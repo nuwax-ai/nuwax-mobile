@@ -14,7 +14,7 @@ export default function request<T = any>(options: any) {
         url: API_BASE_URL + url,
         method: options.method || 'POST',
         ...rest,
-      });
+      }).then(res => res.data);
   }
 
 // 微信小程序：sse
@@ -47,6 +47,6 @@ export const weappEventSource = ({
       const dataStr = str.split("data:").slice(1)[0];
       onmessage(dataStr);
     });
-    // task.catch(onerror);
+    task.catch(onerror);
     return task; // 调用方可通过 task.abort() 手动断开
   }

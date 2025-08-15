@@ -1,0 +1,109 @@
+<template>
+  <uni-popup ref="popupRef" type="left" :mask-click="maskClick" @change="onChange">
+    <view class="drawer-wrapper">
+      <view class="drawer-content" :class="{ 'drawer-show': visible }">
+        <view class="head-box">
+          <view class="title"></view>
+          <view class="close-btn" @click="close">
+            <svg-icon name="X"/>
+          </view>
+        </view>
+        <view class="content-box">
+          <slot></slot>
+        </view>
+      </view>
+    </view>
+  </uni-popup>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue'
+
+const props = defineProps({
+  maskClick: {
+    type: Boolean,
+    default: true
+  }
+})
+
+const popupRef = ref()
+const visible = ref(false)
+
+// 打开抽屉
+const open = () => {
+  popupRef.value?.open()
+  // 延时让动画生效
+  setTimeout(() => {
+    visible.value = true
+  }, 20)
+}
+
+// 关闭抽屉
+const close = () => {
+  visible.value = false
+  // 等待动画结束再关闭 popup
+  setTimeout(() => {
+    popupRef.value?.close()
+  }, 300)
+}
+
+// 监听 uni-popup 状态变化
+const onChange = (e: any) => {
+  if (!e.show) {
+    visible.value = false
+  }
+}
+
+defineExpose({
+  open,
+  close
+})
+</script>
+
+<style scoped lang="scss">
+.drawer-wrapper {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+}
+
+.drawer-content {
+  height: 100vh;
+  width: 80vw;
+  background: #fff;
+  box-shadow: 4rpx 0 20rpx rgba(0, 0, 0, 0.2);
+  transform: translateX(-100%);
+  transition: all 0.3s ease;
+  border-radius: 0 30rpx 30rpx 0;
+
+  .head-box{
+    box-sizing: border-box;
+    width: 100%;
+    display: flex;
+    flex-direction: row;
+    padding: 20rpx 30rpx;
+    align-items: center;
+    justify-content: center;
+
+    .title{
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: center;
+      margin-right: 20rpx;
+    }
+    .close-btn{
+    }
+  }
+
+  .content-box{
+    height: 100%;
+    padding: 20rpx;
+    overflow: auto;
+  }
+}
+
+.drawer-show {
+  transform: translateX(0);
+}
+</style>

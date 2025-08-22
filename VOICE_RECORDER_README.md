@@ -4,6 +4,8 @@
 
 本项目已成功集成基于 `jz-h5-recorder-manager` 插件的语音录制转文本功能。用户可以通过长按按钮进行语音录制，录制完成后系统会自动将语音转换为文本并发送。
 
+**最新更新**: 已重构组件架构，使用 `voiceRecorderManager.uts` 封装类，提供更好的代码组织和可维护性。
+
 ## 功能特性
 
 ✅ **完整的语音录制功能**
@@ -29,38 +31,72 @@
 - 小程序平台
 - App平台
 
+✅ **架构优化** (新增)
+- 使用 `voiceRecorderManager.uts` 封装类
+- 触摸事件统一管理
+- 波形动画自动更新
+- 录音时长自动计时
+- 更好的错误处理机制
+
 ## 文件结构
 
 ```
 components/
 ├── voice-recorder-button/           # 语音录制按钮组件
-│   └── voice-recorder-button.uvue
+│   └── voice-recorder-button.uvue  # 重构后的组件
 ├── chat-input-phone/               # 聊天输入组件（已集成语音功能）
 │   └── chat-input-phone.uvue
 utils/
-├── voiceRecorderManager.uts        # 录音管理器封装
+├── voiceRecorderManager.uts        # 录音管理器封装（核心）
 ├── audioUploader.uts               # 音频上传工具
 └── mockApiService.uts              # 模拟API服务
+examples/
+├── voice-recorder-optimized-example.uts  # 优化版本使用示例
 uni_modules/
 └── jz-h5-recorder-manager/         # 录音插件（已安装）
 ```
+
+## 架构优化说明
+
+### 1. voiceRecorderManager.uts 核心功能
+
+`voiceRecorderManager.uts` 是一个完整的录音管理封装类，提供：
+
+- **触摸事件管理**: 统一处理触摸开始、结束、取消、长按等事件
+- **录音生命周期**: 完整的录音开始、停止、暂停、恢复流程
+- **状态管理**: 实时录音状态、时长、按压状态等
+- **波形动画**: 自动生成和更新波形数据
+- **事件系统**: 完整的事件回调机制
+- **错误处理**: 智能错误分类和处理
+
+### 2. 组件重构优势
+
+重构后的 `voice-recorder-button.uvue` 组件：
+
+- **代码更简洁**: 从 672 行减少到约 400 行
+- **逻辑更清晰**: 触摸事件、录音管理、UI更新分离
+- **维护性更好**: 统一的错误处理和状态管理
+- **扩展性更强**: 易于添加新功能和配置选项
 
 ## 组件使用方法
 
 ### 1. VoiceRecorderButton 组件
 
-独立的语音录制按钮组件，可在任何页面中使用：
+重构后的语音录制按钮组件，使用 `voiceRecorderManager.uts` 封装：
 
 ```vue
 <template>
   <voice-recorder-button
     :duration="60000"
     :format="'mp3'"
-    :show-waveform="true"
+    :sample-rate="44100"
     button-text="长按录音"
+    :show-waveform="true"
+    :use-real-api="false"
     @record-start="handleRecordStart"
     @record-stop="handleRecordStop"
     @error="handleRecordError"
+    @upload-progress="handleUploadProgress"
   />
 </template>
 
@@ -78,6 +114,10 @@ const handleRecordStop = (text: string) => {
 const handleRecordError = (error: any) => {
   console.error('录音错误:', error)
 }
+
+const handleUploadProgress = (progress: number) => {
+  console.log('上传进度:', progress + '%')
+}
 </script>
 ```
 
@@ -90,6 +130,9 @@ const handleRecordError = (error: any) => {
 | sampleRate | number | 44100 | 采样率 |
 | buttonText | string | '长按录音' | 按钮提示文字 |
 | showWaveform | boolean | true | 是否显示波形动画 |
+| useRealApi | boolean | false | 是否使用真实API |
+| apiUrl | string | '' | 真实API地址 |
+| language | string | 'zh-CN' | 语音识别语言 |
 
 #### 组件事件
 
@@ -98,6 +141,7 @@ const handleRecordError = (error: any) => {
 | record-start | - | 开始录音时触发 |
 | record-stop | text: string | 录音结束并转换为文字时触发 |
 | error | error: any | 录音或转换出错时触发 |
+| upload-progress | progress: number | 上传进度更新时触发 |
 
 ### 2. ChatInputPhone 组件
 
@@ -122,7 +166,7 @@ const handleSendMessage = (message: string, files: any[]) => {
 
 ## 工具类使用方法
 
-### 1. VoiceRecorderManager
+### 1. VoiceRecorderManager (核心)
 
 录音管理器封装类，提供完整的录音控制功能：
 
@@ -149,6 +193,23 @@ recorderManager.onStop((audioFile) => {
 
 recorderManager.onError((error) => {
   console.error('录音错误:', error)
+})
+
+recorderManager.onDurationUpdate((duration) => {
+  console.log('录音时长:', duration)
+})
+
+recorderManager.onWaveformUpdate((bars) => {
+  console.log('波形数据:', bars)
+})
+
+// 触摸事件管理
+recorderManager.onTouchStart(() => {
+  console.log('触摸开始')
+})
+
+recorderManager.onTouchEnd(() => {
+  console.log('触摸结束')
 })
 
 // 开始录音
@@ -233,6 +294,15 @@ interface RecorderConfig {
 }
 ```
 
+### 触摸事件配置
+
+新的触摸事件系统提供：
+
+- **触摸开始**: 500ms 长按检测，防误触
+- **触摸结束**: 立即停止录音，快速响应
+- **触摸取消**: 处理意外中断
+- **长按备用**: 确保长按事件能被捕获
+
 ### 上传配置参数
 
 ```typescript
@@ -300,6 +370,12 @@ MemoryManager.cleanupAllAudioFiles()
 - 自动清理过期文件
 - 内存泄漏防护
 
+### 4. 触摸事件优化
+
+- 500ms 长按检测，防止误触
+- 触摸事件统一管理，减少重复代码
+- 自动清理定时器，防止内存泄漏
+
 ## 自定义配置
 
 ### 1. 修改API端点
@@ -313,7 +389,27 @@ const uploader = createAudioUploader({
 })
 ```
 
-### 2. 自定义模拟数据
+### 2. 自定义触摸行为
+
+```typescript
+// 在 voiceRecorderManager.uts 中修改触摸配置
+const recorderManager = createVoiceRecorderManager({
+  duration: 30000,  // 30秒录音
+  format: 'wav',    // WAV格式
+  sampleRate: 16000 // 16kHz采样率
+})
+
+// 自定义触摸事件处理
+recorderManager.onTouchStart(() => {
+  // 自定义触摸开始逻辑
+})
+
+recorderManager.onTouchEnd(() => {
+  // 自定义触摸结束逻辑
+})
+```
+
+### 3. 自定义模拟数据
 
 ```typescript
 import { mockApiService } from '@/utils/mockApiService'
@@ -329,7 +425,7 @@ mockApiService.setSuccessRate(0.98)
 mockApiService.setRequestDelay(2000)
 ```
 
-### 3. 样式自定义
+### 4. 样式自定义
 
 在组件的 `<style>` 部分修改CSS变量：
 
@@ -352,14 +448,22 @@ mockApiService.setRequestDelay(2000)
 - 松开按钮停止录音
 - 查看转换结果
 
-### 2. 错误测试
+### 2. 触摸事件测试
+
+测试各种触摸场景：
+- 短按（<500ms）：不应触发录音
+- 长按（>500ms）：应开始录音
+- 松开：应立即停止录音
+- 触摸取消：应正确处理中断
+
+### 3. 错误测试
 
 测试各种错误场景：
 - 拒绝麦克风权限
 - 录音时长过短
 - 网络异常情况
 
-### 3. 性能测试
+### 4. 性能测试
 
 - 连续多次录音
 - 长时间录音
@@ -409,12 +513,17 @@ const uploader = createAudioUploader({
    - 确认设备支持录音
    - 检查音量设置
 
-2. **转换失败**
+2. **触摸事件不响应**
+   - 检查触摸事件绑定
+   - 确认长按时间足够（>500ms）
+   - 查看控制台错误信息
+
+3. **转换失败**
    - 检查网络连接
    - 确认API配置正确
    - 查看控制台错误信息
 
-3. **界面不响应**
+4. **界面不响应**
    - 检查组件导入
    - 确认事件绑定正确
    - 查看控制台错误
@@ -428,7 +537,24 @@ const uploader = createAudioUploader({
 localStorage.setItem('VOICE_DEBUG', 'true')
 ```
 
+### 触摸事件调试
+
+使用提供的测试页面验证触摸事件：
+
+```bash
+# 查看 examples/voice-recorder-optimized-example.uts
+# 运行测试页面验证功能
+```
+
 ## 更新日志
+
+### v2.0.0 (2025-01-22) - 架构重构
+- ✅ 重构组件架构，使用 `voiceRecorderManager.uts` 封装类
+- ✅ 统一触摸事件管理，提供更好的触摸体验
+- ✅ 自动波形动画更新和录音时长计时
+- ✅ 简化组件代码，提高可维护性
+- ✅ 增强错误处理机制
+- ✅ 新增触摸事件测试页面
 
 ### v1.0.0 (2025-01-22)
 - ✅ 完成语音录制按钮组件
@@ -444,8 +570,9 @@ localStorage.setItem('VOICE_DEBUG', 'true')
 
 如有问题，请查阅：
 1. 本文档的故障排除部分
-2. `jz-h5-recorder-manager` 插件文档
-3. uni-app官方文档
+2. `voiceRecorderManager.uts` 源码注释
+3. `jz-h5-recorder-manager` 插件文档
+4. uni-app官方文档
 
 ## 许可证
 

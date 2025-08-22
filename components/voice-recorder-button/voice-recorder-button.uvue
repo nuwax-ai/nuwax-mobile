@@ -1,0 +1,494 @@
+<template>
+  <view class="voice-recorder-container">
+    <!-- 录音按钮 -->
+    <view 
+      class="voice-button"
+      :class="[
+        `voice-button--${currentState}`,
+        { 'voice-button--pressed': isPressing }
+      ]"
+      @touchstart="handleTouchStart"
+      @touchend="handleTouchEnd"
+      @touchcancel="handleTouchCancel"
+    >
+      <!-- 按钮图标 -->
+      <view class="voice-icon">
+        <uni-icons 
+          v-if="currentState === 'default'"
+          type="mic" 
+          size="24" 
+          color="#666"
+        />
+        <uni-icons 
+          v-else-if="currentState === 'recording'"
+          type="mic-filled" 
+          size="24" 
+          color="#fff"
+        />
+        <uni-icons 
+          v-else-if="currentState === 'uploading'"
+          type="reload" 
+          size="24" 
+          color="#fff"
+        />
+        <uni-icons 
+          v-else-if="currentState === 'success'"
+          type="checkmarkempty" 
+          size="24" 
+          color="#fff"
+        />
+        <uni-icons 
+          v-else-if="currentState === 'error'"
+          type="closeempty" 
+          size="24" 
+          color="#fff"
+        />
+      </view>
+      
+      <!-- 波形动画 -->
+      <view v-if="showWaveform && currentState === 'recording'" class="waveform">
+        <view 
+          v-for="(bar, index) in waveformBars" 
+          :key="index"
+          class="waveform-bar"
+          :style="{ height: `${bar.height}px`, animationDelay: `${bar.delay}ms` }"
+        />
+      </view>
+    </view>
+    
+    <!-- 录音时长显示 -->
+    <view v-if="currentState === 'recording'" class="recording-duration">
+      {{ formatDuration(recordDuration) }}
+    </view>
+    
+    <!-- 状态提示文字 -->
+    <view class="voice-tips">
+      <text v-if="currentState === 'default'">{{ buttonText }}</text>
+      <text v-else-if="currentState === 'recording'">松开结束</text>
+      <text v-else-if="currentState === 'uploading'">正在处理...</text>
+      <text v-else-if="currentState === 'success'">转换成功</text>
+      <text v-else-if="currentState === 'error'">{{ errorMessage }}</text>
+    </view>
+    
+    <!-- 转换结果显示 -->
+    <view v-if="transcriptResult && currentState === 'success'" class="transcript-result">
+      <text>{{ transcriptResult }}</text>
+    </view>
+  </view>
+</template>
+
+<script lang="uts" setup>
+import jzRecorder from '@/uni_modules/jz-h5-recorder-manager'
+
+// 组件Props类型定义
+interface VoiceRecorderProps {
+  // 录音配置
+  duration?: number        // 最大录音时长 (ms)
+  format?: string         // 音频格式
+  sampleRate?: number     // 采样率
+  
+  // UI配置
+  buttonText?: string     // 按钮文字
+  buttonSize?: string     // 按钮尺寸
+  showWaveform?: boolean  // 显示波形动画
+  
+  // 事件回调
+  onRecordStart?: () => void
+  onRecordStop?: (result: string) => void
+  onError?: (error: any) => void
+}
+
+// 录音状态类型
+type RecordState = 'default' | 'recording' | 'uploading' | 'success' | 'error'
+
+// 音频文件接口
+interface AudioFile {
+  tempFilePath: string
+  duration: number
+  fileSize: number
+  format?: string
+}
+
+// 转换结果接口
+interface TranscriptResult {
+  success: boolean
+  text: string
+  confidence: number
+  duration: number
+  error?: string
+}
+
+const props = withDefaults(defineProps<VoiceRecorderProps>(), {
+  duration: 60000,
+  format: 'mp3',
+  sampleRate: 44100,
+  buttonText: '长按录音',
+  buttonSize: '80rpx',
+  showWaveform: true
+})
+
+// 响应式状态
+const currentState = ref<RecordState>('default')
+const isPressing = ref<boolean>(false)
+const recordDuration = ref<number>(0)
+const transcriptResult = ref<string>('')
+const errorMessage = ref<string>('')
+
+// 录音管理器
+let recorderManager: any = null
+let durationTimer: any = null
+
+// 波形动画数据
+const waveformBars = ref([
+  { height: 10, delay: 0 },
+  { height: 15, delay: 100 },
+  { height: 8, delay: 200 },
+  { height: 20, delay: 300 },
+  { height: 12, delay: 400 }
+])
+
+// 初始化录音管理器
+onMounted(() => {
+  recorderManager = jzRecorder.getRecorderManager()
+  setupRecorderEvents()
+})
+
+// 设置录音事件监听
+const setupRecorderEvents = () => {
+  if (!recorderManager) return
+  
+  // 录音开始
+  recorderManager.onStart(() => {
+    console.log('录音开始')
+    currentState.value = 'recording'
+    startDurationTimer()
+    props.onRecordStart?.()
+    
+    // 触发震动反馈
+    uni.vibrateShort()
+  })
+  
+  // 录音停止
+  recorderManager.onStop(async (res: AudioFile) => {
+    console.log('录音停止', res)
+    stopDurationTimer()
+    currentState.value = 'uploading'
+    
+    try {
+      // 上传并转换音频
+      const result = await uploadAndConvert(res)
+      if (result.success) {
+        transcriptResult.value = result.text
+        currentState.value = 'success'
+        props.onRecordStop?.(result.text)
+        
+        // 2秒后重置状态
+        setTimeout(() => {
+          resetState()
+        }, 2000)
+      } else {
+        throw new Error(result.error || '转换失败')
+      }
+    } catch (error: any) {
+      console.error('语音转换失败:', error)
+      errorMessage.value = error.message || '转换失败'
+      currentState.value = 'error'
+      props.onError?.(error)
+      
+      // 3秒后重置状态
+      setTimeout(() => {
+        resetState()
+      }, 3000)
+    }
+  })
+  
+  // 录音错误
+  recorderManager.onError((err: any) => {
+    console.error('录音错误', err)
+    errorMessage.value = err.errMsg || '录音失败'
+    currentState.value = 'error'
+    stopDurationTimer()
+    props.onError?.(err)
+    
+    // 3秒后重置状态
+    setTimeout(() => {
+      resetState()
+    }, 3000)
+  })
+}
+
+// 开始录音时长计时
+const startDurationTimer = () => {
+  recordDuration.value = 0
+  durationTimer = setInterval(() => {
+    recordDuration.value += 100
+    updateWaveform()
+  }, 100)
+}
+
+// 停止录音时长计时
+const stopDurationTimer = () => {
+  if (durationTimer) {
+    clearInterval(durationTimer)
+    durationTimer = null
+  }
+}
+
+// 更新波形动画
+const updateWaveform = () => {
+  waveformBars.value = waveformBars.value.map(bar => ({
+    ...bar,
+    height: Math.random() * 20 + 5
+  }))
+}
+
+// 格式化录音时长
+const formatDuration = (duration: number): string => {
+  const seconds = Math.floor(duration / 1000)
+  const milliseconds = Math.floor((duration % 1000) / 100)
+  return `${seconds}.${milliseconds}s`
+}
+
+// 触摸开始
+const handleTouchStart = (e: any) => {
+  e.preventDefault()
+  if (currentState.value !== 'default') return
+  
+  isPressing.value = true
+  
+  // 开始录音
+  if (recorderManager) {
+    recorderManager.start({
+      duration: props.duration,
+      sampleRate: props.sampleRate,
+      numberOfChannels: 1,
+      encodeBitRate: 192000,
+      format: props.format
+    })
+  }
+}
+
+// 触摸结束
+const handleTouchEnd = (e: any) => {
+  e.preventDefault()
+  handleTouchFinish()
+}
+
+// 触摸取消
+const handleTouchCancel = (e: any) => {
+  e.preventDefault()
+  handleTouchFinish()
+}
+
+// 处理触摸结束
+const handleTouchFinish = () => {
+  if (!isPressing.value) return
+  
+  isPressing.value = false
+  
+  // 停止录音
+  if (recorderManager && currentState.value === 'recording') {
+    recorderManager.stop()
+  }
+}
+
+// 上传并转换音频 (模拟实现)
+const uploadAndConvert = async (audioFile: AudioFile): Promise<TranscriptResult> => {
+  // 模拟网络延迟
+  await new Promise(resolve => setTimeout(resolve, 1500))
+  
+  // 模拟转换结果
+  const mockTexts = [
+    "这是一段测试语音转文本的内容",
+    "语音识别功能正在正常工作", 
+    "请检查录音质量是否清晰",
+    "您好，这是语音转文本测试",
+    "录音功能已经成功集成"
+  ]
+  
+  // 模拟成功率
+  const isSuccess = Math.random() > 0.1 // 90% 成功率
+  
+  if (isSuccess) {
+    return {
+      success: true,
+      text: mockTexts[Math.floor(Math.random() * mockTexts.length)],
+      confidence: 0.85 + Math.random() * 0.15,
+      duration: audioFile.duration
+    }
+  } else {
+    return {
+      success: false,
+      text: '',
+      confidence: 0,
+      duration: audioFile.duration,
+      error: '网络错误，请重试'
+    }
+  }
+}
+
+// 重置状态
+const resetState = () => {
+  currentState.value = 'default'
+  isPressing.value = false
+  recordDuration.value = 0
+  transcriptResult.value = ''
+  errorMessage.value = ''
+}
+
+// 组件卸载时清理资源
+onUnmounted(() => {
+  stopDurationTimer()
+  if (recorderManager) {
+    // 清理事件监听器
+    recorderManager.offStart()
+    recorderManager.offStop()
+    recorderManager.offError()
+  }
+})
+</script>
+
+<style lang="scss" scoped>
+.voice-recorder-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16rpx;
+}
+
+.voice-button {
+  position: relative;
+  width: 120rpx;
+  height: 120rpx;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  user-select: none;
+  
+  // 默认状态
+  &--default {
+    background-color: #f5f5f5;
+    border: 2rpx solid #ddd;
+    
+    &:active, &.voice-button--pressed {
+      transform: scale(1.1);
+      background-color: #ff4d4f;
+      border-color: #ff4d4f;
+      
+      .voice-icon {
+        color: #fff !important;
+      }
+    }
+  }
+  
+  // 录音中状态
+  &--recording {
+    background-color: #ff4d4f;
+    border-color: #ff4d4f;
+    animation: recording-pulse 1s infinite;
+  }
+  
+  // 上传中状态
+  &--uploading {
+    background-color: #1890ff;
+    border-color: #1890ff;
+    
+    .voice-icon {
+      animation: loading-spin 1s linear infinite;
+    }
+  }
+  
+  // 成功状态
+  &--success {
+    background-color: #52c41a;
+    border-color: #52c41a;
+  }
+  
+  // 错误状态
+  &--error {
+    background-color: #ff4d4f;
+    border-color: #ff4d4f;
+  }
+}
+
+.voice-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+
+.waveform {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4rpx;
+  z-index: 1;
+}
+
+.waveform-bar {
+  width: 6rpx;
+  background-color: rgba(255, 255, 255, 0.8);
+  border-radius: 3rpx;
+  animation: waveform-bounce 0.6s ease-in-out infinite alternate;
+}
+
+.recording-duration {
+  font-size: 28rpx;
+  color: #ff4d4f;
+  font-weight: 500;
+}
+
+.voice-tips {
+  font-size: 24rpx;
+  color: #666;
+  text-align: center;
+}
+
+.transcript-result {
+  max-width: 500rpx;
+  padding: 16rpx;
+  background-color: #f6ffed;
+  border: 1rpx solid #b7eb8f;
+  border-radius: 12rpx;
+  
+  text {
+    font-size: 28rpx;
+    color: #389e0d;
+  }
+}
+
+// 动画定义
+@keyframes recording-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 77, 79, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 20rpx rgba(255, 77, 79, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 77, 79, 0);
+  }
+}
+
+@keyframes loading-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes waveform-bounce {
+  from {
+    transform: scaleY(0.5);
+  }
+  to {
+    transform: scaleY(1.5);
+  }
+}
+</style>

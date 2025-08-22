@@ -7,9 +7,7 @@
         `voice-button--${currentState}`,
         { 'voice-button--pressed': isPressing }
       ]"
-      @touchstart="handleTouchStart"
-      @touchend="handleTouchEnd"
-      @touchcancel="handleTouchCancel"
+      @click="handleClick"
     >
       <!-- 按钮图标 -->
       <view class="voice-icon">
@@ -79,6 +77,12 @@
 
 <script lang="uts" setup>
 import jzRecorder from '@/uni_modules/jz-h5-recorder-manager'
+import { 
+  createAudioUploader, 
+  type AudioFile as UploaderAudioFile,
+  type TranscriptResult as UploaderTranscriptResult,
+  type UploadProgress
+} from '@/utils/audioUploader'
 
 // 组件Props类型定义
 interface VoiceRecorderProps {
@@ -92,10 +96,16 @@ interface VoiceRecorderProps {
   buttonSize?: string     // 按钮尺寸
   showWaveform?: boolean  // 显示波形动画
   
+  // 音频上传配置
+  useRealApi?: boolean    // 是否使用真实API接口
+  apiUrl?: string         // 真实API接口地址
+  language?: string       // 语音识别语言
+  
   // 事件回调
   onRecordStart?: () => void
   onRecordStop?: (result: string) => void
   onError?: (error: any) => void
+  onUploadProgress?: (progress: number) => void  // 上传进度回调
 }
 
 // 录音状态类型
@@ -124,7 +134,10 @@ const props = withDefaults(defineProps<VoiceRecorderProps>(), {
   sampleRate: 44100,
   buttonText: '长按录音',
   buttonSize: '80rpx',
-  showWaveform: true
+  showWaveform: true,
+  useRealApi: false,
+  apiUrl: '',
+  language: 'zh-CN'
 })
 
 // 响应式状态
@@ -137,6 +150,11 @@ const errorMessage = ref<string>('')
 // 录音管理器
 let recorderManager: any = null
 let durationTimer: any = null
+let longPressTimer: any = null
+let touchStartTime: number = 0
+
+// 音频上传服务
+let audioUploadService: any = null // 使用audioUploader
 
 // 波形动画数据
 const waveformBars = ref([
@@ -151,7 +169,43 @@ const waveformBars = ref([
 onMounted(() => {
   recorderManager = jzRecorder.getRecorderManager()
   setupRecorderEvents()
+  
+  // 初始化音频上传服务
+  initializeAudioUploadService()
 })
+
+// 初始化音频上传服务
+const initializeAudioUploadService = () => {
+  if (props.useRealApi) {
+    // 使用真实API
+    if (props.apiUrl) {
+      // 创建audioUploader实例，配置真实API
+      audioUploadService = createAudioUploader({
+        apiUrl: props.apiUrl,
+        language: props.language,
+        timeout: 30000
+      })
+      console.log('使用真实API服务:', props.apiUrl)
+    } else {
+      console.warn('启用了真实API但未配置API地址，将使用模拟服务')
+      audioUploadService = createAudioUploader()
+      console.log('使用模拟API服务')
+    }
+  } else {
+    // 使用模拟服务
+    audioUploadService = createAudioUploader()
+    console.log('使用模拟API服务')
+  }
+}
+
+// 检测API类型（保留用于日志显示）
+const detectApiType = (apiUrl: string): string => {
+  const url = apiUrl.toLowerCase()
+  if (url.includes('azure') || url.includes('microsoft')) return 'azure'
+  if (url.includes('baidu') || url.includes('ai.baidu')) return 'baidu'
+  if (url.includes('openai') || url.includes('whisper')) return 'openai'
+  return 'custom'
+}
 
 // 设置录音事件监听
 const setupRecorderEvents = () => {
@@ -172,11 +226,13 @@ const setupRecorderEvents = () => {
   recorderManager.onStop(async (res: AudioFile) => {
     console.log('录音停止', res)
     stopDurationTimer()
+    
+    // 立即显示上传中状态，给用户明确反馈
     currentState.value = 'uploading'
     
     try {
-      // 上传并转换音频
-      const result = await uploadAndConvert(res)
+      // 使用音频上传服务转换音频
+      const result = await uploadAndConvertWithService(res)
       if (result.success) {
         transcriptResult.value = result.text
         currentState.value = 'success'
@@ -225,7 +281,14 @@ const startDurationTimer = () => {
     updateWaveform()
   }, 100)
 }
-
+const handleClick = () => {
+  console.log('handleClick', currentState.value)
+  if (currentState.value === 'default') {
+    startRecording()
+  } else if (currentState.value === 'recording') {
+    handleTouchFinish()
+  }
+}
 // 停止录音时长计时
 const stopDurationTimer = () => {
   if (durationTimer) {
@@ -249,50 +312,156 @@ const formatDuration = (duration: number): string => {
   return `${seconds}.${milliseconds}s`
 }
 
-// 触摸开始
+// 触摸开始事件
 const handleTouchStart = (e: any) => {
   e.preventDefault()
   if (currentState.value !== 'default') return
   
+  touchStartTime = Date.now()
   isPressing.value = true
   
-  // 开始录音
-  if (recorderManager) {
-    recorderManager.start({
-      duration: props.duration,
-      sampleRate: props.sampleRate,
-      numberOfChannels: 1,
-      encodeBitRate: 192000,
-      format: props.format
-    })
-  }
+  // 设置长按定时器，500ms后开始录音
+  longPressTimer = setTimeout(() => {
+    startRecording()
+  }, 500)
 }
 
-// 触摸结束
+// 触摸结束事件
 const handleTouchEnd = (e: any) => {
   e.preventDefault()
   handleTouchFinish()
 }
 
-// 触摸取消
+// 触摸取消事件
 const handleTouchCancel = (e: any) => {
   e.preventDefault()
   handleTouchFinish()
 }
 
-// 处理触摸结束
-const handleTouchFinish = () => {
-  if (!isPressing.value) return
+// 长按事件（备用方案）
+const handleLongPress = (e: any) => {
+  e.preventDefault()
+  if (currentState.value !== 'default') return
   
-  isPressing.value = false
-  
-  // 停止录音
-  if (recorderManager && currentState.value === 'recording') {
-    recorderManager.stop()
+  // 如果触摸开始事件没有触发，这里作为备用
+  if (!isPressing.value) {
+    isPressing.value = true
+    startRecording()
   }
 }
 
-// 上传并转换音频 (模拟实现)
+// 开始录音
+const startRecording = () => {
+  if (currentState.value !== 'default') return
+  
+  // 清除长按定时器
+  if (longPressTimer) {
+    clearTimeout(longPressTimer)
+    longPressTimer = null
+  }
+  
+  // 开始录音
+  if (recorderManager) {
+    try {
+      recorderManager.start({
+        duration: props.duration,
+        sampleRate: props.sampleRate,
+        numberOfChannels: 1,
+        encodeBitRate: 192000,
+        format: props.format
+      })
+    } catch (error: any) {
+      console.error('启动录音失败:', error)
+      errorMessage.value = '启动录音失败'
+      currentState.value = 'error'
+      isPressing.value = false
+      props.onError?.(error)
+    }
+  }
+}
+
+// 处理触摸结束
+const handleTouchFinish = () => {
+  
+  // 清除长按定时器
+  if (longPressTimer) {
+    clearTimeout(longPressTimer)
+    longPressTimer = null
+  }
+  
+  // 如果触摸时间太短，不执行录音
+  const touchDuration = Date.now() - touchStartTime
+  if (touchDuration < 500) {
+    console.log('触摸时间太短，取消录音')
+    return
+  }
+  
+  // 如果正在录音，立即给用户反馈
+  if (currentState.value === 'recording') {
+    console.log('松开录音，准备停止...')
+    
+    // 显示"松开结束"的临时状态
+    const originalState = currentState.value
+    currentState.value = 'uploading' // 临时显示上传中状态
+    
+    // 立即停止录音
+    if (recorderManager) {
+      try {
+        recorderManager.stop()
+      } catch (error: any) {
+        console.error('停止录音失败:', error)
+        errorMessage.value = '停止录音失败'
+        currentState.value = 'error'
+        props.onError?.(error)
+      }
+    }
+  } else if (currentState.value === 'default') {
+    // 如果还没有开始录音（触摸时间不够长），直接重置
+    console.log('触摸时间不够，重置状态')
+    resetState()
+  }
+}
+
+// 使用audioUploader转换音频
+const uploadAndConvertWithService = async (audioFile: AudioFile): Promise<TranscriptResult> => {
+  if (!audioUploadService) {
+    throw new Error('音频上传服务未初始化')
+  }
+
+  try {
+    // 转换音频文件格式
+    const uploaderAudioFile: UploaderAudioFile = {
+      tempFilePath: audioFile.tempFilePath,
+      duration: audioFile.duration,
+      fileSize: audioFile.fileSize,
+      format: audioFile.format
+    }
+
+    // 调用audioUploader的上传方法
+    const result = await audioUploadService.uploadAudio(
+      uploaderAudioFile,
+      (progress: UploadProgress) => {
+        // 上传进度回调
+        console.log('上传进度:', progress.percent + '%')
+        props.onUploadProgress?.(progress.percent)
+      }
+    )
+
+    // 转换结果格式
+    return {
+      success: result.success,
+      text: result.text,
+      confidence: result.confidence,
+      duration: result.duration,
+      error: result.error
+    }
+  } catch (error: any) {
+    console.error('音频转换服务调用失败:', error)
+    throw error
+  }
+}
+
+// 上传并转换音频 (模拟实现 - 保留作为备用)
 const uploadAndConvert = async (audioFile: AudioFile): Promise<TranscriptResult> => {
   // 模拟网络延迟
   await new Promise(resolve => setTimeout(resolve, 1500))
@@ -334,11 +503,20 @@ const resetState = () => {
   recordDuration.value = 0
   transcriptResult.value = ''
   errorMessage.value = ''
+  
+  // 清理定时器
+  if (longPressTimer) {
+    clearTimeout(longPressTimer)
+    longPressTimer = null
+  }
 }
 
 // 组件卸载时清理资源
 onUnmounted(() => {
   stopDurationTimer()
+  if (longPressTimer) {
+    clearTimeout(longPressTimer)
+  }
   if (recorderManager) {
     // 清理事件监听器
     recorderManager.offStart()

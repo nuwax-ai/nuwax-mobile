@@ -215,7 +215,6 @@ class H5RecorderManager {
     const audioBlob = new Blob(this.audioChunks, {
       type: this._getMimeType(config.format),
     });
-    console.log("audioBlob", audioBlob);
 
     // 创建临时文件URL
     const tempFilePath = URL.createObjectURL(audioBlob);

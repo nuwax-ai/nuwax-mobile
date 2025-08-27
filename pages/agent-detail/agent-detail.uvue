@@ -23,7 +23,14 @@
 					@touchend="scrollTouch = false"
 				>
 					<template v-for="item in messageList" :key="item.id">
-						<uni-ai-x-msg v-if="item.messageType === MessageTypeEnum.ASSISTANT" :msg="convertMessageInfoToMsgItem(item)" @longpress="onlongTapMsg(convertMessageInfoToMsgItem(item))" @changeThinkContent="changeThinkContent" :id="'msg-item-' + item.id"></uni-ai-x-msg>
+						<uni-ai-x-msg 
+							v-if="item.messageType === MessageTypeEnum.ASSISTANT" 
+							:msg="convertMessageInfoToMsgItem(item)" 
+							@longpress="onlongTapMsg(convertMessageInfoToMsgItem(item))" 
+							@changeThinkContent="changeThinkContent" 
+							:id="'msg-item-' + item.id"
+							:ref="(el) => setMessageRef(el, item.id)"
+						></uni-ai-x-msg>
 						<text v-else class="user-msg" @longpress="onlongTapMsg(convertMessageInfoToMsgItem(item))">{{item.text}}</text>
 					</template>
 					<!-- 内容 -->
@@ -64,14 +71,12 @@
 	import uniAiXMsg from '@/uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue'
 
 	import { chatService } from '@/utils/chatService'
-  import { markdownParser } from '@/utils/markdownParser'
-  import { MarkdownConverter } from '@/utils/markdownConverter'
   // 导入SSE数据处理器
   import { createSSEProcessor, SSEChunk } from '@/utils/sseDataProcessor'
   // 导入Markdown解析器
   import ParseMarkdown from '@/uni_modules/uni-ai-x/sdk/parseMarkdown.uts'
-  // 导入Markdown相关类型
-  import { NodesToken as MarkdownToken } from '@/uni_modules/kux-marked'
+  // 导入Markdown相关类型和解析器
+  import { useMarked, NodesToken as MarkdownToken } from '@/uni_modules/kux-marked'
   // 导入treeToList工具
   import treeToListSdk from '@/uni_modules/uni-ai-x/sdk/treeToList.uts'
   // 导入会话相关API和类型
@@ -95,6 +100,9 @@
 
 	// 导入需要的类型
 	import {MsgItem, markdownElItem} from '@/uni_modules/uni-ai-x/sdk/'
+
+	  // 初始化useMarked实例（备用方案）
+  const marked = useMarked()
 
 	// 会话id
 	const conversationId = ref<number | null>(null)
@@ -344,8 +352,8 @@
       // 为没有markdownElList的消息生成markdownElList
       const processedMessageList = _messageList.map((message: MessageInfo) => {
         if (!message.markdownElList && message.text) {
-          const markdownElements: MarkdownElement[] = markdownParser.parse(message.text);
-          const datasList: MarkdownToken[][] = MarkdownConverter.convertToTokenArray(markdownElements);
+          			const markdownElements: MarkdownToken[] = (marked.lexer(message.text, null) as TokensList).tokens as MarkdownToken[];
+			const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0]);
           
           const markdownElList: markdownElItem[] = [{
             uniqueId: generateUniqueId(),
@@ -473,17 +481,6 @@
         // MESSAGE事件
         if (eventType === ConversationEventTypeEnum.MESSAGE) {
           const { text, type, ext, id, finished } = data;
-					// 解析markdown
-          const markdownElements: MarkdownElement[] = markdownParser.parse(text);
-          // 使用转换器将MarkdownElement转换为MarkdownToken[][]格式
-          const datasList: MarkdownToken[][] = MarkdownConverter.convertToTokenArray(markdownElements)
-					// 将MarkdownToken转换为markdownElItem
-          const currentTextMarkdownElList: markdownElItem[] = [{
-            uniqueId: generateUniqueId(),
-            type: determineTypeFromData(datasList),
-            datasList,
-          }];
-
           // 思考think
           if (type === MessageModeEnum.THINK) {
             newMessage = {
@@ -494,13 +491,41 @@
           }
           // 问答
           else if (type === MessageModeEnum.QUESTION) {
-            newMessage = {
-              ...currentMessage,
-              text: `${currentMessage.text}${text}`,
-              markdownElList: [...(currentMessage?.markdownElList || []), ...currentTextMarkdownElList],
-              // 如果finished为true，则状态为null，此时不会显示运行状态组件，否则为Incomplete
-              status: finished ? null : MessageStatusEnum.Incomplete,
-            };
+            // 先累加文本，然后重新解析完整的markdown
+            const accumulatedText = `${currentMessage.text}${text}`;
+            console.log('问答类型 - 累加后的完整文本:', accumulatedText);
+            
+            // 使用ParseMarkdown实例处理流式数据
+            if (parseMarkdownInstance) {
+              parseMarkdownInstance.runTask(accumulatedText);
+              // 结果会通过回调函数异步更新，这里先使用临时数据
+              const tempMarkdownElList: markdownElItem[] = [{
+                uniqueId: generateUniqueId(),
+                type: 'text',
+                datasList: []
+              }];
+              newMessage = {
+                ...currentMessage,
+                text: accumulatedText,
+                markdownElList: tempMarkdownElList,
+                status: finished ? null : MessageStatusEnum.Incomplete,
+              };
+                          } else {
+                // 备用方案：直接使用marked.lexer
+                const markdownElements: MarkdownToken[] = (marked.lexer(accumulatedText, null) as TokensList).tokens as MarkdownToken[];
+                const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0]);
+                const newMarkdownElList: markdownElItem[] = [{
+                  uniqueId: generateUniqueId(),
+                  type: determineTypeFromData(datasList),
+                  datasList,
+                }];
+                newMessage = {
+                  ...currentMessage,
+                  text: accumulatedText,
+                  markdownElList: newMarkdownElList,
+                  status: finished ? null : MessageStatusEnum.Incomplete,
+                };
+              }
             if (ext?.length) {
               // 问题建议
               chatSuggestList.value = (
@@ -514,23 +539,82 @@
               (!messageIdRef.value || messageIdRef.value !== id) &&
               finished
             ) {
-              newMessage = {
-                ...currentMessage,
-                id,
-                text: `${currentMessage.text}${text}`, // 这里需要添加 展示MCP 或者其他工具调用
-                markdownElList: [...(currentMessage?.markdownElList || []), ...currentTextMarkdownElList],
-                status: null, // 隐藏运行状态
-              };
+              // 先累加文本，然后重新解析完整的markdown
+              const accumulatedText = `${currentMessage.text}${text}`;
+              console.log('工作流输出 - 累加后的完整文本:', accumulatedText);
+              
+              // 使用ParseMarkdown实例处理流式数据
+              if (parseMarkdownInstance) {
+                parseMarkdownInstance.runTask(accumulatedText);
+                // 结果会通过回调函数异步更新，这里先使用临时数据
+                const tempMarkdownElList: markdownElItem[] = [{
+                  uniqueId: generateUniqueId(),
+                  type: 'text',
+                  datasList: []
+                }];
+                newMessage = {
+                  ...currentMessage,
+                  id,
+                  text: accumulatedText,
+                  markdownElList: tempMarkdownElList,
+                  status: null, // 隐藏运行状态
+                };
+              } else {
+                // 备用方案：直接使用marked.lexer
+                const markdownElements: MarkdownToken[] = (marked.lexer(accumulatedText, null) as TokensList).tokens as MarkdownToken[];
+                const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0]);
+                const newMarkdownElList: markdownElItem[] = [{
+                  uniqueId: generateUniqueId(),
+                  type: determineTypeFromData(datasList),
+                  datasList,
+                }];
+                newMessage = {
+                  ...currentMessage,
+                  id,
+                  text: accumulatedText,
+                  markdownElList: newMarkdownElList,
+                  status: null, // 隐藏运行状态
+                };
+              }
               // 插入新的消息
               arraySpliceAction = 0;
             } else {
               messageIdRef.value = id;
-              newMessage = {
-                ...currentMessage,
-                text: `${currentMessage.text}${text}`,
-                markdownElList: [...(currentMessage?.markdownElList || []), ...currentTextMarkdownElList],
-                status: MessageStatusEnum.Incomplete,
-              };
+              // 先累加文本，然后重新解析完整的markdown
+              const accumulatedText = `${currentMessage.text}${text}`;
+              console.log('工作流进行中 - 累加后的完整文本:', accumulatedText);
+              
+              // 使用ParseMarkdown实例处理流式数据
+              if (parseMarkdownInstance) {
+                parseMarkdownInstance.runTask(accumulatedText);
+                // 结果会通过回调函数异步更新，这里先使用临时数据
+                const tempMarkdownElList: markdownElItem[] = [{
+                  uniqueId: generateUniqueId(),
+                  type: 'text',
+                  datasList: []
+                }];
+                newMessage = {
+                  ...currentMessage,
+                  text: accumulatedText,
+                  markdownElList: tempMarkdownElList,
+                  status: MessageStatusEnum.Incomplete,
+                };
+              } else {
+                // 备用方案：直接使用marked.lexer
+                const markdownElements: MarkdownToken[] = (marked.lexer(accumulatedText, null) as TokensList).tokens as MarkdownToken[];
+                const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0]);
+                const newMarkdownElList: markdownElItem[] = [{
+                  uniqueId: generateUniqueId(),
+                  type: determineTypeFromData(datasList),
+                  datasList,
+                }];
+                newMessage = {
+                  ...currentMessage,
+                  text: accumulatedText,
+                  markdownElList: newMarkdownElList,
+                  status: MessageStatusEnum.Incomplete,
+                };
+              }
             }
           }
         }
@@ -564,6 +648,17 @@
 
         messageList.value = list;
 				console.log(list, '================list666666')
+        
+        // 使用优化更新方法，只更新需要更新的组件
+        if (newMessage && newMessage.messageType === MessageTypeEnum.ASSISTANT) {
+          await nextTick();
+          // 尝试直接更新组件
+          await updateMessageComponent(currentMessageId, {
+            markdownElList: newMessage.markdownElList,
+            text: newMessage.text,
+            status: newMessage.status
+          });
+        }
     // }, 200);
   };
 
@@ -819,8 +914,120 @@
 		setIsInScrollBottom()
 	}
 	
+	// 管理消息组件的ref引用
+	const messageRefs = ref<{ [key: string]: any }>({})
+	
+	const setMessageRef = (el: any, messageId: string) => {
+		if (el) {
+			messageRefs.value[messageId] = el;
+			console.log(`消息组件 ${messageId} 已挂载，ref:`, el);
+		}
+	};
+	
+	const removeMessageRef = (messageId: string) => {
+		if (messageRefs.value[messageId]) {
+			delete messageRefs.value[messageId];
+			console.log(`消息组件 ${messageId} 已卸载`);
+		}
+	};
+	
+	// 优化更新特定消息组件的方法
+	const updateMessageComponent = async (messageId: string, newData: any) => {
+		const messageRef = messageRefs.value[messageId];
+		if (messageRef) {
+			console.log(`正在更新消息组件 ${messageId}:`, newData);
+			console.log('组件实例:', messageRef);
+			console.log('组件方法:', Object.getOwnPropertyNames(messageRef));
+			
+			try {
+				// 调用组件的更新方法（如果存在）
+				if (typeof messageRef.updateMessage === 'function') {
+					console.log('调用组件的updateMessage方法');
+					await messageRef.updateMessage(newData);
+					console.log('组件updateMessage方法调用成功');
+				} else {
+					console.log('组件没有updateMessage方法，使用备用方案');
+					// 如果没有updateMessage方法，强制触发组件更新
+					await nextTick();
+					// 通过改变key来触发组件更新（但只针对特定组件）
+					const message = messageList.value.find(msg => msg.id === messageId);
+					if (message) {
+						// 添加一个更新标记，触发响应式更新
+						message.lastUpdateTime = Date.now();
+						// 强制触发响应式更新
+						messageList.value = [...messageList.value];
+						console.log('使用备用方案更新完成');
+					}
+				}
+			} catch (error) {
+				console.error(`更新消息组件 ${messageId} 失败:`, error);
+				// 如果updateMessage调用失败，也使用备用方案
+				try {
+					await nextTick();
+					const message = messageList.value.find(msg => msg.id === messageId);
+					if (message) {
+						message.lastUpdateTime = Date.now();
+						messageList.value = [...messageList.value];
+						console.log('使用备用方案更新完成（错误恢复）');
+					}
+				} catch (backupError) {
+					console.error('备用方案也失败了:', backupError);
+				}
+			}
+		} else {
+			console.warn(`消息组件 ${messageId} 的ref不存在`);
+			console.log('当前所有refs:', messageRefs.value);
+		}
+	};
+	
 	// 将MessageInfo转换为MsgItem格式
 	const convertMessageInfoToMsgItem = (messageInfo: MessageInfo): MsgItem => {
+		// 添加调试信息，查看markdownElList的状态
+		console.log('convertMessageInfoToMsgItem - messageInfo:', {
+			id: messageInfo.id,
+			text: messageInfo.text,
+			markdownElList: messageInfo.markdownElList,
+			messageType: messageInfo.messageType
+		});
+		
+		// 如果markdownElList为空但有text内容，尝试重新解析
+		let finalMarkdownElList = messageInfo.markdownElList || [];
+		if (!finalMarkdownElList.length && messageInfo.text && messageInfo.messageType === MessageTypeEnum.ASSISTANT) {
+			console.log('重新解析markdown内容:', messageInfo.text);
+			try {
+				// 使用ParseMarkdown实例重新解析完整的文本
+				if (parseMarkdownInstance) {
+					parseMarkdownInstance.runTask(messageInfo.text);
+					// 从实例中获取解析结果
+					const markdownElements = parseMarkdownInstance.markdownTokenList;
+					if (markdownElements && markdownElements.length > 0) {
+						const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0]);
+						finalMarkdownElList = [{
+							uniqueId: generateUniqueId(),
+							type: determineTypeFromData(datasList),
+							datasList,
+						}];
+					}
+				} else {
+					// 备用方案：直接使用marked.lexer
+					const markdownElements: MarkdownToken[] = (marked.lexer(messageInfo.text, null) as TokensList).tokens as MarkdownToken[];
+					if (markdownElements && markdownElements.length > 0) {
+						const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0]);
+						finalMarkdownElList = [{
+							uniqueId: generateUniqueId(),
+							type: determineTypeFromData(datasList),
+							datasList,
+						}];
+					}
+				}
+				
+				console.log('重新解析后的markdownElList:', finalMarkdownElList);
+			} catch (error) {
+				console.error('重新解析markdown失败:', error);
+			}
+		}
+		console.log('convertMessageInfoToMsgItem - finalMarkdownElList', finalMarkdownElList);
+		
 		return {
 			_id: messageInfo.id?.toString() || '',
 			from_uid: messageInfo.messageType === MessageTypeEnum.ASSISTANT ? 'uni-ai' : 'user',
@@ -831,10 +1038,10 @@
 				   messageInfo.status === MessageStatusEnum.Loading ? 2 : 
 				   messageInfo.status === MessageStatusEnum.Incomplete ? 2 : 3,
 			chat_id: 'chat-' + conversationId.value,
-			markdownElList: messageInfo.markdownElList || [],
+			markdownElList: finalMarkdownElList,
 			rendered: false
 		} as MsgItem;
-	}
+	};
 
 	// 长按消息
 	const onlongTapMsg = (item: any) => {
@@ -907,6 +1114,7 @@
 	 */
 	const getPublishedAgentInfo = async (withConversationId: boolean = false, messageInfo: string = '', files: UploadFileInfo[] = []) => {
 		const { code, data, message } = await apiPublishedAgentInfo(agentId.value, withConversationId)
+		console.log('getPublishedAgentInfo', code, data, message);
 		if (code === SUCCESS_CODE) {
 			agentInfo.value = data
 			if(withConversationId){

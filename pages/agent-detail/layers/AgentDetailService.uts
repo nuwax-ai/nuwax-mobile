@@ -1,0 +1,512 @@
+import { nextTick } from 'vue'
+import { NodesToken as MarkdownToken } from '@/uni_modules/kux-marked'
+import { MessageInfo, ConversationChatParams, ConversationChatResponse, ConversationChatSuggestParams, ProcessingInfo, MessageQuestionExtInfo, AttachmentFile, ConversationCreateParams } from '@/types/interfaces/conversationInfo'
+import type { AgentSelectedComponentInfo } from '@/types/interfaces/agent'
+import { UploadFileInfo } from '@/types/interfaces/common'
+import { ConversationInfo } from '@/types/interfaces/conversationInfo'
+import { RequestResponse } from '@/types/interfaces/request'
+import { MessageModeEnum, ConversationEventTypeEnum, MessageTypeEnum, AssistantRoleEnum } from '@/types/enums/agent'
+import { MessageStatusEnum } from '@/types/enums/common'
+import { OpenCloseEnum } from '@/types/enums/space'
+import { SUCCESS_CODE } from '@/constants/codes.constants'
+import { chatService } from '@/utils/chatService'
+import { apiAgentConversationCreate, apiAgentConversation, apiAgentConversationChatSuggest } from '@/servers/conversation'
+import { apiPublishedAgentInfo, apiCollectAgent, apiUnCollectAgent } from '@/servers/agentDev'
+import { v4 as uuidv4 } from 'uuid'
+import ParseMarkdown from '@/uni_modules/uni-ai-x/sdk/parseMarkdown.uts'
+import treeToListSdk from '@/uni_modules/uni-ai-x/sdk/treeToList.uts'
+import { markdownElItem } from '@/uni_modules/uni-ai-x/types.uts'
+import AgentDetailData from '@/pages/agent-detail/layers/AgentDetailData.uts'
+import AgentDetailUtils from '@/pages/agent-detail/layers/AgentDetailUtils.uts'
+
+/**
+ * 服务层：负责业务逻辑和API调用
+ */
+export default class AgentDetailService {
+	private data: AgentDetailData
+	constructor(private data: AgentDetailData) {
+		this.data = data
+	}
+
+	/**
+	 * 初始化ParseMarkdown实例
+	 */
+	initParseMarkdown(): void {
+		if (!this.data.parseMarkdownInstance) {
+			this.data.parseMarkdownInstance = new ParseMarkdown((markdownTokenList: MarkdownToken[]) => {
+				const markdownElList = (markdownTokenList as any[]).map((token: any) => ({
+					uniqueId: token.uniqueId || `token_${Date.now()}_${Math.random()}`,
+					type: token.type || 'text',
+					datasList: treeToListSdk.markTreeToList(token)
+				}))
+				
+				// 更新最新AI消息的markdownElList
+				if (this.data.messageList.value.length > 0) {
+					const lastMsg = this.data.messageList.value[this.data.messageList.value.length - 1]
+					if (lastMsg.messageType === MessageTypeEnum.ASSISTANT) {
+						lastMsg.markdownElList = markdownElList
+						this.data.messageList.value = [...this.data.messageList.value]
+					}
+				}
+			})
+		}
+	}
+
+	/**
+	 * 处理查询会话
+	 */
+	async handleQueryConversation(result: RequestResponse<ConversationInfo>): Promise<void> {
+		this.data.isLoadingConversation.value = true
+		const { data: responseData } = result
+		
+		this.data.conversationInfo.value = responseData as unknown as ConversationInfo
+		this.data.isSuggest.value = responseData?.agent?.openSuggest === OpenCloseEnum.Open
+		this.data.manualComponents.value = responseData?.agent?.manualComponents || []
+		
+		const _variables = responseData?.agent?.variables || []
+		AgentDetailUtils.handleVariables(_variables, this.data)
+		this.data.userFillVariables.value = responseData?.variables as any
+		
+		const _messageList = responseData?.messageList || []
+		const len = _messageList?.length || 0
+		
+		if (len) {
+			// 为没有markdownElList的消息生成markdownElList
+			const processedMessageList = _messageList.map((message: MessageInfo) => {
+				if (!message.markdownElList && message.text) {
+					const markdownElements: MarkdownToken[] = (this.data.marked.lexer(message.text, null) as any).tokens as MarkdownToken[]
+					const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0])
+					
+					const markdownElList: markdownElItem[] = [{
+						uniqueId: AgentDetailUtils.generateUniqueId(),
+						type: AgentDetailUtils.determineTypeFromData(datasList),
+						datasList,
+					}]
+					return { ...message, markdownElList }
+				}
+				return message
+			})
+			
+			this.data.messageList.value = processedMessageList
+			AgentDetailUtils.checkConversationActive(processedMessageList, this.data)
+			
+			// 处理问题建议
+			const lastMessage = processedMessageList[len - 1]
+			if (lastMessage.type === MessageModeEnum.QUESTION && lastMessage.ext?.length) {
+				const suggestList = lastMessage.ext.map((item) => item.content) || []
+				this.data.chatSuggestList.value = suggestList
+			} else if (len === 1) {
+				this.data.chatSuggestList.value = responseData?.agent?.openingGuidQuestions || []
+			}
+		} else {
+			this.data.chatSuggestList.value = responseData?.agent?.openingGuidQuestions || []
+		}
+	}
+
+	/**
+	 * 修改消息列表
+	 */
+	async handleChangeMessageList(
+		res: ConversationChatResponse,
+		currentMessageId: string,
+	): Promise<void> {
+		const { data: responseData, eventType } = res
+		this.data.currentConversationRequestId.value = res.requestId
+		
+		if (!this.data.messageList.value?.length) return
+		
+		const list = [...this.data.messageList.value]
+		const index = list.findIndex((item) => item.id === currentMessageId)
+		let arraySpliceAction = 1
+		
+		const currentMessage = list.find((item) => item.id === currentMessageId) as MessageInfo
+		if (!currentMessage) return
+		
+		let newMessage: MessageInfo | null = null
+
+		// 处理不同的事件类型
+		if (eventType === ConversationEventTypeEnum.PROCESSING) {
+			const processingResult = responseData.result || {}
+			responseData.executeId = processingResult.executeId
+			newMessage = {
+				...currentMessage,
+				text: currentMessage.text || '',
+				status: MessageStatusEnum.Loading,
+				processingList: [...(currentMessage?.processingList || []), responseData] as ProcessingInfo[],
+			}
+			AgentDetailUtils.handleChatProcessingList([...(currentMessage?.processingList || []), { ...responseData }] as ProcessingInfo[], this.data)
+		}
+		
+		if (eventType === ConversationEventTypeEnum.MESSAGE) {
+			const { text, type, ext, id, finished } = responseData
+			
+			if (type === MessageModeEnum.THINK) {
+				newMessage = {
+					...currentMessage,
+					think: `${currentMessage.think}${text}`,
+					status: MessageStatusEnum.Incomplete,
+				}
+			} else if (type === MessageModeEnum.QUESTION) {
+				const accumulatedText = `${currentMessage.text}${text}`
+				
+				if (this.data.parseMarkdownInstance) {
+					this.data.parseMarkdownInstance.runTask(accumulatedText)
+					const tempMarkdownElList: markdownElItem[] = [{
+						uniqueId: AgentDetailUtils.generateUniqueId(),
+						type: 'text',
+						datasList: []
+					}]
+					newMessage = {
+						...currentMessage,
+						text: accumulatedText,
+						markdownElList: tempMarkdownElList,
+						status: finished ? null : MessageStatusEnum.Incomplete,
+					}
+				} else {
+					const markdownElements: MarkdownToken[] = (this.data.marked.lexer(accumulatedText, null) as any).tokens as MarkdownToken[]
+					const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0])
+					const newMarkdownElList: markdownElItem[] = [{
+						uniqueId: AgentDetailUtils.generateUniqueId(),
+						type: AgentDetailUtils.determineTypeFromData(datasList),
+						datasList,
+					}]
+					newMessage = {
+						...currentMessage,
+						text: accumulatedText,
+						markdownElList: newMarkdownElList,
+						status: finished ? null : MessageStatusEnum.Incomplete,
+					}
+				}
+				
+				if (ext?.length) {
+					this.data.chatSuggestList.value = ext.map((extItem: MessageQuestionExtInfo) => extItem.content) || []
+				}
+			} else {
+				// 工作流过程输出
+				if ((!this.data.messageIdRef.value || this.data.messageIdRef.value !== id) && finished) {
+					const accumulatedText = `${currentMessage.text}${text}`
+					
+					if (this.data.parseMarkdownInstance) {
+						this.data.parseMarkdownInstance.runTask(accumulatedText)
+						const tempMarkdownElList: markdownElItem[] = [{
+							uniqueId: AgentDetailUtils.generateUniqueId(),
+							type: 'text',
+							datasList: []
+						}]
+						newMessage = {
+							...currentMessage,
+							id,
+							text: accumulatedText,
+							markdownElList: tempMarkdownElList,
+							status: null,
+						}
+					} else {
+						const markdownElements: MarkdownToken[] = (this.data.marked.lexer(accumulatedText, null) as any).tokens as MarkdownToken[]
+						const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0])
+						const newMarkdownElList: markdownElItem[] = [{
+							uniqueId: AgentDetailUtils.generateUniqueId(),
+							type: AgentDetailUtils.determineTypeFromData(datasList),
+							datasList,
+						}]
+						newMessage = {
+							...currentMessage,
+							id,
+							text: accumulatedText,
+							markdownElList: newMarkdownElList,
+							status: null,
+						}
+					}
+					arraySpliceAction = 0
+				} else {
+					this.data.messageIdRef.value = id
+					const accumulatedText = `${currentMessage.text}${text}`
+					
+					if (this.data.parseMarkdownInstance) {
+						this.data.parseMarkdownInstance.runTask(accumulatedText)
+						const tempMarkdownElList: markdownElItem[] = [{
+							uniqueId: AgentDetailUtils.generateUniqueId(),
+							type: 'text',
+							datasList: []
+						}]
+						newMessage = {
+							...currentMessage,
+							text: accumulatedText,
+							markdownElList: tempMarkdownElList,
+							status: MessageStatusEnum.Incomplete,
+						}
+					} else {
+						const markdownElements: MarkdownToken[] = (this.data.marked.lexer(accumulatedText, null) as any).tokens as MarkdownToken[]
+						const datasList: MarkdownToken[][] = treeToListSdk.markTreeToList(markdownElements[0])
+						const newMarkdownElList: markdownElItem[] = [{
+							uniqueId: AgentDetailUtils.generateUniqueId(),
+							type: AgentDetailUtils.determineTypeFromData(datasList),
+							datasList,
+						}]
+						newMessage = {
+							...currentMessage,
+							text: accumulatedText,
+							markdownElList: newMarkdownElList,
+							status: MessageStatusEnum.Incomplete,
+						}
+					}
+				}
+			}
+		}
+		
+		if (eventType === ConversationEventTypeEnum.FINAL_RESULT) {
+			newMessage = {
+				...currentMessage,
+				status: MessageStatusEnum.Complete,
+				finalResult: responseData,
+				requestId: res.requestId,
+			}
+			this.data.requestId.value = res.requestId
+		}
+		
+		if (eventType === ConversationEventTypeEnum.ERROR) {
+			newMessage = {
+				...currentMessage,
+				status: MessageStatusEnum.Error,
+			}
+		}
+
+		// 更新消息列表
+		if (newMessage) {
+			list.splice(index, arraySpliceAction, newMessage as MessageInfo)
+		}
+
+		AgentDetailUtils.checkConversationActive(list, this.data)
+		this.data.messageList.value = list
+		
+		// 使用优化更新方法，只更新需要更新的组件
+		if (newMessage && newMessage.messageType === MessageTypeEnum.ASSISTANT) {
+			await nextTick()
+			// 这里需要调用组件管理器的更新方法
+			// 通过uni事件总线更新
+			uni.$emit('updateMessageComponent', {
+				messageId: currentMessageId,
+				data: {
+					markdownElList: newMessage.markdownElList,
+					text: newMessage.text,
+					status: newMessage.status
+				}
+			})
+		}
+	}
+
+	/**
+	 * 会话处理
+	 */
+	async handleConversation(
+		params: ConversationChatParams,
+		currentMessageId: string,
+	): Promise<void> {
+		try {
+			await chatService.sendMessage(
+				params,
+				// 处理流式数据
+				(chunk: string) => {
+					try {
+						const result = JSON.parse(chunk)
+						this.handleChangeMessageList(result, currentMessageId)
+					} catch (error) {
+						console.error('解析SSE数据失败:', error, '原始数据:', chunk)
+					}
+				},
+				// 完成回调
+				() => {
+					if (this.data.isSuggest.value) {
+						const responseData = apiAgentConversationChatSuggest(params as ConversationChatSuggestParams)
+						this.data.chatSuggestList.value = responseData as unknown as string[]
+					}
+				},
+				// 错误回调
+				(error: any) => {
+					console.error('Chat error:', error)
+				}
+			)
+		} catch (error) {
+			console.error('Chat error:', error)
+		}
+	}
+
+	/**
+	 * 发送消息
+	 */
+	async handleSendMessage(
+		messageInfo: string,
+		files: UploadFileInfo[] = [],
+		infos: AgentSelectedComponentInfo[] = [],
+		variableParams?: { [key: string]: string | number },
+	): Promise<void> {
+		// 安全检查：确保this.data存在
+		if (!this.data) {
+			console.error('handleSendMessage: this.data is undefined')
+			return
+		}
+		
+		// 参数验证
+		if (!messageInfo || !messageInfo.trim()) {
+			console.error('handleSendMessage: messageInfo is empty')
+			return
+		}
+		
+		if (!this.data.conversationId.value) {
+			console.error('handleSendMessage: conversationId is not set')
+			return
+		}
+		
+		const attachments: AttachmentFile[] = files?.map((file) => ({
+			fileKey: file.key || '',
+			fileUrl: file.url || '',
+			fileName: file.name || '',
+			mimeType: file.type || '',
+		})) || []
+		
+		let chatMessageId: string = ''
+		let currentMessageId: string = ''
+		
+		// #ifdef MP-WEIXIN
+		chatMessageId = uni.getRandomValues({ length: 16 }).then(res => res.randomValues.toString()) as string
+		currentMessageId = uni.getRandomValues({ length: 16 }).then(res => res.randomValues.toString()) as string
+		// #endif
+		
+		// #ifdef H5
+		chatMessageId = uuidv4() as string
+		currentMessageId = uuidv4() as string
+		// #endif
+
+		// 构造消息
+		const chatMessage = {
+			role: AssistantRoleEnum.USER,
+			type: MessageModeEnum.CHAT,
+			text: messageInfo,
+			time: new Date().toISOString(),
+			attachments,
+			id: chatMessageId,
+			messageType: MessageTypeEnum.USER,
+		}
+
+		const currentMessage = {
+			role: AssistantRoleEnum.ASSISTANT,
+			type: MessageModeEnum.CHAT,
+			text: '',
+			think: '',
+			time: new Date().toISOString(),
+			id: currentMessageId,
+			messageType: MessageTypeEnum.ASSISTANT,
+			status: MessageStatusEnum.Loading,
+			markdownElList: [],
+		} as MessageInfo
+
+		// 将Incomplete状态的消息改为Complete状态
+		const completeMessageList = this.data.messageList.value?.map((item: MessageInfo) => {
+			if (item.status === MessageStatusEnum.Incomplete) {
+				item.status = MessageStatusEnum.Complete
+			}
+			return item
+		}) || []
+		
+		// 更新消息列表
+		const newMessageList = [...completeMessageList, chatMessage, currentMessage] as MessageInfo[]
+		AgentDetailUtils.checkConversationActive(newMessageList, this.data)
+		this.data.messageList.value = newMessageList
+		
+		// 发送消息
+		const params: ConversationChatParams = {
+			conversationId: this.data.conversationId.value,
+			variableParams,
+			message: messageInfo,
+			attachments,
+			debug: false,
+			selectedComponents: infos,
+		}
+		this.handleConversation(params, currentMessageId)
+	}
+
+	/**
+	 * 创建新会话
+	 */
+	async createNewConversation(): Promise<void> {
+		if (!this.data.agentId.value) {
+			uni.showToast({
+				title: '智能体id不存在',
+				icon: 'none',
+				type: 'error'
+			})
+			return
+		}
+		
+		this.data.messageList.value = []
+		
+		const conversationParams: ConversationCreateParams = {
+			agentId: this.data.agentId.value,
+			devMode: true
+		}
+		
+		const { code, data: responseData, message } = await apiAgentConversationCreate(conversationParams)
+		
+		if (code === SUCCESS_CODE && responseData && responseData.id) {
+			this.data.conversationId.value = responseData.id
+		} else {
+			uni.showToast({
+				title: message,
+				icon: 'none',
+				type: 'error'
+			})
+		}
+	}
+
+	/**
+	 * 获取基本信息
+	 */
+	async getPublishedAgentInfo(withConversationId: boolean = false, messageInfo: string = '', files: UploadFileInfo[] = []): Promise<void> {
+		const { code, data: responseData, message } = await apiPublishedAgentInfo(this.data.agentId.value, withConversationId)
+		
+		if (code === SUCCESS_CODE) {
+			this.data.agentInfo.value = responseData
+			if (withConversationId) {
+				this.data.conversationId.value = responseData.conversationId
+				// 只有当有实际内容时才发送消息
+				if (messageInfo && messageInfo.trim() && files?.length > 0) {
+					this.handleSendMessage(messageInfo, files, [], {})
+				}
+			}
+		} else {
+			uni.showToast({
+				title: message,
+				icon: 'none',
+				type: 'error'
+			})
+		}
+	}
+
+	/**
+	 * 收藏/取消收藏
+	 */
+	async handleCollect(): Promise<void> {
+		if (!this.data.agentInfo.value) return
+		
+		if (this.data.agentInfo.value.collect) {
+			const { code } = await apiUnCollectAgent(this.data.agentInfo.value.agentId)
+			if (code === SUCCESS_CODE) {
+				uni.showToast({
+					title: '已取消收藏',
+					icon: 'success',
+					duration: 2000
+				})
+				this.data.agentInfo.value.collect = false
+			}
+		} else {
+			const { code } = await apiCollectAgent(this.data.agentInfo.value.agentId)
+			if (code === SUCCESS_CODE) {
+				uni.showToast({
+					title: '已添加到收藏',
+					icon: 'success',
+					duration: 2000
+				})
+				this.data.agentInfo.value.collect = true
+			}
+		}
+	}
+}

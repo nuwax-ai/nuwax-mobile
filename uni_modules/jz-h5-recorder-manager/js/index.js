@@ -88,7 +88,10 @@ class H5RecorderManager {
       const mimeType = this._getMimeType(config.format);
 
       if (!MediaRecorder.isTypeSupported(mimeType)) {
-        console.warn(`不支持${config.format}格式，将使用默认格式`);
+        uni.showToast({
+          title: `不支持${config.format}格式，将使用默认格式`,
+          icon: "none",
+        });
       }
 
       this.mediaRecorder = new MediaRecorder(stream, {
@@ -97,6 +100,7 @@ class H5RecorderManager {
           : undefined,
         audioBitsPerSecond: config.encodeBitRate,
       });
+      console.log(stream, this.mediaRecorder.mimeType);
 
       this.audioChunks = [];
       this.startTime = Date.now();

@@ -371,7 +371,6 @@ const registry = new ExtensionRegistry()
 registry.register(mathInlineExtension)
 registry.register(mathBlockExtension)
 registry.register(mermaidExtension)
-registry.register(alertExtension)
 registry.register(containerExtension)
 
 // 配置Lexer选项

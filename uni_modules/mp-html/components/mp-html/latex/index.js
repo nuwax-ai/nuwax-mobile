@@ -2,7 +2,7 @@
  * @fileoverview latex 插件
  * katex.min.js来源 https://github.com/rojer95/katex-mini
  */
-import parse from "./katex.min.js";
+import parse from "./katex.min";
 
 function Latex() {}
 
@@ -24,18 +24,7 @@ Latex.prototype.onParse = function (node, vm) {
           } else {
             if (status === 1) {
               // 行内公式
-              let nodes = [];
-              try {
-                nodes = parse(part[i], {
-                  displayMode: false,
-                  throwError: false,
-                });
-              } catch (error) {
-                console.error("error", error);
-                nodes = part[i];
-              }
-              console.log("nodes:inline", nodes);
-
+              const nodes = parse.default(part[i]);
               children.push({
                 name: "span",
                 attrs: {},
@@ -45,11 +34,9 @@ Latex.prototype.onParse = function (node, vm) {
               });
             } else {
               // 块公式
-              const nodes = parse(part[i], {
+              const nodes = parse.default(part[i], {
                 displayMode: true,
-                throwError: true,
               });
-              console.log("nodes:block", nodes);
               children.push({
                 name: "div",
                 attrs: {

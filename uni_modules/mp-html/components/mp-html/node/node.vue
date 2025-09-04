@@ -1757,6 +1757,8 @@ export default {
   display: block;
   margin: 1em 0;
   text-align: center;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 /deep/ .katex-display > .katex {
   display: block;

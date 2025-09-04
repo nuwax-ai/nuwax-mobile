@@ -63,20 +63,33 @@ Highlight.prototype.onParse = function (node, vm) {
           name: "div",
           attrs: {
             class: "hl-language",
-            style: "user-select:none",
           },
           children: [
             {
               type: "text",
               text: lang,
             },
+            {
+              name: "div",
+              attrs: {
+                class: "hl-copy-btn",
+                "data-content": text,
+                "data-action": "copy",
+              },
+              children: [
+                {
+                  type: "text",
+                  text: "复制代码",
+                },
+              ],
+            },
           ],
         });
       }
       if (config.copyByLongPress) {
         node.attrs.style += (node.attrs.style || "") + ";user-select:none";
-        node.attrs["data-content"] = text;
-        vm.expose();
+        // node.attrs["data-content"] = text;
+        // vm.expose();
       }
       if (config.showLineNumber) {
         const line = text.split("\n").length;

@@ -105,7 +105,7 @@
       <!-- 富文本 -->
       <!-- #ifdef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
       <rich-text v-else-if="!n.c && (n.l || !handler.isInline(n.name, n.attrs.style))" :id="n.attrs.id" :style="n.f"
-        :user-select="opts[4]" :nodes="[n]" />
+        :user-select="opts[4]" :nodes="[n]" @tap.stop="copyCode" />
       <!-- #endif -->
       <!-- #ifndef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
       <rich-text v-else-if="!n.c" :id="n.attrs.id" :style="'display:inline;' + n.f" :preview="false"
@@ -435,6 +435,35 @@ export default {
             }
           })
         }
+      }
+    },
+
+    /**
+     * @description 复制代码事件
+     * @param {Event} e
+     */
+    copyCode (e) {
+      const data = e.srcElement.dataset || e.currentTarget.dataset
+      if(!data || data.action !== 'copy') {
+        return
+      }
+      const content = data.content
+      
+      if (content) {
+        // 实现复制到剪贴板功能
+        uni.setClipboardData({
+          data: content,
+          success: () => {
+            uni.showToast({
+              title: '复制成功',
+            })
+          },
+          fail: () => {
+            uni.showToast({
+              title: '复制失败',
+            })
+          }
+        })
       }
     },
 

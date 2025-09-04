@@ -4,7 +4,6 @@
  * Include github-markdown-css (https://github.com/sindresorhus/github-markdown-css)
  */
 import MarkdownIt from "markdown-it";
-// import markdownItKatexGpt from "markdown-it-katex-gpt";
 import markdownItContainer from "markdown-it-container";
 let index = 0;
 
@@ -16,13 +15,6 @@ const md = new MarkdownIt({
   breaks: false, // 将换行符转换为 <br> 标签
   langPrefix: "language-",
 });
-// md.use(markdownItKatexGpt, {
-//   delimiters: [
-//     { left: "\\[", right: "\\]", display: true },
-//     { left: "\\(", right: "\\)", display: false },
-//     { left: "$$", right: "$$", display: false },
-//   ],
-// });
 
 md.use(markdownItContainer, "container", {
   validate: function (params) {
@@ -57,9 +49,7 @@ Markdown.prototype.onUpdate = function (content) {
       /\*\*([^*]+)\*\*([，。！？；：])/g,
       "**$1**&#8203;$2"
     );
-    console.log("markdown-it content", content);
     const result = md.render(content);
-    console.log("markdown-it result", result);
     return result;
   }
 };

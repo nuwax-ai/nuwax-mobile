@@ -18,9 +18,7 @@ Markdown.prototype.onUpdate = function (content) {
       /\*\*([^*]+)\*\*([，。！？；：])/g,
       "**$1**&#8203;$2"
     );
-    console.log("marked content", content);
     const result = marked(content);
-    console.log("marked result", result);
     return result;
   }
 };

@@ -127,6 +127,19 @@ function makeMap(str) {
 }
 
 /**
+ * @description 设置节点的暴露标记
+ * @param {Object} node 节点对象
+ * @param {Number} defaultValue 默认值
+ */
+function setNodeExposeFlag(node, defaultValue = 1) {
+  node.c = defaultValue;
+  // MODIFYE: 这里有自定义修改 这里有一个逻辑 ul ol 不需要暴露，但是需要处理
+  if (node.name === "ul" || node.name === "ol") {
+    node.c = 0;
+  }
+}
+
+/**
  * @description 解码 html 实体
  * @param {String} str 要解码的字符串
  * @param {Boolean} amp 要不要解码 &amp;
@@ -244,7 +257,7 @@ Parser.prototype.expose = function () {
       item.name === "audio"
     )
       return;
-    item.c = 1;
+    setNodeExposeFlag(item, 1);
   }
   // #endif
 };
@@ -606,7 +619,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
               }
             }
             // #endif
-            item.c = 1;
+            setNodeExposeFlag(item, 1);
           }
           attrs.i = this.imgList.length.toString();
           let src = attrs["original-src"] || attrs.src;
@@ -964,7 +977,7 @@ Parser.prototype.popNode = function () {
     }
     for (let i = children.length; i--; ) {
       if (children[i].name === "li") {
-        children[i].c = 1;
+        setNodeExposeFlag(children[i], 0);
       }
     }
   } else if (node.name === "table") {
@@ -1254,7 +1267,7 @@ Parser.prototype.popNode = function () {
         }
         // #endif
         if (!child.c || child.name === "table") {
-          node.c = 1;
+          setNodeExposeFlag(node, 1);
         }
       }
     })(node);

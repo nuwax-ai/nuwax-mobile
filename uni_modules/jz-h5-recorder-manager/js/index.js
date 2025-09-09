@@ -69,6 +69,7 @@ class H5RecorderManager {
         },
       })
       .then((stream) => {
+        console.log('获取麦克风权限成功: stream', stream);
         this._initRecorder(stream, config);
       })
       .catch((error) => {

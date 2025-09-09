@@ -66,16 +66,26 @@ Markdown.prototype.onParse = function (node, vm) {
       this.vm._ids[node.attrs.id] = id;
       node.attrs.id = id;
     }
+    console.log(node.name);
+
     if (
-      node.name === "p" ||
-      node.name === "table" ||
-      node.name === "tr" ||
-      node.name === "th" ||
-      node.name === "td" ||
-      node.name === "blockquote" ||
-      node.name === "pre" ||
-      node.name === "hr" ||
-      node.name === "code"
+      [
+        "p",
+        "table",
+        "tr",
+        "th",
+        "td",
+        "blockquote",
+        "pre",
+        "hr",
+        "code",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+      ].includes(node.name)
     ) {
       node.attrs.class = `md-${node.name} ${node.attrs.class || ""}`;
     }

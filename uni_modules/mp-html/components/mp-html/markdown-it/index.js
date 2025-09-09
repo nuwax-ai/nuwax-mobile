@@ -66,7 +66,6 @@ Markdown.prototype.onParse = function (node, vm) {
       this.vm._ids[node.attrs.id] = id;
       node.attrs.id = id;
     }
-    console.log(node.name);
 
     if (
       [

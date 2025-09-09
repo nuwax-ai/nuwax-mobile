@@ -1,13 +1,26 @@
 import { StreamRequestConfig, StreamChunk } from '@/types/interfaces/chat'
+import { createSSEConnection } from '@/servers/useRequest.uts'
+
+// 全局错误处理 - 捕获未处理的 AbortError
+if (typeof window !== 'undefined') {
+  window.addEventListener('unhandledrejection', (event) => {
+    if (event.reason && event.reason.name === 'AbortError') {
+      console.log('捕获到未处理的 AbortError，已静默处理')
+      event.preventDefault() // 阻止默认的错误处理
+    }
+  })
+}
 
 // 流式请求工具类
 export class StreamRequest {
   private requestTask: RequestTask | null = null
   private isAborted: boolean = false
+  private abortController: AbortController | null = null
 
   // 发起流式请求
   async request(config: StreamRequestConfig): Promise<void> {
     this.isAborted = false
+    this.abortController = new AbortController()
     
     try {
       // #ifdef H5
@@ -23,70 +36,71 @@ export class StreamRequest {
       // #endif
       
     } catch (error) {
-      if (!this.isAborted) {
-        config.onError?.(error)
+      // 如果是用户主动中止，不触发错误回调
+      if (error.name === 'AbortError' || this.isAborted) {
+        console.log('请求已被中止')
+        return
       }
+      config.onError?.(error)
     }
   }
 
   // H5环境下的流式请求
   private async requestH5(config: StreamRequestConfig): Promise<void> {
     // #ifdef H5
-    const response = await fetch(config.url, {
-      method: config.method,
-      headers: config.headers as any,
-      body: config.body ? JSON.stringify(config.body) : undefined
-    })
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
-    }
-
-    const reader = response.body?.getReader()
-    if (!reader) {
-      throw new Error('No response body')
-    }
-
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    while (true) {
-      if (this.isAborted) break
-
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (line.trim() === '') continue
-        
-        if (line.startsWith('data:')) {
-          const data = line.slice(5)
-
+    try {
+      await createSSEConnection({
+        url: config.url,
+        method: config.method,
+        headers: config.headers as any,
+        body: config.body,
+        abortController: this.abortController,
+        onMessage: (data: any) => {
+          if (this.isAborted) return
+          
           try {
-            const parseData = JSON.parse(data)
-            if (parseData.completed) {
+            // 检查是否完成
+            if (data && data.completed) {
               config.onComplete?.()
               return
             }
-          } catch (e) {
-            console.error('Parse chunk error:', e)
-          }
-          
-          try {
+            
+            // 处理数据块
             const chunk: StreamChunk = {
               type: 'content',
-              data: data
+              data: data ? JSON.stringify(data) : ''
             }
             config.onChunk?.(chunk)
           } catch (e) {
             console.error('Parse chunk error:', e)
           }
+        },
+        onError: (error: Error) => {
+          // 如果是中止错误，不触发错误回调
+          if (error.name === 'AbortError' || this.isAborted) {
+            console.log('SSE连接已被中止')
+            return
+          }
+          config.onError?.(error)
+        },
+        onOpen: (response: any) => {
+          console.log('SSE连接已建立:', response)
+        },
+        onClose: () => {
+          console.log('SSE连接已关闭')
         }
+      })
+    } catch (error) {
+      // 捕获所有可能的错误，包括 AbortError
+      if (error.message === 'Connection aborted by user' || 
+          error.name === 'AbortError' || 
+          this.isAborted) {
+        console.log('SSE连接已被中止')
+        return
       }
+      // 只有真正的错误才触发错误回调
+      config.onError?.(error)
+      throw error // 重新抛出非中止错误
     }
     // #endif
   }
@@ -186,6 +200,14 @@ export class StreamRequest {
   // 中止请求
   abort(): void {
     this.isAborted = true
+    
+    // 中止 H5 的 SSE 连接
+    if (this.abortController) {
+      this.abortController.abort()
+      this.abortController = null
+    }
+    
+    // 中止小程序和 App 的请求
     if (this.requestTask) {
       this.requestTask.abort()
       this.requestTask = null

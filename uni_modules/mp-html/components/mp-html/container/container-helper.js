@@ -50,7 +50,7 @@ const getCustomBlock = (beforeText, { type, name, executeId, status }) => {
     executeId,
     type,
     status,
-    name: name || "",
+    name: "",
   });
 
   return `${beforeText}${blockContent}`;

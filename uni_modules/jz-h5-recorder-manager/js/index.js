@@ -58,7 +58,17 @@ class H5RecorderManager {
       typeof navigator.mediaDevices === "undefined" ||
       !navigator.mediaDevices.getUserMedia
     ) {
-      this._triggerError("当前浏览器不支持录音功能");
+      // 这里做一个消息原因增加说明
+      const isHttpsProtocol =
+        (typeof window !== "undefined" &&
+          window.location.protocol === "https:") ||
+        false;
+
+      const msg = !isHttpsProtocol
+        ? "需要在HTTPS模式下且同意浏览器录音授权时支持语音"
+        : "当前浏览器不支持录音功能";
+
+      this._triggerError(msg);
       return;
     }
 
@@ -71,7 +81,7 @@ class H5RecorderManager {
         },
       })
       .then((stream) => {
-        console.log('获取麦克风权限成功: stream', stream);
+        console.log("获取麦克风权限成功: stream", stream);
         if (this.touchEndCancelFlag) {
           this.touchEndCancelFlag = false;
           return;

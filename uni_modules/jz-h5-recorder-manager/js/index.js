@@ -19,6 +19,8 @@ class H5RecorderManager {
     this.startTime = null;
     this.isPaused = false;
     this.isRecording = false;
+    // 触摸结束取消录音(自定义变量)
+    this.touchEndCancelFlag = false;
 
     // 事件回调函数
     this.callbacks = {
@@ -70,6 +72,10 @@ class H5RecorderManager {
       })
       .then((stream) => {
         console.log('获取麦克风权限成功: stream', stream);
+        if (this.touchEndCancelFlag) {
+          this.touchEndCancelFlag = false;
+          return;
+        }
         this._initRecorder(stream, config);
       })
       .catch((error) => {
@@ -248,6 +254,7 @@ class H5RecorderManager {
     this.mediaRecorder = null;
     this.audioChunks = [];
     this.startTime = null;
+    this.touchEndCancelFlag = false;
   }
 
   // 事件监听方法
@@ -352,6 +359,8 @@ class H5RecorderManager {
   }
 
   _triggerResume() {
+    // 重置触摸结束取消录音标志
+    this.touchEndCancelFlag = false;
     this.callbacks.onResume.forEach((callback) => {
       try {
         callback();
@@ -362,6 +371,8 @@ class H5RecorderManager {
   }
 
   _triggerStop(result) {
+    // 重置触摸结束取消录音标志
+    this.touchEndCancelFlag = false;
     this.callbacks.onStop.forEach((callback) => {
       try {
         callback(result);
@@ -372,6 +383,8 @@ class H5RecorderManager {
   }
 
   _triggerError(errMsg) {
+    // 重置触摸结束取消录音标志
+    this.touchEndCancelFlag = false;
     this.callbacks.onError.forEach((callback) => {
       try {
         callback({ errMsg });
@@ -382,6 +395,8 @@ class H5RecorderManager {
   }
 
   _triggerFrameRecorded(frameBuffer, isLastFrame = false) {
+    // 重置触摸结束取消录音标志
+    this.touchEndCancelFlag = false;
     this.callbacks.onFrameRecorded.forEach((callback) => {
       try {
         callback({

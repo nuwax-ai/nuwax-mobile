@@ -11,13 +11,13 @@ const config = {
 
   // 块级标签（转为 div，其他的非信任标签转为 span）
   blockTags: makeMap(
-    "address,article,aside,body,caption,center,cite,footer,header,html,nav,pre,section"
+    "address,article,aside,body,caption,center,footer,header,html,nav,pre,section"
   ),
 
   // #ifdef (MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE3
   // 行内标签
   inlineTags: makeMap(
-    "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup"
+    "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
   ),
   // #endif
 

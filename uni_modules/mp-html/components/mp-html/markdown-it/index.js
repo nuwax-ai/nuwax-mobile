@@ -86,6 +86,7 @@ Markdown.prototype.onParse = function (node, vm) {
         "h6",
       ].includes(node.name)
     ) {
+      if (node.name === "table") node.f = "overflow-x: auto;display:block";
       node.attrs.class = `md-${node.name} ${node.attrs.class || ""}`;
     }
   }

@@ -32,6 +32,10 @@ export interface CascaderProps {
 	  * 父子节点选中状态不再关联，可各自选中或取消
 	  */
 	checkStrictly: boolean;
+	/**
+	  * 是否支持多选
+	  */
+	multiple?: boolean;
 	options : UTSJSONObject[];
 	/**
 		* 标题

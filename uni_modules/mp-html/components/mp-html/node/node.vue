@@ -105,7 +105,7 @@
       <!-- 富文本 -->
       <!-- #ifdef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
       <rich-text v-else-if="!n.c && (n.l || !handler.isInline(n.name, n.attrs.style))" :id="n.attrs.id" :style="n.f"
-        :user-select="opts[4]" :nodes="[n]" @tap.stop="copyCode" />
+        :user-select="opts[4]" :nodes="[n]" @tap="copyCode" />
       <!-- #endif -->
       <!-- #ifndef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
       <rich-text v-else-if="!n.c" :id="n.attrs.id" :style="'display:inline;' + n.f" :preview="false"

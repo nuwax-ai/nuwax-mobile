@@ -13,11 +13,14 @@
 				</view>
 			</view>
 			<view class="tool-actions">
-				<view class="action-icon" @tap="handleShowDetails">
-					<uni-icons class="iconfont icon-List" size="18" color="#999"></uni-icons>
+				<view class="action-icon" @tap.stop.prevent="handleShowDetails">
+					<uni-icons class="iconfont icon-List" size="18" color="#333"></uni-icons>
 				</view>
-				<view class="action-icon" @tap="handleCopyToClipboard">
+				<view class="action-icon" @tap.stop.prevent="handleCopyToClipboard">
 					<uni-icons class="iconfont icon-Copy" size="18" color="#333"></uni-icons>
+				</view>
+				<view class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
+					<uni-icons type="eye" size="18" color="#333"></uni-icons>
 				</view>
 			</view>
 		</view>
@@ -49,6 +52,7 @@
 
 <script>
 import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue'
+import { ProcessingEnum } from '@/types/enums/common.uts';
 
 export default {
 	name: 'Container',
@@ -82,11 +86,20 @@ export default {
 		data: {
 			handler(newData) {
 				this.toolCall = newData
+				if (newData.status === ProcessingEnum.EXECUTING) {
+					this.openPreviewPage(newData);
+				}
 			},
 			immediate: true
 		}
 	},
 	methods: {
+
+		// 打开预览页面
+		openPreviewPage(data) {
+			uni.$emit('page_preview_executing', data);
+		},
+
 		// 切换展开状态
 		toggleExpanded() {
 			this.expanded = !this.expanded

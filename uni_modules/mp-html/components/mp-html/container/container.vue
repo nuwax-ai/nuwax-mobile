@@ -52,7 +52,7 @@
 
 <script>
 import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue'
-import { ProcessingEnum } from '@/types/enums/common.uts';
+// import { ProcessingEnum } from '@/types/enums/common.uts';
 import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
 
 export default {
@@ -83,16 +83,16 @@ export default {
 			}
 		}
 	},
-	watch: {
-		data: {
-			handler(newData) {
-				if (newData.status === ProcessingEnum.EXECUTING) {
-					this.openPreviewPage(newData);
-				}
-			},
-			immediate: true
-		}
-	},
+	// watch: {
+	// 	data: {
+	// 		handler(newData) {
+	// 			if (newData.status === ProcessingEnum.EXECUTING) {
+	// 				this.openPreviewPage(newData);
+	// 			}
+	// 		},
+	// 		immediate: true
+	// 	}
+	// },
 	methods: {
 
 		// 打开预览页面

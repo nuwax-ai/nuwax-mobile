@@ -19,7 +19,7 @@
 				<view class="action-icon" @tap.stop.prevent="handleCopyToClipboard">
 					<uni-icons class="iconfont icon-Copy" size="18" color="#333"></uni-icons>
 				</view>
-				<view class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
+				<view v-if="isPageType(toolCall)" class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
 					<uni-icons type="eye" size="18" color="#333"></uni-icons>
 				</view>
 			</view>
@@ -53,6 +53,7 @@
 <script>
 import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue'
 import { ProcessingEnum } from '@/types/enums/common.uts';
+import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
 
 export default {
 	name: 'Container',
@@ -85,7 +86,6 @@ export default {
 	watch: {
 		data: {
 			handler(newData) {
-				this.toolCall = newData
 				if (newData.status === ProcessingEnum.EXECUTING) {
 					this.openPreviewPage(newData);
 				}
@@ -222,6 +222,9 @@ export default {
 			} else {
 				return `${(time / 60000).toFixed(2)}min`
 			}
+		},
+		isPageType(toolCall){
+			return toolCall.type === AgentComponentTypeEnum.Page;
 		}
 	}
 }

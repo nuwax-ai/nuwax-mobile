@@ -93,7 +93,7 @@ export default {
   },
   methods: {
 
-    // 打开预览页面
+    // 打开页面首页
     openPreviewPage(data) {
       uni.$emit('page_preview_executing', data);
     },

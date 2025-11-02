@@ -2,6 +2,19 @@
  * @fileoverview html 解析器
  */
 
+/**
+ * @description 创建 map
+ * @param {String} str 逗号分隔
+ */
+function makeMap(str) {
+  const map = Object.create(null);
+  const list = str.split(",");
+  for (let i = list.length; i--; ) {
+    map[list[i]] = true;
+  }
+  return map;
+}
+
 // 配置
 const config = {
   // 信任的标签（保持标签名不变）
@@ -13,13 +26,6 @@ const config = {
   blockTags: makeMap(
     "address,article,aside,body,caption,center,footer,header,html,nav,pre,section"
   ),
-
-  // #ifdef (MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE3
-  // 行内标签
-  inlineTags: makeMap(
-    "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
-  ),
-  // #endif
 
   // 要移除的标签
   ignoreTags: makeMap(
@@ -92,17 +98,25 @@ if (uni.canIUse("getWindowInfo")) {
   windowWidth = uni.getWindowInfo().windowWidth;
   system = uni.getDeviceInfo().system;
 } else {
-  // #endif
   const systemInfo = uni.getSystemInfoSync();
   windowWidth = systemInfo.windowWidth;
-  // #ifdef MP-WEIXIN
   system = systemInfo.system;
 }
+// #endif
+// #ifndef MP-WEIXIN
+const systemInfo = uni.getSystemInfoSync();
+windowWidth = systemInfo.windowWidth;
 // #endif
 const blankChar = makeMap(" ,\r,\n,\t,\f");
 let idIndex = 0;
 
-// #ifdef H5 || APP-PLUS
+// #ifdef H5
+config.ignoreTags.iframe = undefined;
+config.trustTags.iframe = true;
+config.ignoreTags.embed = undefined;
+config.trustTags.embed = true;
+// #endif
+// #ifdef APP-PLUS
 config.ignoreTags.iframe = undefined;
 config.trustTags.iframe = true;
 config.ignoreTags.embed = undefined;
@@ -112,19 +126,30 @@ config.trustTags.embed = true;
 config.ignoreTags.source = undefined;
 config.ignoreTags.style = undefined;
 // #endif
-
-/**
- * @description 创建 map
- * @param {String} str 逗号分隔
- */
-function makeMap(str) {
-  const map = Object.create(null);
-  const list = str.split(",");
-  for (let i = list.length; i--; ) {
-    map[list[i]] = true;
-  }
-  return map;
-}
+// #ifdef MP-WEIXIN
+// 行内标签配置（微信小程序）
+config.inlineTags = makeMap(
+  "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
+);
+// #endif
+// #ifdef MP-QQ
+// 行内标签配置（QQ小程序）
+config.inlineTags = makeMap(
+  "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
+);
+// #endif
+// #ifdef APP-PLUS
+// 行内标签配置（App）
+config.inlineTags = makeMap(
+  "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
+);
+// #endif
+// #ifdef MP-360
+// 行内标签配置（360小程序）
+config.inlineTags = makeMap(
+  "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
+);
+// #endif
 
 /**
  * @description 解码 html 实体
@@ -280,15 +305,19 @@ Parser.prototype.getUrl = function (url) {
     } else if (domain) {
       // 否则补充整个域名
       url = domain + url;
-    } /* #ifdef APP-PLUS */ else {
+    } else {
+      // #ifdef APP-PLUS
       url = plus.io.convertLocalFileSystemURL(url);
-    } /* #endif */
+      // #endif
+    }
   } else if (!url.includes("data:") && !url.includes("://")) {
     if (domain) {
       url = domain + "/" + url;
-    } /* #ifdef APP-PLUS */ else {
+    } else {
+      // #ifdef APP-PLUS
       url = plus.io.convertLocalFileSystemURL(url);
-    } /* #endif */
+      // #endif
+    }
   }
   return url;
 };
@@ -393,7 +422,19 @@ Parser.prototype.onTagName = function (name) {
  */
 Parser.prototype.onAttrName = function (name) {
   name = this.xml ? name : name.toLowerCase();
-  // #ifdef (VUE3 && (H5 || APP-PLUS)) || APP-PLUS-NVUE
+  // #ifdef APP-PLUS-NVUE
+  if (name.includes("?") || name.includes(";")) {
+    this.attrName = undefined;
+    return;
+  }
+  // #endif
+  // #ifdef H5
+  if (name.includes("?") || name.includes(";")) {
+    this.attrName = undefined;
+    return;
+  }
+  // #endif
+  // #ifdef APP-PLUS
   if (name.includes("?") || name.includes(";")) {
     this.attrName = undefined;
     return;
@@ -463,7 +504,8 @@ Parser.prototype.onOpenTag = function (selfClose) {
 
   // 转换 embed 标签
   if (node.name === "embed") {
-    // #ifndef H5 || APP-PLUS
+    // #ifndef H5
+    // #ifndef APP-PLUS
     const src = attrs.src || "";
     // 按照后缀名和 type 将 embed 转为 video 或 audio
     if (
@@ -487,7 +529,11 @@ Parser.prototype.onOpenTag = function (selfClose) {
     }
     attrs.controls = "T";
     // #endif
-    // #ifdef H5 || APP-PLUS
+    // #endif
+    // #ifdef H5
+    this.expose();
+    // #endif
+    // #ifdef APP-PLUS
     this.expose();
     // #endif
   }
@@ -519,15 +565,19 @@ Parser.prototype.onOpenTag = function (selfClose) {
       // 通过 base 标签设置主域名
       if (node.name === "base" && !this.options.domain) {
         this.options.domain = attrs.href;
-      } /* #ifndef APP-PLUS-NVUE */ else if (
-        node.name === "source" &&
-        parent &&
-        (parent.name === "video" || parent.name === "audio") &&
-        attrs.src
-      ) {
-        // 设置 source 标签（仅父节点为 video 或 audio 时有效）
-        parent.src.push(attrs.src);
-      } /* #endif */
+      } else {
+        // #ifndef APP-PLUS-NVUE
+        if (
+          node.name === "source" &&
+          parent &&
+          (parent.name === "video" || parent.name === "audio") &&
+          attrs.src
+        ) {
+          // 设置 source 标签（仅父节点为 video 或 audio 时有效）
+          parent.src.push(attrs.src);
+        }
+        // #endif
+      }
       return;
     }
 
@@ -567,7 +617,8 @@ Parser.prototype.onOpenTag = function (selfClose) {
               }
               styleObj.display = undefined;
             }
-            // #ifndef H5 || APP-PLUS
+            // #ifndef H5
+            // #ifndef APP-PLUS
             const style = item.attrs.style || "";
             if (
               style.includes("flex:") &&
@@ -606,11 +657,15 @@ Parser.prototype.onOpenTag = function (selfClose) {
               }
             }
             // #endif
+            // #endif
             item.c = 1;
           }
           attrs.i = this.imgList.length.toString();
           let src = attrs["original-src"] || attrs.src;
-          // #ifndef H5 || MP-ALIPAY || APP-PLUS || MP-360
+          // #ifndef H5
+          // #ifndef MP-ALIPAY
+          // #ifndef APP-PLUS
+          // #ifndef MP-360
           if (this.imgList.includes(src)) {
             // 如果有重复的链接则对域名进行随机大小写变换避免预览时错位
             let i = src.indexOf("://");
@@ -626,11 +681,20 @@ Parser.prototype.onOpenTag = function (selfClose) {
             }
           }
           // #endif
+          // #endif
+          // #endif
+          // #endif
           this.imgList.push(src);
           if (!node.t) {
             this.imgList._unloadimgs += 1;
           }
-          // #ifdef H5 || APP-PLUS
+          // #ifdef H5
+          if (this.options.lazyLoad) {
+            attrs["data-src"] = attrs.src;
+            attrs.src = undefined;
+          }
+          // #endif
+          // #ifdef APP-PLUS
           if (this.options.lazyLoad) {
             attrs["data-src"] = attrs.src;
             attrs.src = undefined;
@@ -681,7 +745,12 @@ Parser.prototype.onOpenTag = function (selfClose) {
       }
     }
     attrs.style = attrs.style.substr(1) || undefined;
-    // #ifdef (MP-WEIXIN || MP-QQ) && VUE3
+    // #ifdef MP-WEIXIN
+    if (!attrs.style) {
+      delete attrs.style;
+    }
+    // #endif
+    // #ifdef MP-QQ
     if (!attrs.style) {
       delete attrs.style;
     }
@@ -922,17 +991,25 @@ Parser.prototype.popNode = function () {
 
   if (
     node.name === "a" ||
-    node.name === "ad" ||
-    // #ifdef H5 || APP-PLUS
-    node.name === "iframe" // eslint-disable-line
-    // #endif
+    node.name === "ad"
   ) {
     this.expose();
-  } else if (node.name === "video") {
+  }
+  // #ifdef H5
+  else if (node.name === "iframe") {
+    this.expose();
+  }
+  // #endif
+  // #ifdef APP-PLUS
+  else if (node.name === "iframe") {
+    this.expose();
+  }
+  // #endif
+  else if (node.name === "video") {
     if ((styleObj.height || "").includes("auto")) {
       styleObj.height = undefined;
     }
-    /* #ifdef APP-PLUS */
+    // #ifdef APP-PLUS
     let str = '<video style="width:100%;height:100%"';
     for (const item in attrs) {
       if (attrs[item]) {
@@ -949,7 +1026,7 @@ Parser.prototype.popNode = function () {
     }
     str += "</video>";
     node.html = str;
-    /* #endif */
+    // #endif
   } else if ((node.name === "ul" || node.name === "ol") && node.c) {
     // 列表处理
     const types = {
@@ -1243,7 +1320,37 @@ Parser.prototype.popNode = function () {
       node.c = 2;
       for (let i = node.children.length; i--; ) {
         const child = node.children[i];
-        // #ifdef (MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE3
+        // #ifdef MP-WEIXIN
+        if (
+          child.name &&
+          (config.inlineTags[child.name] ||
+            ((child.attrs.style || "").includes("inline") && child.children)) &&
+          !child.c
+        ) {
+          traversal(child);
+        }
+        // #endif
+        // #ifdef MP-QQ
+        if (
+          child.name &&
+          (config.inlineTags[child.name] ||
+            ((child.attrs.style || "").includes("inline") && child.children)) &&
+          !child.c
+        ) {
+          traversal(child);
+        }
+        // #endif
+        // #ifdef APP-PLUS
+        if (
+          child.name &&
+          (config.inlineTags[child.name] ||
+            ((child.attrs.style || "").includes("inline") && child.children)) &&
+          !child.c
+        ) {
+          traversal(child);
+        }
+        // #endif
+        // #ifdef MP-360
         if (
           child.name &&
           (config.inlineTags[child.name] ||
@@ -1270,17 +1377,16 @@ Parser.prototype.popNode = function () {
     }
   }
   // flex 布局时部分样式需要提取到 rich-text 外层
+  let flexCheck = !node.c;
+  // #ifdef MP-WEIXIN
+  // 检查基础库版本 virtualHost 是否可用
+  flexCheck = !(node.c && wx.getNFCAdapter);
+  // #endif
   const flex =
     parent &&
     ((parent.attrs.style || "").includes("flex") ||
       (parent.attrs.style || "").includes("grid")) &&
-    // #ifdef MP-WEIXIN
-    // 检查基础库版本 virtualHost 是否可用
-    !(node.c && wx.getNFCAdapter) && // eslint-disable-line
-    // #endif
-    // #ifndef MP-WEIXIN || MP-QQ || MP-BAIDU || MP-TOUTIAO
-    !node.c; // eslint-disable-line
-  // #endif
+    flexCheck;
   if (flex) {
     node.f = ";max-width:100%";
   }
@@ -1297,7 +1403,7 @@ Parser.prototype.popNode = function () {
   for (const key in styleObj) {
     if (styleObj[key]) {
       const val = `;${key}:${styleObj[key].replace(" !important", "")}`;
-      /* #ifndef APP-PLUS-NVUE */
+      // #ifndef APP-PLUS-NVUE
       if (
         flex &&
         ((key.includes("flex") && key !== "flex-direction") ||
@@ -1310,13 +1416,24 @@ Parser.prototype.popNode = function () {
         if (key === "width") {
           attrs.style += ";width:100%";
         }
-      } /* #endif */ else {
+      } else {
         attrs.style += val;
       }
+      // #endif
+      // #ifdef APP-PLUS-NVUE
+      attrs.style += val;
+      // #endif
     }
   }
   attrs.style = attrs.style.substr(1) || undefined;
-  // #ifdef (MP-WEIXIN || MP-QQ) && VUE3
+  // #ifdef MP-WEIXIN
+  for (const key in attrs) {
+    if (!attrs[key]) {
+      delete attrs[key];
+    }
+  }
+  // #endif
+  // #ifdef MP-QQ
   for (const key in attrs) {
     if (!attrs[key]) {
       delete attrs[key];
@@ -1360,7 +1477,13 @@ Parser.prototype.onText = function (text) {
   }
   const node = Object.create(null);
   node.type = "text";
-  // #ifdef (MP-BAIDU || MP-ALIPAY || MP-TOUTIAO) && VUE3
+  // #ifdef MP-BAIDU
+  node.attrs = {};
+  // #endif
+  // #ifdef MP-ALIPAY
+  node.attrs = {};
+  // #endif
+  // #ifdef MP-TOUTIAO
   node.attrs = {};
   // #endif
   node.text = decodeEntity(text);

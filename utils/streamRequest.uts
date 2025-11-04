@@ -18,10 +18,12 @@ export class StreamRequest {
   private requestTask: RequestTask | null = null
   private isAborted: boolean = false
   private abortController: AbortController | null = null
+  private buffer: string = '' // 用于缓存不完整的数据行
 
   // 发起流式请求
   async request(config: StreamRequestConfig): Promise<void> {
     this.isAborted = false
+    this.buffer = '' // 重置缓冲区
     
     // #ifdef H5
     // 只在 H5 环境中创建 AbortController
@@ -158,38 +160,67 @@ export class StreamRequest {
           const uint8Array = new Uint8Array(res.data as ArrayBuffer)
           const str = new TextDecoder('utf-8').decode(uint8Array)
           
-          // 处理 SSE 格式的数据流
-          const lines = str.split('\n')
+          console.log('[SSE] 接收到分块数据, 长度:', str.length)
+          
+          // 将新数据添加到缓冲区
+          this.buffer += str
+          
+          // 按行分割，最后一行可能不完整
+          const lines = this.buffer.split('\n')
+          
+          // 保存最后一行（可能不完整）
+          this.buffer = lines.pop() || ''
+          
+          // 处理完整的行
           for (const line of lines) {
             if (line.trim() === '') continue
             
             if (line.startsWith('data:')) {
               const content = line.slice(5).trim()
               
+              // 跳过空内容
+              if (!content) {
+                console.log('[SSE] 跳过空内容行')
+                continue
+              }
+              
+              console.log('[SSE] 处理数据行, 长度:', content.length, '前50字符:', content.substring(0, 50))
+              
               // 检查是否完成
               if (content === '[DONE]') {
+                console.log('[SSE] 收到完成标记 [DONE]')
                 config.onComplete?.()
                 resolve()
                 return
               }
               
-              // 尝试解析 JSON 数据
-              try {
-                const data = JSON.parse(content)
-                if (data && data.completed) {
-                  config.onComplete?.()
-                  resolve()
-                  return
+              // 检查是否看起来像 JSON (以 { 或 [ 开头)
+              const looksLikeJSON = content.startsWith('{') || content.startsWith('[')
+              
+              if (looksLikeJSON) {
+                // 尝试解析 JSON 数据
+                try {
+                  const data = JSON.parse(content)
+                  if (data && data.completed) {
+                    console.log('[SSE] 收到完成标记 completed')
+                    config.onComplete?.()
+                    resolve()
+                    return
+                  }
+                  
+                  // 处理数据块
+                  const chunk: StreamChunk = {
+                    type: 'content',
+                    data: content
+                  }
+                  config.onChunk?.(chunk)
+                } catch (e) {
+                  // JSON 解析失败，说明数据可能还是不完整，暂时跳过
+                  console.log('[SSE] JSON 解析失败，可能数据不完整:', e, '内容长度:', content.length)
                 }
-                
-                // 处理数据块
-                const chunk: StreamChunk = {
-                  type: 'content',
-                  data: content
-                }
-                config.onChunk?.(chunk)
-              } catch (e) {
-                // 如果不是 JSON，直接作为内容处理
+              } else {
+                // 不是 JSON 格式，直接作为内容处理
+                console.log('[SSE] 非 JSON 格式，直接处理')
                 const chunk: StreamChunk = {
                   type: 'content',
                   data: content
@@ -239,27 +270,51 @@ export class StreamRequest {
 
   // 处理流式响应数据
   private handleStreamResponse(data: string, config: StreamRequestConfig): void {
+    console.log('[SSE-APP] 处理流式响应数据, 长度:', data.length)
     const lines = data.split('\n')
     
     for (const line of lines) {
       if (line.trim() === '') continue
       
       if (line.startsWith('data:')) {
-        const content = line.slice(5)
+        const content = line.slice(5).trim()
+        
+        // 跳过空内容
+        if (!content) {
+          console.log('[SSE-APP] 跳过空内容行')
+          continue
+        }
+        
+        console.log('[SSE-APP] 处理数据行:', content)
+        
+        // 检查是否完成
         if (content === '[DONE]') {
+          console.log('[SSE-APP] 收到完成标记 [DONE]')
           config.onComplete?.()
           return
         }
-				try {
-				  const parseData = JSON.parse(data)
-				  if (parseData.completed) {
-				    config.onComplete?.()
-				    return
-				  }
-				} catch (e) {
-				  console.error('Parse chunk error:', e)
-				}
         
+        // 检查是否看起来像 JSON (以 { 或 [ 开头)
+        const looksLikeJSON = content.startsWith('{') || content.startsWith('[')
+        
+        if (looksLikeJSON) {
+          // 尝试解析 JSON 数据
+          try {
+            const parseData = JSON.parse(content)
+            if (parseData && parseData.completed) {
+              console.log('[SSE-APP] 收到完成标记 completed')
+              config.onComplete?.()
+              return
+            }
+          } catch (e) {
+            // JSON 解析失败，继续处理为普通数据
+            console.log('[SSE-APP] JSON 解析失败，作为普通内容处理')
+          }
+        } else {
+          console.log('[SSE-APP] 非 JSON 格式，直接处理')
+        }
+        
+        // 处理数据块
         try {
           const chunk: StreamChunk = {
             type: 'content',
@@ -267,7 +322,7 @@ export class StreamRequest {
           }
           config.onChunk?.(chunk)
         } catch (e) {
-          console.error('Parse chunk error:', e)
+          console.error('[SSE-APP] 处理数据块失败:', e)
         }
       }
     }
@@ -276,6 +331,7 @@ export class StreamRequest {
   // 中止请求
   abort(): void {
     this.isAborted = true
+    this.buffer = '' // 清空缓冲区
     
     // #ifdef H5
     // 中止 H5 的 SSE 连接

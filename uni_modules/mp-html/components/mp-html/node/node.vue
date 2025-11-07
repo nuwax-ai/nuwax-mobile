@@ -108,8 +108,8 @@
         :user-select="opts[4]" :nodes="[n]" @tap="copyCode" />
       <!-- #endif -->
       <!-- #ifndef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
-      <rich-text v-else-if="!n.c" :id="n.attrs.id" :style="'display:inline;' + n.f" :preview="false"
-        :selectable="opts[4]" :user-select="opts[4]" :nodes="[n]" />
+      <rich-text v-else-if="!n.c" :id="n.attrs.id" :style="'display:inline;'+ n.f" :class="n.name==='div' && n.attrs?.class==='event'?'div-event-style':''" :preview="false"
+        :selectable="opts[4]" :user-select="opts[4]" :nodes="[n]" @tap="handleCurrentTap(n)"/>
       <!-- #endif -->
       <!-- 继续递归 -->
       <view v-else-if="n.c === 2" :id="n.attrs.id" :class="'_block _' + n.name + ' ' + n.attrs.class"
@@ -466,6 +466,17 @@ export default {
         })
       }
     },
+    /**
+     * @description 当前节点点击事件
+     * @param {Event} e
+     */
+    handleCurrentTap(e){
+      // #ifdef MP-WEIXIN
+      if (e.name==='div' && e.attrs?.class==='event') {
+        uni.$emit('message-event-delegate', e)
+      }
+      // #endif
+    },
 
     /**
      * @description 错误事件
@@ -510,4 +521,27 @@ export default {
 
 <style lang="scss">
 @import '../styles/index.scss';
+
+// 会话输出内容点击事件
+// 事件绑定配置样式
+.div-event-style{
+  display: inline-block !important;
+  font-size: 12px;
+  margin: 0 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  max-width: 100px;
+  min-width: 18px;
+  border-radius: 24px;
+  color: rgba(0, 0, 0, 60%) !important;
+  background-color: rgba(0, 0, 0, 5%);
+  line-height: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  &:hover {
+    background-color: rgba(235, 235, 235);
+  }
+}
 </style>

@@ -20,7 +20,7 @@
           <uni-icons class="iconfont icon-Copy" size="18" color="#333"></uni-icons>
         </view>
         <view v-if="isPageType(toolCall)" class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
-          <uni-icons type="eye" size="18" color="#333"></uni-icons>
+          <uni-icons class="iconfont icon-eye-open" size="18" color="#333"></uni-icons>
         </view>
       </view>
     </view>

@@ -6,21 +6,20 @@
         <text class="tool-name">{{ toolCall.name || toolCall.type }}</text>
         <view class="tool-status-display">
           <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
-            <uni-icons :class="getStatusIconType(toolCall.status)" size="16"
-              :color="getStatusIconColor(toolCall.status)"></uni-icons>
+              <text :class="getStatusIconType(toolCall.status)" :style="{color: getStatusIconColor(toolCall.status),fontSize: '32rpx'}"></text>
           </view>
           <text class="tool-status-text">{{ getStatusText(toolCall.status) }}</text>
         </view>
       </view>
       <view class="tool-actions">
         <view class="action-icon" @tap.stop.prevent="handleShowDetails">
-          <uni-icons class="iconfont icon-List" size="18" color="#333"></uni-icons>
+          <text class="iconfont icon-List"></text>
         </view>
         <view class="action-icon" @tap.stop.prevent="handleCopyToClipboard">
-          <uni-icons class="iconfont icon-Copy" size="18" color="#333"></uni-icons>
+          <text class="iconfont icon-Copy"></text>
         </view>
         <view v-if="isPageType(toolCall)" class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
-          <uni-icons class="iconfont icon-eye-open" size="18" color="#333"></uni-icons>
+          <text class="iconfont icon-eye-open"></text>
         </view>
       </view>
     </view>
@@ -154,10 +153,10 @@ export default {
     getStatusIconType(status) {
       const iconMap = {
         'EXECUTING': 'icon-Loader',    // 执行中显示加载图标
-        'FINISHED': 'icon-a-Checkcircle', // 已完成显示对勾
+        'FINISHED': 'icon-Check', // 已完成显示对勾
         'FAILED': 'icon-X'     // 执行失败显示叉号
       }
-      return ` iconfont ${iconMap[status] || 'icon-a-Checkcircle'}`
+      return ` iconfont ${iconMap[status] || 'icon-Check'}`
     },
 
     // 获取状态图标样式类
@@ -315,6 +314,13 @@ export default {
         border-radius: 6rpx;
         transition: background-color 0.3s ease;
         cursor: pointer;
+
+        .iconfont {
+          font-size: 36rpx;
+          font-weight: 400;
+          color: #333;
+          line-height: 36rpx;
+        }
 
         &:hover {
           background-color: #f0f0f0;

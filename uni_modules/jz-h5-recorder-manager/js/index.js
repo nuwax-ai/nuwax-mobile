@@ -40,7 +40,7 @@ class H5RecorderManager {
       sampleRate: 44100, // 采样率，有效值 8000/16000/44100
       numberOfChannels: 1, // 录音通道数，有效值 1/2
       encodeBitRate: 192000, // 编码码率，有效值见下表格
-      format: "mp3", // 音频格式，有效值 aac/mp3/wav/PCM
+      format: 'mp3', // 音频格式，有效值 aac/mp3/wav/PCM
       frameSize: null, // 指定帧大小，单位 KB
     };
   }
@@ -48,25 +48,25 @@ class H5RecorderManager {
   // 开始录音
   start(options = {}) {
     if (this.isRecording) {
-      this._triggerError("录音已在进行中");
+      this._triggerError('录音已在进行中');
       return;
     }
 
     const config = Object.assign({}, this.defaultOptions, options);
     // 检查浏览器支持
     if (
-      typeof navigator.mediaDevices === "undefined" ||
+      typeof navigator.mediaDevices === 'undefined' ||
       !navigator.mediaDevices.getUserMedia
     ) {
       // 这里做一个消息原因增加说明
       const isHttpsProtocol =
-        (typeof window !== "undefined" &&
-          window.location.protocol === "https:") ||
+        (typeof window !== 'undefined' &&
+          window.location.protocol === 'https:') ||
         false;
 
       const msg = !isHttpsProtocol
-        ? "需要在HTTPS模式下且同意浏览器录音授权时支持语音"
-        : "当前浏览器不支持录音功能";
+        ? '需要在HTTPS模式下且同意浏览器录音授权时支持语音'
+        : '当前浏览器不支持录音功能';
 
       this._triggerError(msg);
       return;
@@ -80,17 +80,17 @@ class H5RecorderManager {
           channelCount: config.numberOfChannels,
         },
       })
-      .then((stream) => {
-        console.log("获取麦克风权限成功: stream", stream);
+      .then(stream => {
+        console.log('获取麦克风权限成功: stream', stream);
         if (this.touchEndCancelFlag) {
           this.touchEndCancelFlag = false;
           return;
         }
         this._initRecorder(stream, config);
       })
-      .catch((error) => {
-        console.error("获取麦克风权限失败:", error);
-        this._triggerError("获取麦克风权限失败: " + error.message);
+      .catch(error => {
+        console.error('获取麦克风权限失败:', error);
+        this._triggerError('获取麦克风权限失败: ' + error.message);
       });
   }
 
@@ -105,10 +105,10 @@ class H5RecorderManager {
       const mimeType = this._getMimeType(config.format);
 
       if (!MediaRecorder.isTypeSupported(mimeType)) {
-        // uni.showToast({
-        //   title: `不支持${config.format}格式，将使用默认格式`,
-        //   icon: "none",
-        // });
+        uni.showToast({
+          title: `不支持${config.format}格式，将使用默认格式`,
+          icon: 'none',
+        });
       }
 
       this.mediaRecorder = new MediaRecorder(stream, {
@@ -125,7 +125,7 @@ class H5RecorderManager {
       this.isPaused = false;
 
       // 设置事件监听
-      this.mediaRecorder.ondataavailable = (event) => {
+      this.mediaRecorder.ondataavailable = event => {
         if (event.data.size > 0) {
           this.audioChunks.push(event.data);
 
@@ -140,8 +140,8 @@ class H5RecorderManager {
         this._handleRecordStop(config);
       };
 
-      this.mediaRecorder.onerror = (event) => {
-        this._triggerError("录音过程中出现错误: " + event.error);
+      this.mediaRecorder.onerror = event => {
+        this._triggerError('录音过程中出现错误: ' + event.error);
       };
 
       // 开始录音
@@ -164,20 +164,20 @@ class H5RecorderManager {
       // 触发开始事件
       this._triggerStart();
     } catch (error) {
-      console.error("初始化录音器失败:", error);
-      this._triggerError("初始化录音器失败: " + error.message);
+      console.error('初始化录音器失败:', error);
+      this._triggerError('初始化录音器失败: ' + error.message);
     }
   }
 
   // 获取MIME类型
   _getMimeType(format) {
     const mimeTypes = {
-      mp3: "audio/mpeg",
-      wav: "audio/wav",
-      aac: "audio/aac",
-      PCM: "audio/wav",
+      mp3: 'audio/mpeg',
+      wav: 'audio/wav',
+      aac: 'audio/aac',
+      PCM: 'audio/wav',
     };
-    return mimeTypes[format] || "audio/webm";
+    return mimeTypes[format] || 'audio/webm';
   }
 
   // 暂停录音
@@ -186,7 +186,7 @@ class H5RecorderManager {
       return;
     }
 
-    if (this.mediaRecorder && this.mediaRecorder.state === "recording") {
+    if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
       this.mediaRecorder.pause();
       this.isPaused = true;
       this._triggerPause();
@@ -199,7 +199,7 @@ class H5RecorderManager {
       return;
     }
 
-    if (this.mediaRecorder && this.mediaRecorder.state === "paused") {
+    if (this.mediaRecorder && this.mediaRecorder.state === 'paused') {
       this.mediaRecorder.resume();
       this.isPaused = false;
       this._triggerResume();
@@ -212,13 +212,13 @@ class H5RecorderManager {
       return;
     }
 
-    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
       this.mediaRecorder.stop();
     }
 
     // 停止所有音频轨道
     if (this.mediaRecorder && this.mediaRecorder.stream) {
-      this.mediaRecorder.stream.getTracks().forEach((track) => track.stop());
+      this.mediaRecorder.stream.getTracks().forEach(track => track.stop());
     }
 
     this.isRecording = false;
@@ -228,7 +228,7 @@ class H5RecorderManager {
   // 处理录音停止
   _handleRecordStop(config) {
     if (this.audioChunks.length === 0) {
-      this._triggerError("没有录制到音频数据");
+      this._triggerError('没有录制到音频数据');
       return;
     }
 
@@ -269,72 +269,72 @@ class H5RecorderManager {
 
   // 事件监听方法
   onStart(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onStart.push(callback);
     }
   }
 
   onPause(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onPause.push(callback);
     }
   }
 
   onResume(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onResume.push(callback);
     }
   }
 
   onStop(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onStop.push(callback);
     }
   }
 
   onError(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onError.push(callback);
     }
   }
 
   onFrameRecorded(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onFrameRecorded.push(callback);
     }
   }
 
   onInterruptionBegin(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onInterruptionBegin.push(callback);
     }
   }
 
   onInterruptionEnd(callback) {
-    if (typeof callback === "function") {
+    if (typeof callback === 'function') {
       this.callbacks.onInterruptionEnd.push(callback);
     }
   }
 
   // 移除事件监听方法（支付宝小程序兼容）
   offStart(callback) {
-    this._removeCallback("onStart", callback);
+    this._removeCallback('onStart', callback);
   }
 
   offPause(callback) {
-    this._removeCallback("onPause", callback);
+    this._removeCallback('onPause', callback);
   }
 
   offResume(callback) {
-    this._removeCallback("onResume", callback);
+    this._removeCallback('onResume', callback);
   }
 
   offStop(callback) {
-    this._removeCallback("onStop", callback);
+    this._removeCallback('onStop', callback);
   }
 
   offFrameRecorded(callback) {
-    this._removeCallback("onFrameRecorded", callback);
+    this._removeCallback('onFrameRecorded', callback);
   }
 
   // 移除回调函数
@@ -349,21 +349,21 @@ class H5RecorderManager {
 
   // 触发事件的私有方法
   _triggerStart() {
-    this.callbacks.onStart.forEach((callback) => {
+    this.callbacks.onStart.forEach(callback => {
       try {
         callback();
       } catch (error) {
-        console.error("onStart callback error:", error);
+        console.error('onStart callback error:', error);
       }
     });
   }
 
   _triggerPause() {
-    this.callbacks.onPause.forEach((callback) => {
+    this.callbacks.onPause.forEach(callback => {
       try {
         callback();
       } catch (error) {
-        console.error("onPause callback error:", error);
+        console.error('onPause callback error:', error);
       }
     });
   }
@@ -371,11 +371,11 @@ class H5RecorderManager {
   _triggerResume() {
     // 重置触摸结束取消录音标志
     this.touchEndCancelFlag = false;
-    this.callbacks.onResume.forEach((callback) => {
+    this.callbacks.onResume.forEach(callback => {
       try {
         callback();
       } catch (error) {
-        console.error("onResume callback error:", error);
+        console.error('onResume callback error:', error);
       }
     });
   }
@@ -383,11 +383,11 @@ class H5RecorderManager {
   _triggerStop(result) {
     // 重置触摸结束取消录音标志
     this.touchEndCancelFlag = false;
-    this.callbacks.onStop.forEach((callback) => {
+    this.callbacks.onStop.forEach(callback => {
       try {
         callback(result);
       } catch (error) {
-        console.error("onStop callback error:", error);
+        console.error('onStop callback error:', error);
       }
     });
   }
@@ -395,11 +395,11 @@ class H5RecorderManager {
   _triggerError(errMsg) {
     // 重置触摸结束取消录音标志
     this.touchEndCancelFlag = false;
-    this.callbacks.onError.forEach((callback) => {
+    this.callbacks.onError.forEach(callback => {
       try {
         callback({ errMsg });
       } catch (error) {
-        console.error("onError callback error:", error);
+        console.error('onError callback error:', error);
       }
     });
   }
@@ -407,14 +407,14 @@ class H5RecorderManager {
   _triggerFrameRecorded(frameBuffer, isLastFrame = false) {
     // 重置触摸结束取消录音标志
     this.touchEndCancelFlag = false;
-    this.callbacks.onFrameRecorded.forEach((callback) => {
+    this.callbacks.onFrameRecorded.forEach(callback => {
       try {
         callback({
           frameBuffer,
           isLastFrame,
         });
       } catch (error) {
-        console.error("onFrameRecorded callback error:", error);
+        console.error('onFrameRecorded callback error:', error);
       }
     });
   }

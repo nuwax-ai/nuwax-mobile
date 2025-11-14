@@ -105,10 +105,10 @@ class H5RecorderManager {
       const mimeType = this._getMimeType(config.format);
 
       if (!MediaRecorder.isTypeSupported(mimeType)) {
-        uni.showToast({
-          title: `不支持${config.format}格式，将使用默认格式`,
-          icon: "none",
-        });
+        // uni.showToast({
+        //   title: `不支持${config.format}格式，将使用默认格式`,
+        //   icon: "none",
+        // });
       }
 
       this.mediaRecorder = new MediaRecorder(stream, {

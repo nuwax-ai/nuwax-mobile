@@ -20,11 +20,15 @@ export class StreamRequest {
   private isAborted: boolean = false
   private abortController: AbortController | null = null
   private buffer: string = '' // 用于缓存不完整的数据行
+  private messageBuffer: string = '' // 用于缓存跨行的完整消息
+  private pendingBytes: Uint8Array = new Uint8Array(0) // 用于缓存不完整的 UTF-8 字节序列
 
   // 发起流式请求
   async request(config: StreamRequestConfig): Promise<void> {
     this.isAborted = false
     this.buffer = '' // 重置缓冲区
+    this.messageBuffer = '' // 重置消息缓冲区
+    this.pendingBytes = new Uint8Array(0) // 重置字节缓冲区
     
     // #ifdef H5
     // 只在 H5 环境中创建 AbortController
@@ -124,6 +128,115 @@ export class StreamRequest {
     // #endif
   }
 
+  // 处理完整的 SSE 消息
+  private processSSEMessage(content: string, config: StreamRequestConfig, resolve: (value: void | PromiseLike<void>) => void): void {
+    // 检查是否完成
+    if (content === '[DONE]') {
+      console.log('[SSE] 收到完成标记 [DONE]')
+      config.onComplete?.()
+      resolve()
+      return
+    }
+    
+    // 检查是否看起来像 JSON (以 { 或 [ 开头)
+    const looksLikeJSON = content.startsWith('{') || content.startsWith('[')
+    
+    if (looksLikeJSON) {
+      // 尝试解析 JSON 数据
+      try {
+        const data = JSON.parse(content)
+        if (data && data.completed) {
+          console.log('[SSE] 收到完成标记 completed')
+          config.onComplete?.()
+          resolve()
+          return
+        }
+        
+        // 处理数据块
+        const chunk: StreamChunk = {
+          type: 'content',
+          data: content
+        }
+        config.onChunk?.(chunk)
+      } catch (e) {
+        console.log('[SSE] JSON 解析失败，内容:', content)
+      }
+    } else {
+      // 不是 JSON 格式，直接作为内容处理
+      const chunk: StreamChunk = {
+        type: 'content',
+        data: content
+      }
+      config.onChunk?.(chunk)
+    }
+  }
+
+  // 处理 UTF-8 字节流，处理分片造成的字符截断问题
+  private decodeUTF8(chunk: ArrayBuffer): string {
+    const newBytes = new Uint8Array(chunk)
+    let combined = newBytes
+    
+    if (this.pendingBytes.length > 0) {
+      combined = new Uint8Array(this.pendingBytes.length + newBytes.length)
+      combined.set(this.pendingBytes)
+      combined.set(newBytes, this.pendingBytes.length)
+      this.pendingBytes = new Uint8Array(0)
+    }
+    
+    if (combined.length === 0) return ''
+    
+    // 寻找最后一个安全的字节边界
+    let safeEnd = combined.length
+    let i = combined.length - 1
+    let backtrack = 0
+    
+    // 向前回溯，检查末尾是否被截断
+    // UTF-8 最大字符长度为 4 字节
+    while (backtrack < 4 && i >= 0) {
+      const b = combined[i]
+      
+      // ASCII (0xxxxxxx) - 字符结束，且是单字节，安全
+      if ((b & 0x80) === 0) {
+        // 如果我们是回溯过程中遇到的 ASCII，说明之前回溯过的字节（在 ASCII 之后）是孤立的或不完整的？
+        // 比如 [ASCII, Cont, Cont]，我们在 Cont 回溯。
+        // 遇到 ASCII，说明后面的 Cont 没有 Start byte，是无效的。
+        // 但如果是 [ASCII]，backtrack=0，safeEnd=length。
+        // 这里的逻辑：遇到 ASCII，说明前面的序列都结束了。
+        // 那么从 i+1 到 length 的字节就是我们回溯过的“剩余字节”。
+        safeEnd = combined.length - backtrack
+        break
+      }
+      
+      // Start byte (11xxxxxx)
+      if ((b & 0xC0) === 0xC0) {
+        let need = 2
+        if ((b & 0xE0) === 0xE0) need = 3
+        else if ((b & 0xF0) === 0xF0) need = 4
+        
+        const have = combined.length - i
+        if (have < need) {
+          // 不完整，需要保留从 i 开始的所有字节
+          safeEnd = i
+        } else {
+          // 完整
+          safeEnd = combined.length
+        }
+        break
+      }
+      
+      i--
+      backtrack++
+    }
+    
+    // 如果 safeEnd 小于总长度，保存剩余字节
+    if (safeEnd < combined.length) {
+      this.pendingBytes = combined.slice(safeEnd)
+      return utf8ArrayToString(combined.slice(0, safeEnd))
+    }
+    
+    return utf8ArrayToString(combined)
+  }
+
   // 微信小程序环境下的流式请求
   private async requestWeapp(config: StreamRequestConfig): Promise<void> {
     // #ifdef MP-WEIXIN
@@ -135,17 +248,27 @@ export class StreamRequest {
         data: config.body,
         enableChunked: true, // 启用分块传输
         responseType: 'arraybuffer', // 响应类型
+        timeout: 1000*60*60*12, // 设置超时时间为 12小时
         success: (res) => {
           if (res.statusCode === 200) {
             // 流式数据通过 onChunkReceived 接收，success 仅表示请求建立成功
             // 实际的流式数据处理在 onChunkReceived 回调中
             config.onOpen?.(res)
+            resolve() // 请求成功建立连接后即可 resolve
           } else {
             reject(new Error(`HTTP error! status: ${res.statusCode}`))
           }
         },
         fail: (err) => {
           if (!this.isAborted) {
+            // 忽略超时错误，因为对于长连接流式请求，超时是预期内的行为
+            // 只要 connection 还在接收数据，就不应该视为真正的错误
+            if (err.errMsg && (err.errMsg.includes('time out') || err.errMsg.includes('timeout'))) {
+              console.log('请求超时警告（流式请求正常现象）:', err)
+              // 不 reject，也不触发 onError，保持连接继续接收数据
+              return
+            }
+
             config.onError?.(err)
             reject(err)
           }
@@ -157,13 +280,8 @@ export class StreamRequest {
         if (this.isAborted) return
         
         try {
-          const uint8Array = new Uint8Array(res.data as ArrayBuffer)
-          // #ifdef MP-WEIXIN
-          const str = utf8ArrayToString(uint8Array)
-          // #endif
-          // #ifndef MP-WEIXIN
-          const str = new TextDecoder('utf-8').decode(uint8Array)
-          // #endif
+          // 使用 decodeUTF8 处理分块数据，解决字符截断问题
+          const str = this.decodeUTF8(res.data as ArrayBuffer)
           
           // console.log('[SSE] 接收到分块数据, 长度:', str.length)
           
@@ -178,20 +296,16 @@ export class StreamRequest {
           
           // 处理完整的行
           for (const line of lines) {
-            if (line.trim() === '') continue
-            
             if (line.startsWith('data:')) {
-              const content = line.slice(5).trim()
-              
-              // 跳过空内容
-              if (!content) {
-                console.log('[SSE] 跳过空内容行')
-                continue
+              // 1. 如果有之前缓存的消息，先处理它
+              if (this.messageBuffer.length > 0) {
+                this.processSSEMessage(this.messageBuffer, config, resolve)
+                this.messageBuffer = ''
               }
               
-              // console.log('[SSE] 处理数据行, 长度:', content.length, '前50字符:', content.substring(0, 50))
+              const content = line.slice(5).trim()
               
-              // 检查是否完成
+              // 检查是否是直接的结束标记
               if (content === '[DONE]') {
                 console.log('[SSE] 收到完成标记 [DONE]')
                 config.onComplete?.()
@@ -199,38 +313,12 @@ export class StreamRequest {
                 return
               }
               
-              // 检查是否看起来像 JSON (以 { 或 [ 开头)
-              const looksLikeJSON = content.startsWith('{') || content.startsWith('[')
-              
-              if (looksLikeJSON) {
-                // 尝试解析 JSON 数据
-                try {
-                  const data = JSON.parse(content)
-                  if (data && data.completed) {
-                    console.log('[SSE] 收到完成标记 completed')
-                    config.onComplete?.()
-                    resolve()
-                    return
-                  }
-                  
-                  // 处理数据块
-                  const chunk: StreamChunk = {
-                    type: 'content',
-                    data: content
-                  }
-                  config.onChunk?.(chunk)
-                } catch (e) {
-                  // JSON 解析失败，说明数据可能还是不完整，暂时跳过
-                  console.log('[SSE] JSON 解析失败，可能数据不完整:', e, '内容长度:', content.length)
-                }
-              } else {
-                // 不是 JSON 格式，直接作为内容处理
-                console.log('[SSE] 非 JSON 格式，直接处理')
-                const chunk: StreamChunk = {
-                  type: 'content',
-                  data: content
-                }
-                config.onChunk?.(chunk)
+              this.messageBuffer = content
+            } else {
+              // 2. 不是 data: 开头，如果是后续行，拼接到当前缓存
+              // 只有在已经在接收消息的过程中才拼接
+              if (this.messageBuffer.length > 0) {
+                this.messageBuffer += '\n' + line
               }
             }
           }

@@ -39,7 +39,7 @@
 					:name="info.name"
 					:description="info.description"
 					@click="handleAgentClick(info)"
-					@longpress="handleDeleteUserUsedAgent(info)"
+					@longpress="hasToken() ? handleDeleteUserUsedAgent(info) : () => {}"
 				/>
 			</template>
 
@@ -65,6 +65,9 @@
 				</view>
 			</template>
 		</scroll-view>
+		
+		<!-- 登录弹窗 -->
+		<auth-login-popup ref="loginPopupRef" @login-success="handleLoginSuccessFromPopup" />
 	</view>
 </template>
 
@@ -73,6 +76,9 @@
 	import { apiUserInfo } from '@/servers/account'
 	import type { AgentInfo } from '@/types/interfaces/agent'
 	import { apiUserUsedAgentList, apiUserUsedAgentDelete } from '@/servers/agentDev'
+	import { apiPublishedAgentList } from '@/servers/square'
+	import type { SquarePublishedListParams, SquarePublishedItemInfo } from '@/types/interfaces/square'
+	import type { Page, RequestResponse } from '@/types/interfaces/request'
 	import RecentUsedAgentItem from '@/components/recent-used-agent-item/recent-used-agent-item.uvue'
 	import HeaderMenu from './header-menu/header-menu.uvue'
 	import type { UserInfo } from '@/types/interfaces/login'
@@ -83,9 +89,23 @@
 	import { onAddToFavorites } from '@dcloudio/uni-app'
 	import { USER_NO_LOGIN, REDIRECT_LOGIN } from '@/constants/codes.constants'
 	import { getCurrentPagePath } from '@/utils/commonBusiness'
+	import AuthLoginPopup from '@/components/auth-login-popup/auth-login-popup.uvue'
+	import { ACCESS_TOKEN } from '@/constants/home.constants'
+	import { useAuthInterceptor } from '@/hooks/useAuthInterceptor'
 
 	// 头部菜单ref
 	const headerMenuRef = ref<any>(null)
+	// 使用登录拦截 composable
+	const { loginPopupRef, handleAgentClick: baseHandleAgentClick, handleLoginSuccess, checkAuthAndShowPopup } = useAuthInterceptor()
+	
+	// 包装 handleAgentClick 以适配 AgentInfo 类型
+	const handleAgentClick = (info: AgentInfo) => {
+		baseHandleAgentClick({
+			agentId: info.agentId,
+			name: info.name,
+			agentType: info.agentType
+		})
+	}
 
 	// 最近使用智能体列表
 	const recentAgentList = ref<AgentInfo[]>([])
@@ -104,6 +124,12 @@
 	const showNoMore = computed(() => {
 		return !loading.value && !hasMore.value && recentAgentList.value?.length > 8
 	})
+
+	// 检查是否有 token
+	const hasToken = (): boolean => {
+		const token = uni.getStorageSync(ACCESS_TOKEN)
+		return !!token
+	}
 
 	// 查询当前登录用户信息
 	const fetchUserInfo = async () => {
@@ -139,6 +165,42 @@
     } catch (error) {
       return false
     }
+	}
+
+	// 获取公开的智能体列表（未登录时使用）
+	const fetchPublishedAgentList = async () => {
+		try {
+			const params: SquarePublishedListParams = {
+				targetType: AgentComponentTypeEnum.Agent,
+				targetSubType: 'ChatBot',
+				page: 1,
+				pageSize: 10,
+				category: '',
+				kw: '',
+			}
+			const res = await apiPublishedAgentList(params)
+			loading.value = false
+			const { code, data } = res as unknown as RequestResponse<Page<SquarePublishedItemInfo>>
+			if (code === SUCCESS_CODE) {
+				const newList = data.records || []
+				// 转换为 AgentInfo 格式
+				const agentList: AgentInfo[] = newList.map((item: SquarePublishedItemInfo) => ({
+					id: item.id,
+					agentId: item.targetId,
+					name: item.name,
+					icon: item.icon,
+					description: item.description,
+					agentType: item.agentType,
+				} as AgentInfo))
+				recentAgentList.value = agentList
+				// 只显示第一页，所以没有更多数据
+				hasMore.value = false
+				currentPage.value = 1
+				return agentList
+			}
+		} catch (error) {
+			return false
+		}
 	}
 
 	// 删除最近使用的智能体
@@ -177,7 +239,9 @@
 		refreshing.value = true
 		currentPage.value = 1
 		hasMore.value = true
-		fetchUserUsedAgentList().finally(() => {
+		// 根据是否有 token 调用不同的 API
+		const fetchPromise = hasToken() ? fetchUserUsedAgentList() : fetchPublishedAgentList()
+		fetchPromise.finally(() => {
 			// 添加延迟，让loading效果更明显
 			setTimeout(() => {
 				refreshing.value = false
@@ -194,19 +258,29 @@
 		}
 	}
 
-	// 点击智能体
-	const handleAgentClick = (info: AgentInfo) => {
-		jumpToAgentDetailPage(info.agentId, null, info.agentType, info.name)
+	// 登录成功后的回调（扩展 composable 的回调）
+	const handleLoginSuccessFromPopup = () => {
+		// 重新获取用户信息
+		fetchUserInfo()
+		// 调用 composable 的登录成功回调
+		handleLoginSuccess()
 	}
 
 	onPageShow(async () => {
 		loading.value = true
-		const list = await fetchUserUsedAgentList(1, 20 * currentPage.value)
+		// 根据是否有 token 调用不同的 API
+		const list = hasToken() 
+			? await fetchUserUsedAgentList(1, 20 * currentPage.value)
+			: await fetchPublishedAgentList()
+		
     if (list) { // 如果列表为空，则跳转到租户配置的默认的智能体首页
       handleEmptyRecentAgentList(list)
     }
 
-		fetchUserInfo()
+		// 只有在有 token 时才调用 getLoginInfo
+		if (hasToken()) {
+			fetchUserInfo()
+		}
 	})
 
   const handleEmptyRecentAgentList = async (list) => {// 如果列表为空，就跳转到租户配置的默认的智能体首页			recentAgentList.value = list
@@ -227,6 +301,10 @@
 
 	// 处理搜索
 	const handleSearch = () => {
+		// 检查登录状态，如果未登录则显示登录弹窗
+		if (!checkAuthAndShowPopup()) {
+			return
+		}
 		const currentUrl = getCurrentPagePath()
 		uni.navigateTo({
 			url: '/subpackages/agent-search/agent-search?type=Home&backUrl=' + encodeURIComponent(currentUrl)

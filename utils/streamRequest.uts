@@ -21,6 +21,14 @@ export class StreamRequest {
   private abortController: AbortController | null = null
   private buffer: string = '' // 用于缓存不完整的 SSE 消息（以 \n\n 为完整标记）
   private pendingBytes: Uint8Array = new Uint8Array(0) // 用于缓存不完整的 UTF-8 字节序列
+  
+  // #ifdef MP-WEIXIN
+  // 微信小程序数据流超时监控
+  private lastChunkReceivedTime: number = 0 // 最后一次接收数据的时间戳
+  private timeoutCheckTimer: any = null // 超时检查定时器（使用 any 类型以兼容不同平台）
+  private readonly TIMEOUT_DURATION: number = 60000 // 超时时长 60 秒
+  private timeoutCallback: (() => void) | null = null // 超时回调
+  // #endif
 
   // 发起流式请求
   async request(config: StreamRequestConfig): Promise<void> {
@@ -31,6 +39,14 @@ export class StreamRequest {
     // #ifdef H5
     // 只在 H5 环境中创建 AbortController
     this.abortController = new AbortController()
+    // #endif
+    
+    // #ifdef MP-WEIXIN
+    // 清除可能存在的旧定时器（重要：避免定时器泄漏）
+    console.log('[超时监控] 新请求开始，清除旧定时器')
+    this.clearTimeoutMonitor()
+    // 保存超时回调
+    this.timeoutCallback = config.onTimeout || null
     // #endif
     
     try {
@@ -131,6 +147,14 @@ export class StreamRequest {
     // 检查是否完成
     if (content === '[DONE]') {
       console.log('[SSE] 收到完成标记 [DONE]')
+      
+      // #ifdef MP-WEIXIN
+      // 清除超时监控
+      console.log('[SSE] [DONE] 标记触发，准备清除定时器，当前 timer ID:', this.timeoutCheckTimer)
+      this.clearTimeoutMonitor()
+      console.log('[SSE] [DONE] 标记处理完成，定时器已清除')
+      // #endif
+      
       config.onComplete?.()
       resolve()
       return
@@ -145,6 +169,14 @@ export class StreamRequest {
         const data = JSON.parse(content)
         if (data && data.completed) {
           console.log('[SSE] 收到完成标记 completed')
+          
+          // #ifdef MP-WEIXIN
+          // 清除超时监控
+          console.log('[SSE] completed 标记触发，准备清除定时器，当前 timer ID:', this.timeoutCheckTimer)
+          this.clearTimeoutMonitor()
+          console.log('[SSE] completed 标记处理完成，定时器已清除')
+          // #endif
+          
           config.onComplete?.()
           resolve()
           return
@@ -168,6 +200,86 @@ export class StreamRequest {
       config.onChunk?.(chunk)
     }
   }
+
+  // #ifdef MP-WEIXIN
+  // 启动超时监控
+  private startTimeoutMonitor(): void {
+    console.log('[超时监控] 准备启动超时监控，当前 timer ID:', this.timeoutCheckTimer)
+    
+    // 记录初始时间
+    this.lastChunkReceivedTime = Date.now()
+    
+    // 先清除可能存在的旧定时器
+    if (this.timeoutCheckTimer !== null && this.timeoutCheckTimer !== undefined) {
+      console.log('[超时监控] 发现旧定时器，先清除，ID:', this.timeoutCheckTimer)
+      clearInterval(this.timeoutCheckTimer)
+      this.timeoutCheckTimer = null
+    }
+    
+    // 每 10 秒检查一次是否超时
+    const timerId = setInterval(() => {
+      const now = Date.now()
+      const timeSinceLastChunk = now - this.lastChunkReceivedTime
+      
+      console.log(`[超时监控] 检查中... 距离上次接收数据: ${timeSinceLastChunk}ms，定时器 ID: ${this.timeoutCheckTimer}`)
+      
+      if (timeSinceLastChunk >= this.TIMEOUT_DURATION) {
+        console.log(`[超时监控] 数据流超时: ${timeSinceLastChunk}ms 未收到数据`)
+        this.handleTimeout()
+      }
+    }, 10000)
+    
+    this.timeoutCheckTimer = timerId
+    console.log('[超时监控] 定时器已创建，新 ID:', this.timeoutCheckTimer)
+  }
+  
+  // 清除超时监控
+  private clearTimeoutMonitor(): void {
+    console.log('[超时监控] 尝试清除，当前 timer ID:', this.timeoutCheckTimer)
+    
+    if (this.timeoutCheckTimer !== null && this.timeoutCheckTimer !== undefined) {
+      console.log('[超时监控] 清除超时监控，timer ID:', this.timeoutCheckTimer)
+      clearInterval(this.timeoutCheckTimer)
+      this.timeoutCheckTimer = null
+    } else {
+      console.log('[超时监控] 定时器 ID 为空，无需清除')
+    }
+  }
+  
+  // 更新最后接收数据的时间
+  private updateLastChunkTime(): void {
+    this.lastChunkReceivedTime = Date.now()
+  }
+  
+  // 处理超时
+  private handleTimeout(): void {
+    console.log('[超时监控] 触发超时处理')
+    
+    // 清除定时器
+    this.clearTimeoutMonitor()
+    
+    // 标记为中止状态
+    this.isAborted = true
+    
+    // 中止请求
+    if (this.requestTask) {
+      this.requestTask.abort()
+      this.requestTask = null
+    }
+    
+    // 显示轻提示
+    uni.showToast({
+      title: '请求超时，已自动断开',
+      icon: 'none',
+      duration: 2000
+    })
+    
+    // 调用超时回调
+    if (this.timeoutCallback) {
+      this.timeoutCallback()
+    }
+  }
+  // #endif
 
   // 处理 UTF-8 字节流，处理分片造成的字符截断问题
   private decodeUTF8(chunk: ArrayBuffer): string {
@@ -248,16 +360,24 @@ export class StreamRequest {
         responseType: 'arraybuffer', // 响应类型
         timeout: 1000*60*60*12, // 设置超时时间为 12小时
         success: (res) => {
+          console.log('[请求] success 回调触发，statusCode:', res.statusCode)
           if (res.statusCode === 200) {
             // 流式数据通过 onChunkReceived 接收，success 仅表示请求建立成功
             // 实际的流式数据处理在 onChunkReceived 回调中
             config.onOpen?.(res)
+            
             resolve() // 请求成功建立连接后即可 resolve
           } else {
+            console.log('[请求] 请求失败，statusCode:', res.statusCode)
+            // 清除超时监控
+            this.clearTimeoutMonitor()
             reject(new Error(`HTTP error! status: ${res.statusCode}`))
           }
         },
         fail: (err) => {
+          // 清除超时监控
+          this.clearTimeoutMonitor()
+          
           if (!this.isAborted) {
             // 忽略超时错误，因为对于长连接流式请求，超时是预期内的行为
             // 只要 connection 还在接收数据，就不应该视为真正的错误
@@ -273,9 +393,19 @@ export class StreamRequest {
         }
       })
       
+      // 关键修复：在创建 requestTask 后立即启动超时监控
+      // 因为 onChunkReceived 可能比 success 回调更早触发
+      console.log('[请求] requestTask 已创建，立即启动超时监控')
+      this.startTimeoutMonitor()
+      console.log('[请求] 超时监控启动完成')
+      
       // 监听分块数据接收
       this.requestTask?.onChunkReceived?.((res) => {
+        // console.log('[数据接收] onChunkReceived 触发')
         if (this.isAborted) return
+        
+        // 更新最后接收数据的时间
+        this.updateLastChunkTime()
         
         try {
           // 使用 decodeUTF8 处理分块数据，解决字符截断问题
@@ -434,8 +564,19 @@ export class StreamRequest {
     }
     // #endif
     
-    // #ifdef MP-WEIXIN || APP-PLUS
-    // 中止小程序和 App 的请求
+    // #ifdef MP-WEIXIN
+    // 清除超时监控
+    this.clearTimeoutMonitor()
+    
+    // 中止小程序的请求
+    if (this.requestTask) {
+      this.requestTask.abort()
+      this.requestTask = null
+    }
+    // #endif
+    
+    // #ifdef APP-PLUS
+    // 中止 App 的请求
     if (this.requestTask) {
       this.requestTask.abort()
       this.requestTask = null

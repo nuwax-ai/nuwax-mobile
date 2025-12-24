@@ -77,6 +77,10 @@ export default {
       type: Array,
       default: () => []
     },
+    conversationId: {
+      type: [String, Number],
+      default: ''
+    },
     copyLink: {
       type: [Boolean, String],
       default: true

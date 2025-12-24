@@ -102,6 +102,8 @@
       </view>
       <markdown-container v-else-if="n.name == 'container'" :data="getRenderData(n.attrs.data)"
         data-source="markdown-container" />
+      <!-- task-result 任务结果组件 -->
+      <task-result v-else-if="n.name === 'task-result'" :data="n" :conversation-id="getConversationId()" />
       <!-- 富文本 -->
       <!-- #ifdef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
       <rich-text v-else-if="!n.c && (n.l || !handler.isInline(n.name, n.attrs.style))" :id="n.attrs.id" :style="n.f"
@@ -151,6 +153,7 @@ module.exports = {
 </script>
 <script>
 import markdownContainer from '../container/container.vue'
+import taskResult from '../task-result/task-result.vue'
 import { getProcessingDataByPriority } from '../container/utils'
 import node from './node'
 export default {
@@ -185,6 +188,7 @@ export default {
   },
   components: {
     markdownContainer,
+    taskResult,
     // #ifndef ((H5 || APP-PLUS) && VUE3) || APP-HARMONY
     node
     // #endif
@@ -222,6 +226,22 @@ export default {
     // #endif
   },
   methods:{
+    /**
+     * 获取会话ID（用于task-result等组件）
+     */
+    getConversationId() {
+      // 尝试从根组件获取会话ID
+      if (this.root && this.root.conversationId) {
+        return this.root.conversationId
+      }
+      // 尝试从mp-html组件获取
+      for (let parent = this.$parent; parent; parent = parent.$parent) {
+        if (parent.conversationId) {
+          return parent.conversationId
+        }
+      }
+      return ''
+    },
     getRenderData (data: any) {
       if(!data) {
         return {}

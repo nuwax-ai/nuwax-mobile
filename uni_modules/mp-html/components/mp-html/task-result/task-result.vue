@@ -1,8 +1,8 @@
 <template>
   <view class="task-result" @tap="handleClick">
-    <!-- 文件图标 -->
+    <!-- 左侧图标 -->
     <view class="task-result-icon">
-      <text class="iconfont icon-file-text"></text>
+      <text class="iconfont">&#xe64e;</text>
     </view>
     
     <!-- 文件描述/名称 -->
@@ -10,9 +10,9 @@
       <text class="action-text">{{ displayText }}</text>
     </view>
     
-    <!-- 右箭头 -->
+    <!-- 右侧图标 -->
     <view class="task-result-arrow">
-      <text class="iconfont icon-Chevron-right"></text>
+      <text class="iconfont">&#xe63f;</text>
     </view>
   </view>
 </template>
@@ -120,13 +120,12 @@ export default {
   padding: 20rpx 32rpx;
   margin: 16rpx 0;
   border-radius: 16rpx;
-  background-color: #fafafa;
-  border: 2rpx solid #f0f0f0;
+  background-color: rgba(12, 20, 102, 0.04);
   width: 100%;
   box-sizing: border-box;
   
   &:active {
-    background-color: #f5f5f5;
+    background-color: rgba(12, 20, 102, 0.08);
   }
   
   .task-result-icon {
@@ -150,8 +149,8 @@ export default {
     
     .action-text {
       font-size: 28rpx;
-      font-weight: 400;
-      color: rgba(0, 0, 0, 0.65);
+      font-weight: 600;
+      color: #333;
       line-height: 40rpx;
       white-space: nowrap;
       overflow: hidden;
@@ -170,6 +169,15 @@ export default {
     .iconfont {
       font-size: 24rpx;
       color: rgba(0, 0, 0, 0.25);
+    }
+  }
+  
+  // 响应式设计
+  @media (max-width: 750rpx) {
+    .task-result-action {
+      .action-text {
+        font-size: 26rpx;
+      }
     }
   }
 }

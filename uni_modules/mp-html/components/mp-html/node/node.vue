@@ -169,6 +169,7 @@ export default {
   data () {
     return {
       ctrl: {},
+      root: null, // Initialize root to prevent "not defined" warning during render
       // #ifdef MP-WEIXIN
       isiOS: uni.getDeviceInfo().system.includes('iOS')
       // #endif
@@ -248,8 +249,19 @@ export default {
       }
       
       if(typeof data === 'string') {
-        data = JSON.parse(data)
+        try {
+          data = JSON.parse(data)
+        } catch (e) {
+          console.warn('[mp-html/node] getRenderData JSON.parse error:', e, 'data:', data)
+          return {} // Return empty object on parse failure
+        }
       }
+      
+      // Ensure data is an object before spreading
+      if (typeof data !== 'object' || data === null) {
+        return {}
+      }
+      
       const result = {
       ...data,
       ...getProcessingDataByPriority(data.executeId, this.processingList)

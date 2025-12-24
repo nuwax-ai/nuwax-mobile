@@ -77,12 +77,21 @@
       <view class="section-header">
         <text class="section-title">DOCX Preview</text>
       </view>
+      <!-- #ifdef H5 -->
+      <file-preview-h5 
+        src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.docx" 
+        fileType="docx"
+        height="300rpx"
+      />
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
       <file-preview 
         src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.docx" 
         fileName="test.docx"
-        height="150rpx"
+        height="300rpx"
         :showDownload="true"
       />
+      <!-- #endif -->
     </view>
 
     <!-- XLSX Preview -->
@@ -90,12 +99,21 @@
       <view class="section-header">
         <text class="section-title">XLSX Preview</text>
       </view>
+      <!-- #ifdef H5 -->
+      <file-preview-h5 
+        src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.xlsx" 
+        fileType="xlsx"
+        height="300rpx"
+      />
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
       <file-preview 
         src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.xlsx" 
         fileName="test.xlsx"
-        height="150rpx"
+        height="300rpx"
         :showDownload="true"
       />
+      <!-- #endif -->
     </view>
 
     <!-- PDF Preview -->
@@ -103,12 +121,21 @@
       <view class="section-header">
         <text class="section-title">PDF Preview</text>
       </view>
+      <!-- #ifdef H5 -->
+      <file-preview-h5 
+        src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pdf" 
+        fileType="pdf"
+        height="300rpx"
+      />
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
       <file-preview 
         src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pdf" 
         fileName="test.pdf"
-        height="150rpx"
+        height="300rpx"
         :showDownload="true"
       />
+      <!-- #endif -->
     </view>
 
      <!-- PPTX Preview -->
@@ -116,12 +143,22 @@
       <view class="section-header">
         <text class="section-title">PPTX Preview</text>
       </view>
+      <!-- #ifdef H5 -->
+      <file-preview-h5 
+        src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pptx" 
+        fileType="pptx"
+        height="300rpx"
+        :showDownload="true"
+      />
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
       <file-preview 
         src="https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pptx" 
         fileName="test.pptx"
-        height="150rpx"
+        height="300rpx"
         :showDownload="true"
       />
+      <!-- #endif -->
     </view>
 
     <view class="divider">Special States</view>
@@ -134,7 +171,7 @@
       <file-preview 
         src="https://example.com/file.exe" 
         fileName="file.exe"
-        height="200rpx"
+        height="300rpx"
         :showDownload="true"
       />
     </view>
@@ -144,7 +181,7 @@
       <view class="section-header">
         <text class="section-title">Empty State</text>
       </view>
-      <file-preview height="200rpx" />
+      <file-preview height="300rpx" />
     </view>
 
     <view style="height: 50rpx;"></view>
@@ -154,9 +191,16 @@
 <script>
 import FilePreview from '@/uni_modules/file-preview/components/file-preview/file-preview.vue'
 
+// #ifdef H5
+import FilePreviewH5 from '@/subpackages/components/file-preview-h5.vue'
+// #endif
+
 export default {
   components: {
-    FilePreview
+    FilePreview,
+    // #ifdef H5
+    FilePreviewH5
+    // #endif
   },
   data() {
     return {}

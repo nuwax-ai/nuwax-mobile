@@ -14,8 +14,8 @@
       <button class="retry-btn" size="mini" @tap="handleRetry">重试</button>
     </view>
 
-    <!-- Content State -->
-    <view v-else-if="status === 'success'" class="content-area">
+    <!-- Content State (non-Office files) -->
+    <view v-else-if="status === 'success' && !isOfficeDoc" class="content-area">
         
         <!-- Image -->
         <image 
@@ -51,23 +51,55 @@
 
     </view>
 
-    <!-- Office / PDF / Unsupported (File Card Style) -->
-    <!-- Display if: 
-         1. Status is 'idle' (default for docs waiting for click) AND it is a doc or unsupported
-         2. OR Status is 'unsupported'
-    -->
-    <view v-if="(status === 'idle' || status === 'unsupported') && isDocOrUnsupported" class="file-card">
+    <!-- Office / PDF Preview -->
+    <view v-if="status === 'success' && isOfficeDoc" class="office-preview">
+        <!-- #ifdef H5 -->
+        <!-- H5: Use inline iframe -->
+        <iframe 
+            class="office-iframe"
+            :src="officeViewerUrl"
+            frameborder="0"
+            allowfullscreen
+        ></iframe>
+        <!-- #endif -->
+        <!-- #ifdef MP-WEIXIN -->
+        <!-- Mini Program: Show file card -->
+        <view class="file-card">
+            <view class="file-icon">
+                <text class="icon-text">{{ getExtension(fileName || src).toUpperCase() }}</text>
+            </view>
+            <view class="file-info">
+                <text class="file-name">{{ fileName || '未命名文件' }}</text>
+                <text class="file-tip">点击打开文档</text>
+            </view>
+            <button class="action-btn" size="mini" @tap="handleDocClick" :loading="loadingDoc">打开</button>
+        </view>
+        <!-- #endif -->
+        <!-- #ifdef MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ -->
+        <!-- Other Mini Programs -->
+        <view class="file-card">
+            <view class="file-icon">
+                <text class="icon-text">{{ getExtension(fileName || src).toUpperCase() }}</text>
+            </view>
+            <view class="file-info">
+                <text class="file-name">{{ fileName || '未命名文件' }}</text>
+                <text class="file-tip">点击打开文档</text>
+            </view>
+            <button class="action-btn" size="mini" @tap="handleDocClick" :loading="loadingDoc">打开</button>
+        </view>
+        <!-- #endif -->
+    </view>
+
+    <!-- Unsupported File (File Card Style) -->
+    <view v-if="status === 'unsupported' || (status === 'idle' && resolvedType === 'unsupported')" class="file-card">
         <view class="file-icon">
-            <!-- Placeholder for icon -->
             <text class="icon-text">{{ getExtension(fileName || src).toUpperCase() }}</text>
         </view>
         <view class="file-info">
-            <text class="file-name">{{ fileName }}</text>
-            <text class="file-tip" v-if="resolvedType !== 'unsupported'">点击预览</text>
-            <text class="file-tip" v-else>暂不支持预览</text>
+            <text class="file-name">{{ fileName || '未命名文件' }}</text>
+            <text class="file-tip">暂不支持预览</text>
         </view>
-        <button class="action-btn" size="mini" @tap="handleDocClick" v-if="resolvedType !== 'unsupported'" :loading="loadingDoc">打开</button>
-        <button class="action-btn" size="mini" @tap="handleDownload" v-else-if="showDownload">下载</button>
+        <button class="action-btn" size="mini" @tap="handleDownload" v-if="showDownload">下载</button>
     </view>
 
   </view>
@@ -114,8 +146,8 @@ export default {
     };
   },
   mounted() {
-    console.log('[FilePreview] Mounted', { src: this.src, type: this.fileType });
-    this.initPreview();
+    console.log('[FilePreview] Mounted', { src: this.src, type: this.fileType, resolvedType: this.resolvedType, isDocOrUnsupported: this.isDocOrUnsupported });
+    // initPreview is called by watch with immediate:true, no need to call again here
   },
   computed: {
     resolvedType() {
@@ -126,6 +158,15 @@ export default {
     isDocOrUnsupported() {
         const t = this.resolvedType;
         return ['docx', 'xlsx', 'pptx', 'pdf'].includes(t) || t === 'unsupported';
+    },
+    isOfficeDoc() {
+        const t = this.resolvedType;
+        return ['docx', 'xlsx', 'pptx', 'pdf'].includes(t);
+    },
+    officeViewerUrl() {
+        if (!this.src || !this.isOfficeDoc) return '';
+        // Use Microsoft Office Online Viewer for inline preview
+        return `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(this.src)}`;
     }
   },
   watch: {
@@ -139,8 +180,10 @@ export default {
   methods: {
       getExtension,
       async initPreview() {
+          console.log('[FilePreview] initPreview called', { src: this.src, status: this.status });
           if (!this.src) {
               this.status = 'idle';
+              console.log('[FilePreview] No src, setting idle');
               return;
           }
 
@@ -149,7 +192,7 @@ export default {
           
           try {
             const type = this.resolvedType;
-            console.log('[FilePreview] Init preview for type:', type);
+            console.log('[FilePreview] Init preview for type:', type, 'isDocOrUnsupported:', this.isDocOrUnsupported);
             
             // Text/MD/HTML: Fetch content
             if (['html', 'markdown', 'text'].includes(type)) {
@@ -159,13 +202,15 @@ export default {
             else if (['image', 'audio', 'video'].includes(type)) {
                 this.status = 'success';
             }
-            // Office/PDF: Ready to show card
+            // Office/PDF: Set success to trigger iframe (H5) or file card (MP)
             else if (['docx', 'xlsx', 'pptx', 'pdf'].includes(type)) {
-                this.status = 'idle'; // Let user click to open
+                this.status = 'success';
+                console.log('[FilePreview] Office doc, setting success for preview');
             }
              else {
                 this.status = 'unsupported';
             }
+            console.log('[FilePreview] After init, status:', this.status);
           } catch (e) {
               console.error('[FilePreview] Init error:', e);
               this.status = 'error';
@@ -177,6 +222,7 @@ export default {
           return new Promise((resolve, reject) => {
               uni.request({
                   url: this.src,
+                  dataType: 'text', // Prevent auto JSON parsing for text/markdown content
                   success: (res) => {
                       if (res.statusCode === 200) {
                           if (typeof res.data === 'string') {
@@ -184,7 +230,7 @@ export default {
                           } else {
                               // If it's markdown/text but returned as arraybuffer or json? 
                               // Try to convert or just stringify
-                              this.textContent = String(res.data);
+                              this.textContent = JSON.stringify(res.data, null, 2);
                           }
                           this.status = 'success';
                           resolve();
@@ -218,6 +264,7 @@ export default {
                       const filePath = res.tempFilePath;
                       uni.openDocument({
                           filePath: filePath,
+                          fileType: this.resolvedType, // docx, xlsx, pptx, pdf
                           showMenu: true,
                           success: () => {
                               console.log('Opened document');
@@ -327,6 +374,7 @@ export default {
 }
 
 .file-card {
+    height: 100%;
     display: flex;
     align-items: center;
     padding: 20rpx;
@@ -343,7 +391,6 @@ export default {
     align-items: center;
     justify-content: center;
     border-radius: 8rpx;
-    margin-right: 20rpx;
     font-size: 20rpx;
     color: #666;
     font-weight: bold;
@@ -354,11 +401,14 @@ export default {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    text-align: center;
 }
 
 .file-name {
+    margin-top: 8rpx;
     font-size: 28rpx;
     color: #333;
+    text-align: center;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -371,6 +421,20 @@ export default {
 }
 
 .action-btn {
-    margin-left: 20rpx;
+    /* margin-left: 20rpx; */
+}
+
+.office-preview {
+    width: 100%;
+    height: 100%;
+    min-height: 200rpx;
+}
+
+.office-iframe {
+    width: 100%;
+    height: 100%;
+    min-height: 200rpx;
+    border: none;
+    background: #fff;
 }
 </style>

@@ -94,10 +94,16 @@ export default {
      * 点击处理：打开预览视图
      */
     handleClick() {
-      const conversationId = this.conversationId
+      let conversationId = String(this.conversationId)
+      // 移除 chat- 前缀，因为页面参数使用的是纯数字ID
+      if (conversationId && conversationId.startsWith('chat-')) {
+        conversationId = conversationId.replace('chat-', '')
+      }
+      
+      console.log('[TaskResult] Action: CLICK, Params:', { conversationId })
       
       if (conversationId) {
-        CustomActionService.openPreviewView(Number(conversationId))
+        CustomActionService.openPreviewView(conversationId)
       } else {
         // 如果没有会话ID，发送事件让父组件处理
         uni.$emit('task_result_click', {

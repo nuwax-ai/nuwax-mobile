@@ -1,57 +1,89 @@
 <template>
   <view class="tool-call-status">
-    <!-- 工具调用头部信息 -->
-    <view class="tool-header" @tap="toggleExpanded">
-      <view class="tool-info">
-        <text class="tool-name">{{ toolCall.name || toolCall.type }}</text>
-        <view class="tool-status-display">
-          <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
+    <!-- Plan 类型：直接显示任务列表 -->
+    <template v-if="isPlanType">
+      <!-- Plan 头部信息 -->
+      <view class="plan-header" @tap="togglePlanExpanded">
+        <view class="plan-info">
+          <text class="plan-name">{{ toolCall.name || '执行计划' }}</text>
+          <!-- <view class="plan-status-display">
+            <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
               <text :class="getStatusIconType(toolCall.status)" :style="{color: getStatusIconColor(toolCall.status),fontSize: '32rpx'}"></text>
+            </view>
+            <text class="plan-status-text">{{ getStatusText(toolCall.status) }}</text>
+          </view> -->
+        </view>
+        <view class="plan-expand-icon">
+          <text class="iconfont" :class="planExpanded ? 'icon-Chevron-up' : 'icon-a-Chevrondown'"></text>
+        </view>
+      </view>
+      
+      <!-- Plan 任务列表（直接展示） -->
+      <view v-if="planExpanded && planTaskList.length > 0" class="plan-task-list">
+        <view v-for="(task, index) in planTaskList" :key="index" class="plan-task-item">
+          <!-- 字体图标实现的状态 -->
+          <view class="task-status-icon" :class="getTaskStatusClass(task.status)">
+            <text class="task-icon">{{ getTaskStatusIcon(task.status) }}</text>
           </view>
-          <text class="tool-status-text">{{ getStatusText(toolCall.status) }}</text>
+          <text class="task-content">{{ task.content }}</text>
         </view>
       </view>
-      <view class="tool-actions">
-        <view class="action-icon" @tap.stop.prevent="handleShowDetails">
-          <text class="iconfont icon-List"></text>
+    </template>
+    
+    <!-- 非 Plan 类型：显示工具调用状态 -->
+    <template v-else>
+      <!-- 工具调用头部信息 -->
+      <view class="tool-header" @tap="toggleExpanded">
+        <view class="tool-info">
+          <text class="tool-name">{{ toolCall.name || toolCall.type }}</text>
+          <view class="tool-status-display">
+            <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
+              <text :class="getStatusIconType(toolCall.status)" :style="{color: getStatusIconColor(toolCall.status),fontSize: '32rpx'}"></text>
+            </view>
+            <text class="tool-status-text">{{ getStatusText(toolCall.status) }}</text>
+          </view>
         </view>
-        <view class="action-icon" @tap.stop.prevent="handleCopyToClipboard">
-          <text class="iconfont icon-Copy"></text>
-        </view>
-        <view v-if="isPageType(toolCall)" class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
-          <text class="iconfont icon-eye-open"></text>
+        <view class="tool-actions">
+          <view class="action-icon" @tap.stop.prevent="handleShowDetails">
+            <text class="iconfont icon-List"></text>
+          </view>
+          <view class="action-icon" @tap.stop.prevent="handleCopyToClipboard">
+            <text class="iconfont icon-Copy"></text>
+          </view>
+          <view v-if="isPageType(toolCall)" class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
+            <text class="iconfont icon-eye-open"></text>
+          </view>
         </view>
       </view>
-    </view>
 
-    <!-- 展开后的详细信息 -->
-    <view v-if="expanded" class="tool-details-expanded">
-      <!-- 调用参数 -->
-      <view v-if="detailData.params && Object.keys(detailData.params).length > 0" class="detail-section">
-        <view class="section-header">
-          <text class="section-title">调用参数</text>
+      <!-- 展开后的详细信息 -->
+      <view v-if="expanded" class="tool-details-expanded">
+        <!-- 调用参数 -->
+        <view v-if="detailData.params && Object.keys(detailData.params).length > 0" class="detail-section">
+          <view class="section-header">
+            <text class="section-title">调用参数</text>
+          </view>
+          <view class="arguments-content">
+            <text class="arguments-text">{{ formatArguments(detailData.params) }}</text>
+          </view>
         </view>
-        <view class="arguments-content">
-          <text class="arguments-text">{{ formatArguments(detailData.params) }}</text>
-        </view>
-      </view>
 
-      <!-- 调用结果 -->
-      <view v-if="detailData.response" class="detail-section">
-        <view class="section-header">
-          <text class="section-title">调用结果</text>
-        </view>
-        <view class="output-content">
-          <text class="output-text">{{ formatResult(detailData.response) }}</text>
+        <!-- 调用结果 -->
+        <view v-if="detailData.response" class="detail-section">
+          <view class="section-header">
+            <text class="section-title">调用结果</text>
+          </view>
+          <view class="output-content">
+            <text class="output-text">{{ formatResult(detailData.response) }}</text>
+          </view>
         </view>
       </view>
-    </view>
+    </template>
   </view>
 </template>
 
 <script>
 import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue'
-// import { ProcessingEnum } from '@/types/enums/common.uts';
 import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
 
 export default {
@@ -68,10 +100,28 @@ export default {
   data() {
     return {
       expanded: false,
+      planExpanded: true, // Plan 类型默认展开
       toolCall: this.data
     }
   },
   computed: {
+    // 判断是否为 Plan 类型
+    isPlanType() {
+      return this.toolCall.type === AgentComponentTypeEnum.Plan || this.toolCall.type === 'Plan'
+    },
+    
+    // Plan 任务列表
+    planTaskList() {
+      const result = this.toolCall.result || {}
+      const data = result.data
+      
+      if (Array.isArray(data)) {
+        return data
+      }
+      
+      return []
+    },
+    
     detailData() {
       const _result = this.toolCall.result || {}
       return {
@@ -100,6 +150,11 @@ export default {
     // 切换展开状态
     toggleExpanded() {
       this.expanded = !this.expanded
+    },
+    
+    // 切换 Plan 展开状态
+    togglePlanExpanded() {
+      this.planExpanded = !this.planExpanded
     },
 
     // 显示详情
@@ -189,6 +244,29 @@ export default {
       return statusTextMap[status] || '未知状态'
     },
 
+    
+    // 获取任务状态样式类
+    getTaskStatusClass(status) {
+      const classMap = {
+        'completed': 'task-status-completed',
+        'pending': 'task-status-pending',
+        'in_progress': 'task-status-in-progress',
+        'failed': 'task-status-failed'
+      }
+      return classMap[status] || 'task-status-pending'
+    },
+    
+    // 获取任务状态图标 (使用字体图标unicode)
+    getTaskStatusIcon(status) {
+      const iconMap = {
+        'pending': '\ue649',      // 待处理
+        'in_progress': '\ue645',  // 进行中
+        'completed': '\ue636',    // 已完成
+        'failed': '\ue60d'        // 失败
+      }
+      return iconMap[status] || '\ue649'
+    },
+
     // 格式化参数显示
     formatArguments(args) {
       try {
@@ -235,6 +313,105 @@ export default {
   background-color: rgba(12, 20, 102, 0.04);
   overflow: hidden;
 
+  // Plan 类型样式
+  .plan-header {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 24rpx;
+
+    .plan-info {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      flex: 1;
+      gap: 16rpx;
+
+      .plan-name {
+        font-size: 28rpx;
+        font-weight: 600;
+        color: #333;
+        line-height: 40rpx;
+      }
+
+      .plan-status-display {
+        display: flex;
+        align-items: center;
+        flex-direction: row;
+        gap: 8rpx;
+
+        .status-icon {
+          width: 32rpx;
+          height: 32rpx;
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+
+          &.status-icon-executing {
+            animation: spin 1s linear infinite;
+          }
+        }
+
+        .plan-status-text {
+          font-size: 24rpx;
+          color: #666;
+          line-height: 32rpx;
+        }
+      }
+    }
+
+    .plan-expand-icon {
+      .iconfont {
+        font-size: 28rpx;
+        color: #999;
+      }
+    }
+  }
+
+  // Plan 任务列表
+  .plan-task-list {
+    padding: 0 24rpx 24rpx;
+    border-top: 2rpx solid rgba(0, 0, 0, 0.06);
+    margin-top: 0;
+
+    .plan-task-item {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 16rpx;
+      padding: 12rpx 0;
+
+      .task-status-icon {
+        flex-shrink: 0;
+        width: 32rpx;
+        height: 32rpx;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-top: 4rpx;
+
+        .task-icon {
+          font-family: 'iconfont';
+          font-size: 32rpx;
+          font-style: normal;
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+          color: #8c8c8c;
+        }
+      }
+
+      .task-content {
+        flex: 1;
+        font-size: 26rpx;
+        color: #262626;
+        line-height: 40rpx;
+      }
+    }
+  }
+
+  // 非 Plan 类型样式（原有样式）
   .tool-header {
     display: flex;
     flex-direction: row;

@@ -9,7 +9,7 @@
 function makeMap(str) {
   const map = Object.create(null);
   const list = str.split(",");
-  for (let i = list.length; i--; ) {
+  for (let i = list.length; i--;) {
     map[list[i]] = true;
   }
   return map;
@@ -19,7 +19,7 @@ function makeMap(str) {
 const config = {
   // 信任的标签（保持标签名不变）
   trustTags: makeMap(
-    "container,a,abbr,ad,audio,b,blockquote,br,code,col,colgroup,dd,del,dl,dt,div,em,fieldset,h1,h2,h3,h4,h5,h6,hr,i,img,ins,label,legend,li,ol,p,q,ruby,rt,source,span,strong,sub,sup,table,tbody,td,tfoot,th,thead,tr,title,ul,video"
+    "container,a,abbr,ad,audio,b,blockquote,br,code,col,colgroup,dd,del,dl,dt,div,em,fieldset,h1,h2,h3,h4,h5,h6,hr,i,img,ins,label,legend,li,ol,p,q,ruby,rt,source,span,strong,sub,sup,table,tbody,td,tfoot,th,thead,tr,title,ul,video,task-result,description,file"
   ),
 
   // 块级标签（转为 div，其他的非信任标签转为 span）
@@ -227,7 +227,7 @@ function Parser(vm) {
   this.nodes = [];
   this.pre =
     (this.options.containerStyle || "").includes("white-space") &&
-    this.options.containerStyle.includes("pre")
+      this.options.containerStyle.includes("pre")
       ? 2
       : 0;
 }
@@ -238,7 +238,7 @@ function Parser(vm) {
  */
 Parser.prototype.parse = function (content) {
   // 插件处理
-  for (let i = this.plugins.length; i--; ) {
+  for (let i = this.plugins.length; i--;) {
     if (this.plugins[i].onUpdate) {
       content = this.plugins[i].onUpdate(content, config) || content;
     }
@@ -260,7 +260,7 @@ Parser.prototype.parse = function (content) {
  */
 Parser.prototype.expose = function () {
   // #ifndef APP-PLUS-NVUE
-  for (let i = this.stack.length; i--; ) {
+  for (let i = this.stack.length; i--;) {
     const item = this.stack[i];
     if (
       item.c ||
@@ -280,7 +280,7 @@ Parser.prototype.expose = function () {
  * @returns {Boolean} 是否要移除此标签
  */
 Parser.prototype.hook = function (node) {
-  for (let i = this.plugins.length; i--; ) {
+  for (let i = this.plugins.length; i--;) {
     if (
       this.plugins[i].onParse &&
       this.plugins[i].onParse(node, this) === false
@@ -600,7 +600,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
           attrs.ignore = "T";
         }
         if (!attrs.ignore || node.webp || attrs.src.includes("cloud://")) {
-          for (let i = this.stack.length; i--; ) {
+          for (let i = this.stack.length; i--;) {
             const item = this.stack[i];
             if (item.name === "a") {
               node.a = item.attrs;
@@ -781,7 +781,7 @@ Parser.prototype.onCloseTag = function (name) {
   // 依次出栈到匹配为止
   name = this.xml ? name : name.toLowerCase();
   let i;
-  for (i = this.stack.length; i--; ) {
+  for (i = this.stack.length; i--;) {
     if (this.stack[i].name === name) break;
   }
   if (i !== -1) {
@@ -832,7 +832,7 @@ Parser.prototype.popNode = function () {
   if (node.pre && this.pre !== 2) {
     // 是否合并空白符标识
     this.pre = node.pre = undefined;
-    for (let i = this.stack.length; i--; ) {
+    for (let i = this.stack.length; i--;) {
       if (this.stack[i].pre) {
         this.pre = 1;
       }
@@ -1039,7 +1039,7 @@ Parser.prototype.popNode = function () {
       attrs.style += ";list-style-type:" + types[attrs.type];
       attrs.type = undefined;
     }
-    for (let i = children.length; i--; ) {
+    for (let i = children.length; i--;) {
       if (children[i].name === "li") {
         children[i].c = 1;
       }
@@ -1062,9 +1062,8 @@ Parser.prototype.popNode = function () {
       }
     }
     if (border) {
-      attrs.style += `;border:${border}px ${borderstyle || "solid"} ${
-        bordercolor || "gray"
-      }`;
+      attrs.style += `;border:${border}px ${borderstyle || "solid"} ${bordercolor || "gray"
+        }`;
     }
     if (node.flag && node.c) {
       // 有 colspan 或 rowspan 且含有链接的表格通过 grid 布局实现
@@ -1162,18 +1161,16 @@ Parser.prototype.popNode = function () {
             }
             style =
               (border
-                ? `;border:${border}px ${borderstyle || "solid"} ${
-                    bordercolor || "gray"
-                  }` + (spacing ? "" : ";border-right:0;border-bottom:0")
+                ? `;border:${border}px ${borderstyle || "solid"} ${bordercolor || "gray"
+                }` + (spacing ? "" : ";border-right:0;border-bottom:0")
                 : "") +
               (padding ? `;padding:${padding}px` : "") +
               ";" +
               style;
             // 处理列合并
             if (td.attrs.colspan) {
-              style += `;grid-column-start:${col};grid-column-end:${
-                col + parseInt(td.attrs.colspan)
-              }`;
+              style += `;grid-column-start:${col};grid-column-end:${col + parseInt(td.attrs.colspan)
+                }`;
               if (!td.attrs.rowspan) {
                 style += `;grid-row-start:${row};grid-row-end:${row + 1}`;
               }
@@ -1181,9 +1178,8 @@ Parser.prototype.popNode = function () {
             }
             // 处理行合并
             if (td.attrs.rowspan) {
-              style += `;grid-row-start:${row};grid-row-end:${
-                row + parseInt(td.attrs.rowspan)
-              }`;
+              style += `;grid-row-start:${row};grid-row-end:${row + parseInt(td.attrs.rowspan)
+                }`;
               if (!td.attrs.colspan) {
                 style += `;grid-column-start:${col};grid-column-end:${col + 1}`;
               }
@@ -1229,9 +1225,8 @@ Parser.prototype.popNode = function () {
             const td = nodes[i];
             if (td.name === "th" || td.name === "td") {
               if (border) {
-                td.attrs.style = `border:${border}px ${
-                  borderstyle || "solid"
-                } ${bordercolor || "gray"};${td.attrs.style || ""}`;
+                td.attrs.style = `border:${border}px ${borderstyle || "solid"
+                  } ${bordercolor || "gray"};${td.attrs.style || ""}`;
               }
               if (padding) {
                 td.attrs.style = `padding:${padding}px;${td.attrs.style || ""}`;
@@ -1282,7 +1277,7 @@ Parser.prototype.popNode = function () {
     (node.name === "td" || node.name === "th") &&
     (attrs.colspan || attrs.rowspan)
   ) {
-    for (let i = this.stack.length; i--; ) {
+    for (let i = this.stack.length; i--;) {
       if (
         this.stack[i].name === "table" ||
         this.stack[i].name === "tbody" ||
@@ -1318,7 +1313,7 @@ Parser.prototype.popNode = function () {
   } else if (node.c) {
     (function traversal(node) {
       node.c = 2;
-      for (let i = node.children.length; i--; ) {
+      for (let i = node.children.length; i--;) {
         const child = node.children[i];
         // #ifdef MP-WEIXIN
         if (
@@ -1368,7 +1363,7 @@ Parser.prototype.popNode = function () {
   }
 
   if ((styleObj.display || "").includes("flex") && !node.c) {
-    for (let i = children.length; i--; ) {
+    for (let i = children.length; i--;) {
       const item = children[i];
       if (item.f) {
         item.attrs.style = (item.attrs.style || "") + item.f;
@@ -1521,7 +1516,7 @@ Lexer.prototype.parse = function (content) {
   this.i = 0; // 标记解析位置
   this.start = 0; // 标记一个单词的开始位置
   this.state = this.text; // 当前状态
-  for (let len = this.content.length; this.i !== -1 && this.i < len; ) {
+  for (let len = this.content.length; this.i !== -1 && this.i < len;) {
     this.state();
   }
 };

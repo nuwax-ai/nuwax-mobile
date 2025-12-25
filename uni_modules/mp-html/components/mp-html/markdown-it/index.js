@@ -25,7 +25,10 @@ md.use(markdownItContainer, "container", {
     const data =
       m?.[1]?.split(" ").reduce((acc, item) => {
         const [key, value] = item.split("=");
-        acc[key] = value.replace(/^"|"$/g, "");
+        // 防止 value 为 undefined 导致 replace 调用失败
+        if (key && value !== undefined) {
+          acc[key] = value.replace(/^"|"$/g, "");
+        }
         return acc;
       }, {}) || {};
     if (tokens[idx].nesting === 1) {

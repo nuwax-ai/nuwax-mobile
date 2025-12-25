@@ -17,6 +17,10 @@
 </template>
 
 <script>
+// 静态导入 CSS，确保生产构建时被正确打包
+import '@js-preview/docx/lib/index.css';
+import '@js-preview/excel/lib/index.css';
+
 export default {
   name: 'FilePreviewH5',
   props: {
@@ -114,7 +118,6 @@ export default {
         switch (this.fileType) {
           case 'docx': {
             const jsPreviewDocx = await import('@js-preview/docx/lib/index.umd.js');
-            await import('@js-preview/docx/lib/index.css');
             this.previewer = jsPreviewDocx.default.init(container);
             await this.previewer.preview(this.src);
             this.loading = false;
@@ -122,7 +125,6 @@ export default {
           }
           case 'xlsx': {
             const jsPreviewExcel = await import('@js-preview/excel/lib/index.umd.js');
-            await import('@js-preview/excel/lib/index.css');
             this.previewer = jsPreviewExcel.default.init(container);
             await this.previewer.preview(this.src);
             this.loading = false;

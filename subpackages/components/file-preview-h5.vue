@@ -113,7 +113,7 @@ export default {
       try {
         switch (this.fileType) {
           case 'docx': {
-            const jsPreviewDocx = await import('@js-preview/docx');
+            const jsPreviewDocx = await import('@js-preview/docx/lib/index.umd.js');
             await import('@js-preview/docx/lib/index.css');
             this.previewer = jsPreviewDocx.default.init(container);
             await this.previewer.preview(this.src);
@@ -121,7 +121,7 @@ export default {
             break;
           }
           case 'xlsx': {
-            const jsPreviewExcel = await import('@js-preview/excel');
+            const jsPreviewExcel = await import('@js-preview/excel/lib/index.umd.js');
             await import('@js-preview/excel/lib/index.css');
             this.previewer = jsPreviewExcel.default.init(container);
             await this.previewer.preview(this.src);

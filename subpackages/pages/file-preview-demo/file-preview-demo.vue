@@ -161,6 +161,84 @@
       <!-- #endif -->
     </view>
 
+    <view class="divider">Iframe 直接使用示例</view>
+
+    <!-- Iframe DOCX Demo -->
+    <view class="section">
+      <view class="section-header">
+        <text class="section-title">Iframe DOCX (直接使用 file-preview.html)</text>
+      </view>
+      <!-- #ifdef H5 -->
+      <iframe 
+        :src="getPreviewUrl('https://501351981.github.io/vue-office/examples/dist/static/test-files/test.docx', 'docx')"
+        style="width: 100%; height: 300px; border: none;"
+      ></iframe>
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
+      <view class="iframe-tip">
+        <text>小程序环境请使用 WebView 打开</text>
+        <button size="mini" @click="openInWebview('docx')">打开预览</button>
+      </view>
+      <!-- #endif -->
+    </view>
+
+    <!-- Iframe XLSX Demo -->
+    <view class="section">
+      <view class="section-header">
+        <text class="section-title">Iframe XLSX (直接使用 file-preview.html)</text>
+      </view>
+      <!-- #ifdef H5 -->
+      <iframe 
+        :src="getPreviewUrl('https://501351981.github.io/vue-office/examples/dist/static/test-files/test.xlsx', 'xlsx')"
+        style="width: 100%; height: 300px; border: none;"
+      ></iframe>
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
+      <view class="iframe-tip">
+        <text>小程序环境请使用 WebView 打开</text>
+        <button size="mini" @click="openInWebview('xlsx')">打开预览</button>
+      </view>
+      <!-- #endif -->
+    </view>
+
+    <!-- Iframe PDF Demo -->
+    <view class="section">
+      <view class="section-header">
+        <text class="section-title">Iframe PDF (直接使用 file-preview.html)</text>
+      </view>
+      <!-- #ifdef H5 -->
+      <iframe 
+        :src="getPreviewUrl('https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pdf', 'pdf')"
+        style="width: 100%; height: 300px; border: none;"
+      ></iframe>
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
+      <view class="iframe-tip">
+        <text>小程序环境请使用 WebView 打开</text>
+        <button size="mini" @click="openInWebview('pdf')">打开预览</button>
+      </view>
+      <!-- #endif -->
+    </view>
+
+    <!-- Iframe PPTX Demo -->
+    <view class="section">
+      <view class="section-header">
+        <text class="section-title">Iframe PPTX (直接使用 file-preview.html)</text>
+      </view>
+      <!-- #ifdef H5 -->
+      <iframe 
+        :src="getPreviewUrl('https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pptx', 'pptx')"
+        style="width: 100%; height: 300px; border: none;"
+      ></iframe>
+      <!-- #endif -->
+      <!-- #ifndef H5 -->
+      <view class="iframe-tip">
+        <text>小程序环境请使用 WebView 打开</text>
+        <button size="mini" @click="openInWebview('pptx')">打开预览</button>
+      </view>
+      <!-- #endif -->
+    </view>
+
     <view class="divider">Special States</view>
 
     <!-- Unsupported File -->
@@ -203,7 +281,37 @@ export default {
     // #endif
   },
   data() {
-    return {}
+    return {
+      testFiles: {
+        docx: 'https://501351981.github.io/vue-office/examples/dist/static/test-files/test.docx',
+        xlsx: 'https://501351981.github.io/vue-office/examples/dist/static/test-files/test.xlsx',
+        pdf: 'https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pdf',
+        pptx: 'https://501351981.github.io/vue-office/examples/dist/static/test-files/test.pptx'
+      }
+    }
+  },
+  methods: {
+    // 获取预览页面 URL（用于 H5 iframe）
+    getPreviewUrl(fileUrl, fileType) {
+      const baseUrl = window?.location?.origin || '';
+      const params = new URLSearchParams();
+      params.set('fileUrl', fileUrl);
+      params.set('fileType', fileType);
+      return `${baseUrl}/m/static/file-preview.html?${params.toString()}`;
+    },
+    
+    // 小程序环境通过 WebView 打开
+    openInWebview(fileType) {
+      const fileUrl = this.testFiles[fileType];
+      if (!fileUrl) return;
+      
+      // 构建预览页面地址
+      const previewUrl = `/m/static/file-preview.html?fileUrl=${encodeURIComponent(fileUrl)}&fileType=${fileType}`;
+      
+      uni.navigateTo({
+        url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(previewUrl)}`
+      });
+    }
   }
 }
 </script>
@@ -268,5 +376,21 @@ export default {
   height: 1px;
   background: #e8e8e8;
   margin: 0 20rpx;
+}
+
+.iframe-tip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40rpx;
+  background: #f9f9f9;
+  border-radius: 8rpx;
+  gap: 20rpx;
+}
+
+.iframe-tip text {
+  color: #666;
+  font-size: 28rpx;
 }
 </style>

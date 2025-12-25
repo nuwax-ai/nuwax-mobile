@@ -8,19 +8,24 @@
     <!-- Error Overlay -->
     <view v-show="error" class="state-overlay error">
       <text class="error-text">{{ error }}</text>
-      <button size="mini" @click="renderPreview">重试</button>
+      <button size="mini" @click="reload">重试</button>
     </view>
     
-    <!-- Preview Container - Always mounted -->
-    <view ref="previewContainer" class="preview-container" :style="containerStyle"></view>
+    <!-- Preview iframe -->
+    <iframe
+      v-if="previewUrl"
+      ref="previewIframe"
+      :src="previewUrl"
+      class="preview-iframe"
+      frameborder="0"
+      allowfullscreen
+      @load="onIframeLoad"
+      @error="onIframeError"
+    ></iframe>
   </view>
 </template>
 
 <script>
-// 静态导入 CSS，确保生产构建时被正确打包
-import '@js-preview/docx/lib/index.css';
-import '@js-preview/excel/lib/index.css';
-
 export default {
   name: 'FilePreviewH5',
   props: {
@@ -30,7 +35,7 @@ export default {
     },
     fileType: {
       type: String,
-      required: true
+      default: ''
     },
     height: {
       type: String,
@@ -43,127 +48,104 @@ export default {
         minHeight: this.height,
         height: this.height
       };
+    },
+    previewUrl() {
+      if (!this.src) return '';
+      
+      // Get the base URL for the preview page
+      // In production, H5 is served under /m/ path
+      const baseUrl = this.getPreviewBaseUrl();
+      
+      // Build query parameters
+      const params = new URLSearchParams();
+      params.set('fileUrl', this.src);
+      
+      if (this.fileType) {
+        params.set('fileType', this.fileType);
+      }
+      
+      // Use /m/static/ for H5 deployment
+      return `${baseUrl}/m/static/file-preview.html?${params.toString()}`;
     }
   },
   data() {
     return {
       loading: true,
-      error: null,
-      previewer: null
+      error: null
     };
   },
-  mounted() {
-    console.log('[FilePreviewH5] Mounted', { src: this.src, type: this.fileType });
-    // Delay to ensure DOM is ready
-    setTimeout(() => {
-      this.renderPreview();
-    }, 100);
-  },
   watch: {
-    src(newSrc) {
-      if (newSrc) {
-        setTimeout(() => {
-          this.renderPreview();
-        }, 100);
-      }
+    src: {
+      handler(newSrc) {
+        if (newSrc) {
+          this.loading = true;
+          this.error = null;
+        }
+      },
+      immediate: true
     }
   },
+  mounted() {
+    console.log('[FilePreviewH5] Mounted with iframe mode', { src: this.src, type: this.fileType });
+    
+    // Listen for messages from iframe
+    window.addEventListener('message', this.handleMessage);
+  },
   beforeUnmount() {
-    this.destroyPreviewer();
+    window.removeEventListener('message', this.handleMessage);
   },
   methods: {
-    destroyPreviewer() {
-      if (this.previewer) {
-        try {
-          this.previewer.destroy && this.previewer.destroy();
-        } catch (e) { /* ignore */ }
-        this.previewer = null;
+    getPreviewBaseUrl() {
+      // In development, use current origin
+      // In production, use the same origin or configured base URL
+      if (typeof window !== 'undefined') {
+        return window.location.origin;
+      }
+      return '';
+    },
+    
+    onIframeLoad() {
+      console.log('[FilePreviewH5] Iframe loaded');
+      // Don't hide loading here - wait for preview_success message
+    },
+    
+    onIframeError(e) {
+      console.error('[FilePreviewH5] Iframe error:', e);
+      this.loading = false;
+      this.error = '预览页面加载失败';
+    },
+    
+    handleMessage(event) {
+      // Validate message origin if needed
+      const data = event.data;
+      
+      if (!data || !data.type) return;
+      
+      console.log('[FilePreviewH5] Received message:', data);
+      
+      if (data.type === 'preview_success') {
+        this.loading = false;
+        this.error = null;
+        this.$emit('load');
+      } else if (data.type === 'preview_error') {
+        this.loading = false;
+        this.error = data.error || '文档渲染失败';
+        this.$emit('error', data.error);
       }
     },
     
-    getContainer() {
-      const ref = this.$refs.previewContainer;
-      if (!ref) return null;
-      // Uniapp: ref might be component instance or DOM element
-      if (ref.$el) return ref.$el;
-      if (ref instanceof HTMLElement) return ref;
-      // Try to find actual DOM element
-      if (ref.nodeType === 1) return ref;
-      return null;
-    },
-    
-    async renderPreview() {
-      const container = this.getContainer();
-      console.log('[FilePreviewH5] Container:', container, 'src:', this.src, 'type:', this.fileType);
-      
-      if (!container) {
-        console.error('[FilePreviewH5] Container not found');
-        this.error = '容器未找到';
-        this.loading = false;
-        return;
-      }
-      
-      if (!this.src) {
-        this.error = '文件地址不存在';
-        this.loading = false;
-        return;
-      }
-      
+    reload() {
       this.loading = true;
       this.error = null;
-      this.destroyPreviewer();
-      container.innerHTML = '';
       
-      try {
-        switch (this.fileType) {
-          case 'docx': {
-            const jsPreviewDocx = await import('@js-preview/docx/lib/index.umd.js');
-            this.previewer = jsPreviewDocx.default.init(container);
-            await this.previewer.preview(this.src);
-            this.loading = false;
-            break;
-          }
-          case 'xlsx': {
-            const jsPreviewExcel = await import('@js-preview/excel/lib/index.umd.js');
-            this.previewer = jsPreviewExcel.default.init(container);
-            await this.previewer.preview(this.src);
-            this.loading = false;
-            break;
-          }
-          case 'pdf': {
-            // Use browser native PDF embed for better compatibility
-            const embed = document.createElement('embed');
-            embed.src = this.src;
-            embed.type = 'application/pdf';
-            embed.style.width = '100%';
-            embed.style.height = '100%';
-            embed.style.minHeight = this.height || '400px';
-            container.appendChild(embed);
-            this.loading = false;
-            console.log('[FilePreviewH5] PDF rendered via native embed');
-            break;
-          }
-          case 'pptx': {
-            const pptxPreview = await import('pptx-preview');
-            this.previewer = pptxPreview.init(container, {
-              width: container.clientWidth || 800,
-              height: container.clientHeight || 600
-            });
-            const response = await fetch(this.src);
-            const arrayBuffer = await response.arrayBuffer();
-            await this.previewer.preview(arrayBuffer);
-            this.loading = false;
-            break;
-          }
-          default:
-            this.error = `不支持的文件类型: ${this.fileType}`;
-            this.loading = false;
-        }
-        console.log('[FilePreviewH5] Rendered:', this.fileType);
-      } catch (e) {
-        console.error('[FilePreviewH5] Render error:', e);
-        this.error = e?.message || '文档渲染失败';
-        this.loading = false;
+      // Force iframe reload by toggling src
+      const iframe = this.$refs.previewIframe;
+      if (iframe) {
+        const currentSrc = iframe.src;
+        iframe.src = '';
+        this.$nextTick(() => {
+          iframe.src = currentSrc;
+        });
       }
     }
   }
@@ -202,10 +184,9 @@ export default {
   margin-bottom: 16px;
 }
 
-.preview-container {
+.preview-iframe {
   width: 100%;
   height: 100%;
-  min-height: 400px;
-  overflow: auto;
+  border: none;
 }
 </style>

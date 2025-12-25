@@ -306,7 +306,7 @@ export default {
       if (!fileUrl) return;
       
       // 构建预览页面地址
-      const previewUrl = `/m/static/file-preview.html?fileUrl=${encodeURIComponent(fileUrl)}&fileType=${fileType}`;
+      const previewUrl = `http://localhost:5173/m/static/file-preview.html?fileUrl=${encodeURIComponent(fileUrl)}&fileType=${fileType}`;
       
       uni.navigateTo({
         url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(previewUrl)}`

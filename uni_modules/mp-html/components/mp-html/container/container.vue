@@ -209,7 +209,7 @@ export default {
       const iconMap = {
         'EXECUTING': 'icon-Loader',    // 执行中显示加载图标
         'FINISHED': 'icon-Check', // 已完成显示对勾
-        'FAILED': 'icon-X'     // 执行失败显示叉号
+        'FAILED': 'icon-waring'     // 执行失败显示叉号
       }
       return ` iconfont ${iconMap[status] || 'icon-Check'}`
     },
@@ -229,19 +229,21 @@ export default {
       const statusColorMap = {
         'EXECUTING': '#1890ff',
         'FINISHED': '#52c41a',
-        'FAILED': '#ff4d4f'
+        // 'FAILED': '#ff4d4f'
+        'FAILED': '#ffcb00'
       }
       return statusColorMap[status] || '#999'
     },
 
     // 获取状态文本
     getStatusText(status) {
-      const statusTextMap = {
-        'EXECUTING': '执行中',
-        'FINISHED': '已完成',
-        'FAILED': '执行失败'
-      }
-      return statusTextMap[status] || '未知状态'
+      return '';
+      // const statusTextMap = {
+      //   'EXECUTING': '执行中',
+      //   'FINISHED': '已完成',
+      //   'FAILED': '执行失败'
+      // }
+      // return statusTextMap[status] || '未知状态'
     },
 
     
@@ -431,6 +433,10 @@ export default {
         font-weight: 600;
         color: #333;
         line-height: 40rpx;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .tool-status-display {
@@ -442,7 +448,7 @@ export default {
         .status-icon {
           width: 32rpx;
           height: 32rpx;
-          border-radius: 50%;
+          // border-radius: 50%;
           display: flex;
           align-items: center;
           justify-content: center;
@@ -472,6 +478,7 @@ export default {
           font-size: 24rpx;
           color: #666;
           line-height: 32rpx;
+          margin-right: 6px;
         }
       }
     }

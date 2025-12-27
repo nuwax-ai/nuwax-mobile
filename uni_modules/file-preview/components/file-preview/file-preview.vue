@@ -1,5 +1,5 @@
 <template>
-  <view class="file-preview-container" :style="{ width: width, height: height }">
+  <view class="file-preview-container">
     <!-- Loading State -->
     <view v-if="status === 'loading'" class="state-overlay loading">
       <view class="loading-icon">
@@ -45,7 +45,30 @@
         />
 
         <!-- HTML / Markdown / Text -->
-        <view v-else-if="['html', 'markdown', 'text'].includes(resolvedType)" class="preview-text">
+        <template v-else-if="['html'].includes(resolvedType)">
+            <!-- #ifdef H5 -->
+            <view class="html-preview-container">
+                <iframe 
+                    :src="src" 
+                    class="html-iframe"
+                    frameborder="0"
+                    allowfullscreen
+                ></iframe>
+            </view>
+            <!-- #endif -->
+
+            <!-- #ifndef H5 -->
+            <view class="preview-text">
+                <mp-html :content="textContent" :markdown="resolvedType === 'markdown' || resolvedType === 'text'" />
+                <!-- <web-view
+                    :src="src"
+                ></web-view> -->
+            </view>
+            <!-- #endif -->
+        </template>
+
+        <!-- HTML / Markdown / Text -->
+        <view v-else-if="['markdown', 'text'].includes(resolvedType)" class="preview-text">
              <mp-html :content="textContent" :markdown="resolvedType === 'markdown' || resolvedType === 'text'" />
         </view>
 
@@ -335,6 +358,8 @@ export default {
 <style scoped>
 .file-preview-container {
     position: relative;
+    width: 100%;
+    height: 100%;
     background: #f8f8f8;
     border-radius: 8px;
     overflow: hidden;
@@ -436,5 +461,19 @@ export default {
     min-height: 200rpx;
     border: none;
     background: #fff;
+}
+
+.html-preview-container {
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    position: relative;
+}
+
+.html-iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    display: block;
 }
 </style>

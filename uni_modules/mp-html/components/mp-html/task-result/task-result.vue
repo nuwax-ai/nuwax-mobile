@@ -103,7 +103,13 @@ export default {
       console.log('[TaskResult] Action: CLICK, Params:', { conversationId })
       
       if (conversationId) {
-        CustomActionService.openPreviewView(conversationId)
+        // CustomActionService.openPreviewView(conversationId)
+        const fileId = this.fileName.split(`${conversationId}/`).pop();
+
+        uni.navigateTo({
+          url: '/subpackages/pages/file-preview-page/file-preview-page?cId=' + conversationId + '&name=' + encodeURIComponent(fileId)
+        })
+
       } else {
         // 如果没有会话ID，发送事件让父组件处理
         uni.$emit('task_result_click', {
@@ -122,8 +128,8 @@ export default {
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 16rpx;
-  padding: 20rpx 32rpx;
+  gap: 8rpx;
+  padding: 20rpx 20rpx;
   margin: 16rpx 0;
   border-radius: 16rpx;
   background-color: rgba(12, 20, 102, 0.04);

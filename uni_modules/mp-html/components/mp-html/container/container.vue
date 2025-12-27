@@ -23,7 +23,7 @@
         <view v-for="(task, index) in planTaskList" :key="index" class="plan-task-item">
           <!-- 字体图标实现的状态 -->
           <view class="task-status-icon" :class="getTaskStatusClass(task.status)">
-            <text class="task-icon">{{ getTaskStatusIcon(task.status) }}</text>
+            <text class="task-icon iconfont" :class="getTaskStatusIcon(task.status)"></text>
           </view>
           <text class="task-content">{{ task.content }}</text>
         </view>
@@ -116,6 +116,7 @@ export default {
       const data = result.data
       
       if (Array.isArray(data)) {
+        console.log('planTaskList', data)
         return data
       }
       
@@ -261,12 +262,12 @@ export default {
     // 获取任务状态图标 (使用字体图标unicode)
     getTaskStatusIcon(status) {
       const iconMap = {
-        'pending': '\ue649',      // 待处理
-        'in_progress': '\ue645',  // 进行中
-        'completed': '\ue636',    // 已完成
-        'failed': '\ue60d'        // 失败
+        'pending': 'icon-BorderOutlined',      // 待处理
+        'in_progress': 'icon-HourglassOutlined',  // 进行中
+        'completed': 'icon-CheckSquareOutlined',    // 已完成
+        'failed': 'icon-CloseSquareOutlined'        // 失败
       }
-      return iconMap[status] || '\ue649'
+      return iconMap[status] || 'icon-BorderOutlined'
     },
 
     // 格式化参数显示
@@ -382,7 +383,7 @@ export default {
       display: flex;
       flex-direction: row;
       align-items: flex-start;
-      gap: 16rpx;
+      gap: 8rpx;
       padding: 12rpx 0;
 
       .task-status-icon {

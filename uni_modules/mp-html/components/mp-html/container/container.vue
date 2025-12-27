@@ -33,7 +33,7 @@
     <!-- 非 Plan 类型：显示工具调用状态 -->
     <template v-else>
       <!-- 工具调用头部信息 -->
-      <view class="tool-header" @tap="toggleExpanded">
+      <view v-if="toolCall?.type !== 'Event'" class="tool-header" @tap="toggleExpanded">
         <view class="tool-info">
           <text class="tool-name">{{ toolCall.name || toolCall.type }}</text>
           <view class="tool-status-display">

@@ -2,7 +2,7 @@
   <view class="file-preview-h5" :style="containerStyle">
     <!-- Loading Overlay -->
     <view v-show="loading" class="state-overlay">
-      <text>加载中...</text>
+      <!-- <text>加载中...</text> -->
     </view>
     
     <!-- Error Overlay -->
@@ -39,7 +39,7 @@ export default {
     },
     height: {
       type: String,
-      default: '400px'
+      default: '100%'
     }
   },
   computed: {

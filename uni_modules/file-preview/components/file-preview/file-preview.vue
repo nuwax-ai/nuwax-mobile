@@ -16,33 +16,36 @@
 
     <!-- Content State (non-Office files) -->
     <view v-else-if="status === 'success' && !isOfficeDoc" class="content-area">
-        
-        <!-- Image -->
-        <image 
-            v-if="resolvedType === 'image'" 
-            class="preview-image" 
-            :src="src" 
-            mode="widthFix"
-            @tap="handleImageClick"
-            @error="handleError"
-        />
+        <view v-if="resolvedType === 'image' || resolvedType === 'audio' || resolvedType === 'video'"
+        class="w-full h-full flex items-center content-center"
+        >
+            <!-- Image -->
+            <image 
+                v-if="resolvedType === 'image'" 
+                class="preview-image" 
+                :src="src" 
+                mode="widthFix"
+                @tap="handleImageClick"
+                @error="handleError"
+            />
 
-        <!-- Audio -->
-        <video 
-            v-else-if="resolvedType === 'audio'" 
-            class="preview-audio" 
-            :src="src" 
-            :controls="true"
-        />
-        <!-- Note: rendering audio as video tag often works for simple players in uniapp or use audio component -->
+            <!-- Audio -->
+            <video 
+                v-else-if="resolvedType === 'audio'" 
+                class="w-full" 
+                :src="src" 
+                :controls="true"
+            />
+            <!-- Note: rendering audio as video tag often works for simple players in uniapp or use audio component -->
 
-        <!-- Video -->
-        <video 
-            v-else-if="resolvedType === 'video'" 
-            class="preview-video" 
-            :src="src" 
-            :controls="true"
-        />
+            <!-- Video -->
+            <video 
+                v-else-if="resolvedType === 'video'" 
+                class="w-full" 
+                :src="src" 
+                :controls="true"
+            />
+        </view>
 
         <!-- HTML / Markdown / Text -->
         <template v-else-if="['html'].includes(resolvedType)">
@@ -381,13 +384,8 @@ export default {
 
 .preview-image {
     width: 100%;
-    height: 100%;
+    height: auto;
     display: block;
-}
-
-.preview-video {
-    width: 100%;
-    height: 100%; 
 }
 
 .preview-text {

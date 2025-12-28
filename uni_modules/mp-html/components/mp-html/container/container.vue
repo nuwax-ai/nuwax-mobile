@@ -23,7 +23,7 @@
         <view v-for="(task, index) in planTaskList" :key="index" class="plan-task-item">
           <!-- 字体图标实现的状态 -->
           <view class="task-status-icon" :class="getTaskStatusClass(task.status)">
-            <text class="task-icon">{{ getTaskStatusIcon(task.status) }}</text>
+            <text class="task-icon iconfont" :class="getTaskStatusIcon(task.status)"></text>
           </view>
           <text class="task-content">{{ task.content }}</text>
         </view>
@@ -33,7 +33,7 @@
     <!-- 非 Plan 类型：显示工具调用状态 -->
     <template v-else>
       <!-- 工具调用头部信息 -->
-      <view class="tool-header" @tap="toggleExpanded">
+      <view v-if="toolCall?.type !== 'Event'" class="tool-header" @tap="toggleExpanded">
         <view class="tool-info">
           <text class="tool-name">{{ toolCall.name || toolCall.type }}</text>
           <view class="tool-status-display">
@@ -116,6 +116,7 @@ export default {
       const data = result.data
       
       if (Array.isArray(data)) {
+        console.log('planTaskList', data)
         return data
       }
       
@@ -209,7 +210,7 @@ export default {
       const iconMap = {
         'EXECUTING': 'icon-Loader',    // 执行中显示加载图标
         'FINISHED': 'icon-Check', // 已完成显示对勾
-        'FAILED': 'icon-X'     // 执行失败显示叉号
+        'FAILED': 'icon-waring'     // 执行失败显示叉号
       }
       return ` iconfont ${iconMap[status] || 'icon-Check'}`
     },
@@ -229,19 +230,21 @@ export default {
       const statusColorMap = {
         'EXECUTING': '#1890ff',
         'FINISHED': '#52c41a',
-        'FAILED': '#ff4d4f'
+        // 'FAILED': '#ff4d4f'
+        'FAILED': '#ffcb00'
       }
       return statusColorMap[status] || '#999'
     },
 
     // 获取状态文本
     getStatusText(status) {
-      const statusTextMap = {
-        'EXECUTING': '执行中',
-        'FINISHED': '已完成',
-        'FAILED': '执行失败'
-      }
-      return statusTextMap[status] || '未知状态'
+      return '';
+      // const statusTextMap = {
+      //   'EXECUTING': '执行中',
+      //   'FINISHED': '已完成',
+      //   'FAILED': '执行失败'
+      // }
+      // return statusTextMap[status] || '未知状态'
     },
 
     
@@ -259,12 +262,12 @@ export default {
     // 获取任务状态图标 (使用字体图标unicode)
     getTaskStatusIcon(status) {
       const iconMap = {
-        'pending': '\ue649',      // 待处理
-        'in_progress': '\ue645',  // 进行中
-        'completed': '\ue636',    // 已完成
-        'failed': '\ue60d'        // 失败
+        'pending': 'icon-BorderOutlined',      // 待处理
+        'in_progress': 'icon-HourglassOutlined',  // 进行中
+        'completed': 'icon-CheckSquareOutlined',    // 已完成
+        'failed': 'icon-CloseSquareOutlined'        // 失败
       }
-      return iconMap[status] || '\ue649'
+      return iconMap[status] || 'icon-BorderOutlined'
     },
 
     // 格式化参数显示
@@ -380,7 +383,7 @@ export default {
       display: flex;
       flex-direction: row;
       align-items: flex-start;
-      gap: 16rpx;
+      gap: 8rpx;
       padding: 12rpx 0;
 
       .task-status-icon {
@@ -431,6 +434,10 @@ export default {
         font-weight: 600;
         color: #333;
         line-height: 40rpx;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .tool-status-display {
@@ -442,7 +449,7 @@ export default {
         .status-icon {
           width: 32rpx;
           height: 32rpx;
-          border-radius: 50%;
+          // border-radius: 50%;
           display: flex;
           align-items: center;
           justify-content: center;
@@ -472,6 +479,7 @@ export default {
           font-size: 24rpx;
           color: #666;
           line-height: 32rpx;
+          margin-right: 6px;
         }
       }
     }

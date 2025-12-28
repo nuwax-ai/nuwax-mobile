@@ -95,7 +95,7 @@
                 <text class="file-name">{{ fileName || '未命名文件' }}</text>
                 <text class="file-tip">点击打开文档</text>
             </view>
-            <button class="action-btn" size="mini" @tap="handleDocClick" :loading="loadingDoc">打开</button>
+            <button size="mini" @tap="handleDocClick" :loading="loadingDoc">打开</button>
         </view>
         <!-- #endif -->
         <!-- #ifdef MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ -->
@@ -108,7 +108,7 @@
                 <text class="file-name">{{ fileName || '未命名文件' }}</text>
                 <text class="file-tip">点击打开文档</text>
             </view>
-            <button class="action-btn" size="mini" @tap="handleDocClick" :loading="loadingDoc">打开</button>
+            <button size="mini" @tap="handleDocClick" :loading="loadingDoc">打开</button>
         </view>
         <!-- #endif -->
     </view>
@@ -122,7 +122,7 @@
             <text class="file-name">{{ fileName || '未命名文件' }}</text>
             <text class="file-tip">暂不支持预览</text>
         </view>
-        <button class="action-btn" size="mini" @tap="handleDownload" v-if="showDownload">下载</button>
+        <button size="mini" @tap="handleDownload" v-if="showDownload">下载</button>
     </view>
 
   </view>
@@ -400,8 +400,11 @@ export default {
 
 .file-card {
     height: 100%;
+    width: 100%;
     display: flex;
     align-items: center;
+    justify-content: center;
+    gap: 20rpx;
     padding: 20rpx;
     background: #fff;
     border: 1px solid #eee;
@@ -422,9 +425,9 @@ export default {
 }
 
 .file-info {
-    flex: 1;
     display: flex;
     flex-direction: column;
+    gap: 12rpx;
     overflow: hidden;
     text-align: center;
 }
@@ -445,14 +448,13 @@ export default {
     margin-top: 4rpx;
 }
 
-.action-btn {
-    /* margin-left: 20rpx; */
-}
-
 .office-preview {
     width: 100%;
     height: 100%;
     min-height: 200rpx;
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 
 .office-iframe {

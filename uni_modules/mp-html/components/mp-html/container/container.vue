@@ -116,7 +116,6 @@ export default {
       const data = result.data
       
       if (Array.isArray(data)) {
-        console.log('planTaskList', data)
         return data
       }
       

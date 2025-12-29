@@ -62,10 +62,10 @@
 
             <!-- #ifndef H5 -->
             <view class="preview-text">
-                <mp-html :content="textContent" :markdown="resolvedType === 'markdown' || resolvedType === 'text'" />
-                <!-- <web-view
+                <!-- <mp-html :content="textContent" :markdown="resolvedType === 'markdown' || resolvedType === 'text'" /> -->
+                <web-view
                     :src="src"
-                ></web-view> -->
+                ></web-view>
             </view>
             <!-- #endif -->
         </template>

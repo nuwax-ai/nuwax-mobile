@@ -2,7 +2,7 @@
 
 > 本文档描述了 `chat-conversation-component` 会话组件中自动滚动到底部的完整逻辑规则。
 > 
-> **最后更新**: 2025-12-24
+> **最后更新**: 2025-12-30
 
 ---
 
@@ -11,7 +11,7 @@
 | 变量名 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `autoToLastMsg` | `boolean` | `false` | 是否启用自动滚动到底部 |
-| `scrollTouch` | `boolean` | `false` | 用户是否正在触摸滚动 |
+| `scrollTouch` | `boolean` | `false` | 用户是否正在触摸滚动（touchend 后延迟 300ms 重置） |
 | `mouseScroll` | `boolean` | `false` | 鼠标滚轮是否在滚动（H5专用） |
 | `scrollInBottom` | `boolean` | `true` | 当前视图是否在底部 |
 | `needSetLockAutoToLastMsg` | `boolean` | `true` | 是否需要检查锁定自动滚动 |

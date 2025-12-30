@@ -26,6 +26,7 @@
 </template>
 
 <script>
+import { API_BASE_URL } from '@/constants/config';
 export default {
   name: 'FilePreviewH5',
   props: {
@@ -64,8 +65,8 @@ export default {
         params.set('fileType', this.fileType);
       }
       
-      // Use /m/static/ for H5 deployment
-      return `${baseUrl}/m/static/file-preview.html?${params.toString()}`;
+      // Use /static/ for H5 deployment
+      return `${baseUrl}/static/file-preview.html?${params.toString()}`;
     }
   },
   data() {
@@ -96,6 +97,12 @@ export default {
   },
   methods: {
     getPreviewBaseUrl() {
+      // 判断是否为开发环境
+      if (process.env.NODE_ENV === 'development') {
+        console.log('API_BASE_URL',API_BASE_URL);
+        
+        return API_BASE_URL;
+      }
       // In development, use current origin
       // In production, use the same origin or configured base URL
       if (typeof window !== 'undefined') {

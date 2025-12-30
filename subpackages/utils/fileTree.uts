@@ -1,4 +1,6 @@
 import type { FileNode } from '@/types/interfaces/agent'
+import { ACCESS_TOKEN } from '@/constants/home.constants'
+import { COMMON_HEADERS } from '@/constants/common.constants'
 
 /**
  * 文件相关常量
@@ -227,43 +229,208 @@ export const transformFlatListToTree = (files: any[]): FileNode[] => {
   // #endif
 
   /**
-   * 小程序环境：下载文件
-   * @param downloadUrl 下载地址
+   * 小程序环境：下载文件并打包成zip
+   * @param downloadUrl 下载地址（应该是返回zip包的接口）
    * @param filename 文件名称
+   * @returns 返回保存的zip文件路径
    */
   // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
-  export const downloadFileInMiniProgram = async (downloadUrl: string, filename: string) => {
-    return new Promise<void>((resolve, reject) => {
+  export const downloadFileInMiniProgram = async (downloadUrl: string, filename: string): Promise<string> => {
+    return new Promise<string>((resolve, reject) => {
+      // 获取访问令牌并构建请求头
+      const accessToken = uni.getStorageSync(ACCESS_TOKEN);
+      const header: any = {
+        // ...COMMON_HEADERS,
+      };
+      if (accessToken) {
+        header['Authorization'] = `Bearer ${accessToken}`;
+      }
+      
       uni.showLoading({ title: '下载中...' });
       uni.downloadFile({
         url: downloadUrl,
+        header, // 添加请求头，确保认证通过
         success: (res) => {
+          console.log('下载文件响应:', res);
+          
           if (res.statusCode === 200) {
-            uni.saveFile({
-              tempFilePath: res.tempFilePath,
-              success: (saveRes) => {
-                uni.hideLoading();
-                uni.showToast({
-                  title: '文件已保存',
-                  icon: 'success',
+            // 验证下载的文件是否为zip格式
+            const fs = uni.getFileSystemManager();
+            const tempPath = res.tempFilePath;
+            
+            // 检查文件信息
+            fs.stat({
+              path: tempPath,
+              success: (statRes) => {
+                console.log('文件信息:', statRes);
+                
+                // 如果文件太小（小于1KB），可能是JSON错误响应
+                if (statRes.size < 1024) {
+                  // 尝试读取文件内容检查是否为JSON
+                  fs.readFile({
+                    filePath: tempPath,
+                    encoding: 'utf8',
+                    success: (readRes) => {
+                      try {
+                        const content = readRes.data as string;
+                        if (content.trim().startsWith('{') || content.trim().startsWith('[')) {
+                          // 是JSON响应，说明下载失败
+                          uni.hideLoading();
+                          const errorData = JSON.parse(content);
+                          uni.showToast({
+                            title: errorData.message || '下载失败：服务器返回错误',
+                            icon: 'none',
+                            duration: 3000,
+                          });
+                          reject(new Error(errorData.message || '服务器返回错误'));
+                          return;
+                        }
+                      } catch (e) {
+                        // 不是JSON，继续处理
+                      }
+                    },
+                    fail: () => {
+                      // 读取失败，继续保存流程
+                    },
+                  });
+                }
+                
+                // 先使用 uni.saveFile 保存文件，然后尝试重命名为正确的zip文件名
+                // 确保文件名有 .zip 扩展名
+                const zipFileName = filename.endsWith('.zip') ? filename : `${filename}.zip`;
+                
+                uni.saveFile({
+                  tempFilePath: tempPath,
+                  success: (saveRes) => {
+                    let savedFilePath = saveRes.savedFilePath;
+                    console.log('初始保存路径:', savedFilePath);
+                    
+                    // 如果保存的文件没有正确的扩展名，尝试重命名
+                    if (!savedFilePath.endsWith('.zip')) {
+                      // 获取文件目录和原文件名
+                      const pathParts = savedFilePath.split('/');
+                      const dirPath = pathParts.slice(0, -1).join('/');
+                      const newPath = `${dirPath}/${zipFileName}`;
+                      
+                      // 尝试重命名文件（异步方式）
+                      fs.rename({
+                        oldPath: savedFilePath,
+                        newPath: newPath,
+                        success: () => {
+                          savedFilePath = newPath;
+                          console.log('文件已重命名为:', savedFilePath);
+                          finishSave(savedFilePath, zipFileName);
+                        },
+                        fail: (renameErr) => {
+                          console.warn('重命名文件失败，尝试复制方式:', renameErr);
+                          
+                          // 如果重命名失败，尝试读取原文件并写入新文件
+                          fs.readFile({
+                            filePath: savedFilePath,
+                            success: (readFileRes) => {
+                              fs.writeFile({
+                                filePath: newPath,
+                                data: readFileRes.data as ArrayBuffer,
+                                success: () => {
+                                  // 删除旧文件
+                                  fs.unlink({
+                                    filePath: savedFilePath,
+                                    success: () => {
+                                      console.log('已删除旧文件');
+                                    },
+                                    fail: (e) => {
+                                      console.warn('删除旧文件失败:', e);
+                                    },
+                                  });
+                                  savedFilePath = newPath;
+                                  console.log('文件已复制并重命名为:', savedFilePath);
+                                  finishSave(savedFilePath, zipFileName);
+                                },
+                                fail: (writeErr) => {
+                                  console.error('写入新文件失败:', writeErr);
+                                  // 如果复制也失败，使用原路径
+                                  finishSave(savedFilePath, zipFileName);
+                                },
+                              });
+                            },
+                            fail: (readErr) => {
+                              console.error('读取文件失败:', readErr);
+                              // 如果读取失败，使用原路径
+                              finishSave(savedFilePath, zipFileName);
+                            },
+                          });
+                        },
+                      });
+                    } else {
+                      // 已经有正确的扩展名，直接完成保存
+                      finishSave(savedFilePath, zipFileName);
+                    }
+                  },
+                  fail: (err) => {
+                    uni.hideLoading();
+                    console.error('保存ZIP文件失败:', err);
+                    uni.showToast({
+                      title: '保存文件失败',
+                      icon: 'none',
+                      duration: 2000,
+                    });
+                    reject(err);
+                  },
                 });
-                resolve();
+                
+                // 完成保存流程的辅助函数
+                const finishSave = (filePath: string, zipFileName: string) => {
+                  uni.hideLoading();
+                  
+                  // 弹窗提示用户文件保存位置
+                  uni.showModal({
+                    title: '下载完成',
+                    content: `ZIP文件已保存成功！\n\n文件名：${zipFileName}\n文件路径：\n${filePath}\n\n提示：文件保存在小程序文件目录中，可通过微信设置中的小程序存储空间查看，或点击"打开"直接查看文件。`,
+                    confirmText: '打开',
+                    cancelText: '取消',
+                    success: (modalRes) => {
+                      if (modalRes.confirm) {
+                        // 打开文件
+                        uni.openDocument({
+                          filePath: filePath,
+                          fileType: 'zip',
+                          showMenu: true,
+                          success: () => {
+                            console.log('打开文件成功');
+                          },
+                          fail: (err) => {
+                            console.error('打开文件失败:', err);
+                            uni.showToast({
+                              title: '无法打开文件，请通过微信设置查看',
+                              icon: 'none',
+                              duration: 3000,
+                            });
+                          },
+                        });
+                      }
+                    },
+                  });
+                  
+                  resolve(filePath);
+                };
               },
-              fail: (err) => {
+              fail: (statErr) => {
                 uni.hideLoading();
-                console.error('保存文件失败:', err);
+                console.error('获取文件信息失败:', statErr);
                 uni.showToast({
-                  title: '保存文件失败',
+                  title: '文件验证失败',
                   icon: 'none',
+                  duration: 2000,
                 });
-                reject(err);
+                reject(statErr);
               },
             });
           } else {
             uni.hideLoading();
             uni.showToast({
-              title: '下载失败',
+              title: `下载失败: ${res.statusCode}`,
               icon: 'none',
+              duration: 2000,
             });
             reject(new Error(`下载失败: ${res.statusCode}`));
           }
@@ -272,8 +439,9 @@ export const transformFlatListToTree = (files: any[]): FileNode[] => {
           uni.hideLoading();
           console.error('下载文件失败:', err);
           uni.showToast({
-            title: '下载失败',
+            title: '下载失败，请检查网络',
             icon: 'none',
+            duration: 2000,
           });
           reject(err);
         },

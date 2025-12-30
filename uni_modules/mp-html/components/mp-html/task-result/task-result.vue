@@ -50,11 +50,6 @@
         return this.description || this.fileName || "查看结果";
       },
     },
-    data() {
-      return {
-        fileTreeData: [],
-      };
-    },
     methods: {
       /**
        * 从子节点中提取指定类型的文本内容
@@ -111,23 +106,25 @@
           // CustomActionService.openPreviewView(conversationId)
           const fileId = this.fileName.split(`${conversationId}/`).pop();
 
-          // 查找当前文件是否在 fileTreeData 存在
-          const file = this.fileTreeData.find((item) => item.name === fileId);
-          const path = "/subpackages/pages/file-preview-page/file-preview-page";
-          if (file) {
-            const url = `${path}?cId=${conversationId}&fileProxyUrl=${encodeURIComponent(file.fileProxyUrl)}`;
-            uni.navigateTo({ url });
-          } else {
+          try {
+            // uni.showLoading({
+            //   title: '加载中...',
+            // });
             const result = await apiGetStaticFileList(conversationId);
             if (result.code === SUCCESS_CODE) {
               const { files } = result.data || {};
               this.fileTreeData = files;
               const file = files.find((item) => item.name === fileId);
+              const path = "/subpackages/pages/file-preview-page/file-preview-page";
               if (file) {
                 const url = `${path}?cId=${conversationId}&fileProxyUrl=${encodeURIComponent(file.fileProxyUrl)}`;
                 uni.navigateTo({ url });
               }
             }
+          } catch (error) {
+            console.error('[TaskResult] 获取文件列表失败:', error);
+          } finally {
+            // uni.hideLoading();
           }
         } else {
           // 如果没有会话ID，发送事件让父组件处理

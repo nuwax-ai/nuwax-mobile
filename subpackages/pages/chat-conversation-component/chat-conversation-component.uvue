@@ -47,8 +47,9 @@
 						id="msg-list"
 						:scroll-with-animation="scrollWithAnimation"
 						@scroll="onScroll"
-						@touchstart="scrollTouch = true"
-						@touchend="scrollTouch = false"
+						@touchstart="handleTouchStart"
+						@touchend="handleTouchEnd"
+						@touchcancel="handleTouchEnd"
 					>
 						<new-conversation-set 
 							ref="newConversationSetRef" 
@@ -105,9 +106,9 @@
 									<text class="user-msg" v-if="item?.text" @longpress="onlongTapUserMsg(item)">{{item.text}}</text>
 								</template>
 							</template>
-						   <view class="content" v-if="chatSuggestList?.length">
-							 <button-wrapper  :chat-suggest-list="chatSuggestList" @button-click="handleButtonClick" />
-						   </view>
+							<view class="content" v-if="chatSuggestList?.length">
+								<button-wrapper :chat-suggest-list="chatSuggestList" @button-click="handleButtonClick" />
+							</view>
 						</view>
 						
 						<!-- 空状态内容 -->
@@ -123,11 +124,10 @@
 					</scroll-view>
 					
 					<!-- 滚动到底部按钮 -->
-					<view :style="{visibility: scrollInBottom || scrolling ? 'hidden' : 'visible'}" class="scroll-to-bottom" @click="scrollToLastMsg(true)">
+					<view :style="{visibility: scrollInBottom ? 'hidden' : 'visible'}" class="scroll-to-bottom" @click="scrollToLastMsg(true)">
 						<text class="iconfont icon-a-Chevrondown"></text>
 					</view>
 				</view>
-				
 				<!-- 输入框 -->
 				<chat-input-phone
 					v-if="isRenderInputPhone"
@@ -143,6 +143,8 @@
 					@onSendMessage="handleSendMessage"
 					@onStopConversation="handleStopConversation"
 					@onOpenPagePreview="(uri:string)=>handleOpenPagePreview({uri})"
+					:is-task-agent="agentInfo?.type === AgentTypeEnum.TaskAgent"
+					@onOpenFileTree="handleOpenFileTree"
 				/>
 			</view>
 		</template>
@@ -164,7 +166,17 @@
 			<!-- #endif -->
 		</template>
 
+		<!-- 页面预览 -->
 		<page-preview-iframe ref="pagePreviewIframeRef" @update-visible="updateVisible"/>
+		<!-- 文件树 -->
+		<file-tree 
+			ref="fileTreeRef" 
+			v-if="agentInfo?.type === AgentTypeEnum.TaskAgent" 
+			:cId="conversationId"
+			:files="fileList" 
+			:is-loading="isLoadingFiles" 
+			@update-visible="updatePopupFileTreeVisible"
+		/>
 	</view>
 </template>
 
@@ -177,7 +189,7 @@
 	import ScrollManager from './layers/ScrollManager.uts'
 	
 	// 类型定义
-	import { MessageTypeEnum, HideChatAreaEnum, ExpandPageAreaEnum } from '@/types/enums/agent'
+	import { MessageTypeEnum, HideChatAreaEnum, ExpandPageAreaEnum, AgentTypeEnum } from '@/types/enums/agent'
 	import { apiAgentConversation } from '@/subpackages/servers/conversation'
 	import { SUCCESS_CODE } from '@/constants/codes.constants'
 	import type { ChatInputPhoneRef } from '@/types/interfaces/chat.uts'
@@ -190,6 +202,7 @@
 	import ChatInputPhone from '@/components/chat-input-phone/chat-input-phone.uvue'
 	import NewConversationSet from './components/new-conversation-set/new-conversation-set.uvue'
 	// import AliyunCaptcha from './components/aliyun-captcha/aliyun-captcha.uvue'
+	import FileTree from './components/file-tree/file-tree.uvue'
 
 	// 常量
 	import { CONVERSATION_PAYLOAD, TEMP_CONVERSATION_UID, TEMP_CHAT_KEY } from '@/constants/common.constants'
@@ -238,7 +251,6 @@
 	const msgListRef = ref<HTMLElement | null>(null)
 	// 用户临时票据
 	const ticket = ref<string>('')
-		
 	/**
 	 * 是否渲染输入框组件， 进入页面后渲染，离开页面后卸载组件
 	 * 出现一个bug，当从智能体详情页面返回首页时，录音后发送消息事件触发的是智能体详情页绑定的消息事件，而不是首页绑定的消息事件
@@ -246,6 +258,14 @@
 	 */
 	const isRenderInputPhone = ref<boolean>(false)
 
+	// 文件树弹窗是否可见
+	const popupFileTreeVisible = ref<boolean>(false)
+
+	// 文件树引用
+	const fileTreeRef = ref<{
+		open: () => void
+		close: () => void
+	} | null>(null)
 
 	const customMenuList = computed<MenuListItem[]>(() => {
 		const collectIcon = agentInfo.value?.collect ? 'icon-Star-fill' : 'icon-Star'
@@ -272,6 +292,11 @@
 	const updateVisible = (value: boolean) => {
 		pagePreviewVisible.value = value
 	}
+
+	// 处理文件树弹窗可见性变化
+	const updatePopupFileTreeVisible = (value: boolean) => {
+		popupFileTreeVisible.value = value
+	}
 	// ==================== 初始化分层架构 ====================
 	// 创建各层实例
 	const data = new AgentDetailData()
@@ -289,7 +314,7 @@
 		userFillVariables, processingList,
 		scrollIntoView, scrollInBottom, scrollWithAnimation,
 		scrollTouch, scrolling, keyboardHeight, refMorePopup, isStoppingConversation, 
-		isConversationActive, isSendMessageRef, wholeDisabled
+		isConversationActive, isSendMessageRef, wholeDisabled, fileList, isLoadingFiles
 	} = data
 
 	// 处理禁用发送按钮
@@ -312,6 +337,9 @@
 	// 临时会话
 	const queryTempConversation = (conversationUid: string) => service.queryTempConversation(conversationUid)
 	const createTempChatConversation = (captchaVerifyParam: string) => service.createTempChatConversation(captchaVerifyParam)
+
+	// 获取文件树列表
+	const fetchFileList = (cId: number) => service.fetchFileList(cId)
 
 	// 组件管理层 - 使用箭头函数保持this上下文
 	const setMessageRef = (...args: any[]) => componentManager.setMessageRef(...args)
@@ -353,12 +381,13 @@
 		scrollToLastMsg(false)
 		
 		service.handleSendMessage(params, props.isTempChat, ()=>{
+			console.log('超时回调触发');
+			// 将工具调用状态从 loading 修改为 error
+			// service.updateProcessingListToFailed()
 			// 中止当前会话
 			chatService?.abort()
 			// 停止会话
 			handleStopConversation()
-			console.log('超时回调触发');
-			
 		})
 	}
 
@@ -474,10 +503,13 @@
 	 * 思考内容变化处理
 	 */
 	const changeThinkContent = (hideThinkContent: boolean): void => {
-		setIsInScrollBottom()
-		if (data.autoToLastMsg.value) {
+		// 注意：不要在这里调用 setIsInScrollBottom()，因为没有事件参数会导致状态错误
+		if (!data.scrollTouch.value && data.autoToLastMsg.value) {
 			nextTick(() => {
-				scrollToLastMsg(false)
+				// 再次检查条件，防止用户在这期间滚动了
+				if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+					scrollToLastMsg(false)
+				}
 			})
 		}
 	}
@@ -494,14 +526,18 @@
 	// 标题
 	const headerTitle = computed(() => (props.isTempChat && agentInfo.value?.name) ? `和${agentInfo.value?.name}开始会话` : agentInfo.value?.name)
 
+
 	// ==================== 页面加载处理 ==================== 
 	const handleScrollToLastMsg = async () => {
-		setIsInScrollBottom()
+		// 注意：不要在这里调用 setIsInScrollBottom()，因为没有事件参数会导致状态错误
 		lockAutoToLastMsg()
 		if (!data.scrollTouch.value && data.autoToLastMsg.value) {
 			await nextTick()
 			setTimeout(() => {
-				scrollToLastMsg(false)
+				// 在 setTimeout 内再次检查条件，防止用户在这期间滚动了
+				if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+					scrollToLastMsg(false)
+				}
 			}, 100)
 		}
 	}
@@ -746,7 +782,6 @@
 		})
 		// #endif
 
-
 		// 判断是否是临时会话
 		if (props.isTempChat) {
 			await handleTempChatPageLoad(params)
@@ -755,11 +790,69 @@
 		}
 	})
 
+	// 刷新文件列表
+	const onRefreshFileList = () => {
+		// 如果智能体类型为任务型智能体，并且会话id存在,并且文件树弹窗可见，则获取文件树列表
+    if (agentInfo.value?.type === AgentTypeEnum.TaskAgent && conversationId.value && popupFileTreeVisible.value) {
+      fetchFileList(conversationId.value)
+    }
+  }
+
+	// 处理消息组件更新事件
+	const handleUpdateMessageComponent = (eventData: any) => {
+		updateMessageComponent(eventData.messageId, eventData.data)
+	}
+
+	// 流式消息滚动定时器
+	let streamScrollTimer: number = 0
+	// 触摸结束延迟计时器
+	let touchEndTimer: number = 0
+
+	// 触摸开始处理
+	const handleTouchStart = () => {
+		// 清除触摸结束延迟计时器，确保触摸开始时立即生效
+		if (touchEndTimer) {
+			clearTimeout(touchEndTimer)
+			touchEndTimer = 0
+		}
+		data.scrollTouch.value = true
+	}
+
+	// 触摸结束处理 - 延迟重置 scrollTouch
+	const handleTouchEnd = () => {
+		// 清除之前的计时器
+		if (touchEndTimer) {
+			clearTimeout(touchEndTimer)
+		}
+		// 延迟 300ms 后才重置 scrollTouch
+		// 这样在用户快速滑动时，自动滚动不会在手指抬起的瞬间抢占
+		touchEndTimer = setTimeout(() => {
+			data.scrollTouch.value = false
+			touchEndTimer = 0
+		}, 300)
+	}
+
+	const handleStreamMessageUpdate = () => {
+		// 使用防抖处理，避免频繁滚动影响性能
+		// 150ms 可以在保证流畅滚动的同时减少性能开销
+		if (streamScrollTimer) {
+			clearTimeout(streamScrollTimer)
+		}
+		streamScrollTimer = setTimeout(() => {
+			if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+				scrollToLastMsg(false)
+			}
+		}, 150)
+	}
+
 	// 设置事件监听器
 	onMounted(() => {
-		uni.$on('updateMessageComponent', (eventData: any) => {
-			updateMessageComponent(eventData.messageId, eventData.data)
-		})
+		// 监听流式消息更新事件，触发自动滚动到底部
+		// 兼容微信小程序和 H5
+		uni.$on('streamMessageUpdate', handleStreamMessageUpdate)
+		
+		uni.$on('refreshFileList', onRefreshFileList)
+		uni.$on('updateMessageComponent', handleUpdateMessageComponent)
 		// #ifdef H5
 		window.addEventListener('wheel', (e: WheelEvent) => {
 			data.mouseScroll.value = true
@@ -776,7 +869,9 @@
 	
 	// 清理事件监听器
 	onUnmounted(() => {
-		uni.$off('updateMessageComponent')
+		uni.$off('streamMessageUpdate', handleStreamMessageUpdate)
+		uni.$off('refreshFileList', onRefreshFileList)
+		uni.$off('updateMessageComponent', handleUpdateMessageComponent)
 		// 页面卸载时取消监听，防止内存泄漏
 		uni.$off('page_preview_executing', handlePagePreviewExecuting);
 		// 清理微信小程序事件监听器，防止返回首页后仍然触发当前页面的事件
@@ -788,7 +883,14 @@
 		isRenderInputPhone.value = false
 	})
 
-
+	// 打开工作台文件树弹窗
+	const handleOpenFileTree = () => {
+		popupFileTreeVisible.value = true
+		// 打开文件树弹窗
+		fileTreeRef.value?.open()
+		// 查询文件列表
+		onRefreshFileList()
+	}
 	defineExpose({
 		getAgentInfo: ()=> agentInfo.value,
 	})

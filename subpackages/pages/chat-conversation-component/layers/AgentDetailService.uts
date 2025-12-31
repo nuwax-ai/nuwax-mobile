@@ -41,16 +41,29 @@ import {
   apiPublishedAgentInfo,
   apiCollectAgent,
   apiUnCollectAgent,
+  apiGetStaticFileList,
 } from "@/servers/agentDev";
 import { v4 as uuidv4 } from "uuid";
 import AgentDetailData from "./AgentDetailData.uts";
 import { getCustomBlock } from "@/subpackages/utils/containerHelper.uts";
 import { replaceMathBracket } from "@/utils/markdown.uts";
+import { adaptHistoryMessage } from "@/utils/historyMessageAdapter";
 import AgentDetailUtils from "./AgentDetailUtils.uts";
 import { TEMP_CONVERSATION_UID } from "@/constants/common.constants";
 import { API_BASE_URL } from "@/constants/config";
-import { ExpandPageAreaEnum, HideChatAreaEnum } from "@/types/enums/agent.uts";
+import {
+  ExpandPageAreaEnum,
+  HideChatAreaEnum,
+  AgentComponentTypeEnum,
+} from "@/types/enums/agent.uts";
 import { ProcessingEnum } from "@/types/enums/common.uts";
+import { CustomActionService } from "@/utils/customActionService";
+import { transformFlatListToTree } from "@/subpackages/utils/fileTree";
+import {
+  extractTaskResult,
+  getFileProxyUrlByConversationIdAndFilePath,
+  jumpToFilePreviewPage,
+} from "@/utils/system.uts";
 
 const handleMessageProcess = (text: string): string => {
   return text; // 目前由于方案 已经整体切换到 mp-html内处理 所这里都关闭了
@@ -98,16 +111,19 @@ export default class AgentDetailService {
     // 排除预置问题
     const len = _messageList?.filter((item) => !!item.id).length || 0;
     if (len) {
-      // 处理消息文本，应用数学公式格式转换
+      // 处理消息文本，先适配历史消息格式（PC端HTML标签转移动端Markdown语法）
       const processedMessageList = _messageList.map((message: MessageInfo) => {
-        if (message.text) {
-          const text = handleMessageProcess(message.text);
-          // 使用同步方法生成ID，兼容所有平台
-          const id = message.id || generateUniqueId();
+        // 适配历史消息：将PC端自定义HTML标签转换为移动端Markdown容器语法
+        // 同时将componentExecutedList转换为processingList
+        const adaptedMessage = adaptHistoryMessage(message);
 
-          return { ...message, text, id };
-        }
-        return message;
+        // 确保 text 字段始终有值，避免 undefined 导致渲染错误
+        const rawText = adaptedMessage.text ?? "";
+        const text = handleMessageProcess(rawText);
+        // 使用同步方法生成ID，兼容所有平台
+        const id = adaptedMessage.id || generateUniqueId();
+
+        return { ...adaptedMessage, text, id };
       });
 
       // this.data.messageList.value = processedMessageList
@@ -154,6 +170,11 @@ export default class AgentDetailService {
     // 添加空值检查
     if (!res) {
       console.warn("[AgentDetailService] handleChangeMessageList 收到空响应");
+      return;
+    }
+
+    // 忽略心跳包 (HEART_BEAT 不包含 data)
+    if (res.eventType === "HEART_BEAT") {
       return;
     }
 
@@ -214,7 +235,33 @@ export default class AgentDetailService {
           responseData,
         ] as ProcessingInfo[],
       };
-      // handleChatProcessingList 方法需要从 AgentDetailUtils 中保留或简化
+
+      // 长任务型任务处理
+      const conversationId = this.data.conversationId.value;
+
+      // 长任务型任务处理(打开远程桌面)
+      // if (
+      //   responseData.type === AgentComponentTypeEnum.Event &&
+      //   (responseData as any).subEventType === 'OPEN_DESKTOP' &&
+      //   conversationId
+      // ) {
+      //   console.log('[AgentDetailService] Action: RECEIVE_EVENT, Params:', { type: 'OPEN_DESKTOP', conversationId, payload: responseData });
+      //   // 详情见 docs/agent_integration_guide.md
+      //   CustomActionService.openDesktopView(conversationId);
+      // }
+
+      // 长任务型任务处理(刷新文件树)
+      if (
+        responseData.type === AgentComponentTypeEnum.ToolCall &&
+        conversationId
+      ) {
+        console.log("[AgentDetailService] Action: RECEIVE_TOOL_CALL, Params:", {
+          type: "REFRESH_FILE_LIST",
+          conversationId,
+          payload: responseData,
+        });
+        CustomActionService.refreshFileList(conversationId);
+      }
     }
 
     if (eventType === ConversationEventTypeEnum.MESSAGE) {
@@ -307,6 +354,13 @@ export default class AgentDetailService {
     // 确保消息列表更新是同步的
     this.data.messageList.value = [...list];
 
+    // 流式渲染过程中触发自动滚动到底部
+    // 确保 autoToLastMsg 为 true，这样 watch 触发后会执行滚动
+    if (this.data.autoToLastMsg.value) {
+      // 通过事件总线通知主组件执行滚动，兼容微信小程序和 H5
+      uni.$emit("streamMessageUpdate");
+    }
+
     // 调试日志：状态更新
     // if (newMessage) {
     // 	console.log(`[Stream] Message ${currentMessageId} updated: status=${newMessage.status}, textLength=${newMessage.text?.length || 0}`)
@@ -334,6 +388,34 @@ export default class AgentDetailService {
     }
   }
 
+  // 获取文件树列表
+  async fetchFileList(cId: number): Promise<void> {
+    try {
+      this.data.isLoadingFiles.value = true;
+      const result = await apiGetStaticFileList(cId);
+      this.data.isLoadingFiles.value = false;
+      if (result.code === SUCCESS_CODE) {
+        const { files } = result.data || {};
+
+        let treeData: FileNode[] = [];
+
+        // 检查是否是新的扁平格式
+        if (Array.isArray(files) && files.length > 0 && files[0].name) {
+          treeData = transformFlatListToTree(files);
+        } else if (Array.isArray(files)) {
+          // 如果是原有的树形格式，直接使用
+          treeData = files as FileNode[];
+        }
+
+        this.data.fileList.value = treeData;
+      }
+    } catch (error) {
+      console.error("[AgentDetailService] 获取文件树列表失败:", error);
+    } finally {
+      this.data.isLoadingFiles.value = false;
+    }
+  }
+
   /**
    * 会话处理
    */
@@ -350,6 +432,10 @@ export default class AgentDetailService {
       this.data.chatSuggestList.value = [];
       // 开始会话后，允许获取问题建议
       this.isAllowSuggest = true;
+
+      // 标记是否已经更新过主题，确保只更新一次
+      let hasUpdatedTopic = false;
+
       await chatService.sendMessage(
         params,
         // 处理流式数据
@@ -374,6 +460,17 @@ export default class AgentDetailService {
               );
               return;
             }
+
+            // 流式数据开始时，第一次收到数据时更新主题（只执行一次）
+            if (
+              !hasUpdatedTopic &&
+              !isTempChat &&
+              this.data.needUpdateTopicRef.value
+            ) {
+              hasUpdatedTopic = true;
+              this.handleUpdateTopic(params.conversationId, params.message);
+            }
+
             this.handleChangeMessageList(result, currentMessageId);
           } catch (error) {
             console.error(
@@ -388,7 +485,7 @@ export default class AgentDetailService {
         },
         // 完成回调
         async () => {
-          // 如果不是临时会话,则处理问题建议和更新主题，临时会话，不需要处理问题建议和更新主题
+          // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
           if (!isTempChat) {
             if (this.data.isSuggest.value && this.isAllowSuggest) {
               const responseData = await apiAgentConversationChatSuggest(
@@ -397,9 +494,26 @@ export default class AgentDetailService {
               // 更新问题建议列表
               this.data.chatSuggestList.value = responseData?.data ?? [];
             }
-            // 第一次发送消息后更新主题
-            if (this.data.needUpdateTopicRef.value) {
-              this.handleUpdateTopic(params.conversationId, params.message);
+          }
+          // 会话完成后根据消息列表中的最后一条消息 判断是否存在 <task-result> 标签
+          const lastMessage =
+            this.data.messageList.value[this.data.messageList.value.length - 1];
+
+          const taskResult = extractTaskResult(lastMessage.text);
+          if (taskResult.hasTaskResult && taskResult.file) {
+            try {
+              const conversationId = this.data.conversationId.value;
+              const fileProxyUrl =
+                await getFileProxyUrlByConversationIdAndFilePath(
+                  conversationId,
+                  taskResult.file,
+                );
+              jumpToFilePreviewPage(conversationId, fileProxyUrl);
+            } catch (error) {
+              console.error(
+                "会话完成后根据消息列表中的最后一条消息 判断是否存在 <task-result> 标签失败:",
+                error,
+              );
             }
           }
         },
@@ -441,7 +555,9 @@ export default class AgentDetailService {
       if (isTempChat) {
         res = await apiTempChatConversationStop(requestId);
       } else {
-        res = await apiAgentConversationChatStop(requestId);
+        res = await apiAgentConversationChatStop(
+          String(this.data.conversationId.value),
+        );
       }
       const { code, data: responseData, message } = res;
       this.data.isStoppingConversation.value = false;
@@ -459,6 +575,58 @@ export default class AgentDetailService {
       this.data.isStoppingConversation.value = false;
       this.data.isConversationActive.value = false;
     }
+  }
+
+  /**
+   * 将正在执行的工具调用状态更新为失败
+   * 用于超时或异常中断时的状态更新
+   */
+  updateProcessingListToFailed(): void {
+    console.log('[AgentDetailService] 开始更新工具调用状态为 FAILED');
+    
+    const messageList = this.data.messageList.value;
+    if (!messageList || messageList.length === 0) {
+      console.log('[AgentDetailService] 消息列表为空，无需更新');
+      return;
+    }
+
+    // 查找正在处理中的消息（状态为 Loading 或 Incomplete）
+    const updatedMessages = messageList.map(message => {
+      // 只处理正在进行中的助手消息
+      if (
+        (message.status === MessageStatusEnum.Loading || 
+         message.status === MessageStatusEnum.Incomplete) &&
+        message.processingList && 
+        message.processingList.length > 0
+      ) {
+        console.log(`[AgentDetailService] 更新消息 ${message.id} 的工具调用状态`);
+        
+        // 更新 processingList 中的状态
+        const updatedProcessingList = message.processingList.map(processing => {
+          // 将所有 EXECUTING 状态的工具调用改为 FAILED
+          if (processing.status === ProcessingEnum.EXECUTING) {
+            console.log(`[AgentDetailService] 工具 ${processing.name} 状态从 EXECUTING 改为 FAILED`);
+            return {
+              ...processing,
+              status: ProcessingEnum.FAILED
+            };
+          }
+          return processing;
+        });
+
+        // 返回更新后的消息
+        return {
+          ...message,
+          processingList: updatedProcessingList
+        };
+      }
+      
+      return message;
+    });
+
+    // 更新消息列表
+    this.data.messageList.value = updatedMessages;
+    console.log('[AgentDetailService] 工具调用状态更新完成');
   }
 
   /**

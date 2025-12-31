@@ -47,7 +47,7 @@
             />
         </view>
 
-        <!-- HTML / Markdown / Text -->
+        <!-- HTML -->
         <template v-else-if="['html'].includes(resolvedType)">
             <!-- #ifdef H5 -->
             <view class="html-preview-container">
@@ -70,7 +70,7 @@
             <!-- #endif -->
         </template>
 
-        <!-- HTML / Markdown / Text -->
+        <!-- Markdown / Text -->
         <view v-else-if="['markdown', 'text'].includes(resolvedType)" class="preview-text">
              <mp-html :content="textContent" :markdown="resolvedType === 'markdown' || resolvedType === 'text'" />
         </view>
@@ -118,6 +118,7 @@
 
     <!-- Unsupported File (File Card Style) -->
     <view v-if="status === 'unsupported' || (status === 'idle' && resolvedType === 'unsupported')" class="file-card">
+        {{ status }}勾搭噶是的 {{ resolvedType }}
         <view class="file-icon">
             <text class="icon-text">{{ getExtension(fileName || src).toUpperCase() }}</text>
         </view>
@@ -221,7 +222,16 @@ export default {
             console.log('[FilePreview] Init preview for type:', type, 'isDocOrUnsupported:', this.isDocOrUnsupported);
             
             // Text/MD/HTML: Fetch content
-            if (['html', 'markdown', 'text'].includes(type)) {
+            // if (['html', 'markdown', 'text'].includes(type)) {
+
+            /**
+             * HTML 文件在h5中是使用iframe直接渲染的，所以直接设置为成功状态
+             * 在小程序中是使用web-view组件渲染的，不需要通过fetchTextContent方法获取内容
+             * 因为后端的tickek参数值，只能使用一次，如果先通过ticket获取了内容，再通过web-view组件渲染，会导致ticket参数值失效
+             */
+            if (['html'].includes(type)) {
+                this.status = 'success';
+            } else if (['markdown', 'text'].includes(type)) {
                 await this.fetchTextContent();
             } 
             // Image/Audio/Video: Ready to render

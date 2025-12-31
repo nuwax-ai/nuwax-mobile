@@ -85,6 +85,8 @@
 <script>
 import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue'
 import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
+import { getCurrentPageParams } from '@/utils/common';
+import { getFileProxyUrlByConversationIdAndFilePath, jumpToFilePreviewPage } from '@/utils/system.uts';
 
 export default {
   name: 'Container',
@@ -148,7 +150,21 @@ export default {
     },
 
     // 切换展开状态
-    toggleExpanded() {
+   async toggleExpanded() {
+      const result = this.data?.result;
+
+      // 打开预览页面
+      if (result?.kind === 'edit') {
+        const params = getCurrentPageParams();
+
+        const conversationId = params.conversationId;
+        const file_path = result?.input?.file_path;
+
+        const fileProxyUrl = await getFileProxyUrlByConversationIdAndFilePath(conversationId, file_path);
+        jumpToFilePreviewPage(conversationId, fileProxyUrl);
+        return;
+      }
+
       this.expanded = !this.expanded
     },
     

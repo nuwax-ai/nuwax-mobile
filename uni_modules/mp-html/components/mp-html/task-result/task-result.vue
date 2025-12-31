@@ -18,9 +18,10 @@
 </template>
 
 <script>
-  import { CustomActionService } from "@/utils/customActionService.uts";
-  import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { apiGetStaticFileList } from "@/servers/agentDev.uts";
+  import {
+    getFileProxyUrlByConversationIdAndFilePath,
+    jumpToFilePreviewPage,
+  } from "@/utils/system.uts";
 
   export default {
     name: "TaskResult",
@@ -103,28 +104,16 @@
         }
 
         if (conversationId) {
-          // CustomActionService.openPreviewView(conversationId)
-          const fileId = this.fileName.split(`${conversationId}/`).pop();
-
           try {
-            // uni.showLoading({
-            //   title: '加载中...',
-            // });
-            const result = await apiGetStaticFileList(conversationId);
-            if (result.code === SUCCESS_CODE) {
-              const { files } = result.data || {};
-              this.fileTreeData = files;
-              const file = files.find((item) => item.name === fileId);
-              const path = "/subpackages/pages/file-preview-page/file-preview-page";
-              if (file) {
-                const url = `${path}?cId=${conversationId}&fileProxyUrl=${encodeURIComponent(file.fileProxyUrl)}`;
-                uni.navigateTo({ url });
-              }
-            }
+            const fileId = this.fileName.split(`${conversationId}/`).pop();
+            const fileProxyUrl =
+              await getFileProxyUrlByConversationIdAndFilePath(
+                conversationId,
+                fileId,
+              );
+            jumpToFilePreviewPage(conversationId, fileProxyUrl);
           } catch (error) {
-            console.error('[TaskResult] 获取文件列表失败:', error);
-          } finally {
-            // uni.hideLoading();
+            console.error("[TaskResult] 获取文件列表失败:", error);
           }
         } else {
           // 如果没有会话ID，发送事件让父组件处理

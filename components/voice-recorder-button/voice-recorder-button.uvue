@@ -1,0 +1,446 @@
+<template>
+  <!-- :hover-class="currentState === 'recording' ? 'hover-class' : ''" -->
+  <button class="voice-recorder-container"
+    hover-class="hover-class"
+    hover-start-time="50"
+    @touchstart="handleTouchStart"
+    @touchend="handleTouchEnd"
+    @touchcancel="cancelRecording"
+    @touchmove="handleTouchMove">
+    <!-- 点击时隐藏按钮文字 -->
+    <view v-show="!isTapped">
+      <!-- 状态提示文字 -->
+      <text class="hover-text" v-if="currentState === 'default'">按住说话</text>
+      <view class="icon-loading-text" v-else-if="currentState === 'uploading'">
+        <image
+          class="icon-loading-image"
+          src="@/static/assets/icon_loading.svg"
+          :show-menu-by-longpress="false"
+          @longtap.stop.prevent
+          @contextmenu.stop.prevent="true"
+          mode="widthFix" />
+        <text class="loading-text">语音识别中</text>
+      </view>
+    </view>
+  </button>
+</template>
+
+<script lang="uts" setup>
+  // #ifdef H5
+  import jzRecorder from '@/uni_modules/jz-h5-recorder-manager'
+  // #endif
+
+  import {
+    createAudioUploader,
+    type AudioFile as UploaderAudioFile,
+    type TranscriptResult as UploaderTranscriptResult,
+    type UploadProgress
+  } from '@/servers/audioUploader'
+  import { MicrophonePermissionHelper, type PermissionState } from '@/utils/permissionHelper'
+
+  // 组件Props类型定义
+  interface VoiceRecorderProps {
+    // 录音配置
+    duration?: number        // 最大录音时长 (ms)
+    format?: string         // 音频格式
+    sampleRate?: number     // 采样率
+    // 会话是否正在进行中（有消息正在处理）
+    isConversationActive?: boolean
+  }
+
+  // 录音状态类型
+  type RecordState = 'default' | 'recording' | 'uploading' | 'success' | 'error'
+
+  // 音频文件接口
+  interface AudioFile {
+    tempFilePath: string
+    duration: number
+    fileSize: number
+    format?: string
+  }
+
+  // 转换结果接口
+  interface TranscriptResult {
+    success: boolean
+    text: string
+    confidence: number
+    duration: number
+    error?: string
+  }
+
+  const props = withDefaults(defineProps<VoiceRecorderProps>(), {
+    duration: 600000, // 录音时长10分钟
+    format: 'mp3', // 录音格式
+    sampleRate: 44100, // 采样率
+    isConversationActive: false  // 会话是否正在进行中
+  })
+
+  const emit = defineEmits<{
+    // 事件回调
+    onRecordStart?: () => void,
+    onRecordStop?: (result: string) => void,
+    onError?: (error: any) => void,
+    onUploadProgress?: (progress: number) => void
+    // onCancelChange?: (isCancelled: boolean) => void
+    onRecordCancel?: () => void
+    onRecordEnd?: () => void
+  }>()
+
+  // 响应式状态
+  const currentState = ref<RecordState>('default')
+  const isCancelled = ref<boolean>(false)
+  // 是否点击
+  const isTapped = ref<boolean>(false)
+  // 录音管理器
+  let recorderManager: any = null
+  // 音频上传服务
+  let audioUploadService: any = null // 使用audioUploader
+
+  // 重置状态
+  const resetState = () => {
+    currentState.value = 'default'
+    isCancelled.value = false
+    isTapped.value = false
+  }
+
+  // 录音错误
+  const handleRecordError = (err: any) => {
+    resetState()
+    // 重置触摸结束取消录音标志
+    // #ifdef H5
+    if (recorderManager && recorderManager.touchEndCancelFlag !== undefined) {
+      recorderManager.touchEndCancelFlag = false;
+    }
+    // #endif
+    emit('onError', err)
+  }
+
+  // 开始录音
+  const handleTouchStart = async (e) => {
+    console.log('开始录音handleTouchStart')
+    e.preventDefault() // Prevent default to avoid context menu
+
+    // 重置触摸结束取消录音标志
+    // #ifdef H5
+    if (recorderManager && recorderManager.touchEndCancelFlag !== undefined) {
+      recorderManager.touchEndCancelFlag = false;
+    }
+    // #endif
+
+    if (props.isConversationActive) {
+      emit('onError', new Error('会话正在进行中，请先暂停现有会话'))
+      return
+    }
+    if (currentState.value !== 'default') {
+      // emit('onError', new Error('请先停止当前录音' + currentState.value))
+      return
+    }
+
+    isTapped.value = true;
+    uni.showLoading({
+      title: '正在连接',
+    })
+
+    // 开始录音
+    if (recorderManager) {
+      try {
+        recorderManager.start({
+          duration: Math.min(props.duration, 600000), // 小程序最大录音时长限制为10分钟
+          sampleRate: props.sampleRate,
+          numberOfChannels: 1,
+          encodeBitRate: 192000,
+          format: props.format || 'mp3' // 小程序只支持mp3和aac
+        })
+      } catch (error: any) {
+        uni.hideLoading()
+        resetState()
+        emit('onError', error)
+      }
+    }
+  }
+
+  // 监听录音开始
+  const handleRecordStart = () => {
+    console.log('录音开始handleRecordStart')
+    // 设置状态，开始录音，并触发事件
+    currentState.value = 'recording'
+    emit('onRecordStart')
+    uni.hideLoading()
+  }
+
+  // 录音中结束
+  const handleTouchEnd = () => {
+    console.log('录音中结束handleTouchEnd')
+    // #ifdef H5
+    if (recorderManager && recorderManager.touchEndCancelFlag !== undefined) {
+      recorderManager.touchEndCancelFlag = true;
+    }
+    // #endif
+    isTapped.value = false;
+    // 如果正在上传，则不停止录音
+    if (currentState.value === 'uploading') {
+      return
+    }
+    if (isCancelled.value) {
+      cancelRecording()
+    } else {
+      stopRecording()
+    }
+  }
+
+  // 取消录音
+  const cancelRecording = () => {
+    if (recorderManager) {
+      recorderManager.stop()
+    }
+    resetState()
+    // 重置触摸结束取消录音标志
+    // #ifdef H5
+    if (recorderManager && recorderManager.touchEndCancelFlag !== undefined) {
+      recorderManager.touchEndCancelFlag = false;
+    }
+    // #endif
+    emit('onRecordCancel')
+  }
+
+  // 录音停止
+  const handleRecordStop = async (res: any) => {
+    console.log('录音停止handleRecordStop')
+    // 录音总时长，H5端单位秒，小程序端单位毫秒, 后续判断时长是否超过10分钟，是以秒为单位，所以小程序端需要将毫秒转为秒
+    let duration = res.duration || 0
+
+    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    duration = duration / 1000
+    // #endif
+
+    // 小程序端的录音结果格式可能与H5端不同，需要统一处理
+    const audioFile: AudioFile = {
+      tempFilePath: res.tempFilePath, // 录音文件的临时路径
+      duration,
+      fileSize: res.fileSize || 0, // 录音文件大小，单位字节
+      format: res.format || 'mp3'
+    }
+
+    // 重置触摸结束取消录音标志
+    // #ifdef H5
+    if (recorderManager && recorderManager.touchEndCancelFlag !== undefined) {
+      recorderManager.touchEndCancelFlag = false;
+    }
+    // #endif
+
+    // 立即显示上传中状态，给用户明确反馈
+    currentState.value = 'uploading'
+
+    try {
+      // 使用音频上传服务转换音频
+      const result = await uploadAndConvertWithService(audioFile)
+      if (result.success) {
+        currentState.value = 'success'
+        emit('onRecordStop', result.text)
+        // 重置状态
+        resetState()
+      } else {
+        throw new Error(result?.text || '未识别到文字')
+      }
+    } catch (error: any) {
+      handleRecordError(error)
+    }
+  }
+
+  // 停止录音
+  const stopRecording = () => {
+    if (recorderManager) {
+      try {
+        recorderManager.stop()
+        emit('onRecordEnd')
+      } catch (error: any) {
+        // 重置触摸结束取消录音标志
+        // #ifdef H5
+        if (recorderManager && recorderManager.touchEndCancelFlag !== undefined) {
+          recorderManager.touchEndCancelFlag = false;
+        }
+        // #endif
+        currentState.value = 'error'
+        emit('onError', error)
+      }
+    }
+    // 重置状态
+    resetState()
+  }
+
+  // 使用audioUploader转换音频
+  const uploadAndConvertWithService = async (audioFile: AudioFile): Promise<TranscriptResult> => {
+    if (!audioUploadService) {
+      throw new Error('音频上传服务未初始化')
+    }
+
+    try {
+      // 转换音频文件格式
+      const uploaderAudioFile: UploaderAudioFile = {
+        tempFilePath: audioFile.tempFilePath,
+        duration: audioFile.duration,
+        fileSize: audioFile.fileSize,
+        format: audioFile.format
+      }
+
+      // 调用audioUploader的上传方法
+      const result = await audioUploadService.uploadAudio(uploaderAudioFile)
+
+      // 转换结果格式
+      return {
+        success: result.success,
+        text: result.text,
+      }
+    } catch (error: any) {
+      return {
+        success: false,
+        text: error.message,
+      }
+    }
+  }
+
+  // 初始化录音事件监听
+  const initRecorderEvents = async() => {
+    if (!recorderManager) return
+
+    // 录音开始
+    recorderManager.onStart(handleRecordStart)
+    // 录音停止
+    recorderManager.onStop(handleRecordStop)
+    // 录音错误
+    recorderManager.onError(handleRecordError)
+  }
+
+  const initRecorderManager = () => {
+    // #ifdef H5
+    // 获取录音管理器
+    recorderManager = jzRecorder.getRecorderManager()
+    // #endif
+
+    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    // 获取录音管理器
+    recorderManager = uni.getRecorderManager()
+    // #endif
+
+    // 监听录音事件
+    initRecorderEvents()
+    // 初始化音频上传服务
+    audioUploadService = createAudioUploader()
+  }
+
+  // 初始化录音管理器
+  onShow(() => {
+    // #ifdef MP-WEIXIN
+    initRecorderManager()
+    // #endif
+  })
+
+  // 初始化录音管理器
+  onMounted(() => {
+    initRecorderManager()
+  })
+
+  // 销毁录音管理器等资源
+  const destroyRecorderManager = () => {
+    resetState()
+    if (recorderManager) {
+      // 清理所有事件监听器
+      /**
+       * App/H5端, 支持offStart / offStop / offError 方法解绑回调函数，小程序不支持解绑回调函数，所以需要手动清理事件监听器
+       */
+      // #ifdef H5
+      if (recorderManager.offStart) {
+        recorderManager.offStart(handleRecordStart)
+      }
+      if (recorderManager.offStop) {
+        recorderManager.offStop(handleRecordStop)
+      }
+      if (recorderManager.offError) {
+        recorderManager.offError(handleRecordError)
+      }
+      // #endif
+
+      recorderManager = null
+    }
+    audioUploadService = null
+  }
+
+  // 组件卸载时清理资源
+  onHide(() => {
+    // #ifdef MP-WEIXIN
+    destroyRecorderManager()
+    // #endif
+  })
+
+  // 组件卸载时清理资源
+  onUnmounted(() => {
+    destroyRecorderManager()
+  })
+
+  // Add touchmove handler to the button
+  const handleTouchMove = (e) => {
+    e.preventDefault();
+  }
+</script>
+
+<style lang="scss" scoped>
+  .voice-recorder-container {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    height: 90rpx;
+    // height: 112rpx;
+    border-radius: 24rpx;
+    transition: all 0.15s ease;
+    -webkit-touch-callout: none;
+    color: #000;
+    font-size: 32rpx;
+    font-weight: 400;
+    background-color: transparent;
+    padding: 0; // 删除uni-button默认padding
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none; /* 防止系统手势干预 */
+    border: none;
+
+    &::after {
+      border: none !important;
+    }
+
+    .hover-text {
+      color: #000;
+    }
+
+    &.hover-class {
+      background-color: rgb(108, 101, 244);
+      z-index: 100;
+
+      .hover-text {
+        color: #fff;
+      }
+    }
+
+    .icon-loading-text {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+
+      .icon-loading-image {
+        width: 48rpx;
+        height: 48rpx;
+        margin-right: 10rpx;
+        -webkit-touch-callout: none !important;
+        -webkit-user-select: none !important;
+        user-select: none !important;
+      }
+
+      .loading-text {
+        color: #666;
+      }
+    }
+  }
+</style>

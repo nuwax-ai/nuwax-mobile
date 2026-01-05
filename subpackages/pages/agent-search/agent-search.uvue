@@ -1,0 +1,609 @@
+<template>
+  <view class='search-page-container flex flex-col'>
+    <!-- 微信安全区 -->
+		<safety-zone></safety-zone>
+    <!-- 搜索框 -->
+    <view class='search-container border-b'>
+      <!-- #ifdef MP-WEIXIN -->
+      <text class="cancel-text" @click="jumpNavigateBack">取消</text>
+      <!-- #endif -->
+      <view class='search-box' :class="{ focused: isFocused }">
+        <text class="iconfont icon-Search"></text>
+        <input
+          ref="searchInputRef"
+          class='search-input'
+          :placeholder="searchPlaceholder"
+          placeholder-class="placeholder-class"
+          type="search"
+          confirm-type="search"
+          :value="searchKeyword"
+          @confirm="handleSearch($event.detail.value)"
+          @input="handleSearch($event.detail.value)"
+          @focus="handleFocus"
+          @blur="handleBlur"
+          <!-- #ifdef MP-WEIXIN -->
+          :auto-focus="shouldAutoFocus"
+          <!-- #endif -->
+        />
+        <template v-if="searchKeyword">
+          <text class="iconfont icon-a-Xcircle-fill clear-icon" @click="handleSearch('')"></text>
+        </template>
+      </view>
+      <!-- #ifndef MP-WEIXIN -->
+      <text class="cancel-text" @click="jumpNavigateBack">取消</text>
+      <!-- #endif -->
+
+      <!-- 微信胶囊按钮功能区 -->
+			<!-- #ifdef MP-WEIXIN -->
+			<view class="right-safety" :style="{ width: clientRect.width + 13 + 'px', height: clientRect.height + 'px' }"></view>
+			<!-- #endif -->
+    </view>
+    <!-- 滚动部分 -->
+    <view class='scroll-section flex-1'>
+      <scroll-view
+        class='h-full'
+        @scrolltolower="handleLoadMore"
+        :refresher-enabled="searchMode === 'api'"
+        :refresher-triggered="refreshing || false"
+        @refresherrefresh="handleRefresh"
+        :show-scrollbar="false"
+      >
+        <template v-if="(agentList || []).length">
+          <template v-for="info in agentList" :key="info.id">
+            <!-- 页面应用 -->
+            <page-card
+              v-if="cardComponentType === 'PageApp'"
+              :coverImg="info.coverImg"
+              :name="info.name"
+              :userName="info.publishUser?.userName"
+              :created="info.created"
+              @click="handleAgentClick(info)"
+            />
+            <!-- 首页 -->
+            <recent-used-agent-item
+              v-else-if="cardComponentType === 'Home'"
+              :icon="info.icon"
+              :name="info.name"
+              :description="info.description"
+              @click="handleRecentUsedAgentClick(info)"
+            />
+            <!-- 聊天机器人: 默认 cardComponentType 为 ChatBot -->
+            <agent-component
+              v-else
+              :icon="info.icon"
+              :name="info.name"
+              :avatar="info.publishUser?.avatar"
+              :userName="info.publishUser?.nickName || info.publishUser?.userName"
+              :description="info.description"
+              :userCount="info.statistics?.userCount"
+              :convCount="info.statistics?.convCount"
+              :collectCount="info.statistics?.collectCount"
+              @click="handleAgentClick(info)"
+            />
+          </template>
+        </template>
+
+        <template v-if="loading">
+          <view class='loading-state'>
+            <text class='loading-text'>加载中...</text>
+          </view>
+        </template>
+
+        <template v-else-if="!loading && searchKeyword && agentList?.length === 0">
+          <view class='empty-state'>
+            <image :src="noData" class='empty-image' />
+            <text class='empty-text'>暂无结果</text>
+          </view>
+        </template>
+
+        <template v-if="showNoMore">
+          <view class='no-more-state'>
+            <text class='no-more-text'>没有更多数据了</text>
+          </view>
+        </template>
+      </scroll-view>
+    </view>
+  </view>
+</template>
+
+<script lang="uts" setup>
+  import { apiPublishedAgentList } from '@/servers/square'
+  import { apiUserUsedAgentList } from '@/servers/agentDev'
+  import { SquarePublishedListParams, SquarePublishedItemInfo } from '@/types/interfaces/square'
+  import { SquareAgentTypeEnum } from '@/types/enums/square'
+  import { Page, RequestResponse } from '@/types/interfaces/request'
+  import { SUCCESS_CODE } from '@/constants/codes.constants'
+  import { AgentComponentTypeEnum } from '@/types/enums/agent'
+  import RecentUsedAgentItem from '@/components/recent-used-agent-item/recent-used-agent-item.uvue'
+  import { jumpToAgentDetailPage, getCurrentPagePath } from '@/utils/commonBusiness'
+  import type { AgentInfo } from '@/types/interfaces/agent'
+  import noData from '@/static/assets/no_data.png'
+  // import { jumpNavigateBack } from '@/utils/common'
+  import type { CategoryItemInfo } from '@/types/interfaces/agentConfig'
+  import { AllowCopyEnum } from '@/types/enums/agent'
+  import { PluginTypeEnum } from '@/types/enums/plugin'
+  import { isTabPage } from '@/utils/commonBusiness'
+  import { setCurrentPageNavigationBarTitle } from '@/utils/system.uts'
+
+  const searchKeyword = ref<string>('')
+  const searchTimeoutRef = ref<number | null>(null)
+  const agentList = ref<SquarePublishedItemInfo[] | AgentInfo[]>([])
+  const hasMore = ref<boolean>(true)
+  const page = ref<number>(1)
+  const loading = ref<boolean>(false)
+  const refreshing = ref<boolean>(false)
+  // 搜索输入框ref
+  const searchInputRef = ref<UniInputElement | null>(null)
+  const isFocused = ref<boolean>(false)
+  const cardComponentType = ref<'Home' | 'PageApp' | 'ChatBot'>('ChatBot')
+  // 搜索模式：'api' 接口搜索模式，'local' 前端过滤模式
+  const searchMode = ref<'api' | 'local'>('api')
+  // 前端过滤模式下的原始列表数据
+  const localAgentList = ref<CategoryItemInfo[]>([])
+  // 搜索框 placeholder 文案
+  const searchPlaceholder = ref<string>('搜索智能体')
+  // 小程序平台控制 auto-focus
+  const shouldAutoFocus = ref<boolean>(false)
+  // 返回地址
+  const backUrl = ref<string>('')
+
+  // #ifdef MP-WEIXIN
+	const clientRect = uni.getMenuButtonBoundingClientRect();
+	// #endif
+
+  const jumpNavigateBack = () => {
+    const toUrl = backUrl.value ? backUrl.value : "/pages/index/index";
+    console.log(toUrl);
+
+    if (isTabPage(toUrl)) {
+      uni.switchTab({ url: toUrl });
+    } else {
+      uni.redirectTo({ url: toUrl });
+    }
+  }
+
+  onLoad((options: { type: 'Home' | 'PageApp' | 'ChatBot', searchMode?: 'api' | 'local', backUrl?: string }) => {
+    const { type, searchMode: mode } = options
+    backUrl.value = options.backUrl ? decodeURIComponent(options.backUrl) : ''
+    cardComponentType.value = type
+    // 设置当前页面导航栏标题
+    setCurrentPageNavigationBarTitle();
+    // 检测 searchMode 参数，区分搜索模式
+    if (mode === 'local') {
+      // 从 globalData 获取列表数据和文案
+      const app = getApp()
+      // 兜底逻辑：如果 globalData 没有相关数据，回退到 api 模式
+      if (app.globalData && app.globalData.localAgentList && Array.isArray(app.globalData.localAgentList) && app.globalData.localAgentList.length > 0) {
+        // 有数据，使用前端过滤模式
+        searchMode.value = 'local'
+        localAgentList.value = app.globalData.localAgentList as CategoryItemInfo[]
+        // 默认不显示全部列表，只有搜索时才显示
+        agentList.value = []
+        hasMore.value = false
+
+        // 获取搜索文案，如果没有则使用默认值
+        if (app.globalData.searchPlaceholder) {
+          searchPlaceholder.value = app.globalData.searchPlaceholder as string
+        }
+      } else {
+        // 没有数据，回退到 api 模式
+        searchMode.value = 'api'
+      }
+    } else {
+      searchMode.value = 'api'
+    }
+  })
+
+  onMounted(() => {
+    // 页面加载完成后自动获取输入框焦点
+    // #ifndef MP-WEIXIN
+    // 非小程序平台可以直接调用 focus
+    nextTick(() => {
+      if (searchInputRef.value && typeof searchInputRef.value.focus === 'function') {
+        searchInputRef.value.focus()
+      }
+    })
+    // #endif
+  })
+
+  // 小程序平台使用 onReady 确保页面渲染完成后再聚焦
+  onReady(() => {
+    // #ifdef MP-WEIXIN
+    // 小程序平台：通过设置 auto-focus 为 true 来触发聚焦
+    shouldAutoFocus.value = true
+    // #endif
+  })
+
+  // 小程序页面显示时也尝试聚焦
+  onShow(() => {
+    // #ifdef MP-WEIXIN
+    // 小程序平台：通过重置 auto-focus 来重新触发聚焦
+    shouldAutoFocus.value = false
+    nextTick(() => {
+      shouldAutoFocus.value = true
+    })
+    // #endif
+  })
+
+  // 是否显示没有更多数据（前端过滤模式下不显示）
+	const showNoMore = computed(() => {
+		if (searchMode.value === 'local') {
+			return false
+		}
+		return !loading.value && !hasMore.value && agentList.value?.length > 8
+	})
+
+  /**
+   * 将 CategoryItemInfo 转换为 SquarePublishedItemInfo 格式
+   * @param items CategoryItemInfo 数组
+   * @returns SquarePublishedItemInfo 数组
+   */
+  const convertCategoryItemsToSquareItems = (items: CategoryItemInfo[]): SquarePublishedItemInfo[] => {
+    return items.map(item => ({
+      id: item.targetId, // 使用 targetId 作为 id
+      tenantId: 0,
+      spaceId: 0,
+      targetType: item.targetType as SquareAgentTypeEnum,
+      agentType: item.agentType,
+      targetId: item.targetId,
+      name: item.name,
+      description: item.description || null,
+      icon: item.icon,
+      remark: '',
+      modified: '',
+      created: '',
+      statistics: item.statistics,
+      publishUser: item.publishUser,
+      category: '',
+      allowCopy: AllowCopyEnum.No,
+      pluginType: PluginTypeEnum.HTTP,
+      collect: item.collect
+    }))
+  }
+
+  const handleFocus = () => {
+    isFocused.value = true
+  }
+
+  const handleBlur = () => {
+    isFocused.value = false
+  }
+
+  // 获取智能体、页面应用列表
+  const fetchAgentList = async (pageNum: number = 1, keyword: string = searchKeyword.value) => {
+    const params: SquarePublishedListParams = {
+      targetType: AgentComponentTypeEnum.Agent,
+      targetSubType: cardComponentType.value === 'PageApp' ? 'PageApp' : 'ChatBot',
+      page: pageNum,
+      pageSize: 10,
+      category: '' ,
+      kw: keyword,
+    }
+    // 获取智能体列表
+    const response  = await apiPublishedAgentList(params)
+    const {code, data, message}  = response as unknown as RequestResponse<Page<SquarePublishedItemInfo>>
+    // 成功
+    if (code === SUCCESS_CODE) {
+      const newList = data.records || []
+      if (pageNum > 1) {
+        agentList.value = [...agentList.value, ...newList]
+      } else {
+        agentList.value = newList
+      }
+      hasMore.value = pageNum < data.pages
+      page.value = pageNum
+      loading.value = false
+    } else {
+      uni.showToast({
+        title: message || '获取智能体列表失败',
+        icon: 'error'
+      })
+      loading.value = false
+    }
+  }
+
+  // 查询用户最近使用过的智能体列表
+	const fetchUserUsedAgentList = async (pageNum: number = 1, keyword: string = searchKeyword.value) => {
+		const res = await apiUserUsedAgentList({pageIndex: pageNum, size: 20, keyword})
+		const {code, data} = res || {}
+		if(code === SUCCESS_CODE) {
+      const newList = data || []
+      if (pageNum > 1) {
+        // 追加数据
+        agentList.value = [...(agentList.value || []), ...newList]
+      } else {
+        // 替换数据
+        agentList.value = newList
+      }
+
+			// 是否有更多数据, 如果数据长度大于0，则有更多数据
+      hasMore.value = newList?.length > 0
+			page.value = pageNum
+      loading.value = false
+		} else{
+			uni.showToast({
+				title: '获取用户最近使用过的智能体列表失败',
+				icon: 'none'
+			})
+      loading.value = false
+		}
+	}
+
+  // 获取智能体列表
+  const fetchList = async (pageNum: number = 1, keyword: string = searchKeyword.value) => {
+    // 前端过滤模式下不调用接口
+    if (searchMode.value === 'local') {
+      return
+    }
+
+    if (cardComponentType.value === 'Home') {
+      await fetchUserUsedAgentList(pageNum, keyword)
+    } else {
+      await fetchAgentList(pageNum, keyword)
+    }
+  }
+
+  /**
+   * 前端过滤搜索（本地过滤）
+   * @param keyword 搜索关键词
+   */
+  const filterLocalList = (keyword: string) => {
+    // 如果没有关键词，返回空列表
+    if (!keyword || !localAgentList.value.length) {
+      agentList.value = []
+      return
+    }
+
+    // 对本地列表进行过滤，匹配 name 或 description（不区分大小写）
+    const lowerKeyword = keyword.toLowerCase()
+    const filtered = localAgentList.value.filter(item => {
+      const nameMatch = item.name?.toLowerCase().includes(lowerKeyword) || false
+      const descMatch = item.description?.toLowerCase().includes(lowerKeyword) || false
+      return nameMatch || descMatch
+    })
+
+    agentList.value = convertCategoryItemsToSquareItems(filtered)
+  }
+
+   // 处理搜索
+   const handleSearch = (keyword: string) => {
+    searchKeyword.value = keyword
+    // 清除之前的定时器
+    if (searchTimeoutRef.value) {
+      clearTimeout(searchTimeoutRef.value)
+    }
+
+    // 如果搜索关键词为空
+    if (!keyword) {
+      // 前端过滤模式和接口搜索模式都清空列表
+      agentList.value = []
+      loading.value = false
+      // #ifdef H5 || WEB
+      nextTick(() => {
+        if (searchInputRef.value) {
+          searchInputRef.value?.focus()
+        }
+      })
+      // #endif
+      return
+    }
+
+    // 根据搜索模式选择不同的处理方式
+    if (searchMode.value === 'local') {
+      // 前端过滤模式：本地过滤
+      loading.value = true
+      // 设置新的定时器，防抖500ms
+      searchTimeoutRef.value = setTimeout(() => {
+        filterLocalList(keyword)
+        loading.value = false
+      }, 500)
+    } else {
+      // 接口搜索模式：调用接口
+      loading.value = true
+      // 设置新的定时器，防抖500ms
+      searchTimeoutRef.value = setTimeout(() => {
+        page.value = 1
+        hasMore.value = true
+        fetchList(1, keyword)
+      }, 500)
+    }
+  }
+
+  // 加载更多
+  const handleLoadMore = () => {
+    // 前端过滤模式下禁用加载更多
+    if (searchMode.value === 'local') {
+      return
+    }
+
+    if (hasMore.value && !loading.value) {
+      const nextPage = page.value + 1
+      fetchList(nextPage)
+    }
+  }
+
+  // 下拉刷新
+  const handleRefresh = () => {
+    // 前端过滤模式下禁用下拉刷新
+    if (searchMode.value === 'local') {
+      refreshing.value = false
+      return
+    }
+
+    if (refreshing.value) {
+      return
+    }
+    refreshing.value = true
+    fetchList().finally(() => {
+      refreshing.value = false
+    })
+  }
+
+  // 跳转到智能体详情页
+  const handleAgentClick = (info: SquarePublishedItemInfo) => {
+    jumpToAgentDetailPage(info.targetId, null, info.agentType, info.name)
+  }
+
+  // 跳转到智能体详情页
+  const handleRecentUsedAgentClick = (info: AgentInfo) => {
+    jumpToAgentDetailPage(info.agentId, null, info.agentType, info.name)
+  }
+</script>
+
+<style lang="scss" scoped>
+  .search-page-container {
+    height: 100vh;
+    overflow: hidden;
+    background-color: #fff;
+    /* #ifdef MP-WEIXIN */
+		// padding-top: env(safe-area-inset-top);
+		padding-bottom: env(safe-area-inset-bottom);
+		/* #endif */
+
+    /* 搜索框 */
+    .search-container {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      padding: 10rpx 0 10rpx 32rpx;
+      flex-shrink: 0;
+
+      .search-box {
+        flex: 1;
+        gap: 16rpx;
+        display: flex;
+        align-items: center;
+        flex-direction: row;
+        height: 76rpx;
+        padding: 0 24rpx;
+        border-radius: 16rpx;
+        border: 2rpx solid transparent;
+        background: rgba(12, 20, 102, 0.04);
+        transition: border-color 0.3s ease;
+
+        &.focused {
+          border-color: #5147FF;
+        }
+
+        .iconfont {
+          font-size: 32rpx;
+          color: #666;
+        }
+
+        .search-input {
+          flex: 1;
+          border: none;
+          font-size: 28rpx;
+          color: #15171F;
+          outline: none;
+          font-weight: 400;
+        }
+
+        .placeholder-class {
+          color:rgba(21, 23, 31, 0.50);
+          font-size: 28rpx;
+          font-weight: 400;
+        }
+
+        .clear-icon {
+          font-size: 32rpx;
+          color: #999 !important;
+          cursor: pointer;
+        }
+      }
+
+      .cancel-text {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 76rpx;
+        font-weight: 400;
+        padding: 0 32rpx;
+        color: rgba(21, 23, 31, 0.50);
+        font-size: 32rpx;
+        transition: background-color 0.3s ease;
+        border-radius: 8rpx;
+
+        &:active {
+          background-color: rgba(12, 20, 102, 0.04);
+        }
+        /* #ifdef H5 */
+        &:hover {
+          cursor: pointer;
+        }
+        /* #endif */
+      }
+    }
+
+    /* 滚动部分 */
+    .scroll-section {
+      flex: 1;
+      overflow: hidden;
+
+       /* 空状态 */
+      .empty-state {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        .empty-image {
+          width: 172rpx;
+          height: 172rpx;
+        }
+
+        .empty-text {
+          font-size: 32rpx;
+          color: #15171F;
+          font-weight: 400;
+          margin-top: 32rpx;
+        }
+      }
+
+      /* 加载状态 */
+      .loading-state {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 40rpx;
+
+        .loading-text {
+          font-size: 28rpx;
+          color: #666;
+          display: flex;
+          align-items: center;
+        }
+
+        .loading-text::before {
+          content: '';
+          width: 32rpx;
+          height: 32rpx;
+          border: 4rpx solid #e8e8e8;
+          border-top: 4rpx solid #8b5cf6;
+          border-radius: 50%;
+          animation: spin 1s linear infinite;
+          margin-right: 16rpx;
+        }
+      }
+
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+
+      /* 没有更多数据状态 */
+      .no-more-state {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 40rpx;
+      }
+
+      .no-more-text {
+        font-size: 24rpx;
+        color: #999;
+      }
+    }
+  }
+</style>

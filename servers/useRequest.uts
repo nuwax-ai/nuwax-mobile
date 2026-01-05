@@ -1,0 +1,213 @@
+import {
+  CONVERSATION_CONNECTION_URL,
+  COMMON_HEADERS,
+} from "@/constants/common.constants";
+import { ACCESS_TOKEN, EXPIRE_DATE } from "../constants/home.constants";
+import { API_BASE_URL, LOGIN_WHITELIST_URL } from "../constants/config";
+import {
+  REDIRECT_LOGIN,
+  SUCCESS_CODE,
+  USER_NO_LOGIN,
+} from "@/constants/codes.constants";
+
+import {
+  fetchEventSource,
+  EventSourceMessage,
+} from "@microsoft/fetch-event-source";
+
+import { handleExternalLink } from "@/utils/system.uts";
+import { getCurrentPageFullPath } from "@/utils/common";
+
+// 微信小程序：request
+export default function request<T = any>(options: any) {
+  const { url, method, ...rest } = options;
+  const accessToken = uni.getStorageSync(ACCESS_TOKEN);
+  const header = {
+    ...COMMON_HEADERS,
+  };
+  if (accessToken) {
+    // #ifdef H5 || WEB
+    if (process.env.NODE_ENV === "development") {
+      header["Authorization"] = `Bearer ${accessToken}`;
+    }
+    // #endif
+
+    // #ifdef MP-WEIXIN
+    header["Authorization"] = `Bearer ${accessToken}`;
+    // #endif
+  }
+
+  // uEnvProd
+  if (process.env.NODE_ENV === "production") {
+    // #ifdef H5
+    //仅H5需要添加fragment参数
+    const fragment = (window.location.hash || "#/").replace("#/", "/");
+    if (fragment) {
+      header["fragment"] = fragment;
+    }
+    // #endif
+  }
+
+  const requestTask = uni.request<T>({
+    header,
+    url: API_BASE_URL + url,
+    method: method || "POST",
+    ...rest,
+  });
+
+  return requestTask
+    .then((res) => {
+      const { code, message: errorMessage } = res.data;
+      // 用户未登录，跳转到登录页
+      if (code === USER_NO_LOGIN) {
+        uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+        uni.clearStorageSync(); // 清空所有缓存
+
+        // #ifdef H5 || WEB
+        uni.reLaunch({
+          url: "/subpackages/pages/login/login",
+        });
+        // #endif
+        // #ifdef MP-WEIXIN
+        uni.reLaunch({
+          url: "/subpackages/pages/login-weixin/login-weixin",
+        });
+        // #endif
+      }
+      // 重定向到登录页
+      if (code === REDIRECT_LOGIN) {
+        uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+        uni.clearStorageSync(); // 清空所有缓存
+        let redirectUrl = errorMessage;
+        // 如果错误信息包含/login开头，则替换为/subpackages/pages/login/login，跳转到我们自己平台登录页，反之，则直接跳转到message的完整链接
+        if (errorMessage?.startsWith("/login")) {
+          // #ifdef H5 || WEB
+          // 如果url在登录白名单地址中，则不跳转到登录页
+          if (LOGIN_WHITELIST_URL.includes(url)) {
+            return;
+          }
+          redirectUrl = errorMessage?.replace(
+            "/login",
+            "/subpackages/pages/login/login",
+          );
+          uni.reLaunch({ url: redirectUrl });
+          // #endif
+
+          // #ifdef MP-WEIXIN
+          // 微信小程序：获取当前页面的 url
+          const currentUrl = getCurrentPageFullPath();
+          if (currentUrl) {
+            if (globalThis.appConfig.redirectUrl) {
+              const otherQueryStr = globalThis.appConfig.redirectUrl;
+              uni.reLaunch({
+                url:
+                  "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                  encodeURIComponent(
+                    "/subpackages/pages/webview/webview?url=" + otherQueryStr,
+                  ),
+              });
+            } else {
+              uni.reLaunch({
+                url:
+                  "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                  encodeURIComponent("/" + currentUrl),
+              });
+            }
+          }
+          // #endif
+        } else {
+          // #ifdef H5 || WEB
+          window.location.href = errorMessage;
+          // #endif
+          // #ifdef MP
+          handleExternalLink(errorMessage);
+          // #endif
+        }
+      }
+      return res.data;
+    })
+    .catch((error) => {
+      console.error("Request error:", error);
+      // 网络错误或其他错误，也返回错误信息
+      throw error;
+    });
+}
+
+export interface SSEOptions<T = any> {
+  url: string;
+  method?: "GET" | "POST" | "PUT" | "DELETE";
+  headers?: { [key: string]: string };
+  body?: any;
+  onMessage: (data: T) => void;
+  onError?: (error: Error) => void;
+  onOpen?: (response: any) => void;
+  onClose?: () => void;
+  abortController?: any;
+}
+
+// H5 创建SSE连接
+export async function createSSEConnection<T = any>(options: SSEOptions<T>) {
+  const controller = options.abortController || new AbortController();
+  //仅H5需要添加fragment参数
+  const fragment = (window.location.hash || "#/").replace("#/", "/");
+  try {
+    await fetchEventSource(options.url, {
+      method: options.method || "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+        ...(fragment && { fragment }),
+      },
+      body:
+        typeof options.body === "object"
+          ? JSON.stringify(options.body)
+          : options.body,
+      signal: controller.signal,
+      openWhenHidden: true, // 页面不可见时保持连接
+
+      onopen: async (response) => {
+        if (response.status >= 400) {
+          throw new Error(`SSE连接失败: ${response.statusText}`);
+        }
+        options.onOpen?.(response);
+      },
+
+      onmessage: (event: EventSourceMessage) => {
+        try {
+          const data = event.data ? JSON.parse(event.data) : null;
+          options.onMessage(data);
+        } catch (error) {
+          const normalizedError =
+            error instanceof Error ? error : new Error(String(error));
+          options.onError?.(normalizedError);
+        }
+      },
+
+      onclose: () => {
+        options.onClose?.();
+      },
+
+      onerror: (error) => {
+        // 如果是中止错误，不抛出异常
+        if (error.name === "AbortError") {
+          console.log("SSE连接已被中止");
+          return;
+        }
+        options.onError?.(error);
+        throw error; // 停止自动重试
+      },
+    });
+  } catch (error) {
+    // 静默处理所有 AbortError
+    if (error.name === "AbortError") {
+      console.log("SSE连接已被中止");
+      return;
+    }
+
+    // 只有真正的错误才触发错误回调
+    const normalized =
+      error instanceof Error ? error : new Error(String(error));
+    options.onError?.(normalized);
+    throw normalized;
+  }
+}

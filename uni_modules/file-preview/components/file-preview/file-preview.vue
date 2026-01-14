@@ -173,7 +173,7 @@ export default {
     };
   },
   mounted() {
-    console.log('[FilePreview] Mounted', { src: this.src, type: this.fileType, resolvedType: this.resolvedType, isDocOrUnsupported: this.isDocOrUnsupported });
+    // console.log('[FilePreview] Mounted', { src: this.src, type: this.fileType, resolvedType: this.resolvedType, isDocOrUnsupported: this.isDocOrUnsupported });
     // initPreview is called by watch with immediate:true, no need to call again here
   },
   computed: {
@@ -207,10 +207,10 @@ export default {
   methods: {
       getExtension,
       async initPreview() {
-          console.log('[FilePreview] initPreview called', { src: this.src, status: this.status });
+        //   console.log('[FilePreview] initPreview called', { src: this.src, status: this.status });
           if (!this.src) {
               this.status = 'idle';
-              console.log('[FilePreview] No src, setting idle');
+            //   console.log('[FilePreview] No src, setting idle');
               return;
           }
 
@@ -219,7 +219,7 @@ export default {
           
           try {
             const type = this.resolvedType;
-            console.log('[FilePreview] Init preview for type:', type, 'isDocOrUnsupported:', this.isDocOrUnsupported);
+            // console.log('[FilePreview] Init preview for type:', type, 'isDocOrUnsupported:', this.isDocOrUnsupported);
             
             // Text/MD/HTML: Fetch content
             // if (['html', 'markdown', 'text'].includes(type)) {
@@ -241,12 +241,12 @@ export default {
             // Office/PDF: Set success to trigger iframe (H5) or file card (MP)
             else if (['docx', 'xlsx', 'pptx', 'pdf'].includes(type)) {
                 this.status = 'success';
-                console.log('[FilePreview] Office doc, setting success for preview');
+                // console.log('[FilePreview] Office doc, setting success for preview');
             }
              else {
                 this.status = 'unsupported';
             }
-            console.log('[FilePreview] After init, status:', this.status);
+            // console.log('[FilePreview] After init, status:', this.status);
           } catch (e) {
               console.error('[FilePreview] Init error:', e);
               this.status = 'error';

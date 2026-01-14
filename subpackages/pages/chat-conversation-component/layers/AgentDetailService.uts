@@ -36,7 +36,7 @@ import {
   apiTempChatConversationStop,
   apiTempChatConversationQuery,
   apiTempChatConversationCreate,
-} from "@/subpackages/servers/conversation";
+} from "@/servers/conversation";
 import {
   apiPublishedAgentInfo,
   apiCollectAgent,
@@ -47,7 +47,7 @@ import { v4 as uuidv4 } from "uuid";
 import AgentDetailData from "./AgentDetailData.uts";
 import { getCustomBlock } from "@/subpackages/utils/containerHelper.uts";
 import { replaceMathBracket } from "@/utils/markdown.uts";
-import { adaptHistoryMessage } from "@/utils/historyMessageAdapter";
+import { adaptHistoryMessage } from "@/subpackages/utils/historyMessageAdapter";
 import AgentDetailUtils from "./AgentDetailUtils.uts";
 import { TEMP_CONVERSATION_UID } from "@/constants/common.constants";
 import { API_BASE_URL } from "@/constants/config";
@@ -57,13 +57,14 @@ import {
   AgentComponentTypeEnum,
 } from "@/types/enums/agent.uts";
 import { ProcessingEnum } from "@/types/enums/common.uts";
-import { CustomActionService } from "@/utils/customActionService";
+import { CustomActionService } from "@/subpackages/utils/customActionService";
 import { transformFlatListToTree } from "@/subpackages/utils/fileTree";
 import {
   extractTaskResult,
   getFileProxyUrlByConversationIdAndFilePath,
   jumpToFilePreviewPage,
 } from "@/utils/system.uts";
+import { TaskStatus } from "@/types/enums/agent.uts";
 
 const handleMessageProcess = (text: string): string => {
   return text; // 目前由于方案 已经整体切换到 mp-html内处理 所这里都关闭了
@@ -485,6 +486,9 @@ export default class AgentDetailService {
         },
         // 完成回调
         async () => {
+          // 流式消息完成，设置会话状态为不活跃
+          this.data.isConversationActive.value = false;
+
           // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
           if (!isTempChat) {
             if (this.data.isSuggest.value && this.isAllowSuggest) {
@@ -540,14 +544,33 @@ export default class AgentDetailService {
   async handleStopConversation(isTempChat: boolean = false): Promise<void> {
     // 停止会话后，不再允许获取问题建议
     this.isAllowSuggest = false;
+
+    // 如果会话已经不活跃，说明会话已经结束，无需调用 stop 接口
+    if (!this.data.isConversationActive.value) {
+      this.data.isStoppingConversation.value = false;
+      return;
+    }
+
+
+    // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
+    if (this.data.conversationInfo.value?.taskStatus === TaskStatus.EXECUTING) {
+      this.data.conversationInfo.value = {
+        ...this.data.conversationInfo.value,
+        taskStatus: TaskStatus.CANCEL,
+      };
+    }
+
     // 会话消息请求ID
     const requestId = this.data.currentConversationRequestId.value;
-    // 如果会话消息请求ID不存在，则不停止会话
-    if (!requestId) {
+
+    // 对于临时会话，必须要有 requestId 才能停止
+    if (isTempChat && !requestId) {
       this.data.isStoppingConversation.value = false;
       this.data.isConversationActive.value = false;
       return;
     }
+
+    // 对于普通会话，即使没有 requestId 也可以通过 conversationId 停止
     // 显示停止会话loading
     this.data.isStoppingConversation.value = true;
     let res = null;
@@ -564,6 +587,7 @@ export default class AgentDetailService {
       // 停止会话成功
       if (code === SUCCESS_CODE) {
         this.data.isConversationActive.value = false;
+        console.log("[AgentDetailService] stop 接口调用成功");
       } else {
         uni.showToast({
           title: message,
@@ -572,6 +596,7 @@ export default class AgentDetailService {
         });
       }
     } catch (error) {
+      console.error("[AgentDetailService] stop 接口调用失败:", error);
       this.data.isStoppingConversation.value = false;
       this.data.isConversationActive.value = false;
     }
@@ -582,51 +607,140 @@ export default class AgentDetailService {
    * 用于超时或异常中断时的状态更新
    */
   updateProcessingListToFailed(): void {
-    console.log('[AgentDetailService] 开始更新工具调用状态为 FAILED');
-    
+    console.log("[AgentDetailService] 开始更新工具调用状态为 FAILED");
+
     const messageList = this.data.messageList.value;
     if (!messageList || messageList.length === 0) {
-      console.log('[AgentDetailService] 消息列表为空，无需更新');
+      console.log("[AgentDetailService] 消息列表为空，无需更新");
       return;
     }
 
     // 查找正在处理中的消息（状态为 Loading 或 Incomplete）
-    const updatedMessages = messageList.map(message => {
+    const updatedMessages = messageList.map((message) => {
       // 只处理正在进行中的助手消息
       if (
-        (message.status === MessageStatusEnum.Loading || 
-         message.status === MessageStatusEnum.Incomplete) &&
-        message.processingList && 
+        (message.status === MessageStatusEnum.Loading ||
+          message.status === MessageStatusEnum.Incomplete) &&
+        message.processingList &&
         message.processingList.length > 0
       ) {
-        console.log(`[AgentDetailService] 更新消息 ${message.id} 的工具调用状态`);
-        
+        console.log(
+          `[AgentDetailService] 更新消息 ${message.id} 的工具调用状态`,
+        );
+
         // 更新 processingList 中的状态
-        const updatedProcessingList = message.processingList.map(processing => {
-          // 将所有 EXECUTING 状态的工具调用改为 FAILED
-          if (processing.status === ProcessingEnum.EXECUTING) {
-            console.log(`[AgentDetailService] 工具 ${processing.name} 状态从 EXECUTING 改为 FAILED`);
-            return {
-              ...processing,
-              status: ProcessingEnum.FAILED
-            };
-          }
-          return processing;
-        });
+        const updatedProcessingList = message.processingList.map(
+          (processing) => {
+            // 将所有 EXECUTING 状态的工具调用改为 FAILED
+            if (processing.status === ProcessingEnum.EXECUTING) {
+              console.log(
+                `[AgentDetailService] 工具 ${processing.name} 状态从 EXECUTING 改为 FAILED`,
+              );
+              return {
+                ...processing,
+                status: ProcessingEnum.FAILED,
+              };
+            }
+            return processing;
+          },
+        );
 
         // 返回更新后的消息
         return {
           ...message,
-          processingList: updatedProcessingList
+          processingList: updatedProcessingList,
         };
       }
-      
+
       return message;
     });
 
     // 更新消息列表
     this.data.messageList.value = updatedMessages;
-    console.log('[AgentDetailService] 工具调用状态更新完成');
+    console.log("[AgentDetailService] 工具调用状态更新完成");
+  }
+
+  /**
+   * 恢复会话状态
+   * 用于页面从后台唤醒后检测并恢复会话
+   * 
+   * 检测异常中断的条件：最后一条 ASSISTANT 消息状态为 Loading/Incomplete 且无 finalResult
+   * 
+   * @returns 是否需要恢复（true 表示检测到异常中断并已恢复）
+   */
+  async resumeConversationState(): Promise<boolean> {
+    // 1. 检查会话ID
+    const conversationId = this.data.conversationId.value;
+    if (!conversationId) {
+      return false;
+    }
+
+    // 2. 获取最后一条 ASSISTANT 消息
+    const messageList = this.data.messageList.value;
+    const lastAssistantMessage = [...messageList]
+      .reverse()
+      .find((msg) => msg.messageType === MessageTypeEnum.ASSISTANT && msg.status);
+
+    // 3. 获取前端状态
+    const isConversationActive = this.data.isConversationActive.value;
+    const isStreaming = chatService.isCurrentlyStreaming;
+    const isStoppingConversation = this.data.isStoppingConversation.value;
+
+    // 4. 异常中断检测
+    // 条件：最后一条助手消息状态为 Loading/Incomplete 且无 finalResult
+    const isAbnormalInterruption =
+      lastAssistantMessage &&
+      (lastAssistantMessage.status === MessageStatusEnum.Loading ||
+        lastAssistantMessage.status === MessageStatusEnum.Incomplete) &&
+      !lastAssistantMessage.finalResult;
+
+    // 5. 如果用户正在主动停止，不是异常中断
+    if (isStoppingConversation) {
+      return false;
+    }
+
+    // 6. 如果 SSE 仍在工作，无需恢复
+    if (isStreaming) {
+      return false;
+    }
+
+    // 7. 检测到异常中断
+    if (!isAbnormalInterruption) {
+      return false;
+    }
+
+    console.log("[SessionResume] 检测到异常中断，正在查询后端会话状态", {
+      lastMessageStatus: lastAssistantMessage?.status,
+      conversationId
+    });
+
+    try {
+      // 8. 查询后端会话状态并刷新
+      const res = await apiAgentConversation(conversationId);
+      if (res.code === SUCCESS_CODE) {
+        const taskStatus = res.data?.taskStatus;
+        
+        // 更新会话状态
+        if (taskStatus === "EXECUTING") {
+          // 任务仍在后端执行，保持活跃状态
+          this.data.isConversationActive.value = true;
+        } else {
+          // 任务已完成或取消，更新前端状态
+          this.data.isConversationActive.value = false;
+        }
+
+        // 更新消息列表（刷新页面数据）
+        this.handleQueryConversation(res);
+        console.log("[SessionResume] 会话状态已恢复，后端任务状态:", taskStatus);
+      }
+
+      return true;
+    } catch (error) {
+      console.error("[SessionResume] 恢复会话状态失败:", error);
+      // 恢复失败时，重置前端状态
+      this.data.isConversationActive.value = false;
+      return false;
+    }
   }
 
   /**
@@ -842,6 +956,14 @@ export default class AgentDetailService {
 
     // 清空会话数据
     this.clearConversationData();
+
+    // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
+    if (this.data.conversationInfo.value?.taskStatus === TaskStatus.EXECUTING) {
+      this.data.conversationInfo.value = {
+        ...this.data.conversationInfo.value,
+        taskStatus: TaskStatus.CANCEL,
+      };
+    }
 
     const conversationParams: ConversationCreateParams = {
       agentId: this.data.agentId.value,

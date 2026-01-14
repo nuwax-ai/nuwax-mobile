@@ -559,6 +559,11 @@ Parser.prototype.onOpenTag = function (selfClose) {
   }
   // #endif
 
+  // 处理 task-result 自定义组件
+  if (node.name === "task-result") {
+    this.expose();
+  }
+
   // 处理自闭合标签
   if (close) {
     if (!this.hook(node) || config.ignoreTags[node.name]) {

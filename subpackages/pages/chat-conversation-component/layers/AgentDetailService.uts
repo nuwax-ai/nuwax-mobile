@@ -43,6 +43,7 @@ import {
   apiUnCollectAgent,
   apiGetStaticFileList,
 } from "@/servers/agentDev";
+import { apiGetSandboxList, apiUpdateSelectedSandbox } from "@/servers/sandbox";
 import { v4 as uuidv4 } from "uuid";
 import AgentDetailData from "./AgentDetailData.uts";
 import { getCustomBlock } from "@/subpackages/utils/containerHelper.uts";
@@ -92,6 +93,10 @@ export default class AgentDetailService {
     this.data.conversationInfo.value =
       responseData as unknown as ConversationInfo;
     this.data.agentInfo.value = responseData?.agent;
+    // 确保 agentId 被设置
+    if (responseData?.agentId) {
+      this.data.agentId.value = responseData.agentId;
+    }
     // 是否开启问题建议,可用值:Open,Close
     this.data.isSuggest.value =
       responseData?.agent?.openSuggest === OpenCloseEnum.Open;
@@ -159,6 +164,9 @@ export default class AgentDetailService {
         responseData?.agent?.guidQuestionDtos?.slice(0, 5) || [];
     }
     this.data.isLoadingConversation.value = false;
+
+    // 获取沙盒列表
+    this.handleGetSandboxList();
   }
 
   /**
@@ -551,7 +559,6 @@ export default class AgentDetailService {
       return;
     }
 
-
     // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
     if (this.data.conversationInfo.value?.taskStatus === TaskStatus.EXECUTING) {
       this.data.conversationInfo.value = {
@@ -658,6 +665,125 @@ export default class AgentDetailService {
     // 更新消息列表
     this.data.messageList.value = updatedMessages;
     console.log("[AgentDetailService] 工具调用状态更新完成");
+  }
+
+  /**
+   * 获取沙盒列表 (严格模式)
+   */
+  async handleGetSandboxList(): Promise<void> {
+    try {
+      const res = await apiGetSandboxList();
+      if (res.code === SUCCESS_CODE && res.data) {
+        this.data.sandboxList.value = res.data.sandboxes || [];
+        this.data.agentSelectedSandbox.value = res.data.agentSelected || {};
+
+        const sandboxList = this.data.sandboxList.value;
+        const conversationInfo = this.data.conversationInfo.value;
+        const agentInfo = this.data.agentInfo.value;
+        // 优先使用 data.agentId，其次使用 agentInfo.agentId (AgentDetailDto 没有 id 字段，只有 agentId)
+        const agentId = String(
+          this.data.agentId.value || this.data.agentInfo.value?.agentId || "",
+        );
+
+        // 1. 确定目标沙盒ID (优先从会话或智能体配置中获取固定ID)
+        let fixedSandboxId = "";
+
+        // 会话模式：判断 conversationInfo.sandboxServerId
+        if (conversationInfo && conversationInfo.sandboxServerId) {
+          fixedSandboxId = String(conversationInfo.sandboxServerId);
+        }
+        // 智能体模式：判断 agentInfo.sandboxId
+        else if (agentInfo && agentInfo.sandboxId) {
+          fixedSandboxId = String(agentInfo.sandboxId);
+        }
+
+        // 2. 根据固定ID是否存在进行逻辑判断
+        if (fixedSandboxId) {
+          // === 情况 A: 比如 sandboxserverid 或 sandboxId 不为空 ===
+          const exists = sandboxList.some(
+            (s) => s.sandboxId === fixedSandboxId,
+          );
+          this.data.currentSandboxId.value = fixedSandboxId;
+
+          if (exists) {
+            // 列表中存在 -> 不可切换，选中的值以固定值为准
+            this.data.isSandboxSwitchDisabled.value = true;
+            this.data.isSandboxUnavailable.value = false;
+            // 确保对话框可用 (除非有其他逻辑禁用它，但不是因为沙盒)
+            if (this.data.sandboxDisabledText.value === "电脑不可用") {
+              this.data.wholeDisabled.value = false;
+              this.data.sandboxDisabledText.value = "";
+            }
+          } else {
+            // 列表中不存在 -> 显示"电脑不可用"，不可切换，整个对话框置灰禁用
+            this.data.isSandboxSwitchDisabled.value = true;
+            this.data.isSandboxUnavailable.value = true;
+            this.data.sandboxDisabledText.value = "电脑不可用";
+            this.data.wholeDisabled.value = true;
+          }
+        } else {
+          // === 情况 B: sandboxServerId 或 sandboxId 为空 ===
+          // 可以切换
+          this.data.isSandboxSwitchDisabled.value = false;
+          this.data.isSandboxUnavailable.value = false;
+
+          // 恢复对话框状态 (如果之前是因为电脑不可用而禁用的)
+          if (
+            this.data.wholeDisabled.value &&
+            this.data.sandboxDisabledText.value === "电脑不可用"
+          ) {
+            this.data.wholeDisabled.value = false;
+            this.data.sandboxDisabledText.value = "";
+          }
+
+          // 确定当前选中的值：优先使用 agentSelected 映射，否则默认第一个
+          let initialId = "";
+          if (this.data.agentSelectedSandbox.value[agentId]) {
+            initialId = this.data.agentSelectedSandbox.value[agentId];
+          } else if (sandboxList.length > 0) {
+            initialId = sandboxList[0].sandboxId;
+          }
+          this.data.currentSandboxId.value = initialId;
+        }
+      }
+    } catch (error) {
+      console.error("[AgentDetailService] 获取沙盒列表失败:", error);
+    }
+  }
+
+  /**
+   * 切换沙盒
+   */
+  async handleSelectSandbox(sandboxId: string): Promise<void> {
+    // 如果禁止切换，直接返回
+    if (this.data.isSandboxSwitchDisabled.value) {
+      console.warn("[AgentDetailService] 当前不允许切换沙盒");
+      return;
+    }
+
+    const agentId = String(
+      this.data.agentId.value || this.data.agentInfo.value?.agentId || "",
+    );
+
+    try {
+      // 调用 API 更新选中记录
+      await apiUpdateSelectedSandbox(agentId, sandboxId);
+
+      // 更新本地状态
+      this.data.currentSandboxId.value = sandboxId;
+      this.data.agentSelectedSandbox.value[agentId] = sandboxId;
+
+      uni.showToast({
+        title: "切换成功",
+        icon: "none",
+      });
+    } catch (error) {
+      console.error("[AgentDetailService] 切换沙盒失败:", error);
+      uni.showToast({
+        title: "切换失败",
+        icon: "none",
+      });
+    }
   }
 
   /**
@@ -1085,6 +1211,9 @@ export default class AgentDetailService {
           this.handleSendMessage(params);
         }
       }
+
+      // 获取沙盒列表
+      this.handleGetSandboxList();
     }
   }
 

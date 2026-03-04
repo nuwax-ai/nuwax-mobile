@@ -58,17 +58,50 @@ Highlight.prototype.onParse = function (node, vm) {
       }
       node.attrs.class = "hl-pre";
       code.attrs.class = "hl-code";
+      // Create hl-body wrapper
+      const hlBody = {
+        name: "div",
+        attrs: { class: "hl-body" },
+        children: []
+      };
+
+      // Create inner hl-container for stretching
+      const hlContainer = {
+        name: "div",
+        attrs: { class: "hl-container" },
+        children: []
+      };
+
+      if (config.showLineNumber) {
+        const line = text.split("\n").length;
+        const children = [];
+        for (let k = 1; k <= line; k++) {
+          children.push({
+            name: "div",
+            attrs: { class: "span" },
+            children: [{ type: "text", text: String(k) }],
+          });
+        }
+        hlContainer.children.push({
+          name: "div",
+          attrs: { class: "line-numbers-rows" },
+          children,
+        });
+      }
+      
+      code.name = "div";
+      hlContainer.children.push(code);
+      hlBody.children.push(hlContainer);
+      node.children = [];
+
       if (config.showLanguageName) {
-        node.children.unshift({
+        node.children.push({
           name: "div",
           attrs: {
             class: "hl-language",
           },
           children: [
-            {
-              type: "text",
-              text: lang,
-            },
+            { type: "text", text: lang },
             {
               name: "div",
               attrs: {
@@ -76,40 +109,19 @@ Highlight.prototype.onParse = function (node, vm) {
                 "data-content": text,
                 "data-action": "copy",
               },
-              children: [
-                {
-                  type: "text",
-                  text: "复制代码",
-                },
-              ],
+              children: [{ type: "text", text: "复制代码" }],
             },
           ],
         });
       }
+
       if (config.copyByLongPress) {
         node.attrs.style += (node.attrs.style || "") + ";user-select:none";
         // node.attrs["data-content"] = text;
         // vm.expose();
       }
-      if (config.showLineNumber) {
-        const line = text.split("\n").length;
-        const children = [];
-        for (let k = line; k--; ) {
-          children.push({
-            name: "span",
-            attrs: {
-              class: "span",
-            },
-          });
-        }
-        node.children.push({
-          name: "span",
-          attrs: {
-            class: "line-numbers-rows",
-          },
-          children,
-        });
-      }
+
+      node.children.push(hlBody);
     }
   }
 };

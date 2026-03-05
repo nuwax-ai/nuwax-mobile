@@ -36,6 +36,7 @@ import {
   apiTempChatConversationStop,
   apiTempChatConversationQuery,
   apiTempChatConversationCreate,
+  apiAgentConversationMessageList,
 } from "@/servers/conversation";
 import {
   apiPublishedAgentInfo,
@@ -43,6 +44,10 @@ import {
   apiUnCollectAgent,
   apiGetStaticFileList,
 } from "@/servers/agentDev";
+import {
+  apiGetSandboxList,
+  apiUpdateSelectedSandbox,
+} from "@/subpackages/servers/sandbox";
 import { v4 as uuidv4 } from "uuid";
 import AgentDetailData from "./AgentDetailData.uts";
 import { getCustomBlock } from "@/subpackages/utils/containerHelper.uts";
@@ -65,6 +70,9 @@ import {
   jumpToFilePreviewPage,
 } from "@/utils/system.uts";
 import { TaskStatus } from "@/types/enums/agent.uts";
+
+/** 每页加载消息数量 */
+const MESSAGE_LIST_SIZE = 10;
 
 const handleMessageProcess = (text: string): string => {
   return text; // 目前由于方案 已经整体切换到 mp-html内处理 所这里都关闭了
@@ -92,6 +100,10 @@ export default class AgentDetailService {
     this.data.conversationInfo.value =
       responseData as unknown as ConversationInfo;
     this.data.agentInfo.value = responseData?.agent;
+    // 确保 agentId 被设置
+    if (responseData?.agentId) {
+      this.data.agentId.value = responseData.agentId;
+    }
     // 是否开启问题建议,可用值:Open,Close
     this.data.isSuggest.value =
       responseData?.agent?.openSuggest === OpenCloseEnum.Open;
@@ -127,15 +139,12 @@ export default class AgentDetailService {
         return { ...adaptedMessage, text, id };
       });
 
-      // this.data.messageList.value = processedMessageList
-      // // 逐步添加消息以实现渐进渲染和滚动
       this.data.autoToLastMsg.value = true;
-      this.data.messageList.value = [];
-      for (const message of processedMessageList) {
-        this.data.messageList.value.push(message);
-        await nextTick();
-        await new Promise((resolve) => setTimeout(resolve, 50)); // 小延迟以允许渲染
-      }
+      // 一次性设置消息列表，避免逐条渲染产生动态效果
+      this.data.messageList.value = processedMessageList;
+
+      // 无论初始返回多少条，只要有消息就认为可能有历史消息，保证向上滑动时至少调用一次分页接口
+      this.data.hasMoreMessages.value = len > 0;
 
       // 处理问题建议
       const lastMessage = processedMessageList[len - 1];
@@ -159,6 +168,81 @@ export default class AgentDetailService {
         responseData?.agent?.guidQuestionDtos?.slice(0, 5) || [];
     }
     this.data.isLoadingConversation.value = false;
+
+    // 获取沙盒列表
+    this.handleGetSandboxList();
+  }
+
+  /**
+   * 加载更多历史消息
+   * 用户上滑到顶部时触发，向消息列表头部追加更多历史消息
+   */
+  async handleLoadMoreMessages(): Promise<void> {
+    const conversationId = this.data.conversationId.value;
+
+    // 前置校验
+    if (
+      !conversationId ||
+      this.data.isLoadingMoreMessages.value ||
+      !this.data.hasMoreMessages.value ||
+      this.data.messageList.value.length === 0
+    ) {
+      return;
+    }
+
+    // 取消息列表第一条的 index 作为查询游标
+    const firstMessage = this.data.messageList.value[0];
+    const currentIndex = firstMessage?.index || 0;
+
+    // 如果 index 为 0，说明已经是最早的消息
+    if (currentIndex <= 0) {
+      this.data.hasMoreMessages.value = false;
+      return;
+    }
+
+    this.data.isLoadingMoreMessages.value = true;
+
+    try {
+      const res = await apiAgentConversationMessageList({
+        conversationId,
+        index: currentIndex,
+        size: MESSAGE_LIST_SIZE,
+      });
+
+      if (res.code === SUCCESS_CODE && res.data) {
+        const olderMessages = res.data;
+
+        if (olderMessages.length > 0) {
+          // 处理消息格式（与 handleQueryConversation 保持一致）
+          const processedMessages = olderMessages.map(
+            (message: MessageInfo) => {
+              const adaptedMessage = adaptHistoryMessage(message);
+              const rawText = adaptedMessage.text ?? "";
+              const text = handleMessageProcess(rawText);
+              const id = adaptedMessage.id || generateUniqueId();
+              return { ...adaptedMessage, text, id };
+            },
+          );
+
+          // 前插到消息列表头部
+          this.data.messageList.value = [
+            ...processedMessages,
+            ...this.data.messageList.value,
+          ];
+
+          // 判断是否还有更多消息
+          this.data.hasMoreMessages.value =
+            olderMessages.length >= MESSAGE_LIST_SIZE;
+        } else {
+          // 返回空数组，没有更多消息
+          this.data.hasMoreMessages.value = false;
+        }
+      }
+    } catch (error) {
+      console.error("[AgentDetailService] 加载更多消息失败:", error);
+    } finally {
+      this.data.isLoadingMoreMessages.value = false;
+    }
   }
 
   /**
@@ -372,7 +456,7 @@ export default class AgentDetailService {
       await nextTick();
       // 通过uni事件总线更新 - 现在直接传递文本内容给 mp-html 组件
       uni.$emit("updateMessageComponent", {
-        messageId: currentMessageId,
+        messageId: `${currentMessageId}_${newMessage.index}`,
         data: {
           body: handleMessageProcess(newMessage.text || ""),
           ...newMessage,
@@ -551,7 +635,6 @@ export default class AgentDetailService {
       return;
     }
 
-
     // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
     if (this.data.conversationInfo.value?.taskStatus === TaskStatus.EXECUTING) {
       this.data.conversationInfo.value = {
@@ -661,11 +744,162 @@ export default class AgentDetailService {
   }
 
   /**
+   * 获取沙盒列表 (严格模式 - 移动端重构 Phase 9)
+   */
+  async handleGetSandboxList(): Promise<void> {
+    try {
+      const res = await apiGetSandboxList();
+      if (res.code === SUCCESS_CODE && res.data) {
+        this.data.sandboxList.value = res.data.sandboxes || [];
+        this.data.agentSelectedSandbox.value = res.data.agentSelected || {};
+
+        const sandboxList = this.data.sandboxList.value;
+        const conversationInfo = this.data.conversationInfo.value;
+        const agentInfo = this.data.agentInfo.value;
+        // 优先使用 data.agentId，其次使用 agentInfo.agentId
+        const agentId = String(
+          this.data.agentId.value || this.data.agentInfo.value?.agentId || "",
+        );
+
+        // 2.1 权限判断 (UI层已处理置灰，这里主要处理状态)
+        if (agentInfo?.hasPermission === false) {
+          this.data.isSandboxSwitchDisabled.value = true;
+          // this.data.wholeDisabled.value = true;
+          // 提示语由UI层 maskText 控制，或者在这里设置 disabledText?
+          // 根据需求描述 "置灰对话框，提示：您无该智能体权限"
+          // 查看 chat-input-phone 组件，maskText 可能是 prop，但这里好像没有直接控制 maskText 的变量？
+          // 假设 UI 层 `chat-input-phone` 的 `has-permission` 属性已经控制了提示。
+          // 我们主要确保 switch disabled
+          return;
+        }
+
+        // 2.2.1 个人电脑 (Priority 1)
+        if (agentInfo && agentInfo.sandboxId) {
+          const personalSandboxId = String(agentInfo.sandboxId);
+          const exists = sandboxList.some(
+            (s) => s.sandboxId === personalSandboxId,
+          );
+
+          if (!exists) {
+            // 2.2.1.1 不在列表中 -> 展示“个人电脑不可用”
+            this.data.currentSandboxId.value = personalSandboxId; // 或者是空？通常显示名字需要ID匹配，或者UI显示"不可用"
+            this.data.isSandboxSwitchDisabled.value = true;
+            this.data.isSandboxUnavailable.value = true;
+            this.data.sandboxDisabledText.value = "电脑不可用";
+            // this.data.wholeDisabled.value = true;
+          } else {
+            // 2.2.1.2 在列表中 -> 展示对应的电脑名称且不可切换
+            this.data.currentSandboxId.value = personalSandboxId;
+            this.data.isSandboxSwitchDisabled.value = true;
+            this.data.isSandboxUnavailable.value = false;
+            this.data.sandboxDisabledText.value = "";
+            // this.data.wholeDisabled.value = false;
+          }
+          return;
+        }
+
+        // 2.2.2 电脑列表为空 (Priority 2)
+        if (sandboxList.length === 0) {
+          this.data.currentSandboxId.value = "";
+          this.data.isSandboxSwitchDisabled.value = true;
+          this.data.isSandboxUnavailable.value = true;
+          this.data.sandboxDisabledText.value = "无可用电脑";
+          // this.data.wholeDisabled.value = true;
+          return;
+        }
+
+        // 2.2.3 共享电脑 (Priority 3)
+        if (conversationInfo && conversationInfo.sandboxServerId) {
+          const sharedSandboxId = String(conversationInfo.sandboxServerId);
+          const exists = sandboxList.some(
+            (s) => s.sandboxId === sharedSandboxId,
+          );
+
+          if (!exists) {
+            // 2.2.3.1 不在列表中 -> 展示“电脑不可用”
+            this.data.currentSandboxId.value = sharedSandboxId;
+            this.data.isSandboxSwitchDisabled.value = true;
+            this.data.isSandboxUnavailable.value = true;
+            this.data.sandboxDisabledText.value = "电脑不可用";
+            // this.data.wholeDisabled.value = true;
+          } else {
+            // 2.2.3.2 在列表中 -> 展示对应的电脑名称且不可切换
+            this.data.currentSandboxId.value = sharedSandboxId;
+            this.data.isSandboxSwitchDisabled.value = true;
+            this.data.isSandboxUnavailable.value = false;
+            this.data.sandboxDisabledText.value = "";
+            // this.data.wholeDisabled.value = false;
+          }
+          return;
+        }
+
+        // 2.2.4 默认选择 (Priority 4)
+        // conversationInfo?.sandboxServerId 和 conversationInfo?.agent?.sandboxId 都为空
+        this.data.isSandboxSwitchDisabled.value = false;
+        this.data.isSandboxUnavailable.value = false;
+        this.data.sandboxDisabledText.value = "";
+        // this.data.wholeDisabled.value = false;
+
+        let initialId = "";
+        if (this.data.agentSelectedSandbox.value[agentId]) {
+          // agentSelected 优先
+          initialId = this.data.agentSelectedSandbox.value[agentId];
+          // 校验是否存在，不存在默认第一个
+          if (!sandboxList.some((s) => s.sandboxId === initialId)) {
+            initialId = sandboxList[0].sandboxId;
+          }
+        } else {
+          // 默认第一个
+          initialId = sandboxList[0].sandboxId;
+        }
+        this.data.currentSandboxId.value = initialId;
+      }
+    } catch (error) {
+      console.error("[AgentDetailService] 获取沙盒列表失败:", error);
+    }
+  }
+
+  /**
+   * 切换沙盒
+   */
+  async handleSelectSandbox(sandboxId: string): Promise<void> {
+    // 如果禁止切换，直接返回
+    if (this.data.isSandboxSwitchDisabled.value) {
+      console.warn("[AgentDetailService] 当前不允许切换沙盒");
+      return;
+    }
+
+    const agentId = String(
+      this.data.agentId.value || this.data.agentInfo.value?.agentId || "",
+    );
+
+    try {
+      // 调用 API 更新选中记录
+      await apiUpdateSelectedSandbox(agentId, sandboxId);
+
+      // 更新本地状态
+      this.data.currentSandboxId.value = sandboxId;
+      this.data.agentSelectedSandbox.value[agentId] = sandboxId;
+
+      // uni.showToast({
+      //   title: "切换成功",
+      //   icon: "none",
+      // });
+    } catch (error) {
+      console.error("[AgentDetailService] 切换沙盒失败:", error);
+      uni.showToast({
+        title: "切换失败",
+        icon: "none",
+      });
+    }
+  }
+
+  /**
    * 恢复会话状态
    * 用于页面从后台唤醒后检测并恢复会话
-   * 
+   *
    * 检测异常中断的条件：最后一条 ASSISTANT 消息状态为 Loading/Incomplete 且无 finalResult
-   * 
+   *
    * @returns 是否需要恢复（true 表示检测到异常中断并已恢复）
    */
   async resumeConversationState(): Promise<boolean> {
@@ -679,7 +913,9 @@ export default class AgentDetailService {
     const messageList = this.data.messageList.value;
     const lastAssistantMessage = [...messageList]
       .reverse()
-      .find((msg) => msg.messageType === MessageTypeEnum.ASSISTANT && msg.status);
+      .find(
+        (msg) => msg.messageType === MessageTypeEnum.ASSISTANT && msg.status,
+      );
 
     // 3. 获取前端状态
     const isConversationActive = this.data.isConversationActive.value;
@@ -711,7 +947,7 @@ export default class AgentDetailService {
 
     console.log("[SessionResume] 检测到异常中断，正在查询后端会话状态", {
       lastMessageStatus: lastAssistantMessage?.status,
-      conversationId
+      conversationId,
     });
 
     try {
@@ -719,7 +955,6 @@ export default class AgentDetailService {
       const res = await apiAgentConversation(conversationId);
       if (res.code === SUCCESS_CODE) {
         const taskStatus = res.data?.taskStatus;
-        
         // 更新会话状态
         if (taskStatus === "EXECUTING") {
           // 任务仍在后端执行，保持活跃状态
@@ -731,7 +966,10 @@ export default class AgentDetailService {
 
         // 更新消息列表（刷新页面数据）
         this.handleQueryConversation(res);
-        console.log("[SessionResume] 会话状态已恢复，后端任务状态:", taskStatus);
+        console.log(
+          "[SessionResume] 会话状态已恢复，后端任务状态:",
+          taskStatus,
+        );
       }
 
       return true;
@@ -882,6 +1120,7 @@ export default class AgentDetailService {
             conversationId: this.data.conversationId.value,
             ...baseParams,
             debug: false,
+            sandboxId: this.data.currentSandboxId.value,
           };
     this.handleConversation(params, currentMessageId, isTempChat, onTimeout);
   }
@@ -980,6 +1219,15 @@ export default class AgentDetailService {
     } = await apiAgentConversationCreate(conversationParams);
     if (code === SUCCESS_CODE && responseData && responseData.id) {
       this.data.conversationId.value = responseData.id;
+
+      // 更新会话信息
+      this.data.conversationInfo.value = responseData;
+      if (responseData.agent) {
+        this.data.agentInfo.value = responseData.agent;
+      }
+
+      // 重新获取沙盒列表以更新状态
+      this.handleGetSandboxList();
 
       // #ifdef WEB || H5
       // 修改rul参数且不刷新页面
@@ -1080,6 +1328,9 @@ export default class AgentDetailService {
           this.handleSendMessage(params);
         }
       }
+
+      // 获取沙盒列表
+      this.handleGetSandboxList();
     }
   }
 

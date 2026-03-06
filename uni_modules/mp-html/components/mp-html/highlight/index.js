@@ -43,9 +43,17 @@ Highlight.prototype.onParse = function (node, vm) {
     if (code.children.length) {
       const text = this.vm.getText(code.children).replace(/&amp;/g, "&");
       if (!text) return;
+      // #ifndef H5
+      // 非 H5 平台：将 pre 节点标记为 c=1，并调用 vm.expose() 向上传播，
+      // 强制整个祖先链使用递归渲染，确保 pre 运在任何嵌套层级中都能被独立渲染
+      node.c = 1;
+      vm.expose();
+      // #endif
+      // #ifdef H5
       if (node.c) {
         node.c = undefined;
       }
+      // #endif
       if (prism.languages[lang]) {
         code.children = new Parser(this.vm).parse(
           // 加一层 pre 保留空白符
@@ -95,23 +103,29 @@ Highlight.prototype.onParse = function (node, vm) {
       node.children = [];
 
       if (config.showLanguageName) {
+        const langChildren = [{ type: "text", text: lang }];
+        // #ifdef H5
+        // H5: 复制按钮放入 rich-text 内部，通过 srcElement.dataset 实现点击复制
+        langChildren.push({
+          name: "div",
+          attrs: {
+            class: "hl-copy-btn",
+            "data-content": text,
+            "data-action": "copy",
+          },
+          children: [{ type: "text", text: "复制代码" }],
+        });
+        // #endif
+        // #ifndef H5
+        // 非 H5 平台：将代码文本存储到节点上，由 node.vue 渲染真实的可交互复制按钮
+        node._copyText = text;
+        // #endif
         node.children.push({
           name: "div",
           attrs: {
             class: "hl-language",
           },
-          children: [
-            { type: "text", text: lang },
-            {
-              name: "div",
-              attrs: {
-                class: "hl-copy-btn",
-                "data-content": text,
-                "data-action": "copy",
-              },
-              children: [{ type: "text", text: "复制代码" }],
-            },
-          ],
+          children: langChildren,
         });
       }
 

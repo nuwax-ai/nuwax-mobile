@@ -41,7 +41,7 @@ Highlight.prototype.onParse = function (node, vm) {
     }
     const lang = className.substring(i, j);
     if (code.children.length) {
-      const text = this.vm.getText(code.children).replace(/&amp;/g, "&");
+      const text = this.vm.getText(code.children).replace(/&amp;/g, "&")?.trim();
       if (!text) return;
       // #ifndef H5
       // 非 H5 平台：将 pre 节点标记为 c=1，并调用 vm.expose() 向上传播，

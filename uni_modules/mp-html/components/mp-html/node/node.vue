@@ -286,6 +286,20 @@
       />
       <!-- #endif -->
       <!-- #ifndef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
+      <!-- hl-language 头部节点：将 rich-text 和原生复制按钮并排在同一行，避免给对布局的依赖 -->
+      <view
+        v-else-if="
+          !n.c && n.attrs && n.attrs.class === 'hl-language' && copyText
+        "
+        class="hl-language-native"
+      >
+        <text class="hl-language-name">{{
+          (n.children && n.children[0] && n.children[0].text) || ""
+        }}</text>
+        <view class="hl-copy-btn-native" @tap.stop="doCopyText(copyText)">
+          <text class="hl-copy-btn-text">复制代码</text>
+        </view>
+      </view>
       <rich-text
         v-else-if="!n.c"
         :id="n.attrs.id"
@@ -317,6 +331,7 @@
           :attrs="n2.attrs"
           :childs="n2.children"
           :opts="opts"
+          :copy-text="n2._copyText"
         />
       </view>
       <node
@@ -326,6 +341,7 @@
         :attrs="n.attrs"
         :childs="n.children"
         :opts="opts"
+        :copy-text="n._copyText"
       />
     </block>
   </view>
@@ -394,7 +410,8 @@
         }
       },
       childs: Array,
-      opts: Array
+      opts: Array,
+      copyText: String
     },
     components: {
       markdownContainer,
@@ -684,7 +701,8 @@
        * @param {Event} e
        */
       copyCode (e) {
-        const data = e.srcElement.dataset || e.currentTarget.dataset
+        // srcElement \u5728\u5fae\u4fe1\u5c0f\u7a0b\u5e8f\u4e2d\u4e0d\u5b58\u5728\uff0c\u52a0\u5b89\u5168\u8bbf\u95ee
+        const data = (e.srcElement && e.srcElement.dataset) || (e.currentTarget && e.currentTarget.dataset)
         if(!data || data.action !== 'copy') {
           return
         }
@@ -715,8 +733,47 @@
         // #ifdef MP-WEIXIN
         if (e.name==='div' && e.attrs?.class==='event') {
           uni.$emit('message-event-delegate', e)
+          return
         }
         // #endif
+
+        // Handle copy code button in highlight blocks
+        if (e.attrs?.['data-action'] === 'copy' && e.attrs?.['data-content']) {
+          uni.setClipboardData({
+            data: e.attrs['data-content'],
+            success: () => {
+              uni.showToast({
+                title: '复制成功',
+              })
+            },
+            fail: () => {
+              uni.showToast({
+                title: '复制失败',
+              })
+            }
+          })
+        }
+      },
+
+      /**
+       * @description 复制代码文本（非 H5 平台使用）
+       * @param {String} text
+       */
+      doCopyText (text) {
+        if (!text) return
+        uni.setClipboardData({
+          data: text,
+          success: () => {
+            uni.showToast({
+              title: '复制成功',
+            })
+          },
+          fail: () => {
+            uni.showToast({
+              title: '复制失败',
+            })
+          }
+        })
       },
 
       /**
@@ -784,5 +841,43 @@
     &:hover {
       background-color: rgba(235, 235, 235);
     }
+  }
+
+  /* 非 H5 平台：hl-language 头部行的原生包裹层，匹配 .hl-language 的布局 */
+  .hl-language-native {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 10px;
+    background-color: #252526;
+    border-radius: 6px 6px 0 0;
+    font-size: 12px;
+    width: 100%;
+    box-sizing: border-box;
+    flex-shrink: 0;
+  }
+
+  /* 非 H5 平台的原生可交互复制按钮 */
+  .hl-copy-btn-native {
+    display: flex;
+    align-items: center;
+    padding: 2px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+
+    .hl-copy-btn-text {
+      font-size: 10px;
+      color: #999;
+      line-height: normal;
+      white-space: normal;
+    }
+  }
+
+  /* 语言名称文本 */
+  .hl-language-name {
+    font-size: 12px;
+    color: #999;
+    flex: 1;
   }
 </style>

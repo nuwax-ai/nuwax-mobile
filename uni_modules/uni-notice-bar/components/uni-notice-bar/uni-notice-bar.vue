@@ -6,12 +6,20 @@
     @click="onClick"
   >
     <slot v-if="showIcon === true || showIcon === 'true'" name="noticebarIcon">
-      <uni-icons
+      <!-- <uni-icons
         class="uni-noticebar-icon"
         type="sound"
         :color="color"
         :size="fontSize * 1.5"
-      />
+      /> -->
+      <text
+        class="iconfont icon-voice-1"
+        :style="{
+          fontSize: fontSize * 1.2 + 'px',
+          color: color,
+          marginRight: '10rpx',
+        }"
+      ></text>
     </slot>
     <view
       ref="textBox"
@@ -76,12 +84,21 @@
       />
     </view>
     <view class="uni-noticebar-close uni-cursor-point" v-if="isShowClose">
-      <uni-icons
+      <!-- <uni-icons
         type="closeempty"
         :color="color"
         :size="fontSize * 1.1"
         @click="close"
-      />
+      /> -->
+      <text
+        class="iconfont icon-X"
+        @click="close"
+        :style="{
+          fontSize: fontSize * 1 + 'px',
+          color: color,
+          marginRight: '10rpx',
+        }"
+      ></text>
     </view>
   </view>
 </template>

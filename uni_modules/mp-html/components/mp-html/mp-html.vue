@@ -40,7 +40,7 @@
  * @event {Function} error 媒体加载出错时触发
  */
 // #ifndef APP-PLUS-NVUE
-import node from './node/node.js'
+import node from './node/node.vue'
 // #endif
 import Parser from './parser.js'
 import markdownIt from './markdown-it/index.js'

@@ -47,6 +47,8 @@ function Markdown(vm) {
 
 Markdown.prototype.onUpdate = function (content) {
   if (this.vm.markdown) {
+    // 归一化换行符，防止不同平台下识别失败
+    content = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     // 解决中文标点符号后粗体失效的问题，增加零宽空格
     content = content.replace(
       /\*\*([^*]+)\*\*([，。！？；：])/g,

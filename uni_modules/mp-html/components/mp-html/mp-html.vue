@@ -507,6 +507,7 @@ export default {
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
   color: rgb(64, 64, 64);
+  white-space: pre-wrap;
 }
 
 /* 长按复制 */

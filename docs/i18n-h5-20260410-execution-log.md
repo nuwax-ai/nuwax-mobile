@@ -734,3 +734,26 @@
 - Risk / Rollback:
   - risk: very low, text source replacement only
   - rollback: revert login-form + locale key entries + regenerated import artifacts
+
+### S30
+- Start: `2026-03-30 17:32:21 +0800`
+- Goal: improve placeholder language-switch consistency between union-record and search page
+- Action:
+  - changed union-record search handoff to pass i18n key instead of translated text:
+    - `pages/agent-union-record/agent-union-record.uvue`
+      - `app.globalData.searchPlaceholder = "NuwaxMobile.AgentUnion.searchPlaceholder"`
+  - refactored agent-search placeholder rendering to key-driven runtime translation:
+    - `subpackages/pages/agent-search/agent-search.uvue`
+      - introduced `searchPlaceholderSource` (key source)
+      - `searchPlaceholder` switched to computed + `translateText(...)`
+      - local-search handoff now writes source key directly, not one-time translated literal
+- Result:
+  - placeholder can follow current language at runtime more consistently
+  - avoids stale translated string handoff across page jump boundary
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+  - code references confirm key-driven flow in both pages
+- Risk / Rollback:
+  - risk: low; affects only search placeholder source plumbing
+  - rollback: revert S30 two files to prior string-handoff behavior

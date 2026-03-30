@@ -684,3 +684,32 @@
 - Risk / Rollback:
   - risk: low, broad template attribute updates may expose minor rendering differences on niche devices
   - rollback: revert S27 touched files in batches (components/pages/subpackages/audit/locales) without changing i18n runtime core
+
+### S28
+- Start: `2026-03-30 17:18:39 +0800`
+- Goal: improve runtime language-switch consistency for dynamic UI labels
+- Action:
+  - replaced static-at-init translation patterns with dynamic evaluation:
+    - `components/chat-input-phone/skill-select-modal/skill-select-modal.uvue`
+      - `tabs` switched from static array to computed array to follow language switch
+    - `subpackages/pages/webview/webview.uvue`
+      - `pageTitle` fallback switched to computed (`displayPageTitle`) instead of init-time `t(...)`
+    - `pages/index/index.uvue`
+      - share title fallback changed to computed (`fallbackShareTitle`) to avoid stale language text when tenant title absent
+    - `utils/commonBusiness.uts`
+      - function default params no longer evaluate `t(...)` at module-load time
+      - fallback appName moved to call-time resolution
+  - improved generic empty-state component i18n behavior:
+    - `components/empty-state/empty-state.uvue`
+      - default `text` changed to i18n key
+      - render switched to `translateText(...)` for runtime language responsiveness
+  - adjusted `components/published-agent-list/published-agent-list.uvue` default title back to key form for dynamic translation path
+- Result:
+  - reduced stale-text risk after language switching without page reload
+  - component defaults align with key-driven translation flow
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; mostly fallback and computed wiring changes
+  - rollback: revert S28 touched files only (`skill-select-modal`, `webview`, `index`, `commonBusiness`, `empty-state`, `published-agent-list`)

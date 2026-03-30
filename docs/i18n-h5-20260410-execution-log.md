@@ -823,3 +823,21 @@
 - Risk / Rollback:
   - risk: low; label render path adjusted but category key/value behavior unchanged
   - rollback: revert S33 file only
+
+### S34
+- Start: `2026-03-30 18:28:28 +0800`
+- Goal: strengthen i18n audit gate for non-Chinese hardcoded visible text coverage
+- Action:
+  - updated `scripts/i18n-audit.mjs`
+  - added hardcoded visible literal detection for object field `text: "..."`
+  - added `<text>/<button>` raw text-node scan to detect pure literal nodes without i18n
+  - handled self-closing text/button tags in scan path to avoid false positives and preserve line mapping
+- Result:
+  - gate now covers additional non-Chinese hardcoded UI copy patterns
+  - final audit remains green after enhancement
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; only scan logic changes, no runtime behavior impact
+  - rollback: revert `scripts/i18n-audit.mjs` to previous revision

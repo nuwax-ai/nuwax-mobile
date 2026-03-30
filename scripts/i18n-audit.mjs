@@ -45,6 +45,7 @@ const hardcodedVisibleLiteral = new RegExp(
   [
     "title\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "content\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
+    "text\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "confirmText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "cancelText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "(^|\\s)placeholder\\s*=\\s*['\"][^'\"\\n]+['\"]",
@@ -182,6 +183,29 @@ files.forEach((relPath) => {
         text: imageTag.replace(/\s+/g, " ").trim(),
       });
     }
+  }
+
+  const contentWithoutSelfClosedTextNode = content.replace(
+    /<(text|button)\b(?:[^>"']|"[^"]*"|'[^']*')*\/>/g,
+    (match) => match.replace(/[^\n]/g, " "),
+  );
+  const textNodeRegex =
+    /<(text|button)\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\/\1>/g;
+  let textNodeMatch;
+  while ((textNodeMatch = textNodeRegex.exec(contentWithoutSelfClosedTextNode)) !== null) {
+    const rawInnerText = textNodeMatch[2] || "";
+    const cleanedInnerText = rawInnerText
+      .replace(/\{\{[\s\S]*?\}\}/g, "")
+      .replace(/<[^>]+>/g, "")
+      .trim();
+    if (!cleanedInnerText) continue;
+    findings.push({
+      file: relPath,
+      line: contentWithoutSelfClosedTextNode
+        .slice(0, textNodeMatch.index)
+        .split(/\r?\n/).length,
+      text: `${textNodeMatch[1]} node contains hardcoded text: ${cleanedInnerText}`,
+    });
   }
 });
 

@@ -841,3 +841,20 @@
 - Risk / Rollback:
   - risk: low; only scan logic changes, no runtime behavior impact
   - rollback: revert `scripts/i18n-audit.mjs` to previous revision
+
+### S35
+- Start: `2026-03-30 18:30:35 +0800`
+- Goal: post-commit full sweep for remaining i18n coverage gaps
+- Action:
+  - reran audit gate after S34 commit (`npm run i18n:audit`)
+  - executed targeted grep for visible-field literals (`title/content/confirmText/cancelText/label/description/placeholder/alt`)
+  - manually reviewed hits to confirm they are dynamic runtime data or i18n key-based render paths
+- Result:
+  - no new i18n遗漏 found in current sweep
+  - working tree remained clean after scan
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git status --short --branch` => clean (`ahead 2` at scan end)
+- Risk / Rollback:
+  - risk: none (scan/log only)
+  - rollback: remove S35 entry if not needed

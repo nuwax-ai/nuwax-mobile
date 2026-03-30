@@ -952,3 +952,25 @@
 - Risk / Rollback:
   - risk: low; static rule extension only
   - rollback: revert `scripts/i18n-audit.mjs` and this log entry
+
+### S41
+- Start: `2026-03-30 20:03:48 +0800`
+- Goal: extend audit to template-literal error cases and eliminate newly detected SSE error literal
+- Action:
+  - updated `scripts/i18n-audit.mjs`
+  - added hardcoded-literal checks for template forms:
+    - ``showError(`...`)``
+    - ``new Error(`...`)``
+  - audit surfaced one hit in `servers/useRequest.uts`:
+    - ``new Error(`SSE connection failed: ${response.statusText}`)``
+  - fixed SSE open error throw to avoid hardcoded literal text:
+    - `new Error(String(response.statusText || response.status || "SSE_ERROR"))`
+- Result:
+  - template-literal hardcoded error prompts are now covered by gate
+  - SSE connection open failure message no longer uses literal sentence in code
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; gate enhancement + error text construction adjustment
+  - rollback: revert `scripts/i18n-audit.mjs` and `servers/useRequest.uts`

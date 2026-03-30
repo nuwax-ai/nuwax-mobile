@@ -1,6 +1,7 @@
 # i18n-h5-20260410 Execution Log
 
 ## Metadata
+
 - Project: `nuwax-mobile`
 - Target: `H5 i18n rollout`
 - Branch: `feature/i18n-h5-20260410`
@@ -9,6 +10,7 @@
 ## Step Records
 
 ### S01
+
 - Start: `2026-03-30 12:58:41 +0800`
 - Goal: verify baseline git state before implementation
 - Action:
@@ -23,6 +25,7 @@
   - none
 
 ### S02
+
 - Start: `2026-03-30 12:58:41 +0800`
 - Goal: sync remote refs and create feature branch
 - Action:
@@ -42,6 +45,7 @@
   - rollback: re-run `git pull --ff-only origin feat-2026.4.10` after network recovery and rebase feature branch if needed
 
 ### M0 Baseline
+
 - Completed:
   - branch bootstrap
   - execution log initialized
@@ -51,6 +55,7 @@
   - build i18n foundation modules and wire app bootstrap
 
 ### S03
+
 - Start: `2026-03-30 13:00:00 +0800`
 - Goal: create i18n foundation (types/constants/runtime/API)
 - Action:
@@ -69,6 +74,7 @@
   - rollback: update `I18N_SET_LANG_API` constant only, no cross-file refactor needed
 
 ### S04
+
 - Start: `2026-03-30 13:12:00 +0800`
 - Goal: wire app bootstrap and request language context
 - Action:
@@ -86,6 +92,7 @@
   - rollback: keep only one header key by editing `servers/useRequest.uts`
 
 ### S05
+
 - Start: `2026-03-30 13:20:00 +0800`
 - Goal: reduce page-level migration cost through shared component adaptation
 - Action:
@@ -99,6 +106,7 @@
   - rollback: switch translation helper to key-only mode
 
 ### S06
+
 - Start: `2026-03-30 13:28:00 +0800`
 - Goal: implement H5 language switch in profile page
 - Action:
@@ -114,6 +122,7 @@
   - rollback: keep picker visible but disable submit and show toast
 
 ### S07
+
 - Start: `2026-03-30 13:35:00 +0800`
 - Goal: migrate high-frequency user-visible copy in core flows
 - Action:
@@ -135,6 +144,7 @@
   - rollback: fallback map keeps existing zh output; incremental migration remains safe
 
 ### S08
+
 - Start: `2026-03-30 13:50:00 +0800`
 - Goal: run static verification for syntax and formatting safety
 - Action:
@@ -150,6 +160,7 @@
   - rollback: run targeted prettier write before merge if required
 
 ### M1 Foundation + Core Flow
+
 - Completed:
   - i18n runtime/API/cache foundation
   - request header language injection
@@ -161,6 +172,7 @@
   - QA pass against H5 login and conversation flows
 
 ### S09
+
 - Start: `2026-03-30 13:55:01 +0800`
 - Goal: resolve syntax blockers and run static diff sanity checks
 - Action:
@@ -179,6 +191,7 @@
   - rollback: run `npx prettier --write <target-files>` before final merge
 
 ### S10
+
 - Start: `2026-03-30 14:10:00 +0800`
 - Goal: full omission audit against "全部覆盖" requirement
 - Action:
@@ -205,6 +218,7 @@
   - rollback: continue incremental module migration until unresolved user-visible literals reach zero
 
 ### S11
+
 - Start: `2026-03-30 14:20:00 +0800`
 - Goal: complete user-visible copy migration by module batches (A/B/C/D)
 - Action:
@@ -245,6 +259,7 @@
   - rollback: add missing key into local fallback bundle (`constants/i18n.local.constants.uts`) without reverting code-path migration
 
 ### S12
+
 - Start: `2026-03-30 14:45:00 +0800`
 - Goal: complete fallback dictionary for all newly used keys
 - Action:
@@ -262,6 +277,7 @@
   - rollback: adjust values in fallback file only, no API/logic rollback required
 
 ### S13
+
 - Start: `2026-03-30 14:58:00 +0800`
 - Goal: implement enforceable i18n audit gate
 - Action:
@@ -281,6 +297,7 @@
   - rollback: update `scripts/i18n-audit.mjs` rule list; keep command name stable for CI integration
 
 ### S14
+
 - Start: `2026-03-30 15:04:00 +0800`
 - Goal: final static gate verification
 - Action:
@@ -306,6 +323,7 @@
   - rollback: key-level rollback supported by fallback dictionary edits and per-file revert
 
 ### M2 全量覆盖收口
+
 - Completed:
   - `NuwaxMobile.*` single-prefix migration for changed user-visible copy
   - H5 full user-visible copy migration in audited scope
@@ -317,6 +335,7 @@
   - run manual regression matrix for login/chat/search/preview/file-export flows in both language states
 
 ### S15
+
 - Start: `2026-03-30 15:30:18 +0800`
 - Goal: close residual i18n misses in `utils/servers` adjacent paths and restore zero-hit gate
 - Action:
@@ -349,8 +368,65 @@
   - rollback: revert specific files and keep dictionary keys; no runtime API rollback needed
 
 ### M3 收口加固
+
 - Completed:
   - residual 5-hit gap fixed and re-verified to zero
   - audit + key parity + formatting checks all passed for this batch
 - Pending:
   - optional CI integration to enforce `npm run i18n:audit` before merge
+
+### S16
+
+- Start: `2026-03-30 15:38:30 +0800`
+- Goal: provide local default language files for platform bootstrap and import seeding
+- Action:
+  - split local fallback dictionary into independent locale files:
+    - `constants/i18n-locales/zh-cn.uts`
+    - `constants/i18n-locales/en-us.uts`
+  - refactored `constants/i18n.local.constants.uts` to aggregate from split files while keeping existing `I18N_LITERAL_LOOKUP` and runtime helper APIs unchanged
+  - added export command for platform default import package:
+    - script: `scripts/i18n-export-defaults.mjs`
+    - npm: `npm run i18n:export-defaults`
+  - generated import artifacts:
+    - `docs/i18n-platform-default-import.csv`
+    - `docs/i18n-platform-default-import.json`
+- Result:
+  - local runtime now has explicit zh/en default language source files
+  - platform maintenance can directly import generated default package from local source-of-truth
+  - exported key count: `230`
+- Evidence:
+  - `npm run i18n:export-defaults` => `[i18n export] wrote 230 keys ...`
+  - key parity checks:
+    - used keys missing in zh-cn: `0`
+    - used keys missing in en-us: `0`
+    - zh/en mismatch: `0`
+  - `npm run i18n:audit` passed; `git diff --check` passed
+- Risk / Rollback:
+  - risk: if locale source format changes, export script regex may need同步调整
+  - rollback: keep split locale files and temporarily disable export script while preserving runtime fallback behavior
+
+### S17
+
+- Start: `2026-03-30 15:46:30 +0800`
+- Goal: complete additional user-visible literal cleanup and partial delivery checkpoint
+- Action:
+  - replaced residual user-visible literals with i18n keys in:
+    - `App.uvue` (`NuwaxMobile.App.pressAgainToExit`)
+    - `components/page-preview-iframe/page-preview-iframe.uvue` (`NuwaxMobile.PagePreview.defaultTitle`)
+    - `components/button-wrapper/button-wrapper.uvue` (`NuwaxMobile.ButtonWrapper.pagePathParamConfigError`, `NuwaxMobile.ButtonWrapper.pagePathConfigError`)
+    - `components/chat-upload-image/chat-upload-image.uvue` (`NuwaxMobile.Chat.previewTypeUnsupported`)
+  - expanded locale defaults in:
+    - `constants/i18n-locales/zh-cn.uts`
+    - `constants/i18n-locales/en-us.uts`
+  - expanded audit scope to include `App.uvue` in `scripts/i18n-audit.mjs`
+  - regenerated platform import defaults via `npm run i18n:export-defaults`
+- Result:
+  - default import package key count from `230` -> `234`
+  - audit still passes at `0` hit
+- Evidence:
+  - `npm run i18n:export-defaults` => wrote `234` keys
+  - `npm run i18n:audit` => passed
+  - `git diff --check` => no output
+- Risk / Rollback:
+  - risk: App 端提示 key 需依赖 i18n 词典加载（已有本地兜底）
+  - rollback: 可按文件维度回退，不影响 i18n 主流程接口

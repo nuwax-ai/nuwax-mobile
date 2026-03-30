@@ -902,3 +902,22 @@
 - Risk / Rollback:
   - risk: low; error text source changed only
   - rollback: revert `streamRequest` and locale/export artifacts in this step
+
+### S38
+- Start: `2026-03-30 18:55:17 +0800`
+- Goal: close missed literal error prompts in message-event delegate hook
+- Action:
+  - updated `subpackages/hooks/useMessageEventDelegate.uts`
+  - replaced hardcoded Chinese prompt calls:
+    - `'页面路径配置错误'` -> `t("NuwaxMobile.ButtonWrapper.pagePathConfigError")`
+    - `'页面路径参数配置错误'` -> `t("NuwaxMobile.ButtonWrapper.pagePathParamConfigError")`
+  - imported `t` from `@/utils/i18n`
+- Result:
+  - page-event error prompts now follow unified i18n key mechanism
+  - removed a previously uncovered hardcoded visible literal
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; prompt source only
+  - rollback: revert `useMessageEventDelegate.uts` and this log entry

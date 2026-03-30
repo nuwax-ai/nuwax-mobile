@@ -974,3 +974,20 @@
 - Risk / Rollback:
   - risk: low; gate enhancement + error text construction adjustment
   - rollback: revert `scripts/i18n-audit.mjs` and `servers/useRequest.uts`
+
+### S42
+- Start: `2026-03-30 20:05:36 +0800`
+- Goal: remove residual fallback literal in SSE open error path
+- Action:
+  - adjusted `servers/useRequest.uts` SSE `onopen` error construction
+  - fallback changed:
+    - `String(response.statusText || response.status || "SSE_ERROR")`
+    - -> `String(response.statusText || response.status || 0)`
+- Result:
+  - SSE open error fallback now avoids non-i18n literal text completely
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: very low; only fallback error string changed
+  - rollback: revert `servers/useRequest.uts` and this log entry

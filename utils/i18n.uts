@@ -1,0 +1,288 @@
+import { computed, reactive } from "vue";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import {
+  DEFAULT_LANG,
+  I18N_LANG_LIST_STORAGE_KEY,
+  I18N_LANG_MAP_STORAGE_KEY,
+  I18N_LANG_STORAGE_KEY,
+  MP_FIXED_LANG,
+} from "@/constants/i18n.constants";
+import {
+  getLocalFallback,
+  getZhFallback,
+  resolveLiteralKey,
+} from "@/constants/i18n.local.constants";
+import { apiI18nLangList, apiI18nQuery, apiI18nSetLang } from "@/servers/i18n";
+import type { I18nLangDto, I18nState } from "@/types/interfaces/i18n";
+
+const parseJSON = <T = any,>(value: string, fallback: T): T => {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch (error) {
+    return fallback;
+  }
+};
+
+const isH5Platform = (): boolean => {
+  // #ifdef H5 || WEB
+  return true;
+  // #endif
+  return false;
+};
+
+const isMpWeixinPlatform = (): boolean => {
+  // #ifdef MP-WEIXIN
+  return true;
+  // #endif
+  return false;
+};
+
+const getBrowserLang = (): string => {
+  // #ifdef H5 || WEB
+  const navLang = navigator?.language || DEFAULT_LANG;
+  return navLang;
+  // #endif
+  return DEFAULT_LANG;
+};
+
+export const normalizeLang = (lang: string): string => {
+  const source = (lang || "").toLowerCase().trim();
+  if (!source) return DEFAULT_LANG;
+  if (source.startsWith("zh")) return "zh-cn";
+  if (source.startsWith("en")) return "en-us";
+  return source;
+};
+
+const getStoredLang = (): string => {
+  const cachedLang = uni.getStorageSync(I18N_LANG_STORAGE_KEY);
+  if (cachedLang) return normalizeLang(cachedLang);
+  return "";
+};
+
+const setStoredLang = (lang: string) => {
+  uni.setStorageSync(I18N_LANG_STORAGE_KEY, normalizeLang(lang));
+};
+
+const setStoredLangMap = (langMap: Record<string, string>) => {
+  uni.setStorageSync(I18N_LANG_MAP_STORAGE_KEY, JSON.stringify(langMap || {}));
+};
+
+const setStoredLangList = (langList: I18nLangDto[]) => {
+  uni.setStorageSync(
+    I18N_LANG_LIST_STORAGE_KEY,
+    JSON.stringify(langList || []),
+  );
+};
+
+const getCachedLangMap = (): Record<string, string> => {
+  const text = uni.getStorageSync(I18N_LANG_MAP_STORAGE_KEY) || "";
+  return parseJSON<Record<string, string>>(text, {});
+};
+
+const getCachedLangList = (): I18nLangDto[] => {
+  const text = uni.getStorageSync(I18N_LANG_LIST_STORAGE_KEY) || "";
+  return parseJSON<I18nLangDto[]>(text, []);
+};
+
+const sortLangList = (list: I18nLangDto[]): I18nLangDto[] => {
+  const filtered = (list || []).filter((item) => item?.status === 1);
+  return filtered.sort((a, b) => {
+    if (a.sort !== b.sort) return a.sort - b.sort;
+    return a.id - b.id;
+  });
+};
+
+const getDefaultLangFromList = (list: I18nLangDto[]): string => {
+  const defaultItem = list.find((item) => item?.isDefault === 1);
+  return normalizeLang(defaultItem?.lang || DEFAULT_LANG);
+};
+
+export const i18nState = reactive<I18nState>({
+  currentLang: DEFAULT_LANG,
+  langMap: {},
+  langList: [],
+  loaded: false,
+  loading: false,
+});
+
+const fillTemplate = (
+  source: string,
+  params: Record<string, string | number> = {},
+): string => {
+  let output = source || "";
+  Object.keys(params || {}).forEach((key) => {
+    const val = String(params[key] ?? "");
+    output = output.replace(new RegExp(`\\{${key}\\}`, "g"), val);
+  });
+  return output;
+};
+
+const pickLangForInit = (): string => {
+  if (isMpWeixinPlatform()) {
+    return MP_FIXED_LANG;
+  }
+  const cacheLang = getStoredLang();
+  const browserLang = normalizeLang(getBrowserLang());
+  return normalizeLang(cacheLang || browserLang || DEFAULT_LANG);
+};
+
+const fetchLangList = async (): Promise<I18nLangDto[]> => {
+  try {
+    const res = await apiI18nLangList();
+    if (res?.code === SUCCESS_CODE && Array.isArray(res?.data)) {
+      const sortedList = sortLangList(res.data);
+      setStoredLangList(sortedList);
+      return sortedList;
+    }
+  } catch (error) {
+    console.error("fetchLangList failed:", error);
+  }
+  return sortLangList(getCachedLangList());
+};
+
+const fetchLangMap = async (lang: string): Promise<Record<string, string>> => {
+  const targetLang = normalizeLang(lang);
+
+  try {
+    // 初始化阶段始终按目标语言查询，避免 langMap 与 currentLang 不一致
+    const res = await apiI18nQuery(targetLang);
+    if (res?.code === SUCCESS_CODE && res?.data) {
+      return res.data;
+    }
+  } catch (error) {
+    console.error("fetchLangMap failed:", error);
+  }
+  return getCachedLangMap();
+};
+
+export const bootstrapI18nCache = () => {
+  const lang = isMpWeixinPlatform() ? MP_FIXED_LANG : getStoredLang();
+  i18nState.currentLang = normalizeLang(lang);
+  i18nState.langMap = getCachedLangMap();
+  i18nState.langList = sortLangList(getCachedLangList());
+  i18nState.loaded = Object.keys(i18nState.langMap || {}).length > 0;
+};
+
+const resolveMessage = (
+  lang: string,
+  keyOrText: string,
+  fallback: string = "",
+): string => {
+  const key = resolveLiteralKey(keyOrText);
+  const fromServer = i18nState.langMap?.[key] || "";
+  if (fromServer) return fromServer;
+
+  const fromLocal = getLocalFallback(lang, key);
+  if (fromLocal) return fromLocal;
+
+  if (fallback) return fallback;
+  if (key !== keyOrText) {
+    return getLocalFallback(lang, key) || getZhFallback(key) || keyOrText;
+  }
+  return getZhFallback(key);
+};
+
+export const t = (
+  key: string,
+  params: Record<string, string | number> = {},
+  fallback: string = "",
+): string => {
+  const lang = normalizeLang(i18nState.currentLang || DEFAULT_LANG);
+  const value = resolveMessage(lang, key, fallback);
+  return fillTemplate(value, params);
+};
+
+export const translateText = (
+  text: string,
+  params: Record<string, string | number> = {},
+): string => {
+  if (!text) return "";
+  return t(text, params, text);
+};
+
+export const loadI18n = async () => {
+  if (i18nState.loading) return;
+  i18nState.loading = true;
+
+  try {
+    const initLang = pickLangForInit();
+    const langList = await fetchLangList();
+    i18nState.langList = langList;
+
+    let targetLang = initLang;
+    if (langList.length > 0) {
+      const inList = langList.some(
+        (item) => normalizeLang(item.lang) === normalizeLang(initLang),
+      );
+      if (!inList) {
+        targetLang = getDefaultLangFromList(langList);
+      }
+    }
+
+    // 小程序固定简中
+    if (isMpWeixinPlatform()) {
+      targetLang = MP_FIXED_LANG;
+    }
+
+    const langMap = await fetchLangMap(targetLang);
+
+    i18nState.currentLang = normalizeLang(targetLang);
+    i18nState.langMap = langMap || {};
+    i18nState.loaded = true;
+
+    setStoredLang(i18nState.currentLang);
+    setStoredLangMap(i18nState.langMap);
+  } finally {
+    i18nState.loading = false;
+  }
+};
+
+export const setLanguage = async (lang: string): Promise<boolean> => {
+  const targetLang = normalizeLang(lang);
+  if (!targetLang) return false;
+
+  // 小程序固定简中，不做切换
+  if (isMpWeixinPlatform()) {
+    i18nState.currentLang = MP_FIXED_LANG;
+    return true;
+  }
+
+  const previousLang = i18nState.currentLang;
+  const previousLangMap = i18nState.langMap;
+
+  try {
+    const saveResult = await apiI18nSetLang(targetLang);
+    if (!saveResult || saveResult.code !== SUCCESS_CODE) {
+      return false;
+    }
+
+    const queryResult = await apiI18nQuery(targetLang);
+    if (!queryResult || queryResult.code !== SUCCESS_CODE) {
+      return false;
+    }
+
+    i18nState.currentLang = targetLang;
+    i18nState.langMap = queryResult.data || {};
+    setStoredLang(targetLang);
+    setStoredLangMap(i18nState.langMap);
+    return true;
+  } catch (error) {
+    console.error("setLanguage failed:", error);
+    i18nState.currentLang = previousLang;
+    i18nState.langMap = previousLangMap;
+    return false;
+  }
+};
+
+export const useI18n = () => {
+  return {
+    i18nState,
+    t,
+    translateText,
+    currentLang: computed(() => i18nState.currentLang),
+    langList: computed(() => sortLangList(i18nState.langList || [])),
+    loadI18n,
+    setLanguage,
+  };
+};

@@ -802,3 +802,24 @@
 - Risk / Rollback:
   - risk: very low; symbol rendering source only
   - rollback: revert `new-conversation-set` and locale/export artifact updates
+
+### S33
+- Start: `2026-03-30 18:18:57 +0800`
+- Goal: improve language-switch behavior for published-agent category tab labels
+- Action:
+  - refactored category label render path in:
+    - `components/published-agent-list/published-agent-list.uvue`
+  - changes:
+    - template label render switched to `translateText(category.label)`
+    - default "all" category label source changed from translated literal to key:
+      - `t("NuwaxMobile.Common.all")` -> `"NuwaxMobile.Common.all"`
+    - imported `translateText` alongside `useI18n`
+- Result:
+  - "all" tab label can follow runtime language changes through key-driven rendering path
+  - backend-provided category labels remain compatible (non-key labels pass through unchanged)
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; label render path adjusted but category key/value behavior unchanged
+  - rollback: revert S33 file only

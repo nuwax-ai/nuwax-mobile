@@ -8,7 +8,9 @@
     <!-- Error Overlay -->
     <view v-show="error" class="state-overlay error">
       <text class="error-text">{{ error }}</text>
-      <button size="mini" @click="reload">重试</button>
+      <button size="mini" @click="reload">
+        {{ i18n("NuwaxMobile.Common.retry") }}
+      </button>
     </view>
     
     <!-- Preview iframe -->
@@ -27,6 +29,7 @@
 
 <script>
 import { API_BASE_URL } from '@/constants/config';
+import { translateText } from '@/utils/i18n';
 export default {
   name: 'FilePreviewH5',
   props: {
@@ -96,6 +99,10 @@ export default {
     window.removeEventListener('message', this.handleMessage);
   },
   methods: {
+    i18n(key, fallback = '') {
+      const value = translateText(key || '');
+      return value || fallback || key;
+    },
     getPreviewBaseUrl() {
       // 判断是否为开发环境
       if (process.env.NODE_ENV === 'development') {
@@ -119,7 +126,7 @@ export default {
     onIframeError(e) {
       console.error('[FilePreviewH5] Iframe error:', e);
       this.loading = false;
-      this.error = '预览页面加载失败';
+      this.error = this.i18n('NuwaxMobile.FilePreview.previewPageLoadFailed');
     },
     
     handleMessage(event) {
@@ -136,7 +143,7 @@ export default {
         this.$emit('load');
       } else if (data.type === 'preview_error') {
         this.loading = false;
-        this.error = data.error || '文档渲染失败';
+        this.error = data.error || this.i18n('NuwaxMobile.FilePreview.documentRenderFailed');
         this.$emit('error', data.error);
       }
     },

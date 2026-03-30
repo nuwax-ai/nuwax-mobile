@@ -48,6 +48,7 @@ const hardcodedVisibleLiteral = new RegExp(
     "content\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "text\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "showError\\s*\\(\\s*['\"][^'\"\\n]+['\"]\\s*\\)",
+    "new\\s+Error\\s*\\(\\s*['\"][^'\"\\n]+['\"]\\s*\\)",
     "confirmText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "cancelText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "(^|\\s)placeholder\\s*=\\s*['\"][^'\"\\n]+['\"]",

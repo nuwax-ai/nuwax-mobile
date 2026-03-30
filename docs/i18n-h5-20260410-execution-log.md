@@ -937,3 +937,18 @@
 - Risk / Rollback:
   - risk: low; static scan rule extension only
   - rollback: revert `scripts/i18n-audit.mjs` and this log entry
+
+### S40
+- Start: `2026-03-30 20:00:49 +0800`
+- Goal: close audit gap for hardcoded error literals passed via `new Error('...')`
+- Action:
+  - updated `scripts/i18n-audit.mjs`
+  - added hardcoded visible literal rule for `new Error('...')` / `new Error("...")`
+- Result:
+  - audit now blocks additional non-i18n error-literal patterns that may surface to users
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; static rule extension only
+  - rollback: revert `scripts/i18n-audit.mjs` and this log entry

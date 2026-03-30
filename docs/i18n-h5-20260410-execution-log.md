@@ -780,3 +780,25 @@
 - Risk / Rollback:
   - risk: low; stricter gate may expose pre-existing key debt in future branches
   - rollback: revert S31 delta in `scripts/i18n-audit.mjs`
+
+### S32
+- Start: `2026-03-30 17:39:58 +0800`
+- Goal: remove residual literal symbols from form UI to approach strict key-only visible text policy
+- Action:
+  - converted two visible literals in new-conversation-set to i18n keys:
+    - required marker: `*` -> `NuwaxMobile.Common.requiredMark`
+    - single-select separator: `/` -> `NuwaxMobile.Common.optionSeparator`
+  - added locale entries in zh/en defaults:
+    - `NuwaxMobile.Common.requiredMark`
+    - `NuwaxMobile.Common.optionSeparator`
+  - regenerated platform import artifacts via `npm run i18n:export-defaults`
+- Result:
+  - form visible symbols are now key-managed and platform-importable
+  - platform default import key count increased to `249`
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+  - export artifacts contain both new keys
+- Risk / Rollback:
+  - risk: very low; symbol rendering source only
+  - rollback: revert `new-conversation-set` and locale/export artifact updates

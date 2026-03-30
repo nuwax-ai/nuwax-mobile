@@ -713,3 +713,24 @@
 - Risk / Rollback:
   - risk: low; mostly fallback and computed wiring changes
   - rollback: revert S28 touched files only (`skill-select-modal`, `webview`, `index`, `commonBusiness`, `empty-state`, `published-agent-list`)
+
+### S29
+- Start: `2026-03-30 17:22:01 +0800`
+- Goal: continue full-coverage key management for remaining visible login literal
+- Action:
+  - replaced login area-code visible literal in:
+    - `subpackages/pages/login/components/login-form/login-form.uvue`
+      - `+86` -> `t("NuwaxMobile.Auth.defaultAreaCode")`
+  - added locale keys (zh/en):
+    - `NuwaxMobile.Auth.defaultAreaCode`
+  - regenerated platform import artifacts via `npm run i18n:export-defaults`
+- Result:
+  - login area-code text now managed in i18n dictionary and can be imported/maintained on platform uniformly
+  - platform default import key count increased to `247`
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+  - `docs/i18n-platform-default-import.json` => contains `NuwaxMobile.Auth.defaultAreaCode`
+- Risk / Rollback:
+  - risk: very low, text source replacement only
+  - rollback: revert login-form + locale key entries + regenerated import artifacts

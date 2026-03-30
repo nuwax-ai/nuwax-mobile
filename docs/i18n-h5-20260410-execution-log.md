@@ -757,3 +757,26 @@
 - Risk / Rollback:
   - risk: low; affects only search placeholder source plumbing
   - rollback: revert S30 two files to prior string-handoff behavior
+
+### S31
+- Start: `2026-03-30 17:35:43 +0800`
+- Goal: strengthen i18n audit gate for key completeness and prefix policy
+- Action:
+  - enhanced `scripts/i18n-audit.mjs` with key-level checks:
+    - collect all used `NuwaxMobile.*` keys from business code
+    - validate keys exist in both locale defaults:
+      - `constants/i18n-locales/zh-cn.uts`
+      - `constants/i18n-locales/en-us.uts`
+    - enforce zh/en locale key-set parity
+    - block legacy key prefix usage:
+      - code-side `System.*`
+      - locale-side `System.*`
+  - preserved existing visible-text/alt gate checks
+- Result:
+  - audit now catches missing dictionary definitions and bilingual key drift early
+  - key-prefix policy (`NuwaxMobile.*` only) is enforced by gate
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+- Risk / Rollback:
+  - risk: low; stricter gate may expose pre-existing key debt in future branches
+  - rollback: revert S31 delta in `scripts/i18n-audit.mjs`

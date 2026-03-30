@@ -879,3 +879,26 @@
 - Risk / Rollback:
   - risk: low-medium; adds one explicit i18n query when user-lang differs from current state
   - rollback: revert the three files touched in S36
+
+### S37
+- Start: `2026-03-30 18:52:00 +0800`
+- Goal: remove remaining hardcoded HTTP error literal in stream request path
+- Action:
+  - updated `utils/streamRequest.uts`
+  - replaced `HTTP error! status: {code}` literal with i18n key:
+    - `NuwaxMobile.Stream.httpErrorWithCode`
+  - added locale defaults:
+    - `constants/i18n-locales/zh-cn.uts`
+    - `constants/i18n-locales/en-us.uts`
+  - regenerated platform import defaults:
+    - `docs/i18n-platform-default-import.csv`
+    - `docs/i18n-platform-default-import.json`
+- Result:
+  - stream HTTP failure message is now fully translatable and follows `NuwaxMobile` key convention
+- Evidence:
+  - `npm run i18n:export-defaults` => wrote 250 keys
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; error text source changed only
+  - rollback: revert `streamRequest` and locale/export artifacts in this step

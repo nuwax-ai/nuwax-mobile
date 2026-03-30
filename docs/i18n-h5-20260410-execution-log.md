@@ -430,3 +430,130 @@
 - Risk / Rollback:
   - risk: App 端提示 key 需依赖 i18n 词典加载（已有本地兜底）
   - rollback: 可按文件维度回退，不影响 i18n 主流程接口
+
+### S18
+
+- Start: `2026-03-30 16:02:59 +0800`
+- Goal: align initialization behavior with backend language-hit logic
+- Action:
+  - updated `utils/i18n.uts` init path:
+    - H5 init now calls `/api/i18n/query` without `lang`
+    - MP-WEIXIN still enforces fixed `zh-cn` via explicit query target
+  - kept manual switch behavior unchanged (`setLanguage` uses save-lang + explicit query)
+- Result:
+  - initialization semantics now match requirement: "page-load prefetch uses backend-hit language logic"
+- Evidence:
+  - code path in `loadI18n` calls `fetchLangMap("")` on H5
+  - `npm run i18n:audit` passed; `git diff --check` passed
+- Risk / Rollback:
+  - risk: when local cache is empty, `currentLang` may differ from backend-hit language label until explicit switch/save
+  - rollback: revert `utils/i18n.uts` only, no API contract rollback required
+
+### S19
+
+- Start: `2026-03-30 16:07:51 +0800`
+- Goal: close remaining accessibility/visible literal gaps after review
+- Action:
+  - localized `alt` accessibility text:
+    - `components/page-card/page-card.uvue` (`cover image`, `avatar`)
+    - `components/agent-component/agent-component.uvue` (`avatar`)
+  - localized image-choose failure toast in `components/chat-input-phone/chat-input-phone.uvue`
+    - replaced hardcoded english with `NuwaxMobile.Chat.chooseImageFailed`
+  - expanded locale dictionaries:
+    - `NuwaxMobile.Common.coverImageAlt`
+    - `NuwaxMobile.Common.avatarAlt`
+    - `NuwaxMobile.Chat.chooseImageFailed`
+  - strengthened audit rule to include `alt=` in visible-line patterns (`scripts/i18n-audit.mjs`)
+  - regenerated platform default import artifacts (`npm run i18n:export-defaults`)
+- Result:
+  - static `alt` hardcoded literals removed from business components
+  - fallback/export dictionary key count increased to `237`
+  - review-raised missing points are closed for this batch
+- Evidence:
+  - `rg '\balt="[^"]+"'` now returns only `:alt="t(...)"` bindings in relevant components
+  - `npm run i18n:audit` => pass (0 hit)
+  - `git diff --check` => no output
+- Risk / Rollback:
+  - risk: audit still focuses on chinese hardcoded detection and visible patterns; non-standard literal paths may need rule extension
+  - rollback: per-file revert for component-level changes; dictionary additions are backward compatible
+
+### S20
+
+- Start: `2026-03-30 16:10:59 +0800`
+- Goal: verify residual omissions and harden multilingual behavior in mixed-language names
+- Action:
+  - executed residual scans:
+    - hardcoded `alt` attribute scan
+    - hardcoded `title:` literal scan in toast/modal contexts
+    - locale key parity checks (used keys vs zh/en bundles)
+  - updated `components/chat-input-phone/manual-component-item/manual-component-item.uvue` icon mapping logic:
+    - from Chinese-only keyword matching to Chinese + English keyword matching (`search/internet/research/deep`)
+- Result:
+  - no remaining business `alt` hardcoded literal found (all switched to `:alt="t(...)"`)
+  - no remaining business `title:` hardcoded visible literal (excluding commented lines / empty placeholder)
+  - key parity remains complete
+  - multilingual display no longer causes icon match fallback in english keyword cases
+- Evidence:
+  - `npm run i18n:audit` => pass
+  - `git diff --check` => pass
+  - parity output: `Missing in zh-cn:` empty, `Missing in en-us:` empty
+- Risk / Rollback:
+  - risk: keyword-based icon mapping still heuristic; future locale text variants may require type-based mapping
+  - rollback: revert `manual-component-item` logic only
+
+### S21
+
+- Start: `2026-03-30 16:16:48 +0800`
+- Goal: continue omission closure and strengthen gate for non-Chinese hardcoded visible literals
+- Action:
+  - fixed residual visible literals:
+    - `components/page-card/page-card.uvue`: `alt` switched to i18n keys
+    - `components/agent-component/agent-component.uvue`: `alt` switched to i18n key
+    - `components/chat-input-phone/chat-input-phone.uvue`: image choose failure toast switched to i18n key
+    - `subpackages/pages/chat-conversation-component/components/more-info/more-info.uvue`: removed hardcoded author initial (`A`) -> dynamic initial derivation
+  - expanded zh/en locale dictionaries with:
+    - `NuwaxMobile.Common.coverImageAlt`
+    - `NuwaxMobile.Common.avatarAlt`
+    - `NuwaxMobile.Chat.chooseImageFailed`
+  - hardened audit script `scripts/i18n-audit.mjs`:
+    - keeps chinese visible literal detection
+    - adds non-chinese hardcoded visible literal detection for `title/content/confirmText/cancelText/placeholder/alt`
+    - excludes i18n-key form (`NuwaxMobile.*`) and avoids dynamic binding false positives
+  - regenerated platform default import artifacts via `npm run i18n:export-defaults`
+- Result:
+  - no remaining business static `alt` literal
+  - no remaining direct toast `title` hardcoded visible literal in active code paths
+  - audit gate now can block english hardcoded visible literals in key scenes
+  - default import key count increased to `237`
+- Evidence:
+  - `npm run i18n:audit` => pass
+  - `git diff --check` => pass
+  - `rg '\\balt="[^\\"]+"'` returns only `:alt="t(...)"` in business components
+- Risk / Rollback:
+  - risk: regex-based audit still heuristic and may need incremental rule tuning for edge syntax
+  - rollback: rule rollback limited to `scripts/i18n-audit.mjs`, does not affect runtime behavior
+
+### S22
+
+- Start: `2026-03-30 16:24:56 +0800`
+- Goal: close tabBar multilingual omission for H5 runtime
+- Action:
+  - implemented tabBar runtime i18n sync in `utils/i18n.uts`:
+    - added `TAB_BAR_I18N_ITEMS` mapping (home/unionRecord/agent/app)
+    - added `applyTabBarI18n()` using `uni.setTabBarItem`
+    - trigger points:
+      - `bootstrapI18nCache`
+      - `loadI18n` success path
+      - `setLanguage` success path
+  - maintained platform isolation:
+    - only applies on H5/WEB
+    - MP-WEIXIN remains fixed `zh-cn`
+- Result:
+  - H5 tabBar text now follows active language instead of static `pages.json` defaults only
+- Evidence:
+  - code added in `utils/i18n.uts`
+  - `npm run i18n:audit` passed
+  - `git diff --check` passed
+- Risk / Rollback:
+  - risk: on non-tab pages, `setTabBarItem` may throw; protected with try/catch
+  - rollback: remove `applyTabBarI18n()` calls only

@@ -26,6 +26,7 @@ const visibleLine = new RegExp(
     "cancelText",
     "placeholder=",
     "title=",
+    "alt=",
     "label\\s*:",
     "content\\s*:",
     "description\\s*:",
@@ -36,6 +37,16 @@ const visibleLine = new RegExp(
     "<button",
     "<input",
     "<textarea",
+  ].join("|"),
+);
+const hardcodedVisibleLiteral = new RegExp(
+  [
+    "title\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
+    "content\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
+    "confirmText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
+    "cancelText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
+    "(^|\\s)placeholder\\s*=\\s*['\"][^'\"\\n]+['\"]",
+    "(^|\\s)alt\\s*=\\s*['\"][^'\"\\n]+['\"]",
   ].join("|"),
 );
 
@@ -91,9 +102,19 @@ files.forEach((relPath) => {
 
   lines.forEach((line, index) => {
     const code = line.replace(/\/\/.*$/, "");
-    if (!hasChinese.test(code)) return;
     const trimmed = code.trim();
     if (!trimmed || trimmed.startsWith("//")) return;
+
+    if (hardcodedVisibleLiteral.test(code)) {
+      findings.push({
+        file: relPath,
+        line: index + 1,
+        text: code.trim(),
+      });
+      return;
+    }
+
+    if (!hasChinese.test(code)) return;
     if (!visibleLine.test(code)) return;
 
     findings.push({

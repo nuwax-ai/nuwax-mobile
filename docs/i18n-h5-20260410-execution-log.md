@@ -858,3 +858,24 @@
 - Risk / Rollback:
   - risk: none (scan/log only)
   - rollback: remove S35 entry if not needed
+
+### S36
+- Start: `2026-03-30 18:44:57 +0800`
+- Goal: align i18n runtime current language with backend user lang after login info fetch
+- Action:
+  - added `syncLanguageFromUser(lang)` in `utils/i18n.uts`
+    - H5: sync `currentLang` and storage with user `lang`
+    - if lang changed, reload lang map by explicit `lang` query and refresh tabbar i18n
+    - MP: keep fixed `zh-cn`
+  - integrated lang sync call into login-info fetch points:
+    - `pages/index/index.uvue`
+    - `subpackages/pages/about-me/about-me.uvue`
+- Result:
+  - runtime language state is now reconciled with backend persisted user language after user info load
+  - avoids state drift where UI map/actual language and `currentLang` could be inconsistent
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low-medium; adds one explicit i18n query when user-lang differs from current state
+  - rollback: revert the three files touched in S36

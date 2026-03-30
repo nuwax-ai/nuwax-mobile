@@ -5,6 +5,7 @@ import path from "node:path";
 
 const rootDir = process.cwd();
 const includeDirs = ["pages", "subpackages", "components", "utils", "servers"];
+const includeFiles = ["App.uvue"];
 const includeExt = new Set([".uvue", ".vue", ".uts"]);
 const excludeFiles = new Set([
   "components/pane-tabs/example.uvue",
@@ -69,7 +70,18 @@ const walkFiles = (dir) => {
 };
 
 const findings = [];
-const files = includeDirs.flatMap((dir) => walkFiles(dir));
+const files = Array.from(
+  new Set([
+    ...includeDirs.flatMap((dir) => walkFiles(dir)),
+    ...includeFiles.filter((file) => {
+      const relPath = file.replace(/\\/g, "/");
+      return (
+        fs.existsSync(path.join(rootDir, relPath)) &&
+        includeExt.has(path.extname(relPath))
+      );
+    }),
+  ]),
+);
 
 files.forEach((relPath) => {
   const absPath = path.join(rootDir, relPath);

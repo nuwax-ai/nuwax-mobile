@@ -921,3 +921,19 @@
 - Risk / Rollback:
   - risk: low; prompt source only
   - rollback: revert `useMessageEventDelegate.uts` and this log entry
+
+### S39
+- Start: `2026-03-30 18:57:42 +0800`
+- Goal: prevent future misses of helper-based literal prompt calls in i18n audit
+- Action:
+  - updated `scripts/i18n-audit.mjs`
+  - added `showError(...)` into visible-scan trigger set
+  - added hardcoded literal rule for `showError('...')` / `showError("...")`
+- Result:
+  - audit gate now blocks direct literal prompt text routed through `showError` helper
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; static scan rule extension only
+  - rollback: revert `scripts/i18n-audit.mjs` and this log entry

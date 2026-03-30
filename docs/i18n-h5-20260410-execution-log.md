@@ -1,0 +1,356 @@
+# i18n-h5-20260410 Execution Log
+
+## Metadata
+- Project: `nuwax-mobile`
+- Target: `H5 i18n rollout`
+- Branch: `feature/i18n-h5-20260410`
+- Timezone: `Asia/Shanghai (+0800)`
+
+## Step Records
+
+### S01
+- Start: `2026-03-30 12:58:41 +0800`
+- Goal: verify baseline git state before implementation
+- Action:
+  - `git status -sb`
+  - `git rev-parse --abbrev-ref HEAD`
+- Result:
+  - current branch confirmed as `feat-2026.4.10`
+  - worktree clean
+- Evidence:
+  - output snapshot: `## feat-2026.4.10...origin/feat-2026.4.10`
+- Risk / Rollback:
+  - none
+
+### S02
+- Start: `2026-03-30 12:58:41 +0800`
+- Goal: sync remote refs and create feature branch
+- Action:
+  - `git fetch origin --prune`
+  - `git checkout feat-2026.4.10`
+  - `git pull --ff-only origin feat-2026.4.10`
+  - `git checkout -b feature/i18n-h5-20260410`
+- Result:
+  - remote refs fetched successfully
+  - branch `feature/i18n-h5-20260410` created and checked out
+  - `git pull` failed once due to SSL connect error
+- Evidence:
+  - output snapshot: `Switched to a new branch 'feature/i18n-h5-20260410'`
+  - error snapshot: `LibreSSL SSL_connect: SSL_ERROR_SYSCALL`
+- Risk / Rollback:
+  - risk: local branch may miss very latest remote commits if remote changed after fetch
+  - rollback: re-run `git pull --ff-only origin feat-2026.4.10` after network recovery and rebase feature branch if needed
+
+### M0 Baseline
+- Completed:
+  - branch bootstrap
+  - execution log initialized
+- Pending:
+  - i18n runtime, API integration, UI replacement
+- Next:
+  - build i18n foundation modules and wire app bootstrap
+
+### S03
+- Start: `2026-03-30 13:00:00 +0800`
+- Goal: create i18n foundation (types/constants/runtime/API)
+- Action:
+  - added `types/interfaces/i18n.uts`
+  - added `constants/i18n.constants.uts`
+  - added `constants/i18n.local.constants.uts`
+  - added `servers/i18n.uts`
+  - added `utils/i18n.uts`
+- Result:
+  - i18n runtime ready with cache bootstrap, language normalization, language loading, manual language switch, and fallback lookup
+  - API encapsulation for `/api/i18n/lang/list`, `/api/i18n/query`, and `setLang` endpoint
+- Evidence:
+  - new file list present in `git status`
+- Risk / Rollback:
+  - risk: `/api/i18n/lang/set` path may differ by backend deploy
+  - rollback: update `I18N_SET_LANG_API` constant only, no cross-file refactor needed
+
+### S04
+- Start: `2026-03-30 13:12:00 +0800`
+- Goal: wire app bootstrap and request language context
+- Action:
+  - updated `main.uts` to bootstrap i18n cache before app creation
+  - updated `App.uvue` to load i18n on app launch
+  - updated `servers/useRequest.uts` to add `Accept-Language` and `lang` headers
+  - updated `types/interfaces/login.uts` to include `UserInfo.lang`
+- Result:
+  - i18n now initializes at app startup
+  - all HTTP/SSE requests carry language context
+- Evidence:
+  - touched files: `main.uts`, `App.uvue`, `servers/useRequest.uts`, `types/interfaces/login.uts`
+- Risk / Rollback:
+  - risk: header key mismatch in backend gateway
+  - rollback: keep only one header key by editing `servers/useRequest.uts`
+
+### S05
+- Start: `2026-03-30 13:20:00 +0800`
+- Goal: reduce page-level migration cost through shared component adaptation
+- Action:
+  - updated `custom-nav-bar`, `pane-tabs`, `menu-dropdown` to pass labels through i18n translator
+- Result:
+  - common title/menu/tab labels can be translated without repeating per-page conversion
+- Evidence:
+  - changed files under `components/custom-nav-bar`, `components/pane-tabs`, `components/menu-dropdown`
+- Risk / Rollback:
+  - risk: component label props that are dynamic business text could be over-translated
+  - rollback: switch translation helper to key-only mode
+
+### S06
+- Start: `2026-03-30 13:28:00 +0800`
+- Goal: implement H5 language switch in profile page
+- Action:
+  - updated `subpackages/pages/about-me/about-me.uvue`
+  - added language picker for H5
+  - wired `setLanguage()` + re-query flow + success/fail feedback
+- Result:
+  - profile page supports manual language switching with immediate effect
+- Evidence:
+  - H5-only picker section added in template
+- Risk / Rollback:
+  - risk: set language endpoint failure degrades switch action
+  - rollback: keep picker visible but disable submit and show toast
+
+### S07
+- Start: `2026-03-30 13:35:00 +0800`
+- Goal: migrate high-frequency user-visible copy in core flows
+- Action:
+  - converted index/home/header/login/temp-session/agent-list/conversation-list/agent-union key texts to i18n keys
+  - converted login-related toasts/modals/placeholders in:
+    - `components/auth-login-popup.uvue`
+    - `subpackages/pages/login-weixin/login-weixin.uvue`
+    - `subpackages/pages/login/components/login-form/login-form.uvue`
+    - `subpackages/pages/login/components/captcha-verify/captcha-verify.uvue`
+    - `subpackages/pages/login/components/reset-password/reset-password.uvue`
+    - `components/agreement-checkbox/agreement-checkbox.uvue`
+  - updated reusable list component `components/published-agent-list.uvue` empty/loading/error copy
+- Result:
+  - primary login + homepage + profile + list browsing flow now translated through i18n runtime
+- Evidence:
+  - modified file set visible in `git status --short`
+- Risk / Rollback:
+  - risk: some long-tail pages still contain hard-coded Chinese
+  - rollback: fallback map keeps existing zh output; incremental migration remains safe
+
+### S08
+- Start: `2026-03-30 13:50:00 +0800`
+- Goal: run static verification for syntax and formatting safety
+- Action:
+  - ran `npx prettier --check` on changed files
+  - fixed parse issue in `subpackages/pages/temporary-session/temporary-session.uvue` (`textarea` conditional attribute comment)
+- Result:
+  - syntax-blocking issue resolved
+  - formatting warnings remain (non-blocking)
+- Evidence:
+  - check output recorded with one syntax error fixed
+- Risk / Rollback:
+  - risk: style warnings indicate non-formatted files
+  - rollback: run targeted prettier write before merge if required
+
+### M1 Foundation + Core Flow
+- Completed:
+  - i18n runtime/API/cache foundation
+  - request header language injection
+  - profile language switch (H5)
+  - core page copy migration for login/home/profile/list
+- Pending:
+  - long-tail module full copy migration and exhaustive regression
+- Next:
+  - QA pass against H5 login and conversation flows
+
+### S09
+- Start: `2026-03-30 13:55:01 +0800`
+- Goal: resolve syntax blockers and run static diff sanity checks
+- Action:
+  - fixed literal-map key quoting issue in `constants/i18n.local.constants.uts`
+  - ran:
+    - `npx prettier --check ...` (all changed files)
+    - `git diff --check`
+- Result:
+  - no syntax parse errors remain in changed files
+  - formatter still reports style warnings (not auto-written in this round)
+  - `git diff --check` passed (no whitespace errors)
+- Evidence:
+  - previous parser error at `constants/i18n.local.constants.uts:232` no longer appears
+- Risk / Rollback:
+  - risk: style inconsistency until formatting pass is executed
+  - rollback: run `npx prettier --write <target-files>` before final merge
+
+### S10
+- Start: `2026-03-30 14:10:00 +0800`
+- Goal: full omission audit against "全部覆盖" requirement
+- Action:
+  - scanned user-facing Chinese literals across `pages/`, `subpackages/`, `components/`
+  - grouped results by high-frequency modules and user-visible patterns
+  - extracted representative remaining strings (template text, placeholder, toast/modal text)
+- Result:
+  - "not fully covered" confirmed
+  - rough metrics:
+    - total Chinese-hit lines: `2296` (includes comments)
+    - non-comment Chinese-hit lines: `376`
+    - likely user-visible unresolved lines (heuristic): `61`
+  - top remaining modules:
+    - `subpackages/pages/chat-conversation-component/*`
+    - `components/chat-input-phone/*`
+    - `subpackages/pages/agent-search/agent-search.uvue`
+    - `subpackages/pages/file-preview-page/file-preview-page.uvue`
+    - `subpackages/pages/webview/webview.uvue`
+    - `components/voice-recorder-button/voice-recorder-button.uvue`
+- Evidence:
+  - scan commands and outputs retained in session logs
+- Risk / Rollback:
+  - risk: if merged now, H5 i18n claim cannot be "full coverage"
+  - rollback: continue incremental module migration until unresolved user-visible literals reach zero
+
+### S11
+- Start: `2026-03-30 14:20:00 +0800`
+- Goal: complete user-visible copy migration by module batches (A/B/C/D)
+- Action:
+  - Batch A (chat main chain):
+    - updated `subpackages/pages/chat-conversation-component/chat-conversation-component.uvue`
+    - updated `subpackages/pages/chat-conversation-component/components/more-popup/more-popup.uvue`
+    - updated `subpackages/pages/chat-conversation-component/components/more-info/more-info.uvue`
+    - updated `subpackages/pages/chat-conversation-component/components/related-conversation/related-conversation.uvue`
+    - updated `subpackages/pages/chat-conversation-component/components/agent-conversation-history/agent-conversation-history.uvue`
+    - updated `subpackages/pages/chat-conversation-component/components/file-tree/file-tree.uvue`
+    - updated `subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts`
+  - Batch B (input + voice):
+    - updated `components/chat-input-phone/chat-input-phone.uvue`
+    - updated `components/chat-input-phone/manual-component-item/manual-component-item.uvue`
+    - updated `components/chat-input-phone/skill-select-modal/skill-select-modal.uvue`
+    - updated `components/chat-input-phone/sandbox-select-modal/sandbox-select-modal.uvue`
+    - updated `components/voice-recorder-button/voice-recorder-button.uvue`
+  - Batch C (search/preview/webview/file export):
+    - updated `subpackages/pages/agent-search/agent-search.uvue`
+    - updated `subpackages/pages/file-preview-page/file-preview-page.uvue`
+    - updated `subpackages/components/file-preview-h5.vue`
+    - updated `subpackages/pages/webview/webview.uvue`
+    - updated `subpackages/utils/fileTree.uts`
+  - Batch D (residual components/pages):
+    - updated `components/page-card/page-card.uvue`
+    - updated `subpackages/pages/category-agent-list/category-agent-list.uvue`
+    - updated `subpackages/pages/login/components/captcha-verify/captcha-verify.uvue`
+    - updated `components/menu-dropdown/menu-dropdown.uvue`
+    - updated `subpackages/pages/chat-conversation-component/components/new-conversation-set/new-conversation-set.uvue`
+- Result:
+  - migrated unresolved user-visible literals from `54` to `0` (same scan heuristic as S10)
+  - all newly migrated runtime keys use `NuwaxMobile.*` prefix only
+- Evidence:
+  - `/tmp/i18n_user_visible_pending_latest.txt` line count transitioned to `0`
+  - repo grep check: no `System.Mobile` / `System.NuwaxMobile` references
+- Risk / Rollback:
+  - risk: key-value coverage mismatch can surface as raw key on rare pages
+  - rollback: add missing key into local fallback bundle (`constants/i18n.local.constants.uts`) without reverting code-path migration
+
+### S12
+- Start: `2026-03-30 14:45:00 +0800`
+- Goal: complete fallback dictionary for all newly used keys
+- Action:
+  - expanded zh/en fallback bundles in `constants/i18n.local.constants.uts`
+  - added literal lookup mappings for high-frequency literals (e.g. `搜索智能体`, `页面首页`, `对话设置`, `智能体电脑选择`)
+  - executed key parity check:
+    - extract keys from code usage (`NuwaxMobile.*`)
+    - compare with fallback dictionary keys
+- Result:
+  - missing key count reduced from `91` to `0`
+- Evidence:
+  - check artifact `/tmp/missing_i18n_keys.txt` shows `0` lines
+- Risk / Rollback:
+  - risk: translation wording may need product review
+  - rollback: adjust values in fallback file only, no API/logic rollback required
+
+### S13
+- Start: `2026-03-30 14:58:00 +0800`
+- Goal: implement enforceable i18n audit gate
+- Action:
+  - added audit script: `scripts/i18n-audit.mjs`
+    - scans `pages/`, `subpackages/`, `components/`
+    - excludes `components/pane-tabs/example.uvue`
+    - strips block/html comments
+    - checks Chinese literals only in user-visible contexts (template text, placeholder/title, toast/modal/loading/title setters)
+  - added npm command in `package.json`:
+    - `i18n:audit`
+- Result:
+  - gate command available and aligned with "hit count must be 0" merge threshold
+- Evidence:
+  - `npm run i18n:audit` output: `[i18n audit] passed: 0 user-visible Chinese hardcoded lines.`
+- Risk / Rollback:
+  - risk: audit uses heuristic patterns, may need pattern tuning for edge cases
+  - rollback: update `scripts/i18n-audit.mjs` rule list; keep command name stable for CI integration
+
+### S14
+- Start: `2026-03-30 15:04:00 +0800`
+- Goal: final static gate verification
+- Action:
+  - executed user-visible Chinese scan (same heuristic command as S10)
+  - executed `npm run i18n:audit`
+  - executed `git diff --check`
+  - executed targeted `npx prettier --check` to verify parser safety on changed files
+  - fixed parser-blocking template annotations (inline `#ifdef` comments inside tags) in:
+    - `subpackages/pages/agent-search/agent-search.uvue`
+    - `components/chat-input-phone/chat-input-phone.uvue`
+    - `subpackages/pages/chat-conversation-component/components/new-conversation-set/new-conversation-set.uvue`
+  - fixed one trailing whitespace issue in `new-conversation-set.uvue` and re-ran checks
+- Result:
+  - user-visible hardcoded Chinese scan result: `0`
+  - audit script: pass
+  - diff whitespace check: pass
+  - no syntax parse errors in targeted prettier check (style warnings remain)
+- Evidence:
+  - `/tmp/i18n_user_visible_pending_latest.txt` count `0`
+  - terminal outputs for `i18n:audit` and `git diff --check passed`
+- Risk / Rollback:
+  - risk: runtime verification still required on real H5 and MP-WEIXIN environments
+  - rollback: key-level rollback supported by fallback dictionary edits and per-file revert
+
+### M2 全量覆盖收口
+- Completed:
+  - `NuwaxMobile.*` single-prefix migration for changed user-visible copy
+  - H5 full user-visible copy migration in audited scope
+  - MP-WEIXIN fixed-language behavior retained (no language switch entry added)
+  - `i18n:audit` command implemented and passing
+- Pending:
+  - end-to-end runtime regression on target environments (H5 + MP-WEIXIN)
+- Next:
+  - run manual regression matrix for login/chat/search/preview/file-export flows in both language states
+
+### S15
+- Start: `2026-03-30 15:30:18 +0800`
+- Goal: close residual i18n misses in `utils/servers` adjacent paths and restore zero-hit gate
+- Action:
+  - executed `npm run i18n:audit`; initial result found 5 hits:
+    - `subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts`
+    - `components/chat-input-phone/chat-input-phone.uvue`
+    - `servers/agentDev.uts`
+    - `servers/audioUploader.uts`
+  - replaced residual hardcoded messages with i18n keys or english logs:
+    - upload reject fallback in `components/chat-input-phone/chat-input-phone.uvue`
+    - download failure message in `servers/agentDev.uts` -> `NuwaxMobile.AgentDev.downloadFailedWithCode`
+    - status-code failure message in `servers/audioUploader.uts` -> `NuwaxMobile.AudioUploader.requestFailedWithCode`
+    - error callback / processing logs in `AgentDetailService.uts` converted to english
+  - expanded fallback dictionary in `constants/i18n.local.constants.uts` (zh/en) for new keys
+  - extended static quality checks:
+    - `git diff --check`
+    - key parity compare (`NuwaxMobile.*` used vs fallback dictionary)
+    - `npx prettier --check` on touched files, then `--write`, then re-check
+- Result:
+  - i18n audit hit count returned to `0`
+  - no missing `NuwaxMobile.*` keys in fallback dictionary
+  - whitespace/style gates passed on touched files
+- Evidence:
+  - `npm run i18n:audit` => `[i18n audit] passed: 0 user-visible Chinese hardcoded lines.`
+  - key parity output => `Missing in dict:` empty
+  - `git diff --check` => no output
+  - `npx prettier --check ...` => `All matched files use Prettier code style!`
+- Risk / Rollback:
+  - risk: any new future chinese literal in `utils/servers` can bypass coverage if outside audit patterns
+  - rollback: revert specific files and keep dictionary keys; no runtime API rollback needed
+
+### M3 收口加固
+- Completed:
+  - residual 5-hit gap fixed and re-verified to zero
+  - audit + key parity + formatting checks all passed for this batch
+- Pending:
+  - optional CI integration to enforce `npm run i18n:audit` before merge

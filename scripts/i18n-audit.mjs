@@ -12,6 +12,8 @@ const excludeFiles = new Set([
   "utils/mockApiService.uts",
   "utils/pinyin.uts",
 ]);
+const zhLocalePath = "constants/i18n-locales/zh-cn.uts";
+const enLocalePath = "constants/i18n-locales/en-us.uts";
 
 const hasChinese = /[\u4e00-\u9fff]/;
 const visibleLine = new RegExp(
@@ -86,7 +88,24 @@ const walkFiles = (dir) => {
   return results;
 };
 
+const collectLocaleKeyLines = (relPath) => {
+  const absPath = path.join(rootDir, relPath);
+  if (!fs.existsSync(absPath)) return new Map();
+  const content = fs.readFileSync(absPath, "utf8");
+  const keyLineMap = new Map();
+  const keyRegex = /"((?:NuwaxMobile|System)\.[A-Za-z0-9_.]+)"\s*:/g;
+  let match;
+  while ((match = keyRegex.exec(content)) !== null) {
+    const key = match[1];
+    if (!keyLineMap.has(key)) {
+      keyLineMap.set(key, content.slice(0, match.index).split(/\r?\n/).length);
+    }
+  }
+  return keyLineMap;
+};
+
 const findings = [];
+const usedKeyLocations = new Map();
 const files = Array.from(
   new Set([
     ...includeDirs.flatMap((dir) => walkFiles(dir)),
@@ -105,6 +124,28 @@ files.forEach((relPath) => {
   const raw = fs.readFileSync(absPath, "utf8");
   const content = stripComments(raw);
   const lines = content.split(/\r?\n/);
+
+  const keyRegex = /["'`](NuwaxMobile\.[A-Za-z0-9_.]+)["'`]/g;
+  let keyMatch;
+  while ((keyMatch = keyRegex.exec(content)) !== null) {
+    const key = keyMatch[1];
+    if (!usedKeyLocations.has(key)) {
+      usedKeyLocations.set(key, {
+        file: relPath,
+        line: content.slice(0, keyMatch.index).split(/\r?\n/).length,
+      });
+    }
+  }
+
+  const legacyKeyRegex = /["'`](System\.[A-Za-z0-9_.]+)["'`]/g;
+  let legacyMatch;
+  while ((legacyMatch = legacyKeyRegex.exec(content)) !== null) {
+    findings.push({
+      file: relPath,
+      line: content.slice(0, legacyMatch.index).split(/\r?\n/).length,
+      text: `legacy i18n key prefix is forbidden: ${legacyMatch[1]}`,
+    });
+  }
 
   lines.forEach((line, index) => {
     const code = line.replace(/\/\/.*$/, "");
@@ -141,6 +182,62 @@ files.forEach((relPath) => {
         text: imageTag.replace(/\s+/g, " ").trim(),
       });
     }
+  }
+});
+
+const zhKeyLineMap = collectLocaleKeyLines(zhLocalePath);
+const enKeyLineMap = collectLocaleKeyLines(enLocalePath);
+
+const zhKeys = new Set(
+  [...zhKeyLineMap.keys()].filter((key) => key.startsWith("NuwaxMobile.")),
+);
+const enKeys = new Set(
+  [...enKeyLineMap.keys()].filter((key) => key.startsWith("NuwaxMobile.")),
+);
+
+const legacyLocaleKeyList = [
+  ...[...zhKeyLineMap.keys()].filter((key) => key.startsWith("System.")),
+  ...[...enKeyLineMap.keys()].filter((key) => key.startsWith("System.")),
+];
+legacyLocaleKeyList.forEach((key) => {
+  findings.push({
+    file: key.startsWith("System.")
+      ? zhKeyLineMap.has(key)
+        ? zhLocalePath
+        : enLocalePath
+      : zhLocalePath,
+    line: zhKeyLineMap.get(key) || enKeyLineMap.get(key) || 1,
+    text: `legacy locale key prefix is forbidden: ${key}`,
+  });
+});
+
+[...zhKeys]
+  .filter((key) => !enKeys.has(key))
+  .forEach((key) => {
+    findings.push({
+      file: enLocalePath,
+      line: 1,
+      text: `missing key in en-us locale: ${key}`,
+    });
+  });
+
+[...enKeys]
+  .filter((key) => !zhKeys.has(key))
+  .forEach((key) => {
+    findings.push({
+      file: zhLocalePath,
+      line: 1,
+      text: `missing key in zh-cn locale: ${key}`,
+    });
+  });
+
+usedKeyLocations.forEach((location, key) => {
+  if (!zhKeys.has(key) || !enKeys.has(key)) {
+    findings.push({
+      file: location.file,
+      line: location.line,
+      text: `missing locale definition for key: ${key}`,
+    });
   }
 });
 

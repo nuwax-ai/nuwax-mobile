@@ -557,3 +557,93 @@
 - Risk / Rollback:
   - risk: on non-tab pages, `setTabBarItem` may throw; protected with try/catch
   - rollback: remove `applyTabBarI18n()` calls only
+
+### S23
+- Start: `2026-03-30 16:33:17 +0800`
+- Goal: continue final omission closure for hardcoded fallback app titles
+- Action:
+  - replaced hardcoded fallback app title `NuwaX` with i18n key `NuwaxMobile.Common.appName` in:
+    - `utils/commonBusiness.uts`
+    - `subpackages/pages/webview/webview.uvue`
+    - `subpackages/pages/category-agent-list/category-agent-list.uvue`
+  - added locale key in zh/en bundles:
+    - `NuwaxMobile.Common.appName`
+  - regenerated platform import artifacts via `npm run i18n:export-defaults`
+- Result:
+  - business runtime no longer contains direct `NuwaX` fallback literal; all app-name fallback now goes through i18n layer
+  - default import key count increased to `238`
+- Evidence:
+  - `rg -n 'NuwaX' ...` now only hits locale dictionary values
+  - `npm run i18n:audit` passed
+  - `git diff --check` passed
+- Risk / Rollback:
+  - risk: none functionally; key missing would fallback to local dictionary immediately
+  - rollback: revert three usage files while keeping key definitions
+
+### S24
+- Start: `2026-03-30 17:01:42 +0800`
+- Goal: continue final omission closure for residual visible text edge-cases
+- Action:
+  - replaced static agreement separator in `components/agreement-checkbox/agreement-checkbox.uvue` with i18n key:
+    - `NuwaxMobile.Auth.agreementSeparator`
+  - normalized published-agent-list default title to translated default instead of raw key literal:
+    - `components/published-agent-list/published-agent-list.uvue`
+  - updated locale defaults (zh/en) with:
+    - `NuwaxMobile.Auth.agreementSeparator`
+  - adjusted audit output wording in `scripts/i18n-audit.mjs` to align with “hardcoded user-visible text” gate scope
+  - regenerated platform default import artifacts via `npm run i18n:export-defaults`
+- Result:
+  - agreement line punctuation now language-aware
+  - no raw i18n-key fallback title leak when published-agent-list is reused without explicit title prop
+  - platform import default key count increased to `239`
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 user-visible hardcoded lines`)
+  - `git diff --check` => pass
+  - `docs/i18n-platform-default-import.json` => `totalKeys: 239`
+- Risk / Rollback:
+  - risk: minimal; only text rendering defaults changed
+  - rollback: revert S24 touched files without impacting i18n runtime core
+
+### S25
+- Start: `2026-03-30 16:45:19 +0800`
+- Goal: close review concern on accessibility `alt` internationalization and prevent regression
+- Action:
+  - re-checked business `alt` usage:
+    - `components/page-card/page-card.uvue`
+    - `components/agent-component/agent-component.uvue`
+  - confirmed all existing `alt=` in business code are `t(...)` based and use:
+    - `NuwaxMobile.Common.coverImageAlt`
+    - `NuwaxMobile.Common.avatarAlt`
+  - hardened `scripts/i18n-audit.mjs` to detect bound-literal hardcoding patterns, including:
+    - `:alt="'...'"`, `:placeholder="'...'"`, `:title="'...'"`, `:content="'...'"`, `:confirmText="'...'"`, `:cancelText="'...'"`
+- Result:
+  - review-mentioned `alt` hardcoding risk is closed in current branch
+  - audit gate now can block both static and bound-literal forms for key user-visible fields
+- Evidence:
+  - `rg -n "alt=" components pages subpackages --glob '*.uvue'` shows only `:alt="t(...)"` usages
+  - `npm run i18n:audit` => pass (`0 user-visible hardcoded lines`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; regex expansion may introduce rare false positives in future complex expressions
+  - rollback: revert only new bound-literal regex lines in `scripts/i18n-audit.mjs`
+
+### S26
+- Start: `2026-03-30 16:51:00 +0800`
+- Goal: expand accessibility alt coverage beyond card components
+- Action:
+  - added i18n-based avatar `alt` to additional user-visible avatar scenes:
+    - `pages/index/header-menu/header-menu.uvue`
+    - `subpackages/pages/about-me/about-me.uvue`
+    - `subpackages/pages/chat-conversation-component/components/more-info/more-info.uvue`
+  - all above use existing key:
+    - `NuwaxMobile.Common.avatarAlt`
+- Result:
+  - avatar alt text coverage expanded from card components to header/profile/conversation-more-info scenes
+  - no new dictionary key needed, keeps import set stable
+- Evidence:
+  - `rg -n "alt=" components pages subpackages --glob '*.uvue'` shows all current `alt` bindings use `t(...)`
+  - `npm run i18n:audit` => pass (`0 user-visible hardcoded lines`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: very low, template attribute-only change
+  - rollback: revert the three S26 view files only

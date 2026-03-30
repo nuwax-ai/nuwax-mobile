@@ -47,6 +47,12 @@ const hardcodedVisibleLiteral = new RegExp(
     "cancelText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
     "(^|\\s)placeholder\\s*=\\s*['\"][^'\"\\n]+['\"]",
     "(^|\\s)alt\\s*=\\s*['\"][^'\"\\n]+['\"]",
+    "(^|\\s):placeholder\\s*=\\s*['\"]\\s*['\"`][^'\"`\\n]+['\"`]\\s*['\"]",
+    "(^|\\s):alt\\s*=\\s*['\"]\\s*['\"`][^'\"`\\n]+['\"`]\\s*['\"]",
+    "(^|\\s):title\\s*=\\s*['\"]\\s*['\"`][^'\"`\\n]+['\"`]\\s*['\"]",
+    "(^|\\s):content\\s*=\\s*['\"]\\s*['\"`][^'\"`\\n]+['\"`]\\s*['\"]",
+    "(^|\\s):confirmText\\s*=\\s*['\"]\\s*['\"`][^'\"`\\n]+['\"`]\\s*['\"]",
+    "(^|\\s):cancelText\\s*=\\s*['\"]\\s*['\"`][^'\"`\\n]+['\"`]\\s*['\"]",
   ].join("|"),
 );
 
@@ -127,7 +133,7 @@ files.forEach((relPath) => {
 
 if (findings.length > 0) {
   console.error(
-    `[i18n audit] failed: found ${findings.length} user-visible Chinese hardcoded line(s).`,
+    `[i18n audit] failed: found ${findings.length} user-visible hardcoded line(s).`,
   );
   findings.forEach((item) => {
     console.error(`${item.file}:${item.line}: ${item.text}`);
@@ -135,4 +141,4 @@ if (findings.length > 0) {
   process.exit(1);
 }
 
-console.log("[i18n audit] passed: 0 user-visible Chinese hardcoded lines.");
+console.log("[i18n audit] passed: 0 user-visible hardcoded lines.");

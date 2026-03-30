@@ -647,3 +647,40 @@
 - Risk / Rollback:
   - risk: very low, template attribute-only change
   - rollback: revert the three S26 view files only
+
+### S27
+- Start: `2026-03-30 17:09:03 +0800`
+- Goal: continue full-coverage i18n closure for image accessibility text and enforce gate
+- Action:
+  - performed repo-wide business scan for `<image>` tags in `pages/components/subpackages` and closed all missing `alt` cases (non-comment code).
+  - completed alt coverage in key scenes:
+    - list empty states (`agent-list-content`, `conversation-list-content`, `published-agent-list`, `agent-search`)
+    - agent/card icons (`agent-component`, `recent-used-agent-item`, `category-agent-list`, `agent-union-record`)
+    - chat/attachment chain (`chat-upload-image`, `chat-conversation-component`, `file-tree`, `file-tree-node`)
+    - common UI (`custom-nav-bar`, `login-layout`, `empty-state`, `button-wrapper`, `skill-select-modal`, `voice-recorder-button`)
+  - semantics strategy:
+    - meaningful images use i18n alt (`t(...)`)
+    - decorative icons use empty alt (`alt=""`)
+  - enhanced `scripts/i18n-audit.mjs`:
+    - added hard gate for `<image>` without `alt`/`:alt`
+  - expanded locale defaults (zh/en):
+    - `NuwaxMobile.Common.noDataImageAlt`
+    - `NuwaxMobile.Common.agentIconAlt`
+    - `NuwaxMobile.Common.skillIconAlt`
+    - `NuwaxMobile.Common.appLogoAlt`
+    - `NuwaxMobile.Common.deleteIconAlt`
+    - `NuwaxMobile.Chat.uploadImageAlt`
+    - `NuwaxMobile.Chat.uploadFileAlt`
+  - regenerated platform default import artifacts via `npm run i18n:export-defaults`
+- Result:
+  - business code now has zero missing `alt` for image tags in `pages/components/subpackages`
+  - i18n gate upgraded to prevent future missing-alt regression
+  - platform import key count increased to `246`
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 user-visible hardcoded lines`)
+  - `git diff --check` => pass
+  - repo scan script output => `TOTAL_MISSING_ALT=0` (comments excluded)
+  - `docs/i18n-platform-default-import.json` => `totalKeys: 246`
+- Risk / Rollback:
+  - risk: low, broad template attribute updates may expose minor rendering differences on niche devices
+  - rollback: revert S27 touched files in batches (components/pages/subpackages/audit/locales) without changing i18n runtime core

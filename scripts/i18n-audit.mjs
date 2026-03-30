@@ -129,11 +129,24 @@ files.forEach((relPath) => {
       text: code.trim(),
     });
   });
+
+  const imageTagRegex = /<image\b[\s\S]*?>/g;
+  let tagMatch;
+  while ((tagMatch = imageTagRegex.exec(content)) !== null) {
+    const imageTag = tagMatch[0];
+    if (!/(^|\s)(:alt|alt)\s*=/.test(imageTag)) {
+      findings.push({
+        file: relPath,
+        line: content.slice(0, tagMatch.index).split(/\r?\n/).length,
+        text: imageTag.replace(/\s+/g, " ").trim(),
+      });
+    }
+  }
 });
 
 if (findings.length > 0) {
   console.error(
-    `[i18n audit] failed: found ${findings.length} user-visible hardcoded line(s).`,
+    `[i18n audit] failed: found ${findings.length} i18n coverage issue(s).`,
   );
   findings.forEach((item) => {
     console.error(`${item.file}:${item.line}: ${item.text}`);
@@ -141,4 +154,4 @@ if (findings.length > 0) {
   process.exit(1);
 }
 
-console.log("[i18n audit] passed: 0 user-visible hardcoded lines.");
+console.log("[i18n audit] passed: 0 i18n coverage issues.");

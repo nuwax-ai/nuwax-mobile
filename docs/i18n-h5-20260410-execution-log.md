@@ -991,3 +991,23 @@
 - Risk / Rollback:
   - risk: very low; only fallback error string changed
   - rollback: revert `servers/useRequest.uts` and this log entry
+
+### S43
+- Start: `2026-03-30 23:30:43 +0800`
+- Goal: make post-login language reconciliation deterministic by awaiting user-lang sync
+- Action:
+  - updated user-info fetch flows to `await` i18n user-lang sync:
+    - `pages/index/index.uvue`
+    - `subpackages/pages/about-me/about-me.uvue`
+  - change:
+    - `syncLanguageFromUser(data?.lang || "")`
+    - -> `await syncLanguageFromUser(data?.lang || "")`
+- Result:
+  - language state + lang map reconciliation completes before fetch flow exits
+  - reduces timing race where UI could briefly use stale language state after user info load
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; only sequencing adjustment in existing async flow
+  - rollback: revert the two page files and this log entry

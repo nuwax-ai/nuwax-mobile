@@ -9,6 +9,9 @@ const chatTempPathMobile = '/pages/chat-temp/chat-temp';
 const newAgentDetailPathMobile = '/subpackages' + agentDetailPathMobile;
 const newChatTempPathMobile = '/subpackages' + chatTempPathMobile;
 
+// 应用详情页路径
+const appDetailsPathMobile = '/subpackages/pages/app-details/app-details';
+
 function runRedirectLogic(protocol, host, href, hash, userAgent) {
   const baseUrl = protocol + '//' + host;
   const isMobile = /Android|iPhone|iPad|iPod|Mobile|Tablet/i.test(userAgent);
@@ -39,6 +42,7 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
 
   // PC 端访问 M 页面 => 跳转 PC
   if (!isMobile && href.includes('/m/')) {
+    // 智能体详情页
     if (hash && hash.indexOf(agentDetailPathMobile) !== -1) {
       const matchId = hash.match(new RegExp('[?&]id=([^&#]+)'));
       const matchConversationId = hash.match(new RegExp('[?&]conversationId=([^&#]+)'));
@@ -53,6 +57,25 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
         return replaceUrl;
       }
     }
+
+    // 应用详情页
+    if (hash && hash.indexOf(appDetailsPathMobile) !== -1) {
+      const matchId = hash.match(new RegExp('[?&]id=([^&#]+)'));
+      const matchConversationId = hash.match(new RegExp('[?&]conversationId=([^&#]+)'));
+      if (matchId && matchId[1]) {
+        const agentId = matchId[1];
+        if (matchConversationId && matchConversationId[1]) {
+          const conversationId = matchConversationId[1];
+          replaceUrl = baseUrl + '/app/chat/' + conversationId + '/' + agentId;
+        } else {
+          replaceUrl = baseUrl + '/app/details/' + agentId;
+        }
+        return replaceUrl;
+      }
+    }
+
+
+    // 临时会话页
     if (hash && hash.indexOf(chatTempPathMobile) !== -1) {
       const matchChatTemp = hash.match(new RegExp('[?&]chatKey=([^&#]+)'));
       if (matchChatTemp && matchChatTemp[1]) {
@@ -66,11 +89,31 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
 
   // 移动端访问 PC 页面 => 跳转 M
   if (isMobile && !href.includes('/m/')) {
+    // 智能体详情页
     const matchAgent = href.match(new RegExp('/agent/([^/?#]+)'));
     if (matchAgent) {
       replaceUrl = baseUrl + '/m/#' + newAgentDetailPathMobile + '?id=' + matchAgent[1];
       return replaceUrl;
     }
+
+
+    // 应用详情页
+    const matchAppDetails = href.match(new RegExp('/app/details/([^/?#]+)'));
+    if (matchAppDetails) {
+      replaceUrl = baseUrl + '/m/#' + appDetailsPathMobile + '?id=' + matchAppDetails[1];
+      return replaceUrl;
+    }
+
+    // 应用会话页
+    const matchAppChat = href.match(new RegExp('app/chat/([^/]+)/([^/]+)'));
+    if (matchAppChat) {
+      const conversationId = matchAppChat[1];
+      const agentId = matchAppChat[2];
+      replaceUrl = baseUrl + '/m/#' + appDetailsPathMobile + '?id=' + agentId + '&conversationId=' + conversationId;
+      return replaceUrl;
+    }
+
+    // 临时会话页
     const matchChatTemp = href.match(new RegExp('/chat-temp/([^/?#]+)'));
     if (matchChatTemp) {
       replaceUrl = baseUrl + '/m/#' + newChatTempPathMobile + '?chatKey=' + matchChatTemp[1];

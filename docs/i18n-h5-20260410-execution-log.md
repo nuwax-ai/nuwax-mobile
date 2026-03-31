@@ -1011,3 +1011,41 @@
 - Risk / Rollback:
   - risk: low; only sequencing adjustment in existing async flow
   - rollback: revert the two page files and this log entry
+
+### S44
+- Start: `2026-03-30 23:33:42 +0800`
+- Goal: avoid empty-lang-map race when user lang equals current lang
+- Action:
+  - updated `utils/i18n.uts` in `syncLanguageFromUser`
+  - when `userLang === currentLang` and `langMap` is empty:
+    - fetch lang map once by explicit user lang
+    - cache result to runtime/storage
+    - refresh tab bar i18n
+- Result:
+  - prevents early-return branch from leaving runtime with empty dictionary
+  - improves determinism during login/startup timing races
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; only adds guarded fetch when map is empty
+  - rollback: revert `utils/i18n.uts` and this log entry
+
+### S45
+- Start: `2026-03-31 10:12:27 +0800`
+- Goal: close review findings on init timing and merge gate enforcement
+- Action:
+  - updated app launch sequence:
+    - `App.uvue` `onLaunch` changed to async and now `await loadI18n()`
+  - added CI merge gate workflow:
+    - `.github/workflows/i18n-audit.yml`
+    - runs `npm run -s i18n:audit` on `pull_request` and tracked branch pushes
+- Result:
+  - i18n remote dictionary load is now explicitly awaited during app launch
+  - i18n audit is enforced in CI for merge-time blocking
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low; launch hook now async and CI workflow added
+  - rollback: revert `App.uvue` and `.github/workflows/i18n-audit.yml`

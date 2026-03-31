@@ -1049,3 +1049,21 @@
 - Risk / Rollback:
   - risk: low; launch hook now async and CI workflow added
   - rollback: revert `App.uvue` and `.github/workflows/i18n-audit.yml`
+
+### S46
+- Start: `2026-03-31 10:15:14 +0800`
+- Goal: make `loadI18n()` await-safe for concurrent callers
+- Action:
+  - refactored `utils/i18n.uts` load flow with shared task promise:
+    - added `loadI18nTask` singleton promise
+    - concurrent calls now await same task instead of returning early on `loading === true`
+  - preserved existing init logic and state/storage writes
+- Result:
+  - all callers can deterministically await completion of the same i18n load cycle
+  - removes race where one caller could continue before language map actually loaded
+- Evidence:
+  - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
+  - `git diff --check` => pass
+- Risk / Rollback:
+  - risk: low-medium; async orchestration changed, business logic unchanged
+  - rollback: revert `utils/i18n.uts` and this log entry

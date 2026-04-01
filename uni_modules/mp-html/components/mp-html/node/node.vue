@@ -297,7 +297,9 @@
           (n.children && n.children[0] && n.children[0].text) || ""
         }}</text>
         <view class="hl-copy-btn-native" @tap.stop="doCopyText(copyText)">
-          <text class="hl-copy-btn-text">复制代码</text>
+          <text class="hl-copy-btn-text">{{
+            getI18nText("Mobile.ThirdParty.MpHtml.copyCode")
+          }}</text>
         </view>
       </view>
       <rich-text
@@ -381,6 +383,7 @@
   import taskResult from '../task-result/task-result.vue'
   import { getProcessingDataByPriority } from '../container/utils'
   import node from './node'
+  import { t } from '@/utils/i18n'
   export default {
     name: 'node',
     options: {
@@ -453,6 +456,15 @@
       // #endif
     },
     methods:{
+      getI18nText (key) {
+        return t(key)
+      },
+      showTextToast (title) {
+        uni.showToast({
+          title,
+          icon: 'none'
+        })
+      },
       /**
        * 获取会话ID（用于task-result等组件）
        */
@@ -591,10 +603,8 @@
               const save = path => {
                 uni.saveImageToPhotosAlbum({
                   filePath: path,
-                  success () {
-                    uni.showToast({
-                      title: '保存成功'
-                    })
+                  success: () => {
+                    this.showTextToast(t('Mobile.ThirdParty.MpHtml.saveSuccess'))
                   }
                 })
               }
@@ -671,10 +681,7 @@
               // #ifdef MP
               uni.setClipboardData({
                 data: href,
-                success: () =>
-                  uni.showToast({
-                    title: '链接已复制'
-                  })
+                success: () => this.showTextToast(t('Mobile.Link.copied'))
               })
               // #endif
               // #ifdef APP-PLUS
@@ -713,14 +720,10 @@
           uni.setClipboardData({
             data: content,
             success: () => {
-              uni.showToast({
-                title: '复制成功',
-              })
+              this.showTextToast(t('Mobile.Common.copySuccess'))
             },
             fail: () => {
-              uni.showToast({
-                title: '复制失败',
-              })
+              this.showTextToast(t('Mobile.Common.copyFailed'))
             }
           })
         }
@@ -742,14 +745,10 @@
           uni.setClipboardData({
             data: e.attrs['data-content'],
             success: () => {
-              uni.showToast({
-                title: '复制成功',
-              })
+              this.showTextToast(t('Mobile.Common.copySuccess'))
             },
             fail: () => {
-              uni.showToast({
-                title: '复制失败',
-              })
+              this.showTextToast(t('Mobile.Common.copyFailed'))
             }
           })
         }
@@ -764,14 +763,10 @@
         uni.setClipboardData({
           data: text,
           success: () => {
-            uni.showToast({
-              title: '复制成功',
-            })
+            this.showTextToast(t('Mobile.Common.copySuccess'))
           },
           fail: () => {
-            uni.showToast({
-              title: '复制失败',
-            })
+            this.showTextToast(t('Mobile.Common.copyFailed'))
           }
         })
       },

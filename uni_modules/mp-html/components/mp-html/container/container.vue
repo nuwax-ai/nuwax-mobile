@@ -5,7 +5,9 @@
       <!-- Plan 头部信息 -->
       <view class="plan-header" @tap="togglePlanExpanded">
         <view class="plan-info">
-          <text class="plan-name">{{ toolCall.name || '执行计划' }}</text>
+          <text class="plan-name">{{
+            toolCall.name || getI18nText("Mobile.ThirdParty.MpHtml.executionPlan")
+          }}</text>
           <!-- <view class="plan-status-display">
             <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
               <text :class="getStatusIconType(toolCall.status)" :style="{color: getStatusIconColor(toolCall.status),fontSize: '32rpx'}"></text>
@@ -61,7 +63,9 @@
         <!-- 调用参数 -->
         <view v-if="detailData.params && Object.keys(detailData.params).length > 0" class="detail-section">
           <view class="section-header">
-            <text class="section-title">调用参数</text>
+            <text class="section-title">{{
+              getI18nText("Mobile.ThirdParty.MpHtml.callArguments")
+            }}</text>
           </view>
           <view class="arguments-content">
             <text class="arguments-text">{{ formatArguments(detailData.params) }}</text>
@@ -71,7 +75,9 @@
         <!-- 调用结果 -->
         <view v-if="detailData.response" class="detail-section">
           <view class="section-header">
-            <text class="section-title">调用结果</text>
+            <text class="section-title">{{
+              getI18nText("Mobile.ThirdParty.MpHtml.callResult")
+            }}</text>
           </view>
           <view class="output-content">
             <text class="output-text">{{ formatResult(detailData.response) }}</text>
@@ -87,6 +93,7 @@ import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue
 import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
 import { getCurrentPageParams } from '@/utils/common';
 import { getFileProxyUrlByConversationIdAndFilePath, jumpToFilePreviewPage } from '@/utils/system.uts';
+import { t } from '@/utils/i18n';
 
 export default {
   name: 'Container',
@@ -143,6 +150,9 @@ export default {
     }
   },
   methods: {
+    getI18nText(key) {
+      return t(key)
+    },
 
     // 打开页面首页
     openPreviewPage(data) {
@@ -178,7 +188,7 @@ export default {
       if (!this.toolCall.result) {
         return uni.showToast({
           icon: 'none',
-          title: '结果为空',
+          title: t('Mobile.ThirdParty.MpHtml.emptyResult'),
         })
       }
       this.expanded = !this.expanded
@@ -209,12 +219,12 @@ export default {
         data: this.formatArguments(this.detailData),
         success: () => {
           uni.showToast({
-            title: '复制成功',
+            title: t('Mobile.Common.copySuccess'),
           })
         },
         fail: () => {
           uni.showToast({
-            title: '复制失败',
+            title: t('Mobile.Common.copyFailed'),
           })
         }
       })

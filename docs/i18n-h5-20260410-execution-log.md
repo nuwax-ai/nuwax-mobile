@@ -253,7 +253,7 @@
   - all newly migrated runtime keys use `Mobile.*` prefix only
 - Evidence:
   - `/tmp/i18n_user_visible_pending_latest.txt` line count transitioned to `0`
-  - repo grep check: no `System.Mobile` / `System.NuwaxMobile` references
+  - repo grep check: no `System.Mobile` / `System.Mobile` references
 - Risk / Rollback:
   - risk: key-value coverage mismatch can surface as raw key on rare pages
   - rollback: add missing key into local fallback bundle (`constants/i18n.local.constants.uts`) without reverting code-path migration
@@ -894,7 +894,7 @@
     - `docs/i18n-platform-default-import.csv`
     - `docs/i18n-platform-default-import.json`
 - Result:
-  - stream HTTP failure message is now fully translatable and follows `NuwaxMobile` key convention
+  - stream HTTP failure message is now fully translatable and follows `Mobile` key convention
 - Evidence:
   - `npm run i18n:export-defaults` => wrote 250 keys
   - `npm run i18n:audit` => pass (`0 i18n coverage issues`)

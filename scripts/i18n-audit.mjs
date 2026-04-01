@@ -44,15 +44,15 @@ const visibleLine = new RegExp(
 );
 const hardcodedVisibleLiteral = new RegExp(
   [
-    "title\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
-    "content\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
-    "text\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
+    "title\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
+    "content\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
+    "text\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
     "showError\\s*\\(\\s*['\"][^'\"\\n]+['\"]\\s*\\)",
     "showError\\s*\\(\\s*`[^`\\n]+`\\s*\\)",
     "new\\s+Error\\s*\\(\\s*['\"][^'\"\\n]+['\"]\\s*\\)",
     "new\\s+Error\\s*\\(\\s*`[^`\\n]+`\\s*\\)",
-    "confirmText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
-    "cancelText\\s*:\\s*['\"](?!NuwaxMobile\\.)[^'\"\\n]+['\"]",
+    "confirmText\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
+    "cancelText\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
     "(^|\\s)placeholder\\s*=\\s*['\"][^'\"\\n]+['\"]",
     "(^|\\s)alt\\s*=\\s*['\"][^'\"\\n]+['\"]",
     "(^|\\s):placeholder\\s*=\\s*['\"]\\s*['\"`][^'\"`\\n]+['\"`]\\s*['\"]",
@@ -99,7 +99,7 @@ const collectLocaleKeyLines = (relPath) => {
   if (!fs.existsSync(absPath)) return new Map();
   const content = fs.readFileSync(absPath, "utf8");
   const keyLineMap = new Map();
-  const keyRegex = /"((?:NuwaxMobile|System)\.[A-Za-z0-9_.]+)"\s*:/g;
+  const keyRegex = /"((?:Mobile|System)\.[A-Za-z0-9_.]+)"\s*:/g;
   let match;
   while ((match = keyRegex.exec(content)) !== null) {
     const key = match[1];
@@ -131,7 +131,7 @@ files.forEach((relPath) => {
   const content = stripComments(raw);
   const lines = content.split(/\r?\n/);
 
-  const keyRegex = /["'`](NuwaxMobile\.[A-Za-z0-9_.]+)["'`]/g;
+  const keyRegex = /["'`](Mobile\.[A-Za-z0-9_.]+)["'`]/g;
   let keyMatch;
   while ((keyMatch = keyRegex.exec(content)) !== null) {
     const key = keyMatch[1];

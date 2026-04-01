@@ -218,10 +218,10 @@ const zhKeyLineMap = collectLocaleKeyLines(zhLocalePath);
 const enKeyLineMap = collectLocaleKeyLines(enLocalePath);
 
 const zhKeys = new Set(
-  [...zhKeyLineMap.keys()].filter((key) => key.startsWith("NuwaxMobile.")),
+  [...zhKeyLineMap.keys()].filter((key) => key.startsWith("Mobile.")),
 );
 const enKeys = new Set(
-  [...enKeyLineMap.keys()].filter((key) => key.startsWith("NuwaxMobile.")),
+  [...enKeyLineMap.keys()].filter((key) => key.startsWith("Mobile.")),
 );
 
 const legacyLocaleKeyList = [

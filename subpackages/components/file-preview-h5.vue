@@ -9,7 +9,7 @@
     <view v-show="error" class="state-overlay error">
       <text class="error-text">{{ error }}</text>
       <button size="mini" @click="reload">
-        {{ i18n("NuwaxMobile.Common.retry") }}
+        {{ i18n("Mobile.Common.retry") }}
       </button>
     </view>
     
@@ -126,7 +126,7 @@ export default {
     onIframeError(e) {
       console.error('[FilePreviewH5] Iframe error:', e);
       this.loading = false;
-      this.error = this.i18n('NuwaxMobile.FilePreview.previewPageLoadFailed');
+      this.error = this.i18n('Mobile.FilePreview.previewPageLoadFailed');
     },
     
     handleMessage(event) {
@@ -143,7 +143,7 @@ export default {
         this.$emit('load');
       } else if (data.type === 'preview_error') {
         this.loading = false;
-        this.error = data.error || this.i18n('NuwaxMobile.FilePreview.documentRenderFailed');
+        this.error = data.error || this.i18n('Mobile.FilePreview.documentRenderFailed');
         this.$emit('error', data.error);
       }
     },

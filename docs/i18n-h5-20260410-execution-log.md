@@ -250,7 +250,7 @@
     - updated `subpackages/pages/chat-conversation-component/components/new-conversation-set/new-conversation-set.uvue`
 - Result:
   - migrated unresolved user-visible literals from `54` to `0` (same scan heuristic as S10)
-  - all newly migrated runtime keys use `NuwaxMobile.*` prefix only
+  - all newly migrated runtime keys use `Mobile.*` prefix only
 - Evidence:
   - `/tmp/i18n_user_visible_pending_latest.txt` line count transitioned to `0`
   - repo grep check: no `System.Mobile` / `System.NuwaxMobile` references
@@ -266,7 +266,7 @@
   - expanded zh/en fallback bundles in `constants/i18n.local.constants.uts`
   - added literal lookup mappings for high-frequency literals (e.g. `搜索智能体`, `页面首页`, `对话设置`, `智能体电脑选择`)
   - executed key parity check:
-    - extract keys from code usage (`NuwaxMobile.*`)
+    - extract keys from code usage (`Mobile.*`)
     - compare with fallback dictionary keys
 - Result:
   - missing key count reduced from `91` to `0`
@@ -325,7 +325,7 @@
 ### M2 全量覆盖收口
 
 - Completed:
-  - `NuwaxMobile.*` single-prefix migration for changed user-visible copy
+  - `Mobile.*` single-prefix migration for changed user-visible copy
   - H5 full user-visible copy migration in audited scope
   - MP-WEIXIN fixed-language behavior retained (no language switch entry added)
   - `i18n:audit` command implemented and passing
@@ -346,17 +346,17 @@
     - `servers/audioUploader.uts`
   - replaced residual hardcoded messages with i18n keys or english logs:
     - upload reject fallback in `components/chat-input-phone/chat-input-phone.uvue`
-    - download failure message in `servers/agentDev.uts` -> `NuwaxMobile.AgentDev.downloadFailedWithCode`
-    - status-code failure message in `servers/audioUploader.uts` -> `NuwaxMobile.AudioUploader.requestFailedWithCode`
+    - download failure message in `servers/agentDev.uts` -> `Mobile.AgentDev.downloadFailedWithCode`
+    - status-code failure message in `servers/audioUploader.uts` -> `Mobile.AudioUploader.requestFailedWithCode`
     - error callback / processing logs in `AgentDetailService.uts` converted to english
   - expanded fallback dictionary in `constants/i18n.local.constants.uts` (zh/en) for new keys
   - extended static quality checks:
     - `git diff --check`
-    - key parity compare (`NuwaxMobile.*` used vs fallback dictionary)
+    - key parity compare (`Mobile.*` used vs fallback dictionary)
     - `npx prettier --check` on touched files, then `--write`, then re-check
 - Result:
   - i18n audit hit count returned to `0`
-  - no missing `NuwaxMobile.*` keys in fallback dictionary
+  - no missing `Mobile.*` keys in fallback dictionary
   - whitespace/style gates passed on touched files
 - Evidence:
   - `npm run i18n:audit` => `[i18n audit] passed: 0 user-visible Chinese hardcoded lines.`
@@ -411,10 +411,10 @@
 - Goal: complete additional user-visible literal cleanup and partial delivery checkpoint
 - Action:
   - replaced residual user-visible literals with i18n keys in:
-    - `App.uvue` (`NuwaxMobile.App.pressAgainToExit`)
-    - `components/page-preview-iframe/page-preview-iframe.uvue` (`NuwaxMobile.PagePreview.defaultTitle`)
-    - `components/button-wrapper/button-wrapper.uvue` (`NuwaxMobile.ButtonWrapper.pagePathParamConfigError`, `NuwaxMobile.ButtonWrapper.pagePathConfigError`)
-    - `components/chat-upload-image/chat-upload-image.uvue` (`NuwaxMobile.Chat.previewTypeUnsupported`)
+    - `App.uvue` (`Mobile.App.pressAgainToExit`)
+    - `components/page-preview-iframe/page-preview-iframe.uvue` (`Mobile.PagePreview.defaultTitle`)
+    - `components/button-wrapper/button-wrapper.uvue` (`Mobile.ButtonWrapper.pagePathParamConfigError`, `Mobile.ButtonWrapper.pagePathConfigError`)
+    - `components/chat-upload-image/chat-upload-image.uvue` (`Mobile.Chat.previewTypeUnsupported`)
   - expanded locale defaults in:
     - `constants/i18n-locales/zh-cn.uts`
     - `constants/i18n-locales/en-us.uts`
@@ -458,11 +458,11 @@
     - `components/page-card/page-card.uvue` (`cover image`, `avatar`)
     - `components/agent-component/agent-component.uvue` (`avatar`)
   - localized image-choose failure toast in `components/chat-input-phone/chat-input-phone.uvue`
-    - replaced hardcoded english with `NuwaxMobile.Chat.chooseImageFailed`
+    - replaced hardcoded english with `Mobile.Chat.chooseImageFailed`
   - expanded locale dictionaries:
-    - `NuwaxMobile.Common.coverImageAlt`
-    - `NuwaxMobile.Common.avatarAlt`
-    - `NuwaxMobile.Chat.chooseImageFailed`
+    - `Mobile.Common.coverImageAlt`
+    - `Mobile.Common.avatarAlt`
+    - `Mobile.Chat.chooseImageFailed`
   - strengthened audit rule to include `alt=` in visible-line patterns (`scripts/i18n-audit.mjs`)
   - regenerated platform default import artifacts (`npm run i18n:export-defaults`)
 - Result:
@@ -512,13 +512,13 @@
     - `components/chat-input-phone/chat-input-phone.uvue`: image choose failure toast switched to i18n key
     - `subpackages/pages/chat-conversation-component/components/more-info/more-info.uvue`: removed hardcoded author initial (`A`) -> dynamic initial derivation
   - expanded zh/en locale dictionaries with:
-    - `NuwaxMobile.Common.coverImageAlt`
-    - `NuwaxMobile.Common.avatarAlt`
-    - `NuwaxMobile.Chat.chooseImageFailed`
+    - `Mobile.Common.coverImageAlt`
+    - `Mobile.Common.avatarAlt`
+    - `Mobile.Chat.chooseImageFailed`
   - hardened audit script `scripts/i18n-audit.mjs`:
     - keeps chinese visible literal detection
     - adds non-chinese hardcoded visible literal detection for `title/content/confirmText/cancelText/placeholder/alt`
-    - excludes i18n-key form (`NuwaxMobile.*`) and avoids dynamic binding false positives
+    - excludes i18n-key form (`Mobile.*`) and avoids dynamic binding false positives
   - regenerated platform default import artifacts via `npm run i18n:export-defaults`
 - Result:
   - no remaining business static `alt` literal
@@ -562,12 +562,12 @@
 - Start: `2026-03-30 16:33:17 +0800`
 - Goal: continue final omission closure for hardcoded fallback app titles
 - Action:
-  - replaced hardcoded fallback app title `NuwaX` with i18n key `NuwaxMobile.Common.appName` in:
+  - replaced hardcoded fallback app title `NuwaX` with i18n key `Mobile.Common.appName` in:
     - `utils/commonBusiness.uts`
     - `subpackages/pages/webview/webview.uvue`
     - `subpackages/pages/category-agent-list/category-agent-list.uvue`
   - added locale key in zh/en bundles:
-    - `NuwaxMobile.Common.appName`
+    - `Mobile.Common.appName`
   - regenerated platform import artifacts via `npm run i18n:export-defaults`
 - Result:
   - business runtime no longer contains direct `NuwaX` fallback literal; all app-name fallback now goes through i18n layer
@@ -585,11 +585,11 @@
 - Goal: continue final omission closure for residual visible text edge-cases
 - Action:
   - replaced static agreement separator in `components/agreement-checkbox/agreement-checkbox.uvue` with i18n key:
-    - `NuwaxMobile.Auth.agreementSeparator`
+    - `Mobile.Auth.agreementSeparator`
   - normalized published-agent-list default title to translated default instead of raw key literal:
     - `components/published-agent-list/published-agent-list.uvue`
   - updated locale defaults (zh/en) with:
-    - `NuwaxMobile.Auth.agreementSeparator`
+    - `Mobile.Auth.agreementSeparator`
   - adjusted audit output wording in `scripts/i18n-audit.mjs` to align with “hardcoded user-visible text” gate scope
   - regenerated platform default import artifacts via `npm run i18n:export-defaults`
 - Result:
@@ -612,8 +612,8 @@
     - `components/page-card/page-card.uvue`
     - `components/agent-component/agent-component.uvue`
   - confirmed all existing `alt=` in business code are `t(...)` based and use:
-    - `NuwaxMobile.Common.coverImageAlt`
-    - `NuwaxMobile.Common.avatarAlt`
+    - `Mobile.Common.coverImageAlt`
+    - `Mobile.Common.avatarAlt`
   - hardened `scripts/i18n-audit.mjs` to detect bound-literal hardcoding patterns, including:
     - `:alt="'...'"`, `:placeholder="'...'"`, `:title="'...'"`, `:content="'...'"`, `:confirmText="'...'"`, `:cancelText="'...'"`
 - Result:
@@ -636,7 +636,7 @@
     - `subpackages/pages/about-me/about-me.uvue`
     - `subpackages/pages/chat-conversation-component/components/more-info/more-info.uvue`
   - all above use existing key:
-    - `NuwaxMobile.Common.avatarAlt`
+    - `Mobile.Common.avatarAlt`
 - Result:
   - avatar alt text coverage expanded from card components to header/profile/conversation-more-info scenes
   - no new dictionary key needed, keeps import set stable
@@ -664,13 +664,13 @@
   - enhanced `scripts/i18n-audit.mjs`:
     - added hard gate for `<image>` without `alt`/`:alt`
   - expanded locale defaults (zh/en):
-    - `NuwaxMobile.Common.noDataImageAlt`
-    - `NuwaxMobile.Common.agentIconAlt`
-    - `NuwaxMobile.Common.skillIconAlt`
-    - `NuwaxMobile.Common.appLogoAlt`
-    - `NuwaxMobile.Common.deleteIconAlt`
-    - `NuwaxMobile.Chat.uploadImageAlt`
-    - `NuwaxMobile.Chat.uploadFileAlt`
+    - `Mobile.Common.noDataImageAlt`
+    - `Mobile.Common.agentIconAlt`
+    - `Mobile.Common.skillIconAlt`
+    - `Mobile.Common.appLogoAlt`
+    - `Mobile.Common.deleteIconAlt`
+    - `Mobile.Chat.uploadImageAlt`
+    - `Mobile.Chat.uploadFileAlt`
   - regenerated platform default import artifacts via `npm run i18n:export-defaults`
 - Result:
   - business code now has zero missing `alt` for image tags in `pages/components/subpackages`
@@ -720,9 +720,9 @@
 - Action:
   - replaced login area-code visible literal in:
     - `subpackages/pages/login/components/login-form/login-form.uvue`
-      - `+86` -> `t("NuwaxMobile.Auth.defaultAreaCode")`
+      - `+86` -> `t("Mobile.Auth.defaultAreaCode")`
   - added locale keys (zh/en):
-    - `NuwaxMobile.Auth.defaultAreaCode`
+    - `Mobile.Auth.defaultAreaCode`
   - regenerated platform import artifacts via `npm run i18n:export-defaults`
 - Result:
   - login area-code text now managed in i18n dictionary and can be imported/maintained on platform uniformly
@@ -730,7 +730,7 @@
 - Evidence:
   - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
   - `git diff --check` => pass
-  - `docs/i18n-platform-default-import.json` => contains `NuwaxMobile.Auth.defaultAreaCode`
+  - `docs/i18n-platform-default-import.json` => contains `Mobile.Auth.defaultAreaCode`
 - Risk / Rollback:
   - risk: very low, text source replacement only
   - rollback: revert login-form + locale key entries + regenerated import artifacts
@@ -741,7 +741,7 @@
 - Action:
   - changed union-record search handoff to pass i18n key instead of translated text:
     - `pages/agent-union-record/agent-union-record.uvue`
-      - `app.globalData.searchPlaceholder = "NuwaxMobile.AgentUnion.searchPlaceholder"`
+      - `app.globalData.searchPlaceholder = "Mobile.AgentUnion.searchPlaceholder"`
   - refactored agent-search placeholder rendering to key-driven runtime translation:
     - `subpackages/pages/agent-search/agent-search.uvue`
       - introduced `searchPlaceholderSource` (key source)
@@ -763,7 +763,7 @@
 - Goal: strengthen i18n audit gate for key completeness and prefix policy
 - Action:
   - enhanced `scripts/i18n-audit.mjs` with key-level checks:
-    - collect all used `NuwaxMobile.*` keys from business code
+    - collect all used `Mobile.*` keys from business code
     - validate keys exist in both locale defaults:
       - `constants/i18n-locales/zh-cn.uts`
       - `constants/i18n-locales/en-us.uts`
@@ -774,7 +774,7 @@
   - preserved existing visible-text/alt gate checks
 - Result:
   - audit now catches missing dictionary definitions and bilingual key drift early
-  - key-prefix policy (`NuwaxMobile.*` only) is enforced by gate
+  - key-prefix policy (`Mobile.*` only) is enforced by gate
 - Evidence:
   - `npm run i18n:audit` => pass (`0 i18n coverage issues`)
 - Risk / Rollback:
@@ -786,11 +786,11 @@
 - Goal: remove residual literal symbols from form UI to approach strict key-only visible text policy
 - Action:
   - converted two visible literals in new-conversation-set to i18n keys:
-    - required marker: `*` -> `NuwaxMobile.Common.requiredMark`
-    - single-select separator: `/` -> `NuwaxMobile.Common.optionSeparator`
+    - required marker: `*` -> `Mobile.Common.requiredMark`
+    - single-select separator: `/` -> `Mobile.Common.optionSeparator`
   - added locale entries in zh/en defaults:
-    - `NuwaxMobile.Common.requiredMark`
-    - `NuwaxMobile.Common.optionSeparator`
+    - `Mobile.Common.requiredMark`
+    - `Mobile.Common.optionSeparator`
   - regenerated platform import artifacts via `npm run i18n:export-defaults`
 - Result:
   - form visible symbols are now key-managed and platform-importable
@@ -812,7 +812,7 @@
   - changes:
     - template label render switched to `translateText(category.label)`
     - default "all" category label source changed from translated literal to key:
-      - `t("NuwaxMobile.Common.all")` -> `"NuwaxMobile.Common.all"`
+      - `t("Mobile.Common.all")` -> `"Mobile.Common.all"`
     - imported `translateText` alongside `useI18n`
 - Result:
   - "all" tab label can follow runtime language changes through key-driven rendering path
@@ -886,7 +886,7 @@
 - Action:
   - updated `utils/streamRequest.uts`
   - replaced `HTTP error! status: {code}` literal with i18n key:
-    - `NuwaxMobile.Stream.httpErrorWithCode`
+    - `Mobile.Stream.httpErrorWithCode`
   - added locale defaults:
     - `constants/i18n-locales/zh-cn.uts`
     - `constants/i18n-locales/en-us.uts`
@@ -909,8 +909,8 @@
 - Action:
   - updated `subpackages/hooks/useMessageEventDelegate.uts`
   - replaced hardcoded Chinese prompt calls:
-    - `'页面路径配置错误'` -> `t("NuwaxMobile.ButtonWrapper.pagePathConfigError")`
-    - `'页面路径参数配置错误'` -> `t("NuwaxMobile.ButtonWrapper.pagePathParamConfigError")`
+    - `'页面路径配置错误'` -> `t("Mobile.ButtonWrapper.pagePathConfigError")`
+    - `'页面路径参数配置错误'` -> `t("Mobile.ButtonWrapper.pagePathParamConfigError")`
   - imported `t` from `@/utils/i18n`
 - Result:
   - page-event error prompts now follow unified i18n key mechanism

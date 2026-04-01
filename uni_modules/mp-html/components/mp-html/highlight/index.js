@@ -6,7 +6,7 @@ import prism from "./prism.min";
 import config from "./config";
 const getCopyButtonText = () => {
   try {
-    const lang = String(uni.getStorageSync("I18N_LANG") || "zh-cn")
+    const lang = String(uni.getStorageSync("I18N_LANG") || "zh-CN")
       .toLowerCase()
       .trim();
     return lang.startsWith("en")

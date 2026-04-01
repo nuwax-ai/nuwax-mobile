@@ -4,6 +4,18 @@
  */
 import prism from "./prism.min";
 import config from "./config";
+const getCopyButtonText = () => {
+  try {
+    const lang = String(uni.getStorageSync("I18N_LANG") || "zh-cn")
+      .toLowerCase()
+      .trim();
+    return lang.startsWith("en")
+      ? "Copy code"
+      : "复制代码";
+  } catch (error) {
+    return "复制代码";
+  }
+};
 import Parser from "../parser";
 
 function Highlight(vm) {
@@ -113,7 +125,7 @@ Highlight.prototype.onParse = function (node, vm) {
             "data-content": text,
             "data-action": "copy",
           },
-          children: [{ type: "text", text: "复制代码" }],
+          children: [{ type: "text", text: getCopyButtonText() }],
         });
         // #endif
         // #ifndef H5

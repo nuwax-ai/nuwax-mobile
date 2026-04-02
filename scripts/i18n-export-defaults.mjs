@@ -8,11 +8,11 @@ const rootDir = process.cwd();
 
 const localeConfig = {
   "zh-cn": {
-    file: path.join(rootDir, "constants/i18n-locales/zh-cn.uts"),
+    file: path.join(rootDir, "constants/i18n-locales/zh-CN.uts"),
     exportName: "I18N_ZH_CN",
   },
   "en-us": {
-    file: path.join(rootDir, "constants/i18n-locales/en-us.uts"),
+    file: path.join(rootDir, "constants/i18n-locales/en-US.uts"),
     exportName: "I18N_EN_US",
   },
 };

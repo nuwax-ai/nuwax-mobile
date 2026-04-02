@@ -381,8 +381,8 @@
 - Goal: provide local default language files for platform bootstrap and import seeding
 - Action:
   - split local fallback dictionary into independent locale files:
-    - `constants/i18n-locales/zh-cn.uts`
-    - `constants/i18n-locales/en-us.uts`
+    - `constants/i18n-locales/zh-CN.uts`
+    - `constants/i18n-locales/en-US.uts`
   - refactored `constants/i18n.local.constants.uts` to aggregate from split files while keeping existing `I18N_LITERAL_LOOKUP` and runtime helper APIs unchanged
   - added export command for platform default import package:
     - script: `scripts/i18n-export-defaults.mjs`
@@ -416,8 +416,8 @@
     - `components/button-wrapper/button-wrapper.uvue` (`Mobile.ButtonWrapper.pagePathParamConfigError`, `Mobile.ButtonWrapper.pagePathConfigError`)
     - `components/chat-upload-image/chat-upload-image.uvue` (`Mobile.Chat.previewTypeUnsupported`)
   - expanded locale defaults in:
-    - `constants/i18n-locales/zh-cn.uts`
-    - `constants/i18n-locales/en-us.uts`
+    - `constants/i18n-locales/zh-CN.uts`
+    - `constants/i18n-locales/en-US.uts`
   - expanded audit scope to include `App.uvue` in `scripts/i18n-audit.mjs`
   - regenerated platform import defaults via `npm run i18n:export-defaults`
 - Result:
@@ -765,8 +765,8 @@
   - enhanced `scripts/i18n-audit.mjs` with key-level checks:
     - collect all used `Mobile.*` keys from business code
     - validate keys exist in both locale defaults:
-      - `constants/i18n-locales/zh-cn.uts`
-      - `constants/i18n-locales/en-us.uts`
+      - `constants/i18n-locales/zh-CN.uts`
+      - `constants/i18n-locales/en-US.uts`
     - enforce zh/en locale key-set parity
     - block legacy key prefix usage:
       - code-side `System.*`
@@ -888,8 +888,8 @@
   - replaced `HTTP error! status: {code}` literal with i18n key:
     - `Mobile.Stream.httpErrorWithCode`
   - added locale defaults:
-    - `constants/i18n-locales/zh-cn.uts`
-    - `constants/i18n-locales/en-us.uts`
+    - `constants/i18n-locales/zh-CN.uts`
+    - `constants/i18n-locales/en-US.uts`
   - regenerated platform import defaults:
     - `docs/i18n-platform-default-import.csv`
     - `docs/i18n-platform-default-import.json`

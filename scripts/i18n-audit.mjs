@@ -12,8 +12,8 @@ const excludeFiles = new Set([
   "utils/mockApiService.uts",
   "utils/pinyin.uts",
 ]);
-const zhLocalePath = "constants/i18n-locales/zh-cn.uts";
-const enLocalePath = "constants/i18n-locales/en-us.uts";
+const zhLocalePath = "constants/i18n-locales/zh-CN.uts";
+const enLocalePath = "constants/i18n-locales/en-US.uts";
 
 const hasChinese = /[\u4e00-\u9fff]/;
 const visibleLine = new RegExp(

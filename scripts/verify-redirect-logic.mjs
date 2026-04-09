@@ -100,20 +100,19 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
       return replaceUrl;
     }
 
-
-    // 应用详情页
-    const matchAppDetails = href.match(new RegExp('/app/([^/?#]+)'));
-    if (matchAppDetails) {
-      replaceUrl = baseUrl + '/m/#' + appDetailsPathMobile + '?id=' + matchAppDetails[1];
-      return replaceUrl;
-    }
-
-    // 应用会话页
+    // 应用会话页 (这里必须要放在应用详情页匹配之前，否则会匹配到应用详情页)
     const matchAppChat = href.match(new RegExp('app/chat/([^/]+)/([^/]+)'));
     if (matchAppChat) {
       const agentId = matchAppChat[1];
       const conversationId = matchAppChat[2];
       replaceUrl = baseUrl + '/m/#' + appDetailsPathMobile + '?id=' + agentId + '&conversationId=' + conversationId;
+      return replaceUrl;
+    }
+
+    // 应用详情页
+    const matchAppDetails = href.match(new RegExp('/app/([^/?#]+)'));
+    if (matchAppDetails) {
+      replaceUrl = baseUrl + '/m/#' + appDetailsPathMobile + '?id=' + matchAppDetails[1];
       return replaceUrl;
     }
 

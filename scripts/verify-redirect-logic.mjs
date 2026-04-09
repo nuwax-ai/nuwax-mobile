@@ -58,14 +58,11 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
       }
     }
 
-    console.log('应用详情页hash11111111', hash, hash.indexOf(appDetailsPathMobile));
-
     // 应用详情页
     if (hash && hash.indexOf(appDetailsPathMobile) !== -1) {
       const matchId = hash.match(new RegExp('[?&]id=([^&#]+)'));
       const matchConversationId = hash.match(new RegExp('[?&]conversationId=([^&#]+)'));
 
-      console.log('应用详情页matchId11111111', matchId, matchConversationId);
       if (matchId && matchId[1]) {
         const agentId = matchId[1];
         if (matchConversationId && matchConversationId[1]) {

@@ -66,9 +66,9 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
         const agentId = matchId[1];
         if (matchConversationId && matchConversationId[1]) {
           const conversationId = matchConversationId[1];
-          replaceUrl = baseUrl + '/app/chat/' + conversationId + '/' + agentId;
+          replaceUrl = baseUrl + '/app/chat/' + agentId + '/' + conversationId;
         } else {
-          replaceUrl = baseUrl + '/app/details/' + agentId;
+          replaceUrl = baseUrl + '/app/' + agentId;
         }
         return replaceUrl;
       }
@@ -98,7 +98,7 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
 
 
     // 应用详情页
-    const matchAppDetails = href.match(new RegExp('/app/details/([^/?#]+)'));
+    const matchAppDetails = href.match(new RegExp('/app/([^/?#]+)'));
     if (matchAppDetails) {
       replaceUrl = baseUrl + '/m/#' + appDetailsPathMobile + '?id=' + matchAppDetails[1];
       return replaceUrl;
@@ -107,8 +107,8 @@ function runRedirectLogic(protocol, host, href, hash, userAgent) {
     // 应用会话页
     const matchAppChat = href.match(new RegExp('app/chat/([^/]+)/([^/]+)'));
     if (matchAppChat) {
-      const conversationId = matchAppChat[1];
-      const agentId = matchAppChat[2];
+      const agentId = matchAppChat[1];
+      const conversationId = matchAppChat[2];
       replaceUrl = baseUrl + '/m/#' + appDetailsPathMobile + '?id=' + agentId + '&conversationId=' + conversationId;
       return replaceUrl;
     }

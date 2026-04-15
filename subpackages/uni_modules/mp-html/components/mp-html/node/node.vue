@@ -277,7 +277,7 @@
       <!-- 富文本 -->
       <!-- #ifdef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
       <rich-text
-        v-else-if="!n.c && (n.l || !handler.isInline(n.name, n.attrs.style))"
+        v-else-if="!n.c && (n.l || !isInline(n.name, n.attrs.style))"
         :id="n.attrs.id"
         :style="n.f"
         :user-select="opts[4]"
@@ -348,41 +348,10 @@
     </block>
   </view>
 </template>
-<script module="handler" lang="wxs">
-  // 行内标签列表
-  var inlineTags = {
-    abbr: true,
-    b: true,
-    big: true,
-    code: true,
-    del: true,
-    em: true,
-    i: true,
-    ins: true,
-    label: true,
-    q: true,
-    small: true,
-    span: true,
-    strong: true,
-    sub: true,
-    sup: true,
-  };
-  /**
-   * @description 判断是否为行内标签
-   */
-  module.exports = {
-    isInline: function (tagName, style) {
-      return (
-        inlineTags[tagName] || (style || "").indexOf("display:inline") !== -1
-      );
-    },
-  };
-</script>
 <script>
   import markdownContainer from '../container/container.vue'
   import taskResult from '../task-result/task-result.vue'
   import { getProcessingDataByPriority } from '../container/utils'
-  import node from './node'
   import { t } from '@/utils/i18n'
   export default {
     name: 'node',
@@ -419,9 +388,6 @@
     components: {
       markdownContainer,
       taskResult,
-      // #ifndef ((H5 || APP-PLUS) && VUE3) || APP-HARMONY
-      node
-      // #endif
     },
     mounted () {
       this.$nextTick(() => {
@@ -456,6 +422,13 @@
       // #endif
     },
     methods:{
+      /**
+       * @description 判断是否为行内标签（替代原 WXS handler 模块，APP 端不支持 WXS）
+       */
+      isInline (tagName, style) {
+        const inlineTags = { abbr: true, b: true, big: true, code: true, del: true, em: true, i: true, ins: true, label: true, q: true, small: true, span: true, strong: true, sub: true, sup: true }
+        return inlineTags[tagName] || (style || '').indexOf('display:inline') !== -1
+      },
       getI18nText (key) {
         return t(key)
       },

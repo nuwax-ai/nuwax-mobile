@@ -5,7 +5,7 @@ let API_BASE_URL = "";
 
 // uEnvProd
 if (process.env.NODE_ENV === "production") {
-  // #ifdef MP-WEIXIN
+  // #ifdef MP-WEIXIN || APP
   API_BASE_URL = "https://agent.nuwax.com";
   // #endif
 }

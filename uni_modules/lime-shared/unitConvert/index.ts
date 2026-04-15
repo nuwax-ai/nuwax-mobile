@@ -23,7 +23,19 @@ export function unitConvert(value : string | number | null | undefined, base: nu
 		const unit = results[3];
 		const _value = parseFloat(value);
 		if (unit === 'rpx') {
-			return uni.upx2px(_value);
+			if (typeof (uni as any).upx2px === 'function') {
+				return (uni as any).upx2px(_value);
+			}
+			if (typeof (uni as any).rpx2px === 'function') {
+				return (uni as any).rpx2px(_value);
+			}
+			try {
+				const { windowWidth } = uni.getSystemInfoSync();
+				if (windowWidth > 0) {
+					return windowWidth / 750 * _value;
+				}
+			} catch (e) {}
+			return _value;
 		}
 		if (unit === 'px') {
 			return _value * 1;

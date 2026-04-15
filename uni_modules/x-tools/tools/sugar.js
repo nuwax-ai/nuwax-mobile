@@ -1,7 +1,18 @@
 export const log = console.log
 import { t } from '@/utils/i18n'
 
-export const upx2px = val => uni.upx2px(parseInt(val))
+export const upx2px = val => {
+    const num = parseFloat(val)
+    if (Number.isNaN(num)) return 0
+    if (typeof uni?.upx2px === 'function') return uni.upx2px(num)
+    if (typeof uni?.rpx2px === 'function') return uni.rpx2px(num)
+    try {
+        const info = uni?.getSystemInfoSync?.()
+        const windowWidth = Number(info?.windowWidth || 0)
+        if (windowWidth > 0) return (windowWidth / 750) * num
+    } catch (e) {}
+    return num
+}
 
 export const toast = (title, options = { duration: 2000, icon: 'none' }) => uni.showToast({ title, fail: console.log, ...options })
 

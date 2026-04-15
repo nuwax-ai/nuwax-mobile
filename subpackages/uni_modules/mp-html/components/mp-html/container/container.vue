@@ -3,7 +3,7 @@
     <!-- Plan 类型：直接显示任务列表 -->
     <template v-if="isPlanType">
       <!-- Plan 头部信息 -->
-      <view class="plan-header" @tap="togglePlanExpanded">
+      <view class="plan-header">
         <view class="plan-info">
           <text class="plan-name">{{
             toolCall.name || getI18nText("Mobile.ThirdParty.MpHtml.executionPlan")
@@ -15,8 +15,8 @@
             <text class="plan-status-text">{{ getStatusText(toolCall.status) }}</text>
           </view> -->
         </view>
-        <view class="plan-expand-icon">
-          <text class="iconfont" :class="planExpanded ? 'icon-Chevron-up' : 'icon-a-Chevrondown'"></text>
+        <view class="plan-expand-icon" @tap="togglePlanExpanded">
+          <text class="iconfont" :class="planExpanded ? 'icon-MinusOutlined' : 'icon-Plus'"></text>
         </view>
       </view>
       
@@ -46,21 +46,20 @@
           </view>
         </view>
         <view class="tool-actions">
-          <view class="action-icon" @tap.stop.prevent="handleShowDetails">
-            <text class="iconfont icon-List"></text>
+          <view class="action-icon" @tap.stop.prevent="handleShowDetails(detailData)">
+            <text class="iconfont icon-ProfileOutlined"></text>
           </view>
-          <view class="action-icon" @tap.stop.prevent="handleCopyToClipboard">
+          <!-- <view class="action-icon" @tap.stop.prevent="handleCopyToClipboard">
             <text class="iconfont icon-Copy"></text>
-          </view>
+          </view> -->
           <view v-if="isPageType(toolCall)" class="action-icon" @tap.stop.prevent="openPreviewPage(toolCall)">
             <text class="iconfont icon-eye-open"></text>
           </view>
         </view>
       </view>
 
-      <!-- 展开后的详细信息 -->
-      <view v-if="expanded" class="tool-details-expanded">
-        <!-- 调用参数 -->
+      <!-- 展开后的详细信息 调用参数/调用结果-->
+      <!-- <view v-if="expanded" class="tool-details-expanded">
         <view v-if="detailData.params && Object.keys(detailData.params).length > 0" class="detail-section">
           <view class="section-header">
             <text class="section-title">{{
@@ -72,7 +71,6 @@
           </view>
         </view>
 
-        <!-- 调用结果 -->
         <view v-if="detailData.response" class="detail-section">
           <view class="section-header">
             <text class="section-title">{{
@@ -83,8 +81,15 @@
             <text class="output-text">{{ formatResult(detailData.response) }}</text>
           </view>
         </view>
-      </view>
+      </view> -->
     </template>
+
+    <!-- 详情弹窗 -->
+    <tool-details-modal 
+    ref="detailsModal" 
+    :detail-data="detailData" 
+    :title="toolCall.name || getI18nText('Mobile.ThirdParty.MpHtml.executionPlan')"
+    />
   </view>
 </template>
 
@@ -94,11 +99,13 @@ import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
 import { getCurrentPageParams } from '@/utils/common';
 import { getFileProxyUrlByConversationIdAndFilePath, jumpToFilePreviewPage } from '@/utils/system.uts';
 import { t } from '@/utils/i18n';
+import toolDetailsModal from '../tool-details-modal/tool-details-modal.vue';
 
 export default {
   name: 'Container',
   components: {
-    uniIcons
+    uniIcons,
+    toolDetailsModal
   },
   props: {
     data: {
@@ -108,7 +115,7 @@ export default {
   },
   data() {
     return {
-      expanded: false,
+      // expanded: false,
       planExpanded: true, // Plan 类型默认展开
       toolCall: this.data
     }
@@ -175,7 +182,7 @@ export default {
         return;
       }
 
-      this.expanded = !this.expanded
+      // this.expanded = !this.expanded
     },
     
     // 切换 Plan 展开状态
@@ -191,13 +198,12 @@ export default {
           title: t('Mobile.ThirdParty.MpHtml.emptyResult'),
         })
       }
-      this.expanded = !this.expanded
+      // this.expanded = !this.expanded
     },
 
     // 处理显示详情点击（阻止冒泡）
-    handleShowDetails(event) {
-      event.stopPropagation()
-      this.showDetails()
+    handleShowDetails() {
+      this.$refs.detailsModal.open();
     },
 
     // 处理复制到剪贴板点击（阻止冒泡）
@@ -333,13 +339,18 @@ export default {
 }
 </script>
 
-<style lang="scss">
+<style lang="scss" scoped>
 .tool-call-status {
   width: 100%;
   margin: 16rpx 0;
   border-radius: 16rpx;
   background-color: rgba(12, 20, 102, 0.04);
   overflow: hidden;
+
+  .iconfont {
+    font-size: 32rpx;
+    color: #333;
+  }
 
   // Plan 类型样式
   .plan-header {
@@ -390,12 +401,12 @@ export default {
       }
     }
 
-    .plan-expand-icon {
-      .iconfont {
-        font-size: 28rpx;
-        color: #999;
-      }
-    }
+    // .plan-expand-icon {
+    //   .iconfont {
+    //     font-size: 32rpx;
+    //     color: #333;
+    //   }
+    // }
   }
 
   // Plan 任务列表
@@ -526,9 +537,9 @@ export default {
         cursor: pointer;
 
         .iconfont {
-          font-size: 36rpx;
+          // font-size: 32rpx;
           font-weight: 400;
-          color: #333;
+          // color: #333;
           line-height: 36rpx;
         }
 

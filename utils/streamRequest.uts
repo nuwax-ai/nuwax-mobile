@@ -2,6 +2,14 @@ import { StreamRequestConfig, StreamChunk } from "@/types/interfaces/chat";
 import { createSSEConnection } from "@/servers/useRequest.uts";
 import { utf8ArrayToString } from "@/utils/utf8.uts";
 import { t } from "@/utils/i18n";
+import {
+  logFileDebug,
+  logFileError,
+  logFileInfo,
+  logFileWarn,
+} from "@/utils/fileLogger.uts";
+
+const STREAM_LOG_TAG = "StreamRequest";
 
 // 全局错误处理 - 捕获未处理的 AbortError
 // #ifdef H5
@@ -22,6 +30,9 @@ export class StreamRequest {
   private abortController: AbortController | null = null;
   private buffer: string = ""; // 用于缓存不完整的 SSE 消息（以 \n\n 为完整标记）
   private pendingBytes: Uint8Array = new Uint8Array(0); // 用于缓存不完整的 UTF-8 字节序列
+  private chunkCounter: number = 0; // 当前请求接收到的 chunk 数量
+  private frameCounter: number = 0; // 当前请求解析出的 SSE frame 数量
+  private hasReceivedChunk: boolean = false; // 当前请求是否收到过 chunk
 
   // 微信小程序数据流超时监控
   private lastChunkReceivedTime: number = 0; // 最后一次接收数据的时间戳
@@ -34,6 +45,19 @@ export class StreamRequest {
     this.isAborted = false;
     this.buffer = ""; // 重置缓冲区
     this.pendingBytes = new Uint8Array(0); // 重置字节缓冲区
+    this.chunkCounter = 0;
+    this.frameCounter = 0;
+    this.hasReceivedChunk = false;
+    console.log("[SSE-Debug] request start", {
+      method: config.method,
+      url: config.url,
+      hasBody: !!config.body,
+    });
+    logFileInfo(STREAM_LOG_TAG, "request start", {
+      method: config.method,
+      url: config.url,
+      hasBody: !!config.body,
+    });
 
     // #ifdef H5
     // 只在 H5 环境中创建 AbortController
@@ -63,6 +87,7 @@ export class StreamRequest {
       // #ifdef H5
       if (error.name === "AbortError" || this.isAborted) {
         console.log("请求已被中止");
+        logFileDebug(STREAM_LOG_TAG, "request aborted on H5 catch");
         return;
       }
       // #endif
@@ -70,11 +95,15 @@ export class StreamRequest {
       // #ifdef MP-WEIXIN || APP
       if (this.isAborted) {
         console.log("请求已被中止");
+        logFileDebug(STREAM_LOG_TAG, "request aborted on MP/APP catch");
         return;
       }
       // #endif
 
       config.onError?.(error);
+      logFileError(STREAM_LOG_TAG, "request catch error", {
+        error: String((error as any)?.message || error),
+      });
     }
   }
 
@@ -84,6 +113,7 @@ export class StreamRequest {
       // 关键修复：在创建 requestTask 后立即启动超时监控
       // 因为 onChunkReceived 可能比 success 回调更早触发
       console.log("[请求] requestTask 已创建，立即启动超时监控");
+      logFileDebug(STREAM_LOG_TAG, "h5 requestTask created");
       this.startTimeoutMonitor();
       console.log("[请求] 超时监控启动完成");
 
@@ -110,6 +140,7 @@ export class StreamRequest {
               );
               this.clearTimeoutMonitor();
               console.log("[SSE] completed 标记处理完成，定时器已清除");
+              logFileInfo(STREAM_LOG_TAG, "h5 completed marker");
 
               config.onComplete?.();
               return;
@@ -120,9 +151,15 @@ export class StreamRequest {
               type: "content",
               data: data ? JSON.stringify(data) : "",
             };
+            logFileDebug(STREAM_LOG_TAG, "h5 onMessage content", {
+              len: chunk.data.length,
+            });
             config.onChunk?.(chunk);
           } catch (e) {
             console.error("Parse chunk error:", e);
+            logFileError(STREAM_LOG_TAG, "h5 parse chunk error", {
+              error: String((e as any)?.message || e),
+            });
           }
         },
         onError: (error: Error) => {
@@ -131,15 +168,21 @@ export class StreamRequest {
           // 如果是中止错误，不触发错误回调
           if (error.name === "AbortError" || this.isAborted) {
             console.log("SSE连接已被中止");
+            logFileDebug(STREAM_LOG_TAG, "h5 connection aborted");
             return;
           }
+          logFileError(STREAM_LOG_TAG, "h5 onError", {
+            error: String((error as any)?.message || error),
+          });
           config.onError?.(error);
         },
         onOpen: (response: any) => {
           console.log("SSE连接已建立:", response);
+          logFileInfo(STREAM_LOG_TAG, "h5 onOpen");
         },
         onClose: () => {
           console.log("SSE连接已关闭");
+          logFileWarn(STREAM_LOG_TAG, "h5 onClose");
           // 调用超时回调-关闭loading状态以及恢复停止按钮
           config.onTimeout?.();
         },
@@ -152,9 +195,13 @@ export class StreamRequest {
         this.isAborted
       ) {
         console.log("SSE连接已被中止");
+        logFileDebug(STREAM_LOG_TAG, "h5 catch aborted");
         return;
       }
       // 只有真正的错误才触发错误回调
+      logFileError(STREAM_LOG_TAG, "h5 catch error", {
+        error: String((error as any)?.message || error),
+      });
       config.onError?.(error);
       throw error; // 重新抛出非中止错误
     }
@@ -166,6 +213,19 @@ export class StreamRequest {
     config: StreamRequestConfig,
     resolve: (value: void | PromiseLike<void>) => void,
   ): void {
+    const contentPreview =
+      content.length > 160 ? `${content.slice(0, 160)}...` : content;
+    console.log("[SSE-Debug] process frame", {
+      frameNo: this.frameCounter,
+      len: content.length,
+      preview: contentPreview,
+    });
+    logFileDebug(STREAM_LOG_TAG, "process frame", {
+      frameNo: this.frameCounter,
+      len: content.length,
+      preview: contentPreview,
+    });
+
     // 检查是否完成
     if (content === "[DONE]") {
       console.log("[SSE] 收到完成标记 [DONE]");
@@ -177,6 +237,7 @@ export class StreamRequest {
       );
       this.clearTimeoutMonitor();
       console.log("[SSE] [DONE] 标记处理完成，定时器已清除");
+      logFileInfo(STREAM_LOG_TAG, "done marker");
 
       config.onComplete?.();
       resolve();
@@ -200,6 +261,7 @@ export class StreamRequest {
           );
           this.clearTimeoutMonitor();
           console.log("[SSE] completed 标记处理完成，定时器已清除");
+          logFileInfo(STREAM_LOG_TAG, "completed marker in frame");
 
           config.onComplete?.();
           resolve();
@@ -214,6 +276,9 @@ export class StreamRequest {
         config.onChunk?.(chunk);
       } catch (e) {
         console.log("[SSE] JSON 解析失败，内容:", content);
+        logFileWarn(STREAM_LOG_TAG, "frame json parse failed", {
+          preview: content.length > 160 ? `${content.slice(0, 160)}...` : content,
+        });
       }
     } else {
       // 不是 JSON 格式，直接作为内容处理
@@ -269,8 +334,19 @@ export class StreamRequest {
     // 优先按标准 SSE 空行分帧消费
     const messages = this.buffer.split("\n\n");
     this.buffer = messages.pop() || "";
+    if (messages.length > 0) {
+      console.log("[SSE-Debug] consume by blank-line frames", {
+        count: messages.length,
+        remainBufferLen: this.buffer.length,
+      });
+      logFileDebug(STREAM_LOG_TAG, "consume blank-line frames", {
+        count: messages.length,
+        remainBufferLen: this.buffer.length,
+      });
+    }
     for (const rawMessage of messages) {
       if (!rawMessage || !rawMessage.trim()) continue;
+      this.frameCounter += 1;
 
       const lines = rawMessage.split("\n");
       const dataLines: string[] = [];
@@ -305,8 +381,19 @@ export class StreamRequest {
       const lines = this.buffer.split("\n");
       // 最后一行可能不完整，保留
       this.buffer = lines.pop() || "";
+      if (lines.length > 0) {
+        console.log("[SSE-Debug] consume by line fallback", {
+          count: lines.length,
+          remainBufferLen: this.buffer.length,
+        });
+        logFileDebug(STREAM_LOG_TAG, "consume line fallback", {
+          count: lines.length,
+          remainBufferLen: this.buffer.length,
+        });
+      }
 
       for (const line of lines) {
+        this.frameCounter += 1;
         this.processSSELine(line, config, resolve);
       }
     }
@@ -380,6 +467,7 @@ export class StreamRequest {
   // 处理超时
   private handleTimeout(): void {
     console.log("[超时监控] 触发超时处理");
+    logFileWarn(STREAM_LOG_TAG, "timeout triggered");
 
     // 清除定时器
     this.clearTimeoutMonitor();
@@ -485,6 +573,16 @@ export class StreamRequest {
         timeout: 1000 * 60 * 60 * 12, // 设置超时时间为 12小时
         success: (res) => {
           console.log("[请求] success 回调触发，statusCode:", res.statusCode);
+          console.log("[SSE-Debug] request success", {
+            statusCode: res.statusCode,
+            hasReceivedChunk: this.hasReceivedChunk,
+            responseDataType: typeof (res as any).data,
+          });
+          logFileInfo(STREAM_LOG_TAG, "weapp request success", {
+            statusCode: res.statusCode,
+            hasReceivedChunk: this.hasReceivedChunk,
+            responseDataType: typeof (res as any).data,
+          });
           if (res.statusCode === 200) {
             // 流式数据通过 onChunkReceived 接收，success 仅表示请求建立成功
             // 实际的流式数据处理在 onChunkReceived 回调中
@@ -517,11 +615,17 @@ export class StreamRequest {
                 err.errMsg.includes("timeout"))
             ) {
               console.log("请求超时警告（流式请求正常现象）:", err);
+              logFileWarn(STREAM_LOG_TAG, "weapp timeout warning", {
+                errMsg: err.errMsg || "",
+              });
               // 不 reject，也不触发 onError，保持连接继续接收数据
               return;
             }
 
             config.onError?.(err);
+            logFileError(STREAM_LOG_TAG, "weapp request fail", {
+              errMsg: err.errMsg || "",
+            });
             reject(err);
           }
         },
@@ -530,6 +634,7 @@ export class StreamRequest {
       // 关键修复：在创建 requestTask 后立即启动超时监控
       // 因为 onChunkReceived 可能比 success 回调更早触发
       console.log("[请求] requestTask 已创建，立即启动超时监控");
+      logFileDebug(STREAM_LOG_TAG, "weapp requestTask created");
       this.startTimeoutMonitor();
       console.log("[请求] 超时监控启动完成");
 
@@ -537,6 +642,8 @@ export class StreamRequest {
       this.requestTask?.onChunkReceived?.((res) => {
         // console.log('[数据接收] onChunkReceived 触发')
         if (this.isAborted) return;
+        this.hasReceivedChunk = true;
+        this.chunkCounter += 1;
 
         // 更新最后接收数据的时间
         this.updateLastChunkTime();
@@ -544,6 +651,19 @@ export class StreamRequest {
         try {
           // 使用 decodeUTF8 处理分块数据，解决字符截断问题
           const str = this.decodeUTF8(res.data as ArrayBuffer);
+          if (this.chunkCounter <= 8 || this.chunkCounter % 20 === 0) {
+            const preview = str.length > 120 ? `${str.slice(0, 120)}...` : str;
+            console.log("[SSE-Debug] chunk received", {
+              chunkNo: this.chunkCounter,
+              len: str.length,
+              preview,
+            });
+            logFileDebug(STREAM_LOG_TAG, "weapp chunk received", {
+              chunkNo: this.chunkCounter,
+              len: str.length,
+              preview,
+            });
+          }
 
           // 将新数据添加到缓冲区
           this.buffer += str;
@@ -551,6 +671,9 @@ export class StreamRequest {
           this.consumeSSEBuffer(config, resolve);
         } catch (error) {
           console.error("处理分块数据失败:", error);
+          logFileError(STREAM_LOG_TAG, "weapp chunk process error", {
+            error: String((error as any)?.message || error),
+          });
           if (!this.isAborted) {
             config.onError?.(error);
           }
@@ -573,6 +696,16 @@ export class StreamRequest {
         timeout: 1000 * 60 * 60 * 12, // 设置超时时间为 12小时
         success: (res) => {
           console.log("[请求-APP] success 回调触发，statusCode:", res.statusCode);
+          console.log("[SSE-Debug] app request success", {
+            statusCode: res.statusCode,
+            hasReceivedChunk: this.hasReceivedChunk,
+            responseDataType: typeof (res as any).data,
+          });
+          logFileInfo(STREAM_LOG_TAG, "app request success", {
+            statusCode: res.statusCode,
+            hasReceivedChunk: this.hasReceivedChunk,
+            responseDataType: typeof (res as any).data,
+          });
           if (res.statusCode === 200) {
             config.onOpen?.(res);
             resolve();
@@ -597,9 +730,15 @@ export class StreamRequest {
                 err.errMsg.includes("timeout"))
             ) {
               console.log("请求超时警告（流式请求正常现象）:", err);
+              logFileWarn(STREAM_LOG_TAG, "app timeout warning", {
+                errMsg: err.errMsg || "",
+              });
               return;
             }
             config.onError?.(err);
+            logFileError(STREAM_LOG_TAG, "app request fail", {
+              errMsg: err.errMsg || "",
+            });
             reject(err);
           }
         },
@@ -607,12 +746,15 @@ export class StreamRequest {
 
       // 创建 requestTask 后立即启动超时监控
       console.log("[请求-APP] requestTask 已创建，立即启动超时监控");
+      logFileDebug(STREAM_LOG_TAG, "app requestTask created");
       this.startTimeoutMonitor();
       console.log("[请求-APP] 超时监控启动完成");
 
       // 监听分块数据接收
       this.requestTask?.onChunkReceived?.((res) => {
         if (this.isAborted) return;
+        this.hasReceivedChunk = true;
+        this.chunkCounter += 1;
 
         // 更新最后接收数据的时间
         this.updateLastChunkTime();
@@ -620,6 +762,19 @@ export class StreamRequest {
         try {
           // 使用 decodeUTF8 处理分块数据，解决字符截断问题
           const str = this.decodeUTF8(res.data as ArrayBuffer);
+          if (this.chunkCounter <= 8 || this.chunkCounter % 20 === 0) {
+            const preview = str.length > 120 ? `${str.slice(0, 120)}...` : str;
+            console.log("[SSE-Debug] app chunk received", {
+              chunkNo: this.chunkCounter,
+              len: str.length,
+              preview,
+            });
+            logFileDebug(STREAM_LOG_TAG, "app chunk received", {
+              chunkNo: this.chunkCounter,
+              len: str.length,
+              preview,
+            });
+          }
 
           // 将新数据添加到缓冲区
           this.buffer += str;
@@ -627,6 +782,9 @@ export class StreamRequest {
           this.consumeSSEBuffer(config, resolve);
         } catch (error) {
           console.error("处理分块数据失败:", error);
+          logFileError(STREAM_LOG_TAG, "app chunk process error", {
+            error: String((error as any)?.message || error),
+          });
           if (!this.isAborted) {
             config.onError?.(error);
           }

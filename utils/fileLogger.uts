@@ -1,0 +1,246 @@
+type FileLogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+const LOG_DIR_NAME = "nuwax-logs";
+const LOG_FILE_NAME = "sse-debug.log";
+const LOG_PREV_FILE_NAME = "sse-debug.prev.log";
+const LOG_ENABLED_KEY = "SSE_FILE_LOG_ENABLED";
+const MAX_LOG_BYTES = 2 * 1024 * 1024; // 2MB
+const MEMORY_FALLBACK_LIMIT = 500;
+
+const normalizePath = (path: string): string => {
+  return path.replace(/\/+/g, "/").replace(/\/$/, "");
+};
+
+const safeStringify = (payload: any): string => {
+  if (payload == null) return "";
+  if (typeof payload === "string") return payload;
+  try {
+    return JSON.stringify(payload);
+  } catch (e) {
+    return String(payload);
+  }
+};
+
+const buildLogLine = (
+  level: FileLogLevel,
+  tag: string,
+  message: string,
+  payload?: any,
+): string => {
+  const ts = new Date().toISOString();
+  const base = `[${ts}] [${level}] [${tag}] ${message}`;
+  const body = safeStringify(payload);
+  return body ? `${base} | ${body}` : base;
+};
+
+class FileLogger {
+  private fs: any = null;
+  private initialized: boolean = false;
+  private enabled: boolean = true;
+  private dirPath: string = "";
+  private filePath: string = "";
+  private prevFilePath: string = "";
+  private memoryFallback: string[] = [];
+
+  private getFileSystem(): any {
+    if (this.fs) return this.fs;
+    try {
+      const getter = (uni as any).getFileSystemManager;
+      if (typeof getter === "function") {
+        const candidate = getter.call(uni);
+        if (candidate) {
+          this.fs = candidate;
+        }
+      }
+    } catch (e) {}
+    return this.fs;
+  }
+
+  private resolveBasePath(): string {
+    try {
+      const envObj = (uni as any).env;
+      const userDataPath = String(envObj?.USER_DATA_PATH || "").trim();
+      if (userDataPath.length > 0) {
+        return normalizePath(userDataPath);
+      }
+    } catch (e) {}
+    // APP 兜底路径
+    return "_doc/uni-store";
+  }
+
+  private ensureInitialized(): void {
+    if (this.initialized) return;
+
+    const persisted = uni.getStorageSync(LOG_ENABLED_KEY);
+    if (persisted === "0") {
+      this.enabled = false;
+    }
+
+    const basePath = this.resolveBasePath();
+    this.dirPath = normalizePath(`${basePath}/${LOG_DIR_NAME}`);
+    this.filePath = `${this.dirPath}/${LOG_FILE_NAME}`;
+    this.prevFilePath = `${this.dirPath}/${LOG_PREV_FILE_NAME}`;
+
+    const fs = this.getFileSystem();
+    if (fs) {
+      try {
+        fs.mkdirSync(this.dirPath, true);
+      } catch (e) {
+        // 目录已存在或当前端不支持文件系统，忽略
+      }
+    }
+
+    this.initialized = true;
+  }
+
+  private pushMemoryFallback(line: string): void {
+    this.memoryFallback.push(line);
+    if (this.memoryFallback.length > MEMORY_FALLBACK_LIMIT) {
+      this.memoryFallback.splice(
+        0,
+        this.memoryFallback.length - MEMORY_FALLBACK_LIMIT,
+      );
+    }
+  }
+
+  private rotateIfNeeded(): void {
+    const fs = this.getFileSystem();
+    if (!fs) return;
+
+    try {
+      const statRes = fs.statSync(this.filePath);
+      const size = Number((statRes as any)?.size || 0);
+      if (size < MAX_LOG_BYTES) return;
+
+      try {
+        fs.unlinkSync(this.prevFilePath);
+      } catch (e) {}
+      try {
+        fs.renameSync(this.filePath, this.prevFilePath);
+      } catch (e) {}
+    } catch (e) {
+      // 文件不存在，忽略
+    }
+  }
+
+  private appendLine(line: string): void {
+    this.ensureInitialized();
+    this.rotateIfNeeded();
+    const fs = this.getFileSystem();
+    if (!fs) {
+      this.pushMemoryFallback(line);
+      return;
+    }
+
+    try {
+      fs.appendFileSync(this.filePath, `${line}\n`, "utf8");
+      return;
+    } catch (appendError) {}
+
+    try {
+      fs.writeFileSync(this.filePath, `${line}\n`, "utf8");
+      return;
+    } catch (writeError) {
+      this.pushMemoryFallback(line);
+    }
+  }
+
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+    uni.setStorageSync(LOG_ENABLED_KEY, enabled ? "1" : "0");
+  }
+
+  isEnabled(): boolean {
+    this.ensureInitialized();
+    return this.enabled;
+  }
+
+  log(level: FileLogLevel, tag: string, message: string, payload?: any): void {
+    this.ensureInitialized();
+    if (!this.enabled) return;
+    const line = buildLogLine(level, tag, message, payload);
+    this.appendLine(line);
+  }
+
+  readCurrent(): string {
+    this.ensureInitialized();
+    const fs = this.getFileSystem();
+    if (!fs) {
+      return this.memoryFallback.join("\n");
+    }
+    try {
+      return (fs.readFileSync(this.filePath, "utf8") as string) || "";
+    } catch (e) {
+      return this.memoryFallback.join("\n");
+    }
+  }
+
+  readPrevious(): string {
+    this.ensureInitialized();
+    const fs = this.getFileSystem();
+    if (!fs) return "";
+    try {
+      return (fs.readFileSync(this.prevFilePath, "utf8") as string) || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  readAll(): string {
+    const current = this.readCurrent();
+    const previous = this.readPrevious();
+    if (!previous) return current;
+    return `${previous}\n\n----- CURRENT LOG -----\n${current}`;
+  }
+
+  clear(): void {
+    this.ensureInitialized();
+    const fs = this.getFileSystem();
+    if (!fs) {
+      this.memoryFallback = [];
+      return;
+    }
+    try {
+      fs.unlinkSync(this.filePath);
+    } catch (e) {}
+    try {
+      fs.unlinkSync(this.prevFilePath);
+    } catch (e) {}
+    this.memoryFallback = [];
+  }
+
+  getFilePath(): string {
+    this.ensureInitialized();
+    return this.filePath;
+  }
+}
+
+export const fileLogger = new FileLogger();
+
+export const logFileDebug = (tag: string, message: string, payload?: any) => {
+  fileLogger.log("DEBUG", tag, message, payload);
+};
+
+export const logFileInfo = (tag: string, message: string, payload?: any) => {
+  fileLogger.log("INFO", tag, message, payload);
+};
+
+export const logFileWarn = (tag: string, message: string, payload?: any) => {
+  fileLogger.log("WARN", tag, message, payload);
+};
+
+export const logFileError = (tag: string, message: string, payload?: any) => {
+  fileLogger.log("ERROR", tag, message, payload);
+};
+
+export const readSSEFileLogs = (): string => {
+  return fileLogger.readAll();
+};
+
+export const clearSSEFileLogs = (): void => {
+  fileLogger.clear();
+};
+
+export const getSSEFileLogPath = (): string => {
+  return fileLogger.getFilePath();
+};

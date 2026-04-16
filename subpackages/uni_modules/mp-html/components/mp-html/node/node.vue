@@ -755,16 +755,23 @@
 </script>
 
 <style lang="scss">
+  /* #ifdef APP-UVUE */
+  @import "../styles/index-app.scss";
+  /* #endif */
+  /* #ifndef APP-UVUE */
   @import "../styles/index.scss";
+  /* #endif */
 
   // 会话输出内容点击事件
   // 事件绑定配置样式
   .div-event-style {
-    display: inline-block !important;
+    display: flex !important;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
     font-size: 12px;
     margin: 0 4px;
     padding: 4px 8px;
-    cursor: pointer;
     max-width: 100px;
     min-width: 18px;
     border-radius: 24px;
@@ -774,10 +781,6 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-
-    &:hover {
-      background-color: rgba(235, 235, 235);
-    }
   }
 
   /* 非 H5 平台：hl-language 头部行的原生包裹层，匹配 .hl-language 的布局 */

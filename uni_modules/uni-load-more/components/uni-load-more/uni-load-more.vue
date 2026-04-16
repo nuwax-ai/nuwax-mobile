@@ -163,6 +163,46 @@
 </script>
 
 <style lang="scss" >
+	/* #ifdef APP-UVUE */
+	.uni-load-more {
+		display: flex;
+		flex-direction: row;
+		height: 40px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.uni-load-more__text {
+		font-size: 14px;
+		margin-left: 8px;
+	}
+
+	.uni-load-more__img,
+	.uni-load-more__img--android-MP,
+	.uni-load-more__img--ios-H5 {
+		width: 24px;
+		height: 24px;
+	}
+
+	.uni-load-more__img--android-MP {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.uni-load-more__img--android-MP .uni-load-more__img-icon {
+		position: absolute;
+		box-sizing: border-box;
+		width: 100%;
+		height: 100%;
+		border-radius: 50%;
+		border: solid 2px transparent;
+		border-top: solid 2px #777777;
+	}
+	/* #endif */
+
+	/* #ifndef APP-UVUE */
 	.uni-load-more {
 		/* #ifndef APP-NVUE */
 		display: flex;
@@ -405,5 +445,6 @@
 		}
 	}
 
+	/* #endif */
 	/* #endif */
 </style>

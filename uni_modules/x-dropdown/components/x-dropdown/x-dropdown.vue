@@ -8,7 +8,7 @@
                 <slot name="menu">
                     <view class="menu">
                         <view class="menu-item" :style="[{width: dropdownRect.width + 'px'}, menuStyle]" v-for="i,idx in menuList" @click="menuClick(i, idx)">
-                            <text>{{ i }}</text>
+                            <text class="menu-item-text">{{ i }}</text>
                         </view>
                     </view>
                 </slot>
@@ -134,7 +134,7 @@
 
 <style lang="scss" scoped>
     .x-dropdown {
-        width: fit-content;
+        width: auto;
         position: relative;
         overflow: hidden;
     }
@@ -142,8 +142,8 @@
 
     .x-dropdown-mask {
         position: fixed;
-        width: 100vw;
-        height: 100vh;
+        width: 100%;
+        height: 100%;
         left: 0;
         top: 0;
         z-index: 999;
@@ -166,7 +166,7 @@
                     padding: 24rpx 32rpx;
                     text-align: center;
 
-                    text {
+                    .menu-item-text {
                         font-size: 28rpx;
                         color: #000;
                     }

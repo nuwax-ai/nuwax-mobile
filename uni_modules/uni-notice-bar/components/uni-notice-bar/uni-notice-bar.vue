@@ -6,12 +6,22 @@
     @click="onClick"
   >
     <slot v-if="showIcon === true || showIcon === 'true'" name="noticebarIcon">
-      <!-- <uni-icons
+      <uni-icons
+        v-if="false"
         class="uni-noticebar-icon"
         type="sound"
         :color="color"
         :size="fontSize * 1.5"
-      /> -->
+      />
+      <!-- #ifdef APP-UVUE -->
+      <uni-icons
+        class="uni-noticebar-icon"
+        type="sound"
+        :color="color"
+        :size="fontSize * 1.5"
+      />
+      <!-- #endif -->
+      <!-- #ifndef APP-UVUE -->
       <text
         class="iconfont icon-voice-1"
         :style="{
@@ -20,6 +30,7 @@
           marginRight: '10rpx',
         }"
       ></text>
+      <!-- #endif -->
     </slot>
     <view
       ref="textBox"
@@ -84,12 +95,22 @@
       />
     </view>
     <view class="uni-noticebar-close uni-cursor-point" v-if="isShowClose">
-      <!-- <uni-icons
+      <uni-icons
+        v-if="false"
         type="closeempty"
         :color="color"
         :size="fontSize * 1.1"
         @click="close"
-      /> -->
+      />
+      <!-- #ifdef APP-UVUE -->
+      <uni-icons
+        type="closeempty"
+        :color="color"
+        :size="fontSize * 1.1"
+        @click="close"
+      />
+      <!-- #endif -->
+      <!-- #ifndef APP-UVUE -->
       <text
         class="iconfont icon-X"
         @click="close"
@@ -99,6 +120,7 @@
           marginRight: '10rpx',
         }"
       ></text>
+      <!-- #endif -->
     </view>
   </view>
 </template>
@@ -385,6 +407,74 @@
 </script>
 
 <style lang="scss" scoped>
+  /* #ifdef APP-UVUE */
+  .uni-noticebar {
+    display: flex;
+    width: 100%;
+    box-sizing: border-box;
+    flex-direction: row;
+    align-items: center;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+
+  .uni-noticebar-close {
+    margin-left: 8px;
+    margin-right: 5px;
+  }
+
+  .uni-noticebar-icon {
+    margin-right: 5px;
+  }
+
+  .uni-noticebar__content-wrapper {
+    flex: 1;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .uni-noticebar__content-wrapper--single,
+  .uni-noticebar__content-wrapper--scrollable {
+    flex-direction: row;
+  }
+
+  .uni-noticebar__content--scrollable {
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .uni-noticebar__content--single {
+    display: flex;
+    flex: 1;
+    width: 100%;
+    justify-content: center;
+  }
+
+  .uni-noticebar__content-text {
+    font-size: 14px;
+    line-height: 18px;
+  }
+
+  .uni-noticebar__content-text--single {
+    width: 100%;
+    overflow: hidden;
+  }
+
+  .uni-noticebar__content-text--scrollable {
+    width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  .uni-noticebar__more {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding-left: 5px;
+  }
+  /* #endif */
+
+  /* #ifndef APP-UVUE */
   .uni-noticebar {
     /* #ifndef APP-NVUE */
     display: flex;
@@ -509,4 +599,5 @@
       transform: translate3d(-100%, 0, 0);
     }
   }
+  /* #endif */
 </style>

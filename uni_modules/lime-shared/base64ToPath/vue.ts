@@ -48,7 +48,7 @@ export function base64ToPath(base64: string, filename?: string):Promise<string> 
 		})))
 		// #endif
 
-		// #ifdef APP-PLUS
+		// #ifdef APP
 		const bitmap = new plus.nativeObj.Bitmap('bitmap' + Date.now())
 		bitmap.loadBase64Data(base64, () => {
 			if (!filename && !format) {

@@ -64,7 +64,7 @@ const config = {
 
   // 默认的标签样式
   tagStyle: {
-    // #ifndef APP-PLUS-NVUE
+    // #ifndef APP-NVUE
     address: "font-style:italic",
     big: "display:inline;font-size:1.2em",
     caption: "display:table-caption;text-align:center",
@@ -116,13 +116,13 @@ config.trustTags.iframe = true;
 config.ignoreTags.embed = undefined;
 config.trustTags.embed = true;
 // #endif
-// #ifdef APP-PLUS
+// #ifdef APP
 config.ignoreTags.iframe = undefined;
 config.trustTags.iframe = true;
 config.ignoreTags.embed = undefined;
 config.trustTags.embed = true;
 // #endif
-// #ifdef APP-PLUS-NVUE
+// #ifdef APP-NVUE
 config.ignoreTags.source = undefined;
 config.ignoreTags.style = undefined;
 // #endif
@@ -138,7 +138,7 @@ config.inlineTags = makeMap(
   "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
 );
 // #endif
-// #ifdef APP-PLUS
+// #ifdef APP
 // 行内标签配置（App）
 config.inlineTags = makeMap(
   "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
@@ -259,7 +259,7 @@ Parser.prototype.parse = function (content) {
  * @description 将标签暴露出来（不被 rich-text 包含）
  */
 Parser.prototype.expose = function () {
-  // #ifndef APP-PLUS-NVUE
+  // #ifndef APP-NVUE
   for (let i = this.stack.length; i--;) {
     const item = this.stack[i];
     if (
@@ -306,7 +306,7 @@ Parser.prototype.getUrl = function (url) {
       // 否则补充整个域名
       url = domain + url;
     } else {
-      // #ifdef APP-PLUS
+      // #ifdef APP
       url = plus.io.convertLocalFileSystemURL(url);
       // #endif
     }
@@ -314,7 +314,7 @@ Parser.prototype.getUrl = function (url) {
     if (domain) {
       url = domain + "/" + url;
     } else {
-      // #ifdef APP-PLUS
+      // #ifdef APP
       url = plus.io.convertLocalFileSystemURL(url);
       // #endif
     }
@@ -422,7 +422,7 @@ Parser.prototype.onTagName = function (name) {
  */
 Parser.prototype.onAttrName = function (name) {
   name = this.xml ? name : name.toLowerCase();
-  // #ifdef APP-PLUS-NVUE
+  // #ifdef APP-NVUE
   if (name.includes("?") || name.includes(";")) {
     this.attrName = undefined;
     return;
@@ -434,7 +434,7 @@ Parser.prototype.onAttrName = function (name) {
     return;
   }
   // #endif
-  // #ifdef APP-PLUS
+  // #ifdef APP
   if (name.includes("?") || name.includes(";")) {
     this.attrName = undefined;
     return;
@@ -505,7 +505,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
   // 转换 embed 标签
   if (node.name === "embed") {
     // #ifndef H5
-    // #ifndef APP-PLUS
+    // #ifndef APP
     const src = attrs.src || "";
     // 按照后缀名和 type 将 embed 转为 video 或 audio
     if (
@@ -533,12 +533,12 @@ Parser.prototype.onOpenTag = function (selfClose) {
     // #ifdef H5
     this.expose();
     // #endif
-    // #ifdef APP-PLUS
+    // #ifdef APP
     this.expose();
     // #endif
   }
 
-  // #ifndef APP-PLUS-NVUE
+  // #ifndef APP-NVUE
   // 处理音视频
   if (node.name === "video" || node.name === "audio") {
     // 设置 id 以便获取 context
@@ -571,7 +571,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
       if (node.name === "base" && !this.options.domain) {
         this.options.domain = attrs.href;
       } else {
-        // #ifndef APP-PLUS-NVUE
+        // #ifndef APP-NVUE
         if (
           node.name === "source" &&
           parent &&
@@ -623,7 +623,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
               styleObj.display = undefined;
             }
             // #ifndef H5
-            // #ifndef APP-PLUS
+            // #ifndef APP
             const style = item.attrs.style || "";
             if (
               style.includes("flex:") &&
@@ -669,7 +669,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
           let src = attrs["original-src"] || attrs.src;
           // #ifndef H5
           // #ifndef MP-ALIPAY
-          // #ifndef APP-PLUS
+          // #ifndef APP
           // #ifndef MP-360
           if (this.imgList.includes(src)) {
             // 如果有重复的链接则对域名进行随机大小写变换避免预览时错位
@@ -699,7 +699,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
             attrs.src = undefined;
           }
           // #endif
-          // #ifdef APP-PLUS
+          // #ifdef APP
           if (this.options.lazyLoad) {
             attrs["data-src"] = attrs.src;
             attrs.src = undefined;
@@ -710,7 +710,7 @@ Parser.prototype.onOpenTag = function (selfClose) {
       if (styleObj.display === "inline") {
         styleObj.display = "";
       }
-      // #ifndef APP-PLUS-NVUE
+      // #ifndef APP-NVUE
       if (attrs.ignore) {
         styleObj["max-width"] = styleObj["max-width"] || "100%";
         attrs.style += ";-webkit-touch-callout:none";
@@ -853,7 +853,7 @@ Parser.prototype.popNode = function () {
       this.xml--;
       return;
     }
-    // #ifdef APP-PLUS-NVUE
+    // #ifdef APP-NVUE
     (function traversal(node) {
       if (node.name) {
         // 调整 svg 的大小写
@@ -870,7 +870,7 @@ Parser.prototype.popNode = function () {
       }
     })(node);
     // #endif
-    // #ifndef APP-PLUS-NVUE
+    // #ifndef APP-NVUE
     let src = "";
     const style = attrs.style;
     attrs.style = "";
@@ -919,7 +919,7 @@ Parser.prototype.popNode = function () {
     return;
   }
 
-  // #ifndef APP-PLUS-NVUE
+  // #ifndef APP-NVUE
   // 转换 align 属性
   if (attrs.align) {
     if (node.name === "table") {
@@ -986,7 +986,7 @@ Parser.prototype.popNode = function () {
     styleObj["box-sizing"] = "border-box";
   }
 
-  // #ifndef APP-PLUS-NVUE
+  // #ifndef APP-NVUE
   if (config.blockTags[node.name]) {
     node.name = "div";
   } else if (!config.trustTags[node.name] && !this.xml) {
@@ -1005,7 +1005,7 @@ Parser.prototype.popNode = function () {
     this.expose();
   }
   // #endif
-  // #ifdef APP-PLUS
+  // #ifdef APP
   else if (node.name === "iframe") {
     this.expose();
   }
@@ -1014,7 +1014,7 @@ Parser.prototype.popNode = function () {
     if ((styleObj.height || "").includes("auto")) {
       styleObj.height = undefined;
     }
-    // #ifdef APP-PLUS
+    // #ifdef APP
     let str = '<video style="width:100%;height:100%"';
     for (const item in attrs) {
       if (attrs[item]) {
@@ -1340,7 +1340,7 @@ Parser.prototype.popNode = function () {
           traversal(child);
         }
         // #endif
-        // #ifdef APP-PLUS
+        // #ifdef APP
         if (
           child.name &&
           (config.inlineTags[child.name] ||
@@ -1403,7 +1403,7 @@ Parser.prototype.popNode = function () {
   for (const key in styleObj) {
     if (styleObj[key]) {
       const val = `;${key}:${styleObj[key].replace(" !important", "")}`;
-      // #ifndef APP-PLUS-NVUE
+      // #ifndef APP-NVUE
       if (
         flex &&
         ((key.includes("flex") && key !== "flex-direction") ||
@@ -1420,7 +1420,7 @@ Parser.prototype.popNode = function () {
         attrs.style += val;
       }
       // #endif
-      // #ifdef APP-PLUS-NVUE
+      // #ifdef APP-NVUE
       attrs.style += val;
       // #endif
     }

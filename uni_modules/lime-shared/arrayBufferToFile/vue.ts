@@ -36,7 +36,7 @@ export function arrayBufferToFile(buffer: ArrayBuffer | Blob, name?: string, for
 		resolve(file)
 		// #endif
 
-		// #ifdef APP-PLUS
+		// #ifdef APP
 		const bitmap = new plus.nativeObj.Bitmap('bitmap' + Date.now())
 		const base64 = uni.arrayBufferToBase64(buffer)
 		bitmap.loadBase64Data(base64, () => {

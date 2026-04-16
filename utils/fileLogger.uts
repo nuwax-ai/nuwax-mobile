@@ -1,6 +1,6 @@
 type FileLogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
-const LOG_DIR_NAME = "nuwax-logs";
+const LOG_DIR_NAME = "logs";
 const LOG_FILE_NAME = "sse-debug.log";
 const LOG_PREV_FILE_NAME = "sse-debug.prev.log";
 const LOG_ENABLED_KEY = "SSE_FILE_LOG_ENABLED";
@@ -40,7 +40,10 @@ class FileLogger {
   private dirPath: string = "";
   private filePath: string = "";
   private prevFilePath: string = "";
+  // 始终保留最近日志，便于文件写入失败时快速诊断
   private memoryFallback: string[] = [];
+  private pendingLines: string[] = [];
+  private flushing: boolean = false;
 
   private getFileSystem(): any {
     if (this.fs) return this.fs;
@@ -58,14 +61,23 @@ class FileLogger {
 
   private resolveBasePath(): string {
     try {
+      // uni-app x 使用 uni.env.USER_DATA_PATH
       const envObj = (uni as any).env;
       const userDataPath = String(envObj?.USER_DATA_PATH || "").trim();
+      console.log("[FileLogger] USER_DATA_PATH:", userDataPath);
       if (userDataPath.length > 0) {
         return normalizePath(userDataPath);
       }
-    } catch (e) {}
-    // APP 兜底路径
-    return "_doc/uni-store";
+    } catch (e) {
+      console.log("[FileLogger] Failed to get USER_DATA_PATH:", e);
+    }
+    // 兜底：直接访问 uni.env.USER_DATA_PATH
+    const fallback = uni.env.USER_DATA_PATH;
+    if (fallback != null && fallback.length > 0) {
+      return normalizePath(fallback);
+    }
+    console.log("[FileLogger] WARNING: USER_DATA_PATH unavailable, file logging disabled");
+    return "";
   }
 
   private ensureInitialized(): void {
@@ -81,16 +93,41 @@ class FileLogger {
     this.filePath = `${this.dirPath}/${LOG_FILE_NAME}`;
     this.prevFilePath = `${this.dirPath}/${LOG_PREV_FILE_NAME}`;
 
-    const fs = this.getFileSystem();
-    if (fs) {
-      try {
-        fs.mkdirSync(this.dirPath, true);
-      } catch (e) {
-        // 目录已存在或当前端不支持文件系统，忽略
-      }
-    }
+    this.ensureDir();
 
     this.initialized = true;
+  }
+
+  private ensureDir(): void {
+    const fs = this.getFileSystem();
+    if (!fs) return;
+
+    // 优先尝试同步创建目录
+    if (typeof fs.mkdirSync === "function") {
+      try {
+        fs.mkdirSync(this.dirPath, true);
+        return;
+      } catch (e) {}
+      try {
+        fs.mkdirSync({
+          dirPath: this.dirPath,
+          recursive: true,
+        });
+        return;
+      } catch (e) {}
+    }
+
+    // 同步不可用时，异步兜底
+    if (typeof fs.mkdir === "function") {
+      try {
+        fs.mkdir({
+          dirPath: this.dirPath,
+          recursive: true,
+          success: () => {},
+          fail: () => {},
+        });
+      } catch (e) {}
+    }
   }
 
   private pushMemoryFallback(line: string): void {
@@ -107,41 +144,202 @@ class FileLogger {
     const fs = this.getFileSystem();
     if (!fs) return;
 
+    if (typeof fs.statSync !== "function") return;
+
+    let size = 0;
     try {
       const statRes = fs.statSync(this.filePath);
-      const size = Number((statRes as any)?.size || 0);
-      if (size < MAX_LOG_BYTES) return;
+      size = Number((statRes as any)?.size || 0);
+    } catch (e) {
+      try {
+        const statRes = fs.statSync({
+          path: this.filePath,
+          recursive: false,
+        });
+        size = Number((statRes as any)?.size || 0);
+      } catch (e2) {
+        return;
+      }
+    }
 
+    if (size < MAX_LOG_BYTES) return;
+
+    if (typeof fs.unlinkSync === "function") {
       try {
         fs.unlinkSync(this.prevFilePath);
-      } catch (e) {}
+      } catch (e) {
+        try {
+          fs.unlinkSync({ filePath: this.prevFilePath });
+        } catch (e2) {}
+      }
+    }
+
+    if (typeof fs.renameSync === "function") {
       try {
         fs.renameSync(this.filePath, this.prevFilePath);
-      } catch (e) {}
-    } catch (e) {
-      // 文件不存在，忽略
+      } catch (e) {
+        try {
+          fs.renameSync({
+            oldPath: this.filePath,
+            newPath: this.prevFilePath,
+          });
+        } catch (e2) {}
+      }
     }
   }
 
-  private appendLine(line: string): void {
+  private tryAppendSync(fs: any, text: string): boolean {
+    if (typeof fs.appendFileSync !== "function") return false;
+    try {
+      fs.appendFileSync(this.filePath, text, "utf-8");
+      return true;
+    } catch (e) {}
+    try {
+      fs.appendFileSync({
+        filePath: this.filePath,
+        data: text,
+        encoding: "utf-8",
+      });
+      return true;
+    } catch (e) {}
+    return false;
+  }
+
+  private tryWriteSync(fs: any, text: string): boolean {
+    if (typeof fs.writeFileSync !== "function") return false;
+    try {
+      fs.writeFileSync(this.filePath, text, "utf-8");
+      return true;
+    } catch (e) {}
+    try {
+      fs.writeFileSync({
+        filePath: this.filePath,
+        data: text,
+        encoding: "utf-8",
+      });
+      return true;
+    } catch (e) {}
+    return false;
+  }
+
+  private writeFileAsync(fs: any, text: string, done: () => void): void {
+    if (typeof fs.writeFile !== "function") {
+      done();
+      return;
+    }
+    try {
+      fs.writeFile({
+        filePath: this.filePath,
+        data: text,
+        encoding: "utf-8",
+        success: () => {
+          done();
+        },
+        fail: () => {
+          done();
+        },
+      });
+      return;
+    } catch (e) {}
+    done();
+  }
+
+  private writeLine(line: string, done: () => void): void {
     this.ensureInitialized();
+    // 路径无效时跳过文件操作
+    if (this.dirPath.length === 0) {
+      done();
+      return;
+    }
+    this.ensureDir();
     this.rotateIfNeeded();
     const fs = this.getFileSystem();
     if (!fs) {
-      this.pushMemoryFallback(line);
+      done();
       return;
     }
 
-    try {
-      fs.appendFileSync(this.filePath, `${line}\n`, "utf8");
+    const text = `${line}\n`;
+    if (this.tryAppendSync(fs, text)) {
+      done();
       return;
-    } catch (appendError) {}
+    }
 
-    try {
-      fs.writeFileSync(this.filePath, `${line}\n`, "utf8");
+    // append 同步不可用时，优先尝试异步 append，失败再回退 write
+    if (typeof fs.appendFile === "function") {
+      try {
+        fs.appendFile({
+          filePath: this.filePath,
+          data: text,
+          encoding: "utf-8",
+          success: () => {
+            done();
+          },
+          fail: () => {
+            if (this.tryWriteSync(fs, text)) {
+              done();
+              return;
+            }
+            this.writeFileAsync(fs, text, done);
+          },
+        });
+        return;
+      } catch (e) {}
+    }
+
+    if (this.tryWriteSync(fs, text)) {
+      done();
       return;
-    } catch (writeError) {
-      this.pushMemoryFallback(line);
+    }
+
+    this.writeFileAsync(fs, text, done);
+  }
+
+  private flushQueue(): void {
+    if (this.flushing) return;
+    if (this.pendingLines.length === 0) return;
+
+    const nextLine = this.pendingLines.shift();
+    if (nextLine == null) {
+      this.flushing = false;
+      return;
+    }
+
+    this.flushing = true;
+    this.writeLine(nextLine, () => {
+      this.flushing = false;
+      if (this.pendingLines.length > 0) {
+        this.flushQueue();
+      }
+    });
+  }
+
+  private appendLine(line: string): void {
+    this.pendingLines.push(line);
+    this.flushQueue();
+  }
+
+  private unlinkFile(path: string): void {
+    const fs = this.getFileSystem();
+    if (!fs) return;
+    if (typeof fs.unlinkSync === "function") {
+      try {
+        fs.unlinkSync(path);
+        return;
+      } catch (e) {}
+      try {
+        fs.unlinkSync({ filePath: path });
+        return;
+      } catch (e) {}
+    }
+    if (typeof fs.unlink === "function") {
+      try {
+        fs.unlink({
+          filePath: path,
+          success: () => {},
+          fail: () => {},
+        });
+      } catch (e) {}
     }
   }
 
@@ -159,6 +357,7 @@ class FileLogger {
     this.ensureInitialized();
     if (!this.enabled) return;
     const line = buildLogLine(level, tag, message, payload);
+    this.pushMemoryFallback(line);
     this.appendLine(line);
   }
 
@@ -168,10 +367,22 @@ class FileLogger {
     if (!fs) {
       return this.memoryFallback.join("\n");
     }
-    try {
-      return (fs.readFileSync(this.filePath, "utf8") as string) || "";
-    } catch (e) {
+    if (typeof fs.readFileSync !== "function") {
       return this.memoryFallback.join("\n");
+    }
+    try {
+      return (fs.readFileSync(this.filePath, "utf-8") as string) || "";
+    } catch (e) {
+      try {
+        return (
+          fs.readFileSync({
+            filePath: this.filePath,
+            encoding: "utf-8",
+          }) || ""
+        );
+      } catch (e2) {
+        return this.memoryFallback.join("\n");
+      }
     }
   }
 
@@ -179,10 +390,20 @@ class FileLogger {
     this.ensureInitialized();
     const fs = this.getFileSystem();
     if (!fs) return "";
+    if (typeof fs.readFileSync !== "function") return "";
     try {
-      return (fs.readFileSync(this.prevFilePath, "utf8") as string) || "";
+      return (fs.readFileSync(this.prevFilePath, "utf-8") as string) || "";
     } catch (e) {
-      return "";
+      try {
+        return (
+          fs.readFileSync({
+            filePath: this.prevFilePath,
+            encoding: "utf-8",
+          }) || ""
+        );
+      } catch (e2) {
+        return "";
+      }
     }
   }
 
@@ -195,17 +416,10 @@ class FileLogger {
 
   clear(): void {
     this.ensureInitialized();
-    const fs = this.getFileSystem();
-    if (!fs) {
-      this.memoryFallback = [];
-      return;
-    }
-    try {
-      fs.unlinkSync(this.filePath);
-    } catch (e) {}
-    try {
-      fs.unlinkSync(this.prevFilePath);
-    } catch (e) {}
+    this.unlinkFile(this.filePath);
+    this.unlinkFile(this.prevFilePath);
+    this.pendingLines = [];
+    this.flushing = false;
     this.memoryFallback = [];
   }
 

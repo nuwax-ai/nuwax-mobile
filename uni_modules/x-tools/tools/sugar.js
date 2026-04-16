@@ -1,5 +1,14 @@
 export const log = console.log
-import { t } from '@/utils/i18n'
+// uni-app x: .js cannot import from .uts, use hardcoded fallbacks
+const _t = (key) => {
+	const defaults = {
+		'Mobile.ThirdParty.XTools.wechatUnsupported': 'WeChat is not supported',
+		'Mobile.ThirdParty.XTools.getServiceFailed': 'Failed to get service',
+		'Mobile.ThirdParty.XTools.saveSuccess': 'Saved successfully',
+		'Mobile.ThirdParty.XTools.saveFailed': 'Save failed',
+	}
+	return defaults[key] || key
+}
 
 export const upx2px = val => {
     const num = parseFloat(val)
@@ -103,11 +112,11 @@ export const toCustomerService = (corpId, url) => {
                 console.log("error", JSON.stringify(err))
             })
         } else {
-            plus.nativeUI.alert(t('Mobile.ThirdParty.XTools.wechatUnsupported'))
+            plus.nativeUI.alert(_t('Mobile.ThirdParty.XTools.wechatUnsupported'))
         }
     }, function() {
         uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.getServiceFailed'),
+            title: _t('Mobile.ThirdParty.XTools.getServiceFailed'),
             icon: 'error'
         })
     })
@@ -157,14 +166,14 @@ export const saveImage = async (url, tips = true) => {
         // #endif
 
         tips && uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.saveSuccess'),
+            title: _t('Mobile.ThirdParty.XTools.saveSuccess'),
             icon: 'success'
         })
     } catch (e) {
         console.log(e);
 
         tips && uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.saveFailed'),
+            title: _t('Mobile.ThirdParty.XTools.saveFailed'),
             icon: 'error'
         })
     }

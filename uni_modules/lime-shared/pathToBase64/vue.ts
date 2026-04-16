@@ -1,6 +1,6 @@
 // @ts-nocheck
 
-// #ifdef APP-PLUS
+// #ifdef APP
 import { getLocalFilePath } from '../getLocalFilePath'
 // #endif
 function isImage(extension : string) {
@@ -102,7 +102,7 @@ export function pathToBase64(path : string) : Promise<string> {
 		}
 		// #endif
 
-		// #ifdef APP-PLUS
+		// #ifdef APP
 		plus.io.resolveLocalFileSystemURL(getLocalFilePath(path), (entry) => {
 			entry.file((file : any) => {
 				const fileReader = new plus.io.FileReader()

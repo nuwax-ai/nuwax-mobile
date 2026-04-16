@@ -1,14 +1,8 @@
 <template>
   <view id="_root" :class="(selectable ? '_select ' : '') + '_root'" :style="containerStyle">
     <slot v-if="!nodes[0]" />
-    <!-- #ifndef APP-PLUS-NVUE -->
     <node v-else :childs="nodes" :processing-list="processingList"
       :opts="[lazyLoad, loadingImg, errorImg, showImgMenu, selectable]" name="span" />
-    <!-- #endif -->
-    <!-- #ifdef APP-PLUS-NVUE -->
-    <web-view ref="web" src="/static/app-plus/mp-html/local.html" :style="'margin-top:-2px;height:' + height + 'px'"
-      @onPostMessage="_onMessage" />
-    <!-- #endif -->
   </view>
 </template>
 
@@ -39,9 +33,7 @@
  * @event {Function} play 音视频播放时触发
  * @event {Function} error 媒体加载出错时触发
  */
-// #ifndef APP-PLUS-NVUE
 import node from './node/node.vue'
-// #endif
 import Parser from './parser.js'
 import markdownIt from './markdown-it/index.js'
 import highlight from './highlight/index.js'
@@ -50,17 +42,11 @@ import container from './container/index.js'
 // import markdown from './markdown/index.js'
 // const plugins = [markdown, highlight, latex,]
 const plugins = [markdownIt, highlight, latex, container]
-// #ifdef APP-PLUS-NVUE
-const dom = weex.requireModule('dom')
-// #endif
 export default {
   name: 'mp-html',
   data() {
     return {
-      nodes: [],
-      // #ifdef APP-PLUS-NVUE
-      height: 3
-      // #endif
+      nodes: []
     }
   },
   props: {
@@ -122,11 +108,9 @@ export default {
   // #ifdef VUE3
   emits: ['load', 'ready', 'imgtap', 'linktap', 'play', 'error'],
   // #endif
-  // #ifndef APP-PLUS-NVUE
   components: {
     node
   },
-  // #endif
   watch: {
     content(content) {
       this.setContent(content)
@@ -154,7 +138,6 @@ export default {
      * @param {String} scrollTop scroll-view scroll-top 属性绑定的变量名
      */
     in(page, selector, scrollTop) {
-      // #ifndef APP-PLUS-NVUE
       if (page && selector && scrollTop) {
         this._in = {
           page,
@@ -162,7 +145,6 @@ export default {
           scrollTop
         }
       }
-      // #endif
     },
 
     /**
@@ -179,30 +161,13 @@ export default {
           return
         }
         offset = offset || parseInt(this.useAnchor) || 0
-        // #ifdef APP-PLUS-NVUE
-        if (!id) {
-          dom.scrollToElement(this.$refs.web, {
-            offset
-          })
-          resolve()
-        } else {
-          this._navigateTo = {
-            resolve,
-            reject,
-            offset
-          }
-          this.$refs.web.evalJs('uni.postMessage({data:{action:"getOffset",offset:(document.getElementById(' + id + ')||{}).offsetTop}})')
-        }
-        // #endif
-        // #ifndef APP-PLUS-NVUE
+        // #ifndef MP-ALIPAY
         let deep = ' '
         // #ifdef MP-WEIXIN || MP-QQ || MP-TOUTIAO
         deep = '>>>'
         // #endif
         const selector = uni.createSelectorQuery()
-          // #ifndef MP-ALIPAY
           .in(this._in ? this._in.page : this)
-          // #endif
           .select((this._in ? this._in.selector : '._root') + (id ? `${deep}#${id}` : '')).boundingClientRect()
         if (this._in) {
           selector.select(this._in.selector).scrollOffset()
@@ -288,17 +253,6 @@ export default {
       for (let i = (this._videos || []).length; i--;) {
         this._videos[i].pause()
       }
-      // #ifdef APP-PLUS
-      const command = 'for(var e=document.getElementsByTagName("video"),i=e.length;i--;)e[i].pause()'
-      // #ifndef APP-PLUS-NVUE
-      let page = this.$parent
-      while (!page.$scope) page = page.$parent
-      page.$scope.$getAppWebview().evalJS(command)
-      // #endif
-      // #ifdef APP-PLUS-NVUE
-      this.$refs.web.evalJs(command)
-      // #endif
-      // #endif
     },
 
     /**
@@ -310,17 +264,6 @@ export default {
       for (let i = (this._videos || []).length; i--;) {
         this._videos[i].playbackRate(rate)
       }
-      // #ifdef APP-PLUS
-      const command = 'for(var e=document.getElementsByTagName("video"),i=e.length;i--;)e[i].playbackRate=' + rate
-      // #ifndef APP-PLUS-NVUE
-      let page = this.$parent
-      while (!page.$scope) page = page.$parent
-      page.$scope.$getAppWebview().evalJS(command)
-      // #endif
-      // #ifdef APP-PLUS-NVUE
-      this.$refs.web.evalJs(command)
-      // #endif
-      // #endif
     },
 
     /**
@@ -333,14 +276,8 @@ export default {
         this.imgList = []
       }
       const nodes = new Parser(this).parse(content)
-      // #ifdef APP-PLUS-NVUE
-      if (this._ready) {
-        this._set(nodes, append)
-      }
-      // #endif
       this.$set(this, 'nodes', append ? (this.nodes || []).concat(nodes) : nodes)
 
-      // #ifndef APP-PLUS-NVUE
       this._videos = []
       this.$nextTick(() => {
         this._hook('onLoad')
@@ -373,7 +310,6 @@ export default {
           })
         }
       }
-      // #endif
     },
 
     /**
@@ -387,119 +323,12 @@ export default {
       }
     },
 
-    // #ifdef APP-PLUS-NVUE
-    /**
-     * @description 设置内容
-     */
-    _set(nodes, append) {
-      this.$refs.web.evalJs('setContent(' + JSON.stringify(nodes).replace(/%22/g, '') + ',' + JSON.stringify([this.containerStyle.replace(/(?:margin|padding)[^;]+/g, ''), this.errorImg, this.loadingImg, this.pauseVideo, this.scrollTable, this.selectable]) + ',' + append + ')')
-    },
-
-    /**
-     * @description 接收到 web-view 消息
-     */
-    _onMessage(e) {
-      const message = e.detail.data[0]
-      switch (message.action) {
-        // web-view 初始化完毕
-        case 'onJSBridgeReady':
-          this._ready = true
-          if (this.nodes) {
-            this._set(this.nodes)
-          }
-          break
-        // 内容 dom 加载完毕
-        case 'onLoad':
-          this.height = message.height
-          this._hook('onLoad')
-          this.$emit('load')
-          break
-        // 所有图片加载完毕
-        case 'onReady':
-          this.getRect().then(res => {
-            this.$emit('ready', res)
-          }).catch(() => {
-            this.$emit('ready', {})
-          })
-          break
-        // 总高度发生变化
-        case 'onHeightChange':
-          this.height = message.height
-          break
-        // 图片点击
-        case 'onImgTap':
-          this.$emit('imgtap', message.attrs)
-          if (this.previewImg) {
-            uni.previewImage({
-              current: parseInt(message.attrs.i),
-              urls: this.imgList
-            })
-          }
-          break
-        // 链接点击
-        case 'onLinkTap': {
-          const href = message.attrs.href
-          this.$emit('linktap', message.attrs)
-          if (href) {
-            // 锚点跳转
-            if (href[0] === '#') {
-              if (this.useAnchor) {
-                dom.scrollToElement(this.$refs.web, {
-                  offset: message.offset
-                })
-              }
-            } else if (href.includes('://')) {
-              // 打开外链
-              if (this.copyLink) {
-                plus.runtime.openWeb(href)
-              }
-            } else {
-              uni.navigateTo({
-                url: href,
-                fail() {
-                  uni.switchTab({
-                    url: href
-                  })
-                }
-              })
-            }
-          }
-          break
-        }
-        case 'onPlay':
-          this.$emit('play')
-          break
-        // 获取到锚点的偏移量
-        case 'getOffset':
-          if (typeof message.offset === 'number') {
-            dom.scrollToElement(this.$refs.web, {
-              offset: message.offset + this._navigateTo.offset
-            })
-            this._navigateTo.resolve()
-          } else {
-            this._navigateTo.reject(Error('Label not found'))
-          }
-          break
-        // 点击
-        case 'onClick':
-          this.$emit('tap')
-          this.$emit('click')
-          break
-        // 出错
-        case 'onError':
-          this.$emit('error', {
-            source: message.source,
-            attrs: message.attrs
-          })
-      }
-    }
-    // #endif
+    // NVUE web-view mode removed - not needed in uni-app x
   }
 }
 </script>
 
 <style>
-/* #ifndef APP-PLUS-NVUE */
 /* 根节点样式 */
 ._root {
   padding: 1px 0;
@@ -514,6 +343,4 @@ export default {
 ._select {
   user-select: text;
 }
-
-/* #endif */
 </style>

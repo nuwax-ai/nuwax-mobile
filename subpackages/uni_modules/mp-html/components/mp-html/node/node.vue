@@ -17,7 +17,7 @@
         mode="widthFix"
       />
       <!-- 显示图片 -->
-      <!-- #ifdef H5 || (APP-PLUS && VUE2) -->
+      <!-- #ifdef H5 -->
       <img
         v-if="n.name === 'img'"
         :id="n.attrs.id"
@@ -31,7 +31,7 @@
         @longpress="imgLongTap"
       />
       <!-- #endif -->
-      <!-- #ifndef H5 || (APP-PLUS && VUE2) -->
+      <!-- #ifndef H5 -->
       <!-- 表格中的图片，使用 rich-text 防止大小不正确 -->
       <rich-text
         v-if="n.name === 'img' && n.t"
@@ -67,7 +67,7 @@
         @longpress="imgLongTap"
       />
       <!-- #endif -->
-      <!-- #ifndef H5 || APP-PLUS || MP-KUAISHOU -->
+      <!-- #ifndef H5 || MP-KUAISHOU -->
       <image
         v-else-if="n.name === 'img'"
         :id="n.attrs.id"
@@ -106,27 +106,6 @@
         @tap.stop="imgTap"
       ></image>
       <!-- #endif -->
-      <!-- #ifdef APP-PLUS && VUE3 -->
-      <image
-        v-else-if="n.name === 'img'"
-        :id="n.attrs.id"
-        :class="'_img ' + n.attrs.class"
-        :style="
-          (ctrl[i] === -1 ? 'display:none;' : '') +
-          'width:' +
-          (ctrl[i] || 1) +
-          'px;' +
-          n.attrs.style
-        "
-        :src="n.attrs.src || (ctrl.load ? n.attrs['data-src'] : '')"
-        :mode="!n.h ? 'widthFix' : !n.w ? 'heightFix' : n.m || ''"
-        :data-i="i"
-        @load="imgLoad"
-        @error="mediaError"
-        @tap.stop="imgTap"
-        @longpress="imgLongTap"
-      />
-      <!-- #endif -->
       <!-- 文本 -->
       <!-- #ifdef MP-WEIXIN -->
       <text
@@ -158,18 +137,6 @@
         />
       </view>
       <!-- 视频 -->
-      <!-- #ifdef APP-PLUS -->
-      <view
-        v-else-if="n.html"
-        :id="n.attrs.id"
-        :class="'_video ' + n.attrs.class"
-        :style="n.attrs.style"
-        v-html="n.html"
-        :data-i="i"
-        @vplay.stop="play"
-      />
-      <!-- #endif -->
-      <!-- #ifndef APP-PLUS -->
       <video
         v-else-if="n.name === 'video'"
         :id="n.attrs.id"
@@ -186,8 +153,7 @@
         @play="play"
         @error="mediaError"
       />
-      <!-- #endif -->
-      <!-- #ifdef H5 || APP-PLUS -->
+      <!-- #ifdef H5 || APP -->
       <iframe
         v-else-if="n.name === 'iframe'"
         :style="n.attrs.style"
@@ -201,7 +167,7 @@
         :src="n.attrs.src"
       />
       <!-- #endif -->
-      <!-- #ifndef MP-TOUTIAO || ((H5 || APP-PLUS) && VUE3) -->
+      <!-- #ifndef MP-TOUTIAO || H5 -->
       <!-- 音频 -->
       <audio
         v-else-if="n.name === 'audio'"
@@ -275,7 +241,7 @@
         :conversation-id="getConversationId()"
       />
       <!-- 富文本 -->
-      <!-- #ifdef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
+      <!-- #ifdef H5 -->
       <rich-text
         v-else-if="!n.c && (n.l || !isInline(n.name, n.attrs.style))"
         :id="n.attrs.id"
@@ -285,7 +251,7 @@
         @tap="copyCode"
       />
       <!-- #endif -->
-      <!-- #ifndef H5 || ((MP-WEIXIN || MP-QQ || APP-PLUS || MP-360) && VUE2) -->
+      <!-- #ifndef H5 -->
       <!-- hl-language 头部节点：将 rich-text 和原生复制按钮并排在同一行，避免给对布局的依赖 -->
       <view
         v-else-if="
@@ -393,7 +359,7 @@
       this.$nextTick(() => {
         for (this.root = this.$parent; this.root.$options.name !== 'mp-html'; this.root = this.root.$parent);
       })
-      // #ifdef H5 || APP-PLUS
+      // #ifdef H5 || APP
       if (this.opts[0]) {
         let i
         for (i = this.childs.length; i--;) {
@@ -415,7 +381,7 @@
       // #endif
     },
     beforeDestroy () {
-      // #ifdef H5 || APP-PLUS
+      // #ifdef H5 || APP
       if (this.observer) {
         this.observer.disconnect()
       }
@@ -497,7 +463,7 @@
             src: node.src[this.ctrl[i] || 0]
           }
         })
-        // #ifndef APP-PLUS
+        // #ifndef H5
         if (this.root.pauseVideo) {
           let flag = false
           const id = e.target.id
@@ -536,7 +502,7 @@
           return
         }
         if (node.attrs.ignore) return
-        // #ifdef H5 || APP-PLUS
+        // #ifdef H5 || APP
         node.attrs.src = node.attrs.src || node.attrs['data-src']
         // #endif
         // #ifndef APP-HARMONY
@@ -567,7 +533,7 @@
        * @description 图片长按
        */
       imgLongTap (e) {
-        // #ifdef APP-PLUS
+        // #ifdef APP
         const attrs = this.childs[e.currentTarget.dataset.i].attrs
         if (this.opts[3] && !attrs.ignore) {
           uni.showActionSheet({
@@ -601,7 +567,7 @@
        */
       imgLoad (e) {
         const i = e.currentTarget.dataset.i
-        /* #ifndef H5 || (APP-PLUS && VUE2) */
+        /* #ifndef H5 */
         if (!this.childs[i].w) {
           // 设置原宽度
           this.$set(this.ctrl, i, e.detail.width)
@@ -657,8 +623,11 @@
                 success: () => this.showTextToast(t('Mobile.Link.copied'))
               })
               // #endif
-              // #ifdef APP-PLUS
-              plus.runtime.openWeb(href)
+              // #ifdef APP
+              uni.setClipboardData({
+                data: href,
+                success: () => this.showTextToast(t('Mobile.Link.copied'))
+              })
               // #endif
             }
           } else {
@@ -762,7 +731,7 @@
             return
           }
         } else if (node.name === 'img') {
-          // #ifdef H5 && VUE3
+          // #ifdef H5
           if (this.opts[0] && !this.ctrl.load) return
           // #endif
           // 显示错误占位图
@@ -775,7 +744,7 @@
           this.root.$emit('error', {
             source: node.name,
             attrs: node.attrs,
-            // #ifndef H5 && VUE3
+            // #ifndef H5
             errMsg: e.detail.errMsg
             // #endif
           })

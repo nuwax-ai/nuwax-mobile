@@ -45,13 +45,15 @@
 		// #endif
 	}, 16)
 
-	import {
-		initVueI18n
-	} from '@dcloudio/uni-i18n'
-	import messages from './i18n/index.js'
-	const {
-		t
-	} = initVueI18n(messages)
+	// uni-app x does not support @dcloudio/uni-i18n, use simple fallback
+	const i18nMessages = {
+		"uni-load-more.contentdown": "Pull up to load more",
+		"uni-load-more.contentrefresh": "Loading...",
+		"uni-load-more.contentnomore": "No more data"
+	}
+	const translate = (key) => {
+		return i18nMessages[key] || key
+	}
 
 	/**
 	 * LoadMore 加载更多
@@ -123,26 +125,29 @@
 				return (Math.floor(this.iconSize / 24) || 1) * 2
 			},
 			contentdownText() {
-				return this.contentText.contentdown || t("uni-load-more.contentdown")
+				return this.contentText.contentdown || translate("uni-load-more.contentdown")
 			},
 			contentrefreshText() {
-				return this.contentText.contentrefresh || t("uni-load-more.contentrefresh")
+				return this.contentText.contentrefresh || translate("uni-load-more.contentrefresh")
 			},
 			contentnomoreText() {
-				return this.contentText.contentnomore || t("uni-load-more.contentnomore")
+				return this.contentText.contentnomore || translate("uni-load-more.contentnomore")
 			}
 		},
 		mounted() {
-			// #ifdef APP-PLUS
-			var pages = getCurrentPages();
-			var page = pages[pages.length - 1];
-			var currentWebview = page.$getAppWebview();
-			currentWebview.addEventListener('hide', () => {
-				this.webviewHide = true
-			})
-			currentWebview.addEventListener('show', () => {
-				this.webviewHide = false
-			})
+			// #ifdef APP
+			const onAppHide = uni.onAppHide
+			const onAppShow = uni.onAppShow
+			if (typeof onAppHide === 'function') {
+				onAppHide(() => {
+					this.webviewHide = true
+				})
+			}
+			if (typeof onAppShow === 'function') {
+				onAppShow(() => {
+					this.webviewHide = false
+				})
+			}
 			// #endif
 		},
 		methods: {

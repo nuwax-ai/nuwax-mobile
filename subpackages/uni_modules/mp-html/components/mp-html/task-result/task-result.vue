@@ -21,7 +21,7 @@
   import {
     getFileProxyUrlByConversationIdAndFilePath,
     jumpToFilePreviewPage,
-  } from "@/utils/system.uts";
+  } from "@/utils/system";
 
   export default {
     name: "TaskResult",

@@ -54,6 +54,8 @@
 </template>
 
 <script setup lang="ts">
+  import { ref } from 'vue';
+  import { onLoad } from "@dcloudio/uni-app";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { apiUserInfo, apiUserDynamicCode } from "@/servers/account";
   import type { UserInfo } from "@/types/interfaces/login";

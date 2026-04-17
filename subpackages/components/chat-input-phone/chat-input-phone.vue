@@ -230,6 +230,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
   import SkillSelectModal from "./skill-select-modal/skill-select-modal.vue";
   import SkillTagsBar from "./skill-tags-bar/skill-tags-bar.vue";
   import { SkillInfoForAt } from "@/types/interfaces/skill";

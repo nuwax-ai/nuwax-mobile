@@ -84,6 +84,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, computed, nextTick } from 'vue';
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { apiUserInfo } from "@/servers/account";
   import type { AgentInfo } from "@/types/interfaces/agent";
@@ -92,7 +93,7 @@
   import ConversationListContent from "./conversation-list-content/conversation-list-content.vue";
   import type { UserInfo } from "@/types/interfaces/login";
   import { apiTenantConfig } from "@/servers/account";
-  import { onAddToFavorites } from "@dcloudio/uni-app";
+  import { onLoad, onShow, onHide, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
   import {
     getCurrentPagePath,
     jumpToAgentDetailPage,
@@ -249,7 +250,7 @@
     setCurrentShareTitle();
   });
 
-  onPageShow(async () => {
+  onShow(async () => {
     // 确保每次回到首页都刷新一次 TabBar 翻译，
     // 解决语言切换重载后 TabBar 对象可能未就绪导致 uni.setTabBarItem 失效的问题。
     applyTabBarI18n();

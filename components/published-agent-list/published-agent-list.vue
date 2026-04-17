@@ -160,6 +160,8 @@
 </template>
 
 <script setup lang="ts">
+  import { ref } from 'vue';
+  import { onShow, onUnload } from "@dcloudio/uni-app";
   import { CONST_ALL } from "@/constants/common.constants";
   import { SquarePublishedItemInfo } from "@/types/interfaces/square";
   import { apiPublishedCategoryList } from "@/servers/square";
@@ -374,7 +376,7 @@
     }
   };
 
-  onPageShow(() => {
+  onShow(() => {
     // isFirstLoad.value = true
     initData();
     // 预加载第一个分类的数据

@@ -47,7 +47,8 @@
 </template>
 
 <script setup lang="ts">
-  import { onAddToFavorites } from "@dcloudio/uni-app";
+  import { ref } from 'vue';
+  import { onLoad, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
   import {
     parseUrlInfo,
     getFileName,

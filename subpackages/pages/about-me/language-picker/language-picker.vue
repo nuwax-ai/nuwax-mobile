@@ -18,6 +18,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, computed } from 'vue';
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { useI18n, normalizeLang } from "@/utils/i18n";
   import { RadioListItem } from "@/types/interfaces/radio";

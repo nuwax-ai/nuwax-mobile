@@ -301,6 +301,8 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
+  import { onLoad } from "@dcloudio/uni-app";
   // ==================== 导入模块 ====================
   // AI 消息组件
   import AiMsg from "@/subpackages/components/ai-msg/ai-msg.vue";

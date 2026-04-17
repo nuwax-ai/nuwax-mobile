@@ -25,7 +25,7 @@
   import { NO_LOGIN_CHECK_URL } from "@/constants/config";
   import { apiUserTicketCreate } from "@/servers/agentDev";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { onAddToFavorites } from "@dcloudio/uni-app";
+  import { onLoad, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
   import { isHttpUrl } from "@/utils/common";
   import { isTabPage } from "@/utils/commonBusiness";
   import { useI18n } from "@/utils/i18n";

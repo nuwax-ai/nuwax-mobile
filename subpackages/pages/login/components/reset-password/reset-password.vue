@@ -30,6 +30,7 @@
 </template>
 
 <script lang="ts" setup>
+    import { ref } from 'vue';
     import { apiSetPassword } from '@/servers/account'
     import { SUCCESS_CODE } from '@/constants/codes.constants'
     import type { ResetPasswordParams } from '@/types/interfaces/login'

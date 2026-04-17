@@ -113,6 +113,8 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, computed, nextTick, onMounted } from 'vue';
+  import { onLoad, onReady, onShow } from '@dcloudio/uni-app';
   import { apiPublishedAgentList } from '@/servers/square'
   import { apiUserUsedAgentList } from '@/servers/agentDev'
   import { SquarePublishedListParams, SquarePublishedItemInfo } from '@/types/interfaces/square'

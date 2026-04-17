@@ -12,6 +12,8 @@
 
 <script setup lang="ts">
 	import ChatConversationComponent from '@/subpackages/pages/chat-conversation-component/chat-conversation-component.vue'
+	import { ref, reactive } from 'vue';
+	import { onLoad } from "@dcloudio/uni-app";
 
   // 历史会话弹框
   import HistoryConversationPopup  from './history-conversation-popup/history-conversation-popup.vue'

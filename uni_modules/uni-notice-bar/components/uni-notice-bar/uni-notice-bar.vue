@@ -243,7 +243,10 @@
         return this.isFlagTrue(this.single);
       },
       hasMoreText() {
-        return typeof this.moreText === "string" && this.moreText.length > 0;
+        if (typeof this.moreText !== "string") {
+          return false;
+        }
+        return this.moreText.length > 0;
       },
       useSingleWrapperClass() {
         if (this.isScrollable === true) {
@@ -401,13 +404,12 @@
           // #endif
         }
         // #ifdef APP-NVUE
-        if (
-          this.isScrollable === false &&
-          this.useSingleWrapperClass === true
-        ) {
-          dom.getComponentRect(this.$refs["textBox"], (res) => {
-            this.wrapWidth = res.size.width;
-          });
+        if (this.isScrollable === false) {
+          if (this.useSingleWrapperClass === true) {
+            dom.getComponentRect(this.$refs["textBox"], (res) => {
+              this.wrapWidth = res.size.width;
+            });
+          }
         }
         // #endif
       },

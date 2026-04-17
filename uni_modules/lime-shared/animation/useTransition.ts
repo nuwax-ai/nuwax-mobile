@@ -1,7 +1,7 @@
 // @ts-nocheck
 import type { ComponentPublicInstance, Ref } from 'vue'
 import { ease, linear } from './ease';
-import { Timeline, Animation } from './';
+import { Timeline, Animation } from './index';
 export type UseTransitionOptions = {
 	duration ?: number
 	immediate ?: boolean

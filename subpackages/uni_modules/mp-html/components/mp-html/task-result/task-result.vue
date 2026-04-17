@@ -48,17 +48,30 @@
       },
       // 显示文本：优先显示描述，其次显示文件名
       displayText() {
-        return this.description || this.fileName || "查看结果";
+        if (this.hasText(this.description)) {
+          return this.description;
+        }
+        if (this.hasText(this.fileName)) {
+          return this.fileName;
+        }
+        return "查看结果";
       },
     },
     methods: {
+      hasText(value) {
+        return typeof value === "string" && value.length > 0;
+      },
+
       /**
        * 从子节点中提取指定类型的文本内容
        * @param tagName 标签名
        * @returns 文本内容
        */
       extractChildText(tagName) {
-        const children = this.data?.children || [];
+        const sourceData = this.data == null ? {} : this.data;
+        const children = Array.isArray(sourceData.children)
+          ? sourceData.children
+          : [];
 
         for (const child of children) {
           if (child.name === tagName) {
@@ -76,15 +89,15 @@
        * @returns 文本内容
        */
       getTextContent(node) {
-        if (!node) return "";
+        if (node == null) return "";
 
         // 如果是文本节点
         if (node.type === "text") {
-          return node.text || "";
+          return typeof node.text === "string" ? node.text : "";
         }
 
         // 如果有子节点，递归处理
-        if (node.children && Array.isArray(node.children)) {
+        if (Array.isArray(node.children)) {
           return node.children
             .map((child) => this.getTextContent(child))
             .join("");
@@ -99,13 +112,18 @@
       async handleClick() {
         let conversationId = String(this.conversationId);
         // 移除 chat- 前缀，因为页面参数使用的是纯数字ID
-        if (conversationId && conversationId.startsWith("chat-")) {
+        if (
+          this.hasText(conversationId) &&
+          conversationId.startsWith("chat-")
+        ) {
           conversationId = conversationId.replace("chat-", "");
         }
 
-        if (conversationId) {
+        if (this.hasText(conversationId)) {
           try {
-            const fileId = this.fileName.split(`${conversationId}/`).pop();
+            const fileName = this.hasText(this.fileName) ? this.fileName : "";
+            const fileIdPart = fileName.split(`${conversationId}/`).pop();
+            const fileId = typeof fileIdPart === "string" ? fileIdPart : "";
             const fileProxyUrl =
               await getFileProxyUrlByConversationIdAndFilePath(
                 conversationId,

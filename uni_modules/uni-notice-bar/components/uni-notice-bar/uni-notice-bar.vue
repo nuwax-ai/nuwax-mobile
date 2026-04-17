@@ -5,7 +5,7 @@
     :style="{ backgroundColor }"
     @click="onClick"
   >
-    <slot v-if="showIcon === true || showIcon === 'true'" name="noticebarIcon">
+    <slot v-if="isShowIcon" name="noticebarIcon">
       <uni-icons
         v-if="false"
         class="uni-noticebar-icon"
@@ -36,18 +36,17 @@
       ref="textBox"
       class="uni-noticebar__content-wrapper"
       :class="{
-        'uni-noticebar__content-wrapper--scrollable': scrollable,
-        'uni-noticebar__content-wrapper--single':
-          !scrollable && (single || moreText),
+        'uni-noticebar__content-wrapper--scrollable': isScrollable,
+        'uni-noticebar__content-wrapper--single': useSingleWrapperClass,
       }"
-      :style="{ height: scrollable ? fontSize * 1.5 + 'px' : 'auto' }"
+      :style="{ height: isScrollable ? fontSize * 1.5 + 'px' : 'auto' }"
     >
       <view
         :id="elIdBox"
         class="uni-noticebar__content"
         :class="{
-          'uni-noticebar__content--scrollable': scrollable,
-          'uni-noticebar__content--single': !scrollable && (single || moreText),
+          'uni-noticebar__content--scrollable': isScrollable,
+          'uni-noticebar__content--single': useSingleContentClass,
         }"
       >
         <text
@@ -55,9 +54,8 @@
           ref="animationEle"
           class="uni-noticebar__content-text"
           :class="{
-            'uni-noticebar__content-text--scrollable': scrollable,
-            'uni-noticebar__content-text--single':
-              !scrollable && (single || showGetMore),
+            'uni-noticebar__content-text--scrollable': isScrollable,
+            'uni-noticebar__content-text--single': useSingleTextClass,
           }"
           :style="{
             color: color,
@@ -235,14 +233,53 @@
       },
     },
     computed: {
+      isShowIcon() {
+        return this.isFlagTrue(this.showIcon);
+      },
+      isScrollable() {
+        return this.isFlagTrue(this.scrollable);
+      },
+      isSingle() {
+        return this.isFlagTrue(this.single);
+      },
+      hasMoreText() {
+        return typeof this.moreText === "string" && this.moreText.length > 0;
+      },
+      useSingleWrapperClass() {
+        if (this.isScrollable === true) {
+          return false;
+        }
+        if (this.isSingle === true) {
+          return true;
+        }
+        return this.hasMoreText === true;
+      },
+      useSingleContentClass() {
+        if (this.isScrollable === true) {
+          return false;
+        }
+        if (this.isSingle === true) {
+          return true;
+        }
+        return this.hasMoreText === true;
+      },
+      useSingleTextClass() {
+        if (this.isScrollable === true) {
+          return false;
+        }
+        if (this.isSingle === true) {
+          return true;
+        }
+        return this.isShowGetMore === true;
+      },
       isShowGetMore() {
-        return this.showGetMore === true || this.showGetMore === "true";
+        return this.isFlagTrue(this.showGetMore);
       },
       isShowClose() {
-        return (
-          (this.showClose === true || this.showClose === "true") &&
-          (this.showGetMore === false || this.showGetMore === "false")
-        );
+        if (this.isFlagTrue(this.showClose) === false) {
+          return false;
+        }
+        return this.isFlagFalse(this.showGetMore);
       },
     },
     mounted() {
@@ -270,8 +307,20 @@
     },
     // #endif
     methods: {
+      isFlagTrue(value) {
+        if (value === true) {
+          return true;
+        }
+        return value === "true";
+      },
+      isFlagFalse(value) {
+        if (value === false) {
+          return true;
+        }
+        return value === "false";
+      },
       initSize() {
-        if (this.scrollable) {
+        if (this.isScrollable === true) {
           // #ifndef APP-NVUE
           let query = [],
             boxWidth = 0,
@@ -327,7 +376,7 @@
                 delay: 0,
               },
               () => {
-                if (!this.stopAnimation) {
+                if (this.stopAnimation === false) {
                   animation.transition(
                     this.$refs["animationEle"],
                     {
@@ -340,7 +389,7 @@
                       delay: 1000,
                     },
                     () => {
-                      if (!this.stopAnimation) {
+                      if (this.stopAnimation === false) {
                         this.loopAnimation();
                       }
                     },
@@ -352,7 +401,10 @@
           // #endif
         }
         // #ifdef APP-NVUE
-        if (!this.scrollable && (this.single || this.moreText)) {
+        if (
+          this.isScrollable === false &&
+          this.useSingleWrapperClass === true
+        ) {
           dom.getComponentRect(this.$refs["textBox"], (res) => {
             this.wrapWidth = res.size.width;
           });
@@ -370,7 +422,7 @@
             duration: 0,
           },
           () => {
-            if (!this.stopAnimation) {
+            if (this.stopAnimation === false) {
               animation.transition(
                 this.$refs["animationEle"],
                 {
@@ -382,7 +434,7 @@
                   delay: 0,
                 },
                 () => {
-                  if (!this.stopAnimation) {
+                  if (this.stopAnimation === false) {
                     this.loopAnimation();
                   }
                 },

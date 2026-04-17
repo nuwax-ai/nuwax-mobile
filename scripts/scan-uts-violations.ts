@@ -28,6 +28,17 @@ interface ScanResult {
   byFile: Record<string, number>;
 }
 
+function getBraceDelta(line: string): number {
+  // 粗略去除字符串字面量，避免统计到字符串中的花括号
+  const noStringLine = line
+    .replace(/'[^'\\]*(?:\\.[^'\\]*)*'/g, '')
+    .replace(/"[^"\\]*(?:\\.[^"\\]*)*"/g, '')
+    .replace(/`[^`\\]*(?:\\.[^`\\]*)*`/g, '');
+  const openCount = (noStringLine.match(/{/g) || []).length;
+  const closeCount = (noStringLine.match(/}/g) || []).length;
+  return openCount - closeCount;
+}
+
 /**
  * 检测单个文件的违规项
  */
@@ -36,13 +47,29 @@ function scanFile(filePath: string): Violation[] {
   const lines = content.split('\n');
   const violations: Violation[] = [];
   const isVue = filePath.endsWith('.uvue');
+  let inTypeDeclaration = false;
+  let typeBraceDepth = 0;
 
   lines.forEach((line, index) => {
     const lineNum = index + 1;
     const trimmedLine = line.trim();
+    const braceDelta = getBraceDelta(line);
+    const isTypeDeclarationStart =
+      /^\s*(export\s+)?interface\s+\w+/.test(trimmedLine) ||
+      /^\s*(export\s+)?type\s+\w+\s*=\s*\{/.test(trimmedLine);
 
     // 跳过注释行
     if (trimmedLine.startsWith('//') || trimmedLine.startsWith('*') || trimmedLine.startsWith('/*')) {
+      if (isTypeDeclarationStart) {
+        inTypeDeclaration = true;
+        typeBraceDepth = braceDelta;
+      } else if (inTypeDeclaration) {
+        typeBraceDepth += braceDelta;
+        if (typeBraceDepth <= 0) {
+          inTypeDeclaration = false;
+          typeBraceDepth = 0;
+        }
+      }
       return;
     }
 
@@ -140,6 +167,20 @@ function scanFile(filePath: string): Violation[] {
 
     // ===== UTS110111101: 行内对象字面量类型 =====
 
+    // interface/type 内的属性行内对象类型（如: categoryItems: {）
+    const inlinePropObjectTypeMatch = line.match(/^\s*[a-zA-Z_]\w*\??\s*:\s*\{\s*$/);
+    if (inlinePropObjectTypeMatch && inTypeDeclaration) {
+      violations.push({
+        file: filePath,
+        line: lineNum,
+        column: inlinePropObjectTypeMatch.index! + 1,
+        type: 'UTS110111101',
+        code: line.trim(),
+        message: 'Inline object literal type in interface/type property',
+        fix: 'Extract to named type or Record<...>, then reference it by name'
+      });
+    }
+
     // 函数参数中的行内对象类型
     const paramMatch = line.match(/(?:function|fn|async\s+function)?\s*\w+\s*\([^)]*:\s*{/);
     if (paramMatch && !line.includes('//')) { // 排除注释
@@ -212,6 +253,17 @@ function scanFile(filePath: string): Violation[] {
           message: 'Inline index signature type',
           fix: 'Extract to: type MyMap = { [key: string]: ... };'
         });
+      }
+    }
+
+    if (isTypeDeclarationStart) {
+      inTypeDeclaration = true;
+      typeBraceDepth = braceDelta;
+    } else if (inTypeDeclaration) {
+      typeBraceDepth += braceDelta;
+      if (typeBraceDepth <= 0) {
+        inTypeDeclaration = false;
+        typeBraceDepth = 0;
       }
     }
   });

@@ -57,7 +57,8 @@
     CategoryInfo,
     CategoryItemInfo,
   } from "@/types/interfaces/agentConfig";
-  import { onAddToFavorites } from "@dcloudio/uni-app";
+  import { ref, reactive } from 'vue';
+  import { onLoad, onShow, onAddToFavorites } from "@dcloudio/uni-app";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { useI18n } from "@/utils/i18n";
 
@@ -118,7 +119,7 @@
     }
   };
 
-  onPageShow((options) => {
+  onShow((options) => {
     if (isFirstLoad.value) {
       isFirstLoad.value = false;
       return;

@@ -45,7 +45,8 @@
 import { apiWechatLogin } from "@/servers/account";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { redirectTo } from "@/utils/common";
-import { ref } from "vue";
+import { ref, onMounted } from "vue";
+import { onLoad } from "@dcloudio/uni-app";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import AgreementCheckbox from "@/components/agreement-checkbox/agreement-checkbox.vue";
 import { apiTenantConfig } from "@/servers/account";

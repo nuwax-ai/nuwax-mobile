@@ -25,7 +25,8 @@
 
 <script setup lang="ts">
   import LoginLayout from "./components/login-layout/login-layout.vue";
-  import { ref } from "vue";
+  import { ref, onMounted } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
   import { apiLogin } from "@/servers/account";
   import type { ILoginResult, LoginFieldType } from "@/types/interfaces/login";
   import { SUCCESS_CODE, AGENT_NOT_EXIST } from "@/constants/codes.constants";

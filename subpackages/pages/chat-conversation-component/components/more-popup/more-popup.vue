@@ -71,6 +71,7 @@
 
 <script setup lang="ts">
   import { ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
   import MoreInfo from "../more-info/more-info.vue";
   import RelatedConversation from "../related-conversation/related-conversation.vue";
   import type { AgentDetailDto } from "@/types/interfaces/agent";

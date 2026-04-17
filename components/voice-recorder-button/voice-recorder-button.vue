@@ -33,6 +33,8 @@
   import jzRecorder from '@/uni_modules/jz-h5-recorder-manager'
   // #endif
 
+  import { ref, onMounted, onUnmounted } from 'vue';
+  import { onShow, onHide } from "@dcloudio/uni-app";
   import {
     createAudioUploader,
     type AudioFile as UploaderAudioFile,

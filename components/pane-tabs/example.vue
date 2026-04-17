@@ -46,6 +46,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref } from 'vue';
   import PaneTabs from "@/components/pane-tabs/pane-tabs.vue";
   import PaneTab from "@/components/pane-tabs/pane-tab.vue";
   import { useI18n } from "@/utils/i18n";

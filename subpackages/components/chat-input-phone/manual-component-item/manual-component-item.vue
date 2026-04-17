@@ -92,6 +92,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, computed } from 'vue';
   import { ExpandPageAreaEnum } from "@/types/enums/agent";
   import { AgentManualComponentInfo } from "@/types/interfaces/agent";
   import { SandboxInfo } from "@/types/interfaces/sandbox";

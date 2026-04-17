@@ -144,6 +144,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, reactive, nextTick } from 'vue';
   import {
     SUCCESS_CODE,
     USER_NO_LOGIN,
@@ -160,7 +161,7 @@
     getCurrentPagePath,
     jumpToAgentDetailPage,
   } from "@/utils/commonBusiness";
-  import { onAddToFavorites } from "@dcloudio/uni-app";
+  import { onLoad, onTabItemTap, onAddToFavorites } from "@dcloudio/uni-app";
   import iconAgentCollect from "@/static/icons/agent_collect.svg";
   import iconTeamSpace from "@/static/icons/team_space.svg";
   import iconAgentRecommend from "@/static/icons/agent_recommend.svg";

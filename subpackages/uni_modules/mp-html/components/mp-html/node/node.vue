@@ -9,7 +9,9 @@
       <!-- 占位图 -->
       <image
         v-if="
-          n.name === 'img' && !n.t && ((opts[1] && !ctrl[i]) || ctrl[i] < 0)
+          n.name === 'img' &&
+          isTruthy(n.t) === false &&
+          ((isTruthy(opts[1]) && isTruthy(ctrl[i]) === false) || ctrl[i] < 0)
         "
         class="_img"
         :style="n.attrs.style"
@@ -23,7 +25,13 @@
         :id="n.attrs.id"
         :class="'_img ' + n.attrs.class"
         :style="(ctrl[i] === -1 ? 'display:none;' : '') + n.attrs.style"
-        :src="n.attrs.src || (ctrl.load ? n.attrs['data-src'] : '')"
+        :src="
+          isTruthy(n.attrs.src)
+            ? n.attrs.src
+            : isTruthy(ctrl.load)
+              ? n.attrs['data-src']
+              : ''
+        "
         :data-i="i"
         @load="imgLoad"
         @error="mediaError"
@@ -58,8 +66,20 @@
           'px;' +
           n.attrs.style
         "
-        :src="n.attrs.src || (ctrl.load ? n.attrs['data-src'] : '')"
-        :mode="!n.h ? 'widthFix' : !n.w ? 'heightFix' : n.m || 'scaleToFill'"
+        :src="
+          isTruthy(n.attrs.src)
+            ? n.attrs.src
+            : isTruthy(ctrl.load)
+              ? n.attrs['data-src']
+              : ''
+        "
+        :mode="
+          isTruthy(n.h) === false
+            ? 'widthFix'
+            : isTruthy(n.w) === false
+              ? 'heightFix'
+              : valOr(n.m, 'scaleToFill')
+        "
         :data-i="i"
         @load="imgLoad"
         @error="mediaError"
@@ -80,11 +100,21 @@
           n.attrs.style
         "
         :src="n.attrs.src"
-        :mode="!n.h ? 'widthFix' : !n.w ? 'heightFix' : n.m || 'scaleToFill'"
-        :lazy-load="opts[0]"
+        :mode="
+          isTruthy(n.h) === false
+            ? 'widthFix'
+            : isTruthy(n.w) === false
+              ? 'heightFix'
+              : valOr(n.m, 'scaleToFill')
+        "
+        :lazy-load="isTruthy(opts[0])"
         :webp="n.webp"
-        :show-menu-by-longpress="opts[3] && !n.attrs.ignore"
-        :image-menu-prevent="!opts[3] || n.attrs.ignore"
+        :show-menu-by-longpress="
+          isTruthy(opts[3]) && isTruthy(n.attrs.ignore) === false
+        "
+        :image-menu-prevent="
+          isTruthy(opts[3]) === false || isTruthy(n.attrs.ignore)
+        "
         :data-i="i"
         @load="imgLoad"
         @error="mediaError"
@@ -99,7 +129,7 @@
         :class="'_img ' + n.attrs.class"
         :style="(ctrl[i] === -1 ? 'display:none;' : '') + n.attrs.style"
         :src="n.attrs.src"
-        :lazy-load="opts[0]"
+        :lazy-load="isTruthy(opts[0])"
         :data-i="i"
         @load="imgLoad"
         @error="mediaError"
@@ -123,7 +153,7 @@
       <view
         v-else-if="n.name === 'a'"
         :id="n.attrs.id"
-        :class="(n.attrs.href ? '_a ' : '') + n.attrs.class"
+        :class="(isTruthy(n.attrs.href) ? '_a ' : '') + n.attrs.class"
         hover-class="_hover"
         :style="'display:inline;' + n.attrs.style"
         :data-i="i"
@@ -243,7 +273,10 @@
       <!-- 富文本 -->
       <!-- #ifdef H5 -->
       <rich-text
-        v-else-if="!n.c && (n.l || !isInline(n.name, n.attrs.style))"
+        v-else-if="
+          n.c !== true &&
+          (isTruthy(n.l) || !isInline(n.name, n.attrs.style))
+        "
         :id="n.attrs.id"
         :style="n.f"
         :user-select="opts[4]"
@@ -255,13 +288,14 @@
       <!-- hl-language 头部节点：将 rich-text 和原生复制按钮并排在同一行，避免给对布局的依赖 -->
       <view
         v-else-if="
-          !n.c && n.attrs && n.attrs.class === 'hl-language' && copyText
+          isTruthy(n.c) === false &&
+          n.attrs != null &&
+          n.attrs.class === 'hl-language' &&
+          isTruthy(copyText)
         "
         class="hl-language-native"
       >
-        <text class="hl-language-name">{{
-          (n.children && n.children[0] && n.children[0].text) || ""
-        }}</text>
+        <text class="hl-language-name">{{ getFirstChildText(n.children) }}</text>
         <view class="hl-copy-btn-native" @tap.stop="doCopyText(copyText)">
           <text class="hl-copy-btn-text">{{
             getI18nText("Mobile.ThirdParty.MpHtml.copyCode")
@@ -319,6 +353,7 @@
   import taskResult from '../task-result/task-result.vue'
   import { getProcessingDataByPriority } from '../container/utils'
   import { t } from '@/utils/i18n'
+  import { valOr } from '@/utils/common'
   export default {
     name: 'node',
     options: {
@@ -360,9 +395,9 @@
         for (this.root = this.$parent; this.root.$options.name !== 'mp-html'; this.root = this.root.$parent);
       })
       // #ifdef H5 || APP
-      if (this.opts[0]) {
+      if (this.isTruthy(this.opts[0])) {
         let i
-        for (i = this.childs.length; i--;) {
+        for (i = this.childs.length - 1; i >= 0; i--) {
           if (this.childs[i].name === 'img') break
         }
         if (i !== -1) {
@@ -371,7 +406,7 @@
             bottom: 500
           })
           this.observer.observe('._img', res => {
-            if (res.intersectionRatio) {
+            if (res.intersectionRatio > 0) {
               this.$set(this.ctrl, 'load', 1)
               this.observer.disconnect()
             }
@@ -382,18 +417,37 @@
     },
     beforeDestroy () {
       // #ifdef H5 || APP
-      if (this.observer) {
+      if (this.observer != null) {
         this.observer.disconnect()
       }
       // #endif
     },
     methods:{
+      isTruthy (value: any): boolean {
+        if (value == null) {
+          return false
+        }
+        if (typeof value === 'boolean') {
+          return value
+        }
+        if (typeof value === 'number') {
+          return value !== 0
+        }
+        if (typeof value === 'string') {
+          return value.length > 0
+        }
+        return true
+      },
       /**
        * @description 判断是否为行内标签（替代原 WXS handler 模块，APP 端不支持 WXS）
        */
       isInline (tagName, style) {
         const inlineTags = { abbr: true, b: true, big: true, code: true, del: true, em: true, i: true, ins: true, label: true, q: true, small: true, span: true, strong: true, sub: true, sup: true }
-        return inlineTags[tagName] || (style || '').indexOf('display:inline') !== -1
+        if (inlineTags[tagName] === true) {
+          return true;
+        }
+        const tempStyle = valOr(style, '');
+        return tempStyle.indexOf('display:inline') !== -1;
       },
       getI18nText (key) {
         return t(key)
@@ -409,19 +463,19 @@
        */
       getConversationId() {
         // 尝试从根组件获取会话ID
-        if (this.root && this.root.conversationId) {
+        if (this.root != null && this.isTruthy(this.root.conversationId)) {
           return this.root.conversationId
         }
         // 尝试从mp-html组件获取
-        for (let parent = this.$parent; parent; parent = parent.$parent) {
-          if (parent.conversationId) {
+        for (let parent = this.$parent; parent != null; parent = parent.$parent) {
+          if (parent.conversationId != null && parent.conversationId.length > 0) {
             return parent.conversationId
           }
         }
         return ''
       },
       getRenderData (data: any) {
-        if(!data) {
+        if (this.isTruthy(data) === false) {
           return {}
         }
 
@@ -454,38 +508,43 @@
        * @param {Event} e
        */
       play (e) {
-        const i = e.currentTarget.dataset.i
-        const node = this.childs[i]
+        const dataIndex = e.currentTarget.dataset.i
+        const node = this.childs[dataIndex]
+        const currentSrc = this.ctrl[dataIndex] != null && node.src != null && node.src[this.ctrl[dataIndex]] != null ? node.src[this.ctrl[dataIndex]] : null
         this.root.$emit('play', {
           source: node.name,
           attrs: {
             ...node.attrs,
-            src: node.src[this.ctrl[i] || 0]
+            src: currentSrc
           }
         })
         // #ifndef H5
-        if (this.root.pauseVideo) {
-          let flag = false
-          const id = e.target.id
-          for (let i = this.root._videos.length; i--;) {
-            if (this.root._videos[i].id === id) {
-              flag = true
-            } else {
-              this.root._videos[i].pause() // 自动暂停其他视频
+        const shouldPause = this.root.pauseVideo === true || (this.root.pauseVideo != null && typeof this.root.pauseVideo === 'string' && this.root.pauseVideo.length > 0)
+        if (shouldPause === true) {
+          const targetId = e.target.id
+          const originVideos = this.root._videos
+          const videos = Array.isArray(originVideos) ? originVideos : []
+          let found = false
+          for (let idx = 0; idx < videos.length; idx += 1) {
+            const video: any = videos[idx]
+            const isCurrent = video != null && video.id === targetId
+            if (isCurrent === true) {
+              found = true
+            } else if (video != null) {
+              video.pause()
             }
           }
-          // 将自己加入列表
-          if (!flag) {
-            const ctx = uni.createVideoContext(id
-              // #ifndef MP-BAIDU
-              , this
-              // #endif
-            )
-            ctx.id = id
-            if (this.root.playbackRate) {
+          if (found === false) {
+            const ctx = uni.createVideoContext(targetId)
+            ctx.id = targetId
+            const hasRate = this.root.playbackRate != null
+            if (hasRate === true) {
               ctx.playbackRate(this.root.playbackRate)
             }
-            this.root._videos.push(ctx)
+            videos.push(ctx)
+            if (Array.isArray(originVideos) === false) {
+              this.root._videos = videos
+            }
           }
         }
         // #endif
@@ -497,11 +556,11 @@
        */
       imgTap (e) {
         const node = this.childs[e.currentTarget.dataset.i]
-        if (node.a) {
+        if (this.isTruthy(node.a)) {
           this.linkTap(node.a)
           return
         }
-        if (node.attrs.ignore) return
+        if (this.isTruthy(node.attrs.ignore)) return
         // #ifdef H5 || APP
         node.attrs.src = node.attrs.src || node.attrs['data-src']
         // #endif
@@ -514,7 +573,7 @@
         })
         // #endif
         // 自动预览图片
-        if (this.root.previewImg) {
+        if (this.root.previewImg === true || (this.root.previewImg != null && typeof this.root.previewImg === 'string' && this.root.previewImg.length > 0)) {
           uni.previewImage({
             // #ifdef MP-WEIXIN
             showmenu: this.root.showImgMenu,
@@ -535,7 +594,7 @@
       imgLongTap (e) {
         // #ifdef APP
         const attrs = this.childs[e.currentTarget.dataset.i].attrs
-        if (this.opts[3] && !attrs.ignore) {
+        if (this.isTruthy(this.opts[3]) && this.isTruthy(attrs.ignore) === false) {
           uni.showActionSheet({
             itemList: ['保存图片'],
             success: () => {
@@ -568,10 +627,10 @@
       imgLoad (e) {
         const i = e.currentTarget.dataset.i
         /* #ifndef H5 */
-        if (!this.childs[i].w) {
+        if (this.childs[i].w == null || this.childs[i].w == 0) {
           // 设置原宽度
           this.$set(this.ctrl, i, e.detail.width)
-        } else /* #endif */ if ((this.opts[1] && !this.ctrl[i]) || this.ctrl[i] === -1) {
+        } else /* #endif */ if ((this.isTruthy(this.opts[1]) && (this.ctrl[i] == null || this.ctrl[i] == 0)) || this.ctrl[i] === -1) {
           // 加载完毕，取消加载中占位图
           this.$set(this.ctrl, i, 1)
         }
@@ -582,9 +641,9 @@
        * @description 检查是否所有图片加载完毕
        */
       checkReady () {
-        if (this.root && !this.root.lazyLoad) {
+        if (this.root != null && !(this.root.lazyLoad === true || (this.root.lazyLoad != null && typeof this.root.lazyLoad === 'string' && this.root.lazyLoad.length > 0))) {
           this.root._unloadimgs -= 1
-          if (!this.root._unloadimgs) {
+          if (this.root._unloadimgs <= 0) {
             setTimeout(() => {
               this.root.getRect().then(rect => {
                 this.root.$emit('ready', rect)
@@ -601,19 +660,19 @@
        * @param {Event} e
        */
       linkTap (e) {
-        const node = e.currentTarget ? this.childs[e.currentTarget.dataset.i] : {}
+        const node = e.currentTarget != null ? this.childs[e.currentTarget.dataset.i] : {}
         const attrs = node.attrs || e
         const href = attrs.href
         this.root.$emit('linktap', Object.assign({
           innerText: this.root.getText(node.children || []) // 链接内的文本内容
         }, attrs))
-        if (href) {
+        if (this.isTruthy(href)) {
           if (href[0] === '#') {
             // 跳转锚点
             this.root.navigateTo(href.substring(1)).catch(() => { })
           } else if (href.split('?')[0].includes('://')) {
             // 复制外部链接
-            if (this.root.copyLink) {
+            if (this.root.copyLink === true || (this.root.copyLink != null && typeof this.root.copyLink === 'string' && this.root.copyLink.length > 0)) {
               // #ifdef H5
               window.open(href)
               // #endif
@@ -652,12 +711,12 @@
       copyCode (e) {
         // srcElement \u5728\u5fae\u4fe1\u5c0f\u7a0b\u5e8f\u4e2d\u4e0d\u5b58\u5728\uff0c\u52a0\u5b89\u5168\u8bbf\u95ee
         const data = (e.srcElement && e.srcElement.dataset) || (e.currentTarget && e.currentTarget.dataset)
-        if(!data || data.action !== 'copy') {
+        if(data == null || data.action !== 'copy') {
           return
         }
         const content = data.content
 
-        if (content) {
+        if (this.isTruthy(content)) {
           // 实现复制到剪贴板功能
           uni.setClipboardData({
             data: content,
@@ -683,7 +742,8 @@
         // #endif
 
         // Handle copy code button in highlight blocks
-        if (e.attrs?.['data-action'] === 'copy' && e.attrs?.['data-content']) {
+        const hasCopyContent = this.isTruthy(e.attrs?.['data-content'])
+        if (e.attrs?.['data-action'] === 'copy' && hasCopyContent === true) {
           uni.setClipboardData({
             data: e.attrs['data-content'],
             success: () => {
@@ -701,7 +761,7 @@
        * @param {String} text
        */
       doCopyText (text) {
-        if (!text) return
+        if (this.isTruthy(text) === false) return
         uni.setClipboardData({
           data: text,
           success: () => {
@@ -732,15 +792,15 @@
           }
         } else if (node.name === 'img') {
           // #ifdef H5
-          if (this.opts[0] && !this.ctrl.load) return
+          if (this.isTruthy(this.opts[0]) && this.isTruthy(this.ctrl.load) === false) return
           // #endif
           // 显示错误占位图
-          if (this.opts[2]) {
+          if (this.isTruthy(this.opts[2])) {
             this.$set(this.ctrl, i, -1)
           }
           this.checkReady()
         }
-        if (this.root) {
+        if (this.root != null) {
           this.root.$emit('error', {
             source: node.name,
             attrs: node.attrs,

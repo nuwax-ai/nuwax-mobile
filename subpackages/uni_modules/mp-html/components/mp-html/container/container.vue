@@ -6,7 +6,7 @@
       <view class="plan-header" @tap="togglePlanExpanded">
         <view class="plan-info">
           <text class="plan-name">{{
-            toolCall.name || getI18nText("Mobile.ThirdParty.MpHtml.executionPlan")
+            toolCall.name != null && toolCall.name.length > 0 ? toolCall.name : getI18nText("Mobile.ThirdParty.MpHtml.executionPlan")
           }}</text>
           <!-- <view class="plan-status-display">
             <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
@@ -37,7 +37,7 @@
       <!-- 工具调用头部信息 -->
       <view v-if="toolCall?.type !== 'Event'" class="tool-header" @tap="toggleExpanded">
         <view class="tool-info">
-          <text class="tool-name">{{ toolCall.name || toolCall.type }}</text>
+          <text class="tool-name">{{ toolCall.name != null && toolCall.name.length > 0 ? toolCall.name : toolCall.type }}</text>
           <view class="tool-status-display">
             <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
               <text :class="getStatusIconType(toolCall.status)" :style="{color: getStatusIconColor(toolCall.status),fontSize: '32rpx'}"></text>

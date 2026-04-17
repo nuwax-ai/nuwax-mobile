@@ -14,7 +14,7 @@ export const I18N_FALLBACK_BUNDLES: Record<string, Record<string, string>> = {
 const normalizeBundleLang = (lang: string): string => {
   const source = (lang || "").trim();
   if (!source) return "zh-cn";
-  const normalized = source.replaceAll("_", "-");
+  const normalized = source.split("_").join("-");
   const lower = normalized.toLowerCase();
 
   // bundle key 统一收敛为本地词包文件名使用的小写语言 key。

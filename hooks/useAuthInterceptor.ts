@@ -45,6 +45,11 @@ export const useAuthInterceptor = () => {
     return !!mpToken;
     // #endif
 
+    // #ifdef APP-PLUS
+    const appToken = uni.getStorageSync(ACCESS_TOKEN);
+    return !!appToken;
+    // #endif
+
     // #ifdef H5 || WEB
     // 开发环境：只判断本地是否有 token
     if (process.env.NODE_ENV === "development") {
@@ -140,6 +145,11 @@ export const useAuthInterceptor = () => {
     // H5：根据环境和接口结果判断是否已登录
     const loggedInH5 = await hasToken();
     return loggedInH5;
+    // #endif
+
+    // #ifdef APP-PLUS
+    const loggedInApp = await hasToken();
+    return loggedInApp;
     // #endif
 
     // #ifdef MP-WEIXIN

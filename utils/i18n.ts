@@ -38,6 +38,13 @@ const isMpWeixinPlatform = (): boolean => {
   return false;
 };
 
+const isAppPlatform = (): boolean => {
+  // #ifdef APP-PLUS
+  return true;
+  // #endif
+  return false;
+};
+
 const getBrowserLang = (): string => {
   // #ifdef H5 || WEB
   const navLang = navigator?.language || DEFAULT_LANG;
@@ -148,8 +155,8 @@ const pickLangForInit = (): string => {
 };
 
 const fetchLangList = async (): Promise<I18nLangDto[]> => {
-  // 允许在 H5 和微信小程序环境调用接口
-  if (isH5Platform() || isMpWeixinPlatform()) {
+  // 允许在 H5、微信小程序和 APP 环境调用接口
+  if (isH5Platform() || isMpWeixinPlatform() || isAppPlatform()) {
     try {
       const res = await apiI18nLangList();
       if (res?.code === SUCCESS_CODE && Array.isArray(res?.data)) {
@@ -165,8 +172,8 @@ const fetchLangList = async (): Promise<I18nLangDto[]> => {
 };
 
 const fetchLangMap = async (lang: string = "", active: boolean = false): Promise<Record<string, string>> => {
-  // 允许在 H5 和微信小程序环境调用接口
-  if (!isH5Platform() && !isMpWeixinPlatform()) {
+  // 允许在 H5、微信小程序和 APP 环境调用接口
+  if (!isH5Platform() && !isMpWeixinPlatform() && !isAppPlatform()) {
     return {};
   }
 

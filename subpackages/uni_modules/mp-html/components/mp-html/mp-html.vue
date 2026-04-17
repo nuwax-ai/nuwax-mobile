@@ -39,6 +39,7 @@ import markdownIt from './markdown-it/index.js'
 import highlight from './highlight/index.js'
 import latex from './latex/index.js'
 import container from './container/index.js'
+import { valOr } from '@/utils/common'
 // import markdown from './markdown/index.js'
 // const plugins = [markdown, highlight, latex,]
 const plugins = [markdownIt, highlight, latex, container]
@@ -118,7 +119,7 @@ export default {
   },
   created() {
     this.plugins = []
-    for (let i = plugins.length; i--;) {
+    for (let i = plugins.length - 1; i >= 0; i--) {
       this.plugins.push(new plugins[i](this))
     }
   },
@@ -160,7 +161,8 @@ export default {
           reject(Error('Anchor is disabled'))
           return
         }
-        offset = offset || parseInt(this.useAnchor) || 0
+        const parsed = parseInt(this.useAnchor)
+        offset = valOr(offset, isNaN(parsed) ? 0 : parsed)
         // #ifndef MP-ALIPAY
         let deep = ' '
         // #ifdef MP-WEIXIN || MP-QQ || MP-TOUTIAO
@@ -177,7 +179,7 @@ export default {
           selector.selectViewport().scrollOffset() // 获取窗口的滚动距离
         }
         selector.exec(res => {
-          if (!res[0]) {
+          if (res[0] == null) {
             reject(Error('Label not found'))
             return
           }
@@ -272,7 +274,7 @@ export default {
      * @param {Boolean} append 是否在尾部追加
      */
     setContent(content, append) {
-      if (!append || !this.imgList) {
+      if (!append || this.imgList == null) {
         this.imgList = []
       }
       const nodes = new Parser(this).parse(content)
@@ -288,7 +290,7 @@ export default {
         // 设置懒加载，每 350ms 获取高度，不变则认为加载完毕
         let height = 0
         const callback = rect => {
-          if (!rect || !rect.height) rect = {}
+          if (rect == null || rect.height == 0) rect = {}
           // 350ms 总高度无变化就触发 ready 事件
           if (rect.height === height) {
             this.$emit('ready', rect)
@@ -302,7 +304,7 @@ export default {
         this.getRect().then(callback).catch(callback)
       } else {
         // 未设置懒加载，等待所有图片加载完毕
-        if (!this.imgList._unloadimgs) {
+        if (this.imgList._unloadimgs == null) {
           this.getRect().then(rect => {
             this.$emit('ready', rect)
           }).catch(() => {

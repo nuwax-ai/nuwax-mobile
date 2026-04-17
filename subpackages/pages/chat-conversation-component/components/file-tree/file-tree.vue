@@ -60,7 +60,7 @@
 </template>
 
 <script setup lang="ts">
-  import { onMounted } from "vue";
+  import { ref, onMounted } from "vue";
   import DrawerPopup from "@/components/drawer-popup/drawer-popup.vue";
   import type { FileNode } from "@/types/interfaces/agent";
   import FileTreeNode from "./file-tree-node.vue";

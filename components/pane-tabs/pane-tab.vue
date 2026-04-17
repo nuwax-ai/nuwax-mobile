@@ -5,6 +5,7 @@
 </template>
 
 <script setup lang="ts">
+  import { inject, onMounted, watch, onUnmounted, type Ref } from "vue";
   // Props 定义
   interface Props {
     tab: string; // 标签文字

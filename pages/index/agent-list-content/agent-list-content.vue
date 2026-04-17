@@ -54,6 +54,8 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, computed, onMounted } from "vue";
+  import { onShow } from "@dcloudio/uni-app";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import type { AgentInfo } from "@/types/interfaces/agent";
   import {
@@ -255,7 +257,7 @@
     loadData();
   })
 
-  onPageShow(()=>{
+  onShow(()=>{
     loadData();
   })
 

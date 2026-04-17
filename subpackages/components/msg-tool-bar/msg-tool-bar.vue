@@ -6,6 +6,7 @@
 </template>
 
 <script lang="ts" setup>
+	import { ref, computed, onMounted, onUnmounted } from "vue";
 	import { MsgItem } from '@/types/interfaces/ai-msg';
 	import { formatTimeAgo } from '@/utils/common';
 	import { useI18n } from '@/utils/i18n';

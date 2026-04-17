@@ -16,6 +16,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, reactive } from "vue";
   import TurndownService from "turndown"; // markdown转html
   import { apiAgentComponentPageResultUpdate } from "@/servers/agentDev";
   import { useI18n } from "@/utils/i18n";

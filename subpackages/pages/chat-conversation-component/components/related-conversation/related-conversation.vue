@@ -14,6 +14,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, onMounted } from "vue";
   import type { ConversationInfo } from "@/types/interfaces/conversationInfo";
   import type { AgentDetailDto } from "@/types/interfaces/agent";
   import { SUCCESS_CODE } from "@/constants/codes.constants";

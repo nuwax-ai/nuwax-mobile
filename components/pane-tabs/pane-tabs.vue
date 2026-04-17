@@ -56,6 +56,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, computed, provide, watch, nextTick, onMounted } from "vue";
   import { translateText } from "@/utils/i18n";
   // Props定义
   interface TabItem {

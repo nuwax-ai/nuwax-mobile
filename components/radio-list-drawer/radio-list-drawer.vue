@@ -59,6 +59,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, watch } from "vue";
   import { RadioListItem } from "@/types/interfaces/radio";
 
   const props = withDefaults(

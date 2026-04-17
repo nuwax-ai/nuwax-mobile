@@ -1,6 +1,6 @@
 <template>
-  <view id="_root" :class="(selectable ? '_select ' : '') + '_root'" :style="containerStyle">
-    <slot v-if="!nodes[0]" />
+  <view id="_root" :class="(isTruthy(selectable) ? '_select ' : '') + '_root'" :style="containerStyle">
+    <slot v-if="isEmptyNodes(nodes)" />
     <node v-else :childs="nodes" :processing-list="processingList"
       :opts="[lazyLoad, loadingImg, errorImg, showImgMenu, selectable]" name="span" />
   </view>
@@ -34,15 +34,33 @@
  * @event {Function} error 媒体加载出错时触发
  */
 import node from './node/node.vue'
-import Parser from './parser.js'
-import markdownIt from './markdown-it/index.js'
-import highlight from './highlight/index.js'
-import latex from './latex/index.js'
-import container from './container/index.js'
-import { valOr } from '@/utils/common'
-// import markdown from './markdown/index.js'
-// const plugins = [markdown, highlight, latex,]
-const plugins = [markdownIt, highlight, latex, container]
+import { hasLen, valOr } from '@/utils/common'
+class Parser {
+  constructor(vm) {
+    this.vm = vm
+  }
+  parse(content) {
+    const source = typeof content === 'string' ? content : ''
+    if (source.length === 0) {
+      return []
+    }
+    const normalized = source
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p\s*>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+    return [{
+      type: 'text',
+      text: normalized
+    }]
+  }
+}
+const plugins = []
 export default {
   name: 'mp-html',
   data() {
@@ -124,7 +142,7 @@ export default {
     }
   },
   mounted() {
-    if (this.content && !this.nodes.length) {
+    if (hasLen(this.content) && hasLen(this.nodes) === false) {
       this.setContent(this.content)
     }
   },
@@ -139,7 +157,10 @@ export default {
      * @param {String} scrollTop scroll-view scroll-top 属性绑定的变量名
      */
     in(page, selector, scrollTop) {
-      if (page && selector && scrollTop) {
+      const hasPage = page != null
+      const hasSelector = typeof selector === 'string' && selector.length > 0
+      const hasScrollTop = typeof scrollTop === 'string' && scrollTop.length > 0
+      if (hasPage && hasSelector && hasScrollTop) {
         this._in = {
           page,
           selector,
@@ -155,9 +176,11 @@ export default {
      * @returns {Promise}
      */
     navigateTo(id, offset) {
-      id = this._ids[decodeURI(id)] || id
+      const mappedId = this._ids[decodeURI(id)]
+      const hasMappedId = typeof mappedId === 'string' && mappedId.length > 0
+      id = hasMappedId ? mappedId : id
       return new Promise((resolve, reject) => {
-        if (!this.useAnchor) {
+        if (this.isTruthy(this.useAnchor) === false) {
           reject(Error('Anchor is disabled'))
           return
         }
@@ -168,10 +191,13 @@ export default {
         // #ifdef MP-WEIXIN || MP-QQ || MP-TOUTIAO
         deep = '>>>'
         // #endif
+        const hasInTarget = this._in != null
+        const rootSelector = hasInTarget ? this._in.selector : '._root'
+        const hasId = typeof id === 'string' && id.length > 0
         const selector = uni.createSelectorQuery()
-          .in(this._in ? this._in.page : this)
-          .select((this._in ? this._in.selector : '._root') + (id ? `${deep}#${id}` : '')).boundingClientRect()
-        if (this._in) {
+          .in(hasInTarget ? this._in.page : this)
+          .select(rootSelector + (hasId ? `${deep}#${id}` : '')).boundingClientRect()
+        if (hasInTarget) {
           selector.select(this._in.selector).scrollOffset()
             .select(this._in.selector).boundingClientRect()
         } else {
@@ -183,8 +209,9 @@ export default {
             reject(Error('Label not found'))
             return
           }
-          const scrollTop = res[1].scrollTop + res[0].top - (res[2] ? res[2].top : 0) + offset
-          if (this._in) {
+          const viewportTop = res[2] != null ? res[2].top : 0
+          const scrollTop = res[1].scrollTop + res[0].top - viewportTop + offset
+          if (hasInTarget) {
             // scroll-view 跳转
             this._in.page[this._in.scrollTop] = scrollTop
           } else {
@@ -216,21 +243,22 @@ export default {
           } else {
             // 块级标签前后加换行
             const isBlock = node.name === 'p' || node.name === 'div' || node.name === 'tr' || node.name === 'li' || (node.name[0] === 'h' && node.name[1] > '0' && node.name[1] < '7')
-            if (isBlock && text && text[text.length - 1] !== '\n') {
+            const hasText = text.length > 0
+            if (isBlock && hasText && text[text.length - 1] !== '\n') {
               text += '\n'
             }
             // 递归获取子节点的文本
-            if (node.children) {
+            if (Array.isArray(node.children)) {
               traversal(node.children)
             }
-            if (isBlock && text[text.length - 1] !== '\n') {
+            if (isBlock && text.length > 0 && text[text.length - 1] !== '\n') {
               text += '\n'
             } else if (node.name === 'td' || node.name === 'th') {
               text += '\t'
             }
           }
         }
-      })(nodes || this.nodes)
+      })(Array.isArray(nodes) ? nodes : this.nodes)
       return text
     },
 
@@ -244,7 +272,7 @@ export default {
           // #ifndef MP-ALIPAY
           .in(this)
           // #endif
-          .select('#_root').boundingClientRect().exec(res => res[0] ? resolve(res[0]) : reject(Error('Root label not found')))
+          .select('#_root').boundingClientRect().exec(res => res[0] != null ? resolve(res[0]) : reject(Error('Root label not found')))
       })
     },
 
@@ -252,8 +280,9 @@ export default {
      * @description 暂停播放媒体
      */
     pauseMedia() {
-      for (let i = (this._videos || []).length; i--;) {
-        this._videos[i].pause()
+      const videos = Array.isArray(this._videos) ? this._videos : []
+      for (let i = videos.length; i--;) {
+        videos[i].pause()
       }
     },
 
@@ -263,8 +292,9 @@ export default {
      */
     setPlaybackRate(rate) {
       this.playbackRate = rate
-      for (let i = (this._videos || []).length; i--;) {
-        this._videos[i].playbackRate(rate)
+      const videos = Array.isArray(this._videos) ? this._videos : []
+      for (let i = videos.length; i--;) {
+        videos[i].playbackRate(rate)
       }
     },
 
@@ -278,7 +308,8 @@ export default {
         this.imgList = []
       }
       const nodes = new Parser(this).parse(content)
-      this.$set(this, 'nodes', append ? (this.nodes || []).concat(nodes) : nodes)
+      const currentNodes = Array.isArray(this.nodes) ? this.nodes : []
+      this.$set(this, 'nodes', append ? currentNodes.concat(nodes) : nodes)
 
       this._videos = []
       this.$nextTick(() => {
@@ -286,7 +317,7 @@ export default {
         this.$emit('load')
       })
 
-      if (this.lazyLoad || this.imgList._unloadimgs < this.imgList.length / 2) {
+      if (this.isTruthy(this.lazyLoad) || this.imgList._unloadimgs < this.imgList.length / 2) {
         // 设置懒加载，每 350ms 获取高度，不变则认为加载完毕
         let height = 0
         const callback = rect => {
@@ -319,10 +350,21 @@ export default {
      */
     _hook(name) {
       for (let i = plugins.length; i--;) {
-        if (this.plugins[i][name]) {
+        if (this.plugins[i][name] != null) {
           this.plugins[i][name]()
         }
       }
+    },
+    isTruthy(value) {
+      if (value == null) return false
+      if (typeof value === 'boolean') return value
+      if (typeof value === 'number') return value !== 0
+      if (typeof value === 'string') return value.length > 0
+      return true
+    },
+    isEmptyNodes(value) {
+      if (Array.isArray(value) === false) return true
+      return value.length === 0
     },
 
     // NVUE web-view mode removed - not needed in uni-app x

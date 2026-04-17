@@ -10,7 +10,7 @@
 </template>
 
 <script>
-	import { fontData } from './uniicons_file_vue.js';
+	import { fontData } from './uniicons_file';
 
 	const getVal = (val) => {
 		const reg = /^[0-9]*$/g

@@ -35,7 +35,7 @@
     <!-- 非 Plan 类型：显示工具调用状态 -->
     <template v-else>
       <!-- 工具调用头部信息 -->
-      <view v-if="toolCall?.type !== 'Event'" class="tool-header" @tap="toggleExpanded">
+      <view v-if="toolCall != null && toolCall.type !== 'Event'" class="tool-header" @tap="toggleExpanded">
         <view class="tool-info">
           <text class="tool-name">{{ toolCall.name != null && toolCall.name.length > 0 ? toolCall.name : toolCall.type }}</text>
           <view class="tool-status-display">
@@ -61,7 +61,7 @@
       <!-- 展开后的详细信息 -->
       <view v-if="expanded" class="tool-details-expanded">
         <!-- 调用参数 -->
-        <view v-if="detailData.params && Object.keys(detailData.params).length > 0" class="detail-section">
+        <view v-if="hasObjectKeys(detailData.params)" class="detail-section">
           <view class="section-header">
             <text class="section-title">{{
               getI18nText("Mobile.ThirdParty.MpHtml.callArguments")
@@ -89,7 +89,7 @@
 </template>
 
 <script>
-import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue'
+import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.uvue'
 import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
 import { getCurrentPageParams } from '@/utils/common';
 import { getFileProxyUrlByConversationIdAndFilePath, jumpToFilePreviewPage } from '@/utils/system.uts';
@@ -121,7 +121,7 @@ export default {
     
     // Plan 任务列表
     planTaskList() {
-      const result = this.toolCall.result || {}
+      const result = this.toolCall != null && this.toolCall.result != null ? this.toolCall.result : {}
       const data = result.data
       
       if (Array.isArray(data)) {
@@ -132,12 +132,14 @@ export default {
     },
     
     detailData() {
-      const _result = this.toolCall.result || {}
+      const _result = this.toolCall != null && this.toolCall.result != null ? this.toolCall.result : {}
+      const params = _result.input != null ? _result.input : {}
+      const response = _result.data != null ? _result.data : null
       return {
         // 从结果中提取输入参数，如果没有则提供空对象
-        params: _result.input || {},
+        params,
         // 使用结果的 data 作为响应数据，如果没有则提供空对象
-        response: _result.data || null,
+        response,
       }
     }
   },
@@ -161,14 +163,14 @@ export default {
 
     // 切换展开状态
    async toggleExpanded() {
-      const result = this.data?.result;
+      const result = this.data != null ? this.data.result : null;
 
       // 打开预览页面
-      if (result?.kind === 'edit') {
+      if (result != null && result.kind === 'edit') {
         const params = getCurrentPageParams();
 
         const conversationId = params.conversationId;
-        const file_path = result?.input?.file_path;
+        const file_path = result.input != null ? result.input.file_path : '';
 
         const fileProxyUrl = await getFileProxyUrlByConversationIdAndFilePath(conversationId, file_path);
         jumpToFilePreviewPage(conversationId, fileProxyUrl);
@@ -185,7 +187,8 @@ export default {
 
     // 显示详情
     showDetails() {
-      if (!this.toolCall.result) {
+      const hasResult = this.toolCall != null && this.toolCall.result != null
+      if (hasResult === false) {
         return uni.showToast({
           icon: 'none',
           title: t('Mobile.ThirdParty.MpHtml.emptyResult'),
@@ -237,7 +240,8 @@ export default {
         'FINISHED': 'icon-Check', // 已完成显示对勾
         'FAILED': 'icon-waring'     // 执行失败显示叉号
       }
-      return ` iconfont ${iconMap[status] || 'icon-Check'}`
+      const icon = iconMap[status]
+      return ` iconfont ${icon != null ? icon : 'icon-Check'}`
     },
 
     // 获取状态图标样式类
@@ -247,7 +251,8 @@ export default {
         'FINISHED': 'status-icon-finished',
         'FAILED': 'status-icon-failed'
       }
-      return statusClassMap[status] || 'status-icon-default'
+      const className = statusClassMap[status]
+      return className != null ? className : 'status-icon-default'
     },
 
     // 获取状态图标颜色
@@ -258,7 +263,8 @@ export default {
         // 'FAILED': '#ff4d4f'
         'FAILED': '#ffcb00'
       }
-      return statusColorMap[status] || '#999'
+      const color = statusColorMap[status]
+      return color != null ? color : '#999'
     },
 
     // 获取状态文本
@@ -281,7 +287,8 @@ export default {
         'in_progress': 'task-status-in-progress',
         'failed': 'task-status-failed'
       }
-      return classMap[status] || 'task-status-pending'
+      const className = classMap[status]
+      return className != null ? className : 'task-status-pending'
     },
     
     // 获取任务状态图标 (使用字体图标unicode)
@@ -292,7 +299,8 @@ export default {
         'completed': 'icon-CheckSquareOutlined',    // 已完成
         'failed': 'icon-CloseSquareOutlined'        // 失败
       }
-      return iconMap[status] || 'icon-BorderOutlined'
+      const icon = iconMap[status]
+      return icon != null ? icon : 'icon-BorderOutlined'
     },
 
     // 格式化参数显示
@@ -306,7 +314,7 @@ export default {
 
     // 格式化结果显示
     formatResult(result) {
-      if (result && typeof result === 'object') {
+      if (result != null && typeof result === 'object') {
         try {
           return JSON.stringify(result, null, 2)
         } catch (error) {
@@ -328,6 +336,11 @@ export default {
     },
     isPageType(toolCall) {
       return toolCall.type === AgentComponentTypeEnum.Page;
+    },
+    hasObjectKeys(value) {
+      if (value == null) return false
+      if (typeof value !== 'object') return false
+      return Object.keys(value).length > 0
     }
   }
 }

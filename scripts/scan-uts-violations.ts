@@ -165,6 +165,26 @@ function scanFile(filePath: string): Violation[] {
       }
     }
 
+    // Script: 非布尔回退（a || b）常见于 JS 写法，在 UTS/APP 端高风险
+    const hasFallbackOr = line.includes('||');
+    const isControlLine = /\b(if|while|for)\s*\(/.test(line);
+    const looksLikeBooleanExpr = /===|!==|>=|<=|>\s*0|<\s*0|&&/.test(line);
+    if (hasFallbackOr && !isControlLine && !looksLikeBooleanExpr) {
+      const assignFallbackMatch = line.match(/=\s*[^;]*\|\|\s*(\[\]|\{\}|null|undefined|""|''|0)/);
+      const returnFallbackMatch = line.match(/return\s+[^;]*\|\|\s*(\[\]|\{\}|null|undefined|""|''|0)/);
+      if (assignFallbackMatch || returnFallbackMatch) {
+        violations.push({
+          file: filePath,
+          line: lineNum,
+          column: (assignFallbackMatch?.index ?? returnFallbackMatch?.index ?? 0) + 1,
+          type: 'UTS110111120',
+          code: line.trim(),
+          message: 'Non-boolean fallback with || may fail in UTS APP compile',
+          fix: 'Replace with explicit null check, e.g. x != null ? x : fallback'
+        });
+      }
+    }
+
     // ===== UTS110111101: 行内对象字面量类型 =====
 
     // interface/type 内的属性行内对象类型（如: categoryItems: {）
@@ -297,7 +317,7 @@ function scanProject(dir: string, skipDirs: string[] = ['node_modules', 'dist', 
           if (!skipDirs.includes(entry.name)) {
             walk(fullPath);
           }
-        } else if (entry.isFile() && (entry.name.endsWith('.uvue') || entry.name.endsWith('.uts'))) {
+        } else if (entry.isFile() && (entry.name.endsWith('.uvue') || entry.name.endsWith('.uts') || entry.name.endsWith('.vue'))) {
           violations.push(...scanFile(fullPath));
         }
       }
@@ -400,9 +420,14 @@ function outputJSON(result: ScanResult, outputPath: string): void {
  */
 function main() {
   const projectRoot = path.resolve(process.argv[2] || '.');
+  const includeUniModules = process.argv.includes('--include-uni-modules');
+  const skipDirs = includeUniModules
+    ? ['node_modules', 'dist', '.git', 'unpackage']
+    : ['node_modules', 'dist', '.git', 'unpackage', 'uni_modules'];
   console.log(`开始扫描项目: ${projectRoot}`);
+  console.log(`扫描模式: ${includeUniModules ? '含 uni_modules' : '默认(跳过 uni_modules)'}`);
 
-  const violations = scanProject(projectRoot);
+  const violations = scanProject(projectRoot, skipDirs);
   console.log(`扫描完成，发现 ${violations.length} 个违规项`);
 
   const result = generateStats(violations);

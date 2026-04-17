@@ -351,7 +351,6 @@
 <script>
   import markdownContainer from '../container/container.vue'
   import taskResult from '../task-result/task-result.vue'
-  import { getProcessingDataByPriority } from '../container/utils'
   import { t } from '@/utils/i18n'
   import { valOr } from '@/utils/common'
   export default {
@@ -457,6 +456,40 @@
         }
         return fallback
       },
+      getProcessingDataByPriority (executeId: any, processingList: any): any {
+        if (Array.isArray(processingList) === false) {
+          return {}
+        }
+        if (processingList.length === 0) {
+          return {}
+        }
+
+        let bestItem: any = null
+        let bestPriority = 999
+        for (let i = 0; i < processingList.length; i++) {
+          const item = processingList[i]
+          if (item == null || item.executeId !== executeId) {
+            continue
+          }
+          let priority = 999
+          if (item.status === 'FINISHED') {
+            priority = 1
+          } else if (item.status === 'FAILED') {
+            priority = 2
+          } else if (item.status === 'EXECUTING') {
+            priority = 3
+          }
+          if (priority < bestPriority) {
+            bestPriority = priority
+            bestItem = item
+          }
+        }
+
+        if (bestItem == null) {
+          return {}
+        }
+        return bestItem
+      },
       /**
        * @description 判断是否为行内标签（替代原 WXS handler 模块，APP 端不支持 WXS）
        */
@@ -523,7 +556,7 @@
 
         const result = {
         ...data,
-        ...getProcessingDataByPriority(data.executeId, this.processingList)
+        ...this.getProcessingDataByPriority(data.executeId, this.processingList)
         }
 
         return result

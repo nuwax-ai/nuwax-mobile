@@ -54,7 +54,7 @@ export default {
       };
     },
     previewUrl() {
-      if (!this.src) return '';
+      if (typeof this.src !== 'string' || this.src.length === 0) return '';
       
       // Get the base URL for the preview page
       // In production, H5 is served under /m/ path
@@ -81,7 +81,7 @@ export default {
   watch: {
     src: {
       handler(newSrc) {
-        if (newSrc) {
+        if (typeof newSrc === 'string' && newSrc.length > 0) {
           this.loading = true;
           this.error = null;
         }
@@ -100,8 +100,15 @@ export default {
   },
   methods: {
     i18n(key, fallback = '') {
-      const value = translateText(key || '');
-      return value || fallback || key;
+      const safeKey = typeof key === 'string' ? key : '';
+      const value = translateText(safeKey);
+      if (typeof value === 'string' && value.length > 0) {
+        return value;
+      }
+      if (typeof fallback === 'string' && fallback.length > 0) {
+        return fallback;
+      }
+      return safeKey;
     },
     getPreviewBaseUrl() {
       // 判断是否为开发环境
@@ -133,7 +140,7 @@ export default {
       // Validate message origin if needed
       const data = event.data;
       
-      if (!data || !data.type) return;
+      if (data == null || data.type == null) return;
       
       console.log('[FilePreviewH5] Received message:', data);
       
@@ -143,7 +150,7 @@ export default {
         this.$emit('load');
       } else if (data.type === 'preview_error') {
         this.loading = false;
-        this.error = data.error || this.i18n('Mobile.FilePreview.documentRenderFailed');
+        this.error = data.error != null ? data.error : this.i18n('Mobile.FilePreview.documentRenderFailed');
         this.$emit('error', data.error);
       }
     },
@@ -154,7 +161,7 @@ export default {
       
       // Force iframe reload by toggling src
       const iframe = this.$refs.previewIframe;
-      if (iframe) {
+      if (iframe != null) {
         const currentSrc = iframe.src;
         iframe.src = '';
         this.$nextTick(() => {

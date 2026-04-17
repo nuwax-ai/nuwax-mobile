@@ -1,0 +1,98 @@
+<template>
+    <x-dropdown>
+        <view class="trigger" @click="onClick?.()">
+            <text v-if="showIcon" class="iconfont" :class="[icon]"></text>
+            <text v-if="showLabel">{{displayLabel}}</text>
+        </view>
+
+        <template #menu>
+            <view class="custom-menu">
+                <view v-for="item in list" :key="item.value" class="custom-menu-item" hover-class="custom-menu-item-active" @click="item?.onClick?.(item)">
+                    <text class="iconfont" :class="item?.icon" v-if="item?.icon" ></text>
+                    <text class="menu-text">{{ translateText(item?.label) }}</text>
+                </view>
+            </view>
+        </template>
+    </x-dropdown>
+</template>
+  
+<script setup lang="ts">
+    import type { MenuListItem } from '@/types/interfaces/common'
+    import { translateText } from "@/utils/i18n";
+    interface Props{
+        icon?:string;
+        showIcon?: boolean;
+        label?:string;
+        showLabel?: boolean;
+        list: MenuListItem[];
+        onClick?: (item: MenuListItem) => void;
+    }
+
+    // 接收组件属性，设置默认值
+    const props = withDefaults(defineProps<Props>(), {
+        icon:'icon-Menu',
+        showIcon: true,
+        label:'Mobile.Common.menu',
+        showLabel: false,
+        list: () => [],
+        onClick: () => {},
+    })
+
+    const displayLabel = computed(() => translateText(props.label));
+</script>
+  
+<style lang="scss" scoped>
+    .trigger{
+        display:flex;
+        flex-direction:row;
+        justify-content:center;
+        align-items:center;
+
+        .iconfont {
+            font-size: 50rpx;
+            color: #333;
+        }
+    }
+
+    .custom-menu {
+        width: 300rpx;
+        background: white;
+        border-radius: 8rpx;
+        box-shadow: 0 2rpx 20rpx rgba(0, 0, 0, 0.1);
+        border: 1rpx solid rgba(12, 20, 102, 0.04);;
+        overflow: hidden;
+
+        .custom-menu-item {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            justify-content: flex-start;
+            padding: 24rpx 16rpx;
+            gap: 8rpx;
+            border-bottom: 1rpx solid rgba(12, 20, 102, 0.04);;
+
+            &-active {
+                background: rgba(12, 20, 102, 0.04);;
+            }
+
+            &:last-child {
+                border-bottom: none;
+            }
+
+            .iconfont {
+                font-size: 32rpx;
+                color: #333;
+            }
+
+            .menu-text {
+                font-size: 28rpx;
+                color: #333;
+            }
+
+            .icon-Star-fill {
+                color: #faad14;
+            }
+        }
+
+    }
+</style>

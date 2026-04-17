@@ -378,7 +378,7 @@
     },
   };
 </script>
-<script>
+<script lang="ts">
   import markdownContainer from '../container/container.vue'
   import taskResult from '../task-result/task-result.vue'
   import { getProcessingDataByPriority } from '../container/utils'

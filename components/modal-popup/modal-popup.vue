@@ -1,0 +1,172 @@
+<template>
+  <uni-popup ref="popupRef" :is-mask-click="maskClick">
+    <view
+      class="modal-wrapper"
+      @touchstart="handleTouchStart"
+      @touchmove="handleTouchMove"
+      @touchend="handleTouchEnd"
+    >
+      <view
+        class="modal-content"
+        :class="{ 'modal-show': visible }"
+        :style="contentStyle"
+      >
+        <view class="head-box" v-if="showHeader">
+          <view class="title">
+            <text class="text-ellipsis">{{ displayTitle }}</text>
+          </view>
+          <slot name="header-extra"></slot>
+          <view class="close-btn" @tap="close" v-if="showCloseBtn">
+            <text class="iconfont icon-X"></text>
+          </view>
+        </view>
+        <view class="content-box">
+          <slot></slot>
+        </view>
+      </view>
+      <view class="modal-mask" @tap="close"></view>
+    </view>
+  </uni-popup>
+</template>
+
+<script setup lang="ts">
+  import { ref, computed, nextTick, onUnmounted } from "vue";
+  import { translateText } from "@/utils/i18n";
+
+  interface UniPopupInstance {
+    open(type?: string): void;
+    close(): void;
+  }
+
+  const props = defineProps({
+    title: {
+      type: String,
+      default: "",
+    },
+    width: {
+      type: String,
+      default: "80vw",
+    },
+    maskClick: {
+      type: Boolean,
+      default: true,
+    },
+    showHeader: {
+      type: Boolean,
+      default: true,
+    },
+    showCloseBtn: {
+      type: Boolean,
+      default: true,
+    },
+  });
+
+  const emit = defineEmits(["update-visible"]);
+  const popupRef = ref<UniPopupInstance | null>(null);
+
+  const visible = ref(false);
+  const displayTitle = computed(() => translateText(props.title));
+
+  // 滑动关闭相关状态
+  const touchStartX = ref<number>(0);
+  const touchStartY = ref<number>(0);
+  const isSwiping = ref<boolean>(false);
+  const swipeOffset = ref<number>(0);
+  const swipeThreshold = 50; // 灵敏度保持与优化后的一致
+
+  const handleTouchStart = (e: any) => {
+    if (!e.touches || e.touches.length === 0) return;
+    touchStartX.value = e.touches[0].clientX;
+    touchStartY.value = e.touches[0].clientY;
+    isSwiping.value = false;
+    swipeOffset.value = 0;
+  };
+
+  const handleTouchMove = (e: any) => {
+    if (!e.touches || e.touches.length === 0) return;
+    const currentX = e.touches[0].clientX;
+    const currentY = e.touches[0].clientY;
+    const diffX = Math.abs(currentX - touchStartX.value);
+    const diffY = Math.abs(currentY - touchStartY.value);
+
+    // 水平位移大于垂直位移且超过最小阈值，判定为水平滑动
+    if (diffX > diffY && diffX > 5) {
+      isSwiping.value = true;
+      swipeOffset.value = currentX - touchStartX.value;
+      // 仅在水平滑动时阻止默认行为
+      e.preventDefault();
+    }
+  };
+
+  const handleTouchEnd = (e: any) => {
+    if (!isSwiping.value) return;
+
+    if (Math.abs(swipeOffset.value) > swipeThreshold) {
+      close();
+    }
+
+    isSwiping.value = false;
+    swipeOffset.value = 0;
+  };
+
+  const contentStyle = computed(() => {
+    const style = {} as Record<string, any>;
+    style.width = props.width;
+    return style;
+  });
+
+  // 打开弹窗
+  const open = () => {
+    if (!popupRef.value) return;
+
+    popupRef.value.open();
+    emit("update-visible", true);
+
+    // 禁用侧滑返回（App 平台）
+    // #ifdef APP
+    uni.setPageStyle({
+      "popGesture": "none"
+    });
+    // #endif
+
+    setTimeout(() => {
+      visible.value = true;
+    }, 20);
+  };
+
+  // 关闭弹窗
+  const close = () => {
+    visible.value = false;
+    // 等待平滑消失动画
+    setTimeout(() => {
+      popupRef.value?.close();
+    }, 200);
+    emit("update-visible", false);
+
+    // 恢复侧滑返回（App 平台）
+    // #ifdef APP
+    uni.setPageStyle({
+      "popGesture": "close"
+    });
+    // #endif
+  };
+
+  onUnmounted(() => {
+    // #ifdef APP
+    uni.setPageStyle({
+      "popGesture": "close"
+    });
+    // #endif
+  });
+
+  defineExpose({
+    open,
+    close,
+    popupRef,
+    visible,
+  });
+</script>
+
+<style scoped lang="scss">
+  @import "./modal-popup.scss";
+</style>

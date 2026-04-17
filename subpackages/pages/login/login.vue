@@ -1,0 +1,159 @@
+<template>
+  <view>
+    <login-layout
+      :title="tenantConfigInfo?.siteName"
+      :logo="tenantConfigInfo?.siteLogo"
+    >
+      <login-form
+        v-if="!loading"
+        v-show="currentFormType === 'login'"
+        :tenantConfigInfo="tenantConfigInfo"
+        @show-verify="handleShowVerify"
+        :redirectUrl="redirectUrl"
+      />
+      <captcha-verify
+        v-if="currentFormType === 'verify'"
+        :phoneOrEmail="phoneOrEmail"
+        :tenantConfigInfo="tenantConfigInfo"
+        @verify-login="handleLoginByCode"
+        @back="handleBack"
+      />
+      <reset-password v-show="currentFormType === 'reset'" @back="handleBack" />
+    </login-layout>
+  </view>
+</template>
+
+<script setup lang="ts">
+  import LoginLayout from "./components/login-layout/login-layout.vue";
+  import { ref } from "vue";
+  import { apiLogin } from "@/servers/account";
+  import type { ILoginResult, LoginFieldType } from "@/types/interfaces/login";
+  import { SUCCESS_CODE, AGENT_NOT_EXIST } from "@/constants/codes.constants";
+  import { ACCESS_TOKEN, EXPIRE_DATE } from "@/constants/home.constants";
+  import {
+    apiTenantConfig,
+    apiSendCode,
+    apiLoginCode,
+  } from "@/servers/account";
+  import type { TenantConfigInfo } from "@/types/interfaces/login";
+  import CaptchaVerify from "./components/captcha-verify/captcha-verify.vue";
+  import SegmentedControl from "@/components/segmented-control/segmented-control.vue";
+  import LoginForm from "./components/login-form/login-form.vue";
+  import ResetPassword from "./components/reset-password/reset-password.vue";
+  import { redirectTo } from "@/utils/common";
+  import { useI18n } from "@/utils/i18n";
+
+  const { t, ensureLangList } = useI18n();
+
+  // 当前显示 form 表单类型登录-login/验证码-verify/修改密码-reset
+  const currentFormType = ref("login");
+  // 手机号
+  const phoneOrEmail = ref("");
+  const captchaVerifyParam = ref(""); // 阿里云验证码参数
+  const redirectUrl = ref("");
+  const tenantConfigInfo = ref<TenantConfigInfo>(null); // 配置信息
+
+  // 加载中
+  const loading = ref(false);
+  // 获取用户配置
+  const fetchTenantConfig = async () => {
+    try {
+      loading.value = true;
+      const { code, data } = await apiTenantConfig();
+      const siteName = data?.siteName;
+      if (code === SUCCESS_CODE && siteName) {
+        // data.authType = 3; // 临时改变-邮箱登录
+        tenantConfigInfo.value = data;
+        uni.setNavigationBarTitle({ title: siteName });
+      }
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  // 登录
+  const handleShowVerify = async (value: string, captcha: string) => {
+    currentFormType.value = "verify";
+    phoneOrEmail.value = value;
+    captchaVerifyParam.value = captcha;
+  };
+  // 返回登录
+  const handleBack = () => {
+    currentFormType.value = "login";
+  };
+  // 验证码输入完成登录
+  const handleLoginByCode = async (code: string) => {
+    const params = {
+      phoneOrEmail: phoneOrEmail.value,
+      code,
+      captchaVerifyParam: captchaVerifyParam.value,
+    };
+    const result = await apiLoginCode(params);
+    handleLoginSuccess(result);
+  };
+
+  // 登录成功后
+  const handleLoginSuccess = (result: ILoginResult) => {
+    const { code, data, message } = result || {};
+    // 登录失败
+    if (code === AGENT_NOT_EXIST) {
+      uni.showToast({
+        title: message,
+        icon: "none",
+      });
+      return;
+    }
+
+    // 登录成功
+    if (code === SUCCESS_CODE) {
+      // #ifdef H5 || WEB
+      if (process.env.NODE_ENV === "development") {
+        uni.setStorageSync(ACCESS_TOKEN, data.token);
+      }
+      // #endif
+
+      // #ifdef MP-WEIXIN
+      uni.setStorageSync(ACCESS_TOKEN, data.token);
+      // #endif
+
+      // data.resetPass=0
+      // 判断是否已经修改过密码 0-未修改/1-已修改
+      if (!data?.resetPass) {
+        currentFormType.value = "reset";
+        return;
+      }
+      // 验证码登录
+      uni.showToast({
+        title: t("Mobile.Auth.loginSuccess"),
+        icon: "success",
+      });
+      setTimeout(() => {
+        redirectTo(redirectUrl.value);
+      }, 1000);
+    }
+  };
+
+  onLoad((query) => {
+    // 登录成功后跳转的页面
+    if (query.redirect) {
+      // 免跳转白名单
+      const whiteList = ["/subpackages/pages/temporary-session/temporary-session"];
+      const redirect = decodeURIComponent(query.redirect);
+      if (!whiteList.includes(redirect)) {
+        redirectUrl.value = redirect;
+      } else {
+        redirectUrl.value = "/pages/index/index";
+      }
+      // console.log("登录成功后跳转的页面:", redirectUrl.value)
+    }
+  });
+
+  onMounted(() => {
+    fetchTenantConfig();
+    // #ifdef H5
+    ensureLangList();
+    // #endif
+  });
+</script>
+
+<style lang="scss" scoped></style>

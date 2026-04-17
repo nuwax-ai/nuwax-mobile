@@ -1,0 +1,229 @@
+<template>
+  <drawer-popup
+    ref="popup"
+    :title="t('Mobile.Conversation.more')"
+    direction="bottom"
+    :auto-height="true"
+    default-height="15%"
+    max-height="40%"
+  >
+    <view class="menu-list">
+      <view class="menu-item" @click="handleCollect">
+        <text class="iconfont icon-Star" v-if="!agentInfo?.collect" />
+        <text class="iconfont icon-Star-fill" v-else />
+        <text class="menu-text text-ellipsis">{{
+          t("Mobile.Conversation.favorite")
+        }}</text>
+      </view>
+      <view class="menu-item" @click="handleShare">
+        <text class="iconfont icon-Share" />
+        <text class="menu-text text-ellipsis">{{
+          t("Mobile.Conversation.share")
+        }}</text>
+      </view>
+      <view class="menu-item" @click="handleMoreInfo">
+        <text class="iconfont icon-Info" />
+        <text class="menu-text text-ellipsis">{{
+          t("Mobile.Conversation.moreInfo")
+        }}</text>
+      </view>
+      <template v-if="isTaskAgent && hasHistory">
+        <view class="menu-item" @click="handleRestartAgent">
+          <text class="iconfont icon-restart" />
+          <text class="menu-text text-ellipsis">{{ t("Mobile.Sandbox.restartAgent") }}</text>
+        </view>
+        <view class="menu-item" @click="handleRestartSandbox">
+          <text class="iconfont icon-restart_agent" />
+          <text class="menu-text text-ellipsis">{{
+            currentSandboxId === "-1" ? t("Mobile.Sandbox.restartCloudComp") : t("Mobile.Sandbox.restartClient")
+          }}</text>
+        </view>
+      </template>
+    </view>
+  </drawer-popup>
+
+  <drawer-popup
+    ref="popupMore"
+    direction="bottom"
+    height="85vh"
+    :show-header="true"
+  >
+    <more-info v-if="agentInfo" :agent-info="agentInfo" />
+    <related-conversation
+      v-if="agentInfo"
+      :agent-info="agentInfo"
+      @view-all="handleViewAll"
+    />
+  </drawer-popup>
+  <drawer-popup
+    ref="popupViewAll"
+    :title="t('Mobile.Conversation.allConversations')"
+    direction="bottom"
+    height="85vh"
+  >
+    <!-- 根据智能体id动态获取历史记录 -->
+    <agent-conversation-history
+      v-if="agentInfo"
+      :agent-id="agentInfo.agentId"
+    />
+  </drawer-popup>
+</template>
+
+<script setup lang="ts">
+  import { ref } from "vue";
+  import MoreInfo from "../more-info/more-info.vue";
+  import RelatedConversation from "../related-conversation/related-conversation.vue";
+  import type { AgentDetailDto } from "@/types/interfaces/agent";
+  import type { ConversationInfo } from "@/types/interfaces/conversationInfo";
+  import AgentConversationHistory from "../agent-conversation-history/agent-conversation-history.vue";
+  import { useI18n } from "@/utils/i18n";
+
+  const { t } = useI18n();
+
+  interface Props {
+    agentInfo: AgentDetailDto;
+    isTaskAgent?: boolean;
+    hasHistory?: boolean;
+    currentSandboxId?: string;
+  }
+
+  // 接收组件属性，设置默认值
+  const props = withDefaults(defineProps<Props>(), {
+    isTaskAgent: false,
+    hasHistory: false,
+    currentSandboxId: "",
+  });
+
+  // 定义事件
+  const emit = defineEmits(["collect", "restartAgent", "restartSandbox"]);
+
+  const popup = ref<any>(null);
+  const popupMore = ref<any>(null);
+  const popupViewAll = ref<any>(null);
+  const chatList = ref<ConversationInfo[]>([]);
+
+  // 打开抽屉
+  const open = () => {
+    popup.value?.open();
+  };
+
+  // 关闭抽屉
+  const close = () => {
+    popup.value?.close();
+  };
+
+  // 收藏功能
+  const handleCollect = () => {
+    close();
+    emit("collect");
+  };
+
+  // 分享功能
+  const handleShare = () => {
+    // 获取当前页面URL
+    let currentUrl = "";
+
+    // #ifdef H5
+    currentUrl = window.location.href;
+    // #endif
+
+    // #ifdef MP-WEIXIN
+    // 微信小程序中获取当前页面路径
+    const pages = getCurrentPages();
+    const currentPage = pages[pages.length - 1];
+    currentUrl = `/${currentPage.route}`;
+    if (currentPage.options && Object.keys(currentPage.options).length > 0) {
+      const params = Object.keys(currentPage.options)
+        .map((key) => `${key}=${currentPage.options[key]}`)
+        .join("&");
+      currentUrl += `?${params}`;
+    }
+    // #endif
+
+    // 复制到剪贴板
+    uni.setClipboardData({
+      data: currentUrl,
+      success: () => {
+        uni.showToast({
+          title: t("Mobile.Link.copyAndOpen"),
+          icon: "success",
+          duration: 2000,
+        });
+      },
+      fail: (err) => {
+        console.error("复制失败:", err);
+        uni.showToast({
+          title: t("Mobile.Common.copyFailed"),
+          icon: "error",
+          duration: 2000,
+        });
+      },
+    });
+
+    close();
+  };
+
+  // 更多信息功能
+  const handleMoreInfo = () => {
+    close();
+    popupMore.value?.open();
+  };
+
+  // 重启智能体
+  const handleRestartAgent = () => {
+    close();
+    emit("restartAgent");
+  };
+
+  // 重启容器环境
+  const handleRestartSandbox = () => {
+    close();
+    emit("restartSandbox");
+  };
+  const handleViewAll = (data: ConversationInfo[]) => {
+    chatList.value = data;
+    popupViewAll.value?.open();
+  };
+
+  onLoad(() => {});
+
+  defineExpose({
+    open,
+    close,
+    popupMore,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .menu-list {
+    .menu-item {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      padding: 20rpx 30rpx;
+      transition: background-color 0.2s;
+      border-radius: 8rpx;
+
+      &:active {
+        background-color: rgba(12, 20, 102, 0.04);
+      }
+
+      .iconfont {
+        font-size: 40rpx;
+        color: #333;
+      }
+
+      .icon-Star-fill {
+        color: #faad14;
+      }
+
+      .menu-text {
+        margin-left: 24rpx;
+        font-size: 32rpx;
+        line-height: 48rpx;
+        color: rgba(21, 23, 31, 0.7);
+        flex: 1;
+      }
+    }
+  }
+</style>

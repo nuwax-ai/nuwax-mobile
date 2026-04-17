@@ -1,0 +1,268 @@
+import { ALLOW_EXTERNAL_LINK_DOMAIN } from "@/constants/config";
+import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiTenantConfig } from "@/servers/account";
+import { apiGetStaticFileList } from "@/servers/agentDev";
+import { t } from "@/utils/i18n";
+
+const SYSTEM_INFO = uni.getSystemInfoSync();
+
+export const getStatusBarHeight = () => SYSTEM_INFO.statusBarHeight || 15;
+
+export const formatDate = (
+  input: string | number | Date,
+  format: "YYYY-MM-DD" | "MM-DD" | "HH:mm" = "MM-DD",
+): string => {
+  const date = new Date(input);
+
+  const YYYY = date.getFullYear();
+  const MM = String(date.getMonth() + 1).padStart(2, "0");
+  const DD = String(date.getDate()).padStart(2, "0");
+  const HH = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+
+  switch (format) {
+    case "YYYY-MM-DD":
+      return `${YYYY}-${MM}-${DD}`;
+    case "HH:mm":
+      return `${HH}:${mm}`;
+    default:
+      return `${MM}-${DD}`;
+  }
+};
+
+// 判断是否是允许外部链接跳转的域名
+export const isAllowExternalLinkDomain = (url: string) => {
+  return ALLOW_EXTERNAL_LINK_DOMAIN.some((domain) => url.includes(domain));
+};
+
+/**
+ * 根据链接地址判断不允许调整的页面需要复制链接到剪切板
+ * @param url 链接地址
+ * @returns void
+ */
+export const handleExternalLink = (url: string) => {
+  // 如果链接地址为空，则提示链接地址配置错误
+  if (!url) {
+    uni.showToast({
+      title: t("Mobile.Link.invalidConfig"),
+      icon: "none",
+    });
+    return;
+  }
+
+  // #ifdef H5 || WEB
+  // H5 环境直接打开外部链接
+  try {
+    // 判断是否为有效的 URL
+    const isValidUrl =
+      url.startsWith("http://") ||
+      url.startsWith("https://") ||
+      url.startsWith("//");
+
+    if (isValidUrl) {
+      // 尝试在新标签页中打开链接
+      const newWindow = window.open(url, "_blank");
+
+      // 检查是否被浏览器拦截（某些浏览器会阻止弹窗）
+      if (
+        !newWindow ||
+        newWindow.closed ||
+        typeof newWindow.closed === "undefined"
+      ) {
+        // 如果被拦截，提示用户并复制链接到剪贴板
+        console.warn("链接被浏览器拦截，使用备用方案");
+
+        // 尝试复制到剪贴板
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard
+            .writeText(url)
+            .then(() => {
+              uni.showToast({
+                title: t("Mobile.Link.copyAndOpen"),
+                icon: "none",
+                duration: 3000,
+              });
+            })
+            .catch(() => {
+              // 如果复制失败，直接在当前页面打开
+              window.location.href = url;
+            });
+        } else {
+          // 如果不支持剪贴板 API，直接在当前页面打开
+          window.location.href = url;
+        }
+      }
+    } else {
+      // 如果不是完整的 URL，使用 navigateTo 跳转到 webview 页面
+      uni.navigateTo({
+        url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(url)}`,
+      });
+    }
+  } catch (error) {
+    console.error("打开链接失败:", error);
+    uni.showToast({
+      title: t("Mobile.Link.openFailed"),
+      icon: "none",
+    });
+  }
+  // #endif
+
+  // #ifdef MP-WEIXIN
+  // 如果允许外部链接跳转，则打开外部链接
+  if (isAllowExternalLinkDomain(url)) {
+    uni.navigateTo({
+      url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(url)}`,
+    });
+  } else {
+    uni.setClipboardData({
+      data: url,
+      success: () => {
+        uni.showToast({
+          title: t("Mobile.Link.copied"),
+          icon: "none",
+        });
+      },
+    });
+  }
+  // #endif
+};
+
+// 获取用户配置并设置页面标题和缓存租户信息
+export const fetchTenantConfig = async () => {
+  const { code, data } = await apiTenantConfig();
+  const siteName = data?.siteName;
+  if (code === SUCCESS_CODE && siteName) {
+    // 设置当前页面导航栏标题
+    uni.setNavigationBarTitle({ title: siteName });
+    // 缓存租户信息
+    uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(data));
+  }
+};
+
+// 设置当前页面导航栏标题
+export const setCurrentPageNavigationBarTitle = async () => {
+  // 获取本地用户配置
+  const tenantConfigInfoString = await uni.getStorageSync(TENANT_CONFIG_INFO);
+  if (tenantConfigInfoString) {
+    try {
+      // JSON.parse 返回 unknown，这里显式约束为仅关心 siteName 的结构
+      const tenantConfig = JSON.parse(tenantConfigInfoString) as {
+        siteName?: string;
+      };
+      const { siteName } = tenantConfig;
+      if (siteName) {
+        // 设置当前页面导航栏标题
+        uni.setNavigationBarTitle({ title: siteName });
+        return;
+      }
+    } catch (error) {
+      console.error("获取本地用户配置失败:", error);
+    }
+  }
+  fetchTenantConfig(); // 获取用户配置并设置页面标题和缓存租户信息
+};
+
+
+// 根据会话id和文件路径 跳转至预览页面
+export const jumpToFilePreviewPage = (conversationId: string, fileProxyUrl: string) => {
+  if(!conversationId || !fileProxyUrl) {
+    return;
+  }
+  const path = "/subpackages/pages/file-preview-page/file-preview-page";
+  const url = `${path}?cId=${conversationId}&fileProxyUrl=${encodeURIComponent(fileProxyUrl)}`;
+  uni.navigateTo({ url });
+};
+
+// 根据会话id查询文件列表并根据文件路径获取到文件代理url
+export const getFileProxyUrlByConversationIdAndFilePath = async (conversationId: string, filePath: string) => {
+  if(!conversationId || !filePath) {
+    return null;
+  }
+  // 接口要求 number 类型，先做显式转换并校验，避免把非法字符串传入服务层
+  const normalizedConversationId = Number(conversationId);
+  if (Number.isNaN(normalizedConversationId)) {
+    return null;
+  }
+  const result = await apiGetStaticFileList(normalizedConversationId);
+  if (result.code === SUCCESS_CODE) {
+    const { files } = result.data || {};
+    const file = files.find((item) => item.name === filePath);
+    return file?.fileProxyUrl;
+  }
+  return null;
+};
+
+/**
+ * 任务结果数据
+ */
+interface TaskResultData {
+  hasTaskResult: boolean;
+  description?: string;
+  file?: string;
+}
+
+/**
+ * 提取任务结果数据
+ * @param text 文本
+ * @returns 任务结果数据
+ */
+export const extractTaskResult = (text: string): TaskResultData => {
+  const result: TaskResultData = {
+    hasTaskResult: false,
+  };
+
+  if (!text) return result;
+
+  // 1️⃣ 匹配 <task-result>...</task-result>
+  const taskResultMatch = text.match(/<task-result>([\s\S]*?)<\/task-result>/);
+
+  if (!taskResultMatch) {
+    return result;
+  }
+
+  result.hasTaskResult = true;
+  const taskResultContent = taskResultMatch[1];
+
+  // 2️⃣ 提取 description
+  const descriptionMatch = taskResultContent.match(
+    /<description>([\s\S]*?)<\/description>/,
+  );
+  if (descriptionMatch) {
+    result.description = descriptionMatch[1].trim();
+  }
+
+  // 3️⃣ 提取 file
+  const fileMatch = taskResultContent.match(/<file>([\s\S]*?)<\/file>/);
+  if (fileMatch) {
+    result.file = fileMatch[1].trim();
+  }
+
+  return result;
+};
+
+
+
+/**
+ * 提取字符串中最后一个 <task-result> 内的 <file> 内容
+ * @param text 原始字符串
+ * @returns file 内容或 null
+ */
+export const extractLastTaskResultFile = (text: string): string | null => {
+  if (!text) return null;
+
+  // 匹配所有 <task-result>...</task-result>
+  const taskResultMatches = text.match(/<task-result>[\s\S]*?<\/task-result>/g);
+
+  if (!taskResultMatches || taskResultMatches.length === 0) {
+    return null;
+  }
+
+  // 取最后一个 <task-result>
+  const lastTaskResult = taskResultMatches[taskResultMatches.length - 1];
+
+  // 在其中提取 <file> 内容
+  const fileMatch = lastTaskResult.match(/<file>([\s\S]*?)<\/file>/);
+
+  return fileMatch?.[1]?.trim() ?? null;
+};

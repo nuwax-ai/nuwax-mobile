@@ -95,9 +95,9 @@
 
 <script>
 import uniIcons from '@/uni_modules/uni-icons/components/uni-icons/uni-icons.vue'
-import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
+import { AgentComponentTypeEnum } from '@/types/enums/agent';
 import { getCurrentPageParams } from '@/utils/common';
-import { getFileProxyUrlByConversationIdAndFilePath, jumpToFilePreviewPage } from '@/utils/system.uts';
+import { getFileProxyUrlByConversationIdAndFilePath, jumpToFilePreviewPage } from '@/utils/system';
 import { t } from '@/utils/i18n';
 import toolDetailsModal from '../tool-details-modal/tool-details-modal.vue';
 

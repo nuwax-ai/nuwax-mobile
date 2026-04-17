@@ -1,0 +1,114 @@
+<template>
+  <view class="container page-container">
+    <!-- #ifdef H5 -->
+    <login-lang-switcher />
+    <!-- #endif -->
+     
+    <safety-zone />
+    <!-- #ifdef MP-WEIXIN -->
+    <custom-nav-bar
+      v-if="showNavBar"
+      :show-back="showBack"
+      :has-safety-zone="false"
+      :transparent-background="true"
+    />
+    <!-- #endif -->
+    <view class="content-weixin">
+      <view class="header-content">
+        <image
+          v-if="!!logo"
+          class="icon"
+          :src="logo"
+          mode="aspectFill"
+          :alt="t('Mobile.Common.appLogoAlt')"
+        />
+        <view class="title"> {{ title }} </view>
+      </view>
+      <view class="form-content">
+        <slot name="default"></slot>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="ts">
+  import { useI18n } from "@/utils/i18n";
+  import LoginLangSwitcher from "../login-lang-switcher/login-lang-switcher.vue";
+  const { t } = useI18n();
+
+  // 定义组件props
+  interface Props {
+    title?: string;
+    logo?: string;
+    showNavBar?: boolean;
+    showBack?: boolean;
+  }
+
+  const props = withDefaults(defineProps<Props>(), {
+    title: "",
+    logo: "",
+    showNavBar: true,
+    showBack: true,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: linear-gradient(180deg, rgb(150, 136, 230) 0%, #f8b1c5 100%);
+
+    .content-weixin {
+      flex: 1;
+      min-height: 0; /* 允许收缩 */
+      overflow: auto;
+      padding: 16rpx;
+      /* 隐藏滚动条 */
+      scrollbar-width: none; /* Firefox */
+      -ms-overflow-style: none; /* IE and Edge */
+      &::-webkit-scrollbar {
+        display: none; /* Chrome, Safari, Opera */
+      }
+
+      .header-content {
+        display: flex;
+        flex-direction: row;
+        justify-content: center;
+        align-items: center;
+        height: 256rpx;
+
+        .icon {
+          width: 96rpx;
+          height: 96rpx;
+          border-radius: 32rpx;
+        }
+
+        .title {
+          margin-left: 20rpx;
+          font-weight: 600;
+          font-style: Semibold;
+          font-size: 32rpx;
+          leading-trim: NONE;
+          line-height: 48rpx;
+          letter-spacing: 0rpx;
+          vertical-align: middle;
+          color: rgba(255, 255, 255, 1);
+        }
+      }
+
+      .form-content {
+        flex-shrink: 0; /* 防止内容被压缩 */
+        padding: 48rpx;
+        background-color: rgba(255, 255, 255, 0.95);
+        border-radius: 32rpx;
+      }
+    }
+  }
+</style>

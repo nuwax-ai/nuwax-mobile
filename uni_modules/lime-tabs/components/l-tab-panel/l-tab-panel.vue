@@ -28,12 +28,12 @@
 		setup(props) {
 			const children = inject<LTabPanelComponentPublicInstance[]|null>('LimeTabs', null) as Ref<LTabPanelComponentPublicInstance[]>|null;
 			onMounted(()=>{
-				if(!children) return
+				if(children == null) return
 				children.value.push(props)
 			})
 			
 			onUnmounted(()=>{
-				if(!children) return
+				if(children == null) return
 				children.value = children.value.filter((it):boolean => it != props)
 			})
 			

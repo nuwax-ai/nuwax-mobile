@@ -53,7 +53,7 @@
 			const { $limeIconsHost: $iconsHost } = uni as any
 			const IconifyURL = 'https://api.iconify.design/'
 			// const isAPP = uni.getSystemInfoSync().uniPlatform == 'app'
-			const innerName = computed(():string => props.name || '')
+			const innerName = computed(():string => props.name != null ? props.name : '')
 			const hasHost = computed(() => `${innerName.value}`.indexOf('/') !== -1);
 			const isIconify = computed(() => !hasHost.value && `${innerName.value}`.includes(':'))
 			const collectionIcon = computed(() => isObject($iconCollection) && $iconCollection.icons[innerName.value])
@@ -93,7 +93,7 @@
 				const hasIconsHost = $iconsHost != null && $iconsHost != '' 
 				// const hasIconCollection = $iconCollectiont != null
 				if (isImage.value) {
-					return hasHost.value ? innerName.value : ($iconsHost || '') + innerName.value
+					return hasHost.value ? innerName.value : ($iconsHost != null ? $iconsHost : '') + innerName.value
 				} else if (isIconify.value) {
 					// 防止重绘
 					if(cacheMap.has(innerName.value) && !isError.value) {

@@ -419,8 +419,10 @@ function outputJSON(result: ScanResult, outputPath: string): void {
  * 主函数
  */
 function main() {
-  const projectRoot = path.resolve(process.argv[2] || '.');
-  const includeUniModules = process.argv.includes('--include-uni-modules');
+  const args = process.argv.slice(2);
+  const includeUniModules = args.includes('--include-uni-modules');
+  const projectArg = args.find(arg => !arg.startsWith('-'));
+  const projectRoot = path.resolve(projectArg || '.');
   const skipDirs = includeUniModules
     ? ['node_modules', 'dist', '.git', 'unpackage']
     : ['node_modules', 'dist', '.git', 'unpackage', 'uni_modules'];

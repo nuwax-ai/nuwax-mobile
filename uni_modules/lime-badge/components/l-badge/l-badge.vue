@@ -39,9 +39,7 @@
 	import { getClassStr } from '@/uni_modules/lime-shared/getClassStr'
 	import { getOffsetWithMinusString } from './utils'
 	const name = 'l-badge'
-	interface CSSProperties {
-		[key : string] : string | number | undefined;
-	}
+	type CSSProperties = Record<string, string | number | undefined>
 	export default defineComponent({
 		name,
 		props: badgeProps,

@@ -180,7 +180,7 @@
 							const index = currentIndex.value
 							const tabRect = tabsRects[index];
 							tabRects.value = tabsRects
-							if (!tabRect) return;
+							if (tabRect == null) return;
 							
 							let [distance] = calculateTabPositions(tabsRects, index)
 						
@@ -292,7 +292,7 @@
 			})
 
 			const stopVisibleWatch = watch(() => props.visible, (v) => {
-				if (!v) return
+				if (v !== true) return
 				setTimeout(() => {
 					moveToActiveTab()
 					updateInnerStyle(0)

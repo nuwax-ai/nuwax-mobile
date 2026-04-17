@@ -42,11 +42,11 @@
       <!-- #ifndef H5 -->
       <!-- 表格中的图片，使用 rich-text 防止大小不正确 -->
       <rich-text
-        v-if="n.name === 'img' && n.t"
+        v-if="n.name === 'img' && isTruthy(n.t)"
         :style="'display:' + n.t"
         :nodes="[
           {
-            attrs: { style: n.attrs.style || '', src: n.attrs.src },
+            attrs: { style: valOr(n.attrs.style, ''), src: n.attrs.src },
             name: 'img',
           },
         ]"
@@ -95,7 +95,7 @@
         :style="
           (ctrl[i] === -1 ? 'display:none;' : '') +
           'width:' +
-          (ctrl[i] || 1) +
+          toNumberOr(ctrl[i], 1) +
           'px;height:1px;' +
           n.attrs.style
         "
@@ -139,14 +139,14 @@
       <!-- 文本 -->
       <!-- #ifdef MP-WEIXIN -->
       <text
-        v-else-if="n.text"
+        v-else-if="isTruthy(n.text)"
         :user-select="opts[4] == 'force' && isiOS"
         decode
         >{{ n.text }}</text
       >
       <!-- #endif -->
       <!-- #ifndef MP-WEIXIN || MP-BAIDU || MP-ALIPAY || MP-TOUTIAO -->
-      <text v-else-if="n.text" decode>{{ n.text }}</text>
+      <text v-else-if="isTruthy(n.text)" decode>{{ n.text }}</text>
       <!-- #endif -->
       <text v-else-if="n.name === 'br'">{{ "\n" }}</text>
       <!-- 链接 -->
@@ -178,7 +178,7 @@
         :muted="n.attrs.muted"
         :object-fit="n.attrs['object-fit']"
         :poster="n.attrs.poster"
-        :src="n.src[ctrl[i] || 0]"
+        :src="n.src[toNumberOr(ctrl[i], 0)]"
         :data-i="i"
         @play="play"
         @error="mediaError"
@@ -209,14 +209,14 @@
         :loop="n.attrs.loop"
         :name="n.attrs.name"
         :poster="n.attrs.poster"
-        :src="n.src[ctrl[i] || 0]"
+        :src="n.src[toNumberOr(ctrl[i], 0)]"
         :data-i="i"
         @play="play"
         @error="mediaError"
       />
       <!-- #endif -->
       <view
-        v-else-if="(n.name === 'table' && n.c) || n.name === 'li'"
+        v-else-if="(n.name === 'table' && isTruthy(n.c)) || n.name === 'li'"
         :id="n.attrs.id"
         :class="'_' + n.name + ' ' + n.attrs.class"
         :style="n.attrs.style"
@@ -303,7 +303,7 @@
         </view>
       </view>
       <rich-text
-        v-else-if="!n.c"
+        v-else-if="isTruthy(n.c) === false"
         :id="n.attrs.id"
         :style="'display:inline;' + n.f"
         :class="
@@ -438,6 +438,25 @@
         }
         return true
       },
+      getFirstChildText (children: any): string {
+        if (Array.isArray(children) === false) {
+          return ''
+        }
+        if (children.length === 0) {
+          return ''
+        }
+        const first = children[0]
+        if (first == null) {
+          return ''
+        }
+        return typeof first.text === 'string' ? first.text : ''
+      },
+      toNumberOr (value: any, fallback: number): number {
+        if (typeof value === 'number') {
+          return value
+        }
+        return fallback
+      },
       /**
        * @description 判断是否为行内标签（替代原 WXS handler 模块，APP 端不支持 WXS）
        */
@@ -463,13 +482,17 @@
        */
       getConversationId() {
         // 尝试从根组件获取会话ID
-        if (this.root != null && this.isTruthy(this.root.conversationId)) {
-          return this.root.conversationId
+        if (this.root != null) {
+          if (this.isTruthy(this.root.conversationId)) {
+            return this.root.conversationId
+          }
         }
         // 尝试从mp-html组件获取
         for (let parent = this.$parent; parent != null; parent = parent.$parent) {
-          if (parent.conversationId != null && parent.conversationId.length > 0) {
-            return parent.conversationId
+          if (parent.conversationId != null) {
+            if (parent.conversationId.length > 0) {
+              return parent.conversationId
+            }
           }
         }
         return ''
@@ -489,7 +512,12 @@
         }
 
         // Ensure data is an object before spreading
-        if (typeof data !== 'object' || data === null) {
+        const dataType = typeof data
+        const isObjectType = dataType === 'object'
+        if (isObjectType === false) {
+          return {}
+        }
+        if (data === null) {
           return {}
         }
 
@@ -510,7 +538,14 @@
       play (e) {
         const dataIndex = e.currentTarget.dataset.i
         const node = this.childs[dataIndex]
-        const currentSrc = this.ctrl[dataIndex] != null && node.src != null && node.src[this.ctrl[dataIndex]] != null ? node.src[this.ctrl[dataIndex]] : null
+        let currentSrc = null
+        if (this.ctrl[dataIndex] != null) {
+          if (node.src != null) {
+            if (node.src[this.ctrl[dataIndex]] != null) {
+              currentSrc = node.src[this.ctrl[dataIndex]]
+            }
+          }
+        }
         this.root.$emit('play', {
           source: node.name,
           attrs: {
@@ -519,7 +554,7 @@
           }
         })
         // #ifndef H5
-        const shouldPause = this.root.pauseVideo === true || (this.root.pauseVideo != null && typeof this.root.pauseVideo === 'string' && this.root.pauseVideo.length > 0)
+        const shouldPause = this.isTruthy(this.root.pauseVideo)
         if (shouldPause === true) {
           const targetId = e.target.id
           const originVideos = this.root._videos
@@ -527,7 +562,12 @@
           let found = false
           for (let idx = 0; idx < videos.length; idx += 1) {
             const video: any = videos[idx]
-            const isCurrent = video != null && video.id === targetId
+            let isCurrent = false
+            if (video != null) {
+              if (video.id === targetId) {
+                isCurrent = true
+              }
+            }
             if (isCurrent === true) {
               found = true
             } else if (video != null) {
@@ -562,7 +602,9 @@
         }
         if (this.isTruthy(node.attrs.ignore)) return
         // #ifdef H5 || APP
-        node.attrs.src = node.attrs.src || node.attrs['data-src']
+        if (this.isTruthy(node.attrs.src) === false) {
+          node.attrs.src = node.attrs['data-src']
+        }
         // #endif
         // #ifndef APP-HARMONY
         this.root.$emit('imgtap', node.attrs)
@@ -573,7 +615,7 @@
         })
         // #endif
         // 自动预览图片
-        if (this.root.previewImg === true || (this.root.previewImg != null && typeof this.root.previewImg === 'string' && this.root.previewImg.length > 0)) {
+        if (this.isTruthy(this.root.previewImg)) {
           uni.previewImage({
             // #ifdef MP-WEIXIN
             showmenu: this.root.showImgMenu,
@@ -594,7 +636,11 @@
       imgLongTap (e) {
         // #ifdef APP
         const attrs = this.childs[e.currentTarget.dataset.i].attrs
-        if (this.isTruthy(this.opts[3]) && this.isTruthy(attrs.ignore) === false) {
+        let allowShowMenu = false
+        if (this.isTruthy(this.opts[3])) {
+          allowShowMenu = this.isTruthy(attrs.ignore) === false
+        }
+        if (allowShowMenu === true) {
           uni.showActionSheet({
             itemList: ['保存图片'],
             success: () => {
@@ -627,12 +673,32 @@
       imgLoad (e) {
         const i = e.currentTarget.dataset.i
         /* #ifndef H5 */
-        if (this.childs[i].w == null || this.childs[i].w == 0) {
+        let hasWidth = true
+        if (this.childs[i].w == null) {
+          hasWidth = false
+        } else if (this.childs[i].w == 0) {
+          hasWidth = false
+        }
+        if (hasWidth === false) {
           // 设置原宽度
           this.$set(this.ctrl, i, e.detail.width)
-        } else /* #endif */ if ((this.isTruthy(this.opts[1]) && (this.ctrl[i] == null || this.ctrl[i] == 0)) || this.ctrl[i] === -1) {
-          // 加载完毕，取消加载中占位图
-          this.$set(this.ctrl, i, 1)
+        } else /* #endif */ {
+          let needPlaceholder = false
+          if (this.ctrl[i] == null) {
+            needPlaceholder = true
+          } else if (this.ctrl[i] == 0) {
+            needPlaceholder = true
+          }
+          let shouldSetReady = false
+          if (this.ctrl[i] === -1) {
+            shouldSetReady = true
+          } else if (this.isTruthy(this.opts[1])) {
+            shouldSetReady = needPlaceholder
+          }
+          if (shouldSetReady === true) {
+            // 加载完毕，取消加载中占位图
+            this.$set(this.ctrl, i, 1)
+          }
         }
         this.checkReady()
       },
@@ -641,17 +707,21 @@
        * @description 检查是否所有图片加载完毕
        */
       checkReady () {
-        if (this.root != null && !(this.root.lazyLoad === true || (this.root.lazyLoad != null && typeof this.root.lazyLoad === 'string' && this.root.lazyLoad.length > 0))) {
-          this.root._unloadimgs -= 1
-          if (this.root._unloadimgs <= 0) {
-            setTimeout(() => {
-              this.root.getRect().then(rect => {
-                this.root.$emit('ready', rect)
-              }).catch(() => {
-                this.root.$emit('ready', {})
-              })
-            }, 350)
-          }
+        if (this.root == null) {
+          return
+        }
+        if (this.isTruthy(this.root.lazyLoad)) {
+          return
+        }
+        this.root._unloadimgs -= 1
+        if (this.root._unloadimgs <= 0) {
+          setTimeout(() => {
+            this.root.getRect().then(rect => {
+              this.root.$emit('ready', rect)
+            }).catch(() => {
+              this.root.$emit('ready', {})
+            })
+          }, 350)
         }
       },
 
@@ -661,10 +731,10 @@
        */
       linkTap (e) {
         const node = e.currentTarget != null ? this.childs[e.currentTarget.dataset.i] : {}
-        const attrs = node.attrs || e
+        const attrs = node.attrs != null ? node.attrs : e
         const href = attrs.href
         this.root.$emit('linktap', Object.assign({
-          innerText: this.root.getText(node.children || []) // 链接内的文本内容
+          innerText: this.root.getText(node.children != null ? node.children : []) // 链接内的文本内容
         }, attrs))
         if (this.isTruthy(href)) {
           if (href[0] === '#') {
@@ -672,7 +742,7 @@
             this.root.navigateTo(href.substring(1)).catch(() => { })
           } else if (href.split('?')[0].includes('://')) {
             // 复制外部链接
-            if (this.root.copyLink === true || (this.root.copyLink != null && typeof this.root.copyLink === 'string' && this.root.copyLink.length > 0)) {
+            if (this.isTruthy(this.root.copyLink)) {
               // #ifdef H5
               window.open(href)
               // #endif
@@ -710,8 +780,19 @@
        */
       copyCode (e) {
         // srcElement \u5728\u5fae\u4fe1\u5c0f\u7a0b\u5e8f\u4e2d\u4e0d\u5b58\u5728\uff0c\u52a0\u5b89\u5168\u8bbf\u95ee
-        const data = (e.srcElement && e.srcElement.dataset) || (e.currentTarget && e.currentTarget.dataset)
-        if(data == null || data.action !== 'copy') {
+        let data = null
+        if (e.srcElement != null) {
+          data = e.srcElement.dataset
+        }
+        if (data == null) {
+          if (e.currentTarget != null) {
+            data = e.currentTarget.dataset
+          }
+        }
+        if (data == null) {
+          return
+        }
+        if (data.action !== 'copy') {
           return
         }
         const content = data.content
@@ -735,15 +816,18 @@
        */
       handleCurrentTap(e){
         // #ifdef MP-WEIXIN
-        if (e.name==='div' && e.attrs?.class==='event') {
-          uni.$emit('message-event-delegate', e)
-          return
+        if (e.name === 'div') {
+          if (e.attrs?.class === 'event') {
+            uni.$emit('message-event-delegate', e)
+            return
+          }
         }
         // #endif
 
         // Handle copy code button in highlight blocks
         const hasCopyContent = this.isTruthy(e.attrs?.['data-content'])
-        if (e.attrs?.['data-action'] === 'copy' && hasCopyContent === true) {
+        if (e.attrs?.['data-action'] === 'copy') {
+          if (hasCopyContent === true) {
           uni.setClipboardData({
             data: e.attrs['data-content'],
             success: () => {
@@ -753,6 +837,7 @@
               this.showTextToast(t('Mobile.Common.copyFailed'))
             }
           })
+          }
         }
       },
 
@@ -781,8 +866,10 @@
         const i = e.currentTarget.dataset.i
         const node = this.childs[i]
         // 加载其他源
-        if (node.name === 'video' || node.name === 'audio') {
-          let index = (this.ctrl[i] || 0) + 1
+        const isVideo = node.name === 'video'
+        const isAudio = node.name === 'audio'
+        if (isVideo === true || isAudio === true) {
+          let index = this.toNumberOr(this.ctrl[i], 0) + 1
           if (index > node.src.length) {
             index = 0
           }
@@ -792,7 +879,9 @@
           }
         } else if (node.name === 'img') {
           // #ifdef H5
-          if (this.isTruthy(this.opts[0]) && this.isTruthy(this.ctrl.load) === false) return
+          if (this.isTruthy(this.opts[0])) {
+            if (this.isTruthy(this.ctrl.load) === false) return
+          }
           // #endif
           // 显示错误占位图
           if (this.isTruthy(this.opts[2])) {

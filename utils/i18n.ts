@@ -65,7 +65,7 @@ export const normalizeLang = (lang: string): string => {
   if (bundleKey === "en-us") return "en-US";
 
   // 未知语言保持原始归一化形式
-  return source.replaceAll("_", "-");
+  return source.split("_").join("-");
 };
 
 const getStoredLang = (): string => {

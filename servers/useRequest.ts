@@ -1,0 +1,244 @@
+import {
+  CONVERSATION_CONNECTION_URL,
+  COMMON_HEADERS,
+} from "@/constants/common.constants";
+import { ACCESS_TOKEN, EXPIRE_DATE } from "../constants/home.constants";
+import {
+  DEFAULT_LANG,
+  I18N_LANG_STORAGE_KEY,
+} from "@/constants/i18n.constants";
+import { API_BASE_URL, LOGIN_WHITELIST_URL } from "../constants/config";
+import {
+  REDIRECT_LOGIN,
+  SUCCESS_CODE,
+  USER_NO_LOGIN,
+} from "@/constants/codes.constants";
+
+import {
+  fetchEventSource,
+  EventSourceMessage,
+} from "@microsoft/fetch-event-source";
+
+import { handleExternalLink } from "@/utils/system";
+import { getCurrentPageFullPath } from "@/utils/common";
+
+// 微信小程序：request
+export default function request<T = any>(options: any) {
+  const { url, method, ...rest } = options;
+  const accessToken = uni.getStorageSync(ACCESS_TOKEN);
+  let currentLang = uni.getStorageSync(I18N_LANG_STORAGE_KEY) || DEFAULT_LANG;
+  currentLang = String(currentLang || DEFAULT_LANG).toLowerCase();
+  const header = {
+    ...COMMON_HEADERS,
+    "Accept-Language": currentLang,
+  };
+  if (accessToken) {
+    // #ifdef H5 || WEB
+    if (process.env.NODE_ENV === "development") {
+      header["Authorization"] = `Bearer ${accessToken}`;
+    }
+    // #endif
+
+    // #ifdef MP-WEIXIN
+    header["Authorization"] = `Bearer ${accessToken}`;
+    // #endif
+  }
+
+  // uEnvProd
+  if (process.env.NODE_ENV === "production") {
+    // #ifdef H5
+    //仅H5需要添加fragment参数
+    const fragment = (window.location.hash || "#/").replace("#/", "/");
+    if (fragment) {
+      header["fragment"] = fragment;
+    }
+    // #endif
+  }
+
+  // uni.request 在 UTS 里返回 RequestTask（非 Promise），这里手动包装为 Promise
+  return new Promise<T>((resolve, reject) => {
+    uni.request<T>({
+      header,
+      url: API_BASE_URL + url,
+      method: method || "POST",
+      ...rest,
+      success: (res: any) => {
+        const responseData = res.data as any;
+        const { code, message: errorMessage } = responseData || {};
+
+        // batch 接口不做错误消息与跳转相关逻辑
+        const isBatchUrl = url?.includes("/api/notify/event/collect/batch");
+        if (isBatchUrl) {
+          resolve(responseData as T);
+          return;
+        }
+
+        // 用户未登录，跳转到登录页
+        if (code === USER_NO_LOGIN) {
+          uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+          uni.clearStorageSync(); // 清空所有缓存
+
+          // #ifdef H5 || WEB
+          uni.reLaunch({
+            url: "/subpackages/pages/login/login",
+          });
+          // #endif
+          // #ifdef MP-WEIXIN
+          uni.reLaunch({
+            url: "/subpackages/pages/login-weixin/login-weixin",
+          });
+          // #endif
+        }
+        // 重定向到登录页
+        if (code === REDIRECT_LOGIN) {
+          uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+          uni.clearStorageSync(); // 清空所有缓存
+          let redirectUrl = errorMessage;
+          // 如果错误信息包含/login开头，则替换为登录页，否则直接打开完整链接
+          if (errorMessage?.startsWith("/login")) {
+            // #ifdef H5 || WEB
+            // 如果url在登录白名单地址中，则不跳转到登录页
+            if (LOGIN_WHITELIST_URL.includes(url)) {
+              resolve(responseData as T);
+              return;
+            }
+            redirectUrl = errorMessage?.replace(
+              "/login",
+              "/subpackages/pages/login/login",
+            );
+            uni.reLaunch({ url: redirectUrl });
+            // #endif
+
+            // #ifdef MP-WEIXIN
+            // 微信小程序：获取当前页面的 url
+            const currentUrl = getCurrentPageFullPath();
+            if (currentUrl) {
+              if (globalThis.appConfig.redirectUrl) {
+                const otherQueryStr = globalThis.appConfig.redirectUrl;
+                uni.reLaunch({
+                  url:
+                    "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                    encodeURIComponent(
+                      "/subpackages/pages/webview/webview?url=" + otherQueryStr,
+                    ),
+                });
+              } else {
+                uni.reLaunch({
+                  url:
+                    "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                    encodeURIComponent("/" + currentUrl),
+                });
+              }
+            }
+            // #endif
+          } else {
+            // #ifdef H5 || WEB
+            window.location.href = errorMessage;
+            // #endif
+            // #ifdef MP
+            handleExternalLink(errorMessage);
+            // #endif
+          }
+        }
+        resolve(responseData as T);
+      },
+      fail: (error: any) => {
+        console.error("Request error:", error);
+        // 网络错误或其他错误，也返回错误信息
+        reject(error);
+      },
+    });
+  });
+}
+
+export interface SSEOptions<T = any> {
+  url: string;
+  method?: "GET" | "POST" | "PUT" | "DELETE";
+  headers?: { [key: string]: string };
+  body?: any;
+  onMessage: (data: T) => void;
+  onError?: (error: Error) => void;
+  onOpen?: (response: any) => void;
+  onClose?: () => void;
+  abortController?: any;
+}
+
+// H5 创建SSE连接
+export async function createSSEConnection<T = any>(options: SSEOptions<T>) {
+  const controller = options.abortController || new AbortController();
+  const currentLang = String(
+    uni.getStorageSync(I18N_LANG_STORAGE_KEY) || DEFAULT_LANG,
+  ).toLowerCase();
+  //仅H5需要添加fragment参数
+  const fragment = (window.location.hash || "#/").replace("#/", "/");
+  try {
+    // 通过 Parameters<typeof fetchEventSource>[1] 对齐第三方库参数类型
+    const fetchOptions = {
+      method: options.method || "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept-Language": currentLang,
+        ...options.headers,
+        ...(fragment && { fragment }),
+      },
+      body:
+        typeof options.body === "object"
+          ? JSON.stringify(options.body)
+          : options.body,
+      signal: controller.signal,
+      openWhenHidden: true, // 页面不可见时保持连接
+
+      onopen: async (response) => {
+        if (response.status >= 400) {
+          throw new Error(
+            String(response.statusText || response.status || 0),
+          );
+        }
+        options.onOpen?.(response);
+      },
+
+      onmessage: (event: EventSourceMessage) => {
+        try {
+          const data = event.data ? (JSON.parse(event.data) as T) : null;
+          // 无消息体时不回调，避免把 null 传给强类型的 T
+          if (data !== null) {
+            options.onMessage(data);
+          }
+        } catch (error) {
+          const normalizedError =
+            error instanceof Error ? error : new Error(String(error));
+          options.onError?.(normalizedError);
+        }
+      },
+
+      onclose: () => {
+        options.onClose?.();
+      },
+
+      onerror: (error) => {
+        // 如果是中止错误，不抛出异常
+        if (error instanceof Error && error.name === "AbortError") {
+          console.log("SSE连接已被中止");
+          return;
+        }
+        const normalizedError =
+          error instanceof Error ? error : new Error(String(error));
+        options.onError?.(normalizedError);
+        throw normalizedError; // 停止自动重试
+      },
+    } as Parameters<typeof fetchEventSource>[1];
+    await fetchEventSource(options.url, fetchOptions);
+  } catch (error) {
+    // 静默处理所有 AbortError
+    if (error instanceof Error && error.name === "AbortError") {
+      console.log("SSE连接已被中止");
+      return;
+    }
+
+    // 只有真正的错误才触发错误回调
+    const normalized =
+      error instanceof Error ? error : new Error(String(error));
+    options.onError?.(normalized);
+    throw normalized;
+  }
+}

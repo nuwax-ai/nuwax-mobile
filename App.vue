@@ -1,0 +1,151 @@
+<script lang="ts">
+  import { apiAgentComponentPageResultUpdate } from "@/servers/agentDev";
+  import {
+    initEventPolling,
+    startEventPolling,
+    stopEventPolling,
+  } from "@/hooks/useEventPolling";
+  import { loadI18n, t, bootstrapI18nCache } from "@/utils/i18n";
+  // #ifdef MP-WEIXIN
+  import { htmlToMarkdown } from "@/utils/htmlToMarkdown";
+  // #endif
+
+  // #ifdef H5
+  function fix100vh() {
+    // 检测是否有输入框聚焦（键盘可能弹起）
+    const focusedElement = document.activeElement;
+    const isInputFocused =
+      focusedElement &&
+      (focusedElement.tagName === "TEXTAREA" ||
+        focusedElement.tagName === "INPUT");
+
+    // 如果有输入框聚焦（键盘弹起），不更新 --vh 变量，保持页面容器高度稳定
+    // 这样可以防止输入框因页面高度变化而"飘起"
+    if (isInputFocused) {
+      return;
+    }
+
+    let vh = window.innerHeight;
+    if (window.visualViewport && window.visualViewport.height) {
+      vh = Math.round(window.visualViewport.height);
+    } else {
+      vh = window.innerHeight;
+    }
+    document.documentElement.style.setProperty("--vh", `${vh}px`);
+  }
+  fix100vh();
+  window.addEventListener("resize", fix100vh);
+  // 解决iOS键盘问题的代码 使用Visual Viewport API
+  window.visualViewport &&
+    window.visualViewport.addEventListener("resize", fix100vh);
+  // #endif
+
+  // #ifdef APP-ANDROID || APP-HARMONY
+  let firstBackTime = 0;
+  // #endif
+  export default {
+    onLaunch: async function () {
+      // 优先从缓存初始化国际化状态并快速应用 TabBar 翻译
+      bootstrapI18nCache();
+
+      await loadI18n();
+
+      // 使用 globalThis 定义全局变量
+      globalThis.appConfig = {
+        redirectUrl: null,
+      };
+
+      // 微信小程序事件绑定
+      // #ifdef MP-WEIXIN
+      uni.$on("browser_navigate_page", async (data) => {
+        console.log("browser_navigate_page 事件触发2", data);
+        const html = data.html;
+
+        if (!data.method) return;
+        // 获取 iframe 内容
+        let str = "";
+        // 如果是 html
+        if (data.data_type === "html") {
+          str = html;
+        }
+        // 如果是 markdown
+        if (data.data_type === "markdown") {
+          // 将 HTML 转换为 Markdown
+          str = htmlToMarkdown(html);
+          console.log("HTML 已转换为 Markdown");
+        }
+        if (!str) {
+          return;
+        }
+
+        if (data.method === "browser_navigate_page") {
+          const params = {
+            requestId: data.request_id || "",
+            html: str,
+          };
+          await apiAgentComponentPageResultUpdate(params);
+        }
+      });
+      // #endif
+
+      // 初始化全局事件轮询
+      // H5: 自动监听 visibilitychange，切换标签页时自动暂停/恢复
+      // 小程序: 需要依赖 onHide/onShow 手动控制
+      initEventPolling();
+    },
+    onShow: function () {
+      console.log("App Show");
+      // #ifndef H5
+      // 非 H5 端：从后台回到前台，恢复轮询（H5 由 visibilitychange 自动处理）
+      startEventPolling();
+      // #endif
+    },
+    onHide: function () {
+      console.log("App Hide");
+      // #ifndef H5
+      // 非 H5 端：切换到后台，暂停轮询（H5 由 visibilitychange 自动处理）
+      stopEventPolling();
+      // #endif
+    },
+    // #ifdef APP-ANDROID || APP-HARMONY
+    onLastPageBackPress: function () {
+      console.log("App LastPageBackPress");
+      if (firstBackTime == 0) {
+        uni.showToast({
+          title: t("Mobile.App.pressAgainToExit"),
+          position: "bottom",
+        });
+        firstBackTime = Date.now();
+        setTimeout(() => {
+          firstBackTime = 0;
+        }, 2000);
+      } else if (Date.now() - firstBackTime < 2000) {
+        firstBackTime = Date.now();
+        uni.exit();
+      }
+    },
+    // #endif
+    onExit: function () {
+      console.log("App Exit");
+    },
+  };
+</script>
+
+<style lang="scss">
+  @import "@/static/iconfont/iconfont.css"; // 引入图标库
+
+  @import "@/styles/global.scss";
+
+  .page-container {
+    /* #ifdef H5 */
+    height: var(
+      --vh,
+      100svh
+    ); /* 能识别 svh 就用 svh，否则用 JS 算出来的 --vh */
+    /* #endif */
+
+    /* #ifndef H5 */
+    height: 100vh;
+    /* #endif */
+  }
+</style>

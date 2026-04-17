@@ -1,0 +1,285 @@
+<template>
+  <uni-popup ref="popup" type="bottom" safeArea backgroundColor="#fff">
+    <view class="login-popup-container">
+      <view class="login-popup-header">
+        <text class="login-popup-title">{{
+          t("Mobile.Common.loginRegister")
+        }}</text>
+        <view class="close-btn" @click="close">
+          <text class="iconfont icon-a-Xcircle-fill"></text>
+        </view>
+      </view>
+      <view class="login-popup-content">
+        <!-- 微信小程序登录 -->
+        <view class="weixin-login-form" v-if="!loading && tenantConfigInfo">
+          <view class="sub-title-wrapper">
+            <text class="sub-title">{{
+              t("Mobile.Auth.welcomeUse", {
+                siteName: tenantConfigInfo?.siteName || "",
+              })
+            }}</text>
+          </view>
+
+          <!-- 登录区域 -->
+          <view class="login-section">
+            <!-- 协议勾选 -->
+            <agreement-checkbox v-model="agreeTerms" />
+
+            <!-- 微信一键登录按钮 -->
+            <button
+              class="login-btn"
+              :open-type="agreeTerms ? 'getPhoneNumber' : ''"
+              @getphonenumber="onGetPhoneNumber"
+              @tap="onLoginClick"
+            >
+              {{ t("Mobile.Auth.oneClickLogin") }}
+            </button>
+          </view>
+
+          <!-- 手机号登录链接 -->
+          <view class="phone-login-link" @tap="goToPhoneLogin">
+            {{ t("Mobile.Auth.phoneLoginRegister") }}
+          </view>
+        </view>
+      </view>
+    </view>
+  </uni-popup>
+</template>
+
+<script setup lang="ts">
+  import { ref } from "vue";
+  import { apiTenantConfig, apiWechatLogin } from "@/servers/account";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { ACCESS_TOKEN } from "@/constants/home.constants";
+  import type { TenantConfigInfo } from "@/types/interfaces/login";
+  import AgreementCheckbox from "@/components/agreement-checkbox/agreement-checkbox.vue";
+  import { getCurrentPagePath } from "@/utils/commonBusiness";
+  import { useI18n } from "@/utils/i18n";
+
+  const { t } = useI18n();
+
+  const emit = defineEmits(["login-success"]);
+
+  const popup = ref<any>(null);
+  const tenantConfigInfo = ref<TenantConfigInfo>(null);
+  const loading = ref(false);
+  const agreeTerms = ref(false);
+
+  // 打开弹窗
+  const open = async () => {
+    // 获取租户配置
+    await fetchTenantConfig();
+    if (popup.value) {
+      // 显式传入 'bottom' 参数，确保从底部弹出
+      popup.value.open("bottom");
+    }
+  };
+
+  // 关闭弹窗
+  const close = () => {
+    if (popup.value) {
+      popup.value.close();
+    }
+  };
+
+  // 获取租户配置
+  const fetchTenantConfig = async () => {
+    try {
+      loading.value = true;
+      const { code, data } = await apiTenantConfig();
+      if (code === SUCCESS_CODE) {
+        tenantConfigInfo.value = data;
+      }
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  // 点击登录按钮
+  const onLoginClick = () => {
+    if (!agreeTerms.value) {
+      uni.showModal({
+        title: t("Mobile.Common.tip"),
+        content: t("Mobile.Auth.pleaseAgreeProtocol"),
+        confirmText: t("Mobile.Common.agree"),
+        cancelText: t("Mobile.Common.disagree"),
+        success: function (res) {
+          if (res.confirm) {
+            agreeTerms.value = true;
+          }
+        },
+      });
+    }
+  };
+
+  // 跳转到手机号登录页面
+  const goToPhoneLogin = () => {
+    const currentUrl = getCurrentPagePath();
+    const url = `/subpackages/pages/login/login?redirect=${encodeURIComponent(currentUrl)}`;
+    uni.navigateTo({ url });
+    close();
+  };
+
+  // 微信一键登录
+  const onGetPhoneNumber = async (event: any) => {
+    // 1. 检查用户是否取消授权
+    if (!event?.detail || event.detail.errMsg !== "getPhoneNumber:ok") {
+      uni.showToast({ title: t("Mobile.Auth.userCancelAuthorize"), icon: "none" });
+      return;
+    }
+
+    // 2. 微信新版返回的 phoneCode
+    const phoneCode = event.detail.code;
+
+    try {
+      uni.showLoading({ title: t("Mobile.Page.loading") });
+      // 3. 请求后端登录接口
+      const { code, data, message } = await apiWechatLogin({ code: phoneCode });
+
+      handleLoginSuccess(code, data, message);
+    } finally {
+      uni.hideLoading();
+    }
+  };
+
+  // 登录成功处理
+  const handleLoginSuccess = (code: string, data: any, message: string) => {
+    // 4. 登录成功
+    if (code === SUCCESS_CODE) {
+      // #ifdef H5 || WEB
+      if (process.env.NODE_ENV === "development") {
+        uni.setStorageSync(ACCESS_TOKEN, data.token);
+      }
+      // #endif
+
+      // #ifdef MP-WEIXIN
+      uni.setStorageSync(ACCESS_TOKEN, data.token);
+      // #endif
+
+      uni.showToast({
+        title: t("Mobile.Auth.loginSuccess"),
+        icon: "success",
+      });
+      setTimeout(() => {
+        close();
+        // 使用 uni.reLaunch 刷新当前页面（支持 tabbar 页面）
+        // const currentUrl = getCurrentPagePath();
+        // uni.reLaunch({
+        //   url: currentUrl,
+        // });
+        uni.reLaunch({
+          url: "/pages/index/index",
+        });
+      }, 1000);
+    } else {
+      uni.showToast({
+        title: message ?? t("Mobile.Auth.loginFailed"),
+        icon: "none",
+      });
+    }
+  };
+
+  // 暴露方法给父组件调用
+  defineExpose({
+    open,
+    close,
+    popup,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .login-popup-container {
+    width: 100%;
+    background: #fff;
+    border-radius: 24rpx 24rpx 0 0;
+    overflow: hidden;
+    /* 确保底部弹窗样式 */
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+  }
+
+  .login-popup-header {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 32rpx 32rpx 0;
+
+    .login-popup-title {
+      font-size: 36rpx;
+      font-weight: 600;
+      color: #000;
+    }
+
+    .close-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 64rpx;
+      height: 64rpx;
+      cursor: pointer;
+
+      .iconfont {
+        font-size: 40rpx;
+        color: #999;
+      }
+    }
+  }
+
+  .login-popup-content {
+    padding: 32rpx 32rpx 64rpx;
+  }
+
+  .weixin-login-form {
+    display: flex;
+    flex-direction: column;
+
+    .sub-title-wrapper {
+      margin-top: 40rpx;
+      margin-bottom: 80rpx;
+      text-align: center;
+
+      .sub-title {
+        color: #000;
+        text-align: center;
+        font-size: 40rpx;
+        font-style: normal;
+        font-weight: 600;
+        line-height: 56rpx;
+      }
+    }
+
+    .login-section {
+      margin-bottom: 40rpx;
+
+      .login-btn {
+        margin-top: 20rpx;
+        width: 100%;
+        border-radius: 16rpx;
+        padding: 25rpx 24rpx;
+        font-size: 32rpx;
+        font-weight: 400;
+        margin-bottom: 32rpx;
+        line-height: 48rpx;
+        text-align: center;
+        background: #5147ff;
+        color: #ffffff;
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        justify-content: center;
+      }
+    }
+
+    .phone-login-link {
+      width: 100%;
+      text-align: center;
+      font-size: 32rpx;
+      color: rgba(21, 23, 31, 0.5);
+      margin-top: 20rpx;
+      cursor: pointer;
+    }
+  }
+</style>

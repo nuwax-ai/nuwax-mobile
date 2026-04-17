@@ -1,0 +1,238 @@
+<template>
+  <uni-popup ref="popupRef" :is-mask-click="maskClick">
+    <view
+      class="drawer-wrapper page-container"
+      :class="`direction-${direction}`"
+      :style="wrapperStyle"
+      @touchstart="handleTouchStart"
+      @touchmove="handleTouchMove"
+      @touchend="handleTouchEnd"
+    >
+      <view
+        class="drawer-content"
+        :class="[
+          `direction-${direction}`,
+          {
+            'drawer-show': visible,
+            'auto-height': autoHeight && direction === 'bottom',
+          },
+        ]"
+        :style="contentStyle"
+      >
+        <!-- 微信安全区 -->
+        <safety-zone v-if="direction === 'left'" :add-height="0"></safety-zone>
+        <view class="head-box" v-if="showHeader">
+          <view class="title">
+            <text class="text-ellipsis">{{ displayTitle }}</text>
+          </view>
+          <view class="close-btn" @tap="close" v-if="showCloseBtn">
+            <text class="iconfont icon-X"></text>
+          </view>
+        </view>
+        <view class="content-box">
+          <slot></slot>
+        </view>
+      </view>
+      <view
+        class="drawer-mask"
+        :class="`direction-${direction}`"
+        @tap="close"
+      ></view>
+    </view>
+  </uni-popup>
+</template>
+
+<script setup lang="ts">
+  import { ref, computed, nextTick } from "vue";
+  import { translateText } from "@/utils/i18n";
+
+  interface UniPopupInstance {
+    open(type?: string): void;
+    close(): void;
+  }
+
+  const props = defineProps({
+    title: {
+      type: String,
+      default: "",
+    },
+    width: {
+      type: String,
+      default: "75vw",
+    },
+    height: {
+      type: String,
+      default: "50vh",
+    },
+    // 默认高度（仅对bottom方向有效）
+    defaultHeight: {
+      type: String,
+      default: "20vh",
+    },
+    // 最大高度（仅对bottom方向有效）
+    maxHeight: {
+      type: String,
+      default: "50vh",
+    },
+    // 是否启用自适应高度（仅对bottom方向有效）
+    autoHeight: {
+      type: Boolean,
+      default: false,
+    },
+    maskClick: {
+      type: Boolean,
+      default: true,
+    },
+    // 弹出方向：'left' | 'bottom'
+    direction: {
+      type: String,
+      default: "left",
+    },
+    // 是否显示头部
+    showHeader: {
+      type: Boolean,
+      default: true,
+    },
+    // 是否显示关闭按钮
+    showCloseBtn: {
+      type: Boolean,
+      default: true,
+    },
+  });
+
+  const emit = defineEmits(["update-visible"]);
+  const popupRef = ref<UniPopupInstance | null>(null);
+
+  const visible = ref(false);
+  const displayTitle = computed(() => translateText(props.title));
+
+  // 滑动关闭相关状态
+  const touchStartX = ref<number>(0);
+  const touchStartY = ref<number>(0);
+  const isSwiping = ref<boolean>(false);
+  const swipeOffset = ref<number>(0);
+  const swipeThreshold = 50; // 降低最小滑动距离阈值，提升灵敏度
+
+  const handleTouchStart = (e: any) => {
+    if (!e.touches || e.touches.length === 0) return;
+    touchStartX.value = e.touches[0].clientX;
+    touchStartY.value = e.touches[0].clientY;
+    isSwiping.value = false;
+    swipeOffset.value = 0;
+  };
+
+  const handleTouchMove = (e: any) => {
+    if (!e.touches || e.touches.length === 0) return;
+    const currentX = e.touches[0].clientX;
+    const currentY = e.touches[0].clientY;
+    const diffX = Math.abs(currentX - touchStartX.value);
+    const diffY = Math.abs(currentY - touchStartY.value);
+
+    // 降低判定门槛，只要水平意图明显且超过 5px 就算滑动
+    if (diffX > diffY && diffX > 5) {
+      isSwiping.value = true;
+      swipeOffset.value = currentX - touchStartX.value;
+      // 阻止默认行为以防止页面滚动干扰手势
+      e.preventDefault();
+    }
+  };
+
+  const handleTouchEnd = (e: any) => {
+    if (!isSwiping.value) return;
+
+    if (Math.abs(swipeOffset.value) > swipeThreshold) {
+      close();
+    }
+
+    isSwiping.value = false;
+    swipeOffset.value = 0;
+  };
+
+  // 根据方向和props动态计算wrapper样式
+  const wrapperStyle = computed(() => {
+    const style = {};
+
+    if (props.direction === "bottom") {
+      // 为底部弹出设置CSS变量
+      if (props.autoHeight) {
+        style["--content-default-height"] = props.defaultHeight;
+        style["--content-max-height"] = props.maxHeight;
+      } else {
+        style["--content-height"] = props.height;
+      }
+    }
+
+    return style;
+  });
+
+  // 根据方向和props动态计算内容样式
+  const contentStyle = computed(() => {
+    const style = {} as Record<string, any>;
+
+    if (props.direction === "left") {
+      // 左侧弹出时使用width属性
+      style.width = props.width;
+      style.height = "100%";
+    } else if (props.direction === "bottom") {
+      // 底部弹出时使用height属性
+      if (props.autoHeight) {
+        // 自适应高度模式
+        style.minHeight = props.defaultHeight;
+        style.maxHeight = props.maxHeight;
+        style.height = "auto";
+      } else {
+        // 固定高度模式
+        style.height = props.height;
+      }
+      style.width = "100%";
+    }
+
+    return style;
+  });
+
+  // 打开抽屉
+  const open = () => {
+    if (!popupRef.value) {
+      console.warn("popupRef is null");
+      return;
+    }
+
+    popupRef.value.open();
+    emit("update-visible", true);
+
+    // 在微信小程序中使用 nextTick 替代 setTimeout
+    // #ifdef MP-WEIXIN
+    nextTick(() => {
+      visible.value = true;
+    });
+    // #endif
+
+    // 在其他平台使用 setTimeout
+    // #ifndef MP-WEIXIN
+    setTimeout(() => {
+      visible.value = true;
+    }, 20);
+    // #endif
+  };
+
+  // 关闭抽屉
+  const close = () => {
+    visible.value = false;
+    // 等待动画结束再关闭 popup
+    setTimeout(() => {
+      popupRef.value?.close();
+    }, 200);
+    emit("update-visible", false);
+  };
+
+  defineExpose({
+    open,
+    close,
+    popupRef,
+    visible,
+  });
+</script>
+
+<style scoped lang="scss">
+  @import "./drawer-popup.scss";
+</style>

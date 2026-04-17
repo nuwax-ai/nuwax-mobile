@@ -1,0 +1,225 @@
+<template>
+  <drawer-popup
+    ref="drawerRef"
+    direction="bottom"
+    :title="title"
+    height="auto"
+    :auto-height="true"
+    @update-visible="handleUpdateVisible"
+  >
+    <scroll-view
+      class="drawer-content"
+      :scroll-y="true"
+      :show-scrollbar="false"
+    >
+      <view v-if="loading" class="loading-container">
+        <image
+          class="icon-loading"
+          src="@/static/assets/icon_loading.svg"
+          mode="widthFix"
+        />
+      </view>
+      <radio-group
+        v-else
+        class="radio-group"
+        @change="handleRadioChange"
+      >
+        <label
+          class="radio-item"
+          v-for="item in list"
+          :key="item.value"
+          :class="{
+            disabled: readonly || item.disabled,
+          }"
+        >
+          <view class="item-info">
+            <view class="radio-label-box">
+              <text class="radio-text">{{ item.label }}</text>
+              <text class="radio-tag" v-if="item.tag">{{ item.tag }}</text>
+            </view>
+            <text
+              class="radio-desc"
+              v-if="item.desc"
+              :class="{ 'warning-text': item.warningDesc }"
+            >
+              {{ item.desc }}
+            </text>
+          </view>
+          <radio
+            :value="item.value"
+            :checked="item.value === currentValue"
+            color="#5147ff"
+            class="radio-icon"
+            :disabled="readonly || item.disabled"
+          />
+        </label>
+      </radio-group>
+    </scroll-view>
+  </drawer-popup>
+</template>
+
+<script lang="ts" setup>
+  import { RadioListItem } from "@/types/interfaces/radio";
+
+  const props = withDefaults(
+    defineProps<{
+      visible: boolean;
+      title: string;
+      list: RadioListItem[];
+      currentValue?: string;
+      readonly?: boolean;
+      maxHeight?: string;
+      loading?: boolean;
+    }>(),
+    {
+      visible: false,
+      title: '',
+      list: () => [] as RadioListItem[],
+      currentValue: '',
+      readonly: false,
+      maxHeight: '70vh',
+      loading: false,
+    },
+  );
+
+  const emit = defineEmits<{
+    onClose: () => void;
+    onChange: (value: string) => void;
+  }>();
+
+  const drawerRef = ref<any>(null);
+
+  const handleUpdateVisible = (val: boolean) => {
+    if (!val) {
+      emit("onClose");
+    }
+  };
+
+  const handleRadioChange = (e: any) => {
+    const value = e.detail.value as string;
+    if (value && value !== props.currentValue) {
+      emit("onChange", value);
+    }
+    drawerRef.value?.close();
+  };
+
+  watch(
+    () => props.visible,
+    (newVal) => {
+      if (newVal) {
+        drawerRef.value?.open();
+      } else {
+        drawerRef.value?.close();
+      }
+    },
+  );
+</script>
+
+<style lang="scss" scoped>
+  .drawer-content {
+    height: 100%;
+    padding: 0 40rpx;
+    overflow-y: auto;
+
+    .radio-group {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+
+      .radio-item {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        padding: 20rpx 0;
+        border-bottom: 2rpx solid rgba(0, 0, 0, 0.05);
+
+        &:last-child {
+          border-bottom: none;
+        }
+
+        &.disabled {
+          opacity: 0.6;
+          .radio-text {
+            color: #9ea3af;
+          }
+          .radio-desc {
+            color: #cfd4db;
+          }
+        }
+
+        .item-info {
+          display: flex;
+          flex-direction: column;
+          gap: 6rpx;
+          flex: 1;
+          margin-right: 20rpx;
+        }
+
+        .radio-label-box {
+          display: flex;
+          flex-direction: row;
+          align-items: center;
+          gap: 12rpx;
+        }
+
+        .radio-tag {
+          font-size: 24rpx;
+          color: #5147ff;
+          padding: 8rpx 12rpx;
+          background-color: rgba(81, 71, 255, 0.1);
+          border-radius: 12rpx;
+          font-weight: 500;
+          line-height: 1;
+        }
+
+        .radio-text {
+          font-size: 30rpx;
+          color: #1a1a1a;
+          font-weight: 400;
+        }
+
+        .radio-desc {
+          font-size: 24rpx;
+          color: #9ea3af;
+          font-weight: 400;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+
+          &.warning-text {
+            color: #ffa39e !important;
+          }
+        }
+
+        .radio-icon {
+          transform: scale(0.9);
+        }
+      }
+    }
+  }
+
+  .loading-container {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    padding: 60rpx 0;
+    width: 100%;
+
+    .icon-loading {
+      width: 48rpx;
+      height: 48rpx;
+      animation: rotate 1s linear infinite;
+    }
+  }
+
+  @keyframes rotate {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+</style>

@@ -1,0 +1,1417 @@
+<template>
+  <view ref="msgListContentRef" class="agent-detail-container page-container">
+    <!-- 导航栏 -->
+    <!-- 临时会话不显示Logo, 显示标题`和xxx开始会话` -->
+    <custom-nav-bar
+      :title="headerTitle"
+      :show-back="!isAppDetails"
+      :icon="isTempChat ? '' : agentInfo?.icon"
+    >
+      <template v-slot:left>
+        <!-- #ifdef MP-WEIXIN -->
+        <menu-dropdown v-if="!isAppDetails" :list="customMenuList" />
+        <!-- #endif -->
+
+        <!-- 应用详情页显示菜单按钮 -->
+         <!-- #ifdef MP-WEIXIN || H5 || WEB -->
+        <text v-if="isAppDetails" class="iconfont icon-Menu" @tap="onMenuClick"></text>
+        <!-- #endif -->
+
+        <!-- #ifdef H5 || WEB -->
+        <text
+          v-if="isShowWebView"
+          class="iconfont icon-Home"
+          @tap="handleBackHome"
+        ></text>
+        <!-- #endif -->
+      </template>
+
+      <template v-slot:right>
+        <!-- #ifdef H5 || WEB -->
+        <view class="right-buttons">
+          <view
+            class="icon-box"
+            hover-class="icon-box-hover"
+            @tap="handleMorePopup"
+            v-if="!isTempChat && !isAppDetails"
+          >
+            <text class="iconfont icon-More"></text>
+          </view>
+          <template
+            v-if="
+              !(
+                agentInfo?.expandPageArea === ExpandPageAreaEnum.Yes &&
+                agentInfo?.hideChatArea === HideChatAreaEnum.Yes
+              )
+            "
+          >
+            <!-- 创建新会话 -->
+            <view
+              class="icon-box"
+              hover-class="icon-box-hover"
+              @tap="handleCreateNewConversation"
+            >
+              <text class="iconfont icon-message-add"></text>
+            </view>
+          </template>
+        </view>
+        <!-- #endif -->
+      </template>
+    </custom-nav-bar>
+
+    <!-- 默认展开扩展页面区域，且隐藏聊天区域 -->
+    <template v-if="isShowWebView">
+      <web-view
+        class="w-full"
+        v-if="pageHomeUrl?.length"
+        :src="pageHomeUrl + (ticket ? '?_ticket=' + ticket : '')"
+        id="webview"
+      ></web-view>
+    </template>
+    <template v-else>
+      <view class="chat-container">
+        <!-- 聊天内容 -->
+        <view class="scroll-view-box">
+          <scroll-view
+            direction="vertical"
+            class="msg-list"
+            :scroll-into-view="scrollIntoView"
+            id="msg-list"
+            :scroll-with-animation="scrollWithAnimation"
+            :upper-threshold="50"
+            @scrolltoupper="handleScrollToUpper"
+            @scroll="onScroll"
+            @touchstart="handleTouchStart"
+            @touchend="handleTouchEnd"
+            @touchcancel="handleTouchEnd"
+          >
+            <!-- 加载更多历史消息提示 -->
+            <view class="loading-more-tip" v-if="isLoadingMoreMessages">
+              <uni-load-more
+                status="loading"
+                :content-text="historyLoadMoreContentText"
+              />
+            </view>
+            <new-conversation-set
+              ref="newConversationSetRef"
+              :variables="variables"
+              :user-fill-variables="userFillVariables"
+              :disabled="isSendMessageRef"
+              @toggleWholeDisabled="handleToggleWholeDisabled"
+            />
+            <view class="msg-list-content" v-if="messageList?.length">
+              <template
+                v-for="(item, listIndex) in messageList"
+                :key="`${item.id}_${item.index}`"
+              >
+                <view :id="`msg-wrapper-${item.id}_${item.index}`">
+                  <!-- 智能体会话消息 -->
+                  <AiMsg
+                    v-if="item.messageType === MessageTypeEnum.ASSISTANT"
+                    :msg="handleMessageContent(item)"
+                    :is-last-msg="messageList?.length - 1 === listIndex"
+                    :is-conversation-active="isConversationActive"
+                    :task-status="conversationInfo?.taskStatus"
+                    @longpress="onlongTapMsg(convertMessageInfoToMsgItem(item))"
+                    @changeThinkContent="changeThinkContent"
+                    :id="`msg-item-${item.id}_${item.index}`"
+                    :ref="(el) => setMessageRef(el, `${item.id}_${item.index}`)"
+                  ></AiMsg>
+                  <!-- 用户消息 -->
+                  <template v-else>
+                    <!-- 图片以及文件 -->
+                    <scroll-view
+                      class="files-container"
+                      v-if="item?.attachments?.length"
+                      direction="horizontal"
+                      :scroll-with-animation="true"
+                      :show-scrollbar="false"
+                    >
+                      <view class="files-list">
+                        <view
+                          class="files-box"
+                          :class="
+                            !file?.mimeType?.includes('image/')
+                              ? 'files-box-file'
+                              : 'files-box-image'
+                          "
+                          v-for="file in item.attachments"
+                          :key="file.fileKey"
+                          @click="onPreview(file, item?.attachments)"
+                        >
+                          <image
+                            class="image"
+                            v-if="file?.mimeType?.includes('image/')"
+                            :src="file?.fileUrl"
+                            mode="aspectFill"
+                            :alt="
+                              file?.fileName ||
+                              t('Mobile.Chat.uploadImageAlt')
+                            "
+                          />
+                          <!-- 文件 -->
+                          <template v-else>
+                            <image
+                              class="doc-image"
+                              :src="docImage"
+                              mode="aspectFill"
+                              :alt="t('Mobile.Chat.uploadFileAlt')"
+                            />
+                            <view class="doc-info-container">
+                              <view class="doc-name text-ellipsis">{{
+                                file?.fileName
+                              }}</view>
+                              <text class="doc-size text-ellipsis">{{
+                                formatBytes(file?.fileSize)
+                              }}</text>
+                            </view>
+                          </template>
+                        </view>
+                      </view>
+                    </scroll-view>
+                    <text
+                      class="user-msg"
+                      v-if="item?.text"
+                      user-select="true"
+                      :id="`msg-item-${item.id}_${item.index}`"
+                      >{{ item.text }}</text
+                    >
+                  </template>
+                </view>
+              </template>
+              <view class="content" v-if="chatSuggestList?.length">
+                <button-wrapper
+                  :chat-suggest-list="chatSuggestList"
+                  @button-click="handleButtonClick"
+                />
+              </view>
+
+              <!-- 智能体任务执行中，显示加载中图标 -->
+              <image
+                v-if="conversationInfo?.taskStatus === TaskStatus.EXECUTING"
+                class="icon-loading-image"
+                src="@/static/assets/icon_loading.svg"
+                alt=""
+                :show-menu-by-longpress="false"
+                @longtap.stop.prevent
+                @contextmenu.stop.prevent="true"
+                mode="widthFix"
+              />
+            </view>
+
+            <!-- 空状态内容 -->
+            <view class="content" v-else>
+              <view class="title-section">
+                <sub-markdown-msg :text="agentInfo?.openingChatMsg" />
+              </view>
+              <button-wrapper
+                v-if="chatSuggestList?.length"
+                :chat-suggest-list="chatSuggestList"
+                @button-click="handleButtonClick"
+              />
+            </view>
+
+            <!-- 滚动到底部的锚点 -->
+            <view style="height: 35px" id="last-msg"></view>
+          </scroll-view>
+
+          <!-- 滚动到底部按钮 -->
+          <view
+            :style="{ visibility: scrollInBottom ? 'hidden' : 'visible' }"
+            class="scroll-to-bottom"
+            @click="scrollToLastMsg(false)"
+          >
+            <text class="iconfont icon-a-Chevrondown"></text>
+          </view>
+        </view>
+        <!-- 输入框 -->
+        <chat-input-phone
+          v-if="isRenderInputPhone"
+          key="agent-details-chat-input"
+          ref="agentDetailInputPhoneRef"
+          :page-home-index="agentInfo?.pageHomeIndex || ''"
+          :expand-page-area="agentInfo?.expandPageArea || ExpandPageAreaEnum.No"
+          :whole-disabled="wholeDisabled"
+          :manual-components="agentInfo?.manualComponents || []"
+          :default-selected-components="selectedComponents"
+          :is-conversation-active="isConversationActive"
+          :is-stopping-conversation="isStoppingConversation"
+          @onSendMessage="handleSendMessage"
+          @onStopConversation="handleStopConversation"
+          @onOpenPagePreview="(uri:string)=>handleOpenPagePreview({uri})"
+          :is-task-agent="agentInfo?.type === AgentTypeEnum.TaskAgent"
+          @onOpenFileTree="handleOpenFileTree"
+          :sandbox-list="sandboxList"
+          :current-sandbox-id="currentSandboxId"
+          :is-sandbox-switch-disabled="isSandboxLocked"
+          :is-sandbox-unavailable="isSandboxUnavailable"
+          :sandbox-disabled-text="sandboxDisabledText"
+          :readonly="agentInfo?.allowPrivateSandbox === DefaultSelectedEnum.No"
+          :enable-skill-at="agentInfo?.allowAtSkill === DefaultSelectedEnum.Yes"
+          @onSandboxChange="(id: string) => handleSelectSandbox(id)"
+          :has-permission="agentInfo?.hasPermission ?? true"
+          :allow-other-model="agentInfo?.allowOtherModel === DefaultSelectedEnum.Yes"
+          :current-model-id="data.currentModelId.value"
+          :current-model-name="data.currentModelName.value"
+          :agent-id="agentId"
+          :agent-type="agentInfo?.type"
+          @onModelChange="(id: number, name: string) => handleSelectModel(id, name)"
+        />
+      </view>
+    </template>
+
+    <more-popup
+      v-if="!isTempChat"
+      ref="refMorePopup"
+      :agent-info="agentInfo"
+      :is-task-agent="agentInfo?.type === AgentTypeEnum.TaskAgent"
+      :has-history="messageList.length > 0"
+      :current-sandbox-id="currentSandboxId"
+      @collect="handleCollect"
+      @restartAgent="handleRestartAgent"
+      @restartSandbox="handleRestartSandbox"
+    />
+    <template v-else>
+      <!-- #ifdef H5 || WEB-->
+      <button :id="buttonId" type="button" class="captcha-button" />
+      <aliyun-captcha-h5
+        :config="tenantConfigInfo"
+        :element-id="buttonId"
+        @doAction="handleCreateTempChat"
+        @onReady="handleCaptchaReady"
+      />
+      <!-- #endif -->
+    </template>
+
+    <!-- 页面预览 -->
+    <page-preview-iframe
+      ref="pagePreviewIframeRef"
+      @update-visible="updateVisible"
+    />
+    <!-- 文件树 -->
+    <file-tree
+      ref="fileTreeRef"
+      v-if="agentInfo?.type === AgentTypeEnum.TaskAgent"
+      :cId="conversationId"
+      :files="fileList"
+      :is-loading="isLoadingFiles"
+      @update-visible="updatePopupFileTreeVisible"
+    />
+  </view>
+</template>
+
+<script setup lang="ts">
+  // ==================== 导入模块 ====================
+  // AI 消息组件
+  import AiMsg from "@/subpackages/components/ai-msg/ai-msg.vue";
+
+  // 分层架构
+  import AgentDetailData from "./layers/AgentDetailData";
+  import AgentDetailService from "./layers/AgentDetailService";
+  import ComponentManager from "./layers/ComponentManager";
+  import ScrollManager from "./layers/ScrollManager";
+
+  // 类型定义
+  import {
+    MessageTypeEnum,
+    HideChatAreaEnum,
+    ExpandPageAreaEnum,
+    AgentTypeEnum,
+  } from "@/types/enums/agent";
+  import type { ChatInputPhoneRef } from "@/types/interfaces/chat";
+  import type { MessageInfo } from "@/types/interfaces/conversationInfo";
+  import type { UploadFileStatus } from "@/types/enums/common";
+  import type { TenantConfigInfo } from "@/types/interfaces/login";
+  import { AttachmentFile, OpenAppParams } from "@/types/interfaces/conversationInfo";
+  import { EventBindConfig } from "@/types/interfaces/agent";
+  import type { ShowPagePreviewOptions } from "@/types/interfaces/agent";
+  import { ProcessingEnum } from "@/types/enums/common";
+  import { TaskStatus } from "@/types/enums/agent";
+  import { DefaultSelectedEnum } from "@/types/enums/agent";
+  import { UploadFileInfo } from "@/types/interfaces/common";
+
+  // 组件
+  import MorePopup from "./components/more-popup/more-popup.vue";
+  import SubMarkdownMsg from "@/subpackages/components/markdown-msg/markdown-msg.vue";
+  import ChatInputPhone from "@/subpackages/components/chat-input-phone/chat-input-phone.vue";
+  import NewConversationSet from "./components/new-conversation-set/new-conversation-set.vue";
+  import FileTree from "./components/file-tree/file-tree.vue";
+
+  // 常量
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { TEMP_CONVERSATION_UID, TEMP_CHAT_KEY } from "@/constants/common.constants";
+  import docImage from "@/static/assets/doc_image.png";
+  import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
+  import { API_BASE_URL } from "@/constants/config";
+  import { EVENT_TYPE } from "@/subpackages/constants/event.constants";
+
+
+  // ==================== API ====================
+  import { apiAgentConversation } from "@/servers/conversation";
+  import { apiTenantConfig } from "@/servers/account";
+  import { apiUserTicketCreate } from "@/servers/agentDev";
+  import {
+    useMessageEventDelegate,
+    handleMessageEventClick,
+    EventDedupManager,
+  } from "@/subpackages/hooks/useMessageEventDelegate";
+  import { usePageResume } from "@/subpackages/hooks/usePageResume";
+
+  // ==================== 工具方法 ====================
+  import { formatBytes } from "@/utils/byteConverter";
+  import { objectToQueryString } from "@/utils/common";
+  import { chatService } from "@/utils/chatService";
+  import { handleExternalLink } from "@/utils/system";
+  import { setCurrentPageNavigationBarTitle } from "@/utils/system";
+  import eventBus from "@/utils/eventBus";
+  import { throttle } from "@/subpackages/utils/functionUtils";
+  import { useI18n } from "@/utils/i18n";
+  import { getUniLoadMoreContentText } from "@/utils/i18n-third-party";
+
+  const { t } = useI18n();
+  const historyLoadMoreContentText = computed(() =>
+    getUniLoadMoreContentText({
+      contentrefresh: t("Mobile.Conversation.loadingHistory"),
+    }),
+  );
+
+  // 接收组件属性，设置默认值
+  const props = withDefaults(
+    defineProps<{
+      isTempChat?: boolean;
+      isAppDetails?: boolean; // 是否是应用智能体页面
+    }>(),
+    {
+      isTempChat: false,
+      isAppDetails: false,
+    },
+  );
+
+  // 定义 emits
+  const emit = defineEmits<{
+    // 菜单按钮点击事件
+    (e: 'menu-click'): void;
+  }>();
+
+  // 菜单按钮点击事件
+  const onMenuClick = () => {
+    emit('menu-click');
+  }
+
+  // 创建防重复触发管理器（可选）
+  const dedupManager = new EventDedupManager(1000);
+
+  // 定义 chat-input-phone 组件的引用
+  const agentDetailInputPhoneRef = ref<ChatInputPhoneRef | null>(null);
+  const newConversationSetRef = ref<any>(null);
+  // 聊天内容区域引用用于绑定自定义事件代理
+  const msgListContentRef = ref<HTMLElement | null>(null);
+  // 事件绑定配置
+  const eventBindConfig = ref<EventBindConfig | null>(null);
+  // 阿里云验证码按钮id
+  const buttonId = ref<string>("aliyun-captcha-id");
+  // 租户配置信息
+  const tenantConfigInfo = ref<TenantConfigInfo>(null);
+  // 页面预览iframe引用
+  const pagePreviewIframeRef = ref<any>(null);
+  // 页面预览是否可见
+  const pagePreviewVisible = ref(false);
+  const msgListRef = ref<HTMLElement | null>(null);
+  // 用户临时票据
+  const ticket = ref<string>("");
+  /**
+   * 是否渲染输入框组件， 进入页面后渲染，离开页面后卸载组件
+   * 出现一个bug，当从智能体详情页面返回首页时，录音后发送消息事件触发的是智能体详情页绑定的消息事件，而不是首页绑定的消息事件
+   * 所以需要卸载输入框组件，重新渲染输入框组件
+   */
+  const isRenderInputPhone = ref<boolean>(false);
+
+  // 文件树弹窗是否可见
+  const popupFileTreeVisible = ref<boolean>(false);
+
+  // 文件树引用
+  const fileTreeRef = ref<{
+    open: () => void;
+    close: () => void;
+  } | null>(null);
+
+  const customMenuList = computed<MenuListItem[]>(() => {
+    const collectIcon = agentInfo.value?.collect
+      ? "icon-Star-fill"
+      : "icon-Star";
+
+    const list = [
+      {
+        label: "Mobile.Conversation.newConversation",
+        value: "add",
+        icon: "icon-message-add",
+        onClick: handleCreateNewConversation,
+      },
+      {
+        label: "Mobile.Conversation.moreInfo",
+        value: "info",
+        icon: "icon-Info",
+        onClick: handleOpenInfo,
+      },
+      {
+        label: "Mobile.Conversation.favorite",
+        value: "collect",
+        icon: collectIcon,
+        onClick: handleCollect,
+      },
+    ];
+
+    if (
+      agentInfo.value?.type === AgentTypeEnum.TaskAgent &&
+      messageList.value.length > 0
+    ) {
+      list.push({
+        label: "Mobile.Sandbox.restartAgent",
+        value: "restartAgent",
+        icon: "icon-restart",
+        onClick: handleRestartAgent,
+      });
+      list.push({
+        label:
+          currentSandboxId.value === "-1" ? "Mobile.Sandbox.restartCloudComp" : "Mobile.Sandbox.restartClient",
+        value: "restartSandbox",
+        icon: "icon-restart_agent",
+        onClick: handleRestartSandbox,
+      });
+    }
+
+    return list;
+  })
+
+  // 是否显示webview
+  const isShowWebView = computed(() => {
+    return (
+      agentInfo.value?.expandPageArea === ExpandPageAreaEnum.Yes &&
+      agentInfo.value?.hideChatArea === HideChatAreaEnum.Yes
+    );
+  });
+
+  // 处理返回首页
+  const handleBackHome = () => {
+    uni.switchTab({
+      url: "/pages/index/index",
+    });
+  };
+
+  const updateVisible = (value: boolean) => {
+    pagePreviewVisible.value = value;
+  };
+
+  // 处理文件树弹窗可见性变化
+  const updatePopupFileTreeVisible = (value: boolean) => {
+    popupFileTreeVisible.value = value;
+  };
+  // ==================== 初始化分层架构 ====================
+  // 创建各层实例
+  const data = new AgentDetailData();
+  const service = new AgentDetailService(data);
+  const componentManager = new ComponentManager(data);
+  const scrollManager = new ScrollManager(data);
+
+  // ==================== 暴露方法给模板 ====================
+
+  // 数据层
+  const {
+    agentId,
+    agentName,
+    agentInfo,
+    pageHomeUrl,
+    conversationId,
+    messageList,
+    chatSuggestList,
+    requestId,
+    messageIdRef,
+    captchaVerifyParam,
+    chatKey,
+    conversationUid,
+    conversationInfo,
+    needUpdateTopicRef,
+    manualComponents,
+    selectedComponents,
+    variables,
+    userFillVariables,
+    processingList,
+    scrollIntoView,
+    scrollInBottom,
+    scrollWithAnimation,
+    scrollTouch,
+    scrolling,
+    keyboardHeight,
+    refMorePopup,
+    isStoppingConversation,
+    isConversationActive,
+    isSendMessageRef,
+    wholeDisabled,
+    fileList,
+    isLoadingFiles,
+    sandboxList,
+    currentSandboxId,
+    isSandboxSwitchDisabled,
+    isSandboxUnavailable,
+    sandboxDisabledText,
+    isLoadingMoreMessages,
+    hasMoreMessages,
+    currentModelId,
+    currentModelName,
+    modelSelectVisible,
+  } = data;
+
+  // 处理禁用发送按钮
+  const handleToggleWholeDisabled = (disabled: boolean) => {
+    data.wholeDisabled.value = disabled;
+  };
+
+  // 服务层 - 使用箭头函数保持this上下文
+  const handleQueryConversation = (...args: any[]) =>
+    service.handleQueryConversation(...args);
+  const handleChangeMessageList = (...args: any[]) =>
+    service.handleChangeMessageList(...args);
+
+  // 停止会话
+  const handleStopConversation = () =>
+    service.handleStopConversation(props.isTempChat);
+  const createNewConversation = (...args: any[]) =>
+    service.createNewConversation(...args);
+  const getPublishedAgentInfo = (...args: any[]) =>
+    service.getPublishedAgentInfo(...args);
+  const handleCollect = (...args: any[]) => service.handleCollect(...args);
+
+  // 重启智能体
+  const handleRestartAgent = () => service.handleRestartAgent();
+
+  // 重启沙箱
+  const handleRestartSandbox = () =>
+    service.handleRestartSandbox(data.currentSandboxId.value === "-1");
+  // 清空会话数据
+  const clearConversationData = (isTempChat: boolean) =>
+    service.clearConversationData(isTempChat);
+
+  // 临时会话
+  const queryTempConversation = (conversationUid: string) =>
+    service.queryTempConversation(conversationUid);
+  const createTempChatConversation = (captchaVerifyParam: string) =>
+    service.createTempChatConversation(captchaVerifyParam);
+
+  // 获取文件树列表
+  const fetchFileList = (cId: number) => service.fetchFileList(cId);
+
+  const handleSelectSandbox = (sandboxId: string) =>
+    service.handleSelectSandbox(sandboxId);
+
+  // 模型相关
+  const handleSelectModel = (modelId: number, modelName: string) =>
+    service.handleSelectModel(modelId, modelName);
+
+  // ==================== 页面唤醒恢复逻辑 ====================
+  /**
+   * 处理会话恢复
+   * 当页面从后台恢复时，检测并恢复会话状态
+   */
+  const handleSessionResume = async (): Promise<void> => {
+    // 检查会话ID是否存在
+    if (!conversationId.value) {
+      return;
+    }
+
+    // 调用服务层的恢复方法
+    const needResume = await service.resumeConversationState();
+
+    if (needResume) {
+      console.log("[PageResume] 会话状态已恢复");
+    }
+  };
+
+  // 使用页面唤醒检测 Hook
+  // 注意：H5 环境会自动监听 visibilitychange
+  // 小程序环境需要配合 App.vue 的 onShow 使用
+  // 使用页面唤醒检测 Hook
+  // 注意：H5 环境会自动监听 visibilitychange
+  // 小程序环境需要配合 App.vue 的 onShow 使用
+  const {
+    isHidden: isPageHidden,
+    triggerResume,
+    triggerHide,
+  } = usePageResume({
+    onResume: handleSessionResume,
+    onHide: () => {
+      // console.log("[PageResume] 页面进入后台");
+    },
+    // 最小隐藏时间 5 秒，避免短暂切换触发恢复
+    minHiddenDuration: 5000,
+  });
+
+  // 组件管理层 - 使用箭头函数保持this上下文
+  const setMessageRef = (...args: any[]) =>
+    componentManager.setMessageRef(...args);
+  const removeMessageRef = (...args: any[]) =>
+    componentManager.removeMessageRef(...args);
+  const updateMessageComponent = (...args: any[]) =>
+    componentManager.updateMessageComponent(...args);
+  const convertMessageInfoToMsgItem = (...args: any[]) =>
+    componentManager.convertMessageInfoToMsgItem(...args);
+  // 处理消息内容
+  const handleMessageContent = (item: any) => {
+    // 处理消息内容中的data属性
+    item.text = item.text.replace(/data="(\{.*?\})"/g, (_, json) => {
+      return `data='${json}'`;
+    });
+    return convertMessageInfoToMsgItem(item);
+  };
+
+  // 滚动管理层 - 使用箭头函数保持this上下文
+  const scrollToLastMsg = (...args: any[]) =>
+    scrollManager.scrollToLastMsg(...args);
+  const setIsInScrollBottom = (...args: any[]) =>
+    scrollManager.setIsInScrollBottom(...args);
+  const lockAutoToLastMsg = (...args: any[]) =>
+    scrollManager.lockAutoToLastMsg(...args);
+  const onScroll = (...args: any[]) => {
+    // #ifdef MP-WEIXIN
+    // 微信小程序中，由于使用 scrollIntoView 等机制，可能导致系统内部 scrolltoupper 的触发状态机未复位
+    // 表现为“必须先下滑一点，再上滑才能触发”。我们在此加入滚动高度探测做双重保障。
+    if (args.length > 0) {
+      const e = args[0] as UniScrollEvent;
+      // 避免数值过大（如1000px）导致离顶部尚远时便在下滑过程中误触发
+      if (e && e.detail && e.detail.scrollTop <= 100) {
+        if (!data.isLoadingMoreMessages.value && data.hasMoreMessages.value) {
+          handleScrollToUpper();
+        }
+      }
+    }
+    // #endif
+    scrollManager.onScroll(...args);
+  };
+  const scrollToMessage = (...args: any[]) =>
+    scrollManager.scrollToMessage(...args);
+
+  // 加载更多历史消息
+  const handleLoadMoreMessages = () => service.handleLoadMoreMessages();
+
+  /**
+   * 处理上滑到顶部事件，加载更多历史消息
+   */
+  const handleScrollToUpper = async () => {
+    if (
+      !hasMoreMessages.value ||
+      isLoadingMoreMessages.value ||
+      !messageList.value?.length
+    ) {
+      return;
+    }
+
+    // 记录当前第一条可见消息的 ID 和 游标，用于加载完成后保持滚动位置
+    const firstMessage = messageList.value[0];
+    const firstVisibleMessageId = firstMessage
+      ? `${firstMessage.id}_${firstMessage.index}`
+      : "";
+
+    // 临时禁用自动滚动，避免加载更多时触发自动滚动到底部
+    const previousAutoToLastMsg = data.autoToLastMsg.value;
+    data.autoToLastMsg.value = false;
+
+    await handleLoadMoreMessages();
+
+    // 加载完成后，滚动到之前的第一条消息位置，保持用户视角不变
+    if (firstVisibleMessageId) {
+      await nextTick();
+      scrollToMessage(firstVisibleMessageId);
+    }
+
+    // 恢复自动滚动状态
+    data.autoToLastMsg.value = previousAutoToLastMsg;
+  };
+
+  // ==================== 视图层方法 (原ViewManager逻辑) ====================
+
+  const handleCaptchaReady = () => {
+    document.getElementById(buttonId.value)?.click();
+  };
+
+  // 发送消息
+  const handleSendMessage = (_data: any[]) => {
+    // 取消订阅 ChatFinished 事件（发送新消息时，旧会话已结束）
+    eventBus.off(EVENT_TYPE.ChatFinished, handleChatFinishedInternal);
+    
+    data.autoToLastMsg.value = true;
+    data.needSetLockAutoToLastMsg.value = true;
+    // 发送过消息,则禁用变量参数
+    data.isSendMessageRef.value = true;
+
+    scrollToLastMsg(false);
+
+
+    let params; 
+
+    if(data.urlOtherParams.value) {
+      // 用户自带的url参数中的附件文件列表
+      const otherAttachments = (data.urlOtherParams.value?.attachments ||
+        []) as AttachmentFile[];
+  
+      // 用户自带的url参数中的附件文件列表转为file类型，方便统一处理
+      const otherAttachmentsFiles = otherAttachments.map((item) => ({
+        // 文件URL
+        url: item.fileUrl,
+        // 文件类型
+        type: item.mimeType,
+        name: item?.fileName || '',
+        key: item?.fileKey || '',
+      })) as UploadFileInfo[];
+  
+      // 用户自带的url参数中的附件文件列表
+      const otherFiles = (data.urlOtherParams.value?.files || []) as UploadFileInfo[];
+      // 用户自带的url参数中的组件列表
+      const _selectedComponents = (data.urlOtherParams.value?.selectedComponents ||
+        []) as AgentSelectedComponentInfo[];
+      // 用户自带的url参数中的技能ID列表
+      const otherSkillIds = (data.urlOtherParams.value?.skillIds || []) as number[];
+      // 用户自带的url参数中的模型ID
+      const otherModelId = data.urlOtherParams.value?.modelId;
+      // 用户自带的url参数中的沙盒ID
+      const otherSandboxId = data.urlOtherParams.value?.sandboxId;
+
+      params = {
+        ..._data,
+        // 变量参数
+        variableParams: newConversationSetRef.value?.variableParams || null,
+        // 附件文件列表
+        files: [...otherFiles, ...otherAttachmentsFiles, ...(_data?.files || [])],
+        selectedComponents: [..._selectedComponents, ...(_data?.selectedComponents || [])],
+        // 技能ID列表
+        skillIds: [...otherSkillIds, ...(_data?.skillIds || [])],
+        // 模型ID
+        modelId: _data?.modelId || otherModelId,
+        // 沙盒ID
+        sandboxId: _data?.sandboxId || otherSandboxId,
+      };
+    } else {
+      params = {
+        ..._data,
+        variableParams: newConversationSetRef.value?.variableParams || null,
+      };
+    }
+
+    service.handleSendMessage(params, props.isTempChat, () => {
+      // 将工具调用状态从 loading 修改为 error
+      // service.updateProcessingListToFailed()
+      // 中止当前 SSE 连接
+      chatService?.abort();
+      // 注意：超时时不调用停止接口，只中止 SSE 连接
+      // 停止接口只应该由用户手动点击停止按钮时调用
+
+      // 重置按钮状态（按钮变为发送按钮）
+      data.isConversationActive.value = false;
+      data.isStoppingConversation.value = false;
+    });
+  };
+
+  /**
+   * 处理创建新会话
+   */
+  const handleCreateNewConversation = (): void => {
+    // 中止当前 SSE 连接
+    chatService?.abort();
+    // 注意：创建新会话时不调用停止接口，只中止 SSE 连接
+    // 停止接口只应该由用户手动点击停止按钮时调用
+
+    // 重置按钮状态（按钮变为发送按钮）
+    data.isConversationActive.value = false;
+    data.isStoppingConversation.value = false;
+
+    // 取消订阅 ChatFinished 事件（防止旧会话的事件影响新会话）
+    eventBus.off(EVENT_TYPE.ChatFinished, handleChatFinishedInternal);
+
+    // 清空本地缓存中的临时会话uid
+    uni.removeStorageSync(TEMP_CONVERSATION_UID);
+    if (props.isTempChat) {
+      // 清空会话数据
+      clearConversationData(true);
+
+      // 创建临时会话
+      createTempChatConversation(data.captchaVerifyParam.value);
+    } else {
+      createNewConversation(props.isAppDetails);
+    }
+  };
+
+  /**
+   * 处理更多弹窗
+   */
+  const handleMorePopup = (): void => {
+    if (data.refMorePopup.value) {
+      nextTick(() => {
+        data.refMorePopup.value?.open();
+      });
+    }
+  };
+
+  /**
+   * 处理功能按钮点击
+   */
+  const handleButtonClick = (guideQuestion: string): void => {
+    if (data.wholeDisabled.value) {
+      uni.showToast({
+        title: t("Mobile.Chat.fillRequiredParams"),
+        icon: "none",
+        duration: 2000,
+      });
+      return;
+    }
+    // 判断是否存在上传失败的图片或文件
+    const existErrorFile = agentDetailInputPhoneRef.value?.files?.some(
+      (file) => file.status === UploadFileStatus.error,
+    );
+    if (existErrorFile) {
+      uni.showToast({
+        title: t("Mobile.Chat.removeUploadFailed"),
+        icon: "none",
+        duration: 1500,
+      });
+      return;
+    }
+    const params = {
+      messageInfo: guideQuestion,
+      files: agentDetailInputPhoneRef.value?.files || [],
+      selectedComponents:
+        agentDetailInputPhoneRef.value?.selectedComponents || [],
+    };
+
+    handleSendMessage(params);
+  };
+
+  // 预览图片
+  const onPreview = (file: AttachmentFile, attachments: AttachmentFile[]) => {
+    if (!file.mimeType.includes("image/")) {
+      uni.showToast({
+        title: t("Mobile.Chat.previewTypeUnsupported"),
+        icon: "none",
+        duration: 1500,
+      });
+      return;
+    }
+    const urls =
+      attachments
+        ?.filter((f) => f.mimeType.includes("image/"))
+        ?.map((f) => f.fileUrl) || [];
+    if (urls.length > 0 && file?.fileUrl) {
+      uni.previewImage({
+        urls,
+        current: file.fileUrl,
+      });
+    }
+  };
+
+  /**
+   * 长按消息处理
+   */
+  const onlongTapMsg = (item: any): void => {
+    // 显示操作菜单
+  };
+
+  /**
+   * 思考内容变化处理
+   */
+  const changeThinkContent = (hideThinkContent: boolean): void => {
+    // 注意：不要在这里调用 setIsInScrollBottom()，因为没有事件参数会导致状态错误
+    if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+      nextTick(() => {
+        // 再次检查条件，防止用户在这期间滚动了
+        if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+          scrollToLastMsg(false);
+        }
+      });
+    }
+  };
+
+  /**
+   * 键盘高度变化处理
+   */
+  const onKeyboardheightchange = (
+    res: UniInputKeyboardHeightChangeEvent,
+  ): void => {
+    data.keyboardHeight.value = res.detail.height;
+  };
+
+  // ==================== 计算属性 ====================
+  const lastMessage = computed(
+    () => data.messageList.value[data.messageList.value.length - 1] ?? null,
+  );
+  // 标题
+  const headerTitle = computed(() =>
+    props.isTempChat && agentInfo.value?.name
+      ? t("Mobile.Conversation.startWithAgent", {
+          name: agentInfo.value?.name || "",
+        })
+      : agentInfo.value?.name,
+  );
+
+  // 沙盒是否锁定 (综合判断: 服务层限制 || 已发送消息 || 存在历史消息)
+  const isSandboxLocked = computed(() => {
+    // 1. 服务层限制 (权限, 个人/共享电脑绑定)
+    if (data.isSandboxSwitchDisabled.value) return true;
+    // 2. 已发送消息 (变量锁定)
+    if (data.isSendMessageRef.value) return true;
+    // 3. 存在历史消息 (会话已开始)
+    if (data.messageList.value.length > 0) return true;
+
+    return false;
+  });
+
+  // ==================== 页面加载处理 ====================
+  const handleScrollToLastMsg = async () => {
+    // 注意：不要在这里调用 setIsInScrollBottom()，因为没有事件参数会导致状态错误
+    lockAutoToLastMsg();
+    if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+      await nextTick();
+      setTimeout(() => {
+        // 在 setTimeout 内再次检查条件，防止用户在这期间滚动了
+        if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+          scrollToLastMsg(false);
+        }
+      }, 100);
+    }
+  };
+  watch(lastMessage, handleScrollToLastMsg, { deep: true });
+
+  // 消息列表变化处理
+  watch(data.messageList, handleScrollToLastMsg, { deep: true });
+
+  // 问题建议列表变化处理
+  watch(
+    chatSuggestList,
+    (newVal) => {
+      if (newVal?.length) {
+        handleScrollToLastMsg();
+      }
+    },
+    { deep: true },
+  );
+
+  watch(
+    conversationId,
+    async (newVal) => {
+      if (!eventBindConfig.value && newVal) {
+        // 查询历史会话信息(接口返回数据中包含智能体详情信息, 所以不在需要单独查询智能体详情信息了)
+        const res = await apiAgentConversation(newVal);
+        if (res.code === SUCCESS_CODE) {
+          // 事件绑定配置
+          eventBindConfig.value = res.data?.agent?.eventBindConfig || null;
+        }
+      }
+    },
+    { deep: true },
+  );
+
+  // ==================== 页面加载处理 ====================
+  /**
+   * 处理页面加载
+   */
+  const handlePageLoad = async (options): Promise<void> => {
+    // 智能体id
+    data.agentId.value = options.id ? Number(options.id) : "";
+
+    // 如果存在会话id，则初始化ParseMarkdown，查询历史会话信息
+    if (options.conversationId) {
+      const id = Number(options.conversationId);
+      // 先设置一个临时值，防止 watch(conversationId) 触发时重复调用接口
+      eventBindConfig.value = {} as EventBindConfig;
+      data.conversationId.value = id;
+      // 查询历史会话信息(接口返回数据中包含智能体详情信息, 所以不在需要单独查询智能体详情信息了)
+      const res = await apiAgentConversation(id);
+      if (res.code === SUCCESS_CODE) {
+        // 事件绑定配置
+        eventBindConfig.value = res.data?.agent?.eventBindConfig || null;
+        // 处理消息列表
+        handleQueryConversation(res);
+
+        // 检查会话是否正在执行中（taskStatus === 'EXECUTING'）
+        if (res.data?.taskStatus === TaskStatus.EXECUTING) {
+          // 设置会话为活跃状态（按钮显示为停止按钮）
+          data.isConversationActive.value = true;
+          // 订阅 ChatFinished 事件
+          eventBus.on(EVENT_TYPE.ChatFinished, handleChatFinishedInternal);
+        }
+      }
+    } else {
+      // 如果是应用详情页，则从URL参数中获取消息信息、文件信息、组件列表、变量参数等信息
+      // 自动解码：uni-app 会自动对 URL 参数进行解码，所以你不需要手动调用 decodeURIComponent
+      const paramsFromUrl = options?.params;
+      const paramsData = paramsFromUrl ? JSON.parse(paramsFromUrl) : null;
+
+      // 查询智能体详情信息，并初始化会话id
+      getPublishedAgentInfo(paramsData);
+    }
+  };
+
+  /**
+   * 使用chatKey、captchaVerifyParam创建临时会话
+   * chatKey: 链接key
+   * captchaVerifyParam: 验证码参数 (可选)
+   */
+  const handleCreateTempChat = async (captchaVerifyParam: string = "") => {
+    // 验证码参数
+    data.captchaVerifyParam.value = captchaVerifyParam;
+    data.isLoadingConversation.value = true;
+    const uid = uni.getStorageSync(TEMP_CONVERSATION_UID);
+    if (uid) {
+      data.conversationUid.value = uid;
+      // 查询临时会话详细
+      queryTempConversation(uid);
+    } else {
+      // 创建临时会话
+      createTempChatConversation(captchaVerifyParam);
+    }
+  };
+
+  /**
+   * 处理临时会话页面加载
+   */
+  const handleTempChatPageLoad = async (options) => {
+    // 临时会话key
+    data.chatKey.value = options.chatKey;
+    // 是否存在缓存的chatKey值
+    const _cacheChatKey = uni.getStorageSync(TEMP_CHAT_KEY);
+
+    /**
+     * 如果缓存的chatKey值存在且与当前的chatKey值不一致，则清空缓存的临时会话uid
+     * (防止用户手动修改url地址中的chatKey值后刷新页面，因为缓存TEMP_CONVERSATION_UID的值与chatKey值不匹配，导致后面查询会话详情时提示会话ID不存在的bug)
+     */
+    if (_cacheChatKey && options.chatKey !== _cacheChatKey) {
+      uni.removeStorageSync(TEMP_CONVERSATION_UID);
+    }
+    // 缓存chatKey
+    uni.setStorageSync(TEMP_CHAT_KEY, options.chatKey);
+
+    // 租户配置信息
+    let _tenantConfigInfo = null;
+    // 从缓存中查询是否存在租户配置信息
+    const info = uni.getStorageSync(TENANT_CONFIG_INFO);
+    if (info) {
+      _tenantConfigInfo = JSON.parse(info);
+    } else {
+      // 不存在，则查询租户配置信息
+      const res = await apiTenantConfig();
+
+      if (res.code === SUCCESS_CODE) {
+        _tenantConfigInfo = res.data;
+        // 缓存租户配置信息
+        uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(res.data));
+      }
+    }
+
+    tenantConfigInfo.value = _tenantConfigInfo;
+    const { captchaSceneId, captchaPrefix, openCaptcha } = _tenantConfigInfo;
+    // 是否需要阿里云验证码, 只有同时满足三个条件才启用验证码：场景ID存在、身份标存在、开启验证码
+    const isNeedCaptcha = !!(captchaSceneId && captchaPrefix && openCaptcha);
+    // 不需要阿里云验证码时，直接调用接口
+    if (!isNeedCaptcha) {
+      handleCreateTempChat();
+    }
+  };
+
+  const handlePagePreviewExecuting = (data: any) => {
+    const input = data.result?.input || null;
+    if (!input) {
+      return;
+    }
+    /**
+     * 如果uri_type不存在，则默认设置为Page
+     * 如果uri_type存在，则使用uri_type
+     */
+    input.uri_type = input.uri_type ?? "Page";
+    // 拼接 query 参数
+    const argumentsString = objectToQueryString(input.arguments);
+    // 处理 query 参数
+    const queryString = argumentsString ? `?${argumentsString}` : "";
+
+    if (input.uri_type === "Link" && data.status === ProcessingEnum.FINISHED) {
+      const pageUrl = input.uri + queryString;
+      window.open(pageUrl, "_blank");
+      return;
+    }
+
+    if (input.uri_type === "Page") {
+      // 构建完整的页面 URL
+      const fullUri = input.uri + queryString;
+
+      // 手动打开页面首页
+      if (data.status === ProcessingEnum.FINISHED) {
+        // 打开页面首页
+        handleOpenPagePreview({ uri: fullUri });
+        return;
+      }
+
+      // 自动打开预览页面
+      if (data.status === ProcessingEnum.EXECUTING) {
+        // 打开页面并调用接口
+        handleOpenPagePreview({
+          uri: fullUri,
+          method: input.method,
+          data_type: input.data_type,
+          request_id: input.request_id,
+        });
+        return;
+      }
+    }
+  };
+
+  /**
+   * 打开页面预览
+   * @param uri 页面URI
+   * @param method 请求方法 (默认: browser_open_page)
+   * @param data_type 数据类型 (默认: html)
+   * @param request_id 请求ID (默认: '')
+   */
+  const handleOpenPagePreview = async ({
+    uri,
+    method = "browser_open_page",
+    data_type = "html",
+    request_id = "",
+  }: ShowPagePreviewOptions) => {
+    // 打开页面首页
+    // #ifdef H5 || WEB
+    pagePreviewIframeRef.value?.handlePageOpen({
+      uri: `${API_BASE_URL}${uri}`,
+      method,
+      data_type,
+      request_id,
+    });
+    // #endif
+
+    // #ifdef MP-WEIXIN
+    const { code, data } = await apiUserTicketCreate();
+    if (code === SUCCESS_CODE && data) {
+      uri = uri + (uri.includes("?") ? "&" : "?" + "_ticket=") + data;
+    }
+    const pageHomeTitle = encodeURIComponent(t("Mobile.Common.pageHome"));
+    handleExternalLink(
+      `${API_BASE_URL}${uri}&jump_type=inner&title=${pageHomeTitle}&method=${method}&data_type=${data_type}&request_id=${request_id}`,
+    );
+    // #endif
+  };
+
+  // 处理更多信息
+  const handleOpenInfo = () => {
+    nextTick(() => {
+      refMorePopup.value?.popupMore?.open();
+    });
+  };
+
+  // 事件代理
+  useMessageEventDelegate(
+    msgListContentRef,
+    eventBindConfig,
+    (data: ShowPagePreviewOptions) => {
+      // 打开引导问题页面弹窗
+      handleOpenPagePreview({ uri: data.uri });
+    },
+  );
+
+  // ==================== 生命周期 ====================
+  onLoad(async (options) => {
+    // 设置当前页面导航栏标题
+    setCurrentPageNavigationBarTitle();
+    ticket.value = options._ticket || "";
+    // 进入页面后渲染输入框组件
+    isRenderInputPhone.value = true;
+
+    // 微信小程序事件绑定
+    // #ifdef MP-WEIXIN
+    uni.$on("message-event-delegate", (data) => {
+      const eventType = data.attrs["event-type"];
+      const dataStr = data.attrs["data"];
+      if (eventType && dataStr) {
+        handleMessageEventClick(
+          eventType,
+          dataStr,
+          eventBindConfig.value,
+          handleOpenPagePreview,
+          dedupManager,
+        );
+      } else {
+        console.warn("[Event Delegate] 缺少必要属性", { eventType, dataStr });
+      }
+    });
+    // #endif
+
+    // 判断是否是临时会话
+    if (props.isTempChat) {
+      await handleTempChatPageLoad(options);
+    } else {
+      await handlePageLoad(options);
+    }
+  });
+
+  // 刷新文件列表
+  const onRefreshFileList = () => {
+    // 如果智能体类型为任务型智能体，并且会话id存在,并且文件树弹窗可见，则获取文件树列表
+    if (
+      agentInfo.value?.type === AgentTypeEnum.TaskAgent &&
+      conversationId.value &&
+      popupFileTreeVisible.value
+    ) {
+      fetchFileList(conversationId.value);
+    }
+  };
+
+  // 处理消息组件更新事件
+  const handleUpdateMessageComponent = (eventData: any) => {
+    updateMessageComponent(eventData.messageId, eventData.data);
+  };
+
+  // 流式消息滚动定时器
+  let streamScrollTimer: number = 0;
+  // 触摸结束延迟计时器
+  let touchEndTimer: number = 0;
+
+  // 触摸开始处理
+  const handleTouchStart = () => {
+    // 清除触摸结束延迟计时器，确保触摸开始时立即生效
+    if (touchEndTimer) {
+      clearTimeout(touchEndTimer);
+      touchEndTimer = 0;
+    }
+    data.scrollTouch.value = true;
+  };
+
+  // 触摸结束处理 - 延迟重置 scrollTouch
+  const handleTouchEnd = () => {
+    // 清除之前的计时器
+    if (touchEndTimer) {
+      clearTimeout(touchEndTimer);
+    }
+    // 延迟 300ms 后才重置 scrollTouch
+    // 这样在用户快速滑动时，自动滚动不会在手指抬起的瞬间抢占
+    touchEndTimer = setTimeout(() => {
+      data.scrollTouch.value = false;
+      touchEndTimer = 0;
+    }, 300);
+  };
+
+  const handleStreamMessageUpdate = () => {
+    // 使用防抖处理，避免频繁滚动影响性能
+    // 150ms 可以在保证流畅滚动的同时减少性能开销
+    if (streamScrollTimer) {
+      clearTimeout(streamScrollTimer);
+    }
+    streamScrollTimer = setTimeout(() => {
+      if (!data.scrollTouch.value && data.autoToLastMsg.value) {
+        scrollToLastMsg(false);
+      }
+    }, 150);
+  };
+
+  // ChatFinished 事件处理函数（带节流）
+  const handleChatFinishedInternal = (event: any) => {
+    // 判断是否是当前会话
+    if (conversationId.value === Number(event.conversationId)) {
+      // 定义事件回调函数（使用 throttle 工具进行节流，500ms 内只执行一次）
+      throttle(() => {
+        // 关闭会话活跃状态（按钮变为发送按钮）
+        if (data.isConversationActive.value) {
+          data.isConversationActive.value = false;
+        }
+
+        // 重新查询会话信息以更新状态
+        if (conversationId.value) {
+          apiAgentConversation(conversationId.value).then((res) => {
+            if (res.code === SUCCESS_CODE) {
+              handleQueryConversation(res);
+            }
+          });
+        }
+      }, 500)();
+    }
+  };
+
+  // 设置事件监听器
+  onMounted(() => {
+    // 监听流式消息更新事件，触发自动滚动到底部
+    // 兼容微信小程序和 H5
+    uni.$on("streamMessageUpdate", handleStreamMessageUpdate);
+
+    uni.$on("refreshFileList", onRefreshFileList);
+    uni.$on("updateMessageComponent", handleUpdateMessageComponent);
+    // #ifdef H5
+    window.addEventListener("wheel", (e: WheelEvent) => {
+      data.mouseScroll.value = true;
+      let clear: number = 0;
+      clear = setTimeout(() => {
+        data.mouseScroll.value = false;
+        clearTimeout(clear);
+      }, 1000);
+    });
+    // #endif
+
+    uni.$on("page_preview_executing", handlePagePreviewExecuting);
+  });
+
+  // 清理事件监听器
+  onUnmounted(() => {
+    // 页面卸载时立即中断 SSE 连接并清除超时定时器
+    // 注意：只中断连接，不调用停止接口
+    console.log("[页面卸载] 准备中断 SSE 连接");
+    chatService?.abort();
+    console.log("[页面卸载] SSE 连接已中断");
+
+    uni.$off("streamMessageUpdate", handleStreamMessageUpdate);
+    uni.$off("refreshFileList", onRefreshFileList);
+    uni.$off("updateMessageComponent", handleUpdateMessageComponent);
+    // 页面卸载时取消监听，防止内存泄漏
+    uni.$off("page_preview_executing", handlePagePreviewExecuting);
+    // 清理微信小程序事件监听器，防止返回首页后仍然触发当前页面的事件
+    // #ifdef MP-WEIXIN
+    uni.$off("message-event-delegate");
+    // #endif
+    // 离开页面后卸载输入框组件
+    isRenderInputPhone.value = false;
+    // 取消订阅 ChatFinished 事件（必须传入回调函数）
+    eventBus.off(EVENT_TYPE.ChatFinished, handleChatFinishedInternal);
+  });
+
+  // 打开工作台文件树弹窗
+  const handleOpenFileTree = () => {
+    popupFileTreeVisible.value = true;
+    // 打开文件树弹窗
+    fileTreeRef.value?.open();
+    // 查询文件列表
+    onRefreshFileList();
+  };
+  defineExpose({
+    triggerResume,
+    triggerHide,
+    getAgentInfo: () => agentInfo.value,
+  });
+</script>
+
+<style lang="scss" scoped>
+  @import "./styles/index.scss";
+
+  .captcha-button {
+    position: absolute;
+    left: 10px;
+    top: 10px;
+    visibility: hidden;
+    opacity: 0;
+  }
+
+  .icon-loading-image {
+    width: 48rpx;
+    height: 48rpx;
+    margin-left: 32rpx;
+    -webkit-touch-callout: none !important;
+    -webkit-user-select: none !important;
+    user-select: none !important;
+  }
+
+  .loading-more-tip {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 24rpx 0;
+  }
+</style>

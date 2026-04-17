@@ -1,0 +1,282 @@
+<template>
+    <view class="captcha-verify">
+        <view class="captcha-verify-header">
+            <!-- 返回按钮 -->
+            <view class="back-box" @tap="handleBack">
+                <text class="iconfont icon-a-Chevronleft"></text>
+            </view>
+        </view>
+        <view class="captcha-verify-content">
+            <view class="title">{{ t("Mobile.Auth.setPasswordTitle") }}</view>
+            <view class="phone-info">{{ t("Mobile.Auth.setPasswordDesc") }}</view>
+        </view>
+        <view class="password-input-wrapper">
+			<input class="password-input" password :placeholder="t('Mobile.Auth.inputPassword')" v-model="password"	cursor-color="#5147FF" />
+			<view class="clear-btn" v-if="password" @click="clearPassword">
+				<uni-icon class="iconfont icon-a-Xcircle-fill clear-icon" />
+			</view>
+		</view>
+        <view class="password-input-wrapper">
+			<input class="password-input" password :placeholder="t('Mobile.Auth.inputPasswordAgain')" v-model="confirmPassword"	cursor-color="#5147FF" />
+			<view class="clear-btn" v-if="confirmPassword" @click="clearConfirmPassword">
+			<uni-icon class="iconfont icon-a-Xcircle-fill clear-icon" />
+		</view>
+		</view>
+
+        <button class="reset-btn" :class="{ loading: loadingReset }" @click="handleReset" :disabled="loadingReset" :loading="loadingReset">
+            <text>{{ loadingReset ? t("Mobile.Auth.setting") : t("Mobile.Common.ok") }}</text>
+        </button>
+    </view>
+</template>
+
+<script lang="ts" setup>
+    import { apiSetPassword } from '@/servers/account'
+    import { SUCCESS_CODE } from '@/constants/codes.constants'
+    import type { ResetPasswordParams } from '@/types/interfaces/login'
+    import { useI18n } from "@/utils/i18n";
+
+    const { t } = useI18n();
+    
+    const props = defineProps({
+        phoneNumber: {
+            type: String,
+            default: ''
+        },
+        verificationCode: {
+            type: String,
+            default: ''
+        }
+    })
+    
+    const emit = defineEmits(['reset-success', 'back'])
+    
+    // 密码
+    const password = ref('')
+    // 确认密码
+    const confirmPassword = ref('')
+    // 登录loading
+    const loadingReset = ref(false)
+
+    // 清除密码
+    const clearPassword = () => {
+        password.value = ''
+    }
+    
+    // 清除确认密码
+    const clearConfirmPassword = () => {
+        confirmPassword.value = ''
+    }
+
+    // 返回登录
+    const handleBack = () => {
+        emit('back')
+    }
+
+    // 密码验证
+    const validatePassword = () => {
+        if (!password.value) {
+            uni.showToast({
+                title: t("Mobile.Auth.inputPassword"),
+                icon: 'none'
+            })
+            return false
+        }
+        
+        if (password.value.length < 6) {
+            uni.showToast({
+                title: t("Mobile.Auth.passwordMinLength"),
+                icon: 'none'
+            })
+            return false
+        }
+        
+        if (!confirmPassword.value) {
+            uni.showToast({
+                title: t("Mobile.Auth.confirmPassword"),
+                icon: 'none'
+            })
+            return false
+        }
+        
+        if (password.value !== confirmPassword.value) {
+            uni.showToast({
+                title: t("Mobile.Auth.passwordMismatch"),
+                icon: 'none'
+            })
+            return false
+        }
+        
+        return true
+    }
+
+    // 重置密码
+    const handleReset = async () => {
+        
+        if (!validatePassword()) {
+            return
+        }
+        
+        try {
+            loadingReset.value = true
+            const { code, message } = await apiSetPassword({password: password.value})
+            
+            if (code === SUCCESS_CODE) {
+                uni.showToast({
+                    title: t("Mobile.Auth.passwordSetSuccess"),
+                    icon: 'success'
+                })
+                
+                setTimeout(() => {
+                    uni.reLaunch({
+                        url: '/pages/index/index'
+                    })
+                }, 1000)
+            } else {
+                uni.showToast({
+                    title: message || t("Mobile.Auth.passwordSetFailed"),
+                    icon: 'none'
+                })
+            }
+        } catch (error) {
+            uni.showToast({
+                title: t("Mobile.Common.networkRetry"),
+                icon: 'none'
+            })
+        } finally {
+            loadingReset.value = false
+        }
+    }
+
+</script>
+
+<style lang="scss" scoped>
+    .captcha-verify {
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+
+        .captcha-verify-header {
+
+            .back-box{
+                display: inline-block;
+                width: 58rpx;
+                height: 58rpx;
+                line-height: 58rpx;
+                text-align: center;
+                background-color: rgba(12, 20, 102, 0.04);
+                border-radius: 50%;
+                
+                .iconfont {
+                    font-size: 48rpx;
+                    color: #333;
+                }
+            }
+
+        }
+        
+        .captcha-verify-content {
+            flex: 1;
+            overflow: auto;
+            
+            .title {
+                font-size: 40rpx;
+                line-height: 56rpx;
+                font-weight: 600;
+                color: rgba(21, 23, 31, 1);
+                margin-bottom: 24rpx;
+                line-height: 64rpx;
+                text-align: center;
+            }
+            
+            .phone-info {
+                font-size: 28rpx;
+                font-weight: 400;
+                color: rgba(21, 23, 31, 0.7);
+                margin-bottom: 80rpx;
+                line-height: 44rpx;
+                text-align: center;
+            }
+            
+        }
+
+        .password-input-wrapper {
+			background: rgba(12, 20, 102, 0.04);
+			border-radius: 16rpx;
+			padding: 24rpx 32rpx;
+			margin-bottom: 36rpx;
+			position: relative;
+			border: 2rpx solid transparent;
+			transition: border-color 0.3s ease;
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            // justify-content: center;
+
+			&:focus-within {
+				border-color: #5147FF;
+			}
+
+			.password-input {
+				width: 100%;
+				background: transparent;
+				border: none;
+				outline: none;
+				font-size: 32rpx;
+				color: #15171f;
+				font-weight: 400;
+				line-height: 48rpx;
+				padding-right: 60rpx;
+				caret-color: #5147FF;
+				cursor-color: #5147FF;
+			}
+
+            .clear-btn {
+                position: absolute;
+                right: 32rpx;
+                top: 50%;
+                transform: translateY(-50%);
+                cursor: pointer;
+
+                .clear-icon {
+                    color: #b2b4b8;
+                    font-size: 32rpx;
+                }
+            }
+
+		}
+
+        .reset-btn {
+            width: 100%;
+			border-radius: 16rpx;
+            margin-top: 20rpx;
+			padding: 32rpx 23rpx;
+			font-size: 32rpx;
+			font-weight: 400;
+			margin-bottom: 32rpx;
+			line-height: 48rpx;
+			text-align: center;
+			background: #5147ff;
+			color: #ffffff;
+			display: flex;
+			flex-direction: row;
+			align-items: center;
+			justify-content: center;
+			border: none;
+        }
+
+        .reset-btn:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+
+
+        @keyframes rotate {
+            from {
+                transform: rotate(0deg);
+            }
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    }
+</style>

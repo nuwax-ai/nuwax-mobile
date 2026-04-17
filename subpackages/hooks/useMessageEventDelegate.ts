@@ -1,0 +1,203 @@
+import { ref, onMounted, onUnmounted, Ref } from 'vue'
+import { EventBindResponseActionEnum } from '@/types/enums/agent'
+import { checkPathParams, fillPathParams, objectToQueryString } from '@/utils/common'
+import { EventBindConfig, ShowPagePreviewOptions } from '@/types/interfaces/agent'
+import { API_BASE_URL } from '@/constants/config'
+import { handleExternalLink } from '@/utils/system'
+import { t } from '@/utils/i18n'
+
+// ============ 工具方法 ============
+const showError = (msg: string): void => {
+  uni.showToast({
+    title: msg,
+    icon: 'none'
+  })
+}
+
+// ============ 防重复触发管理器 ============
+
+/**
+ * 事件防重复触发管理器
+ * 用于防止短时间内重复触发相同的事件
+ */
+export class EventDedupManager {
+  private handledEvents: Set<string> = new Set()
+  private timeout: number = 1000
+
+  constructor(timeout?: number) {
+    if (timeout !== undefined) {
+      this.timeout = timeout
+    }
+  }
+
+  /**
+   * 检查事件是否已经被处理
+   * @param eventKey 事件键
+   * @returns 是否已处理（true 表示已处理，应该跳过）
+   */
+  isDuplicate(eventKey: string): boolean {
+    if (this.handledEvents.has(eventKey)) {
+      return true
+    }
+    this.handledEvents.add(eventKey)
+    setTimeout(() => {
+      this.handledEvents.delete(eventKey)
+    }, this.timeout)
+    return false
+  }
+
+  /**
+   * 清除所有记录
+   */
+  clear(): void {
+    this.handledEvents.clear()
+  }
+}
+
+// ============ 导出的事件处理函数 ============
+
+/**
+ * 处理消息事件点击
+ * 可以在任何地方独立调用此函数来处理事件
+ * 
+ * @param eventType 事件类型标识
+ * @param dataStr 事件数据（JSON 字符串）
+ * @param eventBindConfig 事件绑定配置
+ * @param showPagePreview 页面预览回调函数
+ * @param dedupManager 防重复触发管理器（可选）
+ */
+export const handleMessageEventClick = (
+  eventType: string,
+  dataStr: string,
+  eventBindConfig: EventBindConfig | undefined,
+  showPagePreview?: (opts: ShowPagePreviewOptions) => void,
+  dedupManager?: EventDedupManager
+): void => {
+  const eventKey = `${eventType}-${dataStr}`
+
+  // 防重复触发
+  if (dedupManager && dedupManager.isDuplicate(eventKey)) {
+    return
+  }
+
+
+  // 解析数据
+  let parsedData: Record<string, any> = {}
+  try {
+    parsedData = JSON.parse(dataStr)
+  } catch (err) {
+    console.error('[Event Handler] 数据解析失败:', err)
+    return
+  }
+
+  // 查找事件配置
+  const eventConfig = eventBindConfig?.eventConfigs?.find(
+    (cfg) => cfg.identification === eventType
+  )
+  if (!eventConfig) {
+    console.warn(`[Event Handler] 未找到事件配置: ${eventType}`)
+    return
+  }
+
+
+  // === 根据类型执行 ===
+  switch (eventConfig.type) {
+    case EventBindResponseActionEnum.Page: {
+      if (!eventConfig.pageUrl) {
+        showError(t("Mobile.ButtonWrapper.pagePathConfigError"))
+        return
+      }
+
+      const pathParams: Record<string, any> = {}
+      const params: Record<string, any> = {}
+
+      eventConfig.args?.forEach((arg) => {
+        if (arg.inputType === 'Path' && arg.name)
+          pathParams[arg.name] = parsedData[arg.name] ?? arg.bindValue
+        if (arg.inputType === 'Query' && arg.name)
+          params[arg.name] = parsedData[arg.name] ?? arg.bindValue
+      })
+
+      if (checkPathParams(eventConfig.pageUrl, pathParams)) {
+        const pageUrl = fillPathParams(eventConfig.pageUrl, pathParams)
+        const fullUri = eventConfig.basePath? `${eventConfig.basePath}${pageUrl}`: pageUrl
+
+        // 构建查询字符串
+        const queryString = objectToQueryString(params)
+        
+        showPagePreview?.({
+          uri: queryString ? `${fullUri}?${queryString}` : fullUri,
+        })
+      } else {
+        showError(t("Mobile.ButtonWrapper.pagePathParamConfigError"))
+      }
+      break
+    }
+
+    case EventBindResponseActionEnum.Link: {
+      handleExternalLink(eventConfig.url)
+      break
+    }
+
+    default:
+      console.warn(`[Event Handler] 未知的事件类型: ${eventConfig.type}`)
+  }
+}
+
+// ============ 主 Hook ============
+
+export const useMessageEventDelegate = (
+  containerRef: Ref<HTMLElement | null>,
+  eventBindConfig?: EventBindConfig,
+  showPagePreview?: (opts: ShowPagePreviewOptions) => void
+) => {
+  // 创建防重复触发管理器
+  const dedupManager = new EventDedupManager(1000)
+
+  // 👉 点击事件处理（内部封装）
+  const handleEventClick = (eventType: string, dataStr: string): void => {
+    handleMessageEventClick(
+      eventType,
+      dataStr,
+      eventBindConfig.value,
+      showPagePreview,
+      dedupManager
+    )
+  }
+
+  // 👉 监听容器点击事件（仅H5平台）
+  // #ifdef H5 || WEB
+  const handleClick = (e: MouseEvent): void => {
+    const target = e.target as HTMLElement
+    const eventElement = target.closest('.event') as HTMLElement | null
+
+    if (eventElement) {
+      e.preventDefault()
+      e.stopPropagation()
+      const eventType = eventElement.getAttribute('event-type')
+      const dataStr = eventElement.getAttribute('data')
+      if (eventType && dataStr) {
+        handleEventClick(eventType, dataStr)
+      } else {
+        console.warn('[Event Delegate] 缺少必要属性', { eventType, dataStr })
+      }
+    }
+  }
+
+  // 👉 生命周期挂载与清理
+  onMounted(() => {
+    const container = containerRef.value
+    if (container) {
+      container.addEventListener('click', handleClick)
+    }
+  })
+
+  onUnmounted(() => {
+    const container = containerRef.value
+    if (container) {
+      container.removeEventListener('click', handleClick)
+    }
+  })
+  // #endif
+
+}

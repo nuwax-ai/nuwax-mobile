@@ -12,7 +12,7 @@
 </template>
 
 <script>
-  import modalPopup from "@/components/modal-popup/modal-popup.uvue";
+  import modalPopup from "@/components/modal-popup/modal-popup.vue";
   import { t } from '@/utils/i18n';
 
   export default {

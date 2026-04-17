@@ -213,7 +213,7 @@
 				} = uni.getSystemInfoSync()
 				// #endif
 				this.popupWidth = windowWidth
-				this.popupHeight = windowHeight + (windowTop || 0)
+				this.popupHeight = windowHeight + (windowTop != null ? windowTop : 0)
 				// TODO fix by mehaotian 是否适配底部安全区 ,目前微信ios 、和 app ios 计算有差异，需要框架修复
 				if (safeArea && this.safeArea) {
 					// #ifdef MP-WEIXIN

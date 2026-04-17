@@ -15,24 +15,24 @@ function makeMap(str) {
   return map;
 }
 
-// 配置
+// parser config
 const config = {
-  // 信任的标签（保持标签名不变）
+  // trusted tags
   trustTags: makeMap(
     "container,a,abbr,ad,audio,b,blockquote,br,code,col,colgroup,dd,del,dl,dt,div,em,fieldset,h1,h2,h3,h4,h5,h6,hr,i,img,ins,label,legend,li,ol,p,q,ruby,rt,source,span,strong,sub,sup,table,tbody,td,tfoot,th,thead,tr,title,ul,video,task-result,description,file"
   ),
 
-  // 块级标签（转为 div，其他的非信任标签转为 span）
+  // block tags
   blockTags: makeMap(
     "address,article,aside,body,caption,center,footer,header,html,nav,pre,section"
   ),
 
-  // 要移除的标签
+  // ignored tags
   ignoreTags: makeMap(
     "area,base,canvas,embed,frame,head,iframe,input,link,map,meta,param,rp,script,source,style,textarea,title,track,wbr"
   ),
 
-  // 自闭合的标签
+  // void tags
   voidTags: makeMap(
     "area,base,br,col,circle,ellipse,embed,frame,hr,img,input,line,link,meta,param,path,polygon,rect,source,track,use,wbr"
   ),
@@ -127,25 +127,25 @@ config.ignoreTags.source = undefined;
 config.ignoreTags.style = undefined;
 // #endif
 // #ifdef MP-WEIXIN
-// 行内标签配置（微信小程序）
+// inline tags for MP-WEIXIN
 config.inlineTags = makeMap(
   "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
 );
 // #endif
 // #ifdef MP-QQ
-// 行内标签配置（QQ小程序）
+// inline tags for MP-QQ
 config.inlineTags = makeMap(
   "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
 );
 // #endif
 // #ifdef APP
-// 行内标签配置（App）
+// inline tags for APP
 config.inlineTags = makeMap(
   "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
 );
 // #endif
 // #ifdef MP-360
-// 行内标签配置（360小程序）
+// inline tags for MP-360
 config.inlineTags = makeMap(
   "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
 );

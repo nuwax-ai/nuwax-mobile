@@ -28,6 +28,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref } from "vue";
   import type { GuidQuestionDto } from "@/types/interfaces/agent";
   import {
     checkPathParams,

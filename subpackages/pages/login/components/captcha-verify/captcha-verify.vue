@@ -62,6 +62,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, computed, nextTick, onMounted, onUnmounted } from "vue";
   import { apiSendCode } from "@/servers/account";
   import { SUCCESS_CODE, AGENT_NOT_EXIST } from "@/constants/codes.constants";
   import { useI18n } from "@/utils/i18n";

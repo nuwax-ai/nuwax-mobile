@@ -49,6 +49,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref } from "vue";
   import iconUser from "@/static/assets/icon_user.png";
   import iconMessage from "@/static/assets/icon_message.png";
   import agentImage from "@/static/assets/agent_image.png";

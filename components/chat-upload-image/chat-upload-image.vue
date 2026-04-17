@@ -77,6 +77,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { computed } from "vue";
   import { UploadFileInfo } from "@/types/interfaces/common";
   import docImage from "@/static/assets/doc_image.png";
   import { formatBytes } from "@/utils/byteConverter";

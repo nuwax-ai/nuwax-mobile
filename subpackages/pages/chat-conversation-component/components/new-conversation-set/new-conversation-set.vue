@@ -108,6 +108,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, reactive, computed, watch } from "vue";
   import { BindConfigWithSub } from '@/types/interfaces/common';
   import { InputTypeEnum } from '@/types/enums/agent';
   import lCascader from '@/uni_modules/lime-cascader/components/l-cascader/l-cascader.vue';

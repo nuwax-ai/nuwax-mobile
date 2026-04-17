@@ -115,6 +115,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, computed, nextTick, watch, onMounted } from "vue";
   import {
     apiSkillListForAt,
     apiSkillRecentlyUsedList,

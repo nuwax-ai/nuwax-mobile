@@ -5,6 +5,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, watch, onUnmounted } from "vue";
   // 阿里云验证码配置类型定义
   interface AliyunCaptchaConfig {
     captchaSceneId: string; // 场景ID

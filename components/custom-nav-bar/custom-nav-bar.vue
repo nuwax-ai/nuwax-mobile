@@ -64,6 +64,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed, ref, watch } from "vue";
 import { chatService } from "@/utils/chatService";
 import agentImage from "@/static/assets/agent_image.png";
 import { translateText, useI18n } from "@/utils/i18n";

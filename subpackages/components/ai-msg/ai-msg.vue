@@ -71,6 +71,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { ref, computed } from "vue";
   import { MsgItem } from "@/types/interfaces/ai-msg";
   import msgToolBar from "@/subpackages/components/msg-tool-bar/msg-tool-bar.vue";
   import mpHtml from "@/subpackages/uni_modules/mp-html/components/mp-html/mp-html.vue";

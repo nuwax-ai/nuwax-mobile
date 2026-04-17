@@ -15,6 +15,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref, watch, onMounted } from "vue";
   import { translateText } from "@/utils/i18n";
 
   interface SegmentOption {

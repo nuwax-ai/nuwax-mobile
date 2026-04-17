@@ -33,6 +33,7 @@
 </template>
 
 <script setup lang="ts">
+  import { ref } from "vue";
   import agentImage from "@/static/assets/agent_image.png";
   import { useI18n } from "@/utils/i18n";
 

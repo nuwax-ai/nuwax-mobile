@@ -17,6 +17,7 @@
 </template>
   
 <script setup lang="ts">
+    import { computed } from "vue";
     import type { MenuListItem } from '@/types/interfaces/common'
     import { translateText } from "@/utils/i18n";
     interface Props{

@@ -5,7 +5,6 @@ import {
   I18N_LANG_LIST_STORAGE_KEY,
   I18N_LANG_MAP_STORAGE_KEY,
   I18N_LANG_STORAGE_KEY,
-  MP_FIXED_LANG,
 } from "@/constants/i18n.constants";
 import {
   getLocalFallback,
@@ -43,6 +42,12 @@ const getBrowserLang = (): string => {
   // #ifdef H5 || WEB
   const navLang = navigator?.language || DEFAULT_LANG;
   return navLang;
+  // #endif
+  // #ifdef MP-WEIXIN
+  try {
+    const sysLang = uni.getSystemInfoSync().language;
+    if (sysLang) return sysLang;
+  } catch (e) {}
   // #endif
   return DEFAULT_LANG;
 };
@@ -137,17 +142,14 @@ const fillTemplate = (
 };
 
 const pickLangForInit = (): string => {
-  if (isMpWeixinPlatform()) {
-    return MP_FIXED_LANG;
-  }
   const cacheLang = getStoredLang();
   const browserLang = normalizeLang(getBrowserLang());
   return normalizeLang(cacheLang || browserLang || DEFAULT_LANG);
 };
 
 const fetchLangList = async (): Promise<I18nLangDto[]> => {
-  // 仅在 H5 环境允许调用接口获取语言列表
-  if (isH5Platform()) {
+  // 允许在 H5 和微信小程序环境调用接口
+  if (isH5Platform() || isMpWeixinPlatform()) {
     try {
       const res = await apiI18nLangList();
       if (res?.code === SUCCESS_CODE && Array.isArray(res?.data)) {
@@ -162,13 +164,15 @@ const fetchLangList = async (): Promise<I18nLangDto[]> => {
   return sortLangList(getCachedLangList());
 };
 
-const fetchLangMap = async (lang?: string): Promise<Record<string, string>> => {
-  // 仅在 H5 环境允许进入远程查询逻辑
-  if (!isH5Platform()) {
+const fetchLangMap = async (lang: string = "", active: boolean = false): Promise<Record<string, string>> => {
+  // 允许在 H5 和微信小程序环境调用接口
+  if (!isH5Platform() && !isMpWeixinPlatform()) {
     return {};
   }
 
-  const targetLang = lang ? normalizeLang(lang) : "";
+  // 仅在主动切换 (active=true) 且有有效 lang 时才透传给后端，
+  // 否则传空字符串，后端将返回默认翻译而不会修改用户配置。
+  const targetLang = (active && lang) ? normalizeLang(lang) : "";
   try {
     // lang 为空时由后端按用户已保存语言/命中逻辑返回对应词典
     const res = await apiI18nQuery(targetLang);
@@ -183,8 +187,8 @@ const fetchLangMap = async (lang?: string): Promise<Record<string, string>> => {
 };
 
 export const bootstrapI18nCache = () => {
-  const lang = isMpWeixinPlatform() ? MP_FIXED_LANG : getStoredLang();
-  i18nState.currentLang = normalizeLang(lang);
+  const lang = getStoredLang();
+  i18nState.currentLang = normalizeLang(lang || pickLangForInit());
   i18nState.langMap = getCachedLangMap();
   i18nState.langList = sortLangList(getCachedLangList());
   i18nState.loaded = Object.keys(i18nState.langMap || {}).length > 0;
@@ -244,8 +248,10 @@ export const translateText = (
   return t(text, params, text);
 };
 
-const applyTabBarI18n = () => {
-  if (!isH5Platform()) return;
+export const applyTabBarI18n = () => {
+  // #ifndef MP-WEIXIN || H5 || WEB
+  return;
+  // #endif
 
   TAB_BAR_I18N_ITEMS.forEach((item) => {
     try {
@@ -262,7 +268,7 @@ const applyTabBarI18n = () => {
   });
 };
 
-export const loadI18n = async () => {
+export const loadI18n = async (active: boolean = false) => {
   if (loadI18nTask) {
     await loadI18nTask;
     return;
@@ -274,21 +280,12 @@ export const loadI18n = async () => {
       const initLang = pickLangForInit();
       let targetLang = initLang;
 
-      // 小程序/原生端固定使用本地中文环境，不加载远程包
-      if (!isH5Platform()) {
-        i18nState.currentLang = normalizeLang(MP_FIXED_LANG);
-        i18nState.langMap = {};
-        i18nState.loaded = true;
-        setStoredLang(i18nState.currentLang);
-        syncThirdPartyLocales(i18nState.currentLang);
-        return;
-      }
-
-      // H5 环境：按需加载远程翻译
-      const langMap = await fetchLangMap("");
-
       // 如果翻译包为空（接口失败或返回 null），统一强制回退到本地英语态作为安全兜底
-      if (Object.keys(langMap).length === 0) {
+      i18nState.currentLang = normalizeLang(targetLang);
+      const langMap = await fetchLangMap(targetLang, active);
+
+      // 如果翻译包为空（接口失败或返回 null），且非中文环境，统一回退到本地英语态作为安全兜底
+      if (Object.keys(langMap).length === 0 && !targetLang.toLowerCase().startsWith("zh")) {
         i18nState.currentLang = normalizeLang("en-us");
         i18nState.langMap = {};
       } else {
@@ -342,12 +339,6 @@ export const setLanguage = async (lang: string): Promise<boolean> => {
   const targetLang = normalizeLang(lang);
   if (!targetLang) return false;
 
-  // 小程序固定简中，不做切换
-  if (isMpWeixinPlatform()) {
-    i18nState.currentLang = MP_FIXED_LANG;
-    return true;
-  }
-
   const previousLang = i18nState.currentLang;
   const previousLangMap = i18nState.langMap;
 
@@ -387,17 +378,10 @@ export const syncLanguageFromUser = async (
   const userLang = normalizeLang(lang);
   if (!userLang) return;
 
-  if (isMpWeixinPlatform()) {
-    i18nState.currentLang = MP_FIXED_LANG;
-    setStoredLang(MP_FIXED_LANG);
-    syncThirdPartyLocales(i18nState.currentLang);
-    return;
-  }
-
   if (userLang === normalizeLang(i18nState.currentLang)) {
     setStoredLang(userLang);
     if (Object.keys(i18nState.langMap || {}).length === 0) {
-      const latestLangMap = await fetchLangMap(userLang);
+      const latestLangMap = await fetchLangMap(userLang, false);
       // 如果翻译包为空且本地已为空，强制开启英语兜底状态
       if (Object.keys(latestLangMap).length === 0) {
         i18nState.currentLang = normalizeLang("en-us");
@@ -416,7 +400,7 @@ export const syncLanguageFromUser = async (
   i18nState.currentLang = userLang;
   setStoredLang(userLang);
 
-  const latestLangMap = await fetchLangMap(userLang);
+  const latestLangMap = await fetchLangMap(userLang, false);
   // 如果同步中翻译包为空（接口异常等），统一回退到英语
   if (Object.keys(latestLangMap).length === 0) {
     i18nState.currentLang = normalizeLang("en-us");

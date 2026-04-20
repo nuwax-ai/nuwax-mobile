@@ -37,7 +37,7 @@
       <!-- 工具调用头部信息 -->
       <view v-if="toolCall?.type !== 'Event'" class="tool-header" @tap="toggleExpanded">
         <view class="tool-info">
-          <text class="tool-name">{{ toolCall.name || toolCall.type }}</text>
+          <text class="tool-name">{{ toolNameDisplay }}</text>
           <view class="tool-status-display">
             <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
               <text :class="getStatusIconType(toolCall.status)" :style="{color: getStatusIconColor(toolCall.status),fontSize: '32rpx'}"></text>
@@ -124,6 +124,13 @@ export default {
     // 判断是否为 Plan 类型
     isPlanType() {
       return this.toolCall.type === AgentComponentTypeEnum.Plan || this.toolCall.type === 'Plan'
+    },
+    
+    // 格式化显示的工具名称，处理多行代码情况
+    toolNameDisplay() {
+      const name = this.toolCall.name || this.toolCall.type || '';
+      // 替换换行符为空格，防止换行符干扰单行省略号显示
+      return name.replace(/\n/g, ' ').trim();
     },
     
     // Plan 任务列表

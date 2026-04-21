@@ -3,7 +3,10 @@
  * Include prismjs (https://prismjs.com)
  */
 import prism from "./prism.min";
+import installJson from "./prism-json";
 import config from "./config";
+
+installJson(prism);
 const getCopyButtonText = () => {
   try {
     const lang = String(uni.getStorageSync("I18N_LANG") || "zh-CN")

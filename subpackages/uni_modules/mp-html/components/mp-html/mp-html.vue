@@ -117,7 +117,11 @@ export default {
       default: true
     },
     tagStyle: Object,
-    useAnchor: [Boolean, Number]
+    useAnchor: [Boolean, Number],
+    showHeader: {
+      type: Boolean,
+      default: true
+    }
   },
   // #ifdef VUE3
   emits: ['load', 'ready', 'imgtap', 'linktap', 'play', 'error'],

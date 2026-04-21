@@ -83,13 +83,6 @@
         </view>
       </view> -->
     </template>
-
-    <!-- 详情弹窗 -->
-    <tool-details-modal 
-    ref="detailsModal" 
-    :detail-data="detailData" 
-    :title="toolCall.name || getI18nText('Mobile.ThirdParty.MpHtml.executionPlan')"
-    />
   </view>
 </template>
 
@@ -99,13 +92,12 @@ import { AgentComponentTypeEnum } from '@/types/enums/agent.uts';
 import { getCurrentPageParams } from '@/utils/common';
 import { getFileProxyUrlByConversationIdAndFilePath, jumpToFilePreviewPage } from '@/utils/system.uts';
 import { t } from '@/utils/i18n';
-import toolDetailsModal from '../tool-details-modal/tool-details-modal.vue';
 
 export default {
   name: 'Container',
   components: {
     uniIcons,
-    toolDetailsModal
+    // toolDetailsModal
   },
   props: {
     data: {
@@ -210,7 +202,7 @@ export default {
 
     // 处理显示详情点击（阻止冒泡）
     handleShowDetails() {
-      this.$refs.detailsModal.open();
+      uni.$emit('page_preview_detail', this.toolCall, this.detailData);
     },
 
     // 处理复制到剪贴板点击（阻止冒泡）

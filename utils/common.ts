@@ -439,7 +439,7 @@ const getCurrentPagePath = () => {
   return window.location.href;
   // #endif
 
-  // #ifdef MP-WEIXIN
+  // #ifdef MP-WEIXIN || APP-PLUS
   return getCurrentPages()[getCurrentPages().length - 1]?.route;
   // #endif
 };
@@ -470,7 +470,7 @@ const getCurrentPageParams = () => {
   return params;
   // #endif
 
-  // #ifdef MP-WEIXIN
+  // #ifdef MP-WEIXIN || APP-PLUS
   return getCurrentPages()[getCurrentPages().length - 1]?.options;
   // #endif
 };

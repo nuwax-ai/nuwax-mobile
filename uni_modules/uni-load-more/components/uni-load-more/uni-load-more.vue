@@ -35,7 +35,7 @@
 </template>
 
 <script>
-	let platform
+	let platform: string = ""
 	setTimeout(() => {
 		// #ifdef MP-WEIXIN
 		platform = uni.getDeviceInfo().platform
@@ -51,7 +51,7 @@
 			"uni-load-more.contentrefresh": "Loading...",
 			"uni-load-more.contentnomore": "No more data"
 		}
-		const translate = (key) => {
+		const translate = (key: string) => {
 			const text = i18nMessages[key]
 			if (typeof text === 'string' && text.length > 0) {
 				return text

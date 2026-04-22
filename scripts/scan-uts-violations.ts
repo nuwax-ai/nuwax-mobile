@@ -1,8 +1,8 @@
 #!/usr/bin/env tsx
 /**
- * UTS 违规项扫描脚本 (v3)
+ * UTS 违规项扫描脚本 (v4)
  *
- * 检测 uni-app-x 项目中的 UTS 兼容性问题，覆盖 26+ 种违规模式。
+ * 检测 uni-app-x 项目中的 UTS 兼容性问题，覆盖 30+ 种违规模式。
  *
  * 用法:
  *   npx tsx scripts/scan-uts-violations.ts                    # 仅扫描
@@ -12,10 +12,11 @@
  *
  * 检测规则:
  *   高频: interface→type, 非布尔条件, 行内对象类型, 嵌套对象, 声明提升,
- *         as unknown as, 箭头默认参数, 展开运算符, Object.assign, ref可选链,
- *         any属性访问, ref<any>方法调用, watch getter, nullable布尔||
+ *         as unknown as, 箭头默认参数, 展开运算符, 解构rest展开, Object.assign,
+ *         ref可选链, any属性访问, ref<any>方法调用, watch getter, nullable布尔||,
+ *         unknown类型, 箭头函数泛型参数
  *   中频: String()构造, valOr nullable, enum-string比较, undefined,
- *         Utility Types, npm import, 下标访问Any?
+ *         Utility Types, npm import, 下标访问Any?, getStorageSync类型不匹配
  *   低频: as const, 确定赋值, delete, index signature, throw非Error
  *
  * 自动修复 (--fix):
@@ -55,6 +56,10 @@ type ViolationType =
   | 'TYPE_WATCH_GETTER_BOOL'   // watch(() => props.bool) 返回类型不匹配
   | 'TYPE_MAP_INDEX_TYPED'     // 对象下标访问返回 Any? 传给类型参数
   | 'TYPE_REF_ANY_METHOD'      // ref<any> 上调用方法
+  | 'TYPE_CURLY_QUOTE'         // 弯引号/全角引号代替ASCII引号（SFC解析器致命错误）
+  | 'UTS110111122'             // unknown 类型
+  | 'TYPE_GENERIC_ARROW'       // 箭头函数泛型参数（不支持）
+  | 'TYPE_DESTRUCT_SPREAD'     // 解构 rest 展开运算符
 
 interface Violation {
   file: string;
@@ -452,6 +457,18 @@ function scanFile(filePath: string): Violation[] {
           fix: 'Extract to named type'
         });
       }
+
+      // as { ... } 类型断言中的行内对象类型
+      const asObjMatch = line.match(/\bas\s*\{/);
+      if (asObjMatch && !isComment(trimmedLine)) {
+        violations.push({
+          file: filePath, line: lineNum, column: asObjMatch.index! + 1,
+          type: 'UTS110111101',
+          code: trimmedLine,
+          message: 'Inline object literal type in "as { }" cast — extract to named type',
+          fix: 'type MyType = { ... }; then use "as MyType"'
+        });
+      }
     }
 
     // ===== 4. UTS110111162: type 中嵌套对象字面量 =====
@@ -472,7 +489,7 @@ function scanFile(filePath: string): Violation[] {
     // ===== 5. UTS110111150: 函数/变量声明提升 =====
     // 只检测 script 区域内的真实函数调用（排除 template 引用、属性名、类型引用等）
 
-    if (!inWebBlock && isVue && index >= scriptStartLine && index <= scriptEndLine && !inTypeDeclaration && !inInterfaceBlock) {
+    if (!inWebBlock && isVue && filePath.endsWith('.uvue') && index >= scriptStartLine && index <= scriptEndLine && !inTypeDeclaration && !inInterfaceBlock) {
       for (const [name, defLine] of definitions) {
         // 跳过过短或太通用的名称
         if (name.length < 3) continue;
@@ -544,10 +561,19 @@ function scanFile(filePath: string): Violation[] {
     }
 
     // ===== 7. UTS110111125: Utility Types =====
-    // Record<> is used extensively as a map pattern — skip it (lower priority)
-    // Focus on actually problematic types: Partial, Required, Pick, Omit, etc.
-
     if (!inWebBlock) {
+      // Record<string, ...> compiles to an abstract Kotlin class — cannot be instantiated
+      const recordMatch = line.match(/\bRecord\s*<[^>]+>/);
+      if (recordMatch && !isComment(trimmedLine)) {
+        violations.push({
+          file: filePath, line: lineNum, column: recordMatch.index! + 1,
+          type: 'UTS110111125',
+          code: trimmedLine,
+          message: 'Record<K,V> is a TS Utility Type not supported in UTS — causes abstract class instantiation error in Kotlin',
+          fix: 'Replace with UTSJSONObject (for string maps) or Map<K,V>, or define a named type'
+        });
+      }
+
       const utilityTypes = ['Partial', 'Required', 'Readonly', 'Pick', 'Omit',
         'Exclude', 'Extract', 'NonNullable', 'Parameters', 'ConstructorParameters',
         'ReturnType', 'InstanceType', 'NoInfer', 'ThisParameterType', 'OmitThisParameter',
@@ -565,6 +591,26 @@ function scanFile(filePath: string): Violation[] {
           });
           break;
         }
+      }
+    }
+
+    // ===== 7.5. UTS110111122: unknown 类型 =====
+    // ': unknown' 在类型注解中不支持，应改为 'any'
+    // 排除 'as unknown as'（已由 TYPE_AS_UNKNOWN 捕获）、字符串字面量中的 unknown
+    if (!inWebBlock && !isComment(trimmedLine)) {
+      const codeWithoutStrings = trimmedLine
+        .replace(/'[^']*'/g, "''")
+        .replace(/"[^"]*"/g, '""')
+        .replace(/`[^`]*`/g, '``');
+      const unknownTypeMatch = codeWithoutStrings.match(/:\s*unknown\b/);
+      if (unknownTypeMatch && !trimmedLine.includes('as unknown as')) {
+        violations.push({
+          file: filePath, line: lineNum, column: unknownTypeMatch.index! + 1,
+          type: 'UTS110111122',
+          code: trimmedLine,
+          message: 'Type unknown not supported in UTS (only allowed in generics)',
+          fix: 'Replace unknown with any'
+        });
       }
     }
 
@@ -599,7 +645,9 @@ function scanFile(filePath: string): Violation[] {
     // ===== 10. UTS110111149: delete 运算符 =====
 
     if (!inWebBlock) {
-      if (/\bdelete\s+/.test(trimmedLine)) {
+      // 排除：字符串字面量行（locale文件）、属性名（obj.delete = ...）
+      const isStringValueLine = trimmedLine.startsWith('"') || trimmedLine.startsWith("'");
+      if (!isStringValueLine && /(?<!\.)\bdelete\s+[a-zA-Z_$]/.test(trimmedLine)) {
         violations.push({
           file: filePath, line: lineNum, column: 1,
           type: 'UTS110111149',
@@ -632,13 +680,19 @@ function scanFile(filePath: string): Violation[] {
       if (throwMatch && !trimmedLine.match(/\bthrow\s+new\s+\w+Error/)) {
         // 排除 throw new Error、throw new CustomError 等
         if (!trimmedLine.match(/\bthrow\s+new\s+/)) {
-          violations.push({
-            file: filePath, line: lineNum, column: 1,
-            type: 'UTS110111158',
-            code: trimmedLine,
-            message: 'Only Error instances can be thrown in UTS',
-            fix: 'Use throw new Error("message") instead'
-          });
+          // 排除：throw this.method(...) 方法调用返回值、throw typedVar（变量名暗示已是Error类型）
+          const throwExpr = trimmedLine.replace(/.*\bthrow\s+/, '').trim();
+          const isMethodCall = /^(this\.\w+|[\w$]+)\s*\(/.test(throwExpr);
+          const isLikelyErrorVar = /^(normalized|normalized\w+|error|err)\b/.test(throwExpr);
+          if (!isMethodCall && !isLikelyErrorVar) {
+            violations.push({
+              file: filePath, line: lineNum, column: 1,
+              type: 'UTS110111158',
+              code: trimmedLine,
+              message: 'Only Error instances can be thrown in UTS',
+              fix: 'Use throw new Error("message") instead'
+            });
+          }
         }
       }
     }
@@ -691,6 +745,22 @@ function scanFile(filePath: string): Violation[] {
       }
     }
 
+    // ===== 14.5. TYPE_GENERIC_ARROW: 箭头函数泛型参数 =====
+    // const fn = <T>(x: T): T => ... 或 const fn = <T = any,>(...) => ...
+    // UTS 不允许箭头函数表达式有泛型参数，需改为 function 声明
+    if (!inWebBlock && !isComment(trimmedLine)) {
+      const genericArrowMatch = trimmedLine.match(/=\s*<[A-Z]\w*(?:\s*[,=][^>]*)?\s*>\s*\(/);
+      if (genericArrowMatch && trimmedLine.includes('=>')) {
+        violations.push({
+          file: filePath, line: lineNum, column: genericArrowMatch.index! + 1,
+          type: 'TYPE_GENERIC_ARROW',
+          code: trimmedLine,
+          message: 'Generic type parameters on arrow function expressions not supported in UTS',
+          fix: 'Convert to function declaration: function fn<T>(...): T { ... }'
+        });
+      }
+    }
+
     // ===== 15. TYPE_STRING_CTOR: String() 构造 =====
 
     if (!inWebBlock) {
@@ -717,8 +787,7 @@ function scanFile(filePath: string): Violation[] {
     // ===== 16. TYPE_SPREAD: 展开运算符 =====
 
     if (!inWebBlock) {
-      // {...obj, key: val} 或 {...obj}
-      // 排除函数调用中的 spread (fn(...args)) 和数组 spread [...arr]
+      // {...obj, key: val} 或 {...obj} — 对象字面量展开
       const objSpreadMatch = trimmedLine.match(/\{\s*\.\.\.(\w+)/);
       if (objSpreadMatch) {
         violations.push({
@@ -727,6 +796,18 @@ function scanFile(filePath: string): Violation[] {
           code: trimmedLine,
           message: `Object spread operator not supported in UTS`,
           fix: 'Modify properties directly or create new object with explicit properties'
+        });
+      }
+
+      // const { a, ...rest } = obj — 解构 rest 展开
+      const destructSpreadMatch = trimmedLine.match(/(?:const|let|var)\s*\{[^}]*\.\.\.\w+[^}]*\}\s*=/);
+      if (destructSpreadMatch && !isComment(trimmedLine)) {
+        violations.push({
+          file: filePath, line: lineNum, column: 1,
+          type: 'TYPE_DESTRUCT_SPREAD',
+          code: trimmedLine,
+          message: 'Destructuring rest spread not supported in UTS',
+          fix: 'Access properties individually: const a = obj.a; const b = obj.b; ...'
         });
       }
     }
@@ -891,7 +972,7 @@ function scanFile(filePath: string): Violation[] {
       if (watchGetterMatch) {
         // 检查下一行是否是 () => props.xxx
         const nextLine = index + 1 < lines.length ? lines[index + 1].trim() : '';
-        if (/^\(\)\s*=>\s*props\.\w+/.test(nextLine)) {
+        if (/^\(\)\s*=>\s*props\.\w+\b(?!\s*[!=<>])/.test(nextLine)) {
           violations.push({
             file: filePath, line: lineNum, column: 1,
             type: 'TYPE_WATCH_GETTER_BOOL',
@@ -902,7 +983,7 @@ function scanFile(filePath: string): Violation[] {
         }
       }
       // 单行模式: watch(() => props.xxx,
-      const inlineWatchMatch = trimmedLine.match(/watch\(\s*\(\)\s*=>\s*props\.\w+/);
+      const inlineWatchMatch = trimmedLine.match(/watch\(\s*\(\)\s*=>\s*props\.\w+\b(?!\s*[!=<>])/);
       if (inlineWatchMatch) {
         violations.push({
           file: filePath, line: lineNum, column: 1,
@@ -916,15 +997,27 @@ function scanFile(filePath: string): Violation[] {
 
     // ===== 25. TYPE_MAP_INDEX_TYPED: 对象下标访问 Any? 传给类型参数 =====
     // strOr(someMap[key], "default") — someMap[key] 返回 Any? 不能传 String?
+    // strOr(uni.getStorageSync(key), "default") — getStorageSync 返回 Any?
     if (!inWebBlock) {
       const mapIndexStrOrMatch = trimmedLine.match(/strOr\(\s*(\w+)\[([^\]]+)\]/);
-      if (mapIndexStrOrMatch) {
+      if (mapIndexStrOrMatch && !trimmedLine.includes('as string')) {
         violations.push({
           file: filePath, line: lineNum, column: 1,
           type: 'TYPE_MAP_INDEX_TYPED',
           code: trimmedLine,
           message: `strOr(${mapIndexStrOrMatch[1]}[...]) — indexed access returns Any?, expected String?`,
           fix: `Cast result: strOr(${mapIndexStrOrMatch[1]}[${mapIndexStrOrMatch[2]}] as string | null, ...)`
+        });
+      }
+      // uni.getStorageSync() returns Any? — needs explicit cast before typed function
+      const getStorageSyncInTyped = trimmedLine.match(/strOr\(\s*uni\.getStorageSync\(/);
+      if (getStorageSyncInTyped && !trimmedLine.includes('as string')) {
+        violations.push({
+          file: filePath, line: lineNum, column: 1,
+          type: 'TYPE_MAP_INDEX_TYPED',
+          code: trimmedLine,
+          message: 'uni.getStorageSync() returns Any?, needs cast before passing to typed param',
+          fix: 'Cast: strOr(uni.getStorageSync(key) as string | null, fallback)'
         });
       }
     }
@@ -950,6 +1043,29 @@ function scanFile(filePath: string): Violation[] {
             fix: `Use typed ref: ref<SomeComponentInstance | null> instead of ref<any | null>`
           });
         }
+      }
+    }
+
+    // ===== 27. TYPE_CURLY_QUOTE: 弯引号代替ASCII引号 =====
+    // 编辑器/输入法自动替换后导致 SFC 解析器报 "Unexpected character" 编译失败
+    // U+201C " U+201D " U+2018 ' U+2019 '
+    {
+      // 去除行尾注释再检测（注释中的弯引号是中文排版，无害）
+      const commentIdx = line.indexOf('//');
+      const codePart = commentIdx >= 0 ? line.slice(0, commentIdx) : line;
+      const hasCurly = /[\u201c\u201d\u2018\u2019]/.test(codePart);
+      if (hasCurly && !isComment(trimmedLine)) {
+        const col = codePart.search(/[\u201c\u201d\u2018\u2019]/);
+        const fixed = line
+          .replace(/\u201c/g, '"').replace(/\u201d/g, '"')
+          .replace(/\u2018/g, "'").replace(/\u2019/g, "'");
+        violations.push({
+          file: filePath, line: lineNum, column: col + 1,
+          type: 'TYPE_CURLY_QUOTE',
+          code: trimmedLine,
+          message: '代码中含有弯引号/全角引号，SFC 解析器会报 "Unexpected character" 编译失败',
+          fix: fixed.trim(),
+        });
       }
     }
 
@@ -1029,22 +1145,29 @@ const VIOLATION_LABELS: Record<string, string> = {
   'TYPE_WATCH_GETTER_BOOL': 'watch getter 返回类型',
   'TYPE_MAP_INDEX_TYPED': '下标访问 Any? 传类型参数',
   'TYPE_REF_ANY_METHOD': 'ref<any> 方法调用',
+  'TYPE_CURLY_QUOTE': '弯引号导致SFC解析失败',
+  'UTS110111122': 'unknown 类型',
+  'TYPE_GENERIC_ARROW': '箭头函数泛型参数',
+  'TYPE_DESTRUCT_SPREAD': '解构 rest 展开',
 };
 
 function outputMarkdown(result: ScanResult, outputPath: string): void {
   const priorityGroups = {
     '高优先级 (编译错误)': [
+      'TYPE_CURLY_QUOTE',
       'UTS110111163', 'UTS110111120', 'UTS110111101', 'UTS110111162',
       'UTS110111150', 'TYPE_AS_UNKNOWN', 'TYPE_ARROW_DEFAULT', 'TYPE_SPREAD',
       'TYPE_OBJECT_ASSIGN', 'TYPE_REF_OPTIONAL', 'TYPE_ANY_PROP_ACCESS',
       'TYPE_REF_ANY_METHOD', 'TYPE_WATCH_GETTER_BOOL', 'TYPE_BOOLEAN_NULLABLE_OR',
+      'UTS110111122', 'TYPE_GENERIC_ARROW', 'TYPE_DESTRUCT_SPREAD',
     ],
     '中优先级 (类型不匹配)': [
-      'TYPE_STRING_CTOR', 'TYPE_VALOR_NULLABLE', 'TYPE_ENUM_STRING_CMP',
+      'TYPE_STRING_CTOR', 'TYPE_ENUM_STRING_CMP',
       'UTS110111119', 'UTS110111125', 'TYPE_NPM_IMPORT', 'TYPE_MAP_INDEX_TYPED',
     ],
     '低优先级 (编码规范)': [
       'UTS110111126', 'UTS110111127', 'UTS110111149', 'UTS110111144', 'UTS110111158',
+      'TYPE_VALOR_NULLABLE', // valOr(any, any):any — false positive, valOr accepts any types
     ],
   };
 
@@ -1148,6 +1271,7 @@ function outputJSON(result: ScanResult, outputPath: string): void {
  * - TYPE_REF_ANY_METHOD: ref<any> 方法调用（需定义类型）
  */
 const SAFE_FIX_TYPES = new Set<ViolationType>([
+  'TYPE_CURLY_QUOTE',         // 弯引号 → ASCII引号（100%安全）
   'UTS110111119',           // undefined → null
   'TYPE_AS_UNKNOWN',        // as unknown as → as
   'UTS110111126',           // as const → remove
@@ -1190,6 +1314,13 @@ function applyAutoFixes(violations: Violation[], dryRun: boolean = false): FixRe
       let fixed = original;
 
       switch (v.type) {
+        case 'TYPE_CURLY_QUOTE': {
+          // 弯引号 → ASCII引号
+          fixed = original
+            .replace(/\u201c/g, '"').replace(/\u201d/g, '"')
+            .replace(/\u2018/g, "'").replace(/\u2019/g, "'");
+          break;
+        }
         case 'UTS110111119': {
           // undefined → null
           fixed = original

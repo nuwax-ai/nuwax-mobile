@@ -36,15 +36,16 @@
 import node from './node/node.vue'
 import { hasLen, valOr } from '@/utils/common'
 class Parser {
-  constructor(vm) {
+  vm: any | null = null
+  constructor(vm: any) {
     this.vm = vm
   }
-  parse(content) {
-    const source = typeof content === 'string' ? content : ''
+  parse(content: any): UTSJSONObject[] {
+    const source: string = typeof content === 'string' ? (content as string) : ''
     if (source.length === 0) {
-      return []
+      return [] as UTSJSONObject[]
     }
-    const normalized = source
+    const normalized: string = source
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<\/p\s*>/gi, '\n')
       .replace(/<[^>]+>/g, '')
@@ -54,13 +55,11 @@ class Parser {
       .replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'")
-    return [{
-      type: 'text',
-      text: normalized
-    }]
+    const item: UTSJSONObject = { type: 'text', text: normalized }
+    return [item]
   }
 }
-const plugins = []
+const plugins: any[] = []
 export default {
   name: 'mp-html',
   data() {

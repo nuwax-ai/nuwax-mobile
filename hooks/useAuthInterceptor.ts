@@ -1,4 +1,4 @@
-import { ref, Ref } from "vue";
+import { ref } from "vue";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { jumpToAgentDetailPage } from "@/utils/commonBusiness";
 import { AgentComponentTypeEnum } from "@/types/enums/agent";
@@ -75,42 +75,36 @@ export const useAuthInterceptor = () => {
    * @param info 智能体信息
    */
   const handleAgentClick = async (info: AgentInfoBase) => {
-    // #ifdef H5 || WEB
-    // H5 端统一走登录校验逻辑
+    // 统一走登录校验逻辑
     const loggedIn = await hasToken();
-
-    if (!loggedIn) {
-      // 微信小程序：获取当前页面的 url
-      const currentUrl = getCurrentPageFullPath();
-      const redirectUrl =
-        "/subpackages/pages/login/login?redirect=" +
-        encodeURIComponent(currentUrl);
-      uni.reLaunch({ url: redirectUrl });
-      // H5 未登录暂不弹登录弹窗，这里直接返回
+    // 已登录，直接跳转详情页
+    if (loggedIn) {
+      performJump(info);
       return;
     }
-    performJump(info);
+
+    // #ifdef H5 || WEB || APP-PLUS
+    // 获取当前页面的 url
+    const currentUrl = getCurrentPageFullPath();
+    // 跳转到登录页，并携带当前页面的 url
+    const redirectUrl =
+      "/subpackages/pages/login/login?redirect=" +
+      encodeURIComponent(currentUrl);
+    uni.reLaunch({ url: redirectUrl });
     // #endif
 
     // #ifdef MP-WEIXIN
-    // 检查是否登录
-    const loggedInMp = await hasToken();
-    if (!loggedInMp) {
-      // 未登录，保存待跳转的智能体信息（包括 icon, name, description）到本地缓存
-      const tempAgentInfo = {
-        name: info.name,
-        icon: info.icon || "",
-        description: info.description || "",
-      };
-      uni.setStorageSync("temp_agent_info", JSON.stringify(tempAgentInfo));
-      // 跳转到临时会话页面
-      uni.navigateTo({
-        url: "/subpackages/pages/temporary-session/temporary-session",
-      });
-    } else {
-      // 已登录，直接跳转详情页
-      performJump(info);
-    }
+    // 未登录，保存待跳转的智能体信息（包括 icon, name, description）到本地缓存
+    const tempAgentInfo = {
+      name: info.name,
+      icon: info.icon || "",
+      description: info.description || "",
+    };
+    uni.setStorageSync("temp_agent_info", JSON.stringify(tempAgentInfo));
+    // 跳转到临时会话页面
+    uni.navigateTo({
+      url: "/subpackages/pages/temporary-session/temporary-session",
+    });
     // #endif
   };
 
@@ -140,20 +134,11 @@ export const useAuthInterceptor = () => {
    * @returns 是否已登录
    */
   const checkAuthAndShowPopup = async (): Promise<boolean> => {
-    // #ifdef H5 || WEB
-    // H5：根据环境和接口结果判断是否已登录
-    const loggedInH5 = await hasToken();
-    return loggedInH5;
-    // #endif
-
-    // #ifdef APP-PLUS
-    const loggedInApp = await hasToken();
-    return loggedInApp;
-    // #endif
+    // 根据环境和接口结果判断是否已登录
+    const loggedIn = await hasToken();
 
     // #ifdef MP-WEIXIN
-    const loggedInMp = await hasToken();
-    if (loggedInMp) {
+    if (loggedIn) {
       return true;
     }
     if (loginPopupRef.value) {
@@ -161,6 +146,8 @@ export const useAuthInterceptor = () => {
     }
     return false;
     // #endif
+
+    return loggedIn;
   };
 
   return {

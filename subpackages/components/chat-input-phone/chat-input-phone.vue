@@ -7,9 +7,10 @@
       @onRemove="removeSkill"
       @onAdd="skillSelectModalVisible = true"
     />
-    <view class="flex flex-row items-center overflow-hide">
+    <view class="manual-component-wrap flex flex-row items-center overflow-hide">
       <!-- 手动选择组件 -->
       <manual-component-item
+        class="manual-component-host"
         v-if="
           (manualComponents?.length && !isRecording) ||
           (pageHomeIndex && expandPageArea === ExpandPageAreaEnum.Yes) ||
@@ -1194,6 +1195,18 @@
     // 确保容器为相对定位，用于容纳绝对定位的蒙层
     position: relative;
     overflow: visible;
+
+    .manual-component-wrap {
+      width: 100%;
+      min-width: 0;
+    }
+
+    .manual-component-host {
+      display: block;
+      flex: 1;
+      width: 0;
+      min-width: 0;
+    }
 
     .split-line {
       width: 100%;

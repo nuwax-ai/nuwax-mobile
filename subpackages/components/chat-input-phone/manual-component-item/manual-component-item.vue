@@ -2,9 +2,10 @@
   <view class="manual-wrapper">
     <scroll-view
       class="manual-container"
-      direction="horizontal"
+      :scroll-x="true"
       :scroll-with-animation="true"
       :show-scrollbar="false"
+      :enable-flex="true"
     >
       <!-- 页面首页 -->
       <view
@@ -256,9 +257,18 @@
       flex: 1;
       display: flex;
       flex-direction: row;
+      min-width: 0;
       height: 76rpx;
       scroll-behavior: smooth;
       -webkit-overflow-scrolling: touch;
+
+      /* #ifdef H5 || WEB */
+      :deep(.uni-scroll-view-content) {
+        display: flex;
+        flex-direction: row;
+        // width: max-content;
+      }
+      /* #endif */
     }
 
     .manual-group {
@@ -270,6 +280,7 @@
       gap: 6rpx;
       display: flex;
       flex-direction: row;
+      flex-shrink: 0;
       align-items: center;
       justify-content: center;
       height: 76rpx;

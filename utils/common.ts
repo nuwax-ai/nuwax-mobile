@@ -422,7 +422,7 @@ const redirectTo = (redirectUrl: string) => {
   location.replace(redirectUrl);
   // #endif
 
-  // #ifdef MP-WEIXIN
+  // #ifdef MP-WEIXIN || APP-PLUS
   // 先解码URL,避免路径被错误拼接(如 %2Fpages%2Findex 会被拼接到当前路径后)
   const decodedUrl = decodeURIComponent(redirectUrl);
   uni.reLaunch({ url: decodedUrl });
@@ -440,7 +440,9 @@ const getCurrentPagePath = () => {
   // #endif
 
   // #ifdef MP-WEIXIN || APP-PLUS
-  return getCurrentPages()[getCurrentPages().length - 1]?.route;
+  const currentPage = getCurrentPages()[getCurrentPages().length - 1];
+  // return getCurrentPages()[getCurrentPages().length - 1]?.route;
+  return currentPage ? `/${currentPage.route}` : "";
   // #endif
 };
 

@@ -47,15 +47,15 @@
   const { t, ensureLangList } = useI18n();
 
   // 当前显示 form 表单类型登录-login/验证码-verify/修改密码-reset
-  const currentFormType = ref("login");
+  const currentFormType = ref<string>("login");
   // 手机号
-  const phoneOrEmail = ref("");
-  const captchaVerifyParam = ref(""); // 阿里云验证码参数
-  const redirectUrl = ref("");
+  const phoneOrEmail = ref<string>("");
+  const captchaVerifyParam = ref<string>(""); // 阿里云验证码参数
+  const redirectUrl = ref<string>("");
   const tenantConfigInfo = ref<TenantConfigInfo>(null); // 配置信息
 
   // 加载中
-  const loading = ref(false);
+  const loading = ref<boolean>(false);
   // 获取用户配置
   const fetchTenantConfig = async () => {
     try {
@@ -113,7 +113,7 @@
       }
       // #endif
 
-      // #ifdef MP-WEIXIN
+      // #ifdef MP-WEIXIN || APP-PLUS
       uni.setStorageSync(ACCESS_TOKEN, data.token);
       // #endif
 

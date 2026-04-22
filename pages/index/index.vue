@@ -147,7 +147,7 @@
   // 包装 handleAgentClick 以适配 AgentInfo 类型
   const handleAgentClick = (info: AgentInfo) => {
     baseHandleAgentClick({
-      agentId: info.agentId,
+      targetId: info.agentId,
       name: info.name,
       agentType: info.agentType,
       icon: info.icon, // 跳转临时会话页面时使用
@@ -162,7 +162,7 @@
       jumpToAgentDetailPage(agentId, lastConversationId);
     } else {
       baseHandleAgentClick({
-        agentId: agentId,
+        targetId: agentId,
         name: name,
         agentType: agentType,
         icon: info.icon, // 跳转临时会话页面时使用

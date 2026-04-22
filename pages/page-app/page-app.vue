@@ -12,13 +12,12 @@
 
   const { t } = useI18n();
 
-
-    // 收藏
-    onAddToFavorites(()=>{
-        return {
-            title: t("Mobile.Nav.app"),
-        }
-    })
+  // 收藏
+  onAddToFavorites(()=>{
+      return {
+          title: t("Mobile.Nav.app"),
+      }
+  })
 </script>
 
 <style lang="scss" scoped>

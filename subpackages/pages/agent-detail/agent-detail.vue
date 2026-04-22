@@ -6,9 +6,9 @@
 	import ChatConversationComponent from '@/subpackages/pages/chat-conversation-component/chat-conversation-component.vue'
 	import { ref, onUnmounted, getCurrentInstance } from 'vue'
 	import { getCurrentPageFullPath } from '@/utils/common'
-	import { onAddToFavorites, onShow, onHide } from '@dcloudio/uni-app'
+	import { onAddToFavorites, onShow, onHide, onShareAppMessage } from '@dcloudio/uni-app'
 
-    const instance = getCurrentInstance()
+	const instance = getCurrentInstance()
 
 	onShow(() => {
         // 尝试通过实例获取引用，绕过闭包捕获问题

@@ -14,7 +14,6 @@ interface AgentInfoBase {
   name: string;
   agentType?: "ChatBot" | "PageApp";
   targetType?: AgentComponentTypeEnum;
-  agentId?: number;
   icon?: string;
   description?: string;
 }
@@ -130,7 +129,7 @@ export const useAuthInterceptor = () => {
     }
 
     // 使用 targetId 或 agentId（兼容不同数据结构）
-    const agentId = info.targetId || info.agentId;
+    const agentId = info.targetId;
     if (agentId) {
       jumpToAgentDetailPage(agentId, null, agentType, info.name);
     }

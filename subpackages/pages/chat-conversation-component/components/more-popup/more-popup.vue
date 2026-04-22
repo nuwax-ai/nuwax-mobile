@@ -82,7 +82,7 @@
   const { t } = useI18n();
 
   interface Props {
-    agentInfo: AgentDetailDto;
+    agentInfo?: AgentDetailDto | null;
     isTaskAgent?: boolean;
     hasHistory?: boolean;
     currentSandboxId?: string;

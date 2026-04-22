@@ -25,13 +25,16 @@
     defineProps<{
       visible: boolean;
       agentId: number;
-      agentType: AgentTypeEnum;
+      agentType?: AgentTypeEnum | null;
       currentModelId: number;
       readonly?: boolean;
     }>(),
     {
       visible: false,
       readonly: false,
+      agentType: AgentTypeEnum.ChatBot,
+      agentId: 0,
+      currentModelId: 0,
     },
   );
 

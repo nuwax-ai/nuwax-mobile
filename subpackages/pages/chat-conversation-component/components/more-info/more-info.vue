@@ -56,6 +56,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { computed } from "vue";
   import type { AgentDetailDto } from "@/types/interfaces/agent";
   import { useI18n } from "@/utils/i18n";
 

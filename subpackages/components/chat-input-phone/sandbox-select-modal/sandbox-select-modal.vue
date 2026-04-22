@@ -11,6 +11,7 @@
 </template>
 
 <script lang="ts" setup>
+  import { computed } from "vue";
   import { SandboxInfo } from "@/types/interfaces/sandbox";
   import { useI18n } from "@/utils/i18n";
   import { RadioListItem } from "@/types/interfaces/radio";

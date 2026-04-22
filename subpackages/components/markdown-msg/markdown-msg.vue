@@ -10,6 +10,7 @@
 </template>
 
 <script lang="ts" setup>
+	import { computed } from "vue";
 	import { replaceMathBracket } from '@/utils/markdown'
 	import mpHtml from '@/subpackages/uni_modules/mp-html/components/mp-html/mp-html.vue'
 	import { handleExternalLink } from '@/utils/system'

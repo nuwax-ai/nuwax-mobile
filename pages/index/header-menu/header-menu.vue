@@ -61,7 +61,7 @@
   const { t ,loadI18n} = useI18n();
 
   interface Props {
-    userInfo: UserInfo;
+    userInfo?: UserInfo | null;
   }
 
   // 接收组件属性，设置默认值

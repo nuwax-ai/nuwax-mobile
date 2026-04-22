@@ -30,7 +30,6 @@
         :is-sandbox-unavailable="isSandboxUnavailable"
         :sandbox-disabled-text="sandboxDisabledText"
         :readonly="readonly"
-        :enable-skill-at="enableSkillAt"
         @onSandboxChange="handleSandboxChange"
         :allow-other-model="allowOtherModel"
         :current-model-id="currentModelId"

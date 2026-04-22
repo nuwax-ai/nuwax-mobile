@@ -147,8 +147,8 @@ export const handleMessageEventClick = (
 // ============ 主 Hook ============
 
 export const useMessageEventDelegate = (
-  containerRef: Ref<HTMLElement | null>,
-  eventBindConfig?: EventBindConfig,
+  containerRef: Ref<any | null>,
+  eventBindConfig?: Ref<EventBindConfig | null>,
   showPagePreview?: (opts: ShowPagePreviewOptions) => void
 ) => {
   // 创建防重复触发管理器
@@ -167,6 +167,17 @@ export const useMessageEventDelegate = (
 
   // 👉 监听容器点击事件（仅H5平台）
   // #ifdef H5 || WEB
+  const getContainerElement = (raw: any): HTMLElement | null => {
+    if (!raw) return null
+    if (raw instanceof HTMLElement) return raw
+    if (raw.$el instanceof HTMLElement) return raw.$el
+    const vnodeEl = raw.$?.vnode?.el
+    if (vnodeEl instanceof HTMLElement) return vnodeEl
+    return null
+  }
+
+  let boundContainer: HTMLElement | null = null
+
   const handleClick = (e: MouseEvent): void => {
     const target = e.target as HTMLElement
     const eventElement = target.closest('.event') as HTMLElement | null
@@ -186,16 +197,19 @@ export const useMessageEventDelegate = (
 
   // 👉 生命周期挂载与清理
   onMounted(() => {
-    const container = containerRef.value
+    const container = getContainerElement(containerRef.value)
     if (container) {
       container.addEventListener('click', handleClick)
+      boundContainer = container
+    } else {
+      console.warn('[Event Delegate] 容器不是 DOM 元素，跳过事件绑定')
     }
   })
 
   onUnmounted(() => {
-    const container = containerRef.value
-    if (container) {
-      container.removeEventListener('click', handleClick)
+    if (boundContainer) {
+      boundContainer.removeEventListener('click', handleClick)
+      boundContainer = null
     }
   })
   // #endif

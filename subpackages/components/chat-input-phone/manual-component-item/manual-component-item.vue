@@ -66,6 +66,8 @@
       </template>
     </scroll-view>
   </view>
+
+  <!-- 页面预览 -->
   <page-preview-iframe ref="pagePreviewIframeRef" />
 
   <!-- 沙盒切换弹窗 -->
@@ -276,6 +278,7 @@
       border-radius: 16rpx;
       border: 2rpx solid #f0f0f0;
       transition: all 0.3s ease;
+      box-sizing: border-box;
 
       &.active {
         background: #f2f2ff;

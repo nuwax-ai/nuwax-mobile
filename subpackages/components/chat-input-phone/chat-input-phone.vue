@@ -1,5 +1,5 @@
 <template>
-  <view class="relative container">
+  <view class="container flex flex-col">
     <!-- 技能选择按钮 -->
     <skill-tags-bar
       v-if="isTaskAgent && enableSkillAt"

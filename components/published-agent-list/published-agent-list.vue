@@ -163,16 +163,12 @@
   import { ref } from 'vue';
   import { onShow, onUnload } from "@dcloudio/uni-app";
   import { CONST_ALL } from "@/constants/common.constants";
-  import { SquarePublishedItemInfo } from "@/types/interfaces/square";
-  import { apiPublishedCategoryList } from "@/servers/square";
-  import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { SquareCategoryInfo } from "@/types/interfaces/square";
+  import { SquarePublishedItemInfo, SquareCategoryInfo, SquarePublishedListParams } from "@/types/interfaces/square";
+  import { apiPublishedCategoryList, apiPublishedAgentList } from "@/servers/square";
+  import { SUCCESS_CODE, USER_NO_LOGIN, REDIRECT_LOGIN } from "@/constants/codes.constants";
   import { SquareAgentTypeEnum } from "@/types/enums/square";
   import { AgentComponentTypeEnum } from "@/types/enums/agent";
-  import { apiPublishedAgentList } from "@/servers/square";
-  import { SquarePublishedListParams } from "@/types/interfaces/square";
-  import { Page } from "@/types/interfaces/request";
-  import { RequestResponse } from "@/types/interfaces/request";
+  import { Page, RequestResponse } from "@/types/interfaces/request";
   import AgentComponent from "@/components/agent-component/agent-component.vue";
   import PageCard from "@/components/page-card/page-card.vue";
   import noData from "@/static/assets/no_data.png";
@@ -181,7 +177,6 @@
   import { getCurrentPagePath } from "@/utils/commonBusiness";
   import CustomNavBar from "@/components/custom-nav-bar/custom-nav-bar.vue";
   import { apiUnCollectAgent, apiCollectAgent } from "@/servers/agentDev";
-  import { USER_NO_LOGIN, REDIRECT_LOGIN } from "@/constants/codes.constants";
   import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
   import AuthLoginPopup from "@/components/auth-login-popup/auth-login-popup.vue";
   import { useI18n, translateText } from "@/utils/i18n";

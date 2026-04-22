@@ -66,14 +66,6 @@
     format?: string
   }
 
-  // 录音停止回调结果
-  type RecordStopRes = {
-    tempFilePath: string
-    duration: number
-    fileSize: number
-    format?: string
-  }
-
   // 转换结果
   type TranscriptResult = {
     success: boolean
@@ -110,6 +102,8 @@
   let recorderManager: RecorderManager | null = null
   // 音频上传服务
   let audioUploadService: AudioUploader | null = null // 使用audioUploader
+  // 记录录音开始时间，用于计算时长（RecorderManagerOnStopResult 不提供 duration）
+  let recordStartTime = 0
 
   // 重置状态
   const resetState = () => {
@@ -175,9 +169,9 @@
   }
 
   // 监听录音开始
-  const handleRecordStart = () => {
+  const handleRecordStart = (_result: any) => {
     console.log('录音开始handleRecordStart')
-    // 设置状态，开始录音，并触发事件
+    recordStartTime = Date.now()
     currentState.value = 'recording'
     emit('onRecordStart')
     uni.hideLoading()
@@ -240,50 +234,6 @@
     }
   }
 
-  // 录音停止
-  const handleRecordStop = async (res: RecordStopRes) => {
-    console.log('录音停止handleRecordStop')
-    // 录音总时长，H5端单位秒，小程序端单位毫秒, 后续判断时长是否超过10分钟，是以秒为单位，所以小程序端需要将毫秒转为秒
-    let duration = res.duration
-
-    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ || APP
-    duration = duration / 1000
-    // #endif
-
-    // 小程序端的录音结果格式可能与H5端不同，需要统一处理
-    const audioFile: AudioFile = {
-      tempFilePath: res.tempFilePath,
-      duration,
-      fileSize: res.fileSize,
-      format: res.format ?? 'mp3'
-    }
-
-    // 重置触摸结束取消录音标志
-    // #ifdef H5
-    if (recorderManager && recorderManager.touchEndCancelFlag !== undefined) {
-      recorderManager.touchEndCancelFlag = false;
-    }
-    // #endif
-
-    // 立即显示上传中状态，给用户明确反馈
-    currentState.value = 'uploading'
-
-    try {
-      // 使用音频上传服务转换音频
-      const result = await uploadAndConvertWithService(audioFile)
-      if (result.success) {
-        currentState.value = 'success'
-        emit('onRecordStop', result.text)
-        // 重置状态
-        resetState()
-      } else {
-        throw new Error(strOr(result?.text, t("Mobile.Voice.noSpeechDetected")))
-      }
-    } catch (error: any) {
-      handleRecordError(error)
-    }
-  }
-
   // 使用audioUploader转换音频
   const uploadAndConvertWithService = async (audioFile: AudioFile): Promise<TranscriptResult> => {
     if (audioUploadService == null) {
@@ -308,23 +258,68 @@
         text: result.text,
       }
     } catch (error: any) {
+      const err = error as Error
       return {
         success: false,
-        text: error.message,
+        text: err?.message ?? '',
       }
     }
   }
 
+  // 录音停止 (async 内部逻辑)
+  const processRecordStopAsync = async (res: RecorderManagerOnStopResult) => {
+    console.log('录音停止handleRecordStop')
+    // RecorderManagerOnStopResult 只提供 tempFilePath，时长通过计时器计算（秒）
+    const durationMs = recordStartTime > 0 ? Date.now() - recordStartTime : 0
+    const duration = durationMs / 1000
+
+    const audioFile: AudioFile = {
+      tempFilePath: res.tempFilePath,
+      duration,
+      fileSize: 1, // API 不提供文件大小，使用占位值；服务端会做真正的验证
+      format: strOr(props.format, 'mp3')
+    }
+
+    // 重置触摸结束取消录音标志
+    // #ifdef H5
+    if (recorderManager != null) {
+      recorderManager.touchEndCancelFlag = false;
+    }
+    // #endif
+
+    // 立即显示上传中状态，给用户明确反馈
+    currentState.value = 'uploading'
+
+    try {
+      const result = await uploadAndConvertWithService(audioFile)
+      if (result.success) {
+        currentState.value = 'success'
+        emit('onRecordStop', result.text)
+        resetState()
+      } else {
+        throw new Error(strOr(result?.text, t("Mobile.Voice.noSpeechDetected")))
+      }
+    } catch (error: any) {
+      handleRecordError(error)
+    }
+  }
+
+  // 录音停止 (同步回调，符合 RecorderManager.onStop 类型要求)
+  const handleRecordStop = (res: RecorderManagerOnStopResult) => {
+    processRecordStopAsync(res)
+  }
+
   // 初始化录音事件监听
   const initRecorderEvents = async() => {
-    if (recorderManager == null) return
+    const mgr = recorderManager
+    if (mgr == null) return
 
     // 录音开始
-    recorderManager.onStart(handleRecordStart)
+    mgr.onStart(handleRecordStart)
     // 录音停止
-    recorderManager.onStop(handleRecordStop)
+    mgr.onStop(handleRecordStop)
     // 录音错误
-    recorderManager.onError(handleRecordError)
+    mgr.onError(handleRecordError)
   }
 
   const initRecorderManager = () => {
@@ -359,21 +354,12 @@
   // 销毁录音管理器等资源
   const destroyRecorderManager = () => {
     resetState()
-    if (recorderManager != null) {
-      // 清理所有事件监听器
-      /**
-       * App/H5端, 支持offStart / offStop / offError 方法解绑回调函数，小程序不支持解绑回调函数，所以需要手动清理事件监听器
-       */
+    const mgr = recorderManager
+    if (mgr != null) {
       // #ifdef H5 || APP
-      if (recorderManager.offStart) {
-        recorderManager.offStart(handleRecordStart)
-      }
-      if (recorderManager.offStop) {
-        recorderManager.offStop(handleRecordStop)
-      }
-      if (recorderManager.offError) {
-        recorderManager.offError(handleRecordError)
-      }
+      mgr.offStart()
+      mgr.offStop()
+      mgr.offError()
       // #endif
 
       recorderManager = null

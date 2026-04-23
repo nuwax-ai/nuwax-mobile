@@ -532,7 +532,7 @@
     // keyboardHeight.value = res.detail.height
 
     // 微信小程序
-    // #ifdef MP-WEIXIN || APP
+    // #ifdef MP-WEIXIN
     if (res.detail.height > 31) {
       keyboardHeight.value = showExtraContainer.value ? 30 + 115 : 30;
     } else {
@@ -541,7 +541,7 @@
     // #endif
 
     // 非微信小程序
-    // #ifndef MP-WEIXIN
+    // #ifdef H5 || WEB || APP-IOS
     keyboardHeight.value = res.detail.height;
     // #endif
   };

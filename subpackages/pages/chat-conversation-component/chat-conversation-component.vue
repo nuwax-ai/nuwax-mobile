@@ -171,13 +171,15 @@
                         </view>
                       </view>
                     </scroll-view>
-                    <text
+                    <view
                       class="user-msg"
                       v-if="item?.text"
-                      user-select="true"
                       :id="`msg-item-${item.id}_${item.index}`"
-                      >{{ item.text }}</text
                     >
+                      <text class="user-msg-text" user-select="true">{{
+                        item.text
+                      }}</text>
+                    </view>
                   </template>
                 </view>
               </template>

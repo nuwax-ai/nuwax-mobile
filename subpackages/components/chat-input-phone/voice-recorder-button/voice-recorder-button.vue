@@ -162,7 +162,8 @@
           format: props.format || 'mp3' // 小程序只支持mp3和aac
           // #endif
 
-          // #ifdef MP-WEIXIN
+          // 音频格式，有效值 aac/mp3/wav/PCM。App默认值为mp3，小程序默认值aac
+          // #ifdef MP-WEIXIN || APP
           format: 'mp3'
           // #endif
         })
@@ -327,12 +328,12 @@
   }
 
   const initRecorderManager = () => {
-    // #ifdef H5
+    // #ifdef H5 || WEB
     // 获取录音管理器
     recorderManager = jzRecorder.getRecorderManager()
     // #endif
 
-    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ || APP
     // 获取录音管理器
     recorderManager = uni.getRecorderManager()
     // #endif
@@ -345,7 +346,7 @@
 
   // 初始化录音管理器
   onShow(() => {
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     initRecorderManager()
     // #endif
   })
@@ -363,7 +364,7 @@
       /**
        * App/H5端, 支持offStart / offStop / offError 方法解绑回调函数，小程序不支持解绑回调函数，所以需要手动清理事件监听器
        */
-      // #ifdef H5
+      // #ifdef H5 || APP
       if (recorderManager.offStart) {
         recorderManager.offStart(handleRecordStart)
       }
@@ -382,7 +383,7 @@
 
   // 组件卸载时清理资源
   onHide(() => {
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     destroyRecorderManager()
     // #endif
   })

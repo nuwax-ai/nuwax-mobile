@@ -1,6 +1,6 @@
 <template>
   <view class="pane-tab">
-    <slot />
+    <slot></slot>
   </view>
 </template>
 

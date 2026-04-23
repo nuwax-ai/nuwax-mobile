@@ -56,7 +56,6 @@
       :key="currentLang"
       v-model="activeTab"
       :lazy-load="false"
-      with-bottom-padding
       @change="handleTabChange"
     >
       <pane-tab key-value="recent" tab="Mobile.Common.recentUsed">

@@ -2,7 +2,7 @@
   <!-- 内容区域 -->
   <scroll-view
     class="flex-1 h-full"
-    scroll-y="true"
+    :scroll-y="true"
     @scrolltolower="handleLoadMore"
     :lower-threshold="50"
     :refresher-enabled="true"
@@ -131,7 +131,8 @@
         }
 
         // 是否有更多数据, 如果数据长度大于0，则有更多数据
-        hasMore.value = newList?.length > 0;
+        // hasMore.value = newList?.length > 0;
+        hasMore.value = newList?.length === pageSize;
         currentPage.value = page;
         return data;
       }

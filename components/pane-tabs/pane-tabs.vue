@@ -29,9 +29,9 @@
     </view>
 
     <!-- Tab 内容区域 -->
+    <!-- :style="{ paddingBottom: withBottomPadding ? '90rpx' : '0' }" -->
     <view
       class="tabs-content flex-1"
-      :style="{ paddingBottom: withBottomPadding ? '90rpx' : '0' }"
       @touchstart="handleTouchStart"
       @touchmove="handleTouchMove"
       @touchend="handleTouchEnd"
@@ -49,7 +49,7 @@
         }"
       >
         <!-- 渲染子组件 -->
-        <slot />
+        <slot></slot>
       </view>
     </view>
   </view>
@@ -70,7 +70,7 @@
     headerHeight?: string;
     animated?: boolean;
     lazyLoad?: boolean;
-    withBottomPadding?: boolean; // 是否添加底部内边距，默认90rpx
+    // withBottomPadding?: boolean; // 是否添加底部内边距，默认90rpx
   }
 
   const props = withDefaults(defineProps<Props>(), {
@@ -78,7 +78,7 @@
     headerHeight: "88rpx",
     animated: true,
     lazyLoad: true,
-    withBottomPadding: false,
+    // withBottomPadding: false,
   });
 
   // Emits定义

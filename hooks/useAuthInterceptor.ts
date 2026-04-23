@@ -44,7 +44,7 @@ export const useAuthInterceptor = () => {
     return !!mpToken;
     // #endif
 
-    // #ifdef APP-PLUS
+    // #ifdef APP
     const appToken = uni.getStorageSync(ACCESS_TOKEN);
     return !!appToken;
     // #endif
@@ -83,7 +83,7 @@ export const useAuthInterceptor = () => {
       return;
     }
 
-    // #ifdef H5 || WEB || APP-PLUS
+    // #ifdef H5 || WEB || APP
     // 获取当前页面的 url
     const currentUrl = getCurrentPageFullPath();
     // 跳转到登录页，并携带当前页面的 url

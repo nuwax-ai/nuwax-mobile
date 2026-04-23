@@ -9,6 +9,7 @@
             :userInfo="userInfo"
             ref="headerMenuRef"
           />
+          <!-- 登录、注册按钮 -->
           <view v-else class="login-btn-wrapper" @click="handleLogin">
             <text class="login-btn-text">{{
               t("Mobile.Common.loginRegister")
@@ -30,6 +31,8 @@
       </template>
       <!-- #endif -->
     </custom-nav-bar>
+
+    <!-- 通知栏 -->
     <uni-notice-bar
       v-if="!isLoggedIn"
       single
@@ -94,10 +97,7 @@
   import type { UserInfo } from "@/types/interfaces/login";
   import { apiTenantConfig } from "@/servers/account";
   import { onLoad, onShow, onHide, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
-  import {
-    getCurrentPagePath,
-    jumpToAgentDetailPage,
-  } from "@/utils/commonBusiness";
+  import { getCurrentPagePath, jumpToAgentDetailPage } from "@/utils/commonBusiness";
   import AuthLoginPopup from "@/components/auth-login-popup/auth-login-popup.vue";
   import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
   import { getCurrentPageFullPath } from "@/utils/common";
@@ -109,10 +109,10 @@
 
   const { t, syncLanguageFromUser } = useI18n();
 
-  const activeTab = ref("recent");
+  const activeTab = ref<string>("recent");
   // 分享标题
-  const shareTitle = ref("");
-  const fallbackShareTitle = computed(() => t("Mobile.Nav.home"));
+  const shareTitle = ref<string>("");
+  const fallbackShareTitle = computed<string>(() => t("Mobile.Nav.home"));
 
   const handleTabChange = (key: string) => {
     if (key === "recent" && agentListContentRef.value) {
@@ -179,8 +179,9 @@
     }
     // #endif
 
-    // #ifdef H5 || WEB
+    // #ifdef H5 || WEB || APP
     const currentUrl = getCurrentPageFullPath();
+    console.log("handleLogin, 当前页面的 url: ", currentUrl);
     uni.navigateTo({
       url:
         "/subpackages/pages/login/login?redirect=" +

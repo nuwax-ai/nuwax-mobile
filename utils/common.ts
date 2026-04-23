@@ -422,7 +422,7 @@ const redirectTo = (redirectUrl: string) => {
   location.replace(redirectUrl);
   // #endif
 
-  // #ifdef MP-WEIXIN || APP-PLUS
+  // #ifdef MP-WEIXIN || APP
   // 先解码URL,避免路径被错误拼接(如 %2Fpages%2Findex 会被拼接到当前路径后)
   const decodedUrl = decodeURIComponent(redirectUrl);
   uni.reLaunch({ url: decodedUrl });
@@ -439,7 +439,7 @@ const getCurrentPagePath = () => {
   return window.location.href;
   // #endif
 
-  // #ifdef MP-WEIXIN || APP-PLUS
+  // #ifdef MP-WEIXIN || APP
   const currentPage = getCurrentPages()[getCurrentPages().length - 1];
   // return getCurrentPages()[getCurrentPages().length - 1]?.route;
   return currentPage ? `/${currentPage.route}` : "";
@@ -472,7 +472,7 @@ const getCurrentPageParams = () => {
   return params;
   // #endif
 
-  // #ifdef MP-WEIXIN || APP-PLUS
+  // #ifdef MP-WEIXIN || APP
   return getCurrentPages()[getCurrentPages().length - 1]?.options;
   // #endif
 };

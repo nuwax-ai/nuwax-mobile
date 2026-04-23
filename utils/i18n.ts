@@ -39,7 +39,7 @@ const isMpWeixinPlatform = (): boolean => {
 };
 
 const isAppPlatform = (): boolean => {
-  // #ifdef APP-PLUS
+  // #ifdef APP
   return true;
   // #endif
   return false;

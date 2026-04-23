@@ -55,7 +55,7 @@ export class StreamRequest {
       await this.requestWeapp(config);
       // #endif
 
-      // #ifdef APP-PLUS
+      // #ifdef APP
       await this.requestApp(config);
       // #endif
     } catch (error) {
@@ -67,7 +67,7 @@ export class StreamRequest {
       }
       // #endif
 
-      // #ifdef MP-WEIXIN || APP-PLUS
+      // #ifdef MP-WEIXIN || APP
       if (this.isAborted) {
         console.log("请求已被中止");
         return;
@@ -511,7 +511,7 @@ export class StreamRequest {
 
   // App环境下的流式请求
   private async requestApp(config: StreamRequestConfig): Promise<void> {
-    // #ifdef APP-PLUS
+    // #ifdef APP
     return new Promise((resolve, reject) => {
       this.requestTask = uni.request({
         url: config.url,
@@ -631,7 +631,7 @@ export class StreamRequest {
     }
     // #endif
 
-    // #ifdef APP-PLUS
+    // #ifdef APP
     // 中止 App 的请求
     if (this.requestTask) {
       this.requestTask.abort();

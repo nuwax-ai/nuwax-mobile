@@ -77,6 +77,7 @@
       <view class="chat-input-container" :class="{ 'multi-line': isMultiLine }">
         <voice-recorder-button
           v-if="inputMethod === ChatInputMethod.Voice"
+          class="w-full"
           :duration="600000"
           :is-conversation-active="isConversationActive"
           @onRecordStart="handleVoiceStart"
@@ -239,7 +240,7 @@
   import { UploadFileStatus } from "@/types/enums/common";
   import ChatUploadImage from "@/components/chat-upload-image/chat-upload-image.vue";
   import ManualComponentItem from "./manual-component-item/manual-component-item.vue";
-  import VoiceRecorderButton from "@/components/voice-recorder-button/voice-recorder-button.vue";
+  import VoiceRecorderButton from "./voice-recorder-button/voice-recorder-button.vue";
   import {
     AgentManualComponentInfo,
     AgentSelectedComponentInfo,
@@ -531,7 +532,7 @@
     // keyboardHeight.value = res.detail.height
 
     // 微信小程序
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     if (res.detail.height > 31) {
       keyboardHeight.value = showExtraContainer.value ? 30 + 115 : 30;
     } else {
@@ -684,7 +685,7 @@
       textareaCursor.value = targetCursor;
     }
 
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     isInputFocused.value = false;
     setTimeout(() => {
       isInputFocused.value = true;
@@ -713,7 +714,7 @@
     if (isAtTrigger.value && atCursorIndex.value >= 0) {
       textareaCursor.value = atCursorIndex.value;
 
-      // #ifdef MP-WEIXIN
+      // #ifdef MP-WEIXIN || APP
       isInputFocused.value = false;
       setTimeout(() => {
         isInputFocused.value = true;
@@ -834,7 +835,7 @@
     }
     // #endif
 
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     header["Authorization"] = `Bearer ${token}`;
     // #endif
 
@@ -980,7 +981,7 @@
     }
     // #endif
 
-    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ || APP
     // 小程序端检查录音权限
     try {
       const authResult = await uni.authorize({
@@ -1001,6 +1002,8 @@
                 }
               },
             });
+          } else if (res.cancel) {
+            // 用户取消了权限，可以重新尝试录音
           }
         },
       });
@@ -1431,6 +1434,10 @@
     // #endif
   }
   .ai-generate-text-container {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
     margin-top: -15rpx;
     margin-bottom: -15rpx;
     // iOS 微信小程序特殊样式

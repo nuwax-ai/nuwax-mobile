@@ -1,29 +1,30 @@
 <template>
-  <!-- 内容区域 -->
-  <scroll-view
-    class="flex-1 h-full"
-    :scroll-y="true"
-    @scrolltolower="handleLoadMore"
-    :lower-threshold="50"
-    :refresher-enabled="true"
-    :refresher-triggered="refreshing"
-    @refresherrefresh="handleRefresh"
-    :show-scrollbar="false"
-  >
-    <!-- 最近使用智能体列表 -->
-    <template v-if="recentAgentList?.length">
-      <recent-used-agent-item
-        v-for="info in recentAgentList"
-        :key="info.id"
-        :icon="info.icon"
-        :name="info.name"
-        :description="info.description"
-        :modifiedTime="formatTimeAgo(info.modified)"
-        :showModifiedTime="isLoggedIn"
-        @click="handleAgentClick(info)"
-        @longpress="isLoggedIn ? handleDeleteUserUsedAgent(info) : () => {}"
-      />
-    </template>
+  <view class="agent-list-content">
+    <!-- 内容区域 -->
+    <scroll-view
+      class="list-scroll"
+      :scroll-y="true"
+      @scrolltolower="handleLoadMore"
+      :lower-threshold="50"
+      :refresher-enabled="true"
+      :refresher-triggered="refreshing"
+      @refresherrefresh="handleRefresh"
+      :show-scrollbar="false"
+    >
+      <!-- 最近使用智能体列表 -->
+      <template v-if="recentAgentList?.length">
+        <recent-used-agent-item
+          v-for="info in recentAgentList"
+          :key="info.id"
+          :icon="info.icon"
+          :name="info.name"
+          :description="info.description"
+          :modifiedTime="formatTimeAgo(info.modified)"
+          :showModifiedTime="isLoggedIn"
+          @click="handleAgentClick(info)"
+          @longpress="isLoggedIn ? handleDeleteUserUsedAgent(info) : () => {}"
+        />
+      </template>
 
     <!-- loading状态或刷新状态时隐藏空状态 -->
     <template v-else-if="!loading && !refreshing">
@@ -44,13 +45,14 @@
       </view>
     </template>
 
-    <!-- 加载状态时隐藏没有更多数据状态 -->
-    <template v-if="showNoMore">
-      <view class="no-more-state">
-        <text class="no-more-text">{{ t("Mobile.Common.noMoreData") }}</text>
-      </view>
-    </template>
-  </scroll-view>
+      <!-- 加载状态时隐藏没有更多数据状态 -->
+      <template v-if="showNoMore">
+        <view class="no-more-state">
+          <text class="no-more-text">{{ t("Mobile.Common.noMoreData") }}</text>
+        </view>
+      </template>
+    </scroll-view>
+  </view>
 </template>
 
 <script setup lang="ts">
@@ -112,12 +114,12 @@
     page: number = 1,
     pageSize: number = 20,
   ) => {
+    loading.value = true;
     try {
       const res = await apiUserUsedAgentList({
         pageIndex: page,
         size: pageSize,
       });
-      loading.value = false;
       const { code, data } = res || {};
       if (code === SUCCESS_CODE) {
         const newList = data || [];
@@ -138,11 +140,14 @@
       }
     } catch (error) {
       return false;
+    } finally {
+      loading.value = false;
     }
   };
 
   // 获取公开的智能体列表（未登录时使用）
   const fetchPublishedAgentList = async () => {
+    loading.value = true;
     try {
       const params: SquarePublishedListParams = {
         targetType: AgentComponentTypeEnum.Agent,
@@ -153,7 +158,6 @@
         kw: "",
       };
       const res = await apiPublishedAgentList(params);
-      loading.value = false;
       const { code, data } = res as unknown as RequestResponse<
         Page<SquarePublishedItemInfo>
       >;
@@ -179,6 +183,8 @@
       }
     } catch (error) {
       return false;
+    } finally {
+      loading.value = false;
     }
   };
 
@@ -249,15 +255,20 @@
   // 初始化加载数据
   const loadData = async () => {
     loading.value = true;
-    const list = props.isLoggedIn
-      ? await fetchUserUsedAgentList(1, 20 * currentPage.value)
-      : await fetchPublishedAgentList();
+    if (props.isLoggedIn) {
+      await fetchUserUsedAgentList(1, 20 * currentPage.value);
+    } else {
+      await fetchPublishedAgentList();
+    }
   };
 
   onMounted(()=>{
+    // #ifdef MP-WEIXIN
     loadData();
+    // #endif
   })
 
+  // 在App端（Android和iOS）、H5，页面进入时 onMounted 和 onShow 都会执行，这与小程序端的行为不同
   onShow(()=>{
     loadData();
   })
@@ -270,6 +281,18 @@
 </script>
 
 <style lang="scss" scoped>
+  .agent-list-content {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .list-scroll {
+    flex: 1;
+    min-height: 0;
+  }
+
   /* 空状态 */
   .h-full {
     height: 100%;

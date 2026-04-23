@@ -263,6 +263,8 @@
 <style lang="scss" scoped>
   .pane-tabs {
     width: 100%;
+    height: 100%;
+    min-height: 0;
     background: #fff;
 
     .tabs-header {
@@ -312,6 +314,7 @@
       position: relative;
       overflow: hidden;
       width: 100%;
+      min-height: 0;
 
       .tabs-content-wrapper {
         display: flex;

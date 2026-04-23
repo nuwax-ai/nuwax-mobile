@@ -1,9 +1,10 @@
 <template>
   <view class="conversation-list h-full">
     <scroll-view
-      class="h-full"
-      scroll-y
+      class="conversation-scroll"
+      :scroll-y="true"
       @scrolltolower="handleLoadMore"
+      :lower-threshold="50"
       :refresher-enabled="true"
       :refresher-triggered="refreshing"
       @refresherrefresh="handleRefresh"
@@ -208,7 +209,16 @@
 
 <style lang="scss" scoped>
   .conversation-list {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
     background: #f5f5f5;
+
+    .conversation-scroll {
+      flex: 1;
+      min-height: 0;
+    }
 
     .list-wrapper {
       padding: 0;

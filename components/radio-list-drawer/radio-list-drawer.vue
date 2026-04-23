@@ -121,6 +121,7 @@
     height: 100%;
     padding: 0 40rpx;
     overflow-y: auto;
+    box-sizing: border-box;
 
     .radio-group {
       display: flex;

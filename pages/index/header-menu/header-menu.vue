@@ -84,6 +84,7 @@
     { immediate: true },
   );
 
+  // 跳转到个人资料页面
   const handlePersonalInfo = () => {
     uni.navigateTo({
       url: "/subpackages/pages/about-me/about-me",

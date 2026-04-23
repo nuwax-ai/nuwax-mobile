@@ -4,7 +4,7 @@
       class="conversation-scroll"
       :scroll-y="true"
       @scrolltolower="handleLoadMore"
-      :lower-threshold="50"
+      :lower-threshold="80"
       :refresher-enabled="true"
       :refresher-triggered="refreshing"
       @refresherrefresh="handleRefresh"

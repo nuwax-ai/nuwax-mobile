@@ -18,21 +18,24 @@
     <view class="category-nav border-b">
       <scroll-view
         class="category-scroll"
-        direction="horizontal"
         :scroll-with-animation="true"
         :scroll-into-view="scrollIntoView"
         :show-scrollbar="false"
+        :scroll-x="true"
+        :enable-flex="true"
       >
-        <view
-          :id="category.key"
-          v-for="(category, index) in categories"
-          :key="category.key"
-          :class="`category-item ${activeCategory === category.key ? 'active' : ''}`"
-          @click="handleCategoryClick(category.key, index)"
-        >
-          <text class="category-text">{{
-            translateText(category.label)
-          }}</text>
+        <view class="category-scroll-content">
+          <view
+            :id="category.key"
+            v-for="(category, index) in categories"
+            :key="category.key"
+            :class="`category-item ${activeCategory === category.key ? 'active' : ''}`"
+            @click="handleCategoryClick(category.key, index)"
+          >
+            <text class="category-text">{{
+              translateText(category.label)
+            }}</text>
+          </view>
         </view>
       </scroll-view>
     </view>
@@ -54,6 +57,7 @@
             <view v-if="shouldRenderCategory(index)" class="h-full">
               <scroll-view
                 class="h-full"
+                :scroll-y="true"
                 @scrolltolower="handleLoadMore"
                 :refresher-enabled="true"
                 :refresher-triggered="refreshingMap[category.key] || false"
@@ -545,7 +549,7 @@
     flex-direction: column;
     overflow: hidden;
     background-color: #fff;
-    /* #ifdef MP-WEIXIN */
+    /* #ifdef MP-WEIXIN || APP */
     // padding-top: env(safe-area-inset-top);
     padding-bottom: env(safe-area-inset-bottom);
     /* #endif */
@@ -562,14 +566,21 @@
         scroll-behavior: smooth;
         -webkit-overflow-scrolling: touch;
         height: 80rpx;
+      }
+
+      .category-scroll-content {
         display: flex;
-        // align-items: center;
         flex-direction: row;
+        flex-wrap: nowrap;
+        width: max-content;
+        min-width: 100%;
       }
 
       .category-item {
         display: flex;
+        align-items: center;
         justify-content: center;
+        flex-shrink: 0;
         height: 80rpx;
         padding: 0 32rpx;
         border-radius: 16rpx;
@@ -610,8 +621,6 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 160rpx 40rpx;
-      text-align: center;
 
       .empty-image {
         width: 172rpx;

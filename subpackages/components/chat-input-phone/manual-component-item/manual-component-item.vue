@@ -262,13 +262,12 @@
       scroll-behavior: smooth;
       -webkit-overflow-scrolling: touch;
 
-      /* #ifdef H5 || WEB */
       :deep(.uni-scroll-view-content) {
         display: flex;
         flex-direction: row;
-        // width: max-content;
+        flex-wrap: nowrap;
+        width: max-content;
       }
-      /* #endif */
     }
 
     .manual-group {

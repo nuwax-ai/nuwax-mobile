@@ -448,7 +448,7 @@
         }
         // #endif
 
-        // #ifdef MP-WEIXIN || APP-PLUS
+        // #ifdef MP-WEIXIN || APP
         uni.setStorageSync(ACCESS_TOKEN, data.token);
         // #endif
 

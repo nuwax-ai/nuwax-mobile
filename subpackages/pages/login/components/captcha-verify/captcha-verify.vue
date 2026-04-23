@@ -158,7 +158,7 @@
     }
     // #endif
 
-    // #ifdef MP-WEIXIN || APP-PLUS
+    // #ifdef MP-WEIXIN || APP
     // 微信小程序和App平台在用户点击粘贴后触发此事件
     // 延迟一下确保粘贴操作完成后再读取
     setTimeout(async () => {
@@ -213,7 +213,7 @@
   };
 
   const handleLongPress = async (event: any) => {
-    // #ifdef MP-WEIXIN || APP-PLUS
+    // #ifdef MP-WEIXIN || APP
     // 长按时直接读取剪贴板并询问是否填充
     try {
       const res = await uni.getClipboardData();
@@ -277,7 +277,7 @@
     }
     // #endif
 
-    // #ifdef APP-PLUS
+    // #ifdef APP
     // App平台使用 ref 引用
     if (captchaInputRef.value && captchaInputRef.value.focus) {
       captchaInputRef.value.focus();

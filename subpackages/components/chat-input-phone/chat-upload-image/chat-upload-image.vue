@@ -1,77 +1,80 @@
 <template>
   <scroll-view
     class="files-container"
-    direction="horizontal"
     :scroll-with-animation="true"
     :show-scrollbar="false"
+    :scroll-x="true"
+    :enable-flex="true"
   >
-    <template v-for="file in files" :key="file.uid">
-      <!-- 如果文件是图片，则显示图片，否则显示文档默认图片 -->
-      <view
-        class="files-box relative"
-        :class="[
-          !file?.type?.includes('image/')
-            ? 'files-box-file'
-            : 'files-box-image',
-          file.status === UploadFileStatus.error ? 'files-box-error' : '',
-        ]"
-        @click="onPreview(file)"
-      >
+    <view class="files-scroll-content">
+      <template v-for="file in files" :key="file.uid">
+        <!-- 如果文件是图片，则显示图片，否则显示文档默认图片 -->
         <view
-          class="files-box-loading"
-          v-if="file.status === UploadFileStatus.uploading"
+          class="files-box relative"
+          :class="[
+            !file?.type?.includes('image/')
+              ? 'files-box-file'
+              : 'files-box-image',
+            file.status === UploadFileStatus.error ? 'files-box-error' : '',
+          ]"
+          @click="onPreview(file)"
         >
-          <image
-            class="icon-loading-image"
-            src="@/static/assets/image_loading.svg"
-            alt=""
-          />
-        </view>
-        <!-- 图片 -->
-        <image
-          class="image"
-          v-if="file?.type?.includes('image/')"
-          :src="file?.url"
-          mode="aspectFill"
-          :alt="file?.name || t('Mobile.Chat.uploadImageAlt')"
-        />
-        <!-- 文件 -->
-        <template v-else>
-          <image
-            class="doc-image"
-            :src="docImage"
-            mode="aspectFill"
-            :alt="t('Mobile.Chat.uploadFileAlt')"
-          />
-          <view class="doc-info-container">
-            <view class="doc-name text-ellipsis">{{ file?.name }}</view>
-            <text class="doc-size text-ellipsis">{{
-              formatBytes(file?.size)
-            }}</text>
+          <view
+            class="files-box-loading"
+            v-if="file.status === UploadFileStatus.uploading"
+          >
+            <image
+              class="icon-loading-image"
+              src="@/static/assets/image_loading.svg"
+              alt=""
+            />
           </view>
-        </template>
-        <!-- 删除按钮 -->
-        <view
-          v-if="file.status !== UploadFileStatus.uploading"
-          class="del-container"
-          @click.stop="emit('onDel', file.uid)"
-        >
+          <!-- 图片 -->
           <image
-            src="@/static/assets/x-circle-fill.svg"
-            mode="aspectFit"
-            style="width: 40rpx; height: 40rpx"
-            :alt="t('Mobile.Common.deleteIconAlt')"
+            class="image"
+            v-if="file?.type?.includes('image/')"
+            :src="file?.url"
+            mode="aspectFill"
+            :alt="file?.name || t('Mobile.Chat.uploadImageAlt')"
           />
+          <!-- 文件 -->
+          <template v-else>
+            <image
+              class="doc-image"
+              :src="docImage"
+              mode="aspectFill"
+              :alt="t('Mobile.Chat.uploadFileAlt')"
+            />
+            <view class="doc-info-container">
+              <view class="doc-name text-ellipsis">{{ file?.name }}</view>
+              <text class="doc-size text-ellipsis">{{
+                formatBytes(file?.size)
+              }}</text>
+            </view>
+          </template>
+          <!-- 删除按钮 -->
+          <view
+            v-if="file.status !== UploadFileStatus.uploading"
+            class="del-container"
+            @click.stop="emit('onDel', file.uid)"
+          >
+            <image
+              src="@/static/assets/x-circle-fill.svg"
+              mode="aspectFit"
+              style="width: 40rpx; height: 40rpx"
+              :alt="t('Mobile.Common.deleteIconAlt')"
+            />
+          </view>
         </view>
+      </template>
+      <!-- 添加按钮 -->
+      <view
+        class="files-box files-box-plus"
+        @click="emit('onAdd')"
+        v-if="props.showAddButton"
+      >
+        <text class="iconfont icon-Plus" />
       </view>
-    </template>
-    <!-- 添加按钮 -->
-    <view
-      class="files-box files-box-plus"
-      @click="emit('onAdd')"
-      v-if="props.showAddButton"
-    >
-      <text class="iconfont icon-Plus" />
     </view>
   </scroll-view>
 </template>
@@ -123,15 +126,21 @@
 
 <style lang="scss" scoped>
   .files-container {
+    width: 100%;
+  }
+
+  .files-scroll-content {
     display: flex;
     flex-direction: row;
-    // padding: 0 32rpx;
+    flex-wrap: nowrap;
+    width: max-content;
 
     .files-box {
       display: flex;
       flex-direction: row;
       align-items: center;
       justify-content: center;
+      flex-shrink: 0;
       border-radius: 16rpx;
       margin-right: 10rpx;
       overflow: hidden;

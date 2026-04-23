@@ -238,7 +238,7 @@
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { UploadFileInfo } from "@/types/interfaces/common";
   import { UploadFileStatus } from "@/types/enums/common";
-  import ChatUploadImage from "@/components/chat-upload-image/chat-upload-image.vue";
+  import ChatUploadImage from "./chat-upload-image/chat-upload-image.vue";
   import ManualComponentItem from "./manual-component-item/manual-component-item.vue";
   import VoiceRecorderButton from "./voice-recorder-button/voice-recorder-button.vue";
   import {

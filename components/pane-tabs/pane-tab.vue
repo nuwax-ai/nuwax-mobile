@@ -57,8 +57,10 @@
     flex: 0 0 auto;
     width: 100vw; // 占满视口宽度
     height: 100%;
+    min-height: 0;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
     box-sizing: border-box;
   }
 </style>

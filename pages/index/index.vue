@@ -44,7 +44,7 @@
     <!-- 未登录时只显示智能体列表，不显示标签页 -->
     <agent-list-content
       v-if="!isLoggedIn"
-      class="h-full w-full"
+      class="content-area"
       ref="agentListContentRef"
       :is-logged-in="isLoggedIn"
       @agent-click="handleAgentClick"
@@ -53,6 +53,7 @@
     <!-- 登录后显示标签页：最近使用 + 会话记录 -->
     <pane-tabs
       v-if="isLoggedIn"
+      class="content-area"
       :key="currentLang"
       v-model="activeTab"
       :lazy-load="false"
@@ -302,12 +303,25 @@
   });
 </script>
 
+<!-- 在微信小程序编译后，scoped 会把选择器变成类似 page[data-v-xxx]，而小程序根节点 page 不会带这个属性，所以匹配不到，样式就“无效” -->
+<style lang="scss">
+  page {
+    height: 100%;
+  }
+</style>
+
 <style lang="scss" scoped>
   .h-full {
     height: 100%;
   }
 
   .w-full {
+    width: 100%;
+  }
+
+  .content-area {
+    flex: 1;
+    min-height: 0;
     width: 100%;
   }
 

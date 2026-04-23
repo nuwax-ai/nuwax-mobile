@@ -14,9 +14,9 @@
 
   // 收藏
   onAddToFavorites(()=>{
-      return {
-          title: t("Mobile.Nav.agent"),
-      }
+    return {
+      title: t("Mobile.Nav.agent"),
+    }
   })
 </script>
 

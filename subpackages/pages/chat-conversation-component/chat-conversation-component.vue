@@ -84,6 +84,7 @@
             @touchstart="handleTouchStart"
             @touchend="handleTouchEnd"
             @touchcancel="handleTouchEnd"
+            :scroll-y="true"
           >
             <!-- 加载更多历史消息提示 -->
             <view class="loading-more-tip" v-if="isLoadingMoreMessages">
@@ -126,6 +127,7 @@
                       direction="horizontal"
                       :scroll-with-animation="true"
                       :show-scrollbar="false"
+                      :scroll-x="true"
                     >
                       <view class="files-list">
                         <view
@@ -227,6 +229,7 @@
         <!-- 输入框 -->
         <chat-input-phone
           v-if="isRenderInputPhone"
+          class="chat-input-phone"
           key="agent-details-chat-input"
           ref="agentDetailInputPhoneRef"
           :page-home-index="agentInfo?.pageHomeIndex || ''"

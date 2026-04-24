@@ -306,7 +306,15 @@
 </template>
 
 <script setup lang="ts">
-  import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
+  import {
+    ref,
+    computed,
+    watch,
+    nextTick,
+    onMounted,
+    onUnmounted,
+    getCurrentInstance,
+  } from 'vue';
   import { onLoad } from "@dcloudio/uni-app";
   // ==================== 导入模块 ====================
   // AI 消息组件
@@ -519,6 +527,13 @@
   const service = new AgentDetailService(data);
   const componentManager = new ComponentManager(data);
   const scrollManager = new ScrollManager(data);
+
+  // 设置 selectorQuery 查询作用域
+  // 小程序/APP 下 selectorQuery 查询作用域（组件实例）, 用于滚动时获取 #msg-list 元素高度
+  const queryScope = getCurrentInstance()?.proxy;
+  if (queryScope) {
+    scrollManager.setQueryScope(queryScope);
+  }
 
   // ==================== 暴露方法给模板 ====================
 

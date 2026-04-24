@@ -9,9 +9,43 @@ export default class ScrollManager {
   private data: AgentDetailData;
   // 记录上次滚动位置，用于判断滚动方向
   private lastScrollTop: number = 0;
+  // 非 H5 端缓存滚动容器高度，避免写死 magic number
+  private msgListOffsetHeight: number = 600;
+  private isMeasuringMsgListHeight: boolean = false;
+  // 小程序/APP 下 selectorQuery 查询作用域（组件实例）
+  private queryScope: any = null;
 
   constructor(private data: AgentDetailData) {
     this.data = data;
+  }
+
+  /**
+   * 设置 selectorQuery 查询作用域
+   */
+  setQueryScope(scope: any): void {
+    this.queryScope = scope;
+  }
+
+  /**
+   * 非 H5 端动态获取 #msg-list 高度
+   */
+  private measureMsgListHeight(): void {
+    // #ifdef MP-WEIXIN || APP
+    if (this.isMeasuringMsgListHeight) return;
+    this.isMeasuringMsgListHeight = true;
+    const query = uni.createSelectorQuery();
+    if (this.queryScope) {
+      query.in(this.queryScope);
+    }
+    query.select("#msg-list").boundingClientRect();
+    query.exec((res: any[]) => {
+      const rect = (res && (res[0])) || null;
+      if (rect && rect.height && rect.height > 0) {
+        this.msgListOffsetHeight = Number(rect.height);
+      }
+      this.isMeasuringMsgListHeight = false;
+    });
+    // #endif
   }
 
   /**
@@ -39,13 +73,14 @@ export default class ScrollManager {
       const scrollHeight = e?.detail?.scrollHeight ?? 0;
 
       // #ifdef MP-WEIXIN || APP
-      // 微信小程序需要通过其他方式获取容器高度，这里使用估算值
-      const offsetHeight = 600; // 默认视窗高度估算
+      // 非 H5 端动态测量滚动容器高度，首帧使用缓存兜底值
+      this.measureMsgListHeight();
+      const offsetHeight = this.msgListOffsetHeight;
       // #endif
 
       // #ifdef H5 || WEB
       const scrollList = document.getElementById("msg-list");
-      const offsetHeight = scrollList?.offsetHeight ?? 600;
+      const offsetHeight = scrollList?.clientHeight ?? 600;
       // #endif
 
       const diff: number = scrollHeight - scrollTop - offsetHeight;

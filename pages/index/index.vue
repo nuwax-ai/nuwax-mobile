@@ -23,7 +23,7 @@
         </view>
       </template>
 
-      <!-- #ifdef H5 || WEB -->
+      <!-- #ifdef H5 || WEB || APP -->
       <template v-slot:right>
         <view class="icon-search-box" @click="handleSearch">
           <text class="iconfont iconfont icon-Search font-48"></text>
@@ -181,7 +181,6 @@
 
     // #ifdef H5 || WEB || APP
     const currentUrl = getCurrentPageFullPath();
-    console.log("handleLogin, 当前页面的 url: ", currentUrl);
     uni.navigateTo({
       url:
         "/subpackages/pages/login/login?redirect=" +
@@ -272,6 +271,7 @@
       return;
     }
     const currentUrl = getCurrentPagePath();
+
     uni.navigateTo({
       url:
         "/subpackages/pages/agent-search/agent-search?type=Home&backUrl=" +

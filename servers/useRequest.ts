@@ -39,7 +39,7 @@ export default function request<T = any>(options: any) {
     }
     // #endif
 
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     header["Authorization"] = `Bearer ${accessToken}`;
     // #endif
   }
@@ -78,7 +78,7 @@ export default function request<T = any>(options: any) {
           uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
           uni.clearStorageSync(); // 清空所有缓存
 
-          // #ifdef H5 || WEB
+          // #ifdef H5 || WEB || APP
           uni.reLaunch({
             url: "/subpackages/pages/login/login",
           });
@@ -96,7 +96,7 @@ export default function request<T = any>(options: any) {
           let redirectUrl = errorMessage;
           // 如果错误信息包含/login开头，则替换为登录页，否则直接打开完整链接
           if (errorMessage?.startsWith("/login")) {
-            // #ifdef H5 || WEB
+            // #ifdef H5 || WEB || APP
             // 如果url在登录白名单地址中，则不跳转到登录页
             if (LOGIN_WHITELIST_URL.includes(url)) {
               resolve(responseData as T);

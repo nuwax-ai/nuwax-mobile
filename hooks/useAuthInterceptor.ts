@@ -114,11 +114,9 @@ export const useAuthInterceptor = () => {
    */
   const performJump = (info: AgentInfoBase) => {
     // 优先使用 agentType，如果没有则根据 targetType 判断
-    let agentType: "ChatBot" | "PageApp" = "ChatBot";
+    let agentType: "ChatBot" | "PageApp" = info.agentType || "ChatBot";
 
-    if (info.agentType) {
-      agentType = info.agentType;
-    } else if (info.targetType === AgentComponentTypeEnum.Page) {
+    if (info.targetType === AgentComponentTypeEnum.Page) {
       agentType = "PageApp";
     }
 

@@ -362,6 +362,7 @@
       padding-bottom: 20rpx;
       width: max-content;
       min-width: 100%;
+      height: 100%;
     }
 
     .test-long-text {

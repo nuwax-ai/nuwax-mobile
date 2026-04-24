@@ -1,6 +1,7 @@
 <template>
   <view class="container page-container">
     <!-- 导航栏 -->
+    <!-- #ifdef H5 || WEB || MP-WEIXIN -->
     <custom-nav-bar :title="fileName" show-back>
       <template v-slot:right>
         <!-- #ifdef H5 || WEB -->
@@ -11,6 +12,7 @@
         <!-- #endif -->
       </template>
     </custom-nav-bar>
+    <!-- #endif -->
 
     <view class="file-preview-content">
       <!-- 加载中 -->
@@ -33,7 +35,7 @@
           :src="previewUrl"
         ></iframe>
         <!-- #endif -->
-         
+
         <!-- #ifdef MP-WEIXIN || APP -->
         <web-view
           class="w-full h-full"

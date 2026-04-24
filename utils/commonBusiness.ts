@@ -64,7 +64,7 @@ export const addTicketAndJumpToWebview = async (
   webviewUrl = encodeURIComponent(baseWebviewUrl);
   // #endif
 
-  // #ifdef MP-WEIXIN
+  // #ifdef MP-WEIXIN || APP
   const _ticket = await getTicket();
   webviewUrl = encodeURIComponent(
     baseWebviewUrl + `&_ticket=${_ticket}&jump_type=${jump_type}`,

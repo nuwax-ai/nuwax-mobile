@@ -86,10 +86,10 @@
 
     <!-- 详情弹窗 -->
     <tool-details-modal 
-    ref="detailsModal" 
-    :detail-data="detailData" 
-    :title="toolCall.name || getI18nText('Mobile.ThirdParty.MpHtml.executionPlan')"
-    />
+      ref="detailsModal" 
+      :detail-data="detailData" 
+      :title="toolCall.name || getI18nText('Mobile.ThirdParty.MpHtml.executionPlan')"
+      />
   </view>
 </template>
 

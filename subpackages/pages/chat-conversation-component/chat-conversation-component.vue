@@ -27,7 +27,7 @@
       </template>
 
       <template v-slot:right>
-        <!-- #ifdef H5 || WEB -->
+        <!-- #ifdef H5 || WEB || APP -->
         <view class="right-buttons">
           <view
             class="icon-box"

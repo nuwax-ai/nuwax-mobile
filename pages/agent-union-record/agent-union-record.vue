@@ -157,10 +157,7 @@
   } from "@/types/interfaces/agentConfig";
   import { pinyin } from "@/utils/pinyin";
   import agentImage from "@/static/assets/agent_image.png";
-  import {
-    getCurrentPagePath,
-    jumpToAgentDetailPage,
-  } from "@/utils/commonBusiness";
+  import { getCurrentPagePath, jumpToAgentDetailPage } from "@/utils/commonBusiness";
   import { onLoad, onTabItemTap, onAddToFavorites } from "@dcloudio/uni-app";
   import iconAgentCollect from "@/static/icons/agent_collect.svg";
   import iconTeamSpace from "@/static/icons/team_space.svg";

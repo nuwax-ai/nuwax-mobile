@@ -117,19 +117,19 @@
 
   const emit = defineEmits(["show-verify", "login-success"]);
 
-  const phoneNumber = ref("");
-  const emailNumber = ref("");
-  const password = ref("");
-  const agreeTerms = ref(false);
-  const showPassword = ref(false);
+  const phoneNumber = ref<string>("");
+  const emailNumber = ref<string>("");
+  const password = ref<string>("");
+  const agreeTerms = ref<boolean>(false);
+  const showPassword = ref<boolean>(false);
   const captchaVerifyParam = ref(""); // 验证码
-  const isCaptchaVerify = ref(false); // 是否验证码
-  const loading = ref(false);
+  const isCaptchaVerify = ref<boolean>(false); // 是否验证码
+  const loading = ref<boolean>(false);
   // 阿里云验证码按钮id
   const buttonId = ref<string>("aliyun-captcha-id");
 
   // 分段器相关数据
-  const currentLoginType = ref("password");
+  const currentLoginType = ref<string>("password");
   const loginOptions = computed(() => [
     { label: t("Mobile.Auth.passwordLogin"), value: "password" },
     { label: t("Mobile.Auth.codeLoginRegister"), value: "phone" },
@@ -178,6 +178,12 @@
   };
 
   const doLogin = () => {
+    // #ifdef APP
+    // 暂不支持阿里云验证码，直接执行登录/验证码逻辑
+    handlerSuccess();
+    return;
+    // #endif
+
     // 阿里云验证码
     const tenantConfigInfo = props?.tenantConfigInfo;
     const { captchaSceneId, captchaPrefix, openCaptcha } =
@@ -414,7 +420,7 @@
         }
         // #endif
 
-        // #ifdef MP-WEIXIN
+        // #ifdef MP-WEIXIN || APP
         uni.setStorageSync(ACCESS_TOKEN, data.token);
         // #endif
 

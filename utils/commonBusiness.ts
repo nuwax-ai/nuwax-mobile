@@ -36,8 +36,8 @@ export const getCurrentPagePath = () => {
   return currentUrl === "/" ? "/pages/index/index" : currentUrl;
   // #endif
 
-  // #ifdef MP-WEIXIN
-  return "/" + getCurrentPageFullPath();
+  // #ifdef MP-WEIXIN || APP
+  return getCurrentPageFullPath();
   // #endif
 };
 

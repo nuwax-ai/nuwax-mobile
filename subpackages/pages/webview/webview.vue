@@ -1,42 +1,46 @@
 <template>
-  <!-- #ifdef H5 || WEB -->
-  <!-- 自定义导航栏 -->
-  <custom-nav-bar :title="displayPageTitle">
-    <template v-slot:left>
-      <text class="iconfont icon-a-Chevronleft" @tap="onBackClick"></text>
-    </template>
-  </custom-nav-bar>
-  <!-- #endif -->
+  <view class="webview-page page-container">
+    <!-- #ifdef H5 || WEB -->
+    <!-- 自定义导航栏 -->
+    <custom-nav-bar class="webview-nav" :title="displayPageTitle">
+      <template v-slot:left>
+        <text class="iconfont icon-a-Chevronleft" @tap="onBackClick"></text>
+      </template>
+    </custom-nav-bar>
+    <!-- #endif -->
 
-  <web-view
-    class="web-view page-container"
-    v-if="url.length != 0"
-    :src="url"
-    id="webview"
-    @error="handleWebviewError"
-    @load="handleWebviewLoad"
-    @message="handleWebviewMessage"
-  ></web-view>
+    <view class="webview-content">
+      <web-view
+        class="web-view"
+        v-if="url.length != 0"
+        :src="url"
+        id="webview"
+        @error="handleWebviewError"
+        @load="handleWebviewLoad"
+        @message="handleWebviewMessage"
+      ></web-view>
+    </view>
+  </view>
 </template>
 
 <script lang="ts" setup>
   import { computed, ref } from "vue";
-  import { removeQueryCompat } from "@/utils/common";
+  import { removeQueryCompat, isHttpUrl } from "@/utils/common";
   import { NO_LOGIN_CHECK_URL } from "@/constants/config";
   import { apiUserTicketCreate } from "@/servers/agentDev";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { onLoad, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
-  import { isHttpUrl } from "@/utils/common";
   import { isTabPage } from "@/utils/commonBusiness";
   import { useI18n } from "@/utils/i18n";
 
   const { t } = useI18n();
 
-  const url = ref("");
-  const method = ref("");
-  const data_type = ref("");
-  const request_id = ref("");
-  const pageTitle = ref("");
+  const url = ref<string>("");
+  const method = ref<string>("");
+  const data_type = ref<string>("");
+  const request_id = ref<string>("");
+  const pageTitle = ref<string>("");
+
   const displayPageTitle = computed(
     () => pageTitle.value || t("Mobile.Webview.defaultTitle"),
   );
@@ -74,7 +78,7 @@
 
   // WebView 加载完成
   const handleWebviewLoad = (e: any) => {
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     if (isNeedCallApi.value) {
       uni.showLoading({
         title: t("Mobile.Webview.aiReading"),
@@ -103,7 +107,7 @@
    * 3. 如果没有，检查网页端代码是否正确调用 wx.miniProgram.postMessage
    */
   const handleWebviewMessage = (e: any) => {
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
 
     // e.detail.data 是一个数组，包含所有 postMessage 发送的消息
     const messages = e.detail.data;
@@ -166,7 +170,7 @@
       }
       // #endif
 
-      // #ifdef MP-WEIXIN
+      // #ifdef MP-WEIXIN || APP
       // 判断当前url是否不需要登录检查
       if (NO_LOGIN_CHECK_URL.includes(currentUrl)) {
         url.value = currentUrl;
@@ -226,7 +230,27 @@
 </script>
 
 <style lang="scss" scoped>
+  .webview-page {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .webview-nav {
+    flex-shrink: 0;
+    position: relative;
+    z-index: 20;
+    background: #fff;
+  }
+
+  .webview-content {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
   .web-view {
     width: 100%;
+    height: 100%;
   }
 </style>

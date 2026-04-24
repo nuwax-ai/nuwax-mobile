@@ -171,7 +171,6 @@
 
   const jumpNavigateBack = () => {
     const toUrl = backUrl.value ? backUrl.value : "/pages/index/index";
-    console.log(toUrl);
 
     if (isTabPage(toUrl)) {
       uni.switchTab({ url: toUrl });
@@ -474,7 +473,8 @@
     height: 100vh;
     overflow: hidden;
     background-color: #fff;
-    /* #ifdef MP-WEIXIN */
+
+    /* #ifdef MP-WEIXIN || APP */
 		// padding-top: env(safe-area-inset-top);
 		padding-bottom: env(safe-area-inset-bottom);
 		/* #endif */

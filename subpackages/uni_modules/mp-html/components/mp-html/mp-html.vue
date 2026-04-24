@@ -1,6 +1,6 @@
 <template>
   <view id="_root" :class="(selectable ? '_select ' : '') + '_root'" :style="containerStyle">
-    <slot v-if="!nodes[0]" />
+    <slot v-if="!nodes[0]"></slot>
     <!-- #ifndef APP-PLUS-NVUE -->
     <node v-else :childs="nodes" :processing-list="processingList"
       :opts="[lazyLoad, loadingImg, errorImg, showImgMenu, selectable]" name="span" />

@@ -33,7 +33,8 @@
           :src="previewUrl"
         ></iframe>
         <!-- #endif -->
-        <!-- #ifdef MP-WEIXIN -->
+         
+        <!-- #ifdef MP-WEIXIN || APP -->
         <web-view
           class="w-full h-full"
           :src="previewUrl"
@@ -83,7 +84,7 @@
   baseUrl = isDev ? API_BASE_URL : window?.location?.origin;
   // #endif
 
-  // #ifdef MP-WEIXIN
+  // #ifdef MP-WEIXIN || APP
   baseUrl = API_BASE_URL;
   // #endif
 
@@ -243,7 +244,7 @@
         }
         // #endif
 
-        // #ifdef MP-WEIXIN
+        // #ifdef MP-WEIXIN || APP
         // _sk 用于下载功能，_ticket 用于当前页面访问（_ticket 只能消费一次，适合当前用户自己访问）
         const _ticket = await getTicket();
         previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${baseUrl + fileUrl}&_ticket=${_ticket}&_sk=${shareKey}`;

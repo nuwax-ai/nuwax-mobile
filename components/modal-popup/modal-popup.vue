@@ -8,8 +8,13 @@
     >
       <view
         class="modal-content"
-        :class="{ 'modal-show': visible }"
         :style="contentStyle"
+        @tap.stop
+        @click.stop
+        @touchstart.stop
+        @touchmove.stop
+        @touchend.stop
+        @touchcancel.stop
       >
         <view class="head-box" v-if="showHeader">
           <view class="title">
@@ -64,7 +69,6 @@
   const emit = defineEmits(["update-visible"]);
   const popupRef = ref<UniPopupInstance | null>(null);
 
-  const visible = ref(false);
   const displayTitle = computed(() => translateText(props.title));
 
   // 滑动关闭相关状态
@@ -128,15 +132,10 @@
       "popGesture": "none"
     });
     // #endif
-
-    setTimeout(() => {
-      visible.value = true;
-    }, 20);
   };
 
   // 关闭弹窗
   const close = () => {
-    visible.value = false;
     // 等待平滑消失动画
     setTimeout(() => {
       popupRef.value?.close();
@@ -163,7 +162,6 @@
     open,
     close,
     popupRef,
-    visible,
   });
 </script>
 

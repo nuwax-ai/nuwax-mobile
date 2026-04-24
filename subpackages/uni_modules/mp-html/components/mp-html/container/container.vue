@@ -462,6 +462,7 @@ export default {
       display: flex;
       flex-direction: row;
       align-items: center;
+      overflow: hidden;
       flex: 1;
       gap: 16rpx;
 

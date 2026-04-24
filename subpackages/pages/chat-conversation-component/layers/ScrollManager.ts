@@ -37,12 +37,14 @@ export default class ScrollManager {
       // 使用事件参数获取滚动信息，兼容微信小程序
       const scrollTop = e?.detail?.scrollTop ?? 0;
       const scrollHeight = e?.detail?.scrollHeight ?? 0;
-      // #ifdef MP-WEIXIN
+
+      // #ifdef MP-WEIXIN || APP
       // 微信小程序需要通过其他方式获取容器高度，这里使用估算值
       const offsetHeight = 600; // 默认视窗高度估算
       // #endif
-      // #ifndef MP-WEIXIN
-      const scrollList = uni.getElementById("msg-list");
+
+      // #ifdef H5 || WEB
+      const scrollList = document.getElementById("msg-list");
       const offsetHeight = scrollList?.offsetHeight ?? 600;
       // #endif
 

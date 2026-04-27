@@ -219,11 +219,15 @@
     emit('onRecordCancel')
   }
 
-  // 录音停止
+  /**
+   * 录音停止事件处理
+   * @param res 录音停止结果
+   * uni.getRecorderManager() 在 App 端（尤其是 Android/iOS 原生端）底层使用的是系统原生录音 API，
+   * 停止录音时返回的对象确实只保证 tempFilePath，其他字段如 fileSize、duration 等属于扩展字段，平台支持不一致。
+   */
   const handleRecordStop = async (res: any) => {
-    console.log('录音停止handleRecordStop')
     // 录音总时长，H5端单位秒，小程序端单位毫秒, 后续判断时长是否超过10分钟，是以秒为单位，所以小程序端需要将毫秒转为秒
-    let duration = res.duration || 0
+    let duration = res?.duration || 0
 
     // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
     duration = duration / 1000
@@ -233,8 +237,8 @@
     const audioFile: AudioFile = {
       tempFilePath: res.tempFilePath, // 录音文件的临时路径
       duration,
-      fileSize: res.fileSize || 0, // 录音文件大小，单位字节
-      format: res.format || 'mp3'
+      fileSize: res?.fileSize || 0, // 录音文件大小，单位字节
+      format: res?.format || 'mp3'
     }
 
     // 重置触摸结束取消录音标志
@@ -286,9 +290,11 @@
 
   // 使用audioUploader转换音频
   const uploadAndConvertWithService = async (audioFile: AudioFile): Promise<TranscriptResult> => {
+    // #ifndef APP
     if (!audioUploadService) {
       throw new Error(t("Mobile.Voice.serviceNotReady"))
     }
+    // #endif
 
     try {
       // 转换音频文件格式

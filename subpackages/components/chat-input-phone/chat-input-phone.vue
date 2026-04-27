@@ -981,8 +981,11 @@
     }
     // #endif
 
-    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ || APP
-    // 小程序端检查录音权限
+    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    /**
+     * 小程序端检查录音权限
+     * uni.authorize 不支持APP、H5端，只支持小程序端
+     */
     try {
       const authResult = await uni.authorize({
         scope: "scope.record",
@@ -1032,6 +1035,7 @@
     }
   };
 
+  // #ifdef H5 || MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
   // 监听输入方式变化
   watch(
     inputMethod,
@@ -1042,6 +1046,7 @@
     },
     { immediate: true },
   );
+  // #endif
 
   // 输入事件
   const handleInput = (e: UniInputEvent) => {

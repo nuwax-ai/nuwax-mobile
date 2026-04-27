@@ -75,6 +75,7 @@ export class AudioUploader {
       throw new Error(t("Mobile.AudioUploader.pathRequired"));
     }
 
+    // #ifndef APP
     if (audioFile.fileSize === 0) {
       throw new Error(t("Mobile.AudioUploader.fileEmpty"));
     }
@@ -96,6 +97,7 @@ export class AudioUploader {
     if (audioFile.duration > 600) {
       throw new Error(t("Mobile.AudioUploader.durationTooLong"));
     }
+    // #endif
 
     // 开始上传
     return this.performUpload(audioFile, onProgress);

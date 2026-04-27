@@ -977,6 +977,8 @@
     data.keyboardHeight.value = res.detail.height;
   };
 
+  // ==================== APP 端 SSE 处理 ====================
+
   // APP 端 SSE 连接建立回调（当前仅用于调试日志）
   const handleAppSSEOpen = (response: any): void => {
     console.log("[APP-SSE] connection opened:", response);

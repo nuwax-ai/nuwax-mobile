@@ -302,6 +302,15 @@
       :is-loading="isLoadingFiles"
       @update-visible="updatePopupFileTreeVisible"
     />
+    <!-- #ifdef APP -->
+    <gao-ChatSSEClient
+      ref="chatSSEClientRef"
+      @onOpen="handleAppSSEOpen"
+      @onMessage="handleAppSSEMessage"
+      @onError="handleAppSSEError"
+      @onFinish="handleAppSSEFinish"
+    />
+    <!-- #endif -->
   </view>
 </template>
 
@@ -432,6 +441,16 @@
   // 页面预览是否可见
   const pagePreviewVisible = ref(false);
   const msgListRef = ref<HTMLElement | null>(null);
+  // APP 端 SSE 插件实例引用（仅 APP 编译条件下生效）
+  const chatSSEClientRef = ref<{
+    startChat: (config: {
+      url: string;
+      headers?: Record<string, string>;
+      method?: string;
+      body?: Record<string, any>;
+    }) => void;
+    stopChat: () => void;
+  } | null>(null);
   // 用户临时票据
   const ticket = ref<string>("");
   /**
@@ -958,6 +977,26 @@
     data.keyboardHeight.value = res.detail.height;
   };
 
+  // APP 端 SSE 连接建立回调（当前仅用于调试日志）
+  const handleAppSSEOpen = (response: any): void => {
+    console.log("[APP-SSE] connection opened:", response);
+  };
+
+  // APP 端插件消息 -> chatService 统一流式处理
+  const handleAppSSEMessage = (message: { data?: string }): void => {
+    chatService.handleAppSSEMessage(message);
+  };
+
+  // APP 端插件错误 -> chatService 统一错误处理
+  const handleAppSSEError = (error: any): void => {
+    chatService.handleAppSSEError(error);
+  };
+
+  // APP 端插件结束 -> chatService 统一完成处理
+  const handleAppSSEFinish = (): void => {
+    chatService.handleAppSSEFinish();
+  };
+
   // ==================== 计算属性 ====================
   const lastMessage = computed(
     () => data.messageList.value[data.messageList.value.length - 1] ?? null,
@@ -1352,6 +1391,11 @@
 
   // 设置事件监听器
   onMounted(() => {
+    // #ifdef APP
+    // 将页面中的插件实例注册到 chatService，发送消息时由 service 按平台自动分发。
+    chatService.setAppSSEClient(chatSSEClientRef.value);
+    // #endif
+
     // 监听流式消息更新事件，触发自动滚动到底部
     // 兼容微信小程序和 H5
     uni.$on("streamMessageUpdate", handleStreamMessageUpdate);
@@ -1376,9 +1420,12 @@
   onUnmounted(() => {
     // 页面卸载时立即中断 SSE 连接并清除超时定时器
     // 注意：只中断连接，不调用停止接口
-    console.log("[页面卸载] 准备中断 SSE 连接");
     chatService?.abort();
-    console.log("[页面卸载] SSE 连接已中断");
+
+    // #ifdef APP
+    // 页面卸载时解除插件实例，避免跨页面误用旧实例。
+    chatService.setAppSSEClient(null);
+    // #endif
 
     uni.$off("streamMessageUpdate", handleStreamMessageUpdate);
     uni.$off("refreshFileList", onRefreshFileList);

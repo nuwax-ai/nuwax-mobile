@@ -286,9 +286,6 @@ export default class AgentDetailService {
     const { data: responseData, eventType } = res;
     this.data.currentConversationRequestId.value = res.requestId;
 
-    // 调试日志：追踪流式过程
-    // console.log(`[Stream] Event: ${eventType}, MessageId: ${currentMessageId}, Text: ${responseData?.text?.substring(0, 50)}...`)
-
     if (!this.data.messageList.value?.length) return;
 
     const list = [...this.data.messageList.value];
@@ -307,7 +304,6 @@ export default class AgentDetailService {
     // 确保流式过程中消息始终可见
     if (currentMessage.status === MessageStatusEnum.Loading) {
       currentMessage.status = MessageStatusEnum.Incomplete;
-      // console.log(`[Stream] Message ${currentMessageId} status changed from Loading to Incomplete`)
     }
 
     let newMessage: MessageInfo | null = null;
@@ -335,27 +331,11 @@ export default class AgentDetailService {
       // 长任务型任务处理
       const conversationId = this.data.conversationId.value;
 
-      // 长任务型任务处理(打开远程桌面)
-      // if (
-      //   responseData.type === AgentComponentTypeEnum.Event &&
-      //   (responseData as any).subEventType === 'OPEN_DESKTOP' &&
-      //   conversationId
-      // ) {
-      //   console.log('[AgentDetailService] Action: RECEIVE_EVENT, Params:', { type: 'OPEN_DESKTOP', conversationId, payload: responseData });
-      //   // 详情见 docs/agent_integration_guide.md
-      //   CustomActionService.openDesktopView(conversationId);
-      // }
-
       // 长任务型任务处理(刷新文件树)
       if (
         responseData.type === AgentComponentTypeEnum.ToolCall &&
         conversationId
       ) {
-        // console.log("[AgentDetailService] Action: RECEIVE_TOOL_CALL, Params:", {
-        //   type: "REFRESH_FILE_LIST",
-        //   conversationId,
-        //   payload: responseData,
-        // });
         CustomActionService.refreshFileList(conversationId);
       }
     }
@@ -456,11 +436,6 @@ export default class AgentDetailService {
       // 通过事件总线通知主组件执行滚动，兼容微信小程序和 H5
       uni.$emit("streamMessageUpdate");
     }
-
-    // 调试日志：状态更新
-    // if (newMessage) {
-    // 	console.log(`[Stream] Message ${currentMessageId} updated: status=${newMessage.status}, textLength=${newMessage.text?.length || 0}`)
-    // }
 
     // 使用优化更新方法，只更新需要更新的组件
     if (newMessage && newMessage.messageType === MessageTypeEnum.ASSISTANT) {

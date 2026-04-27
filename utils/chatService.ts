@@ -3,10 +3,69 @@ import { StreamRequest } from '@/utils/streamRequest'
 import { CHAT_API, API_HEADERS } from '@/constants/api.constants'
 import { ACCESS_TOKEN } from '@/constants/home.constants'
 
+interface AppSSEClient {
+  startChat: (config: {
+    url: string
+    headers?: Record<string, string>
+    method?: string
+    body?: Record<string, any>
+  }) => void
+  stopChat: () => void
+}
+
+interface StreamCallbacks {
+  onChunk: (chunk: string) => void
+  onComplete: () => void
+  onError: (error: any) => void
+}
+
 // 聊天服务类
 export class ChatService {
   private currentRequest: any = null
   private isStreaming: boolean = false
+  private appSSEClient: AppSSEClient | null = null
+  private appStreamCallbacks: StreamCallbacks | null = null
+
+  /**
+   * 注册/清理 APP 端 SSE 插件实例。
+   * 页面 onMounted 时注册，onUnmounted 时置空，避免悬挂引用。
+   */
+  setAppSSEClient(client: AppSSEClient | null): void {
+    this.appSSEClient = client
+  }
+
+  /**
+   * 处理 APP 插件的消息事件并转发到统一流式回调。
+   * 插件已按 SSE 协议分帧，这里只做最小过滤与分发。
+   */
+  handleAppSSEMessage(message: { data?: string }): void {
+    if (!this.appStreamCallbacks) return
+    const chunk = typeof message?.data === 'string' ? message.data : ''
+    if (!chunk || chunk === '[DONE]') return
+    this.appStreamCallbacks.onChunk(chunk)
+  }
+
+  /**
+   * 处理 APP 插件错误事件，统一收口到 sendMessage 的 onError。
+   */
+  handleAppSSEError(error: any): void {
+    if (!this.appStreamCallbacks) return
+    const { onError } = this.appStreamCallbacks
+    this.appStreamCallbacks = null
+    this.isStreaming = false
+    onError(error)
+  }
+
+  /**
+   * 处理 APP 插件结束事件，统一收口到 sendMessage 的 onComplete。
+   */
+  handleAppSSEFinish(): void {
+    if (!this.appStreamCallbacks) return
+    const { onComplete } = this.appStreamCallbacks
+    this.appStreamCallbacks = null
+    this.isStreaming = false
+    onComplete()
+  }
 
   // 发送消息并获取流式响应
   async sendMessage(
@@ -47,15 +106,50 @@ export class ChatService {
       header['Authorization'] = `Bearer ${token}`
       // #endif
 
+      // #ifdef APP
+      header['Authorization'] = `Bearer ${token}`
+      // #endif
+
+      const requestBody = {
+        ...data,
+        stream: true
+      }
+
+      // #ifdef APP
+      // APP 端优先走 gao-ChatSSEClient，规避原生 request 在流式场景的不稳定行为。
+      if (this.appSSEClient) {
+        this.appStreamCallbacks = {
+          onChunk,
+          onComplete: () => {
+            this.isStreaming = false
+            onComplete()
+          },
+          onError: (error: any) => {
+            this.isStreaming = false
+            onError(error)
+          }
+        }
+        this.currentRequest = {
+          abort: () => {
+            this.appSSEClient?.stopChat()
+          }
+        }
+        this.appSSEClient.startChat({
+          url: apiUrl,
+          method: 'POST',
+          headers: header,
+          body: requestBody
+        })
+        return
+      }
+      // #endif
+
+      // H5/WEB/小程序仍使用原有 StreamRequest 逻辑。
       await this.currentRequest.request({
         url: apiUrl,
         method: 'POST',
         headers: header,
-        body: {
-          ...data,
-          // conversationId: 1442734, //TODO 调试 先写死 后面一定删除
-          stream: true
-        },
+        body: requestBody,
         onChunk: (chunk: StreamChunk) => {
           if (chunk.type === 'content') {
             onChunk(chunk.data)
@@ -84,6 +178,8 @@ export class ChatService {
 
   // 中止当前请求
   abort(): void {
+    // 先清理 APP 回调引用，防止 stop 后插件异步回调再次写入状态。
+    this.appStreamCallbacks = null
     if (this.currentRequest) {
       this.currentRequest.abort()
       this.currentRequest = null

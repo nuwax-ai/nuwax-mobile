@@ -61,6 +61,7 @@
           <scroll-view
             class="skill-list"
             scroll-y="true"
+            :lower-threshold="120"
             :refresher-enabled="tab.value === 'all'"
             :refresher-triggered="refresherTriggered"
             @refresherrefresh="onRefresh"
@@ -361,14 +362,19 @@
     height: 100%;
     padding: 10rpx 0;
     width: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
 
     /* Tabs样式（带过渡动画的指示器） */
     .skill-tabs {
       position: relative;
       display: flex;
       flex-direction: row;
+      align-items: stretch;
       border-bottom: 2rpx solid #f0f0f0;
       padding: 0 40rpx;
+      height: 88rpx;
+      flex-shrink: 0;
 
       .tab-item {
         flex: 1;
@@ -376,7 +382,7 @@
         flex-direction: row;
         justify-content: center;
         align-items: center;
-        padding-bottom: 20rpx;
+        height: 100%;
 
         &.active {
           .tab-text {
@@ -386,7 +392,12 @@
         }
 
         .tab-text {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          height: 100%;
           font-size: 28rpx;
+          line-height: 1;
           color: #6b7280;
           transition: color 0.2s ease;
         }
@@ -407,10 +418,12 @@
     /* Swiper 滑动区域 */
     .skill-swiper {
       flex: 1;
+      min-height: 0;
       overflow: hidden;
 
       .swiper-item {
         height: 100%;
+        overflow: hidden;
       }
     }
 
@@ -424,6 +437,7 @@
       flex-direction: row;
       align-items: center;
       position: relative;
+      flex-shrink: 0;
 
       .search-input {
         flex: 1;
@@ -440,9 +454,8 @@
 
     /* 列表视图 */
     .skill-list {
-      flex: 1;
+      height: 100%;
       padding: 0 40rpx;
-      overflow: hidden;
 
       .skill-item {
         display: flex;

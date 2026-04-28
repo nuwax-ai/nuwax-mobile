@@ -7,7 +7,7 @@
     @update-visible="updateVisible"
   >
     <iframe
-      class="h-full"
+      class="w-full h-full"
       ref="iframeRef"
       :src="iframeConfig.uri"
       @load="onIframeLoad"

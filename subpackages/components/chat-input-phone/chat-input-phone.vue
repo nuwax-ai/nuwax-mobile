@@ -227,6 +227,32 @@
       @onClose="handleSkillModalClose"
       @onSelect="handleSkillSelect"
     />
+
+    <!-- 文件选择器 -->
+    <view class="hidden-file-picker">
+      <!-- #ifdef H5 || MP-WEIXIN -->
+      <uni-file-picker
+        ref="filePickerRef"
+        file-mediatype="all"
+        :auto-upload="false"
+        :limit="filePickerLimit"
+        @select="handleFilePickerSelect"
+      >
+        <view class="file-picker-trigger-placeholder" />
+      </uni-file-picker>
+      <!-- #endif -->
+      <!-- #ifdef APP -->
+      <uni-file-picker
+        ref="filePickerRef"
+        file-mediatype="video"
+        :auto-upload="false"
+        :limit="filePickerLimit"
+        @select="handleFilePickerSelect"
+      >
+        <view class="file-picker-trigger-placeholder" />
+      </uni-file-picker>
+      <!-- #endif -->
+    </view>
   </view>
 </template>
 
@@ -270,6 +296,10 @@
 
   // 文档
   const files = ref<UploadFileInfo[]>([]);
+  const filePickerRef = ref<{
+    choose?: () => void;
+    clearFiles?: (index?: number) => void;
+  } | null>(null);
   // 输入内容
   const messageInfo = ref<string>("");
   // 已选技能列表
@@ -366,7 +396,9 @@
     selectedComponents,
   });
 
-  // 添加文件、图片等
+  /**
+   * 打开扩展操作面板（图片/文件/技能等）。
+   */
   const handleAddFile = () => {
     // 显示额外功能栏
     showExtraContainer.value = true;
@@ -389,32 +421,49 @@
     onModelChange: (modelId: number, name: string) => void;
   }>();
 
-  // 切换沙盒
+  /**
+   * 切换当前会话使用的沙盒环境。
+   * @param sandboxId 沙盒ID
+   */
   const handleSandboxChange = (sandboxId: string) => {
     emit("onSandboxChange", sandboxId);
   };
 
-  // 切换模型
+  /**
+   * 切换当前会话使用的模型。
+   * @param modelId 模型ID
+   * @param name 模型名称
+   */
   const handleModelChange = (modelId: number, name: string) => {
     emit("onModelChange", modelId, name);
   };
 
-  // 打开文件树
+  /**
+   * 打开工作台文件树。
+   */
   const handleOpenFileTree = () => {
     emit("onOpenFileTree");
   };
 
-  // 停止会话
+  /**
+   * 停止当前会话，并收起扩展操作面板。
+   */
   const handleStopConversation = () => {
     showExtraContainer.value = false;
     emit("onStopConversation");
   };
 
+  /**
+   * 打开页面预览。
+   * @param uri 预览地址
+   */
   const handleOpenPagePreview = (uri: string) => {
     emit("onOpenPagePreview", uri);
   };
 
-  // 初始化波形动画数据
+  /**
+   * 初始化录音波形条数据。
+   */
   const initWaveform = () => {
     // Dynamically generate waveform bars based on 80% of width
     const targetWidth = 640 * 0.8; // rpx
@@ -470,7 +519,9 @@
     // #endif
   });
 
-  // 更新波形动画
+  /**
+   * 更新录音波形高度，实现动态波形动画效果。
+   */
   const updateWaveform = () => {
     waveformBars.value = waveformBars.value.map((bar) => ({
       ...bar,
@@ -478,14 +529,18 @@
     }));
   };
 
-  // 开始录音时长计时
+  /**
+   * 启动录音计时器并驱动波形刷新。
+   */
   const startDurationTimer = () => {
     durationTimer = setInterval(() => {
       updateWaveform();
     }, 150);
   };
 
-  // 停止录音时长计时
+  /**
+   * 停止录音计时器并清理定时器引用。
+   */
   const stopDurationTimer = () => {
     if (durationTimer) {
       clearInterval(durationTimer);
@@ -498,7 +553,10 @@
     stopDurationTimer();
   });
 
-  // 选择组件
+  /**
+   * 选择/取消选择手动组件。
+   * @param item 组件信息
+   */
   const handleToggleSelectComponent = (item: AgentSelectedComponentInfo) => {
     if (selectedComponents.value?.some((selected) => selected.id === item.id)) {
       selectedComponents.value = selectedComponents.value.filter(
@@ -527,7 +585,10 @@
     { immediate: true, deep: true },
   );
 
-  // 键盘高度变化
+  /**
+   * 处理键盘高度变化，适配不同平台的底部占位逻辑。
+   * @param res 键盘高度变化事件
+   */
   const onKeyboardheightchange = (res: UniInputKeyboardHeightChangeEvent) => {
     // keyboardHeight.value = res.detail.height
 
@@ -546,7 +607,10 @@
     // #endif
   };
 
-  // 生成文件唯一ID
+  /**
+   * 生成上传文件唯一ID。
+   * @returns 文件唯一标识
+   */
   const getFileUid = () => {
     return Date.now().toString() + Math.random().toString(36).substr(2, 9);
   };
@@ -570,6 +634,89 @@
       ) || 0
     );
   });
+  const filePickerLimit = computed(() => {
+    return DEFAULT_FILE_COUNT - fileCount.value;
+  });
+
+  interface FilePickerSelectItem {
+    path?: string;
+    name?: string;
+    size?: number;
+    type?: string;
+    fileType?: string;
+    file?: {
+      path?: string;
+      name?: string;
+      size?: number;
+      type?: string;
+    };
+  }
+
+  interface SelectedFileItem {
+    path: string;
+    name: string;
+    type: string;
+    size: number;
+  }
+
+  /**
+   * 处理选择后的文件列表：校验数量、写入待上传列表并触发上传。
+   * @param selectedFiles 已选择的文件列表
+   */
+  const handleSelectedFiles = (selectedFiles: SelectedFileItem[]) => {
+    const maxCount = filePickerLimit.value;
+    // 当前选择文件数量
+    const uploadCount = selectedFiles.length;
+    // 如果当前选择文件数量大于可选择文件数量，则返回
+    if (uploadCount > maxCount) {
+      uni.showToast({
+        title: t("Mobile.Chat.fileMaxSelect", { count: maxCount }),
+        icon: "none",
+        duration: 2000,
+      });
+      filePickerRef.value?.clearFiles?.();
+      return;
+    }
+
+    const _files = selectedFiles.map((file) => ({
+      url: file.path,
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      status: UploadFileStatus.uploading,
+      uid: getFileUid(),
+    }));
+    files.value = [...files.value, ..._files] as UploadFileInfo[];
+
+    const filePaths = selectedFiles.map((file) => file.path);
+    uploadMultipleFiles(filePaths);
+
+    // 清空 picker 内部列表，避免影响下次选择数量
+    filePickerRef.value?.clearFiles?.();
+  };
+
+  /**
+   * 处理 uni-file-picker 选择回调并转换为统一文件结构。
+   * @param res 选择结果
+   */
+  const handleFilePickerSelect = (res: { tempFiles: FilePickerSelectItem[] }) => {
+    const selectedFiles = (res.tempFiles || [])
+      .map((file) => {
+        const path = file.path || file.file?.path || "";
+        return {
+          path,
+          name: file.name || file.file?.name || path.split("/").pop() || "",
+          type:
+            file.type ||
+            file.fileType ||
+            file.file?.type ||
+            "application/octet-stream",
+          size: file.size || file.file?.size || 0,
+        };
+      })
+      .filter((file) => !!file.path);
+    handleSelectedFiles(selectedFiles);
+  };
 
   // 计算是否显示添加按钮
   const showAddButton = computed(() => {
@@ -579,7 +726,9 @@
     );
   });
 
-  // 选择文件
+  /**
+   * 打开文件选择器。
+   */
   const chooseFile = () => {
     // 如果已选择文件数量大于等于默认文件数量，则提示
     if (fileCount.value >= DEFAULT_FILE_COUNT) {
@@ -591,51 +740,21 @@
       });
       return;
     }
-    // 可选择文件数量
-    const maxCount = DEFAULT_FILE_COUNT - fileCount.value;
-    uni.chooseFile({
-      type: "file",
-      count: maxCount,
-      success: (res) => {
-        // 当前选择文件数量
-        const uploadCount = res.tempFiles.length;
-        // 如果当前选择图片数量大于可选择图片数量，则返回
-        if (uploadCount > maxCount) {
-          uni.showToast({
-            title: t("Mobile.Chat.fileMaxSelect", { count: maxCount }),
-            icon: "none",
-            duration: 2000,
-          });
-          return;
-        }
-
-        const _files = res.tempFiles.map((file) => ({
-          url: file.path,
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          status: UploadFileStatus.uploading,
-          uid: getFileUid(),
-        }));
-        files.value = [...files.value, ..._files] as UploadFileInfo[];
-
-        // 一次性上传所有选中的图片
-        const filePaths = res.tempFiles.map((file) => file.path);
-        uploadMultipleFiles(filePaths);
-      },
-      fail: (err) => {
-        console.error("choose file: " + err.errMsg);
-      },
-    });
+    filePickerRef.value?.choose?.();
   };
 
-  // 选择技能
+  /**
+   * 打开技能选择弹窗。
+   */
   const chooseSkill = () => {
     showExtraContainer.value = false;
     skillSelectModalVisible.value = true;
   };
 
-  // 选中技能
+  /**
+   * 处理技能选择结果，并在输入框内插入 @技能 名称。
+   * @param skill 选中的技能
+   */
   const handleSkillSelect = (skill: SkillInfoForAt) => {
     skillSelectModalVisible.value = false; // 关闭选择技能弹框
 
@@ -707,7 +826,9 @@
     // #endif
   };
 
-  // 关闭技能选择框时的回调
+  /**
+   * 关闭技能选择弹窗后的光标与输入状态恢复。
+   */
   const handleSkillModalClose = () => {
     skillSelectModalVisible.value = false;
 
@@ -740,7 +861,10 @@
     atCursorIndex.value = -1;
   };
 
-  // 移除技能
+  /**
+   * 移除已选技能，并同步清理输入框中的 @技能 文本。
+   * @param index 技能索引
+   */
   const removeSkill = (index: number) => {
     const skill = selectedSkills.value[index];
     if (skill != null) {
@@ -761,7 +885,10 @@
     }
   };
 
-  // 拍照或相册选择图片
+  /**
+   * 选择图片（拍照/相册），并触发上传流程。
+   * @param type 选择来源：camera 或 album
+   */
   const chooseImage = (type: string) => {
     // 如果已选择图片数量大于等于默认图片数量，则提示
     if (imageCount.value >= DEFAULT_IMAGE_COUNT) {
@@ -863,7 +990,12 @@
     // #endif
   };
 
-  // 上传单张图片（返回Promise）
+  /**
+   * 上传单个文件。
+   * @param filePath 文件本地路径
+   * @param uid 文件唯一ID
+   * @returns 上传后的文件信息
+   */
   const uploadFile = (
     filePath: string,
     uid: string,
@@ -938,7 +1070,10 @@
     });
   };
 
-  // 多文件上传
+  /**
+   * 批量上传文件，并逐个更新文件状态。
+   * @param filePaths 待上传文件路径列表
+   */
   const uploadMultipleFiles = async (filePaths: string[]) => {
     if (filePaths.length === 0) return;
 
@@ -988,7 +1123,9 @@
     }
   };
 
-  // 输入框获取焦点
+  /**
+   * 输入框聚焦回调。
+   */
   const onInputFocus = () => {
     isInputFocused.value = true;
     // 隐藏额外功能栏
@@ -997,19 +1134,25 @@
     props.onScrollToLastMsg?.(true);
   };
 
-  // 输入框失去焦点
+  /**
+   * 输入框失焦回调。
+   */
   const onInputBlur = () => {
     isInputFocused.value = false;
     // 隐藏额外功能栏
     showExtraContainer.value = false;
   };
 
-  // 切换额外功能栏显示/隐藏
+  /**
+   * 切换扩展操作面板的显示状态。
+   */
   const toggleExtraContainer = () => {
     showExtraContainer.value = !showExtraContainer.value;
   };
 
-  // 打开麦克风权限
+  /**
+   * 申请/检查麦克风权限（按平台差异处理）。
+   */
   const openMicrophonePermission = async () => {
     // #ifdef H5
     try {
@@ -1056,7 +1199,9 @@
     // #endif
   };
 
-  // 切换输入方式
+  /**
+   * 切换输入模式（文本/语音）。
+   */
   const handleChangeInputMethod = async () => {
     // if (props.isConversationActive.value) return;
     if (inputMethod.value === ChatInputMethod.Voice) {
@@ -1090,7 +1235,10 @@
   );
   // #endif
 
-  // 输入事件
+  /**
+   * 输入框内容变化处理（含 @ 技能触发逻辑）。
+   * @param e 输入事件
+   */
   const handleInput = (e: UniInputEvent) => {
     const value = e.detail.value ?? "";
 
@@ -1118,7 +1266,9 @@
     );
   };
 
-  // 点击发送事件
+  /**
+   * 发送消息（文本/附件/技能），并完成发送后状态重置。
+   */
   const handleSendMessage = () => {
     if (props.wholeDisabled) {
       // 未填写必填参数时，清空输入内容，让用户可以再次切换输入方式
@@ -1172,13 +1322,18 @@
     }
   };
 
-  // 语音录制开始
+  /**
+   * 语音录制开始回调。
+   */
   const handleVoiceStart = () => {
     isRecording.value = true;
     startDurationTimer();
   };
 
-  // 语音录制结束并转换为文字
+  /**
+   * 语音录制结束回调，将识别结果回填并发送。
+   * @param transcriptText 语音识别文本
+   */
   const handleVoiceStop = async (transcriptText: string) => {
     isRecording.value = false;
     stopDurationTimer();
@@ -1190,7 +1345,10 @@
     }
   };
 
-  // 语音录制错误
+  /**
+   * 语音录制异常回调。
+   * @param error 错误对象
+   */
   const handleVoiceError = (error: any) => {
     isRecording.value = false;
     stopDurationTimer();
@@ -1207,30 +1365,35 @@
       duration: 2000,
     });
   };
-
-  // 取消录音
-  // const handleCancelChange = (value: boolean) => {
-  //   isCancelled.value = value;
-  // }
-
-  // Add @onRecordCancel to voice-recorder-button
+  
+  /**
+   * 语音录制取消回调。
+   */
   const handleRecordCancel = () => {
     isRecording.value = false;
     isCancelled.value = false; // Optional: reset cancel state
   };
 
-  // Add handler
+  /**
+   * 语音录制结束回调（非识别完成路径）。
+   */
   const handleRecordEnd = () => {
     isRecording.value = false;
     isCancelled.value = false;
   };
 
-  // Add handler for line change
+  /**
+   * 文本行数变化回调，用于控制输入框多行样式。
+   * @param e 行数变化事件
+   */
   const handleLineChange = (e: UniTextareaLineChangeEvent) => {
     isMultiLine.value = e.detail.lineCount > 1;
   };
 
-  // 删除文档
+  /**
+   * 删除已选择文件。
+   * @param uid 文件唯一ID
+   */
   const handleDelFile = (uid: string) => {
     files.value = files.value?.filter((file) => file.uid !== uid) || [];
   };
@@ -1454,6 +1617,22 @@
         line-height: 44rpx;
       }
     }
+  }
+
+  .hidden-file-picker {
+    position: absolute;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+    opacity: 0;
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  .file-picker-trigger-placeholder {
+    width: 0;
+    height: 0;
+    overflow: hidden;
   }
 
   .icon-loop {

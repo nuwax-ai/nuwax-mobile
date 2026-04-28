@@ -775,50 +775,92 @@
     }
     // 可选择图片数量
     const maxCount = DEFAULT_IMAGE_COUNT - imageCount.value;
+    const handleSuccess = (
+      selectedFiles: {
+        path: string;
+        name?: string;
+        type?: string;
+        size: number;
+      }[],
+    ) => {
+      // 当前选择图片数量
+      const uploadCount = selectedFiles.length;
+      // 如果当前选择图片数量大于可选择图片数量，则返回
+      if (uploadCount > maxCount) {
+        uni.showToast({
+          title: t("Mobile.Chat.imageMaxSelect", { count: maxCount }),
+          icon: "none",
+          duration: 2000,
+        });
+        return;
+      }
+
+      const _files = selectedFiles.map((file) => ({
+        url: file.path,
+        name: file.name || file.path.split("/").pop() || "",
+        type: file.type || "image/*",
+        size: file.size,
+        status: UploadFileStatus.uploading,
+        uid: getFileUid(),
+      }));
+      files.value = [...files.value, ..._files] as UploadFileInfo[];
+
+      // 一次性上传所有选中的图片
+      const filePaths = selectedFiles.map((file) => file.path);
+      uploadMultipleFiles(filePaths);
+    };
+
+    const handleFail = (err: UniError) => {
+      // 如果取消选择图片，则不显示错误提示
+      if (err.errMsg.includes("cancel")) {
+        return;
+      }
+      uni.showToast({
+        title: t("Mobile.Chat.chooseImageFailed", {
+          reason: err?.errMsg || "",
+        }),
+        position: "bottom",
+      });
+    };
+
+    // #ifdef H5 || WEB
     uni.chooseImage({
       sourceType: [type === "camera" ? "camera" : "album"],
       sizeType: ["original", "compressed"],
       count: maxCount,
       success: (res) => {
-        // 当前选择图片数量
-        const uploadCount = res.tempFiles.length;
-        // 如果当前选择图片数量大于可选择图片数量，则返回
-        if (uploadCount > maxCount) {
-          uni.showToast({
-            title: t("Mobile.Chat.imageMaxSelect", { count: maxCount }),
-            icon: "none",
-            duration: 2000,
-          });
-          return;
-        }
-
-        const _files = res.tempFiles.map((file) => ({
-          url: file.path,
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          status: UploadFileStatus.uploading,
-          uid: getFileUid(),
-        }));
-        files.value = [...files.value, ..._files] as UploadFileInfo[];
-
-        // 一次性上传所有选中的图片
-        const filePaths = res.tempFiles.map((file) => file.path);
-        uploadMultipleFiles(filePaths);
+        handleSuccess(
+          res.tempFiles.map((file) => ({
+            path: file.path,
+            name: file.name,
+            type: file.type,
+            size: file.size,
+          })),
+        );
       },
-      fail: (err) => {
-        // 如果取消选择图片，则不显示错误提示
-        if (err.errMsg.includes("cancel")) {
-          return;
-        }
-        uni.showToast({
-          title: t("Mobile.Chat.chooseImageFailed", {
-            reason: err?.errMsg || "",
-          }),
-          position: "bottom",
-        });
-      },
+      fail: handleFail,
     });
+    // #endif
+
+    // #ifdef MP-WEIXIN || APP
+    uni.chooseMedia({
+      count: maxCount,
+      mediaType: ["image"],
+      sourceType: [type === "camera" ? "camera" : "album"],
+      sizeType: ["original", "compressed"],
+      success: (res) => {
+        handleSuccess(
+          res.tempFiles.map((file) => ({
+            path: file.tempFilePath,
+            name: file.tempFilePath.split("/").pop() || "",
+            type: file.fileType === "image" ? "image/*" : file.fileType,
+            size: file.size,
+          })),
+        );
+      },
+      fail: handleFail,
+    });
+    // #endif
   };
 
   // 上传单张图片（返回Promise）

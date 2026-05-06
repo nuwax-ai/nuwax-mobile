@@ -268,6 +268,18 @@
         :data="getRenderData(n.attrs.data)"
         data-source="markdown-container"
       />
+      <!-- markdown-custom-process 工具调用组件 -->
+      <markdown-container
+        v-else-if="n.name == 'markdown-custom-process'"
+        :data="getRenderData(n.attrs)"
+        data-source="markdown-container"
+      />
+      <markdown-container-group
+        v-else-if="n.name == 'container-group' || n.name == 'markdown-custom-process-group'"
+        :childs="n.children"
+      >
+        <node :childs="n.children" :opts="opts" :processing-list="processingList" />
+      </markdown-container-group>
       <!-- task-result 任务结果组件 -->
       <task-result
         v-else-if="n.name === 'task-result'"
@@ -380,6 +392,7 @@
 </script>
 <script>
   import markdownContainer from '../container/container.vue'
+  import markdownContainerGroup from '../container/container-group.vue'
   import taskResult from '../task-result/task-result.vue'
   import { getProcessingDataByPriority } from '../container/utils'
   import node from './node'
@@ -418,6 +431,7 @@
     },
     components: {
       markdownContainer,
+      markdownContainerGroup,
       taskResult,
       // #ifndef ((H5 || APP-PLUS) && VUE3) || APP-HARMONY
       node
@@ -502,7 +516,8 @@
 
         const result = {
         ...data,
-        ...getProcessingDataByPriority(data.executeId, this.processingList)
+        // 在 HTML 解析过程中，mp-html 的解析器会将属性名自动转为全小写，也就是 executeid
+        ...getProcessingDataByPriority(data.executeId || data.executeid, this.processingList) 
         }
 
         return result

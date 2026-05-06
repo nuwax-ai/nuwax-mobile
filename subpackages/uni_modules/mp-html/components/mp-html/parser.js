@@ -19,7 +19,7 @@ function makeMap(str) {
 const config = {
   // 信任的标签（保持标签名不变）
   trustTags: makeMap(
-    "container,a,abbr,ad,audio,b,blockquote,br,code,col,colgroup,dd,del,dl,dt,div,em,fieldset,h1,h2,h3,h4,h5,h6,hr,i,img,ins,label,legend,li,ol,p,q,ruby,rt,source,span,strong,sub,sup,table,tbody,td,tfoot,th,thead,tr,title,ul,video,task-result,description,file"
+    "container,container-group,markdown-custom-process,markdown-custom-process-group,a,abbr,ad,audio,b,blockquote,br,code,col,colgroup,dd,del,dl,dt,div,em,fieldset,h1,h2,h3,h4,h5,h6,hr,i,img,ins,label,legend,li,ol,p,q,ruby,rt,source,span,strong,sub,sup,table,tbody,td,tfoot,th,thead,tr,title,ul,video,task-result,description,file"
   ),
 
   // 块级标签（转为 div，其他的非信任标签转为 span）

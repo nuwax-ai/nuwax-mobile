@@ -40,6 +40,35 @@ md.use(markdownItContainer, "container", {
     }
   },
 });
+
+md.use(markdownItContainer, "container-group", {
+  validate: function (params) {
+    return params.trim().match(/^\s*container-group\s*(.*)$/);
+  },
+  render: function (tokens, idx) {
+    if (tokens[idx].nesting === 1) {
+      // opening tag
+      return `<container-group>`;
+    } else {
+      // closing tag
+      return `</container-group>`;
+    }
+  },
+});
+
+md.use(markdownItContainer, "task-result", {
+  validate: function (params) {
+    return params.trim().match(/^task-result\b/);
+  },
+  render: function (tokens, idx) {
+    if (tokens[idx].nesting === 1) {
+      return "<task-result>";
+    } else {
+      return "</task-result>";
+    }
+  },
+});
+
 function Markdown(vm) {
   this.vm = vm;
   vm._ids = {};

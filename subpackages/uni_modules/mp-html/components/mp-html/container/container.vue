@@ -120,7 +120,9 @@ export default {
     
     // 格式化显示的工具名称，处理多行代码情况
     toolNameDisplay() {
-      const name = this.toolCall.name || this.toolCall.type || '';
+      let name = this.toolCall.name || this.toolCall.type || '';
+      // 还原引号实体
+      name = name.replace(/&quot;/g, '"');
       // 替换换行符为空格，防止换行符干扰单行省略号显示
       return name.replace(/\n/g, ' ').trim();
     },

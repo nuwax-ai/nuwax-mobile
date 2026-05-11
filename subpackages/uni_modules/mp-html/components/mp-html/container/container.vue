@@ -1,5 +1,5 @@
 <template>
-  <view class="tool-call-status">
+  <view v-if="toolCall?.type !== 'Event'" class="tool-call-status">
     <!-- Plan 类型：直接显示任务列表 -->
     <template v-if="isPlanType">
       <!-- Plan 头部信息 -->
@@ -35,7 +35,7 @@
     <!-- 非 Plan 类型：显示工具调用状态 -->
     <template v-else>
       <!-- 工具调用头部信息 -->
-      <view v-if="toolCall?.type !== 'Event'" class="tool-header" @tap="toggleExpanded">
+      <view class="tool-header" @tap="toggleExpanded">
         <view class="tool-info">
           <text class="tool-name">{{ toolNameDisplay }}</text>
           <view class="tool-status-display">

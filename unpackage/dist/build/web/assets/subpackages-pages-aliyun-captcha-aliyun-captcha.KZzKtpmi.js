@@ -1,9 +1,1 @@
-<<<<<<< HEAD:unpackage/dist/build/web/assets/subpackages-pages-aliyun-captcha-aliyun-captcha.dZTyF_Gl.js
-<<<<<<<< HEAD:unpackage/dist/build/web/assets/subpackages-pages-aliyun-captcha-aliyun-captcha.B8i1sfRJ.js
-import{d as e,au as s,o as a,c as t,av as n}from"./index-Cc7CGTjz.js";import{_ as r}from"./_plugin-vue_export-helper.BCo6x5W8.js";const o=r(e({computed:{src:()=>s+"/static/aliyun-captcha.html"},methods:{onMessage(e=null){const s=e.detail.data[0],a=this.getOpenerEventChannel();a&&a.emit("getCaptchaVerifyParam",s)}}}),[["render",function(e,s,r,o,c,l){const i=n;return a(),t(i,{src:l.src,onMessage:l.onMessage},null,8,["src","onMessage"])}]]);export{o as default};
-========
-import{d as e,au as s,o as a,c as t,av as n}from"./index-Dz-juf5a.js";import{_ as r}from"./_plugin-vue_export-helper.BCo6x5W8.js";const o=r(e({computed:{src:()=>s+"/static/aliyun-captcha.html"},methods:{onMessage(e=null){const s=e.detail.data[0],a=this.getOpenerEventChannel();a&&a.emit("getCaptchaVerifyParam",s)}}}),[["render",function(e,s,r,o,c,l){const i=n;return a(),t(i,{src:l.src,onMessage:l.onMessage},null,8,["src","onMessage"])}]]);export{o as default};
->>>>>>>> hotfix/main/feat-2026.5.10:unpackage/dist/build/web/assets/subpackages-pages-aliyun-captcha-aliyun-captcha.dZTyF_Gl.js
-=======
 import{d as e,au as s,o as a,c as t,av as n}from"./index-PTplGajw.js";import{_ as r}from"./_plugin-vue_export-helper.BCo6x5W8.js";const o=r(e({computed:{src:()=>s+"/static/aliyun-captcha.html"},methods:{onMessage(e=null){const s=e.detail.data[0],a=this.getOpenerEventChannel();a&&a.emit("getCaptchaVerifyParam",s)}}}),[["render",function(e,s,r,o,c,l){const i=n;return a(),t(i,{src:l.src,onMessage:l.onMessage},null,8,["src","onMessage"])}]]);export{o as default};
->>>>>>> origin/main:unpackage/dist/build/web/assets/subpackages-pages-aliyun-captcha-aliyun-captcha.KZzKtpmi.js

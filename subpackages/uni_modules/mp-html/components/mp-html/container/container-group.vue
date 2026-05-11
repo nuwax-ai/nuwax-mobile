@@ -34,8 +34,11 @@ export default {
   },
   computed: {
     processCount() {
-      // 过滤掉可能的空白节点，支持原生 container 和 PC 端 HTML 标签名
-      return (this.childs || []).filter(n => n.name === 'container' || n.name === 'markdown-custom-process').length
+      // 过滤掉可能的空白节点，支持原生 container 和 PC 端 HTML 标签名，同时排除隐藏的 Event 类型
+      return (this.childs || []).filter(n => 
+        (n.name === 'container' || n.name === 'markdown-custom-process') && 
+        n.attrs?.type !== 'Event'
+      ).length
     }
   },
   methods: {

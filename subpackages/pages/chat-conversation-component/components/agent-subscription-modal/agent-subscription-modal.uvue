@@ -30,16 +30,30 @@
             v-for="plan in plans"
             :key="plan.id"
             class="plan-card"
-            :class="{ 'plan-current': plan.id === currentPlanId }"
+            :class="{
+              'plan-current': plan.id === activePlanId,
+              'plan-expired': plan.id === activePlanId && currentSubscription?.status === 'EXPIRED',
+              'plan-cancelled': plan.id === activePlanId && currentSubscription?.status === 'CANCELLED',
+            }"
           >
-            <!-- 热门标签 -->
+            <!-- 热门标签 / 订阅状态标签 -->
             <view
               class="card-badge-row"
-              v-if="plan.id === currentPlanId || plan.isHot"
+              v-if="plan.id === activePlanId || plan.isHot"
             >
-              <view v-if="plan.id === currentPlanId" class="badge badge-active">
+              <view
+                v-if="plan.id === activePlanId"
+                class="badge"
+                :class="{
+                  'badge-active': currentSubscription == null || currentSubscription.status === 'ACTIVE',
+                  'badge-expired': currentSubscription != null && currentSubscription.status === 'EXPIRED',
+                  'badge-cancelled': currentSubscription != null && currentSubscription.status === 'CANCELLED',
+                }"
+              >
                 <text class="badge-text">{{
-                  t("Mobile.MySubscriptions.currentPlan")
+                  currentSubscription != null && plan.id === currentSubscription.planId
+                    ? getSubscriptionStatusText(currentSubscription.status)
+                    : t("Mobile.MySubscriptions.currentPlan")
                 }}</text>
               </view>
               <view v-else-if="plan.isHot" class="badge badge-hot">
@@ -71,16 +85,6 @@
 
               <!-- 权益清单 -->
               <view class="plan-limits">
-                <view class="limit-item">
-                  <text class="limit-bullet">✦</text>
-                  <text class="limit-label"
-                    >{{ t("Mobile.MySubscriptions.creditsMonth") }}：</text
-                  >
-                  <text class="limit-val highlight-val"
-                    >{{ formatNumber(plan.creditAmount, 0) }}
-                    {{ t("Mobile.MySubscriptions.creditUnit") }}</text
-                  >
-                </view>
                 <view class="limit-item" v-if="plan.callLimitCount != null">
                   <text class="limit-bullet">✦</text>
                   <text class="limit-label"
@@ -89,7 +93,7 @@
                   <text class="limit-val">{{
                     plan.callLimitCount === -1
                       ? t("Mobile.Chat.unlimited")
-                      : plan.callLimitCount + t("Mobile.Chat.timesPerDay")
+                      : plan.callLimitCount + t("Mobile.Chat.timesPerMonth")
                   }}</text>
                 </view>
               </view>
@@ -100,7 +104,7 @@
               <view
                 class="action-btn"
                 :class="{
-                  'btn-current': plan.id === currentPlanId,
+                  'btn-current': plan.id === activePlanId && currentSubscription?.status !== 'CANCELLED',
                   'btn-processing': processingId === plan.id,
                   'btn-disabled': plan.price <= 0,
                 }"
@@ -119,8 +123,8 @@
 <script setup lang="uts">
   import { ref, computed } from "vue";
   import { useI18n } from "@/utils/i18n";
-  import { apiGetAgentSubscriptionPlanList } from "@/subpackages/servers/subscription";
-  import { SystemSubscriptionPlan } from "@/subpackages/types/interfaces/subscription";
+  import { apiGetAgentSubscriptionPlanList, apiGetMySubscription } from "@/subpackages/servers/subscription";
+  import { SystemSubscriptionPlan, MySubscriptionItem } from "@/subpackages/types/interfaces/subscription";
   import { formatNumber } from "@/utils/system";
   import {
     getPeriodUnit,
@@ -155,18 +159,62 @@
   const loading = ref(false);
   const plans = ref<SystemSubscriptionPlan[]>([]);
   const processingId = ref<number | null>(null);
+  const currentSubscription = ref<MySubscriptionItem | null>(null);
+
+  /**
+   * 动态计算生效中的 planId
+   */
+  const activePlanId = computed((): number | null => {
+    if (currentSubscription.value != null) {
+      return currentSubscription.value!.planId;
+    }
+    return props.currentPlanId;
+  });
+
+  /**
+   * 动态计算生效中的 plan 价格，便于判断升级关系
+   */
+  const activePlanPrice = computed((): number | null => {
+    if (currentSubscription.value != null && currentSubscription.value!.plan != null) {
+      return currentSubscription.value!.plan.price;
+    }
+    return props.currentPlanPrice;
+  });
+
+  /**
+   * 获取订阅状态文本
+   */
+  const getSubscriptionStatusText = (status: string): string => {
+    if (status === "ACTIVE") {
+      return t("Mobile.MySubscriptions.stateActive");
+    }
+    if (status === "EXPIRED") {
+      return t("Mobile.MySubscriptions.stateExpired");
+    }
+    if (status === "CANCELLED") {
+      return t("Mobile.MySubscriptions.stateCancelled");
+    }
+    return "";
+  };
 
   /**
    * 计算操作按钮的文本
    */
   const getActionText = (plan: SystemSubscriptionPlan): string => {
-    if (plan.id === props.currentPlanId) {
+    const curPlanId = activePlanId.value;
+    if (plan.id === curPlanId) {
+      if (currentSubscription.value != null) {
+        const status = currentSubscription.value!.status;
+        if (status === "CANCELLED") {
+          return t("Mobile.MySubscriptions.subscribeNow");
+        }
+      }
       return t("Mobile.MySubscriptions.renewNow");
     }
-    if (props.currentPlanId == null) {
+    if (curPlanId == null) {
       return t("Mobile.MySubscriptions.subscribeNow");
     }
-    const currentPrice = props.currentPlanPrice ?? 0;
+    const currentPrice = activePlanPrice.value ?? 0;
     if (plan.price <= currentPrice) {
       return t("Mobile.MySubscriptions.subscribeNow");
     }
@@ -174,12 +222,24 @@
   };
 
   /**
-   * 加载智能体订阅套餐列表
+   * 加载智能体订阅及套餐列表
    */
   const fetchPlans = async () => {
     if (props.agentId <= 0) return;
     loading.value = true;
     try {
+      // 1. 获取当前智能体订阅情况
+      const subRes = await apiGetMySubscription({
+        bizId: props.agentId.toString(),
+        bizType: "AGENT",
+      });
+      if (subRes.code === SUCCESS_CODE && subRes.data != null) {
+        currentSubscription.value = subRes.data!.currentSubscription;
+      } else {
+        currentSubscription.value = null;
+      }
+
+      // 2. 获取套餐列表
       const res = await apiGetAgentSubscriptionPlanList({
         agentId: props.agentId,
         status: 1,
@@ -188,7 +248,7 @@
         plans.value = res.data!;
       }
     } catch (e) {
-      console.error("[AgentSubscriptionModal] 加载套餐失败:", e);
+      console.error("[AgentSubscriptionModal] 加载数据失败:", e);
     } finally {
       loading.value = false;
     }
@@ -236,7 +296,7 @@
 
 <style lang="scss" scoped>
   .agent-sub-container {
-    border-radius: 12px;
+    border-radius: 24rpx;
     display: flex;
     flex-direction: column;
     max-height: 70vh;
@@ -248,17 +308,17 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 30px 0;
+    padding: 60rpx 0;
 
     .loading-icon,
     .empty-icon {
-      font-size: 28px;
-      margin-bottom: 8px;
+      font-size: 56rpx;
+      margin-bottom: 16rpx;
     }
 
     .loading-text,
     .empty-text {
-      font-size: 13px;
+      font-size: 26rpx;
       color: #999;
     }
   }
@@ -271,44 +331,68 @@
   .plans-list {
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    padding: 2px;
+    gap: 24rpx;
+    padding: 4rpx;
   }
 
   .plan-card {
     position: relative;
     background-color: #ffffff;
-    border: 1px solid #eaeaea;
-    border-radius: 12px;
-    padding: 12px;
+    border: 2rpx solid #eaeaea;
+    border-radius: 24rpx;
+    padding: 24rpx;
     display: flex;
     flex-direction: column;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+    box-shadow: 0 8rpx 24rpx rgba(0, 0, 0, 0.03);
     transition: all 0.25s ease;
 
     &.plan-current {
       border-color: #007aff;
       background-color: #f7faff;
-      box-shadow: 0 4px 16px rgba(0, 122, 255, 0.08);
+      box-shadow: 0 8rpx 32rpx rgba(0, 122, 255, 0.08);
+    }
+
+    &.plan-expired {
+      border-color: #86909c;
+      background-color: #f2f3f5;
+      box-shadow: 0 8rpx 32rpx rgba(134, 144, 156, 0.08);
+    }
+
+    &.plan-cancelled {
+      border-color: #f53f3f;
+      background-color: #fff7f7;
+      box-shadow: 0 8rpx 32rpx rgba(245, 63, 63, 0.08);
     }
   }
 
   .card-badge-row {
     position: absolute;
-    top: 0;
-    right: 12px;
-    transform: translateY(-50%);
+    top: -2rpx;
+    right: -2rpx;
+    z-index: 10;
     display: flex;
     flex-direction: row;
-    gap: 6px;
 
     .badge {
-      padding: 3px 6px;
-      border-radius: 4px;
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+      height: 48rpx;
+      padding: 0 24rpx;
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      justify-content: center;
+      border-radius: 0 24rpx 0 32rpx;
+      box-shadow: 0 4rpx 12rpx rgba(0, 0, 0, 0.05);
 
       &-active {
         background: linear-gradient(135deg, #007aff, #0056b3);
+      }
+
+      &-expired {
+        background: linear-gradient(135deg, #86909c, #4e5969);
+      }
+
+      &-cancelled {
+        background: linear-gradient(135deg, #f53f3f, #b71c1c);
       }
 
       &-hot {
@@ -316,32 +400,34 @@
       }
 
       .badge-text {
-        font-size: 9px;
+        font-size: 20rpx;
         color: #ffffff;
         font-weight: bold;
+        line-height: 1;
       }
     }
   }
 
   .card-main {
     flex: 1;
-    margin-bottom: 12px;
+    margin-bottom: 24rpx;
   }
 
   .plan-info-header {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    margin-bottom: 8px;
+    gap: 8rpx;
+    margin-bottom: 16rpx;
+    padding-right: 120rpx;
 
     .plan-name {
-      font-size: 16px;
+      font-size: 32rpx;
       color: #333333;
       font-weight: bold;
     }
 
     .plan-desc {
-      font-size: 11px;
+      font-size: 22rpx;
       color: #777777;
       line-height: 1.4;
     }
@@ -351,45 +437,45 @@
     display: flex;
     flex-direction: row;
     align-items: baseline;
-    margin-bottom: 12px;
+    margin-bottom: 24rpx;
 
     .price-symbol {
-      font-size: 14px;
+      font-size: 28rpx;
       color: #ff3b30;
       font-weight: bold;
-      margin-right: 2px;
+      margin-right: 4rpx;
     }
 
     .price-value {
-      font-size: 24px;
+      font-size: 48rpx;
       color: #ff3b30;
       font-weight: 800;
     }
 
     .price-period {
-      font-size: 13px;
+      font-size: 26rpx;
       color: #888888;
-      margin-left: 4px;
+      margin-left: 8rpx;
     }
   }
 
   .plan-limits {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 12rpx;
     background-color: #f9f9f9;
-    border-radius: 8px;
-    padding: 8px 10px;
+    border-radius: 16rpx;
+    padding: 16rpx 20rpx;
 
     .limit-item {
       display: flex;
       flex-direction: row;
       align-items: center;
-      font-size: 12px;
+      font-size: 24rpx;
 
       .limit-bullet {
         color: #007aff;
-        margin-right: 6px;
+        margin-right: 12rpx;
         font-weight: bold;
       }
 
@@ -400,10 +486,6 @@
       .limit-val {
         color: #333333;
         font-weight: 600;
-
-        &.highlight-val {
-          color: #ff9500;
-        }
       }
     }
   }
@@ -413,13 +495,13 @@
 
     .action-btn {
       width: 100%;
-      height: 38px;
+      height: 76rpx;
       background: linear-gradient(135deg, #007aff, #0056b3);
-      border-radius: 19px;
+      border-radius: 38rpx;
       display: flex;
       align-items: center;
       justify-content: center;
-      box-shadow: 0 4px 10px rgba(0, 122, 255, 0.15);
+      box-shadow: 0 8rpx 20rpx rgba(0, 122, 255, 0.15);
       transition: all 0.2s ease;
 
       &:active {
@@ -429,7 +511,7 @@
 
       &.btn-current {
         background: linear-gradient(135deg, #34c759, #28cd41);
-        box-shadow: 0 4px 10px rgba(52, 199, 89, 0.15);
+        box-shadow: 0 8rpx 20rpx rgba(52, 199, 89, 0.15);
       }
 
       &.btn-processing {
@@ -442,7 +524,7 @@
       }
 
       .btn-text {
-        font-size: 14px;
+        font-size: 28rpx;
         color: #ffffff;
         font-weight: bold;
       }

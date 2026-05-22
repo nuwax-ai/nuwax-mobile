@@ -1,0 +1,221 @@
+import { ref, onMounted } from "vue";
+import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import {
+  apiCreateSubscriptionOrder,
+  apiCreateCreditOrder,
+  apiGetOrderCashier,
+} from "@/subpackages/servers/subscription";
+import { useI18n } from "@/utils/i18n";
+
+// 全局单例锁：记录已展示过 Toast 的 订单ID + 支付结果 映射，防止多组件重复提示
+const alertedKeys = new Set<string>();
+
+export function useSubscriptionPurchase() {
+  const { t } = useI18n();
+  const processingId = ref<number | null>(null);
+  const loading = ref<boolean>(false);
+
+  // #ifdef H5 || WEB
+  const cleanUrlParams = () => {
+    // 清空 window.location.search 中的参数
+    const search = window.location.search;
+    if (search !== "") {
+      const params = new URLSearchParams(search);
+      if (params.has("payResult") || params.has("orderId")) {
+        params.delete("payResult");
+        params.delete("orderId");
+        const searchStr = params.toString();
+        const newSearch = searchStr ? `?${searchStr}` : "";
+        const newUrl =
+          window.location.pathname + newSearch + window.location.hash;
+        window.history.replaceState(null, "", newUrl);
+      }
+    }
+
+    // 清空 window.location.hash 中的参数
+    const hash = window.location.hash;
+    const qIndex = hash.indexOf("?");
+    if (qIndex !== -1) {
+      const pathPart = hash.substring(0, qIndex);
+      const hashSearch = hash.substring(qIndex);
+      const params = new URLSearchParams(hashSearch);
+      if (params.has("payResult") || params.has("orderId")) {
+        params.delete("payResult");
+        params.delete("orderId");
+        const searchStr = params.toString();
+        const newHash = pathPart + (searchStr ? `?${searchStr}` : "");
+        const newUrl =
+          window.location.pathname + window.location.search + newHash;
+        window.history.replaceState(null, "", newUrl);
+      }
+    }
+  };
+
+  const checkPayResult = () => {
+    const hash = window.location.hash;
+    const search = window.location.search;
+
+    let payResult = "";
+    let orderId = "";
+
+    // 优先从 main search 中解析
+    if (search !== "") {
+      const searchParams = new URLSearchParams(search);
+      payResult = searchParams.get("payResult") || "";
+      orderId = searchParams.get("orderId") || "";
+    }
+
+    // 若无，从 hash search 中解析
+    if (payResult === "") {
+      const qIndex = hash.indexOf("?");
+      if (qIndex !== -1) {
+        const hashSearch = hash.substring(qIndex);
+        const hashParams = new URLSearchParams(hashSearch);
+        payResult = hashParams.get("payResult") || "";
+        orderId = hashParams.get("orderId") || "";
+      }
+    }
+
+    if (payResult !== "") {
+      const alertKey = `${orderId}_${payResult}`;
+      if (alertedKeys.has(alertKey)) return;
+      alertedKeys.add(alertKey);
+
+      if (payResult === "success") {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.paySuccess"),
+          icon: "success",
+        });
+      } else if (payResult === "failed") {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.payFailed"),
+          icon: "none",
+        });
+      } else if (payResult === "pending") {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.payPending"),
+          icon: "none",
+        });
+      }
+
+      // 清除 URL 参数
+      cleanUrlParams();
+    }
+  };
+  // #endif
+
+  onMounted(() => {
+    // #ifdef H5 || WEB
+    checkPayResult();
+    // #endif
+  });
+
+  const getCashierUrlAndRedirect = async (orderId: number) => {
+    loading.value = true;
+    try {
+      let settlementUrl = "";
+      // #ifdef H5 || WEB
+      const token = (uni.getStorageSync(ACCESS_TOKEN) as string) || "";
+      let settlementOrigin = "";
+      const hostname = window.location.hostname;
+      if (hostname === "localhost" || hostname === "127.0.0.1") {
+        settlementOrigin = "http://localhost:3000";
+        settlementUrl = `${settlementOrigin}/static/payment-settlement.html?orderId=${orderId}&returnUrl=${encodeURIComponent(window.location.href)}&token=${encodeURIComponent(token)}`;
+      } else {
+        settlementOrigin = window.location.origin;
+        settlementUrl = `${settlementOrigin}/static/payment-settlement.html?orderId=${orderId}&returnUrl=${encodeURIComponent(window.location.href)}`;
+      }
+      // #endif
+
+      // 获取收银台地址
+      const cashierRes = await apiGetOrderCashier(
+        orderId,
+        settlementUrl !== "" ? settlementUrl : undefined,
+      );
+      if (cashierRes.code === SUCCESS_CODE && cashierRes.data != null) {
+        const cashierInfo = cashierRes.data!;
+
+        // #ifdef H5 || WEB
+        // H5 环境直接重定向跳转到收银台
+        window.location.href = cashierInfo.cashierUrl;
+        // #endif
+
+        // #ifndef H5 || WEB
+        // 非 H5 环境（如 App 或 小程序）则打开内嵌 WebView 进行支付
+        uni.navigateTo({
+          url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(cashierInfo.cashierUrl)}`,
+        });
+        // #endif
+      } else {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.orderIdNotFound"),
+          icon: "none",
+        });
+      }
+    } catch (e) {
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.loadFailed"),
+        icon: "none",
+      });
+    } finally {
+      loading.value = false;
+      processingId.value = null;
+    }
+  };
+
+  const handlePaySubscription = async (planId: number) => {
+    if (processingId.value != null) return;
+    processingId.value = planId;
+    try {
+      const orderRes = await apiCreateSubscriptionOrder(planId);
+      if (orderRes.code === SUCCESS_CODE && orderRes.data) {
+        const orderId = orderRes.data.id ?? orderRes.data;
+        await getCashierUrlAndRedirect(orderId as number);
+      } else {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.orderIdNotFound"),
+          icon: "none",
+        });
+        processingId.value = null;
+      }
+    } catch (e) {
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.loadFailed"),
+        icon: "none",
+      });
+      processingId.value = null;
+    }
+  };
+
+  const handlePayCredits = async (packageId: number) => {
+    if (processingId.value != null) return;
+    processingId.value = packageId;
+    try {
+      const orderRes = await apiCreateCreditOrder(packageId);
+      if (orderRes.code === SUCCESS_CODE && orderRes.data) {
+        const orderId = orderRes.data.id ?? orderRes.data;
+        await getCashierUrlAndRedirect(orderId as number);
+      } else {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.orderIdNotFound"),
+          icon: "none",
+        });
+        processingId.value = null;
+      }
+    } catch (e) {
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.loadFailed"),
+        icon: "none",
+      });
+      processingId.value = null;
+    }
+  };
+
+  return {
+    processingId,
+    loading,
+    handlePaySubscription,
+    handlePayCredits,
+  };
+}

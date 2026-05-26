@@ -5,10 +5,14 @@ import {
   apiCreateSubscriptionOrder,
   apiCreateCreditOrder,
   apiGetOrderCashier,
+  apiPayMinipay,
+  apiGetSettlementStatus,
 } from "@/subpackages/servers/subscription";
 import { useI18n } from "@/utils/i18n";
 import { API_BASE_URL } from "@/constants/config";
 import { objectToQueryString } from "@/utils/common";
+import { PayMode, PayChannel, PayStatus, OrderStatus } from "@/subpackages/types/interfaces/subscription";
+import type { WxPayParams } from "@/subpackages/types/interfaces/subscription";
 
 // 全局单例锁：记录已展示过 Toast 的 订单ID + 支付结果 映射，防止多组件重复提示
 const alertedKeys = new Set<string>();
@@ -113,6 +117,150 @@ export function useSubscriptionPurchase() {
     // #endif
   });
 
+  // #ifdef MP-WEIXIN
+  /** 获取微信登录码，每次支付前调用一次 */
+  const getWxLoginCode = (): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      uni.login({
+        provider: "weixin",
+        success: (res) => {
+          resolve(res.code);
+        },
+        fail: (err) => {
+          reject(err);
+        },
+      });
+    });
+  };
+
+  /** 调起微信支付面板，返回是否支付成功 */
+  const requestWxPayment = (params: WxPayParams): Promise<boolean> => {
+    return new Promise((resolve) => {
+      uni.requestPayment({
+        provider: "wxpay",
+        timeStamp: params.timeStamp,
+        nonceStr: params.nonceStr,
+        package: params.packageValue,
+        signType: params.signType || "RSA",
+        paySign: params.paySign,
+        success: () => {
+          resolve(true);
+        },
+        fail: (err) => {
+          if (err.errCode === 700601 || err.errMsg?.includes("cancel")) {
+            uni.showToast({
+              title: t("Mobile.MySubscriptions.payCancelled"),
+              icon: "none",
+            });
+          } else {
+            uni.showToast({
+              title: t("Mobile.MySubscriptions.payFailed"),
+              icon: "none",
+            });
+            console.error("WeChat payment failed:", err);
+          }
+          resolve(false);
+        },
+      });
+    });
+  };
+
+  /** 轮询结算状态，最多 10 次，间隔 2 秒 */
+  const pollPayResult = async (orderId: number): Promise<string> => {
+    const maxAttempts = 10;
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      try {
+        const res = await apiGetSettlementStatus({ orderId });
+        if (res.code === SUCCESS_CODE && res.data != null) {
+          const data = res.data!;
+          if (
+            data.settled ||
+            data.orderStatus === OrderStatus.PAID ||
+            data.payStatus === PayStatus.SUCCESS
+          ) {
+            return "success";
+          }
+          if (data.terminalFailed || data.orderStatus === OrderStatus.CANCELLED) {
+            return "failed";
+          }
+        }
+      } catch (e) {
+        // 网络异常忽略，继续重试
+      }
+    }
+    return "pending";
+  };
+
+  /** 小程序支付主流程：获取登录码 → 请求支付参数 → 拉起支付 → 轮询结果 */
+  const executeMinipay = async (orderId: number) => {
+    try {
+      // 1. 获取微信登录码
+      const wxLoginCode = await getWxLoginCode();
+
+      // 2. 请求支付参数
+      const minipayRes = await apiPayMinipay({
+        orderId,
+        payChannel: PayChannel.WxPay,
+        wxLoginCode,
+      });
+      if (
+        minipayRes.code !== SUCCESS_CODE ||
+        minipayRes.data == null ||
+        minipayRes.data!.wxPayParams == null
+      ) {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.payParamsFailed"),
+          icon: "none",
+        });
+        return;
+      }
+
+      const wxPayParams = minipayRes.data!.wxPayParams!;
+
+      // 3. 调起微信支付
+      const paySuccess = await requestWxPayment(wxPayParams);
+      if (!paySuccess) {
+        return;
+      }
+
+      // 4. 轮询支付结果
+      uni.showLoading({
+        title: t("Mobile.MySubscriptions.payPending"),
+        mask: true,
+      });
+      const result = await pollPayResult(orderId);
+      uni.hideLoading();
+
+      if (result === "success") {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.paySuccess"),
+          icon: "success",
+        });
+        uni.$emit("paymentCompleted");
+      } else if (result === "failed") {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.payFailed"),
+          icon: "none",
+        });
+      } else {
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.payPollTimeout"),
+          icon: "none",
+        });
+      }
+    } catch (e) {
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.payFailed"),
+        icon: "none",
+      });
+      console.error("Mini-program payment error:", e);
+    } finally {
+      processingId.value = null;
+    }
+  };
+  // #endif
+
   const getCashierUrlAndRedirect = async (orderId: number) => {
     loading.value = true;
     try {
@@ -188,10 +336,22 @@ export function useSubscriptionPurchase() {
     if (processingId.value != null) return;
     processingId.value = planId;
     try {
-      const orderRes = await apiCreateSubscriptionOrder(planId);
+      let payMode = PayMode.scan;
+      // #ifdef MP-WEIXIN
+      payMode = PayMode.minipay;
+      // #endif
+
+      const orderRes = await apiCreateSubscriptionOrder({ planId, payMode });
       if (orderRes.code === SUCCESS_CODE && orderRes.data) {
         const orderId = orderRes.data.id ?? orderRes.data;
+
+        // #ifdef MP-WEIXIN
+        await executeMinipay(orderId as number);
+        // #endif
+
+        // #ifndef MP-WEIXIN
         await getCashierUrlAndRedirect(orderId as number);
+        // #endif
       } else {
         uni.showToast({
           title: t("Mobile.MySubscriptions.orderIdNotFound"),
@@ -212,10 +372,22 @@ export function useSubscriptionPurchase() {
     if (processingId.value != null) return;
     processingId.value = packageId;
     try {
-      const orderRes = await apiCreateCreditOrder(packageId);
+      let payMode = PayMode.scan;
+      // #ifdef MP-WEIXIN
+      payMode = PayMode.minipay;
+      // #endif
+
+      const orderRes = await apiCreateCreditOrder({ packageId, payMode });
       if (orderRes.code === SUCCESS_CODE && orderRes.data) {
         const orderId = orderRes.data.id ?? orderRes.data;
+
+        // #ifdef MP-WEIXIN
+        await executeMinipay(orderId as number);
+        // #endif
+
+        // #ifndef MP-WEIXIN
         await getCashierUrlAndRedirect(orderId as number);
+        // #endif
       } else {
         uni.showToast({
           title: t("Mobile.MySubscriptions.orderIdNotFound"),

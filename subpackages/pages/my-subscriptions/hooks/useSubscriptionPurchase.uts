@@ -6,13 +6,29 @@ import {
   apiCreateCreditOrder,
   apiGetOrderCashier,
   apiPayMinipay,
-  apiGetSettlementStatus,
+  apiGetWechatOaOauthUrl,
+  apiPayWechatJsapi,
+  apiPayH5Web,
 } from "@/subpackages/servers/subscription";
 import { useI18n } from "@/utils/i18n";
-import { API_BASE_URL } from "@/constants/config";
-import { objectToQueryString } from "@/utils/common";
-import { PayMode, PayChannel, PayStatus, OrderStatus } from "@/subpackages/types/interfaces/subscription";
-import type { WxPayParams } from "@/subpackages/types/interfaces/subscription";
+import { PayChannel } from "@/subpackages/types/interfaces/subscription";
+import {
+  // #ifdef H5 || WEB
+  cleanUrlParams,
+  parsePayResultFromUrl,
+  detectClientEnv,
+  cleanWechatOaParams,
+  invokeJsapi,
+  // #endif
+  // #ifdef MP-WEIXIN
+  getWxLoginCode,
+  requestWxPayment,
+  // #endif
+  pollPayResult,
+  handlePayResultToast,
+  handleCreateAndPay,
+  getPayMode,
+} from "@/subpackages/utils/paymentUtils";
 
 // 全局单例锁：记录已展示过 Toast 的 订单ID + 支付结果 映射，防止多组件重复提示
 const alertedKeys = new Set<string>();
@@ -21,21 +37,119 @@ interface UseSubscriptionPurchaseOptions {
   onSuccess?: () => void;
 }
 
-export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions = {}) {
+export function useSubscriptionPurchase(
+  options: UseSubscriptionPurchaseOptions = {},
+) {
   const { onSuccess } = options;
   const { t } = useI18n();
   const processingId = ref<number | null>(null);
   const loading = ref<boolean>(false);
 
+  // ========== H5 / WEB ==========
   // #ifdef H5 || WEB
-  const cleanUrlParams = () => {
-    // 清空 window.location.search 中的参数
+  const checkPayResult = () => {
+    const { payResult, orderId } = parsePayResultFromUrl();
+    if (payResult !== "") {
+      const alertKey = `${orderId}_${payResult}`;
+      if (alertedKeys.has(alertKey)) return;
+      alertedKeys.add(alertKey);
+
+      handlePayResultToast(payResult, t, onSuccess);
+      cleanUrlParams();
+    }
+  };
+
+  const checkWechatOaPayCallback = async () => {
+    // 从 URL 中解析 code 和 state (orderId)
+    const search = window.location.search;
+    const hash = window.location.hash;
+    let code = "";
+    let state = "";
+
+    // 优先从 main search 中解析
+    if (search !== "") {
+      const searchParams = new URLSearchParams(search);
+      code = searchParams.get("code") || "";
+      state = searchParams.get("state") || "";
+    }
+
+    // 若无，从 hash search 中解析
+    if (code === "") {
+      const qIndex = hash.indexOf("?");
+      if (qIndex !== -1) {
+        const hashSearch = hash.substring(qIndex);
+        const hashParams = new URLSearchParams(hashSearch);
+        code = hashParams.get("code") || "";
+        state = hashParams.get("state") || "";
+      }
+    }
+
+    if (code !== "" && state !== "") {
+      const orderId = parseInt(state);
+      if (isNaN(orderId)) return;
+
+      const lockKey = `wx_pay_lock_${orderId}_${code}`;
+      if (uni.getStorageSync(lockKey) === "1") return;
+      uni.setStorageSync(lockKey, "1");
+
+      // 清除 URL 中的 wechat code 和 state 参数（避免刷新重复发起支付）
+      cleanWechatOaParams();
+
+      processingId.value = orderId;
+      uni.showLoading({
+        title: t("Mobile.MySubscriptions.payPending"),
+        mask: true,
+      });
+
+      try {
+        const payParamsRes = await apiPayWechatJsapi({
+          wxOAuthCode: code,
+          orderId: orderId,
+        });
+
+        if (payParamsRes.code === SUCCESS_CODE && payParamsRes.data != null) {
+          const wxPayParams = payParamsRes.data!;
+          uni.hideLoading();
+
+          // 调起微信 JSAPI 支付
+          await invokeJsapi(wxPayParams);
+
+          uni.showLoading({
+            title: t("Mobile.MySubscriptions.payPending"),
+            mask: true,
+          });
+
+          // 轮询结果
+          const result = await pollPayResult(orderId);
+          uni.hideLoading();
+          handlePayResultToast(result, t, onSuccess);
+          processingId.value = null;
+        } else {
+          uni.hideLoading();
+          uni.showToast({
+            title:
+              payParamsRes.message || t("Mobile.MySubscriptions.payFailed"),
+            icon: "none",
+          });
+          processingId.value = null;
+        }
+      } catch (e) {
+        uni.hideLoading();
+        uni.showToast({
+          title: t("Mobile.MySubscriptions.payFailed"),
+          icon: "none",
+        });
+        processingId.value = null;
+      }
+    }
+  };
+
+  const cleanH5Params = () => {
     const search = window.location.search;
     if (search !== "") {
       const params = new URLSearchParams(search);
-      if (params.has("payResult") || params.has("orderId")) {
-        params.delete("payResult");
-        params.delete("orderId");
+      if (params.has("h5OrderId")) {
+        params.delete("h5OrderId");
         const searchStr = params.toString();
         const newSearch = searchStr ? `?${searchStr}` : "";
         const newUrl =
@@ -44,16 +158,14 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
       }
     }
 
-    // 清空 window.location.hash 中的参数
     const hash = window.location.hash;
     const qIndex = hash.indexOf("?");
     if (qIndex !== -1) {
       const pathPart = hash.substring(0, qIndex);
       const hashSearch = hash.substring(qIndex);
       const params = new URLSearchParams(hashSearch);
-      if (params.has("payResult") || params.has("orderId")) {
-        params.delete("payResult");
-        params.delete("orderId");
+      if (params.has("h5OrderId")) {
+        params.delete("h5OrderId");
         const searchStr = params.toString();
         const newHash = pathPart + (searchStr ? `?${searchStr}` : "");
         const newUrl =
@@ -63,141 +175,66 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
     }
   };
 
-  const checkPayResult = () => {
-    const hash = window.location.hash;
+  const checkH5PayCallback = async () => {
     const search = window.location.search;
+    const hash = window.location.hash;
+    let h5OrderIdStr = "";
 
-    let payResult = "";
-    let orderId = "";
-
-    // 优先从 main search 中解析
     if (search !== "") {
       const searchParams = new URLSearchParams(search);
-      payResult = searchParams.get("payResult") || "";
-      orderId = searchParams.get("orderId") || "";
+      h5OrderIdStr = searchParams.get("h5OrderId") || "";
     }
 
-    // 若无，从 hash search 中解析
-    if (payResult === "") {
+    if (h5OrderIdStr === "") {
       const qIndex = hash.indexOf("?");
       if (qIndex !== -1) {
         const hashSearch = hash.substring(qIndex);
         const hashParams = new URLSearchParams(hashSearch);
-        payResult = hashParams.get("payResult") || "";
-        orderId = hashParams.get("orderId") || "";
+        h5OrderIdStr = hashParams.get("h5OrderId") || "";
       }
     }
 
-    if (payResult !== "") {
-      const alertKey = `${orderId}_${payResult}`;
-      if (alertedKeys.has(alertKey)) return;
-      alertedKeys.add(alertKey);
+    if (h5OrderIdStr !== "") {
+      const orderId = parseInt(h5OrderIdStr);
+      if (isNaN(orderId)) return;
 
-      if (payResult === "success") {
-        uni.showToast({
-          title: t("Mobile.MySubscriptions.paySuccess"),
-          icon: "success",
-        });
-        onSuccess?.();
-      } else if (payResult === "failed") {
+      const lockKey = `h5_pay_lock_${orderId}`;
+      if (uni.getStorageSync(lockKey) === "1") return;
+      uni.setStorageSync(lockKey, "1");
+
+      cleanH5Params();
+
+      processingId.value = orderId;
+      uni.showLoading({
+        title: t("Mobile.MySubscriptions.payPending"),
+        mask: true,
+      });
+
+      try {
+        const result = await pollPayResult(orderId);
+        uni.hideLoading();
+        handlePayResultToast(result, t, onSuccess);
+        processingId.value = null;
+      } catch (e) {
+        uni.hideLoading();
         uni.showToast({
           title: t("Mobile.MySubscriptions.payFailed"),
           icon: "none",
         });
-      } else if (payResult === "pending") {
-        uni.showToast({
-          title: t("Mobile.MySubscriptions.payPending"),
-          icon: "none",
-        });
+        processingId.value = null;
       }
-
-      // 清除 URL 参数
-      cleanUrlParams();
     }
   };
-  // #endif
 
   onMounted(() => {
-    // #ifdef H5 || WEB
     checkPayResult();
-    // #endif
+    checkWechatOaPayCallback();
+    checkH5PayCallback();
   });
+  // #endif
 
+  // ========== MP-WEIXIN ==========
   // #ifdef MP-WEIXIN
-  /** 获取微信登录码，每次支付前调用一次 */
-  const getWxLoginCode = (): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      uni.login({
-        provider: "weixin",
-        success: (res) => {
-          resolve(res.code);
-        },
-        fail: (err) => {
-          reject(err);
-        },
-      });
-    });
-  };
-
-  /** 调起微信支付面板，返回是否支付成功 */
-  const requestWxPayment = (params: WxPayParams): Promise<boolean> => {
-    return new Promise((resolve) => {
-      uni.requestPayment({
-        provider: "wxpay",
-        timeStamp: params.timeStamp,
-        nonceStr: params.nonceStr,
-        package: params.packageValue,
-        signType: params.signType || "RSA",
-        paySign: params.paySign,
-        success: () => {
-          resolve(true);
-        },
-        fail: (err) => {
-          if (err.errCode === 700601 || err.errMsg?.includes("cancel")) {
-            uni.showToast({
-              title: t("Mobile.MySubscriptions.payCancelled"),
-              icon: "none",
-            });
-          } else {
-            uni.showToast({
-              title: t("Mobile.MySubscriptions.payFailed"),
-              icon: "none",
-            });
-            console.error("WeChat payment failed:", err);
-          }
-          resolve(false);
-        },
-      });
-    });
-  };
-
-  /** 轮询结算状态，最多 10 次，间隔 2 秒 */
-  const pollPayResult = async (orderId: number): Promise<string> => {
-    const maxAttempts = 10;
-    for (let i = 0; i < maxAttempts; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      try {
-        const res = await apiGetSettlementStatus({ orderId });
-        if (res.code === SUCCESS_CODE && res.data != null) {
-          const data = res.data!;
-          if (
-            data.settled ||
-            data.orderStatus === OrderStatus.PAID ||
-            data.payStatus === PayStatus.SUCCESS
-          ) {
-            return "success";
-          }
-          if (data.terminalFailed || data.orderStatus === OrderStatus.CANCELLED) {
-            return "failed";
-          }
-        }
-      } catch (e) {
-        // 网络异常忽略，继续重试
-      }
-    }
-    return "pending";
-  };
-
   /** 小程序支付主流程：获取登录码 → 请求支付参数 → 拉起支付 → 轮询结果 */
   const executeMinipay = async (orderId: number) => {
     try {
@@ -228,7 +265,7 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
 
       // 3. 关闭加载，调起微信支付
       uni.hideLoading();
-      const paySuccess = await requestWxPayment(wxPayParams);
+      const paySuccess = await requestWxPayment(wxPayParams, t);
       if (!paySuccess) {
         processingId.value = null;
         return;
@@ -241,24 +278,7 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
       });
       const result = await pollPayResult(orderId);
       uni.hideLoading();
-
-      if (result === "success") {
-        uni.showToast({
-          title: t("Mobile.MySubscriptions.paySuccess"),
-          icon: "success",
-        });
-        onSuccess?.();
-      } else if (result === "failed") {
-        uni.showToast({
-          title: t("Mobile.MySubscriptions.payFailed"),
-          icon: "none",
-        });
-      } else {
-        uni.showToast({
-          title: t("Mobile.MySubscriptions.payPollTimeout"),
-          icon: "none",
-        });
-      }
+      handlePayResultToast(result, t, onSuccess);
     } catch (e) {
       uni.hideLoading();
       uni.showToast({
@@ -272,11 +292,13 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
   };
   // #endif
 
-  const getCashierUrlAndRedirect = async (orderId: number) => {
+  // ========== H5 / WEB 支付 ==========
+  // #ifdef H5 || WEB
+  /** 扫码支付（旧版）：构建结算 URL → 获取收银台地址 → 重定向 */
+  const executeScanPay = async (orderId: number) => {
     loading.value = true;
     try {
       let settlementUrl = "";
-      // #ifdef H5 || WEB
       const token = (uni.getStorageSync(ACCESS_TOKEN) as string) || "";
       let settlementOrigin = "";
       const hostname = window.location.hostname;
@@ -287,25 +309,6 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
         settlementOrigin = window.location.origin;
         settlementUrl = `${settlementOrigin}/static/payment-settlement.html?orderId=${orderId}&returnUrl=${encodeURIComponent(window.location.href)}`;
       }
-      // #endif
-
-      // #ifndef H5 || WEB
-      const token = (uni.getStorageSync(ACCESS_TOKEN) as string) || "";
-      const pages = getCurrentPages();
-      let relativePath = "";
-      if (pages.length > 0) {
-        const currentPage = pages[pages.length - 1];
-        const path = currentPage.route;
-        const params = objectToQueryString(currentPage.options);
-        relativePath = params !== "" ? `${path}?${params}` : path;
-      }
-      let baseSettlementUrl = API_BASE_URL;
-      if (process.env.NODE_ENV === "development") {
-        baseSettlementUrl = "http://localhost:3000";
-      }
-      const h5CurrentPageUrl = `${baseSettlementUrl}/m/#/${relativePath}`;
-      settlementUrl = `${baseSettlementUrl}/static/payment-settlement.html?orderId=${orderId}&returnUrl=${encodeURIComponent(h5CurrentPageUrl)}&token=${encodeURIComponent(token)}&isMp=1`;
-      // #endif
 
       // 获取收银台地址
       const cashierRes = await apiGetOrderCashier(
@@ -315,18 +318,8 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
       if (cashierRes.code === SUCCESS_CODE && cashierRes.data != null) {
         const cashierInfo = cashierRes.data!;
         uni.hideLoading();
-
-        // #ifdef H5 || WEB
         // H5 环境直接重定向跳转到收银台
         window.location.href = cashierInfo.cashierUrl;
-        // #endif
-
-        // #ifndef H5 || WEB
-        // 非 H5 环境（如 App 或 小程序）则打开内嵌 WebView 进行支付
-        uni.navigateTo({
-          url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(cashierInfo.cashierUrl)}`,
-        });
-        // #endif
       } else {
         uni.hideLoading();
         uni.showToast({
@@ -347,91 +340,216 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
     }
   };
 
+  /** 微信浏览器支付 */
+  const executeWebWxPay = async (orderId: number) => {
+    loading.value = true;
+    try {
+      // 1. 获取当前页面地址作为回调地址，清理原有的 code 和 state 参数
+      const currentUrl = window.location.href;
+      const urlObj = new URL(currentUrl);
+      urlObj.searchParams.delete("code");
+      urlObj.searchParams.delete("state");
+      const redirectUri = urlObj.toString();
+
+      // 2. 调用后端接口获取授权 URL
+      const oauthRes = await apiGetWechatOaOauthUrl({
+        redirectUri,
+        state: String(orderId),
+      });
+
+      if (oauthRes.code === SUCCESS_CODE && oauthRes.data != null) {
+        const authorizeUrl = oauthRes.data.authorizeUrl;
+        uni.hideLoading();
+        // 3. 跳转到授权页面
+        window.location.href = authorizeUrl;
+      } else {
+        uni.hideLoading();
+        uni.showToast({
+          title: oauthRes.message || t("Mobile.MySubscriptions.payFailed"),
+          icon: "none",
+        });
+        processingId.value = null;
+      }
+    } catch (e) {
+      uni.hideLoading();
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.payFailed"),
+        icon: "none",
+      });
+      processingId.value = null;
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  /** 普通浏览器支付 → 走 H5 支付分支 */
+  const executeWebH5Pay = async (orderId: number) => {
+    const payChannel = "WxPay";
+
+    loading.value = true;
+    uni.showLoading({
+      title: t("Mobile.MySubscriptions.payPending"),
+      mask: true,
+    });
+
+    try {
+      const currentUrl = window.location.href;
+      let frontNotifyUrl = "";
+      const hashIndex = currentUrl.indexOf("#");
+      if (hashIndex !== -1) {
+        const baseUrlPart = currentUrl.substring(0, hashIndex);
+        const hashPart = currentUrl.substring(hashIndex);
+        const qIndex = hashPart.indexOf("?");
+        if (qIndex !== -1) {
+          frontNotifyUrl = baseUrlPart + hashPart + "&h5OrderId=" + orderId;
+        } else {
+          frontNotifyUrl = baseUrlPart + hashPart + "?h5OrderId=" + orderId;
+        }
+      } else {
+        const qIndex = currentUrl.indexOf("?");
+        if (qIndex !== -1) {
+          frontNotifyUrl = currentUrl + "&h5OrderId=" + orderId;
+        } else {
+          frontNotifyUrl = currentUrl + "?h5OrderId=" + orderId;
+        }
+      }
+
+      const payRes = await apiPayH5Web({
+        orderId,
+        payChannel,
+        frontNotifyUrl,
+      });
+
+      uni.hideLoading();
+
+      if (payRes.code === SUCCESS_CODE && payRes.data != null) {
+        const payData = payRes.data as Record<string, any>;
+        const invokeType = payData["invokeType"] as string;
+        const formHtml = payData["formHtml"] as string | null;
+        const redirectUrl = payData["redirectUrl"] as string | null;
+        const qrCodeContent = payData["qrCodeContent"] as string | null;
+
+        if (invokeType === "FORM_HTML") {
+          if (formHtml == null || formHtml === "") {
+            throw new Error("formHtml is empty");
+          }
+          const container = document.createElement("div");
+          container.style.display = "none";
+          container.innerHTML = formHtml;
+          document.body.appendChild(container);
+          const form = container.querySelector("form") as HTMLFormElement | null;
+          if (form != null) {
+            form.submit();
+          } else {
+            throw new Error("formHtml has no valid form");
+          }
+        } else if (invokeType === "REDIRECT_URL") {
+          if (redirectUrl == null || redirectUrl === "") {
+            throw new Error("redirectUrl is empty");
+          }
+          window.location.href = redirectUrl;
+        } else if (invokeType === "QRCODE_FALLBACK") {
+          uni.showToast({
+            title: t("Mobile.MySubscriptions.qrCodeUnsupported"),
+            icon: "none",
+          });
+          processingId.value = null;
+        } else {
+          throw new Error("unknown invokeType: " + invokeType);
+        }
+      } else {
+        uni.showToast({
+          title: payRes.message || t("Mobile.MySubscriptions.payFailed"),
+          icon: "none",
+        });
+        processingId.value = null;
+      }
+    } catch (e) {
+      uni.hideLoading();
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.payFailed"),
+        icon: "none",
+      });
+      processingId.value = null;
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  /** 根据浏览器环境分流，获取收银台地址并重定向 */
+  const getCashierUrlAndRedirect = async (orderId: number) => {
+    const clientEnv = detectClientEnv();
+    if (clientEnv.isWeChat) {
+      executeWebWxPay(orderId);
+    } else {
+      executeWebH5Pay(orderId);
+    }
+  };
+  // #endif
+
+  // ========== 对外暴露的支付方法 ==========
+
+  /** 订阅套餐支付 */
   const handlePaySubscription = async (planId: number) => {
-    if (processingId.value != null) return;
-    processingId.value = planId;
-    uni.showLoading({
-      title: t("Mobile.MySubscriptions.payPending"),
-      mask: true,
-    });
-    try {
-      let payMode = PayMode.scan;
-      // #ifdef MP-WEIXIN
-      payMode = PayMode.minipay;
-      // #endif
-
-      const orderRes = await apiCreateSubscriptionOrder({ planId, payMode });
-      if (orderRes.code === SUCCESS_CODE && orderRes.data) {
-        const orderId = orderRes.data.id ?? orderRes.data;
-
-        // #ifdef MP-WEIXIN
-        await executeMinipay(orderId as number);
-        // #endif
-
-        // #ifndef MP-WEIXIN
-        await getCashierUrlAndRedirect(orderId as number);
-        // #endif
-      } else {
-        uni.hideLoading();
-        uni.showToast({
-          title: t("Mobile.MySubscriptions.orderIdNotFound"),
-          icon: "none",
-        });
-        processingId.value = null;
-      }
-    } catch (e) {
-      uni.hideLoading();
-      uni.showToast({
-        title: t("Mobile.MySubscriptions.loadFailed"),
-        icon: "none",
-      });
-      processingId.value = null;
-    }
+    // #ifdef MP-WEIXIN
+    await handleCreateAndPay(
+      processingId,
+      planId,
+      async () =>
+        await apiCreateSubscriptionOrder({
+          planId,
+          payMode: getPayMode(),
+        }),
+      executeMinipay,
+      t,
+    );
+    // #endif
+    // #ifdef H5 || WEB
+    await handleCreateAndPay(
+      processingId,
+      planId,
+      async () =>
+        await apiCreateSubscriptionOrder({
+          planId,
+          payMode: getPayMode(),
+        }),
+      getCashierUrlAndRedirect,
+      t,
+    );
+    // #endif
   };
 
+  /** 积分套餐支付 */
   const handlePayCredits = async (packageId: number) => {
-    if (processingId.value != null) return;
-    processingId.value = packageId;
-    uni.showLoading({
-      title: t("Mobile.MySubscriptions.payPending"),
-      mask: true,
-    });
-    try {
-      let payMode = PayMode.scan;
-      // #ifdef MP-WEIXIN
-      payMode = PayMode.minipay;
-      // #endif
-
-      const orderRes = await apiCreateCreditOrder({ packageId, payMode });
-      if (orderRes.code === SUCCESS_CODE && orderRes.data) {
-        const orderId = orderRes.data.id ?? orderRes.data;
-
-        // #ifdef MP-WEIXIN
-        await executeMinipay(orderId as number);
-        // #endif
-
-        // #ifndef MP-WEIXIN
-        await getCashierUrlAndRedirect(orderId as number);
-        // #endif
-      } else {
-        uni.hideLoading();
-        uni.showToast({
-          title: t("Mobile.MySubscriptions.orderIdNotFound"),
-          icon: "none",
-        });
-        processingId.value = null;
-      }
-    } catch (e) {
-      uni.hideLoading();
-      uni.showToast({
-        title: t("Mobile.MySubscriptions.loadFailed"),
-        icon: "none",
-      });
-      processingId.value = null;
-    }
+    // #ifdef MP-WEIXIN
+    await handleCreateAndPay(
+      processingId,
+      packageId,
+      async () =>
+        await apiCreateCreditOrder({
+          packageId,
+          payMode: getPayMode(),
+        }),
+      executeMinipay,
+      t,
+    );
+    // #endif
+    // #ifdef H5 || WEB
+    await handleCreateAndPay(
+      processingId,
+      packageId,
+      async () =>
+        await apiCreateCreditOrder({
+          packageId,
+          payMode: getPayMode(),
+        }),
+      getCashierUrlAndRedirect,
+      t,
+    );
+    // #endif
   };
 
-  // 对已存在的未支付订单发起支付
+  /** 对已存在的未支付订单发起支付 */
   const handlePayExistingOrder = async (orderId: number) => {
     if (processingId.value != null) return;
     processingId.value = orderId;
@@ -443,8 +561,7 @@ export function useSubscriptionPurchase(options: UseSubscriptionPurchaseOptions 
       // #ifdef MP-WEIXIN
       await executeMinipay(orderId);
       // #endif
-
-      // #ifndef MP-WEIXIN
+      // #ifdef H5 || WEB
       await getCashierUrlAndRedirect(orderId);
       // #endif
     } catch (e) {

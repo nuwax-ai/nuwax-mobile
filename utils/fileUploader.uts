@@ -1,0 +1,160 @@
+/**
+ * 通用文件上传工具
+ * 从 chat-input-phone 提取的共享上传逻辑
+ * 供 MCP Ask 卡片等组件复用
+ */
+import { UPLOAD_FILE_ACTION } from '@/constants/common.constants'
+import { ACCESS_TOKEN } from '@/constants/home.constants'
+import { SUCCESS_CODE } from '@/constants/codes.constants'
+import { UploadFileInfo } from '@/types/interfaces/common.uts'
+import { UploadFileStatus } from '@/types/enums/common.uts'
+
+/** 上传结果 */
+export interface UploadResult {
+  success: boolean
+  file?: UploadFileInfo
+  error?: string
+}
+
+/**
+ * 生成文件唯一 ID
+ */
+export function generateFileUid(): string {
+  return Date.now().toString() + Math.random().toString(36).substr(2, 9)
+}
+
+/**
+ * 构建上传请求的 header（处理多平台 auth token）
+ */
+function buildUploadHeaders(): UTSJSONObject {
+  const token = uni.getStorageSync(ACCESS_TOKEN) ?? ''
+  const header = {} as UTSJSONObject
+  // #ifdef H5 || WEB
+  if (process.env.NODE_ENV === 'development') {
+    header['Authorization'] = `Bearer ${token}`
+  }
+  // #endif
+
+  // #ifdef MP-WEIXIN
+  header['Authorization'] = `Bearer ${token}`
+  // #endif
+  return header
+}
+
+/**
+ * 上传单个文件到服务器
+ *
+ * @param filePath 本地临时文件路径
+ * @param uid 文件唯一标识
+ * @param onProgress 进度回调（可选）
+ * @returns Promise<UploadResult>
+ */
+export function uploadSingleFile(
+  filePath: string,
+  uid: string,
+  onProgress?: (percent: number) => void
+): Promise<UploadResult> {
+  const header = buildUploadHeaders()
+
+  return new Promise((resolve, _reject) => {
+    const fileName = filePath.split('/').pop() || 'file'
+    const uploadTask: UploadTask = uni.uploadFile({
+      url: UPLOAD_FILE_ACTION,
+      filePath: filePath,
+      name: 'file',
+      header: header,
+      formData: {
+        type: 'tmp',
+      },
+      success: (res) => {
+        try {
+          const result = JSON.parse(res.data)
+          const { code, data, message } = result
+          if (code === SUCCESS_CODE) {
+            const uploadedFile: UploadFileInfo = {
+              key: data?.key || '',
+              name: data?.fileName || fileName,
+              type: data?.mimeType || 'application/octet-stream',
+              size: data?.size || 0,
+              url: data?.url || '',
+              uid: uid,
+              status: UploadFileStatus.done,
+              percent: 100,
+              response: result,
+            }
+            resolve({ success: true, file: uploadedFile })
+          } else {
+            resolve({
+              success: false,
+              error: data?.message || message || '上传失败',
+            })
+          }
+        } catch (error) {
+          console.error('[fileUploader] 解析上传响应失败:', error)
+          resolve({ success: false, error: '解析响应失败' })
+        }
+      },
+      fail: (error) => {
+        console.error('[fileUploader] 上传失败:', error)
+        resolve({ success: false, error: error.errMsg || '网络错误' })
+      },
+    })
+
+    if (onProgress) {
+      uploadTask.onProgressUpdate((res: OnProgressUpdateResult) => {
+        onProgress(res.progress)
+      })
+    }
+  })
+}
+
+/**
+ * 批量上传文件
+ *
+ * @param filePaths 本地临时文件路径数组
+ * @param fileUidMap 路径 → uid 的映射
+ * @param onFileProgress 单文件进度回调（可选）
+ * @returns Promise<UploadFileInfo[]> 上传完成的文件列表
+ */
+export async function uploadMultipleFiles(
+  filePaths: string[],
+  fileUidMap: Record<string, string>,
+  onFileProgress?: (uid: string, percent: number) => void
+): Promise<UploadFileInfo[]> {
+  const results: UploadFileInfo[] = []
+
+  const uploadPromises = filePaths.map(async (filePath) => {
+    const uid = fileUidMap[filePath] || generateFileUid()
+    const result = await uploadSingleFile(filePath, uid, (percent) => {
+      if (onFileProgress) {
+        onFileProgress(uid, percent)
+      }
+    })
+    return result
+  })
+
+  const settledResults = await Promise.allSettled(uploadPromises)
+
+  for (const settled of settledResults) {
+    if (settled.status === 'fulfilled') {
+      const uploadResult = settled.value as UploadResult
+      if (uploadResult.success && uploadResult.file) {
+        results.push(uploadResult.file)
+      } else {
+        // 上传失败的文件，创建一个 error 状态的条目
+        results.push({
+          key: '',
+          name: '',
+          type: '',
+          size: 0,
+          url: '',
+          uid: '',
+          status: UploadFileStatus.error,
+          percent: 0,
+        })
+      }
+    }
+  }
+
+  return results
+}

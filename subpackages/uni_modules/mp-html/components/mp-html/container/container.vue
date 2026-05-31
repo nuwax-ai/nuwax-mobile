@@ -6,7 +6,7 @@
       <view class="plan-header">
         <view class="plan-info">
           <text class="plan-name">{{
-            toolCall.name || getI18nText("Mobile.ThirdParty.MpHtml.executionPlan")
+            planNameDisplay || getI18nText("Mobile.ThirdParty.MpHtml.executionPlan")
           }}</text>
           <!-- <view class="plan-status-display">
             <view class="status-icon" :class="getStatusIconClass(toolCall.status)">
@@ -118,9 +118,29 @@ export default {
       return this.toolCall.type === AgentComponentTypeEnum.Plan || this.toolCall.type === 'Plan'
     },
     
+    // 格式化显示的计划名称
+    planNameDisplay() {
+      let name = this.toolCall.name || '';
+      try {
+        if (name.includes('%')) {
+          name = decodeURIComponent(name);
+        }
+      } catch (e) {
+        // Ignored
+      }
+      return name;
+    },
+    
     // 格式化显示的工具名称，处理多行代码情况
     toolNameDisplay() {
       let name = this.toolCall.name || this.toolCall.type || '';
+      try {
+        if (name.includes('%')) {
+          name = decodeURIComponent(name);
+        }
+      } catch (e) {
+        // Ignored
+      }
       // 还原引号实体
       name = name.replace(/&quot;/g, '"');
       // 替换换行符为空格，防止换行符干扰单行省略号显示
@@ -367,12 +387,17 @@ export default {
       align-items: center;
       flex: 1;
       gap: 16rpx;
+      min-width: 0;
 
       .plan-name {
         font-size: 28rpx;
         font-weight: 600;
         color: #333;
         line-height: 40rpx;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .plan-status-display {
@@ -465,6 +490,7 @@ export default {
       align-items: center;
       flex: 1;
       gap: 16rpx;
+      min-width: 0;
 
       .tool-name {
         font-size: 28rpx;

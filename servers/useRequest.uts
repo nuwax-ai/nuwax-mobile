@@ -14,10 +14,12 @@ import {
   USER_NO_LOGIN,
 } from "@/constants/codes.constants";
 
+// #ifdef H5 || WEB
 import {
   fetchEventSource,
   EventSourceMessage,
 } from "@microsoft/fetch-event-source";
+// #endif
 
 import { handleExternalLink } from "@/utils/system";
 import { getCurrentPageFullPath } from "@/utils/common";
@@ -163,37 +165,31 @@ export interface SSEOptions<T = any> {
   abortController?: any;
 }
 
-// H5 创建SSE连接
-export async function createSSEConnection<T = any>(options: SSEOptions<T>) {
-  const controller = options.abortController || new AbortController();
+// SSE 连接（平台分叉：H5/Web 用 fetch-event-source，APP 用原生分块请求）
+export function createSSEConnection<T = any>(options: SSEOptions<T>) {
   const currentLang = String(
     uni.getStorageSync(I18N_LANG_STORAGE_KEY) || DEFAULT_LANG,
   ).toLowerCase();
-  //仅H5需要添加fragment参数
-  // #ifdef H5
+
+  // #ifdef H5 || WEB
+  const controller = options.abortController || new AbortController();
   const fragment = (window.location.hash || "#/").replace("#/", "/");
-  // #endif
-  // #ifndef H5
-  const fragment = "";
-  // #endif
   try {
-    // 通过 Parameters<typeof fetchEventSource>[1] 对齐第三方库参数类型
     const fetchOptions = {
       method: options.method || "POST",
       headers: {
         "Content-Type": "application/json",
         "Accept-Language": currentLang,
         ...options.headers,
-        ...(fragment && { fragment }),
+        ...(fragment ? { fragment } : {}),
       },
       body:
         typeof options.body === "object"
           ? JSON.stringify(options.body)
           : options.body,
       signal: controller.signal,
-      openWhenHidden: true, // 页面不可见时保持连接
-
-      onopen: async (response) => {
+      openWhenHidden: true,
+      onopen: async (response: any) => {
         if (response.status >= 400) {
           throw new Error(
             String(response.statusText || response.status || 0),
@@ -201,11 +197,9 @@ export async function createSSEConnection<T = any>(options: SSEOptions<T>) {
         }
         options.onOpen?.(response);
       },
-
       onmessage: (event: EventSourceMessage) => {
         try {
           const data = event.data ? (JSON.parse(event.data) as T) : null;
-          // 无消息体时不回调，避免把 null 传给强类型的 T
           if (data !== null) {
             options.onMessage(data);
           }
@@ -215,13 +209,10 @@ export async function createSSEConnection<T = any>(options: SSEOptions<T>) {
           options.onError?.(normalizedError);
         }
       },
-
       onclose: () => {
         options.onClose?.();
       },
-
-      onerror: (error) => {
-        // 如果是中止错误，不抛出异常
+      onerror: (error: any) => {
         if (error instanceof Error && error.name === "AbortError") {
           console.log("SSE连接已被中止");
           return;
@@ -229,21 +220,119 @@ export async function createSSEConnection<T = any>(options: SSEOptions<T>) {
         const normalizedError =
           error instanceof Error ? error : new Error(String(error));
         options.onError?.(normalizedError);
-        throw normalizedError; // 停止自动重试
+        throw normalizedError;
       },
     } as Parameters<typeof fetchEventSource>[1];
-    await fetchEventSource(options.url, fetchOptions);
+    fetchEventSource(options.url, fetchOptions).catch((error: any) => {
+      if (error instanceof Error && error.name === "AbortError") {
+        console.log("SSE连接已被中止");
+        return;
+      }
+      const normalized =
+        error instanceof Error ? error : new Error(String(error));
+      options.onError?.(normalized);
+    });
+    return controller;
   } catch (error) {
-    // 静默处理所有 AbortError
     if (error instanceof Error && error.name === "AbortError") {
       console.log("SSE连接已被中止");
-      return;
+      return undefined;
     }
-
-    // 只有真正的错误才触发错误回调
     const normalized =
       error instanceof Error ? error : new Error(String(error));
     options.onError?.(normalized);
     throw normalized;
+  }
+  // #endif
+
+  // #ifdef APP-PLUS || APP
+  let buffer = "";
+  const task = uni.request({
+    url: options.url,
+    method: options.method || "POST",
+    header: {
+      "Content-Type": "application/json",
+      "Accept-Language": currentLang,
+      Accept: "text/event-stream",
+      ...options.headers,
+    },
+    data:
+      typeof options.body === "object"
+        ? JSON.stringify(options.body)
+        : options.body,
+    enableChunked: true,
+    success: (res: any) => {
+      options.onOpen?.(res);
+    },
+    fail: (err: any) => {
+      const error =
+        err instanceof Error ? err : new Error(String(err?.errMsg || err));
+      options.onError?.(error);
+    },
+    complete: () => {
+      options.onClose?.();
+    },
+  });
+
+  task.onChunkReceived((arrayBuffer: ArrayBuffer) => {
+    try {
+      const text = arrayBufferToString(arrayBuffer);
+      buffer += text;
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      for (const part of parts) {
+        const dataLine = part
+          .split("\n")
+          .find((line: string) => line.startsWith("data:"));
+        if (!dataLine) {
+          continue;
+        }
+        const payload = dataLine.slice(5).trim();
+        if (!payload || payload === "[DONE]") {
+          continue;
+        }
+        try {
+          options.onMessage(JSON.parse(payload) as T);
+        } catch (e) {
+          options.onError?.(
+            e instanceof Error ? e : new Error(String(e)),
+          );
+        }
+      }
+    } catch (e) {
+      options.onError?.(
+        e instanceof Error ? e : new Error(String(e)),
+      );
+    }
+  });
+
+  const controller = options.abortController || {
+    aborted: false,
+    signal: { aborted: false } as any,
+    abort: () => {
+      controller.aborted = true;
+      controller.signal.aborted = true;
+      try {
+        task.abort();
+      } catch (e) {
+        console.error("SSE task abort failed", e);
+      }
+    },
+  } as any;
+
+  return controller;
+  // #endif
+}
+
+function arrayBufferToString(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let result = "";
+  for (let i = 0; i < bytes.length; i++) {
+    result += String.fromCharCode(bytes[i]);
+  }
+  try {
+    return decodeURIComponent(escape(result));
+  } catch (e) {
+    return result;
   }
 }

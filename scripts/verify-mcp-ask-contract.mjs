@@ -151,7 +151,7 @@ const conversation = read(
 );
 for (const needle of [
   "buildMcpAskResumeMessage(interaction, payload)",
-  "service.handleSendMessage(resumeText, [], [], false)",
+  "service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat)",
   'payload.action === "skip"',
   "(i.revision || 1) === (interaction.revision || 1)",
 ]) {

@@ -382,6 +382,7 @@
 </script>
 
 <style lang="scss" scoped>
+/* #ifdef H5 */
   .uni-noticebar {
     /* #ifndef APP-NVUE */
     display: flex;
@@ -506,4 +507,5 @@
       transform: translate3d(-100%, 0, 0);
     }
   }
+/* #endif */
 </style>

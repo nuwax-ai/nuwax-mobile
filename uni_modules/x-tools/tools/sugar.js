@@ -1,5 +1,7 @@
 export const log = console.log
-import { t } from '@/utils/i18n'
+// uni-app x APP-Android: .js 文件无法 import .uts 模块（如 @/utils/i18n）
+// sugar.js 里 t 只用于少数 toast 文案，这里 stub 成返回 key 即可
+const t = (key) => key
 
 export const upx2px = val => uni.upx2px(parseInt(val))
 

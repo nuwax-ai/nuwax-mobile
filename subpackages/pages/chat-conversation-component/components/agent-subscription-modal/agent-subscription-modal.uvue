@@ -1,0 +1,347 @@
+<template>
+  <modal-popup
+    ref="modalRef"
+    :title="modalTitle"
+    width="90vw"
+    @update-visible="handleUpdateVisible"
+  >
+    <view class="agent-sub-container">
+      <!-- 骨架屏 / 加载状态 -->
+      <view v-if="loading" class="loading-state">
+        <text class="loading-icon">⏳</text>
+        <text class="loading-text">{{ t("Mobile.Common.loading") }}</text>
+      </view>
+
+      <!-- 空状态 -->
+      <view v-else-if="plans.length === 0" class="empty-state">
+        <text class="empty-icon">📁</text>
+        <text class="empty-text">{{ t("Mobile.MySubscriptions.empty") }}</text>
+      </view>
+
+      <!-- 套餐卡片列表 -->
+      <scroll-view
+        v-else
+        class="plans-scroll"
+        scroll-y="true"
+        :show-scrollbar="false"
+      >
+        <view class="plans-list">
+          <view
+            v-for="plan in plans"
+            :key="plan.id"
+            class="plan-card"
+            :class="{
+              'plan-current': plan.id === activePlanId,
+              'plan-expired':
+                plan.id === activePlanId &&
+                currentSubscription?.status === 'EXPIRED',
+              'plan-cancelled':
+                plan.id === activePlanId &&
+                currentSubscription?.status === 'CANCELLED',
+            }"
+          >
+            <!-- 热门标签 / 订阅状态标签 -->
+            <view
+              class="card-badge-row"
+              v-if="plan.id === activePlanId || plan.isHot"
+            >
+              <view
+                v-if="plan.id === activePlanId"
+                class="badge"
+                :class="{
+                  'badge-active':
+                    currentSubscription == null ||
+                    currentSubscription.status === 'ACTIVE',
+                  'badge-expired':
+                    currentSubscription != null &&
+                    currentSubscription.status === 'EXPIRED',
+                  'badge-cancelled':
+                    currentSubscription != null &&
+                    currentSubscription.status === 'CANCELLED',
+                }"
+              >
+                <text class="badge-text">{{
+                  currentSubscription != null &&
+                  plan.id === currentSubscription.planId
+                    ? getSubscriptionStatusText(currentSubscription.status)
+                    : t("Mobile.MySubscriptions.currentPlan")
+                }}</text>
+              </view>
+              <view v-else-if="plan.isHot" class="badge badge-hot">
+                <text class="badge-text">{{
+                  t("Mobile.MySubscriptions.statusHot")
+                }}</text>
+              </view>
+            </view>
+
+            <!-- 计划核心信息 -->
+            <view class="card-main">
+              <view class="plan-info-header">
+                <text class="plan-name">{{ plan.name }}</text>
+                <text class="plan-desc" v-if="plan.description">{{
+                  plan.description
+                }}</text>
+              </view>
+
+              <!-- 价格与计费周期 -->
+              <view class="plan-price-box">
+                <text class="price-symbol">¥</text>
+                <text class="price-value">{{
+                  formatNumber(plan.price, 2)
+                }}</text>
+                <text class="price-period">{{
+                  getPeriodUnit(plan.period)
+                }}</text>
+              </view>
+
+              <!-- 操作按钮 -->
+              <view class="card-action">
+                <view
+                  class="action-btn"
+                  :class="{
+                    'btn-current':
+                      plan.id === activePlanId &&
+                      currentSubscription?.status !== 'CANCELLED',
+                    'btn-processing': processingId === plan.id,
+                    'btn-disabled': plan.price <= 0,
+                  }"
+                  @tap="handleSelectPlan(plan)"
+                >
+                  <text class="btn-text">{{ getActionText(plan) }}</text>
+                </view>
+              </view>
+
+              <!-- 权益清单 -->
+              <view class="plan-limits">
+                <view class="limit-item" v-if="plan.callLimitCount != null">
+                  <text class="limit-bullet">✦</text>
+                  <text class="limit-label"
+                    >{{ t("Mobile.Chat.callLimitLabel") }}：</text
+                  >
+                  <text class="limit-val">{{
+                    plan.callLimitCount === -1
+                      ? t("Mobile.Chat.unlimited")
+                      : plan.callLimitCount + t("Mobile.Chat.timesPerMonth")
+                  }}</text>
+                </view>
+              </view>
+            </view>
+          </view>
+        </view>
+      </scroll-view>
+    </view>
+  </modal-popup>
+</template>
+
+<script setup lang="uts">
+  import { ref, computed } from "vue";
+  import { useI18n } from "@/utils/i18n";
+  import {
+    apiGetAgentSubscriptionPlanList,
+    apiGetMySubscription,
+  } from "@/subpackages/servers/subscription";
+  import {
+    SystemSubscriptionPlan,
+    MySubscriptionItem,
+  } from "@/subpackages/types/interfaces/subscription";
+  import { formatNumber } from "@/utils/system";
+  import { useSubscriptionPurchase } from "@/subpackages/pages/my-subscriptions/hooks/useSubscriptionPurchase.uts";
+  import { getPeriodUnit } from "@/subpackages/pages/my-subscriptions/utils.uts";
+  import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+
+  const { t } = useI18n();
+
+  const props = defineProps({
+    agentId: {
+      type: Number,
+      required: true,
+    },
+    currentPlanId: {
+      type: Number,
+      default: null,
+    },
+    currentPlanPrice: {
+      type: Number,
+      default: null,
+    },
+    calledTrialCount: {
+      type: Number,
+      default: 0,
+    },
+    trialCount: {
+      type: Number,
+      default: 0,
+    },
+    isNeedSubscription: {
+      type: Boolean,
+      default: true,
+    },
+  });
+
+  const emit = defineEmits(["purchase-success", "update-visible"]);
+
+  const handleUpdateVisible = (visible: boolean) => {
+    emit("update-visible", visible);
+  };
+
+  const modalRef = ref<any>(null);
+  const loading = ref(false);
+  const plans = ref<SystemSubscriptionPlan[]>([]);
+  const { handlePaySubscription, processingId } = useSubscriptionPurchase({
+    onSuccess: () => {
+      fetchPlans();
+      emit("purchase-success");
+    },
+  });
+  const currentSubscription = ref<MySubscriptionItem | null>(null);
+
+  /**
+   * 动态计算生效中的 planId
+   */
+  const activePlanId = computed((): number | null => {
+    if (currentSubscription.value != null) {
+      return currentSubscription.value!.planId;
+    }
+    return props.currentPlanId;
+  });
+
+  /**
+   * 动态计算生效中的 plan 价格，便于判断升级关系
+   */
+  const activePlanPrice = computed((): number | null => {
+    if (
+      currentSubscription.value != null &&
+      currentSubscription.value!.plan != null
+    ) {
+      return currentSubscription.value!.plan.price;
+    }
+    return props.currentPlanPrice;
+  });
+
+  /**
+   * 动态计算模态框标题，如含试用次数
+   */
+  const modalTitle = computed((): string => {
+    const used = props.calledTrialCount;
+    const total = props.trialCount;
+
+    if (!props.isNeedSubscription || total === 0) {
+      return t("Mobile.Chat.subscriptionModalTitle");
+    }
+
+    return t("Mobile.Chat.subscriptionModalTitleTrial", {
+      used: used.toString(),
+      total: total.toString(),
+    });
+  });
+
+  /**
+   * 获取订阅状态文本
+   */
+  const getSubscriptionStatusText = (status: string): string => {
+    if (status === "ACTIVE") {
+      return t("Mobile.MySubscriptions.stateActive");
+    }
+    if (status === "EXPIRED") {
+      return t("Mobile.MySubscriptions.stateExpired");
+    }
+    if (status === "CANCELLED") {
+      return t("Mobile.MySubscriptions.stateCancelled");
+    }
+    return "";
+  };
+
+  /**
+   * 计算操作按钮的文本（对齐 PC 端逻辑）
+   * - 当前使用中套餐(ACTIVE/EXPIRED): "当前套餐(续订)"，支持点击续订
+   * - 当前套餐已取消(CANCELLED): "订阅"
+   * - 无订阅 / 价格 <= 当前使用金额: "订阅"
+   * - 价格 > 当前使用金额: "升级"
+   */
+  const getActionText = (plan: SystemSubscriptionPlan): string => {
+    const curPlanId = activePlanId.value;
+    if (plan.id === curPlanId) {
+      if (currentSubscription.value != null) {
+        const status = currentSubscription.value!.status;
+        if (status === "CANCELLED") {
+          return t("Mobile.MySubscriptions.planGrid");
+        }
+      }
+      // 使用中/已过期的当前套餐：显示"当前套餐(续订)"
+      const currentPlanText = t("Mobile.MySubscriptions.currentPlanButton");
+      const renewText = t("Mobile.MySubscriptions.renewNow");
+      return `${currentPlanText}(${renewText})`;
+    }
+    if (curPlanId == null) {
+      return t("Mobile.MySubscriptions.planGrid");
+    }
+    // 使用当前生效套餐的金额作为判断基准
+    const currentPrice = activePlanPrice.value ?? 0;
+    if (plan.price <= currentPrice) {
+      return t("Mobile.MySubscriptions.planGrid");
+    }
+    return t("Mobile.MySubscriptions.upgradeNow");
+  };
+
+  /**
+   * 加载智能体订阅及套餐列表
+   */
+  const fetchPlans = async () => {
+    if (props.agentId <= 0) return;
+    loading.value = true;
+    try {
+      // 1. 获取当前智能体订阅情况
+      const subRes = await apiGetMySubscription({
+        bizId: props.agentId.toString(),
+        bizType: "AGENT",
+      });
+      if (subRes.code === SUCCESS_CODE && subRes.data != null) {
+        currentSubscription.value = subRes.data!.currentSubscription;
+      } else {
+        currentSubscription.value = null;
+      }
+
+      // 2. 获取套餐列表
+      const res = await apiGetAgentSubscriptionPlanList({
+        agentId: props.agentId,
+        status: 1,
+      });
+      if (res.code === SUCCESS_CODE && res.data != null) {
+        plans.value = res.data!;
+      }
+    } catch (e) {
+      console.error("[AgentSubscriptionModal] 加载数据失败:", e);
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  const handleSelectPlan = async (plan: SystemSubscriptionPlan) => {
+    if (plan.price <= 0) return;
+    await handlePaySubscription(plan.id);
+  };
+
+  /**
+   * 打开弹窗
+   */
+  const open = () => {
+    modalRef.value?.open();
+    fetchPlans();
+  };
+
+  /**
+   * 关闭弹窗
+   */
+  const close = () => {
+    modalRef.value?.close();
+  };
+
+  defineExpose({
+    open,
+    close,
+  });
+</script>
+
+<style lang="scss" scoped>
+  @import "./agent-subscription-modal.scss";
+</style>

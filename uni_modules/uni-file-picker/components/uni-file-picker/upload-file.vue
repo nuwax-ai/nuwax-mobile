@@ -174,6 +174,7 @@
 </script>
 
 <style lang="scss">
+	/* #ifdef H5 */
 	.uni-file-picker__files {
 		/* #ifndef APP-NVUE */
 		display: flex;
@@ -311,6 +312,8 @@
 		background-color: #333;
 		// border-radius: 1px;
 	}
+
+	/* #endif */
 
 	/* #ifdef H5 */
 	@media all and (min-width: 768px) {

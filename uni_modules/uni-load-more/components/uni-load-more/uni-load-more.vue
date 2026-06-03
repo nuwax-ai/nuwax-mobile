@@ -45,6 +45,7 @@
 		// #endif
 	}, 16)
 
+	// #ifndef APP-ANDROID
 	import {
 		initVueI18n
 	} from '@dcloudio/uni-i18n'
@@ -52,6 +53,11 @@
 	const {
 		t
 	} = initVueI18n(messages)
+	// #endif
+	// #ifdef APP-ANDROID
+	// uni-app x Android 不支持 @dcloudio/uni-i18n，这里给一个空 fallback
+	const t = (key) => ''
+	// #endif
 
 	/**
 	 * LoadMore 加载更多
@@ -158,6 +164,7 @@
 </script>
 
 <style lang="scss" >
+/* #ifdef H5 */
 	.uni-load-more {
 		/* #ifndef APP-NVUE */
 		display: flex;
@@ -401,4 +408,5 @@
 	}
 
 	/* #endif */
+/* #endif */
 </style>

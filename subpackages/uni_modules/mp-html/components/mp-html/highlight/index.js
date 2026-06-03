@@ -3,7 +3,10 @@
  * Include prismjs (https://prismjs.com)
  */
 import prism from "./prism.min";
+import installLanguages from "./prism-languages";
 import config from "./config";
+
+installLanguages(prism);
 const getCopyButtonText = () => {
   try {
     const lang = String(uni.getStorageSync("I18N_LANG") || "zh-CN")
@@ -114,7 +117,7 @@ Highlight.prototype.onParse = function (node, vm) {
       hlBody.children.push(hlContainer);
       node.children = [];
 
-      if (config.showLanguageName) {
+      if (config.showLanguageName && vm.options.showHeader) {
         const langChildren = [{ type: "text", text: lang }];
         // #ifdef H5
         // H5: 复制按钮放入 rich-text 内部，通过 srcElement.dataset 实现点击复制

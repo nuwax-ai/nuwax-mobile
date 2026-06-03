@@ -1,0 +1,379 @@
+/**
+ * MCP Ask schema and tool input helpers.
+ * Keeps SSE, history hydration, resume formatting, and card rendering aligned.
+ */
+import type {
+  InteractionUiOptions,
+  InteractionUiSchema,
+  InteractionUiStep,
+  McpAskInteraction,
+  McpAskToolName,
+  McpAskWidget,
+} from "@/types/intervention";
+
+export const MCP_ASK_SCHEMA_VERSION = "nuwax.mcp_ask.v1";
+export const INTERACTION_UI_SCHEMA_VERSION = "nuwax.interaction.v1";
+
+const SCHEMA_META_KEYS = new Set([
+  "type",
+  "title",
+  "description",
+  "required",
+  "properties",
+  "schema",
+  "uiSchema",
+  "steps",
+]);
+
+export interface ParsedMcpAskField {
+  name: string;
+  property: any;
+  widget: McpAskWidget;
+  required: boolean;
+  options: InteractionUiOptions;
+  enumValues: string[];
+  enumLabels: string[];
+}
+
+function asRecord(value: any): Record<string, unknown> | null {
+  if (value !== null && value !== undefined && typeof value === "object") {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function asStringArray(value: any): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item: any): boolean => typeof item === "string",
+  ) as string[];
+}
+
+function maybeParseRawInput(raw: any): any {
+  if (typeof raw !== "string") return raw;
+  try {
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+function isJsonSchemaProperty(value: any): boolean {
+  const record = asRecord(value);
+  if (!record) return false;
+  return (
+    typeof record.type === "string" ||
+    Array.isArray(record.type) ||
+    typeof record.title === "string" ||
+    typeof record.description === "string" ||
+    Array.isArray(record.enum) ||
+    !!record.items ||
+    record.format === "data-url"
+  );
+}
+
+function normalizeProperties(value: any): Record<string, any> {
+  const record = asRecord(value);
+  const result: Record<string, any> = {};
+  if (!record) return result;
+
+  Object.keys(record).forEach((key: string) => {
+    const property = (record as any)[key];
+    if (!SCHEMA_META_KEYS.has(key) && isJsonSchemaProperty(property)) {
+      result[key] = property;
+    }
+  });
+  return result;
+}
+
+function findSchemaCandidates(
+  ui: InteractionUiSchema,
+): Record<string, unknown>[] {
+  const schema = asRecord(ui.schema);
+  if (!schema) return [];
+
+  const candidates: Record<string, unknown>[] = [schema];
+  const nestedSchema = asRecord((schema as any).schema);
+  const nestedProperties = asRecord((schema as any).properties);
+  const nestedPropertiesSchema = asRecord((nestedProperties as any)?.schema);
+
+  if (nestedSchema) candidates.push(nestedSchema);
+  if (nestedProperties) candidates.push(nestedProperties);
+  if (nestedPropertiesSchema) candidates.push(nestedPropertiesSchema);
+
+  return candidates;
+}
+
+export function getEffectiveUiSchema(
+  ui: InteractionUiSchema,
+): Record<string, unknown> | null {
+  if (ui.uiSchema) return ui.uiSchema;
+
+  const candidates = findSchemaCandidates(ui);
+  for (const candidate of candidates) {
+    const directUiSchema = asRecord((candidate as any).uiSchema);
+    const propertiesUiSchema = asRecord(
+      (asRecord((candidate as any).properties) as any)?.uiSchema,
+    );
+    if (directUiSchema) return directUiSchema;
+    if (propertiesUiSchema) return propertiesUiSchema;
+  }
+  return null;
+}
+
+export function getUiOptions(
+  uiSchema: Record<string, unknown> | null | undefined,
+  fieldName?: string,
+): InteractionUiOptions {
+  const root = (asRecord((uiSchema as any)?.["ui:options"]) ||
+    {}) as InteractionUiOptions;
+  if (!fieldName) return root;
+
+  const fieldUi = asRecord((uiSchema as any)?.[fieldName]);
+  const fieldOptions = (asRecord((fieldUi as any)?.["ui:options"]) ||
+    {}) as InteractionUiOptions;
+  return {
+    ...root,
+    ...fieldOptions,
+  } as InteractionUiOptions;
+}
+
+export function getRootSchema(ui: InteractionUiSchema): {
+  properties: Record<string, any>;
+  required: string[];
+} {
+  const candidates = findSchemaCandidates(ui);
+  for (const candidate of candidates) {
+    let properties = normalizeProperties((candidate as any).properties);
+    if (Object.keys(properties).length === 0) {
+      properties = normalizeProperties(candidate);
+    }
+    let required = asStringArray((candidate as any).required);
+    if (required.length === 0) {
+      required = asStringArray(
+        (asRecord((candidate as any).properties) as any)?.required,
+      );
+    }
+    if (Object.keys(properties).length > 0) {
+      return { properties, required };
+    }
+  }
+  return { properties: {}, required: [] };
+}
+
+function resolveEnumLabels(
+  enumValues: string[],
+  property: any,
+  options: InteractionUiOptions,
+): string[] {
+  if (options.enumNames && options.enumNames.length === enumValues.length) {
+    return options.enumNames;
+  }
+  const propEnumNames = property.enumNames || property["x-enumNames"];
+  if (
+    Array.isArray(propEnumNames) &&
+    propEnumNames.length === enumValues.length
+  ) {
+    return propEnumNames as string[];
+  }
+  return enumValues;
+}
+
+export function resolveFieldWidget(
+  name: string,
+  property: any,
+  uiSchema?: Record<string, unknown> | null,
+): McpAskWidget {
+  const fieldUi = asRecord((uiSchema as any)?.[name]);
+  const explicitWidget = (fieldUi as any)?.["ui:widget"];
+  if (
+    explicitWidget === "radio" ||
+    explicitWidget === "checkboxes" ||
+    explicitWidget === "select" ||
+    explicitWidget === "text" ||
+    explicitWidget === "textarea" ||
+    explicitWidget === "radio-with-custom" ||
+    explicitWidget === "list" ||
+    explicitWidget === "file"
+  ) {
+    return explicitWidget as McpAskWidget;
+  }
+
+  if (property.format === "data-url") return "file";
+
+  const options = getUiOptions(uiSchema, name);
+  const propType = Array.isArray(property.type)
+    ? (property.type as string[]).find(
+        (item: string): boolean => item !== "null",
+      ) || "string"
+    : property.type;
+
+  if (propType === "array") {
+    const itemEnum = property.items?.enum;
+    if (Array.isArray(itemEnum) && itemEnum.length > 0) return "checkboxes";
+    if (Array.isArray(property.enum) && property.enum.length > 0)
+      return "checkboxes";
+  }
+
+  if (Array.isArray(property.enum) && property.enum.length > 0) {
+    if (options.allowCustom || options.otherField) return "radio-with-custom";
+    return "radio";
+  }
+
+  if (propType === "string") {
+    if (
+      explicitWidget === "textarea" ||
+      (property.maxLength && property.maxLength > 200)
+    ) {
+      return "textarea";
+    }
+    return "text";
+  }
+
+  return "text";
+}
+
+export function parseInteractionFields(
+  ui: InteractionUiSchema,
+  fieldNames?: string[],
+): ParsedMcpAskField[] {
+  const root = getRootSchema(ui);
+  const uiSchema = getEffectiveUiSchema(ui);
+  const names = fieldNames || Object.keys(root.properties);
+
+  return names
+    .filter((name: string): boolean => !!root.properties[name])
+    .map((name: string): ParsedMcpAskField => {
+      const property = root.properties[name];
+      const options = getUiOptions(uiSchema, name);
+      const widget = resolveFieldWidget(name, property, uiSchema);
+      const enumValues = Array.isArray(property.enum)
+        ? (property.enum as string[])
+        : Array.isArray(property.items?.enum) && widget === "checkboxes"
+          ? (property.items.enum as string[])
+          : [];
+
+      return {
+        name,
+        property,
+        widget,
+        required: root.required.includes(name),
+        options,
+        enumValues,
+        enumLabels: resolveEnumLabels(enumValues, property, options),
+      };
+    });
+}
+
+export function getInteractionSteps(
+  ui: InteractionUiSchema,
+): InteractionUiStep[] {
+  if (ui.steps && ui.steps.length > 0) return ui.steps;
+
+  const root = getRootSchema(ui);
+  const fields = Object.keys(root.properties);
+  if (!fields.length) return [];
+
+  return [
+    {
+      id: "default",
+      title: ui.title,
+      description: ui.description,
+      fields,
+    },
+  ];
+}
+
+export function isWizardPresentation(ui: InteractionUiSchema): boolean {
+  return ui.presentation === "wizard" || (!!ui.steps && ui.steps.length > 1);
+}
+
+export function isSkipAllowed(ui: InteractionUiSchema): boolean {
+  const options = getUiOptions(getEffectiveUiSchema(ui));
+  return options.allowSkip === true;
+}
+
+export function getSkipLabel(ui: InteractionUiSchema): string | undefined {
+  const options = getUiOptions(getEffectiveUiSchema(ui));
+  return ui.skipLabel || options.skipLabel;
+}
+
+export function parseMcpAskToolInput(raw: any): any | null {
+  const record = asRecord(maybeParseRawInput(raw));
+  if (!record) return null;
+
+  const schemaVersion = (record as any).schemaVersion;
+  if (
+    typeof schemaVersion !== "string" ||
+    schemaVersion !== MCP_ASK_SCHEMA_VERSION
+  ) {
+    return null;
+  }
+
+  const toolName = ((record as any).toolName ||
+    "nuwax_ask_question") as McpAskToolName;
+  if (toolName !== "nuwax_ask_question") {
+    return null;
+  }
+
+  const ui = asRecord((record as any).ui);
+  if (
+    typeof (record as any).requestId !== "string" ||
+    (record as any).requestId.length === 0 ||
+    typeof (record as any).revision !== "number" ||
+    (record as any).revision <= 0 ||
+    Math.floor((record as any).revision) !== (record as any).revision ||
+    typeof (record as any).sessionId !== "string" ||
+    (record as any).sessionId.length === 0 ||
+    typeof (record as any).title !== "string" ||
+    (record as any).title.length === 0 ||
+    !ui
+  )
+    return null;
+
+  const uiVersion = (ui as any).version;
+  if (
+    typeof uiVersion !== "string" ||
+    uiVersion !== INTERACTION_UI_SCHEMA_VERSION
+  ) {
+    return null;
+  }
+
+  if (
+    typeof (ui as any).title !== "string" ||
+    (ui as any).title.length === 0 ||
+    !["modal", "inline", "wizard", "table"].includes(
+      (ui as any).presentation,
+    ) ||
+    !asRecord((ui as any).schema)
+  )
+    return null;
+
+  return {
+    ...record,
+    toolName,
+  };
+}
+
+export function createMcpAskInteractionFromToolInput(
+  rawInput: any,
+  toolCallId?: string,
+): McpAskInteraction | null {
+  const input = parseMcpAskToolInput(rawInput);
+  if (!input) return null;
+
+  const ui = input.ui as InteractionUiSchema;
+  return {
+    toolName: input.toolName,
+    schemaVersion: input.schemaVersion,
+    requestId: input.requestId,
+    revision: input.revision,
+    sessionId: input.sessionId,
+    toolCallId,
+    title: input.title || ui.title || "",
+    description: input.description || ui.description,
+    ui,
+    responseStatus: "pending",
+    triggeredAt: Date.now(),
+  };
+}

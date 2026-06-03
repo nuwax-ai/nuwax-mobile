@@ -3,36 +3,90 @@
  * 从 SSE chunk 中提取 ACP Permission 和 MCP Ask 数据
  * 对齐 nuwax Web 版 applyAcpPermissionSseEvent + applyMcpAskToolCallSseEvent
  */
-import type { AcpPermissionInteraction, AcpPermissionRequest, McpAskInteraction, InteractionUiSchema } from '@/types/intervention'
+import type {
+  AcpPermissionInteraction,
+  McpAskInteraction,
+} from "@/types/intervention";
+import {
+  createMcpAskInteractionFromToolInput,
+  parseMcpAskToolInput,
+} from "@/utils/mcpAskSchema.uts";
 
 /** SSE chunk 中的数据结构（与 chatDataAdapter.uts 中的 SSEChunk 兼容） */
 interface SSEEventData {
-  messageType?: string
-  message_type?: string
-  subType?: string
-  sub_type?: string
-  eventType?: string
+  messageType?: string;
+  message_type?: string;
+  subType?: string;
+  sub_type?: string;
+  eventType?: string;
   data?: {
-    id?: string
-    ext?: unknown
-    [key: string]: unknown
-  }
-  [key: string]: unknown
+    id?: string;
+    ext?: unknown;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
 }
 
 function getMcpAskRawInput(chunk: SSEEventData): any | null {
-  const rawData = chunk as any
-  const data = rawData?.data
-  const ext = data?.ext
+  const rawData = chunk as any;
+  const envelope = parseSseEventEnvelope(chunk);
+  const data = extractEventData(envelope, chunk);
+  const ext = data?.ext;
+  const result = data?.result || rawData?.result;
   return (
     data?.rawInput ||
     data?.raw_input ||
     ext?.rawInput ||
     ext?.raw_input ||
+    result?.input ||
+    result?.rawInput ||
+    result?.raw_input ||
     rawData?.rawInput ||
     rawData?.raw_input ||
     null
-  )
+  );
+}
+
+function parseSseEventEnvelope(chunk: SSEEventData): SSEEventData {
+  const nested = (chunk as any).data;
+  if (
+    nested &&
+    typeof nested === "object" &&
+    (nested.messageType ||
+      nested.message_type ||
+      nested.subType ||
+      nested.sub_type)
+  ) {
+    return nested as SSEEventData;
+  }
+  return chunk;
+}
+
+function extractEventData(envelope: SSEEventData, fallback: SSEEventData): any {
+  const inner = (envelope as any).data;
+  if (inner && typeof inner === "object") return inner;
+  const fallbackData = (fallback as any).data;
+  if (fallbackData && typeof fallbackData === "object") return fallbackData;
+  return fallback as any;
+}
+
+function getToolCallId(chunk: SSEEventData): string {
+  const rawData = chunk as any;
+  const envelope = parseSseEventEnvelope(chunk);
+  const data = extractEventData(envelope, chunk);
+  const result = data?.result || rawData?.result;
+  return (
+    data?.tool_call_id ||
+    data?.toolCallId ||
+    data?.executeId ||
+    result?.executeId ||
+    result?.toolCallId ||
+    result?.tool_call_id ||
+    rawData?.tool_call_id ||
+    rawData?.toolCallId ||
+    rawData?.executeId ||
+    ""
+  );
 }
 
 /**
@@ -40,18 +94,24 @@ function getMcpAskRawInput(chunk: SSEEventData): any | null {
  * 对齐 backend SandboxAgentClient.isAcpPermissionEvent() 的识别逻辑
  */
 export function isAcpPermissionEvent(chunk: SSEEventData): boolean {
-  const messageType = chunk.messageType || (chunk as any).message_type
-  const subType = chunk.subType || (chunk as any).sub_type
+  const envelope = parseSseEventEnvelope(chunk);
+  const messageType = envelope.messageType || (envelope as any).message_type;
+  const subType = envelope.subType || (envelope as any).sub_type;
+  const eventType = (chunk as any).eventType || (envelope as any).eventType;
+
+  if (eventType === "ACP_REQUEST_PERMISSION") {
+    return true;
+  }
 
   // 直接匹配 messageType
-  if (messageType === 'acpRequestPermission') {
-    return true
+  if (messageType === "acpRequestPermission") {
+    return true;
   }
   // 匹配 subType
-  if (subType === 'request_permission' || subType === 'AcpRequestPermission') {
-    return true
+  if (subType === "request_permission" || subType === "AcpRequestPermission") {
+    return true;
   }
-  return false
+  return false;
 }
 
 /**
@@ -59,72 +119,107 @@ export function isAcpPermissionEvent(chunk: SSEEventData): boolean {
  * 对齐 nuwax Web 版 applyMcpAskToolCallSseEvent 的识别逻辑
  */
 export function isMcpAskToolCallEvent(chunk: SSEEventData): boolean {
-  const subType = chunk.subType || (chunk as any).sub_type
-  if (subType !== 'tool_call' && subType !== 'tool_call_update') {
-    return false
+  const envelope = parseSseEventEnvelope(chunk);
+  const subType = envelope.subType || (envelope as any).sub_type;
+  const messageType = envelope.messageType || (envelope as any).message_type;
+  const data = extractEventData(envelope, chunk);
+  const result = data?.result;
+  const isToolCallLike =
+    subType === "tool_call" ||
+    subType === "tool_call_update" ||
+    messageType === "tool_call" ||
+    !!data?.tool_call_id ||
+    !!data?.toolCallId ||
+    !!data?.executeId ||
+    !!result?.executeId;
+
+  if (!isToolCallLike) {
+    return false;
   }
 
-  // 检查 rawInput 中的 schemaVersion
-  const rawInput = getMcpAskRawInput(chunk)
-  if (!rawInput) return false
+  const rawInput = getMcpAskRawInput(chunk);
+  if (!rawInput) return false;
 
-  return rawInput.schemaVersion === 'nuwaclaw.mcp_ask.v1'
-    || rawInput.schemaVersion === 'nuwax.mcp_ask.v1'
+  return parseMcpAskToolInput(rawInput) !== null;
 }
 
 /**
  * 从 ACP Permission SSE 事件中提取交互数据
  */
-export function extractAcpPermissionInteraction(chunk: SSEEventData): AcpPermissionInteraction | null {
-  if (!isAcpPermissionEvent(chunk)) return null
+export function extractAcpPermissionInteraction(
+  chunk: SSEEventData,
+): AcpPermissionInteraction | null {
+  if (!isAcpPermissionEvent(chunk)) return null;
 
-  const rawData = chunk as any
-  const data = rawData.data || rawData
+  const envelope = parseSseEventEnvelope(chunk);
+  const data = extractEventData(envelope, chunk);
 
   // 尝试从 intervention 对象中提取（后端直接提供）
-  if (data.intervention) {
-    return data.intervention as AcpPermissionInteraction
+  if (data.intervention?.request && data.intervention?.responseStatus) {
+    return data.intervention as AcpPermissionInteraction;
   }
 
-  // 从原始数据中构建（后端未直接提供 intervention 对象时）
-  const request = data.request || data
-  const options = request.options || []
+  const intervention =
+    data._intervention || data.interventionRequest || data.intervention;
+  const requestPermission =
+    data.request_permission_request || data.requestPermissionRequest;
+  const request =
+    requestPermission ||
+    intervention?.acp?.request ||
+    intervention?.request ||
+    data.request ||
+    data;
+  const toolCall = request.tool_call || request.toolCall || {};
+  const options = Array.isArray(request.options) ? request.options : [];
+  const sessionId =
+    request.session_id ||
+    request.sessionId ||
+    intervention?.sessionId ||
+    data.session_id ||
+    data.sessionId ||
+    "";
+  const toolCallId =
+    data.tool_call_id ||
+    data.toolCallId ||
+    request.tool_call_id ||
+    request.toolCallId ||
+    toolCall.tool_call_id ||
+    toolCall.toolCallId ||
+    "";
 
+  // 从原始数据中构建（后端未直接提供 intervention 对象时）
   return {
-    id: `itv_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+    id:
+      intervention?.id ||
+      request.id ||
+      `itv_${sessionId || Date.now()}_${toolCallId || Math.random().toString(36).substring(2, 9)}`,
     request: {
-      sessionId: request.session_id || request.sessionId || '',
+      sessionId,
       toolCall: {
-        toolCallId: request.tool_call_id || request.toolCallId || '',
-        title: request.title || request.toolCall?.title || '',
-        kind: request.kind || request.toolCall?.kind || '',
+        toolCallId,
+        title: request.title || toolCall.title || "",
+        kind: request.kind || toolCall.kind || "",
       },
       options: options.map((opt: any) => ({
         optionId: opt.option_id || opt.optionId || opt.id,
-        kind: opt.kind || 'allow_once',
+        kind: opt.kind || "allow_once",
         name: opt.name || opt.label || opt.kind,
       })),
     },
-    responseStatus: 'pending',
-  }
+    responseStatus: "pending",
+  };
 }
 
 /**
  * 从 MCP Ask tool_call 事件中提取交互数据
  */
-export function extractMcpAskInteraction(chunk: SSEEventData): McpAskInteraction | null {
-  if (!isMcpAskToolCallEvent(chunk)) return null
+export function extractMcpAskInteraction(
+  chunk: SSEEventData,
+): McpAskInteraction | null {
+  if (!isMcpAskToolCallEvent(chunk)) return null;
 
-  const rawInput = getMcpAskRawInput(chunk)
-  if (!rawInput) return null
+  const rawInput = getMcpAskRawInput(chunk);
+  if (!rawInput) return null;
 
-  const ui = rawInput.ui as InteractionUiSchema
-
-  return {
-    requestId: rawInput.requestId || '',
-    title: rawInput.title || '',
-    description: rawInput.description,
-    ui: ui,
-    responseStatus: 'pending',
-  }
+  return createMcpAskInteractionFromToolInput(rawInput, getToolCallId(chunk));
 }

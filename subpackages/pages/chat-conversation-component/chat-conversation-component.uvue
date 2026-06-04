@@ -125,8 +125,30 @@
                     :id="`msg-item-${item.id}_${item.index}`"
                     :ref="(el) => setMessageRef(el, `${item.id}_${item.index}`)"
                   ></uni-ai-x-msg>
+                  <!-- ACP 权限审批卡片 -->
+                  <template v-if="item.acpPermissionInteractions?.length">
+                    <acp-permission-card
+                      v-for="acpItem in item.acpPermissionInteractions"
+                      :key="acpItem.id"
+                      :interaction="acpItem"
+                      @respond="
+                        (resp) => handleAcpPermissionRespond(acpItem, resp)
+                      "
+                    />
+                  </template>
+                  <!-- MCP Ask 结构化提问卡片 -->
+                  <template v-if="item.mcpAskInteractions?.length">
+                    <mcp-ask-card
+                      v-for="mcpItem in item.mcpAskInteractions"
+                      :key="`${mcpItem.requestId}:${mcpItem.revision || 1}`"
+                      :interaction="mcpItem"
+                      @respond="
+                        (payload) => handleMcpAskRespond(item, mcpItem, payload)
+                      "
+                    />
+                  </template>
                   <!-- 用户消息 -->
-                  <template v-else>
+                  <template v-if="item.messageType === MessageTypeEnum.USER">
                     <!-- 图片以及文件 -->
                     <scroll-view
                       class="files-container"
@@ -330,6 +352,22 @@
       @purchase-success="handlePurchaseSuccess"
       @update-visible="handleUpdateModalVisible"
     />
+
+    <!-- [DEV] Mock 干预调试按钮 -->
+    <view class="debug-mock-panel">
+      <view
+        class="debug-btn debug-btn-inject"
+        @tap="handleDebugMockIntervention"
+      >
+        <text class="debug-btn-text">Mock+</text>
+      </view>
+      <view
+        class="debug-btn debug-btn-clear"
+        @tap="handleClearMockInterventions"
+      >
+        <text class="debug-btn-text">Clear</text>
+      </view>
+    </view>
   </view>
 </template>
 
@@ -371,6 +409,8 @@
   import NewConversationSet from "./components/new-conversation-set/new-conversation-set.uvue";
   import FileTree from "./components/file-tree/file-tree.uvue";
   import ToolDetailsModal from "./components/tool-details-modal/tool-details-modal.uvue";
+  import AcpPermissionCard from "@/components/acp-permission-card/acp-permission-card.uvue";
+  import McpAskCard from "@/components/mcp-ask-card/mcp-ask-card.uvue";
 
   // 常量
   import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -404,6 +444,19 @@
   import { throttle } from "@/subpackages/utils/functionUtils";
   import { useI18n } from "@/utils/i18n";
   import { getUniLoadMoreContentText } from "@/utils/i18n-third-party";
+  import { apiAgentInterventionRespond } from "@/servers/intervention";
+  import { buildMcpAskResumeMessage } from "@/utils/mcpAskResumeMessage";
+  import type {
+    AcpPermissionInteraction,
+    AcpPermissionResponse,
+    McpAskInteraction,
+    McpAskRespondPayload,
+  } from "@/types/intervention";
+  import {
+    injectMockIntervention,
+    clearMockInterventions,
+    getMockScenarioKeys,
+  } from "@/utils/mockInterventionData";
 
   const { t } = useI18n();
   const historyLoadMoreContentText = computed(() =>
@@ -423,7 +476,6 @@
       isAppDetails: false,
     },
   );
-
 
   // 定义 emits
   const emit = defineEmits<{
@@ -909,6 +961,8 @@
         modelId: _data?.modelId || otherModelId,
         // 沙盒ID
         sandboxId: _data?.sandboxId || otherSandboxId,
+        // Agent 执行模式
+        agentMode: _data?.agentMode,
       };
     } else {
       params = {
@@ -1039,6 +1093,199 @@
    */
   const onlongTapMsg = (item: any): void => {
     // 显示操作菜单
+  };
+
+  const removeAcpPermissionInteraction = (interactionId: string): void => {
+    const list = [...messageList.value];
+    for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
+      const msg = list[msgIndex];
+      const interactions = msg.acpPermissionInteractions;
+      if (!interactions) continue;
+
+      const nextInteractions = interactions.filter(
+        (item) => item.id !== interactionId,
+      );
+      if (nextInteractions.length === interactions.length) continue;
+
+      list[msgIndex] = {
+        ...msg,
+        acpPermissionInteractions: nextInteractions.length
+          ? nextInteractions
+          : undefined,
+      };
+      break;
+    }
+    messageList.value = list;
+  };
+
+  const removeMcpAskInteraction = (interaction: McpAskInteraction): void => {
+    const revision = interaction.revision || 1;
+    const list = [...messageList.value];
+    for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
+      const msg = list[msgIndex];
+      const interactions = msg.mcpAskInteractions;
+      if (!interactions) continue;
+
+      const nextInteractions = interactions.filter(
+        (item) =>
+          !(
+            item.requestId === interaction.requestId &&
+            (item.revision || 1) === revision
+          ),
+      );
+      if (nextInteractions.length === interactions.length) continue;
+
+      list[msgIndex] = {
+        ...msg,
+        mcpAskInteractions: nextInteractions.length
+          ? nextInteractions
+          : undefined,
+      };
+      break;
+    }
+    messageList.value = list;
+  };
+
+  /**
+   * ACP 权限审批响应处理
+   */
+  const handleAcpPermissionRespond = async (
+    interaction: AcpPermissionInteraction,
+    response: AcpPermissionResponse,
+  ): Promise<void> => {
+    // 更新本地状态为 submitting
+    const list = [...messageList.value];
+    for (const msg of list) {
+      if (!msg.acpPermissionInteractions) continue;
+      const idx = msg.acpPermissionInteractions.findIndex(
+        (i) => i.id === interaction.id,
+      );
+      if (idx >= 0) {
+        msg.acpPermissionInteractions[idx] = {
+          ...msg.acpPermissionInteractions[idx],
+          responseStatus: "submitting",
+          selectedOptionId:
+            response.outcome.outcome === "selected"
+              ? response.outcome.optionId
+              : undefined,
+        };
+        break;
+      }
+    }
+    messageList.value = list;
+
+    try {
+      const isSelected = response.outcome.outcome === "selected";
+      const resp = await apiAgentInterventionRespond({
+        interventionId: interaction.id,
+        permission_resolve_request: {
+          request_permission_response: {
+            outcome: isSelected
+              ? { Selected: { option_id: response.outcome.optionId! } }
+              : { Cancelled: null },
+          },
+          session_id: interaction.request.sessionId,
+          tool_call_id: interaction.request.toolCall?.toolCallId,
+          save_rule: false,
+        },
+        conversation_id: conversationId.value || undefined,
+      });
+
+      if (resp?.code && resp.code !== SUCCESS_CODE) {
+        throw new Error(
+          resp.message || t("Mobile.Intervention.AcpPermission.responseFailed"),
+        );
+      }
+
+      removeAcpPermissionInteraction(interaction.id);
+    } catch (error) {
+      const errorMsg =
+        error instanceof Error
+          ? error.message
+          : t("Mobile.Intervention.AcpPermission.responseFailed");
+      // 更新为 failed
+      const list3 = [...messageList.value];
+      for (const msg of list3) {
+        if (!msg.acpPermissionInteractions) continue;
+        const idx = msg.acpPermissionInteractions.findIndex(
+          (i) => i.id === interaction.id,
+        );
+        if (idx >= 0) {
+          msg.acpPermissionInteractions[idx] = {
+            ...msg.acpPermissionInteractions[idx],
+            responseStatus: "failed",
+            errorMessage: errorMsg,
+          };
+          break;
+        }
+      }
+      messageList.value = list3;
+      uni.showToast({ title: errorMsg, icon: "none" });
+    }
+  };
+
+  /**
+   * MCP Ask 结构化提问响应处理
+   */
+  const handleMcpAskRespond = (
+    _message: MessageInfo,
+    interaction: McpAskInteraction,
+    payload: McpAskRespondPayload,
+  ): void => {
+    removeMcpAskInteraction(interaction);
+
+    // 构建 resume 消息并发送给 Agent
+    const resumeText = buildMcpAskResumeMessage(interaction, payload);
+    if (resumeText) {
+      service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat);
+    }
+  };
+
+  // ==================== Mock 干预调试 ====================
+  const mockScenarioLabels: Record<string, string> = {
+    "acp-simple": "ACP: 简单权限(Shell)",
+    "acp-multi": "ACP: 多选项(文件写入)",
+    "acp-network": "ACP: 网络请求",
+    "mcp-survey": "MCP: 调查问卷",
+    "mcp-select": "MCP: 部署配置(选择框)",
+    "mcp-simple": "MCP: 简单文本输入",
+    "mcp-file": "MCP: 文件上传",
+    "mcp-list": "MCP: 单选列表",
+    "mcp-wizard": "MCP: 分步表单",
+  };
+
+  /** 触发 mock 干预 - 弹出操作面板选择场景 */
+  const handleDebugMockIntervention = (): void => {
+    const keys = getMockScenarioKeys();
+    const labels = keys.map((key: string) => mockScenarioLabels[key] || key);
+
+    uni.showActionSheet({
+      itemList: labels,
+      success: (res) => {
+        const selectedKey = keys[res.tapIndex] as any;
+        const success = injectMockIntervention(data.messageList, selectedKey);
+        if (success) {
+          uni.showToast({
+            title: `已注入: ${labels[res.tapIndex]}`,
+            icon: "none",
+            duration: 1500,
+          });
+          // 触发滚动到底部
+          nextTick(() => {
+            uni.$emit("streamMessageUpdate");
+          });
+        }
+      },
+    });
+  };
+
+  /** 清除所有 mock 干预 */
+  const handleClearMockInterventions = (): void => {
+    clearMockInterventions(data.messageList);
+    uni.showToast({
+      title: t("Mobile.Intervention.Mock.cleared"),
+      icon: "none",
+    });
   };
 
   /**
@@ -1592,5 +1839,40 @@
     justify-content: center;
     align-items: center;
     padding: 24rpx 0;
+  }
+
+  /* [DEV] Mock 干预调试按钮 */
+  .debug-mock-panel {
+    position: fixed;
+    right: 24rpx;
+    bottom: 300rpx;
+    display: flex;
+    flex-direction: column;
+    gap: 12rpx;
+    z-index: 9999;
+  }
+
+  .debug-btn {
+    width: 88rpx;
+    height: 64rpx;
+    border-radius: 12rpx;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.15);
+  }
+
+  .debug-btn-inject {
+    background-color: #1677ff;
+  }
+
+  .debug-btn-clear {
+    background-color: #ff7a45;
+  }
+
+  .debug-btn-text {
+    color: #fff;
+    font-size: 22rpx;
+    font-weight: 600;
   }
 </style>

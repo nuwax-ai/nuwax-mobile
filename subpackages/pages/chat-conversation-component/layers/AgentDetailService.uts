@@ -36,6 +36,12 @@ import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { chatService } from "@/utils/chatService";
 import { generateUniqueId } from "@/utils/common";
 import {
+  isAcpPermissionEvent,
+  isMcpAskToolCallEvent,
+  extractAcpPermissionInteraction,
+  extractMcpAskInteraction,
+} from "@/utils/interventionAdapter";
+import {
   apiAgentConversationCreate,
   apiAgentConversation,
   apiAgentConversationChatSuggest,
@@ -62,7 +68,10 @@ import { v4 as uuidv4 } from "uuid";
 import AgentDetailData from "./AgentDetailData.uts";
 import { getCustomBlock } from "@/subpackages/utils/containerHelper.uts";
 import { replaceMathBracket } from "@/utils/markdown.uts";
-import { adaptHistoryMessage } from "@/subpackages/utils/historyMessageAdapter";
+import {
+  adaptHistoryMessageList,
+  applyMcpAskResumeStatusesInMessageList,
+} from "@/subpackages/utils/historyMessageAdapter";
 import AgentDetailUtils from "./AgentDetailUtils.uts";
 import { TEMP_CONVERSATION_UID } from "@/constants/common.constants";
 import { API_BASE_URL } from "@/constants/config";
@@ -171,19 +180,17 @@ export default class AgentDetailService {
     const len = _messageList?.filter((item) => !!item.id).length || 0;
     if (len) {
       // 处理消息文本，先适配历史消息格式（PC端HTML标签转移动端Markdown语法）
-      const processedMessageList = _messageList.map((message: MessageInfo) => {
-        // 适配历史消息：将PC端自定义HTML标签转换为移动端Markdown容器语法
-        // 同时将componentExecutedList转换为processingList
-        const adaptedMessage = adaptHistoryMessage(message);
+      const processedMessageList = adaptHistoryMessageList(_messageList).map(
+        (adaptedMessage: MessageInfo) => {
+          // 确保 text 字段始终有值，避免 undefined 导致渲染错误
+          const rawText = adaptedMessage.text ?? "";
+          const text = handleMessageProcess(rawText);
+          // 使用同步方法生成ID，兼容所有平台
+          const id = adaptedMessage.id || generateUniqueId();
 
-        // 确保 text 字段始终有值，避免 undefined 导致渲染错误
-        const rawText = adaptedMessage.text ?? "";
-        const text = handleMessageProcess(rawText);
-        // 使用同步方法生成ID，兼容所有平台
-        const id = adaptedMessage.id || generateUniqueId();
-
-        return { ...adaptedMessage, text, id };
-      });
+          return { ...adaptedMessage, text, id };
+        },
+      );
 
       this.data.autoToLastMsg.value = true;
       // 一次性设置消息列表，避免逐条渲染产生动态效果
@@ -288,9 +295,8 @@ export default class AgentDetailService {
 
         if (olderMessages.length > 0) {
           // 处理消息格式（与 handleQueryConversation 保持一致）
-          const processedMessages = olderMessages.map(
-            (message: MessageInfo) => {
-              const adaptedMessage = adaptHistoryMessage(message);
+          const processedMessages = adaptHistoryMessageList(olderMessages).map(
+            (adaptedMessage: MessageInfo) => {
               const rawText = adaptedMessage.text ?? "";
               const text = handleMessageProcess(rawText);
               const id = adaptedMessage.id || generateUniqueId();
@@ -299,10 +305,10 @@ export default class AgentDetailService {
           );
 
           // 前插到消息列表头部
-          this.data.messageList.value = [
+          this.data.messageList.value = applyMcpAskResumeStatusesInMessageList([
             ...processedMessages,
             ...this.data.messageList.value,
-          ];
+          ]);
 
           // 判断是否还有更多消息
           this.data.hasMoreMessages.value =
@@ -334,6 +340,25 @@ export default class AgentDetailService {
 
     // 忽略心跳包 (HEART_BEAT 不包含 data)
     if (res.eventType === "HEART_BEAT") {
+      return;
+    }
+
+    // ACP Permission 权限审批事件拦截
+    const chunkAny = res as any;
+    if (isAcpPermissionEvent(chunkAny)) {
+      const interaction = extractAcpPermissionInteraction(chunkAny);
+      if (interaction) {
+        this.handleAcpPermissionEvent(interaction, currentMessageId);
+      }
+      return;
+    }
+
+    // MCP Ask tool_call 事件拦截（在 PROCESSING 分支之前）
+    if (isMcpAskToolCallEvent(chunkAny)) {
+      const mcpInteraction = extractMcpAskInteraction(chunkAny);
+      if (mcpInteraction) {
+        this.handleMcpAskEvent(mcpInteraction, currentMessageId);
+      }
       return;
     }
 
@@ -573,6 +598,67 @@ export default class AgentDetailService {
     } finally {
       this.data.isLoadingFiles.value = false;
     }
+  }
+
+  /**
+   * 处理 ACP Permission 权限审批事件
+   */
+  handleAcpPermissionEvent(
+    interaction: import("@/types/intervention").AcpPermissionInteraction,
+    currentMessageId: string,
+  ): void {
+    const list = [...this.data.messageList.value];
+    const currentMessage = list.find(
+      (item) => item.id === currentMessageId,
+    ) as MessageInfo;
+    if (!currentMessage) return;
+
+    // 避免重复添加同一 intervention
+    const existing = currentMessage.acpPermissionInteractions || [];
+    if (existing.some((i) => i.id === interaction.id)) return;
+
+    currentMessage.acpPermissionInteractions = [...existing, interaction];
+
+    // 更新消息列表
+    const index = list.findIndex((item) => item.id === currentMessageId);
+    list[index] = { ...currentMessage };
+    this.data.messageList.value = list;
+
+    uni.$emit("streamMessageUpdate");
+  }
+
+  /**
+   * 处理 MCP Ask 结构化提问事件
+   */
+  handleMcpAskEvent(
+    interaction: import("@/types/intervention").McpAskInteraction,
+    currentMessageId: string,
+  ): void {
+    const list = [...this.data.messageList.value];
+    const currentMessage = list.find(
+      (item) => item.id === currentMessageId,
+    ) as MessageInfo;
+    if (!currentMessage) return;
+
+    // 避免重复添加同一 requestId
+    const existing = currentMessage.mcpAskInteractions || [];
+    if (
+      existing.some(
+        (i) =>
+          i.requestId === interaction.requestId &&
+          (i.revision || 1) === (interaction.revision || 1),
+      )
+    )
+      return;
+
+    currentMessage.mcpAskInteractions = [...existing, interaction];
+
+    // 更新消息列表
+    const index = list.findIndex((item) => item.id === currentMessageId);
+    list[index] = { ...currentMessage };
+    this.data.messageList.value = list;
+
+    uni.$emit("streamMessageUpdate");
   }
 
   /**
@@ -1101,6 +1187,8 @@ export default class AgentDetailService {
       modelId?: number;
       // 用户选择的沙盒ID
       sandboxId?: string;
+      // Agent 执行模式
+      agentMode?: "ask" | "yolo";
     },
     isTempChat?: boolean = false,
     // 超时回调
@@ -1238,6 +1326,7 @@ export default class AgentDetailService {
       attachments,
       selectedComponents,
       skillIds: data.skillIds,
+      agentMode: data.agentMode,
     };
 
     // 发送消息

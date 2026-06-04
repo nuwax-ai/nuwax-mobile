@@ -67,6 +67,11 @@ assertIncludes(
 );
 assertIncludes(
   schema,
+  "const toolName = (record as any).toolName || MCP_ASK_TOOL_NAME",
+  "mobile default MCP Ask tool name",
+);
+assertIncludes(
+  schema,
   "toolName !== MCP_ASK_TOOL_NAME",
   "mobile tool-name guard",
 );
@@ -164,9 +169,23 @@ for (const needle of [
   "buildMcpAskResumeMessage(interaction, payload)",
   "service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat)",
   "removeMcpAskInteraction(interaction)",
-  "(item.revision || 1) === revision",
+  "class=\"intervention-dock\"",
+  "activeAcpPermissionDockItems",
+  "visibleMcpAskDockItems",
 ]) {
   assertIncludes(conversation, needle, "conversation response wiring");
+}
+
+const mcpAskInterventionState = read(
+  "subpackages/pages/chat-conversation-component/utils/mcpAskInterventionState.uts",
+);
+for (const needle of [
+  "getVisibleMcpAskInteractions",
+  "removeMcpAskInteractionFromMessageList",
+  "updateMcpAskInteractionStatusInMessageList",
+  "(item.revision || 1) === revision",
+]) {
+  assertIncludes(mcpAskInterventionState, needle, "mcp ask state helpers");
 }
 
 const resume = read("utils/mcpAskResumeMessage.uts");

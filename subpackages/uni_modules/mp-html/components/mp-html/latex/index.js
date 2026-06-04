@@ -27,9 +27,8 @@ Latex.prototype.onParse = function (node, vm) {
               const nodes = parse.default(part[i]);
               children.push({
                 name: "span",
-                attrs: {},
+                attrs: { class: "katex-inline" },
                 l: "T",
-                f: "display:inline-block",
                 children: nodes,
               });
             } else {
@@ -39,9 +38,7 @@ Latex.prototype.onParse = function (node, vm) {
               });
               children.push({
                 name: "div",
-                attrs: {
-                  style: "text-align:center",
-                },
+                attrs: { class: "katex-block" },
                 children: nodes,
               });
             }

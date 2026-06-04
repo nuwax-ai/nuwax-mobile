@@ -49,6 +49,12 @@ assert(
 );
 
 const schema = read("utils/mcpAskSchema.uts");
+const interventionTypes = read("types/intervention.uts");
+assertIncludes(
+  interventionTypes,
+  `export const MCP_ASK_TOOL_NAME = "${expectedToolName}"`,
+  "mobile MCP_ASK_TOOL_NAME constant",
+);
 assertIncludes(
   schema,
   `MCP_ASK_SCHEMA_VERSION = "${expectedAskVersion}"`,
@@ -61,7 +67,7 @@ assertIncludes(
 );
 assertIncludes(
   schema,
-  `toolName !== "${expectedToolName}"`,
+  "toolName !== MCP_ASK_TOOL_NAME",
   "mobile tool-name guard",
 );
 assertIncludes(
@@ -91,17 +97,22 @@ const scopedFiles = [
   "utils/mcpAskResumeMessage.uts",
   "utils/mockInterventionData.uts",
   "subpackages/utils/historyMessageAdapter.uts",
-  "components/mcp-ask-card/mcp-ask-card.uvue",
+  "components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue",
   "subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts",
   "subpackages/pages/chat-conversation-component/chat-conversation-component.uvue",
 ];
 
 for (const file of scopedFiles) {
   const source = read(file);
-  assertNotIncludes(source, "nuwaclaw.mcp_ask", file);
-  assertNotIncludes(source, "nuwaclaw.interaction", file);
-  assertNotIncludes(source, "nuwax_ask_user", file);
-  assertNotIncludes(source, "nuwaclaw_ask_user", file);
+  // 仅支持 nuwax_ask_question，禁止回退 legacy 工具名 / schema 前缀
+  for (const legacy of [
+    "nuwaclaw.mcp_ask",
+    "nuwaclaw.interaction",
+    "nuwax_ask_user",
+    "nuwaclaw_ask_user",
+  ]) {
+    assertNotIncludes(source, legacy, file);
+  }
 }
 
 const adapter = read("utils/interventionAdapter.uts");
@@ -172,7 +183,7 @@ for (const needle of [
   assertIncludes(resume, needle, "resume message");
 }
 
-const card = read("components/mcp-ask-card/mcp-ask-card.uvue");
+const card = read("components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue");
 for (const needle of [
   "visibleFields",
   "isWizard",
@@ -191,9 +202,9 @@ for (const needle of [
 
 const mocks = read("utils/mockInterventionData.uts");
 for (const needle of [
-  `schemaVersion: "${expectedAskVersion}"`,
-  `version: "${expectedUiVersion}"`,
-  `toolName: "${expectedToolName}"`,
+  "schemaVersion: MCP_ASK_SCHEMA_VERSION",
+  "version: INTERACTION_UI_SCHEMA_VERSION",
+  "toolName: MCP_ASK_TOOL_NAME",
   "mockMcpAskWizard",
   "allowSkip",
   "radio-with-custom",

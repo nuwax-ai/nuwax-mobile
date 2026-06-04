@@ -152,8 +152,8 @@ const conversation = read(
 for (const needle of [
   "buildMcpAskResumeMessage(interaction, payload)",
   "service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat)",
-  'payload.action === "skip"',
-  "(i.revision || 1) === (interaction.revision || 1)",
+  "removeMcpAskInteraction(interaction)",
+  "(item.revision || 1) === revision",
 ]) {
   assertIncludes(conversation, needle, "conversation response wiring");
 }

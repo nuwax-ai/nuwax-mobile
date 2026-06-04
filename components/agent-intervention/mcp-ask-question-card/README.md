@@ -2,7 +2,7 @@
 
 > 模块总文档见 [`../README.md`](../README.md)
 
-MCP Ask 协议的结构化表单卡片。组件运行时 `name` 仍为 `McpAskCard`。
+MCP Ask 协议的结构化表单卡片。组件 `name` 为 `McpAskQuestionCard`。
 
 ## Props
 

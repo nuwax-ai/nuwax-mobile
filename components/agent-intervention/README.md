@@ -86,7 +86,7 @@ Phase 2 可按需补 `agent-intervention-chat-layer` + `activeInterventionQueue.
 
 ## MCP Ask 工具契约
 
-对齐 [`nuwax-ask-question-mcp`](file:///Users/apple/workspace/nuwax-ask-question-mcp) 最新版，**仅支持单一工具入口**：
+对齐 `nuwax-ask-question-mcp` 最新版，**仅支持单一工具入口**：
 
 | 常量 | 值 |
 | --- | --- |

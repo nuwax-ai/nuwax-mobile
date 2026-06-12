@@ -1,84 +1,1632 @@
 /**
- * @fileoverview html 解析器（Android UTS 桩化版本）
+ * @fileoverview html 解析器（UTS 完整移植版）
+ * 移植自 mp-html 原生 parser.js，保留全部标签/样式/表格/svg 处理逻辑。
  *
- * 原文件为 JS prototype 风格（function Parser + Parser.prototype.* + Lexer 状态机），
- * 与 UTS 不兼容：函数内 this、prototype、Object.keys、动态对象字面量、字符串 Char 索引等。
- * 此处先桩化以解除整体编译阻塞，parse 暂返回空节点树。
- * 完整 UTS 重构（含 Lexer 状态机改写）作为独立后续任务。
+ * UTS 适配要点：
+ *   - Lexer 状态机由"方法引用 + invoke"改为"数值 state + if/else 分发"
+ *   - 动态节点对象统一使用 UTSJSONObject + bracket 访问（属性读返回 any | null）
+ *   - Lexer 中 handler[method](...) 动态分发改为静态 if/else
+ *   - 插件通过 MpHtmlPlugin 接口约束（any 不可 invoke）
+ *   - substr(start,len) → substring(start, start+len)；字符索引经 charAt 辅助
+ *   - SVG 序列化的字符串累积用临时字段 svgBuf（UTS 闭包不可重赋外层局部）
  */
 
-export class Parser {
-  options: UTSJSONObject = {} as UTSJSONObject;
-  tagStyle: UTSJSONObject = {} as UTSJSONObject;
-  imgList: any[] = [] as any[];
-  plugins: any[] = [] as any[];
-  attrs: UTSJSONObject = {} as UTSJSONObject;
-  stack: any[] = [] as any[];
-  nodes: any[] = [] as any[];
-  tagName: string = "";
-  attrName: string = "";
-  pre: number = 0;
+// ============ 通用辅助 ============
 
-  constructor(vm: any) {
-    this.options = (vm != null) ? (vm as UTSJSONObject) : ({} as UTSJSONObject);
-    this.tagStyle = {} as UTSJSONObject;
-    this.imgList = [] as any[];
-    this.plugins = [] as any[];
-    this.attrs = {} as UTSJSONObject;
-    this.stack = [] as any[];
-    this.nodes = [] as any[];
-    this.tagName = "";
-    this.attrName = "";
-    this.pre = 0;
+function makeMap(str: string): UTSJSONObject {
+  const map = new UTSJSONObject()
+  const list = str.split(",")
+  for (let i = list.length - 1; i >= 0; i--) {
+    map[list[i]] = true
   }
-
-  /** 执行解析（桩实现：返回空节点树） */
-  parse(content: string): any[] {
-    return this.nodes;
-  }
-
-  /** 将标签暴露出来（不被 rich-text 包含） */
-  expose(): void {}
-
-  /** 处理插件 */
-  hook(node: any): boolean {
-    return true;
-  }
-
-  /** 将链接拼接上主域名 */
-  getUrl(url: string): string {
-    return url;
-  }
-
-  /** 解析样式表 */
-  parseStyle(node: any): UTSJSONObject {
-    return {} as UTSJSONObject;
-  }
-
-  /** 解析到标签名 */
-  onTagName(name: string): void {
-    this.tagName = name;
-  }
-
-  /** 解析到属性名 */
-  onAttrName(name: string): void {
-    this.attrName = name;
-  }
-
-  /** 解析到属性值 */
-  onAttrVal(val: string): void {}
-
-  /** 解析到标签开始 */
-  onOpenTag(selfClose: boolean): void {}
-
-  /** 解析到标签结束 */
-  onCloseTag(name: string): void {}
-
-  /** 处理标签出栈 */
-  popNode(): void {}
-
-  /** 解析到文本 */
-  onText(text: string): void {}
+  return map
 }
 
-export default Parser;
+function mapHas(map: UTSJSONObject | null, key: string): boolean {
+  if (map == null) return false
+  return map[key] != null
+}
+
+function strVal(obj: UTSJSONObject | null, key: string): string {
+  if (obj == null) return ""
+  const v = obj[key]
+  return v != null ? `${v}` : ""
+}
+
+function charAt(s: string, i: number): string {
+  if (i < 0 || i >= s.length) return ""
+  return s.substring(i, i + 1)
+}
+
+const HEX_DIGITS = "0123456789abcdef"
+function hexToInt(s: string): number {
+  let n = 0
+  const ls = s.toLowerCase()
+  for (let k = 0; k < ls.length; k++) {
+    const d = HEX_DIGITS.indexOf(charAt(ls, k))
+    if (d == -1) return -1
+    n = n * 16 + d
+  }
+  return n
+}
+
+// ============ 配置 ============
+
+const trustTags = makeMap(
+  "container,container-group,markdown-custom-process,markdown-custom-process-group,a,abbr,ad,audio,b,blockquote,br,code,col,colgroup,dd,del,dl,dt,div,em,fieldset,h1,h2,h3,h4,h5,h6,hr,i,img,ins,label,legend,li,ol,p,q,ruby,rt,source,span,strong,sub,sup,table,tbody,td,tfoot,th,thead,tr,title,ul,video,task-result,description,file"
+)
+
+const blockTags = makeMap(
+  "address,article,aside,body,caption,center,footer,header,html,nav,pre,section"
+)
+
+const ignoreTags = makeMap(
+  "area,base,canvas,embed,frame,head,iframe,input,link,map,meta,param,rp,script,source,style,textarea,title,track,wbr"
+)
+
+const voidTags = makeMap(
+  "area,base,br,col,circle,ellipse,embed,frame,hr,img,input,line,link,meta,param,path,polygon,rect,source,track,use,wbr"
+)
+
+const entities: UTSJSONObject = {
+  lt: "<",
+  gt: ">",
+  quot: "\"",
+  apos: "'",
+  ensp: " ",
+  emsp: " ",
+  nbsp: " ",
+  semi: ";",
+  ndash: "–",
+  mdash: "—",
+  middot: "·",
+  lsquo: "‘",
+  rsquo: "’",
+  ldquo: "“",
+  rdquo: "”",
+  bull: "•",
+  hellip: "…",
+  larr: "←",
+  uarr: "↑",
+  rarr: "→",
+  darr: "↓",
+  copy: "©",
+  reg: "®",
+  trade: "™",
+} as UTSJSONObject
+
+const tagStyleDefault = new UTSJSONObject()
+// #ifndef APP-PLUS-NVUE
+tagStyleDefault["address"] = "font-style:italic"
+tagStyleDefault["big"] = "display:inline;font-size:1.2em"
+tagStyleDefault["caption"] = "display:table-caption;text-align:center"
+tagStyleDefault["center"] = "text-align:center"
+tagStyleDefault["cite"] = "font-style:italic"
+tagStyleDefault["dd"] = "margin-left:40px"
+tagStyleDefault["mark"] = "background-color:yellow"
+tagStyleDefault["pre"] = "white-space:pre"
+tagStyleDefault["s"] = "text-decoration:line-through"
+tagStyleDefault["small"] = "display:inline;font-size:0.8em"
+tagStyleDefault["strike"] = "text-decoration:line-through"
+tagStyleDefault["u"] = "text-decoration:underline"
+// #endif
+
+const svgDict: UTSJSONObject = {
+  animatetransform: "animateTransform",
+  lineargradient: "linearGradient",
+  viewbox: "viewBox",
+  attributename: "attributeName",
+  repeatcount: "repeatCount",
+  repeatdur: "repeatDur",
+  foreignobject: "foreignObject",
+} as UTSJSONObject
+
+const tagSelector = new UTSJSONObject()
+
+let windowWidth = 0
+// #ifndef MP-WEIXIN
+{
+  const systemInfo = uni.getSystemInfoSync()
+  windowWidth = systemInfo.windowWidth
+}
+// #endif
+// #ifdef MP-WEIXIN
+{
+  windowWidth = uni.getWindowInfo().windowWidth
+}
+// #endif
+
+const blankChar = makeMap(" ,\r,\n,\t,\f")
+let idIndex = 0
+
+// #ifdef APP-PLUS
+ignoreTags["iframe"] = null
+trustTags["iframe"] = true
+ignoreTags["embed"] = null
+trustTags["embed"] = true
+// #endif
+// #ifdef APP-PLUS-NVUE
+ignoreTags["source"] = null
+ignoreTags["style"] = null
+// #endif
+
+const inlineTags = makeMap(
+  "abbr,b,big,code,del,em,i,ins,label,q,small,span,strong,sub,sup,cite"
+)
+
+// ============ 实体解码 / 合并节点 ============
+
+function decodeEntity(str: string, amp: boolean): string {
+  let i = str.indexOf("&")
+  while (i != -1) {
+    const j = str.indexOf(";", i + 3)
+    if (j == -1) break
+    if (charAt(str, i + 1) == "#") {
+      let code = -1
+      if (charAt(str, i + 2) == "x") {
+        code = hexToInt(str.substring(i + 3, j))
+      } else {
+        code = parseInt(str.substring(i + 2, j))
+      }
+      if (!isNaN(code) && code > 0) {
+        str = str.substring(0, i) + String.fromCharCode(code) + str.substring(j + 1)
+      }
+    } else {
+      const name = str.substring(i + 1, j)
+      const mapped = entities[name]
+      if (mapped != null) {
+        str = str.substring(0, i) + `${mapped}` + str.substring(j + 1)
+      } else if (name == "amp" && amp) {
+        str = str.substring(0, i) + "&" + str.substring(j + 1)
+      }
+    }
+    i = str.indexOf("&", i + 1)
+  }
+  return str
+}
+
+function mergeNodes(nodes: UTSJSONObject[]): void {
+  let i = nodes.length - 1
+  for (let j = i; j >= -1; j--) {
+    const node: UTSJSONObject | null = j == -1 ? null : nodes[j]
+    let isBoundary = false
+    if (j == -1) {
+      isBoundary = true
+    } else if (node != null) {
+      const c = node["c"]
+      const name = strVal(node, "name")
+      const style = strVal(node["attrs"] as UTSJSONObject, "style")
+      isBoundary = (c != null) ||
+        name == "" ||
+        (name != "div" && name != "p" && charAt(name, 0) != "h") ||
+        style.includes("inline")
+    }
+    if (isBoundary) {
+      if (i - j >= 5) {
+        const children: UTSJSONObject[] = []
+        for (let k = j + 1; k <= i; k++) {
+          children.push(nodes[k])
+        }
+        const merged = new UTSJSONObject()
+        merged["name"] = "div"
+        merged["attrs"] = new UTSJSONObject()
+        merged["children"] = children
+        nodes.splice(j + 1, i - j, merged)
+      }
+      i = j - 1
+    }
+  }
+}
+
+// ============ Lexer 状态常量 ============
+
+const ST_TEXT = 0
+const ST_TAG_NAME = 1
+const ST_ATTR_NAME = 2
+const ST_ATTR_VAL = 3
+const ST_END_TAG = 4
+
+// ============ 插件接口 ============
+
+export interface MpHtmlPlugin {
+  onUpdate(content: string, config: UTSJSONObject): string
+  onParse(node: UTSJSONObject, parser: Parser): boolean
+}
+
+// ============ Parser ============
+
+export class Parser {
+  options: UTSJSONObject
+  tagStyle: UTSJSONObject
+  imgList: string[] = [] as string[]
+  plugins: MpHtmlPlugin[] = [] as MpHtmlPlugin[]
+  attrs: UTSJSONObject = new UTSJSONObject()
+  stack: UTSJSONObject[] = [] as UTSJSONObject[]
+  nodes: UTSJSONObject[] = [] as UTSJSONObject[]
+  tagName: string = ""
+  attrName: string = ""
+  pre: number = 0
+  xml: number = 0
+  private svgBuf: string = ""
+
+  constructor(vm: any) {
+    this.options = vm != null ? (vm as UTSJSONObject) : new UTSJSONObject()
+    this.tagStyle = new UTSJSONObject()
+    for (let key in tagStyleDefault) {
+      this.tagStyle[key] = tagStyleDefault[key]
+    }
+    const optTagStyle = this.options["tagStyle"] as UTSJSONObject
+    if (optTagStyle != null) {
+      for (let key in optTagStyle) {
+        this.tagStyle[key] = optTagStyle[key]
+      }
+    }
+    const optImgList = this.options["imgList"] as string[]
+    this.imgList = optImgList != null ? optImgList : [] as string[]
+    const optPlugins = this.options["plugins"] as MpHtmlPlugin[]
+    this.plugins = optPlugins != null ? optPlugins : [] as MpHtmlPlugin[]
+    const containerStyle = this.options["containerStyle"] as string
+    this.pre = (containerStyle != null && containerStyle.includes("white-space") && containerStyle.includes("pre")) ? 2 : 0
+    this.attrs = new UTSJSONObject()
+    this.stack = [] as UTSJSONObject[]
+    this.nodes = [] as UTSJSONObject[]
+  }
+
+  parse(content: string): UTSJSONObject[] {
+    for (let i = this.plugins.length - 1; i >= 0; i--) {
+      const updated = this.plugins[i].onUpdate(content, new UTSJSONObject())
+      if (updated.length > 0) {
+        content = updated
+      }
+    }
+
+    const lexer = new Lexer(this)
+    lexer.parse(content)
+    while (this.stack.length > 0) {
+      this.popNode()
+    }
+    if (this.nodes.length > 50) {
+      mergeNodes(this.nodes)
+    }
+    return this.nodes
+  }
+
+  expose(): void {
+    // #ifndef APP-PLUS-NVUE
+    for (let i = this.stack.length - 1; i >= 0; i--) {
+      const item = this.stack[i]
+      const c = item["c"]
+      const name = strVal(item, "name")
+      if (c != null || name == "a" || name == "video" || name == "audio") return
+      item["c"] = 1
+    }
+    // #endif
+  }
+
+  hook(node: UTSJSONObject): boolean {
+    for (let i = this.plugins.length - 1; i >= 0; i--) {
+      if (this.plugins[i].onParse(node, this) == false) {
+        return false
+      }
+    }
+    return true
+  }
+
+  getUrl(url: string): string {
+    const domain = this.options["domain"] as string
+    if (charAt(url, 0) == "/") {
+      if (charAt(url, 1) == "/") {
+        url = (domain != null ? domain.split("://")[0] : "http") + ":" + url
+      } else if (domain != null) {
+        url = domain + url
+      }
+      // #ifdef APP-PLUS
+      else {
+        url = plus.io.convertLocalFileSystemURL(url)
+      }
+      // #endif
+    } else if (!url.includes("data:") && !url.includes("://")) {
+      if (domain != null) {
+        url = domain + "/" + url
+      }
+      // #ifdef APP-PLUS
+      else {
+        url = plus.io.convertLocalFileSystemURL(url)
+      }
+      // #endif
+    }
+    return url
+  }
+
+  parseStyle(node: UTSJSONObject): UTSJSONObject {
+    const attrs = node["attrs"] as UTSJSONObject
+    const name = strVal(node, "name")
+    const tagStyleStr = strVal(this.tagStyle, name)
+    const list = tagStyleStr.split(";").concat(strVal(attrs, "style").split(";"))
+    const styleObj = new UTSJSONObject()
+    let tmp = ""
+
+    const idVal = strVal(attrs, "id")
+    if (idVal != "" && this.xml == 0) {
+      const useAnchor = this.options["useAnchor"]
+      if (useAnchor != null) {
+        this.expose()
+      } else if (name != "img" && name != "a" && name != "video" && name != "audio") {
+        attrs["id"] = null
+      }
+    }
+
+    const widthVal = strVal(attrs, "width")
+    if (widthVal != "") {
+      styleObj["width"] = `${parseFloat(widthVal)}${widthVal.includes("%") ? "%" : "px"}`
+      attrs["width"] = null
+    }
+    const heightVal = strVal(attrs, "height")
+    if (heightVal != "") {
+      styleObj["height"] = `${parseFloat(heightVal)}${heightVal.includes("%") ? "%" : "px"}`
+      attrs["height"] = null
+    }
+
+    for (let i = 0; i < list.length; i++) {
+      const info = list[i].split(":")
+      if (info.length < 2) continue
+      const key = info[0].trim().toLowerCase()
+      let value = ""
+      for (let k = 1; k < info.length; k++) {
+        value = value + (k > 1 ? ":" : "") + info[k]
+      }
+      value = value.trim()
+      if ((charAt(value, 0) == "-" && value.lastIndexOf("-") > 0) || value.includes("safe")) {
+        tmp += `;${key}:${value}`
+      } else {
+        const existing = strVal(styleObj, key)
+        if (existing == "" || value.includes("import") || !existing.includes("import")) {
+          if (value.includes("url")) {
+            let j = value.indexOf("(") + 1
+            if (j > 0) {
+              while (charAt(value, j) == "\"" || charAt(value, j) == "'" || mapHas(blankChar, charAt(value, j))) {
+                j++
+              }
+              value = value.substring(0, j) + this.getUrl(value.substring(j))
+            }
+          }
+          styleObj[key] = value
+        }
+      }
+    }
+
+    attrs["style"] = tmp
+    return styleObj
+  }
+
+  onTagName(name: string): void {
+    this.tagName = this.xml != 0 ? name : name.toLowerCase()
+    if (this.tagName == "svg") {
+      this.xml = this.xml + 1
+      ignoreTags["style"] = null
+    }
+  }
+
+  onAttrName(nameParam: string): void {
+    const name = this.xml != 0 ? nameParam : nameParam.toLowerCase()
+    // #ifndef APP-PLUS-NVUE
+    // #ifndef H5
+    // #ifndef APP-PLUS
+    if (name.includes("?") || name.includes(";")) {
+      this.attrName = ""
+      return
+    }
+    // #endif
+    // #endif
+    // #endif
+    if (name.length >= 5 && name.substring(0, 5) == "data-") {
+      if (name == "data-src" && strVal(this.attrs, "src") == "") {
+        this.attrName = "src"
+      } else if (this.tagName == "img" || this.tagName == "a") {
+        this.attrName = name
+      } else {
+        this.attrName = ""
+      }
+    } else {
+      this.attrName = name
+      this.attrs[name] = "T"
+    }
+  }
+
+  onAttrVal(val: string): void {
+    const name = this.attrName
+    if (name == "style" || name == "href") {
+      this.attrs[name] = decodeEntity(val, true)
+    } else if (name.includes("src")) {
+      this.attrs[name] = this.getUrl(decodeEntity(val, true))
+    } else if (name != "") {
+      this.attrs[name] = val
+    }
+  }
+
+  onOpenTag(selfClose: boolean): void {
+    const node = new UTSJSONObject()
+    node["name"] = this.tagName
+    node["attrs"] = this.attrs
+    const optionsNodes = this.options["nodes"] as UTSJSONObject[]
+    if (optionsNodes != null && optionsNodes.length > 0) {
+      node["type"] = "node"
+    }
+    this.attrs = new UTSJSONObject()
+
+    const attrs = node["attrs"] as UTSJSONObject
+    const parent = this.stack.length > 0 ? this.stack[this.stack.length - 1] : null
+    let siblings: UTSJSONObject[]
+    if (parent != null) {
+      const pc = parent["children"] as UTSJSONObject[]
+      if (pc != null) {
+        siblings = pc
+      } else {
+        const arr: UTSJSONObject[] = [] as UTSJSONObject[]
+        parent["children"] = arr
+        siblings = arr
+      }
+    } else {
+      siblings = this.nodes
+    }
+    const name = strVal(node, "name")
+    const close = this.xml != 0 ? selfClose : mapHas(voidTags, name)
+
+    const selectorCls = strVal(tagSelector, name)
+    if (selectorCls != "") {
+      const cls = strVal(attrs, "class")
+      attrs["class"] = cls != "" ? `${selectorCls} ${cls}` : selectorCls
+    }
+
+    // embed 转换
+    if (name == "embed") {
+      // #ifndef H5
+      // #ifndef APP-PLUS
+      const src = strVal(attrs, "src")
+      const typeAttr = strVal(attrs, "type")
+      if (src.includes(".mp4") || src.includes(".3gp") || src.includes(".m3u8") || typeAttr.includes("video")) {
+        node["name"] = "video"
+      } else if (src.includes(".mp3") || src.includes(".wav") || src.includes(".aac") || src.includes(".m4a") || typeAttr.includes("audio")) {
+        node["name"] = "audio"
+      }
+      if (attrs["autostart"] != null) {
+        attrs["autoplay"] = "T"
+      }
+      attrs["controls"] = "T"
+      // #endif
+      // #endif
+      // #ifdef H5
+      this.expose()
+      // #endif
+      // #ifdef APP-PLUS
+      this.expose()
+      // #endif
+    }
+
+    const nodeName2 = strVal(node, "name")
+    // #ifndef APP-PLUS-NVUE
+    // 音视频处理
+    if (nodeName2 == "video" || nodeName2 == "audio") {
+      if (nodeName2 == "video" && strVal(attrs, "id") == "") {
+        attrs["id"] = `v${idIndex}`
+        idIndex++
+      }
+      if (attrs["controls"] == null && attrs["autoplay"] == null) {
+        attrs["controls"] = "T"
+      }
+      const srcArr: string[] = [] as string[]
+      const asrc = strVal(attrs, "src")
+      if (asrc != "") {
+        srcArr.push(asrc)
+        attrs["src"] = null
+      }
+      node["src"] = srcArr
+      this.expose()
+    }
+    // #endif
+
+    if (nodeName2 == "task-result") {
+      this.expose()
+    }
+
+    if (close) {
+      if (!this.hook(node) || mapHas(ignoreTags, nodeName2)) {
+        if (nodeName2 == "base" && this.options["domain"] == null) {
+          this.options["domain"] = attrs["href"]
+        } else {
+          // #ifndef APP-PLUS-NVUE
+          if (nodeName2 == "source" && parent != null &&
+            (strVal(parent, "name") == "video" || strVal(parent, "name") == "audio") &&
+            strVal(attrs, "src") != "") {
+            const psrc = parent["src"] as string[]
+            if (psrc != null) {
+              psrc.push(strVal(attrs, "src"))
+            }
+          }
+          // #endif
+        }
+        return
+      }
+
+      const styleObj = this.parseStyle(node)
+
+      if (nodeName2 == "img") {
+        this.handleImg(node, attrs, styleObj, parent)
+        if (strVal(styleObj, "display") == "inline") {
+          styleObj["display"] = ""
+        }
+        // #ifndef APP-PLUS-NVUE
+        if (attrs["ignore"] != null) {
+          if (strVal(styleObj, "max-width") == "") {
+            styleObj["max-width"] = "100%"
+          }
+          attrs["style"] = strVal(attrs, "style") + ";-webkit-touch-callout:none"
+        }
+        // #endif
+        const wNum = parseInt(strVal(styleObj, "width"))
+        if (!isNaN(wNum) && wNum > windowWidth) {
+          styleObj["height"] = null
+        }
+        if (!isNaN(parseInt(strVal(styleObj, "width")))) {
+          node["w"] = "T"
+        }
+        const hNum = parseInt(strVal(styleObj, "height"))
+        const hStr = strVal(styleObj, "height")
+        const parentStyle = parent != null ? strVal(parent["attrs"] as UTSJSONObject, "style") : ""
+        if (!isNaN(hNum) && (!hStr.includes("%") || parentStyle.includes("height"))) {
+          node["h"] = "T"
+        }
+        if (node["w"] != null && node["h"] != null) {
+          const of = strVal(styleObj, "object-fit")
+          if (of == "contain") {
+            node["m"] = "aspectFit"
+          } else if (of == "cover") {
+            node["m"] = "aspectFill"
+          }
+        }
+      } else if (nodeName2 == "svg") {
+        siblings.push(node)
+        this.stack.push(node)
+        this.popNode()
+        return
+      }
+      for (let key in styleObj) {
+        const sv = strVal(styleObj, key)
+        if (sv != "") {
+          attrs["style"] = strVal(attrs, "style") + `;${key}:${sv.replace(" !important", "")}`
+        }
+      }
+      let finalStyle = strVal(attrs, "style")
+      if (finalStyle != "") {
+        finalStyle = finalStyle.substring(1)
+        attrs["style"] = finalStyle != "" ? finalStyle : null
+      } else {
+        attrs["style"] = null
+      }
+    } else {
+      const styleStr = strVal(attrs, "style")
+      if ((nodeName2 == "pre" || (styleStr.includes("white-space") && styleStr.includes("pre"))) && this.pre != 2) {
+        this.pre = 1
+        node["pre"] = 1
+      }
+      const emptyChildren: UTSJSONObject[] = [] as UTSJSONObject[]
+      node["children"] = emptyChildren
+      this.stack.push(node)
+    }
+
+    siblings.push(node)
+  }
+
+  private handleImg(node: UTSJSONObject, attrs: UTSJSONObject, styleObj: UTSJSONObject, parent: UTSJSONObject | null): void {
+    const src = strVal(attrs, "src")
+    if (src == "") return
+    if (src.includes("webp")) {
+      node["webp"] = "T"
+    }
+    const originalSrc = strVal(attrs, "original-src")
+    const previewImg = this.options["previewImg"]
+    if (src.includes("data:") && previewImg != "all" && originalSrc == "") {
+      attrs["ignore"] = "T"
+    }
+    if (attrs["ignore"] == null || node["webp"] != null || src.includes("cloud://")) {
+      for (let i = this.stack.length - 1; i >= 0; i--) {
+        const item = this.stack[i]
+        const iname = strVal(item, "name")
+        if (iname == "a") {
+          node["a"] = item["attrs"]
+        }
+        if (iname == "table" && node["webp"] == null && !src.includes("cloud://")) {
+          const disp = strVal(styleObj, "display")
+          if (disp == "" || disp.includes("inline")) {
+            node["t"] = "inline-block"
+          } else {
+            node["t"] = disp
+          }
+          styleObj["display"] = null
+        }
+        // #ifndef H5
+        // #ifndef APP-PLUS
+        const style = strVal(item["attrs"] as UTSJSONObject, "style")
+        if (style.includes("flex:") && !style.includes("flex:0") && !style.includes("flex: 0") &&
+          (strVal(styleObj, "width") == "" || parseInt(strVal(styleObj, "width")) > 100)) {
+          styleObj["width"] = "100% !important"
+          styleObj["height"] = ""
+          for (let j = i + 1; j < this.stack.length; j++) {
+            const sj = this.stack[j]["attrs"] as UTSJSONObject
+            sj["style"] = strVal(sj, "style").replace("inline-", "")
+          }
+        } else if (style.includes("flex") && strVal(styleObj, "width") == "100%") {
+          for (let j = i + 1; j < this.stack.length; j++) {
+            const sj = this.stack[j]["attrs"] as UTSJSONObject
+            const ss = strVal(sj, "style")
+            if (!ss.includes(";width") && !ss.includes(" width") && ss.indexOf("width") !== 0) {
+              styleObj["width"] = ""
+              break
+            }
+          }
+        } else if (style.includes("inline-block")) {
+          const w = strVal(styleObj, "width")
+          if (w != "" && charAt(w, w.length - 1) == "%") {
+            const itemAttrs = item["attrs"] as UTSJSONObject
+            itemAttrs["style"] = strVal(itemAttrs, "style") + ";max-width:" + w
+            styleObj["width"] = ""
+          } else {
+            const itemAttrs = item["attrs"] as UTSJSONObject
+            itemAttrs["style"] = strVal(itemAttrs, "style") + ";max-width:100%"
+          }
+        }
+        // #endif
+        // #endif
+        item["c"] = 1
+      }
+      attrs["i"] = `${this.imgList.length}`
+      let imgSrc = originalSrc != "" ? originalSrc : src
+      // #ifndef H5
+      // #ifndef MP-ALIPAY
+      // #ifndef APP-PLUS
+      // #ifndef MP-360
+      if (this.imgList.includes(imgSrc)) {
+        const idx = imgSrc.indexOf("://")
+        if (idx != -1) {
+          const startIdx = idx + 3
+          let newSrc = imgSrc.substring(0, startIdx)
+          let k = startIdx
+          while (k < imgSrc.length) {
+            if (charAt(imgSrc, k) == "/") break
+            newSrc += Math.random() > 0.5 ? charAt(imgSrc, k).toUpperCase() : charAt(imgSrc, k)
+            k++
+          }
+          newSrc += imgSrc.substring(k)
+          imgSrc = newSrc
+        }
+      }
+      // #endif
+      // #endif
+      // #endif
+      // #endif
+      this.imgList.push(imgSrc)
+      // #ifdef H5
+      if (this.options["lazyLoad"] != null) {
+        attrs["data-src"] = attrs["src"]
+        attrs["src"] = null
+      }
+      // #endif
+      // #ifdef APP-PLUS
+      if (this.options["lazyLoad"] != null) {
+        attrs["data-src"] = attrs["src"]
+        attrs["src"] = null
+      }
+      // #endif
+    }
+  }
+
+  onCloseTag(nameParam: string): void {
+    const name = this.xml != 0 ? nameParam : nameParam.toLowerCase()
+    let i = -1
+    for (let k = this.stack.length - 1; k >= 0; k--) {
+      if (strVal(this.stack[k], "name") == name) {
+        i = k
+        break
+      }
+    }
+    if (i != -1) {
+      while (this.stack.length > i) {
+        this.popNode()
+      }
+    } else if (name == "p" || name == "br") {
+      let siblings: UTSJSONObject[]
+      if (this.stack.length > 0) {
+        const pc = this.stack[this.stack.length - 1]["children"] as UTSJSONObject[]
+        siblings = pc != null ? pc : this.nodes
+      } else {
+        siblings = this.nodes
+      }
+      const node = new UTSJSONObject()
+      node["name"] = name
+      const a = new UTSJSONObject()
+      a["class"] = strVal(tagSelector, name)
+      a["style"] = strVal(this.tagStyle, name)
+      node["attrs"] = a
+      siblings.push(node)
+    }
+  }
+
+  popNode(): void {
+    if (this.stack.length == 0) return
+    const node = this.stack[this.stack.length - 1]
+    this.stack.pop()
+    const attrs = node["attrs"] as UTSJSONObject
+    const childrenArr = node["children"] as UTSJSONObject[]
+    const children: UTSJSONObject[] = childrenArr != null ? childrenArr : ([] as UTSJSONObject[])
+    const parent = this.stack.length > 0 ? this.stack[this.stack.length - 1] : null
+    let siblings: UTSJSONObject[]
+    if (parent != null) {
+      const pc = parent["children"] as UTSJSONObject[]
+      siblings = pc != null ? pc : this.nodes
+    } else {
+      siblings = this.nodes
+    }
+
+    if (!this.hook(node) || mapHas(ignoreTags, strVal(node, "name"))) {
+      if (strVal(node, "name") == "title" && children.length > 0 &&
+        strVal(children[0], "type") == "text" && this.options["setTitle"] != null) {
+        uni.setNavigationBarTitle({ title: strVal(children[0], "text") })
+      }
+      siblings.pop()
+      return
+    }
+
+    if (node["pre"] != null && this.pre != 2) {
+      node["pre"] = null
+      this.pre = 0
+      for (let i = this.stack.length - 1; i >= 0; i--) {
+        if (this.stack[i]["pre"] != null) {
+          this.pre = 1
+        }
+      }
+    }
+
+    const styleObj = new UTSJSONObject()
+    const nodeName = strVal(node, "name")
+
+    if (nodeName == "svg") {
+      if (this.xml > 1) {
+        this.xml--
+        return
+      }
+      // #ifdef APP-PLUS-NVUE
+      this.traversalSvgCase(node)
+      // #endif
+      // #ifndef APP-PLUS-NVUE
+      this.serializeSvg(node, attrs)
+      // #endif
+      this.xml = 0
+      ignoreTags["style"] = true
+      return
+    }
+
+    // #ifndef APP-PLUS-NVUE
+    const align = strVal(attrs, "align")
+    if (align != "") {
+      if (nodeName == "table") {
+        if (align == "center") {
+          styleObj["margin-inline-start"] = "auto"
+          styleObj["margin-inline-end"] = "auto"
+        } else {
+          styleObj["float"] = align
+        }
+      } else {
+        styleObj["text-align"] = align
+      }
+      attrs["align"] = null
+    }
+
+    const dir = strVal(attrs, "dir")
+    if (dir != "") {
+      styleObj["direction"] = dir
+      attrs["dir"] = null
+    }
+
+    if (nodeName == "font") {
+      const color = strVal(attrs, "color")
+      if (color != "") {
+        styleObj["color"] = color
+        attrs["color"] = null
+      }
+      const face = strVal(attrs, "face")
+      if (face != "") {
+        styleObj["font-family"] = face
+        attrs["face"] = null
+      }
+      const sizeStr = strVal(attrs, "size")
+      if (sizeStr != "") {
+        let size = parseInt(sizeStr)
+        if (!isNaN(size)) {
+          if (size < 1) size = 1
+          else if (size > 7) size = 7
+          const sizes = ["x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"]
+          styleObj["font-size"] = sizes[size - 1]
+        }
+        attrs["size"] = null
+      }
+    }
+    // #endif
+
+    if (strVal(attrs, "class").includes("align-center")) {
+      styleObj["text-align"] = "center"
+    }
+
+    const parsedStyle = this.parseStyle(node)
+    for (let key in parsedStyle) {
+      const v = strVal(parsedStyle, key)
+      if (v != "") styleObj[key] = v
+    }
+
+    if (nodeName != "table" && parseInt(strVal(styleObj, "width")) > windowWidth) {
+      styleObj["max-width"] = "100%"
+      styleObj["box-sizing"] = "border-box"
+    }
+
+    // #ifndef APP-PLUS-NVUE
+    if (mapHas(blockTags, nodeName)) {
+      node["name"] = "div"
+    } else if (!mapHas(trustTags, nodeName) && this.xml == 0) {
+      node["name"] = "span"
+    }
+    const nodeName2 = strVal(node, "name")
+
+    if (nodeName2 == "a" || nodeName2 == "ad") {
+      this.expose()
+    }
+    // #ifdef H5
+    else if (nodeName2 == "iframe") {
+      this.expose()
+    }
+    // #endif
+    // #ifdef APP-PLUS
+    else if (nodeName2 == "iframe") {
+      this.expose()
+    }
+    // #endif
+    else if (nodeName2 == "video") {
+      if (strVal(styleObj, "height").includes("auto")) {
+        styleObj["height"] = null
+      }
+      // #ifdef APP-PLUS
+      this.buildVideoHtml(node, attrs)
+      // #endif
+    } else if ((nodeName2 == "ul" || nodeName2 == "ol") && node["c"] != null) {
+      const types: UTSJSONObject = {
+        a: "lower-alpha",
+        A: "upper-alpha",
+        i: "lower-roman",
+        I: "upper-roman",
+      } as UTSJSONObject
+      const typeAttr = strVal(attrs, "type")
+      if (strVal(types, typeAttr) != "") {
+        attrs["style"] = strVal(attrs, "style") + ";list-style-type:" + strVal(types, typeAttr)
+        attrs["type"] = null
+      }
+      for (let i = children.length - 1; i >= 0; i--) {
+        if (strVal(children[i], "name") == "li") {
+          children[i]["c"] = 1
+        }
+      }
+    } else if (nodeName2 == "table") {
+      this.handleTable(node, attrs, children, styleObj)
+    } else if ((nodeName2 == "tbody" || nodeName2 == "tr") && node["flag"] != null && node["c"] != null) {
+      node["flag"] = null
+      this.traversalTbodyColor(children, styleObj)
+    } else if ((nodeName2 == "td" || nodeName2 == "th") && (attrs["colspan"] != null || attrs["rowspan"] != null)) {
+      for (let i = this.stack.length - 1; i >= 0; i--) {
+        const sn = strVal(this.stack[i], "name")
+        if (sn == "table" || sn == "tbody" || sn == "tr") {
+          this.stack[i]["flag"] = 1
+        }
+      }
+    } else if (nodeName2 == "ruby") {
+      node["name"] = "span"
+      this.handleRuby(children)
+    } else if (node["c"] != null) {
+      this.traversalInline(node, children)
+    }
+
+    if (strVal(styleObj, "display").includes("flex") && node["c"] == null) {
+      for (let i = children.length - 1; i >= 0; i--) {
+        const item = children[i]
+        if (item["f"] != null) {
+          const ia = item["attrs"] as UTSJSONObject
+          ia["style"] = strVal(ia, "style") + `${item["f"]}`
+          item["f"] = null
+        }
+      }
+    }
+
+    let flexCheck = node["c"] == null
+    // #ifdef MP-WEIXIN
+    flexCheck = !(node["c"] != null && wx.getNFCAdapter)
+    // #endif
+    let parentFlexStyle = ""
+    if (parent != null) {
+      parentFlexStyle = strVal(parent["attrs"] as UTSJSONObject, "style")
+    }
+    const flex = parent != null && (parentFlexStyle.includes("flex") || parentFlexStyle.includes("grid")) && flexCheck
+    if (flex) {
+      node["f"] = ";max-width:100%"
+    }
+
+    if (children.length >= 50 && node["c"] != null && !strVal(styleObj, "display").includes("flex")) {
+      mergeNodes(children)
+    }
+
+    for (let key in styleObj) {
+      const sv = strVal(styleObj, key)
+      if (sv != "") {
+        const val = `;${key}:${sv.replace(" !important", "")}`
+        // #ifndef APP-PLUS-NVUE
+        const c0 = charAt(sv, 0)
+        if (flex && ((key.includes("flex") && key != "flex-direction") || key == "align-self" ||
+          key.includes("grid") || c0 == "-" || (key.includes("width") && val.includes("%")))) {
+          node["f"] = `${node["f"]}${val}`
+          if (key == "width") {
+            attrs["style"] = strVal(attrs, "style") + ";width:100%"
+          }
+        } else {
+          attrs["style"] = strVal(attrs, "style") + val
+        }
+        // #endif
+        // #ifdef APP-PLUS-NVUE
+        attrs["style"] = strVal(attrs, "style") + val
+        // #endif
+      }
+    }
+    let fs = strVal(attrs, "style")
+    if (fs != "") {
+      fs = fs.substring(1)
+      attrs["style"] = fs != "" ? fs : null
+    } else {
+      attrs["style"] = null
+    }
+    // #endif
+  }
+
+  // #ifdef APP-PLUS-NVUE
+  private traversalSvgCase(node: UTSJSONObject): void {
+    const name = strVal(node, "name")
+    if (name != "") {
+      const mapped = strVal(svgDict, name)
+      node["name"] = mapped != "" ? mapped : name
+      const attrs = node["attrs"] as UTSJSONObject
+      if (attrs != null) {
+        const newAttrs = new UTSJSONObject()
+        for (let key in attrs) {
+          const mk = strVal(svgDict, key)
+          newAttrs[mk != "" ? mk : key] = attrs[key]
+        }
+        node["attrs"] = newAttrs
+      }
+      const children = node["children"] as UTSJSONObject[]
+      if (children != null) {
+        for (let i = 0; i < children.length; i++) {
+          this.traversalSvgCase(children[i])
+        }
+      }
+    }
+  }
+  // #endif
+
+  // #ifndef APP-PLUS-NVUE
+  private serializeSvg(node: UTSJSONObject, attrs: UTSJSONObject): void {
+    const style = strVal(attrs, "style")
+    attrs["style"] = ""
+    attrs["xmlns"] = "http://www.w3.org/2000/svg"
+    this.svgBuf = ""
+    this.buildSvgNode(node)
+    node["name"] = "img"
+    const newAttrs = new UTSJSONObject()
+    newAttrs["src"] = `data:image/svg+xml;utf8,${this.svgBuf.replace("#", "%23")}`
+    newAttrs["style"] = style
+    newAttrs["ignore"] = "T"
+    node["attrs"] = newAttrs
+    node["children"] = null
+  }
+
+  private buildSvgNode(n: UTSJSONObject): void {
+    if (strVal(n, "type") == "text") {
+      this.svgBuf = this.svgBuf + strVal(n, "text")
+      return
+    }
+    let nm = strVal(svgDict, strVal(n, "name"))
+    if (nm == "") nm = strVal(n, "name")
+    if (nm == "foreignObject") {
+      const nchildren = n["children"] as UTSJSONObject[]
+      if (nchildren != null) {
+        for (let ci = 0; ci < nchildren.length; ci++) {
+          const child = nchildren[ci]
+          const cattrs = child["attrs"] as UTSJSONObject
+          if (cattrs != null && cattrs["xmlns"] == null) {
+            cattrs["xmlns"] = "http://www.w3.org/1999/xhtml"
+            break
+          }
+        }
+      }
+    }
+    this.svgBuf = this.svgBuf + "<" + nm
+    const nattrs = n["attrs"] as UTSJSONObject
+    if (nattrs != null) {
+      for (let key in nattrs) {
+        const val = strVal(nattrs, key)
+        if (val != "") {
+          const mappedKey = strVal(svgDict, key)
+          const kk = mappedKey != "" ? mappedKey : key
+          this.svgBuf = this.svgBuf + ` ${kk}="${val.replace("\"", "")}"`
+        }
+      }
+    }
+    const nchildren = n["children"] as UTSJSONObject[]
+    if (nchildren == null) {
+      this.svgBuf = this.svgBuf + "/>"
+    } else {
+      this.svgBuf = this.svgBuf + ">"
+      for (let i = 0; i < nchildren.length; i++) {
+        this.buildSvgNode(nchildren[i])
+      }
+      this.svgBuf = this.svgBuf + "</" + nm + ">"
+    }
+  }
+  // #endif
+
+  // #ifdef APP-PLUS
+  private buildVideoHtml(node: UTSJSONObject, attrs: UTSJSONObject): void {
+    let str = "<video style=\"width:100%;height:100%\""
+    for (let key in attrs) {
+      const val = strVal(attrs, key)
+      if (val != "") {
+        str += ` ${key}="${val}"`
+      }
+    }
+    if (this.options["pauseVideo"] != null) {
+      str += " onplay=\"this.dispatchEvent(new CustomEvent('vplay',{bubbles:!0}));for(var e=document.getElementsByTagName('video'),t=0;t<e.length;t++)e[t]!=this&&e[t].pause()\""
+    }
+    str += ">"
+    const srcArr = node["src"] as string[]
+    if (srcArr != null) {
+      for (let i = 0; i < srcArr.length; i++) {
+        str += `<source src="${srcArr[i]}">`
+      }
+    }
+    str += "</video>"
+    node["html"] = str
+  }
+  // #endif
+
+  private handleTable(node: UTSJSONObject, attrs: UTSJSONObject, children: UTSJSONObject[], styleObj: UTSJSONObject): void {
+    let padding = parseFloat(strVal(attrs, "cellpadding"))
+    let spacing = parseFloat(strVal(attrs, "cellspacing"))
+    const border = parseFloat(strVal(attrs, "border"))
+    const bordercolor = strVal(styleObj, "border-color")
+    const borderstyle = strVal(styleObj, "border-style")
+    if (node["c"] != null) {
+      if (isNaN(padding)) padding = 2
+      if (isNaN(spacing)) spacing = 2
+    }
+    if (border != null && !isNaN(border)) {
+      attrs["style"] = strVal(attrs, "style") + `;border:${border}px ${borderstyle != "" ? borderstyle : "solid"} ${bordercolor != "" ? bordercolor : "gray"}`
+    }
+
+    if (node["flag"] != null && node["c"] != null) {
+      this.layoutTableGrid(node, attrs, children, styleObj, padding, spacing, border, borderstyle, bordercolor)
+    } else {
+      if (node["c"] != null) {
+        styleObj["display"] = "table"
+      }
+      if (!isNaN(spacing)) {
+        styleObj["border-spacing"] = `${spacing}px`
+      }
+      if ((!isNaN(border) && border != 0) || !isNaN(padding)) {
+        this.traverseTdStyle(children, border, borderstyle, bordercolor, padding)
+      }
+    }
+    if (this.options["scrollTable"] != null && !strVal(attrs, "style").includes("inline")) {
+      const table = new UTSJSONObject()
+      table["name"] = node["name"]
+      table["attrs"] = attrs
+      table["children"] = children
+      const otherKeys = ["src", "c", "t", "w", "h", "m", "pre", "flag"]
+      for (let ki = 0; ki < otherKeys.length; ki++) {
+        if (node[otherKeys[ki]] != null) table[otherKeys[ki]] = node[otherKeys[ki]]
+      }
+      node["name"] = "div"
+      const wrapAttrs = new UTSJSONObject()
+      wrapAttrs["style"] = "overflow:auto"
+      node["attrs"] = wrapAttrs
+      const wrapChildren: UTSJSONObject[] = [table]
+      node["children"] = wrapChildren
+    }
+  }
+
+  private traverseTdStyle(nodes: UTSJSONObject[], border: number, borderstyle: string, bordercolor: string, padding: number): void {
+    for (let i = 0; i < nodes.length; i++) {
+      const td = nodes[i]
+      const tdname = strVal(td, "name")
+      if (tdname == "th" || tdname == "td") {
+        const tdAttrs = td["attrs"] as UTSJSONObject
+        const tdStyle = strVal(tdAttrs, "style")
+        if (!isNaN(border) && border != 0) {
+          tdAttrs["style"] = `border:${border}px ${borderstyle != "" ? borderstyle : "solid"} ${bordercolor != "" ? bordercolor : "gray"};${tdStyle}`
+        }
+        if (!isNaN(padding)) {
+          tdAttrs["style"] = `padding:${padding}px;${strVal(tdAttrs, "style")}`
+        }
+      } else {
+        const tdc = td["children"] as UTSJSONObject[]
+        if (tdc != null) this.traverseTdStyle(tdc, border, borderstyle, bordercolor, padding)
+      }
+    }
+  }
+
+  private layoutTableGrid(node: UTSJSONObject, attrs: UTSJSONObject, children: UTSJSONObject[], styleObj: UTSJSONObject,
+    padding: number, spacing: number, border: number, borderstyle: string, bordercolor: string): void {
+    styleObj["display"] = "grid"
+    if (strVal(styleObj, "border-collapse") == "collapse") {
+      styleObj["border-collapse"] = null
+      spacing = 0
+    }
+    if (spacing != 0 && !isNaN(spacing)) {
+      styleObj["grid-gap"] = `${spacing}px`
+      styleObj["padding"] = `${spacing}px`
+    } else if (!isNaN(border) && border != 0) {
+      attrs["style"] = strVal(attrs, "style") + ";border-left:0;border-top:0"
+    }
+
+    const width: string[] = [] as string[]
+    const trList: UTSJSONObject[] = [] as UTSJSONObject[]
+    const cells: UTSJSONObject[] = [] as UTSJSONObject[]
+    const map = new UTSJSONObject()
+
+    this.collectTrInto(children, trList, width)
+
+    for (let row = 1; row <= trList.length; row++) {
+      let col = 1
+      const trChildren = trList[row - 1]["children"] as UTSJSONObject[]
+      if (trChildren == null) continue
+      for (let j = 0; j < trChildren.length; j++) {
+        const td = trChildren[j]
+        const tdname = strVal(td, "name")
+        if (tdname != "td" && tdname != "th") continue
+        while (map[`${row}.${col}`] != null) {
+          col++
+        }
+        const tdAttrs = td["attrs"] as UTSJSONObject
+        let style = strVal(tdAttrs, "style")
+        const swIdx = style.indexOf("width")
+        let start = -1
+        if (swIdx != -1) {
+          const scw = style.indexOf(";width")
+          start = scw != -1 ? scw : swIdx
+        }
+        if (start != -1) {
+          let end = style.indexOf(";", start + 6)
+          if (end == -1) end = style.length
+          if (tdAttrs["colspan"] == null) {
+            while (width.length <= col) width.push("")
+            width[col] = style.substring(start != 0 ? start + 7 : 6, end)
+          }
+          style = style.substring(0, start) + style.substring(end)
+        }
+        style += ";display:flex"
+        const vaStart = style.indexOf("vertical-align")
+        if (vaStart != -1) {
+          const val = style.substring(vaStart + 15, vaStart + 25)
+          if (val.includes("middle")) {
+            style += ";align-items:center"
+          } else if (val.includes("bottom")) {
+            style += ";align-items:flex-end"
+          }
+        } else {
+          style += ";align-items:center"
+        }
+        const taStart = style.indexOf("text-align")
+        if (taStart != -1) {
+          const val = style.substring(taStart + 11, taStart + 21)
+          if (val.includes("center")) {
+            style += ";justify-content: center"
+          } else if (val.includes("right")) {
+            style += ";justify-content: right"
+          }
+        }
+        let prefix = ";"
+        if (!isNaN(border) && border != 0) {
+          prefix = `;border:${border}px ${borderstyle != "" ? borderstyle : "solid"} ${bordercolor != "" ? bordercolor : "gray"}` + (spacing != 0 && !isNaN(spacing) ? "" : ";border-right:0;border-bottom:0") + prefix
+        }
+        if (!isNaN(padding)) {
+          prefix = `;padding:${padding}px` + prefix
+        }
+        style = prefix + style
+
+        const colspanStr = strVal(tdAttrs, "colspan")
+        const colspan = colspanStr != "" ? parseInt(colspanStr) : 1
+        const rowspanStr = strVal(tdAttrs, "rowspan")
+        const rowspan = rowspanStr != "" ? parseInt(rowspanStr) : 1
+
+        if (tdAttrs["colspan"] != null) {
+          style += `;grid-column-start:${col};grid-column-end:${col + colspan}`
+          if (tdAttrs["rowspan"] == null) {
+            style += `;grid-row-start:${row};grid-row-end:${row + 1}`
+          }
+        }
+        if (tdAttrs["rowspan"] != null) {
+          style += `;grid-row-start:${row};grid-row-end:${row + rowspan}`
+          if (tdAttrs["colspan"] == null) {
+            style += `;grid-column-start:${col};grid-column-end:${col + 1}`
+          }
+          for (let rs = 1; rs < rowspan; rs++) {
+            for (let cs = 0; cs < colspan; cs++) {
+              map[`${row + rs}.${col - cs}`] = 1
+            }
+          }
+        }
+        if (style != "") {
+          tdAttrs["style"] = style
+        }
+        cells.push(td)
+        col++
+      }
+      if (row == 1) {
+        let temp = ""
+        for (let i = 1; i < col; i++) {
+          temp += (i < width.length && width[i] != "" ? width[i] : "auto") + " "
+        }
+        styleObj["grid-template-columns"] = temp
+      }
+    }
+    node["children"] = cells
+  }
+
+  private collectTrInto(nodes: UTSJSONObject[], trList: UTSJSONObject[], width: string[]): void {
+    for (let i = 0; i < nodes.length; i++) {
+      const nm = strVal(nodes[i], "name")
+      if (nm == "tr") {
+        trList.push(nodes[i])
+      } else if (nm == "colgroup") {
+        const cgChildren = nodes[i]["children"] as UTSJSONObject[]
+        if (cgChildren != null) {
+          let colI = 1
+          for (let ci = 0; ci < cgChildren.length; ci++) {
+            const col = cgChildren[ci]
+            if (strVal(col, "name") == "col") {
+              const colAttrs = col["attrs"] as UTSJSONObject
+              const style = strVal(colAttrs, "style")
+              const swIdx = style.indexOf("width")
+              let start = -1
+              if (swIdx != -1) {
+                const scw = style.indexOf(";width")
+                start = scw != -1 ? scw : swIdx
+              }
+              if (start != -1) {
+                let end = style.indexOf(";", start + 6)
+                if (end == -1) end = style.length
+                const w = style.substring(start != 0 ? start + 7 : 6, end)
+                while (width.length <= colI) width.push("")
+                width[colI] = w
+              }
+              colI += 1
+            }
+          }
+        }
+      } else {
+        const nc = nodes[i]["children"] as UTSJSONObject[]
+        if (nc != null) this.collectTrInto(nc, trList, width)
+      }
+    }
+  }
+
+  private traversalTbodyColor(children: UTSJSONObject[], styleObj: UTSJSONObject): void {
+    const styleKeys = ["color", "background", "background-color"]
+    for (let i = 0; i < children.length; i++) {
+      if (strVal(children[i], "name") == "td") {
+        const tdAttrs = children[i]["attrs"] as UTSJSONObject
+        for (let sk = 0; sk < styleKeys.length; sk++) {
+          const sv = strVal(styleObj, styleKeys[sk])
+          if (sv != "") {
+            tdAttrs["style"] = `${styleKeys[sk]}:${sv};${strVal(tdAttrs, "style")}`
+          }
+        }
+      } else {
+        const nc = children[i]["children"] as UTSJSONObject[]
+        if (nc != null) this.traversalTbodyColor(nc, styleObj)
+      }
+    }
+  }
+
+  private handleRuby(children: UTSJSONObject[]): void {
+    for (let i = 0; i < children.length - 1; i++) {
+      if (strVal(children[i], "type") == "text" && strVal(children[i + 1], "name") == "rt") {
+        const rtAttrs = children[i + 1]["attrs"] as UTSJSONObject
+        const rtChildren = children[i + 1]["children"] as UTSJSONObject[]
+        const upper = new UTSJSONObject()
+        upper["name"] = "div"
+        const ua = new UTSJSONObject()
+        ua["style"] = "font-size:50%;" + strVal(rtAttrs, "style")
+        upper["attrs"] = ua
+        const uc: UTSJSONObject[] = rtChildren != null ? rtChildren : ([] as UTSJSONObject[])
+        upper["children"] = uc
+        const wrapper = new UTSJSONObject()
+        wrapper["name"] = "div"
+        const wa = new UTSJSONObject()
+        wa["style"] = "display:inline-block;text-align:center"
+        wrapper["attrs"] = wa
+        const wc: UTSJSONObject[] = [upper, children[i]]
+        wrapper["children"] = wc
+        children[i] = wrapper
+        children.splice(i + 1, 1)
+      }
+    }
+  }
+
+  private traversalInline(node: UTSJSONObject, children: UTSJSONObject[]): void {
+    node["c"] = 2
+    for (let i = children.length - 1; i >= 0; i--) {
+      const child = children[i]
+      const childName = strVal(child, "name")
+      const childStyle = strVal(child["attrs"] as UTSJSONObject, "style")
+      const isInline = childName != "" && (mapHas(inlineTags, childName) || (childStyle.includes("inline") && child["children"] != null))
+      if (isInline && child["c"] == null) {
+        const gc = child["children"] as UTSJSONObject[]
+        if (gc != null) this.traversalInline(child, gc)
+      }
+      if (child["c"] == null || childName == "table") {
+        node["c"] = 1
+      }
+    }
+  }
+
+  onText(textParam: string): void {
+    let text = textParam
+    if (this.pre == 0) {
+      let trim = ""
+      let flag = false
+      for (let i = 0; i < text.length; i++) {
+        const c = charAt(text, i)
+        if (!mapHas(blankChar, c)) {
+          trim += c
+        } else {
+          if (trim.length == 0 || charAt(trim, trim.length - 1) != " ") {
+            trim += " "
+          }
+          if (c == "\n" && !flag) {
+            flag = true
+          }
+        }
+      }
+      if (trim == " ") {
+        if (flag) return
+        // #ifdef VUE3
+        const parent = this.stack.length > 0 ? this.stack[this.stack.length - 1] : null
+        if (parent != null && charAt(strVal(parent, "name"), 0) == "t") return
+        // #endif
+      }
+      text = trim
+    }
+    const node = new UTSJSONObject()
+    node["type"] = "text"
+    node["attrs"] = new UTSJSONObject()
+    node["text"] = decodeEntity(text, false)
+    if (this.hook(node)) {
+      // #ifdef MP-WEIXIN
+      if (`${this.options["selectable"]}` == "force" && `${uni.getDeviceInfo().system}`.includes("iOS")) {
+        this.expose()
+      }
+      // #endif
+      let siblings: UTSJSONObject[]
+      if (this.stack.length > 0) {
+        const pc = this.stack[this.stack.length - 1]["children"] as UTSJSONObject[]
+        siblings = pc != null ? pc : this.nodes
+      } else {
+        siblings = this.nodes
+      }
+      siblings.push(node)
+    }
+  }
+}
+
+// ============ Lexer ============
+
+export class Lexer {
+  handler: Parser
+  content: string = ""
+  i: number = 0
+  start: number = 0
+  state: number = ST_TEXT
+
+  constructor(handler: Parser) {
+    this.handler = handler
+  }
+
+  parse(contentParam: string): void {
+    this.content = contentParam != null ? contentParam : ""
+    this.i = 0
+    this.start = 0
+    this.state = ST_TEXT
+    const len = this.content.length
+    while (this.i != -1 && this.i < len) {
+      if (this.state == ST_TEXT) {
+        this.lexText()
+      } else if (this.state == ST_TAG_NAME) {
+        this.lexTagName()
+      } else if (this.state == ST_ATTR_NAME) {
+        this.lexAttrName()
+      } else if (this.state == ST_ATTR_VAL) {
+        this.lexAttrVal()
+      } else if (this.state == ST_END_TAG) {
+        this.lexEndTag()
+      }
+    }
+  }
+
+  private checkClose(method: string): boolean {
+    const selfClose = charAt(this.content, this.i) == "/"
+    const cur = charAt(this.content, this.i)
+    const next = charAt(this.content, this.i + 1)
+    if (cur == ">" || (selfClose && next == ">")) {
+      if (method != "") {
+        const sub = this.content.substring(this.start, this.i)
+        if (method == "onTagName") this.handler.onTagName(sub)
+        else if (method == "onAttrName") this.handler.onAttrName(sub)
+        else if (method == "onAttrVal") this.handler.onAttrVal(sub)
+      }
+      this.i += selfClose ? 2 : 1
+      this.start = this.i
+      this.handler.onOpenTag(selfClose)
+      if (this.handler.tagName == "script") {
+        this.i = this.content.indexOf("</", this.i)
+        if (this.i != -1) {
+          this.i += 2
+          this.start = this.i
+        }
+        this.state = ST_END_TAG
+      } else {
+        this.state = ST_TEXT
+      }
+      return true
+    }
+    return false
+  }
+
+  private lexText(): void {
+    this.i = this.content.indexOf("<", this.i)
+    if (this.i == -1) {
+      if (this.start < this.content.length) {
+        this.handler.onText(this.content.substring(this.start, this.content.length))
+      }
+      return
+    }
+    const c = charAt(this.content, this.i + 1)
+    if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z")) {
+      if (this.start != this.i) {
+        this.handler.onText(this.content.substring(this.start, this.i))
+      }
+      this.i++
+      this.start = this.i
+      this.state = ST_TAG_NAME
+    } else if (c == "/" || c == "!" || c == "?") {
+      if (this.start != this.i) {
+        this.handler.onText(this.content.substring(this.start, this.i))
+      }
+      const next = charAt(this.content, this.i + 2)
+      if (c == "/" && ((next >= "a" && next <= "z") || (next >= "A" && next <= "Z"))) {
+        this.i += 2
+        this.start = this.i
+        this.state = ST_END_TAG
+        return
+      }
+      let end = "-->"
+      if (c != "!" || charAt(this.content, this.i + 2) != "-" || charAt(this.content, this.i + 3) != "-") {
+        end = ">"
+      }
+      this.i = this.content.indexOf(end, this.i)
+      if (this.i != -1) {
+        this.i += end.length
+        this.start = this.i
+      }
+    } else {
+      this.i++
+    }
+  }
+
+  private lexTagName(): void {
+    const c = charAt(this.content, this.i)
+    if (mapHas(blankChar, c)) {
+      this.handler.onTagName(this.content.substring(this.start, this.i))
+      this.i++
+      while (mapHas(blankChar, charAt(this.content, this.i))) {
+        this.i++
+      }
+      if (this.i < this.content.length && !this.checkClose("")) {
+        this.start = this.i
+        this.state = ST_ATTR_NAME
+      }
+    } else if (!this.checkClose("onTagName")) {
+      this.i++
+    }
+  }
+
+  private lexAttrName(): void {
+    let c = charAt(this.content, this.i)
+    if (mapHas(blankChar, c) || c == "=") {
+      this.handler.onAttrName(this.content.substring(this.start, this.i))
+      const needVal = c == "="
+      const len = this.content.length
+      this.i++
+      while (this.i < len) {
+        c = charAt(this.content, this.i)
+        if (!mapHas(blankChar, c)) {
+          if (this.checkClose("")) return
+          if (needVal) {
+            this.start = this.i
+            this.state = ST_ATTR_VAL
+            return
+          }
+          if (charAt(this.content, this.i) == "=") {
+            // 继续循环，等待 needVal 处理
+          } else {
+            this.start = this.i
+            this.state = ST_ATTR_NAME
+            return
+          }
+        }
+        this.i++
+      }
+    } else if (!this.checkClose("onAttrName")) {
+      this.i++
+    }
+  }
+
+  private lexAttrVal(): void {
+    const c = charAt(this.content, this.i)
+    const len = this.content.length
+    if (c == "\"" || c == "'") {
+      this.i++
+      this.start = this.i
+      this.i = this.content.indexOf(c, this.i)
+      if (this.i == -1) return
+      this.handler.onAttrVal(this.content.substring(this.start, this.i))
+    } else {
+      while (this.i < len) {
+        if (mapHas(blankChar, charAt(this.content, this.i))) {
+          this.handler.onAttrVal(this.content.substring(this.start, this.i))
+          break
+        } else if (this.checkClose("onAttrVal")) {
+          return
+        }
+        this.i++
+      }
+    }
+    this.i++
+    while (mapHas(blankChar, charAt(this.content, this.i))) {
+      this.i++
+    }
+    if (this.i < len && !this.checkClose("")) {
+      this.start = this.i
+      this.state = ST_ATTR_NAME
+    }
+  }
+
+  private lexEndTag(): void {
+    const c = charAt(this.content, this.i)
+    if (mapHas(blankChar, c) || c == ">" || c == "/") {
+      this.handler.onCloseTag(this.content.substring(this.start, this.i))
+      if (c != ">") {
+        this.i = this.content.indexOf(">", this.i)
+        if (this.i == -1) return
+      }
+      this.i++
+      this.start = this.i
+      this.state = ST_TEXT
+    } else {
+      this.i++
+    }
+  }
+}
+
+export default Parser

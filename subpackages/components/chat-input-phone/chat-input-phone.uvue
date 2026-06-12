@@ -10,13 +10,8 @@
     <view class="flex flex-row items-center overflow-hide">
       <!-- 手动选择组件 -->
       <manual-component-item
-        v-if="
-          (manualComponents?.length && !isRecording) ||
-          (pageHomeIndex && expandPageArea === ExpandPageAreaEnum.Yes) ||
-          isTaskAgent ||
-          allowOtherModel
-        "
-        :manual-components="manualComponents || []"
+        v-if="showManualComponent"
+        :manual-components="safeManualComponents"
         :selected-components="selectedComponents"
         :page-home-index="pageHomeIndex"
         :expand-page-area="expandPageArea"
@@ -43,7 +38,7 @@
     </view>
 
     <!--图片列表-->
-    <template v-if="files?.length">
+    <template v-if="hasUploadedFiles">
       <chat-upload-image
         :files="files"
         @onDel="handleDelFile"
@@ -57,7 +52,7 @@
       :class="{ 'remove-shadow': isRecording }"
     >
       <!-- 无权限蒙层 -->
-      <view class="permission-mask" v-if="!hasPermission">
+      <view class="permission-mask" v-if="showNoPermissionMask">
         <text class="permission-text">{{
           t("Mobile.Chat.noAgentPermission")
         }}</text>
@@ -89,7 +84,7 @@
       </view>
       <view class="chat-input-container" :class="{ 'multi-line': isMultiLine }">
         <voice-recorder-button
-          v-if="inputMethod === ChatInputMethod.Voice"
+          v-if="isVoiceInput"
           :duration="600000"
           :is-conversation-active="isConversationActive"
           @onRecordStart="handleVoiceStart"
@@ -127,12 +122,10 @@
         <!-- 图标容器 -->
         <view class="icon-container" v-if="!isRecording">
           <!-- 如果不存在输入内容，则显示输入方式 -->
-          <template
-            v-if="!messageInfo || (messageInfo && messageInfo.trim() === '')"
-          >
+          <template v-if="showInputMethodIcons">
             <!-- 输入方式: 键盘 -->
             <text
-              v-if="inputMethod === ChatInputMethod.Voice"
+              v-if="isVoiceInput"
               class="iconfont icon-keyboard font-48"
               @click="handleChangeInputMethod"
             />
@@ -162,10 +155,7 @@
           </template>
           <!-- 如果存在输入内容或图片文件，则显示发送按钮。没有输入内容和图片文件，则显示添加图片或文件按钮 -->
           <text
-            v-else-if="
-              (messageInfo?.length && messageInfo.trim() !== '') ||
-              files?.length
-            "
+            v-else-if="showSendIcon"
             class="iconfont icon-send icon-send-image"
             @click="handleSendMessage"
           />
@@ -276,15 +266,70 @@
   import { ACCESS_TOKEN } from "@/constants/home.constants";
   import { SandboxInfo } from "@/types/interfaces/sandbox";
   import { useI18n } from "@/utils/i18n";
+  import {
+    canSendChatMessage,
+    computeWechatKeyboardOffset,
+    countImageFiles,
+    countNonImageFiles,
+    filterFilesExcludingUid,
+    filterSkillsRemainingInText,
+    getSkillInsertPrefix,
+    getStorageTokenString,
+    hasUploadErrorInFiles,
+    invertBoolean,
+    isAtTypedOnInput,
+    isHomeChatRoute,
+    isImageChooseCancelled,
+    isMessageEmptyForIcons,
+    isSkillAlreadySelected,
+    isWholeDisabledSendBlocked,
+    resolveUploadFailMessage,
+    shouldApplyAtCursorAfterSkillSelect,
+    shouldInsertSkillAtCursor,
+    shouldOpenSkillPickerOnAtInput,
+    shouldRestoreCursorOnSkillModalClose,
+    shouldShowSendButton,
+    showManualComponentBar,
+    stringContains,
+    stringEndsWith,
+  } from "./chatInputActions.uts";
 
-  const { t } = useI18n();
+  const { t: tRaw } = useI18n();
+
+  /** 模板用：单参翻译（useI18n 的 t 需全参，模板单参调用不匹配） */
+  const t = (key: string): string => tRaw(key, new Map<string, any>(), "");
+
+  /** UTS 兼容：带 count 参数的翻译 */
+  const tCount = (key: string, count: number): string => {
+    const m = new Map<string, any>();
+    m.set("count", count);
+    return tRaw(key, m, "");
+  };
+
+  /** UTS 兼容：带 reason 参数的翻译 */
+  const tReason = (key: string, reason: string): string => {
+    const m = new Map<string, any>();
+    m.set("reason", reason);
+    return tRaw(key, m, "");
+  };
 
   /** UTS 兼容：可空字符串兜底 */
-  const coalesceString = (value: string | null | undefined): string => {
+  const coalesceString = (value: string | null): string => {
     if (value != null) {
       return value;
     }
     return "";
+  };
+
+  // 输入框ref（前置声明，供 focusChatInput 引用）
+  const inputRef = ref<UniInputElement | null>(null);
+
+  /** UTS 兼容：安全聚焦输入框 */
+  const focusChatInput = (): void => {
+    const input = inputRef.value;
+    if (input != null) {
+      input.focus();
+    }
   };
 
   // 文档
@@ -302,8 +347,8 @@
   const showExtraContainer = ref<boolean>(false);
   // 输入方式
   const inputMethod = ref<ChatInputMethod>(ChatInputMethod.Input);
-  // 输入框ref
-  const inputRef = ref<UniInputElement | null>(null);
+  // 模板用：当前是否语音输入（UTS 模板不能直接引用枚举类）
+  const isVoiceInput = computed((): boolean => inputMethod.value == ChatInputMethod.Voice);
   // 是否正在录音
   const isRecording = ref<boolean>(false);
   // 是否取消录音
@@ -311,10 +356,18 @@
   // 已选组件列表
   const selectedComponents = ref<AgentSelectedComponentInfo[]>([]);
   // 录音时长计时器
-  let durationTimer: any = null;
+  let durationTimer: number | null = null;
 
   // 波形动画数据
-  const waveformBars = ref([]);
+  class WaveformBar {
+    height: number;
+    delay: number;
+    constructor(height: number, delay: number) {
+      this.height = height;
+      this.delay = delay;
+    }
+  }
+  const waveformBars = ref<WaveformBar[]>([] as WaveformBar[]);
   // 是否是 iOS 微信小程序
   const isIOSWechatMiniProgram = ref<boolean>(false);
   // 标记是否由输入 @ 触发
@@ -329,7 +382,7 @@
   const props = withDefaults(
     defineProps<{
       manualComponents?: AgentManualComponentInfo[];
-      defaultSelectedComponents?: AgentSelectedComponentInfo[] | null;
+      defaultSelectedComponents?: AgentSelectedComponentInfo[];
       // 会话是否正在进行中（有消息正在处理）
       isConversationActive?: boolean;
       // 停止操作是否正在进行中
@@ -360,7 +413,6 @@
     }>(),
     {
       manualComponents: () => [],
-      defaultSelectedComponents: () => null,
       isConversationActive: false,
       isStoppingConversation: false,
       wholeDisabled: false,
@@ -397,20 +449,19 @@
 
   // 声明事件
   const emit = defineEmits<{
-    // 智能体主页和临时聊天页发送消息
-    onSendMessage: (data: {
+    (e: 'onSendMessage', data: {
       messageInfo: string;
       files: UploadFileInfo[];
       selectedComponents: AgentSelectedComponentInfo[];
       skillIds: number[];
-    }) => void;
-    onStopConversation: () => void;
-    onOpenPagePreview: (uri: string) => void;
-    // 打开工作台
-    onOpenFileTree: () => void;
-    onSandboxChange: (sandboxId: string) => void;
-    onModelChange: (modelId: number, name: string) => void;
-    onOpenSubscription: () => void;
+    }): void;
+    (e: 'onStopConversation'): void;
+    (e: 'onOpenPagePreview', uri: string): void;
+    (e: 'onOpenFileTree'): void;
+    (e: 'onSandboxChange', sandboxId: string): void;
+    (e: 'onModelChange', modelId: number, name: string): void;
+    (e: 'onOpenSubscription'): void;
+    (e: 'onScrollToLastMsg', smooth: boolean): void;
   }>();
 
   // 切换沙盒
@@ -454,10 +505,11 @@
       Math.floor((targetWidth + gap) / (barWidth + gap)),
     ); // At least 3 bars
 
-    waveformBars.value = Array.from({ length: numBars }, (_, index) => ({
-      height: Math.random() * 20 + 5, // Initial random height 5-25
-      delay: index * 100,
-    }));
+    const arr = [] as WaveformBar[];
+    for (let index = 0; index < numBars; index++) {
+      arr.push(new WaveformBar(Math.random() * 20 + 5, index * 100));
+    }
+    waveformBars.value = arr;
   };
 
   // 确保组件挂载后也初始化波形和输入方式
@@ -467,12 +519,10 @@
 
     // 从缓存中读取输入方式
     const chatInputMethod = uni.getStorageSync(CHAT_INPUT_METHOD);
-    if (
-      chatInputMethod &&
-      (chatInputMethod === ChatInputMethod.Voice ||
-        chatInputMethod === ChatInputMethod.Input)
-    ) {
-      inputMethod.value = chatInputMethod as ChatInputMethod;
+    if (chatInputMethod == "voice") {
+      inputMethod.value = ChatInputMethod.Voice;
+    } else if (chatInputMethod == "input") {
+      inputMethod.value = ChatInputMethod.Input;
     }
 
     // 判断是否是 iOS 微信小程序
@@ -501,10 +551,11 @@
 
   // 更新波形动画
   const updateWaveform = () => {
-    waveformBars.value = waveformBars.value.map((bar) => ({
-      ...bar,
-      height: Math.random() * 20 + 5,
-    }));
+    const arr = [] as WaveformBar[];
+    waveformBars.value.forEach((bar: WaveformBar) => {
+      arr.push(new WaveformBar(Math.random() * 20 + 5, bar.delay));
+    });
+    waveformBars.value = arr;
   };
 
   // 开始录音时长计时
@@ -516,8 +567,9 @@
 
   // 停止录音时长计时
   const stopDurationTimer = () => {
-    if (durationTimer) {
-      clearInterval(durationTimer);
+    const t = durationTimer;
+    if (t != null) {
+      clearInterval(t);
       durationTimer = null;
     }
   };
@@ -529,28 +581,49 @@
 
   // 选择组件
   const handleToggleSelectComponent = (item: AgentSelectedComponentInfo) => {
-    if (selectedComponents.value?.some((selected) => selected.id === item.id)) {
-      selectedComponents.value = selectedComponents.value.filter(
-        (selected) => selected.id !== item.id,
-      );
+    let found = false;
+    const list = selectedComponents.value;
+    const listLen = list.length;
+    for (let i = 0; i < listLen; i++) {
+      if (list[i].id == item.id) {
+        found = true;
+        break;
+      }
+    }
+    if (found == true) {
+      const next: AgentSelectedComponentInfo[] = [];
+      for (let j = 0; j < listLen; j++) {
+        if (list[j].id != item.id) {
+          next.push(list[j]);
+        }
+      }
+      selectedComponents.value = next;
     } else {
-      selectedComponents.value = [...selectedComponents.value, item];
+      selectedComponents.value = [...list, item];
     }
   };
 
-  // 监听 props 变化并更新 selectedComponents
+  // 监听 props.defaultSelectedComponents 变化并更新 selectedComponents
   watch(
-    () => [props.defaultSelectedComponents, props.manualComponents],
-    ([newValue]) => {
-      if (newValue) {
+    (): AgentSelectedComponentInfo[] | null => props.defaultSelectedComponents as AgentSelectedComponentInfo[] | null,
+    (newValue: AgentSelectedComponentInfo[] | null) => {
+      if (newValue != null) {
         selectedComponents.value = newValue;
       } else {
-        selectedComponents.value = props.manualComponents
-          ?.filter((item) => item.defaultSelected === DefaultSelectedEnum.Yes)
-          .map((item) => ({
-            id: item.id,
-            type: item.type,
-          }));
+        const defaults = [] as AgentSelectedComponentInfo[];
+        const manualList = props.manualComponents;
+        const manualLen = manualList != null ? manualList.length : 0;
+        for (let i = 0; i < manualLen; i++) {
+          const list_ = props.manualComponents;
+          if (list_ == null) {
+            break;
+          }
+          const item = list_[i];
+          if (item.defaultSelected == DefaultSelectedEnum.Yes) {
+            defaults.push(new AgentSelectedComponentInfo(item.id, item.type));
+          }
+        }
+        selectedComponents.value = defaults;
       }
     },
     { immediate: true, deep: true },
@@ -563,7 +636,9 @@
     // 微信小程序
     // #ifdef MP-WEIXIN
     if (res.detail.height > 31) {
-      keyboardHeight.value = showExtraContainer.value ? 30 + 115 : 30;
+      keyboardHeight.value = computeWechatKeyboardOffset(
+        showExtraContainer.value,
+      );
     } else {
       keyboardHeight.value = 0;
     }
@@ -577,34 +652,75 @@
 
   // 生成文件唯一ID
   const getFileUid = () => {
-    return Date.now().toString() + Math.random().toString(36).substr(2, 9);
+    return Date.now().toString() + Math.floor(Math.random() * 1000000000).toString();
   };
 
-  // 计算已选择图片数量
-  const imageCount = computed(() => {
-    const result: number | undefined = files.value?.reduce(
-      (acc, file) => acc + (file.type?.includes("image/") ? 1 : 0),
-      0,
-    );
-    return result === undefined ? 0 : result;
+  // 计算已选择图片数量（UTS 不支持 reduce，逻辑见 countImageFiles）
+  const imageCount = computed((): number => {
+    return countImageFiles(files.value);
   });
 
   // 计算已选择文件数量
-  const fileCount = computed(() => {
-    const result: number | undefined = files.value?.reduce(
-      (acc, file) => acc + !(file.type?.includes("image/") ? 1 : 0),
-      0,
-    );
-    return result === undefined ? 0 : result;
+  const fileCount = computed((): number => {
+    return countNonImageFiles(files.value);
   });
 
   // 计算是否显示添加按钮
-  const showAddButton = computed(() => {
-    return (
-      imageCount.value < DEFAULT_IMAGE_COUNT ||
-      fileCount.value < DEFAULT_FILE_COUNT
+  const showAddButton = computed((): boolean => {
+    if (imageCount.value < DEFAULT_IMAGE_COUNT) {
+      return true;
+    }
+    if (fileCount.value < DEFAULT_FILE_COUNT) {
+      return true;
+    }
+    return false;
+  });
+
+  /** 模板 v-if：手动组件栏 */
+  const showManualComponent = computed((): boolean => {
+    const manualLen = props.manualComponents.length;
+    let pageHome = "";
+    if (props.pageHomeIndex != null) {
+      pageHome = props.pageHomeIndex as string;
+    }
+    return showManualComponentBar(
+      manualLen,
+      isRecording.value,
+      pageHome,
+      props.expandPageArea != null ? props.expandPageArea! : 0,
+      1,
+      props.isTaskAgent,
+      props.allowOtherModel,
     );
   });
+
+  /** 模板 :manual-components 兜底 */
+  const safeManualComponents = computed((): AgentManualComponentInfo[] => {
+    return props.manualComponents;
+  });
+
+  /** 模板 v-if：附件列表 */
+  const hasUploadedFiles = computed((): boolean => {
+    return files.value.length > 0;
+  });
+
+  /** 模板 v-if：无权限蒙层 */
+  const showNoPermissionMask = computed((): boolean => {
+    return props.hasPermission == false;
+  });
+
+  /** 模板 v-if：空内容时显示语音/键盘图标 */
+  const showInputMethodIcons = computed((): boolean => {
+    return isMessageEmptyForIcons(messageInfo.value);
+  });
+
+  /** 模板 v-if：显示发送按钮 */
+  const showSendIcon = computed((): boolean => {
+    return shouldShowSendButton(messageInfo.value, files.value.length);
+  });
+
+  // 前置间接引用（uploadMultipleFiles 定义在下方，UTS 不支持函数声明提升）
+  let _uploadMultipleFiles: ((filePaths: string[]) => Promise<void>) | null = null;
 
   // 选择文件
   const chooseFile = () => {
@@ -612,9 +728,7 @@
     if (fileCount.value >= DEFAULT_FILE_COUNT) {
       uni.showToast({
         position: "bottom",
-        title: t("Mobile.Chat.fileLimitReached", {
-          count: DEFAULT_FILE_COUNT,
-        }),
+        title: tCount("Mobile.Chat.fileLimitReached", DEFAULT_FILE_COUNT),
       });
       return;
     }
@@ -629,7 +743,7 @@
         // 如果当前选择图片数量大于可选择图片数量，则返回
         if (uploadCount > maxCount) {
           uni.showToast({
-            title: t("Mobile.Chat.fileMaxSelect", { count: maxCount }),
+            title: tCount("Mobile.Chat.fileMaxSelect", maxCount),
             icon: "none",
             duration: 2000,
           });
@@ -648,7 +762,9 @@
 
         // 一次性上传所有选中的图片
         const filePaths = res.tempFiles.map((file) => file.path);
-        uploadMultipleFiles(filePaths);
+        if (_uploadMultipleFiles != null) {
+          _uploadMultipleFiles!(filePaths);
+        }
       },
       fail: (err) => {
         console.error("choose file: " + err.errMsg);
@@ -666,21 +782,25 @@
   const handleSkillSelect = (skill: SkillInfoForAt) => {
     skillSelectModalVisible.value = false; // 关闭选择技能弹框
 
-    if (!selectedSkills.value.some((s) => s.id === skill.id)) {
+    const alreadySelected = isSkillAlreadySelected(
+      selectedSkills.value,
+      skill.id,
+    );
+    if (alreadySelected == false) {
       selectedSkills.value.push(skill);
     }
 
     const _rawText: string = messageInfo.value;
-    const text: string = _rawText ? _rawText : "";
+    let text: string = coalesceString(_rawText);
     const index = atCursorIndex.value;
     let targetCursor: number = -1;
 
-    if (
-      isAtTrigger.value &&
-      index !== undefined &&
-      index >= 1 &&
-      index <= text.length
-    ) {
+    const insertAtCursor = shouldInsertSkillAtCursor(
+      isAtTrigger.value,
+      index,
+      text.length,
+    );
+    if (insertAtCursor == true) {
       // 在光标位置原地补全
       const before = text.substring(0, index - 1);
       const after = text.substring(index);
@@ -690,15 +810,13 @@
     } else {
       // 降级处理（末尾追加）
       let tempText = text;
-      if (isAtTrigger.value && tempText.endsWith("@")) {
-        tempText = tempText.slice(0, -1);
+      const endsWithAt = stringEndsWith(tempText, "@");
+      if (isAtTrigger.value == true) {
+        if (endsWithAt == true) {
+          tempText = tempText.slice(0, -1);
+        }
       }
-      const prefix =
-        tempText && tempText.length > 0
-          ? tempText.endsWith(" ")
-            ? ""
-            : " "
-          : "";
+      const prefix = getSkillInsertPrefix(tempText);
       const addedText = prefix + `@${skill.name} `;
       text = tempText + addedText;
       targetCursor = tempText.length + addedText.length;
@@ -709,7 +827,11 @@
     isAtTrigger.value = false; // 重置状态
     atCursorIndex.value = -1; // 重置光标位置
 
-    if (triggerWasActive && targetCursor >= 0) {
+    const shouldSetCursor = shouldApplyAtCursorAfterSkillSelect(
+      triggerWasActive,
+      targetCursor,
+    );
+    if (shouldSetCursor == true) {
       textareaCursor.value = targetCursor;
     }
 
@@ -725,12 +847,10 @@
 
     // #ifndef MP-WEIXIN
     nextTick(() => {
-      if (inputRef.value !== null && typeof inputRef.value?.focus === "function") {
-        inputRef.value.focus();
-        setTimeout(() => {
-          textareaCursor.value = -1;
-        }, 100);
-      }
+      focusChatInput();
+      setTimeout(() => {
+        textareaCursor.value = -1;
+      }, 100);
     });
     // #endif
   };
@@ -739,7 +859,11 @@
   const handleSkillModalClose = () => {
     skillSelectModalVisible.value = false;
 
-    if (isAtTrigger.value && atCursorIndex.value >= 0) {
+    const shouldRestore = shouldRestoreCursorOnSkillModalClose(
+      isAtTrigger.value,
+      atCursorIndex.value,
+    );
+    if (shouldRestore == true) {
       textareaCursor.value = atCursorIndex.value;
 
       // #ifdef MP-WEIXIN
@@ -754,12 +878,10 @@
 
       // #ifndef MP-WEIXIN
       nextTick(() => {
-        if (inputRef.value !== null && typeof inputRef.value?.focus === "function") {
-          inputRef.value.focus();
-          setTimeout(() => {
-            textareaCursor.value = -1;
-          }, 100);
-        }
+        focusChatInput();
+        setTimeout(() => {
+          textareaCursor.value = -1;
+        }, 100);
       });
       // #endif
     }
@@ -776,14 +898,13 @@
       const mentionWithSpace = `@${skill.name} `;
       const mention = `@${skill.name}`;
 
-      const _rawText: string = messageInfo.value;
-      let text: string = _rawText ? _rawText : "";
+      let text: string = coalesceString(messageInfo.value);
 
       // 本地变量操作，避免对 messageInfo.value 作多次 Response 促发
-      while (text.includes(mentionWithSpace)) {
+      while (stringContains(text, mentionWithSpace) == true) {
         text = text.replace(mentionWithSpace, "");
       }
-      while (text.includes(mention)) {
+      while (stringContains(text, mention) == true) {
         text = text.replace(mention, "");
       }
       messageInfo.value = text;
@@ -796,16 +917,18 @@
     if (imageCount.value >= DEFAULT_IMAGE_COUNT) {
       uni.showToast({
         position: "bottom",
-        title: t("Mobile.Chat.imageLimitReached", {
-          count: DEFAULT_IMAGE_COUNT,
-        }),
+        title: tCount("Mobile.Chat.imageLimitReached", DEFAULT_IMAGE_COUNT),
       });
       return;
     }
     // 可选择图片数量
     const maxCount = DEFAULT_IMAGE_COUNT - imageCount.value;
+    let sourceTypeItem = "album";
+    if (type == "camera") {
+      sourceTypeItem = "camera";
+    }
     uni.chooseImage({
-      sourceType: [type === "camera" ? "camera" : "album"],
+      sourceType: [sourceTypeItem],
       sizeType: ["original", "compressed"],
       count: maxCount,
       success: (res) => {
@@ -814,7 +937,7 @@
         // 如果当前选择图片数量大于可选择图片数量，则返回
         if (uploadCount > maxCount) {
           uni.showToast({
-            title: t("Mobile.Chat.imageMaxSelect", { count: maxCount }),
+            title: tCount("Mobile.Chat.imageMaxSelect", maxCount),
             icon: "none",
             duration: 2000,
           });
@@ -833,17 +956,19 @@
 
         // 一次性上传所有选中的图片
         const filePaths = res.tempFiles.map((file) => file.path);
-        uploadMultipleFiles(filePaths);
+        if (_uploadMultipleFiles != null) {
+          _uploadMultipleFiles!(filePaths);
+        }
       },
       fail: (err) => {
+        const errMsg = coalesceString(err.errMsg);
         // 如果取消选择图片，则不显示错误提示
-        if (err.errMsg.includes("cancel")) {
+        const isCancelled = isImageChooseCancelled(errMsg);
+        if (isCancelled == true) {
           return;
         }
         uni.showToast({
-          title: t("Mobile.Chat.chooseImageFailed", {
-            reason: (err?.errMsg ? err.errMsg : ""),
-          }),
+          title: tReason("Mobile.Chat.chooseImageFailed", errMsg),
           position: "bottom",
         });
       },
@@ -856,8 +981,8 @@
     uid: string,
   ): Promise<UploadFileInfo> => {
     // 令牌
-    const token = uni.getStorageSync(ACCESS_TOKEN) ?? "";
-    const header = {};
+    const token = getStorageTokenString(ACCESS_TOKEN);
+    const header = new UTSJSONObject();
     // #ifdef H5 || WEB
     if (process.env.NODE_ENV === "development") {
       header["Authorization"] = `Bearer ${token}`;
@@ -870,42 +995,80 @@
 
     return new Promise((resolve, reject) => {
       const _pop: string = filePath.split("/").pop() as string;
-      const fileName: string = _pop ? _pop : "image.jpg";
+      let fileName = "image.jpg";
+      if (_pop.length > 0) {
+        fileName = _pop;
+      }
+      const formDataObj = new UTSJSONObject();
+      formDataObj["type"] = "tmp";
       const uploadTask: UploadTask = uni.uploadFile({
         url: UPLOAD_FILE_ACTION,
         filePath: filePath,
         name: "file",
-        header,
-        formData: {
-          type: "tmp",
-        },
+        header: header,
+        formData: formDataObj,
         success: (res) => {
           try {
-            const result = JSON.parse(res.data);
-            const { code, data, message } = result;
-            if (code === SUCCESS_CODE) {
-              const uploadedFile: UploadFileInfo = {
-                key: data?.key ? data.key : "",
-                name: data?.fileName ? data.fileName : fileName,
-                type: data?.mimeType ? data.mimeType : "image/jpeg",
-                size: data?.size ? data.size : 0,
-                url: data?.url ? data.url : "",
-                uid,
-                status: UploadFileStatus.done,
-                percent: 100,
-                response: result,
-              };
-              resolve(uploadedFile);
+            const result = JSON.parse<UTSJSONObject>(res.data as string);
+            const code = result != null ? result["code"] as string : "";
+            const data = result != null ? result["data"] as UTSJSONObject | null : null;
+            const message = result != null ? result["message"] as string | null : null;
+            if (code == SUCCESS_CODE) {
+              let fileKey = "";
+              let uploadName = fileName;
+              let mimeType = "image/jpeg";
+              let fileSize = 0;
+              let fileUrl = "";
+              if (data != null) {
+                if (data["key"] != null) {
+                  fileKey = data["key"] as string;
+                }
+                if (data["fileName"] != null) {
+                  uploadName = data["fileName"] as string;
+                }
+                if (data["mimeType"] != null) {
+                  mimeType = data["mimeType"] as string;
+                }
+                if (data["size"] != null) {
+                  fileSize = data["size"] as number;
+                }
+                if (data["url"] != null) {
+                  fileUrl = data["url"] as string;
+                }
+              }
+              const fileObj = new UTSJSONObject();
+              fileObj["key"] = fileKey;
+              fileObj["name"] = uploadName;
+              fileObj["type"] = mimeType;
+              fileObj["size"] = fileSize;
+              fileObj["url"] = fileUrl;
+              fileObj["uid"] = uid;
+              fileObj["status"] = UploadFileStatus.done;
+              fileObj["percent"] = 100;
+              fileObj["response"] = result;
+              const uploadedFile = JSON.parse<UploadFileInfo>(JSON.stringify(fileObj));
+              if (uploadedFile != null) {
+                resolve(uploadedFile);
+              } else {
+                reject(new Error("parse uploadedFile failed"));
+              }
             } else {
-              reject(
-                new Error(
-                  data?.message
-                    ? data.message
-                    : message
-                      ? message
-                      : t("Mobile.AudioUploader.uploadFailed"),
-                ),
+              let dataMsg: string | null = null;
+              let resultMsg: string | null = null;
+              if (data != null) {
+                if (data["message"] != null) {
+                  dataMsg = data["message"] as string;
+                }
+              }
+              if (message != null) {
+                resultMsg = message;
+              }
+              const failText = resolveUploadFailMessage(
+                dataMsg,
+                resultMsg,
+                t("Mobile.AudioUploader.uploadFailed"),
               );
+              reject(new Error(failText));
             }
           } catch (error) {
             console.error("解析上传响应失败:", error);
@@ -920,25 +1083,43 @@
 
       // 上传进度
       uploadTask.onProgressUpdate((res: OnProgressUpdateResult) => {
-        const index = files.value.findIndex((file) => file.uid === uid);
-        if (index !== -1) {
-          files.value[index].percent = res.progress;
+        const list = files.value;
+        const listLen = list.length;
+        let foundIndex = -1;
+        for (let i = 0; i < listLen; i++) {
+          if (list[i].uid == uid) {
+            foundIndex = i;
+            break;
+          }
+        }
+        if (foundIndex != -1) {
+          list[foundIndex].percent = res.progress;
         }
       });
     });
   };
 
   // 多文件上传
-  const uploadMultipleFiles = async (filePaths: string[]) => {
-    if (filePaths.length === 0) return;
+  async function uploadMultipleFiles(filePaths: string[]): Promise<void> {
+    if (filePaths.length == 0) return;
 
     try {
       // 并发上传所有图片
       const uploadPromises = filePaths.map((filePath) => {
-        // 找到对应的文件以获取uid
-        const file = files.value?.find((f) => f.url === filePath);
-        const _uid: string = file?.uid ? file.uid : "";
-        return uploadFile(filePath, _uid);
+        // 找到对应的文件以获取 uid
+        let matchedUid = "";
+        const fileList = files.value;
+        const fileListLen = fileList.length;
+        for (let i = 0; i < fileListLen; i++) {
+          if (fileList[i].url == filePath) {
+            const fileUid = fileList[i].uid;
+            if (fileUid != null) {
+              matchedUid = fileUid;
+            }
+            break;
+          }
+        }
+        return uploadFile(filePath, matchedUid);
       });
 
       // 使用 Promise.allSettled 处理部分成功、部分失败的情况
@@ -947,26 +1128,39 @@
       // 处理上传结果
       uploadResults.forEach((result, index) => {
         const filePath = filePaths[index];
-        const file = files.value?.find((f) => f.url === filePath);
+        let matchedUid = "";
+        const fileList = files.value;
+        const fileListLen = fileList.length;
+        for (let i = 0; i < fileListLen; i++) {
+          if (fileList[i].url == filePath) {
+            const fileUid = fileList[i].uid;
+            if (fileUid != null) {
+              matchedUid = fileUid;
+            }
+            break;
+          }
+        }
         // 上传成功
-        if (result.status === "fulfilled") {
-          // 上传成功，更新文件状态
-          const uploadedFile = result.value;
-          const fileIndex = files.value?.findIndex(
-            (f) => f.uid === uploadedFile.uid,
-          );
-          if (fileIndex !== -1) {
-            files.value[fileIndex] = uploadedFile;
+        if (result.status == "fulfilled") {
+          // UTS 无法对 allSettled 判别联合窄化，用 JSON 往返取 value
+          const rObj = JSON.parse<UTSJSONObject>(JSON.stringify(result));
+          const uploadedFile = rObj != null ? rObj["value"] as UploadFileInfo : null;
+          if (uploadedFile != null) {
+            for (let j = 0; j < fileListLen; j++) {
+              if (files.value[j].uid == uploadedFile.uid) {
+                files.value[j] = uploadedFile;
+                break;
+              }
+            }
           }
         } else {
           // 上传失败，更新对应文件状态为 error
-          if (file) {
-            const fileIndex = files.value?.findIndex((f) => f.uid === file.uid);
-            if (fileIndex !== -1) {
-              files.value[fileIndex] = {
-                ...files.value[fileIndex],
-                status: UploadFileStatus.error,
-              };
+          if (matchedUid.length > 0) {
+            for (let k = 0; k < fileListLen; k++) {
+              if (files.value[k].uid == matchedUid) {
+                files.value[k].status = UploadFileStatus.error;
+                break;
+              }
             }
           }
         }
@@ -977,7 +1171,8 @@
     } catch (error) {
       console.error("批量上传处理失败:", error);
     }
-  };
+  }
+  _uploadMultipleFiles = uploadMultipleFiles;
 
   // 输入框获取焦点
   const onInputFocus = () => {
@@ -985,7 +1180,7 @@
     // 隐藏额外功能栏
     showExtraContainer.value = false;
     // 滚动到最后一个消息
-    props.onScrollToLastMsg?.(true);
+    emit('onScrollToLastMsg', true);
   };
 
   // 输入框失去焦点
@@ -997,66 +1192,24 @@
 
   // 切换额外功能栏显示/隐藏
   const toggleExtraContainer = () => {
-    showExtraContainer.value = !showExtraContainer.value;
+    showExtraContainer.value = invertBoolean(showExtraContainer.value);
   };
 
   // 打开麦克风权限
   const openMicrophonePermission = async () => {
-    // #ifdef H5
-    try {
-      const permissionState = await MicrophonePermissionHelper.check();
-      console.log("切换到语音模式, 检查麦克风权限", permissionState);
-      if (permissionState !== "granted") {
-        MicrophonePermissionHelper.request();
-      }
-    } catch (error) {
-      console.error("切换到语音模式, 检查麦克风权限失败:", error);
-    }
-    // #endif
-
-    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
-    // 小程序端检查录音权限
-    try {
-      const authResult = await uni.authorize({
-        scope: "scope.record",
-      });
-    } catch (error: any) {
-      // 权限被拒绝，引导用户手动开启
-      uni.showModal({
-        title: t("Mobile.Voice.permissionRequired"),
-        content: t("Mobile.Voice.permissionContent"),
-        confirmText: t("Mobile.Voice.goToSettings"),
-        success: (res) => {
-          if (res.confirm) {
-            uni.openSetting({
-              success: (settingRes) => {
-                if (settingRes.authSetting["scope.record"]) {
-                  // 用户开启了权限，可以重新尝试录音
-                }
-              },
-            });
-          }
-        },
-      });
-    }
-    // #endif
+    // Android 构建阶段暂不处理麦克风权限弹窗
   };
 
   // 切换输入方式
   const handleChangeInputMethod = async () => {
-    // if (props.isConversationActive.value) return;
-    if (inputMethod.value === ChatInputMethod.Voice) {
+    if (inputMethod.value == ChatInputMethod.Voice) {
       inputMethod.value = ChatInputMethod.Input;
       uni.setStorageSync(CHAT_INPUT_METHOD, ChatInputMethod.Input);
-      // 隐藏额外功能栏
       showExtraContainer.value = false;
       nextTick(() => {
-        if (inputRef.value !== null && typeof inputRef.value?.focus === "function") {
-          inputRef.value.focus();
-        }
+        focusChatInput();
       });
     } else {
-      // 切换到语音模式
       inputMethod.value = ChatInputMethod.Voice;
       uni.setStorageSync(CHAT_INPUT_METHOD, ChatInputMethod.Voice);
       inputRef.value = null;
@@ -1067,37 +1220,42 @@
 
   // 输入事件
   const handleInput = (e: any) => {
-    const value = e.detail.value ?? "";
-
-    const _rawPrev: string = messageInfo.value;
-    const prevValue: string = _rawPrev ? _rawPrev : "";
-
-    const cursor = e.detail.cursor;
-    // 兼容判定：如果取不到 cursor fallback 到 endsWith
-    const isAtTyped =
-      cursor !== undefined
-        ? cursor > 0 && value.substring(cursor - 1, cursor) === "@"
-        : value.endsWith("@");
-    const isAddingOne = value.length === prevValue.length + 1;
-
-    // 输入 @ 弹出技能框
-    if (props.isTaskAgent && props.enableSkillAt && isAddingOne && isAtTyped) {
-      uni.hideKeyboard(); // 提前收起键盘
+    const eObj = e as UTSJSONObject;
+    const detail = eObj["detail"] as UTSJSONObject;
+    const value = coalesceString(detail["value"] as string | null);
+    const prevValue = coalesceString(messageInfo.value);
+    const cursorRaw = detail["cursor"];
+    const cursor = cursorRaw != null ? cursorRaw as number : null;
+    const isAtTyped = isAtTypedOnInput(cursor, value);
+    const isAddingOne = value.length == prevValue.length + 1;
+    const openPicker = shouldOpenSkillPickerOnAtInput(
+      props.isTaskAgent,
+      props.enableSkillAt,
+      isAddingOne,
+      isAtTyped,
+    );
+    if (openPicker == true) {
+      uni.hideKeyboard();
       isAtTrigger.value = true;
-      atCursorIndex.value = cursor ?? -1;
+      if (cursor != null) {
+        atCursorIndex.value = cursor;
+      } else {
+        atCursorIndex.value = -1;
+      }
       showExtraContainer.value = false;
       skillSelectModalVisible.value = true;
     }
     messageInfo.value = value;
-    selectedSkills.value = selectedSkills.value.filter(
-      (s: SkillInfoForAt): boolean => value.includes(`@${s.name}`),
+    selectedSkills.value = filterSkillsRemainingInText(
+      selectedSkills.value,
+      value,
     );
   };
 
   // 点击发送事件
   const handleSendMessage = (): void => {
-    const isDisabled = Boolean(props.wholeDisabled) === true;
-    if (isDisabled) {
+    const isDisabled = isWholeDisabledSendBlocked(props.wholeDisabled);
+    if (isDisabled == true) {
       messageInfo.value = "";
       uni.showToast({
         title: t("Mobile.Chat.fillRequiredParams"),
@@ -1106,7 +1264,45 @@
       });
       return;
     }
-    return; // 其余逻辑暂未在 Android 启用
+    const existErrorFile = hasUploadErrorInFiles(files.value);
+    if (existErrorFile == true) {
+      uni.showToast({
+        title: t("Mobile.Chat.removeUploadFailed"),
+        icon: "none",
+        duration: 1500,
+      });
+      return;
+    }
+    const canSend = canSendChatMessage(
+      messageInfo.value,
+      files.value.length,
+      selectedSkills.value.length,
+    );
+    if (canSend == true) {
+      const data = {
+        messageInfo: messageInfo.value,
+        files: files.value,
+        selectedComponents: selectedComponents.value,
+        skillIds: selectedSkills.value.map((s) => s.targetId),
+      };
+      const pages = getCurrentPages();
+      const pagesLen = pages.length;
+      if (pagesLen > 0) {
+        const currentPage = pages[pagesLen - 1];
+        const route = currentPage.route;
+        const isHome = isHomeChatRoute(route);
+        if (isHome == true) {
+          uni.$emit("homeVoiceRecorderStart", data);
+        } else {
+          emit("onSendMessage", data);
+        }
+      } else {
+        emit("onSendMessage", data);
+      }
+      selectedSkills.value = [];
+      files.value = [];
+      messageInfo.value = "";
+    }
   };
 
   // 语音录制开始
@@ -1119,11 +1315,14 @@
   const handleVoiceStop = async (transcriptText: string) => {
     isRecording.value = false;
     stopDurationTimer();
-    if (transcriptText && typeof transcriptText === "string") {
+    const isStringType = typeof transcriptText === "string";
+    if (isStringType == true) {
+      if (transcriptText.length > 0) {
       // 将语音转换的文字作为消息发送
       messageInfo.value = transcriptText;
       await nextTick();
       handleSendMessage();
+      }
     }
   };
 
@@ -1132,10 +1331,17 @@
     isRecording.value = false;
     stopDurationTimer();
     let errorMessage = t("Mobile.Voice.recordFailed");
-    if (error.message) {
-      errorMessage = error.message;
-    } else if (error.errMsg) {
-      errorMessage = error.errMsg;
+    const errObj = error as UTSJSONObject;
+    const errMsgField = errObj["errMsg"] as string | null;
+    const errMessageField = errObj["message"] as string | null;
+    if (errMessageField != null) {
+      if (errMessageField.length > 0) {
+        errorMessage = errMessageField;
+      }
+    } else if (errMsgField != null) {
+      if (errMsgField.length > 0) {
+        errorMessage = errMsgField;
+      }
     }
 
     uni.showToast({
@@ -1169,7 +1375,7 @@
 
   // 删除文档
   const handleDelFile = (uid: string) => {
-    files.value = files.value?.filter((file) => file.uid !== uid) || [];
+    files.value = filterFilesExcludingUid(files.value, uid);
   };
 </script>
 
@@ -1381,6 +1587,7 @@
     }
   }
 
+  // #ifdef H5
   .icon-loop {
     animation: spin 1s linear infinite;
   }
@@ -1394,6 +1601,7 @@
       transform: rotate(360deg);
     }
   }
+  // #endif
 
   // 键盘弹出后，垫高底部。默认占位大小为底部安全区域高度
   .keyboard-cover {
@@ -1462,14 +1670,24 @@
       }
     }
 
+    // #ifdef H5
     .sub-arrow {
       color: #007aff;
       font-size: 32rpx;
       margin-left: 12rpx;
       animation: bounceRight 1.5s infinite ease-in-out;
     }
+    // #endif
+    // #ifndef H5
+    .sub-arrow {
+      color: #007aff;
+      font-size: 32rpx;
+      margin-left: 12rpx;
+    }
+    // #endif
   }
 
+  // #ifdef H5
   @keyframes bounceRight {
     0%,
     100% {
@@ -1479,4 +1697,5 @@
       transform: translateX(6rpx);
     }
   }
+  // #endif
 </style>

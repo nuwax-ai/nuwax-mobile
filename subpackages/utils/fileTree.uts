@@ -1,4 +1,4 @@
-import type { FileNode } from '@/types/interfaces/agent'
+import { FileNode } from '@/types/interfaces/agent'
 import { ACCESS_TOKEN } from '@/constants/home.constants'
 import { COMMON_HEADERS } from '@/constants/common.constants'
 import { t } from "@/utils/i18n";
@@ -6,7 +6,18 @@ import { t } from "@/utils/i18n";
 /**
  * 文件相关常量
  */
-export const FILE_CONSTANTS = {
+type FileConstants = {
+  SUPPORTED_EXTENSIONS: string[];
+  IGNORED_FILE_PATTERNS: RegExp[];
+  DEFAULT_FILE_LANGUAGE: string;
+  FALLBACK_SIZE: number;
+  TREE_ROOT_LEVEL: number;
+  INDENT_SIZE: number;
+  REQUEST_ID_PREFIX: string;
+  SESSION_ID_PREFIX: string;
+};
+
+export const FILE_CONSTANTS: FileConstants = {
   // 支持预览的文件扩展名白名单
   SUPPORTED_EXTENSIONS: [
     // 图片文件
@@ -86,6 +97,87 @@ export const FILE_CONSTANTS = {
   SESSION_ID_PREFIX: 'session_',
 };
 
+/** UTS 兼容：可空字符串兜底 */
+function coalesceString(value: any | null): string {
+  if (value != null) {
+    const s = `${value}`;
+    if (s != '') {
+      return s;
+    }
+  }
+  return '';
+}
+
+/** UTS 兼容：根据路径片段计算父路径 */
+function buildParentPath(pathParts: string[], endIndex: number): string | null {
+  if (endIndex <= 0) {
+    return null;
+  }
+  const joined = pathParts.slice(0, endIndex).join('/');
+  if (joined.length == 0) {
+    return null;
+  }
+  return joined;
+}
+
+/** UTS 兼容：判断扁平文件项是否应保留 */
+function shouldKeepFile(file: any): boolean {
+  const f = file as UTSJSONObject;
+  const nameVal = f["name"];
+  const nameStr = nameVal != null ? `${nameVal}` : '';
+  const segments = nameStr.split('/');
+  const fileName = segments.length > 0 ? segments[segments.length - 1] : '';
+  const nameToTest = fileName;
+  for (let pi = 0; pi < FILE_CONSTANTS.IGNORED_FILE_PATTERNS.length; pi++) {
+    const pattern = FILE_CONSTANTS.IGNORED_FILE_PATTERNS[pi];
+    if (pattern.exec(nameToTest) != null) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** UTS 兼容：根据 isDir 与文件名判断节点类型 */
+function resolveNodeIsFile(file: any, fileName: string): boolean {
+  const f = file as UTSJSONObject;
+  if (f["isDir"] == true) {
+    return fileName.includes('.');
+  }
+  return true;
+}
+
+/** UTS 兼容：计算文件节点大小 */
+function resolveFileSize(file: any): number {
+  const f = file as UTSJSONObject;
+  const sizeVal = f["size"];
+  if (sizeVal != null) {
+    return sizeVal as number;
+  }
+  if (f["sizeExceeded"] == true) {
+    return FILE_CONSTANTS.FALLBACK_SIZE;
+  }
+  const contentsVal = f["contents"];
+  if (contentsVal != null) {
+    const s = `${contentsVal}`;
+    return s.length;
+  }
+  return FILE_CONSTANTS.FALLBACK_SIZE;
+}
+
+/** UTS 兼容：子节点列表中是否已存在指定 id */
+function hasChildWithId(children: FileNode[] | null | undefined, id: string): boolean {
+  if (children == null) {
+    return false;
+  }
+  const list = children as FileNode[];
+  for (let ci = 0; ci < list.length; ci++) {
+    if (list[ci].id == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * 将扁平的文件列表转换为树形结构
  */
@@ -93,95 +185,150 @@ export const transformFlatListToTree = (files: any[]): FileNode[] => {
   const root: FileNode[] = [];
   const map = new Map<string, FileNode>();
 
-  // 过滤掉系统文件
-  const filteredFiles = files.filter((file) => {
-    const fileName = file.name.split('/').pop();
-    return !FILE_CONSTANTS.IGNORED_FILE_PATTERNS.some((pattern) =>
-      pattern.test(fileName ? fileName : ''),
-    );
-  });
+  const filteredFiles: any[] = [];
+  for (let fi = 0; fi < files.length; fi++) {
+    if (shouldKeepFile(files[fi])) {
+      filteredFiles.push(files[fi]);
+    }
+  }
 
-  // 创建所有文件节点和必要的文件夹节点
-  filteredFiles.forEach((file) => {
-    const pathParts = file.name.split('/').filter(Boolean);
-    const fileName = pathParts[pathParts.length - 1];
-    // 如果文件是目录，则认为是文件（后端给了isDir字段，表示是否为目录），兼容之前逻辑
-    const isFile: boolean = file.isDir ? fileName.includes('.') : true;
+  for (let ffi = 0; ffi < filteredFiles.length; ffi++) {
+    const file = filteredFiles[ffi];
+    const f = file as UTSJSONObject;
+    const nameVal = f["name"];
+    const nameStr = nameVal != null ? `${nameVal}` : '';
+    const rawParts = nameStr.split('/');
+    const pathParts: string[] = [];
+    for (let ppi = 0; ppi < rawParts.length; ppi++) {
+      const pp = rawParts[ppi];
+      if (pp != null && pp != '') {
+        pathParts.push(pp);
+      }
+    }
+    const fileName = pathParts.length > 0 ? pathParts[pathParts.length - 1] : nameStr;
+    const isFile = resolveNodeIsFile(f, fileName);
 
-    const node: FileNode = {
-      id: file.name,
-      name: fileName,
-      type: isFile ? 'file' : 'folder',
-      path: file.name,
-      children: [],
-      binary: file.binary ? file.binary : false,
-      size:
-        file.size ? file.size : file.sizeExceeded
-          ? FILE_CONSTANTS.FALLBACK_SIZE
-          : file.contents?.length ? file.contents?.length : FILE_CONSTANTS.FALLBACK_SIZE,
-      status: file.status ? file.status : null,
-      fullPath: file.name,
-      parentPath: pathParts.slice(0, -1).join('/') || null,
-      content: (file.contents ?? contents) || '',
-      lastModified: Date.now(),
-      fileProxyUrl: file?.fileProxyUrl ? file?.fileProxyUrl : '',
-      isLink: file?.isLink ? file?.isLink : false,
-    };
+    let nodeType: "file" | "folder" = "folder";
+    if (isFile == true) {
+      nodeType = "file";
+    }
 
-    map.set(file.name, node);
+    let binary = false;
+    if (f["binary"] == true) {
+      binary = true;
+    }
 
-    // 如果文件在子目录中，确保创建所有必要的父文件夹节点
+    let status: string | null = null;
+    const statusVal = f["status"];
+    if (statusVal != null) {
+      status = `${statusVal}`;
+    }
+
+    let fileProxyUrl = '';
+    const proxyVal = f["fileProxyUrl"];
+    if (proxyVal != null) {
+      fileProxyUrl = `${proxyVal}`;
+    }
+
+    let isLink = false;
+    if (f["isLink"] == true) {
+      isLink = true;
+    }
+
+    const node = new FileNode();
+    node.id = nameStr;
+    node.name = fileName;
+    node.type = nodeType;
+    node.path = nameStr;
+    node.children = [];
+    node.binary = binary;
+    node.size = resolveFileSize(f);
+    node.status = status;
+    node.fullPath = nameStr;
+    node.parentPath = buildParentPath(pathParts, pathParts.length - 1);
+    node.content = coalesceString(f["contents"]);
+    node.lastModified = Date.now();
+    node.fileProxyUrl = fileProxyUrl;
+    node.isLink = isLink;
+
+    map.set(nameStr, node);
+
     if (pathParts.length > 1) {
       for (let i = pathParts.length - 2; i >= 0; i--) {
-        const parentPath = pathParts.slice(0, i + 1).join('/');
+        const parentPathStr = pathParts.slice(0, i + 1).join('/');
         const parentName = pathParts[i];
 
-        if (!map.has(parentPath)) {
-          const parentNode: FileNode = {
-            id: parentPath,
-            name: parentName,
-            type: 'folder',
-            path: parentPath,
-            children: [],
-            parentPath: i > 0 ? pathParts.slice(0, i).join('/') : null,
-            lastModified: Date.now(),
-          };
-          map.set(parentPath, parentNode);
+        if (map.has(parentPathStr) == false) {
+          const parentNode = new FileNode();
+          parentNode.id = parentPathStr;
+          parentNode.name = parentName;
+          parentNode.type = "folder";
+          parentNode.path = parentPathStr;
+          parentNode.children = [];
+          parentNode.parentPath = buildParentPath(pathParts, i);
+          parentNode.lastModified = Date.now();
+          map.set(parentPathStr, parentNode);
         }
       }
     }
-  });
+  }
 
-  // 构建层次结构
-  map.forEach((node) => {
-    if (node.parentPath && map.has(node.parentPath)) {
-      const parentNode = map.get(node.parentPath)!;
-      if (
-        !parentNode.children?.find((child: FileNode) => child.id === node.id)
-      ) {
-        parentNode.children?.push(node);
+  map.forEach((node: FileNode) => {
+    const parentPathVal = node.parentPath;
+    if (parentPathVal != null) {
+      if (map.has(parentPathVal) == true) {
+        const parentNode = map.get(parentPathVal);
+        if (parentNode != null) {
+          if (hasChildWithId(parentNode.children, node.id) == false) {
+            const kids = parentNode.children;
+            if (kids != null) {
+              kids.push(node);
+            }
+          }
+        }
       }
-    } else if (!node.parentPath) {
-      if (!root.find((item: FileNode) => item.id === node.id)) {
+    } else {
+      if (hasChildWithId(root, node.id) == false) {
         root.push(node);
       }
     }
   });
 
-  // 排序：文件夹在前，文件在后，同类型按名称排序
   const sortNodes = (nodes: FileNode[]): FileNode[] => {
-    return nodes.sort((a, b) => {
-      if (a.type !== b.type) {
-        return a.type === 'folder' ? -1 : 1;
+    return nodes.sort((a: FileNode, b: FileNode): number => {
+      if (a.type != b.type) {
+        if (a.type == "folder") {
+          return -1;
+        }
+        return 1;
       }
-      return a.name.localeCompare(b.name);
+      return a.name.compareTo(b.name);
     });
   };
 
-  return sortNodes(root).map((node) => ({
-    ...node,
-    children: node.children ? sortNodes(node.children) : undefined,
-  }));
+  const sortedRoot = sortNodes(root);
+  const result: FileNode[] = [];
+  for (let ri = 0; ri < sortedRoot.length; ri++) {
+    const node = sortedRoot[ri];
+    const nodeKids = node.children;
+    const resultNode = new FileNode();
+    resultNode.id = node.id;
+    resultNode.name = node.name;
+    resultNode.type = node.type;
+    resultNode.path = node.path;
+    resultNode.children = nodeKids != null ? sortNodes(nodeKids) : node.children;
+    resultNode.binary = node.binary;
+    resultNode.size = node.size;
+    resultNode.status = node.status;
+    resultNode.fullPath = node.fullPath;
+    resultNode.parentPath = node.parentPath;
+    resultNode.content = node.content;
+    resultNode.lastModified = node.lastModified;
+    resultNode.fileProxyUrl = node.fileProxyUrl;
+    resultNode.isLink = node.isLink;
+    result.push(resultNode);
+  }
+  return result;
 };
 
 
@@ -191,14 +338,18 @@ export const transformFlatListToTree = (files: any[]): FileNode[] => {
    * @param defaultName 默认文件名
    */
   const parseFileName = (contentDisposition: string | undefined, defaultName: string): string => {
-    if (!contentDisposition) return defaultName;
-    
+    if (contentDisposition == null || contentDisposition == '') {
+      return defaultName;
+    }
+
     // 解析 Content-Disposition 头中的文件名
-    const filenameMatch = contentDisposition.match(
-      /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/,
-    );
-    if (filenameMatch && filenameMatch[1]) {
-      return filenameMatch[1].replace(/['"]/g, '');
+    const regex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/;
+    const m = regex.exec(contentDisposition);
+    if (m != null) {
+      const g1 = m[1];
+      if (g1 != null && g1 != '') {
+        return `${g1}`.replace(/['"]/g, '');
+      }
     }
     return defaultName;
   };

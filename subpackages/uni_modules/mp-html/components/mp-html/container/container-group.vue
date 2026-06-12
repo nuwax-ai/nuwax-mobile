@@ -35,15 +35,29 @@ export default {
   computed: {
     processCount() {
       // 过滤掉可能的空白节点，支持原生 container 和 PC 端 HTML 标签名，同时排除隐藏的 Event 类型
-      return (this.childs || []).filter(n => 
-        (n.name === 'container' || n.name === 'markdown-custom-process') && 
-        n.attrs?.type !== 'Event'
-      ).length
+      const childs = this.childs != null ? this.childs : []
+      return childs.filter((n): boolean => {
+        const nn = n as UTSJSONObject
+        const nameVal = nn["name"]
+        const nameStr = nameVal != null ? `${nameVal}` : ""
+        const attrs = nn["attrs"]
+        const attrsObj = attrs != null ? (attrs as UTSJSONObject) : null
+        const typeVal = attrsObj != null ? attrsObj["type"] : null
+        const typeStr = typeVal != null ? `${typeVal}` : ""
+        return (
+          (nameStr == "container" || nameStr == "markdown-custom-process") &&
+          typeStr != "Event"
+        )
+      }).length
     }
   },
   methods: {
-    getI18nText(key, params) {
-      return t(key, params)
+    getI18nText(key: string): string {
+      return t(
+        key,
+        new Map<string, string | number>() as Record<string, string | number>,
+        "",
+      )
     },
     toggleExpanded() {
       this.isExpanded = !this.isExpanded

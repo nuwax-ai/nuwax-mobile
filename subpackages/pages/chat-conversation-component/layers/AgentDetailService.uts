@@ -3,8 +3,10 @@ import {
   MessageInfo,
   ConversationChatParams,
   ConversationChatResponse,
+  ConversationChatMessage,
   ConversationChatSuggestParams,
   ProcessingInfo,
+  ProcessingData,
   MessageQuestionExtInfo,
   AttachmentFile,
   ConversationCreateParams,
@@ -16,8 +18,10 @@ import type {
   AgentConversationUpdateParams,
   AgentManualComponentInfo,
   AgentDetailDto,
+  GuidQuestionDto,
+  FileNode,
 } from "@/types/interfaces/agent";
-import { UploadFileInfo } from "@/types/interfaces/common";
+import { BindConfigWithSub, UploadFileInfo } from "@/types/interfaces/common";
 import { RequestResponse } from "@/types/interfaces/request";
 import {
   MessageModeEnum,
@@ -74,6 +78,10 @@ import {
 } from "@/utils/system.uts";
 import { t } from "@/utils/i18n";
 
+/** 超时回调类型 */
+type TimeoutCallback = any;
+type NullableTimeoutCallback = any | null;
+
 /** 每页加载消息数量 */
 const MESSAGE_LIST_SIZE = 10;
 
@@ -83,12 +91,29 @@ const handleMessageProcess = (text: string): string => {
 /**
  * 服务层：负责业务逻辑和API调用
  */
+
+export interface HandleSendMessageData {
+  // 初始 chat 消息
+  messageInfo?: string;
+  // 用户上传的文件
+  files?: UploadFileInfo[];
+  // 用户选择的组件
+  selectedComponents?: AgentSelectedComponentInfo[];
+  // 用户填写的变量参数
+  variableParams?: Record<string, any>;
+  // 用户选择的技能ID列表
+  skillIds?: number[];
+  // 用户选择的模型ID
+  modelId?: number;
+  // 用户选择的沙盒ID
+  sandboxId?: string;
+}
+
 export default class AgentDetailService {
   private data: AgentDetailData;
-  private isAllowSuggest: boolean;
-  constructor(private data: AgentDetailData) {
+  private isAllowSuggest: boolean = true;
+  constructor(data: AgentDetailData) {
     this.data = data;
-    this.isAllowSuggest = true;
   }
 
   /**
@@ -100,7 +125,7 @@ export default class AgentDetailService {
     const calledTrialCount = agent.calledTrialCount ?? 0;
 
     // 切换至不同智能体：直接使用后端数据
-    if (this.data.agentId.value !== agent.agentId) {
+    if (this.data.agentId.value != agent.agentId) {
       this.data.localCalledTrialCount.value = Math.min(calledTrialCount, trialCount);
       return;
     }
@@ -119,56 +144,73 @@ export default class AgentDetailService {
   ): Promise<void> {
     this.data.isLoadingConversation.value = true;
     const { data: responseData } = result;
+    if (responseData == null) {
+      this.data.isLoadingConversation.value = false;
+      return;
+    }
 
-    this.data.conversationInfo.value =
-      responseData as unknown as ConversationInfo;
-    this.data.agentInfo.value = responseData?.agent;
-    if (responseData?.agent != null) {
-      this.syncCalledTrialCount(responseData!.agent);
+    this.data.conversationInfo.value = responseData as ConversationInfo;
+    const agentVal = responseData.agent as AgentDetailDto;
+    this.data.agentInfo.value = agentVal;
+    if (agentVal != null) {
+      this.syncCalledTrialCount(agentVal);
     }
     // 确保 agentId 被设置
-    if (responseData?.agentId) {
+    if (responseData.agentId != null) {
       this.data.agentId.value = responseData.agentId;
     }
     // 确保会话ID被设置，临时会话加载历史记录同样需要该 ID
-    if (responseData?.id) {
+    if (responseData.id != null) {
       this.data.conversationId.value = responseData.id;
     }
     // 是否开启问题建议,可用值:Open,Close
     this.data.isSuggest.value =
-      responseData?.agent?.openSuggest === OpenCloseEnum.Open;
+      responseData.agent != null ? responseData.agent.openSuggest == OpenCloseEnum.Open : false;
     // 可用组件列表
-    this.data.manualComponents.value =
-      responseData?.agent?.manualComponents || [];
+    const manualCompsArr: AgentManualComponentInfo[] =
+      responseData.agent != null && responseData.agent.manualComponents != null
+        ? responseData.agent.manualComponents as AgentManualComponentInfo[]
+        : [];
+    this.data.manualComponents.value = manualCompsArr;
     // 初始化默认选中组件
-    this.data.selectedComponents.value = (
-      responseData?.agent?.manualComponents || []
-    )
+    this.data.selectedComponents.value = manualCompsArr
       .filter(
         (item: AgentManualComponentInfo): boolean =>
-          item.defaultSelected === DefaultSelectedEnum.Yes,
+          item.defaultSelected == DefaultSelectedEnum.Yes,
       )
       .map(
         (item: AgentManualComponentInfo): AgentSelectedComponentInfo =>
-          ({
-            id: item.id,
-            type: item.type,
-          }) as AgentSelectedComponentInfo,
+          new AgentSelectedComponentInfo(item.id, item.type),
       );
     // 如果变量参数存在,则禁用变量参数
-    if (responseData?.variables) {
+    if (responseData.variables != null) {
       this.data.isSendMessageRef.value = true;
     }
     // 变量参数
-    const _variables = responseData?.agent?.variables || [];
+    let _variables: BindConfigWithSub[] = [];
+    if (responseData.agent != null) {
+      if (responseData.agent.variables != null) {
+        _variables = responseData.agent.variables as BindConfigWithSub[];
+      }
+    }
     this.data.variables.value = _variables;
     // 用户填充变量
-    this.data.userFillVariables.value = responseData?.variables || {};
+    const vars = responseData.variables;
+    this.data.userFillVariables.value = vars != null ? vars : {};
     // 消息列表
-    const _messageList = responseData?.messageList || [];
+    let _messageList: MessageInfo[] = [];
+    if (responseData.messageList != null) {
+      _messageList = responseData.messageList as MessageInfo[];
+    }
     // 排除预置问题
-    const len = _messageList?.filter((item) => !!item.id).length || 0;
-    if (len) {
+    let len = 0;
+    const msgListLen = _messageList.length;
+    for (let mi = 0; mi < msgListLen; mi++) {
+      if (_messageList[mi].id != null) {
+        len++;
+      }
+    }
+    if (len > 0) {
       // 处理消息文本，先适配历史消息格式（PC端HTML标签转移动端Markdown语法）
       const processedMessageList = _messageList.map((message: MessageInfo) => {
         // 适配历史消息：将PC端自定义HTML标签转换为移动端Markdown容器语法
@@ -176,12 +218,20 @@ export default class AgentDetailService {
         const adaptedMessage = adaptHistoryMessage(message);
 
         // 确保 text 字段始终有值，避免 undefined 导致渲染错误
-        const rawText = adaptedMessage.text ?? "";
+        let rawText = "";
+        if (adaptedMessage.text != null) {
+          rawText = adaptedMessage.text as string;
+        }
         const text = handleMessageProcess(rawText);
-        // 使用同步方法生成ID，兼容所有平台
-        const id = adaptedMessage.id || generateUniqueId();
+        let id = generateUniqueId();
+        if (adaptedMessage.id != null) {
+          id = adaptedMessage.id as string;
+        }
 
-        return { ...adaptedMessage, text, id };
+        const adaptedObj = adaptedMessage as UTSJSONObject;
+        adaptedObj["text"] = text;
+        adaptedObj["id"] = id;
+        return adaptedMessage;
       });
 
       this.data.autoToLastMsg.value = true;
@@ -194,23 +244,42 @@ export default class AgentDetailService {
       // 处理问题建议
       const lastMessage = processedMessageList[len - 1];
       // 最后一条消息为"问答"时，获取问题建议
-      if (
-        lastMessage.type === MessageModeEnum.QUESTION &&
-        lastMessage.ext?.length
-      ) {
-        const suggestList = lastMessage.ext.map((item) => item.content) || [];
-        this.data.chatSuggestList.value = suggestList;
-      } else if (len === 1) {
-        // 如果消息列表大于1时，说明已开始会话，就不显示预置问题，反之显示
-        // 如果存在预置问题，显示预置问题
-        this.data.chatSuggestList.value =
-          responseData?.agent?.openingGuidQuestions || [];
+      const isQuestion = lastMessage.type == MessageModeEnum.QUESTION;
+      const extLen =
+        lastMessage.ext != null ? (lastMessage.ext as any[]).length : 0;
+      if (isQuestion == true) {
+        if (extLen > 0) {
+          const suggestList: any[] = [];
+          const extList = lastMessage.ext as any[];
+          for (let ei = 0; ei < extLen; ei++) {
+            const extItem = extList[ei] as UTSJSONObject;
+            const contentVal = extItem["content"];
+            suggestList.push(contentVal != null ? `${contentVal}` : '');
+          }
+          this.data.chatSuggestList.value = suggestList;
+        }
+      } else if (len == 1) {
+        if (responseData.agent != null) {
+          if (responseData.agent.openingGuidQuestions != null) {
+            this.data.chatSuggestList.value =
+              responseData.agent.openingGuidQuestions as any[];
+          }
+        }
       }
-    }
-    // 不存在会话消息时，才显示开场白预置问题
-    else {
-      this.data.chatSuggestList.value =
-        responseData?.agent?.guidQuestionDtos?.slice(0, 5) || [];
+    } else {
+      const agentLocal = responseData.agent;
+      if (agentLocal != null) {
+        const agentDto = agentLocal as AgentDetailDto;
+        if (agentDto.guidQuestionDtos != null) {
+          const dtos = agentDto.guidQuestionDtos as GuidQuestionDto[];
+          const sliceLen = dtos.length < 5 ? dtos.length : 5;
+          const sliced: any[] = [];
+          for (let gi = 0; gi < sliceLen; gi++) {
+            sliced.push(dtos[gi]);
+          }
+          this.data.chatSuggestList.value = sliced;
+        }
+      }
     }
     this.data.isLoadingConversation.value = false;
 
@@ -218,28 +287,53 @@ export default class AgentDetailService {
     this.handleGetSandboxList();
 
     // 初始化当前模型ID
-    if (responseData?.agent) {
-      this.data.currentModelId.value = responseData.modelId || 0;
+    if (responseData.agent != null) {
+      let modelId = 0;
+      if (responseData.modelId != null) {
+        modelId = responseData.modelId as number;
+      }
+      this.data.currentModelId.value = modelId;
     }
 
     // 检查订阅限制
-    if (responseData?.agent != null) {
-      const agent = responseData.agent!;
-      const paymentRequired = agent.paymentRequired === true;
-      const subscribed = agent.subscribed === true;
-      const overCallLimit = agent.overCallLimit === true;
+    const agent = responseData.agent;
+    if (agent != null) {
+      const paymentRequired = agent.paymentRequired == true;
+      const subscribed = agent.subscribed == true;
+      const overCallLimit = agent.overCallLimit == true;
 
       // 是否弹出模态框：要求订阅且未订阅，或超出调用限制（已订阅时不主动弹窗）
-      const shouldShowModal =
-        paymentRequired && (!subscribed || overCallLimit) && !subscribed;
-      if (shouldShowModal && this.data.enableSubscription.value === 1) {
-        this.data.subscriptionModalVisible.value = true;
+      let shouldShowModal = false;
+      if (paymentRequired == true) {
+        if (subscribed == false) {
+          shouldShowModal = true;
+        } else if (overCallLimit == true) {
+          if (subscribed == false) {
+            shouldShowModal = true;
+          }
+        }
+      }
+      const subscriptionEnabled = this.data.enableSubscription.value == 1;
+      if (shouldShowModal == true) {
+        if (subscriptionEnabled == true) {
+          this.data.subscriptionModalVisible.value = true;
+        }
       }
 
-      // 是否禁用输入框：要求订阅、且未订阅、且已超出调用限制
-      const shouldBlockInput = paymentRequired && !subscribed && overCallLimit;
-      if (shouldBlockInput && this.data.enableSubscription.value === 1) {
-        this.data.subscriptionRequired.value = true;
+      let shouldBlockInput = false;
+      if (paymentRequired == true) {
+        if (subscribed == false) {
+          if (overCallLimit == true) {
+            shouldBlockInput = true;
+          }
+        }
+      }
+      if (shouldBlockInput == true) {
+        if (subscriptionEnabled == true) {
+          this.data.subscriptionRequired.value = true;
+        } else {
+          this.data.subscriptionRequired.value = false;
+        }
       } else {
         this.data.subscriptionRequired.value = false;
       }
@@ -254,18 +348,29 @@ export default class AgentDetailService {
     const conversationId = this.data.conversationId.value;
 
     // 前置校验
-    if (
-      !conversationId ||
-      this.data.isLoadingMoreMessages.value ||
-      !this.data.hasMoreMessages.value ||
-      this.data.messageList.value.length === 0
-    ) {
+    if (conversationId == null) {
+      return;
+    }
+    if (conversationId == 0) {
+      return;
+    }
+    if (this.data.isLoadingMoreMessages.value == true) {
+      return;
+    }
+    if (this.data.hasMoreMessages.value == false) {
+      return;
+    }
+    if (this.data.messageList.value.length == 0) {
       return;
     }
 
-    // 取消息列表第一条的 index 作为查询游标
     const firstMessage = this.data.messageList.value[0];
-    const currentIndex = firstMessage?.index || 0;
+    let currentIndex = 0;
+    if (firstMessage != null) {
+      if (firstMessage.index != null) {
+        currentIndex = firstMessage.index as number;
+      }
+    }
 
     // 如果 index 为 0，说明已经是最早的消息
     if (currentIndex <= 0) {
@@ -282,20 +387,32 @@ export default class AgentDetailService {
         size: MESSAGE_LIST_SIZE,
       });
 
-      if (res.code === SUCCESS_CODE && res.data) {
-        const olderMessages = res.data;
+      const codeOk = res.code == SUCCESS_CODE;
+      const hasData = res.data != null;
+      if (codeOk == true) {
+        if (hasData == true) {
+        const olderMessages = res.data as MessageInfo[];
 
         if (olderMessages.length > 0) {
-          // 处理消息格式（与 handleQueryConversation 保持一致）
-          const processedMessages = olderMessages.map(
-            (message: MessageInfo) => {
-              const adaptedMessage = adaptHistoryMessage(message);
-              const rawText = adaptedMessage.text ?? "";
-              const text = handleMessageProcess(rawText);
-              const id = adaptedMessage.id || generateUniqueId();
-              return { ...adaptedMessage, text, id };
-            },
-          );
+          const processedMessages: MessageInfo[] = [];
+          const olderLen = olderMessages.length;
+          for (let oi = 0; oi < olderLen; oi++) {
+            const message = olderMessages[oi];
+            const adaptedMessage = adaptHistoryMessage(message);
+            let rawText = "";
+            if (adaptedMessage.text != null) {
+              rawText = adaptedMessage.text as string;
+            }
+            const text = handleMessageProcess(rawText);
+            let id = generateUniqueId();
+            if (adaptedMessage.id != null) {
+              id = adaptedMessage.id as string;
+            }
+            const pmObj = adaptedMessage as UTSJSONObject;
+            pmObj["text"] = text;
+            pmObj["id"] = id;
+            processedMessages.push(adaptedMessage);
+          }
 
           // 前插到消息列表头部
           this.data.messageList.value = [
@@ -307,8 +424,8 @@ export default class AgentDetailService {
           this.data.hasMoreMessages.value =
             olderMessages.length >= MESSAGE_LIST_SIZE;
         } else {
-          // 返回空数组，没有更多消息
           this.data.hasMoreMessages.value = false;
+        }
         }
       }
     } catch (error) {
@@ -326,18 +443,18 @@ export default class AgentDetailService {
     currentMessageId: string,
   ): Promise<void> {
     // 添加空值检查
-    if (!res) {
+    if (res == null) {
       console.warn("[AgentDetailService] handleChangeMessageList 收到空响应");
       return;
     }
 
     // 忽略心跳包 (HEART_BEAT 不包含 data)
-    if (res.eventType === "HEART_BEAT") {
+    if (`${res.eventType}` == "HEART_BEAT") {
       return;
     }
 
     // 检查 res.data 是否存在
-    if (!res.data) {
+    if (res.data == null) {
       console.warn(
         "[AgentDetailService] handleChangeMessageList 响应中缺少 data 字段:",
         res,
@@ -351,23 +468,30 @@ export default class AgentDetailService {
     // 调试日志：追踪流式过程
     // console.log(`[Stream] Event: ${eventType}, MessageId: ${currentMessageId}, Text: ${responseData?.text?.substring(0, 50)}...`)
 
-    if (!this.data.messageList.value?.length) return;
+    if (this.data.messageList.value.length == 0) {
+      return;
+    }
 
     const list = [...this.data.messageList.value];
-    const index = list.findIndex((item) => item.id === currentMessageId);
+    const index = list.findIndex((item) => item.id == currentMessageId);
     let arraySpliceAction = 1;
 
     const currentMessage = list.find(
-      (item) => item.id === currentMessageId,
+      (item) => item.id == currentMessageId,
     ) as MessageInfo;
-    if (!currentMessage) return;
+    if (currentMessage == null) {
+      return;
+    }
 
-    // 检查是否是新的对话开始（第一个消息块）
-    const isNewConversation =
-      !currentMessage.text || currentMessage.text.length === 0;
+    let isNewConversation = false;
+    if (currentMessage.text == null) {
+      isNewConversation = true;
+    } else if (currentMessage.text.length == 0) {
+      isNewConversation = true;
+    }
 
     // 确保流式过程中消息始终可见
-    if (currentMessage.status === MessageStatusEnum.Loading) {
+    if (currentMessage.status == MessageStatusEnum.Loading) {
       currentMessage.status = MessageStatusEnum.Incomplete;
       // console.log(`[Stream] Message ${currentMessageId} status changed from Loading to Incomplete`)
     }
@@ -375,32 +499,48 @@ export default class AgentDetailService {
     let newMessage: MessageInfo | null = null;
 
     // 处理不同的事件类型
-    if (eventType === ConversationEventTypeEnum.PROCESSING) {
-      const processingResult = responseData.result || {};
-      responseData.executeId = processingResult.executeId;
+    if (eventType == ConversationEventTypeEnum.PROCESSING) {
+      let processingResult: any = {};
+      const rdObj = responseData as UTSJSONObject;
+      const resultVal = rdObj["result"];
+      if (resultVal != null) {
+        processingResult = resultVal;
+      }
+      const prObj = processingResult as UTSJSONObject;
+      rdObj["executeId"] = prObj["executeId"];
 
+      let currentText = "";
+      if (currentMessage.text != null) {
+        currentText = currentMessage.text as string;
+      }
       const accumulatedText = getCustomBlock(
-        currentMessage.text || "",
+        currentText,
         responseData,
       );
 
-      newMessage = {
-        ...currentMessage,
-        text: accumulatedText,
-        status: MessageStatusEnum.Loading,
-        processingList: [
-          ...(currentMessage?.processingList || []),
-          responseData,
-        ] as ProcessingInfo[],
-      };
+      let oldProcessingList: ProcessingInfo[] = [];
+      if (currentMessage.processingList != null) {
+        oldProcessingList = currentMessage.processingList as ProcessingInfo[];
+      }
+
+      const nmObj = JSON.parse(JSON.stringify(currentMessage)) as UTSJSONObject;
+      nmObj["text"] = accumulatedText;
+      nmObj["status"] = MessageStatusEnum.Loading;
+      const newProcList: any[] = [];
+      for (let opi = 0; opi < oldProcessingList.length; opi++) {
+        newProcList.push(oldProcessingList[opi]);
+      }
+      newProcList.push(responseData);
+      nmObj["processingList"] = newProcList;
+      newMessage = nmObj as MessageInfo;
 
       // 长任务型任务处理
       const conversationId = this.data.conversationId.value;
 
       // 长任务型任务处理(打开远程桌面)
       // if (
-      //   responseData.type === AgentComponentTypeEnum.Event &&
-      //   (responseData as any).subEventType === 'OPEN_DESKTOP' &&
+      //   responseData.type == AgentComponentTypeEnum.Event &&
+      //   (responseData as any).subEventType == 'OPEN_DESKTOP' &&
       //   conversationId
       // ) {
       //   console.log('[AgentDetailService] Action: RECEIVE_EVENT, Params:', { type: 'OPEN_DESKTOP', conversationId, payload: responseData });
@@ -409,103 +549,113 @@ export default class AgentDetailService {
       // }
 
       // 长任务型任务处理(刷新文件树)
+      const pData = responseData as ProcessingData;
       if (
-        responseData.type === AgentComponentTypeEnum.ToolCall &&
-        conversationId
+        pData.type == AgentComponentTypeEnum.ToolCall &&
+        conversationId != null && conversationId != 0
       ) {
         // console.log("[AgentDetailService] Action: RECEIVE_TOOL_CALL, Params:", {
         //   type: "REFRESH_FILE_LIST",
         //   conversationId,
         //   payload: responseData,
         // });
-        CustomActionService.refreshFileList(conversationId);
+        CustomActionService.refreshFileList(`${conversationId}`);
       }
     }
 
-    if (eventType === ConversationEventTypeEnum.MESSAGE) {
-      const { text, type, ext, id, finished } = responseData;
+    const cloneMsg = (base: MessageInfo): UTSJSONObject => {
+      return JSON.parse(JSON.stringify(base)) as UTSJSONObject;
+    };
+
+    if (eventType == ConversationEventTypeEnum.MESSAGE) {
+      const chatMsg = responseData as ConversationChatMessage;
+      const text = chatMsg.text;
+      const type = chatMsg.type;
+      const ext = chatMsg.ext;
+      const id = chatMsg.id;
+      const finished = chatMsg.finished;
       // 如果会话结束，则设置会话状态为不活跃
       if (finished) {
         this.data.isConversationActive.value = false;
       }
 
-      if (type === MessageModeEnum.THINK) {
-        newMessage = {
-          ...currentMessage,
-          think: `${currentMessage.think}${text}`,
-          status: MessageStatusEnum.Incomplete,
-        };
-      } else if (type === MessageModeEnum.QUESTION) {
+      if (type == MessageModeEnum.THINK) {
+        const m = cloneMsg(currentMessage);
+        const curThink = currentMessage.think != null ? currentMessage.think : '';
+        m["think"] = `${curThink}${text}`;
+        m["status"] = MessageStatusEnum.Incomplete;
+        newMessage = m as MessageInfo;
+      } else if (type == MessageModeEnum.QUESTION) {
         // 问题内容累积 - 新对话时从头开始，否则累积
         const accumulatedText = handleMessageProcess(
-          isNewConversation ? text : `${currentMessage.text}${text}`,
+          isNewConversation ? (text != null ? text : "") : `${currentMessage.text != null ? currentMessage.text : ""}${text != null ? text : ""}`,
         );
-        newMessage = {
-          ...currentMessage,
-          text: accumulatedText,
-          status: finished
-            ? MessageStatusEnum.Complete
-            : MessageStatusEnum.Incomplete,
-        };
+        const m = cloneMsg(currentMessage);
+        m["text"] = accumulatedText;
+        m["status"] = finished
+          ? MessageStatusEnum.Complete
+          : MessageStatusEnum.Incomplete;
+        newMessage = m as MessageInfo;
 
-        if (ext?.length) {
-          this.data.chatSuggestList.value =
-            ext.map((extItem: MessageQuestionExtInfo) => extItem.content) || [];
+        if (ext != null && ext.length > 0) {
+          const extSuggestList: any[] = [];
+          for (let ei2 = 0; ei2 < ext.length; ei2++) {
+            const eiItem = ext[ei2] as MessageQuestionExtInfo;
+            extSuggestList.push(eiItem.content);
+          }
+          this.data.chatSuggestList.value = extSuggestList;
         }
       } else {
         // 工作流过程输出
         if (
-          this.data.messageIdRef.value &&
-          this.data.messageIdRef.value !== id &&
+          this.data.messageIdRef.value != null &&
+          this.data.messageIdRef.value.length > 0 &&
+          this.data.messageIdRef.value != id &&
           finished
         ) {
           // 新对话时从头开始，否则累积
           const accumulatedText = handleMessageProcess(
-            isNewConversation ? text : `${currentMessage.text}${text}`,
+            isNewConversation ? (text != null ? text : "") : `${currentMessage.text != null ? currentMessage.text : ""}${text != null ? text : ""}`,
           );
-          newMessage = {
-            ...currentMessage,
-            id,
-            text: accumulatedText,
-            status: MessageStatusEnum.Complete,
-          };
+          const m = cloneMsg(currentMessage);
+          m["id"] = id;
+          m["text"] = accumulatedText;
+          m["status"] = MessageStatusEnum.Complete;
+          newMessage = m as MessageInfo;
           arraySpliceAction = 0;
         } else {
           this.data.messageIdRef.value = id;
           // 新对话时从头开始，否则累积
           const accumulatedText = handleMessageProcess(
-            isNewConversation ? text : `${currentMessage.text}${text}`,
+            isNewConversation ? (text != null ? text : "") : `${currentMessage.text != null ? currentMessage.text : ""}${text != null ? text : ""}`,
           );
 
-          newMessage = {
-            ...currentMessage,
-            text: accumulatedText,
-            status: MessageStatusEnum.Incomplete,
-          };
+          const m = cloneMsg(currentMessage);
+          m["text"] = accumulatedText;
+          m["status"] = MessageStatusEnum.Incomplete;
+          newMessage = m as MessageInfo;
         }
       }
     }
 
-    if (eventType === ConversationEventTypeEnum.FINAL_RESULT) {
-      newMessage = {
-        ...currentMessage,
-        status: MessageStatusEnum.Complete,
-        finalResult: responseData,
-        requestId: res.requestId,
-      };
+    if (eventType == ConversationEventTypeEnum.FINAL_RESULT) {
+      const m = cloneMsg(currentMessage);
+      m["status"] = MessageStatusEnum.Complete;
+      m["finalResult"] = responseData;
+      m["requestId"] = res.requestId;
+      newMessage = m as MessageInfo;
       this.data.requestId.value = res.requestId;
     }
 
-    if (eventType === ConversationEventTypeEnum.ERROR) {
-      newMessage = {
-        ...currentMessage,
-        status: MessageStatusEnum.Error,
-      };
+    if (eventType == ConversationEventTypeEnum.ERROR) {
+      const m = cloneMsg(currentMessage);
+      m["status"] = "error";
+      newMessage = m as MessageInfo;
       this.data.isConversationActive.value = false;
     }
 
     // 更新消息列表
-    if (newMessage) {
+    if (newMessage != null) {
       list.splice(index, arraySpliceAction, newMessage as MessageInfo);
     }
 
@@ -525,21 +675,25 @@ export default class AgentDetailService {
     // }
 
     // 使用优化更新方法，只更新需要更新的组件
-    if (newMessage && newMessage.messageType === MessageTypeEnum.ASSISTANT) {
+    if (newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT) {
       await nextTick();
       // 通过uni事件总线更新 - 现在直接传递文本内容给 mp-html 组件
+      let assistantText = "";
+      if (newMessage.text != null) {
+        assistantText = newMessage.text as string;
+      }
+      const emitData = cloneMsg(newMessage as MessageInfo);
+      emitData["body"] = handleMessageProcess(assistantText);
       uni.$emit("updateMessageComponent", {
         messageId: `${currentMessageId}_${newMessage.index}`,
-        data: {
-          body: handleMessageProcess(newMessage.text || ""),
-          ...newMessage,
-        },
+        data: emitData,
       });
 
       // 打开页面首页
+      const pDataFinal = responseData as ProcessingData;
       if (
-        responseData.status === ProcessingEnum.EXECUTING &&
-        responseData.type === "Page"
+        pDataFinal.status == ProcessingEnum.EXECUTING &&
+        `${pDataFinal.type}` == "Page"
       ) {
         uni.$emit("page_preview_executing", responseData);
       }
@@ -552,16 +706,28 @@ export default class AgentDetailService {
       this.data.isLoadingFiles.value = true;
       const result = await apiGetStaticFileList(cId);
       this.data.isLoadingFiles.value = false;
-      if (result.code === SUCCESS_CODE) {
-        const { files } = result.data || {};
+      if (result.code == SUCCESS_CODE) {
+        let files: any[] = [];
+        if (result.data != null) {
+          const rdFiles = result.data as UTSJSONObject;
+          const filesVal = rdFiles["files"];
+          if (filesVal != null) {
+            files = filesVal as any[];
+          }
+        }
 
         let treeData: FileNode[] = [];
 
         // 检查是否是新的扁平格式
-        if (Array.isArray(files) && files.length > 0 && files[0].name) {
-          treeData = transformFlatListToTree(files);
-        } else if (Array.isArray(files)) {
-          // 如果是原有的树形格式，直接使用
+        if (files.length > 0) {
+          const firstFile = files[0] as UTSJSONObject;
+          const firstNameVal = firstFile["name"];
+          if (firstNameVal != null && `${firstNameVal}`.length > 0) {
+            treeData = transformFlatListToTree(files);
+          } else {
+            treeData = files as FileNode[];
+          }
+        } else {
           treeData = files as FileNode[];
         }
 
@@ -581,9 +747,8 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     currentMessageId: string,
     // 是否是临时会话
-    isTempChat?: boolean = false,
-    // 超时回调
-    onTimeout?: () => void,
+    isTempChat: boolean = false,
+    onTimeout : NullableTimeoutCallback,
   ): Promise<void> {
     try {
       // 清空问题建议列表
@@ -600,37 +765,40 @@ export default class AgentDetailService {
         (chunk: string) => {
           try {
             const result = JSON.parse(chunk);
+            const resultObj = result != null ? (result as UTSJSONObject) : (null as UTSJSONObject | null);
             // 验证解析结果
-            if (!result || typeof result !== "object") {
-              console.warn(
-                "[AgentDetailService] 解析结果无效, type:",
-                typeof result,
-                "value:",
-                result,
-              );
+            if (resultObj == null) {
+              console.warn("[AgentDetailService] 解析结果无效");
               return;
             }
             // 验证是否包含必要字段
-            if (!result.hasOwnProperty("data")) {
-              console.warn(
-                "[AgentDetailService] 解析结果缺少 data 字段, keys:",
-                Object.keys(result),
-              );
+            if (resultObj["data"] == null) {
+              console.warn("[AgentDetailService] 解析结果缺少 data 字段");
               return;
             }
 
             // 流式数据开始时，第一次收到数据时更新主题（只执行一次）
+            const convInfo = this.data.conversationInfo.value;
+            let topicUpdated = 0;
+            if (convInfo != null) {
+              const convObj = convInfo as UTSJSONObject;
+              const tuVal = convObj["topicUpdated"];
+              if (tuVal != null) {
+                topicUpdated = tuVal as number;
+              }
+            }
             if (
               !hasUpdatedTopic &&
               !isTempChat &&
               this.data.needUpdateTopicRef.value &&
-              this.data.conversationInfo?.value?.topicUpdated !== 1 // 只有未更新过才会执行，避免重复修改标题
+              topicUpdated != 1 // 只有未更新过才会执行，避免重复修改标题
             ) {
               hasUpdatedTopic = true;
-              this.handleUpdateTopic(params.conversationId, params.message);
+              const topicParams = params as ConversationChatParams;
+              this.handleUpdateTopic(`${topicParams.conversationId}`, topicParams.message);
             }
 
-            this.handleChangeMessageList(result, currentMessageId);
+            this.handleChangeMessageList(result as ConversationChatResponse, currentMessageId);
           } catch (error) {
             console.error(
               "[AgentDetailService] 解析SSE数据失败:",
@@ -643,41 +811,8 @@ export default class AgentDetailService {
           }
         },
         // 完成回调
-        async () => {
-          // 流式消息完成，设置会话状态为不活跃
-          this.data.isConversationActive.value = false;
-
-          // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
-          if (!isTempChat) {
-            if (this.data.isSuggest.value && this.isAllowSuggest) {
-              const responseData = await apiAgentConversationChatSuggest(
-                params as ConversationChatSuggestParams,
-              );
-              // 更新问题建议列表
-              this.data.chatSuggestList.value = responseData?.data ?? [];
-            }
-          }
-          // 会话完成后根据消息列表中的最后一条消息 判断是否存在 <task-result> 标签
-          const lastMessage =
-            this.data.messageList.value[this.data.messageList.value.length - 1];
-
-          const taskResult = extractTaskResult(lastMessage.text);
-          if (taskResult.hasTaskResult && taskResult.file) {
-            try {
-              const conversationId = this.data.conversationId.value;
-              const fileProxyUrl =
-                await getFileProxyUrlByConversationIdAndFilePath(
-                  conversationId,
-                  taskResult.file,
-                );
-              jumpToFilePreviewPage(conversationId, fileProxyUrl);
-            } catch (error) {
-              console.error(
-                "[AgentDetailService] Failed to parse <task-result> from last message:",
-                error,
-              );
-            }
-          }
+        () => {
+          this.handleStreamComplete(params, isTempChat);
         },
         // 错误回调
         (error: any) => {
@@ -685,16 +820,70 @@ export default class AgentDetailService {
             "[AgentDetailService] Chat stream error callback:",
             error,
           );
-          onTimeout?.();
+          if (onTimeout != null) {
+            (onTimeout as () => void)();
+          }
         },
         isTempChat,
         // 超时回调
         () => {
-          onTimeout?.();
+          if (onTimeout != null) {
+            (onTimeout as () => void)();
+          }
         },
       );
     } catch (error) {
       console.error("[AgentDetailService] Chat handling failed:", error);
+    }
+  }
+
+  /**
+   * 流式会话完成处理（从 handleConversation 的完成回调中抽取，便于使用 async/await）
+   */
+  async handleStreamComplete(
+    params: ConversationChatParams | TempConversationChatParams,
+    isTempChat: boolean,
+  ): Promise<void> {
+    // 流式消息完成，设置会话状态为不活跃
+    this.data.isConversationActive.value = false;
+
+    // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
+    if (!isTempChat) {
+      if (this.data.isSuggest.value && this.isAllowSuggest) {
+        const responseData = await apiAgentConversationChatSuggest(
+          params as ConversationChatSuggestParams,
+        );
+        // 更新问题建议列表
+        const rd = responseData != null ? responseData.data : null;
+        this.data.chatSuggestList.value = rd != null ? (rd as any[]) : [];
+      }
+    }
+    // 会话完成后根据消息列表中的最后一条消息 判断是否存在 <task-result> 标签
+    const lastMessage =
+      this.data.messageList.value[this.data.messageList.value.length - 1];
+
+    const lastText = lastMessage.text != null ? lastMessage.text : "";
+    const taskResult = extractTaskResult(lastText);
+    if (taskResult.hasTaskResult && taskResult.file != null && taskResult.file.length > 0) {
+      try {
+        const conversationId = this.data.conversationId.value;
+        if (conversationId != null) {
+          const cidStr = `${conversationId}`;
+            const fileProxyUrl =
+              await getFileProxyUrlByConversationIdAndFilePath(
+                cidStr,
+                taskResult.file,
+              );
+            if (fileProxyUrl != null) {
+              jumpToFilePreviewPage(cidStr, fileProxyUrl);
+            }
+          }
+      } catch (error) {
+        console.error(
+          "[AgentDetailService] Failed to parse <task-result> from last message:",
+          error,
+        );
+      }
     }
   }
 
@@ -713,18 +902,18 @@ export default class AgentDetailService {
     }
 
     // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
-    if (this.data.conversationInfo.value?.taskStatus === TaskStatus.EXECUTING) {
-      this.data.conversationInfo.value = {
-        ...this.data.conversationInfo.value,
-        taskStatus: TaskStatus.CANCEL,
-      };
+    const stopConvInfo = this.data.conversationInfo.value;
+    if (stopConvInfo != null && stopConvInfo.taskStatus == TaskStatus.EXECUTING) {
+      const convObj = JSON.parse(JSON.stringify(stopConvInfo)) as UTSJSONObject;
+      convObj["taskStatus"] = TaskStatus.CANCEL;
+      this.data.conversationInfo.value = convObj as ConversationInfo;
     }
 
     // 会话消息请求ID
     const requestId = this.data.currentConversationRequestId.value;
 
     // 对于临时会话，必须要有 requestId 才能停止
-    if (isTempChat && !requestId) {
+    if (isTempChat && (requestId == null || requestId.length == 0)) {
       this.data.isStoppingConversation.value = false;
       this.data.isConversationActive.value = false;
       return;
@@ -733,26 +922,25 @@ export default class AgentDetailService {
     // 对于普通会话，即使没有 requestId 也可以通过 conversationId 停止
     // 显示停止会话loading
     this.data.isStoppingConversation.value = true;
-    let res = null;
+    let res: RequestResponse<any> | null = null;
     try {
       if (isTempChat) {
         res = await apiTempChatConversationStop(requestId);
       } else {
         res = await apiAgentConversationChatStop(
-          String(this.data.conversationId.value),
+          `${this.data.conversationId.value}`,
         );
       }
-      const { code, data: responseData, message } = res;
+      const { code, data: responseData, message } = res as RequestResponse<any>;
       this.data.isStoppingConversation.value = false;
       // 停止会话成功
-      if (code === SUCCESS_CODE) {
+      if (code == SUCCESS_CODE) {
         this.data.isConversationActive.value = false;
         console.log("[AgentDetailService] stop 接口调用成功");
       } else {
         uni.showToast({
           title: message,
           icon: "none",
-          type: "error",
         });
       }
     } catch (error) {
@@ -770,18 +958,18 @@ export default class AgentDetailService {
     console.log("[AgentDetailService] 开始更新工具调用状态为 FAILED");
 
     const messageList = this.data.messageList.value;
-    if (!messageList || messageList.length === 0) {
+    if (messageList == null || messageList.length == 0) {
       console.log("[AgentDetailService] 消息列表为空，无需更新");
       return;
     }
 
     // 查找正在处理中的消息（状态为 Loading 或 Incomplete）
-    const updatedMessages = messageList.map((message) => {
+    const updatedMessages = messageList.map((message: MessageInfo): MessageInfo => {
       // 只处理正在进行中的助手消息
       if (
-        (message.status === MessageStatusEnum.Loading ||
-          message.status === MessageStatusEnum.Incomplete) &&
-        message.processingList &&
+        (message.status == MessageStatusEnum.Loading ||
+          message.status == MessageStatusEnum.Incomplete) &&
+        message.processingList != null &&
         message.processingList.length > 0
       ) {
         console.log(
@@ -789,27 +977,26 @@ export default class AgentDetailService {
         );
 
         // 更新 processingList 中的状态
-        const updatedProcessingList = message.processingList.map(
-          (processing) => {
+        const procList = message.processingList as ProcessingInfo[];
+        const updatedProcessingList = procList.map(
+          (processing: ProcessingInfo): ProcessingInfo => {
             // 将所有 EXECUTING 状态的工具调用改为 FAILED
-            if (processing.status === ProcessingEnum.EXECUTING) {
+            if (processing.status == ProcessingEnum.EXECUTING) {
               console.log(
                 `[AgentDetailService] 工具 ${processing.name} 状态从 EXECUTING 改为 FAILED`,
               );
-              return {
-                ...processing,
-                status: ProcessingEnum.FAILED,
-              };
+              const pObj = JSON.parse(JSON.stringify(processing)) as UTSJSONObject;
+              pObj["status"] = ProcessingEnum.FAILED;
+              return pObj as ProcessingInfo;
             }
             return processing;
           },
         );
 
         // 返回更新后的消息
-        return {
-          ...message,
-          processingList: updatedProcessingList,
-        };
+        const mObj = JSON.parse(JSON.stringify(message)) as UTSJSONObject;
+        mObj["processingList"] = updatedProcessingList;
+        return mObj as MessageInfo;
       }
 
       return message;
@@ -827,22 +1014,30 @@ export default class AgentDetailService {
     if (this.data.isTempChat.value) return;
     try {
       const res = await apiGetSandboxList();
-      if (res.code === SUCCESS_CODE && res.data) {
-        this.data.sandboxList.value = res.data.sandboxes || [];
+      if (res.code == SUCCESS_CODE && res.data != null) {
+        this.data.sandboxList.value = res.data.sandboxes != null ? res.data.sandboxes : [];
         this.data.agentSelectedSandbox.value = useAgentSelected
-          ? res.data.agentSelected || {}
-          : {};
+          ? (res.data.agentSelected != null ? res.data.agentSelected : {} as Record<string, string>)
+          : {} as Record<string, string>;
 
         const sandboxList = this.data.sandboxList.value;
         const conversationInfo = this.data.conversationInfo.value;
         const agentInfo = this.data.agentInfo.value;
         // 优先使用 data.agentId，其次使用 agentInfo.agentId
-        const agentId = String(
-          this.data.agentId.value || this.data.agentInfo.value?.agentId || "",
-        );
+        let agentId = "";
+        if (this.data.agentId.value != null) {
+          agentId = `${this.data.agentId.value}`;
+        } else {
+          const info = this.data.agentInfo.value;
+          if (info != null) {
+            if (info.agentId != null) {
+              agentId = `${info.agentId}`;
+            }
+          }
+        }
 
         // 2.1 权限判断 (UI层已处理置灰，这里主要处理状态)
-        if (agentInfo?.hasPermission === false) {
+        if (agentInfo?.hasPermission == false) {
           this.data.isSandboxSwitchDisabled.value = true;
           // this.data.wholeDisabled.value = true;
           // 提示语由UI层 maskText 控制，或者在这里设置 disabledText?
@@ -854,10 +1049,10 @@ export default class AgentDetailService {
         }
 
         // 2.2.1 个人电脑 (Priority 1)
-        if (agentInfo && agentInfo.sandboxId) {
-          const personalSandboxId = String(agentInfo.sandboxId);
+        if (agentInfo != null && agentInfo.sandboxId != null && agentInfo.sandboxId.length > 0) {
+          const personalSandboxId = `${agentInfo.sandboxId}`;
           const exists = sandboxList.some(
-            (s) => s.sandboxId === personalSandboxId,
+            (s) => s.sandboxId == personalSandboxId,
           );
 
           if (!exists) {
@@ -881,7 +1076,7 @@ export default class AgentDetailService {
         }
 
         // 2.2.2 电脑列表为空 (Priority 2)
-        if (sandboxList.length === 0) {
+        if (sandboxList.length == 0) {
           this.data.currentSandboxId.value = "";
           this.data.isSandboxSwitchDisabled.value = true;
           this.data.isSandboxUnavailable.value = true;
@@ -893,10 +1088,10 @@ export default class AgentDetailService {
         }
 
         // 2.2.3 共享电脑 (Priority 3)
-        if (conversationInfo && conversationInfo.sandboxServerId) {
-          const sharedSandboxId = String(conversationInfo.sandboxServerId);
+        if (conversationInfo != null && conversationInfo.sandboxServerId != null && conversationInfo.sandboxServerId.length > 0) {
+          const sharedSandboxId = `${conversationInfo.sandboxServerId}`;
           const exists = sandboxList.some(
-            (s) => s.sandboxId === sharedSandboxId,
+            (s) => s.sandboxId == sharedSandboxId,
           );
 
           if (!exists) {
@@ -927,11 +1122,19 @@ export default class AgentDetailService {
         // this.data.wholeDisabled.value = false;
 
         let initialId = "";
-        if (this.data.agentSelectedSandbox.value[agentId]) {
-          // agentSelected 优先
-          initialId = this.data.agentSelectedSandbox.value[agentId];
-          // 校验是否存在，不存在默认第一个
-          if (!sandboxList.some((s) => s.sandboxId === initialId)) {
+        const selectedMap = this.data.agentSelectedSandbox.value as UTSJSONObject;
+        const selectedId = selectedMap[agentId];
+        if (selectedId != null) {
+          const idStr = `${selectedId}`;
+          if (idStr.length > 0) {
+            // agentSelected 优先
+            initialId = idStr;
+            // 校验是否存在，不存在默认第一个
+            if (!sandboxList.some((s) => s.sandboxId == initialId)) {
+              initialId = sandboxList[0].sandboxId;
+            }
+          } else {
+            // 默认第一个
             initialId = sandboxList[0].sandboxId;
           }
         } else {
@@ -955,9 +1158,17 @@ export default class AgentDetailService {
       return;
     }
 
-    const agentId = String(
-      this.data.agentId.value || this.data.agentInfo.value?.agentId || "",
-    );
+    let agentId = "";
+    if (this.data.agentId.value != null) {
+      agentId = `${this.data.agentId.value}`;
+    } else {
+      const info = this.data.agentInfo.value;
+      if (info != null) {
+        if (info.agentId != null) {
+          agentId = `${info.agentId}`;
+        }
+      }
+    }
 
     try {
       // 调用 API 更新选中记录
@@ -965,7 +1176,7 @@ export default class AgentDetailService {
 
       // 更新本地状态
       this.data.currentSandboxId.value = sandboxId;
-      this.data.agentSelectedSandbox.value[agentId] = sandboxId;
+      (this.data.agentSelectedSandbox.value as UTSJSONObject)[agentId] = sandboxId;
 
       // uni.showToast({
       //   title: "切换成功",
@@ -985,7 +1196,7 @@ export default class AgentDetailService {
    */
   handleSelectModel(modelId: number, modelName: string = ""): void {
     this.data.currentModelId.value = modelId;
-    if (modelName) {
+    if (modelName.length > 0) {
       this.data.currentModelName.value = modelName;
     }
     this.data.modelSelectVisible.value = false;
@@ -1002,7 +1213,7 @@ export default class AgentDetailService {
   async resumeConversationState(): Promise<boolean> {
     // 1. 检查会话ID
     const conversationId = this.data.conversationId.value;
-    if (!conversationId || this.data.isTempChat.value) {
+    if ((conversationId == null || conversationId == 0) || this.data.isTempChat.value) {
       return false;
     }
 
@@ -1011,7 +1222,7 @@ export default class AgentDetailService {
     const lastAssistantMessage = [...messageList]
       .reverse()
       .find(
-        (msg) => msg.messageType === MessageTypeEnum.ASSISTANT && msg.status,
+        (msg) => msg.messageType == MessageTypeEnum.ASSISTANT && msg.status != null,
       );
 
     // 3. 获取前端状态
@@ -1022,10 +1233,10 @@ export default class AgentDetailService {
     // 4. 异常中断检测
     // 条件：最后一条助手消息状态为 Loading/Incomplete 且无 finalResult
     const isAbnormalInterruption =
-      lastAssistantMessage &&
-      (lastAssistantMessage.status === MessageStatusEnum.Loading ||
-        lastAssistantMessage.status === MessageStatusEnum.Incomplete) &&
-      !lastAssistantMessage.finalResult;
+      lastAssistantMessage != null &&
+      (lastAssistantMessage.status == MessageStatusEnum.Loading ||
+        lastAssistantMessage.status == MessageStatusEnum.Incomplete) &&
+      lastAssistantMessage.finalResult == null;
 
     // 5. 如果用户正在主动停止，不是异常中断
     if (isStoppingConversation) {
@@ -1050,10 +1261,10 @@ export default class AgentDetailService {
     try {
       // 8. 查询后端会话状态并刷新
       const res = await apiAgentConversation(conversationId);
-      if (res.code === SUCCESS_CODE) {
+      if (res.code == SUCCESS_CODE) {
         const taskStatus = res.data?.taskStatus;
         // 更新会话状态
-        if (taskStatus === "EXECUTING") {
+        if (taskStatus == TaskStatus.EXECUTING) {
           // 任务仍在后端执行，保持活跃状态
           this.data.isConversationActive.value = true;
         } else {
@@ -1085,66 +1296,84 @@ export default class AgentDetailService {
    * @param isTempChat 是否是临时会话
    */
   async handleSendMessage(
-    data: {
-      // 初始 chat 消息
-      messageInfo?: string;
-      // 用户上传的文件
-      files?: UploadFileInfo[];
-      // 用户选择的组件
-      selectedComponents?: AgentSelectedComponentInfo[];
-      // 用户填写的变量参数
-      variableParams?: { [key: string]: string | number };
-      // 用户选择的技能ID列表
-      skillIds?: number[];
-      // 用户选择的模型ID
-      modelId?: number;
-      // 用户选择的沙盒ID
-      sandboxId?: string;
-    },
-    isTempChat?: boolean = false,
-    // 超时回调
-    onTimeout?: () => void,
+    data: HandleSendMessageData,
+    isTempChat: boolean = false,
+    onTimeout: NullableTimeoutCallback = null,
   ): Promise<void> {
     const { messageInfo, files, selectedComponents, variableParams } = data;
     // 安全检查：确保this.data存在
-    if (!this.data) {
+    if (this.data == null) {
       return;
     }
 
     // 清空用户自带的url参数，只在第一次发送消息时使用，后续发送消息时不再使用
     this.data.urlOtherParams.value = null;
 
-    const attachments: AttachmentFile[] =
-      files?.map((file) => ({
-        fileKey: file.key || "",
-        fileUrl: file.url || "",
-        fileName: file.name || "",
-        mimeType: file.type || "",
-        fileSize: file.size || 0,
-      })) || [];
+    const attachments: AttachmentFile[] = [];
+    if (files != null) {
+      const filesLen = files.length;
+      for (let i = 0; i < filesLen; i++) {
+        const file = files[i];
+        let fileKey = "";
+        if (file.key != null) {
+          fileKey = file.key as string;
+        }
+        let fileUrl = "";
+        if (file.url != null) {
+          fileUrl = file.url as string;
+        }
+        let fileName = "";
+        if (file.name != null) {
+          fileName = file.name as string;
+        }
+        let mimeType = "";
+        if (file.type != null) {
+          mimeType = file.type as string;
+        }
+        let fileSize = 0;
+        if (file.size != null) {
+          fileSize = file.size as number;
+        }
+        const attObj: UTSJSONObject = {
+          fileKey: fileKey,
+          fileUrl: fileUrl,
+          fileName: fileName,
+          mimeType: mimeType,
+          fileSize: fileSize,
+        };
+        attachments.push(attObj as AttachmentFile);
+      }
+    }
 
-    // 参数验证
-    if ((!messageInfo || !messageInfo?.trim()) && attachments.length === 0) {
-      return;
+    // 参数验证：消息文本为空且附件为空时不发送
+    let hasMessage = false;
+    if (messageInfo != null) {
+      const trimmed = (messageInfo as string).trim();
+      if (trimmed.length > 0) {
+        hasMessage = true;
+      }
+    }
+    if (hasMessage == false) {
+      if (attachments.length == 0) {
+        return;
+      }
     }
 
     // 是否是临时会话
     if (isTempChat) {
       // 链接Key 或 会话唯一标识为空
-      if (!this.data.chatKey.value) {
+      if (this.data.chatKey.value == null || this.data.chatKey.value.length == 0) {
         uni.showToast({
           title: t("Mobile.Conversation.chatKeyRequired"),
           icon: "none",
-          type: "error",
         });
         return;
       }
     } else {
-      if (!this.data.conversationId.value) {
+      if (this.data.conversationId.value == null || this.data.conversationId.value == 0) {
         uni.showToast({
           title: t("Mobile.Conversation.idRequired"),
           icon: "none",
-          type: "error",
         });
         return;
       }
@@ -1174,7 +1403,7 @@ export default class AgentDetailService {
     const currentMessageId = generateUniqueId();
 
     // 构造消息
-    const chatMessage = {
+    const chatMessage: UTSJSONObject = {
       role: AssistantRoleEnum.USER,
       type: MessageModeEnum.CHAT,
       text: messageInfo,
@@ -1185,7 +1414,7 @@ export default class AgentDetailService {
     };
 
     // 当前助手信息
-    const currentMessage = {
+    const currentMessage: UTSJSONObject = {
       role: AssistantRoleEnum.ASSISTANT,
       type: MessageModeEnum.CHAT,
       text: "",
@@ -1194,16 +1423,18 @@ export default class AgentDetailService {
       id: currentMessageId,
       messageType: MessageTypeEnum.ASSISTANT,
       status: MessageStatusEnum.Loading,
-    } as MessageInfo;
+    };
 
     // 将Incomplete状态的消息改为Complete状态，并清理旧的消息状态
     const completeMessageList =
-      this.data.messageList.value?.map((item: MessageInfo) => {
-        if (item.status === MessageStatusEnum.Incomplete) {
-          item.status = MessageStatusEnum.Complete;
-        }
-        return item;
-      }) || [];
+      this.data.messageList.value != null
+        ? this.data.messageList.value.map((item: MessageInfo) => {
+          if (item.status == MessageStatusEnum.Incomplete) {
+            item.status = MessageStatusEnum.Complete;
+          }
+          return item;
+        })
+        : [] as MessageInfo[];
 
     // 清理旧的消息状态，确保新对话开始时状态是干净的
     this.data.messageIdRef.value = "";
@@ -1211,7 +1442,8 @@ export default class AgentDetailService {
 
     // 用户发送消息后已试用次数 +1，不超过可试用总次数
     if (this.data.agentInfo.value != null) {
-      const trialCount = this.data.agentInfo.value!.trialCount ?? 0;
+      const agentInfo = this.data.agentInfo.value as ConversationAgentInfo;
+      const trialCount = agentInfo.trialCount != null ? (agentInfo.trialCount as number) : 0;
       if (trialCount > 0) {
         this.data.localCalledTrialCount.value = Math.min(
           this.data.localCalledTrialCount.value + 1,
@@ -1221,40 +1453,49 @@ export default class AgentDetailService {
     }
 
     // 更新消息列表
-    const newMessageList = [
-      ...completeMessageList,
-      chatMessage,
-      currentMessage,
-    ] as MessageInfo[];
+    const newMessageList: MessageInfo[] = [];
+    const cl = completeMessageList;
+    if (cl != null) {
+      for (let i = 0; i < cl.length; i++) {
+        newMessageList.push(cl[i]);
+      }
+    }
+    newMessageList.push(chatMessage as MessageInfo);
+    newMessageList.push(currentMessage as MessageInfo);
     // AgentDetailUtils.checkConversationActive(newMessageList, this.data)
     this.data.isConversationActive.value = true;
     this.data.messageList.value = newMessageList;
 
-    // 基础参数
-    const baseParams = {
-      variableParams,
-      message: messageInfo,
-      attachments,
-      selectedComponents,
-      skillIds: data.skillIds,
-    };
-
     // 发送消息
-    const params: ConversationChatParams | TempConversationChatParams =
-      isTempChat
-        ? {
-            chatKey: this.data.chatKey.value,
-            conversationUid: this.data.conversationUid.value,
-            ...baseParams,
-          }
-        : {
-            conversationId: this.data.conversationId.value,
-            ...baseParams,
-            debug: false,
-            sandboxId: this.data.currentSandboxId.value || data.sandboxId,
-            modelId:
-              this.data.currentModelId.value || data.modelId || undefined,
-          };
+    let params: any = {};
+    if (isTempChat) {
+      params = {
+        chatKey: this.data.chatKey.value,
+        conversationUid: this.data.conversationUid.value,
+        variableParams: variableParams,
+        message: messageInfo,
+        attachments: attachments,
+        selectedComponents: selectedComponents,
+        skillIds: data.skillIds,
+      };
+    } else {
+      params = {
+        conversationId: this.data.conversationId.value,
+        variableParams: variableParams,
+        message: messageInfo,
+        attachments: attachments,
+        selectedComponents: selectedComponents,
+        skillIds: data.skillIds,
+        debug: false,
+        sandboxId: (this.data.currentSandboxId.value != null && this.data.currentSandboxId.value.length > 0)
+          ? this.data.currentSandboxId.value
+          : data.sandboxId,
+        modelId:
+          (this.data.currentModelId.value != null && this.data.currentModelId.value != 0)
+            ? this.data.currentModelId.value
+            : (data.modelId != null ? data.modelId : 0),
+      };
+    }
     this.handleConversation(params, currentMessageId, isTempChat, onTimeout);
   }
 
@@ -1263,29 +1504,31 @@ export default class AgentDetailService {
     conversationId: string,
     messageInfo: string,
   ): Promise<void> {
-    const params: AgentConversationUpdateParams = {
+    const paramsObj: UTSJSONObject = {
       id: conversationId,
       firstMessage: messageInfo,
     };
+    const params = paramsObj as AgentConversationUpdateParams;
 
     const {
       code,
       data: responseData,
       message,
     } = await apiAgentConversationUpdate(params);
-    if (code === SUCCESS_CODE) {
-      this.data.needUpdateTopicRef.value = responseData?.topicUpdated !== 1;
+    if (code == SUCCESS_CODE) {
+      const topicUpdatedRaw = responseData != null ? (responseData as UTSJSONObject)["topicUpdated"] : null;
+      this.data.needUpdateTopicRef.value = topicUpdatedRaw != 1;
       // 更新会话主题
-      this.data.conversationInfo.value = {
-        ...this.data.conversationInfo.value,
-        topic: responseData?.topic,
-        topicUpdated: responseData?.topicUpdated,
-      };
+      const conv = this.data.conversationInfo.value;
+      if (conv != null && responseData != null) {
+        const convObj = JSON.parse(JSON.stringify(conv)) as UTSJSONObject;
+        convObj["topic"] = (responseData as UTSJSONObject)["topic"];
+        this.data.conversationInfo.value = convObj as ConversationInfo;
+      }
     } else {
       uni.showToast({
         title: message,
         icon: "none",
-        type: "error",
       });
     }
   }
@@ -1310,18 +1553,15 @@ export default class AgentDetailService {
 
     // 重新根据 manualComponents 初始化默认选中的组件
     this.data.selectedComponents.value = (
-      this.data.manualComponents.value || []
+      this.data.manualComponents.value != null ? this.data.manualComponents.value as AgentManualComponentInfo[] : [] as AgentManualComponentInfo[]
     )
       .filter(
         (item: AgentManualComponentInfo): boolean =>
-          item.defaultSelected === DefaultSelectedEnum.Yes,
+          item.defaultSelected == DefaultSelectedEnum.Yes,
       )
       .map(
         (item: AgentManualComponentInfo): AgentSelectedComponentInfo =>
-          ({
-            id: item.id,
-            type: item.type,
-          }) as AgentSelectedComponentInfo,
+          new AgentSelectedComponentInfo(item.id, item.type),
       );
 
     if (!isTempChat) {
@@ -1334,11 +1574,10 @@ export default class AgentDetailService {
    * 创建新会话
    */
   async createNewConversation(isAppDetails: boolean = false): Promise<void> {
-    if (!this.data.agentId.value) {
+    if (this.data.agentId.value == null || this.data.agentId.value == 0) {
       uni.showToast({
         title: t("Mobile.Conversation.agentIdMissing"),
         icon: "none",
-        type: "error",
       });
       return;
     }
@@ -1347,18 +1586,19 @@ export default class AgentDetailService {
     this.clearConversationData();
 
     // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
-    if (this.data.conversationInfo.value?.taskStatus === TaskStatus.EXECUTING) {
-      this.data.conversationInfo.value = {
-        ...this.data.conversationInfo.value,
-        taskStatus: TaskStatus.CANCEL,
-      };
+    const stopConvInfo = this.data.conversationInfo.value;
+    if (stopConvInfo != null && stopConvInfo.taskStatus == TaskStatus.EXECUTING) {
+      const convObj = JSON.parse(JSON.stringify(stopConvInfo)) as UTSJSONObject;
+      convObj["taskStatus"] = TaskStatus.CANCEL;
+      this.data.conversationInfo.value = convObj as ConversationInfo;
     }
 
     // 会话参数
-    const conversationParams: ConversationCreateParams = {
+    const convParamsObj: UTSJSONObject = {
       agentId: this.data.agentId.value,
       devMode: false, // 开发模式, 只有智能体编排页才会设置为true
     };
+    const conversationParams = convParamsObj as ConversationCreateParams;
 
     // 获取引导问题
     this.getGuidQuestion(this.data.agentId.value);
@@ -1368,15 +1608,16 @@ export default class AgentDetailService {
       data: responseData,
       message,
     } = await apiAgentConversationCreate(conversationParams);
-    if (code === SUCCESS_CODE && responseData && responseData.id) {
+    if (code == SUCCESS_CODE && responseData != null && responseData.id != null && responseData.id != 0) {
       this.data.conversationId.value = responseData.id;
 
       // 更新会话信息
       this.data.conversationInfo.value = responseData;
-      if (responseData.agent) {
-        this.data.agentInfo.value = responseData.agent;
-        this.syncCalledTrialCount(responseData.agent);
-        if (responseData.agent.manualComponents) {
+      if (responseData.agent != null) {
+        const agentDetail = responseData.agent as AgentDetailDto;
+        this.data.agentInfo.value = agentDetail;
+        this.syncCalledTrialCount(agentDetail);
+        if (responseData.agent.manualComponents != null) {
           this.data.manualComponents.value =
             responseData.agent.manualComponents;
         }
@@ -1384,22 +1625,24 @@ export default class AgentDetailService {
 
       // 重新基于最新的 manualComponents 初始化默认选中的组件
       this.data.selectedComponents.value = (
-        this.data.manualComponents.value || []
+        this.data.manualComponents.value != null ? this.data.manualComponents.value as AgentManualComponentInfo[] : [] as AgentManualComponentInfo[]
       )
         .filter(
           (item: AgentManualComponentInfo): boolean =>
-            item.defaultSelected === DefaultSelectedEnum.Yes,
+            item.defaultSelected == DefaultSelectedEnum.Yes,
         )
         .map(
           (item: AgentManualComponentInfo): AgentSelectedComponentInfo =>
-            ({
-              id: item.id,
-              type: item.type,
-            }) as AgentSelectedComponentInfo,
+            new AgentSelectedComponentInfo(item.id, item.type),
         );
 
       // 重新获取沙盒列表以更新状态
-      this.handleGetSandboxList(responseData.agent?.allowPrivateSandbox === 1);
+      let allowPrivateSandbox = 0;
+      if (responseData.agent != null) {
+        const raw = (responseData.agent as UTSJSONObject)["allowPrivateSandbox"];
+        allowPrivateSandbox = raw != null ? (raw as number) : 0;
+      }
+      this.handleGetSandboxList(allowPrivateSandbox == 1);
 
       let newUrl = "";
 
@@ -1427,7 +1670,6 @@ export default class AgentDetailService {
       uni.showToast({
         title: message,
         icon: "none",
-        type: "error",
       });
     }
   }
@@ -1442,9 +1684,12 @@ export default class AgentDetailService {
       data: responseData,
       message,
     } = await apiPublishedAgentInfo(agentId);
-    if (code === SUCCESS_CODE) {
-      this.data.chatSuggestList.value =
-        responseData?.guidQuestionDtos?.slice(0, 5) ?? [];
+    if (code == SUCCESS_CODE) {
+      let guidSuggest: any[] = [];
+      if (responseData != null && responseData.guidQuestionDtos != null) {
+        guidSuggest = (responseData.guidQuestionDtos as any[]).slice(0, 5);
+      }
+      this.data.chatSuggestList.value = guidSuggest;
     }
   }
 
@@ -1454,48 +1699,56 @@ export default class AgentDetailService {
    */
   async getPublishedAgentInfo(appParams?: OpenAppParams): Promise<void> {
     // 查询已发布的智能体详情接口, 初始化会话id
+    const agentIdVal = this.data.agentId.value;
+    if (agentIdVal == null) {
+      return;
+    }
     const {
       code,
       data: responseData,
       message,
     } = await apiPublishedAgentInfo(
-      this.data.agentId.value,
+      agentIdVal,
       true, // 开启获取初始化会话id
     );
 
-    if (code === SUCCESS_CODE) {
+    if (code == SUCCESS_CODE) {
       this.data.agentInfo.value = responseData;
       this.syncCalledTrialCount(responseData);
       // 初始化可用组件列表和默认选中组件
-      this.data.manualComponents.value = responseData?.manualComponents || [];
-      this.data.selectedComponents.value = (
-        responseData?.manualComponents || []
-      )
+      const manualComps: AgentManualComponentInfo[] = (responseData != null && responseData.manualComponents != null) ? (responseData.manualComponents as AgentManualComponentInfo[]) : ([] as AgentManualComponentInfo[]);
+      this.data.manualComponents.value = manualComps;
+      this.data.selectedComponents.value = manualComps
         .filter(
           (item: AgentManualComponentInfo): boolean =>
-            item.defaultSelected === DefaultSelectedEnum.Yes,
+            item.defaultSelected == DefaultSelectedEnum.Yes,
         )
         .map(
           (item: AgentManualComponentInfo): AgentSelectedComponentInfo =>
-            ({
-              id: item.id,
-              type: item.type,
-            }) as AgentSelectedComponentInfo,
+            new AgentSelectedComponentInfo(item.id, item.type),
         );
 
       // 判断是否开启问题建议
       this.data.isSuggest.value =
-        responseData?.openSuggest === OpenCloseEnum.Open;
+        responseData != null && responseData.openSuggest == OpenCloseEnum.Open;
       // 引导问题建议（兼容旧版）
-      this.data.chatSuggestList.value =
-        responseData?.guidQuestionDtos?.length > 0
-          ? responseData?.guidQuestionDtos
-          : responseData?.openingGuidQuestions?.slice(0, 5);
+      let suggestList: any[] = [];
+      if (responseData != null && responseData.guidQuestionDtos != null) {
+        const dtos = responseData.guidQuestionDtos as any[];
+        if (dtos.length > 0) {
+          suggestList = dtos.slice(0, 5);
+        }
+      }
+      if (suggestList.length == 0 && responseData != null && responseData.openingGuidQuestions != null) {
+        suggestList = (responseData.openingGuidQuestions as any[]).slice(0, 5);
+      }
+      this.data.chatSuggestList.value = suggestList;
       // 首页页面URL
-      const httpUrl = `${API_BASE_URL}${responseData?.pageHomeIndex ?? ""}`;
+      const pageHomeIdx = (responseData != null && responseData.pageHomeIndex != null) ? (responseData.pageHomeIndex as string) : "";
+      const httpUrl = `${API_BASE_URL}${pageHomeIdx}`;
       // #ifdef H5 || WEB
       this.data.pageHomeUrl.value =
-        process.env.NODE_ENV === "production"
+        process.env.NODE_ENV == "production"
           ? `${window.location.origin}${httpUrl}`
           : httpUrl;
       // #endif
@@ -1505,20 +1758,20 @@ export default class AgentDetailService {
       // #endif
 
       // 变量参数
-      const _variables = responseData?.variables || [];
+      const _variables: BindConfigWithSub[] = (responseData != null && responseData.variables != null) ? (responseData.variables as BindConfigWithSub[]) : ([] as BindConfigWithSub[]);
       this.data.variables.value = _variables;
       // 获取会话ID
-      this.data.conversationId.value = responseData.conversationId;
+      this.data.conversationId.value = responseData?.conversationId;
 
       // 获取沙盒列表
-      this.handleGetSandboxList(responseData?.allowPrivateSandbox === 1);
+      this.handleGetSandboxList(responseData?.allowPrivateSandbox == DefaultSelectedEnum.Yes);
 
       // #ifdef H5 || WEB
       try {
         // 如果存在开放应用参数，则发送消息
         if (
-          appParams &&
-          typeof appParams === "object" &&
+          appParams != null &&
+          typeof appParams == "object" &&
           Object.keys(appParams)?.length > 0
         ) {
           // 保存开放应用参数
@@ -1535,48 +1788,48 @@ export default class AgentDetailService {
           const { message, variableParams, ...urlOtherParams } = newParams;
           // 如果存在其他参数，则保存到urlOtherParams中
           if (
-            urlOtherParams &&
-            typeof urlOtherParams === "object" &&
+            urlOtherParams != null &&
+            typeof urlOtherParams == "object" &&
             Object.keys(urlOtherParams)?.length > 0
           ) {
             this.data.urlOtherParams.value = urlOtherParams;
           }
           // 如果存在变量参数，则保存变量参数
           if (
-            variableParams &&
-            typeof variableParams === "object" &&
+            variableParams != null &&
+            typeof variableParams == "object" &&
             Object.keys(variableParams)?.length > 0
           ) {
             this.data.userFillVariables.value = variableParams;
           }
           // 如果存在消息或文件，则发送消息
-          if (message && message.trim()) {
+          if (message != null && message.trim().length > 0) {
             // 智能体必填变量参数 name 列表（排除系统变量）
             const requiredNames = _variables
-              .filter((item: any) => !item.systemVariable && item.require)
+              .filter((item: any) => item.systemVariable != true && item.require == true)
               .map((item: any) => item.name);
 
             // 用户自带的url参数中的变量参数对象
             const vp =
-              variableParams !== null &&
-              typeof variableParams === "object" &&
+              variableParams != null &&
+              typeof variableParams == "object" &&
               !Array.isArray(variableParams)
                 ? (variableParams as Record<string, unknown>)
                 : null;
 
             // 判断用户自带的url参数中的变量参数是否存在且不为空
             const variableValuePresent = (val: unknown): boolean => {
-              if (val === null || val === undefined) return false;
-              if (typeof val === "string") return val.trim() !== "";
-              if (typeof val === "number") return !Number.isNaN(val);
-              if (typeof val === "boolean") return true;
+              if (val == null || val == undefined) return false;
+              if (typeof val == "string") return val.trim() != "";
+              if (typeof val == "number") return !Number.isNaN(val);
+              if (typeof val == "boolean") return true;
               return false;
             };
 
             // 判断用户自带的url参数中的变量参数是否满足智能体必填变量参数要求
             const allRequiredInParams =
-              requiredNames.length === 0 ||
-              (vp !== null &&
+              requiredNames.length == 0 ||
+              (vp != null &&
                 requiredNames.every(
                   (name: string) =>
                     Object.prototype.hasOwnProperty.call(vp, name) &&
@@ -1591,7 +1844,7 @@ export default class AgentDetailService {
               newParams.messageInfo = message;
               delete newParams.message; // 删除消息信息
               // 初始化会话时，发送消息
-              this.handleSendMessage(newParams);
+              this.handleSendMessage(newParams, false, null);
             }
           }
         }
@@ -1605,14 +1858,15 @@ export default class AgentDetailService {
 
       // 检查订阅限制
       if (responseData != null) {
-        const paymentRequired = responseData!.paymentRequired === true;
-        const subscribed = responseData!.subscribed === true;
-        const overCallLimit = responseData!.overCallLimit === true;
+        const respObj = responseData as UTSJSONObject;
+        const paymentRequired = respObj["paymentRequired"] == true;
+        const subscribed = respObj["subscribed"] == true;
+        const overCallLimit = respObj["overCallLimit"] == true;
 
         // 是否弹出模态框：要求订阅且未订阅，或超出调用限制（已订阅时不主动弹窗）
         const shouldShowModal =
           paymentRequired && (!subscribed || overCallLimit) && !subscribed;
-        if (shouldShowModal && this.data.enableSubscription.value === 1) {
+        if (shouldShowModal && this.data.enableSubscription.value == 1) {
           this.data.subscriptionModalVisible.value = true;
         } else {
           this.data.subscriptionModalVisible.value = false;
@@ -1621,7 +1875,7 @@ export default class AgentDetailService {
         // 是否禁用输入框：要求订阅、且未订阅、且已超出调用限制
         const shouldBlockInput =
           paymentRequired && !subscribed && overCallLimit;
-        if (shouldBlockInput && this.data.enableSubscription.value === 1) {
+        if (shouldBlockInput && this.data.enableSubscription.value == 1) {
           this.data.subscriptionRequired.value = true;
         } else {
           this.data.subscriptionRequired.value = false;
@@ -1634,13 +1888,13 @@ export default class AgentDetailService {
    * 收藏/取消收藏
    */
   async handleCollect(): Promise<void> {
-    if (!this.data.agentInfo.value) return;
+    if (this.data.agentInfo.value == null) return;
 
     if (this.data.agentInfo.value.collect) {
       const { code } = await apiUnCollectAgent(
         this.data.agentInfo.value.agentId,
       );
-      if (code === SUCCESS_CODE) {
+      if (code == SUCCESS_CODE) {
         uni.showToast({
           title: t("Mobile.Conversation.unfavoriteSuccess"),
           icon: "success",
@@ -1650,7 +1904,7 @@ export default class AgentDetailService {
       }
     } else {
       const { code } = await apiCollectAgent(this.data.agentInfo.value.agentId);
-      if (code === SUCCESS_CODE) {
+      if (code == SUCCESS_CODE) {
         uni.showToast({
           title: t("Mobile.Conversation.favoriteSuccess"),
           icon: "success",
@@ -1667,25 +1921,32 @@ export default class AgentDetailService {
    */
   async queryTempConversation(conversationUid: string) {
     // 链接Key为空
-    if (!this.data.chatKey.value) {
+    if (this.data.chatKey.value == null || this.data.chatKey.value.length == 0) {
       uni.showToast({
         title: t("Mobile.Conversation.chatKeyRequired"),
         icon: "none",
-        type: "error",
       });
       return;
     }
-    const res = await apiTempChatConversationQuery({
+    const queryObj: UTSJSONObject = {
       chatKey: this.data.chatKey.value,
-      conversationUid,
-    });
-    if (res.code === SUCCESS_CODE) {
+      conversationUid: conversationUid,
+    };
+    const res = await apiTempChatConversationQuery(queryObj as TempConversationQueryDto);
+    if (res.code == SUCCESS_CODE) {
       // 临时会话页, 设置导航栏标题
-      if (res.data?.agent) {
+      if (res.data?.agent != null) {
+        let agentName = "";
+        const agent = res.data.agent;
+        if (agent != null) {
+          if (agent.name != null) {
+            agentName = agent.name as string;
+          }
+        }
+        const nameParams = new Map<string, string | number>();
+        nameParams.set("name", agentName);
         uni.setNavigationBarTitle({
-          title: t("Mobile.Conversation.startWithAgent", {
-            name: res.data?.agent?.name || "",
-          }),
+          title: t("Mobile.Conversation.startWithAgent", nameParams as Record<string, string | number>),
         });
       }
 
@@ -1708,22 +1969,21 @@ export default class AgentDetailService {
    */
   async createTempChatConversation(captchaVerifyParam: string) {
     // 链接Key为空
-    if (!this.data.chatKey.value) {
+    if (this.data.chatKey.value == null || this.data.chatKey.value.length == 0) {
       uni.showToast({
         title: t("Mobile.Conversation.chatKeyRequired"),
         icon: "none",
-        type: "error",
       });
       return;
     }
-    const params = {
+    const createObj: UTSJSONObject = {
       chatKey: this.data.chatKey.value,
-      captchaVerifyParam,
+      captchaVerifyParam: captchaVerifyParam,
     };
-    const res = await apiTempChatConversationCreate(params);
+    const res = await apiTempChatConversationCreate(createObj as TempConversationCreateDto);
     const { data: resData, code, message } = res;
     // 创建临时会话成功
-    if (code === SUCCESS_CODE) {
+    if (code == SUCCESS_CODE) {
       this.data.conversationUid.value = resData.uid;
       uni.setStorageSync(TEMP_CONVERSATION_UID, resData.uid);
       // 查询临时会话详细
@@ -1743,7 +2003,7 @@ export default class AgentDetailService {
    */
   async handleRestartAgent(): Promise<void> {
     const conversationId = this.data.conversationId.value;
-    if (!conversationId) return;
+    if (conversationId == null || conversationId == 0) return;
 
     uni.showLoading({
       title: t("Mobile.Common.restarting"),
@@ -1752,14 +2012,22 @@ export default class AgentDetailService {
     try {
       const res = await apiRestartAgent(conversationId);
       uni.hideLoading();
-      if (res.code === SUCCESS_CODE) {
+      if (res.code == SUCCESS_CODE) {
         uni.showToast({
           title: t("Mobile.Sandbox.restartAgentSuccess"),
           icon: "success",
         });
       } else {
+        let failTitle = t("Mobile.Sandbox.restartAgentFailed");
+        const msg = res.message;
+        if (msg != null) {
+          const msgText = msg as string;
+          if (msgText.length > 0) {
+            failTitle = msgText;
+          }
+        }
         uni.showToast({
-          title: res.message || t("Mobile.Sandbox.restartAgentFailed"),
+          title: failTitle,
           icon: "none",
         });
       }
@@ -1771,11 +2039,11 @@ export default class AgentDetailService {
 
   /**
    * 重启容器/客户端
-   * @param isCloudComp 是否是云电脑 (currentSandboxId === '-1')
+   * @param isCloudComp 是否是云电脑 (currentSandboxId == '-1')
    */
   async handleRestartSandbox(isCloudComp: boolean): Promise<void> {
     const conversationId = this.data.conversationId.value;
-    if (!conversationId) return;
+    if (conversationId == null || conversationId == 0) return;
 
     uni.showLoading({
       title: t("Mobile.Common.restarting"),
@@ -1784,7 +2052,7 @@ export default class AgentDetailService {
     try {
       const res = await apiRestartSandbox(conversationId);
       uni.hideLoading();
-      if (res.code === SUCCESS_CODE) {
+      if (res.code == SUCCESS_CODE) {
         uni.showToast({
           title: isCloudComp
             ? t("Mobile.Sandbox.restartCloudCompSuccess")
@@ -1792,8 +2060,16 @@ export default class AgentDetailService {
           icon: "success",
         });
       } else {
+        let failTitle = t("Mobile.Common.operationFailed");
+        const msg = res.message;
+        if (msg != null) {
+          const msgText = msg as string;
+          if (msgText.length > 0) {
+            failTitle = msgText;
+          }
+        }
         uni.showToast({
-          title: res.message || t("Mobile.Common.operationFailed"),
+          title: failTitle,
           icon: "none",
         });
       }
@@ -1808,21 +2084,23 @@ export default class AgentDetailService {
    */
   async handleCheckSubscriptionLimit(): Promise<void> {
     const id = this.data.conversationId.value;
-    if (id) {
+    if (id != null && id != 0) {
       const res = await apiAgentConversation(id);
-      if (res.code === SUCCESS_CODE && res.data != null) {
-        const agent = res.data!.agent;
+      if (res.code == SUCCESS_CODE && res.data != null) {
+        const conv = res.data as ConversationInfo;
+        const agent = conv.agent;
         if (agent != null) {
-          this.data.agentInfo.value = agent;
-          this.syncCalledTrialCount(agent);
-          const paymentRequired = agent.paymentRequired === true;
-          const subscribed = agent.subscribed === true;
-          const overCallLimit = agent.overCallLimit === true;
+          const agentDetail = agent as AgentDetailDto;
+          this.data.agentInfo.value = agentDetail;
+          this.syncCalledTrialCount(agentDetail);
+          const paymentRequired = agent.paymentRequired == true;
+          const subscribed = agent.subscribed == true;
+          const overCallLimit = agent.overCallLimit == true;
 
           // 是否弹出模态框：要求订阅且未订阅，或超出调用限制（已订阅时不主动弹窗）
           const shouldShowModal =
             paymentRequired && (!subscribed || overCallLimit) && !subscribed;
-          if (shouldShowModal && this.data.enableSubscription.value === 1) {
+          if (shouldShowModal && this.data.enableSubscription.value == 1) {
             this.data.subscriptionModalVisible.value = true;
           } else {
             this.data.subscriptionModalVisible.value = false;
@@ -1831,7 +2109,7 @@ export default class AgentDetailService {
           // 是否禁用输入框：要求订阅、且未订阅、且已超出调用限制
           const shouldBlockInput =
             paymentRequired && !subscribed && overCallLimit;
-          if (shouldBlockInput && this.data.enableSubscription.value === 1) {
+          if (shouldBlockInput && this.data.enableSubscription.value == 1) {
             this.data.subscriptionRequired.value = true;
           } else {
             this.data.subscriptionRequired.value = false;

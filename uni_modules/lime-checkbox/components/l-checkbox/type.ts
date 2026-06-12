@@ -54,7 +54,7 @@ export type CheckboxProps = {
 	labelStyle?: string | UTSJSONObject
 }
 
-export type ManageChildInList = (child: LCheckboxComponentPublicInstance, shouldAdd: boolean) => void;
+export type ManageChildInList = (instance: any | null, register: boolean) => void;
 export type CheckboxStatus = 'checked' | 'uncheck' | 'indeterminate';
 export type CheckboxChangeOptions = {
 	checked : boolean,

@@ -99,10 +99,10 @@ export class Animation {
 	startValue: number
 	endValue: number
 	duration: number
-	timingFunction: (t: number) => number
+	timingFunction: any
 	delay: number
-	template: (t: number) => void
-	constructor(startValue: number, endValue: number, duration: number, delay: number, timingFunction: (t: number) => number, template: (v: number) => void) {
+	template: any
+	constructor(startValue: number, endValue: number, duration: number, delay: number, timingFunction: any, template: any) {
 		timingFunction = timingFunction || (v => v);
 		template = template || (v => v);
 		

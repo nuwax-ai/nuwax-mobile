@@ -42,7 +42,7 @@ interface StepAnimates {
 // 	ref?: string
 // }
 
-type Callback = (time: number) => void
+type Callback = any
 const animateTypes1 : AnimationTypes[] = ['matrix', 'matrix3d', 'rotate', 'rotate3d', 'rotateX', 'rotateY', 'rotateZ', 'scale', 'scale3d',
 	'scaleX', 'scaleY', 'scaleZ', 'skew', 'skewX', 'skewY', 'translate', 'translate3d', 'translateX', 'translateY',
 	'translateZ'

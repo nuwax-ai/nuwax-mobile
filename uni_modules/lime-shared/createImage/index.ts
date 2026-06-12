@@ -11,8 +11,8 @@ class Image {
 	path: string = ''
 	crossOrigin: string = ''
 	referrerPolicy: string = ''
-	onload: () => void = () => {}
-	onerror: () => void = () => {}
+	onload: any = () => {}
+	onerror: any = () => {}
 	complete: boolean = false
 	constructor() {}
 	set src(src: string) {

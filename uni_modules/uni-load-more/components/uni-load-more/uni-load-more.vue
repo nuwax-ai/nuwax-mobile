@@ -15,7 +15,7 @@
 		<!-- #endif -->
 		<!-- #ifndef APP-NVUE || H5 -->
 		<view
-			v-if="!webviewHide && (iconType==='circle' || iconType==='auto' && platform === 'android') && status === 'loading' && showIcon"
+			v-if="showAndroidCircleLoading"
 			:style="{width:iconSize+'px',height:iconSize+'px'}"
 			class="uni-load-more__img uni-load-more__img--android-MP">
 			<view class="uni-load-more__img-icon" :style="{borderTopColor:color,borderTopWidth:iconSize/12}"></view>
@@ -24,18 +24,18 @@
 		</view>
 		<!-- #endif -->
 		<!-- #ifndef APP-NVUE -->
-		<view v-else-if="!webviewHide && status === 'loading' && showIcon"
+		<view v-else-if="showIosSnowLoading"
 			:style="{width:iconSize+'px',height:iconSize+'px'}" class="uni-load-more__img uni-load-more__img--ios-H5">
 			<image class="image" :src="imgBase64" mode="widthFix"></image>
 		</view>
 		<!-- #endif -->
 		<text v-if="showText" class="uni-load-more__text"
-			:style="{color: color}">{{ status === 'more' ? contentdownText : status === 'loading' ? contentrefreshText : contentnomoreText }}</text>
+			:style="{color: color}">{{ statusDisplayText }}</text>
 	</view>
 </template>
 
 <script>
-	let platform
+	let platform = ""
 	setTimeout(() => {
 		// #ifdef MP-WEIXIN
 		platform = uni.getDeviceInfo().platform
@@ -56,7 +56,7 @@
 	// #endif
 	// #ifdef APP-ANDROID
 	// uni-app x Android 不支持 @dcloudio/uni-i18n，这里给一个空 fallback
-	const t = (key) => ''
+	const t = (key: string): string => { return ""; }
 	// #endif
 
 	/**
@@ -104,12 +104,12 @@
 			},
 			contentText: {
 				type: Object,
-				default () {
+				default(): UTSJSONObject {
 					return {
 						contentdown: '',
 						contentrefresh: '',
 						contentnomore: ''
-					}
+					} as UTSJSONObject
 				}
 			},
 			showText: {
@@ -126,17 +126,80 @@
 		},
 		computed: {
 			iconSnowWidth() {
-				return (Math.floor(this.iconSize / 24) || 1) * 2
+				const base = Math.floor(this.iconSize / 24);
+				if (base == 0) {
+					return 2;
+				}
+				return base * 2;
 			},
 			contentdownText() {
-				return this.contentText.contentdown || t("uni-load-more.contentdown")
+				const ct = this.contentText as UTSJSONObject;
+				const text = ct["contentdown"];
+				if (text != null && `${text}` != '') {
+					return `${text}`;
+				}
+				return t("uni-load-more.contentdown");
 			},
 			contentrefreshText() {
-				return this.contentText.contentrefresh || t("uni-load-more.contentrefresh")
+				const ct = this.contentText as UTSJSONObject;
+				const text = ct["contentrefresh"];
+				if (text != null && `${text}` != '') {
+					return `${text}`;
+				}
+				return t("uni-load-more.contentrefresh");
 			},
 			contentnomoreText() {
-				return this.contentText.contentnomore || t("uni-load-more.contentnomore")
-			}
+				const ct = this.contentText as UTSJSONObject;
+				const text = ct["contentnomore"];
+				if (text != null && `${text}` != '') {
+					return `${text}`;
+				}
+				return t("uni-load-more.contentnomore");
+			},
+			/** 是否展示 Android 圆环 loading */
+			showAndroidCircleLoading() {
+				if (this.webviewHide == true) {
+					return false;
+				}
+				if (this.status !== 'loading') {
+					return false;
+				}
+				if (this.showIcon != true) {
+					return false;
+				}
+				if (this.iconType === 'circle') {
+					return true;
+				}
+				if (this.iconType === 'auto') {
+					if (platform === 'android') {
+						return true;
+					}
+				}
+				return false;
+			},
+			/** 是否展示 iOS 雪花 loading */
+			showIosSnowLoading() {
+				if (this.webviewHide == true) {
+					return false;
+				}
+				if (this.status !== 'loading') {
+					return false;
+				}
+				if (this.showIcon != true) {
+					return false;
+				}
+				return true;
+			},
+			/** 状态文案 */
+			statusDisplayText() {
+				if (this.status === 'more') {
+					return this.contentdownText;
+				}
+				if (this.status === 'loading') {
+					return this.contentrefreshText;
+				}
+				return this.contentnomoreText;
+			},
 		},
 		mounted() {
 			// #ifdef APP-PLUS

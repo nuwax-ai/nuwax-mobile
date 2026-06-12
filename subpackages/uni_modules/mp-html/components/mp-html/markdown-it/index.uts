@@ -1,23 +1,378 @@
 /**
- * @fileoverview markdown 插件（Android UTS stub）
- * markdown-it and markdown-it-container are JS-only npm packages.
- * On native platforms, markdown rendering is not available.
+ * @fileoverview markdown 插件（UTS 版）
+ * 原生端无 markdown-it npm 包，此处实现一个覆盖常见语法的 markdown→HTML 转换器，
+ * 供 mp-html 在 markdown=true 时于解析前调用。
+ *
+ * 覆盖：代码围栏、标题、粗体/斜体/删除线、行内代码、链接/图片/自动链接、
+ * 有序/无序列表、引用块、分隔线、段落。
+ * 未覆盖：表格、脚注、嵌套列表（按扁平处理）。
  */
+import { MpHtmlPlugin, Parser } from '../parser.uts'
 
-export class Markdown {
-  vm: any | null = null;
+// ============ 通用辅助 ============
 
-  constructor(vm: any) {
-    this.vm = vm;
-  }
-
-  /** 原样返回 content（native 端无 markdown 渲染） */
-  onUpdate(content: string): string {
-    return content;
-  }
-
-  /** no-op */
-  onParse(node: any, vm: any): void {}
+function mdCharAt(s: string, i: number): string {
+  if (i < 0 || i >= s.length) return ""
+  return s.substring(i, i + 1)
 }
 
-export default Markdown;
+function escapeHtml(s: string): string {
+  let r = ""
+  for (let i = 0; i < s.length; i++) {
+    const c = mdCharAt(s, i)
+    if (c == "&") r += "&amp;"
+    else if (c == "<") r += "&lt;"
+    else if (c == ">") r += "&gt;"
+    else if (c == "\"") r += "&quot;"
+    else r += c
+  }
+  return r
+}
+
+function grp(m: RegExpExecArray, idx: number): string {
+  const v = m[idx]
+  return v != null ? `${v}` : ""
+}
+
+function isHr(line: string): boolean {
+  const s = line.trim()
+  if (s.length < 3) return false
+  const c = mdCharAt(s, 0)
+  if (c != "-" && c != "*" && c != "_") return false
+  for (let k = 1; k < s.length; k++) {
+    if (mdCharAt(s, k) != c) return false
+  }
+  return true
+}
+
+// ============ 行内渲染 ============
+
+function findInlineClose(text: string, start: number, delim: string): number {
+  const len = text.length
+  const dl = delim.length
+  let i = start
+  while (i < len) {
+    if (mdCharAt(text, i) == "\\") {
+      i += 2
+      continue
+    }
+    let matched = true
+    for (let k = 0; k < dl; k++) {
+      if (mdCharAt(text, i + k) != mdCharAt(delim, k)) {
+        matched = false
+        break
+      }
+    }
+    if (matched) return i
+    i++
+  }
+  return -1
+}
+
+function parseLink(text: string, i: number): UTSJSONObject | null {
+  // text[i] == "["
+  const closeBracket = text.indexOf("]", i)
+  if (closeBracket == -1) return null
+  if (mdCharAt(text, closeBracket + 1) != "(") return null
+  const closeParen = text.indexOf(")", closeBracket + 2)
+  if (closeParen == -1) return null
+  const linkText = text.substring(i + 1, closeBracket)
+  const url = text.substring(closeBracket + 2, closeParen)
+  const r = new UTSJSONObject()
+  r["text"] = linkText
+  r["url"] = url
+  r["end"] = closeParen + 1
+  return r
+}
+
+function renderInline(text: string): string {
+  let out = ""
+  let i = 0
+  const len = text.length
+  while (i < len) {
+    const c = mdCharAt(text, i)
+
+    if (c == "\n") {
+      out += "<br/>"
+      i++
+      continue
+    }
+
+    if (c == "\\") {
+      const nx = mdCharAt(text, i + 1)
+      if (nx != "") {
+        out += nx
+        i += 2
+        continue
+      }
+      out += "\\"
+      i++
+      continue
+    }
+
+    // 行内代码 `code`
+    if (c == "`") {
+      let ticks = 0
+      while (mdCharAt(text, i + ticks) == "`") ticks++
+      const contentStart = i + ticks
+      let closeIdx = -1
+      let k = contentStart
+      while (k < len) {
+        if (mdCharAt(text, k) == "`") {
+          let tk = 0
+          while (mdCharAt(text, k + tk) == "`") tk++
+          if (tk == ticks) {
+            closeIdx = k
+            break
+          }
+          k += tk
+        } else {
+          k++
+        }
+      }
+      if (closeIdx != -1) {
+        const code = text.substring(contentStart, closeIdx).trim()
+        out += "<code>" + escapeHtml(code) + "</code>"
+        i = closeIdx + ticks
+        continue
+      }
+      out += "`"
+      i++
+      continue
+    }
+
+    // 图片 ![alt](url)
+    if (c == "!" && mdCharAt(text, i + 1) == "[") {
+      const link = parseLink(text, i + 1)
+      if (link != null) {
+        const lt = `${link["text"]}`
+        const lu = `${link["url"]}`
+        out += `<img src="${lu}" alt="${lt}"/>`
+        i = parseInt(`${link["end"]}`)
+        continue
+      }
+    }
+
+    // 链接 [text](url)
+    if (c == "[") {
+      const link = parseLink(text, i)
+      if (link != null) {
+        const lu = `${link["url"]}`
+        const lt = `${link["text"]}`
+        out += `<a href="${lu}">${renderInline(lt)}</a>`
+        i = parseInt(`${link["end"]}`)
+        continue
+      }
+    }
+
+    // 自动链接 <http(s)://...>
+    if (c == "<") {
+      const probeLen = i + 9 < len ? i + 9 : len
+      const rest = text.substring(i, probeLen)
+      if (rest.indexOf("<http://") == 0 || rest.indexOf("<https://") == 0) {
+        const close = text.indexOf(">", i)
+        if (close != -1) {
+          const url = text.substring(i + 1, close)
+          out += `<a href="${url}">${url}</a>`
+          i = close + 1
+          continue
+        }
+      }
+      out += "<"
+      i++
+      continue
+    }
+
+    // 粗体 ** 或 __
+    if ((c == "*" && mdCharAt(text, i + 1) == "*") || (c == "_" && mdCharAt(text, i + 1) == "_")) {
+      const delim = c + c
+      const close = findInlineClose(text, i + 2, delim)
+      if (close != -1) {
+        const inner = text.substring(i + 2, close)
+        out += "<strong>" + renderInline(inner) + "</strong>"
+        i = close + 2
+        continue
+      }
+    }
+
+    // 删除线 ~~
+    if (c == "~" && mdCharAt(text, i + 1) == "~") {
+      const close = findInlineClose(text, i + 2, "~~")
+      if (close != -1) {
+        out += "<del>" + renderInline(text.substring(i + 2, close)) + "</del>"
+        i = close + 2
+        continue
+      }
+    }
+
+    // 斜体 * 或 _
+    if (c == "*" || c == "_") {
+      const close = findInlineClose(text, i + 1, c)
+      if (close != -1 && close > i + 1) {
+        out += "<em>" + renderInline(text.substring(i + 1, close)) + "</em>"
+        i = close + 1
+        continue
+      }
+    }
+
+    out += c
+    i++
+  }
+  return out
+}
+
+// ============ 块级渲染 ============
+
+function flushPara(para: string[]): string {
+  if (para.length == 0) return ""
+  const joined = para.join("\n").trim()
+  const html = "<p>" + renderInline(joined) + "</p>\n"
+  para.splice(0, para.length)
+  return html
+}
+
+export function markdownToHtml(src: string): string {
+  const text = src.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+  const lines = text.split("\n")
+  const n = lines.length
+  let out = ""
+  let i = 0
+  const para: string[] = [] as string[]
+
+  while (i < n) {
+    const line = lines[i]
+
+    // 围栏代码块
+    const fenceRe = /^(\s{0,3})(`{3,}|~{3,})(.*)$/
+    const fm = fenceRe.exec(line)
+    if (fm != null) {
+      out += flushPara(para)
+      const fenceMarker = grp(fm, 2)
+      const fc = mdCharAt(fenceMarker, 0)
+      const lang = grp(fm, 3).trim()
+      const closeRe = new RegExp("^\\s{0,3}" + fc + "{3,}\\s*$")
+      const codeLines: string[] = [] as string[]
+      i++
+      while (i < n) {
+        if (closeRe.exec(lines[i]) != null) {
+          i++
+          break
+        }
+        codeLines.push(lines[i])
+        i++
+      }
+      const code = codeLines.join("\n")
+      const langAttr = lang != "" ? ` class="language-${lang}"` : ""
+      out += `<pre><code${langAttr}>${escapeHtml(code)}</code></pre>\n`
+      continue
+    }
+
+    // ATX 标题
+    const headRe = /^(#{1,6})\s+(.+)$/
+    const hm = headRe.exec(line)
+    if (hm != null) {
+      out += flushPara(para)
+      const hashes = grp(hm, 1)
+      const level = hashes.length
+      let content = grp(hm, 2)
+      content = content.replace(/\s+#+\s*$/, "").trim()
+      out += `<h${level}>${renderInline(content)}</h${level}>\n`
+      i++
+      continue
+    }
+
+    // 分隔线
+    if (isHr(line)) {
+      out += flushPara(para)
+      out += "<hr/>\n"
+      i++
+      continue
+    }
+
+    // 引用块
+    const bqRe = /^\s{0,3}>\s?(.*)$/
+    const bqm = bqRe.exec(line)
+    if (bqm != null) {
+      out += flushPara(para)
+      const bqLines: string[] = [] as string[]
+      while (i < n) {
+        const m2 = bqRe.exec(lines[i])
+        if (m2 == null) break
+        bqLines.push(grp(m2, 1))
+        i++
+      }
+      out += "<blockquote>\n" + markdownToHtml(bqLines.join("\n")) + "</blockquote>\n"
+      continue
+    }
+
+    // 无序列表
+    const ulRe = /^(\s{0,3})[-*+]\s+(.*)$/
+    const ulm = ulRe.exec(line)
+    if (ulm != null) {
+      out += flushPara(para)
+      let block = "<ul>\n"
+      while (i < n) {
+        const m = ulRe.exec(lines[i])
+        if (m == null) break
+        block += `<li>${renderInline(grp(m, 2).trim())}</li>\n`
+        i++
+      }
+      block += "</ul>\n"
+      out += block
+      continue
+    }
+
+    // 有序列表
+    const olRe = /^(\s{0,3})\d+\.\s+(.*)$/
+    const olm = olRe.exec(line)
+    if (olm != null) {
+      out += flushPara(para)
+      let block = "<ol>\n"
+      while (i < n) {
+        const m = olRe.exec(lines[i])
+        if (m == null) break
+        block += `<li>${renderInline(grp(m, 2).trim())}</li>\n`
+        i++
+      }
+      block += "</ol>\n"
+      out += block
+      continue
+    }
+
+    // 空行 -> 段落边界
+    if (line.trim() == "") {
+      out += flushPara(para)
+      i++
+      continue
+    }
+
+    // 默认：段落累积
+    para.push(line)
+    i++
+  }
+  out += flushPara(para)
+  return out
+}
+
+// ============ 插件类 ============
+
+export class Markdown implements MpHtmlPlugin {
+  vm: UTSJSONObject
+
+  constructor(vm: any) {
+    this.vm = vm as UTSJSONObject
+  }
+
+  onUpdate(content: string, config: UTSJSONObject): string {
+    if (`${this.vm["markdown"]}` == "true") {
+      return markdownToHtml(content)
+    }
+    return content
+  }
+
+  onParse(node: UTSJSONObject, parser: Parser): boolean {
+    return true
+  }
+}
+
+export default Markdown

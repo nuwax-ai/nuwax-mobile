@@ -14,7 +14,7 @@
 2. H5 只会做两件事：`location.href` 跳转，或 `form.submit()` 提交表单  
 3. **客户端职责**：让上述跳转链路畅通，并在末端 scheme 出现时交给系统打开  
 4. **支付结果由 H5 轮询**（读回跳 URL 的 `h5OrderId`，或 `visibilitychange`/`pageshow` 触发），客户端无需实现「支付成功/失败」的业务回调  
-5. **但 iOS「支付完回到 APP」需要客户端额外处理**（见步骤 5），这是安信富网关的已知限制，与支付结果判定无关
+5. **但 iOS「支付完回到 APP」需要客户端额外处理**（见步骤 5），这是安心付网关的已知限制，与支付结果判定无关
 
 ---
 
@@ -147,7 +147,7 @@ func webView(_ webView: WKWebView,
 - 拦截 `form.submit()` 触发的 POST 请求
 - 在支付外跳时 `finish()` Activity / pop 掉 WebView 页面
 
-> **第三方网关域名必须放行（最常见失败点）**：当前支付走 **安信富（安心校园）** 网关，表单会 POST 到 `insurance.axinfu.com`，收银台/回调还可能涉及其它 `*.axinfu.com` 域名。若客户端有「仅放行业务域名（santisaas / nuwax）」的白名单策略，**务必把 `*.axinfu.com` 一并放行**。否则 POST 被拦 → 收银台打不开 → 微信/支付宝永远唤不起（典型现象：点支付后页面停在「pay redirect」或白屏）。
+> **第三方网关域名必须放行（最常见失败点）**：当前支付走 **安心付** 网关，表单会 POST 到 `insurance.axinfu.com`，收银台/回调还可能涉及其它 `*.axinfu.com` 域名。若客户端有「仅放行业务域名（santisaas / nuwax）」的白名单策略，**务必把 `*.axinfu.com` 一并放行**。否则 POST 被拦 → 收银台打不开 → 微信/支付宝永远唤不起（典型现象：点支付后页面停在「pay redirect」或白屏）。
 
 ---
 
@@ -165,9 +165,9 @@ func webView(_ webView: WKWebView,
 
 ---
 
-### 步骤 5：iOS 支付完成自动返回原 APP（安信富网关特有）
+### 步骤 5：iOS 支付完成自动返回原 APP（安心付网关特有）
 
-> 安信富网关官方已声明：**iOS 客户端支付完成时无法自动跳转回 APP**，不额外处理的话用户支付完会落到 Safari 而非你们的 APP。以下「三件套」由 **iOS 客户端** 完成（H5 无法实现），方案来自网关官方推荐文档。
+> 安心付网关官方已声明：**iOS 客户端支付完成时无法自动跳转回 APP**，不额外处理的话用户支付完会落到 Safari 而非你们的 APP。以下「三件套」由 **iOS 客户端** 完成（H5 无法实现），方案来自网关官方推荐：[iOS WKWebView 实现 H5 跳转微信支付并返回原 APP](https://www.jianshu.com/p/28483a16c4d5)。
 
 **前提**：向开通微信支付的同学要到 **H5 微信支付授权域名**（形如 `pay.nuwax.com`；二级域名前缀可自定义）。
 
@@ -227,7 +227,7 @@ Android、iOS 各至少一台真机，按序执行：
 | 点支付后无外跳，页面停在「pay redirect」/白屏 | 第三方网关域名 `*.axinfu.com` 被域名白名单拦截（**最常见**）；抓包看 form POST 到 `insurance.axinfu.com` 是否真的发出 |
 | 有收银台页但进不了微信/支付宝 | scheme 没被拦截外跳，或被当普通 URL 在 WebView 内加载；确认拦截逻辑认 `weixin://wap/pay?` |
 | iOS 完全唤不起微信 | 检查 `LSApplicationQueriesSchemes` 是否含 `weixin` |
-| iOS 支付完回到 Safari 而非 APP | 未实现步骤 5 的自动返回三件套（安信富网关已知限制） |
+| iOS 支付完回到 Safari 而非 APP | 未实现步骤 5 的自动返回三件套（安心付网关已知限制） |
 | 弹「支付失败」Toast（H5 文案） | 多为接口 / 网络 / 登录态问题，**非**客户端拦截；看 Console 与 `/pay/h5-web` 响应的 `code` / `message` |
 | 支付成功但 H5 显示失败 | 返回后 WebView 被销毁或 reload、Cookie 丢失，H5 轮询未拉起 |
 
@@ -247,3 +247,5 @@ Android、iOS 各至少一台真机，按序执行：
 ## 六、相关文档
 
 - [APP WebView 支付接入说明](./app-webview-pay-integration.md) — H5 支付流程与背景说明
+- [安心付 · 网页跳转支付 /gateway_web](https://s.apifox.cn/ba15f216-093d-4f4e-8e1d-1b162bda4ff5/doc-3296425) — 安心付网关接口文档（外部链接）
+- [iOS WKWebView 实现 H5 跳转微信支付并返回原 APP](https://www.jianshu.com/p/28483a16c4d5) — 安心付网关官方推荐的 iOS 返回原 APP 方案（外部链接）

@@ -52,6 +52,11 @@ const schema = read("utils/mcpAskSchema.uts");
 const interventionTypes = read("types/intervention.uts");
 assertIncludes(
   interventionTypes,
+  "export const MCP_ASK_WIDGET_TYPES",
+  "mobile widget whitelist constant",
+);
+assertIncludes(
+  interventionTypes,
   `export const MCP_ASK_TOOL_NAME = "${expectedToolName}"`,
   "mobile MCP_ASK_TOOL_NAME constant",
 );
@@ -87,11 +92,16 @@ assertIncludes(
 );
 assertIncludes(
   schema,
-  'explicitWidget === "radio-with-custom"',
-  "radio-with-custom widget",
+  "isKnownWidget(explicitWidget)",
+  "widget whitelist guard",
 );
-assertIncludes(schema, 'explicitWidget === "file"', "file widget");
+assertIncludes(schema, '"radio-with-custom"', "radio-with-custom widget name");
+assertIncludes(schema, '"file"', "file widget name");
+assertIncludes(schema, '"number"', "number widget name");
+assertIncludes(schema, "MCP_ASK_WIDGET_TYPES", "widget whitelist constant");
+assertIncludes(schema, "getJsonSchemaPrimaryType", "json schema primary type helper");
 assertIncludes(schema, 'return "checkboxes"', "checkbox widget inference");
+assertIncludes(schema, 'return "number"', "number widget inference");
 assertIncludes(schema, 'return "textarea"', "textarea widget inference");
 assertIncludes(schema, "getInteractionSteps", "wizard steps helper");
 
@@ -210,6 +220,9 @@ for (const needle of [
   "handleSkip",
   "validateFields",
   "radio-with-custom",
+  "field.widget === 'number'",
+  "onNumberInput",
+  "integerNumberSuffix",
   "field.otherValue",
   "field.otherField",
   "field.multiple",

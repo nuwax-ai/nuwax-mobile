@@ -73,6 +73,7 @@ components/agent-intervention/
 | Dock 面板 + 活跃队列 | 有 | 无（消息流内联渲染） |
 | SSE 解析 / respond | model + hooks | `utils/interventionAdapter.uts`、`AgentDetailService.uts` |
 | MCP resume 消息 | `mcpAskResumeMessage` | `utils/mcpAskResumeMessage.uts` |
+| MCP 3.3.2+ structuredContent | `extractMcpAskStructuredInputFromResult` | `utils/mcpAskSchema.uts`（优先于 `result.input`） |
 
 Phase 2 可按需补 `agent-intervention-chat-layer` + `activeInterventionQueue.uts`。
 

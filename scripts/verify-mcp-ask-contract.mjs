@@ -104,6 +104,12 @@ assertIncludes(schema, 'return "checkboxes"', "checkbox widget inference");
 assertIncludes(schema, 'return "number"', "number widget inference");
 assertIncludes(schema, 'return "textarea"', "textarea widget inference");
 assertIncludes(schema, "getInteractionSteps", "wizard steps helper");
+assertIncludes(
+  schema,
+  "extractMcpAskStructuredInputFromResult",
+  "MCP structuredContent input extractor",
+);
+assertIncludes(schema, "resolveSchemaVersion", "schemaVersion inference");
 
 const scopedFiles = [
   "types/intervention.uts",
@@ -141,6 +147,8 @@ for (const needle of [
   'subType === "tool_call"',
   'subType === "tool_call_update"',
   'messageType === "tool_call"',
+  'eventType === "PROCESSING"',
+  "extractMcpAskStructuredInputFromResult(result)",
   "parseMcpAskToolInput(rawInput) !== null",
 ]) {
   assertIncludes(adapter, needle, "SSE adapter");
@@ -150,6 +158,7 @@ const history = read("subpackages/utils/historyMessageAdapter.uts");
 for (const needle of [
   "hydrateMcpAskInteractionsFromExecutedComponents",
   "createMcpAskInteractionFromToolInput",
+  "extractMcpAskStructuredInputFromResult",
   "getMcpAskKey",
   "requestId",
   "revision",

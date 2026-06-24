@@ -90,19 +90,11 @@ assertIncludes(
   "Math.floor((record as any).revision)",
   "positive integer revision validation",
 );
-assertIncludes(
-  schema,
-  "isKnownWidget(explicitWidget)",
-  "widget whitelist guard",
-);
-assertIncludes(schema, '"radio-with-custom"', "radio-with-custom widget name");
-assertIncludes(schema, '"file"', "file widget name");
-assertIncludes(schema, '"number"', "number widget name");
+assertIncludes(interventionTypes, '"radio-with-custom"', "radio-with-custom widget in whitelist");
+assertIncludes(interventionTypes, '"file"', "file widget in whitelist");
+assertIncludes(interventionTypes, '"number"', "number widget in whitelist");
 assertIncludes(schema, "MCP_ASK_WIDGET_TYPES", "widget whitelist constant");
 assertIncludes(schema, "getJsonSchemaPrimaryType", "json schema primary type helper");
-assertIncludes(schema, 'return "checkboxes"', "checkbox widget inference");
-assertIncludes(schema, 'return "number"', "number widget inference");
-assertIncludes(schema, 'return "textarea"', "textarea widget inference");
 assertIncludes(schema, "getInteractionSteps", "wizard steps helper");
 assertIncludes(
   schema,

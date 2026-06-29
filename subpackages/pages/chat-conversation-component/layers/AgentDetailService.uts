@@ -808,13 +808,29 @@ export default class AgentDetailService {
     conversationId: number,
     onSubClose?: () => void,
   ): Promise<void> {
-    // 防重 / 本地流式时不订阅
+    // 防重 / live SSE 在跑时不订阅(live 驱动输出;不用 isConversationActive——
+    // 调用方进入 EXECUTING 会话时会置 isConversationActive=true,用它做门会直接 return)
     if (this.isSubscribed) return;
-    if (this.data.isConversationActive.value) return;
+    if (chatService.isCurrentlyStreaming) return;
 
-    this.isSubscribed = true;
-    // 中断旧 sub
+    // 先中断旧 sub,再标记订阅(abort 会置 isSubscribed=false,必须在标记前)
     this.abortSubConversation();
+    this.isSubscribed = true;
+
+    // 统一清理 sub 状态 + 恢复轮询(sub 结束/ERROR/失败都走这里;幂等防重复回调)
+    let isCleanedUp = false;
+    const cleanupSub = () => {
+      if (isCleanedUp) return;
+      isCleanedUp = true;
+      if (this.subStreamRequest != null) {
+        this.subStreamRequest.abort();
+        this.subStreamRequest = null;
+      }
+      this.isSubscribed = false;
+      // sub 结束:会话不再活跃(防停止按钮卡死 + pollOnce 不被 isConversationActive gate)
+      this.data.isConversationActive.value = false;
+      if (onSubClose != null) onSubClose();
+    };
 
     // 1. reload 历史(拿最新 messageList,含 hydrate)
     try {
@@ -838,6 +854,9 @@ export default class AgentDetailService {
         "[AgentDetailService] handleSubConversation reload failed:",
         error,
       );
+      // reload 失败:放弃订阅(不基于过时 messageList 开 sub)
+      cleanupSub();
+      return;
     }
 
     // 2. 追加 assistant 占位
@@ -884,37 +903,25 @@ export default class AgentDetailService {
             if (!result || typeof result !== "object") return;
             // 复用 handleChangeMessageList 重建占位消息(含审批/ask 干预)
             this.handleChangeMessageList(result, currentMessageId);
-            // 会话失败(ERROR):主动断开 sub,恢复轮询(对齐 PC:FAILED 也要轮询)
+            // 会话失败(ERROR):主动清理 sub + 恢复轮询(对齐 PC:FAILED 也要轮询)
             const eventType = (result as any)?.eventType;
             if (eventType === ConversationEventTypeEnum.ERROR) {
-              this.abortSubConversation();
+              cleanupSub();
             }
           } catch (e) {
             console.error("[AgentDetailService] sub 解析 SSE 失败:", e);
           }
         },
-        onComplete: () => {
-          this.isSubscribed = false;
-          this.subStreamRequest = null;
-          if (onSubClose != null) onSubClose();
-        },
+        onComplete: () => cleanupSub(),
         onError: (error: any) => {
           console.error("[AgentDetailService] sub stream error:", error);
-          this.isSubscribed = false;
-          this.subStreamRequest = null;
-          if (onSubClose != null) onSubClose();
+          cleanupSub();
         },
-        onTimeout: () => {
-          this.isSubscribed = false;
-          this.subStreamRequest = null;
-          if (onSubClose != null) onSubClose();
-        },
+        onTimeout: () => cleanupSub(),
       });
     } catch (error) {
       console.error("[AgentDetailService] handleSubConversation failed:", error);
-      this.isSubscribed = false;
-      this.subStreamRequest = null;
-      if (onSubClose != null) onSubClose();
+      cleanupSub();
     }
   }
 
@@ -1294,8 +1301,7 @@ export default class AgentDetailService {
           this.data.isConversationActive.value = true;
           // 更新消息列表（刷新页面数据，含 hydrate）
           this.handleQueryConversation(res);
-          // 执行中:订阅 sub 流恢复(重建执行中的助手消息)
-          this.handleSubConversation(conversationId);
+          // sub 流恢复由调用方(页面 handleSessionResume)处理,传 onSubClose 恢复轮询
         } else {
           // 任务已完成或取消，更新前端状态
           this.data.isConversationActive.value = false;

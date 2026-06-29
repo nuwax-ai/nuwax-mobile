@@ -1,0 +1,165 @@
+/**
+ * 会话状态轮询（sub 流式恢复用）
+ *
+ * 用途:会话页持续轮询会话状态(taskStatus),一旦发现 EXECUTING(刷新页面后 / 定时任务 /
+ * 其它入口触发同一会话)且非本地流式、未已订阅 sub,回调 onExecuting 让上层恢复 sub 流。
+ * 与 PC useConversationStreamResume 的轮询部分对齐(不考虑多页签,简化版)。
+ *
+ * 暂停条件(对齐 PC):会话执行中(本地流式 / sub 已订阅) 或 页面不可见。
+ * - H5:visibilitychange 自动暂停/恢复
+ * - 小程序/App:页面 onShow/onHide 调 resume/pause
+ *
+ * 使用:
+ * - onLoad/onShow: startConversationPolling(conversationId, onExecuting, isConversationActiveGetter, isSubscribedGetter)
+ * - onHide: pauseConversationPolling()
+ * - onUnload: destroyConversationPolling()
+ */
+import { apiAgentConversation } from '@/servers/conversation';
+import { SUCCESS_CODE } from '@/constants/codes.constants';
+import { TaskStatus } from '@/types/enums/agent';
+
+// 轮询间隔(ms),与 PC GLOBAL_POLLING_INTERVAL 一致
+const POLLING_INTERVAL = 5000;
+
+// 轮询定时器 ID
+let pollingTimerId: number | null = null;
+// 是否正在处理(避免并发)
+let isProcessing = false;
+// 是否已初始化 H5 可见性监听
+let isVisibilityListenerInitialized = false;
+
+// 当前轮询的会话配置
+let currentConversationId = 0;
+let onExecutingCallback: ((id: number) => void) | null = null;
+// 状态 getter(由外部注入,避免闭包过期)
+let isConversationActiveGetter: (() => boolean) | null = null;
+let isSubscribedGetter: (() => boolean) | null = null;
+
+/**
+ * 执行一次轮询:查会话状态,EXECUTING + 非本地流式 + 未订阅 → onExecuting
+ */
+async function pollOnce(): Promise<void> {
+  if (isProcessing) return;
+  if (!currentConversationId) return;
+  // 本地流式(live SSE 在跑) or sub 已订阅(执行中) → 跳过(执行中不轮询)
+  if (isConversationActiveGetter != null && isConversationActiveGetter()) return;
+  if (isSubscribedGetter != null && isSubscribedGetter()) return;
+
+  try {
+    isProcessing = true;
+    const response = await apiAgentConversation(currentConversationId);
+    const data = response as any;
+    if (!data || data.code !== SUCCESS_CODE) return;
+
+    const taskStatus = (data.data as any)?.taskStatus as string | undefined;
+    if (taskStatus === TaskStatus.EXECUTING) {
+      // 会话执行中 + 非本地流式 + 未订阅 → 恢复 sub 流
+      if (onExecutingCallback != null) {
+        onExecutingCallback(currentConversationId);
+      }
+    }
+  } catch (error) {
+    console.error('[ConversationStatusPolling] 轮询失败:', error);
+  } finally {
+    isProcessing = false;
+  }
+}
+
+/**
+ * H5 页面可见性变化:不可见暂停,可见恢复
+ */
+function handleVisibilityChange(): void {
+  // #ifdef H5 || WEB
+  if (document.hidden) {
+    console.log('[ConversationStatusPolling] H5 不可见,暂停轮询');
+    pauseConversationPolling();
+  } else {
+    console.log('[ConversationStatusPolling] H5 可见,恢复轮询');
+    resumeConversationPolling();
+  }
+  // #endif
+}
+
+function initVisibilityListener(): void {
+  // #ifdef H5 || WEB
+  if (isVisibilityListenerInitialized) return;
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+  isVisibilityListenerInitialized = true;
+  // #endif
+}
+
+/**
+ * 启动会话状态轮询(切换会话时先 stop 旧的再 start 新的)
+ */
+export function startConversationPolling(
+  conversationId: number,
+  onExecuting: (id: number) => void,
+  isConversationActive: () => boolean,
+  isSubscribed: () => boolean,
+): void {
+  // 停止旧轮询
+  stopConversationPolling();
+
+  currentConversationId = conversationId;
+  onExecutingCallback = onExecuting;
+  isConversationActiveGetter = isConversationActive;
+  isSubscribedGetter = isSubscribed;
+
+  initVisibilityListener();
+
+  if (pollingTimerId !== null) return;
+
+  // 立即执行一次
+  pollOnce();
+
+  pollingTimerId = setInterval(() => {
+    pollOnce();
+  }, POLLING_INTERVAL) as unknown as number;
+}
+
+/**
+ * 停止轮询(清除定时器,保留配置)
+ */
+export function stopConversationPolling(): void {
+  if (pollingTimerId !== null) {
+    clearInterval(pollingTimerId);
+    pollingTimerId = null;
+  }
+}
+
+/**
+ * 恢复轮询(页面 onShow / H5 可见)
+ */
+export function resumeConversationPolling(): void {
+  if (!currentConversationId) return;
+  if (pollingTimerId !== null) return;
+  pollOnce();
+  pollingTimerId = setInterval(() => {
+    pollOnce();
+  }, POLLING_INTERVAL) as unknown as number;
+}
+
+/**
+ * 暂停轮询(页面 onHide / H5 不可见)
+ */
+export function pauseConversationPolling(): void {
+  stopConversationPolling();
+}
+
+/**
+ * 销毁轮询(离开会话页):停定时器 + 清配置 + 移除监听
+ */
+export function destroyConversationPolling(): void {
+  stopConversationPolling();
+  currentConversationId = 0;
+  onExecutingCallback = null;
+  isConversationActiveGetter = null;
+  isSubscribedGetter = null;
+
+  // #ifdef H5 || WEB
+  if (isVisibilityListenerInitialized) {
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    isVisibilityListenerInitialized = false;
+  }
+  // #endif
+}

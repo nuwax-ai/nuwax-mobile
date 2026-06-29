@@ -33,8 +33,12 @@ import {
 import { MessageStatusEnum, ProcessingEnum } from "@/types/enums/common";
 import { OpenCloseEnum } from "@/types/enums/space";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { API_HEADERS } from "@/constants/api.constants";
 import { chatService } from "@/utils/chatService";
 import { generateUniqueId } from "@/utils/common";
+import { StreamRequest } from "@/utils/streamRequest";
+import { StreamChunk } from "@/types/interfaces/chat";
 import {
   isAcpPermissionEvent,
   isMcpAskToolCallEvent,
@@ -97,6 +101,10 @@ const handleMessageProcess = (text: string): string => {
 export default class AgentDetailService {
   private data: AgentDetailData;
   private isAllowSuggest: boolean;
+  // sub 流恢复专用 StreamRequest(独立于 live chatService,避免互相 abort)
+  private subStreamRequest: StreamRequest | null = null;
+  // sub 是否已订阅(执行中)
+  private isSubscribed = false;
   constructor(private data: AgentDetailData) {
     this.data = data;
     this.isAllowSuggest = true;
@@ -792,6 +800,141 @@ export default class AgentDetailService {
   }
 
   /**
+   * 订阅 sub 流恢复 EXECUTING 会话的流式输出(刷新页面/重进会话时重建执行中的助手消息)。
+   * reload 历史 → 追加 assistant 占位 → StreamRequest GET sub → 复用 handleChangeMessageList 重建。
+   * onSubClose: sub 关闭(完成/错误/超时)时回调,页面据此恢复轮询。
+   */
+  async handleSubConversation(
+    conversationId: number,
+    onSubClose?: () => void,
+  ): Promise<void> {
+    // 防重 / 本地流式时不订阅
+    if (this.isSubscribed) return;
+    if (this.data.isConversationActive.value) return;
+
+    this.isSubscribed = true;
+    // 中断旧 sub
+    this.abortSubConversation();
+
+    // 1. reload 历史(拿最新 messageList,含 hydrate)
+    try {
+      const result = await apiAgentConversation(conversationId);
+      const data = (result as any)?.data;
+      const rawList = (data?.messageList || []) as MessageInfo[];
+      if (rawList.length > 0) {
+        const processedList = adaptHistoryMessageList(rawList).map(
+          (m: MessageInfo): MessageInfo => {
+            return {
+              ...m,
+              text: handleMessageProcess(m.text ?? ""),
+              id: m.id || generateUniqueId(),
+            } as MessageInfo;
+          },
+        );
+        this.data.messageList.value = processedList;
+      }
+    } catch (error) {
+      console.error(
+        "[AgentDetailService] handleSubConversation reload failed:",
+        error,
+      );
+    }
+
+    // 2. 追加 assistant 占位
+    const currentMessageId = generateUniqueId();
+    const placeholder = {
+      role: AssistantRoleEnum.ASSISTANT,
+      type: MessageModeEnum.CHAT,
+      text: "",
+      think: "",
+      time: new Date().toISOString(),
+      id: currentMessageId,
+      messageType: MessageTypeEnum.ASSISTANT,
+      status: MessageStatusEnum.Loading,
+    } as MessageInfo;
+    this.data.messageList.value = [
+      ...this.data.messageList.value,
+      placeholder,
+    ];
+
+    // 3. 订阅 sub(GET SSE)
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    const header = {
+      ...API_HEADERS,
+    };
+    // #ifdef H5 || WEB
+    if (process.env.NODE_ENV === "development") {
+      header["Authorization"] = `Bearer ${token}`;
+    }
+    // #endif
+    // #ifdef MP-WEIXIN
+    header["Authorization"] = `Bearer ${token}`;
+    // #endif
+
+    this.subStreamRequest = new StreamRequest();
+    try {
+      await this.subStreamRequest.request({
+        url: `${API_BASE_URL}/api/agent/conversation/chat/sub/${conversationId}`,
+        method: "GET",
+        headers: header,
+        onChunk: (chunk: StreamChunk) => {
+          if (chunk.type !== "content") return;
+          try {
+            const result = JSON.parse(chunk.data);
+            if (!result || typeof result !== "object") return;
+            // 复用 handleChangeMessageList 重建占位消息(含审批/ask 干预)
+            this.handleChangeMessageList(result, currentMessageId);
+            // 会话失败(ERROR):主动断开 sub,恢复轮询(对齐 PC:FAILED 也要轮询)
+            const eventType = (result as any)?.eventType;
+            if (eventType === ConversationEventTypeEnum.ERROR) {
+              this.abortSubConversation();
+            }
+          } catch (e) {
+            console.error("[AgentDetailService] sub 解析 SSE 失败:", e);
+          }
+        },
+        onComplete: () => {
+          this.isSubscribed = false;
+          this.subStreamRequest = null;
+          if (onSubClose != null) onSubClose();
+        },
+        onError: (error: any) => {
+          console.error("[AgentDetailService] sub stream error:", error);
+          this.isSubscribed = false;
+          this.subStreamRequest = null;
+          if (onSubClose != null) onSubClose();
+        },
+        onTimeout: () => {
+          this.isSubscribed = false;
+          this.subStreamRequest = null;
+          if (onSubClose != null) onSubClose();
+        },
+      });
+    } catch (error) {
+      console.error("[AgentDetailService] handleSubConversation failed:", error);
+      this.isSubscribed = false;
+      this.subStreamRequest = null;
+      if (onSubClose != null) onSubClose();
+    }
+  }
+
+  /**
+   * 中断 sub 流恢复连接
+   */
+  abortSubConversation(): void {
+    if (this.subStreamRequest != null) {
+      this.subStreamRequest.abort();
+      this.subStreamRequest = null;
+    }
+    this.isSubscribed = false;
+  }
+
+  /** sub 是否已订阅(执行中) */
+  get isSubConversationSubscribed(): boolean {
+    return this.isSubscribed;
+  }
+
+  /**
    * 停止会话
    * @param isTempChat 是否是临时会话
    */
@@ -1149,13 +1292,16 @@ export default class AgentDetailService {
         if (taskStatus === "EXECUTING") {
           // 任务仍在后端执行，保持活跃状态
           this.data.isConversationActive.value = true;
+          // 更新消息列表（刷新页面数据，含 hydrate）
+          this.handleQueryConversation(res);
+          // 执行中:订阅 sub 流恢复(重建执行中的助手消息)
+          this.handleSubConversation(conversationId);
         } else {
           // 任务已完成或取消，更新前端状态
           this.data.isConversationActive.value = false;
+          // 更新消息列表（刷新页面数据）
+          this.handleQueryConversation(res);
         }
-
-        // 更新消息列表（刷新页面数据）
-        this.handleQueryConversation(res);
         console.log(
           "[SessionResume] 会话状态已恢复，后端任务状态:",
           taskStatus,

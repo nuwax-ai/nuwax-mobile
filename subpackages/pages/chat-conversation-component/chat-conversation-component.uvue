@@ -393,6 +393,12 @@
   // 分层架构
   import AgentDetailData from "./layers/AgentDetailData.uts";
   import AgentDetailService from "./layers/AgentDetailService.uts";
+  import {
+    startConversationPolling,
+    destroyConversationPolling,
+    pauseConversationPolling,
+    resumeConversationPolling,
+  } from "@/hooks/useConversationStatusPolling.uts";
   import ComponentManager from "./layers/ComponentManager.uts";
   import ScrollManager from "./layers/ScrollManager.uts";
 
@@ -820,6 +826,9 @@
     // 调用服务层的恢复方法
     const needResume = await service.resumeConversationState();
 
+    // 唤醒后恢复会话状态轮询(pollOnce 内部 isConversationActive/isSubscribed gate 控制实际执行)
+    resumeConversationPolling();
+
     if (needResume) {
       console.log("[PageResume] 会话状态已恢复");
     }
@@ -838,7 +847,8 @@
   } = usePageResume({
     onResume: handleSessionResume,
     onHide: () => {
-      // console.log("[PageResume] 页面进入后台");
+      // 页面进入后台:暂停会话状态轮询(sub 流保持,由 StreamRequest 超时控制)
+      pauseConversationPolling();
     },
     // 最小隐藏时间 5 秒，避免短暂切换触发恢复
     minHiddenDuration: 5000,
@@ -1003,6 +1013,9 @@
         variableParams: newConversationSetRef.value?.variableParams || null,
       };
     }
+
+    // 本地发送前中断 sub 流恢复(避免 live + sub 双流)
+    service.abortSubConversation();
 
     service.handleSendMessage(params, props.isTempChat, () => {
       // 将工具调用状态从 loading 修改为 error
@@ -1493,6 +1506,19 @@
   /**
    * 处理页面加载
    */
+  // 启动会话状态轮询(sub 恢复):轮询发现 EXECUTING → handleSubConversation;sub 关闭 → 恢复轮询
+  const startResumePolling = () => {
+    const cid = data.conversationId.value;
+    if (!cid) return;
+    startConversationPolling(
+      cid,
+      (executingCid) =>
+        service.handleSubConversation(executingCid, () => startResumePolling()),
+      () => data.isConversationActive.value,
+      () => service.isSubConversationSubscribed,
+    );
+  };
+
   const handlePageLoad = async (options): Promise<void> => {
     // 智能体id
     data.agentId.value = options.id ? Number(options.id) : "";
@@ -1518,8 +1544,13 @@
         if (res.data?.taskStatus === TaskStatus.EXECUTING) {
           // 设置会话为活跃状态（按钮显示为停止按钮）
           data.isConversationActive.value = true;
+          // 执行中:订阅 sub 流恢复(重建执行中的助手消息);sub 关闭后启动轮询检测再次 EXECUTING
+          service.handleSubConversation(id, () => startResumePolling());
           // 订阅 ChatFinished 事件
           eventBus.on(EVENT_TYPE.ChatFinished, handleChatFinishedInternal);
+        } else {
+          // 非执行中:启动轮询,检测会话变为 EXECUTING
+          startResumePolling();
         }
       }
     } else {
@@ -1841,6 +1872,9 @@
     // 注意：只中断连接，不调用停止接口
     console.log("[页面卸载] 准备中断 SSE 连接");
     chatService?.abort();
+    // 中断 sub 流恢复 + 销毁会话状态轮询(避免泄漏)
+    service.abortSubConversation();
+    destroyConversationPolling();
     console.log("[页面卸载] SSE 连接已中断");
 
     uni.$off("streamMessageUpdate", handleStreamMessageUpdate);

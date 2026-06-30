@@ -275,10 +275,18 @@
         data-source="markdown-container"
       />
       <markdown-container-group
-        v-else-if="n.name == 'container-group' || n.name == 'markdown-custom-process-group'"
+        v-else-if="
+          n.name == 'container-group' ||
+          n.name == 'markdown-custom-process-group'
+        "
         :childs="n.children"
+        :processing-list="processingList"
       >
-        <node :childs="n.children" :opts="opts" :processing-list="processingList" />
+        <node
+          :childs="n.children"
+          :opts="opts"
+          :processing-list="processingList"
+        />
       </markdown-container-group>
       <!-- task-result 任务结果组件 -->
       <task-result

@@ -1,0 +1,303 @@
+/**
+ * SSE 干预数据适配器
+ * 从 SSE chunk 中提取 ACP Permission 和 MCP Ask 数据
+ * 对齐 nuwax Web 版 applyAcpPermissionSseEvent + applyMcpAskToolCallSseEvent
+ */
+import type {
+  AcpPermissionInteraction,
+  McpAskInteraction,
+} from "@/types/intervention";
+import {
+  createMcpAskInteractionFromToolInput,
+  extractMcpAskStructuredInputFromResult,
+  parseMcpAskToolInput,
+} from "@/utils/mcpAskSchema.uts";
+
+/** SSE chunk 中的数据结构（与 chatDataAdapter.uts 中的 SSEChunk 兼容） */
+interface SSEEventData {
+  messageType?: string;
+  message_type?: string;
+  subType?: string;
+  sub_type?: string;
+  eventType?: string;
+  data?: {
+    id?: string;
+    ext?: unknown;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+function nonEmpty(value: any): any | null {
+  if (value && typeof value === "object" && Object.keys(value).length > 0) {
+    return value;
+  }
+  return null;
+}
+
+function getMcpAskRawInput(chunk: SSEEventData): any | null {
+  const rawData = chunk as any;
+  const envelope = parseSseEventEnvelope(chunk);
+  const data = extractEventData(envelope, chunk);
+  const ext = data?.ext;
+  const result = data?.result || rawData?.result;
+  return (
+    nonEmpty(extractMcpAskStructuredInputFromResult(result)) ||
+    nonEmpty(data?.rawInput) ||
+    nonEmpty(data?.raw_input) ||
+    nonEmpty(ext?.rawInput) ||
+    nonEmpty(ext?.raw_input) ||
+    nonEmpty(result?.input) ||
+    nonEmpty(result?.rawInput) ||
+    nonEmpty(result?.raw_input) ||
+    nonEmpty(rawData?.rawInput) ||
+    nonEmpty(rawData?.raw_input) ||
+    null
+  );
+}
+
+function parseSseEventEnvelope(chunk: SSEEventData): SSEEventData {
+  const nested = (chunk as any).data;
+  if (
+    nested &&
+    typeof nested === "object" &&
+    (nested.messageType ||
+      nested.message_type ||
+      nested.subType ||
+      nested.sub_type ||
+      nested.subEventType)
+  ) {
+    return nested as SSEEventData;
+  }
+  return chunk;
+}
+
+function extractEventData(envelope: SSEEventData, fallback: SSEEventData): any {
+  const inner = (envelope as any).data;
+  if (inner && typeof inner === "object") return inner;
+  const fallbackData = (fallback as any).data;
+  if (fallbackData && typeof fallbackData === "object") return fallbackData;
+  return fallback as any;
+}
+
+function getToolCallId(chunk: SSEEventData): string {
+  const rawData = chunk as any;
+  const envelope = parseSseEventEnvelope(chunk);
+  const data = extractEventData(envelope, chunk);
+  const result = data?.result || rawData?.result;
+  return (
+    data?.tool_call_id ||
+    data?.toolCallId ||
+    data?.executeId ||
+    result?.executeId ||
+    result?.toolCallId ||
+    result?.tool_call_id ||
+    rawData?.tool_call_id ||
+    rawData?.toolCallId ||
+    rawData?.executeId ||
+    ""
+  );
+}
+
+/**
+ * 判断是否为 ACP Permission 事件
+ * 对齐 backend SandboxAgentClient.isAcpPermissionEvent() 的识别逻辑
+ */
+export function isAcpPermissionEvent(chunk: SSEEventData): boolean {
+  const envelope = parseSseEventEnvelope(chunk);
+  const messageType = envelope.messageType || (envelope as any).message_type;
+  const subType = envelope.subType || (envelope as any).sub_type;
+  const eventType = (chunk as any).eventType || (envelope as any).eventType;
+  const data = extractEventData(envelope, chunk);
+  const result = data?.result;
+  const processingInput = result?.input;
+
+  if (eventType === "ACP_REQUEST_PERMISSION") {
+    return true;
+  }
+  if (
+    eventType === "PROCESSING" &&
+    (data?.subEventType === "REQUEST_PERMISSION" ||
+      !!processingInput?.request_permission_request)
+  ) {
+    return true;
+  }
+
+  // 直接匹配 messageType
+  if (messageType === "acpRequestPermission") {
+    return true;
+  }
+  // 匹配 subType
+  if (subType === "request_permission" || subType === "AcpRequestPermission") {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 判断是否为 MCP Ask tool_call 事件
+ * 对齐 nuwax Web 版 applyMcpAskToolCallSseEvent 的识别逻辑
+ */
+export function isMcpAskToolCallEvent(chunk: SSEEventData): boolean {
+  const envelope = parseSseEventEnvelope(chunk);
+  const subType = envelope.subType || (envelope as any).sub_type;
+  const messageType = envelope.messageType || (envelope as any).message_type;
+  const eventType = (chunk as any).eventType || (envelope as any).eventType;
+  const data = extractEventData(envelope, chunk);
+  const result = data?.result;
+  const isToolCallLike =
+    subType === "tool_call" ||
+    subType === "tool_call_update" ||
+    messageType === "tool_call" ||
+    !!data?.tool_call_id ||
+    !!data?.toolCallId ||
+    !!data?.executeId ||
+    !!result?.executeId;
+
+  // 对齐 Web applyMcpAskToolCallSseEvent：Sandbox PROCESSING ToolCall 事件
+  const isProcessingToolCallEvent =
+    eventType === "PROCESSING" &&
+    !!(
+      data?.executeId ||
+      result?.executeId ||
+      result?.input ||
+      extractMcpAskStructuredInputFromResult(result)
+    );
+
+  // 识别 subEventType=ASK_QUESTION 的 PROCESSING 事件。
+  // 此类事件 result.executeId/input 均为 null，MCP Ask 数据在 result.data 中。
+  const isAskQuestionEvent =
+    eventType === "PROCESSING" &&
+    (envelope as any).subEventType === "ASK_QUESTION";
+
+  if (!isToolCallLike && !isProcessingToolCallEvent && !isAskQuestionEvent) {
+    return false;
+  }
+
+  // ASK_QUESTION 事件：直接从 result.data 提取 MCP Ask 数据
+  if (isAskQuestionEvent && result?.data && typeof result.data === "object") {
+    return parseMcpAskToolInput(result.data) !== null;
+  }
+
+  const rawInput = getMcpAskRawInput(chunk);
+  if (!rawInput) return false;
+
+  return parseMcpAskToolInput(rawInput) !== null;
+}
+
+/**
+ * 从 ACP Permission SSE 事件中提取交互数据
+ */
+export function extractAcpPermissionInteraction(
+  chunk: SSEEventData,
+): AcpPermissionInteraction | null {
+  if (!isAcpPermissionEvent(chunk)) return null;
+
+  const envelope = parseSseEventEnvelope(chunk);
+  const data = extractEventData(envelope, chunk);
+  const result = data?.result;
+  const processingInput = result?.input;
+  const requestMeta = processingInput?._meta || data?._meta;
+
+  const intervention =
+    data._intervention || data.interventionRequest || data.intervention;
+  const requestPermission =
+    data.request_permission_request ||
+    processingInput?.request_permission_request ||
+    data.requestPermissionRequest;
+  const request =
+    requestPermission ||
+    intervention?.acp?.request ||
+    intervention?.request ||
+    data.request ||
+    data;
+  const toolCall = request.tool_call || request.toolCall || {};
+  const options = Array.isArray(request.options) ? request.options : [];
+  const sessionId =
+    request.session_id ||
+    request.sessionId ||
+    intervention?.sessionId ||
+    data.session_id ||
+    data.sessionId ||
+    "";
+  const toolCallId =
+    data.tool_call_id ||
+    processingInput?.tool_call_id ||
+    data.toolCallId ||
+    request.tool_call_id ||
+    request.toolCallId ||
+    toolCall.tool_call_id ||
+    toolCall.toolCallId ||
+    "";
+  const executeId =
+    data.executeId ||
+    result?.executeId ||
+    processingInput?.executeId ||
+    undefined;
+  // 原始工具输入：用于提取 MCP Ask requestId，对齐 PC readMcpAskRequestId 的双路抑制逻辑
+  const toolCallRawInput =
+    toolCall.rawInput ||
+    toolCall.raw_input ||
+    request.rawInput ||
+    request.raw_input ||
+    request.input ||
+    processingInput ||
+    null;
+
+  // 从原始数据中构建（后端未直接提供 intervention 对象时）
+  return {
+    id:
+      intervention?.id ||
+      requestMeta?.nuwaclaw_intervention_id ||
+      request.id ||
+      `itv_${sessionId || Date.now()}_${toolCallId || Math.random().toString(36).substring(2, 9)}`,
+    request: {
+      sessionId,
+      toolCall: {
+        toolCallId,
+        title: request.title || toolCall.title || "",
+        kind: request.kind || toolCall.kind || "",
+        rawInput: toolCallRawInput,
+      },
+      options: options.map((opt: any) => ({
+        optionId: opt.option_id || opt.optionId || opt.id,
+        kind: opt.kind || "allow_once",
+        name: opt.name || opt.label || opt.kind,
+      })),
+    },
+    responseStatus: "pending",
+    executeId:
+      typeof executeId === "string" && executeId ? executeId : undefined,
+  };
+}
+
+/**
+ * 从 MCP Ask tool_call 事件中提取交互数据
+ */
+export function extractMcpAskInteraction(
+  chunk: SSEEventData,
+): McpAskInteraction | null {
+  if (!isMcpAskToolCallEvent(chunk)) return null;
+
+  const envelope = parseSseEventEnvelope(chunk);
+  const eventType = (chunk as any).eventType || (envelope as any).eventType;
+
+  // ASK_QUESTION 事件：MCP Ask 数据在 result.data 中，toolCallId 用 result.data.requestId
+  if (
+    eventType === "PROCESSING" &&
+    (envelope as any).subEventType === "ASK_QUESTION"
+  ) {
+    const data = extractEventData(envelope, chunk);
+    const result = data?.result;
+    const resultData = result?.data;
+    if (resultData && typeof resultData === "object") {
+      const toolCallId = resultData.requestId || getToolCallId(chunk);
+      return createMcpAskInteractionFromToolInput(resultData, toolCallId);
+    }
+  }
+
+  const rawInput = getMcpAskRawInput(chunk);
+  if (!rawInput) return null;
+
+  return createMcpAskInteractionFromToolInput(rawInput, getToolCallId(chunk));
+}

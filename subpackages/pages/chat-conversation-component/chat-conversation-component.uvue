@@ -126,7 +126,7 @@
                     :ref="(el) => setMessageRef(el, `${item.id}_${item.index}`)"
                   ></uni-ai-x-msg>
                   <!-- 用户消息 -->
-                  <template v-else>
+                  <template v-if="item.messageType === MessageTypeEnum.USER">
                     <!-- 图片以及文件 -->
                     <scroll-view
                       class="files-container"
@@ -231,6 +231,50 @@
             <text class="iconfont icon-a-Chevrondown"></text>
           </view>
         </view>
+        <!-- Agent 干预固定栏：FIFO 队列，仅展示队首一张卡片 -->
+        <view v-if="activeInterventionQueue.length" class="intervention-dock">
+          <scroll-view
+            class="intervention-dock-scroll"
+            direction="vertical"
+            :show-scrollbar="false"
+          >
+            <view class="intervention-dock-content">
+              <view
+                v-if="activeInterventionQueue.length > 2"
+                class="intervention-queue-badge"
+              >
+                <text class="intervention-queue-badge-text">
+                  +{{ interventionQueueBadge }}
+                </text>
+              </view>
+              <acp-permission-card
+                v-if="frontInterventionItem?.kind === 'acp_permission'"
+                :key="frontInterventionItem.key"
+                :interaction="frontInterventionItem.interaction"
+                @respond="
+                  (resp) =>
+                    handleAcpPermissionRespond(
+                      frontInterventionItem.interaction,
+                      resp,
+                    )
+                "
+              />
+              <mcp-ask-question-card
+                v-if="frontInterventionItem?.kind === 'mcp_ask'"
+                :key="frontInterventionItem.key"
+                :interaction="frontInterventionItem.interaction"
+                @respond="
+                  (payload) =>
+                    handleMcpAskRespond(
+                      frontInterventionItem.message,
+                      frontInterventionItem.interaction,
+                      payload,
+                    )
+                "
+              />
+            </view>
+          </scroll-view>
+        </view>
         <!-- 输入框 -->
         <chat-input-phone
           v-if="isRenderInputPhone"
@@ -266,6 +310,7 @@
           :agent-id="agentId"
           :agent-type="agentInfo?.type"
           :subscription-required="subscriptionRequired"
+          :allow-choose-mode="agentInfo?.allowChooseMode"
           @onModelChange="(id: number, name: string) => handleSelectModel(id, name)"
           @onOpenSubscription="handleOpenSubscription"
         />
@@ -330,6 +375,22 @@
       @purchase-success="handlePurchaseSuccess"
       @update-visible="handleUpdateModalVisible"
     />
+
+    <!-- [DEV] Mock 干预调试按钮 -->
+    <view class="debug-mock-panel" v-if="false">
+      <view
+        class="debug-btn debug-btn-inject"
+        @tap="handleDebugMockIntervention"
+      >
+        <text class="debug-btn-text">Mock+</text>
+      </view>
+      <view
+        class="debug-btn debug-btn-clear"
+        @tap="handleClearMockInterventions"
+      >
+        <text class="debug-btn-text">Clear</text>
+      </view>
+    </view>
   </view>
 </template>
 
@@ -338,6 +399,13 @@
   // 分层架构
   import AgentDetailData from "./layers/AgentDetailData.uts";
   import AgentDetailService from "./layers/AgentDetailService.uts";
+  import {
+    startConversationPolling,
+    stopConversationPolling,
+    destroyConversationPolling,
+    pauseConversationPolling,
+    resumeConversationPolling,
+  } from "@/hooks/useConversationStatusPolling.uts";
   import ComponentManager from "./layers/ComponentManager.uts";
   import ScrollManager from "./layers/ScrollManager.uts";
 
@@ -347,7 +415,10 @@
     HideChatAreaEnum,
     ExpandPageAreaEnum,
     AgentTypeEnum,
+    AssistantRoleEnum,
+    MessageModeEnum,
   } from "@/types/enums/agent";
+  import { MessageStatusEnum } from "@/types/enums/common";
   import type { ChatInputPhoneRef } from "@/types/interfaces/chat.uts";
   import type { MessageInfo } from "@/types/interfaces/conversationInfo.uts";
   import type { UploadFileStatus } from "@/types/enums/common.uts";
@@ -371,6 +442,8 @@
   import NewConversationSet from "./components/new-conversation-set/new-conversation-set.uvue";
   import FileTree from "./components/file-tree/file-tree.uvue";
   import ToolDetailsModal from "./components/tool-details-modal/tool-details-modal.uvue";
+  import AcpPermissionCard from "@/components/agent-intervention/acp-permission-card/acp-permission-card.uvue";
+  import McpAskQuestionCard from "@/components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue";
 
   // 常量
   import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -393,6 +466,7 @@
     EventDedupManager,
   } from "@/subpackages/hooks/useMessageEventDelegate.uts";
   import { usePageResume } from "@/subpackages/hooks/usePageResume.uts";
+  import { onShow, onHide } from "@dcloudio/uni-app";
 
   // ==================== 工具方法 ====================
   import { formatBytes } from "@/utils/byteConverter.uts";
@@ -404,6 +478,27 @@
   import { throttle } from "@/subpackages/utils/functionUtils";
   import { useI18n } from "@/utils/i18n";
   import { getUniLoadMoreContentText } from "@/utils/i18n-third-party";
+  import { apiAgentInterventionRespond } from "@/servers/intervention";
+  import { buildMcpAskResumeMessage } from "@/utils/mcpAskResumeMessage";
+  import type {
+    AcpPermissionInteraction,
+    AcpPermissionResponse,
+    InterventionStatus,
+    McpAskInteraction,
+    McpAskRespondPayload,
+  } from "@/types/intervention";
+  import {
+    getActiveInterventionQueue,
+    removeMcpAskInteractionFromMessageList,
+    updateAcpPermissionInteractionStatusInMessageList,
+    updateMcpAskInteractionStatusInMessageList,
+  } from "./utils/mcpAskInterventionState.uts";
+  import { isIdempotentAcpPermissionResolveError } from "@/utils/reconcileAcpPermissionStatus.uts";
+  import {
+    injectMockIntervention,
+    clearMockInterventions,
+    getMockScenarioKeys,
+  } from "@/utils/mockInterventionData";
 
   const { t } = useI18n();
   const historyLoadMoreContentText = computed(() =>
@@ -423,7 +518,6 @@
       isAppDetails: false,
     },
   );
-
 
   // 定义 emits
   const emit = defineEmits<{
@@ -489,7 +583,7 @@
         value: "add",
         icon: "icon-message-add",
         onClick: handleCreateNewConversation,
-      }
+      },
     ];
 
     if (
@@ -516,7 +610,7 @@
         value: "collect",
         icon: collectIcon,
         onClick: handleCollect,
-      }
+      },
     );
 
     if (
@@ -627,6 +721,16 @@
     localCalledTrialCount,
   } = data;
 
+  const activeInterventionQueue = computed(() =>
+    getActiveInterventionQueue(messageList.value),
+  );
+  const frontInterventionItem = computed(
+    () => activeInterventionQueue.value[0] ?? null,
+  );
+  const interventionQueueBadge = computed(() =>
+    Math.max(0, activeInterventionQueue.value.length - 1),
+  );
+
   // 处理禁用发送按钮
   const handleToggleWholeDisabled = (disabled: boolean) => {
     data.wholeDisabled.value = disabled;
@@ -736,16 +840,20 @@
     const needResume = await service.resumeConversationState();
 
     if (needResume) {
-      console.log("[PageResume] 会话状态已恢复");
+      // EXECUTING:订阅 sub 流恢复(重建执行中的助手消息);sub 关闭后 onSubClose 恢复轮询
+      console.log("[PageResume] 会话状态已恢复,订阅 sub 流恢复");
+      service.handleSubConversation(data.conversationId.value, () =>
+        startResumePolling(),
+      );
+      // 兜底轮询：与 handlePageLoad 同理，确保 live stream 结束后有轮询能续上 sub。
+      startResumePolling();
+    } else {
+      // 非执行中:恢复轮询
+      resumeConversationPolling();
     }
   };
 
-  // 使用页面唤醒检测 Hook
-  // 注意：H5 环境会自动监听 visibilitychange
-  // 小程序环境需要配合 App.uvue 的 onShow 使用
-  // 使用页面唤醒检测 Hook
-  // 注意：H5 环境会自动监听 visibilitychange
-  // 小程序环境需要配合 App.uvue 的 onShow 使用
+  // 页面唤醒检测：H5 由 visibilitychange 自动处理；小程序/App 见下方 onShow/onHide
   const {
     isHidden: isPageHidden,
     triggerResume,
@@ -753,11 +861,27 @@
   } = usePageResume({
     onResume: handleSessionResume,
     onHide: () => {
-      // console.log("[PageResume] 页面进入后台");
+      // 页面进入后台：暂停会话状态轮询（sub 流保持，由 StreamRequest 超时控制）
+      pauseConversationPolling();
     },
-    // 最小隐藏时间 5 秒，避免短暂切换触发恢复
+    // 最小隐藏时间 5 秒，避免短暂切换触发完整会话恢复
     minHiddenDuration: 5000,
   });
+
+  // 小程序/App：页面切后台暂停轮询、回前台恢复（覆盖 app-details / chat-temp 等所有入口）
+  // H5 已由 usePageResume + useConversationStatusPolling 的 visibilitychange 处理
+  // #ifndef H5
+  onHide(() => {
+    pauseConversationPolling();
+    triggerHide();
+  });
+
+  onShow(() => {
+    triggerResume();
+    // 短切后台（< minHiddenDuration）不触发 handleSessionResume，但仍需恢复轮询
+    resumeConversationPolling();
+  });
+  // #endif
 
   // 组件管理层 - 使用箭头函数保持this上下文
   const setMessageRef = (...args: any[]) =>
@@ -909,6 +1033,8 @@
         modelId: _data?.modelId || otherModelId,
         // 沙盒ID
         sandboxId: _data?.sandboxId || otherSandboxId,
+        // Agent 执行模式
+        agentMode: _data?.agentMode,
       };
     } else {
       params = {
@@ -916,6 +1042,9 @@
         variableParams: newConversationSetRef.value?.variableParams || null,
       };
     }
+
+    // 本地发送前中断 sub 流恢复(避免 live + sub 双流)
+    service.abortSubConversation();
 
     service.handleSendMessage(params, props.isTempChat, () => {
       // 将工具调用状态从 loading 修改为 error
@@ -1039,6 +1168,203 @@
    */
   const onlongTapMsg = (item: any): void => {
     // 显示操作菜单
+  };
+
+  const removeMcpAskInteraction = (interaction: McpAskInteraction): void => {
+    messageList.value = removeMcpAskInteractionFromMessageList(
+      messageList.value,
+      interaction,
+    );
+  };
+
+  /**
+   * ACP 权限审批响应处理
+   */
+  const handleAcpPermissionRespond = async (
+    interaction: AcpPermissionInteraction,
+    response: AcpPermissionResponse,
+  ): Promise<void> => {
+    const selectedOptionId =
+      response.outcome.outcome === "selected"
+        ? response.outcome.optionId
+        : undefined;
+
+    // 更新本地状态为 submitting
+    messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+      messageList.value,
+      interaction.id,
+      "submitting",
+      { selectedOptionId },
+    );
+
+    // 插入临时加载气泡以触发聊天组件的加载状态
+    const tempLoadingId = "acp_loading_" + Date.now();
+    const tempLoadingMsg = {
+      role: AssistantRoleEnum.ASSISTANT,
+      type: MessageModeEnum.CHAT,
+      text: "",
+      think: "",
+      time: new Date().toISOString(),
+      id: tempLoadingId,
+      messageType: MessageTypeEnum.ASSISTANT,
+      status: MessageStatusEnum.Loading,
+    } as MessageInfo;
+
+    messageList.value = [...messageList.value, tempLoadingMsg];
+    data.isConversationActive.value = true;
+
+    nextTick(() => {
+      scrollToLastMsg(false);
+    });
+
+    try {
+      const isSelected = response.outcome.outcome === "selected";
+      const resp = await apiAgentInterventionRespond({
+        interventionId: interaction.id,
+        permission_resolve_request: {
+          request_permission_response: {
+            outcome: isSelected
+              ? { Selected: { option_id: response.outcome.optionId! } }
+              : { Cancelled: null },
+          },
+          session_id: interaction.request.sessionId,
+          tool_call_id: interaction.request.toolCall?.toolCallId,
+          save_rule: false,
+        },
+        conversation_id: conversationId.value || undefined,
+      });
+
+      if (resp?.code && resp.code !== SUCCESS_CODE) {
+        throw new Error(
+          resp.message || t("Mobile.Intervention.AcpPermission.responseFailed"),
+        );
+      }
+
+      // 成功后保留 interaction，标为 submitted（FIFO 队列自动展示下一项）
+      messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+        messageList.value.filter((item) => item.id !== tempLoadingId),
+        interaction.id,
+        "submitted",
+        { selectedOptionId },
+      );
+    } catch (error) {
+      // 失败后，清理临时加载气泡，还原活跃状态
+      messageList.value = messageList.value.filter(
+        (item) => item.id !== tempLoadingId,
+      );
+      data.isConversationActive.value = false;
+
+      const errorMsg =
+        error instanceof Error
+          ? error.message
+          : t("Mobile.Intervention.AcpPermission.responseFailed");
+
+      if (isIdempotentAcpPermissionResolveError(error)) {
+        messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+          messageList.value,
+          interaction.id,
+          "submitted",
+          { selectedOptionId },
+        );
+        return;
+      }
+
+      messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+        messageList.value,
+        interaction.id,
+        "failed",
+        { errorMessage: errorMsg },
+      );
+      uni.showToast({ title: errorMsg, icon: "none" });
+    }
+  };
+
+  /** 对齐 nuwax useAgentInterventionHandlers.respondMcpAsk.resolveStatus */
+  const resolveMcpAskResponseStatus = (
+    payload: McpAskRespondPayload,
+  ): InterventionStatus => {
+    if (payload.action === "cancel") {
+      return "cancelled";
+    }
+    if (payload.action === "skip") {
+      return "skipped";
+    }
+    return "submitted";
+  };
+
+  /**
+   * MCP Ask 结构化提问响应处理
+   * 提交前不主动 cancel/stop（后端已兼容）；直接发 resume 消息即可。
+   */
+  const handleMcpAskRespond = async (
+    _message: MessageInfo,
+    interaction: McpAskInteraction,
+    payload: McpAskRespondPayload,
+  ): Promise<void> => {
+    // 对齐 PC respondMcpAsk：直接写 submitted/cancelled/skipped，不经 submitting
+    messageList.value = updateMcpAskInteractionStatusInMessageList(
+      messageList.value,
+      interaction,
+      resolveMcpAskResponseStatus(payload),
+    );
+
+    removeMcpAskInteraction(interaction);
+
+    const resumeText = buildMcpAskResumeMessage(interaction, payload);
+    if (resumeText) {
+      // 对齐 PC onSendMessage(resumeMessage) → rawSend；Mobile 走 handleSendMessage（off ChatFinished + abortSub）
+      handleSendMessage({ messageInfo: resumeText });
+      nextTick(() => {
+        scrollToLastMsg(false);
+      });
+    }
+  };
+
+  // ==================== Mock 干预调试 ====================
+  const mockScenarioLabels: Record<string, string> = {
+    "acp-simple": "ACP: 简单权限(Shell)",
+    "acp-multi": "ACP: 多选项(文件写入)",
+    "acp-network": "ACP: 网络请求",
+    "mcp-survey": "MCP: 调查问卷",
+    "mcp-select": "MCP: 部署配置(选择框)",
+    "mcp-simple": "MCP: 简单文本输入",
+    "mcp-file": "MCP: 文件上传",
+    "mcp-list": "MCP: 单选列表",
+    "mcp-wizard": "MCP: 分步表单",
+  };
+
+  /** 触发 mock 干预 - 弹出操作面板选择场景 */
+  const handleDebugMockIntervention = (): void => {
+    const keys = getMockScenarioKeys();
+    const labels = keys.map((key: string) => mockScenarioLabels[key] || key);
+
+    uni.showActionSheet({
+      itemList: labels,
+      success: (res) => {
+        const selectedKey = keys[res.tapIndex] as any;
+        const success = injectMockIntervention(data.messageList, selectedKey);
+        if (success) {
+          uni.showToast({
+            title: `已注入: ${labels[res.tapIndex]}`,
+            icon: "none",
+            duration: 1500,
+          });
+          // 触发滚动到底部
+          nextTick(() => {
+            uni.$emit("streamMessageUpdate");
+          });
+        }
+      },
+    });
+  };
+
+  /** 清除所有 mock 干预 */
+  const handleClearMockInterventions = (): void => {
+    clearMockInterventions(data.messageList);
+    uni.showToast({
+      title: t("Mobile.Intervention.Mock.cleared"),
+      icon: "none",
+    });
   };
 
   /**
@@ -1187,6 +1513,19 @@
   /**
    * 处理页面加载
    */
+  // 启动会话状态轮询(sub 恢复):轮询发现 EXECUTING → handleSubConversation;sub 关闭 → 恢复轮询
+  const startResumePolling = () => {
+    const cid = data.conversationId.value;
+    if (!cid) return;
+    startConversationPolling(
+      cid,
+      (executingCid) =>
+        service.handleSubConversation(executingCid, () => startResumePolling()),
+      () => data.isConversationActive.value,
+      () => service.isSubConversationSubscribed,
+    );
+  };
+
   const handlePageLoad = async (options): Promise<void> => {
     // 智能体id
     data.agentId.value = options.id ? Number(options.id) : "";
@@ -1203,6 +1542,8 @@
       // 查询历史会话信息(接口返回数据中包含智能体详情信息, 所以不在需要单独查询智能体详情信息了)
       const res = await apiAgentConversation(id);
       if (res.code === SUCCESS_CODE) {
+        // 切换会话:先停止旧会话的状态轮询(模块级单例,避免继续轮询上一个会话)
+        stopConversationPolling();
         // 事件绑定配置
         eventBindConfig.value = res.data?.agent?.eventBindConfig || null;
         // 处理消息列表
@@ -1212,8 +1553,17 @@
         if (res.data?.taskStatus === TaskStatus.EXECUTING) {
           // 设置会话为活跃状态（按钮显示为停止按钮）
           data.isConversationActive.value = true;
+          // 执行中:订阅 sub 流恢复(重建执行中的助手消息);sub 关闭后启动轮询检测再次 EXECUTING
+          service.handleSubConversation(id, () => startResumePolling());
+          // 兜底轮询：abortSubConversation 不触发 onSubClose，若用户在 sub 运行中发消息，
+          // 轮询需提前启动，否则 live stream 结束后无人检测 EXECUTING 再续 sub。
+          // 轮询内部已有 isConversationActive / isSubscribed 双门保护，不会干扰 sub/live stream。
+          startResumePolling();
           // 订阅 ChatFinished 事件
           eventBus.on(EVENT_TYPE.ChatFinished, handleChatFinishedInternal);
+        } else {
+          // 非执行中:启动轮询,检测会话变为 EXECUTING
+          startResumePolling();
         }
       }
     } else {
@@ -1535,6 +1885,9 @@
     // 注意：只中断连接，不调用停止接口
     console.log("[页面卸载] 准备中断 SSE 连接");
     chatService?.abort();
+    // 中断 sub 流恢复 + 销毁会话状态轮询(避免泄漏)
+    service.abortSubConversation();
+    destroyConversationPolling();
     console.log("[页面卸载] SSE 连接已中断");
 
     uni.$off("streamMessageUpdate", handleStreamMessageUpdate);
@@ -1592,5 +1945,40 @@
     justify-content: center;
     align-items: center;
     padding: 24rpx 0;
+  }
+
+  /* [DEV] Mock 干预调试按钮 */
+  .debug-mock-panel {
+    position: fixed;
+    right: 24rpx;
+    top: 300rpx;
+    display: flex;
+    flex-direction: column;
+    gap: 12rpx;
+    z-index: 9999;
+  }
+
+  .debug-btn {
+    width: 88rpx;
+    height: 64rpx;
+    border-radius: 12rpx;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.15);
+  }
+
+  .debug-btn-inject {
+    background-color: #1677ff;
+  }
+
+  .debug-btn-clear {
+    background-color: #ff7a45;
+  }
+
+  .debug-btn-text {
+    color: #fff;
+    font-size: 22rpx;
+    font-weight: 600;
   }
 </style>

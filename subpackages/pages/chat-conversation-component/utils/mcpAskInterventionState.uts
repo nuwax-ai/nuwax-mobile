@@ -1,0 +1,240 @@
+import type { MessageInfo } from "@/types/interfaces/conversationInfo.uts";
+import type {
+  AcpPermissionInteraction,
+  InterventionStatus,
+  McpAskInteraction,
+} from "@/types/intervention";
+import { hasMcpAskResumeMessage } from "@/utils/mcpAskResumeMessage.uts";
+
+export type InterventionQueueKind = "acp_permission" | "mcp_ask";
+
+export interface AcpInterventionQueueItem {
+  kind: "acp_permission";
+  key: string;
+  messageId: string;
+  messageIndex: number;
+  interaction: AcpPermissionInteraction;
+  sortKey: number;
+}
+
+export interface McpAskInterventionQueueItem {
+  kind: "mcp_ask";
+  key: string;
+  messageId: string;
+  messageIndex: number;
+  message: MessageInfo;
+  interaction: McpAskInteraction;
+  sortKey: number;
+}
+
+export type InterventionQueueItem =
+  | AcpInterventionQueueItem
+  | McpAskInterventionQueueItem;
+
+/** 对齐 PC useActiveInterventionQueue：pending/submitting 进队，failed 不进队 */
+const isActiveResponseStatus = (status?: string): boolean => {
+  const value = status || "pending";
+  return value === "pending" || value === "submitting";
+};
+
+const readMcpAskRequestIdFromRawInput = (rawInput: any): string | undefined => {
+  if (!rawInput || typeof rawInput !== "object") return undefined;
+  const id = (rawInput as any).requestId;
+  return typeof id === "string" && id ? id : undefined;
+};
+
+/**
+ * 跨消息 FIFO 审批队列（对齐 nuwax PC useActiveInterventionQueue）。
+ * front = items[0] 为最早待处理项；ACP 双路抑制同 requestId/toolCallId 的 MCP Ask。
+ *
+ * 注意：PC 已移除按 executeId / focusExecuteId 的队列过期过滤（见 useActiveInterventionQueue.test.ts
+ * 「keeps the approval card even when its executeId is no longer the focus」）。
+ * 队列侧仅依据 responseStatus；已审批/失效态由 reconcileAcpPermissionStatus 在 messageList 更新时标为 submitted。
+ */
+export const getActiveInterventionQueue = (
+  messageList: MessageInfo[],
+): InterventionQueueItem[] => {
+  const pendingMap = new Map<string, InterventionQueueItem>();
+  const permissionPendingToolCallIds = new Set<string>();
+  const permissionPendingAskRequestIds = new Set<string>();
+  let fallbackSeq = 0;
+
+  const messages = [...(messageList || [])].sort(
+    (a, b) => (a.index ?? 0) - (b.index ?? 0),
+  );
+
+  messages.forEach((message: MessageInfo) => {
+    const interactions = message.acpPermissionInteractions || [];
+    interactions.forEach((interaction: AcpPermissionInteraction) => {
+      if (!isActiveResponseStatus(interaction.responseStatus)) return;
+      const toolCallId = interaction.request?.toolCall?.toolCallId;
+      if (toolCallId) permissionPendingToolCallIds.add(toolCallId);
+      const askRequestId = readMcpAskRequestIdFromRawInput(
+        interaction.request?.toolCall?.rawInput,
+      );
+      if (askRequestId) permissionPendingAskRequestIds.add(askRequestId);
+    });
+  });
+
+  messages.forEach((message: MessageInfo) => {
+    const messageId = String(message.id ?? message.index);
+    const messageIndex = message.index ?? 0;
+
+    const acpInteractions = message.acpPermissionInteractions || [];
+    acpInteractions.forEach((interaction: AcpPermissionInteraction) => {
+      if (!isActiveResponseStatus(interaction.responseStatus)) return;
+      const sortKey = interaction.triggeredAt ?? fallbackSeq++;
+      pendingMap.set(`acp-${interaction.id}`, {
+        kind: "acp_permission",
+        key: `acp:${interaction.id}`,
+        messageId,
+        messageIndex,
+        interaction,
+        sortKey,
+      });
+    });
+
+    const mcpInteractions = message.mcpAskInteractions || [];
+    mcpInteractions.forEach((interaction: McpAskInteraction) => {
+      if (!isActiveResponseStatus(interaction.responseStatus)) return;
+      if (hasMcpAskResumeMessage(messages, interaction)) return;
+      if (
+        (interaction.toolCallId &&
+          permissionPendingToolCallIds.has(interaction.toolCallId)) ||
+        (interaction.requestId &&
+          permissionPendingAskRequestIds.has(interaction.requestId))
+      ) {
+        return;
+      }
+      const sortKey = interaction.triggeredAt ?? fallbackSeq++;
+      const revision = interaction.revision || 1;
+      pendingMap.set(`ask-${interaction.requestId}`, {
+        kind: "mcp_ask",
+        key: `ask:${interaction.requestId}:${revision}`,
+        messageId,
+        messageIndex,
+        message,
+        interaction,
+        sortKey,
+      });
+    });
+  });
+
+  return [...pendingMap.values()].sort((a, b) => a.sortKey - b.sortKey);
+};
+
+export const updateAcpPermissionInteractionStatusInMessageList = (
+  messageList: MessageInfo[],
+  interactionId: string,
+  responseStatus: InterventionStatus,
+  extras?: { selectedOptionId?: string; errorMessage?: string },
+): MessageInfo[] => {
+  const list = [...messageList];
+  for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
+    const msg = list[msgIndex];
+    const interactions = msg.acpPermissionInteractions;
+    if (!interactions) continue;
+
+    let matched = false;
+    const nextInteractions = interactions.map(
+      (item: AcpPermissionInteraction) => {
+        if (item.id !== interactionId) return item;
+        matched = true;
+        return {
+          ...item,
+          responseStatus,
+          ...(extras?.selectedOptionId !== undefined
+            ? { selectedOptionId: extras.selectedOptionId }
+            : {}),
+          ...(extras?.errorMessage !== undefined
+            ? { errorMessage: extras.errorMessage }
+            : {}),
+        };
+      },
+    );
+
+    if (!matched) continue;
+
+    list[msgIndex] = {
+      ...msg,
+      acpPermissionInteractions: nextInteractions,
+    };
+    break;
+  }
+  return list;
+};
+
+export const updateMcpAskInteractionStatusInMessageList = (
+  messageList: MessageInfo[],
+  interaction: McpAskInteraction,
+  responseStatus: InterventionStatus,
+): MessageInfo[] => {
+  const revision = interaction.revision || 1;
+  const list = [...messageList];
+  for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
+    const msg = list[msgIndex];
+    const interactions = msg.mcpAskInteractions;
+    if (!interactions) continue;
+
+    let matched = false;
+    const nextInteractions = interactions.map((item: McpAskInteraction) => {
+      if (
+        item.requestId === interaction.requestId &&
+        (item.revision || 1) === revision
+      ) {
+        matched = true;
+        return { ...item, responseStatus };
+      }
+      return item;
+    });
+
+    if (!matched) continue;
+
+    list[msgIndex] = {
+      ...msg,
+      mcpAskInteractions: nextInteractions,
+    };
+    break;
+  }
+  return list;
+};
+
+export const removeMcpAskInteractionFromMessageList = (
+  messageList: MessageInfo[],
+  interaction: McpAskInteraction,
+): MessageInfo[] => {
+  const revision = interaction.revision || 1;
+  const list = [...messageList];
+  for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
+    const msg = list[msgIndex];
+    const interactions = msg.mcpAskInteractions;
+    if (!interactions) continue;
+
+    const nextInteractions = interactions.filter(
+      (item: McpAskInteraction) =>
+        !(
+          item.requestId === interaction.requestId &&
+          (item.revision || 1) === revision
+        ),
+    );
+    if (nextInteractions.length === interactions.length) continue;
+
+    list[msgIndex] = {
+      ...msg,
+      mcpAskInteractions: nextInteractions.length
+        ? nextInteractions
+        : undefined,
+    };
+    break;
+  }
+  return list;
+};
+
+/** @deprecated 请使用 getActiveInterventionQueue */
+export const getVisibleMcpAskInteractions = (
+  item: MessageInfo,
+): McpAskInteraction[] => {
+  return getActiveInterventionQueue([item])
+    .filter((q) => q.kind === "mcp_ask")
+    .map((q) => (q as McpAskInterventionQueueItem).interaction);
+};

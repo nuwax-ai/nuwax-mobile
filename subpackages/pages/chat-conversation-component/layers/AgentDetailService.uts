@@ -33,8 +33,18 @@ import {
 import { MessageStatusEnum, ProcessingEnum } from "@/types/enums/common";
 import { OpenCloseEnum } from "@/types/enums/space";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { API_HEADERS } from "@/constants/api.constants";
 import { chatService } from "@/utils/chatService";
 import { generateUniqueId } from "@/utils/common";
+import { StreamRequest } from "@/utils/streamRequest";
+import { StreamChunk } from "@/types/interfaces/chat";
+import {
+  isAcpPermissionEvent,
+  isMcpAskToolCallEvent,
+  extractAcpPermissionInteraction,
+  extractMcpAskInteraction,
+} from "@/utils/interventionAdapter";
 import {
   apiAgentConversationCreate,
   apiAgentConversation,
@@ -62,7 +72,11 @@ import { v4 as uuidv4 } from "uuid";
 import AgentDetailData from "./AgentDetailData.uts";
 import { getCustomBlock } from "@/subpackages/utils/containerHelper.uts";
 import { replaceMathBracket } from "@/utils/markdown.uts";
-import { adaptHistoryMessage } from "@/subpackages/utils/historyMessageAdapter";
+import {
+  adaptHistoryMessageList,
+  applyMcpAskResumeStatusesInMessageList,
+} from "@/subpackages/utils/historyMessageAdapter";
+import { adaptAgentInfoTags } from "@/utils/historyMessageAdapter";
 import AgentDetailUtils from "./AgentDetailUtils.uts";
 import { TEMP_CONVERSATION_UID } from "@/constants/common.constants";
 import { API_BASE_URL } from "@/constants/config";
@@ -74,6 +88,7 @@ import {
   jumpToFilePreviewPage,
 } from "@/utils/system.uts";
 import { t } from "@/utils/i18n";
+import { reconcileAcpPermissionStatusesInMessageList } from "@/utils/reconcileAcpPermissionStatus.uts";
 
 /** 每页加载消息数量 */
 const MESSAGE_LIST_SIZE = 10;
@@ -81,12 +96,63 @@ const MESSAGE_LIST_SIZE = 10;
 const handleMessageProcess = (text: string): string => {
   return text; // 目前由于方案 已经整体切换到 mp-html内处理 所这里都关闭了
 };
+
+const shouldFinalizeProcessingList = (
+  message: MessageInfo,
+  conversationTaskStatus?: TaskStatus | string,
+): boolean => {
+  if (!message.processingList?.length) return false;
+  if (message.finalResult) return true;
+  return conversationTaskStatus != null && conversationTaskStatus !== TaskStatus.EXECUTING;
+};
+
+const finalizeProcessingList = (
+  processingList?: ProcessingInfo[],
+  finalResult?: MessageInfo["finalResult"],
+): ProcessingInfo[] | undefined => {
+  if (!processingList?.length) return processingList;
+
+  const terminalStatus =
+    finalResult?.success === false || !!finalResult?.error
+      ? ProcessingEnum.FAILED
+      : ProcessingEnum.FINISHED;
+
+  return processingList.map((processing: ProcessingInfo) => {
+    if (processing.status !== ProcessingEnum.EXECUTING) {
+      return processing;
+    }
+
+    return {
+      ...processing,
+      status: terminalStatus,
+      result: {
+        ...processing.result,
+        success:
+          terminalStatus === ProcessingEnum.FAILED
+            ? false
+            : (processing.result?.success ?? true),
+        error:
+          terminalStatus === ProcessingEnum.FAILED
+            ? (finalResult?.error || processing.result?.error)
+            : processing.result?.error,
+        endTime:
+          processing.result?.endTime ||
+          finalResult?.endTime ||
+          processing.result?.startTime,
+      },
+    };
+  });
+};
 /**
  * 服务层：负责业务逻辑和API调用
  */
 export default class AgentDetailService {
   private data: AgentDetailData;
   private isAllowSuggest: boolean;
+  // sub 流恢复专用 StreamRequest(独立于 live chatService,避免互相 abort)
+  private subStreamRequest: StreamRequest | null = null;
+  // sub 是否已订阅(执行中)
+  private isSubscribed = false;
   constructor(private data: AgentDetailData) {
     this.data = data;
     this.isAllowSuggest = true;
@@ -171,23 +237,29 @@ export default class AgentDetailService {
     const len = _messageList?.filter((item) => !!item.id).length || 0;
     if (len) {
       // 处理消息文本，先适配历史消息格式（PC端HTML标签转移动端Markdown语法）
-      const processedMessageList = _messageList.map((message: MessageInfo) => {
-        // 适配历史消息：将PC端自定义HTML标签转换为移动端Markdown容器语法
-        // 同时将componentExecutedList转换为processingList
-        const adaptedMessage = adaptHistoryMessage(message);
+      const processedMessageList = adaptHistoryMessageList(_messageList).map(
+        (adaptedMessage: MessageInfo) => {
+          // 确保 text 字段始终有值，避免 undefined 导致渲染错误
+          const rawText = adaptedMessage.text ?? "";
+          const text = handleMessageProcess(rawText);
+          // 使用同步方法生成ID，兼容所有平台
+          const id = adaptedMessage.id || generateUniqueId();
+          const nextMessage = { ...adaptedMessage, text, id };
+          if (shouldFinalizeProcessingList(nextMessage, responseData?.taskStatus)) {
+            nextMessage.processingList = finalizeProcessingList(
+              nextMessage.processingList,
+              nextMessage.finalResult,
+            );
+          }
 
-        // 确保 text 字段始终有值，避免 undefined 导致渲染错误
-        const rawText = adaptedMessage.text ?? "";
-        const text = handleMessageProcess(rawText);
-        // 使用同步方法生成ID，兼容所有平台
-        const id = adaptedMessage.id || generateUniqueId();
-
-        return { ...adaptedMessage, text, id };
-      });
+          return nextMessage;
+        },
+      );
 
       this.data.autoToLastMsg.value = true;
       // 一次性设置消息列表，避免逐条渲染产生动态效果
-      this.data.messageList.value = processedMessageList;
+      this.data.messageList.value =
+        reconcileAcpPermissionStatusesInMessageList(processedMessageList);
 
       // 无论初始返回多少条，只要有消息就认为可能有历史消息，保证向上滑动时至少调用一次分页接口
       this.data.hasMoreMessages.value = len > 0;
@@ -288,9 +360,8 @@ export default class AgentDetailService {
 
         if (olderMessages.length > 0) {
           // 处理消息格式（与 handleQueryConversation 保持一致）
-          const processedMessages = olderMessages.map(
-            (message: MessageInfo) => {
-              const adaptedMessage = adaptHistoryMessage(message);
+          const processedMessages = adaptHistoryMessageList(olderMessages).map(
+            (adaptedMessage: MessageInfo) => {
               const rawText = adaptedMessage.text ?? "";
               const text = handleMessageProcess(rawText);
               const id = adaptedMessage.id || generateUniqueId();
@@ -299,10 +370,13 @@ export default class AgentDetailService {
           );
 
           // 前插到消息列表头部
-          this.data.messageList.value = [
-            ...processedMessages,
-            ...this.data.messageList.value,
-          ];
+          this.data.messageList.value =
+            reconcileAcpPermissionStatusesInMessageList(
+              applyMcpAskResumeStatusesInMessageList([
+                ...processedMessages,
+                ...this.data.messageList.value,
+              ]),
+            );
 
           // 判断是否还有更多消息
           this.data.hasMoreMessages.value =
@@ -334,6 +408,25 @@ export default class AgentDetailService {
 
     // 忽略心跳包 (HEART_BEAT 不包含 data)
     if (res.eventType === "HEART_BEAT") {
+      return;
+    }
+
+    // ACP Permission 权限审批事件拦截
+    const chunkAny = res as any;
+    if (isAcpPermissionEvent(chunkAny)) {
+      const interaction = extractAcpPermissionInteraction(chunkAny);
+      if (interaction) {
+        this.handleAcpPermissionEvent(interaction, currentMessageId);
+      }
+      return;
+    }
+
+    // MCP Ask tool_call 事件拦截（在 PROCESSING 分支之前）
+    if (isMcpAskToolCallEvent(chunkAny)) {
+      const mcpInteraction = extractMcpAskInteraction(chunkAny);
+      if (mcpInteraction) {
+        this.handleMcpAskEvent(mcpInteraction, currentMessageId);
+      }
       return;
     }
 
@@ -425,10 +518,6 @@ export default class AgentDetailService {
 
     if (eventType === ConversationEventTypeEnum.MESSAGE) {
       const { text, type, ext, id, finished } = responseData;
-      // 如果会话结束，则设置会话状态为不活跃
-      if (finished) {
-        this.data.isConversationActive.value = false;
-      }
 
       if (type === MessageModeEnum.THINK) {
         newMessage = {
@@ -491,6 +580,10 @@ export default class AgentDetailService {
       newMessage = {
         ...currentMessage,
         status: MessageStatusEnum.Complete,
+        processingList: finalizeProcessingList(
+          currentMessage.processingList,
+          responseData,
+        ),
         finalResult: responseData,
         requestId: res.requestId,
       };
@@ -507,11 +600,16 @@ export default class AgentDetailService {
 
     // 更新消息列表
     if (newMessage) {
+      if (newMessage.text != null) {
+        newMessage.text = adaptAgentInfoTags(newMessage.text!);
+      }
       list.splice(index, arraySpliceAction, newMessage as MessageInfo);
     }
 
     // 确保消息列表更新是同步的
-    this.data.messageList.value = [...list];
+    this.data.messageList.value = reconcileAcpPermissionStatusesInMessageList([
+      ...list,
+    ]);
 
     // 流式渲染过程中触发自动滚动到底部
     // 确保 autoToLastMsg 为 true，这样 watch 触发后会执行滚动
@@ -573,6 +671,95 @@ export default class AgentDetailService {
     } finally {
       this.data.isLoadingFiles.value = false;
     }
+  }
+
+  /**
+   * 处理 ACP Permission 权限审批事件
+   */
+  handleAcpPermissionEvent(
+    interaction: import("@/types/intervention").AcpPermissionInteraction,
+    currentMessageId: string,
+  ): void {
+    const list = [...this.data.messageList.value];
+    const currentMessage = list.find(
+      (item) => item.id === currentMessageId,
+    ) as MessageInfo;
+    if (!currentMessage) return;
+
+    // 避免重复添加同一 intervention
+    const existing = currentMessage.acpPermissionInteractions || [];
+    if (existing.some((i) => i.id === interaction.id)) return;
+
+    // 记录此刻 processingList 长度（对齐 PC focusExecuteId 机制）:
+    // streaming 模式下若 processingList 后续增长，说明 agent 已进入下一步，审批失效。
+    const processingListLengthAtAdd = currentMessage.processingList?.length ?? 0;
+    currentMessage.acpPermissionInteractions = [
+      ...existing,
+      {
+        ...interaction,
+        processingListLengthAtAdd,
+        triggeredAt: interaction.triggeredAt ?? Date.now(),
+      },
+    ];
+
+    // 更新消息列表
+    const index = list.findIndex((item) => item.id === currentMessageId);
+    list[index] = { ...currentMessage };
+    this.data.messageList.value =
+      reconcileAcpPermissionStatusesInMessageList(list);
+
+    uni.$emit("streamMessageUpdate");
+  }
+
+  /**
+   * 处理 MCP Ask 结构化提问事件
+   */
+  handleMcpAskEvent(
+    interaction: import("@/types/intervention").McpAskInteraction,
+    currentMessageId: string,
+  ): void {
+    const list = [...this.data.messageList.value];
+    const currentMessage = list.find(
+      (item) => item.id === currentMessageId,
+    ) as MessageInfo;
+    if (!currentMessage) return;
+
+    // 避免重复添加同一 requestId，若有更高 revision 则覆盖更新
+    const existing = currentMessage.mcpAskInteractions || [];
+    const existIndex = existing.findIndex(
+      (i) => i.requestId === interaction.requestId,
+    );
+
+    if (existIndex > -1) {
+      const existItem = existing[existIndex];
+      if ((interaction.revision || 1) > (existItem.revision || 1)) {
+        const nextExisting = [...existing];
+        nextExisting[existIndex] = interaction;
+        currentMessage.mcpAskInteractions = nextExisting;
+      } else {
+        return;
+      }
+    } else {
+      // 记录此刻 processingList 长度（对齐 PC focusExecuteId 机制）:
+      // streaming 模式下若 processingList 后续增长，说明 agent 已进入下一步，卡片过期关闭。
+      const processingListLengthAtAdd = currentMessage.processingList?.length ?? 0;
+      currentMessage.mcpAskInteractions = [
+        ...existing,
+        {
+          ...interaction,
+          processingListLengthAtAdd,
+          triggeredAt: interaction.triggeredAt ?? Date.now(),
+        },
+      ];
+    }
+
+    // 更新消息列表
+    const index = list.findIndex((item) => item.id === currentMessageId);
+    list[index] = { ...currentMessage };
+    this.data.messageList.value =
+      reconcileAcpPermissionStatusesInMessageList(list);
+
+    uni.$emit("streamMessageUpdate");
   }
 
   /**
@@ -700,7 +887,150 @@ export default class AgentDetailService {
   }
 
   /**
-   * 停止会话
+   * 订阅 sub 流恢复 EXECUTING 会话的流式输出(刷新页面/重进会话时重建执行中的助手消息)。
+   * reload 历史 → 追加 assistant 占位 → StreamRequest GET sub → 复用 handleChangeMessageList 重建。
+   * onSubClose: sub 关闭(完成/错误/超时)时回调,页面据此恢复轮询。
+   */
+  async handleSubConversation(
+    conversationId: number,
+    onSubClose?: () => void,
+  ): Promise<void> {
+    // 防重 / live SSE 在跑时不订阅(live 驱动输出;不用 isConversationActive——
+    // 调用方进入 EXECUTING 会话时会置 isConversationActive=true,用它做门会直接 return)
+    if (this.isSubscribed) return;
+    if (chatService.isCurrentlyStreaming) return;
+
+    // 先中断旧 sub,再标记订阅(abort 会置 isSubscribed=false,必须在标记前)
+    this.abortSubConversation();
+    this.isSubscribed = true;
+
+    // 统一清理 sub 状态 + 恢复轮询(sub 结束/ERROR/失败都走这里;幂等防重复回调)
+    let isCleanedUp = false;
+    const cleanupSub = () => {
+      if (isCleanedUp) return;
+      isCleanedUp = true;
+      if (this.subStreamRequest != null) {
+        this.subStreamRequest.abort();
+        this.subStreamRequest = null;
+      }
+      this.isSubscribed = false;
+      // sub 结束:会话不再活跃(防停止按钮卡死 + pollOnce 不被 isConversationActive gate)
+      this.data.isConversationActive.value = false;
+      if (onSubClose != null) onSubClose();
+    };
+
+    // 1. reload 历史(拿最新 messageList,含 hydrate)
+    try {
+      const result = await apiAgentConversation(conversationId);
+      const data = (result as any)?.data;
+      const rawList = (data?.messageList || []) as MessageInfo[];
+      if (rawList.length > 0) {
+        const processedList = adaptHistoryMessageList(rawList).map(
+          (m: MessageInfo): MessageInfo => {
+            return {
+              ...m,
+              text: handleMessageProcess(m.text ?? ""),
+              id: m.id || generateUniqueId(),
+            } as MessageInfo;
+          },
+        );
+        this.data.messageList.value =
+          reconcileAcpPermissionStatusesInMessageList(processedList);
+      }
+    } catch (error) {
+      console.error(
+        "[AgentDetailService] handleSubConversation reload failed:",
+        error,
+      );
+      // reload 失败:放弃订阅(不基于过时 messageList 开 sub)
+      cleanupSub();
+      return;
+    }
+
+    // 2. 追加 assistant 占位
+    const currentMessageId = generateUniqueId();
+    const placeholder = {
+      role: AssistantRoleEnum.ASSISTANT,
+      type: MessageModeEnum.CHAT,
+      text: "",
+      think: "",
+      time: new Date().toISOString(),
+      id: currentMessageId,
+      messageType: MessageTypeEnum.ASSISTANT,
+      status: MessageStatusEnum.Loading,
+    } as MessageInfo;
+    this.data.messageList.value = [
+      ...this.data.messageList.value,
+      placeholder,
+    ];
+
+    // 3. 订阅 sub(GET SSE)
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    const header = {
+      ...API_HEADERS,
+    };
+    // #ifdef H5 || WEB
+    if (process.env.NODE_ENV === "development") {
+      header["Authorization"] = `Bearer ${token}`;
+    }
+    // #endif
+    // #ifdef MP-WEIXIN
+    header["Authorization"] = `Bearer ${token}`;
+    // #endif
+
+    this.subStreamRequest = new StreamRequest();
+    try {
+      await this.subStreamRequest.request({
+        url: `${API_BASE_URL}/api/agent/conversation/chat/sub/${conversationId}`,
+        method: "GET",
+        headers: header,
+        onChunk: (chunk: StreamChunk) => {
+          if (chunk.type !== "content") return;
+          try {
+            const result = JSON.parse(chunk.data);
+            if (!result || typeof result !== "object") return;
+            // 复用 handleChangeMessageList 重建占位消息(含审批/ask 干预)
+            this.handleChangeMessageList(result, currentMessageId);
+            // 会话失败(ERROR):主动清理 sub + 恢复轮询(对齐 PC:FAILED 也要轮询)
+            const eventType = (result as any)?.eventType;
+            if (eventType === ConversationEventTypeEnum.ERROR) {
+              cleanupSub();
+            }
+          } catch (e) {
+            console.error("[AgentDetailService] sub 解析 SSE 失败:", e);
+          }
+        },
+        onComplete: () => cleanupSub(),
+        onError: (error: any) => {
+          console.error("[AgentDetailService] sub stream error:", error);
+          cleanupSub();
+        },
+        onTimeout: () => cleanupSub(),
+      });
+    } catch (error) {
+      console.error("[AgentDetailService] handleSubConversation failed:", error);
+      cleanupSub();
+    }
+  }
+
+  /**
+   * 中断 sub 流恢复连接
+   */
+  abortSubConversation(): void {
+    if (this.subStreamRequest != null) {
+      this.subStreamRequest.abort();
+      this.subStreamRequest = null;
+    }
+    this.isSubscribed = false;
+  }
+
+  /** sub 是否已订阅(执行中) */
+  get isSubConversationSubscribed(): boolean {
+    return this.isSubscribed;
+  }
+
+  /**
+   * 停止会话（中断当前 chat 流式 SSE）
    * @param isTempChat 是否是临时会话
    */
   async handleStopConversation(isTempChat: boolean = false): Promise<void> {
@@ -1057,13 +1387,15 @@ export default class AgentDetailService {
         if (taskStatus === "EXECUTING") {
           // 任务仍在后端执行，保持活跃状态
           this.data.isConversationActive.value = true;
+          // 更新消息列表（刷新页面数据，含 hydrate）
+          this.handleQueryConversation(res);
+          // sub 流恢复由调用方(页面 handleSessionResume)处理,传 onSubClose 恢复轮询
         } else {
           // 任务已完成或取消，更新前端状态
           this.data.isConversationActive.value = false;
+          // 更新消息列表（刷新页面数据）
+          this.handleQueryConversation(res);
         }
-
-        // 更新消息列表（刷新页面数据）
-        this.handleQueryConversation(res);
         console.log(
           "[SessionResume] 会话状态已恢复，后端任务状态:",
           taskStatus,
@@ -1101,6 +1433,8 @@ export default class AgentDetailService {
       modelId?: number;
       // 用户选择的沙盒ID
       sandboxId?: string;
+      // Agent 执行模式
+      agentMode?: "ask" | "yolo";
     },
     isTempChat?: boolean = false,
     // 超时回调
@@ -1238,6 +1572,7 @@ export default class AgentDetailService {
       attachments,
       selectedComponents,
       skillIds: data.skillIds,
+      agentMode: data.agentMode,
     };
 
     // 发送消息

@@ -51,36 +51,58 @@ const isActiveInterventionStatus = (status?: string): boolean => {
   return value === "pending" || value === "submitting" || value === "failed";
 };
 
-const getPendingAcpPermissionToolCallIds = (
+// 对齐 PC readMcpAskRequestId：从 ACP toolCall.rawInput 中提取 MCP Ask requestId
+const readMcpAskRequestIdFromRawInput = (rawInput: any): string | undefined => {
+  if (!rawInput || typeof rawInput !== "object") return undefined;
+  const id = (rawInput as any).requestId;
+  return typeof id === "string" && id ? id : undefined;
+};
+
+// 收集 pending ACP 的两路抑制 ID（对齐 PC permissionPendingToolCallIds + permissionPendingAskRequestIds）
+// toolCallIds:    ACP.toolCallId  ←→ MCP Ask.toolCallId
+// askRequestIds:  ACP.rawInput.requestId ←→ MCP Ask.requestId
+const getPendingAcpPermissionSuppressIds = (
   messageList: MessageInfo[],
-): Set<string> => {
-  const ids = new Set<string>();
+): { toolCallIds: Set<string>; askRequestIds: Set<string> } => {
+  const toolCallIds = new Set<string>();
+  const askRequestIds = new Set<string>();
   messageList.forEach((item: MessageInfo) => {
     const interactions = item.acpPermissionInteractions || [];
     interactions.forEach((interaction: AcpPermissionInteraction) => {
       if (!isActiveInterventionStatus(interaction.responseStatus)) return;
       const toolCallId = interaction.request?.toolCall?.toolCallId;
-      if (toolCallId) ids.add(toolCallId);
+      if (toolCallId) toolCallIds.add(toolCallId);
+      const askRequestId = readMcpAskRequestIdFromRawInput(
+        interaction.request?.toolCall?.rawInput,
+      );
+      if (askRequestId) askRequestIds.add(askRequestId);
     });
   });
-  return ids;
+  return { toolCallIds, askRequestIds };
 };
 
 const filterVisibleMcpAskInteractions = (
   interactions: McpAskInteraction[],
   pendingToolCallIds: Set<string>,
+  pendingAskRequestIds: Set<string>,
 ): McpAskInteraction[] => {
   const activeInteractions = interactions.filter(
     (interaction: McpAskInteraction) =>
       isActiveInterventionStatus(interaction.responseStatus),
   );
-  if (!pendingToolCallIds.size) return activeInteractions;
+  if (!pendingToolCallIds.size && !pendingAskRequestIds.size) return activeInteractions;
 
   return activeInteractions.filter((interaction: McpAskInteraction) => {
-    return (
-      !interaction.toolCallId ||
-      !pendingToolCallIds.has(interaction.toolCallId)
-    );
+    // 第一路：MCP Ask.toolCallId 命中 ACP.toolCallId → 抑制
+    if (interaction.toolCallId && pendingToolCallIds.has(interaction.toolCallId)) {
+      return false;
+    }
+    // 第二路（对齐 PC permissionPendingAskRequestIds）：
+    // MCP Ask.requestId 命中 ACP.rawInput.requestId → 抑制
+    if (interaction.requestId && pendingAskRequestIds.has(interaction.requestId)) {
+      return false;
+    }
+    return true;
   });
 };
 
@@ -90,10 +112,8 @@ export const getVisibleMcpAskInteractions = (
   const interactions = item.mcpAskInteractions || [];
   if (!interactions.length) return [];
 
-  return filterVisibleMcpAskInteractions(
-    interactions,
-    getPendingAcpPermissionToolCallIds([item]),
-  );
+  const { toolCallIds, askRequestIds } = getPendingAcpPermissionSuppressIds([item]);
+  return filterVisibleMcpAskInteractions(interactions, toolCallIds, askRequestIds);
 };
 
 export const getActiveAcpPermissionDockItems = (
@@ -145,10 +165,12 @@ export const getVisibleMcpAskDockItems = (
   const componentList = (latest as any).componentExecutedList as any[] | null;
   const isHistory = componentList != null && componentList.length > 0;
   if (isHistory && getFocusSubEventType(latest) !== "ASK_QUESTION") return [];
-  const pendingToolCallIds = getPendingAcpPermissionToolCallIds([latest]);
+  const { toolCallIds: pendingToolCallIds, askRequestIds: pendingAskRequestIds } =
+    getPendingAcpPermissionSuppressIds([latest]);
   const interactions = filterVisibleMcpAskInteractions(
     latest.mcpAskInteractions || [],
     pendingToolCallIds,
+    pendingAskRequestIds,
   );
   const items: McpAskDockItem[] = [];
   interactions.forEach((interaction: McpAskInteraction) => {

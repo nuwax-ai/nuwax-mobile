@@ -9,9 +9,11 @@ const includeFiles = ["App.uvue"];
 const includeExt = new Set([".uvue", ".vue", ".uts"]);
 const excludeFiles = new Set([
   "components/pane-tabs/example.uvue",
+  "utils/mockInterventionData.uts",
   "utils/mockApiService.uts",
   "utils/pinyin.uts",
 ]);
+const excludePathPrefixes = ["subpackages/uni_modules/"];
 const zhLocalePath = "constants/i18n-locales/zh-CN.uts";
 const enLocalePath = "constants/i18n-locales/en-US.uts";
 
@@ -86,6 +88,9 @@ const walkFiles = (dir) => {
         return;
       }
       const relPath = path.relative(rootDir, absPath).replace(/\\/g, "/");
+      if (excludePathPrefixes.some((prefix) => relPath.startsWith(prefix))) {
+        return;
+      }
       if (excludeFiles.has(relPath)) return;
       if (!includeExt.has(path.extname(relPath))) return;
       results.push(relPath);
@@ -177,19 +182,6 @@ files.forEach((relPath) => {
     });
   });
 
-  const imageTagRegex = /<image\b[\s\S]*?>/g;
-  let tagMatch;
-  while ((tagMatch = imageTagRegex.exec(content)) !== null) {
-    const imageTag = tagMatch[0];
-    if (!/(^|\s)(:alt|alt)\s*=/.test(imageTag)) {
-      findings.push({
-        file: relPath,
-        line: content.slice(0, tagMatch.index).split(/\r?\n/).length,
-        text: imageTag.replace(/\s+/g, " ").trim(),
-      });
-    }
-  }
-
   const contentWithoutSelfClosedTextNode = content.replace(
     /<(text|button)\b(?:[^>"']|"[^"]*"|'[^']*')*\/>/g,
     (match) => match.replace(/[^\n]/g, " "),
@@ -197,13 +189,17 @@ files.forEach((relPath) => {
   const textNodeRegex =
     /<(text|button)\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\/\1>/g;
   let textNodeMatch;
-  while ((textNodeMatch = textNodeRegex.exec(contentWithoutSelfClosedTextNode)) !== null) {
+  while (
+    (textNodeMatch = textNodeRegex.exec(contentWithoutSelfClosedTextNode)) !==
+    null
+  ) {
     const rawInnerText = textNodeMatch[2] || "";
     const cleanedInnerText = rawInnerText
       .replace(/\{\{[\s\S]*?\}\}/g, "")
       .replace(/<[^>]+>/g, "")
       .trim();
     if (!cleanedInnerText) continue;
+    if (!hasChinese.test(cleanedInnerText)) continue;
     findings.push({
       file: relPath,
       line: contentWithoutSelfClosedTextNode

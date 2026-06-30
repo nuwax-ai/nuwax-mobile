@@ -181,8 +181,9 @@ for (const needle of [
   "service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat)",
   "removeMcpAskInteraction(interaction)",
   "class=\"intervention-dock\"",
-  "activeAcpPermissionDockItems",
-  "visibleMcpAskDockItems",
+  "getActiveInterventionQueue",
+  "frontInterventionItem",
+  "interventionQueueBadge",
 ]) {
   assertIncludes(conversation, needle, "conversation response wiring");
 }
@@ -191,12 +192,23 @@ const mcpAskInterventionState = read(
   "subpackages/pages/chat-conversation-component/utils/mcpAskInterventionState.uts",
 );
 for (const needle of [
+  "getActiveInterventionQueue",
   "getVisibleMcpAskInteractions",
   "removeMcpAskInteractionFromMessageList",
   "updateMcpAskInteractionStatusInMessageList",
+  "updateAcpPermissionInteractionStatusInMessageList",
   "(item.revision || 1) === revision",
 ]) {
   assertIncludes(mcpAskInterventionState, needle, "mcp ask state helpers");
+}
+
+const reconcileAcp = read("utils/reconcileAcpPermissionStatus.uts");
+for (const needle of [
+  "reconcileAcpPermissionStatusesInMessageList",
+  "isIdempotentAcpPermissionResolveError",
+  "reconcileMessageAcpPermissionStatuses",
+]) {
+  assertIncludes(reconcileAcp, needle, "acp reconcile helpers");
 }
 
 const resume = read("utils/mcpAskResumeMessage.uts");

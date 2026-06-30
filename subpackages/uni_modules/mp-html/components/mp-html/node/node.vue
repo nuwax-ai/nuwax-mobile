@@ -515,9 +515,13 @@
         }
 
         const result = {
-        ...data,
-        // 在 HTML 解析过程中，mp-html 的解析器会将属性名自动转为全小写，也就是 executeid
-        ...getProcessingDataByPriority(data.executeId || data.executeid, this.processingList) 
+          ...data,
+          // 在 HTML 解析过程中，mp-html 的解析器会将属性名自动转为全小写，也就是 executeid
+          ...getProcessingDataByPriority(
+            data.executeId || data.executeid,
+            this.processingList,
+            data.type
+          )
         }
 
         return result

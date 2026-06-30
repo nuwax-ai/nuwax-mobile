@@ -205,12 +205,10 @@ updateAcpPermissionInteractionStatus(interaction, 'submitting')
 ### 7.2 MCP Ask 提交（`handleMcpAskRespond`）
 
 ```typescript
-// 1. 更新 responseStatus → 'submitting'
-updateMcpAskInteractionStatusInMessageList(messageList, interaction, 'submitting')
-// 2. isConversationActive = true（锁定输入框）
-// 3. 立即从 messageList 移除该 interaction（卡片消失，无需等 API）
-removeMcpAskInteraction(interaction)
-// 4. buildMcpAskResumeMessage → handleSendMessage 将 resume 文本发回会话
+// 1. 更新终态 submitted/cancelled/skipped（不经 submitting）
+// 2. removeMcpAskInteraction
+// 3. buildMcpAskResumeMessage → handleSendMessage（off ChatFinished + abortSub）
+// 注：提交前不主动 cancel/stop，后端已兼容 EXECUTING 态下直接发 resume
 ```
 
 ---

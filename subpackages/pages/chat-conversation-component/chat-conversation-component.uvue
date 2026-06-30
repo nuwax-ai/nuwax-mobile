@@ -231,12 +231,9 @@
             <text class="iconfont icon-a-Chevrondown"></text>
           </view>
         </view>
-        <!-- Agent 干预固定栏：权限审批 / Ask Question 表单 -->
+        <!-- Agent 干预固定栏：FIFO 队列，仅展示队首一张卡片 -->
         <view
-          v-if="
-            activeAcpPermissionDockItems.length ||
-            visibleMcpAskDockItems.length
-          "
+          v-if="activeInterventionQueue.length"
           class="intervention-dock"
         >
           <scroll-view
@@ -245,24 +242,35 @@
             :show-scrollbar="false"
           >
             <view class="intervention-dock-content">
+              <view
+                v-if="interventionQueueBadge > 0"
+                class="intervention-queue-badge"
+              >
+                <text class="intervention-queue-badge-text">
+                  +{{ interventionQueueBadge }}
+                </text>
+              </view>
               <acp-permission-card
-                v-for="acpItem in activeAcpPermissionDockItems"
-                :key="acpItem.key"
-                :interaction="acpItem.interaction"
+                v-if="frontInterventionItem?.kind === 'acp_permission'"
+                :key="frontInterventionItem.key"
+                :interaction="frontInterventionItem.interaction"
                 @respond="
                   (resp) =>
-                    handleAcpPermissionRespond(acpItem.interaction, resp)
+                    handleAcpPermissionRespond(
+                      frontInterventionItem.interaction,
+                      resp,
+                    )
                 "
               />
               <mcp-ask-question-card
-                v-for="mcpItem in visibleMcpAskDockItems"
-                :key="mcpItem.key"
-                :interaction="mcpItem.interaction"
+                v-if="frontInterventionItem?.kind === 'mcp_ask'"
+                :key="frontInterventionItem.key"
+                :interaction="frontInterventionItem.interaction"
                 @respond="
                   (payload) =>
                     handleMcpAskRespond(
-                      mcpItem.message,
-                      mcpItem.interaction,
+                      frontInterventionItem.message,
+                      frontInterventionItem.interaction,
                       payload,
                     )
                 "
@@ -480,11 +488,12 @@
     McpAskRespondPayload,
   } from "@/types/intervention";
   import {
-    getActiveAcpPermissionDockItems,
-    getVisibleMcpAskDockItems,
+    getActiveInterventionQueue,
     removeMcpAskInteractionFromMessageList,
+    updateAcpPermissionInteractionStatusInMessageList,
     updateMcpAskInteractionStatusInMessageList,
   } from "./utils/mcpAskInterventionState.uts";
+  import { isIdempotentAcpPermissionResolveError } from "@/utils/reconcileAcpPermissionStatus.uts";
   import {
     injectMockIntervention,
     clearMockInterventions,
@@ -712,11 +721,14 @@
     localCalledTrialCount,
   } = data;
 
-  const activeAcpPermissionDockItems = computed(() =>
-    getActiveAcpPermissionDockItems(messageList.value),
+  const activeInterventionQueue = computed(() =>
+    getActiveInterventionQueue(messageList.value),
   );
-  const visibleMcpAskDockItems = computed(() =>
-    getVisibleMcpAskDockItems(messageList.value),
+  const frontInterventionItem = computed(
+    () => activeInterventionQueue.value[0] ?? null,
+  );
+  const interventionQueueBadge = computed(() =>
+    Math.max(0, activeInterventionQueue.value.length - 1),
   );
 
   // 处理禁用发送按钮
@@ -1149,29 +1161,6 @@
     // 显示操作菜单
   };
 
-  const removeAcpPermissionInteraction = (interactionId: string): void => {
-    const list = [...messageList.value];
-    for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
-      const msg = list[msgIndex];
-      const interactions = msg.acpPermissionInteractions;
-      if (!interactions) continue;
-
-      const nextInteractions = interactions.filter(
-        (item) => item.id !== interactionId,
-      );
-      if (nextInteractions.length === interactions.length) continue;
-
-      list[msgIndex] = {
-        ...msg,
-        acpPermissionInteractions: nextInteractions.length
-          ? nextInteractions
-          : undefined,
-      };
-      break;
-    }
-    messageList.value = list;
-  };
-
   const removeMcpAskInteraction = (interaction: McpAskInteraction): void => {
     messageList.value = removeMcpAskInteractionFromMessageList(
       messageList.value,
@@ -1186,26 +1175,18 @@
     interaction: AcpPermissionInteraction,
     response: AcpPermissionResponse,
   ): Promise<void> => {
+    const selectedOptionId =
+      response.outcome.outcome === "selected"
+        ? response.outcome.optionId
+        : undefined;
+
     // 更新本地状态为 submitting
-    const list = [...messageList.value];
-    for (const msg of list) {
-      if (!msg.acpPermissionInteractions) continue;
-      const idx = msg.acpPermissionInteractions.findIndex(
-        (i) => i.id === interaction.id,
-      );
-      if (idx >= 0) {
-        msg.acpPermissionInteractions[idx] = {
-          ...msg.acpPermissionInteractions[idx],
-          responseStatus: "submitting",
-          selectedOptionId:
-            response.outcome.outcome === "selected"
-              ? response.outcome.optionId
-              : undefined,
-        };
-        break;
-      }
-    }
-    messageList.value = list;
+    messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+      messageList.value,
+      interaction.id,
+      "submitting",
+      { selectedOptionId },
+    );
 
     // 插入临时加载气泡以触发聊天组件的加载状态
     const tempLoadingId = "acp_loading_" + Date.now();
@@ -1250,11 +1231,13 @@
         );
       }
 
-      // 成功后，移除当前 ACP 交互并清理临时加载气泡
-      messageList.value = messageList.value.filter(
-        (item) => item.id !== tempLoadingId,
+      // 成功后保留 interaction，标为 submitted（FIFO 队列自动展示下一项）
+      messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+        messageList.value.filter((item) => item.id !== tempLoadingId),
+        interaction.id,
+        "submitted",
+        { selectedOptionId },
       );
-      removeAcpPermissionInteraction(interaction.id);
     } catch (error) {
       // 失败后，清理临时加载气泡，还原活跃状态
       messageList.value = messageList.value.filter(
@@ -1266,23 +1249,23 @@
         error instanceof Error
           ? error.message
           : t("Mobile.Intervention.AcpPermission.responseFailed");
-      // 更新为 failed
-      const list3 = [...messageList.value];
-      for (const msg of list3) {
-        if (!msg.acpPermissionInteractions) continue;
-        const idx = msg.acpPermissionInteractions.findIndex(
-          (i) => i.id === interaction.id,
+
+      if (isIdempotentAcpPermissionResolveError(error)) {
+        messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+          messageList.value,
+          interaction.id,
+          "submitted",
+          { selectedOptionId },
         );
-        if (idx >= 0) {
-          msg.acpPermissionInteractions[idx] = {
-            ...msg.acpPermissionInteractions[idx],
-            responseStatus: "failed",
-            errorMessage: errorMsg,
-          };
-          break;
-        }
+        return;
       }
-      messageList.value = list3;
+
+      messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+        messageList.value,
+        interaction.id,
+        "failed",
+        { errorMessage: errorMsg },
+      );
       uni.showToast({ title: errorMsg, icon: "none" });
     }
   };

@@ -16,16 +16,14 @@ components/agent-intervention/
 └── mcp-ask-question-card/      # MCP Ask 结构化表单卡片
 
 subpackages/pages/chat-conversation-component/
-├── layers/AgentDetailService.uts         # SSE 事件处理 + handleAcpPermissionEvent / handleMcpAskEvent
-└── utils/mcpAskInterventionState.uts     # DockPanel 显隐计算（getActiveAcpPermissionDockItems / getVisibleMcpAskDockItems）
-
-subpackages/utils/
-└── historyMessageAdapter.uts             # 历史消息 hydrate + applyMcpAskResumeStatuses
+├── layers/AgentDetailService.uts         # SSE 事件处理 + reconcile 挂载
+└── utils/mcpAskInterventionState.uts     # FIFO 队列 getActiveInterventionQueue
 
 utils/
-├── interventionAdapter.uts               # SSE 事件识别与提取（isAcpPermissionEvent / extractAcpPermissionInteraction 等）
-├── mcpAskSchema.uts                      # MCP Ask JSON Schema 解析（parseMcpAskToolInput / parseInteractionFields）
-└── mcpAskResumeMessage.uts               # resume 消息构建与识别（buildMcpAskResumeMessage / hasMcpAskResumeMessage）
+├── interventionAdapter.uts               # SSE 事件识别与提取
+├── reconcileAcpPermissionStatus.uts      # ACP sub 恢复 reconcile（对齐 PC）
+├── mcpAskSchema.uts
+└── mcpAskResumeMessage.uts
 
 types/intervention.uts                    # AcpPermissionInteraction / McpAskInteraction 类型定义
 ```
@@ -105,103 +103,56 @@ handleQueryConversation / handleLoadMoreMessages
 
 ---
 
-## 三、DockPanel 渲染：何时显示卡片
+## 三、DockPanel 渲染：FIFO 审批队列
 
-DockPanel 在 `chat-conversation-component.uvue` 的 `intervention-dock` 区域渲染，由两个 `computed` 驱动：
+DockPanel 在 `chat-conversation-component.uvue` 的 `intervention-dock` 区域渲染，由 `getActiveInterventionQueue` 驱动（对齐 PC `useActiveInterventionQueue`）：
 
 ```typescript
-const activeAcpPermissionDockItems = computed(() => getActiveAcpPermissionDockItems(messageList.value))
-const visibleMcpAskDockItems = computed(() => getVisibleMcpAskDockItems(messageList.value))
+const activeInterventionQueue = computed(() => getActiveInterventionQueue(messageList.value))
+const frontInterventionItem = computed(() => activeInterventionQueue.value[0] ?? null)
+const interventionQueueBadge = computed(() => Math.max(0, activeInterventionQueue.value.length - 1))
 ```
 
-两者均只处理 `messageList` 中的**最后一条消息**（`latestMessage`），历史消息上残留的 pending 审批不进 DockPanel。
+**关键语义：**
 
----
+- **跨消息扫描**：遍历全量 `messageList`，不再只看 `latestMessage`
+- **FIFO**：`sortKey = triggeredAt ?? fallbackSeq`，队首 `queue[0]` 为最早待审批项
+- **仅展示队首一张卡片**；`badge` 显示 `+N` 表示后续队列长度
+- **进队条件**：`responseStatus` 为 `pending` / `submitting`；`failed` / `submitted` 不进队
+- **ACP 双路抑制 MCP Ask**：pending ACP 的 `toolCallId` 与 `rawInput.requestId` 抑制同 ID 的 MCP Ask
 
-### 3.1 ACP 权限审批卡片（`getActiveAcpPermissionDockItems`）
+### 3.1 ACP 权限审批
 
-```
-latestMessage = messageList[last]
-isHistory = componentExecutedList 非空
+审批成功后 **保留** `acpPermissionInteractions` 条目，将 `responseStatus` 置为 `submitted`（不再 `remove`），队列自动推进下一项。
 
-[历史模式] componentExecutedList 末项 subEventType !== 'REQUEST_PERMISSION'  → 返回空
-[任意模式] isMessageTerminal(Complete / Error / Stopped)                     → 返回空
+`notify-resolved` 幂等错误（`not found` / `already_resolved` / `gone`）同样标为 `submitted`。
 
-currentProcessingLength = isHistory ? 0 : latestMessage.processingList.length
+### 3.2 sub 流恢复 reconcile
 
-对 latestMessage.acpPermissionInteractions 逐条过滤：
-  × responseStatus 不是 pending / submitting / failed  → 跳过
-  × [实时流] processingListLengthAtAdd 已设置
-         且 currentProcessingLength > processingListLengthAtAdd  → 跳过（过期）
-  ✓ 其余 → 加入队列显示
-```
+`utils/reconcileAcpPermissionStatus.uts` 在以下时机运行：
 
-**关闭时机：**
+- `handleChangeMessageList` 每次更新 messageList 后
+- `handleAcpPermissionEvent` / `handleMcpAskEvent` 挂载后
+- 历史消息加载 / 分页前插 / `handleSubConversation` reload 后
 
-| 原因 | 触发方式 |
+判定已审批：
+
+| 信号 | 动作 |
 |---|---|
-| 用户审批 | `responseStatus` → `submitted` |
-| Agent 推进 | `processingList` 新增项，`currentProcessingLength > processingListLengthAtAdd` |
-| 会话结束 | `status` → `Complete / Error / Stopped` |
-| 切换到非 REQUEST_PERMISSION 末项 | 历史模式 `componentExecutedList` 末项变化 |
+| 同 `toolCallId` / `executeId` 在 `processingList` 为 `FINISHED` | → `submitted` |
+| ACP `rawInput.requestId` 关联的 MCP Ask 已有 resume 消息 | → `submitted` |
+
+### 3.3 MCP Ask 卡片
+
+与 ACP 共用 FIFO 队列；被 pending ACP 双路抑制时不进队。用户本端提交后仍通过 `removeMcpAskInteractionFromMessageList` 移除；跨端由 `hasMcpAskResumeMessage` 关闭。
 
 ---
 
-### 3.2 MCP Ask 卡片（`getVisibleMcpAskDockItems`）
+## 四、过期机制说明
 
-```
-latestMessage = messageList[last]
-isHistory = componentExecutedList 非空
+队列逻辑（`getActiveInterventionQueue`）**不再**依赖 `processingListLengthAtAdd` / `latestMessage` 过滤，与 PC 对齐。
 
-[历史模式] componentExecutedList 末项 subEventType !== 'ASK_QUESTION'  → 返回空
-
-currentProcessingLength = isHistory ? 0 : latestMessage.processingList.length
-
-收集 pending ACP 的抑制 ID（来自 latestMessage.acpPermissionInteractions）：
-  pendingAcpToolCallIds   = { acp.toolCallId }
-  pendingAskRequestIds    = { acp.toolCall.rawInput.requestId }   ← rawInput 为 MCP Ask 参数时有值
-
-对 latestMessage.mcpAskInteractions 逐条过滤：
-  × responseStatus 不是 pending / submitting / failed  → 跳过
-  × [实时流] processingListLengthAtAdd 已设置
-         且 currentProcessingLength > processingListLengthAtAdd  → 跳过（过期）
-  × toolCallId ∈ pendingAcpToolCallIds     → 跳过（第一路 ACP 抑制）
-  × requestId  ∈ pendingAskRequestIds      → 跳过（第二路 ACP 抑制）
-  × hasMcpAskResumeMessage(messageList, interaction)  → 跳过（已回答）
-  ✓ 其余 → 加入队列显示
-```
-
-**与 ACP 的重要区别：**
-- MCP Ask **不受** `isMessageTerminal` 影响——消息 `Complete` 后用户仍可能在填表，由 `responseStatus` 独立控制关闭。
-- MCP Ask 可被 pending ACP 双路抑制（ACP 优先显示）。
-
-**关闭时机：**
-
-| 原因 | 触发方式 |
-|---|---|
-| 本端用户提交 | `removeMcpAskInteractionFromMessageList` 直接从 list 移除（`handleMcpAskRespond`） |
-| Agent 推进 | `processingList` 新增项，过期检查生效 |
-| 跨端感知 | resume 消息出现在 `messageList`，`hasMcpAskResumeMessage` 返回 true |
-| 本端历史 hydrate | `applyMcpAskResumeStatusesInMessageList` 置 `responseStatus` = `submitted` |
-
----
-
-## 四、过期机制（`processingListLengthAtAdd`）
-
-对齐 PC 端 `focusExecuteId` / `isExpired` 机制，移动端用 `processingList.length` 作为时间戳。
-
-**工作原理：**
-
-1. ACP 或 MCP Ask SSE 事件到来时，`handleAcpPermissionEvent` / `handleMcpAskEvent` 记录此时 `processingList.length` 为 `processingListLengthAtAdd`。
-2. 后续 PROCESSING（Plan/ToolCall）事件使 `processingList.length` 增长。
-3. DockPanel 渲染时：`currentProcessingLength > processingListLengthAtAdd` → agent 已推进到下一步 → 该卡片过期关闭。
-
-```
-t=0  processingList=[A,B]          MCP Ask arrives  → processingListLengthAtAdd=2
-t=1  PROCESSING(C)  processingList=[A,B,C]
-t=2  REQUEST_PERMISSION            ACP arrives      → processingListLengthAtAdd=3
-     currentProcessingLength=3 > 2  ∴ MCP Ask 过期  ✓ 仅 ACP 显示
-```
+`processingListLengthAtAdd` 仍会在 SSE 挂载时写入，供调试与后续扩展；sub 恢复后已审批态主要由 `reconcileAcpPermissionStatus` 根据 `processingList.FINISHED` 判定。
 
 **注意：** ASK_QUESTION 和 REQUEST_PERMISSION 事件本身**不进** `processingList`（被拦截 return），因此不影响 `processingListLengthAtAdd` 计算。
 

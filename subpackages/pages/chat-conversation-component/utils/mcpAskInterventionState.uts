@@ -2,196 +2,162 @@ import type { MessageInfo } from "@/types/interfaces/conversationInfo.uts";
 import type {
   AcpPermissionInteraction,
   InterventionStatus,
-  InterventionCardKind,
   McpAskInteraction,
 } from "@/types/intervention";
-import { MessageStatusEnum } from "@/types/enums/common";
 import { hasMcpAskResumeMessage } from "@/utils/mcpAskResumeMessage.uts";
 
-// 只看最新一条消息(对齐 PC useActiveInterventionQueue 的 latestMessage 过滤,
-// 避免历史消息里的残留 pending 审批顶住 DockPanel)
-const getLatestMessage = (messageList: MessageInfo[]): MessageInfo | null => {
-  if (!messageList || messageList.length === 0) return null;
-  return messageList[messageList.length - 1];
-};
+export type InterventionQueueKind = "acp_permission" | "mcp_ask";
 
-// 最新消息 componentExecutedList 末项的 subEventType
-// (对齐用户需求 + PC focusExecuteId:只有「最后一个」是 ASK_QUESTION / REQUEST_PERMISSION 才展示对应卡片)
-const getFocusSubEventType = (message: MessageInfo): string | null => {
-  const list = (message as any).componentExecutedList as any[] | null;
-  if (!list || list.length === 0) return null;
-  const last = list[list.length - 1] as any;
-  const subEventType = last?.subEventType;
-  return typeof subEventType === "string" ? subEventType : null;
-};
-
-// 会话结束态(对齐 PC isMessageTerminal,仅用于 acp permission —— ask-question 不受影响)
-const isMessageTerminal = (message: MessageInfo): boolean => {
-  const status = message.status;
-  return (
-    status === MessageStatusEnum.Complete || status === MessageStatusEnum.Error
-  );
-};
-
-export interface AcpPermissionDockItem {
+export interface AcpInterventionQueueItem {
+  kind: "acp_permission";
   key: string;
-  kind: InterventionCardKind;
+  messageId: string;
+  messageIndex: number;
   interaction: AcpPermissionInteraction;
+  sortKey: number;
 }
 
-export interface McpAskDockItem {
+export interface McpAskInterventionQueueItem {
+  kind: "mcp_ask";
   key: string;
-  kind: InterventionCardKind;
+  messageId: string;
+  messageIndex: number;
   message: MessageInfo;
   interaction: McpAskInteraction;
+  sortKey: number;
 }
 
-const isActiveInterventionStatus = (status?: string): boolean => {
+export type InterventionQueueItem =
+  | AcpInterventionQueueItem
+  | McpAskInterventionQueueItem;
+
+/** 对齐 PC useActiveInterventionQueue：pending/submitting 进队，failed 不进队 */
+const isActiveResponseStatus = (status?: string): boolean => {
   const value = status || "pending";
-  return value === "pending" || value === "submitting" || value === "failed";
+  return value === "pending" || value === "submitting";
 };
 
-// 对齐 PC readMcpAskRequestId：从 ACP toolCall.rawInput 中提取 MCP Ask requestId
 const readMcpAskRequestIdFromRawInput = (rawInput: any): string | undefined => {
   if (!rawInput || typeof rawInput !== "object") return undefined;
   const id = (rawInput as any).requestId;
   return typeof id === "string" && id ? id : undefined;
 };
 
-// 收集 pending ACP 的两路抑制 ID（对齐 PC permissionPendingToolCallIds + permissionPendingAskRequestIds）
-// toolCallIds:    ACP.toolCallId  ←→ MCP Ask.toolCallId
-// askRequestIds:  ACP.rawInput.requestId ←→ MCP Ask.requestId
-const getPendingAcpPermissionSuppressIds = (
+/**
+ * 跨消息 FIFO 审批队列（对齐 nuwax PC useActiveInterventionQueue）。
+ * front = items[0] 为最早待处理项；ACP 双路抑制同 requestId/toolCallId 的 MCP Ask。
+ */
+export const getActiveInterventionQueue = (
   messageList: MessageInfo[],
-): { toolCallIds: Set<string>; askRequestIds: Set<string> } => {
-  const toolCallIds = new Set<string>();
-  const askRequestIds = new Set<string>();
-  messageList.forEach((item: MessageInfo) => {
-    const interactions = item.acpPermissionInteractions || [];
+): InterventionQueueItem[] => {
+  const pendingMap = new Map<string, InterventionQueueItem>();
+  const permissionPendingToolCallIds = new Set<string>();
+  const permissionPendingAskRequestIds = new Set<string>();
+  let fallbackSeq = 0;
+
+  const messages = [...(messageList || [])].sort(
+    (a, b) => (a.index ?? 0) - (b.index ?? 0),
+  );
+
+  messages.forEach((message: MessageInfo) => {
+    const interactions = message.acpPermissionInteractions || [];
     interactions.forEach((interaction: AcpPermissionInteraction) => {
-      if (!isActiveInterventionStatus(interaction.responseStatus)) return;
+      if (!isActiveResponseStatus(interaction.responseStatus)) return;
       const toolCallId = interaction.request?.toolCall?.toolCallId;
-      if (toolCallId) toolCallIds.add(toolCallId);
+      if (toolCallId) permissionPendingToolCallIds.add(toolCallId);
       const askRequestId = readMcpAskRequestIdFromRawInput(
         interaction.request?.toolCall?.rawInput,
       );
-      if (askRequestId) askRequestIds.add(askRequestId);
+      if (askRequestId) permissionPendingAskRequestIds.add(askRequestId);
     });
   });
-  return { toolCallIds, askRequestIds };
-};
 
-const filterVisibleMcpAskInteractions = (
-  interactions: McpAskInteraction[],
-  pendingToolCallIds: Set<string>,
-  pendingAskRequestIds: Set<string>,
-): McpAskInteraction[] => {
-  const activeInteractions = interactions.filter(
-    (interaction: McpAskInteraction) =>
-      isActiveInterventionStatus(interaction.responseStatus),
-  );
-  if (!pendingToolCallIds.size && !pendingAskRequestIds.size) return activeInteractions;
+  messages.forEach((message: MessageInfo) => {
+    const messageId = String(message.id ?? message.index);
+    const messageIndex = message.index ?? 0;
 
-  return activeInteractions.filter((interaction: McpAskInteraction) => {
-    // 第一路：MCP Ask.toolCallId 命中 ACP.toolCallId → 抑制
-    if (interaction.toolCallId && pendingToolCallIds.has(interaction.toolCallId)) {
-      return false;
-    }
-    // 第二路（对齐 PC permissionPendingAskRequestIds）：
-    // MCP Ask.requestId 命中 ACP.rawInput.requestId → 抑制
-    if (interaction.requestId && pendingAskRequestIds.has(interaction.requestId)) {
-      return false;
-    }
-    return true;
+    const acpInteractions = message.acpPermissionInteractions || [];
+    acpInteractions.forEach((interaction: AcpPermissionInteraction) => {
+      if (!isActiveResponseStatus(interaction.responseStatus)) return;
+      const sortKey = interaction.triggeredAt ?? fallbackSeq++;
+      pendingMap.set(`acp-${interaction.id}`, {
+        kind: "acp_permission",
+        key: `acp:${interaction.id}`,
+        messageId,
+        messageIndex,
+        interaction,
+        sortKey,
+      });
+    });
+
+    const mcpInteractions = message.mcpAskInteractions || [];
+    mcpInteractions.forEach((interaction: McpAskInteraction) => {
+      if (!isActiveResponseStatus(interaction.responseStatus)) return;
+      if (hasMcpAskResumeMessage(messages, interaction)) return;
+      if (
+        (interaction.toolCallId &&
+          permissionPendingToolCallIds.has(interaction.toolCallId)) ||
+        (interaction.requestId &&
+          permissionPendingAskRequestIds.has(interaction.requestId))
+      ) {
+        return;
+      }
+      const sortKey = interaction.triggeredAt ?? fallbackSeq++;
+      const revision = interaction.revision || 1;
+      pendingMap.set(`ask-${interaction.requestId}`, {
+        kind: "mcp_ask",
+        key: `ask:${interaction.requestId}:${revision}`,
+        messageId,
+        messageIndex,
+        message,
+        interaction,
+        sortKey,
+      });
+    });
   });
+
+  return [...pendingMap.values()].sort((a, b) => a.sortKey - b.sortKey);
 };
 
-export const getVisibleMcpAskInteractions = (
-  item: MessageInfo,
-): McpAskInteraction[] => {
-  const interactions = item.mcpAskInteractions || [];
-  if (!interactions.length) return [];
-
-  const { toolCallIds, askRequestIds } = getPendingAcpPermissionSuppressIds([item]);
-  return filterVisibleMcpAskInteractions(interactions, toolCallIds, askRequestIds);
-};
-
-export const getActiveAcpPermissionDockItems = (
+export const updateAcpPermissionInteractionStatusInMessageList = (
   messageList: MessageInfo[],
-): AcpPermissionDockItem[] => {
-  // 只看最新一条消息。
-  // 历史消息(componentExecutedList 存在):末项必须是 REQUEST_PERMISSION + 非结束态。
-  // 实时流(componentExecutedList 为空):acpPermissionInteractions 由 SSE 即时挂载,有 pending 就显示。
-  const latest = getLatestMessage(messageList);
-  if (latest == null) return [];
-  const componentList = (latest as any).componentExecutedList as any[] | null;
-  const isHistory = componentList != null && componentList.length > 0;
-  // history 消息：末项不是 REQUEST_PERMISSION 则无审批要展示
-  if (isHistory && getFocusSubEventType(latest) !== "REQUEST_PERMISSION") return [];
-  // 对齐 PC isMessageTerminal：会话已结束则 ACP 审批失效，无论 history 还是实时流
-  // （sub 流结束后 componentExecutedList 仍为 null，必须在 isHistory 块外检测终态）
-  if (isMessageTerminal(latest)) return [];
+  interactionId: string,
+  responseStatus: InterventionStatus,
+  extras?: { selectedOptionId?: string; errorMessage?: string },
+): MessageInfo[] => {
+  const list = [...messageList];
+  for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
+    const msg = list[msgIndex];
+    const interactions = msg.acpPermissionInteractions;
+    if (!interactions) continue;
 
-  // 实时流（componentExecutedList 为空）：检查是否有新的处理步骤到来
-  // 对齐 PC focusExecuteId 机制：processingList 在 ACP 到来后增长 → agent 已进入下一步 → 关闭审批
-  // （HEART_BEAT 和 ACP 自身均在 handleChangeMessageList 中 return，不会进 processingList，无需额外过滤）
-  const currentProcessingLength = (!isHistory ? (latest.processingList || []).length : 0);
+    let matched = false;
+    const nextInteractions = interactions.map(
+      (item: AcpPermissionInteraction) => {
+        if (item.id !== interactionId) return item;
+        matched = true;
+        return {
+          ...item,
+          responseStatus,
+          ...(extras?.selectedOptionId !== undefined
+            ? { selectedOptionId: extras.selectedOptionId }
+            : {}),
+          ...(extras?.errorMessage !== undefined
+            ? { errorMessage: extras.errorMessage }
+            : {}),
+        };
+      },
+    );
 
-  const items: AcpPermissionDockItem[] = [];
-  const interactions = latest.acpPermissionInteractions || [];
-  interactions.forEach((interaction: AcpPermissionInteraction) => {
-    if (!isActiveInterventionStatus(interaction.responseStatus)) return;
-    // 实时流：若 processingList 在审批到来后有新增项，说明 agent 已进入下一步
-    if (!isHistory && interaction.processingListLengthAtAdd !== undefined) {
-      if (currentProcessingLength > interaction.processingListLengthAtAdd) return;
-    }
-    items.push({
-      key: `acp:${interaction.id}`,
-      kind: "acp_permission",
-      interaction,
-    });
-  });
-  return items;
-};
+    if (!matched) continue;
 
-export const getVisibleMcpAskDockItems = (
-  messageList: MessageInfo[],
-): McpAskDockItem[] => {
-  // 只看最新一条消息。
-  // 历史消息(componentExecutedList 存在):末项必须是 ASK_QUESTION。
-  // 实时流(componentExecutedList 为空):mcpAskInteractions 由 SSE 即时挂载,有 pending 就显示(对齐 PC)。
-  const latest = getLatestMessage(messageList);
-  if (latest == null) return [];
-  const componentList = (latest as any).componentExecutedList as any[] | null;
-  const isHistory = componentList != null && componentList.length > 0;
-  if (isHistory && getFocusSubEventType(latest) !== "ASK_QUESTION") return [];
-  // 实时流：当前 processingList 长度（对齐 PC focusExecuteId 机制，用于判断 MCP Ask 是否过期）
-  const currentProcessingLength = (!isHistory ? (latest.processingList || []).length : 0);
-  const { toolCallIds: pendingToolCallIds, askRequestIds: pendingAskRequestIds } =
-    getPendingAcpPermissionSuppressIds([latest]);
-  const interactions = filterVisibleMcpAskInteractions(
-    latest.mcpAskInteractions || [],
-    pendingToolCallIds,
-    pendingAskRequestIds,
-  );
-  const items: McpAskDockItem[] = [];
-  interactions.forEach((interaction: McpAskInteraction) => {
-    // 对齐 PC focusExecuteId 机制：实时流下若 processingList 在 MCP Ask 到来后有新增，
-    // 说明 agent 已进入下一步，卡片过期关闭
-    if (!isHistory && interaction.processingListLengthAtAdd !== undefined) {
-      if (currentProcessingLength > interaction.processingListLengthAtAdd) return;
-    }
-    // 对齐 PC hasMcpAskResumeMessage：其他端（如 PC）已回答时，
-    // resume 消息出现在 messageList 中即关闭卡片（PC 答完会发一条 resume 用户消息）
-    if (hasMcpAskResumeMessage(messageList, interaction)) return;
-    items.push({
-      key: `ask:${interaction.requestId}:${interaction.revision || 1}`,
-      kind: "mcp_ask",
-      message: latest,
-      interaction,
-    });
-  });
-  return items;
+    list[msgIndex] = {
+      ...msg,
+      acpPermissionInteractions: nextInteractions,
+    };
+    break;
+  }
+  return list;
 };
 
 export const updateMcpAskInteractionStatusInMessageList = (
@@ -258,4 +224,13 @@ export const removeMcpAskInteractionFromMessageList = (
     break;
   }
   return list;
+};
+
+/** @deprecated 请使用 getActiveInterventionQueue */
+export const getVisibleMcpAskInteractions = (
+  item: MessageInfo,
+): McpAskInteraction[] => {
+  return getActiveInterventionQueue([item])
+    .filter((q) => q.kind === "mcp_ask")
+    .map((q) => (q as McpAskInterventionQueueItem).interaction);
 };

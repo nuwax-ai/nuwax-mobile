@@ -150,9 +150,11 @@ const interventionQueueBadge = computed(() => Math.max(0, activeInterventionQueu
 
 ## 四、过期机制说明
 
-队列逻辑（`getActiveInterventionQueue`）**不再**依赖 `processingListLengthAtAdd` / `latestMessage` 过滤，与 PC 对齐。
+队列逻辑（`getActiveInterventionQueue`）**不按** `executeId` / `focusExecuteId` / `processingListLengthAtAdd` 过滤 pending 项，与 PC `useActiveInterventionQueue` 一致：只要 `responseStatus` 为 `pending` / `submitting` 即进队，避免多步 `processingList` 误关 DockPanel。
 
-`processingListLengthAtAdd` 仍会在 SSE 挂载时写入，供调试与后续扩展；sub 恢复后已审批态主要由 `reconcileAcpPermissionStatus` 根据 `processingList.FINISHED` 判定。
+已审批 / 失效态由 `reconcileAcpPermissionStatus` 在 messageList 更新时标为 `submitted`（依据 `processingList.FINISHED`、跨端 resume 等），队列自动不再展示该项。
+
+`processingListLengthAtAdd` 仍会在 SSE 挂载时写入，供调试与后续扩展。
 
 **注意：** ASK_QUESTION 和 REQUEST_PERMISSION 事件本身**不进** `processingList`（被拦截 return），因此不影响 `processingListLengthAtAdd` 计算。
 
@@ -203,12 +205,10 @@ updateAcpPermissionInteractionStatus(interaction, 'submitting')
 ### 7.2 MCP Ask 提交（`handleMcpAskRespond`）
 
 ```typescript
-// 1. 更新 responseStatus → 'submitting'
-updateMcpAskInteractionStatusInMessageList(messageList, interaction, 'submitting')
-// 2. isConversationActive = true（锁定输入框）
-// 3. 立即从 messageList 移除该 interaction（卡片消失，无需等 API）
-removeMcpAskInteraction(interaction)
-// 4. buildMcpAskResumeMessage → handleSendMessage 将 resume 文本发回会话
+// 1. 更新终态 submitted/cancelled/skipped（不经 submitting）
+// 2. removeMcpAskInteraction
+// 3. buildMcpAskResumeMessage → handleSendMessage（off ChatFinished + abortSub）
+// 注：提交前不主动 cancel/stop，后端已兼容 EXECUTING 态下直接发 resume
 ```
 
 ---
@@ -216,18 +216,13 @@ removeMcpAskInteraction(interaction)
 ## 八、规则速查
 
 ```
-ACP visible  =  responseStatus ∈ {pending, submitting, failed}
-             && !isMessageTerminal
-             && !expired (processingList.length ≤ processingListLengthAtAdd)
-             [history: componentExecutedList last subEventType == REQUEST_PERMISSION]
+ACP in queue =  responseStatus ∈ {pending, submitting}
+             （failed / submitted 不进队；failed 由卡片内状态标签展示，submitted 由 reconcile 关闭）
 
-MCP visible  =  responseStatus ∈ {pending, submitting, failed}
-             && !expired (processingList.length ≤ processingListLengthAtAdd)
+MCP in queue =  responseStatus ∈ {pending, submitting}
              && !hasMcpAskResumeMessage(messageList, interaction)
              && toolCallId ∉ pendingAcpToolCallIds          // ACP 双路抑制
              && requestId  ∉ pendingAskRequestIds
-             [history: componentExecutedList last subEventType == ASK_QUESTION]
-             [NOT affected by isMessageTerminal]
 ```
 
 ---
@@ -236,14 +231,13 @@ MCP visible  =  responseStatus ∈ {pending, submitting, failed}
 
 | 机制 | PC（`useActiveInterventionQueue`） | Mobile（`mcpAskInterventionState.uts`） |
 |---|---|---|
-| 过期检查 | `isExpired(executeId)` vs `focusExecuteId`（processingList 末尾 executeId） | `processingList.length > processingListLengthAtAdd` |
+| 队列过期检查 | 无（pending/submitting 即进队；已应答由 reconcile 标 submitted） | 同左 |
+| 已审批态 reconcile | `reconcileAcpPermissionStatus` | `reconcileAcpPermissionStatusesInMessageList` |
 | 本端提交关闭 | `dismissedMcpAskRequestIds` Set，API 失败可回滚 | `removeMcpAskInteractionFromMessageList`，直接移除 |
 | 跨端感知关闭 | `hasMcpAskResumeMessage`（搜索签名） | 同左 |
 | 历史状态恢复 | `hydrateMcpAskInteractionsInMessageList` | `applyMcpAskResumeStatusesInMessageList` |
 | ACP 抑制 MCP Ask | `permissionPendingToolCallIds` + `permissionPendingAskRequestIds` | 同左 |
-| 卡片渲染方式 | `DockPanel` 堆叠（多卡叠放，最新在前） | ACP + MCP Ask 分列 `v-for` 渲染，同时有值则并排 |
-| ACP 不受 terminal 影响 | ACP 受影响（isMessageTerminal 过滤），MCP Ask 不受 | 同左 |
-| 历史模式判断 | `executeId` 对比（统一使用 focusExecuteId） | `componentExecutedList` 末项 `subEventType` 判断 |
+| 卡片渲染方式 | `DockPanel` FIFO 队首单卡 | `intervention-dock` FIFO 队首单卡 |
 
 ---
 

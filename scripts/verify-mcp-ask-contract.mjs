@@ -106,8 +106,8 @@ assertIncludes(schema, "resolveSchemaVersion", "schemaVersion inference");
 const scopedFiles = [
   "types/intervention.uts",
   "utils/mcpAskSchema.uts",
-  "utils/interventionAdapter.uts",
-  "utils/mcpAskResumeMessage.uts",
+  "subpackages/utils/interventionAdapter.uts",
+  "subpackages/utils/mcpAskResumeMessage.uts",
   "utils/mockInterventionData.uts",
   "subpackages/utils/historyMessageAdapter.uts",
   "components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue",
@@ -128,7 +128,7 @@ for (const file of scopedFiles) {
   }
 }
 
-const adapter = read("utils/interventionAdapter.uts");
+const adapter = read("subpackages/utils/interventionAdapter.uts");
 for (const needle of [
   "data?.rawInput",
   "data?.raw_input",
@@ -202,7 +202,7 @@ for (const needle of [
   assertIncludes(mcpAskInterventionState, needle, "mcp ask state helpers");
 }
 
-const reconcileAcp = read("utils/reconcileAcpPermissionStatus.uts");
+const reconcileAcp = read("subpackages/utils/reconcileAcpPermissionStatus.uts");
 for (const needle of [
   "reconcileAcpPermissionStatusesInMessageList",
   "isIdempotentAcpPermissionResolveError",
@@ -211,7 +211,7 @@ for (const needle of [
   assertIncludes(reconcileAcp, needle, "acp reconcile helpers");
 }
 
-const resume = read("utils/mcpAskResumeMessage.uts");
+const resume = read("subpackages/utils/mcpAskResumeMessage.uts");
 for (const needle of [
   "我已填写「${title}」，表单内容如下：",
   "我取消了「${title}」。",

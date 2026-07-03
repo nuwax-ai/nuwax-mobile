@@ -19,11 +19,13 @@ subpackages/pages/chat-conversation-component/
 ├── layers/AgentDetailService.uts         # SSE 事件处理 + reconcile 挂载
 └── utils/mcpAskInterventionState.uts     # FIFO 队列 getActiveInterventionQueue
 
-utils/
+subpackages/utils/
 ├── interventionAdapter.uts               # SSE 事件识别与提取
 ├── reconcileAcpPermissionStatus.uts      # ACP sub 恢复 reconcile（对齐 PC）
-├── mcpAskSchema.uts
 └── mcpAskResumeMessage.uts
+
+utils/
+└── mcpAskSchema.uts
 
 types/intervention.uts                    # AcpPermissionInteraction / McpAskInteraction 类型定义
 ```
@@ -129,7 +131,7 @@ const interventionQueueBadge = computed(() => Math.max(0, activeInterventionQueu
 
 ### 3.2 sub 流恢复 reconcile
 
-`utils/reconcileAcpPermissionStatus.uts` 在以下时机运行：
+`subpackages/utils/reconcileAcpPermissionStatus.uts` 在以下时机运行：
 
 - `handleChangeMessageList` 每次更新 messageList 后
 - `handleAcpPermissionEvent` / `handleMcpAskEvent` 挂载后

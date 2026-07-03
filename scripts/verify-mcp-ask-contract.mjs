@@ -186,8 +186,9 @@ const conversation = read(
 );
 for (const needle of [
   "buildMcpAskResumeMessage(interaction, payload)",
-  "handleSendMessage({ messageInfo: resumeText })",
-  "mcp-ask-resume-user-display",
+  "messageInfo: resumeText",
+  "files: payload.files",
+  "stripMcpAskResumeDisplayArtifacts",
   'class="intervention-dock"',
   "getActiveInterventionQueue",
   "frontInterventionItem",
@@ -195,6 +196,11 @@ for (const needle of [
 ]) {
   assertIncludes(conversation, needle, "conversation response wiring");
 }
+assertNotIncludes(
+  conversation,
+  "mcp-ask-resume-user-display",
+  "resume user message must use plain text rendering",
+);
 assertNotIncludes(
   conversation,
   "removeMcpAskInteraction(interaction)",
@@ -235,15 +241,7 @@ for (const needle of [
   "field.enumLabels",
   "resolveMcpAskResumeStatus",
   "stripMcpAskResumeDisplayArtifacts",
-  "parseMcpAskResumeDisplayContent",
-  "buildMcpAskResumeTextDisplay",
-  "extractMcpAskResumeImageAttachments",
-  "extractMcpAskResumeDocumentAttachments",
-  "fileUrlToAttachmentFile",
-  "isRemoteImageUrl",
-  "isRemoteFileUrl",
-  "isExtensionlessRemoteUrl",
-  "fileUrls",
+  "extractFileNameFromUrl",
   "hasOrdinalPairedResumeMessage",
   "nuwax-mcp-ask-request-id:",
   "textContainsMcpAskRequestIdMarker",
@@ -257,24 +255,20 @@ assertNotIncludes(
   "resume message build must not append requestId marker",
 );
 
-const resumeDisplay = read(
-  "components/mcp-ask-resume-user-display/mcp-ask-resume-user-display.uvue",
-);
-for (const needle of [
+assertNotIncludes(
+  resume,
   "parseMcpAskResumeDisplayContent",
-  "fileUrlToAttachmentFile",
-  "resume-auth-image",
-  "fileUrls",
-  "imageUrls",
-]) {
-  assertIncludes(resumeDisplay, needle, "resume display component");
-}
-
-assertIncludes(
-  resumeDisplay,
-  "fetchAuthProtectedFileDisplayUrl(url)",
-  "protected resume image preview",
+  "resume message must not include display parsing",
 );
+
+const normalizeForm = read("subpackages/utils/normalizeMcpAskFormData.uts");
+for (const needle of [
+  "extractMcpAskFormAttachments",
+  'field.widget !== "file"',
+  "UploadFileStatus.removed",
+]) {
+  assertIncludes(normalizeForm, needle, "normalize mcp ask form data");
+}
 
 const authFile = read("utils/authProtectedFileUrl.uts");
 for (const needle of [
@@ -305,6 +299,7 @@ for (const needle of [
   "field.otherField",
   "field.multiple",
   "singleFileOnly",
+  "extractMcpAskFormAttachments",
   'answeredBy: { kind: "mobile" }',
 ]) {
   assertIncludes(card, needle, "MCP Ask card");

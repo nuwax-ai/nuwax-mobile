@@ -8,7 +8,10 @@
  * "我跳过了「${title}」。"
  * "「${title}」已超时，没有收到表单答案。"
  */
-import type { AttachmentFile, MessageInfo } from "@/types/interfaces/conversationInfo.uts";
+import type {
+  AttachmentFile,
+  MessageInfo,
+} from "@/types/interfaces/conversationInfo.uts";
 import { AssistantRoleEnum } from "@/types/enums/agent.uts";
 import type {
   McpAskInteraction,
@@ -34,9 +37,7 @@ export interface McpAskResumeMatchOptions {
 export function sortMessagesByConversationIndex(
   messages: MessageInfo[],
 ): MessageInfo[] {
-  return [...(messages || [])].sort(
-    (a, b) => (a.index ?? 0) - (b.index ?? 0),
-  );
+  return [...(messages || [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 }
 
 function readMessageOrdinal(message: MessageInfo, fallback = 0): number {
@@ -75,8 +76,7 @@ export type McpAskResumeDisplayContent = {
   fields?: McpAskResumeDisplayField[];
 };
 
-const REMOTE_IMAGE_URL_RE =
-  /\.(png|jpe?g|gif|webp|bmp|svg|avif)(\?|#|$)/i;
+const REMOTE_IMAGE_URL_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif)(\?|#|$)/i;
 
 const MCP_ASK_SUBMITTED_PREAMBLE_RE =
   /^(我已填写「.+」|我已填寫「.+」|I filled out ".+"\.?|I answered ".+"\.)/i;
@@ -407,7 +407,9 @@ function formatFileFieldDisplayValue(value: unknown): string {
     if (value.length === 0) {
       return notFilled;
     }
-    return value.map((item: unknown): string => formatSingle(item)).join(listSeparator);
+    return value
+      .map((item: unknown): string => formatSingle(item))
+      .join(listSeparator);
   }
 
   return formatSingle(value);
@@ -541,8 +543,8 @@ function messageMatchesAnyResumeSignature(
   }
   const actions = ["submit", "cancel", "skip", "timeout"];
   return actions.some((action: string): boolean =>
-    collectResumeMessageSignatures(title, action).some((signature: string): boolean =>
-      text.includes(signature),
+    collectResumeMessageSignatures(title, action).some(
+      (signature: string): boolean => text.includes(signature),
     ),
   );
 }
@@ -550,8 +552,19 @@ function messageMatchesAnyResumeSignature(
 function collectSameTitleAskOrdinals(
   sortedMessages: MessageInfo[],
   title: string,
-): Array<{ ordinal: number; requestId: string }> {
-  const entries: Array<{ ordinal: number; requestId: string }> = [];
+): Array<{
+  ordinal: number;
+  sequence: number;
+  requestId: string;
+  resolved: boolean;
+}> {
+  const entries: Array<{
+    ordinal: number;
+    sequence: number;
+    requestId: string;
+    resolved: boolean;
+  }> = [];
+  let sequence = 0;
 
   sortedMessages.forEach((message: MessageInfo, messageIndex: number) => {
     const ordinal = readMessageOrdinal(message, messageIndex);
@@ -559,39 +572,57 @@ function collectSameTitleAskOrdinals(
       if (getMcpAskResumeTitle(item) !== title) {
         return;
       }
-      entries.push({ ordinal, requestId: item.requestId });
+      const responseStatus = item.responseStatus ?? "pending";
+      entries.push({
+        ordinal,
+        sequence: sequence++,
+        requestId: item.requestId,
+        resolved:
+          responseStatus !== "pending" && responseStatus !== "submitting",
+      });
     });
   });
 
   return entries.sort(
-    (left, right): number => left.ordinal - right.ordinal,
+    (left, right): number =>
+      left.ordinal - right.ordinal || left.sequence - right.sequence,
   );
 }
 
 function collectSameTitleResumeOrdinals(
   sortedMessages: MessageInfo[],
   title: string,
-): number[] {
-  const ordinals: number[] = [];
+): Array<{ ordinal: number; sequence: number }> {
+  const entries: Array<{ ordinal: number; sequence: number }> = [];
 
   sortedMessages.forEach((message: MessageInfo, messageIndex: number) => {
-    if (
-      message.role !== undefined &&
-      message.role !== AssistantRoleEnum.USER
-    ) {
+    if (message.role !== undefined && message.role !== AssistantRoleEnum.USER) {
       return;
     }
     const text = message.text;
-    if (!messageMatchesAnyResumeSignature(text, title)) {
+    if (
+      !text ||
+      messageHasForeignRequestIdMarker(text) ||
+      !messageMatchesAnyResumeSignature(text, title)
+    ) {
       return;
     }
-    ordinals.push(readMessageOrdinal(message, messageIndex));
+    entries.push({
+      ordinal: readMessageOrdinal(message, messageIndex),
+      sequence: messageIndex,
+    });
   });
 
-  return ordinals.sort((left: number, right: number): number => left - right);
+  return entries.sort(
+    (left, right): number =>
+      left.ordinal - right.ordinal || left.sequence - right.sequence,
+  );
 }
 
-/** 同 title 多次询问时，按消息顺序将第 N 次 ask 与第 N 条 resume 配对。 */
+/**
+ * 同 title 多次询问时，将无 marker 的 resume 配给它之前最可信的 ask：
+ * 已有终态的 ask 优先，否则取位置最近的未配对 ask。
+ */
 function hasOrdinalPairedResumeMessage(
   sortedMessages: MessageInfo[],
   interaction: McpAskInteraction,
@@ -599,26 +630,38 @@ function hasOrdinalPairedResumeMessage(
   const title = getMcpAskResumeTitle(interaction);
   const asks = collectSameTitleAskOrdinals(sortedMessages, title);
   const resumes = collectSameTitleResumeOrdinals(sortedMessages, title);
-  const askIndex = asks.findIndex(
+  const targetAsk = asks.find(
     (entry): boolean => entry.requestId === interaction.requestId,
   );
-
-  if (askIndex < 0 || askIndex >= resumes.length) {
+  if (!targetAsk) {
     return false;
   }
 
-  const askOrdinal = asks[askIndex].ordinal;
-  const resumeOrdinal = resumes[askIndex];
+  const pairedRequestIds = new Set<string>();
+  resumes.forEach((resume) => {
+    const candidates = asks.filter(
+      (ask): boolean =>
+        !pairedRequestIds.has(ask.requestId) &&
+        (ask.ordinal < resume.ordinal ||
+          (ask.ordinal === resume.ordinal && ask.sequence <= resume.sequence)),
+    );
+    if (candidates.length === 0) {
+      return;
+    }
 
-  if (resumeOrdinal > askOrdinal) {
+    const resolvedCandidate = candidates.find((ask): boolean => ask.resolved);
+    const selectedAsk = resolvedCandidate ?? candidates[candidates.length - 1];
+    pairedRequestIds.add(selectedAsk.requestId);
+  });
+
+  if (pairedRequestIds.has(targetAsk.requestId)) {
     return true;
   }
 
   return (
-    askIndex === 0 &&
     asks.length === 1 &&
     resumes.length === 1 &&
-    resumeOrdinal < askOrdinal
+    resumes[0].ordinal < targetAsk.ordinal
   );
 }
 
@@ -645,27 +688,11 @@ function matchesLegacyTitleResumeMessage(
 
 function shouldBlockLegacyTitleMatch(
   sortedMessages: MessageInfo[],
-  containingMessage: MessageInfo | undefined,
-  containingOrdinal: number | undefined,
   interaction: McpAskInteraction,
 ): boolean {
-  if (!containingMessage || containingOrdinal === undefined) {
-    return false;
-  }
   const title = getMcpAskResumeTitle(interaction);
 
   return sortedMessages.some((message: MessageInfo): boolean => {
-    const ordinal = readMessageOrdinal(message, 0);
-    const isEarlier = ordinal < containingOrdinal;
-    const isSameMessage =
-      (containingMessage.id !== undefined &&
-        message.id === containingMessage.id) ||
-      (containingMessage.index !== undefined &&
-        message.index === containingMessage.index);
-    if (!isEarlier && !isSameMessage) {
-      return false;
-    }
-
     return (message.mcpAskInteractions ?? []).some(
       (item: McpAskInteraction): boolean =>
         item.requestId !== interaction.requestId &&
@@ -792,12 +819,16 @@ export function resolveMcpAskResumeStatus(
   const title = getMcpAskResumeTitle(interaction);
 
   if (
-    collectResumeMessageSignatures(title, "submit").some((s) => text.includes(s))
+    collectResumeMessageSignatures(title, "submit").some((s) =>
+      text.includes(s),
+    )
   ) {
     return "submitted";
   }
   if (
-    collectResumeMessageSignatures(title, "cancel").some((s) => text.includes(s))
+    collectResumeMessageSignatures(title, "cancel").some((s) =>
+      text.includes(s),
+    )
   ) {
     return "cancelled";
   }
@@ -848,14 +879,7 @@ export function hasMcpAskResumeMessage(
     return true;
   }
 
-  if (
-    shouldBlockLegacyTitleMatch(
-      sortedMessages,
-      containingMessage,
-      containingOrdinal,
-      interaction,
-    )
-  ) {
+  if (shouldBlockLegacyTitleMatch(sortedMessages, interaction)) {
     return false;
   }
 
@@ -867,7 +891,11 @@ export function hasMcpAskResumeMessage(
       (message: MessageInfo): boolean =>
         readMessageOrdinal(message, 0) > containingOrdinal,
     );
-    if (afterMessages.some((message: MessageInfo): boolean => matchesLegacy(message.text))) {
+    if (
+      afterMessages.some((message: MessageInfo): boolean =>
+        matchesLegacy(message.text),
+      )
+    ) {
       return true;
     }
 

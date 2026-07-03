@@ -218,9 +218,14 @@ for (const needle of [
   "我跳过了「${title}」。",
   "「${title}」已超时，没有收到表单答案。",
   'field.widget === "radio-with-custom"',
+  'field.widget === "file"',
   "field.enumValues",
   "field.enumLabels",
   "resolveMcpAskResumeStatus",
+  "stripMcpAskResumeDisplayArtifacts",
+  "nuwax-mcp-ask-request-id:",
+  "textContainsMcpAskRequestIdMarker",
+  "appendMcpAskRequestIdMarker",
 ]) {
   assertIncludes(resume, needle, "resume message");
 }

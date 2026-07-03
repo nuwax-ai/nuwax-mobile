@@ -25,6 +25,22 @@ const parseJSON = (value: string, fallback: any): any => {
   }
 };
 
+// UTS: JSON.parse / 服务端返回的字典运行时是 UTSJSONObject，
+// 但本模块按 Record<string,string>(Map-backed) 使用，`(x as Map)` 会抛 CCE。
+// 用 UTSJSONObject.keys() 枚举键 + 方括号取值，构造真实 Map<string,string>。
+const toLangMap = (obj: any): Record<string, string> => {
+  const m = new Map<string, string>();
+  if (obj == null) return m as Record<string, string>;
+  const o = obj as UTSJSONObject;
+  const keys = UTSJSONObject.keys(o);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const v = o[k];
+    m.set(k, v != null ? `${v}` : "");
+  }
+  return m as Record<string, string>;
+};
+
 const isH5Platform = (): boolean => {
   // #ifdef H5 || WEB
   return true;
@@ -102,8 +118,14 @@ const setStoredLangList = (langList: I18nLangDto[]) => {
 const getCachedLangMap = (): Record<string, string> => {
   const _rawText = uni.getStorageSync(I18N_LANG_MAP_STORAGE_KEY);
   const text = (_rawText != null ? _rawText : "") as string;
-  const fallback = new Map<string, string>() as Record<string, string>;
-  return parseJSON(text, fallback) as Record<string, string>;
+  if (text.length == 0) return new Map<string, string>() as Record<string, string>;
+  try {
+    const parsed = JSON.parse<UTSJSONObject>(text);
+    if (parsed == null) return new Map<string, string>() as Record<string, string>;
+    return toLangMap(parsed);
+  } catch (e) {
+    return new Map<string, string>() as Record<string, string>;
+  }
 };
 
 const getCachedLangList = (): I18nLangDto[] => {
@@ -189,7 +211,7 @@ const fetchLangList = async (): Promise<I18nLangDto[]> => {
   if (isH5Platform() || isMpWeixinPlatform() || isAppPlatform()) {
     try {
       const res = await apiI18nLangList();
-      if (res?.code === SUCCESS_CODE && Array.isArray(res?.data)) {
+      if (res?.code == SUCCESS_CODE && Array.isArray(res?.data)) {
         const sortedList = sortLangList(res.data);
         setStoredLangList(sortedList);
         return sortedList;
@@ -204,7 +226,7 @@ const fetchLangList = async (): Promise<I18nLangDto[]> => {
 async function fetchLangMap(lang: string = "", active: boolean = false): Promise<Record<string, string>> {
   // 允许在 H5、微信小程序和 APP 环境调用接口
   if (!isH5Platform() && !isMpWeixinPlatform() && !isAppPlatform()) {
-    return {};
+    return new Map<string, string>() as Record<string, string>;
   }
 
   // 仅在主动切换 (active=true) 且有有效 lang 时才透传给后端，
@@ -213,14 +235,18 @@ async function fetchLangMap(lang: string = "", active: boolean = false): Promise
   try {
     // lang 为空时由后端按已保存语言/命中逻辑返回对应词典
     const res = await apiI18nQuery(targetLang);
-    // 只有成功且有数据才返回数据，其余（失败、异常、data=null）统统返回空对象以触发兜底逻辑
-    if (res?.code === SUCCESS_CODE && res?.data != null) {
-      return res.data;
+    // apiI18nQuery 返回 RequestResponse<UTSJSONObject>(避开 Map 反序列化 100003)，
+    // res.data 是服务端词典对象(UTSJSONObject)。必须 toLangMap 转真实 Map：
+    // 直接赋给 langMap(Record/Map-backed)，后续 `(langMap as Map).size` 会抛 CCE。
+    if (res != null && res.code == SUCCESS_CODE && res.data != null) {
+      return toLangMap(res.data);
     }
   } catch (error) {
     console.error("fetchLangMap failed:", error);
   }
-  return {};
+  // 注意：不能 `return {}`——UTS 里 {} 运行时是 UTSJSONObject，
+  // 后续 `(langMap as Map).size` 会抛 CCE。必须返回真实空 Map。
+  return new Map<string, string>() as Record<string, string>;
 }
 
 export const bootstrapI18nCache = () => {
@@ -313,70 +339,44 @@ export const applyTabBarI18n = () => {
   });
 };
 
-export async function loadI18n(active: boolean = false) {
-  if (loadI18nTask != null) {
-    await loadI18nTask;
-    return;
-  }
-
-    loadI18nTask = (async () => {
-    i18nState.loading = true;
-    try {
-      const initLang = pickLangForInit();
-      let targetLang = initLang;
-
-      // 如果翻译包为空（接口失败或返回 null），统一强制回退到本地英语态作为安全兜底
-      i18nState.currentLang = normalizeLang(targetLang);
-      const langMap = await fetchLangMap(targetLang, active);
-
-      // 如果翻译包为空（接口失败或返回 null），且非中文环境，统一回退到本地英语态作为安全兜底
-      if ((langMap as Map<string, string>).size == 0 && !targetLang.toLowerCase().startsWith("zh")) {
-        i18nState.currentLang = normalizeLang("en-us");
-        i18nState.langMap = new Map<string, string>() as Record<string, string>;
-      } else {
-        i18nState.currentLang = normalizeLang(targetLang);
-        i18nState.langMap = langMap;
-      }
-
-      i18nState.loaded = true;
-      setStoredLang(i18nState.currentLang != null ? (i18nState.currentLang as string) : "");
-      setStoredLangMap(i18nState.langMap as Record<string, string>);
-      syncThirdPartyLocales(i18nState.currentLang as string);
-      applyTabBarI18n();
-    } finally {
-      i18nState.loading = false;
-    }
-  })();
-
+// UTS 陷阱：async IIFE `(async()=>{})()` 与 `task=asyncFn(); await task` 模式都可能
+// 触发 "kotlin.Unit cannot be cast to UTSPromise"。用最简结构：单 async 函数直接 await，
+// 不引入 loadI18nTask 中间变量/嵌套函数（放弃并发去重；loadI18n 启动时仅调一次）。
+export async function loadI18n(active: boolean = false): Promise<void> {
+  i18nState.loading = true;
   try {
-    await loadI18nTask;
+    const initLang = pickLangForInit();
+    const targetLang = initLang;
+    i18nState.currentLang = normalizeLang(targetLang);
+    const langMap = await fetchLangMap(targetLang, active);
+    // 翻译包为空且非中文环境 → 统一回退本地英语态作安全兜底
+    if ((langMap as Map<string, string>).size == 0 && !targetLang.toLowerCase().startsWith("zh")) {
+      i18nState.currentLang = normalizeLang("en-us");
+      i18nState.langMap = new Map<string, string>() as Record<string, string>;
+    } else {
+      i18nState.currentLang = normalizeLang(targetLang);
+      i18nState.langMap = langMap;
+    }
+    i18nState.loaded = true;
+    setStoredLang(i18nState.currentLang != null ? (i18nState.currentLang as string) : "");
+    setStoredLangMap(i18nState.langMap as Record<string, string>);
+    syncThirdPartyLocales(i18nState.currentLang as string);
+    applyTabBarI18n();
   } finally {
-    loadI18nTask = null;
+    i18nState.loading = false;
   }
 }
 
 /**
  * 确保语言列表已加载（按需加载）
  */
-export const ensureLangList = async () => {
-  if (loadLangListTask != null) {
-    await loadLangListTask;
-    return;
-  }
-
-  loadLangListTask = (async () => {
-    try {
-      const list = await fetchLangList();
-      i18nState.langList = list;
-    } catch (error) {
-      console.error("ensureLangList failed:", error);
-    }
-  })();
-
+// 同 loadI18n：最简单 async 结构，避免 task 中间变量引发的 UTSPromise 陷阱。
+export const ensureLangList = async (): Promise<void> => {
   try {
-    await loadLangListTask;
-  } finally {
-    loadLangListTask = null;
+    const list = await fetchLangList();
+    i18nState.langList = list;
+  } catch (error) {
+    console.error("ensureLangList failed:", error);
   }
 };
 
@@ -391,12 +391,12 @@ export const setLanguage = async (lang: string): Promise<boolean> => {
     const queryResult = await apiI18nQuery(targetLang);
 
     // 接口请求失败或业务码错误，执行统一英语兜底
-    if (queryResult == null || queryResult.code !== SUCCESS_CODE || queryResult.data == null) {
+    if (queryResult == null || queryResult.code != SUCCESS_CODE || queryResult.data == null) {
       i18nState.currentLang = normalizeLang("en-us");
       i18nState.langMap = new Map<string, string>() as Record<string, string>;
     } else {
       i18nState.currentLang = targetLang;
-      i18nState.langMap = queryResult.data;
+      i18nState.langMap = toLangMap(queryResult.data);
     }
 
     setStoredLang(i18nState.currentLang != null ? (i18nState.currentLang as string) : "");
@@ -423,7 +423,7 @@ export async function syncLanguageFromUser(
   const userLang = normalizeLang(lang);
   if (userLang.length == 0) return;
 
-  if (userLang === normalizeLang(i18nState.currentLang as string)) {
+  if (userLang == normalizeLang(i18nState.currentLang as string)) {
     setStoredLang(userLang);
     const langMapSize = i18nState.langMap != null ? (i18nState.langMap as Map<string, string>).size : 0;
     if (langMapSize == 0) {

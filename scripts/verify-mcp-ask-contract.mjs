@@ -178,8 +178,9 @@ const conversation = read(
 );
 for (const needle of [
   "buildMcpAskResumeMessage(interaction, payload)",
-  "service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat)",
+  "handleSendMessage({ messageInfo: resumeText })",
   "removeMcpAskInteraction(interaction)",
+  "mcp-ask-resume-user-display",
   "class=\"intervention-dock\"",
   "getActiveInterventionQueue",
   "frontInterventionItem",
@@ -223,11 +224,49 @@ for (const needle of [
   "field.enumLabels",
   "resolveMcpAskResumeStatus",
   "stripMcpAskResumeDisplayArtifacts",
+  "parseMcpAskResumeDisplayContent",
+  "buildMcpAskResumeTextDisplay",
+  "extractMcpAskResumeImageAttachments",
+  "extractMcpAskResumeDocumentAttachments",
+  "fileUrlToAttachmentFile",
+  "isRemoteImageUrl",
+  "isRemoteFileUrl",
+  "isExtensionlessRemoteUrl",
+  "fileUrls",
+  "hasOrdinalPairedResumeMessage",
   "nuwax-mcp-ask-request-id:",
   "textContainsMcpAskRequestIdMarker",
-  "appendMcpAskRequestIdMarker",
+  "buildMcpAskRequestIdMarker",
 ]) {
   assertIncludes(resume, needle, "resume message");
+}
+assertNotIncludes(
+  resume,
+  "return appendMcpAskRequestIdMarker(message, requestId)",
+  "resume message build must not append requestId marker",
+);
+
+const resumeDisplay = read(
+  "components/mcp-ask-resume-user-display/mcp-ask-resume-user-display.uvue",
+);
+for (const needle of [
+  "parseMcpAskResumeDisplayContent",
+  "fileUrlToAttachmentFile",
+  "resume-auth-image",
+  "fileUrls",
+  "imageUrls",
+]) {
+  assertIncludes(resumeDisplay, needle, "resume display component");
+}
+
+const authFile = read("utils/authProtectedFileUrl.uts");
+for (const needle of [
+  "isAuthProtectedFileUrl",
+  "fetchAuthProtectedFileDisplayUrl",
+  "openRemoteFileUrl",
+  "AUTH_PROTECTED_FILE_PATH_RE",
+]) {
+  assertIncludes(authFile, needle, "auth protected file util");
 }
 
 const card = read("components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue");

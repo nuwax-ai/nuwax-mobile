@@ -90,11 +90,19 @@ assertIncludes(
   "Math.floor((record as any).revision)",
   "positive integer revision validation",
 );
-assertIncludes(interventionTypes, '"radio-with-custom"', "radio-with-custom widget in whitelist");
+assertIncludes(
+  interventionTypes,
+  '"radio-with-custom"',
+  "radio-with-custom widget in whitelist",
+);
 assertIncludes(interventionTypes, '"file"', "file widget in whitelist");
 assertIncludes(interventionTypes, '"number"', "number widget in whitelist");
 assertIncludes(schema, "MCP_ASK_WIDGET_TYPES", "widget whitelist constant");
-assertIncludes(schema, "getJsonSchemaPrimaryType", "json schema primary type helper");
+assertIncludes(
+  schema,
+  "getJsonSchemaPrimaryType",
+  "json schema primary type helper",
+);
 assertIncludes(schema, "getInteractionSteps", "wizard steps helper");
 assertIncludes(
   schema,
@@ -178,15 +186,20 @@ const conversation = read(
 );
 for (const needle of [
   "buildMcpAskResumeMessage(interaction, payload)",
-  "service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat)",
-  "removeMcpAskInteraction(interaction)",
-  "class=\"intervention-dock\"",
+  "handleSendMessage({ messageInfo: resumeText })",
+  "mcp-ask-resume-user-display",
+  'class="intervention-dock"',
   "getActiveInterventionQueue",
   "frontInterventionItem",
   "interventionQueueBadge",
 ]) {
   assertIncludes(conversation, needle, "conversation response wiring");
 }
+assertNotIncludes(
+  conversation,
+  "removeMcpAskInteraction(interaction)",
+  "resolved MCP Ask interactions must be retained for resume pairing",
+);
 
 const mcpAskInterventionState = read(
   "subpackages/pages/chat-conversation-component/utils/mcpAskInterventionState.uts",
@@ -194,7 +207,6 @@ const mcpAskInterventionState = read(
 for (const needle of [
   "getActiveInterventionQueue",
   "getVisibleMcpAskInteractions",
-  "removeMcpAskInteractionFromMessageList",
   "updateMcpAskInteractionStatusInMessageList",
   "updateAcpPermissionInteractionStatusInMessageList",
   "(item.revision || 1) === revision",
@@ -223,14 +235,62 @@ for (const needle of [
   "field.enumLabels",
   "resolveMcpAskResumeStatus",
   "stripMcpAskResumeDisplayArtifacts",
+  "parseMcpAskResumeDisplayContent",
+  "buildMcpAskResumeTextDisplay",
+  "extractMcpAskResumeImageAttachments",
+  "extractMcpAskResumeDocumentAttachments",
+  "fileUrlToAttachmentFile",
+  "isRemoteImageUrl",
+  "isRemoteFileUrl",
+  "isExtensionlessRemoteUrl",
+  "fileUrls",
+  "hasOrdinalPairedResumeMessage",
   "nuwax-mcp-ask-request-id:",
   "textContainsMcpAskRequestIdMarker",
-  "appendMcpAskRequestIdMarker",
+  "buildMcpAskRequestIdMarker",
 ]) {
   assertIncludes(resume, needle, "resume message");
 }
+assertNotIncludes(
+  resume,
+  "return appendMcpAskRequestIdMarker(message, requestId)",
+  "resume message build must not append requestId marker",
+);
 
-const card = read("components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue");
+const resumeDisplay = read(
+  "components/mcp-ask-resume-user-display/mcp-ask-resume-user-display.uvue",
+);
+for (const needle of [
+  "parseMcpAskResumeDisplayContent",
+  "fileUrlToAttachmentFile",
+  "resume-auth-image",
+  "fileUrls",
+  "imageUrls",
+]) {
+  assertIncludes(resumeDisplay, needle, "resume display component");
+}
+
+assertIncludes(
+  resumeDisplay,
+  "fetchAuthProtectedFileDisplayUrl(url)",
+  "protected resume image preview",
+);
+
+const authFile = read("utils/authProtectedFileUrl.uts");
+for (const needle of [
+  "isAuthProtectedFileUrl",
+  "fetchAuthProtectedFileDisplayUrl",
+  "openRemoteFileUrl",
+  "AUTH_PROTECTED_FILE_PATH_RE",
+  'header["Authorization"] = `Bearer ${token}`',
+  "MP || APP-PLUS || APP-ANDROID || APP-IOS",
+]) {
+  assertIncludes(authFile, needle, "auth protected file util");
+}
+
+const card = read(
+  "components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue",
+);
 for (const needle of [
   "visibleFields",
   "isWizard",

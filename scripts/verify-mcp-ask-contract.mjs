@@ -90,11 +90,19 @@ assertIncludes(
   "Math.floor((record as any).revision)",
   "positive integer revision validation",
 );
-assertIncludes(interventionTypes, '"radio-with-custom"', "radio-with-custom widget in whitelist");
+assertIncludes(
+  interventionTypes,
+  '"radio-with-custom"',
+  "radio-with-custom widget in whitelist",
+);
 assertIncludes(interventionTypes, '"file"', "file widget in whitelist");
 assertIncludes(interventionTypes, '"number"', "number widget in whitelist");
 assertIncludes(schema, "MCP_ASK_WIDGET_TYPES", "widget whitelist constant");
-assertIncludes(schema, "getJsonSchemaPrimaryType", "json schema primary type helper");
+assertIncludes(
+  schema,
+  "getJsonSchemaPrimaryType",
+  "json schema primary type helper",
+);
 assertIncludes(schema, "getInteractionSteps", "wizard steps helper");
 assertIncludes(
   schema,
@@ -106,8 +114,8 @@ assertIncludes(schema, "resolveSchemaVersion", "schemaVersion inference");
 const scopedFiles = [
   "types/intervention.uts",
   "utils/mcpAskSchema.uts",
-  "utils/interventionAdapter.uts",
-  "utils/mcpAskResumeMessage.uts",
+  "subpackages/utils/interventionAdapter.uts",
+  "subpackages/utils/mcpAskResumeMessage.uts",
   "utils/mockInterventionData.uts",
   "subpackages/utils/historyMessageAdapter.uts",
   "components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue",
@@ -128,7 +136,7 @@ for (const file of scopedFiles) {
   }
 }
 
-const adapter = read("utils/interventionAdapter.uts");
+const adapter = read("subpackages/utils/interventionAdapter.uts");
 for (const needle of [
   "data?.rawInput",
   "data?.raw_input",
@@ -178,15 +186,26 @@ const conversation = read(
 );
 for (const needle of [
   "buildMcpAskResumeMessage(interaction, payload)",
-  "service.handleSendMessage({ messageInfo: resumeText }, props.isTempChat)",
-  "removeMcpAskInteraction(interaction)",
-  "class=\"intervention-dock\"",
+  "messageInfo: resumeText",
+  "files: payload.files",
+  "stripMcpAskResumeDisplayArtifacts",
+  'class="intervention-dock"',
   "getActiveInterventionQueue",
   "frontInterventionItem",
   "interventionQueueBadge",
 ]) {
   assertIncludes(conversation, needle, "conversation response wiring");
 }
+assertNotIncludes(
+  conversation,
+  "mcp-ask-resume-user-display",
+  "resume user message must use plain text rendering",
+);
+assertNotIncludes(
+  conversation,
+  "removeMcpAskInteraction(interaction)",
+  "resolved MCP Ask interactions must be retained for resume pairing",
+);
 
 const mcpAskInterventionState = read(
   "subpackages/pages/chat-conversation-component/utils/mcpAskInterventionState.uts",
@@ -194,7 +213,6 @@ const mcpAskInterventionState = read(
 for (const needle of [
   "getActiveInterventionQueue",
   "getVisibleMcpAskInteractions",
-  "removeMcpAskInteractionFromMessageList",
   "updateMcpAskInteractionStatusInMessageList",
   "updateAcpPermissionInteractionStatusInMessageList",
   "(item.revision || 1) === revision",
@@ -202,7 +220,7 @@ for (const needle of [
   assertIncludes(mcpAskInterventionState, needle, "mcp ask state helpers");
 }
 
-const reconcileAcp = read("utils/reconcileAcpPermissionStatus.uts");
+const reconcileAcp = read("subpackages/utils/reconcileAcpPermissionStatus.uts");
 for (const needle of [
   "reconcileAcpPermissionStatusesInMessageList",
   "isIdempotentAcpPermissionResolveError",
@@ -211,21 +229,62 @@ for (const needle of [
   assertIncludes(reconcileAcp, needle, "acp reconcile helpers");
 }
 
-const resume = read("utils/mcpAskResumeMessage.uts");
+const resume = read("subpackages/utils/mcpAskResumeMessage.uts");
 for (const needle of [
   "我已填写「${title}」，表单内容如下：",
   "我取消了「${title}」。",
   "我跳过了「${title}」。",
   "「${title}」已超时，没有收到表单答案。",
   'field.widget === "radio-with-custom"',
+  'field.widget === "file"',
   "field.enumValues",
   "field.enumLabels",
   "resolveMcpAskResumeStatus",
+  "stripMcpAskResumeDisplayArtifacts",
+  "extractFileNameFromUrl",
+  "hasOrdinalPairedResumeMessage",
+  "nuwax-mcp-ask-request-id:",
+  "textContainsMcpAskRequestIdMarker",
+  "buildMcpAskRequestIdMarker",
 ]) {
   assertIncludes(resume, needle, "resume message");
 }
+assertNotIncludes(
+  resume,
+  "return appendMcpAskRequestIdMarker(message, requestId)",
+  "resume message build must not append requestId marker",
+);
 
-const card = read("components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue");
+assertNotIncludes(
+  resume,
+  "parseMcpAskResumeDisplayContent",
+  "resume message must not include display parsing",
+);
+
+const normalizeForm = read("subpackages/utils/normalizeMcpAskFormData.uts");
+for (const needle of [
+  "extractMcpAskFormAttachments",
+  'field.widget !== "file"',
+  "UploadFileStatus.removed",
+]) {
+  assertIncludes(normalizeForm, needle, "normalize mcp ask form data");
+}
+
+const authFile = read("utils/authProtectedFileUrl.uts");
+for (const needle of [
+  "isAuthProtectedFileUrl",
+  "fetchAuthProtectedFileDisplayUrl",
+  "openRemoteFileUrl",
+  "AUTH_PROTECTED_FILE_PATH_RE",
+  'header["Authorization"] = `Bearer ${token}`',
+  "MP || APP-PLUS || APP-ANDROID || APP-IOS",
+]) {
+  assertIncludes(authFile, needle, "auth protected file util");
+}
+
+const card = read(
+  "components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue",
+);
 for (const needle of [
   "visibleFields",
   "isWizard",
@@ -240,6 +299,7 @@ for (const needle of [
   "field.otherField",
   "field.multiple",
   "singleFileOnly",
+  "extractMcpAskFormAttachments",
   'answeredBy: { kind: "mobile" }',
 ]) {
   assertIncludes(card, needle, "MCP Ask card");

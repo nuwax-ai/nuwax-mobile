@@ -1,0 +1,180 @@
+/**
+ * ACP 权限审批状态 reconcile（对齐 nuwax PC reconcileAcpPermissionStatus.ts）
+ * 用于 sub 流重放、跨端审批后将会话内 pending 标为 submitted。
+ */
+import type { MessageInfo } from "@/types/interfaces/conversationInfo.uts";
+import type { ProcessingInfo } from "@/types/interfaces/conversationInfo.uts";
+import type {
+  AcpPermissionInteraction,
+  McpAskInteraction,
+} from "@/types/intervention";
+import { ProcessingEnum } from "@/types/enums/common";
+import { hasMcpAskResumeMessage } from "@/subpackages/utils/mcpAskResumeMessage.uts";
+import { MCP_ASK_TOOL_NAME } from "@/types/intervention";
+
+function readMcpAskRequestId(rawInput: any): string | undefined {
+  if (!rawInput || typeof rawInput !== "object") return undefined;
+  const id = (rawInput as any).requestId;
+  return typeof id === "string" && id ? id : undefined;
+}
+
+function getToolCallId(
+  interaction: AcpPermissionInteraction,
+): string | undefined {
+  return interaction.request?.toolCall?.toolCallId;
+}
+
+function isProcessingFinishedForTool(
+  processingList: ProcessingInfo[] | undefined,
+  toolCallId: string,
+  permissionExecuteId?: string,
+): boolean {
+  if (!processingList || processingList.length === 0) return false;
+
+  for (let i = 0; i < processingList.length; i++) {
+    const item = processingList[i];
+    if (item.status !== ProcessingEnum.FINISHED) continue;
+
+    if (permissionExecuteId && item.executeId === permissionExecuteId) {
+      return true;
+    }
+    if (item.executeId === toolCallId) {
+      return true;
+    }
+
+    const result = item.result as any;
+    const input = result?.input;
+    if (input && typeof input === "object") {
+      const matchedId = input.toolCallId ?? input.tool_call_id;
+      if (matchedId === toolCallId) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function buildMcpAskInteractionFromRawInput(
+  rawInput: any,
+  toolCallId: string,
+): McpAskInteraction | null {
+  if (!rawInput || typeof rawInput !== "object") return null;
+  const requestId = readMcpAskRequestId(rawInput);
+  const title = typeof rawInput.title === "string" ? rawInput.title : undefined;
+  const ui = rawInput.ui;
+  if (!requestId || !title || !ui || typeof ui !== "object") {
+    return null;
+  }
+
+  return {
+    toolName: MCP_ASK_TOOL_NAME,
+    schemaVersion: "nuwax.mcp_ask.v2",
+    requestId,
+    revision: 1,
+    sessionId: "",
+    title,
+    ui: ui as McpAskInteraction["ui"],
+    toolCallId,
+    responseStatus: "pending",
+  };
+}
+
+function shouldMarkAcpPermissionSubmitted(
+  interaction: AcpPermissionInteraction,
+  message: MessageInfo,
+  contextMessageList: MessageInfo[],
+): boolean {
+  const status = interaction.responseStatus ?? "pending";
+  if (status === "submitted" || status === "failed") {
+    return false;
+  }
+
+  const toolCallId = getToolCallId(interaction);
+  if (
+    toolCallId &&
+    isProcessingFinishedForTool(
+      message.processingList,
+      toolCallId,
+      interaction.executeId,
+    )
+  ) {
+    return true;
+  }
+
+  const rawInput = interaction.request?.toolCall?.rawInput;
+  if (toolCallId && readMcpAskRequestId(rawInput)) {
+    const syntheticAsk = buildMcpAskInteractionFromRawInput(
+      rawInput,
+      toolCallId,
+    );
+    if (
+      syntheticAsk &&
+      hasMcpAskResumeMessage(contextMessageList, syntheticAsk)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/** 单条消息内 ACP 审批 reconcile */
+export function reconcileMessageAcpPermissionStatuses(
+  message: MessageInfo,
+  contextMessageList?: MessageInfo[],
+): MessageInfo {
+  const interactions = message.acpPermissionInteractions;
+  if (!interactions || interactions.length === 0) {
+    return message;
+  }
+
+  const context = contextMessageList ?? [message];
+  let changed = false;
+  const nextInteractions = interactions.map(
+    (interaction: AcpPermissionInteraction) => {
+      if (
+        !shouldMarkAcpPermissionSubmitted(interaction, message, context)
+      ) {
+        return interaction;
+      }
+      changed = true;
+      return {
+        ...interaction,
+        responseStatus: "submitted" as const,
+      };
+    },
+  );
+
+  if (!changed) return message;
+
+  return {
+    ...message,
+    acpPermissionInteractions: nextInteractions,
+  };
+}
+
+/** 全量 messageList reconcile */
+export function reconcileAcpPermissionStatusesInMessageList(
+  messageList: MessageInfo[],
+): MessageInfo[] {
+  return messageList.map((message: MessageInfo) =>
+    reconcileMessageAcpPermissionStatuses(message, messageList),
+  );
+}
+
+/** notify-resolved 幂等：Host 侧 pending 已不存在时视为已审批成功 */
+export function isIdempotentAcpPermissionResolveError(error: unknown): boolean {
+  const message =
+    error instanceof Error ? error.message : String(error ?? "");
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("not_found") ||
+    normalized.includes("not found") ||
+    normalized.includes("already_resolved") ||
+    normalized.includes("already resolved") ||
+    normalized.includes("permission not found") ||
+    normalized.includes("err_permission_not_found") ||
+    normalized.includes("gone")
+  );
+}

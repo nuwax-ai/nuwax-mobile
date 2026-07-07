@@ -97,7 +97,14 @@ export default {
       display: flex;
       flex-direction: row;
       align-items: center;
-      gap: 12rpx;
+
+      > text {
+        margin-right: 12rpx;
+
+        &:last-child {
+          margin-right: 0;
+        }
+      }
 
       .process-count {
         font-size: 24rpx;

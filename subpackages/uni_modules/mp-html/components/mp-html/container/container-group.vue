@@ -98,15 +98,8 @@ export default {
       flex-direction: row;
       align-items: center;
 
-      > text {
-        margin-right: 12rpx;
-
-        &:last-child {
-          margin-right: 0;
-        }
-      }
-
       .process-count {
+        margin-right: 12rpx;
         font-size: 24rpx;
         color: #8c8c8c;
       }

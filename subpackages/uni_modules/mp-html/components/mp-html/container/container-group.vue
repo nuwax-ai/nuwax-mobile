@@ -120,8 +120,13 @@ export default {
     padding: 12rpx 24rpx;
     border-top: 1rpx solid rgba(0, 0, 0, 0.05);
     max-height: 500rpx;
+    /* #ifdef H5 || MP-WEIXIN */
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
+    /* #endif */
+    /* #ifdef APP */
+    overflow: hidden;
+    /* #endif */
   }
 }
 </style>

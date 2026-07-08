@@ -16,10 +16,10 @@ export type UseTransitionOptions = {
 	leaveToClass ?: string,
 	appear ?: boolean,
 	defaultName ?: string,
-	name ?: () => string,
-	visible ?: () => boolean,
-	emits ?: (name : TransitionEmitStatus) => void,
-	onNextTick ?: (name : TransitionEmitStatus) => Promise<void>,
+	name ?: any,
+	visible ?: any,
+	emits ?: any,
+	onNextTick ?: any,
 	duration ?: number
 }
 
@@ -31,8 +31,8 @@ export type UseTransitionReturn = {
 	inited : Ref<boolean>,
 	classes : Ref<string>,
 	name : Ref<string>,
-	finished : () => void,
-	toggle : (v : boolean) => void,
+	finished : any,
+	toggle : any,
 }
 
 export function useTransition(options : UseTransitionOptions) : UseTransitionReturn {
@@ -58,7 +58,7 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 	let timeoutId = -1
 
 	const emitEvent = (event : TransitionEmitStatus) => {
-		options.emits?.(event);
+		if (options.emits != null) { (options.emits as (e: TransitionEmitStatus) => void)(event); }
 	};
 
 	// 结束
@@ -125,7 +125,7 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 			classes.value = classNames.get(eventName)!;
 			emitEvent(eventName);
 
-			const executeAfterTick = options.onNextTick?.(eventName);
+			const executeAfterTick = options.onNextTick != null ? (options.onNextTick as (n: string) => any)(eventName) : null;
 			if (executeAfterTick != null) {
 				await executeAfterTick;
 			}
@@ -169,7 +169,7 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 	let init = false;
 	watchEffect(() => {
 		if (options.visible == null) return
-		state.value = options.visible!();
+		state.value = (options.visible as () => boolean)();
 		if (!appear && !init) {
 			init = true
 			return
@@ -183,7 +183,7 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 	})
 	watchEffect(() => {
 		if (options.name == null) return
-		name.value = options.name!()
+		name.value = (options.name as () => string)()
 	})
 
 	const toggle = (v : boolean) => {

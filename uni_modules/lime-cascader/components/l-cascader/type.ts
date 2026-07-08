@@ -35,7 +35,19 @@ export interface CascaderProps {
 	/**
 	  * 是否支持多选
 	  */
-	multiple?: boolean;
+	multiple: boolean;
+	/**
+	  * 多选模式下的默认选中值数组
+	  */
+	defaultMultipleValue?: string[][];
+	/**
+	  * 多选模式下最大选择数量，-1表示无限制
+	  */
+	maxTagCount: number;
+	/**
+	  * 多选模式下是否显示选中数量
+	  */
+	showCheckedCount: boolean;
 	options : UTSJSONObject[];
 	/**
 		* 标题

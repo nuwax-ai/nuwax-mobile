@@ -133,6 +133,7 @@
 </script>
 
 <style lang="scss" scoped>
+/* #ifdef H5 */
     .x-dropdown {
         width: fit-content;
         position: relative;
@@ -184,4 +185,5 @@
         opacity: 1;
         pointer-events: auto;
     }
+/* #endif */
 </style>

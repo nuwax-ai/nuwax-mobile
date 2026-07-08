@@ -5,14 +5,14 @@
 export type ControlCommand = 'continue' | 'break' | null;
 
 export type ControllableWhileReturn = {
-	start: () => void;
-	abort: () => void;
-	execContinue: () => 'continue';
-	execBreak: () => 'break';
+	start: any;
+	abort: any;
+	execContinue: any;
+	execBreak: any;
 };
 
 export type Controller = {
-	abort: () => void;
+	abort: any;
 };
 
 export function controllableWhile(

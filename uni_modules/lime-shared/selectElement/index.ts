@@ -4,7 +4,7 @@ import {isDef} from '../isDef'
 import {type ComponentPublicInstance} from '../vue'
 // #endif
 
-type HasSelectorFunc = (selector : string, element : UniElement) => boolean
+type HasSelectorFunc = any
 
 const hasSelectorClassName : HasSelectorFunc = (selector : string, element : UniElement) : boolean => {
 	return element.classList.includes(selector)

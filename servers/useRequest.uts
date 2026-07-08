@@ -13,32 +13,49 @@ import {
   USER_NO_LOGIN,
 } from "@/constants/codes.constants";
 
+// #ifdef H5 || WEB
 import {
   fetchEventSource,
   EventSourceMessage,
 } from "@microsoft/fetch-event-source";
+// #endif
 
-import { handleExternalLink } from "@/utils/system.uts";
+import { handleExternalLink } from "@/utils/system";
 import { getCurrentPageFullPath } from "@/utils/common";
 
 // 微信小程序：request
-export default function request<T = any>(options: any) {
-  const { url, method, ...rest } = options;
+// 参数/返回值均用 any：Android 运行时对象字面量与响应体均为 UTSJSONObject，禁止 interface 强转
+export default function request(options: any): Promise<any> {
+  // Android: 调用方传入的对象字面量运行时为 UTSJSONObject，禁止 options.xxx interface 属性访问
+  // （Kotlin 会生成 RequestOptions.getData() 等虚调用，UTSJSONObject 未实现该接口 → IncompatibleClassChangeError）
+  const opts = options as UTSJSONObject;
+  const urlVal = opts["url"];
+  const url = urlVal != null ? `${urlVal}` : "";
+  const methodVal = opts["method"];
+  const method = methodVal != null ? `${methodVal}` : "POST";
+  const dataVal = opts["data"];
+  const requestData = dataVal != null ? dataVal : "";
+  const timeoutRaw = opts["timeout"];
+  let timeoutNum: number | null = null;
+  if (timeoutRaw != null) {
+    timeoutNum = timeoutRaw as number;
+  }
   const accessToken = uni.getStorageSync(ACCESS_TOKEN);
-  let currentLang = uni.getStorageSync(I18N_LANG_STORAGE_KEY) || DEFAULT_LANG;
-  currentLang = String(currentLang || DEFAULT_LANG).toLowerCase();
-  const header = {
-    ...COMMON_HEADERS,
-    "Accept-Language": currentLang,
-  };
-  if (accessToken) {
+  const _rawLang = uni.getStorageSync(I18N_LANG_STORAGE_KEY);
+  let currentLang = (_rawLang != null ? _rawLang : DEFAULT_LANG) as string;
+  currentLang = (currentLang != null ? currentLang : DEFAULT_LANG).toLowerCase();
+  // Build header from COMMON_HEADERS + overrides
+  const headerObj = new UTSJSONObject(COMMON_HEADERS);
+  const header = JSON.parse(JSON.stringify(headerObj)) as UTSJSONObject;
+  header["Accept-Language"] = currentLang;
+  if (accessToken != null && accessToken != "") {
     // #ifdef H5 || WEB
     if (process.env.NODE_ENV === "development") {
       header["Authorization"] = `Bearer ${accessToken}`;
     }
     // #endif
 
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
     header["Authorization"] = `Bearer ${accessToken}`;
     // #endif
   }
@@ -48,36 +65,44 @@ export default function request<T = any>(options: any) {
     // #ifdef H5
     //仅H5需要添加fragment参数
     const fragment = (window.location.hash || "#/").replace("#/", "/");
-    if (fragment) {
+    if (fragment != null && fragment != "") {
       header["fragment"] = fragment;
     }
     // #endif
   }
 
   // uni.request 在 UTS 里返回 RequestTask（非 Promise），这里手动包装为 Promise
-  return new Promise<T>((resolve, reject) => {
-    uni.request<T>({
-      header,
+  return new Promise<any>((resolve, reject) => {
+  // uni-app x: 后端响应大量字段返 null，严格反序列化会 errCode=100003。
+  // uni.request<UTSJSONObject> 顶层宽松解析；禁止 JSON.parse<T>（Gson 无法实例化 interface）。
+  // 自定义 RequestOptions 已改名为 ApiRequestOptions，避免与 SDK RequestOptions 冲突。
+    uni.request<UTSJSONObject>({
       url: API_BASE_URL + url,
-      method: method || "POST",
-      ...rest,
-      success: (res: any) => {
-        const responseData = res.data as any;
-        const { code, message: errorMessage } = responseData || {};
+      method: method,
+      // data 可能为 null(无 body 的 GET)，无 body 时传空串
+      data: requestData as any,
+      timeout: timeoutNum,
+      header: header,
+      success: (res) => {
+        // res.data 已是 UTSJSONObject，禁止 JSON.parse<T> 或强转为 interface
+        const responseData = res.data;
+        const respObj = responseData != null ? (responseData as UTSJSONObject) : null;
+        const codeVal = respObj != null ? respObj["code"] : null;
+        const code = codeVal != null ? `${codeVal}` : null;
+        const msgVal = respObj != null ? respObj["message"] : null;
+        const errorMessage = msgVal != null ? `${msgVal}` : "";
+        // UTS→Kotlin: `===` 引用相等，业务码比较一律 `==`。
 
         // batch 接口不做错误消息与跳转相关逻辑
-        const isBatchUrl = url?.includes("/api/notify/event/collect/batch");
+        const isBatchUrl = url != null && url.includes("/api/notify/event/collect/batch");
         if (isBatchUrl) {
-          resolve(responseData as T);
-          return;
-        }
-
-        // 用户未登录，跳转到登录页
-        if (code === USER_NO_LOGIN) {
+          resolve(responseData as any);
+        } else if (code == USER_NO_LOGIN) {
+          // 用户未登录，跳转到登录页
           uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
           uni.clearStorageSync(); // 清空所有缓存
 
-          // #ifdef H5 || WEB
+          // #ifdef H5 || WEB || APP
           uni.reLaunch({
             url: "/subpackages/pages/login/login",
           });
@@ -87,32 +112,34 @@ export default function request<T = any>(options: any) {
             url: "/subpackages/pages/login-weixin/login-weixin",
           });
           // #endif
-        }
-        // 重定向到登录页
-        if (code === REDIRECT_LOGIN) {
+          resolve(responseData as any);
+        } else if (code == REDIRECT_LOGIN) {
+          // 重定向到登录页
           uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
           uni.clearStorageSync(); // 清空所有缓存
           let redirectUrl = errorMessage;
+          let resolvedEarly = false;
           // 如果错误信息包含/login开头，则替换为登录页，否则直接打开完整链接
-          if (errorMessage?.startsWith("/login")) {
-            // #ifdef H5 || WEB
+          if (errorMessage.startsWith("/login")) {
+            // #ifdef H5 || WEB || APP
             // 如果url在登录白名单地址中，则不跳转到登录页
             if (LOGIN_WHITELIST_URL.includes(url)) {
-              resolve(responseData as T);
-              return;
+              resolve(responseData as any);
+              resolvedEarly = true;
+            } else {
+              redirectUrl = errorMessage.replace(
+                "/login",
+                "/subpackages/pages/login/login",
+              );
+              uni.reLaunch({ url: redirectUrl });
             }
-            redirectUrl = errorMessage?.replace(
-              "/login",
-              "/subpackages/pages/login/login",
-            );
-            uni.reLaunch({ url: redirectUrl });
             // #endif
 
             // #ifdef MP-WEIXIN
             // 微信小程序：获取当前页面的 url
             const currentUrl = getCurrentPageFullPath();
-            if (currentUrl) {
-              if (globalThis.appConfig.redirectUrl) {
+            if (currentUrl != null && currentUrl != "") {
+              if (globalThis.appConfig.redirectUrl != null && globalThis.appConfig.redirectUrl != "") {
                 const otherQueryStr = globalThis.appConfig.redirectUrl;
                 uni.reLaunch({
                   url:
@@ -125,7 +152,7 @@ export default function request<T = any>(options: any) {
                 uni.reLaunch({
                   url:
                     "/subpackages/pages/login-weixin/login-weixin?redirect=" +
-                    encodeURIComponent("/" + currentUrl),
+                    encodeURIComponent(currentUrl),
                 });
               }
             }
@@ -138,11 +165,15 @@ export default function request<T = any>(options: any) {
             handleExternalLink(errorMessage);
             // #endif
           }
+          if (!resolvedEarly) {
+            resolve(responseData as any);
+          }
+        } else {
+          resolve(responseData as any);
         }
-        resolve(responseData as T);
       },
       fail: (error: any) => {
-        console.error("Request error:", error);
+        console.error(`Request error [${url}]:`, error);
         // 网络错误或其他错误，也返回错误信息
         reject(error);
       },
@@ -150,94 +181,244 @@ export default function request<T = any>(options: any) {
   });
 }
 
-export interface SSEOptions<T = any> {
+export type SSEOptions<T = any> = {
   url: string;
   method?: "GET" | "POST" | "PUT" | "DELETE";
-  headers?: { [key: string]: string };
+  headers?: Record<string, string>;
   body?: any;
-  onMessage: (data: T) => void;
-  onError?: (error: Error) => void;
-  onOpen?: (response: any) => void;
-  onClose?: () => void;
+  onMessage: any;
+  onError: any;
+  onOpen: any;
+  onClose: any;
   abortController?: any;
 }
 
-// H5 创建SSE连接
-export async function createSSEConnection<T = any>(options: SSEOptions<T>) {
+// SSE 连接（平台分叉：H5/Web 用 fetch-event-source，APP 用原生分块请求）
+export function createSSEConnection<T = any>(options: SSEOptions<T>) {
+  const _rawLang = uni.getStorageSync(I18N_LANG_STORAGE_KEY);
+  const rawLangStr = _rawLang != null ? _rawLang as string : DEFAULT_LANG;
+  const currentLang = rawLangStr.toLowerCase();
+
+  // #ifdef H5 || WEB
   const controller = options.abortController || new AbortController();
-  const currentLang = String(
-    uni.getStorageSync(I18N_LANG_STORAGE_KEY) || DEFAULT_LANG,
-  ).toLowerCase();
-  //仅H5需要添加fragment参数
   const fragment = (window.location.hash || "#/").replace("#/", "/");
   try {
-    // 通过 Parameters<typeof fetchEventSource>[1] 对齐第三方库参数类型
+    const headers = new UTSJSONObject(COMMON_HEADERS);
+    headers["Content-Type"] = "application/json";
+    headers["Accept-Language"] = currentLang;
+    if (options.headers != null) {
+      const optHeaders = options.headers as UTSJSONObject;
+      const headerKeys = Object.keys(optHeaders);
+      for (let hi = 0; hi < headerKeys.length; hi++) {
+        headers[headerKeys[hi]] = optHeaders[headerKeys[hi]];
+      }
+    }
+    if (fragment != null && fragment != "") {
+      headers["fragment"] = fragment;
+    }
     const fetchOptions = {
-      method: options.method || "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept-Language": currentLang,
-        ...options.headers,
-        ...(fragment && { fragment }),
-      },
+      method: options.method != null ? options.method : "POST",
+      headers: headers,
       body:
-        typeof options.body === "object"
+        options.body != null && typeof options.body === "object"
           ? JSON.stringify(options.body)
           : options.body,
       signal: controller.signal,
-      openWhenHidden: true, // 页面不可见时保持连接
-
-      onopen: async (response) => {
+      openWhenHidden: true,
+      onopen: async (response: any) => {
         if (response.status >= 400) {
           throw new Error(
-            String(response.statusText || response.status || 0),
+            String(response.statusText != null ? response.statusText : String(response.status != null ? response.status : 0)),
           );
         }
-        options.onOpen?.(response);
+        if (options.onOpen != null) {
+          options.onOpen(response);
+        }
       },
-
       onmessage: (event: EventSourceMessage) => {
         try {
-          const data = event.data ? (JSON.parse(event.data) as T) : null;
-          // 无消息体时不回调，避免把 null 传给强类型的 T
+          const data = event.data != null ? (JSON.parse(event.data) as T) : null;
           if (data !== null) {
             options.onMessage(data);
           }
         } catch (error) {
-          const normalizedError =
-            error instanceof Error ? error : new Error(String(error));
-          options.onError?.(normalizedError);
+          const errMsg = error != null ? String(error) : "Unknown error";
+          const normalizedError = new Error(errMsg);
+          if (options.onError != null) {
+            options.onError(normalizedError);
+          }
         }
       },
-
       onclose: () => {
-        options.onClose?.();
+        if (options.onClose != null) {
+          options.onClose();
+        }
       },
-
-      onerror: (error) => {
-        // 如果是中止错误，不抛出异常
-        if (error instanceof Error && error.name === "AbortError") {
+      onerror: (error: any) => {
+        if (error != null && error.name === "AbortError") {
           console.log("SSE连接已被中止");
           return;
         }
-        const normalizedError =
-          error instanceof Error ? error : new Error(String(error));
-        options.onError?.(normalizedError);
-        throw normalizedError; // 停止自动重试
+        const errMsg2 = error != null ? String(error) : "Unknown error";
+        const normalizedError = new Error(errMsg2);
+        if (options.onError != null) {
+          options.onError(normalizedError);
+        }
+        throw normalizedError;
       },
-    } as Parameters<typeof fetchEventSource>[1];
-    await fetchEventSource(options.url, fetchOptions);
+    } as any;
+    fetchEventSource(options.url, fetchOptions).catch((error: any) => {
+      if (error != null && error.name === "AbortError") {
+        console.log("SSE连接已被中止");
+        return;
+      }
+      const errMsg3 = error != null ? String(error) : "Unknown error";
+      const normalized = new Error(errMsg3);
+      if (options.onError != null) {
+        options.onError(normalized);
+      }
+    });
+    return controller;
   } catch (error) {
-    // 静默处理所有 AbortError
-    if (error instanceof Error && error.name === "AbortError") {
+    if (error != null && (error as any).name === "AbortError") {
       console.log("SSE连接已被中止");
-      return;
+      return undefined;
     }
-
-    // 只有真正的错误才触发错误回调
-    const normalized =
-      error instanceof Error ? error : new Error(String(error));
-    options.onError?.(normalized);
+    const errMsg4 = error != null ? String(error) : "Unknown error";
+    const normalized = new Error(errMsg4);
+    if (options.onError != null) {
+      options.onError(normalized);
+    }
     throw normalized;
+  }
+  // #endif
+
+  // #ifdef APP-PLUS || APP
+  let buffer = "";
+  const task = uni.request({
+    url: options.url,
+    method: options.method != null ? options.method : "POST",
+    header: new UTSJSONObject(),
+    data:
+      options.body != null && typeof options.body === "object"
+        ? JSON.stringify(options.body)
+        : options.body,
+    enableChunked: true,
+    success: (res: any) => {
+      const onOpenFn = options.onOpen as ((res: any) => void) | null;
+      if (onOpenFn != null) {
+        onOpenFn(res);
+      }
+    },
+    fail: (err: any) => {
+      const errObj = err as UTSJSONObject;
+      const errMsgRaw = errObj != null ? errObj["errMsg"] : null;
+      const errMsg5 = errMsgRaw != null ? (errMsgRaw as string) : "Unknown error";
+      const error = new Error(errMsg5);
+      const onErrorFn = options.onError as ((error: Error) => void) | null;
+      if (onErrorFn != null) {
+        onErrorFn(error);
+      }
+    },
+    complete: () => {
+      const onCloseFn = options.onClose as (() => void) | null;
+      if (onCloseFn != null) {
+        onCloseFn();
+      }
+    },
+  });
+
+  task.onChunkReceived((res: any) => {
+    const arrayBuffer = res as ArrayBuffer;
+    try {
+      const text = arrayBufferToString(arrayBuffer);
+      buffer += text;
+      const parts = buffer.split("\n\n");
+      const lastPart = parts.pop();
+      buffer = lastPart != null ? lastPart : "";
+      for (let pi = 0; pi < parts.length; pi++) {
+        const part = parts[pi];
+        const lines = part.split("\n");
+        let dataLine: string | null = null;
+        for (let li = 0; li < lines.length; li++) {
+          if (lines[li].startsWith("data:")) {
+            dataLine = lines[li];
+            break;
+          }
+        }
+        if (dataLine == null) {
+          continue;
+        }
+        const payload = dataLine.slice(5).trim();
+        if (payload.length === 0 || payload === "[DONE]") {
+          continue;
+        }
+        try {
+          const onMessageFn = options.onMessage as ((data: T) => void) | null;
+          if (onMessageFn != null) {
+            onMessageFn(JSON.parse(payload) as T);
+          }
+        } catch (e) {
+          const errMsg6 = e != null ? (e as string) : "Unknown error";
+          const onErrorFn2 = options.onError as ((error: Error) => void) | null;
+          if (onErrorFn2 != null) {
+            onErrorFn2(new Error(errMsg6));
+          }
+        }
+      }
+    } catch (e) {
+      const errMsg7 = e != null ? (e as string) : "Unknown error";
+      const onErrorFn3 = options.onError as ((error: Error) => void) | null;
+      if (onErrorFn3 != null) {
+        onErrorFn3(new Error(errMsg7));
+      }
+    }
+  });
+
+  class SSEController {
+    aborted: boolean = false;
+    signal: UTSJSONObject;
+    abort: (() => void);
+    constructor(task: any) {
+      this.signal = new UTSJSONObject();
+      this.signal["aborted"] = false;
+      this.abort = () => {
+        this.aborted = true;
+        this.signal["aborted"] = true;
+        try {
+          const taskObj = task as UTSJSONObject;
+          const abortFn = taskObj["abort"] as (() => void) | null;
+          if (abortFn != null) {
+            abortFn();
+          }
+        } catch (e) {
+          console.error("SSE task abort failed", e);
+        }
+      };
+    }
+  }
+
+  let controller: SSEController;
+  if (options.abortController != null) {
+    controller = options.abortController as SSEController;
+  } else {
+    controller = new SSEController(task);
+  }
+
+  return controller as any;
+  // #endif
+}
+
+function arrayBufferToString(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let result = "";
+  for (let i = 0; i < bytes.length; i++) {
+    result += String.fromCharCode(bytes[i]);
+  }
+  try {
+    const decoded = decodeURIComponent(result);
+    return decoded != null ? decoded : result;
+  } catch (e) {
+    return result;
   }
 }

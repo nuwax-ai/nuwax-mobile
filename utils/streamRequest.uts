@@ -2,7 +2,92 @@ import { StreamRequestConfig, StreamChunk } from "@/types/interfaces/chat";
 import { createSSEConnection } from "@/servers/useRequest.uts";
 import { utf8ArrayToString } from "@/utils/utf8.uts";
 import { t } from "@/utils/i18n";
-import { orEmpty } from "@/utils/utsCoalesce";
+
+/**
+ * 合并两个 Uint8Array。
+ * UTS 中 Uint8Array.set 不支持带偏移写入另一数组，因此用循环拼接。
+ * @param first 前一段字节
+ * @param second 后一段字节
+ * @returns 合并后的新数组
+ */
+function mergeUint8Arrays(first: Uint8Array, second: Uint8Array): Uint8Array {
+  const merged = new Uint8Array(first.length + second.length);
+  for (let i = 0; i < first.length; i++) {
+    merged[i] = first[i];
+  }
+  for (let j = 0; j < second.length; j++) {
+    merged[first.length + j] = second[j];
+  }
+  return merged;
+}
+
+/**
+ * 构建 HTTP 错误提示文案。
+ * UTS 中 i18n 插值参数需使用 Map，不能传对象字面量。
+ * @param statusCode HTTP 状态码
+ * @returns 本地化后的错误信息
+ */
+function buildHttpErrorMessage(statusCode: number): string {
+  const params = new Map<string, string | number>();
+  params.set("code", statusCode);
+  return t("Mobile.Stream.httpErrorWithCode", params as Record<string, string | number>);
+}
+
+/**
+ * 创建流式内容块。
+ * UTS 中 StreamChunk 为 class，不能用对象字面量初始化。
+ * @param data SSE 数据内容
+ * @returns 类型为 content 的 StreamChunk 实例
+ */
+function createContentChunk(data: string): StreamChunk {
+  const chunk = new StreamChunk();
+  chunk.type = "content";
+  chunk.data = data;
+  return chunk;
+}
+
+/**
+ * 判断 SSE 载荷是否表示流已结束。
+ * UTS 不能对 any 直接访问 .completed，需通过 UTSJSONObject 下标读取。
+ * @param data SSE 解析后的数据
+ * @returns completed 字段为 true 时返回 true
+ */
+function isCompletedPayload(data: any): boolean {
+  if (data == null) {
+    return false;
+  }
+  const dataObj = data as UTSJSONObject;
+  const completed = dataObj["completed"];
+  return completed != null && completed == true;
+}
+
+/**
+ * 判断错误是否为用户主动中止请求（AbortError）。
+ * @param error 捕获到的错误对象
+ * @returns 是 AbortError 时返回 true
+ */
+function isAbortError(error: any): boolean {
+  if (error == null) {
+    return false;
+  }
+  const errorObj = error as UTSJSONObject;
+  const name = errorObj["name"];
+  return name != null && `${name}` === "AbortError";
+}
+
+/**
+ * 安全读取错误对象的 message 字段。
+ * @param error 捕获到的错误对象
+ * @returns 错误信息字符串，无 message 时返回空字符串
+ */
+function getErrorMessage(error: any): string {
+  if (error == null) {
+    return "";
+  }
+  const errorObj = error as UTSJSONObject;
+  const message = errorObj["message"];
+  return message != null ? `${message}` : "";
+}
 
 // 全局错误处理 - 捕获未处理的 AbortError
 // #ifdef H5
@@ -20,13 +105,13 @@ if (typeof window !== "undefined") {
 export class StreamRequest {
   private requestTask: RequestTask | null = null;
   private isAborted: boolean = false;
-  private abortController: AbortController | null = null;
+  private abortController: any | null = null;
   private buffer: string = ""; // 用于缓存不完整的 SSE 消息（以 \n\n 为完整标记）
   private pendingBytes: Uint8Array = new Uint8Array(0); // 用于缓存不完整的 UTF-8 字节序列
 
   // 微信小程序数据流超时监控
   private lastChunkReceivedTime: number = 0; // 最后一次接收数据的时间戳
-  private timeoutCheckTimer: any = null; // 超时检查定时器（使用 any 类型以兼容不同平台）
+  private timeoutCheckTimer: number | null = null;
   private readonly TIMEOUT_DURATION: number = 60000; // 超时时长 60 秒
   private timeoutCallback: (() => void) | null = null; // 超时回调
 
@@ -62,7 +147,7 @@ export class StreamRequest {
     } catch (error) {
       // 如果是用户主动中止，不触发错误回调
       // #ifdef H5
-      if (error.name === "AbortError" || this.isAborted) {
+      if (isAbortError(error) || this.isAborted) {
         console.log("请求已被中止");
         return;
       }
@@ -88,10 +173,10 @@ export class StreamRequest {
       this.startTimeoutMonitor();
       console.log("[请求] 超时监控启动完成");
 
-      await createSSEConnection({
+      await createSSEConnection<any>({
         url: config.url,
         method: config.method,
-        headers: config.headers as any,
+        headers: config.headers,
         body: config.body,
         abortController: this.abortController,
         onMessage: (data: any) => {
@@ -101,7 +186,7 @@ export class StreamRequest {
 
           try {
             // 检查是否完成
-            if (data && data.completed) {
+            if (isCompletedPayload(data)) {
               console.log("[SSE] 收到完成标记 completed");
 
               // 清除超时监控
@@ -117,20 +202,19 @@ export class StreamRequest {
             }
 
             // 处理数据块
-            const chunk: StreamChunk = {
-              type: "content",
-              data: data ? JSON.stringify(data) : "",
-            };
+            const chunk = createContentChunk(
+              data != null ? JSON.stringify(data) : "",
+            );
             config.onChunk?.(chunk);
           } catch (e) {
             console.error("Parse chunk error:", e);
           }
         },
-        onError: (error: Error) => {
+        onError: (error: any) => {
           // 清除超时监控
           this.clearTimeoutMonitor();
           // 如果是中止错误，不触发错误回调
-          if (error.name === "AbortError" || this.isAborted) {
+          if (isAbortError(error) || this.isAborted) {
             console.log("SSE连接已被中止");
             return;
           }
@@ -148,8 +232,8 @@ export class StreamRequest {
     } catch (error) {
       // 捕获所有可能的错误，包括 AbortError
       if (
-        error.message === "Connection aborted by user" ||
-        error.name === "AbortError" ||
+        getErrorMessage(error) === "Connection aborted by user" ||
+        isAbortError(error) ||
         this.isAborted
       ) {
         console.log("SSE连接已被中止");
@@ -190,8 +274,8 @@ export class StreamRequest {
     if (looksLikeJSON) {
       // 尝试解析 JSON 数据
       try {
-        const data = JSON.parse(content);
-        if (data && data.completed) {
+        const data = JSON.parse(content) as UTSJSONObject;
+        if (isCompletedPayload(data)) {
           console.log("[SSE] 收到完成标记 completed");
 
           // 清除超时监控
@@ -208,20 +292,14 @@ export class StreamRequest {
         }
 
         // 处理数据块
-        const chunk: StreamChunk = {
-          type: "content",
-          data: content,
-        };
+        const chunk = createContentChunk(content);
         config.onChunk?.(chunk);
       } catch (e) {
         console.log("[SSE] JSON 解析失败，内容:", content);
       }
     } else {
       // 不是 JSON 格式，直接作为内容处理
-      const chunk: StreamChunk = {
-        type: "content",
-        data: content,
-      };
+      const chunk = createContentChunk(content);
       config.onChunk?.(chunk);
     }
   }
@@ -237,15 +315,13 @@ export class StreamRequest {
     this.lastChunkReceivedTime = Date.now();
 
     // 先清除可能存在的旧定时器
-    if (
-      this.timeoutCheckTimer !== null &&
-      this.timeoutCheckTimer !== undefined
-    ) {
+    const existingTimerId = this.timeoutCheckTimer;
+    if (existingTimerId !== null) {
       console.log(
         "[超时监控] 发现旧定时器，先清除，ID:",
-        this.timeoutCheckTimer,
+        existingTimerId,
       );
-      clearInterval(this.timeoutCheckTimer);
+      clearInterval(existingTimerId);
       this.timeoutCheckTimer = null;
     }
 
@@ -274,12 +350,10 @@ export class StreamRequest {
   private clearTimeoutMonitor(): void {
     console.log("[超时监控] 尝试清除，当前 timer ID:", this.timeoutCheckTimer);
 
-    if (
-      this.timeoutCheckTimer !== null &&
-      this.timeoutCheckTimer !== undefined
-    ) {
-      console.log("[超时监控] 清除超时监控，timer ID:", this.timeoutCheckTimer);
-      clearInterval(this.timeoutCheckTimer);
+    const timerId = this.timeoutCheckTimer;
+    if (timerId !== null) {
+      console.log("[超时监控] 清除超时监控，timer ID:", timerId);
+      clearInterval(timerId);
       this.timeoutCheckTimer = null;
     } else {
       console.log("[超时监控] 定时器 ID 为空，无需清除");
@@ -326,9 +400,7 @@ export class StreamRequest {
     let combined = newBytes;
 
     if (this.pendingBytes.length > 0) {
-      combined = new Uint8Array(this.pendingBytes.length + newBytes.length);
-      combined.set(this.pendingBytes);
-      combined.set(newBytes, this.pendingBytes.length);
+      combined = mergeUint8Arrays(this.pendingBytes, newBytes);
       this.pendingBytes = new Uint8Array(0);
     }
 
@@ -392,7 +464,7 @@ export class StreamRequest {
       this.requestTask = uni.request({
         url: config.url,
         method: config.method,
-        header: config.headers as any,
+        header: config.headers,
         data: config.body,
         enableChunked: true, // 启用分块传输
         responseType: "arraybuffer", // 响应类型
@@ -409,13 +481,7 @@ export class StreamRequest {
             console.log("[请求] 请求失败，statusCode:", res.statusCode);
             // 清除超时监控
             this.clearTimeoutMonitor();
-            reject(
-              new Error(
-                t("Mobile.Stream.httpErrorWithCode", {
-                  code: res.statusCode,
-                }),
-              ),
-            );
+            reject(new Error(buildHttpErrorMessage(res.statusCode)));
           }
         },
         fail: (err) => {
@@ -448,7 +514,9 @@ export class StreamRequest {
       console.log("[请求] 超时监控启动完成");
 
       // 监听分块数据接收
-      this.requestTask?.onChunkReceived?.((res) => {
+      const requestTask = this.requestTask;
+      if (requestTask != null) {
+        requestTask.onChunkReceived((res) => {
         // console.log('[数据接收] onChunkReceived 触发')
         if (this.isAborted) return;
 
@@ -469,7 +537,8 @@ export class StreamRequest {
           const messages = this.buffer.split("\n\n");
 
           // 保存最后一个可能不完整的消息块
-          this.buffer = orEmpty(messages.pop());
+          const pendingMessage = messages.pop();
+          this.buffer = pendingMessage != null ? pendingMessage : "";
 
           // 处理所有完整的消息块
           for (const message of messages) {
@@ -506,7 +575,8 @@ export class StreamRequest {
             config.onError?.(error);
           }
         }
-      });
+        });
+      }
     });
   }
 
@@ -517,7 +587,7 @@ export class StreamRequest {
       this.requestTask = uni.request({
         url: config.url,
         method: config.method,
-        header: config.headers as any,
+        header: config.headers,
         data: config.body,
         success: (res) => {
           if (res.statusCode === 200) {
@@ -525,13 +595,7 @@ export class StreamRequest {
             this.handleStreamResponse(res.data as string, config);
             resolve();
           } else {
-            reject(
-              new Error(
-                t("Mobile.Stream.httpErrorWithCode", {
-                  code: res.statusCode,
-                }),
-              ),
-            );
+            reject(new Error(buildHttpErrorMessage(res.statusCode)));
           }
         },
         fail: (err) => {
@@ -580,8 +644,8 @@ export class StreamRequest {
         if (looksLikeJSON) {
           // 尝试解析 JSON 数据
           try {
-            const parseData = JSON.parse(content);
-            if (parseData && parseData.completed) {
+            const parseData = JSON.parse(content) as UTSJSONObject;
+            if (isCompletedPayload(parseData)) {
               console.log("[SSE-APP] 收到完成标记 completed");
               config.onComplete?.();
               return;
@@ -596,10 +660,7 @@ export class StreamRequest {
 
         // 处理数据块
         try {
-          const chunk: StreamChunk = {
-            type: "content",
-            data: content,
-          };
+          const chunk = createContentChunk(content);
           config.onChunk?.(chunk);
         } catch (e) {
           console.error("[SSE-APP] 处理数据块失败:", e);

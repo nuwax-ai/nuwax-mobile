@@ -87,104 +87,225 @@ export const FILE_CONSTANTS = {
   SESSION_ID_PREFIX: 'session_',
 };
 
+const IGNORED_FILE_PATTERNS: RegExp[] = [
+  new RegExp("^\\."),
+  new RegExp("^\\.DS_Store$"),
+  new RegExp("^Thumbs\\.db$"),
+  new RegExp("\\.tmp$"),
+  new RegExp("\\.bak$"),
+];
+
+function readFileItemField(file: any, key: string): any | null {
+  if (file == null) {
+    return null;
+  }
+  return (file as UTSJSONObject)[key] as any;
+}
+
+function getFileItemPath(file: any): string {
+  return orEmpty(readFileItemField(file, "name"));
+}
+
+function getBaseFileName(fullPath: string): string {
+  const parts = fullPath.split("/");
+  if (parts.length === 0) {
+    return fullPath;
+  }
+  const lastPart = parts[parts.length - 1];
+  return orEmpty(lastPart);
+}
+
+function shouldIgnoreFile(file: any): boolean {
+  const fileName = getBaseFileName(getFileItemPath(file));
+  for (let i = 0; i < IGNORED_FILE_PATTERNS.length; i++) {
+    const pattern = IGNORED_FILE_PATTERNS[i];
+    if (pattern.test(fileName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function splitPathParts(path: string): string[] {
+  const rawParts = path.split("/");
+  const parts: string[] = [];
+  for (let i = 0; i < rawParts.length; i++) {
+    const part = rawParts[i];
+    if (part != null && part.length > 0) {
+      parts.push(part);
+    }
+  }
+  return parts;
+}
+
+function hasChildWithId(parent: FileNode, id: string): boolean {
+  for (let i = 0; i < parent.children.length; i++) {
+    if (parent.children[i].id === id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function rootContainsId(nodes: FileNode[], id: string): boolean {
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i].id === id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function compareFileNodes(a: FileNode, b: FileNode): number {
+  if (a.type !== b.type) {
+    return a.type === "folder" ? -1 : 1;
+  }
+  if (a.name < b.name) {
+    return -1;
+  }
+  if (a.name > b.name) {
+    return 1;
+  }
+  return 0;
+}
+
+function sortNodes(nodes: FileNode[]): void {
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      if (compareFileNodes(nodes[i], nodes[j]) > 0) {
+        const temp = nodes[i];
+        nodes[i] = nodes[j];
+        nodes[j] = temp;
+      }
+    }
+  }
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i].children.length > 0) {
+      sortNodes(nodes[i].children);
+    }
+  }
+}
+
+function createFolderNode(
+  parentPath: string,
+  parentName: string,
+  grandParentPath: string | null,
+): FileNode {
+  const parentNode = new FileNode();
+  parentNode.id = parentPath;
+  parentNode.name = parentName;
+  parentNode.type = "folder";
+  parentNode.path = parentPath;
+  parentNode.parentPath = grandParentPath;
+  parentNode.lastModified = Date.now();
+  return parentNode;
+}
+
+function createNodeFromFileItem(file: any, pathParts: string[]): FileNode {
+  const fullPath = getFileItemPath(file);
+  const fileName = pathParts[pathParts.length - 1];
+  const isDir = readFileItemField(file, "isDir") == true;
+  const isFile = isDir == false || fileName.includes(".");
+  const parentPathJoined =
+    pathParts.length > 1 ? pathParts.slice(0, pathParts.length - 1).join("/") : "";
+  const contents = readFileItemField(file, "contents");
+  let contentsLength: number = 0;
+  if (contents != null && typeof contents === "string") {
+    contentsLength = (contents as string).length;
+  }
+  const fileSize = readFileItemField(file, "size");
+  const sizeExceeded = readFileItemField(file, "sizeExceeded") == true;
+  const hasReportedSize =
+    fileSize != null && typeof fileSize === "number" && (fileSize as number) > 0;
+  const useFallbackSize = sizeExceeded == true || hasReportedSize == true;
+  const node = new FileNode();
+  node.id = fullPath;
+  node.name = fileName;
+  node.type = isFile ? "file" : "folder";
+  node.path = fullPath;
+  node.binary = readFileItemField(file, "binary") == true;
+  if (useFallbackSize == true) {
+    node.size = orNumber(FILE_CONSTANTS.FALLBACK_SIZE, 0);
+  } else {
+    node.size = contentsLength;
+  }
+  node.status = orObject(readFileItemField(file, "status"), null);
+  node.fullPath = fullPath;
+  node.parentPath = parentPathJoined.length > 0 ? parentPathJoined : null;
+  node.content = orEmpty(contents);
+  node.lastModified = Date.now();
+  node.fileProxyUrl = orEmpty(readFileItemField(file, "fileProxyUrl"));
+  node.isLink = readFileItemField(file, "isLink") == true;
+  return node;
+}
+
 /**
  * 将扁平的文件列表转换为树形结构
  */
 export const transformFlatListToTree = (files: any[]): FileNode[] => {
   const root: FileNode[] = [];
   const map = new Map<string, FileNode>();
+  const mapKeys: string[] = [];
 
-  // 过滤掉系统文件
-  const filteredFiles = files.filter((file) => {
-    const fileName = file.name.split('/').pop();
-    return !FILE_CONSTANTS.IGNORED_FILE_PATTERNS.some((pattern) =>
-      pattern.test(orEmpty(fileName)),
-    );
-  });
+  const filteredFiles: any[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    if (shouldIgnoreFile(file) == false) {
+      filteredFiles.push(file);
+    }
+  }
 
-  // 创建所有文件节点和必要的文件夹节点
-  filteredFiles.forEach((file) => {
-    const pathParts = file.name.split('/').filter(Boolean);
-    const fileName = pathParts[pathParts.length - 1];
-    // 如果文件是目录，则认为是文件（后端给了isDir字段，表示是否为目录），兼容之前逻辑
-    const isFile = !file.isDir || fileName.includes('.');
+  for (let i = 0; i < filteredFiles.length; i++) {
+    const file = filteredFiles[i];
+    const fullPath = getFileItemPath(file);
+    const pathParts = splitPathParts(fullPath);
+    if (pathParts.length === 0) {
+      continue;
+    }
 
-    const parentPathJoined = pathParts.slice(0, -1).join('/');
+    const node = createNodeFromFileItem(file, pathParts);
+    map.set(fullPath, node);
+    mapKeys.push(fullPath);
 
-    const node: FileNode = {
-      id: file.name,
-      name: fileName,
-      type: isFile ? 'file' : 'folder',
-      path: file.name,
-      children: [],
-      binary: file.binary == true,
-      size:
-        file.sizeExceeded == true || (file.size != null && file.size > 0)
-          ? FILE_CONSTANTS.FALLBACK_SIZE
-          : orNumber(file.contents?.length, FILE_CONSTANTS.FALLBACK_SIZE),
-      status: orObject(file.status, null),
-      fullPath: file.name,
-      parentPath: parentPathJoined.length > 0 ? parentPathJoined : null,
-      content: orEmpty(file.contents),
-      lastModified: Date.now(),
-      fileProxyUrl: orEmpty(file?.fileProxyUrl),
-      isLink: file?.isLink == true,
-    };
-
-    map.set(file.name, node);
-
-    // 如果文件在子目录中，确保创建所有必要的父文件夹节点
     if (pathParts.length > 1) {
-      for (let i = pathParts.length - 2; i >= 0; i--) {
-        const parentPath = pathParts.slice(0, i + 1).join('/');
-        const parentName = pathParts[i];
-
-        if (!map.has(parentPath)) {
-          const parentNode: FileNode = {
-            id: parentPath,
-            name: parentName,
-            type: 'folder',
-            path: parentPath,
-            children: [],
-            parentPath: i > 0 ? pathParts.slice(0, i).join('/') : null,
-            lastModified: Date.now(),
-          };
-          map.set(parentPath, parentNode);
+      for (let j = pathParts.length - 2; j >= 0; j--) {
+        const parentPath = pathParts.slice(0, j + 1).join("/");
+        if (map.has(parentPath)) {
+          continue;
         }
+        const parentName = pathParts[j];
+        const grandParentPath = j > 0 ? pathParts.slice(0, j).join("/") : null;
+        const parentNode = createFolderNode(
+          parentPath,
+          parentName,
+          grandParentPath,
+        );
+        map.set(parentPath, parentNode);
+        mapKeys.push(parentPath);
       }
     }
-  });
+  }
 
-  // 构建层次结构
-  map.forEach((node) => {
-    if (node.parentPath && map.has(node.parentPath)) {
-      const parentNode = map.get(node.parentPath)!;
-      if (
-        !parentNode.children?.find((child: FileNode) => child.id === node.id)
-      ) {
-        parentNode.children?.push(node);
+  for (let i = 0; i < mapKeys.length; i++) {
+    const key = mapKeys[i];
+    const node = map.get(key);
+    if (node == null) {
+      continue;
+    }
+    if (node.parentPath != null && node.parentPath.length > 0 && map.has(node.parentPath)) {
+      const parentNode = map.get(node.parentPath);
+      if (parentNode != null && hasChildWithId(parentNode, node.id) == false) {
+        parentNode.children.push(node);
       }
-    } else if (!node.parentPath) {
-      if (!root.find((item: FileNode) => item.id === node.id)) {
+    } else if (node.parentPath == null || node.parentPath.length === 0) {
+      if (rootContainsId(root, node.id) == false) {
         root.push(node);
       }
     }
-  });
+  }
 
-  // 排序：文件夹在前，文件在后，同类型按名称排序
-  const sortNodes = (nodes: FileNode[]): FileNode[] => {
-    return nodes.sort((a, b) => {
-      if (a.type !== b.type) {
-        return a.type === 'folder' ? -1 : 1;
-      }
-      return a.name.localeCompare(b.name);
-    });
-  };
-
-  return sortNodes(root).map((node) => ({
-    ...node,
-    children: node.children ? sortNodes(node.children) : undefined,
-  }));
+  sortNodes(root);
+  return root;
 };
 
 

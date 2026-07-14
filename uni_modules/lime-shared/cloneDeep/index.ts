@@ -1,12 +1,10 @@
 // @ts-nocheck
 
 // #ifdef APP-ANDROID
-// export * from './uvue.uts'
-export { cloneDeep } from  './uvue.uts'
+export { cloneDeep } from  './uvue'
 // #endif
 
 
 // #ifndef APP-ANDROID
-// export * from './vue.ts'
-export { cloneDeep } from  './vue.ts'
+export { cloneDeep } from  './vue'
 // #endif

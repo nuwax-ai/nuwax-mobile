@@ -1,3 +1,4 @@
+// @ts-nocheck
 export const ariaProps = {
 	ariaHidden: Boolean,
 	ariaRole: String,
@@ -5,7 +6,7 @@ export const ariaProps = {
 	ariaLabelledby: String,
 	ariaDescribedby: String,
 	ariaBusy: Boolean,
-	lStyle: String
+	lStyle: [String, Object, Array]
 }
 export default {
 	...ariaProps,

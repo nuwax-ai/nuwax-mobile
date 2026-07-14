@@ -13,7 +13,7 @@ import { isDef } from '../isDef'
  */
 export function getClassStr<T>(obj : T) : string {
 	let classNames : string[] = [];
-	// #ifdef UNI-APP-X && APP
+	// #ifdef APP-ANDROID
 	if (obj instanceof UTSJSONObject) {
 		(obj as UTSJSONObject).toMap().forEach((value, key) => {
 			if (isDef(value)) {
@@ -30,7 +30,7 @@ export function getClassStr<T>(obj : T) : string {
 		})
 	} 
 	// #endif
-	// #ifndef UNI-APP-X && APP
+	// #ifndef APP-ANDROID
 	// 遍历对象的属性
 	for (let key in obj) {
 		// 检查属性确实属于对象自身且其值为true

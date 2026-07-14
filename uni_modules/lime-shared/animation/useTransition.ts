@@ -6,13 +6,14 @@ export type UseTransitionOptions = {
 	duration ?: number
 	immediate ?: boolean
 	context ?: ComponentPublicInstance
+	onChange?: (v: number) => void
 }
 // #ifndef UNI-APP-X && APP
 import { ref, watch } from '@/uni_modules/lime-shared/vue'
 
 export function useTransition(percent : Ref<number>|(() => number), options : UseTransitionOptions) : Ref<number> {
 	const current = ref(0)
-	const { immediate, duration = 300 } = options
+	const { immediate, duration = 300, onChange } = options
 	let tl:Timeline|null = null;
 	let timer = -1
 	const isFunction = typeof percent === 'function'
@@ -30,6 +31,7 @@ export function useTransition(percent : Ref<number>|(() => number), options : Us
 				ease,
 				nowValue => {
 					current.value = nowValue
+					onChange?.(nowValue)
 					clearTimeout(timer)
 					if(current.value == v){
 						timer = setTimeout(()=>{

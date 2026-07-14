@@ -1,11 +1,11 @@
 // @ts-nocheck
 
-// #ifndef APP-ANDROID || APP-HARMONY || APP-IOS
+// #ifndef UNI-APP-X && APP
 type UTSJSONObject = {
 	version : string | number | null;
 };
 // #endif
-// #ifdef APP-ANDROID || APP-HARMONY || APP-IOS
+// #ifdef UNI-APP-X && APP
 // type Options = UTSJSONObject
 // #endif
 

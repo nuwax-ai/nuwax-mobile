@@ -67,11 +67,11 @@ export default {
 	},
 	icon: {
 		type: String,
-		default: 'rectangle'
+		default: null//'rectangle'
 	}, //?: 'circle' | 'line' | 'dot';
 	size: {
 		type: String,
-		default: 'medium'
+		default: null//'medium'
 	}, //?: 'small' | 'medium' | 'large';
 	iconSize: {
 		type: String,

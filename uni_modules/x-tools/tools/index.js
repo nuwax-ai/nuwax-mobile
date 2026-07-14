@@ -7,39 +7,39 @@ export * from './retryAsync'
 import pagesJson from '@/pages.json'
 
 export const isPromise = (obj) => {
-    return !!obj && (typeof obj === "object" || typeof obj === "function") && typeof obj.then === "function";
+	return !!obj && (typeof obj === "object" || typeof obj === "function") && typeof obj.then === "function";
 }
 
 let promisifyFlag = false
 export const promisify = () => {
 
-    if (promisifyFlag) return
+	if (promisifyFlag) return
 
-    promisifyFlag = true
+	promisifyFlag = true
 
-    // #ifdef VUE2
-    uni.addInterceptor({
-        returnValue(res) {
-            if (isPromise(res)) {
-                return new Promise((resolve, reject) => {
-                    res.then((res) => {
-                        if (Array.isArray(res)) {
-                            if (res[0]) reject(res[0])
-                            else resolve(res[1])
-                        } else {
-                            if (typeof res == 'object' && String(res.errMsg).includes(':ok')) {
-                                resolve(res)
-                            } else {
-                                reject(res)
-                            }
-                        }
-                    });
-                });
-            }
-            return res;
-        },
-    });
-    // #endif
+	// #ifdef VUE2
+	uni.addInterceptor({
+		returnValue(res) {
+			if (isPromise(res)) {
+				return new Promise((resolve, reject) => {
+					res.then((res) => {
+						if (Array.isArray(res)) {
+							if (res[0]) reject(res[0])
+							else resolve(res[1])
+						} else {
+							if (typeof res == 'object' && String(res.errMsg).includes(':ok')) {
+								resolve(res)
+							} else {
+								reject(res)
+							}
+						}
+					});
+				});
+			}
+			return res;
+		},
+	});
+	// #endif
 }
 
 // 获取类型
@@ -50,48 +50,48 @@ export const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 // 获取当前页面信息
 export const getCurrentPage = () => {
-    const pages = getCurrentPages()
-    return pages[pages.length - 1] || {}
+	const pages = getCurrentPages()
+	return pages[pages.length - 1] || {}
 }
 
 // 获取当前页面 path
 export const getCurrentPagePath = (fullPath = false) => {
-    const { route, $page } = getCurrentPage()
-    return fullPath ? $page.fullPath : '/' + route
+	const { route, $page } = getCurrentPage()
+	return fullPath && $page?.fullPath ? $page?.fullPath : '/' + route
 }
 
 // 判断当前页或指定 path 是否是 tabbar 页面
 export const isTabBarPage = path => {
-    const { tabBar } = pagesJson
-    if (!tabBar) return false
-    path = path || getCurrentPagePath()
-    return !(!tabBar || !tabBar.list || !tabBar.list.length || tabBar.list.findIndex(i => '/' + i.pagePath == path) == -1)
+	const { tabBar } = pagesJson
+	if (!tabBar) return false
+	path = path || getCurrentPagePath()
+	return !(!tabBar || !tabBar.list || !tabBar.list.length || tabBar.list.findIndex(i => '/' + i.pagePath == path) == -1)
 }
 
 // 获取应用运行页面信息
 export const getPageInfo = () => {
 
-    // 获取 pages 并去重
-    const pages = getCurrentPages().reduce((p, c) => {
-        if (!p.find(f => f.route == c.route)) p.push(c)
-        return p
-    }, [])
+	// 获取 pages 并去重
+	const pages = getCurrentPages().reduce((p, c) => {
+		if (!p.find(f => f.route == c.route)) p.push(c)
+		return p
+	}, [])
 
-    // 启动页
-    const startPage = pagesJson.pages[0].path
+	// 启动页
+	const startPage = pagesJson.pages[0].path
 
-    // tabBar
-    const tabBarList = pagesJson.tabBar?.list || []
+	// tabBar
+	const tabBarList = pagesJson.tabBar?.list || []
 
-    // 首页
-    const [page] = pages
+	// 首页
+	const [page] = pages
 
-    return {
-        currentPage: pages[pages.length - 1] || {},
-        startPage,
-        isSharePage: pages.length == 1 && page.route != startPage && !tabBarList.some(i => i.pagePath == page.route),
-        pageStackLen: pages.length,
-    }
+	return {
+		currentPage: pages[pages.length - 1] || {},
+		startPage,
+		isSharePage: pages.length == 1 && page.route != startPage && !tabBarList.some(i => i.pagePath == page.route),
+		pageStackLen: pages.length,
+	}
 }
 
 /**
@@ -104,59 +104,59 @@ export const getPageInfo = () => {
  * @return {Number} 定时器 id 用于结束倒计时
  */
 export const countDown = function(endTime, callback, formatStr = 'hh:mm:ss', refreshRate = 100) {
-    const targetTime = new Date(endTime).getTime();
-    let cacheStr
-    const intervalId = setInterval(function() {
+	const targetTime = new Date(endTime).getTime();
+	let cacheStr
+	const intervalId = setInterval(function() {
 
-        const currentTime = new Date().getTime();
+		const currentTime = new Date().getTime();
 
-        const distance = targetTime - currentTime;
+		const distance = targetTime - currentTime;
 
-        const date = {
-            d: Math.floor(distance / (1000 * 60 * 60 * 24)),
-            h: Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)),
-            m: Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60)),
-            s: Math.floor((distance % (1000 * 60)) / 1000)
-        }
+		const date = {
+			d: Math.floor(distance / (1000 * 60 * 60 * 24)),
+			h: Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)),
+			m: Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60)),
+			s: Math.floor((distance % (1000 * 60)) / 1000)
+		}
 
-        if (!formatStr.includes('d')) {
-            date.h += date.d * 24;
-            date.d = 0;
-        }
+		if (!formatStr.includes('d')) {
+			date.h += date.d * 24;
+			date.d = 0;
+		}
 
-        if (!formatStr.includes('h')) {
-            date.m += date.h * 60;
-            date.h = 0;
-        }
+		if (!formatStr.includes('h')) {
+			date.m += date.h * 60;
+			date.h = 0;
+		}
 
-        if (!formatStr.includes('m')) {
-            date.s += date.m * 60;
-            date.m = 0;
-        }
+		if (!formatStr.includes('m')) {
+			date.s += date.m * 60;
+			date.m = 0;
+		}
 
-        let str = formatStr
+		let str = formatStr
 
-        Object.keys(date).forEach(key => {
-            if (date[key] < 0) date[key] = 0
-            if (str.includes(key)) {
-                if (str.includes(key + key)) {
-                    str = str.replace(key + key, date[key].toString().padStart(2, 0))
-                } else {
-                    str = str.replace(key, date[key])
-                }
-            }
-        })
-        if (cacheStr != str) {
-            cacheStr = str
-            if (date.d + date.h + date.m + date.s <= 0) {
-                clearInterval(intervalId);
-                callback && callback({ str, ...date }, true)
-            } else {
-                callback && callback({ str, ...date }, false)
-            }
-        }
-    }, refreshRate);
-    return intervalId
+		Object.keys(date).forEach(key => {
+			if (date[key] < 0) date[key] = 0
+			if (str.includes(key)) {
+				if (str.includes(key + key)) {
+					str = str.replace(key + key, date[key].toString().padStart(2, 0))
+				} else {
+					str = str.replace(key, date[key])
+				}
+			}
+		})
+		if (cacheStr != str) {
+			cacheStr = str
+			if (date.d + date.h + date.m + date.s <= 0) {
+				clearInterval(intervalId);
+				callback && callback({ str, ...date }, true)
+			} else {
+				callback && callback({ str, ...date }, false)
+			}
+		}
+	}, refreshRate);
+	return intervalId
 }
 
 
@@ -171,47 +171,47 @@ export const countDown = function(endTime, callback, formatStr = 'hh:mm:ss', ref
  * @return {Promise} judgeFun 函数返回 success 或 fail 的调用结果
  */
 export const pollingForResult = function(fun, params, judgeFun, ms = 1000, timeout = 1000 * 60) {
-    // console.time('polling-time')
-    console.log('polling-params', arguments);
-    let startTime = Date.now()
-    let prevCallTime = 0
-    if (typeof judgeFun != 'function') throw new Error('judgeFun 参数应为一个 function');
-    if (!(params instanceof Array)) params = [params]
-    if (ms <= 0) ms = 1
-    return new Promise((resolve, reject) => {
-        function fun_call() {
-            if ((prevCallTime + ms) > Date.now()) {
-                setTimeout(() => {
-                    fun_call()
-                }, (prevCallTime + ms) - Date.now());
-                return
-            }
-            if ((timeout + startTime) < Date.now()) {
-                reject('Timeout')
-                return
-            }
-            prevCallTime = Date.now()
-            // console.time('fun-call-time')
-            fun(...params).then(res => {
-                console.log('fun-call-res', res);
-                // console.timeEnd('fun-call-time')
-                if (judgeFun(res) === 'success') {
-                    resolve(res)
-                    // console.timeEnd('polling-time')
-                } else if (judgeFun(res) === 'fail') {
-                    reject(res)
-                    // console.timeEnd('polling-time')
-                } else {
-                    fun_call()
-                }
-            }).catch(err => {
-                console.log('fun-call-err', err);
-                // console.timeEnd('fun-call-time')
-                fun_call()
-            })
-        }
-        fun_call()
-    })
+	// console.time('polling-time')
+	console.log('polling-params', arguments);
+	let startTime = Date.now()
+	let prevCallTime = 0
+	if (typeof judgeFun != 'function') throw new Error('judgeFun 参数应为一个 function');
+	if (!(params instanceof Array)) params = [params]
+	if (ms <= 0) ms = 1
+	return new Promise((resolve, reject) => {
+		function fun_call() {
+			if ((prevCallTime + ms) > Date.now()) {
+				setTimeout(() => {
+					fun_call()
+				}, (prevCallTime + ms) - Date.now());
+				return
+			}
+			if ((timeout + startTime) < Date.now()) {
+				reject('Timeout')
+				return
+			}
+			prevCallTime = Date.now()
+			// console.time('fun-call-time')
+			fun(...params).then(res => {
+				console.log('fun-call-res', res);
+				// console.timeEnd('fun-call-time')
+				if (judgeFun(res) === 'success') {
+					resolve(res)
+					// console.timeEnd('polling-time')
+				} else if (judgeFun(res) === 'fail') {
+					reject(res)
+					// console.timeEnd('polling-time')
+				} else {
+					fun_call()
+				}
+			}).catch(err => {
+				console.log('fun-call-err', err);
+				// console.timeEnd('fun-call-time')
+				fun_call()
+			})
+		}
+		fun_call()
+	})
 }
 
 /**
@@ -224,37 +224,37 @@ export const pollingForResult = function(fun, params, judgeFun, ms = 1000, timeo
  * @return {Function} 结束轮询函数
  */
 export const pollingForData = function(fun, params, callback, ms = 1000) {
-    console.log('polling-params', arguments);
-    let prevCallTime = 0
-    let endFlag = false
-    let count = 0
-    if (typeof callback != 'function') throw new Error('callback 参数应为一个 function');
-    if (!(params instanceof Array)) params = [params]
-    if (ms <= 0) ms = 1
+	console.log('polling-params', arguments);
+	let prevCallTime = 0
+	let endFlag = false
+	let count = 0
+	if (typeof callback != 'function') throw new Error('callback 参数应为一个 function');
+	if (!(params instanceof Array)) params = [params]
+	if (ms <= 0) ms = 1
 
-    function fun_call() {
-        if (endFlag) return
-        if ((prevCallTime + ms) > Date.now()) {
-            setTimeout(() => {
-                fun_call()
-            }, (prevCallTime + ms) - Date.now());
-            return
-        }
-        prevCallTime = Date.now()
-        count++
-        fun(...params).then(res => {
-            callback && callback(null, res, count)
-            fun_call()
-        }).catch(err => {
-            callback && callback(err, null, count)
-            fun_call()
-        })
-    }
-    fun_call()
-    return () => {
-        console.log('polling-end');
-        endFlag = true
-    }
+	function fun_call() {
+		if (endFlag) return
+		if ((prevCallTime + ms) > Date.now()) {
+			setTimeout(() => {
+				fun_call()
+			}, (prevCallTime + ms) - Date.now());
+			return
+		}
+		prevCallTime = Date.now()
+		count++
+		fun(...params).then(res => {
+			callback && callback(null, res, count)
+			fun_call()
+		}).catch(err => {
+			callback && callback(err, null, count)
+			fun_call()
+		})
+	}
+	fun_call()
+	return () => {
+		console.log('polling-end');
+		endFlag = true
+	}
 }
 
 /**
@@ -264,58 +264,58 @@ export const pollingForData = function(fun, params, callback, ms = 1000) {
  * @return {Object} 新对象
  */
 export const deepClone = (target, map = new WeakMap()) => {
-    if (target === null || typeof target !== 'object') {
-        return target;
-    }
+	if (target === null || typeof target !== 'object') {
+		return target;
+	}
 
-    if (target instanceof Date) {
-        return new Date(target);
-    }
+	if (target instanceof Date) {
+		return new Date(target);
+	}
 
-    if (target instanceof RegExp) {
-        return new RegExp(target.source, target.flags);
-    }
+	if (target instanceof RegExp) {
+		return new RegExp(target.source, target.flags);
+	}
 
-    if (target instanceof Map) {
-        const newMap = new Map();
-        target.forEach((value, key) => {
-            newMap.set(deepClone(key, map), deepClone(value, map));
-        });
-        return newMap;
-    }
+	if (target instanceof Map) {
+		const newMap = new Map();
+		target.forEach((value, key) => {
+			newMap.set(deepClone(key, map), deepClone(value, map));
+		});
+		return newMap;
+	}
 
-    if (target instanceof Set) {
-        const newSet = new Set();
-        target.forEach(value => {
-            newSet.add(deepClone(value, map));
-        });
-        return newSet;
-    }
+	if (target instanceof Set) {
+		const newSet = new Set();
+		target.forEach(value => {
+			newSet.add(deepClone(value, map));
+		});
+		return newSet;
+	}
 
-    if (typeof target === 'function') {
-        return target;
-    }
+	if (typeof target === 'function') {
+		return target;
+	}
 
-    if (map.has(target)) {
-        return map.get(target);
-    }
+	if (map.has(target)) {
+		return map.get(target);
+	}
 
-    const cloneTarget = Array.isArray(target) ? [] : {};
+	const cloneTarget = Array.isArray(target) ? [] : {};
 
-    map.set(target, cloneTarget);
+	map.set(target, cloneTarget);
 
-    const symbolKeys = Object.getOwnPropertySymbols(target);
-    if (symbolKeys.length > 0) {
-        symbolKeys.forEach(symKey => {
-            cloneTarget[symKey] = deepClone(target[symKey], map);
-        });
-    }
+	const symbolKeys = Object.getOwnPropertySymbols(target);
+	if (symbolKeys.length > 0) {
+		symbolKeys.forEach(symKey => {
+			cloneTarget[symKey] = deepClone(target[symKey], map);
+		});
+	}
 
-    for (let key in target) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) {
-            cloneTarget[key] = deepClone(target[key], map);
-        }
-    }
+	for (let key in target) {
+		if (Object.prototype.hasOwnProperty.call(target, key)) {
+			cloneTarget[key] = deepClone(target[key], map);
+		}
+	}
 
-    return cloneTarget;
+	return cloneTarget;
 }

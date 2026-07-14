@@ -17,9 +17,16 @@
  * 2. 当长度>11时采用递归拼接，可能略微影响性能（在极端大长度情况下）
  * 3. 字符串补全时使用'0'填充，可能略微降低末尾字符的随机性
  */
-export function guid(len:number = 32):string {
+export function guid(len : number = 32) : string {
 	// crypto.randomUUID();
-	return len <= 11 
+	// #ifdef WEB
+	if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+		const uuid = crypto.randomUUID().replace(/-/g, '');
+		return len === 32 ? uuid : uuid.substring(0, len);
+	}
+	// #endif
+
+	return len <= 11
 		? Math.random()
 			.toString(36)
 			.substring(2, 2 + len)

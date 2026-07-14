@@ -1,7 +1,4 @@
 export const log = console.log
-// uni-app x APP-Android: .js 文件无法 import .uts 模块（如 @/utils/i18n）
-// sugar.js 里 t 只用于少数 toast 文案，这里 stub 成返回 key 即可
-const t = (key) => key
 
 export const upx2px = val => uni.upx2px(parseInt(val))
 
@@ -94,13 +91,10 @@ export const toCustomerService = (corpId, url) => {
                 console.log("error", JSON.stringify(err))
             })
         } else {
-            plus.nativeUI.alert(t('Mobile.ThirdParty.XTools.wechatUnsupported'))
+            plus.nativeUI.alert('当前环境不支持微信操作!')
         }
     }, function() {
-        uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.getServiceFailed'),
-            icon: 'error'
-        })
+        uni.showToast({ title: "获取服务失败，不支持该操作。" + JSON.stringify(e), icon: 'error' })
     })
     // #endif
 
@@ -148,14 +142,14 @@ export const saveImage = async (url, tips = true) => {
         // #endif
 
         tips && uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.saveSuccess'),
+            title: '保存成功',
             icon: 'success'
         })
     } catch (e) {
         console.log(e);
 
         tips && uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.saveFailed'),
+            title: '保存失败',
             icon: 'error'
         })
     }

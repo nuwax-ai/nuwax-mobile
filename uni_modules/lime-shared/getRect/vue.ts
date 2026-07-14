@@ -23,9 +23,15 @@ export function getRect(selector : string, context : ComponentInternalInstance|C
 	// #ifdef MP || VUE2
 	if (context.proxy) context = context.proxy
 	// #endif
+	
 	return new Promise<UniNamespace.NodeInfo>((resolve, reject) => {
 		// #ifndef APP-NVUE
-		const dom = uni.createSelectorQuery().in(context).select(selector);
+		const dom = uni.createSelectorQuery()
+		
+		.in(context) // 抖音virtualHost时使用this无法拿到真正的尺寸
+		// #ifndef MP-TOUTIAO
+		// #endif
+		.select(selector);
 		const result = (rect: UniNamespace.NodeInfo) => {
 			if (rect) {
 				resolve(rect)

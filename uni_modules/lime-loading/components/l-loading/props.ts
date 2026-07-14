@@ -16,7 +16,9 @@ export default {
 	},
 	text: String,
 	textColor: String,
-	textSize: String,
+	textSize: {
+		type: [String, Number]
+	},
 	vertical: Boolean,
 	inheritColor: Boolean,
 	animated: {

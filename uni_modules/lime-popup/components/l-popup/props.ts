@@ -78,5 +78,12 @@ export default {
 	radius: {
 		type: [String, Number, Array],
 		default: undefined
+	},
+	safeAreaInsetBottom: {
+		type: Boolean
+	},
+	safeAreaInsetTop : {
+		type: Boolean,
+		default: true
 	}
 };

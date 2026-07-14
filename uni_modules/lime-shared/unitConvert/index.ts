@@ -8,7 +8,8 @@ import { isNumeric } from '../isNumeric'
  * @returns 转换后的数字，如果无法转换则返回0
  */
 // #ifndef UNI-APP-X && APP
-export function unitConvert(value : string | number | null | undefined, base: number = 0) : number {
+export function unitConvert(value : string | number | null | undefined, base : number = 0) : number {
+	if (value == null) return NaN
 	// 如果是字符串数字
 	if (isNumeric(value)) {
 		return Number(value);
@@ -18,7 +19,7 @@ export function unitConvert(value : string | number | null | undefined, base: nu
 		const reg = /^-?([0-9]+)?([.]{1}[0-9]+){0,1}(em|rpx|px|%)$/g;
 		const results = reg.exec(value);
 		if (!value || !results) {
-			return 0;
+			return NaN;
 		}
 		const unit = results[3];
 		const _value = parseFloat(value);
@@ -28,19 +29,20 @@ export function unitConvert(value : string | number | null | undefined, base: nu
 		if (unit === 'px') {
 			return _value * 1;
 		}
-		if(unit == '%') {
+		if (unit == '%') {
 			return _value / 100 * base
 		}
 		// 如果是其他单位，可以继续添加对应的转换逻辑
 	}
-	return 0;
+	return NaN;
 }
 // #endif
 
 
 // #ifdef UNI-APP-X && APP
 import { isNumber } from '../isNumber'
-export function unitConvert(value : any | null, base: number = 0) : number {
+export function unitConvert(value : any | null, base : number = 0) : number {
+	if (value == null) return NaN
 	if (isNumber(value)) {
 		return value as number
 	}
@@ -53,26 +55,38 @@ export function unitConvert(value : any | null, base: number = 0) : number {
 		const reg = /^-?([0-9]+)?([.]{1}[0-9]+){0,1}(em|rpx|px|%)$/g;
 		const results = reg.exec(value as string);
 		if (results == null) {
-			return 0;
+			return NaN;
 		}
 		const unit = results[3];
 		const _value = parseFloat(value);
 		if (unit == 'rpx') {
-			// const { windowWidth } = uni.getWindowInfo()
-			// return windowWidth / 750 * _value;
 			return uni.rpx2px(_value)
 		}
 		if (unit == 'px') {
 			return _value;
 		}
-		if(unit == '%') {
+		if (unit == '%') {
 			return _value / 100 * base
 		}
 		// 如果是其他单位，可以继续添加对应的转换逻辑
 	}
-	return 0;
+	return NaN;
 }
 // #endif
+
+export function parseUnit(
+	// #ifndef UNI-APP-X && APP
+	value : string | number | null | undefined,
+	// #endif
+	// #ifdef UNI-APP-X && APP
+	value : string | number | null,
+	// #endif
+	base : number = 0
+) : number | null {
+	const result = unitConvert(value, base);
+	return isNaN(result) ? null : result;
+}
+
 // 示例
 // console.log(unitConvert("123")); // 输出: 123 (字符串数字转换为数字)
 // console.log(unitConvert("3.14em")); // 输出: 0 (无法识别的单位)

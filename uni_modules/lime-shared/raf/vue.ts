@@ -1,5 +1,5 @@
 // @ts-nocheck
-type Callback = any
+type Callback = () => void//Function
 // 是否支持被动事件监听
 export const supportsPassive = true;
 

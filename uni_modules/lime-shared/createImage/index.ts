@@ -11,12 +11,11 @@ class Image {
 	path: string = ''
 	crossOrigin: string = ''
 	referrerPolicy: string = ''
-	onload: any = () => {}
-	onerror: any = () => {}
+	onload: () => void = () => {}
+	onerror: () => void = () => {}
 	complete: boolean = false
 	constructor() {}
 	set src(src: string) {
-		console.log('src', src)
 		if(!src) {
 			return this.onerror()
 		}

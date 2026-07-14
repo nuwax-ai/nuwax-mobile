@@ -7,8 +7,8 @@
 
 
 // #ifdef UNI-APP-X && APP
-function sleep(delay: number = 300):Promise<boolean> {
-	return new Promise((resolve):void => {setTimeout(() => {resolve(true)}, delay)});
+function sleep(delay: number = 300):Promise<void> {
+	return new Promise((resolve):void => {setTimeout(() => {resolve()}, delay)});
 }
 export {
 	sleep

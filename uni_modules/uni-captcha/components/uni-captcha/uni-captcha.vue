@@ -6,12 +6,11 @@
 				mode="widthFix"></image>
 		</view>
 		<input @blur="focusCaptchaInput = false" :focus="focusCaptchaInput" type="text" class="captcha"
-			:inputBorder="false" maxlength="4" v-model="val" :placeholder="verifyCodePlaceholder">
+			:inputBorder="false" maxlength="4" v-model="val" placeholder="请输入验证码">
 	</view>
 </template>
 
 <script>
-	import { t } from '@/utils/i18n'
 	export default {
 		props: {
 			modelValue:String,
@@ -55,11 +54,6 @@
 				loging: false
 			};
 		},
-		computed: {
-			verifyCodePlaceholder() {
-				return t('Mobile.Auth.inputVerifyCode')
-			}
-		},
 		watch: {
 			scene: {
 				handler(scene) {
@@ -67,7 +61,7 @@
 						this.getImageCaptcha(this.focus)
 					} else {
 						uni.showToast({
-							title: t('Mobile.ThirdParty.UniCaptcha.sceneRequired'),
+							title: 'scene不能为空',
 							icon: 'none'
 						});
 					}

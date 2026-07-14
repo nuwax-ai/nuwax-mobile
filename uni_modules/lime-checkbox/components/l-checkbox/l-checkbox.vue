@@ -117,11 +117,13 @@
 				return props.indeterminate;
 			})
 			
-			const innerIcon = computed(():string => checkboxGroup?.icon || props.icon)
-			const innerSize = computed(():string => checkboxGroup?.size || props.size)
-			const innerIconSize = computed(():string|null => checkboxGroup?.iconSize || props.iconSize)
-			const innerFontSize = computed(():string|null => checkboxGroup?.fontSize || props.fontSize)
-			const innerCheckedColor = computed(():string|null => checkboxGroup?.checkedColor || props.checkedColor)
+			// const innerIcon = computed(():string => checkboxGroup?.icon || props.icon)
+			// const innerSize = computed(():string => checkboxGroup?.size || props.size)
+			const innerIcon = computed(():string => props.icon || checkboxGroup?.icon || 'rectangle')
+			const innerSize = computed(():string => props.size || checkboxGroup?.size || 'medium')
+			const innerIconSize = computed(():string|null => props.iconSize || checkboxGroup?.iconSize)
+			const innerFontSize = computed(():string|null => props.fontSize || checkboxGroup?.fontSize)
+			const innerCheckedColor = computed(():string|null =>  props.checkedColor || checkboxGroup?.checkedColor)
 			const innerIconBgColor = computed(():string => props.iconBgColor || checkboxGroup?.iconBgColor)
 			const innerIconBorderColor = computed(():string => props.iconBorderColor || checkboxGroup?.iconBorderColor)
 			const innerIconDisabledColor = computed(():string => props.iconDisabledColor || checkboxGroup?.iconDisabledColor)
@@ -129,7 +131,7 @@
 			
 			
 			const rootCasses = computed(()=>{
-				const cls = [`${name}--${props.size}`]
+				const cls = [`${name}--${innerSize.value}`]
 				if(isDisabled.value) {
 					cls.push(`${name}--disabled`)
 				}
@@ -137,7 +139,7 @@
 			})
 			
 			const iconClasses = computed(()=>{
-				const cls = [`${name}__icon--${props.icon}`]
+				const cls = [`${name}__icon--${innerIcon.value}`]
 				if(isChecked.value) {
 					cls.push(`${name}__icon--checked`)
 				}

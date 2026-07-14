@@ -28,7 +28,7 @@ export type CheckboxProps = {
 	 * 只读
 	 */
 	readonly : boolean;
-	size : 'small' | 'medium' | 'large'
+	size ?: 'small' | 'medium' | 'large'
 	/**
 	 * 标识符，通常为一个唯一的字符串或数字
 	 */
@@ -41,7 +41,7 @@ export type CheckboxProps = {
 	 * 多选框的值
 	 */
 	value?: any; // string | number 
-	icon: 'circle' | 'line' | 'rectangle' | 'dot';
+	icon ?: 'circle' | 'line' | 'rectangle' | 'dot';
 	
 	fontSize?: string;
 	iconSize?: string;
@@ -54,7 +54,7 @@ export type CheckboxProps = {
 	labelStyle?: string | UTSJSONObject
 }
 
-export type ManageChildInList = (instance: any | null, register: boolean) => void;
+export type ManageChildInList = (child: LCheckboxComponentPublicInstance, shouldAdd: boolean) => void;
 export type CheckboxStatus = 'checked' | 'uncheck' | 'indeterminate';
 export type CheckboxChangeOptions = {
 	checked : boolean,

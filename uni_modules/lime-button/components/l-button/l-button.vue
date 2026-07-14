@@ -40,7 +40,9 @@
 		<view class="l-button__loading"  v-if="loading">
 			<l-loading inheritColor></l-loading>
 		</view>
-		<l-icon class="l-button__icon" v-if="icon" :name="icon"></l-icon>
+		<view class="l-button__icon" v-if="icon">
+			<l-icon :name="icon" inherit></l-icon>
+		</view>
 		<view class="l-button__content" v-if="content || $slots.default">
 			<slot>{{content}}</slot>
 		</view>
@@ -149,8 +151,14 @@
 			})
 			const styles = computed(()=>{
 				const style:Record<string, any> = {}
+				if(props.iconSize) {
+					style['--l-button-icon-size'] = props.iconSize
+				}
 				if(props.gap) {
 					style['--l-button-gap'] = props.gap
+				}
+				if(props.radius) {
+					style['--l-button-border-radius'] = props.radius
 				}
 				if(props.color){
 					if(['outline'].includes(props.variant) ){
@@ -162,7 +170,9 @@
 						style['color'] = 'white'
 					}
 				}
-				
+				if(props.textColor) {
+					style['color'] = props.textColor
+				}
 				return style
 			})
 			const getuserinfo = (e) => {

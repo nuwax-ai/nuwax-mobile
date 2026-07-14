@@ -20,9 +20,9 @@ export function addUnit(value?: string | number): string | null {
 
 
 // #ifdef UNI-APP-X && APP
-function addUnit(value: string): string
-function addUnit(value: number): string
-function addUnit(value: any|null): string|null  {
+function addUnit(value: string): string|null
+function addUnit(value: number): string|null
+function addUnit(value: string|number|null): string|null  {
   if (!isDef(value)) {
     return null;
   }

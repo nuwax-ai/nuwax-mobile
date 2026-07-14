@@ -53,7 +53,7 @@ export interface PopupProps {
 	safeAreaInsetBottom:boolean;
 	safeAreaInsetTop:boolean;
 	
-	radius?: string | number | (string|number)[]
+	radius?: string | number | Array//(string|number)[]
 }
 
 export type PopupSource = 'close-btn' | 'overlay';

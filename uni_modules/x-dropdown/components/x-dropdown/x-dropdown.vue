@@ -3,7 +3,7 @@
         <view class="x-dropdown" :style="customStyle" @click="click">
             <slot></slot>
         </view>
-        <view class="x-dropdown-mask" :class="{'x-dropdown-mask-show': maskShow}" @click="close">
+        <view class="x-dropdown-mask" :class="{'x-dropdown-mask-show': maskShow}" @touchmove.prevent="()=>{}" @click="close">
             <view class="x-dropdown-menu-container" :style="[layout]">
                 <slot name="menu">
                     <view class="menu">
@@ -133,7 +133,6 @@
 </script>
 
 <style lang="scss" scoped>
-/* #ifdef H5 */
     .x-dropdown {
         width: fit-content;
         position: relative;
@@ -185,5 +184,4 @@
         opacity: 1;
         pointer-events: auto;
     }
-/* #endif */
 </style>

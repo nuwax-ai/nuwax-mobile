@@ -2,19 +2,18 @@
 	<uni-popup ref="popup" type="center">
 		<view class="popup-captcha">
 			<view class="content">
-				<text class="title">{{displayTitle}}</text>
+				<text class="title">{{title}}</text>
 				<uni-captcha :focus="focus" :scene="scene" v-model="val"></uni-captcha>
 			</view>
 			<view class="button-box">
-				<view @click="close" class="btn">{{ getI18nText("Mobile.Common.cancel") }}</view>
-				<view @click="confirm" class="btn confirm">{{ getI18nText("Mobile.Common.confirm") }}</view>
+				<view @click="close" class="btn">取消</view>
+				<view @click="confirm" class="btn confirm">确认</view>
 			</view>
 		</view>
 	</uni-popup>
 </template>
 
 <script>
-	import { t, translateText } from '@/utils/i18n'
 	export default {
 		data() {
 			return {
@@ -38,9 +37,6 @@
 			},
 		},
 		computed:{
-			displayTitle() {
-				return translateText(this.title || 'Mobile.ThirdParty.UniCaptcha.defaultTitle')
-			},
 			val:{
 				get(){
 					return this.value||this.modelValue
@@ -60,9 +56,6 @@
 			}
 		},
 		methods: {
-			getI18nText(key) {
-				return t(key)
-			},
 			open() {
 				this.focus = true
 				this.val = ""
@@ -75,7 +68,7 @@
 			confirm() {
 				if(!this.val){
 					return uni.showToast({
-						title: t('Mobile.ThirdParty.UniCaptcha.fillCaptcha'),
+						title: '请填写验证码',
 						icon: 'none'
 					});
 				}

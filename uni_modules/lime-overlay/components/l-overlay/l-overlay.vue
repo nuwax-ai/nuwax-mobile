@@ -7,6 +7,7 @@
 		@click.stop="onClick" 
 		@touchmove.stop="noop" 
 		@transitionend="finished"
+		:data-display="display"
 		:aria-role="ariaRole || 'button'" 
 		:aria-label="ariaLabel || '关闭'">
 		<slot></slot>
@@ -39,7 +40,7 @@
 	 * @event {Function} after-leave
 	 */
 
-	import { computed, defineComponent } from '@/uni_modules/lime-shared/vue';
+	import { computed, defineComponent, watch } from '@/uni_modules/lime-shared/vue';
 	import { useTransition, type UseTransitionOptions, type TransitionEmitStatus } from '@/uni_modules/lime-transition';
 	import overlayProps from './props';
 
@@ -63,12 +64,15 @@
 			} as UseTransitionOptions)
 
 
-			const styles = computed(() => ({
-				'transition-duration': props.duration + 'ms',
-				'background': props.bgColor,
-				'z-index': props.zIndex,
-				'display': !display.value ? 'none' : '',
-			}))
+			const styles = computed(() => {
+				const style = {
+					'transition-duration': props.duration + 'ms',
+					'background': props.bgColor,
+					'z-index': props.zIndex,
+					'display': !display.value ? 'none' : '',
+				}
+				return style
+			})
 
 			const onClick = () => {
 				emit('click', !props.visible)
@@ -77,8 +81,10 @@
 				e?.preventDefault();
 				return
 			}
-
+			
+			
 			return {
+				display,
 				inited,
 				styles,
 				classes,

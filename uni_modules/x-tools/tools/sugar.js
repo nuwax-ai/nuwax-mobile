@@ -1,6 +1,8 @@
+import { rpx2px as _rpx2px } from './com.js'
+
 export const log = console.log
 
-export const upx2px = val => uni.upx2px(parseInt(val))
+export const upx2px = val => _rpx2px(parseInt(val))
 
 export const toast = (title, options = { duration: 2000, icon: 'none' }) => uni.showToast({ title, fail: console.log, ...options })
 

@@ -4,7 +4,8 @@
     :class="'_block _' + name + ' ' + attrs.class"
     :style="attrs.style"
   >
-    <block v-for="(n, i) in childs" v-bind:key="i">
+    <!-- uni-app-x App：无 block 内置组件，用 template 作虚拟包裹 -->
+    <template v-for="(n, i) in childs" :key="i">
       <!-- 图片 -->
       <!-- 占位图 -->
       <image
@@ -238,7 +239,7 @@
             :childs="tbody.children"
             :opts="opts"
           />
-          <block v-else v-for="(tr, y) in tbody.children" v-bind:key="y">
+          <template v-else v-for="(tr, y) in tbody.children" :key="y">
             <view
               v-if="tr.name === 'td' || tr.name === 'th'"
               :class="'_' + tr.name + ' ' + tr.attrs.class"
@@ -253,14 +254,14 @@
             >
               <view
                 v-for="(td, z) in tr.children"
-                v-bind:key="z"
+                :key="z"
                 :class="'_' + td.name + ' ' + td.attrs.class"
                 :style="td.attrs.style"
               >
                 <node :childs="td.children" :opts="opts" />
               </view>
             </view>
-          </block>
+          </template>
         </view>
       </view>
       <markdown-container
@@ -365,7 +366,7 @@
         :opts="opts"
         :copy-text="n._copyText"
       />
-    </block>
+    </template>
   </view>
 </template>
 <script module="handler" lang="wxs">

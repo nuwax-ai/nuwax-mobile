@@ -1,5 +1,11 @@
 /**
  * Android 兼容：API / JSON 数据需通过 class 构造 MessageInfo，禁止 UTSJSONObject as MessageInfo。
+ *
+ * Android 响应数组项常为 Map：
+ * - JSON.stringify(Map) == "{}"
+ * - Map as UTSJSONObject 后 bracket 读不到字段
+ * - UTSJSONObject as Map 会 ClassCastException
+ * 必须用 Map.get(已知键) / UTSJSONObject.keys 读取。
  */
 import {
   MessageInfo,
@@ -16,8 +22,175 @@ import {
 } from "@/types/enums/agent";
 import { MessageStatusEnum } from "@/types/enums/common";
 
+/** 消息对象已知字段（避免依赖 Map.forEach / stringify） */
+const MESSAGE_FIELD_KEYS: string[] = [
+  "id",
+  "role",
+  "type",
+  "text",
+  "think",
+  "time",
+  "attachments",
+  "ext",
+  "finished",
+  "metadata",
+  "messageType",
+  "requestId",
+  "index",
+  "status",
+  "finalResult",
+  "processingList",
+  "markdownElList",
+  "componentExecutedList",
+  "mcpAskInteractions",
+];
+
+function isMessageFieldKey(key: string): boolean {
+  for (let i = 0; i < MESSAGE_FIELD_KEYS.length; i++) {
+    if (MESSAGE_FIELD_KEYS[i] == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 从 Map / UTSJSONObject / 普通对象安全读字段。
+ * Android：优先 Map.get；禁止对 Map 做 as UTSJSONObject 后用 bracket。
+ */
+export function readRawField(raw: any | null, key: string): any | null {
+  if (raw == null || key.length == 0) {
+    return null;
+  }
+
+  // 1) Map.get（Android Gson / 网络层常见）
+  try {
+    const m = raw as Map<string, any | null>;
+    if (m != null) {
+      if (m.has(key) == true) {
+        return m.get(key);
+      }
+      // 部分实现 has 不可靠，再试 get
+      const fromGet = m.get(key);
+      if (fromGet != null) {
+        return fromGet;
+      }
+    }
+  } catch (_eMap) {
+    // 非 Map（如 UTSJSONObject as Map 会 CCE）
+  }
+
+  // 2) UTSJSONObject bracket
+  try {
+    const o = raw as UTSJSONObject;
+    if (o != null) {
+      return o[key];
+    }
+  } catch (_eObj) {
+    // ignore
+  }
+
+  return null;
+}
+
+/**
+ * 将 API 消息项规范为可 bracket 读取的 UTSJSONObject。
+ */
+export function normalizeMessageRawToJson(raw: any | null): UTSJSONObject | null {
+  if (raw == null) {
+    return null;
+  }
+
+  // 1) Map：先按已知键 get；再 forEach（兼容 JS (value,key) / Kotlin (key,value)）
+  try {
+    const m = raw as Map<string, any | null>;
+    if (m != null) {
+      const out = new UTSJSONObject();
+      let count = 0;
+      for (let i = 0; i < MESSAGE_FIELD_KEYS.length; i++) {
+        const key = MESSAGE_FIELD_KEYS[i];
+        if (m.has(key) == true) {
+          out[key] = m.get(key);
+          count++;
+        } else {
+          const v = m.get(key);
+          if (v != null) {
+            out[key] = v;
+            count++;
+          }
+        }
+      }
+      if (count > 0) {
+        return out;
+      }
+      // get/has 未命中时用 forEach；用「参数是否为已知字段名」判断顺序
+      m.forEach((a: any | null, b: any | null) => {
+        const aStr = a != null ? `${a}` : "";
+        const bStr = b != null ? `${b}` : "";
+        let fieldKey: string | null = null;
+        let fieldVal: any | null = null;
+        if (isMessageFieldKey(bStr)) {
+          // JS 约定：(value, key)
+          fieldKey = bStr;
+          fieldVal = a;
+        } else if (isMessageFieldKey(aStr)) {
+          // Kotlin 常见：(key, value)
+          fieldKey = aStr;
+          fieldVal = b;
+        }
+        if (fieldKey != null) {
+          out[fieldKey] = fieldVal;
+          count++;
+        }
+      });
+      if (count > 0) {
+        return out;
+      }
+    }
+  } catch (_eMap) {
+    // 非 Map
+  }
+
+  // 2) 已是 UTSJSONObject：必须能读到业务字段，否则当作无效（避免空壳 MessageInfo）
+  try {
+    const o = raw as UTSJSONObject;
+    const hasId = o["id"] != null;
+    const hasText = o["text"] != null;
+    const hasRole = o["role"] != null;
+    if (hasId == true || hasText == true || hasRole == true) {
+      return o;
+    }
+  } catch (_eObj) {
+    // 非 UTSJSONObject
+  }
+
+  // 3) JSON 往返（仅非空对象；Map 通常走不到或 stringify 为 "{}"）
+  try {
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr != null && jsonStr.length > 2 && jsonStr != "null" && jsonStr != "{}") {
+      const parsed = JSON.parse(jsonStr) as UTSJSONObject | null;
+      if (parsed != null) {
+        return parsed;
+      }
+    }
+  } catch (_eJson) {
+    // ignore
+  }
+
+  return null;
+}
+
 function parseAssistantRole(val: any | null): AssistantRoleEnum {
   if (val == null) return AssistantRoleEnum.USER;
+  // Android 枚举 / 嵌套可能是 { value: "USER" }
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseAssistantRole(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
   const s = `${val}`;
   if (s == "ASSISTANT") return AssistantRoleEnum.ASSISTANT;
   if (s == "SYSTEM") return AssistantRoleEnum.SYSTEM;
@@ -27,6 +200,14 @@ function parseAssistantRole(val: any | null): AssistantRoleEnum {
 
 function parseMessageMode(val: any | null): MessageModeEnum | null {
   if (val == null) return null;
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseMessageMode(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
   const s = `${val}`;
   if (s == "CHAT") return MessageModeEnum.CHAT;
   if (s == "THINK") return MessageModeEnum.THINK;
@@ -38,6 +219,14 @@ function parseMessageMode(val: any | null): MessageModeEnum | null {
 
 function parseMessageType(val: any | null): MessageTypeEnum {
   if (val == null) return MessageTypeEnum.USER;
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseMessageType(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
   const s = `${val}`;
   if (s == "ASSISTANT") return MessageTypeEnum.ASSISTANT;
   if (s == "SYSTEM") return MessageTypeEnum.SYSTEM;
@@ -47,11 +236,19 @@ function parseMessageType(val: any | null): MessageTypeEnum {
 
 function parseMessageStatus(val: any | null): MessageStatusEnum | null {
   if (val == null) return null;
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseMessageStatus(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
   const s = `${val}`;
   if (s == "loading") return MessageStatusEnum.Loading;
   if (s == "incomplete") return MessageStatusEnum.Incomplete;
   if (s == "complete") return MessageStatusEnum.Complete;
-  if (s == "error") return "error" as MessageStatusEnum;
+  if (s == "error") return MessageStatusEnum.Failed;
   return null;
 }
 
@@ -76,55 +273,123 @@ export class MessageInfoClass implements MessageInfo {
   componentExecutedList: any | null = null;
   mcpAskInteractions: any | null = null;
 
-  constructor(raw: UTSJSONObject) {
+  /**
+   * @param raw Map / UTSJSONObject / 已规范化对象；禁止依赖 as UTSJSONObject 后才可读
+   */
+  constructor(raw: any | null) {
     if (raw == null) return;
-    this.id = (raw["id"] as number | string | null) ?? 0;
-    this.role = parseAssistantRole(raw["role"]);
-    this.type = parseMessageMode(raw["type"]);
-    const textRaw = raw["text"];
+
+    const idRaw = readRawField(raw, "id");
+    this.id = idRaw != null ? `${idRaw}` : 0;
+    this.role = parseAssistantRole(readRawField(raw, "role"));
+    this.type = parseMessageMode(readRawField(raw, "type"));
+    const textRaw = readRawField(raw, "text");
     this.text = textRaw != null ? `${textRaw}` : null;
-    const thinkRaw = raw["think"];
+    const thinkRaw = readRawField(raw, "think");
     this.think = thinkRaw != null ? `${thinkRaw}` : null;
-    this.time = (raw["time"] as string | null) ?? "";
-    const attachmentsRaw = raw["attachments"];
+    const timeRaw = readRawField(raw, "time");
+    this.time = timeRaw != null ? `${timeRaw}` : "";
+    const attachmentsRaw = readRawField(raw, "attachments");
     this.attachments =
       attachmentsRaw != null ? (attachmentsRaw as AttachmentFile[]) : null;
-    const extRaw = raw["ext"];
+    const extRaw = readRawField(raw, "ext");
     this.ext = extRaw != null ? (extRaw as MessageQuestionExtInfo[]) : null;
-    const finishedRaw = raw["finished"];
-    this.finished = finishedRaw != null ? (finishedRaw as boolean) : null;
-    this.metadata = raw["metadata"] ?? null;
-    this.messageType = parseMessageType(raw["messageType"]);
-    const requestIdRaw = raw["requestId"];
+    const finishedRaw = readRawField(raw, "finished");
+    this.finished = finishedRaw == true ? true : finishedRaw == false ? false : null;
+    this.metadata = readRawField(raw, "metadata");
+    this.messageType = parseMessageType(readRawField(raw, "messageType"));
+    const requestIdRaw = readRawField(raw, "requestId");
     this.requestId = requestIdRaw != null ? `${requestIdRaw}` : null;
-    const indexRaw = raw["index"];
-    this.index = indexRaw != null ? (indexRaw as number) : null;
-    this.status = parseMessageStatus(raw["status"]);
-    const finalResultRaw = raw["finalResult"];
+    const indexRaw = readRawField(raw, "index");
+    if (indexRaw != null) {
+      const idx = parseFloat(`${indexRaw}`);
+      this.index = idx != idx ? null : idx;
+    } else {
+      this.index = null;
+    }
+    this.status = parseMessageStatus(readRawField(raw, "status"));
+    const finalResultRaw = readRawField(raw, "finalResult");
     this.finalResult =
       finalResultRaw != null ? (finalResultRaw as ConversationFinalResult) : null;
-    const processingListRaw = raw["processingList"];
+    const processingListRaw = readRawField(raw, "processingList");
     this.processingList =
       processingListRaw != null ? (processingListRaw as ProcessingInfo[]) : null;
-    const markdownElListRaw = raw["markdownElList"];
+    const markdownElListRaw = readRawField(raw, "markdownElList");
     this.markdownElList =
       markdownElListRaw != null ? (markdownElListRaw as markdownElItem[]) : null;
-    this.componentExecutedList = raw["componentExecutedList"] ?? null;
-    this.mcpAskInteractions = raw["mcpAskInteractions"] ?? null;
+    this.componentExecutedList = readRawField(raw, "componentExecutedList");
+    this.mcpAskInteractions = readRawField(raw, "mcpAskInteractions");
   }
 }
 
-export function messageToJsonObject(message: MessageInfo): UTSJSONObject {
-  const jsonStr = JSON.stringify(message);
-  if (jsonStr == null || jsonStr.length <= 2) {
-    return new UTSJSONObject();
+/** 枚举 → 业务字符串（兼容 Android { value: "USER" }） */
+function enumToBizString(val: any | null): string | null {
+  if (val == null) {
+    return null;
   }
-  const parsed = JSON.parse<UTSJSONObject>(jsonStr);
-  return parsed != null ? parsed : new UTSJSONObject();
+  const nested = readRawField(val, "value");
+  if (nested != null) {
+    return `${nested}`;
+  }
+  return `${val}`;
+}
+
+export function messageToJsonObject(message: MessageInfo): UTSJSONObject {
+  // 手写字段，避免 Android 上 JSON.stringify(class/enum) 丢字段或变成 {value}
+  const out = new UTSJSONObject();
+  if (message == null) {
+    return out;
+  }
+  out["id"] = message.id;
+  out["role"] = enumToBizString(message.role);
+  out["type"] = enumToBizString(message.type);
+  out["text"] = message.text;
+  out["think"] = message.think;
+  out["time"] = message.time;
+  out["attachments"] = message.attachments;
+  out["ext"] = message.ext;
+  out["finished"] = message.finished;
+  out["metadata"] = message.metadata;
+  out["messageType"] = enumToBizString(message.messageType);
+  out["requestId"] = message.requestId;
+  out["index"] = message.index;
+  out["status"] = enumToBizString(message.status);
+  out["finalResult"] = message.finalResult;
+  out["processingList"] = message.processingList;
+  out["markdownElList"] = message.markdownElList;
+  out["componentExecutedList"] = message.componentExecutedList;
+  out["mcpAskInteractions"] = message.mcpAskInteractions;
+  return out;
 }
 
 export function createMessageInfoFromRaw(raw: UTSJSONObject): MessageInfo {
   return new MessageInfoClass(raw);
+}
+
+/** 从任意 API 项构造 MessageInfo（兼容 Map / UTSJSONObject） */
+export function createMessageInfoFromAny(raw: any | null): MessageInfo | null {
+  if (raw == null) {
+    return null;
+  }
+  // 直接用 readRawField 构造（Map.get / UTSJSONObject）
+  const probeId = readRawField(raw, "id");
+  const probeText = readRawField(raw, "text");
+  const probeRole = readRawField(raw, "role");
+  if (probeId != null || probeText != null || probeRole != null) {
+    return new MessageInfoClass(raw);
+  }
+  // 读不到业务字段：再 normalize；仍无则返回 null（禁止推空壳进列表）
+  const obj = normalizeMessageRawToJson(raw);
+  if (obj == null) {
+    return null;
+  }
+  const id2 = obj["id"];
+  const text2 = obj["text"];
+  const role2 = obj["role"];
+  if (id2 == null && text2 == null && role2 == null) {
+    return null;
+  }
+  return new MessageInfoClass(obj);
 }
 
 export function cloneMessageInfo(message: MessageInfo): MessageInfo {

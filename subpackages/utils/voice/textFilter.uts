@@ -1,0 +1,158 @@
+/**
+ * 朗读文本过滤器：Markdown → 可朗读纯文本，以及按句切分。
+ * 注意：uts 正则编译为 Kotlin Regex——不使用 \u{...} 与 m 标志（行锚点用 (?:^|\n) 替代）。
+ */
+import { VoiceSettings, SentenceDrainResult } from "./voiceTypes";
+
+/** 句末标点（换行视为停顿） */
+const SENTENCE_END_CHARS = "。！？!?；;\n";
+
+/** 单句最大长度，超过强制切分（流式场景防积压） */
+const MAX_SENTENCE_LENGTH = 120;
+
+/**
+ * 将 Markdown 文本清洗为可朗读的纯文本
+ * @param raw 原始文本
+ * @param settings 过滤设置，为空时按默认（过滤代码块/链接URL/emoji）
+ */
+export function cleanTextForSpeech(raw: string, settings: VoiceSettings | null = null): string {
+  if (raw.length == 0) {
+    return "";
+  }
+  const opts = settings != null ? settings! : new VoiceSettings();
+  let text = raw;
+
+  // 1. fenced 代码块 ```...```
+  if (opts.includeCodeBlocks) {
+    // 保留代码内容，仅去掉围栏标记与语言标识
+    text = text.replace(/```[a-zA-Z0-9+#-]*/g, "\n");
+  } else {
+    // 整段移除（含未闭合的流式中间态）
+    text = text.replace(/```[\s\S]*?```/g, "\n");
+    text = text.replace(/```[\s\S]*$/g, "\n");
+  }
+
+  // 2. 行内代码
+  if (opts.includeCodeBlocks) {
+    text = text.replace(/`([^`]*)`/g, "$1");
+  } else {
+    text = text.replace(/`[^`\n]*`/g, " ");
+  }
+
+  // 3. 图片 ![alt](url) —— 不可朗读，直接移除
+  text = text.replace(/!\[[^\]]*\]\([^)]*\)/g, " ");
+
+  // 4. 链接 [text](url)
+  if (opts.includeLinkUrl) {
+    text = text.replace(/\[([^\]]*)\]\(([^)]*)\)/g, "$1，$2");
+  } else {
+    // 只保留链接文字
+    text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+    // 裸 URL 移除
+    text = text.replace(/https?:\/\/[^\s)\]>"]+/g, " ");
+  }
+
+  // 5.1 业务自定义块：task-result（含文件信息，不可朗读；含未闭合流式中间态）
+  // 注意必须先于通用 HTML 标签规则，否则标签被剥离后内部内容会残留
+  text = text.replace(/<task-result>[\s\S]*?<\/task-result>/g, " ");
+  text = text.replace(/<task-result>[\s\S]*$/g, " ");
+
+  // 5.2 Markdown 容器指令行（:::container ... / :::，工具调用卡片标记）
+  text = text.replace(/(?:^|\n)[ \t]*:::[^\n]*/g, "\n");
+
+  // 5. HTML 标签
+  text = text.replace(/<[^>\n]+>/g, " ");
+
+  // 6. 表格：分隔行整行移除；数据行竖线转为停顿
+  text = text.replace(/(?:^|\n)[|:\- \t]+-{2,}[|:\- \t]*(?=\n|$)/g, "\n");
+  text = text.replace(/\|/g, "，");
+
+  // 7. 标题 / 引用 / 列表标记
+  text = text.replace(/(?:^|\n)#{1,6}[ \t]+/g, "\n");
+  text = text.replace(/(?:^|\n)[ \t]*>[ \t]?/g, "\n");
+  text = text.replace(/(?:^|\n)[ \t]*[-*+][ \t]+/g, "\n");
+  text = text.replace(/(?:^|\n)[ \t]*\d+\.[ \t]+/g, "\n");
+
+  // 8. 加粗 / 斜体 / 删除线标记
+  text = text.replace(/\*\*([^*]+)\*\*/g, "$1");
+  text = text.replace(/\*([^*\n]+)\*/g, "$1");
+  text = text.replace(/__([^_]+)__/g, "$1");
+  text = text.replace(/~~([^~]+)~~/g, "$1");
+
+  // 9. emoji
+  if (!opts.keepEmoji) {
+    // 增补平面 emoji（代理对）
+    text = text.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "");
+    // BMP 符号（箭头、杂项符号、变体选择符等）
+    text = text.replace(/[\u2190-\u27BF\u2B00-\u2BFF\uFE0F]/g, "");
+  }
+
+  // 10. 空白规整
+  text = text.replace(/[ \t]+/g, " ");
+  text = text.replace(/\n[ \t]+/g, "\n");
+  text = text.replace(/\n{3,}/g, "\n\n");
+
+  return text.trim();
+}
+
+/**
+ * 将完整文本切分为可朗读的句子（用于整段播放）
+ */
+export function extractSpeakableSentences(text: string, maxLength: number = MAX_SENTENCE_LENGTH): string[] {
+  const sentences: string[] = [];
+  let buffer = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charAt(i);
+    buffer += ch;
+    if (SENTENCE_END_CHARS.indexOf(ch) >= 0 || buffer.length >= maxLength) {
+      const sentence = buffer.trim();
+      if (sentence.length > 0) {
+        sentences.push(sentence);
+      }
+      buffer = "";
+    }
+  }
+  const tail = buffer.trim();
+  if (tail.length > 0) {
+    sentences.push(tail);
+  }
+  return sentences;
+}
+
+/**
+ * 流式场景：从缓冲区提取"已完结"的句子，未完结部分留作 remainder。
+ * @param buffer 待处理文本（通常为上次的 remainder + 本次增量）
+ * @param flush 为 true 时（流结束）剩余文本全部作为句子输出
+ */
+export function drainCompleteSentences(buffer: string, flush: boolean): SentenceDrainResult {
+  const result = new SentenceDrainResult();
+  let current = "";
+  for (let i = 0; i < buffer.length; i++) {
+    const ch = buffer.charAt(i);
+    current += ch;
+    if (SENTENCE_END_CHARS.indexOf(ch) >= 0) {
+      const sentence = current.trim();
+      if (sentence.length > 0) {
+        result.sentences.push(sentence);
+      }
+      current = "";
+    }
+  }
+  if (flush) {
+    const tail = current.trim();
+    if (tail.length > 0) {
+      result.sentences.push(tail);
+    }
+    result.remainder = "";
+  } else if (current.length >= MAX_SENTENCE_LENGTH) {
+    // 超长未完结文本强制切出，避免无限积压
+    const sentence = current.trim();
+    if (sentence.length > 0) {
+      result.sentences.push(sentence);
+    }
+    result.remainder = "";
+  } else {
+    result.remainder = current;
+  }
+  return result;
+}

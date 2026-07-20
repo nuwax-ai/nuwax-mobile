@@ -888,7 +888,7 @@ export default class AgentDetailService {
 
   /**
    * 订阅 sub 流恢复 EXECUTING 会话的流式输出(刷新页面/重进会话时重建执行中的助手消息)。
-   * reload 历史 → 追加 assistant 占位 → StreamRequest GET sub → 复用 handleChangeMessageList 重建。
+   * reload 历史 → 收到首个有效事件后追加 assistant 占位 → StreamRequest GET sub → 复用 handleChangeMessageList 重建。
    * onSubClose: sub 关闭(完成/错误/超时)时回调,页面据此恢复轮询。
    */
   async handleSubConversation(
@@ -904,6 +904,23 @@ export default class AgentDetailService {
     this.abortSubConversation();
     this.isSubscribed = true;
 
+    const currentMessageId = generateUniqueId();
+    let hasCreatedPlaceholder = false;
+
+    const removeEmptyPlaceholder = () => {
+      if (!hasCreatedPlaceholder) return;
+      this.data.messageList.value = this.data.messageList.value.filter(
+        (message: MessageInfo): boolean =>
+          !(
+            message.id === currentMessageId &&
+            !message.text &&
+            !message.think &&
+            !message.processingList?.length &&
+            !message.finalResult
+          ),
+      );
+    };
+
     // 统一清理 sub 状态 + 恢复轮询(sub 结束/ERROR/失败都走这里;幂等防重复回调)
     let isCleanedUp = false;
     const cleanupSub = () => {
@@ -916,6 +933,8 @@ export default class AgentDetailService {
       this.isSubscribed = false;
       // sub 结束:会话不再活跃(防停止按钮卡死 + pollOnce 不被 isConversationActive gate)
       this.data.isConversationActive.value = false;
+      // sub 流未返回有效消息时，不保留仅用于流式渲染的空占位。
+      removeEmptyPlaceholder();
       if (onSubClose != null) onSubClose();
     };
 
@@ -923,6 +942,11 @@ export default class AgentDetailService {
     try {
       const result = await apiAgentConversation(conversationId);
       const data = (result as any)?.data;
+      // 轮询请求与此次详情请求之间，后端任务可能已结束；此时不可再建立 sub 流或插入占位消息。
+      if (data?.taskStatus !== TaskStatus.EXECUTING) {
+        cleanupSub();
+        return;
+      }
       const rawList = (data?.messageList || []) as MessageInfo[];
       if (rawList.length > 0) {
         const processedList = adaptHistoryMessageList(rawList).map(
@@ -947,22 +971,25 @@ export default class AgentDetailService {
       return;
     }
 
-    // 2. 追加 assistant 占位
-    const currentMessageId = generateUniqueId();
-    const placeholder = {
-      role: AssistantRoleEnum.ASSISTANT,
-      type: MessageModeEnum.CHAT,
-      text: "",
-      think: "",
-      time: new Date().toISOString(),
-      id: currentMessageId,
-      messageType: MessageTypeEnum.ASSISTANT,
-      status: MessageStatusEnum.Loading,
-    } as MessageInfo;
-    this.data.messageList.value = [
-      ...this.data.messageList.value,
-      placeholder,
-    ];
+    // 2. 延迟创建占位：空 sub 流不会向列表留下空消息。
+    const ensurePlaceholder = () => {
+      if (hasCreatedPlaceholder) return;
+      hasCreatedPlaceholder = true;
+      const placeholder = {
+        role: AssistantRoleEnum.ASSISTANT,
+        type: MessageModeEnum.CHAT,
+        text: "",
+        think: "",
+        time: new Date().toISOString(),
+        id: currentMessageId,
+        messageType: MessageTypeEnum.ASSISTANT,
+        status: MessageStatusEnum.Loading,
+      } as MessageInfo;
+      this.data.messageList.value = [
+        ...this.data.messageList.value,
+        placeholder,
+      ];
+    };
 
     // 3. 订阅 sub(GET SSE)
     const token = uni.getStorageSync(ACCESS_TOKEN);
@@ -988,7 +1015,9 @@ export default class AgentDetailService {
           if (chunk.type !== "content") return;
           try {
             const result = JSON.parse(chunk.data);
-            if (!result || typeof result !== "object") return;
+            // 心跳及不含 data 的控制事件不创建 UI 占位。
+            if (!result || typeof result !== "object" || !result.data) return;
+            ensurePlaceholder();
             // 复用 handleChangeMessageList 重建占位消息(含审批/ask 干预)
             this.handleChangeMessageList(result, currentMessageId);
             // 会话失败(ERROR):主动清理 sub + 恢复轮询(对齐 PC:FAILED 也要轮询)

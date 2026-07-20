@@ -42,6 +42,8 @@ export class StreamingAsrService {
   private mockTimerId: number | null = null;
   /** mock 已吐出位置 */
   private mockPos: number = 0;
+  /** 会话代次；用于丢弃 cancel/start 之后才返回的旧请求与旧定时器回调。 */
+  private generation: number = 0;
 
   constructor(config: VoiceConfig | null = null) {
     this.config = config != null ? config! : voiceConfig;
@@ -60,6 +62,8 @@ export class StreamingAsrService {
     if (this.active) {
       return false;
     }
+    this.generation += 1;
+    const expectedGeneration = this.generation;
     this.onText = onText;
     this.seq = 0;
     this.pendingFrames = [];
@@ -67,16 +71,22 @@ export class StreamingAsrService {
     if (this.config.asrMock) {
       this.sessionId = "mock-session";
       this.active = true;
-      this.startMockEmit();
+      this.startMockEmit(expectedGeneration);
       return true;
     }
     try {
-      this.sessionId = await this.requestSession();
+      const sessionId = await this.requestSession();
+      if (expectedGeneration != this.generation) {
+        return false;
+      }
+      this.sessionId = sessionId;
       this.active = true;
       return true;
     } catch (e: any) {
       console.warn("[StreamingAsr] create session failed", e);
-      this.onText = null;
+      if (expectedGeneration == this.generation) {
+        this.onText = null;
+      }
       return false;
     }
   }
@@ -101,34 +111,47 @@ export class StreamingAsrService {
     if (!this.active) {
       return;
     }
+    const expectedGeneration = this.generation;
     if (this.config.asrMock) {
       this.stopMockEmit();
       const finalText = this.config.asrMockStreamText.substring(0, this.mockPos);
       this.active = false;
-      this.emitText(finalText, true);
+      this.emitText(finalText, true, expectedGeneration);
       this.onText = null;
       return;
     }
     // 真实模式：等待待传帧冲刷完成
     let waitRounds = 0;
-    while ((this.pendingFrames.length > 0 || this.uploading) && waitRounds < 20) {
+    while ((this.pendingFrames.length > 0 || this.uploading) && waitRounds < 100) {
       await this.sleep(100);
       waitRounds += 1;
     }
+    if (expectedGeneration != this.generation) {
+      return;
+    }
     try {
       const result = await this.requestFinish();
+      if (expectedGeneration != this.generation) {
+        return;
+      }
       this.active = false;
-      this.emitText(result.text, true);
+      this.emitText(result.text, true, expectedGeneration);
     } catch (e: any) {
       console.warn("[StreamingAsr] finish failed", e);
+      if (expectedGeneration != this.generation) {
+        return;
+      }
       this.active = false;
-      this.emitText("", true);
+      this.emitText("", true, expectedGeneration);
     }
-    this.onText = null;
+    if (expectedGeneration == this.generation) {
+      this.onText = null;
+    }
   }
 
   /** 取消识别（不上传 finish，直接关闭会话） */
   cancel(): void {
+    this.generation += 1;
     this.stopMockEmit();
     this.active = false;
     this.pendingFrames = [];
@@ -138,11 +161,11 @@ export class StreamingAsrService {
 
   // ==================== mock ====================
 
-  private startMockEmit(): void {
+  private startMockEmit(expectedGeneration: number): void {
     this.mockPos = 0;
     const full = this.config.asrMockStreamText;
     this.mockTimerId = setInterval(() => {
-      if (!this.active) {
+      if (!this.active || expectedGeneration != this.generation) {
         this.stopMockEmit();
         return;
       }
@@ -150,7 +173,7 @@ export class StreamingAsrService {
       if (this.mockPos > full.length) {
         this.mockPos = full.length;
       }
-      this.emitText(full.substring(0, this.mockPos), false);
+      this.emitText(full.substring(0, this.mockPos), false, expectedGeneration);
       if (this.mockPos >= full.length) {
         this.stopMockEmit();
       }
@@ -167,7 +190,10 @@ export class StreamingAsrService {
 
   // ==================== 真实接口 ====================
 
-  private emitText(text: string, isFinal: boolean): void {
+  private emitText(text: string, isFinal: boolean, expectedGeneration: number): void {
+    if (expectedGeneration != this.generation) {
+      return;
+    }
     const cb = this.onText;
     if (cb != null) {
       cb(text, isFinal);
@@ -241,20 +267,26 @@ export class StreamingAsrService {
       return;
     }
     this.uploading = true;
-    while (this.pendingFrames.length > 0 && this.active) {
-      const frame = this.pendingFrames.shift()!;
-      const curSeq = this.seq;
-      this.seq += 1;
-      try {
-        const result = await this.requestChunk(frame, curSeq, false);
-        if (result.text.length > 0) {
-          this.emitText(result.text, result.isFinal);
+    const expectedGeneration = this.generation;
+    try {
+      while (this.pendingFrames.length > 0 && this.active && expectedGeneration == this.generation) {
+        const frame = this.pendingFrames.shift()!;
+        const curSeq = this.seq;
+        this.seq += 1;
+        try {
+          const result = await this.requestChunk(frame, curSeq, false);
+          if (result.text.length > 0) {
+            this.emitText(result.text, result.isFinal, expectedGeneration);
+          }
+        } catch (e: any) {
+          console.warn("[StreamingAsr] chunk upload failed", e);
         }
-      } catch (e: any) {
-        console.warn("[StreamingAsr] chunk upload failed", e);
+      }
+    } finally {
+      if (expectedGeneration == this.generation) {
+        this.uploading = false;
       }
     }
-    this.uploading = false;
   }
 
   /** 上传单个音频分片，返回累计识别文本 */

@@ -2,6 +2,12 @@ import { StreamRequestConfig, StreamChunk } from "@/types/interfaces/chat";
 import { createSSEConnection } from "@/servers/useRequest.uts";
 import { utf8ArrayToString } from "@/utils/utf8.uts";
 import { t } from "@/utils/i18n";
+import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+
+/** onChunkReceived 回调结果（Android 为原生 RequestTaskOnChunkReceivedListenerResult） */
+interface ChunkReceivedResult {
+  data: ArrayBuffer | null;
+}
 
 /**
  * 合并两个 Uint8Array。
@@ -48,17 +54,38 @@ function createContentChunk(data: string): StreamChunk {
 
 /**
  * 判断 SSE 载荷是否表示流已结束。
- * UTS 不能对 any 直接访问 .completed，需通过 UTSJSONObject 下标读取。
- * @param data SSE 解析后的数据
- * @returns completed 字段为 true 时返回 true
+ * Android：completed 可能是 boolean / 字符串 / 数字，禁止仅判断 == true。
  */
 function isCompletedPayload(data: any): boolean {
   if (data == null) {
     return false;
   }
-  const dataObj = data as UTSJSONObject;
-  const completed = dataObj["completed"];
-  return completed != null && completed == true;
+  const completedRaw = readRawField(data, "completed");
+  if (completedRaw == true) {
+    return true;
+  }
+  const completedStr = completedRaw != null ? `${completedRaw}` : "";
+  return completedStr == "true" || completedStr == "1";
+}
+
+/** 心跳包，不含 data */
+function isSseHeartBeatPayload(data: any): boolean {
+  const eventTypeRaw = readRawField(data, "eventType");
+  return eventTypeRaw != null && `${eventTypeRaw}` == "HEART_BEAT";
+}
+
+/** 不应下发给业务 onChunk 的 SSE 载荷（无 data 的完成包 / 心跳等） */
+function shouldSkipSsePayloadEmit(data: any): boolean {
+  if (data == null) {
+    return true;
+  }
+  if (isCompletedPayload(data)) {
+    return true;
+  }
+  if (isSseHeartBeatPayload(data)) {
+    return true;
+  }
+  return readRawField(data, "data") == null;
 }
 
 /**
@@ -99,15 +126,35 @@ function extractChunkArrayBuffer(chunkResult: any): ArrayBuffer | null {
   if (chunkResult == null) {
     return null;
   }
-  const chunkObj = chunkResult as UTSJSONObject;
-  const dataField = chunkObj["data"];
+
+  // Android APP：原生 RequestTaskOnChunkReceivedListenerResult，禁止 as UTSJSONObject
+  try {
+    const listener = chunkResult as ChunkReceivedResult;
+    const listenerData = listener.data;
+    if (listenerData != null) {
+      return listenerData;
+    }
+  } catch (_eListener) {
+    // 非 listener result，继续尝试其他格式
+  }
+
+  // 小程序 / UTSJSONObject / Map
+  const dataField = readRawField(chunkResult, "data");
   if (dataField != null) {
     return dataField as ArrayBuffer;
   }
-  const byteLengthField = chunkObj["byteLength"];
-  if (byteLengthField != null) {
-    return chunkResult as ArrayBuffer;
+
+  // success 回调中 res.data 可能直接是 ArrayBuffer
+  try {
+    const maybeBuffer = chunkResult as ArrayBuffer;
+    const byteLength = maybeBuffer.byteLength;
+    if (byteLength != null && byteLength >= 0) {
+      return maybeBuffer;
+    }
+  } catch (_eBuffer) {
+    // ignore
   }
+
   return null;
 }
 
@@ -225,6 +272,10 @@ export class StreamRequest {
               console.log("[SSE] completed 标记处理完成，定时器已清除");
 
               config.onComplete?.();
+              return;
+            }
+
+            if (shouldSkipSsePayloadEmit(data)) {
               return;
             }
 
@@ -360,6 +411,10 @@ export class StreamRequest {
 
           config.onComplete?.();
           onStreamComplete();
+          return;
+        }
+
+        if (shouldSkipSsePayloadEmit(data)) {
           return;
         }
 
@@ -817,6 +872,9 @@ export class StreamRequest {
             if (isCompletedPayload(parseData)) {
               console.log("[SSE-APP] 收到完成标记 completed");
               config.onComplete?.();
+              return;
+            }
+            if (shouldSkipSsePayloadEmit(parseData)) {
               return;
             }
           } catch (e) {

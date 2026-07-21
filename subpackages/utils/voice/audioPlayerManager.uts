@@ -1,0 +1,160 @@
+/**
+ * 音频播放队列管理器（模块级单例）
+ * 封装 uni.createInnerAudioContext：顺序播放、追加队列、打断、单句失败跳过。
+ */
+import { AudioQueueItem, AudioPlayerState, OnPlayerStateChange } from "./voiceTypes";
+
+export class AudioPlayerManager {
+  private ctx: InnerAudioContext | null = null;
+  private queue: AudioQueueItem[] = [];
+  private state: AudioPlayerState = "idle";
+  private currentItem: AudioQueueItem | null = null;
+  private onStateChange: OnPlayerStateChange | null = null;
+  /** 手动停止标记：stop 后忽略后续 onEnded/onError 驱动的继续播放 */
+  private stopped: boolean = true;
+  /**
+   * 播放会话序号：playList/stop 时自增。
+   * enqueue 凭序号校验是否同一会话，防止打断后旧异步任务继续入队。
+   */
+  private sessionId: number = 0;
+
+  /** 注册状态回调 */
+  setOnStateChange(cb: OnPlayerStateChange | null): void {
+    this.onStateChange = cb;
+  }
+
+  getState(): AudioPlayerState {
+    return this.state;
+  }
+
+  /** 当前播放会话序号 */
+  getSessionId(): number {
+    return this.sessionId;
+  }
+
+  /** 当前正在播放的消息 ID（无则空串） */
+  getCurrentMessageId(): string {
+    const item = this.currentItem;
+    return item != null ? item!.messageId : "";
+  }
+
+  /**
+   * 替换队列并从头播放
+   * @returns 本次播放会话序号（用于后续 enqueue 校验）
+   */
+  playList(items: AudioQueueItem[]): number {
+    this.stopInternal();
+    this.stopped = false;
+    this.queue = items;
+    this.playNext();
+    return this.sessionId;
+  }
+
+  /** 向当前会话追加队列项（边生成边播报场景）；会话不匹配则丢弃 */
+  enqueue(items: AudioQueueItem[], sessionId: number): void {
+    if (sessionId != this.sessionId || this.stopped) {
+      return;
+    }
+    for (let i = 0; i < items.length; i++) {
+      this.queue.push(items[i]);
+    }
+    // 队列恰好播完处于空闲时继续播放
+    if (this.state == "idle") {
+      this.playNext();
+    }
+  }
+
+  /** 停止播放并清空队列 */
+  stop(): void {
+    this.stopInternal();
+    this.setState("idle", "");
+  }
+
+  private stopInternal(): void {
+    this.stopped = true;
+    this.sessionId += 1;
+    this.queue = [];
+    this.currentItem = null;
+    const ctx = this.ctx;
+    if (ctx != null) {
+      try {
+        ctx!.stop();
+      } catch (e: any) {
+        console.warn("[AudioPlayer] stop error", e);
+      }
+    }
+  }
+
+  private ensureContext(): InnerAudioContext {
+    if (this.ctx == null) {
+      const ctx = uni.createInnerAudioContext();
+      ctx.onEnded(() => {
+        this.handleEnded();
+      });
+      ctx.onError((res: any) => {
+        this.handlePlayError(res);
+      });
+      this.ctx = ctx;
+    }
+    return this.ctx!;
+  }
+
+  private playNext(): void {
+    if (this.stopped) {
+      return;
+    }
+    if (this.queue.length == 0) {
+      this.currentItem = null;
+      this.setState("idle", "");
+      return;
+    }
+    const item = this.queue.shift()!;
+    this.currentItem = item;
+    if (item.src.length == 0) {
+      // 空音频（mock 占位）：直接跳下一句，保持状态流转
+      this.playNext();
+      return;
+    }
+    this.setState("playing", item.messageId);
+    const ctx = this.ensureContext();
+    ctx.src = item.src;
+    ctx.play();
+  }
+
+  private handleEnded(): void {
+    this.playNext();
+  }
+
+  /** 单句播放失败：跳过并继续下一句，避免整段卡死 */
+  private handlePlayError(err: any): void {
+    console.warn("[AudioPlayer] play error, skip segment", err);
+    this.playNext();
+  }
+
+  private setState(state: AudioPlayerState, messageId: string): void {
+    this.state = state;
+    const cb = this.onStateChange;
+    if (cb != null) {
+      cb(state, messageId);
+    }
+  }
+
+  /** 释放资源（页面卸载时调用） */
+  destroy(): void {
+    this.stopInternal();
+    this.onStateChange = null;
+    const ctx = this.ctx;
+    if (ctx != null) {
+      try {
+        ctx!.destroy();
+      } catch (e: any) {
+        console.warn("[AudioPlayer] destroy error", e);
+      }
+      this.ctx = null;
+    }
+    this.state = "idle";
+  }
+}
+
+/** 全局播放单例（全应用同时只有一路语音播报） */
+export const audioPlayerManager = new AudioPlayerManager();

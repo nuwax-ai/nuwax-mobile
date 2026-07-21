@@ -11,12 +11,94 @@ import {
   apiGetWechatOaOauthUrl,
   apiPayWechatJsapi,
   apiPayH5Web,
+  apiPayAppNative,
 } from "@/subpackages/servers/subscription";
 import {
   PayMode,
   PayChannel,
 } from "@/subpackages/types/interfaces/subscription";
+import type {
+  AppNativePayRequest,
+  AppNativePayResult,
+  GetSettlementStatusRequest,
+  SettlementStatusInfo,
+} from "@/subpackages/types/interfaces/subscription";
 import { orEmpty, orString } from "@/utils/utsCoalesce.uts";
+
+const ANXINFU_MINIPROGRAM_USER_NAME = "gh_cd6acad9a40d";
+const ANXINFU_MINIPROGRAM_PATH = "ipay/main";
+const ACTIVE_APP_PAY_ORDER_ID = "ACTIVE_APP_PAY_ORDER_ID";
+
+/** 从网关 weixin:// redirectUrl 中提取 query= 后的 Base64 原文。 */
+export function parseAnxinfuMiniProgramParam(redirectUrl: string | null): string {
+  if (redirectUrl == null || redirectUrl.length == 0) {
+    return "";
+  }
+  const marker = "query=";
+  const queryIndex = redirectUrl.indexOf(marker);
+  if (queryIndex < 0) {
+    return "";
+  }
+  const valueStart = queryIndex + marker.length;
+  const ampIndex = redirectUrl.indexOf("&", valueStart);
+  if (ampIndex < 0) {
+    return redirectUrl.substring(valueStart);
+  }
+  return redirectUrl.substring(valueStart, ampIndex);
+}
+
+// ========== APP 原生支付桥 ===========
+// #ifdef APP
+
+export interface AppNativePayBridge {
+  launchAnxinfuMiniProgram(options: UTSJSONObject): Promise<any>;
+  openPayUrl(url: string): Promise<any>;
+}
+
+let appNativePayBridge: AppNativePayBridge | null = null;
+
+/** 由 Android / iOS / HarmonyOS 宿主在初始化原生支付模块后注入。 */
+export function registerAppNativePayBridge(bridge: AppNativePayBridge): void {
+  appNativePayBridge = bridge;
+}
+
+/**
+ * 调用宿主注入的 NativePay / wx.miniapp 桥拉起安心付微信小程序。
+ * param 必须保持网关 Base64 原文，禁止 encodeURIComponent。
+ */
+export function launchAnxinfuMiniProgram(redirectUrl: string): Promise<any> {
+  const param = parseAnxinfuMiniProgramParam(redirectUrl);
+  if (param.length == 0) {
+    return new Promise((_resolve, reject) => {
+      reject(new Error("invalid anxinfu mini-program redirectUrl"));
+    });
+  }
+
+  const options = {
+    userName: ANXINFU_MINIPROGRAM_USER_NAME,
+    path: ANXINFU_MINIPROGRAM_PATH + "?" + param,
+    miniprogramType: 0,
+  } as UTSJSONObject;
+
+  if (appNativePayBridge == null) {
+    return new Promise((_resolve, reject) => {
+      reject(new Error("native wx.miniapp bridge is unavailable"));
+    });
+  }
+  return appNativePayBridge!.launchAnxinfuMiniProgram(options);
+}
+
+/** 支付宝 redirectUrl 交由宿主打开，避免在业务层绑定平台 SDK。 */
+export function openAppPayUrl(url: string): Promise<any> {
+  if (appNativePayBridge == null) {
+    return new Promise((_resolve, reject) => {
+      reject(new Error("native pay url bridge is unavailable"));
+    });
+  }
+  return appNativePayBridge!.openPayUrl(url);
+}
+
+// #endif
 
 // ========== H5 / WEB 工具函数 ==========
 // #ifdef H5 || WEB
@@ -836,6 +918,104 @@ async function executeWebH5PayFlow(
 }
 // #endif
 
+// ========== APP（Android / iOS / HarmonyOS）工具函数 ==========
+// #ifdef APP
+
+/**
+ * App 原生支付流程：选择渠道 → app-native → 原生桥 → 服务端结算轮询。
+ * 原生桥回调只代表客户端动作，业务成功始终以 settlement-status 为准。
+ */
+export async function executeAppNativePayFlow(
+  orderId: number,
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+  t: (key: string) => string,
+  onSuccess?: () => void,
+): Promise<void> {
+  uni.hideLoading();
+
+  const handleSelectedChannel = async (tapIndex: number): Promise<void> => {
+    const payChannel = tapIndex == 1
+      ? PayChannel.AliPay
+      : PayChannel.WxPay;
+    loading.value = true;
+    uni.showLoading({
+      title: t("Mobile.MySubscriptions.payPending"),
+      mask: true,
+    });
+
+    try {
+      const requestData = new UTSJSONObject();
+      requestData["orderId"] = orderId as any;
+      requestData["payChannel"] = payChannel as any;
+      const payRes = await apiPayAppNative(
+        requestData as AppNativePayRequest,
+      );
+      if (payRes.code != SUCCESS_CODE || payRes.data == null) {
+        throw new Error(orString(
+          payRes.message,
+          t("Mobile.MySubscriptions.payParamsFailed"),
+        ));
+      }
+
+      const payData = payRes.data! as AppNativePayResult;
+      const redirectUrl = payData.redirectUrl;
+      uni.setStorageSync(ACTIVE_APP_PAY_ORDER_ID, `${orderId}`);
+      uni.hideLoading();
+
+      if (payChannel == PayChannel.WxPay) {
+        if (
+          redirectUrl == null ||
+          redirectUrl.length == 0 ||
+          redirectUrl.indexOf("weixin://") != 0
+        ) {
+          throw new Error("wechat app-native redirectUrl is missing");
+        }
+        await launchAnxinfuMiniProgram(redirectUrl);
+      } else {
+        if (redirectUrl == null || redirectUrl.length == 0) {
+          throw new Error("alipay app-native redirectUrl is missing");
+        }
+        await openAppPayUrl(redirectUrl);
+      }
+
+      uni.showLoading({
+        title: t("Mobile.MySubscriptions.payPending"),
+        mask: true,
+      });
+      const result = await pollPayResult(orderId);
+      uni.hideLoading();
+      handlePayResultToast(result, t, onSuccess);
+    } catch (e) {
+      uni.hideLoading();
+      console.error("App native payment flow error:", e);
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.payFailed"),
+        icon: "none",
+      });
+    } finally {
+      uni.removeStorageSync(ACTIVE_APP_PAY_ORDER_ID);
+      loading.value = false;
+      processingId.value = null;
+    }
+  };
+
+  uni.showActionSheet({
+    itemList: [
+      t("Mobile.MySubscriptions.wechatPay"),
+      t("Mobile.MySubscriptions.alipay"),
+    ],
+    success: (res) => {
+      handleSelectedChannel(res.tapIndex);
+    },
+    fail: () => {
+      processingId.value = null;
+    },
+  });
+}
+
+// #endif
+
 // ========== MP-WEIXIN 工具函数 ==========
 // #ifdef MP-WEIXIN
 
@@ -976,20 +1156,31 @@ export async function executePayFlow(
   // #ifdef H5 || WEB
   await executeWebPayFlow(orderId, processingId, loading, t, onSuccess);
   // #endif
+  // #ifdef APP
+  await executeAppNativePayFlow(orderId, processingId, loading, t, onSuccess);
+  // #endif
 }
 
 /**
- * 轮询结算状态，最多 10 次，间隔 2 秒
+ * 轮询结算状态，最多 60 次，间隔 2 秒
  * @returns "success" | "failed" | "pending"
  */
 export async function pollPayResult(orderId: number): Promise<string> {
-  const maxAttempts = 10;
+  const maxAttempts = 60;
   for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, 2000);
+    });
     try {
-      const res = await apiGetSettlementStatus({ orderId });
+      const requestData = new UTSJSONObject();
+      requestData["orderId"] = orderId as any;
+      const res = await apiGetSettlementStatus(
+        requestData as GetSettlementStatusRequest,
+      );
       if (res.code === SUCCESS_CODE && res.data != null) {
-        const data = res.data!;
+        const data = res.data! as SettlementStatusInfo;
         if (
           data.settled ||
           data.orderStatus === OrderStatus.PAID ||
@@ -1052,6 +1243,11 @@ export function getPayMode(): PayMode {
   if (env.isWeChat) {
     payMode = PayMode.minipay;
   }
+  // #endif
+
+  // Android / iOS / HarmonyOS 原生 App
+  // #ifdef APP
+  payMode = PayMode.app;
   // #endif
 
   return payMode;

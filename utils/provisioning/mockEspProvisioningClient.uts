@@ -1,0 +1,254 @@
+/** ESP-IDF 官方 Provisioning 语义的 Mock 客户端。 */
+import type {
+  EspProvisioningClient,
+  EspProvisioningDeviceFoundCallback,
+  EspProvisioningLogCallback,
+  EspProvisioningProgressCallback,
+} from '@/utils/provisioning/espProvisioningClient';
+import {
+  EspProvisioningConfig,
+  EspProvisioningDevice,
+  EspProvisioningError,
+  EspProvisioningProgress,
+  EspWifiNetwork,
+} from '@/types/interfaces/espProvisioning';
+import {
+  EspProvisioningErrorCodeEnum,
+  EspProvisioningPhaseEnum,
+  EspProvisioningSecurityEnum,
+} from '@/types/enums/espProvisioning';
+import { MockScenarioEnum } from '@/types/enums/provision';
+import { getMockScenario, mockScanDevices } from '@/utils/mockProvisionData';
+import { ESP_PROV_DEFAULT_SERVICE_UUID } from '@/constants/espProvisioning.constants';
+import { maskProvisioningDeviceId } from '@/utils/provisioning/espProvisioningQr';
+
+export class MockEspProvisioningClient implements EspProvisioningClient {
+  private config: EspProvisioningConfig | null = null;
+  private initialized = false;
+  private scanning = false;
+  private connected = false;
+  private disposed = false;
+  private connectAttempts = 0;
+  private provisionAttempts = 0;
+  private timers = [] as number[];
+
+  private deviceFoundCb: EspProvisioningDeviceFoundCallback | null = null;
+  private progressCb: EspProvisioningProgressCallback | null = null;
+  private logCb: EspProvisioningLogCallback | null = null;
+
+  initialize(config: EspProvisioningConfig): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (config.security == EspProvisioningSecurityEnum.SECURITY_0) {
+        reject(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.SECURITY_MISMATCH,
+          '生产协议不允许 Security 0',
+          'Mock refuses security0',
+          0,
+          false,
+        ));
+        return;
+      }
+      this.config = config;
+      this.initialized = true;
+      this.disposed = false;
+      this.log('info', 'client_initialized', `security=${config.security}`);
+      resolve();
+    });
+  }
+
+  startScan(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (!this.initialized || this.disposed) {
+        reject(this.error(EspProvisioningErrorCodeEnum.SCAN_FAILED, '客户端尚未初始化'));
+        return;
+      }
+      this.scanning = true;
+      this.progress(EspProvisioningPhaseEnum.SCANNING, 'Mock scanning');
+      const devices = mockScanDevices();
+      for (let i = 0; i < devices.length; i++) {
+        const d = devices[i];
+        this.later(() => {
+          if (!this.scanning || this.deviceFoundCb == null) return;
+          this.deviceFoundCb!!(new EspProvisioningDevice(
+            d.deviceId,
+            d.name,
+            d.rssi,
+            ESP_PROV_DEFAULT_SERVICE_UUID,
+          ));
+          this.log('info', 'device_found', `${maskProvisioningDeviceId(d.deviceId)}|${d.rssi}`);
+        }, 400 + i * 350);
+      }
+      resolve();
+    });
+  }
+
+  stopScan(): Promise<void> {
+    this.scanning = false;
+    return Promise.resolve();
+  }
+
+  onDeviceFound(cb: EspProvisioningDeviceFoundCallback): void {
+    this.deviceFoundCb = cb;
+  }
+
+  connect(device: EspProvisioningDevice): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.stopScan();
+      this.connectAttempts++;
+      this.progress(EspProvisioningPhaseEnum.CONNECTING, `attempt=${this.connectAttempts}`);
+      this.later(() => {
+        if (this.disposed) {
+          reject(this.error(EspProvisioningErrorCodeEnum.DISCONNECTED, '配网会话已释放'));
+          return;
+        }
+        const scenario = getMockScenario();
+        if (scenario == MockScenarioEnum.CONNECT_FLAKY && this.connectAttempts < 3) {
+          reject(this.error(EspProvisioningErrorCodeEnum.CONNECT_FAILED, 'Mock 连接抖动'));
+          return;
+        }
+        this.progress(EspProvisioningPhaseEnum.DISCOVERING, device.primaryServiceUuid);
+        this.connected = true;
+        this.log('info', 'device_connected', maskProvisioningDeviceId(device.deviceId));
+        resolve();
+      }, 350);
+    });
+  }
+
+  getCapabilities(): Promise<string[]> {
+    return new Promise<string[]>((resolve, reject) => {
+      if (!this.connected) {
+        reject(this.error(EspProvisioningErrorCodeEnum.DISCONNECTED, '设备未连接'));
+        return;
+      }
+      this.later(() => {
+        resolve(['wifi_scan', 'wifi_prov', 'device_info'] as string[]);
+      }, 150);
+    });
+  }
+
+  scanNetworks(): Promise<EspWifiNetwork[]> {
+    return new Promise<EspWifiNetwork[]>((resolve, reject) => {
+      if (!this.connected) {
+        reject(this.error(EspProvisioningErrorCodeEnum.DISCONNECTED, '设备未连接'));
+        return;
+      }
+      this.later(() => {
+        resolve([
+          new EspWifiNetwork('Nuwax-2.4G', -42, 3),
+          new EspWifiNetwork('Office-WiFi', -61, 3),
+          new EspWifiNetwork('Guest', -73, 0),
+        ] as EspWifiNetwork[]);
+      }, 300);
+    });
+  }
+
+  provision(ssid: string, password: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (!this.connected) {
+        reject(this.error(EspProvisioningErrorCodeEnum.DISCONNECTED, '设备未连接'));
+        return;
+      }
+      this.provisionAttempts++;
+      const scenario = getMockScenario();
+      this.progress(EspProvisioningPhaseEnum.ESTABLISHING_SESSION, 'security handshake');
+      this.later(() => {
+        if (scenario == MockScenarioEnum.WRITE_FLAKY && this.provisionAttempts == 1) {
+          reject(this.error(EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED, 'Mock 首次发送配置失败'));
+          return;
+        }
+        this.progress(EspProvisioningPhaseEnum.SENDING_CREDENTIALS, `ssidBytes=${ssid.length}`);
+        this.later(() => {
+          this.progress(EspProvisioningPhaseEnum.APPLYING_CONFIG, 'apply_config');
+          this.later(() => {
+            this.progress(EspProvisioningPhaseEnum.CHECKING_STATUS, 'get_status');
+            if (scenario == MockScenarioEnum.UNEXPECTED_DISCONNECT) {
+              this.later(() => {
+                this.connected = false;
+                reject(this.error(EspProvisioningErrorCodeEnum.DISCONNECTED, 'Mock 意外断开'));
+              }, 600);
+              return;
+            }
+            if (scenario == MockScenarioEnum.FAIL_WRONG_PASSWORD) {
+              this.later(() => {
+                reject(this.error(EspProvisioningErrorCodeEnum.AUTH_FAILED, 'WiFi 密码错误'));
+              }, 900);
+              return;
+            }
+            if (scenario == MockScenarioEnum.FAIL_AP_NOT_FOUND) {
+              this.later(() => {
+                reject(this.error(EspProvisioningErrorCodeEnum.NETWORK_NOT_FOUND, '找不到 WiFi'));
+              }, 900);
+              return;
+            }
+            if (scenario == MockScenarioEnum.FAIL_TIMEOUT) {
+              this.later(() => {
+                reject(this.error(EspProvisioningErrorCodeEnum.STATUS_TIMEOUT, '查询配网状态超时'));
+              }, 3000);
+              return;
+            }
+            this.later(() => {
+              this.progress(EspProvisioningPhaseEnum.SUCCESS, 'deviceProvisioningSuccess');
+              resolve();
+            }, 1000);
+          }, 250);
+        }, 250);
+      }, 250);
+    });
+  }
+
+  onProgress(cb: EspProvisioningProgressCallback): void {
+    this.progressCb = cb;
+  }
+
+  onLog(cb: EspProvisioningLogCallback): void {
+    this.logCb = cb;
+  }
+
+  disconnect(): Promise<void> {
+    this.connected = false;
+    this.scanning = false;
+    this.clearTimers();
+    this.log('info', 'device_disconnected', 'manual');
+    return Promise.resolve();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.connected = false;
+    this.scanning = false;
+    this.clearTimers();
+    this.deviceFoundCb = null;
+    this.progressCb = null;
+    this.logCb = null;
+  }
+
+  private progress(phase: EspProvisioningPhaseEnum, message: string): void {
+    if (this.progressCb != null) {
+      this.progressCb!!(new EspProvisioningProgress(phase, message));
+    }
+  }
+
+  private log(level: string, event: string, detail: string): void {
+    if (this.logCb != null) {
+      this.logCb!!(level, event, detail);
+    }
+  }
+
+  private error(code: EspProvisioningErrorCodeEnum, message: string): EspProvisioningError {
+    return new EspProvisioningError(code, message, `Mock: ${message}`);
+  }
+
+  private later(fn: () => void, delayMs: number): void {
+    const id = setTimeout(() => {
+      fn();
+    }, delayMs) as number;
+    this.timers.push(id);
+  }
+
+  private clearTimers(): void {
+    for (let i = 0; i < this.timers.length; i++) {
+      clearTimeout(this.timers[i]);
+    }
+    this.timers = [] as number[];
+  }
+}

@@ -1,0 +1,249 @@
+<template>
+  <view class="voice-panel">
+    <view class="panel-row">
+      <view class="play-button" @tap="toggleLatestPlayback">
+        <text class="action-icon">{{ isPlaying ? "■" : "▶" }}</text>
+        <text class="action-label">{{ isPlaying ? t("Mobile.Voice.stopPlaying") : t("Mobile.Voice.playLatest") }}</text>
+      </view>
+      <view class="settings-button" @tap="openSettings">
+        <svg-icon name="icon-settings" />
+      </view>
+    </view>
+
+    <voice-setting-modal ref="voiceSettingModalRef" @change="handleSettingsChange" />
+  </view>
+</template>
+
+<script lang="uts" setup>
+  import { ref, watch, onMounted, onUnmounted } from "vue";
+  import { onShow, onHide } from "@dcloudio/uni-app";
+  import VoiceSettingModal from "@/subpackages/components/voice-setting-modal/voice-setting-modal.uvue";
+  import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
+  import { cleanTextForSpeech, extractSpeakableSentences } from "@/subpackages/utils/voice/textFilter";
+  import { ttsService } from "@/subpackages/utils/voice/ttsService";
+  import { voiceConfig } from "@/subpackages/utils/voice/voiceConfig";
+  import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
+  import { VoiceSettings, cloneVoiceSettings, loadVoiceSettings } from "@/subpackages/utils/voice/voiceTypes";
+  import { useI18n, emptyI18nParams } from "@/utils/i18n";
+
+  const props = withDefaults(defineProps<{
+    assistantMsgId?: string;
+    streamText?: string;
+    thinkText?: string;
+    streamStatus?: string;
+    isConversationActive?: boolean;
+    conversationKey?: string;
+  }>(), {
+    assistantMsgId: "",
+    streamText: "",
+    thinkText: "",
+    streamStatus: "",
+    isConversationActive: false,
+    conversationKey: "",
+  });
+
+  const { t: tFn } = useI18n();
+  function t(key: string): string {
+    return tFn(key, emptyI18nParams(), "");
+  }
+
+  const isPlaying = ref<boolean>(false);
+  const voiceSettings = ref<VoiceSettings>(new VoiceSettings());
+  const voiceSettingModalRef = ref<any | null>(null);
+
+  let activeStreamId: string = "";
+  let manualPlayGeneration: number = 0;
+
+  function isStreamFinished(): boolean {
+    return props.streamStatus == "complete" || props.streamStatus == "error";
+  }
+
+  function isNewAssistantStream(): boolean {
+    if (props.isConversationActive == false) {
+      return false;
+    }
+    return props.streamStatus == "loading" || props.streamStatus == "incomplete";
+  }
+
+  function stopAllAudio(): void {
+    manualPlayGeneration += 1;
+    activeStreamId = "";
+    voiceStreamSpeaker.stop();
+    audioPlayerManager.stop();
+    isPlaying.value = false;
+  }
+
+  function setupPlayerStateListener(): void {
+    audioPlayerManager.setOnStateChange((state, _messageId) => {
+      isPlaying.value = state == "playing";
+    });
+  }
+
+  function feedCurrentStream(): void {
+    if (activeStreamId.length == 0 || activeStreamId != props.assistantMsgId) {
+      return;
+    }
+    voiceStreamSpeaker.onStreamChunk(
+      props.streamText,
+      props.thinkText,
+      isStreamFinished(),
+    );
+  }
+
+  async function playLatestReply(): Promise<void> {
+    stopAllAudio();
+    const settings = voiceSettings.value;
+    let fullText = props.streamText;
+    if (settings.includeThinkContent == true && props.thinkText.length > 0) {
+      fullText = props.thinkText + "\n" + fullText;
+    }
+    const cleaned = cleanTextForSpeech(fullText, settings);
+    const allSentences = extractSpeakableSentences(cleaned);
+    const sentenceLimit = Math.min(allSentences.length, voiceConfig.maxSentencesPerMessage);
+    if (sentenceLimit == 0) {
+      uni.showToast({ title: t("Mobile.Voice.noSpeakableContent"), icon: "none" });
+      return;
+    }
+
+    manualPlayGeneration += 1;
+    const expectedGeneration = manualPlayGeneration;
+    const messageId = props.assistantMsgId;
+    const first = await ttsService.synthesize(allSentences[0], messageId, 0);
+    if (expectedGeneration != manualPlayGeneration) {
+      return;
+    }
+    const sessionId = audioPlayerManager.playList([first]);
+    for (let i = 1; i < sentenceLimit; i++) {
+      if (expectedGeneration != manualPlayGeneration || audioPlayerManager.getSessionId() != sessionId) {
+        return;
+      }
+      const item = await ttsService.synthesize(allSentences[i], messageId, i);
+      if (expectedGeneration != manualPlayGeneration || audioPlayerManager.getSessionId() != sessionId) {
+        return;
+      }
+      audioPlayerManager.enqueue([item], sessionId);
+    }
+  }
+
+  function toggleLatestPlayback(): void {
+    if (isPlaying.value == true) {
+      stopAllAudio();
+    } else {
+      playLatestReply();
+    }
+  }
+
+  function openSettings(): void {
+    const modal = voiceSettingModalRef.value;
+    if (modal == null) {
+      return;
+    }
+    const openFn = (modal as UTSJSONObject)["open"] as (() => void) | null;
+    if (openFn != null) {
+      openFn();
+    }
+  }
+
+  function handleSettingsChange(settings: VoiceSettings): void {
+    voiceSettings.value = cloneVoiceSettings(settings);
+    if (settings.autoPlay == false && activeStreamId.length > 0) {
+      stopAllAudio();
+    }
+  }
+
+  watch((): string => props.assistantMsgId, (newId: string, _oldId: string) => {
+    if (newId.length == 0 || voiceSettings.value.autoPlay == false || isNewAssistantStream() == false) {
+      return;
+    }
+    stopAllAudio();
+    activeStreamId = newId;
+    voiceStreamSpeaker.begin(newId, cloneVoiceSettings(voiceSettings.value));
+    feedCurrentStream();
+  });
+
+  watch((): string => props.streamText, (_value: string, _oldValue: string) => {
+    feedCurrentStream();
+  });
+  watch((): string => props.thinkText, (_value: string, _oldValue: string) => {
+    feedCurrentStream();
+  });
+  watch((): string => props.streamStatus, (_value: string, _oldValue: string) => {
+    feedCurrentStream();
+  });
+  watch((): boolean => props.isConversationActive, (active: boolean, oldActive: boolean) => {
+    if (oldActive == true && active == false && activeStreamId.length > 0 && isStreamFinished() == false) {
+      stopAllAudio();
+    }
+  });
+  watch((): string => props.conversationKey, (newKey: string, oldKey: string) => {
+    if (newKey != oldKey) {
+      stopAllAudio();
+    }
+  });
+
+  onMounted(() => {
+    voiceSettings.value = loadVoiceSettings();
+    setupPlayerStateListener();
+  });
+
+  onShow(() => {
+    setupPlayerStateListener();
+  });
+
+  onHide(() => {
+    stopAllAudio();
+    audioPlayerManager.setOnStateChange(null);
+  });
+
+  onUnmounted(() => {
+    stopAllAudio();
+    audioPlayerManager.setOnStateChange(null);
+  });
+</script>
+
+<style lang="scss" scoped>
+  .voice-panel {
+    flex-shrink: 0;
+    padding: 12rpx 24rpx 4rpx;
+    background-color: #fff;
+  }
+
+  .panel-row {
+    min-height: 84rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    border: 1rpx solid rgba(0, 0, 0, 0.08);
+    border-radius: 24rpx;
+    background-color: #f7f7fa;
+  }
+
+  .play-button {
+    flex: 1;
+    height: 76rpx;
+    padding: 0 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .action-icon {
+    font-size: 22rpx;
+    color: rgb(108, 101, 244);
+    margin-right: 12rpx;
+  }
+
+  .action-label {
+    font-size: 26rpx;
+    color: rgba(0, 0, 0, 0.65);
+  }
+
+  .settings-button {
+    width: 76rpx;
+    height: 76rpx;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-left: 1rpx solid rgba(0, 0, 0, 0.08);
+  }
+</style>

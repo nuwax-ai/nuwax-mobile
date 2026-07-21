@@ -1,0 +1,174 @@
+/**
+ * 桌宠配网协议层（平台无关，纯函数）
+ *
+ * 职责：把「字节 ⇄ 语义」收敛到一处，配网逻辑层不直接拼字节。
+ * 全部纯函数，可在无真机时配合 Mock 充分联调，亦可独立单测。
+ *
+ * ⚠️ 待与固件确认的协议细节（详见方案 §8.2）：
+ *  - PROV_STATUS byte1-2 错误详情的字节序（此处先按 little-endian）
+ *  - DEVICE_INFO 具体格式（此处先按 UTF-8 分隔符串 "sn|model|firmware"）
+ */
+import { ProvStatusEnum, ProvCommandEnum } from '@/types/enums/provision';
+import type { ProvStatusResult, ProvisionDeviceInfo } from '@/types/interfaces/provision';
+import {
+  PROV_SSID_MAX_BYTES,
+  PROV_PASSWORD_MAX_BYTES,
+  PROV_PASSWORD_MIN_BYTES,
+} from '@/constants/provision.constants';
+
+/**
+ * string → UTF-8 ArrayBuffer（SSID/密码编码用）
+ * 兼容无 TextEncoder 场景，手写 UTF-8 编码（与 utils/utf8.uts 的解码互逆）。
+ */
+export function encodeUtf8(text: string): ArrayBuffer {
+  const bytes = [] as number[];
+  for (let i = 0; i < text.length; i++) {
+    let code = text.charCodeAt(i) as number;
+    // 处理代理对（surrogate pair）→ 实际码点
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1) as number;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+        i++;
+      }
+    }
+    if (code < 0x80) {
+      bytes.push(code);
+    } else if (code < 0x800) {
+      bytes.push(0xc0 | (code >> 6));
+      bytes.push(0x80 | (code & 0x3f));
+    } else if (code < 0x10000) {
+      bytes.push(0xe0 | (code >> 12));
+      bytes.push(0x80 | ((code >> 6) & 0x3f));
+      bytes.push(0x80 | (code & 0x3f));
+    } else {
+      bytes.push(0xf0 | (code >> 18));
+      bytes.push(0x80 | ((code >> 12) & 0x3f));
+      bytes.push(0x80 | ((code >> 6) & 0x3f));
+      bytes.push(0x80 | (code & 0x3f));
+    }
+  }
+  const u8 = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    u8[i] = bytes[i];
+  }
+  return u8.buffer as ArrayBuffer;
+}
+
+/** 计算 string 的 UTF-8 字节数（校验长度用，不实际分配 buffer） */
+export function utf8ByteLength(text: string): number {
+  return encodeUtf8(text).byteLength;
+}
+
+/**
+ * Uint8Array → string（UTF-8 解码）
+ * 复用项目既有实现思路（见 utils/utf8.uts 的 utf8ArrayToString），此处内联以避免环形依赖。
+ */
+export function decodeUtf8(bytes: Uint8Array): string {
+  let out = '';
+  let i = 0;
+  const len = bytes.length;
+  while (i < len) {
+    const c = bytes[i++];
+    if (c < 0x80) {
+      out += String.fromCharCode(c);
+    } else if (c < 0xe0) {
+      const c2 = bytes[i++];
+      out += String.fromCharCode(((c & 0x1f) << 6) | (c2 & 0x3f));
+    } else if (c < 0xf0) {
+      const c2 = bytes[i++];
+      const c3 = bytes[i++];
+      out += String.fromCharCode(((c & 0x0f) << 12) | ((c2 & 0x3f) << 6) | (c3 & 0x3f));
+    } else {
+      const c2 = bytes[i++];
+      const c3 = bytes[i++];
+      const c4 = bytes[i++];
+      let codepoint = ((c & 0x07) << 18) | ((c2 & 0x3f) << 12) | ((c3 & 0x3f) << 6) | (c4 & 0x3f);
+      codepoint -= 0x10000;
+      out += String.fromCharCode(0xd800 + (codepoint >> 10));
+      out += String.fromCharCode(0xdc00 + (codepoint & 0x3ff));
+    }
+  }
+  return out;
+}
+
+/** ArrayBuffer → string（UTF-8 解码便捷入口） */
+export function bytesToString(buf: ArrayBuffer): string {
+  return decodeUtf8(new Uint8Array(buf));
+}
+
+/** 单字节命令编码（COMMAND 特征写入用） */
+export function encodeCommand(cmd: ProvCommandEnum): ArrayBuffer {
+  const u8 = new Uint8Array(1);
+  u8[0] = cmd as number;
+  return u8.buffer as ArrayBuffer;
+}
+
+/**
+ * 解析 PROV_STATUS Notify/Read 的 3 字节：
+ *   byte0     = 状态码（ProvStatusEnum）
+ *   byte1-2   = 错误详情码（little-endian，无则 0）
+ */
+export function decodeProvStatus(buf: ArrayBuffer): ProvStatusResult {
+  const u8 = new Uint8Array(buf);
+  const statusByte = u8.length > 0 ? u8[0] : 0;
+  let detail = 0;
+  if (u8.length >= 3) {
+    // little-endian：byte1 低位，byte2 高位
+    detail = (u8[2] << 8) | u8[1];
+  } else if (u8.length == 2) {
+    detail = u8[1];
+  }
+  return new ProvStatusResult(statusByte as ProvStatusEnum, detail);
+}
+
+/**
+ * 解析 DEVICE_INFO（先按 UTF-8 分隔符串 "sn|model|firmware"，待与固件确认格式）。
+ * 解析失败时各字段置空、raw 保留原文兜底展示。
+ */
+export function decodeDeviceInfo(buf: ArrayBuffer): ProvisionDeviceInfo {
+  const raw = bytesToString(buf);
+  const parts = raw.split('|');
+  return new ProvisionDeviceInfo(
+    parts.length > 0 ? parts[0] : '',
+    parts.length > 1 ? parts[1] : '',
+    parts.length > 2 ? parts[2] : '',
+    raw,
+  );
+}
+
+/** 校验 SSID：1..32 字节。返回是否合法。 */
+export function validateSsid(ssid: string): boolean {
+  const len = utf8ByteLength(ssid);
+  return len >= 1 && len <= PROV_SSID_MAX_BYTES;
+}
+
+/** 校验密码：开放网络允许空（0 字节），否则 8..64 字节。 */
+export function validatePassword(password: string): boolean {
+  const len = utf8ByteLength(password);
+  if (len == 0) return true; // 开放网络
+  return len >= PROV_PASSWORD_MIN_BYTES && len <= PROV_PASSWORD_MAX_BYTES;
+}
+
+/**
+ * 把 (status, errorDetail) 映射为 Mobile.Provision.Error.* 文案 key。
+ * 错误详情码表待固件给出，此处先占位约定：
+ *   0x0001=密码错误 0x0002=找不到AP 0x0003=DHCP失败 0x0004=超时
+ */
+export function provErrorToI18nKey(status: ProvStatusEnum, errorDetail: number): string {
+  if (status == ProvStatusEnum.FAILED) {
+    switch (errorDetail) {
+      case 1:
+        return 'Mobile.Provision.Error.wrongPassword';
+      case 2:
+        return 'Mobile.Provision.Error.apNotFound';
+      case 3:
+        return 'Mobile.Provision.Error.dhcpFailed';
+      case 4:
+        return 'Mobile.Provision.Error.timeout';
+      default:
+        return 'Mobile.Provision.Error.unknown';
+    }
+  }
+  return 'Mobile.Provision.Error.unknown';
+}

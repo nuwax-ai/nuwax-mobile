@@ -1,0 +1,317 @@
+/** ESP-IDF 6.0 network_provisioning 跨页面单一会话 Controller。 */
+import { ref, type Ref } from 'vue';
+import type { EspProvisioningClient } from '@/utils/provisioning/espProvisioningClient';
+import {
+  createEspProvisioningClient,
+  hasEspProvisioningClientProvider,
+} from '@/utils/provisioning/espProvisioningClientFactory';
+import { MockEspProvisioningClient } from '@/utils/provisioning/mockEspProvisioningClient';
+import { UnavailableEspProvisioningClient } from '@/utils/provisioning/unavailableEspProvisioningClient';
+import { isUsingMock } from '@/utils/ble/bleAdapterFactory';
+import {
+  EspProvisioningConfig,
+  EspProvisioningDevice,
+  EspProvisioningError,
+  EspProvisioningProgress,
+} from '@/types/interfaces/espProvisioning';
+import {
+  EspProvisioningErrorCodeEnum,
+  EspProvisioningPhaseEnum,
+  EspProvisioningSecurityEnum,
+} from '@/types/enums/espProvisioning';
+import { ProvisionError } from '@/types/interfaces/provision';
+import { ProvisionRetryActionEnum } from '@/types/enums/provision';
+import {
+  ESP_PROV_CONNECT_TIMEOUT_MS,
+  ESP_PROV_DEFAULT_DEVICE_PREFIX,
+  ESP_PROV_DEFAULT_SERVICE_UUID,
+  ESP_PROV_SCAN_TIMEOUT_MS,
+  ESP_PROV_STATUS_TIMEOUT_MS,
+} from '@/constants/espProvisioning.constants';
+import { validatePassword, validateSsid } from '@/utils/provisionProtocol';
+
+export class EspProvisioningController {
+  phase: Ref<EspProvisioningPhaseEnum>;
+  scannedDevices: Ref<EspProvisioningDevice[]>;
+  error: Ref<ProvisionError | null>;
+  connectedSsid: Ref<string>;
+  capabilities: Ref<string[]>;
+  busy: Ref<boolean>;
+
+  private client: EspProvisioningClient;
+  private initialized = false;
+  private disposed = false;
+  private currentDevice: EspProvisioningDevice | null = null;
+  private pendingSsid = '';
+  private pendingPassword = '';
+  private retryAction: ProvisionRetryActionEnum = ProvisionRetryActionEnum.NONE;
+  private config: EspProvisioningConfig;
+
+  constructor() {
+    this.client = isUsingMock()
+      ? new MockEspProvisioningClient()
+      : (hasEspProvisioningClientProvider() ? createEspProvisioningClient() : new UnavailableEspProvisioningClient());
+    this.phase = ref<EspProvisioningPhaseEnum>(EspProvisioningPhaseEnum.IDLE);
+    this.scannedDevices = ref<EspProvisioningDevice[]>([] as EspProvisioningDevice[]);
+    this.error = ref<ProvisionError | null>(null);
+    this.connectedSsid = ref<string>('');
+    this.capabilities = ref<string[]>([] as string[]);
+    this.busy = ref<boolean>(false);
+    this.config = this.createDefaultConfig();
+
+    this.client.onDeviceFound((device: EspProvisioningDevice) => this.handleDeviceFound(device));
+    this.client.onProgress((progress: EspProvisioningProgress) => this.handleProgress(progress));
+    this.client.onLog((level: string, event: string, detail: string) => {
+      console.log(`[EspProvisioning][${level}] ${event} ${detail}`);
+    });
+  }
+
+  /** 二维码解析完成后覆盖默认安全参数，仅保存在当前 Controller 内存。 */
+  configureSecurity(
+    security: EspProvisioningSecurityEnum,
+    username: string,
+    proofOfPossession: string,
+    deviceNamePrefix: string,
+  ): void {
+    this.config.security = security;
+    this.config.username = username;
+    this.config.proofOfPossession = proofOfPossession;
+    if (deviceNamePrefix != '') this.config.deviceNamePrefix = deviceNamePrefix;
+  }
+
+  async startScan(): Promise<void> {
+    this.ensureActive();
+    this.error.value = null;
+    this.scannedDevices.value = [] as EspProvisioningDevice[];
+    this.busy.value = true;
+    try {
+      if (!this.initialized) {
+        await this.client.initialize(this.config);
+        this.initialized = true;
+      }
+      this.phase.value = EspProvisioningPhaseEnum.SCANNING;
+      await this.client.startScan();
+    } catch (e) {
+      this.fail(this.asEspError(e), ProvisionRetryActionEnum.RESCAN);
+    } finally {
+      this.busy.value = false;
+    }
+  }
+
+  stopScan(): void {
+    this.client.stopScan().catch(() => {});
+    if (this.phase.value == EspProvisioningPhaseEnum.SCANNING) {
+      this.phase.value = EspProvisioningPhaseEnum.IDLE;
+    }
+  }
+
+  async selectAndPrepare(
+    device: EspProvisioningDevice,
+    ssid: string = '',
+    password: string = '',
+  ): Promise<boolean> {
+    this.ensureActive();
+    this.stopScan();
+    this.currentDevice = device;
+    if (ssid != '') {
+      this.pendingSsid = ssid;
+      this.pendingPassword = password;
+    }
+    this.error.value = null;
+    this.busy.value = true;
+    let lastError = null as EspProvisioningError | null;
+
+    try {
+      if (!this.initialized) {
+        await this.client.initialize(this.config);
+        this.initialized = true;
+      }
+    } catch (e) {
+      this.fail(this.asEspError(e), ProvisionRetryActionEnum.RECONNECT);
+      return false;
+    }
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.client.connect(device);
+        this.capabilities.value = await this.client.getCapabilities();
+        this.busy.value = false;
+        return true;
+      } catch (e) {
+        lastError = this.asEspError(e);
+        if (attempt < 2) await this.sleep(1000 * (attempt + 1));
+      }
+    }
+
+    if (lastError == null) {
+      lastError = new EspProvisioningError(
+        EspProvisioningErrorCodeEnum.CONNECT_FAILED,
+        'BLE 连接失败',
+      );
+    }
+    this.fail(lastError!!, ProvisionRetryActionEnum.RECONNECT);
+    return false;
+  }
+
+  async provision(ssid: string, password: string): Promise<void> {
+    this.ensureActive();
+    if (!validateSsid(ssid)) {
+      this.fail(new EspProvisioningError(
+        EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
+        'SSID 长度非法',
+        '',
+        0,
+        false,
+      ), ProvisionRetryActionEnum.NONE);
+      return;
+    }
+    if (!validatePassword(password)) {
+      this.fail(new EspProvisioningError(
+        EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
+        'WiFi 密码长度非法',
+        '',
+        0,
+        false,
+      ), ProvisionRetryActionEnum.NONE);
+      return;
+    }
+
+    this.pendingSsid = ssid;
+    this.pendingPassword = password;
+    this.error.value = null;
+    this.busy.value = true;
+    try {
+      await this.client.provision(ssid, password);
+      this.connectedSsid.value = ssid;
+      this.phase.value = EspProvisioningPhaseEnum.SUCCESS;
+      this.retryAction = ProvisionRetryActionEnum.NONE;
+    } catch (e) {
+      const err = this.asEspError(e);
+      const action = err.code == EspProvisioningErrorCodeEnum.DISCONNECTED
+        ? ProvisionRetryActionEnum.RECONNECT
+        : ProvisionRetryActionEnum.REWRITE;
+      this.fail(err, action);
+    } finally {
+      this.busy.value = false;
+    }
+  }
+
+  async retry(): Promise<void> {
+    if (this.error.value == null || !this.error.value!!.retryable) return;
+    if (this.retryAction == ProvisionRetryActionEnum.RESCAN) {
+      await this.startScan();
+      return;
+    }
+    if (this.retryAction == ProvisionRetryActionEnum.RECONNECT) {
+      const device = this.currentDevice;
+      if (device == null) return;
+      const ok = await this.selectAndPrepare(device);
+      if (!ok) return;
+    }
+    await this.provision(this.pendingSsid, this.pendingPassword);
+  }
+
+  /** 当前官方协议尚未冻结 reset custom endpoint，先明确返回 false。 */
+  resetDevice(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+
+  async disconnect(): Promise<void> {
+    await this.client.disconnect();
+    this.phase.value = EspProvisioningPhaseEnum.IDLE;
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.client.dispose();
+    this.pendingSsid = '';
+    this.pendingPassword = '';
+    this.currentDevice = null;
+  }
+
+  private createDefaultConfig(): EspProvisioningConfig {
+    return new EspProvisioningConfig(
+      ESP_PROV_DEFAULT_SERVICE_UUID,
+      ESP_PROV_DEFAULT_DEVICE_PREFIX,
+      EspProvisioningSecurityEnum.SECURITY_2,
+      isUsingMock() ? 'mock-user' : '',
+      isUsingMock() ? 'mock-pop' : '',
+      ESP_PROV_SCAN_TIMEOUT_MS,
+      ESP_PROV_CONNECT_TIMEOUT_MS,
+      ESP_PROV_STATUS_TIMEOUT_MS,
+    );
+  }
+
+  private handleDeviceFound(device: EspProvisioningDevice): void {
+    const list = this.scannedDevices.value;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].deviceId == device.deviceId) {
+        list[i].rssi = device.rssi;
+        return;
+      }
+    }
+    list.push(device);
+  }
+
+  private handleProgress(progress: EspProvisioningProgress): void {
+    this.phase.value = progress.phase;
+  }
+
+  private fail(err: EspProvisioningError, retryAction: ProvisionRetryActionEnum): void {
+    this.retryAction = retryAction;
+    this.error.value = new ProvisionError(
+      this.errorI18nKey(err.code),
+      `${err.code}: ${err.detail != '' ? err.detail : err.message}`,
+      err.retryable,
+      retryAction,
+    );
+    this.phase.value = EspProvisioningPhaseEnum.FAILED;
+    this.busy.value = false;
+  }
+
+  private errorI18nKey(code: EspProvisioningErrorCodeEnum): string {
+    if (code == EspProvisioningErrorCodeEnum.BLUETOOTH_OFF) return 'Mobile.Provision.Error.bluetoothOff';
+    if (code == EspProvisioningErrorCodeEnum.CONNECT_FAILED) return 'Mobile.Provision.Error.connectFailed';
+    if (code == EspProvisioningErrorCodeEnum.DISCONNECTED) return 'Mobile.Provision.Error.disconnected';
+    if (code == EspProvisioningErrorCodeEnum.AUTH_FAILED) return 'Mobile.Provision.Error.wrongPassword';
+    if (code == EspProvisioningErrorCodeEnum.NETWORK_NOT_FOUND) return 'Mobile.Provision.Error.apNotFound';
+    if (code == EspProvisioningErrorCodeEnum.STATUS_TIMEOUT) return 'Mobile.Provision.Error.timeout';
+    if (code == EspProvisioningErrorCodeEnum.SERVICE_MISMATCH) return 'Mobile.Provision.Error.firmwareMismatch';
+    if (code == EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED) return 'Mobile.Provision.Error.writeFailed';
+    return 'Mobile.Provision.Error.unknown';
+  }
+
+  private asEspError(value: any): EspProvisioningError {
+    if (value instanceof EspProvisioningError) return value;
+    return new EspProvisioningError(
+      EspProvisioningErrorCodeEnum.UNKNOWN,
+      '未知配网错误',
+      `${value}`,
+    );
+  }
+
+  private ensureActive(): void {
+    if (this.disposed) throw new Error('ESP_PROVISIONING_SESSION_DISPOSED');
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      setTimeout(() => resolve(), ms);
+    });
+  }
+}
+
+let activeController: EspProvisioningController | null = null;
+
+/** 获取跨 scan/wifi/progress 页面共享的单一 Controller。 */
+export function useEspProvisioning(): EspProvisioningController {
+  if (activeController == null) activeController = new EspProvisioningController();
+  return activeController!!;
+}
+
+/** 完成或取消整个流程时释放；普通 navigateTo/navigateBack 不调用。 */
+export function releaseEspProvisioning(): void {
+  if (activeController != null) activeController!!.dispose();
+  activeController = null;
+}

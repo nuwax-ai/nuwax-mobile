@@ -1,6 +1,6 @@
 # 桌搭 BLE 配网接入方案对齐文档
 
-> 文档状态：待硬件、固件、APP 联合评审
+> 文档状态：技术路线评审完成；首轮联调参数已冻结
 > APP 平台：Android 首联调，后续覆盖 iOS / HarmonyOS
 > 通信角色：APP = BLE Central，桌搭硬件 = BLE Peripheral
 > 核心目标：APP 通过 BLE 将 WiFi 凭据安全下发给桌搭，并获取联网结果及设备身份信息
@@ -10,6 +10,8 @@
 > 评审结论：可作为需求草案，不建议按 v1.0 原样进入固件开发；需先完成第 2.1 节中的技术路线决策和协议修订。
 
 APP 代码级方案见 [`esp32s3-idf6-provisioning-code-plan.md`](./esp32s3-idf6-provisioning-code-plan.md)，双方机器可读参数契约见 [`esp32s3-idf6-provisioning-contract.json`](./esp32s3-idf6-provisioning-contract.json)。
+
+硬件回传后的权威联调文档为 [`esp32s3-ble-app-firmware-handoff.md`](./esp32s3-ble-app-firmware-handoff.md) 和 [`esp32s3-ble-first-integration-handoff.md`](./esp32s3-ble-first-integration-handoff.md)。若本文中的早期草案假设与权威联调文档冲突，以 `1.0-first-integration` 契约为准。
 
 ## 1. 对齐目标
 

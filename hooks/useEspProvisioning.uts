@@ -9,8 +9,10 @@ import { MockEspProvisioningClient } from '@/utils/provisioning/mockEspProvision
 import { UnavailableEspProvisioningClient } from '@/utils/provisioning/unavailableEspProvisioningClient';
 import { isUsingMock } from '@/utils/ble/bleAdapterFactory';
 import {
+  EspProvisioningCapabilities,
   EspProvisioningConfig,
   EspProvisioningDevice,
+  EspProvisioningDeviceInfo,
   EspProvisioningError,
   EspProvisioningProgress,
 } from '@/types/interfaces/espProvisioning';
@@ -27,6 +29,7 @@ import {
   ESP_PROV_DEFAULT_SERVICE_UUID,
   ESP_PROV_SCAN_TIMEOUT_MS,
   ESP_PROV_STATUS_TIMEOUT_MS,
+  ESP_PROV_REQUIRED_CAPABILITY,
 } from '@/constants/espProvisioning.constants';
 import { validatePassword, validateSsid } from '@/utils/provisionProtocol';
 
@@ -35,7 +38,8 @@ export class EspProvisioningController {
   scannedDevices: Ref<EspProvisioningDevice[]>;
   error: Ref<ProvisionError | null>;
   connectedSsid: Ref<string>;
-  capabilities: Ref<string[]>;
+  capabilities: Ref<EspProvisioningCapabilities | null>;
+  deviceInfo: Ref<EspProvisioningDeviceInfo | null>;
   busy: Ref<boolean>;
 
   private client: EspProvisioningClient;
@@ -55,7 +59,8 @@ export class EspProvisioningController {
     this.scannedDevices = ref<EspProvisioningDevice[]>([] as EspProvisioningDevice[]);
     this.error = ref<ProvisionError | null>(null);
     this.connectedSsid = ref<string>('');
-    this.capabilities = ref<string[]>([] as string[]);
+    this.capabilities = ref<EspProvisioningCapabilities | null>(null);
+    this.deviceInfo = ref<EspProvisioningDeviceInfo | null>(null);
     this.busy = ref<boolean>(false);
     this.config = this.createDefaultConfig();
 
@@ -121,6 +126,17 @@ export class EspProvisioningController {
     this.busy.value = true;
     let lastError = null as EspProvisioningError | null;
 
+    if (!isUsingMock() && (this.config.username == '' || this.config.proofOfPossession == '')) {
+      this.fail(new EspProvisioningError(
+        EspProvisioningErrorCodeEnum.SECURITY_AUTH_FAILED,
+        '缺少 Security 2 username 或 PoP',
+        'Security 2 credentials must come from QR or controlled integration input',
+        0,
+        false,
+      ), ProvisionRetryActionEnum.NONE);
+      return false;
+    }
+
     try {
       if (!this.initialized) {
         await this.client.initialize(this.config);
@@ -134,7 +150,39 @@ export class EspProvisioningController {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await this.client.connect(device);
-        this.capabilities.value = await this.client.getCapabilities();
+        const capabilities = await this.client.getCapabilities();
+        if (capabilities.securityVersion != 2) {
+          throw new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SECURITY_MISMATCH,
+            '固件没有启用 Security 2',
+            `sec_ver=${capabilities.securityVersion}`,
+            0,
+            false,
+          );
+        }
+        if (!capabilities.has(ESP_PROV_REQUIRED_CAPABILITY)) {
+          throw new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SERVICE_MISMATCH,
+            '固件缺少 wifi_prov capability',
+            capabilities.capabilities.join(','),
+            0,
+            false,
+          );
+        }
+        this.capabilities.value = capabilities;
+        this.phase.value = EspProvisioningPhaseEnum.ESTABLISHING_SESSION;
+        const info = await this.client.getDeviceInfo();
+        if (info.serialNumber == '') {
+          throw new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SERVICE_MISMATCH,
+            'device-info 缺少 serialNumber',
+            '',
+            0,
+            false,
+          );
+        }
+        this.deviceInfo.value = info;
+        this.phase.value = EspProvisioningPhaseEnum.READY;
         this.busy.value = false;
         return true;
       } catch (e) {
@@ -274,9 +322,11 @@ export class EspProvisioningController {
     if (code == EspProvisioningErrorCodeEnum.BLUETOOTH_OFF) return 'Mobile.Provision.Error.bluetoothOff';
     if (code == EspProvisioningErrorCodeEnum.CONNECT_FAILED) return 'Mobile.Provision.Error.connectFailed';
     if (code == EspProvisioningErrorCodeEnum.DISCONNECTED) return 'Mobile.Provision.Error.disconnected';
-    if (code == EspProvisioningErrorCodeEnum.AUTH_FAILED) return 'Mobile.Provision.Error.wrongPassword';
+    if (code == EspProvisioningErrorCodeEnum.AUTH_FAILED || code == EspProvisioningErrorCodeEnum.WIFI_AUTH_FAILED) return 'Mobile.Provision.Error.wrongPassword';
+    if (code == EspProvisioningErrorCodeEnum.INVALID_POP || code == EspProvisioningErrorCodeEnum.SECURITY_AUTH_FAILED || code == EspProvisioningErrorCodeEnum.SESSION_FAILED) return 'Mobile.Provision.Error.securityAuthFailed';
     if (code == EspProvisioningErrorCodeEnum.NETWORK_NOT_FOUND) return 'Mobile.Provision.Error.apNotFound';
     if (code == EspProvisioningErrorCodeEnum.STATUS_TIMEOUT) return 'Mobile.Provision.Error.timeout';
+    if (code == EspProvisioningErrorCodeEnum.PROVISIONING_WINDOW_EXPIRED) return 'Mobile.Provision.Error.windowExpired';
     if (code == EspProvisioningErrorCodeEnum.SERVICE_MISMATCH) return 'Mobile.Provision.Error.firmwareMismatch';
     if (code == EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED) return 'Mobile.Provision.Error.writeFailed';
     return 'Mobile.Provision.Error.unknown';

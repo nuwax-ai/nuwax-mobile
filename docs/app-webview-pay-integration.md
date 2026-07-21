@@ -1,5 +1,7 @@
 # APP WebView 支付接入说明
 
+> **已废弃（仅保留历史排查用途）**：Android、iOS、HarmonyOS 新包请使用 [App 原生支付接入说明](./app-native-pay-integration.md)，走 `/api/bill/order/pay/app-native` 和微信 `WXLaunchMiniProgram`，不要继续接入本文的 `/pay/h5-web` 跳转方案。
+
 > 面向：APP 客户端研发同学  
 > 场景：在 APP 内置 WebView 中打开我方 H5「我的订阅」并完成支付  
 > 前提：**登录已打通**，本次仅需处理 WebView 支付外跳能力  

@@ -55,6 +55,31 @@ ADB=/Applications/HBuilderX.app/Contents/HBuilderX/plugins/launcher-tools/tools/
 $ADB -s emulator-5554 logcat | grep -iE "uts|uniapp|console"
 ```
 
+## iOS 调试（HBuilderX CLI）
+
+```bash
+CLI=/Applications/HBuilderX.app/Contents/MacOS/cli
+
+# 查看设备（真机 + 模拟器）
+$CLI devices list --platform ios-iPhone
+$CLI devices list --platform ios-simulator
+
+# 跑模拟器（无需签名，先验证编译/UI 用这条）
+$CLI launch app-ios --project nuwax-mobile --iosTarget simulator --deviceId <UDID>
+
+# 跑真机
+$CLI launch app-ios --project nuwax-mobile --iosTarget device --deviceId <设备序列号>
+
+# 看日志
+$CLI logcat app-ios --project nuwax-mobile
+```
+
+**iOS 真机签名（重要）**：iOS 真机无法运行未签名的标准基座，三条路：
+
+1. **模拟器** —— 无需签名，但不能装微信/支付宝，支付链路只能验证到 `app-native` 请求
+2. **重签名标准基座** —— 用自己的 Apple 证书签 `plugins/uniappx-launcher/base/iPhone_base.ipa`（bundle id `io.dcloud.uniappx`），替换后跑真机。iPhone 需开启开发者模式
+3. **自定义基座（云打包）** —— 正式调试支付/推送等原生能力的推荐方式，需配置证书 + profile
+
 排障要点：
 
 - 编译产物输出到 `unpackage/dist/dev/app-android/`，该目录已 gitignore，不要提交

@@ -17,6 +17,13 @@ export UNI_PLATFORM=app
 export RUN_BY_HBUILDERX=1
 export HX_Version=5.07
 
+# 含 Android 三方依赖的 UTS 插件需要 HBuilderX 运行配置。
+# 可由调用方覆盖；GRADLE_HOME 在此工具链中应指向 Gradle 7.5-8.x 可执行文件。
+export USER_DATA_PATH="${USER_DATA_PATH:-/tmp/nuwax-uni-build-cache}"
+export JDK_PATH="${JDK_PATH:-$HOME/Library/Android/sdk}"
+export APP_ROOT="${APP_ROOT:-$HX_APP_ROOT}"
+export GRADLE_JAVA_HOME="${GRADLE_JAVA_HOME:-$HX_APP_ROOT/plugins/amazon-corretto}"
+
 /Applications/HBuilderX.app/Contents/HBuilderX/plugins/node/node \
   --max-old-space-size=3072 \
   --no-warnings \
@@ -38,7 +45,9 @@ for i in $(seq 1 20); do
   fi
   LINES=$(wc -l < /tmp/uni-app-build.log | tr -d ' ')
   echo "[$((i*5))s] running, $LINES lines"
-  if [ "$LINES" = "$PREV_LINES" ]; then
+  if grep -q "正在更新三方依赖" /tmp/uni-app-build.log && ! grep -q "三方依赖更新完成" /tmp/uni-app-build.log; then
+    STABLE_COUNT=0
+  elif [ "$LINES" = "$PREV_LINES" ]; then
     STABLE_COUNT=$((STABLE_COUNT+1))
     [ "$STABLE_COUNT" -ge 3 ] && break
   else
@@ -56,7 +65,7 @@ wc -lc /tmp/uni-app-build.log
 
 echo ""
 echo "===关键阻塞错误（非 CSS）==="
-grep -E "Could not resolve|Cannot find module|Single file component|Build failed|error TS|✗" /tmp/uni-app-build.log | grep -v "app-uvue-css" | head -30
+grep -E "Could not resolve|Cannot find module|Single file component|Build failed|编译失败|TypeError|error TS|✗" /tmp/uni-app-build.log | grep -v "app-uvue-css" | head -30
 
 echo ""
 echo "===Build failed 计数==="
@@ -66,4 +75,8 @@ if [ "${1:-}" = "show-log" ]; then
   echo ""
   echo "===最后 60 行==="
   tail -60 /tmp/uni-app-build.log
+fi
+
+if grep -Eq "Build failed|编译失败|TypeError \[ERR_|Could not resolve|Cannot find module" /tmp/uni-app-build.log; then
+  exit 1
 fi

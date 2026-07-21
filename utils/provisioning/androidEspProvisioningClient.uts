@@ -1,0 +1,294 @@
+/** Android 乐鑫官方 Provisioning Library 适配器，仅由 APP-ANDROID 构建引用。 */
+import type {
+  EspProvisioningClient,
+  EspProvisioningDeviceFoundCallback,
+  EspProvisioningLogCallback,
+  EspProvisioningProgressCallback,
+} from '@/utils/provisioning/espProvisioningClient';
+import { registerEspProvisioningClientProvider } from '@/utils/provisioning/espProvisioningClientFactory';
+import {
+  EspProvisioningCapabilities,
+  EspProvisioningConfig,
+  EspProvisioningDevice,
+  EspProvisioningDeviceInfo,
+  EspProvisioningError,
+  EspProvisioningProgress,
+  EspWifiNetwork,
+} from '@/types/interfaces/espProvisioning';
+import {
+  EspProvisioningErrorCodeEnum,
+  EspProvisioningPhaseEnum,
+  EspProvisioningSecurityEnum,
+} from '@/types/enums/espProvisioning';
+import {
+  connectNativeEspDevice,
+  disconnectNativeEspDevice,
+  disposeNativeEspProvisioning,
+  getNativeEspCapabilities,
+  getNativeEspDeviceInfo,
+  initializeNativeEspProvisioning,
+  provisionNativeEspDevice,
+  scanNativeEspNetworks,
+  startNativeEspScan,
+  stopNativeEspScan,
+} from '@/uni_modules/nuwax-esp-provisioning';
+
+function jsonString(obj: UTSJSONObject, key: string): string {
+  const value = obj[key];
+  return value != null ? `${value}` : '';
+}
+
+function jsonNumber(obj: UTSJSONObject, key: string, fallback: number = 0): number {
+  const value = obj[key];
+  if (value == null) return fallback;
+  const parsed = parseInt(`${value}`);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+function jsonStringArray(value: any | null): string[] {
+  const result = [] as string[];
+  if (value == null || !Array.isArray(value)) return result;
+  const source = value as any[];
+  for (let i = 0; i < source.length; i++) result.push(`${source[i]}`);
+  return result;
+}
+
+export class AndroidEspProvisioningClient implements EspProvisioningClient {
+  private config: EspProvisioningConfig | null = null;
+  private initialized = false;
+  private disposed = false;
+  private deviceFoundCb: EspProvisioningDeviceFoundCallback | null = null;
+  private progressCb: EspProvisioningProgressCallback | null = null;
+  private logCb: EspProvisioningLogCallback | null = null;
+
+  initialize(config: EspProvisioningConfig): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (config.security != EspProvisioningSecurityEnum.SECURITY_2) {
+        reject(this.error('SECURITY_MISMATCH', '本期固件只允许 Security 2'));
+        return;
+      }
+      this.config = config;
+      initializeNativeEspProvisioning(
+        (_value: string) => {
+          this.initialized = true;
+          this.disposed = false;
+          this.log('info', 'android_provider_initialized', 'lib-2.4.4');
+          resolve();
+        },
+        (code: string, message: string) => reject(this.error(code, message)),
+      );
+    });
+  }
+
+  startScan(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const config = this.config;
+      if (!this.initialized || config == null || this.disposed) {
+        reject(this.error('SCAN_FAILED', 'Android Provider 尚未初始化'));
+        return;
+      }
+      startNativeEspScan(
+        config.deviceNamePrefix,
+        config.serviceUuid,
+        (deviceId: string, name: string, rssi: number, serviceUuid: string) => {
+          if (this.deviceFoundCb != null) {
+            this.deviceFoundCb!!(new EspProvisioningDevice(deviceId, name, rssi, serviceUuid));
+          }
+        },
+        (code: string, message: string) => this.log('error', code, message),
+      );
+      this.progress(EspProvisioningPhaseEnum.SCANNING, 'BLE scan started');
+      resolve();
+    });
+  }
+
+  stopScan(): Promise<void> {
+    stopNativeEspScan();
+    return Promise.resolve();
+  }
+
+  onDeviceFound(cb: EspProvisioningDeviceFoundCallback): void {
+    this.deviceFoundCb = cb;
+  }
+
+  connect(device: EspProvisioningDevice): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const config = this.config;
+      if (config == null) {
+        reject(this.error('CONNECT_FAILED', 'Android Provider 尚未初始化'));
+        return;
+      }
+      this.progress(EspProvisioningPhaseEnum.CONNECTING, 'BLE connecting');
+      connectNativeEspDevice(
+        device.deviceId,
+        device.primaryServiceUuid,
+        config.username,
+        config.proofOfPossession,
+        config.connectTimeoutMs,
+        (_value: string) => {
+          this.progress(EspProvisioningPhaseEnum.DISCOVERING, 'proto-ver available');
+          resolve();
+        },
+        (code: string, message: string) => reject(this.error(code, message)),
+      );
+    });
+  }
+
+  getCapabilities(): Promise<EspProvisioningCapabilities> {
+    return new Promise<EspProvisioningCapabilities>((resolve, reject) => {
+      getNativeEspCapabilities(
+        (value: string) => {
+          try {
+            const obj = JSON.parse(value) as UTSJSONObject;
+            resolve(new EspProvisioningCapabilities(
+              jsonString(obj, 'appVersion'),
+              jsonString(obj, 'protocolVersion'),
+              jsonNumber(obj, 'securityVersion', -1),
+              jsonStringArray(obj['capabilities']),
+            ));
+          } catch (e) {
+            reject(this.error('SERVICE_MISMATCH', 'proto-ver 响应无法解析'));
+          }
+        },
+        (code: string, message: string) => reject(this.error(code, message)),
+      );
+    });
+  }
+
+  getDeviceInfo(): Promise<EspProvisioningDeviceInfo> {
+    return new Promise<EspProvisioningDeviceInfo>((resolve, reject) => {
+      this.progress(EspProvisioningPhaseEnum.ESTABLISHING_SESSION, 'Security 2 session');
+      getNativeEspDeviceInfo(
+        (value: string) => {
+          try {
+            const obj = JSON.parse(value) as UTSJSONObject;
+            this.progress(EspProvisioningPhaseEnum.READING_DEVICE_INFO, 'device-info');
+            resolve(new EspProvisioningDeviceInfo(
+              jsonString(obj, 'protocolVersion'),
+              jsonString(obj, 'serialNumber'),
+              jsonString(obj, 'productModel'),
+              jsonString(obj, 'hardwareVersion'),
+              jsonString(obj, 'firmwareVersion'),
+              jsonStringArray(obj['capabilities']),
+              jsonString(obj, 'lastProvisioningOutcome'),
+              jsonString(obj, 'lastProvisioningReason'),
+            ));
+          } catch (e) {
+            reject(this.error('SERVICE_MISMATCH', 'device-info 响应无法解析'));
+          }
+        },
+        (code: string, message: string) => reject(this.error(code, message)),
+      );
+    });
+  }
+
+  scanNetworks(): Promise<EspWifiNetwork[]> {
+    return new Promise<EspWifiNetwork[]>((resolve, reject) => {
+      scanNativeEspNetworks(
+        (value: string) => {
+          try {
+            const source = JSON.parse(value) as any[];
+            const result = [] as EspWifiNetwork[];
+            for (let i = 0; i < source.length; i++) {
+              const obj = source[i] as UTSJSONObject;
+              result.push(new EspWifiNetwork(
+                jsonString(obj, 'ssid'),
+                jsonNumber(obj, 'rssi'),
+                jsonNumber(obj, 'security'),
+              ));
+            }
+            resolve(result);
+          } catch (e) {
+            reject(this.error('UNKNOWN', 'WiFi 扫描响应无法解析'));
+          }
+        },
+        (code: string, message: string) => reject(this.error(code, message)),
+      );
+    });
+  }
+
+  provision(ssid: string, password: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const config = this.config;
+      if (config == null) {
+        reject(this.error('UNKNOWN', 'Android Provider 尚未初始化'));
+        return;
+      }
+      provisionNativeEspDevice(
+        ssid,
+        password,
+        config.statusTimeoutMs,
+        (stage: string) => this.progressFromNative(stage),
+        (_value: string) => resolve(),
+        (code: string, message: string) => reject(this.error(code, message)),
+      );
+    });
+  }
+
+  onProgress(cb: EspProvisioningProgressCallback): void {
+    this.progressCb = cb;
+  }
+
+  onLog(cb: EspProvisioningLogCallback): void {
+    this.logCb = cb;
+  }
+
+  disconnect(): Promise<void> {
+    disconnectNativeEspDevice();
+    return Promise.resolve();
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    disposeNativeEspProvisioning();
+    this.deviceFoundCb = null;
+    this.progressCb = null;
+    this.logCb = null;
+    this.config = null;
+  }
+
+  private progressFromNative(stage: string): void {
+    if (stage == 'SENDING_CREDENTIALS') this.progress(EspProvisioningPhaseEnum.SENDING_CREDENTIALS, stage);
+    else if (stage == 'APPLYING_CONFIG') this.progress(EspProvisioningPhaseEnum.APPLYING_CONFIG, stage);
+    else if (stage == 'CHECKING_STATUS') this.progress(EspProvisioningPhaseEnum.CHECKING_STATUS, stage);
+    else if (stage == 'SUCCESS') this.progress(EspProvisioningPhaseEnum.SUCCESS, stage);
+  }
+
+  private progress(phase: EspProvisioningPhaseEnum, message: string): void {
+    if (this.progressCb != null) this.progressCb!!(new EspProvisioningProgress(phase, message));
+  }
+
+  private log(level: string, event: string, detail: string): void {
+    if (this.logCb != null) this.logCb!!(level, event, detail);
+  }
+
+  private error(code: string, message: string): EspProvisioningError {
+    return new EspProvisioningError(this.errorCode(code), message, `android:${code}`);
+  }
+
+  private errorCode(code: string): EspProvisioningErrorCodeEnum {
+    if (code == 'BLUETOOTH_OFF') return EspProvisioningErrorCodeEnum.BLUETOOTH_OFF;
+    if (code == 'NO_PERMISSION') return EspProvisioningErrorCodeEnum.NO_PERMISSION;
+    if (code == 'SCAN_FAILED') return EspProvisioningErrorCodeEnum.SCAN_FAILED;
+    if (code == 'DEVICE_NOT_FOUND') return EspProvisioningErrorCodeEnum.DEVICE_NOT_FOUND;
+    if (code == 'CONNECT_FAILED') return EspProvisioningErrorCodeEnum.CONNECT_FAILED;
+    if (code == 'DISCONNECTED') return EspProvisioningErrorCodeEnum.DISCONNECTED;
+    if (code == 'SERVICE_MISMATCH') return EspProvisioningErrorCodeEnum.SERVICE_MISMATCH;
+    if (code == 'SECURITY_MISMATCH') return EspProvisioningErrorCodeEnum.SECURITY_MISMATCH;
+    if (code == 'SECURITY_AUTH_FAILED') return EspProvisioningErrorCodeEnum.SECURITY_AUTH_FAILED;
+    if (code == 'SESSION_FAILED') return EspProvisioningErrorCodeEnum.SESSION_FAILED;
+    if (code == 'SEND_CONFIG_FAILED') return EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED;
+    if (code == 'APPLY_CONFIG_FAILED') return EspProvisioningErrorCodeEnum.APPLY_CONFIG_FAILED;
+    if (code == 'WIFI_AUTH_FAILED') return EspProvisioningErrorCodeEnum.WIFI_AUTH_FAILED;
+    if (code == 'NETWORK_NOT_FOUND') return EspProvisioningErrorCodeEnum.NETWORK_NOT_FOUND;
+    if (code == 'STATUS_TIMEOUT') return EspProvisioningErrorCodeEnum.STATUS_TIMEOUT;
+    if (code == 'PROVISIONING_WINDOW_EXPIRED') return EspProvisioningErrorCodeEnum.PROVISIONING_WINDOW_EXPIRED;
+    if (code == 'UNSUPPORTED') return EspProvisioningErrorCodeEnum.UNSUPPORTED;
+    return EspProvisioningErrorCodeEnum.UNKNOWN;
+  }
+}
+
+export function registerAndroidEspProvisioningProvider(): void {
+  registerEspProvisioningClientProvider((): EspProvisioningClient => new AndroidEspProvisioningClient());
+}

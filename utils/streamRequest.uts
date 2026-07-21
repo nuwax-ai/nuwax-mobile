@@ -2,6 +2,12 @@ import { StreamRequestConfig, StreamChunk } from "@/types/interfaces/chat";
 import { createSSEConnection } from "@/servers/useRequest.uts";
 import { utf8ArrayToString } from "@/utils/utf8.uts";
 import { t } from "@/utils/i18n";
+import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+
+/** onChunkReceived 回调结果（Android 为原生 RequestTaskOnChunkReceivedListenerResult） */
+interface ChunkReceivedResult {
+  data: ArrayBuffer | null;
+}
 
 /**
  * 合并两个 Uint8Array。
@@ -48,17 +54,38 @@ function createContentChunk(data: string): StreamChunk {
 
 /**
  * 判断 SSE 载荷是否表示流已结束。
- * UTS 不能对 any 直接访问 .completed，需通过 UTSJSONObject 下标读取。
- * @param data SSE 解析后的数据
- * @returns completed 字段为 true 时返回 true
+ * Android：completed 可能是 boolean / 字符串 / 数字，禁止仅判断 == true。
  */
 function isCompletedPayload(data: any): boolean {
   if (data == null) {
     return false;
   }
-  const dataObj = data as UTSJSONObject;
-  const completed = dataObj["completed"];
-  return completed != null && completed == true;
+  const completedRaw = readRawField(data, "completed");
+  if (completedRaw == true) {
+    return true;
+  }
+  const completedStr = completedRaw != null ? `${completedRaw}` : "";
+  return completedStr == "true" || completedStr == "1";
+}
+
+/** 心跳包，不含 data */
+function isSseHeartBeatPayload(data: any): boolean {
+  const eventTypeRaw = readRawField(data, "eventType");
+  return eventTypeRaw != null && `${eventTypeRaw}` == "HEART_BEAT";
+}
+
+/** 不应下发给业务 onChunk 的 SSE 载荷（无 data 的完成包 / 心跳等） */
+function shouldSkipSsePayloadEmit(data: any): boolean {
+  if (data == null) {
+    return true;
+  }
+  if (isCompletedPayload(data)) {
+    return true;
+  }
+  if (isSseHeartBeatPayload(data)) {
+    return true;
+  }
+  return readRawField(data, "data") == null;
 }
 
 /**
@@ -87,6 +114,48 @@ function getErrorMessage(error: any): string {
   const errorObj = error as UTSJSONObject;
   const message = errorObj["message"];
   return message != null ? `${message}` : "";
+}
+
+/**
+ * 从 onChunkReceived 回调参数中提取 ArrayBuffer。
+ * 官方文档为 { data: ArrayBuffer }；APP 端部分运行时直接传入 ArrayBuffer。
+ * @param chunkResult onChunkReceived 回调参数
+ * @returns 分块字节数据，无法识别时返回 null
+ */
+function extractChunkArrayBuffer(chunkResult: any): ArrayBuffer | null {
+  if (chunkResult == null) {
+    return null;
+  }
+
+  // Android APP：原生 RequestTaskOnChunkReceivedListenerResult，禁止 as UTSJSONObject
+  try {
+    const listener = chunkResult as ChunkReceivedResult;
+    const listenerData = listener.data;
+    if (listenerData != null) {
+      return listenerData;
+    }
+  } catch (_eListener) {
+    // 非 listener result，继续尝试其他格式
+  }
+
+  // 小程序 / UTSJSONObject / Map
+  const dataField = readRawField(chunkResult, "data");
+  if (dataField != null) {
+    return dataField as ArrayBuffer;
+  }
+
+  // success 回调中 res.data 可能直接是 ArrayBuffer
+  try {
+    const maybeBuffer = chunkResult as ArrayBuffer;
+    const byteLength = maybeBuffer.byteLength;
+    if (byteLength != null && byteLength >= 0) {
+      return maybeBuffer;
+    }
+  } catch (_eBuffer) {
+    // ignore
+  }
+
+  return null;
 }
 
 // 全局错误处理 - 捕获未处理的 AbortError
@@ -141,6 +210,11 @@ export class StreamRequest {
       await this.requestWeapp(config);
       // #endif
 
+      // #ifdef APP
+      // uni-app x APP：uni.request 返回 RequestTask（非 Promise），需独立实现 chunked 流式接收
+      await this.requestAppX(config);
+      // #endif
+
       // #ifdef APP-PLUS
       await this.requestApp(config);
       // #endif
@@ -153,7 +227,7 @@ export class StreamRequest {
       }
       // #endif
 
-      // #ifdef MP-WEIXIN || APP-PLUS
+      // #ifdef MP-WEIXIN || APP-PLUS || APP
       if (this.isAborted) {
         console.log("请求已被中止");
         return;
@@ -201,6 +275,10 @@ export class StreamRequest {
               return;
             }
 
+            if (shouldSkipSsePayloadEmit(data)) {
+              return;
+            }
+
             // 处理数据块
             const chunk = createContentChunk(
               data != null ? JSON.stringify(data) : "",
@@ -245,11 +323,56 @@ export class StreamRequest {
     }
   }
 
+  /**
+   * 将解码后的 SSE 文本追加到缓冲区，并处理完整消息块。
+   * @param text 新接收的 UTF-8 文本
+   * @param config 流式请求配置
+   * @param onStreamComplete 流结束时的回调（[DONE] / completed）
+   */
+  private appendAndProcessSSEText(
+    text: string,
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    if (text.length === 0) {
+      return;
+    }
+
+    this.buffer += text;
+    const messages = this.buffer.split("\n\n");
+    const pendingMessage = messages.pop();
+    this.buffer = pendingMessage != null ? pendingMessage : "";
+
+    for (const message of messages) {
+      if (!message.trim()) {
+        continue;
+      }
+
+      const lines = message.split("\n");
+      let dataContent = "";
+
+      for (const line of lines) {
+        if (line.startsWith("data:")) {
+          const content = line.slice(5).trim();
+          if (dataContent.length > 0) {
+            dataContent += "\n" + content;
+          } else {
+            dataContent = content;
+          }
+        }
+      }
+
+      if (dataContent.length > 0) {
+        this.processSSEMessage(dataContent, config, onStreamComplete);
+      }
+    }
+  }
+
   // 处理完整的 SSE 消息
   private processSSEMessage(
     content: string,
     config: StreamRequestConfig,
-    resolve: (value: void | PromiseLike<void>) => void,
+    onStreamComplete: () => void,
   ): void {
     // 检查是否完成
     if (content === "[DONE]") {
@@ -260,11 +383,11 @@ export class StreamRequest {
         "[SSE] [DONE] 标记触发，准备清除定时器，当前 timer ID:",
         this.timeoutCheckTimer,
       );
-      this.clearTimeoutMonitor();
+      this.finalizeCompletedStream();
       console.log("[SSE] [DONE] 标记处理完成，定时器已清除");
 
       config.onComplete?.();
-      resolve();
+      onStreamComplete();
       return;
     }
 
@@ -283,11 +406,15 @@ export class StreamRequest {
             "[SSE] completed 标记触发，准备清除定时器，当前 timer ID:",
             this.timeoutCheckTimer,
           );
-          this.clearTimeoutMonitor();
+          this.finalizeCompletedStream();
           console.log("[SSE] completed 标记处理完成，定时器已清除");
 
           config.onComplete?.();
-          resolve();
+          onStreamComplete();
+          return;
+        }
+
+        if (shouldSkipSsePayloadEmit(data)) {
           return;
         }
 
@@ -365,22 +492,39 @@ export class StreamRequest {
     this.lastChunkReceivedTime = Date.now();
   }
 
+  /**
+   * 释放 requestTask 引用。
+   * uni-app x 在请求实例已销毁后调用 abort 会抛错，需 try-catch 并先置空引用。
+   */
+  private releaseRequestTask(attemptAbort: boolean = true): void {
+    const task = this.requestTask;
+    this.requestTask = null;
+    if (task == null || attemptAbort == false) {
+      return;
+    }
+    try {
+      task.abort();
+    } catch (error) {
+      console.log(
+        "[StreamRequest] requestTask abort ignored:",
+        getErrorMessage(error),
+      );
+    }
+  }
+
+  /** SSE 正常结束时仅清理引用，避免对已销毁实例再次 abort。 */
+  private finalizeCompletedStream(): void {
+    this.clearTimeoutMonitor();
+    this.releaseRequestTask(false);
+  }
+
   // 处理超时
   private handleTimeout(): void {
     console.log("[超时监控] 触发超时处理");
 
-    // 清除定时器
     this.clearTimeoutMonitor();
-
-    // 标记为中止状态
     this.isAborted = true;
-
-    // 中止请求
-    const requestTask = this.requestTask;
-    if (requestTask != null) {
-      requestTask.abort();
-      this.requestTask = null;
-    }
+    this.releaseRequestTask(true);
 
     // 显示轻提示
     uni.showToast({
@@ -481,14 +625,12 @@ export class StreamRequest {
             resolve(); // 请求成功建立连接后即可 resolve
           } else {
             console.log("[请求] 请求失败，statusCode:", res.statusCode);
-            // 清除超时监控
-            this.clearTimeoutMonitor();
+            this.finalizeCompletedStream();
             reject(new Error(buildHttpErrorMessage(res.statusCode)));
           }
         },
         fail: (err) => {
-          // 清除超时监控
-          this.clearTimeoutMonitor();
+          this.finalizeCompletedStream();
 
           if (!this.isAborted) {
             // 忽略超时错误，因为对于长连接流式请求，超时是预期内的行为
@@ -519,67 +661,148 @@ export class StreamRequest {
       // 监听分块数据接收
       const requestTask = this.requestTask;
       if (requestTask != null) {
+        const onWeappStreamComplete = (): void => {
+          resolve();
+        };
         requestTask.onChunkReceived((res) => {
-        // console.log('[数据接收] onChunkReceived 触发')
-        if (this.isAborted) return;
+          if (this.isAborted) return;
 
-        // 更新最后接收数据的时间
-        this.updateLastChunkTime();
+          this.updateLastChunkTime();
 
-        try {
-          // 使用 decodeUTF8 处理分块数据，解决字符截断问题
-          const str = this.decodeUTF8(res.data as ArrayBuffer);
-
-          // console.log('[SSE] 接收到分块数据, 长度:', str.length)
-
-          // 将新数据添加到缓冲区
-          this.buffer += str;
-
-          // SSE 协议：完整的消息以 \n\n 结尾
-          // 按 \n\n 分割出完整的消息块
-          const messages = this.buffer.split("\n\n");
-
-          // 保存最后一个可能不完整的消息块
-          const pendingMessage = messages.pop();
-          this.buffer = pendingMessage != null ? pendingMessage : "";
-
-          // 处理所有完整的消息块
-          for (const message of messages) {
-            if (message.trim().length == 0) continue;
-
-            // 按行分割消息块，处理多行的情况
-            const lines = message.split("\n");
-            let dataContent = "";
-
-            // 提取所有 data: 开头的行
-            for (const line of lines) {
-              if (line.startsWith("data:")) {
-                // 移除 "data:" 前缀，保留后面的内容
-                const content = line.slice(5).trim();
-
-                // 拼接多个 data: 行的内容（用换行符连接）
-                if (dataContent.length > 0) {
-                  dataContent += "\n" + content;
-                } else {
-                  dataContent = content;
-                }
-              }
+          try {
+            const chunkBuffer = extractChunkArrayBuffer(res);
+            if (chunkBuffer == null) {
+              return;
             }
-
-            // 如果提取到了数据内容，进行处理
-            if (dataContent.length > 0) {
-              // 统一由 processSSEMessage 处理所有消息，包括 [DONE] 标记
-              this.processSSEMessage(dataContent, config, resolve);
+            const str = this.decodeUTF8(chunkBuffer);
+            this.appendAndProcessSSEText(str, config, onWeappStreamComplete);
+          } catch (error) {
+            console.error("处理分块数据失败:", error);
+            if (!this.isAborted) {
+              config.onError?.(error);
             }
           }
+        });
+      }
+    });
+  }
+
+  /**
+   * uni-app x APP 端流式 SSE 请求。
+   * 官方文档：uni.request 返回 RequestTask（非 Promise），需 enableChunked + onChunkReceived + responseType arraybuffer。
+   * @see https://doc.dcloud.net.cn/uni-app-x/api/request.html
+   */
+  private requestAppX(config: StreamRequestConfig): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let isStreamFinished = false;
+      let hasReceivedChunk = false;
+
+      const finishStream = (): void => {
+        if (isStreamFinished) {
+          return;
+        }
+        isStreamFinished = true;
+        this.finalizeCompletedStream();
+        resolve();
+      };
+
+      const failStream = (error: any): void => {
+        if (isStreamFinished || this.isAborted) {
+          return;
+        }
+        isStreamFinished = true;
+        this.finalizeCompletedStream();
+        reject(error);
+      };
+
+      const handleChunkBuffer = (chunkBuffer: ArrayBuffer | null): void => {
+        if (chunkBuffer == null || this.isAborted) {
+          return;
+        }
+        hasReceivedChunk = true;
+        this.updateLastChunkTime();
+        try {
+          const text = this.decodeUTF8(chunkBuffer);
+          this.appendAndProcessSSEText(text, config, finishStream);
         } catch (error) {
-          console.error("处理分块数据失败:", error);
+          console.error("[SSE-APP] 处理分块数据失败:", error);
           if (!this.isAborted) {
             config.onError?.(error);
           }
         }
-        });
-      }
+      };
+
+      console.log("[SSE-APP] 创建 RequestTask 流式请求");
+      this.startTimeoutMonitor();
+
+      // APP 端 uni.request 同步返回 RequestTask，不可当作 Promise 使用
+      const requestTask = uni.request<ArrayBuffer>({
+        url: config.url,
+        method: config.method,
+        header: config.headers,
+        data: config.body,
+        enableChunked: true,
+        responseType: "arraybuffer",
+        dataType: "text",
+        timeout: 1000 * 60 * 60 * 12,
+        success: (res) => {
+          console.log(
+            "[SSE-APP] success 回调，statusCode:",
+            res.statusCode,
+          );
+          if (res.statusCode !== 200) {
+            failStream(new Error(buildHttpErrorMessage(res.statusCode)));
+            return;
+          }
+
+          config.onOpen?.(res);
+
+          // 兜底：未收到 onChunkReceived 时，尝试处理 success 中的完整响应体
+          const responseData = res.data;
+          if (!hasReceivedChunk && responseData != null) {
+            const fallbackBuffer = extractChunkArrayBuffer(responseData);
+            handleChunkBuffer(fallbackBuffer);
+          }
+        },
+        fail: (err) => {
+          console.log("[SSE-APP] fail 回调:", err.errMsg);
+          this.finalizeCompletedStream();
+
+          if (this.isAborted) {
+            return;
+          }
+
+          if (
+            err.errMsg != null &&
+            (err.errMsg.includes("time out") || err.errMsg.includes("timeout"))
+          ) {
+            console.log("[SSE-APP] 超时警告（流式请求可能仍在进行）:", err);
+            return;
+          }
+
+          config.onError?.(err);
+          failStream(err);
+        },
+        complete: () => {
+          console.log("[SSE-APP] complete 回调");
+          if (!isStreamFinished && !this.isAborted) {
+            config.onComplete?.();
+            finishStream();
+          } else {
+            this.releaseRequestTask(false);
+          }
+        },
+      });
+
+      this.requestTask = requestTask;
+
+      requestTask.onChunkReceived((result) => {
+        if (this.isAborted) {
+          return;
+        }
+        const chunkBuffer = extractChunkArrayBuffer(result);
+        handleChunkBuffer(chunkBuffer);
+      });
     });
   }
 
@@ -653,6 +876,9 @@ export class StreamRequest {
               config.onComplete?.();
               return;
             }
+            if (shouldSkipSsePayloadEmit(parseData)) {
+              return;
+            }
           } catch (e) {
             // JSON 解析失败，继续处理为普通数据
             console.log("[SSE-APP] JSON 解析失败，作为普通内容处理");
@@ -689,22 +915,8 @@ export class StreamRequest {
     }
     // #endif
 
-    // #ifdef MP-WEIXIN
-    // 中止小程序的请求
-    const requestTask = this.requestTask;
-    if (requestTask != null) {
-      requestTask.abort();
-      this.requestTask = null;
-    }
-    // #endif
-
-    // #ifdef APP-PLUS
-    // 中止 App 的请求
-    const requestTask = this.requestTask;
-    if (requestTask != null) {
-      requestTask.abort();
-      this.requestTask = null;
-    }
+    // #ifdef MP-WEIXIN || APP || APP-PLUS
+    this.releaseRequestTask(true);
     // #endif
   }
 }

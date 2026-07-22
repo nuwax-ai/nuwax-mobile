@@ -34,6 +34,14 @@ import {
 } from '@/constants/espProvisioning.constants';
 import { validatePassword, validateSsid } from '@/utils/provisionProtocol';
 import { parseEspProvisioningQr } from '@/utils/provisioning/espProvisioningQr';
+import { apiVoxBindDevice } from '@/servers/vox/voxDevice';
+import { AppDeviceBindParams } from '@/types/interfaces/voxDevice';
+import { apiResCode, apiResData, apiResMessage } from '@/utils/common';
+import { SUCCESS_CODE } from '@/constants/codes.constants';
+import { VOX_DEVICE_WS_URL } from '@/constants/config';
+
+/** 固件接收 vox 配置的自定义 endpoint（deviceSecret + gatewayUrl） */
+const VOX_CONFIG_ENDPOINT = 'vox-config';
 
 export class EspProvisioningController {
   phase: Ref<EspProvisioningPhaseEnum>;
@@ -283,6 +291,52 @@ export class EspProvisioningController {
   /** 当前官方协议尚未冻结 reset custom endpoint，先明确返回 false。 */
   resetDevice(): Promise<boolean> {
     return Promise.resolve(false);
+  }
+
+  /**
+   * WiFi 配网成功后调用：绑定设备到 App 账号并把 deviceSecret + gatewayUrl
+   * 经加密会话下发到固件 vox-config 端点。
+   * 失败不阻断 WiFi 成功态（返回 false，页面自行 toast），须在配网成功后 BLE 窗口内尽快调用。
+   */
+  async bindAndDeliverSecret(displayName: string): Promise<boolean> {
+    this.ensureActive();
+    const info = this.deviceInfo.value;
+    if (info == null || info.serialNumber == '') {
+      console.error('[VoxBind] 缺少 serialNumber，跳过设备绑定');
+      return false;
+    }
+    this.phase.value = EspProvisioningPhaseEnum.BINDING_DEVICE;
+    const deviceId = info.serialNumber;
+    try {
+      const params = new AppDeviceBindParams();
+      params.deviceId = deviceId;
+      params.displayName = displayName != '' ? displayName : deviceId;
+      const res = await apiVoxBindDevice(params);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        console.error(`[VoxBind] 绑定失败 code=${apiResCode(res)} msg=${apiResMessage(res)}`);
+        return false;
+      }
+      const raw = apiResData<any>(res);
+      const data = raw != null ? (raw as UTSJSONObject) : null;
+      const secretVal = data != null ? data['deviceSecret'] : null;
+      const secret = secretVal != null ? `${secretVal}` : '';
+      if (secret == '') {
+        console.error('[VoxBind] 绑定响应缺少 deviceSecret');
+        return false;
+      }
+      // deviceSecret 仅内存持有，随 payload 下发后即弃，勿写 storage / 日志
+      const payload = new UTSJSONObject();
+      payload['deviceId'] = deviceId;
+      payload['deviceSecret'] = secret;
+      payload['gatewayUrl'] = VOX_DEVICE_WS_URL;
+      const payloadJson = JSON.stringify(payload);
+      const resp = await this.client.sendCustomData(VOX_CONFIG_ENDPOINT, payloadJson);
+      console.log(`[VoxBind] vox-config 下发成功 deviceId=${deviceId} resp=${resp}`);
+      return true;
+    } catch (e) {
+      console.error(`[VoxBind] 绑定/密钥下发异常 deviceId=${deviceId}`, e);
+      return false;
+    }
   }
 
   async disconnect(): Promise<void> {

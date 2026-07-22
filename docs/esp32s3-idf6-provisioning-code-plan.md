@@ -2,7 +2,7 @@
 
 > 状态：APP 代码架构基线
 > 固件：ESP32-S3 + ESP-IDF 6.0 + `espressif/network_provisioning`
-> 推荐安全：Security 2；如固件资源或客户端兼容性受限，退到 Security 1 + 每设备 PoP
+> 安全：Security 2 已冻结，不允许降级
 > 首联调平台：Android
 > 本期范围：BLE 唯一正式传输，不实现 SoftAP fallback
 
@@ -14,7 +14,7 @@ APP 不再继续扩展现有 `FF01～FF05` 自定义 GATT 协议。现有页面�
 scan BLE device
 → connect primary provisioning service
 → discover protocomm endpoints/capabilities
-→ establish Security 2/1 session
+→ establish Security 2 session
 → optional scanNetworks
 → set_config
 → apply_config
@@ -53,9 +53,9 @@ provision-scan / provision-wifi / provision-progress
 - `docs/esp32s3-idf6-provisioning-contract.json`
 - `scripts/check-esp-provisioning-contract.mjs`
 
-当前已完成：统一 Client/Factory、跨页面单 Controller、BLE Mock Client、页面迁移、QR 安全校验、未注册真实 Provider 的受控失败，以及 Android UTS 编译验证。待固件参数冻结后只需补 Android 原生 Provider，不改页面业务流程。
+当前已完成：统一 Client/Factory、跨页面单 Controller、BLE Mock Client、页面迁移、QR 安全校验、Android UTS 原生插件、乐鑫官方客户端适配和 Provider 自动注册。真实 Provider 固定使用 `com.github.espressif:esp-idf-provisioning-android:lib-2.4.4`。
 
-`EspProvisioningClientFactory` 是平台实现注入口：硬件协议未完成时注入 Mock，Android 原生插件完成后注入官方客户端实现。业务页面不感知当前使用哪种实现。
+`EspProvisioningClientFactory` 是平台实现注入口：Mock 模式注入 Mock Client；Android 启动时自动注册官方客户端实现。业务页面不感知当前使用哪种实现。
 
 `esp32s3-idf6-provisioning-contract.json` 是 APP/固件共同维护的机器可读契约。所有 `TBD` 项必须在联调前变成明确值，变更时同步提升 `contractVersion`。
 
@@ -99,7 +99,7 @@ Android 原生实现要点：
 - `ESPProvisionManager.createESPDevice(TRANSPORT_BLE, SECURITY_2)`。
 - 扫描时缓存 `deviceId → BluetoothDevice/ScanResult`，不向 UTS 泄漏原生对象。
 - 从 ScanResult 获取 Primary Service UUID，不假设 endpoint UUID 为 `FF01～FF05`。
-- Security 2 设置 username；Security 1 设置 PoP。
+- Security 2 同时设置 username 与 PoP，并校验 `proto-ver.prov.sec_ver == 2`。
 - 监听官方连接事件并转换为单一回调，插件销毁时注销监听。
 - `ProvisionListener` 映射为建立会话、发送配置、应用配置、查询状态和终态事件。
 - 日志只记录设备 ID 的脱敏值、阶段、耗时、错误码；禁止记录密码、PoP、salt/verifier。
@@ -127,7 +127,7 @@ Android 原生实现要点：
 
 - 禁止 Security 0。
 - Security 2 的 username/password/salt/verifier 生成和烧录由硬件产线方案负责。
-- 若使用 Security 1，每台设备必须有不同 PoP，不使用全产品通用 PoP。
+- 生产环境每台设备必须有独立 PoP，不使用全产品通用 PoP。
 - service name 应能帮助用户识别设备，但不能直接暴露敏感的完整 SN。
 
 ## 5. 现有代码迁移
@@ -203,13 +203,15 @@ maskedDeviceId, rssi, nativeErrorCode
 7. 完成错误密码、AP 不存在、超时、断连、重配测试。
 8. 再评估 iOS、HarmonyOS 和微信小程序客户端实现。
 
-## 10. 进入编码前剩余输入
+## 10. 当前状态
 
-- [ ] `espressif/network_provisioning` 精确版本。
-- [ ] ESP-IDF 6.0 精确 tag/commit。
-- [ ] Security 2 或 Security 1 最终选择。
-- [ ] 二维码 JSON 和产线密钥生成方案。
-- [ ] BLE Service UUID、service name/prefix。
-- [ ] capabilities 与 custom endpoint 清单。
-- [ ] 配网成功边界：DHCP 成功还是云端上线。
-- [ ] 配网完成后是否继续使用 BLE。
+- [x] `espressif/network_provisioning` `1.2.4`。
+- [x] ESP-IDF `v6.0` / `662a3be354759d9487bf4b1a629fadb766cb1800`。
+- [x] Security 2，不允许降级。
+- [x] BLE Service UUID、`PROV_` 广播名前缀。
+- [x] `wifi_prov`、`wifi_scan` 和 `device-info`。
+- [x] 成功边界为 `IP_EVENT_STA_GOT_IP`，不要求云端上线。
+- [x] 成功后 BLE 保留 15 秒；总配网窗口 300 秒。
+- [x] Android Provider、Mock 和调试凭据内存入口。
+- [ ] Android + ESP32-S3 首轮真机验收。
+- [ ] 逐设备生产 PoP、二维码和产线密钥链路。

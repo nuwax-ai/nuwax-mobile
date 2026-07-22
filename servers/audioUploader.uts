@@ -4,9 +4,83 @@
  */
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { REDIRECT_LOGIN, SUCCESS_CODE } from "@/constants/codes.constants";
+import {
+  DEFAULT_LANG,
+  I18N_LANG_STORAGE_KEY,
+} from "@/constants/i18n.constants";
 import { API_BASE_URL } from "../constants/config";
 import { t, toI18nParams } from "@/utils/i18n";
 import { orString } from "@/utils/utsCoalesce";
+
+/**
+ * 构建 STT 上传请求头（与 useRequest 对齐：APP 需 Bearer Token）
+ */
+function buildSttUploadHeaders(): UTSJSONObject {
+  const accessToken = uni.getStorageSync(ACCESS_TOKEN);
+  const _rawLang = uni.getStorageSync(I18N_LANG_STORAGE_KEY);
+  let currentLang = (_rawLang != null ? _rawLang : DEFAULT_LANG) as string;
+  currentLang = (currentLang != null ? currentLang : DEFAULT_LANG).toLowerCase();
+  const header = {} as UTSJSONObject;
+  header["Accept-Language"] = currentLang;
+  if (accessToken != null && `${accessToken}` != "") {
+    // #ifdef H5 || WEB
+    if (process.env.NODE_ENV == "development") {
+      header["Authorization"] = `Bearer ${accessToken}`;
+    }
+    // #endif
+
+    // #ifdef MP-WEIXIN || APP
+    header["Authorization"] = `Bearer ${accessToken}`;
+    // #endif
+  }
+  // uEnvProd
+  if (process.env.NODE_ENV == "production") {
+    // #ifdef H5
+    const fragment = orString(window.location.hash, "#/").replace("#/", "/");
+    if (Boolean(fragment)) {
+      header["fragment"] = fragment;
+    }
+    // #endif
+  }
+  return header;
+}
+
+/**
+ * 解析 uploadFile 响应体（Android：res.data 可能已是 UTSJSONObject，禁止直接 JSON.parse）
+ */
+function parseUploadResponseData(raw: any | null): UTSJSONObject | null {
+  if (raw == null) {
+    return null;
+  }
+  if (typeof raw == "string") {
+    const text = `${raw}`.trim();
+    if (text.length == 0) {
+      return null;
+    }
+    try {
+      return JSON.parse(text) as UTSJSONObject;
+    } catch (_eStr) {
+      return null;
+    }
+  }
+  try {
+    const obj = raw as UTSJSONObject;
+    if (obj["code"] != null || obj["data"] != null || obj["message"] != null) {
+      return obj;
+    }
+  } catch (_eObj) {
+    // ignore
+  }
+  try {
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+      return JSON.parse(jsonStr) as UTSJSONObject;
+    }
+  } catch (_eJson) {
+    // ignore
+  }
+  return null;
+}
 /**
  * 音频文件数据（UTS 使用 class 以支持 .uvue 中构造，避免 interface 对象字面量限制）
  */
@@ -196,29 +270,7 @@ export class AudioUploader {
     onProgress?: any,
   ): Promise<TranscriptResult> {
     return new Promise((resolve, reject) => {
-      const accessToken = uni.getStorageSync(ACCESS_TOKEN);
-      const header = {} as UTSJSONObject;
-      if (accessToken != null && `${accessToken}` != '') {
-        // #ifdef H5 || WEB
-        if (process.env.NODE_ENV == "development") {
-          header["Authorization"] = `Bearer ${accessToken}`;
-        }
-        // #endif
-
-        // #ifdef MP-WEIXIN
-        header["Authorization"] = `Bearer ${accessToken}`;
-        // #endif
-      }
-      // uEnvProd
-      if (process.env.NODE_ENV == "production") {
-        // #ifdef H5
-        //仅H5需要添加fragment参数
-        const fragment = orString(window.location.hash, "#/").replace("#/", "/");
-        if (Boolean(fragment)) {
-          header["fragment"] = fragment;
-        }
-        // #endif
-      }
+      const header = buildSttUploadHeaders();
       const uploadTask = uni.uploadFile({
         header,
         url: this.config.apiUrl,
@@ -227,33 +279,43 @@ export class AudioUploader {
         // formData: any,
         timeout: this.config.timeout,
         success: (res) => {
-          try {
-            const parsed = JSON.parse(res.data) as UTSJSONObject;
-            const code = parsed["code"];
-            const data = parsed == null ? null : (parsed["data"] as UTSJSONObject);
-            if (code == SUCCESS_CODE) {
-              const dataText = data == null ? null : data["text"];
-              if (dataText != null) {
-                resolve(
-                  new TranscriptResult(true, dataText as string, 0, 0, "", []),
-                );
-              } else {
-                reject(
-                  new Error(t("Mobile.AudioUploader.noTextRecognized")),
-                );
-              }
-            } else {
-              const codeParams = new Map<string, string | number>();
-              codeParams.set("code", `${res.statusCode}`);
-              reject(
-                new Error(
-                  t("Mobile.AudioUploader.requestFailedWithCode", toI18nParams(codeParams)),
-                ),
-              );
-            }
-          } catch (error) {
+          const parsed = parseUploadResponseData(res.data);
+          if (parsed == null) {
+            console.error("[audioUploader] 解析上传响应失败, statusCode:", res.statusCode, "data:", res.data);
             reject(
               new Error(t("Mobile.AudioUploader.responseParseFailed")),
+            );
+            return;
+          }
+          const code = parsed["code"];
+          const dataRaw = parsed["data"];
+          const data =
+            dataRaw != null && typeof dataRaw == "object"
+              ? (dataRaw as UTSJSONObject)
+              : null;
+          if (code == SUCCESS_CODE) {
+            const dataText = data == null ? null : data["text"];
+            if (dataText != null && `${dataText}`.length > 0) {
+              resolve(
+                new TranscriptResult(true, `${dataText}`, 0, 0, "", []),
+              );
+            } else {
+              reject(
+                new Error(t("Mobile.AudioUploader.noTextRecognized")),
+              );
+            }
+          } else {
+            const msgVal = parsed["message"];
+            if (msgVal != null && `${msgVal}`.length > 0) {
+              reject(new Error(`${msgVal}`));
+              return;
+            }
+            const codeParams = new Map<string, string | number>();
+            codeParams.set("code", code != null ? `${code}` : `${res.statusCode}`);
+            reject(
+              new Error(
+                t("Mobile.AudioUploader.requestFailedWithCode", toI18nParams(codeParams)),
+              ),
             );
           }
         },
@@ -410,17 +472,36 @@ export class AudioUploader {
   // }
 
   /**
-   * 格式化错误信息
+   * 格式化错误信息（Android：禁止 error as UTSJSONObject）
    */
   private formatError(error: any): Error {
-    const errObj = error as UTSJSONObject;
-    const errMsgRaw = errObj["message"];
     let message = t("Mobile.AudioUploader.uploadFailed");
-    if (errMsgRaw != null) {
-      const s = errMsgRaw as string;
-      if (s != '') {
-        message = s;
+    try {
+      const err = error as Error;
+      if (err.message != null && `${err.message}`.length > 0) {
+        message = `${err.message}`;
       }
+    } catch (_eErr) {
+      // ignore
+    }
+    try {
+      const jsonStr = JSON.stringify(error);
+      if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+        const parsed = JSON.parse(jsonStr) as UTSJSONObject;
+        const errMsgRaw = parsed["message"];
+        if (errMsgRaw != null && `${errMsgRaw}`.length > 0) {
+          message = `${errMsgRaw}`;
+        }
+        const errMsgField = parsed["errMsg"];
+        if (errMsgField != null && `${errMsgField}`.length > 0) {
+          message = `${errMsgField}`;
+        }
+      }
+    } catch (_eJson) {
+      // ignore
+    }
+    if (message.indexOf("ClassCastException") >= 0) {
+      message = t("Mobile.AudioUploader.uploadFailed");
     }
 
     // 根据错误类型返回用户友好的提示

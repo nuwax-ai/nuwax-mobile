@@ -3,7 +3,7 @@
     :visible="visible"
     :title="t('Mobile.Chat.modelSelect')"
     :list="modelOptions"
-    :current-value="currentModelId.toString()"
+    :current-value="currentModelIdVal.toString()"
     :readonly="readonly"
     :loading="isLoading"
     @onClose="handleClose"
@@ -12,29 +12,29 @@
 </template>
 
 <script lang="uts" setup>
-  import { AgentModelOption } from "@/types/interfaces/agent";
-  import { AgentTypeEnum } from "@/types/enums/agent";
   import { RadioListItem } from "@/types/interfaces/radio";
   import RadioListDrawer from "@/components/radio-list-drawer/radio-list-drawer.uvue";
   import { apiGetAgentModelOptions } from "@/servers/agentDev";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { t as tRaw, emptyI18nParams } from "@/utils/i18n";
+  import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+  import { readAgentEnumString } from "@/subpackages/utils/agentInfoField.uts";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
 
   const t = (key: string): string => tRaw(key, emptyI18nParams(), "");
-
-  // 模板单参 t 包装：useI18n/utils 的 t 需要完整参数
 
   const props = withDefaults(
     defineProps<{
       visible: boolean;
       agentId: number;
-      agentType: AgentTypeEnum;
+      agentType: string;
       currentModelId: number;
       readonly?: boolean;
       isTempChat?: boolean;
     }>(),
     {
       visible: false,
+      agentType: "ChatBot",
       readonly: false,
       isTempChat: false,
     },
@@ -42,21 +42,46 @@
 
   const emit = defineEmits<{
     (e: 'onClose'): void;
-    (e: 'onModelChange', modelId: number): void;
+    /** 用户从列表选中模型 */
+    (e: 'onModelChange', modelId: number, name: string): void;
+    /** 静默同步模型名称（初始化/回填，不关弹窗） */
+    (e: 'onModelSync', modelId: number, name: string): void;
   }>();
 
   const modelOptions = ref<RadioListItem[]>([]);
   const isLoading = ref(false);
 
-  /** 模型 usageScenarios 是否包含当前智能体类型 */
-  const modelMatchesAgentType = (model: AgentModelOption): boolean => {
-    const scenarios = model.usageScenarios;
-    if (scenarios == null) {
+  const currentModelIdVal = computed((): number => {
+    const id = props.currentModelId;
+    if (id == null) {
+      return 0;
+    }
+    return id;
+  });
+
+  const agentTypeStrVal = computed((): string => {
+    const typeVal = props.agentType;
+    if (typeVal == null || `${typeVal}`.length == 0) {
+      return "ChatBot";
+    }
+    return readAgentEnumString(typeVal as any);
+  });
+
+  /** 模型 usageScenarios 是否包含当前智能体类型（Android：readRawField + 字符串比较） */
+  const modelMatchesAgentType = (raw: any): boolean => {
+    const agentTypeStr = agentTypeStrVal.value;
+    if (agentTypeStr.length == 0) {
+      return true;
+    }
+    const scenariosRaw = readRawField(raw, "usageScenarios");
+    if (scenariosRaw == null) {
       return false;
     }
+    const scenarios = scenariosRaw as any[];
     const len = scenarios.length;
     for (let i = 0; i < len; i++) {
-      if (scenarios[i] == props.agentType) {
+      const scenarioStr = readAgentEnumString(scenarios[i]);
+      if (scenarioStr == agentTypeStr) {
         return true;
       }
     }
@@ -75,6 +100,13 @@
     emit("onClose");
   };
 
+  const emitModelSync = (modelId: number, name: string): void => {
+    if (modelId == 0 || name.length == 0) {
+      return;
+    }
+    emit("onModelSync", modelId, name);
+  };
+
   // 注意：handleModelChange 必须在 fetchModelOptions 之前定义（UTS 不提升函数声明）
   const handleModelChange = (value: string) => {
     let label = "";
@@ -89,52 +121,77 @@
     emit("onModelChange", parseInt(value), label);
   };
 
-  // 获取并过滤模型列表
-  const fetchModelOptions = async () => {
+  /** 同步当前模型：已有 modelId 则回填名称，否则默认选第一项（静默，不关弹窗） */
+  const syncCurrentModelSelection = (): void => {
+    const options = modelOptions.value;
+    if (options.length == 0) {
+      return;
+    }
+    const currentId = currentModelIdVal.value;
+    if (currentId != 0) {
+      const currentIdStr = `${currentId}`;
+      for (let i = 0; i < options.length; i++) {
+        if (options[i].value == currentIdStr) {
+          emitModelSync(currentId, options[i].label);
+          return;
+        }
+      }
+    }
+    const first = options[0];
+    emitModelSync(parseInt(first.value), first.label);
+  };
+
+  // 获取并过滤模型列表；打开弹窗时仅刷新列表，不触发 sync 避免误关弹窗
+  const fetchModelOptions = async (syncSelection: boolean) => {
     if (props.isTempChat == true) {
+      return;
+    }
+    if (props.agentId == 0) {
       return;
     }
     isLoading.value = true;
     try {
       modelOptions.value = [];
       const res = await apiGetAgentModelOptions(props.agentId);
-      const codeOk = res.code == SUCCESS_CODE;
-      const hasData = res.data != null;
-      if (codeOk == true) {
-        if (hasData == true) {
-          const allModels = res.data as AgentModelOption[];
-          const filteredModels: AgentModelOption[] = [];
-          const allLen = allModels.length;
-          for (let i = 0; i < allLen; i++) {
-            const model = allModels[i];
-            if (modelMatchesAgentType(model) == true) {
-              filteredModels.push(model);
-            }
-          }
-
-          const options: RadioListItem[] = [];
-          const filteredLen = filteredModels.length;
-          for (let j = 0; j < filteredLen; j++) {
-            const model = filteredModels[j];
-            // UTS interface 不能用对象字面量构造，RadioListItem 已改为 class
-            const item = new RadioListItem(
-              model.name,
-              model.id.toString(),
-              coalesceDescription(model.description),
-            );
-            options.push(item);
-          }
-          modelOptions.value = options;
-
-          // 如果当前没有选中模型，则默认选中第一个
-          const noCurrentModel = props.currentModelId == 0;
-          const hasOptions = modelOptions.value.length > 0;
-          if (noCurrentModel == true) {
-            if (hasOptions == true) {
-              handleModelChange(modelOptions.value[0].value);
-            }
-          }
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      if (dataRaw == null) {
+        return;
+      }
+      const allModelsRaw = dataRaw as any[];
+      const filteredModels: any[] = [];
+      const allLen = allModelsRaw.length;
+      for (let i = 0; i < allLen; i++) {
+        const modelRaw = allModelsRaw[i];
+        if (modelMatchesAgentType(modelRaw) == true) {
+          filteredModels.push(modelRaw);
         }
+      }
+
+      const options: RadioListItem[] = [];
+      const filteredLen = filteredModels.length;
+      for (let j = 0; j < filteredLen; j++) {
+        const modelRaw = filteredModels[j];
+        const idRaw = readRawField(modelRaw, "id");
+        const nameRaw = readRawField(modelRaw, "name");
+        const descRaw = readRawField(modelRaw, "description");
+        const idNum = idRaw != null ? parseFloat(`${idRaw}`) : 0;
+        const nameStr = nameRaw != null ? `${nameRaw}` : "";
+        if (idNum == 0 || nameStr.length == 0) {
+          continue;
+        }
+        const item = new RadioListItem(
+          nameStr,
+          `${idNum}`,
+          coalesceDescription(descRaw != null ? `${descRaw}` : ""),
+        );
+        options.push(item);
+      }
+      modelOptions.value = options;
+      if (syncSelection == true) {
+        syncCurrentModelSelection();
       }
     } catch (error) {
       console.error("[model-select-modal] 获取模型选项失败:", error);
@@ -145,13 +202,27 @@
 
   watch((): boolean => props.visible, (newVal: boolean): void => {
     if (newVal == true) {
-      fetchModelOptions();
+      fetchModelOptions(false);
     }
   });
 
+  watch(
+    (): number => props.agentId,
+    (): void => {
+      fetchModelOptions(true);
+    },
+  );
+
+  watch(
+    (): string => agentTypeStrVal.value,
+    (): void => {
+      fetchModelOptions(true);
+    },
+  );
+
   // 初始化加载数据，以便在外部显示首项名称（即使弹窗未打开）
   onMounted(() => {
-    fetchModelOptions();
+    fetchModelOptions(true);
   });
 </script>
 

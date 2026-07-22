@@ -27,42 +27,17 @@
           :class="{ 'hide-think-content': hideThinkContent }"
         >
           <view class="text-box">
-            <!-- #ifndef APP -->
-            <mp-html
-              :content="thinkContent"
-              :markdown="true"
-              :selectable="true"
-              :container-style="`font-size: 28rpx; color: #888; line-height: 1.6;`"
-            />
-            <!-- #endif -->
-            <!-- #ifdef APP -->
             <text class="think-plain-text">{{ thinkContent }}</text>
-            <!-- #endif -->
           </view>
         </view>
       </view>
 
-      <!-- AI 答复内容 -->
+      <!-- AI 答复内容（uni-cmark → UniAiMarkdownElItem[] → uni-ai-x-msg） -->
       <view class="answer-container">
-        <!-- #ifdef APP -->
-        <text
-          v-if="appPlainText.length > 0"
-          class="answer-fallback"
-        >{{ appPlainText }}</text>
-        <!-- #endif -->
-        <!-- #ifndef APP -->
-        <mp-html
-          v-if="processedText.length > 0"
-          :content="processedText"
-          :processing-list="msg.processingList"
-          :conversation-id="msg.chat_id"
-          :markdown="true"
-          :selectable="true"
-          :container-style="`width: 100%;`"
-          :tag-style="tagStyle"
-          :scroll-table="true"
+        <UniAiXMsgRender
+          v-if="renderMarkdownElList.length > 0"
+          :markdown-el-list="renderMarkdownElList"
         />
-        <!-- #endif -->
       </view>
     </template>
     <image
@@ -85,15 +60,12 @@
 </template>
 
 <script lang="uts" setup>
-  import { MsgItem, type markdownElItem } from "@/types/interfaces/ai-msg";
+  import { MsgItem } from "@/types/interfaces/ai-msg";
+  import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
+  import { ChatDataAdapter } from "@/utils/chatDataAdapter.uts";
   import msgToolBar from "@/subpackages/components/msg-tool-bar/msg-tool-bar.uvue";
-  // #ifndef APP
-  import mpHtml from "@/subpackages/uni_modules/mp-html/components/mp-html/mp-html.uvue";
-  // #endif
-  import {
-    replaceMathBracket,
-    groupMarkdownContainers,
-  } from "@/utils/markdown.uts";
+  import UniAiXMsgRender from "@/uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue";
+  import { AiMsgMarkdownParser } from "@/subpackages/components/ai-msg/aiMsgMarkdownParser.uts";
   import { TaskStatus } from "@/types/enums/agent";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
 
@@ -119,6 +91,10 @@
     },
   );
 
+  const emit = defineEmits<{
+    changeThinkContent: [hideThinkContent: boolean];
+  }>();
+
   /** 克隆 MsgItem（UTS 不支持 class spread；须先于 sync 定义） */
   function cloneMsgItem(source: MsgItem): MsgItem {
     const next = new MsgItem();
@@ -130,7 +106,7 @@
     next.create_time = source.create_time;
     next.about_msg_id = source.about_msg_id;
     next.chat_id = source.chat_id;
-    next.markdownElList = source.markdownElList;
+    next.markdownElList = source.markdownElList.slice();
     next.error_msg = source.error_msg;
     next.rendered = source.rendered;
     next.processingList = source.processingList;
@@ -170,6 +146,14 @@
     if (stateVal != null) {
       target.state = stateVal as number;
     }
+    const statusVal = p["status"];
+    if (statusVal != null) {
+      target.state = ChatDataAdapter.mapStatusToMsgState(statusVal);
+    }
+    const finishedVal = p["finished"];
+    if (finishedVal == true) {
+      target.state = 3;
+    }
 
     const errorMsgVal = p["error_msg"];
     if (errorMsgVal != null) {
@@ -178,7 +162,12 @@
 
     const markdownElListVal = p["markdownElList"];
     if (markdownElListVal != null) {
-      target.markdownElList = markdownElListVal as markdownElItem[];
+      const converted = JSON.parseArray<UniAiMarkdownElItem>(
+        JSON.stringify(markdownElListVal),
+      );
+      if (converted != null && converted.length > 0) {
+        target.markdownElList = converted;
+      }
     }
 
     const renderedVal = p["rendered"];
@@ -191,21 +180,47 @@
   const msg = ref<MsgItem>(new MsgItem());
   /** App 流式：强制触发 appPlainText 重算 */
   const streamRevision = ref<number>(0);
+  /** 每次 props 同步后递增，驱动 markdown 解析（避免 UTS watch immediate 未触发） */
+  const markdownParseTick = ref<number>(0);
+
+  function mergeMsgFromProps(incoming: MsgItem): void {
+    const cur = msg.value;
+    if (incoming.body.length > cur.body.length) {
+      cur.body = incoming.body;
+    }
+    if (incoming.thinkContent.length > cur.thinkContent.length) {
+      cur.thinkContent = incoming.thinkContent;
+    }
+    cur.state = incoming.state;
+    cur.processingList = incoming.processingList;
+    if (incoming.error_msg.length > 0) {
+      cur.error_msg = incoming.error_msg;
+    }
+    if (incoming.markdownElList.length > 0) {
+      cur.markdownElList = incoming.markdownElList.slice();
+    }
+    console.log("[MdRender] mergeMsgFromProps id=" + cur._id + " bodyLen=" + cur.body.length + " elCount=" + cur.markdownElList.length);
+  }
+
   function syncMsgFromProps(source: any | null): void {
     if (source == null) {
       msg.value = new MsgItem();
+      markdownParseTick.value = markdownParseTick.value + 1;
       return;
     }
-    msg.value = cloneMsgItem(source as MsgItem);
+    const incoming = source as MsgItem;
+    const incomingId = incoming._id;
+    const propBodyLen =
+      props.bodyText != null ? `${props.bodyText}`.length : 0;
+    const sameId = incomingId.length > 0 && incomingId == msg.value._id;
+    console.log("[MdRender] syncMsgFromProps id=" + incomingId + " sameId=" + sameId + " bodyLen=" + incoming.body.length + " incomingEl=" + incoming.markdownElList.length + " propBodyLen=" + propBodyLen);
+    if (sameId) {
+      mergeMsgFromProps(incoming);
+    } else {
+      msg.value = cloneMsgItem(incoming);
+    }
+    markdownParseTick.value = markdownParseTick.value + 1;
   }
-  syncMsgFromProps(props.msg);
-  watch(
-    (): any => props.msg,
-    (newVal: any) => {
-      syncMsgFromProps(newVal);
-    },
-    { deep: true },
-  );
 
   /**
    * 合并 prop 与内部 msg 文本。
@@ -242,24 +257,6 @@
     return propThink.length > 0 ? propThink : msgThink;
   }
 
-  // 字符串 prop 变化时写入内部 msg，保证工具栏等依赖 body 的逻辑一致
-  watch(
-    (): string => (props.bodyText != null ? `${props.bodyText}` : ""),
-    (v: string) => {
-      msg.value.body = v;
-    },
-    { immediate: true },
-  );
-  watch(
-    (): string => (props.thinkText != null ? `${props.thinkText}` : ""),
-    (v: string) => {
-      if (v.length > 0) {
-        msg.value.thinkContent = v;
-      }
-    },
-    { immediate: true },
-  );
-
   const isLastMsg = computed((): boolean => props.isLastMsg == true);
   const isConversationActive = computed((): boolean => props.isConversationActive == true);
   const showLoadingIcon = computed((): boolean => {
@@ -290,70 +287,105 @@
     );
   });
 
-  // 标签自定义样式，解决长文本换行问题
-  // #ifndef APP
-  const tagStyle = {
-    p: "word-break: break-all; overflow-wrap: break-word;",
-    li: "word-break: break-all; overflow-wrap: break-word;",
-    div: "word-break: break-all; overflow-wrap: break-word;",
-    span: "word-break: break-all; overflow-wrap: break-word;",
-  };
-  // #endif
-  // #ifdef APP
-  const tagStyle = {
-    p: "",
-    li: "",
-    div: "",
-    span: "",
-  };
-  // #endif
+  const markdownParser = new AiMsgMarkdownParser(
+    msg,
+    streamRevision,
+    resolveBodyText,
+    (): boolean => isConversationActive.value,
+    (): boolean => isLastMsg.value,
+  );
 
-  const emit = defineEmits<{
-    changeThinkContent: [hideThinkContent: boolean];
-  }>();
+  const renderMarkdownElList = computed((): UniAiMarkdownElItem[] => {
+    const _rev = streamRevision.value;
+    return markdownParser.resolveRenderList();
+  });
 
   const changeThinkContent = () => {
     hideThinkContent.value = !hideThinkContent.value;
     emit("changeThinkContent", hideThinkContent.value);
   };
 
-  // 添加updateMessage方法，支持动态更新消息内容
   const updateMessage = (newData: any) => {
     try {
       if (newData != null) {
-        const next = cloneMsgItem(msg.value);
-        applyMsgPatch(next, newData);
-        msg.value = next;
-        streamRevision.value = streamRevision.value + 1;
+        applyMsgPatch(msg.value, newData);
+        markdownParser.runMarkdownParse(false);
       }
     } catch (error) {
       console.error("updateMessage 执行失败:", error);
     }
   };
-  // 处理文本内容，应用数学公式格式转换及组件合并
-  const processedText = computed((): string => {
-    const bodyText = resolveBodyText();
-    if (bodyText.trim().length == 0) {
-      return "";
-    }
-    try {
-      const groupedText = groupMarkdownContainers(bodyText);
-      return replaceMathBracket(groupedText);
-    } catch (e) {
-      console.error("processedText failed:", e);
-      return bodyText;
-    }
-  });
 
-  // #ifdef APP
-  /** App：plain text 展示 markdown 源文（支持 SSE 流式增量更新） */
-  const appPlainText = computed((): string => {
-    const _rev = streamRevision.value;
-    return processedText.value;
-  });
-  // #endif
+  watch(
+    (): any => props.msg,
+    (newVal: any) => {
+      syncMsgFromProps(newVal);
+    },
+    { deep: true, immediate: true },
+  );
 
-  // 暴露方法给父组件
+  watch(
+    (): string => (props.bodyText != null ? `${props.bodyText}` : ""),
+    (v: string) => {
+      msg.value.body = v;
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): string => (props.thinkText != null ? `${props.thinkText}` : ""),
+    (v: string) => {
+      if (v.length > 0) {
+        msg.value.thinkContent = v;
+      }
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): number => markdownParseTick.value,
+    () => {
+      markdownParser.runMarkdownParse(true);
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): string => msg.value._id,
+    () => {
+      markdownParser.resetForNewMessage();
+      markdownParser.runMarkdownParse(true);
+    },
+  );
+
+  watch(
+    (): string => resolveBodyText(),
+    () => {
+      markdownParser.runMarkdownParse(false);
+    },
+  );
+
+  watch(
+    (): boolean => isConversationActive.value,
+    () => {
+      markdownParser.runMarkdownParse(false);
+    },
+  );
+
+  watch(
+    (): boolean => isLastMsg.value,
+    () => {
+      markdownParser.runMarkdownParse(false);
+    },
+  );
+
+  watch(
+    (): number => msg.value.state,
+    () => {
+      markdownParser.runMarkdownParse(false);
+    },
+  );
+
   defineExpose({
     updateMessage,
   });

@@ -184,11 +184,19 @@ export class StreamRequest {
   private readonly TIMEOUT_DURATION: number = 60000; // 超时时长 60 秒
   private timeoutCallback: (() => void) | null = null; // 超时回调
 
+  /** App：SSE 消息分帧队列，避免同一事件循环内批量 onChunk 导致 iOS UI 只在结束时刷新 */
+  private sseDispatchQueue: string[] = [];
+  private sseDispatchRunning: boolean = false;
+  private sseDispatchConfig: StreamRequestConfig | null = null;
+  private sseDispatchOnComplete: (() => void) | null = null;
+  private readonly SSE_DISPATCH_INTERVAL_MS: number = 16;
+
   // 发起流式请求
   async request(config: StreamRequestConfig): Promise<void> {
     this.isAborted = false;
     this.buffer = ""; // 重置缓冲区
     this.pendingBytes = new Uint8Array(0); // 重置字节缓冲区
+    this.resetSseDispatchQueue();
 
     // #ifdef H5
     // 只在 H5 环境中创建 AbortController
@@ -329,10 +337,65 @@ export class StreamRequest {
    * @param config 流式请求配置
    * @param onStreamComplete 流结束时的回调（[DONE] / completed）
    */
+  private resetSseDispatchQueue(): void {
+    this.sseDispatchQueue = [];
+    this.sseDispatchRunning = false;
+    this.sseDispatchConfig = null;
+    this.sseDispatchOnComplete = null;
+  }
+
+  /**
+   * App 端将 SSE 消息逐帧派发，让 iOS 有机会在 chunk 之间渲染打字机效果。
+   */
+  private enqueueSseMessage(
+    content: string,
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    this.sseDispatchQueue.push(content);
+    this.sseDispatchConfig = config;
+    this.sseDispatchOnComplete = onStreamComplete;
+    if (this.sseDispatchRunning == false) {
+      this.pumpSseDispatchQueue();
+    }
+  }
+
+  private pumpSseDispatchQueue(): void {
+    if (this.isAborted) {
+      this.resetSseDispatchQueue();
+      return;
+    }
+    if (this.sseDispatchQueue.length == 0) {
+      this.sseDispatchRunning = false;
+      return;
+    }
+
+    this.sseDispatchRunning = true;
+    const content = this.sseDispatchQueue.shift() as string;
+    const config = this.sseDispatchConfig as StreamRequestConfig;
+    const onComplete = this.sseDispatchOnComplete as () => void;
+    this.processSSEMessage(content, config, onComplete);
+
+    setTimeout(() => {
+      this.pumpSseDispatchQueue();
+    }, this.SSE_DISPATCH_INTERVAL_MS);
+  }
+
+  private waitForSseDispatchIdle(onIdle: () => void): void {
+    if (this.sseDispatchRunning == false && this.sseDispatchQueue.length == 0) {
+      onIdle();
+      return;
+    }
+    setTimeout(() => {
+      this.waitForSseDispatchIdle(onIdle);
+    }, this.SSE_DISPATCH_INTERVAL_MS);
+  }
+
   private appendAndProcessSSEText(
     text: string,
     config: StreamRequestConfig,
     onStreamComplete: () => void,
+    yieldBetweenMessages: boolean = false,
   ): void {
     if (text.length === 0) {
       return;
@@ -363,7 +426,11 @@ export class StreamRequest {
       }
 
       if (dataContent.length > 0) {
-        this.processSSEMessage(dataContent, config, onStreamComplete);
+        if (yieldBetweenMessages) {
+          this.enqueueSseMessage(dataContent, config, onStreamComplete);
+        } else {
+          this.processSSEMessage(dataContent, config, onStreamComplete);
+        }
       }
     }
   }
@@ -420,6 +487,7 @@ export class StreamRequest {
 
         // 处理数据块
         const chunk = createContentChunk(content);
+        console.log("[SSE-Stream] emit chunk len=", content.length);
         config.onChunk?.(chunk);
       } catch (e) {
         console.log("[SSE] JSON 解析失败，内容:", content);
@@ -701,9 +769,14 @@ export class StreamRequest {
         if (isStreamFinished) {
           return;
         }
-        isStreamFinished = true;
-        this.finalizeCompletedStream();
-        resolve();
+        this.waitForSseDispatchIdle(() => {
+          if (isStreamFinished) {
+            return;
+          }
+          isStreamFinished = true;
+          this.finalizeCompletedStream();
+          resolve();
+        });
       };
 
       const failStream = (error: any): void => {
@@ -723,7 +796,7 @@ export class StreamRequest {
         this.updateLastChunkTime();
         try {
           const text = this.decodeUTF8(chunkBuffer);
-          this.appendAndProcessSSEText(text, config, finishStream);
+          this.appendAndProcessSSEText(text, config, finishStream, true);
         } catch (error) {
           console.error("[SSE-APP] 处理分块数据失败:", error);
           if (!this.isAborted) {
@@ -902,6 +975,7 @@ export class StreamRequest {
   abort(): void {
     this.isAborted = true;
     this.buffer = ""; // 清空缓冲区
+    this.resetSseDispatchQueue();
 
     // 清除超时监控（所有平台都需要）
     this.clearTimeoutMonitor();

@@ -1,0 +1,251 @@
+import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
+import ParseMarkdown from "@/uni_modules/uni-ai-x/sdk/parseMarkdown.uts";
+import treeToListSdk from "@/uni_modules/uni-ai-x/sdk/treeToList.uts";
+import { MarkdownToken, type ParseMdRes } from "@/uni_modules/uni-cmark/utssdk/interface.uts";
+import { md2json } from "@/uni_modules/uni-cmark";
+import { MsgItem } from "@/types/interfaces/ai-msg";
+import { parseAppMarkdownFallback } from "@/subpackages/components/ai-msg/appMarkdownFallback.uts";
+
+function token2el(token: MarkdownToken): UniAiMarkdownElItem {
+  return {
+    uniqueId: token.uniqueId!,
+    type: token.type!,
+    datasList: treeToListSdk.markTreeToList(token),
+  };
+}
+
+/**
+ * 历史/SSE 消息 markdown 解析（从 ai-msg.uvue 抽出，避免 UTS 大 setup 编译失败）
+ */
+export class AiMsgMarkdownParser {
+  cmarkParseEnabled: boolean = true;
+  private msg: Ref<MsgItem>;
+  private streamRevision: Ref<number>;
+  private getBodyText: () => string;
+  private getIsConversationActive: () => boolean;
+  private getIsLastMsg: () => boolean;
+  private parseMarkdown: ParseMarkdown | null = null;
+  private cmarkProbeDone: boolean = false;
+  private cmarkProbeOk: boolean = true;
+
+  constructor(
+    msg: Ref<MsgItem>,
+    streamRevision: Ref<number>,
+    getBodyText: () => string,
+    getIsConversationActive: () => boolean,
+    getIsLastMsg: () => boolean,
+  ) {
+    this.msg = msg;
+    this.streamRevision = streamRevision;
+    this.getBodyText = getBodyText;
+    this.getIsConversationActive = getIsConversationActive;
+    this.getIsLastMsg = getIsLastMsg;
+  }
+
+  resolveRenderList(): UniAiMarkdownElItem[] {
+    const parsed = this.msg.value.markdownElList;
+    if (parsed != null && parsed.length > 0) {
+      return parsed;
+    }
+    return [] as UniAiMarkdownElItem[];
+  }
+
+  resetForNewMessage(): void {
+    this.cmarkParseEnabled = true;
+    this.cmarkProbeDone = false;
+    this.cmarkProbeOk = true;
+    this.parseMarkdown = this.createParseMarkdown();
+  }
+
+  private bumpRevision(): void {
+    this.streamRevision.value = this.streamRevision.value + 1;
+  }
+
+  private applyAppFallback(): void {
+    const body = this.getBodyText();
+    if (body.length == 0) {
+      return;
+    }
+    this.msg.value.markdownElList = parseAppMarkdownFallback(
+      body,
+      (): void => {
+        this.bumpRevision();
+      },
+    );
+    this.msg.value.rendered = true;
+    this.bumpRevision();
+  }
+
+  private applyMarkdownTokenList(markdownTokenList: MarkdownToken[]): void {
+    if (markdownTokenList.length == 0) {
+      console.log(
+        "[MdRender] applyMarkdownTokenList.skip",
+        `msgId=${this.msg.value._id} empty tokens`,
+      );
+      return;
+    }
+    this.msg.value.markdownElList = markdownTokenList.map((token: MarkdownToken) =>
+      token2el(token),
+    );
+    console.log(
+      "[MdRender] applyMarkdownTokenList",
+      `msgId=${this.msg.value._id} bodyLen=${this.getBodyText().length} elCount=${this.msg.value.markdownElList.length}`,
+    );
+  }
+
+  private parseFullBodyMarkdown(body: string): boolean {
+    if (body.length == 0) {
+      return false;
+    }
+    try {
+      let tokens = [] as MarkdownToken[];
+      // #ifdef APP-IOS
+      const jsonString = md2json(body) as string;
+      if (jsonString.length == 0) {
+        return false;
+      }
+      tokens = JSON.parseArray<MarkdownToken>(jsonString) as MarkdownToken[];
+      // #endif
+      // #ifndef APP-IOS
+      const parseRes = md2json(body) as ParseMdRes;
+      if (parseRes.errorMsg.length > 0) {
+        console.log(
+          "[MdRender] parseFullBodyMarkdown.errorMsg",
+          `msgId=${this.msg.value._id} err=${parseRes.errorMsg}`,
+        );
+        return false;
+      }
+      tokens = parseRes.data;
+      // #endif
+      if (tokens.length == 0) {
+        return false;
+      }
+      this.applyMarkdownTokenList(tokens);
+      return true;
+    } catch (e) {
+      console.log(
+        "[MdRender] parseFullBodyMarkdown.exception",
+        `msgId=${this.msg.value._id} err=${e}`,
+      );
+      return false;
+    }
+  }
+
+  private ensureCmarkAvailable(): boolean {
+    if (this.cmarkProbeDone) {
+      return this.cmarkProbeOk;
+    }
+    this.cmarkProbeDone = true;
+    try {
+      // #ifdef APP-IOS
+      const jsonString = md2json("#") as string;
+      this.cmarkProbeOk = jsonString.length > 0;
+      // #endif
+      // #ifndef APP-IOS
+      const probeRes = md2json("#") as ParseMdRes;
+      this.cmarkProbeOk = probeRes.errorMsg.length == 0;
+      if (!this.cmarkProbeOk) {
+        console.log(
+          "[MdRender] ensureCmark.probeError",
+          `errorMsg=${probeRes.errorMsg}`,
+        );
+      }
+      // #endif
+    } catch (e) {
+      this.cmarkProbeOk = false;
+      console.log("[MdRender] ensureCmark.probeException", `err=${e}`);
+    }
+    if (!this.cmarkProbeOk) {
+      this.cmarkParseEnabled = false;
+    }
+    console.log(
+      "[MdRender] ensureCmark.probe",
+      `ok=${this.cmarkProbeOk} cmarkParseEnabled=${this.cmarkParseEnabled}`,
+    );
+    return this.cmarkProbeOk;
+  }
+
+  private createParseMarkdown(): ParseMarkdown {
+    return new ParseMarkdown((markdownTokenList: MarkdownToken[], isParseDone: boolean) => {
+      this.applyMarkdownTokenList(markdownTokenList);
+      if (isParseDone) {
+        this.msg.value.rendered = true;
+        const body = this.getBodyText();
+        if (markdownTokenList.length == 0 && body.trim().length > 0) {
+          if (!this.parseFullBodyMarkdown(body)) {
+            this.cmarkParseEnabled = false;
+            this.applyAppFallback();
+            console.log(
+              "[MdRender] ParseMarkdown.disableCmark",
+              `msgId=${this.msg.value._id} app markdown fallback`,
+            );
+          }
+        }
+      }
+      this.bumpRevision();
+    });
+  }
+
+  runMarkdownParse(forceDone: boolean = false): void {
+    const msgId = this.msg.value._id;
+    const body = this.getBodyText();
+    console.log(
+      "[MdRender] runMarkdownParse.enter",
+      `msgId=${msgId} bodyLen=${body.length} forceDone=${forceDone}`,
+    );
+    const streamFinished =
+      forceDone ||
+      !this.getIsConversationActive() ||
+      !this.getIsLastMsg() ||
+      this.msg.value.state === 3;
+
+    if (!this.cmarkParseEnabled) {
+      console.log(
+        "[MdRender] runMarkdownParse.skip",
+        `cmarkParseEnabled=false msgId=${msgId} bodyLen=${body.length}`,
+      );
+      this.applyAppFallback();
+      return;
+    }
+    if (!this.ensureCmarkAvailable()) {
+      console.log(
+        "[MdRender] runMarkdownParse.cmarkUnavailable",
+        `msgId=${msgId} bodyLen=${body.length}`,
+      );
+      this.applyAppFallback();
+      return;
+    }
+
+    if (streamFinished && body.length > 0) {
+      console.log(
+        "[MdRender] runMarkdownParse.fullBody.try",
+        `msgId=${msgId} bodyLen=${body.length}`,
+      );
+      if (this.parseFullBodyMarkdown(body)) {
+        this.msg.value.rendered = true;
+        this.bumpRevision();
+        console.log(
+          "[MdRender] runMarkdownParse.fullBody.ok",
+          `msgId=${msgId} bodyLen=${body.length}`,
+        );
+        return;
+      }
+      console.log(
+        "[MdRender] runMarkdownParse.fullBody.fail",
+        `msgId=${msgId} bodyLen=${body.length}`,
+      );
+    }
+
+    if (this.parseMarkdown == null) {
+      this.parseMarkdown = this.createParseMarkdown();
+    }
+    this.parseMarkdown!.msgReceiveDone = streamFinished;
+    if (body.length > 0) {
+      console.log(
+        "[MdRender] runMarkdownParse.incremental",
+        `msgId=${msgId} bodyLen=${body.length} streamFinished=${streamFinished}`,
+      );
+      this.parseMarkdown!.runTask(body);
+    }
+  }
+}

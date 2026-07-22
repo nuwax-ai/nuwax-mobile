@@ -2,8 +2,8 @@
   <view class="container relative flex flex-col">
     <custom-nav-bar :title="t('Mobile.Terminal.meetingDetail')" className="border-b" hasSafetyZone showBack />
 
-    <scroll-view class="flex-1" direction="vertical" :show-scrollbar="false">
-      <!-- 头部信息 -->
+    <!-- 顶部：标题 + Tab（播放 / 转写由共用组件承接） -->
+    <view class="top-fixed">
       <view class="head-card">
         <text class="head-title">{{ title != '' ? title : t('Mobile.Terminal.untitledMeeting') }}</text>
         <view class="head-meta">
@@ -19,35 +19,43 @@
         </view>
       </view>
 
-      <!-- 播放器 -->
-      <view v-if="hasAudio" class="player-card">
-        <view class="player-btn" hover-class="player-btn-active" @click="handlePlayToggle">
-          <text class="player-btn-icon">{{ playing ? "⏸" : "▶" }}</text>
-        </view>
-        <view class="player-body">
-          <!-- 进度条（点击跳转） -->
-          <view class="player-track" @click="handleTrackClick">
-            <view class="player-track-fill" :style="'width: ' + progressPercent.toString() + '%;'"></view>
-          </view>
-          <view class="player-time-row">
-            <text class="player-time">{{ formatMs(currentTimeMs) }}</text>
-            <text class="player-time">{{ formatMs(durationMs) }}</text>
-          </view>
-        </view>
-      </view>
-
-      <!-- 纪要 / 转写 切换 -->
       <view class="tab-row">
-        <view :class="['tab-btn', activeTab == 'summary' ? 'tab-btn-on' : '']" @click="activeTab = 'summary'">
+        <view :class="['tab-btn', activeTab == 'summary' ? 'tab-btn-on' : '']" @click="switchTab('summary')">
           <text :class="['tab-text', activeTab == 'summary' ? 'tab-text-on' : '']">{{ t("Mobile.Terminal.summaryTab") }}</text>
         </view>
-        <view :class="['tab-btn', activeTab == 'transcript' ? 'tab-btn-on' : '']" @click="activeTab = 'transcript'">
+        <view :class="['tab-btn', activeTab == 'transcript' ? 'tab-btn-on' : '']" @click="switchTab('transcript')">
           <text :class="['tab-text', activeTab == 'transcript' ? 'tab-text-on' : '']">{{ t("Mobile.Terminal.transcriptTab") }}</text>
         </view>
       </view>
+    </view>
 
-      <!-- 纪要（Markdown：App 端先按纯文本渲染） -->
-      <view v-if="activeTab == 'summary'" class="content-card">
+    <!--
+      音频转写播放器（会议 / 监控列表共用）
+      - 常挂载：切纪要 Tab 不销毁音频
+      - 纪要 Tab：只显示播放条；转写 Tab：播放条 + 转写列表
+    -->
+    <audio-transcript-player
+      v-if="detailReady && (hasAudio || segments.length > 0)"
+      :class="activeTab == 'transcript' ? 'player-host flex-1' : 'player-host player-host--bar'"
+      :meeting-id="meetingId"
+      :segments="segments"
+      :duration-ms="durationMs"
+      :has-audio="hasAudio"
+      :autoplay="autoplay"
+      :show-player="hasAudio"
+      :show-transcript="activeTab == 'transcript'"
+      :visible="activeTab == 'transcript'"
+      @play="handlePlayerPlay"
+    />
+
+    <!-- 纪要（播放条之下，避免挡住控制区） -->
+    <scroll-view
+      v-if="activeTab == 'summary'"
+      class="content-scroll flex-1"
+      direction="vertical"
+      :show-scrollbar="false"
+    >
+      <view class="content-card">
         <template v-if="summary != ''">
           <!-- #ifndef APP -->
           <mp-html :content="summary" :markdown="true" :show-header="false"></mp-html>
@@ -58,26 +66,6 @@
         </template>
         <text v-else class="empty-text">{{ statusFailed ? t("Mobile.Terminal.processFailed") : t("Mobile.Terminal.noSummary") }}</text>
       </view>
-
-      <!-- 转写分段 -->
-      <view v-if="activeTab == 'transcript'" class="content-card">
-        <template v-if="segments.length > 0">
-          <view
-            v-for="seg in segments"
-            :key="seg.seq"
-            :class="['segment-item', isActiveSegment(seg) ? 'segment-item-active' : '']"
-            @click="handleSegmentClick(seg)"
-          >
-            <view class="segment-head">
-              <text class="segment-speaker">{{ seg.speaker != '' ? seg.speaker : t("Mobile.Terminal.unknownSpeaker") }}</text>
-              <text class="segment-time">{{ formatMs(seg.startMs) }}</text>
-            </view>
-            <text class="segment-text">{{ seg.text }}</text>
-          </view>
-        </template>
-        <text v-else class="empty-text">{{ t("Mobile.Terminal.noTranscript") }}</text>
-      </view>
-
       <view class="bottom-space"></view>
     </scroll-view>
   </view>
@@ -85,35 +73,22 @@
 
 <script setup lang="uts">
   import { ref } from "vue";
-  import { onLoad, onUnload } from "@dcloudio/uni-app";
+  import { onLoad } from "@dcloudio/uni-app";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   // #ifndef APP
   import mpHtml from "@/subpackages/uni_modules/mp-html/components/mp-html/mp-html.uvue";
   // #endif
-  import { apiVoxMeetingDetail, apiVoxMeetingAudioUrl, apiVoxMeetingReprocess } from "@/servers/vox/voxMeeting";
+  import { apiVoxMeetingDetail, apiVoxMeetingReprocess } from "@/servers/vox/voxMeeting";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { AudioTranscriptSegment } from "@/components/audio-transcript-player/types.uts";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
-  class Segment {
-    seq: number = 0;
-    speaker: string = "";
-    text: string = "";
-    startMs: number = 0;
-    endMs: number = 0;
-    constructor(seq: number, speaker: string, text: string, startMs: number, endMs: number) {
-      this.seq = seq;
-      this.speaker = speaker;
-      this.text = text;
-      this.startMs = startMs;
-      this.endMs = endMs;
-    }
-  }
-
   const meetingId = ref<number>(0);
   const autoplay = ref<boolean>(false);
+  const detailReady = ref<boolean>(false);
 
   const title = ref<string>("");
   const startedAt = ref<string>("");
@@ -126,15 +101,8 @@
   const hasAudio = ref<boolean>(false);
   const statusFailed = ref<boolean>(false);
 
-  const segments = ref<Segment[]>([]);
+  const segments = ref<AudioTranscriptSegment[]>([]);
   const activeTab = ref<string>("summary");
-
-  // 播放状态
-  const playing = ref<boolean>(false);
-  const currentTimeMs = ref<number>(0);
-  const progressPercent = ref<number>(0);
-
-  let audioCtx: InnerAudioContext | null = null;
 
   const formatMs = (ms: number): string => {
     const totalSec = Math.floor(ms / 1000);
@@ -152,96 +120,15 @@
     return endTime != "" ? `${datePart} ${startTime}-${endTime}` : `${datePart} ${startTime}`;
   };
 
-  const updateProgress = () => {
-    if (audioCtx == null) return;
-    const cur = audioCtx!!.currentTime; // 秒
-    const dur = audioCtx!!.duration > 0 ? audioCtx!!.duration : (durationMs.value / 1000);
-    currentTimeMs.value = Math.floor(cur * 1000);
-    if (dur > 0) {
-      progressPercent.value = Math.min(100, Math.floor((cur / dur) * 100));
+  const switchTab = (tab: string) => {
+    activeTab.value = tab;
+  };
+
+  /** 播放时切到转写 Tab，保证听 + 看同屏 */
+  const handlePlayerPlay = () => {
+    if (activeTab.value != "transcript") {
+      activeTab.value = "transcript";
     }
-  };
-
-  const initAudio = async () => {
-    if (!hasAudio.value) return;
-    try {
-      const res = await apiVoxMeetingAudioUrl(meetingId.value);
-      if (apiResCode(res) != SUCCESS_CODE) return;
-      const raw = apiResData<any>(res);
-      const obj = raw != null ? (raw as UTSJSONObject) : null;
-      const urlVal = obj != null ? obj["url"] : null;
-      const url = urlVal != null ? `${urlVal}` : "";
-      if (url == "") return;
-      // #ifdef APP
-      if (audioCtx == null) {
-        audioCtx = uni.createInnerAudioContext();
-        audioCtx!!.onTimeUpdate(() => updateProgress());
-        audioCtx!!.onEnded(() => {
-          playing.value = false;
-          currentTimeMs.value = 0;
-          progressPercent.value = 0;
-        });
-        audioCtx!!.onError((err) => {
-          console.error("audio error", err);
-          playing.value = false;
-          uni.showToast({ title: t("Mobile.Terminal.audioPlayFailed"), icon: "none" });
-        });
-      }
-      audioCtx!!.src = url;
-      if (autoplay.value) {
-        audioCtx!!.play();
-        playing.value = true;
-      }
-      // #endif
-    } catch (e) {
-      console.error("initAudio error", e);
-    }
-  };
-
-  const handlePlayToggle = () => {
-    // #ifdef APP
-    if (audioCtx == null) return;
-    if (playing.value) {
-      audioCtx!!.pause();
-      playing.value = false;
-    } else {
-      audioCtx!!.play();
-      playing.value = true;
-    }
-    // #endif
-  };
-
-  const seekToMs = (ms: number) => {
-    // #ifdef APP
-    if (audioCtx == null) return;
-    audioCtx!!.seek(ms / 1000);
-    currentTimeMs.value = ms;
-    // #endif
-  };
-
-  const handleTrackClick = (e: any) => {
-    const dur = durationMs.value;
-    if (dur <= 0) return;
-    const touch = (e as UTSJSONObject)["detail"] as UTSJSONObject;
-    const xVal = touch["x"];
-    if (xVal == null) return;
-    const sysInfo = uni.getSystemInfoSync();
-    const winW = sysInfo.windowWidth != null ? sysInfo.windowWidth : 375;
-    // 播放器卡片内边距：24rpx 页边距 ×2 + 32rpx 卡片 padding ×2 + 播放键 96rpx
-    const trackWidthPx = winW * ((750 - 48 - 64 - 96) / 750);
-    if (trackWidthPx <= 0) return;
-    const ratio = Math.max(0, Math.min(1, (xVal as number) / trackWidthPx));
-    seekToMs(Math.floor(ratio * dur));
-  };
-
-  const handleSegmentClick = (seg: Segment) => {
-    if (!hasAudio.value) return;
-    seekToMs(seg.startMs);
-    if (!playing.value) handlePlayToggle();
-  };
-
-  const isActiveSegment = (seg: Segment): boolean => {
-    return playing.value && currentTimeMs.value >= seg.startMs && currentTimeMs.value < seg.endMs;
   };
 
   const handleReprocess = async () => {
@@ -295,7 +182,7 @@
 
       const segsVal = d["segments"];
       const segs = segsVal != null ? (segsVal as UTSJSONObject[]) : ([] as UTSJSONObject[]);
-      const list: Segment[] = [];
+      const list: AudioTranscriptSegment[] = [];
       for (let i = 0; i < segs.length; i++) {
         const s = segs[i];
         const seqVal = s["seq"];
@@ -303,7 +190,7 @@
         const textVal = s["text"];
         const startMsVal = s["startMs"];
         const endMsVal = s["endMs"];
-        list.push(new Segment(
+        list.push(new AudioTranscriptSegment(
           seqVal != null ? (seqVal as number) : i,
           speakerVal != null ? `${speakerVal}` : "",
           textVal != null ? `${textVal}` : "",
@@ -312,8 +199,11 @@
         ));
       }
       segments.value = list;
-
-      await initAudio();
+      // autoplay 时进入转写 Tab，组件挂载后即可听+看
+      if (autoplay.value && hasAudio.value && list.length > 0) {
+        activeTab.value = "transcript";
+      }
+      detailReady.value = true;
     } catch (e) {
       console.error("fetchDetail error", e);
     }
@@ -332,21 +222,30 @@
     setCurrentPageNavigationBarTitle();
     fetchDetail();
   });
-
-  onUnload(() => {
-    // #ifdef APP
-    if (audioCtx != null) {
-      audioCtx!!.destroy();
-      audioCtx = null;
-    }
-    // #endif
-  });
 </script>
 
 <style lang="scss" scoped>
   .container {
     height: 100%;
     background-color: #f7f7f7;
+  }
+
+  .top-fixed {
+    flex-shrink: 0;
+  }
+
+  .content-scroll {
+    min-height: 0;
+  }
+
+  .player-host {
+    min-height: 0;
+    width: 100%;
+
+    &--bar {
+      flex-shrink: 0;
+      flex-grow: 0;
+    }
   }
 
   .head-card {
@@ -399,65 +298,6 @@
     }
   }
 
-  .player-card {
-    background-color: #ffffff;
-    border-radius: 24rpx;
-    margin: 20rpx 24rpx 0;
-    padding: 24rpx 32rpx;
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-
-    .player-btn {
-      width: 88rpx;
-      height: 88rpx;
-      border-radius: 50%;
-      background-color: #5147ff;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      margin-right: 24rpx;
-
-      &-active {
-        opacity: 0.85;
-      }
-
-      .player-btn-icon {
-        font-size: 36rpx;
-        color: #ffffff;
-      }
-    }
-
-    .player-body {
-      flex: 1;
-
-      .player-track {
-        height: 12rpx;
-        border-radius: 6rpx;
-        background-color: #e8e8e8;
-        overflow: hidden;
-
-        .player-track-fill {
-          height: 100%;
-          border-radius: 6rpx;
-          background-color: #5147ff;
-        }
-      }
-
-      .player-time-row {
-        margin-top: 12rpx;
-        display: flex;
-        flex-direction: row;
-        justify-content: space-between;
-
-        .player-time {
-          font-size: 22rpx;
-          color: #999999;
-        }
-      }
-    }
-  }
-
   .tab-row {
     display: flex;
     flex-direction: row;
@@ -500,41 +340,6 @@
       font-size: 28rpx;
       color: #1a1a1a;
       line-height: 1.7;
-    }
-
-    .segment-item {
-      padding: 20rpx 16rpx;
-      border-radius: 16rpx;
-      margin-bottom: 8rpx;
-
-      .segment-head {
-        display: flex;
-        flex-direction: row;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 8rpx;
-
-        .segment-speaker {
-          font-size: 24rpx;
-          color: #5147ff;
-          font-weight: 600;
-        }
-
-        .segment-time {
-          font-size: 22rpx;
-          color: #999999;
-        }
-      }
-
-      .segment-text {
-        font-size: 28rpx;
-        color: #1a1a1a;
-        line-height: 1.6;
-      }
-    }
-
-    .segment-item-active {
-      background-color: rgba(81, 71, 255, 0.08);
     }
 
     .empty-text {

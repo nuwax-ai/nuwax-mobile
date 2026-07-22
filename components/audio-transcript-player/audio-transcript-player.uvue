@@ -1,0 +1,557 @@
+<template>
+  <!-- 音频转写播放器：会议 / 监控列表共用（播放条 + 转写分段同步高亮 / 点击跳转） -->
+  <view class="atp flex flex-col">
+    <!-- 播放器 -->
+    <view v-if="showPlayer && hasAudio" class="atp__player">
+      <view class="atp__play-btn" hover-class="atp__play-btn--active" @click="handlePlayToggle">
+        <text class="atp__play-icon">{{ playing ? "⏸" : "▶" }}</text>
+      </view>
+      <view class="atp__player-body">
+        <slider
+          class="atp__slider"
+          :value="progressPercent"
+          :max="100"
+          :block-size="14"
+          activeColor="#5147ff"
+          backgroundColor="#e8e8e8"
+          @changing="handleSliderChanging"
+          @change="handleSliderChange"
+        />
+        <view class="atp__time-row">
+          <text class="atp__time">{{ formatMs(currentTimeMs) }}</text>
+          <text class="atp__time">{{ formatMs(displayDurationMs) }}</text>
+        </view>
+      </view>
+    </view>
+
+    <!-- 转写列表：跟随当前播放进度高亮并自动滚入视口 -->
+    <scroll-view
+      v-if="showTranscript"
+      class="atp__transcript flex-1"
+      direction="vertical"
+      :show-scrollbar="false"
+      :scroll-into-view="scrollIntoViewId"
+      :scroll-with-animation="true"
+      @scroll="handleTranscriptScroll"
+    >
+      <view class="atp__transcript-card">
+        <template v-if="segments.length > 0">
+          <view
+            v-for="seg in segments"
+            :key="seg.seq"
+            :id="'seg-' + seg.seq.toString()"
+            :class="['atp__seg', isActiveSegment(seg) ? 'atp__seg--active' : '']"
+            @click="handleSegmentClick(seg)"
+          >
+            <view class="atp__seg-head">
+              <text class="atp__seg-speaker">{{ seg.speaker != '' ? seg.speaker : t('Mobile.Terminal.unknownSpeaker') }}</text>
+              <text class="atp__seg-time">{{ formatMs(seg.startMs) }}</text>
+            </view>
+            <text class="atp__seg-text">{{ seg.text }}</text>
+          </view>
+        </template>
+        <text v-else class="atp__empty">{{ t("Mobile.Terminal.noTranscript") }}</text>
+      </view>
+      <view class="atp__bottom-space"></view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, watch, onMounted, onUnmounted } from "vue";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiVoxMeetingAudioUrl } from "@/servers/vox/voxMeeting";
+  import { apiResCode, apiResData } from "@/utils/common";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { AudioTranscriptSegment } from "./types.uts";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /**
+   * Props
+   * - meetingId：拉临时播放地址（会议 / 监控记录 id）
+   * - segments：带 startMs/endMs 的转写分段
+   * - durationMs：业务时长（进度条与 seek 上限）
+   * - hasAudio：无录音时隐藏播放器
+   * - autoplay：就绪后自动播放
+   * - showPlayer / showTranscript：控制播放条与转写列表显隐
+   * - visible：父级不可见时暂停自动滚屏（如切到纪要 Tab）
+   */
+  interface Props {
+    meetingId: number;
+    segments: AudioTranscriptSegment[];
+    durationMs: number;
+    hasAudio: boolean;
+    autoplay: boolean;
+    showPlayer: boolean;
+    showTranscript: boolean;
+    visible: boolean;
+  }
+
+  const props = withDefaults(defineProps<Props>(), {
+    meetingId: 0,
+    durationMs: 0,
+    hasAudio: false,
+    autoplay: false,
+    showPlayer: true,
+    showTranscript: true,
+    visible: true,
+  });
+
+  const emit = defineEmits<{
+    (e: "play"): void;
+    (e: "pause"): void;
+    (e: "ended"): void;
+    (e: "seek", ms: number): void;
+    (e: "active-change", seq: number): void;
+  }>();
+
+  const playing = ref<boolean>(false);
+  const currentTimeMs = ref<number>(0);
+  const progressPercent = ref<number>(0);
+  /** 展示用时长：优先业务 durationMs */
+  const displayDurationMs = ref<number>(0);
+  /** 当前高亮分段 seq；与 playing 解耦，暂停/seek 后仍高亮 */
+  const activeSeq = ref<number>(-1);
+  const sliderDragging = ref<boolean>(false);
+
+  const scrollIntoViewId = ref<string>("");
+  const followTranscript = ref<boolean>(true);
+  let followResumeTimer: number = 0;
+  const FOLLOW_RESUME_MS = 3000;
+
+  let audioCtx: InnerAudioContext | null = null;
+  /** 避免重复 init 同一 meetingId */
+  let initedMeetingId: number = 0;
+
+  const formatMs = (ms: number): string => {
+    const totalSec = Math.floor(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    const secStr = sec < 10 ? `0${sec}` : `${sec}`;
+    return `${min}:${secStr}`;
+  };
+
+  const resolveDurationMs = (): number => {
+    if (props.durationMs > 0) return props.durationMs;
+    if (audioCtx != null && audioCtx!!.duration > 0) {
+      return Math.floor(audioCtx!!.duration * 1000);
+    }
+    return 0;
+  };
+
+  const syncDisplayDuration = () => {
+    displayDurationMs.value = resolveDurationMs();
+  };
+
+  /**
+   * 按进度解析应对齐的分段 seq。
+   * 区间 [startMs, endMs)；超出最后一段仍锚定末句。
+   */
+  const resolveActiveSeq = (ms: number): number => {
+    const list = props.segments;
+    if (list.length == 0) return -1;
+    for (let i = 0; i < list.length; i++) {
+      const seg = list[i];
+      if (ms >= seg.startMs && ms < seg.endMs) {
+        return seg.seq;
+      }
+    }
+    const last = list[list.length - 1];
+    if (ms >= last.startMs) {
+      return last.seq;
+    }
+    return -1;
+  };
+
+  /** 刷新高亮，并在跟随开启且可见时滚到当前句 */
+  const syncActiveFromTime = (ms: number, forceScroll: boolean) => {
+    const next = resolveActiveSeq(ms);
+    const seqChanged = next != activeSeq.value;
+    activeSeq.value = next;
+    if (seqChanged) {
+      emit("active-change", next);
+    }
+    if (next < 0) return;
+    if (!props.visible) return;
+    if (!props.showTranscript) return;
+    if (!followTranscript.value && !forceScroll) return;
+    if (!seqChanged && !forceScroll) return;
+    const target = `seg-${next.toString()}`;
+    if (scrollIntoViewId.value == target) {
+      scrollIntoViewId.value = "";
+      setTimeout(() => {
+        scrollIntoViewId.value = target;
+      }, 16);
+    } else {
+      scrollIntoViewId.value = target;
+    }
+  };
+
+  const enableFollowTranscript = () => {
+    if (followResumeTimer != 0) {
+      clearTimeout(followResumeTimer);
+      followResumeTimer = 0;
+    }
+    followTranscript.value = true;
+  };
+
+  /** 用户手动滑动：暂停跟随，一段时间后恢复 */
+  const handleTranscriptScroll = (_e: any) => {
+    followTranscript.value = false;
+    if (followResumeTimer != 0) {
+      clearTimeout(followResumeTimer);
+    }
+    followResumeTimer = setTimeout(() => {
+      followTranscript.value = true;
+      followResumeTimer = 0;
+      syncActiveFromTime(currentTimeMs.value, true);
+    }, FOLLOW_RESUME_MS) as number;
+  };
+
+  const updateProgress = () => {
+    if (audioCtx == null) return;
+    if (sliderDragging.value) return;
+    const cur = audioCtx!!.currentTime;
+    let ms = Math.floor(cur * 1000);
+    const durMs = resolveDurationMs();
+    syncDisplayDuration();
+    // 到达业务时长终点：停在末尾，避免长音频继续跑
+    if (durMs > 0 && ms >= durMs) {
+      ms = durMs;
+      currentTimeMs.value = ms;
+      progressPercent.value = 100;
+      syncActiveFromTime(ms, false);
+      if (playing.value) {
+        audioCtx!!.pause();
+        playing.value = false;
+        emit("pause");
+        emit("ended");
+      }
+      return;
+    }
+    currentTimeMs.value = ms;
+    if (durMs > 0) {
+      progressPercent.value = Math.min(100, Math.floor((ms / durMs) * 100));
+    }
+    syncActiveFromTime(ms, false);
+  };
+
+  const destroyAudio = () => {
+    // #ifdef APP
+    if (audioCtx != null) {
+      audioCtx!!.destroy();
+      audioCtx = null;
+    }
+    // #endif
+    initedMeetingId = 0;
+    playing.value = false;
+  };
+
+  /** 拉取临时 URL 并绑定 InnerAudioContext（仅 App） */
+  const initAudio = async (doAutoplay: boolean) => {
+    if (!props.hasAudio || props.meetingId <= 0) return;
+    try {
+      const res = await apiVoxMeetingAudioUrl(props.meetingId);
+      if (apiResCode(res) != SUCCESS_CODE) return;
+      const raw = apiResData<any>(res);
+      const obj = raw != null ? (raw as UTSJSONObject) : null;
+      const urlVal = obj != null ? obj["url"] : null;
+      const url = urlVal != null ? `${urlVal}` : "";
+      if (url == "") return;
+      // #ifdef APP
+      if (audioCtx == null) {
+        audioCtx = uni.createInnerAudioContext();
+        audioCtx!!.onTimeUpdate(() => updateProgress());
+        audioCtx!!.onEnded(() => {
+          playing.value = false;
+          currentTimeMs.value = 0;
+          progressPercent.value = 0;
+          syncActiveFromTime(0, false);
+          emit("ended");
+        });
+        audioCtx!!.onError((err) => {
+          console.error("audio-transcript-player audio error", err);
+          playing.value = false;
+          uni.showToast({ title: t("Mobile.Terminal.audioPlayFailed"), icon: "none" });
+        });
+      }
+      audioCtx!!.src = url;
+      initedMeetingId = props.meetingId;
+      syncDisplayDuration();
+      syncActiveFromTime(0, false);
+      if (doAutoplay) {
+        enableFollowTranscript();
+        audioCtx!!.play();
+        playing.value = true;
+        emit("play");
+        setTimeout(() => {
+          syncActiveFromTime(currentTimeMs.value, true);
+        }, 80);
+      }
+      // #endif
+    } catch (e) {
+      console.error("audio-transcript-player initAudio error", e);
+    }
+  };
+
+  const play = () => {
+    // #ifdef APP
+    if (audioCtx == null) {
+      initAudio(true);
+      return;
+    }
+    enableFollowTranscript();
+    audioCtx!!.play();
+    playing.value = true;
+    emit("play");
+    setTimeout(() => {
+      syncActiveFromTime(currentTimeMs.value, true);
+    }, 80);
+    // #endif
+  };
+
+  const pause = () => {
+    // #ifdef APP
+    if (audioCtx == null) return;
+    audioCtx!!.pause();
+    playing.value = false;
+    emit("pause");
+    // #endif
+  };
+
+  const handlePlayToggle = () => {
+    if (playing.value) {
+      pause();
+    } else {
+      play();
+    }
+  };
+
+  const seekToMs = (ms: number) => {
+    // #ifdef APP
+    if (audioCtx == null) return;
+    const durMs = resolveDurationMs();
+    const clamped = Math.max(0, durMs > 0 ? Math.min(ms, durMs) : ms);
+    audioCtx!!.seek(clamped / 1000);
+    currentTimeMs.value = clamped;
+    if (durMs > 0) {
+      progressPercent.value = Math.min(100, Math.floor((clamped / durMs) * 100));
+    }
+    syncActiveFromTime(clamped, true);
+    emit("seek", clamped);
+    // #endif
+  };
+
+  const handleSliderChanging = (e: any) => {
+    sliderDragging.value = true;
+    const detail = (e as UTSJSONObject)["detail"] as UTSJSONObject;
+    const val = detail["value"];
+    if (val == null) return;
+    const percent = val as number;
+    progressPercent.value = percent;
+    const dur = resolveDurationMs();
+    if (dur <= 0) return;
+    const ms = Math.floor((percent / 100) * dur);
+    currentTimeMs.value = ms;
+    syncActiveFromTime(ms, false);
+  };
+
+  const handleSliderChange = (e: any) => {
+    const detail = (e as UTSJSONObject)["detail"] as UTSJSONObject;
+    const val = detail["value"];
+    sliderDragging.value = false;
+    if (val == null) return;
+    const percent = val as number;
+    progressPercent.value = percent;
+    const dur = resolveDurationMs();
+    if (dur <= 0) return;
+    seekToMs(Math.floor((percent / 100) * dur));
+  };
+
+  const handleSegmentClick = (seg: AudioTranscriptSegment) => {
+    if (!props.hasAudio) return;
+    enableFollowTranscript();
+    seekToMs(seg.startMs);
+    // #ifdef APP
+    if (!playing.value) {
+      play();
+    }
+    // #endif
+  };
+
+  const isActiveSegment = (seg: AudioTranscriptSegment): boolean => {
+    return props.hasAudio && activeSeq.value == seg.seq;
+  };
+
+  // meetingId 变化时重新拉播放地址
+  watch(
+    (): number => props.meetingId,
+    (id: number) => {
+      if (id > 0 && props.hasAudio && id != initedMeetingId) {
+        destroyAudio();
+        initAudio(props.autoplay);
+      }
+    },
+  );
+
+  watch(
+    (): number => props.durationMs,
+    (_v: number) => {
+      syncDisplayDuration();
+    },
+  );
+
+  // 切回可见时滚到当前句
+  watch(
+    (): boolean => props.visible,
+    (v: boolean) => {
+      if (v && activeSeq.value >= 0) {
+        setTimeout(() => {
+          syncActiveFromTime(currentTimeMs.value, true);
+        }, 50);
+      }
+    },
+  );
+
+  onMounted(() => {
+    syncDisplayDuration();
+    if (props.hasAudio && props.meetingId > 0) {
+      initAudio(props.autoplay);
+    } else {
+      syncActiveFromTime(0, false);
+    }
+  });
+
+  onUnmounted(() => {
+    if (followResumeTimer != 0) {
+      clearTimeout(followResumeTimer);
+      followResumeTimer = 0;
+    }
+    destroyAudio();
+  });
+
+  defineExpose({
+    play: play as any,
+    pause: pause as any,
+    seekToMs: seekToMs as any,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .atp {
+    width: 100%;
+    min-height: 0;
+
+    &__player {
+      flex-shrink: 0;
+      background-color: #ffffff;
+      border-radius: 24rpx;
+      margin: 20rpx 24rpx 0;
+      padding: 24rpx 32rpx;
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+    }
+
+    &__play-btn {
+      width: 88rpx;
+      height: 88rpx;
+      border-radius: 50%;
+      background-color: #5147ff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-right: 24rpx;
+
+      &--active {
+        opacity: 0.85;
+      }
+    }
+
+    &__play-icon {
+      font-size: 36rpx;
+      color: #ffffff;
+    }
+
+    &__player-body {
+      flex: 1;
+    }
+
+    &__slider {
+      margin: 0;
+    }
+
+    &__time-row {
+      margin-top: 4rpx;
+      display: flex;
+      flex-direction: row;
+      justify-content: space-between;
+    }
+
+    &__time {
+      font-size: 22rpx;
+      color: #999999;
+    }
+
+    &__transcript {
+      min-height: 0;
+    }
+
+    &__transcript-card {
+      background-color: #ffffff;
+      border-radius: 24rpx;
+      margin: 20rpx 24rpx 0;
+      padding: 32rpx;
+    }
+
+    &__seg {
+      padding: 20rpx 16rpx;
+      border-radius: 16rpx;
+      margin-bottom: 8rpx;
+
+      &--active {
+        background-color: rgba(81, 71, 255, 0.08);
+
+        .atp__seg-text {
+          color: #5147ff;
+          font-weight: 500;
+        }
+      }
+    }
+
+    &__seg-head {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8rpx;
+    }
+
+    &__seg-speaker {
+      font-size: 24rpx;
+      color: #5147ff;
+      font-weight: 600;
+    }
+
+    &__seg-time {
+      font-size: 22rpx;
+      color: #999999;
+    }
+
+    &__seg-text {
+      font-size: 28rpx;
+      color: #1a1a1a;
+      line-height: 1.6;
+    }
+
+    &__empty {
+      font-size: 26rpx;
+      color: #999999;
+    }
+
+    &__bottom-space {
+      height: 40rpx;
+    }
+  }
+</style>

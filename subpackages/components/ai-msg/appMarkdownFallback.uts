@@ -1,0 +1,351 @@
+import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
+import type {
+  Align,
+  MarkdownToken,
+} from "@/uni_modules/uni-cmark/utssdk/interface.uts";
+import proxyWeb from "@/uni_modules/uni-ai-x/sdk/proxy-web.uts";
+
+type MathRenderedCallback = () => void;
+
+function makeTextToken(text: string, className: string = "text"): MarkdownToken {
+  return {
+    type: "text",
+    text,
+    className,
+  };
+}
+
+function parseInline(text: string): MarkdownToken[] {
+  const result = [] as MarkdownToken[];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const strongStart = text.indexOf("**", cursor);
+    const codeStart = text.indexOf("`", cursor);
+    let nextStart = -1;
+    let marker = "";
+    if (strongStart >= 0 && (codeStart < 0 || strongStart <= codeStart)) {
+      nextStart = strongStart;
+      marker = "**";
+    } else if (codeStart >= 0) {
+      nextStart = codeStart;
+      marker = "`";
+    }
+    if (nextStart < 0) {
+      result.push(makeTextToken(text.substring(cursor)));
+      break;
+    }
+    if (nextStart > cursor) {
+      result.push(makeTextToken(text.substring(cursor, nextStart)));
+    }
+    const contentStart = nextStart + marker.length;
+    const end = text.indexOf(marker, contentStart);
+    if (end < 0) {
+      result.push(makeTextToken(text.substring(nextStart)));
+      break;
+    }
+    result.push({
+      type: marker == "**" ? "strong" : "code",
+      text: text.substring(contentStart, end),
+      className: marker == "**" ? "strong" : "code",
+    });
+    cursor = end + marker.length;
+  }
+  if (result.length == 0) {
+    result.push(makeTextToken(text.length > 0 ? text : " "));
+  }
+  return result;
+}
+
+function splitTableRow(line: string): string[] {
+  let normalized = line.trim();
+  if (normalized.startsWith("|")) {
+    normalized = normalized.substring(1);
+  }
+  if (normalized.endsWith("|")) {
+    normalized = normalized.substring(0, normalized.length - 1);
+  }
+  return normalized.split("|").map((cell: string): string => cell.trim());
+}
+
+function isTableSeparator(line: string): boolean {
+  const cells = splitTableRow(line);
+  if (cells.length == 0) {
+    return false;
+  }
+  for (let i = 0; i < cells.length; i++) {
+    const cell = cells[i].replace(/:/g, "").trim();
+    if (cell.length < 3 || cell.replace(/-/g, "").length > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function tableAligns(separatorLine: string): Align[] {
+  const cells = splitTableRow(separatorLine);
+  const aligns = [] as Align[];
+  for (let i = 0; i < cells.length; i++) {
+    const cell = cells[i].trim();
+    if (cell.startsWith(":") && cell.endsWith(":")) {
+      aligns.push("center");
+    } else if (cell.endsWith(":")) {
+      aligns.push("right");
+    } else {
+      aligns.push("left");
+    }
+  }
+  return aligns;
+}
+
+function makeTableRow(line: string): MarkdownToken {
+  const cells = splitTableRow(line);
+  const cellTokens = [] as MarkdownToken[];
+  for (let i = 0; i < cells.length; i++) {
+    const inline = parseInline(cells[i]);
+    const width = Math.max(56, Math.min(300, cells[i].length * 15 + 24));
+    cellTokens.push({
+      type: "table_cell",
+      tokens: inline,
+      width,
+    });
+  }
+  return {
+    type: "table_row",
+    tokens: cellTokens,
+  };
+}
+
+function makeItem(
+  type: string,
+  index: number,
+  datasList: MarkdownToken[][],
+): UniAiMarkdownElItem {
+  return {
+    uniqueId: "fallback-" + type + "-" + index,
+    type,
+    datasList,
+  };
+}
+
+function renderMathToken(
+  latex: string,
+  token: MarkdownToken,
+  callback: MathRenderedCallback,
+): void {
+  const param = new UTSJSONObject();
+  param["action"] = "katexRender";
+  param["pureMathText"] = latex;
+  proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
+    const imageData = res["imageDataURL"];
+    const htmlData = res["resultHtml"];
+    const widthData = res["width"];
+    const heightData = res["height"];
+    if (imageData != null) token.href = `${imageData}`;
+    if (htmlData != null) token.html = `${htmlData}`;
+    if (widthData != null) token.width = widthData as number;
+    if (heightData != null) token.height = heightData as number;
+    callback();
+  });
+}
+
+/**
+ * 标准 App 基座缺少 uni-cmark 原生库时的纯 UTS Markdown 解析。
+ * 支持标题、段落、粗体、行内代码、分隔线、表格、代码块及块级数学公式。
+ */
+export function parseAppMarkdownFallback(
+  markdown: string,
+  onMathRendered: MathRenderedCallback,
+): UniAiMarkdownElItem[] {
+  const result = [] as UniAiMarkdownElItem[];
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  let index = 0;
+  let itemIndex = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed.length == 0) {
+      index++;
+      continue;
+    }
+
+    if (trimmed.startsWith("```")) {
+      const lang = trimmed.substring(3).trim();
+      const codeLines = [] as string[];
+      index++;
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index]);
+        index++;
+      }
+      if (index < lines.length) index++;
+      const codeText = codeLines.join("\n");
+      if (lang == "math") {
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: codeText,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(codeText, mathToken, onMathRendered);
+      } else {
+        const codeRows = [] as MarkdownToken[][];
+        for (let ci = 0; ci < codeLines.length; ci++) {
+          codeRows.push([makeTextToken(codeLines[ci], "text")]);
+        }
+        const codeToken: MarkdownToken = {
+          type: "code_block",
+          text: codeText,
+          lang: lang.length > 0 ? lang : "text",
+          codeTokens: codeRows,
+          uniqueId: "fallback-code-token-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[codeToken]]));
+      }
+      continue;
+    }
+
+    if (trimmed == "$$" || trimmed == "\\[") {
+      const closeMarker = trimmed == "$$" ? "$$" : "\\]";
+      const mathLines = [] as string[];
+      index++;
+      while (index < lines.length && lines[index].trim() != closeMarker) {
+        mathLines.push(lines[index]);
+        index++;
+      }
+      if (index < lines.length) index++;
+      const latex = mathLines.join("\n").trim();
+      const mathToken: MarkdownToken = {
+        type: "math",
+        text: latex,
+        uniqueId: "fallback-math-token-" + itemIndex,
+      };
+      result.push(makeItem("math", itemIndex++, [[mathToken]]));
+      renderMathToken(latex, mathToken, onMathRendered);
+      continue;
+    }
+
+    let inlineBlockMath = "";
+    if (
+      trimmed.length > 4 &&
+      trimmed.startsWith("$$") &&
+      trimmed.endsWith("$$")
+    ) {
+      inlineBlockMath = trimmed.substring(2, trimmed.length - 2).trim();
+    } else if (
+      trimmed.length > 4 &&
+      trimmed.startsWith("\\[") &&
+      trimmed.endsWith("\\]")
+    ) {
+      inlineBlockMath = trimmed.substring(2, trimmed.length - 2).trim();
+    } else if (
+      trimmed.length > 2 &&
+      trimmed.startsWith("$") &&
+      trimmed.endsWith("$")
+    ) {
+      inlineBlockMath = trimmed.substring(1, trimmed.length - 1).trim();
+    }
+    if (inlineBlockMath.length > 0) {
+      const mathToken: MarkdownToken = {
+        type: "math",
+        text: inlineBlockMath,
+        uniqueId: "fallback-math-token-" + itemIndex,
+      };
+      result.push(makeItem("math", itemIndex++, [[mathToken]]));
+      renderMathToken(inlineBlockMath, mathToken, onMathRendered);
+      index++;
+      continue;
+    }
+
+    if (
+      index + 1 < lines.length &&
+      trimmed.indexOf("|") >= 0 &&
+      isTableSeparator(lines[index + 1])
+    ) {
+      const tableRows = [] as MarkdownToken[];
+      tableRows.push(makeTableRow(line));
+      const aligns = tableAligns(lines[index + 1]);
+      index += 2;
+      while (index < lines.length && lines[index].trim().indexOf("|") >= 0) {
+        tableRows.push(makeTableRow(lines[index]));
+        index++;
+      }
+      const tableToken: MarkdownToken = {
+        type: "table",
+        tokens: tableRows,
+        align: aligns,
+        uniqueId: "fallback-table-token-" + itemIndex,
+      };
+      result.push(makeItem("table", itemIndex++, [[tableToken]]));
+      continue;
+    }
+
+    if (trimmed == "---" || trimmed == "***" || trimmed == "___") {
+      const hrToken: MarkdownToken = {
+        type: "thematic_break",
+        uniqueId: "fallback-hr-token-" + itemIndex,
+      };
+      result.push(makeItem("thematic_break", itemIndex++, [[hrToken]]));
+      index++;
+      continue;
+    }
+
+    let headingDepth = 0;
+    while (headingDepth < trimmed.length && trimmed.charAt(headingDepth) == "#") {
+      headingDepth++;
+    }
+    if (
+      headingDepth > 0 &&
+      headingDepth <= 6 &&
+      trimmed.length > headingDepth &&
+      trimmed.charAt(headingDepth) == " "
+    ) {
+      const headingText = trimmed.substring(headingDepth + 1);
+      const headingTokens = parseInline(headingText);
+      for (let hi = 0; hi < headingTokens.length; hi++) {
+        const oldClass = headingTokens[hi].className ?? "text";
+        headingTokens[hi].className = oldClass + " depth-" + headingDepth;
+      }
+      result.push(makeItem("heading", itemIndex++, [headingTokens]));
+      index++;
+      continue;
+    }
+
+    const paragraphLines = [] as string[];
+    paragraphLines.push(line);
+    index++;
+    while (index < lines.length && lines[index].trim().length > 0) {
+      const next = lines[index].trim();
+      if (
+        next.startsWith("```") ||
+        next == "$$" ||
+        next == "\\[" ||
+        next == "---" ||
+        (index + 1 < lines.length &&
+          next.indexOf("|") >= 0 &&
+          isTableSeparator(lines[index + 1]))
+      ) {
+        break;
+      }
+      paragraphLines.push(lines[index]);
+      index++;
+    }
+    const paragraphTokens = [] as MarkdownToken[];
+    for (let pi = 0; pi < paragraphLines.length; pi++) {
+      if (pi > 0) paragraphTokens.push(makeTextToken("\n"));
+      const inline = parseInline(paragraphLines[pi]);
+      for (let ii = 0; ii < inline.length; ii++) {
+        paragraphTokens.push(inline[ii]);
+      }
+    }
+    result.push(makeItem("paragraph", itemIndex++, [paragraphTokens]));
+  }
+
+  console.log(
+    "[MdRender] appFallback parsed bodyLen=" +
+      markdown.length +
+      " elCount=" +
+      result.length,
+  );
+  return result;
+}

@@ -16,6 +16,7 @@ import {
   EspProvisioningError,
   EspProvisioningProgress,
   EspProvisioningQrParseResult,
+  EspWifiNetwork,
 } from '@/types/interfaces/espProvisioning';
 import {
   EspProvisioningErrorCodeEnum,
@@ -31,9 +32,11 @@ import {
   ESP_PROV_SCAN_TIMEOUT_MS,
   ESP_PROV_STATUS_TIMEOUT_MS,
   ESP_PROV_REQUIRED_CAPABILITY,
+  ESP_PROV_OPTIONAL_SCAN_CAPABILITY,
 } from '@/constants/espProvisioning.constants';
 import { validatePassword, validateSsid } from '@/utils/provisionProtocol';
 import { parseEspProvisioningQr } from '@/utils/provisioning/espProvisioningQr';
+import { getQrPayload } from '@/utils/provisionSession';
 import { apiVoxBindDevice } from '@/servers/vox/voxDevice';
 import { AppDeviceBindParams } from '@/types/interfaces/voxDevice';
 import { apiResCode, apiResData, apiResMessage } from '@/utils/common';
@@ -209,6 +212,17 @@ export class EspProvisioningController {
           ), ProvisionRetryActionEnum.NONE);
           return false;
         }
+        // 冻结契约 §3：username 非空时校验 device-info.serialNumber == username（手动链路 username 来自受控输入）
+        if (this.config.username != '' && info.serialNumber != this.config.username) {
+          this.fail(new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.DEVICE_ID_MISMATCH,
+            '设备身份不匹配，已停止配网',
+            'device-info.serialNumber != username',
+            0,
+            false,
+          ), ProvisionRetryActionEnum.NONE);
+          return false;
+        }
         this.deviceInfo.value = info;
         if (this.applyRecoveredOutcome(info)) return false;
         this.phase.value = EspProvisioningPhaseEnum.READY;
@@ -228,6 +242,125 @@ export class EspProvisioningController {
     }
     this.fail(lastError!!, ProvisionRetryActionEnum.RECONNECT);
     return false;
+  }
+
+  /**
+   * 扫码直连的准备流程：用 QR 凭据配置安全参数，按 QR name 直连设备，
+   * 后续校验 capabilities / 读 device-info 与 selectAndPrepare 一致。成功 phase=READY。
+   */
+  async selectAndPrepareFromQr(): Promise<boolean> {
+    this.ensureActive();
+    const qr = getQrPayload();
+    if (qr == null) {
+      this.fail(new EspProvisioningError(
+        EspProvisioningErrorCodeEnum.SECURITY_AUTH_FAILED,
+        '缺少二维码凭据，无法直连',
+        'QR payload missing from session',
+        0,
+        false,
+      ), ProvisionRetryActionEnum.NONE);
+      return false;
+    }
+    this.configureSecurity(qr.security, qr.username, qr.proofOfPossession, qr.name);
+    this.error.value = null;
+    this.busy.value = true;
+
+    try {
+      if (!this.initialized) {
+        await this.client.initialize(this.config);
+        this.initialized = true;
+      }
+    } catch (e) {
+      this.fail(this.asEspError(e), ProvisionRetryActionEnum.RECONNECT);
+      return false;
+    }
+
+    let lastError = null as EspProvisioningError | null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.client.connectFromQr(qr);
+        const capabilities = await this.client.getCapabilities();
+        if (capabilities.securityVersion != 2) {
+          this.fail(new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SECURITY_MISMATCH,
+            '固件没有启用 Security 2',
+            `sec_ver=${capabilities.securityVersion}`,
+            0,
+            false,
+          ), ProvisionRetryActionEnum.NONE);
+          return false;
+        }
+        if (!capabilities.has(ESP_PROV_REQUIRED_CAPABILITY)) {
+          this.fail(new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SERVICE_MISMATCH,
+            '固件缺少 wifi_prov capability',
+            capabilities.capabilities.join(','),
+            0,
+            false,
+          ), ProvisionRetryActionEnum.NONE);
+          return false;
+        }
+        this.capabilities.value = capabilities;
+        this.phase.value = EspProvisioningPhaseEnum.ESTABLISHING_SESSION;
+        const info = await this.client.getDeviceInfo();
+        if (info.serialNumber == '') {
+          this.fail(new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SERVICE_MISMATCH,
+            'device-info 缺少 serialNumber',
+            '',
+            0,
+            false,
+          ), ProvisionRetryActionEnum.NONE);
+          return false;
+        }
+        // 冻结契约 §3：Security 2 后必须校验 device-info.serialNumber == QR username，
+        // 不一致禁止下发 Wi-Fi 凭据。
+        if (qr.username != '' && info.serialNumber != qr.username) {
+          this.fail(new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.DEVICE_ID_MISMATCH,
+            '设备身份不匹配，已停止配网',
+            'device-info.serialNumber != qr.username',
+            0,
+            false,
+          ), ProvisionRetryActionEnum.NONE);
+          return false;
+        }
+        this.deviceInfo.value = info;
+        if (this.applyRecoveredOutcome(info)) return false;
+        this.phase.value = EspProvisioningPhaseEnum.READY;
+        this.busy.value = false;
+        return true;
+      } catch (e) {
+        lastError = this.asEspError(e);
+        if (attempt < 2) await this.sleep(1000 * (attempt + 1));
+      }
+    }
+
+    if (lastError == null) {
+      lastError = new EspProvisioningError(
+        EspProvisioningErrorCodeEnum.CONNECT_FAILED,
+        'BLE 连接失败',
+      );
+    }
+    this.fail(lastError!!, ProvisionRetryActionEnum.RECONNECT);
+    return false;
+  }
+
+  /**
+   * 让设备扫描它附近的可用 AP。设备不支持 wifi_scan 能力时返回空数组（页面降级为手动输入）。
+   */
+  async scanDeviceNetworks(): Promise<EspWifiNetwork[]> {
+    this.ensureActive();
+    const caps = this.capabilities.value;
+    if (caps == null || !caps.has(ESP_PROV_OPTIONAL_SCAN_CAPABILITY)) {
+      return [] as EspWifiNetwork[];
+    }
+    try {
+      return await this.client.scanNetworks();
+    } catch (e) {
+      this.fail(this.asEspError(e), ProvisionRetryActionEnum.RECONNECT);
+      return [] as EspWifiNetwork[];
+    }
   }
 
   async provision(ssid: string, password: string): Promise<void> {
@@ -458,6 +591,8 @@ export class EspProvisioningController {
     if (code == EspProvisioningErrorCodeEnum.NETWORK_NOT_FOUND) return 'Mobile.Provision.Error.apNotFound';
     if (code == EspProvisioningErrorCodeEnum.STATUS_TIMEOUT) return 'Mobile.Provision.Error.timeout';
     if (code == EspProvisioningErrorCodeEnum.PROVISIONING_WINDOW_EXPIRED) return 'Mobile.Provision.Error.windowExpired';
+    if (code == EspProvisioningErrorCodeEnum.DEVICE_ID_MISMATCH) return 'Mobile.Provision.Error.deviceIdMismatch';
+    if (code == EspProvisioningErrorCodeEnum.BUSY) return 'Mobile.Provision.Error.busy';
     if (code == EspProvisioningErrorCodeEnum.SERVICE_MISMATCH) return 'Mobile.Provision.Error.firmwareMismatch';
     if (code == EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED) return 'Mobile.Provision.Error.writeFailed';
     return 'Mobile.Provision.Error.unknown';

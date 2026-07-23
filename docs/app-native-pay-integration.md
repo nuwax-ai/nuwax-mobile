@@ -40,6 +40,16 @@ interface AppNativePayBridge {
 | iOS | `WXLaunchMiniProgramReq`，并配置 Universal Links | 系统打开 `redirectUrl` |
 | HarmonyOS | `@tencent/wechat_open_sdk` 的拉起小程序能力 | 系统打开 `redirectUrl` |
 
+## Android 已实现
+
+- 移动应用 AppID：`wxbdaaa9ecab166aee`。
+- UTS 插件：`uni_modules/nuwax-android-native-pay`，在 `libs` 中携带 `wechat-sdk-android-6.8.34.aar`，供本地编译和云端打包使用。
+- 微信：注册 OpenSDK 后使用 `WXLaunchMiniProgram.Req` 拉起安心付小程序，不使用微信官方 App 支付 `PayReq`。
+- 支付宝：使用 Android `ACTION_VIEW` Intent 打开服务端返回的收银台 URL。
+- `App.uvue` 启动时注册 Android `AppNativePayBridge`；支付完成后沿用服务端结算状态轮询。
+
+插件包含 Android 三方依赖，必须使用自定义基座或云端打包进行编译、安装和真机验证；标准基座不携带微信 OpenSDK。
+
 三端都需要在微信开放平台登记“移动应用”。这里所需的移动应用 AppID 不是支付小程序 AppID `wx98a5c8f239de55f8`。
 
 ## 待提供的打包配置
@@ -58,8 +68,9 @@ interface AppNativePayBridge {
 - [ ] 创建并解析 `link.nuwax.com`，确认公网 HTTPS 可访问。
 - [ ] 部署 `https://link.nuwax.com/.well-known/apple-app-site-association`，确认直接返回 HTTP 200 且没有重定向。
 - [ ] 确认 AASA 使用真实的 Apple Team ID 和 iOS Bundle ID，并覆盖 `/wechat/*`。
-- [ ] 在微信开放平台创建或确认 `Nuwax AI` 移动应用，取得真实的 `wx...` AppID。
+- [x] 配置 Android 微信开放平台移动应用 AppID：`wxbdaaa9ecab166aee`。
 - [ ] 确认 Android 包名与签名、iOS Bundle ID 与 Universal Links、HarmonyOS bundleName 均已登记并审核通过。
 - [ ] 将真实 AppID 和 Universal Links 写入私有打包配置及 `manifest.json`。
-- [ ] 实现并注册 Android、iOS、HarmonyOS 的 `AppNativePayBridge`。
+- [x] 实现并注册 Android `AppNativePayBridge`。
+- [ ] 实现并注册 iOS、HarmonyOS 的 `AppNativePayBridge`。
 - [ ] 使用三端真机分别验证微信支付、支付宝支付、取消支付和支付完成后的结算轮询。

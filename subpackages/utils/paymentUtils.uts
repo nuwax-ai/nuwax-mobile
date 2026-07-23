@@ -1,9 +1,5 @@
 import { Ref } from "vue";
 import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
-import {
-  PayStatus,
-  OrderStatus,
-} from "@/subpackages/types/interfaces/subscription";
 import type { WxPayParams } from "@/subpackages/types/interfaces/subscription";
 import {
   apiGetSettlementStatus,
@@ -17,13 +13,14 @@ import {
   PayMode,
   PayChannel,
 } from "@/subpackages/types/interfaces/subscription";
-import type {
-  AppNativePayRequest,
-  AppNativePayResult,
-  GetSettlementStatusRequest,
-  SettlementStatusInfo,
-} from "@/subpackages/types/interfaces/subscription";
 import { orEmpty, orString } from "@/utils/utsCoalesce.uts";
+
+// #ifdef APP-ANDROID
+import {
+  launchAnxinfuMiniProgramNative,
+  openPayUrlNative,
+} from "@/uni_modules/nuwax-android-native-pay";
+// #endif
 
 const ANXINFU_MINIPROGRAM_USER_NAME = "gh_cd6acad9a40d";
 const ANXINFU_MINIPROGRAM_PATH = "ipay/main";
@@ -41,10 +38,20 @@ export function parseAnxinfuMiniProgramParam(redirectUrl: string | null): string
   }
   const valueStart = queryIndex + marker.length;
   const ampIndex = redirectUrl.indexOf("&", valueStart);
-  if (ampIndex < 0) {
-    return redirectUrl.substring(valueStart);
+  const encodedParam = ampIndex < 0
+    ? redirectUrl.substring(valueStart)
+    : redirectUrl.substring(valueStart, ampIndex);
+  if (encodedParam.length == 0) {
+    return "";
   }
-  return redirectUrl.substring(valueStart, ampIndex);
+  try {
+    // 网关 URL 可能将 Base64 末尾的 = 编成 %3D；还原后直接传给小程序，禁止再次编码。
+    const decodedParam = decodeURIComponent(encodedParam);
+    return decodedParam ?? encodedParam;
+  } catch (_error) {
+    // 保留原始值，由支付端返回明确的参数错误，避免解析失败导致无法调起。
+    return encodedParam;
+  }
 }
 
 // ========== APP 原生支付桥 ===========
@@ -80,22 +87,38 @@ export function launchAnxinfuMiniProgram(redirectUrl: string): Promise<any> {
     miniprogramType: 0,
   } as UTSJSONObject;
 
+  // #ifdef APP-ANDROID
+  // 分包可能加载独立的 UTS 模块实例，Android 直接调用原生插件，避免依赖跨分包的桥注册状态。
+  return launchAnxinfuMiniProgramNative(
+    options.getString("userName") ?? "",
+    options.getString("path") ?? "",
+  );
+  // #endif
+
+  // #ifndef APP-ANDROID
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native wx.miniapp bridge is unavailable"));
     });
   }
   return appNativePayBridge!.launchAnxinfuMiniProgram(options);
+  // #endif
 }
 
 /** 支付宝 redirectUrl 交由宿主打开，避免在业务层绑定平台 SDK。 */
 export function openAppPayUrl(url: string): Promise<any> {
+  // #ifdef APP-ANDROID
+  return openPayUrlNative(url);
+  // #endif
+
+  // #ifndef APP-ANDROID
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native pay url bridge is unavailable"));
     });
   }
   return appNativePayBridge!.openPayUrl(url);
+  // #endif
 }
 
 // #endif
@@ -947,19 +970,20 @@ export async function executeAppNativePayFlow(
     try {
       const requestData = new UTSJSONObject();
       requestData["orderId"] = orderId as any;
-      requestData["payChannel"] = payChannel as any;
-      const payRes = await apiPayAppNative(
-        requestData as AppNativePayRequest,
-      );
-      if (payRes.code != SUCCESS_CODE || payRes.data == null) {
+      requestData["payChannel"] = payChannel.value as any;
+      console.log('start:',requestData)
+      const payRes = await apiPayAppNative(requestData);
+      console.log('end:',payRes)
+      const payData = payRes["data"] as UTSJSONObject | null;
+      if (payRes["code"] != SUCCESS_CODE || payData == null) {
         throw new Error(orString(
-          payRes.message,
+          payRes["message"],
           t("Mobile.MySubscriptions.payParamsFailed"),
         ));
       }
 
-      const payData = payRes.data! as AppNativePayResult;
-      const redirectUrl = payData.redirectUrl;
+      const redirectUrlRaw = payData["redirectUrl"];
+      const redirectUrl = redirectUrlRaw != null ? `${redirectUrlRaw}` : null;
       uni.setStorageSync(ACTIVE_APP_PAY_ORDER_ID, `${orderId}`);
       uni.hideLoading();
 
@@ -1176,19 +1200,21 @@ export async function pollPayResult(orderId: number): Promise<string> {
     try {
       const requestData = new UTSJSONObject();
       requestData["orderId"] = orderId as any;
-      const res = await apiGetSettlementStatus(
-        requestData as GetSettlementStatusRequest,
-      );
-      if (res.code === SUCCESS_CODE && res.data != null) {
-        const data = res.data! as SettlementStatusInfo;
+      const res = await apiGetSettlementStatus(requestData);
+      const data = res["data"] as UTSJSONObject | null;
+      if (res["code"] === SUCCESS_CODE && data != null) {
+        const settled = data["settled"] === true;
+        const orderStatus = data["orderStatus"] != null ? `${data["orderStatus"]}` : "";
+        const payStatus = data["payStatus"] != null ? `${data["payStatus"]}` : "";
+        const terminalFailed = data["terminalFailed"] === true;
         if (
-          data.settled ||
-          data.orderStatus === OrderStatus.PAID ||
-          data.payStatus === PayStatus.SUCCESS
+          settled ||
+          orderStatus === "PAID" ||
+          payStatus === "SUCCESS"
         ) {
           return "success";
         }
-        if (data.terminalFailed || data.orderStatus === OrderStatus.CANCELLED) {
+        if (terminalFailed || orderStatus === "CANCELLED") {
           return "failed";
         }
       }

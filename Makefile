@@ -1,6 +1,6 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
-# 详见 docs/local-custom-base-maintenance.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-harmony
+# 详见 docs/local-custom-base-maintenance.md · docs/custom-base-distribution-s3.md
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-harmony base-publish base-fetch
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -11,6 +11,10 @@ help:
 	@echo "  make base-ios-simulator   # Pandora_simulator_debug.app（模拟器）"
 	@echo "  make base-all             # 上述三份"
 	@echo "  make base-env             # 打印路径"
+	@echo ""
+	@echo "S3 分发（版本 = manifest versionName；同版本覆盖；fetch 默认最新）"
+	@echo "  make base-publish         # 上传当前 unpackage/debug 产物"
+	@echo "  make base-fetch           # 拉取最新基座（不指定版本）"
 	@echo ""
 	@echo "真机与模拟器是两套包，勿混用。"
 
@@ -35,3 +39,9 @@ base-ios: base-ios-device
 base-harmony:
 	@echo "鸿蒙本地基座尚未实现。见 scripts/harmony-esp/README.md"
 	@exit 1
+
+base-publish:
+	@bash "$(ROOT)scripts/publish-custom-base-s3.sh"
+
+base-fetch:
+	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh"

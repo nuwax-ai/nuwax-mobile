@@ -23,6 +23,7 @@ PINNED_VERSION="${NUWAX_BASE_VERSION:-}"
 INSECURE="${NUWAX_S3_INSECURE:-0}"
 TARGETS="android,ios-device,ios-simulator,harmony"
 DEST_DIR=""
+VERSION=""
 
 usage() {
   cat <<'EOF'
@@ -109,20 +110,21 @@ trap 'rm -rf "$TMP"' EXIT
 
 if [[ -n "$PINNED_VERSION" ]]; then
   VERSION="${PINNED_VERSION#v}"
-  ok "指定版本: $VERSION"
+  ok "指定版本: ${VERSION}"
 else
-  info "未指定版本，解析最新 channel '$CHANNEL' ..."
+  info "未指定版本，解析最新 channel '${CHANNEL}' ..."
   fetch "$base/channels/$CHANNEL.json" "$TMP/channel.json" || fail "无法读取 channel: $base/channels/$CHANNEL.json（是否已发布过？）"
   if command -v node >/dev/null 2>&1; then
     VERSION="$(node -p "require('$TMP/channel.json').version" 2>/dev/null || true)"
   else
     VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/channel.json" | head -1)"
   fi
-  [[ -n "$VERSION" ]] || fail "channel 无 version 字段"
-  ok "最新 → $VERSION（与 App versionName 对齐）"
+  [[ -n "${VERSION}" ]] || fail "channel 无 version 字段"
+  # 必须用 ${VERSION}：紧跟全角「（」时，$VERSION（ 会被当成未定义变量名（set -u 直接挂）
+  ok "最新 → ${VERSION}（与 App versionName 对齐）"
 fi
 
-ART_BASE="$base/versions/$VERSION/artifacts"
+ART_BASE="$base/versions/${VERSION}/artifacts"
 info "拉取 manifest ..."
 if fetch "$ART_BASE/manifest.json" "$TMP/manifest.json"; then
   cp "$TMP/manifest.json" "$DEST_DIR/manifest.json"
@@ -132,13 +134,16 @@ else
 fi
 
 download_one() {
-  local name="$1" url="$ART_BASE/$name" out="$DEST_DIR/$name"
-  info "下载 $name ..."
+  # 勿写成 local name="$1" url="...$name"：同语句内 $name 仍指向外层（set -u 会挂）
+  local name="$1"
+  local url="${ART_BASE}/${name}"
+  local out="${DEST_DIR}/${name}"
+  info "下载 ${name} ..."
   if fetch "$url" "$out"; then
-    ok "$name → $out"
+    ok "${name} → ${out}"
     return 0
   fi
-  warn "跳过 $name（该版本可能未发布）"
+  warn "跳过 ${name}（该版本可能未发布）"
   rm -f "$out"
   return 1
 }
@@ -167,7 +172,7 @@ if want_target harmony; then
 fi
 
 echo
-ok "完成 → $DEST_DIR (version=$VERSION)"
+ok "完成 → ${DEST_DIR} (version=${VERSION})"
 echo "HX：运行 → 使用自定义基座运行 → 选择对应 apk / ipa / simulator .app"
 echo "同步更新：再执行一次本脚本（不指定版本）即可覆盖本地文件。"
 echo "说明：真机与模拟器勿混用；iOS 真机包受证书/设备列表限制。"

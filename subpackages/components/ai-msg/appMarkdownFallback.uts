@@ -13,6 +13,11 @@ function normalizeInlineMath(markdown: string): string {
   const output = [] as string[];
   for (let lineIndex = 0; lineIndex < sourceLines.length; lineIndex++) {
     const line = sourceLines[lineIndex];
+    // 保留 Markdown 空行，否则段落、工具占位符等块级元素会被错误合并。
+    if (line.length == 0) {
+      output.push("");
+      continue;
+    }
     if (line.indexOf("$$") >= 0) {
       output.push(line);
       continue;
@@ -53,20 +58,44 @@ function makeTextToken(text: string, className: string = "text"): MarkdownToken 
   };
 }
 
+/** 查找下一个合法 Markdown 链接起点。 */
+function findInlineLinkStart(text: string, start: number): number {
+  let bracketStart = text.indexOf("[", start);
+  while (bracketStart >= 0) {
+    const labelEnd = text.indexOf("](", bracketStart + 1);
+    if (labelEnd >= 0) {
+      const hrefEnd = text.indexOf(")", labelEnd + 2);
+      if (hrefEnd >= 0) {
+        return bracketStart;
+      }
+    }
+    bracketStart = text.indexOf("[", bracketStart + 1);
+  }
+  return -1;
+}
+
 function parseInline(text: string): MarkdownToken[] {
   const result = [] as MarkdownToken[];
   let cursor = 0;
   while (cursor < text.length) {
     const strongStart = text.indexOf("**", cursor);
     const codeStart = text.indexOf("`", cursor);
+    const linkStart = findInlineLinkStart(text, cursor);
     let nextStart = -1;
     let marker = "";
-    if (strongStart >= 0 && (codeStart < 0 || strongStart <= codeStart)) {
+    if (
+      strongStart >= 0 &&
+      (codeStart < 0 || strongStart <= codeStart) &&
+      (linkStart < 0 || strongStart <= linkStart)
+    ) {
       nextStart = strongStart;
       marker = "**";
-    } else if (codeStart >= 0) {
+    } else if (codeStart >= 0 && (linkStart < 0 || codeStart <= linkStart)) {
       nextStart = codeStart;
       marker = "`";
+    } else if (linkStart >= 0) {
+      nextStart = linkStart;
+      marker = "[";
     }
     if (nextStart < 0) {
       result.push(makeTextToken(text.substring(cursor)));
@@ -74,6 +103,23 @@ function parseInline(text: string): MarkdownToken[] {
     }
     if (nextStart > cursor) {
       result.push(makeTextToken(text.substring(cursor, nextStart)));
+    }
+    if (marker == "[") {
+      const labelEnd = text.indexOf("](", nextStart + 1);
+      const hrefEnd =
+        labelEnd >= 0 ? text.indexOf(")", labelEnd + 2) : -1;
+      if (labelEnd < 0 || hrefEnd < 0) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      result.push({
+        type: "link",
+        text: text.substring(nextStart + 1, labelEnd),
+        href: text.substring(labelEnd + 2, hrefEnd),
+        className: "link",
+      });
+      cursor = hrefEnd + 1;
+      continue;
     }
     const contentStart = nextStart + marker.length;
     const end = text.indexOf(marker, contentStart);
@@ -94,6 +140,46 @@ function parseInline(text: string): MarkdownToken[] {
   return result;
 }
 
+/** 是否为无序或有序列表行。 */
+function isFallbackListLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (/^[-+*]\s+/.test(trimmed)) {
+    return true;
+  }
+  return /^\d+[.)]\s+/.test(trimmed);
+}
+
+/** 提取列表标记后的正文。 */
+function fallbackListContent(line: string): string {
+  const trimmed = line.trim();
+  if (/^[-+*]\s+/.test(trimmed)) {
+    return trimmed.substring(1).trim();
+  }
+  const orderedMatch = trimmed.match(/^(\d+)[.)]\s+/);
+  if (
+    orderedMatch != null &&
+    orderedMatch.length > 0 &&
+    orderedMatch[0] != null
+  ) {
+    return trimmed.substring(orderedMatch[0]!.length).trim();
+  }
+  return trimmed;
+}
+
+/** 获取列表显示前缀。 */
+function fallbackListPrefix(line: string): string {
+  const trimmed = line.trim();
+  const orderedMatch = trimmed.match(/^(\d+)[.)]\s+/);
+  if (
+    orderedMatch != null &&
+    orderedMatch.length > 1 &&
+    orderedMatch[1] != null
+  ) {
+    return orderedMatch[1]! + ". ";
+  }
+  return "• ";
+}
+
 function splitTableRow(line: string): string[] {
   let normalized = line.trim();
   if (normalized.startsWith("|")) {
@@ -112,7 +198,8 @@ function isTableSeparator(line: string): boolean {
   }
   for (let i = 0; i < cells.length; i++) {
     const cell = cells[i].replace(/:/g, "").trim();
-    if (cell.length < 3 || cell.replace(/-/g, "").length > 0) {
+    // 兼容模型输出的 :--:；渲染层仍会过滤该分隔行。
+    if (cell.length == 0 || cell.replace(/-/g, "").length > 0) {
       return false;
     }
   }
@@ -187,6 +274,181 @@ function makeItem(
   };
 }
 
+/** 读取 markdown-custom-process 标签属性。 */
+function extractCustomProcessAttribute(
+  attributes: string,
+  name: string,
+): string {
+  let regex = new RegExp(`${name}="([^"]*)"`, "i");
+  let match = attributes.match(regex);
+  if (match != null && match.length > 1) {
+    const value = match[1];
+    return value != null ? value.replace(/&quot;/g, '"') : "";
+  }
+  regex = new RegExp(`${name}='([^']*)'`, "i");
+  match = attributes.match(regex);
+  if (match != null && match.length > 1) {
+    const value = match[1];
+    return value != null ? value.replace(/&quot;/g, '"') : "";
+  }
+  return "";
+}
+
+/** 解析一个或多个工具调用标签。 */
+function parseCustomProcessTags(source: string): any[] {
+  const result: any[] = [];
+  const regex =
+    /<markdown-custom-process(?!-group)\b([^>]*)>(?:<\/markdown-custom-process>)?|<markdown-custom-process(?!-group)\b([^>]*?)\/>/gi;
+  let match = regex.exec(source);
+  while (match != null) {
+    const firstAttrs = match.length > 1 ? match[1] : null;
+    const secondAttrs = match.length > 2 ? match[2] : null;
+    const attributes =
+      firstAttrs != null && firstAttrs.length > 0
+        ? firstAttrs
+        : secondAttrs != null
+          ? secondAttrs
+          : "";
+    const item = new UTSJSONObject();
+    let executeId = extractCustomProcessAttribute(attributes, "executeId");
+    if (executeId.length == 0) {
+      executeId = extractCustomProcessAttribute(attributes, "executeid");
+    }
+    item["executeId"] = executeId;
+    item["type"] = extractCustomProcessAttribute(attributes, "type");
+    item["status"] = extractCustomProcessAttribute(attributes, "status");
+    item["name"] = extractCustomProcessAttribute(attributes, "name");
+    result.push(item);
+    match = regex.exec(source);
+  }
+  return result;
+}
+
+/** 创建工具调用 Markdown 元素。 */
+function makeCustomProcessItem(
+  type: string,
+  index: number,
+  processList: any[],
+): UniAiMarkdownElItem {
+  return {
+    uniqueId: "fallback-" + type + "-" + index,
+    type,
+    datasList: [] as MarkdownToken[][],
+    customProcessList: processList,
+  };
+}
+
+function makeTaskResultItem(
+  index: number,
+  taskResultData: UTSJSONObject,
+): UniAiMarkdownElItem {
+  return {
+    uniqueId: "fallback-task-result-" + index,
+    type: "task_result",
+    datasList: [] as MarkdownToken[][],
+    taskResultData,
+  };
+}
+
+/** 解析 task-result 的描述与文件。 */
+function parseFallbackTaskResultData(source: string): UTSJSONObject | null {
+  const taskMatch = source.match(
+    /<task-result\b[^>]*>([\s\S]*?)<\/task-result>/i,
+  );
+  if (taskMatch == null || taskMatch.length < 2 || taskMatch[1] == null) {
+    return null;
+  }
+  const content = taskMatch[1]!;
+  const descriptionMatch = content.match(
+    /<description\b[^>]*>([\s\S]*?)<\/description>/i,
+  );
+  const fileMatch = content.match(
+    /<file\b[^>]*>([\s\S]*?)<\/file>/i,
+  );
+  const data = new UTSJSONObject();
+  data["description"] =
+    descriptionMatch != null &&
+    descriptionMatch.length > 1 &&
+    descriptionMatch[1] != null
+      ? descriptionMatch[1]!.trim()
+      : "";
+  data["file"] =
+    fileMatch != null && fileMatch.length > 1 && fileMatch[1] != null
+      ? fileMatch[1]!.trim()
+      : "";
+  return data;
+}
+
+class CustomProcessBlock {
+  type: string = "markdown_custom_process";
+  processList: any[] = [];
+  taskResultData: UTSJSONObject | null = null;
+}
+
+class CustomProcessSegment {
+  markdown: string = "";
+  block: CustomProcessBlock | null = null;
+}
+
+class CustomProcessExtraction {
+  segments: CustomProcessSegment[] = [];
+  hasCustomBlock: boolean = false;
+}
+
+/**
+ * 将正文结构化拆分为 Markdown 片段与工具片段。
+ * 不向原文注入任何占位字符串。
+ */
+function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
+  const extraction = new CustomProcessExtraction();
+  const regex =
+    /<markdown-custom-process-group>[\s\S]*?<\/markdown-custom-process-group>|<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?|<task-result\b[^>]*>[\s\S]*?<\/task-result>/gi;
+  let cursor = 0;
+  let match = regex.exec(markdown);
+  while (match != null) {
+    const fullMatch = match[0] != null ? match[0]! : "";
+    const markdownBefore = markdown.substring(cursor, match.index);
+    if (markdownBefore.length > 0) {
+      const markdownSegment = new CustomProcessSegment();
+      markdownSegment.markdown = markdownBefore;
+      extraction.segments.push(markdownSegment);
+    }
+    const taskResultData = parseFallbackTaskResultData(fullMatch);
+    const processList = parseCustomProcessTags(fullMatch);
+    if (taskResultData != null || processList.length > 0) {
+      const block = new CustomProcessBlock();
+      if (taskResultData != null) {
+        block.type = "task_result";
+        block.taskResultData = taskResultData;
+      } else {
+        block.type =
+          fullMatch.indexOf("<markdown-custom-process-group>") >= 0 ||
+          processList.length > 1
+            ? "markdown_custom_process_group"
+            : "markdown_custom_process";
+      }
+      block.processList = processList;
+      const processSegment = new CustomProcessSegment();
+      processSegment.block = block;
+      extraction.segments.push(processSegment);
+      extraction.hasCustomBlock = true;
+    } else {
+      const fallbackSegment = new CustomProcessSegment();
+      fallbackSegment.markdown = fullMatch;
+      extraction.segments.push(fallbackSegment);
+    }
+    cursor = regex.lastIndex;
+    match = regex.exec(markdown);
+  }
+  const markdownAfter = markdown.substring(cursor);
+  if (markdownAfter.length > 0) {
+    const tailSegment = new CustomProcessSegment();
+    tailSegment.markdown = markdownAfter;
+    extraction.segments.push(tailSegment);
+  }
+  return extraction;
+}
+
 function renderMathToken(
   latex: string,
   token: MarkdownToken,
@@ -239,6 +501,59 @@ export function parseAppMarkdownFallback(
   markdown: string,
   onMathRendered: MathRenderedCallback,
 ): UniAiMarkdownElItem[] {
+  const customExtraction = extractCustomProcessBlocks(markdown);
+  if (customExtraction.hasCustomBlock) {
+    const segmentedResult = [] as UniAiMarkdownElItem[];
+    let segmentedItemIndex = 0;
+    for (
+      let segmentIndex = 0;
+      segmentIndex < customExtraction.segments.length;
+      segmentIndex++
+    ) {
+      const segment = customExtraction.segments[segmentIndex];
+      const block = segment.block;
+      if (block != null) {
+        if (block.type == "task_result" && block.taskResultData != null) {
+          segmentedResult.push(
+            makeTaskResultItem(
+              segmentedItemIndex++,
+              block.taskResultData!,
+            ),
+          );
+        } else {
+          segmentedResult.push(
+            makeCustomProcessItem(
+              block.type,
+              segmentedItemIndex++,
+              block.processList,
+            ),
+          );
+        }
+        continue;
+      }
+      if (segment.markdown.trim().length == 0) {
+        continue;
+      }
+      const markdownItems = parseAppMarkdownFallback(
+        segment.markdown,
+        onMathRendered,
+      );
+      for (let itemIndex = 0; itemIndex < markdownItems.length; itemIndex++) {
+        const item = markdownItems[itemIndex];
+        item.uniqueId =
+          "fallback-segment-" +
+          segmentIndex +
+          "-" +
+          itemIndex +
+          "-" +
+          item.uniqueId;
+        segmentedResult.push(item);
+        segmentedItemIndex++;
+      }
+    }
+    return segmentedResult;
+  }
+
   const result = [] as UniAiMarkdownElItem[];
   const lines = normalizeInlineMath(markdown).split("\n");
   let index = 0;
@@ -249,6 +564,45 @@ export function parseAppMarkdownFallback(
     const trimmed = line.trim();
 
     if (trimmed.length == 0) {
+      index++;
+      continue;
+    }
+
+    if (trimmed.startsWith("<markdown-custom-process-group")) {
+      const groupLines = [] as string[];
+      index++;
+      while (
+        index < lines.length &&
+        !lines[index].trim().startsWith("</markdown-custom-process-group")
+      ) {
+        groupLines.push(lines[index]);
+        index++;
+      }
+      if (index < lines.length) index++;
+      const processList = parseCustomProcessTags(groupLines.join("\n"));
+      if (processList.length > 0) {
+        result.push(
+          makeCustomProcessItem(
+            "markdown_custom_process_group",
+            itemIndex++,
+            processList,
+          ),
+        );
+      }
+      continue;
+    }
+
+    if (trimmed.startsWith("<markdown-custom-process")) {
+      const processList = parseCustomProcessTags(trimmed);
+      if (processList.length > 0) {
+        result.push(
+          makeCustomProcessItem(
+            "markdown_custom_process",
+            itemIndex++,
+            processList,
+          ),
+        );
+      }
       index++;
       continue;
     }
@@ -425,6 +779,31 @@ export function parseAppMarkdownFallback(
       continue;
     }
 
+    if (isFallbackListLine(line)) {
+      const listRows = [] as MarkdownToken[][];
+      while (index < lines.length && isFallbackListLine(lines[index])) {
+        const listLine = lines[index];
+        const rowTokens = [] as MarkdownToken[];
+        rowTokens.push(
+          makeTextToken(
+            fallbackListPrefix(listLine),
+            "list-item-index list-item-index-unordered",
+          ),
+        );
+        const inlineTokens = parseInline(fallbackListContent(listLine));
+        for (let li = 0; li < inlineTokens.length; li++) {
+          rowTokens.push(inlineTokens[li]);
+        }
+        listRows.push(rowTokens);
+        index++;
+      }
+      for (let rowIndex = 0; rowIndex < listRows.length - 1; rowIndex++) {
+        listRows[rowIndex].push(makeTextToken("\n", "linebreak"));
+      }
+      result.push(makeItem("list", itemIndex++, listRows));
+      continue;
+    }
+
     const paragraphLines = [] as string[];
     paragraphLines.push(line);
     index++;
@@ -435,6 +814,7 @@ export function parseAppMarkdownFallback(
         next == "$$" ||
         next == "\\[" ||
         next == "---" ||
+        isFallbackListLine(lines[index]) ||
         (next.indexOf("|") >= 0 &&
           findTableSeparatorIndex(lines, index) >= 0)
       ) {

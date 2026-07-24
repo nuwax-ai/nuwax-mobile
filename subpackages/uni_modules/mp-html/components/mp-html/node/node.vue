@@ -266,13 +266,13 @@
       </view>
       <markdown-container
         v-else-if="n.name == 'container'"
-        :data="getRenderData(n.attrs.data)"
+        :tool-call-data="getRenderData(n.attrs.data)"
         data-source="markdown-container"
       />
       <!-- markdown-custom-process 工具调用组件 -->
       <markdown-container
         v-else-if="n.name == 'markdown-custom-process'"
-        :data="getRenderData(n.attrs)"
+        :tool-call-data="getRenderData(n.attrs)"
         data-source="markdown-container"
       />
       <markdown-container-group

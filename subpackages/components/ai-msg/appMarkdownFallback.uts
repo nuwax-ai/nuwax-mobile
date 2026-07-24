@@ -58,20 +58,44 @@ function makeTextToken(text: string, className: string = "text"): MarkdownToken 
   };
 }
 
+/** 查找下一个合法 Markdown 链接起点。 */
+function findInlineLinkStart(text: string, start: number): number {
+  let bracketStart = text.indexOf("[", start);
+  while (bracketStart >= 0) {
+    const labelEnd = text.indexOf("](", bracketStart + 1);
+    if (labelEnd >= 0) {
+      const hrefEnd = text.indexOf(")", labelEnd + 2);
+      if (hrefEnd >= 0) {
+        return bracketStart;
+      }
+    }
+    bracketStart = text.indexOf("[", bracketStart + 1);
+  }
+  return -1;
+}
+
 function parseInline(text: string): MarkdownToken[] {
   const result = [] as MarkdownToken[];
   let cursor = 0;
   while (cursor < text.length) {
     const strongStart = text.indexOf("**", cursor);
     const codeStart = text.indexOf("`", cursor);
+    const linkStart = findInlineLinkStart(text, cursor);
     let nextStart = -1;
     let marker = "";
-    if (strongStart >= 0 && (codeStart < 0 || strongStart <= codeStart)) {
+    if (
+      strongStart >= 0 &&
+      (codeStart < 0 || strongStart <= codeStart) &&
+      (linkStart < 0 || strongStart <= linkStart)
+    ) {
       nextStart = strongStart;
       marker = "**";
-    } else if (codeStart >= 0) {
+    } else if (codeStart >= 0 && (linkStart < 0 || codeStart <= linkStart)) {
       nextStart = codeStart;
       marker = "`";
+    } else if (linkStart >= 0) {
+      nextStart = linkStart;
+      marker = "[";
     }
     if (nextStart < 0) {
       result.push(makeTextToken(text.substring(cursor)));
@@ -79,6 +103,23 @@ function parseInline(text: string): MarkdownToken[] {
     }
     if (nextStart > cursor) {
       result.push(makeTextToken(text.substring(cursor, nextStart)));
+    }
+    if (marker == "[") {
+      const labelEnd = text.indexOf("](", nextStart + 1);
+      const hrefEnd =
+        labelEnd >= 0 ? text.indexOf(")", labelEnd + 2) : -1;
+      if (labelEnd < 0 || hrefEnd < 0) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      result.push({
+        type: "link",
+        text: text.substring(nextStart + 1, labelEnd),
+        href: text.substring(labelEnd + 2, hrefEnd),
+        className: "link",
+      });
+      cursor = hrefEnd + 1;
+      continue;
     }
     const contentStart = nextStart + marker.length;
     const end = text.indexOf(marker, contentStart);
@@ -97,6 +138,46 @@ function parseInline(text: string): MarkdownToken[] {
     result.push(makeTextToken(text.length > 0 ? text : " "));
   }
   return result;
+}
+
+/** 是否为无序或有序列表行。 */
+function isFallbackListLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (/^[-+*]\s+/.test(trimmed)) {
+    return true;
+  }
+  return /^\d+[.)]\s+/.test(trimmed);
+}
+
+/** 提取列表标记后的正文。 */
+function fallbackListContent(line: string): string {
+  const trimmed = line.trim();
+  if (/^[-+*]\s+/.test(trimmed)) {
+    return trimmed.substring(1).trim();
+  }
+  const orderedMatch = trimmed.match(/^(\d+)[.)]\s+/);
+  if (
+    orderedMatch != null &&
+    orderedMatch.length > 0 &&
+    orderedMatch[0] != null
+  ) {
+    return trimmed.substring(orderedMatch[0]!.length).trim();
+  }
+  return trimmed;
+}
+
+/** 获取列表显示前缀。 */
+function fallbackListPrefix(line: string): string {
+  const trimmed = line.trim();
+  const orderedMatch = trimmed.match(/^(\d+)[.)]\s+/);
+  if (
+    orderedMatch != null &&
+    orderedMatch.length > 1 &&
+    orderedMatch[1] != null
+  ) {
+    return orderedMatch[1]! + ". ";
+  }
+  return "• ";
 }
 
 function splitTableRow(line: string): string[] {
@@ -257,9 +338,51 @@ function makeCustomProcessItem(
   };
 }
 
+function makeTaskResultItem(
+  index: number,
+  taskResultData: UTSJSONObject,
+): UniAiMarkdownElItem {
+  return {
+    uniqueId: "fallback-task-result-" + index,
+    type: "task_result",
+    datasList: [] as MarkdownToken[][],
+    taskResultData,
+  };
+}
+
+/** 解析 task-result 的描述与文件。 */
+function parseFallbackTaskResultData(source: string): UTSJSONObject | null {
+  const taskMatch = source.match(
+    /<task-result\b[^>]*>([\s\S]*?)<\/task-result>/i,
+  );
+  if (taskMatch == null || taskMatch.length < 2 || taskMatch[1] == null) {
+    return null;
+  }
+  const content = taskMatch[1]!;
+  const descriptionMatch = content.match(
+    /<description\b[^>]*>([\s\S]*?)<\/description>/i,
+  );
+  const fileMatch = content.match(
+    /<file\b[^>]*>([\s\S]*?)<\/file>/i,
+  );
+  const data = new UTSJSONObject();
+  data["description"] =
+    descriptionMatch != null &&
+    descriptionMatch.length > 1 &&
+    descriptionMatch[1] != null
+      ? descriptionMatch[1]!.trim()
+      : "";
+  data["file"] =
+    fileMatch != null && fileMatch.length > 1 && fileMatch[1] != null
+      ? fileMatch[1]!.trim()
+      : "";
+  return data;
+}
+
 class CustomProcessBlock {
   type: string = "markdown_custom_process";
   processList: any[] = [];
+  taskResultData: UTSJSONObject | null = null;
 }
 
 class CustomProcessSegment {
@@ -279,7 +402,7 @@ class CustomProcessExtraction {
 function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
   const extraction = new CustomProcessExtraction();
   const regex =
-    /<markdown-custom-process-group>[\s\S]*?<\/markdown-custom-process-group>|<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?/gi;
+    /<markdown-custom-process-group>[\s\S]*?<\/markdown-custom-process-group>|<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?|<task-result\b[^>]*>[\s\S]*?<\/task-result>/gi;
   let cursor = 0;
   let match = regex.exec(markdown);
   while (match != null) {
@@ -290,14 +413,20 @@ function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
       markdownSegment.markdown = markdownBefore;
       extraction.segments.push(markdownSegment);
     }
+    const taskResultData = parseFallbackTaskResultData(fullMatch);
     const processList = parseCustomProcessTags(fullMatch);
-    if (processList.length > 0) {
+    if (taskResultData != null || processList.length > 0) {
       const block = new CustomProcessBlock();
-      block.type =
-        fullMatch.indexOf("<markdown-custom-process-group>") >= 0 ||
-        processList.length > 1
-          ? "markdown_custom_process_group"
-          : "markdown_custom_process";
+      if (taskResultData != null) {
+        block.type = "task_result";
+        block.taskResultData = taskResultData;
+      } else {
+        block.type =
+          fullMatch.indexOf("<markdown-custom-process-group>") >= 0 ||
+          processList.length > 1
+            ? "markdown_custom_process_group"
+            : "markdown_custom_process";
+      }
       block.processList = processList;
       const processSegment = new CustomProcessSegment();
       processSegment.block = block;
@@ -384,13 +513,22 @@ export function parseAppMarkdownFallback(
       const segment = customExtraction.segments[segmentIndex];
       const block = segment.block;
       if (block != null) {
-        segmentedResult.push(
-          makeCustomProcessItem(
-            block.type,
-            segmentedItemIndex++,
-            block.processList,
-          ),
-        );
+        if (block.type == "task_result" && block.taskResultData != null) {
+          segmentedResult.push(
+            makeTaskResultItem(
+              segmentedItemIndex++,
+              block.taskResultData!,
+            ),
+          );
+        } else {
+          segmentedResult.push(
+            makeCustomProcessItem(
+              block.type,
+              segmentedItemIndex++,
+              block.processList,
+            ),
+          );
+        }
         continue;
       }
       if (segment.markdown.trim().length == 0) {
@@ -641,6 +779,31 @@ export function parseAppMarkdownFallback(
       continue;
     }
 
+    if (isFallbackListLine(line)) {
+      const listRows = [] as MarkdownToken[][];
+      while (index < lines.length && isFallbackListLine(lines[index])) {
+        const listLine = lines[index];
+        const rowTokens = [] as MarkdownToken[];
+        rowTokens.push(
+          makeTextToken(
+            fallbackListPrefix(listLine),
+            "list-item-index list-item-index-unordered",
+          ),
+        );
+        const inlineTokens = parseInline(fallbackListContent(listLine));
+        for (let li = 0; li < inlineTokens.length; li++) {
+          rowTokens.push(inlineTokens[li]);
+        }
+        listRows.push(rowTokens);
+        index++;
+      }
+      for (let rowIndex = 0; rowIndex < listRows.length - 1; rowIndex++) {
+        listRows[rowIndex].push(makeTextToken("\n", "linebreak"));
+      }
+      result.push(makeItem("list", itemIndex++, listRows));
+      continue;
+    }
+
     const paragraphLines = [] as string[];
     paragraphLines.push(line);
     index++;
@@ -651,6 +814,7 @@ export function parseAppMarkdownFallback(
         next == "$$" ||
         next == "\\[" ||
         next == "---" ||
+        isFallbackListLine(lines[index]) ||
         (next.indexOf("|") >= 0 &&
           findTableSeparatorIndex(lines, index) >= 0)
       ) {

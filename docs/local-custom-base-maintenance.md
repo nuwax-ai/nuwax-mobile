@@ -17,7 +17,7 @@
 | 业务仓 | `nuwax-mobile` | 源码真相 |
 | 官方 SDK | `$NUWAX_OFFLINE_SDK_HOME/sdk/{ios,android,harmony}/<ver>/` | 只读解压包，跟 HX 同版本 |
 | 工作副本 | `$NUWAX_OFFLINE_SDK_HOME/work/{ios,android,harmony}/` | 可删可重建；禁止当源码仓 |
-| 基座产物 | `nuwax-mobile/unpackage/debug/` | gitignore；本机/制品库分发 |
+| 基座产物 | `nuwax-mobile/unpackage/debug/` | gitignore（仅 README 入库）；**S3 分发**见 [custom-base-distribution-s3.md](./custom-base-distribution-s3.md) |
 
 ```text
 nuwax-mobile/                          # Git
@@ -68,6 +68,17 @@ make base-all              # 三份一起打（不装设备）
 | `Pandora_simulator_debug.app` | **iOS 模拟器**（官方命名；与真机包分离，勿混用） |
 
 一键脚本：`./scripts/package-custom-bases.sh`（`TARGETS=android,ios-device,ios-simulator`）。
+
+## 4. S3 分发（同事免打包）
+
+版本默认 = `manifest.json` 的 `versionName`；**同版本覆盖**；同事 **不指定版本 = 最新**（安装/同步更新）。
+
+```bash
+make base-publish    # 上传（需 NUWAX_S3_* 或 ~/.aws）
+make base-fetch      # 拉最新到 unpackage/debug/
+```
+
+详见 [custom-base-distribution-s3.md](./custom-base-distribution-s3.md)。仅用自定义基座的同事不需要 iOS 开发证书。
 
 ## 5. 升级清单（换 HX / SDK）
 

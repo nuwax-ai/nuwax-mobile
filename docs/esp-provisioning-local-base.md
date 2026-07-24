@@ -5,6 +5,7 @@
 | 平台 | 文档 | 脚本 |
 |------|------|------|
 | **维护规范** | [local-custom-base-maintenance.md](./local-custom-base-maintenance.md) | `scripts/local-base-env.sh` + 根目录 `Makefile` |
+| **S3 分发** | [custom-base-distribution-s3.md](./custom-base-distribution-s3.md) | `make base-publish` / `make base-fetch` |
 | iOS | [ios-esp-provisioning-local-base.md](./ios-esp-provisioning-local-base.md) | `scripts/ios-esp/` |
 | Android | [android-esp-provisioning-local-base.md](./android-esp-provisioning-local-base.md) | `scripts/android-esp/` |
 | 鸿蒙 | [harmony-esp-provisioning-local-base.md](./harmony-esp-provisioning-local-base.md) | `scripts/harmony-esp/`（预留） |
@@ -24,9 +25,11 @@ make base-android          # android_debug.apk
 make base-ios-device        # iOS_debug.ipa（真机）
 make base-ios-simulator    # Pandora_simulator_debug.app（模拟器，与真机分离）
 make base-all
+make base-publish          # 上传 S3（版本=versionName，同版本覆盖）
+make base-fetch            # 同事拉最新
 ```
 
-`unpackage/debug/` 中 **iOS 真机与模拟器是两套包**，勿混用。
+`unpackage/debug/` 中 **iOS 真机与模拟器是两套包**，勿混用。S3 说明见 [custom-base-distribution-s3.md](./custom-base-distribution-s3.md)。
 
 阅读顺序：本总览 → [维护规范](./local-custom-base-maintenance.md) → 对应平台方案文档 → 脚本 README。  
 业务契约见 [esp32s3-ble-first-integration-handoff.md](./esp32s3-ble-first-integration-handoff.md)。

@@ -93,10 +93,11 @@ $CLI logcat app-ios --project nuwax-mobile
 含原生插件联调时，从 S3 拉最新基座到 `unpackage/debug/`（**不指定版本 = 最新**）。详情：[docs/custom-base-distribution-s3.md](docs/custom-base-distribution-s3.md)。
 
 ```bash
-make base-fetch
+pnpm base:fetch
+# 或：make base-fetch
 # 或：curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh | bash
 # 自签证书：NUWAX_S3_INSECURE=1
-# 固定版本：NUWAX_BASE_VERSION=1.0.0 make base-fetch
+# 固定版本：NUWAX_BASE_VERSION=1.0.0 pnpm base:fetch
 ```
 
 HX：运行 → **使用自定义基座运行** → 选 `unpackage/debug/` 下 apk / ipa / 模拟器 `.app`（真机与模拟器勿混用）。仅同步使用**不需要**本机打基座，也不需要 iOS 开发证书。
@@ -107,8 +108,23 @@ HX：运行 → **使用自定义基座运行** → 选 `unpackage/debug/` 下 a
 pnpm i18n:audit            # i18n 文案审计
 pnpm i18n:export-defaults  # 导出平台默认文案
 pnpm verify:mcp-ask        # 校验 mcp-ask 契约
-./scripts/run-uni-build.sh # 编译 app-android 并提取关键错误
-make base-fetch            # 同步最新自定义基座（S3）
+pnpm uni:build             # 编译 app-android 并提取关键错误
+pnpm base:fetch            # 同步最新自定义基座（S3）
+pnpm base:publish          # 发布自定义基座到 S3（维护者）
+pnpm base:help             # 列出 make 基座相关目标
+
+# HBuilderX CLI（需本机已开 HX；项目名默认 nuwax-mobile；可用 HX_CLI / HX_PROJECT 覆盖）
+pnpm hx:devices            # 列出已连接设备
+pnpm hx:android            # 运行到 Android（标准基座，默认第一台）
+pnpm hx:android:custom     # 运行到 Android（自定义基座）
+pnpm hx:android:compile    # 只编译不安装
+pnpm hx:android:clean      # 清缓存后运行
+pnpm hx:android:log        # Android 应用日志
+pnpm hx:ios:devices        # iOS 真机列表
+pnpm hx:ios:simulators     # iOS 模拟器列表
+pnpm hx:ios:sim -- --deviceId <UDID>      # 跑模拟器（须指定 UDID）
+pnpm hx:ios:device -- --deviceId <序列号>  # 跑真机
+pnpm hx:ios:log            # iOS 应用日志
 ```
 
 ## 工程约定

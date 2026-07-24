@@ -48,10 +48,12 @@ final class EspSec2ConnectionDelegate: NSObject, ESPDeviceConnectionDelegate {
   }
 
   func getProofOfPossesion(forDevice _: ESPDevice, completionHandler: @escaping (String) -> Void) {
+    NSLog("[EspBridge] Sec2 delegate getProofOfPossesion")
     completionHandler(proofOfPossession)
   }
 
   func getUsername(forDevice _: ESPDevice, completionHandler: @escaping (String?) -> Void) {
+    NSLog("[EspBridge] Sec2 delegate getUsername")
     completionHandler(username)
   }
 }
@@ -158,6 +160,7 @@ public final class EspProvisioningBridge: NSObject {
     // 连接超时（预算需覆盖 createESPDevice 内部 ~5s 重扫 + Security 2 会话建立）
     let work = DispatchWorkItem { [weak self] in
       guard let self, let failCb = self.connectFail else { return }
+      NSLog("[EspBridge] connect TIMEOUT after \(timeoutMs.intValue)ms")
       self.connectSuccess = nil
       self.connectFail = nil
       failCb("CONNECT_FAILED", "BLE connection timed out")
@@ -166,23 +169,33 @@ public final class EspProvisioningBridge: NSObject {
     connectTimeoutWork = work
     workQueue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs.intValue), execute: work)
 
-    ESPProvisionManager.shared.createESPDevice(
-      deviceName: name,
-      transport: .ble,
-      security: .secure2,
-      proofOfPossession: proofOfPossession,
-      username: username
-    ) { [weak self] device, error in
-      guard let self else { return }
-      self.workQueue.async {
+    NSLog("[EspBridge] createESPDevice name=%@ user=%@", name, username)
+    // ESPProvision 是主线程/runloop 模型：ESPBleTransport 用 Timer.scheduledTimer 做 5s 扫描超时、
+    // CBCentralManager(queue: nil) 在主线程回调、ESPDevice.connect 的 Security 2 握手全程
+    // DispatchQueue.main.async。UTS 调 native 的线程无 runloop，若不在主线程发起，
+    // 扫描超时 Timer 永不 fire，completion 永不回调 → 上层永久卡在「正在连接」。故派发到主线程。
+    DispatchQueue.main.async {
+      ESPProvisionManager.shared.createESPDevice(
+        deviceName: name,
+        transport: .ble,
+        security: .secure2,
+        proofOfPossession: proofOfPossession,
+        username: username
+      ) { [weak self] device, error in
+        guard let self else { return }
         if let device {
+          NSLog("[EspBridge] createESPDevice OK, calling device.connect")
           self.espDevice = device
+          // device.connect 内部 Security 2 握手走 main.async，从主线程发起以确保 runloop 正常推进
           device.connect(delegate: self.sec2Delegate) { status in
             self.workQueue.async { self.handleConnectStatus(status) }
           }
         } else {
           let msg = (error?.description ?? "device create failed")
-          self.failPendingConnect("DEVICE_NOT_FOUND", self.safe(msg))
+          NSLog("[EspBridge] createESPDevice FAIL: %@", msg)
+          self.workQueue.async {
+            self.failPendingConnect("DEVICE_NOT_FOUND", self.safe(msg))
+          }
         }
       }
     }
@@ -191,16 +204,20 @@ public final class EspProvisioningBridge: NSObject {
   private func handleConnectStatus(_ status: ESPSessionStatus) {
     switch status {
     case .connected:
+      NSLog("[EspBridge] session CONNECTED")
       guard let success = connectSuccess else { return }
       clearConnectTimer()
       connectSuccess = nil
       connectFail = nil
       success("")
     case .failedToConnect(let error):
+      NSLog("[EspBridge] session FAILED: %@", error.description)
       failPendingConnect(mapSessionError(error), safe(error.description))
     case .disconnected:
+      NSLog("[EspBridge] session DISCONNECTED")
       failPendingConnect("DISCONNECTED", "BLE device disconnected")
     @unknown default:
+      NSLog("[EspBridge] session UNKNOWN status")
       failPendingConnect("CONNECT_FAILED", "BLE connection failed")
     }
   }

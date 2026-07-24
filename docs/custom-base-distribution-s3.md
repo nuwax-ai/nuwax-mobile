@@ -30,6 +30,11 @@ HX：**运行 → 使用自定义基座运行**。仅用基座的同事**不需�
 ### 维护者发布
 
 ```bash
+# 推荐一键：HX appResource → 出包 → 上传 S3（需 HX 已开、项目已导入）
+make base-ship
+# 或：pnpm base:ship
+
+# 分步（旧习惯仍可用）
 make base-all
 make base-publish    # 上传并更新 latest 指针
 ```

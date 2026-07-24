@@ -25,6 +25,11 @@ export default {
     childs: {
       type: Array,
       default: () => []
+    },
+    // uni-ai-x-msg 直接传入解析后的工具标签
+    items: {
+      type: Array,
+      default: () => []
     }
   },
   data() {
@@ -34,6 +39,14 @@ export default {
   },
   computed: {
     processCount() {
+      const items = this.items != null ? this.items : []
+      if (items.length > 0) {
+        return items.filter((item): boolean => {
+          const obj = item as UTSJSONObject
+          const typeVal = obj["type"]
+          return typeVal == null || `${typeVal}` != "Event"
+        }).length
+      }
       // 过滤掉可能的空白节点，支持原生 container 和 PC 端 HTML 标签名，同时排除隐藏的 Event 类型
       const childs = this.childs != null ? this.childs : []
       return childs.filter((n): boolean => {

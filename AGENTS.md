@@ -111,6 +111,7 @@ pnpm verify:mcp-ask        # 校验 mcp-ask 契约
 pnpm uni:build             # 编译 app-android 并提取关键错误
 pnpm base:fetch            # 同步最新自定义基座（S3）
 pnpm base:publish          # 发布自定义基座到 S3（维护者）
+pnpm base:ship             # 一键：appResource → 出包 → 上传 S3（维护者）
 pnpm base:help             # 列出 make 基座相关目标
 
 # HBuilderX CLI（需本机已开 HX；项目名默认 nuwax-mobile；可用 HX_CLI / HX_PROJECT 覆盖）

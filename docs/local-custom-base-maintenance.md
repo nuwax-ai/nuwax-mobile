@@ -49,16 +49,36 @@ nuwax-mobile-offline-sdk/              # 本机统一入口
 
 兼容旧名：`UNIAPPX_SDK_ROOT`、`IOS_ESP_BUILD_ROOT`、`ANDROID_ESP_WORK` 等仍可覆盖。
 
-## 3. 日常命令（仅出包）
+## 3. 日常命令
 
-先 HX「生成本地打包 App 资源」，再：
+### 3.1 维护者一键（推荐）
+
+`base-ship` = 生成本地打包 App 资源 → 打三端基座 → 上传 S3：
 
 ```bash
 cd /Users/apple/workspace/nuwax-mobile
+# 需先打开 HBuilderX，且项目已导入；发 S3 需 NUWAX_S3_* 或 ~/.aws
+make base-ship
+# 或：pnpm base:ship
+```
+
+| 开关 | 含义 |
+|------|------|
+| `SKIP_APP_RESOURCE=1` | 跳过 HX `publish app --type appResource`（资源已就绪时） |
+| `SKIP_PUBLISH=1` | 跳过 S3，只本地出包 |
+| `TARGETS=android` 等 | 只打部分平台（同 `package-custom-bases.sh`） |
+
+实现：[`scripts/ship-custom-bases.sh`](../scripts/ship-custom-bases.sh)。
+
+### 3.2 仅出包（不上传）
+
+先 HX「生成本地打包 App 资源」（或 CLI：`pnpm hx:…` / `scripts/hx-cli.sh publish app --type appResource`），再：
+
+```bash
 make base-android          # → unpackage/debug/android_debug.apk
 make base-ios-device        # → unpackage/debug/iOS_debug.ipa
 make base-ios-simulator    # → unpackage/debug/Pandora_simulator_debug.app
-make base-all              # 三份一起打（不装设备）
+make base-all              # 三份一起打（不装设备、不上 S3）
 ```
 
 | 文件 | 用途 |
@@ -67,14 +87,15 @@ make base-all              # 三份一起打（不装设备）
 | `iOS_debug.ipa` | **iOS 真机** HX 自定义基座 |
 | `Pandora_simulator_debug.app` | **iOS 模拟器**（官方命名；与真机包分离，勿混用） |
 
-一键脚本：`./scripts/package-custom-bases.sh`（`TARGETS=android,ios-device,ios-simulator`）。
+一键出包（不含资源/S3）：`./scripts/package-custom-bases.sh`（`TARGETS=android,ios-device,ios-simulator`）。
 
 ## 4. S3 分发（同事免打包）
 
 版本默认 = `manifest.json` 的 `versionName`；**同版本覆盖**；同事 **不指定版本 = 最新**（安装/同步更新）。
 
 ```bash
-make base-publish    # 上传（需 NUWAX_S3_* 或 ~/.aws）
+make base-ship       # 维护者：资源 + 出包 + 上传（推荐）
+make base-publish    # 仅上传当前 unpackage/debug（需 NUWAX_S3_* 或 ~/.aws）
 make base-fetch      # 拉最新到 unpackage/debug/
 ```
 

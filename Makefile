@@ -1,8 +1,9 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
 # 详见 docs/local-custom-base-maintenance.md · docs/custom-base-distribution-s3.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch app-resource
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
 
 help:
 	@echo "自定义基座 · 只生成包 → unpackage/debug/"
@@ -12,6 +13,7 @@ help:
 	@echo "  make base-all             # 上述三份（仅出包，不生成资源、不上 S3）"
 	@echo "  make base-ship            # 一键：appResource → 出包 → 上传 S3"
 	@echo "  make base-env             # 打印路径"
+	@echo "  make app-resource         # 生成本地打包App资源（HX CLI，iOS+Android，需 HX 已启动）"
 	@echo ""
 	@echo "S3 分发（版本 = manifest versionName；同版本覆盖；fetch 默认最新）"
 	@echo "  make base-publish         # 上传当前 unpackage/debug 产物"
@@ -61,3 +63,7 @@ sdk-publish:
 
 sdk-fetch:
 	@bash "$(ROOT)scripts/fetch-offline-sdk-s3.sh"
+
+# 生成本地打包 App 资源（iOS+Android；HX CLI，需 HBuilderX 已启动 + 项目已导入）
+app-resource:
+	@"$(HX_CLI)" publish app --type appResource --project "$(ROOT:%/=%)"

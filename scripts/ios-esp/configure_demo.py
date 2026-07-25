@@ -4,7 +4,7 @@
 
 敏感值通过环境变量注入，不写死进仓库：
   DCLOUD_APPKEY                 离线打包 AppKey（必填，除非 Info.plist 已有）
-  IOS_DEVELOPMENT_TEAM          默认 <REDACTED>
+  IOS_DEVELOPMENT_TEAM          Apple Team ID（必填，写 scripts/local-secrets.env）
   IOS_BUNDLE_ID                 默认 com.nuwax.nuwa
   IOS_PROVISIONING_PROFILE_UUID 描述文件 UUID（手动签名时必填）
   UNIAPPX_SDK_ROOT              Demo 所在 SDK 根目录
@@ -107,7 +107,7 @@ def main() -> int:
     sdk = os.path.expanduser(os.environ.get("UNIAPPX_SDK_ROOT", DEFAULT_SDK))
     appid = os.environ.get("UNIAPPX_APPID", "__UNI__8BF05E4")
     appkey = os.environ.get("DCLOUD_APPKEY") or None
-    team = os.environ.get("IOS_DEVELOPMENT_TEAM", "<REDACTED>")
+    team = os.environ.get("IOS_DEVELOPMENT_TEAM")
     bundle_id = os.environ.get("IOS_BUNDLE_ID", "com.nuwax.nuwa")
     profile = os.environ.get("IOS_PROVISIONING_PROFILE_UUID") or None
     # 默认 1：HX「运行到自定义基座」；发版离线包再设 UNIAPPX_IPATYPE=2
@@ -119,35 +119,11 @@ def main() -> int:
         print(f"✗ Demo 不完整：{sdk}/UniAppXDemo", file=sys.stderr)
         return 1
 
-    # 若未设环境变量，尝试从 backup MODIFIED 读取 appkey（仅本机恢复）
-    if not appkey:
-        backup_info = (
-            "/Users/apple/workspace/backups/ios-esp-local-packaging-20260724"
-            "/native-project-delta/Info.plist.MODIFIED"
-        )
-        if os.path.isfile(backup_info):
-            with open(backup_info, "rb") as f:
-                b = plistlib.load(f)
-            appkey = (b.get("uniapp-x") or {}).get("dcloud_appkey")
-            if appkey:
-                print("ℹ 使用 backup Info.plist.MODIFIED 中的 dcloud_appkey")
-
+    # 敏感值一律走环境变量（scripts/local-secrets.env，gitignore），不再硬编码或从本机 backup 猜。
+    if not team:
+        raise SystemExit("✗ 未设置 IOS_DEVELOPMENT_TEAM（写到 scripts/local-secrets.env）")
     if not profile:
-        backup_hint = "60be0b3e-b807-4a30-8e6b-5f8244683f1b"
-        # 优先用本机已安装 / Downloads 较新 UUID
-        newer = "<REDACTED>"
-        downloads = os.path.expanduser(
-            "~/Downloads/Nuwa iOS 证书/Nuwa_iOS_Dev.mobileprovision"
-        )
-        installed = os.path.expanduser(
-            f"~/Library/MobileDevice/Provisioning Profiles/{newer}.mobileprovision"
-        )
-        if os.path.isfile(downloads) or os.path.isfile(installed):
-            profile = newer
-            print(f"ℹ 使用较新描述文件 UUID {profile}")
-        else:
-            profile = backup_hint
-            print(f"ℹ 回退描述文件 UUID {profile}")
+        print("ℹ 未设置 IOS_PROVISIONING_PROFILE_UUID → pbxproj 不写 profile（走自动签名）")
 
     patch_info_plist(info, appid, appkey, ipatype)
     patch_pbxproj(pbx, team, bundle_id, profile)

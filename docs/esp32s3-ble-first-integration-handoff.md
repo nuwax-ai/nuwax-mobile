@@ -32,7 +32,7 @@ Service name format: PROV_ + final 3 STA MAC bytes, uppercase hexadecimal
 Example: PROV_A1B2C3
 Security: 2
 Development username: device UID from serial log
-Development PoP: <REDACTED>
+Development PoP: <DEV_POP（受控渠道获取，勿入仓库）>
 Required capability: wifi_prov
 Optional capability: wifi_scan
 Custom endpoint: device-info

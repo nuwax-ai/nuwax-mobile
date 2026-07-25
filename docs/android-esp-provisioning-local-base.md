@@ -28,13 +28,22 @@
 
 ## 环境
 
+路径全部由 [`scripts/local-base-env.sh`](../scripts/local-base-env.sh) 统一派生（基于 `NUWAX_OFFLINE_SDK_HOME`，默认 `$HOME/workspace/nuwax-mobile-offline-sdk`）。**不要写死 `/Users/xxx`**；本机没有 SDK 时先拉取（见 [offline-sdk-distribution-s3.md](./offline-sdk-distribution-s3.md)）：
+
 ```bash
-export UNIAPPX_ANDROID_SDK_ROOT=/Users/apple/workspace/UniAppX-Android-5.15/Android-uni-app-x-SDK@14915-5.15
-export ANDROID_ESP_WORK=/Users/apple/workspace/nuwax-android-esp
-export ANDROID_HOME=/Users/apple/workspace/Android/sdk
-export ANDROID_BUNDLE_ID=com.nuwax.nuwa
-export ANDROID_COMPILE_SDK=36
-export DCLOUD_APPKEY=<REDACTED>   # 与 iOS 同源，可覆盖
+cd <本仓根目录>                       # nuwax-mobile
+make sdk-fetch                        # 本机没有离线 SDK 时拉取（sdk/ + archives/）
+source scripts/local-base-env.sh      # 自动派生下列变量
+```
+
+脚本自动设置（无需手动 export）：`UNIAPPX_ANDROID_SDK_ROOT`、`ANDROID_ESP_WORK`、`ANDROID_BUNDLE_ID`（=com.nuwax.nuwa）、`ANDROID_COMPILE_SDK`（=36）、`DCLOUD_APPKEY`。
+
+> ⚠️ SDK 路径已迁移到 `$NUWAX_OFFLINE_SDK_HOME/sdk/android/5.15/...`，**旧的 `/Users/.../UniAppX-Android-5.15` 已作废**。
+
+唯一按本机设置的是 Android SDK（Android Studio 安装位置）：
+
+```bash
+export ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk}   # macOS 默认，按实际改
 ```
 
 - HBuilderX **5.15**  
@@ -44,7 +53,7 @@ export DCLOUD_APPKEY=<REDACTED>   # 与 iOS 同源，可覆盖
 ## 标准流程（A → B → C → D）
 
 ```bash
-cd /Users/apple/workspace/nuwax-mobile
+cd <本仓根目录>                # nuwax-mobile
 source scripts/local-base-env.sh
 
 # 0) HX：发行 → 原生App-本地打包 → 生成本地打包App资源
@@ -71,6 +80,8 @@ python3 scripts/android-esp/configure_app.py
 |------|------|
 | **方案1** | `unpackage/debug/android_debug.apk` →「使用自定义基座运行」 |
 | **方案2** | AS 打开 `$ANDROID_ESP_WORK/project`；HX 关联该原生工程根目录 |
+
+**HX 控制台日志**：`configure_app.py` 默认把 `debug-server-release.aar` 拷入 `app/libs` 并写入 `DCLOUD_DEBUG=true`（官方原生联调要求）。正式发行向本地包请设 `ENABLE_HX_DEBUG=0`。临时看日志也可用 `pnpm hx:android:log` / `adb logcat`。
 
 ### 已验证
 

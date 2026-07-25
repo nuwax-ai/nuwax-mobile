@@ -10,7 +10,7 @@
 | `../local-base-env.sh` | * | 统一 `NUWAX_*` / 兼容旧变量 |
 | `official/setup_sdk.sh` | A | 下载/校验 SDK，同步工作副本 + gradle-wrapper + local.properties |
 | `ensure_env.sh` | * | JAVA_HOME / ANDROID_HOME |
-| `configure_app.py` | A | 包名 / appid / AppKey / 精简示例与可选远程依赖 |
+| `configure_app.py` | A | 包名 / appid / AppKey / 精简示例与可选远程依赖；默认打入 HX `debug-server`（`ENABLE_HX_DEBUG`） |
 | `inject_all_uts_modules.py` | B | 注入 HX 导出的全部 UTS 插件 |
 | `inject_esp_module.sh` | B | 兼容入口 → `inject_all_uts_modules.py` |
 | `sync_local_pack_resources.sh` | B | 同步 HX www + **整目录替换** kt + 注入插件 |
@@ -20,7 +20,7 @@
 ## 一键构建
 
 ```bash
-cd /Users/apple/workspace/nuwax-mobile
+cd <本仓根目录>  # nuwax-mobile
 source scripts/local-base-env.sh
 # 先 HX 生成本地打包 App 资源
 make base-android

@@ -17,13 +17,11 @@ if [[ -n "${JAVA_HOME:-}" ]]; then
   export PATH="$JAVA_HOME/bin:$PATH"
 fi
 
-# Android SDK：优先已装完整包的工作区路径
+# Android SDK：按常见位置探测（$HOME/workspace/Android/sdk 或 macOS 默认）
 if [[ -z "${ANDROID_HOME:-}" ]] || [[ ! -d "${ANDROID_HOME}/platforms" ]]; then
-  if [[ -d "/Users/apple/workspace/Android/sdk/platforms" ]]; then
-    export ANDROID_HOME="/Users/apple/workspace/Android/sdk"
-  elif [[ -d "$HOME/Library/Android/sdk/platforms" ]]; then
-    export ANDROID_HOME="$HOME/Library/Android/sdk"
-  fi
+  for _cand in "$HOME/workspace/Android/sdk" "$HOME/Library/Android/sdk"; do
+    if [[ -d "$_cand/platforms" ]]; then export ANDROID_HOME="$_cand"; break; fi
+  done
 fi
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 

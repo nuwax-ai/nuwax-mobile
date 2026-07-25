@@ -20,7 +20,7 @@
 快捷命令（**只出包、不装设备**）：
 
 ```bash
-cd /Users/apple/workspace/nuwax-mobile
+cd <本仓根目录>  # nuwax-mobile
 make base-android          # android_debug.apk
 make base-ios-device        # iOS_debug.ipa（真机）
 make base-ios-simulator    # Pandora_simulator_debug.app（模拟器，与真机分离）

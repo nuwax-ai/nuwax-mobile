@@ -23,12 +23,14 @@
 | `strip_sample_unimodules.py` | 去掉 Demo 示例 unimodule 链接 |
 | `sync_local_pack_resources.sh` | 同步 HX www + xcframework → Libs |
 | `configure_demo.py` | appid / AppKey / 签名 / 蓝牙文案 / ipatype |
-| `run_simulator.sh` | 模拟器冒烟 |
+| `run_simulator.sh` | 模拟器冒烟（默认 Release，可 simctl 冷启动） |
+| `package_simulator_base.sh` | 只出 `Pandora_simulator_debug.app`（**Release + 默认 x86_64**；对齐 ExtAPI；Debug blank / arm64-sim 会导致模块“不存在”） |
+
 
 ## 一键 / 环境
 
 ```bash
-cd /Users/apple/workspace/nuwax-mobile
+cd <本仓根目录>  # nuwax-mobile
 source scripts/local-base-env.sh
 make base-ios   # 需已完成 ExtAPI + 插件链
 

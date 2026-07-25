@@ -3,6 +3,8 @@ type OnMsgFn = (e : UTSJSONObject) => void
 class ProxyWeb {
 	isInit : boolean = false
 	private webviewContext : WebviewContext | null = null
+	/** App 端 createWebviewContext 使用的节点 id */
+	private webviewId : string = "markdown-proxy-web"
 	callbackMap : Map<string, OnMsgFn> = new Map()
 	constructor() {
 		// #ifdef WEB
@@ -13,75 +15,144 @@ class ProxyWeb {
 		}, false)
 		// #endif
 	}
-	callMethod(param : UTSJSONObject, callback : OnMsgFn) {
-		// 先判断 isInit 是否为 true
-		if (this.isInit == false) {
-			if (param['action'] == 'katexRender') {
-				console.log('[MathRender] proxy not ready, retry after 1s')
-			}
-			// console.log('isInit false , wait 1s')
-			setTimeout(() => {
-				this.callMethod(param, callback)
-			}, 1000)
+
+	/**
+	 * iOS 上 onMounted 时 createWebviewContext 常为 null，需在消息到达或重试时再绑定。
+	 */
+	ensureAppContext(webviewId : string = ""): void {
+		if (webviewId.length > 0) {
+			this.webviewId = webviewId
+		}
+		if (this.webviewContext != null) {
 			return
 		}
-		// console.log('callMethod', param)
+		// #ifdef APP
+		try {
+			const ctx = uni.createWebviewContext(this.webviewId)
+			if (ctx != null) {
+				this.webviewContext = ctx
+				console.log("[MathRender] proxy context ensured id=" + this.webviewId)
+			}
+		} catch (e) {
+			console.warn("[MathRender] ensureAppContext failed", e)
+		}
+		// #endif
+	}
+
+	callMethod(param : UTSJSONObject, callback : OnMsgFn, retryCount : number = 0) {
+		// #ifdef APP
+		if (this.webviewContext == null) {
+			this.ensureAppContext(this.webviewId)
+		}
+		// #endif
+		// DOM 未就绪，或 App 尚未拿到 webviewContext：排队重试（勿先登记 callback 再 skip）
+		if (this.isInit == false || this.webviewContext == null) {
+			if (param["action"] == "katexRender") {
+				console.log(
+					"[MathRender] proxy not ready isInit=" +
+						this.isInit +
+						" hasCtx=" +
+						(this.webviewContext != null) +
+						" retry=" +
+						retryCount,
+				)
+			}
+			if (retryCount >= 40) {
+				console.error("[MathRender] proxy give up after retries")
+				const fail = new UTSJSONObject()
+				fail["error"] = "proxy_not_ready"
+				fail["imageDataURL"] = ""
+				fail["resultHtml"] = ""
+				callback(fail)
+				return
+			}
+			setTimeout(() => {
+				this.callMethod(param, callback, retryCount + 1)
+			}, 500)
+			return
+		}
+
 		const requestId = Date.now() + Math.random().toString(36).substring(2, 15)
-		param['requestId'] = requestId
-		const key = (param['action'] as string) + '_callback_' + requestId
+		param["requestId"] = requestId
+		const key = (param["action"] as string) + "_callback_" + requestId
 		this.callbackMap.set(key, callback)
-		if (param['action'] == 'katexRender') {
-			console.log('[MathRender] proxy dispatch requestId=' + requestId)
+		if (param["action"] == "katexRender") {
+			console.log("[MathRender] proxy dispatch requestId=" + requestId)
 		}
 
 		// #ifdef APP-ANDROID
-		const code = `onMessage(${JSON.stringify(param)})`;
+		const code = `onMessage(${JSON.stringify(param)})`
 		// #endif
 		// #ifndef APP-ANDROID
-		const code = `onMessage("${encodeURIComponent(JSON.stringify(param))}")`;
+		const code = `onMessage("${encodeURIComponent(JSON.stringify(param))}")`
 		// #endif
-		// console.log('code', code)
+
 		/* #ifdef APP */
-		this.webviewContext?.evalJS(code)
-			/* #endif */
-			/* #ifdef WEB */
-			(this.webviewContext as any)?.contentWindow.eval(code)
+		this.webviewContext!.evalJS(code)
+		/* #endif */
+		/* #ifdef WEB */
+		;(this.webviewContext as any)?.contentWindow.eval(code)
 		/* #endif */
 	}
-	init(webviewContext : WebviewContext) {
-		this.webviewContext = webviewContext
+
+	init(webviewContext : WebviewContext | null, webviewId : string = "") {
+		if (webviewId.length > 0) {
+			this.webviewId = webviewId
+		}
+		if (webviewContext != null) {
+			this.webviewContext = webviewContext
+			console.log("[MathRender] proxy init ok id=" + this.webviewId)
+		} else {
+			console.warn("[MathRender] proxy init with null context, will retry later")
+			// #ifdef APP
+			this.ensureAppContext(this.webviewId)
+			// #endif
+		}
 	}
+
+	/** 页面卸载时重置，避免单例残留 isInit=true 但 context 已失效 */
+	reset(): void {
+		this.isInit = false
+		this.webviewContext = null
+		this.callbackMap.clear()
+		console.log("[MathRender] proxy reset")
+	}
+
 	onWebMsg(e : UniWebViewMessageEvent) {
-		// console.log('onWebMsg', e)
+		// 任意消息到达都说明 web-view 已挂载，趁机补绑 context（iOS 关键）
+		this.ensureAppContext(this.webviewId)
 		const event = e.detail.data[0] as UTSJSONObject
-		const action = event['action'] as string
-		const param = event['param'] as UTSJSONObject
+		const action = event["action"] as string
+		const param = event["param"] as UTSJSONObject
 		this.emitMsg({
 			action,
-			param
-		})
+			param,
+		} as UTSJSONObject)
 	}
+
 	emitMsg(res : UTSJSONObject) {
-		if (res['action'] == 'DOMContentLoaded_callback') {
+		if (res["action"] == "DOMContentLoaded_callback") {
 			this.isInit = true
-			console.log('[MathRender] proxy DOMContentLoaded')
+			this.ensureAppContext(this.webviewId)
+			console.log(
+				"[MathRender] proxy DOMContentLoaded hasCtx=" +
+					(this.webviewContext != null),
+			)
 			return
 		}
-		const funName = res['action']! as string
-		// console.log('funName', funName)
+		const funName = res["action"]! as string
 		const callback = this.callbackMap.get(funName)
-		if (funName.startsWith('katexRender_callback_')) {
-			console.log('[MathRender] proxy callback action=' + funName)
+		if (funName.startsWith("katexRender_callback_")) {
+			console.log("[MathRender] proxy callback action=" + funName)
 		}
 		if (callback == null) {
-			console.error('callback is null', funName)
+			console.error("callback is null", funName)
 			return
 		}
 		this.callbackMap.delete(funName)
 		// 回调会更新 Vue 响应式消息数据，Android 必须切回主线程。
-		// 在 io 线程修改 markdownElList 会与渲染依赖遍历并发，触发 ConcurrentModificationException。
-		utils.uniGetDispatcher('main',()=>{
-			callback(res['param'] as UTSJSONObject)
+		utils.uniGetDispatcher("main", () => {
+			callback(res["param"] as UTSJSONObject)
 		})
 	}
 }

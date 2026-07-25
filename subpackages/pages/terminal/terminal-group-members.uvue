@@ -10,26 +10,40 @@
       <!-- 当前组员 -->
       <view class="field-label">{{ t("Mobile.Terminal.currentMembers") }}</view>
       <view class="card-group">
-        <view class="row-item" v-for="member in memberList" :key="member.name">
+        <view v-if="memberList.length == 0 && !loading" class="empty-row">
+          <text class="empty-text">{{ t("Mobile.Terminal.noMembers") }}</text>
+        </view>
+        <view class="row-item" v-for="member in memberList" :key="member.agentId">
           <view class="row-avatar">
-            <text class="row-avatar-emoji">{{ member.icon }}</text>
+            <image v-if="isIconUrl(member.icon)" class="row-avatar-img" :src="member.icon" mode="aspectFill" />
+            <text v-else class="row-avatar-emoji">{{ member.icon != "" ? member.icon : "🤖" }}</text>
           </view>
           <view class="row-info">
             <text class="row-title">{{ member.name }}</text>
             <text class="row-desc">{{ member.desc }}</text>
           </view>
-          <view class="remove-btn" hover-class="remove-btn-active" @click="handleRemove(member.name)">
+          <view class="remove-btn" hover-class="remove-btn-active" @click="handleRemove(member.agentId)">
             <text class="remove-text">{{ t("Mobile.Terminal.remove") }}</text>
           </view>
         </view>
       </view>
 
-      <!-- 添加智能体 -->
+      <!-- 添加智能体（候选自最近使用，已过滤在组成员） -->
       <view class="field-label">{{ t("Mobile.Terminal.addAgent") }}</view>
       <view class="card-group">
-        <view class="row-item" v-for="agent in candidateList" :key="agent.name" hover-class="row-item-active" @click="handleAdd(agent.name)">
+        <view v-if="candidateList.length == 0 && !loading" class="empty-row">
+          <text class="empty-text">{{ t("Mobile.Terminal.noCandidates") }}</text>
+        </view>
+        <view
+          class="row-item"
+          v-for="agent in candidateList"
+          :key="agent.agentId"
+          hover-class="row-item-active"
+          @click="handleAdd(agent.agentId)"
+        >
           <view class="row-avatar row-avatar-add">
-            <text class="row-avatar-plus">+</text>
+            <image v-if="isIconUrl(agent.icon)" class="row-avatar-img" :src="agent.icon" mode="aspectFill" />
+            <text v-else class="row-avatar-plus">+</text>
           </view>
           <view class="row-info">
             <text class="row-title">{{ agent.name }}</text>
@@ -56,39 +70,187 @@
   import { onLoad } from "@dcloudio/uni-app";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiGetGroupMembers, apiAddGroupMember } from "@/servers/terminalAgent";
+  import { apiUserUsedAgentList } from "@/servers/agentDev";
+  import { GroupMemberAddParams } from "@/types/interfaces/terminalGroupMember";
+  import { ListParams } from "@/types/interfaces/common";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
-  class Member {
+  /** 列表行展示模型（组员 / 候选共用） */
+  class MemberRow {
+    agentId: number = 0;
     name: string = "";
     desc: string = "";
     icon: string = "";
-    constructor(name: string, desc: string, icon: string) {
+    constructor(agentId: number, name: string, desc: string, icon: string) {
+      this.agentId = agentId;
       this.name = name;
       this.desc = desc;
       this.icon = icon;
     }
   }
 
-  const memberList = ref<Member[]>([
-    new Member("Backend-Agent", "后端API优化与性能调优", "⚙️"),
-    new Member("UI-Agent", "前端组件库重构与设计系统", "🎨"),
-    new Member("DB-Agent", "数据库迁移与连接池管理", "🗄️"),
-    new Member("女娲助手", "通用对话与知识问答", "🔮"),
-  ]);
+  /** 设备宿主智能体 ID（路由入参） */
+  const hostAgentId = ref<number>(0);
+  const memberList = ref<MemberRow[]>([] as MemberRow[]);
+  const candidateList = ref<MemberRow[]>([] as MemberRow[]);
+  const loading = ref<boolean>(false);
+  /** 防止连续点击添加 */
+  const adding = ref<boolean>(false);
 
-  const candidateList = ref<Member[]>([
-    new Member("Doc-Agent", "API文档自动生成与维护", "+"),
-    new Member("DevOps-Agent", "CI/CD流水线与部署监控", "+"),
-    new Member("Test-Agent", "集成测试与质量保障", "+"),
-  ]);
-
-  const handleRemove = (name: string) => {
-    uni.showToast({ title: t("Mobile.Terminal.removed"), icon: "none" });
+  /** icon 是否为图片 URL（否则按 emoji / 占位文本渲染） */
+  const isIconUrl = (icon: string): boolean => {
+    if (icon == "") return false;
+    return icon.indexOf("http://") == 0 || icon.indexOf("https://") == 0 || icon.indexOf("/") == 0;
   };
 
-  const handleAdd = (name: string) => {
-    uni.showToast({ title: t("Mobile.Terminal.added"), icon: "none" });
+  const readStr = (obj: UTSJSONObject, key: string): string => {
+    const v = obj[key];
+    return v != null ? `${v}` : "";
+  };
+
+  const readNum = (obj: UTSJSONObject, key: string): number => {
+    const v = obj[key];
+    if (v == null) return 0;
+    const n = parseFloat(`${v}`);
+    return !isNaN(n) ? (n as number) : 0;
+  };
+
+  /**
+   * 将组员接口项转为行模型
+   * @param src 接口 UTSJSONObject
+   */
+  const mapMember = (src: UTSJSONObject): MemberRow => {
+    return new MemberRow(
+      readNum(src, "agentId"),
+      readStr(src, "name"),
+      readStr(src, "description"),
+      readStr(src, "icon"),
+    );
+  };
+
+  /**
+   * 拉取当前组员列表
+   * @returns 组员 agentId 集合，供候选过滤
+   */
+  const fetchMembers = async (): Promise<number[]> => {
+    const ids: number[] = [] as number[];
+    if (hostAgentId.value <= 0) return ids;
+    try {
+      const res = await apiGetGroupMembers(hostAgentId.value);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const raw = apiResData<any>(res);
+        const arr = raw != null ? (raw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        const rows: MemberRow[] = [] as MemberRow[];
+        for (let i = 0; i < arr.length; i++) {
+          const row = mapMember(arr[i]);
+          if (row.agentId > 0) {
+            rows.push(row);
+            ids.push(row.agentId);
+          }
+        }
+        memberList.value = rows;
+      } else {
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.loadMembersFailed"), icon: "none" });
+      }
+    } catch (e) {
+      console.error("fetchMembers error", e);
+      uni.showToast({ title: t("Mobile.Terminal.loadMembersFailed"), icon: "none" });
+    }
+    return ids;
+  };
+
+  /**
+   * 拉取最近使用智能体作为候选，并排除已在组内的成员
+   * @param memberIds 已在组内的 agentId
+   */
+  const fetchCandidates = async (memberIds: number[]): Promise<void> => {
+    try {
+      const params = new ListParams();
+      params.size = 50;
+      params.pageIndex = 1;
+      const res = await apiUserUsedAgentList(params);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        // used/list 直接返回数组（与首页最近使用一致）
+        const raw = apiResData<any>(res);
+        const arr = raw != null ? (raw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        const rows: MemberRow[] = [] as MemberRow[];
+        for (let i = 0; i < arr.length; i++) {
+          const src = arr[i];
+          const aid = readNum(src, "agentId");
+          if (aid <= 0) continue;
+          // 宿主自身与已在组内的不进候选
+          if (aid == hostAgentId.value) continue;
+          let inGroup = false;
+          for (let j = 0; j < memberIds.length; j++) {
+            if (memberIds[j] == aid) {
+              inGroup = true;
+              break;
+            }
+          }
+          if (inGroup) continue;
+          rows.push(
+            new MemberRow(aid, readStr(src, "name"), readStr(src, "description"), readStr(src, "icon")),
+          );
+        }
+        candidateList.value = rows;
+      } else {
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.loadCandidatesFailed"), icon: "none" });
+      }
+    } catch (e) {
+      console.error("fetchCandidates error", e);
+      uni.showToast({ title: t("Mobile.Terminal.loadCandidatesFailed"), icon: "none" });
+    }
+  };
+
+  /** 并行刷新组员 + 候选 */
+  const refreshAll = async (): Promise<void> => {
+    loading.value = true;
+    uni.showLoading({ title: "", mask: true });
+    try {
+      const memberIds = await fetchMembers();
+      await fetchCandidates(memberIds);
+    } finally {
+      loading.value = false;
+      uni.hideLoading();
+    }
+  };
+
+  /** 移除：后端暂无删除接口，仅提示 */
+  const handleRemove = (_agentId: number) => {
+    uni.showToast({ title: t("Mobile.Terminal.removeNotSupported"), icon: "none" });
+  };
+
+  /**
+   * 添加组员
+   * @param targetAgentId 要加入的智能体 ID
+   */
+  const handleAdd = async (targetAgentId: number) => {
+    if (adding.value || hostAgentId.value <= 0 || targetAgentId <= 0) return;
+    adding.value = true;
+    try {
+      const body = new GroupMemberAddParams();
+      body.agentId = hostAgentId.value;
+      body.targetAgentId = targetAgentId;
+      const res = await apiAddGroupMember(body);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Terminal.added"), icon: "none" });
+        await refreshAll();
+      } else {
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.addFailed"), icon: "none" });
+      }
+    } catch (e) {
+      console.error("handleAdd error", e);
+      uni.showToast({ title: t("Mobile.Terminal.addFailed"), icon: "none" });
+    } finally {
+      adding.value = false;
+    }
   };
 
   const handleDone = () => {
@@ -97,6 +259,26 @@
 
   onLoad((options: any) => {
     setCurrentPageNavigationBarTitle();
+    let aid = 0;
+    if (options != null) {
+      const optObj = options as UTSJSONObject;
+      const raw = optObj["agentId"];
+      if (raw != null && `${raw}`.length > 0) {
+        const parsed = parseFloat(`${raw}`);
+        if (!isNaN(parsed) && parsed > 0) {
+          aid = parsed as number;
+        }
+      }
+    }
+    if (aid <= 0) {
+      uni.showToast({ title: t("Mobile.Terminal.agentIdMissing"), icon: "none" });
+      setTimeout(() => {
+        uni.navigateBack({ delta: 1 });
+      }, 500);
+      return;
+    }
+    hostAgentId.value = aid;
+    refreshAll();
   });
 </script>
 
@@ -131,6 +313,18 @@
     overflow: hidden;
   }
 
+  .empty-row {
+    padding: 32rpx;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    .empty-text {
+      font-size: 26rpx;
+      color: #999999;
+    }
+  }
+
   .row-item {
     display: flex;
     flex-direction: row;
@@ -155,9 +349,15 @@
       align-items: center;
       justify-content: center;
       margin-right: 24rpx;
+      overflow: hidden;
 
       .row-avatar-emoji {
         font-size: 36rpx;
+      }
+
+      .row-avatar-img {
+        width: 72rpx;
+        height: 72rpx;
       }
 
       &.row-avatar-add {

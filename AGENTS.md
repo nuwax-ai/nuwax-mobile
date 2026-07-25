@@ -13,6 +13,33 @@
 - 主要目录：`pages/`（主包页面）、`subpackages/`（分包页面）、`components/`（可复用组件）、`servers/`（API 请求层，UTS）、`hooks/`、`utils/`、`constants/`、`types/`、`scripts/`（工程脚本）、`docs/`（设计与对接文档）
 - 包管理：仓库同时存在 `pnpm-lock.yaml` 与 `yarn.lock`，根目录依赖主要是 Web 端渲染相关库（markdown-it、katex、文件预览等），不用于 App 端编译
 
+## 产品线分支规范
+
+仓库用两条长期 `release/*` 产品线区分「开源通用基座」与「桌搭自定义基座」，**不要**再用 `feat-app-zhuoda` / `feature/2026.07-zhuoda-dong` 等临时/日期名作为长期线。
+
+| 分支 | 产品 | 基座 | 合入 / 上线 |
+|---|---|---|---|
+| `release/nuwa-basic` | 开源 Nuwax App（可合 `main`） | uni-app x **官方通用基座** | → `main`；也可被桌搭线合入 |
+| `release/nuwa-zhuoda` | 桌搭 App（终端 Tab 等） | **自定义基座**（`pnpm base:fetch` / 本地打基座） | **当前生产上线线**；不反向合入 basic |
+
+流向（单向）：
+
+```text
+feat/<topic>  →  release/nuwa-basic  →  main
+                      ↓ 定期 merge
+                 release/nuwa-zhuoda  →  生产发版
+```
+
+派生规则：
+
+- 改开源通用能力：从 `release/nuwa-basic` 拉 `feat/<topic>` 或 `fix/<topic>`，PR 回 `release/nuwa-basic`，再择机合 `main`
+- 改桌搭专属（终端、ESP 配网、自定义基座脚本等）：从 `release/nuwa-zhuoda` 拉 `feat/zhuoda/<topic>`，PR 回 `release/nuwa-zhuoda`
+- **禁止**桌搭专属提交直接合入 `release/nuwa-basic` / `main`
+- **推荐**定期把 `release/nuwa-basic` merge 进 `release/nuwa-zhuoda`
+- `dev` 与历史 `feat-YYYY.*` 分支保留不动；新工作不再用日期型 `feat-YYYY.M.D` / `feature/YYYY.MM-*` 作长期线名
+
+旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
+
 ## 构建工具链（重要）
 
 **本项目没有 `uni` CLI / vite 的 npm scripts，所有平台的编译、运行、打包都必须通过 HBuilderX 完成**（本机安装版本 5.15，路径 `/Applications/HBuilderX.app`）。uni-app x 的 uts/uvue 编译依赖 HBuilderX 内置的编译器，不要尝试 `npx vite build` 或 `npm run dev` 来跑 App 端。

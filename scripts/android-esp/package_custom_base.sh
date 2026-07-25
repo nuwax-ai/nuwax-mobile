@@ -21,6 +21,13 @@ mkdir -p "$OUT_DIR"
 
 # shellcheck source=ensure_env.sh
 source "$SCRIPT_DIR/ensure_env.sh"
+
+# 自动引导：project 未就绪（如 sdk-fetch 后 work/ 为空）时跑 setup_sdk，让 fetch → base-android 一键成立
+if [[ ! -e "$PROJ/settings.gradle" ]]; then
+  echo "==== 0) 自动引导工作副本（official/setup_sdk.sh）===="
+  bash "$SCRIPT_DIR/official/setup_sdk.sh"
+fi
+
 ensure_gradle_wrapper_jar "$PROJ"
 write_local_properties "$PROJ"
 

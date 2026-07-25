@@ -42,6 +42,7 @@ bootstrap_work() {
       "$UNIAPPX_ANDROID_SDK_ROOT/" "$target/"
   fi
   ln -sfn "$target" "$ANDROID_ESP_WORK/sdk-root"
+  rm -rf "$ANDROID_ESP_WORK/project"   # 清掉可能残留的真目录/旧链接，确保 project 是干净符号链接
   ln -sfn "$target/uniappxnativepackage" "$ANDROID_ESP_WORK/project"
   echo "✓ ANDROID_ESP_WORK=$ANDROID_ESP_WORK"
   echo "  project=$ANDROID_ESP_WORK/project"

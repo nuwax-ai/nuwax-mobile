@@ -153,8 +153,8 @@ make sdk-fetch                       # → NUWAX_OFFLINE_SDK_HOME（sdk/ + archi
 # Step 1  派生各平台路径（UNIAPPX_*_SDK_ROOT / *_ESP_WORK 等）
 source scripts/local-base-env.sh     # 若提示缺 SDK，回到 Step 0
 
-# Step 2  HBuilderX 生成本地打包 App 资源（GUI，不可跳过）
-#   HX：发行 → 原生App-本地打包 → 生成本地打包App资源（iOS / Android）
+# Step 2  生成本地打包 App 资源（HX CLI，iOS+Android 一起出；需 HBuilderX 已启动 + 项目已导入）
+make app-resource                 # = cli publish app --type appResource --project <本仓绝对路径>
 #   产物：unpackage/resources/app-ios、app-android
 
 # Step 3  出基座（按目标选一个）

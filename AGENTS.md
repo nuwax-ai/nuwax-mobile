@@ -30,32 +30,35 @@
 
 | 用途 | 命名格式 | 从哪拉 | 合回哪 |
 |---|---|---|---|
-| 开源 / 通用能力 | `feat/<YYYY.MM>-<slug>` | `release/nuwa-basic` | `release/nuwa-basic` → 再择机合 `main` |
-| 桌搭专属 | `feat/zhuoda/<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
+| 开源月度迭代（整月合集） | `feat/<YYYY.MM>` | `release/nuwa-basic` | `release/nuwa-basic` → 再择机合 `main` |
+| 开源单需求 | `feat/<YYYY.MM>-<slug>` | `release/nuwa-basic` | 同上 |
+| 桌搭月度迭代（整月合集） | `feat/zhuoda/<YYYY.MM>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
+| 桌搭单需求 | `feat/zhuoda/<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | 同上 |
 | 开源线紧急修复 | `fix/<YYYY.MM>-<slug>` | `release/nuwa-basic` | `release/nuwa-basic` |
 | 桌搭线紧急修复 | `fix/zhuoda/<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
 
 示例：
 
-- `feat/2026.07-provision-wifi` —— 2026 年 7 月开源线配网需求
-- `feat/zhuoda/2026.07-terminal-meeting` —— 同月桌搭终端会议需求
+- `feat/2026.07` / `feat/zhuoda/2026.07` —— 当月版本开发合集分支
+- `feat/2026.07-provision-wifi` —— 开源线单需求
+- `feat/zhuoda/2026.07-terminal-meeting` —— 桌搭单需求
 - `fix/zhuoda/2026.07-ble-scan` —— 桌搭 BLE 扫描热修
 
-`slug` 用小写英文短横线，概括需求主题；同一版本迭代可多个分支并行（不同 slug）。
+`slug` 用小写英文短横线，**只概括需求主题**（如 `terminal-meeting`、`provision-wifi`）；**禁止**人名、花名、个人后缀（如 `-dong`）。同一版本迭代可多个单需求分支并行。
 
 ### 流向（单向）
 
 ```text
-feat/<YYYY.MM>-<slug>           →  release/nuwa-basic  →  main
-                                         ↓ 定期 merge
-feat/zhuoda/<YYYY.MM>-<slug>    →  release/nuwa-zhuoda  →  生产发版
+feat/<YYYY.MM>[-<slug>]           →  release/nuwa-basic  →  main
+                                           ↓ 定期 merge
+feat/zhuoda/<YYYY.MM>[-<slug>]    →  release/nuwa-zhuoda  →  生产发版
 ```
 
 ### 派生与合入规则
 
 - **禁止**桌搭专属提交直接合入 `release/nuwa-basic` / `main`
 - **推荐**定期把 `release/nuwa-basic` merge 进 `release/nuwa-zhuoda`
-- `dev` 与历史 `feat-2026.*` 等旧分支保留不动；新需求一律按上表带 `YYYY.MM` 命名，**不要**再写 `feat-2026.7.18`（缺零、把长期线当需求分支）这类旧格式
+- `dev` 与历史 `feat-2026.*` 等旧分支保留不动；新需求一律按上表带 `YYYY.MM` 命名，**不要**再写 `feat-2026.7.18`、`feature/2026.07-zhuoda-dong` 这类旧格式
 
 旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
 

@@ -160,6 +160,20 @@ function token2el(token: MarkdownToken): UniAiMarkdownElItem {
   };
 }
 
+/** 打开后可在调试时查看 Markdown 解析细节；默认关闭避免热路径刷屏。 */
+const MD_RENDER_DEBUG = false;
+
+function mdRenderLog(tag: string, detail: string = ""): void {
+  if (!MD_RENDER_DEBUG) {
+    return;
+  }
+  if (detail.length > 0) {
+    console.log(tag, detail);
+  } else {
+    console.log(tag);
+  }
+}
+
 /**
  * 历史/SSE 消息 markdown 解析（从 ai-msg.uvue 抽出，避免 UTS 大 setup 编译失败）
  */
@@ -174,6 +188,8 @@ export class AiMsgMarkdownParser {
   private cmarkProbeDone: boolean = false;
   private cmarkProbeOk: boolean = true;
   private lastFallbackBody: string = "";
+  /** 已完成消息的正文快照，用于跳过父级重渲染触发的重复解析。 */
+  private lastFinishedBody: string = "";
 
   constructor(
     msg: Ref<MsgItem>,
@@ -202,11 +218,37 @@ export class AiMsgMarkdownParser {
     this.cmarkProbeDone = false;
     this.cmarkProbeOk = true;
     this.lastFallbackBody = "";
+    this.lastFinishedBody = "";
     this.parseMarkdown = this.createParseMarkdown();
   }
 
   private bumpRevision(): void {
     this.streamRevision.value = this.streamRevision.value + 1;
+  }
+
+  /** 正文是否包含需由 App fallback 识别的自定义标签（cmark 无法可靠产出）。 */
+  private hasCustomMarkup(body: string): boolean {
+    return (
+      body.indexOf("markdown-custom-process") >= 0 ||
+      body.indexOf(":::container") >= 0 ||
+      body.indexOf("<task-result") >= 0
+    );
+  }
+
+  /** 当前渲染列表是否已包含自定义组件元素。 */
+  private renderListHasCustomEl(): boolean {
+    const list = this.msg.value.markdownElList;
+    for (let i = 0; i < list.length; i++) {
+      const type = list[i].type;
+      if (
+        type == "markdown_custom_process" ||
+        type == "markdown_custom_process_group" ||
+        type == "task_result"
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private applyAppFallback(): void {
@@ -216,13 +258,14 @@ export class AiMsgMarkdownParser {
     }
     if (
       body == this.lastFallbackBody &&
-      this.msg.value.markdownElList.length > 0
+      this.msg.value.markdownElList.length > 0 &&
+      (!this.hasCustomMarkup(body) || this.renderListHasCustomEl())
     ) {
       return;
     }
     this.lastFallbackBody = body;
     if (body.indexOf("|") >= 0) {
-      console.log(
+      mdRenderLog(
         "[MdRender] fallback table source msgId=" +
           this.msg.value._id +
           " body=" +
@@ -239,12 +282,13 @@ export class AiMsgMarkdownParser {
       },
     );
     this.msg.value.rendered = true;
+    this.lastFinishedBody = body;
     this.bumpRevision();
   }
 
   private applyMarkdownTokenList(markdownTokenList: MarkdownToken[]): void {
     if (markdownTokenList.length == 0) {
-      console.log(
+      mdRenderLog(
         "[MdRender] applyMarkdownTokenList.skip",
         `msgId=${this.msg.value._id} empty tokens`,
       );
@@ -253,7 +297,7 @@ export class AiMsgMarkdownParser {
     this.msg.value.markdownElList = markdownTokenList.map((token: MarkdownToken) =>
       token2el(token),
     );
-    console.log(
+    mdRenderLog(
       "[MdRender] applyMarkdownTokenList",
       `msgId=${this.msg.value._id} bodyLen=${this.getBodyText().length} elCount=${this.msg.value.markdownElList.length}`,
     );
@@ -275,7 +319,7 @@ export class AiMsgMarkdownParser {
       // #ifndef APP-IOS
       const parseRes = md2json(body) as ParseMdRes;
       if (parseRes.errorMsg.length > 0) {
-        console.log(
+        mdRenderLog(
           "[MdRender] parseFullBodyMarkdown.errorMsg",
           `msgId=${this.msg.value._id} err=${parseRes.errorMsg}`,
         );
@@ -289,7 +333,7 @@ export class AiMsgMarkdownParser {
       this.applyMarkdownTokenList(tokens);
       return true;
     } catch (e) {
-      console.log(
+      mdRenderLog(
         "[MdRender] parseFullBodyMarkdown.exception",
         `msgId=${this.msg.value._id} err=${e}`,
       );
@@ -311,7 +355,7 @@ export class AiMsgMarkdownParser {
       const probeRes = md2json("#") as ParseMdRes;
       this.cmarkProbeOk = probeRes.errorMsg.length == 0;
       if (!this.cmarkProbeOk) {
-        console.log(
+        mdRenderLog(
           "[MdRender] ensureCmark.probeError",
           `errorMsg=${probeRes.errorMsg}`,
         );
@@ -319,12 +363,12 @@ export class AiMsgMarkdownParser {
       // #endif
     } catch (e) {
       this.cmarkProbeOk = false;
-      console.log("[MdRender] ensureCmark.probeException", `err=${e}`);
+      mdRenderLog("[MdRender] ensureCmark.probeException", `err=${e}`);
     }
     if (!this.cmarkProbeOk) {
       this.cmarkParseEnabled = false;
     }
-    console.log(
+    mdRenderLog(
       "[MdRender] ensureCmark.probe",
       `ok=${this.cmarkProbeOk} cmarkParseEnabled=${this.cmarkParseEnabled}`,
     );
@@ -337,11 +381,12 @@ export class AiMsgMarkdownParser {
       if (isParseDone) {
         this.msg.value.rendered = true;
         const body = this.getBodyText();
+        this.lastFinishedBody = body;
         if (markdownTokenList.length == 0 && body.trim().length > 0) {
           if (!this.parseFullBodyMarkdown(body)) {
             this.cmarkParseEnabled = false;
             this.applyAppFallback();
-            console.log(
+            mdRenderLog(
               "[MdRender] ParseMarkdown.disableCmark",
               `msgId=${this.msg.value._id} app markdown fallback`,
             );
@@ -355,18 +400,47 @@ export class AiMsgMarkdownParser {
   runMarkdownParse(forceDone: boolean = false): void {
     const msgId = this.msg.value._id;
     const body = this.getBodyText();
-    console.log(
-      "[MdRender] runMarkdownParse.enter",
-      `msgId=${msgId} bodyLen=${body.length} forceDone=${forceDone}`,
-    );
     const streamFinished =
       forceDone ||
       !this.getIsConversationActive() ||
       !this.getIsLastMsg() ||
       this.msg.value.state === 3;
+    const needsCustomFallback = this.hasCustomMarkup(body);
+
+    // 历史/已完成消息：已有渲染结果且正文未变时跳过，避免列表刷新反复解析。
+    // 含 Plan/工具标签时，必须已解析出对应 el，否则不能跳过（防止 cmark 把标签当纯文本后被缓存）。
+    if (
+      streamFinished &&
+      body.length > 0 &&
+      this.msg.value.markdownElList.length > 0
+    ) {
+      if (needsCustomFallback && !this.renderListHasCustomEl()) {
+        // 继续走下方 fallback
+      } else if (this.lastFinishedBody.length == 0 && this.msg.value.rendered) {
+        this.lastFinishedBody = body;
+        return;
+      } else if (body == this.lastFinishedBody) {
+        return;
+      }
+    }
+
+    mdRenderLog(
+      "[MdRender] runMarkdownParse.enter",
+      `msgId=${msgId} bodyLen=${body.length} forceDone=${forceDone}`,
+    );
+
+    // Plan / ToolCall / task-result：与 dev 的 mp-html 自定义节点等价，须走 App fallback。
+    // uni-cmark 不会产出 markdown_custom_process，会把标签泄漏为正文。
+    if (needsCustomFallback) {
+      this.applyAppFallback();
+      if (streamFinished) {
+        this.lastFinishedBody = body;
+      }
+      return;
+    }
 
     if (!this.cmarkParseEnabled) {
-      console.log(
+      mdRenderLog(
         "[MdRender] runMarkdownParse.skip",
         `cmarkParseEnabled=false msgId=${msgId} bodyLen=${body.length}`,
       );
@@ -374,7 +448,7 @@ export class AiMsgMarkdownParser {
       return;
     }
     if (!this.ensureCmarkAvailable()) {
-      console.log(
+      mdRenderLog(
         "[MdRender] runMarkdownParse.cmarkUnavailable",
         `msgId=${msgId} bodyLen=${body.length}`,
       );
@@ -387,11 +461,14 @@ export class AiMsgMarkdownParser {
     }
     this.parseMarkdown!.msgReceiveDone = streamFinished;
     if (body.length > 0) {
-      console.log(
+      mdRenderLog(
         "[MdRender] runMarkdownParse.incremental",
         `msgId=${msgId} bodyLen=${body.length} streamFinished=${streamFinished}`,
       );
       this.parseMarkdown!.runTask(body);
+      if (streamFinished) {
+        this.lastFinishedBody = body;
+      }
     }
   }
 }

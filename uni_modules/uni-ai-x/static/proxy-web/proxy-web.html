@@ -164,90 +164,149 @@
               console.log(action + '方法执行失败', error);
             }
           }
+          isIOS() {
+            return /iPhone|iPad|iPod/i.test(window.navigator.userAgent || '');
+          }
+
+          /** iOS 上 fonts.ready / html2canvas 可能永不 settle，必须加超时。 */
+          withTimeout(promise, ms, fallback) {
+            return new Promise((resolve) => {
+              let done = false;
+              const finish = (value) => {
+                if (done) return;
+                done = true;
+                resolve(value);
+              };
+              setTimeout(() => finish(fallback), ms);
+              Promise.resolve(promise).then(
+                (value) => finish(value),
+                () => finish(fallback)
+              );
+            });
+          }
+
           async html2Base64(htmlString, scale = 3, setTheme = false) {
             const markImgContainer = document.getElementById('markImgContainer');
             markImgContainer.innerHTML = htmlString;
             if (setTheme) {
               markImgContainer.style.color = this.setting.theme == 'light' ? '#25282c' : '#ffffff';
             }
-            return new Promise((resolve, reject) => {
-              document.fonts.ready.then(() => {
-								  // 转化为PNG格式图片
-                  html2canvas(markImgContainer, {
-                    allowTaint: true,
-                    scale: window.devicePixelRatio * scale,
-                    imageTimeout: 300,
-                    logging: false, // 关闭日志减少内存占用
-                    foreignObjectRendering: false, // 减少内存占用
-                    removeContainer: true,
-                    useCORS: true,
-                    backgroundColor: setTheme ? (this.setting.theme == 'light' ? '#ffffff' : '#25282c') : '#FFFFFF'
-                  }).then(canvas => {
-                    // 清理容器内容
-                    markImgContainer.innerHTML = '';
-                    // blob 刷新后会丢失，所以不使用
-                    // if(parentIsWeb) {
-                    //   canvas.toBlob((blob) => {
-                    //     resolve(URL.createObjectURL(blob))
-                    //   })
-                    // } else {
-                      resolve(canvas.toDataURL('image/webp'));
-                    // }
-                  }).catch(error => {
-                    console.log('html2canvas error', error)
-                    resolve('')
-                  })
-							});
-            });
+            // iOS：fonts.ready 在本地 KaTeX 字体跨域失败时可能挂起，导致整条 katex 队列卡死（无 callback）
+            await this.withTimeout(document.fonts.ready, 1500, null);
+            try {
+              // iOS 画布像素上限更严；dpr*3 易超限得到空图或卡住。iOS 固定较低 scale。
+              const dpr = window.devicePixelRatio > 0 ? window.devicePixelRatio : 2;
+              const renderScale = this.isIOS()
+                ? Math.min(2, dpr)
+                : dpr * scale;
+              const canvas = await this.withTimeout(
+                html2canvas(markImgContainer, {
+                  allowTaint: true,
+                  scale: renderScale,
+                  imageTimeout: 300,
+                  logging: false,
+                  foreignObjectRendering: false,
+                  removeContainer: true,
+                  useCORS: true,
+                  backgroundColor: setTheme
+                    ? (this.setting.theme == 'light' ? '#ffffff' : '#25282c')
+                    : '#FFFFFF'
+                }),
+                8000,
+                null
+              );
+              markImgContainer.innerHTML = '';
+              if (canvas == null) {
+                console.log('html2canvas timeout');
+                return '';
+              }
+              // iOS Safari/WKWebView 不支持 toDataURL('image/webp')，会回退异常或空 data
+              let dataUrl = '';
+              try {
+                dataUrl = canvas.toDataURL('image/png');
+              } catch (e) {
+                console.log('toDataURL png error', e);
+                dataUrl = '';
+              }
+              if (dataUrl == null || dataUrl.length < 32 || dataUrl === 'data:,') {
+                console.log('toDataURL empty, try jpeg');
+                try {
+                  dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+                } catch (e2) {
+                  console.log('toDataURL jpeg error', e2);
+                  dataUrl = '';
+                }
+              }
+              return dataUrl;
+            } catch (error) {
+              console.log('html2canvas error', error);
+              markImgContainer.innerHTML = '';
+              return '';
+            }
           }
 
           async katexRender({ pureMathText, requestId }) {
-            // 把 \\ 替换为 \
-            pureMathText = pureMathText.replace(/\\\\/g, '\\');
-            const resultHtml = katex.renderToString(pureMathText, {
-                throwOnError: false,
-                displayMode: true, // true 为块级公式 \[ \]，false 为行内公式 \( \)
-                output: 'html',
-                trust: true, // 允许一些不安全的命令
-                strict: 'ignore' // 是否严格模式
-            });
-            // parentIsWeb = false 时，才需要转换为图片
-            const imageDataURL = parentIsWeb ? null : await this.html2Base64(resultHtml, 3, true);
-            const param = {
-              imageDataURL,
-              width: null,
-              height: null,
-              resultHtml: parentIsWeb ? resultHtml : ''
-            }
-            // 非 web 平台，则返回图片的宽高
-            if (!parentIsWeb) {
-              const tmpImg = document.createElement('img');
-              document.body.appendChild(tmpImg);
-              await new Promise(resolve => {
-                let settled = false;
-                const done = () => {
-                  if (settled) return;
-                  settled = true;
-                  resolve();
-                };
-                // 必须先监听再设置 data URL；否则图片可能同步完成，永久错过 load。
-                tmpImg.addEventListener('load', done, { once: true });
-                tmpImg.addEventListener('error', done, { once: true });
-                tmpImg.src = imageDataURL;
-                if (tmpImg.complete) {
-                  setTimeout(done, 0);
-                }
-                setTimeout(done, 3000);
+            try {
+              // 把 \\ 替换为 \
+              pureMathText = pureMathText.replace(/\\\\/g, '\\');
+              const resultHtml = katex.renderToString(pureMathText, {
+                  throwOnError: false,
+                  displayMode: true, // true 为块级公式 \[ \]，false 为行内公式 \( \)
+                  output: 'html',
+                  trust: true, // 允许一些不安全的命令
+                  strict: 'ignore' // 是否严格模式
               });
-              param.width = tmpImg.offsetWidth;
-              param.height = tmpImg.offsetHeight;
-              // console.log('katexRender width', param.width, 'height', param.height)
-              document.body.removeChild(tmpImg);
+              // parentIsWeb = false 时，才需要转换为图片
+              const imageDataURL = parentIsWeb ? null : await this.html2Base64(resultHtml, 3, true);
+              const param = {
+                imageDataURL,
+                width: null,
+                height: null,
+                resultHtml: parentIsWeb ? resultHtml : '',
+                error: (!parentIsWeb && (imageDataURL == null || imageDataURL.length < 32))
+                  ? 'empty_image'
+                  : ''
+              }
+              // 非 web 平台，则返回图片的宽高
+              if (!parentIsWeb && imageDataURL != null && imageDataURL.length >= 32) {
+                const tmpImg = document.createElement('img');
+                document.body.appendChild(tmpImg);
+                await new Promise(resolve => {
+                  let settled = false;
+                  const done = () => {
+                    if (settled) return;
+                    settled = true;
+                    resolve();
+                  };
+                  // 必须先监听再设置 data URL；否则图片可能同步完成，永久错过 load。
+                  tmpImg.addEventListener('load', done, { once: true });
+                  tmpImg.addEventListener('error', done, { once: true });
+                  tmpImg.src = imageDataURL;
+                  if (tmpImg.complete) {
+                    setTimeout(done, 0);
+                  }
+                  setTimeout(done, 3000);
+                });
+                param.width = tmpImg.offsetWidth;
+                param.height = tmpImg.offsetHeight;
+                document.body.removeChild(tmpImg);
+              }
+              this.postMessage({
+                action: "katexRender_callback_" + requestId,
+                param
+              });
+            } catch (error) {
+              this.postMessage({
+                action: "katexRender_callback_" + requestId,
+                param: {
+                  imageDataURL: '',
+                  resultHtml: '',
+                  width: null,
+                  height: null,
+                  error: error != null && error.message != null ? error.message : 'katexRender_failed'
+                }
+              });
             }
-            this.postMessage({
-              action: "katexRender_callback_" + requestId,
-              param
-            });
           }
         }
 
@@ -257,16 +316,22 @@
         window.onMessage = (...args) => window.proxyWebHandler.onMessage(...args);
     </script>
     <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        min-height: 100%;
+        background: transparent;
+      }
       #markImgContainer {
-        padding: 1px;
+        padding: 8px;
         display: flex;
         justify-content: center;
-        min-width: 100%;
-      }
-      @media (min-width: 960px) {
-        #markImgContainer {
-          min-width: 400px;
-        }
+        align-items: center;
+        /* 固定最小宽度，避免父 web-view 过窄时公式被压成几像素 */
+        min-width: 360px;
+        width: 100%;
+        box-sizing: border-box;
       }
     </style>
   </body>

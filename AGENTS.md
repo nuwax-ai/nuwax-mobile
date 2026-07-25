@@ -24,41 +24,41 @@
 | `release/nuwa-basic` | 开源 Nuwax App（可合 `main`） | uni-app x **官方通用基座** | → `main`；也可被桌搭线合入 |
 | `release/nuwa-zhuoda` | 桌搭 App（终端 Tab 等） | **自定义基座**（`pnpm base:fetch` / 本地打基座） | **当前生产上线线**；不反向合入 basic |
 
-### 版本需求开发分支（须带年月）
+### 版本需求开发分支（须带产品线 + 年月）
 
-按「需求启动月」打 `YYYY.MM`（两位月份），合入对应产品线后可删分支。
+格式：`feat/nuwa-<line>-<YYYY.MM>`（月度合集）或 `feat/nuwa-<line>-<YYYY.MM>-<slug>`（单需求）。`YYYY.MM` 为需求启动月（两位月份），合入对应产品线后可删分支。
 
 | 用途 | 命名格式 | 从哪拉 | 合回哪 |
 |---|---|---|---|
-| 开源月度迭代（整月合集） | `feat/<YYYY.MM>` | `release/nuwa-basic` | `release/nuwa-basic` → 再择机合 `main` |
-| 开源单需求 | `feat/<YYYY.MM>-<slug>` | `release/nuwa-basic` | 同上 |
-| 桌搭月度迭代（整月合集） | `feat/zhuoda/<YYYY.MM>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
-| 桌搭单需求 | `feat/zhuoda/<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | 同上 |
-| 开源线紧急修复 | `fix/<YYYY.MM>-<slug>` | `release/nuwa-basic` | `release/nuwa-basic` |
-| 桌搭线紧急修复 | `fix/zhuoda/<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
+| 开源月度迭代 | `feat/nuwa-basic-<YYYY.MM>` | `release/nuwa-basic` | `release/nuwa-basic` → 再择机合 `main` |
+| 开源单需求 | `feat/nuwa-basic-<YYYY.MM>-<slug>` | `release/nuwa-basic` | 同上 |
+| 桌搭月度迭代 | `feat/nuwa-zhuoda-<YYYY.MM>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
+| 桌搭单需求 | `feat/nuwa-zhuoda-<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | 同上 |
+| 开源线紧急修复 | `fix/nuwa-basic-<YYYY.MM>-<slug>` | `release/nuwa-basic` | `release/nuwa-basic` |
+| 桌搭线紧急修复 | `fix/nuwa-zhuoda-<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
 
 示例：
 
-- `feat/2026.07` / `feat/zhuoda/2026.07` —— 当月版本开发合集分支
-- `feat/2026.07-provision-wifi` —— 开源线单需求
-- `feat/zhuoda/2026.07-terminal-meeting` —— 桌搭单需求
-- `fix/zhuoda/2026.07-ble-scan` —— 桌搭 BLE 扫描热修
+- `feat/nuwa-basic-2026.07` / `feat/nuwa-zhuoda-2026.07` —— 当月版本开发合集分支
+- `feat/nuwa-basic-2026.07-provision-wifi` —— 开源线单需求
+- `feat/nuwa-zhuoda-2026.07-terminal-meeting` —— 桌搭单需求
+- `fix/nuwa-zhuoda-2026.07-ble-scan` —— 桌搭 BLE 扫描热修
 
 `slug` 用小写英文短横线，**只概括需求主题**（如 `terminal-meeting`、`provision-wifi`）；**禁止**人名、花名、个人后缀（如 `-dong`）。同一版本迭代可多个单需求分支并行。
 
 ### 流向（单向）
 
 ```text
-feat/<YYYY.MM>[-<slug>]           →  release/nuwa-basic  →  main
-                                           ↓ 定期 merge
-feat/zhuoda/<YYYY.MM>[-<slug>]    →  release/nuwa-zhuoda  →  生产发版
+feat/nuwa-basic-<YYYY.MM>[-<slug>]    →  release/nuwa-basic  →  main
+                                               ↓ 定期 merge
+feat/nuwa-zhuoda-<YYYY.MM>[-<slug>]   →  release/nuwa-zhuoda  →  生产发版
 ```
 
 ### 派生与合入规则
 
 - **禁止**桌搭专属提交直接合入 `release/nuwa-basic` / `main`
 - **推荐**定期把 `release/nuwa-basic` merge 进 `release/nuwa-zhuoda`
-- `dev` 与历史 `feat-2026.*` 等旧分支保留不动；新需求一律按上表带 `YYYY.MM` 命名，**不要**再写 `feat-2026.7.18`、`feature/2026.07-zhuoda-dong` 这类旧格式
+- `dev` 与历史 `feat-2026.*` 等旧分支保留不动；新需求一律按上表命名，**不要**再写 `feat/2026.07`、`feat/zhuoda/2026.07`、`feat-2026.7.18`、`feature/2026.07-zhuoda-dong` 这类旧格式
 
 旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
 

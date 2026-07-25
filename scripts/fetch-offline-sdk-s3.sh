@@ -30,7 +30,7 @@ Options:
   --version VER   固定 HX 版本（默认读 latest.json 拉最新）
   -h, --help
 
-还原内容：sdk/ + archives/（work/ 不打包，由构建脚本按需生成）。
+还原内容：sdk/ + archives/ + iOS ESP 源码（work 的派生产物由构建脚本按需生成）。
 
 Environment:
   NUWAX_OFFLINE_SDK_HOME   解压根目录
@@ -152,6 +152,8 @@ miss=0
 [[ -d "$DEST_DIR/sdk/android/$VERSION" ]] || { warn "缺失 sdk/android/$VERSION"; miss=1; }
 [[ -d "$DEST_DIR/sdk/ios/$VERSION" ]]     || { warn "缺失 sdk/ios/$VERSION"; miss=1; }
 [[ -d "$DEST_DIR/archives" ]]             || { warn "缺失 archives/"; miss=1; }
+# iOS ESP 源码（信息性：Android 用不到；缺失则 iOS 模拟器基座需另备 ESP 源码）
+[[ -d "$DEST_DIR/work/ios/src/SwiftProtobuf" ]] || warn "缺失 work/ios/src/SwiftProtobuf（iOS 模拟器基座需 ESP 源码）"
 
 echo
 if [[ "$miss" == "0" ]]; then

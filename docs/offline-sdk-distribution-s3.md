@@ -10,10 +10,11 @@
 |------|----------|------|
 | `sdk/`     | ✅ | 各平台解压好的 uni-app x SDK（`{ios,android,harmony}/5.15/...`） |
 | `archives/`| ✅ | 官方原始 zip（版本溯源 / 重钉） |
-| `work/`    | ❌ | 工作副本 + DerivedData + 编译产物。**跨机不可用**（DerivedData 绑绝对路径/签名），由各机构建脚本按需生成 |
+| iOS ESP 源码（`work/ios/{src/SwiftProtobuf,src/ESPProvision,SwiftProtobuf,ESPProvision}`） | ✅ | **非派生输入**；iOS 从源码编 ESPProvision/SwiftProtobuf framework 必需，否则打不出 iOS 模拟器基座 |
+| `work/` 派生产物（`build/` `out/` DerivedData） | ❌ | 跨机不可用（DerivedData 绑绝对路径/签名），由各机构建脚本按需生成 |
 | **iOS 证书 / Profile / 密钥** | ❌❌ | **绝不打包、绝不外传**。见下文「iOS 签名」 |
 
-打包脚本：[`scripts/publish-offline-sdk-s3.sh`](../scripts/publish-offline-sdk-s3.sh) 只 `tar` 了 `sdk/ + archives/`，并显式不包含 `work/`。已核实包内无 `.p12 / .mobileprovision / .cer / .key`。
+打包脚本：[`scripts/publish-offline-sdk-s3.sh`](../scripts/publish-offline-sdk-s3.sh) 打包 `sdk/ + archives/ + iOS ESP 源码`，排除 `work/` 的派生产物。已核实包内无 `.p12 / .mobileprovision / .cer / .key`。
 
 ## 发布（维护者）
 

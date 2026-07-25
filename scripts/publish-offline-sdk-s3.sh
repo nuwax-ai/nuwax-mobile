@@ -88,16 +88,21 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 echo "Publishing offline SDK version=$VERSION"
-echo "  source:   $SDK_HOME (sdk + archives; work excluded)"
+echo "  source:   $SDK_HOME (sdk + archives + iOS ESP 源码；work 派生产物 excluded)"
 echo "  endpoint: $ENDPOINT"
 echo "  bucket:   $BUCKET"
 echo "  prefix:   $PREFIX"
 [[ "$DRY_RUN" == "1" ]] && echo "  [DRY RUN]"
 
-# 打包：只含 sdk/ + archives/（work/ 跨机不可用，不打）
+# 打包：sdk/ + archives/ + iOS ESP 源码输入（work 的派生产物 build/out/DerivedData 仍不打）
 INCLUDE=()
 [[ -d "$SDK_HOME/sdk" ]] && INCLUDE+=("sdk")
 [[ -d "$SDK_HOME/archives" ]] && INCLUDE+=("archives")
+# iOS ESP 源码（非派生输入；fresh fetch 后从源码编 ESPProvision/SwiftProtobuf framework 必需，否则 iOS 模拟器基座打不出）
+ESP_SRC_DIRS=("work/ios/src/SwiftProtobuf" "work/ios/src/ESPProvision" "work/ios/SwiftProtobuf" "work/ios/ESPProvision")
+for d in "${ESP_SRC_DIRS[@]}"; do
+  [[ -d "$SDK_HOME/$d" ]] && INCLUDE+=("$d")
+done
 if [[ ${#INCLUDE[@]} == 0 ]]; then
   echo "sdk/ 与 archives/ 均不存在，无内容可打包" >&2; exit 1
 fi
@@ -126,8 +131,8 @@ MANIFEST="$STAGE/manifest.json"
   echo "  \"bytes\": $SIZE,"
   echo "  \"gitSha\": \"$GIT_SHA\","
   echo "  \"releasedAt\": \"$RELEASE_DATE\","
-  echo "  \"includes\": [\"sdk\", \"archives\"],"
-  echo "  \"excludes\": [\"work\"]"
+  echo "  \"includes\": [\"sdk\", \"archives\", \"ios-esp-source\"],"
+  echo "  \"excludes\": [\"work/build\", \"work/out\", \"DerivedData\"]"
   echo "}"
 } > "$MANIFEST"
 echo "→ manifest:"

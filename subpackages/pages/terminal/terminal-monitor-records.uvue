@@ -2,42 +2,55 @@
   <view class="container relative flex flex-col">
     <custom-nav-bar :title="t('Mobile.Terminal.monitorRecords')" className="border-b" hasSafetyZone showBack />
 
-    <!-- 搜索 + 筛选 -->
+    <!-- 搜索 + 时间筛选 -->
     <view class="search-row">
       <view class="search-box">
-        <input class="search-input" v-model="keyword" :placeholder="searchPlaceholder" placeholder-class="search-placeholder" />
+        <input class="search-input" v-model="keyword" :placeholder="searchPlaceholder" placeholder-class="search-placeholder" @confirm="handleSearch" />
       </view>
       <view class="filter-btn" hover-class="filter-btn-active" @click="handleFilter">
-        <text class="filter-text">{{ currentFilter }}</text>
+        <text class="filter-text">{{ currentFilterLabel }}</text>
       </view>
     </view>
 
-    <scroll-view class="flex-1" direction="vertical" :show-scrollbar="false">
+    <scroll-view class="flex-1" direction="vertical" :show-scrollbar="false" @scrolltolower="handleLoadMore">
       <view class="record-list">
-        <view :class="['record-card', 'level-' + item.level]" v-for="item in filteredList" :key="item.time">
+        <view
+          :class="['record-card', 'level-' + item.level]"
+          v-for="item in recordList"
+          :key="item.id"
+          hover-class="record-card-active"
+          @click="handleDetail(item)"
+        >
           <view class="record-head">
-            <view class="keyword-tag">
-              <text :class="['keyword-text', 'keyword-' + item.level]">{{ item.keyword }}</text>
-            </view>
-            <text class="record-date">{{ item.time }}</text>
+            <text class="record-title text-ellipsis">{{ item.title != '' ? item.title : t('Mobile.Terminal.untitledMeeting') }}</text>
+            <text class="record-date">{{ formatDate(item.startedAt) }}</text>
           </view>
-          <text class="record-summary">{{ item.summary }}</text>
-          <view class="record-actions">
-            <view class="action-btn" hover-class="action-btn-active" @click="handleAction(t('Mobile.Terminal.replay'))">
+          <view class="record-meta">
+            <text :class="['keyword-text', 'keyword-' + item.level]">{{ item.keyword }}</text>
+            <text v-if="item.fileAsrStatus == 'FAILED' || item.summaryStatus == 'FAILED'" class="record-status-fail">{{ t("Mobile.Terminal.processFailed") }}</text>
+            <text v-else-if="item.fileAsrStatus == 'PENDING' || item.summaryStatus == 'PENDING'" class="record-status-pending">{{ t("Mobile.Terminal.processing") }}</text>
+          </view>
+          <text v-if="item.briefSummary != ''" class="record-summary">{{ item.briefSummary }}</text>
+          <view class="record-actions" @tap.stop="">
+            <view v-if="item.hasAudio" class="action-btn" hover-class="action-btn-active" @click="handleReplay(item)">
               <text class="action-text">▶ {{ t("Mobile.Terminal.replay") }}</text>
             </view>
-            <view class="action-btn" hover-class="action-btn-active" @click="handleAction(t('Mobile.Terminal.download'))">
-              <text class="action-text">⬇ {{ t("Mobile.Terminal.download") }}</text>
-            </view>
-            <view class="action-btn action-btn-primary" hover-class="action-btn-active" @click="handleDetail(item.keyword)">
-              <text class="action-text-primary">{{ t("Mobile.Terminal.viewDetail") }}</text>
+            <view v-if="item.hasAudio" :class="['action-btn', item.downloading ? 'action-btn--busy' : '']" hover-class="action-btn-active" @click="handleDownload(item)">
+              <text class="action-text">{{ item.downloading ? "… " : "⬇ " }}{{ item.downloading ? t("Mobile.Terminal.downloading") : t("Mobile.Terminal.download") }}</text>
             </view>
           </view>
         </view>
 
         <!-- 空状态 -->
-        <view class="empty-box" v-if="filteredList.length == 0">
+        <view class="empty-box" v-if="!loading && recordList.length == 0">
           <text class="empty-text">{{ t("Mobile.Terminal.noMonitorRecords") }}</text>
+        </view>
+        <!-- 加载更多 -->
+        <view class="empty-box" v-if="loading">
+          <text class="empty-text">{{ t("Mobile.Terminal.loading") }}</text>
+        </view>
+        <view class="empty-box" v-if="!loading && !hasMore && recordList.length > 0">
+          <text class="empty-text">{{ t("Mobile.Terminal.noMore") }}</text>
         </view>
       </view>
       <view class="bottom-space"></view>
@@ -46,65 +59,230 @@
 </template>
 
 <script setup lang="uts">
-  import { ref, computed } from "vue";
-  import { onLoad } from "@dcloudio/uni-app";
+  import { ref } from "vue";
+  import { onLoad, onShow } from "@dcloudio/uni-app";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiVoxMeetingList, apiVoxMeetingAudioUrl } from "@/servers/vox/voxMeeting";
+  import { AppMeetingListParams } from "@/types/interfaces/voxMeeting";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
+  import { SUCCESS_CODE, USER_NO_LOGIN, REDIRECT_LOGIN } from "@/constants/codes.constants";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
   const keyword = ref<string>("");
-  const currentFilter = ref<string>(t("Mobile.Terminal.allTime"));
   const searchPlaceholder = ref<string>(t("Mobile.Terminal.searchKeyword"));
 
+  /**
+   * 监控告警记录：复用会议接口数据（监控模式记录的告警片段与会议同一存储）。
+   * level 由处理状态推导：FAILED=error、PENDING=warn、其余=info；keyword 取标题首词做标签。
+   */
   class MonitorRecord {
-    time: string = "";
+    id: number = 0;
+    title: string = "";
+    briefSummary: string = "";
+    summaryStatus: string = "";
+    fileAsrStatus: string = "";
+    hasAudio: boolean = false;
+    startedAt: string = "";
     keyword: string = "";
-    level: string = "";
-    summary: string = "";
-    constructor(time: string, keyword: string, level: string, summary: string) {
-      this.time = time;
-      this.keyword = keyword;
-      this.level = level;
-      this.summary = summary;
+    level: string = "info";
+    downloading: boolean = false;
+    constructor(
+      id: number, title: string, brief: string, summaryStatus: string, fileAsrStatus: string,
+      hasAudio: boolean, startedAt: string,
+    ) {
+      this.id = id;
+      this.title = title;
+      this.briefSummary = brief;
+      this.summaryStatus = summaryStatus;
+      this.fileAsrStatus = fileAsrStatus;
+      this.hasAudio = hasAudio;
+      this.startedAt = startedAt;
+      this.keyword = title.length > 8 ? title.substring(0, 8) : title;
+      if (summaryStatus == "FAILED" || fileAsrStatus == "FAILED") {
+        this.level = "error";
+      } else if (summaryStatus == "PENDING" || fileAsrStatus == "PENDING") {
+        this.level = "warn";
+      } else {
+        this.level = "info";
+      }
     }
   }
 
-  const recordList = ref<MonitorRecord[]>([
-    new MonitorRecord("07-18 15:22", "线上故障", "error", "检测到关键词挂了和500，触发告警，已通知DevOps-Agent排查"),
-    new MonitorRecord("07-18 14:10", "紧急上线", "warn", "对话中出现紧急部署关键词，创建紧急上线任务单"),
-    new MonitorRecord("07-18 11:45", "数据异常", "error", "检测到数据丢失关键词，手动确认后触发数据恢复流程"),
-    new MonitorRecord("07-17 16:30", "安全风险", "warn", "对话中提到权限异常，安全检查已自动运行"),
-    new MonitorRecord("07-17 09:15", "线上故障", "info", "预警关键词报错出现但上下文无故障特征，记录备查"),
-  ]);
+  const recordList = ref<MonitorRecord[]>([]);
+  const loading = ref<boolean>(false);
+  const page = ref<number>(1);
+  const pageSize = 10;
+  const total = ref<number>(0);
+  const hasMore = ref<boolean>(false);
 
-  // 前端过滤
-  const filteredList = computed((): MonitorRecord[] => {
-    const kw = keyword.value;
-    if (kw.length == 0) return recordList.value;
-    const result: MonitorRecord[] = [] as MonitorRecord[];
-    recordList.value.forEach((item: MonitorRecord) => {
-      if (item.keyword.indexOf(kw) >= 0 || item.summary.indexOf(kw) >= 0) {
-        result.push(item);
+  // 时间筛选（timeRange）
+  class FilterOption {
+    value: string = "";
+    label: string = "";
+    constructor(value: string, label: string) {
+      this.value = value;
+      this.label = label;
+    }
+  }
+  const timeRange = ref<string>("ALL");
+  const currentFilterLabel = ref<string>(t("Mobile.Terminal.allTime"));
+  const filterOptions = [
+    new FilterOption("ALL", t("Mobile.Terminal.allTime")),
+    new FilterOption("TODAY", t("Mobile.Terminal.rangeToday")),
+    new FilterOption("THIS_WEEK", t("Mobile.Terminal.rangeThisWeek")),
+    new FilterOption("THIS_MONTH", t("Mobile.Terminal.rangeThisMonth")),
+  ];
+
+  // ISO 时间 → MM-DD HH:mm 展示
+  const formatDate = (iso: string): string => {
+    if (iso.length < 16) return iso;
+    return `${iso.substring(5, 10)} ${iso.substring(11, 16)}`;
+  };
+
+  const fetchList = async (reset: boolean) => {
+    if (loading.value) return;
+    loading.value = true;
+    if (reset) {
+      page.value = 1;
+    }
+    try {
+      const params = new AppMeetingListParams();
+      params.keyword = keyword.value.trim();
+      params.timeRange = timeRange.value;
+      params.page = page.value;
+      params.pageSize = pageSize;
+      const res = await apiVoxMeetingList(params);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const raw = apiResData<any>(res);
+        const obj = raw != null ? (raw as UTSJSONObject) : null;
+        const itemsVal = obj != null ? obj["items"] : null;
+        const items = itemsVal != null ? (itemsVal as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        const list: MonitorRecord[] = [];
+        for (let i = 0; i < items.length; i++) {
+          const m = items[i];
+          const idVal = m["id"];
+          const titleVal = m["title"];
+          const briefVal = m["briefSummary"];
+          const ssVal = m["summaryStatus"];
+          const asrVal = m["fileAsrStatus"];
+          const audioVal = m["audioFileUrl"];
+          const startVal = m["startedAt"];
+          list.push(new MonitorRecord(
+            idVal != null ? (idVal as number) : 0,
+            titleVal != null ? `${titleVal}` : "",
+            briefVal != null ? `${briefVal}` : "",
+            ssVal != null ? `${ssVal}` : "",
+            asrVal != null ? `${asrVal}` : "",
+            audioVal != null && `${audioVal}` != "",
+            startVal != null ? `${startVal}` : "",
+          ));
+        }
+        if (reset) {
+          recordList.value = list;
+        } else {
+          recordList.value = recordList.value.concat(list);
+        }
+        const totalVal = obj != null ? obj["total"] : null;
+        total.value = totalVal != null ? (totalVal as number) : 0;
+        hasMore.value = recordList.value.length < total.value;
+      } else if (apiResCode(res) != USER_NO_LOGIN && apiResCode(res) != REDIRECT_LOGIN) {
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.fetchMeetingsFailed"), icon: "none" });
       }
-    });
-    return result;
-  });
+    } catch (e) {
+      console.error("fetchList error", e);
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  const handleSearch = () => {
+    fetchList(true);
+  };
 
   const handleFilter = () => {
-    uni.showToast({ title: currentFilter.value, icon: "none" });
+    const labels: string[] = [];
+    const values: string[] = [];
+    for (let i = 0; i < filterOptions.length; i++) {
+      labels.push(filterOptions[i].label);
+      values.push(filterOptions[i].value);
+    }
+    uni.showActionSheet({
+      itemList: labels,
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        const next = values[res.tapIndex];
+        if (next != timeRange.value) {
+          timeRange.value = next;
+          currentFilterLabel.value = labels[res.tapIndex];
+          fetchList(true);
+        }
+      },
+    });
   };
 
-  const handleAction = (action: string) => {
-    uni.showToast({ title: action, icon: "none" });
+  const handleLoadMore = () => {
+    if (!hasMore.value || loading.value) return;
+    page.value = page.value + 1;
+    fetchList(false);
   };
 
-  const handleDetail = (kw: string) => {
-    uni.showToast({ title: kw, icon: "none" });
+  const handleReplay = (item: MonitorRecord) => {
+    uni.navigateTo({ url: `/subpackages/pages/terminal/terminal-meeting-detail?id=${item.id}&autoplay=1` });
+  };
+
+  /** 真实下载：拉临时播放地址 → uni.downloadFile 存本地 */
+  const handleDownload = async (item: MonitorRecord) => {
+    if (item.downloading) return;
+    item.downloading = true;
+    try {
+      const res = await apiVoxMeetingAudioUrl(item.id);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.downloadFailed"), icon: "none" });
+        return;
+      }
+      const raw = apiResData<any>(res);
+      const obj = raw != null ? (raw as UTSJSONObject) : null;
+      const urlVal = obj != null ? obj["url"] : null;
+      const url = urlVal != null ? `${urlVal}` : "";
+      if (url == "") {
+        uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
+        return;
+      }
+      uni.downloadFile({
+        url: url,
+        success: (dl) => {
+          if (dl.statusCode == 200) {
+            uni.showToast({ title: t("Mobile.Terminal.downloadDone"), icon: "none" });
+          } else {
+            uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
+          }
+        },
+        fail: (_e) => {
+          uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
+        },
+      });
+    } catch (e) {
+      console.error("handleDownload error", e);
+      uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
+    } finally {
+      item.downloading = false;
+    }
+  };
+
+  const handleDetail = (item: MonitorRecord) => {
+    uni.navigateTo({ url: `/subpackages/pages/terminal/terminal-meeting-detail?id=${item.id}` });
   };
 
   onLoad((options: any) => {
     setCurrentPageNavigationBarTitle();
+  });
+
+  onShow(() => {
+    fetchList(true);
   });
 </script>
 
@@ -166,8 +344,7 @@
     padding: 32rpx;
     margin-bottom: 20rpx;
     border-left: 6rpx solid #c0c0c0;
-
-    &.level-error {
+&.level-error {
       border-left-color: #fa5151;
     }
 
@@ -179,42 +356,69 @@
       border-left-color: #999999;
     }
 
+    &-active {
+      background-color: rgba(12, 20, 102, 0.04);
+    }
+
     .record-head {
       display: flex;
       flex-direction: row;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
-      margin-bottom: 16rpx;
+      margin-bottom: 12rpx;
 
-      .keyword-tag {
-        display: flex;
-        flex-direction: row;
-        align-items: center;
-
-        .keyword-text {
-          font-size: 22rpx;
-          padding: 4rpx 16rpx;
-          border-radius: 8rpx;
-          font-weight: 600;
-
-          &.keyword-error {
-            color: #fa5151;
-          }
-
-          &.keyword-warn {
-            color: #ff9500;
-          }
-
-          &.keyword-info {
-            color: #666666;
-          }
-        }
+      .record-title {
+        flex: 1;
+        font-size: 30rpx;
+        font-weight: 600;
+        color: #1a1a1a;
+        margin-right: 16rpx;
       }
 
       .record-date {
         font-size: 22rpx;
         color: #999999;
         flex-shrink: 0;
+      }
+    }
+
+    .record-meta {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      margin-bottom: 12rpx;
+
+      .keyword-text {
+        font-size: 22rpx;
+        padding: 4rpx 16rpx;
+        border-radius: 8rpx;
+        font-weight: 600;
+        margin-right: 16rpx;
+
+        &.keyword-error {
+          color: #fa5151;
+          background-color: rgba(250, 81, 81, 0.08);
+        }
+
+        &.keyword-warn {
+          color: #ff9500;
+          background-color: rgba(255, 149, 0, 0.08);
+        }
+
+        &.keyword-info {
+          color: #666666;
+          background-color: #f0f0f0;
+        }
+      }
+
+      .record-status-fail {
+        font-size: 22rpx;
+        color: #dd524d;
+      }
+
+      .record-status-pending {
+        font-size: 22rpx;
+        color: #f0a020;
       }
     }
 
@@ -228,30 +432,26 @@
     .record-actions {
       display: flex;
       flex-direction: row;
+      flex-wrap: wrap;
 
       .action-btn {
         padding: 12rpx 24rpx;
         border-radius: 12rpx;
         border: 2rpx solid #e0e0e0;
         margin-right: 16rpx;
+        margin-bottom: 8rpx;
 
         &-active {
           background-color: rgba(12, 20, 102, 0.04);
         }
 
+        &--busy {
+          opacity: 0.6;
+        }
+
         .action-text {
           font-size: 24rpx;
           color: #666666;
-        }
-
-        &.action-btn-primary {
-          border-color: #5147ff;
-          background-color: rgba(81, 71, 255, 0.08);
-
-          .action-text-primary {
-            font-size: 24rpx;
-            color: #5147ff;
-          }
         }
       }
     }
@@ -272,4 +472,6 @@
   .bottom-space {
     height: 40rpx;
   }
+
+  
 </style>

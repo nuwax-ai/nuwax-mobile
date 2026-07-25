@@ -15,28 +15,47 @@
 
 ## 产品线分支规范
 
-仓库用两条长期 `release/*` 产品线区分「开源通用基座」与「桌搭自定义基座」，**不要**再用 `feat-app-zhuoda` / `feature/2026.07-zhuoda-dong` 等临时/日期名作为长期线。
+仓库用两条长期 `release/*` 产品线区分「开源通用基座」与「桌搭自定义基座」。**日期月份只用于版本需求开发分支**，不得用在长期产品线上（禁止再用 `feat-app-zhuoda`、`feature/2026.07-zhuoda-dong` 这类名字当长期线）。
+
+### 长期产品线
 
 | 分支 | 产品 | 基座 | 合入 / 上线 |
 |---|---|---|---|
 | `release/nuwa-basic` | 开源 Nuwax App（可合 `main`） | uni-app x **官方通用基座** | → `main`；也可被桌搭线合入 |
 | `release/nuwa-zhuoda` | 桌搭 App（终端 Tab 等） | **自定义基座**（`pnpm base:fetch` / 本地打基座） | **当前生产上线线**；不反向合入 basic |
 
-流向（单向）：
+### 版本需求开发分支（须带年月）
+
+按「需求启动月」打 `YYYY.MM`（两位月份），合入对应产品线后可删分支。
+
+| 用途 | 命名格式 | 从哪拉 | 合回哪 |
+|---|---|---|---|
+| 开源 / 通用能力 | `feat/<YYYY.MM>-<slug>` | `release/nuwa-basic` | `release/nuwa-basic` → 再择机合 `main` |
+| 桌搭专属 | `feat/zhuoda/<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
+| 开源线紧急修复 | `fix/<YYYY.MM>-<slug>` | `release/nuwa-basic` | `release/nuwa-basic` |
+| 桌搭线紧急修复 | `fix/zhuoda/<YYYY.MM>-<slug>` | `release/nuwa-zhuoda` | `release/nuwa-zhuoda` |
+
+示例：
+
+- `feat/2026.07-provision-wifi` —— 2026 年 7 月开源线配网需求
+- `feat/zhuoda/2026.07-terminal-meeting` —— 同月桌搭终端会议需求
+- `fix/zhuoda/2026.07-ble-scan` —— 桌搭 BLE 扫描热修
+
+`slug` 用小写英文短横线，概括需求主题；同一版本迭代可多个分支并行（不同 slug）。
+
+### 流向（单向）
 
 ```text
-feat/<topic>  →  release/nuwa-basic  →  main
-                      ↓ 定期 merge
-                 release/nuwa-zhuoda  →  生产发版
+feat/<YYYY.MM>-<slug>           →  release/nuwa-basic  →  main
+                                         ↓ 定期 merge
+feat/zhuoda/<YYYY.MM>-<slug>    →  release/nuwa-zhuoda  →  生产发版
 ```
 
-派生规则：
+### 派生与合入规则
 
-- 改开源通用能力：从 `release/nuwa-basic` 拉 `feat/<topic>` 或 `fix/<topic>`，PR 回 `release/nuwa-basic`，再择机合 `main`
-- 改桌搭专属（终端、ESP 配网、自定义基座脚本等）：从 `release/nuwa-zhuoda` 拉 `feat/zhuoda/<topic>`，PR 回 `release/nuwa-zhuoda`
 - **禁止**桌搭专属提交直接合入 `release/nuwa-basic` / `main`
 - **推荐**定期把 `release/nuwa-basic` merge 进 `release/nuwa-zhuoda`
-- `dev` 与历史 `feat-YYYY.*` 分支保留不动；新工作不再用日期型 `feat-YYYY.M.D` / `feature/YYYY.MM-*` 作长期线名
+- `dev` 与历史 `feat-2026.*` 等旧分支保留不动；新需求一律按上表带 `YYYY.MM` 命名，**不要**再写 `feat-2026.7.18`（缺零、把长期线当需求分支）这类旧格式
 
 旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
 

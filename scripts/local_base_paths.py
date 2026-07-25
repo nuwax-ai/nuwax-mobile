@@ -10,7 +10,7 @@ def offline_home() -> Path:
     return Path(
         os.environ.get(
             "NUWAX_OFFLINE_SDK_HOME",
-            "/Users/apple/workspace/nuwax-mobile-offline-sdk",
+            os.path.expanduser("~/workspace/nuwax-mobile-offline-sdk"),
         )
     )
 

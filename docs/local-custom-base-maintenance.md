@@ -56,7 +56,7 @@ nuwax-mobile-offline-sdk/              # 本机统一入口
 `base-ship` = 生成本地打包 App 资源 → 打三端基座 → 上传 S3：
 
 ```bash
-cd /Users/apple/workspace/nuwax-mobile
+cd <本仓根目录>  # nuwax-mobile
 # 需先打开 HBuilderX，且项目已导入；发 S3 需 NUWAX_S3_* 或 ~/.aws
 make base-ship
 # 或：pnpm base:ship
@@ -83,11 +83,15 @@ make base-all              # 三份一起打（不装设备、不上 S3）
 
 | 文件 | 用途 |
 |------|------|
-| `android_debug.apk` | Android 真机 / 模拟器（同一包） |
+| `android_debug.apk` | Android 真机 / 模拟器（同一包；默认含 HX `debug-server`，见 `ENABLE_HX_DEBUG`） |
 | `iOS_debug.ipa` | **iOS 真机** HX 自定义基座 |
-| `Pandora_simulator_debug.app` | **iOS 模拟器**（官方命名；与真机包分离，勿混用） |
+| `Pandora_simulator_debug.app` | **iOS 模拟器**（官方命名；**Release + 默认 x86_64/Rosetta**，对齐 ExtAPI 仅有的 x86_64-sim；与真机包勿混用） |
 
 一键出包（不含资源/S3）：`./scripts/package-custom-bases.sh`（`TARGETS=android,ios-device,ios-simulator`）。
+
+Android 调试基座：`configure_app.py` 默认 `ENABLE_HX_DEBUG=1`（`app/libs/debug-server` + `DCLOUD_DEBUG`），否则 HX 控制台无 `console.log`。正式向包用 `ENABLE_HX_DEBUG=0`。
+
+iOS 模拟器注意：官方 5.15 `DCloudUTSExtAPI` 无 arm64-simulator slice。Apple Silicon 上若出现「UTS-Storage / uni-getSystemInfo 模块不存在」，请用脚本默认的 `SIM_FORCE_X86_64=1` 重打，并安装/选用 **支持 Rosetta** 的 iOS Simulator runtime（见 DCloud 模拟器文档）。
 
 ## 4. S3 分发（同事免打包）
 

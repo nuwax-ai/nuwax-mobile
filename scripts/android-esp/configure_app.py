@@ -5,6 +5,7 @@
 - DCLOUD_UNI_APPID = __UNI__8BF05E4
 - dcloud_appkey
 - 从 settings / app / uniappx 去掉示例 UTS 模块依赖，只保留 uniappx + 我们的插件
+- 默认 ENABLE_HX_DEBUG=1：拷贝 debug-server → app/libs + DCLOUD_DEBUG（HX 控制台 log）
 """
 from __future__ import annotations
 
@@ -22,10 +23,12 @@ WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
 PROJ = WORK / "project"
 APPID = os.environ.get("APPID", "__UNI__8BF05E4")
 BUNDLE = os.environ.get("ANDROID_BUNDLE_ID", "com.nuwax.nuwa")
-APPKEY = os.environ.get(
-    "DCLOUD_APPKEY",
-    "02c109ded799bad828c3183534b330e3",  # 与 iOS 离线 AppKey 同源
-)
+APPKEY = os.environ.get("DCLOUD_APPKEY")
+if not APPKEY:
+    raise SystemExit("✗ 未设置 DCLOUD_APPKEY（写到 scripts/local-secrets.env，已 gitignore）")
+# 是否为 HBuilderX 自定义基座打入调试通道（debug-server + DCLOUD_DEBUG）。
+# 默认开启；正式发行包请设 ENABLE_HX_DEBUG=0，否则可能提示「正在加载调试框架」。
+ENABLE_HX_DEBUG = os.environ.get("ENABLE_HX_DEBUG", "1") != "0"
 # 本机若未装 platforms;android-36 / build-tools;35，可降到已安装的 34（官方示例默认常为 36）
 # 官方示例默认 compileSdk 36；本机需已装 platforms;android-36
 COMPILE_SDK = int(os.environ.get("ANDROID_COMPILE_SDK", "36"))
@@ -196,12 +199,88 @@ def configure_manifest() -> None:
     print(f"✓ uniappx AndroidManifest appid={APPID} dcloud_appkey=***")
 
 
+def find_debug_server_aar() -> Path | None:
+    """在离线 SDK 中定位 debug-server-release.aar（HX 日志/资源同步依赖）。"""
+    candidates = [
+        WORK / "sdk-root" / "SDK" / "libs" / "debug-server-release.aar",
+        WORK / "Android-uni-app-x-SDK@14915-5.15" / "SDK" / "libs" / "debug-server-release.aar",
+        # project/app → ../../SDK/libs（官方示例相对路径）
+        PROJ / ".." / "SDK" / "libs" / "debug-server-release.aar",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    return None
+
+
+def enable_hx_debug_channel() -> None:
+    """
+    按官方「原生联调」为自定义调试基座打入 HX 控制台通道：
+    1) 复制 debug-server-release.aar → app/libs（主模块 fileTree 会打进包）
+    2) app Manifest 写入 DCLOUD_DEBUG=true
+    SDK/libs 的 fileTree 仍 exclude debug-server，避免与广告排除策略纠缠；正式包用 ENABLE_HX_DEBUG=0。
+    """
+    app_libs = PROJ / "app" / "libs"
+    app_manifest = PROJ / "app" / "src" / "main" / "AndroidManifest.xml"
+    dest_aar = app_libs / "debug-server-release.aar"
+
+    if not ENABLE_HX_DEBUG:
+        # 关闭时移除残留，避免误带进「正式向」本地包
+        if dest_aar.is_file():
+            dest_aar.unlink()
+            print("✓ 已移除 app/libs/debug-server-release.aar（ENABLE_HX_DEBUG=0）")
+        if app_manifest.is_file():
+            text = app_manifest.read_text()
+            text2 = re.sub(
+                r'\s*<meta-data\s+android:name="DCLOUD_DEBUG"\s+android:value="[^"]*"\s*/>\s*',
+                "\n",
+                text,
+            )
+            if text2 != text:
+                app_manifest.write_text(text2)
+                print("✓ 已移除 app Manifest DCLOUD_DEBUG（ENABLE_HX_DEBUG=0）")
+        return
+
+    src = find_debug_server_aar()
+    if src is None:
+        die(
+            "找不到 debug-server-release.aar（ENABLE_HX_DEBUG=1）。"
+            "请确认离线 SDK 含 SDK/libs/debug-server-release.aar，或设 ENABLE_HX_DEBUG=0"
+        )
+    app_libs.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest_aar)
+    print(f"✓ 已复制 debug-server → app/libs/ ({src})")
+
+    if not app_manifest.is_file():
+        die(f"找不到 {app_manifest}")
+    text = app_manifest.read_text()
+    if 'android:name="DCLOUD_DEBUG"' in text:
+        text = re.sub(
+            r'android:name="DCLOUD_DEBUG"\s+android:value="[^"]*"',
+            'android:name="DCLOUD_DEBUG" android:value="true"',
+            text,
+        )
+    else:
+        if "</application>" not in text:
+            die("app AndroidManifest 缺少 </application>，无法写入 DCLOUD_DEBUG")
+        text = text.replace(
+            "</application>",
+            '        <!-- HX 自定义基座：控制台 log / 资源同步（正式发行请 ENABLE_HX_DEBUG=0） -->\n'
+            '        <meta-data android:name="DCLOUD_DEBUG" android:value="true"/>\n'
+            "    </application>",
+        )
+    app_manifest.write_text(text)
+    print("✓ app AndroidManifest DCLOUD_DEBUG=true")
+
+
 def patch_sdk_libs_excludes(gradle_path: Path) -> None:
-    """官方示例 SDK/libs 含广告等可选 AAR；本地配网基座排除以免缺 HMS 资源导致 aapt 失败。"""
+    """官方示例 SDK/libs 含广告等可选 AAR；本地配网基座排除以免缺 HMS 资源导致 aapt 失败。
+    仍 exclude debug-server：调试通道改由 app/libs 显式拷贝（见 enable_hx_debug_channel）。
+    """
     if not gradle_path.is_file():
         return
     text = gradle_path.read_text()
-    # 扩展 exclude 列表（保留原有 beizi / debug-server）
+    # 扩展 exclude 列表（保留 beizi；debug-server 仍从 SDK/libs 排除，改走 app/libs）
     new_exclude = (
         "exclude: ["
         "'**/beizi_fusion_sdk_*.aar', "
@@ -286,6 +365,7 @@ def main() -> None:
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
     configure_manifest()
+    enable_hx_debug_channel()
     print("完成 configure_app")
 
 

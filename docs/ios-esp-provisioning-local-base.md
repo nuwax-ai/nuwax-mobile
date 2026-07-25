@@ -34,22 +34,25 @@
 
 ## 环境
 
+路径全部由 [`scripts/local-base-env.sh`](../scripts/local-base-env.sh) 统一派生（基于 `NUWAX_OFFLINE_SDK_HOME`，默认 `$HOME/workspace/nuwax-mobile-offline-sdk`）。**不要写死 `/Users/xxx`**；本机没有 SDK 时先拉取（见 [offline-sdk-distribution-s3.md](./offline-sdk-distribution-s3.md)）：
+
 ```bash
-export UNIAPPX_SDK_ROOT=/Users/apple/workspace/UniAppX-iOS-5.15/UniAppX-iOS@5.15
-export IOS_ESP_BUILD_ROOT=/Users/apple/workspace/nuwax-ios-esp
-export IOS_ESP_OUT=$IOS_ESP_BUILD_ROOT/out
-# 可选
-export DCLOUD_APPKEY=...
-export IOS_PROVISIONING_PROFILE_UUID=...
+cd <本仓根目录>                       # nuwax-mobile
+make sdk-fetch                        # 本机没有离线 SDK 时拉取
+source scripts/local-base-env.sh      # 自动派生 UNIAPPX_SDK_ROOT / IOS_ESP_BUILD_ROOT / IOS_ESP_OUT …
 ```
 
+敏感值（离线 AppKey / Team / Profile UUID）写到 `scripts/local-secrets.env`（已 gitignore），`local-base-env.sh` 会自动 source，**勿入仓库**。
+
+> ⚠️ SDK 路径已迁移到 `$NUWAX_OFFLINE_SDK_HOME/sdk/ios/5.15/...`，**旧的 `/Users/.../UniAppX-iOS-5.15` 已作废**。
+
 - Xcode **26.3 / Swift 6.2.4**（与 `DCloudUniappRuntime` 匹配）  
-- 离线 AppKey、bundle `com.nuwax.nuwa`、team `89GQ2RJVW7`
+- bundle `com.nuwax.nuwa`；离线 AppKey / Team / Profile UUID 见 `scripts/local-secrets.env`（gitignore）
 
 ## 标准流程（A → B → C → D）
 
 ```bash
-cd /Users/apple/workspace/nuwax-mobile
+cd <本仓根目录>                # nuwax-mobile
 source scripts/local-base-env.sh
 
 # 0) HBuilderX：发行 → 原生App-本地打包 → 生成本地打包App资源

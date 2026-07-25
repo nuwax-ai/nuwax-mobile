@@ -88,6 +88,44 @@ $CLI logcat app-ios --project nuwax-mobile
 - 快速检查编译是否通过（不跑设备）可参考现成脚本 [scripts/run-uni-build.sh](scripts/run-uni-build.sh)，它直接调起 HBuilderX 内置的 uni 编译器并把错误摘要到终端
 - H5/微信小程序同样走 HBuilderX（菜单 运行/发行），CLI 侧重 App 端
 
+## 本地自定义基座打包流程（含离线 SDK）
+
+含原生插件（ESP 配网 / 支付 / 推送 等）联调时必须用**自定义基座**（标准基座不含这些 UTS 模块）。两种得到方式：
+
+- **A. 直接拉现成基座**（最快，无需 SDK/证书）：`make base-fetch`（见下文「自定义基座同步更新」）
+- **B. 本机从源码打**（改了原生插件 / 需重签 iOS 真机包时）：按下面完整流程
+
+### B. 完整流程
+
+```bash
+# Step 0  拉离线 SDK（仅首次 / 换机器 / 升级 HX；本机已有则跳过）
+make sdk-fetch                       # → NUWAX_OFFLINE_SDK_HOME（sdk/ + archives/，不含 work/ 与证书）
+
+# Step 1  派生各平台路径（UNIAPPX_*_SDK_ROOT / *_ESP_WORK 等）
+source scripts/local-base-env.sh     # 若提示缺 SDK，回到 Step 0
+
+# Step 2  HBuilderX 生成本地打包 App 资源（GUI，不可跳过）
+#   HX：发行 → 原生App-本地打包 → 生成本地打包App资源（iOS / Android）
+#   产物：unpackage/resources/app-ios、app-android
+
+# Step 3  出基座（按目标选一个）
+make base-android                    # → unpackage/debug/android_debug.apk
+make base-ios-device                 # → unpackage/debug/iOS_debug.ipa（真机，需证书）
+make base-ios-simulator              # → Pandora_simulator_debug.app（模拟器，免签）
+
+# Step 4  iOS 真机另需自备 Apple 证书 / Profile / DCloud AppKey（不随 SDK 分发）
+
+# Step 5  用 / 发
+#   HX：运行 → 使用自定义基座运行 → 选 unpackage/debug 下对应包
+#   或发给同事：make base-publish   /   make base-ship（一键：资源→出包→S3）
+```
+
+要点：
+- iOS 真机与模拟器是**两套包**，勿混用；模拟器包免签但不能验支付/推送等原生链路。
+- **改了 UTS 原生插件** → Step 0/1 免（SDK 不变），从 Step 2 重跑（重新生成本地资源 + Step 3 重打基座）。
+- **仅改 uvue/uts 业务代码** → 直接 HX「使用自定义基座运行」热更，不必重打基座。
+- 详细：[docs/local-custom-base-maintenance.md](docs/local-custom-base-maintenance.md)、[offline-sdk-distribution-s3.md](docs/offline-sdk-distribution-s3.md)、各平台 [android](docs/android-esp-provisioning-local-base.md) / [ios](docs/ios-esp-provisioning-local-base.md)。
+
 ## 自定义基座同步更新
 
 含原生插件联调时，从 S3 拉最新基座到 `unpackage/debug/`（**不指定版本 = 最新**）。详情：[docs/custom-base-distribution-s3.md](docs/custom-base-distribution-s3.md)。
@@ -102,6 +140,20 @@ pnpm base:fetch
 
 HX：运行 → **使用自定义基座运行** → 选 `unpackage/debug/` 下 apk / ipa / 模拟器 `.app`（真机与模拟器勿混用）。仅同步使用**不需要**本机打基座，也不需要 iOS 开发证书。
 
+## 离线 SDK 同步
+
+本地自定义基座需要 uni-app x 离线 SDK + 乐鑫配网依赖。从 S3 拉取到 `NUWAX_OFFLINE_SDK_HOME`（默认 `$HOME/workspace/nuwax-mobile-offline-sdk`）：**只含 `sdk/ + archives/`，不含 `work/`（跨机不可用，由构建脚本生成），也不含 iOS 证书**。详情：[docs/offline-sdk-distribution-s3.md](docs/offline-sdk-distribution-s3.md)。
+
+```bash
+make sdk-fetch
+# 或：curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-offline-sdk/fetch-offline-sdk-s3.sh | bash
+# 自签证书：NUWAX_S3_INSECURE=1
+# 固定版本：NUWAX_HX_VERSION=5.15 make sdk-fetch
+# 维护者发布：make sdk-publish
+```
+
+拉取后 `source scripts/local-base-env.sh` 派生各平台路径，再 `make base-*` 出基座。**iOS 真机基座另需自备 Apple 证书 / Profile / AppKey**（不随 SDK 分发，各端通过受控渠道配置）。
+
 ## 其他可用脚本
 
 ```bash
@@ -113,6 +165,8 @@ pnpm base:fetch            # 同步最新自定义基座（S3）
 pnpm base:publish          # 发布自定义基座到 S3（维护者）
 pnpm base:ship             # 一键：appResource → 出包 → 上传 S3（维护者）
 pnpm base:help             # 列出 make 基座相关目标
+pnpm sdk:fetch             # 拉取离线 SDK（sdk/+archives/，首次/换机）
+pnpm sdk:publish           # 发布离线 SDK 到 S3（维护者）
 
 # HBuilderX CLI（需本机已开 HX；项目名默认 nuwax-mobile；可用 HX_CLI / HX_PROJECT 覆盖）
 pnpm hx:devices            # 列出已连接设备

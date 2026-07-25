@@ -1,6 +1,6 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
 # 详见 docs/local-custom-base-maintenance.md · docs/custom-base-distribution-s3.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -16,6 +16,10 @@ help:
 	@echo "S3 分发（版本 = manifest versionName；同版本覆盖；fetch 默认最新）"
 	@echo "  make base-publish         # 上传当前 unpackage/debug 产物"
 	@echo "  make base-fetch           # 拉取最新基座（不指定版本）"
+	@echo ""
+	@echo "离线 SDK S3 分发（版本 = NUWAX_HX_VERSION；打包 sdk/+archives，不含 work）"
+	@echo "  make sdk-publish          # 打包并上传离线 SDK"
+	@echo "  make sdk-fetch            # 拉取离线 SDK 到 NUWAX_OFFLINE_SDK_HOME"
 	@echo ""
 	@echo "base-ship 开关：SKIP_APP_RESOURCE=1 / SKIP_PUBLISH=1 / TARGETS=android,…"
 	@echo "真机与模拟器是两套包，勿混用。"
@@ -51,3 +55,9 @@ base-publish:
 
 base-fetch:
 	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh"
+
+sdk-publish:
+	@bash "$(ROOT)scripts/publish-offline-sdk-s3.sh"
+
+sdk-fetch:
+	@bash "$(ROOT)scripts/fetch-offline-sdk-s3.sh"

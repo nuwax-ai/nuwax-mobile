@@ -62,6 +62,10 @@ export class EspProvisioningController {
   private pendingSsid = '';
   private pendingPassword = '';
   private retryAction: ProvisionRetryActionEnum = ProvisionRetryActionEnum.NONE;
+  // 本次配网会话内已绑定设备的缓存：RECONNECT 重连后跳过二次 bind，复用已下发密钥，
+  // 避免后端对已绑设备返错（mock 1002）或重置 secret。仅内存持有，dispose 清空。
+  private boundDeviceId = '';
+  private boundSecret = '';
   private config: EspProvisioningConfig;
 
   constructor() {
@@ -224,6 +228,11 @@ export class EspProvisioningController {
           return false;
         }
         this.deviceInfo.value = info;
+        // 注意（配网重试 gap B）：applyRecoveredOutcome 命中设备上报的 lastProvisioningOutcome
+        // （auth_failed/network_not_found/timeout/internal_error 等）时会 fail() 并 return true，
+        // 致本函数 return false；retry() RECONNECT 据此在 if(!ok) 提前退出，末尾 provision() 不会执行。
+        // 当前需用户再点一次重试（此时 retryAction 已被改成 REWRITE，会直接走到 provision）。
+        // 真机验证后可考虑：RECONNECT 路径下命中失败终态时 fall-through 直接 provision，少一次点击。
         if (this.applyRecoveredOutcome(info)) return false;
         this.phase.value = EspProvisioningPhaseEnum.READY;
         this.busy.value = false;
@@ -326,6 +335,11 @@ export class EspProvisioningController {
           return false;
         }
         this.deviceInfo.value = info;
+        // 注意（配网重试 gap B）：applyRecoveredOutcome 命中设备上报的 lastProvisioningOutcome
+        // （auth_failed/network_not_found/timeout/internal_error 等）时会 fail() 并 return true，
+        // 致本函数 return false；retry() RECONNECT 据此在 if(!ok) 提前退出，末尾 provision() 不会执行。
+        // 当前需用户再点一次重试（此时 retryAction 已被改成 REWRITE，会直接走到 provision）。
+        // 真机验证后可考虑：RECONNECT 路径下命中失败终态时 fall-through 直接 provision，少一次点击。
         if (this.applyRecoveredOutcome(info)) return false;
         this.phase.value = EspProvisioningPhaseEnum.READY;
         this.busy.value = false;
@@ -414,12 +428,31 @@ export class EspProvisioningController {
     }
     if (this.retryAction == ProvisionRetryActionEnum.RECONNECT) {
       const device = this.currentDevice;
-      if (device == null) return;
+      if (device == null) {
+        // QR 直连链路不写 currentDevice（或会话已 disposed）：无法重连，
+        // 显式失败让用户重新进入配网，避免 UI 假死在"重试"按钮。
+        console.warn('[ProvisionRetry] RECONNECT 但 currentDevice 为空（QR 直连链路或会话已释放）');
+        this.fail(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.CONNECT_FAILED,
+          '设备未连接，请重新选择设备后配网',
+          'retry RECONNECT with null currentDevice',
+          0,
+          false,
+        ), ProvisionRetryActionEnum.NONE);
+        return;
+      }
       const ok = await this.selectAndPrepare(device);
-      if (!ok) return;
-      // 重连后 Security 2 会话重建，须在 provision 前重新 bind+下发 vox-config
+      if (!ok) {
+        console.warn('[ProvisionRetry] selectAndPrepare 未就绪，失败态已由内部 fail 设置');
+        return;
+      }
+      // 重连后 Security 2 会话重建，须在 provision 前重新下发 vox-config；
+      // bindAndDeliverSecret 内部对已绑定设备复用缓存密钥，跳过二次 bind。
       const delivered = await this.bindAndDeliverSecret("");
-      if (!delivered) return;
+      if (!delivered) {
+        console.warn('[ProvisionRetry] bindAndDeliverSecret 未成功，失败态已由内部 fail 设置');
+        return;
+      }
     }
     await this.provision(this.pendingSsid, this.pendingPassword);
   }
@@ -455,41 +488,51 @@ export class EspProvisioningController {
     //   deviceSecret = 现有 bind 接口返回的最新值（不生成/不改写/不写死）
     //   gatewayUrl   = APP 环境配置 VOX_DEVICE_WS_URL（bind 响应不含）
     // 任一来源失败即停止，不得继续下发 Wi-Fi 凭据。
-    const params = new AppDeviceBindParams();
-    params.deviceId = deviceId;
-    params.displayName = displayName != '' ? displayName : deviceId;
     let secret = '';
-    try {
-      const res = await apiVoxBindDevice(params);
-      if (apiResCode(res) != SUCCESS_CODE) {
+    // RECONNECT 重连后：同一设备本次会话已绑定过则复用密钥，跳过二次 bind，
+    // 避免后端对已绑设备返错（mock 1002）或重置 secret。
+    if (this.boundDeviceId == deviceId && this.boundSecret != '') {
+      secret = this.boundSecret;
+      console.log(`[VoxBind] 复用本次会话已下发密钥，跳过二次 bind deviceId=${deviceId}`);
+    } else {
+      const params = new AppDeviceBindParams();
+      params.deviceId = deviceId;
+      params.displayName = displayName != '' ? displayName : deviceId;
+      try {
+        const res = await apiVoxBindDevice(params);
+        if (apiResCode(res) != SUCCESS_CODE) {
+          this.fail(new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
+            '设备绑定失败',
+            `bind code=${apiResCode(res)} msg=${apiResMessage(res)}`,
+            0,
+            true,
+          ), ProvisionRetryActionEnum.RECONNECT);
+          return false;
+        }
+        const raw = apiResData<any>(res);
+        const data = raw != null ? (raw as UTSJSONObject) : null;
+        const secretVal = data != null ? data['deviceSecret'] : null;
+        secret = secretVal != null ? `${secretVal}` : '';
+      } catch (e) {
+        const err = this.asEspError(e);
+        console.error(`[VoxBind] bind 异常 deviceId=${deviceId} | code=${err.code} | detail=${err.detail} | nativeCode=${err.nativeCode}`);
+        this.fail(err, ProvisionRetryActionEnum.RECONNECT);
+        return false;
+      }
+      if (secret == '') {
         this.fail(new EspProvisioningError(
           EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
-          '设备绑定失败',
-          `bind code=${apiResCode(res)} msg=${apiResMessage(res)}`,
+          '绑定响应缺少 deviceSecret',
+          'bind response missing deviceSecret',
           0,
           true,
         ), ProvisionRetryActionEnum.RECONNECT);
         return false;
       }
-      const raw = apiResData<any>(res);
-      const data = raw != null ? (raw as UTSJSONObject) : null;
-      const secretVal = data != null ? data['deviceSecret'] : null;
-      secret = secretVal != null ? `${secretVal}` : '';
-    } catch (e) {
-      const err = this.asEspError(e);
-      console.error(`[VoxBind] bind 异常 deviceId=${deviceId} | code=${err.code} | detail=${err.detail} | nativeCode=${err.nativeCode}`);
-      this.fail(err, ProvisionRetryActionEnum.RECONNECT);
-      return false;
-    }
-    if (secret == '') {
-      this.fail(new EspProvisioningError(
-        EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
-        '绑定响应缺少 deviceSecret',
-        'bind response missing deviceSecret',
-        0,
-        true,
-      ), ProvisionRetryActionEnum.RECONNECT);
-      return false;
+      // 缓存密钥供本次会话 RECONNECT 复用（仅内存，不落盘/不日志）
+      this.boundDeviceId = deviceId;
+      this.boundSecret = secret;
     }
     // 扁平 payload：仅 deviceId/gatewayUrl/deviceSecret，无 op/bundle/credentialId/signature。
     // deviceSecret 仅内存持有，随 payload 下发后即弃，勿写 storage / 日志。
@@ -562,6 +605,8 @@ export class EspProvisioningController {
     this.pendingSsid = '';
     this.pendingPassword = '';
     this.currentDevice = null;
+    this.boundDeviceId = '';
+    this.boundSecret = '';
   }
 
   private createDefaultConfig(): EspProvisioningConfig {

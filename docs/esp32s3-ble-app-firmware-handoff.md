@@ -1,5 +1,7 @@
 # ESP32-S3 BLE Wi-Fi 配网 APP/固件对接文档
 
+> 演进提示：本文是 `1.0-first-integration` 的 BLE/Wi‑Fi 配网基线契约。在此之上，**动态云端绑定层**已升级到 `1.3-dynamic-vox-config`（新增 `vox-config` endpoint，在 WiFi 凭据下发前完成 bind + 密钥下发）。绑定层的完整契约见 [`esp32s3-ble-vox-config-handoff.md`](./esp32s3-ble-vox-config-handoff.md)；本文 §5/§6/§8 已补入 `vox-config` 相关要点，但以该文档为准。
+
 ## 1. 文档状态与范围
 
 本文是桌搭本期 Android APP 与 ESP32-S3 固件的 BLE Wi-Fi 配网联调契约。文档结论来自当前固件代码、ESP-IDF 组件源码、`sdkconfig` 和 `dependencies.lock`，不是仅依据 README 推断。
@@ -122,8 +124,9 @@ key: sec2_verifier   (blob, current buffer maximum 384 bytes)
 | `prov-ctrl` | apply、状态查询和官方失败原因 | 必须调用，作为配网状态权威来源 |
 | `prov-scan` | 设备侧 AP 扫描 | 可选 |
 | `device-info` | Nuwax 设备信息及辅助诊断 | Security 2 后调用 |
+| `vox-config` | 动态云端绑定（`deviceId` + `gatewayUrl` + `deviceSecret`） | Security 2 后、`prov-config` **之前**调用，详见 [`esp32s3-ble-vox-config-handoff.md`](./esp32s3-ble-vox-config-handoff.md) |
 
-APP 应使用 Espressif Provider/协议实现发现 endpoint，不自行实现旧 GATT characteristic。官方固定 endpoint 的 characteristic UUID 由组件维护；自定义 `device-info` 是本固件创建的第一个扩展 endpoint。
+APP 应使用 Espressif Provider/协议实现发现 endpoint，不自行实现旧 GATT characteristic。官方固定 endpoint 的 characteristic UUID 由组件维护；`device-info` 与 `vox-config` 是本固件按名称注册的两个扩展 endpoint，其 characteristic UUID 由 provisioning manager 动态分配，App 按 endpoint 名（读 `0x2901` descriptor）映射，不得硬编码。`cloud_prov` capability 在 `proto-ver` 的 `nuwax.cap` 中，不在 `prov.cap`。
 
 ### 5.2 `proto-ver` 结构
 
@@ -181,7 +184,9 @@ initialize provider
   -> negotiate MTU (optional optimization)
   -> establish Security 2(username + PoP)
   -> read proto-ver and validate sec_ver/capabilities
-  -> read device-info
+  -> read device-info（校验 serialNumber == username）
+  -> bind（/api/app/devices/bind）取最新 deviceSecret
+  -> vox-config 下发 {deviceId, gatewayUrl, deviceSecret}（必须在下一步之前）
   -> optional prov-scan
   -> send SSID/passphrase through prov-config
   -> apply through prov-ctrl
@@ -190,6 +195,8 @@ initialize provider
   -> optionally read device-info while BLE is still available
   -> disconnect and dispose provider
 ```
+
+> `vox-config` 必须在 `prov-config set/apply` **之前**下发：Wi‑Fi 一成功 SDK 即清理 Security 2 会话，事后 `sendCustomData` 会得到 `SECURITY_AUTH_FAILED`。App 主流程与重连重试路径都按 `selectAndPrepare → bindAndDeliverSecret → provision` 顺序执行（代码：`provision-progress.uvue`、`useEspProvisioning.retry()`）。任一来源失败（缺 serialNumber / bind 失败 / 缺 deviceSecret / 设备拒绝 vox-config）一律硬失败进失败页，不再软提示且不阻断 Wi‑Fi。详见 [`esp32s3-ble-vox-config-handoff.md`](./esp32s3-ble-vox-config-handoff.md)。
 
 建议 APP 页面状态：
 
@@ -235,6 +242,9 @@ APP 的状态等待上限建议为 35 秒，以覆盖固件 30 秒观察窗口�
 | `TIMEOUT` | 30 秒未得到终态，或 APP 35 秒保护超时 | 可使用 |
 | `INTERNAL_ERROR` | Provider/protobuf/内存/NVS/ESP-IDF 本地错误 | APP 以调用失败及日志判断 |
 | `DHCP_FAILED` | 尚无独立官方状态 | 当前不支持，暂映射为 `TIMEOUT` |
+| `SEND_CONFIG_FAILED` | bind 失败或响应缺 `deviceSecret`、`vox-config` 原生下发异常 | 硬失败，进失败页（RECONNECT） |
+| `VOX_CONFIG_INVALID` | 设备对 `vox-config` 返回 `ok:false` 且非 persist 类（字段/身份非法） | 设备错误字符串区分 |
+| `VOX_CONFIG_PERSIST_FAILED` | 设备对 `vox-config` 返回 `ok:false` 且含 `persist`/`nvs`（NVS 写失败） | 设备错误字符串区分 |
 
 不要把所有未知 Wi-Fi disconnect reason 映射为 `NETWORK_NOT_FOUND`。无法可靠分类时应使用 `INTERNAL_ERROR` 或 `TIMEOUT`，并保留原始数值 reason 供日志诊断。
 

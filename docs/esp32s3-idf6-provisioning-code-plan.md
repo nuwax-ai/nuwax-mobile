@@ -209,9 +209,10 @@ maskedDeviceId, rssi, nativeErrorCode
 - [x] ESP-IDF `v6.0` / `662a3be354759d9487bf4b1a629fadb766cb1800`。
 - [x] Security 2，不允许降级。
 - [x] BLE Service UUID、`PROV_` 广播名前缀。
-- [x] `wifi_prov`、`wifi_scan` 和 `device-info`。
+- [x] `wifi_prov`、`wifi_scan`、`cloud_prov` 和 `device-info`、`vox-config`。
+- [x] 动态云端绑定 `vox-config`（`1.3-dynamic-vox-config`）：`bindAndDeliverSecret` 在 WiFi 前 bind 取 `deviceSecret` 并扁平下发，响应校验 `ok/state/deviceId`，新增 `VOX_CONFIG_INVALID`/`VOX_CONFIG_PERSIST_FAILED`，日志脱敏。详见 [`esp32s3-ble-vox-config-handoff.md`](./esp32s3-ble-vox-config-handoff.md)。
 - [x] 成功边界为 `IP_EVENT_STA_GOT_IP`，不要求云端上线。
 - [x] 成功后 BLE 保留 15 秒；总配网窗口 300 秒。
-- [x] Android Provider、Mock 和调试凭据内存入口。
-- [ ] Android + ESP32-S3 首轮真机验收。
+- [x] Android Provider、iOS Provider（CocoaPods ESPProvision 3.1.0）、Mock 和调试凭据内存入口。
+- [ ] Android + ESP32-S3 首轮真机三端联合验收（bind → vox-config → WiFi → 正式后端在线）。
 - [ ] 逐设备生产 PoP、二维码和产线密钥链路。

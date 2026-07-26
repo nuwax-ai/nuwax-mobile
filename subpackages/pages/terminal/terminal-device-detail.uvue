@@ -14,10 +14,10 @@
           <text class="detail-status-text">{{ isLingzhu ? t("Mobile.Terminal.lingzhuTerminal") : t("Mobile.Terminal.computerTerminal") }} · {{ deviceOnline ? t("Mobile.Terminal.connected") : t("Mobile.Terminal.disconnected") }}</text>
           <!-- 灵珠快捷入口：对话 / 组员管理 -->
           <template v-if="isLingzhu">
-            <view class="quick-btn" @click="handleOpenChat">
+            <view :class="['quick-btn', quickBtnDisabled ? 'quick-btn-disabled' : '']" @click="handleOpenChat">
               <text class="quick-btn-emoji">💬</text>
             </view>
-            <view class="quick-btn" @click="handleGroupMembers">
+            <view :class="['quick-btn', quickBtnDisabled ? 'quick-btn-disabled' : '']" @click="handleGroupMembers">
               <text class="quick-btn-emoji">👥</text>
             </view>
           </template>
@@ -59,12 +59,14 @@
         <template v-if="activeMode == 'chat'">
           <view class="field-label">{{ t("Mobile.Terminal.voiceBroadcast") }}</view>
           <view class="card-group">
-            <view class="row-item" hover-class="row-item-active" @click="handleToggle('语音播报开关')">
+            <view class="row-item" hover-class="row-item-active" @click="handleVoiceBroadcastToggle">
               <view class="row-info">
                 <text class="row-title">{{ t("Mobile.Terminal.voiceSwitch") }}</text>
                 <text class="row-desc">{{ t("Mobile.Terminal.voiceSwitchDesc") }}</text>
               </view>
-              <view class="pill-on"><text class="pill-on-text">{{ t("Mobile.Terminal.switchOn") }}</text></view>
+              <view :class="voiceBroadcastEnabled ? 'pill-on' : 'pill-off'">
+                <text :class="voiceBroadcastEnabled ? 'pill-on-text' : 'pill-off-text'">{{ voiceBroadcastEnabled ? t("Mobile.Terminal.switchOn") : t("Mobile.Terminal.switchOff") }}</text>
+              </view>
             </view>
             <view class="row-item">
               <view class="row-info">
@@ -88,7 +90,7 @@
             </view>
           </view>
           <!-- 事件表情绑定 -->
-          <event-emoji-bind />
+          <event-emoji-bind :deviceId="deviceId" />
         </template>
 
         <!-- 会议模式配置 -->
@@ -114,7 +116,7 @@
               </view>
             </view>
           </view>
-          <event-emoji-bind />
+          <event-emoji-bind :deviceId="deviceId" />
         </template>
 
         <!-- 监控模式配置 -->
@@ -139,7 +141,7 @@
               <view class="pill-on"><text class="pill-on-text">✓</text></view>
             </view>
           </view>
-          <event-emoji-bind />
+          <event-emoji-bind :deviceId="deviceId" />
         </template>
       </template>
 
@@ -188,14 +190,17 @@
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import EventEmojiBind from "./components/event-emoji-bind.uvue";
   import {
-    apiVoxDeviceList,
+    apiVoxDeviceDetail,
     apiVoxRenameDevice,
     apiVoxUnbindDevice,
     apiVoxMeetingModeStart,
     apiVoxMeetingModeStop,
+    apiVoxUpdateDeviceMode,
+    apiVoxGetVoiceSettings,
+    apiVoxUpdateVoiceSettings,
   } from "@/servers/vox/voxDevice";
   import { apiVoxGetPushSettings, apiVoxUpdatePushSettings } from "@/servers/vox/voxPushSettings";
-  import { AppDeviceRenameParams } from "@/types/interfaces/voxDevice";
+  import { AppDeviceRenameParams, AppDeviceVoiceSettingsUpdateParams } from "@/types/interfaces/voxDevice";
   import { AppMeetingPushSettingsUpdateParams } from "@/types/interfaces/voxPushSettings";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
   import { jumpToAgentDetailPage } from "@/utils/commonBusiness";
@@ -216,8 +221,21 @@
   // Android UTS：字符串比较用 ==
   const isLingzhu = computed((): boolean => deviceType.value == "lingzhu");
 
-  // 模式
+  // 模式：本地 key（chat/meeting/monitor）↔ 后端 enum（CONVERSATION/MEETING/MONITORING）
+  const MODE_CHAT = "chat";
+  const MODE_MEETING = "meeting";
+  const MODE_MONITOR = "monitor";
   const activeMode = ref<string>("chat");
+  const toModeEnum = (key: string): string => {
+    if (key == MODE_MEETING) return "MEETING";
+    if (key == MODE_MONITOR) return "MONITORING";
+    return "CONVERSATION";
+  };
+  const toModeKey = (mode: string): string => {
+    if (mode == "MEETING") return MODE_MEETING;
+    if (mode == "MONITORING") return MODE_MONITOR;
+    return MODE_CHAT;
+  };
   class ModeItem {
     key: string = "";
     label: string = "";
@@ -228,8 +246,15 @@
   }
   const modeList = ref<ModeItem[]>([]);
 
-  // 音量
+  // 设备详情是否就绪（消除 💬/👥 按钮在拉取完成前的竞态误报）
+  const infoReady = ref<boolean>(false);
+  const quickBtnDisabled = computed((): boolean => !infoReady.value || deviceAgentId.value <= 0);
+
+  // 语音设置（voiceBroadcastEnabled / volumePercent；ttsVoice 见工作流 3）
+  const voiceBroadcastEnabled = ref<boolean>(true);
   const voiceVolume = ref<number>(70);
+  // 最近一次已落库的音量，用于失败回滚（拖动预览会临时改 voiceVolume）
+  const lastPersistedVolume = ref<number>(70);
 
   // 会议推送渠道（网关 push-settings）
   class PushChannel {
@@ -346,11 +371,39 @@
     ];
   };
 
-  const handleModeSwitch = (key: string) => {
-    activeMode.value = key;
+  const handleModeSwitch = async (key: string) => {
+    // 我的电脑等无 deviceId 场景：仅本地切换
+    if (deviceId.value == "" || activeMode.value == key) {
+      activeMode.value = key;
+      return;
+    }
+    const prev = activeMode.value;
+    activeMode.value = key; // 乐观切换
+    try {
+      const res = await apiVoxUpdateDeviceMode(deviceId.value, toModeEnum(key));
+      if (apiResCode(res) == SUCCESS_CODE) {
+        // 用返回的最新设备详情校准 mode / online
+        const raw = apiResData<any>(res);
+        const d = raw != null ? (raw as UTSJSONObject) : null;
+        if (d != null) {
+          const modeVal = d["mode"];
+          if (modeVal != null) activeMode.value = toModeKey(`${modeVal}`);
+          const onlineVal = d["online"];
+          if (onlineVal != null) deviceOnline.value = onlineVal as boolean;
+        }
+      } else {
+        activeMode.value = prev;
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.modeSwitchFailed"), icon: "none" });
+      }
+    } catch (e) {
+      activeMode.value = prev;
+      console.error("handleModeSwitch error", e);
+      uni.showToast({ title: t("Mobile.Terminal.modeSwitchFailed"), icon: "none" });
+    }
   };
 
-  /** 音量拖动中实时预览，松手落定（当前仅前端态，设备音量接口待接入） */
+  /** 音量拖动中实时预览，松手落定并下发 /voice-settings/update（离线由后端拒绝，失败回滚） */
   const readSliderValue = (e: any): number => {
     const detail = (e as UTSJSONObject)["detail"] as UTSJSONObject;
     const val = detail["value"];
@@ -359,8 +412,76 @@
   const handleVolumeChanging = (e: any) => {
     voiceVolume.value = readSliderValue(e);
   };
-  const handleVolumeChange = (e: any) => {
-    voiceVolume.value = readSliderValue(e);
+  const handleVolumeChange = async (e: any) => {
+    const v = readSliderValue(e);
+    if (deviceId.value == "") {
+      voiceVolume.value = v;
+      lastPersistedVolume.value = v;
+      return;
+    }
+    const params = new AppDeviceVoiceSettingsUpdateParams();
+    params.volumePercent = v;
+    try {
+      const res = await apiVoxUpdateVoiceSettings(deviceId.value, params);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        voiceVolume.value = v;
+        lastPersistedVolume.value = v;
+      } else {
+        voiceVolume.value = lastPersistedVolume.value; // 回滚到上次落库值
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.voiceSettingsUpdateFailed"), icon: "none" });
+      }
+    } catch (err) {
+      voiceVolume.value = lastPersistedVolume.value;
+      console.error("handleVolumeChange error", err);
+      uni.showToast({ title: t("Mobile.Terminal.voiceSettingsUpdateFailed"), icon: "none" });
+    }
+  };
+
+  /** 语音播报开关：乐观切换 + 失败回滚 */
+  const handleVoiceBroadcastToggle = async () => {
+    if (deviceId.value == "") return;
+    const next = !voiceBroadcastEnabled.value;
+    const prev = voiceBroadcastEnabled.value;
+    voiceBroadcastEnabled.value = next;
+    const params = new AppDeviceVoiceSettingsUpdateParams();
+    params.voiceBroadcastEnabled = next;
+    try {
+      const res = await apiVoxUpdateVoiceSettings(deviceId.value, params);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        voiceBroadcastEnabled.value = prev;
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.voiceSettingsUpdateFailed"), icon: "none" });
+      }
+    } catch (e) {
+      voiceBroadcastEnabled.value = prev;
+      console.error("handleVoiceBroadcastToggle error", e);
+      uni.showToast({ title: t("Mobile.Terminal.voiceSettingsUpdateFailed"), icon: "none" });
+    }
+  };
+
+  const fetchVoiceSettings = async () => {
+    if (deviceId.value == "") return;
+    try {
+      const res = await apiVoxGetVoiceSettings(deviceId.value);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const raw = apiResData<any>(res);
+        const d = raw != null ? (raw as UTSJSONObject) : null;
+        if (d != null) {
+          const vbe = d["voiceBroadcastEnabled"];
+          voiceBroadcastEnabled.value = vbe != null ? (vbe as boolean) : true;
+          const vp = d["volumePercent"];
+          const v = vp != null ? (vp as number) : 70;
+          voiceVolume.value = v;
+          lastPersistedVolume.value = v;
+        }
+      } else {
+        uni.showToast({ title: t("Mobile.Terminal.voiceSettingsLoadFailed"), icon: "none" });
+      }
+    } catch (e) {
+      console.error("fetchVoiceSettings error", e);
+      uni.showToast({ title: t("Mobile.Terminal.voiceSettingsLoadFailed"), icon: "none" });
+    }
   };
 
   const handleNameChange = async () => {
@@ -369,7 +490,12 @@
       editName.value = deviceName.value;
       return;
     }
-    if (deviceId.value == "") return; // 我的电脑：静态，不接接口
+    if (deviceId.value == "") {
+      // 我的电脑：静态，不支持改名；回退编辑态并提示，避免 UI 显示新名却未落库
+      editName.value = deviceName.value;
+      uni.showToast({ title: t("Mobile.Terminal.renameNotSupported"), icon: "none" });
+      return;
+    }
     const params = new AppDeviceRenameParams();
     params.displayName = newName;
     try {
@@ -444,6 +570,11 @@
   };
 
   const handleOpenChat = () => {
+    // 详情未就绪时提示加载中，避免 fetchDeviceInfo 返回前误报"未关联"
+    if (!infoReady.value) {
+      uni.showToast({ title: t("Mobile.Terminal.loading"), icon: "none" });
+      return;
+    }
     // 用设备绑定的终端智能体 agentId 进入通用智能体会话详情页（与首页/智联录入口一致）
     if (deviceAgentId.value <= 0) {
       uni.showToast({ title: t("Mobile.Terminal.agentIdMissing"), icon: "none" });
@@ -453,6 +584,10 @@
   };
 
   const handleGroupMembers = () => {
+    if (!infoReady.value) {
+      uni.showToast({ title: t("Mobile.Terminal.loading"), icon: "none" });
+      return;
+    }
     // 组员接口以设备关联的 agentId 为宿主，缺省时拦截进页
     if (deviceAgentId.value <= 0) {
       uni.showToast({ title: t("Mobile.Terminal.agentIdMissing"), icon: "none" });
@@ -480,37 +615,43 @@
   };
 
   const fetchDeviceInfo = async () => {
-    if (deviceId.value == "") return;
+    if (deviceId.value == "") {
+      infoReady.value = true;
+      return;
+    }
     try {
-      const res = await apiVoxDeviceList();
+      const res = await apiVoxDeviceDetail(deviceId.value);
       if (apiResCode(res) == SUCCESS_CODE) {
         const raw = apiResData<any>(res);
-        const arr = raw != null ? (raw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
-        for (let i = 0; i < arr.length; i++) {
-          const idVal = arr[i]["deviceId"];
-          if (idVal != null && `${idVal}` == deviceId.value) {
-            const onlineVal = arr[i]["online"];
-            deviceOnline.value = onlineVal != null ? (onlineVal as boolean) : false;
-            const nameVal = arr[i]["displayName"];
-            if (nameVal != null && `${nameVal}` != "") {
-              deviceName.value = `${nameVal}`;
-              editName.value = deviceName.value;
-            }
-            // 后端设备列表下发 agentId，供组员管理等主站配置接口使用
-            const agentIdVal = arr[i]["agentId"];
-            if (agentIdVal != null) {
-              const parsed = parseFloat(`${agentIdVal}`);
-              deviceAgentId.value = !isNaN(parsed) && parsed > 0 ? parsed as number : 0;
-            } else {
-              deviceAgentId.value = 0;
-            }
-            break;
+        const d = raw != null ? (raw as UTSJSONObject) : null;
+        if (d != null) {
+          const onlineVal = d["online"];
+          deviceOnline.value = onlineVal != null ? (onlineVal as boolean) : false;
+          const nameVal = d["displayName"];
+          if (nameVal != null && `${nameVal}` != "") {
+            deviceName.value = `${nameVal}`;
+            editName.value = deviceName.value;
           }
+          // 后端下发 agentId，供组员管理等主站配置接口使用
+          const agentIdVal = d["agentId"];
+          if (agentIdVal != null) {
+            const parsed = parseFloat(`${agentIdVal}`);
+            deviceAgentId.value = !isNaN(parsed) && parsed > 0 ? parsed as number : 0;
+          } else {
+            deviceAgentId.value = 0;
+          }
+          // 工作模式回显（CONVERSATION/MEETING/MONITORING → chat/meeting/monitor）
+          const modeVal = d["mode"];
+          if (modeVal != null) activeMode.value = toModeKey(`${modeVal}`);
         }
+      } else {
+        uni.showToast({ title: t("Mobile.Terminal.fetchDevicesFailed"), icon: "none" });
       }
     } catch (e) {
       console.error("fetchDeviceInfo error", e);
+      uni.showToast({ title: t("Mobile.Terminal.fetchDevicesFailed"), icon: "none" });
     }
+    infoReady.value = true;
   };
 
   onLoad((options: any) => {
@@ -537,6 +678,7 @@
     if (isLingzhu.value && deviceId.value != "") {
       fetchDeviceInfo();
       fetchPushSettings();
+      fetchVoiceSettings();
     }
   });
 </script>
@@ -599,6 +741,10 @@
         align-items: center;
         justify-content: center;
         margin-left: 16rpx;
+
+        &.quick-btn-disabled {
+          opacity: 0.4;
+        }
 
         .quick-btn-emoji {
           font-size: 24rpx;

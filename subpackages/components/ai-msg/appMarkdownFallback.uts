@@ -7,7 +7,10 @@ import proxyWeb from "@/uni_modules/uni-ai-x/sdk/proxy-web.uts";
 
 type MathRenderedCallback = () => void;
 
-/** 将段落中的 $...$ 拆为独立公式块，适配当前 katex-el 的块级渲染。 */
+/**
+ * 将行内 $...$ / $$...$$ 拆成独立行（整行 $$latex$$），适配 katex-el 块级渲染。
+ * 注意：若行内已有 $$，不能整行跳过，否则会连同前后正文一起留在段落里显示为裸 $$。
+ */
 function normalizeInlineMath(markdown: string): string {
   const sourceLines = markdown.replace(/\r\n/g, "\n").split("\n");
   const output = [] as string[];
@@ -18,36 +21,115 @@ function normalizeInlineMath(markdown: string): string {
       output.push("");
       continue;
     }
-    if (line.indexOf("$$") >= 0) {
-      output.push(line);
-      continue;
-    }
     let cursor = 0;
     let foundMath = false;
     while (cursor < line.length) {
       const start = line.indexOf("$", cursor);
       if (start < 0) {
         const tail = line.substring(cursor);
-        if (tail.length > 0 || !foundMath) output.push(tail);
+        if (tail.length > 0 || !foundMath) {
+          output.push(tail);
+        }
         break;
+      }
+      // 优先匹配 $$...$$，避免被拆成两个单 $
+      const isDouble =
+        start + 1 < line.length && line.charAt(start + 1) == "$";
+      if (isDouble) {
+        const end = line.indexOf("$$", start + 2);
+        if (end < 0) {
+          output.push(line.substring(cursor));
+          break;
+        }
+        const before = line.substring(cursor, start);
+        const latex = line.substring(start + 2, end).trim();
+        if (before.length > 0) {
+          output.push(before);
+        }
+        if (latex.length > 0) {
+          output.push("$$" + latex + "$$");
+          foundMath = true;
+        }
+        cursor = end + 2;
+        continue;
       }
       const end = line.indexOf("$", start + 1);
       if (end < 0) {
         output.push(line.substring(cursor));
         break;
       }
+      // `$` 紧邻（空公式）跳过，避免死循环
+      if (end == start + 1) {
+        if (start > cursor) {
+          output.push(line.substring(cursor, start + 1));
+        } else {
+          output.push("$");
+        }
+        cursor = start + 1;
+        continue;
+      }
       const before = line.substring(cursor, start);
       const latex = line.substring(start + 1, end).trim();
-      if (before.length > 0) output.push(before);
+      if (before.length > 0) {
+        output.push(before);
+      }
       if (latex.length > 0) {
         output.push("$$" + latex + "$$");
         foundMath = true;
       }
       cursor = end + 1;
-      if (cursor == line.length && !foundMath) output.push("");
     }
   }
   return output.join("\n");
+}
+
+/** 整行是否为独立公式（normalize 后的 $$...$$ / $...$ / \[...\]）。 */
+function isStandaloneMathLine(trimmed: string): boolean {
+  if (trimmed.length <= 2) {
+    return false;
+  }
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("$$") &&
+    trimmed.endsWith("$$")
+  ) {
+    return true;
+  }
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("\\[") &&
+    trimmed.endsWith("\\]")
+  ) {
+    return true;
+  }
+  if (trimmed.startsWith("$") && trimmed.endsWith("$") && !trimmed.startsWith("$$")) {
+    const inner = trimmed.substring(1, trimmed.length - 1);
+    // 整行单个 $...$，内部不再含 $
+    return inner.length > 0 && inner.indexOf("$") < 0;
+  }
+  return false;
+}
+
+/** 从整行公式文本提取 latex（不含定界符）。 */
+function extractStandaloneMathLatex(trimmed: string): string {
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("$$") &&
+    trimmed.endsWith("$$")
+  ) {
+    return trimmed.substring(2, trimmed.length - 2).trim();
+  }
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("\\[") &&
+    trimmed.endsWith("\\]")
+  ) {
+    return trimmed.substring(2, trimmed.length - 2).trim();
+  }
+  if (trimmed.startsWith("$") && trimmed.endsWith("$") && trimmed.length > 2) {
+    return trimmed.substring(1, trimmed.length - 1).trim();
+  }
+  return "";
 }
 
 function makeTextToken(text: string, className: string = "text"): MarkdownToken {
@@ -294,12 +376,26 @@ function extractCustomProcessAttribute(
   return "";
 }
 
-/** 解析一个或多个工具调用标签。 */
+/** 从属性串构造工具调用对象。 */
+function buildCustomProcessItem(attributes: string): UTSJSONObject {
+  const item = new UTSJSONObject();
+  let executeId = extractCustomProcessAttribute(attributes, "executeId");
+  if (executeId.length == 0) {
+    executeId = extractCustomProcessAttribute(attributes, "executeid");
+  }
+  item["executeId"] = executeId;
+  item["type"] = extractCustomProcessAttribute(attributes, "type");
+  item["status"] = extractCustomProcessAttribute(attributes, "status");
+  item["name"] = extractCustomProcessAttribute(attributes, "name");
+  return item;
+}
+
+/** 解析一个或多个工具调用标签（HTML 与 :::container）。 */
 function parseCustomProcessTags(source: string): any[] {
   const result: any[] = [];
-  const regex =
+  const htmlRegex =
     /<markdown-custom-process(?!-group)\b([^>]*)>(?:<\/markdown-custom-process>)?|<markdown-custom-process(?!-group)\b([^>]*?)\/>/gi;
-  let match = regex.exec(source);
+  let match = htmlRegex.exec(source);
   while (match != null) {
     const firstAttrs = match.length > 1 ? match[1] : null;
     const secondAttrs = match.length > 2 ? match[2] : null;
@@ -309,17 +405,25 @@ function parseCustomProcessTags(source: string): any[] {
         : secondAttrs != null
           ? secondAttrs
           : "";
-    const item = new UTSJSONObject();
-    let executeId = extractCustomProcessAttribute(attributes, "executeId");
-    if (executeId.length == 0) {
-      executeId = extractCustomProcessAttribute(attributes, "executeid");
+    const item = buildCustomProcessItem(attributes);
+    if (`${item["executeId"]}`.length > 0) {
+      result.push(item);
     }
-    item["executeId"] = executeId;
-    item["type"] = extractCustomProcessAttribute(attributes, "type");
-    item["status"] = extractCustomProcessAttribute(attributes, "status");
-    item["name"] = extractCustomProcessAttribute(attributes, "name");
-    result.push(item);
-    match = regex.exec(source);
+    match = htmlRegex.exec(source);
+  }
+  if (result.length > 0) {
+    return result;
+  }
+  // 兼容历史适配后的 :::container 语法（dev mp-html 原生支持；当前须自行解析）
+  const containerRegex = /:::container\b([^\n]*)\n:::/gi;
+  match = containerRegex.exec(source);
+  while (match != null) {
+    const attributes = match.length > 1 && match[1] != null ? match[1]! : "";
+    const item = buildCustomProcessItem(attributes);
+    if (`${item["executeId"]}`.length > 0) {
+      result.push(item);
+    }
+    match = containerRegex.exec(source);
   }
   return result;
 }
@@ -398,11 +502,16 @@ class CustomProcessExtraction {
 /**
  * 将正文结构化拆分为 Markdown 片段与工具片段。
  * 不向原文注入任何占位字符串。
+ * 同时识别：
+ * - <div><markdown-custom-process/></div>（PC/历史原文）
+ * - <markdown-custom-process/> / group
+ * - :::container ...\n:::（历史适配后的移动端语法）
+ * - <task-result>
  */
 function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
   const extraction = new CustomProcessExtraction();
   const regex =
-    /<markdown-custom-process-group>[\s\S]*?<\/markdown-custom-process-group>|<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?|<task-result\b[^>]*>[\s\S]*?<\/task-result>/gi;
+    /<(?:div|p)\b[^>]*>\s*<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?\s*<\/(?:div|p)>|<markdown-custom-process-group>[\s\S]*?<\/markdown-custom-process-group>|<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?|:::container\b[^\n]*\n:::|<task-result\b[^>]*>[\s\S]*?<\/task-result>/gi;
   let cursor = 0;
   let match = regex.exec(markdown);
   while (match != null) {
@@ -607,6 +716,28 @@ export function parseAppMarkdownFallback(
       continue;
     }
 
+    // :::container attrs + 下一行 :::
+    if (trimmed.startsWith(":::container")) {
+      let block = trimmed;
+      if (index + 1 < lines.length && lines[index + 1].trim() == ":::") {
+        block = trimmed + "\n:::";
+        index += 2;
+      } else {
+        index++;
+      }
+      const processList = parseCustomProcessTags(block);
+      if (processList.length > 0) {
+        result.push(
+          makeCustomProcessItem(
+            "markdown_custom_process",
+            itemIndex++,
+            processList,
+          ),
+        );
+      }
+      continue;
+    }
+
     if (trimmed.startsWith("```")) {
       const lang = trimmed.substring(3).trim();
       const codeLines = [] as string[];
@@ -645,65 +776,63 @@ export function parseAppMarkdownFallback(
     if (trimmed == "$$" || trimmed == "\\[") {
       const closeMarker = trimmed == "$$" ? "$$" : "\\]";
       const mathLines = [] as string[];
+      const blockStart = index;
       index++;
-      while (index < lines.length && lines[index].trim() != closeMarker) {
+      let closed = false;
+      while (index < lines.length) {
+        if (lines[index].trim() == closeMarker) {
+          closed = true;
+          index++;
+          break;
+        }
         mathLines.push(lines[index]);
         index++;
       }
-      if (index < lines.length) index++;
       const latex = mathLines.join("\n").trim();
-      console.log(
-        "[MathRender] fallback block math index=" +
-          itemIndex +
-          " latex=" +
-          latex,
-      );
-      const mathToken: MarkdownToken = {
-        type: "math",
-        text: latex,
-        uniqueId: "fallback-math-token-" + itemIndex,
-      };
-      result.push(makeItem("math", itemIndex++, [[mathToken]]));
-      renderMathToken(latex, mathToken, onMathRendered);
-      continue;
+      // 流式未闭合的 $$：勿当完整公式渲染（否则会吃掉后续正文并反复打无效 katex）
+      if (closed && latex.length > 0) {
+        console.log(
+          "[MathRender] fallback block math index=" +
+            itemIndex +
+            " latex=" +
+            latex,
+        );
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: latex,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(latex, mathToken, onMathRendered);
+        continue;
+      }
+      if (!closed) {
+        index = blockStart;
+        // 落入下方段落逻辑，等下一 chunk 补全闭合符
+      } else {
+        continue;
+      }
     }
 
-    let inlineBlockMath = "";
-    if (
-      trimmed.length > 4 &&
-      trimmed.startsWith("$$") &&
-      trimmed.endsWith("$$")
-    ) {
-      inlineBlockMath = trimmed.substring(2, trimmed.length - 2).trim();
-    } else if (
-      trimmed.length > 4 &&
-      trimmed.startsWith("\\[") &&
-      trimmed.endsWith("\\]")
-    ) {
-      inlineBlockMath = trimmed.substring(2, trimmed.length - 2).trim();
-    } else if (
-      trimmed.length > 2 &&
-      trimmed.startsWith("$") &&
-      trimmed.endsWith("$")
-    ) {
-      inlineBlockMath = trimmed.substring(1, trimmed.length - 1).trim();
-    }
-    if (inlineBlockMath.length > 0) {
-      console.log(
-        "[MathRender] fallback same-line math index=" +
-          itemIndex +
-          " latex=" +
-          inlineBlockMath,
-      );
-      const mathToken: MarkdownToken = {
-        type: "math",
-        text: inlineBlockMath,
-        uniqueId: "fallback-math-token-" + itemIndex,
-      };
-      result.push(makeItem("math", itemIndex++, [[mathToken]]));
-      renderMathToken(inlineBlockMath, mathToken, onMathRendered);
-      index++;
-      continue;
+    if (isStandaloneMathLine(trimmed)) {
+      const inlineBlockMath = extractStandaloneMathLatex(trimmed);
+      if (inlineBlockMath.length > 0) {
+        console.log(
+          "[MathRender] fallback same-line math index=" +
+            itemIndex +
+            " latex=" +
+            inlineBlockMath,
+        );
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: inlineBlockMath,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(inlineBlockMath, mathToken, onMathRendered);
+        index++;
+        continue;
+      }
     }
 
     const tableSeparatorIndex =
@@ -730,14 +859,6 @@ export function parseAppMarkdownFallback(
         tableRows.push(makeTableRow(lines[index]));
         index++;
       }
-      console.log(
-        "[MdRender] fallback table recovered start=" +
-          tableStartIndex +
-          " separator=" +
-          tableSeparatorIndex +
-          " rows=" +
-          tableRows.length,
-      );
       const tableToken: MarkdownToken = {
         type: "table",
         tokens: tableRows,
@@ -748,12 +869,8 @@ export function parseAppMarkdownFallback(
       continue;
     }
 
+    // 忽略 Markdown 水平线（如 $$ 后跟 ---），避免思考/正文出现多余中横线
     if (trimmed == "---" || trimmed == "***" || trimmed == "___") {
-      const hrToken: MarkdownToken = {
-        type: "thematic_break",
-        uniqueId: "fallback-hr-token-" + itemIndex,
-      };
-      result.push(makeItem("thematic_break", itemIndex++, [[hrToken]]));
       index++;
       continue;
     }
@@ -797,6 +914,7 @@ export function parseAppMarkdownFallback(
         listRows.push(rowTokens);
         index++;
       }
+      // H5 上兄弟 text 默认 inline，行间需要 \\n；App 端在 uni-ai-text-md 里会过滤 linebreak，避免多占一行。
       for (let rowIndex = 0; rowIndex < listRows.length - 1; rowIndex++) {
         listRows[rowIndex].push(makeTextToken("\n", "linebreak"));
       }
@@ -809,10 +927,12 @@ export function parseAppMarkdownFallback(
     index++;
     while (index < lines.length && lines[index].trim().length > 0) {
       const next = lines[index].trim();
+      // 独立公式行必须留给后续 math 分支，不能并进段落（否则会显示裸 $$latex$$）
       if (
         next.startsWith("```") ||
         next == "$$" ||
         next == "\\[" ||
+        isStandaloneMathLine(next) ||
         next == "---" ||
         isFallbackListLine(lines[index]) ||
         (next.indexOf("|") >= 0 &&
@@ -834,11 +954,5 @@ export function parseAppMarkdownFallback(
     result.push(makeItem("paragraph", itemIndex++, [paragraphTokens]));
   }
 
-  console.log(
-    "[MdRender] appFallback parsed bodyLen=" +
-      markdown.length +
-      " elCount=" +
-      result.length,
-  );
   return result;
 }

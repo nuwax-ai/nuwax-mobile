@@ -22,20 +22,20 @@
             <text class="row-title">{{ member.name }}</text>
             <text class="row-desc">{{ member.desc }}</text>
           </view>
-          <view class="remove-btn" hover-class="remove-btn-active" @click="handleRemove(member.agentId)">
-            <text class="remove-text">{{ t("Mobile.Terminal.remove") }}</text>
+          <view :class="['remove-btn', removingAgentId == member.agentId ? 'remove-btn-busy' : '']" hover-class="remove-btn-active" @click="handleRemove(member.agentId)">
+            <text class="remove-text">{{ removingAgentId == member.agentId ? t("Mobile.Terminal.removing") : t("Mobile.Terminal.remove") }}</text>
           </view>
         </view>
       </view>
 
-      <!-- 添加智能体（候选自最近使用，已过滤在组成员） -->
+      <!-- 添加智能体（候选来自智联录已发布智能体，已过滤宿主与在组内成员） -->
       <view class="field-label">{{ t("Mobile.Terminal.addAgent") }}</view>
       <view class="card-group">
         <view v-if="candidateList.length == 0 && !loading" class="empty-row">
           <text class="empty-text">{{ t("Mobile.Terminal.noCandidates") }}</text>
         </view>
         <view
-          class="row-item"
+          :class="['row-item', addingAgentId == agent.agentId ? 'row-item-busy' : '']"
           v-for="agent in candidateList"
           :key="agent.agentId"
           hover-class="row-item-active"
@@ -49,7 +49,7 @@
             <text class="row-title">{{ agent.name }}</text>
             <text class="row-desc">{{ agent.desc }}</text>
           </view>
-          <text class="add-text">{{ t("Mobile.Terminal.add") }}</text>
+          <text :class="['add-text', addingAgentId == agent.agentId ? 'add-text-busy' : '']">{{ addingAgentId == agent.agentId ? t("Mobile.Terminal.adding") : t("Mobile.Terminal.add") }}</text>
         </view>
       </view>
 
@@ -70,10 +70,10 @@
   import { onLoad } from "@dcloudio/uni-app";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
-  import { apiGetGroupMembers, apiAddGroupMember } from "@/servers/terminalAgent";
-  import { apiUserUsedAgentList } from "@/servers/agentDev";
+  import { apiGetGroupMembers, apiAddGroupMember, apiRemoveGroupMember } from "@/servers/terminalAgent";
+  import { apiPublishedAgentList } from "@/servers/square";
   import { GroupMemberAddParams } from "@/types/interfaces/terminalGroupMember";
-  import { ListParams } from "@/types/interfaces/common";
+  import { SquarePublishedListParams } from "@/types/interfaces/square";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
 
@@ -99,7 +99,8 @@
   const candidateList = ref<MemberRow[]>([] as MemberRow[]);
   const loading = ref<boolean>(false);
   /** 防止连续点击添加 */
-  const adding = ref<boolean>(false);
+  const addingAgentId = ref<number>(0);
+  const removingAgentId = ref<number>(0);
 
   /** icon 是否为图片 URL（否则按 emoji / 占位文本渲染） */
   const isIconUrl = (icon: string): boolean => {
@@ -171,24 +172,30 @@
 
   /**
    * 拉取候选智能体并排除已在组内的成员。
-   * ⚠️ 临时复用 apiUserUsedAgentList（用户最近使用），语义非"可加入设备组的智能体"；
-   * 待后端提供专用候选接口（如 /group-member/candidates）后替换数据源。
+   * 数据源与智联录一致：apiPublishedAgentList（POST /api/published/agent/list，已发布智能体广场），
+   * records 中 targetType=Agent 时 targetId 即 agentId。
    * @param memberIds 已在组内的 agentId
    */
   const fetchCandidates = async (memberIds: number[]): Promise<void> => {
     try {
-      const params = new ListParams();
-      params.size = 50;
-      params.pageIndex = 1;
-      const res = await apiUserUsedAgentList(params);
+      const params = new SquarePublishedListParams();
+      params.targetType = "Agent";
+      params.targetSubType = "ChatBot";
+      params.page = 1;
+      params.pageSize = 50;
+      params.category = "";
+      params.kw = "";
+      const res = await apiPublishedAgentList(params);
       if (apiResCode(res) == SUCCESS_CODE) {
-        // used/list 直接返回数组（与首页最近使用一致）
-        const raw = apiResData<any>(res);
-        const arr = raw != null ? (raw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        const pageDataRaw = apiResData<any>(res);
+        const pageObj = pageDataRaw != null ? (pageDataRaw as UTSJSONObject) : null;
+        const recordsRaw = pageObj != null ? pageObj["records"] : null;
+        const arr = recordsRaw != null ? (recordsRaw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
         const rows: MemberRow[] = [] as MemberRow[];
         for (let i = 0; i < arr.length; i++) {
           const src = arr[i];
-          const aid = readNum(src, "agentId");
+          // targetId（targetType=Agent 时即 agentId）
+          const aid = readNum(src, "targetId");
           if (aid <= 0) continue;
           // 宿主自身与已在组内的不进候选
           if (aid == hostAgentId.value) continue;
@@ -228,9 +235,28 @@
     }
   };
 
-  /** 移除组员：主站暂无 remove 端点（仅 list/add），诚实提示，不发起必将 404 的请求 */
-  const handleRemove = (_agentId: number) => {
-    uni.showToast({ title: t("Mobile.Terminal.removeNotSupported"), icon: "none" });
+  /** 移除组员：逐行"移除中..."反馈，成功后刷新；POST /group-member/remove */
+  const handleRemove = async (agentId: number) => {
+    if (removingAgentId.value != 0 || hostAgentId.value <= 0 || agentId <= 0) return;
+    removingAgentId.value = agentId;
+    const body = new GroupMemberAddParams();
+    body.agentId = hostAgentId.value;
+    body.targetAgentId = agentId;
+    try {
+      const res = await apiRemoveGroupMember(body);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Terminal.removed"), icon: "none" });
+        refreshAll();
+      } else {
+        const msg = apiResMessage(res);
+        uni.showToast({ title: msg != "" ? msg : t("Mobile.Terminal.removeFailed"), icon: "none" });
+      }
+    } catch (e) {
+      console.error("handleRemove error", e);
+      uni.showToast({ title: t("Mobile.Terminal.removeFailed"), icon: "none" });
+    } finally {
+      removingAgentId.value = 0;
+    }
   };
 
   /**
@@ -238,8 +264,8 @@
    * @param targetAgentId 要加入的智能体 ID
    */
   const handleAdd = async (targetAgentId: number) => {
-    if (adding.value || hostAgentId.value <= 0 || targetAgentId <= 0) return;
-    adding.value = true;
+    if (addingAgentId.value != 0 || hostAgentId.value <= 0 || targetAgentId <= 0) return;
+    addingAgentId.value = targetAgentId;
     try {
       const body = new GroupMemberAddParams();
       body.agentId = hostAgentId.value;
@@ -256,7 +282,7 @@
       console.error("handleAdd error", e);
       uni.showToast({ title: t("Mobile.Terminal.addFailed"), icon: "none" });
     } finally {
-      adding.value = false;
+      addingAgentId.value = 0;
     }
   };
 
@@ -403,6 +429,10 @@
         opacity: 0.7;
       }
 
+      &.remove-btn-busy {
+        opacity: 0.6;
+      }
+
       .remove-text {
         font-size: 24rpx;
         color: #fa5151;
@@ -410,10 +440,18 @@
       }
     }
 
+    &.row-item-busy {
+      opacity: 0.6;
+    }
+
     .add-text {
       font-size: 24rpx;
       color: #07c160;
       font-weight: 500;
+
+      &.add-text-busy {
+        color: #999999;
+      }
     }
   }
 

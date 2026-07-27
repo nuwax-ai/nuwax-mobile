@@ -65,10 +65,15 @@ class EspProvisioningBridge(context: Context) {
     }
   }
 
+  /** 是否应持续扫描：scanCompleted 时据此决定是否重启扫描窗口，stopScan 置 false。 */
+  @Volatile
+  private var scanning = false
+
   fun startScan(prefix: String, requiredServiceUuid: String, callback: BridgeScanCallback) {
     registerEvents()
     peripherals.clear()
-    manager.searchBleEspDevices(prefix, object : BleScanListener {
+    scanning = true
+    val listener = object : BleScanListener {
       override fun scanStartFailed() {
         callback.onFailure("BLUETOOTH_OFF", "Bluetooth is disabled")
       }
@@ -86,15 +91,23 @@ class EspProvisioningBridge(context: Context) {
         callback.onDevice(address, name, scanResult.rssi, matchedUuid)
       }
 
-      override fun scanCompleted() = Unit
+      override fun scanCompleted() {
+        // ESP 库默认扫描窗口较短（实测 ~6s），单次易漏掉广播间隔较长的设备。
+        // 窗口结束但仍在 scanning（未被 stopScan）时自动重启，直到找到设备或上层超时调用 stopScan。
+        if (scanning) {
+          manager.searchBleEspDevices(prefix, this)
+        }
+      }
 
       override fun onFailure(error: Exception) {
         callback.onFailure("SCAN_FAILED", safeMessage(error))
       }
-    })
+    }
+    manager.searchBleEspDevices(prefix, listener)
   }
 
   fun stopScan() {
+    scanning = false
     manager.stopBleScan()
   }
 

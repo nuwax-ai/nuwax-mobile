@@ -4,6 +4,11 @@ import type {
   MarkdownToken,
 } from "@/uni_modules/uni-cmark/utssdk/interface.uts";
 import proxyWeb from "@/uni_modules/uni-ai-x/sdk/proxy-web.uts";
+import {
+  isIncompleteMarkdownImageLine,
+  parseMarkdownImageAt,
+  parseStandaloneMarkdownImageLine,
+} from "@/subpackages/components/ai-msg/markdownImage.uts";
 
 type MathRenderedCallback = () => void;
 
@@ -140,10 +145,50 @@ function makeTextToken(text: string, className: string = "text"): MarkdownToken 
   };
 }
 
+/** 查找下一个已闭合 Markdown 图片起点 `![alt](url)`。 */
+function findInlineImageStart(text: string, start: number): number {
+  let markerStart = text.indexOf("![", start);
+  while (markerStart >= 0) {
+    if (parseMarkdownImageAt(text, markerStart) != null) {
+      return markerStart;
+    }
+    markerStart = text.indexOf("![", markerStart + 2);
+  }
+  return -1;
+}
+
+/** 构造原位图片 token（由 UniAiXMsg 渲染为 <image>）。 */
+function makeImageToken(alt: string, url: string): MarkdownToken {
+  return {
+    type: "image",
+    text: alt,
+    href: url,
+    className: "image",
+  };
+}
+
+/** 构造原位图片 Markdown 元素。 */
+function makeMarkdownImageItem(
+  index: number,
+  alt: string,
+  url: string,
+): UniAiMarkdownElItem {
+  return {
+    uniqueId: "fallback-markdown-image-" + index,
+    type: "markdown_image",
+    datasList: [[makeImageToken(alt, url)]],
+  };
+}
+
 /** 查找下一个合法 Markdown 链接起点。 */
 function findInlineLinkStart(text: string, start: number): number {
   let bracketStart = text.indexOf("[", start);
   while (bracketStart >= 0) {
+    // 跳过图片语法中的 [
+    if (bracketStart > 0 && text.charAt(bracketStart - 1) == "!") {
+      bracketStart = text.indexOf("[", bracketStart + 1);
+      continue;
+    }
     const labelEnd = text.indexOf("](", bracketStart + 1);
     if (labelEnd >= 0) {
       const hrefEnd = text.indexOf(")", labelEnd + 2);
@@ -162,10 +207,19 @@ function parseInline(text: string): MarkdownToken[] {
   while (cursor < text.length) {
     const strongStart = text.indexOf("**", cursor);
     const codeStart = text.indexOf("`", cursor);
+    const imageStart = findInlineImageStart(text, cursor);
     const linkStart = findInlineLinkStart(text, cursor);
     let nextStart = -1;
     let marker = "";
     if (
+      imageStart >= 0 &&
+      (strongStart < 0 || imageStart <= strongStart) &&
+      (codeStart < 0 || imageStart <= codeStart) &&
+      (linkStart < 0 || imageStart <= linkStart)
+    ) {
+      nextStart = imageStart;
+      marker = "![";
+    } else if (
       strongStart >= 0 &&
       (codeStart < 0 || strongStart <= codeStart) &&
       (linkStart < 0 || strongStart <= linkStart)
@@ -185,6 +239,16 @@ function parseInline(text: string): MarkdownToken[] {
     }
     if (nextStart > cursor) {
       result.push(makeTextToken(text.substring(cursor, nextStart)));
+    }
+    if (marker == "![") {
+      const parsed = parseMarkdownImageAt(text, nextStart);
+      if (parsed == null) {
+        // 流式未闭合：不推原文
+        break;
+      }
+      result.push(makeImageToken(parsed.alt, parsed.url));
+      cursor = parsed.end;
+      continue;
     }
     if (marker == "[") {
       const labelEnd = text.indexOf("](", nextStart + 1);
@@ -875,6 +939,25 @@ export function parseAppMarkdownFallback(
       continue;
     }
 
+    // 独立图片行：原位 markdown_image（勿抽到消息末尾）
+    const standaloneImage = parseStandaloneMarkdownImageLine(trimmed);
+    if (standaloneImage != null) {
+      result.push(
+        makeMarkdownImageItem(
+          itemIndex++,
+          standaloneImage.alt,
+          standaloneImage.url,
+        ),
+      );
+      index++;
+      continue;
+    }
+    // 流式未闭合图片行：跳过，避免原文泄漏
+    if (isIncompleteMarkdownImageLine(trimmed)) {
+      index++;
+      continue;
+    }
+
     let headingDepth = 0;
     while (headingDepth < trimmed.length && trimmed.charAt(headingDepth) == "#") {
       headingDepth++;
@@ -935,6 +1018,8 @@ export function parseAppMarkdownFallback(
         isStandaloneMathLine(next) ||
         next == "---" ||
         isFallbackListLine(lines[index]) ||
+        parseStandaloneMarkdownImageLine(next) != null ||
+        isIncompleteMarkdownImageLine(next) ||
         (next.indexOf("|") >= 0 &&
           findTableSeparatorIndex(lines, index) >= 0)
       ) {

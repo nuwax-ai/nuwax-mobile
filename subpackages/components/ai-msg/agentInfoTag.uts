@@ -1,0 +1,225 @@
+/**
+ * 解析会话正文中的 <agent-info> / <agent> 标签。
+ * 流式与历史统一由 ai-msg 用原生 <image> 渲染，不再依赖 mp-html HTML 转换。
+ */
+
+export class AgentInfoDisplayItem {
+  name: string = "";
+  icon: string = "";
+}
+
+/**
+ * 从属性串读取 name="..." / name='...'。
+ */
+function readQuotedAttr(attrs: string, key: string): string {
+  const dq = key + '="';
+  let idx = attrs.indexOf(dq);
+  if (idx >= 0) {
+    const start = idx + dq.length;
+    const end = attrs.indexOf('"', start);
+    if (end >= 0) {
+      return attrs.substring(start, end);
+    }
+  }
+  const sq = key + "='";
+  idx = attrs.indexOf(sq);
+  if (idx >= 0) {
+    const start = idx + sq.length;
+    const end = attrs.indexOf("'", start);
+    if (end >= 0) {
+      return attrs.substring(start, end);
+    }
+  }
+  return "";
+}
+
+type AgentTagMatch = {
+  start: number;
+  end: number;
+  name: string;
+  icon: string;
+};
+
+/**
+ * 查找下一个已闭合的 agent-info / agent 标签。
+ */
+function findNextAgentTag(text: string, from: number): AgentTagMatch | null {
+  const infoOpen = text.indexOf("<agent-info", from);
+  let agentOpen = text.indexOf("<agent", from);
+  // <agent 不能误匹配 <agent-info
+  while (agentOpen >= 0) {
+    const after = agentOpen + 6;
+    if (after < text.length) {
+      const ch = text.charAt(after);
+      if (ch == "-" || (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")) {
+        agentOpen = text.indexOf("<agent", after);
+        continue;
+      }
+    }
+    break;
+  }
+
+  let start = -1;
+  let tagName = "";
+  if (infoOpen >= 0 && (agentOpen < 0 || infoOpen <= agentOpen)) {
+    start = infoOpen;
+    tagName = "agent-info";
+  } else if (agentOpen >= 0) {
+    start = agentOpen;
+    tagName = "agent";
+  } else {
+    return null;
+  }
+
+  const afterName = start + 1 + tagName.length;
+  const gt = text.indexOf(">", afterName);
+  if (gt < 0) {
+    return null;
+  }
+
+  let end = gt + 1;
+  const openTag = text.substring(start, gt + 1);
+  const selfClosing =
+    openTag.indexOf("/>") >= 0 ||
+    (gt > start && text.charAt(gt - 1) == "/");
+  if (!selfClosing) {
+    const closeTag = "</" + tagName + ">";
+    const closeIdx = text.indexOf(closeTag, gt + 1);
+    if (closeIdx < 0) {
+      // 流式未闭合，跳过本次
+      return null;
+    }
+    end = closeIdx + closeTag.length;
+  }
+
+  const attrsEnd = selfClosing && text.charAt(gt - 1) == "/" ? gt - 1 : gt;
+  const attrs = text.substring(afterName, attrsEnd);
+  const name = readQuotedAttr(attrs, "name");
+  const icon = readQuotedAttr(attrs, "icon");
+  return {
+    start,
+    end,
+    name,
+    icon,
+  } as AgentTagMatch;
+}
+
+/**
+ * 提取已闭合的 agent-info / agent 展示项。
+ * 连续相同 name+icon 去重（SSE 常对同一智能体重复下发标签）。
+ */
+export function extractAgentInfoList(text: string): AgentInfoDisplayItem[] {
+  const list = [] as AgentInfoDisplayItem[];
+  if (text.length == 0) {
+    return list;
+  }
+  let cursor = 0;
+  let lastName = "";
+  let lastIcon = "";
+  while (cursor < text.length) {
+    const match = findNextAgentTag(text, cursor);
+    if (match == null) {
+      break;
+    }
+    const iconRaw = match.icon.trim();
+    const name = match.name.trim();
+    const hasIcon =
+      iconRaw.length > 0 && iconRaw != "null" && iconRaw != "undefined";
+    const icon = hasIcon ? iconRaw : "";
+    if (hasIcon || name.length > 0) {
+      // 相邻重复不堆叠；不同智能体切换仍保留
+      if (name != lastName || icon != lastIcon) {
+        const item = new AgentInfoDisplayItem();
+        item.name = name;
+        item.icon = icon;
+        list.push(item);
+        lastName = name;
+        lastIcon = icon;
+      }
+    }
+    cursor = match.end;
+  }
+  return list;
+}
+
+/**
+ * 定位未闭合的 <agent-info / <agent 起点（流式尾部）。
+ */
+function findIncompleteAgentTagStart(text: string, from: number): number {
+  const infoOpen = text.indexOf("<agent-info", from);
+  let agentOpen = text.indexOf("<agent", from);
+  while (agentOpen >= 0) {
+    const after = agentOpen + 6;
+    if (after < text.length) {
+      const ch = text.charAt(after);
+      if (ch == "-" || (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")) {
+        agentOpen = text.indexOf("<agent", after);
+        continue;
+      }
+    }
+    break;
+  }
+  if (infoOpen >= 0 && (agentOpen < 0 || infoOpen <= agentOpen)) {
+    return infoOpen;
+  }
+  if (agentOpen >= 0) {
+    return agentOpen;
+  }
+  return -1;
+}
+
+/**
+ * 从正文剥离 agent-info / agent（含流式未闭合尾部），避免泄漏为纯文本。
+ */
+export function stripAgentInfoTags(text: string): string {
+  if (
+    text.length == 0 ||
+    (text.indexOf("<agent-info") < 0 && text.indexOf("<agent") < 0)
+  ) {
+    return text;
+  }
+  let out = "";
+  let cursor = 0;
+  while (cursor < text.length) {
+    const match = findNextAgentTag(text, cursor);
+    if (match == null) {
+      // 流式未闭合：隐藏从标签起点到文末，避免 name 等属性泄漏
+      const incomplete = findIncompleteAgentTagStart(text, cursor);
+      if (incomplete >= 0) {
+        out += text.substring(cursor, incomplete);
+      } else {
+        out += text.substring(cursor);
+      }
+      break;
+    }
+    out += text.substring(cursor, match.start);
+    cursor = match.end;
+  }
+  return out;
+}
+
+/**
+ * 兼容历史适配产出的 agent-info HTML 容器，解析前剥离。
+ */
+export function stripAdaptedAgentInfoHtml(text: string): string {
+  if (text.length == 0 || text.indexOf("agent-info-container") < 0) {
+    return text;
+  }
+  let out = "";
+  let cursor = 0;
+  while (cursor < text.length) {
+    const start = text.indexOf('<div class="agent-info-container"', cursor);
+    if (start < 0) {
+      out += text.substring(cursor);
+      break;
+    }
+    const end = text.indexOf("</div>", start);
+    if (end < 0) {
+      out += text.substring(cursor);
+      break;
+    }
+    out += text.substring(cursor, start);
+    cursor = end + 6;
+  }
+  return out;
+}

@@ -5,7 +5,7 @@
     <custom-nav-bar
       :title="headerTitle"
       :show-back="!isAppDetails"
-      :icon="isTempChat ? '' : agentInfo?.icon"
+      :icon="headerIcon"
       hasSafetyZone
     >
       <template v-slot:left>
@@ -36,7 +36,7 @@
       </template>
 
       <template v-slot:right>
-        <!-- #ifdef H5 || WEB -->
+        <!-- #ifdef H5 || WEB || APP -->
         <view class="right-buttons">
           <view
             class="icon-box"
@@ -54,6 +54,18 @@
               @tap="handleCreateNewConversation"
             >
               <svg-icon name="icon-message-add" />
+            </view>
+            <!-- 语音播报开/静音 -->
+            <view
+              class="icon-box"
+              hover-class="icon-box-hover"
+              @tap="handleToggleVoiceMute"
+            >
+              <uni-icons
+                :type="voiceMuted ? 'micoff' : 'sound'"
+                size="36rpx"
+                :color="voiceMuted ? '#999999' : '#333333'"
+              />
             </view>
           </template>
         </view>
@@ -128,10 +140,10 @@
                   ></UniAiXMsg>
                   <!-- 用户消息 -->
                   <template v-else>
-                    <!-- 图片以及文件 -->
+                    <!-- 图片以及文件（Android：attachments 元素多为 UTSJSONObject，禁止当 AttachmentFile 用） -->
                     <scroll-view
                       class="files-container"
-                      v-if="hasMessageAttachments(item.attachments)"
+                      v-if="hasMessageAttachments(item)"
                       direction="horizontal"
                       :scroll-with-animation="true"
                       :show-scrollbar="false"
@@ -139,17 +151,17 @@
                       <view class="files-list">
                         <view
                           class="files-box"
-                          :class="getFileBoxClassName(file.mimeType)"
-                          v-for="file in item.attachments"
-                          :key="file.fileKey"
-                          @click="onPreview(file, safeAttachments(item))"
+                          :class="getFileBoxClassName(getAttachmentMimeType(file))"
+                          v-for="(file, fileIndex) in getMessageAttachments(item)"
+                          :key="getAttachmentFileKey(file, fileIndex)"
+                          @click="onPreview(file, getMessageAttachments(item))"
                         >
                           <image
                             class="image"
-                            v-if="isImageMimeType(file.mimeType)"
-                            :src="file?.fileUrl"
+                            v-if="isImageMimeType(getAttachmentMimeType(file))"
+                            :src="getAttachmentFileUrl(file)"
                             mode="aspectFill"
-                            :alt="getUploadImageAlt(file.fileName)"
+                            :alt="getUploadImageAlt(getAttachmentFileName(file))"
                           />
                           <!-- 文件 -->
                           <template v-else>
@@ -161,7 +173,7 @@
                             />
                             <view class="doc-info-container">
                               <view class="doc-name text-ellipsis">{{
-                                file?.fileName
+                                getAttachmentFileName(file)
                               }}</view>
                               <text class="doc-size text-ellipsis">{{
                                 formatFileSize(file)
@@ -279,6 +291,7 @@
           :current-model-name="inputCurrentModelName"
           :agent-id="agentId"
           :agent-type="inputAgentTypeStr"
+          :allow-choose-mode="inputAllowChooseMode"
           :subscription-required="subscriptionRequired"
           @onModelChange="(id: number, name: string) => handleSelectModel(id, name)"
           @onOpenSubscription="handleOpenSubscription"
@@ -376,6 +389,12 @@
   import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
   import ScrollManager from "./layers/ScrollManager.uts";
   import AgentDetailUtils from "./layers/AgentDetailUtils.uts";
+  import { ttsWebSocketPlayer } from "@/subpackages/utils/voice/ttsWebSocketPlayer";
+  import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
+  import {
+    loadVoiceSettings,
+    saveVoiceSettings,
+  } from "@/subpackages/utils/voice/voiceTypes";
 
   // 类型定义
   import {
@@ -426,6 +445,7 @@
     TEMP_CHAT_KEY,
   } from "@/constants/common.constants";
   import docImage from "@/static/assets/doc_image.png";
+  import agentImage from "@/static/assets/agent_image.png";
   import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { API_BASE_URL } from "@/constants/config";
   import { EVENT_TYPE } from "@/subpackages/constants/event.constants";
@@ -529,6 +549,36 @@
       return null;
     }
   };
+
+  /**
+   * 读取 chat-input-phone 附件 / 已选组件。
+   * Android：禁止对 Gen* 组件 as UTSJSONObject 读 expose 的 ref。
+   */
+  const getInputPhoneGuidePayload = (): UTSJSONObject => {
+    const payload: UTSJSONObject = {
+      "files": [] as any[],
+      "selectedComponents": [] as any[],
+      "existErrorFile": false,
+    };
+    const inputPhoneRef = agentDetailInputPhoneRef.value as any | null;
+    if (inputPhoneRef == null) {
+      return payload;
+    }
+    try {
+      const proxy = inputPhoneRef as ComponentPublicInstance;
+      const filesResult = proxy.$callMethod("getFiles");
+      const compsResult = proxy.$callMethod("getSelectedComponents");
+      const filesArr =
+        filesResult != null ? (filesResult as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+      payload["files"] = filesArr;
+      payload["selectedComponents"] =
+        compsResult != null ? compsResult : ([] as any[]);
+      payload["existErrorFile"] = hasUploadErrorInFiles(filesArr);
+    } catch (_e) {
+      // ignore
+    }
+    return payload;
+  };
   // 聊天内容区域引用用于绑定自定义事件代理
   const msgListContentRef = ref<any | null>(null);
   // 事件绑定配置
@@ -544,6 +594,8 @@
   const msgListRef = ref<any | null>(null);
   // 用户临时票据
   const ticket = ref<string>("");
+  /** 全局 TTS 静音（持久化于 VoiceSettings.muted） */
+  const voiceMuted = ref<boolean>(loadVoiceSettings().muted);
   /**
    * 是否渲染输入框组件， 进入页面后渲染，离开页面后卸载组件
    * 出现一个bug，当从智能体详情页面返回首页时，录音后发送消息事件触发的是智能体详情页绑定的消息事件，而不是首页绑定的消息事件
@@ -618,6 +670,7 @@
     conversationId,
     messageList,
     streamingAssistantText,
+    streamingAssistantMessageId,
     chatSuggestList,
     requestId,
     isTempChat,
@@ -747,14 +800,57 @@
     return false;
   });
 
-  /** 消息是否含附件 */
-  const hasMessageAttachments = (
-    attachments: AttachmentFile[] | null | undefined,
-  ): boolean => {
-    if (attachments == null) {
-      return false;
+  /**
+   * 模板：消息附件列表。
+   * Android 上元素是 UTSJSONObject，禁止 as AttachmentFile[]。
+   * 须先于 hasMessageAttachments 声明（UTS const 箭头不可前向引用）。
+   */
+  const getMessageAttachments = (item: any | null): any[] => {
+    const raw = readRawField(item, "attachments");
+    if (raw == null) {
+      return [] as any[];
     }
-    return (attachments as AttachmentFile[]).length > 0;
+    try {
+      const list = raw as any[];
+      if (list != null && list.length >= 0) {
+        return list;
+      }
+    } catch (_e) {
+      // ignore
+    }
+    return [] as any[];
+  };
+
+  /** 消息是否含附件（Android：attachments 为 UTSJSONObject[]，勿强转 AttachmentFile） */
+  const hasMessageAttachments = (item: any | null): boolean => {
+    return getMessageAttachments(item).length > 0;
+  };
+
+  /** 安全读取附件字段字符串。 */
+  const readAttachmentString = (file: any | null, key: string): string => {
+    const raw = readRawField(file, key);
+    return raw != null ? `${raw}` : "";
+  };
+
+  /** 模板：附件 mimeType */
+  const getAttachmentMimeType = (file: any | null): string => {
+    return readAttachmentString(file, "mimeType");
+  };
+
+  /** 模板：附件 fileUrl */
+  const getAttachmentFileUrl = (file: any | null): string => {
+    return readAttachmentString(file, "fileUrl");
+  };
+
+  /** 模板：附件 fileName */
+  const getAttachmentFileName = (file: any | null): string => {
+    return readAttachmentString(file, "fileName");
+  };
+
+  /** 模板：附件列表 key */
+  const getAttachmentFileKey = (file: any | null, index: number): string => {
+    const key = readAttachmentString(file, "fileKey");
+    return key.length > 0 ? key : `att-${index}`;
   };
 
   /**
@@ -813,6 +909,7 @@
   /**
    * 流式会话中最后一条助手消息优先走 streamingAssistantText，
    * 避免 iOS 上 MessageInfo 批量更新导致打字机不刷新。
+   * 必须校验 messageId，防止上一轮正文串到新开的空助手气泡。
    */
   function resolveAssistantBodyText(item: any | null, listIndex: number): string {
     // #ifdef APP
@@ -820,7 +917,14 @@
       const list = messageList.value;
       if (list.length - 1 == listIndex) {
         const streamText = streamingAssistantText.value;
-        if (streamText.length > 0) {
+        const streamMsgId = streamingAssistantMessageId.value;
+        const itemIdRaw = readRawField(item, "id");
+        const itemId = itemIdRaw != null ? `${itemIdRaw}` : "";
+        if (
+          streamText.length > 0 &&
+          streamMsgId.length > 0 &&
+          itemId == streamMsgId
+        ) {
           return streamText;
         }
       }
@@ -970,10 +1074,12 @@
 
   /** 模板中安全读取文件大小（UTS 不允许模板里把 nullable 传给非空参数） */
   const safeFileSize = (file: any): number => {
-    const obj = file as UTSJSONObject;
-    const sizeVal = obj["fileSize"];
+    const sizeVal = readRawField(file, "fileSize");
     if (sizeVal != null) {
-      return sizeVal as number;
+      const n = parseFloat(`${sizeVal}`);
+      if (isNaN(n) == false) {
+        return n;
+      }
     }
     return 0;
   };
@@ -981,16 +1087,6 @@
   /** 模板中安全格式化文件大小（合并读取与格式化，避免模板里嵌套调用） */
   const formatFileSize = (file: any): string => {
     return formatBytes(safeFileSize(file));
-  };
-
-  /** 模板中安全获取附件数组（保证非空，避免 nullable 传给非空参数） */
-  const safeAttachments = (item: any): AttachmentFile[] => {
-    const obj = item as UTSJSONObject;
-    const attVal = obj["attachments"];
-    if (attVal != null) {
-      return attVal as AttachmentFile[];
-    }
-    return [] as AttachmentFile[];
   };
 
   /** 模板中读取 agentInfo 字段（UTSJSONObject 用 bracket） */
@@ -1055,6 +1151,13 @@
   /** 是否允许切换模型 */
   const inputAllowOtherModel = computed((): boolean => {
     return isDefaultSelectedYes(readAgentInfoField(agentInfo.value, "allowOtherModel"));
+  });
+
+  /** 是否允许切换自动/审批模式（Android 模板传参使用数值） */
+  const inputAllowChooseMode = computed((): number => {
+    return isDefaultSelectedYes(readAgentInfoField(agentInfo.value, "allowChooseMode"))
+      ? 1
+      : 0;
   });
 
   /** 沙盒只读 */
@@ -1205,6 +1308,9 @@
   // 滚动管理层 - 使用箭头函数保持this上下文
   const scrollToLastMsg = (userClick: boolean) =>
     scrollManager.scrollToLastMsg(userClick);
+  /** 历史会话首屏加载后延迟无动画滚底 */
+  const scrollToLastMsgAfterHistoryLoad = () =>
+    scrollManager.scrollToLastMsgAfterHistoryLoad();
   const setIsInScrollBottom = (e: UniScrollEvent) =>
     scrollManager.setIsInScrollBottom(e);
   const lockAutoToLastMsg = () => scrollManager.lockAutoToLastMsg();
@@ -1314,6 +1420,9 @@
 
   // 发送消息
   const handleSendMessage = (_data: any) => {
+    // 发送新消息时停止当前 TTS 播报（工具栏订阅会同步 UI）
+    ttsWebSocketPlayer.stop();
+
     // 取消订阅 ChatFinished 事件（发送新消息时，旧会话已结束）
     eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
 
@@ -1470,6 +1579,29 @@
   };
 
   /**
+   * 切换语音播报静音。
+   * 设为静音时：若正在播报则暂停；取消静音仅恢复可出声状态，不自动续播。
+   */
+  const handleToggleVoiceMute = (): void => {
+    const settings = loadVoiceSettings();
+    const nextMuted = settings.muted != true;
+    settings.muted = nextMuted;
+    saveVoiceSettings(settings);
+    voiceMuted.value = nextMuted;
+    ttsWebSocketPlayer.setMuted(nextMuted);
+    audioPlayerManager.setMuted(nextMuted);
+    if (nextMuted) {
+      ttsWebSocketPlayer.pause();
+      audioPlayerManager.pause();
+    }
+    uni.showToast({
+      title: nextMuted ? t("Mobile.Voice.muted") : t("Mobile.Voice.unmuted"),
+      icon: "none",
+      duration: 1500,
+    });
+  };
+
+  /**
    * 处理创建新会话
    */
   const handleCreateNewConversation = (): void => {
@@ -1505,9 +1637,11 @@
     const morePopup = data.refMorePopup.value as any | null;
     if (morePopup != null) {
       nextTick(() => {
-        const openFn = (morePopup as UTSJSONObject)["open"] as (() => void) | null;
-        if (openFn != null) {
-          openFn();
+        try {
+          const proxy = morePopup as ComponentPublicInstance;
+          proxy.$callMethod("open");
+        } catch (_e) {
+          // ignore
         }
       });
     }
@@ -1525,20 +1659,8 @@
       });
       return;
     }
-    const inputPhoneRef = agentDetailInputPhoneRef.value;
-    let existErrorFile = false;
-    if (inputPhoneRef != null) {
-      const refObj = inputPhoneRef as UTSJSONObject;
-      const filesRef = refObj["files"];
-      if (filesRef != null) {
-        const filesVal = (filesRef as UTSJSONObject)["value"];
-        // Android：附件元素多为 UTSJSONObject，hasUploadErrorInFiles 按 bracket 读 status
-        const filesArr =
-          filesVal != null ? (filesVal as UTSJSONObject[]) : ([] as UTSJSONObject[]);
-        existErrorFile = hasUploadErrorInFiles(filesArr);
-      }
-    }
-    if (existErrorFile == true) {
+    const guidePayload = getInputPhoneGuidePayload();
+    if (guidePayload["existErrorFile"] == true) {
       uni.showToast({
         title: t("Mobile.Chat.removeUploadFailed"),
         icon: "none",
@@ -1546,34 +1668,19 @@
       });
       return;
     }
-    let guideFiles: any = [] as any[];
-    let guideComponents: any = [] as any[];
-    if (inputPhoneRef != null) {
-      const refObj = inputPhoneRef as UTSJSONObject;
-      const filesRef = refObj["files"];
-      if (filesRef != null) {
-        const filesVal = (filesRef as UTSJSONObject)["value"];
-        guideFiles = filesVal != null ? filesVal : [] as any[];
-      }
-      const compsRef = refObj["selectedComponents"];
-      if (compsRef != null) {
-        const compsVal = (compsRef as UTSJSONObject)["value"];
-        guideComponents = compsVal != null ? compsVal : [] as any[];
-      }
-    }
     const params: UTSJSONObject = {
       "messageInfo": guideQuestion,
-      "files": guideFiles,
-      "selectedComponents": guideComponents,
+      "files": guidePayload["files"],
+      "selectedComponents": guidePayload["selectedComponents"],
     };
 
     handleSendMessage(params);
   };
 
-  // 预览图片
-  const onPreview = (file: AttachmentFile, attachments: AttachmentFile[]) => {
-    const isImage = file.mimeType.indexOf("image/") >= 0;
-    if (isImage == false) {
+  // 预览图片（Android：file / attachments 为 UTSJSONObject，勿当 AttachmentFile）
+  const onPreview = (file: any, attachments: any[]): void => {
+    const mime = getAttachmentMimeType(file);
+    if (mime.indexOf("image/") < 0) {
       uni.showToast({
         title: t("Mobile.Chat.previewTypeUnsupported"),
         icon: "none",
@@ -1585,18 +1692,19 @@
     const attachLen = attachments.length;
     for (let i = 0; i < attachLen; i++) {
       const item = attachments[i];
-      if (item.mimeType.indexOf("image/") >= 0) {
-        urls.push(item.fileUrl);
+      if (getAttachmentMimeType(item).indexOf("image/") >= 0) {
+        const url = getAttachmentFileUrl(item);
+        if (url.length > 0) {
+          urls.push(url);
+        }
       }
     }
-    const currentUrl = file.fileUrl;
-    if (urls.length > 0) {
-      if (currentUrl.length > 0) {
-        uni.previewImage({
-          urls,
-          current: currentUrl,
-        });
-      }
+    const currentUrl = getAttachmentFileUrl(file);
+    if (urls.length > 0 && currentUrl.length > 0) {
+      uni.previewImage({
+        urls,
+        current: currentUrl,
+      });
     }
   };
 
@@ -1657,6 +1765,21 @@
       }
     }
     return agentName;
+  });
+
+  /** 非临时会话始终显示图标；接口未配置图标时使用默认智能体图标。 */
+  const headerIcon = computed((): string => {
+    if (props.isTempChat == true) {
+      return "";
+    }
+    const info = agentInfo.value;
+    if (info != null) {
+      const iconRaw = info["icon"];
+      if (iconRaw != null && `${iconRaw}`.length > 0) {
+        return `${iconRaw}`;
+      }
+    }
+    return agentImage;
   });
 
   // 沙盒是否锁定 (综合判断: 服务层限制 || 已发送消息 || 存在历史消息)
@@ -1885,7 +2008,11 @@
             eventBindConfig.value = parseEventBindConfig((agent as UTSJSONObject)["eventBindConfig"]);
           }
         }
-        handleQueryConversation(res);
+        await handleQueryConversation(res);
+        // 历史消息首屏布局完成后再无动画滚到底（watch 可能早于 DOM 就绪）
+        if (data.messageList.value.length > 0) {
+          scrollToLastMsgAfterHistoryLoad();
+        }
 
         // 首页会话框会先创建会话，再以 conversationId 为键保存一次性草稿。
         // 会话详情初始化完成后复用既有发送链路，避免首页重复实现流式聊天。
@@ -1917,6 +2044,7 @@
               skillIds: draft.skillIds,
               modelId: draft.modelId,
               sandboxId: draft.sandboxId,
+              agentMode: draft.agentMode,
             };
             // 等待消息列表和输入组件完成首轮渲染，避免 App 首屏丢失首条消息。
             nextTick(() => {
@@ -2192,12 +2320,11 @@
     nextTick(() => {
       const morePopup = refMorePopup.value as any | null;
       if (morePopup != null) {
-        const popupMore = (morePopup as UTSJSONObject)["popupMore"] as any | null;
-        if (popupMore != null) {
-          const openFn = (popupMore as UTSJSONObject)["open"] as (() => void) | null;
-          if (openFn != null) {
-            openFn();
-          }
+        try {
+          const proxy = morePopup as ComponentPublicInstance;
+          proxy.$callMethod("openMoreInfo");
+        } catch (_e) {
+          // ignore
         }
       }
     });

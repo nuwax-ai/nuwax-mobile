@@ -508,6 +508,8 @@ export function parseEventBindConfig(raw: any | null): EventBindConfig | null {
 export default class AgentDetailService {
   private data: AgentDetailData;
   private isAllowSuggest: boolean = true;
+  /** 流式会话代数：abort/新开流时递增，用于丢弃旧 SSE 回调 */
+  private streamGeneration: number = 0;
   constructor(data: AgentDetailData) {
     this.data = data;
   }
@@ -535,6 +537,35 @@ export default class AgentDetailService {
       return null;
     }
     return info[key];
+  }
+
+  /**
+   * 任务执行中时，将本地 conversationInfo.taskStatus 标为 CANCEL。
+   * Android：conversationInfo 可能为 null / Map，禁止先 as UTSJSONObject。
+   */
+  private markConversationTaskCancelIfExecuting(): void {
+    const stopConvInfo = this.data.conversationInfo.value;
+    if (stopConvInfo == null) {
+      return;
+    }
+    const taskStatusRaw = readRawField(stopConvInfo, "taskStatus");
+    if (taskStatusRaw == null || `${taskStatusRaw}` != `${TaskStatus.EXECUTING}`) {
+      return;
+    }
+    try {
+      const jsonStr = JSON.stringify(stopConvInfo);
+      if (jsonStr == null || jsonStr.length == 0 || jsonStr == "null") {
+        return;
+      }
+      const convObj = JSON.parse(jsonStr) as UTSJSONObject | null;
+      if (convObj == null) {
+        return;
+      }
+      convObj["taskStatus"] = TaskStatus.CANCEL;
+      this.data.conversationInfo.value = convObj as any;
+    } catch (_e) {
+      // ignore
+    }
   }
 
   /**
@@ -1006,10 +1037,8 @@ export default class AgentDetailService {
       const id = idRaw != null ? `${idRaw}` : "";
       const finishedRaw = readRawField(responseData, "finished");
       const finished = finishedRaw == true;
-      // 如果会话结束，则设置会话状态为不活跃
-      if (finished) {
-        this.data.isConversationActive.value = false;
-      }
+      // 注意：中间段 CHAT 也可能带 finished=true（如仅下发 agent-info），
+      // 不能据此结束整轮会话；整轮结束以 FINAL_RESULT / 流完成 / 用户停止为准。
 
       if (type == `${MessageModeEnum.THINK}`) {
         const m = cloneMessageInfoDraft(currentMessage);
@@ -1227,19 +1256,18 @@ export default class AgentDetailService {
 
       // 标记是否已经更新过主题，确保只更新一次
       let hasUpdatedTopic = false;
+      // 本轮流代数；abort / 新开流后旧回调直接丢弃
+      this.streamGeneration = this.streamGeneration + 1;
+      const streamGen = this.streamGeneration;
 
       await chatService.sendMessage(
         params,
         // 处理流式数据
         (chunk: string) => {
+          if (streamGen != this.streamGeneration) {
+            return;
+          }
           try {
-            const previewLen = chunk.length > 120 ? 120 : chunk.length;
-            console.log(
-              "[SSE-Stream] 收到 chunk len=",
-              chunk.length,
-              "preview=",
-              chunk.substring(0, previewLen),
-            );
             const result = JSON.parse(chunk);
             const resultObj = result;
             if (resultObj == null) {
@@ -1258,8 +1286,7 @@ export default class AgentDetailService {
             const convInfo = this.data.conversationInfo.value;
             let topicUpdated = 0;
             if (convInfo != null) {
-              const convObj = convInfo as UTSJSONObject;
-              const tuVal = convObj["topicUpdated"];
+              const tuVal = readRawField(convInfo, "topicUpdated");
               if (tuVal != null) {
                 topicUpdated = tuVal as number;
               }
@@ -1294,11 +1321,17 @@ export default class AgentDetailService {
         },
         // 完成回调
         () => {
+          if (streamGen != this.streamGeneration) {
+            return;
+          }
           console.log("[SSE-Stream] 流式会话完成");
           this.handleStreamComplete(params, isTempChat);
         },
         // 错误回调
         (error: any) => {
+          if (streamGen != this.streamGeneration) {
+            return;
+          }
           console.error(
             "[AgentDetailService] Chat stream error callback:",
             error,
@@ -1310,6 +1343,9 @@ export default class AgentDetailService {
         isTempChat,
         // 超时回调
         () => {
+          if (streamGen != this.streamGeneration) {
+            return;
+          }
           if (onTimeout != null) {
             (onTimeout as () => void)();
           }
@@ -1378,6 +1414,10 @@ export default class AgentDetailService {
     // 停止会话后，不再允许获取问题建议
     this.isAllowSuggest = false;
 
+    // 无论 UI 是否已标为结束，都先中止本地 SSE，避免 chunk 回调继续跑
+    this.streamGeneration = this.streamGeneration + 1;
+    chatService.abort();
+
     // 如果会话已经不活跃，说明会话已经结束，无需调用 stop 接口
     if (!this.data.isConversationActive.value) {
       this.data.isStoppingConversation.value = false;
@@ -1385,13 +1425,7 @@ export default class AgentDetailService {
     }
 
     // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
-    const stopConvInfo = this.data.conversationInfo.value;
-    const convInfoObj = stopConvInfo as UTSJSONObject;
-    if (convInfoObj != null && convInfoObj["taskStatus"] as TaskStatus == TaskStatus.EXECUTING) {
-      const convObj = JSON.parse(JSON.stringify(stopConvInfo)) as UTSJSONObject;
-      convObj["taskStatus"] = TaskStatus.CANCEL;
-      this.data.conversationInfo.value = convObj as any;
-    }
+    this.markConversationTaskCancelIfExecuting();
 
     // 会话消息请求ID
     const requestId = this.data.currentConversationRequestId.value;
@@ -2078,13 +2112,7 @@ export default class AgentDetailService {
     this.clearConversationData();
 
     // 如果普通会话，并且任务正在执行，则更新任务状态为 CANCEL
-    const stopConvInfo = this.data.conversationInfo.value;
-    const convInfoObj = stopConvInfo as UTSJSONObject;
-    if (convInfoObj != null && convInfoObj["taskStatus"] as TaskStatus == TaskStatus.EXECUTING) {
-      const convObj = JSON.parse(JSON.stringify(stopConvInfo)) as UTSJSONObject;
-      convObj["taskStatus"] = TaskStatus.CANCEL;
-      this.data.conversationInfo.value = convObj as any;
-    }
+    this.markConversationTaskCancelIfExecuting();
 
     // 会话参数
     const conversationParams: UTSJSONObject = {

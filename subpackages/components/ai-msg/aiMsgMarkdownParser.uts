@@ -5,6 +5,7 @@ import { MarkdownToken, type ParseMdRes } from "@/uni_modules/uni-cmark/utssdk/i
 import { md2json } from "@/uni_modules/uni-cmark";
 import { MsgItem } from "@/types/interfaces/ai-msg";
 import { parseAppMarkdownFallback } from "@/subpackages/components/ai-msg/appMarkdownFallback.uts";
+import { expandMarkdownImageItems } from "@/subpackages/components/ai-msg/markdownImage.uts";
 
 /** 从自定义工具标签属性中读取字符串。 */
 function extractCustomProcessAttribute(
@@ -272,14 +273,16 @@ export class AiMsgMarkdownParser {
           body.replace(/\n/g, "\\n"),
       );
     }
-    this.msg.value.markdownElList = parseAppMarkdownFallback(
-      body,
-      (): void => {
-        // KaTeX 回调修改的是原始 token；替换外层数组以通知 Vue 子组件刷新 href。
-        this.msg.value.markdownElList =
-          this.msg.value.markdownElList.slice();
-        this.bumpRevision();
-      },
+    this.msg.value.markdownElList = expandMarkdownImageItems(
+      parseAppMarkdownFallback(
+        body,
+        (): void => {
+          // KaTeX 回调修改的是原始 token；替换外层数组以通知 Vue 子组件刷新 href。
+          this.msg.value.markdownElList =
+            this.msg.value.markdownElList.slice();
+          this.bumpRevision();
+        },
+      ),
     );
     this.msg.value.rendered = true;
     this.lastFinishedBody = body;
@@ -294,9 +297,10 @@ export class AiMsgMarkdownParser {
       );
       return;
     }
-    this.msg.value.markdownElList = markdownTokenList.map((token: MarkdownToken) =>
+    const mapped = markdownTokenList.map((token: MarkdownToken) =>
       token2el(token),
     );
+    this.msg.value.markdownElList = expandMarkdownImageItems(mapped);
     mdRenderLog(
       "[MdRender] applyMarkdownTokenList",
       `msgId=${this.msg.value._id} bodyLen=${this.getBodyText().length} elCount=${this.msg.value.markdownElList.length}`,
@@ -407,8 +411,11 @@ export class AiMsgMarkdownParser {
       this.msg.value.state === 3;
     const needsCustomFallback = this.hasCustomMarkup(body);
 
-    // 历史/已完成消息：已有渲染结果且正文未变时跳过，避免列表刷新反复解析。
-    // 含 Plan/工具标签时，必须已解析出对应 el，否则不能跳过（防止 cmark 把标签当纯文本后被缓存）。
+    // 历史/已完成消息：正文未变且已有渲染结果时跳过。
+    // 含 Plan/工具标签时，必须已解析出对应 el，否则不能跳过。
+    // 注意：勿在 lastFinishedBody 为空时仅凭 rendered 直接 return ——
+    // 中间段 CHAT finished 会把 state 置 Complete，此时 token 可能仍是
+    // 「未剥离图片语法」的旧结果，跳过会导致原文与 <image> 双显。
     if (
       streamFinished &&
       body.length > 0 &&
@@ -416,10 +423,10 @@ export class AiMsgMarkdownParser {
     ) {
       if (needsCustomFallback && !this.renderListHasCustomEl()) {
         // 继续走下方 fallback
-      } else if (this.lastFinishedBody.length == 0 && this.msg.value.rendered) {
-        this.lastFinishedBody = body;
-        return;
-      } else if (body == this.lastFinishedBody) {
+      } else if (
+        this.lastFinishedBody.length > 0 &&
+        body == this.lastFinishedBody
+      ) {
         return;
       }
     }
@@ -458,6 +465,19 @@ export class AiMsgMarkdownParser {
 
     if (this.parseMarkdown == null) {
       this.parseMarkdown = this.createParseMarkdown();
+    }
+    // strip 掉已闭合图片后正文会变短；官方 ParseMarkdown 对缩短直接 return，
+    // 会残留流式阶段写入的 `![alt](url)` 文本 token，必须重建解析器。
+    const pm = this.parseMarkdown!;
+    if (body.length < pm.oldMsgBodyLength) {
+      mdRenderLog(
+        "[MdRender] runMarkdownParse.bodyShrunk",
+        `msgId=${msgId} bodyLen=${body.length} oldLen=${pm.oldMsgBodyLength}`,
+      );
+      this.parseMarkdown = this.createParseMarkdown();
+      this.msg.value.markdownElList = [] as UniAiMarkdownElItem[];
+      this.lastFinishedBody = "";
+      this.lastFallbackBody = "";
     }
     this.parseMarkdown!.msgReceiveDone = streamFinished;
     if (body.length > 0) {

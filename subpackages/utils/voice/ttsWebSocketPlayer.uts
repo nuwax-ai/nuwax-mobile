@@ -1,16 +1,22 @@
 /**
  * App TTS WebSocket 播放器。
  * 服务端下发 PCM16 LE mono；客户端收齐后封装为 WAV，再交给 InnerAudioContext 播放。
+ *
+ * H5 注意：浏览器要求 play() 落在用户手势链路内。TTS 合成是异步的，
+ * 因此在 play() 同步阶段先用同一 InnerAudioContext 播一段静音解锁，
+ * 合成完成后再切到真实 WAV，避免“动画在播、实际无声”。
  */
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { API_BASE_URL } from "@/constants/config";
 import { audioPlayerManager } from "./audioPlayerManager";
+import { loadVoiceSettings } from "./voiceTypes";
 
 export type TtsPlaybackState =
   | "idle"
   | "connecting"
   | "synthesizing"
   | "playing"
+  | "paused"
   | "error";
 
 export type TtsPlaybackListener = (
@@ -28,6 +34,10 @@ class TtsListenerEntry {
   }
 }
 
+/** 极短静音 WAV，仅用于 H5 在用户点击时解锁音频通道 */
+const SILENT_WAV_DATA_URI =
+  "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+
 function createTtsWebSocketUrl(token: string): string {
   let baseUrl = API_BASE_URL;
   if (baseUrl.startsWith("https://")) {
@@ -35,7 +45,7 @@ function createTtsWebSocketUrl(token: string): string {
   } else if (baseUrl.startsWith("http://")) {
     baseUrl = "ws://" + baseUrl.substring(7);
   }
-  let url = baseUrl + "/api/app/tts/ws";
+  let url = baseUrl + "/api/speech/tts/ws";
   // 浏览器无法可靠传递自定义握手 Header，使用 Query 鉴权；App（含 iOS）走 Header。
   // #ifdef H5 || WEB
   const encodedTokenRaw = encodeURIComponent(token);
@@ -99,7 +109,7 @@ async function saveWavFile(buffer: ArrayBuffer): Promise<string> {
   return URL.createObjectURL(blob);
   // #endif
 
-  // #ifndef H5
+  // #ifndef H5 || WEB
   return await new Promise<string>((resolve, reject) => {
     const filePath =
       uni.env.USER_DATA_PATH + "/tts-" + Date.now().toString() + ".wav";
@@ -113,6 +123,55 @@ async function saveWavFile(buffer: ArrayBuffer): Promise<string> {
   // #endif
 }
 
+/**
+ * 将 WebSocket 二进制帧规范为 ArrayBuffer。
+ * H5 上常见为 Blob，不能直接当 ArrayBuffer 读 byteLength。
+ * 注意：本函数对外不 reject，避免 UTS 对 Promise.catch 回调签名的限制。
+ */
+function toArrayBufferAsync(data: any): Promise<ArrayBuffer | null> {
+  if (data == null) {
+    return Promise.resolve(null);
+  }
+  // #ifdef H5 || WEB
+  // Blob：优先走 arrayBuffer()
+  const blobCandidate = data as Blob;
+  if (
+    blobCandidate != null &&
+    typeof blobCandidate.arrayBuffer == "function" &&
+    typeof blobCandidate.size == "number"
+  ) {
+    return new Promise<ArrayBuffer | null>((resolve) => {
+      blobCandidate
+        .arrayBuffer()
+        .then((buf: ArrayBuffer): void => {
+          resolve(buf);
+        })
+        .catch((): void => {
+          resolve(null);
+        });
+    });
+  }
+  // #endif
+  const asBuffer = data as ArrayBuffer;
+  if (typeof asBuffer.byteLength != "number") {
+    return Promise.resolve(null);
+  }
+  // TypedArray（有 byteOffset + buffer）；ArrayBuffer 没有 byteOffset
+  const maybeView = data as Uint8Array;
+  if (
+    typeof maybeView.byteOffset == "number" &&
+    typeof maybeView.buffer == "object" &&
+    maybeView.buffer != null
+  ) {
+    const out = new Uint8Array(maybeView.byteLength);
+    for (let i = 0; i < maybeView.byteLength; i++) {
+      out[i] = maybeView[i];
+    }
+    return Promise.resolve(out.buffer as ArrayBuffer);
+  }
+  return Promise.resolve(asBuffer);
+}
+
 export class TtsWebSocketPlayer {
   private socketTask: SocketTask | null = null;
   private audioContext: InnerAudioContext | null = null;
@@ -124,6 +183,18 @@ export class TtsWebSocketPlayer {
   private listeners: TtsListenerEntry[] = [];
   private nextListenerId: number = 1;
   private readonly sampleRate: number = 16000;
+  /** 尚未完成 ArrayBuffer 转换的二进制帧数（H5 Blob） */
+  private pendingBinary: number = 0;
+  /** 已收到 tts_end，等待 pendingBinary 清零后再封装播放 */
+  private finishRequested: boolean = false;
+  /** 是否已切入真实 TTS 音频（避免静音解锁片段的 onEnded 误停） */
+  private realPlayback: boolean = false;
+  /** 正在从解锁片段切换到真实音频，期间忽略 abort 类错误 */
+  private switchingToReal: boolean = false;
+  /** 因静音而暂停，取消静音后可 resume */
+  private pausedByMute: boolean = false;
+  /** H5 blob: URL，stop 时 revoke */
+  private blobUrl: string = "";
 
   subscribe(callback: TtsPlaybackListener): number {
     const id = this.nextListenerId++;
@@ -144,6 +215,64 @@ export class TtsWebSocketPlayer {
 
   getMessageId(): string {
     return this.messageId;
+  }
+
+  /**
+   * 全局静音：只调节音量；正在播放时请配合 pause()。
+   */
+  setMuted(muted: boolean): void {
+    const audio = this.audioContext;
+    if (audio != null) {
+      audio!.volume = muted ? 0 : 1;
+    }
+  }
+
+  /**
+   * 暂停当前播报（用于切到静音时）。
+   * - 已在播放：pause 音频，状态改为 paused
+   * - 仍在连接/合成：直接 stop，避免静音后继续合成
+   */
+  pause(): void {
+    if (this.state == "playing" && this.audioContext != null) {
+      try {
+        this.audioContext!.pause();
+      } catch (e: any) {
+        console.warn("[TTS] pause failed", e);
+      }
+      this.pausedByMute = true;
+      this.setState("paused");
+      return;
+    }
+    if (this.state == "connecting" || this.state == "synthesizing") {
+      this.stop();
+    }
+  }
+
+  /**
+   * 恢复因静音暂停的播报。
+   */
+  resume(): void {
+    if (
+      this.pausedByMute != true ||
+      this.state != "paused" ||
+      this.audioContext == null
+    ) {
+      return;
+    }
+    const audio = this.audioContext!;
+    audio.volume = this.getTargetVolume();
+    this.pausedByMute = false;
+    this.setState("playing");
+    try {
+      audio.play();
+    } catch (e: any) {
+      console.warn("[TTS] resume failed", e);
+    }
+  }
+
+  /** 按当前 VoiceSettings.muted 计算目标音量 */
+  private getTargetVolume(): number {
+    return loadVoiceSettings().muted == true ? 0 : 1;
   }
 
   async play(messageId: string, text: string): Promise<void> {
@@ -168,7 +297,15 @@ export class TtsWebSocketPlayer {
     this.messageId = messageId;
     this.text = text;
     this.chunks = [] as Uint8Array[];
+    this.pendingBinary = 0;
+    this.finishRequested = false;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
     this.setState("connecting");
+
+    // 在用户点击的同步阶段创建并解锁音频，避免异步合成后 H5 静音拦截
+    this.prepareAudioContextForGesture();
 
     await new Promise<void>((resolve, reject) => {
       let socketTask: SocketTask;
@@ -223,6 +360,7 @@ export class TtsWebSocketPlayer {
         if (
           expectedGeneration == this.generation &&
           this.state != "playing" &&
+          this.state != "paused" &&
           this.state != "idle"
         ) {
           this.fail("TTS 连接已关闭");
@@ -233,6 +371,11 @@ export class TtsWebSocketPlayer {
 
   stop(): void {
     this.generation += 1;
+    this.finishRequested = false;
+    this.pendingBinary = 0;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
     const socket = this.socketTask;
     this.socketTask = null;
     if (socket != null) {
@@ -252,10 +395,47 @@ export class TtsWebSocketPlayer {
         // ignore
       }
     }
+    this.revokeBlobUrl();
     this.chunks = [] as Uint8Array[];
     this.text = "";
     this.messageId = "";
     this.setState("idle");
+  }
+
+  private revokeBlobUrl(): void {
+    // #ifdef H5 || WEB
+    if (this.blobUrl.length > 0) {
+      try {
+        URL.revokeObjectURL(this.blobUrl);
+      } catch (_eRevoke) {
+        // ignore
+      }
+      this.blobUrl = "";
+    }
+    // #endif
+  }
+
+  /**
+   * 用户手势同步阶段创建 InnerAudioContext，并在 H5 上播静音片段解锁。
+   */
+  private prepareAudioContextForGesture(): void {
+    const audio = uni.createInnerAudioContext();
+    this.audioContext = audio;
+    audio.volume = this.getTargetVolume();
+    // #ifdef APP-IOS
+    audio.obeyMuteSwitch = false;
+    // #endif
+    // #ifdef H5 || WEB
+    try {
+      // 解锁通道时用极低音量，避免静音模式下突然出声
+      audio.volume = this.getTargetVolume() > 0 ? 0.01 : 0;
+      audio.src = SILENT_WAV_DATA_URI;
+      audio.play();
+      console.log("[TTS] h5.audioUnlocked");
+    } catch (e: any) {
+      console.warn("[TTS] h5.audioUnlockFailed", e);
+    }
+    // #endif
   }
 
   private sendJson(data: UTSJSONObject): void {
@@ -268,10 +448,7 @@ export class TtsWebSocketPlayer {
 
   private handleSocketMessage(res: OnSocketMessageCallbackResult): void {
     if (typeof res.data != "string") {
-      const buffer = res.data as ArrayBuffer;
-      if (buffer.byteLength > 0) {
-        this.chunks.push(new Uint8Array(buffer));
-      }
+      this.appendBinaryChunk(res.data);
       return;
     }
 
@@ -297,11 +474,37 @@ export class TtsWebSocketPlayer {
     } else if (type == "tts_begin") {
       this.setState("synthesizing");
     } else if (type == "tts_end") {
-      this.finishSynthesis();
+      this.finishRequested = true;
+      this.tryFinishSynthesis();
     } else if (type == "error") {
       const messageVal = message!["message"];
       this.fail(messageVal != null ? `${messageVal}` : "TTS 合成失败");
     }
+  }
+
+  private appendBinaryChunk(data: any): void {
+    const expectedGeneration = this.generation;
+    this.pendingBinary += 1;
+    toArrayBufferAsync(data).then((buffer: ArrayBuffer | null): void => {
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      this.pendingBinary -= 1;
+      if (buffer != null && buffer!.byteLength > 0) {
+        this.chunks.push(new Uint8Array(buffer!));
+      } else {
+        console.warn("[TTS] skip empty/unrecognized binary frame");
+      }
+      this.tryFinishSynthesis();
+    });
+  }
+
+  private tryFinishSynthesis(): void {
+    if (!this.finishRequested || this.pendingBinary > 0) {
+      return;
+    }
+    this.finishRequested = false;
+    this.finishSynthesis();
   }
 
   private async finishSynthesis(): Promise<void> {
@@ -311,31 +514,101 @@ export class TtsWebSocketPlayer {
       return;
     }
     try {
+      let pcmBytes = 0;
+      for (let i = 0; i < this.chunks.length; i++) {
+        pcmBytes += this.chunks[i].length;
+      }
+      console.log(
+        "[TTS] finishSynthesis chunks=" +
+          this.chunks.length.toString() +
+          " pcmBytes=" +
+          pcmBytes.toString(),
+      );
       const wav = buildPcm16Wav(this.chunks, this.sampleRate);
       const src = await saveWavFile(wav);
       if (expectedGeneration != this.generation) {
         return;
       }
+      // #ifdef H5 || WEB
+      this.revokeBlobUrl();
+      this.blobUrl = src;
+      // #endif
       const socket = this.socketTask;
       if (socket != null) {
         this.sendJson({ type: "close" } as UTSJSONObject);
       }
       this.socketTask = null;
-      const audio = uni.createInnerAudioContext();
-      this.audioContext = audio;
-      audio.onEnded(() => {
-        if (expectedGeneration == this.generation) {
+
+      let audio = this.audioContext;
+      if (audio == null) {
+        audio = uni.createInnerAudioContext();
+        this.audioContext = audio;
+        // #ifdef APP-IOS
+        audio.obeyMuteSwitch = false;
+        // #endif
+      }
+      audio!.volume = this.getTargetVolume();
+      // #ifdef APP-IOS
+      audio!.obeyMuteSwitch = false;
+      // #endif
+
+      const startPlay = (): void => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        // 允许 onCanplay / 主动调用多次 play；以 onPlay 为准进入 playing
+        this.switchingToReal = true;
+        console.log("[TTS] audio.play srcLen=" + src.length.toString());
+        try {
+          audio!.play();
+        } catch (ePlay: any) {
+          console.warn("[TTS] audio.play threw", ePlay);
+        }
+      };
+
+      audio!.onPlay(() => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        // 解锁静音片段的 onPlay 忽略；真实音频才切状态
+        if (this.switchingToReal || this.realPlayback) {
+          this.switchingToReal = false;
+          this.realPlayback = true;
+          console.log("[TTS] audio.onPlay");
+          this.setState("playing");
+        }
+      });
+      audio!.onEnded(() => {
+        // 忽略 H5 解锁静音片段结束；只在真实播报结束后 stop
+        if (
+          expectedGeneration == this.generation &&
+          this.realPlayback
+        ) {
           this.stop();
         }
       });
-      audio.onError((err) => {
-        if (expectedGeneration == this.generation) {
+      audio!.onError((err) => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        // 切换 src 时常见 abort，尚未真正起播则忽略
+        if (this.switchingToReal && this.realPlayback != true) {
+          console.warn(
+            "[TTS] audio transient error while switching",
+            err.errMsg ?? err,
+          );
+          return;
+        }
+        if (this.realPlayback) {
           this.fail(err.errMsg ?? "TTS 音频播放失败");
         }
       });
-      audio.src = src;
-      this.setState("playing");
-      audio.play();
+      audio!.onCanplay(() => {
+        startPlay();
+      });
+      audio!.src = src;
+      // App 端 onCanplay 可能不触发；H5 若过早 play 失败，onCanplay 会再试
+      startPlay();
     } catch (e: any) {
       this.fail(e.message ?? "TTS 音频处理失败");
     }

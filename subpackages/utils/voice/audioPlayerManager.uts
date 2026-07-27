@@ -2,7 +2,7 @@
  * 音频播放队列管理器（模块级单例）
  * 封装 uni.createInnerAudioContext：顺序播放、追加队列、打断、单句失败跳过。
  */
-import { AudioQueueItem, AudioPlayerState, OnPlayerStateChange } from "./voiceTypes";
+import { AudioQueueItem, AudioPlayerState, OnPlayerStateChange, loadVoiceSettings } from "./voiceTypes";
 
 export class AudioPlayerManager {
   private ctx: InnerAudioContext | null = null;
@@ -17,6 +17,9 @@ export class AudioPlayerManager {
    * enqueue 凭序号校验是否同一会话，防止打断后旧异步任务继续入队。
    */
   private sessionId: number = 0;
+
+  /** 因静音暂停：保留队列与当前句，取消静音后可 resume */
+  private pausedByMute: boolean = false;
 
   /** 注册状态回调 */
   setOnStateChange(cb: OnPlayerStateChange | null): void {
@@ -39,6 +42,52 @@ export class AudioPlayerManager {
   }
 
   /**
+   * 全局静音：只调节音量；正在播放时请配合 pause()。
+   */
+  setMuted(muted: boolean): void {
+    const ctx = this.ctx;
+    if (ctx != null) {
+      ctx!.volume = muted ? 0 : 1;
+    }
+  }
+
+  /** 暂停当前播放（保留队列，供取消静音后 resume） */
+  pause(): void {
+    if (this.state != "playing" || this.ctx == null) {
+      return;
+    }
+    try {
+      this.ctx!.pause();
+    } catch (e: any) {
+      console.warn("[AudioPlayer] pause error", e);
+    }
+    this.pausedByMute = true;
+    const msgId = this.getCurrentMessageId();
+    this.setState("idle", msgId);
+  }
+
+  /** 恢复因静音暂停的播放 */
+  resume(): void {
+    if (this.pausedByMute != true || this.ctx == null || this.currentItem == null) {
+      return;
+    }
+    this.pausedByMute = false;
+    this.stopped = false;
+    const msgId = this.getCurrentMessageId();
+    this.ctx!.volume = this.getTargetVolume();
+    this.setState("playing", msgId);
+    try {
+      this.ctx!.play();
+    } catch (e: any) {
+      console.warn("[AudioPlayer] resume error", e);
+    }
+  }
+
+  private getTargetVolume(): number {
+    return loadVoiceSettings().muted == true ? 0 : 1;
+  }
+
+  /**
    * 替换队列并从头播放
    * @returns 本次播放会话序号（用于后续 enqueue 校验）
    */
@@ -58,8 +107,8 @@ export class AudioPlayerManager {
     for (let i = 0; i < items.length; i++) {
       this.queue.push(items[i]);
     }
-    // 队列恰好播完处于空闲时继续播放
-    if (this.state == "idle") {
+    // 静音暂停中只入队，不自动续播
+    if (this.state == "idle" && this.pausedByMute != true) {
       this.playNext();
     }
   }
@@ -72,6 +121,7 @@ export class AudioPlayerManager {
 
   private stopInternal(): void {
     this.stopped = true;
+    this.pausedByMute = false;
     this.sessionId += 1;
     this.queue = [];
     this.currentItem = null;
@@ -82,12 +132,23 @@ export class AudioPlayerManager {
       } catch (e: any) {
         console.warn("[AudioPlayer] stop error", e);
       }
+      // 销毁以释放音频焦点，避免后续 TTS 出现“在播却无声”
+      try {
+        ctx!.destroy();
+      } catch (e2: any) {
+        console.warn("[AudioPlayer] destroy error", e2);
+      }
+      this.ctx = null;
     }
   }
 
   private ensureContext(): InnerAudioContext {
     if (this.ctx == null) {
       const ctx = uni.createInnerAudioContext();
+      ctx.volume = this.getTargetVolume();
+      // #ifdef APP-IOS
+      ctx.obeyMuteSwitch = false;
+      // #endif
       ctx.onEnded(() => {
         this.handleEnded();
       });
@@ -117,11 +178,18 @@ export class AudioPlayerManager {
     }
     this.setState("playing", item.messageId);
     const ctx = this.ensureContext();
+    ctx.volume = this.getTargetVolume();
+    // #ifdef APP-IOS
+    ctx.obeyMuteSwitch = false;
+    // #endif
     ctx.src = item.src;
     ctx.play();
   }
 
   private handleEnded(): void {
+    if (this.pausedByMute) {
+      return;
+    }
     this.playNext();
   }
 

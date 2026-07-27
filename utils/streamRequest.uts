@@ -178,11 +178,19 @@ export class StreamRequest {
   private buffer: string = ""; // 用于缓存不完整的 SSE 消息（以 \n\n 为完整标记）
   private pendingBytes: Uint8Array = new Uint8Array(0); // 用于缓存不完整的 UTF-8 字节序列
 
-  // 微信小程序数据流超时监控
-  private lastChunkReceivedTime: number = 0; // 最后一次接收数据的时间戳
+  // 流式空闲超时监控（无数据到达则断开）
+  private lastChunkReceivedTime: number = 0;
   private timeoutCheckTimer: number | null = null;
-  private readonly TIMEOUT_DURATION: number = 60000; // 超时时长 60 秒
-  private timeoutCallback: (() => void) | null = null; // 超时回调
+  /** H5 / 小程序：事件较密，60s 无数据即可判超时 */
+  private readonly TIMEOUT_DURATION_DEFAULT: number = 60000;
+  /**
+   * APP：onChunkReceived 可能长时间不回调（工具/生图计算、系统缓冲），
+   * 空闲阈值需更宽，避免误杀仍在进行的长连接。
+   */
+  private readonly TIMEOUT_DURATION_APP: number = 180000;
+  private timeoutCallback: (() => void) | null = null;
+  /** 当前请求使用的空闲超时（ms） */
+  private activeTimeoutDuration: number = 60000;
 
   /** App：SSE 消息分帧队列，避免同一事件循环内批量 onChunk 导致 iOS UI 只在结束时刷新 */
   private sseDispatchQueue: string[] = [];
@@ -499,10 +507,23 @@ export class StreamRequest {
     }
   }
 
+  /** 按平台返回空闲超时时长。 */
+  private resolveTimeoutDuration(): number {
+    // #ifdef APP
+    return this.TIMEOUT_DURATION_APP;
+    // #endif
+    // #ifndef APP
+    return this.TIMEOUT_DURATION_DEFAULT;
+    // #endif
+  }
+
   // 启动超时监控
   private startTimeoutMonitor(): void {
+    this.activeTimeoutDuration = this.resolveTimeoutDuration();
     console.log(
-      "[超时监控] 准备启动超时监控，当前 timer ID:",
+      "[超时监控] 启动，空闲阈值:",
+      this.activeTimeoutDuration,
+      "ms，当前 timer ID:",
       this.timeoutCheckTimer,
     );
 
@@ -512,46 +533,40 @@ export class StreamRequest {
     // 先清除可能存在的旧定时器
     const existingTimerId = this.timeoutCheckTimer;
     if (existingTimerId !== null) {
-      console.log(
-        "[超时监控] 发现旧定时器，先清除，ID:",
-        existingTimerId,
-      );
       clearInterval(existingTimerId);
       this.timeoutCheckTimer = null;
     }
 
-    // 每 10 秒检查一次是否超时
+    // 每 15 秒检查一次；接近超时再打详细日志，避免刷屏
     const timerId = setInterval(() => {
       const now = Date.now();
       const timeSinceLastChunk = now - this.lastChunkReceivedTime;
+      const limit = this.activeTimeoutDuration;
 
-      console.log(
-        `[超时监控] 检查中... 距离上次接收数据: ${timeSinceLastChunk}ms，定时器 ID: ${this.timeoutCheckTimer}`,
-      );
-
-      if (timeSinceLastChunk >= this.TIMEOUT_DURATION) {
+      if (timeSinceLastChunk >= limit / 2) {
         console.log(
-          `[超时监控] 数据流超时: ${timeSinceLastChunk}ms 未收到数据`,
+          `[超时监控] 空闲 ${timeSinceLastChunk}ms / 阈值 ${limit}ms`,
+        );
+      }
+
+      if (timeSinceLastChunk >= limit) {
+        console.log(
+          `[超时监控] 数据流超时: ${timeSinceLastChunk}ms 未收到数据（阈值 ${limit}ms）`,
         );
         this.handleTimeout();
       }
-    }, 10000);
+    }, 15000);
 
     this.timeoutCheckTimer = timerId;
-    console.log("[超时监控] 定时器已创建，新 ID:", this.timeoutCheckTimer);
   }
 
   // 清除超时监控
   private clearTimeoutMonitor(): void {
-    console.log("[超时监控] 尝试清除，当前 timer ID:", this.timeoutCheckTimer);
-
     const timerId = this.timeoutCheckTimer;
     if (timerId !== null) {
-      console.log("[超时监控] 清除超时监控，timer ID:", timerId);
+      console.log("[超时监控] 清除，timer ID:", timerId);
       clearInterval(timerId);
       this.timeoutCheckTimer = null;
-    } else {
-      console.log("[超时监控] 定时器 ID 为空，无需清除");
     }
   }
 
@@ -823,11 +838,16 @@ export class StreamRequest {
             "[SSE-APP] success 回调，statusCode:",
             res.statusCode,
           );
+          if (this.isAborted) {
+            return;
+          }
           if (res.statusCode !== 200) {
             failStream(new Error(buildHttpErrorMessage(res.statusCode)));
             return;
           }
 
+          // 连接已建立也算活跃（部分机型首包很晚才到 onChunkReceived）
+          this.updateLastChunkTime();
           config.onOpen?.(res);
 
           // 兜底：未收到 onChunkReceived 时，尝试处理 success 中的完整响应体
@@ -873,7 +893,15 @@ export class StreamRequest {
         if (this.isAborted) {
           return;
         }
+        // 回调一到就刷新空闲计时（即使 buffer 解析失败也不误杀）
+        this.updateLastChunkTime();
         const chunkBuffer = extractChunkArrayBuffer(result);
+        if (chunkBuffer == null) {
+          console.warn(
+            "[SSE-APP] onChunkReceived 无法解析 ArrayBuffer，已刷新空闲计时",
+          );
+          return;
+        }
         handleChunkBuffer(chunkBuffer);
       });
     });

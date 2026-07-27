@@ -1,5 +1,5 @@
 <template>
-  <view class="relative container" :class="{ 'container--home-launcher': isHomeLauncher }">
+  <view class="relative container">
     <!-- 技能选择按钮 -->
     <skill-tags-bar
       v-if="isTaskAgent && enableSkillAt"
@@ -35,6 +35,9 @@
         :agent-id="agentId"
         :agent-type="agentTypeVal"
         :is-temp-chat="isTempChat"
+        :current-agent-mode="agentMode"
+        :allow-choose-mode="allowChooseMode"
+        @onAgentModeChange="handleAgentModeChange"
         @onModelChange="handleModelChange"
       />
     </view>
@@ -332,6 +335,12 @@
   import { ChatSendMessageData } from "@/types/interfaces/chat";
   import { useI18n, toI18nParams, emptyI18nParams } from "@/utils/i18n";
   import {
+    readAgentModeCache,
+    writeAgentModeCache,
+    type AgentMode,
+  } from "@/subpackages/utils/agentModeCache.uts";
+  import { watch } from "vue";
+  import {
     canSendChatMessage,
     computeWechatKeyboardOffset,
     filterSkillsRemainingInText,
@@ -339,7 +348,6 @@
     getStorageTokenString,
     invertBoolean,
     isAtTypedOnInput,
-    isHomeChatRoute,
     isImageChooseCancelled,
     isMessageEmptyForIcons,
     isSkillAlreadySelected,
@@ -418,6 +426,8 @@
   const isCancelled = ref<boolean>(false);
   // 已选组件列表
   const selectedComponents = ref<AgentSelectedComponentInfo[]>([]);
+  // 当前 Agent 执行模式，默认自动
+  const agentMode = ref<AgentMode>("yolo");
   // 录音时长计时器
   let durationTimer: number | null = null;
 
@@ -473,8 +483,8 @@
       agentType?: string;
       isTempChat?: boolean;
       subscriptionRequired?: boolean;
-      /** 首页头部嵌入式样式，避免沿用会话页底部输入区的留白与直角。 */
-      isHomeLauncher?: boolean;
+      // 是否允许用户选择自动/审批模式
+      allowChooseMode?: number;
     }>(),
     {
       manualComponents: () => [],
@@ -497,15 +507,52 @@
       agentType: "ChatBot",
       isTempChat: false,
       subscriptionRequired: false,
-      isHomeLauncher: false,
+      allowChooseMode: 0,
     },
   );
+
+  /**
+   * 供父组件通过 $callMethod 读取附件列表。
+   * Android：Gen* 组件禁止 as UTSJSONObject 取 defineExpose 的 ref。
+   */
+  const getFiles = (): UTSJSONObject[] => {
+    return files.value;
+  };
+
+  /**
+   * 供父组件通过 $callMethod 读取已选组件。
+   */
+  const getSelectedComponents = (): AgentSelectedComponentInfo[] => {
+    return selectedComponents.value;
+  };
 
   // 暴露messageInfo和files
   defineExpose({
     files,
     selectedComponents,
+    getFiles,
+    getSelectedComponents,
   });
+
+  const updateAgentModeByProps = (): void => {
+    if (props.allowChooseMode != 1) {
+      agentMode.value = "yolo";
+      return;
+    }
+    const cachedAgentMode = readAgentModeCache(props.agentId);
+    agentMode.value = cachedAgentMode == "ask" || cachedAgentMode == "yolo"
+      ? cachedAgentMode
+      : "yolo";
+  };
+
+  watch(
+    (): number => props.agentId,
+    (_agentId: number): void => updateAgentModeByProps(),
+  );
+  watch(
+    (): number => props.allowChooseMode,
+    (_allowChooseMode: number): void => updateAgentModeByProps(),
+  );
 
   // 添加文件、图片等
   const handleAddFile = () => {
@@ -555,6 +602,11 @@
     emit("onOpenPagePreview", uri);
   };
 
+  const handleAgentModeChange = (mode: AgentMode): void => {
+    agentMode.value = mode;
+    writeAgentModeCache(mode, props.agentId);
+  };
+
   // 初始化波形动画数据
   const initWaveform = () => {
     // Dynamically generate waveform bars based on 80% of width
@@ -573,6 +625,21 @@
     waveformBars.value = arr;
   };
 
+  const handleNuwaxAgentModeChanged = (payload: any): void => {
+    const data = payload as UTSJSONObject;
+    const agentIdRaw = data["agentId"];
+    const modeRaw = data["mode"];
+    const eventAgentId = agentIdRaw != null ? `${agentIdRaw}` : null;
+    const eventMode = modeRaw != null ? `${modeRaw}` : "";
+    const currentAgentKey = props.agentId > 0 ? `${props.agentId}` : null;
+    if (
+      eventAgentId === currentAgentKey &&
+      (eventMode === "yolo" || eventMode === "ask")
+    ) {
+      agentMode.value = eventMode as AgentMode;
+    }
+  };
+
   // 确保组件挂载后也初始化波形和输入方式
   onMounted(() => {
     // 初始化波形动画数据
@@ -585,6 +652,9 @@
     } else if (chatInputMethod == "input") {
       inputMethod.value = ChatInputMethod.Input;
     }
+
+    updateAgentModeByProps();
+    uni.$on("NuwaxAgentModeChanged", handleNuwaxAgentModeChanged);
 
     // 判断是否是 iOS 微信小程序
     // #ifdef MP-WEIXIN
@@ -638,6 +708,7 @@
   // 组件卸载时清理资源
   onUnmounted(() => {
     stopDurationTimer();
+    uni.$off("NuwaxAgentModeChanged", handleNuwaxAgentModeChanged);
   });
 
   // 选择组件
@@ -1474,20 +1545,14 @@
         skillIds.push(skills[i].targetId);
       }
       payload["skillIds"] = skillIds;
-      const pages = getCurrentPages();
-      const pagesLen = pages.length;
-      if (pagesLen > 0) {
-        const currentPage = pages[pagesLen - 1];
-        const route = currentPage.route;
-        const isHome = isHomeChatRoute(route);
-        if (isHome == true) {
-          uni.$emit("homeVoiceRecorderStart", payload);
-        } else {
-          emit("onSendMessage", payload);
-        }
-      } else {
-        emit("onSendMessage", payload);
+      if (props.isTaskAgent == true) {
+        payload["agentMode"] =
+          props.allowChooseMode == 1
+            ? agentMode.value
+            : "yolo";
       }
+      // 首页和会话页都通过组件事件发送，避免首页语音转写结果落到无人监听的全局事件中。
+      emit("onSendMessage", payload);
       selectedSkills.value = [];
       files.value = [];
       messageInfo.value = "";
@@ -1618,12 +1683,6 @@
     // 确保容器为相对定位，用于容纳绝对定位的蒙层
     position: relative;
     overflow: visible;
-
-    &.container--home-launcher {
-      padding: 16rpx 16rpx 12rpx;
-      border-radius: 24rpx;
-      overflow: hidden;
-    }
 
     .container-block {
       margin-bottom: 20rpx;

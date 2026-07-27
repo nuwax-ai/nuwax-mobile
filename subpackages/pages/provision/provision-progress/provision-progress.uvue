@@ -42,6 +42,8 @@
         </view>
         <text class="result__title">{{ t('Mobile.Provision.Result.successTitle') }}</text>
         <text class="result__desc">{{ successDesc }}</text>
+        <text v-if="deviceOnline" class="result__online result__online--ok">✓ {{ t('Mobile.Provision.Result.deviceOnline') }}</text>
+        <text v-else class="result__online">{{ t('Mobile.Provision.Result.checkingOnline') }} ({{ onlineCountdown }}s)</text>
         <view class="result__btn result__btn--primary" hover-class="result__btn--hover" @tap="onDone">
           <text class="result__btn-text result__btn-text--primary">{{ t('Mobile.Provision.Result.done') }}</text>
         </view>
@@ -72,12 +74,15 @@
 
 <script setup lang="uts">
   import CustomNavBar from "@/components/custom-nav-bar/custom-nav-bar.uvue";
-  import { computed } from "vue";
+  import { computed, watch, onUnmounted } from "vue";
   import { onLoad } from "@dcloudio/uni-app";
   import { useI18n, toI18nParams, emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { useEspProvisioning, releaseEspProvisioning } from "@/hooks/useEspProvisioning";
   import { getProvisionDevice, getProvisionCredentials, clearProvisionSession, getReprovisionTarget, getQrPayload } from "@/utils/provisionSession";
   import { EspProvisioningPhaseEnum } from "@/types/enums/espProvisioning";
+  import { apiVoxDeviceDetail } from "@/servers/vox/voxDevice";
+  import { apiResCode, apiResData } from "@/utils/common";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
 
   // 本地 t 包装（composable 的 t 在模板中解析有坑，与主包页面一致）
   const t = (key: string, params?: Record<string, string | number>): string =>
@@ -198,11 +203,83 @@
     if (ok) await controller.retry();
   };
 
+  // ===== 成功后轮询检测设备上线（最长 30s，到时或检测到上线自动跳回列表）=====
+  const ONLINE_TIMEOUT_SEC = 30;
+  const onlineCountdown = ref<number>(ONLINE_TIMEOUT_SEC);
+  const deviceOnline = ref<boolean>(false);
+  const pollingOnline = ref<boolean>(false);
+  let pollTimerId = 0;
+  let pollTick = 0;
+
+  const stopOnlinePolling = () => {
+    if (pollTimerId != 0) {
+      clearInterval(pollTimerId);
+      pollTimerId = 0;
+    }
+    pollingOnline.value = false;
+  };
+
+  let hasDone = false;
   const onDone = () => {
+    if (hasDone) return;
+    hasDone = true;
+    stopOnlinePolling();
     releaseEspProvisioning();
     clearProvisionSession();
     uni.navigateBack({ delta: 3 });
   };
+
+  const checkDeviceOnline = async () => {
+    const info = controller.deviceInfo.value;
+    if (info == null || info.serialNumber == "") return;
+    try {
+      const res = await apiVoxDeviceDetail(info.serialNumber);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const raw = apiResData<any>(res);
+        const d = raw != null ? (raw as UTSJSONObject) : null;
+        if (d != null) {
+          const onlineVal = d["online"];
+          if (onlineVal != null && (onlineVal as boolean)) {
+            deviceOnline.value = true;
+            stopOnlinePolling();
+            // 检测到上线，稍作停留让用户看到，再自动跳回列表
+            setTimeout(() => { onDone(); }, 1500);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("checkDeviceOnline error", e);
+    }
+  };
+
+  const startOnlinePolling = () => {
+    stopOnlinePolling();
+    onlineCountdown.value = ONLINE_TIMEOUT_SEC;
+    deviceOnline.value = false;
+    pollingOnline.value = true;
+    pollTick = 0;
+    pollTimerId = setInterval(() => {
+      pollTick = pollTick + 1;
+      onlineCountdown.value = onlineCountdown.value - 1;
+      // 每 2 个 tick（约 2s）探测一次
+      if (pollTick % 2 == 0) {
+        checkDeviceOnline();
+      }
+      // 倒计时到 0：自动跳回列表
+      if (onlineCountdown.value <= 0) {
+        stopOnlinePolling();
+        onDone();
+      }
+    }, 1000);
+  };
+
+  watch(isSuccess, (val: boolean) => {
+    if (val) startOnlinePolling();
+  });
+
+  onUnmounted(() => {
+    stopOnlinePolling();
+  });
 
   onLoad((_options: OnLoadOptions) => {
     run();
@@ -412,6 +489,19 @@
       text-align: center;
       margin-bottom: 48rpx;
       line-height: 1.5;
+    }
+
+    &__online {
+      font-size: 26rpx;
+      color: #999999;
+      text-align: center;
+      margin-top: 0;
+      margin-bottom: 40rpx;
+
+      &--ok {
+        color: #07c160;
+        font-weight: 500;
+      }
     }
 
     &__btn-group {

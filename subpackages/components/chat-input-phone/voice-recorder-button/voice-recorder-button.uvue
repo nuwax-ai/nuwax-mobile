@@ -41,6 +41,13 @@
   } from '@/servers/audioUploader'
   import { MicrophonePermissionHelper, type PermissionState } from '@/utils/permissionHelper'
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
+  // #ifdef APP
+  import {
+    asrWebSocketClient,
+    ASR_SAMPLE_RATE,
+  } from "@/subpackages/utils/voice/asrWebSocketClient";
+  import { streamLocalAudioFileToAsr } from "@/subpackages/utils/voice/pcmStreamRecorder";
+  // #endif
 
   const { t: tFn } = useI18n();
   function t(key: string): string {
@@ -72,40 +79,15 @@
    */
   function buildNativeRecorderStartOptions(): RecorderManagerStartOptions {
     const duration = Math.min(getDuration(), 600000);
-    // #ifdef APP-IOS
-    // 使用平台默认采样率，并选择官方表中匹配的编码码率。
-    const iosOptions = {
-      duration: duration,
-      sampleRate: 44100,
-      numberOfChannels: 2,
-      encodeBitRate: 64000,
-      format: "aac",
-    } as RecorderManagerStartOptions;
-    return iosOptions;
-    // #endif
-    // #ifdef APP-ANDROID
-    const androidOptions = {
-      duration: duration,
-      sampleRate: 16000,
-      numberOfChannels: 1,
-      encodeBitRate: 96000,
-      format: "mp3",
-    } as RecorderManagerStartOptions;
-    return androidOptions;
-    // #endif
     // #ifdef APP
-    // #ifndef APP-ANDROID
-    // #ifndef APP-IOS
-    const appFallbackOptions = {
+    // App：16kHz mono PCM，走 WebSocket ASR（非 HTTP 上传）
+    const appAsrOptions = {
       duration: duration,
-      sampleRate: 16000,
-      numberOfChannels: 2,
-      encodeBitRate: 48000,
-      format: "aac",
+      sampleRate: ASR_SAMPLE_RATE,
+      numberOfChannels: 1,
+      format: "pcm",
     } as RecorderManagerStartOptions;
-    return appFallbackOptions;
-    // #endif
-    // #endif
+    return appAsrOptions;
     // #endif
     // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
     const mpOptions = {
@@ -173,6 +155,12 @@
   let ignoreNextStopResult: boolean = false
   // iOS 原生 button 在状态切换后可能补发一组紧邻的触摸事件。
   let lastTouchEndAt: number = 0
+  // #ifdef APP
+  /** App：ASR 会话已 begin，等待 asr_ready / 结果 */
+  let asrSessionActive: boolean = false
+  /** App：已发 stop，等待 asr_result */
+  let asrWaitingResult: boolean = false
+  // #endif
   // 音频上传服务
   let audioUploadService: AudioUploader | null = null
   let recorderInitialized: boolean = false
@@ -236,6 +224,9 @@
     currentState.value = 'default'
     isCancelled.value = false
     isTapped.value = false
+    // #ifdef APP
+    asrWaitingResult = false
+    // #endif
   }
 
   /** RecorderManager.onError 回调结构（禁止 as UTSJSONObject） */
@@ -307,12 +298,103 @@
       rawError = `${err}`;
     }
     console.error("[VoiceRecord] recorder error message=" + readErrorMessage(err, "") + " raw=" + rawError);
+    // #ifdef APP
+    asrWebSocketClient.abort()
+    asrSessionActive = false
+    asrWaitingResult = false
+    // #endif
     resetState()
     // #ifdef H5 || WEB
     setH5TouchEndCancelFlag(false)
     // #endif
     emit('onError', normalizeRecorderFail(err))
   }
+
+  // #ifdef APP
+  function handleAsrResult(text: string, ok: boolean, errorMessage: string): void {
+    asrSessionActive = false
+    asrWaitingResult = false
+    if (ok == true && text.length > 0) {
+      currentState.value = "success"
+      emit("onRecordStop", text)
+      resetState()
+    } else {
+      const errMsg =
+        errorMessage.length > 0
+          ? errorMessage
+          : t("Mobile.Voice.noSpeechDetected")
+      handleRecordError(new Error(errMsg))
+    }
+  }
+
+  function handleAsrError(message: string): void {
+    asrSessionActive = false
+    asrWaitingResult = false
+    try {
+      callRecorderStop()
+    } catch (_eStop) {
+      // ignore
+    }
+    handleRecordError(new Error(message.length > 0 ? message : t("Mobile.Voice.recordFailed")))
+  }
+
+  /** App：ASR ready 后开始本地 PCM 录音 */
+  function startAppRecorderAfterAsrReady(): void {
+    if (ignoreNextStopResult) {
+      console.log("[VoiceRecord] asr_ready after release, abort")
+      asrWebSocketClient.abort()
+      asrSessionActive = false
+      resetState()
+      emit("onRecordCancel")
+      return
+    }
+    try {
+      callRecorderStart()
+    } catch (error: any) {
+      asrWebSocketClient.abort()
+      asrSessionActive = false
+      handleRecordError(error)
+    }
+  }
+
+  /** App：按下后先连 ASR，再录音 */
+  function beginAppAsrSession(): void {
+    asrSessionActive = true
+    asrWaitingResult = false
+    asrWebSocketClient.begin(
+      () => {
+        startAppRecorderAfterAsrReady()
+      },
+      (text: string, ok: boolean, errorMessage: string) => {
+        handleAsrResult(text, ok, errorMessage)
+      },
+      (message: string) => {
+        handleAsrError(message)
+      },
+    )
+  }
+
+  /** App：录音文件就绪后切帧推送并 finish */
+  function pushRecordedFileThenFinish(tempFilePath: string): void {
+    currentState.value = "uploading"
+    streamLocalAudioFileToAsr(
+      tempFilePath,
+      (frame: ArrayBuffer) => {
+        asrWebSocketClient.sendPcm(frame)
+      },
+      (ok: boolean) => {
+        if (ok == true) {
+          asrWaitingResult = true
+          asrWebSocketClient.finish()
+        } else {
+          asrWebSocketClient.abort()
+          asrSessionActive = false
+          handleRecordError(new Error(t("Mobile.AudioUploader.fileEmpty")))
+        }
+      },
+    )
+  }
+  // #endif
 
   // 使用audioUploader转换音频
   async function uploadAndConvertWithService(
@@ -333,6 +415,11 @@
   // 取消录音
   function cancelRecording() {
     ignoreNextStopResult = true
+    // #ifdef APP
+    asrSessionActive = false
+    asrWaitingResult = false
+    asrWebSocketClient.abort()
+    // #endif
     if (currentState.value != 'default') {
       callRecorderStop()
     }
@@ -349,21 +436,39 @@
     if (neverStarted) {
       ignoreNextStopResult = true
       console.log("[VoiceRecord] released before onStart, wait for onStart then stop")
+      // #ifdef APP
+      asrWebSocketClient.abort()
+      asrSessionActive = false
+      // #endif
       resetState()
       emit('onRecordCancel')
       return
     }
     try {
+      // #ifdef APP
+      // 先进入识别中，等 onStop 推流 + asr_result；勿立刻 reset
+      currentState.value = "uploading"
+      isTapped.value = false
+      callRecorderStop()
+      emit("onRecordEnd")
+      // #endif
+      // #ifndef APP
       callRecorderStop()
       emit('onRecordEnd')
+      resetState()
+      // #endif
     } catch (error: any) {
       // #ifdef H5 || WEB
       setH5TouchEndCancelFlag(false)
       // #endif
+      // #ifdef APP
+      asrWebSocketClient.abort()
+      asrSessionActive = false
+      // #endif
       currentState.value = 'error'
       emit('onError', normalizeRecorderFail(error))
+      resetState()
     }
-    resetState()
   }
 
   // 录音中结束
@@ -380,10 +485,15 @@
     setH5TouchEndCancelFlag(true)
     // #endif
     isTapped.value = false;
-    // 如果正在上传，则不停止录音
+    // 如果正在上传/识别，则不停止录音
     if (currentState.value == 'uploading') {
       return
     }
+    // #ifdef APP
+    if (asrWaitingResult == true) {
+      return
+    }
+    // #endif
     if (isCancelled.value) {
       cancelRecording()
     } else {
@@ -548,7 +658,12 @@
     }
 
     try {
+      // #ifdef APP
+      beginAppAsrSession()
+      // #endif
+      // #ifndef APP
       callRecorderStart()
+      // #endif
     } catch (error: any) {
       console.error("[VoiceRecord] RecorderManager.start threw message=" + readErrorMessage(error, ""));
       handleRecordError(error)
@@ -561,6 +676,10 @@
     if (ignoreNextStopResult) {
       console.log("[VoiceRecord] onStart arrived after release, stopping without upload")
       callRecorderStop()
+      // #ifdef APP
+      asrWebSocketClient.abort()
+      asrSessionActive = false
+      // #endif
       resetState()
       return
     }
@@ -668,6 +787,10 @@
     if (ignoreNextStopResult) {
       ignoreNextStopResult = false
       console.log("[VoiceRecord] ignored empty/cancelled stop result")
+      // #ifdef APP
+      asrWebSocketClient.abort()
+      asrSessionActive = false
+      // #endif
       resetState()
       return
     }
@@ -680,41 +803,45 @@
     }
     console.log("[VoiceRecord] onStop result=" + rawStopResult)
 
-    // 录音总时长：H5 为秒；小程序/APP 原生为毫秒
-    let duration = readRecorderStopNumber(res, "duration", 0);
-
-    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ || APP
-    duration = duration / 1000;
-    // #endif
-
-    const fileSize = readRecorderStopNumber(res, "fileSize", 0);
     const tempFilePath = readRecorderStopString(res, "tempFilePath");
-    let formatStr = readRecorderStopString(res, "format");
-    if (formatStr.length == 0) {
-      const dotIndex = tempFilePath.lastIndexOf(".");
-      formatStr = dotIndex >= 0 ? tempFilePath.slice(dotIndex + 1).toLowerCase() : "mp3";
-    }
     if (tempFilePath.length == 0) {
       handleRecordError(new Error(t("Mobile.Voice.recordFailed")));
       return;
     }
 
+    // #ifdef APP
+    // App：PCM 文件切帧经 WebSocket 推给 ASR，识别完成后走与 H5 相同的 onRecordStop
+    if (asrSessionActive != true || asrWebSocketClient.isReady() != true) {
+      handleRecordError(new Error(t("Mobile.Voice.recordFailed")));
+      return;
+    }
+    pushRecordedFileThenFinish(tempFilePath)
+    // #endif
+
+    // #ifndef APP
+    // H5 / 小程序：上传文件转写
+    let duration = readRecorderStopNumber(res, "duration", 0);
+    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    duration = duration / 1000;
+    // #endif
+    const fileSize = readRecorderStopNumber(res, "fileSize", 0);
+    let formatStr = readRecorderStopString(res, "format");
+    if (formatStr.length == 0) {
+      const dotIndex = tempFilePath.lastIndexOf(".");
+      formatStr = dotIndex >= 0 ? tempFilePath.slice(dotIndex + 1).toLowerCase() : "mp3";
+    }
     const audioFile = new UploaderAudioFile(
       tempFilePath,
       duration,
       fileSize,
       formatStr,
     );
-
-    // 重置触摸结束取消录音标志
     // #ifdef H5 || WEB
     setH5TouchEndCancelFlag(false)
     // #endif
-
-    // 立即显示上传中状态，给用户明确反馈
     currentState.value = 'uploading'
-
     runUploadAfterStop(audioFile)
+    // #endif
   }
 
   function bindRecorderEvents() {
@@ -782,6 +909,11 @@
       return
     }
     recorderInitialized = false
+    // #ifdef APP
+    asrWebSocketClient.abort()
+    asrSessionActive = false
+    asrWaitingResult = false
+    // #endif
     resetState()
     unbindRecorderEvents()
     // #ifdef H5 || WEB

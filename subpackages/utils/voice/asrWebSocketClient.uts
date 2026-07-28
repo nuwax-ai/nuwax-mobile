@@ -1,0 +1,287 @@
+/**
+ * App ASR WebSocket 客户端。
+ * 协议：start → asr_ready → Binary PCM16 → stop → asr_result
+ * @see docs / agent-platform App ASR 对接说明
+ */
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { API_BASE_URL } from "@/constants/config";
+
+export const ASR_SAMPLE_RATE = 16000;
+export const ASR_FRAME_DURATION_MS = 20;
+/** 16kHz * 20ms * 2 bytes = 640 */
+export const ASR_FRAME_BYTES = 640;
+
+export type AsrReadyCallback = () => void;
+export type AsrResultCallback = (
+  text: string,
+  ok: boolean,
+  errorMessage: string,
+) => void;
+export type AsrErrorCallback = (message: string) => void;
+
+function createAsrWebSocketUrl(token: string): string {
+  let baseUrl = API_BASE_URL;
+  if (baseUrl.startsWith("https://")) {
+    baseUrl = "wss://" + baseUrl.substring(8);
+  } else if (baseUrl.startsWith("http://")) {
+    baseUrl = "ws://" + baseUrl.substring(7);
+  }
+  // 与服务端 speech.app.asr-websocket-path 默认一致
+  let url = baseUrl + "/api/app/asr/ws";
+  // #ifdef H5 || WEB
+  const encodedTokenRaw = encodeURIComponent(token);
+  const encodedToken = encodedTokenRaw != null ? encodedTokenRaw : token;
+  url += "?access_token=" + encodedToken;
+  // #endif
+  return url;
+}
+
+function createAsrWebSocketHeaders(token: string): UTSJSONObject {
+  const header = new UTSJSONObject();
+  header["Authorization"] = "Bearer " + token;
+  return header;
+}
+
+function readAccessToken(): string {
+  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+  if (tokenRaw == null) {
+    return "";
+  }
+  let accessToken = `${tokenRaw}`;
+  if (accessToken.startsWith("Bearer ")) {
+    accessToken = accessToken.substring(7);
+  }
+  return accessToken;
+}
+
+export class AsrWebSocketClient {
+  private socketTask: SocketTask | null = null;
+  private generation: number = 0;
+  private ready: boolean = false;
+  private onReadyCb: AsrReadyCallback | null = null;
+  private onResultCb: AsrResultCallback | null = null;
+  private onErrorCb: AsrErrorCallback | null = null;
+
+  /** 当前会话是否已收到 asr_ready，可发音频 */
+  isReady(): boolean {
+    return this.ready && this.socketTask != null;
+  }
+
+  /**
+   * 建立连接并发送 start；收到 asr_ready 后回调 onReady。
+   */
+  begin(
+    onReady: AsrReadyCallback,
+    onResult: AsrResultCallback,
+    onError: AsrErrorCallback,
+  ): void {
+    this.abortInternal(false);
+    this.generation += 1;
+    const expectedGeneration = this.generation;
+    this.onReadyCb = onReady;
+    this.onResultCb = onResult;
+    this.onErrorCb = onError;
+    this.ready = false;
+
+    const accessToken = readAccessToken();
+    if (accessToken.length == 0) {
+      this.fail("登录状态已失效");
+      return;
+    }
+
+    let socketTask: SocketTask;
+    // #ifdef H5 || WEB
+    socketTask = uni.connectSocket({
+      url: createAsrWebSocketUrl(accessToken),
+      fail: (err) => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        this.fail(err.errMsg != null ? `${err.errMsg}` : "ASR 连接失败");
+      },
+    });
+    // #endif
+    // #ifndef H5 || WEB
+    socketTask = uni.connectSocket({
+      url: createAsrWebSocketUrl(accessToken),
+      header: createAsrWebSocketHeaders(accessToken),
+      fail: (err) => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        this.fail(err.errMsg != null ? `${err.errMsg}` : "ASR 连接失败");
+      },
+    });
+    // #endif
+    this.socketTask = socketTask;
+
+    socketTask.onOpen((_res) => {
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      console.log("[ASR] socket open, send start");
+      this.sendJsonStart();
+    });
+    socketTask.onMessage((res: OnSocketMessageCallbackResult) => {
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      this.handleMessage(res);
+    });
+    socketTask.onError((err) => {
+      if (expectedGeneration != this.generation || this.socketTask == null) {
+        return;
+      }
+      this.fail(err.errMsg != null ? `${err.errMsg}` : "ASR WebSocket 错误");
+    });
+    socketTask.onClose((_res) => {
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      // finish 后服务端可能关连接；若尚未拿到结果则报错
+      if (this.ready == true && this.onResultCb != null) {
+        // 等待结果过程中被关：交给超时/错误路径，这里不强制
+      }
+    });
+  }
+
+  /** 发送一帧裸 PCM16（须在 asr_ready 之后） */
+  sendPcm(frame: ArrayBuffer): void {
+    if (this.ready != true || this.socketTask == null) {
+      return;
+    }
+    if (frame.byteLength == 0) {
+      return;
+    }
+    try {
+      this.socketTask!.send({ data: frame });
+    } catch (e) {
+      console.warn("[ASR] sendPcm failed");
+    }
+  }
+
+  /** 结束本轮识别，等待 asr_result */
+  finish(): void {
+    if (this.socketTask == null) {
+      this.fail("ASR 连接不存在");
+      return;
+    }
+    console.log("[ASR] send stop");
+    const payload = new UTSJSONObject();
+    payload["type"] = "stop";
+    try {
+      this.socketTask!.send({ data: JSON.stringify(payload) });
+    } catch (e) {
+      this.fail("ASR stop 发送失败");
+    }
+  }
+
+  /** 取消会话并关闭连接 */
+  abort(): void {
+    this.abortInternal(true);
+  }
+
+  private abortInternal(bumpGeneration: boolean): void {
+    if (bumpGeneration) {
+      this.generation += 1;
+    }
+    this.ready = false;
+    this.onReadyCb = null;
+    this.onResultCb = null;
+    this.onErrorCb = null;
+    const socket = this.socketTask;
+    this.socketTask = null;
+    if (socket != null) {
+      try {
+        socket!.close({});
+      } catch (_eClose) {
+        // ignore
+      }
+    }
+  }
+
+  private sendJsonStart(): void {
+    const payload = new UTSJSONObject();
+    payload["type"] = "start";
+    payload["sample_rate"] = ASR_SAMPLE_RATE;
+    payload["frame_duration_ms"] = ASR_FRAME_DURATION_MS;
+    if (this.socketTask == null) {
+      return;
+    }
+    this.socketTask!.send({ data: JSON.stringify(payload) });
+  }
+
+  private handleMessage(res: OnSocketMessageCallbackResult): void {
+    if (typeof res.data != "string") {
+      // ASR 下行不应有 binary
+      return;
+    }
+    let message: UTSJSONObject | null = null;
+    try {
+      message = JSON.parse(`${res.data}`) as UTSJSONObject;
+    } catch (_eJson) {
+      this.fail("ASR 返回了无效消息");
+      return;
+    }
+    if (message == null) {
+      return;
+    }
+    const typeVal = message["type"];
+    const type = typeVal != null ? `${typeVal}` : "";
+    if (type == "asr_ready") {
+      this.ready = true;
+      console.log("[ASR] asr_ready");
+      const cb = this.onReadyCb;
+      if (cb != null) {
+        cb();
+      }
+    } else if (type == "asr_result") {
+      const textVal = message["text"];
+      const text = textVal != null ? `${textVal}` : "";
+      const okVal = message["ok"];
+      let ok = true;
+      if (okVal != null) {
+        ok = `${okVal}` == "true" || okVal == true;
+      }
+      const errVal = message["error"];
+      const errorMessage = errVal != null ? `${errVal}` : "";
+      console.log("[ASR] asr_result ok=" + (ok ? "1" : "0") + " textLen=" + text.length.toString());
+      const cb = this.onResultCb;
+      // 先清回调再关连接，避免重入
+      this.onReadyCb = null;
+      this.onResultCb = null;
+      this.onErrorCb = null;
+      this.ready = false;
+      const socket = this.socketTask;
+      this.socketTask = null;
+      if (socket != null) {
+        try {
+          socket!.close({});
+        } catch (_eClose) {
+          // ignore
+        }
+      }
+      if (cb != null) {
+        cb(text, ok, errorMessage);
+      }
+    } else if (type == "error") {
+      const codeVal = message["code"];
+      const msgVal = message["message"];
+      const code = codeVal != null ? `${codeVal}` : "";
+      const msg = msgVal != null ? `${msgVal}` : "ASR 错误";
+      this.fail(code.length > 0 ? code + ": " + msg : msg);
+    }
+  }
+
+  private fail(message: string): void {
+    console.error("[ASR] fail " + message);
+    const cb = this.onErrorCb;
+    this.abortInternal(true);
+    if (cb != null) {
+      cb(message);
+    }
+  }
+}
+
+/** 单例：按住说话期间复用同一客户端实例 */
+export const asrWebSocketClient = new AsrWebSocketClient();

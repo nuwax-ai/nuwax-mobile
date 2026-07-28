@@ -91,7 +91,7 @@ make base-all              # 三份一起打（不装设备、不上 S3）
 
 一键出包（不含资源/S3）：`./scripts/package-custom-bases.sh`（`TARGETS=android,ios-device,ios-simulator`）。
 
-Android 调试基座：`configure_app.py` 默认 `ENABLE_HX_DEBUG=1`（`app/libs/debug-server` + `DCLOUD_DEBUG`），否则 HX 控制台无 `console.log`。正式向 / 发测试包用 `ENABLE_HX_DEBUG=0`，并建议 `ANDROID_BUILD_TYPE=release`（`assembleRelease`，debuggable=false）。
+Android 调试基座：`configure_app.py` 默认 `ENABLE_HX_DEBUG=1`（`app/libs/debug-server` + `DCLOUD_DEBUG`），否则 HX 控制台无 `console.log`。正式向 / 发测试包用 `ENABLE_HX_DEBUG=0`，并建议 `ANDROID_BUILD_TYPE=release`（`assembleRelease`，debuggable=false）。`configure_app.py` 会把官方示例的 LeakCanary 改为 `debugImplementation`，避免 Release 启动闪退。
 
 iOS 模拟器注意：官方 5.15 `DCloudUTSExtAPI` 无 arm64-simulator slice。Apple Silicon 上若出现「UTS-Storage / uni-getSystemInfo 模块不存在」，请用脚本默认的 `SIM_FORCE_X86_64=1` 重打，并安装/选用 **支持 Rosetta** 的 iOS Simulator runtime（见 DCloud 模拟器文档）。
 

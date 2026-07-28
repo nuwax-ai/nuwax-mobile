@@ -81,7 +81,7 @@ python3 scripts/android-esp/configure_app.py
 | **方案1** | `unpackage/debug/android_debug.apk` →「使用自定义基座运行」 |
 | **方案2** | AS 打开 `$ANDROID_ESP_WORK/project`；HX 关联该原生工程根目录 |
 
-**HX 控制台日志**：`configure_app.py` 默认把 `debug-server-release.aar` 拷入 `app/libs` 并写入 `DCLOUD_DEBUG=true`（官方原生联调要求）。正式发行向本地包请设 `ENABLE_HX_DEBUG=0`。临时看日志也可用 `pnpm hx:android:log` / `adb logcat`。
+**HX 控制台日志**：`configure_app.py` 默认把 `debug-server-release.aar` 拷入 `app/libs` 并写入 `DCLOUD_DEBUG=true`（官方原生联调要求）。正式发行向 / 发测试包请设 `ENABLE_HX_DEBUG=0`；需要接近发行性能时再加 `ANDROID_BUILD_TYPE=release`（产物 `android_release.apk`）。临时看日志也可用 `pnpm hx:android:log` / `adb logcat`。
 
 ### 已验证
 

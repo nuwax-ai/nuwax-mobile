@@ -35,7 +35,7 @@ make android-tester
 ```
 
 流水线脚本：[`build_tester_release_apk.sh`](./build_tester_release_apk.sh)  
-步骤：环境预检 → appResource → Release 出包（`ENABLE_HX_DEBUG=0`）→ 复制 `nuwa-zhuoda-release-YYYYMMDD.apk` → 验收摘要。
+步骤：环境预检 → appResource → Release 出包（`ENABLE_HX_DEBUG=0`）→ 复制 `nuwa-zhuoda-release-YYYYMMDD-HHMM.apk` → 验收摘要。
 
 ## 环境变量
 

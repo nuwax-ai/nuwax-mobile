@@ -134,6 +134,7 @@
                     :message-time="item.time"
                     :is-last-msg="isLastMessage(listIndex)"
                     :is-conversation-active="isConversationActive"
+                    :show-tool-bar="!(isConversationActive && isLastMessage(listIndex))"
                     :task-status="conversationTaskStatus"
                     @longpress="onlongTapMsg(item)"
                     @changeThinkContent="changeThinkContent"
@@ -198,8 +199,12 @@
                   </template>
                 </view>
               </template>
-              <view class="content" v-if="chatSuggestList?.length">
+              <view
+                class="content"
+                v-if="!isConversationActive && chatSuggestList.length > 0"
+              >
                 <button-wrapper
+                  button-align="flex-start"
                   :chat-suggest-list="chatSuggestList"
                   @button-click="handleButtonClick"
                 />
@@ -233,7 +238,7 @@
                 />
               </view>
               <button-wrapper
-                v-if="chatSuggestList?.length"
+                v-if="!isConversationActive && chatSuggestList.length > 0"
                 :chat-suggest-list="chatSuggestList"
                 @button-click="handleButtonClick"
               />
@@ -393,9 +398,11 @@
   import AgentDetailUtils from "./layers/AgentDetailUtils.uts";
   import { ttsWebSocketPlayer } from "@/subpackages/utils/voice/ttsWebSocketPlayer";
   import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
+  import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
   import {
     loadVoiceSettings,
     saveVoiceSettings,
+    cloneVoiceSettings,
   } from "@/subpackages/utils/voice/voiceTypes";
 
   // 类型定义
@@ -911,7 +918,7 @@
   /**
    * 流式会话中最后一条助手消息优先走 streamingAssistantText，
    * 避免 iOS 上 MessageInfo 批量更新导致打字机不刷新。
-   * 必须校验 messageId，防止上一轮正文串到新开的空助手气泡。
+   * 服务端可能改写助手 id，故不能仅做严格 id 相等；新一轮发送前会 clear 通道防串文。
    */
   function resolveAssistantBodyText(item: any | null, listIndex: number): string {
     // #ifdef APP
@@ -919,15 +926,22 @@
       const list = messageList.value;
       if (list.length - 1 == listIndex) {
         const streamText = streamingAssistantText.value;
-        const streamMsgId = streamingAssistantMessageId.value;
-        const itemIdRaw = readRawField(item, "id");
-        const itemId = itemIdRaw != null ? `${itemIdRaw}` : "";
-        if (
-          streamText.length > 0 &&
-          streamMsgId.length > 0 &&
-          itemId == streamMsgId
-        ) {
-          return streamText;
+        if (streamText.length > 0) {
+          const streamMsgId = streamingAssistantMessageId.value;
+          const itemIdRaw = readRawField(item, "id");
+          const itemId = itemIdRaw != null ? `${itemIdRaw}` : "";
+          if (
+            streamMsgId.length == 0 ||
+            itemId.length == 0 ||
+            itemId == streamMsgId
+          ) {
+            return streamText;
+          }
+          // id 已被服务端改写，但流式正文不短于列表项：仍走打字机通道
+          const itemText = getAssistantBodyText(item);
+          if (streamText.length >= itemText.length) {
+            return streamText;
+          }
         }
       }
     }
@@ -990,7 +1004,16 @@
     const index = msg.index != null ? `${msg.index}` : "0";
     return `${msg.id}_${index}`;
   });
-  const assistantStreamText = computed((): string => getAssistantBodyText(lastAssistantMessage.value));
+  /** 边生成边播报 / 语音面板：会话进行中优先用 streamingAssistantText */
+  const assistantStreamText = computed((): string => {
+    if (isConversationActive.value == true) {
+      const streamText = streamingAssistantText.value;
+      if (streamText.length > 0) {
+        return streamText;
+      }
+    }
+    return getAssistantBodyText(lastAssistantMessage.value);
+  });
   const assistantThinkText = computed((): string => getAssistantThinkText(lastAssistantMessage.value));
   const assistantStreamStatus = computed((): string => {
     const msg = lastAssistantMessage.value;
@@ -1004,6 +1027,126 @@
   const voiceConversationKey = computed((): string => `${conversationId.value}`);
   // 语音会话功能总开关（见 voiceConfig.enableVoiceConversation，便于调试原会话页时关闭）
   const voiceConversationEnabled = computed((): boolean => voiceConfig.enableVoiceConversation);
+
+  /** 当前无面板时的无头边生成边播报会话 id（避免与面板重复 begin） */
+  let headlessStreamSpeakId: string = "";
+  /** 合并高频 SSE 喂播报，避免与渲染抢主线程 */
+  let feedSpeakTimer: number = 0;
+  let feedSpeakPending: boolean = false;
+
+  function stopAllStreamSpeech(hardStop: boolean): void {
+    headlessStreamSpeakId = "";
+    feedSpeakPending = false;
+    if (feedSpeakTimer != 0) {
+      clearTimeout(feedSpeakTimer);
+      feedSpeakTimer = 0;
+    }
+    if (hardStop == true) {
+      voiceStreamSpeaker.stop();
+      ttsWebSocketPlayer.stop();
+      audioPlayerManager.stop();
+    } else {
+      // 正常结束：冲刷尾句，已入队音频继续播完
+      voiceStreamSpeaker.onStreamChunk(
+        assistantStreamText.value,
+        assistantThinkText.value,
+        true,
+      );
+    }
+  }
+
+  /**
+   * SSE 会话进行中开启无头实时播报（App / H5 / 小程序统一）。
+   * 不依赖 VoiceSettings.autoPlay（历史 storage 常为 false）；仅尊重 muted。
+   * 若工具栏/上一轮仍在播，先全部停掉再 begin。
+   */
+  function ensureHeadlessStreamSpeak(): void {
+    if (voiceConversationEnabled.value == true) {
+      // 面板已接管，避免双重 begin
+      return;
+    }
+    if (isConversationActive.value != true) {
+      return;
+    }
+    let msgId = streamingAssistantMessageId.value;
+    if (msgId.length == 0) {
+      const last = lastAssistantMessage.value;
+      if (last != null && last.id != null) {
+        msgId = `${last.id}`;
+      }
+    }
+    if (msgId.length == 0) {
+      return;
+    }
+    if (headlessStreamSpeakId == msgId && voiceStreamSpeaker.isActive()) {
+      return;
+    }
+    const settings = loadVoiceSettings();
+    // 打断其他消息的工具栏播报 / 上一轮流式播报
+    ttsWebSocketPlayer.stop();
+    audioPlayerManager.stop();
+    headlessStreamSpeakId = msgId;
+    audioPlayerManager.setMuted(settings.muted == true);
+    // 流式播报强制开启自动朗读语义（不受 storage 里旧 autoPlay=false 影响）
+    const speakSettings = cloneVoiceSettings(settings);
+    speakSettings.autoPlay = true;
+    voiceStreamSpeaker.begin(msgId, speakSettings);
+    // 勿在 console.log 末参后加尾逗号：uni 注入源码位置时会拆坏括号并提前闭合 setup
+    console.log(
+      "[StreamSpeak] begin msgId=",
+      msgId,
+      "textLen=",
+      assistantStreamText.value.length
+    );
+    voiceStreamSpeaker.onStreamChunk(
+      assistantStreamText.value,
+      assistantThinkText.value,
+      false,
+    );
+  }
+
+  function feedHeadlessStreamSpeak(finished: boolean): void {
+    if (voiceConversationEnabled.value == true) {
+      return;
+    }
+    if (headlessStreamSpeakId.length == 0) {
+      // 迟到的正文：补一次 begin
+      ensureHeadlessStreamSpeak();
+      if (headlessStreamSpeakId.length == 0) {
+        return;
+      }
+    }
+    voiceStreamSpeaker.onStreamChunk(
+      assistantStreamText.value,
+      assistantThinkText.value,
+      finished,
+    );
+  }
+
+  /** 防抖喂播报：合并字符级 SSE，定时器到期仍会读到最新正文 */
+  function scheduleFeedHeadlessStreamSpeak(finished: boolean): void {
+    if (finished == true) {
+      feedSpeakPending = false;
+      if (feedSpeakTimer != 0) {
+        clearTimeout(feedSpeakTimer);
+        feedSpeakTimer = 0;
+      }
+      feedHeadlessStreamSpeak(true);
+      return;
+    }
+    feedSpeakPending = true;
+    if (feedSpeakTimer != 0) {
+      return;
+    }
+    feedSpeakTimer = setTimeout(() => {
+      feedSpeakTimer = 0;
+      if (feedSpeakPending == false) {
+        return;
+      }
+      feedSpeakPending = false;
+      feedHeadlessStreamSpeak(false);
+    }, 80);
+  }
 
   /** 是否消息列表最后一条（模板辅助，避免模板中做 nullable 算术） */
   const isLastMessage = (listIndex: number): boolean => {
@@ -1205,9 +1348,11 @@
     currentMessageId: string,
   ) => service.handleChangeMessageList(res, currentMessageId);
 
-  // 停止会话
-  const handleStopConversation = () =>
+  // 停止会话：掐断 SSE + 停止播报；已输出正文保留并由 Markdown 终态渲染
+  const handleStopConversation = () => {
+    stopAllStreamSpeech(true);
     service.handleStopConversation(props.isTempChat);
+  };
   const createNewConversation = (isAppDetails: boolean) =>
     service.createNewConversation(isAppDetails);
   function getPublishedAgentInfo(appParams: OpenAppParams | null) {
@@ -1423,7 +1568,10 @@
   // 发送消息
   const handleSendMessage = (_data: any) => {
     // 发送新消息时停止当前 TTS 播报（工具栏订阅会同步 UI）
-    ttsWebSocketPlayer.stop();
+    stopAllStreamSpeech(true);
+
+    // 与 dev 一致：一点击发送就清空问题建议，避免会话进行中仍展示
+    data.chatSuggestList.value = [] as any[];
 
     // 取消订阅 ChatFinished 事件（发送新消息时，旧会话已结束）
     eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
@@ -1571,6 +1719,8 @@
       data.isConversationActive.value = false;
       data.isStoppingConversation.value = false;
     });
+    // 发送手势同步链路内开启流式播报（H5 需用户手势解锁音频；App/小程序同样尽早 begin）
+    ensureHeadlessStreamSpeak();
   };
 
   /**
@@ -1827,6 +1977,46 @@
       }
     },
     { deep: true },
+  );
+
+  // 无头边生成边播报：会话一开始就开启；正文增长时防抖分句送 TTS（App/H5/小程序统一）
+  watch(
+    (): string => streamingAssistantMessageId.value,
+    (_id: string) => {
+      ensureHeadlessStreamSpeak();
+    },
+  );
+  watch(
+    (): string => streamingAssistantText.value,
+    (_text: string) => {
+      ensureHeadlessStreamSpeak();
+      scheduleFeedHeadlessStreamSpeak(false);
+    },
+  );
+  // 双保险：部分端 messageList 正文更新早于 streaming 通道
+  watch(
+    (): string => assistantStreamText.value,
+    (_text: string) => {
+      if (_text.length == 0) {
+        return;
+      }
+      ensureHeadlessStreamSpeak();
+      scheduleFeedHeadlessStreamSpeak(false);
+    },
+  );
+  watch(
+    (): boolean => isConversationActive.value,
+    (active: boolean, oldActive: boolean) => {
+      if (active == true && oldActive != true) {
+        ensureHeadlessStreamSpeak();
+      }
+      if (oldActive == true && active == false) {
+        if (headlessStreamSpeakId.length > 0) {
+          scheduleFeedHeadlessStreamSpeak(true);
+          headlessStreamSpeakId = "";
+        }
+      }
+    },
   );
 
   watch(
@@ -2645,6 +2835,7 @@
   // 清理事件监听器
   onUnmounted(() => {
     console.log("[页面卸载] 准备中断 SSE 连接");
+    stopAllStreamSpeech(true);
     chatService.abort();
     console.log("[页面卸载] SSE 连接已中断");
     scrollManager.dispose();

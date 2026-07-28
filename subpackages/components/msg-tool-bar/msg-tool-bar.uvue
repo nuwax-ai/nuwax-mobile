@@ -23,11 +23,17 @@
 	import { formatTimeAgo } from '@/utils/common';
 	import { useI18n, emptyI18nParams } from '@/utils/i18n';
 	import { cleanTextForSpeech } from "@/subpackages/utils/voice/textFilter";
-	import { loadVoiceSettings } from "@/subpackages/utils/voice/voiceTypes";
+	import {
+		loadVoiceSettings,
+		cloneVoiceSettings,
+	} from "@/subpackages/utils/voice/voiceTypes";
 	import {
 		ttsWebSocketPlayer,
 		type TtsPlaybackState,
 	} from "@/subpackages/utils/voice/ttsWebSocketPlayer";
+	import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
+	import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
+	import type { AudioPlayerState } from "@/subpackages/utils/voice/voiceTypes";
 
 	const { t: tFn } = useI18n();
 	const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -37,6 +43,7 @@
 	const isSpeaking = ref<boolean>(false)
 	const speechFrame = ref<boolean>(false)
 	let ttsListenerId: number = 0
+	let audioListenerId: number = 0
 	let speechAnimationTimer: number | null = null
 
 	const props = withDefaults(defineProps<{
@@ -97,22 +104,40 @@
 		speechFrame.value = false
 	}
 
+	/** 工具栏播报中：工具栏 TTS WebSocket，或该消息的流式尾包续播 */
+	const refreshSpeakingUi = (): void => {
+		const messageId = msg.value._id
+		const ttsState = ttsWebSocketPlayer.getState()
+		const ttsSpeaking =
+			ttsWebSocketPlayer.getMessageId() == messageId &&
+			(ttsState == "connecting" ||
+				ttsState == "synthesizing" ||
+				ttsState == "playing")
+		const streamSpeaking =
+			voiceStreamSpeaker.getMessageId() == messageId &&
+			(voiceStreamSpeaker.isActive() ||
+				audioPlayerManager.isBusyForMessage(messageId))
+		isSpeaking.value = ttsSpeaking || streamSpeaking
+		if (isSpeaking.value) {
+			startSpeechAnimation()
+		} else {
+			stopSpeechAnimation()
+		}
+	}
+
 	onMounted(() => {
 		startTimer()
 		ttsListenerId = ttsWebSocketPlayer.subscribe(
-			(state: TtsPlaybackState, messageId: string): void => {
-				isSpeaking.value =
-					messageId == msg.value._id &&
-					(state == "connecting" ||
-						state == "synthesizing" ||
-						state == "playing")
-				if (isSpeaking.value) {
-					startSpeechAnimation()
-				} else {
-					stopSpeechAnimation()
-				}
+			(_state: TtsPlaybackState, _messageId: string): void => {
+				refreshSpeakingUi()
 			},
 		)
+		audioListenerId = audioPlayerManager.subscribe(
+			(_state: AudioPlayerState, _messageId: string): void => {
+				refreshSpeakingUi()
+			},
+		)
+		refreshSpeakingUi()
 	})
 
 	onUnmounted(() => {
@@ -121,6 +146,10 @@
 		if (ttsListenerId > 0) {
 			ttsWebSocketPlayer.unsubscribe(ttsListenerId)
 			ttsListenerId = 0
+		}
+		if (audioListenerId > 0) {
+			audioPlayerManager.unsubscribe(audioListenerId)
+			audioListenerId = 0
 		}
 	})
 
@@ -155,17 +184,35 @@
 		return text.split("\r").join("\\r").split("\n").join("\\n")
 	}
 
+	/** 当前消息是否正被流式/队列播报占用 */
+	const isStreamSpeakingThisMsg = (): boolean => {
+		const messageId = msg.value._id
+		return (
+			voiceStreamSpeaker.getMessageId() == messageId &&
+			(voiceStreamSpeaker.isActive() ||
+				audioPlayerManager.isBusyForMessage(messageId))
+		)
+	}
+
 	/** 播报或停止当前 AI 消息。 */
 	const toggleSpeech = async (): Promise<void> => {
 		const messageId = msg.value._id
-		if (
-			isSpeaking.value &&
-			ttsWebSocketPlayer.getMessageId() == messageId
-		) {
-			ttsWebSocketPlayer.stop()
-			return
+		// 停止：工具栏 TTS 或本条流式续播
+		if (isSpeaking.value) {
+			const ttsMatch = ttsWebSocketPlayer.getMessageId() == messageId
+			const streamMatch = isStreamSpeakingThisMsg()
+			if (ttsMatch || streamMatch) {
+				ttsWebSocketPlayer.stop()
+				voiceStreamSpeaker.stop()
+				audioPlayerManager.stop()
+				refreshSpeakingUi()
+				return
+			}
 		}
-		const settings = loadVoiceSettings()
+		const settings = cloneVoiceSettings(loadVoiceSettings())
+		// 工具栏只播正文：强制排除 think / 代码块
+		settings.includeThinkContent = false
+		settings.includeCodeBlocks = false
 		const sourceText =
 			props.speakText.length > 0 ? props.speakText : msg.value.body
 		const sourceLogText = formatSpeechLogText(sourceText)
@@ -198,6 +245,8 @@
 			return
 		}
 		try {
+			// 手动播报前打断流式队列，避免两路抢音频
+			voiceStreamSpeaker.stop()
 			await ttsWebSocketPlayer.play(messageId, speakableText)
 		} catch (error: any) {
 			console.error("[TTS] start failed", error)

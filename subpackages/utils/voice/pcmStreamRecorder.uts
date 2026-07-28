@@ -1,0 +1,124 @@
+/**
+ * 将本地 PCM/WAV 录音文件切成 ASR 协议帧（默认 640B）并回调。
+ * 用于 App 端 RecorderManager 无实时帧回调时的兜底推流。
+ */
+import { ASR_FRAME_BYTES } from "./asrWebSocketClient";
+
+export type OnPcmChunkCallback = (frame: ArrayBuffer) => void;
+
+/**
+ * 读取录音临时文件为 ArrayBuffer。
+ * 注意：勿在 Promise executor 内写 try/catch（UTS 易截断 setup）。
+ */
+export function readAudioFileBuffer(
+  filePath: string,
+  done: (buffer: ArrayBuffer | null) => void,
+): void {
+  const fs = uni.getFileSystemManager();
+  fs.readFile({
+    filePath: filePath,
+    success: (res) => {
+      const data = res.data;
+      if (data == null) {
+        done(null);
+        return;
+      }
+      // APP 上通常为 ArrayBuffer
+      const asBuffer = data as ArrayBuffer;
+      if (typeof asBuffer.byteLength == "number") {
+        done(asBuffer);
+        return;
+      }
+      done(null);
+    },
+    fail: (_err) => {
+      console.warn("[ASR] readAudioFileBuffer fail path=" + filePath);
+      done(null);
+    },
+  });
+}
+
+/** 若是 WAV，跳过 44 字节头，返回裸 PCM；否则原样返回 */
+export function stripWavHeaderIfNeeded(buffer: ArrayBuffer): ArrayBuffer {
+  if (buffer.byteLength < 44) {
+    return buffer;
+  }
+  const view = new Uint8Array(buffer);
+  // "RIFF" .... "WAVE"
+  if (
+    view[0] == 0x52 &&
+    view[1] == 0x49 &&
+    view[2] == 0x46 &&
+    view[3] == 0x46 &&
+    view[8] == 0x57 &&
+    view[9] == 0x41 &&
+    view[10] == 0x56 &&
+    view[11] == 0x45
+  ) {
+    const pcmLen = buffer.byteLength - 44;
+    const out = new ArrayBuffer(pcmLen);
+    const outView = new Uint8Array(out);
+    for (let i = 0; i < pcmLen; i++) {
+      outView[i] = view[i + 44];
+    }
+    return out;
+  }
+  return buffer;
+}
+
+/**
+ * 按 frameBytes 切分 PCM，逐块回调（最后一块可不足一帧，服务端允许更大块）。
+ */
+export function forEachPcmFrame(
+  pcm: ArrayBuffer,
+  frameBytes: number,
+  onChunk: OnPcmChunkCallback,
+): void {
+  const size = frameBytes > 0 ? frameBytes : ASR_FRAME_BYTES;
+  const total = pcm.byteLength;
+  if (total == 0) {
+    return;
+  }
+  const src = new Uint8Array(pcm);
+  let offset = 0;
+  while (offset < total) {
+    const remain = total - offset;
+    const chunkLen = remain > size ? size : remain;
+    const frame = new ArrayBuffer(chunkLen);
+    const dst = new Uint8Array(frame);
+    for (let i = 0; i < chunkLen; i++) {
+      dst[i] = src[offset + i];
+    }
+    onChunk(frame);
+    offset += chunkLen;
+  }
+}
+
+/**
+ * 读文件 → 去 WAV 头 → 切帧推送。
+ */
+export function streamLocalAudioFileToAsr(
+  filePath: string,
+  sendFrame: OnPcmChunkCallback,
+  done: (ok: boolean) => void,
+): void {
+  readAudioFileBuffer(filePath, (buffer: ArrayBuffer | null) => {
+    if (buffer == null || buffer!.byteLength == 0) {
+      done(false);
+      return;
+    }
+    const pcm = stripWavHeaderIfNeeded(buffer!);
+    if (pcm.byteLength == 0) {
+      done(false);
+      return;
+    }
+    console.log(
+      "[ASR] stream file bytes=" +
+        pcm.byteLength.toString() +
+        " path=" +
+        filePath,
+    );
+    forEachPcmFrame(pcm, ASR_FRAME_BYTES, sendFrame);
+    done(true);
+  });
+}

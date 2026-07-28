@@ -1,0 +1,267 @@
+/**
+ * Markdown 图片：原位渲染辅助。
+ * 完整 `![alt](url)` 留给解析器产出 markdown_image；仅剥离流式未闭合尾部。
+ */
+
+import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
+import type { MarkdownToken } from "@/uni_modules/uni-cmark/utssdk/interface.uts";
+
+/**
+ * 定位图片 URL 的闭合 `)`（括号深度匹配）。
+ */
+function findMarkdownImageHrefEnd(text: string, urlStart: number): number {
+  let depth = 1;
+  for (let i = urlStart; i < text.length; i++) {
+    const ch = text.charAt(i);
+    if (ch == "(") {
+      depth++;
+    } else if (ch == ")") {
+      depth--;
+      if (depth == 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+export type ParsedMarkdownImage = {
+  start: number;
+  end: number;
+  alt: string;
+  url: string;
+};
+
+/**
+ * 从 start 处解析已闭合的 `![alt](url)`。
+ * @returns 解析结果；未闭合或不匹配返回 null
+ */
+export function parseMarkdownImageAt(
+  text: string,
+  start: number,
+): ParsedMarkdownImage | null {
+  if (start < 0 || start + 4 > text.length) {
+    return null;
+  }
+  if (text.charAt(start) != "!" || text.charAt(start + 1) != "[") {
+    return null;
+  }
+  const labelEnd = text.indexOf("](", start + 2);
+  if (labelEnd < 0) {
+    return null;
+  }
+  const hrefEnd = findMarkdownImageHrefEnd(text, labelEnd + 2);
+  if (hrefEnd < 0) {
+    return null;
+  }
+  const alt = text.substring(start + 2, labelEnd);
+  const url = text.substring(labelEnd + 2, hrefEnd).trim();
+  if (url.length == 0) {
+    return null;
+  }
+  return {
+    start,
+    end: hrefEnd + 1,
+    alt,
+    url,
+  } as ParsedMarkdownImage;
+}
+
+/**
+ * 整行是否为单个已闭合 Markdown 图片（允许首尾空白）。
+ */
+export function parseStandaloneMarkdownImageLine(
+  line: string,
+): ParsedMarkdownImage | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("![")) {
+    return null;
+  }
+  const parsed = parseMarkdownImageAt(trimmed, 0);
+  if (parsed == null) {
+    return null;
+  }
+  if (parsed.end != trimmed.length) {
+    return null;
+  }
+  return parsed;
+}
+
+/**
+ * 行是否为未闭合的图片语法开头（流式中）。
+ */
+export function isIncompleteMarkdownImageLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("![")) {
+    return false;
+  }
+  return parseMarkdownImageAt(trimmed, 0) == null;
+}
+
+/**
+ * 提取正文中已闭合的 Markdown 图片地址。
+ */
+export function extractMarkdownImageUrls(text: string): string[] {
+  const urls = [] as string[];
+  if (text.length == 0) {
+    return urls;
+  }
+  let cursor = 0;
+  while (cursor < text.length) {
+    const start = text.indexOf("![", cursor);
+    if (start < 0) {
+      break;
+    }
+    const parsed = parseMarkdownImageAt(text, start);
+    if (parsed == null) {
+      break;
+    }
+    urls.push(parsed.url);
+    cursor = parsed.end;
+  }
+  return urls;
+}
+
+/**
+ * 仅剥离流式未闭合的 `![...](` 尾部，完整图片保留在正文原位渲染。
+ */
+export function stripMarkdownImages(text: string): string {
+  if (text.length == 0 || text.indexOf("![") < 0) {
+    return text;
+  }
+  let out = "";
+  let cursor = 0;
+  while (cursor < text.length) {
+    const start = text.indexOf("![", cursor);
+    if (start < 0) {
+      out += text.substring(cursor);
+      break;
+    }
+    const parsed = parseMarkdownImageAt(text, start);
+    if (parsed != null) {
+      // 完整图片保留
+      out += text.substring(cursor, parsed.end);
+      cursor = parsed.end;
+      continue;
+    }
+    // 未闭合：丢弃从 ![ 到文末，避免原文泄漏
+    out += text.substring(cursor, start);
+    break;
+  }
+  return out;
+}
+
+function isImageLeafToken(token: MarkdownToken): boolean {
+  if (token.type == "image") {
+    return true;
+  }
+  const href = token.href != null ? `${token.href}` : "";
+  const className = token.className != null ? `${token.className}` : "";
+  // cmark / treeToList 可能把 image 展平为带 href 的叶子
+  return (
+    className.indexOf("image") >= 0 &&
+    href.length > 0 &&
+    token.type != "link"
+  );
+}
+
+function tokenHasTextContent(token: MarkdownToken): boolean {
+  const text = token.text != null ? `${token.text}` : "";
+  if (text.trim().length > 0 && text != "\n") {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 将段落/标题中的 image token 拆成独立 markdown_image 块，保证原位渲染。
+ */
+export function expandMarkdownImageItems(
+  items: UniAiMarkdownElItem[],
+): UniAiMarkdownElItem[] {
+  const out = [] as UniAiMarkdownElItem[];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const type = item.type;
+    if (
+      type == "markdown_image" ||
+      type == "markdown_custom_process" ||
+      type == "markdown_custom_process_group" ||
+      type == "task_result" ||
+      type == "table" ||
+      type == "code_block" ||
+      type == "math"
+    ) {
+      out.push(item);
+      continue;
+    }
+    const rows = item.datasList;
+    if (rows == null || rows.length == 0) {
+      out.push(item);
+      continue;
+    }
+    let hasImage = false;
+    for (let r = 0; r < rows.length && !hasImage; r++) {
+      const row = rows[r];
+      for (let t = 0; t < row.length; t++) {
+        if (isImageLeafToken(row[t])) {
+          hasImage = true;
+          break;
+        }
+      }
+    }
+    if (!hasImage) {
+      out.push(item);
+      continue;
+    }
+    // 按行展开；行内图拆成「前文段落 + 图 + 后文段落」
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      let pending = [] as MarkdownToken[];
+      const flushPending = (): void => {
+        if (pending.length == 0) {
+          return;
+        }
+        const hasContent = pending.some((tok: MarkdownToken): boolean =>
+          tokenHasTextContent(tok),
+        );
+        if (hasContent) {
+          out.push({
+            uniqueId: item.uniqueId + "-p-" + out.length,
+            type: type,
+            datasList: [pending],
+          });
+        }
+        pending = [] as MarkdownToken[];
+      };
+      for (let t = 0; t < row.length; t++) {
+        const tok = row[t];
+        if (isImageLeafToken(tok)) {
+          flushPending();
+          const href = tok.href != null ? `${tok.href}` : "";
+          if (href.length > 0) {
+            const alt = tok.text != null ? `${tok.text}` : "";
+            out.push({
+              uniqueId: item.uniqueId + "-img-" + out.length,
+              type: "markdown_image",
+              datasList: [
+                [
+                  {
+                    type: "image",
+                    text: alt,
+                    href: href,
+                    className: "image",
+                  },
+                ],
+              ],
+            });
+          }
+        } else {
+          pending.push(tok);
+        }
+      }
+      flushPending();
+    }
+  }
+  return out;
+}

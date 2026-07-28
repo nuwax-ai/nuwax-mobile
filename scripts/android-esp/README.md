@@ -47,6 +47,8 @@ make android-tester
 | `ANDROID_BUILD_TYPE` | `debug` | `debug` 联调基座；`release` 接近发行性能（内测 debug 签名） |
 | `ENABLE_HX_DEBUG` | `1` | `0` 去掉 debug-server / DCLOUD_DEBUG |
 
+注意：官方示例把 LeakCanary 写成 `implementation`，Release 会闪退（`LeakCanary in non-debuggable build`）。`configure_app.py` 会自动改成 `debugImplementation`。
+
 ## 注意
 
 - 官方 SDK zip 常缺 `gradle-wrapper.jar`，`ensure_env.sh` 会自动补齐。

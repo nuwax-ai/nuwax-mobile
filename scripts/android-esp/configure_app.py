@@ -114,6 +114,31 @@ def strip_optional_remote_deps(gradle_path: Path) -> None:
         print(f"✓ 去掉可选远程依赖: {gradle_path.relative_to(PROJ)}")
 
 
+def confine_leakcanary_to_debug(gradle_path: Path) -> None:
+    """
+    官方示例把 LeakCanary 写成 implementation，assembleRelease 会打进非 debuggable 包，
+    启动即抛：java.lang.Error: LeakCanary in non-debuggable build（表现为闪退）。
+    改为 debugImplementation，Debug 联调仍可用，Release/发测试包不再包含。
+    """
+    if not gradle_path.is_file():
+        return
+    text = gradle_path.read_text()
+    # 已是 debugImplementation 则跳过；仅改仍挂在 implementation 上的 leakcanary
+    text2, n = re.subn(
+        r'(?m)^(?P<indent>\s*)implementation(?P<rest>\s+[\'"]com\.squareup\.leakcanary:[^\'"]+[\'"])',
+        r"\g<indent>debugImplementation\g<rest>",
+        text,
+    )
+    if n:
+        gradle_path.write_text(text2)
+        print(
+            f"✓ LeakCanary → debugImplementation（{n} 处）: "
+            f"{gradle_path.relative_to(PROJ)}"
+        )
+    elif "leakcanary" in text.lower():
+        print(f"✓ LeakCanary 已是 debug 范围: {gradle_path.relative_to(PROJ)}")
+
+
 def strip_project_deps(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
@@ -402,6 +427,9 @@ def main() -> None:
     strip_project_deps(PROJ / "app" / "build.gradle")
     strip_project_deps(PROJ / "uniappx" / "build.gradle")
     strip_optional_remote_deps(PROJ / "app" / "build.gradle")
+    # Release 闪退修复：LeakCanary 不得进非 debuggable 包
+    confine_leakcanary_to_debug(PROJ / "app" / "build.gradle")
+    confine_leakcanary_to_debug(PROJ / "uniappx" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
     configure_manifest()

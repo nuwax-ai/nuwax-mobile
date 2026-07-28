@@ -40,7 +40,8 @@ DELIVER_NAME="${DELIVER_NAME:-nuwa-zhuoda-release-${STAMP}.apk}"
 export ENABLE_HX_DEBUG=0
 export ANDROID_BUILD_TYPE=release
 export SKIP_INSTALL=1
-export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+# 不强制覆盖 ANDROID_HOME：无效路径会导致误报；由 ensure_env / package_custom_base 自动探测
+# （本机常见：~/Library/Android/sdk 或 ~/workspace/Android/sdk）
 
 OUT_DIR="$ROOT_DIR/unpackage/debug"
 RELEASE_APK="$OUT_DIR/android_release.apk"
@@ -71,13 +72,15 @@ fi
 
 # shellcheck source=../local-base-env.sh
 source "$SCRIPT_DIR/../local-base-env.sh"
+# shellcheck source=ensure_env.sh
+source "$SCRIPT_DIR/ensure_env.sh"
 echo "✓ NUWAX_OFFLINE_SDK_HOME=${NUWAX_OFFLINE_SDK_HOME}"
 echo "✓ ANDROID_ESP_WORK=${ANDROID_ESP_WORK}"
-echo "✓ ANDROID_HOME=${ANDROID_HOME}"
+echo "✓ ANDROID_HOME=${ANDROID_HOME:-}"
 echo "✓ ENABLE_HX_DEBUG=${ENABLE_HX_DEBUG}  ANDROID_BUILD_TYPE=${ANDROID_BUILD_TYPE}"
 
-if [[ ! -d "${ANDROID_HOME}/platforms" ]]; then
-  fail "ANDROID_HOME 无效（无 platforms/）: $ANDROID_HOME"
+if [[ -z "${ANDROID_HOME:-}" || ! -d "${ANDROID_HOME}/platforms" ]]; then
+  fail "ANDROID_HOME 无效（无 platforms/）: ${ANDROID_HOME:-unset}"
 fi
 
 # 离线 Android SDK 目录粗检（具体 work 由 package_custom_base 自动 bootstrap）

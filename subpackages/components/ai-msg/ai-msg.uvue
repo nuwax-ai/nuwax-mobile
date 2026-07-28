@@ -52,7 +52,7 @@
         </view>
       </view>
 
-      <!-- AI 答复内容（uni-cmark → UniAiMarkdownElItem[] → uni-ai-x-msg） -->
+      <!-- AI 答复内容：流式也走 UniAiXMsgRender；解析节流避免每 SSE 字卡死 -->
       <view class="answer-container">
         <UniAiXMsgRender
           v-if="renderMarkdownElList.length > 0"
@@ -87,7 +87,7 @@
     <msg-tool-bar
       v-if="shouldShowMsgToolBar"
       :msg="msg"
-      :speak-text="resolveBodyText()"
+      :speak-text="resolveSpeakableBodyText()"
     />
   </view>
 </template>
@@ -112,6 +112,8 @@
     stripAgentInfoTags,
     stripAdaptedAgentInfoHtml,
   } from "@/subpackages/components/ai-msg/agentInfoTag.uts";
+  import { stripNonSpeakableMarkup } from "@/subpackages/utils/voice/textFilter";
+  import { onUnmounted } from "vue";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -302,6 +304,16 @@
     );
   }
 
+  /**
+   * 工具栏播报专用：只要助手正文，不含 think / 工具调用 / agent-info。
+   * 避免把非正文送进 TTS 导致长时间 synthesizing、图标空转。
+   */
+  function resolveSpeakableBodyText(): string {
+    return stripNonSpeakableMarkup(
+      stripAdaptedAgentInfoHtml(stripAgentInfoTags(resolveBodyText())),
+    );
+  }
+
   function resolveThinkText(): string {
     const propThink =
       props.thinkText != null && `${props.thinkText}`.length > 0
@@ -332,6 +344,22 @@
       props.taskStatus != TaskStatus.EXECUTING
     );
   });
+
+  /**
+   * 流式也直接用 UniAiXMsgRender。
+   * 为避免每个 SSE 字符全量解析卡死主线程，会话进行中对 Markdown 解析做节流。
+   */
+  const STREAM_MD_PARSE_INTERVAL_MS: number = 200;
+  let streamMdParseTimer: number = 0;
+  let streamMdParsePending: boolean = false;
+
+  function clearStreamMdParseTimer(): void {
+    if (streamMdParseTimer != 0) {
+      clearTimeout(streamMdParseTimer);
+      streamMdParseTimer = 0;
+    }
+    streamMdParsePending = false;
+  }
 
   // 思考内容是否隐藏（默认隐藏）
   const hideThinkContent = ref<boolean>(true);
@@ -377,6 +405,10 @@
     if (hasBodyOrText.value != true) {
       return false;
     }
+    // 流式输出 / loading 中不显示复制、语音播报
+    if (showLoadingIcon.value == true) {
+      return false;
+    }
     if (isLastMsg.value == true && isConversationActive.value == true) {
       return false;
     }
@@ -399,6 +431,39 @@
     (): boolean => isConversationActive.value,
     (): boolean => isLastMsg.value,
   );
+
+  function runBodyMarkdownParseNow(forceDone: boolean): void {
+    clearStreamMdParseTimer();
+    markdownParser.runMarkdownParse(forceDone);
+    streamRevision.value = streamRevision.value + 1;
+  }
+
+  /** 流式：合并高频 chunk 后再解析；非流式：立即解析；首帧无结果时立即解析（无纯文本兜底） */
+  function scheduleBodyMarkdownParse(): void {
+    const streaming =
+      isConversationActive.value == true && isLastMsg.value == true;
+    if (streaming == false) {
+      runBodyMarkdownParseNow(true);
+      return;
+    }
+    if (markdownParser.resolveRenderList().length == 0) {
+      runBodyMarkdownParseNow(false);
+      return;
+    }
+    streamMdParsePending = true;
+    if (streamMdParseTimer != 0) {
+      return;
+    }
+    streamMdParseTimer = setTimeout(() => {
+      streamMdParseTimer = 0;
+      if (streamMdParsePending == false) {
+        return;
+      }
+      streamMdParsePending = false;
+      markdownParser.runMarkdownParse(false);
+      streamRevision.value = streamRevision.value + 1;
+    }, STREAM_MD_PARSE_INTERVAL_MS);
+  }
 
   const renderMarkdownElList = computed((): UniAiMarkdownElItem[] => {
     const _rev = streamRevision.value;
@@ -437,7 +502,8 @@
     try {
       if (newData != null) {
         applyMsgPatch(msg.value, newData);
-        markdownParser.runMarkdownParse(false);
+        streamRevision.value = streamRevision.value + 1;
+        scheduleBodyMarkdownParse();
       }
     } catch (error) {
       console.error("updateMessage 执行失败:", error);
@@ -483,6 +549,9 @@
       : [] as any[],
     (list: any[]) => {
       msg.value.processingList = list;
+      streamRevision.value = streamRevision.value + 1;
+      // PROCESSING 状态变化也需驱动组件重绘（节流解析会带上容器节点）
+      scheduleBodyMarkdownParse();
     },
     { immediate: true },
   );
@@ -530,13 +599,20 @@
     (): string => (props.bodyText != null ? `${props.bodyText}` : ""),
     (v: string) => {
       msg.value.body = v;
+      streamRevision.value = streamRevision.value + 1;
     },
     { immediate: true },
   );
 
   watch(
-    (): string => resolveThinkText(),
-    (v: string) => {
+    (): string =>
+      resolveThinkText() +
+      "|" +
+      `${isConversationActive.value}` +
+      "|" +
+      `${hideThinkContent.value}`,
+    () => {
+      const v = resolveThinkText();
       msg.value.thinkContent = v;
       const thinkId = msg.value._id + "-think";
       if (thinkMsg.value._id != thinkId) {
@@ -548,6 +624,9 @@
       thinkMsg.value.body = v;
       thinkMsg.value.markdownElList = [] as UniAiMarkdownElItem[];
       if (!hideThinkContent.value && v.length > 0) {
+        if (isConversationActive.value == true && isLastMsg.value == true) {
+          return;
+        }
         thinkMarkdownParser.runMarkdownParse(true);
       }
     },
@@ -576,10 +655,19 @@
       "|" +
       `${msg.value.state}`,
     () => {
-      markdownParser.runMarkdownParse(false);
+      // 会话从进行中结束：立刻冲刷一次终态解析（含 PROCESSING 容器）
+      if (isConversationActive.value != true || isLastMsg.value != true) {
+        runBodyMarkdownParseNow(true);
+        return;
+      }
+      scheduleBodyMarkdownParse();
     },
     { immediate: true },
   );
+
+  onUnmounted(() => {
+    clearStreamMdParseTimer();
+  });
 
   defineExpose({
     updateMessage,

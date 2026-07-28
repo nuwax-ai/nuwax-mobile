@@ -33,7 +33,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 SKIP_APP_RESOURCE="${SKIP_APP_RESOURCE:-0}"
 SKIP_DELIVER_COPY="${SKIP_DELIVER_COPY:-0}"
-STAMP="$(date +%Y%m%d)"
+STAMP="$(date +%Y%m%d-%H%M)"
 DELIVER_NAME="${DELIVER_NAME:-nuwa-zhuoda-release-${STAMP}.apk}"
 
 # 发测试固定：关 HX 调试通道 + Gradle Release 变体

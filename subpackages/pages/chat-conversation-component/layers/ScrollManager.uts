@@ -9,6 +9,14 @@ export default class ScrollManager {
   private data: AgentDetailData;
   // 记录上次滚动位置，用于判断滚动方向
   private lastScrollTop: number = 0;
+  /** 历史首屏布局稳定截止时间（ms），期内允许因异步组件撑高而补滚 */
+  private historySettleUntil: number = 0;
+  /** 历史首屏分批滚底定时器 */
+  private historySettleTimers: number[] = [];
+  /** 稳定期内观测到的最大 scrollHeight，用于检测内容撑高 */
+  private lastSettleScrollHeight: number = 0;
+  /** 内容撑高后的补滚防抖标记 */
+  private settleScrollScheduled: boolean = false;
 
   constructor(data: AgentDetailData) {
     this.data = data;
@@ -31,15 +39,89 @@ export default class ScrollManager {
 
   /**
    * 历史消息加载后延迟滚到底部（无动画）。
-   * 首屏列表与消息内容布局完成前 scroll-into-view 可能无效，故补一次延迟定位。
+   * 首屏含数学公式 / 卡片等异步撑高时，单次 300ms 滚底往往已过期，
+   * 故在稳定窗口内分批重试，并在 scrollHeight 增长时补滚。
    */
   scrollToLastMsgAfterHistoryLoad(): void {
+    this.clearHistorySettle();
     this.data.autoToLastMsg.value = true;
-    nextTick(() => {
-      setTimeout(() => {
-        this.scrollToLastMsg(false);
-      }, 300);
-    });
+    this.historySettleUntil = Date.now() + 5000;
+    this.lastSettleScrollHeight = 0;
+
+    // 分批延迟：覆盖列表挂载 → markdown → katex 图片等逐步撑高
+    const delays: number[] = [50, 200, 500, 1000, 1800, 3000, 4500];
+    for (let i = 0; i < delays.length; i++) {
+      const delay = delays[i];
+      const timerId = setTimeout((): void => {
+        this.tryScrollDuringHistorySettle();
+      }, delay) as number;
+      this.historySettleTimers.push(timerId);
+    }
+  }
+
+  /** 页面卸载时清理历史滚底定时器 */
+  dispose(): void {
+    this.clearHistorySettle();
+  }
+
+  private isHistorySettling(): boolean {
+    return Date.now() <= this.historySettleUntil;
+  }
+
+  private clearHistorySettle(): void {
+    for (let i = 0; i < this.historySettleTimers.length; i++) {
+      clearTimeout(this.historySettleTimers[i]);
+    }
+    this.historySettleTimers = [];
+    this.historySettleUntil = 0;
+    this.settleScrollScheduled = false;
+    this.lastSettleScrollHeight = 0;
+  }
+
+  /**
+   * 稳定期内尝试滚底；用户已上滑打断自动滚时立即结束稳定期。
+   */
+  private tryScrollDuringHistorySettle(): void {
+    if (this.isHistorySettling() == false) {
+      return;
+    }
+    if (this.data.autoToLastMsg.value != true) {
+      this.clearHistorySettle();
+      return;
+    }
+    if (this.data.scrollTouch.value == true) {
+      this.clearHistorySettle();
+      return;
+    }
+    this.scrollToLastMsg(false);
+  }
+
+  /**
+   * 稳定期内内容高度增长时补一次滚底（katex 图、组件晚渲染）。
+   */
+  private maybeRescrollOnContentGrow(scrollHeight: number): void {
+    if (this.isHistorySettling() == false) {
+      return;
+    }
+    if (this.data.autoToLastMsg.value != true) {
+      this.clearHistorySettle();
+      return;
+    }
+    if (scrollHeight <= this.lastSettleScrollHeight + 24) {
+      if (scrollHeight > this.lastSettleScrollHeight) {
+        this.lastSettleScrollHeight = scrollHeight;
+      }
+      return;
+    }
+    this.lastSettleScrollHeight = scrollHeight;
+    if (this.settleScrollScheduled == true) {
+      return;
+    }
+    this.settleScrollScheduled = true;
+    setTimeout((): void => {
+      this.settleScrollScheduled = false;
+      this.tryScrollDuringHistorySettle();
+    }, 80);
   }
 
   /**
@@ -59,6 +141,8 @@ export default class ScrollManager {
       const scrollList = uni.getElementById("msg-list");
       const offsetHeight = scrollList?.offsetHeight ?? 600;
       // #endif
+
+      this.maybeRescrollOnContentGrow(scrollHeight);
 
       const diff: number = scrollHeight - scrollTop - offsetHeight;
       const isInBottom = diff < 50;
@@ -83,6 +167,10 @@ export default class ScrollManager {
         this.data.autoToLastMsg.value = false;
         // 同时显示"滚动到底部"按钮
         this.data.scrollInBottom.value = false;
+        // 打断历史首屏补滚，避免与用户阅读冲突
+        if (this.isHistorySettling() == true) {
+          this.clearHistorySettle();
+        }
       }
     });
   }

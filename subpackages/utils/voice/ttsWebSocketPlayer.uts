@@ -684,4 +684,164 @@ export class TtsWebSocketPlayer {
   }
 }
 
+/**
+ * 单句合成：打开一次性 TTS WebSocket，收齐 PCM 后封装为可播放 src（不播报）。
+ * 供 voiceStreamSpeaker / ttsService 边生成边播报分句使用。
+ */
+export async function synthesizeSpeechToSrc(text: string): Promise<string> {
+  const trimmed = text.trim();
+  if (trimmed.length == 0) {
+    return "";
+  }
+  const accessToken = resolveAccessToken();
+  if (accessToken.length == 0) {
+    throw new Error("登录状态已失效");
+  }
+  const sampleRate = 24000;
+  const chunks = [] as Uint8Array[];
+  let pendingBinary = 0;
+  let finishRequested = false;
+  let settled = false;
+  let socketTask: SocketTask | null = null;
+
+  return await new Promise<string>((resolve, reject) => {
+    const fail = (message: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      const sock = socketTask;
+      socketTask = null;
+      if (sock != null) {
+        try {
+          sock!.close({});
+        } catch (_eClose) {
+          // ignore
+        }
+      }
+      reject(new Error(message));
+    };
+
+    const tryFinish = (): void => {
+      if (!finishRequested || pendingBinary > 0 || settled) {
+        return;
+      }
+      settled = true;
+      const sock = socketTask;
+      socketTask = null;
+      if (sock != null) {
+        try {
+          sock!.send({ data: JSON.stringify({ type: "close" } as UTSJSONObject) });
+          sock!.close({});
+        } catch (_eClose) {
+          // ignore
+        }
+      }
+      if (chunks.length == 0) {
+        reject(new Error("TTS 未返回音频"));
+        return;
+      }
+      const wav = buildPcm16Wav(chunks, sampleRate);
+      saveWavFile(wav).then(
+        (src: string) => {
+          resolve(src);
+        },
+        (e: any | null) => {
+          let msg = "TTS 音频保存失败";
+          if (e != null) {
+            const em = (e as UTSJSONObject)["message"];
+            if (em != null && `${em}`.length > 0) {
+              msg = `${em}`;
+            }
+          }
+          reject(new Error(msg));
+        },
+      );
+    };
+
+    const sendJson = (data: UTSJSONObject): void => {
+      const sock = socketTask;
+      if (sock == null) {
+        return;
+      }
+      sock!.send({ data: JSON.stringify(data) });
+    };
+
+    // #ifdef H5 || WEB
+    socketTask = uni.connectSocket({
+      url: createTtsWebSocketUrl(accessToken),
+      fail: (err) => fail(err.errMsg ?? "TTS 连接失败"),
+    });
+    // #endif
+    // #ifndef H5 || WEB
+    socketTask = uni.connectSocket({
+      url: createTtsWebSocketUrl(accessToken),
+      header: createTtsWebSocketHeaders(accessToken),
+      fail: (err) => fail(err.errMsg ?? "TTS 连接失败"),
+    });
+    // #endif
+
+    const sock = socketTask;
+    if (sock == null) {
+      fail("TTS 连接失败");
+      return;
+    }
+
+    sock!.onOpen(() => {
+      sendJson({
+        type: "start",
+        sample_rate: sampleRate,
+        frame_duration_ms: 20,
+      } as UTSJSONObject);
+    });
+    sock!.onMessage((res: OnSocketMessageCallbackResult) => {
+      if (typeof res.data != "string") {
+        pendingBinary += 1;
+        toArrayBufferAsync(res.data).then((buffer: ArrayBuffer | null): void => {
+          pendingBinary -= 1;
+          if (buffer != null && buffer!.byteLength > 0) {
+            chunks.push(new Uint8Array(buffer!));
+          }
+          tryFinish();
+        });
+        return;
+      }
+      let message: UTSJSONObject | null = null;
+      try {
+        message = JSON.parse<UTSJSONObject>(res.data as string);
+      } catch (_eJson) {
+        fail("TTS 返回了无效消息");
+        return;
+      }
+      if (message == null) {
+        return;
+      }
+      const typeVal = message!["type"];
+      const type = typeVal != null ? `${typeVal}` : "";
+      if (type == "tts_ready") {
+        sendJson({
+          type: "text",
+          text: trimmed,
+          flush: true,
+        } as UTSJSONObject);
+      } else if (type == "tts_end") {
+        finishRequested = true;
+        tryFinish();
+      } else if (type == "error") {
+        const messageVal = message!["message"];
+        fail(messageVal != null ? `${messageVal}` : "TTS 合成失败");
+      }
+    });
+    sock!.onError((err) => {
+      fail(err.errMsg ?? "TTS WebSocket 错误");
+    });
+    sock!.onClose(() => {
+      if (!settled) {
+        finishRequested = true;
+        tryFinish();
+      }
+    });
+  });
+}
+
 export const ttsWebSocketPlayer = new TtsWebSocketPlayer();

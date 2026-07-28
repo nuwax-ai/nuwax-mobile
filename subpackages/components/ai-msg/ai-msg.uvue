@@ -52,29 +52,14 @@
         </view>
       </view>
 
-      <!-- AI 答复内容（uni-cmark → UniAiMarkdownElItem[] → uni-ai-x-msg） -->
+      <!-- AI 答复内容：流式也走 UniAiXMsgRender；解析节流避免每 SSE 字卡死 -->
       <view class="answer-container">
-        <!-- App 流式中用纯文本打字机，避免每 chunk 重解析 Markdown 卡死主线程 -->
-        <!-- #ifdef APP -->
-        <text
-          v-if="showStreamingPlainText"
-          class="answer-fallback"
-        >{{ streamingPlainBody }}</text>
-        <UniAiXMsgRender
-          v-else-if="renderMarkdownElList.length > 0"
-          :markdown-el-list="renderMarkdownElList"
-          :processing-list="renderProcessingList"
-          :conversation-id="msg.chat_id"
-        />
-        <!-- #endif -->
-        <!-- #ifndef APP -->
         <UniAiXMsgRender
           v-if="renderMarkdownElList.length > 0"
           :markdown-el-list="renderMarkdownElList"
           :processing-list="renderProcessingList"
           :conversation-id="msg.chat_id"
         />
-        <!-- #endif -->
       </view>
     </template>
     <!-- APP：CSS animation 对 image 无效，用 lime-loading 原生旋转 -->
@@ -127,6 +112,7 @@
     stripAgentInfoTags,
     stripAdaptedAgentInfoHtml,
   } from "@/subpackages/components/ai-msg/agentInfoTag.uts";
+  import { onUnmounted } from "vue";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -349,24 +335,20 @@
   });
 
   /**
-   * App：会话进行中的最后一条助手消息走纯文本通道。
-   * 完整 Markdown（代码高亮/公式等）放到会话结束后再解析，避免 SSE 每帧卡顿。
+   * 流式也直接用 UniAiXMsgRender。
+   * 为避免每个 SSE 字符全量解析卡死主线程，会话进行中对 Markdown 解析做节流。
    */
-  const streamingPlainBody = computed((): string => resolveBodyText());
-  const showStreamingPlainText = computed((): boolean => {
-    let usePlainDuringStream = false;
-    // #ifdef APP
-    usePlainDuringStream = true;
-    // #endif
-    if (usePlainDuringStream == false) {
-      return false;
+  const STREAM_MD_PARSE_INTERVAL_MS: number = 200;
+  let streamMdParseTimer: number = 0;
+  let streamMdParsePending: boolean = false;
+
+  function clearStreamMdParseTimer(): void {
+    if (streamMdParseTimer != 0) {
+      clearTimeout(streamMdParseTimer);
+      streamMdParseTimer = 0;
     }
-    return (
-      isConversationActive.value == true &&
-      isLastMsg.value == true &&
-      streamingPlainBody.value.trim().length > 0
-    );
-  });
+    streamMdParsePending = false;
+  }
 
   // 思考内容是否隐藏（默认隐藏）
   const hideThinkContent = ref<boolean>(true);
@@ -413,7 +395,7 @@
       return false;
     }
     // 流式输出 / loading 中不显示复制、语音播报
-    if (showLoadingIcon.value == true || showStreamingPlainText.value == true) {
+    if (showLoadingIcon.value == true) {
       return false;
     }
     if (isLastMsg.value == true && isConversationActive.value == true) {
@@ -438,6 +420,39 @@
     (): boolean => isConversationActive.value,
     (): boolean => isLastMsg.value,
   );
+
+  function runBodyMarkdownParseNow(forceDone: boolean): void {
+    clearStreamMdParseTimer();
+    markdownParser.runMarkdownParse(forceDone);
+    streamRevision.value = streamRevision.value + 1;
+  }
+
+  /** 流式：合并高频 chunk 后再解析；非流式：立即解析；首帧无结果时立即解析（无纯文本兜底） */
+  function scheduleBodyMarkdownParse(): void {
+    const streaming =
+      isConversationActive.value == true && isLastMsg.value == true;
+    if (streaming == false) {
+      runBodyMarkdownParseNow(true);
+      return;
+    }
+    if (markdownParser.resolveRenderList().length == 0) {
+      runBodyMarkdownParseNow(false);
+      return;
+    }
+    streamMdParsePending = true;
+    if (streamMdParseTimer != 0) {
+      return;
+    }
+    streamMdParseTimer = setTimeout(() => {
+      streamMdParseTimer = 0;
+      if (streamMdParsePending == false) {
+        return;
+      }
+      streamMdParsePending = false;
+      markdownParser.runMarkdownParse(false);
+      streamRevision.value = streamRevision.value + 1;
+    }, STREAM_MD_PARSE_INTERVAL_MS);
+  }
 
   const renderMarkdownElList = computed((): UniAiMarkdownElItem[] => {
     const _rev = streamRevision.value;
@@ -476,12 +491,8 @@
     try {
       if (newData != null) {
         applyMsgPatch(msg.value, newData);
-        // #ifdef APP
-        if (isConversationActive.value == true && isLastMsg.value == true) {
-          return;
-        }
-        // #endif
-        markdownParser.runMarkdownParse(false);
+        streamRevision.value = streamRevision.value + 1;
+        scheduleBodyMarkdownParse();
       }
     } catch (error) {
       console.error("updateMessage 执行失败:", error);
@@ -527,6 +538,9 @@
       : [] as any[],
     (list: any[]) => {
       msg.value.processingList = list;
+      streamRevision.value = streamRevision.value + 1;
+      // PROCESSING 状态变化也需驱动组件重绘（节流解析会带上容器节点）
+      scheduleBodyMarkdownParse();
     },
     { immediate: true },
   );
@@ -574,6 +588,7 @@
     (): string => (props.bodyText != null ? `${props.bodyText}` : ""),
     (v: string) => {
       msg.value.body = v;
+      streamRevision.value = streamRevision.value + 1;
     },
     { immediate: true },
   );
@@ -598,11 +613,9 @@
       thinkMsg.value.body = v;
       thinkMsg.value.markdownElList = [] as UniAiMarkdownElItem[];
       if (!hideThinkContent.value && v.length > 0) {
-        // #ifdef APP
         if (isConversationActive.value == true && isLastMsg.value == true) {
           return;
         }
-        // #endif
         thinkMarkdownParser.runMarkdownParse(true);
       }
     },
@@ -631,16 +644,19 @@
       "|" +
       `${msg.value.state}`,
     () => {
-      // #ifdef APP
-      // 流式进行中跳过重解析：否则 md2json/高亮会堵死主线程，表现为 loading 停转、无打字机、结束突然出全文。
-      if (isConversationActive.value == true && isLastMsg.value == true) {
+      // 会话从进行中结束：立刻冲刷一次终态解析（含 PROCESSING 容器）
+      if (isConversationActive.value != true || isLastMsg.value != true) {
+        runBodyMarkdownParseNow(true);
         return;
       }
-      // #endif
-      markdownParser.runMarkdownParse(false);
+      scheduleBodyMarkdownParse();
     },
     { immediate: true },
   );
+
+  onUnmounted(() => {
+    clearStreamMdParseTimer();
+  });
 
   defineExpose({
     updateMessage,

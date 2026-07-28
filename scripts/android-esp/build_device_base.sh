@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# 阶段 D：组装 Debug APK → android_debug.apk → unpackage/debug/，并可选安装真机
+# 阶段 D：组装 APK → unpackage/debug/，并可选安装真机
+#
+# ANDROID_BUILD_TYPE=debug（默认）→ android_debug.apk（HX 自定义基座联调）
+# ANDROID_BUILD_TYPE=release      → android_release.apk（接近发行性能，内测用 debug 签名）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,6 +14,21 @@ ANDROID_ESP_WORK="${ANDROID_ESP_WORK}"
 PROJ="${ANDROID_ESP_PROJECT:-$ANDROID_ESP_WORK/project}"
 OUT_DIR="${ANDROID_CUSTOM_BASE_OUT:-$WT_ROOT/out/android-custom-base}"
 BUNDLE="${ANDROID_BUNDLE_ID:-com.nuwax.nuwa}"
+
+BUILD_TYPE="$(echo "${ANDROID_BUILD_TYPE:-debug}" | tr '[:upper:]' '[:lower:]')"
+case "$BUILD_TYPE" in
+  debug|release) ;;
+  *)
+    echo "✗ ANDROID_BUILD_TYPE 仅支持 debug|release，当前=$BUILD_TYPE" >&2
+    exit 1
+    ;;
+esac
+if [[ "$BUILD_TYPE" == "release" ]]; then
+  GRADLE_TASK=":app:assembleRelease"
+else
+  GRADLE_TASK=":app:assembleDebug"
+fi
+OUT_NAME="android_${BUILD_TYPE}"
 
 export APP_RESOURCES_DIR="${APP_RESOURCES_DIR:-$WT_ROOT/unpackage/resources/app-android}"
 
@@ -25,7 +43,7 @@ echo "==== 1) sync + inject + configure ===="
 "$SCRIPT_DIR/sync_local_pack_resources.sh"
 python3 "$SCRIPT_DIR/configure_app.py"
 
-echo "==== 2) gradlew :app:assembleDebug ===="
+echo "==== 2) gradlew ${GRADLE_TASK} (BUILD_TYPE=${BUILD_TYPE}) ===="
 cd "$PROJ"
 chmod +x ./gradlew
 if [[ -z "${JAVA_HOME:-}" ]]; then
@@ -38,28 +56,30 @@ if [[ -z "${ANDROID_HOME:-}" ]]; then
 fi
 echo "JAVA_HOME=$JAVA_HOME"
 echo "ANDROID_HOME=$ANDROID_HOME"
-./gradlew :app:assembleDebug --stacktrace
+./gradlew "$GRADLE_TASK" --stacktrace
 
-APK="$PROJ/app/build/outputs/apk/debug/app-debug.apk"
+APK="$PROJ/app/build/outputs/apk/${BUILD_TYPE}/app-${BUILD_TYPE}.apk"
 if [[ ! -f "$APK" ]]; then
-  # 兼容可能的命名
+  APK="$(find "$PROJ/app/build/outputs/apk/${BUILD_TYPE}" -name '*.apk' 2>/dev/null | head -1 || true)"
+fi
+if [[ -z "${APK:-}" || ! -f "$APK" ]]; then
   APK="$(find "$PROJ/app/build/outputs/apk" -name '*.apk' | head -1 || true)"
 fi
 if [[ -z "${APK:-}" || ! -f "$APK" ]]; then
-  echo "✗ 未找到 debug apk" >&2
+  echo "✗ 未找到 ${BUILD_TYPE} apk" >&2
   exit 1
 fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-DEST="$OUT_DIR/android_debug-$STAMP.apk"
+DEST="$OUT_DIR/${OUT_NAME}-$STAMP.apk"
 cp -f "$APK" "$DEST"
-ln -sfn "$(basename "$DEST")" "$OUT_DIR/android_debug-latest.apk"
+ln -sfn "$(basename "$DEST")" "$OUT_DIR/${OUT_NAME}-latest.apk"
 
-# 官方方案1：android_debug.apk → unpackage/debug/
+# 官方方案1：产物落到 unpackage/debug/
 for DBG in "$WT_ROOT/unpackage/debug" "$MAIN_ROOT/unpackage/debug"; do
   mkdir -p "$DBG"
-  cp -f "$DEST" "$DBG/android_debug.apk"
-  echo "✓ 已写入 $DBG/android_debug.apk"
+  cp -f "$DEST" "$DBG/${OUT_NAME}.apk"
+  echo "✓ 已写入 $DBG/${OUT_NAME}.apk"
 done
 
 echo "==== 3) 可选安装真机 ===="
@@ -91,5 +111,8 @@ fi
 echo ""
 echo "==== 完成 ===="
 echo "产物: $DEST"
-echo "HX 方案1: unpackage/debug/android_debug.apk → 使用自定义基座运行"
+echo "交付: unpackage/debug/${OUT_NAME}.apk"
+if [[ "$BUILD_TYPE" == "debug" ]]; then
+  echo "HX 方案1: unpackage/debug/android_debug.apk → 使用自定义基座运行"
+fi
 echo "AS 打开: open -a 'Android Studio' \"$PROJ\""

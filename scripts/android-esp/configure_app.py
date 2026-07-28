@@ -143,6 +143,43 @@ def strip_project_deps(gradle_path: Path) -> None:
     print(f"✓ 精简依赖: {gradle_path.relative_to(PROJ)}")
 
 
+def ensure_release_uses_debug_signing(text: str) -> tuple[str, bool]:
+    """
+    内测 Release 包：debuggable=false、无 HX debug-server，但用 debug keystore 签名，
+    以便 assembleRelease 无需正式证书即可安装。上架请另配正式 signingConfig。
+    """
+    changed = False
+    # 已配置则跳过，避免重复插入
+    if re.search(
+        r"buildTypes\s*\{[^}]*release\s*\{[^}]*signingConfig\s+signingConfigs\.debug",
+        text,
+        flags=re.DOTALL,
+    ):
+        return text, False
+
+    def _inject_signing(m: re.Match[str]) -> str:
+        nonlocal changed
+        block = m.group(0)
+        if "signingConfig" in block:
+            return block
+        changed = True
+        # 插在 release { 后第一行，保持原缩进风格
+        return re.sub(
+            r"(release\s*\{\s*\n)",
+            r"\1            signingConfig signingConfigs.debug\n",
+            block,
+            count=1,
+        )
+
+    text2 = re.sub(
+        r"release\s*\{[^{}]*\}",
+        _inject_signing,
+        text,
+        count=1,
+    )
+    return text2, changed
+
+
 def configure_app_gradle() -> None:
     p = PROJ / "app" / "build.gradle"
     text = p.read_text()
@@ -159,11 +196,14 @@ def configure_app_gradle() -> None:
     # compileSdk / targetSdk：对齐本机已安装 platform
     text = re.sub(r"compileSdk\s+\d+", f"compileSdk {COMPILE_SDK}", text, count=1)
     text = re.sub(r"targetSdk\s+\d+", f"targetSdk {TARGET_SDK}", text, count=1)
+    text, signed = ensure_release_uses_debug_signing(text)
     p.write_text(text)
     print(
         f"✓ app applicationId/namespace={BUNDLE} "
         f"minSdk=26 compileSdk={COMPILE_SDK} targetSdk={TARGET_SDK}"
     )
+    if signed:
+        print("✓ release 使用 signingConfigs.debug（内测 assembleRelease 可装）")
 
 
 def configure_manifest() -> None:

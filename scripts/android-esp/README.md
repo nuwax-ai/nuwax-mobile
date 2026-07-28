@@ -15,7 +15,7 @@
 | `inject_esp_module.sh` | B | 兼容入口 → `inject_all_uts_modules.py` |
 | `sync_local_pack_resources.sh` | B | 同步 HX www + **整目录替换** kt + 注入插件 |
 | `setup_as.sh` | C | 打开 Android Studio / 打印联调路径 |
-| `build_device_base.sh` | D | `assembleDebug` → `unpackage/debug/android_debug.apk` |
+| `build_device_base.sh` | D | `assembleDebug`/`assembleRelease` → `android_debug.apk` / `android_release.apk` |
 
 ## 一键构建
 
@@ -26,13 +26,30 @@ source scripts/local-base-env.sh
 make base-android
 ```
 
+### 发给测试同学（推荐 · 流程化）
+
+```bash
+make android-tester
+# 或：pnpm android:tester
+# 跳过资源导出：SKIP_APP_RESOURCE=1 make android-tester
+```
+
+流水线脚本：[`build_tester_release_apk.sh`](./build_tester_release_apk.sh)  
+步骤：环境预检 → appResource → Release 出包（`ENABLE_HX_DEBUG=0`）→ 复制 `nuwa-zhuoda-release-YYYYMMDD.apk` → 验收摘要。
+
 ## 环境变量
 
 优先使用 `scripts/local-base-env.sh`（`NUWAX_SDK_ROOT` / `NUWAX_LOCAL_BASE_ROOT` / `NUWAX_HX_VERSION`）。  
 仍可用旧名覆盖：`UNIAPPX_ANDROID_SDK_ROOT`、`ANDROID_ESP_WORK`、`ANDROID_BUNDLE_ID`、`DCLOUD_APPKEY`。
 
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `ANDROID_BUILD_TYPE` | `debug` | `debug` 联调基座；`release` 接近发行性能（内测 debug 签名） |
+| `ENABLE_HX_DEBUG` | `1` | `0` 去掉 debug-server / DCLOUD_DEBUG |
+
 ## 注意
 
 - 官方 SDK zip 常缺 `gradle-wrapper.jar`，`ensure_env.sh` 会自动补齐。
 - 个推 / 广告 AAR 等非配网必需依赖会在 `configure_app.py` 中排除。
-- 产物：`unpackage/debug/android_debug.apk` → HX「使用自定义基座运行」。
+- Debug 产物：`unpackage/debug/android_debug.apk` → HX「使用自定义基座运行」。
+- Release 产物：`unpackage/debug/android_release.apk` → 发给测试安装（非上架证书）。

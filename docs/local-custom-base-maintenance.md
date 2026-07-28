@@ -76,6 +76,7 @@ make base-ship
 
 ```bash
 make base-android          # → unpackage/debug/android_debug.apk
+make android-tester        # → 发测试 Release：appResource + ENABLE_HX_DEBUG=0 + assembleRelease
 make base-ios-device        # → unpackage/debug/iOS_debug.ipa
 make base-ios-simulator    # → unpackage/debug/Pandora_simulator_debug.app
 make base-all              # 三份一起打（不装设备、不上 S3）
@@ -84,12 +85,13 @@ make base-all              # 三份一起打（不装设备、不上 S3）
 | 文件 | 用途 |
 |------|------|
 | `android_debug.apk` | Android 真机 / 模拟器（同一包；默认含 HX `debug-server`，见 `ENABLE_HX_DEBUG`） |
+| `android_release.apk` | 给测试的接近发行包：`ENABLE_HX_DEBUG=0 ANDROID_BUILD_TYPE=release make base-android`（内测 debug 签名，非上架） |
 | `iOS_debug.ipa` | **iOS 真机** HX 自定义基座 |
 | `Pandora_simulator_debug.app` | **iOS 模拟器**（官方命名；**Release + 默认 x86_64/Rosetta**，对齐 ExtAPI 仅有的 x86_64-sim；与真机包勿混用） |
 
 一键出包（不含资源/S3）：`./scripts/package-custom-bases.sh`（`TARGETS=android,ios-device,ios-simulator`）。
 
-Android 调试基座：`configure_app.py` 默认 `ENABLE_HX_DEBUG=1`（`app/libs/debug-server` + `DCLOUD_DEBUG`），否则 HX 控制台无 `console.log`。正式向包用 `ENABLE_HX_DEBUG=0`。
+Android 调试基座：`configure_app.py` 默认 `ENABLE_HX_DEBUG=1`（`app/libs/debug-server` + `DCLOUD_DEBUG`），否则 HX 控制台无 `console.log`。正式向 / 发测试包用 `ENABLE_HX_DEBUG=0`，并建议 `ANDROID_BUILD_TYPE=release`（`assembleRelease`，debuggable=false）。
 
 iOS 模拟器注意：官方 5.15 `DCloudUTSExtAPI` 无 arm64-simulator slice。Apple Silicon 上若出现「UTS-Storage / uni-getSystemInfo 模块不存在」，请用脚本默认的 `SIM_FORCE_X86_64=1` 重打，并安装/选用 **支持 Rosetta** 的 iOS Simulator runtime（见 DCloud 模拟器文档）。
 

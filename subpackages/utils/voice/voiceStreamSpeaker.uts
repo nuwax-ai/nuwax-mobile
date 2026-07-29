@@ -188,6 +188,12 @@ export class VoiceStreamSpeaker {
       } catch (e: any) {
         console.warn("[VoiceStreamSpeaker] process chunk failed", e);
       }
+      // 让出主线程：SSE 洪峰时否则 TTS WS / 音频回调要等会话结束后才被调度
+      await new Promise<void>((resolve) => {
+        setTimeout(() => {
+          resolve();
+        }, 0);
+      });
     }
     this.processing = false;
   }
@@ -414,10 +420,8 @@ export class VoiceStreamSpeaker {
         }
       }
 
-      // 开播前尽量再预合成 1～2 句（此时 WS 空闲，无需 preserve），消除「第一句播完空等」
-      if (ready.length < MAX_READY_BUFFER && this.pendingSentences.length > 0) {
-        await fillReadyBuffer(false);
-      }
+      // 首条就绪立刻开播：禁止再等预填 2～3 句（否则首声晚数秒，长 SSE 更像「结束后才播」）
+      // 预取放到播放期间串行做
 
       // 首条就绪后再允许入队回调预取（与当前播放串行占同一条 WS）
       if (this.onPendingEnqueued == null) {
@@ -511,7 +515,7 @@ export class VoiceStreamSpeaker {
 
   /**
    * 单通道增量处理：全文 → 流式可朗读快照 → 相对上次的增量 → 分句。
-   * 仅在 source 未变时复用清洗结果；source 变化一律全量清洗。
+   * source 前缀增长时只清洗增量，避免 SSE 每帧 O(n²) 全量 clean 堵死 Android 主线程。
    * 终态 flush 也走 speakableRawForStreaming（与流式同一套），避免对整篇工具 HTML
    * 再跑一遍 clean（Android 上可达数秒，表现为「会话已结束很久才开始播报」）。
    */
@@ -528,6 +532,17 @@ export class VoiceStreamSpeaker {
     if (source == ch.lastSource && ch.lastSource.length > 0) {
       // agent-info 未闭合等场景：可朗读快照不变，跳过昂贵正则
       speakable = ch.lastSpeakable;
+    } else if (
+      ch.lastSource.length > 0 &&
+      source.length > ch.lastSource.length &&
+      source.indexOf(ch.lastSource) == 0
+    ) {
+      // 前缀增长：只清洗新增段并拼接
+      const rawDelta = source.substring(ch.lastSource.length);
+      const cleanedDelta = cleanTextForSpeech(rawDelta, this.settings, false);
+      speakable = ch.lastSpeakable + cleanedDelta;
+      ch.lastSource = source;
+      ch.lastSpeakable = speakable;
     } else {
       speakable = cleanTextForSpeech(source, this.settings, true);
       ch.lastSource = source;
@@ -542,9 +557,9 @@ export class VoiceStreamSpeaker {
     if (speakable.length > ch.consumedSpeakable) {
       const delta = speakable.substring(ch.consumedSpeakable);
       ch.consumedSpeakable = speakable.length;
+      // 增量已是 speakable 子串，禁止再插空格（中文会被拆成「床 前 明 月」）
       if (delta.length > 0) {
-        ch.pending =
-          ch.pending.length > 0 ? ch.pending + " " + delta : delta;
+        ch.pending = ch.pending + delta;
       }
     }
     const drain = drainCompleteSentences(ch.pending, flush);

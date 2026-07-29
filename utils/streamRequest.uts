@@ -177,6 +177,8 @@ export class StreamRequest {
   private abortController: any | null = null;
   private buffer: string = ""; // 用于缓存不完整的 SSE 消息（以 \n\n 为完整标记）
   private pendingBytes: Uint8Array = new Uint8Array(0); // 用于缓存不完整的 UTF-8 字节序列
+  /** 是否已收到 completed / [DONE] 终态标记（用于判断 HTTP complete 是否过早） */
+  private receivedTerminalMarker: boolean = false;
 
   // 流式空闲超时监控（无数据到达则断开）
   private lastChunkReceivedTime: number = 0;
@@ -204,6 +206,7 @@ export class StreamRequest {
     this.isAborted = false;
     this.buffer = ""; // 重置缓冲区
     this.pendingBytes = new Uint8Array(0); // 重置字节缓冲区
+    this.receivedTerminalMarker = false;
     this.resetSseDispatchQueue();
 
     // #ifdef H5
@@ -278,6 +281,8 @@ export class StreamRequest {
             // 检查是否完成
             if (isCompletedPayload(data)) {
               console.log("[SSE] 收到完成标记 completed");
+              // 与 App 对齐：标记终态，避免随后 onClose 误触发 onTimeout
+              this.receivedTerminalMarker = true;
 
               // 清除超时监控
               console.log(
@@ -319,7 +324,11 @@ export class StreamRequest {
         },
         onClose: () => {
           console.log("SSE连接已关闭");
-          // 调用超时回调-关闭loading状态以及恢复停止按钮
+          // 正常 completed 后 EventSource 也会 onClose；勿再当超时/异常断流
+          if (this.isAborted == true || this.receivedTerminalMarker == true) {
+            return;
+          }
+          // 无终态的异常关闭：恢复停止按钮 / 触发回补
           config.onTimeout?.();
         },
       });
@@ -399,6 +408,21 @@ export class StreamRequest {
     }, this.SSE_DISPATCH_INTERVAL_MS);
   }
 
+  /**
+   * 将 decodeUTF8 残留的不完整 UTF-8 字节强制刷入文本 buffer（流结束时调用）。
+   */
+  private flushPendingUtf8Bytes(): void {
+    if (this.pendingBytes.length == 0) {
+      return;
+    }
+    const leftover = this.pendingBytes;
+    this.pendingBytes = new Uint8Array(0);
+    const text = utf8ArrayToString(leftover);
+    if (text.length > 0) {
+      this.buffer += text;
+    }
+  }
+
   private appendAndProcessSSEText(
     text: string,
     config: StreamRequestConfig,
@@ -452,6 +476,7 @@ export class StreamRequest {
     // 检查是否完成
     if (content === "[DONE]") {
       console.log("[SSE] 收到完成标记 [DONE]");
+      this.receivedTerminalMarker = true;
 
       // 清除超时监控
       console.log(
@@ -475,6 +500,7 @@ export class StreamRequest {
         const data = JSON.parse(content) as UTSJSONObject;
         if (isCompletedPayload(data)) {
           console.log("[SSE] 收到完成标记 completed");
+          this.receivedTerminalMarker = true;
 
           // 清除超时监控
           console.log(
@@ -836,7 +862,7 @@ export class StreamRequest {
         success: (res) => {
           console.log(
             "[SSE-APP] success 回调，statusCode:",
-            res.statusCode,
+            res.statusCode, res, this.isAborted
           );
           if (this.isAborted) {
             return;
@@ -850,11 +876,33 @@ export class StreamRequest {
           this.updateLastChunkTime();
           config.onOpen?.(res);
 
-          // 兜底：未收到 onChunkReceived 时，尝试处理 success 中的完整响应体
+          // iOS：工具调用后 MESSAGE/completed 可能只出现在 success.data，
+          // 即使前面已通过 onChunkReceived 收到过 PROCESSING，也要继续解析 residual。
+          // UTS：res.data 为 ArrayBuffer?，不可直接作为 any 入参（error17）
           const responseData = res.data;
-          if (!hasReceivedChunk && responseData != null) {
-            const fallbackBuffer = extractChunkArrayBuffer(responseData);
-            handleChunkBuffer(fallbackBuffer);
+          let residualText = "";
+          if (responseData != null) {
+            const byteLength = responseData.byteLength;
+            if (byteLength != null && byteLength > 0) {
+              console.log(
+                "[SSE-APP] success residual ArrayBuffer bytes=",
+                byteLength,
+              );
+              residualText = utf8ArrayToString(new Uint8Array(responseData));
+            }
+          }
+          if (residualText.length > 0 && this.receivedTerminalMarker != true) {
+            console.log(
+              "[SSE-APP] process success residual len=",
+              residualText.length,
+              "hasReceivedChunk=",
+              hasReceivedChunk,
+            );
+            hasReceivedChunk = true;
+            this.appendAndProcessSSEText(residualText, config, finishStream, true);
+          } else if (hasReceivedChunk != true && responseData != null) {
+            // 兼容旧兜底：整包作为 chunk 再走一遍解码/分帧
+            handleChunkBuffer(responseData);
           }
         },
         fail: (err) => {
@@ -878,12 +926,48 @@ export class StreamRequest {
         },
         complete: () => {
           console.log("[SSE-APP] complete 回调");
-          if (!isStreamFinished && !this.isAborted) {
-            config.onComplete?.();
-            finishStream();
-          } else {
+          if (isStreamFinished || this.isAborted) {
             this.releaseRequestTask(false);
+            return;
           }
+          // iOS enableChunked：complete 可能早于分发队列排空，也可能是真结束但 completed 卡在 buffer（缺尾部 \n\n）。
+          // 流程：冲刷 UTF-8 残留 → 等队列空 → 冲刷 buffer → 再等队列空。
+          // 与 H5 对齐：仅当已有 SSE 终态（completed/[DONE]）才算成功；否则走 onTimeout，不当 onComplete。
+          this.flushPendingUtf8Bytes();
+          this.waitForSseDispatchIdle(() => {
+            if (isStreamFinished || this.isAborted) {
+              this.releaseRequestTask(false);
+              return;
+            }
+            if (this.buffer.trim().length > 0) {
+              console.log(
+                "[SSE-APP] flush SSE buffer len=",
+                this.buffer.length,
+              );
+              // 补一个分隔符，强制解析残留帧（常见含 completed）
+              this.appendAndProcessSSEText("\n\n", config, finishStream, true);
+            }
+            this.waitForSseDispatchIdle(() => {
+              if (isStreamFinished || this.isAborted) {
+                this.releaseRequestTask(false);
+                return;
+              }
+              if (this.receivedTerminalMarker == true) {
+                // 终态帧可能刚被 flush 出来，但 processSSEMessage 已调过 onComplete；此处只收尾
+                console.log(
+                  "[SSE-APP] HTTP complete after SSE terminal → finish",
+                );
+                finishStream();
+                return;
+              }
+              console.warn(
+                "[SSE-APP] HTTP complete without SSE terminal → onTimeout (align H5 onClose)",
+              );
+              this.clearTimeoutMonitor();
+              config.onTimeout?.();
+              finishStream();
+            });
+          });
         },
       });
 
@@ -897,9 +981,7 @@ export class StreamRequest {
         this.updateLastChunkTime();
         const chunkBuffer = extractChunkArrayBuffer(result);
         if (chunkBuffer == null) {
-          console.warn(
-            "[SSE-APP] onChunkReceived 无法解析 ArrayBuffer，已刷新空闲计时",
-          );
+          console.warn("[SSE-APP] onChunkReceived 无法解析 ArrayBuffer，已刷新空闲计时", result);
           return;
         }
         handleChunkBuffer(chunkBuffer);

@@ -281,6 +281,12 @@
         "
         :childs="n.children"
         :processing-list="processingList"
+        :auto-collapse="
+          n.attrs &&
+          (n.attrs['auto-collapse'] ||
+            n.attrs.autoCollapse ||
+            n.attrs.autocollapse)
+        "
       >
         <node
           :childs="n.children"

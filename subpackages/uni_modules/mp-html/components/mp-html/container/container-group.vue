@@ -16,7 +16,7 @@
         ></text>
       </view>
     </view>
-    <view v-if="isExpanded" class="group-content">
+    <view class="group-content" :class="{ 'is-expanded': isExpanded }">
       <slot />
     </view>
   </view>
@@ -38,10 +38,15 @@
         type: Array,
         default: () => [],
       },
+      // 流式正文开始输出时由 Markdown 分组层传入，表示当前工具调用组已完成。
+      autoCollapse: {
+        type: [Boolean, String],
+        default: false,
+      },
     },
     data() {
       return {
-        isExpanded: false,
+        isExpanded: true,
       };
     },
     computed: {
@@ -49,9 +54,9 @@
         // 与 markdown-container 渲染一致：先按 executeId 从 processingList 取最终数据，
         // 再排除 container.vue 中不会展示的 Event 类型，避免标题数量和展开项不一致。
         return (this.childs || []).filter((n) => {
-          if (
-            !(n.name === "container" || n.name === "markdown-custom-process")
-          ) {
+          if (!(
+            n.name === "container" || n.name === "markdown-custom-process"
+          )) {
             return false;
           }
           const data = this.getRenderData(n);
@@ -93,6 +98,16 @@
       },
       toggleExpanded() {
         this.isExpanded = !this.isExpanded;
+      },
+    },
+    watch: {
+      autoCollapse: {
+        immediate: true,
+        handler(value) {
+          if (`${value}`.toLowerCase() === "true") {
+            this.isExpanded = false;
+          }
+        },
       },
     },
   };
@@ -149,11 +164,24 @@
     }
 
     .group-content {
-      padding: 12rpx 24rpx;
-      border-top: 1rpx solid rgba(0, 0, 0, 0.05);
-      max-height: 500rpx;
+      max-height: 0;
+      padding: 0 24rpx;
+      border-top: 0 solid rgba(0, 0, 0, 0.05);
+      opacity: 0;
       overflow-y: auto;
       -webkit-overflow-scrolling: touch;
+      transition:
+        max-height 0.3s ease,
+        padding 0.3s ease,
+        opacity 0.2s ease,
+        border-top-width 0.3s ease;
+
+      &.is-expanded {
+        max-height: 500rpx;
+        padding: 12rpx 24rpx;
+        border-top-width: 1rpx;
+        opacity: 1;
+      }
     }
   }
 </style>

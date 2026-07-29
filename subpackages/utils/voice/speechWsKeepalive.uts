@@ -1,7 +1,9 @@
 /**
  * Speech WebSocket 应用层心跳保活。
- * 连接 open 后定时发送 {"type":"ping"}，避免空闲被网关/服务端断开。
- * 预热待命与业务会话共用；关连时必须 stop。
+ * 连接 open 后定时发送 {"type":"ping"}，避免空闲被网关断开。
+ *
+ * 注意：即使服务端回 UNKNOWN_TYPE，往返流量仍能保活 TCP/网关；
+ * 因此不得因业务层拒识而停心跳（停了反而会被空闲超时踢掉）。
  */
 
 /** 心跳间隔（ms）；需小于常见网关空闲超时（常 30～60s） */
@@ -18,8 +20,8 @@ export class SpeechWsKeepalive {
   private sendFn: SpeechWsKeepaliveSendFn | null = null;
   private label: string = "";
   private onTick: (() => void) | null = null;
-  /** 服务端若不支持 ping（UNKNOWN_TYPE），停心跳但不断开业务连接 */
-  private disabledByServer: boolean = false;
+  /** 仅用于降噪：服务端拒识 ping 时只打一次日志，心跳继续发 */
+  private loggedServerReject: boolean = false;
 
   /**
    * 启动或重启心跳。
@@ -36,10 +38,6 @@ export class SpeechWsKeepalive {
     this.label = label;
     this.sendFn = sendFn;
     this.onTick = onTick;
-    if (this.disabledByServer == true) {
-      console.log("[" + label + "] keepalive skipped (server rejected ping)");
-      return;
-    }
     console.log("[" + label + "] keepalive start intervalMs=", SPEECH_WS_KEEPALIVE_INTERVAL_MS);
     this.timerId = setInterval((): void => {
       this.tick();
@@ -53,7 +51,7 @@ export class SpeechWsKeepalive {
   ): void {
     this.sendFn = sendFn;
     this.onTick = onTick;
-    if (this.timerId == 0 && sendFn != null && this.disabledByServer != true) {
+    if (this.timerId == 0 && sendFn != null) {
       this.start(this.label.length > 0 ? this.label : "SpeechWS", sendFn, onTick);
     }
   }
@@ -65,20 +63,26 @@ export class SpeechWsKeepalive {
   }
 
   /**
-   * 服务端明确不支持 ping 时调用：停止心跳，保留连接。
-   * 之后同实例 start 也会跳过，直到 resetServerReject。
+   * 服务端回 UNKNOWN_TYPE(ping)：只记日志，不停心跳。
+   * 应用层拒识不影响网关侧「有流量=保活」。
    */
   markRejectedByServer(): void {
-    this.disabledByServer = true;
-    this.stopTimerOnly();
+    if (this.loggedServerReject == true) {
+      return;
+    }
+    this.loggedServerReject = true;
     if (this.label.length > 0) {
-      console.warn("[" + this.label + "] keepalive disabled: server UNKNOWN_TYPE ping");
+      console.warn(
+        "[" +
+          this.label +
+          "] server UNKNOWN_TYPE ping (keepalive continues for gateway)",
+      );
     }
   }
 
-  /** 离开页面 / 完整 teardown 时清除「服务端拒绝」标记，便于下次进页重试 */
+  /** 离开页面 / 完整 teardown 时重置日志标记，便于下次进页重试提示 */
   resetServerReject(): void {
-    this.disabledByServer = false;
+    this.loggedServerReject = false;
   }
 
   isRunning(): boolean {
@@ -96,23 +100,31 @@ export class SpeechWsKeepalive {
   }
 
   private tick(): void {
-    if (this.disabledByServer == true) {
-      return;
-    }
     const sendFn = this.sendFn;
     if (sendFn == null) {
       return;
     }
-    const payload = new UTSJSONObject();
-    payload["type"] = "ping";
-    const ok = sendFn(JSON.stringify(payload));
-    if (ok != true) {
-      console.warn("[" + this.label + "] keepalive send failed");
+    try {
+      const payload = new UTSJSONObject();
+      payload["type"] = "ping";
+      const ok = sendFn(JSON.stringify(payload));
+      if (ok != true) {
+        console.warn("[" + this.label + "] keepalive send failed");
+        return;
+      }
+    } catch (_eSend) {
+      console.warn("[" + this.label + "] keepalive send threw");
       return;
     }
     const tickCb = this.onTick;
-    if (tickCb != null) {
+    if (tickCb == null) {
+      return;
+    }
+    try {
       tickCb();
+    } catch (_eTick) {
+      // onTick 不得打断心跳（iOS storage 等副作用异常）
+      console.warn("[" + this.label + "] keepalive onTick threw");
     }
   }
 }

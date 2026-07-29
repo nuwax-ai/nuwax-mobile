@@ -523,6 +523,13 @@ export class TtsWebSocketPlayer {
    */
   private playRequestId: number = 0;
   /**
+   * 边播边合成取消令牌：仅 bump 本字段，禁止动 generation / 当前音频。
+   * 流式分句在播 A 时预取合成 B。
+   */
+  private synthEpoch: number = 0;
+  /** 是否有 preservePlayingAudio 合成占用 session socket */
+  private synthInFlight: boolean = false;
+  /**
    * 单一消息出口：每个 SocketTask 只注册一次 onMessage，业务通过替换 sink 切换。
    * 避免 warm 空回调 + bindSession 二次 onMessage 在 H5 上叠层/后者被忽略。
    */
@@ -885,11 +892,44 @@ export class TtsWebSocketPlayer {
     });
   }
 
+  /** 当前合成/取连接操作是否已取消 */
+  private isSynthOpCancelled(
+    preservePlayingAudio: boolean,
+    expectedGeneration: number,
+    expectedSynthEpoch: number,
+  ): boolean {
+    if (preservePlayingAudio == true) {
+      return expectedSynthEpoch != this.synthEpoch;
+    }
+    return expectedGeneration != this.generation;
+  }
+
   /**
-   * 单句合成到可播放 src（不播报），复用预热连接。
-   * 合成结束后不关 TCP，收回预热池供下一句复用（流式播报不再每句 connectSocket）。
+   * 取消边播边合成（不打断当前音频播放）。
+   * kickPlay 失败 / 换轮次时调用。
    */
-  async synthesizeToSrc(text: string): Promise<string> {
+  cancelInFlightPreserveSynth(): void {
+    if (this.synthInFlight != true) {
+      return;
+    }
+    this.synthEpoch += 1;
+    this.synthInFlight = false;
+    this.clearSynthStallWatchdog();
+    this.finishRequested = false;
+    this.pendingBinary = 0;
+    this.chunks = [] as Uint8Array[];
+    this.recycleSessionToWarm();
+    console.log("[TTS] cancel preserve synth (keep audio)");
+  }
+
+  /**
+   * 只合成可播放 src，不播报（供 audioPlayerManager / 流式边播边合成）。
+   * @param preservePlayingAudio true：不 stop 当前音频、不 bump generation；供播 A 时预取 B
+   */
+  async synthesizeToSrc(
+    text: string,
+    preservePlayingAudio: boolean = false,
+  ): Promise<string> {
     const trimmed = text.trim();
     if (trimmed.length == 0) {
       return "";
@@ -899,21 +939,46 @@ export class TtsWebSocketPlayer {
       throw new Error("登录状态已失效");
     }
 
-    // 与工具栏播放互斥：只停播报会话，保留预热 TCP
-    this.stopSessionKeepWarm();
-    this.generation += 1;
-    const expectedGeneration = this.generation;
-    this.messageId = "";
-    this.text = trimmed;
-    this.chunks = [] as Uint8Array[];
-    this.pendingBinary = 0;
-    this.finishRequested = false;
-    this.realPlayback = false;
-    this.switchingToReal = false;
-    this.pausedByMute = false;
+    if (preservePlayingAudio == true) {
+      // 取消上一笔预取合成；保留正在播放的音频与 generation
+      this.synthEpoch += 1;
+      this.synthInFlight = true;
+      this.clearSynthStallWatchdog();
+      this.chunks = [] as Uint8Array[];
+      this.pendingBinary = 0;
+      this.finishRequested = false;
+      this.text = trimmed;
+      // 不改 messageId / realPlayback：当前句仍在播
+    } else {
+      // 与工具栏互斥：结束上一会话，但保留已解锁 InnerAudioContext（H5）
+      this.prepareForNextUtterance(true);
+      this.messageId = "";
+      this.text = trimmed;
+      this.chunks = [] as Uint8Array[];
+      this.pendingBinary = 0;
+      this.finishRequested = false;
+      this.realPlayback = false;
+      this.switchingToReal = false;
+      this.pausedByMute = false;
+    }
 
-    await this.takeOrOpenSessionSocket(accessToken, expectedGeneration);
-    if (expectedGeneration != this.generation) {
+    const expectedGeneration = this.generation;
+    const expectedSynthEpoch = this.synthEpoch;
+    const preserve = preservePlayingAudio == true;
+
+    await this.takeOrOpenSessionSocket(
+      accessToken,
+      expectedGeneration,
+      preserve,
+      expectedSynthEpoch,
+    );
+    if (
+      this.isSynthOpCancelled(preserve, expectedGeneration, expectedSynthEpoch)
+    ) {
+      if (preserve == true) {
+        this.synthInFlight = false;
+        this.recycleSessionToWarm();
+      }
       throw new Error("TTS 会话已取消");
     }
 
@@ -926,7 +991,10 @@ export class TtsWebSocketPlayer {
           return;
         }
         settled = true;
-        // 失败不断连：收回待命，心跳继续
+        if (preserve == true) {
+          this.synthInFlight = false;
+        }
+        // 失败不断连：收回待命，心跳继续；不碰当前播放音频
         this.recycleSessionToWarm();
         reject(new Error(message));
       };
@@ -935,10 +1003,19 @@ export class TtsWebSocketPlayer {
         if (!this.finishRequested || this.pendingBinary > 0 || settled) {
           return;
         }
-        if (expectedGeneration != this.generation) {
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
           return;
         }
         settled = true;
+        if (preserve == true) {
+          this.synthInFlight = false;
+        }
         if (this.chunks.length == 0) {
           this.recycleSessionToWarm();
           reject(new Error("TTS 未返回音频"));
@@ -975,7 +1052,13 @@ export class TtsWebSocketPlayer {
       }
       this.installSocketRouter(sock!);
       this.socketMessageSink = (res: OnSocketMessageCallbackResult): void => {
-        if (expectedGeneration != this.generation) {
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
           return;
         }
         if (typeof res.data != "string") {
@@ -985,7 +1068,13 @@ export class TtsWebSocketPlayer {
             if (this.pendingBinary < 0) {
               this.pendingBinary = 0;
             }
-            if (expectedGeneration != this.generation) {
+            if (
+              this.isSynthOpCancelled(
+                preserve,
+                expectedGeneration,
+                expectedSynthEpoch,
+              )
+            ) {
               tryFinishSrc();
               return;
             }
@@ -1034,13 +1123,26 @@ export class TtsWebSocketPlayer {
         }
       };
       sock!.onError((err: GeneralCallbackResult) => {
-        if (expectedGeneration != this.generation) {
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
           return;
         }
         fail(err.errMsg ?? "TTS WebSocket 错误");
       });
       sock!.onClose((_res: OnSocketCloseCallbackResult) => {
-        if (expectedGeneration != this.generation || settled) {
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          ) ||
+          settled
+        ) {
           return;
         }
         canRecycle = false;
@@ -1050,6 +1152,218 @@ export class TtsWebSocketPlayer {
 
       this.sendJson(buildTtsControlMessage("start", null, this.sampleRate));
     });
+  }
+
+  /**
+   * 播放已合成的 src，并等到结束（供流式边播边合成，避免串行 playAndWait 的合成空窗）。
+   * @returns true=正常播完；false=error/超时
+   */
+  async playSrcAndWait(messageId: string, src: string): Promise<boolean> {
+    if (src.trim().length == 0) {
+      return true;
+    }
+    audioPlayerManager.stop();
+    // 不 bump generation / 不 recycle：预取合成可能占用 socket
+    this.clearSynthStallWatchdog();
+    this.messageId = messageId;
+    this.finishRequested = false;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
+
+    if (this.audioContext == null) {
+      this.prepareAudioContextForGesture();
+    }
+    let audio = this.audioContext;
+    if (audio == null) {
+      audio = uni.createInnerAudioContext();
+      this.audioContext = audio;
+      // #ifdef APP-IOS
+      audio.obeyMuteSwitch = false;
+      // #endif
+    }
+
+    // #ifdef H5 || WEB
+    this.revokeBlobUrl();
+    if (src.indexOf("blob:") == 0) {
+      this.blobUrl = src;
+    }
+    // #endif
+
+    try {
+      audio!.stop();
+    } catch (_eStop) {
+      // ignore
+    }
+    audio!.volume = this.getTargetVolume();
+    // #ifdef APP-IOS
+    audio!.obeyMuteSwitch = false;
+    // #endif
+
+    this.playRequestId = this.playRequestId + 1;
+    const reqId = this.playRequestId;
+    const waitGeneration = this.generation;
+    let playStarted = false;
+    const startPlay = (): void => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (playStarted) {
+        return;
+      }
+      playStarted = true;
+      this.switchingToReal = true;
+      console.log("[TTS] playSrc.play srcLen=" + src.length.toString());
+      try {
+        audio!.play();
+      } catch (ePlay: any) {
+        console.warn("[TTS] playSrc.play threw", ePlay);
+        playStarted = false;
+      }
+    };
+
+    audio!.onPlay(() => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (this.switchingToReal || this.realPlayback) {
+        this.switchingToReal = false;
+        this.realPlayback = true;
+        console.log("[TTS] playSrc.onPlay");
+        this.setState("playing");
+      }
+    });
+    audio!.onEnded(() => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (this.realPlayback != true) {
+        return;
+      }
+      // 预取合成占用 socket 时：只收尾播放，禁止 recycle / 清 chunks / bump synthEpoch
+      if (this.synthInFlight == true) {
+        this.endPlaybackKeepSynth();
+      } else {
+        this.prepareForNextUtterance(true);
+      }
+    });
+    audio!.onError((err) => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (this.switchingToReal && this.realPlayback != true) {
+        console.warn(
+          "[TTS] playSrc transient error while switching",
+          err.errMsg ?? err,
+        );
+        return;
+      }
+      if (this.realPlayback) {
+        this.fail(err.errMsg ?? "TTS 音频播放失败");
+      }
+    });
+
+    // #ifdef H5 || WEB
+    audio!.onCanplay(() => {
+      startPlay();
+    });
+    audio!.src = src;
+    setTimeout(() => {
+      startPlay();
+    }, 80);
+    // #endif
+
+    // #ifndef H5
+    // #ifndef WEB
+    audio!.src = src;
+    startPlay();
+    // #endif
+    // #endif
+
+    let waitMs = 30000 + Math.floor(src.length / 4) * 80;
+    if (waitMs > 180000) {
+      waitMs = 180000;
+    }
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let seenActive = false;
+      let listenerId = 0;
+      let timerId = 0;
+      const finish = (ok: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timerId > 0) {
+          clearTimeout(timerId);
+          timerId = 0;
+        }
+        if (listenerId > 0) {
+          this.unsubscribe(listenerId);
+          listenerId = 0;
+        }
+        resolve(ok);
+      };
+      timerId = setTimeout(() => {
+        console.warn(
+          "[TTS] playSrcAndWait timeout reqId=",
+          reqId,
+          "state=",
+          this.state,
+        );
+        if (reqId == this.playRequestId) {
+          if (this.synthInFlight == true) {
+            this.endPlaybackKeepSynth();
+          } else {
+            this.prepareForNextUtterance(true);
+          }
+        }
+        finish(false);
+      }, waitMs);
+      listenerId = this.subscribe((state: TtsPlaybackState, _mid: string) => {
+        // endPlaybackKeepSynth 不 bump generation；prepareForNext 会 bump
+        if (waitGeneration != this.generation) {
+          if (seenActive == true && (state == "idle" || state == "error")) {
+            finish(state != "error");
+          } else if (seenActive != true) {
+            finish(false);
+          }
+          return;
+        }
+        if (state == "playing") {
+          seenActive = true;
+          return;
+        }
+        if (state == "error") {
+          finish(false);
+          return;
+        }
+        if (state == "idle" && seenActive == true) {
+          finish(true);
+        }
+      });
+    });
+  }
+
+  /**
+   * 播放结束且预取合成仍在进行：停音频、idle，但不 recycle / 不清 PCM / 不取消合成。
+   */
+  private endPlaybackKeepSynth(): void {
+    this.clearSynthStallWatchdog();
+    const audio = this.audioContext;
+    if (audio != null) {
+      try {
+        audio!.stop();
+      } catch (_eStop) {
+        // ignore
+      }
+    }
+    this.revokeBlobUrl();
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
+    this.messageId = "";
+    this.setState("idle");
   }
 
   private notifyWarmOpenWaiters(ok: boolean): void {
@@ -1088,13 +1402,22 @@ export class TtsWebSocketPlayer {
   private async takeOrOpenSessionSocket(
     accessToken: string,
     expectedGeneration: number,
+    preservePlayingAudio: boolean = false,
+    expectedSynthEpoch: number = 0,
   ): Promise<void> {
+    const cancelled = (): boolean => {
+      return this.isSynthOpCancelled(
+        preservePlayingAudio,
+        expectedGeneration,
+        expectedSynthEpoch,
+      );
+    };
     // 预热已就绪 → 直接复用；若仍在连 → 短等；否则新建
     if (this.warmOpen != true || this.warmSocketTask == null) {
       if (this.warmSocketTask != null) {
         console.log("[TTS] wait warm connecting");
         const ok = await this.waitForWarmOpen(5000);
-        if (expectedGeneration != this.generation) {
+        if (cancelled()) {
           return;
         }
         // 超时也不主动 close：继续等 open 回调；若仍不可用再走新建
@@ -1109,6 +1432,7 @@ export class TtsWebSocketPlayer {
       this.warmSocketTask = null;
       this.warmOpen = false;
       this.warmOpenedAtMs = 0;
+      // preserve 合成会立刻覆盖 sink；仍 bind 以保证 socket router 就绪
       this.bindSessionHandlers(expectedGeneration);
       this.refreshKeepalive();
       return;
@@ -1117,7 +1441,7 @@ export class TtsWebSocketPlayer {
     if (this.warmSocketTask != null) {
       console.warn("[TTS] warm connecting, skip openSession");
       const ok = await this.waitForWarmOpen(5000);
-      if (expectedGeneration != this.generation) {
+      if (cancelled()) {
         return;
       }
       if (ok == true && this.warmSocketTask != null) {
@@ -1131,13 +1455,20 @@ export class TtsWebSocketPlayer {
       }
     }
     console.log("[TTS] no warm socket, connecting now");
-    await this.openSessionSocketOnce(accessToken, expectedGeneration);
+    await this.openSessionSocketOnce(
+      accessToken,
+      expectedGeneration,
+      preservePlayingAudio,
+      expectedSynthEpoch,
+    );
   }
 
   /** 建立会话 Socket（open 后 bindSessionHandlers） */
   private openSessionSocketOnce(
     accessToken: string,
     expectedGeneration: number,
+    preservePlayingAudio: boolean = false,
+    expectedSynthEpoch: number = 0,
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -1159,7 +1490,13 @@ export class TtsWebSocketPlayer {
           return;
         }
         settled = true;
-        if (expectedGeneration != this.generation) {
+        if (
+          this.isSynthOpCancelled(
+            preservePlayingAudio,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
           reject(new Error("TTS 会话已取消"));
           return;
         }
@@ -1537,6 +1874,8 @@ export class TtsWebSocketPlayer {
    */
   private prepareForNextUtterance(keepAudio: boolean): void {
     this.generation += 1;
+    this.synthEpoch += 1;
+    this.synthInFlight = false;
     this.clearSynthStallWatchdog();
     this.finishRequested = false;
     this.pendingBinary = 0;
@@ -2003,7 +2342,11 @@ export const ttsWebSocketPlayer = new TtsWebSocketPlayer();
 
 /**
  * 单句合成：优先复用预热 TTS WebSocket，收齐 PCM 后封装为可播放 src（不播报）。
+ * @param preservePlayingAudio true 时不打断当前音频（流式边播边合成）
  */
-export async function synthesizeSpeechToSrc(text: string): Promise<string> {
-  return await ttsWebSocketPlayer.synthesizeToSrc(text);
+export async function synthesizeSpeechToSrc(
+  text: string,
+  preservePlayingAudio: boolean = false,
+): Promise<string> {
+  return await ttsWebSocketPlayer.synthesizeToSrc(text, preservePlayingAudio);
 }

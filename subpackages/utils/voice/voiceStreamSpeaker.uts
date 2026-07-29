@@ -1,8 +1,8 @@
 /**
  * 边生成边播报器：AI 回复流式生成过程中，增量文本分句后顺序播报。
  *
- * 播放链路：synthesizeToSrc + playSrcAndWait，并在当前句播放时预取下一句合成，
- * 避免串行 playAndWait「播完再合成」造成的空窗与滞后。
+ * 播放链路：synthesizeToSrc + playSrcAndWait；播放当前句时串行预合成队列中后续句子
+ * （ready 缓冲，深度见 MAX_READY_BUFFER），避免「只预取一句」仍跟不上播速。
  *
  * 文本侧：
  * - 双通道（body / think）按「可朗读快照」增量消费（consumedSpeakable）；
@@ -24,6 +24,18 @@ const MIN_UTTERANCE_CHARS = 12;
 
 /** 短句合并上限，避免一次合成过长 */
 const MAX_MERGED_UTTERANCE_CHARS = 100;
+
+/**
+ * 播放时最多提前合成的句数（含即将播放的不在此列）。
+ * 单路 TTS WebSocket 只能串行合成；缓冲过深会占内存，过浅仍有空窗。
+ */
+const MAX_READY_BUFFER = 8;
+
+/** 已合成待播条目 */
+class ReadyUtterance {
+  sentence: string = "";
+  src: string = "";
+}
 
 /** 单通道（body/think）消费状态 */
 class StreamChannel {
@@ -58,6 +70,8 @@ export class VoiceStreamSpeaker {
   private processing: boolean = false;
   /** 播放循环运行标记 */
   private playLooping: boolean = false;
+  /** kickPlay 内挂接：SSE 继续入队时唤醒预合成填缓冲 */
+  private onPendingEnqueued: (() => void) | null = null;
   /** SSE 已结束（尾句入队后仍可能在播） */
   private streamFinished: boolean = false;
   /** 待处理快照（只保留最新一份） */
@@ -80,6 +94,7 @@ export class VoiceStreamSpeaker {
     this.queuedChunk = null;
     this.streamFinished = false;
     this.playLooping = false;
+    this.onPendingEnqueued = null;
     this.active = true;
   }
 
@@ -109,6 +124,7 @@ export class VoiceStreamSpeaker {
     this.pendingSentences = [];
     this.streamFinished = false;
     this.playLooping = false;
+    this.onPendingEnqueued = null;
     this.messageId = "";
     ttsWebSocketPlayer.stop();
     audioPlayerManager.stop();
@@ -194,6 +210,10 @@ export class VoiceStreamSpeaker {
         "textLen=",
         sentences[i].length,
       );
+      const notify = this.onPendingEnqueued;
+      if (notify != null) {
+        notify!();
+      }
     }
     if (snap.finished == true) {
       this.streamFinished = true;
@@ -246,7 +266,7 @@ export class VoiceStreamSpeaker {
   }
 
   /**
-   * 流水线播放：当前句播放时预取下一句合成，缩短句间空窗。
+   * 流水线播放：播当前句的同时，把 pending 队列里后续句串行预合成进 ready 缓冲。
    */
   private async kickPlay(expectedRound: number): Promise<void> {
     if (this.playLooping) {
@@ -255,84 +275,156 @@ export class VoiceStreamSpeaker {
     this.playLooping = true;
     // 短句暂缓（等更多 SSE 文本）时勿在末尾同步重入，否则会无限递归撑爆栈
     let waitingForMoreText = false;
-    let heldSentence: string | null = null;
-    let heldSrcPromise: Promise<string> | null = null;
+    const ready: ReadyUtterance[] = [];
+    let fillTask: Promise<void> | null = null;
+    let fillFailed = false;
+
+    /** 串行把 pending 填进 ready，最多 MAX_READY_BUFFER 条；播放中须 preserve=true */
+    const fillReadyBuffer = async (preserve: boolean): Promise<void> => {
+      while (
+        expectedRound == this.round &&
+        fillFailed != true &&
+        ready.length < MAX_READY_BUFFER &&
+        (this.active == true || this.streamFinished == true)
+      ) {
+        const utt = this.takeNextUtterance();
+        if (utt == null) {
+          // 队列里还有被放回的短句 → 等更多 SSE；队列空则静默退出，入队时再唤醒
+          if (this.pendingSentences.length > 0) {
+            waitingForMoreText = true;
+          }
+          break;
+        }
+        if (utt.trim().length == 0) {
+          continue;
+        }
+        try {
+          console.log(
+            "[StreamSpeak] prefetch synthesize textLen=",
+            utt.length,
+            "ready=",
+            ready.length,
+          );
+          const src = await ttsWebSocketPlayer.synthesizeToSrc(utt, preserve);
+          if (expectedRound != this.round) {
+            break;
+          }
+          if (src.trim().length == 0) {
+            continue;
+          }
+          const item = new ReadyUtterance();
+          item.sentence = utt;
+          item.src = src;
+          ready.push(item);
+          // 缓冲里已有条目后，后续合成一律 preserve，避免打断正在播的音频
+          preserve = true;
+        } catch (eFill: any) {
+          console.warn("[StreamSpeak] prefetch synthesize failed", eFill);
+          fillFailed = true;
+          break;
+        }
+      }
+    };
+
+    const ensureFillTask = (preserve: boolean): void => {
+      if (fillTask != null) {
+        return;
+      }
+      if (ready.length >= MAX_READY_BUFFER) {
+        return;
+      }
+      if (this.pendingSentences.length == 0) {
+        return;
+      }
+      fillTask = fillReadyBuffer(preserve).then(
+        () => {
+          fillTask = null;
+        },
+        () => {
+          fillTask = null;
+        },
+      );
+    };
+
+    this.onPendingEnqueued = (): void => {
+      if (expectedRound != this.round) {
+        return;
+      }
+      ensureFillTask(true);
+    };
 
     while (
       expectedRound == this.round &&
-      (heldSentence != null || this.pendingSentences.length > 0) &&
-      (this.active == true || this.streamFinished == true)
+      (ready.length > 0 || this.pendingSentences.length > 0) &&
+      (this.active == true || this.streamFinished == true) &&
+      fillFailed != true
     ) {
-      let sentence: string = "";
-      let srcPromise: Promise<string> | null = null;
-
-      if (heldSentence != null && heldSrcPromise != null) {
-        sentence = heldSentence!;
-        srcPromise = heldSrcPromise;
-        heldSentence = null;
-        heldSrcPromise = null;
-      } else {
-        const nextUtt = this.takeNextUtterance();
-        if (nextUtt == null) {
-          waitingForMoreText = true;
-          break;
+      // 缓冲空：等在途 fill，或独占合成首条
+      if (ready.length == 0) {
+        if (fillTask != null) {
+          await fillTask;
+          fillTask = null;
         }
-        if (nextUtt.trim().length == 0) {
-          continue;
+        if (ready.length == 0) {
+          const nextUtt = this.takeNextUtterance();
+          if (nextUtt == null) {
+            waitingForMoreText = true;
+            break;
+          }
+          if (nextUtt.trim().length == 0) {
+            continue;
+          }
+          let src = "";
+          try {
+            console.log(
+              "[StreamSpeak] synthesize textLen=",
+              nextUtt.length,
+            );
+            src = await ttsWebSocketPlayer.synthesizeToSrc(nextUtt, false);
+          } catch (eSynth: any) {
+            console.warn("[StreamSpeak] synthesize failed, retry once", eSynth);
+            ttsWebSocketPlayer.cancelInFlightPreserveSynth();
+            try {
+              src = await ttsWebSocketPlayer.synthesizeToSrc(nextUtt, false);
+            } catch (eRetry: any) {
+              console.warn(
+                "[VoiceStreamSpeaker] synthesize retry failed",
+                eRetry,
+              );
+              this.pendingSentences = [];
+              this.active = false;
+              break;
+            }
+          }
+          if (expectedRound != this.round) {
+            break;
+          }
+          if (src.trim().length == 0) {
+            continue;
+          }
+          const first = new ReadyUtterance();
+          first.sentence = nextUtt;
+          first.src = src;
+          ready.push(first);
         }
-        sentence = nextUtt;
-        // 首句 / 空窗后：允许打断旧会话，独占 socket 合成
-        srcPromise = ttsWebSocketPlayer.synthesizeToSrc(sentence, false);
       }
 
-      let src = "";
-      try {
-        console.log(
-          "[StreamSpeak] synthesize textLen=",
-          sentence.length,
-        );
-        src = await srcPromise!;
-      } catch (eSynth: any) {
-        console.warn("[StreamSpeak] synthesize failed, retry once", eSynth);
-        ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-        try {
-          src = await ttsWebSocketPlayer.synthesizeToSrc(sentence, false);
-        } catch (eRetry: any) {
-          console.warn("[VoiceStreamSpeaker] synthesize retry failed", eRetry);
-          this.pendingSentences = [];
-          this.active = false;
-          break;
-        }
-      }
-      if (expectedRound != this.round) {
-        break;
-      }
-      if (src.trim().length == 0) {
-        continue;
-      }
-
-      // 先开播，再预取下一句（合成与播放重叠）
+      const item = ready.shift()!;
       console.log(
         "[StreamSpeak] playSrc textLen=",
-        sentence.length,
+        item.sentence.length,
         "srcLen=",
-        src.length,
+        item.src.length,
+        "readyLeft=",
+        ready.length,
       );
       const playPromise = ttsWebSocketPlayer.playSrcAndWait(
         this.messageId,
-        src,
+        item.src,
       );
 
-      const prefetch = this.takeNextUtterance();
-      if (prefetch != null && prefetch.trim().length > 0) {
-        heldSentence = prefetch;
-        // 保留当前播放音频，只占用暖连接合成下一句
-        heldSrcPromise = ttsWebSocketPlayer.synthesizeToSrc(prefetch, true);
-        console.log(
-          "[StreamSpeak] prefetch synthesize textLen=",
-          prefetch.length,
-        );
-      }
+      // 播放期间把队列后续句尽量预合成进缓冲
+      ensureFillTask(true);
 
       let ok = false;
       try {
@@ -347,26 +439,37 @@ export class VoiceStreamSpeaker {
           this.pendingSentences.length,
         );
         ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-        heldSentence = null;
-        heldSrcPromise = null;
+        if (fillTask != null) {
+          await fillTask;
+          fillTask = null;
+        }
+        ready.splice(0, ready.length);
         this.pendingSentences = [];
         this.active = false;
         break;
       }
       if (expectedRound != this.round) {
         ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-        heldSentence = null;
-        heldSrcPromise = null;
+        if (fillTask != null) {
+          await fillTask;
+          fillTask = null;
+        }
+        ready.splice(0, ready.length);
         break;
       }
+
+      // 缓冲未满且仍有 pending：继续填（上一轮 fill 可能已结束）
+      ensureFillTask(true);
     }
 
-    // 循环退出时若仍有未消费的预取，取消以免脏 socket
-    if (heldSrcPromise != null) {
+    // 退出时收尾在途预取，避免脏 socket
+    this.onPendingEnqueued = null;
+    if (fillTask != null) {
       ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-      heldSentence = null;
-      heldSrcPromise = null;
+      await fillTask;
+      fillTask = null;
     }
+    ready.splice(0, ready.length);
 
     this.playLooping = false;
     if (

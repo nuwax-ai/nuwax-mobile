@@ -1,7 +1,7 @@
 /**
  * 将本地 PCM/WAV 录音文件推给 ASR。
  * - 等每块 WebSocket send success 后再发下一块 / stop
- * - 按音频时长节流（逼近实时流），避免瞬间灌完被服务端判 no_speech
+ * - 文件已录完：按发送成功节拍尽快推完（不再实时 20ms 回放，否则松手后还要再等一整段录音时长）
  * - 切帧必须独立拷贝 ArrayBuffer：Android UTS 上 ArrayBuffer.slice 送给 WS 易成静音 → no_speech
  */
 import { ASR_FRAME_BYTES, ASR_SAMPLE_RATE } from "./asrWebSocketClient";
@@ -107,16 +107,6 @@ export function splitPcmChunks(
   return chunks;
 }
 
-/** PCM16 mono 字节数 → 时长 ms */
-function pcmBytesToMs(byteLength: number): number {
-  const samples = byteLength / 2;
-  const ms = (samples * 1000) / ASR_SAMPLE_RATE;
-  if (ms < 1) {
-    return 1;
-  }
-  return Math.floor(ms);
-}
-
 /** 按时长上限截取 PCM 前缀（16k mono PCM16） */
 function truncatePcmForAsr(pcm: ArrayBuffer): ArrayBuffer {
   const maxBytes = Math.floor((ASR_SAMPLE_RATE * 2 * ASR_MAX_PUSH_MS) / 1000);
@@ -169,7 +159,6 @@ function sendChunksSequentially(
     return;
   }
   const frame = chunks[index];
-  const paceMs = pcmBytesToMs(frame.byteLength);
   sendFrameAsync(frame).then(
     (ok: boolean) => {
       if (ok != true) {
@@ -180,26 +169,39 @@ function sendChunksSequentially(
         return;
       }
       const nextBytes = sentBytes + frame.byteLength;
-      // 按帧时长节流，模拟实时推流（最后一帧不再额外等）
-      if (index + 1 >= chunks.length) {
+      const nextIndex = index + 1;
+      if (nextIndex >= chunks.length) {
         sendChunksSequentially(
           chunks,
           sendFrameAsync,
-          index + 1,
+          nextIndex,
           nextBytes,
           done,
         );
         return;
       }
-      setTimeout(() => {
-        sendChunksSequentially(
-          chunks,
-          sendFrameAsync,
-          index + 1,
-          nextBytes,
-          done,
-        );
-      }, paceMs);
+      // 文件已录完：只等 WS send success，不再按 20ms 实时回放。
+      // 实时节拍会让「松手→识别」多等一整段录音时长（一句话也要再等数秒）。
+      // 每 16 帧 setTimeout(0) 让出主线程，避免超长录音连续 then 占满 UI。
+      if (nextIndex % 16 == 0) {
+        setTimeout(() => {
+          sendChunksSequentially(
+            chunks,
+            sendFrameAsync,
+            nextIndex,
+            nextBytes,
+            done,
+          );
+        }, 0);
+        return;
+      }
+      sendChunksSequentially(
+        chunks,
+        sendFrameAsync,
+        nextIndex,
+        nextBytes,
+        done,
+      );
     },
     (_e: any | null) => {
       console.warn("[ASR] stream send reject at chunk=" + index.toString());

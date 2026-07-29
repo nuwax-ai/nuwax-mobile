@@ -1,10 +1,13 @@
 /**
  * App ASR WebSocket 客户端。
  * 协议：start → asr_ready → Binary PCM16 → stop → asr_result
- * @see docs / agent-platform App ASR 对接说明
+ *
+ * 预热：仅建立 TCP（不发 start），录音 begin 时再 start。
+ * 避免「进页就 asr_ready、空闲后再推 PCM」被服务端判 no_speech。
  */
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { API_BASE_URL } from "@/constants/config";
+import { SpeechWsKeepalive } from "./speechWsKeepalive";
 
 export const ASR_SAMPLE_RATE = 16000;
 export const ASR_FRAME_DURATION_MS = 20;
@@ -26,10 +29,10 @@ function createAsrWebSocketUrl(token: string): string {
   } else if (baseUrl.startsWith("http://")) {
     baseUrl = "ws://" + baseUrl.substring(7);
   }
-  // 实际部署路径为 /api/speech/asr/ws（/api/app/asr/ws 会 404）
   let url = baseUrl + "/api/speech/asr/ws";
-  // H5 无法自定义握手 Header；iOS Starscream 也常带不上 Authorization，改用 Query。
-  // #ifdef H5 || WEB || APP-IOS
+  // 与 TTS 一致：仅 H5/WEB 用 Query；App（含 iOS）走 Authorization Header。
+  // iOS 若只拼 access_token 易被网关 401（Starscream notAnUpgrade）。
+  // #ifdef H5 || WEB
   const encodedTokenRaw = encodeURIComponent(token);
   const encodedToken = encodedTokenRaw != null ? encodedTokenRaw : token;
   url += "?access_token=" + encodedToken;
@@ -43,35 +46,193 @@ function createAsrWebSocketHeaders(token: string): UTSJSONObject {
   return header;
 }
 
+/**
+ * H5：从 document.cookie 读取指定 key（仅非 HttpOnly 可读）。
+ */
+function readCookie(name: string): string {
+  // #ifdef H5 || WEB
+  try {
+    const raw = document.cookie;
+    if (raw == null || raw.length == 0) {
+      return "";
+    }
+    const parts = raw.split(";");
+    const prefix = name + "=";
+    for (let i = 0; i < parts.length; i++) {
+      let part = parts[i];
+      while (part.length > 0 && part.charAt(0) == " ") {
+        part = part.substring(1);
+      }
+      if (part.indexOf(prefix) == 0) {
+        const value = part.substring(prefix.length);
+        const decodedRaw = decodeURIComponent(value);
+        return decodedRaw != null ? decodedRaw : value;
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+  return "";
+}
+
+/** 去掉 Bearer 前缀 */
+function normalizeAccessToken(token: string): string {
+  if (token.startsWith("Bearer ")) {
+    return token.substring(7);
+  }
+  return token;
+}
+
+/**
+ * 解析 ASR 鉴权 Token（与 TTS 一致）。
+ * H5：优先 Cookie（ACCESS_TOKEN / access_token），否则回退本地 storage。
+ */
 function readAccessToken(): string {
+  // #ifdef H5 || WEB
+  let cookieToken = readCookie(ACCESS_TOKEN);
+  if (cookieToken.length == 0) {
+    cookieToken = readCookie("access_token");
+  }
+  if (cookieToken.length > 0) {
+    return normalizeAccessToken(cookieToken);
+  }
+  // #endif
   const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
   if (tokenRaw == null) {
     return "";
   }
-  let accessToken = `${tokenRaw}`;
-  if (accessToken.startsWith("Bearer ")) {
-    accessToken = accessToken.substring(7);
-  }
-  return accessToken;
+  return normalizeAccessToken(`${tokenRaw}`);
 }
 
 export class AsrWebSocketClient {
   private socketTask: SocketTask | null = null;
   private generation: number = 0;
+  /** 已收到 asr_ready，可发音频 */
   private ready: boolean = false;
+  /** TCP 已 open，尚未 asr_ready（含预热待命 / 已发 start 等待中） */
+  private socketOpen: boolean = false;
+  /** 正在建连 */
+  private connecting: boolean = false;
+  /** 已发 start，等待 asr_ready */
+  private starting: boolean = false;
   private onReadyCb: AsrReadyCallback | null = null;
   private onResultCb: AsrResultCallback | null = null;
   private onErrorCb: AsrErrorCallback | null = null;
+  private warmupEnabled: boolean = false;
+  /** TCP 预热待命（open 且未 start） */
+  private warmIdle: boolean = false;
+  /** 连接成功后的心跳保活（预热 / 业务会话共用） */
+  private keepalive: SpeechWsKeepalive = new SpeechWsKeepalive();
 
-  /** 当前会话是否已收到 asr_ready，可发音频 */
   isReady(): boolean {
-    return this.ready && this.socketTask != null;
+    return this.ready == true && this.socketTask != null;
+  }
+
+  /** 是否有可复用的预热 TCP（未 start） */
+  isWarmOpen(): boolean {
+    return (
+      this.warmIdle == true &&
+      this.socketOpen == true &&
+      this.socketTask != null &&
+      this.ready == false
+    );
+  }
+
+  /** 进入会话页：只预连 TCP，不发 start */
+  enableWarmupAndConnect(): void {
+    this.warmupEnabled = true;
+    if (this.isWarmOpen() == true || this.isReady() == true) {
+      console.log("[ASR] warmup already open");
+      return;
+    }
+    if (this.connecting == true && this.socketTask != null) {
+      console.log("[ASR] warmup already connecting");
+      return;
+    }
+    this.connectWarmTcp();
+  }
+
+  disableWarmupAndDisconnect(): void {
+    this.warmupEnabled = false;
+    this.warmIdle = false;
+    this.keepalive.resetServerReject();
+    this.abortInternal(true);
   }
 
   /**
-   * 建立连接并发送 start；收到 asr_ready 后回调 onReady。
+   * 开始一轮识别：复用预热 TCP 则只发 start；否则新建连接。
    */
   begin(
+    onReady: AsrReadyCallback,
+    onResult: AsrResultCallback,
+    onError: AsrErrorCallback,
+  ): void {
+    this.onReadyCb = onReady;
+    this.onResultCb = onResult;
+    this.onErrorCb = onError;
+
+    // 业务会话已 asr_ready（极少见）：直接开录
+    if (this.isReady() == true && this.warmIdle == false) {
+      console.log("[ASR] session already ready");
+      onReady();
+      return;
+    }
+
+    // 预热 TCP 已 open：发 start，等 asr_ready（不 connectSocket）
+    if (this.isWarmOpen() == true) {
+      console.log("[ASR] reuse warm TCP, send start");
+      this.warmIdle = false;
+      this.starting = true;
+      this.sendJsonStart();
+      return;
+    }
+
+    // 建连中：挂好回调，等 open 后由 onOpen 发 start（见 connectForSession）
+    if (this.connecting == true && this.socketTask != null) {
+      console.log("[ASR] await in-flight connection");
+      // 若仍是纯预热建连，标记为业务占用，open 后发 start
+      this.warmIdle = false;
+      return;
+    }
+
+    console.log("[ASR] no warm socket, connecting now");
+    this.connectForSession(onReady, onResult, onError);
+  }
+
+  /** 预热：TCP open 后不发 start */
+  private connectWarmTcp(): void {
+    this.openSocket(
+      true,
+      () => {
+        this.warmIdle = true;
+        this.starting = false;
+        this.ready = false;
+        console.log("[ASR] warmup TCP open (no start)");
+      },
+      (_text: string, _ok: boolean, _errorMessage: string) => {
+        console.warn("[ASR] unexpected result during warmup");
+      },
+      (message: string) => {
+        console.warn("[ASR] warmup failed (no auto-retry): " + message);
+      },
+    );
+  }
+
+  /** 业务：open 后立即 start */
+  private connectForSession(
+    onReady: AsrReadyCallback,
+    onResult: AsrResultCallback,
+    onError: AsrErrorCallback,
+  ): void {
+    this.openSocket(false, onReady, onResult, onError);
+  }
+
+  /**
+   * @param warmOnly true=预热（open 后不 start）；false=业务（open 后 start）
+   */
+  private openSocket(
+    warmOnly: boolean,
     onReady: AsrReadyCallback,
     onResult: AsrResultCallback,
     onError: AsrErrorCallback,
@@ -83,27 +244,32 @@ export class AsrWebSocketClient {
     this.onResultCb = onResult;
     this.onErrorCb = onError;
     this.ready = false;
+    this.socketOpen = false;
+    this.starting = false;
+    this.connecting = true;
+    this.warmIdle = warmOnly;
 
     const accessToken = readAccessToken();
     if (accessToken.length == 0) {
+      this.connecting = false;
       this.fail("登录状态已失效");
       return;
     }
 
     let socketTask: SocketTask;
-    // #ifdef H5 || WEB || APP-IOS
-    // H5 / iOS：仅用 URL Query 鉴权（不传自定义 Header）
+    // #ifdef H5 || WEB
     socketTask = uni.connectSocket({
       url: createAsrWebSocketUrl(accessToken),
       fail: (err) => {
         if (expectedGeneration != this.generation) {
           return;
         }
+        this.connecting = false;
         this.fail(err.errMsg != null ? `${err.errMsg}` : "ASR 连接失败");
       },
     });
     // #endif
-    // #ifndef H5 || WEB || APP-IOS
+    // #ifndef H5 || WEB
     socketTask = uni.connectSocket({
       url: createAsrWebSocketUrl(accessToken),
       header: createAsrWebSocketHeaders(accessToken),
@@ -111,6 +277,7 @@ export class AsrWebSocketClient {
         if (expectedGeneration != this.generation) {
           return;
         }
+        this.connecting = false;
         this.fail(err.errMsg != null ? `${err.errMsg}` : "ASR 连接失败");
       },
     });
@@ -121,7 +288,21 @@ export class AsrWebSocketClient {
       if (expectedGeneration != this.generation) {
         return;
       }
+      this.connecting = false;
+      this.socketOpen = true;
+      this.startKeepalive();
+      // 预热建连过程中用户已 begin：warmIdle 会被 begin 清掉，此处应发 start
+      if (this.warmIdle == true) {
+        console.log("[ASR] socket open (warm, hold)");
+        const cb = this.onReadyCb;
+        // 预热 onReady 仅用于标记待命，不触发录音
+        if (cb != null && warmOnly == true) {
+          cb();
+        }
+        return;
+      }
       console.log("[ASR] socket open, send start");
+      this.starting = true;
       this.sendJsonStart();
     });
     socketTask.onMessage((res: OnSocketMessageCallbackResult) => {
@@ -134,35 +315,94 @@ export class AsrWebSocketClient {
       if (expectedGeneration != this.generation || this.socketTask == null) {
         return;
       }
+      this.connecting = false;
       this.fail(err.errMsg != null ? `${err.errMsg}` : "ASR WebSocket 错误");
     });
     socketTask.onClose((_res) => {
       if (expectedGeneration != this.generation) {
         return;
       }
-      // finish 后服务端可能关连接；若尚未拿到结果则报错
-      if (this.ready == true && this.onResultCb != null) {
-        // 等待结果过程中被关：交给超时/错误路径，这里不强制
+      this.stopKeepalive();
+      this.ready = false;
+      this.connecting = false;
+      this.socketOpen = false;
+      this.starting = false;
+      this.warmIdle = false;
+      this.socketTask = null;
+      console.log("[ASR] socket closed");
+      // 仍在会话页：对端/网关掐断后单次补预热（业务操作本身不再主动关连）
+      if (this.warmupEnabled == true) {
+        setTimeout(() => {
+          if (
+            this.warmupEnabled == true &&
+            this.isWarmOpen() == false &&
+            this.connecting == false &&
+            this.socketTask == null
+          ) {
+            console.log("[ASR] peer closed → reconnect warm once");
+            this.connectWarmTcp();
+          }
+        }, 300);
       }
     });
   }
 
-  /** 发送一帧裸 PCM16（须在 asr_ready 之后） */
-  sendPcm(frame: ArrayBuffer): void {
-    if (this.ready != true || this.socketTask == null) {
-      return;
-    }
-    if (frame.byteLength == 0) {
-      return;
-    }
-    try {
-      this.socketTask!.send({ data: frame });
-    } catch (e) {
-      console.warn("[ASR] sendPcm failed");
-    }
+  /** WebSocket 已 open：启动 / 刷新心跳 */
+  private startKeepalive(): void {
+    this.keepalive.start("ASR", (payloadJson: string): boolean => {
+      const socket = this.socketTask;
+      if (socket == null || this.socketOpen != true) {
+        return false;
+      }
+      try {
+        socket!.send({ data: payloadJson });
+        return true;
+      } catch (_eSend) {
+        return false;
+      }
+    });
   }
 
-  /** 结束本轮识别，等待 asr_result */
+  private stopKeepalive(): void {
+    this.keepalive.stop();
+  }
+
+  sendPcm(frame: ArrayBuffer): void {
+    this.sendPcmAsync(frame).then(
+      (_ok: boolean) => {},
+      (_e: any | null) => {},
+    );
+  }
+
+  /**
+   * 发送一帧 PCM，等原生 send success 后再 resolve。
+   * 文件推流必须用这个，避免 stop 抢在 binary 之前发出。
+   */
+  sendPcmAsync(frame: ArrayBuffer): Promise<boolean> {
+    if (this.ready != true || this.socketTask == null) {
+      return Promise.resolve(false);
+    }
+    if (frame.byteLength == 0) {
+      return Promise.resolve(true);
+    }
+    const socket = this.socketTask!;
+    return new Promise<boolean>((resolve) => {
+      socket.send({
+        data: frame,
+        success: (_res) => {
+          resolve(true);
+        },
+        fail: (err) => {
+          console.warn(
+            "[ASR] sendPcm fail " +
+              (err.errMsg != null ? `${err.errMsg}` : ""),
+          );
+          resolve(false);
+        },
+      });
+    });
+  }
+
   finish(): void {
     if (this.socketTask == null) {
       this.fail("ASR 连接不存在");
@@ -171,23 +411,85 @@ export class AsrWebSocketClient {
     console.log("[ASR] send stop");
     const payload = new UTSJSONObject();
     payload["type"] = "stop";
+    const socket = this.socketTask!;
     try {
-      this.socketTask!.send({ data: JSON.stringify(payload) });
+      socket.send({
+        data: JSON.stringify(payload),
+        fail: (err) => {
+          this.fail(
+            err.errMsg != null ? `${err.errMsg}` : "ASR stop 发送失败",
+          );
+        },
+      });
     } catch (e) {
       this.fail("ASR stop 发送失败");
     }
   }
 
-  /** 取消会话并关闭连接 */
+  /**
+   * 取消本轮识别。
+   * 预热开启时优先不断连：发 stop 收回待命，或已在待命则仅清回调。
+   */
   abort(): void {
+    if (this.warmupEnabled != true) {
+      this.abortInternal(true);
+      return;
+    }
+    // 已在预热待命：不断连
+    if (this.isWarmOpen() == true) {
+      this.onReadyCb = null;
+      this.onResultCb = null;
+      this.onErrorCb = null;
+      return;
+    }
+    // 业务进行中且 TCP 仍开：发 stop，由 asr_result 收回待命（不断连）
+    if (
+      this.socketTask != null &&
+      this.socketOpen == true &&
+      (this.ready == true || this.starting == true)
+    ) {
+      this.onReadyCb = null;
+      this.onErrorCb = null;
+      // 吞掉本轮结果，只把连接收回待命
+      this.onResultCb = (
+        _text: string,
+        _ok: boolean,
+        _errorMessage: string,
+      ): void => {};
+      this.finish();
+      return;
+    }
+    // 连接已死 / 半开：关断后单次重建预热
     this.abortInternal(true);
+    this.connectWarmTcp();
+  }
+
+  /** 一轮识别结束后：保留 TCP，回到预热待命（不 connectSocket） */
+  private recycleToWarmIdle(): void {
+    this.ready = false;
+    this.connecting = false;
+    this.starting = false;
+    this.warmIdle = true;
+    this.socketOpen = this.socketTask != null;
+    this.onReadyCb = null;
+    this.onResultCb = null;
+    this.onErrorCb = null;
+    if (this.socketOpen == true) {
+      this.startKeepalive();
+      console.log("[ASR] recycle → warm idle (reuse TCP, no new socket)");
+    }
   }
 
   private abortInternal(bumpGeneration: boolean): void {
     if (bumpGeneration) {
       this.generation += 1;
     }
+    this.stopKeepalive();
     this.ready = false;
+    this.connecting = false;
+    this.socketOpen = false;
+    this.starting = false;
+    this.warmIdle = false;
     this.onReadyCb = null;
     this.onResultCb = null;
     this.onErrorCb = null;
@@ -215,7 +517,6 @@ export class AsrWebSocketClient {
 
   private handleMessage(res: OnSocketMessageCallbackResult): void {
     if (typeof res.data != "string") {
-      // ASR 下行不应有 binary
       return;
     }
     let message: UTSJSONObject | null = null;
@@ -230,8 +531,15 @@ export class AsrWebSocketClient {
     }
     const typeVal = message["type"];
     const type = typeVal != null ? `${typeVal}` : "";
+    if (type == "ping" || type == "pong") {
+      // 心跳应答，忽略
+      return;
+    }
     if (type == "asr_ready") {
       this.ready = true;
+      this.connecting = false;
+      this.starting = false;
+      this.warmIdle = false;
       console.log("[ASR] asr_ready");
       const cb = this.onReadyCb;
       if (cb != null) {
@@ -247,20 +555,36 @@ export class AsrWebSocketClient {
       }
       const errVal = message["error"];
       const errorMessage = errVal != null ? `${errVal}` : "";
-      console.log("[ASR] asr_result ok=" + (ok ? "1" : "0") + " textLen=" + text.length.toString());
+      console.log(
+        "[ASR] asr_result ok=" +
+          (ok ? "1" : "0") +
+          " textLen=" +
+          text.length.toString(),
+      );
       const cb = this.onResultCb;
-      // 先清回调再关连接，避免重入
-      this.onReadyCb = null;
-      this.onResultCb = null;
-      this.onErrorCb = null;
-      this.ready = false;
-      const socket = this.socketTask;
-      this.socketTask = null;
-      if (socket != null) {
-        try {
-          socket!.close({});
-        } catch (_eClose) {
-          // ignore
+      // 预热开启：保留 TCP，下一轮只发 start；否则关连
+      // 注意：复用同一 socket 时不可 bump generation，否则 onMessage 会被 generation 守卫丢弃
+      if (this.warmupEnabled == true && this.socketTask != null) {
+        this.recycleToWarmIdle();
+      } else {
+        this.generation += 1;
+        this.stopKeepalive();
+        this.ready = false;
+        this.connecting = false;
+        this.starting = false;
+        this.socketOpen = false;
+        this.warmIdle = false;
+        this.onReadyCb = null;
+        this.onResultCb = null;
+        this.onErrorCb = null;
+        const socket = this.socketTask;
+        this.socketTask = null;
+        if (socket != null) {
+          try {
+            socket!.close({});
+          } catch (_eClose) {
+            // ignore
+          }
         }
       }
       if (cb != null) {
@@ -271,6 +595,14 @@ export class AsrWebSocketClient {
       const msgVal = message["message"];
       const code = codeVal != null ? `${codeVal}` : "";
       const msg = msgVal != null ? `${msgVal}` : "ASR 错误";
+      // 服务端不支持应用层 ping：停心跳，不断连
+      if (
+        code == "UNKNOWN_TYPE" &&
+        (msg.indexOf("ping") >= 0 || msg.indexOf("pong") >= 0)
+      ) {
+        this.keepalive.markRejectedByServer();
+        return;
+      }
       this.fail(code.length > 0 ? code + ": " + msg : msg);
     }
   }
@@ -285,5 +617,4 @@ export class AsrWebSocketClient {
   }
 }
 
-/** 单例：按住说话期间复用同一客户端实例 */
 export const asrWebSocketClient = new AsrWebSocketClient();

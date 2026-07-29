@@ -183,6 +183,24 @@ class EspProvisioningBridge(context: Context) {
     )
   }
 
+  /** 向固件自定义 protocomm endpoint 写数据（如 vox-config），走已加密的 Security 2 会话 */
+  fun sendCustomData(endpoint: String, payload: String, callback: BridgeResultCallback) {
+    val device = espDevice ?: return callback.onFailure("DISCONNECTED", "Device is not connected")
+    device.sendDataToCustomEndPoint(
+      endpoint,
+      payload.toByteArray(StandardCharsets.UTF_8),
+      object : ResponseListener {
+        override fun onSuccess(returnData: ByteArray) {
+          callback.onSuccess(String(returnData, StandardCharsets.UTF_8))
+        }
+
+        override fun onFailure(error: Exception) {
+          callback.onFailure(mapSessionError(error), safeMessage(error))
+        }
+      },
+    )
+  }
+
   fun scanNetworks(callback: BridgeResultCallback) {
     val device = espDevice ?: return callback.onFailure("DISCONNECTED", "Device is not connected")
     device.scanNetworks(object : WiFiScanListener {

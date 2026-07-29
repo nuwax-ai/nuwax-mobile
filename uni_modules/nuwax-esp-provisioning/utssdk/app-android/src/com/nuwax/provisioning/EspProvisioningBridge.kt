@@ -75,7 +75,9 @@ class EspProvisioningBridge(context: Context) {
     scanning = true
     val listener = object : BleScanListener {
       override fun scanStartFailed() {
-        callback.onFailure("BLUETOOTH_OFF", "Bluetooth is disabled")
+        dispatchToMain {
+          callback.onFailure("BLUETOOTH_OFF", "Bluetooth is disabled")
+        }
       }
 
       override fun onPeripheralFound(device: BluetoothDevice, scanResult: ScanResult) {
@@ -88,7 +90,9 @@ class EspProvisioningBridge(context: Context) {
           ?: return
         val address = runCatching { device.address }.getOrNull() ?: return
         peripherals[address] = CachedPeripheral(device, matchedUuid)
-        callback.onDevice(address, name, scanResult.rssi, matchedUuid)
+        dispatchToMain {
+          callback.onDevice(address, name, scanResult.rssi, matchedUuid)
+        }
       }
 
       override fun scanCompleted() {
@@ -100,7 +104,10 @@ class EspProvisioningBridge(context: Context) {
       }
 
       override fun onFailure(error: Exception) {
-        callback.onFailure("SCAN_FAILED", safeMessage(error))
+        val message = safeMessage(error)
+        dispatchToMain {
+          callback.onFailure("SCAN_FAILED", message)
+        }
       }
     }
     manager.searchBleEspDevices(prefix, listener)
@@ -121,7 +128,9 @@ class EspProvisioningBridge(context: Context) {
   ) {
     val peripheral = peripherals[deviceId]
     if (peripheral == null) {
-      callback.onFailure("DEVICE_NOT_FOUND", "BLE scan result is no longer available")
+      dispatchToMain {
+        callback.onFailure("DEVICE_NOT_FOUND", "BLE scan result is no longer available")
+      }
       return
     }
     stopScan()
@@ -138,7 +147,9 @@ class EspProvisioningBridge(context: Context) {
     val timeout = Runnable {
       val pending = pendingConnect ?: return@Runnable
       pendingConnect = null
-      pending.onFailure("CONNECT_FAILED", "BLE connection timed out")
+      dispatchToMain {
+        pending.onFailure("CONNECT_FAILED", "BLE connection timed out")
+      }
       device.disconnectDevice()
     }
     connectTimeout = timeout
@@ -153,7 +164,9 @@ class EspProvisioningBridge(context: Context) {
         val callback = pendingConnect ?: return
         clearConnectTimer()
         pendingConnect = null
-        callback.onSuccess("")
+        dispatchToMain {
+          callback.onSuccess("")
+        }
       }
       ESPConstants.EVENT_DEVICE_CONNECTION_FAILED -> failPendingConnect("CONNECT_FAILED", "BLE connection failed")
       ESPConstants.EVENT_DEVICE_DISCONNECTED -> failPendingConnect("DISCONNECTED", "BLE device disconnected")
@@ -161,7 +174,13 @@ class EspProvisioningBridge(context: Context) {
   }
 
   fun getCapabilities(callback: BridgeResultCallback) {
-    val device = espDevice ?: return callback.onFailure("DISCONNECTED", "Device is not connected")
+    val device = espDevice
+    if (device == null) {
+      dispatchToMain {
+        callback.onFailure("DISCONNECTED", "Device is not connected")
+      }
+      return
+    }
     try {
       val root = JSONObject(device.versionInfo ?: "{}")
       val prov = root.optJSONObject("prov") ?: JSONObject()
@@ -173,24 +192,43 @@ class EspProvisioningBridge(context: Context) {
         .put("protocolVersion", prov.optString("ver", ""))
         .put("securityVersion", prov.optInt("sec_ver", -1))
         .put("capabilities", capabilities)
-      callback.onSuccess(result.toString())
+      val payload = result.toString()
+      dispatchToMain {
+        callback.onSuccess(payload)
+      }
     } catch (error: Exception) {
-      callback.onFailure("SERVICE_MISMATCH", safeMessage(error))
+      val message = safeMessage(error)
+      dispatchToMain {
+        callback.onFailure("SERVICE_MISMATCH", message)
+      }
     }
   }
 
   fun getDeviceInfo(callback: BridgeResultCallback) {
-    val device = espDevice ?: return callback.onFailure("DISCONNECTED", "Device is not connected")
+    val device = espDevice
+    if (device == null) {
+      dispatchToMain {
+        callback.onFailure("DISCONNECTED", "Device is not connected")
+      }
+      return
+    }
     device.sendDataToCustomEndPoint(
       "device-info",
       "{}".toByteArray(StandardCharsets.UTF_8),
       object : ResponseListener {
         override fun onSuccess(returnData: ByteArray) {
-          callback.onSuccess(String(returnData, StandardCharsets.UTF_8))
+          val payload = String(returnData, StandardCharsets.UTF_8)
+          dispatchToMain {
+            callback.onSuccess(payload)
+          }
         }
 
         override fun onFailure(error: Exception) {
-          callback.onFailure(mapSessionError(error), safeMessage(error))
+          val code = mapSessionError(error)
+          val message = safeMessage(error)
+          dispatchToMain {
+            callback.onFailure(code, message)
+          }
         }
       },
     )
@@ -198,24 +236,43 @@ class EspProvisioningBridge(context: Context) {
 
   /** 向固件自定义 protocomm endpoint 写数据（如 vox-config 下发 deviceSecret），走已加密的 Security 2 会话 */
   fun sendCustomData(endpoint: String, payload: String, callback: BridgeResultCallback) {
-    val device = espDevice ?: return callback.onFailure("DISCONNECTED", "Device is not connected")
+    val device = espDevice
+    if (device == null) {
+      dispatchToMain {
+        callback.onFailure("DISCONNECTED", "Device is not connected")
+      }
+      return
+    }
     device.sendDataToCustomEndPoint(
       endpoint,
       payload.toByteArray(StandardCharsets.UTF_8),
       object : ResponseListener {
         override fun onSuccess(returnData: ByteArray) {
-          callback.onSuccess(String(returnData, StandardCharsets.UTF_8))
+          val response = String(returnData, StandardCharsets.UTF_8)
+          dispatchToMain {
+            callback.onSuccess(response)
+          }
         }
 
         override fun onFailure(error: Exception) {
-          callback.onFailure(mapSessionError(error), safeMessage(error))
+          val code = mapSessionError(error)
+          val message = safeMessage(error)
+          dispatchToMain {
+            callback.onFailure(code, message)
+          }
         }
       },
     )
   }
 
   fun scanNetworks(callback: BridgeResultCallback) {
-    val device = espDevice ?: return callback.onFailure("DISCONNECTED", "Device is not connected")
+    val device = espDevice
+    if (device == null) {
+      dispatchToMain {
+        callback.onFailure("DISCONNECTED", "Device is not connected")
+      }
+      return
+    }
     device.scanNetworks(object : WiFiScanListener {
       override fun onWifiListReceived(wifiList: ArrayList<WiFiAccessPoint>) {
         val result = JSONArray()
@@ -227,11 +284,17 @@ class EspProvisioningBridge(context: Context) {
               .put("security", network.security),
           )
         }
-        callback.onSuccess(result.toString())
+        val payload = result.toString()
+        dispatchToMain {
+          callback.onSuccess(payload)
+        }
       }
 
       override fun onWiFiScanFailed(error: Exception) {
-        callback.onFailure("UNKNOWN", safeMessage(error))
+        val message = safeMessage(error)
+        dispatchToMain {
+          callback.onFailure("UNKNOWN", message)
+        }
       }
     })
   }
@@ -243,11 +306,19 @@ class EspProvisioningBridge(context: Context) {
     progress: BridgeProgressCallback,
     callback: BridgeResultCallback,
   ) {
-    val device = espDevice ?: return callback.onFailure("DISCONNECTED", "Device is not connected")
+    val device = espDevice
+    if (device == null) {
+      dispatchToMain {
+        callback.onFailure("DISCONNECTED", "Device is not connected")
+      }
+      return
+    }
     val completed = AtomicBoolean(false)
     val timeout = Runnable {
       if (completed.compareAndSet(false, true)) {
-        callback.onFailure("STATUS_TIMEOUT", "Provisioning status timed out")
+        dispatchToMain {
+          callback.onFailure("STATUS_TIMEOUT", "Provisioning status timed out")
+        }
       }
     }
     mainHandler.postDelayed(timeout, timeoutMs)
@@ -255,14 +326,18 @@ class EspProvisioningBridge(context: Context) {
     fun success() {
       if (completed.compareAndSet(false, true)) {
         mainHandler.removeCallbacks(timeout)
-        callback.onSuccess("")
+        dispatchToMain {
+          callback.onSuccess("")
+        }
       }
     }
 
     fun failure(code: String, message: String) {
       if (completed.compareAndSet(false, true)) {
         mainHandler.removeCallbacks(timeout)
-        callback.onFailure(code, message)
+        dispatchToMain {
+          callback.onFailure(code, message)
+        }
       }
     }
 
@@ -272,7 +347,9 @@ class EspProvisioningBridge(context: Context) {
       }
 
       override fun wifiConfigSent() {
-        progress.onProgress("SENDING_CREDENTIALS")
+        dispatchToMain {
+          progress.onProgress("SENDING_CREDENTIALS")
+        }
       }
 
       override fun wifiConfigFailed(error: Exception) {
@@ -280,8 +357,10 @@ class EspProvisioningBridge(context: Context) {
       }
 
       override fun wifiConfigApplied() {
-        progress.onProgress("APPLYING_CONFIG")
-        progress.onProgress("CHECKING_STATUS")
+        dispatchToMain {
+          progress.onProgress("APPLYING_CONFIG")
+          progress.onProgress("CHECKING_STATUS")
+        }
       }
 
       override fun wifiConfigApplyFailed(error: Exception) {
@@ -298,7 +377,9 @@ class EspProvisioningBridge(context: Context) {
       }
 
       override fun deviceProvisioningSuccess() {
-        progress.onProgress("SUCCESS")
+        dispatchToMain {
+          progress.onProgress("SUCCESS")
+        }
         success()
       }
 
@@ -338,7 +419,25 @@ class EspProvisioningBridge(context: Context) {
     val callback = pendingConnect ?: return
     clearConnectTimer()
     pendingConnect = null
-    callback.onFailure(code, message)
+    dispatchToMain {
+      callback.onFailure(code, message)
+    }
+  }
+
+  /**
+   * ESP SDK 的扫描、ResponseListener 与 ProvisionListener 回调线程不固定。
+   * UTS 回调会进一步触发 Vue 响应式调度；若从多个线程同时入队，
+   * flushJobs 对队列排序时可能抛出 ConcurrentModificationException。
+   * 所有跨 UTS 边界的回调统一串行到 Android 主线程。
+   */
+  private fun dispatchToMain(action: () -> Unit) {
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+      action()
+    } else {
+      mainHandler.post {
+        action()
+      }
+    }
   }
 
   private fun mapSessionError(error: Exception): String {

@@ -2,12 +2,16 @@
  * 将本地 PCM/WAV 录音文件推给 ASR。
  * - 等每块 WebSocket send success 后再发下一块 / stop
  * - 按音频时长节流（逼近实时流），避免瞬间灌完被服务端判 no_speech
+ * - 切帧用 TypedArray.set，禁止整文件逐字节拷贝（长按后松手易 ANR）
  */
 import { ASR_FRAME_BYTES, ASR_SAMPLE_RATE } from "./asrWebSocketClient";
 
 export type OnPcmChunkCallback = (frame: ArrayBuffer) => void;
 /** 异步发送一帧，成功 resolve */
 export type SendPcmAsync = (frame: ArrayBuffer) => Promise<boolean>;
+
+/** ASR 推流硬上限：超过只取前段，避免超长录音整文件切帧打满主线程 */
+const ASR_MAX_PUSH_MS: number = 60000;
 
 /**
  * 读取录音临时文件为 ArrayBuffer。
@@ -40,6 +44,17 @@ export function readAudioFileBuffer(
   });
 }
 
+/**
+ * 用 ArrayBuffer.slice 截取一段（平台原生拷贝，避免逐字节循环）。
+ */
+function copyBufferRange(
+  buffer: ArrayBuffer,
+  start: number,
+  length: number,
+): ArrayBuffer {
+  return buffer.slice(start, start + length);
+}
+
 /** 若是 WAV，跳过 44 字节头，返回裸 PCM；否则原样返回 */
 export function stripWavHeaderIfNeeded(buffer: ArrayBuffer): ArrayBuffer {
   if (buffer.byteLength < 44) {
@@ -57,12 +72,7 @@ export function stripWavHeaderIfNeeded(buffer: ArrayBuffer): ArrayBuffer {
     view[11] == 0x45
   ) {
     const pcmLen = buffer.byteLength - 44;
-    const out = new ArrayBuffer(pcmLen);
-    const outView = new Uint8Array(out);
-    for (let i = 0; i < pcmLen; i++) {
-      outView[i] = view[i + 44];
-    }
-    return out;
+    return copyBufferRange(buffer, 44, pcmLen);
   }
   return buffer;
 }
@@ -80,17 +90,11 @@ export function splitPcmChunks(
   if (total == 0) {
     return chunks;
   }
-  const src = new Uint8Array(pcm);
   let offset = 0;
   while (offset < total) {
     const remain = total - offset;
     const chunkLen = remain > size ? size : remain;
-    const frame = new ArrayBuffer(chunkLen);
-    const dst = new Uint8Array(frame);
-    for (let i = 0; i < chunkLen; i++) {
-      dst[i] = src[offset + i];
-    }
-    chunks.push(frame);
+    chunks.push(copyBufferRange(pcm, offset, chunkLen));
     offset += chunkLen;
   }
   return chunks;
@@ -106,6 +110,21 @@ function pcmBytesToMs(byteLength: number): number {
   return Math.floor(ms);
 }
 
+/** 按时长上限截取 PCM 前缀（16k mono PCM16） */
+function truncatePcmForAsr(pcm: ArrayBuffer): ArrayBuffer {
+  const maxBytes = Math.floor((ASR_SAMPLE_RATE * 2 * ASR_MAX_PUSH_MS) / 1000);
+  if (pcm.byteLength <= maxBytes) {
+    return pcm;
+  }
+  console.warn(
+    "[ASR] pcm truncated for push len=" +
+      pcm.byteLength.toString() +
+      " max=" +
+      maxBytes.toString(),
+  );
+  return copyBufferRange(pcm, 0, maxBytes);
+}
+
 /**
  * 读文件 → 去 WAV 头 → 按帧异步发送（success + 按时长节流）→ done。
  */
@@ -119,11 +138,12 @@ export function streamLocalAudioFileToAsr(
       done(false);
       return;
     }
-    const pcm = stripWavHeaderIfNeeded(buffer!);
-    if (pcm.byteLength == 0) {
+    const pcmRaw = stripWavHeaderIfNeeded(buffer!);
+    if (pcmRaw.byteLength == 0) {
       done(false);
       return;
     }
+    const pcm = truncatePcmForAsr(pcmRaw);
     // 对齐协议 20ms 帧，便于服务端 VAD
     const chunks = splitPcmChunks(pcm, ASR_FRAME_BYTES);
     sendChunksSequentially(chunks, sendFrameAsync, 0, 0, done);

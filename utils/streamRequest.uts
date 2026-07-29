@@ -5,18 +5,19 @@ import { t } from "@/utils/i18n";
 import { readRawField } from "@/utils/readRawField.uts";
 
 /**
- * 合并两个 Uint8Array（TypedArray.set 批量拷贝，避免主线程逐字节拼接）。
+ * 合并两个 Uint8Array。
+ * UTS 的 Uint8Array.set 只支持 set(index, element)，不支持整段拷贝。
  * @param first 前一段字节
  * @param second 后一段字节
  * @returns 合并后的新数组
  */
 function mergeUint8Arrays(first: Uint8Array, second: Uint8Array): Uint8Array {
   const merged = new Uint8Array(first.length + second.length);
-  if (first.length > 0) {
-    merged.set(first, 0);
+  for (let i = 0; i < first.length; i++) {
+    merged[i] = first[i];
   }
-  if (second.length > 0) {
-    merged.set(second, first.length);
+  for (let j = 0; j < second.length; j++) {
+    merged[first.length + j] = second[j];
   }
   return merged;
 }
@@ -141,6 +142,66 @@ function shouldSkipSsePayloadEmit(data: any): boolean {
 }
 
 /**
+ * 从 SSE data 帧里粗提取 eventType（避免 enqueue 时全量 JSON.parse）。
+ */
+function peekSseEventType(content: string): string {
+  if (content.length == 0) {
+    return "";
+  }
+  const key = "\"eventType\"";
+  const keyIdx = content.indexOf(key);
+  if (keyIdx < 0) {
+    return "";
+  }
+  const afterKey = content.substring(keyIdx + key.length);
+  const colonIdx = afterKey.indexOf(":");
+  if (colonIdx < 0) {
+    return "";
+  }
+  let i = colonIdx + 1;
+  while (i < afterKey.length) {
+    const ch = afterKey.charAt(i);
+    if (ch == " " || ch == "\t" || ch == "\n" || ch == "\r") {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  if (i >= afterKey.length || afterKey.charAt(i) != "\"") {
+    return "";
+  }
+  i += 1;
+  const end = afterKey.indexOf("\"", i);
+  if (end < 0) {
+    return "";
+  }
+  return afterKey.substring(i, end);
+}
+
+/**
+ * 从原始 SSE 文本块中提取 data: 载荷（可能多行）。
+ */
+function extractSseDataContent(message: string): string {
+  if (message.length == 0) {
+    return "";
+  }
+  const lines = message.split("\n");
+  let dataContent = "";
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("data:")) {
+      const content = line.slice(5).trim();
+      if (dataContent.length > 0) {
+        dataContent += "\n" + content;
+      } else {
+        dataContent = content;
+      }
+    }
+  }
+  return dataContent;
+}
+
+/**
  * 判断错误是否为用户主动中止请求（AbortError）。
  * @param error 捕获到的错误对象
  * @returns 是 AbortError 时返回 true
@@ -255,7 +316,15 @@ export class StreamRequest {
   private sseDispatchRunning: boolean = false;
   private sseDispatchConfig: StreamRequestConfig | null = null;
   private sseDispatchOnComplete: (() => void) | null = null;
+  /** 轻负载时帧间隔；积压时会降为 0 并加大 batch */
   private readonly SSE_DISPATCH_INTERVAL_MS: number = 16;
+  /** 大包异步入队尚未完成（防止 complete 误判队列空闲） */
+  private sseBurstEnqueuePending: boolean = false;
+  private sseBurstTimer: number | null = null;
+  /** burst 入队剩余帧与游标（UTS 不支持嵌套函数自引用，须挂实例） */
+  private sseBurstRest: string[] | null = null;
+  private sseBurstOffset: number = 0;
+  private readonly SSE_BURST_SLICE: number = 80;
   /** App：已通过 onChunkReceived 解码的原始字节数，用于 residual 只吃增量尾包 */
   private decodedChunkBytes: number = 0;
 
@@ -411,24 +480,48 @@ export class StreamRequest {
     this.sseDispatchRunning = false;
     this.sseDispatchConfig = null;
     this.sseDispatchOnComplete = null;
+    this.sseBurstEnqueuePending = false;
+    this.sseBurstRest = null;
+    this.sseBurstOffset = 0;
+    if (this.sseBurstTimer != null) {
+      clearTimeout(this.sseBurstTimer!);
+      this.sseBurstTimer = null;
+    }
   }
 
   /**
-   * App 端将 SSE 消息逐帧派发，让 iOS 有机会在 chunk 之间渲染打字机效果。
+   * App 端入队：连续 MESSAGE 只保留最新一帧，避免大数据查询时数千帧×16ms 严重拖垮渲染。
    */
   private enqueueSseMessage(
     content: string,
     config: StreamRequestConfig,
     onStreamComplete: () => void,
   ): void {
-    this.sseDispatchQueue.push(content);
     this.sseDispatchConfig = config;
     this.sseDispatchOnComplete = onStreamComplete;
+    const eventType = peekSseEventType(content);
+    if (
+      eventType == "MESSAGE" &&
+      this.sseDispatchQueue.length > 0
+    ) {
+      const last = this.sseDispatchQueue[this.sseDispatchQueue.length - 1];
+      if (peekSseEventType(last) == "MESSAGE") {
+        this.sseDispatchQueue[this.sseDispatchQueue.length - 1] = content;
+        if (this.sseDispatchRunning == false) {
+          this.pumpSseDispatchQueue();
+        }
+        return;
+      }
+    }
+    this.sseDispatchQueue.push(content);
     if (this.sseDispatchRunning == false) {
       this.pumpSseDispatchQueue();
     }
   }
 
+  /**
+   * 按积压深度自适应批量派发：队列越深，单次处理越多、间隔越短，尽快追上网络进度。
+   */
   private pumpSseDispatchQueue(): void {
     if (this.isAborted) {
       this.resetSseDispatchQueue();
@@ -440,24 +533,162 @@ export class StreamRequest {
     }
 
     this.sseDispatchRunning = true;
-    const content = this.sseDispatchQueue.shift() as string;
     const config = this.sseDispatchConfig as StreamRequestConfig;
     const onComplete = this.sseDispatchOnComplete as () => void;
-    this.processSSEMessage(content, config, onComplete);
+    const qLen = this.sseDispatchQueue.length;
+    let batchSize = 1;
+    if (qLen > 200) {
+      batchSize = 40;
+    } else if (qLen > 50) {
+      batchSize = 16;
+    } else if (qLen > 10) {
+      batchSize = 5;
+    } else if (qLen > 1) {
+      batchSize = 2;
+    }
 
+    for (let i = 0; i < batchSize; i++) {
+      if (this.sseDispatchQueue.length == 0) {
+        break;
+      }
+      if (this.isAborted) {
+        break;
+      }
+      const content = this.sseDispatchQueue.shift() as string;
+      this.processSSEMessage(content, config, onComplete);
+      if (this.receivedTerminalMarker == true) {
+        // 终态后丢弃积压帧，避免 completed 之后还慢吞吞刷旧 MESSAGE
+        this.sseDispatchQueue = [];
+        this.sseBurstEnqueuePending = false;
+        this.sseBurstRest = null;
+        this.sseBurstOffset = 0;
+        if (this.sseBurstTimer != null) {
+          clearTimeout(this.sseBurstTimer!);
+          this.sseBurstTimer = null;
+        }
+        break;
+      }
+    }
+
+    if (this.isAborted || this.receivedTerminalMarker == true) {
+      this.sseDispatchRunning = false;
+      return;
+    }
+    if (
+      this.sseDispatchQueue.length == 0 &&
+      this.sseBurstEnqueuePending != true
+    ) {
+      this.sseDispatchRunning = false;
+      return;
+    }
+    if (this.sseDispatchQueue.length == 0) {
+      // burst 还在往队列塞，稍后由 burst 回调再泵
+      this.sseDispatchRunning = false;
+      return;
+    }
+
+    const remain = this.sseDispatchQueue.length;
+    const delay =
+      remain > 20 ? 0 : this.SSE_DISPATCH_INTERVAL_MS;
     setTimeout(() => {
       this.pumpSseDispatchQueue();
-    }, this.SSE_DISPATCH_INTERVAL_MS);
+    }, delay);
   }
 
   private waitForSseDispatchIdle(onIdle: () => void): void {
-    if (this.sseDispatchRunning == false && this.sseDispatchQueue.length == 0) {
+    if (
+      this.sseDispatchRunning == false &&
+      this.sseDispatchQueue.length == 0 &&
+      this.sseBurstEnqueuePending != true
+    ) {
       onIdle();
       return;
     }
     setTimeout(() => {
       this.waitForSseDispatchIdle(onIdle);
     }, this.SSE_DISPATCH_INTERVAL_MS);
+  }
+
+  /**
+   * 大包分帧：先同步处理首帧让 UI 立刻有内容，其余异步入队（MESSAGE 合并），避免卡死主线程。
+   */
+  private enqueueSseFramesWithFirstPaint(
+    frames: string[],
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    if (frames.length == 0) {
+      return;
+    }
+    // 首帧同步：尽快驱动 streamingAssistantText / 气泡
+    this.processSSEMessage(frames[0], config, onStreamComplete);
+    if (frames.length == 1 || this.receivedTerminalMarker == true) {
+      return;
+    }
+
+    const rest: string[] = [];
+    for (let i = 1; i < frames.length; i++) {
+      rest.push(frames[i]);
+    }
+
+    this.sseBurstEnqueuePending = true;
+    this.sseDispatchConfig = config;
+    this.sseDispatchOnComplete = onStreamComplete;
+    this.sseBurstRest = rest;
+    this.sseBurstOffset = 0;
+    this.sseBurstTimer = setTimeout(() => {
+      this.pumpSseBurstEnqueue();
+    }, 0);
+  }
+
+  /**
+   * 分片把大包剩余帧入队（实例方法，避免 UTS 嵌套函数自引用编译失败）。
+   */
+  private pumpSseBurstEnqueue(): void {
+    this.sseBurstTimer = null;
+    if (this.isAborted) {
+      this.sseBurstEnqueuePending = false;
+      this.sseBurstRest = null;
+      this.sseBurstOffset = 0;
+      return;
+    }
+    const rest = this.sseBurstRest;
+    if (rest == null) {
+      this.sseBurstEnqueuePending = false;
+      return;
+    }
+    const offset = this.sseBurstOffset;
+    const sliceSize = this.SSE_BURST_SLICE;
+    const end =
+      offset + sliceSize < rest.length ? offset + sliceSize : rest.length;
+    for (let i = offset; i < end; i++) {
+      const content = rest[i];
+      const eventType = peekSseEventType(content);
+      if (eventType == "MESSAGE" && this.sseDispatchQueue.length > 0) {
+        const last = this.sseDispatchQueue[this.sseDispatchQueue.length - 1];
+        if (peekSseEventType(last) == "MESSAGE") {
+          this.sseDispatchQueue[this.sseDispatchQueue.length - 1] = content;
+          continue;
+        }
+      }
+      this.sseDispatchQueue.push(content);
+    }
+    this.sseBurstOffset = end;
+    if (end < rest.length) {
+      this.sseBurstTimer = setTimeout(() => {
+        this.pumpSseBurstEnqueue();
+      }, 0);
+      if (this.sseDispatchRunning == false) {
+        this.pumpSseDispatchQueue();
+      }
+      return;
+    }
+    this.sseBurstRest = null;
+    this.sseBurstOffset = 0;
+    this.sseBurstEnqueuePending = false;
+    if (this.sseDispatchRunning == false) {
+      this.pumpSseDispatchQueue();
+    }
   }
 
   /**
@@ -490,33 +721,42 @@ export class StreamRequest {
     const pendingMessage = messages.pop();
     this.buffer = pendingMessage != null ? pendingMessage : "";
 
-    for (const message of messages) {
-      if (!message.trim()) {
-        continue;
-      }
-
-      const lines = message.split("\n");
-      let dataContent = "";
-
-      for (const line of lines) {
-        if (line.startsWith("data:")) {
-          const content = line.slice(5).trim();
-          if (dataContent.length > 0) {
-            dataContent += "\n" + content;
-          } else {
-            dataContent = content;
-          }
+    if (yieldBetweenMessages != true) {
+      for (let mi = 0; mi < messages.length; mi++) {
+        const message = messages[mi];
+        if (!message.trim()) {
+          continue;
         }
-      }
-
-      if (dataContent.length > 0) {
-        if (yieldBetweenMessages) {
-          this.enqueueSseMessage(dataContent, config, onStreamComplete);
-        } else {
+        const dataContent = extractSseDataContent(message);
+        if (dataContent.length > 0) {
           this.processSSEMessage(dataContent, config, onStreamComplete);
         }
       }
+      return;
     }
+
+    // App：先收集 data 帧；多帧时首帧同步上屏，其余异步入队+MESSAGE 合并
+    const frames: string[] = [];
+    for (let mi = 0; mi < messages.length; mi++) {
+      const message = messages[mi];
+      if (!message.trim()) {
+        continue;
+      }
+      const dataContent = extractSseDataContent(message);
+      if (dataContent.length > 0) {
+        frames.push(dataContent);
+      }
+    }
+    if (frames.length == 0) {
+      return;
+    }
+    if (frames.length <= 3) {
+      for (let fi = 0; fi < frames.length; fi++) {
+        this.enqueueSseMessage(frames[fi], config, onStreamComplete);
+      }
+      return;
+    }
+    this.enqueueSseFramesWithFirstPaint(frames, config, onStreamComplete);
   }
 
   // 处理完整的 SSE 消息

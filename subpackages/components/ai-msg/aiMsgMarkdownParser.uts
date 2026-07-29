@@ -186,6 +186,8 @@ export class AiMsgMarkdownParser {
   private getIsConversationActive: () => boolean;
   private getIsLastMsg: () => boolean;
   private parseMarkdown: ParseMarkdown | null = null;
+  /** 递增后忽略旧 ParseMarkdown 回调，避免增量打字机覆盖 fallback 结果 */
+  private parseGeneration: number = 0;
   private cmarkProbeDone: boolean = false;
   private cmarkProbeOk: boolean = true;
   private lastFallbackBody: string = "";
@@ -215,12 +217,26 @@ export class AiMsgMarkdownParser {
   }
 
   resetForNewMessage(): void {
+    this.abortIncrementalParse();
     this.cmarkParseEnabled = true;
     this.cmarkProbeDone = false;
     this.cmarkProbeOk = true;
     this.lastFallbackBody = "";
     this.lastFinishedBody = "";
     this.parseMarkdown = this.createParseMarkdown();
+  }
+
+  /**
+   * 中止 uni-cmark 增量打字机。
+   * 正文一旦出现 :::container / 工具标签会切到 App fallback；
+   * 若不中止，旧 runTask 的延迟回调会用半截正文覆盖已渲染列表（H5 表现为卡在「好的…7月30」）。
+   */
+  private abortIncrementalParse(): void {
+    this.parseGeneration = this.parseGeneration + 1;
+    const pm = this.parseMarkdown;
+    if (pm != null) {
+      pm.abort();
+    }
   }
 
   private bumpRevision(): void {
@@ -264,6 +280,9 @@ export class AiMsgMarkdownParser {
     ) {
       return;
     }
+    // 进入 fallback 前必须掐掉 cmark 打字机，否则延迟回调会覆盖本结果
+    this.abortIncrementalParse();
+    this.parseMarkdown = null;
     this.lastFallbackBody = body;
     if (body.indexOf("|") >= 0) {
       mdRenderLog(
@@ -380,7 +399,12 @@ export class AiMsgMarkdownParser {
   }
 
   private createParseMarkdown(): ParseMarkdown {
+    const gen = this.parseGeneration;
     return new ParseMarkdown((markdownTokenList: MarkdownToken[], isParseDone: boolean) => {
+      // 已切换到 fallback / 新消息：忽略过期打字机回调
+      if (gen != this.parseGeneration) {
+        return;
+      }
       this.applyMarkdownTokenList(markdownTokenList);
       if (isParseDone) {
         this.msg.value.rendered = true;
@@ -438,6 +462,7 @@ export class AiMsgMarkdownParser {
 
     // Plan / ToolCall / task-result：与 dev 的 mp-html 自定义节点等价，须走 App fallback。
     // uni-cmark 不会产出 markdown_custom_process，会把标签泄漏为正文。
+    // 一旦出现自定义标记，立即中止 cmark 增量打字机，避免半截正文覆盖 UI。
     if (needsCustomFallback) {
       this.applyAppFallback();
       if (streamFinished) {
@@ -474,6 +499,7 @@ export class AiMsgMarkdownParser {
         "[MdRender] runMarkdownParse.bodyShrunk",
         `msgId=${msgId} bodyLen=${body.length} oldLen=${pm.oldMsgBodyLength}`,
       );
+      this.abortIncrementalParse();
       this.parseMarkdown = this.createParseMarkdown();
       this.msg.value.markdownElList = [] as UniAiMarkdownElItem[];
       this.lastFinishedBody = "";

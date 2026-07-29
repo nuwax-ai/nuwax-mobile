@@ -85,6 +85,7 @@ import {
   jumpToFilePreviewPage,
 } from "@/utils/system.uts";
 import { t } from "@/utils/i18n";
+import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
 
 /** 超时回调类型 */
 type TimeoutCallback = any;
@@ -187,7 +188,10 @@ class _ConversationChatSuggestParams implements ConversationChatSuggestParams {
     }
     const variableRaw = readRawField(raw, "variableParams");
     if (variableRaw != null) {
-      this.variableParams = variableRaw as StringAnyRecord;
+      // Android：UTSReactiveJSONObject / UTSJSONObject 禁止 as StringAnyRecord(Map)
+      this.variableParams = AgentDetailUtils.utsObjToRecord(
+        variableRaw as UTSJSONObject,
+      );
     }
     const sandboxRaw = readRawField(raw, "sandboxId");
     if (sandboxRaw != null) {
@@ -975,10 +979,41 @@ export default class AgentDetailService {
         processingResult = resultVal;
       }
       const executeIdRaw = readRawField(processingResult, "executeId");
+      // App：executeId 多在 result 内；补到顶层再生成 :::container，避免 getCustomBlock 跳过
+      const blockSource = new UTSJSONObject();
+      const typeTop = readRawField(responseData, "type");
+      const nameTop = readRawField(responseData, "name");
+      const statusTop = readRawField(responseData, "status");
+      if (typeTop != null) {
+        blockSource["type"] = typeTop;
+      }
+      if (nameTop != null) {
+        blockSource["name"] = nameTop;
+      }
+      if (statusTop != null) {
+        blockSource["status"] = statusTop;
+      }
+      if (executeIdRaw != null) {
+        blockSource["executeId"] = executeIdRaw;
+      } else {
+        const execTop = readRawField(responseData, "executeId");
+        if (execTop != null) {
+          blockSource["executeId"] = execTop;
+        }
+      }
+      const nameNested = readRawField(processingResult, "name");
+      if (blockSource["name"] == null && nameNested != null) {
+        blockSource["name"] = nameNested;
+      }
+      const statusNested = readRawField(processingResult, "status");
+      if (blockSource["status"] == null && statusNested != null) {
+        blockSource["status"] = statusNested;
+      }
+      blockSource["result"] = processingResult;
 
       const accumulatedText = getCustomBlock(
         currentTextSnapshot,
-        responseData,
+        blockSource,
       );
 
       let oldProcessingList: ProcessingInfo[] = [];
@@ -1031,7 +1066,20 @@ export default class AgentDetailService {
 
     if (eventTypeStr == `${ConversationEventTypeEnum.MESSAGE}`) {
       const textRaw = readRawField(responseData, "text");
-      const text = textRaw != null ? `${textRaw}` : "";
+      let text = textRaw != null ? `${textRaw}` : "";
+      // App：偶发正文在 content/delta（兼容兜底）
+      if (text.length == 0) {
+        const contentRaw = readRawField(responseData, "content");
+        if (contentRaw != null) {
+          text = `${contentRaw}`;
+        }
+      }
+      if (text.length == 0) {
+        const deltaRaw = readRawField(responseData, "delta");
+        if (deltaRaw != null) {
+          text = `${deltaRaw}`;
+        }
+      }
       const typeRaw = readRawField(responseData, "type");
       const type = typeRaw != null ? `${typeRaw}` : "";
       const extRaw = readRawField(responseData, "ext");
@@ -1039,9 +1087,20 @@ export default class AgentDetailService {
       const idRaw = readRawField(responseData, "id");
       const id = idRaw != null ? `${idRaw}` : "";
       const finishedRaw = readRawField(responseData, "finished");
-      const finished = finishedRaw == true;
+      const finished = finishedRaw == true || `${finishedRaw}` == "true";
       // 注意：中间段 CHAT 也可能带 finished=true（如仅下发 agent-info），
       // 不能据此结束整轮会话；整轮结束以 FINAL_RESULT / 流完成 / 用户停止为准。
+
+      if (text.length == 0 && type.length > 0) {
+        console.log(
+          "[SSE-Stream] MESSAGE empty text type=",
+          type,
+          "finished=",
+          finished,
+          "id=",
+          id,
+        );
+      }
 
       if (type == `${MessageModeEnum.THINK}`) {
         const m = cloneMessageInfoDraft(currentMessage);
@@ -1136,9 +1195,16 @@ export default class AgentDetailService {
         this.data.streamingAssistantText.value = patchedText;
         // 固定为客户端气泡 id（currentMessageId），避免服务端改写 id 导致播报会话被 begin 重置
         this.data.streamingAssistantMessageId.value = currentMessageId;
+        // 直接驱动无头 TTS：不依赖页面 watch（长 SSE 下 watch/hold 易拖到结束后才播）
+        uni.$emit("streamSpeakFeed", {
+          messageId: currentMessageId,
+          bodyText: patchedText,
+          finished: false,
+        });
       }
       const preview =
         patchedText.length > 48 ? `${patchedText.substring(0, 48)}...` : patchedText;
+      const thinkPreview = readMessageThink(newMessage);
       console.log(
         "[SSE-Stream] 更新消息 event=",
         eventTypeStr,
@@ -1146,6 +1212,8 @@ export default class AgentDetailService {
         currentMessageId,
         "textLen=",
         patchedText.length,
+        "thinkLen=",
+        thinkPreview.length,
         "streamTextLen=",
         this.data.streamingAssistantText.value.length,
         "status=",
@@ -1255,7 +1323,9 @@ export default class AgentDetailService {
     try {
       // 清空问题建议列表
       this.data.chatSuggestList.value = [];
-      this.clearStreamingAssistantText();
+      // 只清正文，保留本轮助手气泡 id，供发送手势内立刻 begin 流式播报
+      this.data.streamingAssistantText.value = "";
+      this.data.streamingAssistantMessageId.value = currentMessageId;
       // 开始会话后，允许获取问题建议
       this.isAllowSuggest = true;
 
@@ -1347,12 +1417,15 @@ export default class AgentDetailService {
           }
         },
         isTempChat,
-        // 超时回调
+        // 超时 / 连接异常关闭回调（H5 onClose、App 无 SSE 终态的 HTTP complete）
         () => {
           if (streamGen != this.streamGeneration) {
             return;
           }
+          console.warn("[SSE-Stream] stream abnormal close / timeout");
           this.clearStreamingAssistantText();
+          // App：无终态断流时助手常停在 Loading（仅工具卡），回拉会话补正文
+          this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
           if (onTimeout != null) {
             (onTimeout as () => void)();
           }
@@ -1378,6 +1451,28 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
+    // 冲刷尾句：必须在 clearStreaming / inactive 之前，携带最终正文
+    const speakMsgId = this.data.streamingAssistantMessageId.value;
+    let speakBody = this.data.streamingAssistantText.value;
+    if (speakBody.length == 0) {
+      const list = this.data.messageList.value;
+      if (list.length > 0) {
+        const last = list[list.length - 1];
+        if (
+          last != null &&
+          last.messageType == MessageTypeEnum.ASSISTANT
+        ) {
+          speakBody = readMessageText(last);
+        }
+      }
+    }
+    if (speakMsgId.length > 0 || speakBody.length > 0) {
+      uni.$emit("streamSpeakFeed", {
+        messageId: speakMsgId,
+        bodyText: speakBody,
+        finished: true,
+      });
+    }
     // 先结束会话态（触发 Markdown 终态解析），再清打字机通道，避免中间空白一帧
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
@@ -1420,6 +1515,83 @@ export default class AgentDetailService {
         );
       }
     }
+
+    // App：正常 onComplete 后若助手仍 Loading（少见），同样尝试回补
+    this.scheduleRecoverIfAssistantLoading(isTempChat, this.streamGeneration);
+  }
+
+  /**
+   * App：助手气泡仍为 Loading（常见于工具 PROCESSING 后断流）时，延迟回拉会话详情补正文。
+   */
+  private scheduleRecoverIfAssistantLoading(
+    isTempChat: boolean,
+    streamGenAtSchedule: number,
+  ): void {
+    // #ifdef APP
+    if (isTempChat == true) {
+      return;
+    }
+    let needRecover = false;
+    const listForRecover = this.data.messageList.value;
+    if (listForRecover.length > 0) {
+      const lastForRecover = listForRecover[listForRecover.length - 1];
+      if (
+        lastForRecover != null &&
+        lastForRecover.messageType == MessageTypeEnum.ASSISTANT &&
+        lastForRecover.status == MessageStatusEnum.Loading
+      ) {
+        needRecover = true;
+      }
+    }
+    if (needRecover != true) {
+      return;
+    }
+    console.warn(
+      "[SSE-Stream] assistant still Loading → schedule resume",
+    );
+    setTimeout(() => {
+      if (streamGenAtSchedule != this.streamGeneration) {
+        return;
+      }
+      this.resumeConversationState().then((recovered: boolean) => {
+        if (recovered != true) {
+          return;
+        }
+        console.log("[SSE-Stream] resume applied");
+        this.schedulePostStreamRecovery(streamGenAtSchedule, 0);
+      });
+    }, 500);
+    // #endif
+  }
+
+  /**
+   * App：流结束后会话仍 EXECUTING 时，短暂轮询回补助手正文。
+   */
+  private schedulePostStreamRecovery(
+    expectedGen: number,
+    attempt: number,
+  ): void {
+    // #ifdef APP
+    if (attempt >= 5) {
+      return;
+    }
+    if (expectedGen != this.streamGeneration) {
+      return;
+    }
+    if (this.data.isConversationActive.value != true) {
+      return;
+    }
+    setTimeout(() => {
+      if (expectedGen != this.streamGeneration) {
+        return;
+      }
+      this.resumeConversationState().then((_ok: boolean) => {
+        if (this.data.isConversationActive.value == true) {
+          this.schedulePostStreamRecovery(expectedGen, attempt + 1);
+        }
+      });
+    }, 2000);
+    // #endif
   }
 
   /**
@@ -1921,6 +2093,10 @@ export default class AgentDetailService {
         return;
       }
     }
+
+    // 发送新消息前：打断上一条流式/工具栏/队列播报（H5 + App 统一）
+    stopAllSpeechPlayback();
+    uni.$emit("streamSpeakInterrupt", {});
 
     // #ifdef WEB || H5
     // 如果不是临时会话页面，并且url中不包含conversationId，则修改url

@@ -1,10 +1,13 @@
 /**
- * 将本地 PCM/WAV 录音文件切成 ASR 协议帧（默认 640B）并回调。
- * 用于 App 端 RecorderManager 无实时帧回调时的兜底推流。
+ * 将本地 PCM/WAV 录音文件推给 ASR。
+ * - 等每块 WebSocket send success 后再发下一块 / stop
+ * - 按音频时长节流（逼近实时流），避免瞬间灌完被服务端判 no_speech
  */
-import { ASR_FRAME_BYTES } from "./asrWebSocketClient";
+import { ASR_FRAME_BYTES, ASR_SAMPLE_RATE } from "./asrWebSocketClient";
 
 export type OnPcmChunkCallback = (frame: ArrayBuffer) => void;
+/** 异步发送一帧，成功 resolve */
+export type SendPcmAsync = (frame: ArrayBuffer) => Promise<boolean>;
 
 /**
  * 读取录音临时文件为 ArrayBuffer。
@@ -23,7 +26,6 @@ export function readAudioFileBuffer(
         done(null);
         return;
       }
-      // APP 上通常为 ArrayBuffer
       const asBuffer = data as ArrayBuffer;
       if (typeof asBuffer.byteLength == "number") {
         done(asBuffer);
@@ -44,7 +46,6 @@ export function stripWavHeaderIfNeeded(buffer: ArrayBuffer): ArrayBuffer {
     return buffer;
   }
   const view = new Uint8Array(buffer);
-  // "RIFF" .... "WAVE"
   if (
     view[0] == 0x52 &&
     view[1] == 0x49 &&
@@ -67,17 +68,17 @@ export function stripWavHeaderIfNeeded(buffer: ArrayBuffer): ArrayBuffer {
 }
 
 /**
- * 按 frameBytes 切分 PCM，逐块回调（最后一块可不足一帧，服务端允许更大块）。
+ * 切成不超过 maxChunkBytes 的块（默认 20ms@16k PCM16 = 640B，对齐协议帧）。
  */
-export function forEachPcmFrame(
+export function splitPcmChunks(
   pcm: ArrayBuffer,
-  frameBytes: number,
-  onChunk: OnPcmChunkCallback,
-): void {
-  const size = frameBytes > 0 ? frameBytes : ASR_FRAME_BYTES;
+  maxChunkBytes: number,
+): ArrayBuffer[] {
+  const size = maxChunkBytes > 0 ? maxChunkBytes : ASR_FRAME_BYTES;
   const total = pcm.byteLength;
+  const chunks: ArrayBuffer[] = [];
   if (total == 0) {
-    return;
+    return chunks;
   }
   const src = new Uint8Array(pcm);
   let offset = 0;
@@ -89,17 +90,28 @@ export function forEachPcmFrame(
     for (let i = 0; i < chunkLen; i++) {
       dst[i] = src[offset + i];
     }
-    onChunk(frame);
+    chunks.push(frame);
     offset += chunkLen;
   }
+  return chunks;
+}
+
+/** PCM16 mono 字节数 → 时长 ms */
+function pcmBytesToMs(byteLength: number): number {
+  const samples = byteLength / 2;
+  const ms = (samples * 1000) / ASR_SAMPLE_RATE;
+  if (ms < 1) {
+    return 1;
+  }
+  return Math.floor(ms);
 }
 
 /**
- * 读文件 → 去 WAV 头 → 切帧推送。
+ * 读文件 → 去 WAV 头 → 按帧异步发送（success + 按时长节流）→ done。
  */
 export function streamLocalAudioFileToAsr(
   filePath: string,
-  sendFrame: OnPcmChunkCallback,
+  sendFrameAsync: SendPcmAsync,
   done: (ok: boolean) => void,
 ): void {
   readAudioFileBuffer(filePath, (buffer: ArrayBuffer | null) => {
@@ -112,13 +124,70 @@ export function streamLocalAudioFileToAsr(
       done(false);
       return;
     }
+    // 对齐协议 20ms 帧，便于服务端 VAD
+    const chunks = splitPcmChunks(pcm, ASR_FRAME_BYTES);
     console.log(
       "[ASR] stream file bytes=" +
         pcm.byteLength.toString() +
+        " chunks=" +
+        chunks.length.toString() +
         " path=" +
         filePath,
     );
-    forEachPcmFrame(pcm, ASR_FRAME_BYTES, sendFrame);
-    done(true);
+    sendChunksSequentially(chunks, sendFrameAsync, 0, 0, done);
   });
+}
+
+function sendChunksSequentially(
+  chunks: ArrayBuffer[],
+  sendFrameAsync: SendPcmAsync,
+  index: number,
+  sentBytes: number,
+  done: (ok: boolean) => void,
+): void {
+  if (index >= chunks.length) {
+    console.log(
+      "[ASR] stream send done bytes=" + sentBytes.toString(),
+    );
+    done(true);
+    return;
+  }
+  const frame = chunks[index];
+  const paceMs = pcmBytesToMs(frame.byteLength);
+  sendFrameAsync(frame).then(
+    (ok: boolean) => {
+      if (ok != true) {
+        console.warn(
+          "[ASR] stream send fail at chunk=" + index.toString(),
+        );
+        done(false);
+        return;
+      }
+      const nextBytes = sentBytes + frame.byteLength;
+      // 按帧时长节流，模拟实时推流（最后一帧不再额外等）
+      if (index + 1 >= chunks.length) {
+        sendChunksSequentially(
+          chunks,
+          sendFrameAsync,
+          index + 1,
+          nextBytes,
+          done,
+        );
+        return;
+      }
+      setTimeout(() => {
+        sendChunksSequentially(
+          chunks,
+          sendFrameAsync,
+          index + 1,
+          nextBytes,
+          done,
+        );
+      }, paceMs);
+    },
+    (_e: any | null) => {
+      console.warn("[ASR] stream send reject at chunk=" + index.toString());
+      done(false);
+    },
+  );
 }

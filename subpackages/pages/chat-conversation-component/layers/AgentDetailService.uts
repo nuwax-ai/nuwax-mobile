@@ -461,8 +461,94 @@ export default class AgentDetailService {
   private isAllowSuggest: boolean = true;
   /** 流式会话代数：abort/新开流时递增，用于丢弃旧 SSE 回调 */
   private streamGeneration: number = 0;
+  /**
+   * SSE 流式期间的消息列表草稿：始终保存最新态，避免未 flush 时下一帧读到旧 list。
+   * 对 messageList / updateMessageComponent 做短时合并，减轻主线程卡顿。
+   */
+  private streamListDraft: MessageInfo[] | null = null;
+  private streamUiTimer: number | null = null;
+  private pendingUiMessageId: string = "";
+  private pendingUiMessage: MessageInfo | null = null;
+  private pendingUiNeedScroll: boolean = false;
+  private readonly STREAM_UI_COALESCE_MS: number = 40;
+
   constructor(data: AgentDetailData) {
     this.data = data;
+  }
+
+  /** 取得流式草稿列表（首次从 messageList 拷贝） */
+  private getStreamListDraft(): MessageInfo[] {
+    if (this.streamListDraft != null) {
+      return this.streamListDraft as MessageInfo[];
+    }
+    const draft = [...this.data.messageList.value];
+    this.streamListDraft = draft;
+    return draft;
+  }
+
+  /** 冲刷挂起的流式 UI（messageList + 气泡组件 + 滚动） */
+  private flushStreamUiPublish(): void {
+    if (this.streamUiTimer != null) {
+      clearTimeout(this.streamUiTimer!);
+      this.streamUiTimer = null;
+    }
+    if (this.streamListDraft != null) {
+      this.data.messageList.value = [...(this.streamListDraft as MessageInfo[])];
+    }
+    const pendingMsg = this.pendingUiMessage;
+    if (pendingMsg != null) {
+      const patchedText = readMessageText(pendingMsg);
+      const emitData = messageToJsonObject(pendingMsg);
+      emitData["body"] = handleMessageProcess(patchedText);
+      uni.$emit("updateMessageComponent", {
+        messageId: `${this.pendingUiMessageId}_${pendingMsg.index}`,
+        data: emitData,
+      });
+    }
+    if (this.pendingUiNeedScroll == true) {
+      uni.$emit("streamMessageUpdate");
+    }
+    this.pendingUiMessage = null;
+    this.pendingUiNeedScroll = false;
+  }
+
+  /**
+   * 合并流式 UI 更新：TTS 仍即时 emit，列表/气泡按 40ms 合并。
+   * @param immediate true 时立刻冲刷（ERROR / 流结束 / 新发送）
+   */
+  private scheduleStreamUiPublish(
+    messageId: string,
+    message: MessageInfo | null,
+    needScroll: boolean,
+    immediate: boolean,
+  ): void {
+    if (message != null) {
+      this.pendingUiMessageId = messageId;
+      this.pendingUiMessage = message;
+    }
+    if (needScroll == true) {
+      this.pendingUiNeedScroll = true;
+    }
+    if (immediate == true) {
+      this.flushStreamUiPublish();
+      return;
+    }
+    if (this.streamUiTimer != null) {
+      return;
+    }
+    this.streamUiTimer = setTimeout(() => {
+      this.streamUiTimer = null;
+      this.flushStreamUiPublish();
+    }, this.STREAM_UI_COALESCE_MS);
+  }
+
+  /** 结束流式草稿：冲刷 UI 并丢弃草稿引用 */
+  private endStreamListDraft(): void {
+    this.flushStreamUiPublish();
+    this.streamListDraft = null;
+    this.pendingUiMessage = null;
+    this.pendingUiMessageId = "";
+    this.pendingUiNeedScroll = false;
   }
 
   /** Android：agent 接口数据统一为 UTSJSONObject，禁止 Interface 强转 */
@@ -884,7 +970,7 @@ export default class AgentDetailService {
       return;
     }
 
-    const list = [...this.data.messageList.value];
+    const list = this.getStreamListDraft();
     const index = findMessageIndexById(
       list,
       currentMessageId,
@@ -1108,14 +1194,12 @@ export default class AgentDetailService {
       this.data.isConversationActive.value = false;
     }
 
-    // 更新消息列表
+    // 更新消息列表草稿
     if (newMessage != null) {
       list.splice(index, arraySpliceAction, newMessage);
     }
 
-    // 确保消息列表更新是同步的
-    this.data.messageList.value = [...list];
-
+    // TTS 即时驱动（不进 UI 合并），避免播报被 40ms 合并拖慢
     if (newMessage != null) {
       const patchedText = readMessageText(newMessage);
       if (
@@ -1134,24 +1218,20 @@ export default class AgentDetailService {
       }
     }
 
-    // 流式渲染过程中触发自动滚动到底部
-    // 确保 autoToLastMsg 为 true，这样 watch 触发后会执行滚动
-    if (this.data.autoToLastMsg.value) {
-      // 通过事件总线通知主组件执行滚动，兼容微信小程序和 H5
-      uni.$emit("streamMessageUpdate");
-    }
+    const needScroll = this.data.autoToLastMsg.value;
+    const isErrorEvent = eventTypeStr == `${ConversationEventTypeEnum.ERROR}`;
+    // ERROR 立即冲刷；其余 SSE 事件合并 UI，降低 [...list] + 气泡更新频率
+    this.scheduleStreamUiPublish(
+      currentMessageId,
+      newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT
+        ? newMessage
+        : null,
+      needScroll,
+      isErrorEvent,
+    );
 
-    // 使用优化更新方法，只更新需要更新的组件（勿 await nextTick，避免 App 流式 chunk 堆积）
+    // 打开页面首页（与气泡更新解耦，保持即时）
     if (newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT) {
-      const patchedText = readMessageText(newMessage);
-      const emitData = messageToJsonObject(newMessage);
-      emitData["body"] = handleMessageProcess(patchedText);
-      uni.$emit("updateMessageComponent", {
-        messageId: `${currentMessageId}_${newMessage.index}`,
-        data: emitData,
-      });
-
-      // 打开页面首页
       const pageStatusRaw = readRawField(responseData, "status");
       const pageTypeRaw = readRawField(responseData, "type");
       if (
@@ -1232,6 +1312,7 @@ export default class AgentDetailService {
       let hasUpdatedTopic = false;
       // 本轮流代数；abort / 新开流后旧回调直接丢弃
       this.streamGeneration = this.streamGeneration + 1;
+      this.endStreamListDraft();
       const streamGen = this.streamGeneration;
 
       await chatService.sendMessage(
@@ -1309,6 +1390,7 @@ export default class AgentDetailService {
             "[AgentDetailService] Chat stream error callback:",
             error,
           );
+          this.endStreamListDraft();
           this.clearStreamingAssistantText();
           if (onTimeout != null) {
             (onTimeout as () => void)();
@@ -1321,6 +1403,7 @@ export default class AgentDetailService {
             return;
           }
           console.warn("[SSE-Stream] stream abnormal close / timeout");
+          this.endStreamListDraft();
           this.clearStreamingAssistantText();
           // App：无终态断流时助手常停在 Loading（仅工具卡），回拉会话补正文
           this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
@@ -1349,6 +1432,9 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
+    // 先冲刷流式 UI，保证完成态气泡与列表一致
+    this.endStreamListDraft();
+
     // 冲刷尾句：必须在 clearStreaming / inactive 之前，携带最终正文
     const speakMsgId = this.data.streamingAssistantMessageId.value;
     let speakBody = this.data.streamingAssistantText.value;
@@ -1501,6 +1587,7 @@ export default class AgentDetailService {
 
     // 无论 UI 是否已标为结束，都先中止本地 SSE，避免 chunk 回调继续跑
     this.streamGeneration = this.streamGeneration + 1;
+    this.endStreamListDraft();
     chatService.abort();
 
     // 如果会话已经不活跃，说明会话已经结束，无需调用 stop 接口
@@ -1995,6 +2082,7 @@ export default class AgentDetailService {
 
     // 先掐断上一轮 SSE / 打字机通道，再挂新气泡，避免旧正文串到空助手消息
     this.streamGeneration = this.streamGeneration + 1;
+    this.endStreamListDraft();
     chatService.abort();
     this.clearStreamingAssistantText();
 

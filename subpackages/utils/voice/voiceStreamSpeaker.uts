@@ -27,9 +27,9 @@ const MAX_MERGED_UTTERANCE_CHARS = 100;
 
 /**
  * 播放时最多提前合成的句数（含即将播放的不在此列）。
- * 单路 TTS WebSocket 只能串行合成；缓冲过深会占内存，过浅仍有空窗。
+ * 单路 TTS WebSocket 只能串行合成；App 过深易堆 WAV/内存，统一压到 3。
  */
-const MAX_READY_BUFFER = 8;
+const MAX_READY_BUFFER = 3;
 
 /** 已合成待播条目 */
 class ReadyUtterance {
@@ -45,6 +45,10 @@ class StreamChannel {
   consumedSpeakable: number = 0;
   /** 已清洗但未分句的文本 */
   pending: string = "";
+  /** 上次参与清洗的 source（speakableRaw / flush raw），用于增量清洗 */
+  lastSource: string = "";
+  /** 与 lastSource 对应的清洗结果缓存 */
+  lastSpeakable: string = "";
 }
 
 /** 流式文本快照（onStreamChunk 入参，携带全量累计文本） */
@@ -489,7 +493,8 @@ export class VoiceStreamSpeaker {
 
   /**
    * 单通道增量处理：全文 → 流式可朗读快照 → 相对上次的增量 → 分句。
-   * 不再按 raw 游标 hold 未闭合 agent-info（否则整轮 SSE 只在结束时 enqueue）。
+   * 仅在 source 未变时复用清洗结果；source 变化一律全量清洗。
+   * （不对 delta 单独 clean：Markdown/标签跨 chunk 边界时增量清洗会读脏）
    */
   private drainChannel(
     ch: StreamChannel,
@@ -499,7 +504,17 @@ export class VoiceStreamSpeaker {
   ): void {
     const source =
       flush == true ? fullRaw : speakableRawForStreaming(fullRaw);
-    const speakable = cleanTextForSpeech(source, this.settings);
+
+    let speakable: string = "";
+    if (source == ch.lastSource && ch.lastSource.length > 0) {
+      // agent-info 未闭合等场景：可朗读快照不变，跳过昂贵正则
+      speakable = ch.lastSpeakable;
+    } else {
+      speakable = cleanTextForSpeech(source, this.settings, true);
+      ch.lastSource = source;
+      ch.lastSpeakable = speakable;
+    }
+
     if (speakable.length < ch.consumedSpeakable) {
       // 服务端改写/回退：重置通道，避免增量错位
       ch.consumedSpeakable = 0;

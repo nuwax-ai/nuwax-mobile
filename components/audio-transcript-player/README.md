@@ -27,6 +27,7 @@
       :show-player="true"
       :show-transcript="true"
       :visible="true"
+      record-type="meeting"
       @play="onPlay"
       @pause="onPause"
       @seek="onSeek"
@@ -73,6 +74,7 @@ import AudioTranscriptPlayer from "@/components/audio-transcript-player/audio-tr
 | `showPlayer` | `boolean` | `true` | 是否显示播放条 |
 | `showTranscript` | `boolean` | `true` | 是否显示转写列表 |
 | `visible` | `boolean` | `true` | 为 false 时暂停自动滚屏（如父级切到其它 Tab） |
+| `recordType` | `string` | `meeting` | 录音来源：`meeting` / `monitoring`，用于选择临时播放地址接口 |
 
 ## Events
 

@@ -90,6 +90,7 @@
   import { ref, watch, computed, onMounted, onUnmounted } from "vue";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { apiVoxMeetingAudioUrl } from "@/servers/vox/voxMeeting";
+  import { apiVoxMonitoringAudioUrl } from "@/servers/vox/voxMonitoring";
   import { apiResCode, apiResData } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { AudioTranscriptSegment } from "./types.uts";
@@ -115,6 +116,7 @@
     showPlayer: boolean;
     showTranscript: boolean;
     visible: boolean;
+    recordType: string;
   }
 
   const props = withDefaults(defineProps<Props>(), {
@@ -125,6 +127,7 @@
     showPlayer: true,
     showTranscript: true,
     visible: true,
+    recordType: "meeting",
   });
 
   const emit = defineEmits<{
@@ -160,6 +163,11 @@
   let audioCtx: InnerAudioContext | null = null;
   /** 避免重复 init 同一 meetingId */
   let initedMeetingId: number = 0;
+  /** 音频上下文尚未就绪时保留最后一次跳转，初始化完成后补做 */
+  let pendingSeekMs: number = -1;
+  /** seek 异步生效前忽略旧的 onTimeUpdate，避免滑杆松手后跳回旧位置 */
+  let seekGuardTargetMs: number = -1;
+  let seekGuardUntilMs: number = 0;
 
   const formatMs = (ms: number): string => {
     const totalSec = Math.floor(ms / 1000);
@@ -264,6 +272,17 @@
     if (sliderDragging.value) return;
     const cur = audioCtx!!.currentTime;
     let ms = Math.floor(cur * 1000);
+    if (seekGuardTargetMs >= 0) {
+      if (Math.abs(ms - seekGuardTargetMs) <= 1000) {
+        seekGuardTargetMs = -1;
+        seekGuardUntilMs = 0;
+      } else if (Date.now() < seekGuardUntilMs) {
+        return;
+      } else {
+        seekGuardTargetMs = -1;
+        seekGuardUntilMs = 0;
+      }
+    }
     const durMs = resolveDurationMs();
     syncDisplayDuration();
     // 到达业务时长终点：停在末尾，避免长音频继续跑
@@ -287,6 +306,15 @@
     syncActiveFromTime(ms, false);
   };
 
+  /** 将已归一化的目标时间应用到已创建的音频上下文 */
+  const applySeekToAudio = (targetMs: number) => {
+    if (audioCtx == null) return;
+    seekGuardTargetMs = targetMs;
+    seekGuardUntilMs = Date.now() + 1500;
+    audioCtx!!.seek(targetMs / 1000);
+    emit("seek", targetMs);
+  };
+
   const destroyAudio = () => {
     // #ifdef APP
     if (audioCtx != null) {
@@ -296,13 +324,18 @@
     // #endif
     initedMeetingId = 0;
     playing.value = false;
+    pendingSeekMs = -1;
+    seekGuardTargetMs = -1;
+    seekGuardUntilMs = 0;
   };
 
   /** 拉取临时 URL 并绑定 InnerAudioContext（仅 App） */
   const initAudio = async (doAutoplay: boolean) => {
     if (!props.hasAudio || props.meetingId <= 0) return;
     try {
-      const res = await apiVoxMeetingAudioUrl(props.meetingId);
+      const res = props.recordType == "monitoring"
+        ? await apiVoxMonitoringAudioUrl(props.meetingId)
+        : await apiVoxMeetingAudioUrl(props.meetingId);
       if (apiResCode(res) != SUCCESS_CODE) return;
       const raw = apiResData<any>(res);
       const obj = raw != null ? (raw as UTSJSONObject) : null;
@@ -331,6 +364,11 @@
       initedMeetingId = props.meetingId;
       syncDisplayDuration();
       syncActiveFromTime(0, false);
+      if (pendingSeekMs >= 0) {
+        const target = pendingSeekMs;
+        pendingSeekMs = -1;
+        applySeekToAudio(target);
+      }
       if (doAutoplay) {
         enableFollowTranscript();
         audioCtx!!.play();
@@ -392,16 +430,19 @@
 
   const seekToMs = (ms: number) => {
     // #ifdef APP
-    if (audioCtx == null) return;
     const durMs = resolveDurationMs();
     const clamped = Math.max(0, durMs > 0 ? Math.min(ms, durMs) : ms);
-    audioCtx!!.seek(clamped / 1000);
     currentTimeMs.value = clamped;
     if (durMs > 0) {
       progressPercent.value = Math.min(100, Math.floor((clamped / durMs) * 100));
     }
     syncActiveFromTime(clamped, true);
-    emit("seek", clamped);
+    if (audioCtx == null) {
+      pendingSeekMs = clamped;
+      initAudio(false);
+      return;
+    }
+    applySeekToAudio(clamped);
     // #endif
   };
 
@@ -413,19 +454,13 @@
     let target = currentTimeMs.value + deltaMs;
     if (target < 0) target = 0;
     if (durMs > 0 && target > durMs) target = durMs;
-    if (audioCtx == null) {
-      initAudio(false);
-    }
     seekToMs(target);
     // #endif
   };
 
-  const handleSliderChanging = (e: any) => {
+  const handleSliderChanging = (e: UniSliderChangeEvent) => {
     sliderDragging.value = true;
-    const detail = (e as UTSJSONObject)["detail"] as UTSJSONObject;
-    const val = detail["value"];
-    if (val == null) return;
-    const percent = val as number;
+    const percent = e.detail.value;
     progressPercent.value = percent;
     const dur = resolveDurationMs();
     if (dur <= 0) return;
@@ -434,16 +469,14 @@
     syncActiveFromTime(ms, false);
   };
 
-  const handleSliderChange = (e: any) => {
-    const detail = (e as UTSJSONObject)["detail"] as UTSJSONObject;
-    const val = detail["value"];
-    sliderDragging.value = false;
-    if (val == null) return;
-    const percent = val as number;
+  const handleSliderChange = (e: UniSliderChangeEvent) => {
+    const percent = e.detail.value;
     progressPercent.value = percent;
     const dur = resolveDurationMs();
-    if (dur <= 0) return;
-    seekToMs(Math.floor((percent / 100) * dur));
+    if (dur > 0) {
+      seekToMs(Math.floor((percent / 100) * dur));
+    }
+    sliderDragging.value = false;
   };
 
   const handleSegmentClick = (seg: AudioTranscriptSegment) => {
@@ -466,6 +499,16 @@
     (): number => props.meetingId,
     (id: number) => {
       if (id > 0 && props.hasAudio && id != initedMeetingId) {
+        destroyAudio();
+        initAudio(props.autoplay);
+      }
+    },
+  );
+
+  watch(
+    (): string => props.recordType,
+    (_type: string) => {
+      if (props.meetingId > 0 && props.hasAudio) {
         destroyAudio();
         initAudio(props.autoplay);
       }

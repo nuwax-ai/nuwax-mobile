@@ -4,11 +4,6 @@ import { utf8ArrayToString } from "@/utils/utf8.uts";
 import { t } from "@/utils/i18n";
 import { readRawField } from "@/utils/readRawField.uts";
 
-/** onChunkReceived 回调结果（Android 为原生 RequestTaskOnChunkReceivedListenerResult） */
-interface ChunkReceivedResult {
-  data: ArrayBuffer | null;
-}
-
 /**
  * 合并两个 Uint8Array。
  * UTS 中 Uint8Array.set 不支持带偏移写入另一数组，因此用循环拼接。
@@ -118,7 +113,8 @@ function getErrorMessage(error: any): string {
 
 /**
  * 从 onChunkReceived 回调参数中提取 ArrayBuffer。
- * 官方文档为 { data: ArrayBuffer }；APP 端部分运行时直接传入 ArrayBuffer。
+ * Android 上必须用官方 RequestTaskOnChunkReceivedListenerResult 访问 .data；
+ * 自定义 interface / UTSJSONObject 强转绑不到 Kotlin getData()，会得到 null（日志里仍能 toString 出 data=…）。
  * @param chunkResult onChunkReceived 回调参数
  * @returns 分块字节数据，无法识别时返回 null
  */
@@ -127,21 +123,25 @@ function extractChunkArrayBuffer(chunkResult: any): ArrayBuffer | null {
     return null;
   }
 
-  // Android APP：原生 RequestTaskOnChunkReceivedListenerResult，禁止 as UTSJSONObject
+  // 官方类型（与 uni_modules/uni-ai-x/sdk/requestAiWorker.uts 一致）
   try {
-    const listener = chunkResult as ChunkReceivedResult;
+    const listener = chunkResult as RequestTaskOnChunkReceivedListenerResult;
     const listenerData = listener.data;
     if (listenerData != null) {
-      return listenerData;
+      return listenerData as ArrayBuffer;
     }
   } catch (_eListener) {
-    // 非 listener result，继续尝试其他格式
+    // 非官方 listener result，继续尝试其他格式
   }
 
-  // 小程序 / UTSJSONObject / Map
-  const dataField = readRawField(chunkResult, "data");
-  if (dataField != null) {
-    return dataField as ArrayBuffer;
+  // 小程序 / UTSJSONObject / Map（禁止对 Android 原生 listener 走这条，会 ClassCastException）
+  try {
+    const dataField = readRawField(chunkResult, "data");
+    if (dataField != null) {
+      return dataField as ArrayBuffer;
+    }
+  } catch (_eField) {
+    // ignore
   }
 
   // success 回调中 res.data 可能直接是 ArrayBuffer
@@ -773,13 +773,20 @@ export class StreamRequest {
         const onWeappStreamComplete = (): void => {
           resolve();
         };
-        requestTask.onChunkReceived((res) => {
+        requestTask.onChunkReceived((res: RequestTaskOnChunkReceivedListenerResult) => {
           if (this.isAborted) return;
 
           this.updateLastChunkTime();
 
           try {
-            const chunkBuffer = extractChunkArrayBuffer(res);
+            // 优先走官方类型 .data；extractChunkArrayBuffer 作兜底
+            let chunkBuffer: ArrayBuffer | null = null;
+            const typedData = res.data;
+            if (typedData != null) {
+              chunkBuffer = typedData as ArrayBuffer;
+            } else {
+              chunkBuffer = extractChunkArrayBuffer(res);
+            }
             if (chunkBuffer == null) {
               return;
             }
@@ -973,13 +980,20 @@ export class StreamRequest {
 
       this.requestTask = requestTask;
 
-      requestTask.onChunkReceived((result) => {
+      // 必须标注官方类型：Android 上自定义 interface 读不到 getData()
+      requestTask.onChunkReceived((result: RequestTaskOnChunkReceivedListenerResult) => {
         if (this.isAborted) {
           return;
         }
         // 回调一到就刷新空闲计时（即使 buffer 解析失败也不误杀）
         this.updateLastChunkTime();
-        const chunkBuffer = extractChunkArrayBuffer(result);
+        let chunkBuffer: ArrayBuffer | null = null;
+        const typedData = result.data;
+        if (typedData != null) {
+          chunkBuffer = typedData as ArrayBuffer;
+        } else {
+          chunkBuffer = extractChunkArrayBuffer(result);
+        }
         if (chunkBuffer == null) {
           console.warn("[SSE-APP] onChunkReceived 无法解析 ArrayBuffer，已刷新空闲计时", result);
           return;

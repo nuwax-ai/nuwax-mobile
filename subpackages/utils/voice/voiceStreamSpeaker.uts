@@ -1,29 +1,34 @@
 /**
- * 边生成边播报器：AI 回复流式生成过程中，增量文本分句送 TTS 并顺序播放。
+ * 边生成边播报器：AI 回复流式生成过程中，增量文本分句后顺序播报。
  *
- * 核心机制：
- * - 双通道（body / think）各自跟踪 consumedRaw 指针，只处理新增原始文本；
- * - 代码围栏配对保护：流未结束时，未闭合的 ``` 围栏之后的内容不参与清洗，
- *   避免增量清洗把后续正文误吞进"未闭合代码块"；
- * - 边界回退：每次消费预留 HOLD_BACK_CHARS 个字符，给跨分片的行内代码/链接/
- *   加粗等短模式留出重扫空间（流结束时全量消费）；
- * - 快照合并：高频 chunk 只保留最新快照，处理循环串行执行，避免 Promise 链堆积；
- * - 播放会话校验：首句 playList 开播后记录 sessionId，后续 enqueue 凭会话追加；
- *   会话被外部打断（手动停止/单条播放/新一轮）时自动停用。
+ * 播放链路：synthesizeToSrc + playSrcAndWait，并在当前句播放时预取下一句合成，
+ * 避免串行 playAndWait「播完再合成」造成的空窗与滞后。
+ *
+ * 文本侧：
+ * - 双通道（body / think）按「可朗读快照」增量消费（consumedSpeakable）；
+ * - 流式用 speakableRawForStreaming，避免未闭合 agent-info 整段 hold 到 SSE 结束；
+ * - 快照合并，处理循环串行。
  */
 import { voiceConfig } from "./voiceConfig";
-import { AudioQueueItem, VoiceSettings } from "./voiceTypes";
-import { cleanTextForSpeech, drainCompleteSentences } from "./textFilter";
-import { ttsService } from "./ttsService";
+import { VoiceSettings } from "./voiceTypes";
+import {
+  cleanTextForSpeech,
+  drainCompleteSentences,
+  speakableRawForStreaming,
+} from "./textFilter";
+import { ttsWebSocketPlayer } from "./ttsWebSocketPlayer";
 import { audioPlayerManager } from "./audioPlayerManager";
 
-/** 边界回退字符数（覆盖行内代码/链接等短模式的跨片切分；宜小，否则句末迟迟不播） */
-const HOLD_BACK_CHARS = 4;
+/** 单次 TTS 最短字数：过短会频繁建会话，听感断续 */
+const MIN_UTTERANCE_CHARS = 12;
+
+/** 短句合并上限，避免一次合成过长 */
+const MAX_MERGED_UTTERANCE_CHARS = 100;
 
 /** 单通道（body/think）消费状态 */
 class StreamChannel {
-  /** 已消费的原始文本长度 */
-  consumedRaw: number = 0;
+  /** 已消费的「可朗读快照」长度（相对 clean 后全文，而非 raw） */
+  consumedSpeakable: number = 0;
   /** 已清洗但未分句的文本 */
   pending: string = "";
 }
@@ -43,31 +48,38 @@ export class VoiceStreamSpeaker {
   private settings: VoiceSettings = new VoiceSettings();
   private bodyChannel: StreamChannel = new StreamChannel();
   private thinkChannel: StreamChannel = new StreamChannel();
-  /** 播放会话序号；-1 表示尚未开播（首句未合成完成） */
-  private playSession: number = -1;
-  /** 全局分段序号（跨通道递增，保证合成顺序） */
+  /** 待播句子队列（已分句、尚未合成/播放） */
+  private pendingSentences: string[] = [];
+  /** 全局分段序号（跨通道递增） */
   private segmentIndex: number = 0;
   /** 生成轮次计数 */
   private round: number = 0;
-  /** 处理循环运行标记 */
+  /** 文本处理循环运行标记 */
   private processing: boolean = false;
+  /** 播放循环运行标记 */
+  private playLooping: boolean = false;
+  /** SSE 已结束（尾句入队后仍可能在播） */
+  private streamFinished: boolean = false;
   /** 待处理快照（只保留最新一份） */
   private queuedChunk: ChunkSnapshot | null = null;
 
   /**
    * 开始一轮流式播报（新一轮会话开始时调用）
-   * 会打断当前播报（含单条消息播放）。
+   * 会打断当前播报（含工具栏单条播放）。
    */
   begin(messageId: string, settings: VoiceSettings): void {
+    ttsWebSocketPlayer.stop();
     audioPlayerManager.stop();
     this.round += 1;
     this.messageId = messageId;
     this.settings = settings;
     this.bodyChannel = new StreamChannel();
     this.thinkChannel = new StreamChannel();
-    this.playSession = -1;
+    this.pendingSentences = [];
     this.segmentIndex = 0;
     this.queuedChunk = null;
+    this.streamFinished = false;
+    this.playLooping = false;
     this.active = true;
   }
 
@@ -86,25 +98,50 @@ export class VoiceStreamSpeaker {
     snap.thinkText = thinkText;
     snap.finished = finished;
     snap.round = this.round;
-    // 快照合并：只留最新，处理循环会消费到最新状态
     this.queuedChunk = snap;
     this.kick();
   }
 
-  /** 停止流式播报（清空播放队列；会话停止/新轮次/单条播放时调用） */
+  /** 停止流式播报（会话停止/新轮次/手动停止时调用） */
   stop(): void {
     this.active = false;
     this.queuedChunk = null;
-    this.playSession = -1;
+    this.pendingSentences = [];
+    this.streamFinished = false;
+    this.playLooping = false;
+    this.messageId = "";
+    ttsWebSocketPlayer.stop();
     audioPlayerManager.stop();
   }
 
-  /** 是否处于流式播报中（仍在接收/合成句；尾音频可能仍在 audioPlayerManager） */
+  /** 是否仍在接收/分句（尾音频可能仍在 ttsWebSocketPlayer） */
   isActive(): boolean {
     return this.active;
   }
 
-  /** 当前流式播报绑定的消息 ID */
+  /** 是否仍占用播报（分句中、待播队列、或本轮 TTS 仍在播） */
+  isBusy(): boolean {
+    if (this.active == true) {
+      return true;
+    }
+    if (this.playLooping == true) {
+      return true;
+    }
+    if (this.pendingSentences.length > 0) {
+      return true;
+    }
+    if (
+      this.messageId.length > 0 &&
+      ttsWebSocketPlayer.getMessageId() == this.messageId
+    ) {
+      const st = ttsWebSocketPlayer.getState();
+      if (st == "connecting" || st == "synthesizing" || st == "playing") {
+        return true;
+      }
+    }
+    return false;
+  }
+
   getMessageId(): string {
     return this.messageId;
   }
@@ -133,10 +170,9 @@ export class VoiceStreamSpeaker {
     this.processing = false;
   }
 
-  /** 处理一份快照：双通道清洗分句 → 合成入队 */
+  /** 处理一份快照：双通道清洗分句 → 入待播队列 → 触发流水线合成/播放 */
   private async processChunk(snap: ChunkSnapshot): Promise<void> {
     const sentences: string[] = [];
-    // think 通道：正文已开始或流结束时，冲刷思考内容尾句（保持先 think 后 body 顺序）
     if (this.settings.includeThinkContent && snap.thinkText.length > 0) {
       const thinkFlush = snap.finished || snap.bodyText.length > 0;
       this.drainChannel(this.thinkChannel, snap.thinkText, thinkFlush, sentences);
@@ -144,130 +180,245 @@ export class VoiceStreamSpeaker {
     if (snap.bodyText.length > 0) {
       this.drainChannel(this.bodyChannel, snap.bodyText, snap.finished, sentences);
     }
-    if (sentences.length > 0) {
-      await this.enqueueSentences(sentences, snap.round);
-      if (snap.round != this.round) {
-        return;
+    for (let i = 0; i < sentences.length; i++) {
+      if (this.segmentIndex >= voiceConfig.maxSentencesPerMessage) {
+        // 只停入队，不置 active=false，否则已入队句与尾段都播不完
+        console.warn("[VoiceStreamSpeaker] reach max sentences, stop enqueue");
+        break;
       }
+      this.segmentIndex += 1;
+      this.pendingSentences.push(sentences[i]);
+      console.log(
+        "[StreamSpeak] enqueue segment=",
+        this.segmentIndex,
+        "textLen=",
+        sentences[i].length,
+      );
     }
-    if (snap.finished) {
-      // 流结束：停用（已入队音频继续播完）
+    if (snap.finished == true) {
+      this.streamFinished = true;
+    }
+    // 不 await：文本继续吃 SSE，播放在独立循环里流水线执行
+    this.kickPlay(snap.round);
+    if (
+      this.streamFinished == true &&
+      this.playLooping != true &&
+      this.pendingSentences.length == 0
+    ) {
       this.active = false;
     }
   }
 
   /**
-   * 单通道增量处理：安全边界 → 增量清洗 → 追加缓冲 → 提取完结句
-   * @param flush 为 true 时消费全部文本并冲刷尾句
+   * 从待播队列取出下一段：合并过短片段，减少 TTS 往返。
+   * @returns null 表示短句暂缓（等更多文本或流结束）
    */
-  private drainChannel(ch: StreamChannel, fullRaw: string, flush: boolean, out: string[]): void {
-    const safeEnd = this.computeSafeEnd(fullRaw, flush);
-    if (safeEnd > ch.consumedRaw) {
-      const piece = fullRaw.substring(ch.consumedRaw, safeEnd);
-      ch.consumedRaw = safeEnd;
-      const cleaned = cleanTextForSpeech(piece, this.settings);
-      if (cleaned.length > 0) {
-        ch.pending = ch.pending.length > 0 ? ch.pending + "\n" + cleaned : cleaned;
+  private takeNextUtterance(): string | null {
+    if (this.pendingSentences.length == 0) {
+      return null;
+    }
+    let utterance = this.pendingSentences.shift()!;
+    while (
+      utterance.trim().length < MIN_UTTERANCE_CHARS &&
+      this.pendingSentences.length > 0
+    ) {
+      const next = this.pendingSentences[0];
+      if (
+        utterance.length + next.length > MAX_MERGED_UTTERANCE_CHARS &&
+        utterance.trim().length > 0
+      ) {
+        break;
+      }
+      this.pendingSentences.shift();
+      utterance = utterance + next;
+    }
+    // 仍过短且流未结束：放回队列，等后续分句再合
+    if (
+      utterance.trim().length < MIN_UTTERANCE_CHARS &&
+      this.streamFinished != true &&
+      this.pendingSentences.length == 0 &&
+      this.active == true
+    ) {
+      this.pendingSentences.unshift(utterance);
+      return null;
+    }
+    return utterance;
+  }
+
+  /**
+   * 流水线播放：当前句播放时预取下一句合成，缩短句间空窗。
+   */
+  private async kickPlay(expectedRound: number): Promise<void> {
+    if (this.playLooping) {
+      return;
+    }
+    this.playLooping = true;
+    // 短句暂缓（等更多 SSE 文本）时勿在末尾同步重入，否则会无限递归撑爆栈
+    let waitingForMoreText = false;
+    let heldSentence: string | null = null;
+    let heldSrcPromise: Promise<string> | null = null;
+
+    while (
+      expectedRound == this.round &&
+      (heldSentence != null || this.pendingSentences.length > 0) &&
+      (this.active == true || this.streamFinished == true)
+    ) {
+      let sentence: string = "";
+      let srcPromise: Promise<string> | null = null;
+
+      if (heldSentence != null && heldSrcPromise != null) {
+        sentence = heldSentence!;
+        srcPromise = heldSrcPromise;
+        heldSentence = null;
+        heldSrcPromise = null;
+      } else {
+        const nextUtt = this.takeNextUtterance();
+        if (nextUtt == null) {
+          waitingForMoreText = true;
+          break;
+        }
+        if (nextUtt.trim().length == 0) {
+          continue;
+        }
+        sentence = nextUtt;
+        // 首句 / 空窗后：允许打断旧会话，独占 socket 合成
+        srcPromise = ttsWebSocketPlayer.synthesizeToSrc(sentence, false);
+      }
+
+      let src = "";
+      try {
+        console.log(
+          "[StreamSpeak] synthesize textLen=",
+          sentence.length,
+        );
+        src = await srcPromise!;
+      } catch (eSynth: any) {
+        console.warn("[StreamSpeak] synthesize failed, retry once", eSynth);
+        ttsWebSocketPlayer.cancelInFlightPreserveSynth();
+        try {
+          src = await ttsWebSocketPlayer.synthesizeToSrc(sentence, false);
+        } catch (eRetry: any) {
+          console.warn("[VoiceStreamSpeaker] synthesize retry failed", eRetry);
+          this.pendingSentences = [];
+          this.active = false;
+          break;
+        }
+      }
+      if (expectedRound != this.round) {
+        break;
+      }
+      if (src.trim().length == 0) {
+        continue;
+      }
+
+      // 先开播，再预取下一句（合成与播放重叠）
+      console.log(
+        "[StreamSpeak] playSrc textLen=",
+        sentence.length,
+        "srcLen=",
+        src.length,
+      );
+      const playPromise = ttsWebSocketPlayer.playSrcAndWait(
+        this.messageId,
+        src,
+      );
+
+      const prefetch = this.takeNextUtterance();
+      if (prefetch != null && prefetch.trim().length > 0) {
+        heldSentence = prefetch;
+        // 保留当前播放音频，只占用暖连接合成下一句
+        heldSrcPromise = ttsWebSocketPlayer.synthesizeToSrc(prefetch, true);
+        console.log(
+          "[StreamSpeak] prefetch synthesize textLen=",
+          prefetch.length,
+        );
+      }
+
+      let ok = false;
+      try {
+        ok = await playPromise;
+      } catch (ePlay: any) {
+        console.warn("[VoiceStreamSpeaker] playSrcAndWait failed", ePlay);
+        ok = false;
+      }
+      if (ok != true) {
+        console.warn(
+          "[StreamSpeak] TTS play failed, drop remaining segments=",
+          this.pendingSentences.length,
+        );
+        ttsWebSocketPlayer.cancelInFlightPreserveSynth();
+        heldSentence = null;
+        heldSrcPromise = null;
+        this.pendingSentences = [];
+        this.active = false;
+        break;
+      }
+      if (expectedRound != this.round) {
+        ttsWebSocketPlayer.cancelInFlightPreserveSynth();
+        heldSentence = null;
+        heldSrcPromise = null;
+        break;
+      }
+    }
+
+    // 循环退出时若仍有未消费的预取，取消以免脏 socket
+    if (heldSrcPromise != null) {
+      ttsWebSocketPlayer.cancelInFlightPreserveSynth();
+      heldSentence = null;
+      heldSrcPromise = null;
+    }
+
+    this.playLooping = false;
+    if (
+      this.streamFinished == true &&
+      this.pendingSentences.length == 0 &&
+      this.queuedChunk == null
+    ) {
+      this.active = false;
+    } else if (
+      waitingForMoreText != true &&
+      (this.active == true || this.streamFinished == true) &&
+      this.pendingSentences.length > 0 &&
+      expectedRound == this.round
+    ) {
+      // 播放期间又入队了新句；异步再入，避免同步递归
+      setTimeout(() => {
+        this.kickPlay(expectedRound);
+      }, 0);
+    }
+    // waitingForMoreText：短句已放回队列，等下一次 processChunk → kickPlay
+  }
+
+  /**
+   * 单通道增量处理：全文 → 流式可朗读快照 → 相对上次的增量 → 分句。
+   * 不再按 raw 游标 hold 未闭合 agent-info（否则整轮 SSE 只在结束时 enqueue）。
+   */
+  private drainChannel(
+    ch: StreamChannel,
+    fullRaw: string,
+    flush: boolean,
+    out: string[],
+  ): void {
+    const source =
+      flush == true ? fullRaw : speakableRawForStreaming(fullRaw);
+    const speakable = cleanTextForSpeech(source, this.settings);
+    if (speakable.length < ch.consumedSpeakable) {
+      // 服务端改写/回退：重置通道，避免增量错位
+      ch.consumedSpeakable = 0;
+      ch.pending = "";
+    }
+    if (speakable.length > ch.consumedSpeakable) {
+      const delta = speakable.substring(ch.consumedSpeakable);
+      ch.consumedSpeakable = speakable.length;
+      if (delta.length > 0) {
+        ch.pending =
+          ch.pending.length > 0 ? ch.pending + " " + delta : delta;
       }
     }
     const drain = drainCompleteSentences(ch.pending, flush);
     ch.pending = drain.remainder;
     for (let i = 0; i < drain.sentences.length; i++) {
       out.push(drain.sentences[i]);
-    }
-  }
-
-  /**
-   * 计算本次可安全消费的原始文本边界
-   * 1. 未闭合 ``` 围栏之后的内容不消费（等围栏闭合或流结束）；
-   * 2. 未结束时预留 HOLD_BACK_CHARS 边界回退。
-   */
-  private computeSafeEnd(raw: string, flush: boolean): number {
-    if (flush) {
-      return raw.length;
-    }
-    let end: number = raw.length;
-    if (this.countFences(raw) % 2 == 1) {
-      end = raw.lastIndexOf("```");
-      if (end < 0) {
-        end = 0;
-      }
-    }
-    let holdEnd = raw.length - HOLD_BACK_CHARS;
-    if (holdEnd < 0) {
-      holdEnd = 0;
-    }
-    let safe = end;
-    if (safe > holdEnd) {
-      safe = holdEnd;
-    }
-    // 允许吃进 hold 窗口内的完整句末，避免「。后面还要再等 16 字才播」
-    const sentenceEnds = "。！？!?；;\n";
-    let lastSentenceEnd = -1;
-    const scanLimit = end;
-    for (let i = 0; i < scanLimit; i++) {
-      const ch = raw.substring(i, i + 1);
-      if (sentenceEnds.indexOf(ch) >= 0) {
-        lastSentenceEnd = i;
-      }
-    }
-    if (lastSentenceEnd >= 0) {
-      const afterSentence = lastSentenceEnd + 1;
-      if (afterSentence > safe && afterSentence <= end) {
-        safe = afterSentence;
-      }
-    }
-    if (safe > 0 && safe < raw.length) {
-      const code = raw.charCodeAt(safe);
-      if (code != null && code >= 0xDC00 && code <= 0xDFFF) {
-        safe -= 1;
-      }
-    }
-    return safe > 0 ? safe : 0;
-  }
-
-  /** 统计 ``` 围栏出现次数（不重叠） */
-  private countFences(raw: string): number {
-    let count = 0;
-    let idx = 0;
-    while (true) {
-      const found = raw.indexOf("```", idx);
-      if (found < 0) {
-        break;
-      }
-      count += 1;
-      idx = found + 3;
-    }
-    return count;
-  }
-
-  /** 逐句合成并入队；首句开播并记录播放会话 */
-  private async enqueueSentences(sentences: string[], expectedRound: number): Promise<void> {
-    for (let i = 0; i < sentences.length; i++) {
-      if (!this.active || expectedRound != this.round) {
-        return;
-      }
-      if (this.segmentIndex >= voiceConfig.maxSentencesPerMessage) {
-        console.warn("[VoiceStreamSpeaker] reach max sentences, stop enqueue");
-        this.active = false;
-        return;
-      }
-      const idx = this.segmentIndex;
-      this.segmentIndex += 1;
-      const item = await ttsService.synthesize(sentences[i], this.messageId, idx);
-      if (!this.active || expectedRound != this.round) {
-        return;
-      }
-      if (this.playSession < 0) {
-        this.playSession = audioPlayerManager.playList([item]);
-      } else {
-        audioPlayerManager.enqueue([item], this.playSession);
-        // 会话被外部打断（手动停止/单条播放），停用流式播报
-        if (audioPlayerManager.getSessionId() != this.playSession) {
-          this.active = false;
-          return;
-        }
-      }
     }
   }
 }

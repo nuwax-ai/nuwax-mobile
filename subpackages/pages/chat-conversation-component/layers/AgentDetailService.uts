@@ -340,59 +340,6 @@ function parseMessageList(raw: any | null): MessageInfo[] {
   return result;
 }
 
-/**
- * 打印接口消息源中的思考与工具调用字段，定位字段在转换前后的丢失位置。
- * 仅输出助手消息，避免普通消息日志干扰排查。
- */
-function logRawAssistantMessageSource(
-  source: string,
-  raw: any | null,
-): void {
-  if (raw == null) {
-    console.log(`[MessageSource] ${source} messageList=null`);
-    return;
-  }
-  const arr = raw as any[];
-  console.log(`[MessageSource] ${source} count=${arr.length}`);
-  for (let i = 0; i < arr.length; i++) {
-    const item = arr[i];
-    if (item == null) continue;
-    const roleRaw = readRawField(item, "role");
-    const messageTypeRaw = readRawField(item, "messageType");
-    const role = roleRaw != null ? `${roleRaw}` : "";
-    const messageType = messageTypeRaw != null ? `${messageTypeRaw}` : "";
-    if (role != "ASSISTANT" && messageType != "ASSISTANT") {
-      continue;
-    }
-    const idRaw = readRawField(item, "id");
-    const typeRaw = readRawField(item, "type");
-    const textRaw = readRawField(item, "text");
-    const thinkRaw = readRawField(item, "think");
-    const componentsRaw = readRawField(item, "componentExecutedList");
-    const type = typeRaw != null ? `${typeRaw}` : "";
-    const text = textRaw != null ? `${textRaw}` : "";
-    const think = thinkRaw != null ? `${thinkRaw}` : "";
-    const componentCount =
-      componentsRaw != null && Array.isArray(componentsRaw)
-        ? (componentsRaw as any[]).length
-        : 0;
-    let componentsJson = "null";
-    try {
-      componentsJson =
-        componentsRaw != null ? JSON.stringify(componentsRaw) : "null";
-    } catch (_e) {
-      componentsJson = "[unserializable]";
-    }
-    console.log(
-      `[MessageSource] ${source}.assistant index=${i} id=${idRaw != null ? `${idRaw}` : ""} role=${role} messageType=${messageType} type=${type} textLen=${text.length} thinkLen=${think.length} componentExecutedCount=${componentCount}`,
-    );
-    console.log(`[MessageSource] ${source}.think id=${idRaw != null ? `${idRaw}` : ""} value=${think}`);
-    console.log(
-      `[MessageSource] ${source}.componentExecutedList id=${idRaw != null ? `${idRaw}` : ""} value=${componentsJson}`,
-    );
-  }
-}
-
 /** 安全解析沙盒列表 */
 function parseSandboxList(raw: any | null): SandboxInfo[] {
   if (raw == null) return [];
@@ -514,8 +461,94 @@ export default class AgentDetailService {
   private isAllowSuggest: boolean = true;
   /** 流式会话代数：abort/新开流时递增，用于丢弃旧 SSE 回调 */
   private streamGeneration: number = 0;
+  /**
+   * SSE 流式期间的消息列表草稿：始终保存最新态，避免未 flush 时下一帧读到旧 list。
+   * 对 messageList / updateMessageComponent 做短时合并，减轻主线程卡顿。
+   */
+  private streamListDraft: MessageInfo[] | null = null;
+  private streamUiTimer: number | null = null;
+  private pendingUiMessageId: string = "";
+  private pendingUiMessage: MessageInfo | null = null;
+  private pendingUiNeedScroll: boolean = false;
+  private readonly STREAM_UI_COALESCE_MS: number = 40;
+
   constructor(data: AgentDetailData) {
     this.data = data;
+  }
+
+  /** 取得流式草稿列表（首次从 messageList 拷贝） */
+  private getStreamListDraft(): MessageInfo[] {
+    if (this.streamListDraft != null) {
+      return this.streamListDraft as MessageInfo[];
+    }
+    const draft = [...this.data.messageList.value];
+    this.streamListDraft = draft;
+    return draft;
+  }
+
+  /** 冲刷挂起的流式 UI（messageList + 气泡组件 + 滚动） */
+  private flushStreamUiPublish(): void {
+    if (this.streamUiTimer != null) {
+      clearTimeout(this.streamUiTimer!);
+      this.streamUiTimer = null;
+    }
+    if (this.streamListDraft != null) {
+      this.data.messageList.value = [...(this.streamListDraft as MessageInfo[])];
+    }
+    const pendingMsg = this.pendingUiMessage;
+    if (pendingMsg != null) {
+      const patchedText = readMessageText(pendingMsg);
+      const emitData = messageToJsonObject(pendingMsg);
+      emitData["body"] = handleMessageProcess(patchedText);
+      uni.$emit("updateMessageComponent", {
+        messageId: `${this.pendingUiMessageId}_${pendingMsg.index}`,
+        data: emitData,
+      });
+    }
+    if (this.pendingUiNeedScroll == true) {
+      uni.$emit("streamMessageUpdate");
+    }
+    this.pendingUiMessage = null;
+    this.pendingUiNeedScroll = false;
+  }
+
+  /**
+   * 合并流式 UI 更新：TTS 仍即时 emit，列表/气泡按 40ms 合并。
+   * @param immediate true 时立刻冲刷（ERROR / 流结束 / 新发送）
+   */
+  private scheduleStreamUiPublish(
+    messageId: string,
+    message: MessageInfo | null,
+    needScroll: boolean,
+    immediate: boolean,
+  ): void {
+    if (message != null) {
+      this.pendingUiMessageId = messageId;
+      this.pendingUiMessage = message;
+    }
+    if (needScroll == true) {
+      this.pendingUiNeedScroll = true;
+    }
+    if (immediate == true) {
+      this.flushStreamUiPublish();
+      return;
+    }
+    if (this.streamUiTimer != null) {
+      return;
+    }
+    this.streamUiTimer = setTimeout(() => {
+      this.streamUiTimer = null;
+      this.flushStreamUiPublish();
+    }, this.STREAM_UI_COALESCE_MS);
+  }
+
+  /** 结束流式草稿：冲刷 UI 并丢弃草稿引用 */
+  private endStreamListDraft(): void {
+    this.flushStreamUiPublish();
+    this.streamListDraft = null;
+    this.pendingUiMessage = null;
+    this.pendingUiMessageId = "";
+    this.pendingUiNeedScroll = false;
   }
 
   /** Android：agent 接口数据统一为 UTSJSONObject，禁止 Interface 强转 */
@@ -672,7 +705,6 @@ export default class AgentDetailService {
       vars2 != null ? AgentDetailUtils.utsObjToRecord(vars2 as UTSJSONObject) : (new Map<string, any>() as any as StringAnyRecord);
     // 消息列表（Android：UTSJSONObject[] 不能 as MessageInfo[]，通过 parseMessageList 转换）
     const rawMessageList = responseObj["messageList"];
-    logRawAssistantMessageSource("conversationDetail.raw", rawMessageList);
     const _messageList = parseMessageList(rawMessageList);
 
     // 排除预置问题
@@ -851,7 +883,6 @@ export default class AgentDetailService {
       const hasData = dataRaw != null;
       if (codeOk == true) {
         if (hasData == true) {
-          logRawAssistantMessageSource("messagePage.raw", dataRaw);
           const olderMessages = parseMessageList(dataRaw);
 
           if (olderMessages.length > 0) {
@@ -939,7 +970,7 @@ export default class AgentDetailService {
       return;
     }
 
-    const list = [...this.data.messageList.value];
+    const list = this.getStreamListDraft();
     const index = findMessageIndexById(
       list,
       currentMessageId,
@@ -1044,7 +1075,7 @@ export default class AgentDetailService {
       //   (responseData as any).subEventType == 'OPEN_DESKTOP' &&
       //   conversationId
       // ) {
-      //   console.log('[AgentDetailService] Action: RECEIVE_EVENT, Params:', { type: 'OPEN_DESKTOP', conversationId, payload: responseData });
+      //   
       //   // 详情见 docs/agent_integration_guide.md
       //   CustomActionService.openDesktopView(conversationId);
       // }
@@ -1055,11 +1086,7 @@ export default class AgentDetailService {
         `${toolTypeRaw}` == `${AgentComponentTypeEnum.ToolCall}` &&
         conversationId != null && conversationId != 0
       ) {
-        // console.log("[AgentDetailService] Action: RECEIVE_TOOL_CALL, Params:", {
-        //   type: "REFRESH_FILE_LIST",
-        //   conversationId,
-        //   payload: responseData,
-        // });
+        // 
         CustomActionService.refreshFileList(`${conversationId}`);
       }
     }
@@ -1090,17 +1117,6 @@ export default class AgentDetailService {
       const finished = finishedRaw == true || `${finishedRaw}` == "true";
       // 注意：中间段 CHAT 也可能带 finished=true（如仅下发 agent-info），
       // 不能据此结束整轮会话；整轮结束以 FINAL_RESULT / 流完成 / 用户停止为准。
-
-      if (text.length == 0 && type.length > 0) {
-        console.log(
-          "[SSE-Stream] MESSAGE empty text type=",
-          type,
-          "finished=",
-          finished,
-          "id=",
-          id,
-        );
-      }
 
       if (type == `${MessageModeEnum.THINK}`) {
         const m = cloneMessageInfoDraft(currentMessage);
@@ -1178,14 +1194,12 @@ export default class AgentDetailService {
       this.data.isConversationActive.value = false;
     }
 
-    // 更新消息列表
+    // 更新消息列表草稿
     if (newMessage != null) {
       list.splice(index, arraySpliceAction, newMessage);
     }
 
-    // 确保消息列表更新是同步的
-    this.data.messageList.value = [...list];
-
+    // TTS 即时驱动（不进 UI 合并），避免播报被 40ms 合并拖慢
     if (newMessage != null) {
       const patchedText = readMessageText(newMessage);
       if (
@@ -1202,57 +1216,22 @@ export default class AgentDetailService {
           finished: false,
         });
       }
-      const preview =
-        patchedText.length > 48 ? `${patchedText.substring(0, 48)}...` : patchedText;
-      const thinkPreview = readMessageThink(newMessage);
-      console.log(
-        "[SSE-Stream] 更新消息 event=",
-        eventTypeStr,
-        "targetId=",
-        currentMessageId,
-        "textLen=",
-        patchedText.length,
-        "thinkLen=",
-        thinkPreview.length,
-        "streamTextLen=",
-        this.data.streamingAssistantText.value.length,
-        "status=",
-        newMessage.status,
-        "preview=",
-        preview,
-      );
-    } else {
-      console.log(
-        "[SSE-Stream] 未产生消息 patch event=",
-        eventTypeStr,
-        "targetId=",
-        currentMessageId,
-      );
     }
 
-    // 流式渲染过程中触发自动滚动到底部
-    // 确保 autoToLastMsg 为 true，这样 watch 触发后会执行滚动
-    if (this.data.autoToLastMsg.value) {
-      // 通过事件总线通知主组件执行滚动，兼容微信小程序和 H5
-      uni.$emit("streamMessageUpdate");
-    }
+    const needScroll = this.data.autoToLastMsg.value;
+    const isErrorEvent = eventTypeStr == `${ConversationEventTypeEnum.ERROR}`;
+    // ERROR 立即冲刷；其余 SSE 事件合并 UI，降低 [...list] + 气泡更新频率
+    this.scheduleStreamUiPublish(
+      currentMessageId,
+      newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT
+        ? newMessage
+        : null,
+      needScroll,
+      isErrorEvent,
+    );
 
-    // 调试日志：状态更新
-    // if (newMessage) {
-    // 	console.log(`[Stream] Message ${currentMessageId} updated: status=${newMessage.status}, textLength=${newMessage.text?.length || 0}`)
-    // }
-
-    // 使用优化更新方法，只更新需要更新的组件（勿 await nextTick，避免 App 流式 chunk 堆积）
+    // 打开页面首页（与气泡更新解耦，保持即时）
     if (newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT) {
-      const patchedText = readMessageText(newMessage);
-      const emitData = messageToJsonObject(newMessage);
-      emitData["body"] = handleMessageProcess(patchedText);
-      uni.$emit("updateMessageComponent", {
-        messageId: `${currentMessageId}_${newMessage.index}`,
-        data: emitData,
-      });
-
-      // 打开页面首页
       const pageStatusRaw = readRawField(responseData, "status");
       const pageTypeRaw = readRawField(responseData, "type");
       if (
@@ -1333,6 +1312,7 @@ export default class AgentDetailService {
       let hasUpdatedTopic = false;
       // 本轮流代数；abort / 新开流后旧回调直接丢弃
       this.streamGeneration = this.streamGeneration + 1;
+      this.endStreamListDraft();
       const streamGen = this.streamGeneration;
 
       await chatService.sendMessage(
@@ -1399,7 +1379,6 @@ export default class AgentDetailService {
           if (streamGen != this.streamGeneration) {
             return;
           }
-          console.log("[SSE-Stream] 流式会话完成");
           this.handleStreamComplete(params, isTempChat);
         },
         // 错误回调
@@ -1411,6 +1390,7 @@ export default class AgentDetailService {
             "[AgentDetailService] Chat stream error callback:",
             error,
           );
+          this.endStreamListDraft();
           this.clearStreamingAssistantText();
           if (onTimeout != null) {
             (onTimeout as () => void)();
@@ -1423,6 +1403,7 @@ export default class AgentDetailService {
             return;
           }
           console.warn("[SSE-Stream] stream abnormal close / timeout");
+          this.endStreamListDraft();
           this.clearStreamingAssistantText();
           // App：无终态断流时助手常停在 Loading（仅工具卡），回拉会话补正文
           this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
@@ -1451,6 +1432,9 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
+    // 先冲刷流式 UI，保证完成态气泡与列表一致
+    this.endStreamListDraft();
+
     // 冲刷尾句：必须在 clearStreaming / inactive 之前，携带最终正文
     const speakMsgId = this.data.streamingAssistantMessageId.value;
     let speakBody = this.data.streamingAssistantText.value;
@@ -1557,7 +1541,6 @@ export default class AgentDetailService {
         if (recovered != true) {
           return;
         }
-        console.log("[SSE-Stream] resume applied");
         this.schedulePostStreamRecovery(streamGenAtSchedule, 0);
       });
     }, 500);
@@ -1604,6 +1587,7 @@ export default class AgentDetailService {
 
     // 无论 UI 是否已标为结束，都先中止本地 SSE，避免 chunk 回调继续跑
     this.streamGeneration = this.streamGeneration + 1;
+    this.endStreamListDraft();
     chatService.abort();
 
     // 如果会话已经不活跃，说明会话已经结束，无需调用 stop 接口
@@ -1645,10 +1629,8 @@ export default class AgentDetailService {
       const code = res != null ? apiResCode(res) : null;
       const message = res != null ? apiResMessage(res) : "";
       this.data.isStoppingConversation.value = false;
-      // 停止会话成功
-      if (code == SUCCESS_CODE) {
-        console.log("[AgentDetailService] stop 接口调用成功");
-      } else {
+      // 停止会话失败时提示
+      if (code != SUCCESS_CODE) {
         uni.showToast({
           title: message != null ? message : "",
           icon: "none",
@@ -1665,11 +1647,9 @@ export default class AgentDetailService {
    * 用于超时或异常中断时的状态更新
    */
   updateProcessingListToFailed(): void {
-    console.log("[AgentDetailService] 开始更新工具调用状态为 FAILED");
 
     const messageList = this.data.messageList.value;
     if (messageList == null || messageList.length == 0) {
-      console.log("[AgentDetailService] 消息列表为空，无需更新");
       return;
     }
 
@@ -1682,9 +1662,6 @@ export default class AgentDetailService {
         message.processingList != null &&
         message.processingList.length > 0
       ) {
-        console.log(
-          `[AgentDetailService] 更新消息 ${message.id} 的工具调用状态`,
-        );
 
         // 更新 processingList 中的状态
         const procList = message.processingList as ProcessingInfo[];
@@ -1692,9 +1669,6 @@ export default class AgentDetailService {
           (processing: ProcessingInfo): ProcessingInfo => {
             // 将所有 EXECUTING 状态的工具调用改为 FAILED
             if (processing.status == ProcessingEnum.EXECUTING) {
-              console.log(
-                `[AgentDetailService] 工具 ${processing.name} 状态从 EXECUTING 改为 FAILED`,
-              );
               const pObj = JSON.parse(JSON.stringify(processing)) as UTSJSONObject;
               pObj["status"] = ProcessingEnum.FAILED;
               return pObj as ProcessingInfo;
@@ -1714,7 +1688,6 @@ export default class AgentDetailService {
 
     // 更新消息列表
     this.data.messageList.value = updatedMessages;
-    console.log("[AgentDetailService] 工具调用状态更新完成");
   }
 
   /**
@@ -1903,11 +1876,6 @@ export default class AgentDetailService {
       const selectedMap = this.data.agentSelectedSandbox.value as UTSJSONObject;
       selectedMap[agentId] = sandboxId;
       this.data.agentSelectedSandbox.value = selectedMap;
-
-      // uni.showToast({
-      //   title: "切换成功",
-      //   icon: "none",
-      // });
     } catch (error) {
       console.error("[AgentDetailService] 切换沙盒失败:", error);
       uni.showToast({
@@ -1979,11 +1947,6 @@ export default class AgentDetailService {
       return false;
     }
 
-    console.log("[SessionResume] 检测到异常中断，正在查询后端会话状态", {
-      lastMessageStatus: lastAssistantMessage?.status,
-      conversationId,
-    });
-
     try {
       // 8. 查询后端会话状态并刷新
       const res = await apiAgentConversation(conversationId);
@@ -2002,10 +1965,6 @@ export default class AgentDetailService {
 
         // 更新消息列表（刷新页面数据）
         this.handleQueryConversation(res);
-        console.log(
-          "[SessionResume] 会话状态已恢复，后端任务状态:",
-          taskStatusRaw,
-        );
       }
 
       return true;
@@ -2123,6 +2082,7 @@ export default class AgentDetailService {
 
     // 先掐断上一轮 SSE / 打字机通道，再挂新气泡，避免旧正文串到空助手消息
     this.streamGeneration = this.streamGeneration + 1;
+    this.endStreamListDraft();
     chatService.abort();
     this.clearStreamingAssistantText();
 

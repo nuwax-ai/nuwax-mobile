@@ -164,11 +164,11 @@ function buildPcm16Wav(chunks: Uint8Array[], sampleRate: number): ArrayBuffer {
 
   const output = new Uint8Array(buffer);
   let offset = 44;
+  // 禁止逐字节拷贝：长句 PCM 可达数 MB，主线程逐字节拷会 ANR
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    for (let j = 0; j < chunk.length; j++) {
-      output[offset++] = chunk[j];
-    }
+    output.set(chunk, offset);
+    offset += chunk.length;
   }
   return buffer;
 }
@@ -466,7 +466,6 @@ function createTtsSocket(
   const url = createTtsWebSocketUrl(accessToken);
   // #ifdef H5 || WEB
   try {
-    console.log("[TTS] connect via native WebSocket");
     return new H5NativeSocketAdapter(url);
   } catch (e: any) {
     onFail(e != null && e.message != null ? `${e.message}` : "TTS 连接失败");
@@ -552,11 +551,9 @@ export class TtsWebSocketPlayer {
   enableWarmupAndConnect(): void {
     this.warmupEnabled = true;
     if (this.isWarmOpen() == true) {
-      console.log("[TTS] warmup already open");
       return;
     }
     if (this.warmSocketTask != null) {
-      console.log("[TTS] warmup already connecting");
       return;
     }
     this.ensureWarmSocketAsync();
@@ -929,7 +926,6 @@ export class TtsWebSocketPlayer {
     this.pendingBinary = 0;
     this.chunks = [] as Uint8Array[];
     this.recycleSessionToWarm();
-    console.log("[TTS] cancel preserve synth (keep audio)");
   }
 
   /**
@@ -951,6 +947,11 @@ export class TtsWebSocketPlayer {
 
     if (preservePlayingAudio == true) {
       // 取消上一笔预取合成；保留正在播放的音频与 generation
+      // 主句仍在占用 session 时禁止并发开第二条 WS（否则双连接 + 帧风暴 → ANR）
+      if (this.socketTask != null) {
+        console.warn("[TTS] refuse preserve synth while session busy");
+        throw new Error("TTS session busy");
+      }
       this.synthEpoch += 1;
       this.synthInFlight = true;
       this.clearSynthStallWatchdog();
@@ -1119,6 +1120,9 @@ export class TtsWebSocketPlayer {
         }
         if (type == "tts_ready") {
           this.sendJson(buildTtsControlMessage("text", trimmed, 0, true));
+        } else if (type == "tts_begin") {
+          // 服务端正常生命周期：每句合成开始都会推一次，流式多句会多次出现，无需告警
+          return;
         } else if (type == "tts_end") {
           this.finishRequested = true;
           tryFinishSrc();
@@ -1235,7 +1239,6 @@ export class TtsWebSocketPlayer {
       }
       playStarted = true;
       this.switchingToReal = true;
-      console.log("[TTS] playSrc.play srcLen=" + src.length.toString());
       try {
         audio!.play();
       } catch (ePlay: any) {
@@ -1251,7 +1254,6 @@ export class TtsWebSocketPlayer {
       if (this.switchingToReal || this.realPlayback) {
         this.switchingToReal = false;
         this.realPlayback = true;
-        console.log("[TTS] playSrc.onPlay");
         this.setState("playing");
       }
     });
@@ -1445,7 +1447,6 @@ export class TtsWebSocketPlayer {
     // 预热已就绪 → 直接复用；若仍在连 → 短等；否则新建
     if (this.warmOpen != true || this.warmSocketTask == null) {
       if (this.warmSocketTask != null) {
-        console.log("[TTS] wait warm connecting");
         const ok = await this.waitForWarmOpen(5000);
         if (cancelled()) {
           return;
@@ -1457,7 +1458,6 @@ export class TtsWebSocketPlayer {
       }
     }
     if (this.warmOpen == true && this.warmSocketTask != null) {
-      console.log("[TTS] reuse warm socket (no new socket)");
       this.socketTask = this.warmSocketTask;
       this.warmSocketTask = null;
       this.warmOpen = false;
@@ -1484,7 +1484,6 @@ export class TtsWebSocketPlayer {
         return;
       }
     }
-    console.log("[TTS] no warm socket, connecting now");
     await this.openSessionSocketOnce(
       accessToken,
       expectedGeneration,
@@ -1568,16 +1567,6 @@ export class TtsWebSocketPlayer {
     this.socketRouterInstalledFor = socketTask;
     socketTask.onMessage((res: OnSocketMessageCallbackResult) => {
       const dataType = typeof res.data;
-      let rawHint = dataType;
-      if (dataType == "string") {
-        const s = res.data as string;
-        rawHint = s.length > 96 ? s.substring(0, 96) : s;
-      } else {
-        const sync = tryAsArrayBufferSync(res.data);
-        if (sync != null) {
-          rawHint = "bin:" + sync.byteLength.toString();
-        }
-      }
       // 仅处理「当前会话 socket」或「当前预热 socket」的消息，避免旧连接串扰
       const isSession = this.socketTask == socketTask;
       const isWarm = this.warmSocketTask == socketTask;
@@ -1588,20 +1577,6 @@ export class TtsWebSocketPlayer {
         this.tryHandleKeepaliveReject(res.data as string)
       ) {
         return;
-      }
-      const isKeepaliveRejectHint =
-        dataType == "string" &&
-        rawHint.indexOf("UNKNOWN_TYPE") >= 0 &&
-        (rawHint.indexOf("ping") >= 0 || rawHint.indexOf("pong") >= 0);
-      if (isKeepaliveRejectHint != true) {
-        console.log(
-          "[TTS] raw frame session=",
-          isSession,
-          "warm=",
-          isWarm,
-          "data=",
-          rawHint,
-        );
       }
       if (!isSession && !isWarm) {
         return;
@@ -1706,7 +1681,6 @@ export class TtsWebSocketPlayer {
     }
     // 会话进行中禁止新建预热：会抢 router / 误清 sink，导致 tts_ready 后收不到 PCM
     if (this.socketTask != null) {
-      console.log("[TTS] warmup skip: session busy");
       return;
     }
     if (this.warmOpen == true && this.warmSocketTask != null) {
@@ -1723,7 +1697,6 @@ export class TtsWebSocketPlayer {
     }
     this.warmGeneration += 1;
     const expectedWarm = this.warmGeneration;
-    console.log("[TTS] warmup connecting");
     const socketTask = createTtsSocket(accessToken, (errMsg: string) => {
       console.warn("[TTS] warmup fail (no auto-retry)", errMsg);
       if (expectedWarm == this.warmGeneration) {
@@ -1751,7 +1724,6 @@ export class TtsWebSocketPlayer {
       this.warmOpen = true;
       this.warmOpenedAtMs = Date.now();
       this.preferArrayBufferBinaryType(socketTask);
-      console.log("[TTS] warmup open");
       this.refreshKeepalive();
       this.notifyWarmOpenWaiters(true);
     });
@@ -1784,7 +1756,6 @@ export class TtsWebSocketPlayer {
             this.socketTask == null &&
             this.warmSocketTask == null
           ) {
-            console.log("[TTS] peer closed → reconnect warm once");
             this.ensureWarmSocketAsync();
           }
         }, 300);
@@ -1895,7 +1866,6 @@ export class TtsWebSocketPlayer {
       }
     });
     this.refreshKeepalive();
-    console.log("[TTS] recycle session → warm (reuse TCP, no new socket)");
   }
 
   /**
@@ -1979,7 +1949,6 @@ export class TtsWebSocketPlayer {
       audio.volume = this.getTargetVolume() > 0 ? 0.01 : 0;
       audio.src = SILENT_WAV_DATA_URI;
       audio.play();
-      console.log("[TTS] h5.audioUnlocked");
     } catch (e: any) {
       console.warn("[TTS] h5.audioUnlockFailed", e);
     }
@@ -1995,12 +1964,6 @@ export class TtsWebSocketPlayer {
     const payload = JSON.stringify(data);
     const typeVal = data["type"];
     const type = typeVal != null ? `${typeVal}` : "";
-    console.log(
-      "[TTS] send type=",
-      type,
-      "payloadLen=",
-      payload.length,
-    );
     try {
       socket!.send({ data: payload } as SendSocketMessageOptions);
     } catch (e: any) {
@@ -2012,12 +1975,6 @@ export class TtsWebSocketPlayer {
   private handleSocketMessage(res: OnSocketMessageCallbackResult): void {
     if (typeof res.data != "string") {
       const sync = tryAsArrayBufferSync(res.data);
-      console.log(
-        "[TTS] recv binary sync=",
-        sync != null,
-        "bytes=",
-        sync != null ? sync!.byteLength : -1,
-      );
       this.appendBinaryChunk(res.data);
       return;
     }
@@ -2038,24 +1995,13 @@ export class TtsWebSocketPlayer {
       return;
     }
     if (type == "tts_ready") {
-      console.log(
-        "[TTS] tts_ready → send textLen=",
-        this.text.length,
-      );
       this.setState("synthesizing");
       // 冒烟协议：单帧 text + flush:true
       this.sendJson(buildTtsControlMessage("text", this.text, 0, true));
       this.armSynthStallWatchdog();
     } else if (type == "tts_begin") {
-      console.log("[TTS] tts_begin");
       this.setState("synthesizing");
     } else if (type == "tts_end") {
-      console.log(
-        "[TTS] tts_end chunks=",
-        this.chunks.length,
-        "pendingBinary=",
-        this.pendingBinary,
-      );
       this.clearSynthStallWatchdog();
       this.finishRequested = true;
       this.tryFinishSynthesis();
@@ -2125,16 +2071,6 @@ export class TtsWebSocketPlayer {
       if (syncBuffer!.byteLength > 0) {
         this.chunks.push(new Uint8Array(syncBuffer!));
         this.clearSynthStallWatchdog();
-        if (this.chunks.length == 1 || this.chunks.length % 20 == 0) {
-          console.log(
-            "[TTS] pcm chunk#",
-            this.chunks.length,
-            "bytes=",
-            syncBuffer!.byteLength,
-            "pendingBinary=",
-            this.pendingBinary,
-          );
-        }
       } else {
         console.warn("[TTS] skip empty binary frame");
       }
@@ -2156,16 +2092,6 @@ export class TtsWebSocketPlayer {
       if (buffer != null && buffer!.byteLength > 0) {
         this.chunks.push(new Uint8Array(buffer!));
         this.clearSynthStallWatchdog();
-        if (this.chunks.length == 1 || this.chunks.length % 20 == 0) {
-          console.log(
-            "[TTS] pcm chunk#",
-            this.chunks.length,
-            "bytes=",
-            buffer!.byteLength,
-            "pendingBinary=",
-            this.pendingBinary,
-          );
-        }
       } else {
         console.warn("[TTS] skip empty/unrecognized binary frame");
       }
@@ -2192,12 +2118,6 @@ export class TtsWebSocketPlayer {
       for (let i = 0; i < this.chunks.length; i++) {
         pcmBytes += this.chunks[i].length;
       }
-      console.log(
-        "[TTS] finishSynthesis chunks=" +
-          this.chunks.length.toString() +
-          " pcmBytes=" +
-          pcmBytes.toString(),
-      );
       const wav = buildPcm16Wav(this.chunks, this.sampleRate);
       const src = await saveWavFile(wav);
       if (expectedGeneration != this.generation) {
@@ -2251,7 +2171,6 @@ export class TtsWebSocketPlayer {
         }
         playStarted = true;
         this.switchingToReal = true;
-        console.log("[TTS] audio.play srcLen=" + src.length.toString());
         try {
           audio!.play();
         } catch (ePlay: any) {
@@ -2271,7 +2190,6 @@ export class TtsWebSocketPlayer {
         if (this.switchingToReal || this.realPlayback) {
           this.switchingToReal = false;
           this.realPlayback = true;
-          console.log("[TTS] audio.onPlay");
           this.setState("playing");
         }
       });
@@ -2335,7 +2253,6 @@ export class TtsWebSocketPlayer {
     console.error("[TTS] " + message);
     this.clearSynthStallWatchdog();
     // 保留 messageId 直到 idle 通知结束，便于工具栏按消息匹配并退出播报态
-    const failedMessageId = this.messageId;
     this.setState("error");
     // 流式多句连续 stall 时只弹一次，避免连环 toast
     const now = Date.now();
@@ -2354,9 +2271,6 @@ export class TtsWebSocketPlayer {
     // 仍带原 messageId 通知 idle，避免监听方因 id 已空而跳过复位
     this.setState("idle");
     this.messageId = "";
-    if (failedMessageId.length > 0) {
-      console.log("[TTS] fail → idle messageId=", failedMessageId);
-    }
   }
 
   private setState(state: TtsPlaybackState): void {

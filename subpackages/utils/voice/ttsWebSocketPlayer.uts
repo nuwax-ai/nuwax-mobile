@@ -545,6 +545,8 @@ export class TtsWebSocketPlayer {
   private keepalive: SpeechWsKeepalive = new SpeechWsKeepalive();
   /** fail toast 节流，避免流式多句连续弹窗 */
   private lastFailToastAtMs: number = 0;
+  /** 最近一次合成 PCM 估算时长（ms）；H5 blob URL 长度不能反映音频时长 */
+  private lastSynthDurationMs: number = 0;
 
   /** 进入会话页：开启预热并预连 WebSocket */
   enableWarmupAndConnect(): void {
@@ -693,6 +695,14 @@ export class TtsWebSocketPlayer {
 
   getMessageId(): string {
     return this.messageId;
+  }
+
+  /**
+   * 最近一次 synthesizeToSrc 完成时的 PCM 估算时长（ms）。
+   * H5 blob: URL 的 string.length 不能反映音频时长，播放超时请用此值或 playSrcAndWait 的 durationMs 入参。
+   */
+  getLastSynthDurationMs(): number {
+    return this.lastSynthDurationMs;
   }
 
   /**
@@ -1021,6 +1031,13 @@ export class TtsWebSocketPlayer {
           reject(new Error("TTS 未返回音频"));
           return;
         }
+        let pcmBytes = 0;
+        for (let ci = 0; ci < this.chunks.length; ci++) {
+          pcmBytes += this.chunks[ci].length;
+        }
+        // PCM16 mono：时长 = bytes / (sampleRate * 2)
+        const durMs = Math.floor((pcmBytes * 1000) / (this.sampleRate * 2));
+        this.lastSynthDurationMs = durMs > 0 ? durMs : 0;
         const wav = buildPcm16Wav(this.chunks, this.sampleRate);
         if (canRecycle == true) {
           this.recycleSessionToWarm();
@@ -1156,9 +1173,14 @@ export class TtsWebSocketPlayer {
 
   /**
    * 播放已合成的 src，并等到结束（供流式边播边合成，避免串行 playAndWait 的合成空窗）。
+   * @param expectedDurationMs 该 src 对应 PCM 估算时长；深预取时 lastSynthDurationMs 会被后续句覆盖，必须传本条目时长。
    * @returns true=正常播完；false=error/超时
    */
-  async playSrcAndWait(messageId: string, src: string): Promise<boolean> {
+  async playSrcAndWait(
+    messageId: string,
+    src: string,
+    expectedDurationMs: number = 0,
+  ): Promise<boolean> {
     if (src.trim().length == 0) {
       return true;
     }
@@ -1240,12 +1262,8 @@ export class TtsWebSocketPlayer {
       if (this.realPlayback != true) {
         return;
       }
-      // 预取合成占用 socket 时：只收尾播放，禁止 recycle / 清 chunks / bump synthEpoch
-      if (this.synthInFlight == true) {
-        this.endPlaybackKeepSynth();
-      } else {
-        this.prepareForNextUtterance(true);
-      }
+      // 流水线预取可能紧接下一句合成：播放收尾一律不 recycle，避免清掉 in-flight PCM
+      this.endPlaybackKeepSynth();
     });
     audio!.onError((err) => {
       if (reqId != this.playRequestId) {
@@ -1280,9 +1298,20 @@ export class TtsWebSocketPlayer {
     // #endif
     // #endif
 
-    let waitMs = 30000 + Math.floor(src.length / 4) * 80;
-    if (waitMs > 180000) {
-      waitMs = 180000;
+    // H5 blob: URL 的 src.length≈63，旧公式几乎总是 ~30s，长音频会被误掐断
+    let durationHint = expectedDurationMs;
+    if (durationHint <= 0) {
+      durationHint = this.lastSynthDurationMs;
+    }
+    let waitMs = 60000;
+    if (durationHint > 0) {
+      waitMs = durationHint + 15000;
+    }
+    if (waitMs < 20000) {
+      waitMs = 20000;
+    }
+    if (waitMs > 300000) {
+      waitMs = 300000;
     }
     return await new Promise<boolean>((resolve) => {
       let settled = false;
@@ -1310,18 +1339,19 @@ export class TtsWebSocketPlayer {
           reqId,
           "state=",
           this.state,
+          "waitMs=",
+          waitMs,
+          "durationHint=",
+          durationHint,
         );
-        if (reqId == this.playRequestId) {
-          if (this.synthInFlight == true) {
-            this.endPlaybackKeepSynth();
-          } else {
-            this.prepareForNextUtterance(true);
-          }
-        }
+        // 必须先 finish(false)：若先 endPlayback→idle，订阅会抢成 finish(true)
         finish(false);
+        if (reqId == this.playRequestId) {
+          this.endPlaybackKeepSynth();
+        }
       }, waitMs);
       listenerId = this.subscribe((state: TtsPlaybackState, _mid: string) => {
-        // endPlaybackKeepSynth 不 bump generation；prepareForNext 会 bump
+        // endPlaybackKeepSynth 不 bump generation；外部 stop/synthesize(false) 才会 bump
         if (waitGeneration != this.generation) {
           if (seenActive == true && (state == "idle" || state == "error")) {
             finish(state != "error");

@@ -87,6 +87,7 @@ function normalizeAccessToken(token: string): string {
 /**
  * 解析 ASR 鉴权 Token（与 TTS 一致）。
  * H5：优先 Cookie（ACCESS_TOKEN / access_token），否则回退本地 storage。
+ * iOS：key 不存在时 getStorageSync 可能抛「返回值为 undefined」，必须 try-catch。
  */
 function readAccessToken(): string {
   // #ifdef H5 || WEB
@@ -98,11 +99,19 @@ function readAccessToken(): string {
     return normalizeAccessToken(cookieToken);
   }
   // #endif
-  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
-  if (tokenRaw == null) {
+  try {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    if (tokenRaw == null) {
+      return "";
+    }
+    const asStr = `${tokenRaw}`;
+    if (asStr.length == 0 || asStr == "undefined" || asStr == "null") {
+      return "";
+    }
+    return normalizeAccessToken(asStr);
+  } catch (_eStorage) {
     return "";
   }
-  return normalizeAccessToken(`${tokenRaw}`);
 }
 
 export class AsrWebSocketClient {
@@ -237,7 +246,36 @@ export class AsrWebSocketClient {
     onResult: AsrResultCallback,
     onError: AsrErrorCallback,
   ): void {
-    this.abortInternal(false);
+    // 已有存活连接：禁止再 connectSocket，只更新回调与角色
+    if (this.socketTask != null && this.socketOpen == true) {
+      this.onReadyCb = onReady;
+      this.onResultCb = onResult;
+      this.onErrorCb = onError;
+      this.warmIdle = warmOnly;
+      this.ready = false;
+      this.starting = false;
+      this.connecting = false;
+      if (warmOnly == true) {
+        console.log("[ASR] reuse existing TCP as warm");
+        return;
+      }
+      console.log("[ASR] reuse existing TCP, send start");
+      this.starting = true;
+      this.sendJsonStart();
+      return;
+    }
+    // 建连中：挂回调，open 后按 warmIdle 决定是否 start
+    if (this.connecting == true && this.socketTask != null) {
+      this.onReadyCb = onReady;
+      this.onResultCb = onResult;
+      this.onErrorCb = onError;
+      this.warmIdle = warmOnly;
+      return;
+    }
+    // 仅此时允许新建：先清掉残留引用（socket 已死），不主动 close 第二次
+    if (this.socketTask != null) {
+      this.socketTask = null;
+    }
     this.generation += 1;
     const expectedGeneration = this.generation;
     this.onReadyCb = onReady;
@@ -330,7 +368,7 @@ export class AsrWebSocketClient {
       this.warmIdle = false;
       this.socketTask = null;
       console.log("[ASR] socket closed");
-      // 仍在会话页：对端/网关掐断后单次补预热（业务操作本身不再主动关连）
+      // 仍在会话页：对端/网关掐断后单次补预热（业务路径本身不再主动关连）
       if (this.warmupEnabled == true) {
         setTimeout(() => {
           if (
@@ -428,13 +466,9 @@ export class AsrWebSocketClient {
 
   /**
    * 取消本轮识别。
-   * 预热开启时优先不断连：发 stop 收回待命，或已在待命则仅清回调。
+   * 策略：只要 TCP 还在就不断连——待命则清回调；进行中则发 stop 收回待命。
    */
   abort(): void {
-    if (this.warmupEnabled != true) {
-      this.abortInternal(true);
-      return;
-    }
     // 已在预热待命：不断连
     if (this.isWarmOpen() == true) {
       this.onReadyCb = null;
@@ -450,7 +484,6 @@ export class AsrWebSocketClient {
     ) {
       this.onReadyCb = null;
       this.onErrorCb = null;
-      // 吞掉本轮结果，只把连接收回待命
       this.onResultCb = (
         _text: string,
         _ok: boolean,
@@ -459,9 +492,16 @@ export class AsrWebSocketClient {
       this.finish();
       return;
     }
-    // 连接已死 / 半开：关断后单次重建预热
-    this.abortInternal(true);
-    this.connectWarmTcp();
+    // 半开/无 socket：仅清状态；页内由 onClose 或 enableWarmup 补连，此处不主动 close
+    this.onReadyCb = null;
+    this.onResultCb = null;
+    this.onErrorCb = null;
+    this.ready = false;
+    this.starting = false;
+    this.connecting = false;
+    if (this.warmupEnabled == true && this.socketTask == null) {
+      this.connectWarmTcp();
+    }
   }
 
   /** 一轮识别结束后：保留 TCP，回到预热待命（不 connectSocket） */
@@ -480,6 +520,9 @@ export class AsrWebSocketClient {
     }
   }
 
+  /**
+   * 真正关连：仅离开会话页 disableWarmup 时调用。
+   */
   private abortInternal(bumpGeneration: boolean): void {
     if (bumpGeneration) {
       this.generation += 1;
@@ -562,13 +605,10 @@ export class AsrWebSocketClient {
           text.length.toString(),
       );
       const cb = this.onResultCb;
-      // 预热开启：保留 TCP，下一轮只发 start；否则关连
-      // 注意：复用同一 socket 时不可 bump generation，否则 onMessage 会被 generation 守卫丢弃
-      if (this.warmupEnabled == true && this.socketTask != null) {
+      // 只要 TCP 还在：收回待命，绝不主动 close（复用同一 socket 时不可 bump generation）
+      if (this.socketTask != null) {
         this.recycleToWarmIdle();
       } else {
-        this.generation += 1;
-        this.stopKeepalive();
         this.ready = false;
         this.connecting = false;
         this.starting = false;
@@ -577,15 +617,6 @@ export class AsrWebSocketClient {
         this.onReadyCb = null;
         this.onResultCb = null;
         this.onErrorCb = null;
-        const socket = this.socketTask;
-        this.socketTask = null;
-        if (socket != null) {
-          try {
-            socket!.close({});
-          } catch (_eClose) {
-            // ignore
-          }
-        }
       }
       if (cb != null) {
         cb(text, ok, errorMessage);
@@ -595,7 +626,7 @@ export class AsrWebSocketClient {
       const msgVal = message["message"];
       const code = codeVal != null ? `${codeVal}` : "";
       const msg = msgVal != null ? `${msgVal}` : "ASR 错误";
-      // 服务端不支持应用层 ping：停心跳，不断连
+      // 服务端拒识 ping：心跳仍继续（网关保活），此处仅降噪
       if (
         code == "UNKNOWN_TYPE" &&
         (msg.indexOf("ping") >= 0 || msg.indexOf("pong") >= 0)
@@ -607,10 +638,25 @@ export class AsrWebSocketClient {
     }
   }
 
+  /**
+   * 业务失败：通知回调并收回待命，不断开 TCP。
+   * 真正关连只在 disableWarmupAndDisconnect。
+   */
   private fail(message: string): void {
     console.error("[ASR] fail " + message);
     const cb = this.onErrorCb;
-    this.abortInternal(true);
+    if (this.socketTask != null) {
+      this.recycleToWarmIdle();
+    } else {
+      this.onReadyCb = null;
+      this.onResultCb = null;
+      this.onErrorCb = null;
+      this.ready = false;
+      this.starting = false;
+      this.connecting = false;
+      this.warmIdle = false;
+      this.socketOpen = false;
+    }
     if (cb != null) {
       cb(message);
     }

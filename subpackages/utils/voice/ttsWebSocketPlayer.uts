@@ -80,6 +80,7 @@ function normalizeAccessToken(token: string): string {
 /**
  * 解析 TTS 鉴权 Token。
  * H5：优先 Cookie（ACCESS_TOKEN / access_token），否则回退本地 storage。
+ * iOS：key 不存在时 getStorageSync 可能抛「返回值为 undefined」，必须 try-catch。
  */
 function resolveAccessToken(): string {
   // #ifdef H5 || WEB
@@ -91,11 +92,19 @@ function resolveAccessToken(): string {
     return normalizeAccessToken(cookieToken);
   }
   // #endif
-  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
-  if (tokenRaw == null) {
+  try {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    if (tokenRaw == null) {
+      return "";
+    }
+    const asStr = `${tokenRaw}`;
+    if (asStr.length == 0 || asStr == "undefined" || asStr == "null") {
+      return "";
+    }
+    return normalizeAccessToken(asStr);
+  } catch (_eStorage) {
     return "";
   }
-  return normalizeAccessToken(`${tokenRaw}`);
 }
 
 function createTtsWebSocketUrl(token: string): string {
@@ -527,6 +536,8 @@ export class TtsWebSocketPlayer {
   private synthStallTimerId: number = 0;
   /** 预热 / 会话连接成功后的心跳保活 */
   private keepalive: SpeechWsKeepalive = new SpeechWsKeepalive();
+  /** fail toast 节流，避免流式多句连续弹窗 */
+  private lastFailToastAtMs: number = 0;
 
   /** 进入会话页：开启预热并预连 WebSocket */
   enableWarmupAndConnect(): void {
@@ -542,13 +553,32 @@ export class TtsWebSocketPlayer {
     this.ensureWarmSocketAsync();
   }
 
-  /** 离开会话页：关闭预热并断开待命/业务连接 */
+  /** 离开会话页：关闭预热并断开待命/业务连接（唯一允许主动关连的入口） */
   disableWarmupAndDisconnect(): void {
     this.warmupEnabled = false;
+    this.generation += 1;
+    this.warmGeneration += 1;
+    this.clearSynthStallWatchdog();
     this.closeWarmSocket();
-    this.stop();
+    this.closeSessionSocketOnly();
     this.stopKeepalive();
     this.keepalive.resetServerReject();
+    // 销毁音频，但不经由 recycle（上面已关连）
+    const audio = this.audioContext;
+    this.audioContext = null;
+    if (audio != null) {
+      try {
+        audio!.stop();
+        audio!.destroy();
+      } catch (_eAudio) {
+        // ignore
+      }
+    }
+    this.revokeBlobUrl();
+    this.chunks = [] as Uint8Array[];
+    this.text = "";
+    this.messageId = "";
+    this.setState("idle");
   }
 
   /**
@@ -718,6 +748,7 @@ export class TtsWebSocketPlayer {
 
   async play(messageId: string, text: string): Promise<void> {
     // 串行分句时复用已解锁的 InnerAudioContext，避免 H5 第二句再走手势解锁失败后卡住
+    // 只结束上一句会话音频状态，禁止动预热 TCP（recycle 空 session 为 no-op）
     this.prepareForNextUtterance(true);
     if (text.trim().length == 0) {
       throw new Error("没有可播报的文本");
@@ -744,6 +775,20 @@ export class TtsWebSocketPlayer {
       this.prepareAudioContextForGesture();
     }
 
+    // 预热丢失（上次 fail 关连 / 对端掐断）时先补待命再取用，避免业务路径直接 new WebSocket
+    if (
+      this.warmupEnabled == true &&
+      this.isWarmOpen() != true &&
+      this.warmSocketTask == null
+    ) {
+      console.warn("[TTS] warm missing before play → ensure warm");
+      this.ensureWarmSocketAsync();
+      await this.waitForWarmOpen(3000);
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+    }
+
     await this.takeOrOpenSessionSocket(accessToken, expectedGeneration);
     if (expectedGeneration != this.generation) {
       return;
@@ -753,12 +798,12 @@ export class TtsWebSocketPlayer {
 
   /**
    * 与工具栏 play 同一套合成+播报，并等到本轮结束（idle/error）再返回。
-   * 供流式分句串行调用，避免 synthesizeToSrc + audioPlayerManager 在 H5 叠音。
+   * @returns true=正常播完；false=error/超时/无音频（调用方应停掉后续分句）
    */
-  async playAndWait(messageId: string, text: string): Promise<void> {
+  async playAndWait(messageId: string, text: string): Promise<boolean> {
     const trimmed = text.trim();
     if (trimmed.length == 0) {
-      return;
+      return true;
     }
     await this.play(messageId, trimmed);
     const expectedGeneration = this.generation;
@@ -767,12 +812,13 @@ export class TtsWebSocketPlayer {
     if (waitMs > 180000) {
       waitMs = 180000;
     }
-    return await new Promise<void>((resolve) => {
+    return await new Promise<boolean>((resolve) => {
       let settled = false;
       let seenActive = false;
+      let succeeded = true;
       let listenerId = 0;
       let timerId = 0;
-      const finish = (): void => {
+      const finish = (ok: boolean): void => {
         if (settled) {
           return;
         }
@@ -785,7 +831,7 @@ export class TtsWebSocketPlayer {
           this.unsubscribe(listenerId);
           listenerId = 0;
         }
-        resolve();
+        resolve(ok);
       };
       timerId = setTimeout(() => {
         console.warn(
@@ -806,11 +852,11 @@ export class TtsWebSocketPlayer {
             this.ensureWarmSocketAsync();
           }
         }
-        finish();
+        finish(false);
       }, waitMs);
       listenerId = this.subscribe((state: TtsPlaybackState, _mid: string) => {
         if (expectedGeneration != this.generation) {
-          finish();
+          finish(false);
           return;
         }
         if (
@@ -822,11 +868,12 @@ export class TtsWebSocketPlayer {
           return;
         }
         if (state == "error") {
-          finish();
+          succeeded = false;
+          finish(false);
           return;
         }
         if (seenActive == true && state == "idle") {
-          finish();
+          finish(succeeded);
         }
       });
     });
@@ -873,8 +920,8 @@ export class TtsWebSocketPlayer {
           return;
         }
         settled = true;
-        // 失败：关掉坏连接，不自动重连
-        this.closeSessionSocketOnly();
+        // 失败不断连：收回待命，心跳继续
+        this.recycleSessionToWarm();
         reject(new Error(message));
       };
 
@@ -887,7 +934,7 @@ export class TtsWebSocketPlayer {
         }
         settled = true;
         if (this.chunks.length == 0) {
-          this.closeSessionSocketOnly();
+          this.recycleSessionToWarm();
           reject(new Error("TTS 未返回音频"));
           return;
         }
@@ -1040,17 +1087,16 @@ export class TtsWebSocketPlayer {
     if (this.warmOpen != true || this.warmSocketTask == null) {
       if (this.warmSocketTask != null) {
         console.log("[TTS] wait warm connecting");
-        const ok = await this.waitForWarmOpen(3000);
+        const ok = await this.waitForWarmOpen(5000);
         if (expectedGeneration != this.generation) {
           return;
         }
+        // 超时也不主动 close：继续等 open 回调；若仍不可用再走新建
         if (ok != true && this.warmOpen != true) {
-          // 超时仍未 open：丢弃坏连接，后面新建
-          this.closeWarmSocket();
+          console.warn("[TTS] warm still not open after wait");
         }
       }
     }
-    // 不再按空闲时长主动丢弃预热连接：进页连一次，页内复用，靠心跳/对端关闭后再补连
     if (this.warmOpen == true && this.warmSocketTask != null) {
       console.log("[TTS] reuse warm socket (no new socket)");
       this.socketTask = this.warmSocketTask;
@@ -1060,6 +1106,23 @@ export class TtsWebSocketPlayer {
       this.bindSessionHandlers(expectedGeneration);
       this.refreshKeepalive();
       return;
+    }
+    // 已有未 open 完的 warm：禁止再 new，避免双连接
+    if (this.warmSocketTask != null) {
+      console.warn("[TTS] warm connecting, skip openSession");
+      const ok = await this.waitForWarmOpen(5000);
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      if (ok == true && this.warmSocketTask != null) {
+        this.socketTask = this.warmSocketTask;
+        this.warmSocketTask = null;
+        this.warmOpen = false;
+        this.warmOpenedAtMs = 0;
+        this.bindSessionHandlers(expectedGeneration);
+        this.refreshKeepalive();
+        return;
+      }
     }
     console.log("[TTS] no warm socket, connecting now");
     await this.openSessionSocketOnce(accessToken, expectedGeneration);
@@ -1323,15 +1386,15 @@ export class TtsWebSocketPlayer {
       if (expectedWarm != this.warmGeneration) {
         return;
       }
-      console.warn("[TTS] warmup error (no auto-retry)");
-      this.closeWarmSocket();
+      // 不主动 close：等 onClose 清状态；页内再补连
+      console.warn("[TTS] warmup error (wait peer close)");
       this.notifyWarmOpenWaiters(false);
     });
     socketTask.onClose((_res: OnSocketCloseCallbackResult) => {
       if (expectedWarm != this.warmGeneration) {
         return;
       }
-      // 待命连接断开：页内仍开启预热时单次补连（业务路径不再主动关连）
+      // 待命连接被对端/网关掐断：页内仍开启预热时单次补连
       this.warmSocketTask = null;
       this.warmOpen = false;
       this.warmOpenedAtMs = 0;
@@ -1356,6 +1419,9 @@ export class TtsWebSocketPlayer {
     });
   }
 
+  /**
+   * 仅离开会话页时关预热连接。
+   */
   private closeWarmSocket(): void {
     this.warmGeneration += 1;
     const sock = this.warmSocketTask;
@@ -1380,6 +1446,10 @@ export class TtsWebSocketPlayer {
     this.refreshKeepalive();
   }
 
+  /**
+   * 仅离开会话页时关会话连接。
+   * 业务 fail/stall/stop 禁止调用——应走 recycleSessionToWarm。
+   */
   private closeSessionSocketOnly(): void {
     const socket = this.socketTask;
     this.socketTask = null;
@@ -1398,56 +1468,34 @@ export class TtsWebSocketPlayer {
   }
 
   /**
-   * 本轮合成结束后：不关 TCP，把连接收回预热池，供下一句 start 复用。
-   * 避免流式播报「每句 close + 再 connectSocket」。
+   * 本轮合成/播报结束或失败：不关 TCP，把连接收回预热池。
    */
   private recycleSessionToWarm(): void {
     const sock = this.socketTask;
     this.socketTask = null;
+    this.socketMessageSink = null;
     if (sock == null) {
       this.refreshKeepalive();
       return;
     }
-    if (this.warmupEnabled != true) {
-      try {
-        const closePayload = JSON.stringify(
-          buildTtsControlMessage("close", null, 0),
-        );
-        sock!.send({ data: closePayload } as SendSocketMessageOptions);
-      } catch (_eSend) {
-        // ignore
-      }
-      try {
-        sock!.close({} as CloseSocketOptions);
-      } catch (_eClose) {
-        // ignore
-      }
-      this.refreshKeepalive();
-      return;
-    }
-    // 已有待命连接则关掉本轮会话连接，避免双连接
-    if (this.warmSocketTask != null) {
-      try {
-        sock!.close({} as CloseSocketOptions);
-      } catch (_eDup) {
-        // ignore
-      }
-      this.refreshKeepalive();
-      return;
+    // 已有待命：保留当前会话 sock 作为 warm（不主动 close 任一端）
+    if (this.warmSocketTask != null && this.warmSocketTask != sock) {
+      console.warn(
+        "[TTS] dual socket on recycle; keep session TCP as warm (no close)",
+      );
     }
     this.warmGeneration += 1;
     const expectedWarm = this.warmGeneration;
     this.warmSocketTask = sock;
     this.warmOpen = true;
     this.warmOpenedAtMs = Date.now();
-    // 保持原 socket 的 router，仅清空 sink（待命忽略消息）
     this.installSocketRouter(sock!);
     this.socketMessageSink = null;
     sock!.onError((_err: GeneralCallbackResult) => {
       if (expectedWarm != this.warmGeneration) {
         return;
       }
-      this.closeWarmSocket();
+      console.warn("[TTS] warm error after recycle (wait peer close)");
     });
     sock!.onClose((_res: OnSocketCloseCallbackResult) => {
       if (expectedWarm != this.warmGeneration) {
@@ -1461,13 +1509,24 @@ export class TtsWebSocketPlayer {
         this.socketMessageSink = null;
       }
       this.refreshKeepalive();
+      if (this.warmupEnabled == true) {
+        setTimeout(() => {
+          if (
+            this.warmupEnabled == true &&
+            this.socketTask == null &&
+            this.warmSocketTask == null
+          ) {
+            this.ensureWarmSocketAsync();
+          }
+        }, 300);
+      }
     });
     this.refreshKeepalive();
     console.log("[TTS] recycle session → warm (reuse TCP, no new socket)");
   }
 
   /**
-   * 结束当前播报会话。
+   * 结束当前播报会话（不断开 WebSocket）。
    * @param keepAudio true：仅 stop、保留 InnerAudioContext（H5 串行分句复用已解锁通道）
    */
   private prepareForNextUtterance(keepAudio: boolean): void {
@@ -1478,12 +1537,8 @@ export class TtsWebSocketPlayer {
     this.realPlayback = false;
     this.switchingToReal = false;
     this.pausedByMute = false;
-    // 页内预热开启：会话结束收回待命，禁止 close + 再 connect
-    if (this.warmupEnabled == true) {
-      this.recycleSessionToWarm();
-    } else {
-      this.closeSessionSocketOnly();
-    }
+    // 无论是否 warmup：业务结束只收回待命，禁止主动 close
+    this.recycleSessionToWarm();
     const audio = this.audioContext;
     if (keepAudio == true) {
       if (audio != null) {
@@ -1907,8 +1962,14 @@ export class TtsWebSocketPlayer {
     // 保留 messageId 直到 idle 通知结束，便于工具栏按消息匹配并退出播报态
     const failedMessageId = this.messageId;
     this.setState("error");
-    uni.showToast({ title: message, icon: "none" });
-    this.closeSessionSocketOnly();
+    // 流式多句连续 stall 时只弹一次，避免连环 toast
+    const now = Date.now();
+    if (now - this.lastFailToastAtMs > 8000) {
+      this.lastFailToastAtMs = now;
+      uni.showToast({ title: message, icon: "none" });
+    }
+    // stall / fail / 协议错误：绝不主动关 WebSocket，只收回待命并保持心跳
+    this.recycleSessionToWarm();
     this.chunks = [] as Uint8Array[];
     this.text = "";
     this.finishRequested = false;
@@ -1921,7 +1982,6 @@ export class TtsWebSocketPlayer {
     if (failedMessageId.length > 0) {
       console.log("[TTS] fail → idle messageId=", failedMessageId);
     }
-    // 失败不自动重连；下次 play/synthesize 或进页 warmup 再连
   }
 
   private setState(state: TtsPlaybackState): void {

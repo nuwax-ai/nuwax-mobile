@@ -85,6 +85,7 @@ import {
   jumpToFilePreviewPage,
 } from "@/utils/system.uts";
 import { t } from "@/utils/i18n";
+import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
 
 /** 超时回调类型 */
 type TimeoutCallback = any;
@@ -187,7 +188,10 @@ class _ConversationChatSuggestParams implements ConversationChatSuggestParams {
     }
     const variableRaw = readRawField(raw, "variableParams");
     if (variableRaw != null) {
-      this.variableParams = variableRaw as StringAnyRecord;
+      // Android：UTSReactiveJSONObject / UTSJSONObject 禁止 as StringAnyRecord(Map)
+      this.variableParams = AgentDetailUtils.utsObjToRecord(
+        variableRaw as UTSJSONObject,
+      );
     }
     const sandboxRaw = readRawField(raw, "sandboxId");
     if (sandboxRaw != null) {
@@ -1136,6 +1140,12 @@ export default class AgentDetailService {
         this.data.streamingAssistantText.value = patchedText;
         // 固定为客户端气泡 id（currentMessageId），避免服务端改写 id 导致播报会话被 begin 重置
         this.data.streamingAssistantMessageId.value = currentMessageId;
+        // 直接驱动无头 TTS：不依赖页面 watch（长 SSE 下 watch/hold 易拖到结束后才播）
+        uni.$emit("streamSpeakFeed", {
+          messageId: currentMessageId,
+          bodyText: patchedText,
+          finished: false,
+        });
       }
       const preview =
         patchedText.length > 48 ? `${patchedText.substring(0, 48)}...` : patchedText;
@@ -1255,7 +1265,9 @@ export default class AgentDetailService {
     try {
       // 清空问题建议列表
       this.data.chatSuggestList.value = [];
-      this.clearStreamingAssistantText();
+      // 只清正文，保留本轮助手气泡 id，供发送手势内立刻 begin 流式播报
+      this.data.streamingAssistantText.value = "";
+      this.data.streamingAssistantMessageId.value = currentMessageId;
       // 开始会话后，允许获取问题建议
       this.isAllowSuggest = true;
 
@@ -1378,6 +1390,28 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
+    // 冲刷尾句：必须在 clearStreaming / inactive 之前，携带最终正文
+    const speakMsgId = this.data.streamingAssistantMessageId.value;
+    let speakBody = this.data.streamingAssistantText.value;
+    if (speakBody.length == 0) {
+      const list = this.data.messageList.value;
+      if (list.length > 0) {
+        const last = list[list.length - 1];
+        if (
+          last != null &&
+          last.messageType == MessageTypeEnum.ASSISTANT
+        ) {
+          speakBody = readMessageText(last);
+        }
+      }
+    }
+    if (speakMsgId.length > 0 || speakBody.length > 0) {
+      uni.$emit("streamSpeakFeed", {
+        messageId: speakMsgId,
+        bodyText: speakBody,
+        finished: true,
+      });
+    }
     // 先结束会话态（触发 Markdown 终态解析），再清打字机通道，避免中间空白一帧
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
@@ -1921,6 +1955,10 @@ export default class AgentDetailService {
         return;
       }
     }
+
+    // 发送新消息前：打断上一条流式/工具栏/队列播报（H5 + App 统一）
+    stopAllSpeechPlayback();
+    uni.$emit("streamSpeakInterrupt", {});
 
     // #ifdef WEB || H5
     // 如果不是临时会话页面，并且url中不包含conversationId，则修改url

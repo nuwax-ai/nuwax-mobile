@@ -94,6 +94,11 @@ import {
 import { t } from "@/utils/i18n";
 import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
 import { buildAssistantSpeakableText } from "@/subpackages/utils/voice/textFilter";
+import {
+  isAssistantMessageInfo,
+  isInFlightAssistantMessage,
+  isTurnUserReadyFromMessageInfoList,
+} from "@/subpackages/utils/subResumeGate.uts";
 
 /** 超时回调类型 */
 type TimeoutCallback = any;
@@ -116,7 +121,7 @@ function attachSpeakableTextToDraft(
  * 历史/列表项：助手消息在定稿 text 后写入 speakableText。
  */
 function attachSpeakableTextToMessage(message: MessageInfo): MessageInfo {
-  if (message.messageType != MessageTypeEnum.ASSISTANT) {
+  if (isAssistantMessageInfo(message) != true) {
     return message;
   }
   const text = readMessageText(message);
@@ -360,14 +365,43 @@ function parseMessageList(raw: any | null): MessageInfo[] {
   if (raw == null) return [];
   const result: MessageInfo[] = [];
   const arr = raw as any[];
-  if (arr == null) return result;
-  for (let i = 0; i < arr.length; i++) {
-    const item = arr[i];
-    if (item == null) continue;
-    const msg = createMessageInfoFromAny(item);
-    if (msg != null) {
-      result.push(msg);
+  if (arr != null) {
+    for (let i = 0; i < arr.length; i++) {
+      const item = arr[i];
+      if (item == null) continue;
+      const msg = createMessageInfoFromAny(item);
+      if (msg != null) {
+        result.push(msg);
+      }
     }
+  }
+  if (result.length > 0) {
+    return result;
+  }
+  // iOS 等：messageList 偶发不是原生 Array，JSON 往返兜底（对齐 parseSandboxList）
+  try {
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr == null || jsonStr.length <= 2) {
+      return result;
+    }
+    const parsedAny = JSON.parse(jsonStr) as any | null;
+    if (parsedAny == null) {
+      return result;
+    }
+    const fallbackArr = parsedAny as any[];
+    if (fallbackArr == null) {
+      return result;
+    }
+    for (let j = 0; j < fallbackArr.length; j++) {
+      const fallbackItem = fallbackArr[j];
+      if (fallbackItem == null) continue;
+      const msg2 = createMessageInfoFromAny(fallbackItem);
+      if (msg2 != null) {
+        result.push(msg2);
+      }
+    }
+  } catch (_e) {
+    // ignore
   }
   return result;
 }
@@ -1245,7 +1279,7 @@ export default class AgentDetailService {
     if (newMessage != null) {
       const patchedText = readMessageText(newMessage);
       if (
-        newMessage.messageType == MessageTypeEnum.ASSISTANT &&
+        isAssistantMessageInfo(newMessage) == true &&
         patchedText.length > 0
       ) {
         this.data.streamingAssistantText.value = patchedText;
@@ -1259,7 +1293,7 @@ export default class AgentDetailService {
     // ERROR 立即冲刷；其余 SSE 事件合并 UI，降低 [...list] + 气泡更新频率
     this.scheduleStreamUiPublish(
       currentMessageId,
-      newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT
+      newMessage != null && isAssistantMessageInfo(newMessage) == true
         ? newMessage
         : null,
       needScroll,
@@ -1270,7 +1304,7 @@ export default class AgentDetailService {
     if (newMessage != null) {
       const patchedText = readMessageText(newMessage);
       if (
-        newMessage.messageType == MessageTypeEnum.ASSISTANT &&
+        isAssistantMessageInfo(newMessage) == true &&
         patchedText.length > 0
       ) {
         const speakId = currentMessageId;
@@ -1282,7 +1316,7 @@ export default class AgentDetailService {
     }
 
     // 打开页面首页（与气泡更新解耦，保持即时）
-    if (newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT) {
+    if (newMessage != null && isAssistantMessageInfo(newMessage) == true) {
       const pageStatusRaw = readRawField(responseData, "status");
       const pageTypeRaw = readRawField(responseData, "type");
       if (
@@ -1700,8 +1734,13 @@ export default class AgentDetailService {
   }
 
   /**
-   * 订阅 sub 流恢复 EXECUTING 会话的流式输出（刷新/重进/断流回补时重建执行中的助手消息）。
-   * reload 历史 → 优先复用最后一条助手气泡（避免「历史一条 + 占位一条」双气泡）→ GET sub。
+   * 订阅 sub 流恢复 EXECUTING 会话的流式输出（刷新/重进/断流回补/跨端续接）。
+   *
+   * 四端（H5 / iOS / Android / 微信小程序）同一路径：
+   * 1) reload 会话详情 → 2) subResumeGate 确认本轮用户已在列表 →
+   * 3) ensurePlaceholder（复用进行中助手或新建）→ 4) GET /chat/sub →
+   * 5) handleChangeMessageList 写 UI + streamSpeakFeed（TTS）
+   *
    * onSubClose: sub 关闭（完成/错误/超时）时回调，页面据此恢复轮询。
    */
   async handleSubConversation(
@@ -1824,6 +1863,17 @@ export default class AgentDetailService {
         }
         this.data.messageList.value = processed;
       }
+
+      // 与轮询门禁共用 subResumeGate：本轮用户未进列表则不开 sub（四端一致）
+      if (
+        isTurnUserReadyFromMessageInfoList(this.data.messageList.value) !=
+        true
+      ) {
+        console.log("[VoiceSSE] sub.abort: turn user not in messageList yet, wait poll");
+        cleanupSub();
+        return;
+      }
+
       this.data.isConversationActive.value = true;
     } catch (error) {
       console.error(
@@ -1835,9 +1885,10 @@ export default class AgentDetailService {
     }
 
     /**
-     * 绑定 sub 写入目标：
-     * - 最后一条已是助手 → 复用该气泡（清空正文供 sub 重放，避免双气泡 / 增量叠字）
-     * - 最后一条是用户或空列表 → 新建占位
+     * 绑定 sub 写入目标（四端同一套规则）：
+     * - 最后一条是「本轮未完成」的助手 → 复用（清空后重放，避免双气泡）
+     * - 最后一条是已完成助手 / 用户 / 空 → 新建占位
+     * 禁止复用上一轮已 Complete 的助手。
      */
     const ensurePlaceholder = (): void => {
       if (hasBoundTarget) {
@@ -1847,16 +1898,16 @@ export default class AgentDetailService {
       const list = this.data.messageList.value;
       if (list.length > 0) {
         const last = list[list.length - 1];
-        if (
-          last != null &&
-          last.messageType == MessageTypeEnum.ASSISTANT
-        ) {
+        if (isInFlightAssistantMessage(last) == true && last != null) {
+          const lastStatus = last.status;
+          const lastText =
+            last.text != null ? `${last.text}`.trim() : "";
           let reuseId = targetMessageId;
           if (last.id != null && `${last.id}`.length > 0) {
             reuseId = `${last.id}`;
           }
           targetMessageId = reuseId;
-          // 清空后按空泡重放：sub 的 MESSAGE 是 delta，叠在已有全文上会变成「两条内容糊在一起」
+          // 清空后按空泡重放：sub 的 MESSAGE 是 delta，叠在已有全文上会糊字
           const draft = messageToJsonObject(last);
           draft["text"] = "";
           draft["think"] = "";
@@ -1874,10 +1925,11 @@ export default class AgentDetailService {
           this.data.messageIdRef.value = targetMessageId;
           this.data.streamingAssistantMessageId.value = targetMessageId;
           this.data.streamingAssistantText.value = "";
-          console.log(
-            "[VoiceSSE] sub.reuseAssistant id=" + targetMessageId,
-          );
+          console.log("[VoiceSSE] sub.reuseAssistant id=" + targetMessageId + " status=" + `${lastStatus}` + " textLen=" + lastText.length.toString());
           return;
+        }
+        if (isAssistantMessageInfo(last) == true && last != null) {
+          console.log("[VoiceSSE] sub.skipReuse completedAssistant id=" + `${last.id}` + " → newPlaceholder");
         }
       }
 
@@ -1905,25 +1957,16 @@ export default class AgentDetailService {
       this.data.messageIdRef.value = targetMessageId;
       this.data.streamingAssistantMessageId.value = targetMessageId;
       this.data.streamingAssistantText.value = "";
-      console.log(
-        "[VoiceSSE] sub.newPlaceholder id=" + targetMessageId,
-      );
+      console.log("[VoiceSSE] sub.newPlaceholder id=" + targetMessageId);
     };
 
-    // 3. 订阅 sub（GET SSE）
+    // 3. 订阅 sub（GET SSE）—— 四端同一 URL / 同一 handleChangeMessageList 写 UI+TTS
     const token = uni.getStorageSync(ACCESS_TOKEN);
     const header = new UTSJSONObject(API_HEADERS as UTSJSONObject);
-    // #ifdef H5 || WEB
-    if (process.env.NODE_ENV === "development") {
+    // H5 / 小程序 / App 统一带 Bearer（与 live SSE 一致；H5 生产环境有 cookie 时多带也不影响）
+    if (token != null && `${token}`.length > 0) {
       header["Authorization"] = `Bearer ${token}`;
     }
-    // #endif
-    // #ifdef MP-WEIXIN
-    header["Authorization"] = `Bearer ${token}`;
-    // #endif
-    // #ifdef APP
-    header["Authorization"] = `Bearer ${token}`;
-    // #endif
 
     this.subStreamRequest = new StreamRequest();
     const requestConfig = new StreamRequestConfig();

@@ -603,15 +603,8 @@ export class StreamRequest {
       const content = this.sseDispatchQueue.shift() as string;
       this.processSSEMessage(content, config, onComplete);
       if (this.receivedTerminalMarker == true) {
-        // 终态后丢弃积压帧，避免 completed 之后还慢吞吞刷旧 MESSAGE
+        // 终态已在 processSSEMessage 内尽量排空 burst；此处只停泵，勿再丢弃未入队帧
         this.sseDispatchQueue = [];
-        this.sseBurstEnqueuePending = false;
-        this.sseBurstRest = null;
-        this.sseBurstOffset = 0;
-        if (this.sseBurstTimer != null) {
-          clearTimeout(this.sseBurstTimer!);
-          this.sseBurstTimer = null;
-        }
         break;
       }
     }
@@ -656,7 +649,8 @@ export class StreamRequest {
   }
 
   /**
-   * 大包分帧：先同步处理首帧让 UI 立刻有内容，其余异步入队（MESSAGE 合并），避免卡死主线程。
+   * 大包分帧：先同步处理首帧让 UI 立刻有内容，其余异步入队，避免卡死主线程。
+   * 注意：MESSAGE 禁止合并（见 enqueueSseMessage / pumpSseBurstEnqueue）。
    */
   private enqueueSseFramesWithFirstPaint(
     frames: string[],
@@ -666,6 +660,14 @@ export class StreamRequest {
     if (frames.length == 0) {
       return;
     }
+    // 上一包 burst 尚未入队完：禁止覆盖 sseBurstRest，否则中间 MESSAGE delta 会丢光
+    if (this.sseBurstEnqueuePending == true || this.sseBurstRest != null) {
+      for (let i = 0; i < frames.length; i++) {
+        this.enqueueSseMessage(frames[i], config, onStreamComplete);
+      }
+      return;
+    }
+
     // 首帧同步：尽快驱动 streamingAssistantText / 气泡
     this.processSSEMessage(frames[0], config, onStreamComplete);
     if (frames.length == 1 || this.receivedTerminalMarker == true) {
@@ -688,7 +690,70 @@ export class StreamRequest {
   }
 
   /**
+   * 把尚未入队的 burst 剩余帧一次性进入派发队列（终态前调用，防止丢尾部 MESSAGE）。
+   */
+  private materializeBurstRestToQueue(
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    if (this.sseBurstTimer != null) {
+      clearTimeout(this.sseBurstTimer!);
+      this.sseBurstTimer = null;
+    }
+    const rest = this.sseBurstRest;
+    if (rest == null) {
+      this.sseBurstEnqueuePending = false;
+      this.sseBurstOffset = 0;
+      return;
+    }
+    const offset = this.sseBurstOffset;
+    for (let i = offset; i < rest.length; i++) {
+      this.enqueueSseMessage(rest[i], config, onStreamComplete);
+    }
+    this.sseBurstRest = null;
+    this.sseBurstOffset = 0;
+    this.sseBurstEnqueuePending = false;
+  }
+
+  /**
+   * 终态前同步排空派发队列中的非终态帧（MESSAGE/PROCESSING 等）。
+   */
+  private flushQueuedNonTerminalBeforeComplete(
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    while (this.sseDispatchQueue.length > 0) {
+      const content = this.sseDispatchQueue.shift() as string;
+      if (content === "[DONE]") {
+        // 终态交给调用方统一处理
+        this.sseDispatchQueue.unshift(content);
+        break;
+      }
+      const looksLikeJSON =
+        content.startsWith("{") || content.startsWith("[");
+      if (looksLikeJSON) {
+        try {
+          const data = JSON.parse(content) as UTSJSONObject;
+          if (isCompletedPayload(data)) {
+            this.sseDispatchQueue.unshift(content);
+            break;
+          }
+        } catch (_e) {
+          // fallthrough 当普通 chunk
+        }
+      }
+      // 临时清除终态标记干扰，按普通消息处理
+      this.processSSEMessage(content, config, onStreamComplete);
+      if (this.receivedTerminalMarker == true) {
+        // processSSEMessage 不应在此路径再次 complete；若误触则停
+        break;
+      }
+    }
+  }
+
+  /**
    * 分片把大包剩余帧入队（实例方法，避免 UTS 嵌套函数自引用编译失败）。
+   * PROCESSING 可合并；MESSAGE 禁止合并（delta 丢失会表现为 Android 少字）。
    */
   private pumpSseBurstEnqueue(): void {
     this.sseBurstTimer = null;
@@ -710,12 +775,10 @@ export class StreamRequest {
     for (let i = offset; i < end; i++) {
       const content = rest[i];
       const eventType = peekSseEventType(content);
-      if (
-        (eventType == "MESSAGE" || eventType == "PROCESSING") &&
-        this.sseDispatchQueue.length > 0
-      ) {
+      // 仅 PROCESSING 合并；MESSAGE 必须逐帧入队
+      if (eventType == "PROCESSING" && this.sseDispatchQueue.length > 0) {
         const last = this.sseDispatchQueue[this.sseDispatchQueue.length - 1];
-        if (peekSseEventType(last) == eventType) {
+        if (peekSseEventType(last) == "PROCESSING") {
           this.sseDispatchQueue[this.sseDispatchQueue.length - 1] = content;
           continue;
         }
@@ -784,7 +847,7 @@ export class StreamRequest {
       return;
     }
 
-    // App：先收集 data 帧；多帧时首帧同步上屏，其余异步入队+MESSAGE 合并
+    // App：先收集 data 帧；多帧时首帧同步上屏，其余异步入队（MESSAGE 不合并）
     const frames: string[] = [];
     for (let mi = 0; mi < messages.length; mi++) {
       const message = messages[mi];
@@ -816,6 +879,9 @@ export class StreamRequest {
   ): void {
     // 检查是否完成
     if (content === "[DONE]") {
+      // 终态前先排空 burst + 队列里尚未派发的 MESSAGE，避免 Android 少字
+      this.materializeBurstRestToQueue(config, onStreamComplete);
+      this.flushQueuedNonTerminalBeforeComplete(config, onStreamComplete);
       this.receivedTerminalMarker = true;
 
       // 清除超时监控
@@ -834,6 +900,8 @@ export class StreamRequest {
       try {
         const data = JSON.parse(content) as UTSJSONObject;
         if (isCompletedPayload(data)) {
+          this.materializeBurstRestToQueue(config, onStreamComplete);
+          this.flushQueuedNonTerminalBeforeComplete(config, onStreamComplete);
           this.receivedTerminalMarker = true;
 
           // 清除超时监控

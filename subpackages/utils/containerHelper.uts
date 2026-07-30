@@ -59,27 +59,37 @@ function readToolFieldString(raw: any | null, key: string): string {
 }
 
 /**
- * 生成工具调用自定义块。
- * App（尤其 iOS）：PROCESSING data 常为 Map，且 executeId 在 result 内；
- * 旧逻辑 `as UTSJSONObject` + `typeof === "string"` 会导致 type/executeId 为空，
- * 容器块写不进正文 → 工具调用 UI 不渲染（日志里 PROCESSING 的 textLen 一直为 0）。
+ * 将 PROCESSING 事件规范为顶层含 executeId/status/type 的对象。
+ * App SSE 常把这些字段放在 result 内；若不提升，processingList 无法按 executeId 匹配，
+ * 卡片会一直读标签上的 EXECUTING，重进历史页才显示 FINISHED。
  */
-export function getCustomBlock(
-  beforeText: string,
-  toolCallData: any,
-): string {
+export function normalizeToolCallProcessingData(toolCallData: any): UTSJSONObject {
+  const out = new UTSJSONObject();
   if (toolCallData == null) {
-    return beforeText;
+    return out;
+  }
+
+  // 尽量保留原始顶层字段（含 cardBindConfig 等）
+  try {
+    const keys = UTSJSONObject.keys(toolCallData as UTSJSONObject);
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      const value = readRawField(toolCallData, key);
+      if (value != null) {
+        out[key] = value;
+      }
+    }
+  } catch (_eKeys) {
+    // Map / 类实例：按字段逐个提升
   }
 
   let type = readToolFieldString(toolCallData, "type");
   let executeId = readToolFieldString(toolCallData, "executeId");
   let status = readToolFieldString(toolCallData, "status");
   let name = readToolFieldString(toolCallData, "name");
-
-  // executeId / name / status 常嵌在 result 里
   const resultVal = readRawField(toolCallData, "result");
   if (resultVal != null) {
+    out["result"] = resultVal;
     if (executeId.length == 0) {
       executeId = readToolFieldString(resultVal, "executeId");
     }
@@ -93,6 +103,145 @@ export function getCustomBlock(
       type = readToolFieldString(resultVal, "type");
     }
   }
+  if (type.length > 0) {
+    out["type"] = type;
+  }
+  if (executeId.length > 0) {
+    out["executeId"] = executeId;
+  }
+  if (status.length > 0) {
+    out["status"] = status;
+  }
+  if (name.length > 0) {
+    out["name"] = name;
+  }
+  return out;
+}
+
+/**
+ * 同 executeId 时是否应用新状态（对齐 PC shouldReplaceProcessingItem）。
+ * 优先级：FINISHED > FAILED > EXECUTING。
+ */
+export function shouldReplaceToolCallProcessing(
+  existingStatus: string,
+  nextStatus: string,
+): boolean {
+  if (existingStatus.length == 0) {
+    return nextStatus.length > 0;
+  }
+  if (nextStatus.length == 0) {
+    return false;
+  }
+  if (existingStatus == "EXECUTING" && nextStatus != "EXECUTING") {
+    return true;
+  }
+  if (existingStatus == "FAILED" && nextStatus == "FINISHED") {
+    return true;
+  }
+  if (existingStatus == "FINISHED" && nextStatus == "FAILED") {
+    return false;
+  }
+  // 同状态或其它组合：用新数据覆盖（补齐 result）
+  if (existingStatus == nextStatus) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 按 executeId 合并 PROCESSING 列表，终态覆盖执行中。
+ */
+export function upsertToolCallProcessingList(
+  oldList: any[],
+  nextItem: any,
+): any[] {
+  const normalized = normalizeToolCallProcessingData(nextItem);
+  const nextId = readToolFieldString(normalized, "executeId");
+  const nextStatus = readToolFieldString(normalized, "status");
+  const out: any[] = [];
+  let replaced = false;
+  for (let i = 0; i < oldList.length; i++) {
+    const oldItem = oldList[i];
+    const oldNorm = normalizeToolCallProcessingData(oldItem);
+    const oldId = readToolFieldString(oldNorm, "executeId");
+    if (nextId.length > 0 && oldId == nextId) {
+      const oldStatus = readToolFieldString(oldNorm, "status");
+      if (shouldReplaceToolCallProcessing(oldStatus, nextStatus)) {
+        out.push(normalized);
+      } else {
+        out.push(oldNorm);
+      }
+      replaced = true;
+    } else {
+      out.push(oldNorm);
+    }
+  }
+  if (!replaced) {
+    out.push(normalized);
+  }
+  return out;
+}
+
+/**
+ * 更新已有容器块上的 status 属性（同 executeId 不重复插入时用）。
+ */
+function updateExistingBlockStatus(
+  beforeText: string,
+  executeId: string,
+  status: string,
+): string {
+  if (status.length == 0) {
+    return beforeText;
+  }
+  const marker = `executeId="${executeId}"`;
+  const markerIdx = beforeText.indexOf(marker);
+  if (markerIdx < 0) {
+    return beforeText;
+  }
+  // 同一标签内 status 通常紧跟 executeId/type；限制搜索窗口避免误改其它块
+  const windowEnd = markerIdx + 240;
+  const end = windowEnd < beforeText.length ? windowEnd : beforeText.length;
+  const slice = beforeText.substring(markerIdx, end);
+  const statusKey = 'status="';
+  const statusRel = slice.indexOf(statusKey);
+  if (statusRel < 0) {
+    return beforeText;
+  }
+  const valueStart = markerIdx + statusRel + statusKey.length;
+  const valueEnd = beforeText.indexOf('"', valueStart);
+  if (valueEnd <= valueStart) {
+    return beforeText;
+  }
+  const oldStatus = beforeText.substring(valueStart, valueEnd);
+  if (oldStatus == status) {
+    return beforeText;
+  }
+  return (
+    beforeText.substring(0, valueStart) +
+    status +
+    beforeText.substring(valueEnd)
+  );
+}
+
+/**
+ * 生成工具调用自定义块。
+ * App（尤其 iOS）：PROCESSING data 常为 Map，且 executeId 在 result 内；
+ * 旧逻辑 `as UTSJSONObject` + `typeof === "string"` 会导致 type/executeId 为空，
+ * 容器块写不进正文 → 工具调用 UI 不渲染（日志里 PROCESSING 的 textLen 一直为 0）。
+ */
+export function getCustomBlock(
+  beforeText: string,
+  toolCallData: any,
+): string {
+  if (toolCallData == null) {
+    return beforeText;
+  }
+
+  const normalized = normalizeToolCallProcessingData(toolCallData);
+  const type = readToolFieldString(normalized, "type");
+  const executeId = readToolFieldString(normalized, "executeId");
+  const status = readToolFieldString(normalized, "status");
+  const name = readToolFieldString(normalized, "name");
 
   // 如果 type 或 executeId 不存在，则返回原文本
   if (type.length === 0 || executeId.length === 0) {
@@ -109,8 +258,8 @@ export function getCustomBlock(
   const hasBlock = beforeText.includes(`executeId="${executeId}"`);
 
   if (hasBlock) {
-    // 如果已经存在相同的执行ID，则不重复添加
-    return beforeText;
+    // 已存在同 executeId 块：更新 status，避免标签长期停在 EXECUTING
+    return updateExistingBlockStatus(beforeText, executeId, status);
   }
 
   const blockData = new UTSJSONObject();

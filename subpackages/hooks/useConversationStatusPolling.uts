@@ -14,13 +14,28 @@ import { apiAgentConversation } from '@/servers/conversation';
 import { SUCCESS_CODE } from '@/constants/codes.constants';
 import { TaskStatus } from '@/types/enums/agent';
 import { apiResCode, apiResData } from '@/utils/apiResponse';
-import { isTurnUserReadyFromRawMessageList } from '@/subpackages/utils/subResumeGate.uts';
+import {
+  describeTurnUserGate,
+  isTurnUserReadyFromRawMessageList,
+} from '@/subpackages/utils/subResumeGate.uts';
 
+/** 常态轮询间隔 */
 const POLLING_INTERVAL = 5000;
+/** EXECUTING 但本轮用户未就绪时的加速间隔（控制负载，取 2–3s 中位） */
+const POLLING_INTERVAL_WAITING_USER = 2500;
+/**
+ * 加速轮询最多连续次数；超出后回到 5s，避免门禁长期不过时一直密打详情接口。
+ * 6 × 2.5s ≈ 15s 覆盖语音/跨端用户落库短窗。
+ */
+const MAX_FAST_POLLS_WHILE_WAITING_USER = 6;
 
 let pollingTimerId: number | null = null;
 let isProcessing = false;
 let isVisibilityListenerInitialized = false;
+/** 当前定时器间隔；等待用户时切到更快间隔 */
+let currentPollingInterval = POLLING_INTERVAL;
+/** 本轮 EXECUTING 门禁未过期间，已使用的加速轮询次数 */
+let waitingUserFastPollCount = 0;
 
 let currentConversationId = 0;
 let onExecutingCallback: ((id: number) => void) | null = null;
@@ -48,6 +63,44 @@ function normalizeTaskStatus(val: any | null): string {
 }
 
 /**
+ * 按目标间隔重启定时器（仅 interval 变化时）。
+ */
+function ensurePollingInterval(intervalMs: number): void {
+  if (currentPollingInterval == intervalMs && pollingTimerId != null) {
+    return;
+  }
+  currentPollingInterval = intervalMs;
+  if (pollingTimerId != null) {
+    clearInterval(pollingTimerId!);
+    pollingTimerId = null;
+  }
+  if (!currentConversationId) {
+    return;
+  }
+  pollingTimerId = setInterval((): void => {
+    pollOnce();
+  }, currentPollingInterval) as number;
+}
+
+/** 门禁通过 / 非 EXECUTING / 停止轮询时复位加速计数 */
+function resetWaitingUserFastPoll(): void {
+  waitingUserFastPollCount = 0;
+}
+
+/**
+ * EXECUTING 但用户未就绪：有限次加速，超出后回常态间隔。
+ */
+function scheduleWaitingUserPoll(): void {
+  if (waitingUserFastPollCount < MAX_FAST_POLLS_WHILE_WAITING_USER) {
+    waitingUserFastPollCount = waitingUserFastPollCount + 1;
+    ensurePollingInterval(POLLING_INTERVAL_WAITING_USER);
+    return;
+  }
+  // 加速额度用尽：回 5s，避免长时间密轮询
+  ensurePollingInterval(POLLING_INTERVAL);
+}
+
+/**
  * 执行一次轮询:查会话状态,EXECUTING + 非本地流式 + 未订阅 → onExecuting
  */
 async function pollOnce(): Promise<void> {
@@ -70,14 +123,28 @@ async function pollOnce(): Promise<void> {
     const dataObj = dataRaw as UTSJSONObject;
     const taskStatusStr = normalizeTaskStatus(dataObj['taskStatus']);
     if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
-      if (isTurnUserReadyFromRawMessageList(dataObj['messageList']) != true) {
-        console.log('[ConversationStatusPolling] EXECUTING 但本轮用户未进 messageList，等待下次轮询');
+      const rawMessageList = dataObj['messageList'];
+      if (isTurnUserReadyFromRawMessageList(rawMessageList) != true) {
+        console.log(
+          '[ConversationStatusPolling] EXECUTING 但本轮用户未进 messageList，等待下次轮询 ' +
+            describeTurnUserGate(rawMessageList) +
+            ' fast=' +
+            `${waitingUserFastPollCount}` +
+            '/' +
+            `${MAX_FAST_POLLS_WHILE_WAITING_USER}`,
+        );
+        scheduleWaitingUserPoll();
         return;
       }
+      resetWaitingUserFastPoll();
+      ensurePollingInterval(POLLING_INTERVAL);
       const cb = onExecutingCallback;
       if (cb != null) {
         cb(currentConversationId);
       }
+    } else {
+      resetWaitingUserFastPoll();
+      ensurePollingInterval(POLLING_INTERVAL);
     }
   } catch (error) {
     console.error('[ConversationStatusPolling] 轮询失败:', error);
@@ -121,6 +188,8 @@ export function startConversationPolling(
   onExecutingCallback = onExecuting;
   isConversationActiveGetter = isConversationActive;
   isSubscribedGetter = isSubscribed;
+  currentPollingInterval = POLLING_INTERVAL;
+  resetWaitingUserFastPoll();
 
   initVisibilityListener();
 
@@ -130,7 +199,7 @@ export function startConversationPolling(
 
   pollingTimerId = setInterval((): void => {
     pollOnce();
-  }, POLLING_INTERVAL) as number;
+  }, currentPollingInterval) as number;
 }
 
 /**
@@ -141,6 +210,8 @@ export function stopConversationPolling(): void {
     clearInterval(pollingTimerId!);
     pollingTimerId = null;
   }
+  currentPollingInterval = POLLING_INTERVAL;
+  resetWaitingUserFastPoll();
 }
 
 /**
@@ -152,7 +223,7 @@ export function resumeConversationPolling(): void {
   pollOnce();
   pollingTimerId = setInterval((): void => {
     pollOnce();
-  }, POLLING_INTERVAL) as number;
+  }, currentPollingInterval) as number;
 }
 
 /**

@@ -44,7 +44,14 @@ import {
 import { MessageStatusEnum, ProcessingEnum } from "@/types/enums/common";
 import { OpenCloseEnum } from "@/types/enums/space";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { API_HEADERS } from "@/constants/api.constants";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { chatService } from "@/utils/chatService";
+import { StreamRequest } from "@/utils/streamRequest";
+import {
+  StreamChunk,
+  StreamRequestConfig,
+} from "@/types/interfaces/chat";
 import { generateUniqueId } from "@/utils/common";
 import {
   apiAgentConversationCreate,
@@ -496,6 +503,10 @@ export default class AgentDetailService {
   private pendingUiMessage: MessageInfo | null = null;
   private pendingUiNeedScroll: boolean = false;
   private readonly STREAM_UI_COALESCE_MS: number = 40;
+  /** sub 流恢复专用 StreamRequest（独立于 live chatService，避免互相 abort） */
+  private subStreamRequest: StreamRequest | null = null;
+  /** sub 是否已订阅（执行中） */
+  private isSubscribed: boolean = false;
 
   constructor(data: AgentDetailData) {
     this.data = data;
@@ -1625,14 +1636,12 @@ export default class AgentDetailService {
         );
       }
     }
-
-    // App：正常 onComplete 后若助手仍 Loading（少见），同样尝试回补
-    this.scheduleRecoverIfAssistantLoading(isTempChat, this.streamGeneration);
+    // 正常 onComplete 不做 recover；异常断流由 finalize → 详情回补，EXECUTING 由页面轮询开 sub
   }
 
   /**
-   * App：流中断后回拉会话详情补正文。
-   * 语音发送 / 进后台杀连接后常见半截字：只要最后一条助手尚无 finalResult 就回补。
+   * App：流异常中断后只拉一次会话详情，补「后端已结束但本地半截字」的终态。
+   * EXECUTING 续接交给页面轮询 → handleSubConversation，此处不再开 sub / 连环轮询。
    */
   private scheduleRecoverIfAssistantLoading(
     isTempChat: boolean,
@@ -1657,7 +1666,6 @@ export default class AgentDetailService {
           noFinal == true &&
           (status == MessageStatusEnum.Loading ||
             status == MessageStatusEnum.Incomplete ||
-            status == MessageStatusEnum.Complete ||
             textLen == 0)
         ) {
           needRecover = true;
@@ -1665,79 +1673,276 @@ export default class AgentDetailService {
       }
     }
     if (needRecover != true) {
-      console.warn(
-        "[SSE-Stream] skip recover (no assistant pending finalResult)",
-      );
       return;
     }
     console.warn(
-      "[SSE-Stream] assistant needs resume after stream interrupt → schedule",
+      "[SSE-Stream] assistant needs detail hydrate after stream interrupt",
     );
-    const runRecover = (attempt: number): void => {
+    setTimeout(() => {
       if (streamGenAtSchedule != this.streamGeneration) {
+        return;
+      }
+      // 已由 live/sub 接管则无需再拉
+      if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
         return;
       }
       this.resumeConversationState().then((recovered: boolean) => {
         console.warn(
-          "[SSE-Stream] resume attempt=" +
-            attempt.toString() +
-            " recovered=" +
-            `${recovered}`,
+          "[SSE-Stream] detail hydrate recovered=" + `${recovered}`,
         );
-        if (recovered == true) {
-          this.schedulePostStreamRecovery(streamGenAtSchedule, 0);
-        } else if (attempt < 1) {
-          setTimeout(() => {
-            runRecover(attempt + 1);
-          }, 2000);
-        }
       });
-    };
-    setTimeout(() => {
-      runRecover(0);
     }, 400);
     // #endif
   }
 
   /**
-   * App：流结束后会话仍 EXECUTING 时，短暂轮询回补助手正文。
+   * 订阅 sub 流恢复 EXECUTING 会话的流式输出（刷新/重进/断流回补时重建执行中的助手消息）。
+   * reload 历史 → 收到首个有效事件后追加 assistant 占位 → StreamRequest GET sub → 复用 handleChangeMessageList。
+   * onSubClose: sub 关闭（完成/错误/超时）时回调，页面据此恢复轮询。
    */
-  private schedulePostStreamRecovery(
-    expectedGen: number,
-    attempt: number,
-  ): void {
-    // #ifdef APP
-    // App：流中断后即使当前 inactive，也允许轮询回补（软断流会先把 active=false）
-    if (attempt >= 8) {
+  async handleSubConversation(
+    conversationId: number,
+    onSubClose: any | null = null,
+  ): Promise<void> {
+    // 防重 / live SSE 在跑时不订阅
+    if (this.isSubscribed) {
       return;
     }
-    if (expectedGen != this.streamGeneration) {
+    if (chatService.isCurrentlyStreaming) {
       return;
     }
-    setTimeout(() => {
-      if (expectedGen != this.streamGeneration) {
+
+    // 先中断旧 sub，再标记订阅（abort 会置 isSubscribed=false，必须在标记前）
+    this.abortSubConversation();
+    this.isSubscribed = true;
+
+    const currentMessageId = generateUniqueId();
+    let hasCreatedPlaceholder = false;
+
+    const removeEmptyPlaceholder = (): void => {
+      if (!hasCreatedPlaceholder) {
         return;
       }
-      this.resumeConversationState().then((ok: boolean) => {
-        // 后端仍 EXECUTING 或本地仍缺 finalResult 时继续拍
-        const list = this.data.messageList.value;
-        let stillPending = this.data.isConversationActive.value == true;
-        if (list.length > 0) {
-          const last = list[list.length - 1];
-          if (
-            last != null &&
-            last.messageType == MessageTypeEnum.ASSISTANT &&
-            last.finalResult == null
-          ) {
-            stillPending = true;
+      const list = this.data.messageList.value;
+      const next: MessageInfo[] = [];
+      for (let i = 0; i < list.length; i++) {
+        const message = list[i];
+        if (message == null) {
+          continue;
+        }
+        const textEmpty =
+          message.text == null || `${message.text}`.length == 0;
+        const thinkEmpty =
+          message.think == null || `${message.think}`.length == 0;
+        const processingEmpty =
+          message.processingList == null ||
+          (message.processingList as any[]).length == 0;
+        const noFinal = message.finalResult == null;
+        if (
+          message.id == currentMessageId &&
+          textEmpty &&
+          thinkEmpty &&
+          processingEmpty &&
+          noFinal
+        ) {
+          continue;
+        }
+        next.push(message);
+      }
+      this.data.messageList.value = next;
+    };
+
+    let isCleanedUp = false;
+    const cleanupSub = (): void => {
+      if (isCleanedUp) {
+        return;
+      }
+      isCleanedUp = true;
+      this.endStreamListDraft();
+      if (this.subStreamRequest != null) {
+        this.subStreamRequest!.abort();
+        this.subStreamRequest = null;
+      }
+      this.isSubscribed = false;
+      this.data.isConversationActive.value = false;
+      this.clearStreamingAssistantText();
+      removeEmptyPlaceholder();
+      if (onSubClose != null) {
+        (onSubClose as () => void)();
+      }
+    };
+
+    // 1. reload 历史（拿最新 messageList）
+    try {
+      const result = await apiAgentConversation(conversationId);
+      if (apiResCode(result) != SUCCESS_CODE) {
+        cleanupSub();
+        return;
+      }
+      const dataRaw = apiResData<any>(result);
+      if (dataRaw == null) {
+        cleanupSub();
+        return;
+      }
+      const dataObj = dataRaw as UTSJSONObject;
+      const taskStatusRaw = dataObj["taskStatus"];
+      const taskStatusStr =
+        taskStatusRaw != null ? `${taskStatusRaw}` : "";
+      // 轮询与详情之间任务可能已结束；此时不可再建立 sub 或插入占位
+      if (taskStatusStr != `${TaskStatus.EXECUTING}`) {
+        // 仍刷新一次列表，避免界面停在半截字
+        await this.handleQueryConversation(result);
+        cleanupSub();
+        return;
+      }
+      const rawMessageList = dataObj["messageList"];
+      const parsedList = parseMessageList(rawMessageList);
+      if (parsedList.length > 0) {
+        const processed: MessageInfo[] = [];
+        for (let mi = 0; mi < parsedList.length; mi++) {
+          const message = parsedList[mi];
+          const adaptedMessage = adaptHistoryMessage(message);
+          let rawText = "";
+          if (adaptedMessage.text != null) {
+            rawText = `${adaptedMessage.text}`;
           }
+          const text = handleMessageProcess(rawText);
+          let id = generateUniqueId();
+          if (adaptedMessage.id != null) {
+            id = `${adaptedMessage.id}`;
+          }
+          adaptedMessage.text = text;
+          adaptedMessage.id = id;
+          processed.push(attachSpeakableTextToMessage(adaptedMessage));
         }
-        if (stillPending == true && (ok == true || attempt < 3)) {
-          this.schedulePostStreamRecovery(expectedGen, attempt + 1);
-        }
-      });
-    }, 2000);
+        this.data.messageList.value = processed;
+      }
+      this.data.isConversationActive.value = true;
+    } catch (error) {
+      console.error(
+        "[AgentDetailService] handleSubConversation reload failed:",
+        error,
+      );
+      cleanupSub();
+      return;
+    }
+
+    // 2. 延迟创建占位：空 sub 流不会向列表留下空消息
+    const ensurePlaceholder = (): void => {
+      if (hasCreatedPlaceholder) {
+        return;
+      }
+      hasCreatedPlaceholder = true;
+      const placeholderObj: UTSJSONObject = {
+        role: AssistantRoleEnum.ASSISTANT,
+        type: MessageModeEnum.CHAT,
+        text: "",
+        think: "",
+        time: new Date().toISOString(),
+        id: currentMessageId,
+        messageType: MessageTypeEnum.ASSISTANT,
+        status: MessageStatusEnum.Loading,
+      };
+      const placeholder = createMessageInfoFromAny(placeholderObj);
+      if (placeholder == null) {
+        return;
+      }
+      const next: MessageInfo[] = [];
+      const list = this.data.messageList.value;
+      for (let i = 0; i < list.length; i++) {
+        next.push(list[i]);
+      }
+      next.push(placeholder);
+      this.data.messageList.value = next;
+      this.data.messageIdRef.value = currentMessageId;
+      this.data.streamingAssistantMessageId.value = currentMessageId;
+      this.data.streamingAssistantText.value = "";
+    };
+
+    // 3. 订阅 sub（GET SSE）
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    const header = new UTSJSONObject(API_HEADERS as UTSJSONObject);
+    // #ifdef H5 || WEB
+    if (process.env.NODE_ENV === "development") {
+      header["Authorization"] = `Bearer ${token}`;
+    }
     // #endif
+    // #ifdef MP-WEIXIN
+    header["Authorization"] = `Bearer ${token}`;
+    // #endif
+    // #ifdef APP
+    header["Authorization"] = `Bearer ${token}`;
+    // #endif
+
+    this.subStreamRequest = new StreamRequest();
+    const requestConfig = new StreamRequestConfig();
+    requestConfig.url = `${API_BASE_URL}/api/agent/conversation/chat/sub/${conversationId}`;
+    requestConfig.method = "GET";
+    requestConfig.headers = header;
+    requestConfig.onChunk = (chunk: StreamChunk) => {
+      if (chunk.type != "content") {
+        return;
+      }
+      try {
+        const result = JSON.parse(chunk.data);
+        if (result == null) {
+          return;
+        }
+        const resultObj = result;
+        if (readRawField(resultObj, "data") == null) {
+          if (shouldSkipSsePayloadWithoutData(resultObj)) {
+            return;
+          }
+          return;
+        }
+        ensurePlaceholder();
+        this.handleChangeMessageList(resultObj, currentMessageId);
+        const eventTypeRaw = readRawField(resultObj, "eventType");
+        const eventTypeStr =
+          eventTypeRaw != null ? `${eventTypeRaw}` : "";
+        if (eventTypeStr == `${ConversationEventTypeEnum.ERROR}`) {
+          cleanupSub();
+        }
+      } catch (e) {
+        console.error("[AgentDetailService] sub 解析 SSE 失败:", e);
+      }
+    };
+    requestConfig.onComplete = () => {
+      cleanupSub();
+    };
+    requestConfig.onError = (error: any) => {
+      console.error("[AgentDetailService] sub stream error:", error);
+      cleanupSub();
+    };
+    requestConfig.onTimeout = () => {
+      cleanupSub();
+    };
+
+    try {
+      await this.subStreamRequest!.request(requestConfig);
+    } catch (error) {
+      console.error(
+        "[AgentDetailService] handleSubConversation failed:",
+        error,
+      );
+      cleanupSub();
+    }
+  }
+
+  /**
+   * 中断 sub 流恢复连接
+   */
+  abortSubConversation(): void {
+    if (this.subStreamRequest != null) {
+      this.subStreamRequest!.abort();
+      this.subStreamRequest = null;
+    }
+    this.isSubscribed = false;
+  }
+
+  /** sub 是否已订阅（执行中） */
+  get isSubConversationSubscribed(): boolean {
+    return this.isSubscribed;
   }
 
   /**
@@ -1748,10 +1953,11 @@ export default class AgentDetailService {
     // 停止会话后，不再允许获取问题建议
     this.isAllowSuggest = false;
 
-    // 无论 UI 是否已标为结束，都先中止本地 SSE，避免 chunk 回调继续跑
+    // 无论 UI 是否已标为结束，都先中止本地 SSE / sub，避免 chunk 回调继续跑
     this.streamGeneration = this.streamGeneration + 1;
     this.endStreamListDraft();
     chatService.abort();
+    this.abortSubConversation();
 
     // 如果会话已经不活跃，说明会话已经结束，无需调用 stop 接口
     if (!this.data.isConversationActive.value) {
@@ -2062,12 +2268,14 @@ export default class AgentDetailService {
   }
 
   /**
-   * 恢复会话状态
-   * 用于页面从后台唤醒后检测并恢复会话
+   * 检测并恢复会话状态（回前台 / 断流回补）。
    *
-   * 检测异常中断的条件：最后一条 ASSISTANT 消息状态为 Loading/Incomplete 且无 finalResult
+   * 返回 true：后端仍为 EXECUTING，调用方应订阅 sub。
+   * 覆盖：
+   * - 本端 SSE 异常中断
+   * - 其它端（如 Android）在同会话发了消息，本端（如 iOS）需续接
    *
-   * @returns 是否需要恢复（true 表示检测到异常中断并已恢复）
+   * @returns 是否需要订阅 sub（后端 EXECUTING）
    */
   async resumeConversationState(): Promise<boolean> {
     // 1. 检查会话ID
@@ -2076,79 +2284,56 @@ export default class AgentDetailService {
       return false;
     }
 
-    // 2. 获取最后一条 ASSISTANT 消息
-    const messageList = this.data.messageList.value;
-    const lastAssistantMessage = [...messageList]
-      .reverse()
-      .find(
-        (msg) => msg.messageType == MessageTypeEnum.ASSISTANT && msg.status != null,
-      );
-
-    // 3. 获取前端状态
-    const isConversationActive = this.data.isConversationActive.value;
-    const isStreaming = chatService.isCurrentlyStreaming;
-    const isStoppingConversation = this.data.isStoppingConversation.value;
-
-    // 4. 异常中断检测
-    // 条件：最后一条助手尚无 finalResult，且本地 SSE 已停
-    // （含 Incomplete / 被误标 Complete 的半截字，进后台杀流常见）
-    const isAbnormalInterruption =
-      lastAssistantMessage != null &&
-      lastAssistantMessage.finalResult == null &&
-      (lastAssistantMessage.status == MessageStatusEnum.Loading ||
-        lastAssistantMessage.status == MessageStatusEnum.Incomplete ||
-        lastAssistantMessage.status == MessageStatusEnum.Complete);
-
-    // 5. 如果用户正在主动停止，不是异常中断
-    if (isStoppingConversation) {
+    // 2. 用户正在主动停止 / 本地 live 或 sub 已在跑 → 不抢
+    if (this.data.isStoppingConversation.value) {
       return false;
     }
-
-    // 6. 如果 SSE 仍在工作，无需恢复
-    if (isStreaming) {
-      return false;
-    }
-
-    // 7. 检测到异常中断
-    if (!isAbnormalInterruption) {
+    if (chatService.isCurrentlyStreaming || this.isSubscribed) {
       return false;
     }
 
     try {
-      // 8. 查询后端会话状态并刷新
+      // 3. 始终拉一次详情：跨端时本地气泡可能已是 Complete，不能只靠「异常中断」判断
       const res = await apiAgentConversation(conversationId);
-      if (apiResCode(res) == SUCCESS_CODE) {
-        const convData = apiResData<ConversationInfo>(res);
-        const convObj = convData != null ? (convData as UTSJSONObject) : null;
-        const taskStatusRaw = convObj != null ? convObj["taskStatus"] : null;
-        // 更新会话状态
-        if (taskStatusRaw == TaskStatus.EXECUTING) {
-          // 任务仍在后端执行，保持活跃状态
-          this.data.isConversationActive.value = true;
-        } else {
-          // 任务已完成或取消，更新前端状态
-          this.data.isConversationActive.value = false;
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return false;
+      }
+      const convData = apiResData<ConversationInfo>(res);
+      const convObj = convData != null ? (convData as UTSJSONObject) : null;
+      let taskStatusStr = "";
+      if (convObj != null) {
+        const taskStatusRaw = convObj["taskStatus"];
+        if (taskStatusRaw != null) {
+          // App：可能是字符串或带 value 的对象
+          try {
+            const nested = (taskStatusRaw as UTSJSONObject)["value"];
+            if (nested != null) {
+              taskStatusStr = `${nested}`;
+            } else {
+              taskStatusStr = `${taskStatusRaw}`;
+            }
+          } catch (_e) {
+            taskStatusStr = `${taskStatusRaw}`;
+          }
         }
-
-        // 更新消息列表（刷新页面数据）
-        this.handleQueryConversation(res);
       }
 
-      return true;
+      // 刷新消息列表（其它端新消息 / 半截字终态）
+      await this.handleQueryConversation(res);
+
+      if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
+        this.data.isConversationActive.value = true;
+        return true;
+      }
+      this.data.isConversationActive.value = false;
+      return false;
     } catch (error) {
       console.error("[SessionResume] 恢复会话状态失败:", error);
-      // 恢复失败时，重置前端状态
       this.data.isConversationActive.value = false;
       return false;
     }
   }
 
-  /**
-   * 发送消息
-   *
-   * @param data 消息数据
-   * @param isTempChat 是否是临时会话
-   */
   async handleSendMessage(
     data: HandleSendMessageData | any,
     isTempChat: boolean = false,
@@ -2247,10 +2432,11 @@ export default class AgentDetailService {
     const chatMessageId = generateUniqueId();
     const currentMessageId = generateUniqueId();
 
-    // 先掐断上一轮 SSE / 打字机通道，再挂新气泡，避免旧正文串到空助手消息
+    // 先掐断上一轮 SSE / sub / 打字机通道，再挂新气泡，避免旧正文串到空助手消息
     this.streamGeneration = this.streamGeneration + 1;
     this.endStreamListDraft();
     chatService.abort();
+    this.abortSubConversation();
     this.clearStreamingAssistantText();
 
     // 构造消息

@@ -387,7 +387,7 @@
   // ==================== 导入模块 ====================
   // 分层架构
   import { nextTick, type ComponentPublicInstance } from "vue";
-  import { onLoad } from "@dcloudio/uni-app";
+  import { onLoad, onHide, onShow } from "@dcloudio/uni-app";
   import AgentDetailData from "./layers/AgentDetailData.uts";
   import AgentDetailService, {
     HandleSendMessageData,
@@ -473,6 +473,13 @@
     EventDedupManager,
   } from "@/subpackages/hooks/useMessageEventDelegate.uts";
   import { usePageResume, PageResumeOptions } from "@/subpackages/hooks/usePageResume.uts";
+  import {
+    startConversationPolling,
+    stopConversationPolling,
+    resumeConversationPolling,
+    pauseConversationPolling,
+    destroyConversationPolling,
+  } from "@/subpackages/hooks/useConversationStatusPolling.uts";
 
   // ==================== 工具方法 ====================
   import { formatBytes } from "@/utils/byteConverter.uts";
@@ -1764,6 +1771,9 @@
       params = paramsObjElse;
     }
 
+    // 本地发送前中断 sub 流恢复（避免 live + sub 双流）
+    service.abortSubConversation();
+
     service.handleSendMessage(params, props.isTempChat, () => {
       // 软断流 / 超时收尾：只复位按钮态。
       // 不要在这里 abort——streamRequest 软收尾前还要排空 MESSAGE 队列；
@@ -1813,8 +1823,10 @@
    * 处理创建新会话
    */
   const handleCreateNewConversation = (): void => {
-    // 中止当前 SSE 连接
+    // 中止当前 SSE / sub 连接
     chatService.abort();
+    service.abortSubConversation();
+    stopConversationPolling();
     // 注意：创建新会话时不调用停止接口，只中止 SSE 连接
     // 停止接口只应该由用户手动点击停止按钮时调用
 
@@ -2137,10 +2149,36 @@
 
   // ==================== 页面唤醒恢复逻辑 ====================
   /**
+   * 启动会话状态轮询（sub 恢复）：轮询发现 EXECUTING → handleSubConversation；
+   * sub 关闭 → 再启轮询。
+   * 须用 function 声明：UTS 嵌套回调内无法引用同作用域 const（error18）。
+   */
+  function startResumePolling(): void {
+    const cid = data.conversationId.value;
+    if (cid == null || cid == 0) {
+      return;
+    }
+    startConversationPolling(
+      cid,
+      (executingCid: number) => {
+        service.handleSubConversation(executingCid, (): void => {
+          startResumePolling();
+        });
+      },
+      (): boolean => {
+        return data.isConversationActive.value;
+      },
+      (): boolean => {
+        return service.isSubConversationSubscribed;
+      },
+    );
+  }
+
+  /**
    * 处理会话恢复
    * 当页面从后台恢复时，检测并恢复会话状态
    */
-  const handleSessionResume = async (): Promise<void> => {
+  async function handleSessionResume(): Promise<void> {
     // 页面切回前台时，同步并更新最新的租户配置
     await initTenantConfig();
 
@@ -2157,12 +2195,25 @@
     await service.handleCheckSubscriptionLimit();
 
     // 调用服务层的恢复方法
-    await service.resumeConversationState();
-  };
+    const needResume = await service.resumeConversationState();
 
-  // 使用页面唤醒检测 Hook
-  // 注意：H5 环境会自动监听 visibilitychange
-  // 小程序环境需要配合 App.uvue 的 onShow 使用
+    if (needResume) {
+      // EXECUTING：订阅 sub 流恢复；sub 关闭后 onSubClose 恢复轮询
+      console.log("[PageResume] 会话状态已恢复,订阅 sub 流恢复");
+      const resumeCid = data.conversationId.value;
+      if (resumeCid != null && resumeCid != 0) {
+        service.handleSubConversation(resumeCid, (): void => {
+          startResumePolling();
+        });
+      }
+      // 兜底轮询：与 handlePageLoad 同理，确保 live stream 结束后有轮询能续上 sub
+      startResumePolling();
+    } else {
+      // 非执行中：恢复轮询
+      resumeConversationPolling();
+    }
+  }
+
   // 使用页面唤醒检测 Hook
   // 注意：H5 环境会自动监听 visibilitychange
   // 小程序环境需要配合 App.uvue 的 onShow 使用
@@ -2175,13 +2226,28 @@
     handleSessionResume();
   };
   pageResumeOptions.onHide = (): void => {
-    // 仅真正离开页面（onUnmounted）才断开；短暂 hide 保留预热连接
+    // 页面进入后台：暂停会话状态轮询（sub 流保持，由 StreamRequest 超时控制）
+    // 短暂 hide 仍保留语音预热连接
+    pauseConversationPolling();
   };
   pageResumeOptions.minHiddenDuration = 5000;
   const pageResumeResult = usePageResume(pageResumeOptions);
   const isPageHidden = pageResumeResult.isHidden;
   const triggerResume = pageResumeResult.triggerResume;
   const triggerHide = pageResumeResult.triggerHide;
+
+  // 小程序/App：组件内只管轮询启停（triggerResume/Hide 由父页 agent-detail 经 expose 调用，
+  // 避免 UTS 嵌套回调引用局部 const 报 error18；也避免与父页 onShow/onHide 双重触发 resume）
+  // #ifndef H5
+  onHide((): void => {
+    pauseConversationPolling();
+  });
+
+  onShow((): void => {
+    // 短切后台（< minHiddenDuration）不触发 handleSessionResume，但仍需恢复轮询
+    resumeConversationPolling();
+  });
+  // #endif
 
   /**
    * 处理页面加载
@@ -2264,12 +2330,23 @@
 
         if (resData != null) {
           const resDataObj = resData as UTSJSONObject;
+          // 切换会话：先停止旧会话的状态轮询
+          stopConversationPolling();
           // Android：taskStatus 为字符串，禁止依赖 string==枚举隐式强转
           if (parseTaskStatus(resDataObj["taskStatus"]) == TaskStatus.EXECUTING) {
             // 设置会话为活跃状态（按钮显示为停止按钮）
             data.isConversationActive.value = true;
+            // 执行中：订阅 sub 流恢复；sub 关闭后启动轮询
+            service.handleSubConversation(id, () => {
+              startResumePolling();
+            });
+            // 兜底轮询：abortSub 不触发 onSubClose，需提前启动
+            startResumePolling();
             // 订阅 ChatFinished 事件
             eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
+          } else {
+            // 非执行中：启动轮询，检测会话变为 EXECUTING
+            startResumePolling();
           }
         }
       }
@@ -2854,6 +2931,8 @@
     speechSocketWarmup.teardown();
     stopAllStreamSpeech(true);
     chatService.abort();
+    service.abortSubConversation();
+    destroyConversationPolling();
     scrollManager.dispose();
 
     // #ifdef APP

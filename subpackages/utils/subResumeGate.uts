@@ -1,0 +1,277 @@
+/**
+ * 跨端 sub 续接门禁（H5 / iOS / Android / 微信小程序共用）。
+ *
+ * 仅 taskStatus=EXECUTING 不够：跨端刚开聊时，详情里可能还只有上一轮已完成助手，
+ * 本轮用户句尚未写入 messageList。此时开 sub 会出现「双 AI 中间缺用户」。
+ *
+ * 可安全开 sub 的条件：
+ * - 末尾是 USER；或
+ * - 末尾是进行中助手，且前一条是 USER
+ */
+import {
+  AssistantRoleEnum,
+  MessageTypeEnum,
+} from "@/types/enums/agent";
+import { MessageStatusEnum } from "@/types/enums/common";
+import { MessageInfo } from "@/types/interfaces/conversationInfo";
+import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+
+/**
+ * 读取业务枚举字符串（兼容 { value: "USER" }）。
+ */
+export function readBizEnumStr(raw: any | null, key: string): string {
+  const val = readRawField(raw, key);
+  if (val == null) {
+    return "";
+  }
+  const nested = readRawField(val, "value");
+  if (nested != null) {
+    return `${nested}`;
+  }
+  return `${val}`;
+}
+
+export function isRawUserMessage(raw: any | null): boolean {
+  if (raw == null) {
+    return false;
+  }
+  const role = readBizEnumStr(raw, "role");
+  const messageType = readBizEnumStr(raw, "messageType");
+  const senderType = readBizEnumStr(raw, "senderType");
+  return (
+    role == "USER" || messageType == "USER" || senderType == "USER"
+  );
+}
+
+export function isRawAssistantMessage(raw: any | null): boolean {
+  if (raw == null) {
+    return false;
+  }
+  const role = readBizEnumStr(raw, "role");
+  const messageType = readBizEnumStr(raw, "messageType");
+  const senderType = readBizEnumStr(raw, "senderType");
+  return (
+    role == "ASSISTANT" ||
+    messageType == "ASSISTANT" ||
+    senderType == "AGENT" ||
+    senderType == "ASSISTANT"
+  );
+}
+
+/**
+ * 将 messageList 收成可下标访问的数组（兼容 App Map / 非原生 Array）。
+ */
+export function asRawMessageArray(raw: any | null): any[] {
+  const empty: any[] = [];
+  if (raw == null) {
+    return empty;
+  }
+  if (Array.isArray(raw)) {
+    return raw as any[];
+  }
+  try {
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr == null || jsonStr.length <= 2) {
+      return empty;
+    }
+    const parsed = JSON.parse(jsonStr);
+    if (Array.isArray(parsed)) {
+      return parsed as any[];
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return empty;
+}
+
+/**
+ * 原始 API messageList：本轮用户是否已就绪（轮询侧使用）。
+ */
+export function isTurnUserReadyFromRawMessageList(
+  rawMessageList: any | null,
+): boolean {
+  const list = asRawMessageArray(rawMessageList);
+  if (list.length == 0) {
+    return false;
+  }
+  const last = list[list.length - 1];
+  if (isRawUserMessage(last)) {
+    return true;
+  }
+  if (isRawAssistantMessage(last) != true) {
+    return false;
+  }
+  if (isRawInFlightAssistant(last) != true) {
+    return false;
+  }
+  if (list.length < 2) {
+    return false;
+  }
+  return isRawUserMessage(list[list.length - 2]);
+}
+
+/**
+ * 门禁未通过时的诊断快照（role/status/textLen），便于区分「用户未落库」与「助手已有正文被误判完成」。
+ */
+export function describeTurnUserGate(rawMessageList: any | null): string {
+  const list = asRawMessageArray(rawMessageList);
+  if (list.length == 0) {
+    return "listEmpty";
+  }
+  const last = list[list.length - 1];
+  const prev = list.length >= 2 ? list[list.length - 2] : null;
+  return (
+    "len=" +
+    `${list.length}` +
+    " lastRole=" +
+    describeRawMessageBrief(last) +
+    " prevRole=" +
+    describeRawMessageBrief(prev)
+  );
+}
+
+function describeRawMessageBrief(raw: any | null): string {
+  if (raw == null) {
+    return "null";
+  }
+  const role = readBizEnumStr(raw, "role");
+  const messageType = readBizEnumStr(raw, "messageType");
+  const senderType = readBizEnumStr(raw, "senderType");
+  const status = readBizEnumStr(raw, "status");
+  const textRaw = readRawField(raw, "text");
+  const textLen = textRaw != null ? `${textRaw}`.trim().length : 0;
+  const hasFinal = readRawField(raw, "finalResult") != null;
+  const finishedRaw = readRawField(raw, "finished");
+  let finished = "?";
+  if (finishedRaw == true || `${finishedRaw}` == "true") {
+    finished = "1";
+  } else if (finishedRaw == false || `${finishedRaw}` == "false") {
+    finished = "0";
+  }
+  const rolePart = role.length > 0 ? role : "-";
+  const typePart = messageType.length > 0 ? messageType : "-";
+  const senderPart = senderType.length > 0 ? senderType : "-";
+  const statusPart = status.length > 0 ? status : "-";
+  return (
+    rolePart +
+    "/" +
+    typePart +
+    "/" +
+    senderPart +
+    " st=" +
+    statusPart +
+    " fin=" +
+    finished +
+    " final=" +
+    (hasFinal ? "1" : "0") +
+    " textLen=" +
+    `${textLen}`
+  );
+}
+
+function isRawInFlightAssistant(raw: any | null): boolean {
+  if (raw == null) {
+    return false;
+  }
+  if (readRawField(raw, "finalResult") != null) {
+    return false;
+  }
+  const status = readBizEnumStr(raw, "status").toLowerCase();
+  if (status == "complete" || status == "error" || status == "failed") {
+    return false;
+  }
+  if (status == "loading" || status == "incomplete") {
+    return true;
+  }
+  // 历史完成态常带 finished=true；明确完成后勿当进行中。
+  // 注意：本地 SSE 中间段也可能 finished=true，但跨端详情里进行中消息多为 false/null。
+  const finishedRaw = readRawField(raw, "finished");
+  if (finishedRaw == true || `${finishedRaw}` == "true") {
+    return false;
+  }
+  // status 缺失且未 finished：跨端续接时助手正文可能已落库，不能再要求 text 为空，
+  // 否则会一直卡在「等待本轮用户」而无法 sub。
+  return true;
+}
+
+export function isUserMessageInfo(message: MessageInfo | null): boolean {
+  if (message == null) {
+    return false;
+  }
+  if (message.messageType == MessageTypeEnum.USER) {
+    return true;
+  }
+  if (message.role == AssistantRoleEnum.USER) {
+    return true;
+  }
+  return false;
+}
+
+export function isAssistantMessageInfo(message: MessageInfo | null): boolean {
+  if (message == null) {
+    return false;
+  }
+  if (message.messageType == MessageTypeEnum.ASSISTANT) {
+    return true;
+  }
+  if (message.role == AssistantRoleEnum.ASSISTANT) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 本地 MessageInfo 列表中的「进行中」助手（sub 复用 / 门禁共用）。
+ * Complete / Failed / 有 finalResult / finished=true 一律不算进行中。
+ * status 缺失时：允许已有部分正文（跨端流式中途落库），否则 H5 无法续接 iOS 语音等场景。
+ */
+export function isInFlightAssistantMessage(
+  message: MessageInfo | null,
+): boolean {
+  if (isAssistantMessageInfo(message) != true || message == null) {
+    return false;
+  }
+  if (message.finalResult != null) {
+    return false;
+  }
+  const status = message.status;
+  if (
+    status == MessageStatusEnum.Complete ||
+    status == MessageStatusEnum.Failed
+  ) {
+    return false;
+  }
+  if (
+    status == MessageStatusEnum.Loading ||
+    status == MessageStatusEnum.Incomplete
+  ) {
+    return true;
+  }
+  if (message.finished == true) {
+    return false;
+  }
+  // status 缺失且 finished 非 true：视为进行中（含已有正文）
+  return true;
+}
+
+/**
+ * 已解析的 MessageInfo[]：本轮用户是否已就绪（handleSubConversation 侧使用）。
+ */
+export function isTurnUserReadyFromMessageInfoList(
+  list: MessageInfo[],
+): boolean {
+  if (list.length == 0) {
+    return false;
+  }
+  const last = list[list.length - 1];
+  if (isUserMessageInfo(last)) {
+    return true;
+  }
+  if (isInFlightAssistantMessage(last) != true) {
+    return false;
+  }
+  if (list.length < 2) {
+    return false;
+  }
+  return isUserMessageInfo(list[list.length - 2]);
+}

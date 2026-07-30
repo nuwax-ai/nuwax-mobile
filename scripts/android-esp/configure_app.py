@@ -390,32 +390,64 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
 
 
 def relocate_main_activity() -> None:
-    """applicationId/namespace 改为 com.nuwax.nuwa 后，示例 MainActivity 包名必须同步，否则 R 类解析失败。"""
+    """迁移 SDK 示例入口，并将其改为无界面的业务 App 跳板。"""
     old_root = PROJ / "app/src/main/java/com/example/uniappx_native_package"
     new_root = PROJ / "app/src/main/java" / Path(*BUNDLE.split("."))
     old_file = old_root / "MainActivity.kt"
-    if not old_file.is_file():
-        # 已迁移
-        if (new_root / "MainActivity.kt").is_file():
-            print("✓ MainActivity 包名已是", BUNDLE)
-        return
-    new_root.mkdir(parents=True, exist_ok=True)
-    text = old_file.read_text()
-    text = text.replace(
-        "package com.example.uniappx_native_package",
-        f"package {BUNDLE}",
-    )
-    # 自定义基座：启动即进入 uni-app（官方 UniAppActivity），保留按钮作调试兜底
-    if "UniAppXSDK.start(null" in text and "autoStart" not in text:
-        text = text.replace(
-            "setContentView(R.layout.main_activity)",
-            "setContentView(R.layout.main_activity)\n"
-            "        // autoStart: 自定义基座默认直接进入业务 App\n"
-            "        UniAppXSDK.start(null, this@MainActivity)",
+    activity_file = new_root / "MainActivity.kt"
+
+    if old_file.is_file():
+        new_root.mkdir(parents=True, exist_ok=True)
+        text = old_file.read_text().replace(
+            "package com.example.uniappx_native_package", f"package {BUNDLE}"
         )
-    (new_root / "MainActivity.kt").write_text(text)
-    shutil.rmtree(old_root)
-    print(f"✓ MainActivity → package {BUNDLE}")
+        activity_file.write_text(text)
+        shutil.rmtree(old_root)
+        print(f"✓ MainActivity → package {BUNDLE}")
+    elif not activity_file.is_file():
+        print("⚠ 未找到 SDK MainActivity，跳过入口页处理")
+        return
+
+    # SDK 默认 MainActivity 会显示两个「uni-app x-Native」示例按钮。它只应作为
+    # 启动业务 UniAppActivity 的跳板，启动后立即结束，避免启动失败或返回时露出示例页。
+    text = activity_file.read_text()
+    already_redirects = (
+        "UniAppXSDK.start(null, this@MainActivity)" in text and "finish()" in text
+    )
+    text, layout_count = re.subn(
+        r"setContentView\(R\.layout\.main_activity\)",
+        "UniAppXSDK.start(null, this@MainActivity)\n        finish()",
+        text,
+        count=1,
+    )
+    # 兼容已由旧脚本注入过 autoStart 的工作副本，去掉 finish() 后重复的启动调用。
+    text = re.sub(
+        r"(finish\(\)\s*)(?://[^\n]*\n\s*)?"
+        r"UniAppXSDK\.start\(null, this@MainActivity\)\s*",
+        r"\1",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"\s*findViewById<View>\(R\.id\.btn_goto\)\.setOnClickListener\s*\{.*?\n\s*}\n",
+        "\n",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"\s*findViewById<View>\(R\.id\.btn_go_view\)\.setOnClickListener\s*\{.*?\n\s*}\n",
+        "\n",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if layout_count != 1 and not already_redirects:
+        die(f"未能改写 {activity_file} 的 SDK 示例入口")
+    if "findViewById<View>(R.id.btn_" in text:
+        die(f"未能移除 {activity_file} 的 SDK 示例按钮绑定")
+    activity_file.write_text(text)
+    print("✓ MainActivity 已改为直接启动业务 App，不显示 SDK 示例页")
 
 
 def main() -> None:

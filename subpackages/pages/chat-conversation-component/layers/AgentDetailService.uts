@@ -86,6 +86,8 @@ import {
 } from "@/utils/system.uts";
 import { t } from "@/utils/i18n";
 import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
+import { buildAssistantSpeakableText } from "@/subpackages/utils/voice/textFilter";
+import { speechSocketWarmup } from "@/subpackages/utils/voice/speechSocketWarmup";
 
 /** 超时回调类型 */
 type TimeoutCallback = any;
@@ -93,6 +95,30 @@ type NullableTimeoutCallback = any | null;
 
 /** 每页加载消息数量 */
 const MESSAGE_LIST_SIZE = 10;
+
+/**
+ * 为助手草稿写入可播报缓存（工具栏点击时直接用，避免重复清洗）。
+ */
+function attachSpeakableTextToDraft(
+  draft: UTSJSONObject,
+  rawText: string,
+): void {
+  draft["speakableText"] = buildAssistantSpeakableText(rawText);
+}
+
+/**
+ * 历史/列表项：助手消息在定稿 text 后写入 speakableText。
+ */
+function attachSpeakableTextToMessage(message: MessageInfo): MessageInfo {
+  if (message.messageType != MessageTypeEnum.ASSISTANT) {
+    return message;
+  }
+  const text = readMessageText(message);
+  const draft = messageToJsonObject(message);
+  attachSpeakableTextToDraft(draft, text);
+  const next = createMessageInfoFromAny(draft);
+  return next != null ? next : message;
+}
 
 const handleMessageProcess = (text: string): string => {
   return text; // 目前由于方案 已经整体切换到 mp-html内处理 所这里都关闭了
@@ -730,7 +756,7 @@ export default class AgentDetailService {
         }
         adaptedMessage.text = text;
         adaptedMessage.id = id;
-        return adaptedMessage;
+        return attachSpeakableTextToMessage(adaptedMessage);
       });
 
       this.data.autoToLastMsg.value = true;
@@ -904,7 +930,7 @@ export default class AgentDetailService {
               }
               adaptedMessage.text = text;
               adaptedMessage.id = id;
-              processedMessages.push(adaptedMessage);
+              processedMessages.push(attachSpeakableTextToMessage(adaptedMessage));
             }
 
             // 前插到消息列表头部
@@ -1159,6 +1185,7 @@ export default class AgentDetailService {
           m["id"] = id;
           m["text"] = accumulatedText;
           m["status"] = MessageStatusEnum.Complete;
+          attachSpeakableTextToDraft(m, accumulatedText);
           newMessage = buildMessageInfoFromDraft(m);
           arraySpliceAction = 0;
         } else {
@@ -1173,6 +1200,9 @@ export default class AgentDetailService {
           m["status"] = finished
             ? MessageStatusEnum.Complete
             : MessageStatusEnum.Incomplete;
+          if (finished == true) {
+            attachSpeakableTextToDraft(m, accumulatedText);
+          }
           newMessage = buildMessageInfoFromDraft(m);
         }
       }
@@ -1183,6 +1213,10 @@ export default class AgentDetailService {
       m["status"] = MessageStatusEnum.Complete;
       m["finalResult"] = responseData;
       m["requestId"] = requestIdStr;
+      const finalText = readMessageText(currentMessage);
+      if (finalText.length > 0) {
+        attachSpeakableTextToDraft(m, finalText);
+      }
       newMessage = buildMessageInfoFromDraft(m);
       this.data.requestId.value = requestIdStr;
     }
@@ -1199,7 +1233,8 @@ export default class AgentDetailService {
       list.splice(index, arraySpliceAction, newMessage);
     }
 
-    // TTS 即时驱动（不进 UI 合并），避免播报被 40ms 合并拖慢
+    // 先写打字机通道 + 调度 UI，再驱动 TTS。
+    // 禁止 TTS 同步异常打断后续 scheduleStreamUiPublish（否则会出现「有 SSE 无渲染」）。
     if (newMessage != null) {
       const patchedText = readMessageText(newMessage);
       if (
@@ -1209,12 +1244,6 @@ export default class AgentDetailService {
         this.data.streamingAssistantText.value = patchedText;
         // 固定为客户端气泡 id（currentMessageId），避免服务端改写 id 导致播报会话被 begin 重置
         this.data.streamingAssistantMessageId.value = currentMessageId;
-        // 直接驱动无头 TTS：不依赖页面 watch（长 SSE 下 watch/hold 易拖到结束后才播）
-        uni.$emit("streamSpeakFeed", {
-          messageId: currentMessageId,
-          bodyText: patchedText,
-          finished: false,
-        });
       }
     }
 
@@ -1229,6 +1258,17 @@ export default class AgentDetailService {
       needScroll,
       isErrorEvent,
     );
+
+    // TTS 与渲染解耦：失败只打日志，绝不回写会话态 / 清列表
+    if (newMessage != null) {
+      const patchedText = readMessageText(newMessage);
+      if (
+        newMessage.messageType == MessageTypeEnum.ASSISTANT &&
+        patchedText.length > 0
+      ) {
+        this.safeEmitStreamSpeakFeed(currentMessageId, patchedText, false);
+      }
+    }
 
     // 打开页面首页（与气泡更新解耦，保持即时）
     if (newMessage != null && newMessage.messageType == MessageTypeEnum.ASSISTANT) {
@@ -1390,11 +1430,7 @@ export default class AgentDetailService {
             "[AgentDetailService] Chat stream error callback:",
             error,
           );
-          this.endStreamListDraft();
-          this.clearStreamingAssistantText();
-          if (onTimeout != null) {
-            (onTimeout as () => void)();
-          }
+          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout);
         },
         isTempChat,
         // 超时 / 连接异常关闭回调（H5 onClose、App 无 SSE 终态的 HTTP complete）
@@ -1403,13 +1439,7 @@ export default class AgentDetailService {
             return;
           }
           console.warn("[SSE-Stream] stream abnormal close / timeout");
-          this.endStreamListDraft();
-          this.clearStreamingAssistantText();
-          // App：无终态断流时助手常停在 Loading（仅工具卡），回拉会话补正文
-          this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
-          if (onTimeout != null) {
-            (onTimeout as () => void)();
-          }
+          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout);
         },
       );
     } catch (error) {
@@ -1423,6 +1453,102 @@ export default class AgentDetailService {
   private clearStreamingAssistantText(): void {
     this.data.streamingAssistantText.value = "";
     this.data.streamingAssistantMessageId.value = "";
+  }
+
+  /**
+   * 安全触发流式播报：TTS 侧任何异常不得冒泡到 SSE / UI 路径。
+   */
+  private safeEmitStreamSpeakFeed(
+    messageId: string,
+    bodyText: string,
+    finished: boolean,
+  ): void {
+    try {
+      uni.$emit("streamSpeakFeed", {
+        messageId: messageId,
+        bodyText: bodyText,
+        finished: finished,
+      });
+    } catch (eSpeak) {
+      console.warn("[AgentDetailService] streamSpeakFeed ignored (TTS must not break SSE)", eSpeak);
+    }
+  }
+
+  /**
+   * 断流 / 出错清打字机前：把 streamingAssistantText 落回 messageList，
+   * 否则 App 渲染优先通道被清空后气泡会空白（正文只在 typewriter 里）。
+   */
+  private sealStreamingAssistantBeforeClear(): void {
+    const speakMsgId = this.data.streamingAssistantMessageId.value;
+    const speakBody = this.data.streamingAssistantText.value;
+    try {
+      if (speakBody.length > 0) {
+        this.persistLastAssistantSpeakableText(speakBody);
+        this.safeEmitStreamSpeakFeed(speakMsgId, speakBody, true);
+      } else {
+        this.persistLastAssistantSpeakableText("");
+      }
+    } catch (eSeal) {
+      console.warn("[AgentDetailService] sealStreamingAssistant ignored", eSeal);
+    }
+  }
+
+  /**
+   * 流式异常收尾：冲刷草稿 → 落盘打字机正文 → 清通道 → 回补。
+   */
+  private finalizeStreamAbnormally(
+    isTempChat: boolean,
+    streamGen: number,
+    onTimeout: NullableTimeoutCallback,
+  ): void {
+    this.endStreamListDraft();
+    this.sealStreamingAssistantBeforeClear();
+    this.clearStreamingAssistantText();
+    speechSocketWarmup.resumeKeepaliveAfterSse();
+    this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
+    if (onTimeout != null) {
+      (onTimeout as () => void)();
+    }
+  }
+
+  /**
+   * 将本轮最终可播报文写入最后一条助手消息的 speakableText。
+   */
+  private persistLastAssistantSpeakableText(preferBody: string): void {
+    try {
+      const list = this.data.messageList.value;
+      if (list.length == 0) {
+        return;
+      }
+      const last = list[list.length - 1];
+      if (last == null || last.messageType != MessageTypeEnum.ASSISTANT) {
+        return;
+      }
+      const body = preferBody.length > 0 ? preferBody : readMessageText(last);
+      if (body.length == 0) {
+        return;
+      }
+      const draft = messageToJsonObject(last);
+      if (preferBody.length > 0) {
+        draft["text"] = preferBody;
+      }
+      attachSpeakableTextToDraft(draft, body);
+      const updated = buildMessageInfoFromDraft(draft);
+      if (updated == null) {
+        return;
+      }
+      const next: MessageInfo[] = [];
+      for (let i = 0; i < list.length - 1; i++) {
+        next.push(list[i]);
+      }
+      next.push(updated);
+      this.data.messageList.value = next;
+    } catch (ePersist) {
+      console.warn(
+        "[AgentDetailService] persistSpeakableText ignored (must not break SSE/UI)",
+        ePersist,
+      );
+    }
   }
 
   /**
@@ -1451,15 +1577,14 @@ export default class AgentDetailService {
       }
     }
     if (speakMsgId.length > 0 || speakBody.length > 0) {
-      uni.$emit("streamSpeakFeed", {
-        messageId: speakMsgId,
-        bodyText: speakBody,
-        finished: true,
-      });
+      this.safeEmitStreamSpeakFeed(speakMsgId, speakBody, true);
     }
+    // 会话结束：把最终可播报文写入消息字段，供工具栏直接播放
+    this.persistLastAssistantSpeakableText(speakBody);
     // 先结束会话态（触发 Markdown 终态解析），再清打字机通道，避免中间空白一帧
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
+    speechSocketWarmup.resumeKeepaliveAfterSse();
 
     // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
     if (!isTempChat) {
@@ -1505,7 +1630,8 @@ export default class AgentDetailService {
   }
 
   /**
-   * App：助手气泡仍为 Loading（常见于工具 PROCESSING 后断流）时，延迟回拉会话详情补正文。
+   * App：助手气泡仍为 Loading，或正文仍空时，延迟回拉会话详情补正文。
+   * （语音发送后 iOS 常「网络连接已中断」：可能已有 Incomplete 空壳，仅判 Loading 会漏回补）
    */
   private scheduleRecoverIfAssistantLoading(
     isTempChat: boolean,
@@ -1521,17 +1647,24 @@ export default class AgentDetailService {
       const lastForRecover = listForRecover[listForRecover.length - 1];
       if (
         lastForRecover != null &&
-        lastForRecover.messageType == MessageTypeEnum.ASSISTANT &&
-        lastForRecover.status == MessageStatusEnum.Loading
+        lastForRecover.messageType == MessageTypeEnum.ASSISTANT
       ) {
-        needRecover = true;
+        const status = lastForRecover.status;
+        const textLen = readMessageText(lastForRecover).trim().length;
+        if (
+          status == MessageStatusEnum.Loading ||
+          status == MessageStatusEnum.Incomplete ||
+          textLen == 0
+        ) {
+          needRecover = true;
+        }
       }
     }
     if (needRecover != true) {
       return;
     }
     console.warn(
-      "[SSE-Stream] assistant still Loading → schedule resume",
+      "[SSE-Stream] assistant needs resume (loading/incomplete/empty) → schedule",
     );
     setTimeout(() => {
       if (streamGenAtSchedule != this.streamGeneration) {
@@ -1602,8 +1735,11 @@ export default class AgentDetailService {
 
     // 先结束会话态：保留 messageList 正文并触发 Markdown 终态渲染；
     // 再清打字机通道。停止只掐断 SSE/播报，不抹掉已输出内容。
+    const stopSpeakBody = this.data.streamingAssistantText.value;
+    this.persistLastAssistantSpeakableText(stopSpeakBody);
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
+    speechSocketWarmup.resumeKeepaliveAfterSse();
 
     // 会话消息请求ID
     const requestId = this.data.currentConversationRequestId.value;
@@ -2154,6 +2290,8 @@ export default class AgentDetailService {
     }
     // AgentDetailUtils.checkConversationActive(newMessageList, this.data)
     this.data.isConversationActive.value = true;
+    // SSE 进行中先停 ASR/TTS 应用层 ping，降低与 HTTP chunked 并发冲突（尤其 iOS）
+    speechSocketWarmup.pauseKeepaliveForSse();
     this.data.messageList.value = newMessageList;
     // 会话一开始就绑定流式播报目标（不等首包正文），H5/App 均可立刻 begin
     this.data.streamingAssistantMessageId.value = currentMessageId;

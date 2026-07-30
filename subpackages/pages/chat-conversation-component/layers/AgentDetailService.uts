@@ -77,7 +77,11 @@ import {
   apiRestartSandbox,
 } from "@/servers/sandbox";
 import AgentDetailData from "./AgentDetailData.uts";
-import { getCustomBlock } from "@/subpackages/utils/containerHelper.uts";
+import {
+  getCustomBlock,
+  normalizeToolCallProcessingData,
+  upsertToolCallProcessingList,
+} from "@/subpackages/utils/containerHelper.uts";
 import { replaceMathBracket } from "@/utils/markdown.uts";
 import { adaptHistoryMessage } from "@/subpackages/utils/historyMessageAdapter";
 import { createMessageInfoFromAny, messageToJsonObject, readRawField } from "@/subpackages/utils/messageInfoClass.uts";
@@ -1074,43 +1078,11 @@ export default class AgentDetailService {
 
     // 处理不同的事件类型
     if (eventTypeStr == `${ConversationEventTypeEnum.PROCESSING}`) {
-      let processingResult: any = {};
-      const resultVal = readRawField(responseData, "result");
-      if (resultVal != null) {
-        processingResult = resultVal;
-      }
-      const executeIdRaw = readRawField(processingResult, "executeId");
-      // App：executeId 多在 result 内；补到顶层再生成 :::container，避免 getCustomBlock 跳过
-      const blockSource = new UTSJSONObject();
-      const typeTop = readRawField(responseData, "type");
-      const nameTop = readRawField(responseData, "name");
-      const statusTop = readRawField(responseData, "status");
-      if (typeTop != null) {
-        blockSource["type"] = typeTop;
-      }
-      if (nameTop != null) {
-        blockSource["name"] = nameTop;
-      }
-      if (statusTop != null) {
-        blockSource["status"] = statusTop;
-      }
-      if (executeIdRaw != null) {
-        blockSource["executeId"] = executeIdRaw;
-      } else {
-        const execTop = readRawField(responseData, "executeId");
-        if (execTop != null) {
-          blockSource["executeId"] = execTop;
-        }
-      }
-      const nameNested = readRawField(processingResult, "name");
-      if (blockSource["name"] == null && nameNested != null) {
-        blockSource["name"] = nameNested;
-      }
-      const statusNested = readRawField(processingResult, "status");
-      if (blockSource["status"] == null && statusNested != null) {
-        blockSource["status"] = statusNested;
-      }
-      blockSource["result"] = processingResult;
+      // App：executeId/status 多在 result 内；必须提升到顶层，否则：
+      // 1) 容器块只插入一次且 status 停在 EXECUTING
+      // 2) processingList 无法按 executeId 匹配 FINISHED → 卡片一直显示「·」
+      const blockSource = normalizeToolCallProcessingData(responseData);
+      const executeIdRaw = readRawField(blockSource, "executeId");
 
       const accumulatedText = getCustomBlock(
         currentTextSnapshot,
@@ -1128,12 +1100,11 @@ export default class AgentDetailService {
       if (executeIdRaw != null) {
         nmObj["executeId"] = executeIdRaw;
       }
-      const newProcList: any[] = [];
-      for (let opi = 0; opi < oldProcessingList.length; opi++) {
-        newProcList.push(oldProcessingList[opi]);
-      }
-      newProcList.push(responseData);
-      nmObj["processingList"] = newProcList;
+      // 按 executeId upsert，FINISHED/FAILED 覆盖 EXECUTING（对齐 PC）
+      nmObj["processingList"] = upsertToolCallProcessingList(
+        oldProcessingList as any[],
+        blockSource,
+      );
       newMessage = buildMessageInfoFromDraft(nmObj);
 
       // 长任务型任务处理
@@ -2132,9 +2103,11 @@ export default class AgentDetailService {
         const procList = message.processingList as ProcessingInfo[];
         const updatedProcessingList = procList.map(
           (processing: ProcessingInfo): ProcessingInfo => {
-            // 将所有 EXECUTING 状态的工具调用改为 FAILED
-            if (processing.status == ProcessingEnum.EXECUTING) {
-              const pObj = JSON.parse(JSON.stringify(processing)) as UTSJSONObject;
+            // 将所有 EXECUTING 状态的工具调用改为 FAILED（兼容 status 在 result 内）
+            const pObj = normalizeToolCallProcessingData(processing);
+            const statusRaw = readRawField(pObj, "status");
+            const statusStr = statusRaw != null ? `${statusRaw}` : "";
+            if (statusStr == `${ProcessingEnum.EXECUTING}`) {
               pObj["status"] = ProcessingEnum.FAILED;
               return pObj as ProcessingInfo;
             }

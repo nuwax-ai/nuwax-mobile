@@ -216,6 +216,77 @@ function isAbortError(error: any): boolean {
 }
 
 /**
+ * 汇总 errMsg / message / cause.message，便于识别 iOS 嵌套错误文案。
+ */
+function collectRequestErrorText(error: any): string {
+  if (error == null) {
+    return "";
+  }
+  let out = "";
+  try {
+    const obj = error as UTSJSONObject;
+    const errMsg = obj["errMsg"];
+    if (errMsg != null && `${errMsg}`.length > 0) {
+      out = out + `${errMsg} `;
+    }
+    const message = obj["message"];
+    if (message != null && `${message}`.length > 0) {
+      out = out + `${message} `;
+    }
+    const cause = obj["cause"];
+    if (cause != null) {
+      try {
+        const causeObj = cause as UTSJSONObject;
+        const causeMsg = causeObj["message"];
+        if (causeMsg != null && `${causeMsg}`.length > 0) {
+          out = out + `${causeMsg} `;
+        }
+      } catch (_eCause) {
+        // ignore
+      }
+    }
+    const errCode = obj["errCode"];
+    if (errCode != null) {
+      out = out + `errCode=${errCode} `;
+    }
+    const code = obj["code"];
+    if (code != null) {
+      out = out + `code=${code} `;
+    }
+  } catch (_eObj) {
+    // ignore
+  }
+  if (out.length == 0) {
+    out = `${error}`;
+  }
+  return out.toLowerCase();
+}
+
+/**
+ * iOS enableChunked 常见：服务端关连接或录音后短暂断网，fail 报「网络连接已中断」(600003)，
+ * 并不等于业务失败——若已有 chunk / 终态，应软收尾而非 onError 清会话。
+ */
+function isNetworkConnectionLostError(error: any): boolean {
+  const text = collectRequestErrorText(error);
+  if (text.length == 0) {
+    return false;
+  }
+  if (text.indexOf("网络连接已中断") >= 0) {
+    return true;
+  }
+  if (text.indexOf("network connection was lost") >= 0) {
+    return true;
+  }
+  if (text.indexOf("nsurlerrornetworkconnectionlost") >= 0) {
+    return true;
+  }
+  if (text.indexOf("errcode=600003") >= 0 || text.indexOf("code=600003") >= 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * 安全读取错误对象的 message 字段。
  * @param error 捕获到的错误对象
  * @returns 错误信息字符串，无 message 时返回空字符串
@@ -1259,14 +1330,41 @@ export class StreamRequest {
         fail: (err) => {
           this.finalizeCompletedStream();
 
-          if (this.isAborted) {
+          if (this.isAborted || isStreamFinished) {
             return;
           }
 
+          // 忽略超时错误（长连接预期行为）
+          const errMsgText = err.errMsg;
           if (
-            err.errMsg != null &&
-            (err.errMsg.includes("time out") || err.errMsg.includes("timeout"))
+            errMsgText != null &&
+            (errMsgText.includes("time out") || errMsgText.includes("timeout"))
           ) {
+            return;
+          }
+
+          // 已收到 SSE 终态：iOS 关连接常再报「网络连接已中断」，忽略
+          if (this.receivedTerminalMarker == true) {
+            console.warn(
+              "[SSE-APP] ignore fail after terminal marker:",
+              collectRequestErrorText(err),
+            );
+            finishStream();
+            return;
+          }
+
+          // iOS 录音后 / 服务端关连接：常报网络中断。无论是否已有 chunk，
+          // 一律软收尾走 onTimeout（回补），禁止 onError 清空打字机导致空白气泡。
+          if (isNetworkConnectionLostError(err) == true) {
+            console.warn(
+              "[SSE-APP] connection lost soft-close hasChunk=" +
+                hasReceivedChunk +
+                " " +
+                collectRequestErrorText(err),
+            );
+            this.clearTimeoutMonitor();
+            config.onTimeout?.();
+            finishStream();
             return;
           }
 

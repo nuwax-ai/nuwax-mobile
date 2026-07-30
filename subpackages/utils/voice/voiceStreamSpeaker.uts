@@ -15,6 +15,7 @@ import {
   cleanTextForSpeech,
   drainCompleteSentences,
   speakableRawForStreaming,
+  needsFullSpeechClean,
 } from "./textFilter";
 import { ttsWebSocketPlayer } from "./ttsWebSocketPlayer";
 import { audioPlayerManager } from "./audioPlayerManager";
@@ -111,16 +112,50 @@ export class VoiceStreamSpeaker {
    * @param finished 本轮流式输出是否结束
    */
   onStreamChunk(bodyText: string, thinkText: string, finished: boolean): void {
-    if (!this.active) {
+    try {
+      if (!this.active) {
+        return;
+      }
+      const snap = new ChunkSnapshot();
+      snap.bodyText = bodyText;
+      snap.thinkText = thinkText;
+      snap.finished = finished;
+      snap.round = this.round;
+      this.queuedChunk = snap;
+      this.kick();
+    } catch (eChunk) {
+      // 底线：分句/入队异常不得冒泡到 SSE 同步调用栈
+      console.warn("[VoiceStreamSpeaker] onStreamChunk ignored", eChunk);
+    }
+  }
+
+  /**
+   * 工具栏手动播报：已清洗全文 → 分句 → 分段 TTS（禁止整段一次合成）。
+   * @param messageId 消息 id
+   * @param settings 播报设置
+   * @param preparedText 可播报纯文本（建议已是 speakableText）
+   */
+  speakPrepared(
+    messageId: string,
+    settings: VoiceSettings,
+    preparedText: string,
+  ): void {
+    const trimmed = preparedText.trim();
+    if (trimmed.length == 0) {
       return;
     }
-    const snap = new ChunkSnapshot();
-    snap.bodyText = bodyText;
-    snap.thinkText = thinkText;
-    snap.finished = finished;
-    snap.round = this.round;
-    this.queuedChunk = snap;
-    this.kick();
+    const logText = trimmed.split("\r").join("\\r").split("\n").join("\\n");
+    console.log(
+      "[TTS] toolbar.full messageId=" +
+        messageId +
+        " textLen=" +
+        trimmed.length +
+        " text=" +
+        logText,
+    );
+    this.begin(messageId, settings);
+    // finished=true：整段按句/软切分入队，kickPlay 逐段 synthesize
+    this.onStreamChunk(trimmed, "", true);
   }
 
   /** 停止流式播报（会话停止/新轮次/手动停止时调用） */
@@ -312,6 +347,17 @@ export class VoiceStreamSpeaker {
           continue;
         }
         try {
+          const segLog = utt.split("\r").join("\\r").split("\n").join("\\n");
+          console.log(
+            "[TTS] segment.synth messageId=" +
+              this.messageId +
+              " ready=" +
+              ready.length +
+              " textLen=" +
+              utt.length +
+              " text=" +
+              segLog,
+          );
           const src = await ttsWebSocketPlayer.synthesizeToSrc(utt, preserve);
           if (expectedRound != this.round) {
             break;
@@ -390,6 +436,20 @@ export class VoiceStreamSpeaker {
           }
           let src = "";
           try {
+            const firstLog = nextUtt
+              .split("\r")
+              .join("\\r")
+              .split("\n")
+              .join("\\n");
+            console.log(
+              "[TTS] segment.synth messageId=" +
+                this.messageId +
+                " ready=0" +
+                " textLen=" +
+                nextUtt.length +
+                " text=" +
+                firstLog,
+            );
             src = await ttsWebSocketPlayer.synthesizeToSrc(nextUtt, false);
           } catch (eSynth: any) {
             console.warn("[StreamSpeak] synthesize failed, retry once", eSynth);
@@ -403,6 +463,13 @@ export class VoiceStreamSpeaker {
               );
               this.pendingSentences = [];
               this.active = false;
+              this.playLooping = false;
+              // 失败立刻停 TTS，避免工具栏一直转圈
+              try {
+                ttsWebSocketPlayer.stop();
+              } catch (_eStop) {
+                // ignore
+              }
               break;
             }
           }
@@ -515,9 +582,9 @@ export class VoiceStreamSpeaker {
 
   /**
    * 单通道增量处理：全文 → 流式可朗读快照 → 相对上次的增量 → 分句。
-   * source 前缀增长时只清洗增量，避免 SSE 每帧 O(n²) 全量 clean 堵死 Android 主线程。
-   * 终态 flush 也走 speakableRawForStreaming（与流式同一套），避免对整篇工具 HTML
-   * 再跑一遍 clean（Android 上可达数秒，表现为「会话已结束很久才开始播报」）。
+   * 纯中文等无标记正文：前缀增长时只清洗增量，避免 SSE 每帧 O(n²) 全量 clean。
+   * 一旦出现 Markdown / 公式 / 图片 / 未闭合结构：必须全量 clean，
+   * 避免只洗 delta 导致代码/LaTeX/半截 URL 泄漏进播报。
    */
   private drainChannel(
     ch: StreamChannel,
@@ -532,29 +599,32 @@ export class VoiceStreamSpeaker {
     if (source == ch.lastSource && ch.lastSource.length > 0) {
       // agent-info 未闭合等场景：可朗读快照不变，跳过昂贵正则
       speakable = ch.lastSpeakable;
-    } else if (
-      ch.lastSource.length > 0 &&
-      source.length > ch.lastSource.length &&
-      source.indexOf(ch.lastSource) == 0
-    ) {
-      // 前缀增长：只清洗新增段并拼接
-      const rawDelta = source.substring(ch.lastSource.length);
-      const cleanedDelta = cleanTextForSpeech(rawDelta, this.settings, false);
-      speakable = ch.lastSpeakable + cleanedDelta;
-      ch.lastSource = source;
-      ch.lastSpeakable = speakable;
     } else {
-      speakable = cleanTextForSpeech(source, this.settings, true);
+      const prefixGrew =
+        ch.lastSource.length > 0 &&
+        source.length > ch.lastSource.length &&
+        source.indexOf(ch.lastSource) == 0;
+      // 仅当「历史 + 当前」都无需全量清洗时，才走增量
+      const canIncremental =
+        prefixGrew &&
+        needsFullSpeechClean(source) != true &&
+        needsFullSpeechClean(ch.lastSource) != true;
+      if (canIncremental == true) {
+        const rawDelta = source.substring(ch.lastSource.length);
+        const cleanedDelta = cleanTextForSpeech(rawDelta, this.settings, false);
+        speakable = ch.lastSpeakable + cleanedDelta;
+      } else {
+        speakable = cleanTextForSpeech(source, this.settings, true);
+      }
       ch.lastSource = source;
       ch.lastSpeakable = speakable;
     }
 
     if (speakable.length < ch.consumedSpeakable) {
-      // 服务端改写/回退：重置通道，避免增量错位
-      ch.consumedSpeakable = 0;
+      // 新出现代码围栏等导致可朗读文本变短：对齐已消费长度，清空未播 pending（已入队句无法撤回）
+      ch.consumedSpeakable = speakable.length;
       ch.pending = "";
-    }
-    if (speakable.length > ch.consumedSpeakable) {
+    } else if (speakable.length > ch.consumedSpeakable) {
       const delta = speakable.substring(ch.consumedSpeakable);
       ch.consumedSpeakable = speakable.length;
       // 增量已是 speakable 子串，禁止再插空格（中文会被拆成「床 前 明 月」）

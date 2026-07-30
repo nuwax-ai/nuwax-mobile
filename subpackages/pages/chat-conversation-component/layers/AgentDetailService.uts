@@ -87,7 +87,6 @@ import {
 import { t } from "@/utils/i18n";
 import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
 import { buildAssistantSpeakableText } from "@/subpackages/utils/voice/textFilter";
-import { speechSocketWarmup } from "@/subpackages/utils/voice/speechSocketWarmup";
 
 /** 超时回调类型 */
 type TimeoutCallback = any;
@@ -1197,12 +1196,9 @@ export default class AgentDetailService {
 
           const m = cloneMessageInfoDraft(currentMessage);
           m["text"] = accumulatedText;
-          m["status"] = finished
-            ? MessageStatusEnum.Complete
-            : MessageStatusEnum.Incomplete;
-          if (finished == true) {
-            attachSpeakableTextToDraft(m, accumulatedText);
-          }
+          // 中间段 CHAT 也可能带 finished=true，不能标 Complete：
+          // 否则 iOS 软断流后 recover 会因「已 Complete」跳过，气泡停在半截字。
+          m["status"] = MessageStatusEnum.Incomplete;
           newMessage = buildMessageInfoFromDraft(m);
         }
       }
@@ -1495,16 +1491,22 @@ export default class AgentDetailService {
 
   /**
    * 流式异常收尾：冲刷草稿 → 落盘打字机正文 → 清通道 → 回补。
+   * Android 进后台杀 SSE 时常见：此处必须打日志并强制走会话回补，否则半截字停住。
    */
   private finalizeStreamAbnormally(
     isTempChat: boolean,
     streamGen: number,
     onTimeout: NullableTimeoutCallback,
   ): void {
+    console.warn(
+      "[SSE-Stream] finalizeStreamAbnormally gen=" +
+        streamGen.toString() +
+        " temp=" +
+        `${isTempChat}`,
+    );
     this.endStreamListDraft();
     this.sealStreamingAssistantBeforeClear();
     this.clearStreamingAssistantText();
-    speechSocketWarmup.resumeKeepaliveAfterSse();
     this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
     if (onTimeout != null) {
       (onTimeout as () => void)();
@@ -1584,7 +1586,6 @@ export default class AgentDetailService {
     // 先结束会话态（触发 Markdown 终态解析），再清打字机通道，避免中间空白一帧
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
-    speechSocketWarmup.resumeKeepaliveAfterSse();
 
     // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
     if (!isTempChat) {
@@ -1630,8 +1631,8 @@ export default class AgentDetailService {
   }
 
   /**
-   * App：助手气泡仍为 Loading，或正文仍空时，延迟回拉会话详情补正文。
-   * （语音发送后 iOS 常「网络连接已中断」：可能已有 Incomplete 空壳，仅判 Loading 会漏回补）
+   * App：流中断后回拉会话详情补正文。
+   * 语音发送 / 进后台杀连接后常见半截字：只要最后一条助手尚无 finalResult 就回补。
    */
   private scheduleRecoverIfAssistantLoading(
     isTempChat: boolean,
@@ -1651,32 +1652,50 @@ export default class AgentDetailService {
       ) {
         const status = lastForRecover.status;
         const textLen = readMessageText(lastForRecover).trim().length;
+        const noFinal = lastForRecover.finalResult == null;
         if (
-          status == MessageStatusEnum.Loading ||
-          status == MessageStatusEnum.Incomplete ||
-          textLen == 0
+          noFinal == true &&
+          (status == MessageStatusEnum.Loading ||
+            status == MessageStatusEnum.Incomplete ||
+            status == MessageStatusEnum.Complete ||
+            textLen == 0)
         ) {
           needRecover = true;
         }
       }
     }
     if (needRecover != true) {
+      console.warn(
+        "[SSE-Stream] skip recover (no assistant pending finalResult)",
+      );
       return;
     }
     console.warn(
-      "[SSE-Stream] assistant needs resume (loading/incomplete/empty) → schedule",
+      "[SSE-Stream] assistant needs resume after stream interrupt → schedule",
     );
-    setTimeout(() => {
+    const runRecover = (attempt: number): void => {
       if (streamGenAtSchedule != this.streamGeneration) {
         return;
       }
       this.resumeConversationState().then((recovered: boolean) => {
-        if (recovered != true) {
-          return;
+        console.warn(
+          "[SSE-Stream] resume attempt=" +
+            attempt.toString() +
+            " recovered=" +
+            `${recovered}`,
+        );
+        if (recovered == true) {
+          this.schedulePostStreamRecovery(streamGenAtSchedule, 0);
+        } else if (attempt < 1) {
+          setTimeout(() => {
+            runRecover(attempt + 1);
+          }, 2000);
         }
-        this.schedulePostStreamRecovery(streamGenAtSchedule, 0);
       });
-    }, 500);
+    };
+    setTimeout(() => {
+      runRecover(0);
+    }, 400);
     // #endif
   }
 
@@ -1688,21 +1707,32 @@ export default class AgentDetailService {
     attempt: number,
   ): void {
     // #ifdef APP
-    if (attempt >= 5) {
+    // App：流中断后即使当前 inactive，也允许轮询回补（软断流会先把 active=false）
+    if (attempt >= 8) {
       return;
     }
     if (expectedGen != this.streamGeneration) {
-      return;
-    }
-    if (this.data.isConversationActive.value != true) {
       return;
     }
     setTimeout(() => {
       if (expectedGen != this.streamGeneration) {
         return;
       }
-      this.resumeConversationState().then((_ok: boolean) => {
-        if (this.data.isConversationActive.value == true) {
+      this.resumeConversationState().then((ok: boolean) => {
+        // 后端仍 EXECUTING 或本地仍缺 finalResult 时继续拍
+        const list = this.data.messageList.value;
+        let stillPending = this.data.isConversationActive.value == true;
+        if (list.length > 0) {
+          const last = list[list.length - 1];
+          if (
+            last != null &&
+            last.messageType == MessageTypeEnum.ASSISTANT &&
+            last.finalResult == null
+          ) {
+            stillPending = true;
+          }
+        }
+        if (stillPending == true && (ok == true || attempt < 3)) {
           this.schedulePostStreamRecovery(expectedGen, attempt + 1);
         }
       });
@@ -1739,7 +1769,6 @@ export default class AgentDetailService {
     this.persistLastAssistantSpeakableText(stopSpeakBody);
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
-    speechSocketWarmup.resumeKeepaliveAfterSse();
 
     // 会话消息请求ID
     const requestId = this.data.currentConversationRequestId.value;
@@ -2061,12 +2090,14 @@ export default class AgentDetailService {
     const isStoppingConversation = this.data.isStoppingConversation.value;
 
     // 4. 异常中断检测
-    // 条件：最后一条助手消息状态为 Loading/Incomplete 且无 finalResult
+    // 条件：最后一条助手尚无 finalResult，且本地 SSE 已停
+    // （含 Incomplete / 被误标 Complete 的半截字，进后台杀流常见）
     const isAbnormalInterruption =
       lastAssistantMessage != null &&
+      lastAssistantMessage.finalResult == null &&
       (lastAssistantMessage.status == MessageStatusEnum.Loading ||
-        lastAssistantMessage.status == MessageStatusEnum.Incomplete) &&
-      lastAssistantMessage.finalResult == null;
+        lastAssistantMessage.status == MessageStatusEnum.Incomplete ||
+        lastAssistantMessage.status == MessageStatusEnum.Complete);
 
     // 5. 如果用户正在主动停止，不是异常中断
     if (isStoppingConversation) {
@@ -2290,8 +2321,6 @@ export default class AgentDetailService {
     }
     // AgentDetailUtils.checkConversationActive(newMessageList, this.data)
     this.data.isConversationActive.value = true;
-    // SSE 进行中先停 ASR/TTS 应用层 ping，降低与 HTTP chunked 并发冲突（尤其 iOS）
-    speechSocketWarmup.pauseKeepaliveForSse();
     this.data.messageList.value = newMessageList;
     // 会话一开始就绑定流式播报目标（不等首包正文），H5/App 均可立刻 begin
     this.data.streamingAssistantMessageId.value = currentMessageId;

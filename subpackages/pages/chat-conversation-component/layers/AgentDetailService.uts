@@ -1701,7 +1701,7 @@ export default class AgentDetailService {
 
   /**
    * 订阅 sub 流恢复 EXECUTING 会话的流式输出（刷新/重进/断流回补时重建执行中的助手消息）。
-   * reload 历史 → 收到首个有效事件后追加 assistant 占位 → StreamRequest GET sub → 复用 handleChangeMessageList。
+   * reload 历史 → 优先复用最后一条助手气泡（避免「历史一条 + 占位一条」双气泡）→ GET sub。
    * onSubClose: sub 关闭（完成/错误/超时）时回调，页面据此恢复轮询。
    */
   async handleSubConversation(
@@ -1720,11 +1720,14 @@ export default class AgentDetailService {
     this.abortSubConversation();
     this.isSubscribed = true;
 
-    const currentMessageId = generateUniqueId();
-    let hasCreatedPlaceholder = false;
+    // 可变：复用历史助手时会改成已有 id
+    let targetMessageId = generateUniqueId();
+    let hasBoundTarget = false;
+    /** 仅当新建了空占位时，cleanup 才允许删掉空泡 */
+    let createdNewPlaceholder = false;
 
     const removeEmptyPlaceholder = (): void => {
-      if (!hasCreatedPlaceholder) {
+      if (!createdNewPlaceholder) {
         return;
       }
       const list = this.data.messageList.value;
@@ -1743,7 +1746,7 @@ export default class AgentDetailService {
           (message.processingList as any[]).length == 0;
         const noFinal = message.finalResult == null;
         if (
-          message.id == currentMessageId &&
+          message.id == targetMessageId &&
           textEmpty &&
           thinkEmpty &&
           processingEmpty &&
@@ -1831,19 +1834,61 @@ export default class AgentDetailService {
       return;
     }
 
-    // 2. 延迟创建占位：空 sub 流不会向列表留下空消息
+    /**
+     * 绑定 sub 写入目标：
+     * - 最后一条已是助手 → 复用该气泡（清空正文供 sub 重放，避免双气泡 / 增量叠字）
+     * - 最后一条是用户或空列表 → 新建占位
+     */
     const ensurePlaceholder = (): void => {
-      if (hasCreatedPlaceholder) {
+      if (hasBoundTarget) {
         return;
       }
-      hasCreatedPlaceholder = true;
+      hasBoundTarget = true;
+      const list = this.data.messageList.value;
+      if (list.length > 0) {
+        const last = list[list.length - 1];
+        if (
+          last != null &&
+          last.messageType == MessageTypeEnum.ASSISTANT
+        ) {
+          let reuseId = targetMessageId;
+          if (last.id != null && `${last.id}`.length > 0) {
+            reuseId = `${last.id}`;
+          }
+          targetMessageId = reuseId;
+          // 清空后按空泡重放：sub 的 MESSAGE 是 delta，叠在已有全文上会变成「两条内容糊在一起」
+          const draft = messageToJsonObject(last);
+          draft["text"] = "";
+          draft["think"] = "";
+          draft["status"] = MessageStatusEnum.Loading;
+          draft["finalResult"] = null;
+          const resetMsg = createMessageInfoFromAny(draft);
+          if (resetMsg != null) {
+            const next: MessageInfo[] = [];
+            for (let i = 0; i < list.length - 1; i++) {
+              next.push(list[i]);
+            }
+            next.push(resetMsg);
+            this.data.messageList.value = next;
+          }
+          this.data.messageIdRef.value = targetMessageId;
+          this.data.streamingAssistantMessageId.value = targetMessageId;
+          this.data.streamingAssistantText.value = "";
+          console.log(
+            "[VoiceSSE] sub.reuseAssistant id=" + targetMessageId,
+          );
+          return;
+        }
+      }
+
+      createdNewPlaceholder = true;
       const placeholderObj: UTSJSONObject = {
         role: AssistantRoleEnum.ASSISTANT,
         type: MessageModeEnum.CHAT,
         text: "",
         think: "",
         time: new Date().toISOString(),
-        id: currentMessageId,
+        id: targetMessageId,
         messageType: MessageTypeEnum.ASSISTANT,
         status: MessageStatusEnum.Loading,
       };
@@ -1852,15 +1897,17 @@ export default class AgentDetailService {
         return;
       }
       const next: MessageInfo[] = [];
-      const list = this.data.messageList.value;
       for (let i = 0; i < list.length; i++) {
         next.push(list[i]);
       }
       next.push(placeholder);
       this.data.messageList.value = next;
-      this.data.messageIdRef.value = currentMessageId;
-      this.data.streamingAssistantMessageId.value = currentMessageId;
+      this.data.messageIdRef.value = targetMessageId;
+      this.data.streamingAssistantMessageId.value = targetMessageId;
       this.data.streamingAssistantText.value = "";
+      console.log(
+        "[VoiceSSE] sub.newPlaceholder id=" + targetMessageId,
+      );
     };
 
     // 3. 订阅 sub（GET SSE）
@@ -1900,7 +1947,7 @@ export default class AgentDetailService {
           return;
         }
         ensurePlaceholder();
-        this.handleChangeMessageList(resultObj, currentMessageId);
+        this.handleChangeMessageList(resultObj, targetMessageId);
         const eventTypeRaw = readRawField(resultObj, "eventType");
         const eventTypeStr =
           eventTypeRaw != null ? `${eventTypeRaw}` : "";

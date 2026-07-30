@@ -171,9 +171,10 @@ export function speakableRawForStreaming(raw: string): string {
 }
 
 /**
- * 是否可能含 Markdown / HTML 标记（无则走空白规整快路径）。
+ * 是否可能含 Markdown / HTML / 公式标记（无则走空白规整快路径）。
+ * 流式 TTS 增量路径也用它：有标记时必须全量 clean，禁止只洗 delta。
  */
-function looksLikeMarkup(raw: string): boolean {
+export function looksLikeMarkup(raw: string): boolean {
   return (
     raw.indexOf("<") >= 0 ||
     raw.indexOf("`") >= 0 ||
@@ -185,8 +186,202 @@ function looksLikeMarkup(raw: string): boolean {
     raw.indexOf("|") >= 0 ||
     raw.indexOf(">") >= 0 ||
     raw.indexOf("~") >= 0 ||
+    raw.indexOf("$") >= 0 ||
+    raw.indexOf("\\") >= 0 ||
     raw.indexOf(":::") >= 0
   );
+}
+
+/**
+ * 是否含未闭合的 Markdown 代码围栏（``` 出现奇数次）。
+ */
+export function hasUnclosedCodeFence(raw: string): boolean {
+  if (raw.indexOf("```") < 0) {
+    return false;
+  }
+  let count = 0;
+  let from = 0;
+  while (from < raw.length) {
+    const idx = raw.indexOf("```", from);
+    if (idx < 0) {
+      break;
+    }
+    count += 1;
+    from = idx + 3;
+  }
+  return count % 2 == 1;
+}
+
+/**
+ * 是否含未闭合块级公式（$$ / \[ / \(）。
+ * 未闭合时后续 LaTeX 正文会像代码一样泄漏进增量播报。
+ */
+export function hasUnclosedMath(raw: string): boolean {
+  if (raw.length == 0) {
+    return false;
+  }
+  // $$ 奇数次
+  let dollarBlock = 0;
+  let from = 0;
+  while (from < raw.length) {
+    const idx = raw.indexOf("$$", from);
+    if (idx < 0) {
+      break;
+    }
+    dollarBlock += 1;
+    from = idx + 2;
+  }
+  if (dollarBlock % 2 == 1) {
+    return true;
+  }
+  // \[ 多于 \]
+  let openBracket = 0;
+  let closeBracket = 0;
+  from = 0;
+  while (from < raw.length) {
+    const idx = raw.indexOf("\\[", from);
+    if (idx < 0) {
+      break;
+    }
+    openBracket += 1;
+    from = idx + 2;
+  }
+  from = 0;
+  while (from < raw.length) {
+    const idx = raw.indexOf("\\]", from);
+    if (idx < 0) {
+      break;
+    }
+    closeBracket += 1;
+    from = idx + 2;
+  }
+  if (openBracket > closeBracket) {
+    return true;
+  }
+  // \( 多于 \)
+  let openParen = 0;
+  let closeParen = 0;
+  from = 0;
+  while (from < raw.length) {
+    const idx = raw.indexOf("\\(", from);
+    if (idx < 0) {
+      break;
+    }
+    openParen += 1;
+    from = idx + 2;
+  }
+  from = 0;
+  while (from < raw.length) {
+    const idx = raw.indexOf("\\)", from);
+    if (idx < 0) {
+      break;
+    }
+    closeParen += 1;
+    from = idx + 2;
+  }
+  return openParen > closeParen;
+}
+
+/**
+ * 是否含未闭合 Markdown 图片 `![...](...`。
+ */
+export function hasUnclosedImage(raw: string): boolean {
+  const start = raw.lastIndexOf("![");
+  if (start < 0) {
+    return false;
+  }
+  const after = raw.substring(start);
+  // 完整形：![alt](url)
+  if (/^!\[[^\]]*\]\([^)]*\)/.test(after) == true) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 流式 TTS：出现结构标记或未闭合结构时必须全量 clean。
+ */
+export function needsFullSpeechClean(raw: string): boolean {
+  if (looksLikeMarkup(raw) == true) {
+    return true;
+  }
+  if (hasUnclosedCodeFence(raw) == true) {
+    return true;
+  }
+  if (hasUnclosedMath(raw) == true) {
+    return true;
+  }
+  if (hasUnclosedImage(raw) == true) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 剥离数学公式（块级 / 行内），避免朗读 LaTeX。
+ * 货币 `$100`：单 $ 后紧跟数字时保留，不当作公式。
+ */
+function stripMathForSpeech(text: string): string {
+  let out = text;
+  // 块级 $$...$$（含未闭合到文末）
+  out = out.replace(/\$\$[\s\S]*?\$\$/g, " ");
+  out = out.replace(/\$\$[\s\S]*$/g, " ");
+  // \[...\] / \(...\)（含未闭合）
+  out = out.replace(/\\\[[\s\S]*?\\\]/g, " ");
+  out = out.replace(/\\\[[\s\S]*$/g, " ");
+  out = out.replace(/\\\([\s\S]*?\\\)/g, " ");
+  out = out.replace(/\\\([\s\S]*$/g, " ");
+  // 行内 $...$：跳过 $123 / $1,234.56 货币形态
+  let result = "";
+  let i = 0;
+  while (i < out.length) {
+    if (out.charAt(i) != "$") {
+      result = result + out.charAt(i);
+      i += 1;
+      continue;
+    }
+    // 货币：$ + 数字
+    if (i + 1 < out.length) {
+      const next = out.charAt(i + 1);
+      if (next >= "0" && next <= "9") {
+        result = result + "$";
+        i += 1;
+        continue;
+      }
+    }
+    // 寻找闭合 $
+    const close = out.indexOf("$", i + 1);
+    if (close < 0 || close == i + 1) {
+      // 未闭合或空：丢掉起始 $，避免朗读美元符碎片
+      i += 1;
+      continue;
+    }
+    // 中间含换行则不当行内公式（可能是半截块）
+    const inner = out.substring(i + 1, close);
+    if (inner.indexOf("\n") >= 0) {
+      result = result + "$";
+      i += 1;
+      continue;
+    }
+    // 跳过整段 $...$（不朗读公式内容）
+    i = close + 1;
+  }
+  return result;
+}
+
+/**
+ * 剥离图片语法；未闭合的 `![` 截断到开标记前，避免读半截 URL。
+ */
+function stripImagesForSpeech(text: string): string {
+  let out = text.replace(/!\[[^\]]*\]\([^)]*\)/g, " ");
+  // 未闭合：![... 或 ![...](... 
+  out = out.replace(/!\[[^\]]*\]\([^)]*$/g, " ");
+  out = out.replace(/!\[[^\]]*$/g, " ");
+  const dangling = out.indexOf("![");
+  if (dangling >= 0) {
+    out = out.substring(0, dangling);
+  }
+  return out;
 }
 
 /**
@@ -239,8 +434,11 @@ export function cleanTextForSpeech(
     text = text.replace(/`[^`\n]*`/g, " ");
   }
 
-  // 3. 图片 ![alt](url) —— 不可朗读，直接移除
-  text = text.replace(/!\[[^\]]*\]\([^)]*\)/g, " ");
+  // 3. 图片 ![alt](url)（含流式未闭合，截断到 ![ 前）
+  text = stripImagesForSpeech(text);
+
+  // 3.5 数学公式（$$ / \[ \] / \( \) / 行内 $...$；保留 $100 货币）
+  text = stripMathForSpeech(text);
 
   // 4. 链接 [text](url)
   if (opts.includeLinkUrl) {
@@ -259,8 +457,8 @@ export function cleanTextForSpeech(
   text = text.replace(/(?:^|\n)[|:\- \t]+-{2,}[|:\- \t]*(?=\n|$)/g, "\n");
   text = text.replace(/\|/g, "，");
 
-  // 7. 标题 / 引用 / 列表标记
-  text = text.replace(/(?:^|\n)#{1,6}[ \t]+/g, "\n");
+  // 7. 标题 / 引用 / 列表标记（模型常输出 ##标题 无空格，不能强制要求空白）
+  text = text.replace(/(?:^|\n)#{1,6}(?=[ \t]|$|[^#\s])/g, "\n");
   text = text.replace(/(?:^|\n)[ \t]*>[ \t]?/g, "\n");
   text = text.replace(/(?:^|\n)[ \t]*[-*+][ \t]+/g, "\n");
   text = text.replace(/(?:^|\n)[ \t]*\d+\.[ \t]+/g, "\n");
@@ -270,6 +468,10 @@ export function cleanTextForSpeech(
   text = text.replace(/\*([^*\n]+)\*/g, "$1");
   text = text.replace(/__([^_]+)__/g, "$1");
   text = text.replace(/~~([^~]+)~~/g, "$1");
+  // 流式未闭合的 ** / __ / ~~ 残留，勿朗读（保留单个 * 以免误伤乘号）
+  text = text.replace(/\*\*/g, "");
+  text = text.replace(/__/g, "");
+  text = text.replace(/~~/g, "");
 
   // 9. emoji
   if (!opts.keepEmoji) {

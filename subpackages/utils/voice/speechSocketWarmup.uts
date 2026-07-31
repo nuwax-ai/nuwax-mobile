@@ -1,39 +1,129 @@
 /**
- * 会话页语音 Socket 预热：进入页面预连 ASR/TTS，离开才断开。
+ * 会话页语音 Socket 预热：进入页面预连 ASR/TTS，离开才彻底断开。
  *
- * 页内约定（强制）：
- * - 录音成功/失败、播报 stall/fail/stop、abort 等业务路径一律不断连
- * - 连接 open 后持续应用层心跳（即便服务端 UNKNOWN_TYPE(ping)，仍继续发以保活网关）
- * - SSE 与 ASR/TTS 心跳互不干扰：心跳全程开启，UNKNOWN_TYPE 只记日志，绝不 abort chat / 清渲染
- * - 仅对端/网关掐断时补连；仅 unmount teardown 时主动 close
- *
- * 注意：不要在短暂 onHide（权限弹窗等）里 teardown。
+ * 前后台（H5 / App / 微信小程序，统一经 usePageResume）：
+ * - 真实进后台 ≥30s：断开 ASR/TTS
+ * - 回前台：取消待断开；若已断开则重连
+ * - 相册/权限等 pageSystemOverlay 活跃时：不挂起、不断开
  */
 import { asrWebSocketClient } from "./asrWebSocketClient";
 import { ttsWebSocketPlayer } from "./ttsWebSocketPlayer";
+import { stopAllSpeechPlayback } from "./stopAllSpeechPlayback";
+import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
+
+/** 真实进后台后延迟断开（ms） */
+export const SPEECH_BACKGROUND_SUSPEND_DELAY_MS = 30000;
 
 export class SpeechSocketWarmup {
+  /** 会话页仍挂载（onMounted～onUnmounted） */
   private active: boolean = false;
+  /** 已因进后台断开，回前台需重连 */
+  private suspended: boolean = false;
+  private suspendTimerId: number | null = null;
 
   /** 是否处于页面预热生命周期内 */
   isActive(): boolean {
     return this.active;
   }
 
-  /** 进入会话页：预连 ASR + TTS（失败仅打日志，业务侧 ensure 会重试） */
+  /** 是否因进后台已断开预热连接 */
+  isSuspended(): boolean {
+    return this.suspended;
+  }
+
+  /** 进入会话页：预连 ASR + TTS */
   warmup(): void {
+    this.cancelPendingSuspend();
     this.active = true;
+    this.suspended = false;
+    asrWebSocketClient.enableWarmupAndConnect();
+    ttsWebSocketPlayer.enableWarmupAndConnect();
+  }
+
+  /**
+   * 真实进后台：延迟断开 ASR/TTS。
+   * overlay（相册/权限）期间调用会被忽略并取消待断开。
+   */
+  suspendForBackground(
+    delayMs: number = SPEECH_BACKGROUND_SUSPEND_DELAY_MS,
+  ): void {
+    if (this.active != true) {
+      return;
+    }
+    if (pageSystemOverlay.isActive() == true) {
+      this.cancelPendingSuspend();
+      return;
+    }
+    this.cancelPendingSuspend();
+    let wait = delayMs;
+    if (wait < 0) {
+      wait = 0;
+    }
+    this.suspendTimerId = setTimeout((): void => {
+      this.suspendTimerId = null;
+      if (pageSystemOverlay.isActive() == true) {
+        return;
+      }
+      this.disconnectForBackground();
+    }, wait) as number;
+  }
+
+  /**
+   * overlay hide 时调用：确保不会在相册/权限期间误断开。
+   */
+  cancelPendingBackgroundSuspend(_reason: string = "overlay-hide"): void {
+    this.cancelPendingSuspend();
+  }
+
+  /**
+   * 回前台：取消待断开；若已 suspend 则重连；
+   * 无论是否曾挂起都 ensure 一次（防系统在后台静默杀连 / 长相册回收）。
+   */
+  resumeFromBackground(): void {
+    this.cancelPendingSuspend();
+    if (this.active != true) {
+      return;
+    }
+    this.suspended = false;
     asrWebSocketClient.enableWarmupAndConnect();
     ttsWebSocketPlayer.enableWarmupAndConnect();
   }
 
   /** 离开会话页（unmount）：停止预热并断开 */
   teardown(): void {
+    this.cancelPendingSuspend();
     this.active = false;
+    this.suspended = false;
+    asrWebSocketClient.disableWarmupAndDisconnect();
+    ttsWebSocketPlayer.disableWarmupAndDisconnect();
+  }
+
+  private cancelPendingSuspend(): void {
+    const timerId = this.suspendTimerId;
+    if (timerId != null) {
+      clearTimeout(timerId);
+      this.suspendTimerId = null;
+    }
+  }
+
+  /** 延迟到期：停播报并断开预热/业务 socket（页仍挂载） */
+  private disconnectForBackground(): void {
+    if (this.active != true) {
+      return;
+    }
+    if (this.suspended == true) {
+      return;
+    }
+    this.suspended = true;
+    try {
+      stopAllSpeechPlayback();
+    } catch (_eStop) {
+      // ignore
+    }
     asrWebSocketClient.disableWarmupAndDisconnect();
     ttsWebSocketPlayer.disableWarmupAndDisconnect();
   }
 }
 
-/** 全局单例：会话页 mount/unmount 调用 */
+/** 全局单例：会话页 mount/unmount / 前后台 调用 */
 export const speechSocketWarmup = new SpeechSocketWarmup();

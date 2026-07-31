@@ -401,7 +401,8 @@
   import { ttsWebSocketPlayer } from "@/subpackages/utils/voice/ttsWebSocketPlayer";
   import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
   import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
-  import { speechSocketWarmup } from "@/subpackages/utils/voice/speechSocketWarmup";
+  import { speechSocketWarmup, SPEECH_BACKGROUND_SUSPEND_DELAY_MS } from "@/subpackages/utils/voice/speechSocketWarmup";
+  import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
   import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
   import {
     loadVoiceSettings,
@@ -1057,6 +1058,15 @@
   /** 最近一次 SSE 喂入的正文 / 消息 id（结束冲刷尾句用） */
   let feedSpeakBodyText: string = "";
   let feedSpeakMsgId: string = "";
+  /**
+   * 硬停止后为 false：忽略 abort/seal 迟到的 streamSpeakFeed，避免停会话后又 begin 播报，
+   * 导致工具栏一直 isSpeaking。发新消息前须 resumeStreamSpeakAllowance()。
+   */
+  let streamSpeakAllowed: boolean = true;
+
+  function resumeStreamSpeakAllowance(): void {
+    streamSpeakAllowed = true;
+  }
 
   function stopAllStreamSpeech(hardStop: boolean): void {
     headlessStreamSpeakId = "";
@@ -1064,6 +1074,7 @@
     feedSpeakBodyText = "";
     feedSpeakMsgId = "";
     if (hardStop == true) {
+      streamSpeakAllowed = false;
       stopAllSpeechPlayback();
     } else {
       // 正常结束：冲刷尾句，已入队音频继续播完
@@ -1089,6 +1100,9 @@
   ): void {
     if (voiceConversationEnabled.value == true) {
       // 面板已接管，避免双重 begin
+      return;
+    }
+    if (streamSpeakAllowed != true) {
       return;
     }
     // 本轮已在播：只同步 tracking id，禁止二次 begin（会 stop 清队列，长 SSE 只剩一句）
@@ -1143,6 +1157,9 @@
     if (voiceConversationEnabled.value == true) {
       return;
     }
+    if (streamSpeakAllowed != true) {
+      return;
+    }
     const body = bodyText.length > 0 ? bodyText : feedSpeakBodyText;
     if (headlessStreamSpeakId.length == 0) {
       if (voiceStreamSpeaker.isBusy() == true) {
@@ -1187,6 +1204,9 @@
    */
   function handleStreamSpeakFeed(data: any): void {
     if (voiceConversationEnabled.value == true) {
+      return;
+    }
+    if (streamSpeakAllowed != true) {
       return;
     }
     if (data == null) {
@@ -1787,6 +1807,7 @@
     });
     // 发送手势同步链路内开启本轮流式播报（空正文，禁止回放上一条）
     // H5 需用户手势解锁音频；真实正文由 streamSpeakFeed 喂入
+    resumeStreamSpeakAllowance();
     const newSpeakId = streamingAssistantMessageId.value;
     if (newSpeakId.length > 0) {
       ensureHeadlessStreamSpeak(newSpeakId, "");
@@ -2228,37 +2249,67 @@
   }
 
   // 使用页面唤醒检测 Hook
-  // 注意：H5 环境会自动监听 visibilitychange
-  // 小程序环境需要配合 App.uvue 的 onShow 使用
+  // H5: visibilitychange；App/小程序: 页面 onShow/onHide → triggerHide/Resume
+  // 真实后台 ≥30s 断 ASR/TTS；相册/权限等 overlay 不断连
+  function onChatPageResume(): void {
+    // 长隐藏后的会话恢复；系统相册/权限等触发的 hide 不跑
+    if (pageSystemOverlay.wasLastShowReal() == true) {
+      handleSessionResume();
+    }
+  }
+  function onChatPageForeground(): void {
+    const realShow = pageSystemOverlay.noteShow();
+    speechSocketWarmup.resumeFromBackground();
+    if (realShow == true) {
+      resumeConversationPolling();
+    }
+  }
+  function onChatPageHide(): void {
+    if (pageSystemOverlay.noteHide() != true) {
+      speechSocketWarmup.cancelPendingBackgroundSuspend("chat-onHide-overlay");
+    } else {
+      pauseConversationPolling();
+      speechSocketWarmup.suspendForBackground(SPEECH_BACKGROUND_SUSPEND_DELAY_MS);
+    }
+  }
   const pageResumeOptions = new PageResumeOptions();
-  pageResumeOptions.onResume = (): void => {
-    // 回到前台：若预热已断（系统杀连接），静默补连；勿在 onHide 里 teardown
-    // （录音权限弹窗等也会触发 onHide，误断会导致点击时再次 connectSocket）
-    speechSocketWarmup.warmup();
-    // 异步恢复逻辑包装为同步回调，避免 Promise 类型不匹配
-    handleSessionResume();
-  };
-  pageResumeOptions.onHide = (): void => {
-    // 页面进入后台：暂停会话状态轮询（sub 流保持，由 StreamRequest 超时控制）
-    // 短暂 hide 仍保留语音预热连接
-    pauseConversationPolling();
-  };
-  pageResumeOptions.minHiddenDuration = 5000;
+  pageResumeOptions.onResume = onChatPageResume;
+  pageResumeOptions.onForeground = onChatPageForeground;
+  pageResumeOptions.onHide = onChatPageHide;
+  pageResumeOptions.minHiddenDuration = SPEECH_BACKGROUND_SUSPEND_DELAY_MS;
   const pageResumeResult = usePageResume(pageResumeOptions);
   const isPageHidden = pageResumeResult.isHidden;
-  const triggerResume = pageResumeResult.triggerResume;
-  const triggerHide = pageResumeResult.triggerHide;
 
-  // 小程序/App：组件内只管轮询启停（triggerResume/Hide 由父页 agent-detail 经 expose 调用，
-  // 避免 UTS 嵌套回调引用局部 const 报 error18；也避免与父页 onShow/onHide 双重触发 resume）
-  // #ifndef H5
+  /**
+   * UTS error18：onHide/onShow 嵌套回调不能引用同作用域 const。
+   * Android/Kotlin 类属性函数用 .invoke()；iOS/H5/小程序直接 () 调用。
+   */
+  function invokeTriggerHide(): void {
+    // #ifdef APP-ANDROID
+    pageResumeResult.triggerHide.invoke();
+    // #endif
+    // #ifndef APP-ANDROID
+    pageResumeResult.triggerHide();
+    // #endif
+  }
+  function invokeTriggerResume(): void {
+    // #ifdef APP-ANDROID
+    pageResumeResult.triggerResume.invoke();
+    // #endif
+    // #ifndef APP-ANDROID
+    pageResumeResult.triggerResume();
+    // #endif
+  }
+
+  // App/小程序：统一走 triggerHide/Resume（与 pageResume 回调同一条链路）
+  // H5/WEB 只靠 visibilitychange，避免与页面 onShow/onHide 双触发
+  // #ifndef H5 || WEB
   onHide((): void => {
-    pauseConversationPolling();
+    invokeTriggerHide();
   });
 
   onShow((): void => {
-    // 短切后台（< minHiddenDuration）不触发 handleSessionResume，但仍需恢复轮询
-    resumeConversationPolling();
+    invokeTriggerResume();
   });
   // #endif
 
@@ -2990,8 +3041,8 @@
   };
 
   defineExpose({
-    triggerResume: triggerResume as any,
-    triggerHide: triggerHide as any,
+    triggerResume: invokeTriggerResume as any,
+    triggerHide: invokeTriggerHide as any,
     getAgentInfo: exposedGetAgentInfo as any,
   });
 </script>

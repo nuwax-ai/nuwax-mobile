@@ -40,6 +40,7 @@
     type UploadProgress
   } from '@/servers/audioUploader'
   import { MicrophonePermissionHelper, type PermissionState } from '@/utils/permissionHelper'
+  import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   // #ifdef APP
   import {
@@ -165,6 +166,10 @@
   // #ifdef APP
   /** App：ASR 会话已 begin，等待 asr_ready / 结果 */
   let asrSessionActive: boolean = false
+  /** App：本轮已收到 asr_ready（可推 PCM） */
+  let asrReadyForSession: boolean = false
+  /** App：松手时 ASR 尚未 ready，暂存录音路径，ready 后再推流 */
+  let pendingAsrFilePath: string = ""
   /** App：已发 stop，等待 asr_result */
   let asrWaitingResult: boolean = false
   // #endif
@@ -255,6 +260,8 @@
     isTapped.value = false
     // #ifdef APP
     asrWaitingResult = false
+    asrReadyForSession = false
+    pendingAsrFilePath = ""
     // #endif
   }
 
@@ -327,6 +334,10 @@
       rawError = `${err}`;
     }
     console.error("[VoiceRecord] recorder error message=" + readErrorMessage(err, "") + " raw=" + rawError);
+    // iOS 首次权限等：若仍挂着 overlay 则释放（depth=0 时 end 为空操作）
+    if (pageSystemOverlay.isActive() == true) {
+      pageSystemOverlay.end();
+    }
     // #ifdef APP
     asrWebSocketClient.abort()
     asrSessionActive = false
@@ -370,42 +381,7 @@
     handleRecordError(new Error(message.length > 0 ? message : t("Mobile.Voice.recordFailed")))
   }
 
-  /** App：ASR ready 后开始本地 PCM 录音 */
-  function startAppRecorderAfterAsrReady(): void {
-    if (ignoreNextStopResult) {
-      asrWebSocketClient.abort()
-      asrSessionActive = false
-      resetState()
-      emit("onRecordCancel")
-      return
-    }
-    try {
-      callRecorderStart()
-    } catch (error: any) {
-      asrWebSocketClient.abort()
-      asrSessionActive = false
-      handleRecordError(error)
-    }
-  }
-
-  /** App：按下后先连 ASR，再录音 */
-  function beginAppAsrSession(): void {
-    asrSessionActive = true
-    asrWaitingResult = false
-    asrWebSocketClient.begin(
-      () => {
-        startAppRecorderAfterAsrReady()
-      },
-      (text: string, ok: boolean, errorMessage: string) => {
-        handleAsrResult(text, ok, errorMessage)
-      },
-      (message: string) => {
-        handleAsrError(message)
-      },
-    )
-  }
-
-  /** App：录音文件就绪后切帧推送并 finish（等每块 send success 后再 stop） */
+  /** App：录音文件就绪后切帧推送并 finish（须在 beginAppAsrSession 之前定义，避免 UTS error18） */
   function pushRecordedFileThenFinish(tempFilePath: string): void {
     currentState.value = "uploading"
     streamLocalAudioFileToAsr(
@@ -425,6 +401,34 @@
           asrSessionActive = false
           handleRecordError(new Error(t("Mobile.AudioUploader.fileEmpty")))
         }
+      },
+    )
+  }
+
+  /**
+   * App：按下后并行发起 ASR start（等 asr_ready）。
+   * 本地录音不再等 ready——PCM 在松手后才推流，开录可与 WS RTT 并行。
+   */
+  function beginAppAsrSession(): void {
+    asrSessionActive = true
+    asrWaitingResult = false
+    asrReadyForSession = false
+    pendingAsrFilePath = ""
+    asrWebSocketClient.begin(
+      () => {
+        asrReadyForSession = true
+        // 松手过早：录音已结束，ready 后再推流
+        if (pendingAsrFilePath.length > 0) {
+          const path = pendingAsrFilePath
+          pendingAsrFilePath = ""
+          pushRecordedFileThenFinish(path)
+        }
+      },
+      (text: string, ok: boolean, errorMessage: string) => {
+        handleAsrResult(text, ok, errorMessage)
+      },
+      (message: string) => {
+        handleAsrError(message)
       },
     )
   }
@@ -564,13 +568,17 @@
         resolve(true);
         return;
       }
+      // 系统权限弹窗会 onHide：标记 overlay
+      pageSystemOverlay.begin("android.recordPermission", true);
       UTSAndroid.requestSystemPermission(
         activity,
         permissionCheck,
         (allGranted: boolean, _granted: string[]) => {
+          pageSystemOverlay.end();
           resolve(allGranted);
         },
         (_doNotAskAgain: boolean, _denied: string[]) => {
+          pageSystemOverlay.end();
           resolve(false);
         },
       );
@@ -585,7 +593,9 @@
     if (authSetting.microphoneAuthorized == "denied") {
       return false;
     }
-    // not determined：首次录音时系统弹窗
+    // not determined：start 时系统才弹窗，可能触发 onHide。
+    // endOnNextShow 兜底；无 hide 的应用内弹窗则在 onStart/onError 里 end。
+    pageSystemOverlay.begin("ios.recordPermission", true);
     return true;
     // #endif
 
@@ -598,10 +608,17 @@
             resolve(true);
             return;
           }
+          pageSystemOverlay.begin("mp.authorize.record");
           uni.authorize({
             scope: "scope.record",
-            success: () => resolve(true),
-            fail: () => resolve(false),
+            success: () => {
+              pageSystemOverlay.end();
+              resolve(true);
+            },
+            fail: () => {
+              pageSystemOverlay.end();
+              resolve(false);
+            },
           });
         },
         fail: () => resolve(false),
@@ -610,7 +627,12 @@
     // #endif
 
     // #ifdef H5 || WEB
-    return await MicrophonePermissionHelper.ensure(false);
+    pageSystemOverlay.begin("h5.micPermission");
+    try {
+      return await MicrophonePermissionHelper.ensure(false);
+    } finally {
+      pageSystemOverlay.end();
+    }
     // #endif
 
     return true;
@@ -621,14 +643,21 @@
     const activity = UTSAndroid.getUniActivity();
     if (activity != null) {
       const permissionNeed = ["android.permission.RECORD_AUDIO"] as string[];
+      pageSystemOverlay.begin("android.permissionSettings", true);
       UTSAndroid.gotoSystemPermissionActivity(activity, permissionNeed);
     }
     // #endif
     // #ifdef APP-IOS
+    pageSystemOverlay.begin("ios.authorizeSetting", true);
     uni.openAppAuthorizeSetting({});
     // #endif
     // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
-    uni.openSetting({});
+    pageSystemOverlay.begin("mp.openSetting");
+    uni.openSetting({
+      complete: () => {
+        pageSystemOverlay.end();
+      },
+    });
     // #endif
     // #ifdef H5 || WEB
     MicrophonePermissionHelper.showGuide();
@@ -685,7 +714,9 @@
 
     try {
       // #ifdef APP
+      // ASR start 与本地开录并行：loading 只等 RecorderManager.onStart，不等 asr_ready RTT
       beginAppAsrSession()
+      callRecorderStart()
       // #endif
       // #ifndef APP
       callRecorderStart()
@@ -698,6 +729,10 @@
 
   // 监听录音开始
   function handleRecordStart(_res: any | null) {
+    // 权限弹窗已过（含 iOS not-determined 无 hide 场景），释放 overlay
+    if (pageSystemOverlay.isActive() == true) {
+      pageSystemOverlay.end();
+    }
     if (ignoreNextStopResult) {
       callRecorderStop()
       // #ifdef APP
@@ -832,12 +867,17 @@
     }
 
     // #ifdef APP
-    // App：PCM 文件切帧经 WebSocket 推给 ASR，识别完成后走与 H5 相同的 onRecordStop
-    if (asrSessionActive != true || asrWebSocketClient.isReady() != true) {
+    // App：PCM 文件切帧经 WebSocket 推给 ASR；开录已与 begin 并行，松手时可能尚未 asr_ready
+    if (asrSessionActive != true) {
       handleRecordError(new Error(t("Mobile.Voice.recordFailed")));
       return;
     }
-    pushRecordedFileThenFinish(tempFilePath)
+    if (asrReadyForSession == true || asrWebSocketClient.isReady() == true) {
+      pushRecordedFileThenFinish(tempFilePath)
+    } else {
+      currentState.value = "uploading"
+      pendingAsrFilePath = tempFilePath
+    }
     // #endif
 
     // #ifndef APP

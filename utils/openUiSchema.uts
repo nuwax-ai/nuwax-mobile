@@ -1,0 +1,387 @@
+/**
+ * OpenUI artifact 检测/提取/路径工具（nuwax.openui-ref / nuwax.openui-file）。
+ *
+ * 对齐 PC Web 的 @/utils/openUiArtifact.ts（isOpenUiRenderToolName / extractOpenUiArtifact /
+ * buildOpenUiFilePath），供 nuwax-mobile 在 SSE 工具结果中识别 OpenUI 渲染产物，并构造
+ * webview 全屏预览所需的 file_path。OpenUI 在移动端一律「点击 → 全屏 webview」展示
+ * （小程序 <web-view> 不能局部内嵌）。
+ *
+ * UTS（编译到 Kotlin）：对齐 mcpAskSchema.uts——统一 UTSJSONObject + readField，
+ * 对可空返回值（decodeURIComponent / 正则捕获组 / 数组下标 / 字段读取）一律先判空再用。
+ */
+import { orEmpty } from "@/utils/utsCoalesce";
+
+/** OpenUI MCP 中「真正发布 Host UI」的工具基名（可出现在任意引擎包装名中）。 */
+export const OPENUI_RENDER_TOOL_TOKEN = "nuwax_render_openui";
+
+/** 非 render 工具，名称里也可能带 openui，必须排除。 */
+const OPENUI_NON_RENDER_TOOL_TOKENS = [
+  "nuwax_get_openui_reference",
+  "nuwax_get_openui_update_guide",
+  "nuwax_validate_openui",
+];
+
+const UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+const PATH_REGEX = new RegExp(
+  `(?:^|[^0-9a-zA-Z])data/(${UUID_PATTERN})\\.openui\\.json(?:$|[^0-9a-zA-Z])`,
+  "i",
+);
+
+/**
+ * 解析后的 OpenUI 产物信息（仅取卡片展示 + webview 跳转所需字段）。
+ * UTS：需 class 构造。
+ */
+export class OpenUiArtifactInfo {
+  artifactId: string = "";
+  title: string = "";
+  /** presentation.mode：inline（本页内嵌渲染）/ sidecar（点击→全屏预览）。空串按 inline 兜底。 */
+  mode: string = "";
+}
+
+function asRecord(value: any | null): UTSJSONObject | null {
+  if (value == null || typeof value != "object") {
+    return null;
+  }
+  if (Array.isArray(value)) {
+    return null;
+  }
+  // 枚举/类实例（如 AgentComponentTypeEnum）typeof 也是 object，强转 UTSJSONObject 会 CCE；try/catch 跳过。
+  try {
+    return value as UTSJSONObject;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function readField(obj: UTSJSONObject | null, key: string): any | null {
+  if (obj == null) {
+    return null;
+  }
+  const val = obj[key];
+  return val != null ? val : null;
+}
+
+/**
+ * 识别 nuwax_render_openui 工具名——跨引擎通用，不绑定前缀/分隔符/版本后缀。
+ * 覆盖：nuwax_render_openui、mcp__nuwax-openui__nuwax_render_openui_v0_3_9、URL 编码名等。
+ */
+export function isOpenUiRenderToolName(name: string): boolean {
+  const trimmed = name.trim();
+  if (trimmed.length == 0) {
+    return false;
+  }
+  // decodeURIComponent 在 UTS 返回 String?，先判空再 toLowerCase。
+  let normalized = "";
+  try {
+    const decoded = decodeURIComponent(trimmed);
+    normalized = decoded != null ? decoded.toLowerCase() : trimmed.toLowerCase();
+  } catch (_e) {
+    normalized = trimmed.toLowerCase();
+  }
+  if (normalized.includes(OPENUI_RENDER_TOOL_TOKEN) == false) {
+    return false;
+  }
+  for (let i = 0; i < OPENUI_NON_RENDER_TOOL_TOKENS.length; i++) {
+    if (normalized.includes(OPENUI_NON_RENDER_TOOL_TOKENS[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function maybeParseJson(text: string): any | null {
+  const candidate = text.trim();
+  if (
+    candidate.length == 0 ||
+    candidate.length > 200000 ||
+    (candidate.startsWith("{") == false && candidate.startsWith("[") == false)
+  ) {
+    return null;
+  }
+  try {
+    return JSON.parse(candidate);
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** 读取 presentation.mode（inline / sidecar）；缺失返回空串。 */
+function readMode(obj: UTSJSONObject | null): string {
+  const pres = asRecord(readField(obj, "presentation"));
+  if (pres == null) {
+    return "";
+  }
+  const m = readField(pres, "mode");
+  return m != null ? `${m}` : "";
+}
+
+function buildInfo(
+  artifactId: string,
+  title: string,
+  mode: string = "",
+): OpenUiArtifactInfo | null {
+  if (artifactId.length == 0) {
+    return null;
+  }
+  const info = new OpenUiArtifactInfo();
+  info.artifactId = artifactId;
+  info.title = title.length > 0 ? title : "OpenUI";
+  info.mode = mode;
+  return info;
+}
+
+/** 从文本中匹配 data/{uuid}.openui.json 的 artifactId；未命中返回空串。 */
+function matchArtifactId(text: string): string {
+  const match = PATH_REGEX.exec(text);
+  if (match == null) {
+    return "";
+  }
+  if (match.length <= 1) {
+    return "";
+  }
+  // 正则捕获组在 UTS 为 String?，判空。
+  const group = match[1];
+  return group != null ? `${group}` : "";
+}
+
+/**
+ * 从任意文本（URL / 路径 / 文件名，如文件代理 URL 里含 data/{uuid}.openui.json）提取 artifactId。
+ * 供文件树/任务结果点击 .openui.json 时判断是否走 OpenUI runtime 预览。
+ */
+export function extractOpenUiArtifactIdFromText(text: string): string {
+  return matchArtifactId(text);
+}
+
+/**
+ * 从 uni <web-view> @message 事件解析 OPENUI_RESIZE 高度（detail.data 数组取最后一条）。
+ * 命中返回正数高度；否则返回 -1。供 inline-openui 自适应高度（try/catch 放普通模块，避免 <script setup> 编译问题）。
+ */
+export function parseOpenUiResizeHeight(e: any): number {
+  try {
+    const detail = asRecord((e as UTSJSONObject)["detail"]);
+    if (detail != null) {
+      const dataArr = detail["data"];
+      if (dataArr != null && Array.isArray(dataArr)) {
+        const arr = dataArr as any[];
+        if (arr.length > 0) {
+          const msg = asRecord(arr[arr.length - 1]);
+          if (
+            msg != null &&
+            `${msg["type"]}` == "OPENUI_RESIZE" &&
+            msg["height"] != null
+          ) {
+            const h = parseInt(`${msg["height"]}`);
+            if (h > 0) {
+              return h;
+            }
+          }
+        }
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return -1;
+}
+
+/**
+ * 从 uni <web-view> @message 事件解析 OPENUI_ACTION 的 event 对象（detail.data 数组取最后一条，
+ * 命中 type==OPENUI_ACTION 时返回其 event：含 values/formName/humanFriendlyMessage 等）。
+ * 未命中返回 null。供 file-preview-page 把表单提交转成续作消息。
+ */
+export function parseOpenUiActionEvent(e: any): UTSJSONObject | null {
+  try {
+    const detail = asRecord((e as UTSJSONObject)["detail"]);
+    if (detail != null) {
+      const dataArr = detail["data"];
+      if (dataArr != null && Array.isArray(dataArr)) {
+        const arr = dataArr as any[];
+        if (arr.length > 0) {
+          const msg = asRecord(arr[arr.length - 1]);
+          if (msg != null && `${msg["type"]}` == "OPENUI_ACTION") {
+            return asRecord(msg["event"]);
+          }
+        }
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * 从工具结果（任意嵌套 JSON / JSON 字符串）中提取 OpenUI 产物信息。
+ * BFS（带计数上限）：命中 nuwax.openui-ref/file 或 data/{uuid}.openui.json 路径即返回。
+ */
+export function extractOpenUiArtifactInfo(
+  data: any | null,
+  context: string = "",
+): OpenUiArtifactInfo | null {
+  if (data != null) {
+    console.log('[OpenUI-data] ' + context + ': ' + JSON.stringify(data).substring(0, 300))
+  }
+  if (data == null) {
+    return null;
+  }
+  const queue: any[] = [data];
+  let visited = 0;
+  // 路径命中（无 mode）作为兜底；优先返回带 presentation.mode 的 ref/file 对象。
+  let pathFallback: OpenUiArtifactInfo | null = null;
+  while (queue.length > 0 && visited < 256) {
+    visited += 1;
+    // shift() 返回 any?，判空。
+    const current = queue.shift();
+    if (current == null) {
+      continue;
+    }
+    const currentStr = `${current}`;
+    if (typeof current == "string") {
+      const id = matchArtifactId(currentStr);
+      if (id.length > 0 && pathFallback == null) {
+        pathFallback = buildInfo(id, "", "");
+      }
+      const parsed = maybeParseJson(currentStr);
+      if (parsed != null) {
+        queue.push(parsed);
+      }
+      continue;
+    }
+    if (typeof current != "object") {
+      continue;
+    }
+    const obj = asRecord(current);
+    if (obj != null) {
+      const typeRaw = readField(obj, "type");
+      const typeStr = typeRaw != null ? `${typeRaw}`.toLowerCase() : "";
+      if (
+        typeStr == "nuwax.openui-ref" ||
+        typeStr == "nuwax.openui-file" ||
+        typeStr == "nuwax.openui"
+      ) {
+        const artifactId = orEmpty(readField(obj, "artifactId"));
+        const title = orEmpty(readField(obj, "title"));
+        const info = buildInfo(artifactId, title, readMode(obj));
+        if (info != null) {
+          console.log(
+            `[OpenUI-mode] ref mode=${info.mode} id=${info.artifactId}`,
+          );
+          return info;
+        }
+      }
+      const pathRaw = readField(obj, "path");
+      if (typeof pathRaw == "string" && pathFallback == null) {
+        const id = matchArtifactId(`${pathRaw}`);
+        if (id.length > 0) {
+          pathFallback = buildInfo(
+            id,
+            orEmpty(readField(obj, "title")),
+            readMode(obj),
+          );
+        }
+      }
+      const keys = UTSJSONObject.keys(obj);
+      for (let i = 0; i < keys.length; i++) {
+        // 字段读取返回 any?，判空后再入队。
+        const v = obj[keys[i]];
+        if (v != null) {
+          queue.push(v);
+        }
+      }
+    } else if (Array.isArray(current)) {
+      const arr = current as any[];
+      for (let j = 0; j < arr.length; j++) {
+        // 数组下标返回 any?，判空后再入队。
+        const v = arr[j];
+        if (v != null) {
+          queue.push(v);
+        }
+      }
+    }
+  }
+  if (pathFallback != null) {
+    console.log(
+      `[OpenUI-mode] path mode=${pathFallback.mode} id=${pathFallback.artifactId}`,
+    );
+  } else if (context.length > 0) {
+    console.log(`[OpenUI-extract] ${context}: no artifact found in result`);
+  }
+  return pathFallback;
+}
+
+/**
+ * 扫描 processingList（工具结果列表），命中 nuwax_render_openui 工具项则抽取 artifact。
+ * 放在普通 .uts 模块里（非 <script setup>），for/continue/return 均可正常编译；
+ * ai-msg 只需一行调用，避免 <script setup> 内的循环/return 触发 UTS 编译限制。
+ */
+export function extractOpenUiArtifactFromMessage(
+  body: string,
+  list: any[] | null,
+): OpenUiArtifactInfo | null {
+  // 历史工具调用以 :::container name="...nuwax_render_openui..." ::: 嵌在消息正文（非仅 processingList）；
+  // 容器只带 executeId+工具名，artifactId 在工具结果（processingList 的 result）里。故：正文判存在 + processingList 抽 id。
+  try {
+    const hasRender = body.indexOf("nuwax_render_openui") >= 0;
+    console.log(
+      `[OpenUI-diag] body hasRender=${hasRender} processingList len=${list == null ? -1 : list.length}`,
+    );
+    if (hasRender == false) {
+      return null;
+    }
+    if (list != null) {
+      for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        if (item != null && typeof item == "object") {
+          // processingList 项是 ProcessingInfo 等 class 实例，直接 as UTSJSONObject 会 CCE（Android）；
+          // JSON 往返规整为纯 UTSJSONObject 树后再 BFS 抽 artifactId。
+          let serialized: any | null = null;
+          try {
+            serialized = JSON.parse(JSON.stringify(item));
+          } catch (_se) {
+            // 不可序列化则跳过该项
+          }
+          const info = extractOpenUiArtifactInfo(serialized);
+          console.log(
+            `[OpenUI-diag] item ${i} extracted=${info == null ? "null" : info.artifactId}`,
+          );
+          if (info != null) {
+            return info;
+          }
+        }
+      }
+    }
+  } catch (_e) {
+    console.log(`[OpenUI-diag] scan error=${_e}`);
+  }
+  return null;
+}
+
+/**
+ * 构造 OpenUI Runtime「自主拉取」模式所需的 file_path（/api/computer/static 之后的相对地址）。
+ * 例：cid=1557425, artifactId=<uuid> → /1557425/data/<uuid>.openui.json
+ */
+export function buildOpenUiFilePath(
+  conversationId: string,
+  artifactId: string,
+): string | null {
+  const cid = conversationId.trim();
+  if (cid.length == 0 || artifactId.length == 0) {
+    return null;
+  }
+  if (/^\d+$/.test(cid) == false) {
+    return null;
+  }
+  return `/${cid}/data/${artifactId}.openui.json`;
+}
+
+/**
+ * 剥离 OpenUI action 幂等标记（`<!--nuwax-openui-action-id:...-->` HTML 注释），
+ * 避免它泄露到展示/复制/发送的 prompt。对齐 nuwax PC web 的 stripOpenUiResumeDisplayArtifacts。
+ */
+const OPENUI_ACTION_ID_MARKER_RE = /\n?<!--nuwax-openui-action-id:[^>]+-->/g;
+export function stripOpenUiActionIdMarker(text: string): string {
+  if (text.length == 0) {
+    return text;
+  }
+  return text.replace(OPENUI_ACTION_ID_MARKER_RE, "").replace(/\s+$/, "");
+}

@@ -511,7 +511,10 @@ export class TtsWebSocketPlayer {
   private pausedByMute: boolean = false;
   /** H5 blob: URL，stop 时 revoke */
   private blobUrl: string = "";
-  /** 会话页预热 */
+  /**
+   * 允许预热建连（按下录音时开启；非进页长连）。
+   * false 时 ensureWarmSocketAsync 不再建连。
+   */
   private warmupEnabled: boolean = false;
   /** 预热待命连接（已 open，尚未 send start） */
   private warmSocketTask: TtsSocketHandle | null = null;
@@ -519,6 +522,13 @@ export class TtsWebSocketPlayer {
   private warmGeneration: number = 0;
   /** 等待预热 open 的回调（避免覆盖 socket.onOpen） */
   private warmOpenWaiters: ((ok: boolean) => void)[] = [];
+  /** 闲置关闭定时器：播报结束后延迟释放 TCP */
+  private idleCloseTimerId: number = 0;
+  /**
+   * 播报/合成空闲后关闭连接的等待（ms）。
+   * 分句间隙会取消重计；完整播报结束后也可由 releaseIdleConnection 立刻关。
+   */
+  private readonly IDLE_CLOSE_MS: number = 30000;
   /**
    * 每次 finishSynthesis 递增；H5/WEB 上 InnerAudioContext 的 onCanplay 会叠加，
    * 旧回调用过期 id 直接 return，避免双重 play 重启。
@@ -550,21 +560,30 @@ export class TtsWebSocketPlayer {
   /** 最近一次合成 PCM 估算时长（ms）；H5 blob URL 长度不能反映音频时长 */
   private lastSynthDurationMs: number = 0;
 
-  /** 进入会话页：开启预热并预连 WebSocket */
+  /**
+   * 按下录音时预热：建连但不发合成请求。
+   * 防重连风暴：已有 warm / 建连中则直接返回。
+   */
   enableWarmupAndConnect(): void {
     this.warmupEnabled = true;
+    this.cancelIdleClose();
     if (this.isWarmOpen() == true) {
       return;
     }
     if (this.warmSocketTask != null) {
       return;
     }
+    if (this.socketTask != null) {
+      // 会话进行中已有连接，无需再预热
+      return;
+    }
     this.ensureWarmSocketAsync();
   }
 
-  /** 离开会话页：关闭预热并断开待命/业务连接（唯一允许主动关连的入口） */
+  /** 离开会话页 / 进后台：关闭预热与业务连接 */
   disableWarmupAndDisconnect(): void {
     this.warmupEnabled = false;
+    this.cancelIdleClose();
     this.generation += 1;
     this.warmGeneration += 1;
     this.clearSynthStallWatchdog();
@@ -589,6 +608,59 @@ export class TtsWebSocketPlayer {
     this.text = "";
     this.messageId = "";
     this.setState("idle");
+  }
+
+  /**
+   * 整轮播报结束后释放空闲连接（流式分句全部播完 / 工具栏播完）。
+   * 分句之间请勿调用——应继续复用 warm TCP。
+   */
+  releaseIdleConnection(): void {
+    this.cancelIdleClose();
+    // 合成或播放进行中：改走闲置超时，避免掐断尾句
+    if (
+      this.state == "connecting" ||
+      this.state == "synthesizing" ||
+      this.state == "playing" ||
+      this.synthInFlight == true
+    ) {
+      this.scheduleIdleClose(this.IDLE_CLOSE_MS);
+      return;
+    }
+    this.closeWarmSocket();
+    this.closeSessionSocketOnly();
+    this.stopKeepalive();
+  }
+
+  private cancelIdleClose(): void {
+    if (this.idleCloseTimerId != 0) {
+      clearTimeout(this.idleCloseTimerId);
+      this.idleCloseTimerId = 0;
+    }
+  }
+
+  /** 空闲后关闭 warm/session TCP；busy 时由调用方改用更长 delay */
+  private scheduleIdleClose(delayMs: number): void {
+    this.cancelIdleClose();
+    let wait = delayMs;
+    if (wait < 0) {
+      wait = 0;
+    }
+    this.idleCloseTimerId = setTimeout((): void => {
+      this.idleCloseTimerId = 0;
+      if (
+        this.state == "connecting" ||
+        this.state == "synthesizing" ||
+        this.state == "playing" ||
+        this.synthInFlight == true
+      ) {
+        // 仍忙：再延一档
+        this.scheduleIdleClose(this.IDLE_CLOSE_MS);
+        return;
+      }
+      this.closeWarmSocket();
+      this.closeSessionSocketOnly();
+      this.stopKeepalive();
+    }, wait) as number;
   }
 
   /**
@@ -876,10 +948,8 @@ export class TtsWebSocketPlayer {
           this.finishRequested,
         );
         if (expectedGeneration == this.generation) {
+          // 超时收尾：收回待命并进入闲置关闭，不再强制补预热
           this.prepareForNextUtterance(true);
-          if (this.warmupEnabled == true) {
-            this.ensureWarmSocketAsync();
-          }
         }
         finish(false);
       }, waitMs);
@@ -1452,6 +1522,12 @@ export class TtsWebSocketPlayer {
     preservePlayingAudio: boolean = false,
     expectedSynthEpoch: number = 0,
   ): Promise<void> {
+    // 即将使用连接：取消闲置关闭
+    this.cancelIdleClose();
+    // 合成路径允许在无预热时临时建连（文本发送未按过录音）
+    if (this.warmupEnabled != true) {
+      this.warmupEnabled = true;
+    }
     const cancelled = (): boolean => {
       return this.isSynthOpCancelled(
         preservePlayingAudio,
@@ -1694,6 +1770,7 @@ export class TtsWebSocketPlayer {
     if (this.warmupEnabled != true) {
       return;
     }
+    this.cancelIdleClose();
     // 会话进行中禁止新建预热：会抢 router / 误清 sink，导致 tts_ready 后收不到 PCM
     if (this.socketTask != null) {
       return;
@@ -1702,7 +1779,7 @@ export class TtsWebSocketPlayer {
       return;
     }
     if (this.warmSocketTask != null) {
-      // connecting
+      // connecting：防重连风暴
       return;
     }
     const accessToken = resolveAccessToken();
@@ -1741,12 +1818,14 @@ export class TtsWebSocketPlayer {
       this.preferArrayBufferBinaryType(socketTask);
       this.refreshKeepalive();
       this.notifyWarmOpenWaiters(true);
+      // 预热后若长时间无合成，按闲置策略关闭
+      this.scheduleIdleClose(this.IDLE_CLOSE_MS);
     });
     socketTask.onError((_err: GeneralCallbackResult) => {
       if (expectedWarm != this.warmGeneration) {
         return;
       }
-      // 不主动 close：等 onClose 清状态；页内再补连
+      // 不主动 close：等 onClose 清状态
       console.warn("[TTS] warmup error (wait peer close)");
       this.notifyWarmOpenWaiters(false);
     });
@@ -1754,7 +1833,6 @@ export class TtsWebSocketPlayer {
       if (expectedWarm != this.warmGeneration) {
         return;
       }
-      // 待命连接被对端/网关掐断：页内仍开启预热时单次补连
       this.warmSocketTask = null;
       this.warmOpen = false;
       this.warmOpenedAtMs = 0;
@@ -1764,17 +1842,7 @@ export class TtsWebSocketPlayer {
       }
       this.refreshKeepalive();
       this.notifyWarmOpenWaiters(false);
-      if (this.warmupEnabled == true) {
-        setTimeout(() => {
-          if (
-            this.warmupEnabled == true &&
-            this.socketTask == null &&
-            this.warmSocketTask == null
-          ) {
-            this.ensureWarmSocketAsync();
-          }
-        }, 300);
-      }
+      // 用完即关：对端关闭后不再自动重连，等下次按录音预热或合成时再建
     });
   }
 
@@ -1827,7 +1895,8 @@ export class TtsWebSocketPlayer {
   }
 
   /**
-   * 本轮合成/播报结束或失败：不关 TCP，把连接收回预热池。
+   * 本轮合成/播报间隙：不立刻关 TCP，收回预热池供下一分句复用；
+   * 并启动闲置关闭计时（下一句合成会 cancel）。
    */
   private recycleSessionToWarm(): void {
     const sock = this.socketTask;
@@ -1835,6 +1904,7 @@ export class TtsWebSocketPlayer {
     this.socketMessageSink = null;
     if (sock == null) {
       this.refreshKeepalive();
+      this.scheduleIdleClose(this.IDLE_CLOSE_MS);
       return;
     }
     // 已有待命：保留当前会话 sock 作为 warm（不主动 close 任一端）
@@ -1868,23 +1938,14 @@ export class TtsWebSocketPlayer {
         this.socketMessageSink = null;
       }
       this.refreshKeepalive();
-      if (this.warmupEnabled == true) {
-        setTimeout(() => {
-          if (
-            this.warmupEnabled == true &&
-            this.socketTask == null &&
-            this.warmSocketTask == null
-          ) {
-            this.ensureWarmSocketAsync();
-          }
-        }, 300);
-      }
+      // 不再自动重连
     });
     this.refreshKeepalive();
+    this.scheduleIdleClose(this.IDLE_CLOSE_MS);
   }
 
   /**
-   * 结束当前播报会话（不断开 WebSocket）。
+   * 结束当前播报会话；TCP 收回待命并进入闲置关闭倒计时。
    * @param keepAudio true：仅 stop、保留 InnerAudioContext（H5 串行分句复用已解锁通道）
    */
   private prepareForNextUtterance(keepAudio: boolean): void {
@@ -1897,7 +1958,6 @@ export class TtsWebSocketPlayer {
     this.realPlayback = false;
     this.switchingToReal = false;
     this.pausedByMute = false;
-    // 无论是否 warmup：业务结束只收回待命，禁止主动 close
     this.recycleSessionToWarm();
     const audio = this.audioContext;
     if (keepAudio == true) {
@@ -1927,13 +1987,10 @@ export class TtsWebSocketPlayer {
     this.messageId = "";
   }
 
-  /** 结束当前播报会话，保留预热连接；销毁音频（显式 stop / 离开页） */
-  private stopSessionKeepWarm(): void {
-    this.prepareForNextUtterance(false);
-  }
-
   stop(): void {
-    this.stopSessionKeepWarm();
+    this.prepareForNextUtterance(false);
+    // 显式停止：立刻释放连接，不保留空闲长连
+    this.releaseIdleConnection();
   }
 
   private revokeBlobUrl(): void {
@@ -2145,10 +2202,8 @@ export class TtsWebSocketPlayer {
       // #endif
       const socket = this.socketTask;
       if (socket != null) {
-        // 工具栏单次播报：合成完收回 TCP，播放期不再新建预热连接
+        // 合成完收回 TCP 待命，播放期复用；闲置超时后关闭
         this.recycleSessionToWarm();
-      } else if (this.warmupEnabled == true) {
-        this.ensureWarmSocketAsync();
       }
 
       // H5/WEB 与 App 起播路径互斥：

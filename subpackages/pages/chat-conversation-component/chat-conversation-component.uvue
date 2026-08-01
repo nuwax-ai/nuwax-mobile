@@ -1064,12 +1064,24 @@
    * 导致工具栏一直 isSpeaking。发新消息前须 resumeStreamSpeakAllowance()。
    */
   let streamSpeakAllowed: boolean = true;
+  /** TTS 喂入合并定时器（仅节流 onStreamChunk，不影响 UI 刷新） */
+  let feedSpeakTimer: number = 0;
+  /** TTS 喂入合并窗口（ms）：降低长回复上 cleanText/分句频率 */
+  const FEED_SPEAK_COALESCE_MS: number = 100;
 
   function resumeStreamSpeakAllowance(): void {
     streamSpeakAllowed = true;
   }
 
+  function clearFeedSpeakTimer(): void {
+    if (feedSpeakTimer != 0) {
+      clearTimeout(feedSpeakTimer);
+      feedSpeakTimer = 0;
+    }
+  }
+
   function stopAllStreamSpeech(hardStop: boolean): void {
+    clearFeedSpeakTimer();
     headlessStreamSpeakId = "";
     const tailBody = feedSpeakBodyText;
     feedSpeakBodyText = "";
@@ -1183,7 +1195,8 @@
   }
 
   /**
-   * 立刻喂播报：SSE 一旦有可朗读正文就推给 TTS，不做防抖延迟。
+   * 喂播报：更新最新正文快照；流式中合并推送，结束时立刻冲刷尾句。
+   * 合并只作用于 TTS，不影响 messageList / Markdown UI。
    */
   function feedHeadlessStreamSpeakNow(
     finished: boolean,
@@ -1196,7 +1209,19 @@
     if (messageId.length > 0) {
       feedSpeakMsgId = messageId;
     }
-    feedHeadlessStreamSpeak(finished, feedSpeakBodyText);
+    // 流结束必须立刻冲刷，避免尾句被合并窗口截断
+    if (finished == true) {
+      clearFeedSpeakTimer();
+      feedHeadlessStreamSpeak(true, feedSpeakBodyText);
+      return;
+    }
+    if (feedSpeakTimer != 0) {
+      return;
+    }
+    feedSpeakTimer = setTimeout((): void => {
+      feedSpeakTimer = 0;
+      feedHeadlessStreamSpeak(false, feedSpeakBodyText);
+    }, FEED_SPEAK_COALESCE_MS);
   }
 
   /**
@@ -2046,8 +2071,17 @@
   });
 
   // ==================== 页面加载处理 ====================
-  const handleScrollToLastMsg = async () => {
+  /**
+   * 滚到底部。
+   * @param fromListWatch true 表示由 messageList / lastMessage 监听触发；
+   *   流式进行中交给 streamMessageUpdate，避免与 deep watch 叠加重置 scroll-into-view。
+   * 注意：Android UTS 对 async 箭头函数默认参数支持不稳，故不使用默认值，调用方显式传参。
+   */
+  const handleScrollToLastMsg = async (fromListWatch: boolean) => {
     // 注意：不要在这里调用 setIsInScrollBottom()，因为没有事件参数会导致状态错误
+    if (fromListWatch == true && isConversationActive.value == true) {
+      return;
+    }
     lockAutoToLastMsg();
     if (shouldAutoScrollToLast() == true) {
       await nextTick();
@@ -2058,10 +2092,20 @@
       }, 100);
     }
   };
-  watch(lastMessage, handleScrollToLastMsg, { deep: true });
 
-  // 消息列表变化处理
-  watch(data.messageList, handleScrollToLastMsg, { deep: true });
+  /** 列表监听触发的滚底（流式期跳过） */
+  const handleScrollToLastMsgFromListWatch = () => {
+    handleScrollToLastMsg(true);
+  };
+
+  // 最后一条消息内容变化（非流式：状态更新 / 历史落库等）；流式期跳过
+  watch(lastMessage, handleScrollToLastMsgFromListWatch, { deep: true });
+
+  // 仅监听条数变化，避免对整表 deep watch 遍历嵌套字段
+  watch(
+    (): number => data.messageList.value.length,
+    handleScrollToLastMsgFromListWatch,
+  );
 
   // 问题建议列表变化处理
   watch(
@@ -2069,7 +2113,7 @@
     (newVal: any[]) => {
       if (newVal != null) {
         if ((newVal as any[]).length > 0) {
-          handleScrollToLastMsg();
+          handleScrollToLastMsg(false);
         }
       }
     },
@@ -2108,7 +2152,7 @@
   // 监听键盘高度变化
   watch(data.keyboardHeight, (newVal: number) => {
     if (newVal > 0) {
-      handleScrollToLastMsg();
+      handleScrollToLastMsg(false);
     }
   });
 
@@ -2251,7 +2295,8 @@
 
   // 使用页面唤醒检测 Hook
   // H5: visibilitychange；App/小程序: 页面 onShow/onHide → triggerHide/Resume
-  // 真实后台 ≥30s 断 ASR/TTS；相册/权限等 overlay 不断连
+  // 真实后台 ≥30s 断 ASR/TTS；回前台不再自动重连（等按录音/合成再建）
+  // 相册/权限等 overlay 不断连
   function onChatPageResume(): void {
     // 长隐藏后的会话恢复；系统相册/权限等触发的 hide 不跑
     if (pageSystemOverlay.wasLastShowReal() == true) {
@@ -2260,6 +2305,7 @@
   }
   function onChatPageForeground(): void {
     const realShow = pageSystemOverlay.noteShow();
+    // 仅取消待断开；不预连 ASR/TTS
     speechSocketWarmup.resumeFromBackground();
     if (realShow == true) {
       resumeConversationPolling();
@@ -2927,8 +2973,8 @@
     touchEndTimer = setTimeout(() => {
       data.scrollTouch.value = false;
       touchEndTimer = 0;
-      // 触摸结束后，如果需要，自动滚动到底部
-      handleScrollToLastMsg();
+      // 触摸结束后，如果需要，自动滚动到底部（含流式期恢复跟底）
+      handleScrollToLastMsg(false);
     }, 300);
   };
 
@@ -2945,6 +2991,18 @@
     }, 150);
   };
 
+  // #ifdef H5
+  /** H5 滚轮监听：与 onUnmounted removeEventListener 共用同一引用 */
+  const handleH5Wheel = (_e: WheelEvent): void => {
+    data.mouseScroll.value = true;
+    let clear: number = 0;
+    clear = setTimeout(() => {
+      data.mouseScroll.value = false;
+      clearTimeout(clear);
+    }, 1000);
+  };
+  // #endif
+
   // 设置事件监听器
   // 内部异步逻辑包装为同步回调，避免 Promise 类型不匹配
   const runOnMountedAsync = async (): Promise<void> => {
@@ -2957,14 +3015,7 @@
     uni.$on("refreshFileList", onRefreshFileList);
     uni.$on("updateMessageComponent", handleUpdateMessageComponent);
     // #ifdef H5
-    window.addEventListener("wheel", (e: WheelEvent) => {
-      data.mouseScroll.value = true;
-      let clear: number = 0;
-      clear = setTimeout(() => {
-        data.mouseScroll.value = false;
-        clearTimeout(clear);
-      }, 1000);
-    });
+    window.addEventListener("wheel", handleH5Wheel);
     // #endif
 
     uni.$on("page_preview_executing", handlePagePreviewExecuting);
@@ -3010,7 +3061,7 @@
   // #endif
 
   onMounted(() => {
-    // 进入会话页即预连 ASR / TTS WebSocket
+    // 仅标记会话页活跃；ASR/TTS 改为按录音预热 / 合成时建连（不再进页预连）
     speechSocketWarmup.warmup();
     // #ifdef APP || WEB
     bindMarkdownProxyWeb();
@@ -3026,6 +3077,20 @@
     service.abortSubConversation();
     destroyConversationPolling();
     scrollManager.dispose();
+
+    if (streamScrollTimer != 0) {
+      clearTimeout(streamScrollTimer);
+      streamScrollTimer = 0;
+    }
+    if (touchEndTimer != 0) {
+      clearTimeout(touchEndTimer);
+      touchEndTimer = 0;
+    }
+    clearFeedSpeakTimer();
+
+    // #ifdef H5
+    window.removeEventListener("wheel", handleH5Wheel);
+    // #endif
 
     // #ifdef APP
     proxyWeb.reset();

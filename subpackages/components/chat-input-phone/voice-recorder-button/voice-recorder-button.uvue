@@ -166,6 +166,10 @@
   // #ifdef APP
   /** App：ASR 会话已 begin，等待 asr_ready / 结果 */
   let asrSessionActive: boolean = false
+  /** App：本轮已收到 asr_ready（可推 PCM） */
+  let asrReadyForSession: boolean = false
+  /** App：松手时 ASR 尚未 ready，暂存录音路径，ready 后再推流 */
+  let pendingAsrFilePath: string = ""
   /** App：已发 stop，等待 asr_result */
   let asrWaitingResult: boolean = false
   // #endif
@@ -256,6 +260,8 @@
     isTapped.value = false
     // #ifdef APP
     asrWaitingResult = false
+    asrReadyForSession = false
+    pendingAsrFilePath = ""
     // #endif
   }
 
@@ -375,42 +381,7 @@
     handleRecordError(new Error(message.length > 0 ? message : t("Mobile.Voice.recordFailed")))
   }
 
-  /** App：ASR ready 后开始本地 PCM 录音 */
-  function startAppRecorderAfterAsrReady(): void {
-    if (ignoreNextStopResult) {
-      asrWebSocketClient.abort()
-      asrSessionActive = false
-      resetState()
-      emit("onRecordCancel")
-      return
-    }
-    try {
-      callRecorderStart()
-    } catch (error: any) {
-      asrWebSocketClient.abort()
-      asrSessionActive = false
-      handleRecordError(error)
-    }
-  }
-
-  /** App：按下后先连 ASR，再录音 */
-  function beginAppAsrSession(): void {
-    asrSessionActive = true
-    asrWaitingResult = false
-    asrWebSocketClient.begin(
-      () => {
-        startAppRecorderAfterAsrReady()
-      },
-      (text: string, ok: boolean, errorMessage: string) => {
-        handleAsrResult(text, ok, errorMessage)
-      },
-      (message: string) => {
-        handleAsrError(message)
-      },
-    )
-  }
-
-  /** App：录音文件就绪后切帧推送并 finish（等每块 send success 后再 stop） */
+  /** App：录音文件就绪后切帧推送并 finish（须在 beginAppAsrSession 之前定义，避免 UTS error18） */
   function pushRecordedFileThenFinish(tempFilePath: string): void {
     currentState.value = "uploading"
     streamLocalAudioFileToAsr(
@@ -430,6 +401,34 @@
           asrSessionActive = false
           handleRecordError(new Error(t("Mobile.AudioUploader.fileEmpty")))
         }
+      },
+    )
+  }
+
+  /**
+   * App：按下后并行发起 ASR start（等 asr_ready）。
+   * 本地录音不再等 ready——PCM 在松手后才推流，开录可与 WS RTT 并行。
+   */
+  function beginAppAsrSession(): void {
+    asrSessionActive = true
+    asrWaitingResult = false
+    asrReadyForSession = false
+    pendingAsrFilePath = ""
+    asrWebSocketClient.begin(
+      () => {
+        asrReadyForSession = true
+        // 松手过早：录音已结束，ready 后再推流
+        if (pendingAsrFilePath.length > 0) {
+          const path = pendingAsrFilePath
+          pendingAsrFilePath = ""
+          pushRecordedFileThenFinish(path)
+        }
+      },
+      (text: string, ok: boolean, errorMessage: string) => {
+        handleAsrResult(text, ok, errorMessage)
+      },
+      (message: string) => {
+        handleAsrError(message)
       },
     )
   }
@@ -715,7 +714,9 @@
 
     try {
       // #ifdef APP
+      // ASR start 与本地开录并行：loading 只等 RecorderManager.onStart，不等 asr_ready RTT
       beginAppAsrSession()
+      callRecorderStart()
       // #endif
       // #ifndef APP
       callRecorderStart()
@@ -866,12 +867,17 @@
     }
 
     // #ifdef APP
-    // App：PCM 文件切帧经 WebSocket 推给 ASR，识别完成后走与 H5 相同的 onRecordStop
-    if (asrSessionActive != true || asrWebSocketClient.isReady() != true) {
+    // App：PCM 文件切帧经 WebSocket 推给 ASR；开录已与 begin 并行，松手时可能尚未 asr_ready
+    if (asrSessionActive != true) {
       handleRecordError(new Error(t("Mobile.Voice.recordFailed")));
       return;
     }
-    pushRecordedFileThenFinish(tempFilePath)
+    if (asrReadyForSession == true || asrWebSocketClient.isReady() == true) {
+      pushRecordedFileThenFinish(tempFilePath)
+    } else {
+      currentState.value = "uploading"
+      pendingAsrFilePath = tempFilePath
+    }
     // #endif
 
     // #ifndef APP

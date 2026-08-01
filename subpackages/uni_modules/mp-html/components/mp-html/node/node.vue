@@ -132,14 +132,24 @@
       <text
         v-else-if="n.text"
         :user-select="opts[4] == 'force' && isiOS"
+        style="display:inline;"
         decode
         >{{ n.text }}</text
       >
       <!-- #endif -->
       <!-- #ifndef MP-WEIXIN || MP-BAIDU || MP-ALIPAY || MP-TOUTIAO -->
-      <text v-else-if="n.text" decode>{{ n.text }}</text>
+      <text v-else-if="n.text" style="display:inline;" decode>{{ n.text }}</text>
       <!-- #endif -->
       <text v-else-if="n.name === 'br'">{{ "\n" }}</text>
+      <!-- 会话详情链接使用 text 渲染，避免 view 在原生端独占一行。 -->
+      <text
+        v-else-if="n.name === 'a' && n.attrs['data-conversation-link']"
+        :id="n.attrs.id"
+        :class="'_a ' + n.attrs.class"
+        :style="n.attrs.style"
+        :data-i="i"
+        @tap.stop="linkTap"
+      >{{ (n.children && n.children[0] && n.children[0].text) || "" }}</text>
       <!-- 链接 -->
       <view
         v-else-if="n.name === 'a'"

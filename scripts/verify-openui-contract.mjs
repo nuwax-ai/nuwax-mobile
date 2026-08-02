@@ -23,13 +23,18 @@ function assert(condition, message) {
   }
 }
 
-/** 从 tool-names.ts 提取所有工具名「基名」（版本化模板的前缀 + validate 字面量）。 */
-function extractBaseNames(toolNamesSource) {
+/** 从 contracts.ts 提取最新工具名基名；兼容旧版 tool-names.ts 直接声明。 */
+function extractBaseNames(toolNamesSource, contractsSource) {
   const bases = {};
+  const contractRe =
+    /export\s+const\s+(OPENUI_[A-Z_]*TOOL_BASE_NAME)\s*=\s*['"]([a-z_]+)['"]/g;
+  let m;
+  while ((m = contractRe.exec(contractsSource)) !== null) {
+    bases[m[1]] = m[2];
+  }
   // 版本化：`<base>${OPENUI_MCP_VERSION_SUFFIX}`
   const versionedRe =
     /export\s+const\s+(OPENUI_[A-Z_]*TOOL_NAME)\s*=\s*`([a-z_]+)\$\{OPENUI_MCP_VERSION_SUFFIX\}`/g;
-  let m;
   while ((m = versionedRe.exec(toolNamesSource)) !== null) {
     bases[m[1]] = m[2];
   }
@@ -43,16 +48,18 @@ function extractBaseNames(toolNamesSource) {
 }
 
 const toolNames = read("packages/server/src/tool-names.ts", mcpDir);
-const mcpBases = extractBaseNames(toolNames);
-const renderBase = mcpBases.OPENUI_TOOL_NAME;
+const contracts = read("packages/server/src/contracts.ts", mcpDir);
+const mcpBases = extractBaseNames(toolNames, contracts);
+const renderBase =
+  mcpBases.OPENUI_RENDER_TOOL_BASE_NAME ?? mcpBases.OPENUI_TOOL_NAME;
 assert(
   renderBase === "nuwax_render_openui",
   `Could not derive OpenUI render tool base (got "${renderBase}")`,
 );
 const nonRenderBases = [
-  mcpBases.OPENUI_REFERENCE_TOOL_NAME,
-  mcpBases.OPENUI_UPDATE_GUIDE_TOOL_NAME,
-  mcpBases.OPENUI_VALIDATE_TOOL_NAME,
+  mcpBases.OPENUI_REFERENCE_TOOL_BASE_NAME ?? mcpBases.OPENUI_REFERENCE_TOOL_NAME,
+  mcpBases.OPENUI_UPDATE_GUIDE_TOOL_BASE_NAME ?? mcpBases.OPENUI_UPDATE_GUIDE_TOOL_NAME,
+  mcpBases.OPENUI_VALIDATE_TOOL_BASE_NAME ?? mcpBases.OPENUI_VALIDATE_TOOL_NAME,
 ];
 for (const b of nonRenderBases) {
   assert(!!b, `Could not derive a non-render tool base from nuwax-openui-mcp`);
@@ -110,9 +117,32 @@ assert(
   ),
   "openUiArtifactAdapter.uts missing",
 );
+const mobileAdapter = read("subpackages/utils/openUiArtifactAdapter.uts");
+assert(
+  mobileAdapter.includes("normalizeRenderUiProcessingData") &&
+    mobileAdapter.includes('"subEventType"') &&
+    mobileAdapter.includes('readRawField(result, "data")'),
+  "openUiArtifactAdapter.uts missing latest PROCESSING + RENDER_UI result.data adapter",
+);
 assert(
   read("utils/system.uts").includes("openOpenUiArtifact"),
   "utils/system.uts missing openOpenUiArtifact nav helper",
+);
+const previewPage = read(
+  "subpackages/pages/file-preview-page/file-preview-page.uvue",
+);
+const conversationPage = read(
+  "subpackages/pages/chat-conversation-component/chat-conversation-component.uvue",
+);
+assert(
+  previewPage.includes("savePendingOpenUiAction(cid, message)") &&
+    previewPage.includes("uni.navigateBack({ delta: 1 })"),
+  "file-preview-page must persist OPENUI_ACTION before returning to chat",
+);
+assert(
+  conversationPage.includes("consumePendingOpenUiAction") &&
+    conversationPage.includes("handlePendingOpenUiAction"),
+  "chat conversation must consume and send pending OpenUI actions on resume",
 );
 
 console.log(

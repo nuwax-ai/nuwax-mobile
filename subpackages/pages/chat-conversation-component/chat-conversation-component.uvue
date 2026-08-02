@@ -1671,12 +1671,26 @@
 
   // ChatFinished 事件处理函数（带节流）
   // 注意：须位于 handleSendMessage 等引用之前（UTS 无提升）
+  // 他端点停止也会推此事件：需掐断本端 SSE/sub，并复位播报图标
   const handleChatFinishedInternal = (event: any) => {
     const eventConvIdStr = `${(event as UTSJSONObject)["conversationId"]}`;
     if (conversationId.value == parseInt(eventConvIdStr, 10)) {
       throttle(() => {
-        if (data.isConversationActive.value == true) {
+        // 仍在收 live/sub：他端停止或任务结束，强制收尾并停播报
+        const stillReceiving =
+          chatService.isCurrentlyStreaming == true ||
+          service.isSubConversationSubscribed == true;
+        if (stillReceiving == true) {
+          chatService.abort();
+          service.abortSubConversation();
+          stopAllStreamSpeech(true);
           data.isConversationActive.value = false;
+        } else if (data.isConversationActive.value == true) {
+          // 流已断但会话态未清：只清态；若仍在播报则停（避免误伤「正常结束后的尾句播报」）
+          data.isConversationActive.value = false;
+          if (voiceStreamSpeaker.isBusy() == true) {
+            stopAllStreamSpeech(true);
+          }
         }
 
         const convId = conversationId.value;
@@ -1706,7 +1720,7 @@
     // 与 dev 一致：一点击发送就清空问题建议，避免会话进行中仍展示
     data.chatSuggestList.value = [] as any[];
 
-    // 取消订阅 ChatFinished 事件（发送新消息时，旧会话已结束）
+    // 先卸旧监听，发送后再挂上，以便本轮他端停止能收到 ChatFinished
     eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
 
     data.autoToLastMsg.value = true;
@@ -1857,6 +1871,8 @@
     if (newSpeakId.length > 0) {
       ensureHeadlessStreamSpeak(newSpeakId, "");
     }
+    // 本轮会话进行中监听结束/他端停止（与进页 EXECUTING 续接时的订阅一致）
+    eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
   };
 
   /**
@@ -2265,6 +2281,20 @@
    * sub 关闭 → 再启轮询。
    * 须用 function 声明：UTS 嵌套回调内无法引用同作用域 const（error18）。
    */
+  /** 本地是否正处于会话中（live SSE / 已标 active / 已订 sub）：此时禁止轮询续接 */
+  function isLocalConversationBusy(): boolean {
+    if (data.isConversationActive.value == true) {
+      return true;
+    }
+    if (chatService.isCurrentlyStreaming == true) {
+      return true;
+    }
+    if (service.isSubConversationSubscribed == true) {
+      return true;
+    }
+    return false;
+  }
+
   function startResumePolling(): void {
     const cid = data.conversationId.value;
     if (cid == null || cid == 0) {
@@ -2273,12 +2303,17 @@
     startConversationPolling(
       cid,
       (executingCid: number) => {
+        // 页面正在会话中：不续接，等结束后下一轮 poll 再判断
+        if (isLocalConversationBusy() == true) {
+          return;
+        }
         service.handleSubConversation(executingCid, (): void => {
           startResumePolling();
         });
       },
       (): boolean => {
-        return data.isConversationActive.value;
+        // 轮询门禁：会话进行中跳过本轮（结束后 getter 变 false，自动继续）
+        return isLocalConversationBusy();
       },
       (): boolean => {
         return service.isSubConversationSubscribed;
@@ -2306,10 +2341,21 @@
     // 重新获取会话订阅与限制状态，确保在支付返回后能够实时同步状态与解锁输入框
     await service.handleCheckSubscriptionLimit();
 
+    // 本地已在会话中：不抢续接，只保持轮询（会话结束后可再续）
+    if (isLocalConversationBusy() == true) {
+      startResumePolling();
+      return;
+    }
+
     // 调用服务层的恢复方法
     const needResume = await service.resumeConversationState();
 
     if (needResume) {
+      // await 期间可能已进入本地会话
+      if (isLocalConversationBusy() == true) {
+        startResumePolling();
+        return;
+      }
       // EXECUTING：本轮用户已就绪才立刻开 sub；否则只靠轮询（四端同一门禁）
       console.log("[PageResume] 会话状态已恢复,检查是否可订阅 sub");
       const resumeCid = data.conversationId.value;

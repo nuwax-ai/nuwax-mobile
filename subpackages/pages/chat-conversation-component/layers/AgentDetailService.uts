@@ -84,6 +84,7 @@ import {
 } from "@/subpackages/utils/containerHelper.uts";
 import { replaceMathBracket } from "@/utils/markdown.uts";
 import { adaptHistoryMessage } from "@/subpackages/utils/historyMessageAdapter";
+import { normalizeRenderUiProcessingData } from "@/subpackages/utils/openUiArtifactAdapter.uts";
 import { createMessageInfoFromAny, messageToJsonObject, readRawField } from "@/subpackages/utils/messageInfoClass.uts";
 import AgentDetailUtils from "./AgentDetailUtils.uts";
 import { TEMP_CONVERSATION_UID } from "@/constants/common.constants";
@@ -98,6 +99,7 @@ import {
 import { t } from "@/utils/i18n";
 import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
 import { buildAssistantSpeakableText } from "@/subpackages/utils/voice/textFilter";
+import { extractOpenUiArtifactFromMessage } from "@/utils/openUiSchema.uts";
 import {
   isAssistantMessageInfo,
   isInFlightAssistantMessage,
@@ -158,6 +160,49 @@ function readMessageThink(msg: MessageInfo | null): string {
   }
   const raw = readRawField(msg, "think");
   return raw != null ? `${raw}` : "";
+}
+
+function waitForOpenUiHydrate(delayMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), delayMs);
+  });
+}
+
+/** 最后一条助手消息是否含 OpenUI 占位但尚未拿到 artifact。 */
+function hasUnresolvedOpenUi(message: MessageInfo | null): boolean {
+  if (message == null) {
+    return false;
+  }
+  const body = readMessageText(message);
+  const normalizedBody = body.toLowerCase();
+  const hasRenderMarker =
+    normalizedBody.indexOf("nuwax_render_openui") >= 0 ||
+    normalizedBody.indexOf("renderui") >= 0;
+  if (!hasRenderMarker) {
+    return false;
+  }
+  const list = message.processingList != null
+    ? message.processingList as any[]
+    : [] as any[];
+  return extractOpenUiArtifactFromMessage(body, list) == null;
+}
+
+/**
+ * 流式草稿的 messageType 在 Android 上可能为空或仍是接口枚举对象；
+ * 不依赖角色枚举，按正文中的 renderUI 标记定位最近一条 OpenUI 消息。
+ */
+function findLatestOpenUiMessage(list: MessageInfo[]): MessageInfo | null {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const message = list[i];
+    const body = readMessageText(message).toLowerCase();
+    if (
+      body.indexOf("nuwax_render_openui") >= 0 ||
+      body.indexOf("renderui") >= 0
+    ) {
+      return message;
+    }
+  }
+  return null;
 }
 
 /** 将编辑后的 draft 转为 MessageInfo 实例 */
@@ -1081,7 +1126,11 @@ export default class AgentDetailService {
       // App：executeId/status 多在 result 内；必须提升到顶层，否则：
       // 1) 容器块只插入一次且 status 停在 EXECUTING
       // 2) processingList 无法按 executeId 匹配 FINISHED → 卡片一直显示「·」
-      const blockSource = normalizeToolCallProcessingData(responseData);
+      // OpenUI 使用独立 RENDER_UI 契约：先按最新 Web 接入结构标准化，再回退通用工具事件。
+      const openUiBlockSource = normalizeRenderUiProcessingData(res, responseData);
+      const blockSource = openUiBlockSource != null
+        ? openUiBlockSource
+        : normalizeToolCallProcessingData(responseData);
       const executeIdRaw = readRawField(blockSource, "executeId");
 
       const accumulatedText = getCustomBlock(
@@ -1607,6 +1656,10 @@ export default class AgentDetailService {
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
 
+    // RENDER_UI 完成结果可能只在会话详情落库，live SSE 仅收到 EXECUTING。
+    // 仅当最后一条消息仍有未决 OpenUI 时回补，避免所有普通会话额外请求。
+    await this.hydrateCompletedOpenUiIfNeeded(isTempChat);
+
     // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
     if (!isTempChat) {
       if (this.data.isSuggest.value && this.isAllowSuggest) {
@@ -1646,6 +1699,39 @@ export default class AgentDetailService {
       }
     }
     // 正常 onComplete 不做 recover；异常断流由 finalize → 详情回补，EXECUTING 由页面轮询开 sub
+  }
+
+  /** 用历史详情链路回补已完成但 live SSE 未携带 ref 的 OpenUI。 */
+  private async hydrateCompletedOpenUiIfNeeded(isTempChat: boolean): Promise<void> {
+    if (isTempChat) {
+      return;
+    }
+    const conversationId = this.data.conversationId.value;
+    if (conversationId == null || conversationId == 0) {
+      return;
+    }
+    // RENDER_UI ref 由后端异步落库，实测可能晚于正文流结束数秒。
+    const delays = [250, 750, 1500, 3000, 6000] as number[];
+    for (let i = 0; i < delays.length; i++) {
+      const currentList = this.data.messageList.value;
+      const currentOpenUiMessage = findLatestOpenUiMessage(currentList);
+      if (!hasUnresolvedOpenUi(currentOpenUiMessage)) {
+        return;
+      }
+      await waitForOpenUiHydrate(delays[i]);
+      // 用户已发起下一轮时，禁止旧完成回调覆盖新消息。
+      if (this.data.isConversationActive.value || chatService.isCurrentlyStreaming) {
+        return;
+      }
+      try {
+        const res = await apiAgentConversation(conversationId);
+        if (apiResCode(res) == SUCCESS_CODE) {
+          await this.handleQueryConversation(res);
+        }
+      } catch (_e) {
+        // 下一轮重试；最终失败时保留“界面生成中”，不阻断正常聊天完成流程。
+      }
+    }
   }
 
   /**

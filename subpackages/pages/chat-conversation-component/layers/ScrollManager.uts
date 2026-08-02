@@ -19,14 +19,17 @@ export default class ScrollManager {
   private settleScrollScheduled: boolean = false;
   /**
    * 自动滚底节流定时器。
-   * 采用 leading + trailing：首击立刻滚，窗口内再请求则窗口结束再补滚一次，
-   * 避免「忽略中间请求」导致流式输出时一顿一顿才跟底。
+   * leading + trailing：首击立刻滚，窗口内再请求则窗口结束补滚，跟上内容增高。
    */
   private scrollThrottleTimer: number = 0;
   /** 节流窗口内是否还有未消费的滚底请求 */
   private scrollThrottlePending: boolean = false;
-  /** 流式跟底节流窗口（ms），约一帧～两帧，兼顾丝滑与性能 */
-  private readonly SCROLL_THROTTLE_MS: number = 48;
+  /**
+   * 流式跟底节流（ms）。贴近 UI 冲刷（40ms）与一帧，过大（如 80）会呈一段一段跟底。
+   */
+  private readonly SCROLL_THROTTLE_MS: number = 32;
+  /** 流式内容晚撑高（工具卡片 / Markdown）后的短补滚定时器 */
+  private streamFollowTimers: number[] = [];
   /** setIsInScrollBottom 节流 */
   private bottomCheckTimer: number = 0;
   private pendingBottomEvent: UniScrollEvent | null = null;
@@ -72,7 +75,7 @@ export default class ScrollManager {
     }, this.SCROLL_THROTTLE_MS) as number;
   }
 
-  /** 实际执行 scroll-into-view 滚底 */
+  /** 实际执行 scroll-into-view 滚底（官方推荐） */
   private doScrollToLastMsg(userClick: boolean): void {
     this.data.autoToLastMsg.value = true;
     this.data.scrollIntoView.value = "";
@@ -81,6 +84,10 @@ export default class ScrollManager {
       this.data.scrollIntoView.value = "last-msg";
       this.data.scrollInBottom.value = true;
     });
+    // 自动跟底：布局晚到（工具调用卡片等）时短时补滚，避免「先停一会再跳」
+    if (userClick != true) {
+      this.scheduleStreamFollowRetries();
+    }
   }
 
   private clearScrollThrottle(): void {
@@ -89,6 +96,47 @@ export default class ScrollManager {
       this.scrollThrottleTimer = 0;
     }
     this.scrollThrottlePending = false;
+  }
+
+  private clearStreamFollowRetries(): void {
+    for (let i = 0; i < this.streamFollowTimers.length; i++) {
+      clearTimeout(this.streamFollowTimers[i]);
+    }
+    this.streamFollowTimers = [];
+  }
+
+  /**
+   * 流式自动跟底后短补滚：等工具卡片 / Markdown 撑高再滚一次。
+   * 用户上滑（autoToLastMsg=false / scrollTouch）时立刻停。
+   */
+  private scheduleStreamFollowRetries(): void {
+    this.clearStreamFollowRetries();
+    const delays = [50, 120, 240];
+    for (let i = 0; i < delays.length; i++) {
+      const delay = delays[i];
+      const timerId = setTimeout((): void => {
+        if (this.data.autoToLastMsg.value != true) {
+          this.clearStreamFollowRetries();
+          return;
+        }
+        if (this.data.scrollTouch.value == true) {
+          return;
+        }
+        // 绕过节流，直接 into-view，吃到晚到的高度
+        this.data.scrollIntoView.value = "";
+        nextTick(() => {
+          if (this.data.autoToLastMsg.value != true) {
+            return;
+          }
+          if (this.data.scrollTouch.value == true) {
+            return;
+          }
+          this.data.scrollIntoView.value = "last-msg";
+          this.data.scrollInBottom.value = true;
+        });
+      }, delay) as number;
+      this.streamFollowTimers.push(timerId);
+    }
   }
 
   /**
@@ -125,10 +173,21 @@ export default class ScrollManager {
     ]);
   }
 
+  /**
+   * 发送消息后滚底（含语音转写发送）。
+   * 须在用户/助手气泡已写入 messageList 之后调用：
+   * 发送前那次 scroll-into-view 打在旧锚点上；流式期 list watch 又会跳过滚底，
+   * iOS 上语音发送后常见停在旧位置。短窗口分批补滚覆盖布局晚到。
+   */
+  scrollToLastMsgAfterSend(): void {
+    this.armFollowSettle(2500, [0, 80, 200, 450, 900, 1600]);
+  }
+
   /** 页面卸载时清理历史滚底 / 节流滚底定时器 */
   dispose(): void {
     this.clearHistorySettle();
     this.clearScrollThrottle();
+    this.clearStreamFollowRetries();
     if (this.bottomCheckTimer != 0) {
       clearTimeout(this.bottomCheckTimer);
       this.bottomCheckTimer = 0;
@@ -266,37 +325,30 @@ export default class ScrollManager {
       const isInBottom = diff < 50;
       this.data.scrollInBottom.value = isInBottom;
 
-      // 如果滑到底部，自动恢复自动滚动
-      if (isInBottom) {
-        this.data.autoToLastMsg.value = true;
-      }
-
       const isScrollingUp = scrollTop < this.lastScrollTop;
       this.lastScrollTop = scrollTop;
+      const userScrolling =
+        this.data.scrollTouch.value == true ||
+        this.data.mouseScroll.value == true;
 
-      // 历史稳定期：仅手指触摸上滑才打断；忽略程序滚 / 布局跳动误判
-      if (this.isHistorySettling() == true) {
-        if (
-          this.data.scrollTouch.value == true &&
-          isScrollingUp &&
-          !isInBottom
-        ) {
-          this.data.autoToLastMsg.value = false;
+      // 手指/滚轮上滑：立刻停跟底。
+      // 以前要求先离开底部 50px，导致「上滑一点点」仍被判在底部，
+      // 且下方会把 autoToLastMsg 强制拉回 true，松手后再被 touchend 滚回底。
+      if (userScrolling == true && isScrollingUp == true) {
+        this.data.autoToLastMsg.value = false;
+        if (isInBottom != true) {
           this.data.scrollInBottom.value = false;
+        }
+        this.clearStreamFollowRetries();
+        if (this.isHistorySettling() == true) {
           this.clearHistorySettle();
         }
         return;
       }
 
-      // 只有在用户主动滚动（触摸或鼠标）时才可能禁用自动滚动
-      // 且只在向上滚动（远离底部）时禁用
-      if (
-        (this.data.scrollTouch.value || this.data.mouseScroll.value) &&
-        isScrollingUp &&
-        !isInBottom
-      ) {
-        this.data.autoToLastMsg.value = false;
-        this.data.scrollInBottom.value = false;
+      // 非上滑且已在底部（滑回底 / 程序滚底）：恢复跟底
+      if (isInBottom == true) {
+        this.data.autoToLastMsg.value = true;
       }
     });
   }

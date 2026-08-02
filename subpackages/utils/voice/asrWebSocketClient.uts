@@ -2,9 +2,10 @@
  * App ASR WebSocket 客户端。
  * 协议：start → asr_ready → Binary PCM16 → stop → asr_result
  *
- * 生命周期（一问一答 / 按下说话）：
- * - 按下录音 → begin() 新建连接并 start
- * - 收到 asr_result / abort / 失败 → 关闭连接（不回收待命、不进页长连）
+ * 生命周期（一问一答 / 按住说话）：
+ * - Recorder onStart：preheatConnect() 只建 WebSocket（不发 start）；轻触未开录不预热
+ * - 松手：begin() 发 start → asr_ready → 推完整 PCM → stop → asr_result → 关连
+ * - 勿在按下/预热时发 start：按住空等会被服务端 VAD/超时截断漏字
  */
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { API_BASE_URL } from "@/constants/config";
@@ -117,8 +118,8 @@ function readAccessToken(): string {
 
 /** 等待 asr_ready 超时（建连 + start），避免假死卡在「识别中」 */
 const ASR_READY_TIMEOUT_MS: number = 15000;
-/** 已发 stop 后等待 asr_result 超时 */
-const ASR_RESULT_TIMEOUT_MS: number = 25000;
+/** 已发 stop 后等待 asr_result（长录音服务端处理需更久） */
+const ASR_RESULT_TIMEOUT_MS: number = 60000;
 
 export class AsrWebSocketClient {
   private socketTask: SocketTask | null = null;
@@ -159,12 +160,26 @@ export class AsrWebSocketClient {
   }
 
   /**
-   * 兼容旧调用：ASR 不再进页预连。
-   * 仅标记允许页内生命周期；真正建连由 begin() 完成。
+   * 兼容旧调用：进页只标记活跃，不建连（避免空闲长连）。
+   * 真正预热在按下录音时 preheatConnect()。
    */
   enableWarmupAndConnect(): void {
     this.warmupEnabled = true;
-    // 故意不 connectWarmTcp：随录随建，避免空闲长连
+  }
+
+  /**
+   * 按下录音：只 connect WebSocket，不发业务 start。
+   * 预热失败仅打日志，不影响本地录音；松手 begin 时再正式建连/报错。
+   */
+  preheatConnect(): void {
+    this.warmupEnabled = true;
+    if (this.isWarmOpen() == true || this.isReady() == true) {
+      return;
+    }
+    if (this.connecting == true && this.socketTask != null) {
+      return;
+    }
+    this.connectWarmTcp();
   }
 
   /** 离开页面 / 进后台：关闭 ASR 连接 */
@@ -186,11 +201,28 @@ export class AsrWebSocketClient {
     this.keepalive.resume();
   }
 
+  /** 预热：TCP open 后不发 start */
+  private connectWarmTcp(): void {
+    this.openSocket(
+      true,
+      (): void => {
+        this.warmIdle = true;
+        this.starting = false;
+        this.ready = false;
+      },
+      (_text: string, _ok: boolean, _errorMessage: string): void => {
+        console.warn("[ASR] unexpected result during warmup");
+      },
+      (message: string): void => {
+        console.warn("[ASR] warmup fail: " + message);
+      },
+    );
+  }
+
   /**
-   * 开始一轮识别：优先复用尚未 start 的 TCP；否则新建连接。
+   * 松手后开始识别：优先复用预热 TCP 只发 start；否则新建连接并 start。
    * 防重连风暴：connecting / 已有 socket 时只挂回调，不二次 connectSocket。
-   * 注意：不在此处启动 ready 超时——长按录音可能超过超时窗口；
-   * 松手后仍未 ready 时由 watchReadyAfterStop() 启动。
+   * ready 超时由 watchReadyAfterStop() 在松手后启动。
    */
   begin(
     onReady: AsrReadyCallback,

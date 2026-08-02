@@ -2,8 +2,10 @@
  * App ASR WebSocket 客户端。
  * 协议：start → asr_ready → Binary PCM16 → stop → asr_result
  *
- * 预热：仅建立 TCP（不发 start），录音 begin 时再 start。
- * 避免「进页就 asr_ready、空闲后再推 PCM」被服务端判 no_speech。
+ * 生命周期（一问一答 / 按住说话）：
+ * - Recorder onStart：preheatConnect() 只建 WebSocket（不发 start）；轻触未开录不预热
+ * - 松手：begin() 发 start → asr_ready → 推完整 PCM → stop → asr_result → 关连
+ * - 勿在按下/预热时发 start：按住空等会被服务端 VAD/超时截断漏字
  */
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { API_BASE_URL } from "@/constants/config";
@@ -114,6 +116,11 @@ function readAccessToken(): string {
   }
 }
 
+/** 等待 asr_ready 超时（建连 + start），避免假死卡在「识别中」 */
+const ASR_READY_TIMEOUT_MS: number = 15000;
+/** 已发 stop 后等待 asr_result（长录音服务端处理需更久） */
+const ASR_RESULT_TIMEOUT_MS: number = 60000;
+
 export class AsrWebSocketClient {
   private socketTask: SocketTask | null = null;
   private generation: number = 0;
@@ -133,6 +140,10 @@ export class AsrWebSocketClient {
   private warmIdle: boolean = false;
   /** 连接成功后的心跳保活（预热 / 业务会话共用） */
   private keepalive: SpeechWsKeepalive = new SpeechWsKeepalive();
+  /** 等待 asr_ready 的超时定时器 */
+  private readyTimeoutId: number = 0;
+  /** 等待 asr_result 的超时定时器 */
+  private resultTimeoutId: number = 0;
 
   isReady(): boolean {
     return this.ready == true && this.socketTask != null;
@@ -148,8 +159,19 @@ export class AsrWebSocketClient {
     );
   }
 
-  /** 进入会话页：只预连 TCP，不发 start */
+  /**
+   * 兼容旧调用：进页只标记活跃，不建连（避免空闲长连）。
+   * 真正预热在按下录音时 preheatConnect()。
+   */
   enableWarmupAndConnect(): void {
+    this.warmupEnabled = true;
+  }
+
+  /**
+   * 按下录音：只 connect WebSocket，不发业务 start。
+   * 预热失败仅打日志，不影响本地录音；松手 begin 时再正式建连/报错。
+   */
+  preheatConnect(): void {
     this.warmupEnabled = true;
     if (this.isWarmOpen() == true || this.isReady() == true) {
       return;
@@ -160,6 +182,7 @@ export class AsrWebSocketClient {
     this.connectWarmTcp();
   }
 
+  /** 离开页面 / 进后台：关闭 ASR 连接 */
   disableWarmupAndDisconnect(): void {
     this.warmupEnabled = false;
     this.warmIdle = false;
@@ -178,8 +201,28 @@ export class AsrWebSocketClient {
     this.keepalive.resume();
   }
 
+  /** 预热：TCP open 后不发 start */
+  private connectWarmTcp(): void {
+    this.openSocket(
+      true,
+      (): void => {
+        this.warmIdle = true;
+        this.starting = false;
+        this.ready = false;
+      },
+      (_text: string, _ok: boolean, _errorMessage: string): void => {
+        console.warn("[ASR] unexpected result during warmup");
+      },
+      (message: string): void => {
+        console.warn("[ASR] warmup fail: " + message);
+      },
+    );
+  }
+
   /**
-   * 开始一轮识别：复用预热 TCP 则只发 start；否则新建连接。
+   * 松手后开始识别：优先复用预热 TCP 只发 start；否则新建连接并 start。
+   * 防重连风暴：connecting / 已有 socket 时只挂回调，不二次 connectSocket。
+   * ready 超时由 watchReadyAfterStop() 在松手后启动。
    */
   begin(
     onReady: AsrReadyCallback,
@@ -189,6 +232,8 @@ export class AsrWebSocketClient {
     this.onReadyCb = onReady;
     this.onResultCb = onResult;
     this.onErrorCb = onError;
+    this.clearResultTimeout();
+    this.clearReadyTimeout();
 
     // 业务会话已 asr_ready（极少见）：直接开录
     if (this.isReady() == true && this.warmIdle == false) {
@@ -196,7 +241,7 @@ export class AsrWebSocketClient {
       return;
     }
 
-    // 预热 TCP 已 open：发 start，等 asr_ready（不 connectSocket）
+    // 已有 open 且未 start：发 start，等 asr_ready（不 connectSocket）
     if (this.isWarmOpen() == true) {
       this.warmIdle = false;
       this.starting = true;
@@ -204,9 +249,8 @@ export class AsrWebSocketClient {
       return;
     }
 
-    // 建连中：挂好回调，等 open 后由 onOpen 发 start（见 connectForSession）
+    // 建连中：挂好回调，等 open 后由 onOpen 发 start
     if (this.connecting == true && this.socketTask != null) {
-      // 若仍是纯预热建连，标记为业务占用，open 后发 start
       this.warmIdle = false;
       return;
     }
@@ -214,22 +258,64 @@ export class AsrWebSocketClient {
     this.connectForSession(onReady, onResult, onError);
   }
 
-  /** 预热：TCP open 后不发 start */
-  private connectWarmTcp(): void {
-    this.openSocket(
-      true,
-      () => {
-        this.warmIdle = true;
-        this.starting = false;
-        this.ready = false;
-      },
-      (_text: string, _ok: boolean, _errorMessage: string) => {
-        console.warn("[ASR] unexpected result during warmup");
-      },
-      (message: string) => {
-        console.warn("[ASR] warmup failed (no auto-retry): " + message);
-      },
-    );
+  /**
+   * 松手时录音已结束但尚未 asr_ready：启动 ready 看门狗。
+   * 超时走 fail → 录音按钮复位，避免一直停在「识别中」。
+   */
+  watchReadyAfterStop(): void {
+    if (this.ready == true) {
+      this.clearReadyTimeout();
+      return;
+    }
+    this.armReadyTimeout();
+  }
+
+  private clearReadyTimeout(): void {
+    if (this.readyTimeoutId != 0) {
+      clearTimeout(this.readyTimeoutId);
+      this.readyTimeoutId = 0;
+    }
+  }
+
+  private clearResultTimeout(): void {
+    if (this.resultTimeoutId != 0) {
+      clearTimeout(this.resultTimeoutId);
+      this.resultTimeoutId = 0;
+    }
+  }
+
+  private clearAllTimeouts(): void {
+    this.clearReadyTimeout();
+    this.clearResultTimeout();
+  }
+
+  /** 等待 asr_ready；到期走 fail → 录音按钮 onError 复位 UI */
+  private armReadyTimeout(): void {
+    this.clearReadyTimeout();
+    const expectedGeneration = this.generation;
+    this.readyTimeoutId = setTimeout((): void => {
+      this.readyTimeoutId = 0;
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      if (this.ready == true) {
+        return;
+      }
+      this.fail("ASR 连接超时，请重试");
+    }, ASR_READY_TIMEOUT_MS) as number;
+  }
+
+  /** 已发 stop 后等待 asr_result */
+  private armResultTimeout(): void {
+    this.clearResultTimeout();
+    const expectedGeneration = this.generation;
+    this.resultTimeoutId = setTimeout((): void => {
+      this.resultTimeoutId = 0;
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      this.fail("ASR 识别超时，请重试");
+    }, ASR_RESULT_TIMEOUT_MS) as number;
   }
 
   /** 业务：open 后立即 start */
@@ -367,19 +453,7 @@ export class AsrWebSocketClient {
       this.starting = false;
       this.warmIdle = false;
       this.socketTask = null;
-      // 仍在会话页：对端/网关掐断后单次补预热（业务路径本身不再主动关连）
-      if (this.warmupEnabled == true) {
-        setTimeout(() => {
-          if (
-            this.warmupEnabled == true &&
-            this.isWarmOpen() == false &&
-            this.connecting == false &&
-            this.socketTask == null
-          ) {
-            this.connectWarmTcp();
-          }
-        }, 300);
-      }
+      // ASR 用完即关：对端关闭后不再自动重连，等下次 begin
     });
   }
 
@@ -447,6 +521,8 @@ export class AsrWebSocketClient {
     const payload = new UTSJSONObject();
     payload["type"] = "stop";
     const socket = this.socketTask!;
+    // 先挂结果超时：即使 send success 回调缺失，也不会永远停在 uploading
+    this.armResultTimeout();
     try {
       socket.send({
         data: JSON.stringify(payload),
@@ -462,67 +538,28 @@ export class AsrWebSocketClient {
   }
 
   /**
-   * 取消本轮识别。
-   * 策略：只要 TCP 还在就不断连——待命则清回调；进行中则发 stop 收回待命。
+   * 取消本轮识别并关闭连接（录完即关 / 用户取消）。
    */
   abort(): void {
-    // 已在预热待命：不断连
-    if (this.isWarmOpen() == true) {
-      this.onReadyCb = null;
-      this.onResultCb = null;
-      this.onErrorCb = null;
-      return;
-    }
-    // 业务进行中且 TCP 仍开：发 stop，由 asr_result 收回待命（不断连）
-    if (
-      this.socketTask != null &&
-      this.socketOpen == true &&
-      (this.ready == true || this.starting == true)
-    ) {
-      this.onReadyCb = null;
-      this.onErrorCb = null;
-      this.onResultCb = (
-        _text: string,
-        _ok: boolean,
-        _errorMessage: string,
-      ): void => {};
-      this.finish();
-      return;
-    }
-    // 半开/无 socket：仅清状态；页内由 onClose 或 enableWarmup 补连，此处不主动 close
-    this.onReadyCb = null;
-    this.onResultCb = null;
-    this.onErrorCb = null;
-    this.ready = false;
-    this.starting = false;
-    this.connecting = false;
-    if (this.warmupEnabled == true && this.socketTask == null) {
-      this.connectWarmTcp();
-    }
-  }
-
-  /** 一轮识别结束后：保留 TCP，回到预热待命（不 connectSocket） */
-  private recycleToWarmIdle(): void {
-    this.ready = false;
-    this.connecting = false;
-    this.starting = false;
-    this.warmIdle = true;
-    this.socketOpen = this.socketTask != null;
-    this.onReadyCb = null;
-    this.onResultCb = null;
-    this.onErrorCb = null;
-    if (this.socketOpen == true) {
-      this.startKeepalive();
-    }
+    this.abortInternal(true);
   }
 
   /**
-   * 真正关连：仅离开会话页 disableWarmup 时调用。
+   * 一轮识别结束后关闭连接（不再回收待命长连）。
+   * bump generation，忽略关连过程中迟到的 onMessage/onClose 副作用。
+   */
+  private closeAfterSession(): void {
+    this.abortInternal(true);
+  }
+
+  /**
+   * 真正关连。
    */
   private abortInternal(bumpGeneration: boolean): void {
     if (bumpGeneration) {
       this.generation += 1;
     }
+    this.clearAllTimeouts();
     this.stopKeepalive();
     this.ready = false;
     this.connecting = false;
@@ -575,6 +612,7 @@ export class AsrWebSocketClient {
       return;
     }
     if (type == "asr_ready") {
+      this.clearReadyTimeout();
       this.ready = true;
       this.connecting = false;
       this.starting = false;
@@ -584,6 +622,7 @@ export class AsrWebSocketClient {
         cb();
       }
     } else if (type == "asr_result") {
+      this.clearResultTimeout();
       const textVal = message["text"];
       const text = textVal != null ? `${textVal}` : "";
       const okVal = message["ok"];
@@ -594,19 +633,8 @@ export class AsrWebSocketClient {
       const errVal = message["error"];
       const errorMessage = errVal != null ? `${errVal}` : "";
       const cb = this.onResultCb;
-      // 只要 TCP 还在：收回待命，绝不主动 close（复用同一 socket 时不可 bump generation）
-      if (this.socketTask != null) {
-        this.recycleToWarmIdle();
-      } else {
-        this.ready = false;
-        this.connecting = false;
-        this.starting = false;
-        this.socketOpen = false;
-        this.warmIdle = false;
-        this.onReadyCb = null;
-        this.onResultCb = null;
-        this.onErrorCb = null;
-      }
+      // 识别结束：先关连再回调（随录随关）
+      this.closeAfterSession();
       if (cb != null) {
         cb(text, ok, errorMessage);
       }
@@ -628,24 +656,12 @@ export class AsrWebSocketClient {
   }
 
   /**
-   * 业务失败：通知回调并收回待命，不断开 TCP。
-   * 真正关连只在 disableWarmupAndDisconnect。
+   * 业务失败：通知回调并关闭连接。
    */
   private fail(message: string): void {
     console.error("[ASR] fail " + message);
     const cb = this.onErrorCb;
-    if (this.socketTask != null) {
-      this.recycleToWarmIdle();
-    } else {
-      this.onReadyCb = null;
-      this.onResultCb = null;
-      this.onErrorCb = null;
-      this.ready = false;
-      this.starting = false;
-      this.connecting = false;
-      this.warmIdle = false;
-      this.socketOpen = false;
-    }
+    this.closeAfterSession();
     if (cb != null) {
       cb(message);
     }

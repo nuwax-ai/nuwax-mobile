@@ -255,7 +255,7 @@
           <view
             :style="{ visibility: scrollInBottom ? 'hidden' : 'visible' }"
             class="scroll-to-bottom"
-            @click="scrollToLastMsg(false)"
+            @click="scrollToLastMsg(true)"
           >
             <svg-icon name="icon-a-Chevrondown" />
           </view>
@@ -403,7 +403,7 @@
   import { ttsWebSocketPlayer } from "@/subpackages/utils/voice/ttsWebSocketPlayer";
   import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
   import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
-  import { speechSocketWarmup, SPEECH_BACKGROUND_SUSPEND_DELAY_MS } from "@/subpackages/utils/voice/speechSocketWarmup";
+  import { speechSocketWarmup, CHAT_PAGE_LONG_HIDE_MS } from "@/subpackages/utils/voice/speechSocketWarmup";
   import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
   import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
   import {
@@ -1065,17 +1065,39 @@
    * 导致工具栏一直 isSpeaking。发新消息前须 resumeStreamSpeakAllowance()。
    */
   let streamSpeakAllowed: boolean = true;
+  /** TTS 喂入合并定时器（仅节流 onStreamChunk，不影响 UI 刷新） */
+  let feedSpeakTimer: number = 0;
+  /** TTS 喂入合并窗口（ms）：降低长回复上 cleanText/分句频率 */
+  const FEED_SPEAK_COALESCE_MS: number = 100;
 
   function resumeStreamSpeakAllowance(): void {
     streamSpeakAllowed = true;
   }
 
+  function clearFeedSpeakTimer(): void {
+    if (feedSpeakTimer != 0) {
+      clearTimeout(feedSpeakTimer);
+      feedSpeakTimer = 0;
+    }
+  }
+
+  /** 仅停播并清空喂入状态，不改 streamSpeakAllowed */
+  function interruptStreamSpeakPlayback(): void {
+    clearFeedSpeakTimer();
+    headlessStreamSpeakId = "";
+    feedSpeakBodyText = "";
+    feedSpeakMsgId = "";
+    stopAllSpeechPlayback();
+  }
+
   function stopAllStreamSpeech(hardStop: boolean): void {
+    clearFeedSpeakTimer();
     headlessStreamSpeakId = "";
     const tailBody = feedSpeakBodyText;
     feedSpeakBodyText = "";
     feedSpeakMsgId = "";
     if (hardStop == true) {
+      // 用户点停止 / 离页：禁止迟到 feed 再 begin
       streamSpeakAllowed = false;
       stopAllSpeechPlayback();
     } else {
@@ -1086,9 +1108,10 @@
     }
   }
 
-  /** 服务层发送新消息时打断播报：清本地流式播报状态 */
+  /** 服务层发送新消息：只停播，保持本轮可播额度 */
   function handleStreamSpeakInterrupt(_data: any): void {
-    stopAllStreamSpeech(true);
+    interruptStreamSpeakPlayback();
+    streamSpeakAllowed = true;
   }
 
   /**
@@ -1140,13 +1163,15 @@
     const speakSettings = cloneVoiceSettings(settings);
     speakSettings.autoPlay = true;
     voiceStreamSpeaker.begin(msgId, speakSettings);
+    // begin/stop 会拆掉「按下录音」时的 TTS 预热；立刻重建，避免首句合成卡在建连上被 SSE 饿死
+    ttsWebSocketPlayer.enableWarmupAndConnect();
     // preferMsgId 已指定时：正文以 preferBody 为准（可空），禁止回落到上一条助手全文
-    const body =
-      preferMsgId.length > 0
-        ? preferBody
-        : preferBody.length > 0
-          ? preferBody
-          : assistantStreamText.value;
+    let body = assistantStreamText.value;
+    if (preferMsgId.length > 0) {
+      body = preferBody;
+    } else if (preferBody.length > 0) {
+      body = preferBody;
+    }
     if (body.length > 0) {
       voiceStreamSpeaker.onStreamChunk(body, "", false);
     }
@@ -1184,7 +1209,8 @@
   }
 
   /**
-   * 立刻喂播报：SSE 一旦有可朗读正文就推给 TTS，不做防抖延迟。
+   * 喂播报：更新最新正文快照；流式中合并推送，结束时立刻冲刷尾句。
+   * 合并只作用于 TTS，不影响 messageList / Markdown UI。
    */
   function feedHeadlessStreamSpeakNow(
     finished: boolean,
@@ -1197,7 +1223,19 @@
     if (messageId.length > 0) {
       feedSpeakMsgId = messageId;
     }
-    feedHeadlessStreamSpeak(finished, feedSpeakBodyText);
+    // 流结束必须立刻冲刷，避免尾句被合并窗口截断
+    if (finished == true) {
+      clearFeedSpeakTimer();
+      feedHeadlessStreamSpeak(true, feedSpeakBodyText);
+      return;
+    }
+    if (feedSpeakTimer != 0) {
+      return;
+    }
+    feedSpeakTimer = setTimeout((): void => {
+      feedSpeakTimer = 0;
+      feedHeadlessStreamSpeak(false, feedSpeakBodyText);
+    }, FEED_SPEAK_COALESCE_MS);
   }
 
   /**
@@ -1206,9 +1244,6 @@
    */
   function handleStreamSpeakFeed(data: any): void {
     if (voiceConversationEnabled.value == true) {
-      return;
-    }
-    if (streamSpeakAllowed != true) {
       return;
     }
     if (data == null) {
@@ -1220,6 +1255,13 @@
     const bodyText =
       obj["bodyText"] != null ? `${obj["bodyText"]}` : "";
     const finished = obj["finished"] == true;
+    // 有正文/终态喂入时兜底恢复额度（防止发送路径漏 resume）
+    if (streamSpeakAllowed != true) {
+      if (bodyText.length == 0 && finished != true) {
+        return;
+      }
+      streamSpeakAllowed = true;
+    }
     if (finished == true) {
       ensureHeadlessStreamSpeak(messageId, bodyText);
       feedHeadlessStreamSpeakNow(true, bodyText, messageId);
@@ -1629,12 +1671,26 @@
 
   // ChatFinished 事件处理函数（带节流）
   // 注意：须位于 handleSendMessage 等引用之前（UTS 无提升）
+  // 他端点停止也会推此事件：需掐断本端 SSE/sub，并复位播报图标
   const handleChatFinishedInternal = (event: any) => {
     const eventConvIdStr = `${(event as UTSJSONObject)["conversationId"]}`;
     if (conversationId.value == parseInt(eventConvIdStr, 10)) {
       throttle(() => {
-        if (data.isConversationActive.value == true) {
+        // 仍在收 live/sub：他端停止或任务结束，强制收尾并停播报
+        const stillReceiving =
+          chatService.isCurrentlyStreaming == true ||
+          service.isSubConversationSubscribed == true;
+        if (stillReceiving == true) {
+          chatService.abort();
+          service.abortSubConversation();
+          stopAllStreamSpeech(true);
           data.isConversationActive.value = false;
+        } else if (data.isConversationActive.value == true) {
+          // 流已断但会话态未清：只清态；若仍在播报则停（避免误伤「正常结束后的尾句播报」）
+          data.isConversationActive.value = false;
+          if (voiceStreamSpeaker.isBusy() == true) {
+            stopAllStreamSpeech(true);
+          }
         }
 
         const convId = conversationId.value;
@@ -1657,13 +1713,14 @@
 
   // 发送消息
   const handleSendMessage = (_data: any) => {
-    // 发送新消息时停止当前 TTS 播报（工具栏订阅会同步 UI）
-    stopAllStreamSpeech(true);
+    // 停上一轮播报，但保持本轮可播（勿 hardStop，否则 streamSpeakFeed 会被吞掉）
+    interruptStreamSpeakPlayback();
+    streamSpeakAllowed = true;
 
     // 与 dev 一致：一点击发送就清空问题建议，避免会话进行中仍展示
     data.chatSuggestList.value = [] as any[];
 
-    // 取消订阅 ChatFinished 事件（发送新消息时，旧会话已结束）
+    // 先卸旧监听，发送后再挂上，以便本轮他端停止能收到 ChatFinished
     eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
 
     data.autoToLastMsg.value = true;
@@ -1814,6 +1871,8 @@
     if (newSpeakId.length > 0) {
       ensureHeadlessStreamSpeak(newSpeakId, "");
     }
+    // 本轮会话进行中监听结束/他端停止（与进页 EXECUTING 续接时的订阅一致）
+    eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
   };
 
   /**
@@ -2047,8 +2106,17 @@
   });
 
   // ==================== 页面加载处理 ====================
-  const handleScrollToLastMsg = async () => {
+  /**
+   * 滚到底部。
+   * @param fromListWatch true 表示由 messageList / lastMessage 监听触发；
+   *   流式进行中交给 streamMessageUpdate，避免与 deep watch 叠加重置 scroll-into-view。
+   * 注意：Android UTS 对 async 箭头函数默认参数支持不稳，故不使用默认值，调用方显式传参。
+   */
+  const handleScrollToLastMsg = async (fromListWatch: boolean) => {
     // 注意：不要在这里调用 setIsInScrollBottom()，因为没有事件参数会导致状态错误
+    if (fromListWatch == true && isConversationActive.value == true) {
+      return;
+    }
     lockAutoToLastMsg();
     if (shouldAutoScrollToLast() == true) {
       await nextTick();
@@ -2059,10 +2127,40 @@
       }, 100);
     }
   };
-  watch(lastMessage, handleScrollToLastMsg, { deep: true });
 
-  // 消息列表变化处理
-  watch(data.messageList, handleScrollToLastMsg, { deep: true });
+  /** 列表监听触发的滚底（流式期跳过） */
+  const handleScrollToLastMsgFromListWatch = () => {
+    handleScrollToLastMsg(true);
+  };
+
+  // 最后一条消息内容变化（非流式：状态更新 / 历史落库等）；流式期跳过
+  watch(lastMessage, handleScrollToLastMsgFromListWatch, { deep: true });
+
+  // 仅监听条数变化，避免对整表 deep watch 遍历嵌套字段
+  watch(
+    (): number => data.messageList.value.length,
+    handleScrollToLastMsgFromListWatch,
+  );
+
+  /**
+   * 流式打字机正文变化：实时跟底（不依赖 40ms messageList 冲刷）。
+   * 上滑打断仍由 shouldAutoScrollToLast（scrollTouch / autoToLastMsg）守卫。
+   */
+  watch(
+    (): string => streamingAssistantText.value,
+    (newText: string) => {
+      if (newText.length == 0) {
+        return;
+      }
+      if (isConversationActive.value != true) {
+        return;
+      }
+      if (shouldAutoScrollToLast() != true) {
+        return;
+      }
+      scrollToLastMsg(false);
+    },
+  );
 
   // 问题建议列表变化处理
   watch(
@@ -2070,7 +2168,7 @@
     (newVal: any[]) => {
       if (newVal != null) {
         if ((newVal as any[]).length > 0) {
-          handleScrollToLastMsg();
+          handleScrollToLastMsg(false);
         }
       }
     },
@@ -2109,7 +2207,7 @@
   // 监听键盘高度变化
   watch(data.keyboardHeight, (newVal: number) => {
     if (newVal > 0) {
-      handleScrollToLastMsg();
+      handleScrollToLastMsg(false);
     }
   });
 
@@ -2183,6 +2281,20 @@
    * sub 关闭 → 再启轮询。
    * 须用 function 声明：UTS 嵌套回调内无法引用同作用域 const（error18）。
    */
+  /** 本地是否正处于会话中（live SSE / 已标 active / 已订 sub）：此时禁止轮询续接 */
+  function isLocalConversationBusy(): boolean {
+    if (data.isConversationActive.value == true) {
+      return true;
+    }
+    if (chatService.isCurrentlyStreaming == true) {
+      return true;
+    }
+    if (service.isSubConversationSubscribed == true) {
+      return true;
+    }
+    return false;
+  }
+
   function startResumePolling(): void {
     const cid = data.conversationId.value;
     if (cid == null || cid == 0) {
@@ -2191,12 +2303,17 @@
     startConversationPolling(
       cid,
       (executingCid: number) => {
+        // 页面正在会话中：不续接，等结束后下一轮 poll 再判断
+        if (isLocalConversationBusy() == true) {
+          return;
+        }
         service.handleSubConversation(executingCid, (): void => {
           startResumePolling();
         });
       },
       (): boolean => {
-        return data.isConversationActive.value;
+        // 轮询门禁：会话进行中跳过本轮（结束后 getter 变 false，自动继续）
+        return isLocalConversationBusy();
       },
       (): boolean => {
         return service.isSubConversationSubscribed;
@@ -2224,10 +2341,21 @@
     // 重新获取会话订阅与限制状态，确保在支付返回后能够实时同步状态与解锁输入框
     await service.handleCheckSubscriptionLimit();
 
+    // 本地已在会话中：不抢续接，只保持轮询（会话结束后可再续）
+    if (isLocalConversationBusy() == true) {
+      startResumePolling();
+      return;
+    }
+
     // 调用服务层的恢复方法
     const needResume = await service.resumeConversationState();
 
     if (needResume) {
+      // await 期间可能已进入本地会话
+      if (isLocalConversationBusy() == true) {
+        startResumePolling();
+        return;
+      }
       // EXECUTING：本轮用户已就绪才立刻开 sub；否则只靠轮询（四端同一门禁）
       console.log("[PageResume] 会话状态已恢复,检查是否可订阅 sub");
       const resumeCid = data.conversationId.value;
@@ -2252,7 +2380,8 @@
 
   // 使用页面唤醒检测 Hook
   // H5: visibilitychange；App/小程序: 页面 onShow/onHide → triggerHide/Resume
-  // 真实后台 ≥30s 断 ASR/TTS；相册/权限等 overlay 不断连
+  // ASR/TTS 按需连接：前后台 / 相册不再做任何 socket 挂起、保活或重连
+  // pageSystemOverlay 仅过滤轮询暂停 / 长隐藏会话恢复
   function onChatPageResume(): void {
     // 长隐藏后的会话恢复；系统相册/权限等触发的 hide 不跑
     if (pageSystemOverlay.wasLastShowReal() == true) {
@@ -2261,24 +2390,20 @@
   }
   function onChatPageForeground(): void {
     const realShow = pageSystemOverlay.noteShow();
-    speechSocketWarmup.resumeFromBackground();
     if (realShow == true) {
       resumeConversationPolling();
     }
   }
   function onChatPageHide(): void {
-    if (pageSystemOverlay.noteHide() != true) {
-      speechSocketWarmup.cancelPendingBackgroundSuspend("chat-onHide-overlay");
-    } else {
+    if (pageSystemOverlay.noteHide() == true) {
       pauseConversationPolling();
-      speechSocketWarmup.suspendForBackground(SPEECH_BACKGROUND_SUSPEND_DELAY_MS);
     }
   }
   const pageResumeOptions = new PageResumeOptions();
   pageResumeOptions.onResume = onChatPageResume;
   pageResumeOptions.onForeground = onChatPageForeground;
   pageResumeOptions.onHide = onChatPageHide;
-  pageResumeOptions.minHiddenDuration = SPEECH_BACKGROUND_SUSPEND_DELAY_MS;
+  pageResumeOptions.minHiddenDuration = CHAT_PAGE_LONG_HIDE_MS;
   const pageResumeResult = usePageResume(pageResumeOptions);
   const isPageHidden = pageResumeResult.isHidden;
 
@@ -2928,23 +3053,36 @@
     touchEndTimer = setTimeout(() => {
       data.scrollTouch.value = false;
       touchEndTimer = 0;
-      // 触摸结束后，如果需要，自动滚动到底部
-      handleScrollToLastMsg();
+      // 触摸结束后，如果需要，自动滚动到底部（含流式期恢复跟底）
+      handleScrollToLastMsg(false);
     }, 300);
   };
 
   const handleStreamMessageUpdate = () => {
-    // 使用防抖处理，避免频繁滚动影响性能
-    // 150ms 可以在保证流畅滚动的同时减少性能开销
+    // 流式 UI 冲刷后的跟底：短延迟让布局先更新高度，再滚；
+    // 实际节流在 ScrollManager（leading+trailing），此处不再用 150ms 长防抖拖慢跟手。
     if (streamScrollTimer != 0) {
       clearTimeout(streamScrollTimer);
     }
     streamScrollTimer = setTimeout(() => {
+      streamScrollTimer = 0;
       if (shouldAutoScrollToLast() == true) {
         scrollToLastMsg(false);
       }
-    }, 150);
+    }, 30);
   };
+
+  // #ifdef H5
+  /** H5 滚轮监听：与 onUnmounted removeEventListener 共用同一引用 */
+  const handleH5Wheel = (_e: WheelEvent): void => {
+    data.mouseScroll.value = true;
+    let clear: number = 0;
+    clear = setTimeout(() => {
+      data.mouseScroll.value = false;
+      clearTimeout(clear);
+    }, 1000);
+  };
+  // #endif
 
   // 设置事件监听器
   // 内部异步逻辑包装为同步回调，避免 Promise 类型不匹配
@@ -2958,14 +3096,7 @@
     uni.$on("refreshFileList", onRefreshFileList);
     uni.$on("updateMessageComponent", handleUpdateMessageComponent);
     // #ifdef H5
-    window.addEventListener("wheel", (e: WheelEvent) => {
-      data.mouseScroll.value = true;
-      let clear: number = 0;
-      clear = setTimeout(() => {
-        data.mouseScroll.value = false;
-        clearTimeout(clear);
-      }, 1000);
-    });
+    window.addEventListener("wheel", handleH5Wheel);
     // #endif
 
     uni.$on("page_preview_executing", handlePagePreviewExecuting);
@@ -3011,7 +3142,7 @@
   // #endif
 
   onMounted(() => {
-    // 进入会话页即预连 ASR / TTS WebSocket
+    // 仅标记会话页活跃；ASR/TTS 改为按录音预热 / 合成时建连（不再进页预连）
     speechSocketWarmup.warmup();
     // #ifdef APP || WEB
     bindMarkdownProxyWeb();
@@ -3027,6 +3158,20 @@
     service.abortSubConversation();
     destroyConversationPolling();
     scrollManager.dispose();
+
+    if (streamScrollTimer != 0) {
+      clearTimeout(streamScrollTimer);
+      streamScrollTimer = 0;
+    }
+    if (touchEndTimer != 0) {
+      clearTimeout(touchEndTimer);
+      touchEndTimer = 0;
+    }
+    clearFeedSpeakTimer();
+
+    // #ifdef H5
+    window.removeEventListener("wheel", handleH5Wheel);
+    // #endif
 
     // #ifdef APP
     proxyWeb.reset();

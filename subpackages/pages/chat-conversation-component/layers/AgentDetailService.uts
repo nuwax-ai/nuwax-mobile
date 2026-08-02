@@ -586,6 +586,13 @@ export default class AgentDetailService {
   private pendingUiMessage: MessageInfo | null = null;
   private pendingUiNeedScroll: boolean = false;
   private readonly STREAM_UI_COALESCE_MS: number = 40;
+  /** 待冲刷的打字机正文（与 UI 同窗口合并，避免每 SSE 字触发父组件重绘） */
+  private pendingStreamingText: string = "";
+  private pendingStreamingMsgId: string = "";
+  /** 待冲刷的 TTS 喂入（与 UI 同窗口合并） */
+  private pendingSpeakId: string = "";
+  private pendingSpeakBody: string = "";
+  private pendingSpeakDirty: boolean = false;
   /** sub 流恢复专用 StreamRequest（独立于 live chatService，避免互相 abort） */
   private subStreamRequest: StreamRequest | null = null;
   /** sub 是否已订阅（执行中） */
@@ -605,7 +612,7 @@ export default class AgentDetailService {
     return draft;
   }
 
-  /** 冲刷挂起的流式 UI（messageList + 气泡组件 + 滚动） */
+  /** 冲刷挂起的流式 UI（messageList + 打字机 + 气泡组件 + 滚动 + TTS 喂入） */
   private flushStreamUiPublish(): void {
     if (this.streamUiTimer != null) {
       clearTimeout(this.streamUiTimer!);
@@ -613,6 +620,14 @@ export default class AgentDetailService {
     }
     if (this.streamListDraft != null) {
       this.data.messageList.value = [...(this.streamListDraft as MessageInfo[])];
+    }
+    // 打字机通道与列表同频冲刷，避免每 token 触发 App 端整页重绘
+    if (
+      this.pendingStreamingMsgId.length > 0 ||
+      this.pendingStreamingText.length > 0
+    ) {
+      this.data.streamingAssistantText.value = this.pendingStreamingText;
+      this.data.streamingAssistantMessageId.value = this.pendingStreamingMsgId;
     }
     const pendingMsg = this.pendingUiMessage;
     if (pendingMsg != null) {
@@ -627,12 +642,21 @@ export default class AgentDetailService {
     if (this.pendingUiNeedScroll == true) {
       uni.$emit("streamMessageUpdate");
     }
+    // TTS 与 UI 同窗口合并后延后一拍，避免挤占 SSE/渲染同栈
+    if (this.pendingSpeakDirty == true) {
+      const speakId = this.pendingSpeakId;
+      const speakBody = this.pendingSpeakBody;
+      this.pendingSpeakDirty = false;
+      setTimeout(() => {
+        this.safeEmitStreamSpeakFeed(speakId, speakBody, false);
+      }, 0);
+    }
     this.pendingUiMessage = null;
     this.pendingUiNeedScroll = false;
   }
 
   /**
-   * 合并流式 UI 更新：TTS 仍即时 emit，列表/气泡按 40ms 合并。
+   * 合并流式 UI 更新：打字机 / TTS / 列表按 40ms 合并。
    * @param immediate true 时立刻冲刷（ERROR / 流结束 / 新发送）
    */
   private scheduleStreamUiPublish(
@@ -668,6 +692,11 @@ export default class AgentDetailService {
     this.pendingUiMessage = null;
     this.pendingUiMessageId = "";
     this.pendingUiNeedScroll = false;
+    this.pendingStreamingText = "";
+    this.pendingStreamingMsgId = "";
+    this.pendingSpeakId = "";
+    this.pendingSpeakBody = "";
+    this.pendingSpeakDirty = false;
   }
 
   /** Android：agent 接口数据统一为 UTSJSONObject，禁止 Interface 强转 */
@@ -1294,7 +1323,7 @@ export default class AgentDetailService {
       list.splice(index, arraySpliceAction, newMessage);
     }
 
-    // 先写打字机通道 + 调度 UI，再驱动 TTS。
+    // 打字机 / TTS 先写入 pending，与 scheduleStreamUiPublish 同窗口冲刷。
     // 禁止 TTS 同步异常打断后续 scheduleStreamUiPublish（否则会出现「有 SSE 无渲染」）。
     if (newMessage != null) {
       const patchedText = readMessageText(newMessage);
@@ -1302,9 +1331,12 @@ export default class AgentDetailService {
         isAssistantMessageInfo(newMessage) == true &&
         patchedText.length > 0
       ) {
-        this.data.streamingAssistantText.value = patchedText;
         // 固定为客户端气泡 id（currentMessageId），避免服务端改写 id 导致播报会话被 begin 重置
-        this.data.streamingAssistantMessageId.value = currentMessageId;
+        this.pendingStreamingText = patchedText;
+        this.pendingStreamingMsgId = currentMessageId;
+        this.pendingSpeakId = currentMessageId;
+        this.pendingSpeakBody = patchedText;
+        this.pendingSpeakDirty = true;
       }
     }
 
@@ -1319,21 +1351,6 @@ export default class AgentDetailService {
       needScroll,
       isErrorEvent,
     );
-
-    // TTS 与渲染解耦：延后到下一 macrotask，避免 iOS 上 TTS 建连/失败挤占 SSE 同栈导致 UI 不刷
-    if (newMessage != null) {
-      const patchedText = readMessageText(newMessage);
-      if (
-        isAssistantMessageInfo(newMessage) == true &&
-        patchedText.length > 0
-      ) {
-        const speakId = currentMessageId;
-        const speakBody = patchedText;
-        setTimeout(() => {
-          this.safeEmitStreamSpeakFeed(speakId, speakBody, false);
-        }, 0);
-      }
-    }
 
     // 打开页面首页（与气泡更新解耦，保持即时）
     if (newMessage != null && isAssistantMessageInfo(newMessage) == true) {
@@ -1516,6 +1533,11 @@ export default class AgentDetailService {
    * 清空 App 流式打字机通道，避免上一轮正文串到新助手气泡。
    */
   private clearStreamingAssistantText(): void {
+    this.pendingStreamingText = "";
+    this.pendingStreamingMsgId = "";
+    this.pendingSpeakId = "";
+    this.pendingSpeakBody = "";
+    this.pendingSpeakDirty = false;
     this.data.streamingAssistantText.value = "";
     this.data.streamingAssistantMessageId.value = "";
   }
@@ -1735,8 +1757,8 @@ export default class AgentDetailService {
   }
 
   /**
-   * App：流异常中断后只拉一次会话详情，补「后端已结束但本地半截字」的终态。
-   * EXECUTING 续接交给页面轮询 → handleSubConversation，此处不再开 sub / 连环轮询。
+   * App：流异常中断后拉一次会话详情补终态；
+   * 若后端仍为 EXECUTING，立刻开 sub 续流（不等页面轮询，避免「第一句后卡住、结束才整段出来」）。
    */
   private scheduleRecoverIfAssistantLoading(
     isTempChat: boolean,
@@ -1781,10 +1803,27 @@ export default class AgentDetailService {
       if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
         return;
       }
-      this.resumeConversationState().then((recovered: boolean) => {
+      this.resumeConversationState().then((needSub: boolean) => {
         console.warn(
-          "[SSE-Stream] detail hydrate recovered=" + `${recovered}`,
+          "[SSE-Stream] detail hydrate needSub=" + `${needSub}`,
         );
+        if (needSub != true) {
+          return;
+        }
+        if (streamGenAtSchedule != this.streamGeneration) {
+          return;
+        }
+        if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
+          return;
+        }
+        const cid = this.data.conversationId.value;
+        if (cid == null || cid == 0) {
+          return;
+        }
+        console.warn(
+          "[SSE-Stream] stream interrupt still EXECUTING, open sub now",
+        );
+        this.handleSubConversation(cid, null);
       });
     }, 400);
     // #endif

@@ -128,6 +128,22 @@ assert(
   read("utils/system.uts").includes("openOpenUiArtifact"),
   "utils/system.uts missing openOpenUiArtifact nav helper",
 );
+const previewPage = read(
+  "subpackages/pages/file-preview-page/file-preview-page.uvue",
+);
+const conversationPage = read(
+  "subpackages/pages/chat-conversation-component/chat-conversation-component.uvue",
+);
+assert(
+  previewPage.includes("savePendingOpenUiAction(cid, message)") &&
+    previewPage.includes("uni.navigateBack({ delta: 1 })"),
+  "file-preview-page must persist OPENUI_ACTION before returning to chat",
+);
+assert(
+  conversationPage.includes("consumePendingOpenUiAction") &&
+    conversationPage.includes("handlePendingOpenUiAction"),
+  "chat conversation must consume and send pending OpenUI actions on resume",
+);
 
 console.log(
   `✓ OpenUI 契约一致：render "${mobileRenderToken}"，非 render [${mobileNonRender.join(

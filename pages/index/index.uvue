@@ -1,6 +1,28 @@
 <template>
   <view class="h-full flex flex-col border-b">
-    <!-- 顶部导航栏 -->
+    <!-- 页面级下拉层：固定在屏幕最顶部，覆盖导航栏展开。 -->
+    <view
+      v-if="defaultAgentId > 0 && defaultAgentPullDistance > 0"
+      class="default-agent-top-layer"
+      :style="'height: ' + defaultAgentLayerHeight + 'px;'"
+    >
+      <default-agent-pull-entry
+        :agent-name="defaultAgentName"
+        :agent-icon="defaultAgentIcon"
+        :agent-description="defaultAgentDescription"
+        :pull-distance="defaultAgentPullDistance"
+        :trigger-distance="defaultAgentTriggerDistance"
+      />
+    </view>
+
+    <!-- 顶部导航栏：仅此区域下拉时展开默认智能体入口。 -->
+    <view
+      class="home-nav-pull-zone"
+      @touchstart="handleNavPullStart"
+      @touchmove.stop="handleNavPullMove"
+      @touchend="handleNavPullEnd"
+      @touchcancel="handleNavPullCancel"
+    >
     <custom-nav-bar :title="t('Mobile.Nav.home')" className="border-b" hasSafetyZone>
       <template v-slot:left>
         <view class="flex flex-row items-center header-menu-trigger">
@@ -42,6 +64,7 @@
       </template>
       <!-- #endif -->
     </custom-nav-bar>
+    </view>
 
     <!-- 小程序与 Android 使用原生布局，避免 uni-notice-bar 的 Vue 样式未编译导致错位。 -->
     <!-- #ifdef MP-WEIXIN -->
@@ -116,12 +139,14 @@
 <script setup lang="uts">
   import { ref, computed, nextTick, type ComponentPublicInstance } from 'vue';
   import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { apiUserInfo } from "@/servers/account";
+  import { apiUserInfo, apiTenantConfig } from "@/servers/account";
+  import { apiPublishedAgentInfo } from "@/servers/agentDev";
   import type { AgentInfo } from "@/types/interfaces/agent";
   import HeaderMenu from "./header-menu/header-menu.uvue";
   import HomeHeader from "./home-header/home-header.uvue";
   import HomeContent from "./home-content/home-content.uvue";
   import AgentListContent from "./agent-list-content/agent-list-content.uvue";
+  import DefaultAgentPullEntry from "./default-agent-pull-entry/default-agent-pull-entry.uvue";
   import { UserInfo } from "@/types/interfaces/login";
   import { onLoad, onShow, onHide } from "@dcloudio/uni-app";
   // #ifdef MP-WEIXIN
@@ -135,7 +160,7 @@
   import AuthLoginPopup from "@/components/auth-login-popup/auth-login-popup.uvue";
   // #endif
   import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
-  import { setCurrentPageNavigationBarTitle } from "@/utils/system";
+  import { getStatusBarHeight, setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { useI18n, applyTabBarI18n, emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { orEmpty } from "@/utils/utsCoalesce.uts";
@@ -144,6 +169,25 @@
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
   const showExperienceNotice = ref<boolean>(true);
+  const defaultAgentId = ref<number>(0);
+  const defaultAgentName = ref<string>("");
+  const defaultAgentIcon = ref<string>("");
+  const defaultAgentDescription = ref<string>("");
+  const defaultAgentType = ref<string>("ChatBot");
+  const defaultAgentLoading = ref<boolean>(false);
+  const defaultAgentPullDistance = ref<number>(0);
+  // 下拉层完整高度 = 系统顶部安全区 + 卡片内容层。
+  const defaultAgentTriggerDistance = getStatusBarHeight() + 140;
+  const defaultAgentLayerHeight = computed((): number => {
+    const distance = defaultAgentPullDistance.value;
+    if (distance <= 0) {
+      return 0;
+    }
+    return distance > defaultAgentTriggerDistance ? defaultAgentTriggerDistance : distance;
+  });
+  const navPullStartX = ref<number>(0);
+  const navPullStartY = ref<number>(0);
+  const navPullTracking = ref<boolean>(false);
   // 分享标题
   const shareTitle = ref<string>("");
   const fallbackShareTitle = computed<string>((): string => t("Mobile.Nav.home"));
@@ -166,6 +210,120 @@
   const agentListContentRef = ref<any | null>(null);
   // 首页内容组件ref（登录后：固定标签栏 + 独立滚动列表）
   const homeContentRef = ref<any | null>(null);
+
+  function applyDefaultAgentConfig(raw: any | null): number {
+    if (raw == null) {
+      return 0;
+    }
+    const obj = raw as UTSJSONObject;
+    const idRaw = obj["defaultAgentId"];
+    const id = idRaw != null ? (idRaw as number) : 0;
+    defaultAgentId.value = id;
+    return id;
+  }
+
+  async function loadDefaultAgentEntry(): Promise<void> {
+    if (defaultAgentLoading.value) {
+      return;
+    }
+    defaultAgentLoading.value = true;
+    try {
+      let agentId = 0;
+      const cachedRaw = uni.getStorageSync(TENANT_CONFIG_INFO);
+      if (cachedRaw != null && `${cachedRaw}`.length > 0) {
+        try {
+          const cached = JSON.parse<UTSJSONObject>(`${cachedRaw}`);
+          agentId = applyDefaultAgentConfig(cached);
+        } catch (_e) {
+          agentId = 0;
+        }
+      }
+
+      // 每次进入首页以服务端租户配置为准；缓存只用于提前准备下拉入口。
+      const configRes = await apiTenantConfig();
+      if (apiResCode(configRes) == SUCCESS_CODE) {
+        const configData = apiResData<any>(configRes);
+        if (configData != null) {
+          uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(configData));
+          agentId = applyDefaultAgentConfig(configData);
+        }
+      }
+
+      if (agentId > 0) {
+        const detailRes = await apiPublishedAgentInfo(agentId, false);
+        if (apiResCode(detailRes) == SUCCESS_CODE) {
+          const detailRaw = apiResData<any>(detailRes);
+          if (detailRaw != null) {
+            const detail = detailRaw as UTSJSONObject;
+            const nameRaw = detail["name"];
+            const iconRaw = detail["icon"];
+            const descriptionRaw = detail["description"];
+            const typeRaw = detail["type"];
+            defaultAgentName.value = nameRaw != null ? `${nameRaw}` : t("Mobile.Common.appName");
+            defaultAgentIcon.value = iconRaw != null ? `${iconRaw}` : "";
+            defaultAgentDescription.value = descriptionRaw != null ? `${descriptionRaw}` : "";
+            defaultAgentType.value = typeRaw != null ? `${typeRaw}` : "ChatBot";
+          }
+        }
+      }
+    } catch (error) {
+      console.error("加载首页默认智能体入口失败", error);
+    } finally {
+      defaultAgentLoading.value = false;
+    }
+  }
+
+  function handleDefaultAgentOpen(): void {
+    const agentId = defaultAgentId.value;
+    if (agentId <= 0) {
+      return;
+    }
+    const rawType = defaultAgentType.value;
+    const agentType: "ChatBot" | "PageApp" | "TaskAgent" = rawType == "PageApp"
+      ? "PageApp"
+      : (rawType == "TaskAgent" ? "TaskAgent" : "ChatBot");
+    jumpToAgentDetailPage(agentId, null, agentType, defaultAgentName.value);
+  }
+
+  function handleNavPullStart(e: UniTouchEvent): void {
+    if (defaultAgentId.value <= 0 || e.touches == null || e.touches.length == 0) {
+      return;
+    }
+    navPullStartX.value = e.touches[0].clientX;
+    navPullStartY.value = e.touches[0].clientY;
+    navPullTracking.value = true;
+    defaultAgentPullDistance.value = 0;
+  }
+
+  function handleNavPullMove(e: UniTouchEvent): void {
+    if (!navPullTracking.value || e.touches == null || e.touches.length == 0) {
+      return;
+    }
+    const touch = e.touches[0];
+    const deltaX = touch.clientX - navPullStartX.value;
+    const deltaY = touch.clientY - navPullStartY.value;
+    if (deltaY <= 0 || Math.abs(deltaX) > deltaY) {
+      defaultAgentPullDistance.value = 0;
+      return;
+    }
+    defaultAgentPullDistance.value = deltaY;
+  }
+
+  function finishNavPull(shouldOpen: boolean): void {
+    navPullTracking.value = false;
+    if (shouldOpen) {
+      handleDefaultAgentOpen();
+    }
+    defaultAgentPullDistance.value = 0;
+  }
+
+  function handleNavPullEnd(): void {
+    finishNavPull(defaultAgentPullDistance.value >= defaultAgentTriggerDistance);
+  }
+
+  function handleNavPullCancel(): void {
+    finishNavPull(false);
+  }
 
   // 使用登录拦截 composable
   const {
@@ -317,6 +475,7 @@
 
     // 设置分享标题
     setCurrentShareTitle();
+    loadDefaultAgentEntry();
   });
 
   // onShow 的异步逻辑抽出到命名函数，规避 async 回调返回 Promise 与 Unit 不匹配
@@ -386,6 +545,21 @@
 </script>
 
 <style lang="scss" scoped>
+  .default-agent-top-layer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    left: 0;
+    z-index: 999;
+    overflow: hidden;
+    background-color: #f2f0ff;
+  }
+
+  .home-nav-pull-zone {
+    width: 100%;
+    flex-shrink: 0;
+  }
+
   /* #ifdef MP-WEIXIN || APP-ANDROID */
   .experience-notice {
     display: flex;

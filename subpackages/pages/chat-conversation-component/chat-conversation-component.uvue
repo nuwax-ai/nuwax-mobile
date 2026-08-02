@@ -121,7 +121,11 @@
                 v-for="(item, listIndex) in messageList"
                 :key="`${item.id}_${item.index}`"
               >
-                <view class="msg-list-item" :id="`msg-wrapper-${item.id}_${item.index}`">
+                <view
+                  class="msg-list-item"
+                  :class="isLastMessage(listIndex) ? 'msg-list-item--last' : ''"
+                  :id="`msg-wrapper-${item.id}_${item.index}`"
+                >
                   <!-- 智能体会话消息 -->
                   <UniAiXMsg
                     v-if="isAssistantMessage(item)"
@@ -247,8 +251,8 @@
               />
             </view>
 
-            <!-- 滚动到底部的锚点 -->
-            <view style="height: 35px" id="last-msg"></view>
+            <!-- 滚底锚点：保留极小高度保证 scroll-into-view 稳定，避免底部大块空白 -->
+            <view style="height: 6px" id="last-msg"></view>
           </scroll-view>
 
           <!-- 滚动到底部按钮 -->
@@ -1590,6 +1594,9 @@
   /** 历史会话首屏加载后延迟无动画滚底 */
   const scrollToLastMsgAfterHistoryLoad = () =>
     scrollManager.scrollToLastMsgAfterHistoryLoad();
+  /** 发送后（气泡已入列表）滚底，含 iOS 语音发送补滚 */
+  const scrollToLastMsgAfterSend = () =>
+    scrollManager.scrollToLastMsgAfterSend();
   const setIsInScrollBottom = (e: UniScrollEvent) =>
     scrollManager.setIsInScrollBottom(e);
   const lockAutoToLastMsg = () => scrollManager.lockAutoToLastMsg();
@@ -1728,7 +1735,8 @@
     // 发送过消息,则禁用变量参数
     data.isSendMessageRef.value = true;
 
-    scrollToLastMsg(false);
+    // 滚底挪到 handleSendMessage 写入气泡之后（见下方 scrollToLastMsgAfterSend）
+    // 此处立刻滚只会打到旧 last-msg；流式期 list watch 又跳过，iOS 语音发送后易不跟底
 
     let params: UTSJSONObject = {} as UTSJSONObject;
 
@@ -1864,6 +1872,9 @@
       data.isConversationActive.value = false;
       data.isStoppingConversation.value = false;
     });
+    // 用户/助手气泡已入列表后再滚底（含短时补滚，覆盖 iOS 布局晚到）
+    data.autoToLastMsg.value = true;
+    scrollToLastMsgAfterSend();
     // 发送手势同步链路内开启本轮流式播报（空正文，禁止回放上一条）
     // H5 需用户手势解锁音频；真实正文由 streamSpeakFeed 喂入
     resumeStreamSpeakAllowance();
@@ -2281,7 +2292,10 @@
    * sub 关闭 → 再启轮询。
    * 须用 function 声明：UTS 嵌套回调内无法引用同作用域 const（error18）。
    */
-  /** 本地是否正处于会话中（live SSE / 已标 active / 已订 sub）：此时禁止轮询续接 */
+  /**
+   * 本地忙：会话进行中，或语音播报尚未结束。
+   * 后者即使 chat_finished 也要挡轮询，避免详情接口与 TTS 抢主线程。
+   */
   function isLocalConversationBusy(): boolean {
     if (data.isConversationActive.value == true) {
       return true;
@@ -2290,6 +2304,10 @@
       return true;
     }
     if (service.isSubConversationSubscribed == true) {
+      return true;
+    }
+    // 会话已结束但工具栏/流式 TTS 仍在播：同样跳过详情轮询
+    if (voiceStreamSpeaker.isBusy() == true) {
       return true;
     }
     return false;
@@ -2312,7 +2330,7 @@
         });
       },
       (): boolean => {
-        // 轮询门禁：会话进行中跳过本轮（结束后 getter 变 false，自动继续）
+        // 轮询门禁：会话中 / TTS 播报中跳过（播完后 getter 变 false，自动继续）
         return isLocalConversationBusy();
       },
       (): boolean => {
@@ -3027,8 +3045,6 @@
     updateMessageComponent(edObj["messageId"] as string, dataVal);
   };
 
-  // 流式消息滚动定时器
-  let streamScrollTimer: number = 0;
   // 触摸结束延迟计时器
   let touchEndTimer: number = 0;
 
@@ -3053,23 +3069,20 @@
     touchEndTimer = setTimeout(() => {
       data.scrollTouch.value = false;
       touchEndTimer = 0;
-      // 触摸结束后，如果需要，自动滚动到底部（含流式期恢复跟底）
-      handleScrollToLastMsg(false);
+      // 仅 SSE/会话进行中才在松手后尝试恢复跟底。
+      // 空闲浏览时若仍调用，会把「上滑一点点」又强行拉回底部。
+      if (isConversationActive.value == true) {
+        handleScrollToLastMsg(false);
+      }
     }, 300);
   };
 
   const handleStreamMessageUpdate = () => {
-    // 流式 UI 冲刷后的跟底：短延迟让布局先更新高度，再滚；
-    // 实际节流在 ScrollManager（leading+trailing），此处不再用 150ms 长防抖拖慢跟手。
-    if (streamScrollTimer != 0) {
-      clearTimeout(streamScrollTimer);
+    // 流式 UI 已冲刷；跟底节流交给 ScrollManager，不再叠加 30ms，
+    // 避免与 STREAM_UI_COALESCE / SCROLL_THROTTLE 错拍造成 Android 跳跃跟底。
+    if (shouldAutoScrollToLast() == true) {
+      scrollToLastMsg(false);
     }
-    streamScrollTimer = setTimeout(() => {
-      streamScrollTimer = 0;
-      if (shouldAutoScrollToLast() == true) {
-        scrollToLastMsg(false);
-      }
-    }, 30);
   };
 
   // #ifdef H5
@@ -3159,10 +3172,6 @@
     destroyConversationPolling();
     scrollManager.dispose();
 
-    if (streamScrollTimer != 0) {
-      clearTimeout(streamScrollTimer);
-      streamScrollTimer = 0;
-    }
     if (touchEndTimer != 0) {
       clearTimeout(touchEndTimer);
       touchEndTimer = 0;

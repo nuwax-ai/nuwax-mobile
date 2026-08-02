@@ -315,6 +315,31 @@ function collectRequestErrorText(error: any): string {
 }
 
 /**
+ * iOS enableChunked 常见：服务端关连接 / 录音或 TTS 后短暂断网时，
+ * fail 报「网络连接已中断」(600003)，并不等于业务失败。
+ * 已有 chunk 或即将走 complete 冲刷时，应软收尾（onTimeout → 回补/sub），禁止 onError。
+ */
+function isNetworkConnectionLostError(error: any): boolean {
+  const text = collectRequestErrorText(error);
+  if (text.length == 0) {
+    return false;
+  }
+  if (text.indexOf("网络连接已中断") >= 0) {
+    return true;
+  }
+  if (text.indexOf("network connection was lost") >= 0) {
+    return true;
+  }
+  if (text.indexOf("nsurlerrornetworkconnectionlost") >= 0) {
+    return true;
+  }
+  if (text.indexOf("errcode=600003") >= 0 || text.indexOf("code=600003") >= 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * 安全读取错误对象的 message 字段。
  * @param error 捕获到的错误对象
  * @returns 错误信息字符串，无 message 时返回空字符串
@@ -701,8 +726,12 @@ export class StreamRequest {
   }
 
   /**
-   * 大包分帧：先同步处理首帧让 UI 立刻有内容，其余异步入队，避免卡死主线程。
-   * 注意：MESSAGE 禁止合并（见 enqueueSseMessage / pumpSseBurstEnqueue）。
+   * 大包分帧入队（保持 MESSAGE delta 全局顺序）。
+   *
+   * 历史坑（Android 语音后长文常见）：
+   * 1) 队列非空时同步 process 首帧 → 插队，正文错位（如两行新闻互相嵌套）
+   * 2) burst 未入队完时把新包直接 push 进 dispatch 队列 → 与 rest 交错，同样乱序
+   * 因此：有积压时只追加到 burstRest / 派发队列；仅完全空闲时才首帧同步上屏。
    */
   private enqueueSseFramesWithFirstPaint(
     frames: string[],
@@ -712,15 +741,36 @@ export class StreamRequest {
     if (frames.length == 0) {
       return;
     }
-    // 上一包 burst 尚未入队完：禁止覆盖 sseBurstRest，否则中间 MESSAGE delta 会丢光
-    if (this.sseBurstEnqueuePending == true || this.sseBurstRest != null) {
+    this.sseDispatchConfig = config;
+    this.sseDispatchOnComplete = onStreamComplete;
+
+    // burst 进行中：追加到 rest 末尾，禁止与 dispatch 队列交错
+    const burstRest = this.sseBurstRest;
+    if (burstRest != null) {
+      for (let i = 0; i < frames.length; i++) {
+        burstRest.push(frames[i]);
+      }
+      return;
+    }
+    if (this.sseBurstEnqueuePending == true) {
       for (let i = 0; i < frames.length; i++) {
         this.enqueueSseMessage(frames[i], config, onStreamComplete);
       }
       return;
     }
 
-    // 首帧同步：尽快驱动 streamingAssistantText / 气泡
+    // 派发未空闲：禁止首帧插队
+    if (
+      this.sseDispatchRunning == true ||
+      this.sseDispatchQueue.length > 0
+    ) {
+      for (let i = 0; i < frames.length; i++) {
+        this.enqueueSseMessage(frames[i], config, onStreamComplete);
+      }
+      return;
+    }
+
+    // 完全空闲：首帧同步上屏，其余 burst 入队
     this.processSSEMessage(frames[0], config, onStreamComplete);
     if (frames.length == 1 || this.receivedTerminalMarker == true) {
       return;
@@ -732,8 +782,6 @@ export class StreamRequest {
     }
 
     this.sseBurstEnqueuePending = true;
-    this.sseDispatchConfig = config;
-    this.sseDispatchOnComplete = onStreamComplete;
     this.sseBurstRest = rest;
     this.sseBurstOffset = 0;
     this.sseBurstTimer = setTimeout(() => {
@@ -1447,7 +1495,35 @@ export class StreamRequest {
             return;
           }
 
-          config.onError?.(err);
+          // iOS：录音/TTS/服务端关连后常报「网络连接已中断」。
+          // 软收尾：先冲刷 residual，再走 onTimeout（hydrate/sub），禁止 onError 双回调清会话。
+          if (isNetworkConnectionLostError(err) == true) {
+            console.warn(
+              "[SSE-APP] connection lost soft-close hasChunk=" +
+                `${hasReceivedChunk}` +
+                " " +
+                collectRequestErrorText(err),
+            );
+            this.flushPendingUtf8Bytes();
+            if (this.buffer.trim().length > 0) {
+              this.appendAndProcessSSEText("\n\n", config, finishStream, true);
+            }
+            this.waitForSseDispatchIdle(() => {
+              if (isStreamFinished || this.isAborted) {
+                return;
+              }
+              if (this.receivedTerminalMarker == true) {
+                finishStream();
+                return;
+              }
+              this.clearTimeoutMonitor();
+              config.onTimeout?.();
+              finishStream();
+            });
+            return;
+          }
+
+          // 真正失败：只 reject，由 request() catch 统一调一次 onError（避免双次 finalize）
           failStream(err);
         },
         complete: () => {

@@ -1,141 +1,55 @@
 /**
- * 会话页语音 Socket 生命周期协调（一问一答 / 按下说话）。
+ * 会话页语音 Socket 生命周期（按需连接）。
  *
- * 策略（放弃「进页即预连」）：
- * - ASR：Recorder onStart 后 preheatConnect（只建连不 start）；松手 begin 发 start；识别结束即关闭
- * - TTS：Recorder onStart 后预热建连（不发合成）；轻触未开录不预热；播报结束 / 闲置超时后关闭
- * - 离开页面：彻底断开；真实进后台延迟断开；回前台不再自动重连
+ * - 进页：只标记活跃，不预连
+ * - 录音 onStart：预热 TTS；ASR 由录音按钮自行 preheatConnect / begin
+ * - 离页：teardown 断开
+ * - 前后台 / 相册 / Home：不做任何 socket 保活、挂起或重连
+ *   （连接随录音/合成建立；ASR 识别完即关；TTS 靠自身 idleClose）
  */
 import { asrWebSocketClient } from "./asrWebSocketClient";
 import { ttsWebSocketPlayer } from "./ttsWebSocketPlayer";
-import { stopAllSpeechPlayback } from "./stopAllSpeechPlayback";
-import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
 
-/** 真实进后台后延迟断开（ms） */
-export const SPEECH_BACKGROUND_SUSPEND_DELAY_MS = 30000;
+/**
+ * 会话页「长隐藏」阈值（ms）：仅给 usePageResume 做会话恢复 / 轮询，
+ * 与 ASR·TTS socket 无关。
+ */
+export const CHAT_PAGE_LONG_HIDE_MS = 30000;
+
+/** @deprecated 使用 CHAT_PAGE_LONG_HIDE_MS；保留别名避免外部旧引用 */
+export const SPEECH_BACKGROUND_SUSPEND_DELAY_MS = CHAT_PAGE_LONG_HIDE_MS;
 
 export class SpeechSocketWarmup {
   /** 会话页仍挂载（onMounted～onUnmounted） */
   private active: boolean = false;
-  /** 已因进后台断开 */
-  private suspended: boolean = false;
-  private suspendTimerId: number | null = null;
 
-  /** 是否处于会话页生命周期内 */
   isActive(): boolean {
     return this.active;
   }
 
-  /** 是否因进后台已断开 */
-  isSuspended(): boolean {
-    return this.suspended;
-  }
-
-  /**
-   * 进入会话页：只标记活跃，不再预连 ASR/TTS。
-   * 连接改在「按下录音」或首次合成时建立。
-   */
+  /** 进入会话页：只标记活跃，不建连 */
   warmup(): void {
-    this.cancelPendingSuspend();
     this.active = true;
-    this.suspended = false;
   }
 
   /**
    * 录音真正 onStart 后预热 TTS（建连但不发合成）。
-   * 轻触未开录不应调用；ASR 由录音按钮 preheatConnect() / begin() 自行处理。
+   * 轻触未开录不应调用。
    */
   preheatTtsForRecording(): void {
     if (this.active != true) {
       return;
     }
-    if (this.suspended == true) {
-      this.suspended = false;
-    }
     ttsWebSocketPlayer.enableWarmupAndConnect();
   }
 
-  /**
-   * 真实进后台：延迟断开 ASR/TTS。
-   * overlay（相册/权限）期间调用会被忽略并取消待断开。
-   */
-  suspendForBackground(
-    delayMs: number = SPEECH_BACKGROUND_SUSPEND_DELAY_MS,
-  ): void {
-    if (this.active != true) {
-      return;
-    }
-    if (pageSystemOverlay.isActive() == true) {
-      this.cancelPendingSuspend();
-      return;
-    }
-    this.cancelPendingSuspend();
-    let wait = delayMs;
-    if (wait < 0) {
-      wait = 0;
-    }
-    this.suspendTimerId = setTimeout((): void => {
-      this.suspendTimerId = null;
-      if (pageSystemOverlay.isActive() == true) {
-        return;
-      }
-      this.disconnectForBackground();
-    }, wait) as number;
-  }
-
-  /**
-   * overlay hide 时调用：确保不会在相册/权限期间误断开。
-   */
-  cancelPendingBackgroundSuspend(_reason: string = "overlay-hide"): void {
-    this.cancelPendingSuspend();
-  }
-
-  /**
-   * 回前台：取消待断开；不再自动重连（等下次按录音 / 合成时再建）。
-   */
-  resumeFromBackground(): void {
-    this.cancelPendingSuspend();
-    if (this.active != true) {
-      return;
-    }
-    this.suspended = false;
-  }
-
-  /** 离开会话页（unmount）：停止播报并断开 */
+  /** 离开会话页：断开 ASR/TTS */
   teardown(): void {
-    this.cancelPendingSuspend();
     this.active = false;
-    this.suspended = false;
-    asrWebSocketClient.disableWarmupAndDisconnect();
-    ttsWebSocketPlayer.disableWarmupAndDisconnect();
-  }
-
-  private cancelPendingSuspend(): void {
-    const timerId = this.suspendTimerId;
-    if (timerId != null) {
-      clearTimeout(timerId);
-      this.suspendTimerId = null;
-    }
-  }
-
-  /** 延迟到期：停播报并断开（页仍挂载） */
-  private disconnectForBackground(): void {
-    if (this.active != true) {
-      return;
-    }
-    if (this.suspended == true) {
-      return;
-    }
-    this.suspended = true;
-    try {
-      stopAllSpeechPlayback();
-    } catch (_eStop) {
-      // ignore
-    }
     asrWebSocketClient.disableWarmupAndDisconnect();
     ttsWebSocketPlayer.disableWarmupAndDisconnect();
   }
 }
 
-/** 全局单例：会话页 mount/unmount / 前后台 / 按录音预热 调用 */
+/** 全局单例：会话页 mount/unmount / 按录音预热 */
 export const speechSocketWarmup = new SpeechSocketWarmup();

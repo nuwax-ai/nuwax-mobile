@@ -1,7 +1,6 @@
 # uni-modal-popup
 
-基于 uni-app x 内置 [`page-container`](https://doc.dcloud.net.cn/uni-app-x/component/page-container.html) 的弹窗容器。  
-用于替代 App 端不稳定的 `uni-popup`（本仓库旧组件见 `components/modal-popup`）。
+基于 uni-app x 内置 [`page-container`](https://doc.dcloud.net.cn/uni-app-x/component/page-container.html) 的弹窗容器。
 
 ## 能力
 
@@ -39,6 +38,5 @@
 
 ## 注意
 
-- 微信小程序同页仅允许 1 个 `page-container`
+- 微信小程序同页仅允许 1 个 `page-container`（勿与其他 page-container 弹层叠用）
 - 居中弹出默认全屏：`custom-style` 保持透明全屏，宽度加在内容面板上，由内部 flex 居中；点空白区域关闭
-- 请勿与旧 `modal-popup`（uni-popup）混用同一交互路径

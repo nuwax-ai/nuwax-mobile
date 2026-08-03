@@ -24,13 +24,7 @@
 - **uni-ai-x/static/font/FiraCode-Regular.ttf**（284K）
   - 说明：代码块字体，项目中未直接使用
 
-### 2. 删除 mp-html 中的字体资源
-
-#### 已删除的字体：
-- **mp-html/static/font/FiraCode-Regular.ttf**（283K）
-  - 说明：代码高亮字体，已修复引用
-
-### 3. 优化 KaTeX 数学公式字体
+### 2. 优化 KaTeX 数学公式字体
 
 #### 已删除的不常用字体：
 - **KaTeX_Typewriter-Regular.ttf**（27K）
@@ -57,31 +51,23 @@
 - ai-provider 图片：672K
 - uni-chat-logo.png：188K
 - FiraCode 字体（uni-ai-x）：284K
-- FiraCode 字体（mp-html）：283K
 - KaTeX Typewriter 字体：27K
 - KaTeX Size3 字体：7.4K
 - KaTeX Size4 字体：10K
-- **总计：约 1.48MB**
+- **总计：约 1.2MB**
 
 ### 预期优化后主包大小：
 - 优化前：3378KB（约 3.3MB）
-- 优化后：预计 < 1900KB（约 1.9MB）
-- **减小：约 1.48MB**
+- 优化后：预计 < 2200KB（约 2.2MB）
+- **减小：约 1.2MB**
 
 ## 修改的文件
 
-1. **uni_modules/mp-html/components/mp-html/styles/highlight.scss**
-   - 注释掉 FiraCode 字体引用
-
-2. **uni_modules/mp-html/components/mp-html/styles/katex-fonts.scss**
-   - 注释掉 Typewriter、Size3、Size4 字体定义
-
-3. **删除的文件**
+1. **删除的文件**
    - `uni_modules/uni-ai-x/static/ai-provider/*.png`
    - `uni_modules/uni-ai-x/static/uni-chat-logo.png`
    - `uni_modules/uni-ai-x/static/default-avatar.png`
    - `uni_modules/uni-ai-x/static/font/FiraCode-Regular.ttf`
-   - `uni_modules/mp-html/static/font/FiraCode-Regular.ttf`
    - `static/fonts/KaTeX_Typewriter-Regular.ttf`
    - `static/fonts/KaTeX_Size3-Regular.ttf`
    - `static/fonts/KaTeX_Size4-Regular.ttf`

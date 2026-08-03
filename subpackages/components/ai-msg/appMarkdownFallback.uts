@@ -15,6 +15,7 @@ type MathRenderedCallback = () => void;
 /**
  * 将行内 $...$ / $$...$$ 拆成独立行（整行 $$latex$$），适配 katex-el 块级渲染。
  * 注意：若行内已有 $$，不能整行跳过，否则会连同前后正文一起留在段落里显示为裸 $$。
+ * 含 `|` 的表格行跳过，避免拆散 | cell | $math$ |。
  */
 function normalizeInlineMath(markdown: string): string {
   const sourceLines = markdown.replace(/\r\n/g, "\n").split("\n");
@@ -24,6 +25,29 @@ function normalizeInlineMath(markdown: string): string {
     // 保留 Markdown 空行，否则段落、工具占位符等块级元素会被错误合并。
     if (line.length == 0) {
       output.push("");
+      continue;
+    }
+    // 表格行：单元格内公式留给 parseInline，不能拆成独立 $$ 行
+    if (line.indexOf("|") >= 0) {
+      output.push(line);
+      continue;
+    }
+    // 标题行：保留行内 $a_1$，由 heading + katex-el 混排渲染
+    const headingTrim = line.trim();
+    let headingMarks = 0;
+    while (
+      headingMarks < headingTrim.length &&
+      headingTrim.charAt(headingMarks) == "#"
+    ) {
+      headingMarks++;
+    }
+    if (
+      headingMarks > 0 &&
+      headingMarks <= 6 &&
+      headingTrim.length > headingMarks &&
+      headingTrim.charAt(headingMarks) == " "
+    ) {
+      output.push(line);
       continue;
     }
     let cursor = 0;
@@ -240,6 +264,32 @@ function parseConversationReferenceAt(
   };
 }
 
+/** 查找可配对的行内 `$...$` 起点（跳过 `$$`）。 */
+function findInlineMathStart(text: string, cursor: number): number {
+  let i = cursor;
+  while (i < text.length) {
+    if (text.charAt(i) != "$") {
+      i++;
+      continue;
+    }
+    if (i + 1 < text.length && text.charAt(i + 1) == "$") {
+      i += 2;
+      continue;
+    }
+    const end = text.indexOf("$", i + 1);
+    if (end > i + 1) {
+      // 闭合 `$` 前若紧邻另一个 `$`（形成 $$），不是行内公式
+      if (end + 1 < text.length && text.charAt(end + 1) == "$") {
+        i = end + 2;
+        continue;
+      }
+      return i;
+    }
+    return -1;
+  }
+  return -1;
+}
+
 function parseInline(text: string): MarkdownToken[] {
   const result = [] as MarkdownToken[];
   let cursor = 0;
@@ -249,6 +299,7 @@ function parseInline(text: string): MarkdownToken[] {
     const imageStart = findInlineImageStart(text, cursor);
     const linkStart = findInlineLinkStart(text, cursor);
     const conversationStart = findInlineConversationStart(text, cursor);
+    const mathStart = findInlineMathStart(text, cursor);
     let nextStart = -1;
     let marker = "";
     if (
@@ -256,7 +307,8 @@ function parseInline(text: string): MarkdownToken[] {
       (imageStart < 0 || conversationStart <= imageStart) &&
       (strongStart < 0 || conversationStart <= strongStart) &&
       (codeStart < 0 || conversationStart <= codeStart) &&
-      (linkStart < 0 || conversationStart <= linkStart)
+      (linkStart < 0 || conversationStart <= linkStart) &&
+      (mathStart < 0 || conversationStart <= mathStart)
     ) {
       nextStart = conversationStart;
       marker = "<conversation";
@@ -264,10 +316,19 @@ function parseInline(text: string): MarkdownToken[] {
       imageStart >= 0 &&
       (strongStart < 0 || imageStart <= strongStart) &&
       (codeStart < 0 || imageStart <= codeStart) &&
-      (linkStart < 0 || imageStart <= linkStart)
+      (linkStart < 0 || imageStart <= linkStart) &&
+      (mathStart < 0 || imageStart <= mathStart)
     ) {
       nextStart = imageStart;
       marker = "![";
+    } else if (
+      mathStart >= 0 &&
+      (strongStart < 0 || mathStart <= strongStart) &&
+      (codeStart < 0 || mathStart <= codeStart) &&
+      (linkStart < 0 || mathStart <= linkStart)
+    ) {
+      nextStart = mathStart;
+      marker = "$";
     } else if (
       strongStart >= 0 &&
       (codeStart < 0 || strongStart <= codeStart) &&
@@ -288,6 +349,24 @@ function parseInline(text: string): MarkdownToken[] {
     }
     if (nextStart > cursor) {
       result.push(makeTextToken(text.substring(cursor, nextStart)));
+    }
+    if (marker == "$") {
+      const end = text.indexOf("$", nextStart + 1);
+      if (end <= nextStart + 1) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const latex = text.substring(nextStart + 1, end).trim();
+      if (latex.length > 0) {
+        result.push({
+          type: "math",
+          text: latex,
+          uniqueId:
+            "fallback-inline-math-" + nextStart + "-" + latex.length,
+        });
+      }
+      cursor = end + 1;
+      continue;
     }
     if (marker == "![") {
       const parsed = parseMarkdownImageAt(text, nextStart);
@@ -456,24 +535,6 @@ function tableAligns(separatorLine: string): Align[] {
     }
   }
   return aligns;
-}
-
-function makeTableRow(line: string): MarkdownToken {
-  const cells = splitTableRow(line);
-  const cellTokens = [] as MarkdownToken[];
-  for (let i = 0; i < cells.length; i++) {
-    const inline = parseInline(cells[i]);
-    const width = Math.max(56, Math.min(300, cells[i].length * 15 + 24));
-    cellTokens.push({
-      type: "table_cell",
-      tokens: inline,
-      width,
-    });
-  }
-  return {
-    type: "table_row",
-    tokens: cellTokens,
-  };
 }
 
 function makeItem(
@@ -694,16 +755,20 @@ function renderMathToken(
   latex: string,
   token: MarkdownToken,
   callback: MathRenderedCallback,
+  displayMode: boolean,
 ): void {
   console.log(
     "[MathRender] request latexLen=" +
       latex.length +
       " tokenId=" +
-      (token.uniqueId ?? ""),
+      (token.uniqueId ?? "") +
+      " displayMode=" +
+      displayMode,
   );
   const param = new UTSJSONObject();
   param["action"] = "katexRender";
   param["pureMathText"] = latex;
+  param["displayMode"] = displayMode;
   proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
     const imageData = res["imageDataURL"];
     const htmlData = res["resultHtml"];
@@ -732,6 +797,69 @@ function renderMathToken(
     );
     callback();
   });
+}
+
+/** 为行内 math token 触发 KaTeX 渲染（异步回填 html/href/width/height）。 */
+function scheduleInlineMathRender(
+  tokens: MarkdownToken[],
+  onMathRendered: MathRenderedCallback,
+): void {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.type != "math") {
+      continue;
+    }
+    const latex = token.text ?? "";
+    if (latex.length == 0) {
+      continue;
+    }
+    // 已渲染过则跳过，避免流式重复请求
+    if (
+      (token.html != null && `${token.html}`.length > 0) ||
+      (token.href != null && `${token.href}`.length > 0)
+    ) {
+      continue;
+    }
+    // 行内公式（表格单元格 / 标题）使用 displayMode=false
+    renderMathToken(latex, token, onMathRendered, false);
+  }
+}
+
+/**
+ * 下一非空行是否为三级标题（###）。
+ * 用于把「数列公式」这类紧挨 ### 小节的短行提升为二级标题，避免误伤普通短句。
+ */
+function nextNonEmptyIsH3(lines: string[], fromIndex: number): boolean {
+  for (let i = fromIndex; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length == 0) {
+      continue;
+    }
+    return t.startsWith("### ") && !t.startsWith("####");
+  }
+  return false;
+}
+
+function makeTableRow(
+  line: string,
+  onMathRendered: MathRenderedCallback,
+): MarkdownToken {
+  const cells = splitTableRow(line);
+  const cellTokens = [] as MarkdownToken[];
+  for (let i = 0; i < cells.length; i++) {
+    const inline = parseInline(cells[i]);
+    scheduleInlineMathRender(inline, onMathRendered);
+    const width = Math.max(56, Math.min(300, cells[i].length * 15 + 24));
+    cellTokens.push({
+      type: "table_cell",
+      tokens: inline,
+      width,
+    });
+  }
+  return {
+    type: "table_row",
+    tokens: cellTokens,
+  };
 }
 
 /**
@@ -887,7 +1015,7 @@ export function parseAppMarkdownFallback(
           uniqueId: "fallback-math-token-" + itemIndex,
         };
         result.push(makeItem("math", itemIndex++, [[mathToken]]));
-        renderMathToken(codeText, mathToken, onMathRendered);
+        renderMathToken(codeText, mathToken, onMathRendered, true);
       } else {
         const codeRows = [] as MarkdownToken[][];
         for (let ci = 0; ci < codeLines.length; ci++) {
@@ -935,7 +1063,7 @@ export function parseAppMarkdownFallback(
           uniqueId: "fallback-math-token-" + itemIndex,
         };
         result.push(makeItem("math", itemIndex++, [[mathToken]]));
-        renderMathToken(latex, mathToken, onMathRendered);
+        renderMathToken(latex, mathToken, onMathRendered, true);
         continue;
       }
       if (!closed) {
@@ -961,7 +1089,7 @@ export function parseAppMarkdownFallback(
           uniqueId: "fallback-math-token-" + itemIndex,
         };
         result.push(makeItem("math", itemIndex++, [[mathToken]]));
-        renderMathToken(inlineBlockMath, mathToken, onMathRendered);
+        renderMathToken(inlineBlockMath, mathToken, onMathRendered, true);
         index++;
         continue;
       }
@@ -988,7 +1116,7 @@ export function parseAppMarkdownFallback(
         if (tableLine.indexOf("|") < 0) {
           break;
         }
-        tableRows.push(makeTableRow(lines[index]));
+        tableRows.push(makeTableRow(lines[index], onMathRendered));
         index++;
       }
       const tableToken: MarkdownToken = {
@@ -1038,11 +1166,42 @@ export function parseAppMarkdownFallback(
     ) {
       const headingText = trimmed.substring(headingDepth + 1);
       const headingTokens = parseInline(headingText);
+      scheduleInlineMathRender(headingTokens, onMathRendered);
       for (let hi = 0; hi < headingTokens.length; hi++) {
-        const oldClass = headingTokens[hi].className ?? "text";
-        headingTokens[hi].className = oldClass + " depth-" + headingDepth;
+        if (headingTokens[hi].type == "math") {
+          headingTokens[hi].className = "math depth-" + headingDepth;
+        } else {
+          const oldClass = headingTokens[hi].className ?? "text";
+          headingTokens[hi].className = oldClass + " depth-" + headingDepth;
+        }
       }
       result.push(makeItem("heading", itemIndex++, [headingTokens]));
+      index++;
+      continue;
+    }
+
+    // 「数列公式」这类单独成行、紧跟 ### 标题的短文，提升为二级标题（贴近图二）
+    if (
+      trimmed.length > 0 &&
+      trimmed.length <= 40 &&
+      trimmed.indexOf("|") < 0 &&
+      !trimmed.startsWith("```") &&
+      !trimmed.endsWith("。") &&
+      !trimmed.endsWith("！") &&
+      !trimmed.endsWith("？") &&
+      nextNonEmptyIsH3(lines, index + 1)
+    ) {
+      const titleTokens = parseInline(trimmed);
+      scheduleInlineMathRender(titleTokens, onMathRendered);
+      for (let ti = 0; ti < titleTokens.length; ti++) {
+        if (titleTokens[ti].type == "math") {
+          titleTokens[ti].className = "math depth-2";
+        } else {
+          const oldClass = titleTokens[ti].className ?? "text";
+          titleTokens[ti].className = oldClass + " depth-2";
+        }
+      }
+      result.push(makeItem("heading", itemIndex++, [titleTokens]));
       index++;
       continue;
     }

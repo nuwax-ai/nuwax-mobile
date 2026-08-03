@@ -158,7 +158,6 @@ H5 主链路中的标题、按钮、toast、modal、placeholder、loading、空�
 
 - `uni-load-more`
 - `uni-ai-x`
-- `uni-captcha`
 - `x-tools`
 - `lime-cascader` 的业务实际调用路径
 

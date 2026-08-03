@@ -93,7 +93,10 @@
               svg = svg.replace(`<style>#fixed-mermaid{font-family:`, `<style>#fixed-mermaid{background-color: #FFFFFF;font-family:`)
               imageDataURL = "data:image/svg+xml;utf8," + encodeURIComponent(svg);
             } else {
-              imageDataURL = await this.html2Base64(svg);
+              const mermaidShot = await this.html2Base64(svg);
+              imageDataURL = mermaidShot != null && mermaidShot.dataUrl != null
+                ? mermaidShot.dataUrl
+                : '';
             }
             // console.log('imageDataURL', imageDataURL);
             this.postMessage({
@@ -185,8 +188,35 @@
             });
           }
 
-          async html2Base64(htmlString, scale = 3, setTheme = false) {
+          /**
+           * @returns {{ dataUrl: string, width: number, height: number }}
+           * width/height 为 CSS 逻辑像素（不是 canvas 物理像素），避免 iOS 上行内公式被放大数倍。
+           */
+          async html2Base64(htmlString, scale = 3, setTheme = false, fitContent = false) {
             const markImgContainer = document.getElementById('markImgContainer');
+            const empty = { dataUrl: '', width: 0, height: 0 };
+            // 行内公式：按内容收缩。iOS 对 fit-content 支持不稳，改用 inline-block + width:auto
+            if (fitContent) {
+              markImgContainer.style.minWidth = '0';
+              markImgContainer.style.width = 'auto';
+              markImgContainer.style.maxWidth = 'none';
+              markImgContainer.style.display = 'inline-block';
+              markImgContainer.style.padding = '2px 8px 2px 4px';
+              markImgContainer.style.justifyContent = 'flex-start';
+              markImgContainer.style.fontSize = '16px';
+              markImgContainer.style.lineHeight = '1.25';
+              markImgContainer.style.overflow = 'visible';
+            } else {
+              markImgContainer.style.minWidth = '360px';
+              markImgContainer.style.width = 'auto';
+              markImgContainer.style.maxWidth = 'none';
+              markImgContainer.style.display = 'inline-block';
+              markImgContainer.style.padding = '8px 12px';
+              markImgContainer.style.justifyContent = 'center';
+              markImgContainer.style.fontSize = '';
+              markImgContainer.style.lineHeight = '';
+              markImgContainer.style.overflow = 'visible';
+            }
             markImgContainer.innerHTML = htmlString;
             // 数学公式统一浅色：白底 + 与会话正文一致的 #404040（勿跟随 dark theme，避免黑底白字）
             if (setTheme) {
@@ -195,14 +225,33 @@
             }
             // iOS：fonts.ready 在本地 KaTeX 字体跨域失败时可能挂起，导致整条 katex 队列卡死（无 callback）
             await this.withTimeout(document.fonts.ready, 1500, null);
+            // 等一帧让 inline-block 完成布局
+            await new Promise(resolve => setTimeout(resolve, 0));
             try {
+              // 行内优先截 wrap（含左右 padding），避免只截 .katex 时斜体左右被裁
+              // 切勿截大容器：会把空白算进宽高，iOS 上标题公式显得巨大
+              const wrapNode = markImgContainer.querySelector('.katex-inline-wrap');
+              const katexNode = markImgContainer.querySelector('.katex');
+              const captureTarget = fitContent
+                ? (wrapNode != null ? wrapNode : (katexNode != null ? katexNode : markImgContainer))
+                : (katexNode != null ? katexNode : markImgContainer);
+              const rect = captureTarget.getBoundingClientRect();
+              // scrollWidth 防止长公式被窄 web-view 视口裁切后 rect 偏小
+              const cssWidth = Math.max(
+                1,
+                Math.ceil(Math.max(rect.width, captureTarget.scrollWidth || 0))
+              );
+              const cssHeight = Math.max(
+                1,
+                Math.ceil(Math.max(rect.height, captureTarget.scrollHeight || 0))
+              );
               // iOS 画布像素上限更严；dpr*3 易超限得到空图或卡住。iOS 固定较低 scale。
               const dpr = window.devicePixelRatio > 0 ? window.devicePixelRatio : 2;
               const renderScale = this.isIOS()
                 ? Math.min(2, dpr)
                 : dpr * scale;
               const canvas = await this.withTimeout(
-                html2canvas(markImgContainer, {
+                html2canvas(captureTarget, {
                   allowTaint: true,
                   scale: renderScale,
                   imageTimeout: 300,
@@ -210,15 +259,33 @@
                   foreignObjectRendering: false,
                   removeContainer: true,
                   useCORS: true,
-                  backgroundColor: '#ffffff'
+                  backgroundColor: '#ffffff',
+                  width: cssWidth,
+                  height: cssHeight,
+                  windowWidth: Math.max(cssWidth, 1024),
+                  windowHeight: Math.max(cssHeight, 256),
+                  x: 0,
+                  y: 0,
+                  scrollX: 0,
+                  scrollY: 0
                 }),
                 8000,
                 null
               );
               markImgContainer.innerHTML = '';
+              // 恢复块级公式容器默认样式，避免污染后续渲染
+              markImgContainer.style.minWidth = '360px';
+              markImgContainer.style.width = 'auto';
+              markImgContainer.style.maxWidth = 'none';
+              markImgContainer.style.display = 'inline-block';
+              markImgContainer.style.padding = '8px 12px';
+              markImgContainer.style.justifyContent = 'center';
+              markImgContainer.style.fontSize = '';
+              markImgContainer.style.lineHeight = '';
+              markImgContainer.style.overflow = 'visible';
               if (canvas == null) {
                 console.log('html2canvas timeout');
-                return '';
+                return empty;
               }
               // iOS Safari/WKWebView 不支持 toDataURL('image/webp')，会回退异常或空 data
               let dataUrl = '';
@@ -237,59 +304,57 @@
                   dataUrl = '';
                 }
               }
-              return dataUrl;
+              // 斜体首尾字符防裁切
+              const padX = fitContent ? 2 : 0;
+              return {
+                dataUrl,
+                width: cssWidth + padX,
+                height: cssHeight
+              };
             } catch (error) {
               console.log('html2canvas error', error);
               markImgContainer.innerHTML = '';
-              return '';
+              return empty;
             }
           }
 
-          async katexRender({ pureMathText, requestId }) {
+          async katexRender({ pureMathText, requestId, displayMode }) {
             try {
               // 把 \\ 替换为 \
               pureMathText = pureMathText.replace(/\\\\/g, '\\');
+              // 表格单元格 / 标题行内公式用 displayMode=false，避免过大且更贴近正文
+              const useDisplayMode = displayMode !== false;
               const resultHtml = katex.renderToString(pureMathText, {
                   throwOnError: false,
-                  displayMode: true, // true 为块级公式 \[ \]，false 为行内公式 \( \)
+                  displayMode: useDisplayMode, // true 为块级公式 \[ \]，false 为行内公式 \( \)
                   output: 'html',
                   trust: true, // 允许一些不安全的命令
                   strict: 'ignore' // 是否严格模式
               });
+              // 行内公式包一层字号，贴近标题/正文（约 16px）
+              const htmlForCapture = useDisplayMode
+                ? resultHtml
+                : '<span class="katex-inline-wrap" style="display:inline-block;font-size:16px;line-height:1.25;padding:1px 6px 1px 1px;">' +
+                  resultHtml +
+                  '</span>';
               // parentIsWeb = false 时，才需要转换为图片
-              const imageDataURL = parentIsWeb ? null : await this.html2Base64(resultHtml, 3, true);
+              let imageDataURL = '';
+              let cssWidth = 0;
+              let cssHeight = 0;
+              if (!parentIsWeb) {
+                const shot = await this.html2Base64(htmlForCapture, 3, true, !useDisplayMode);
+                imageDataURL = shot != null && shot.dataUrl != null ? shot.dataUrl : '';
+                cssWidth = shot != null && shot.width != null ? shot.width : 0;
+                cssHeight = shot != null && shot.height != null ? shot.height : 0;
+              }
               const param = {
-                imageDataURL,
-                width: null,
-                height: null,
+                imageDataURL: parentIsWeb ? null : imageDataURL,
+                width: cssWidth > 0 ? cssWidth : null,
+                height: cssHeight > 0 ? cssHeight : null,
                 resultHtml: parentIsWeb ? resultHtml : '',
                 error: (!parentIsWeb && (imageDataURL == null || imageDataURL.length < 32))
                   ? 'empty_image'
                   : ''
-              }
-              // 非 web 平台，则返回图片的宽高
-              if (!parentIsWeb && imageDataURL != null && imageDataURL.length >= 32) {
-                const tmpImg = document.createElement('img');
-                document.body.appendChild(tmpImg);
-                await new Promise(resolve => {
-                  let settled = false;
-                  const done = () => {
-                    if (settled) return;
-                    settled = true;
-                    resolve();
-                  };
-                  // 必须先监听再设置 data URL；否则图片可能同步完成，永久错过 load。
-                  tmpImg.addEventListener('load', done, { once: true });
-                  tmpImg.addEventListener('error', done, { once: true });
-                  tmpImg.src = imageDataURL;
-                  if (tmpImg.complete) {
-                    setTimeout(done, 0);
-                  }
-                  setTimeout(done, 3000);
-                });
-                param.width = tmpImg.offsetWidth;
-                param.height = tmpImg.offsetHeight;
-                document.body.removeChild(tmpImg);
               }
               this.postMessage({
                 action: "katexRender_callback_" + requestId,
@@ -319,21 +384,33 @@
       html, body {
         margin: 0;
         padding: 0;
-        width: 100%;
+        /* 勿锁死 100% 宽：长公式需超出父级也能完整布局再截图 */
+        width: auto;
+        min-width: 100%;
         min-height: 100%;
+        overflow: visible;
         background: transparent;
       }
       #markImgContainer {
-        padding: 8px;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        /* 固定最小宽度，避免父 web-view 过窄时公式被压成几像素 */
-        min-width: 360px;
-        width: 100%;
+        padding: 8px 12px;
+        display: inline-block;
         box-sizing: border-box;
         background-color: #ffffff;
         color: #404040;
+        overflow: visible;
+        vertical-align: top;
+      }
+      /* 斜体数学字母右倾，截图时多留右侧空间 */
+      #markImgContainer .katex,
+      #markImgContainer .katex-html {
+        overflow: visible;
+        padding-right: 0.35em;
+      }
+      #markImgContainer .katex-inline-wrap {
+        display: inline-block;
+        font-size: 16px;
+        line-height: 1.25;
+        padding: 1px 6px 1px 1px;
       }
     </style>
   </body>

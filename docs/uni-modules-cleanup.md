@@ -9,6 +9,7 @@
 - `uni_modules/uni-datetime-picker`
 - `uni_modules/uni-config-center`
 - `uni_modules/uni-captcha`（业务已用阿里云验证码，无引用）
+- `uni_modules/uni-popup`（业务弹层已切到 `uni-modal-popup`，无引用）
 
 ### 2. 删除的文档类文件
 - 各模块下的 `README.md` / `readme.md`

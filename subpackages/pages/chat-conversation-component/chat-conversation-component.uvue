@@ -1125,6 +1125,8 @@
   /**
    * 开启无头实时播报（App / H5 / 小程序统一）。
    * 优先使用 SSE 事件带入的 messageId / bodyText，避免依赖 watch。
+   * - 同消息已在播：不二次 begin（避免长 SSE 清队列只剩一句）
+   * - 异消息 / 工具栏旧播报 / 续接新流：先 stop 再 begin
    * TTS 异常由 voiceStreamSpeaker / stopAllSpeechPlayback 内部兜底，此处不加 try/catch（uvue setup 易被 UTS 截断）。
    */
   function ensureHeadlessStreamSpeak(
@@ -1136,14 +1138,6 @@
       return;
     }
     if (streamSpeakAllowed != true) {
-      return;
-    }
-    // 本轮已在播：只同步 tracking id，禁止二次 begin（会 stop 清队列，长 SSE 只剩一句）
-    if (voiceStreamSpeaker.isBusy() == true) {
-      const busyId = voiceStreamSpeaker.getMessageId();
-      if (busyId.length > 0) {
-        headlessStreamSpeakId = busyId;
-      }
       return;
     }
     let msgId = preferMsgId;
@@ -1159,11 +1153,18 @@
     if (msgId.length == 0) {
       return;
     }
-    if (headlessStreamSpeakId == msgId) {
+    const busy = voiceStreamSpeaker.isBusy() == true;
+    const busyId = busy ? voiceStreamSpeaker.getMessageId() : "";
+    // 本轮同消息已在播：只同步 tracking，禁止二次 begin
+    if (busy == true && busyId == msgId) {
+      headlessStreamSpeakId = msgId;
+      return;
+    }
+    if (busy != true && headlessStreamSpeakId == msgId) {
       return;
     }
     const settings = loadVoiceSettings();
-    // 打断其他消息的工具栏播报 / 上一轮流式播报（仅语音，不动 SSE）
+    // 续接 / 新流 / 工具栏旧播报：先停再播目标消息
     stopAllSpeechPlayback();
     headlessStreamSpeakId = msgId;
     audioPlayerManager.setMuted(settings.muted == true);
@@ -1196,19 +1197,13 @@
       return;
     }
     const body = bodyText.length > 0 ? bodyText : feedSpeakBodyText;
+    // 统一走 ensure：同消息不打断；异消息 / 续接新流先停再播
+    ensureHeadlessStreamSpeak(
+      feedSpeakMsgId.length > 0 ? feedSpeakMsgId : "",
+      body,
+    );
     if (headlessStreamSpeakId.length == 0) {
-      if (voiceStreamSpeaker.isBusy() == true) {
-        const busyId = voiceStreamSpeaker.getMessageId();
-        if (busyId.length > 0) {
-          headlessStreamSpeakId = busyId;
-        }
-      } else {
-        // 迟到的正文：补一次 begin
-        ensureHeadlessStreamSpeak(feedSpeakMsgId, body);
-      }
-      if (headlessStreamSpeakId.length == 0) {
-        return;
-      }
+      return;
     }
     if (body.length == 0 && finished != true) {
       return;
@@ -2294,8 +2289,8 @@
    * 须用 function 声明：UTS 嵌套回调内无法引用同作用域 const（error18）。
    */
   /**
-   * 本地忙：会话进行中，或语音播报尚未结束。
-   * 后者即使 chat_finished 也要挡轮询，避免详情接口与 TTS 抢主线程。
+   * 本地忙：会话进行中（发消息 / live SSE / sub 续流）。
+   * 不含 TTS：App 开会话后 H5 续接时，即使本端正在语音播报也要继续轮询状态。
    */
   function isLocalConversationBusy(): boolean {
     if (data.isConversationActive.value == true) {
@@ -2305,10 +2300,6 @@
       return true;
     }
     if (service.isSubConversationSubscribed == true) {
-      return true;
-    }
-    // 会话已结束但工具栏/流式 TTS 仍在播：同样跳过详情轮询
-    if (voiceStreamSpeaker.isBusy() == true) {
       return true;
     }
     return false;
@@ -2331,7 +2322,7 @@
         });
       },
       (): boolean => {
-        // 轮询门禁：会话中 / TTS 播报中跳过（播完后 getter 变 false，自动继续）
+        // 轮询门禁：仅会话进行中跳过；语音播报不挡轮询
         return isLocalConversationBusy();
       },
       (): boolean => {

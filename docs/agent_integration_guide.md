@@ -98,4 +98,4 @@ CustomActionService.openDesktopView(123)
   - A: 检查是否传入了 `conversationId`。如果没有 `conversationId`，`task-result` 会降级发出 `task_result_click` 事件，你需要手动处理该事件。
   
 - **Q: 样式不符合预期？**
-  - A: `task-result` 和 `Plan` 的样式已内置在组件中，如需全局调整，请修改 `uni_modules/mp-html` 下的相关文件。
+  - A: `task-result` 与 Plan/工具调用样式分别在 `subpackages/components/task-result/`、`subpackages/components/tool-call/` 中，按需调整对应组件样式即可。

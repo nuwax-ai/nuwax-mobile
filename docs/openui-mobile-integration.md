@@ -40,7 +40,7 @@ SSE PROCESSING + subEventType=RENDER_UI
 会话页。会话页 `onShow` 一次性消费暂存内容，通过既有 `handleSendMessage` 自动发送。
 同一预览页只接受第一次有效提交，避免 webview 重复派发造成重复消息。
 App/小程序仍统一打开网关 `/static/file-preview.html`；该页面识别 `.openui.json` 后，
-在同源 iframe 中加载 `/static/openui-runtime/index.html` 并向原生 webview 转发提交事件。
+所有 OpenUI 预览统一进入 `/static/file-preview.html`，由该页面按需加载 OpenUI Runtime 资源并向原生 webview 转发提交事件。
 
 ## ⚠️ HBuilderX 验证时需重点确认的环节
 

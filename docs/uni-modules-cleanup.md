@@ -30,6 +30,10 @@
 - 当前未发现新增悬空引用。
 - 当前未发现新增 linter 报错。
 
+## 后续清理（分包）
+- 已删除未使用的 `subpackages/uni_modules/` 下富文本模块（会话渲染已切到 `ai-msg` / `uni-ai-x`）。
+- 同步删除孤立包装组件 `subpackages/components/markdown-msg`。
+
 ## 后续建议
 - 如需继续瘦身，优先继续盘点 `static/`、`docs/`、`unpackage/` 等目录中的可清理文件。
 - 不建议继续直接删除 `uni_modules` 中的运行时代码或资源，除非先完成更细的依赖与平台验证。

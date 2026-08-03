@@ -1,0 +1,1 @@
+import"./index-C5Mj2gE0.js";class s{constructor(){this.url="",this.name="",this.type="",this.size=0}}class t{constructor(){this.size=10,this.pageIndex=1,this.keyword=""}}class i{constructor(){this.label="",this.value=null,this.icon=null,this.disabled=!1,this.onClick=null}}export{t as L,i as M,s as U};

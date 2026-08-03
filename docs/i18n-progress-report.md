@@ -157,7 +157,6 @@ H5 主链路中的标题、按钮、toast、modal、placeholder、loading、空�
 当前已处理的第三方或框架相关模块包括：
 
 - `uni-load-more`
-- `mp-html`
 - `uni-ai-x`
 - `uni-captcha`
 - `x-tools`

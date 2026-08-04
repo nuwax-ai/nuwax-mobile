@@ -62,14 +62,14 @@
             >
               <svg-icon name="icon-message-add" size="44" />
             </view>
-            <!-- 语音播报开/静音 -->
+            <!-- 自动播报开/关（关：SSE 不播报；工具栏手动播放仍可用） -->
             <view
               class="icon-box"
               hover-class="icon-box-hover"
-              @tap="handleToggleVoiceMute"
+              @tap="handleToggleVoiceAutoPlay"
             >
               <uni-icons
-                v-if="voiceMuted"
+                v-if="voiceAutoPlayOff"
                 type="micoff"
                 size="44rpx"
                 color="#333333"
@@ -258,7 +258,7 @@
             </view>
 
             <!-- 滚底锚点：保留极小高度保证 scroll-into-view 稳定，避免底部大块空白 -->
-            <view style="height: 6px" id="last-msg"></view>
+            <view style="height: 12px" id="last-msg"></view>
           </scroll-view>
 
           <!-- 滚动到底部按钮 -->
@@ -362,6 +362,8 @@
       :is-task-agent="isTaskAgentType"
       :has-history="messageList.length > 0"
       :current-sandbox-id="currentSandboxId"
+      :conversation-id="conversationId != null ? conversationId : 0"
+      :is-app-details="isAppDetails"
       @collect="handleCollect"
       @restartAgent="handleRestartAgent"
       @restartSandbox="handleRestartSandbox"
@@ -679,8 +681,8 @@
   const msgListRef = ref<any | null>(null);
   // 用户临时票据
   const ticket = ref<string>("");
-  /** 全局 TTS 静音（持久化于 VoiceSettings.muted） */
-  const voiceMuted = ref<boolean>(loadVoiceSettings().muted);
+  /** 关闭自动播报时为 true（持久化于 VoiceSettings.autoPlay） */
+  const voiceAutoPlayOff = ref<boolean>(loadVoiceSettings().autoPlay != true);
   /**
    * 是否渲染输入框组件， 进入页面后渲染，离开页面后卸载组件
    * 出现一个bug，当从智能体详情页面返回首页时，录音后发送消息事件触发的是智能体详情页绑定的消息事件，而不是首页绑定的消息事件
@@ -1297,6 +1299,8 @@
   /**
    * 开启无头实时播报（App / H5 / 小程序统一）。
    * 优先使用 SSE 事件带入的 messageId / bodyText，避免依赖 watch。
+   * - 同消息已在播：不二次 begin（避免长 SSE 清队列只剩一句）
+   * - 异消息 / 工具栏旧播报 / 续接新流：先 stop 再 begin
    * TTS 异常由 voiceStreamSpeaker / stopAllSpeechPlayback 内部兜底，此处不加 try/catch（uvue setup 易被 UTS 截断）。
    */
   function ensureHeadlessStreamSpeak(
@@ -1310,12 +1314,9 @@
     if (streamSpeakAllowed != true) {
       return;
     }
-    // 本轮已在播：只同步 tracking id，禁止二次 begin（会 stop 清队列，长 SSE 只剩一句）
-    if (voiceStreamSpeaker.isBusy() == true) {
-      const busyId = voiceStreamSpeaker.getMessageId();
-      if (busyId.length > 0) {
-        headlessStreamSpeakId = busyId;
-      }
+    const settings = loadVoiceSettings();
+    // 关闭自动播报：SSE 不 begin/feed；工具栏手动播报不受影响
+    if (settings.autoPlay != true) {
       return;
     }
     let msgId = preferMsgId;
@@ -1331,17 +1332,21 @@
     if (msgId.length == 0) {
       return;
     }
-    if (headlessStreamSpeakId == msgId) {
+    const busy = voiceStreamSpeaker.isBusy() == true;
+    const busyId = busy ? voiceStreamSpeaker.getMessageId() : "";
+    // 本轮同消息已在播：只同步 tracking，禁止二次 begin
+    if (busy == true && busyId == msgId) {
+      headlessStreamSpeakId = msgId;
       return;
     }
-    const settings = loadVoiceSettings();
-    // 打断其他消息的工具栏播报 / 上一轮流式播报（仅语音，不动 SSE）
+    if (busy != true && headlessStreamSpeakId == msgId) {
+      return;
+    }
+    // 续接 / 新流 / 工具栏旧播报：先停再播目标消息
     stopAllSpeechPlayback();
     headlessStreamSpeakId = msgId;
     audioPlayerManager.setMuted(settings.muted == true);
-    // 流式播报强制开启自动朗读语义（不受 storage 里旧 autoPlay=false 影响）
     const speakSettings = cloneVoiceSettings(settings);
-    speakSettings.autoPlay = true;
     voiceStreamSpeaker.begin(msgId, speakSettings);
     // begin/stop 会拆掉「按下录音」时的 TTS 预热；立刻重建，避免首句合成卡在建连上被 SSE 饿死
     ttsWebSocketPlayer.enableWarmupAndConnect();
@@ -1368,19 +1373,13 @@
       return;
     }
     const body = bodyText.length > 0 ? bodyText : feedSpeakBodyText;
+    // 统一走 ensure：同消息不打断；异消息 / 续接新流先停再播
+    ensureHeadlessStreamSpeak(
+      feedSpeakMsgId.length > 0 ? feedSpeakMsgId : "",
+      body,
+    );
     if (headlessStreamSpeakId.length == 0) {
-      if (voiceStreamSpeaker.isBusy() == true) {
-        const busyId = voiceStreamSpeaker.getMessageId();
-        if (busyId.length > 0) {
-          headlessStreamSpeakId = busyId;
-        }
-      } else {
-        // 迟到的正文：补一次 begin
-        ensureHeadlessStreamSpeak(feedSpeakMsgId, body);
-      }
-      if (headlessStreamSpeakId.length == 0) {
-        return;
-      }
+      return;
     }
     if (body.length == 0 && finished != true) {
       return;
@@ -1773,6 +1772,10 @@
   /** 发送后（气泡已入列表）滚底，含 iOS 语音发送补滚 */
   const scrollToLastMsgAfterSend = () =>
     scrollManager.scrollToLastMsgAfterSend();
+  /** 历史/公式一次性上屏后补滚到底 */
+  const handleAiMsgContentReady = (_payload: any): void => {
+    scrollManager.nudgeAfterContentReady();
+  };
   const setIsInScrollBottom = (e: UniScrollEvent) =>
     scrollManager.setIsInScrollBottom(e);
   const lockAutoToLastMsg = () => scrollManager.lockAutoToLastMsg();
@@ -2064,26 +2067,38 @@
   sendInterventionResumeMessage = handleSendMessage;
 
   /**
-   * 切换语音播报静音。
-   * - 设为静音：停止当前流式/工具栏 TTS/音频（stop 派发 idle，工具栏播报态复位）
-   * - 取消静音：只恢复音量，不停播。若静音期间已点工具栏在播（音量 0），取消后继续出声；
-   *   若因「切静音」已 stop 掉的播报，不会自动重播。
+   * 切换 SSE 自动播报。
+   * - 关闭：停止当前流式自动播报；后续 SSE 不再 begin/feed（录音仍预热 TTS）
+   * - 开启：若本轮 SSE 仍在进行则立刻续播当前助手正文；已结束则不补播
+   * 工具栏手动播放不受此开关影响（始终可出声）。
    */
-  const handleToggleVoiceMute = (): void => {
+  const handleToggleVoiceAutoPlay = (): void => {
     const settings = loadVoiceSettings();
-    const nextMuted = settings.muted != true;
-    settings.muted = nextMuted;
+    const nextAutoPlay = settings.autoPlay != true;
+    settings.autoPlay = nextAutoPlay;
     saveVoiceSettings(settings);
-    voiceMuted.value = nextMuted;
-    // 先落盘再调音量：播放链路 getTargetVolume 读的是 storage
-    ttsWebSocketPlayer.setMuted(nextMuted);
-    audioPlayerManager.setMuted(nextMuted);
-    if (nextMuted) {
-      // 须 stop 而非 pause：pause 不打断 voiceStreamSpeaker，工具栏会一直 isSpeaking
+    voiceAutoPlayOff.value = nextAutoPlay != true;
+    if (nextAutoPlay != true) {
+      // 只停播，保留 feed 快照，便于中途再打开时续播
+      clearFeedSpeakTimer();
+      headlessStreamSpeakId = "";
       stopAllSpeechPlayback();
+    } else if (isConversationActive.value == true) {
+      // SSE 未结束：用当前流式正文立刻 begin（后续仍由 streamSpeakFeed 续喂）
+      let msgId = streamingAssistantMessageId.value;
+      if (msgId.length == 0) {
+        msgId = feedSpeakMsgId;
+      }
+      let body = feedSpeakBodyText;
+      if (body.length == 0) {
+        body = assistantStreamText.value;
+      }
+      ensureHeadlessStreamSpeak(msgId, body);
     }
     uni.showToast({
-      title: nextMuted ? t("Mobile.Voice.muted") : t("Mobile.Voice.unmuted"),
+      title: nextAutoPlay
+        ? t("Mobile.Voice.autoPlayOn")
+        : t("Mobile.Voice.autoPlayOff"),
       icon: "none",
       duration: 1500,
     });
@@ -2467,8 +2482,8 @@
    * 须用 function 声明：UTS 嵌套回调内无法引用同作用域 const（error18）。
    */
   /**
-   * 本地忙：会话进行中，或语音播报尚未结束。
-   * 后者即使 chat_finished 也要挡轮询，避免详情接口与 TTS 抢主线程。
+   * 本地忙：会话进行中（发消息 / live SSE / sub 续流）。
+   * 不含 TTS：App 开会话后 H5 续接时，即使本端正在语音播报也要继续轮询状态。
    */
   function isLocalConversationBusy(): boolean {
     if (data.isConversationActive.value == true) {
@@ -2478,10 +2493,6 @@
       return true;
     }
     if (service.isSubConversationSubscribed == true) {
-      return true;
-    }
-    // 会话已结束但工具栏/流式 TTS 仍在播：同样跳过详情轮询
-    if (voiceStreamSpeaker.isBusy() == true) {
       return true;
     }
     return false;
@@ -2504,7 +2515,7 @@
         });
       },
       (): boolean => {
-        // 轮询门禁：会话中 / TTS 播报中跳过（播完后 getter 变 false，自动继续）
+        // 轮询门禁：仅会话进行中跳过；语音播报不挡轮询
         return isLocalConversationBusy();
       },
       (): boolean => {
@@ -3188,6 +3199,7 @@
 
     uni.$on("page_preview_executing", handlePagePreviewExecuting);
     uni.$on("page_preview_detail", handlePagePreviewDetail);
+    uni.$on("ai-msg-content-ready", handleAiMsgContentReady);
   };
   const handleMarkdownProxyMessage = (event: UniWebViewMessageEvent): void => {
     // #ifdef APP
@@ -3266,6 +3278,7 @@
     uni.$off("refreshFileList", onRefreshFileList);
     uni.$off("updateMessageComponent", handleUpdateMessageComponent);
     uni.$off("page_preview_executing", handlePagePreviewExecuting);
+    uni.$off("ai-msg-content-ready", handleAiMsgContentReady);
     // #ifdef MP-WEIXIN
     uni.$off("message-event-delegate");
     // #endif

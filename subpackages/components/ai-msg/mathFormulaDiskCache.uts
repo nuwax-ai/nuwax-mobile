@@ -1,16 +1,15 @@
 /**
- * App 数学公式截图磁盘缓存。
- * - PNG 落在 uni.env.USER_DATA_PATH/katex-cache/
- * - 索引（key/file/宽高/顺序）落在 storage，进程重启可恢复
- * - 上限 FIFO，与原先内存缓存策略一致
- * H5 无持久化需求：读写均为空操作。
+ * App 数学公式截图缓存：
+ * - L1 内存：SSE 同会话秒级复用，避免落盘完成前反复截图
+ * - L2 磁盘：PNG + storage 索引，冷启动可恢复；上限 FIFO=500
+ * H5：读写均为空操作。
  */
 
 const MATH_CACHE_MAX: number = 500;
 const INDEX_STORAGE_KEY: string = "MATH_FORMULA_DISK_CACHE_V1";
 const CACHE_DIR_NAME: string = "katex-cache";
 
-/** 对外缓存条目：href 用本地文件路径，不再持有 base64 */
+/** 对外缓存条目：本地路径或 dataURL + 宽高 */
 export class MathRenderCacheEntry {
   imageDataURL: string = "";
   width: number = 0;
@@ -28,6 +27,30 @@ class MathDiskIndexItem {
 let indexLoaded: boolean = false;
 let indexItems: MathDiskIndexItem[] = [] as MathDiskIndexItem[];
 let dirEnsured: boolean = false;
+
+/** 会话内 L1：key → entry（可含 dataURL，落盘后改为 filePath） */
+const memoryL1 = new Map<string, MathRenderCacheEntry>();
+let memoryL1Keys: string[] = [] as string[];
+
+function putMemoryL1(key: string, entry: MathRenderCacheEntry): void {
+  if (memoryL1.has(key) == false) {
+    memoryL1Keys.push(key);
+  }
+  memoryL1.set(key, entry);
+  while (memoryL1Keys.length > MATH_CACHE_MAX) {
+    const oldKey = memoryL1Keys.shift();
+    if (oldKey != null && oldKey.length > 0) {
+      memoryL1.delete(oldKey);
+    }
+  }
+}
+
+function getMemoryL1(key: string): MathRenderCacheEntry | null {
+  if (memoryL1.has(key) == false) {
+    return null;
+  }
+  return memoryL1.get(key) as MathRenderCacheEntry;
+}
 
 function isAppDiskCacheEnabled(): boolean {
   let enabled = false;
@@ -258,11 +281,15 @@ function stripDataUrlBase64(dataUrl: string): string {
 }
 
 /**
- * 读取磁盘缓存。命中返回本地路径（可直接作 image.src）。
+ * 读取缓存：先 L1（SSE 防重复截图），再磁盘。
  */
 export function getMathCache(key: string): MathRenderCacheEntry | null {
   if (isAppDiskCacheEnabled() == false) {
     return null;
+  }
+  const mem = getMemoryL1(key);
+  if (mem != null && mem.imageDataURL.length > 0) {
+    return mem;
   }
   loadIndex();
   const item = findIndexItem(key);
@@ -285,6 +312,7 @@ export function getMathCache(key: string): MathRenderCacheEntry | null {
   entry.imageDataURL = filePath;
   entry.width = item.width;
   entry.height = item.height;
+  putMemoryL1(key, entry);
   return entry;
 }
 
@@ -299,7 +327,7 @@ function evictOverflow(): void {
 }
 
 /**
- * 写入磁盘缓存（异步落盘）。当前帧仍用 res 里的 dataURL 上屏；下次启动走文件路径。
+ * 写入缓存：先同步进 L1（SSE 立刻可复用），再异步落盘。
  */
 export function putMathCache(key: string, res: UTSJSONObject): void {
   if (isAppDiskCacheEnabled() == false) {
@@ -310,19 +338,33 @@ export function putMathCache(key: string, res: UTSJSONObject): void {
     return;
   }
   const dataUrl = `${imageData}`;
-  // 已是本地路径则只更新索引元数据
-  if (dataUrl.indexOf("data:") != 0 && dataUrl.length > 0) {
+  if (dataUrl.length == 0) {
+    return;
+  }
+  let width = 0;
+  let height = 0;
+  const widthData = res["width"];
+  const heightData = res["height"];
+  if (widthData != null) {
+    width = widthData as number;
+  }
+  if (heightData != null) {
+    height = heightData as number;
+  }
+  // 同步 L1：后续 SSE 重解析不再打 proxy
+  const l1 = new MathRenderCacheEntry();
+  l1.imageDataURL = dataUrl;
+  l1.width = width;
+  l1.height = height;
+  const htmlData = res["resultHtml"];
+  if (htmlData != null) {
+    l1.resultHtml = `${htmlData}`;
+  }
+  putMemoryL1(key, l1);
+
+  // 已是本地路径：只更新磁盘索引元数据
+  if (dataUrl.indexOf("data:") != 0) {
     loadIndex();
-    let width = 0;
-    let height = 0;
-    const widthData = res["width"];
-    const heightData = res["height"];
-    if (widthData != null) {
-      width = widthData as number;
-    }
-    if (heightData != null) {
-      height = heightData as number;
-    }
     const existing = findIndexItem(key);
     if (existing != null) {
       existing.width = width;
@@ -336,16 +378,6 @@ export function putMathCache(key: string, res: UTSJSONObject): void {
     return;
   }
   loadIndex();
-  let width = 0;
-  let height = 0;
-  const widthData = res["width"];
-  const heightData = res["height"];
-  if (widthData != null) {
-    width = widthData as number;
-  }
-  if (heightData != null) {
-    height = heightData as number;
-  }
 
   let fileName = "";
   const existing = findIndexItem(key);
@@ -388,6 +420,12 @@ export function putMathCache(key: string, res: UTSJSONObject): void {
       }
       evictOverflow();
       persistIndex();
+      // 落盘成功后 L1 改为文件路径，释放巨型 base64 字符串
+      const pathEntry = new MathRenderCacheEntry();
+      pathEntry.imageDataURL = filePath;
+      pathEntry.width = width;
+      pathEntry.height = height;
+      putMemoryL1(key, pathEntry);
     },
     fail: (err) => {
       console.warn(

@@ -166,8 +166,6 @@ export class AiMsgMarkdownParser {
   private lastFallbackBody: string = "";
   /** 已完成消息的正文快照，用于跳过父级重渲染触发的重复解析。 */
   private lastFinishedBody: string = "";
-  /** 历史公式未齐：暂不上屏，避免重复 parse */
-  private fallbackHoldPending: boolean = false;
 
   constructor(
     msg: Ref<MsgItem>,
@@ -198,7 +196,6 @@ export class AiMsgMarkdownParser {
     this.cmarkProbeOk = true;
     this.lastFallbackBody = "";
     this.lastFinishedBody = "";
-    this.fallbackHoldPending = false;
     this.parseMarkdown = this.createParseMarkdown();
   }
 
@@ -308,19 +305,17 @@ export class AiMsgMarkdownParser {
   }
 
   /**
-   * App fallback 渲染。
-   * @param holdMathUntilDone 历史/已完成：先截完公式，再与文案一次性上屏（对应位置已回填）
+   * fallback 渲染。
+   * - App：文案+占位先上屏，截图齐后一次填入
+   * - H5：仍走单条 katex → resultHtml（与改 App 前一致），回调合并刷新
    */
-  private applyAppFallback(holdMathUntilDone: boolean = false): void {
+  private applyAppFallback(_holdMathUntilDone: boolean = false): void {
     const body = this.getBodyText();
     if (body.length == 0) {
       return;
     }
     const needsCustom = this.hasCustomMarkup(body);
     const needsStructural = this.prefersAppStructuralFallback(body);
-    if (body == this.lastFallbackBody && this.fallbackHoldPending == true) {
-      return;
-    }
     if (
       body == this.lastFallbackBody &&
       this.msg.value.markdownElList.length > 0
@@ -345,33 +340,7 @@ export class AiMsgMarkdownParser {
           body.replace(/\n/g, "\\n"),
       );
     }
-    let committed = false;
-    let safetyTimer: number = 0;
-    let pendingList: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
-    const commitUi = (list: UniAiMarkdownElItem[]): void => {
-      if (committed == true) {
-        return;
-      }
-      committed = true;
-      this.fallbackHoldPending = false;
-      if (safetyTimer != 0) {
-        clearTimeout(safetyTimer);
-        safetyTimer = 0;
-      }
-      // 此时 token 上公式 href/尺寸已回填，与文案同帧上屏
-      this.msg.value.markdownElList = list;
-      this.msg.value.rendered = true;
-      this.lastFinishedBody = body;
-      this.bumpRevision();
-      // 通知会话页补滚底（历史公式撑高后 scroll-into-view 常已过期）
-      uni.$emit("ai-msg-content-ready", null);
-    };
-    const onMathAllDone = (): void => {
-      if (holdMathUntilDone == true) {
-        commitUi(pendingList);
-        return;
-      }
-      // 流式：骨架已上屏，公式齐活后换引用刷新一次
+    const flushMathUi = (): void => {
       const prev = this.msg.value.markdownElList;
       const next = [] as UniAiMarkdownElItem[];
       for (let i = 0; i < prev.length; i++) {
@@ -381,19 +350,20 @@ export class AiMsgMarkdownParser {
       this.bumpRevision();
       uni.$emit("ai-msg-content-ready", null);
     };
-    pendingList = expandMarkdownImageItems(
-      parseAppMarkdownFallback(body, onMathAllDone),
+    // App：batch 齐活只回调一次；H5：单条 katex 回调也直接刷（不再额外 coalesce）
+    const onMathNotify = (): void => {
+      flushMathUi();
+    };
+    this.msg.value.markdownElList = expandMarkdownImageItems(
+      parseAppMarkdownFallback(body, onMathNotify),
     );
-    const mathJobCount = takeLastMathFlushCount();
-    if (holdMathUntilDone == true && mathJobCount > 0) {
-      this.fallbackHoldPending = true;
-      safetyTimer = setTimeout((): void => {
-        safetyTimer = 0;
-        commitUi(pendingList);
-      }, 8000) as number;
-      return;
+    this.msg.value.rendered = true;
+    this.lastFinishedBody = body;
+    this.bumpRevision();
+    // App 有批量队列时 count>0，等齐活再 emit；H5 无队列 count=0，正文先 emit
+    if (takeLastMathFlushCount() == 0) {
+      uni.$emit("ai-msg-content-ready", null);
     }
-    commitUi(pendingList);
   }
 
   private applyMarkdownTokenList(markdownTokenList: MarkdownToken[]): void {
@@ -596,7 +566,7 @@ export class AiMsgMarkdownParser {
     // 一旦出现自定义标记，立即中止 cmark 增量打字机，避免半截正文覆盖 UI。
     if (needsCustomFallback) {
       this.applyAppFallback(streamFinished);
-      if (streamFinished && this.fallbackHoldPending != true) {
+      if (streamFinished) {
         this.lastFinishedBody = body;
       }
       return;
@@ -608,7 +578,7 @@ export class AiMsgMarkdownParser {
     // #ifdef APP
     if (this.prefersAppStructuralFallback(body) == true) {
       this.applyAppFallback(streamFinished);
-      if (streamFinished && this.fallbackHoldPending != true) {
+      if (streamFinished) {
         this.lastFinishedBody = body;
       }
       return;

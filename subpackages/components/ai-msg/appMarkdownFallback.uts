@@ -68,66 +68,69 @@ function applyMathResultToToken(token: MarkdownToken, res: UTSJSONObject): void 
 /** 最近一次根 parse 提交的公式数（0 表示无 batch） */
 let lastMathFlushCount: number = 0;
 
-/**
- * 代理侧仍可一次吃完；宿主：正文先上屏，全部公式 token 回填后再回调一次。
- * UTS 不支持局部函数递归，用类方法发起。
- */
-class MathBatchRunner {
-  jobs: PendingMathJob[];
-  tokenById: Map<string, MarkdownToken>;
-  onAllDone: MathRenderedCallback;
+/** 截图结果暂存：齐活前不写 token，避免逐条触发 Vue 重绘抖动 */
+class PendingMathResult {
+  token: MarkdownToken;
+  res: UTSJSONObject;
+  constructor(token: MarkdownToken, res: UTSJSONObject) {
+    this.token = token;
+    this.res = res;
+  }
+}
 
-  constructor(
-    jobs: PendingMathJob[],
-    tokenById: Map<string, MarkdownToken>,
-    onAllDone: MathRenderedCallback,
-  ) {
+/**
+ * App 专用：并行派发 katexRender（proxy 内 4 槽）。
+ * 回调只暂存结果，全部完成后再一次性写回 token 并通知 UI（防 Android 逐条抖动）。
+ * H5 不走此路径（见 parseAppMarkdownFallback / renderMathToken）。
+ */
+class MathBatchUiRunner {
+  jobs: PendingMathJob[];
+  onAllDone: MathRenderedCallback;
+  pending: number = 0;
+  buffered: PendingMathResult[] = [] as PendingMathResult[];
+
+  constructor(jobs: PendingMathJob[], onAllDone: MathRenderedCallback) {
     this.jobs = jobs;
-    this.tokenById = tokenById;
     this.onAllDone = onAllDone;
   }
 
   start(): void {
-    const jobs = this.jobs;
-    const items = [] as UTSJSONObject[];
-    for (let i = 0; i < jobs.length; i++) {
-      const job = jobs[i];
-      const item = new UTSJSONObject();
-      item["id"] = job.id;
-      item["pureMathText"] = job.latex;
-      item["displayMode"] = job.displayMode;
-      items.push(item);
+    this.pending = this.jobs.length;
+    this.buffered = [] as PendingMathResult[];
+    for (let i = 0; i < this.jobs.length; i++) {
+      this.dispatchOne(i);
     }
+  }
+
+  dispatchOne(index: number): void {
+    const job = this.jobs[index];
     const param = new UTSJSONObject();
-    param["action"] = "katexRenderBatch";
-    param["items"] = items;
+    param["action"] = "katexRender";
+    param["pureMathText"] = job.latex;
+    param["displayMode"] = job.displayMode;
     const runner = this;
+    const token = job.token;
     proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
-      const results = res["results"];
-      if (results != null) {
-        const list = results as any[];
-        for (let ri = 0; ri < list.length; ri++) {
-          const one = list[ri] as UTSJSONObject;
-          if (one == null) {
-            continue;
-          }
-          const idVal = one["id"];
-          const id = idVal != null ? `${idVal}` : "";
-          const token = id.length > 0 ? runner.tokenById.get(id) : null;
-          if (token != null) {
-            applyMathResultToToken(token, one);
-          }
+      // 先缓冲，勿 apply —— 否则每条 href 赋值都会触发列表重排/滚底抖动
+      runner.buffered.push(new PendingMathResult(token, res));
+      runner.pending = runner.pending - 1;
+      if (runner.pending == 0) {
+        const all = runner.buffered;
+        for (let bi = 0; bi < all.length; bi++) {
+          applyMathResultToToken(all[bi].token, all[bi].res);
         }
+        console.log(
+          "[MathRender] batch ui ready count=" + runner.jobs.length,
+        );
+        runner.onAllDone();
       }
-      console.log("[MathRender] batch all done count=" + runner.jobs.length);
-      runner.onAllDone();
     });
   }
 }
 
 /**
- * 将收集到的公式一次交给 proxy；全部完成后回调 onAllDone（一次性刷新 UI）。
- * 无任务时不回调（由调用方立刻提交正文）。
+ * App：将收集到的公式并行交给 proxy，全部完成回调 onAllDone。
+ * 无任务时不回调。
  * @returns 提交的公式条数
  */
 function flushMathJobs(onAllDone: MathRenderedCallback): number {
@@ -143,12 +146,8 @@ function flushMathJobs(onAllDone: MathRenderedCallback): number {
     return 0;
   }
   lastMathFlushCount = jobs.length;
-  const tokenById = new Map<string, MarkdownToken>();
-  for (let i = 0; i < jobs.length; i++) {
-    tokenById.set(jobs[i].id, jobs[i].token);
-  }
   console.log("[MathRender] batch enqueue count=" + jobs.length);
-  new MathBatchRunner(jobs, tokenById, onAllDone).start();
+  new MathBatchUiRunner(jobs, onAllDone).start();
   return jobs.length;
 }
 
@@ -1059,28 +1058,26 @@ function renderMathToken(
   if (token.text != safeLatex) {
     token.text = safeLatex;
   }
-  // 解析期入队，出口统一 katexRenderBatch（一次桥接 + 一次 UI 提交）
-  const queue = currentMathJobs();
-  if (queue != null) {
-    mathJobSeq = mathJobSeq + 1;
-    const id =
-      (token.uniqueId != null && `${token.uniqueId}`.length > 0
-        ? `${token.uniqueId}`
-        : "math") +
-      "-" +
-      mathJobSeq;
-    queue.push(new PendingMathJob(id, safeLatex, token, displayMode));
-    return;
+  // App：解析期入队，出口批量截图；H5：不入队，单条即时 katexRender → resultHtml
+  let useAppQueue = false;
+  // #ifdef APP
+  useAppQueue = true;
+  // #endif
+  if (useAppQueue == true) {
+    const queue = currentMathJobs();
+    if (queue != null) {
+      mathJobSeq = mathJobSeq + 1;
+      const id =
+        (token.uniqueId != null && `${token.uniqueId}`.length > 0
+          ? `${token.uniqueId}`
+          : "math") +
+        "-" +
+        mathJobSeq;
+      queue.push(new PendingMathJob(id, safeLatex, token, displayMode));
+      return;
+    }
   }
-  // 无队列时退回单条（兼容外部直接调用）
-  console.log(
-    "[MathRender] request latexLen=" +
-      safeLatex.length +
-      " tokenId=" +
-      (token.uniqueId ?? "") +
-      " displayMode=" +
-      displayMode,
-  );
+  // H5 / 无队列：保持原单条请求逻辑
   const param = new UTSJSONObject();
   param["action"] = "katexRender";
   param["pureMathText"] = safeLatex;
@@ -1157,12 +1154,21 @@ function makeTableRow(
 /**
  * 标准 App 基座缺少 uni-cmark 原生库时的纯 UTS Markdown 解析。
  * 支持标题、段落、粗体、行内代码、分隔线、表格、代码块及块级数学公式。
- * 根调用会收集公式并一次 katexRenderBatch；完成后回调 onMathRendered。
+ * - App：根调用收集公式 → 并行截图 → 全部完成回调一次
+ * - H5：不走批量队列，解析中单条 katexRender（resultHtml + v-html，原逻辑）
  */
 export function parseAppMarkdownFallback(
   markdown: string,
   onMathRendered: MathRenderedCallback,
 ): UniAiMarkdownElItem[] {
+  let useAppBatch = false;
+  // #ifdef APP
+  useAppBatch = true;
+  // #endif
+  if (useAppBatch != true) {
+    lastMathFlushCount = 0;
+    return parseAppMarkdownFallbackInner(markdown, onMathRendered);
+  }
   mathJobStack.push(new MathJobFrame());
   const parsed = parseAppMarkdownFallbackInner(markdown, onMathRendered);
   const jobCount = flushMathJobs(onMathRendered);

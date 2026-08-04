@@ -3,24 +3,27 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <!-- 预加载常用 KaTeX 字体（必须加 crossorigin 以匹配 CSS @font-face 的匿名跨域模式） -->
-    <link rel="preload" href="./libs/fonts/KaTeX_Math-Italic.woff2" as="font" type="font/woff2" crossorigin="anonymous" />
-    <link rel="preload" href="./libs/fonts/KaTeX_Main-Regular.woff2" as="font" type="font/woff2" crossorigin="anonymous" />
-    <link rel="preload" href="./libs/fonts/KaTeX_Size2-Regular.woff2" as="font" type="font/woff2" crossorigin="anonymous" />
+    <!--
+      App Android WebView 以 file:// + origin=null 加载本页时，带 crossorigin 的 font preload
+      会被 CORS 拦截且无法命中（日志里大量 KaTeX_*.woff2 blocked）。H5/http 仍可走 CSS @font-face。
+      故不再 preload，避免无效请求拖慢首屏并刷屏。
+    -->
     <link rel="stylesheet" href="./libs/katex.min.css">
     <title></title>
   </head>
   <body>
-    <div id="markImgContainer"></div>
+    <!-- 多容器并行截图，避免公式串行 html2canvas 导致历史/SSE 逐个冒泡 -->
+    <div id="markImgContainer" class="mark-img-container"></div>
+    <div id="markImgContainer1" class="mark-img-container"></div>
+    <div id="markImgContainer2" class="mark-img-container"></div>
+    <div id="markImgContainer3" class="mark-img-container"></div>
     <script type="text/javascript" src="./libs/uni.webview.1.5.5.js"></script>
 
-    <!-- 引入 katex 数学公式渲染库 -->
+    <!-- katex + html2canvas 同步加载；mermaid/mhchem 异步，避免拖慢代理就绪（历史公式可早数百 ms～数秒开渲） -->
     <script type="text/javascript" src="./libs/katex.min.js"></script>
-    <!-- 引入 mhchem 扩展 -->
-    <script defer src="./libs/mhchem.min.js"></script>
-
     <script type="text/javascript" src="./libs/html2canvas1.4.1.js"></script>
-    <script type="text/javascript" src="./libs/mermaid.min.js"></script>
+    <script defer src="./libs/mhchem.min.js"></script>
+    <script async src="./libs/mermaid.min.js"></script>
 		
     <script type="text/javascript">
         let parentIsAppAndroid = false;
@@ -37,7 +40,13 @@
 			
         class ProxyWebHandler {
           setting = {}
-          katexQueue = Promise.resolve()
+          _hostReadySent = false
+          /** 并行截图上限（每槽位独立 DOM，互不覆盖） */
+          katexConcurrency = 4
+          katexActive = 0
+          katexWaiters = []
+          katexSlotBusy = [false, false, false, false]
+          fontsReadyPromise = null
           constructor() {
             // window.addEventListener('storage', (e) => {
             //   console.log('storage change', e);
@@ -57,13 +66,30 @@
             //   });
             // });
 						
-            // 监听当前 web 初始化完成
-            document.addEventListener('DOMContentLoaded', () => {
+            // 尽快通知宿主：document 已可交互，或脚本执行时已过 DOMContentLoaded
+            this.signalHostReady();
+          }
+
+          signalHostReady() {
+            if (this._hostReadySent == true) {
+              return;
+            }
+            const send = () => {
+              if (this._hostReadySent == true) {
+                return;
+              }
+              this._hostReadySent = true;
               this.postMessage({
                 action: 'DOMContentLoaded_callback',
                 param: {}
               });
-            });
+            };
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', send);
+            } else {
+              // interactive/complete：同步脚本已跑完，立刻就绪（勿再等 async mermaid）
+              send();
+            }
           }
           setSetting(e) {
             this.setting = e.data;
@@ -131,27 +157,37 @@
             // console.log('web 内部执行了 onMessage', param);
             const { action } = param;
 
+            // KaTeX：有限并行（多容器），避免串行队列让公式逐个冒泡、反复撑高滚底
+            // 须在 typeof this[action] 之前处理：batch 走 runKatexBatch，类上无同名方法
+            if (action === 'katexRender') {
+              this.runKatexJob(param).catch(error => {
+                this.postMessage({
+                  action: `${action}_callback_${param.requestId}`,
+                  param: {
+                    imageDataURL: '',
+                    error: error != null && error.message != null ? error.message : 'katex_queue_failed'
+                  }
+                });
+              });
+              return;
+            }
+            // 历史/整段：一次桥接批量渲，宿主可等齐后单次提交 UI
+            if (action === 'katexRenderBatch') {
+              this.runKatexBatch(param).catch(error => {
+                this.postMessage({
+                  action: `${action}_callback_${param.requestId}`,
+                  param: {
+                    results: [],
+                    error: error != null && error.message != null ? error.message : 'katex_batch_failed'
+                  }
+                });
+              });
+              return;
+            }
+
             if (typeof this[action] !== 'function') {
               console.error('不支持的 e.action', action);
               throw new Error('不支持的 e.action: ' + action);
-            }
-
-            // KaTeX 渲染会复用 markImgContainer，必须串行执行，否则多个 html2canvas
-            // 会互相覆盖 DOM，并导致部分 Promise 永远不返回。
-            if (action === 'katexRender') {
-              this.katexQueue = this.katexQueue
-                .then(() => this.katexRender(param))
-                .catch(error => {
-                  this.postMessage({
-                    action: `${action}_callback_${param.requestId}`,
-                    param: {
-                      imageDataURL: '',
-                      error: error.message
-                    }
-                  });
-                  console.log(action + ' queue failed', error);
-                });
-              return;
             }
 
             try {
@@ -188,13 +224,169 @@
             });
           }
 
+          ensureFontsReady() {
+            if (this.fontsReadyPromise == null) {
+              // Android file:// 下 KaTeX woff2 常被 CORS 永久失败，fonts.ready 会空等到超时；
+              // 拉长等待只会推迟全部截图回调，表现为历史公式页长时间抖动。
+              const ua = window.navigator.userAgent || '';
+              const isAndroid = /Android/i.test(ua);
+              const timeoutMs = isAndroid ? 60 : (this.isIOS() ? 1500 : 800);
+              this.fontsReadyPromise = this.withTimeout(
+                document.fonts != null ? document.fonts.ready : Promise.resolve(),
+                timeoutMs,
+                null
+              );
+            }
+            return this.fontsReadyPromise;
+          }
+
+          getCaptureContainer(slotIndex) {
+            if (slotIndex <= 0) {
+              return document.getElementById('markImgContainer');
+            }
+            return document.getElementById('markImgContainer' + slotIndex);
+          }
+
+          acquireKatexSlot() {
+            return new Promise((resolve) => {
+              const tryAcquire = () => {
+                if (this.katexActive >= this.katexConcurrency) {
+                  this.katexWaiters.push(tryAcquire);
+                  return;
+                }
+                let slot = -1;
+                for (let i = 0; i < this.katexSlotBusy.length; i++) {
+                  if (this.katexSlotBusy[i] != true) {
+                    slot = i;
+                    break;
+                  }
+                }
+                if (slot < 0) {
+                  this.katexWaiters.push(tryAcquire);
+                  return;
+                }
+                this.katexSlotBusy[slot] = true;
+                this.katexActive += 1;
+                resolve(slot);
+              };
+              tryAcquire();
+            });
+          }
+
+          releaseKatexSlot(slotIndex) {
+            if (slotIndex >= 0 && slotIndex < this.katexSlotBusy.length) {
+              this.katexSlotBusy[slotIndex] = false;
+            }
+            if (this.katexActive > 0) {
+              this.katexActive -= 1;
+            }
+            const next = this.katexWaiters.shift();
+            if (typeof next === 'function') {
+              next();
+            }
+          }
+
+          async runKatexJob(param) {
+            const slot = await this.acquireKatexSlot();
+            try {
+              await this.katexRender(param, slot);
+            } finally {
+              this.releaseKatexSlot(slot);
+            }
+          }
+
+          /**
+           * 批量公式：内部仍走并行槽位，但只 postMessage 一次。
+           * items: [{ id, pureMathText, displayMode }]
+           */
+          async runKatexBatch(param) {
+            const requestId = param.requestId;
+            const items = param.items != null && Array.isArray(param.items) ? param.items : [];
+            const results = new Array(items.length);
+            await Promise.all(
+              items.map(async (item, index) => {
+                const slot = await this.acquireKatexSlot();
+                try {
+                  results[index] = await this.katexRenderToResult(item, slot);
+                } catch (error) {
+                  results[index] = {
+                    id: item != null && item.id != null ? item.id : '' + index,
+                    imageDataURL: '',
+                    resultHtml: '',
+                    width: null,
+                    height: null,
+                    error: error != null && error.message != null ? error.message : 'katex_item_failed'
+                  };
+                } finally {
+                  this.releaseKatexSlot(slot);
+                }
+              })
+            );
+            this.postMessage({
+              action: 'katexRenderBatch_callback_' + requestId,
+              param: { results }
+            });
+          }
+
+          /** 渲染单条公式并返回结果对象（不 postMessage） */
+          async katexRenderToResult(item, slotIndex = 0) {
+            const id = item != null && item.id != null ? item.id : '';
+            let pureMathText = item != null && item.pureMathText != null ? item.pureMathText : '';
+            pureMathText = pureMathText.replace(/\\\\/g, '\\');
+            const useDisplayMode = item == null || item.displayMode !== false;
+            const resultHtml = katex.renderToString(pureMathText, {
+              throwOnError: false,
+              displayMode: useDisplayMode,
+              output: 'html',
+              trust: true,
+              strict: 'ignore'
+            });
+            const htmlForCapture = useDisplayMode
+              ? resultHtml
+              : '<span class="katex-inline-wrap" style="display:inline-block;font-size:16px;line-height:1.25;padding:1px 6px 1px 1px;">' +
+                resultHtml +
+                '</span>';
+            let imageDataURL = '';
+            let cssWidth = 0;
+            let cssHeight = 0;
+            if (!parentIsWeb) {
+              const containerEl = this.getCaptureContainer(slotIndex);
+              const shot = await this.html2Base64(
+                htmlForCapture,
+                2,
+                true,
+                !useDisplayMode,
+                containerEl
+              );
+              imageDataURL = shot != null && shot.dataUrl != null ? shot.dataUrl : '';
+              cssWidth = shot != null && shot.width != null ? shot.width : 0;
+              cssHeight = shot != null && shot.height != null ? shot.height : 0;
+            }
+            return {
+              id,
+              imageDataURL: parentIsWeb ? null : imageDataURL,
+              width: cssWidth > 0 ? cssWidth : null,
+              height: cssHeight > 0 ? cssHeight : null,
+              resultHtml: parentIsWeb ? resultHtml : '',
+              error: (!parentIsWeb && (imageDataURL == null || imageDataURL.length < 32))
+                ? 'empty_image'
+                : ''
+            };
+          }
+
           /**
            * @returns {{ dataUrl: string, width: number, height: number }}
            * width/height 为 CSS 逻辑像素（不是 canvas 物理像素），避免 iOS 上行内公式被放大数倍。
            */
-          async html2Base64(htmlString, scale = 3, setTheme = false, fitContent = false) {
-            const markImgContainer = document.getElementById('markImgContainer');
+          async html2Base64(htmlString, scale = 2, setTheme = false, fitContent = false, containerEl = null) {
+            const markImgContainer =
+              containerEl != null
+                ? containerEl
+                : document.getElementById('markImgContainer');
             const empty = { dataUrl: '', width: 0, height: 0 };
+            if (markImgContainer == null) {
+              return empty;
+            }
             // 行内公式：按内容收缩。iOS 对 fit-content 支持不稳，改用 inline-block + width:auto
             if (fitContent) {
               markImgContainer.style.minWidth = '0';
@@ -223,8 +415,8 @@
               markImgContainer.style.color = '#404040';
               markImgContainer.style.backgroundColor = '#ffffff';
             }
-            // iOS：fonts.ready 在本地 KaTeX 字体跨域失败时可能挂起，导致整条 katex 队列卡死（无 callback）
-            await this.withTimeout(document.fonts.ready, 1500, null);
+            // 字体只等一次，避免每条公式重复卡 1.5s
+            await this.ensureFontsReady();
             // 等一帧让 inline-block 完成布局
             await new Promise(resolve => setTimeout(resolve, 0));
             try {
@@ -318,44 +510,12 @@
             }
           }
 
-          async katexRender({ pureMathText, requestId, displayMode }) {
+          async katexRender({ pureMathText, requestId, displayMode }, slotIndex = 0) {
             try {
-              // 把 \\ 替换为 \
-              pureMathText = pureMathText.replace(/\\\\/g, '\\');
-              // 表格单元格 / 标题行内公式用 displayMode=false，避免过大且更贴近正文
-              const useDisplayMode = displayMode !== false;
-              const resultHtml = katex.renderToString(pureMathText, {
-                  throwOnError: false,
-                  displayMode: useDisplayMode, // true 为块级公式 \[ \]，false 为行内公式 \( \)
-                  output: 'html',
-                  trust: true, // 允许一些不安全的命令
-                  strict: 'ignore' // 是否严格模式
-              });
-              // 行内公式包一层字号，贴近标题/正文（约 16px）
-              const htmlForCapture = useDisplayMode
-                ? resultHtml
-                : '<span class="katex-inline-wrap" style="display:inline-block;font-size:16px;line-height:1.25;padding:1px 6px 1px 1px;">' +
-                  resultHtml +
-                  '</span>';
-              // parentIsWeb = false 时，才需要转换为图片
-              let imageDataURL = '';
-              let cssWidth = 0;
-              let cssHeight = 0;
-              if (!parentIsWeb) {
-                const shot = await this.html2Base64(htmlForCapture, 3, true, !useDisplayMode);
-                imageDataURL = shot != null && shot.dataUrl != null ? shot.dataUrl : '';
-                cssWidth = shot != null && shot.width != null ? shot.width : 0;
-                cssHeight = shot != null && shot.height != null ? shot.height : 0;
-              }
-              const param = {
-                imageDataURL: parentIsWeb ? null : imageDataURL,
-                width: cssWidth > 0 ? cssWidth : null,
-                height: cssHeight > 0 ? cssHeight : null,
-                resultHtml: parentIsWeb ? resultHtml : '',
-                error: (!parentIsWeb && (imageDataURL == null || imageDataURL.length < 32))
-                  ? 'empty_image'
-                  : ''
-              }
+              const param = await this.katexRenderToResult(
+                { id: '', pureMathText, displayMode },
+                slotIndex
+              );
               this.postMessage({
                 action: "katexRender_callback_" + requestId,
                 param
@@ -391,7 +551,7 @@
         overflow: visible;
         background: transparent;
       }
-      #markImgContainer {
+      .mark-img-container {
         padding: 8px 12px;
         display: inline-block;
         box-sizing: border-box;
@@ -401,12 +561,12 @@
         vertical-align: top;
       }
       /* 斜体数学字母右倾，截图时多留右侧空间 */
-      #markImgContainer .katex,
-      #markImgContainer .katex-html {
+      .mark-img-container .katex,
+      .mark-img-container .katex-html {
         overflow: visible;
         padding-right: 0.35em;
       }
-      #markImgContainer .katex-inline-wrap {
+      .mark-img-container .katex-inline-wrap {
         display: inline-block;
         font-size: 16px;
         line-height: 1.25;

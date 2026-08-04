@@ -68,7 +68,7 @@ function applyMathResultToToken(token: MarkdownToken, res: UTSJSONObject): void 
 /** 最近一次根 parse 提交的公式数（0 表示无 batch） */
 let lastMathFlushCount: number = 0;
 
-/** 截图结果暂存：齐活前不写 token，避免逐条触发 Vue 重绘抖动 */
+/** 截图结果暂存：凑满一批再写 token，避免逐条重绘抖动 */
 class PendingMathResult {
   token: MarkdownToken;
   res: UTSJSONObject;
@@ -80,18 +80,20 @@ class PendingMathResult {
 
 /**
  * App 专用：并行派发 katexRender（proxy 内 4 槽）。
- * 回调只暂存结果，全部完成后再一次性写回 token 并通知 UI（防 Android 逐条抖动）。
+ * 按 chunk 分批上屏：先出一部分，缩短「全白等齐」时间；末批不足 chunk 也刷。
  * H5 不走此路径（见 parseAppMarkdownFallback / renderMathToken）。
  */
 class MathBatchUiRunner {
   jobs: PendingMathJob[];
-  onAllDone: MathRenderedCallback;
+  onChunkReady: MathRenderedCallback;
   pending: number = 0;
   buffered: PendingMathResult[] = [] as PendingMathResult[];
+  /** 每完成一批（默认 8 条）就上屏，兼顾首屏速度与刷新次数 */
+  chunkSize: number = 8;
 
-  constructor(jobs: PendingMathJob[], onAllDone: MathRenderedCallback) {
+  constructor(jobs: PendingMathJob[], onChunkReady: MathRenderedCallback) {
     this.jobs = jobs;
-    this.onAllDone = onAllDone;
+    this.onChunkReady = onChunkReady;
   }
 
   start(): void {
@@ -100,6 +102,19 @@ class MathBatchUiRunner {
     for (let i = 0; i < this.jobs.length; i++) {
       this.dispatchOne(i);
     }
+  }
+
+  /** 把当前缓冲写回 token 并通知 UI 刷一帧 */
+  flushBuffered(): void {
+    const all = this.buffered;
+    if (all.length == 0) {
+      return;
+    }
+    this.buffered = [] as PendingMathResult[];
+    for (let bi = 0; bi < all.length; bi++) {
+      applyMathResultToToken(all[bi].token, all[bi].res);
+    }
+    this.onChunkReady();
   }
 
   dispatchOne(index: number): void {
@@ -111,29 +126,25 @@ class MathBatchUiRunner {
     const runner = this;
     const token = job.token;
     proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
-      // 先缓冲，勿 apply —— 否则每条 href 赋值都会触发列表重排/滚底抖动
       runner.buffered.push(new PendingMathResult(token, res));
       runner.pending = runner.pending - 1;
-      if (runner.pending == 0) {
-        const all = runner.buffered;
-        for (let bi = 0; bi < all.length; bi++) {
-          applyMathResultToToken(all[bi].token, all[bi].res);
-        }
-        console.log(
-          "[MathRender] batch ui ready count=" + runner.jobs.length,
-        );
-        runner.onAllDone();
+      // 凑满 chunk，或已全部完成 → 分批上屏
+      if (
+        runner.buffered.length >= runner.chunkSize ||
+        runner.pending == 0
+      ) {
+        runner.flushBuffered();
       }
     });
   }
 }
 
 /**
- * App：将收集到的公式并行交给 proxy，全部完成回调 onAllDone。
+ * App：将收集到的公式并行交给 proxy，按 chunk 分批回调 onChunkReady。
  * 无任务时不回调。
  * @returns 提交的公式条数
  */
-function flushMathJobs(onAllDone: MathRenderedCallback): number {
+function flushMathJobs(onChunkReady: MathRenderedCallback): number {
   const frame =
     mathJobStack.length > 0 ? mathJobStack[mathJobStack.length - 1] : null;
   if (frame == null) {
@@ -146,8 +157,7 @@ function flushMathJobs(onAllDone: MathRenderedCallback): number {
     return 0;
   }
   lastMathFlushCount = jobs.length;
-  console.log("[MathRender] batch enqueue count=" + jobs.length);
-  new MathBatchUiRunner(jobs, onAllDone).start();
+  new MathBatchUiRunner(jobs, onChunkReady).start();
   return jobs.length;
 }
 
@@ -1154,7 +1164,7 @@ function makeTableRow(
 /**
  * 标准 App 基座缺少 uni-cmark 原生库时的纯 UTS Markdown 解析。
  * 支持标题、段落、粗体、行内代码、分隔线、表格、代码块及块级数学公式。
- * - App：根调用收集公式 → 并行截图 → 全部完成回调一次
+ * - App：根调用收集公式 → 并行截图 → 按 chunk（默认 8）分批回调上屏
  * - H5：不走批量队列，解析中单条 katexRender（resultHtml + v-html，原逻辑）
  */
 export function parseAppMarkdownFallback(
@@ -1362,12 +1372,6 @@ function parseAppMarkdownFallbackInner(
       const latex = mathLines.join("\n").trim();
       // 流式未闭合的 $$：勿当完整公式渲染（否则会吃掉后续正文并反复打无效 katex）
       if (closed && latex.length > 0) {
-        console.log(
-          "[MathRender] fallback block math index=" +
-            itemIndex +
-            " latex=" +
-            latex,
-        );
         const mathToken: MarkdownToken = {
           type: "math",
           text: latex,
@@ -1388,12 +1392,6 @@ function parseAppMarkdownFallbackInner(
     if (isStandaloneMathLine(trimmed)) {
       const inlineBlockMath = extractStandaloneMathLatex(trimmed);
       if (inlineBlockMath.length > 0) {
-        console.log(
-          "[MathRender] fallback same-line math index=" +
-            itemIndex +
-            " latex=" +
-            inlineBlockMath,
-        );
         const mathToken: MarkdownToken = {
           type: "math",
           text: inlineBlockMath,

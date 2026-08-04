@@ -2,7 +2,7 @@ import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
 import ParseMarkdown from "@/uni_modules/uni-ai-x/sdk/parseMarkdown.uts";
 import treeToListSdk from "@/uni_modules/uni-ai-x/sdk/treeToList.uts";
 import { MarkdownToken, type ParseMdRes } from "@/uni_modules/uni-cmark/utssdk/interface.uts";
-import { md2json } from "@/uni_modules/uni-cmark";
+import { initCmark, isCmarkReady, md2json } from "@/uni_modules/uni-cmark";
 import { MsgItem } from "@/types/interfaces/ai-msg";
 import {
   parseAppMarkdownFallback,
@@ -149,6 +149,8 @@ export class AiMsgMarkdownParser {
   private parseGeneration: number = 0;
   private cmarkProbeDone: boolean = false;
   private cmarkProbeOk: boolean = true;
+  /** H5/小程序：WASM 尚未就绪时只等一次 init，避免探测失败永久关掉 cmark */
+  private cmarkInitScheduled: boolean = false;
   private lastFallbackBody: string = "";
   /** 已完成消息的正文快照，用于跳过父级重渲染触发的重复解析。 */
   private lastFinishedBody: string = "";
@@ -427,10 +429,50 @@ export class AiMsgMarkdownParser {
     // #endif
   }
 
+  /**
+   * H5/小程序 WASM 未就绪时：先 fallback 出屏，init 完成后再用 cmark 重解析。
+   * 不可把「未初始化」当成永久失败，否则整页会话都会锁死在 fallback。
+   */
+  private scheduleCmarkInitThenParse(): void {
+    // #ifdef H5 || WEB || MP-WEIXIN
+    if (this.cmarkInitScheduled == true) {
+      return;
+    }
+    this.cmarkInitScheduled = true;
+    initCmark()
+      .then(() => {
+        this.cmarkInitScheduled = false;
+        this.cmarkProbeDone = false;
+        this.cmarkProbeOk = true;
+        this.cmarkParseEnabled = true;
+        // 清快照，避免「已 fallback 出屏」被当成终态而跳过 cmark 重解析
+        this.lastFinishedBody = "";
+        const forceDone =
+          !this.getIsConversationActive() ||
+          !this.getIsLastMsg() ||
+          this.msg.value.state === 3;
+        this.runMarkdownParse(forceDone);
+      })
+      .catch((err) => {
+        this.cmarkInitScheduled = false;
+        this.cmarkProbeDone = true;
+        this.cmarkProbeOk = false;
+        this.cmarkParseEnabled = false;
+        console.warn("uni-cmark init failed, keep fallback:", err);
+      });
+    // #endif
+  }
+
   private ensureCmarkAvailable(): boolean {
     if (this.cmarkProbeDone) {
       return this.cmarkProbeOk;
     }
+    // #ifdef H5 || WEB || MP-WEIXIN
+    if (isCmarkReady() != true) {
+      this.scheduleCmarkInitThenParse();
+      return false;
+    }
+    // #endif
     this.cmarkProbeDone = true;
     try {
       // #ifdef APP-IOS
@@ -439,9 +481,29 @@ export class AiMsgMarkdownParser {
       // #endif
       // #ifndef APP-IOS
       const probeRes = md2json("#") as ParseMdRes;
-      this.cmarkProbeOk = probeRes.errorMsg.length == 0;
+      const errMsg = probeRes.errorMsg;
+      if (
+        errMsg.length > 0 &&
+        (errMsg.indexOf("not initialized") >= 0 ||
+          errMsg.indexOf("initCmark") >= 0)
+      ) {
+        // 竞态：ready 检查与真实调用之间仍可能未就绪
+        this.cmarkProbeDone = false;
+        this.scheduleCmarkInitThenParse();
+        return false;
+      }
+      this.cmarkProbeOk = errMsg.length == 0;
       // #endif
     } catch (e) {
+      const msg = `${e}`;
+      if (
+        msg.indexOf("not initialized") >= 0 ||
+        msg.indexOf("initCmark") >= 0
+      ) {
+        this.cmarkProbeDone = false;
+        this.scheduleCmarkInitThenParse();
+        return false;
+      }
       this.cmarkProbeOk = false;
     }
     if (!this.cmarkProbeOk) {

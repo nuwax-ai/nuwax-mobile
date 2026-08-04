@@ -308,7 +308,6 @@
   import SkillSelectModal from "./skill-select-modal/skill-select-modal.uvue";
   import SkillTagsBar from "./skill-tags-bar/skill-tags-bar.uvue";
   import { SkillInfoForAt } from "@/types/interfaces/skill";
-  import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { UploadFileStatus } from "@/types/enums/common.uts";
   import ChatUploadImage from "./chat-upload-image/chat-upload-image.uvue";
   import ManualComponentItem from "./manual-component-item/manual-component-item.uvue";
@@ -326,7 +325,6 @@
   } from "@/types/enums/agent.uts";
   import { ChatInputMethod } from "@/subpackages/types/enums/chat.uts";
   import {
-    UPLOAD_FILE_ACTION,
     DEFAULT_IMAGE_COUNT,
     DEFAULT_FILE_COUNT,
     CHAT_INPUT_METHOD,
@@ -337,10 +335,10 @@
   } from "@/utils/permissionHelper";
   import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
   import { ExpandPageAreaEnum } from "@/types/enums/agent.uts";
-  import { ACCESS_TOKEN } from "@/constants/home.constants";
   import { SandboxInfo } from "@/types/interfaces/sandbox";
   import { ChatSendMessageData } from "@/types/interfaces/chat";
   import { useI18n, toI18nParams, emptyI18nParams } from "@/utils/i18n";
+  import { uploadSingleFile } from "@/utils/fileUploader.uts";
   import {
     readAgentModeCache,
     writeAgentModeCache,
@@ -352,14 +350,15 @@
     computeWechatKeyboardOffset,
     filterSkillsRemainingInText,
     getSkillInsertPrefix,
-    getStorageTokenString,
     invertBoolean,
     isAtTypedOnInput,
+    guessImageMimeFromPath,
     isImageChooseCancelled,
     isMessageEmptyForIcons,
     isSkillAlreadySelected,
+    isUploadImageLike,
     isWholeDisabledSendBlocked,
-    resolveUploadFailMessage,
+    looksLikeImageFileName,
     shouldApplyAtCursorAfterSkillSelect,
     shouldInsertSkillAtCursor,
     shouldOpenSkillPickerOnAtInput,
@@ -853,11 +852,21 @@
   };
 
   // UTS 跨模块会把 UTSJSONObject[] 导出参数降级为 Any[]，附件数组操作保留在组件内。
+  // App chooseImage 无 type，需结合 name/url 扩展名判断（见 isUploadImageLike）。
   const countImageFiles = (fileList: UTSJSONObject[]): number => {
     let count = 0;
     for (let i = 0; i < fileList.length; i++) {
-      const type = fileList[i]["type"] as string | null;
-      if (type != null && type.indexOf("image/") >= 0) {
+      const item = fileList[i];
+      const type = item["type"] as string | null;
+      const name = item["name"] as string | null;
+      const url = item["url"] as string | null;
+      if (
+        isUploadImageLike(
+          type != null ? type : "",
+          name != null ? name : "",
+          url != null ? url : "",
+        ) == true
+      ) {
         count++;
       }
     }
@@ -867,8 +876,17 @@
   const countNonImageFiles = (fileList: UTSJSONObject[]): number => {
     let count = 0;
     for (let i = 0; i < fileList.length; i++) {
-      const type = fileList[i]["type"] as string | null;
-      if (type == null || type.indexOf("image/") < 0) {
+      const item = fileList[i];
+      const type = item["type"] as string | null;
+      const name = item["name"] as string | null;
+      const url = item["url"] as string | null;
+      if (
+        isUploadImageLike(
+          type != null ? type : "",
+          name != null ? name : "",
+          url != null ? url : "",
+        ) != true
+      ) {
         count++;
       }
     }
@@ -1045,11 +1063,27 @@
         const _files = res.tempFiles.map((file) => {
           const uploadFile = new UTSJSONObject();
           uploadFile["url"] = file.path;
-          if (file.name != null) {
-            uploadFile["name"] = file.name;
+          let resolvedName = "";
+          if (file.name != null && `${file.name}`.length > 0) {
+            resolvedName = `${file.name}`;
+          } else {
+            const pathParts = file.path.split("/");
+            if (pathParts.length > 0) {
+              resolvedName = pathParts[pathParts.length - 1];
+            }
           }
-          if (file.type != null) {
-            uploadFile["type"] = file.type;
+          uploadFile["name"] = resolvedName;
+          // App 常无 type；若扩展名是图片则补 image/*，否则保留空/原值
+          let resolvedType = "";
+          if (file.type != null && `${file.type}`.length > 0) {
+            resolvedType = `${file.type}`;
+          } else if (looksLikeImageFileName(resolvedName) == true || looksLikeImageFileName(file.path) == true) {
+            resolvedType = guessImageMimeFromPath(
+              resolvedName.length > 0 ? resolvedName : file.path,
+            );
+          }
+          if (resolvedType.length > 0) {
+            uploadFile["type"] = resolvedType;
           }
           uploadFile["size"] = file.size;
           uploadFile["status"] = UploadFileStatus.uploading;
@@ -1228,50 +1262,119 @@
     if (type == "camera") {
       sourceTypeItem = "camera";
     }
+    console.log(
+      "[Upload] chooseImage invoke type=" + sourceTypeItem + " maxCount=" + maxCount
+    );
     // 标记 overlay：避免相册/相机 onHide 误暂停轮询 / 长隐藏恢复（与 ASR·TTS 无关）
     // endOnNextShow 兜底 complete 晚于 onShow 的机型
     pageSystemOverlay.begin("chooseImage." + sourceTypeItem, true);
     uni.chooseImage({
       sourceType: [sourceTypeItem],
-      sizeType: ["original", "compressed"],
+      sizeType: ["compressed"],
       count: maxCount,
       success: (res) => {
-        // 当前选择图片数量
-        const uploadCount = res.tempFiles.length;
-        // 如果当前选择图片数量大于可选择图片数量，则返回
-        if (uploadCount > maxCount) {
-          uni.showToast({
-            title: tCount("Mobile.Chat.imageMaxSelect", maxCount),
-            icon: "none",
-            duration: 2000,
-          });
-          return;
-        }
-
-        const _files = res.tempFiles.map((file) => {
-          const uploadFile = new UTSJSONObject();
-          uploadFile["url"] = file.path;
-          if (file.name != null) {
-            uploadFile["name"] = file.name;
+        console.log("[Upload] chooseImage success enter");
+        try {
+          // App 官方示例优先 tempFilePaths；tempFiles 可能缺字段，做兼容
+          const pathList = [] as string[];
+          const pathsFromApi = res.tempFilePaths;
+          if (pathsFromApi != null) {
+            for (let pi = 0; pi < pathsFromApi.length; pi++) {
+              const p = pathsFromApi[pi];
+              if (p != null && `${p}`.length > 0) {
+                pathList.push(`${p}`);
+              }
+            }
           }
-          if (file.type != null) {
-            uploadFile["type"] = file.type;
+          const tempFiles = res.tempFiles;
+          if (pathList.length == 0 && tempFiles != null) {
+            for (let fi = 0; fi < tempFiles.length; fi++) {
+              const f = tempFiles[fi];
+              if (f != null && f.path != null && `${f.path}`.length > 0) {
+                pathList.push(`${f.path}`);
+              }
+            }
           }
-          uploadFile["size"] = file.size;
-          uploadFile["status"] = UploadFileStatus.uploading;
-          uploadFile["uid"] = getFileUid();
-          return uploadFile;
-        });
-        files.value = [...files.value, ..._files];
+          const uploadCount = pathList.length;
+          const tempFilesLen = tempFiles != null ? tempFiles.length : -1;
+          console.log(
+            "[Upload] chooseImage paths=" + uploadCount + " tempFiles=" + tempFilesLen
+          );
+          if (uploadCount == 0) {
+            console.warn("[Upload] chooseImage empty paths");
+            return;
+          }
+          if (uploadCount > maxCount) {
+            uni.showToast({
+              title: tCount("Mobile.Chat.imageMaxSelect", maxCount),
+              icon: "none",
+              duration: 2000,
+            });
+            return;
+          }
 
-        // 一次性上传所有选中的图片
-        const filePaths = res.tempFiles.map((file) => file.path);
-        if (_uploadMultipleFiles != null) {
-          _uploadMultipleFiles!(filePaths);
+          const _files = [] as UTSJSONObject[];
+          for (let i = 0; i < pathList.length; i++) {
+            const filePath = pathList[i];
+            let fileSize = 0;
+            let resolvedName = "";
+            let resolvedType = "";
+            if (tempFiles != null && i < tempFiles.length) {
+              const file = tempFiles[i];
+              if (file != null) {
+                fileSize = file.size;
+                if (file.name != null && `${file.name}`.length > 0) {
+                  resolvedName = `${file.name}`;
+                }
+                if (file.type != null && `${file.type}`.length > 0) {
+                  resolvedType = `${file.type}`;
+                }
+              }
+            }
+            if (resolvedName.length == 0) {
+              const pathParts = filePath.split("/");
+              if (pathParts.length > 0) {
+                resolvedName = pathParts[pathParts.length - 1];
+              }
+              if (resolvedName.length == 0) {
+                resolvedName = "image.jpg";
+              }
+            }
+            if (resolvedType.length == 0 || resolvedType.indexOf("image/") < 0) {
+              resolvedType = guessImageMimeFromPath(filePath);
+              if (resolvedType.indexOf("image/") < 0) {
+                resolvedType = guessImageMimeFromPath(resolvedName);
+              }
+              if (resolvedType.indexOf("image/") < 0) {
+                resolvedType = "image/jpeg";
+              }
+            }
+            const uploadFile = new UTSJSONObject();
+            uploadFile["url"] = filePath;
+            uploadFile["name"] = resolvedName;
+            uploadFile["type"] = resolvedType;
+            uploadFile["size"] = fileSize;
+            uploadFile["status"] = UploadFileStatus.uploading;
+            uploadFile["uid"] = getFileUid();
+            _files.push(uploadFile);
+          }
+          files.value = [...files.value, ..._files];
+          console.log(
+            "[Upload] chooseImage queued count=" + uploadCount + " files=" + files.value.length
+          );
+
+          if (_uploadMultipleFiles != null) {
+            _uploadMultipleFiles!(pathList);
+          } else {
+            console.error("[Upload] _uploadMultipleFiles is null");
+          }
+        } catch (e) {
+          console.error("[Upload] chooseImage success handler error:", e);
         }
       },
       fail: (err) => {
         const errMsg = coalesceString(err.errMsg);
+        console.warn("[Upload] chooseImage fail errMsg=" + errMsg);
         // 如果取消选择图片，则不显示错误提示
         const isCancelled = isImageChooseCancelled(errMsg);
         if (isCancelled == true) {
@@ -1283,229 +1386,238 @@
         });
       },
       complete: () => {
+        console.log("[Upload] chooseImage complete");
         pageSystemOverlay.end();
       },
     });
   };
 
-  // 上传单张图片（返回Promise）
-  const uploadFile = (
+  /** 按 uid 整表替换单项，确保 App 下 status/loading 刷新 */
+  const replaceFileByUid = (uid: string, nextFile: UTSJSONObject): void => {
+    if (uid.length == 0) {
+      return;
+    }
+    const list = files.value;
+    const out = [] as UTSJSONObject[];
+    let found = false;
+    for (let i = 0; i < list.length; i++) {
+      const cur = list[i] as UTSJSONObject;
+      const curUid = cur["uid"] as string | null;
+      if (curUid != null && `${curUid}` == uid) {
+        out.push(nextFile);
+        found = true;
+      } else {
+        out.push(cur);
+      }
+    }
+    if (found == true) {
+      files.value = out;
+    } else {
+      console.warn("[Upload] replaceFileByUid miss uid=" + uid);
+    }
+  };
+
+  const markFileUploadError = (uid: string): void => {
+    if (uid.length == 0) {
+      return;
+    }
+    const list = files.value;
+    const out = [] as UTSJSONObject[];
+    for (let i = 0; i < list.length; i++) {
+      const cur = list[i] as UTSJSONObject;
+      const curUid = cur["uid"] as string | null;
+      if (curUid != null && `${curUid}` == uid) {
+        const errorFile = new UTSJSONObject();
+        if (cur["url"] != null) {
+          errorFile["url"] = cur["url"];
+        }
+        if (cur["name"] != null) {
+          errorFile["name"] = cur["name"];
+        }
+        if (cur["type"] != null) {
+          errorFile["type"] = cur["type"];
+        }
+        if (cur["size"] != null) {
+          errorFile["size"] = cur["size"];
+        }
+        errorFile["uid"] = uid;
+        if (cur["key"] != null) {
+          errorFile["key"] = cur["key"];
+        }
+        errorFile["status"] = UploadFileStatus.error;
+        out.push(errorFile);
+      } else {
+        out.push(cur);
+      }
+    }
+    files.value = out;
+  };
+
+  // 上传单张图片：复用 fileUploader（.uvue 内联 uni.uploadFile 易触发 UTS110111101）
+  const uploadFile = async (
     filePath: string,
     uid: string,
   ): Promise<UTSJSONObject> => {
-    // 令牌
-    const token = getStorageTokenString(ACCESS_TOKEN);
-    const header = new UTSJSONObject();
-    // #ifdef H5 || WEB
-    if (process.env.NODE_ENV === "development") {
-      header["Authorization"] = `Bearer ${token}`;
-    }
-    // #endif
-
-    // #ifdef MP-WEIXIN
-    header["Authorization"] = `Bearer ${token}`;
-    // #endif
-
-    return new Promise((resolve, reject) => {
-      const _pop: string = filePath.split("/").pop() as string;
-      let fileName = "image.jpg";
-      if (_pop.length > 0) {
-        fileName = _pop;
+    console.log("[Upload] start uid=" + uid + " path=" + filePath);
+    const result = await uploadSingleFile(filePath, uid, (percent: number) => {
+      const list = files.value;
+      for (let i = 0; i < list.length; i++) {
+        const cur = list[i] as UTSJSONObject;
+        if (`${cur["uid"]}` == uid) {
+          cur["percent"] = percent;
+          break;
+        }
       }
-      const formDataObj = new UTSJSONObject();
-      formDataObj["type"] = "tmp";
-      const uploadTask: UploadTask = uni.uploadFile({
-        url: UPLOAD_FILE_ACTION,
-        filePath: filePath,
-        name: "file",
-        header: header,
-        formData: formDataObj,
-        success: (res) => {
-          try {
-            const result = JSON.parse<UTSJSONObject>(res.data as string);
-            const code = result != null ? result["code"] as string : "";
-            const data = result != null ? result["data"] as UTSJSONObject | null : null;
-            const message = result != null ? result["message"] as string | null : null;
-            if (code == SUCCESS_CODE) {
-              let fileKey = "";
-              let uploadName = fileName;
-              let mimeType = "image/jpeg";
-              let fileSize = 0;
-              let fileUrl = "";
-              if (data != null) {
-                if (data["key"] != null) {
-                  fileKey = data["key"] as string;
-                }
-                if (data["fileName"] != null) {
-                  uploadName = data["fileName"] as string;
-                }
-                if (data["mimeType"] != null) {
-                  mimeType = data["mimeType"] as string;
-                }
-                if (data["size"] != null) {
-                  fileSize = data["size"] as number;
-                }
-                if (data["url"] != null) {
-                  fileUrl = data["url"] as string;
-                }
-              }
-              const uploadedFile = new UTSJSONObject();
-              uploadedFile["key"] = fileKey;
-              uploadedFile["name"] = uploadName;
-              uploadedFile["type"] = mimeType;
-              uploadedFile["size"] = fileSize;
-              uploadedFile["url"] = fileUrl;
-              uploadedFile["uid"] = uid;
-              uploadedFile["status"] = UploadFileStatus.done;
-              uploadedFile["percent"] = 100;
-              if (result != null) {
-                uploadedFile["response"] = result;
-              }
-              resolve(uploadedFile);
-            } else {
-              let dataMsg: string | null = null;
-              let resultMsg: string | null = null;
-              if (data != null) {
-                if (data["message"] != null) {
-                  dataMsg = data["message"] as string;
-                }
-              }
-              if (message != null) {
-                resultMsg = message;
-              }
-              const failText = resolveUploadFailMessage(
-                dataMsg,
-                resultMsg,
-                t("Mobile.AudioUploader.uploadFailed"),
-              );
-              reject(new Error(failText));
-            }
-          } catch (error) {
-            console.error("解析上传响应失败:", error);
-            reject(error);
-          }
-        },
-        fail: (error) => {
-          // console.error('上传失败:', error);
-          reject(error);
-        },
-      });
-
-      // 上传进度
-      uploadTask.onProgressUpdate((res: OnProgressUpdateResult) => {
-        const list = files.value;
-        const listLen = list.length;
-        let foundIndex = -1;
-        for (let i = 0; i < listLen; i++) {
-          if ((list[i] as UTSJSONObject)["uid"] == uid) {
-            foundIndex = i;
-            break;
-          }
-        }
-        if (foundIndex != -1) {
-          (list[foundIndex] as UTSJSONObject)["percent"] = res.progress;
-        }
-      });
     });
+
+    if (result.success && result.file != null) {
+      const info = result.file;
+      let mimeType = info.type;
+      // 保留本地已推断的 mime，避免服务端空值把图片变成文档卡
+      const list = files.value;
+      for (let i = 0; i < list.length; i++) {
+        const cur = list[i] as UTSJSONObject;
+        if (`${cur["uid"]}` == uid && cur["type"] != null) {
+          const localType = `${cur["type"]}`;
+          if (localType.length > 0) {
+            mimeType = localType;
+          }
+          break;
+        }
+      }
+      if (mimeType.length == 0) {
+        mimeType = "image/jpeg";
+      }
+      let fileUrl = info.url;
+      if (fileUrl.length == 0) {
+        fileUrl = filePath;
+      }
+      const uploadedFile = new UTSJSONObject();
+      if (info.key != null) {
+        uploadedFile["key"] = info.key;
+      } else {
+        uploadedFile["key"] = "";
+      }
+      uploadedFile["name"] = info.name;
+      uploadedFile["type"] = mimeType;
+      uploadedFile["size"] = info.size;
+      uploadedFile["url"] = fileUrl;
+      uploadedFile["uid"] = uid;
+      uploadedFile["status"] = UploadFileStatus.done;
+      uploadedFile["percent"] = 100;
+      if (info.response != null) {
+        uploadedFile["response"] = info.response;
+      }
+      replaceFileByUid(uid, uploadedFile);
+      console.log("[Upload] done uid=" + uid);
+      return uploadedFile;
+    }
+
+    const failText =
+      result.error != null && result.error.length > 0
+        ? result.error
+        : t("Mobile.AudioUploader.uploadFailed");
+    markFileUploadError(uid);
+    console.warn("[Upload] fail uid=" + uid + " msg=" + failText);
+    throw new Error(failText);
   };
 
-  // 多文件上传
+  // 多文件上传（单文件完成态已在 uploadFile 内更新）
   async function uploadMultipleFiles(filePaths: string[]): Promise<void> {
     if (filePaths.length == 0) return;
 
     try {
-      // 并发上传所有图片
-      const uploadPromises = filePaths.map((filePath) => {
-        // 找到对应的文件以获取 uid
+      const trackedUids = [] as string[];
+      for (let pi = 0; pi < filePaths.length; pi++) {
+        const filePath = filePaths[pi];
         let matchedUid = "";
         const fileList = files.value;
-        const fileListLen = fileList.length;
-        for (let i = 0; i < fileListLen; i++) {
+        for (let i = 0; i < fileList.length; i++) {
           const file = fileList[i] as UTSJSONObject;
-          if (file["url"] == filePath) {
-            const fileUid = file["uid"] as string | null;
-            if (fileUid != null) {
-              matchedUid = fileUid;
+          if (`${file["url"]}` == `${filePath}`) {
+            const uidVal = file["uid"] as string | null;
+            if (uidVal != null) {
+              matchedUid = `${uidVal}`;
             }
             break;
           }
         }
-        return uploadFile(filePath, matchedUid);
-      });
+        trackedUids.push(matchedUid);
+      }
+      console.log(
+        "[Upload] batch start count=" + filePaths.length + " uids=" + trackedUids.join(",")
+      );
 
-      // 使用 Promise.allSettled 处理部分成功、部分失败的情况
-      const uploadResults = await Promise.allSettled(uploadPromises);
+      const uploadPromises = [] as Promise<UTSJSONObject>[];
+      for (let i = 0; i < filePaths.length; i++) {
+        uploadPromises.push(uploadFile(filePaths[i], trackedUids[i]));
+      }
+      await Promise.allSettled(uploadPromises);
 
-      // 处理上传结果
-      uploadResults.forEach((result, index) => {
-        const filePath = filePaths[index];
-        let matchedUid = "";
-        const fileList = files.value;
-        const fileListLen = fileList.length;
-        for (let i = 0; i < fileListLen; i++) {
-          const file = fileList[i] as UTSJSONObject;
-          if (file["url"] == filePath) {
-            const fileUid = file["uid"] as string | null;
-            if (fileUid != null) {
-              matchedUid = fileUid;
-            }
-            break;
+      // 兜底：仍 uploading 的标 error，避免 loading 永久卡住
+      const recovered = [] as UTSJSONObject[];
+      let hasUploading = false;
+      for (let i = 0; i < files.value.length; i++) {
+        const prev = files.value[i] as UTSJSONObject;
+        if (`${prev["status"]}` == `${UploadFileStatus.uploading}`) {
+          hasUploading = true;
+          const errorFile = new UTSJSONObject();
+          if (prev["url"] != null) {
+            errorFile["url"] = prev["url"];
           }
-        }
-        // 上传成功
-        if (result.status == "fulfilled") {
-          // UTS 无法对 allSettled 判别联合窄化，用 JSON 往返读取 value。
-          const rObj = JSON.parse<UTSJSONObject>(JSON.stringify(result));
-          const uploadedFileRaw = rObj != null ? rObj["value"] : null;
-          if (uploadedFileRaw != null) {
-            const uploadedFile = uploadedFileRaw as UTSJSONObject;
-            const uploadedUid = uploadedFile["uid"] as string | null;
-            for (let j = 0; j < fileListLen; j++) {
-              if ((files.value[j] as UTSJSONObject)["uid"] == uploadedUid) {
-                const completedFile = new UTSJSONObject();
-                const fileKey = uploadedFile["key"] as string | null;
-                if (fileKey != null) {
-                  completedFile["key"] = fileKey;
-                }
-                completedFile["name"] = uploadedFile["name"] as string;
-                completedFile["type"] = uploadedFile["type"] as string;
-                completedFile["size"] = uploadedFile["size"] as number;
-                completedFile["url"] = uploadedFile["url"] as string;
-                if (uploadedUid != null) {
-                  completedFile["uid"] = uploadedUid;
-                }
-                completedFile["status"] = uploadedFile["status"] as UploadFileStatus;
-                const uploadPercent = uploadedFile["percent"] as number | null;
-                if (uploadPercent != null) {
-                  completedFile["percent"] = uploadPercent;
-                }
-                const uploadResponse = uploadedFile["response"];
-                if (uploadResponse != null) {
-                  completedFile["response"] = uploadResponse;
-                }
-                files.value[j] = completedFile;
-                break;
-              }
-            }
+          if (prev["name"] != null) {
+            errorFile["name"] = prev["name"];
           }
+          if (prev["type"] != null) {
+            errorFile["type"] = prev["type"];
+          }
+          if (prev["size"] != null) {
+            errorFile["size"] = prev["size"];
+          }
+          if (prev["uid"] != null) {
+            errorFile["uid"] = prev["uid"];
+          }
+          errorFile["status"] = UploadFileStatus.error;
+          recovered.push(errorFile);
         } else {
-          // 上传失败，更新对应文件状态为 error
-          if (matchedUid.length > 0) {
-            for (let k = 0; k < fileListLen; k++) {
-              const file = files.value[k] as UTSJSONObject;
-              if (file["uid"] == matchedUid) {
-                file["status"] = UploadFileStatus.error;
-                break;
-              }
-            }
-          }
+          recovered.push(prev);
         }
-      });
+      }
+      if (hasUploading == true) {
+        console.warn("[Upload] batch fallback clear uploading leftovers");
+        files.value = recovered;
+      }
 
-      // 隐藏额外功能栏
       showExtraContainer.value = false;
     } catch (error) {
       console.error("批量上传处理失败:", error);
+      const recovered = [] as UTSJSONObject[];
+      for (let i = 0; i < files.value.length; i++) {
+        const prev = files.value[i] as UTSJSONObject;
+        if (`${prev["status"]}` == `${UploadFileStatus.uploading}`) {
+          const errorFile = new UTSJSONObject();
+          if (prev["url"] != null) {
+            errorFile["url"] = prev["url"];
+          }
+          if (prev["name"] != null) {
+            errorFile["name"] = prev["name"];
+          }
+          if (prev["type"] != null) {
+            errorFile["type"] = prev["type"];
+          }
+          if (prev["size"] != null) {
+            errorFile["size"] = prev["size"];
+          }
+          if (prev["uid"] != null) {
+            errorFile["uid"] = prev["uid"];
+          }
+          errorFile["status"] = UploadFileStatus.error;
+          recovered.push(errorFile);
+        } else {
+          recovered.push(prev);
+        }
+      }
+      files.value = recovered;
     }
   }
   _uploadMultipleFiles = uploadMultipleFiles;

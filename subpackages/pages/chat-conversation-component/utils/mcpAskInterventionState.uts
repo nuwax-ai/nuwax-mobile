@@ -4,40 +4,64 @@ import type {
   InterventionStatus,
   McpAskInteraction,
 } from "@/types/intervention";
-import { hasMcpAskResumeMessage } from "@/subpackages/utils/mcpAskResumeMessage.uts";
+import { hasMcpAskResumeMessage } from "@/subpackages/utils/mcpAskResumeLite.uts";
+import { normalizeAcpPermissionInteraction } from "@/subpackages/utils/interventionAdapter";
 import { orArray, orNumber, orString } from "@/utils/utsCoalesce.uts";
+import { readRawField } from "@/utils/readRawField.uts";
+import {
+  createMessageInfoFromRaw,
+  messageToJsonObject,
+} from "@/subpackages/utils/messageInfoClass.uts";
 
-function cloneMessageInfo(message: MessageInfo): UTSJSONObject {
-  return JSON.parse(JSON.stringify(message)) as UTSJSONObject;
+/**
+ * 读 ACP 字段前先 normalize：messageList 里可能仍是 class 实例，
+ * 直接 readRawField 会得到空 id/tc，导致审批状态更新 matched=0、Dock 关不掉。
+ */
+function asReadableAcp(interaction: any): UTSJSONObject {
+  return normalizeAcpPermissionInteraction(interaction);
 }
 
+/**
+ * Android 上 interaction 存进 MessageInfo.any 字段后是 UTSJSONObject（非 class 实例），
+ * 一律用 readRawField 读标量；H5 上也兼容（普通对象 bracket 可读）。
+ * 禁止 orArray<T> 泛型强转后直读属性（Android 会静默丢字段 → 队列恒空）。
+ */
+function readInteractionStatus(interaction: any | null): string {
+  return orString(readRawField(interaction, "responseStatus"), "pending");
+}
+
+function readAcpToolCall(interaction: any | null): any | null {
+  const request = readRawField(interaction, "request");
+  return readRawField(request, "toolCall");
+}
+
+// Android 上 UTSJSONObject as MessageInfo（class）会 ClassCastException。
+// 禁止 JSON.parse 后强转 class；走 messageToJsonObject（手写字段，避免 stringify(class) 丢字段）
+// → 改字段 → createMessageInfoFromRaw 重建 MessageInfoClass，与 messageInfoClass.cloneMessageInfo 同源。
 function patchMessageInfo(
   message: MessageInfo,
   field: string,
   value: any,
 ): MessageInfo {
-  const copy = cloneMessageInfo(message);
+  const copy = messageToJsonObject(message);
   copy[field] = value;
-  return copy as MessageInfo;
+  return createMessageInfoFromRaw(copy);
 }
 
+// Android 上 interaction 运行时是 UTSJSONObject（非 class 实例），JSON.parse 返回 UTSJSONObject，
+// 禁止 as AcpPermissionInteraction（class）→ CCE。统一 as UTSJSONObject（bracket 可读可写）。
 function cloneAcpPermissionInteraction(
-  interaction: AcpPermissionInteraction,
-): AcpPermissionInteraction {
+  interaction: any,
+): UTSJSONObject {
   return JSON.parse(
     JSON.stringify(interaction),
-  ) as AcpPermissionInteraction;
+  ) as UTSJSONObject;
 }
 
 function cloneMcpAskInteraction(
-  interaction: McpAskInteraction,
-): McpAskInteraction {
-  return JSON.parse(JSON.stringify(interaction)) as McpAskInteraction;
-}
-
-export interface AcpPermissionStatusExtras {
-  selectedOptionId?: string;
-  errorMessage?: string;
+  interaction: any,
+): UTSJSONObject {
+  return JSON.parse(JSON.stringify(interaction)) as UTSJSONObject;
 }
 
 export type InterventionQueueKind = "acp_permission" | "mcp_ask";
@@ -67,13 +91,13 @@ export type InterventionQueueItem =
 /** 对齐 PC useActiveInterventionQueue：pending/submitting 进队，failed 不进队 */
 const isActiveResponseStatus = (status?: string): boolean => {
   const value = orString(status, "pending");
-  return value === "pending" || value === "submitting";
+  return value == "pending" || value == "submitting";
 };
 
-const readMcpAskRequestIdFromRawInput = (rawInput: any): string | undefined => {
-  if (rawInput == null || typeof rawInput !== "object") return undefined;
-  const id = (rawInput as any).requestId;
-  return typeof id === "string" && id.length > 0 ? id : undefined;
+const readMcpAskRequestIdFromRawInput = (rawInput: any | null): string | null => {
+  if (rawInput == null || typeof rawInput != "object") return null;
+  const id = readRawField(rawInput, "requestId");
+  return typeof id == "string" && id.length > 0 ? id : null;
 };
 
 /**
@@ -86,107 +110,264 @@ const readMcpAskRequestIdFromRawInput = (rawInput: any): string | undefined => {
  */
 export const getActiveInterventionQueue = (
   messageList: MessageInfo[],
-): InterventionQueueItem[] => {
-  const pendingMap = new Map<string, InterventionQueueItem>();
+): UTSJSONObject[] => {
+  // queue item 必须是 UTSJSONObject（bracket 可读）：联合 interface InterventionQueueItem 在
+  // Android 上编译为既非 Map 也非 UTSJSONObject 的结构，readRawField 读不到字段，
+  // 会导致下游 getFrontInterventionSnapshot/frontInterventionKey 恒空、dockPanel 不渲染。
+  const pendingMap = new Map<string, UTSJSONObject>();
   const permissionPendingToolCallIds = new Set<string>();
   const permissionPendingAskRequestIds = new Set<string>();
   let fallbackSeq = 0;
 
   const messages = [...orArray<MessageInfo>(messageList)].sort(
-    (a, b) => (a.index ?? 0) - (b.index ?? 0),
+    (a, b) => (a.index != null ? a.index : 0) - (b.index != null ? b.index : 0),
   );
 
   messages.forEach((message: MessageInfo) => {
-    const interactions = orArray<AcpPermissionInteraction>(
-      message.acpPermissionInteractions,
-    );
-    interactions.forEach((interaction: AcpPermissionInteraction) => {
-      if (!isActiveResponseStatus(interaction.responseStatus)) return;
-      const toolCallId = interaction.request?.toolCall?.toolCallId;
-      if (toolCallId) permissionPendingToolCallIds.add(toolCallId);
+    const interactions = orArray<any>(message.acpPermissionInteractions);
+    interactions.forEach((interaction: any) => {
+      const readable = asReadableAcp(interaction);
+      if (!isActiveResponseStatus(readInteractionStatus(readable))) return;
+      const toolCall = readAcpToolCall(readable);
+      const toolCallId = readRawField(toolCall, "toolCallId");
+      if (toolCallId != null && `${toolCallId}`.length > 0) {
+        permissionPendingToolCallIds.add(`${toolCallId}`);
+      }
       const askRequestId = readMcpAskRequestIdFromRawInput(
-        interaction.request?.toolCall?.rawInput,
+        readRawField(toolCall, "rawInput"),
       );
-      if (askRequestId) permissionPendingAskRequestIds.add(askRequestId);
+      if (askRequestId != null && askRequestId.length > 0) {
+        permissionPendingAskRequestIds.add(askRequestId);
+      }
     });
   });
 
   messages.forEach((message: MessageInfo) => {
-    const messageId = String(message.id ?? message.index);
-    const messageIndex = message.index ?? 0;
+    const messageId = `${message.id != null ? message.id : message.index}`;
+    const messageIndex = (message.index != null ? message.index : 0);
 
-    const acpInteractions = orArray<AcpPermissionInteraction>(
-      message.acpPermissionInteractions,
-    );
-    acpInteractions.forEach((interaction: AcpPermissionInteraction) => {
-      if (!isActiveResponseStatus(interaction.responseStatus)) return;
-      const sortKey = interaction.triggeredAt ?? fallbackSeq++;
-      pendingMap.set(`acp-${interaction.id}`, {
-        kind: "acp_permission",
-        key: `acp:${interaction.id}`,
-        messageId,
-        messageIndex,
-        interaction,
-        sortKey,
-      });
+    const acpInteractions = orArray<any>(message.acpPermissionInteractions);
+    acpInteractions.forEach((interaction: any) => {
+      // 队列里放 readable UTSJSONObject，渲染/审批都能 readRawField
+      const readable = asReadableAcp(interaction);
+      if (!isActiveResponseStatus(readInteractionStatus(readable))) return;
+      const interactionId = orString(readRawField(readable, "id"), "");
+      // 有 toolCallId 时用 tc 作为 map key：live/sub 若生成不同 interaction.id，
+      // 仍只进队一条，避免「批完又弹一张」并卡住 MCP Ask 双路抑制。
+      const toolCall = readAcpToolCall(readable);
+      const tcId = orString(readRawField(toolCall, "toolCallId"), "");
+      const mapKey =
+        tcId.length > 0 ? `acp-tc-${tcId}` : `acp-${interactionId}`;
+      const displayKey =
+        tcId.length > 0 ? `acp:tc:${tcId}` : `acp:${interactionId}`;
+      const triggeredAt = readRawField(readable, "triggeredAt");
+      const sortKey =
+        triggeredAt != null ? orNumber(triggeredAt, fallbackSeq++) : fallbackSeq++;
+      // 已存在同 tc 条目时保留较早 sortKey 的那条（先写入的），不覆盖
+      if (pendingMap.has(mapKey)) {
+        return;
+      }
+      const acpItem = new UTSJSONObject();
+      acpItem["kind"] = "acp_permission";
+      acpItem["key"] = displayKey;
+      acpItem["messageId"] = messageId;
+      acpItem["messageIndex"] = messageIndex;
+      // 禁止 as AcpPermissionInteraction：UTSJSONObject 强转 class 会 CCE
+      acpItem["interaction"] = readable;
+      acpItem["sortKey"] = sortKey;
+      pendingMap.set(mapKey, acpItem);
     });
 
-    const mcpInteractions = orArray<McpAskInteraction>(
-      message.mcpAskInteractions,
-    );
-    mcpInteractions.forEach((interaction: McpAskInteraction) => {
-      if (!isActiveResponseStatus(interaction.responseStatus)) return;
+    const mcpInteractions = orArray<any>(message.mcpAskInteractions);
+    mcpInteractions.forEach((interaction: any) => {
+      if (!isActiveResponseStatus(readInteractionStatus(interaction))) return;
       if (hasMcpAskResumeMessage(messages, interaction)) return;
+      const toolCallIdRaw = readRawField(interaction, "toolCallId");
+      const toolCallId = toolCallIdRaw != null ? `${toolCallIdRaw}` : "";
+      const requestId = orString(readRawField(interaction, "requestId"), "");
       if (
-        (interaction.toolCallId != null &&
-          interaction.toolCallId.length > 0 &&
-          permissionPendingToolCallIds.has(interaction.toolCallId)) ||
-        (interaction.requestId.length > 0 &&
-          permissionPendingAskRequestIds.has(interaction.requestId))
+        (toolCallId.length > 0 && permissionPendingToolCallIds.has(toolCallId)) ||
+        (requestId.length > 0 && permissionPendingAskRequestIds.has(requestId))
       ) {
         return;
       }
-      const sortKey = interaction.triggeredAt ?? fallbackSeq++;
-      const revision = orNumber(interaction.revision, 1);
-      pendingMap.set(`ask-${interaction.requestId}`, {
-        kind: "mcp_ask",
-        key: `ask:${interaction.requestId}:${revision}`,
-        messageId,
-        messageIndex,
-        message,
-        interaction,
-        sortKey,
-      });
+      const triggeredAt = readRawField(interaction, "triggeredAt");
+      const sortKey =
+        triggeredAt != null ? orNumber(triggeredAt, fallbackSeq++) : fallbackSeq++;
+      const revision = orNumber(readRawField(interaction, "revision"), 1);
+      const askItem = new UTSJSONObject();
+      askItem["kind"] = "mcp_ask";
+      askItem["key"] = `ask:${requestId}:${revision}`;
+      askItem["messageId"] = messageId;
+      askItem["messageIndex"] = messageIndex;
+      askItem["message"] = message;
+      askItem["interaction"] = interaction;
+      askItem["sortKey"] = sortKey;
+      pendingMap.set(`ask-${requestId}`, askItem);
     });
   });
 
-  return [...pendingMap.values()].sort((a, b) => a.sortKey - b.sortKey);
+  const queue: UTSJSONObject[] = [];
+  pendingMap.forEach((value: UTSJSONObject) => {
+    queue.push(value);
+  });
+  const sorted = queue.sort((a, b) =>
+    orNumber(readRawField(a, "sortKey"), 0) -
+    orNumber(readRawField(b, "sortKey"), 0),
+  );
+  // 诊断：Android 上 interaction 若为 UTSJSONObject 被误读会导致队列恒空。
+  let acpRawCount = 0;
+  let mcpRawCount = 0;
+  messages.forEach((m: MessageInfo) => {
+    acpRawCount += orArray<any>(m.acpPermissionInteractions).length;
+    mcpRawCount += orArray<any>(m.mcpAskInteractions).length;
+  });
+  console.log(
+    `[InterventionQueue] size=${sorted.length} acpRaw=${acpRawCount} mcpRaw=${mcpRawCount} msgs=${messages.length}`,
+  );
+  return sorted;
+};
+
+/**
+ * 取队首 interaction（Android 渲染专用）。
+ * queue item 在 Android 编译为 LinkedHashMap，渲染侧 as UTSJSONObject 抛 CCE、readRawField 对
+ * interface 入参读不到，导致 frontAcpInteraction 恒 null、卡片不渲染。
+ * 这里不经过 queue item，直接按队列同一套规则重扫 messageList，取出最早 active interaction，
+ * 封装为 UTSJSONObject（bracket 可读）返回。返回 null 表示无待审批项。
+ */
+export const getFrontInterventionSnapshot = (
+  messageList: MessageInfo[],
+): UTSJSONObject | null => {
+  const queue = getActiveInterventionQueue(messageList);
+  if (queue.length == 0) return null;
+  // 队列已按 sortKey 排好，front=queue[0]。取其 key（acp:<id> / ask:<reqId>:<rev>），
+  // 再从 messageList 里找到对应 interaction（此处 readRawField 对 UTSJSONObject 可读）。
+  const frontKey = orString(readRawField(queue[0], "key"), "");
+
+  const messages = [...orArray<MessageInfo>(messageList)].sort(
+    (a, b) => (a.index != null ? a.index : 0) - (b.index != null ? b.index : 0),
+  );
+  // ACP：key 形如 acp:tc:<toolCallId> 或 acp:<interactionId>
+  for (let i = 0; i < messages.length; i++) {
+    const acps = orArray<any>(messages[i].acpPermissionInteractions);
+    for (let j = 0; j < acps.length; j++) {
+      const readable = asReadableAcp(acps[j]);
+      if (!isActiveResponseStatus(readInteractionStatus(readable))) continue;
+      const id = orString(readRawField(readable, "id"), "");
+      const toolCall = readAcpToolCall(readable);
+      const tcId = orString(readRawField(toolCall, "toolCallId"), "");
+      const matchByTc =
+        tcId.length > 0 && frontKey == `acp:tc:${tcId}`;
+      const matchById = frontKey == `acp:${id}`;
+      if (matchByTc || matchById) {
+        const out = new UTSJSONObject();
+        out["kind"] = "acp_permission";
+        // 返回 readable，避免卡片/审批再踩 class 实例读空字段
+        out["interaction"] = readable;
+        out["key"] = frontKey;
+        return out;
+      }
+    }
+  }
+  // MCP Ask：key 形如 ask:<requestId>:<revision>
+  for (let i = 0; i < messages.length; i++) {
+    const asks = orArray<any>(messages[i].mcpAskInteractions);
+    for (let j = 0; j < asks.length; j++) {
+      if (!isActiveResponseStatus(readInteractionStatus(asks[j]))) continue;
+      const rid = orString(readRawField(asks[j], "requestId"), "");
+      const rev = orNumber(readRawField(asks[j], "revision"), 1);
+      if (`ask:${rid}:${rev}` == frontKey) {
+        const out = new UTSJSONObject();
+        out["kind"] = "mcp_ask";
+        out["interaction"] = asks[j];
+        out["key"] = frontKey;
+        out["message"] = messages[i];
+        return out;
+      }
+    }
+  }
+  return null;
 };
 
 export const updateAcpPermissionInteractionStatusInMessageList = (
   messageList: MessageInfo[],
   interactionId: string,
   responseStatus: InterventionStatus,
-  extras?: AcpPermissionStatusExtras,
+  extras: UTSJSONObject | null,
 ): MessageInfo[] => {
   const list = [...messageList];
+
+  // Android 上 frontAcpInteraction 是 UTSJSONObject，调用方若用点访问读 .id 会得到空串，
+  // 导致按 id 更新永远 miss、Dock 关不掉。extras.toolCallId / executeId 作为兜底匹配键。
+  let linkToolCallId = orString(readRawField(extras, "toolCallId"), "");
+  let linkExecuteId = orString(readRawField(extras, "executeId"), "");
+
+  // 若带了有效 id，再从已挂载条目补全 tc / executeId，用于联动清兄弟副本
+  if (interactionId.length > 0) {
+    for (let si = 0; si < list.length; si++) {
+      const interactions = orArray<any>(list[si].acpPermissionInteractions);
+      for (let sj = 0; sj < interactions.length; sj++) {
+        const readable = asReadableAcp(interactions[sj]);
+        if (orString(readRawField(readable, "id"), "") != interactionId) {
+          continue;
+        }
+        const toolCall = readAcpToolCall(readable);
+        if (linkToolCallId.length == 0) {
+          linkToolCallId = orString(readRawField(toolCall, "toolCallId"), "");
+        }
+        if (linkExecuteId.length == 0) {
+          linkExecuteId = orString(readRawField(readable, "executeId"), "");
+        }
+        break;
+      }
+      if (linkToolCallId.length > 0 || linkExecuteId.length > 0) break;
+    }
+  }
+
+  let totalMatched = 0;
   for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
     const msg = list[msgIndex];
-    const interactions = msg.acpPermissionInteractions;
-    if (interactions == null) continue;
+    // interaction 运行时可能是 class 或 UTSJSONObject：先 normalize 再读字段，
+    // 写回一律 UTSJSONObject（bracket 可写）。
+    const interactions = orArray<any>(
+      msg.acpPermissionInteractions,
+    );
+    if (interactions.length == 0) continue;
 
     let matched = false;
     const nextInteractions = interactions.map(
-      (item: AcpPermissionInteraction) => {
-        if (item.id !== interactionId) return item;
-        matched = true;
-        const next = cloneAcpPermissionInteraction(item);
-        next.responseStatus = responseStatus;
-        if (extras?.selectedOptionId !== undefined) {
-          next.selectedOptionId = extras.selectedOptionId;
+      (item: any): any => {
+        const readable = asReadableAcp(item);
+        const itemId = orString(readRawField(readable, "id"), "");
+        const toolCall = readAcpToolCall(readable);
+        const itemTc = orString(readRawField(toolCall, "toolCallId"), "");
+        const itemExec = orString(readRawField(readable, "executeId"), "");
+        const sameId =
+          interactionId.length > 0 && itemId == interactionId;
+        const sameTc =
+          linkToolCallId.length > 0 &&
+          itemTc.length > 0 &&
+          itemTc == linkToolCallId;
+        const sameExec =
+          linkExecuteId.length > 0 &&
+          itemExec.length > 0 &&
+          itemExec == linkExecuteId;
+        // 主 id 命中，或同 toolCallId / executeId 的兄弟副本一并更新
+        if (!sameId && !sameTc && !sameExec) {
+          // 顺带把历史 class 实例改写成 UTSJSONObject，避免后续再读空
+          return readable;
         }
-        if (extras?.errorMessage !== undefined) {
-          next.errorMessage = extras.errorMessage;
+        matched = true;
+        totalMatched++;
+        const next = cloneAcpPermissionInteraction(readable);
+        next["responseStatus"] = responseStatus;
+        const selectedOptionId = readRawField(extras, "selectedOptionId");
+        if (selectedOptionId != null && typeof selectedOptionId == "string") {
+          next["selectedOptionId"] = selectedOptionId;
+        }
+        const errorMessage = readRawField(extras, "errorMessage");
+        if (errorMessage != null && typeof errorMessage == "string") {
+          next["errorMessage"] = errorMessage;
         }
         return next;
       },
@@ -199,32 +380,38 @@ export const updateAcpPermissionInteractionStatusInMessageList = (
       "acpPermissionInteractions",
       nextInteractions,
     );
-    break;
+    // live SSE 与 sub 重放可能把同一 intervention 挂到不同消息。
+    // 必须同步更新全部副本；否则后一个 pending 副本仍会留在 FIFO 队列中，
+    // 表现为接口已成功但权限审批卡片没有关闭，且 MCP Ask 被双路抑制。
   }
+  console.log(
+    `[ITV] acp.status→${responseStatus} id=${interactionId} tc=${linkToolCallId} matched=${totalMatched}`,
+  );
   return list;
 };
 
 export const updateMcpAskInteractionStatusInMessageList = (
   messageList: MessageInfo[],
-  interaction: McpAskInteraction,
+  interaction: any,
   responseStatus: InterventionStatus,
 ): MessageInfo[] => {
-  const revision = orNumber(interaction.revision, 1);
+  const targetRequestId = orString(readRawField(interaction, "requestId"), "");
+  const revision = orNumber(readRawField(interaction, "revision"), 1);
   const list = [...messageList];
   for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
     const msg = list[msgIndex];
-    const interactions = msg.mcpAskInteractions;
-    if (!interactions) continue;
+    const interactions = orArray<any>(msg.mcpAskInteractions);
+    if (interactions.length == 0) continue;
 
     let matched = false;
-    const nextInteractions = interactions.map((item: McpAskInteraction) => {
+    const nextInteractions = interactions.map((item: any): any => {
       if (
-        item.requestId === interaction.requestId &&
-        orNumber(item.revision, 1) === revision
+        orString(readRawField(item, "requestId"), "") == targetRequestId &&
+        orNumber(readRawField(item, "revision"), 1) == revision
       ) {
         matched = true;
         const next = cloneMcpAskInteraction(item);
-        next.responseStatus = responseStatus;
+        next["responseStatus"] = responseStatus;
         return next;
       }
       return item;
@@ -247,6 +434,6 @@ export const getVisibleMcpAskInteractions = (
   item: MessageInfo,
 ): McpAskInteraction[] => {
   return getActiveInterventionQueue([item])
-    .filter((q) => q.kind === "mcp_ask")
-    .map((q) => (q as McpAskInterventionQueueItem).interaction);
+    .filter((q) => readRawField(q, "kind") == "mcp_ask")
+    .map((q) => readRawField(q, "interaction") as McpAskInteraction);
 };

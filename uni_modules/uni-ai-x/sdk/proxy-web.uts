@@ -1,11 +1,36 @@
 import utils from '@/uni_modules/uni-ai-x/sdk/utils.uts'
 type OnMsgFn = (e : UTSJSONObject) => void
+
+/** 代理未就绪时暂存的调用 */
+class ProxyPendingCall {
+	param : UTSJSONObject
+	callback : OnMsgFn
+	constructor(param : UTSJSONObject, callback : OnMsgFn) {
+		this.param = param
+		this.callback = callback
+	}
+}
+
+/** 等待代理就绪的监听（UTS 避免直接存函数数组） */
+class ProxyReadyListener {
+	fn : () => void
+	constructor(fn : () => void) {
+		this.fn = fn
+	}
+}
+
 class ProxyWeb {
 	isInit : boolean = false
 	private webviewContext : WebviewContext | null = null
 	/** App 端 createWebviewContext 使用的节点 id */
 	private webviewId : string = "markdown-proxy-web"
 	callbackMap : Map<string, OnMsgFn> = new Map()
+	/** isInit 前入队，DOMContentLoaded 后一次性冲刷（避免上百次 100ms 重试刷屏） */
+	private pendingCalls : ProxyPendingCall[] = []
+	/** 等待代理就绪的监听（历史含公式消息可 defer 到就绪后再解析） */
+	private readyListeners : ProxyReadyListener[] = []
+	private safetyFlushTimer : number = 0
+
 	constructor() {
 		// #ifdef WEB
 		window.addEventListener('message', (event) => {
@@ -39,39 +64,82 @@ class ProxyWeb {
 		// #endif
 	}
 
-	callMethod(param : UTSJSONObject, callback : OnMsgFn, retryCount : number = 0) {
-		// #ifdef APP
-		if (this.webviewContext == null) {
-			this.ensureAppContext(this.webviewId)
+	/** 代理是否可立刻 evalJS */
+	isReady(): boolean {
+		return this.isInit == true && this.webviewContext != null
+	}
+
+	/**
+	 * 代理就绪后执行；已就绪则同步调用。
+	 * 用于历史会话：含公式时等 webview 再 parse，避免先出文本、公式空转重试。
+	 */
+	whenReady(listener : () => void): void {
+		if (this.isReady() == true) {
+			listener()
+			return
 		}
-		// #endif
-		// DOM 未就绪，或 App 尚未拿到 webviewContext：排队重试（勿先登记 callback 再 skip）
-		if (this.isInit == false || this.webviewContext == null) {
-			if (param["action"] == "katexRender") {
-				console.log(
-					"[MathRender] proxy not ready isInit=" +
-						this.isInit +
-						" hasCtx=" +
-						(this.webviewContext != null) +
-						" retry=" +
-						retryCount,
-				)
+		this.readyListeners.push(new ProxyReadyListener(listener))
+		this.ensureAppContext(this.webviewId)
+		this.armSafetyFlush()
+	}
+
+	private armSafetyFlush(): void {
+		if (this.safetyFlushTimer != 0) {
+			return
+		}
+		// 若 DOMContentLoaded 丢失，最多 8s 后放弃排队并回调失败
+		this.safetyFlushTimer = setTimeout((): void => {
+			this.safetyFlushTimer = 0
+			if (this.isReady() == true) {
+				return
 			}
-			if (retryCount >= 40) {
-				console.error("[MathRender] proxy give up after retries")
+			const pending = this.pendingCalls
+			this.pendingCalls = []
+			for (let i = 0; i < pending.length; i++) {
 				const fail = new UTSJSONObject()
 				fail["error"] = "proxy_not_ready"
 				fail["imageDataURL"] = ""
 				fail["resultHtml"] = ""
-				callback(fail)
-				return
+				const cb = pending[i].callback
+				utils.uniGetDispatcher("main", () => {
+					cb(fail)
+				})
 			}
-			setTimeout(() => {
-				this.callMethod(param, callback, retryCount + 1)
-			}, 500)
-			return
-		}
+			const listeners = this.readyListeners
+			this.readyListeners = []
+			for (let j = 0; j < listeners.length; j++) {
+				listeners[j].fn()
+			}
+		}, 8000) as number
+	}
 
+	private clearSafetyFlush(): void {
+		if (this.safetyFlushTimer != 0) {
+			clearTimeout(this.safetyFlushTimer)
+			this.safetyFlushTimer = 0
+		}
+	}
+
+	private notifyReadyListeners(): void {
+		const listeners = this.readyListeners
+		this.readyListeners = []
+		for (let i = 0; i < listeners.length; i++) {
+			listeners[i].fn()
+		}
+	}
+
+	private flushPendingCalls(): void {
+		const pending = this.pendingCalls
+		this.pendingCalls = []
+		if (pending.length > 0) {
+			console.log("[MathRender] proxy flush pending=" + pending.length)
+		}
+		for (let i = 0; i < pending.length; i++) {
+			this.dispatchCall(pending[i].param, pending[i].callback)
+		}
+	}
+
+	private dispatchCall(param : UTSJSONObject, callback : OnMsgFn): void {
 		const requestId = Date.now() + Math.random().toString(36).substring(2, 15)
 		param["requestId"] = requestId
 		const key = (param["action"] as string) + "_callback_" + requestId
@@ -95,6 +163,22 @@ class ProxyWeb {
 		/* #endif */
 	}
 
+	callMethod(param : UTSJSONObject, callback : OnMsgFn, _retryCount : number = 0) {
+		// #ifdef APP
+		if (this.webviewContext == null) {
+			this.ensureAppContext(this.webviewId)
+		}
+		// #endif
+		// 未就绪：入队等待 DOMContentLoaded 一次冲刷（禁止每条公式独立 setTimeout 重试）
+		if (this.isReady() != true) {
+			this.pendingCalls.push(new ProxyPendingCall(param, callback))
+			this.armSafetyFlush()
+			return
+		}
+
+		this.dispatchCall(param, callback)
+	}
+
 	init(webviewContext : WebviewContext | null, webviewId : string = "") {
 		if (webviewId.length > 0) {
 			this.webviewId = webviewId
@@ -108,13 +192,22 @@ class ProxyWeb {
 			this.ensureAppContext(this.webviewId)
 			// #endif
 		}
+		// 若 webview 已就绪（热更/二次进入），立刻冲刷
+		if (this.isReady() == true) {
+			this.clearSafetyFlush()
+			this.flushPendingCalls()
+			this.notifyReadyListeners()
+		}
 	}
 
 	/** 页面卸载时重置，避免单例残留 isInit=true 但 context 已失效 */
 	reset(): void {
+		this.clearSafetyFlush()
 		this.isInit = false
 		this.webviewContext = null
 		this.callbackMap.clear()
+		this.pendingCalls = []
+		this.readyListeners = []
 		console.log("[MathRender] proxy reset")
 	}
 
@@ -134,10 +227,18 @@ class ProxyWeb {
 		if (res["action"] == "DOMContentLoaded_callback") {
 			this.isInit = true
 			this.ensureAppContext(this.webviewId)
+			this.clearSafetyFlush()
 			console.log(
 				"[MathRender] proxy DOMContentLoaded hasCtx=" +
-					(this.webviewContext != null),
+					(this.webviewContext != null) +
+					" pending=" +
+					this.pendingCalls.length +
+					" listeners=" +
+					this.readyListeners.length,
 			)
+			// 先冲刷已入队的 katex，再通知「等就绪再 parse」的历史消息
+			this.flushPendingCalls()
+			this.notifyReadyListeners()
 			return
 		}
 		const funName = res["action"]! as string

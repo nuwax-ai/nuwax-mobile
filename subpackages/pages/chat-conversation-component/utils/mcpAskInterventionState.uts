@@ -22,6 +22,50 @@ function asReadableAcp(interaction: any): UTSJSONObject {
 }
 
 /**
+ * 读 MCP Ask 字段前先 normalize：挂载进 mcpAskInteractions 的是 new McpAskInteraction()
+ * class 实例（见 createMcpAskInteractionFromToolInput）。Android 上 @/utils/readRawField
+ * 只认 Map / UTSJSONObject，读 class 实例全字段恒空（responseStatus 又因默认 "pending"
+ * 不被状态门拦住，静默漏卡 → ask-question DockPanel 不弹）。
+ * McpAskInteraction 字段均为纯标量/ui 对象，JSON 往返即可成可读 UTSJSONObject。
+ */
+function asReadableMcp(interaction: any): UTSJSONObject {
+  // 已是可读（bracket 能取到 requestId）：直接深拷贝返回
+  const probeRid = orString(readRawField(interaction, "requestId"), "");
+  if (probeRid.length > 0) {
+    try {
+      return JSON.parse(JSON.stringify(interaction)) as UTSJSONObject;
+    } catch (_e) {
+      // fallthrough 手工抄字段
+    }
+  }
+  // class 实例路径：as class 包在 try 里（已是 UTSJSONObject 时会 CCE，不能裸转）
+  const out = new UTSJSONObject();
+  try {
+    const typed = interaction as McpAskInteraction;
+    out["requestId"] = orString(typed.requestId, "");
+    out["responseStatus"] = orString(typed.responseStatus, "pending");
+    out["title"] = orString(typed.title, "");
+    out["sessionId"] = orString(typed.sessionId, "");
+    if (typed.revision != null) out["revision"] = typed.revision;
+    if (typed.toolCallId != null) out["toolCallId"] = typed.toolCallId;
+    if (typed.description != null) out["description"] = typed.description;
+    if (typed.errorMessage != null) out["errorMessage"] = typed.errorMessage;
+    if (typed.triggeredAt != null) out["triggeredAt"] = typed.triggeredAt;
+    if (typed.ui != null) {
+      // ui 含枚举/嵌套，JSON 往返成可读 UTSJSONObject 供卡片/审批 readRawField
+      try {
+        out["ui"] = JSON.parse(JSON.stringify(typed.ui));
+      } catch (_eUi) {
+        out["ui"] = null;
+      }
+    }
+  } catch (_eClass) {
+    // 既非可读对象也非 class：返回空壳（调用方 readRawField 得空，安全跳过）
+  }
+  return out;
+}
+
+/**
  * Android 上 interaction 存进 MessageInfo.any 字段后是 UTSJSONObject（非 class 实例），
  * 一律用 readRawField 读标量；H5 上也兼容（普通对象 bracket 可读）。
  * 禁止 orArray<T> 泛型强转后直读属性（Android 会静默丢字段 → 队列恒空）。
@@ -180,28 +224,31 @@ export const getActiveInterventionQueue = (
 
     const mcpInteractions = orArray<any>(message.mcpAskInteractions);
     mcpInteractions.forEach((interaction: any) => {
-      if (!isActiveResponseStatus(readInteractionStatus(interaction))) return;
-      if (hasMcpAskResumeMessage(messages, interaction)) return;
-      const toolCallIdRaw = readRawField(interaction, "toolCallId");
+      // 队列里放 readable UTSJSONObject：messageList 里是 McpAskInteraction class 实例，
+      // Android readRawField 读不到 requestId/responseStatus → 静默漏卡。先 normalize。
+      const readable = asReadableMcp(interaction);
+      if (!isActiveResponseStatus(readInteractionStatus(readable))) return;
+      if (hasMcpAskResumeMessage(messages, readable)) return;
+      const toolCallIdRaw = readRawField(readable, "toolCallId");
       const toolCallId = toolCallIdRaw != null ? `${toolCallIdRaw}` : "";
-      const requestId = orString(readRawField(interaction, "requestId"), "");
+      const requestId = orString(readRawField(readable, "requestId"), "");
       if (
         (toolCallId.length > 0 && permissionPendingToolCallIds.has(toolCallId)) ||
         (requestId.length > 0 && permissionPendingAskRequestIds.has(requestId))
       ) {
         return;
       }
-      const triggeredAt = readRawField(interaction, "triggeredAt");
+      const triggeredAt = readRawField(readable, "triggeredAt");
       const sortKey =
         triggeredAt != null ? orNumber(triggeredAt, fallbackSeq++) : fallbackSeq++;
-      const revision = orNumber(readRawField(interaction, "revision"), 1);
+      const revision = orNumber(readRawField(readable, "revision"), 1);
       const askItem = new UTSJSONObject();
       askItem["kind"] = "mcp_ask";
       askItem["key"] = `ask:${requestId}:${revision}`;
       askItem["messageId"] = messageId;
       askItem["messageIndex"] = messageIndex;
       askItem["message"] = message;
-      askItem["interaction"] = interaction;
+      askItem["interaction"] = readable;
       askItem["sortKey"] = sortKey;
       pendingMap.set(`ask-${requestId}`, askItem);
     });
@@ -273,13 +320,16 @@ export const getFrontInterventionSnapshot = (
   for (let i = 0; i < messages.length; i++) {
     const asks = orArray<any>(messages[i].mcpAskInteractions);
     for (let j = 0; j < asks.length; j++) {
-      if (!isActiveResponseStatus(readInteractionStatus(asks[j]))) continue;
-      const rid = orString(readRawField(asks[j], "requestId"), "");
-      const rev = orNumber(readRawField(asks[j], "revision"), 1);
+      // class 实例先 normalize，否则 rid/rev 读空永远匹配不到 frontKey → frontMcp 恒 null
+      const readable = asReadableMcp(asks[j]);
+      if (!isActiveResponseStatus(readInteractionStatus(readable))) continue;
+      const rid = orString(readRawField(readable, "requestId"), "");
+      const rev = orNumber(readRawField(readable, "revision"), 1);
       if (`ask:${rid}:${rev}` == frontKey) {
         const out = new UTSJSONObject();
         out["kind"] = "mcp_ask";
-        out["interaction"] = asks[j];
+        // 返回 readable，卡片/审批统一 readRawField（bracket 可读）
+        out["interaction"] = readable;
         out["key"] = frontKey;
         out["message"] = messages[i];
         return out;
@@ -395,8 +445,10 @@ export const updateMcpAskInteractionStatusInMessageList = (
   interaction: any,
   responseStatus: InterventionStatus,
 ): MessageInfo[] => {
-  const targetRequestId = orString(readRawField(interaction, "requestId"), "");
-  const revision = orNumber(readRawField(interaction, "revision"), 1);
+  // 入参 interaction 可能是 readable UTSJSONObject 或 class 实例，统一 normalize 再取匹配键
+  const target = asReadableMcp(interaction);
+  const targetRequestId = orString(readRawField(target, "requestId"), "");
+  const revision = orNumber(readRawField(target, "revision"), 1);
   const list = [...messageList];
   for (let msgIndex = 0; msgIndex < list.length; msgIndex++) {
     const msg = list[msgIndex];
@@ -405,16 +457,20 @@ export const updateMcpAskInteractionStatusInMessageList = (
 
     let matched = false;
     const nextInteractions = interactions.map((item: any): any => {
+      // item 是 McpAskInteraction class 实例：先 normalize 再读 requestId/revision，
+      // 否则 Android 读空永远 match 不到、状态写不回、卡片关不掉。
+      const readableItem = asReadableMcp(item);
       if (
-        orString(readRawField(item, "requestId"), "") == targetRequestId &&
-        orNumber(readRawField(item, "revision"), 1) == revision
+        orString(readRawField(readableItem, "requestId"), "") == targetRequestId &&
+        orNumber(readRawField(readableItem, "revision"), 1) == revision
       ) {
         matched = true;
-        const next = cloneMcpAskInteraction(item);
+        const next = cloneMcpAskInteraction(readableItem);
         next["responseStatus"] = responseStatus;
         return next;
       }
-      return item;
+      // 顺带把 class 实例改写成可读 UTSJSONObject，避免后续再读空
+      return readableItem;
     });
 
     if (!matched) continue;

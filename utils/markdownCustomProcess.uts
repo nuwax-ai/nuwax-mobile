@@ -184,6 +184,7 @@ export function findNextMarkdownCustomProcessTag(
     }
     const openEnd = scanOpenTagEnd(text, idx);
     if (openEnd < 0) {
+      // 开标签未闭合：跳过，留给 stripIncomplete / 后续 chunk
       search = afterName;
       continue;
     }
@@ -191,9 +192,12 @@ export function findNextMarkdownCustomProcessTag(
     if (!isSelfClosingOpen(text, idx, openEnd)) {
       const closeMarker = "</markdown-custom-process>";
       const closeIdx = text.indexOf(closeMarker, openEnd);
-      if (closeIdx >= 0) {
-        tagEnd = closeIdx + closeMarker.length;
+      if (closeIdx < 0) {
+        // 非自闭合必须成对闭合，否则半截开标签会把后续正文吃进「伪工具块」
+        search = afterName;
+        continue;
       }
+      tagEnd = closeIdx + closeMarker.length;
     }
     let attrEnd = openEnd - 1;
     if (isSelfClosingOpen(text, idx, openEnd)) {
@@ -249,6 +253,138 @@ export function toMarkdownCustomProcessHtml(
   const safeType = type.replace(/"/g, "&quot;");
   const safeStatus = status.replace(/"/g, "&quot;");
   return `<markdown-custom-process executeid="${executeId}" type="${safeType}" status="${safeStatus}" name="${safeName}"></markdown-custom-process>`;
+}
+
+/**
+ * 若未闭合标签前紧挨可选的 <div>/<p> 开标签，截断点前移到外层起点，避免泄漏半截包裹。
+ */
+function expandIncompleteMarkupStart(text: string, tagStart: number): number {
+  let j = tagStart;
+  while (j > 0 && isHtmlSpace(text.charAt(j - 1))) {
+    j--;
+  }
+  if (j <= 0 || text.charAt(j - 1) != ">") {
+    return tagStart;
+  }
+  let k = j - 1;
+  const minK = tagStart - 256 > 0 ? tagStart - 256 : 0;
+  while (k >= minK) {
+    if (text.charAt(k) == "<") {
+      const open = text.substring(k, j);
+      if (/^<(?:div|p)\b[^>]*>$/i.test(open)) {
+        return k;
+      }
+      break;
+    }
+    k--;
+  }
+  return tagStart;
+}
+
+function earlierIndex(a: number, b: number): number {
+  if (a < 0) {
+    return b;
+  }
+  if (b < 0) {
+    return a;
+  }
+  return a < b ? a : b;
+}
+
+/**
+ * 定位流式未闭合自定义标签起点（process / group / task-result / container / conversation）。
+ * @returns 应截断的起点；无可截断返回 -1
+ */
+export function findIncompleteCustomMarkupTailStart(text: string): number {
+  if (text.length == 0) {
+    return -1;
+  }
+  let cut = -1;
+
+  // markdown-custom-process / -group
+  const processMarker = "<markdown-custom-process";
+  let search = 0;
+  while (search < text.length) {
+    const idx = text.indexOf(processMarker, search);
+    if (idx < 0) {
+      break;
+    }
+    const afterName = idx + processMarker.length;
+    if (text.substring(afterName, afterName + 6) == "-group") {
+      const closeIdx = text.indexOf(
+        "</markdown-custom-process-group>",
+        afterName,
+      );
+      if (closeIdx < 0) {
+        cut = earlierIndex(cut, expandIncompleteMarkupStart(text, idx));
+      }
+      search = afterName + 6;
+      continue;
+    }
+    const openEnd = scanOpenTagEnd(text, idx);
+    if (openEnd < 0) {
+      // 开标签属性未闭合（缺 >）：截断，禁止半截标签当正文
+      cut = earlierIndex(cut, expandIncompleteMarkupStart(text, idx));
+      break;
+    }
+    if (!isSelfClosingOpen(text, idx, openEnd)) {
+      const closeMarker = "</markdown-custom-process>";
+      const closeIdx = text.indexOf(closeMarker, openEnd);
+      if (closeIdx < 0) {
+        // 已有 > 但尚未输出闭合标签：整段起截断，避免后续分析正文被挂到半截标签后丢失刷新
+        cut = earlierIndex(cut, expandIncompleteMarkupStart(text, idx));
+        break;
+      }
+      search = closeIdx + closeMarker.length;
+      continue;
+    }
+    search = openEnd;
+  }
+
+  // task-result：必须成对闭合
+  const taskIdx = text.lastIndexOf("<task-result");
+  if (taskIdx >= 0) {
+    const taskClose = text.indexOf("</task-result>", taskIdx);
+    if (taskClose < 0) {
+      cut = earlierIndex(cut, expandIncompleteMarkupStart(text, taskIdx));
+    }
+  }
+
+  // :::container ... \n:::
+  const fenceIdx = text.lastIndexOf(":::container");
+  if (fenceIdx >= 0) {
+    const fenceClose = text.indexOf("\n:::", fenceIdx + ":::container".length);
+    if (fenceClose < 0) {
+      cut = earlierIndex(cut, fenceIdx);
+    }
+  }
+
+  // <conversation .../> 或成对闭合
+  const lower = text.toLowerCase();
+  const convIdx = lower.lastIndexOf("<conversation");
+  if (convIdx >= 0) {
+    const slice = text.substring(convIdx);
+    const match = slice.match(
+      /^<conversation\b([^>]*?)(?:\/\s*>|>\s*<\/conversation\s*>)/i,
+    );
+    if (match == null) {
+      cut = earlierIndex(cut, convIdx);
+    }
+  }
+
+  return cut;
+}
+
+/**
+ * 剥离流式未闭合的自定义标签尾部，避免半截 HTML 当普通文本渲染。
+ * 完整标签保留，由 fallback 产出工具卡 / 会话链接。
+ */
+export function stripIncompleteCustomMarkupTail(text: string): string {
+  const cut = findIncompleteCustomMarkupTailStart(text);
+  if (cut < 0) {
+    return text;
+  }
+  return text.substring(0, cut);
 }
 
 /**

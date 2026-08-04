@@ -35,12 +35,18 @@ SSE PROCESSING + subEventType=RENDER_UI
 `nuwax.openui-ref` 的完成帧后才切换为“点击查看界面”。连续 PROCESSING 帧只允许在
 `executeId` 相同时合并，避免不同工具调用互相覆盖。
 
-表单型 OpenUI 在 webview 发出 `OPENUI_ACTION` 后，预览页会校验
+表单型 OpenUI 在预览网关发出 `OPENUI_ACTION` 后，预览页会校验
 `nuwax.openui-action/v1`、构建与 PC/ask-question 一致的可读续作消息、同步暂存并返回
 会话页。会话页 `onShow` 一次性消费暂存内容，通过既有 `handleSendMessage` 自动发送。
-同一预览页只接受第一次有效提交，避免 webview 重复派发造成重复消息。
-App/小程序仍统一打开网关 `/static/file-preview.html`；该页面识别 `.openui.json` 后，
-在同源 iframe 中加载 `/static/openui-runtime/index.html` 并向原生 webview 转发提交事件。
+同一预览页只接受第一次有效提交，避免重复派发造成重复消息。
+
+- **App / 小程序**：`<web-view @message>` 接收网关 `notifyParent` / `uni.webView.postMessage`
+- **H5**：`<iframe>` + `window.message` 接收 `parent.postMessage`（与网关 `notifyParent` 同源路径）
+- 会话内预览须带 `_ticket`（`isChat=true`）才允许提交；真分享链接 `?sk=` 与 ticket 失败回退仍为只读
+- H5 生产与 App 一致：会话内用 `fileUrl` + `_ticket` + `_sk`，不再误用顶层 `sk` 只读模式
+
+App/小程序/H5 均打开网关 `/static/file-preview.html`；该页面识别 `.openui.json` 后，
+在同源 iframe 中加载 `/static/openui-runtime/index.html` 并转发提交事件。
 
 ## ⚠️ HBuilderX 验证时需重点确认的环节
 

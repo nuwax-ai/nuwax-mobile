@@ -270,6 +270,42 @@
             <svg-icon name="icon-a-Chevrondown" />
           </view>
         </view>
+
+        <!-- Agent 干预固定栏：FIFO 队列，仅展示队首一张卡片 -->
+        <!-- interventionRenderProbe：引用以触发渲染诊断日志（队列>0 时打 [ITV] render-probe） -->
+        <view v-if="activeInterventionQueue.length" class="intervention-dock" :class="interventionRenderProbe">
+          <scroll-view
+            class="intervention-dock-scroll"
+            direction="vertical"
+            :show-scrollbar="false"
+          >
+            <view class="intervention-dock-content">
+              <!-- length>1 即显示 +N：与 interventionQueueBadge(=length-1) 一致；
+                   若写成 >2，两条重复 ACP 时无 badge，用户误以为只有一张。 -->
+              <view
+                v-if="activeInterventionQueue.length > 1"
+                class="intervention-queue-badge"
+              >
+                <text class="intervention-queue-badge-text">
+                  +{{ interventionQueueBadge }}
+                </text>
+              </view>
+              <acp-permission-card
+                v-if="frontAcpInteraction != null"
+                  :key="frontInterventionKey"
+                :interaction="frontAcpInteraction"
+                @respond="onFrontAcpRespond"
+              />
+              <mcp-ask-question-card
+                v-if="frontMcpInteraction != null"
+                  :key="frontInterventionKey"
+                :interaction="frontMcpInteraction"
+                @respond="onFrontMcpRespond"
+              />
+            </view>
+          </scroll-view>
+        </view>
+
         <voice-conversation-panel
           v-if="isRenderInputPhone && voiceConversationEnabled"
           :assistant-msg-id="assistantMsgId"
@@ -399,7 +435,7 @@
 <script setup lang="uts">
   // ==================== 导入模块 ====================
   // 分层架构
-  import { nextTick, type ComponentPublicInstance } from "vue";
+  import { nextTick, computed, watch, type ComponentPublicInstance } from "vue";
   import { onLoad, onHide, onShow } from "@dcloudio/uni-app";
   import { consumePendingOpenUiAction } from "@/utils/pendingOpenUiAction.uts";
   import AgentDetailData from "./layers/AgentDetailData.uts";
@@ -428,9 +464,22 @@
   import {
     MessageTypeEnum,
     AssistantRoleEnum,
+    MessageModeEnum,
   } from "@/types/enums/agent";
   import type { ChatInputPhoneRef } from "@/types/interfaces/chat.uts";
   import type { MessageInfo } from "@/types/interfaces/conversationInfo.uts";
+  import type {
+    AcpPermissionInteraction,
+    AcpPermissionResponse,
+    InterventionStatus,
+    McpAskInteraction,
+    McpAskRespondPayload,
+  } from "@/types/intervention";
+  import {
+    getActiveInterventionQueue,
+    getFrontInterventionSnapshot,
+  } from "./utils/mcpAskInterventionState.uts";
+  import { buildMcpAskResumeMessage } from "@/subpackages/utils/mcpAskResumeLite.uts";
   import type { UploadFileStatus } from "@/types/enums/common.uts";
   import type { TenantConfigInfo } from "@/types/interfaces/login";
   import {
@@ -462,6 +511,8 @@
   // 显式导入 uni-ai-x-msg 组件（H5 上 easycom 扫描不到 uni_modules/uni-ai-x，需手动注册）
   import UniAiXMsg from "@/subpackages/components/ai-msg/ai-msg.uvue";
   import VoiceConversationPanel from "@/subpackages/components/voice-conversation-panel/voice-conversation-panel.uvue";
+  import AcpPermissionCard from "@/components/agent-intervention/acp-permission-card/acp-permission-card.uvue";
+  import McpAskQuestionCard from "@/components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue";
   import { voiceConfig } from "@/subpackages/utils/voice/voiceConfig";
   import proxyWeb from "@/uni_modules/uni-ai-x/sdk/proxy-web.uts";
 
@@ -749,6 +800,127 @@
     subscriptionModalVisible,
     localCalledTrialCount,
   } = data;
+
+  // ==================== 干预审批 FIFO 队列（dockpanel） ====================
+  // 队首 frontInterventionItem 为最早待审批项；badge 显示后续排队数量。
+  const activeInterventionQueue = computed((): UTSJSONObject[] =>
+    getActiveInterventionQueue(messageList.value),
+  );
+  const frontInterventionItem = computed(
+    (): UTSJSONObject | null => activeInterventionQueue.value.length > 0
+      ? activeInterventionQueue.value[0]
+      : null,
+  );
+  const interventionQueueBadge = computed(() =>
+    Math.max(0, activeInterventionQueue.value.length - 1),
+  );
+  const frontInterventionKey = computed((): string => {
+    const key = readRawField(frontInterventionItem.value, "key");
+    return key != null ? `${key}` : "";
+  });
+
+  // 队首快照：Android 上 queue item 是 LinkedHashMap（渲染侧读不到字段致卡片不渲染），
+  // 改用 getFrontInterventionSnapshot 返回的 UTSJSONObject（bracket 可读）。
+  const frontSnapshot = computed((): UTSJSONObject | null =>
+    getFrontInterventionSnapshot(messageList.value),
+  );
+  // Android：interaction 是 UTSJSONObject，禁止 as AcpPermissionInteraction / McpAskInteraction（CCE）
+  const frontAcpInteraction = computed((): any | null => {
+    const snap = frontSnapshot.value;
+    if (snap == null || snap["kind"] != "acp_permission") {
+      return null;
+    }
+    const interaction = snap["interaction"];
+    return interaction != null ? interaction : null;
+  });
+  const frontMcpInteraction = computed((): any | null => {
+    const snap = frontSnapshot.value;
+    if (snap == null || snap["kind"] != "mcp_ask") {
+      return null;
+    }
+    const interaction = snap["interaction"];
+    return interaction != null ? interaction : null;
+  });
+  // 渲染诊断：队首与卡片渲染对象是否就位（queue.len>0 但卡片不显示时用）。
+  // 必须在 frontAcp/frontMcp 声明之后（UTS 先声明后引用）。
+  const interventionRenderProbe = computed((): string => {
+    const len = activeInterventionQueue.value.length;
+    const acp = frontAcpInteraction.value != null;
+    const mcp = frontMcpInteraction.value != null;
+    let dbg = "";
+    if (len > 0) {
+      const snap = frontSnapshot.value;
+      const kind = snap != null ? `${snap["kind"]}` : "null";
+      const itvRaw = snap != null ? snap["interaction"] : null;
+      dbg = ` kind=${kind} itvNull=${itvRaw == null}`;
+      console.log(`[ITV] render-probe len=${len} acp=${acp} mcp=${mcp}${dbg}`);
+    }
+    return `len=${len} acp=${acp} mcp=${mcp}`;
+  });
+
+  /**
+   * ACP 权限审批入口（同步转发）。
+   * 真正的 async/try-catch 在 AgentDetailService.respondAcpPermission（.uts），
+   * 避免 uvue script setup 被 UTS 截断出现 Return statement is not allowed here。
+   */
+  function handleAcpPermissionRespond(
+    interaction: any,
+    response: AcpPermissionResponse,
+  ): void {
+    const isSelected = response.outcome.outcome == "selected";
+    const selectedOptionId = isSelected ? response.outcome.optionId : null;
+    service.respondAcpPermission(interaction, selectedOptionId, isSelected);
+  }
+
+  /** 对齐 PC respondMcpAsk.resolveStatus */
+  const resolveMcpAskResponseStatus = (
+    payload: McpAskRespondPayload,
+  ): InterventionStatus => {
+    if (payload.action == "cancel") {
+      return "cancelled";
+    }
+    if (payload.action == "skip") {
+      return "skipped";
+    }
+    return "submitted";
+  };
+
+  /** MCP Ask 响应：直接写终态（不经 submitting），构建 resume 文本走既有发送链路续作 */
+  let sendInterventionResumeMessage = (_data: any): void => {};
+  function handleMcpAskRespond(
+    _message: MessageInfo,
+    interaction: any,
+    payload: McpAskRespondPayload,
+  ): void {
+    service.applyMcpAskStatus(
+      interaction,
+      resolveMcpAskResponseStatus(payload),
+    );
+
+    const resumeText = buildMcpAskResumeMessage(interaction, payload);
+    if (resumeText.length > 0) {
+      sendInterventionResumeMessage({
+        messageInfo: resumeText,
+        files: payload.files != null ? payload.files : [],
+      });
+    }
+  }
+
+  /** ACP 权限审批：队首卡片 @respond 入口 */
+  const onFrontAcpRespond = (response: AcpPermissionResponse): void => {
+    const interaction = frontAcpInteraction.value;
+    if (interaction == null) return;
+    handleAcpPermissionRespond(interaction, response);
+  };
+
+  /** MCP Ask：队首卡片 @respond 入口 */
+  const onFrontMcpRespond = (payload: McpAskRespondPayload): void => {
+    const item = frontInterventionItem.value;
+    const interaction = frontMcpInteraction.value;
+    if (item == null || interaction == null) return;
+    const message = readRawField(item, "message") as MessageInfo;
+    handleMcpAskRespond(message, interaction, payload);
+  };
 
   /**
    * 将开场白中的常见 HTML 转为 Markdown。
@@ -1892,6 +2064,7 @@
     // 本轮会话进行中监听结束/他端停止（与进页 EXECUTING 续接时的订阅一致）
     eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
   };
+  sendInterventionResumeMessage = handleSendMessage;
 
   /**
    * 切换 SSE 自动播报。
@@ -2987,6 +3160,14 @@
     if (shouldAutoScrollToLast() == true) {
       scrollToLastMsg(false);
     }
+    // 干预挂载后强制重算 FIFO 队列：Android 上 messageList.value 整体替换后
+    // activeInterventionQueue computed 可能不重算（dockpanel 不渲染），显式驱动一次。
+    nextTick(() => {
+      const probe = interventionRenderProbe.value;
+      if (activeInterventionQueue.value.length > 0) {
+        console.log(`[ITV] render-probe(force) ${probe}`);
+      }
+    });
   };
 
   // #ifdef H5

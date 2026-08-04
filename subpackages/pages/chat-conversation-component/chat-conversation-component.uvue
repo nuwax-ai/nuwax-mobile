@@ -265,6 +265,11 @@
             <view style="height: 12px" id="last-msg"></view>
           </scroll-view>
 
+          <!-- 历史会话首屏加载：超过 300ms 才显示，显示后至少 1s -->
+          <view class="history-loading-mask" v-if="showHistoryLoading">
+            <spin-loading size="64rpx" color="#3bb346" :duration-ms="833" />
+          </view>
+
           <!-- 滚动到底部按钮 -->
           <view
             :style="{ visibility: scrollInBottom ? 'hidden' : 'visible' }"
@@ -508,6 +513,7 @@
   import MorePopup from "./components/more-popup/more-popup.uvue";
   import AgentSubscriptionModal from "./components/agent-subscription-modal/agent-subscription-modal.uvue";
   import ChatInputPhone from "@/subpackages/components/chat-input-phone/chat-input-phone.uvue";
+  import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
   import NewConversationSet from "./components/new-conversation-set/new-conversation-set.uvue";
   import FileTree from "./components/file-tree/file-tree.uvue";
   import ToolDetailsModal from "./components/tool-details-modal/tool-details-modal.uvue";
@@ -795,6 +801,7 @@
     isSandboxUnavailable,
     sandboxDisabledText,
     isLoadingMoreMessages,
+    isLoadingConversation,
     hasMoreMessages,
     currentModelId,
     currentModelName,
@@ -803,6 +810,82 @@
     subscriptionModalVisible,
     localCalledTrialCount,
   } = data;
+
+  /** 历史加载超过 300ms 才显示；一旦显示至少保持 1s */
+  const HISTORY_LOADING_DELAY_MS: number = 300;
+  const HISTORY_LOADING_MIN_VISIBLE_MS: number = 1000;
+  const showHistoryLoading = ref<boolean>(false);
+  let historyLoadingDelayTimer: number = 0;
+  let historyLoadingHideTimer: number = 0;
+  let historyLoadingShownAt: number = 0;
+
+  function clearHistoryLoadingDelayTimer(): void {
+    if (historyLoadingDelayTimer != 0) {
+      clearTimeout(historyLoadingDelayTimer);
+      historyLoadingDelayTimer = 0;
+    }
+  }
+
+  function clearHistoryLoadingHideTimer(): void {
+    if (historyLoadingHideTimer != 0) {
+      clearTimeout(historyLoadingHideTimer);
+      historyLoadingHideTimer = 0;
+    }
+  }
+
+  function hideHistoryLoadingNow(): void {
+    clearHistoryLoadingHideTimer();
+    showHistoryLoading.value = false;
+    historyLoadingShownAt = 0;
+  }
+
+  function scheduleHideHistoryLoading(): void {
+    clearHistoryLoadingHideTimer();
+    if (showHistoryLoading.value != true) {
+      return;
+    }
+    const elapsed =
+      historyLoadingShownAt > 0 ? Date.now() - historyLoadingShownAt : 0;
+    const remain = HISTORY_LOADING_MIN_VISIBLE_MS - elapsed;
+    if (remain <= 0) {
+      hideHistoryLoadingNow();
+      return;
+    }
+    historyLoadingHideTimer = setTimeout(() => {
+      historyLoadingHideTimer = 0;
+      if (data.isLoadingConversation.value != true) {
+        hideHistoryLoadingNow();
+      }
+    }, remain) as number;
+  }
+
+  watch(
+    (): boolean => data.isLoadingConversation.value,
+    (loading: boolean) => {
+      clearHistoryLoadingDelayTimer();
+      if (loading == true) {
+        clearHistoryLoadingHideTimer();
+        if (showHistoryLoading.value == true) {
+          return;
+        }
+        historyLoadingDelayTimer = setTimeout(() => {
+          historyLoadingDelayTimer = 0;
+          if (data.isLoadingConversation.value == true) {
+            showHistoryLoading.value = true;
+            historyLoadingShownAt = Date.now();
+          }
+        }, HISTORY_LOADING_DELAY_MS) as number;
+      } else {
+        // 未到 300ms 就结束：不显示
+        if (showHistoryLoading.value != true) {
+          return;
+        }
+        // 已显示：至少再留足 1s
+        scheduleHideHistoryLoading();
+      }
+    },
+    { immediate: true },
+  );
 
   // ==================== 干预审批 FIFO 队列（dockpanel） ====================
   // 队首 frontInterventionItem 为最早待审批项；badge 显示后续排队数量。
@@ -2709,90 +2792,98 @@
 
       if (props.isTempChat) return;
 
+      // 历史会话首屏：接口等待期间展示居中 loading（handleQueryConversation 结束时会关掉）
+      data.isLoadingConversation.value = true;
       // 查询历史会话信息(接口返回数据中包含智能体详情信息, 所以不在需要单独查询智能体详情信息了)
-      const res = await apiAgentConversation(id);
-      // Android：res 是 UTSJSONObject，res.code / res.data 点号访问失败 → 不会进 handleQueryConversation → messageList 空
-      if (apiResCode(res) == SUCCESS_CODE) {
-        const resData = apiResData<any>(res);
-        if (resData != null) {
-          const resDataObj = resData as UTSJSONObject;
-          const agent = resDataObj["agent"];
-          if (agent != null) {
-            eventBindConfig.value = parseEventBindConfig((agent as UTSJSONObject)["eventBindConfig"]);
+      try {
+        const res = await apiAgentConversation(id);
+        // Android：res 是 UTSJSONObject，res.code / res.data 点号访问失败 → 不会进 handleQueryConversation → messageList 空
+        if (apiResCode(res) == SUCCESS_CODE) {
+          const resData = apiResData<any>(res);
+          if (resData != null) {
+            const resDataObj = resData as UTSJSONObject;
+            const agent = resDataObj["agent"];
+            if (agent != null) {
+              eventBindConfig.value = parseEventBindConfig((agent as UTSJSONObject)["eventBindConfig"]);
+            }
           }
-        }
-        await handleQueryConversation(res);
-        // 历史消息首屏布局完成后再无动画滚到底（watch 可能早于 DOM 就绪）
-        if (data.messageList.value.length > 0) {
-          scrollToLastMsgAfterHistoryLoad();
-        }
+          await handleQueryConversation(res);
+          // 历史消息首屏布局完成后再无动画滚到底（watch 可能早于 DOM 就绪）
+          if (data.messageList.value.length > 0) {
+            scrollToLastMsgAfterHistoryLoad();
+          }
 
-        // 首页会话框会先创建会话，再以 conversationId 为键保存一次性草稿。
-        // 会话详情初始化完成后复用既有发送链路，避免首页重复实现流式聊天。
-        const currentAgentId = data.agentId.value;
-        if (currentAgentId != null) {
-          const draft = consumePendingChatDraft(id, currentAgentId);
-          if (draft != null) {
-            if (draft.modelId != null && draft.modelId != 0) {
-              data.currentModelId.value = draft.modelId;
-            }
-            if (draft.sandboxId != null && draft.sandboxId.length > 0) {
-              data.currentSandboxId.value = draft.sandboxId;
-            }
-            const draftFiles: UTSJSONObject[] = [];
-            for (let attachmentIndex = 0; attachmentIndex < draft.attachments.length; attachmentIndex++) {
-              const attachment = draft.attachments[attachmentIndex];
-              draftFiles.push({
-                url: attachment["fileUrl"],
-                type: attachment["mimeType"],
-                name: attachment["fileName"],
-                key: attachment["fileKey"],
-                size: attachment["fileSize"],
+          // 首页会话框会先创建会话，再以 conversationId 为键保存一次性草稿。
+          // 会话详情初始化完成后复用既有发送链路，避免首页重复实现流式聊天。
+          const currentAgentId = data.agentId.value;
+          if (currentAgentId != null) {
+            const draft = consumePendingChatDraft(id, currentAgentId);
+            if (draft != null) {
+              if (draft.modelId != null && draft.modelId != 0) {
+                data.currentModelId.value = draft.modelId;
+              }
+              if (draft.sandboxId != null && draft.sandboxId.length > 0) {
+                data.currentSandboxId.value = draft.sandboxId;
+              }
+              const draftFiles: UTSJSONObject[] = [];
+              for (let attachmentIndex = 0; attachmentIndex < draft.attachments.length; attachmentIndex++) {
+                const attachment = draft.attachments[attachmentIndex];
+                draftFiles.push({
+                  url: attachment["fileUrl"],
+                  type: attachment["mimeType"],
+                  name: attachment["fileName"],
+                  key: attachment["fileKey"],
+                  size: attachment["fileSize"],
+                });
+              }
+              const sendPayload: UTSJSONObject = {
+                messageInfo: draft.message,
+                files: draftFiles,
+                selectedComponents: draft.selectedComponents,
+                skillIds: draft.skillIds,
+                modelId: draft.modelId,
+                sandboxId: draft.sandboxId,
+                agentMode: draft.agentMode,
+              };
+              // 等待消息列表和输入组件完成首轮渲染，避免 App 首屏丢失首条消息。
+              nextTick(() => {
+                handleSendMessage(sendPayload);
               });
             }
-            const sendPayload: UTSJSONObject = {
-              messageInfo: draft.message,
-              files: draftFiles,
-              selectedComponents: draft.selectedComponents,
-              skillIds: draft.skillIds,
-              modelId: draft.modelId,
-              sandboxId: draft.sandboxId,
-              agentMode: draft.agentMode,
-            };
-            // 等待消息列表和输入组件完成首轮渲染，避免 App 首屏丢失首条消息。
-            nextTick(() => {
-              handleSendMessage(sendPayload);
-            });
           }
-        }
 
-        if (resData != null) {
-          const resDataObj = resData as UTSJSONObject;
-          // 切换会话：先停止旧会话的状态轮询
-          stopConversationPolling();
-          // Android：taskStatus 为字符串，禁止依赖 string==枚举隐式强转
-          if (parseTaskStatus(resDataObj["taskStatus"]) == TaskStatus.EXECUTING) {
-            // 本轮用户已进列表才立刻开 sub；否则只靠轮询（与 H5/App/小程序同一门禁）
-            if (
-              isTurnUserReadyFromRawMessageList(resDataObj["messageList"]) ==
-              true
-            ) {
-              data.isConversationActive.value = true;
-              service.handleSubConversation(id, () => {
-                startResumePolling();
-              });
+          if (resData != null) {
+            const resDataObj = resData as UTSJSONObject;
+            // 切换会话：先停止旧会话的状态轮询
+            stopConversationPolling();
+            // Android：taskStatus 为字符串，禁止依赖 string==枚举隐式强转
+            if (parseTaskStatus(resDataObj["taskStatus"]) == TaskStatus.EXECUTING) {
+              // 本轮用户已进列表才立刻开 sub；否则只靠轮询（与 H5/App/小程序同一门禁）
+              if (
+                isTurnUserReadyFromRawMessageList(resDataObj["messageList"]) ==
+                true
+              ) {
+                data.isConversationActive.value = true;
+                service.handleSubConversation(id, () => {
+                  startResumePolling();
+                });
+              } else {
+                console.log("[PageLoad] EXECUTING 但本轮用户未就绪，先轮询再续接");
+              }
+              // 兜底轮询：abortSub 不触发 onSubClose，需提前启动
+              startResumePolling();
+              // 订阅 ChatFinished 事件
+              eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
             } else {
-              console.log("[PageLoad] EXECUTING 但本轮用户未就绪，先轮询再续接");
+              // 非执行中：启动轮询，检测会话变为 EXECUTING
+              startResumePolling();
             }
-            // 兜底轮询：abortSub 不触发 onSubClose，需提前启动
-            startResumePolling();
-            // 订阅 ChatFinished 事件
-            eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
-          } else {
-            // 非执行中：启动轮询，检测会话变为 EXECUTING
-            startResumePolling();
           }
+        } else {
+          data.isLoadingConversation.value = false;
         }
+      } catch (_e) {
+        data.isLoadingConversation.value = false;
       }
     } else {
       let paramsData: OpenAppParams | null = null;
@@ -3266,6 +3357,8 @@
 
   // 清理事件监听器
   onUnmounted(() => {
+    clearHistoryLoadingDelayTimer();
+    hideHistoryLoadingNow();
     speechSocketWarmup.teardown();
     stopAllStreamSpeech(true);
     chatService.abort();

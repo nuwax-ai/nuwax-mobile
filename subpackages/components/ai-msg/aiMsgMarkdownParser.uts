@@ -4,58 +4,31 @@ import treeToListSdk from "@/uni_modules/uni-ai-x/sdk/treeToList.uts";
 import { MarkdownToken, type ParseMdRes } from "@/uni_modules/uni-cmark/utssdk/interface.uts";
 import { md2json } from "@/uni_modules/uni-cmark";
 import { MsgItem } from "@/types/interfaces/ai-msg";
-import { parseAppMarkdownFallback } from "@/subpackages/components/ai-msg/appMarkdownFallback.uts";
+import {
+  parseAppMarkdownFallback,
+  takeLastMathFlushCount,
+} from "@/subpackages/components/ai-msg/appMarkdownFallback.uts";
 import { expandMarkdownImageItems } from "@/subpackages/components/ai-msg/markdownImage.uts";
+import { listMarkdownCustomProcessTags } from "@/utils/markdownCustomProcess.uts";
 
-/** 从自定义工具标签属性中读取字符串。 */
-function extractCustomProcessAttribute(
-  attributes: string,
-  name: string,
-): string {
-  let regex = new RegExp(`${name}="([^"]*)"`, "i");
-  let match = attributes.match(regex);
-  if (match != null && match.length > 1) {
-    const value = match[1];
-    return value != null ? value.replace(/&quot;/g, '"') : "";
-  }
-  regex = new RegExp(`${name}='([^']*)'`, "i");
-  match = attributes.match(regex);
-  if (match != null && match.length > 1) {
-    const value = match[1];
-    return value != null ? value.replace(/&quot;/g, '"') : "";
-  }
-  return "";
-}
-
-/** 解析 html token 中的 markdown-custom-process 标签。 */
+/** 解析 html token 中的 markdown-custom-process 标签（引号感知，允许 name 含 >）。 */
 function parseCustomProcessList(source: string): any[] {
   const result: any[] = [];
   if (source.indexOf("<markdown-custom-process") < 0) {
     return result;
   }
-  const regex =
-    /<markdown-custom-process(?!-group)\b([^>]*)>(?:<\/markdown-custom-process>)?|<markdown-custom-process(?!-group)\b([^>]*?)\/>/gi;
-  let match = regex.exec(source);
-  while (match != null) {
-    const firstAttrs = match.length > 1 ? match[1] : null;
-    const secondAttrs = match.length > 2 ? match[2] : null;
-    const attributes =
-      firstAttrs != null && firstAttrs.length > 0
-        ? firstAttrs
-        : secondAttrs != null
-          ? secondAttrs
-          : "";
-    const item = new UTSJSONObject();
-    let executeId = extractCustomProcessAttribute(attributes, "executeId");
-    if (executeId.length == 0) {
-      executeId = extractCustomProcessAttribute(attributes, "executeid");
+  const tags = listMarkdownCustomProcessTags(source);
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tags[i];
+    if (tag.executeId.length == 0) {
+      continue;
     }
-    item["executeId"] = executeId;
-    item["type"] = extractCustomProcessAttribute(attributes, "type");
-    item["status"] = extractCustomProcessAttribute(attributes, "status");
-    item["name"] = extractCustomProcessAttribute(attributes, "name");
+    const item = new UTSJSONObject();
+    item["executeId"] = tag.executeId;
+    item["type"] = tag.type;
+    item["status"] = tag.status;
+    item["name"] = tag.name;
     result.push(item);
-    match = regex.exec(source);
   }
   return result;
 }
@@ -193,6 +166,8 @@ export class AiMsgMarkdownParser {
   private lastFallbackBody: string = "";
   /** 已完成消息的正文快照，用于跳过父级重渲染触发的重复解析。 */
   private lastFinishedBody: string = "";
+  /** 历史公式未齐：暂不上屏，避免重复 parse */
+  private fallbackHoldPending: boolean = false;
 
   constructor(
     msg: Ref<MsgItem>,
@@ -223,6 +198,7 @@ export class AiMsgMarkdownParser {
     this.cmarkProbeOk = true;
     this.lastFallbackBody = "";
     this.lastFinishedBody = "";
+    this.fallbackHoldPending = false;
     this.parseMarkdown = this.createParseMarkdown();
   }
 
@@ -331,13 +307,20 @@ export class AiMsgMarkdownParser {
     return false;
   }
 
-  private applyAppFallback(): void {
+  /**
+   * App fallback 渲染。
+   * @param holdMathUntilDone 历史/已完成：先截完公式，再与文案一次性上屏（对应位置已回填）
+   */
+  private applyAppFallback(holdMathUntilDone: boolean = false): void {
     const body = this.getBodyText();
     if (body.length == 0) {
       return;
     }
     const needsCustom = this.hasCustomMarkup(body);
     const needsStructural = this.prefersAppStructuralFallback(body);
+    if (body == this.lastFallbackBody && this.fallbackHoldPending == true) {
+      return;
+    }
     if (
       body == this.lastFallbackBody &&
       this.msg.value.markdownElList.length > 0
@@ -362,25 +345,55 @@ export class AiMsgMarkdownParser {
           body.replace(/\n/g, "\\n"),
       );
     }
-    this.msg.value.markdownElList = expandMarkdownImageItems(
-      parseAppMarkdownFallback(
-        body,
-        (): void => {
-          // KaTeX 回调修改的是原始 token；替换外层数组并 bump，
-          // 让表格 key（含 href/html 长度）变化以 remount 出公式图。
-          const prev = this.msg.value.markdownElList;
-          const next = [] as UniAiMarkdownElItem[];
-          for (let i = 0; i < prev.length; i++) {
-            next.push(prev[i]);
-          }
-          this.msg.value.markdownElList = next;
-          this.bumpRevision();
-        },
-      ),
+    let committed = false;
+    let safetyTimer: number = 0;
+    let pendingList: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
+    const commitUi = (list: UniAiMarkdownElItem[]): void => {
+      if (committed == true) {
+        return;
+      }
+      committed = true;
+      this.fallbackHoldPending = false;
+      if (safetyTimer != 0) {
+        clearTimeout(safetyTimer);
+        safetyTimer = 0;
+      }
+      // 此时 token 上公式 href/尺寸已回填，与文案同帧上屏
+      this.msg.value.markdownElList = list;
+      this.msg.value.rendered = true;
+      this.lastFinishedBody = body;
+      this.bumpRevision();
+      // 通知会话页补滚底（历史公式撑高后 scroll-into-view 常已过期）
+      uni.$emit("ai-msg-content-ready", null);
+    };
+    const onMathAllDone = (): void => {
+      if (holdMathUntilDone == true) {
+        commitUi(pendingList);
+        return;
+      }
+      // 流式：骨架已上屏，公式齐活后换引用刷新一次
+      const prev = this.msg.value.markdownElList;
+      const next = [] as UniAiMarkdownElItem[];
+      for (let i = 0; i < prev.length; i++) {
+        next.push(prev[i]);
+      }
+      this.msg.value.markdownElList = next;
+      this.bumpRevision();
+      uni.$emit("ai-msg-content-ready", null);
+    };
+    pendingList = expandMarkdownImageItems(
+      parseAppMarkdownFallback(body, onMathAllDone),
     );
-    this.msg.value.rendered = true;
-    this.lastFinishedBody = body;
-    this.bumpRevision();
+    const mathJobCount = takeLastMathFlushCount();
+    if (holdMathUntilDone == true && mathJobCount > 0) {
+      this.fallbackHoldPending = true;
+      safetyTimer = setTimeout((): void => {
+        safetyTimer = 0;
+        commitUi(pendingList);
+      }, 8000) as number;
+      return;
+    }
+    commitUi(pendingList);
   }
 
   private applyMarkdownTokenList(markdownTokenList: MarkdownToken[]): void {
@@ -459,13 +472,13 @@ export class AiMsgMarkdownParser {
     }
     // App：终态统一 fallback（结构块更稳，且无打字机）
     // #ifdef APP
-    this.applyAppFallback();
+    this.applyAppFallback(true);
     return;
     // #endif
     // #ifndef APP
     // H5：公式/代码/表/图走 fallback；普通正文 cmark 全量一次
     if (this.prefersAppStructuralFallback(body) == true || body.indexOf("$") >= 0) {
-      this.applyAppFallback();
+      this.applyAppFallback(true);
       return;
     }
     if (
@@ -478,7 +491,7 @@ export class AiMsgMarkdownParser {
       this.bumpRevision();
       return;
     }
-    this.applyAppFallback();
+    this.applyAppFallback(true);
     // #endif
   }
 
@@ -531,7 +544,7 @@ export class AiMsgMarkdownParser {
         if (markdownTokenList.length == 0 && body.trim().length > 0) {
           if (!this.parseFullBodyMarkdown(body)) {
             this.cmarkParseEnabled = false;
-            this.applyAppFallback();
+            this.applyAppFallback(true);
             mdRenderLog(
               "[MdRender] ParseMarkdown.disableCmark",
               `msgId=${this.msg.value._id} app markdown fallback`,
@@ -582,8 +595,8 @@ export class AiMsgMarkdownParser {
     // uni-cmark 不会产出 markdown_custom_process，会把标签泄漏为正文。
     // 一旦出现自定义标记，立即中止 cmark 增量打字机，避免半截正文覆盖 UI。
     if (needsCustomFallback) {
-      this.applyAppFallback();
-      if (streamFinished) {
+      this.applyAppFallback(streamFinished);
+      if (streamFinished && this.fallbackHoldPending != true) {
         this.lastFinishedBody = body;
       }
       return;
@@ -594,8 +607,8 @@ export class AiMsgMarkdownParser {
     // 判定收窄（见 prefersAppStructuralFallback），避免普通 `|` / `$100` 误伤。
     // #ifdef APP
     if (this.prefersAppStructuralFallback(body) == true) {
-      this.applyAppFallback();
-      if (streamFinished) {
+      this.applyAppFallback(streamFinished);
+      if (streamFinished && this.fallbackHoldPending != true) {
         this.lastFinishedBody = body;
       }
       return;

@@ -52,7 +52,7 @@
 </template>
 
 <script setup lang="uts">
-  import { ref } from 'vue';
+  import { ref, onMounted, onUnmounted } from 'vue';
   import { onLoad } from "@dcloudio/uni-app";
   // #ifndef APP-ANDROID
   import { onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
@@ -305,21 +305,10 @@
         // 故先拼绝对地址，再只对值做一次 encodeURIComponent（不要在 baseUrl 之后二次编码）。
         const fileUrl = encodeURIComponent(`${baseUrl}${fileProxyUrl.value}`);
 
-        // #ifdef H5 || WEB
-        if (isDev == true) {
-          // _sk 用于下载功能，_ticket 用于当前页面访问（_ticket 只能消费一次，适合当前用户自己访问）
-          const _ticket = await getTicket();
-          previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${fileUrl}&_ticket=${_ticket}&_sk=${shareKey}`;
-        } else {
-          previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${fileUrl}&sk=${shareKey}`;
-        }
-        // #endif
-
-        // #ifdef MP-WEIXIN || APP
-        // _sk 用于下载功能，_ticket 用于当前页面访问（_ticket 只能消费一次，适合当前用户自己访问）
+        // H5 / App / 小程序会话内预览统一走 _ticket（isChat=true，OpenUI 可提交）。
+        // _sk 用于下载；ticket 失败时回退顶层 sk（分享只读，表单不可回写会话）。
         const _ticket = await getTicket();
         if (_ticket.length > 0) {
-          // 会话内预览（isChat=true）：OpenUI 表单可提交回会话。
           previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${fileUrl}&_ticket=${_ticket}&_sk=${shareKey}`;
         } else {
           // ticket 签发失败（如 /api/user/ticket/create 返回 error auth token）时，
@@ -329,6 +318,7 @@
           console.warn(`[FilePreview] ticket empty, fallback to sk share preview. cId=${cId} shareKey=${shareKey}`);
           previewUrl.value = `${baseUrl}/static/file-preview.html?sk=${shareKey}`;
         }
+        // #ifdef MP-WEIXIN || APP
         // 设置 html 文件标题
         setHtmlTitle(baseUrl + fileProxyUrl.value + "?sk=" + shareKey);
         // #endif
@@ -340,14 +330,12 @@
     }
   }
 
-  // <web-view> @message：收到 OpenUI 表单提交（OPENUI_ACTION）→ 构建续作消息并按 cId 暂存，
-  // 用户返回 chat 页 onShow 时消费并发送（跨页无事件总线，走 storage；对齐 pendingChatDraft）。
-  const onWebViewMessage = (e: UniWebViewMessageEvent): void => {
+  /**
+   * 处理已解析的 OpenUI action：校验契约与 artifact → 构建续作消息 → 暂存并返回会话页。
+   * App/小程序走 web-view @message；H5 走 iframe parent postMessage，共用本函数。
+   */
+  const handleOpenUiAction = (action: UTSJSONObject): void => {
     if (hasHandledOpenUiAction) return;
-    // UniWebViewMessageEvent 是原生强类型对象，Android 上不可整体强转 UTSJSONObject；
-    // 直接读取其公开字段，再交给跨平台解析器处理消息数组。
-    const action = parseOpenUiActionData(e.detail.data);
-    if (action == null) return;
     if (
       `${action["type"]}` != "nuwax.openui-action" ||
       `${action["schemaVersion"]}` != "nuwax.openui-action/v1"
@@ -379,6 +367,51 @@
     // storage 为同步写入；返回会话页后 onShow 消费并复用 ask-question 同款发送入口。
     uni.navigateBack({ delta: 1 });
   };
+
+  // <web-view> @message：收到 OpenUI 表单提交（OPENUI_ACTION）→ 构建续作消息并按 cId 暂存。
+  const onWebViewMessage = (e: UniWebViewMessageEvent): void => {
+    // UniWebViewMessageEvent 是原生强类型对象，Android 上不可整体强转 UTSJSONObject；
+    // 直接读取其公开字段，再交给跨平台解析器处理消息数组。
+    const action = parseOpenUiActionData(e.detail.data);
+    if (action == null) return;
+    handleOpenUiAction(action);
+  };
+
+  // #ifdef H5 || WEB
+  /**
+   * H5 iframe：file-preview-openui.js 经 notifyParent → window.parent.postMessage
+   * 投递 { type: 'OPENUI_ACTION', event }，与 App web-view 桥接语义对齐。
+   */
+  const onH5OpenUiMessage = (event: any): void => {
+    try {
+      // H5 MessageEvent：与 uni-ai-x proxy-web 相同，直接读 event.data / event.origin
+      if (event == null || event.data == null) return;
+      const origin = event.origin != null ? `${event.origin}` : "";
+      // 限制来源为本站预览网关（dev 下 baseUrl=API；prod 下为 location.origin）
+      if (
+        origin.length > 0 &&
+        baseUrl.length > 0 &&
+        origin.indexOf(baseUrl) != 0 &&
+        origin != window.location.origin
+      ) {
+        return;
+      }
+      const action = parseOpenUiActionData(event.data);
+      if (action == null) return;
+      handleOpenUiAction(action);
+    } catch (_e) {
+      // ignore malformed postMessage
+    }
+  };
+
+  onMounted(() => {
+    window.addEventListener("message", onH5OpenUiMessage);
+  });
+
+  onUnmounted(() => {
+    window.removeEventListener("message", onH5OpenUiMessage);
+  });
+  // #endif
 
   onLoad((options: any) => {
     runOnLoad(options);

@@ -85,7 +85,29 @@ import {
 import { replaceMathBracket } from "@/utils/markdown.uts";
 import { adaptHistoryMessage } from "@/subpackages/utils/historyMessageAdapter";
 import { normalizeRenderUiProcessingData } from "@/subpackages/utils/openUiArtifactAdapter.uts";
+import {
+  isAcpPermissionEvent,
+  isMcpAskToolCallEvent,
+  extractAcpPermissionInteraction,
+  extractMcpAskInteraction,
+  normalizeAcpPermissionInteraction,
+} from "@/subpackages/utils/interventionAdapter";
+import {
+  isIdempotentAcpPermissionResolveError,
+  reconcileAcpPermissionStatusesInMessageList,
+} from "@/subpackages/utils/reconcileAcpPermissionStatus.uts";
+import {
+  updateAcpPermissionInteractionStatusInMessageList,
+  updateMcpAskInteractionStatusInMessageList,
+} from "@/subpackages/pages/chat-conversation-component/utils/mcpAskInterventionState.uts";
+import { apiAgentInterventionRespond } from "@/subpackages/servers/intervention";
+import {
+  AcpPermissionInteraction,
+  McpAskInteraction,
+  InterventionStatus,
+} from "@/types/intervention";
 import { createMessageInfoFromAny, messageToJsonObject, readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+import { orString } from "@/utils/utsCoalesce.uts";
 import AgentDetailUtils from "./AgentDetailUtils.uts";
 import { TEMP_CONVERSATION_UID } from "@/constants/common.constants";
 import { API_BASE_URL } from "@/constants/config";
@@ -699,6 +721,162 @@ export default class AgentDetailService {
     this.pendingSpeakDirty = false;
   }
 
+  /**
+   * 外部（.uvue 审批提交）修改 messageList 干预状态后，必须同步 streamListDraft，
+   * 否则下一次 flushStreamUiPublish 会用旧 draft（pending）覆盖 messageList（submitted），
+   * 导致已审批卡片重复弹出。draft 保留流式 token，仅改对应 interaction 的 status。
+   * 对照 nuwax PC（单 source messageList，无 draft 双缓冲）。
+   */
+  applyAcpPermissionStatus(
+    interactionId: string,
+    responseStatus: InterventionStatus,
+    extras: UTSJSONObject | null,
+  ): void {
+    this.data.messageList.value = updateAcpPermissionInteractionStatusInMessageList(
+      this.data.messageList.value,
+      interactionId,
+      responseStatus,
+      extras,
+    );
+    if (this.streamListDraft != null) {
+      this.streamListDraft = updateAcpPermissionInteractionStatusInMessageList(
+        this.streamListDraft as MessageInfo[],
+        interactionId,
+        responseStatus,
+        extras,
+      );
+    }
+    // 通知会话页刷新；否则仅改 messageList 时部分端 Dock 计算属性不重算
+    uni.$emit("streamMessageUpdate");
+  }
+
+  applyMcpAskStatus(
+    interaction: any,
+    responseStatus: InterventionStatus,
+  ): void {
+    this.data.messageList.value = updateMcpAskInteractionStatusInMessageList(
+      this.data.messageList.value,
+      interaction,
+      responseStatus,
+    );
+    if (this.streamListDraft != null) {
+      this.streamListDraft = updateMcpAskInteractionStatusInMessageList(
+        this.streamListDraft as MessageInfo[],
+        interaction,
+        responseStatus,
+      );
+    }
+  }
+
+  /**
+   * ACP 权限审批提交（放在 .uts 而非 .uvue）：
+   * uvue script setup 内 async+try/catch 会被 UTS 截断，导致
+   * 「Return statement is not allowed here」编译失败。
+   *
+   * @param interaction 队首 ACP interaction（Android 上为 UTSJSONObject）
+   * @param selectedOptionId 选中的 optionId；取消/拒绝时也可传 reject 的 optionId
+   * @param isSelected true=Selected 结果；false=Cancelled
+   */
+  async respondAcpPermission(
+    interaction: any,
+    selectedOptionId: string | null,
+    isSelected: boolean,
+  ): Promise<void> {
+    // class 实例 → UTSJSONObject，否则 readRawField 读到空 id/tc（API toolId=""）
+    const normalized = normalizeAcpPermissionInteraction(interaction);
+    const interactionId = orString(readRawField(normalized, "id"), "");
+    const request = readRawField(normalized, "request");
+    const toolCall = readRawField(request, "toolCall");
+    const toolCallId = orString(readRawField(toolCall, "toolCallId"), "");
+    const sessionId = orString(readRawField(request, "sessionId"), "");
+    const executeId = orString(readRawField(normalized, "executeId"), "");
+
+    const statusExtras = new UTSJSONObject();
+    if (selectedOptionId != null && selectedOptionId.length > 0) {
+      statusExtras["selectedOptionId"] = selectedOptionId;
+    }
+    if (toolCallId.length > 0) {
+      statusExtras["toolCallId"] = toolCallId;
+    }
+    if (executeId.length > 0) {
+      statusExtras["executeId"] = executeId;
+    }
+
+    console.log(
+      `[ITV] acp.respond start id=${interactionId} tc=${toolCallId} session=${sessionId} selected=${selectedOptionId}`,
+    );
+    this.applyAcpPermissionStatus(interactionId, "submitting", statusExtras);
+
+    let respondOk = false;
+    let errorMsg = "";
+    try {
+      const selectedOutcome = new UTSJSONObject();
+      if (isSelected && selectedOptionId != null) {
+        const selectedBody = new UTSJSONObject();
+        selectedBody["option_id"] = selectedOptionId;
+        selectedOutcome["Selected"] = selectedBody;
+      } else {
+        selectedOutcome["Cancelled"] = null;
+      }
+      const permissionResponse = new UTSJSONObject();
+      permissionResponse["outcome"] = selectedOutcome;
+      const permissionRequest = new UTSJSONObject();
+      permissionRequest["request_permission_response"] = permissionResponse;
+      permissionRequest["session_id"] = sessionId;
+      permissionRequest["tool_call_id"] = toolCallId;
+      permissionRequest["save_rule"] = false;
+      const apiParams = new UTSJSONObject();
+      apiParams["interventionId"] = interactionId;
+      apiParams["permission_resolve_request"] = permissionRequest;
+      const convId = this.data.conversationId.value;
+      if (convId != null) {
+        apiParams["conversation_id"] = convId;
+      }
+
+      const resp = await apiAgentInterventionRespond(apiParams);
+      const respCode = readRawField(resp, "code");
+      if (resp == null || respCode == SUCCESS_CODE) {
+        respondOk = true;
+      } else {
+        const respMessage = readRawField(resp, "message");
+        const respMessageStr = respMessage != null ? `${respMessage}` : "";
+        if (isIdempotentAcpPermissionResolveError(respMessageStr)) {
+          respondOk = true;
+        } else {
+          errorMsg =
+            respMessageStr.length > 0
+              ? respMessageStr
+              : t("Mobile.Intervention.AcpPermission.responseFailed");
+        }
+      }
+    } catch (error) {
+      const catchMsg =
+        error instanceof Error
+          ? error.message
+          : t("Mobile.Intervention.AcpPermission.responseFailed");
+      if (isIdempotentAcpPermissionResolveError(error)) {
+        respondOk = true;
+      } else {
+        errorMsg = catchMsg;
+      }
+    }
+
+    if (respondOk) {
+      this.applyAcpPermissionStatus(interactionId, "submitted", statusExtras);
+    } else {
+      const failExtras = new UTSJSONObject();
+      failExtras["errorMessage"] = errorMsg;
+      if (toolCallId.length > 0) {
+        failExtras["toolCallId"] = toolCallId;
+      }
+      if (executeId.length > 0) {
+        failExtras["executeId"] = executeId;
+      }
+      this.applyAcpPermissionStatus(interactionId, "failed", failExtras);
+      uni.showToast({ title: errorMsg, icon: "none" });
+    }
+  }
+
   /** Android：agent 接口数据统一为 UTSJSONObject，禁止 Interface 强转 */
   private toAgentJson(agent: any | null): UTSJSONObject | null {
     if (agent == null) {
@@ -882,7 +1060,9 @@ export default class AgentDetailService {
       });
 
       this.data.autoToLastMsg.value = true;
-      this.data.messageList.value = processedMessageList;
+      // 历史消息可能携带 pending 审批/提问：reconcile 后才进入可渲染队列（对齐 main）
+      this.data.messageList.value =
+        reconcileAcpPermissionStatusesInMessageList(processedMessageList);
       this.data.hasMoreMessages.value = msgRealCount > 0;
 
       // 处理问题建议
@@ -1055,11 +1235,12 @@ export default class AgentDetailService {
               processedMessages.push(attachSpeakableTextToMessage(adaptedMessage));
             }
 
-            // 前插到消息列表头部
-            this.data.messageList.value = [
-              ...processedMessages,
-              ...this.data.messageList.value,
-            ];
+            // 前插到消息列表头部；加载更多可能引入历史 pending 审批/提问，需 reconcile
+            this.data.messageList.value =
+              reconcileAcpPermissionStatusesInMessageList([
+                ...processedMessages,
+                ...this.data.messageList.value,
+              ]);
 
             // 判断是否还有更多消息
             this.data.hasMoreMessages.value =
@@ -1094,6 +1275,32 @@ export default class AgentDetailService {
 
     // 忽略心跳包 (HEART_BEAT 不包含 data)
     if (eventTypeStr == "HEART_BEAT") {
+      return;
+    }
+
+    // ACP Permission 权限审批事件拦截（在 data 校验 / PROCESSING 分支之前，命中即 return，不进 processingList）
+    const isAcpEvt = isAcpPermissionEvent(res);
+    if (isAcpEvt) {
+      const interaction = extractAcpPermissionInteraction(res);
+      console.log(
+        `[ITV] acp.hit extracted=${interaction != null} id=${interaction != null ? interaction.id : "null"} msgId=${currentMessageId}`,
+      );
+      if (interaction != null) {
+        this.handleAcpPermissionEvent(interaction, currentMessageId);
+      }
+      return;
+    }
+
+    // MCP Ask 结构化提问事件拦截（同上，命中即 return）
+    const isAskEvt = isMcpAskToolCallEvent(res);
+    if (isAskEvt) {
+      const mcpInteraction = extractMcpAskInteraction(res);
+      console.log(
+        `[ITV] ask.hit extracted=${mcpInteraction != null} reqId=${mcpInteraction != null ? mcpInteraction.requestId : "null"} msgId=${currentMessageId}`,
+      );
+      if (mcpInteraction != null) {
+        this.handleMcpAskEvent(mcpInteraction, currentMessageId);
+      }
       return;
     }
 
@@ -1365,6 +1572,208 @@ export default class AgentDetailService {
     }
   }
 
+  /**
+   * ACP 权限审批事件：把 interaction 挂载到目标消息的 acpPermissionInteractions。
+   * 走 messageToJsonObject draft 模式（Android Gson 对 class 直接设字段不可靠），
+   * 写回后统一 reconcile，并 $emit 触发 UI 刷新。
+   */
+  handleAcpPermissionEvent(
+    interaction: AcpPermissionInteraction,
+    currentMessageId: string,
+  ): void {
+    const list = this.getStreamListDraft();
+    const index = findMessageIndexById(
+      list,
+      currentMessageId,
+      this.data.messageIdRef.value,
+    );
+    if (index < 0) {
+      console.log(
+        `[ITV] acp.mount FAIL no-target id=${interaction.id} msgId=${currentMessageId} ref=${this.data.messageIdRef.value} listLen=${list.length}`,
+      );
+      return;
+    }
+    const currentMessage = list[index];
+
+    // 去重：live SSE 与 sub/PROCESSING 重放可能对「同一权限」生成不同 id。
+    // 除同 id 外，还需按非空 toolCallId / executeId 判重，否则 FIFO 会出现两张审批卡，
+    // 用户批掉一张后另一条仍 pending，继续双路抑制 MCP Ask（表现为 Ask 永远不展示）。
+    // 先规范为 UTSJSONObject，再读字段 / 挂载（禁止直接塞 class 实例）
+    const stored = normalizeAcpPermissionInteraction(interaction);
+    const newReq = readRawField(stored, "request");
+    const newTc = readRawField(newReq, "toolCall");
+    const newTcId = orString(readRawField(newTc, "toolCallId"), "");
+    const newExecuteId = orString(readRawField(stored, "executeId"), "");
+    const newId = orString(readRawField(stored, "id"), "");
+
+    for (let mi = 0; mi < list.length; mi++) {
+      const msgInteractions = readRawField(list[mi], "acpPermissionInteractions");
+      const msgArr = msgInteractions != null ? (msgInteractions as any[]) : [];
+      for (let ii = 0; ii < msgArr.length; ii++) {
+        const exist = msgArr[ii];
+        const existId = orString(readRawField(exist, "id"), "");
+        if (existId.length > 0 && existId == newId) {
+          console.log(`[ITV] acp.mount SKIP dup id=${newId}`);
+          return;
+        }
+        const existReq = readRawField(exist, "request");
+        const existTc = readRawField(existReq, "toolCall");
+        const existTcId = orString(readRawField(existTc, "toolCallId"), "");
+        if (newTcId.length > 0 && existTcId.length > 0 && existTcId == newTcId) {
+          // 新事件若带更完整的后端 intervention id，覆盖旧条目 id，便于 respond 命中真实 id
+          const existServerLike =
+            existId.length > 0 && !existId.startsWith("itv_");
+          const newServerLike = newId.length > 0 && !newId.startsWith("itv_");
+          if (newServerLike && !existServerLike) {
+            const patched = JSON.parse(JSON.stringify(exist)) as UTSJSONObject;
+            patched["id"] = newId;
+            if (newExecuteId.length > 0) {
+              patched["executeId"] = newExecuteId;
+            }
+            msgArr[ii] = patched;
+            const msgObj = messageToJsonObject(list[mi]);
+            msgObj["acpPermissionInteractions"] = msgArr;
+            const rebuilt = buildMessageInfoFromDraft(msgObj);
+            if (rebuilt != null) {
+              list.splice(mi, 1, rebuilt);
+              this.data.messageList.value =
+                reconcileAcpPermissionStatusesInMessageList([...list]);
+              this.streamListDraft = [...this.data.messageList.value];
+              uni.$emit("streamMessageUpdate");
+            }
+            console.log(
+              `[ITV] acp.mount MERGE id ${existId}→${newId} tc=${newTcId}`,
+            );
+            return;
+          }
+          console.log(
+            `[ITV] acp.mount SKIP dup-toolCallId tc=${newTcId} existId=${existId} newId=${newId}`,
+          );
+          return;
+        }
+        const existExecuteId = orString(readRawField(exist, "executeId"), "");
+        if (
+          newExecuteId.length > 0 &&
+          existExecuteId.length > 0 &&
+          existExecuteId == newExecuteId
+        ) {
+          console.log(
+            `[ITV] acp.mount SKIP dup-executeId exec=${newExecuteId} existId=${existId} newId=${newId}`,
+          );
+          return;
+        }
+      }
+    }
+
+    const existingRaw = readRawField(currentMessage, "acpPermissionInteractions");
+    const existing = existingRaw != null ? (existingRaw as any[]) : [];
+    const nextInteractions = ([] as any[]).concat(existing);
+    nextInteractions.push(stored);
+
+    const nmObj = messageToJsonObject(currentMessage);
+    nmObj["acpPermissionInteractions"] = nextInteractions;
+    const newMessage = buildMessageInfoFromDraft(nmObj);
+    if (newMessage == null) {
+      console.log(`[ITV] acp.mount FAIL build-null id=${newId}`);
+      return;
+    }
+    list.splice(index, 1, newMessage);
+
+    this.data.messageList.value =
+      reconcileAcpPermissionStatusesInMessageList([...list]);
+    this.streamListDraft = [...this.data.messageList.value];
+    uni.$emit("streamMessageUpdate");
+    console.log(
+      `[ITV] acp.mount OK id=${newId} tc=${newTcId} msgIdx=${index} total=${nextInteractions.length}`,
+    );
+  }
+
+  /**
+   * MCP Ask 结构化提问事件：把 interaction 挂载到目标消息的 mcpAskInteractions。
+   * 按 requestId 去重，高 revision 覆盖低 revision。
+   */
+  handleMcpAskEvent(
+    interaction: McpAskInteraction,
+    currentMessageId: string,
+  ): void {
+    const list = this.getStreamListDraft();
+    const index = findMessageIndexById(
+      list,
+      currentMessageId,
+      this.data.messageIdRef.value,
+    );
+    if (index < 0) {
+      console.log(
+        `[ITV] ask.mount FAIL no-target reqId=${interaction.requestId} msgId=${currentMessageId} ref=${this.data.messageIdRef.value} listLen=${list.length}`,
+      );
+      return;
+    }
+    const currentMessage = list[index];
+
+    const existingRaw = readRawField(currentMessage, "mcpAskInteractions");
+    const existing = existingRaw != null ? (existingRaw as any[]) : [];
+    const nextInteractions = ([] as any[]).concat(existing);
+
+    // 跨消息去重：同一 requestId 已被挂载（live 与 sub 重放）时直接覆盖到既有位置，
+    // 避免同一提问卡出现在两条消息里。先收集全列表中该 requestId 的最高 revision。
+    let existIndex = -1;
+    let globalMaxRev = 0;
+    for (let mi = 0; mi < list.length; mi++) {
+      const msgInteractions = readRawField(list[mi], "mcpAskInteractions");
+      const msgArr = msgInteractions != null ? (msgInteractions as any[]) : [];
+      for (let ii = 0; ii < msgArr.length; ii++) {
+        const rid = readRawField(msgArr[ii], "requestId");
+        if (rid != null && `${rid}` == interaction.requestId) {
+          const rev = readRawField(msgArr[ii], "revision");
+          const revNum = rev != null ? parseFloat(`${rev}`) : 1;
+          if (revNum > globalMaxRev) globalMaxRev = revNum;
+        }
+      }
+    }
+    for (let i = 0; i < nextInteractions.length; i++) {
+      const rid = readRawField(nextInteractions[i], "requestId");
+      if (rid != null && `${rid}` == interaction.requestId) {
+        existIndex = i;
+        break;
+      }
+    }
+
+    const newRev = interaction.revision != null ? interaction.revision! : 1;
+    if (existIndex >= 0) {
+      const existItem = nextInteractions[existIndex] as McpAskInteraction;
+      const existRev = existItem.revision != null ? existItem.revision! : 1;
+      if (newRev > existRev) {
+        nextInteractions[existIndex] = interaction;
+      } else {
+        console.log(`[ITV] ask.mount SKIP dup reqId=${interaction.requestId}`);
+        return;
+      }
+    } else if (globalMaxRev > 0 && newRev <= globalMaxRev) {
+      // 已在别的消息挂载且 revision 不更高：丢弃，避免重复卡片
+      console.log(`[ITV] ask.mount SKIP dup-cross reqId=${interaction.requestId}`);
+      return;
+    } else {
+      nextInteractions.push(interaction);
+    }
+
+    const nmObj = messageToJsonObject(currentMessage);
+    nmObj["mcpAskInteractions"] = nextInteractions;
+    const newMessage = buildMessageInfoFromDraft(nmObj);
+    if (newMessage == null) {
+      console.log(`[ITV] ask.mount FAIL build-null reqId=${interaction.requestId}`);
+      return;
+    }
+    list.splice(index, 1, newMessage);
+
+    this.data.messageList.value =
+      reconcileAcpPermissionStatusesInMessageList([...list]);
+    this.streamListDraft = [...this.data.messageList.value];
+    uni.$emit("streamMessageUpdate");
+    console.log(
+      `[ITV] ask.mount OK reqId=${interaction.requestId} msgIdx=${index} total=${nextInteractions.length}`,
+    );
+  }
+
   // 获取文件树列表
   async fetchFileList(cId: number): Promise<void> {
     try {
@@ -1451,7 +1860,44 @@ export default class AgentDetailService {
               console.warn("[SSE-Stream] 解析结果无效");
               return;
             }
-            if (readRawField(resultObj, "data") == null) {
+            // [临时诊断] 抓 ASK_QUESTION 原始载荷：PROCESSING 或含 AskQuestion/subEventType 一律打全量 JSON。
+            // 修复 ask-question 不弹 DockPanel 后删除本段。
+            // 注意：诊断绝不能影响正常解析，整段 try/catch；字符串用 orString 保证是 string，
+            // 用 indexOf 而非 .contains（H5 下模板插值非真 string，.contains 会抛 TypeError）。
+            try {
+              const dbgEt = orString(readRawField(resultObj, "eventType"), "");
+              const dbgData = readRawField(resultObj, "data");
+              const dbgSet = orString(readRawField(resultObj, "subEventType"), "");
+              const dbgDataSet = orString(readRawField(dbgData, "subEventType"), "");
+              const dbgName = orString(readRawField(resultObj, "name"), "");
+              const dbgDataName = orString(readRawField(dbgData, "name"), "");
+              const dbgWhole = JSON.stringify(resultObj);
+              const dbgBody = dbgWhole != null ? dbgWhole : "";
+              const dbgHitMcp = isMcpAskToolCallEvent(resultObj);
+              const looksAsk =
+                dbgSet.indexOf("ASK") >= 0 ||
+                dbgDataSet.indexOf("ASK") >= 0 ||
+                dbgName.indexOf("AskQuestion") >= 0 ||
+                dbgDataName.indexOf("AskQuestion") >= 0 ||
+                dbgBody.indexOf("ASK_QUESTION") >= 0 ||
+                dbgBody.indexOf("AskQuestion") >= 0 ||
+                dbgBody.indexOf("补充询问") >= 0;
+              if (dbgEt == "PROCESSING" || looksAsk) {
+                console.log(
+                  `[ITV] ask.raw et=${dbgEt} set=${dbgSet}/${dbgDataSet} name=${dbgName}/${dbgDataName} hitMcp=${dbgHitMcp} len=${dbgBody.length}`,
+                );
+                if (looksAsk) {
+                  console.log(`[ITV] ask.raw.body=${dbgBody}`);
+                }
+              }
+            } catch (_eDbg) {
+              // 诊断失败静默，绝不影响正常消息解析
+            }
+            // 干预事件（ACP 权限/ASK_QUESTION）字段常在 _intervention/result.data，
+            // 顶层 data 可能为 null；须先放行给事件识别，再判缺 data 丢弃。
+            const isInterventionChunk =
+              isAcpPermissionEvent(resultObj) || isMcpAskToolCallEvent(resultObj);
+            if (readRawField(resultObj, "data") == null && !isInterventionChunk) {
               if (shouldSkipSsePayloadWithoutData(resultObj)) {
                 return;
               }
@@ -1957,7 +2403,9 @@ export default class AgentDetailService {
           adaptedMessage.id = id;
           processed.push(attachSpeakableTextToMessage(adaptedMessage));
         }
-        this.data.messageList.value = processed;
+        // sub 重载的历史可能携带 pending 审批/提问：reconcile 后才进入可渲染队列（对齐 main）
+        this.data.messageList.value =
+          reconcileAcpPermissionStatusesInMessageList(processed);
       }
 
       // 与轮询门禁共用 subResumeGate：本轮用户未进列表则不开 sub（四端一致）
@@ -2079,7 +2527,15 @@ export default class AgentDetailService {
           return;
         }
         const resultObj = result;
-        if (readRawField(resultObj, "data") == null) {
+        // 干预事件字段常在 _intervention/result.data，顶层 data 可能为 null；先放行给事件识别
+        const isInterventionChunk =
+          isAcpPermissionEvent(resultObj) || isMcpAskToolCallEvent(resultObj);
+        if (isInterventionChunk) {
+          console.log(
+            `[ITV] sub.chunk et=${readRawField(resultObj, "eventType")} set=${readRawField(resultObj, "subEventType")} hit=1`,
+          );
+        }
+        if (readRawField(resultObj, "data") == null && !isInterventionChunk) {
           if (shouldSkipSsePayloadWithoutData(resultObj)) {
             return;
           }

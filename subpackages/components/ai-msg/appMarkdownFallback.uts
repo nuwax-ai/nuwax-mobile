@@ -15,6 +15,11 @@ import {
   findNextMarkdownCustomProcessTag,
   listMarkdownCustomProcessTags,
 } from "@/utils/markdownCustomProcess.uts";
+import {
+  cacheEntryToRes,
+  getMathCache,
+  putMathCache,
+} from "@/subpackages/components/ai-msg/mathFormulaDiskCache.uts";
 
 type MathRenderedCallback = () => void;
 
@@ -65,6 +70,13 @@ function applyMathResultToToken(token: MarkdownToken, res: UTSJSONObject): void 
   if (heightData != null) token.height = heightData as number;
 }
 
+function mathCacheKey(latex: string, displayMode: boolean): string {
+  if (displayMode == true) {
+    return "d1:" + latex;
+  }
+  return "d0:" + latex;
+}
+
 /** 最近一次根 parse 提交的公式数（0 表示无 batch） */
 let lastMathFlushCount: number = 0;
 
@@ -78,18 +90,25 @@ class PendingMathResult {
   }
 }
 
+/** 同一 latex 去重：一次截图扇出到多个 token */
+class MathDedupeGroup {
+  key: string = "";
+  latex: string = "";
+  displayMode: boolean = true;
+  tokens: MarkdownToken[] = [] as MarkdownToken[];
+}
+
 /**
- * App 专用：并行派发 katexRender（proxy 内 4 槽）。
- * 按 chunk 分批上屏：先出一部分，缩短「全白等齐」时间；末批不足 chunk 也刷。
- * H5 不走此路径（见 parseAppMarkdownFallback / renderMathToken）。
+ * App 专用：并行派发 katexRender（proxy 多槽）。
+ * 命中磁盘缓存则跳过截图；相同 latex 去重；按 chunk 上屏减轻抖动。
  */
 class MathBatchUiRunner {
   jobs: PendingMathJob[];
   onChunkReady: MathRenderedCallback;
   pending: number = 0;
   buffered: PendingMathResult[] = [] as PendingMathResult[];
-  /** 每完成一批（默认 8 条）就上屏，兼顾首屏速度与刷新次数 */
-  chunkSize: number = 8;
+  /** 多条一起刷，减轻历史长文「一张一抖」；仍远小于旧的整页齐套 */
+  chunkSize: number = 4;
 
   constructor(jobs: PendingMathJob[], onChunkReady: MathRenderedCallback) {
     this.jobs = jobs;
@@ -97,10 +116,50 @@ class MathBatchUiRunner {
   }
 
   start(): void {
-    this.pending = this.jobs.length;
-    this.buffered = [] as PendingMathResult[];
+    const groups = [] as MathDedupeGroup[];
+    const hitResults = [] as PendingMathResult[];
     for (let i = 0; i < this.jobs.length; i++) {
-      this.dispatchOne(i);
+      const job = this.jobs[i];
+      const key = mathCacheKey(job.latex, job.displayMode);
+      const cached = getMathCache(key);
+      if (cached != null) {
+        hitResults.push(
+          new PendingMathResult(job.token, cacheEntryToRes(cached)),
+        );
+        continue;
+      }
+      let group: MathDedupeGroup | null = null;
+      for (let g = 0; g < groups.length; g++) {
+        if (groups[g].key == key) {
+          group = groups[g];
+          break;
+        }
+      }
+      if (group == null) {
+        const created = new MathDedupeGroup();
+        created.key = key;
+        created.latex = job.latex;
+        created.displayMode = job.displayMode;
+        groups.push(created);
+        group = created;
+      }
+      group.tokens.push(job.token);
+    }
+
+    if (hitResults.length > 0) {
+      for (let hi = 0; hi < hitResults.length; hi++) {
+        applyMathResultToToken(hitResults[hi].token, hitResults[hi].res);
+      }
+      this.onChunkReady();
+    }
+
+    this.pending = groups.length;
+    this.buffered = [] as PendingMathResult[];
+    if (groups.length == 0) {
+      return;
+    }
+    for (let gi = 0; gi < groups.length; gi++) {
+      this.dispatchGroup(groups[gi]);
     }
   }
 
@@ -117,18 +176,20 @@ class MathBatchUiRunner {
     this.onChunkReady();
   }
 
-  dispatchOne(index: number): void {
-    const job = this.jobs[index];
+  dispatchGroup(group: MathDedupeGroup): void {
     const param = new UTSJSONObject();
     param["action"] = "katexRender";
-    param["pureMathText"] = job.latex;
-    param["displayMode"] = job.displayMode;
+    param["pureMathText"] = group.latex;
+    param["displayMode"] = group.displayMode;
     const runner = this;
-    const token = job.token;
+    const cacheKey = group.key;
+    const tokens = group.tokens;
     proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
-      runner.buffered.push(new PendingMathResult(token, res));
+      putMathCache(cacheKey, res);
+      for (let ti = 0; ti < tokens.length; ti++) {
+        runner.buffered.push(new PendingMathResult(tokens[ti], res));
+      }
       runner.pending = runner.pending - 1;
-      // 凑满 chunk，或已全部完成 → 分批上屏
       if (
         runner.buffered.length >= runner.chunkSize ||
         runner.pending == 0
@@ -140,9 +201,9 @@ class MathBatchUiRunner {
 }
 
 /**
- * App：将收集到的公式并行交给 proxy，按 chunk 分批回调 onChunkReady。
+ * App：将收集到的公式并行交给 proxy；磁盘缓存命中/去重后按 chunk 回调上屏。
  * 无任务时不回调。
- * @returns 提交的公式条数
+ * @returns 提交的公式条数（含仅走缓存的条数）
  */
 function flushMathJobs(onChunkReady: MathRenderedCallback): number {
   const frame =
@@ -1068,6 +1129,20 @@ function renderMathToken(
   if (token.text != safeLatex) {
     token.text = safeLatex;
   }
+  // 磁盘缓存命中：解析阶段直接写回本地路径，冷启动亦可秒开
+  const cacheKey = mathCacheKey(safeLatex, displayMode);
+  const cached = getMathCache(cacheKey);
+  if (cached != null) {
+    applyMathResultToToken(token, cacheEntryToRes(cached));
+    let useAppQueueHit = false;
+    // #ifdef APP
+    useAppQueueHit = true;
+    // #endif
+    if (useAppQueueHit == false) {
+      callback();
+    }
+    return;
+  }
   // App：解析期入队，出口批量截图；H5：不入队，单条即时 katexRender → resultHtml
   let useAppQueue = false;
   // #ifdef APP
@@ -1093,6 +1168,7 @@ function renderMathToken(
   param["pureMathText"] = safeLatex;
   param["displayMode"] = displayMode;
   proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
+    putMathCache(cacheKey, res);
     applyMathResultToToken(token, res);
     callback();
   });

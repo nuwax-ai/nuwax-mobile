@@ -9,6 +9,12 @@ import {
   parseMarkdownImageAt,
   parseStandaloneMarkdownImageLine,
 } from "@/subpackages/components/ai-msg/markdownImage.uts";
+import {
+  extractMarkdownCustomProcessAttribute,
+  findNextMarkdownContainerFence,
+  findNextMarkdownCustomProcessTag,
+  listMarkdownCustomProcessTags,
+} from "@/utils/markdownCustomProcess.uts";
 
 type MathRenderedCallback = () => void;
 
@@ -549,24 +555,12 @@ function makeItem(
   };
 }
 
-/** 读取 markdown-custom-process 标签属性。 */
+/** 读取标签属性（与 markdown-custom-process 共用引号规则）。 */
 function extractCustomProcessAttribute(
   attributes: string,
   name: string,
 ): string {
-  let regex = new RegExp(`${name}="([^"]*)"`, "i");
-  let match = attributes.match(regex);
-  if (match != null && match.length > 1) {
-    const value = match[1];
-    return value != null ? value.replace(/&quot;/g, '"') : "";
-  }
-  regex = new RegExp(`${name}='([^']*)'`, "i");
-  match = attributes.match(regex);
-  if (match != null && match.length > 1) {
-    const value = match[1];
-    return value != null ? value.replace(/&quot;/g, '"') : "";
-  }
-  return "";
+  return extractMarkdownCustomProcessAttribute(attributes, name);
 }
 
 /** 从属性串构造工具调用对象。 */
@@ -583,40 +577,41 @@ function buildCustomProcessItem(attributes: string): UTSJSONObject {
   return item;
 }
 
-/** 解析一个或多个工具调用标签（HTML 与 :::container）。 */
+/** 解析一个或多个工具调用标签（HTML 与 :::container；引号感知）。 */
 function parseCustomProcessTags(source: string): any[] {
   const result: any[] = [];
-  const htmlRegex =
-    /<markdown-custom-process(?!-group)\b([^>]*)>(?:<\/markdown-custom-process>)?|<markdown-custom-process(?!-group)\b([^>]*?)\/>/gi;
-  let match = htmlRegex.exec(source);
-  while (match != null) {
-    const firstAttrs = match.length > 1 ? match[1] : null;
-    const secondAttrs = match.length > 2 ? match[2] : null;
-    const attributes =
-      firstAttrs != null && firstAttrs.length > 0
-        ? firstAttrs
-        : secondAttrs != null
-          ? secondAttrs
-          : "";
-    const item = buildCustomProcessItem(attributes);
-    if (`${item["executeId"]}`.length > 0) {
-      result.push(item);
+  const tags = listMarkdownCustomProcessTags(source);
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tags[i];
+    if (tag.executeId.length == 0) {
+      continue;
     }
-    match = htmlRegex.exec(source);
+    const item = new UTSJSONObject();
+    item["executeId"] = tag.executeId;
+    item["type"] = tag.type;
+    item["status"] = tag.status;
+    item["name"] = tag.name;
+    result.push(item);
   }
   if (result.length > 0) {
     return result;
   }
-  // 兼容历史适配后的 :::container 语法（dev mp-html 原生支持；当前须自行解析）
-  const containerRegex = /:::container\b([^\n]*)\n:::/gi;
-  match = containerRegex.exec(source);
-  while (match != null) {
-    const attributes = match.length > 1 && match[1] != null ? match[1]! : "";
-    const item = buildCustomProcessItem(attributes);
-    if (`${item["executeId"]}`.length > 0) {
+  // 兼容历史适配后的 :::container 语法（可跨多行属性）
+  let from = 0;
+  while (from < source.length) {
+    const fence = findNextMarkdownContainerFence(source, from);
+    if (fence.found != true) {
+      break;
+    }
+    if (fence.executeId.length > 0) {
+      const item = new UTSJSONObject();
+      item["executeId"] = fence.executeId;
+      item["type"] = fence.type;
+      item["status"] = fence.status;
+      item["name"] = fence.name;
       result.push(item);
     }
-    match = containerRegex.exec(source);
+    from = fence.endIndex > from ? fence.endIndex : from + 1;
   }
   return result;
 }
@@ -692,29 +687,110 @@ class CustomProcessExtraction {
   hasCustomBlock: boolean = false;
 }
 
+class CustomBlockHit {
+  index: number = 0;
+  endIndex: number = 0;
+  fullMatch: string = "";
+  kind: string = ""; // process | group | container | task_result
+}
+
+/** 在 from 处找最近的自定义块（引号感知 process / group / container / task-result）。 */
+function findNextCustomBlock(markdown: string, from: number): CustomBlockHit {
+  const hit = new CustomBlockHit();
+  const process = findNextMarkdownCustomProcessTag(markdown, from);
+  const fence = findNextMarkdownContainerFence(markdown, from);
+  const groupMarker = "<markdown-custom-process-group>";
+  const groupIdx = markdown.indexOf(groupMarker, from);
+  const taskIdx = markdown.indexOf("<task-result", from);
+
+  let bestIdx = -1;
+  let kind = "";
+  if (process.found == true) {
+    bestIdx = process.index;
+    kind = "process";
+  }
+  if (fence.found == true && (bestIdx < 0 || fence.index < bestIdx)) {
+    bestIdx = fence.index;
+    kind = "container";
+  }
+  if (groupIdx >= 0 && (bestIdx < 0 || groupIdx < bestIdx)) {
+    bestIdx = groupIdx;
+    kind = "group";
+  }
+  if (taskIdx >= 0 && (bestIdx < 0 || taskIdx < bestIdx)) {
+    bestIdx = taskIdx;
+    kind = "task_result";
+  }
+  if (bestIdx < 0 || kind.length == 0) {
+    return hit;
+  }
+
+  if (kind == "process") {
+    hit.index = process.index;
+    hit.endIndex = process.endIndex;
+    hit.fullMatch = process.fullMatch;
+    hit.kind = kind;
+    return hit;
+  }
+  if (kind == "container") {
+    hit.index = fence.index;
+    hit.endIndex = fence.endIndex;
+    hit.fullMatch = fence.fullMatch;
+    hit.kind = kind;
+    return hit;
+  }
+  if (kind == "group") {
+    const closeMarker = "</markdown-custom-process-group>";
+    const closeIdx = markdown.indexOf(closeMarker, groupIdx + groupMarker.length);
+    if (closeIdx < 0) {
+      // 残缺 group 开标签：跳过继续找，避免挡住后续合法块
+      return findNextCustomBlock(markdown, groupIdx + 1);
+    }
+    hit.index = groupIdx;
+    hit.endIndex = closeIdx + closeMarker.length;
+    hit.fullMatch = markdown.substring(hit.index, hit.endIndex);
+    hit.kind = kind;
+    return hit;
+  }
+  // task_result：沿用非贪婪闭合
+  const taskSlice = markdown.substring(taskIdx);
+  const taskMatch = taskSlice.match(
+    /^<task-result\b[^>]*>[\s\S]*?<\/task-result>/i,
+  );
+  if (taskMatch == null || taskMatch[0] == null) {
+    return findNextCustomBlock(markdown, taskIdx + 1);
+  }
+  hit.index = taskIdx;
+  hit.endIndex = taskIdx + taskMatch[0]!.length;
+  hit.fullMatch = taskMatch[0]!;
+  hit.kind = kind;
+  return hit;
+}
+
 /**
  * 将正文结构化拆分为 Markdown 片段与工具片段。
  * 不向原文注入任何占位字符串。
  * 同时识别：
- * - <div><markdown-custom-process/></div>（PC/历史原文）
+ * - <div><markdown-custom-process/></div>（PC/历史原文；name 可含 >）
  * - <markdown-custom-process/> / group
  * - :::container ...\n:::（历史适配后的移动端语法）
  * - <task-result>
  */
 function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
   const extraction = new CustomProcessExtraction();
-  const regex =
-    /<(?:div|p)\b[^>]*>\s*<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?\s*<\/(?:div|p)>|<markdown-custom-process-group>[\s\S]*?<\/markdown-custom-process-group>|<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?|:::container\b[^\n]*\n:::|<task-result\b[^>]*>[\s\S]*?<\/task-result>/gi;
   let cursor = 0;
-  let match = regex.exec(markdown);
-  while (match != null) {
-    const fullMatch = match[0] != null ? match[0]! : "";
-    const markdownBefore = markdown.substring(cursor, match.index);
+  while (cursor < markdown.length) {
+    const hit = findNextCustomBlock(markdown, cursor);
+    if (hit.kind.length == 0) {
+      break;
+    }
+    const markdownBefore = markdown.substring(cursor, hit.index);
     if (markdownBefore.length > 0) {
       const markdownSegment = new CustomProcessSegment();
       markdownSegment.markdown = markdownBefore;
       extraction.segments.push(markdownSegment);
     }
+    const fullMatch = hit.fullMatch;
     const taskResultData = parseFallbackTaskResultData(fullMatch);
     const processList = parseCustomProcessTags(fullMatch);
     if (taskResultData != null || processList.length > 0) {
@@ -724,8 +800,7 @@ function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
         block.taskResultData = taskResultData;
       } else {
         block.type =
-          fullMatch.indexOf("<markdown-custom-process-group>") >= 0 ||
-          processList.length > 1
+          hit.kind == "group" || processList.length > 1
             ? "markdown_custom_process_group"
             : "markdown_custom_process";
       }
@@ -739,8 +814,7 @@ function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
       fallbackSegment.markdown = fullMatch;
       extraction.segments.push(fallbackSegment);
     }
-    cursor = regex.lastIndex;
-    match = regex.exec(markdown);
+    cursor = hit.endIndex > cursor ? hit.endIndex : cursor + 1;
   }
   const markdownAfter = markdown.substring(cursor);
   if (markdownAfter.length > 0) {

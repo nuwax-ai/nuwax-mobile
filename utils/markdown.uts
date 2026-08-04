@@ -1,4 +1,9 @@
-import { firstNullableString, orEmpty } from "@/utils/utsCoalesce";
+import { orEmpty } from "@/utils/utsCoalesce";
+import {
+  findNextMarkdownContainerFence,
+  findNextMarkdownCustomProcessTag,
+  toMarkdownCustomProcessHtml,
+} from "@/utils/markdownCustomProcess.uts";
 
 class MathDelimiter {
   left: string = "";
@@ -124,41 +129,98 @@ class MarkdownContainerMatch {
   fullMatch: string = "";
   tagMatch: string = "";
   isPlan: boolean = false;
+  type: string = "";
+  status: string = "";
+  name: string = "";
+}
+
+function expandLeadingWhitespace(text: string, index: number): number {
+  let i = index;
+  while (i > 0) {
+    const ch = text.charAt(i - 1);
+    if (ch == " " || ch == "\n" || ch == "\r" || ch == "\t") {
+      i--;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+/** 按出现顺序收集 HTML / :::container 过程块（引号感知，允许 name 含 >）。 */
+function collectMarkdownContainerMatches(
+  text: string,
+): MarkdownContainerMatch[] {
+  const matches: MarkdownContainerMatch[] = [];
+  let from = 0;
+  while (from < text.length) {
+    const htmlTag = findNextMarkdownCustomProcessTag(text, from);
+    const fence = findNextMarkdownContainerFence(text, from);
+    const htmlFound = htmlTag.found == true;
+    const fenceFound = fence.found == true;
+    if (htmlFound != true && fenceFound != true) {
+      break;
+    }
+    let useHtml = false;
+    if (htmlFound == true && fenceFound == true) {
+      useHtml = htmlTag.index <= fence.index;
+    } else {
+      useHtml = htmlFound == true;
+    }
+    const item = new MarkdownContainerMatch();
+    if (useHtml == true) {
+      if (htmlTag.executeId.length == 0) {
+        from = htmlTag.endIndex > from ? htmlTag.endIndex : from + 1;
+        continue;
+      }
+      item.index = expandLeadingWhitespace(text, htmlTag.index);
+      item.endIndex = htmlTag.endIndex;
+      item.executeId = htmlTag.executeId;
+      item.fullMatch = text.substring(item.index, item.endIndex);
+      item.tagMatch = htmlTag.tagMatch;
+      item.type = htmlTag.type;
+      item.status = htmlTag.status;
+      item.name = htmlTag.name;
+      item.isPlan = htmlTag.type == "Plan";
+      matches.push(item);
+      from = htmlTag.endIndex > from ? htmlTag.endIndex : from + 1;
+    } else {
+      if (fence.executeId.length == 0) {
+        from = fence.endIndex > from ? fence.endIndex : from + 1;
+        continue;
+      }
+      item.index = expandLeadingWhitespace(text, fence.index);
+      item.endIndex = fence.endIndex;
+      item.executeId = fence.executeId;
+      item.fullMatch = text.substring(item.index, item.endIndex);
+      item.tagMatch = fence.fullMatch;
+      item.type = fence.type;
+      item.status = fence.status;
+      item.name = fence.name;
+      item.isPlan = fence.type == "Plan";
+      matches.push(item);
+      from = fence.endIndex > from ? fence.endIndex : from + 1;
+    }
+  }
+  return matches;
+}
+
+function normalizeContainerTag(m: MarkdownContainerMatch): string {
+  return toMarkdownCustomProcessHtml(
+    m.executeId,
+    orEmpty(m.type),
+    orEmpty(m.status),
+    orEmpty(m.name),
+  );
 }
 
 function dedupeMarkdownContainers(text: string): string {
   if (text.length === 0) return "";
 
-  const blockRegex =
-    /(?:[\r\n\s]*)(?:(?:<(?:div|p)\b[^>]*>)?\s*(<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>|\/>)?)\s*(?:<\/(?:div|p)>)?|(:::container\b[^\n]*?\n:::))/g;
-
-  const matches: MarkdownContainerMatch[] = [];
-
+  const matches = collectMarkdownContainerMatches(text);
   const lastIndexMap = new Map<string, number>();
-  let match = blockRegex.exec(text);
-  while (match != null) {
-    const fullMatch = match[0];
-    // Android：未命中的捕获组为 null，禁止 as any
-    const g1 = match.length > 1 ? match[1] : null;
-    const g2 = match.length > 2 ? match[2] : null;
-    const tagMatch = firstNullableString([g1, g2]);
-    const executeId = extractAttribute(tagMatch, "executeId");
-
-    if (executeId.length > 0) {
-      const type = extractAttribute(tagMatch, "type");
-      const isPlan = type === "Plan";
-
-      const item = new MarkdownContainerMatch();
-      item.index = match.index;
-      item.endIndex = blockRegex.lastIndex;
-      item.executeId = executeId;
-      item.fullMatch = orEmpty(fullMatch);
-      item.tagMatch = tagMatch;
-      item.isPlan = isPlan;
-      matches.push(item);
-      lastIndexMap.set(executeId, match.index);
-    }
-    match = blockRegex.exec(text);
+  for (let i = 0; i < matches.length; i++) {
+    lastIndexMap.set(matches[i].executeId, matches[i].index);
   }
 
   const ignoreMatchIndices = new Set<number>();
@@ -213,7 +275,7 @@ function dedupeMarkdownContainers(text: string): string {
  * 2. 中间包含“执行计划”的不合并（作为分隔符）
  * 3. 标签间只包含空白字符时不中断合并
  * 4. 支持 :::container 语法和 PC 端的 HTML 标签语法
- * @param text - 待处理 of Markdown 文本
+ * @param text - 待处理的 Markdown 文本
  * @returns 处理后的文本
  */
 export function groupMarkdownContainers(text: string): string {
@@ -221,11 +283,7 @@ export function groupMarkdownContainers(text: string): string {
 
   // 预处理：合并连续相同的 Plan 并去重重复的自定义容器
   const dedupedText = dedupeMarkdownContainers(text);
-
-  // 1. 匹配 HTML 格式的过程标签 (markdown-custom-process)
-  // 2. 匹配 :::container 格式的标签
-  const blockRegex =
-    /(?:[\r\n\s]*)(?:(?:<(?:div|p)\b[^>]*>)?\s*(<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>|\/>)?)\s*(?:<\/(?:div|p)>)?|(:::container\b[^\n]*?\n:::))/g;
+  const matches = collectMarkdownContainerMatches(dedupedText);
 
   let result = "";
   let lastIndex = 0;
@@ -248,10 +306,8 @@ export function groupMarkdownContainers(text: string): string {
     }
   };
 
-  let count = 0;
-  let match = blockRegex.exec(dedupedText);
-  while (match != null) {
-    count++;
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
     const textBefore = dedupedText.slice(lastIndex, match.index);
 
     if (textBefore.trim() !== "") {
@@ -263,35 +319,10 @@ export function groupMarkdownContainers(text: string): string {
       }
     }
 
-    // Android：未命中的捕获组为 null，禁止 as any
-    const g1b = match.length > 1 ? match[1] : null;
-    const g2b = match.length > 2 ? match[2] : null;
-    let tagMatch = firstNullableString([g1b, g2b]);
+    const tagMatch = match.tagMatch;
+    const normalizedTag = normalizeContainerTag(match);
 
-    // 为了分组显示，我们依然需要一份规范化后的 HTML 标签
-    let normalizedTag = "";
-    if (tagMatch.startsWith(":::container")) {
-      const executeId = extractAttribute(tagMatch, "executeId");
-      const type = extractAttribute(tagMatch, "type");
-      const status = extractAttribute(tagMatch, "status");
-      const name = extractAttribute(tagMatch, "name");
-      const safeName = name.replace(/"/g, "&quot;");
-      normalizedTag = `<markdown-custom-process executeid="${executeId}" type="${orEmpty(type)}" status="${orEmpty(status)}" name="${safeName}"></markdown-custom-process>`;
-    } else {
-      normalizedTag = tagMatch;
-      if (
-        !normalizedTag.includes("</markdown-custom-process>") &&
-        !normalizedTag.endsWith("/>")
-      ) {
-        normalizedTag = normalizedTag.replace(
-          ">",
-          "></markdown-custom-process>",
-        );
-      }
-    }
-
-    const isPlan = /type=["']Plan["']/.test(normalizedTag);
-    if (isPlan) {
+    if (match.isPlan == true) {
       flushGroup();
       // Plan 不参与工具分组；须输出规范化 HTML，供 UniAiXMsg 识别为 markdown_custom_process。
       // （旧 mp-html 路径可直接吃 :::container；当前渲染链路只识别 <markdown-custom-process>）
@@ -301,8 +332,7 @@ export function groupMarkdownContainers(text: string): string {
       normalizedGroup.push(normalizedTag);
     }
 
-    lastIndex = blockRegex.lastIndex;
-    match = blockRegex.exec(dedupedText);
+    lastIndex = match.endIndex;
   }
 
   flushGroup();
@@ -310,25 +340,6 @@ export function groupMarkdownContainers(text: string): string {
 
   const finalResult = result.replace(/\n{3,}/g, "\n\n").trim();
   return finalResult;
-}
-
-/**
- * 从属性字符串中提取指定属性的值
- */
-function extractAttribute(attrString: string, attrName: string): string {
-  // 先尝试双引号
-  let regex = new RegExp(`${attrName}="([^"]*)"`);
-  let match = attrString.match(regex);
-  if (match != null) {
-    return orEmpty(match[1]).replace(/&quot;/g, '"');
-  }
-  // 再尝试单引号
-  regex = new RegExp(`${attrName}='([^']*)'`);
-  match = attrString.match(regex);
-  if (match != null) {
-    return orEmpty(match[1]).replace(/&quot;/g, '"');
-  }
-  return "";
 }
 
 // 新的数学公式替换函数 - 直接替换为 $$ 分隔符

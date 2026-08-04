@@ -63,6 +63,9 @@ export class EspProvisioningController {
   private pendingSsid = '';
   private pendingPassword = '';
   private retryAction: ProvisionRetryActionEnum = ProvisionRetryActionEnum.NONE;
+  // 仅当本次 WiFi 下发已开始、等待结果时发生断连，才允许重连后恢复设备终态。
+  // 用户修改 WiFi 后发起的是新尝试，不能消费 device-info 中上一次遗留的失败结果。
+  private recoverOutcomeOnReconnect = false;
   // 本次配网会话内已绑定设备的缓存：RECONNECT 重连后跳过二次 bind，复用已下发密钥，
   // 避免后端对已绑设备返错（mock 1002）或重置 secret。仅内存持有，dispose 清空。
   private boundDeviceId = '';
@@ -149,6 +152,8 @@ export class EspProvisioningController {
     ssid: string = '',
     password: string = '',
   ): Promise<boolean> {
+    const recoverPreviousOutcome = this.recoverOutcomeOnReconnect;
+    this.recoverOutcomeOnReconnect = false;
     this.ensureActive();
     this.stopScan();
     this.currentDevice = device;
@@ -230,11 +235,9 @@ export class EspProvisioningController {
           return false;
         }
         this.deviceInfo.value = info;
-        // 配网重试 gap B（已在 retry() 修复）：applyRecoveredOutcome 命中设备上报的 lastProvisioningOutcome
-        // （auth_failed/network_not_found/timeout 等）时 fail(REWRITE) 并 return true → 本函数 return false。
-        // retry() 的 RECONNECT 分支据此判断 retryAction==REWRITE → 清失败态 fall-through 直接 provision，
-        // 无需用户再点第二次。本函数行为不变（仍 return false）。
-        if (this.applyRecoveredOutcome(info)) return false;
+        // lastProvisioningOutcome 是设备保存的最近一次终态。仅断连恢复当前尝试时消费；
+        // 新凭据尝试若无条件消费，会被上一次 auth_failed 提前中止，导致新密码根本没有下发。
+        if (recoverPreviousOutcome && this.applyRecoveredOutcome(info)) return false;
         this.phase.value = EspProvisioningPhaseEnum.READY;
         this.busy.value = false;
         return true;
@@ -259,6 +262,8 @@ export class EspProvisioningController {
    * 后续校验 capabilities / 读 device-info 与 selectAndPrepare 一致。成功 phase=READY。
    */
   async selectAndPrepareFromQr(): Promise<boolean> {
+    const recoverPreviousOutcome = this.recoverOutcomeOnReconnect;
+    this.recoverOutcomeOnReconnect = false;
     this.ensureActive();
     const qr = getQrPayload();
     if (qr == null) {
@@ -336,11 +341,8 @@ export class EspProvisioningController {
           return false;
         }
         this.deviceInfo.value = info;
-        // 配网重试 gap B（已在 retry() 修复）：applyRecoveredOutcome 命中设备上报的 lastProvisioningOutcome
-        // （auth_failed/network_not_found/timeout 等）时 fail(REWRITE) 并 return true → 本函数 return false。
-        // retry() 的 RECONNECT 分支据此判断 retryAction==REWRITE → 清失败态 fall-through 直接 provision，
-        // 无需用户再点第二次。本函数行为不变（仍 return false）。
-        if (this.applyRecoveredOutcome(info)) return false;
+        // 与手动扫描链路一致：新尝试忽略历史终态，仅断连恢复当前尝试时消费。
+        if (recoverPreviousOutcome && this.applyRecoveredOutcome(info)) return false;
         this.phase.value = EspProvisioningPhaseEnum.READY;
         this.busy.value = false;
         return true;
@@ -408,6 +410,7 @@ export class EspProvisioningController {
     this.pendingPassword = password;
     this.error.value = null;
     this.busy.value = true;
+    this.recoverOutcomeOnReconnect = false;
     try {
       await this.client.provision(ssid, password);
       this.connectedSsid.value = ssid;
@@ -415,6 +418,7 @@ export class EspProvisioningController {
       this.retryAction = ProvisionRetryActionEnum.NONE;
     } catch (e) {
       const err = this.asEspError(e);
+      this.recoverOutcomeOnReconnect = err.code == EspProvisioningErrorCodeEnum.DISCONNECTED;
       const action = err.code == EspProvisioningErrorCodeEnum.DISCONNECTED
         ? ProvisionRetryActionEnum.RECONNECT
         : ProvisionRetryActionEnum.REWRITE;
@@ -616,6 +620,7 @@ export class EspProvisioningController {
     this.client.dispose();
     this.pendingSsid = '';
     this.pendingPassword = '';
+    this.recoverOutcomeOnReconnect = false;
     this.currentDevice = null;
     this.boundDeviceId = '';
     this.boundSecret = '';

@@ -156,12 +156,8 @@
             // console.log('web 内部执行了 onMessage', param);
             const { action } = param;
 
-            if (typeof this[action] !== 'function') {
-              console.error('不支持的 e.action', action);
-              throw new Error('不支持的 e.action: ' + action);
-            }
-
             // KaTeX：有限并行（多容器），避免串行队列让公式逐个冒泡、反复撑高滚底
+            // 须在 typeof this[action] 之前处理：batch 走 runKatexBatch，类上无同名方法
             if (action === 'katexRender') {
               this.runKatexJob(param).catch(error => {
                 this.postMessage({
@@ -173,6 +169,24 @@
                 });
               });
               return;
+            }
+            // 历史/整段：一次桥接批量渲，宿主可等齐后单次提交 UI
+            if (action === 'katexRenderBatch') {
+              this.runKatexBatch(param).catch(error => {
+                this.postMessage({
+                  action: `${action}_callback_${param.requestId}`,
+                  param: {
+                    results: [],
+                    error: error != null && error.message != null ? error.message : 'katex_batch_failed'
+                  }
+                });
+              });
+              return;
+            }
+
+            if (typeof this[action] !== 'function') {
+              console.error('不支持的 e.action', action);
+              throw new Error('不支持的 e.action: ' + action);
             }
 
             try {
@@ -273,6 +287,85 @@
             } finally {
               this.releaseKatexSlot(slot);
             }
+          }
+
+          /**
+           * 批量公式：内部仍走并行槽位，但只 postMessage 一次。
+           * items: [{ id, pureMathText, displayMode }]
+           */
+          async runKatexBatch(param) {
+            const requestId = param.requestId;
+            const items = param.items != null && Array.isArray(param.items) ? param.items : [];
+            const results = new Array(items.length);
+            await Promise.all(
+              items.map(async (item, index) => {
+                const slot = await this.acquireKatexSlot();
+                try {
+                  results[index] = await this.katexRenderToResult(item, slot);
+                } catch (error) {
+                  results[index] = {
+                    id: item != null && item.id != null ? item.id : '' + index,
+                    imageDataURL: '',
+                    resultHtml: '',
+                    width: null,
+                    height: null,
+                    error: error != null && error.message != null ? error.message : 'katex_item_failed'
+                  };
+                } finally {
+                  this.releaseKatexSlot(slot);
+                }
+              })
+            );
+            this.postMessage({
+              action: 'katexRenderBatch_callback_' + requestId,
+              param: { results }
+            });
+          }
+
+          /** 渲染单条公式并返回结果对象（不 postMessage） */
+          async katexRenderToResult(item, slotIndex = 0) {
+            const id = item != null && item.id != null ? item.id : '';
+            let pureMathText = item != null && item.pureMathText != null ? item.pureMathText : '';
+            pureMathText = pureMathText.replace(/\\\\/g, '\\');
+            const useDisplayMode = item == null || item.displayMode !== false;
+            const resultHtml = katex.renderToString(pureMathText, {
+              throwOnError: false,
+              displayMode: useDisplayMode,
+              output: 'html',
+              trust: true,
+              strict: 'ignore'
+            });
+            const htmlForCapture = useDisplayMode
+              ? resultHtml
+              : '<span class="katex-inline-wrap" style="display:inline-block;font-size:16px;line-height:1.25;padding:1px 6px 1px 1px;">' +
+                resultHtml +
+                '</span>';
+            let imageDataURL = '';
+            let cssWidth = 0;
+            let cssHeight = 0;
+            if (!parentIsWeb) {
+              const containerEl = this.getCaptureContainer(slotIndex);
+              const shot = await this.html2Base64(
+                htmlForCapture,
+                2,
+                true,
+                !useDisplayMode,
+                containerEl
+              );
+              imageDataURL = shot != null && shot.dataUrl != null ? shot.dataUrl : '';
+              cssWidth = shot != null && shot.width != null ? shot.width : 0;
+              cssHeight = shot != null && shot.height != null ? shot.height : 0;
+            }
+            return {
+              id,
+              imageDataURL: parentIsWeb ? null : imageDataURL,
+              width: cssWidth > 0 ? cssWidth : null,
+              height: cssHeight > 0 ? cssHeight : null,
+              resultHtml: parentIsWeb ? resultHtml : '',
+              error: (!parentIsWeb && (imageDataURL == null || imageDataURL.length < 32))
+                ? 'empty_image'
+                : ''
+            };
           }
 
           /**
@@ -413,49 +506,10 @@
 
           async katexRender({ pureMathText, requestId, displayMode }, slotIndex = 0) {
             try {
-              // 把 \\ 替换为 \
-              pureMathText = pureMathText.replace(/\\\\/g, '\\');
-              // 表格单元格 / 标题行内公式用 displayMode=false，避免过大且更贴近正文
-              const useDisplayMode = displayMode !== false;
-              const resultHtml = katex.renderToString(pureMathText, {
-                  throwOnError: false,
-                  displayMode: useDisplayMode, // true 为块级公式 \[ \]，false 为行内公式 \( \)
-                  output: 'html',
-                  trust: true, // 允许一些不安全的命令
-                  strict: 'ignore' // 是否严格模式
-              });
-              // 行内公式包一层字号，贴近标题/正文（约 16px）
-              const htmlForCapture = useDisplayMode
-                ? resultHtml
-                : '<span class="katex-inline-wrap" style="display:inline-block;font-size:16px;line-height:1.25;padding:1px 6px 1px 1px;">' +
-                  resultHtml +
-                  '</span>';
-              // parentIsWeb = false 时，才需要转换为图片
-              let imageDataURL = '';
-              let cssWidth = 0;
-              let cssHeight = 0;
-              if (!parentIsWeb) {
-                const containerEl = this.getCaptureContainer(slotIndex);
-                const shot = await this.html2Base64(
-                  htmlForCapture,
-                  2,
-                  true,
-                  !useDisplayMode,
-                  containerEl
-                );
-                imageDataURL = shot != null && shot.dataUrl != null ? shot.dataUrl : '';
-                cssWidth = shot != null && shot.width != null ? shot.width : 0;
-                cssHeight = shot != null && shot.height != null ? shot.height : 0;
-              }
-              const param = {
-                imageDataURL: parentIsWeb ? null : imageDataURL,
-                width: cssWidth > 0 ? cssWidth : null,
-                height: cssHeight > 0 ? cssHeight : null,
-                resultHtml: parentIsWeb ? resultHtml : '',
-                error: (!parentIsWeb && (imageDataURL == null || imageDataURL.length < 32))
-                  ? 'empty_image'
-                  : ''
-              }
+              const param = await this.katexRenderToResult(
+                { id: '', pureMathText, displayMode },
+                slotIndex
+              );
               this.postMessage({
                 action: "katexRender_callback_" + requestId,
                 param

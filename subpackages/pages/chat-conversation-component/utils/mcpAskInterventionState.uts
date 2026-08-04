@@ -52,12 +52,23 @@ function asReadableMcp(interaction: any): UTSJSONObject {
     if (typed.errorMessage != null) out["errorMessage"] = typed.errorMessage;
     if (typed.triggeredAt != null) out["triggeredAt"] = typed.triggeredAt;
     if (typed.ui != null) {
-      // ui 含枚举/嵌套，JSON 往返成可读 UTSJSONObject 供卡片/审批 readRawField
-      try {
-        out["ui"] = JSON.parse(JSON.stringify(typed.ui));
-      } catch (_eUi) {
-        out["ui"] = null;
-      }
+      // ui 是 InteractionUiSchema class 实例：禁止 JSON.stringify(class)（Android 丢嵌套 fields）。
+      // 手工逐字段抄成 UTSJSONObject；fields/steps/fallback 元素本就是 SSE JSON 来的
+      // UTSJSONObject，直接引用透传即可（天然 readRawField 可读），卡片侧
+      // createInteractionUiSchemaFromAny 会重建 class 供 parseInteractionFields 消费。
+      const uiObj = new UTSJSONObject();
+      uiObj["version"] = orString(typed.ui.version, "");
+      uiObj["presentation"] = orString(`${typed.ui.presentation}`, "inline");
+      uiObj["title"] = orString(typed.ui.title, "");
+      if (typed.ui.description != null) uiObj["description"] = typed.ui.description;
+      if (typed.ui.fields != null) uiObj["fields"] = typed.ui.fields;
+      if (typed.ui.steps != null) uiObj["steps"] = typed.ui.steps;
+      if (typed.ui.submitLabel != null) uiObj["submitLabel"] = typed.ui.submitLabel;
+      if (typed.ui.cancelLabel != null) uiObj["cancelLabel"] = typed.ui.cancelLabel;
+      if (typed.ui.allowSkip != null) uiObj["allowSkip"] = typed.ui.allowSkip;
+      if (typed.ui.skipLabel != null) uiObj["skipLabel"] = typed.ui.skipLabel;
+      if (typed.ui.fallback != null) uiObj["fallback"] = typed.ui.fallback;
+      out["ui"] = uiObj;
     }
   } catch (_eClass) {
     // 既非可读对象也非 class：返回空壳（调用方 readRawField 得空，安全跳过）
@@ -152,12 +163,46 @@ const readMcpAskRequestIdFromRawInput = (rawInput: any | null): string | null =>
  * 「keeps the approval card even when its executeId is no longer the focus」）。
  * 队列侧仅依据 responseStatus；已审批/失效态由 reconcileAcpPermissionStatus 在 messageList 更新时标为 submitted。
  */
+/**
+ * 干预指纹：只读各 interaction 的标量（id/status/revision），不读正文。
+ * 流式纯文本 chunk 到来时 messageList 整体替换但干预集合不变 → 指纹不变 → 命中缓存，
+ * 跳过全量深拷贝/排序/MCP 全表文本扫描（这是 ask-question 出现后卡顿的主因）。
+ */
+function interventionsFingerprint(messageList: MessageInfo[]): string {
+  const messages = orArray<MessageInfo>(messageList);
+  let fp = `${messages.length}:`;
+  for (let i = 0; i < messages.length; i++) {
+    const acps = orArray<any>(messages[i].acpPermissionInteractions);
+    for (let j = 0; j < acps.length; j++) {
+      const id = orString(readRawField(acps[j], "id"), "");
+      const st = orString(readRawField(acps[j], "responseStatus"), "");
+      fp += `a${id}|${st};`;
+    }
+    const asks = orArray<any>(messages[i].mcpAskInteractions);
+    for (let j = 0; j < asks.length; j++) {
+      const rid = orString(readRawField(asks[j], "requestId"), "");
+      const st = orString(readRawField(asks[j], "responseStatus"), "");
+      const rev = orNumber(readRawField(asks[j], "revision"), 1);
+      fp += `m${rid}|${st}|${rev};`;
+    }
+  }
+  return fp;
+}
+
+let _queueCacheKey: string = "";
+let _queueCache: UTSJSONObject[] = [];
+
 export const getActiveInterventionQueue = (
   messageList: MessageInfo[],
 ): UTSJSONObject[] => {
   // queue item 必须是 UTSJSONObject（bracket 可读）：联合 interface InterventionQueueItem 在
   // Android 上编译为既非 Map 也非 UTSJSONObject 的结构，readRawField 读不到字段，
   // 会导致下游 getFrontInterventionSnapshot/frontInterventionKey 恒空、dockPanel 不渲染。
+  // 记忆化：指纹未变（流式纯文本 chunk）直接返回缓存，避免每 40ms 全量重算。
+  const fp = interventionsFingerprint(messageList);
+  if (fp == _queueCacheKey) {
+    return _queueCache;
+  }
   const pendingMap = new Map<string, UTSJSONObject>();
   const permissionPendingToolCallIds = new Set<string>();
   const permissionPendingAskRequestIds = new Set<string>();
@@ -262,16 +307,9 @@ export const getActiveInterventionQueue = (
     orNumber(readRawField(a, "sortKey"), 0) -
     orNumber(readRawField(b, "sortKey"), 0),
   );
-  // 诊断：Android 上 interaction 若为 UTSJSONObject 被误读会导致队列恒空。
-  let acpRawCount = 0;
-  let mcpRawCount = 0;
-  messages.forEach((m: MessageInfo) => {
-    acpRawCount += orArray<any>(m.acpPermissionInteractions).length;
-    mcpRawCount += orArray<any>(m.mcpAskInteractions).length;
-  });
-  console.log(
-    `[InterventionQueue] size=${sorted.length} acpRaw=${acpRawCount} mcpRaw=${mcpRawCount} msgs=${messages.length}`,
-  );
+  // 写缓存：指纹对应的队列结果（同一引用，下游只读不改，安全）
+  _queueCacheKey = fp;
+  _queueCache = sorted;
   return sorted;
 };
 

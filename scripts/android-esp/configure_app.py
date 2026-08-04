@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -21,8 +22,13 @@ from local_base_paths import default_android_esp_work
 
 WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
 PROJ = WORK / "project"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APPID = os.environ.get("APPID", "__UNI__8BF05E4")
 BUNDLE = os.environ.get("ANDROID_BUNDLE_ID", "com.nuwax.nuwa")
+APP_NAME = os.environ.get(
+    "APP_NAME",
+    json.loads((PROJECT_ROOT / "manifest.json").read_text())["name"],
+)
 APPKEY = os.environ.get("DCLOUD_APPKEY")
 if not APPKEY:
     raise SystemExit("✗ 未设置 DCLOUD_APPKEY（写到 scripts/local-secrets.env，已 gitignore）")
@@ -33,6 +39,12 @@ ENABLE_HX_DEBUG = os.environ.get("ENABLE_HX_DEBUG", "1") != "0"
 # 官方示例默认 compileSdk 36；本机需已装 platforms;android-36
 COMPILE_SDK = int(os.environ.get("ANDROID_COMPILE_SDK", "36"))
 TARGET_SDK = int(os.environ.get("ANDROID_TARGET_SDK", str(COMPILE_SDK)))
+APP_RESOURCES_DIR = Path(
+    os.environ.get(
+        "APP_RESOURCES_DIR",
+        PROJECT_ROOT / "unpackage/resources/app-android",
+    )
+)
 
 SAMPLE_MODULES = [
     "test-invoke-network-api",
@@ -260,8 +272,220 @@ def configure_manifest() -> None:
     # scheme
     text = text.replace("hellouniappx", "nuwax")
     text = text.replace("uniappxhello", "nuwaxapp")
+    text = text.replace(
+        '@style/UniAppX.Activity.DefaultTheme',
+        '@style/Theme.Nuwax.UniAppContent',
+    )
     p.write_text(text)
     print(f"✓ uniappx AndroidManifest appid={APPID} dcloud_appkey=***")
+
+
+def upsert_style(
+    resources: ET.Element,
+    name: str,
+    parent: str,
+    items: dict[str, str],
+) -> None:
+    """新增或更新 Android style，并保持脚本重复执行时结果稳定。"""
+    style = next(
+        (node for node in resources.findall("style") if node.get("name") == name),
+        None,
+    )
+    if style is None:
+        style = ET.SubElement(resources, "style", {"name": name, "parent": parent})
+    else:
+        style.set("parent", parent)
+
+    existing = {node.get("name"): node for node in style.findall("item")}
+    for item_name, value in items.items():
+        node = existing.get(item_name)
+        if node is None:
+            node = ET.SubElement(style, "item", {"name": item_name})
+        node.text = value
+
+
+def write_resources_xml(path: Path, root: ET.Element) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ET.indent(root, space="    ")
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def configure_app_name() -> None:
+    """让离线 Android 宿主使用 manifest.json 中的应用显示名称。"""
+    strings_path = PROJ / "app/src/main/res/values/strings.xml"
+    if strings_path.is_file():
+        tree = ET.parse(strings_path)
+        resources = tree.getroot()
+    else:
+        resources = ET.Element("resources")
+
+    app_name = next(
+        (
+            node
+            for node in resources.findall("string")
+            if node.get("name") == "app_name"
+        ),
+        None,
+    )
+    if app_name is None:
+        app_name = ET.SubElement(resources, "string", {"name": "app_name"})
+    app_name.text = APP_NAME
+    write_resources_xml(strings_path, resources)
+    print(f"✓ Android 应用名称={APP_NAME}")
+
+
+def configure_splash_screen() -> None:
+    """
+    把 appResource 中的 Splash 图片注入离线 Android 宿主。
+
+    manifest.json 的 splashScreens 属于云打包配置；离线 SDK 不会自动把这些
+    Web 资源转换为 Android drawable/theme，因此 android:tester 必须显式同步。
+    """
+    src_root = APP_RESOURCES_DIR / APPID / "www/static/splash"
+    res_root = PROJ / "app/src/main/res"
+    densities = ("xhdpi", "xxhdpi", "xxxhdpi")
+
+    required = [src_root / f"launch-{density}.png" for density in densities]
+    required += [src_root / f"icon-{density}.png" for density in densities]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        die("缺少 Android 启动页资源：\n  " + "\n  ".join(missing))
+
+    for density in densities:
+        drawable = res_root / f"drawable-{density}"
+        drawable.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            src_root / f"launch-{density}.png",
+            drawable / "nuwax_splash_screen.png",
+        )
+        shutil.copy2(
+            src_root / f"icon-{density}.png",
+            drawable / "nuwax_splash_icon.png",
+        )
+
+    drawable_root = res_root / "drawable"
+    drawable_root.mkdir(parents=True, exist_ok=True)
+    (drawable_root / "nuwax_splash_background.xml").write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#FFFFFF" />
+        </shape>
+    </item>
+    <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/nuwax_splash_screen" />
+    </item>
+</layer-list>
+"""
+    )
+
+    themes_path = res_root / "values/themes.xml"
+    tree = ET.parse(themes_path)
+    resources = tree.getroot()
+    upsert_style(
+        resources,
+        "Theme.Uniappxnativepackage",
+        "Theme.AppCompat.Light",
+        {
+            "android:windowBackground": "@drawable/nuwax_splash_background",
+            "android:windowNoTitle": "true",
+        },
+    )
+    upsert_style(
+        resources,
+        "Theme.Nuwax.UniAppContent",
+        "@style/UniAppX.Activity.DefaultTheme",
+        {"android:windowBackground": "@drawable/nuwax_splash_background"},
+    )
+    write_resources_xml(themes_path, resources)
+
+    values_v31 = ET.Element("resources")
+    upsert_style(
+        values_v31,
+        "Theme.Uniappxnativepackage",
+        "Theme.AppCompat.Light",
+        {
+            "android:windowSplashScreenBackground": "#FFFFFF",
+            "android:windowSplashScreenAnimatedIcon": "@drawable/nuwax_splash_icon",
+            "android:windowSplashScreenIconBackgroundColor": "#FFFFFF",
+            "android:windowBackground": "@drawable/nuwax_splash_background",
+            "android:windowNoTitle": "true",
+        },
+    )
+    write_resources_xml(res_root / "values-v31/themes.xml", values_v31)
+    print("✓ Android Splash 已注入 drawable/theme（Android 12+ 与低版本）")
+
+
+def configure_launcher_icon() -> None:
+    """把项目应用图标注入离线 Android 宿主，替换 SDK 示例机器人图标。"""
+    src_root = APP_RESOURCES_DIR / APPID / "www/static/app-icon"
+    res_root = PROJ / "app/src/main/res"
+    densities = ("mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi")
+
+    required = [src_root / f"launcher-{density}.png" for density in densities]
+    required.append(src_root / "launcher-adaptive-foreground.png")
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        die("缺少 Android 应用图标资源：\n  " + "\n  ".join(missing))
+
+    for density in densities:
+        mipmap = res_root / f"mipmap-{density}"
+        mipmap.mkdir(parents=True, exist_ok=True)
+        for old_icon in (
+            mipmap / "ic_launcher.webp",
+            mipmap / "ic_launcher.png",
+            mipmap / "ic_launcher_round.webp",
+            mipmap / "ic_launcher_round.png",
+        ):
+            if old_icon.is_file():
+                old_icon.unlink()
+        shutil.copy2(src_root / f"launcher-{density}.png", mipmap / "ic_launcher.png")
+        shutil.copy2(
+            src_root / f"launcher-{density}.png",
+            mipmap / "ic_launcher_round.png",
+        )
+
+    adaptive_dir = res_root / "drawable-xxxhdpi"
+    adaptive_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        src_root / "launcher-adaptive-foreground.png",
+        adaptive_dir / "nuwax_launcher_foreground.png",
+    )
+
+    colors_path = res_root / "values/colors.xml"
+    colors_tree = ET.parse(colors_path)
+    colors = colors_tree.getroot()
+    background = next(
+        (
+            node
+            for node in colors.findall("color")
+            if node.get("name") == "nuwax_launcher_background"
+        ),
+        None,
+    )
+    if background is None:
+        background = ET.SubElement(
+            colors,
+            "color",
+            {"name": "nuwax_launcher_background"},
+        )
+    background.text = "#EFEDFB"
+    write_resources_xml(colors_path, colors)
+
+    adaptive_xml = """<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/nuwax_launcher_background" />
+    <foreground android:drawable="@drawable/nuwax_launcher_foreground" />
+</adaptive-icon>
+"""
+    anydpi = res_root / "mipmap-anydpi-v26"
+    anydpi.mkdir(parents=True, exist_ok=True)
+    (anydpi / "ic_launcher.xml").write_text(adaptive_xml)
+    (anydpi / "ic_launcher_round.xml").write_text(adaptive_xml)
+    print("✓ Android 应用图标已注入 legacy/adaptive launcher 资源")
 
 
 def find_debug_server_aar() -> Path | None:
@@ -465,6 +689,9 @@ def main() -> None:
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
     configure_manifest()
+    configure_app_name()
+    configure_splash_screen()
+    configure_launcher_icon()
     enable_hx_debug_channel()
     print("完成 configure_app")
 

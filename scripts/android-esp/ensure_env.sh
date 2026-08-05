@@ -3,15 +3,23 @@
 # 由 setup_sdk.sh / build_device_base.sh 调用，也可: source scripts/android-esp/ensure_env.sh
 set -euo pipefail
 
-# JDK：优先 Android Studio JBR，其次 Homebrew OpenJDK 17
-if [[ -z "${JAVA_HOME:-}" ]] || [[ ! -x "${JAVA_HOME}/bin/java" ]]; then
-  if [[ -x "/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/java" ]]; then
-    export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
-  elif [[ -x "/opt/homebrew/opt/openjdk@17/bin/java" ]]; then
-    export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
-  elif [[ -x "/opt/homebrew/opt/openjdk/bin/java" ]]; then
-    export JAVA_HOME="/opt/homebrew/opt/openjdk"
-  fi
+# Android Gradle 工具链固定使用 JDK 17；不要继承系统里可能更新到 21/26 的 JAVA_HOME。
+_nuwax_java_major() {
+  local java_home_path="${1:-}"
+  [[ -x "$java_home_path/bin/java" ]] || return 0
+  "$java_home_path/bin/java" -version 2>&1 \
+    | sed -n '1s/.*version "\([0-9][0-9]*\).*/\1/p'
+}
+
+if [[ "$(_nuwax_java_major "${JAVA_HOME:-}")" != "17" ]]; then
+  for _nuwax_jdk_candidate in \
+    "/opt/homebrew/opt/openjdk@17" \
+    "/Applications/Android Studio.app/Contents/jbr/Contents/Home"; do
+    if [[ "$(_nuwax_java_major "$_nuwax_jdk_candidate")" == "17" ]]; then
+      export JAVA_HOME="$_nuwax_jdk_candidate"
+      break
+    fi
+  done
 fi
 if [[ -n "${JAVA_HOME:-}" ]]; then
   export PATH="$JAVA_HOME/bin:$PATH"

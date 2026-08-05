@@ -39,6 +39,7 @@ DELIVER_NAME="${DELIVER_NAME:-nuwa-zhuoda-release-${STAMP}.apk}"
 # 发测试固定：关 HX 调试通道 + Gradle Release 变体
 export ENABLE_HX_DEBUG=0
 export ANDROID_BUILD_TYPE=release
+export ANDROID_SIGNING_MODE=release
 export SKIP_INSTALL=1
 # 不强制覆盖 ANDROID_HOME：无效路径会导致误报；由 ensure_env / package_custom_base 自动探测
 # （本机常见：~/Library/Android/sdk 或 ~/workspace/Android/sdk）
@@ -113,6 +114,10 @@ else
   echo "✓ 资源已导出"
 fi
 
+# HBuilderX 的 publish app 固定按 production 编译；Android tester 明确改为测试接口。
+python3 "$SCRIPT_DIR/set_app_resource_api_env.py" \
+  test "$ROOT_DIR/unpackage/resources/app-android"
+
 # ---------- [2/4] Release 出包 ----------
 step 2 4 "出 Release 包（无 HX debug-server，assembleRelease）"
 bash "$SCRIPT_DIR/package_custom_base.sh"
@@ -140,7 +145,7 @@ echo ""
 echo "测试安装说明:"
 echo "  1. 允许「未知来源」安装"
 echo "  2. 若已装旧包且签名冲突：先卸载再装"
-echo "  3. 本包为内测 Release（debug 签名），非应用市场上架包"
+echo "  3. 本包为内测 Release，与正式包使用同一签名证书"
 echo ""
 echo "======== 流水线完成 ========"
 echo "$DELIVER_APK"

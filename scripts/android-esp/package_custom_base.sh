@@ -4,7 +4,7 @@
 # 产物：
 #   ANDROID_BUILD_TYPE=debug（默认）→ unpackage/debug/android_debug.apk
 #   ANDROID_BUILD_TYPE=release      → unpackage/debug/android_release.apk
-#     （debuggable=false，接近发行性能；内测用 debug 签名，见 configure_app.py）
+#     （debuggable=false，接近发行性能；默认与调试基座共用正式签名）
 #
 # 给测试同学发「接近发行版」包示例：
 #   ENABLE_HX_DEBUG=0 ANDROID_BUILD_TYPE=release make base-android
@@ -16,6 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=../local-base-env.sh
 source "$SCRIPT_DIR/../local-base-env.sh"
+# 三条 Android 构建链默认统一使用团队正式证书；需要临时排障时可显式覆盖为 debug。
+export ANDROID_SIGNING_MODE="${ANDROID_SIGNING_MODE:-release}"
 MAIN_ROOT="${NUWAX_MAIN_ROOT}"
 ANDROID_ESP_WORK="${ANDROID_ESP_WORK}"
 PROJ="${ANDROID_ESP_PROJECT:-$ANDROID_ESP_WORK/project}"

@@ -125,6 +125,7 @@ import { extractOpenUiArtifactFromMessage } from "@/utils/openUiSchema.uts";
 import {
   isAssistantMessageInfo,
   isInFlightAssistantMessage,
+  canReuseAssistantOnSubResume,
   isTurnUserReadyFromMessageInfoList,
 } from "@/subpackages/utils/subResumeGate.uts";
 
@@ -1477,17 +1478,38 @@ export default class AgentDetailService {
           this.data.messageIdRef.value != id &&
           finished
         ) {
-          // 新对话时从头开始，否则累积
           const accumulatedText = handleMessageProcess(
             isNewConversation ? text : `${currentTextSnapshot}${text}`,
           );
           const m = cloneMessageInfoDraft(currentMessage);
           m["id"] = id;
           m["text"] = accumulatedText;
-          m["status"] = MessageStatusEnum.Complete;
           attachSpeakableTextToDraft(m, accumulatedText);
-          newMessage = buildMessageInfoFromDraft(m);
-          arraySpliceAction = 0;
+
+          // 当前仍是未完成/占位泡：视为同一条回填服务端 id，原地替换，禁止 insert 双气泡
+          const openBubble =
+            currentMessage.status == MessageStatusEnum.Loading ||
+            currentMessage.status == MessageStatusEnum.Incomplete ||
+            currentTextSnapshot.length == 0;
+          if (openBubble == true) {
+            m["status"] = MessageStatusEnum.Incomplete;
+            newMessage = buildMessageInfoFromDraft(m);
+            arraySpliceAction = 1;
+            const prevMsgRef = `${this.data.messageIdRef.value}`;
+            this.data.messageIdRef.value = id;
+            const streamId = this.data.streamingAssistantMessageId.value;
+            if (
+              streamId == currentMessageId ||
+              streamId == prevMsgRef ||
+              streamId.length == 0
+            ) {
+              this.data.streamingAssistantMessageId.value = id;
+            }
+          } else {
+            m["status"] = MessageStatusEnum.Complete;
+            newMessage = buildMessageInfoFromDraft(m);
+            arraySpliceAction = 0;
+          }
         } else {
           this.data.messageIdRef.value = id;
           // 新对话时从头开始，否则累积
@@ -2398,9 +2420,9 @@ export default class AgentDetailService {
 
     /**
      * 绑定 sub 写入目标（四端同一套规则）：
-     * - 最后一条是「本轮未完成」的助手 → 复用（清空后重放，避免双气泡）
-     * - 最后一条是已完成助手 / 用户 / 空 → 新建占位
-     * 禁止复用上一轮已 Complete 的助手。
+     * - 最后一条是本轮助手（进行中，或跨端软完成且无 finalResult）→ 复用，避免双气泡
+     * - 最后一条是用户 / 空 → 新建占位
+     * - 禁止复用已有 finalResult / Failed 的助手
      */
     const ensurePlaceholder = (): void => {
       if (hasBoundTarget) {
@@ -2410,7 +2432,11 @@ export default class AgentDetailService {
       const list = this.data.messageList.value;
       if (list.length > 0) {
         const last = list[list.length - 1];
-        if (isInFlightAssistantMessage(last) == true && last != null) {
+        const prev = list.length >= 2 ? list[list.length - 2] : null;
+        const canReuse =
+          (isInFlightAssistantMessage(last) == true && last != null) ||
+          canReuseAssistantOnSubResume(last, prev) == true;
+        if (canReuse == true && last != null) {
           const lastStatus = last.status;
           const lastText =
             last.text != null ? `${last.text}`.trim() : "";
@@ -2425,6 +2451,7 @@ export default class AgentDetailService {
           draft["think"] = "";
           draft["status"] = MessageStatusEnum.Loading;
           draft["finalResult"] = null;
+          draft["finished"] = false;
           const resetMsg = createMessageInfoFromAny(draft);
           if (resetMsg != null) {
             const next: MessageInfo[] = [];

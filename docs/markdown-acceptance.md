@@ -74,7 +74,7 @@ $$
 
 ## 三、代码与表格
 
-代码块（App 高亮 / H5 纯文本）：
+代码块（App+H5 统一语法高亮）：
 
 ```javascript
 function fib(n) {

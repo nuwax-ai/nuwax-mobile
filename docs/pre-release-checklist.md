@@ -11,7 +11,6 @@
 
 - [ ] **`subpackages/pages/provision/provision-entry/provision-entry.uvue`**
   - `showQrInvalid`：QR 解析失败的 toast 现在始终拼 `(QR_XXX)` 错误码（自定义基座下 NODE_ENV 门控失效临时放开）→ 正式版恢复 `process.env.NODE_ENV === 'development'` 门控，或直接去掉错误码拼接。
-  - 临时入口「🛠 调试页 test-provision」+ `goDebug()`：发布前删除（仅联调用）。
   - 脱敏扫码日志 `[provision-entry] scan raw ... / parse ...`：正式版可降级或移除。
 - [ ] **`uni_modules/nuwax-esp-provisioning/.../EspProvisioningBridge.swift` + `utils/provisioning/iosEspProvisioningClient.uts`**
   - `[EspBridge→UTS]` 原生日志通道（`fwd` → `logSink` → `console.log`）：非密钥（不打 PoP/密码），但属调试噪声。正式版建议**降级为只在异常时输出**，或加 debug 开关。

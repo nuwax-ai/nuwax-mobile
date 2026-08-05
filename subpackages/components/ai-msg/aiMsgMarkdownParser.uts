@@ -155,6 +155,10 @@ export class AiMsgMarkdownParser {
   private lastFallbackBody: string = "";
   /** 已完成消息的正文快照，用于跳过父级重渲染触发的重复解析。 */
   private lastFinishedBody: string = "";
+  /** 公式回填批量刷新防抖：攒一批 token 回填后整体刷一次，避免逐条替换 markdownElList
+   *  造成高频重渲染、与渲染帧竞争触发 ConcurrentModificationException。 */
+  private mathFlushPending: boolean = false;
+  private mathFlushGen: number = 0;
 
   constructor(
     msg: Ref<MsgItem>,
@@ -185,6 +189,9 @@ export class AiMsgMarkdownParser {
     this.cmarkProbeOk = true;
     this.lastFallbackBody = "";
     this.lastFinishedBody = "";
+    // 作废任何在途的批量刷新，避免新消息被旧回调刷到半截
+    this.mathFlushGen = this.mathFlushGen + 1;
+    this.mathFlushPending = false;
     this.parseMarkdown = this.createParseMarkdown();
   }
 
@@ -294,6 +301,33 @@ export class AiMsgMarkdownParser {
   }
 
   /**
+   * 公式回填批量刷新（防抖）：~40ms 内多次 token 回填只整体替换 markdownElList 一次，
+   * 把「一条多公式消息 = 连续十几次重渲染」压成一两次，降低与原生渲染帧竞争导致的
+   * ConcurrentModificationException。gen 用于在新消息到来时作废在途的过期刷新。
+   */
+  private scheduleMathFlush(): void {
+    if (this.mathFlushPending == true) {
+      return;
+    }
+    this.mathFlushPending = true;
+    const gen = this.mathFlushGen;
+    setTimeout((): void => {
+      this.mathFlushPending = false;
+      if (gen != this.mathFlushGen) {
+        return;
+      }
+      const prev = this.msg.value.markdownElList;
+      const next = [] as UniAiMarkdownElItem[];
+      for (let i = 0; i < prev.length; i++) {
+        next.push(prev[i]);
+      }
+      this.msg.value.markdownElList = next;
+      this.bumpRevision();
+      uni.$emit("ai-msg-content-ready", null);
+    }, 40);
+  }
+
+  /**
    * fallback 渲染。
    * - App：文案+占位先上屏，截图齐后一次填入
    * - H5：仍走单条 katex → resultHtml（与改 App 前一致），回调合并刷新
@@ -321,19 +355,9 @@ export class AiMsgMarkdownParser {
     this.abortIncrementalParse();
     this.parseMarkdown = null;
     this.lastFallbackBody = body;
-    const flushMathUi = (): void => {
-      const prev = this.msg.value.markdownElList;
-      const next = [] as UniAiMarkdownElItem[];
-      for (let i = 0; i < prev.length; i++) {
-        next.push(prev[i]);
-      }
-      this.msg.value.markdownElList = next;
-      this.bumpRevision();
-      uni.$emit("ai-msg-content-ready", null);
-    };
-    // App：按 chunk 分批上屏会多次回调；H5：单条 katex 回调直接刷
+    // 公式/mermaid/高亮回填走防抖批量刷新（scheduleMathFlush），避免逐条替换 list 与渲染帧竞争
     const onMathNotify = (): void => {
-      flushMathUi();
+      this.scheduleMathFlush();
     };
     const __parseT0 = Date.now();
     this.msg.value.markdownElList = expandMarkdownImageItems(

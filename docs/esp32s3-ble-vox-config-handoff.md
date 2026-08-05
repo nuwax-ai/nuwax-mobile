@@ -81,11 +81,11 @@
 | --- | --- | --- |
 | `deviceId` | `device-info.serialNumber`，且必须等于 QR / 手动输入的 username | 永久身份，**不**用 BLE address |
 | `deviceSecret` | 现有 `/api/app/devices/bind` 返回的最新值 | App **不生成、不改写、不写死**，仅原样放入 payload |
-| `gatewayUrl` | App 环境配置 `VOX_DEVICE_WS_URL`（`constants/config.uts`） | **`bind` 响应不含 `gatewayUrl`**，勿再查找 |
+| `gatewayUrl` | `/api/app/devices/bind` 返回的 `websocketUrl` | App **不拼接、不改写**，仅将该值放入 payload 的 `gatewayUrl` |
 
 任一来源失败时，App 必须停在 `vox-config` 之前，**不得继续下发 Wi‑Fi 凭据**（冻结契约硬约束）。
 
-> App 的 `gatewayUrl` 由 `API_BASE_URL` 派生：`wss://<host>/api/device/ws`（`constants/config.uts:28`）。正式环境随 `API_BASE_URL` 切换；硬件真机验收用的 `wss://testagent.xspaceagi.com/api/device/ws` 是当前正式联调环境值。
+> `gatewayUrl` 由后端通过绑定响应的 `websocketUrl` 统一下发，App 不再根据 `API_BASE_URL` 派生。
 
 ### 3.5 代码位置
 
@@ -93,7 +93,7 @@
 | --- | --- |
 | endpoint 名常量 | `hooks/useEspProvisioning.uts` `VOX_CONFIG_ENDPOINT = 'vox-config'` |
 | 下发 + 响应校验主逻辑 | `hooks/useEspProvisioning.uts` `EspProvisioningController.bindAndDeliverSecret()` |
-| `gatewayUrl` 派生 | `constants/config.uts` `VOX_DEVICE_WS_URL` |
+| `gatewayUrl` 来源与下发 | `hooks/useEspProvisioning.uts` `EspProvisioningController.bindAndDeliverSecret()` |
 | bind 接口 | `servers/vox/voxDevice.uts` `apiVoxBindDevice()` |
 | bind 参数类型 | `types/interfaces/voxDevice.uts` `AppDeviceBindParams` |
 | 原生下发（Android/iOS） | `EspProvisioningBridge.sendCustomData`（UTS 插件） |
@@ -238,7 +238,7 @@ App 工程师需了解的固侧行为（实现由固件团队负责）：
 - 首轮联调操作与验收矩阵：[`esp32s3-ble-first-integration-handoff.md`](./esp32s3-ble-first-integration-handoff.md)
 - 机器可读契约：[`esp32s3-idf6-provisioning-contract.json`](./esp32s3-idf6-provisioning-contract.json)（`1.3-dynamic-vox-config`）
 - App 代码分层：[`esp32s3-idf6-provisioning-code-plan.md`](./esp32s3-idf6-provisioning-code-plan.md)
-- Vox 后端 / 网关集成要点：[`app-asr-tts.md`](./app-asr-tts.md)、`constants/config.uts`（`VOX_BASE_URL` / `VOX_DEVICE_WS_URL`）
+- Vox 后端 / 网关集成要点：[`app-asr-tts.md`](./app-asr-tts.md)、`servers/vox/voxDevice.uts`（绑定接口）
 - 上游硬件交接包：`ble-vox-config-formal-handoff-2026-07-26`（外部，仅供参考）
 
 核心代码：
@@ -252,6 +252,5 @@ servers/vox/voxDevice.uts                    apiVoxBindDevice
 servers/useRequest.uts                       deviceSecret/signature/password/token 脱敏
 types/enums/espProvisioning.uts              VOX_CONFIG_INVALID / VOX_CONFIG_PERSIST_FAILED
 types/interfaces/voxDevice.uts               AppDeviceBindParams
-constants/config.uts                         VOX_DEVICE_WS_URL 派生
 constants/i18n-locales/*.uts                 voxConfigInvalid / voxConfigPersistFailed 文案
 ```

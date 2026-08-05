@@ -1466,6 +1466,34 @@ function renderMermaidToken(
 }
 
 /**
+ * 全局串行化代码块高亮。
+ * App 原生 libscopeparser 非线程安全：多个代码块并发 tokenizeLine 会抛
+ * java.util.ConcurrentModificationException。一次只高亮一个块（块内逐行本就串行）即可避免。
+ * H5 单线程无此问题，串行化也无害（仅顺序化）。
+ */
+let highlightBusy = false;
+let highlightWaiters: Array<() => void> = [] as Array<() => void>;
+function acquireHighlight(task: () => void): void {
+  if (highlightBusy) {
+    highlightWaiters.push(task);
+    return;
+  }
+  highlightBusy = true;
+  task();
+}
+function releaseHighlight(): void {
+  if (highlightWaiters.length > 0) {
+    const next = highlightWaiters.shift();
+    if (next != null) {
+      // 锁交接给下一个任务，保持互斥
+      next();
+      return;
+    }
+  }
+  highlightBusy = false;
+}
+
+/**
  * 异步语法高亮：逐行 parseLineCode 分词，全部完成后回填 codeToken.codeTokens 并回调刷帧。
  * 与 SDK parseMarkdown.uts 的 parseCodehighlight 等价，供 fallback 独立使用（无增量缓存）。
  * 语言不在 grammarList 时首行即返回 error → 保持调用方已写入的纯文本 codeTokens，不逐行空跑。
@@ -1480,45 +1508,43 @@ function highlightCodeBlock(
   if (codeText.length == 0) {
     return;
   }
-  const lines = codeText.split("\n");
-  const highlighted = [] as MarkdownToken[][];
-  let lineIndex = 0;
-  let unsupported = false;
-  console.log("[HL] enter lang=" + lang + " lines=" + lines.length);
-  function parseNext(): void {
-    if (unsupported) {
-      return;
-    }
-    if (lineIndex >= lines.length) {
-      // 全部行分词完成 → 回填新数组（新引用，触发子组件重渲染）并刷帧
-      codeToken.codeTokens = highlighted;
-      console.log("[HL] done highlighted=" + highlighted.length + " call flush");
-      callback();
-      return;
-    }
-    const lineText = lines[lineIndex];
-    parseLineCode((res: ParseLineCodeRes): void => {
-      if (res.error != null) {
-        // 语言不支持：保留调用方写入的纯文本 codeTokens，不再逐行尝试
-        console.log("[HL] unsupported lang=" + lang + " err=" + res.error);
-        unsupported = true;
+  acquireHighlight((): void => {
+    const lines = codeText.split("\n");
+    const highlighted = [] as MarkdownToken[][];
+    let lineIndex = 0;
+    let unsupported = false;
+    function parseNext(): void {
+      if (unsupported) {
+        releaseHighlight();
         return;
       }
-      if (res.tokens.length == 0) {
-        // 空行/无分词：降级为纯文本行，避免该行被吞
-        highlighted.push([makeTextToken(lineText, "text")]);
-      } else {
-        highlighted.push(res.tokens);
-        if (lineIndex == 0) {
-          const firstClass = res.tokens[0].className ?? "";
-          console.log("[HL] line0 tokens=" + res.tokens.length + " firstClass=" + firstClass);
-        }
+      if (lineIndex >= lines.length) {
+        // 全部行分词完成 → 回填新数组（新引用，触发子组件重渲染）并刷帧
+        codeToken.codeTokens = highlighted;
+        releaseHighlight();
+        callback();
+        return;
       }
-      lineIndex = lineIndex + 1;
-      parseNext();
-    }, lineText, lang);
-  }
-  parseNext();
+      const lineText = lines[lineIndex];
+      parseLineCode((res: ParseLineCodeRes): void => {
+        if (res.error != null) {
+          // 语言不支持 / 高亮器初始化失败：保留调用方写入的纯文本 codeTokens，不再逐行尝试
+          unsupported = true;
+          releaseHighlight();
+          return;
+        }
+        if (res.tokens.length == 0) {
+          // 空行/无分词：降级为纯文本行，避免该行被吞
+          highlighted.push([makeTextToken(lineText, "text")]);
+        } else {
+          highlighted.push(res.tokens);
+        }
+        lineIndex = lineIndex + 1;
+        parseNext();
+      }, lineText, lang);
+    }
+    parseNext();
+  });
 }
 
 /** 为行内 math token 触发 KaTeX 渲染（异步回填 html/href/width/height）。 */

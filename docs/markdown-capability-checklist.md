@@ -22,7 +22,7 @@
 | 标题 H1-H6 | ✅ | ✅ | ✅ | 含行内公式混排 |
 | 段落 | ✅ | ✅ | ✅ | |
 | 有序/无序列表 | ✅ | ✅ | ✅ | 含行内公式混排 |
-| 代码块 + 语法高亮 | ✅ | ✅ | ✅ | App 用 uni-highlight(TextMate)；**H5 不高亮（纯文本，⚠️ 见下）** |
+| 代码块 + 语法高亮 | ✅ | ✅ | ✅ | App+H5 统一 `parseLineCode`（uni-highlight/TextMate）。**关键**：含 ```` ``` ```` 的消息整段走 fallback，故高亮须在 fallback 代码块分支接入（`appMarkdownFallback.uts:highlightCodeBlock`）；SDK `parseMarkdown.uts` 的 `#ifdef WEB` 跳过已移除。曾误标 ✅（App 实走 fallback 未分词→纯文本），现已修复 |
 | 行内代码 `` ` `` | ✅ | ✅ | ✅ | |
 | 表格 GFM | ✅ | ✅ | ✅ | 横滚 + 复制/下载 markdown + 单元格公式 + 对齐 + 空表头剔除 |
 | 引用块 `>` | ⚠️ 不完善 | ✅ | ✅ | 仅 cmark 路径支持；**fallback 不识别**，含结构块消息里失效 |
@@ -97,7 +97,7 @@
 3. `\[...\]` 跨行块公式不完整
 4. **mermaid App 流式不出图**（fallback 不识别）★功能缺失感强
 5. mermaid 失败回退、图片错误占位
-6. H5 代码块不高亮（App 有）
+6. ~~H5 代码块不高亮（App 有）~~ ✅ 已修复（App+H5 统一 `parseLineCode`，见上表「代码块」行）
 7. 嵌套列表层级
 
 ### 本次改动三大块（对应专项设计）

@@ -372,10 +372,17 @@ function normalizeInlineMath(markdown: string): string {
       output.push(line);
       continue;
     }
+    // 段落行：仅块级 $$...$$ 拆成独立行（块级公式须独占行渲染）；
+    // 行内 $...$ / \(...\) 保留在段落内混排（不再拆成块级，否则行内公式被强制换行）。
+    // 若整行不含 $$，直接原样保留（行内公式交给 parseInline 混排）。
+    if (line.indexOf("$$") < 0) {
+      output.push(line);
+      continue;
+    }
     let cursor = 0;
     let foundMath = false;
     while (cursor < line.length) {
-      const start = line.indexOf("$", cursor);
+      const start = line.indexOf("$$", cursor);
       if (start < 0) {
         const tail = line.substring(cursor);
         if (tail.length > 0 || !foundMath) {
@@ -383,44 +390,13 @@ function normalizeInlineMath(markdown: string): string {
         }
         break;
       }
-      // 优先匹配 $$...$$，避免被拆成两个单 $
-      const isDouble =
-        start + 1 < line.length && line.charAt(start + 1) == "$";
-      if (isDouble) {
-        const end = line.indexOf("$$", start + 2);
-        if (end < 0) {
-          output.push(line.substring(cursor));
-          break;
-        }
-        const before = line.substring(cursor, start);
-        const latex = line.substring(start + 2, end).trim();
-        if (before.length > 0) {
-          output.push(before);
-        }
-        if (latex.length > 0) {
-          output.push("$$" + latex + "$$");
-          foundMath = true;
-        }
-        cursor = end + 2;
-        continue;
-      }
-      const end = line.indexOf("$", start + 1);
+      const end = line.indexOf("$$", start + 2);
       if (end < 0) {
         output.push(line.substring(cursor));
         break;
       }
-      // `$` 紧邻（空公式）跳过，避免死循环
-      if (end == start + 1) {
-        if (start > cursor) {
-          output.push(line.substring(cursor, start + 1));
-        } else {
-          output.push("$");
-        }
-        cursor = start + 1;
-        continue;
-      }
       const before = line.substring(cursor, start);
-      const latex = line.substring(start + 1, end).trim();
+      const latex = line.substring(start + 2, end).trim();
       if (before.length > 0) {
         output.push(before);
       }
@@ -428,7 +404,7 @@ function normalizeInlineMath(markdown: string): string {
         output.push("$$" + latex + "$$");
         foundMath = true;
       }
-      cursor = end + 1;
+      cursor = end + 2;
     }
   }
   return output.join("\n");
@@ -613,6 +589,115 @@ function findInlineMathStart(text: string, cursor: number): number {
 }
 
 /**
+ * 查找可配对的行内 `\(...\)` 起点（PC bracket 模式的行内定界符）。
+ * 与 `$...$` 同级；返回 `\(` 的下标，未闭合返回 -1。
+ */
+function findInlineParenMathStart(text: string, cursor: number): number {
+  let i = text.indexOf("\\(", cursor);
+  while (i >= 0) {
+    // 闭合 \) 必须存在；未闭合（流式半截）不算行内公式起点
+    const end = text.indexOf("\\)", i + 2);
+    if (end < 0) {
+      return -1;
+    }
+    // 空公式 \(\) 跳过，继续找下一个
+    if (end == i + 2) {
+      i = text.indexOf("\\(", i + 2);
+      continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * 查找斜体单个 `*` 起点（跳过 `**` 粗体）。返回星号下标，找不到返回 -1。
+ * 仅定位起点；闭合由调用处按同样规则查找。
+ */
+function findSingleStarStart(text: string, cursor: number): number {
+  let i = text.indexOf("*", cursor);
+  while (i >= 0) {
+    const prevIsStar = i > 0 && text.charAt(i - 1) == "*";
+    const nextIsStar = i + 1 < text.length && text.charAt(i + 1) == "*";
+    if (!prevIsStar && !nextIsStar) {
+      return i;
+    }
+    i = text.indexOf("*", i + 1);
+  }
+  return -1;
+}
+
+/** 查找 `~~` 删除线起点。返回下标，找不到返回 -1。 */
+function findDelStart(text: string, cursor: number): number {
+  return text.indexOf("~~", cursor);
+}
+
+/**
+ * 查找裸 URL 起点（http/https，remark-gfm autolink 对齐）。
+ * 返回 scheme 下标，找不到返回 -1。闭合（URL 结束）由调用处按空白/标点截断。
+ */
+function findBareUrlStart(text: string, cursor: number): number {
+  const httpIdx = text.indexOf("http://", cursor);
+  const httpsIdx = text.indexOf("https://", cursor);
+  if (httpIdx < 0) {
+    return httpsIdx;
+  }
+  if (httpsIdx < 0) {
+    return httpIdx;
+  }
+  return httpIdx < httpsIdx ? httpIdx : httpsIdx;
+}
+
+/** 判断裸 URL 起点前一字是否为 `(` `<` `=` 引号（即已在 markdown 链接/属性内），避免重复识别。 */
+function isBareUrlInLinkContext(text: string, urlStart: number): boolean {
+  if (urlStart <= 0) {
+    return false;
+  }
+  const prev = text.charAt(urlStart - 1);
+  // [label](http://...) 的 ( 、 ![alt](http://...) 的 ( 、 <http://...> 的 < 、属性引号
+  return prev == "(" || prev == "<" || prev == "=" || prev == "\"" || prev == "'";
+}
+
+/** 从 urlStart 起截取裸 URL 文本（到空白或 markdown 结构字符为止）。 */
+function extractBareUrl(text: string, urlStart: number): string {
+  let end = urlStart;
+  while (end < text.length) {
+    const ch = text.charAt(end);
+    // 空白、换行、markdown 结构字符终止 URL
+    if (
+      ch == " " ||
+      ch == "\t" ||
+      ch == "\n" ||
+      ch == "\r" ||
+      ch == ")" ||
+      ch == "]" ||
+      ch == "<" ||
+      ch == ">" ||
+      ch == "\"" ||
+      ch == "'"
+    ) {
+      break;
+    }
+    end++;
+  }
+  return text.substring(urlStart, end);
+}
+
+/** 从 from 起找斜体闭合 `*`（同样跳过 `**`）。 */
+function findSingleStarEnd(text: string, from: number): number {
+  let i = text.indexOf("*", from);
+  while (i >= 0) {
+    const prevIsStar = i > 0 && text.charAt(i - 1) == "*";
+    const nextIsStar = i + 1 < text.length && text.charAt(i + 1) == "*";
+    if (!prevIsStar && !nextIsStar) {
+      return i;
+    }
+    i = text.indexOf("*", i + 1);
+  }
+  return -1;
+}
+
+/**
  * 还原被 JSON/转义误伤的 LaTeX 控制符。
  * 例如 `\nabla` 若被当成 `\n`+`abla`，显示会变成 abla。
  */
@@ -648,6 +733,15 @@ function parseInline(text: string): MarkdownToken[] {
     const linkStart = findInlineLinkStart(text, cursor);
     const conversationStart = findInlineConversationStart(text, cursor);
     const mathStart = findInlineMathStart(text, cursor);
+    const parenMathStart = findInlineParenMathStart(text, cursor);
+    // 行内公式取 $...$ 与 \(...\) 中更早出现者
+    const anyMathStart =
+      mathStart >= 0 && (parenMathStart < 0 || mathStart <= parenMathStart)
+        ? mathStart
+        : parenMathStart;
+    const emStart = findSingleStarStart(text, cursor);
+    const delStart = findDelStart(text, cursor);
+    const bareUrlStart = findBareUrlStart(text, cursor);
     let nextStart = -1;
     let marker = "";
     if (
@@ -656,7 +750,7 @@ function parseInline(text: string): MarkdownToken[] {
       (strongStart < 0 || conversationStart <= strongStart) &&
       (codeStart < 0 || conversationStart <= codeStart) &&
       (linkStart < 0 || conversationStart <= linkStart) &&
-      (mathStart < 0 || conversationStart <= mathStart)
+      (anyMathStart < 0 || conversationStart <= anyMathStart)
     ) {
       nextStart = conversationStart;
       marker = "<conversation";
@@ -665,31 +759,57 @@ function parseInline(text: string): MarkdownToken[] {
       (strongStart < 0 || imageStart <= strongStart) &&
       (codeStart < 0 || imageStart <= codeStart) &&
       (linkStart < 0 || imageStart <= linkStart) &&
-      (mathStart < 0 || imageStart <= mathStart)
+      (anyMathStart < 0 || imageStart <= anyMathStart)
     ) {
       nextStart = imageStart;
       marker = "![";
     } else if (
-      mathStart >= 0 &&
-      (strongStart < 0 || mathStart <= strongStart) &&
-      (codeStart < 0 || mathStart <= codeStart) &&
-      (linkStart < 0 || mathStart <= linkStart)
+      anyMathStart >= 0 &&
+      (strongStart < 0 || anyMathStart <= strongStart) &&
+      (codeStart < 0 || anyMathStart <= codeStart) &&
+      (linkStart < 0 || anyMathStart <= linkStart)
     ) {
-      nextStart = mathStart;
-      marker = "$";
+      nextStart = anyMathStart;
+      // 区分 $...$ 与 \(...\) 两种行内公式定界符
+      marker =
+        mathStart >= 0 && anyMathStart == mathStart ? "$" : "\\(";
     } else if (
       strongStart >= 0 &&
       (codeStart < 0 || strongStart <= codeStart) &&
+      (emStart < 0 || strongStart <= emStart) &&
+      (delStart < 0 || strongStart <= delStart) &&
       (linkStart < 0 || strongStart <= linkStart)
     ) {
       nextStart = strongStart;
       marker = "**";
+    } else if (
+      delStart >= 0 &&
+      (codeStart < 0 || delStart <= codeStart) &&
+      (emStart < 0 || delStart <= emStart) &&
+      (linkStart < 0 || delStart <= linkStart)
+    ) {
+      nextStart = delStart;
+      marker = "~~";
+    } else if (
+      emStart >= 0 &&
+      (codeStart < 0 || emStart <= codeStart) &&
+      (linkStart < 0 || emStart <= linkStart)
+    ) {
+      nextStart = emStart;
+      marker = "*";
     } else if (codeStart >= 0 && (linkStart < 0 || codeStart <= linkStart)) {
       nextStart = codeStart;
       marker = "`";
     } else if (linkStart >= 0) {
       nextStart = linkStart;
       marker = "[";
+    } else if (
+      bareUrlStart >= 0 &&
+      isBareUrlInLinkContext(text, bareUrlStart) != true
+    ) {
+      // 裸 URL autolink：最低优先级兜底，且不在 [t](url) 链接上下文内
+      nextStart = bareUrlStart;
+      marker = "bareurl";
     }
     if (nextStart < 0) {
       result.push(makeTextToken(text.substring(cursor)));
@@ -716,6 +836,63 @@ function parseInline(text: string): MarkdownToken[] {
         });
       }
       cursor = end + 1;
+      continue;
+    }
+    if (marker == "\\(") {
+      // \(...\) 行内公式（PC bracket 模式）
+      const end = text.indexOf("\\)", nextStart + 2);
+      if (end <= nextStart + 2) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const latex = sanitizeLatexText(
+        text.substring(nextStart + 2, end).trim(),
+      );
+      if (latex.length > 0) {
+        result.push({
+          type: "math",
+          text: latex,
+          uniqueId:
+            "fallback-inline-paren-math-" + nextStart + "-" + latex.length,
+        });
+      }
+      cursor = end + 2;
+      continue;
+    }
+    if (marker == "*") {
+      // 斜体 *text*：闭合跳过 **
+      const end = findSingleStarEnd(text, nextStart + 1);
+      if (end < 0) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const emText = text.substring(nextStart + 1, end);
+      if (emText.length > 0) {
+        result.push({
+          type: "em",
+          text: emText,
+          className: "em",
+        });
+      }
+      cursor = end + 1;
+      continue;
+    }
+    if (marker == "~~") {
+      // 删除线 ~~text~~
+      const end = text.indexOf("~~", nextStart + 2);
+      if (end < 0) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const delText = text.substring(nextStart + 2, end);
+      if (delText.length > 0) {
+        result.push({
+          type: "del",
+          text: delText,
+          className: "del",
+        });
+      }
+      cursor = end + 2;
       continue;
     }
     if (marker == "![") {
@@ -745,6 +922,22 @@ function parseInline(text: string): MarkdownToken[] {
       });
       cursor = hrefEnd + 1;
       continue;
+    }
+    if (marker == "bareurl") {
+      // 裸 URL autolink：截到空白/结构字符，文本即 URL
+      const url = extractBareUrl(text, nextStart);
+      if (url.length > 0) {
+        result.push({
+          type: "link",
+          text: url,
+          href: url,
+          className: "link",
+        });
+        cursor = nextStart + url.length;
+        continue;
+      }
+      result.push(makeTextToken(text.substring(nextStart)));
+      break;
     }
     if (marker == "<conversation") {
       const reference = parseConversationReferenceAt(text, nextStart);
@@ -1232,6 +1425,42 @@ function renderMathToken(
   });
 }
 
+/**
+ * 异步渲染 mermaid 代码块（App 流式/历史走 fallback，cmark 路径触达不到）。
+ * 参考 renderMathToken 的 whenReady/回调刷帧模式：webview 未就绪则等待，结果回填 token.href（+width/height）。
+ * mermaid 量少，单条直调，不进 KaTeX 并发队列。
+ */
+function renderMermaidToken(
+  mermaidText: string,
+  token: MarkdownToken,
+  callback: MathRenderedCallback,
+): void {
+  const doRender = (): void => {
+    const param = new UTSJSONObject();
+    param["action"] = "renderMermaid";
+    param["mermaidText"] = mermaidText;
+    proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
+      const imageData = res["imageDataURL"];
+      if (imageData != null && `${imageData}`.length > 0) {
+        token.href = `${imageData}`;
+        const widthData = res["width"];
+        const heightData = res["height"];
+        if (widthData != null) token.width = widthData as number;
+        if (heightData != null) token.height = heightData as number;
+      }
+      // 失败（imageDataURL 空）不回填 href，由渲染组件落代码 Tab
+      callback();
+    });
+  };
+  if (proxyWeb.isReady() == true) {
+    doRender();
+  } else {
+    proxyWeb.whenReady((): void => {
+      doRender();
+    });
+  }
+}
+
 /** 为行内 math token 触发 KaTeX 渲染（异步回填 html/href/width/height）。 */
 function scheduleInlineMathRender(
   tokens: MarkdownToken[],
@@ -1482,6 +1711,17 @@ function parseAppMarkdownFallbackInner(
           };
           result.push(makeItem("math", itemIndex++, [[mathToken]]));
           renderMathToken(codeText, mathToken, onMathRendered, true);
+        } else if (lang == "mermaid") {
+          // mermaid：fence 已闭合才走到这（未闭合回退段落逻辑等补全），产 code_block 并异步出图回填 href
+          const mermaidToken: MarkdownToken = {
+            type: "code_block",
+            text: codeText,
+            lang: "mermaid",
+            codeTokens: [] as MarkdownToken[][],
+            uniqueId: "fallback-mermaid-token-" + itemIndex,
+          };
+          result.push(makeItem("code_block", itemIndex++, [[mermaidToken]]));
+          renderMermaidToken(codeText, mermaidToken, onMathRendered);
         } else {
           const codeRows = [] as MarkdownToken[][];
           for (let ci = 0; ci < codeLines.length; ci++) {
@@ -1591,6 +1831,30 @@ function parseAppMarkdownFallbackInner(
     // 忽略 Markdown 水平线（如 $$ 后跟 ---），避免思考/正文出现多余中横线
     if (trimmed == "---" || trimmed == "***" || trimmed == "___") {
       index++;
+      continue;
+    }
+
+    // 引用块：连续 > 行，剥离前缀后逐行 parseInline（支持引用内行内公式/斜体/删除线）
+    if (trimmed.startsWith(">")) {
+      const quoteRows = [] as MarkdownToken[][];
+      while (index < lines.length) {
+        const qline = lines[index].trim();
+        if (!qline.startsWith(">")) {
+          break;
+        }
+        // 剥离 > 及一个可选空格
+        let content = qline.substring(1);
+        if (content.startsWith(" ")) {
+          content = content.substring(1);
+        }
+        const rowTokens = parseInline(content);
+        scheduleInlineMathRender(rowTokens, onMathRendered);
+        quoteRows.push(rowTokens);
+        index++;
+      }
+      if (quoteRows.length > 0) {
+        result.push(makeItem("block_quote", itemIndex++, quoteRows));
+      }
       continue;
     }
 
@@ -1705,6 +1969,7 @@ function parseAppMarkdownFallbackInner(
         next == "\\[" ||
         isStandaloneMathLine(next) ||
         next == "---" ||
+        next.startsWith(">") ||
         isFallbackListLine(lines[index]) ||
         parseStandaloneMarkdownImageLine(next) != null ||
         isIncompleteMarkdownImageLine(next) ||
@@ -1720,6 +1985,8 @@ function parseAppMarkdownFallbackInner(
     for (let pi = 0; pi < paragraphLines.length; pi++) {
       if (pi > 0) paragraphTokens.push(makeTextToken("\n"));
       const inline = parseInline(paragraphLines[pi]);
+      // 段落行内公式需触发 KaTeX 渲染（与列表/标题一致），否则露出裸 latex
+      scheduleInlineMathRender(inline, onMathRendered);
       for (let ii = 0; ii < inline.length; ii++) {
         paragraphTokens.push(inline[ii]);
       }

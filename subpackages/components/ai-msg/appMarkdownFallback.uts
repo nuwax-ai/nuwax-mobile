@@ -5,6 +5,10 @@ import type {
 } from "@/uni_modules/uni-cmark/utssdk/interface.uts";
 import proxyWeb from "@/uni_modules/uni-ai-x/sdk/proxy-web.uts";
 import {
+  parseLineCode,
+  ParseLineCodeRes,
+} from "@/uni_modules/uni-ai-x/sdk/parseCode.uts";
+import {
   isIncompleteMarkdownImageLine,
   parseMarkdownImageAt,
   parseStandaloneMarkdownImageLine,
@@ -1461,6 +1465,62 @@ function renderMermaidToken(
   }
 }
 
+/**
+ * 异步语法高亮：逐行 parseLineCode 分词，全部完成后回填 codeToken.codeTokens 并回调刷帧。
+ * 与 SDK parseMarkdown.uts 的 parseCodehighlight 等价，供 fallback 独立使用（无增量缓存）。
+ * 语言不在 grammarList 时首行即返回 error → 保持调用方已写入的纯文本 codeTokens，不逐行空跑。
+ * 回填后走 onMathRendered（与 mermaid/math 同一 flushMathUi 链路）触发重渲染上色。
+ */
+function highlightCodeBlock(
+  codeToken: MarkdownToken,
+  codeText: string,
+  lang: string,
+  callback: MathRenderedCallback,
+): void {
+  if (codeText.length == 0) {
+    return;
+  }
+  const lines = codeText.split("\n");
+  const highlighted = [] as MarkdownToken[][];
+  let lineIndex = 0;
+  let unsupported = false;
+  console.log("[HL] enter lang=" + lang + " lines=" + lines.length);
+  function parseNext(): void {
+    if (unsupported) {
+      return;
+    }
+    if (lineIndex >= lines.length) {
+      // 全部行分词完成 → 回填新数组（新引用，触发子组件重渲染）并刷帧
+      codeToken.codeTokens = highlighted;
+      console.log("[HL] done highlighted=" + highlighted.length + " call flush");
+      callback();
+      return;
+    }
+    const lineText = lines[lineIndex];
+    parseLineCode((res: ParseLineCodeRes): void => {
+      if (res.error != null) {
+        // 语言不支持：保留调用方写入的纯文本 codeTokens，不再逐行尝试
+        console.log("[HL] unsupported lang=" + lang + " err=" + res.error);
+        unsupported = true;
+        return;
+      }
+      if (res.tokens.length == 0) {
+        // 空行/无分词：降级为纯文本行，避免该行被吞
+        highlighted.push([makeTextToken(lineText, "text")]);
+      } else {
+        highlighted.push(res.tokens);
+        if (lineIndex == 0) {
+          const firstClass = res.tokens[0].className ?? "";
+          console.log("[HL] line0 tokens=" + res.tokens.length + " firstClass=" + firstClass);
+        }
+      }
+      lineIndex = lineIndex + 1;
+      parseNext();
+    }, lineText, lang);
+  }
+  parseNext();
+}
+
 /** 为行内 math token 触发 KaTeX 渲染（异步回填 html/href/width/height）。 */
 function scheduleInlineMathRender(
   tokens: MarkdownToken[],
@@ -1735,6 +1795,14 @@ function parseAppMarkdownFallbackInner(
             uniqueId: "fallback-code-token-" + itemIndex,
           };
           result.push(makeItem("code_block", itemIndex++, [[codeToken]]));
+          // 异步语法高亮（App + H5）：分词完成后回填 codeTokens 并刷帧；
+          // 不支持的语言保持上方纯文本 codeRows。先上纯文本再异步上色，流式友好。
+          highlightCodeBlock(
+            codeToken,
+            codeText,
+            lang.length > 0 ? lang : "text",
+            onMathRendered,
+          );
         }
         continue;
       }

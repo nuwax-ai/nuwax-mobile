@@ -1,7 +1,7 @@
 # OpenUI H5 表单无法提交修复
 
 ## 问题
-H5 场景下，OpenUI 生成的页面无法提交表单，顶部提示「Share preview is read-only and cannot submit forms.」。App 端正常（ticket 成功时）。
+H5 和 App 场景下，OpenUI 生成的页面均无法提交表单，顶部提示「Share preview is read-only and cannot submit forms.」。
 
 ## 根因
 `file-preview-page.uvue` 构建 OpenUI 预览 URL 时有两个分支：
@@ -9,9 +9,9 @@ H5 场景下，OpenUI 生成的页面无法提交表单，顶部提示「Share p
 1. **`_ticket` 分支**（ticket 成功）：`?fileUrl=...&_ticket=...&_sk=...` → **交互态（可提交）**。
 2. **`sk` 回退**（ticket 失败）：`?sk=...` → **分享只读态（不可提交）**。
 
-H5 生产环境无法设置 `Authorization` 请求头（网关限制），导致 `/api/user/ticket/create` 鉴权失败 → `getTicket()` 返回空 → 回退到 `?sk=` 分享只读态 → 渲染器显示 read-only 横幅 → 表单不可提交。
+ticket 签发失败（`/api/user/ticket/create` 返回错误）时，两端都会回退到 `?sk=` 分享只读态 → 渲染器显示 read-only 横幅 → 表单不可提交。
 
-App 端能设 Authorization 头 → ticket 成功 → 走 `_ticket` 交互分支 → 可提交。
+H5 尤为严重：生产环境无法设置 `Authorization` 请求头（网关限制），导致 ticket 接口鉴权必然失败 → H5 必然回退只读。App 虽然能设头，但当 ticket 接口本身异常时同样回退只读。
 
 ## 修复方案
 **按文件类型区分回退策略**（`file-preview-page.uvue:313-325`）：

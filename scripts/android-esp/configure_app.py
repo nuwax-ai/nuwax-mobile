@@ -162,6 +162,22 @@ def confine_leakcanary_to_debug(gradle_path: Path) -> None:
         print(f"✓ LeakCanary 已是 debug 范围: {gradle_path.relative_to(PROJ)}")
 
 
+def hide_leakcanary_launcher_entry() -> None:
+    """保留 Debug 泄漏检测，但不让 LeakCanary 在桌面创建“Leaks”入口。"""
+    values_dir = PROJ / "app" / "src" / "debug" / "res" / "values"
+    values_dir.mkdir(parents=True, exist_ok=True)
+    target = values_dir / "nuwax_leakcanary.xml"
+    target.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <bool name="leak_canary_add_launcher_icon">false</bool>
+    <bool name="leak_canary_add_dynamic_shortcut">false</bool>
+</resources>
+"""
+    )
+    print("✓ LeakCanary 保留检测能力，已隐藏桌面图标与动态快捷方式")
+
+
 def strip_project_deps(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
@@ -775,6 +791,7 @@ def main() -> None:
     # Release 闪退修复：LeakCanary 不得进非 debuggable 包
     confine_leakcanary_to_debug(PROJ / "app" / "build.gradle")
     confine_leakcanary_to_debug(PROJ / "uniappx" / "build.gradle")
+    hide_leakcanary_launcher_entry()
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
     configure_manifest()

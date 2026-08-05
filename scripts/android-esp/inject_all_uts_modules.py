@@ -33,10 +33,57 @@ APP_RES = Path(
 )
 COMPILE_SDK = int(os.environ.get("ANDROID_COMPILE_SDK", "34"))
 
+# 蒸汽（vapor/bytecode）模式下，uts→kt 编译器会给插件 index.kt 生成
+# `import io.dcloud.uniappxv.runtime.*` 及 UTSCallback.fnJS 桥接访问器。
+# 这套 vapor 运行时只在 HBuilderX 的 uniapp-runextension/libVapor/*.jar，
+# 不在离线 SDK 的 SDK/libs（那里的 app-runtime/uts-runtime aar 是旧版，
+# 无 uniappxv、无 fnJS）。注入时把这些 vapor jar 拷进插件 vapor-libs/ 作 compileOnly，
+# 并从 SDK/libs fileTree 排除旧版同名运行时，避免 io.dcloud.uts/* 类重复冲突。
+VAPOR_RUNTIME_JARS = [
+    "app-runtime-release.jar",
+    "uniExtAPI-release.jar",
+    "ext-component-release.jar",
+    "uts-runtime-release.jar",
+]
+# SDK/libs 中与 vapor jar 同包(io.dcloud.uniapp/uts/uniappxv)的旧版 aar，须排除防类重复。
+VAPOR_SDK_LIBS_EXCLUDE = [
+    "app-runtime-release.aar",
+    "uts-runtime-release.aar",
+]
+VAPOR_RUNTIME_SRC = Path(
+    os.environ.get(
+        "HX_VAPOR_RUNTIME_DIR",
+        "/Applications/HBuilderX-Alpha.app/Contents/HBuilderX/plugins/"
+        "uniapp-runextension/libVapor",
+    )
+)
+
 
 def die(msg: str) -> None:
     print(f"✗ {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def copy_vapor_runtime(mod: Path, uses_vapor: bool) -> None:
+    """把 HX libVapor 的 vapor 运行时 jar 拷进插件模块 vapor-libs/（compileOnly）。
+
+    仅 vapor 插件（uses_vapor）才拷贝，避免给非 vapor 插件引入多余依赖。
+    """
+    if not uses_vapor:
+        return
+    if not VAPOR_RUNTIME_SRC.is_dir():
+        die(f"插件引用 uniappxv 但找不到 vapor 运行时目录: {VAPOR_RUNTIME_SRC}")
+    dest = mod / "vapor-libs"
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for jar in VAPOR_RUNTIME_JARS:
+        src = VAPOR_RUNTIME_SRC / jar
+        if src.is_file():
+            shutil.copy2(src, dest / jar)
+            copied.append(jar)
+    if not copied:
+        die(f"未从 {VAPOR_RUNTIME_SRC} 拷到任何 vapor 运行时 jar")
+    print(f"  ✓ vapor 运行时 → {mod.name}/vapor-libs ({len(copied)} jar)")
 
 
 def detect_namespace(export_dir: Path) -> str:
@@ -79,7 +126,24 @@ def has_abi_libs(libs: Path) -> bool:
     return False
 
 
-def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: bool) -> None:
+def plugin_uses_vapor(export_dir: Path) -> bool:
+    """判断插件源码是否引用 vapor 运行时（io.dcloud.uniappxv）。"""
+    for kt in export_dir.rglob("*.kt"):
+        try:
+            if "io.dcloud.uniappxv" in kt.read_text():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def write_module_gradle(
+    mod: Path,
+    namespace: str,
+    min_sdk: int,
+    jni_from_libs: bool,
+    uses_vapor: bool,
+) -> None:
     jni_block = ""
     if jni_from_libs:
         jni_block = """
@@ -89,6 +153,15 @@ def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: 
         }
     }
 """
+    # vapor 插件：从 SDK/libs fileTree 排除旧版运行时 aar（与 vapor jar 同包，防类重复）。
+    sdk_exclude = ""
+    if uses_vapor:
+        excludes = ", ".join(f"'**/{n}'" for n in VAPOR_SDK_LIBS_EXCLUDE)
+        sdk_exclude = f", exclude: [{excludes}]"
+    # vapor 运行时 jar 是 JVM 17 字节码，插件须用 jvmTarget 17 才能 inline，否则
+    # 报 “Cannot inline bytecode built with JVM target 17 into bytecode ... 1.8”。
+    jvm_target = "17" if uses_vapor else "1.8"
+    java_compat = "JavaVersion.VERSION_17" if uses_vapor else "JavaVersion.VERSION_1_8"
     text = f"""plugins {{
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
@@ -114,17 +187,19 @@ android {{
         }}
     }}
     compileOptions {{
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility {java_compat}
+        targetCompatibility {java_compat}
     }}
     kotlinOptions {{
-        jvmTarget = '1.8'
+        jvmTarget = '{jvm_target}'
     }}{jni_block}
 }}
 
 dependencies {{
-    compileOnly fileTree(include: ['*.aar'], dir: '../../SDK/libs')
+    compileOnly fileTree(include: ['*.aar'], dir: '../../SDK/libs'{sdk_exclude})
     compileOnly fileTree(include: ['*.aar', '*.jar'], dir: './libs')
+    // 蒸汽模式 vapor 运行时（uniappxv / fnJS），由 inject_all_uts_modules 拷贝注入
+    compileOnly fileTree(include: ['*.jar'], dir: './vapor-libs')
     compileOnly "com.alibaba:fastjson:1.2.83"
     compileOnly "androidx.core:core-ktx:1.10.1"
     compileOnly 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.3.8'
@@ -189,6 +264,8 @@ def inject_one(export_dir: Path) -> str:
     (mod / "libs").mkdir(parents=True)
     (mod / "src/main/java").mkdir(parents=True)
 
+    uses_vapor = plugin_uses_vapor(export_dir)
+
     libs_src = export_dir / "libs"
     jni = has_abi_libs(libs_src)
     if libs_src.is_dir():
@@ -199,9 +276,11 @@ def inject_one(export_dir: Path) -> str:
             else:
                 shutil.copy2(item, dst)
 
-    write_module_gradle(mod, namespace, min_sdk, jni)
+    write_module_gradle(mod, namespace, min_sdk, jni, uses_vapor)
     copy_manifest(export_dir, mod)
     copy_kotlin_sources(export_dir, mod)
+    # 蒸汽模式：vapor 插件注入 vapor 运行时 jar（compileOnly，含 uniappxv / fnJS）
+    copy_vapor_runtime(mod, uses_vapor)
 
     # 官方：插件 libs 的 aar/jar 也进主模块
     app_libs = PROJ / "app" / "libs"

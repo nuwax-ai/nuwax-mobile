@@ -61,24 +61,12 @@ APP_RESOURCES_DIR = Path(
     )
 )
 
-SAMPLE_MODULES = [
-    "test-invoke-network-api",
-    "uni-getbatteryinfo",
-    "uts-openSchema",
-    "uts-progressNotification",
-    "uts-get-native-view",
-    "native-button",
-    "native-time-picker",
-    "uni-stat",
-    "uni-openLocation",
-    "uts-button",
-    "uni-usercapturescreen",
-    "uts-worker",
-    "app-comm",
-    # 5.23 模板新增的原生示例模块，未列入会残留 implementation project() 引用导致
-    # UnknownProjectException（settings.gradle 已注释 include，但依赖行未剥离）。
-    "test-native-view",
-]
+# 蒸汽（vapor）模式下，uniappx 主模块的 index.kt 静态引用了官方示例页/插件
+# （uni-stat / native-button / uts-worker 等 2570 个演示组件）。vapor 业务是
+# app-service.js 字节码、不落 uniappx .kt，故示例模块必须全部保留编译，否则
+# uniappx:compileReleaseKotlin 批量 Unresolved reference。因此不再剥离任何示例
+# 模块（settings.gradle 全 include、build.gradle 全依赖），保持官方基座结构完整。
+SAMPLE_MODULES: list[str] = []
 
 # 本地离线基座不需要的远程三方（网络不可达 / 非 ESP 配网必需）
 # 个推 Maven 在部分网络下 TLS 握手失败，导致 assembleDebug 无法解析
@@ -109,14 +97,16 @@ def configure_settings() -> None:
     marker = WORK / "injected-uts-modules.txt"
     if marker.is_file():
         injected = {x.strip() for x in marker.read_text().splitlines() if x.strip()}
+    # vapor 模式：保留官方全部示例模块（uniappx index.kt 静态引用它们，剥则断链），
+    # 只追加注入的业务 uts 插件，不再注释任何 include。
     keep = {"app", "uniappx"} | injected | {"uts-nuwax-esp-provisioning"}
     lines = []
     for line in text.splitlines():
-        m = re.match(r"include\s+':([^']+)'", line.strip())
-        if m and m.group(1) not in keep:
-            if not line.strip().startswith("//"):
-                lines.append("// " + line + "  // stripped by configure_app")
-                continue
+        m_inc = re.match(r"include\s+':([^']+)'", line.strip())
+        if m_inc and line.strip().startswith("//"):
+            # 恢复此前被注释的示例模块 include（幂等）
+            lines.append(f"include ':{m_inc.group(1)}'")
+            continue
         lines.append(line)
     text = "\n".join(lines) + "\n"
     for name in sorted(keep - {"app", "uniappx"}):

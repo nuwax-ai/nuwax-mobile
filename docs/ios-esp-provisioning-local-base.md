@@ -47,7 +47,7 @@ source scripts/local-base-env.sh      # 自动派生 UNIAPPX_SDK_ROOT / IOS_ESP_
 > ⚠️ SDK 路径已迁移到 `$NUWAX_OFFLINE_SDK_HOME/sdk/ios/5.15/...`，**旧的 `/Users/.../UniAppX-iOS-5.15` 已作废**。
 
 - Xcode **26.3 / Swift 6.2.4**（与 `DCloudUniappRuntime` 匹配）  
-- bundle `com.nuwax.nuwa`；离线 AppKey / Team / Profile UUID 见 `scripts/local-secrets.env`（gitignore）
+- bundle `com.nuwax.app`；离线 AppKey / Team / Profile UUID 见 `scripts/local-secrets.env`（gitignore）
 
 ## 标准流程（A → B → C → D）
 

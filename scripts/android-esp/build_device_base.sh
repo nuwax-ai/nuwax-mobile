@@ -13,7 +13,7 @@ MAIN_ROOT="${NUWAX_MAIN_ROOT}"
 ANDROID_ESP_WORK="${ANDROID_ESP_WORK}"
 PROJ="${ANDROID_ESP_PROJECT:-$ANDROID_ESP_WORK/project}"
 OUT_DIR="${ANDROID_CUSTOM_BASE_OUT:-$WT_ROOT/out/android-custom-base}"
-BUNDLE="${ANDROID_BUNDLE_ID:-com.nuwax.nuwa}"
+BUNDLE="${ANDROID_BUNDLE_ID:-com.nuwax.app}"
 
 BUILD_TYPE="$(echo "${ANDROID_BUILD_TYPE:-debug}" | tr '[:upper:]' '[:lower:]')"
 case "$BUILD_TYPE" in

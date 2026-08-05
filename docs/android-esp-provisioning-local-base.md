@@ -22,7 +22,7 @@
 | UTS 插件 Android Library | `uts-nuwax-esp-provisioning` | 已对齐 |
 | 插件 libs → 模块 + 主模块 | `inject_esp_module.sh` | 已对齐 |
 | assets/apps/{appid} | `sync_local_pack_resources.sh` | 已对齐 |
-| `applicationId=com.nuwax.nuwa` | `configure_app.py` | 已对齐 |
+| `applicationId=com.nuwax.app` | `configure_app.py` | 已对齐 |
 | 方案1 `android_debug.apk` → `unpackage/debug/` | `build_device_base.sh` | 已对齐 |
 | 方案2 AS 联调 / HX 关联原生工程 | `setup_as.sh` | 已对齐 |
 
@@ -36,7 +36,7 @@ make sdk-fetch                        # 本机没有离线 SDK 时拉取（sdk/ 
 source scripts/local-base-env.sh      # 自动派生下列变量
 ```
 
-脚本自动设置（无需手动 export）：`UNIAPPX_ANDROID_SDK_ROOT`、`ANDROID_ESP_WORK`、`ANDROID_BUNDLE_ID`（=com.nuwax.nuwa）、`ANDROID_COMPILE_SDK`（=36）、`DCLOUD_APPKEY`。
+脚本自动设置（无需手动 export）：`UNIAPPX_ANDROID_SDK_ROOT`、`ANDROID_ESP_WORK`、`ANDROID_BUNDLE_ID`（=com.nuwax.app）、`ANDROID_COMPILE_SDK`（=36）、`DCLOUD_APPKEY`。
 
 > ⚠️ SDK 路径已迁移到 `$NUWAX_OFFLINE_SDK_HOME/sdk/android/5.15/...`，**旧的 `/Users/.../UniAppX-Android-5.15` 已作废**。
 
@@ -85,7 +85,7 @@ python3 scripts/android-esp/configure_app.py
 
 ### 已验证
 
-- `BUILD SUCCESSFUL`：`applicationId=com.nuwax.nuwa`，产物写入 `unpackage/debug/android_debug.apk`
+- `BUILD SUCCESSFUL`：`applicationId=com.nuwax.app`，产物写入 `unpackage/debug/android_debug.apk`
 - 注入模块：`uts-nuwax-esp-provisioning` / `uts-nuwax-android-native-pay` / `uts-uni-cmark` / `uts-uni-highlight`
 
 ## 真机验收

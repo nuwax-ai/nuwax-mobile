@@ -5,7 +5,7 @@
 敏感值通过环境变量注入，不写死进仓库：
   DCLOUD_APPKEY                 离线打包 AppKey（必填，除非 Info.plist 已有）
   IOS_DEVELOPMENT_TEAM          Apple Team ID（必填，写 scripts/local-secrets.env）
-  IOS_BUNDLE_ID                 默认 com.nuwax.nuwa
+  IOS_BUNDLE_ID                 默认 com.nuwax.app
   IOS_PROVISIONING_PROFILE_UUID 描述文件 UUID（手动签名时必填）
   UNIAPPX_SDK_ROOT              Demo 所在 SDK 根目录
   UNIAPPX_APPID                 默认 __UNI__8BF05E4
@@ -108,7 +108,7 @@ def main() -> int:
     appid = os.environ.get("UNIAPPX_APPID", "__UNI__8BF05E4")
     appkey = os.environ.get("DCLOUD_APPKEY") or None
     team = os.environ.get("IOS_DEVELOPMENT_TEAM")
-    bundle_id = os.environ.get("IOS_BUNDLE_ID", "com.nuwax.nuwa")
+    bundle_id = os.environ.get("IOS_BUNDLE_ID", "com.nuwax.app")
     profile = os.environ.get("IOS_PROVISIONING_PROFILE_UUID") or None
     # 默认 1：HX「运行到自定义基座」；发版离线包再设 UNIAPPX_IPATYPE=2
     ipatype = int(os.environ.get("UNIAPPX_IPATYPE", "1"))

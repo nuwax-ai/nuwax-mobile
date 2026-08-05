@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 配置 Android 离线宿主（官方 uniappxnativepackage）：
-- applicationId / namespace = com.nuwax.nuwa
+- applicationId / namespace = com.nuwax.app
 - DCLOUD_UNI_APPID = __UNI__8BF05E4
 - dcloud_appkey
 - 从 settings / app / uniappx 去掉示例 UTS 模块依赖，只保留 uniappx + 我们的插件
@@ -24,7 +24,7 @@ WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
 PROJ = WORK / "project"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APPID = os.environ.get("APPID", "__UNI__8BF05E4")
-BUNDLE = os.environ.get("ANDROID_BUNDLE_ID", "com.nuwax.nuwa")
+BUNDLE = os.environ.get("ANDROID_BUNDLE_ID", "com.nuwax.app")
 APP_NAME = os.environ.get(
     "APP_NAME",
     json.loads((PROJECT_ROOT / "manifest.json").read_text())["name"],
@@ -220,13 +220,13 @@ def ensure_release_uses_debug_signing(text: str) -> tuple[str, bool]:
 def configure_app_gradle() -> None:
     p = PROJ / "app" / "build.gradle"
     text = p.read_text()
-    text = text.replace(
-        "namespace 'com.example.uniappx_native_package'",
-        f"namespace '{BUNDLE}'",
-    )
-    text = text.replace(
-        'applicationId "com.example.uniappx_native_package"',
+    # 同时覆盖官方模板与已有工作副本中的旧包名，确保包名迁移后再次构建即可生效。
+    text = re.sub(r"namespace\s+['\"][^'\"]+['\"]", f"namespace '{BUNDLE}'", text, count=1)
+    text = re.sub(
+        r"applicationId\s+['\"][^'\"]+['\"]",
         f'applicationId "{BUNDLE}"',
+        text,
+        count=1,
     )
     # minSdk 至少 26（ESP 插件要求）
     text = re.sub(r"minSdk\s+\d+", "minSdk 26", text, count=1)

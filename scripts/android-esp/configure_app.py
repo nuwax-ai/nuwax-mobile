@@ -42,6 +42,10 @@ if not APPKEY:
 # 是否为 HBuilderX 自定义基座打入调试通道（debug-server + DCLOUD_DEBUG）。
 # 默认开启；正式发行包请设 ENABLE_HX_DEBUG=0，否则可能提示「正在加载调试框架」。
 ENABLE_HX_DEBUG = os.environ.get("ENABLE_HX_DEBUG", "1") != "0"
+# release 变体签名模式：tester 使用 debug；应用市场正式包使用 release。
+ANDROID_SIGNING_MODE = os.environ.get("ANDROID_SIGNING_MODE", "debug").strip().lower()
+if ANDROID_SIGNING_MODE not in {"debug", "release"}:
+    raise SystemExit("✗ ANDROID_SIGNING_MODE 仅支持 debug|release")
 # 本机若未装 platforms;android-36 / build-tools;35，可降到已安装的 34（官方示例默认常为 36）
 # 官方示例默认 compileSdk 36；本机需已装 platforms;android-36
 COMPILE_SDK = int(os.environ.get("ANDROID_COMPILE_SDK", "36"))
@@ -187,41 +191,72 @@ def strip_project_deps(gradle_path: Path) -> None:
     print(f"✓ 精简依赖: {gradle_path.relative_to(PROJ)}")
 
 
-def ensure_release_uses_debug_signing(text: str) -> tuple[str, bool]:
-    """
-    内测 Release 包：debuggable=false、无 HX debug-server，但用 debug keystore 签名，
-    以便 assembleRelease 无需正式证书即可安装。上架请另配正式 signingConfig。
-    """
-    changed = False
-    # 已配置则跳过，避免重复插入
-    if re.search(
-        r"buildTypes\s*\{[^}]*release\s*\{[^}]*signingConfig\s+signingConfigs\.debug",
-        text,
+def configure_release_signing(text: str) -> str:
+    """为 release 变体确定性配置内测或应用市场签名，不把密码写入工程。"""
+    marker_pattern = re.compile(
+        r"\n\s*// BEGIN NUWAX RELEASE SIGNING.*?"
+        r"// END NUWAX RELEASE SIGNING\s*\n",
         flags=re.DOTALL,
-    ):
-        return text, False
+    )
+    text = marker_pattern.sub("\n", text)
 
-    def _inject_signing(m: re.Match[str]) -> str:
-        nonlocal changed
-        block = m.group(0)
-        if "signingConfig" in block:
-            return block
-        changed = True
-        # 插在 release { 后第一行，保持原缩进风格
+    signing_name = "debug"
+    if ANDROID_SIGNING_MODE == "release":
+        required = [
+            "ANDROID_RELEASE_STORE_FILE",
+            "ANDROID_RELEASE_STORE_PASSWORD",
+            "ANDROID_RELEASE_KEY_ALIAS",
+            "ANDROID_RELEASE_KEY_PASSWORD",
+        ]
+        missing = [name for name in required if not os.environ.get(name)]
+        if missing:
+            die(f"正式签名配置缺失: {', '.join(missing)}")
+        store_file = Path(os.environ["ANDROID_RELEASE_STORE_FILE"]).expanduser()
+        if not store_file.is_file():
+            die(f"正式签名证书不存在: {store_file}")
+        signing_block = """
+    // BEGIN NUWAX RELEASE SIGNING — values are read from process environment
+    signingConfigs {
+        release {
+            storeFile file(System.getenv("ANDROID_RELEASE_STORE_FILE"))
+            storePassword System.getenv("ANDROID_RELEASE_STORE_PASSWORD")
+            keyAlias System.getenv("ANDROID_RELEASE_KEY_ALIAS")
+            keyPassword System.getenv("ANDROID_RELEASE_KEY_PASSWORD")
+            storeType System.getenv("ANDROID_RELEASE_STORE_TYPE") ?: "JKS"
+        }
+    }
+    // END NUWAX RELEASE SIGNING
+"""
+        signing_name = "release"
+
+    def _set_signing(m: re.Match[str]) -> str:
+        block = re.sub(
+            r"^\s*signingConfig\s+signingConfigs\.(?:debug|release)\s*$",
+            "",
+            m.group(0),
+            flags=re.MULTILINE,
+        )
         return re.sub(
             r"(release\s*\{\s*\n)",
-            r"\1            signingConfig signingConfigs.debug\n",
+            rf"\1            signingConfig signingConfigs.{signing_name}\n",
             block,
             count=1,
         )
 
-    text2 = re.sub(
+    text, count = re.subn(
         r"release\s*\{[^{}]*\}",
-        _inject_signing,
+        _set_signing,
         text,
         count=1,
     )
-    return text2, changed
+    if count != 1:
+        die("app/build.gradle 缺少可识别的 release buildType")
+    if ANDROID_SIGNING_MODE == "release":
+        if "buildTypes {" not in text:
+            die("app/build.gradle 缺少 buildTypes，无法配置正式签名")
+        text = text.replace("    buildTypes {", signing_block + "\n    buildTypes {", 1)
+    print(f"✓ release signingConfig=signingConfigs.{signing_name}")
+    return text
 
 
 def configure_app_gradle() -> None:
@@ -250,15 +285,13 @@ def configure_app_gradle() -> None:
         text,
         count=1,
     )
-    text, signed = ensure_release_uses_debug_signing(text)
+    text = configure_release_signing(text)
     p.write_text(text)
     print(
         f"✓ app applicationId/namespace={BUNDLE} "
         f"versionName={APP_VERSION_NAME} versionCode={APP_VERSION_CODE} "
         f"minSdk=26 compileSdk={COMPILE_SDK} targetSdk={TARGET_SDK}"
     )
-    if signed:
-        print("✓ release 使用 signingConfigs.debug（内测 assembleRelease 可装）")
 
 
 def configure_manifest() -> None:

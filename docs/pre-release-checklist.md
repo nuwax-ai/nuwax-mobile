@@ -4,7 +4,7 @@
 
 ## 🚫 必改（不改会出生产事故）
 
-- [ ] **`constants/config.uts:22-24`** —— 删除 `TODO 打包正式环境时要删除` 块（强制 `API_BASE_URL = testagent.xspaceagi.com`）。**不删 → release 包也走测试后端。** 同时确认 prod 分支 `API_BASE_URL = https://agent.nuwax.com`、Vox 走全局域名。
+- [x] **生产 API** —— 已删除强制测试域名覆盖；prod 分支使用 `https://agent.nuwax.com`，`android:release` 会在构建前再次检查。
 - [ ] **开发配网 PoP** —— 量产固件必须改为**每设备独立 PoP/salt/verifier**（契约 §7）。仓内 dev PoP 已脱敏（见下「已处理」），但联调设备仍用固定 PoP，发布前确认固件侧已切换。
 
 ## 🧹 调试残留（建议清理，非致命）
@@ -33,6 +33,8 @@ git check-ignore scripts/local-secrets.env
 # 3. 确认 config.uts 的 test 域名 TODO 已删
 grep -n "打包正式环境时要删除" constants/config.uts   # 应为空
 # 4. 确认 prod 环境分支正确（NODE_ENV=production 时走 agent.nuwax.com）
+# 5. 使用正式证书生成并验收 APK+AAB
+pnpm android:release
 ```
 
 > 关联：[offline-sdk-distribution-s3.md](./offline-sdk-distribution-s3.md) · [local-custom-base-maintenance.md](./local-custom-base-maintenance.md)

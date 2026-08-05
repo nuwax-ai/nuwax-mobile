@@ -1,6 +1,6 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
 # 详见 docs/local-custom-base-maintenance.md · docs/custom-base-distribution-s3.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch app-resource android-tester
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch app-resource android-tester android-release
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
@@ -15,6 +15,7 @@ help:
 	@echo "  make base-env             # 打印路径"
 	@echo "  make app-resource         # 生成本地打包App资源（HX CLI，iOS+Android，需 HX 已启动）"
 	@echo "  make android-tester       # 发测试：appResource → Release APK（无 HX 调试）"
+	@echo "  make android-release      # 正式上架：生产资源 → 正式签名 APK+AAB"
 	@echo ""
 	@echo "S3 分发（版本 = manifest versionName；同版本覆盖；fetch 默认最新）"
 	@echo "  make base-publish         # 上传当前 unpackage/debug 产物"
@@ -37,6 +38,10 @@ base-android:
 # 发给测试同学：流程化打接近发行性能的完整 APK（非上架证书）
 android-tester:
 	@bash "$(ROOT)scripts/android-esp/build_tester_release_apk.sh"
+
+# 应用市场正式包：生产配置、正式证书、APK+AAB，并执行签名/版本验收
+android-release:
+	@bash "$(ROOT)scripts/android-esp/build_store_release.sh"
 
 base-ios-device:
 	@bash "$(ROOT)scripts/ios-esp/package_device_base.sh"

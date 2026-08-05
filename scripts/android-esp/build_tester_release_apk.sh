@@ -113,6 +113,10 @@ else
   echo "✓ 资源已导出"
 fi
 
+# HBuilderX 的 publish app 固定按 production 编译；Android tester 明确改为测试接口。
+python3 "$SCRIPT_DIR/set_app_resource_api_env.py" \
+  test "$ROOT_DIR/unpackage/resources/app-android"
+
 # ---------- [2/4] Release 出包 ----------
 step 2 4 "出 Release 包（无 HX debug-server，assembleRelease）"
 bash "$SCRIPT_DIR/package_custom_base.sh"

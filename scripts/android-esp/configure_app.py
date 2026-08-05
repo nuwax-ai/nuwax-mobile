@@ -615,22 +615,45 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
 
 def relocate_main_activity() -> None:
     """迁移 SDK 示例入口，并将其改为无界面的业务 App 跳板。"""
-    old_root = PROJ / "app/src/main/java/com/example/uniappx_native_package"
-    new_root = PROJ / "app/src/main/java" / Path(*BUNDLE.split("."))
-    old_file = old_root / "MainActivity.kt"
+    java_root = PROJ / "app/src/main/java"
+    template_root = java_root / "com/example/uniappx_native_package"
+    new_root = java_root / Path(*BUNDLE.split("."))
+    old_file = template_root / "MainActivity.kt"
     activity_file = new_root / "MainActivity.kt"
 
-    if old_file.is_file():
+    # 包名迁移后的工作副本不再位于官方模板目录。目标文件不存在时，在 app
+    # 模块中定位已有入口类，避免 Manifest 的相对类名解析到一个不存在的类。
+    if not old_file.is_file() and not activity_file.is_file():
+        candidates = [
+            path
+            for path in java_root.rglob("MainActivity.kt")
+            if path != activity_file
+        ]
+        if len(candidates) == 1:
+            old_file = candidates[0]
+        elif len(candidates) > 1:
+            die(f"发现多个 MainActivity，无法确定迁移来源: {candidates}")
+
+    if old_file.is_file() and old_file != activity_file:
         new_root.mkdir(parents=True, exist_ok=True)
-        text = old_file.read_text().replace(
-            "package com.example.uniappx_native_package", f"package {BUNDLE}"
+        text, package_count = re.subn(
+            r"^package\s+[A-Za-z_][\w.]*",
+            f"package {BUNDLE}",
+            old_file.read_text(),
+            count=1,
+            flags=re.MULTILINE,
         )
+        if package_count != 1:
+            die(f"未能更新 {old_file} 的 package 声明")
         activity_file.write_text(text)
-        shutil.rmtree(old_root)
+        old_file.unlink()
+        old_root = old_file.parent
+        while old_root != java_root and not any(old_root.iterdir()):
+            old_root.rmdir()
+            old_root = old_root.parent
         print(f"✓ MainActivity → package {BUNDLE}")
     elif not activity_file.is_file():
-        print("⚠ 未找到 SDK MainActivity，跳过入口页处理")
-        return
+        die(f"未找到 SDK MainActivity，目标入口应为 {activity_file}")
 
     # SDK 默认 MainActivity 会显示两个「uni-app x-Native」示例按钮。它只应作为
     # 启动业务 UniAppActivity 的跳板，启动后立即结束，避免启动失败或返回时露出示例页。

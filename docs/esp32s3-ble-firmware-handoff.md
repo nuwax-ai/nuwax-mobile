@@ -23,7 +23,7 @@
 - `prov-ctrl` 是配网终态权威来源；`device-info` 只负责稳定身份和辅助诊断。
 - 自定义 endpoint：`device-info`（身份/诊断）与 `vox-config`（动态云端绑定，**必须在 WiFi 凭据下发之前**调用）。
 - `cloud_prov` capability 位于 `proto-ver` 的 `nuwax.cap`（**不**在 `prov.cap`）。
-- `vox-config` 三字段来源：`deviceId`=`device-info.serialNumber`=`bind.data.deviceId`；`deviceSecret`=`/api/app/devices/bind` 返回的最新值；`gatewayUrl`=App 环境 `VOX_DEVICE_WS_URL`（`bind` 响应不含）。详见 vox-config 交接文档。
+- `vox-config` 三字段来源：`deviceId`=`device-info.serialNumber`=`bind.data.deviceId`；`deviceSecret`=`/api/app/devices/bind` 返回的最新值；`gatewayUrl`=`bind.data.websocketUrl`，App 不再自行拼接。详见 vox-config 交接文档。
 - `cloud-config` / `credentialId` / `signature` / ECDSA bundle / claim-status 两阶段提交**已废弃**，不得继续实现。
 
 ## 校验命令

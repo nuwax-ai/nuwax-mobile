@@ -20,9 +20,9 @@
 
 | 能力 | 状态 | PC web | main 旧版(mp-html) | 说明 / 缺口 |
 |---|---|---|---|---|
-| 标题 H1-H6 | ✅ | ✅ | ✅ | 含行内公式混排 |
-| 段落 | ✅ | ✅ | ✅ | |
-| 有序/无序列表 | ✅ | ✅ | ✅ | 含行内公式混排 |
+| 标题 H1-H6 | ⚠️ 不完善 | ✅ | ✅ | 含行内公式混排；**App 行内公式为原文降级**（见「App 行内公式混排」） |
+| 段落 | ⚠️ 不完善 | ✅ | ✅ | **App 含行内公式段落不走 mixed-box**，走 `uni-ai-text-md` 显示裸 LaTeX |
+| 有序/无序列表 | ⚠️ 不完善 | ✅ | ✅ | 含行内公式混排；**App 行内公式为原文降级** |
 | 代码块 + 语法高亮 | ✅ | ✅ | ✅ | App+H5 统一 `parseLineCode`（uni-highlight/TextMate）。**关键**：含 ```` ``` ```` 的消息整段走 fallback，故高亮须在 fallback 代码块分支接入（`appMarkdownFallback.uts:highlightCodeBlock`）；SDK `parseMarkdown.uts` 的 `#ifdef WEB` 跳过已移除。曾误标 ✅（App 实走 fallback 未分词→纯文本），现已修复。未提交 WIP：H5 wasm 路径校验、App 高亮全局串行 |
 | 行内代码 `` ` `` | ✅ | ✅ | ✅ | |
 | 表格 GFM | ✅ | ✅ | ✅ | 横滚 + 复制/下载 markdown + 单元格公式 + 对齐 + 空表头剔除 |
@@ -35,14 +35,15 @@
 
 | 能力 | 状态 | PC web | main 旧版(mp-html) | 说明 / 缺口 |
 |---|---|---|---|---|
-| inline `$...$` | ✅ | ✅ | ✅ | App 截图 / H5 v-html |
-| inline `\(...\)` | ✅ | ✅ | ✅ | `12397a98` fallback `parseInline` 已识别；流式未闭合不渲 |
+| inline `$...$` | ⚠️ 不完善 | ✅ | ✅ | **H5** v-html 正常。**App 当前降级为 LaTeX 原文**（`uni-ai-x-msg.uvue`：`hasMathToken` 在 App 恒 false，段落不走 mixed-box；列表/标题 math token 直接 `<text>{{ token.text }}</text>`）。根因：uvue `<text>` 不能嵌 `<image>`，行内公式截图混排会断行/留白；块级公式不受影响 |
+| inline `\(...\)` | ⚠️ 不完善 | ✅ | ✅ | 解析已识别（`12397a98` fallback）；**App 展示同 `$...$`，仍为原文降级** |
 | block `$$...$$` | ✅ | ✅ | ✅ | |
 | block `\[...\]` | ✅ | ✅ | ✅ | `12397a98` 支持跨行闭合；未闭合不渲 |
 | ```` ```math ```` 代码块 | ✅ | — | ❌ | mobile 特有 |
 | 公式闭合才渲染（流式） | ✅ | ✅(隐式) | — | 未闭合不渲、等补全 |
 | KaTeX 磁盘缓存 + 并发去重 | ✅ | — | ❌ | App 截图优化 |
 | **H5 公式换行/折断** | ✅ | ✅(原生矢量) | ✅ | 已治本：`displayMode` 区分 + `::v-deep` 穿透 scoped（`ac6333f5`）+ nowrap + 超长横滚（`935a7552`）。未提交 WIP：放得下居中无滚动条、宽扁才套最小高度 |
+| **App 行内公式混排** | ⚠️ **待优化** | ✅(原生矢量) | ✅ | **当前 App 段落/列表/标题行内公式显示 LaTeX 原文**，非 KaTeX 图。待优化方向：行内截图尺寸/基线对齐、flex 混排不断行、或原生矢量方案；表格单元格仍走 `katex-el`（待一并验证） |
 
 ## 三、图表 / 媒体
 
@@ -89,9 +90,10 @@
 2. citation 角标（PC 也无，可不做）
 
 ### 不完善 ⚠️（已有但有缺陷）
-1. 嵌套列表层级（fallback 仍单层）
-2. 图片错误占位（加载失败无占位图）
-3. 斜体 `_text_`（仅 `*`，下划线形式未做）
+1. **App 行内公式显示原文**（段落/列表/标题）★观感问题，待优化混排方案
+2. 嵌套列表层级（fallback 仍单层）
+3. 图片错误占位（加载失败无占位图）
+4. 斜体 `_text_`（仅 `*`，下划线形式未做）
 
 ### 已完成 ✅（原对齐范围 A/B/C + 跟进 fix）
 1. ~~`\(...\)` 行内公式定界符（fallback）~~ → `12397a98`
@@ -112,3 +114,6 @@
 - **宽扁公式最小高度**：仅 `aspect≥6` 且矮时套 `BLOCK_MIN_DISPLAY_HEIGHT=44`，避免窄/高公式被过度放大
 - **代码高亮稳定性**：App `highlightCodeBlock` 全局串行（防 `ConcurrentModificationException`）；H5 `_onig.wasm` 改走 `static/uni-highlight/` + `\0asm` 魔数校验；`parseCode` 初始化/tokenize 失败返回 error 不再挂起回调
 - **调试页**：`pages/test-katex-app` 同步 fits/scroll 行为；`pages.json` tab 入口暂清空（本地调试用）
+
+### 待优化 backlog（已知问题，未开工）
+- **App 行内公式混排**：恢复 KaTeX 展示（替代 LaTeX 原文），需解决 uvue 行内 `<image>` 断行/留白；涉及 `uni-ai-x-msg.uvue`（`hasMathToken`、列表/标题 math 分支）及 `katex-el` 行内尺寸

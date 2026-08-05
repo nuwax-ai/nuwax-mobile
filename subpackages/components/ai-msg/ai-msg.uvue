@@ -105,7 +105,6 @@
   import { TaskStatus } from "@/types/enums/agent";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { groupMarkdownContainers } from "@/utils/markdown.uts";
-  import { stripIncompleteCustomMarkupTail } from "@/utils/markdownCustomProcess.uts";
   import {
     stripMarkdownImages,
   } from "@/subpackages/components/ai-msg/markdownImage.uts";
@@ -321,20 +320,15 @@
     return propText.length > 0 ? propText : msgBody;
   }
 
-  /** 工具标签规范化；agent-info 只剥离不展示；完整图片留在正文原位；流式中半截自定义标签隐藏。 */
+  /** 工具标签规范化；agent-info 只剥离不展示；完整图片留在正文原位。 */
   function resolveRenderableBodyText(): string {
-    const base = stripOpenUiActionIdMarker(
+    return stripOpenUiActionIdMarker(
       stripMarkdownImages(
         stripAdaptedAgentInfoHtml(
           stripAgentInfoTags(groupMarkdownContainers(resolveBodyText())),
         ),
       ),
     );
-    // 仅流式进行中剥离半截标签；结束后保留原文，避免误截导致终态丢字
-    if (props.isConversationActive == true && props.isLastMsg == true) {
-      return stripIncompleteCustomMarkupTail(base);
-    }
-    return base;
   }
 
   /**
@@ -384,13 +378,13 @@
 
   /**
    * 流式 Markdown 解析：
-   * - 纯文本 / 工具卡等自定义标签：50ms 合并
-   * - 公式 / 代码 / 表 / 图：20ms 合并
-   * - 半截自定义标签先剥离，完整后再出卡
+   * - 纯文本：120ms 合并，接近真流式
+   * - 含公式/代码/表/图：每个 chunk 立刻 parse（L1 缓存避免公式重复截图）
    */
-  const STREAM_MD_TEXT_INTERVAL_MS: number = 50;
-  const STREAM_MD_CUSTOM_INTERVAL_MS: number = 50;
-  const STREAM_MD_STRUCTURAL_INTERVAL_MS: number = 20;
+  const STREAM_MD_TEXT_INTERVAL_MS: number = 120;
+  // 结构化内容（公式/代码/表/图）合并窗：原每 chunk 立即 parse，复杂 markdown 时把整段正文
+  // O(n) 全量解析打到每 40ms 一次 → 卡死。改为 80ms 合并，解析次数立减一半以上。
+  const STREAM_MD_STRUCT_INTERVAL_MS: number = 80;
   let streamMdParseTimer: number = 0;
   let streamMdParsePending: boolean = false;
 
@@ -403,38 +397,14 @@
   }
 
   function bodyHasStructuralMarkup(body: string): boolean {
-    // 与 prefersAppStructuralFallback 对齐：避免正文普通 `$` / `|` 误判为结构块
-    if (body.indexOf("```") >= 0) {
-      return true;
-    }
-    if (body.indexOf("![") >= 0) {
-      return true;
-    }
-    if (body.indexOf("$$") >= 0) {
-      return true;
-    }
-    if (body.indexOf("\\[") >= 0 || body.indexOf("\\(") >= 0) {
-      return true;
-    }
-    if (body.indexOf("|") >= 0) {
-      if (
-        body.indexOf("---") >= 0 ||
-        body.indexOf(":--") >= 0 ||
-        body.indexOf("--:") >= 0 ||
-        body.indexOf(":-:") >= 0
-      ) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function bodyHasCustomMarkupForThrottle(body: string): boolean {
     return (
       body.indexOf("markdown-custom-process") >= 0 ||
       body.indexOf(":::container") >= 0 ||
       body.indexOf("<task-result") >= 0 ||
-      body.toLowerCase().indexOf("<conversation") >= 0
+      body.indexOf("$") >= 0 ||
+      body.indexOf("|") >= 0 ||
+      body.indexOf("![") >= 0 ||
+      body.indexOf("```") >= 0
     );
   }
 
@@ -520,6 +490,23 @@
     streamRevision.value = streamRevision.value + 1;
   }
 
+  /** 合并高频 chunk 后解析：intervalMs 合并窗内多次调用只解析一次 */
+  function scheduleMergedParse(intervalMs: number): void {
+    streamMdParsePending = true;
+    if (streamMdParseTimer != 0) {
+      return;
+    }
+    streamMdParseTimer = setTimeout(() => {
+      streamMdParseTimer = 0;
+      if (streamMdParsePending == false) {
+        return;
+      }
+      streamMdParsePending = false;
+      markdownParser.runMarkdownParse(false);
+      streamRevision.value = streamRevision.value + 1;
+    }, intervalMs);
+  }
+
   /** 流式：合并高频 chunk 后再解析；非流式：立即解析；首帧无结果时立即解析 */
   function scheduleBodyMarkdownParse(): void {
     const streaming =
@@ -534,35 +521,12 @@
       return;
     }
     const body = resolveRenderableBodyText();
-    // 公式/代码/表/图：20ms；自定义标签与纯文本：50ms
-    let intervalMs = STREAM_MD_TEXT_INTERVAL_MS;
+    // 公式/代码/表/图：纳入 80ms 合并（原每 chunk 立即 parse 会 O(n) 全量解析卡死）
     if (bodyHasStructuralMarkup(body) == true) {
-      intervalMs = STREAM_MD_STRUCTURAL_INTERVAL_MS;
-    } else if (bodyHasCustomMarkupForThrottle(body) == true) {
-      intervalMs = STREAM_MD_CUSTOM_INTERVAL_MS;
-    }
-    streamMdParsePending = true;
-    if (streamMdParseTimer != 0) {
+      scheduleMergedParse(STREAM_MD_STRUCT_INTERVAL_MS);
       return;
     }
-    streamMdParseTimer = setTimeout(() => {
-      streamMdParseTimer = 0;
-      if (streamMdParsePending == false) {
-        return;
-      }
-      streamMdParsePending = false;
-      const bodyBefore = resolveRenderableBodyText();
-      markdownParser.runMarkdownParse(false);
-      streamRevision.value = streamRevision.value + 1;
-      // 若本轮解析后正文相对解析前又变化（极端同 tick 写入），再排一次避免停在半截
-      if (
-        isConversationActive.value == true &&
-        isLastMsg.value == true &&
-        resolveRenderableBodyText() != bodyBefore
-      ) {
-        scheduleBodyMarkdownParse();
-      }
-    }, intervalMs);
+    scheduleMergedParse(STREAM_MD_TEXT_INTERVAL_MS);
   }
 
   const renderMarkdownElList = computed((): UniAiMarkdownElItem[] => {
@@ -699,7 +663,7 @@
     (): string => (props.bodyText != null ? `${props.bodyText}` : ""),
     (v: string) => {
       msg.value.body = v;
-      // 流式最后一条：由 scheduleBodyMarkdownParse（文本/工具卡 50ms，结构块 20ms）驱动渲染，
+      // 流式最后一条：由 scheduleBodyMarkdownParse（200ms）驱动渲染，
       // 避免每字 bump streamRevision 导致 App 端整树重绘卡顿。
       if (isConversationActive.value == true && isLastMsg.value == true) {
         return;

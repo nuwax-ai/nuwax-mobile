@@ -20,6 +20,7 @@ import {
   getMathCache,
   putMathCache,
 } from "@/subpackages/components/ai-msg/mathFormulaDiskCache.uts";
+import { perfRecordMathBatch } from "@/utils/perfProbe.uts";
 
 type MathRenderedCallback = () => void;
 
@@ -98,6 +99,16 @@ class MathDedupeGroup {
   tokens: MarkdownToken[] = [] as MarkdownToken[];
 }
 
+/** KaTeX 并发上限：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥队列（公式多时卡死） */
+const MAX_CONCURRENT_KATEX: number = 2;
+
+/**
+ * 跨 frame 在途公式（已 dispatch 未回调）key → 等待的同 key token。
+ * 堵「首个 dispatch 在途、L1 未写，下一 chunk 全量解析又遇同一闭合公式」的重复 dispatch。
+ * 命中时 token 挂入等待列表，dispatch 回调统一扇出，不再重复 evalJS。
+ */
+let mathInFlightTokens: Map<string, MarkdownToken[]> = new Map<string, MarkdownToken[]>();
+
 /**
  * App 专用：并行派发 katexRender（proxy 多槽）。
  * 命中磁盘缓存则跳过截图；相同 latex 去重；按 chunk 上屏减轻抖动。
@@ -109,6 +120,9 @@ class MathBatchUiRunner {
   buffered: PendingMathResult[] = [] as PendingMathResult[];
   /** 多条一起刷，减轻历史长文「一张一抖」；仍远小于旧的整页齐套 */
   chunkSize: number = 4;
+  /** KaTeX 并发闸：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥队列 → 卡死 */
+  inFlight: number = 0;
+  queue: MathDedupeGroup[] = [] as MathDedupeGroup[];
 
   constructor(jobs: PendingMathJob[], onChunkReady: MathRenderedCallback) {
     this.jobs = jobs;
@@ -126,6 +140,12 @@ class MathBatchUiRunner {
         hitResults.push(
           new PendingMathResult(job.token, cacheEntryToRes(cached)),
         );
+        continue;
+      }
+      // 跨 frame 在途去重：该 latex 已在 dispatch 未回调 → 挂等待列表，不再重复 dispatch
+      const inFlightWaiters = mathInFlightTokens.get(key);
+      if (inFlightWaiters != null) {
+        inFlightWaiters.push(job.token);
         continue;
       }
       let group: MathDedupeGroup | null = null;
@@ -155,11 +175,33 @@ class MathBatchUiRunner {
 
     this.pending = groups.length;
     this.buffered = [] as PendingMathResult[];
+    // [PerfProbe] 观测：公式 batch 缓存命中数 vs 实际 dispatch 数（性能排查，可关）
+    try {
+      perfRecordMathBatch(hitResults.length, groups.length);
+    } catch (_e) {
+      // 埋点失败静默
+    }
     if (groups.length == 0) {
       return;
     }
-    for (let gi = 0; gi < groups.length; gi++) {
-      this.dispatchGroup(groups[gi]);
+    // 并发闸：入队后按 MAX_CONCURRENT_KATEX 匀速 pump，不再一次性全 dispatch 打满 WebView 桥
+    this.queue = groups;
+    this.inFlight = 0;
+    this.pump();
+  }
+
+  /** 按并发上限持续派发队列中的 group；每个 dispatch 回调后再 pump 续发 */
+  pump(): void {
+    while (
+      this.inFlight < MAX_CONCURRENT_KATEX &&
+      this.queue.length > 0
+    ) {
+      const group = this.queue.shift();
+      if (group == null) {
+        break;
+      }
+      this.inFlight = this.inFlight + 1;
+      this.dispatchGroup(group);
     }
   }
 
@@ -183,22 +225,31 @@ class MathBatchUiRunner {
     const latex = group.latex;
     const displayMode = group.displayMode;
     const doDispatch = (): void => {
+      // 登记在途：同 key 后续 chunk 会挂入 mathInFlightTokens 等待列表而非重复 dispatch
+      mathInFlightTokens.set(cacheKey, tokens);
       const param = new UTSJSONObject();
       param["action"] = "katexRender";
       param["pureMathText"] = latex;
       param["displayMode"] = displayMode;
       proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
         putMathCache(cacheKey, res);
-        for (let ti = 0; ti < tokens.length; ti++) {
-          runner.buffered.push(new PendingMathResult(tokens[ti], res));
+        // 扇出给 group.tokens + 跨 frame 挂入的等待 token（同一 list 引用，含已追加的等待者）
+        const fanout = mathInFlightTokens.get(cacheKey);
+        mathInFlightTokens.delete(cacheKey);
+        const targets = fanout != null ? fanout : tokens;
+        for (let ti = 0; ti < targets.length; ti++) {
+          runner.buffered.push(new PendingMathResult(targets[ti], res));
         }
         runner.pending = runner.pending - 1;
+        runner.inFlight = runner.inFlight - 1;
         if (
           runner.buffered.length >= runner.chunkSize ||
           runner.pending == 0
         ) {
           runner.flushBuffered();
         }
+        // 一个回调完成，续发队列中下一个（保持 ≤MAX_CONCURRENT_KATEX 在途）
+        runner.pump();
       });
     };
     // 未命中磁盘缓存才需要 proxy；未就绪时等 webview，避免 callMethod 空转

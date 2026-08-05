@@ -42,7 +42,7 @@ if not APPKEY:
 # 是否为 HBuilderX 自定义基座打入调试通道（debug-server + DCLOUD_DEBUG）。
 # 默认开启；正式发行包请设 ENABLE_HX_DEBUG=0，否则可能提示「正在加载调试框架」。
 ENABLE_HX_DEBUG = os.environ.get("ENABLE_HX_DEBUG", "1") != "0"
-# release 变体签名模式：tester 使用 debug；应用市场正式包使用 release。
+# Android 变体签名模式：release 时 debug/release 两个变体统一使用正式证书。
 ANDROID_SIGNING_MODE = os.environ.get("ANDROID_SIGNING_MODE", "debug").strip().lower()
 if ANDROID_SIGNING_MODE not in {"debug", "release"}:
     raise SystemExit("✗ ANDROID_SIGNING_MODE 仅支持 debug|release")
@@ -192,7 +192,7 @@ def strip_project_deps(gradle_path: Path) -> None:
 
 
 def configure_release_signing(text: str) -> str:
-    """为 release 变体确定性配置内测或应用市场签名，不把密码写入工程。"""
+    """为 debug/release 变体确定性配置签名，不把密码写入工程。"""
     marker_pattern = re.compile(
         r"\n\s*// BEGIN NUWAX RELEASE SIGNING.*?"
         r"// END NUWAX RELEASE SIGNING\s*\n",
@@ -231,31 +231,46 @@ def configure_release_signing(text: str) -> str:
 
     def _set_signing(m: re.Match[str]) -> str:
         block = re.sub(
-            r"^\s*signingConfig\s+signingConfigs\.(?:debug|release)\s*$",
+            r"^[ \t]*signingConfig[ \t]+signingConfigs\.(?:debug|release)[ \t]*\n?",
             "",
             m.group(0),
             flags=re.MULTILINE,
         )
         return re.sub(
-            r"(release\s*\{\s*\n)",
+            r"((?:debug|release)\s*\{\s*\n)",
             rf"\1            signingConfig signingConfigs.{signing_name}\n",
             block,
             count=1,
         )
 
-    text, count = re.subn(
+    text, release_count = re.subn(
         r"release\s*\{[^{}]*\}",
         _set_signing,
         text,
         count=1,
     )
-    if count != 1:
+    if release_count != 1:
         die("app/build.gradle 缺少可识别的 release buildType")
+    text, debug_count = re.subn(
+        r"debug\s*\{[^{}]*\}",
+        _set_signing,
+        text,
+        count=1,
+    )
+    if debug_count == 0:
+        text = text.replace(
+            "    buildTypes {",
+            "    buildTypes {\n"
+            "        debug {\n"
+            f"            signingConfig signingConfigs.{signing_name}\n"
+            "        }",
+            1,
+        )
     if ANDROID_SIGNING_MODE == "release":
         if "buildTypes {" not in text:
             die("app/build.gradle 缺少 buildTypes，无法配置正式签名")
         text = text.replace("    buildTypes {", signing_block + "\n    buildTypes {", 1)
-    print(f"✓ release signingConfig=signingConfigs.{signing_name}")
+    print(f"✓ debug/release signingConfig=signingConfigs.{signing_name}")
     return text
 
 

@@ -18,7 +18,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from local_base_paths import default_android_esp_work
+from local_base_paths import (
+    android_sdk_build,
+    default_android_esp_work,
+    hx_version,
+)
 
 WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
 PROJ = WORK / "project"
@@ -67,6 +71,9 @@ SAMPLE_MODULES = [
     "uni-usercapturescreen",
     "uts-worker",
     "app-comm",
+    # 5.23 模板新增的原生示例模块，未列入会残留 implementation project() 引用导致
+    # UnknownProjectException（settings.gradle 已注释 include，但依赖行未剥离）。
+    "test-native-view",
 ]
 
 # 本地离线基座不需要的远程三方（网络不可达 / 非 ESP 配网必需）
@@ -508,9 +515,12 @@ def configure_launcher_icon() -> None:
 
 def find_debug_server_aar() -> Path | None:
     """在离线 SDK 中定位 debug-server-release.aar（HX 日志/资源同步依赖）。"""
+    sdk_dir = (
+        f"Android-uni-app-x-SDK@{android_sdk_build()}-{hx_version()}"
+    )
     candidates = [
         WORK / "sdk-root" / "SDK" / "libs" / "debug-server-release.aar",
-        WORK / "Android-uni-app-x-SDK@14915-5.15" / "SDK" / "libs" / "debug-server-release.aar",
+        WORK / sdk_dir / "SDK" / "libs" / "debug-server-release.aar",
         # project/app → ../../SDK/libs（官方示例相对路径）
         PROJ / ".." / "SDK" / "libs" / "debug-server-release.aar",
     ]

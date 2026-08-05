@@ -16,7 +16,10 @@
 _NUWAX_LB_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _NUWAX_REPO_ROOT="$(cd "$_NUWAX_LB_ENV_DIR/.." && pwd)"
 
-export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.15}"
+# 版本默认对齐本机 HBuilderX-Alpha（蒸汽模式 vapor 需 Android 编译器 5.21+，见 docs）
+export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.23}"
+# Android 离线 SDK 构建号（官方包名 Android-uni-app-x-SDK@<build>-<ver>；5.23=14987，5.15=14915）
+export NUWAX_ANDROID_SDK_BUILD="${NUWAX_ANDROID_SDK_BUILD:-14987}"
 export NUWAX_WORKSPACE_ROOT="${NUWAX_WORKSPACE_ROOT:-$HOME/workspace}"
 export NUWAX_OFFLINE_SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-mobile-offline-sdk}"
 export NUWAX_SDK_ROOT="${NUWAX_SDK_ROOT:-$NUWAX_OFFLINE_SDK_HOME/sdk}"
@@ -38,9 +41,9 @@ export IOS_ESP_OUT="${IOS_ESP_OUT:-$IOS_ESP_BUILD_ROOT/out}"
 export IOS_ESP_FRAMEWORKS_DIR="${IOS_ESP_FRAMEWORKS_DIR:-$IOS_ESP_BUILD_ROOT/official/build/frameworks-iphoneos}"
 
 # ---------- Android ----------
-export UNIAPPX_ANDROID_SDK_ROOT="${UNIAPPX_ANDROID_SDK_ROOT:-$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}}"
+export UNIAPPX_ANDROID_SDK_ROOT="${UNIAPPX_ANDROID_SDK_ROOT:-$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@${NUWAX_ANDROID_SDK_BUILD}-${NUWAX_HX_VERSION}}"
 if [[ ! -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
-  _ALT="$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}"
+  _ALT="$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@${NUWAX_ANDROID_SDK_BUILD}-${NUWAX_HX_VERSION}"
   if [[ -d "$_ALT/uniappxnativepackage" ]]; then
     export UNIAPPX_ANDROID_SDK_ROOT="$_ALT"
   fi
@@ -65,6 +68,7 @@ fi
 
 if [[ "${NUWAX_LOCAL_BASE_ENV_VERBOSE:-0}" == "1" ]]; then
   echo "NUWAX_HX_VERSION=$NUWAX_HX_VERSION"
+  echo "NUWAX_ANDROID_SDK_BUILD=$NUWAX_ANDROID_SDK_BUILD"
   echo "NUWAX_OFFLINE_SDK_HOME=$NUWAX_OFFLINE_SDK_HOME"
   echo "NUWAX_MAIN_ROOT=$NUWAX_MAIN_ROOT"
   echo "UNIAPPX_SDK_ROOT=$UNIAPPX_SDK_ROOT"

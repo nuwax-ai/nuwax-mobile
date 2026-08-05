@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 阶段 A：校验 / 引导 UniAppX Android 5.15 离线 SDK 工作副本
+# 阶段 A：校验 / 引导 UniAppX Android 离线 SDK 工作副本（默认 5.23，蒸汽模式需 5.21+）
 #
-# 官方包：Android-uni-app-x-SDK@14915-5.15
-# 下载：https://web-ext-storage.dcloud.net.cn/uni-app-x/sdk/Android/Android-uni-app-x-SDK@14915-5.15.zip
+# 官方包：Android-uni-app-x-SDK@${NUWAX_ANDROID_SDK_BUILD}-${NUWAX_HX_VERSION}（如 @14987-5.23）
+# 下载：https://web-ext-storage.dcloud.net.cn/uni-app-x/sdk/Android/Android-uni-app-x-SDK@${NUWAX_ANDROID_SDK_BUILD}-${NUWAX_HX_VERSION}.zip
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -12,8 +12,9 @@ source "$SCRIPT_DIR/../../local-base-env.sh"
 
 UNIAPPX_ANDROID_SDK_ROOT="${UNIAPPX_ANDROID_SDK_ROOT}"
 ANDROID_ESP_WORK="${ANDROID_ESP_WORK}"
+SDK_DIR_NAME="Android-uni-app-x-SDK@${NUWAX_ANDROID_SDK_BUILD}-${NUWAX_HX_VERSION}"
 SDK_ZIP="${ANDROID_SDK_ZIP:-$NUWAX_SDK_ARCHIVES/UniAppX-Android-${NUWAX_HX_VERSION}.zip}"
-SDK_URL="${ANDROID_SDK_URL:-https://web-ext-storage.dcloud.net.cn/uni-app-x/sdk/Android/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}.zip}"
+SDK_URL="${ANDROID_SDK_URL:-https://web-ext-storage.dcloud.net.cn/uni-app-x/sdk/Android/${SDK_DIR_NAME}.zip}"
 
 download_sdk() {
   if [[ -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
@@ -22,7 +23,7 @@ download_sdk() {
   fi
   mkdir -p "$(dirname "$SDK_ZIP")"
   if [[ ! -f "$SDK_ZIP" ]]; then
-    echo "下载 Android SDK 5.15 ..."
+    echo "下载 Android SDK ${NUWAX_HX_VERSION}（${SDK_DIR_NAME}）..."
     curl -L --fail --progress-bar -o "$SDK_ZIP" "$SDK_URL"
   fi
   local dest
@@ -34,7 +35,7 @@ download_sdk() {
 
 bootstrap_work() {
   mkdir -p "$ANDROID_ESP_WORK"
-  local target="$ANDROID_ESP_WORK/Android-uni-app-x-SDK@14915-5.15"
+  local target="$ANDROID_ESP_WORK/${SDK_DIR_NAME}"
   if [[ ! -d "$target/uniappxnativepackage" ]] || [[ "${FORCE_BOOTSTRAP:-0}" == "1" ]]; then
     echo "同步工作副本 → $target"
     rm -rf "$target"
@@ -51,7 +52,7 @@ bootstrap_work() {
 download_sdk
 # 若用户只解压了 zip，校正 ROOT
 if [[ ! -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
-  ALT="$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}"
+  ALT="$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/${SDK_DIR_NAME}"
   if [[ -d "$ALT/uniappxnativepackage" ]]; then
     UNIAPPX_ANDROID_SDK_ROOT="$ALT"
   fi

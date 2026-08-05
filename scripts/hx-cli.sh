@@ -14,13 +14,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CLI="${HX_CLI:-/Applications/HBuilderX.app/Contents/MacOS/cli}"
+# 蒸汽模式 vapor 需 5.21+，默认用 Alpha；稳定版可设 HX_CLI 覆盖
+CLI="${HX_CLI:-/Applications/HBuilderX-Alpha.app/Contents/MacOS/cli}"
 # publish appResource 官方更推荐绝对路径；launch/logcat 用已导入项目名亦可
 PROJECT="${HX_PROJECT:-$ROOT_DIR}"
 
 if [[ ! -x "$CLI" ]]; then
   echo "找不到 HBuilderX CLI: $CLI" >&2
-  echo "请安装 HBuilderX 5.15+，或设置 HX_CLI=/path/to/cli" >&2
+  echo "请安装 HBuilderX-Alpha 5.21+（蒸汽模式），或设置 HX_CLI=/path/to/cli" >&2
   exit 1
 fi
 

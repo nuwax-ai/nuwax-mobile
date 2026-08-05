@@ -2,13 +2,14 @@
 # 阶段 D：组装 APK → unpackage/debug/，并可选安装真机
 #
 # ANDROID_BUILD_TYPE=debug（默认）→ android_debug.apk（HX 自定义基座联调）
-# ANDROID_BUILD_TYPE=release      → android_release.apk（接近发行性能，内测用 debug 签名）
+# ANDROID_BUILD_TYPE=release      → android_release.apk（接近发行性能，与调试包共用正式签名）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=../local-base-env.sh
 source "$SCRIPT_DIR/../local-base-env.sh"
+export ANDROID_SIGNING_MODE="${ANDROID_SIGNING_MODE:-release}"
 MAIN_ROOT="${NUWAX_MAIN_ROOT}"
 ANDROID_ESP_WORK="${ANDROID_ESP_WORK}"
 PROJ="${ANDROID_ESP_PROJECT:-$ANDROID_ESP_WORK/project}"

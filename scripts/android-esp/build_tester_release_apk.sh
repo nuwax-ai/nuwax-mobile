@@ -132,7 +132,7 @@ fi
 # ---------- [4/4] 验收摘要 ----------
 step 4 4 "验收摘要（发给测试）"
 SIZE="$(du -h "$DELIVER_APK" | awk '{print $1}')"
-echo "包名（applicationId）: com.nuwax.nuwa"
+echo "包名（applicationId）: com.nuwax.app"
 echo "体积: $SIZE"
 echo "主文件: $RELEASE_APK"
 echo "交付: $DELIVER_APK"

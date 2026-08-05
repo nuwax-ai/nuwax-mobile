@@ -12,7 +12,7 @@
 
 共性：
 
-- appid `__UNI__8BF05E4`，包名 / bundle `com.nuwax.nuwa`
+- appid `__UNI__8BF05E4`，包名 / bundle `com.nuwax.app`
 - HX「生成本地打包 App 资源」→ 同步到离线宿主 → 打 debug 基座 → `unpackage/debug/`
 - 插件：`uni_modules/nuwax-esp-provisioning`
 - 云打包路径保留作兜底

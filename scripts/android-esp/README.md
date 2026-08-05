@@ -71,6 +71,8 @@ ANDROID_RELEASE_FORMATS=aab pnpm android:release
 | `ANDROID_SIGNING_MODE` | `release` | `release` 统一使用 `ANDROID_RELEASE_*` 证书；仅临时排障时可覆盖为 `debug`。 |
 | `ENABLE_HX_DEBUG` | `1` | `0` 去掉 debug-server / DCLOUD_DEBUG |
 
+Debug 包保留 LeakCanary 内存泄漏检测，但构建脚本会关闭其名为 `Leaks` 的桌面图标与动态快捷方式。
+
 注意：官方示例把 LeakCanary 写成 `implementation`，Release 会闪退（`LeakCanary in non-debuggable build`）。`configure_app.py` 会自动改成 `debugImplementation`。
 
 ## 注意

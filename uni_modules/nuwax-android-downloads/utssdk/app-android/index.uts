@@ -1,0 +1,136 @@
+import Environment from 'android.os.Environment';
+import File from 'java.io.File';
+import FileInputStream from 'java.io.FileInputStream';
+import FileOutputStream from 'java.io.FileOutputStream';
+import Build from 'android.os.Build';
+import ContentValues from 'android.content.ContentValues';
+import MediaStore from 'android.provider.MediaStore';
+
+/**
+ * 把常见扩展名映射为 MIME 类型，未知扩展名统一返回 application/octet-stream。
+ * 仅覆盖本仓库下载流程常见的打包 / 文档 / 图片类型，避免 MediaStore 入库时 MIME 缺失。
+ */
+function guessMimeType(filename: string): string {
+  const dotIdx = filename.lastIndexOf('.');
+  if (dotIdx < 0) return 'application/octet-stream';
+  const ext = filename.substring(dotIdx + 1).toLowerCase();
+  if (ext == 'zip') return 'application/zip';
+  if (ext == 'pdf') return 'application/pdf';
+  if (ext == 'txt') return 'text/plain';
+  if (ext == 'json') return 'application/json';
+  if (ext == 'doc') return 'application/msword';
+  if (ext == 'docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext == 'xls') return 'application/vnd.ms-excel';
+  if (ext == 'xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext == 'ppt') return 'application/vnd.ms-powerpoint';
+  if (ext == 'pptx') return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  if (ext == 'png') return 'image/png';
+  if (ext == 'jpg' || ext == 'jpeg') return 'image/jpeg';
+  if (ext == 'gif') return 'image/gif';
+  if (ext == 'webp') return 'image/webp';
+  if (ext == 'mp4') return 'video/mp4';
+  if (ext == 'mp3') return 'audio/mpeg';
+  return 'application/octet-stream';
+}
+
+/**
+ * API >= 29：通过 MediaStore.Downloads 写入公共 Downloads 目录，无需任何存储权限。
+ * 失败（context / resolver / uri / 输出流任一为空，或读写抛错）时由上层 try/catch 兜底。
+ */
+function copyViaMediaStore(tempFilePath: string, filename: string): string {
+  const context = UTSAndroid.getAppContext();
+  if (context == null) {
+    return tempFilePath;
+  }
+  const resolver = context.getContentResolver();
+  if (resolver == null) {
+    return tempFilePath;
+  }
+
+  const values = new ContentValues();
+  values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+  values.put(MediaStore.MediaColumns.MIME_TYPE, guessMimeType(filename));
+  values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+
+  const uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+  if (uri == null) {
+    return tempFilePath;
+  }
+  const outStream = resolver.openOutputStream(uri);
+  if (outStream == null) {
+    return tempFilePath;
+  }
+
+  const srcFile = new File(tempFilePath);
+  const inStream = new FileInputStream(srcFile);
+  const buffer = new ByteArray(1024 * 8);
+  let bytesRead = inStream.read(buffer);
+  while (bytesRead != -1) {
+    outStream.write(buffer, 0, bytesRead);
+    bytesRead = inStream.read(buffer);
+  }
+  inStream.close();
+  outStream.close();
+  return uri.toString();
+}
+
+/**
+ * API < 29：直接拷贝到 Environment.getExternalStoragePublicDirectory(DIRECTORY_DOWNLOADS)。
+ * 文件名冲突时在扩展名前追加 (1)..(99) 去重，逻辑与历史 copyToPublicDownload 一致。
+ */
+function copyViaLegacyFile(tempFilePath: string, filename: string): string {
+  const downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+  if (downloadDir == null) {
+    return tempFilePath;
+  }
+  if (!downloadDir.exists()) {
+    downloadDir.mkdirs();
+  }
+  let targetFile = new File(downloadDir, filename);
+  if (targetFile.exists()) {
+    const dotIdx = filename.lastIndexOf('.');
+    const nameWithoutExt = dotIdx > 0 ? filename.substring(0, dotIdx) : filename;
+    const ext = dotIdx > 0 ? filename.substring(dotIdx) : '';
+    let counter = 1;
+    while (targetFile.exists() && counter < 100) {
+      targetFile = new File(downloadDir, `${nameWithoutExt}(${counter})${ext}`);
+      counter++;
+    }
+  }
+  const srcFile = new File(tempFilePath);
+  const inStream = new FileInputStream(srcFile);
+  const outStream = new FileOutputStream(targetFile);
+  const buffer = new ByteArray(1024 * 8);
+  let bytesRead = inStream.read(buffer);
+  while (bytesRead != -1) {
+    outStream.write(buffer, 0, bytesRead);
+    bytesRead = inStream.read(buffer);
+  }
+  inStream.close();
+  outStream.close();
+  return targetFile.getAbsolutePath();
+}
+
+/**
+ * 将 uni.downloadFile 返回的沙盒临时文件拷贝到系统公共 Downloads 目录。
+ *
+ * - API >= 29：经 MediaStore.Downloads 写入（应用沙盒外可见，无需存储权限）。
+ * - API <  29：回退到 Environment.getExternalStoragePublicDirectory(DIRECTORY_DOWNLOADS)。
+ * - 任意环节抛错一律返回原始 tempFilePath，绝不使下载流程整体失败。
+ *
+ * @param tempFilePath uni.downloadFile 返回的沙盒临时文件路径
+ * @param filename     目标文件名（带扩展名）
+ * @returns 落盘文件路径（API<29）或 MediaStore Uri 字符串（API>=29）；失败时返回 tempFilePath
+ */
+export function copyToPublicDownload(tempFilePath: string, filename: string): string {
+  try {
+    if (Build.VERSION.SDK_INT >= 29) {
+      return copyViaMediaStore(tempFilePath, filename);
+    } else {
+      return copyViaLegacyFile(tempFilePath, filename);
+    }
+  } catch (e) {
+    console.error('拷贝文件至 Download 目录失败:', e);
+    return tempFilePath;
+  }
+}

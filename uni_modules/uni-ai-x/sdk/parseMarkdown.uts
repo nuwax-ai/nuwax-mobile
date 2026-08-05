@@ -111,6 +111,8 @@ export default class ParseMarkdown {
 			if (mathStartIndex != -1) {
 				// 获取开头标记
 				const startToken: string = withFindMathText.match(mathStartPattern)![0]!
+				// 行内公式标记：$...$ 或 \(...\) 是行内（displayMode:false）；$$、\[...\]、\begin{} 是块级
+				const isInlineMath = startToken == '$' || startToken == '\\('
 				// console.error('发现数学公式开头', startToken, mathStartIndex)
 				// 定义结尾标记
 				const endToken: string = mathMarkMap.get(startToken) ?? '';
@@ -122,7 +124,10 @@ export default class ParseMarkdown {
 				if (hasMathEndTag) {
 					const mathEndIndex = _index + mathStartIndex + startToken.length
 					const mathText = withFindMathText.slice(startToken.length + mathStartIndex, mathEndIndex)
-					const mathCodeText = "\n```math\n" + mathText + "\n```\n"
+					// 行内公式用 ```math-inline 标记，md2jsonTask 据此设 displayMode:false（两端统一 inline 渲染）
+					const mathCodeText = isInlineMath
+						? "\n```math-inline\n" + mathText + "\n```\n"
+						: "\n```math\n" + mathText + "\n```\n"
 					this.myMarkdownText = this.myMarkdownText.slice(0, this.lastMathEndIndex + lastCodeTagIndex) + 
 									withFindMathText.slice(0, mathStartIndex) + mathCodeText +
 									withFindMathText.slice(mathEndIndex + endToken.length)
@@ -231,7 +236,13 @@ export default class ParseMarkdown {
 						beforeDone()
 					} else {
 						const lang = item.lang ?? 'text'
-						if (lang == 'math') {
+						// 行内公式 fence 用 ```math-inline（wasm 取 info 首词为 lang，无空格故完整保留）。
+						// 防御：lang 可能被个别端规整（去连字符/截断），统一小写后判断含 inline 即行内。
+						const langLower = lang.toLowerCase()
+						const isMathBlock = langLower == 'math' || langLower.indexOf('math') == 0
+						if (isMathBlock) {
+							// math-inline / mathinline → 行内 displayMode:false（两端统一 inline 渲染）；math → 块级 displayMode:true
+							item.displayMode = langLower.indexOf('inline') >= 0 ? false : true
 							const index = i
 							this.parseMath(item, (latexEl: MarkdownToken | null)=>{
 								if (latexEl != null) {
@@ -244,16 +255,11 @@ export default class ParseMarkdown {
 								beforeDone()
 							})
 						} else {
-							// #ifdef WEB
-							// H5 不做语法高亮，统一纯文本，避免 python/bash 样式不一致
-							item.codeTokens = [] as MarkdownToken[][]
-							beforeDone()
-							// #endif
-							// #ifndef WEB
+							// 代码块语法高亮（App + H5 统一）：逐行 parseLineCode 分词回填 codeTokens。
+							// H5 原刻意跳过（纯文本），现对齐 PC web 一并高亮；不支持的语言由 parseLineCode 返回 error，渲染层降级纯文本。
 							this.parseCodehighlight(item, ()=>{
 								beforeDone()
 							})
-							// #endif
 						}
 					}
 				} else {
@@ -317,6 +323,11 @@ export default class ParseMarkdown {
 		callBack()
 		//#endif
 		// #ifndef MP-WEIXIN
+		// 闭合才渲染：代码块未闭合（流式半截）不触发 render，避免半截 mermaid 反复报错/重渲
+		if (mermaidToken.isClose == 0) {
+			callBack()
+			return
+		}
 		proxyWeb.callMethod({
 			action: 'renderMermaid',
 			mermaidText: mermaidToken.text
@@ -324,6 +335,10 @@ export default class ParseMarkdown {
 			const imageDataURL : string = param['imageDataURL'] as string
 			if (imageDataURL.length > 0) {
 				mermaidToken.href = imageDataURL
+				const width = param['width'] as number | null
+				const height = param['height'] as number | null
+				if (width != null) mermaidToken.width = width
+				if (height != null) mermaidToken.height = height
 			}
 			callBack()
 		})
@@ -336,10 +351,15 @@ export default class ParseMarkdown {
 		// #endif
 		// #ifndef MP-WEIXIN
 		mathToken.text = mathToken.text?.trim()
-		if (true || mathToken.isClose == 1) {
+		// 性能：原 `if (true || mathToken.isClose == 1)` 是无条件渲染（true 短路），
+		// 流式期公式文本未闭合(isClose!=1)也强行 katexRender，每个公式一次 WebView 往返，
+		// 公式一多（如复杂 markdown 混合多公式）WebView 桥队列被打满 → 卡死。
+		// 改为仅闭合(isClose==1)才渲染；未闭合等后续增量补全闭合后再渲。
+		if (mathToken.isClose == 1) {
 			proxyWeb.callMethod({
 				action: 'katexRender',
-				pureMathText: mathToken.text!
+				pureMathText: mathToken.text!,
+				displayMode: mathToken.displayMode ?? true
 			}, (param : UTSJSONObject) => {
 				// console.error('katexRender-callback', param)
 				const imageDataURL = param['imageDataURL'] as string | null
@@ -355,6 +375,7 @@ export default class ParseMarkdown {
 					width: width,
 					height: height,
 					isClose: 0,
+					displayMode: mathToken.displayMode ?? true,
 					uniqueId: mathToken.uniqueId!
 				}
 				callBack(latexEl)

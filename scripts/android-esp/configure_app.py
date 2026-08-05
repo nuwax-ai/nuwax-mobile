@@ -61,12 +61,26 @@ APP_RESOURCES_DIR = Path(
     )
 )
 
-# 蒸汽（vapor）模式下，uniappx 主模块的 index.kt 静态引用了官方示例页/插件
-# （uni-stat / native-button / uts-worker 等 2570 个演示组件）。vapor 业务是
-# app-service.js 字节码、不落 uniappx .kt，故示例模块必须全部保留编译，否则
-# uniappx:compileReleaseKotlin 批量 Unresolved reference。因此不再剥离任何示例
-# 模块（settings.gradle 全 include、build.gradle 全依赖），保持官方基座结构完整。
-SAMPLE_MODULES: list[str] = []
+# HelloUniAppX 演示用的兄弟 UTS 模块（settings.gradle include + 各 build.gradle
+# implementation project(...)）。vapor 下这些示例模块的引用方是 uniappx 主模块的
+# index.kt 演示胶水；strip_uniappx_demo_sources() 删除该胶水后即可安全剥离兄弟
+# 模块（业务在字节码 + 独立 uts 插件，与示例零耦合）。5.23 模板新增 test-native-view。
+SAMPLE_MODULES: list[str] = [
+    "test-invoke-network-api",
+    "uni-getbatteryinfo",
+    "uts-openSchema",
+    "uts-progressNotification",
+    "uts-get-native-view",
+    "native-button",
+    "native-time-picker",
+    "uni-stat",
+    "uni-openLocation",
+    "uts-button",
+    "uni-usercapturescreen",
+    "uts-worker",
+    "app-comm",
+    "test-native-view",
+]
 
 # 本地离线基座不需要的远程三方（网络不可达 / 非 ESP 配网必需）
 # 个推 Maven 在部分网络下 TLS 握手失败，导致 assembleDebug 无法解析
@@ -97,16 +111,17 @@ def configure_settings() -> None:
     marker = WORK / "injected-uts-modules.txt"
     if marker.is_file():
         injected = {x.strip() for x in marker.read_text().splitlines() if x.strip()}
-    # vapor 模式：保留官方全部示例模块（uniappx index.kt 静态引用它们，剥则断链），
-    # 只追加注入的业务 uts 插件，不再注释任何 include。
+    # 剥离示例兄弟模块 include（uniappx 演示胶水由 strip_uniappx_demo_sources
+    # 单独删除，故这些兄弟模块不再被引用、可安全注释掉），并追加注入的业务 uts 插件。
     keep = {"app", "uniappx"} | injected | {"uts-nuwax-esp-provisioning"}
     lines = []
     for line in text.splitlines():
         m_inc = re.match(r"include\s+':([^']+)'", line.strip())
-        if m_inc and line.strip().startswith("//"):
-            # 恢复此前被注释的示例模块 include（幂等）
-            lines.append(f"include ':{m_inc.group(1)}'")
-            continue
+        if m_inc and m_inc.group(1) not in keep:
+            # 幂等：已被注释的示例 include 保持注释，未注释的注释掉
+            if not line.strip().startswith("//"):
+                lines.append("// " + line + "  // stripped by configure_app")
+                continue
         lines.append(line)
     text = "\n".join(lines) + "\n"
     for name in sorted(keep - {"app", "uniappx"}):
@@ -186,6 +201,37 @@ def strip_project_deps(gradle_path: Path) -> None:
             )
     gradle_path.write_text(text)
     print(f"✓ 精简依赖: {gradle_path.relative_to(PROJ)}")
+
+
+def strip_uniappx_demo_sources() -> None:
+    """vapor: uniappx 主模块的 index.kt / pages / components / uni_modules 等
+    是 HelloUniAppX 演示胶水（静态 SDK 模板，不随 app-resource 重生成）。
+    业务在字节码 + 独立 uts 插件，与此树零耦合。删除以免打包演示代码。
+    保留 java/ 目录（空 kotlin 源码目录 gradle 可编译）。幂等。"""
+    java_root = PROJ / "uniappx" / "src" / "main" / "java"
+    removed: list[str] = []
+    for name in (
+        "index.kt",
+        "pages",
+        "components",
+        "uni_modules",
+        "node-modules",
+        "uniCloud",
+    ):
+        target = java_root / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+            removed.append(name + "/")
+        elif target.exists():
+            try:
+                target.unlink()
+                removed.append(name)
+            except OSError:
+                pass
+    if removed:
+        print(f"✓ 删除 uniappx 演示源码: {', '.join(removed)}")
+    else:
+        print("✓ uniappx 演示源码已清空（幂等跳过）")
 
 
 def configure_release_signing(text: str) -> str:
@@ -756,6 +802,8 @@ def main() -> None:
     relocate_main_activity()
     strip_project_deps(PROJ / "app" / "build.gradle")
     strip_project_deps(PROJ / "uniappx" / "build.gradle")
+    # vapor: 删除 uniappx 主模块的 HelloUniAppX 演示 kt 树（兄弟模块依赖已在上面剥离）
+    strip_uniappx_demo_sources()
     strip_optional_remote_deps(PROJ / "app" / "build.gradle")
     # Release 闪退修复：LeakCanary 不得进非 debuggable 包
     confine_leakcanary_to_debug(PROJ / "app" / "build.gradle")

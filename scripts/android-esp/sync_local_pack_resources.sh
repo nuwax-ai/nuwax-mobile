@@ -45,7 +45,7 @@ if [[ -d "$KT_SRC" ]]; then
   rsync -a "$KT_SRC/" "$JAVA_DST/"
   echo "✓ uniappx kt → src/main/java（已清空示例残留）"
 else
-  echo "⚠ 无 $KT_SRC，跳过 kt 同步"
+  echo "⚠ 无 ${KT_SRC}，跳过 kt 同步"
 fi
 
 # 注入全部 UTS 原生插件（含 esp / pay / cmark / highlight）

@@ -23,12 +23,19 @@ from local_base_paths import default_android_esp_work
 WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
 PROJ = WORK / "project"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+APP_MANIFEST = json.loads((PROJECT_ROOT / "manifest.json").read_text())
 APPID = os.environ.get("APPID", "__UNI__8BF05E4")
 BUNDLE = os.environ.get("ANDROID_BUNDLE_ID", "com.nuwax.app")
-APP_NAME = os.environ.get(
-    "APP_NAME",
-    json.loads((PROJECT_ROOT / "manifest.json").read_text())["name"],
-)
+APP_NAME = os.environ.get("APP_NAME", APP_MANIFEST["name"])
+APP_VERSION_NAME = str(APP_MANIFEST.get("versionName", "")).strip()
+try:
+    APP_VERSION_CODE = int(APP_MANIFEST.get("versionCode", 0))
+except (TypeError, ValueError) as exc:
+    raise SystemExit("✗ manifest.json versionCode 必须为正整数") from exc
+if not APP_VERSION_NAME:
+    raise SystemExit("✗ manifest.json versionName 不能为空")
+if APP_VERSION_CODE <= 0:
+    raise SystemExit("✗ manifest.json versionCode 必须为正整数")
 APPKEY = os.environ.get("DCLOUD_APPKEY")
 if not APPKEY:
     raise SystemExit("✗ 未设置 DCLOUD_APPKEY（写到 scripts/local-secrets.env，已 gitignore）")
@@ -233,10 +240,21 @@ def configure_app_gradle() -> None:
     # compileSdk / targetSdk：对齐本机已安装 platform
     text = re.sub(r"compileSdk\s+\d+", f"compileSdk {COMPILE_SDK}", text, count=1)
     text = re.sub(r"targetSdk\s+\d+", f"targetSdk {TARGET_SDK}", text, count=1)
+    # manifest.json 是应用版本的唯一来源，避免离线宿主保留 SDK 示例版本。
+    text = re.sub(
+        r"versionCode\s+\d+", f"versionCode {APP_VERSION_CODE}", text, count=1
+    )
+    text = re.sub(
+        r"versionName\s+['\"][^'\"]*['\"]",
+        f'versionName "{APP_VERSION_NAME}"',
+        text,
+        count=1,
+    )
     text, signed = ensure_release_uses_debug_signing(text)
     p.write_text(text)
     print(
         f"✓ app applicationId/namespace={BUNDLE} "
+        f"versionName={APP_VERSION_NAME} versionCode={APP_VERSION_CODE} "
         f"minSdk=26 compileSdk={COMPILE_SDK} targetSdk={TARGET_SDK}"
     )
     if signed:

@@ -29,7 +29,7 @@ export NUWAX_MAIN_ROOT="${NUWAX_MAIN_ROOT:-$_NUWAX_REPO_ROOT}"
 export NUWAX_BUNDLE_ID="${NUWAX_BUNDLE_ID:-com.nuwax.app}"
 export NUWAX_APPID="${NUWAX_APPID:-__UNI__8BF05E4}"
 
-# 本机敏感配置（gitignore）：DCLOUD_APPKEY / iOS Team / Profile UUID。存在则 source，绝不入库。
+# 本机敏感配置（gitignore）：AppKey / Android 正式签名 / iOS 签名。存在则 source，绝不入库。
 if [[ -f "$_NUWAX_LB_ENV_DIR/local-secrets.env" ]]; then
   source "$_NUWAX_LB_ENV_DIR/local-secrets.env"
 fi

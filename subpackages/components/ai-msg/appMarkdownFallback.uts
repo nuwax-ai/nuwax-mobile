@@ -76,10 +76,11 @@ function applyMathResultToToken(token: MarkdownToken, res: UTSJSONObject): void 
 }
 
 function mathCacheKey(latex: string, displayMode: boolean): string {
+  // v2：与磁盘缓存 V3 对齐，避免内存 L1 仍命中「\\ 被折叠」时期的坏截图
   if (displayMode == true) {
-    return "d1:" + latex;
+    return "v2d1:" + latex;
   }
-  return "d0:" + latex;
+  return "v2d0:" + latex;
 }
 
 /** 最近一次根 parse 提交的公式数（0 表示无 batch） */
@@ -308,8 +309,14 @@ function isFallbackListLine(line: string): boolean {
 /**
  * 行内是否存在「表格管道」：忽略 $...$ / $$...$$ 内的 |（如 $|\Psi|^2$）。
  * 避免把绝对值公式误判成 Markdown 表格。
+ * 流式：以 | 开头的行一律视为表格行（即使单元格内 $ 未闭合），防止拆表后后续行丢失。
  */
 function lineHasMarkdownTablePipe(line: string): boolean {
+  const trimmed = line.trim();
+  // 标准 GFM 表行列以 | 起手；流式半截公式行也必须保住表格上下文
+  if (trimmed.startsWith("|")) {
+    return true;
+  }
   let i = 0;
   while (i < line.length) {
     const ch = line.charAt(i);
@@ -319,6 +326,7 @@ function lineHasMarkdownTablePipe(line: string): boolean {
       if (isDouble) {
         const end = line.indexOf("$$", i + 2);
         if (end < 0) {
+          // 未闭合块公式：其后 | 视为公式内，不再扫描
           return false;
         }
         i = end + 2;
@@ -1618,6 +1626,72 @@ function makeTableRow(
 }
 
 /**
+ * 工具标签把表格拆成两段后，后段往往只有数据行（无 |---|" 分隔）。
+ * 若整段都是管道行，则续接到结果列表末尾的表格。
+ */
+function tryAppendTableContinuation(
+  result: UniAiMarkdownElItem[],
+  markdown: string,
+  onMathRendered: MathRenderedCallback,
+): boolean {
+  if (result.length == 0) {
+    return false;
+  }
+  const prev = result[result.length - 1];
+  if (
+    prev.type != "table" ||
+    prev.datasList.length == 0 ||
+    prev.datasList[0].length == 0
+  ) {
+    return false;
+  }
+  const tableToken = prev.datasList[0][0];
+  if (tableToken.type != "table") {
+    return false;
+  }
+  const lines = normalizeInlineMath(markdown).split("\n");
+  let start = 0;
+  while (start < lines.length && lines[start].trim().length == 0) {
+    start++;
+  }
+  if (start >= lines.length) {
+    return false;
+  }
+  if (lineHasMarkdownTablePipe(lines[start].trim()) != true) {
+    return false;
+  }
+  // 自带表头分隔 → 独立新表，不续接
+  if (findTableSeparatorIndex(lines, start) >= 0) {
+    return false;
+  }
+  for (let i = start; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length == 0) {
+      continue;
+    }
+    if (isTableSeparator(t)) {
+      continue;
+    }
+    if (lineHasMarkdownTablePipe(t) != true || isFallbackListLine(t)) {
+      return false;
+    }
+  }
+  let rowTokens = tableToken.tokens;
+  if (rowTokens == null) {
+    rowTokens = [] as MarkdownToken[];
+    tableToken.tokens = rowTokens;
+  }
+  for (let i = start; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length == 0 || isTableSeparator(t)) {
+      continue;
+    }
+    rowTokens.push(makeTableRow(lines[i], onMathRendered));
+  }
+  return true;
+}
+
+/**
  * 标准 App 基座缺少 uni-cmark 原生库时的纯 UTS Markdown 解析。
  * 支持标题、段落、粗体、行内代码、分隔线、表格、代码块及块级数学公式。
  * - App：根调用收集公式 → 并行截图 → 按 chunk（默认 8）分批回调上屏
@@ -1715,6 +1789,16 @@ function parseAppMarkdownFallbackInner(
         continue;
       }
       if (segment.markdown.trim().length == 0) {
+        continue;
+      }
+      // 自定义标签拆段后：后段若仅为无分隔行的管道表，续接到上一段表格
+      if (
+        tryAppendTableContinuation(
+          segmentedResult,
+          segment.markdown,
+          onMathRendered,
+        ) == true
+      ) {
         continue;
       }
       const markdownItems = parseAppMarkdownFallbackInner(
@@ -1815,7 +1899,6 @@ function parseAppMarkdownFallbackInner(
     if (trimmed.startsWith("```")) {
       const lang = trimmed.substring(3).trim();
       const codeLines = [] as string[];
-      const fenceStart = index;
       index++;
       let fenceClosed = false;
       while (index < lines.length) {
@@ -1827,61 +1910,71 @@ function parseAppMarkdownFallbackInner(
         codeLines.push(lines[index]);
         index++;
       }
-      // 流式未闭合 ```：勿吞掉后续全部正文（否则表现为「出几个字就停」）
+      const codeText = codeLines.join("\n");
+      // 流式未闭合 ```：while 已吃到文末。必须输出临时 code_block 并 continue，
+      // 禁止回落段落——段落遇空行会拆断，表现为代码/流程图「渲染到一半就停」。
       if (fenceClosed != true) {
-        index = fenceStart;
-        // 落入下方段落逻辑，等下一 chunk 补全闭合符
-      } else {
-        const codeText = codeLines.join("\n");
-        if (lang == "math") {
-          const mathToken: MarkdownToken = {
-            type: "math",
-            text: codeText,
-            uniqueId: "fallback-math-token-" + itemIndex,
-          };
-          result.push(makeItem("math", itemIndex++, [[mathToken]]));
-          renderMathToken(codeText, mathToken, onMathRendered, true);
-        } else if (lang == "mermaid") {
-          // mermaid：fence 已闭合才走到这（未闭合回退段落逻辑等补全），产 code_block 并异步出图回填 href
-          const mermaidToken: MarkdownToken = {
-            type: "code_block",
-            text: codeText,
-            lang: "mermaid",
-            codeTokens: [] as MarkdownToken[][],
-            uniqueId: "fallback-mermaid-token-" + itemIndex,
-          };
-          result.push(makeItem("code_block", itemIndex++, [[mermaidToken]]));
-          renderMermaidToken(codeText, mermaidToken, onMathRendered);
-        } else {
-          const codeRows = [] as MarkdownToken[][];
-          for (let ci = 0; ci < codeLines.length; ci++) {
-            codeRows.push([makeTextToken(codeLines[ci], "text")]);
-          }
-          const codeToken: MarkdownToken = {
-            type: "code_block",
-            text: codeText,
-            lang: lang.length > 0 ? lang : "text",
-            codeTokens: codeRows,
-            uniqueId: "fallback-code-token-" + itemIndex,
-          };
-          result.push(makeItem("code_block", itemIndex++, [[codeToken]]));
-          // 异步语法高亮（App + H5）：分词完成后回填 codeTokens 并刷帧；
-          // 不支持的语言保持上方纯文本 codeRows。先上纯文本再异步上色，流式友好。
-          highlightCodeBlock(
-            codeToken,
-            codeText,
-            lang.length > 0 ? lang : "text",
-            onMathRendered,
-          );
+        const codeRows = [] as MarkdownToken[][];
+        for (let ci = 0; ci < codeLines.length; ci++) {
+          codeRows.push([makeTextToken(codeLines[ci], "text")]);
         }
+        const pendingToken: MarkdownToken = {
+          type: "code_block",
+          text: codeText,
+          lang: lang.length > 0 ? lang : "text",
+          codeTokens: codeRows,
+          uniqueId: "fallback-code-pending-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[pendingToken]]));
         continue;
       }
+      if (lang == "math") {
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: codeText,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(codeText, mathToken, onMathRendered, true);
+      } else if (lang == "mermaid") {
+        // mermaid：仅闭合后出图；未闭合走上方 pending 纯文本
+        const mermaidToken: MarkdownToken = {
+          type: "code_block",
+          text: codeText,
+          lang: "mermaid",
+          codeTokens: [] as MarkdownToken[][],
+          uniqueId: "fallback-mermaid-token-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[mermaidToken]]));
+        renderMermaidToken(codeText, mermaidToken, onMathRendered);
+      } else {
+        const codeRows = [] as MarkdownToken[][];
+        for (let ci = 0; ci < codeLines.length; ci++) {
+          codeRows.push([makeTextToken(codeLines[ci], "text")]);
+        }
+        const codeToken: MarkdownToken = {
+          type: "code_block",
+          text: codeText,
+          lang: lang.length > 0 ? lang : "text",
+          codeTokens: codeRows,
+          uniqueId: "fallback-code-token-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[codeToken]]));
+        // 异步语法高亮（App + H5）：分词完成后回填 codeTokens 并刷帧；
+        // 不支持的语言保持上方纯文本 codeRows。先上纯文本再异步上色，流式友好。
+        highlightCodeBlock(
+          codeToken,
+          codeText,
+          lang.length > 0 ? lang : "text",
+          onMathRendered,
+        );
+      }
+      continue;
     }
 
     if (trimmed == "$$" || trimmed == "\\[") {
       const closeMarker = trimmed == "$$" ? "$$" : "\\]";
       const mathLines = [] as string[];
-      const blockStart = index;
       index++;
       let closed = false;
       while (index < lines.length) {
@@ -1894,7 +1987,6 @@ function parseAppMarkdownFallbackInner(
         index++;
       }
       const latex = mathLines.join("\n").trim();
-      // 流式未闭合的 $$：勿当完整公式渲染（否则会吃掉后续正文并反复打无效 katex）
       if (closed && latex.length > 0) {
         const mathToken: MarkdownToken = {
           type: "math",
@@ -1906,11 +1998,27 @@ function parseAppMarkdownFallbackInner(
         continue;
       }
       if (!closed) {
-        index = blockStart;
-        // 落入下方段落逻辑，等下一 chunk 补全闭合符
-      } else {
+        // 流式未闭合 $$ / \[：临时 code 展示，禁止回落段落（空行拆断 + 半截 katex）
+        const rawLatex = mathLines.join("\n");
+        const codeRows = [] as MarkdownToken[][];
+        for (let mi = 0; mi < mathLines.length; mi++) {
+          codeRows.push([makeTextToken(mathLines[mi], "text")]);
+        }
+        if (codeRows.length == 0) {
+          codeRows.push([makeTextToken("", "text")]);
+        }
+        const pendingMath: MarkdownToken = {
+          type: "code_block",
+          text: rawLatex,
+          lang: "math",
+          codeTokens: codeRows,
+          uniqueId: "fallback-math-pending-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[pendingMath]]));
         continue;
       }
+      // 闭合但内容为空
+      continue;
     }
 
     if (isStandaloneMathLine(trimmed)) {
@@ -1935,7 +2043,6 @@ function parseAppMarkdownFallbackInner(
     if (tableSeparatorIndex >= 0) {
       const tableRows = [] as MarkdownToken[];
       const aligns = tableAligns(lines[tableSeparatorIndex]);
-      const tableStartIndex = index;
       while (index < lines.length) {
         const tableLine = lines[index].trim();
         if (tableLine.length == 0) {
@@ -1964,6 +2071,51 @@ function parseAppMarkdownFallbackInner(
       };
       result.push(makeItem("table", itemIndex++, [[tableToken]]));
       continue;
+    }
+
+    // 无表头分隔行：若上一块已是表格，把连续管道行续接上去。
+    // 常见于：工具自定义标签把表格拆成两段，后段只有数据行。
+    if (
+      lineHasMarkdownTablePipe(trimmed) == true &&
+      isFallbackListLine(trimmed) != true &&
+      result.length > 0
+    ) {
+      const prev = result[result.length - 1];
+      if (
+        prev.type == "table" &&
+        prev.datasList.length > 0 &&
+        prev.datasList[0].length > 0
+      ) {
+        const tableToken = prev.datasList[0][0];
+        if (tableToken.type == "table") {
+          let rowTokens = tableToken.tokens;
+          if (rowTokens == null) {
+            rowTokens = [] as MarkdownToken[];
+            tableToken.tokens = rowTokens;
+          }
+          while (index < lines.length) {
+            const tableLine = lines[index].trim();
+            if (tableLine.length == 0) {
+              index++;
+              continue;
+            }
+            if (lineHasMarkdownTablePipe(tableLine) != true) {
+              break;
+            }
+            if (isFallbackListLine(tableLine)) {
+              break;
+            }
+            // 续接段里偶发重复分隔行：跳过
+            if (isTableSeparator(tableLine)) {
+              index++;
+              continue;
+            }
+            rowTokens.push(makeTableRow(lines[index], onMathRendered));
+            index++;
+          }
+          continue;
+        }
+      }
     }
 
     // 忽略 Markdown 水平线（如 $$ 后跟 ---），避免思考/正文出现多余中横线

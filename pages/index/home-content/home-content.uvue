@@ -193,6 +193,8 @@
   const tenantConfigInfo = ref<any | null>(null);
   // 在途去重锁：首屏 onMounted 与父级 onShow 几乎同时各触发一次 loadRecent，用此锁杀掉重复的那次
   let recentLoadingNow = false;
+  // 在途期间又有刷新请求时置位，加载完成后补刷一次（避免静默丢弃从子页返回的刷新）
+  let recentNeedsReload = false;
 
   const enableSubscription = computed((): number => {
     const tc = tenantConfigInfo.value;
@@ -389,7 +391,9 @@
 
   async function loadRecent() {
     if (recentLoadingNow) {
-      return; // 在途去重：杀掉 onMounted + onShow 同时触发的重复加载
+      // 在途期间又有刷新请求（如从子页改完数据返回）：完成后补刷一次，不静默丢弃
+      recentNeedsReload = true;
+      return;
     }
     recentLoadingNow = true;
     recentLoading.value = true;
@@ -403,6 +407,10 @@
     } finally {
       recentLoadingNow = false;
     }
+    if (recentNeedsReload) {
+      recentNeedsReload = false;
+      loadRecent(); // 补刷（fire-and-forget）
+    }
   }
 
   // ============================================================
@@ -414,8 +422,6 @@
     timeLabel: string = "";
     agentName: string = "";
     showExecuting: boolean = false;
-    // 内部签名（不渲染）：内容变化才重建该行，否则复用同一实例，让 list-view 跳过重绑
-    sig: string = "";
   }
 
   const conversationList = ref<UTSJSONObject[]>([]);
@@ -424,6 +430,8 @@
   const lastId = ref<number | null>(null);
   // 在途去重锁：同 recentLoadingNow
   let convLoadingNow = false;
+  // 同 recentNeedsReload
+  let convNeedsReload = false;
 
   function toNum(v: any | null, fallback: number = 0): number {
     if (v == null) {
@@ -466,23 +474,11 @@
     }
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      if (item == null) {
+      // 仅接受对象型记录；非对象（脏数据）整条跳过，避免 as UTSJSONObject 运行时失败拖垮整列表
+      if (item == null || typeof item != "object" || Array.isArray(item)) {
         continue;
       }
-      // 直接 cast 为 UTSJSONObject，避免每条记录 stringify+parse 往返（主线程同步阻塞）
-      let obj: UTSJSONObject | null = null;
-      if (typeof item == "object" && Array.isArray(item) == false) {
-        obj = item as UTSJSONObject;
-      } else {
-        try {
-          obj = JSON.parse(`${item}`) as UTSJSONObject | null;
-        } catch (_e2) {
-          obj = null;
-        }
-      }
-      if (obj == null) {
-        continue;
-      }
+      const obj = item as UTSJSONObject;
       // agent.name 直接读嵌套对象，避免再次 stringify+parse
       let agentName = "";
       const agentRaw = obj["agent"];
@@ -496,63 +492,32 @@
     return result;
   }
 
-  // 行缓存（非响应式）：按 id 复用 ConversationRowView，仅当内容签名变化才重建该行。
-  // 让 list-view 在未变更行上跳过重绑（DCloud：保持引用稳定，仅重建变更行）。
-  let convRowCache = new Map<number, ConversationRowView>();
-
-  function convRowSig(item: UTSJSONObject): string {
-    return toStr(item["topic"], "") + "|" + toStr(item["modified"], "") + "|"
-      + toStr(item["_agentName"], "") + "|" + toStr(item["taskStatus"], "");
-  }
-
-  function buildConvRow(
-    item: UTSJSONObject,
-    id: number,
-    sig: string,
-    unnamed: string,
-    unknownAgent: string,
-  ): ConversationRowView {
-    const row = new ConversationRowView();
-    row.id = id;
-    row.sig = sig;
-    const topic = toStr(item["topic"], "");
-    row.topic = topic.length > 0 ? topic : unnamed;
-    const modified = toStr(item["modified"], "");
-    const ago = formatTimeAgo(modified);
-    row.timeLabel = ago != null ? ago : "";
-    const agentName = toStr(item["_agentName"], "");
-    row.agentName = agentName.length > 0 ? agentName : unknownAgent;
-    const statusStr = toStr(item["taskStatus"], "");
-    row.showExecuting = statusStr == "EXECUTING";
-    return row;
-  }
-
   const convRowList = computed((): ConversationRowView[] => {
     const raw = conversationList.value;
     const result: ConversationRowView[] = [];
     if (raw == null) {
-      convRowCache = new Map<number, ConversationRowView>();
       return result;
     }
     const unnamed = t("Mobile.Conversation.unnamed");
     const unknownAgent = t("Mobile.Conversation.unknownAgent");
-    const fresh = new Map<number, ConversationRowView>();
     for (let i = 0; i < raw.length; i++) {
       const item = raw[i];
       if (item == null) {
         continue;
       }
-      const id = toNum(item["id"], 0);
-      const sig = convRowSig(item);
-      const cached = convRowCache.get(id);
-      // 内容签名未变 → 复用同一实例；否则重建（新 id 或 topic/status 等变化）
-      const row: ConversationRowView = cached != null && cached.sig == sig
-        ? cached
-        : buildConvRow(item, id, sig, unnamed, unknownAgent);
-      fresh.set(id, row);
+      const row = new ConversationRowView();
+      row.id = toNum(item["id"], 0);
+      const topic = toStr(item["topic"], "");
+      row.topic = topic.length > 0 ? topic : unnamed;
+      const modified = toStr(item["modified"], "");
+      const ago = formatTimeAgo(modified);
+      row.timeLabel = ago != null ? ago : "";
+      const agentName = toStr(item["_agentName"], "");
+      row.agentName = agentName.length > 0 ? agentName : unknownAgent;
+      const statusStr = toStr(item["taskStatus"], "");
+      row.showExecuting = statusStr == "EXECUTING";
       result.push(row);
     }
-    convRowCache = fresh; // 整表替换：被删 id 随旧 map 丢弃，无需遍历 keys
     return result;
   });
 
@@ -604,7 +569,8 @@
 
   async function loadConversation() {
     if (convLoadingNow) {
-      return; // 在途去重
+      convNeedsReload = true; // 在途期间的刷新请求：完成后补刷
+      return;
     }
     convLoadingNow = true;
     convLoading.value = true;
@@ -612,6 +578,10 @@
       await fetchConversationList(false);
     } finally {
       convLoadingNow = false;
+    }
+    if (convNeedsReload) {
+      convNeedsReload = false;
+      loadConversation();
     }
   }
 

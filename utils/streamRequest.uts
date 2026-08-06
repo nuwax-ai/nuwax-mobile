@@ -3,6 +3,7 @@ import { createSSEConnection } from "@/servers/useRequest.uts";
 import { utf8ArrayToString } from "@/utils/utf8.uts";
 import { t } from "@/utils/i18n";
 import { readRawField } from "@/utils/readRawField.uts";
+import { isAppInBackground } from "@/utils/appLifecycle.uts";
 
 /**
  * 合并两个 Uint8Array。
@@ -1080,8 +1081,11 @@ export class StreamRequest {
       this.timeoutCheckTimer = null;
     }
 
-    // 每 15 秒检查一次
+    // 每 15 秒检查一次；后台跳过（系统可能挂起网络，避免误杀）
     const timerId = setInterval(() => {
+      if (isAppInBackground() == true) {
+        return;
+      }
       const now = Date.now();
       const timeSinceLastChunk = now - this.lastChunkReceivedTime;
       const limit = this.activeTimeoutDuration;
@@ -1092,6 +1096,7 @@ export class StreamRequest {
     }, 15000);
 
     this.timeoutCheckTimer = timerId;
+    registerTimeoutMonitor(this);
   }
 
   // 清除超时监控
@@ -1101,11 +1106,22 @@ export class StreamRequest {
       clearInterval(timerId);
       this.timeoutCheckTimer = null;
     }
+    unregisterTimeoutMonitor(this);
   }
 
   // 更新最后接收数据的时间
   private updateLastChunkTime(): void {
     this.lastChunkReceivedTime = Date.now();
+  }
+
+  /**
+   * App 回前台：刷新空闲计时，避免后台停留计入超时。
+   */
+  onAppForeground(): void {
+    if (this.timeoutCheckTimer == null || this.isAborted == true) {
+      return;
+    }
+    this.updateLastChunkTime();
   }
 
   /**
@@ -1132,6 +1148,10 @@ export class StreamRequest {
 
   // 处理超时
   private handleTimeout(): void {
+    // 后台不因空闲超时 abort（系统可能挂起网络）；回前台由 notifyStreamAppForeground 刷新计时
+    if (isAppInBackground() == true) {
+      return;
+    }
 
     this.clearTimeoutMonitor();
     this.isAborted = true;
@@ -1534,6 +1554,8 @@ export class StreamRequest {
             console.warn(
               "[SSE-APP] connection lost soft-close hasChunk=" +
                 `${hasReceivedChunk}` +
+                " background=" +
+                `${isAppInBackground()}` +
                 " " +
                 collectRequestErrorText(err),
             );
@@ -1589,6 +1611,10 @@ export class StreamRequest {
             return;
           }
 
+              console.warn(
+                "[SSE-APP] complete without terminal background=" +
+                  `${isAppInBackground()}`,
+              );
               this.clearTimeoutMonitor();
               config.onTimeout?.();
               finishStream();
@@ -1726,6 +1752,47 @@ export class StreamRequest {
     // #ifdef MP-WEIXIN || APP || APP-PLUS
     this.releaseRequestTask(true);
     // #endif
+  }
+}
+
+/**
+ * 当前挂了空闲超时监控的 StreamRequest（含 live chat 与 sub）。
+ * App 回前台时统一刷新 lastChunkTime，避免后台停留时间计入空闲超时。
+ */
+const activeTimeoutMonitors: StreamRequest[] = [];
+
+function registerTimeoutMonitor(req: StreamRequest): void {
+  for (let i = 0; i < activeTimeoutMonitors.length; i++) {
+    if (activeTimeoutMonitors[i] === req) {
+      return;
+    }
+  }
+  activeTimeoutMonitors.push(req);
+}
+
+function unregisterTimeoutMonitor(req: StreamRequest): void {
+  const next: StreamRequest[] = [];
+  for (let i = 0; i < activeTimeoutMonitors.length; i++) {
+    if (activeTimeoutMonitors[i] !== req) {
+      next.push(activeTimeoutMonitors[i]);
+    }
+  }
+  // 原地替换，避免外部仍持有旧引用语义混乱
+  while (activeTimeoutMonitors.length > 0) {
+    activeTimeoutMonitors.pop();
+  }
+  for (let j = 0; j < next.length; j++) {
+    activeTimeoutMonitors.push(next[j]);
+  }
+}
+
+/**
+ * App 回前台：活跃 SSE 刷新 lastChunk 时间，避免后台停留误触发空闲超时。
+ * 由 App.uvue onShow 调用。
+ */
+export function notifyStreamAppForeground(): void {
+  for (let i = 0; i < activeTimeoutMonitors.length; i++) {
+    activeTimeoutMonitors[i].onAppForeground();
   }
 }
 

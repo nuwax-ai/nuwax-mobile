@@ -35,7 +35,7 @@ if [ -f "$BASE" ]; then
   log "vapor 基座已存在: $(du -h "$BASE" | awk '{print $1}')"
 else
   warn "拉取 vapor 自定义基座（~200MB）..."
-  NUWAX_BASE_CHANNEL=vapor pnpm base:fetch || err "base-fetch 失败。手动：NUWAX_BASE_CHANNEL=vapor NUWAX_S3_INSECURE=1 pnpm base:fetch"
+  pnpm base:fetch:vapor || err "base-fetch 失败。手动：NUWAX_S3_INSECURE=1 pnpm base:fetch:vapor"
   log "vapor 基座拉取完成"
 fi
 

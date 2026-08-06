@@ -306,6 +306,14 @@ def configure_app_gradle() -> None:
     # compileSdk / targetSdk：对齐本机已安装 platform
     text = re.sub(r"compileSdk\s+\d+", f"compileSdk {COMPILE_SDK}", text, count=1)
     text = re.sub(r"targetSdk\s+\d+", f"targetSdk {TARGET_SDK}", text, count=1)
+    # 仅打 arm64-v8a：真机唯一需要的目标 ABI；去掉 armeabi-v7a/x86/x86_64 等约 127MB 死重量原生库。
+    if "abiFilters 'arm64-v8a'" not in text and 'abiFilters "arm64-v8a"' not in text:
+        text = re.sub(
+            r"(targetSdk\s+\d+\s*\n)",
+            r"\1        ndk {\n            abiFilters 'arm64-v8a'\n        }\n",
+            text,
+            count=1,
+        )
     # manifest.json 是应用版本的唯一来源，避免离线宿主保留 SDK 示例版本。
     text = re.sub(
         r"versionCode\s+\d+", f"versionCode {APP_VERSION_CODE}", text, count=1
@@ -651,25 +659,27 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
     text = gradle_path.read_text()
-    # 扩展 exclude 列表（保留 beizi；debug-server 仍从 SDK/libs 排除，改走 app/libs）
-    new_exclude = (
-        "exclude: ["
-        "'**/beizi_fusion_sdk_*.aar', "
-        "'**/uniad_bz_adapter_*.aar', "
-        "'**/uniad_bz-adapter*.aar', "
-        "'**/debug-server-release.aar', "
-        "'**/uniad-*.aar', "
-        "'**/uni-ad-*.aar', "
-        "'**/Baidu_MobAds_SDK.aar', "
-        "'**/GDTSDK*.aar', "
-        "'**/ks_adsdk*.aar', "
-        "'**/Funlink_adapter_uniad*.aar', "
-        "'**/advista-uniad*.aar', "
-        "'**/mm_adapter_uniad*.aar'"
-        "]"
-    )
-    if "**/uniad-*.aar" in text:
-        print(f"✓ SDK libs exclude 已含广告排除: {gradle_path.relative_to(PROJ)}")
+    # 规范化 exclude 列表：广告 SDK（App 无广告）+ 未用的直播/画布/阿里人脸安全。
+    excludes = [
+        "'**/debug-server-release.aar'",
+        "'**/beizi_fusion_sdk_*.aar'", "'**/uniad_bz_adapter_*.aar'", "'**/uniad_bz-adapter*.aar'",
+        "'**/uniad-*.aar'", "'**/uni-ad-*.aar'", "'**/Baidu_MobAds_SDK.aar'", "'**/GDTSDK*.aar'",
+        "'**/ks_adsdk*.aar'", "'**/Funlink_adapter_uniad*.aar'", "'**/advista-uniad*.aar'",
+        "'**/mm_adapter_uniad*.aar'", "'**/open_ad_sdk*.aar'", "'**/wm_ad_sdk*.aar'", "'**/windAd.aar'",
+        "'**/octopus_ad_sdk*.aar'", "'**/adalliance_adn_sdk*.aar'", "'**/Funlink_*release.aar'",
+        "'**/funlink_*release.aar'", "'**/advista-*release.aar'",
+        "'**/uni-live-pusher-release.aar'", "'**/uni-canvas-component-release.aar'",
+        "'**/APSecuritySDK-deepSec-*.aar'", "'**/Android-AliyunFaceGuard-*.aar'", "'**/aliyun-*.aar'",
+        "'**/facialRecognitionVerify-*.aar'", "'**/uni-facialVerify-*.aar'",
+    ]
+    # vapor 模式（5.21+）：运行时由 app/vapor-libs 提供，排除 SDK/libs 副本以免重复类。
+    # VDOM 模式（如 5.15）：运行时必须从 SDK/libs 取，绝不能排除，否则断运行时。
+    is_vapor = (PROJ / "app" / "vapor-libs").is_dir()
+    if is_vapor:
+        excludes = ["'**/app-runtime-release.aar'", "'**/uts-runtime-release.aar'"] + excludes
+    new_exclude = "exclude: [" + ", ".join(excludes) + "]"
+    if "**/uni-facialVerify-*.aar" in text:
+        print(f"✓ SDK libs exclude 已是规范化清单(vapor={is_vapor}): {gradle_path.relative_to(PROJ)}")
         return
     text2, n = re.subn(
         r"exclude:\s*\[[^\]]*\]",
@@ -779,6 +789,28 @@ def relocate_main_activity() -> None:
     print("✓ MainActivity 已改为直接启动业务 App，不显示 SDK 示例页")
 
 
+def patch_gradle_properties() -> None:
+    """调优 gradle.properties：抬高 JVM 堆（R8/全量构建所需）、开启并行与构建缓存。"""
+    p = PROJ / "gradle.properties"
+    if not p.is_file():
+        return
+    text = p.read_text()
+    text = re.sub(
+        r"org\.gradle\.jvmargs\s*=.*",
+        "org.gradle.jvmargs=-Xmx8g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8",
+        text,
+    )
+    for key in ("org.gradle.parallel", "org.gradle.caching"):
+        if key in text:
+            # 已存在（可能被注释）：取消注释并置 true
+            text = re.sub(r"#\s*" + re.escape(key) + r"\s*=.*", f"{key}=true", text)
+            text = re.sub(re.escape(key) + r"\s*=.*", f"{key}=true", text)
+        else:
+            text = text.rstrip() + f"\n{key}=true\n"
+    p.write_text(text)
+    print("✓ gradle.properties: jvmargs=-Xmx8g, parallel=true, caching=true")
+
+
 def main() -> None:
     if not (PROJ / "settings.gradle").is_file():
         die(f"找不到工程 {PROJ}，请先跑 official/setup_sdk.sh")
@@ -794,6 +826,7 @@ def main() -> None:
     hide_leakcanary_launcher_entry()
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
+    patch_gradle_properties()
     configure_manifest()
     configure_app_name()
     configure_splash_screen()

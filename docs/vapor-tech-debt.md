@@ -268,6 +268,32 @@ vapor 运行时（libVapor）**只有 jar（纯类）**；离线 SDK 的 **aar�
 - 实跑验证（emulator-5554，vapor 自定义基座）：`element.evalJS OK` ×18（setSetting + katexRender×7 等），`THREW` ×0，`getElementById null` ×0。katexRender 实测通过；mermaid 走同一 `dispatchCall` 路径，同修。
 - **排查口诀**：vapor 下 web-view「收得到、发不出」（@message 正常、evalJS 报 not a function）→ 别用 `createWebviewContext().evalJS`，改用 `uni.getElementById(id) as UniWebViewElement` 的 `evalJS`。
 
+### 9.3 续：mermaid/公式渲染链路下游（evalJS 修好后仍要逐环处理的 vapor 坑）
+
+> evalJS（§9.3）通了只代表「指令送进 web-view」，到「图真正上屏」之间还有 4 个 vapor 坑，逐条记此。实跑判定法：在 `dispatchCall` / `emitMsg` 回调里打 `console.log` 看 `action` 与 `imageDataURL` 长度——能区分是「没送进去」「没回传」还是「回传了没上屏」。
+
+**(a) mermaid 在 web-view 内不出图——已修（`proxy-web.html`）**
+- 症状：`renderMermaid_callback` 回来 `imageDataURL` 为空。
+- 根因：① `mermaid.min.js` 是 `async` 加载，vapor 隐藏 web-view 下偏慢，原 `waitForMermaid` 只等 3s 就放弃；② mermaid v10+ 首次 `mermaid.render` 前需要 `mermaid.initialize`，且 `securityLevel` 默认 `strict` 会拦部分图。
+- 修法：`waitForMermaid` 超时 3s→8s；首次渲染前 `mermaid.initialize({ startOnLoad:false, securityLevel:'loose', theme:'default' })`（加 `_mermaidInited` 守卫只跑一次）。
+- 验证：11 张 mermaid 回调 10 张带回真 PNG（imgLen 15K–216K），1 张 imgLen=0 是该图 mermaid 源码本身语法问题（非 proxy）。
+
+**(b) mermaid 图回传了但不上屏——已修（`uni-ai-msg-code.uvue`，最隐蔽）**
+- 症状：proxy 回调 `imgLen=15万+`（数据到了宿主、`renderMermaidToken` 也 `token.href = imageDataURL` 了），但 `<uni-ai-msg-code :href="data.href">` 的 `props.href` **永远停在 null**（watch 只在 mount 时 fire 一次，`hrefNull=true`）。
+- 根因（vapor 响应式数组元素坑，同 [[uvue-ref-array-class-not-reactive]]）：`token.href = x` 是直接改 reactive 列表元素属性，vapor bytecode 下**不触发重渲染**，下游 `:href="data.href"` prop 不更新。公式（katex）能上屏是因为有**磁盘缓存**（`mathFormulaDiskCache`），解析期就把 href 写进 token（列表赋值时已带值）；mermaid 无缓存，只在回调里后写 → 永远传不进 prop。
+- 修法：`uni-ai-msg-code.uvue` 不再依赖父 prop 传 href——组件自带 `codeText`，**自己 `proxyWeb.callMethod(renderMermaid)`**，回调用 `mermaidInfos.splice(0, len, next)`（整体替换，vapor 唯一可靠触发重渲染的方式）填图。同时把原来「push 多张 + 改 `.show/.renderd` 属性」改成「只保留最新一张 splice」。
+- 口诀：vapor 下 reactive 数组元素属性改了不重渲染 → 要么解析期（缓存）就把值备好，要么组件自己拉 + splice 整体替换。
+
+**(c) 块级公式不能左右滚动——已修（`uni-ai-x-msg.uvue`）**
+- 症状：长公式图超宽，但 scroll-view 不横滚。
+- 根因：块级公式外层 `<scroll-view scroll-x="true" scroll-y="false">`——vapor 下 `scroll-x`/`scroll-y` **被忽略**（编译告警 `Property 'scroll-y' is not supported on '<scroll-view>'`）。
+- 修法：改 `direction="horizontal"`（vapor 支持的横向滚动属性，本项目代码块等已用）。
+
+**(d) 旧空白公式被磁盘缓存命中——已修（`mathFormulaDiskCache.uts`）**
+- proxy 修复前回退的空 `imageDataURL` 被缓存，修好后仍命中坏图。修法：缓存 key 版本 `V3→V4`（`MATH_FORMULA_DISK_CACHE_V4`，沿用 V2→V3「作废坏图」老办法）。
+
+**关联**：`acp-permission-card.uvue` 的 `spin-loading` import 路径错（`@/components/...`→`@/subpackages/components/...`，与其余文件一致）也一并修，否则卡死整包编译。
+
 ### 9.4 其它遗漏（待随实跑补充）
 > 跑起来陆续发现的渲染/功能问题记在此（症状→定位→修法），量多再拆子节。
 

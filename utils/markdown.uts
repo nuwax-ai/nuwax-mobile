@@ -112,16 +112,7 @@ function escapedBracketRule(delimiters: MathDelimiter[]) {
   };
 }
 
-/**
- * 根据规则将连续的过程标签（ToolCall, Skill等）合并
- * 规则：
- * 1. 连续 2 个及以上的过程标签合并
- * 2. 中间包含“执行计划”的不合并（作为分隔符）
- * 3. 标签间只包含空白字符时不中断合并
- * 4. 支持 :::container 语法和 PC 端的 HTML 标签语法
- * @param text - 待处理的 Markdown 文本
- * @returns 处理后的文本
- */
+/** groupMarkdownContainers / dedupe 用的过程块匹配结果。 */
 class MarkdownContainerMatch {
   index: number = 0;
   endIndex: number = 0;
@@ -269,12 +260,13 @@ function dedupeMarkdownContainers(text: string): string {
 }
 
 /**
- * 根据规则将连续的过程标签（ToolCall, Skill等）合并
- * 规则：
- * 1. 连续 2 个及以上的过程标签合并
- * 2. 中间包含“执行计划”的不合并（作为分隔符）
- * 3. 标签间只包含空白字符时不中断合并
- * 4. 支持 :::container 语法和 PC 端的 HTML 标签语法
+ * 根据规则将连续的过程标签（ToolCall, Skill等）合并。
+ * 对齐 dev 的「后接正文才定界」语义，并适配 App 增量冻结：
+ * 1. 文末仍可能继续跟工具：≥1 个过程标签都进 process-group（避免先单卡后合组闪烁）
+ * 2. 已定界（后接非空正文 / Plan 分隔）：单工具保持独立卡；≥2 仍合组
+ * 3. Plan 作分隔符不进组；Event 跳过（不展示、不打断合组）
+ * 4. 标签间仅空白时不中断合并
+ * 5. 支持 :::container 与 HTML 过程标签
  * @param text - 待处理的 Markdown 文本
  * @returns 处理后的文本
  */
@@ -290,15 +282,20 @@ export function groupMarkdownContainers(text: string): string {
   let currentGroup: string[] = [];
   let normalizedGroup: string[] = [];
 
-  const flushGroup = () => {
+  /**
+   * @param followedByText true=簇已定界（后接正文/Plan）；false=文末开放簇
+   */
+  const flushGroup = (followedByText: boolean) => {
     if (currentGroup.length > 0) {
-      if (currentGroup.length >= 2) {
-        // 多个时，为了支持层级，必须使用规范化后的 HTML 标签
+      // 开放簇：单工具也进 group；定界后单工具才拆成独立卡
+      const useGroup =
+        currentGroup.length >= 2 ||
+        (currentGroup.length >= 1 && followedByText != true);
+      if (useGroup == true) {
         const groupContent = `\n\n<markdown-custom-process-group>\n${normalizedGroup.join("\n")}\n</markdown-custom-process-group>\n\n`;
         result += groupContent;
       } else {
-        // 只有一个工具时，直接输出规范化后的 HTML 标签，避免 H5 上 markdown-it 容器插件将 ::: 转为 <container data={JSON}>
-        // 导致 <markdown-container> 组件取到的 data 为字符串而非对象，无法渲染属性
+        // 定界单工具：规范化 HTML，避免 H5 :::container 插件把 data 弄成字符串
         result += `\n\n${normalizedGroup[0]}\n\n`;
       }
       currentGroup = [] as string[];
@@ -310,8 +307,20 @@ export function groupMarkdownContainers(text: string): string {
     const match = matches[i];
     const textBefore = dedupedText.slice(lastIndex, match.index);
 
+    // Event：内部事件，跳过且不打断合组（对齐 dev）
+    if (match.type == "Event") {
+      if (textBefore.trim() !== "") {
+        flushGroup(true);
+        result += textBefore;
+      } else if (currentGroup.length === 0) {
+        result += textBefore;
+      }
+      lastIndex = match.endIndex;
+      continue;
+    }
+
     if (textBefore.trim() !== "") {
-      flushGroup();
+      flushGroup(true);
       result += textBefore;
     } else {
       if (currentGroup.length === 0) {
@@ -323,9 +332,8 @@ export function groupMarkdownContainers(text: string): string {
     const normalizedTag = normalizeContainerTag(match);
 
     if (match.isPlan == true) {
-      flushGroup();
-      // Plan 不参与工具分组；须输出规范化 HTML，供 UniAiXMsg 识别为 markdown_custom_process。
-      // （旧 mp-html 路径可直接吃 :::container；当前渲染链路只识别 <markdown-custom-process>）
+      // Plan 定界前面的工具簇，自身不进组
+      flushGroup(true);
       result += `\n\n${normalizedTag}\n\n`;
     } else {
       currentGroup.push(tagMatch);
@@ -335,8 +343,9 @@ export function groupMarkdownContainers(text: string): string {
     lastIndex = match.endIndex;
   }
 
-  flushGroup();
-  result += dedupedText.slice(lastIndex);
+  const trailingText = dedupedText.slice(lastIndex);
+  flushGroup(trailingText.trim() !== "");
+  result += trailingText;
 
   const finalResult = result.replace(/\n{3,}/g, "\n\n").trim();
   return finalResult;

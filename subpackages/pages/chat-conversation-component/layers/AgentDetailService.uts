@@ -55,6 +55,7 @@ import { API_HEADERS } from "@/constants/api.constants";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { chatService } from "@/utils/chatService";
 import { StreamRequest } from "@/utils/streamRequest";
+import { isAppInBackground } from "@/utils/appLifecycle.uts";
 import {
   StreamChunk,
   StreamRequestConfig,
@@ -132,7 +133,6 @@ import { buildAssistantSpeakableText } from "@/subpackages/utils/voice/textFilte
 import { extractOpenUiArtifactFromMessage } from "@/utils/openUiSchema.uts";
 import {
   isAssistantMessageInfo,
-  isInFlightAssistantMessage,
   canReuseAssistantOnSubResume,
   isTurnUserReadyFromMessageInfoList,
 } from "@/subpackages/utils/subResumeGate.uts";
@@ -642,9 +642,24 @@ export default class AgentDetailService {
   private subStreamRequest: StreamRequest | null = null;
   /** sub 是否已订阅（执行中） */
   private isSubscribed: boolean = false;
+  /**
+   * 退后台被系统掐断 live/sub 后待回前台续接。
+   * 为 true 时不把本地 taskStatus 误标 COMPLETE/FAILED。
+   */
+  private pendingBackgroundReconnect: boolean = false;
 
   constructor(data: AgentDetailData) {
     this.data = data;
+  }
+
+  /** 是否有待回前台的后台断流续接 */
+  get needsBackgroundReconnect(): boolean {
+    return this.pendingBackgroundReconnect == true;
+  }
+
+  /** 清除后台续接标记（续接成功 / 确认已结束 / 用户停会话） */
+  clearBackgroundReconnectPending(): void {
+    this.pendingBackgroundReconnect = false;
   }
 
   /** 取得流式草稿列表（首次从 messageList 拷贝） */
@@ -2162,6 +2177,7 @@ export default class AgentDetailService {
       let hasUpdatedTopic = false;
       // 本轮流代数；abort / 新开流后旧回调直接丢弃
       this.streamGeneration = this.streamGeneration + 1;
+      this.pendingBackgroundReconnect = false;
       this.endStreamListDraft();
       const streamGen = this.streamGeneration;
       // #ifdef APP
@@ -2358,7 +2374,8 @@ export default class AgentDetailService {
 
   /**
    * 流式异常收尾：冲刷草稿 → 落盘打字机正文 → 清通道 → 强制会话终态（触发全量 KaTeX）→ 回补。
-   * Android 进后台杀 SSE 时常见：此处必须打日志并强制走会话回补，否则半截字停住、公式永不截图。
+   * Android 进后台杀 SSE 时：静默软收尾 + pendingBackgroundReconnect，不标本地 COMPLETE，
+   * 等回前台 / scheduleRecover 用 sub 续流。
    */
   private finalizeStreamAbnormally(
     isTempChat: boolean,
@@ -2368,6 +2385,19 @@ export default class AgentDetailService {
     this.endStreamListDraft();
     this.sealStreamingAssistantBeforeClear();
     this.clearStreamingAssistantText();
+
+    const fromBackground = isAppInBackground() == true;
+    if (fromBackground == true) {
+      this.pendingBackgroundReconnect = true;
+      // 保持「生成中」，便于回前台续接；不调 onTimeout（避免按钮态立刻变空闲）
+      console.warn(
+        "[SSE-Stream] soft finalize while background, pending reconnect gen=" +
+          `${streamGen}`,
+      );
+      this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
+      return;
+    }
+
     // 与正常 complete 对齐：延后 inactive，让 ai-msg 走 fallback_full + KaTeX 终态刷图
     const genAtAbnormal = this.streamGeneration;
     setTimeout(() => {
@@ -2430,6 +2460,8 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
+    // 正常结束：清后台续接标记
+    this.pendingBackgroundReconnect = false;
     // 完成回调里已同步 endStreamListDraft；此处再调一次幂等兜底（异常入口/竞态）
     this.endStreamListDraft();
 
@@ -2576,7 +2608,7 @@ export default class AgentDetailService {
         }
       }
     }
-    if (needRecover != true) {
+    if (needRecover != true && this.pendingBackgroundReconnect != true) {
       return;
     }
     setTimeout(() => {
@@ -2589,6 +2621,8 @@ export default class AgentDetailService {
       }
       this.resumeConversationState().then((needSub: boolean) => {
         if (needSub != true) {
+          // 后端已结束：清 pending，避免前台反复空转
+          this.pendingBackgroundReconnect = false;
           return;
         }
         if (streamGenAtSchedule != this.streamGeneration) {
@@ -2632,6 +2666,8 @@ export default class AgentDetailService {
     // 先中断旧 sub，再标记订阅（abort 会置 isSubscribed=false，必须在标记前）
     this.abortSubConversation();
     this.isSubscribed = true;
+    // 已接管续流：清 pending；若随后在后台再被掐断，softCleanup 会再置位
+    this.pendingBackgroundReconnect = false;
 
     // 可变：复用历史助手时会改成已有 id
     let targetMessageId = generateUniqueId();
@@ -2689,6 +2725,27 @@ export default class AgentDetailService {
       this.data.isConversationActive.value = false;
       this.clearStreamingAssistantText();
       removeEmptyPlaceholder();
+      if (onSubClose != null) {
+        (onSubClose as () => void)();
+      }
+    };
+
+    /** 后台被系统掐断 sub：清订阅、保留 pending，不标 FAILED / 不关生成中 */
+    const softCleanupSubWhileBackground = (): void => {
+      if (isCleanedUp) {
+        return;
+      }
+      isCleanedUp = true;
+      this.endStreamListDraft();
+      if (this.subStreamRequest != null) {
+        this.subStreamRequest!.abort();
+        this.subStreamRequest = null;
+      }
+      this.isSubscribed = false;
+      this.pendingBackgroundReconnect = true;
+      console.warn(
+        "[SSE-Sub] soft cleanup while background, pending reconnect",
+      );
       if (onSubClose != null) {
         (onSubClose as () => void)();
       }
@@ -2763,9 +2820,9 @@ export default class AgentDetailService {
 
     /**
      * 绑定 sub 写入目标（四端同一套规则）：
-     * - 最后一条是本轮助手（进行中，或跨端软完成且无 finalResult）→ 复用，避免双气泡
-     * - 最后一条是用户 / 空 → 新建占位
-     * - 禁止复用已有 finalResult / Failed 的助手
+     * - 最后一条是本轮进行中助手，且前一条是 USER → 复用（清空后按 delta 重放）
+     * - 最后一条是用户 / 空 / 已完成助手 → 新建占位
+     * - 禁止复用上轮 Complete/finished 助手（无 finalResult 也不能当软完成清空）
      */
     const ensurePlaceholder = (): void => {
       if (hasBoundTarget) {
@@ -2776,13 +2833,8 @@ export default class AgentDetailService {
       if (list.length > 0) {
         const last = list[list.length - 1];
         const prev = list.length >= 2 ? list[list.length - 2] : null;
-        const canReuse =
-          (isInFlightAssistantMessage(last) == true && last != null) ||
-          canReuseAssistantOnSubResume(last, prev) == true;
+        const canReuse = canReuseAssistantOnSubResume(last, prev) == true;
         if (canReuse == true && last != null) {
-          const lastStatus = last.status;
-          const lastText =
-            last.text != null ? `${last.text}`.trim() : "";
           let reuseId = targetMessageId;
           if (last.id != null && `${last.id}`.length > 0) {
             reuseId = `${last.id}`;
@@ -2882,14 +2934,25 @@ export default class AgentDetailService {
     };
     requestConfig.onComplete = () => {
       // sub SSE 正常结束：立刻关掉 Loading（不等 ChatFinished / 详情回拉）
+      this.pendingBackgroundReconnect = false;
       this.markConversationTaskCompleteIfExecuting();
       cleanupSub();
     };
     requestConfig.onError = (error: any) => {
+      if (isAppInBackground() == true) {
+        softCleanupSubWhileBackground();
+        return;
+      }
+      this.pendingBackgroundReconnect = false;
       this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
       cleanupSub();
     };
     requestConfig.onTimeout = () => {
+      if (isAppInBackground() == true) {
+        softCleanupSubWhileBackground();
+        return;
+      }
+      this.pendingBackgroundReconnect = false;
       this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
       cleanupSub();
     };
@@ -2897,7 +2960,11 @@ export default class AgentDetailService {
     try {
       await this.subStreamRequest!.request(requestConfig);
     } catch (error) {
-      cleanupSub();
+      if (isAppInBackground() == true && isCleanedUp != true) {
+        softCleanupSubWhileBackground();
+      } else {
+        cleanupSub();
+      }
     }
   }
 
@@ -2924,6 +2991,9 @@ export default class AgentDetailService {
   async handleStopConversation(isTempChat: boolean = false): Promise<void> {
     // 停止会话后，清空问题建议列表（对齐 PC handleClearSideEffect：停止即清空，防止旧建议残留）
     this.data.chatSuggestList.value = [];
+
+    // 用户主动停止：取消后台续接
+    this.pendingBackgroundReconnect = false;
 
     // 无论 UI 是否已标为结束，都先中止本地 SSE / sub，避免 chunk 回调继续跑
     this.streamGeneration = this.streamGeneration + 1;
@@ -3297,6 +3367,7 @@ export default class AgentDetailService {
         this.data.isConversationActive.value = true;
         return true;
       }
+      this.pendingBackgroundReconnect = false;
       this.data.isConversationActive.value = false;
       return false;
     } catch (error) {

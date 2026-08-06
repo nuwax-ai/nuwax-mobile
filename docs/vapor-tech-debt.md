@@ -17,7 +17,7 @@
 > | §6 | 正式签名上线 | ⏳ 待做（上线最后一公里） |
 > | §7 | iOS vapor 基座 | ⏳ 未开始 |
 > | §8 | 独立 vapor APK 卡启动屏 | 🔴 path-a 死胡同；等 DCloud 提供 vapor-runtime aar(含资源)；当前 vapor 仅 HX 自定义基座形态可跑 |
-> | §9 | 运行时遗漏（实跑发现） | ⚠️ 进行中（9.1 iconfont 图标不显示——已修待验；其它待补） |
+> | §9 | 运行时遗漏（实跑发现） | ✅ 主体已修并 UI 验证（§9.0 defineOptions 放开全局样式 → 图标/高度/工具类等一批遗漏消除；commit `d1486aeb`） |
 
 ---
 
@@ -217,13 +217,17 @@ vapor 运行时（libVapor）**只有 jar（纯类）**；离线 SDK 的 **aar�
 
 [官方 vapor 文档](https://doc.dcloud.net.cn/uni-app-x/app-vapor.html)「开发注意·css」明确：styleIsolation 2.0 下「**组件默认不受外部 css 同名影响，不管是页面还是全局 css，外部的同名 class 默认都不能影响组件样式**」，默认值 `isolated`，可设 `app` / `app-and-page`。故凡组件依赖全局/页面样式（字体、主题色、通用类 `.iconfont` 等）的，vapor 下都会丢样式——**§9 各项「遗漏」大概率同源**。
 
+> **✅ 已统一应用并验证（2026-08-06，commit `d1486aeb`）**：88 个业务组件统一加 `defineOptions({ styleIsolation: 'app' })` 放开接收全局样式（官方唯一方案，无项目级开关）。HX 自定义基座 UI 走查确认一批遗漏消除：iconfont 图标、薄壳页高度、全局工具类（`.h-full/.flex/.flex-1/.relative` 等）。`App.uvue` 应用根与纯模板组件 `home-chat-dialog`（无全局类）不加。个别组件若仍缺「页面级」样式，再单独升 `'app-and-page'`。
+
+
+
 - **官方修法**：组件 `<script setup>` 加 `defineOptions({ styleIsolation: 'app-and-page' })`（或 `'app'`）即可重新接收外部同名 class。
 - **替代（更可控）**：把所需样式内联或挪进组件 scoped（不依赖外部透传）。
 - 排查 §9 各项优先按此判断：症状是"样式/图标/主题没生效" → 先看组件是不是吃了全局样式 → 是则 `defineOptions` 或内联。
 
 > 同源官方约束（均见该页）：运行时只支持简单 class + 分组选择器（后代/复合被丢，即 §3 BEM 的根因）；Android uvue 页面不能直接调原生 API，须挪进 uts 插件（即 §4 的根因）；仅组合式、不支持选项式/mixin（即附 A 移出 uni_modules 的根因）；scroll-view/swiper 布尔属性默认 true→false（notice-bar 已显式 `:scroll-x="true"`）；flatten 元素不支持 background-image。
 
-### 9.1 iconfont 图标大面积不显示（高优，影响 54 处 svg-icon）——已修待验
+### 9.1 iconfont 图标大面积不显示（高优，影响 54 处 svg-icon）——✅ 已验证（UI 走查）
 
 **症状**：vapor 基座进页面后，页面内 `<svg-icon>` 图标（nav/按钮/tab 等，共 54 处）全部不显示 / 变豆腐块。
 
@@ -234,7 +238,7 @@ vapor 运行时（libVapor）**只有 jar（纯类）**；离线 SDK 的 **aar�
 
 **根因**：vapor styleIsolation 2.0 下全局 App 样式（`.iconfont{font-family}`）透传不进 svg-icon 组件 → `<text>` 拿不到字体 → unicode 用默认字体 = 空白。drops 日志里 `.iconfont`/font-family 未被丢，印证是**样式隔离透传**问题，非选择器丢失。
 
-**已修（待实机/模拟器验证）**：`svg-icon.uvue` 的 `iconStyle` 内联追加 `font-family: iconfont`（内联不受样式隔离影响）。业务代码改动，**不用重打基座**，HX 自定义基座热推 www 即可验。
+**已修 + 已验证（UI 走查）**：`svg-icon.uvue` 的 `iconStyle` 内联追加 `font-family: iconfont`（内联不受样式隔离影响）；且 svg-icon 亦在 §9.0 的 88 组件 defineOptions 之列，双重保障。业务代码改动，热推 www 即生效，实测图标恢复。
 
 **若仍未恢复**（fallback）：vapor 可能没注册 CSS `@font-face` → `App.uvue` onLaunch 用 `uni.loadFontFace({ global:true, family:"iconfont", source:"url('/static/iconfont/iconfont.ttf')" })` 显式注册字体。
 
@@ -252,7 +256,19 @@ vapor 运行时（libVapor）**只有 jar（纯类）**；离线 SDK 的 **aar�
 
 **排查口诀**：页面没撑满 → 看页面根是不是自定义组件 → 看组件根 scoped 的 height/flex 是不是只写在 H5 分支、APP 分支漏了 → 补 `flex: 1`（APP 页面默认是 flex column）。
 
-### 9.3 其它遗漏（待随实跑补充）
+### 9.3 markdown proxy（KaTeX/mermaid web-view）host→web 通信在 vapor 缺失——已修
+
+**症状**：vapor 基座下 AI 消息里的 KaTeX 公式与 mermaid 图表都不渲染，降级成原始 LaTeX/mermaid 源码文本（commits `a05475ee`/`2b3fb68e`/`c3dfd6ba` 加的兜底回填被命中）。原生 markdown 不受影响。
+
+**机制**：公式/图表靠隐藏 `<web-view>`（`uni_modules/uni-ai-x/static/proxy-web/proxy-web.html`，内含 KaTeX+mermaid+html2canvas）渲染。宿主 `uni_modules/uni-ai-x/sdk/proxy-web.uts` 的 `dispatchCall` 调 `webviewContext.evalJS(code)` 把渲染指令送进 web-view，web-view 渲染完再 `uni.webView.postMessage` 回传（`@message` 接收）。
+
+**根因（实跑 logcat 印证）**：vapor 运行时缺口——`uni.createWebviewContext(id)` 返回的 context 对象**没有 `evalJS` 方法**，调它抛 `TypeError: this.webviewContext.evalJS is not a function`（setSetting / katexRender / renderMermaid 全挂）。注意：`@message`（web→宿主）方向**正常**（DOMContentLoaded_callback 能收到，isInit 能置 true，web-view 确实加载了）；只有宿主→web（evalJS）这个方向的 context 方法在 vapor 缺失。类型定义（`@dcloudio/uni-app-x/types/.../WebviewContext`）声明了 `evalJS`，但 vapor 运行时没实现——属于 DCloud vapor 运行时未对齐类型的现象。官方文档（app-vapor.html）未提 web-view，组件页亦称「vapor 无差异」，故**文档查不到，只能实跑发现**。
+
+**已修**：`proxy-web.uts` `dispatchCall` 改走 **web-view 元素自身的 evalJS**——`uni.getElementById(webviewId) as UniWebViewElement` 的 `evalJS(code)` 直连原生 `WebView.evaluateJavascript`，vapor 下可用。优先元素路径；`context.evalJS` 仅作 VDOM（非 vapor）回退；两条路都失败才回填原始文本。改动只在 `dispatchCall`，iOS/WEB 分支不动。**业务代码改动，热推 www 即可验，不用重打基座。**
+- 实跑验证（emulator-5554，vapor 自定义基座）：`element.evalJS OK` ×18（setSetting + katexRender×7 等），`THREW` ×0，`getElementById null` ×0。katexRender 实测通过；mermaid 走同一 `dispatchCall` 路径，同修。
+- **排查口诀**：vapor 下 web-view「收得到、发不出」（@message 正常、evalJS 报 not a function）→ 别用 `createWebviewContext().evalJS`，改用 `uni.getElementById(id) as UniWebViewElement` 的 `evalJS`。
+
+### 9.4 其它遗漏（待随实跑补充）
 > 跑起来陆续发现的渲染/功能问题记在此（症状→定位→修法），量多再拆子节。
 
 ---

@@ -176,7 +176,7 @@ android {{
         minSdk {min_sdk}
         consumerProguardFiles "consumer-rules.pro"
         ndk {{
-            abiFilters "armeabi-v7a", "arm64-v8a"
+            abiFilters "arm64-v8a"
         }}
     }}
 

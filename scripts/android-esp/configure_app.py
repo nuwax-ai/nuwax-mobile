@@ -349,6 +349,14 @@ def configure_app_gradle() -> None:
     # compileSdk / targetSdk：对齐本机已安装 platform
     text = re.sub(r"compileSdk\s+\d+", f"compileSdk {COMPILE_SDK}", text, count=1)
     text = re.sub(r"targetSdk\s+\d+", f"targetSdk {TARGET_SDK}", text, count=1)
+    # 仅打 arm64-v8a：真机唯一需要的目标 ABI；去掉 armeabi-v7a/x86/x86_64 等约 127MB 死重量原生库。
+    if "abiFilters 'arm64-v8a'" not in text and 'abiFilters "arm64-v8a"' not in text:
+        text = re.sub(
+            r"(targetSdk\s+\d+\s*\n)",
+            r"\1        ndk {\n            abiFilters 'arm64-v8a'\n        }\n",
+            text,
+            count=1,
+        )
     # manifest.json 是应用版本的唯一来源，避免离线宿主保留 SDK 示例版本。
     text = re.sub(
         r"versionCode\s+\d+", f"versionCode {APP_VERSION_CODE}", text, count=1
@@ -724,7 +732,10 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
         # 直播推流（业务无直播/推流）
         "'**/uni-live-pusher-release.aar', "
         # canvas 组件（业务 0 处 <canvas>；同步在 strip_canvas_registration 去注册项）
-        "'**/uni-canvas-component-release.aar'"
+        "'**/uni-canvas-component-release.aar', "
+        # 阿里人脸/安全（业务仅用 WebView 验证码，非人脸/KYC；确认 0 引用）
+        "'**/APSecuritySDK-deepSec-*.aar', '**/Android-AliyunFaceGuard-*.aar', '**/aliyun-*.aar', "
+        "'**/facialRecognitionVerify-*.aar', '**/uni-facialVerify-*.aar'"
         "]"
     )
     # 始终用规范列表（重）写 exclude，保证新增 aar 排除项在增量构建里也能生效（幂等）。
@@ -971,6 +982,28 @@ def generate_index_kt_stub() -> None:
     print(f"✓ 生成 {pkg}.index.kt 存根（IndexKt 引导用）")
 
 
+def patch_gradle_properties() -> None:
+    """调优 gradle.properties：抬高 JVM 堆（R8/全量构建所需）、开启并行与构建缓存。"""
+    p = PROJ / "gradle.properties"
+    if not p.is_file():
+        return
+    text = p.read_text()
+    text = re.sub(
+        r"org\.gradle\.jvmargs\s*=.*",
+        "org.gradle.jvmargs=-Xmx8g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8",
+        text,
+    )
+    for key in ("org.gradle.parallel", "org.gradle.caching"):
+        if key in text:
+            # 已存在（可能被注释）：取消注释并置 true
+            text = re.sub(r"#\s*" + re.escape(key) + r"\s*=.*", f"{key}=true", text)
+            text = re.sub(re.escape(key) + r"\s*=.*", f"{key}=true", text)
+        else:
+            text = text.rstrip() + f"\n{key}=true\n"
+    p.write_text(text)
+    print("✓ gradle.properties: jvmargs=-Xmx8g, parallel=true, caching=true")
+
+
 def main() -> None:
     if not (PROJ / "settings.gradle").is_file():
         die(f"找不到工程 {PROJ}，请先跑 official/setup_sdk.sh")
@@ -988,6 +1021,7 @@ def main() -> None:
     hide_leakcanary_launcher_entry()
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
+    patch_gradle_properties()
     # canvas aar 已在 SDK/libs exclude 剥离；同步去 UTSRegisterComponents 注册项防反射加载缺失类
     strip_canvas_registration()
     # path-a 已验证不可行：vapor 运行时(libVapor)只有 jar(纯类)，缺 Android 资源

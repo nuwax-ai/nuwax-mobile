@@ -604,7 +604,6 @@ export function parseEventBindConfig(raw: any | null): EventBindConfig | null {
 
 export default class AgentDetailService {
   private data: AgentDetailData;
-  private isAllowSuggest: boolean = true;
   /** 流式会话代数：abort/新开流时递增，用于丢弃旧 SSE 回调 */
   private streamGeneration: number = 0;
   /**
@@ -616,7 +615,15 @@ export default class AgentDetailService {
   private pendingUiMessageId: string = "";
   private pendingUiMessage: MessageInfo | null = null;
   private pendingUiNeedScroll: boolean = false;
-  private readonly STREAM_UI_COALESCE_MS: number = 40;
+  /**
+   * 流式 UI 合并窗。正文/公式路径略宽，避免 40ms 洪峰触发 Markdown+KaTeX 堵 SSE。
+   * thinkOnly 用更长合并窗（见 THINK_UI_COALESCE_MS），且早退不 parse。
+   */
+  private readonly STREAM_UI_COALESCE_MS: number = 100;
+  /** THINK-only 合并窗：默认折叠不渲染，仅低频同步标题栏/数据即可 */
+  private readonly THINK_UI_COALESCE_MS: number = 500;
+  /** 当前 streamUiTimer 使用的合并窗（正文短窗可打断 think 长窗） */
+  private streamUiCoalesceMs: number = 100;
   /** 待冲刷的打字机正文（与 UI 同窗口合并，避免每 SSE 字触发父组件重绘） */
   private pendingStreamingText: string = "";
   private pendingStreamingMsgId: string = "";
@@ -648,6 +655,64 @@ export default class AgentDetailService {
     const draft = [...this.data.messageList.value];
     this.streamListDraft = draft;
     return draft;
+  }
+
+  /**
+   * 流式冲刷写入 messageList：只替换当前助手气泡，历史项沿用现有 list 引用。
+   * 避免 `[...draft]` 整表换数组导致父级对所有历史气泡重算 props / 触发重绘。
+   */
+  private publishStreamDraftLastOnly(): void {
+    if (this.streamListDraft == null) {
+      return;
+    }
+    const draftList = this.streamListDraft as MessageInfo[];
+    if (draftList.length == 0) {
+      return;
+    }
+    const list = this.data.messageList.value;
+
+    let targetIdx = -1;
+    const pendingId = this.pendingUiMessageId;
+    if (pendingId.length > 0) {
+      targetIdx = findMessageIndexById(draftList, pendingId, null);
+    }
+    if (targetIdx < 0 && this.pendingUiMessage != null) {
+      const rawId = readRawField(this.pendingUiMessage!, "id");
+      const mid = rawId != null ? `${rawId}` : "";
+      if (mid.length > 0) {
+        targetIdx = findMessageIndexById(draftList, mid, null);
+      }
+    }
+    if (targetIdx < 0) {
+      for (let i = draftList.length - 1; i >= 0; i--) {
+        if (draftList[i].messageType == MessageTypeEnum.ASSISTANT) {
+          targetIdx = i;
+          break;
+        }
+      }
+    }
+    if (targetIdx < 0) {
+      targetIdx = draftList.length - 1;
+    }
+
+    let msgToWrite = draftList[targetIdx];
+    if (this.pendingUiMessage != null) {
+      msgToWrite = this.pendingUiMessage as MessageInfo;
+    }
+
+    const next: MessageInfo[] = [];
+    for (let i = 0; i < draftList.length; i++) {
+      if (i == targetIdx) {
+        next.push(msgToWrite);
+      } else if (i < list.length) {
+        // 历史项：保留当前 messageList 引用，不换成 draft 里的同下标对象
+        next.push(list[i]);
+      } else {
+        // 本轮新追加（如 user + 空助手占位）
+        next.push(draftList[i]);
+      }
+    }
+    this.data.messageList.value = next;
   }
 
   /** 冲刷挂起的流式 UI（messageList + 打字机 + 气泡组件 + 滚动 + TTS 喂入） */
@@ -705,35 +770,39 @@ export default class AgentDetailService {
       return;
     }
 
-    // THINK-only：只 patch 气泡 think，禁止 [...messageList] 全量拷贝（否则随 think 变长主线程被拖死）
+    // THINK-only：默认折叠不渲染正文；首帧发一次抬头即可，之后只记长度，
+    // 避免每 500ms 把数千字 think 经 updateMessageComponent 拷进气泡拖死主线程。
+    // 完整 think 在 endStreamListDraft → publishStreamDraftLastOnly 落盘。
     if (thinkOnly == true && pendingMsg != null) {
+      const isFirstThinkPublish = this.lastPublishedThinkLen == 0;
       this.lastPublishedThinkLen = thinkLen;
-      const thinkRaw = readMessageThink(pendingMsg);
-      const emitData = {} as UTSJSONObject;
-      emitData["think"] = thinkRaw;
-      emitData["thinkContent"] = thinkRaw;
-      // #ifdef APP
-      try {
-        perfRecordSseUi(
-          readMessageText(pendingMsg).length,
-          `msg=${this.pendingUiMessageId} think=${thinkLen} bodySame=true thinkSame=false thinkOnly=true`,
-        );
-      } catch (_eStall) {
-        // ignore
+      if (isFirstThinkPublish == true && thinkLen > 0) {
+        const thinkRaw = readMessageThink(pendingMsg);
+        const emitData = {} as UTSJSONObject;
+        emitData["think"] = thinkRaw;
+        emitData["thinkContent"] = thinkRaw;
+        // #ifdef APP
+        try {
+          perfRecordSseUi(
+            readMessageText(pendingMsg).length,
+            `msg=${this.pendingUiMessageId} think=${thinkLen} bodySame=true thinkSame=false thinkOnly=true`,
+          );
+        } catch (_eStall) {
+          // ignore
+        }
+        // #endif
+        uni.$emit("updateMessageComponent", {
+          messageId: `${this.pendingUiMessageId}_${pendingMsg.index}`,
+          data: emitData,
+        });
       }
-      // #endif
-      uni.$emit("updateMessageComponent", {
-        messageId: `${this.pendingUiMessageId}_${pendingMsg.index}`,
-        data: emitData,
-      });
-      // 思考流不强制滚底，减轻列表 layout
       this.pendingUiMessage = null;
       this.pendingUiNeedScroll = false;
       return;
     }
 
     if (this.streamListDraft != null) {
-      this.data.messageList.value = [...(this.streamListDraft as MessageInfo[])];
+      this.publishStreamDraftLastOnly();
     }
     // 打字机通道与列表同频冲刷，避免每 token 触发 App 端整页重绘
     if (hasStreamPayload == true) {
@@ -797,14 +866,16 @@ export default class AgentDetailService {
   }
 
   /**
-   * 合并流式 UI 更新：打字机 / TTS / 列表按 40ms 合并。
+   * 合并流式 UI 更新：打字机 / TTS / 列表按合并窗冲刷。
    * @param immediate true 时立刻冲刷（ERROR / 流结束 / 新发送）
+   * @param thinkHeavy true 时用更长 THINK 合并窗（正文到达可打断为短窗）
    */
   private scheduleStreamUiPublish(
     messageId: string,
     message: MessageInfo | null,
     needScroll: boolean,
     immediate: boolean,
+    thinkHeavy: boolean = false,
   ): void {
     if (message != null) {
       this.pendingUiMessageId = messageId;
@@ -817,18 +888,50 @@ export default class AgentDetailService {
       this.flushStreamUiPublish();
       return;
     }
-    if (this.streamUiTimer != null) {
+    // 折叠态已发过 think 头：draft/pending 已持有最新 think，无需再开定时冲刷
+    if (thinkHeavy == true && this.lastPublishedThinkLen > 0) {
       return;
     }
+    const wantMs =
+      thinkHeavy == true
+        ? this.THINK_UI_COALESCE_MS
+        : this.STREAM_UI_COALESCE_MS;
+    if (this.streamUiTimer != null) {
+      // 正文/工具等到达时，打断 think 长窗，尽快冲刷
+      if (
+        thinkHeavy != true &&
+        this.streamUiCoalesceMs > this.STREAM_UI_COALESCE_MS
+      ) {
+        clearTimeout(this.streamUiTimer!);
+        this.streamUiTimer = null;
+        this.streamUiCoalesceMs = this.STREAM_UI_COALESCE_MS;
+      } else {
+        return;
+      }
+    } else {
+      this.streamUiCoalesceMs = wantMs;
+    }
+    const coalesceMs = this.streamUiCoalesceMs;
     this.streamUiTimer = setTimeout(() => {
       this.streamUiTimer = null;
       this.flushStreamUiPublish();
-    }, this.STREAM_UI_COALESCE_MS);
+    }, coalesceMs);
   }
 
-  /** 结束流式草稿：冲刷 UI 并丢弃草稿引用 */
+  /**
+   * 结束流式草稿：冲刷 UI，把 draft 落回 messageList，再丢弃草稿引用。
+   * thinkOnly 冲刷只 patch 气泡、不写 messageList；若此处直接 null draft，
+   * STREAM_COMPLETE 后晚到的 THINK 会从无 think 的 messageList 重建草稿，
+   * 表现为 thinkLen 从上千骤降为个位数（日志里常见 think=1346 → think=1）。
+   */
   private endStreamListDraft(): void {
     this.flushStreamUiPublish();
+    // 落盘必须在 null 之前：只写回当前助手条，历史引用不变（与 flush 同策略）
+    if (this.streamListDraft != null) {
+      this.publishStreamDraftLastOnly();
+      // 落盘后跟一次底，把 thinkOnly 期间节流掉的滚动补上
+      uni.$emit("streamMessageUpdate");
+    }
     this.streamListDraft = null;
     this.pendingUiMessage = null;
     this.pendingUiMessageId = "";
@@ -842,6 +945,7 @@ export default class AgentDetailService {
     this.lastPublishedStreamMsgId = "";
     this.lastPublishedProcessingFp = "";
     this.lastPublishedThinkLen = 0;
+    this.streamUiCoalesceMs = this.STREAM_UI_COALESCE_MS;
   }
 
   /**
@@ -1509,6 +1613,8 @@ export default class AgentDetailService {
     }
 
     let newMessage: MessageInfo | null = null;
+    /** THINK 增量用更长 UI 合并窗；正文/工具到达会打断为短窗 */
+    let thinkHeavyUi: boolean = false;
 
     // 处理不同的事件类型
     if (eventTypeStr == `${ConversationEventTypeEnum.PROCESSING}`) {
@@ -1629,6 +1735,7 @@ export default class AgentDetailService {
         m["think"] = `${readMessageThink(currentMessage)}${text}`;
         m["status"] = MessageStatusEnum.Incomplete;
         newMessage = buildMessageInfoFromDraft(m);
+        thinkHeavyUi = true;
       } else if (type == `${MessageModeEnum.QUESTION}`) {
         // 问题内容累积 - 新对话时从头开始，否则累积
         const accumulatedText = handleMessageProcess(
@@ -1796,6 +1903,7 @@ export default class AgentDetailService {
         uiMessage,
         needScroll,
         isErrorEvent,
+        thinkHeavyUi,
       );
     }
 
@@ -2049,8 +2157,6 @@ export default class AgentDetailService {
       // 只清正文，保留本轮助手气泡 id，供发送手势内立刻 begin 流式播报
       this.data.streamingAssistantText.value = "";
       this.data.streamingAssistantMessageId.value = currentMessageId;
-      // 开始会话后，允许获取问题建议
-      this.isAllowSuggest = true;
 
       // 标记是否已经更新过主题，确保只更新一次
       let hasUpdatedTopic = false;
@@ -2167,6 +2273,10 @@ export default class AgentDetailService {
             // ignore
           }
           // #endif
+          // 同步落盘 draft→messageList，再进 async 完成态。
+          // UTS/JS 对 async 的调度可能导致 MESSAGE 晚于 STREAM_COMPLETE 才入队；
+          // 若等 handleStreamComplete 才 endStream，thinkOnly 未写回的 think 会被丢掉。
+          this.endStreamListDraft();
           this.handleStreamComplete(params, isTempChat);
         },
         // 错误回调
@@ -2247,8 +2357,8 @@ export default class AgentDetailService {
   }
 
   /**
-   * 流式异常收尾：冲刷草稿 → 落盘打字机正文 → 清通道 → 回补。
-   * Android 进后台杀 SSE 时常见：此处必须打日志并强制走会话回补，否则半截字停住。
+   * 流式异常收尾：冲刷草稿 → 落盘打字机正文 → 清通道 → 强制会话终态（触发全量 KaTeX）→ 回补。
+   * Android 进后台杀 SSE 时常见：此处必须打日志并强制走会话回补，否则半截字停住、公式永不截图。
    */
   private finalizeStreamAbnormally(
     isTempChat: boolean,
@@ -2258,6 +2368,15 @@ export default class AgentDetailService {
     this.endStreamListDraft();
     this.sealStreamingAssistantBeforeClear();
     this.clearStreamingAssistantText();
+    // 与正常 complete 对齐：延后 inactive，让 ai-msg 走 fallback_full + KaTeX 终态刷图
+    const genAtAbnormal = this.streamGeneration;
+    setTimeout(() => {
+      if (genAtAbnormal != this.streamGeneration) {
+        return;
+      }
+      this.data.isConversationActive.value = false;
+      this.markConversationTaskCompleteIfExecuting();
+    }, 150);
     this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
     if (onTimeout != null) {
       (onTimeout as () => void)();
@@ -2311,7 +2430,7 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
-    // 先冲刷流式 UI，保证完成态气泡与列表一致
+    // 完成回调里已同步 endStreamListDraft；此处再调一次幂等兜底（异常入口/竞态）
     this.endStreamListDraft();
 
     // 冲刷尾句：必须在 clearStreaming / inactive 之前，携带最终正文
@@ -2334,11 +2453,17 @@ export default class AgentDetailService {
     }
     // 会话结束：把最终可播报文写入消息字段，供工具栏直接播放
     this.persistLastAssistantSpeakableText(speakBody);
-    // 先结束会话态（触发 Markdown 终态解析），再清打字机通道，避免中间空白一帧
-    this.data.isConversationActive.value = false;
-    // 关闭「任务执行中」Loading（与 isConversationActive 解耦；续接场景尤其依赖）
-    this.markConversationTaskCompleteIfExecuting();
-    this.clearStreamingAssistantText();
+    // 延后 inactive：Android 上 success 扫尾 / 队列尾包可能在 onComplete 后仍派发 MESSAGE；
+    // 若立刻 active=false，ai-msg 会 fallback_full 连扫堵死主线程（日志 fallback_full_reason）。
+    const genAtComplete = this.streamGeneration;
+    setTimeout(() => {
+      if (genAtComplete != this.streamGeneration) {
+        return;
+      }
+      this.data.isConversationActive.value = false;
+      this.markConversationTaskCompleteIfExecuting();
+      this.clearStreamingAssistantText();
+    }, 150);
 
     // RENDER_UI 完成结果可能只在会话详情落库，live SSE 仅收到 EXECUTING。
     // 仅当最后一条消息仍有未决 OpenUI 时回补，避免所有普通会话额外请求。
@@ -2346,7 +2471,7 @@ export default class AgentDetailService {
 
     // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
     if (!isTempChat) {
-      if (this.data.isSuggest.value && this.isAllowSuggest) {
+      if (this.data.isSuggest.value) {
         const responseData = await apiAgentConversationChatSuggest(
           buildConversationChatSuggestParams(params),
         );
@@ -2797,8 +2922,8 @@ export default class AgentDetailService {
    * @param isTempChat 是否是临时会话
    */
   async handleStopConversation(isTempChat: boolean = false): Promise<void> {
-    // 停止会话后，不再允许获取问题建议
-    this.isAllowSuggest = false;
+    // 停止会话后，清空问题建议列表（对齐 PC handleClearSideEffect：停止即清空，防止旧建议残留）
+    this.data.chatSuggestList.value = [];
 
     // 无论 UI 是否已标为结束，都先中止本地 SSE / sub，避免 chunk 回调继续跑
     this.streamGeneration = this.streamGeneration + 1;

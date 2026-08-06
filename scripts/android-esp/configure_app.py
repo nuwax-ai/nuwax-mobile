@@ -680,12 +680,21 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
         "'**/ks_adsdk*.aar', "
         "'**/Funlink_adapter_uniad*.aar', "
         "'**/advista-uniad*.aar', "
-        "'**/mm_adapter_uniad*.aar'"
+        "'**/mm_adapter_uniad*.aar', "
+        # 本地基座无广告业务，额外排除各广告网络主包（上面的 adapter 只是聚合层）
+        "'**/open_ad_sdk*.aar', "
+        "'**/wm_ad_sdk*.aar', "
+        "'**/windAd.aar', "
+        "'**/octopus_ad_sdk*.aar', "
+        "'**/adalliance_adn_sdk*.aar', "
+        "'**/Funlink_*release.aar', "
+        "'**/funlink_*release.aar', "
+        "'**/advista-*release.aar', "
+        # 直播推流（业务无直播/推流）
+        "'**/uni-live-pusher-release.aar'"
         "]"
     )
-    if "**/uniad-*.aar" in text:
-        print(f"✓ SDK libs exclude 已含广告排除: {gradle_path.relative_to(PROJ)}")
-        return
+    # 始终用规范列表（重）写 exclude，保证新增 aar 排除项在增量构建里也能生效（幂等）。
     text2, n = re.subn(
         r"exclude:\s*\[[^\]]*\]",
         new_exclude,

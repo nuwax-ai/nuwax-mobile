@@ -1,6 +1,9 @@
 /**
  * 流式 Markdown 稳定切点：切点之前可冻结不再重解析，之后为仍在增长的 live 区。
  * 供 App 增量 fallback 使用（纯函数，便于 Node 自测镜像）。
+ *
+ * 工具卡约定：文末相连的工具（含 process-group）流式期间不得冻入 stable，
+ * 否则第一张进冻结区、后续进 live，会先分开显示、结束才合组。
  */
 
 import { findIncompleteCustomMarkupTailStart } from "@/utils/markdownCustomProcess.uts";
@@ -127,9 +130,66 @@ function maxInt(a: number, b: number): number {
   return a > b ? a : b;
 }
 
+function isWhitespaceChar(ch: string): boolean {
+  return ch == " " || ch == "\n" || ch == "\r" || ch == "\t";
+}
+
+function isTerminalProcessOpenTag(openTag: string): boolean {
+  return (
+    openTag.indexOf('status="FINISHED"') >= 0 ||
+    openTag.indexOf('status="FAILED"') >= 0 ||
+    openTag.indexOf("status='FINISHED'") >= 0 ||
+    openTag.indexOf("status='FAILED'") >= 0
+  );
+}
+
 /**
- * 已终态（FINISHED/FAILED）的完整 markdown-custom-process 块终点。
- * EXECUTING 不冻：status 原地改写会破坏 stable 前缀。
+ * 解析单个 markdown-custom-process（非 group）块终点；失败返回 -1。
+ */
+function scanProcessBlockEnd(slice: string, openIdx: number): number {
+  const openMarker = "<markdown-custom-process";
+  if (slice.substring(openIdx, openIdx + openMarker.length) != openMarker) {
+    return -1;
+  }
+  const afterName = openIdx + openMarker.length;
+  if (slice.substring(afterName, afterName + 6) == "-group") {
+    return -1;
+  }
+  const gt = slice.indexOf(">", afterName);
+  if (gt < 0) {
+    return -1;
+  }
+  let blockEnd = gt + 1;
+  if (slice.charAt(gt - 1) != "/") {
+    const closeMarker = "</markdown-custom-process>";
+    const closeIdx = slice.indexOf(closeMarker, gt);
+    if (closeIdx < 0) {
+      return -1;
+    }
+    blockEnd = closeIdx + closeMarker.length;
+  }
+  return blockEnd;
+}
+
+/**
+ * 吃掉紧随的空白与可选 </div>，返回新终点。
+ */
+function expandAfterProcessBlock(slice: string, blockEnd: number): number {
+  let lastEnd = blockEnd;
+  let p = blockEnd;
+  while (p < slice.length && isWhitespaceChar(slice.charAt(p)) == true) {
+    p++;
+  }
+  if (slice.substring(p, p + 6).toLowerCase() == "</div>") {
+    lastEnd = p + 6;
+  }
+  return lastEnd;
+}
+
+/**
+ * 已终态工具块可冻终点。
+ * - process-group：整组全 FINISHED/FAILED 才冻到组闭合；禁止切在组中（否则拆开显示）。
+ * - 独立 process：FINISHED/FAILED 可冻。
  * @returns exclusive end；无可冻返回 0
  */
 function endOfFinishedCustomBlocks(text: string, limit: number): number {
@@ -139,15 +199,71 @@ function endOfFinishedCustomBlocks(text: string, limit: number): number {
   }
   const slice = text.substring(0, sliceEnd);
   const openMarker = "<markdown-custom-process";
-  const closeMarker = "</markdown-custom-process>";
+  const groupOpen = "<markdown-custom-process-group>";
+  const groupClose = "</markdown-custom-process-group>";
   let search = 0;
   let lastEnd = 0;
+
   while (search < slice.length) {
-    const idx = slice.indexOf(openMarker, search);
-    if (idx < 0) {
+    const groupIdx = slice.indexOf(groupOpen, search);
+    const procIdx = slice.indexOf(openMarker, search);
+    if (groupIdx < 0 && procIdx < 0) {
       break;
     }
-    const afterName = idx + openMarker.length;
+
+    // 优先消费完整 group，避免组内 process 被单独冻到组中
+    if (groupIdx >= 0 && (procIdx < 0 || groupIdx <= procIdx)) {
+      const innerStart = groupIdx + groupOpen.length;
+      const closeIdx = slice.indexOf(groupClose, innerStart);
+      if (closeIdx < 0) {
+        // 组未闭合：不可冻及组内任何部分
+        break;
+      }
+      const inner = slice.substring(innerStart, closeIdx);
+      let allTerminal = true;
+      let hasProcess = false;
+      let innerSearch = 0;
+      while (innerSearch < inner.length) {
+        const pIdx = inner.indexOf(openMarker, innerSearch);
+        if (pIdx < 0) {
+          break;
+        }
+        const after = pIdx + openMarker.length;
+        if (inner.substring(after, after + 6) == "-group") {
+          innerSearch = after + 6;
+          continue;
+        }
+        const gt = inner.indexOf(">", after);
+        if (gt < 0) {
+          allTerminal = false;
+          break;
+        }
+        hasProcess = true;
+        const openTag = inner.substring(pIdx, gt + 1);
+        if (isTerminalProcessOpenTag(openTag) != true) {
+          allTerminal = false;
+          break;
+        }
+        const blockEndRel = scanProcessBlockEnd(inner, pIdx);
+        if (blockEndRel < 0) {
+          allTerminal = false;
+          break;
+        }
+        innerSearch = blockEndRel;
+      }
+      const groupEnd = closeIdx + groupClose.length;
+      if (hasProcess == true && allTerminal == true) {
+        lastEnd = expandAfterProcessBlock(slice, groupEnd);
+      }
+      search = groupEnd;
+      continue;
+    }
+
+    // 独立 process（不在 group 内；上面已跳过 group）
+    if (procIdx < 0) {
+      break;
+    }
+    const afterName = procIdx + openMarker.length;
     if (slice.substring(afterName, afterName + 6) == "-group") {
       search = afterName + 6;
       continue;
@@ -156,39 +272,159 @@ function endOfFinishedCustomBlocks(text: string, limit: number): number {
     if (gt < 0) {
       break;
     }
-    const openTag = slice.substring(idx, gt + 1);
-    const terminal =
-      openTag.indexOf('status="FINISHED"') >= 0 ||
-      openTag.indexOf('status="FAILED"') >= 0 ||
-      openTag.indexOf("status='FINISHED'") >= 0 ||
-      openTag.indexOf("status='FAILED'") >= 0;
-    let blockEnd = gt + 1;
-    if (slice.charAt(gt - 1) != "/") {
-      const closeIdx = slice.indexOf(closeMarker, gt);
-      if (closeIdx < 0) {
-        break;
-      }
-      blockEnd = closeIdx + closeMarker.length;
+    const openTag = slice.substring(procIdx, gt + 1);
+    const blockEnd = scanProcessBlockEnd(slice, procIdx);
+    if (blockEnd < 0) {
+      break;
     }
-    if (terminal == true) {
-      lastEnd = blockEnd;
-      // 吃掉紧随的 </div>
-      let p = blockEnd;
-      while (
-        p < slice.length &&
-        (slice.charAt(p) == " " ||
-          slice.charAt(p) == "\n" ||
-          slice.charAt(p) == "\r")
-      ) {
-        p++;
-      }
-      if (slice.substring(p, p + 6).toLowerCase() == "</div>") {
-        lastEnd = p + 6;
-      }
+    if (isTerminalProcessOpenTag(openTag) == true) {
+      lastEnd = expandAfterProcessBlock(slice, blockEnd);
     }
     search = blockEnd;
   }
   return lastEnd;
+}
+
+class ToolBlockRange {
+  start: number = 0;
+  end: number = 0;
+}
+
+/**
+ * 收集正文中的工具块范围（group / process / :::container）。
+ */
+function collectToolBlockRanges(text: string): ToolBlockRange[] {
+  const ranges: ToolBlockRange[] = [];
+  const openMarker = "<markdown-custom-process";
+  const groupOpen = "<markdown-custom-process-group>";
+  const groupClose = "</markdown-custom-process-group>";
+  const containerMarker = ":::container";
+  let search = 0;
+  while (search < text.length) {
+    const groupIdx = text.indexOf(groupOpen, search);
+    const procIdx = text.indexOf(openMarker, search);
+    const fenceIdx = text.indexOf(containerMarker, search);
+
+    let best = -1;
+    let kind = "";
+    if (groupIdx >= 0) {
+      best = groupIdx;
+      kind = "group";
+    }
+    if (procIdx >= 0 && (best < 0 || procIdx < best)) {
+      best = procIdx;
+      kind = "process";
+    }
+    if (fenceIdx >= 0 && (best < 0 || fenceIdx < best)) {
+      best = fenceIdx;
+      kind = "container";
+    }
+    if (best < 0 || kind.length == 0) {
+      break;
+    }
+
+    if (kind == "group") {
+      const closeIdx = text.indexOf(groupClose, best + groupOpen.length);
+      if (closeIdx < 0) {
+        const r = new ToolBlockRange();
+        r.start = best;
+        r.end = text.length;
+        ranges.push(r);
+        break;
+      }
+      const r = new ToolBlockRange();
+      r.start = best;
+      r.end = closeIdx + groupClose.length;
+      ranges.push(r);
+      search = r.end;
+      continue;
+    }
+
+    if (kind == "process") {
+      const afterName = best + openMarker.length;
+      if (text.substring(afterName, afterName + 6) == "-group") {
+        search = afterName + 6;
+        continue;
+      }
+      const blockEnd = scanProcessBlockEnd(text, best);
+      if (blockEnd < 0) {
+        const r = new ToolBlockRange();
+        r.start = best;
+        r.end = text.length;
+        ranges.push(r);
+        break;
+      }
+      // 与 endOfFinished 一致：吃掉紧随 </div>，避免文末簇误判
+      const expanded = expandAfterProcessBlock(text, blockEnd);
+      const r = new ToolBlockRange();
+      r.start = best;
+      r.end = expanded;
+      ranges.push(r);
+      search = expanded;
+      continue;
+    }
+
+    // :::container ...\n:::
+    const after = best + containerMarker.length;
+    if (after < text.length) {
+      const next = text.charAt(after);
+      if (next != " " && next != "\t" && next != "\n" && next != "\r") {
+        search = after;
+        continue;
+      }
+    }
+    const closeIdx = text.indexOf("\n:::", after);
+    if (closeIdx < 0) {
+      const r = new ToolBlockRange();
+      r.start = best;
+      r.end = text.length;
+      ranges.push(r);
+      break;
+    }
+    const r = new ToolBlockRange();
+    r.start = best;
+    r.end = closeIdx + "\n:::".length;
+    ranges.push(r);
+    search = r.end;
+  }
+  return ranges;
+}
+
+/**
+ * 文末相连工具簇起点：从文末向前，仅空白间隔的连续工具块。
+ * 流式时这些块必须留在 live，以便第二张起即合组显示。
+ * @returns 起点；无则 -1
+ */
+function startOfTrailingToolCluster(text: string): number {
+  const ranges = collectToolBlockRanges(text);
+  if (ranges.length == 0) {
+    return -1;
+  }
+  // 文末若有非空白非工具内容，则工具不在「文末簇」
+  let lastContent = text.length - 1;
+  while (lastContent >= 0 && isWhitespaceChar(text.charAt(lastContent)) == true) {
+    lastContent--;
+  }
+  if (lastContent < 0) {
+    return ranges[0].start;
+  }
+  // lastContent 必须落在最后一个工具块内，才算文末工具簇
+  const lastRange = ranges[ranges.length - 1];
+  if (lastContent < lastRange.start || lastContent >= lastRange.end) {
+    return -1;
+  }
+
+  // 从末块向前合并：块间仅空白
+  let clusterStart = lastRange.start;
+  for (let i = ranges.length - 2; i >= 0; i--) {
+    const prev = ranges[i];
+    const between = text.substring(prev.end, clusterStart);
+    if (between.trim().length > 0) {
+      break;
+    }
+    clusterStart = prev.start;
+  }
+  return clusterStart;
 }
 
 /**
@@ -222,5 +458,16 @@ export function findStableMarkdownCut(
   const structureLimit = incompleteAt >= 0 ? incompleteAt : markdown.length;
   const paraCut = lastParagraphBoundaryBefore(markdown, structureLimit);
   const toolCut = endOfFinishedCustomBlocks(markdown, structureLimit);
-  return maxInt(paraCut, toolCut);
+  let cut = maxInt(paraCut, toolCut);
+
+  // 文末相连工具簇留在 live：避免第一张冻住后第二张拆开显示
+  const trailingTools = startOfTrailingToolCluster(markdown);
+  if (trailingTools >= 0 && cut > trailingTools) {
+    const beforeTools = lastParagraphBoundaryBefore(markdown, trailingTools);
+    cut = beforeTools <= trailingTools ? beforeTools : trailingTools;
+    if (cut > trailingTools) {
+      cut = trailingTools;
+    }
+  }
+  return cut;
 }

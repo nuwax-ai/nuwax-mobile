@@ -6,13 +6,19 @@
 #   - 不指定版本 → 读 channels/<channel>.json（默认 debug）= 当前最新（安装/同步更新用）
 #   - 指定 NUWAX_BASE_VERSION / --version → 固定 App versionName
 #
+# 变体（flavor）：
+#   - --flavor vapor（或 channel=vapor / 版本含 vapor）：拉 _vapor 后缀的产物，
+#     落地为 android_debug_vapor.apk / iOS_debug_vapor.ipa / Pandora_simulator_debug_vapor.app，
+#     与标准基座文件名共存、互不覆盖。
+#
 # One-liner:
 #   curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh | bash
 #
 # 仓库内:
 #   make base-fetch
 #   bash scripts/fetch-custom-base-s3.sh --targets android,ios-device
-#   NUWAX_BASE_VERSION=1.0.0 bash scripts/fetch-custom-base-s3.sh
+#   NUWAX_BASE_CHANNEL=vapor make base-fetch                 # 拉 vapor 蒸汽基座
+#   NUWAX_BASE_VERSION=1.0.0-vapor make base-fetch
 set -euo pipefail
 
 ENDPOINT="${NUWAX_S3_ENDPOINT:-https://s3.nuwax.com:9443}"
@@ -20,6 +26,7 @@ BUCKET="${NUWAX_S3_BUCKET:-nuwax-packages}"
 PREFIX="${NUWAX_S3_PREFIX:-mobile-custom-bases}"
 CHANNEL="${NUWAX_BASE_CHANNEL:-debug}"
 PINNED_VERSION="${NUWAX_BASE_VERSION:-}"
+FLAVOR="${NUWAX_BASE_FLAVOR:-}"
 INSECURE="${NUWAX_S3_INSECURE:-0}"
 TARGETS="android,ios-device,ios-simulator,harmony"
 DEST_DIR=""
@@ -34,13 +41,15 @@ Options:
   --dest DIR         输出目录（默认：仓库 unpackage/debug）
   --version VER      固定 App versionName（不设则拉最新）
   --channel NAME     通道（默认 debug）
+  --flavor NAME      变体（如 vapor：拉 _<flavor> 后缀产物；channel/version 含 vapor 时自动）
   -h, --help
 
 不指定 --version：读 channels/<channel>.json → 当前最新（同步更新时再跑一次即可）。
+vapor：--channel vapor（或 --version 1.0.0-vapor）自动拉 _vapor 后缀产物，与标准基座共存。
 
 Environment:
   NUWAX_S3_ENDPOINT / NUWAX_S3_BUCKET / NUWAX_S3_PREFIX
-  NUWAX_BASE_CHANNEL / NUWAX_BASE_VERSION
+  NUWAX_BASE_CHANNEL / NUWAX_BASE_VERSION / NUWAX_BASE_FLAVOR
   NUWAX_S3_INSECURE=1
 EOF
 }
@@ -51,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --dest) DEST_DIR="${2:-}"; shift 2 ;;
     --version) PINNED_VERSION="${2:-}"; shift 2 ;;
     --channel) CHANNEL="${2:-}"; shift 2 ;;
+    --flavor) FLAVOR="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -124,6 +134,16 @@ else
   ok "最新 → ${VERSION}（与 App versionName 对齐）"
 fi
 
+# 变体后缀：--flavor 显式；否则 channel/version 含 vapor 自动识别
+SUFFIX=""
+if [[ -n "$FLAVOR" ]]; then
+  SUFFIX="_${FLAVOR}"
+elif [[ "$CHANNEL" == "vapor" || "$VERSION" == *vapor* ]]; then
+  SUFFIX="_vapor"
+  FLAVOR="vapor"
+fi
+[[ -n "$SUFFIX" ]] && ok "变体: ${FLAVOR}（产物名带 ${SUFFIX} 后缀，与标准基座共存）"
+
 ART_BASE="$base/versions/${VERSION}/artifacts"
 info "拉取 manifest ..."
 if fetch "$ART_BASE/manifest.json" "$TMP/manifest.json"; then
@@ -148,15 +168,15 @@ download_one() {
   return 1
 }
 
-if want_target android; then download_one "android_debug.apk" || true; fi
-if want_target ios-device; then download_one "iOS_debug.ipa" || true; fi
+if want_target android; then download_one "android_debug${SUFFIX}.apk" || true; fi
+if want_target ios-device; then download_one "iOS_debug${SUFFIX}.ipa" || true; fi
 
 if want_target ios-simulator; then
-  if download_one "Pandora_simulator_debug.app.zip"; then
-    info "解压 Pandora_simulator_debug.app.zip ..."
-    rm -rf "$DEST_DIR/Pandora_simulator_debug.app"
-    unzip -q -o "$DEST_DIR/Pandora_simulator_debug.app.zip" -d "$DEST_DIR"
-    ok "Pandora_simulator_debug.app"
+  if download_one "Pandora_simulator_debug${SUFFIX}.app.zip"; then
+    info "解压 Pandora_simulator_debug${SUFFIX}.app.zip ..."
+    rm -rf "$DEST_DIR/Pandora_simulator_debug${SUFFIX}.app"
+    unzip -q -o "$DEST_DIR/Pandora_simulator_debug${SUFFIX}.app.zip" -d "$DEST_DIR"
+    ok "Pandora_simulator_debug${SUFFIX}.app"
   fi
 fi
 

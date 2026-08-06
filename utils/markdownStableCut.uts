@@ -1,0 +1,226 @@
+/**
+ * 流式 Markdown 稳定切点：切点之前可冻结不再重解析，之后为仍在增长的 live 区。
+ * 供 App 增量 fallback 使用（纯函数，便于 Node 自测镜像）。
+ */
+
+import { findIncompleteCustomMarkupTailStart } from "@/utils/markdownCustomProcess.uts";
+
+/**
+ * 未闭合 ``` 代码围栏起点；无则 -1。
+ */
+function findUnclosedCodeFenceStart(text: string): number {
+  let search = 0;
+  let openAt = -1;
+  while (search < text.length) {
+    const idx = text.indexOf("```", search);
+    if (idx < 0) {
+      break;
+    }
+    if (openAt < 0) {
+      openAt = idx;
+      search = idx + 3;
+      continue;
+    }
+    // 闭合
+    openAt = -1;
+    search = idx + 3;
+  }
+  return openAt;
+}
+
+/**
+ * 未闭合块级 $$ 起点；无则 -1。
+ * 跳过行内单 $；成对 $$ 开合交替。
+ */
+function findUnclosedBlockMathStart(text: string): number {
+  let search = 0;
+  let openAt = -1;
+  while (search < text.length) {
+    const idx = text.indexOf("$$", search);
+    if (idx < 0) {
+      break;
+    }
+    if (openAt < 0) {
+      openAt = idx;
+      search = idx + 2;
+      continue;
+    }
+    openAt = -1;
+    search = idx + 2;
+  }
+  return openAt;
+}
+
+/**
+ * 文末仍在增长的 GFM 表格起点（末尾连续 | 行且未以空行结束）。
+ * 无则 -1。
+ */
+function findTrailingOpenTableStart(text: string): number {
+  if (text.length == 0) {
+    return -1;
+  }
+  const normalized = text.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines.length == 0) {
+    return -1;
+  }
+  // 末行非空且是表行 → 表可能仍在增长
+  let end = lines.length - 1;
+  while (end >= 0 && lines[end].trim().length == 0) {
+    end--;
+  }
+  if (end < 0) {
+    return -1;
+  }
+  if (!lines[end].trim().startsWith("|")) {
+    return -1;
+  }
+  // 向上收齐连续表行（含分隔行）
+  let startLine = end;
+  while (startLine > 0) {
+    const prev = lines[startLine - 1].trim();
+    if (prev.length == 0) {
+      break;
+    }
+    if (!prev.startsWith("|")) {
+      break;
+    }
+    startLine--;
+  }
+  // 至少两行才像表（表头+分隔或表头+数据）；单行 | 也可能是半截表
+  // 计算该 startLine 在原文中的字符偏移
+  let offset = 0;
+  for (let i = 0; i < startLine; i++) {
+    offset += lines[i].length + 1; // + \n
+  }
+  return offset;
+}
+
+/**
+ * 在 limit 之前找最后一个段落边界（\n\n 之后），作为可冻结终点。
+ * 找不到返回 0。
+ */
+function lastParagraphBoundaryBefore(text: string, limit: number): number {
+  const sliceEnd = limit > text.length ? text.length : limit;
+  if (sliceEnd <= 0) {
+    return 0;
+  }
+  const region = text.substring(0, sliceEnd);
+  const idx = region.lastIndexOf("\n\n");
+  if (idx < 0) {
+    return 0;
+  }
+  return idx + 2;
+}
+
+function earlierNonNeg(a: number, b: number): number {
+  if (a < 0) {
+    return b;
+  }
+  if (b < 0) {
+    return a;
+  }
+  return a < b ? a : b;
+}
+
+function maxInt(a: number, b: number): number {
+  return a > b ? a : b;
+}
+
+/**
+ * 已终态（FINISHED/FAILED）的完整 markdown-custom-process 块终点。
+ * EXECUTING 不冻：status 原地改写会破坏 stable 前缀。
+ * @returns exclusive end；无可冻返回 0
+ */
+function endOfFinishedCustomBlocks(text: string, limit: number): number {
+  const sliceEnd = limit > text.length ? text.length : limit;
+  if (sliceEnd <= 0) {
+    return 0;
+  }
+  const slice = text.substring(0, sliceEnd);
+  const openMarker = "<markdown-custom-process";
+  const closeMarker = "</markdown-custom-process>";
+  let search = 0;
+  let lastEnd = 0;
+  while (search < slice.length) {
+    const idx = slice.indexOf(openMarker, search);
+    if (idx < 0) {
+      break;
+    }
+    const afterName = idx + openMarker.length;
+    if (slice.substring(afterName, afterName + 6) == "-group") {
+      search = afterName + 6;
+      continue;
+    }
+    const gt = slice.indexOf(">", afterName);
+    if (gt < 0) {
+      break;
+    }
+    const openTag = slice.substring(idx, gt + 1);
+    const terminal =
+      openTag.indexOf('status="FINISHED"') >= 0 ||
+      openTag.indexOf('status="FAILED"') >= 0 ||
+      openTag.indexOf("status='FINISHED'") >= 0 ||
+      openTag.indexOf("status='FAILED'") >= 0;
+    let blockEnd = gt + 1;
+    if (slice.charAt(gt - 1) != "/") {
+      const closeIdx = slice.indexOf(closeMarker, gt);
+      if (closeIdx < 0) {
+        break;
+      }
+      blockEnd = closeIdx + closeMarker.length;
+    }
+    if (terminal == true) {
+      lastEnd = blockEnd;
+      // 吃掉紧随的 </div>
+      let p = blockEnd;
+      while (
+        p < slice.length &&
+        (slice.charAt(p) == " " ||
+          slice.charAt(p) == "\n" ||
+          slice.charAt(p) == "\r")
+      ) {
+        p++;
+      }
+      if (slice.substring(p, p + 6).toLowerCase() == "</div>") {
+        lastEnd = p + 6;
+      }
+    }
+    search = blockEnd;
+  }
+  return lastEnd;
+}
+
+/**
+ * 流式「可冻结」切点（exclusive end index）。
+ * @param markdown 已经过 stripIncomplete 的可渲染正文
+ * @param streaming true=流式（末段段落留 live）；false=终态（可冻到文末）
+ */
+export function findStableMarkdownCut(
+  markdown: string,
+  streaming: boolean = true,
+): number {
+  if (markdown.length == 0) {
+    return 0;
+  }
+  if (streaming != true) {
+    return markdown.length;
+  }
+
+  // 不完整结构起点（取最早者）
+  let incompleteAt = -1;
+  const fenceAt = findUnclosedCodeFenceStart(markdown);
+  const mathAt = findUnclosedBlockMathStart(markdown);
+  const tableAt = findTrailingOpenTableStart(markdown);
+  const customAt = findIncompleteCustomMarkupTailStart(markdown);
+  incompleteAt = earlierNonNeg(incompleteAt, fenceAt);
+  incompleteAt = earlierNonNeg(incompleteAt, mathAt);
+  incompleteAt = earlierNonNeg(incompleteAt, tableAt);
+  incompleteAt = earlierNonNeg(incompleteAt, customAt);
+
+  // 结构完整时：段落边界 + 已 FINISHED 工具卡均可冻；末段纯文本仍留 live
+  const structureLimit = incompleteAt >= 0 ? incompleteAt : markdown.length;
+  const paraCut = lastParagraphBoundaryBefore(markdown, structureLimit);
+  const toolCut = endOfFinishedCustomBlocks(markdown, structureLimit);
+  return maxInt(paraCut, toolCut);
+}

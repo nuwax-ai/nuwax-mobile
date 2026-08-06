@@ -10,7 +10,20 @@ import {
 } from "@/subpackages/components/ai-msg/appMarkdownFallback.uts";
 import { expandMarkdownImageItems } from "@/subpackages/components/ai-msg/markdownImage.uts";
 import { listMarkdownCustomProcessTags } from "@/utils/markdownCustomProcess.uts";
-import { perfRecordParse } from "@/utils/perfProbe.uts";
+import { findStableMarkdownCut } from "@/utils/markdownStableCut.uts";
+import { perfRecordParseDetail, sseStallLog } from "@/utils/perfProbe.uts";
+
+/** 给 fallback el 的 uniqueId 加前缀，避免 stable/live 碰撞。 */
+function prefixMarkdownElIds(
+  list: UniAiMarkdownElItem[],
+  prefix: string,
+): void {
+  for (let i = 0; i < list.length; i++) {
+    const id = list[i].uniqueId;
+    const base = id != null && `${id}`.length > 0 ? `${id}` : `i${i}`;
+    list[i].uniqueId = prefix + base;
+  }
+}
 
 /** 解析 html token 中的 markdown-custom-process 标签（引号感知，允许 name 含 >）。 */
 function parseCustomProcessList(source: string): any[] {
@@ -155,6 +168,10 @@ export class AiMsgMarkdownParser {
   private lastFallbackBody: string = "";
   /** 已完成消息的正文快照，用于跳过父级重渲染触发的重复解析。 */
   private lastFinishedBody: string = "";
+  /** App 增量 fallback：已冻结正文前缀（与 fallbackStableEls 对应）。 */
+  private fallbackStablePrefix: string = "";
+  /** App 增量 fallback：已冻结的渲染列表（不再随 SSE 重解析）。 */
+  private fallbackStableEls: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
   /** 公式回填批量刷新防抖：攒一批 token 回填后整体刷一次，避免逐条替换 markdownElList
    *  造成高频重渲染、与渲染帧竞争触发 ConcurrentModificationException。 */
   private mathFlushPending: boolean = false;
@@ -189,10 +206,17 @@ export class AiMsgMarkdownParser {
     this.cmarkProbeOk = true;
     this.lastFallbackBody = "";
     this.lastFinishedBody = "";
+    this.clearFallbackIncrementalState();
     // 作废任何在途的批量刷新，避免新消息被旧回调刷到半截
     this.mathFlushGen = this.mathFlushGen + 1;
     this.mathFlushPending = false;
     this.parseMarkdown = this.createParseMarkdown();
+  }
+
+  /** 清空 App 增量 fallback 冻结区。 */
+  private clearFallbackIncrementalState(): void {
+    this.fallbackStablePrefix = "";
+    this.fallbackStableEls = [] as UniAiMarkdownElItem[];
   }
 
   /**
@@ -301,9 +325,8 @@ export class AiMsgMarkdownParser {
   }
 
   /**
-   * 公式回填批量刷新（防抖）：~40ms 内多次 token 回填只整体替换 markdownElList 一次，
-   * 把「一条多公式消息 = 连续十几次重渲染」压成一两次，降低与原生渲染帧竞争导致的
-   * ConcurrentModificationException。gen 用于在新消息到来时作废在途的过期刷新。
+   * 公式回填批量刷新（防抖）：~40ms 内多次 token 回填只整体替换 markdownElList 一次。
+   * 含工具卡时拉长到 80ms，降低 ToolCallCard 挂载后列表抖动触发 Android 原生停更的概率。
    */
   private scheduleMathFlush(): void {
     if (this.mathFlushPending == true) {
@@ -311,6 +334,7 @@ export class AiMsgMarkdownParser {
     }
     this.mathFlushPending = true;
     const gen = this.mathFlushGen;
+    const delayMs = this.renderListHasCustomEl() == true ? 80 : 40;
     setTimeout((): void => {
       this.mathFlushPending = false;
       if (gen != this.mathFlushGen) {
@@ -324,13 +348,13 @@ export class AiMsgMarkdownParser {
       this.msg.value.markdownElList = next;
       this.bumpRevision();
       uni.$emit("ai-msg-content-ready", null);
-    }, 40);
+    }, delayMs);
   }
 
   /**
    * fallback 渲染。
-   * - App：文案+占位先上屏，截图齐后一次填入
-   * - H5：仍走单条 katex → resultHtml（与改 App 前一致），回调合并刷新
+   * - App 流式：稳定前缀冻结 + 只解析尾巴（增量）
+   * - App 终态 / H5：全量 parse 一次定稿
    */
   private applyAppFallback(_holdMathUntilDone: boolean = false): void {
     const body = this.getBodyText();
@@ -354,7 +378,35 @@ export class AiMsgMarkdownParser {
     // 进入 fallback 前必须掐掉 cmark 打字机，否则延迟回调会覆盖本结果
     this.abortIncrementalParse();
     this.parseMarkdown = null;
-    // 公式/mermaid/高亮回填走防抖批量刷新（scheduleMathFlush），避免逐条替换 list 与渲染帧竞争
+
+    const streaming =
+      _holdMathUntilDone != true &&
+      this.getIsConversationActive() == true &&
+      this.getIsLastMsg() == true;
+
+    // #ifdef APP
+    if (streaming == true) {
+      this.applyAppFallbackIncremental(body);
+      return;
+    }
+    // #endif
+
+    // #ifdef APP
+    try {
+      sseStallLog(
+        "fallback_full_reason",
+        `hold=${_holdMathUntilDone} active=${this.getIsConversationActive()} last=${this.getIsLastMsg()} body=${body.length}`,
+      );
+    } catch (_eR) {
+      // ignore
+    }
+    // #endif
+    this.applyAppFallbackFull(body);
+  }
+
+  /** 全量 fallback（终态定稿 / 前缀失效兜底 / 非 App）。 */
+  private applyAppFallbackFull(body: string): void {
+    this.clearFallbackIncrementalState();
     const onMathNotify = (): void => {
       this.scheduleMathFlush();
     };
@@ -362,19 +414,125 @@ export class AiMsgMarkdownParser {
     const parsed = expandMarkdownImageItems(
       parseAppMarkdownFallback(body, onMathNotify),
     );
-    // 解析成功后再记快照，避免抛错/半截结果把同正文锁死跳过
     this.lastFallbackBody = body;
     this.msg.value.markdownElList = parsed;
-    // [PerfProbe] 观测：fallback 全量/增量解析耗时与正文长度（性能排查，可关）
     try {
-      perfRecordParse(body.length, Date.now() - __parseT0);
+      perfRecordParseDetail(
+        "full",
+        body.length,
+        body.length,
+        0,
+        body.length,
+        parsed.length,
+        Date.now() - __parseT0,
+      );
     } catch (_e) {
-      // 埋点失败静默，绝不影响渲染
+      // 埋点失败静默
     }
     this.msg.value.rendered = true;
     this.lastFinishedBody = body;
     this.bumpRevision();
-    // App 有公式队列时 count>0，等首批 chunk 上屏再 emit；H5 无队列 count=0，正文先 emit
+    if (takeLastMathFlushCount() == 0) {
+      uni.$emit("ai-msg-content-ready", null);
+    }
+  }
+
+  /**
+   * App 流式增量 fallback：只解析 newlyFrozen + live，前缀 el 冻结复用。
+   * body 非纯 append（前缀不匹配）时回退全量。
+   */
+  private applyAppFallbackIncremental(body: string): void {
+    // 前缀被改写 / 缩短 → 全量
+    if (
+      this.fallbackStablePrefix.length > 0 &&
+      !body.startsWith(this.fallbackStablePrefix)
+    ) {
+      this.applyAppFallbackFull(body);
+      return;
+    }
+
+    const cut = findStableMarkdownCut(body, true);
+    // 切点回退到已冻结前缀之内（异常）→ 全量，避免结构错乱
+    if (
+      this.fallbackStablePrefix.length > 0 &&
+      cut < this.fallbackStablePrefix.length
+    ) {
+      this.applyAppFallbackFull(body);
+      return;
+    }
+
+    const onMathNotify = (): void => {
+      this.scheduleMathFlush();
+    };
+    const __parseT0 = Date.now();
+    let parsedChars = 0;
+
+    let stablePrefix = this.fallbackStablePrefix;
+    let stableEls = this.fallbackStableEls;
+
+    // 扩展冻结区：只 parse 新增的 newlyFrozen
+    if (cut > stablePrefix.length) {
+      const newlyFrozen = body.substring(stablePrefix.length, cut);
+      if (newlyFrozen.length > 0) {
+        const newEls = expandMarkdownImageItems(
+          parseAppMarkdownFallback(newlyFrozen, onMathNotify),
+        );
+        prefixMarkdownElIds(newEls, `f${stablePrefix.length}-`);
+        const merged = [] as UniAiMarkdownElItem[];
+        for (let i = 0; i < stableEls.length; i++) {
+          merged.push(stableEls[i]);
+        }
+        for (let j = 0; j < newEls.length; j++) {
+          merged.push(newEls[j]);
+        }
+        stableEls = merged;
+        parsedChars += newlyFrozen.length;
+      }
+      stablePrefix = body.substring(0, cut);
+    }
+
+    // live 区每次重解析（通常很短）
+    const live = body.substring(stablePrefix.length);
+    const liveEls = [] as UniAiMarkdownElItem[];
+    if (live.length > 0) {
+      const parsedLive = expandMarkdownImageItems(
+        parseAppMarkdownFallback(live, onMathNotify),
+      );
+      prefixMarkdownElIds(parsedLive, "live-");
+      for (let k = 0; k < parsedLive.length; k++) {
+        liveEls.push(parsedLive[k]);
+      }
+      parsedChars += live.length;
+    }
+
+    const nextList = [] as UniAiMarkdownElItem[];
+    for (let s = 0; s < stableEls.length; s++) {
+      nextList.push(stableEls[s]);
+    }
+    for (let l = 0; l < liveEls.length; l++) {
+      nextList.push(liveEls[l]);
+    }
+
+    this.fallbackStablePrefix = stablePrefix;
+    this.fallbackStableEls = stableEls;
+    this.lastFallbackBody = body;
+    this.msg.value.markdownElList = nextList;
+    try {
+      perfRecordParseDetail(
+        "inc",
+        body.length,
+        parsedChars,
+        stablePrefix.length,
+        live.length,
+        nextList.length,
+        Date.now() - __parseT0,
+      );
+    } catch (_e2) {
+      // ignore
+    }
+    this.msg.value.rendered = true;
+    this.lastFinishedBody = body;
+    this.bumpRevision();
     if (takeLastMathFlushCount() == 0) {
       uni.$emit("ai-msg-content-ready", null);
     }
@@ -571,11 +729,13 @@ export class AiMsgMarkdownParser {
 
   runMarkdownParse(forceDone: boolean = false): void {
     const body = this.getBodyText();
+    // 注意：勿用 msg.state===Complete 单独判定流结束。
+    // SSE 中间态也可能短暂 Complete，会导致 App 增量被关掉、反复 full 全量扫。
+    // 整轮结束以 isConversationActive / isLastMsg / forceDone 为准。
     const streamFinished =
       forceDone ||
       !this.getIsConversationActive() ||
-      !this.getIsLastMsg() ||
-      this.msg.value.state === 3;
+      !this.getIsLastMsg();
     const needsCustomFallback = this.hasCustomMarkup(body);
 
     // 历史/已完成消息：正文未变且已有渲染结果时跳过。
@@ -593,6 +753,13 @@ export class AiMsgMarkdownParser {
       } else if (
         this.lastFinishedBody.length > 0 &&
         body == this.lastFinishedBody
+      ) {
+        return;
+      } else if (
+        // 非末条：已有 fallback 结果且正文未变，禁止因父级 prop 抖动再全量扫
+        this.getIsLastMsg() != true &&
+        this.lastFallbackBody.length > 0 &&
+        body == this.lastFallbackBody
       ) {
         return;
       }
@@ -649,6 +816,7 @@ export class AiMsgMarkdownParser {
       this.msg.value.markdownElList = [] as UniAiMarkdownElItem[];
       this.lastFinishedBody = "";
       this.lastFallbackBody = "";
+      this.clearFallbackIncrementalState();
     }
     // 仅 SSE 进行中走增量打字机
     this.parseMarkdown!.msgReceiveDone = false;

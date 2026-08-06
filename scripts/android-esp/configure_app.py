@@ -858,6 +858,22 @@ def generate_uni_app_config() -> None:
     print(f"✓ 生成 {pkg}.UniAppConfig（vapor 运行时引导，替代 HX 不再生成的 kt）")
 
 
+def generate_index_kt_stub() -> None:
+    """vapor 运行时反射查找 uni.<appid去下划线>.IndexKt（index.kt 编译产物），
+    找不到报 'Unable to load index Kotlin class'。先放最小存根让类存在，
+    若运行时还调 defineAppConfig/definePageRoutes 等再据报错补。"""
+    pkg_suffix = APPID.replace("__", "")
+    pkg = f"uni.{pkg_suffix}"
+    d = PROJ / "app/src/main/java" / pkg.replace(".", "/")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "index.kt").write_text(
+        f"package {pkg}\n\n"
+        f"// vapor: IndexKt 存根。运行时要本类存在（业务入口在字节码 app-service.js）。\n"
+        f"val __vapor_index_stub: Boolean = true\n"
+    )
+    print(f"✓ 生成 {pkg}.index.kt 存根（IndexKt 引导用）")
+
+
 def main() -> None:
     if not (PROJ / "settings.gradle").is_file():
         die(f"找不到工程 {PROJ}，请先跑 official/setup_sdk.sh")
@@ -879,6 +895,7 @@ def main() -> None:
     configure_manifest()
     configure_app_name()
     generate_uni_app_config()
+    generate_index_kt_stub()
     configure_splash_screen()
     configure_launcher_icon()
     enable_hx_debug_channel()

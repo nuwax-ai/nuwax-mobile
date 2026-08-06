@@ -237,3 +237,32 @@ pnpm hx:ios:log            # iOS 应用日志
 - 网络请求统一走 `servers/` 目录的 UTS 模块，不要在页面里直接写 `uni.request`
 - `unpackage/` 下仅 `unpackage/dist/build/web/` 被允许提交（用于 H5 部署），其余产物不进版本库
 - 样式变量统一放在 [uni.scss](uni.scss)
+
+## vapor（蒸汽模式）开发约束（权威指导）
+
+> **权威文档**：https://doc.dcloud.net.cn/uni-app-x/app-vapor.html — 所有 vapor 相关决策以此为准。详细交接见 [docs/vapor-tech-debt.md](docs/vapor-tech-debt.md)（含 附 D 官方约束摘要）。
+> 条件编译：`// #ifdef VUE3-VAPOR` 是蒸汽模式专属条件。
+
+**CSS（styleIsolation 2.0 强制）**：
+- 只支持**简单 class + 分组选择器**；后代 `.a .b`、复合 `.a.b`、伪类 `:last-child`/`:active` 等运行时**整条丢弃**（非警告）。SCSS 嵌套编译出的后代也会丢 → 反嵌套为顶层单类（BEM `.parent__child`）。
+- styleIsolation 默认 `isolated`（组件不受外部同名 class 影响）；`<script setup>` 内 `defineOptions({ styleIsolation: 'app' | 'app-and-page' })` 放开。需接收全局工具类/iconfont 的组件记得放开。
+- 不支持的值：`em`、`display:inline`、`%` font-size、`color:inherit`、`max-height:none/%`。
+
+**uvue 原生 API**：
+- **uvue 页面/纯 uts 文件不能用 `java.*`/`android.*` 原生 import**（含 `UTSAndroid`）→ 挪进 uts 插件（`uni_modules/*/utssdk/app-android/`，插件内可用原生 import）。
+- 第三方 `.ts`/`.uts`（lime-shared、uni-ai-x 等）也受此限 → 用 `#ifdef VUE3-VAPOR` 分支绕（vapor 下直接调/空实现，VDOM-APP 保留原逻辑）。
+
+**组件**：
+- **布尔属性默认 `false`**（scroll-view `scroll-y`、swiper 等）→ 必须显式 `:scroll-y="true"`。
+- **list-view**：v-for 必须有 `:key`；list-item + list-view 同文件；第一个 v-for+`:key` 才回收，其余降级为 view（可能不滚）。scroll-view 更稳（无回收约束）。
+- **flatten**（view/text/image）：`<view flatten>` 不创建独立元素，有 css/事件限制。
+- 仅支持 uts 标准模式组件（native-view），不支持 uts 兼容模式。
+
+**编译目标**：bytecode（默认，5.11+，编译快）；manifest `uni-app-x: { vapor:true, styleIsolationVersion:"2", vapor-render-target:"bytecode" }`。
+
+**OS 版本**：Android 6.0+/target36，iOS 15+，鸿蒙 API 20+。
+
+**关键坑（实跑总结）**：
+- 独立离线 vapor APK 卡启动屏：运行时反射 `uni.<appid>.UniAppConfig` + `IndexKt.main` 引导，vapor 不生成这些 kt → 需 `configure_app.py generate_uni_app_config()` 生成 UniAppConfig（IndexKt/main 完整桥接待 DCloud 提供 vapor-runtime aar）。详见记忆 `vapor-uniappconfig-required`。
+- 自定义基座（HX「运行到自定义基座」）能跑（自动生成脚手架）；独立离线 APK 当前不行 → 用 HX 自定义基座或云打包验证业务。
+- 图标字体：svg-icon 已内联 `font-family`，但 `@font-face`（App.uvue @import iconfont.css）vapor 下可能不加载 → 必要时 `uni.loadFontFace()` 动态加载。

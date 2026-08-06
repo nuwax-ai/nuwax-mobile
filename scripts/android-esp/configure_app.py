@@ -834,6 +834,30 @@ def relocate_main_activity() -> None:
     print("✓ MainActivity 已改为直接启动业务 App，不显示 SDK 示例页")
 
 
+def generate_uni_app_config() -> None:
+    """vapor 下 HX app-resource 不再生成 UniAppConfig.kt（业务在字节码），但运行时
+    UniAppEngineHost 仍反射加载 uni.<appid 去下划线>.UniAppConfig 来引导 app；
+    找不到则 'Failed to initialize the resource to find the application'（卡启动屏）。
+    在构建期生成它（参照 demo index.kt 的 UniAppConfig 写法）。"""
+    pkg_suffix = APPID.replace("__", "")  # __UNI__8BF05E4 -> UNI8BF05E4
+    pkg = f"uni.{pkg_suffix}"
+    d = PROJ / "app/src/main/java" / pkg.replace(".", "/")
+    d.mkdir(parents=True, exist_ok=True)
+    kt = (
+        f"package {pkg}\n\n"
+        f"open class UniAppConfig : io.dcloud.uniapp.appframe.AppConfig {{\n"
+        f"    override var name: String = \"{APP_NAME}\"\n"
+        f"    override var appid: String = \"{APPID}\"\n"
+        f"    override var versionName: String = \"{APP_VERSION_NAME}\"\n"
+        f"    override var versionCode: String = \"{APP_VERSION_CODE}\"\n"
+        f"    override var uniCompilerVersion: String = \"{hx_version()}\"\n"
+        f"    constructor() : super() {{}}\n"
+        f"}}\n"
+    )
+    (d / "UniAppConfig.kt").write_text(kt)
+    print(f"✓ 生成 {pkg}.UniAppConfig（vapor 运行时引导，替代 HX 不再生成的 kt）")
+
+
 def main() -> None:
     if not (PROJ / "settings.gradle").is_file():
         die(f"找不到工程 {PROJ}，请先跑 official/setup_sdk.sh")
@@ -854,6 +878,7 @@ def main() -> None:
     strip_canvas_registration()
     configure_manifest()
     configure_app_name()
+    generate_uni_app_config()
     configure_splash_screen()
     configure_launcher_icon()
     enable_hx_debug_channel()

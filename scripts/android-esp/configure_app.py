@@ -46,6 +46,10 @@ if not APPKEY:
 # 是否为 HBuilderX 自定义基座打入调试通道（debug-server + DCLOUD_DEBUG）。
 # 默认开启；正式发行包请设 ENABLE_HX_DEBUG=0，否则可能提示「正在加载调试框架」。
 ENABLE_HX_DEBUG = os.environ.get("ENABLE_HX_DEBUG", "1") != "0"
+# R8 代码裁剪（minifyEnabled+shrinkResources+dontobfuscate，只裁剪不改名）。
+# 默认关闭：DCloud 运行时反射重、官方无 keep 支持，属高风险；显式 NUWAX_ENABLE_R8=1 才开启。
+# 开启后须真机全量冒烟（EasyCom/支付/OAuth/分享/定位/扫码/cmark/ESP）。
+ENABLE_R8 = os.environ.get("NUWAX_ENABLE_R8", "0") == "1"
 # Android 变体签名模式：release 时 debug/release 两个变体统一使用正式证书。
 ANDROID_SIGNING_MODE = os.environ.get("ANDROID_SIGNING_MODE", "debug").strip().lower()
 if ANDROID_SIGNING_MODE not in {"debug", "release"}:
@@ -1004,11 +1008,43 @@ def patch_gradle_properties() -> None:
     print("✓ gradle.properties: jvmargs=-Xmx8g, parallel=true, caching=true")
 
 
+def apply_r8_minify() -> None:
+    """启用 R8（minifyEnabled+shrinkResources，dontobfuscate 只裁剪不改名）。
+    高风险（DCloud 反射），默认 NUWAX_ENABLE_R8=0 关闭；=1 才开启，须真机全量冒烟。
+    必须在 configure_app_gradle（含 configure_release_signing）之后运行。"""
+    if not ENABLE_R8:
+        print("• R8 未启用（默认；如需开启设 NUWAX_ENABLE_R8=1）")
+        return
+    # 1) keep 规则拷入 work 树 app/proguard-rules.pro（默认是空模板）
+    src = Path(__file__).parent / "proguard-rules.nuwax.pro"
+    dst = PROJ / "app" / "proguard-rules.pro"
+    if src.is_file():
+        dst.write_text(src.read_text())
+        print(f"✓ 拷入 keep 规则 → {dst.relative_to(PROJ)}")
+    else:
+        print(f"⚠ 找不到 {src}，R8 将用空 keep（高风险）")
+    # 2) app/build.gradle release 块翻 minify + shrink（仅 app 模块；库模块 minify 保持 false）
+    p = PROJ / "app" / "build.gradle"
+    text = p.read_text()
+    text = re.sub(r"minifyEnabled\s+false", "minifyEnabled true", text)
+    if "shrinkResources" not in text:
+        # 在 minifyEnabled true 行后插入 shrinkResources true（沿用其缩进）
+        text = re.sub(
+            r"(?m)^(\s*)minifyEnabled true\s*$",
+            r"\1minifyEnabled true" + "\n" + r"\1shrinkResources true",
+            text,
+            count=1,
+        )
+    p.write_text(text)
+    print("✓ R8 已启用：minifyEnabled true + shrinkResources true（dontobfuscate）")
+
+
 def main() -> None:
     if not (PROJ / "settings.gradle").is_file():
         die(f"找不到工程 {PROJ}，请先跑 official/setup_sdk.sh")
     configure_settings()
     configure_app_gradle()
+    apply_r8_minify()
     relocate_main_activity()
     strip_project_deps(PROJ / "app" / "build.gradle")
     strip_project_deps(PROJ / "uniappx" / "build.gradle")

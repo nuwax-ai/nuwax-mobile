@@ -122,7 +122,7 @@ unzip -l unpackage/debug/android_release.apk | grep -iE "native-view|HelloUniApp
 ## 6. 正式签名上线（最后一步）
 
 前置全部完成后：
-1. 确认 `scripts/local-secrets.env` 的 `ANDROID_RELEASE_*` 指向正式 `nuwax-release.jks`（本机 `/Users/apple/workspace/nuwax-release.jks`，alias `nuwax-release`）。
+1. 确认 `scripts/local-secrets.env` 的 `ANDROID_RELEASE_*` 指向正式 `nuwax-release.jks`（本机 `~/workspace/nuwax-signing/android/nuwax-release.jks`，alias `nuwax-release`）。
 2. 切到 `release/nuwa-zhuoda` 分支（或 `ALLOW_NON_RELEASE_BRANCH=1` 仅验包）。
 3. `bash scripts/android-esp/build_store_release.sh` → 出 `unpackage/release/` 下 **正式签名** apk + aab（production API）。
 4. 按 `docs/pre-release-checklist.md` 做发布前清理（确认无密钥/调试残留）。

@@ -2,7 +2,20 @@
 
 > **目标产物**：一个**干净、纯粹、可正式上线**的 vapor Android 包（最终走 `scripts/android-esp/build_store_release.sh`，正式签名 + aab/apk + 生产环境 API）。
 > **读者**：接手这些任务的工程师 / agent。
-> **当前状态**：本地自定义基座已能打 vapor **内测包**（debug 签名、test 环境、含全部官方演示代码、样式坍塌）。本手册列出从「能出包」到「能上线」的全部剩余工作。
+> **当前状态（2026-08-06 复核）**：Android vapor 离线打包**主体已完成**，能稳定出 debug/release 内测包（release APK 148M，今日 12:34 实测出包）。多数原列技术债已闭环，仅剩正式签名上线、uni-stat 产品确认、iOS vapor 三项。下面各节已标注实际进度。
+>
+> **进度总览**：
+> | 节 | 项 | 状态 |
+> |---|---|---|
+> | §1 | vapor 运行时注入 | ✅ 已提交（`2f659fe4`） |
+> | §2 | 包瘦身（剥 HelloUniAppX 演示） | ✅ 已完成（206M→148M，`502ec0a1`/`bcb7befd`） |
+> | §3 | CSS 样式坍塌 | ⚠️ 已近下限（2745→**176**；残差=伪类 `:last-child`/`:active` + 第三方 uni_modules，BEM 修不动） |
+> | §4.1 | 下载进公共 Downloads | ✅ 已恢复（`bc3c200f` nuwax-android-downloads 插件） |
+> | §4.2 | notice-bar 跑马灯 | ✅ 已恢复（scroll-view + JS translateX 重写） |
+> | §4.3 | BigDecimal 精度 | ⚠️ 仍降级（低优；在 lime-* 第三方，随 v4 升级解决） |
+> | §5 | uni-stat 统计 | ⏳ 待产品确认 |
+> | §6 | 正式签名上线 | ⏳ 待做（上线最后一公里） |
+> | §7 | iOS vapor 基座 | ⏳ 未开始 |
 
 ---
 
@@ -14,7 +27,7 @@
 | HBuilderX | **Alpha `5.23.2026080313-alpha`**（不是稳定版 5.15）。CLI：`/Applications/HBuilderX-Alpha.app/Contents/MacOS/cli` | `cli --version` |
 | Android 离线 SDK | `Android-uni-app-x-SDK@14987-5.23`（须与 HX 严格配套） | `ls ~/workspace/nuwax-mobile-offline-sdk/sdk/android/5.23/` |
 | manifest | `uni-app-x: { vapor:true, styleIsolationVersion:"2", vapor-render-target:"bytecode" }` | `python3 -c "import json;print(json.load(open('manifest.json'))['uni-app-x'])"` |
-| 密钥 | `scripts/local-secrets.env`（**gitignored，绝不入库**）含 `DCLOUD_APPKEY` + `ANDROID_RELEASE_*` 五项 | 见 `docs/pre-release-checklist.md` |
+| 密钥 | `$NUWAX_SIGNING_HOME/local-secrets.env`（由同目录 `.example` 生成；仅本地 Git）含 `DCLOUD_APPKEY` + `ANDROID_RELEASE_*` 等 | 见 `docs/pre-release-checklist.md` |
 | JDK | gradle 用 Android Studio JBR：`export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"` | 无系统 java，必须设 |
 | Android SDK | `~/workspace/Android/sdk` 含 `platforms;android-36` | `ls ~/workspace/Android/sdk/platforms` |
 
@@ -22,7 +35,7 @@
 ```bash
 export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 export PATH="$JAVA_HOME/bin:$PATH"
-source scripts/local-base-env.sh        # 自动 source local-secrets.env
+source scripts/local-base-env.sh        # 优先 source $NUWAX_SIGNING_HOME/local-secrets.env
 
 # 内测包（debug 签名，test 环境，快速验证）
 SKIP_APP_RESOURCE=1 bash scripts/android-esp/build_tester_release_apk.sh
@@ -37,26 +50,22 @@ bash scripts/android-esp/build_store_release.sh
 
 ---
 
-## 1. 关键机制：vapor 运行时注入（已解决，改动未提交，先提交！）
+## 1. 关键机制：vapor 运行时注入（✅ 已解决并提交）
 
 uts 插件（esp/pay/cmark）在 vapor 下编译需要 `io.dcloud.uniappxv.runtime.*` + `fnJS`，**离线 SDK 的 `SDK/libs/*.aar` 没有**，只在 HBuilderX 的 `plugins/uniapp-runextension/libVapor/*.jar`。已通过 `inject_all_uts_modules.py` 注入解决。
 
-**⚠️ 第一件事：以下工具链改动尚未提交，接手后先提交，否则下次从干净仓库无法复现：**
-```bash
-git add scripts/android-esp/configure_app.py \
-        scripts/android-esp/inject_all_uts_modules.py \
-        scripts/android-esp/set_app_resource_api_env.py \
-        docs/vapor-tech-debt.md   # 本文件
-```
+**已提交**（commit `2f659fe4 fix(vapor): 提交蒸汽模式工具链改动`），从干净仓库可复现，无需手动 `git add`。下面三条是注入机制说明（留作原理备查）：
 - `inject_all_uts_modules.py`：`plugin_uses_vapor()` 检测插件 → 拷 libVapor 四件套进 `uts-{name}/vapor-libs/` + `compileOnly fileTree(vapor-libs)` + 从 SDK/libs 排除旧版 `app-runtime/uts-runtime-release.aar`（376 类重叠防 Duplicate）+ jvmTarget 提到 17。
-- `configure_app.py`：`SAMPLE_MODULES` 清空 + `configure_settings` 不再剥示例 include（见 §2）。
+- `configure_app.py`：`strip_uniappx_demo_sources()` 删 uniappx 演示 kt 树 + `strip_project_deps` 剥示例兄弟模块依赖 + `relocate_main_activity()` 把入口改为 `UniAppXSDK.start(...)`（见 §2，包瘦身已落地）。
 - `set_app_resource_api_env.py`：API 地址替换目标从旧 `uniappx/app-android/src/index.kt` 改为 vapor 的 `__UNI__*/www/app-service.js`。
 
 ---
 
-## 2. 包瘦身（干净纯粹的核心，必做）
+## 2. 包瘦身（✅ 已完成：206M → 148M）
 
-**问题**：vapor 下 `uniappx` 模块的 `index.kt`（35908 行官方胶水）**静态引用了 HelloUniAppX 演示 App 的全部代码**，剥离就编译断链。当前为出包**全量保留**了官方示例，导致包 ~206MB 且带无用功能。**这些对 vapor 业务毫无作用**（业务在字节码里）。
+> **已完成**（commit `502ec0a1 feat(vapor): 恢复包瘦身——剥离 HelloUniAppX 演示模块与 uniappx 演示源码树`、`bcb7befd` 裁 canvas aar）。机制：`configure_app.py` 的 `strip_uniappx_demo_sources()` 删 `uniappx/src/main/java/{index.kt,pages,components,uni_modules,node-modules,uniCloud}` 演示树，`relocate_main_activity()` 把入口改为 `UniAppXSDK.start(...)`。运行时按 appid 从 `app-service.js` 启动，不依赖演示 `index.kt` 符号。当前 release APK **148M**。下面留作背景与回退参考。
+
+**原问题**：vapor 下 `uniappx` 模块的 `index.kt`（35908 行官方胶水）静态引用 HelloUniAppX 演示 App 全部代码，早期为出包全量保留致 ~206MB——现已剥离，业务在字节码里，与演示零耦合。
 
 **要删的演示内容**（都在 `uniappxnativepackage/uniappx/src/main/java/`）：
 - 演示页 `pages/{API,CSS,component,tabBar,template,uni-ui}/**`，共 **487 个 kt**
@@ -80,10 +89,13 @@ unzip -l unpackage/debug/android_release.apk | grep -iE "native-view|HelloUniApp
 
 ---
 
-## 3. 样式坍塌重构（功能正确性，必做）
+## 3. 样式坍塌重构（✅ 已近下限：2745 → 176）
 
-**问题**：vapor styleIsolation 2.0（**官方强制，无 1.0 可选**）不支持以下 CSS，相关规则**整条丢弃**（非警告是真丢），本次编译丢 **2731 条** → 页面样式坍塌：
-- 后代选择器 `.a .b`、复合选择器 `.a.b`
+> **进度**：经多轮 BEM 反嵌套（commits `804044ce`/`3517886c`/`09dd4328`/`f4c997f5` 等）已从 ~2745 条降到 **176 条**（2026-08-06 实测）。后代/复合选择器基本清完，**残差 176 条已非 BEM 可治**：~112 条是伪类（`:last-child`×64、`:active`×34、`:focus-within`×6 等——vapor 根本丢弃，需模板 `:class` 状态绑定逐处改；`:active`/`:hover` 属可放弃的渐进增强），~112 条在第三方 uni_modules（lime-* ≈64 等 v4 升级、uni-ai-x ≈48 走上游）。继续 SCSS 反嵌套收益已很低；若要再降，仅针对业务代码 `:last-child` 做模板状态类，第三方随 [[vapor-lime-alignment-plan]] / lime v4 解决。
+
+**问题（背景）**：vapor styleIsolation 2.0（**官方强制，无 1.0 可选**）不支持以下 CSS，相关规则**整条丢弃**（非警告是真丢）：
+- 后代选择器 `.a .b`、复合选择器 `.a.b`（**已基本清完**）
+- 伪类 `:last-child`/`:active`/`:focus-within`/`:hover`（**残差主体，vapor 不支持**）
 - `em` 单位、`display:inline`、百分比 `font-size`、`inherit` 颜色、`max-height:none/100%`
 
 **官方建议**：`.parent .child` → BEM `.parent__child`；SCSS 编译时方案可用。文档：https://doc.dcloud.net.cn/uni-app-x/css/common/style-isolation.html
@@ -103,11 +115,11 @@ unzip -l unpackage/debug/android_release.apk | grep -iE "native-view|HelloUniApp
 
 **根因**：vapor 下 uvue/纯 uts 文件**不能用 `java.*`/`android.*` 原生 import**（5.23 蒸汽 SDK Rollup 无法解析）。本轮为出包移除了以下系统能力调用。**恢复统一做法：把原生调用挪进 uts 插件**（`uni_modules/*/utssdk/app-android/` 下插件可正常用原生 import；官方明确 vapor 下 uvue 页面不能直接调原生 API）。
 
-| # | 位置 | 删了什么 | 用户影响 | 恢复优先级 |
+| # | 位置 | 原降级 | 用户影响 | 状态 |
 |---|---|---|---|---|
-| 4.1 | `subpackages/utils/fileTree.uts` | `copyToPublicDownload()` 整个函数 + `java.io.File`/`android.os.Environment`；下载直接返回 `res.tempFilePath`（约 line 634） | **下载文件不进系统「下载/Downloads」**，只在沙盒临时目录，用户找不到、可能被清理 | **高** |
-| 4.2 | `uni_modules/uni-notice-bar/.../uni-notice-bar.vue` | weex/`$getAppWebview`/CSS 动画跑马灯 | 长通告文本不再滚动，单行截断 | 中 |
-| 4.3 | `uni_modules/lime-color/common/util.uts`、`uni_modules/lime-shared/floatMul/index.ts` | `java.math.BigDecimal`，改用 `` `${n}` `` 模板串 | 大数/科学计数法精度不准（普通小数无碍） | 低 |
+| 4.1 | `subpackages/utils/fileTree.uts` | 删 `copyToPublicDownload()` + `java.io.File`/`android.os.Environment`，下载只返回 `res.tempFilePath` | 下载文件不进系统「下载/Downloads」 | ✅ **已恢复**——新增 uts 插件 `uni_modules/nuwax-android-downloads`，`fileTree.uts:632` 调 `copyToPublicDownload(tempFilePath, filename)`（commit `bc3c200f`） |
+| 4.2 | `uni_modules/uni-notice-bar/.../uni-notice-bar.vue` | 删 weex/`$getAppWebview`/CSS 动画跑马灯 | 长通告文本不滚动 | ✅ **已恢复**——vapor 下改用 `scroll-view` + JS 驱动 `transform: translateX` 实现跑马灯（组件 25–45 行） |
+| 4.3 | `uni_modules/lime-color/common/util.uts`、`uni_modules/lime-shared/floatMul/index.ts` | `java.math.BigDecimal` 改 `` `${n}` `` 模板串 | 大数/科学计数法精度不准（普通小数无碍） | ⚠️ **仍降级**（低优；在 lime-* 第三方，随 [[vapor-lime-alignment-plan]] v4 升级解决，不手改） |
 
 **4.1 恢复参考**（下载进公共目录）：新建/复用一个 uts 插件封装 `MediaStore`/`Environment` 拷贝，fileTree.uts 改为调插件接口。
 
@@ -122,7 +134,7 @@ unzip -l unpackage/debug/android_release.apk | grep -iE "native-view|HelloUniApp
 ## 6. 正式签名上线（最后一步）
 
 前置全部完成后：
-1. 确认 `scripts/local-secrets.env` 的 `ANDROID_RELEASE_*` 指向正式 `nuwax-release.jks`（本机 `~/workspace/nuwax-signing/android/nuwax-release.jks`，alias `nuwax-release`）。
+1. 确认 `$NUWAX_SIGNING_HOME/local-secrets.env` 的 `ANDROID_RELEASE_*` 指向正式 jks（默认 `$NUWAX_SIGNING_HOME/android/nuwax-release.jks`，alias `nuwax-release`）。
 2. 切到 `release/nuwa-zhuoda` 分支（或 `ALLOW_NON_RELEASE_BRANCH=1` 仅验包）。
 3. `bash scripts/android-esp/build_store_release.sh` → 出 `unpackage/release/` 下 **正式签名** apk + aab（production API）。
 4. 按 `docs/pre-release-checklist.md` 做发布前清理（确认无密钥/调试残留）。
@@ -160,3 +172,35 @@ SKIP_APP_RESOURCE=0 bash scripts/android-esp/build_tester_release_apk.sh 2>&1 | 
 # 查 APK 包名/版本
 ~/workspace/Android/sdk/build-tools/*/aapt dump badging unpackage/debug/android_release.apk | grep -E "package:|versionName"
 ```
+
+---
+
+## 8. 独立 vapor APK 卡启动屏根因 + path-a 结论（2026-08-06 实测）
+
+真机/模拟器装离线独立 APK（`build_tester_release_apk.sh`）卡启动屏。HX 自定义基座能跑、独立 APK 不能。根因链（已逐一验证）：
+
+```
+运行时反射 uni.UNI8BF05E4.UniAppConfig 引导 app
+  → 找不到（vapor 不生成 kt）✅ 已修：configure_app.py generate_uni_app_config()
+    → 运行时再找 uni.UNI8BF05E4.IndexKt
+      → 找不到 ✅ 已放存根：generate_index_kt_stub()
+        → 运行时再调 IndexKt.main(UniNativeApp)
+          → NoSuchMethod（main 调 createApp()=createSSRApp(GenAppClass)）
+            → GenAppClass（app 组件）在 vapor 下是字节码，Kotlin 无法引用 → 🔴 桥接硬核
+```
+
+**核心矛盾**：vapor 离线基座的运行时是 VDOM 风格，要一整套 Kotlin app 脚手架（UniAppConfig/IndexKt/main/createApp/GenAppClass）；vapor 把业务放字节码、**不生成这些 kt**。HX 自定义基座能自动生成/桥接，离线独立 APK 不能。
+
+### path-a 两条路都已验证不可行
+1. **手写最小 index.kt**（main/createApp/GenAppClass）→ GenAppClass 在字节码里，Kotlin 没法引用，桥接机制 DCloud 未文档化。
+2. **注入 vapor 运行时到主 app**（`inject_vapor_runtime_into_app()`，commit `2b0bc8d4`，函数保留但已注释停用）→
+   - libVapor 的 `uniExtAPI/ext-component` jar 是**聚合 jar**，与 SDK/libs 的 `uni-push`/`uni-accelerometer` 等单独 aar 类重叠 → Duplicate class。
+   - 只换 `app-runtime`/`uts-runtime` 两个核心 jar + 排除 VDM 同名 aar → 排除 aar 后**丢 Android 资源**（`style/UniAppX.Activity.DefaultTheme` 等），vapor jar 只有类没 res/ → manifest 链接失败。
+
+### 根因（DCloud 离线 SDK 限制）
+vapor 运行时（libVapor）**只有 jar（纯类）**；离线 SDK 的 **aar（类+资源）是 VDM 版**。**没有"vapor 运行时 aar（含 Android 资源）"。** 独立 vapor APK 要加载，需 DCloud 在离线 SDK 里提供 vapor-runtime aar（带 res/）。
+
+### 结论
+- **能跑的 vapor app = HX 自定义基座**（`make base-android` 出基座 + HX「运行到自定义基座」，业务改动在 www 热推）。所有 vapor 业务改动（§2-§4 + BEM/aar/UTSAndroid/图标/滚动）在此形态下生效并验证。
+- **独立离线 vapor APK**：等 DCloud 提供 vapor-runtime aar（含资源），或 path-a（手写 Kotlin↔字节码桥接）有突破。在此之前不可用。
+- 排查路径见记忆 [[vapor-uniappconfig-required]]（含完整根因链 + path-a 死胡同）。

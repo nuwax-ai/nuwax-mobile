@@ -30,19 +30,19 @@ fi
 step "2/3 安装依赖 + 拉 vapor 自定义基座"
 pnpm install --silent 2>/dev/null || warn "pnpm install 跳过（非 H5 开发可忽略）"
 
-BASE="$ROOT/unpackage/debug/android_debug.apk"
+BASE="$ROOT/unpackage/debug/android_debug_vapor.apk"
 if [ -f "$BASE" ]; then
-  log "基座已存在: $(du -h "$BASE" | awk '{print $1}')"
+  log "vapor 基座已存在: $(du -h "$BASE" | awk '{print $1}')"
 else
   warn "拉取 vapor 自定义基座（~200MB）..."
-  pnpm base:fetch || err "base-fetch 失败。手动：NUWAX_S3_INSECURE=1 pnpm base:fetch"
-  log "基座拉取完成"
+  NUWAX_BASE_CHANNEL=vapor pnpm base:fetch || err "base-fetch 失败。手动：NUWAX_BASE_CHANNEL=vapor NUWAX_S3_INSECURE=1 pnpm base:fetch"
+  log "vapor 基座拉取完成"
 fi
 
 step "3/3 验证"
 VAPOR=$(python3 -c "import json;print(json.load(open('$ROOT/manifest.json'))['uni-app-x'].get('vapor'))" 2>/dev/null)
 [[ "$VAPOR" == "True" ]] && log "manifest vapor:true ✓" || warn "manifest vapor 配置异常"
-ls "$ROOT/unpackage/debug/"*.apk >/dev/null 2>&1 && log "基座 APK 就绪 ✓" || warn "未找到基座 APK"
+ls "$ROOT/unpackage/debug/"*vapor*.apk >/dev/null 2>&1 && log "vapor 基座 APK 就绪 ✓" || warn "未找到 vapor 基座 APK"
 
 echo ""
 echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"

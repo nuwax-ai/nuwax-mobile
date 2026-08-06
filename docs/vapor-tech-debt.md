@@ -16,6 +16,8 @@
 > | §5 | uni-stat 统计 | ⏳ 待产品确认 |
 > | §6 | 正式签名上线 | ⏳ 待做（上线最后一公里） |
 > | §7 | iOS vapor 基座 | ⏳ 未开始 |
+> | §8 | 独立 vapor APK 卡启动屏 | 🔴 path-a 死胡同；等 DCloud 提供 vapor-runtime aar(含资源)；当前 vapor 仅 HX 自定义基座形态可跑 |
+> | §9 | 运行时遗漏（实跑发现） | ⚠️ 进行中（9.1 iconfont 图标不显示——已修待验；其它待补） |
 
 ---
 
@@ -204,3 +206,90 @@ vapor 运行时（libVapor）**只有 jar（纯类）**；离线 SDK 的 **aar�
 - **能跑的 vapor app = HX 自定义基座**（`make base-android` 出基座 + HX「运行到自定义基座」，业务改动在 www 热推）。所有 vapor 业务改动（§2-§4 + BEM/aar/UTSAndroid/图标/滚动）在此形态下生效并验证。
 - **独立离线 vapor APK**：等 DCloud 提供 vapor-runtime aar（含资源），或 path-a（手写 Kotlin↔字节码桥接）有突破。在此之前不可用。
 - 排查路径见记忆 [[vapor-uniappconfig-required]]（含完整根因链 + path-a 死胡同）。
+
+---
+
+## 9. 运行时遗漏（vapor 自定义基座实跑发现，2026-08-06 起）
+
+> 形态：HX 自定义基座（§8 结论里当前唯一能跑的 vapor 形态）已能进业务页，但实跑暴露一批渲染/资源遗漏。逐条记此。
+
+### 9.0 通用根因：styleIsolation 2.0 默认 `isolated` 隔绝全局/页面样式（官方文档印证）
+
+[官方 vapor 文档](https://doc.dcloud.net.cn/uni-app-x/app-vapor.html)「开发注意·css」明确：styleIsolation 2.0 下「**组件默认不受外部 css 同名影响，不管是页面还是全局 css，外部的同名 class 默认都不能影响组件样式**」，默认值 `isolated`，可设 `app` / `app-and-page`。故凡组件依赖全局/页面样式（字体、主题色、通用类 `.iconfont` 等）的，vapor 下都会丢样式——**§9 各项「遗漏」大概率同源**。
+
+- **官方修法**：组件 `<script setup>` 加 `defineOptions({ styleIsolation: 'app-and-page' })`（或 `'app'`）即可重新接收外部同名 class。
+- **替代（更可控）**：把所需样式内联或挪进组件 scoped（不依赖外部透传）。
+- 排查 §9 各项优先按此判断：症状是"样式/图标/主题没生效" → 先看组件是不是吃了全局样式 → 是则 `defineOptions` 或内联。
+
+> 同源官方约束（均见该页）：运行时只支持简单 class + 分组选择器（后代/复合被丢，即 §3 BEM 的根因）；Android uvue 页面不能直接调原生 API，须挪进 uts 插件（即 §4 的根因）；仅组合式、不支持选项式/mixin（即附 A 移出 uni_modules 的根因）；scroll-view/swiper 布尔属性默认 true→false（notice-bar 已显式 `:scroll-x="true"`）；flatten 元素不支持 background-image。
+
+### 9.1 iconfont 图标大面积不显示（高优，影响 54 处 svg-icon）——已修待验
+
+**症状**：vapor 基座进页面后，页面内 `<svg-icon>` 图标（nav/按钮/tab 等，共 54 处）全部不显示 / 变豆腐块。
+
+**机制**：APP 端图标 = `components/svg-icon/svg-icon.uvue` 渲染为 `<text class="iconfont">{{ unicodeChar }}</text>`，靠 iconfont 字体的 unicode 文本出 glyph：
+- 字体 `static/iconfont/iconfont.ttf`（已存在、已进资源包）；`@font-face` + `.iconfont{font-family:"iconfont"!important}` 在 `static/iconfont/iconfont-app.css`，由 `App.uvue:187` 全局 `@import`。
+- unicode 映射：`constants/iconfont.constants.uts` 的 `ICON_UNICODE`（如 `icon-order→""`）。
+- svg-icon 自身 scoped 样式只有 `.svg-icon{display:flex}`，`iconStyle` 内联只给 font-size/color——**两处都没有 font-family**，完全依赖全局 `.iconfont`。
+
+**根因**：vapor styleIsolation 2.0 下全局 App 样式（`.iconfont{font-family}`）透传不进 svg-icon 组件 → `<text>` 拿不到字体 → unicode 用默认字体 = 空白。drops 日志里 `.iconfont`/font-family 未被丢，印证是**样式隔离透传**问题，非选择器丢失。
+
+**已修（待实机/模拟器验证）**：`svg-icon.uvue` 的 `iconStyle` 内联追加 `font-family: iconfont`（内联不受样式隔离影响）。业务代码改动，**不用重打基座**，HX 自定义基座热推 www 即可验。
+
+**若仍未恢复**（fallback）：vapor 可能没注册 CSS `@font-face` → `App.uvue` onLaunch 用 `uni.loadFontFace({ global:true, family:"iconfont", source:"url('/static/iconfont/iconfont.ttf')" })` 显式注册字体。
+
+**关联**：[[vapor-style-bem-methodology]]（全局类透传同源问题）、`custom-nav-bar.uvue:185` 已有同类 vapor icon 选择器处理记录。
+
+### 9.2 薄壳页（组件作页面根）不撑满高度——已修
+
+**症状**：智能体 tab（`pages/agent-list/agent-list.uvue`）+ 应用页（`pages/page-app/page-app.uvue`）没撑满视口，塌成内容高度。
+
+**定位**：两页都是薄壳——模板仅 `<published-agent-list>`，页面根即该组件。组件根 `.container` 的 `height:100%/max-height:100%` 写在 `#ifdef H5` 分支，**`#ifdef MP-WEIXIN || APP` 分支只有 padding-bottom、无任何 flex/height**。vapor/APP 下组件 host 不带高度、APP 分支又没 height → 组件根无尺寸 → 塌成内容高。（VDOM APP 时代靠默认行为蒙混，vapor 暴露。）
+
+**根因类别**：非样式隔离（区别于 §9.0），是**条件编译只给 H5 height、APP 分支漏 flex** 的 latent bug。
+
+**已修**：`published-agent-list.uvue` 的 `.container` 在 `MP-WEIXIN || APP` 分支加 `flex: 1`（页面是 flex column，flex 子项不依赖 host 高度解析，最稳）。两处薄壳页一并修。业务代码改动，热推 www 即可验。
+
+**排查口诀**：页面没撑满 → 看页面根是不是自定义组件 → 看组件根 scoped 的 height/flex 是不是只写在 H5 分支、APP 分支漏了 → 补 `flex: 1`（APP 页面默认是 flex column）。
+
+### 9.3 其它遗漏（待随实跑补充）
+> 跑起来陆续发现的渲染/功能问题记在此（症状→定位→修法），量多再拆子节。
+
+---
+
+## 附 D：vapor 官方开发约束摘要（权威参考）
+
+> 来源：https://doc.dcloud.net.cn/uni-app-x/app-vapor.html （2026-08-06 抓取）
+> 条件编译：`// #ifdef VUE3-VAPOR` 是蒸汽模式专属条件。
+
+### D.1 CSS（styleIsolation 2.0 强制）
+- **只支持简单 class 选择器 + 分组选择器**；后代 `.a .b`、复合 `.a.b`、伪类 `:last-child`/`:active`/`:focus-within`/`:hover` 运行时**整条丢弃**（非警告）。
+- 替代：BEM `.parent__child`；SCSS 是编译时方案，不影响运行时。
+- **styleIsolation 默认 `isolated`**：组件不受外部同名 class 影响。如需受影响，`<script setup>` 内 `defineOptions({ styleIsolation: 'app' | 'app-and-page' })`。
+- 不支持的值：`em`、`display:inline`、`%` font-size、`color:inherit`、`max-height:none/%`。
+
+### D.2 uvue 原生 API（uts plugin）
+- **uvue 页面/纯 uts 文件不能用 `java.*`/`android.*` 原生 import**（含 `UTSAndroid`）。
+- 挪进 uts 插件（`uni_modules/*/utssdk/app-android/`，插件内可正常用原生 import）。
+- 第三方 .ts/.uts 也受此限（如 lime-shared、uni-ai-x 的 `UTSAndroid.getDispatcher`），用 `#ifdef VUE3-VAPOR` 分支绕。
+
+### D.3 组件变更
+- **布尔属性默认值 `true`→`false`**：scroll-view `scroll-y`、swiper 等——必须显式 `:scroll-y="true"`。
+- **list-view**：v-for 必须有 `:key`；list-item + list-view 同文件；第一个 v-for+`:key` 才回收，其余降级为 view；不支持横向滚动；list-item 宽 100%/position absolute/不能直接文字/不能 margin。
+- **flatten（view/text/image）**：`<view flatten>` 不创建独立元素；不支持事件/takeSnapshot/部分 css。
+- 不再支持 uts 兼容模式组件，仅 uts 标准模式（native-view）。
+
+### D.4 编译目标
+- **字节码（bytecode，默认）**：5.11+，编译快、支持差量/wgt 热更新，性能比机器码低 ~3%。
+- 机器码：性能略高，编译极慢（C 编译），iOS 云打包不开放。
+- manifest：`vapor:true, styleIsolationVersion:"2", vapor-render-target:"bytecode"`。
+
+### D.5 OS 版本
+- Android 6.0+，默认 target 36（vapor 专属）；iOS 15+；鸿蒙 API 20+（6.0+）。
+
+### D.6 从 VDOM 升级 vapor 步骤（官方）
+1. 复杂选择器 → 简单 class/分组。
+2. 开 styleIsolation 2.0，改造（三方组件核对支持）。
+3. 原生 API（含 UTSAndroid）→ uts 插件。
+4. 选项式 → 组合式（setup）。
+5. manifest 切 vapor，按"开发注意"检查。

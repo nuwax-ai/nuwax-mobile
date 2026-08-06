@@ -4,13 +4,17 @@
 # 用法：
 #   source scripts/local-base-env.sh
 #
-# 仓外统一目录（默认基于 $HOME，可覆盖）：
-#   NUWAX_OFFLINE_SDK_HOME = $HOME/workspace/nuwax-mobile-offline-sdk
+# 仓外本机目录（默认基于 $HOME/workspace，可覆盖）——三者职责不同，勿混放证书：
+#   NUWAX_OFFLINE_SDK_HOME = …/nuwax-mobile-offline-sdk
 #     ├── sdk/{ios,android,harmony}/<ver>/
 #     ├── work/{ios,android,harmony}/
-#     └── archives/*.zip
+#     └── archives/*.zip          # 无证书；S3 包也不含签名材料
+#   NUWAX_SIGNING_HOME     = …/nuwax-signing
+#     ├── local-secrets.env   # 口令 / AppKey / UUID（权威；仅本地 Git）
+#     └── android|ios-app|…   # 签名实体（极敏感，永不进业务仓 / SDK / S3）
 #
-# 进 Git 的只有 nuwax-mobile 内脚本/文档；SDK 与工作副本不进业务仓。
+# 进 Git 可推远程的只有 nuwax-mobile 内脚本/文档；SDK、work、signing 均不进业务仓远程。
+# 敏感配置：优先 $NUWAX_SIGNING_HOME/local-secrets.env，回退 scripts/local-secrets.env。
 # 兼容旧变量：UNIAPPX_SDK_ROOT / ANDROID_ESP_WORK / IOS_ESP_BUILD_ROOT 等仍可手动覆盖。
 
 _NUWAX_LB_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -22,6 +26,7 @@ export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.23}"
 export NUWAX_ANDROID_SDK_BUILD="${NUWAX_ANDROID_SDK_BUILD:-14987}"
 export NUWAX_WORKSPACE_ROOT="${NUWAX_WORKSPACE_ROOT:-$HOME/workspace}"
 export NUWAX_OFFLINE_SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-mobile-offline-sdk}"
+export NUWAX_SIGNING_HOME="${NUWAX_SIGNING_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-signing}"
 export NUWAX_SDK_ROOT="${NUWAX_SDK_ROOT:-$NUWAX_OFFLINE_SDK_HOME/sdk}"
 export NUWAX_LOCAL_BASE_ROOT="${NUWAX_LOCAL_BASE_ROOT:-$NUWAX_OFFLINE_SDK_HOME/work}"
 export NUWAX_SDK_ARCHIVES="${NUWAX_SDK_ARCHIVES:-$NUWAX_OFFLINE_SDK_HOME/archives}"
@@ -29,9 +34,17 @@ export NUWAX_MAIN_ROOT="${NUWAX_MAIN_ROOT:-$_NUWAX_REPO_ROOT}"
 export NUWAX_BUNDLE_ID="${NUWAX_BUNDLE_ID:-com.nuwax.app}"
 export NUWAX_APPID="${NUWAX_APPID:-__UNI__8BF05E4}"
 
-# 本机敏感配置（gitignore）：AppKey / Android 正式签名 / iOS 签名。存在则 source，绝不入库。
-if [[ -f "$_NUWAX_LB_ENV_DIR/local-secrets.env" ]]; then
-  source "$_NUWAX_LB_ENV_DIR/local-secrets.env"
+# 本机敏感配置：AppKey / Android 正式签名路径与口令 / iOS Team·Profile。
+# 权威路径在签名目录；业务仓 scripts/local-secrets.env 仅作回退（勿提交真实值到远程）。
+_NUWAX_SECRETS_SIGNING="${NUWAX_SIGNING_HOME}/local-secrets.env"
+_NUWAX_SECRETS_LEGACY="${_NUWAX_LB_ENV_DIR}/local-secrets.env"
+if [[ -f "$_NUWAX_SECRETS_SIGNING" ]]; then
+  # shellcheck source=/dev/null
+  source "$_NUWAX_SECRETS_SIGNING"
+elif [[ -f "$_NUWAX_SECRETS_LEGACY" ]]; then
+  echo "[local-base-env] 警告：使用已弃用的 $_NUWAX_SECRETS_LEGACY；请迁移到 $_NUWAX_SECRETS_SIGNING" >&2
+  # shellcheck source=/dev/null
+  source "$_NUWAX_SECRETS_LEGACY"
 fi
 
 # ---------- iOS ----------
@@ -70,6 +83,7 @@ if [[ "${NUWAX_LOCAL_BASE_ENV_VERBOSE:-0}" == "1" ]]; then
   echo "NUWAX_HX_VERSION=$NUWAX_HX_VERSION"
   echo "NUWAX_ANDROID_SDK_BUILD=$NUWAX_ANDROID_SDK_BUILD"
   echo "NUWAX_OFFLINE_SDK_HOME=$NUWAX_OFFLINE_SDK_HOME"
+  echo "NUWAX_SIGNING_HOME=$NUWAX_SIGNING_HOME"
   echo "NUWAX_MAIN_ROOT=$NUWAX_MAIN_ROOT"
   echo "UNIAPPX_SDK_ROOT=$UNIAPPX_SDK_ROOT"
   echo "IOS_ESP_BUILD_ROOT=$IOS_ESP_BUILD_ROOT"

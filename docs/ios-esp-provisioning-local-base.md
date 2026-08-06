@@ -42,12 +42,14 @@ make sdk-fetch                        # 本机没有离线 SDK 时拉取
 source scripts/local-base-env.sh      # 自动派生 UNIAPPX_SDK_ROOT / IOS_ESP_BUILD_ROOT / IOS_ESP_OUT …
 ```
 
-敏感值（离线 AppKey / Team / Profile UUID）写到 `scripts/local-secrets.env`（已 gitignore），`local-base-env.sh` 会自动 source，**勿入仓库**。
+敏感值（离线 AppKey / Team / Profile UUID）写到 **`$NUWAX_SIGNING_HOME/local-secrets.env`**（签名目录仅本地 Git），`local-base-env.sh` 会自动 source，**勿写入业务仓远程**。
+- 权威空模板：`$NUWAX_SIGNING_HOME/local-secrets.env.example`（`cp` 为 `local-secrets.env` 后填写）
+- 业务仓同步空模板：`scripts/local-secrets.env.example`（字段对齐，勿填真实值推远程）
 
 > ⚠️ SDK 路径已迁移到 `$NUWAX_OFFLINE_SDK_HOME/sdk/ios/5.15/...`，**旧的 `/Users/.../UniAppX-iOS-5.15` 已作废**。
 
 - Xcode **26.3 / Swift 6.2.4**（与 `DCloudUniappRuntime` 匹配）  
-- bundle `com.nuwax.app`；离线 AppKey / Team / Profile UUID 见 `scripts/local-secrets.env`（gitignore）
+- bundle `com.nuwax.app`；离线 AppKey / Team / Profile UUID 见 `$NUWAX_SIGNING_HOME/local-secrets.env`
 
 ## 标准流程（A → B → C → D）
 

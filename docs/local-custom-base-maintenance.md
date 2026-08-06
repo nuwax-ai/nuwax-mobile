@@ -3,12 +3,15 @@
 > 目标：用**可重建**方式维护 iOS / Android（及未来鸿蒙）自定义调试基座，避免云打包费用，并与业务仓解耦。  
 > 总览：[esp-provisioning-local-base.md](./esp-provisioning-local-base.md)
 
-## 1. 两仓分工
+## 1. 三处本机分工
 
-| 项目 | 路径 | 进 Git？ | 职责 |
-|------|------|----------|------|
-| 业务仓 | `nuwax-mobile` | ✅ | 插件、脚本、文档、契约、`Makefile` |
-| 离线 SDK 仓（本机） | `nuwax-mobile-offline-sdk` | ❌（建议不进业务仓） | 官方 SDK + 可重建工作副本 + zip 归档 |
+| 项目 | 路径 | Git | 职责 |
+|------|------|-----|------|
+| 业务仓 | `nuwax-mobile` | ✅ 可推远程 | 插件、脚本、文档、契约、`Makefile`；`local-secrets.env.example` 仅模板 |
+| 离线 SDK（本机） | `nuwax-mobile-offline-sdk` | ✅ **仅本地**（禁 push）；**团队同步走 S3** | 官方 SDK + `work/` + `archives/`；**不含任何证书**。说明见该目录 [README.md](../../nuwax-mobile-offline-sdk/README.md) |
+| 签名材料（本机） | `nuwax-signing`（`NUWAX_SIGNING_HOME`） | ✅ **仅本地**（禁 remote / push） | 签名实体 + **`local-secrets.env` / `local-secrets.env.example`**；永不进业务仓远程 / SDK / S3 |
+
+关系：`local-base-env.sh` 派生 SDK 路径 → **优先** source `$NUWAX_SIGNING_HOME/local-secrets.env`。首次配置：`cp $NUWAX_SIGNING_HOME/local-secrets.env.example $NUWAX_SIGNING_HOME/local-secrets.env`。业务仓 `scripts/local-secrets.env.example` 为同步空模板（便于查阅，勿填真实值推远程）。
 
 ## 2. 四层模型
 
@@ -23,16 +26,23 @@
 nuwax-mobile/                          # Git
 ├── docs/local-custom-base-maintenance.md
 ├── scripts/local-base-env.sh
+├── scripts/local-secrets.env.example  # 与签名目录模板字段同步；勿填真实值推远程
 ├── scripts/{ios,android,harmony}-esp/
 └── Makefile
 
-nuwax-mobile-offline-sdk/              # 本机统一入口
-├── README.md
-├── sdk/ios/5.15/…  sdk/android/5.15/…
-├── work/ios/  work/android/  work/harmony/
+nuwax-mobile-offline-sdk/              # 本机：本地 Git + S3 分发（无证书）
+├── README.md                          # 本机说明（本地 Git vs S3）
+├── docs/LOCAL-AND-S3.md
+├── sdk/ios/…  sdk/android/…           # 大文件：gitignore；靠 sdk-fetch
+├── work/ios/  work/android/  …
 └── archives/*.zip
-```
 
+nuwax-signing/                         # 本机：签名 + 口令权威（敏感）
+├── local-secrets.env.example          # 权威空模板
+├── local-secrets.env                  # 本机实值（仅本地 Git）
+├── android/  ios-app/  macos-…/  windows-ev/
+└── （本机 README / 上架指南；仅本地 Git）
+```
 历史路径（`UniAppX-*-5.15`、`nuwax-*-esp`）通过软链指向本目录，可逐步废弃。
 
 ## 3. 环境变量
@@ -41,10 +51,11 @@ nuwax-mobile-offline-sdk/              # 本机统一入口
 
 | 变量 | 默认 | 含义 |
 |------|------|------|
-| `NUWAX_OFFLINE_SDK_HOME` | `…/nuwax-mobile-offline-sdk` | 离线目录根 |
-| `NUWAX_SDK_ROOT` | `$HOME/…/sdk` | 官方 SDK |
-| `NUWAX_LOCAL_BASE_ROOT` | `$HOME/…/work` | 工作副本 |
-| `NUWAX_HX_VERSION` | `5.15` | 与 HBuilderX 对齐 |
+| `NUWAX_OFFLINE_SDK_HOME` | `…/nuwax-mobile-offline-sdk` | 离线 SDK 根（无证书） |
+| `NUWAX_SIGNING_HOME` | `…/nuwax-signing` | 签名材料根；含 `local-secrets.env(.example)` |
+| `NUWAX_SDK_ROOT` | `$NUWAX_OFFLINE_SDK_HOME/sdk` | 官方 SDK |
+| `NUWAX_LOCAL_BASE_ROOT` | `$NUWAX_OFFLINE_SDK_HOME/work` | 工作副本 |
+| `NUWAX_HX_VERSION` | 见 `local-base-env.sh` | 与 HBuilderX 对齐 |
 | `NUWAX_MAIN_ROOT` | 业务仓根 | 同步 `unpackage/debug` |
 
 兼容旧名：`UNIAPPX_SDK_ROOT`、`IOS_ESP_BUILD_ROOT`、`ANDROID_ESP_WORK` 等仍可覆盖。

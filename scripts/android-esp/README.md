@@ -44,9 +44,15 @@ make android-tester
 
 ### 应用市场正式包
 
-先复制 `scripts/local-secrets.env.example` 为 `scripts/local-secrets.env`，填写
-`ANDROID_RELEASE_STORE_FILE`、`ANDROID_RELEASE_STORE_PASSWORD`、
-`ANDROID_RELEASE_KEY_ALIAS`、`ANDROID_RELEASE_KEY_PASSWORD`，再执行：
+先复制模板到签名目录并填写：
+
+```bash
+cp "${NUWAX_SIGNING_HOME:-$HOME/workspace/nuwax-signing}/local-secrets.env.example" \
+   "${NUWAX_SIGNING_HOME:-$HOME/workspace/nuwax-signing}/local-secrets.env"
+# 编辑 ANDROID_RELEASE_* / DCLOUD_APPKEY / IOS_* 等
+```
+
+再执行：
 
 ```bash
 pnpm android:release

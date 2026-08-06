@@ -23,7 +23,7 @@ fail() {
 
 require_env() {
   local name="$1"
-  [[ -n "${!name:-}" ]] || fail "缺少 ${name}（请配置到 scripts/local-secrets.env）"
+  [[ -n "${!name:-}" ]] || fail "缺少 ${name}（请配置到 \$NUWAX_SIGNING_HOME/local-secrets.env）"
 }
 
 contains_format() {

@@ -691,7 +691,9 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
         "'**/funlink_*release.aar', "
         "'**/advista-*release.aar', "
         # 直播推流（业务无直播/推流）
-        "'**/uni-live-pusher-release.aar'"
+        "'**/uni-live-pusher-release.aar', "
+        # canvas 组件（业务 0 处 <canvas>；同步在 strip_canvas_registration 去注册项）
+        "'**/uni-canvas-component-release.aar'"
         "]"
     )
     # 始终用规范列表（重）写 exclude，保证新增 aar 排除项在增量构建里也能生效（幂等）。
@@ -717,6 +719,35 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
             print(f"✓ 写入 SDK/libs exclude: {gradle_path.relative_to(PROJ)}")
         else:
             print(f"⚠ 未改 SDK libs exclude: {gradle_path.relative_to(PROJ)}")
+
+
+def strip_canvas_registration() -> None:
+    """业务 0 处 <canvas>，剥离 uni-canvas-component 后须同步去掉 app/build.gradle
+    UTSRegisterComponents 里的 canvas 注册项，否则运行时反射加载缺失类。canvas 是该
+    JSON 数组首项，删后 [{ad},{video}] 仍合法。幂等。"""
+    p = PROJ / "app" / "build.gradle"
+    if not p.is_file():
+        return
+    lines = p.read_text().splitlines(keepends=True)
+    out: list[str] = []
+    in_block = False
+    removed = False
+    for line in lines:
+        if "UTSRegisterComponents" in line:
+            in_block = True
+            out.append(line)
+            continue
+        if in_block and "io.dcloud.canvas" in line:
+            removed = True  # 删 canvas 注册拼接行
+            continue
+        if in_block and "buildConfigField" in line:
+            in_block = False  # 下一个 buildConfigField，块结束
+        out.append(line)
+    if removed:
+        p.write_text("".join(out))
+        print("✓ 剥离 UTSRegisterComponents canvas 注册项（业务不用 canvas）")
+    else:
+        print("✓ canvas 注册项未找到（幂等跳过）")
 
 
 def relocate_main_activity() -> None:
@@ -819,6 +850,8 @@ def main() -> None:
     confine_leakcanary_to_debug(PROJ / "uniappx" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
+    # canvas aar 已在 SDK/libs exclude 剥离；同步去 UTSRegisterComponents 注册项防反射加载缺失类
+    strip_canvas_registration()
     configure_manifest()
     configure_app_name()
     configure_splash_screen()

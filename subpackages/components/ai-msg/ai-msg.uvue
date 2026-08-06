@@ -36,13 +36,15 @@
           :class="{ 'hide-think-content': hideThinkContent }"
         >
           <view class="text-box">
-            <rich-text
-              v-if="thinkContent.length > 0"
-              class="think-rich-text"
+            <!--
+              单 text 展示：UTS 对 ref 数组 v-for 不稳定（会报找不到 thinkFrozenParts）。
+              增量逻辑仍在 paintThinkIncremental 内维护 frozen/live，仅拼接后绑定。
+            -->
+            <text
+              v-if="thinkDisplayText.length > 0"
+              class="think-plain-text"
               :selectable="true"
-              :nodes="thinkRichTextNodes"
-              mode="web"
-            />
+            >{{ thinkDisplayText }}</text>
           </view>
         </view>
       </view>
@@ -102,7 +104,7 @@
   import { TaskStatus } from "@/types/enums/agent";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { groupMarkdownContainers } from "@/utils/markdown.uts";
-  import { stripIncompleteCustomMarkupTail } from "@/utils/markdownCustomProcess.uts";
+  import { stripIncompleteCustomMarkupTail, stripOrphanCustomProcessGroupCloseTags } from "@/utils/markdownCustomProcess.uts";
   import {
     stripMarkdownImages,
   } from "@/subpackages/components/ai-msg/markdownImage.uts";
@@ -115,6 +117,7 @@
   import { perfRecordSseUi } from "@/utils/perfProbe.uts";
   // #endif
   import { toolCallProcessingListFingerprint } from "@/subpackages/utils/containerHelper.uts";
+  import { applyThinkIncremental } from "@/subpackages/components/ai-msg/thinkIncrementalDisplay.uts";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -326,8 +329,10 @@
       stripMarkdownImages(
         stripAdaptedAgentInfoHtml(
           stripAgentInfoTags(
-            stripIncompleteCustomMarkupTail(
-              groupMarkdownContainers(resolveBodyText()),
+            stripOrphanCustomProcessGroupCloseTags(
+              stripIncompleteCustomMarkupTail(
+                groupMarkdownContainers(resolveBodyText()),
+              ),
             ),
           ),
         ),
@@ -377,12 +382,12 @@
 
   /**
    * 流式 Markdown 解析：
-   * - 纯文本：120ms 合并
+   * - 纯文本：160ms 合并
    * - 含公式/代码/表/工具：自适应合并窗（正文越长间隔越大）
    *   旧固定 80ms 对长 SSE 做全量 O(n) fallback → 累计 O(n²) 打满主线程后「卡顿停更」
    */
-  const STREAM_MD_TEXT_INTERVAL_MS: number = 120;
-  const STREAM_MD_STRUCT_INTERVAL_BASE_MS: number = 80;
+  const STREAM_MD_TEXT_INTERVAL_MS: number = 160;
+  const STREAM_MD_STRUCT_INTERVAL_BASE_MS: number = 280;
   let streamMdParseTimer: number = 0;
   let streamMdParsePending: boolean = false;
 
@@ -409,19 +414,20 @@
 
   /**
    * 结构化内容解析合并窗：随正文变长加大，压低全量 fallback 频率。
-   * 阈值：小于 2k→80ms；小于 8k→160ms；小于 20k→280ms；更长→400ms
+   * 含 `$` 公式时基线更高（Android KaTeX/WebView 桥极贵）。
+   * 阈值：小于 2k→280ms；小于 8k→400ms；小于 20k→560ms；更长→720ms
    */
   function resolveStructParseIntervalMs(bodyLen: number): number {
     if (bodyLen < 2000) {
       return STREAM_MD_STRUCT_INTERVAL_BASE_MS;
     }
     if (bodyLen < 8000) {
-      return 160;
+      return 400;
     }
     if (bodyLen < 20000) {
-      return 280;
+      return 560;
     }
-    return 400;
+    return 720;
   }
 
   // 思考内容是否隐藏（默认隐藏）
@@ -555,48 +561,94 @@
   });
 
   /**
-   * 思考 rich-text 展示缓冲：流式时节流重绘整段 HTML（否则 2k+ 字每次 coalesce 全量转义会卡主线程）。
+   * 思考区增量缓冲：frozen/live 仅内部维护；模板绑 thinkDisplayText（规避 UTS v-for ref 数组）。
+   * 流式默认折叠：折叠时只缓存 pending，不 paint；用户展开后再渲染。
    */
-  const THINK_RICH_THROTTLE_MS: number = 150;
-  const thinkDisplayForRich = ref<string>("");
-  let thinkRichPending: string = "";
-  let thinkRichThrottleTimer: number | null = null;
+  const THINK_TEXT_THROTTLE_MS: number = 50;
+  const thinkDisplayText = ref<string>("");
+  let thinkFrozenParts: string[] = [] as string[];
+  let thinkLivePart: string = "";
+  let thinkPaintedRaw: string = "";
+  let thinkTextPending: string = "";
+  let thinkTextThrottleTimer: number | null = null;
 
-  const flushThinkRichDisplay = (immediate: boolean) => {
-    if (thinkRichThrottleTimer != null) {
-      clearTimeout(thinkRichThrottleTimer!);
-      thinkRichThrottleTimer = null;
+  const joinThinkPaint = (frozen: string[], live: string): string => {
+    let out = "";
+    for (let i = 0; i < frozen.length; i++) {
+      out += frozen[i];
     }
-    if (immediate == true) {
-      thinkDisplayForRich.value = thinkRichPending;
-      return;
-    }
-    thinkRichThrottleTimer = setTimeout(() => {
-      thinkRichThrottleTimer = null;
-      thinkDisplayForRich.value = thinkRichPending;
-    }, THINK_RICH_THROTTLE_MS) as number;
+    return out + live;
   };
 
-  const scheduleThinkRichPaint = (raw: string) => {
-    thinkRichPending = raw;
-    // 非末条 / 非流式：立刻对齐，避免历史气泡滞后
+  const resetThinkPaintState = () => {
+    thinkFrozenParts = [] as string[];
+    thinkLivePart = "";
+    thinkPaintedRaw = "";
+    thinkDisplayText.value = "";
+  };
+
+  const paintThinkIncremental = (raw: string) => {
+    const painted = applyThinkIncremental(
+      thinkPaintedRaw,
+      thinkFrozenParts,
+      thinkLivePart,
+      raw,
+    );
+    thinkFrozenParts = painted.frozenParts;
+    thinkLivePart = painted.livePart;
+    thinkPaintedRaw = raw;
+    thinkDisplayText.value = joinThinkPaint(
+      thinkFrozenParts,
+      thinkLivePart,
+    );
+  };
+
+  const flushThinkTextDisplay = (immediate: boolean) => {
+    if (thinkTextThrottleTimer != null) {
+      clearTimeout(thinkTextThrottleTimer!);
+      thinkTextThrottleTimer = null;
+    }
+    if (immediate == true) {
+      paintThinkIncremental(thinkTextPending);
+      return;
+    }
+    thinkTextThrottleTimer = setTimeout(() => {
+      thinkTextThrottleTimer = null;
+      // 定时器触发时若已重新折叠，丢弃本次 paint
+      if (hideThinkContent.value == true) {
+        return;
+      }
+      paintThinkIncremental(thinkTextPending);
+    }, THINK_TEXT_THROTTLE_MS) as number;
+  };
+
+  const scheduleThinkTextPaint = (raw: string) => {
+    thinkTextPending = raw;
+    // 折叠：不渲染思考正文（省掉增量拼接与 text layout）
+    if (hideThinkContent.value == true) {
+      if (thinkTextThrottleTimer != null) {
+        clearTimeout(thinkTextThrottleTimer!);
+        thinkTextThrottleTimer = null;
+      }
+      return;
+    }
     if (
       isConversationActive.value != true ||
       isLastMsg.value != true
     ) {
-      flushThinkRichDisplay(true);
+      flushThinkTextDisplay(true);
       return;
     }
-    if (thinkRichThrottleTimer != null) {
+    if (thinkTextThrottleTimer != null) {
       return;
     }
-    flushThinkRichDisplay(false);
+    flushThinkTextDisplay(false);
   };
 
   watch(
     (): string => thinkContent.value,
     (v: string) => {
-      scheduleThinkRichPaint(v);
+      scheduleThinkTextPaint(v);
     },
     { immediate: true },
   );
@@ -604,38 +656,32 @@
   watch(
     (): boolean => isConversationActive.value,
     (active: boolean) => {
-      if (active != true) {
-        flushThinkRichDisplay(true);
+      // 会话结束且已展开时定稿；折叠仍不 paint，展开时再刷
+      if (active != true && hideThinkContent.value != true) {
+        thinkTextPending = resolveThinkText();
+        flushThinkTextDisplay(true);
       }
     },
   );
 
-  /**
-   * 思考内容 → rich-text nodes。
-   * App/H5 的 rich-text 不继承宿主 class 的 font-size/color（会无效），
-   * 字号颜色必须写在 nodes HTML 的内联 style 里；换行已转 <br/>。
-   * 约等于 28rpx / #888 / lh 1.5（改字号请改此处，勿改 .think-rich-text）
-   */
-  const thinkRichTextNodes = computed((): string => {
-    const raw = thinkDisplayForRich.value;
-    if (raw.length == 0) {
-      return "";
-    }
-    const escaped = raw
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/\n/g, "<br/>");
-    return (
-      `<span style="font-size:12px;color:#888888;line-height:1.2;">` +
-      escaped +
-      `</span>`
-    );
-  });
-
   const changeThinkContent = () => {
-    hideThinkContent.value = !hideThinkContent.value;
+    const nextHide = !hideThinkContent.value;
+    hideThinkContent.value = nextHide;
+    if (nextHide != true) {
+      // 用户展开：立刻用当前缓存/消息全文渲染
+      thinkTextPending = resolveThinkText();
+      if (thinkTextPending.length == 0) {
+        thinkTextPending = thinkContent.value;
+      }
+      flushThinkTextDisplay(true);
+    } else {
+      // 收起：卸载展示态，释放 layout；原文仍在 msg / pending
+      if (thinkTextThrottleTimer != null) {
+        clearTimeout(thinkTextThrottleTimer!);
+        thinkTextThrottleTimer = null;
+      }
+      resetThinkPaintState();
+    }
     emit("changeThinkContent", hideThinkContent.value);
   };
 
@@ -672,16 +718,17 @@
           // ignore
         }
         // #endif
-        // THINK 只抬 thinkStreamRevision，勿 bump streamRevision（否则连带正文 UniAiXMsgRender 整树失效）
+        // THINK：勿 bump streamRevision（否则连带正文 UniAiXMsgRender 整树失效）。
+        // 流式默认折叠：折叠时只写入 msg，不抬 revision（避免驱动 thinkContent watch → paint）；
+        // 仅「空→有」抬一次以便显示思考标题栏；展开后才持续抬 revision 驱动渲染。
         if (thinkChanged == true) {
-          thinkStreamRevision.value = thinkStreamRevision.value + 1;
-          if (
-            thinkAfter.length > 0 &&
-            isConversationActive.value == true &&
-            isLastMsg.value == true &&
-            hideThinkContent.value == true
-          ) {
-            hideThinkContent.value = false;
+          if (hideThinkContent.value == true) {
+            thinkTextPending = thinkAfter;
+            if (thinkBefore.length == 0 && thinkAfter.length > 0) {
+              thinkStreamRevision.value = thinkStreamRevision.value + 1;
+            }
+          } else {
+            thinkStreamRevision.value = thinkStreamRevision.value + 1;
           }
         }
         if (bodyChanged == true || procChanged == true) {
@@ -813,7 +860,7 @@
       `${hideThinkContent.value}`,
     () => {
       const v = resolveThinkText();
-      // 已由 updateMessage patch 过则勿再 bump，避免 THINK 每帧 double rich-text
+      // 已由 updateMessage patch 过则勿再 bump，避免 THINK 每帧 double 刷新
       if (msg.value.thinkContent == v) {
         return;
       }
@@ -827,6 +874,13 @@
     (): string => msg.value._id,
     () => {
       markdownParser.resetForNewMessage();
+      thinkFrozenParts = [] as string[];
+      thinkLivePart = "";
+      thinkPaintedRaw = "";
+      thinkTextPending = "";
+      thinkDisplayText.value = "";
+      // 新消息默认折叠思考区
+      hideThinkContent.value = true;
     },
   );
 
@@ -862,9 +916,9 @@
 
   onUnmounted(() => {
     clearStreamMdParseTimer();
-    if (thinkRichThrottleTimer != null) {
-      clearTimeout(thinkRichThrottleTimer!);
-      thinkRichThrottleTimer = null;
+    if (thinkTextThrottleTimer != null) {
+      clearTimeout(thinkTextThrottleTimer!);
+      thinkTextThrottleTimer = null;
     }
   });
 
@@ -951,9 +1005,13 @@
     white-space: pre-wrap;
   }
 
-          /* rich-text 正文样式见 thinkRichTextNodes 内联 style；此处改 font-size 无效 */
-          .think-rich-text {
+          /* 思考正文：原生 text 可吃 class 字号颜色；保留换行 */
+          .think-plain-text {
             width: 100%;
+            font-size: 24rpx;
+            color: #888888;
+            line-height: 1.4;
+            white-space: pre-wrap;
           }
 
     .answer-container {

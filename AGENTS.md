@@ -184,6 +184,7 @@ pnpm base:fetch
 # 或：make base-fetch
 # 或：curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh | bash
 # 自签证书：NUWAX_S3_INSECURE=1
+# vapor 蒸汽模式基座：pnpm base:fetch:vapor（= NUWAX_BASE_CHANNEL=vapor）
 # 固定版本：NUWAX_BASE_VERSION=1.0.0 pnpm base:fetch
 ```
 
@@ -211,6 +212,7 @@ pnpm i18n:export-defaults  # 导出平台默认文案
 pnpm verify:mcp-ask        # 校验 mcp-ask 契约
 pnpm uni:build             # 编译 app-android 并提取关键错误
 pnpm base:fetch            # 同步最新自定义基座（S3）
+pnpm base:fetch:vapor      # 同步最新 vapor 蒸汽基座（S3）
 pnpm base:publish          # 发布自定义基座到 S3（维护者）
 pnpm base:ship             # 一键：appResource → 出包 → 上传 S3（维护者）
 pnpm base:help             # 列出 make 基座相关目标

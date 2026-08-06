@@ -24,7 +24,7 @@ import {
   getMathCache,
   putMathCache,
 } from "@/subpackages/components/ai-msg/mathFormulaDiskCache.uts";
-import { perfRecordMathBatch } from "@/utils/perfProbe.uts";
+import { perfRecordMathBatchDetail } from "@/utils/perfProbe.uts";
 
 type MathRenderedCallback = () => void;
 
@@ -123,8 +123,8 @@ class MathBatchUiRunner {
   onChunkReady: MathRenderedCallback;
   pending: number = 0;
   buffered: PendingMathResult[] = [] as PendingMathResult[];
-  /** 多条一起刷，减轻历史长文「一张一抖」；仍远小于旧的整页齐套 */
-  chunkSize: number = 4;
+  /** 多条一起刷会拖慢「闭合即见」；流式逐个上屏用 1 */
+  chunkSize: number = 1;
   /** KaTeX 并发闸：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥队列 → 卡死 */
   inFlight: number = 0;
   queue: MathDedupeGroup[] = [] as MathDedupeGroup[];
@@ -175,14 +175,26 @@ class MathBatchUiRunner {
       for (let hi = 0; hi < hitResults.length; hi++) {
         applyMathResultToToken(hitResults[hi].token, hitResults[hi].res);
       }
-      this.onChunkReady();
+      // App：缓存命中已在解析期写回 token.href，本次 markdownElList 赋值即可上屏，
+      // 勿再 onChunkReady 触发整表 flush（流式增量下会放大主线程抖动）。
+      let skipCacheFlush = false;
+      // #ifdef APP
+      skipCacheFlush = true;
+      // #endif
+      if (skipCacheFlush != true) {
+        this.onChunkReady();
+      }
     }
 
     this.pending = groups.length;
     this.buffered = [] as PendingMathResult[];
     // [PerfProbe] 观测：公式 batch 缓存命中数 vs 实际 dispatch 数（性能排查，可关）
     try {
-      perfRecordMathBatch(hitResults.length, groups.length);
+      perfRecordMathBatchDetail(
+        hitResults.length,
+        groups.length,
+        proxyWeb.isReady(),
+      );
     } catch (_e) {
       // 埋点失败静默
     }
@@ -1186,8 +1198,34 @@ function makeCustomProcessItem(
   index: number,
   processList: any[],
 ): UniAiMarkdownElItem {
+  // 优先用 executeId 做稳定 uniqueId，避免 SSE 重解析后 :key 漂移触发组件错位复用
+  let uid = "fallback-" + type + "-" + index;
+  if (processList.length > 0) {
+    const ids = [] as string[];
+    for (let i = 0; i < processList.length; i++) {
+      const raw = processList[i];
+      if (raw == null) {
+        continue;
+      }
+      try {
+        const obj = raw as UTSJSONObject;
+        let eid = obj["executeId"];
+        if (eid == null || `${eid}`.length == 0) {
+          eid = obj["executeid"];
+        }
+        if (eid != null && `${eid}`.length > 0) {
+          ids.push(`${eid}`);
+        }
+      } catch (_e) {
+        // ignore
+      }
+    }
+    if (ids.length > 0) {
+      uid = "fallback-" + type + "-" + ids.join("_");
+    }
+  }
   return {
-    uniqueId: "fallback-" + type + "-" + index,
+    uniqueId: uid,
     type,
     datasList: [] as MarkdownToken[][],
     customProcessList: processList,
@@ -1696,10 +1734,13 @@ function tryAppendTableContinuation(
  * 支持标题、段落、粗体、行内代码、分隔线、表格、代码块及块级数学公式。
  * - App：根调用收集公式 → 并行截图 → 按 chunk（默认 8）分批回调上屏
  * - H5：不走批量队列，解析中单条 katexRender（resultHtml + v-html，原逻辑）
+ * @param deferMathFlush App 流式 live 区：只建 math token、不派发 KaTeX/WebView；
+ *   冻结前缀（已闭合公式）应传 false，逐段 flush。终态 full parse 也传 false。
  */
 export function parseAppMarkdownFallback(
   markdown: string,
   onMathRendered: MathRenderedCallback,
+  deferMathFlush: boolean = false,
 ): UniAiMarkdownElItem[] {
   // #ifdef APP
   try {
@@ -1711,6 +1752,12 @@ export function parseAppMarkdownFallback(
     }
     mathJobStack.push(new MathJobFrame());
     const parsed = parseAppMarkdownFallbackInner(markdown, onMathRendered);
+    if (deferMathFlush == true) {
+      // live：丢弃本帧 jobs，token 保留 latex 占位；进入冻结区 / 终态再截图
+      mathJobStack.pop();
+      lastMathFlushCount = 0;
+      return parsed;
+    }
     const jobCount = flushMathJobs(onMathRendered);
     mathJobStack.pop();
     lastMathFlushCount = jobCount;
@@ -1831,6 +1878,12 @@ function parseAppMarkdownFallbackInner(
     const trimmed = line.trim();
 
     if (trimmed.length == 0) {
+      index++;
+      continue;
+    }
+
+    if (trimmed.startsWith("</markdown-custom-process-group")) {
+      // 孤立结束标签（工具已在 processingList）：勿当正文
       index++;
       continue;
     }

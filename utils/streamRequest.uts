@@ -451,6 +451,8 @@ export class StreamRequest {
   private readonly SSE_BURST_SLICE: number = 80;
   /** App：已通过 onChunkReceived 解码的原始字节数，用于 residual 只吃增量尾包 */
   private decodedChunkBytes: number = 0;
+  /** 防止 [DONE] / completed / residual 终态多路径重复触发 onComplete */
+  private streamOnCompleteFired: boolean = false;
 
   // 发起流式请求
   async request(config: StreamRequestConfig): Promise<void> {
@@ -458,6 +460,7 @@ export class StreamRequest {
     this.buffer = ""; // 重置缓冲区
     this.pendingBytes = new Uint8Array(0); // 重置字节缓冲区
     this.receivedTerminalMarker = false;
+    this.streamOnCompleteFired = false;
     this.decodedChunkBytes = 0;
     this.resetSseDispatchQueue();
 
@@ -678,15 +681,12 @@ export class StreamRequest {
         break;
       }
       const content = this.sseDispatchQueue.shift() as string;
+      // 终态后仍须派发积压 MESSAGE（success 扫尾抢跑 onComplete 时常见），
+      // 禁止清空队列，否则会丢后半段正文（日志里 STREAM_COMPLETE 后仍有 MESSAGE）。
       this.processSSEMessage(content, config, onComplete);
-      if (this.receivedTerminalMarker == true) {
-        // 终态已在 processSSEMessage 内尽量排空 burst；此处只停泵，勿再丢弃未入队帧
-        this.sseDispatchQueue = [];
-        break;
-      }
     }
 
-    if (this.isAborted || this.receivedTerminalMarker == true) {
+    if (this.isAborted) {
       this.sseDispatchRunning = false;
       return;
     }
@@ -715,6 +715,7 @@ export class StreamRequest {
     if (
       this.sseDispatchRunning == false &&
       this.sseDispatchQueue.length == 0 &&
+      this.sseBurstRest == null &&
       this.sseBurstEnqueuePending != true
     ) {
       onIdle();
@@ -723,6 +724,28 @@ export class StreamRequest {
     setTimeout(() => {
       this.waitForSseDispatchIdle(onIdle);
     }, this.SSE_DISPATCH_INTERVAL_MS);
+  }
+
+  /**
+   * 终态后等分发队列空闲再调业务 onComplete。
+   * 否则 [DONE] 后仍积压的 THINK/MESSAGE 会撞上已 endStreamListDraft 的空 draft，
+   * 日志表现为 STREAM_COMPLETE 后继续刷大量 MESSAGE。
+   */
+  private fireStreamOnCompleteAfterIdle(
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    this.waitForSseDispatchIdle(() => {
+      if (this.isAborted) {
+        onStreamComplete();
+        return;
+      }
+      if (this.streamOnCompleteFired != true) {
+        this.streamOnCompleteFired = true;
+        config.onComplete?.();
+      }
+      onStreamComplete();
+    });
   }
 
   /**
@@ -979,6 +1002,9 @@ export class StreamRequest {
   ): void {
     // 检查是否完成
     if (content === "[DONE]") {
+      if (this.receivedTerminalMarker == true) {
+        return;
+      }
       // 终态前先排空 burst + 队列里尚未派发的 MESSAGE，避免 Android 少字
       this.materializeBurstRestToQueue(config, onStreamComplete);
       this.flushQueuedNonTerminalBeforeComplete(config, onStreamComplete);
@@ -987,8 +1013,8 @@ export class StreamRequest {
       // 清除超时监控
       this.finalizeCompletedStream();
 
-      config.onComplete?.();
-      onStreamComplete();
+      // 等本轮 pump / burst 余量全部应用后再 onComplete，避免 draft 被提前关掉
+      this.fireStreamOnCompleteAfterIdle(config, onStreamComplete);
       return;
     }
 
@@ -1000,6 +1026,9 @@ export class StreamRequest {
       try {
         const data = JSON.parse(content) as UTSJSONObject;
         if (isCompletedPayload(data)) {
+          if (this.receivedTerminalMarker == true) {
+            return;
+          }
           this.materializeBurstRestToQueue(config, onStreamComplete);
           this.flushQueuedNonTerminalBeforeComplete(config, onStreamComplete);
           this.receivedTerminalMarker = true;
@@ -1007,8 +1036,7 @@ export class StreamRequest {
           // 清除超时监控
           this.finalizeCompletedStream();
 
-          config.onComplete?.();
-          onStreamComplete();
+          this.fireStreamOnCompleteAfterIdle(config, onStreamComplete);
           return;
         }
 
@@ -1429,10 +1457,15 @@ export class StreamRequest {
                     SSE_RESIDUAL_TERMINAL_SCAN_BYTES,
                   );
                   if (sseTextLooksTerminal(tailText)) {
+                    // 必须先排空派发队列再 onComplete，否则 success 抢跑会丢后半段 MESSAGE
+                    this.materializeBurstRestToQueue(config, finishStream);
+                    this.flushQueuedNonTerminalBeforeComplete(
+                      config,
+                      finishStream,
+                    );
                     this.receivedTerminalMarker = true;
                     this.finalizeCompletedStream();
-                    config.onComplete?.();
-                    finishStream();
+                    this.fireStreamOnCompleteAfterIdle(config, finishStream);
                   }
                 }
               } else {
@@ -1549,11 +1582,12 @@ export class StreamRequest {
                 this.releaseRequestTask(false);
                 return;
               }
-              if (this.receivedTerminalMarker == true) {
-                // 终态帧可能刚被 flush 出来，但 processSSEMessage 已调过 onComplete；此处只收尾
-                finishStream();
-                return;
-              }
+          if (this.receivedTerminalMarker == true) {
+            // 终态已见：onComplete 可能仍在 waitForSseDispatchIdle 排队；
+            // finishStream 再等一次 idle 后 resolve，与 deferred onComplete 对齐。
+            finishStream();
+            return;
+          }
 
               this.clearTimeoutMonitor();
               config.onTimeout?.();

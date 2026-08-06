@@ -1,7 +1,19 @@
 /**
- * 渲染性能观测探针（UTS，App/H5 通用）。
- * 打点 markdown 解析耗时 / 帧间隔，logcat 前缀 [PerfProbe] 便于 grep，dump() 汇总导出。
- * 仅用于性能测试与排查，不改动业务逻辑。
+ * SSE / Markdown 卡顿诊断探针。
+ * logcat 前缀：
+ *   [PerfProbe]  — 解析耗时汇总
+ *   [SseStall]   — 分阶段流水（sse_ui / parse / math / warn）
+ *   [SseEvent]   — SSE 原始事件入口（对照 Web 是否在吐字）
+ *
+ * 真机复现后：
+ *   adb logcat | grep -iE 'SseEvent|SseStall|PerfProbe|proxy_not_ready'
+ *
+ * 判读：
+ * - 有 [SseEvent] MESSAGE 且 add>0，但无 sse_ui/parse → 事件被丢掉或未进 UI
+ * - Web 在涨、Android 无 [SseEvent] → 流未进本端 / gen 丢弃 / 解析失败
+ * - 有 PROCESSING 无 MESSAGE → 工具态在更新，正文未下发
+ * - sse_ui.bodyLen 持续涨，但 parse 长时间不出现 → 卡在 UI 合并/组件 update 之前
+ * - parse mode=inc/full 有、cost 很大或 mode 一直 full → 解析主线程打满或增量失效回退全量
  */
 
 let parseCount: number = 0;
@@ -12,27 +24,217 @@ let mathBatchCount: number = 0;
 let mathCacheHit: number = 0;
 let mathDispatchCount: number = 0;
 
-/** 记录一次 markdown 解析（bodyLen 正文字符数，costMs 耗时） */
+/** 卡顿诊断：最近一次 SSE UI 正文长度 */
+let lastSseBodyLen: number = 0;
+let lastSseAt: number = 0;
+/** 卡顿诊断：最近一次 parse */
+let lastParseAt: number = 0;
+let lastParseMode: string = "";
+let lastElCount: number = 0;
+let lastStableLen: number = 0;
+let lastLiveLen: number = 0;
+/** body 涨但 el 不动的连续次数 */
+let stuckElStreak: number = 0;
+let proxyNotReadyWarnCount: number = 0;
+/** sse_stale_body 告警分桶，避免刷屏 */
+let staleBodyWarnBucket: number = -1;
+/** SSE 事件计数（本轮流） */
+let sseEventSeq: number = 0;
+let sseMsgChunkCount: number = 0;
+let sseMsgCharTotal: number = 0;
+
+function nowMs(): number {
+  return Date.now();
+}
+
+/** 新开一轮流式时重置入口计数，避免跨会话误报 */
+export function perfResetSseEventCounters(): void {
+  sseEventSeq = 0;
+  sseMsgChunkCount = 0;
+  sseMsgCharTotal = 0;
+  lastSseBodyLen = 0;
+  lastParseAt = 0;
+  staleBodyWarnBucket = -1;
+}
+
+/** 通用阶段日志 */
+export function sseStallLog(stage: string, detail: string): void {
+  console.log(`[SseStall] ${stage} ${detail}`);
+}
+
+/**
+ * SSE 原始事件入口日志（handleConversation chunk / handleChangeMessageList）。
+ * @param eventType PROCESSING|MESSAGE|FINAL_RESULT|ERROR|...
+ * @param detail 补充字段（type/add/bodyLen/preview 等）
+ */
+export function perfRecordSseEvent(eventType: string, detail: string = ""): void {
+  sseEventSeq += 1;
+  const extra = detail.length > 0 ? ` ${detail}` : "";
+  console.log(
+    `[SseEvent] #${sseEventSeq} type=${eventType}${extra} msgChunks=${sseMsgChunkCount} msgChars=${sseMsgCharTotal}`,
+  );
+}
+
+/** MESSAGE 增量统计（有实际追加字符时调用） */
+export function perfRecordSseMessageChunk(addChars: number): void {
+  if (addChars > 0) {
+    sseMsgChunkCount += 1;
+    sseMsgCharTotal += addChars;
+  }
+}
+
+/** SSE → 气泡 update 冲刷（正文是否还在涨） */
+export function perfRecordSseUi(bodyLen: number, hint: string = ""): void {
+  const t = nowMs();
+  const delta = bodyLen - lastSseBodyLen;
+  const gap =
+    lastParseAt > 0 ? t - lastParseAt : lastSseAt > 0 ? t - lastSseAt : 0;
+  lastSseBodyLen = bodyLen;
+  lastSseAt = t;
+  const extra = hint.length > 0 ? ` ${hint}` : "";
+  console.log(
+    `[SseStall] sse_ui bodyLen=${bodyLen} delta=${delta} sinceParse=${gap}ms` +
+      extra,
+  );
+  // 正文仍在涨，但超过 1.5s 没有 parse → 怀疑卡在 updateMessage/节流前或主线程饿死
+  if (delta > 0 && lastParseAt > 0 && gap > 1500) {
+    console.warn(
+      `[SseStall] WARN sse_without_parse gap=${gap}ms bodyLen=${bodyLen} lastMode=${lastParseMode}`,
+    );
+  }
+  // 正文长时间不涨却持续冲刷 UI → 工具态空刷 / SSE 无 MESSAGE（表现为卡在工具卡）
+  if (
+    delta == 0 &&
+    lastParseAt > 0 &&
+    gap > 5000 &&
+    bodyLen > 0 &&
+    bodyLen < 2000
+  ) {
+    // 节流：同一卡滞窗口只告警一次（gap 每跳变 5s 档）
+    const bucket = Math.floor(gap / 5000);
+    if (bucket != staleBodyWarnBucket) {
+      staleBodyWarnBucket = bucket;
+      console.warn(
+        `[SseStall] WARN sse_stale_body gap=${gap}ms bodyLen=${bodyLen} (正文未增长；若 THINK 在涨而 body 不动属正常，看 think= 埋点)`,
+      );
+    }
+  }
+}
+
+/**
+ * 记录一次 markdown 解析（兼容旧调用：bodyLen + costMs）
+ */
 export function perfRecordParse(bodyLen: number, costMs: number): void {
+  perfRecordParseDetail("unknown", bodyLen, bodyLen, 0, 0, 0, costMs);
+}
+
+/**
+ * 详细 parse 打点（增量/全量）
+ * @param mode inc | full | unknown
+ * @param bodyLen 当前全文长度
+ * @param parsedChars 本次实际送进 parse 的字符数
+ */
+export function perfRecordParseDetail(
+  mode: string,
+  bodyLen: number,
+  parsedChars: number,
+  stableLen: number,
+  liveLen: number,
+  elCount: number,
+  costMs: number,
+): void {
   parseCount += 1;
   parseCostTotal += costMs;
   if (costMs > parseCostMax) {
     parseCostMax = costMs;
   }
+  const prevBodyLen = lastBodyLen;
+  const prevElCount = lastElCount;
+
   lastBodyLen = bodyLen;
+  lastParseAt = nowMs();
+  lastParseMode = mode;
+
+  const avg =
+    parseCount > 0 ? Math.round(parseCostTotal / parseCount) : 0;
   console.log(
-    `[PerfProbe] parse #${parseCount} cost=${costMs}ms bodyLen=${bodyLen} avg=${parseCount > 0 ? Math.round(parseCostTotal / parseCount) : 0}ms max=${parseCostMax}ms`,
+    `[PerfProbe] parse #${parseCount} mode=${mode} cost=${costMs}ms bodyLen=${bodyLen} parsed=${parsedChars} stable=${stableLen} live=${liveLen} el=${elCount} avg=${avg}ms max=${parseCostMax}ms`,
   );
+  console.log(
+    `[SseStall] parse mode=${mode} cost=${costMs}ms body=${bodyLen} parsed=${parsedChars} stable=${stableLen} live=${liveLen} el=${elCount}`,
+  );
+
+  // 慢解析：接近/超过合并窗
+  if (costMs >= 80) {
+    console.warn(
+      `[SseStall] WARN slow_parse cost=${costMs}ms mode=${mode} parsed=${parsedChars} (合并窗约 80~400ms，易叠峰卡顿)`,
+    );
+  }
+
+  // 大正文 full：多为历史气泡被误触发，或流式增量回退
+  if (mode == "full" && bodyLen > 2000) {
+    console.warn(
+      `[SseStall] WARN full_parse_large bodyLen=${bodyLen} (历史误触发或增量回退全量；对照 fallback_full_reason)`,
+    );
+  }
+  // 增量但切点一直为 0：短工具卡（无 \n\n）时属正常；长文才告警
+  if (
+    mode == "inc" &&
+    bodyLen > 500 &&
+    parsedChars >= bodyLen &&
+    stableLen == 0
+  ) {
+    console.warn(
+      `[SseStall] WARN inc_no_stable body=${bodyLen} parsed=${parsedChars} (切点一直为 0，等同全量扫尾巴=全文)`,
+    );
+  }
+
+  // body 变长但 elCount 不涨
+  if (bodyLen > prevBodyLen && elCount == prevElCount && elCount > 0) {
+    stuckElStreak += 1;
+  } else {
+    stuckElStreak = 0;
+  }
+  if (stuckElStreak >= 3) {
+    console.warn(
+      `[SseStall] WARN el_stuck streak=${stuckElStreak} el=${elCount} body=${bodyLen} (解析在跑但列表结构几乎不变)`,
+    );
+  }
+  lastElCount = elCount;
+  lastStableLen = stableLen;
+  lastLiveLen = liveLen;
 }
 
-/** 记录一次公式 batch：cacheHit 缓存命中数、dispatched 实际 dispatch 数 */
+/** 公式 batch：缓存命中 / 实际 dispatch / proxy 是否就绪 */
 export function perfRecordMathBatch(cacheHit: number, dispatched: number): void {
   mathBatchCount += 1;
   mathCacheHit += cacheHit;
   mathDispatchCount += dispatched;
 }
 
-/** 汇总报告（测试页「导出报告」展示用） */
+export function perfRecordMathBatchDetail(
+  cacheHit: number,
+  dispatched: number,
+  proxyReady: boolean,
+): void {
+  perfRecordMathBatch(cacheHit, dispatched);
+  console.log(
+    `[SseStall] math cacheHit=${cacheHit} dispatched=${dispatched} proxyReady=${proxyReady}`,
+  );
+  if (proxyReady != true && dispatched > 0) {
+    proxyNotReadyWarnCount += 1;
+    console.warn(
+      `[SseStall] WARN math_proxy_not_ready count=${proxyNotReadyWarnCount} queued=${dispatched} (公式截图会堵在 WebView 就绪前；日志里的 setSetting proxy_not_ready 同源)`,
+    );
+  }
+}
+
+/** 列表应用后（可选） */
+export function perfRecordListApply(elCount: number, rev: number): void {
+  console.log(`[SseStall] list_apply el=${elCount} rev=${rev}`);
+}
+
+/** 汇总报告 */
 export function perfDump(): string {
   const avg = parseCount > 0 ? Math.round(parseCostTotal / parseCount) : 0;
   const hitRate =
@@ -41,12 +243,14 @@ export function perfDump(): string {
       : 0;
   const report =
     `解析次数=${parseCount} 平均耗时=${avg}ms 最大耗时=${parseCostMax}ms 最后正文=${lastBodyLen}字符\n` +
-    `公式batch=${mathBatchCount} 缓存命中=${mathCacheHit} 实际dispatch=${mathDispatchCount} 命中率=${hitRate}%`;
+    `公式batch=${mathBatchCount} 缓存命中=${mathCacheHit} 实际dispatch=${mathDispatchCount} 命中率=${hitRate}%\n` +
+    `诊断 lastMode=${lastParseMode} stable=${lastStableLen} live=${lastLiveLen} el=${lastElCount} proxyNotReadyWarns=${proxyNotReadyWarnCount}`;
   console.log(`[PerfProbe] dump ${report}`);
+  console.log(`[SseStall] dump ${report}`);
   return report;
 }
 
-/** 重置（测试页 reset 时调用） */
+/** 重置 */
 export function perfReset(): void {
   parseCount = 0;
   parseCostTotal = 0;
@@ -55,4 +259,13 @@ export function perfReset(): void {
   mathBatchCount = 0;
   mathCacheHit = 0;
   mathDispatchCount = 0;
+  lastSseBodyLen = 0;
+  lastSseAt = 0;
+  lastParseAt = 0;
+  lastParseMode = "";
+  lastElCount = 0;
+  lastStableLen = 0;
+  lastLiveLen = 0;
+  stuckElStreak = 0;
+  proxyNotReadyWarnCount = 0;
 }

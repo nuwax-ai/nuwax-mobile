@@ -30,6 +30,13 @@ import { StringAnyRecord, UploadFileInfo } from "@/types/interfaces/common";
 import { RequestResponse } from "@/types/interfaces/request";
 import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
 import {
+  perfRecordSseUi,
+  perfRecordSseEvent,
+  perfRecordSseMessageChunk,
+  perfResetSseEventCounters,
+  sseStallLog,
+} from "@/utils/perfProbe.uts";
+import {
   MessageModeEnum,
   ConversationEventTypeEnum,
   MessageTypeEnum,
@@ -80,6 +87,7 @@ import AgentDetailData from "./AgentDetailData.uts";
 import {
   getCustomBlock,
   normalizeToolCallProcessingData,
+  toolCallProcessingListFingerprint,
   upsertToolCallProcessingList,
 } from "@/subpackages/utils/containerHelper.uts";
 import { replaceMathBracket } from "@/utils/markdown.uts";
@@ -616,6 +624,13 @@ export default class AgentDetailService {
   private pendingSpeakId: string = "";
   private pendingSpeakBody: string = "";
   private pendingSpeakDirty: boolean = false;
+  /** 上次已冲刷到 UI 的打字机正文（相同则跳过空刷） */
+  private lastPublishedStreamText: string = "";
+  private lastPublishedStreamMsgId: string = "";
+  /** 上次已冲刷气泡的 processing 指纹 */
+  private lastPublishedProcessingFp: string = "";
+  /** 上次已冲刷的 think 长度（THINK 增量不改 body，必须单独判断） */
+  private lastPublishedThinkLen: number = 0;
   /** sub 流恢复专用 StreamRequest（独立于 live chatService，避免互相 abort） */
   private subStreamRequest: StreamRequest | null = null;
   /** sub 是否已订阅（执行中） */
@@ -641,26 +656,129 @@ export default class AgentDetailService {
       clearTimeout(this.streamUiTimer!);
       this.streamUiTimer = null;
     }
-    if (this.streamListDraft != null) {
-      this.data.messageList.value = [...(this.streamListDraft as MessageInfo[])];
-    }
-    // 打字机通道与列表同频冲刷，避免每 token 触发 App 端整页重绘
-    if (
-      this.pendingStreamingMsgId.length > 0 ||
-      this.pendingStreamingText.length > 0
-    ) {
-      this.data.streamingAssistantText.value = this.pendingStreamingText;
-      this.data.streamingAssistantMessageId.value = this.pendingStreamingMsgId;
-    }
+
     const pendingMsg = this.pendingUiMessage;
+    let processingFp = "";
+    let thinkLen = 0;
     if (pendingMsg != null) {
-      const patchedText = readMessageText(pendingMsg);
-      const emitData = messageToJsonObject(pendingMsg);
-      emitData["body"] = handleMessageProcess(patchedText);
+      if (pendingMsg.processingList != null) {
+        processingFp = toolCallProcessingListFingerprint(
+          pendingMsg.processingList as any[],
+        );
+      }
+      thinkLen = readMessageThink(pendingMsg).length;
+    }
+    const streamTextSame =
+      this.pendingStreamingText == this.lastPublishedStreamText &&
+      this.pendingStreamingMsgId == this.lastPublishedStreamMsgId;
+    const processingSame = processingFp == this.lastPublishedProcessingFp;
+    const thinkSame = thinkLen == this.lastPublishedThinkLen;
+    const hasStreamPayload =
+      this.pendingStreamingMsgId.length > 0 ||
+      this.pendingStreamingText.length > 0;
+    // 正文 / think / 工具态均未变才跳过（THINK 流不改 body，旧逻辑会把思考增量整段吞掉）
+    const contentUnchanged =
+      streamTextSame == true &&
+      thinkSame == true &&
+      (pendingMsg == null || processingSame == true);
+
+    const thinkOnly =
+      thinkSame != true &&
+      streamTextSame == true &&
+      (pendingMsg == null || processingSame == true);
+
+    if (contentUnchanged == true) {
+      // 仅滚动 / TTS，不碰 messageList 与气泡（避免历史消息被连带全量重解析）
+      if (this.pendingUiNeedScroll == true) {
+        uni.$emit("streamMessageUpdate");
+      }
+      if (this.pendingSpeakDirty == true) {
+        const speakId = this.pendingSpeakId;
+        const speakBody = this.pendingSpeakBody;
+        this.pendingSpeakDirty = false;
+        setTimeout(() => {
+          this.safeEmitStreamSpeakFeed(speakId, speakBody, false);
+        }, 0);
+      }
+      this.pendingUiMessage = null;
+      this.pendingUiNeedScroll = false;
+      return;
+    }
+
+    // THINK-only：只 patch 气泡 think，禁止 [...messageList] 全量拷贝（否则随 think 变长主线程被拖死）
+    if (thinkOnly == true && pendingMsg != null) {
+      this.lastPublishedThinkLen = thinkLen;
+      const thinkRaw = readMessageThink(pendingMsg);
+      const emitData = {} as UTSJSONObject;
+      emitData["think"] = thinkRaw;
+      emitData["thinkContent"] = thinkRaw;
+      // #ifdef APP
+      try {
+        perfRecordSseUi(
+          readMessageText(pendingMsg).length,
+          `msg=${this.pendingUiMessageId} think=${thinkLen} bodySame=true thinkSame=false thinkOnly=true`,
+        );
+      } catch (_eStall) {
+        // ignore
+      }
+      // #endif
       uni.$emit("updateMessageComponent", {
         messageId: `${this.pendingUiMessageId}_${pendingMsg.index}`,
         data: emitData,
       });
+      // 思考流不强制滚底，减轻列表 layout
+      this.pendingUiMessage = null;
+      this.pendingUiNeedScroll = false;
+      return;
+    }
+
+    if (this.streamListDraft != null) {
+      this.data.messageList.value = [...(this.streamListDraft as MessageInfo[])];
+    }
+    // 打字机通道与列表同频冲刷，避免每 token 触发 App 端整页重绘
+    if (hasStreamPayload == true) {
+      this.data.streamingAssistantText.value = this.pendingStreamingText;
+      this.data.streamingAssistantMessageId.value = this.pendingStreamingMsgId;
+      this.lastPublishedStreamText = this.pendingStreamingText;
+      this.lastPublishedStreamMsgId = this.pendingStreamingMsgId;
+    }
+    if (pendingMsg != null) {
+      this.lastPublishedProcessingFp = processingFp;
+      this.lastPublishedThinkLen = thinkLen;
+      const patchedText = readMessageText(pendingMsg);
+      const emitData = messageToJsonObject(pendingMsg);
+      emitData["body"] = handleMessageProcess(patchedText);
+      // 显式带上 think，避免 Android 侧 patch 丢思考链
+      const thinkRaw = readMessageThink(pendingMsg);
+      if (thinkRaw.length > 0) {
+        emitData["think"] = thinkRaw;
+        emitData["thinkContent"] = thinkRaw;
+      }
+      // #ifdef APP
+      try {
+        perfRecordSseUi(
+          patchedText.length,
+          `msg=${this.pendingUiMessageId} think=${thinkLen} bodySame=${streamTextSame} thinkSame=${thinkSame}`,
+        );
+      } catch (_eStall) {
+        // ignore
+      }
+      // #endif
+      uni.$emit("updateMessageComponent", {
+        messageId: `${this.pendingUiMessageId}_${pendingMsg.index}`,
+        data: emitData,
+      });
+    } else if (hasStreamPayload == true) {
+      // #ifdef APP
+      try {
+        perfRecordSseUi(
+          this.pendingStreamingText.length,
+          `msg=${this.pendingStreamingMsgId} think=${thinkLen}`,
+        );
+      } catch (_eStall) {
+        // ignore
+      }
+      // #endif
     }
     if (this.pendingUiNeedScroll == true) {
       uni.$emit("streamMessageUpdate");
@@ -720,6 +838,10 @@ export default class AgentDetailService {
     this.pendingSpeakId = "";
     this.pendingSpeakBody = "";
     this.pendingSpeakDirty = false;
+    this.lastPublishedStreamText = "";
+    this.lastPublishedStreamMsgId = "";
+    this.lastPublishedProcessingFp = "";
+    this.lastPublishedThinkLen = 0;
   }
 
   /**
@@ -901,10 +1023,10 @@ export default class AgentDetailService {
   }
 
   /**
-   * 任务执行中时，将本地 conversationInfo.taskStatus 标为 CANCEL。
+   * 任务执行中时，将本地 conversationInfo.taskStatus 更新为指定终态。
    * Android：conversationInfo 可能为 null / Map，禁止先 as UTSJSONObject。
    */
-  private markConversationTaskCancelIfExecuting(): void {
+  private markConversationTaskStatusIfExecuting(nextStatus: TaskStatus): void {
     const stopConvInfo = this.data.conversationInfo.value;
     if (stopConvInfo == null) {
       return;
@@ -922,11 +1044,26 @@ export default class AgentDetailService {
       if (convObj == null) {
         return;
       }
-      convObj["taskStatus"] = TaskStatus.CANCEL;
+      convObj["taskStatus"] = nextStatus;
       this.data.conversationInfo.value = convObj as any;
     } catch (_e) {
       // ignore
     }
+  }
+
+  /**
+   * 任务执行中时，将本地 conversationInfo.taskStatus 标为 CANCEL。
+   */
+  private markConversationTaskCancelIfExecuting(): void {
+    this.markConversationTaskStatusIfExecuting(TaskStatus.CANCEL);
+  }
+
+  /**
+   * 流/sub 正常结束：本地 taskStatus 标 COMPLETE，关闭「任务执行中」Loading。
+   * 跨端续接时 ChatFinished/详情刷新可能滞后或缺失，不能只靠 isConversationActive。
+   */
+  private markConversationTaskCompleteIfExecuting(): void {
+    this.markConversationTaskStatusIfExecuting(TaskStatus.COMPLETE);
   }
 
   /**
@@ -1277,6 +1414,13 @@ export default class AgentDetailService {
     // ACP Permission 权限审批事件拦截（在 data 校验 / PROCESSING 分支之前，命中即 return，不进 processingList）
     const isAcpEvt = isAcpPermissionEvent(res);
     if (isAcpEvt) {
+      // #ifdef APP
+      try {
+        perfRecordSseEvent("ACP_PERMISSION", `msg=${currentMessageId}`);
+      } catch (_eAcp) {
+        // ignore
+      }
+      // #endif
       const interaction = extractAcpPermissionInteraction(res);
       if (interaction != null) {
         this.handleAcpPermissionEvent(interaction, currentMessageId);
@@ -1287,6 +1431,13 @@ export default class AgentDetailService {
     // MCP Ask 结构化提问事件拦截（同上，命中即 return）
     const isAskEvt = isMcpAskToolCallEvent(res);
     if (isAskEvt) {
+      // #ifdef APP
+      try {
+        perfRecordSseEvent("MCP_ASK", `msg=${currentMessageId}`);
+      } catch (_eAsk) {
+        // ignore
+      }
+      // #endif
       const mcpInteraction = extractMcpAskInteraction(res);
       if (mcpInteraction != null) {
         this.handleMcpAskEvent(mcpInteraction, currentMessageId);
@@ -1299,6 +1450,16 @@ export default class AgentDetailService {
       if (shouldSkipSsePayloadWithoutData(res)) {
         return;
       }
+      // #ifdef APP
+      try {
+        perfRecordSseEvent(
+          eventTypeStr.length > 0 ? eventTypeStr : "UNKNOWN",
+          `drop=no_data msg=${currentMessageId}`,
+        );
+      } catch (_eNd) {
+        // ignore
+      }
+      // #endif
       return;
     }
 
@@ -1307,6 +1468,13 @@ export default class AgentDetailService {
     this.data.currentConversationRequestId.value = requestIdStr;
 
     if (this.data.messageList.value.length == 0) {
+      // #ifdef APP
+      try {
+        perfRecordSseEvent(eventTypeStr, "drop=empty_messageList");
+      } catch (_eEm) {
+        // ignore
+      }
+      // #endif
       return;
     }
 
@@ -1317,6 +1485,16 @@ export default class AgentDetailService {
       this.data.messageIdRef.value,
     );
     if (index < 0) {
+      // #ifdef APP
+      try {
+        perfRecordSseEvent(
+          eventTypeStr,
+          `drop=msg_not_found currentId=${currentMessageId} ref=${this.data.messageIdRef.value}`,
+        );
+      } catch (_eIdx) {
+        // ignore
+      }
+      // #endif
       return;
     }
     let arraySpliceAction = 1;
@@ -1343,6 +1521,18 @@ export default class AgentDetailService {
         ? openUiBlockSource
         : normalizeToolCallProcessingData(responseData);
       const executeIdRaw = readRawField(blockSource, "executeId");
+      const procToolTypeRaw = readRawField(blockSource, "type");
+      const procToolStatusRaw = readRawField(blockSource, "status");
+      // #ifdef APP
+      try {
+        perfRecordSseEvent(
+          "PROCESSING",
+          `msg=${currentMessageId} tool=${procToolTypeRaw != null ? `${procToolTypeRaw}` : ""} status=${procToolStatusRaw != null ? `${procToolStatusRaw}` : ""} execIdLen=${executeIdRaw != null ? `${executeIdRaw}`.length : 0} bodyLen=${currentTextSnapshot.length}`,
+        );
+      } catch (_eProc) {
+        // ignore
+      }
+      // #endif
 
       const accumulatedText = getCustomBlock(
         currentTextSnapshot,
@@ -1354,18 +1544,28 @@ export default class AgentDetailService {
         oldProcessingList = currentMessage.processingList as ProcessingInfo[];
       }
 
-      const nmObj = messageToJsonObject(currentMessage);
-      nmObj["text"] = accumulatedText;
-      nmObj["status"] = MessageStatusEnum.Loading;
-      if (executeIdRaw != null) {
-        nmObj["executeId"] = executeIdRaw;
-      }
       // 按 executeId upsert，FINISHED/FAILED 覆盖 EXECUTING（对齐 PC）
-      nmObj["processingList"] = upsertToolCallProcessingList(
+      const nextProcessingList = upsertToolCallProcessingList(
         oldProcessingList as any[],
         blockSource,
       );
-      newMessage = buildMessageInfoFromDraft(nmObj);
+      const textUnchanged = accumulatedText == currentTextSnapshot;
+      const processingUnchanged =
+        nextProcessingList == (oldProcessingList as any[]) ||
+        toolCallProcessingListFingerprint(oldProcessingList as any[]) ==
+          toolCallProcessingListFingerprint(nextProcessingList);
+
+      // 正文与工具卡展示态均无变化：跳过写消息 / 冲刷（FINISHED 重复事件会空刷 Android）
+      if (textUnchanged != true || processingUnchanged != true) {
+        const nmObj = messageToJsonObject(currentMessage);
+        nmObj["text"] = accumulatedText;
+        nmObj["status"] = MessageStatusEnum.Loading;
+        if (executeIdRaw != null) {
+          nmObj["executeId"] = executeIdRaw;
+        }
+        nmObj["processingList"] = nextProcessingList;
+        newMessage = buildMessageInfoFromDraft(nmObj);
+      }
 
       // 长任务型任务处理
       const conversationId = this.data.conversationId.value;
@@ -1404,6 +1604,23 @@ export default class AgentDetailService {
       const id = idRaw != null ? `${idRaw}` : "";
       const finishedRaw = readRawField(responseData, "finished");
       const finished = finishedRaw == true || `${finishedRaw}` == "true";
+      // #ifdef APP
+      try {
+        const preview =
+          text.length > 40 ? text.substring(0, 40).replace(/\n/g, "\\n") : text.replace(/\n/g, "\\n");
+        perfRecordSseMessageChunk(text.length);
+        const thinkSnap =
+          type == `${MessageModeEnum.THINK}`
+            ? readMessageThink(currentMessage).length + text.length
+            : readMessageThink(currentMessage).length;
+        perfRecordSseEvent(
+          "MESSAGE",
+          `msg=${currentMessageId} mode=${type} add=${text.length} bodyLen=${currentTextSnapshot.length} thinkLen=${thinkSnap} finished=${finished} dataId=${id} preview="${preview}"`,
+        );
+      } catch (_eMsgEvt) {
+        // ignore
+      }
+      // #endif
       // 注意：中间段 CHAT 也可能带 finished=true（如仅下发 agent-info），
       // 不能据此结束整轮会话；整轮结束以 FINAL_RESULT / 流完成 / 用户停止为准。
 
@@ -1478,6 +1695,21 @@ export default class AgentDetailService {
           const accumulatedText = handleMessageProcess(
             isNewConversation ? text : `${currentTextSnapshot}${text}`,
           );
+          // #ifdef APP
+          try {
+            sseStallLog(
+              "sse_msg",
+              `add=${text.length} bodyLen=${accumulatedText.length} delta=${accumulatedText.length - currentTextSnapshot.length}`,
+            );
+            if (text.length > 0 && accumulatedText.length == currentTextSnapshot.length) {
+              console.warn(
+                `[SseEvent] WARN msg_no_grow add=${text.length} bodyLen=${accumulatedText.length} (增量未写入气泡)`,
+              );
+            }
+          } catch (_eMsg) {
+            // ignore
+          }
+          // #endif
 
           const m = cloneMessageInfoDraft(currentMessage);
           m["text"] = accumulatedText;
@@ -1490,6 +1722,16 @@ export default class AgentDetailService {
     }
 
     if (eventTypeStr == `${ConversationEventTypeEnum.FINAL_RESULT}`) {
+      // #ifdef APP
+      try {
+        perfRecordSseEvent(
+          "FINAL_RESULT",
+          `msg=${currentMessageId} bodyLen=${currentTextSnapshot.length}`,
+        );
+      } catch (_eFr) {
+        // ignore
+      }
+      // #endif
       const m = cloneMessageInfoDraft(currentMessage);
       m["status"] = MessageStatusEnum.Complete;
       m["finalResult"] = responseData;
@@ -1500,13 +1742,23 @@ export default class AgentDetailService {
       }
       newMessage = buildMessageInfoFromDraft(m);
       this.data.requestId.value = requestIdStr;
+      // 终态事件先落本地 COMPLETE，避免跨端续接结束后 Loading 仍转（详情刷新可能滞后）
+      this.markConversationTaskCompleteIfExecuting();
     }
 
     if (eventTypeStr == `${ConversationEventTypeEnum.ERROR}`) {
+      // #ifdef APP
+      try {
+        perfRecordSseEvent("ERROR", `msg=${currentMessageId}`);
+      } catch (_eErr) {
+        // ignore
+      }
+      // #endif
       const m = cloneMessageInfoDraft(currentMessage);
       m["status"] = "error";
       newMessage = buildMessageInfoFromDraft(m);
       this.data.isConversationActive.value = false;
+      this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
     }
 
     // 更新消息列表草稿
@@ -1533,15 +1785,19 @@ export default class AgentDetailService {
 
     const needScroll = this.data.autoToLastMsg.value;
     const isErrorEvent = eventTypeStr == `${ConversationEventTypeEnum.ERROR}`;
-    // ERROR 立即冲刷；其余 SSE 事件合并 UI，降低 [...list] + 气泡更新频率
-    this.scheduleStreamUiPublish(
-      currentMessageId,
+    const uiMessage =
       newMessage != null && isAssistantMessageInfo(newMessage) == true
         ? newMessage
-        : null,
-      needScroll,
-      isErrorEvent,
-    );
+        : null;
+    // 无实质消息变更时不排程冲刷（否则 autoToLastMsg 会让空 PROCESSING 每秒 [...list]）
+    if (uiMessage != null || isErrorEvent == true) {
+      this.scheduleStreamUiPublish(
+        currentMessageId,
+        uiMessage,
+        needScroll,
+        isErrorEvent,
+      );
+    }
 
     // 打开页面首页（与气泡更新解耦，保持即时）
     if (newMessage != null && isAssistantMessageInfo(newMessage) == true) {
@@ -1802,12 +2058,32 @@ export default class AgentDetailService {
       this.streamGeneration = this.streamGeneration + 1;
       this.endStreamListDraft();
       const streamGen = this.streamGeneration;
+      // #ifdef APP
+      try {
+        perfResetSseEventCounters();
+        perfRecordSseEvent(
+          "STREAM_START",
+          `msg=${currentMessageId} gen=${streamGen} temp=${isTempChat}`,
+        );
+      } catch (_eStart) {
+        // ignore
+      }
+      // #endif
 
       await chatService.sendMessage(
         params,
         // 处理流式数据
         (chunk: string) => {
           if (streamGen != this.streamGeneration) {
+            // #ifdef APP
+            try {
+              console.warn(
+                `[SseEvent] drop=stale_gen chunkLen=${chunk.length} gen=${streamGen} cur=${this.streamGeneration}`,
+              );
+            } catch (_eGen) {
+              // ignore
+            }
+            // #endif
             return;
           }
           try {
@@ -1825,6 +2101,17 @@ export default class AgentDetailService {
               if (shouldSkipSsePayloadWithoutData(resultObj)) {
                 return;
               }
+              // #ifdef APP
+              try {
+                const etRaw = readRawField(resultObj, "eventType");
+                perfRecordSseEvent(
+                  etRaw != null ? `${etRaw}` : "UNKNOWN",
+                  `drop=chunk_no_data chunkLen=${chunk.length}`,
+                );
+              } catch (_eCd) {
+                // ignore
+              }
+              // #endif
               return;
             }
 
@@ -1870,6 +2157,16 @@ export default class AgentDetailService {
           if (streamGen != this.streamGeneration) {
             return;
           }
+          // #ifdef APP
+          try {
+            perfRecordSseEvent(
+              "STREAM_COMPLETE",
+              `msg=${currentMessageId} gen=${streamGen}`,
+            );
+          } catch (_eDone) {
+            // ignore
+          }
+          // #endif
           this.handleStreamComplete(params, isTempChat);
         },
         // 错误回调
@@ -2039,6 +2336,8 @@ export default class AgentDetailService {
     this.persistLastAssistantSpeakableText(speakBody);
     // 先结束会话态（触发 Markdown 终态解析），再清打字机通道，避免中间空白一帧
     this.data.isConversationActive.value = false;
+    // 关闭「任务执行中」Loading（与 isConversationActive 解耦；续接场景尤其依赖）
+    this.markConversationTaskCompleteIfExecuting();
     this.clearStreamingAssistantText();
 
     // RENDER_UI 完成结果可能只在会话详情落库，live SSE 仅收到 EXECUTING。
@@ -2260,6 +2559,8 @@ export default class AgentDetailService {
         this.subStreamRequest = null;
       }
       this.isSubscribed = false;
+      // 与 live SSE 完成对齐：先冲刷 TTS 终态，再关会话态（否则播报图标卡住）
+      this.sealStreamingAssistantBeforeClear();
       this.data.isConversationActive.value = false;
       this.clearStreamingAssistantText();
       removeEmptyPlaceholder();
@@ -2455,12 +2756,16 @@ export default class AgentDetailService {
       }
     };
     requestConfig.onComplete = () => {
+      // sub SSE 正常结束：立刻关掉 Loading（不等 ChatFinished / 详情回拉）
+      this.markConversationTaskCompleteIfExecuting();
       cleanupSub();
     };
     requestConfig.onError = (error: any) => {
+      this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
       cleanupSub();
     };
     requestConfig.onTimeout = () => {
+      this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
       cleanupSub();
     };
 

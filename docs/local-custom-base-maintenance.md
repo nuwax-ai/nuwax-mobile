@@ -96,7 +96,7 @@ make base-all              # 三份一起打（不装设备、不上 S3）
 | 文件 | 用途 |
 |------|------|
 | `android_debug.apk` | Android 真机 / 模拟器（同一包；默认含 HX `debug-server`，见 `ENABLE_HX_DEBUG`） |
-| `android_release.apk` | 给测试的接近发行包：`ENABLE_HX_DEBUG=0 ANDROID_BUILD_TYPE=release make base-android`（内测 debug 签名，非上架） |
+| `android_release.apk` | 给测试的接近发行包：`ENABLE_HX_DEBUG=0 ANDROID_BUILD_TYPE=release make base-android`（与调试基座、正式包共用正式签名） |
 | `iOS_debug.ipa` | **iOS 真机** HX 自定义基座 |
 | `Pandora_simulator_debug.app` | **iOS 模拟器**（官方命名；**Release + 默认 x86_64/Rosetta**，对齐 ExtAPI 仅有的 x86_64-sim；与真机包勿混用） |
 

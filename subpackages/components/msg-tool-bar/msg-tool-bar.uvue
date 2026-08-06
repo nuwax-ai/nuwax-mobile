@@ -27,7 +27,7 @@
 </template>
 
 <script lang="uts" setup>
-	import { ref, computed, onMounted, onUnmounted } from "vue";
+	import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 	import { MsgItem } from '@/types/interfaces/ai-msg';
 	import { formatTimeAgo } from '@/utils/common';
 	import { useI18n, emptyI18nParams } from '@/utils/i18n';
@@ -125,45 +125,27 @@
 		stopSpeechAnimation()
 	}
 
-	/** 工具栏播报中：工具栏 TTS WebSocket，或该消息的流式播报 */
+	/** 本条是否处于播报态（流式 id 精确匹配，或续接后最后一条兜底） */
 	const refreshSpeakingUi = (): void => {
 		const messageId = msg.value._id
 		const ttsState = ttsWebSocketPlayer.getState()
 		const ttsMessageId = ttsWebSocketPlayer.getMessageId()
 		const speakerId = voiceStreamSpeaker.getMessageId()
 		const speakerBusy = voiceStreamSpeaker.isBusy()
-		// SSE 结束后 handleQueryConversation 会把最后一条助手消息的临时 id 改写为服务端真实 id，
-		// 而 voiceStreamSpeaker / ttsWebSocketPlayer 仍暂存旧临时 id → getMessageId() != msg._id，
-		// 图标被误判为未播报（声仍在响）。此时若为最后一条消息且流式播报仍活跃，保持播报态。
-		// 仅 id 失配时兜底；id 匹配路径不受影响。
 		const lastMsgStreamFallback =
 			props.isLastMsg == true &&
 			speakerId.length > 0 &&
 			speakerId != messageId &&
 			speakerBusy == true
-		// error / idle / paused / 无 messageId：一律未播报
-		if (
-			ttsState == "error" ||
-			ttsState == "idle" ||
-			ttsState == "paused" ||
-			ttsMessageId.length == 0
-		) {
-			const streamSpeaking =
-				(speakerId == messageId || lastMsgStreamFallback) &&
-				speakerBusy
-			if (streamSpeaking != true) {
-				clearSpeakingUi()
-				return
-			}
-		}
+		const streamSpeaking =
+			(speakerId == messageId || lastMsgStreamFallback) && speakerBusy == true
 		const ttsSpeaking =
+			ttsMessageId.length > 0 &&
 			ttsMessageId == messageId &&
 			(ttsState == "connecting" ||
 				ttsState == "synthesizing" ||
 				ttsState == "playing")
-		const streamSpeaking =
-			(speakerId == messageId || lastMsgStreamFallback) && speakerBusy
-		const speaking = ttsSpeaking || streamSpeaking
+		const speaking = streamSpeaking || ttsSpeaking
 		isSpeaking.value = speaking
 		if (speaking) {
 			startSpeechAnimation()
@@ -175,17 +157,8 @@
 	onMounted(() => {
 		startTimer()
 		ttsListenerId = ttsWebSocketPlayer.subscribe(
-			(state: TtsPlaybackState, eventMessageId: string): void => {
-				// 失败/结束：按消息匹配后强制清 UI，不再走 refresh（避免又算回 true）
-				if (state == "error" || state == "idle") {
-					if (
-						eventMessageId.length == 0 ||
-						eventMessageId == msg.value._id
-					) {
-						clearSpeakingUi()
-						return
-					}
-				}
+			(_state: TtsPlaybackState, _eventMessageId: string): void => {
+				// 分句间隙也会 idle：用 isBusy 判定，避免误清；整轮结束靠 notifyUiIdle
 				refreshSpeakingUi()
 			},
 		)
@@ -196,6 +169,14 @@
 		)
 		refreshSpeakingUi()
 	})
+
+	// 续接后 msg._id 改写时重算
+	watch(
+		(): string => `${msg.value._id}|${props.isLastMsg == true ? "1" : "0"}`,
+		(): void => {
+			refreshSpeakingUi()
+		},
+	)
 
 	onUnmounted(() => {
 		stopTimer()
@@ -236,27 +217,31 @@
 		})
 	}
 
-	/** 当前消息是否正被流式播报占用 */
+	/** 当前消息是否正被流式播报占用（含续接后 id 改写兜底） */
 	const isStreamSpeakingThisMsg = (): boolean => {
 		const messageId = msg.value._id
-		return (
-			voiceStreamSpeaker.getMessageId() == messageId &&
-			voiceStreamSpeaker.isBusy()
-		)
+		const speakerId = voiceStreamSpeaker.getMessageId()
+		if (voiceStreamSpeaker.isBusy() != true) {
+			return false
+		}
+		if (speakerId == messageId) {
+			return true
+		}
+		return props.isLastMsg == true && speakerId.length > 0
 	}
 
 	/** 播报或停止当前 AI 消息。 */
 	const toggleSpeech = async (): Promise<void> => {
 		const messageId = msg.value._id
-		// 停止：工具栏 TTS 或本条流式续播
+		// 停止：本条工具栏 TTS 或本条流式续播（含 lastMsg id 改写）
 		if (isSpeaking.value) {
 			const ttsMatch = ttsWebSocketPlayer.getMessageId() == messageId
 			const streamMatch = isStreamSpeakingThisMsg()
 			if (ttsMatch || streamMatch) {
-				ttsWebSocketPlayer.stop()
 				voiceStreamSpeaker.stop()
+				ttsWebSocketPlayer.stop()
 				audioPlayerManager.stop()
-				refreshSpeakingUi()
+				clearSpeakingUi()
 				return
 			}
 		}

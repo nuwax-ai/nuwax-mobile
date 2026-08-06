@@ -36,20 +36,13 @@
           :class="{ 'hide-think-content': hideThinkContent }"
         >
           <view class="text-box">
-            <UniAiXMsgRender
-              v-if="renderThinkMarkdownElList.length > 0"
-              :markdown-el-list="renderThinkMarkdownElList"
-              :processing-list="renderProcessingList"
-              :conversation-id="msg.chat_id"
-              :body-text="resolveBodyText()"
-              :is-app-details="isAppDetails"
-              content-variant="think"
+            <rich-text
+              v-if="thinkContent.length > 0"
+              class="think-rich-text"
+              :selectable="true"
+              :nodes="thinkRichTextNodes"
+              mode="web"
             />
-            <text
-              v-else-if="thinkContent.length > 0"
-              class="think-plain-text"
-              selectable="true"
-            >{{ thinkContent }}</text>
           </view>
         </view>
       </view>
@@ -106,6 +99,7 @@
   import { TaskStatus } from "@/types/enums/agent";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { groupMarkdownContainers } from "@/utils/markdown.uts";
+  import { stripIncompleteCustomMarkupTail } from "@/utils/markdownCustomProcess.uts";
   import {
     stripMarkdownImages,
   } from "@/subpackages/components/ai-msg/markdownImage.uts";
@@ -115,7 +109,9 @@
   } from "@/subpackages/components/ai-msg/agentInfoTag.uts";
   import { onUnmounted } from "vue";
   // #ifdef APP
+  import { perfRecordSseUi } from "@/utils/perfProbe.uts";
   // #endif
+  import { toolCallProcessingListFingerprint } from "@/subpackages/utils/containerHelper.uts";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -262,7 +258,7 @@
 
   // 内部响应式副本；App 上必须 watch props.msg，否则历史消息 body 可能一直为空
   const msg = ref<MsgItem>(new MsgItem());
-  /** App 流式：强制触发 appPlainText 重算 */
+  /** App 流式：强制触发正文 markdown / UniAiXMsgRender 失效 */
   const streamRevision = ref<number>(0);
 
   function mergeMsgFromProps(incoming: MsgItem): void {
@@ -321,12 +317,16 @@
     return propText.length > 0 ? propText : msgBody;
   }
 
-  /** 工具标签规范化；agent-info 只剥离不展示；完整图片留在正文原位。 */
+  /** 工具标签规范化；未闭合自定义标签只剥真尾巴，完整图片留在原位。 */
   function resolveRenderableBodyText(): string {
     return stripOpenUiActionIdMarker(
       stripMarkdownImages(
         stripAdaptedAgentInfoHtml(
-          stripAgentInfoTags(groupMarkdownContainers(resolveBodyText())),
+          stripAgentInfoTags(
+            stripIncompleteCustomMarkupTail(
+              groupMarkdownContainers(resolveBodyText()),
+            ),
+          ),
         ),
       ),
     );
@@ -361,11 +361,6 @@
     return propThink.length > 0 ? propThink : msgThink;
   }
 
-  /** 思考内容与正文使用相同的工具标签分组预处理。 */
-  function resolveRenderableThinkText(): string {
-    return groupMarkdownContainers(resolveThinkText());
-  }
-
   const isLastMsg = computed((): boolean => props.isLastMsg == true);
   const isConversationActive = computed((): boolean => props.isConversationActive == true);
   const showToolBar = computed((): boolean => props.showToolBar == true);
@@ -379,13 +374,12 @@
 
   /**
    * 流式 Markdown 解析：
-   * - 纯文本：120ms 合并，接近真流式
-   * - 含公式/代码/表/图：每个 chunk 立刻 parse（L1 缓存避免公式重复截图）
+   * - 纯文本：120ms 合并
+   * - 含公式/代码/表/工具：自适应合并窗（正文越长间隔越大）
+   *   旧固定 80ms 对长 SSE 做全量 O(n) fallback → 累计 O(n²) 打满主线程后「卡顿停更」
    */
   const STREAM_MD_TEXT_INTERVAL_MS: number = 120;
-  // 结构化内容（公式/代码/表/图）合并窗：原每 chunk 立即 parse，复杂 markdown 时把整段正文
-  // O(n) 全量解析打到每 40ms 一次 → 卡死。改为 80ms 合并，解析次数立减一半以上。
-  const STREAM_MD_STRUCT_INTERVAL_MS: number = 80;
+  const STREAM_MD_STRUCT_INTERVAL_BASE_MS: number = 80;
   let streamMdParseTimer: number = 0;
   let streamMdParsePending: boolean = false;
 
@@ -405,8 +399,26 @@
       body.indexOf("$") >= 0 ||
       body.indexOf("|") >= 0 ||
       body.indexOf("![") >= 0 ||
-      body.indexOf("```") >= 0
+      body.indexOf("```") >= 0 ||
+      body.indexOf("mermaid") >= 0
     );
+  }
+
+  /**
+   * 结构化内容解析合并窗：随正文变长加大，压低全量 fallback 频率。
+   * 阈值：小于 2k→80ms；小于 8k→160ms；小于 20k→280ms；更长→400ms
+   */
+  function resolveStructParseIntervalMs(bodyLen: number): number {
+    if (bodyLen < 2000) {
+      return STREAM_MD_STRUCT_INTERVAL_BASE_MS;
+    }
+    if (bodyLen < 8000) {
+      return 160;
+    }
+    if (bodyLen < 20000) {
+      return 280;
+    }
+    return 400;
   }
 
   // 思考内容是否隐藏（默认隐藏）
@@ -423,10 +435,6 @@
     // #ifndef APP
     return true;
     // #endif
-  });
-
-  const thinkContent = computed((): string => {
-    return resolveThinkText();
   });
 
   /** componentExecutedList 经历史适配后保存为 processingList，由工具调用组件渲染。 */
@@ -487,8 +495,9 @@
     clearStreamMdParseTimer();
     // App：始终立即 parse。磁盘缓存命中可直接出图，不必再等 proxyWeb（历史长公式页可省约 1s）；
     // 未命中公式由 flushMathJobs 在 proxy 就绪后再截图，占位过渡即可。
+    // 注意：parser.applyAppFallback / bumpRevision 已会抬 streamRevision，此处勿再 bump，
+    // 避免一次 parse 触发 2～3 次整树失效。
     markdownParser.runMarkdownParse(forceDone);
-    streamRevision.value = streamRevision.value + 1;
   }
 
   /** 合并高频 chunk 后解析：intervalMs 合并窗内多次调用只解析一次 */
@@ -504,7 +513,6 @@
       }
       streamMdParsePending = false;
       markdownParser.runMarkdownParse(false);
-      streamRevision.value = streamRevision.value + 1;
     }, intervalMs);
   }
 
@@ -522,9 +530,8 @@
       return;
     }
     const body = resolveRenderableBodyText();
-    // 公式/代码/表/图：纳入 80ms 合并（原每 chunk 立即 parse 会 O(n) 全量解析卡死）
     if (bodyHasStructuralMarkup(body) == true) {
-      scheduleMergedParse(STREAM_MD_STRUCT_INTERVAL_MS);
+      scheduleMergedParse(resolveStructParseIntervalMs(body.length));
       return;
     }
     scheduleMergedParse(STREAM_MD_TEXT_INTERVAL_MS);
@@ -535,40 +542,151 @@
     return markdownParser.resolveRenderList();
   });
 
-  /** think 使用独立 MsgItem，避免解析结果覆盖正文 markdownElList。 */
-  const thinkMsg = ref<MsgItem>(new MsgItem());
+  /** 仅驱动思考区 rich-text，与正文 streamRevision 解耦，避免 THINK 流空刷答案树 */
   const thinkStreamRevision = ref<number>(0);
-  const thinkMarkdownParser = new AiMsgMarkdownParser(
-    thinkMsg,
-    thinkStreamRevision,
-    resolveRenderableThinkText,
-    (): boolean => isConversationActive.value,
-    (): boolean => isLastMsg.value,
-  );
-  const renderThinkMarkdownElList = computed((): UniAiMarkdownElItem[] => {
+
+  const thinkContent = computed((): string => {
+    // Android：MsgItem 字段变更不一定被深层追踪；think 用独立 revision，勿绑 streamRevision
     const _rev = thinkStreamRevision.value;
-    return thinkMarkdownParser.resolveRenderList();
+    return resolveThinkText();
+  });
+
+  /**
+   * 思考 rich-text 展示缓冲：流式时节流重绘整段 HTML（否则 2k+ 字每次 coalesce 全量转义会卡主线程）。
+   */
+  const THINK_RICH_THROTTLE_MS: number = 150;
+  const thinkDisplayForRich = ref<string>("");
+  let thinkRichPending: string = "";
+  let thinkRichThrottleTimer: number | null = null;
+
+  const flushThinkRichDisplay = (immediate: boolean) => {
+    if (thinkRichThrottleTimer != null) {
+      clearTimeout(thinkRichThrottleTimer!);
+      thinkRichThrottleTimer = null;
+    }
+    if (immediate == true) {
+      thinkDisplayForRich.value = thinkRichPending;
+      return;
+    }
+    thinkRichThrottleTimer = setTimeout(() => {
+      thinkRichThrottleTimer = null;
+      thinkDisplayForRich.value = thinkRichPending;
+    }, THINK_RICH_THROTTLE_MS) as number;
+  };
+
+  const scheduleThinkRichPaint = (raw: string) => {
+    thinkRichPending = raw;
+    // 非末条 / 非流式：立刻对齐，避免历史气泡滞后
+    if (
+      isConversationActive.value != true ||
+      isLastMsg.value != true
+    ) {
+      flushThinkRichDisplay(true);
+      return;
+    }
+    if (thinkRichThrottleTimer != null) {
+      return;
+    }
+    flushThinkRichDisplay(false);
+  };
+
+  watch(
+    (): string => thinkContent.value,
+    (v: string) => {
+      scheduleThinkRichPaint(v);
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): boolean => isConversationActive.value,
+    (active: boolean) => {
+      if (active != true) {
+        flushThinkRichDisplay(true);
+      }
+    },
+  );
+
+  /**
+   * 思考内容 → rich-text nodes。
+   * App/H5 的 rich-text 不继承宿主 class 的 font-size/color（会无效），
+   * 字号颜色必须写在 nodes HTML 的内联 style 里；换行已转 <br/>。
+   * 约等于 28rpx / #888 / lh 1.5（改字号请改此处，勿改 .think-rich-text）
+   */
+  const thinkRichTextNodes = computed((): string => {
+    const raw = thinkDisplayForRich.value;
+    if (raw.length == 0) {
+      return "";
+    }
+    const escaped = raw
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/\n/g, "<br/>");
+    return (
+      `<span style="font-size:12px;color:#888888;line-height:1.2;">` +
+      escaped +
+      `</span>`
+    );
   });
 
   const changeThinkContent = () => {
     hideThinkContent.value = !hideThinkContent.value;
-    if (
-      !hideThinkContent.value &&
-      thinkContent.value.length > 0 &&
-      thinkMsg.value.markdownElList.length == 0
-    ) {
-      thinkMsg.value.body = thinkContent.value;
-      thinkMarkdownParser.runMarkdownParse(true);
-    }
     emit("changeThinkContent", hideThinkContent.value);
   };
 
   const updateMessage = (newData: any) => {
     try {
       if (newData != null) {
+        const bodyBefore = resolveBodyText();
+        const thinkBefore = resolveThinkText();
+        const procBefore = toolCallProcessingListFingerprint(
+          msg.value.processingList != null
+            ? (msg.value.processingList as any[])
+            : ([] as any[]),
+        );
         applyMsgPatch(msg.value, newData);
-        streamRevision.value = streamRevision.value + 1;
-        scheduleBodyMarkdownParse();
+        const bodyAfter = resolveBodyText();
+        const thinkAfter = resolveThinkText();
+        const procAfter = toolCallProcessingListFingerprint(
+          msg.value.processingList != null
+            ? (msg.value.processingList as any[])
+            : ([] as any[]),
+        );
+        const bodyChanged = bodyBefore != bodyAfter;
+        const thinkChanged = thinkBefore != thinkAfter;
+        const procChanged = procBefore != procAfter;
+        // #ifdef APP
+        try {
+          if (bodyChanged == true || thinkChanged == true || procChanged == true) {
+            perfRecordSseUi(
+              bodyAfter.length,
+              `rev=${streamRevision.value} thinkRev=${thinkStreamRevision.value} think=${thinkAfter.length}`,
+            );
+          }
+        } catch (_eStall) {
+          // ignore
+        }
+        // #endif
+        // THINK 只抬 thinkStreamRevision，勿 bump streamRevision（否则连带正文 UniAiXMsgRender 整树失效）
+        if (thinkChanged == true) {
+          thinkStreamRevision.value = thinkStreamRevision.value + 1;
+          if (
+            thinkAfter.length > 0 &&
+            isConversationActive.value == true &&
+            isLastMsg.value == true &&
+            hideThinkContent.value == true
+          ) {
+            hideThinkContent.value = false;
+          }
+        }
+        if (bodyChanged == true || procChanged == true) {
+          streamRevision.value = streamRevision.value + 1;
+          if (bodyChanged == true) {
+            scheduleBodyMarkdownParse();
+          }
+        }
       }
     } catch (error) {
       console.error("updateMessage 执行失败:", error);
@@ -608,14 +726,23 @@
     { immediate: true },
   );
 
+  let lastProcessingListFp: string = "";
   watch(
     (): any[] => props.processingList != null
       ? props.processingList
       : [] as any[],
     (list: any[]) => {
+      const fp = toolCallProcessingListFingerprint(list);
       msg.value.processingList = list;
+      if (fp == lastProcessingListFp) {
+        return;
+      }
+      lastProcessingListFp = fp;
       streamRevision.value = streamRevision.value + 1;
-      // PROCESSING 状态变化也需驱动组件重绘（节流解析会带上容器节点）
+      // 历史消息：工具卡靠 processingList + revision 刷新即可，勿强制全量 markdown
+      if (isLastMsg.value != true) {
+        return;
+      }
       scheduleBodyMarkdownParse();
     },
     { immediate: true },
@@ -683,22 +810,12 @@
       `${hideThinkContent.value}`,
     () => {
       const v = resolveThinkText();
+      // 已由 updateMessage patch 过则勿再 bump，避免 THINK 每帧 double rich-text
+      if (msg.value.thinkContent == v) {
+        return;
+      }
       msg.value.thinkContent = v;
-      const thinkId = msg.value._id + "-think";
-      if (thinkMsg.value._id != thinkId) {
-        thinkMsg.value = new MsgItem();
-        thinkMsg.value._id = thinkId;
-        thinkMarkdownParser.resetForNewMessage();
-      }
-      // 收起时只同步文本，展开时再解析，避免历史消息首屏解析全部 think。
-      thinkMsg.value.body = v;
-      thinkMsg.value.markdownElList = [] as UniAiMarkdownElItem[];
-      if (!hideThinkContent.value && v.length > 0) {
-        if (isConversationActive.value == true && isLastMsg.value == true) {
-          return;
-        }
-        thinkMarkdownParser.runMarkdownParse(true);
-      }
+      thinkStreamRevision.value = thinkStreamRevision.value + 1;
     },
     { immediate: true },
   );
@@ -707,36 +824,45 @@
     (): string => msg.value._id,
     () => {
       markdownParser.resetForNewMessage();
-      thinkMsg.value = new MsgItem();
-      thinkMsg.value._id = msg.value._id + "-think";
-      thinkMsg.value.body = resolveThinkText();
-      thinkMarkdownParser.resetForNewMessage();
     },
   );
 
   /** 合并正文解析触发条件，避免多个 watch 对同一正文重复解析。 */
   watch(
     (): string =>
-      resolveBodyText() +
-      "|" +
-      `${isConversationActive.value}` +
-      "|" +
-      `${isLastMsg.value}` +
-      "|" +
-      `${msg.value.state}`,
+      resolveBodyText() + "|" + `${msg.value.state}` + "|" + `${isLastMsg.value}`,
     () => {
-      // 会话从进行中结束：立刻冲刷一次终态解析（含 PROCESSING 容器）
-      if (isConversationActive.value != true || isLastMsg.value != true) {
-        runBodyMarkdownParseNow(true);
+      if (isLastMsg.value == true && isConversationActive.value == true) {
+        scheduleBodyMarkdownParse();
         return;
       }
-      scheduleBodyMarkdownParse();
+      // 历史 / 非流式末条：定稿解析（runMarkdownParse 内部会跳过正文未变）
+      runBodyMarkdownParseNow(true);
     },
     { immediate: true },
   );
 
+  /** 仅末条关心会话 active：开始→节流解析；结束→立刻定稿。历史消息忽略 active 抖动。 */
+  watch(
+    (): boolean => isConversationActive.value,
+    (active: boolean) => {
+      if (isLastMsg.value != true) {
+        return;
+      }
+      if (active == true) {
+        scheduleBodyMarkdownParse();
+      } else {
+        runBodyMarkdownParseNow(true);
+      }
+    },
+  );
+
   onUnmounted(() => {
     clearStreamMdParseTimer();
+    if (thinkRichThrottleTimer != null) {
+      clearTimeout(thinkRichThrottleTimer!);
+      thinkRichThrottleTimer = null;
+    }
   });
 
   defineExpose({
@@ -822,34 +948,32 @@
     white-space: pre-wrap;
   }
 
-  // vapor: 原 `.think-container .think-content .text-box .text` 后代选择器在 vapor 被丢弃；
-  // .text 由外部 UniAiXMsgRender markdown 组件渲染（不在本文件模板可改范围），删除该嵌套
-  // 覆盖——与 vapor 现状一致。think 纯文本兜底走本文件模板内的 .think-plain-text。
+          /* rich-text 正文样式见 thinkRichTextNodes 内联 style；此处改 font-size 无效 */
+          .think-rich-text {
+            width: 100%;
+          }
+        }
+      }
+    }
 
-  // vapor: 原 &.hide-think-content hoist 为同层单类（与 .think-content 同特异性）
-  /* #ifndef APP */
-  .hide-think-content {
-    height: 0;
-    padding-top: 0;
-    opacity: 0;
-  }
-  /* #endif */
+    .answer-container {
+      /* 仅布局。App 禁止在 view 写 color/font-size/line-height。
+       * AI 答复正文样式在 UniAiXMsg 的 text 上（非用户气泡 .user-msg-text）：
+       * - uni-ai-text-md `.text` / `.uni-ai-text-md-paragraph-box-text`
+       * - uni-ai-x-msg `.msg-root-paragraph-text`
+       * 取值：color #404040、font-size 32rpx、line-height 48rpx(=1.5)
+       */
+      width: 100%;
+    }
 
-  .answer-container {
-    width: 100%;
-    /* 对齐 dev mp-html 正文色与基础字号（原 16px → 32rpx） */
-    color: #404040;
-    font-size: 32rpx;
-    line-height: 1.5;
-  }
-
-  .answer-fallback {
-    width: 100%;
-    font-size: 32rpx;
-    color: #404040;
-    line-height: 1.5;
-    white-space: pre-wrap;
-  }
+    .answer-fallback {
+      /* 若使用：须挂在 <text class="answer-fallback">，勿挂 view */
+      width: 100%;
+      font-size: 32rpx;
+      color: #404040;
+      line-height: 48rpx;
+      white-space: pre-wrap;
+    }
 
   .error-msg {
     color: #ff4d4f;

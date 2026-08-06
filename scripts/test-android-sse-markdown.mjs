@@ -283,47 +283,208 @@ function lastParagraphBoundaryBefore(text, limit) {
   return idx + 2;
 }
 
+function isWhitespaceChar(ch) {
+  return ch === " " || ch === "\n" || ch === "\r" || ch === "\t";
+}
+
+function isTerminalProcessOpenTag(openTag) {
+  return (
+    openTag.includes('status="FINISHED"') ||
+    openTag.includes('status="FAILED"') ||
+    openTag.includes("status='FINISHED'") ||
+    openTag.includes("status='FAILED'")
+  );
+}
+
+function scanProcessBlockEnd(slice, openIdx) {
+  const openMarker = "<markdown-custom-process";
+  if (slice.substring(openIdx, openIdx + openMarker.length) !== openMarker) {
+    return -1;
+  }
+  const afterName = openIdx + openMarker.length;
+  if (slice.substring(afterName, afterName + 6) === "-group") return -1;
+  const gt = slice.indexOf(">", afterName);
+  if (gt < 0) return -1;
+  let blockEnd = gt + 1;
+  if (slice.charAt(gt - 1) !== "/") {
+    const closeMarker = "</markdown-custom-process>";
+    const closeIdx = slice.indexOf(closeMarker, gt);
+    if (closeIdx < 0) return -1;
+    blockEnd = closeIdx + closeMarker.length;
+  }
+  return blockEnd;
+}
+
+function expandAfterProcessBlock(slice, blockEnd) {
+  let lastEnd = blockEnd;
+  let p = blockEnd;
+  while (p < slice.length && isWhitespaceChar(slice.charAt(p))) p++;
+  if (slice.substring(p, p + 6).toLowerCase() === "</div>") {
+    lastEnd = p + 6;
+  }
+  return lastEnd;
+}
+
 function endOfFinishedCustomBlocks(text, limit) {
   const sliceEnd = Math.min(limit, text.length);
   if (sliceEnd <= 0) return 0;
   const slice = text.substring(0, sliceEnd);
   const openMarker = "<markdown-custom-process";
-  const closeMarker = "</markdown-custom-process>";
+  const groupOpen = "<markdown-custom-process-group>";
+  const groupClose = "</markdown-custom-process-group>";
   let search = 0;
   let lastEnd = 0;
   while (search < slice.length) {
-    const idx = slice.indexOf(openMarker, search);
-    if (idx < 0) break;
-    const afterName = idx + openMarker.length;
+    const groupIdx = slice.indexOf(groupOpen, search);
+    const procIdx = slice.indexOf(openMarker, search);
+    if (groupIdx < 0 && procIdx < 0) break;
+    if (groupIdx >= 0 && (procIdx < 0 || groupIdx <= procIdx)) {
+      const innerStart = groupIdx + groupOpen.length;
+      const closeIdx = slice.indexOf(groupClose, innerStart);
+      if (closeIdx < 0) break;
+      const inner = slice.substring(innerStart, closeIdx);
+      let allTerminal = true;
+      let hasProcess = false;
+      let innerSearch = 0;
+      while (innerSearch < inner.length) {
+        const pIdx = inner.indexOf(openMarker, innerSearch);
+        if (pIdx < 0) break;
+        const after = pIdx + openMarker.length;
+        if (inner.substring(after, after + 6) === "-group") {
+          innerSearch = after + 6;
+          continue;
+        }
+        const gt = inner.indexOf(">", after);
+        if (gt < 0) {
+          allTerminal = false;
+          break;
+        }
+        hasProcess = true;
+        if (!isTerminalProcessOpenTag(inner.substring(pIdx, gt + 1))) {
+          allTerminal = false;
+          break;
+        }
+        const blockEndRel = scanProcessBlockEnd(inner, pIdx);
+        if (blockEndRel < 0) {
+          allTerminal = false;
+          break;
+        }
+        innerSearch = blockEndRel;
+      }
+      const groupEnd = closeIdx + groupClose.length;
+      if (hasProcess && allTerminal) {
+        lastEnd = expandAfterProcessBlock(slice, groupEnd);
+      }
+      search = groupEnd;
+      continue;
+    }
+    if (procIdx < 0) break;
+    const afterName = procIdx + openMarker.length;
     if (slice.substring(afterName, afterName + 6) === "-group") {
       search = afterName + 6;
       continue;
     }
     const gt = slice.indexOf(">", afterName);
     if (gt < 0) break;
-    const openTag = slice.substring(idx, gt + 1);
-    const terminal =
-      openTag.includes('status="FINISHED"') ||
-      openTag.includes('status="FAILED"') ||
-      openTag.includes("status='FINISHED'") ||
-      openTag.includes("status='FAILED'");
-    let blockEnd = gt + 1;
-    if (slice.charAt(gt - 1) !== "/") {
-      const closeIdx = slice.indexOf(closeMarker, gt);
-      if (closeIdx < 0) break;
-      blockEnd = closeIdx + closeMarker.length;
-    }
-    if (terminal) {
-      lastEnd = blockEnd;
-      let p = blockEnd;
-      while (p < slice.length && /\s/.test(slice.charAt(p))) p++;
-      if (slice.substring(p, p + 6).toLowerCase() === "</div>") {
-        lastEnd = p + 6;
-      }
+    const openTag = slice.substring(procIdx, gt + 1);
+    const blockEnd = scanProcessBlockEnd(slice, procIdx);
+    if (blockEnd < 0) break;
+    if (isTerminalProcessOpenTag(openTag)) {
+      lastEnd = expandAfterProcessBlock(slice, blockEnd);
     }
     search = blockEnd;
   }
   return lastEnd;
+}
+
+function collectToolBlockRanges(text) {
+  const ranges = [];
+  const openMarker = "<markdown-custom-process";
+  const groupOpen = "<markdown-custom-process-group>";
+  const groupClose = "</markdown-custom-process-group>";
+  const containerMarker = ":::container";
+  let search = 0;
+  while (search < text.length) {
+    const groupIdx = text.indexOf(groupOpen, search);
+    const procIdx = text.indexOf(openMarker, search);
+    const fenceIdx = text.indexOf(containerMarker, search);
+    let best = -1;
+    let kind = "";
+    if (groupIdx >= 0) {
+      best = groupIdx;
+      kind = "group";
+    }
+    if (procIdx >= 0 && (best < 0 || procIdx < best)) {
+      best = procIdx;
+      kind = "process";
+    }
+    if (fenceIdx >= 0 && (best < 0 || fenceIdx < best)) {
+      best = fenceIdx;
+      kind = "container";
+    }
+    if (best < 0) break;
+    if (kind === "group") {
+      const closeIdx = text.indexOf(groupClose, best + groupOpen.length);
+      if (closeIdx < 0) {
+        ranges.push({ start: best, end: text.length });
+        break;
+      }
+      ranges.push({ start: best, end: closeIdx + groupClose.length });
+      search = ranges[ranges.length - 1].end;
+      continue;
+    }
+    if (kind === "process") {
+      const afterName = best + openMarker.length;
+      if (text.substring(afterName, afterName + 6) === "-group") {
+        search = afterName + 6;
+        continue;
+      }
+      const blockEnd = scanProcessBlockEnd(text, best);
+      if (blockEnd < 0) {
+        ranges.push({ start: best, end: text.length });
+        break;
+      }
+      const expanded = expandAfterProcessBlock(text, blockEnd);
+      ranges.push({ start: best, end: expanded });
+      search = expanded;
+      continue;
+    }
+    const after = best + containerMarker.length;
+    if (after < text.length) {
+      const next = text.charAt(after);
+      if (next !== " " && next !== "\t" && next !== "\n" && next !== "\r") {
+        search = after;
+        continue;
+      }
+    }
+    const closeIdx = text.indexOf("\n:::", after);
+    if (closeIdx < 0) {
+      ranges.push({ start: best, end: text.length });
+      break;
+    }
+    ranges.push({ start: best, end: closeIdx + "\n:::".length });
+    search = ranges[ranges.length - 1].end;
+  }
+  return ranges;
+}
+
+function startOfTrailingToolCluster(text) {
+  const ranges = collectToolBlockRanges(text);
+  if (ranges.length === 0) return -1;
+  let lastContent = text.length - 1;
+  while (lastContent >= 0 && isWhitespaceChar(text.charAt(lastContent))) {
+    lastContent--;
+  }
+  if (lastContent < 0) return ranges[0].start;
+  const lastRange = ranges[ranges.length - 1];
+  if (lastContent < lastRange.start || lastContent >= lastRange.end) return -1;
+  let clusterStart = lastRange.start;
+  for (let i = ranges.length - 2; i >= 0; i--) {
+    const prev = ranges[i];
+    if (text.substring(prev.end, clusterStart).trim().length > 0) break;
+    clusterStart = prev.start;
+  }
+  return clusterStart;
 }
 
 function findStableMarkdownCut(markdown, streaming = true) {
@@ -340,7 +501,14 @@ function findStableMarkdownCut(markdown, streaming = true) {
   const structureLimit = incompleteAt >= 0 ? incompleteAt : markdown.length;
   const paraCut = lastParagraphBoundaryBefore(markdown, structureLimit);
   const toolCut = endOfFinishedCustomBlocks(markdown, structureLimit);
-  return Math.max(paraCut, toolCut);
+  let cut = Math.max(paraCut, toolCut);
+  const trailingTools = startOfTrailingToolCluster(markdown);
+  if (trailingTools >= 0 && cut > trailingTools) {
+    const beforeTools = lastParagraphBoundaryBefore(markdown, trailingTools);
+    cut = beforeTools <= trailingTools ? beforeTools : trailingTools;
+    if (cut > trailingTools) cut = trailingTools;
+  }
+  return cut;
 }
 
 /**
@@ -630,12 +798,18 @@ test("完整工具卡后切点越过工具区，末段留 live", () => {
   assert.ok(frozen.includes("你好！") || FULL.substring(cut).includes("你好！"));
 });
 
-test("仅 FINISHED 工具卡可冻全文；EXECUTING 不冻（防 status 改写）", () => {
+test("文末 FINISHED 工具簇不冻（可继续合组）；后接正文才冻；EXECUTING 不冻", () => {
   const finished = TOOL;
   assert.equal(
     findStableMarkdownCut(finished, true),
-    finished.length,
-    "FINISHED 单卡应冻满",
+    0,
+    "文末单卡应留 live，避免第二张拆开",
+  );
+  const withText = TOOL + "\n\n你好";
+  const cutWithText = findStableMarkdownCut(withText, true);
+  assert.ok(
+    cutWithText >= TOOL.length,
+    `后接正文应冻过工具卡 cut=${cutWithText}`,
   );
   const executing = TOOL.replace('status="FINISHED"', 'status="EXECUTING"');
   assert.equal(

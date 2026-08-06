@@ -32,7 +32,7 @@ export function controllableWhile(
 	
 	return {
 		start: () => {
-			// #ifdef APP-ANDROID
+			// #ifdef APP-ANDROID && !VUE3-VAPOR
 			UTSAndroid.getDispatcher('io').async((_) => {
 			// #endif
 				while (isActive && condition()) {
@@ -44,7 +44,7 @@ export function controllableWhile(
 						continue;
 					}
 				}
-			// #ifdef APP-ANDROID
+			// #ifdef APP-ANDROID && !VUE3-VAPOR
 			}, null);
 			// #endif
 		},

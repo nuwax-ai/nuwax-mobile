@@ -360,6 +360,165 @@ function lineHasMarkdownTablePipe(line: string): boolean {
 }
 
 /**
+ * LaTeX 命令名在字母后结束的判定（后接非字母即可）。
+ */
+function isLatexCommandNameEnd(ch: string): boolean {
+  if (ch.length == 0) {
+    return true;
+  }
+  const c = ch.charAt(0);
+  if (c >= "a" && c <= "z") {
+    return false;
+  }
+  if (c >= "A" && c <= "Z") {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 公式区内：把「换行 + 原 \n… 命令后缀」还原为 \n… 命令。
+ * JSON/JS 转义常把 \nabla 吃成换行 + "abla"，导致 $$ 被拆行无法渲染。
+ */
+function repairNewlinesInMathLatex(latex: string): string {
+  if (latex.indexOf("\n") < 0 && latex.indexOf("\r") < 0) {
+    return latex;
+  }
+  // \nabla / \neq / \nu … 被误解析后，换行后面剩下的后缀（最长优先）
+  const afterN = [
+    "ormalsize",
+    "subseteq",
+    "supseteq",
+    "parallel",
+    "approx",
+    "ewline",
+    "ewpage",
+    "abla",
+    "otin",
+    "cong",
+    "leq",
+    "geq",
+    "mid",
+    "sim",
+    "eq",
+    "eg",
+    "u",
+  ];
+  let out = "";
+  let i = 0;
+  while (i < latex.length) {
+    const ch = latex.charAt(i);
+    if (ch != "\n" && ch != "\r") {
+      out += ch;
+      i++;
+      continue;
+    }
+    // 消费 \r\n 或 \n / \r
+    if (ch == "\r" && i + 1 < latex.length && latex.charAt(i + 1) == "\n") {
+      i += 2;
+    } else {
+      i++;
+    }
+    let matched = "";
+    for (let s = 0; s < afterN.length; s++) {
+      const suf = afterN[s];
+      if (latex.substring(i, i + suf.length) != suf) {
+        continue;
+      }
+      const next =
+        i + suf.length < latex.length ? latex.charAt(i + suf.length) : "";
+      if (isLatexCommandNameEnd(next) == true) {
+        matched = suf;
+        break;
+      }
+    }
+    if (matched.length > 0) {
+      // "\\n" + "abla" => \nabla
+      out += "\\n" + matched;
+      i += matched.length;
+    } else {
+      out += "\n";
+    }
+  }
+  return out;
+}
+
+/**
+ * 仅在 $ / $$ / \( / \[ 公式定界内修复 \nabla 等转义误伤。
+ */
+function repairLatexEscapedNewlineCommands(markdown: string): string {
+  if (markdown.indexOf("\n") < 0 && markdown.indexOf("\r") < 0) {
+    return markdown;
+  }
+  let out = "";
+  let i = 0;
+  const n = markdown.length;
+  while (i < n) {
+    if (i + 1 < n && markdown.charAt(i) == "$" && markdown.charAt(i + 1) == "$") {
+      const end = markdown.indexOf("$$", i + 2);
+      if (end < 0) {
+        out += "$$" + repairNewlinesInMathLatex(markdown.substring(i + 2));
+        break;
+      }
+      out +=
+        "$$" +
+        repairNewlinesInMathLatex(markdown.substring(i + 2, end)) +
+        "$$";
+      i = end + 2;
+      continue;
+    }
+    if (
+      i + 1 < n &&
+      markdown.charAt(i) == "\\" &&
+      markdown.charAt(i + 1) == "["
+    ) {
+      const end = markdown.indexOf("\\]", i + 2);
+      if (end < 0) {
+        out += "\\[" + repairNewlinesInMathLatex(markdown.substring(i + 2));
+        break;
+      }
+      out +=
+        "\\[" +
+        repairNewlinesInMathLatex(markdown.substring(i + 2, end)) +
+        "\\]";
+      i = end + 2;
+      continue;
+    }
+    if (
+      i + 1 < n &&
+      markdown.charAt(i) == "\\" &&
+      markdown.charAt(i + 1) == "("
+    ) {
+      const end = markdown.indexOf("\\)", i + 2);
+      if (end < 0) {
+        out += "\\(" + repairNewlinesInMathLatex(markdown.substring(i + 2));
+        break;
+      }
+      out +=
+        "\\(" +
+        repairNewlinesInMathLatex(markdown.substring(i + 2, end)) +
+        "\\)";
+      i = end + 2;
+      continue;
+    }
+    if (markdown.charAt(i) == "$") {
+      const end = markdown.indexOf("$", i + 1);
+      if (end < 0) {
+        out += "$" + repairNewlinesInMathLatex(markdown.substring(i + 1));
+        break;
+      }
+      out +=
+        "$" + repairNewlinesInMathLatex(markdown.substring(i + 1, end)) + "$";
+      i = end + 1;
+      continue;
+    }
+    out += markdown.charAt(i);
+    i++;
+  }
+  return out;
+}
+
+/**
  * 将行内 $...$ / $$...$$ 拆成独立行（整行 $$latex$$），适配 katex-el 块级渲染。
  * 注意：若行内已有 $$，不能整行跳过，否则会连同前后正文一起留在段落里显示为裸 $$。
  * 真正的表格管道行跳过，避免拆散 | cell | $math$ |。
@@ -1869,7 +2028,9 @@ function parseAppMarkdownFallbackInner(
   }
 
   const result = [] as UniAiMarkdownElItem[];
-  const lines = normalizeInlineMath(markdown).split("\n");
+  const lines = normalizeInlineMath(
+    repairLatexEscapedNewlineCommands(markdown),
+  ).split("\n");
   let index = 0;
   let itemIndex = 0;
 
@@ -2071,6 +2232,58 @@ function parseAppMarkdownFallbackInner(
         continue;
       }
       // 闭合但内容为空
+      continue;
+    }
+
+    // $$latex... 开头但未在本行闭合：跨行收到闭合 $$（含 \nabla 被拆行的场景）
+    if (
+      trimmed.startsWith("$$") == true &&
+      isStandaloneMathLine(trimmed) != true
+    ) {
+      let latexBuf = trimmed.substring(2);
+      index++;
+      let closedSpan = false;
+      while (index < lines.length) {
+        const rawLine = lines[index];
+        const closeAt = rawLine.indexOf("$$");
+        if (closeAt >= 0) {
+          const before = rawLine.substring(0, closeAt);
+          if (latexBuf.length > 0 && before.length > 0) {
+            latexBuf += "\n";
+          }
+          latexBuf += before;
+          closedSpan = true;
+          index++;
+          break;
+        }
+        if (latexBuf.length > 0) {
+          latexBuf += "\n";
+        }
+        latexBuf += rawLine;
+        index++;
+      }
+      const spanLatex = latexBuf.trim();
+      if (closedSpan == true && spanLatex.length > 0) {
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: spanLatex,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(spanLatex, mathToken, onMathRendered, true);
+        continue;
+      }
+      if (closedSpan != true && spanLatex.length > 0) {
+        const pendingMath: MarkdownToken = {
+          type: "code_block",
+          text: spanLatex,
+          lang: "math",
+          codeTokens: [[makeTextToken(spanLatex, "text")]],
+          uniqueId: "fallback-math-pending-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[pendingMath]]));
+        continue;
+      }
       continue;
     }
 

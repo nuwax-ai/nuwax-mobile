@@ -858,6 +858,72 @@ def generate_uni_app_config() -> None:
     print(f"✓ 生成 {pkg}.UniAppConfig（vapor 运行时引导，替代 HX 不再生成的 kt）")
 
 
+VAPOR_RUNTIME_SRC = Path(
+    os.environ.get(
+        "HX_VAPOR_RUNTIME_DIR",
+        "/Applications/HBuilderX-Alpha.app/Contents/HBuilderX/plugins/"
+        "uniapp-runextension/libVapor",
+    )
+)
+VAPOR_RUNTIME_JARS = [
+    "app-runtime-release.jar",
+    "uniExtAPI-release.jar",
+    "ext-component-release.jar",
+    "uts-runtime-release.jar",
+]
+
+
+def inject_vapor_runtime_into_app() -> None:
+    """主 app 模块默认打包 SDK/libs 的 VDM 运行时(app-runtime/uts-runtime aar)，
+    运行时按 VDOM 找 IndexKt.main 等 Kotlin 脚手架 → vapor app 不加载(path-a)。
+    注入 vapor 运行时：拷 libVapor 4 jar 到 app/vapor-libs，从 app 的 SDK/libs 排除
+    旧 app-runtime/uts-runtime aar，加 implementation fileTree(vapor-libs)。
+    uniappx 保持 compileOnly SDK/libs（不进包，运行时用 app 打包的 vapor 类）。"""
+    if not VAPOR_RUNTIME_SRC.is_dir():
+        print(f"⚠ 跳过 vapor 运行时注入：找不到 {VAPOR_RUNTIME_SRC}")
+        return
+    dest = PROJ / "app" / "vapor-libs"
+    if dest.is_dir():
+        shutil.rmtree(dest)  # 清空上次残留 jar，避免聚合 jar(Duplicate) 混入
+    dest.mkdir(parents=True, exist_ok=True)
+    # 主 app 是 implementation（进包），uniExtAPI/ext-component 是聚合 jar，与 SDK/libs 的
+    # uni-push/uni-accelerometer 等单独 aar 类重叠会 Duplicate。故只换运行时核心两个 jar。
+    app_jars = ["app-runtime-release.jar", "uts-runtime-release.jar"]
+    copied = []
+    for jar in app_jars:
+        src = VAPOR_RUNTIME_SRC / jar
+        if src.is_file():
+            shutil.copy2(src, dest / jar)
+            copied.append(jar)
+    if not copied:
+        print(f"⚠ vapor 运行时注入：未从 {VAPOR_RUNTIME_SRC} 拷到任何 jar")
+        return
+    p = PROJ / "app" / "build.gradle"
+    text = p.read_text()
+    changed = False
+    # 1) 排除旧 VDM 运行时 aar（幂等）
+    if "**/app-runtime-release.aar" not in text:
+        text, n = re.subn(
+            r"(exclude:\s*\[)",
+            r"\1'**/app-runtime-release.aar', '**/uts-runtime-release.aar', ",
+            text,
+            count=1,
+        )
+        changed = changed or n > 0
+    # 2) 加 vapor-libs fileTree（implementation，进包；幂等）
+    if "vapor-libs" not in text:
+        text = text.replace(
+            "implementation project(':uniappx')",
+            "implementation project(':uniappx')\n"
+            "    implementation fileTree(include: ['*.jar'], dir: './vapor-libs')  // vapor 运行时(path-a)",
+            1,
+        )
+        changed = True
+    if changed:
+        p.write_text(text)
+        print(f"✓ app 注入 vapor 运行时({len(copied)} jar) + 排除 VDM app-runtime/uts-runtime aar")
+
+
 def generate_index_kt_stub() -> None:
     """vapor 运行时反射查找 uni.<appid去下划线>.IndexKt（index.kt 编译产物），
     找不到报 'Unable to load index Kotlin class'。先放最小存根让类存在，
@@ -892,6 +958,10 @@ def main() -> None:
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
     # canvas aar 已在 SDK/libs exclude 剥离；同步去 UTSRegisterComponents 注册项防反射加载缺失类
     strip_canvas_registration()
+    # path-a 已验证不可行：vapor 运行时(libVapor)只有 jar(纯类)，缺 Android 资源
+    # (style/UniAppX.Activity.DefaultTheme 等)；离线 SDK 的 aar(含资源)是 VDM 版。
+    # 换 jar 丢资源→manifest 链接失败。需 DCloud 提供"vapor 运行时 aar(含资源)"才能独立 APK。
+    # inject_vapor_runtime_into_app()
     configure_manifest()
     configure_app_name()
     generate_uni_app_config()

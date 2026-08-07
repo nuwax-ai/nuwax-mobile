@@ -527,7 +527,6 @@
   import docImage from "@/static/assets/doc_image.png";
   import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { getApiBaseUrl } from "@/constants/config";
-  import { EVENT_TYPE } from "@/subpackages/constants/event.constants";
 
   // ==================== API ====================
   import { apiAgentConversation } from "@/servers/conversation";
@@ -557,8 +556,6 @@
   import { chatService } from "@/utils/chatService";
   import { handleExternalLink } from "@/utils/system.uts";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system.uts";
-  import eventBus from "@/utils/eventBus";
-  import { throttle } from "@/subpackages/utils/functionUtils";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { getUniLoadMoreContentText, UniLoadMoreContentText } from "@/utils/i18n-third-party";
   import { hasUploadErrorInFiles } from "@/subpackages/components/chat-input-phone/chatInputActions.uts";
@@ -1843,48 +1840,6 @@
     }
   };
 
-  // ChatFinished 事件处理函数（带节流）
-  // 注意：须位于 handleSendMessage 等引用之前（UTS 无提升）
-  // 他端点停止也会推此事件：需掐断本端 SSE/sub，并复位播报图标
-  const handleChatFinishedInternal = (event: any) => {
-    const eventConvIdStr = `${(event as UTSJSONObject)["conversationId"]}`;
-    if (conversationId.value == parseInt(eventConvIdStr, 10)) {
-      throttle(() => {
-        // 仍在收 live/sub：他端停止或任务结束，强制收尾并停播报
-        const stillReceiving =
-          chatService.isCurrentlyStreaming == true ||
-          service.isSubConversationSubscribed == true;
-        if (stillReceiving == true) {
-          chatService.abort();
-          service.abortSubConversation();
-          stopAllStreamSpeech(true);
-          data.isConversationActive.value = false;
-        } else if (data.isConversationActive.value == true) {
-          // 流已断但会话态未清：只清态；若仍在播报则停（避免误伤「正常结束后的尾句播报」）
-          data.isConversationActive.value = false;
-          if (voiceStreamSpeaker.isBusy() == true) {
-            stopAllStreamSpeech(true);
-          }
-        }
-
-        const convId = conversationId.value;
-        const isNotTemp = props.isTempChat == false;
-        if (convId != null) {
-          if (convId != 0) {
-            if (isNotTemp == true) {
-              apiAgentConversation(convId as number).then((res) => {
-                // Android：res 是 UTSJSONObject，禁止 res.code（点号读不到）
-                if (apiResCode(res) == SUCCESS_CODE) {
-                  handleQueryConversation(res);
-                }
-              });
-            }
-          }
-        }
-      }, 500)();
-    }
-  };
-
   // 发送消息
   const handleSendMessage = (_data: any) => {
     // 停上一轮播报，但保持本轮可播（勿 hardStop，否则 streamSpeakFeed 会被吞掉）
@@ -1895,9 +1850,6 @@
 
     // 与 dev 一致：一点击发送就清空问题建议，避免会话进行中仍展示
     data.chatSuggestList.value = [] as any[];
-
-    // 先卸旧监听，发送后再挂上，以便本轮他端停止能收到 ChatFinished
-    eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
 
     data.autoToLastMsg.value = true;
     data.needSetLockAutoToLastMsg.value = true;
@@ -2051,8 +2003,6 @@
     if (newSpeakId.length > 0) {
       ensureHeadlessStreamSpeak(newSpeakId, "");
     }
-    // 本轮会话进行中监听结束/他端停止（与进页 EXECUTING 续接时的订阅一致）
-    eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
   };
   sendInterventionResumeMessage = handleSendMessage;
 
@@ -2108,9 +2058,6 @@
     // 重置按钮状态（按钮变为发送按钮）
     data.isConversationActive.value = false;
     data.isStoppingConversation.value = false;
-
-    // 取消订阅 ChatFinished 事件（防止旧会话的事件影响新会话）
-    eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
 
     // 清空本地缓存中的临时会话uid
     uni.removeStorageSync(TEMP_CONVERSATION_UID);
@@ -2494,6 +2441,38 @@
     return false;
   }
 
+  /**
+   * 他端已结束 / 暂停任务（本地流式/sub 期间轮询检测到终态）：
+   * 强制收尾 + 停播报（原 handleChatFinishedInternal 的收尾逻辑迁移至此）。
+   * - live/sub 仍在跑：掐断流、硬停播报、清会话态
+   * - 仅残留 active 态：只清态，仍在播报则停（避免误伤正常结束后的尾句播报）
+   */
+  function handleRemoteTaskFinished(finishedCid: number): void {
+    const convId = conversationId.value;
+    if (convId == null || convId != finishedCid) {
+      return;
+    }
+    const stillReceiving =
+      chatService.isCurrentlyStreaming == true ||
+      service.isSubConversationSubscribed == true;
+    if (stillReceiving != true && data.isConversationActive.value != true) {
+      // 已收尾，忽略重复轮询触发
+      return;
+    }
+    if (stillReceiving == true) {
+      chatService.abort();
+      service.abortSubConversation();
+      stopAllStreamSpeech(true);
+      data.isConversationActive.value = false;
+    } else if (data.isConversationActive.value == true) {
+      // 流已断但会话态未清：只清态；若仍在播报则停（避免误伤「正常结束后的尾句播报」）
+      data.isConversationActive.value = false;
+      if (voiceStreamSpeaker.isBusy() == true) {
+        stopAllStreamSpeech(true);
+      }
+    }
+  }
+
   function startResumePolling(): void {
     const cid = data.conversationId.value;
     if (cid == null || cid == 0) {
@@ -2511,11 +2490,14 @@
         });
       },
       (): boolean => {
-        // 轮询门禁：仅会话进行中跳过；语音播报不挡轮询
+        // 轮询门禁：本地忙（live 流式 / sub 已订阅）时进静默终态轮询；语音播报不挡轮询
         return isLocalConversationBusy();
       },
       (): boolean => {
         return service.isSubConversationSubscribed;
+      },
+      (finishedCid: number) => {
+        handleRemoteTaskFinished(finishedCid);
       },
     );
   }
@@ -2824,8 +2806,6 @@
               }
               // 兜底轮询：abortSub 不触发 onSubClose，需提前启动
               startResumePolling();
-              // 订阅 ChatFinished 事件
-              eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
             } else {
               // 非执行中：启动轮询，检测会话变为 EXECUTING
               startResumePolling();
@@ -3341,7 +3321,6 @@
     uni.$off("message-event-delegate");
     // #endif
     isRenderInputPhone.value = false;
-    eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedInternal);
   });
 
   const handleOpenFileTree = () => {

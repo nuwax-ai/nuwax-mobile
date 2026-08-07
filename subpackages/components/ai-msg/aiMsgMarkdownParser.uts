@@ -18,6 +18,13 @@ import {
 } from "@/utils/markdownStableCut.uts";
 import { perfRecordParseDetail, sseStallLog } from "@/utils/perfProbe.uts";
 
+/**
+ * 消融开关：增量分段解析（applyAppFallbackIncremental）。
+ * 默认 true（开）。Phase 3 消融实验时改 false 对比「全量解析」基线，测完还原。
+ * 见 docs/perf-conversation-stream-render.md Phase 3。
+ */
+const INCREMENTAL_FALLBACK_ENABLED: boolean = true;
+
 /** 给 fallback el 的 uniqueId 加前缀，避免 stable/live 碰撞。 */
 function prefixMarkdownElIds(
   list: UniAiMarkdownElItem[],
@@ -28,6 +35,52 @@ function prefixMarkdownElIds(
     const base = id != null && `${id}`.length > 0 ? `${id}` : `i${i}`;
     list[i].uniqueId = prefix + base;
   }
+}
+
+/** 子串计数（indexOf 累加，空 sub 返回 0）。 */
+function countSubstringOf(s: string, sub: string): number {
+  if (sub.length == 0) {
+    return 0;
+  }
+  let count = 0;
+  let from = 0;
+  while (true) {
+    const idx = s.indexOf(sub, from);
+    if (idx < 0) {
+      break;
+    }
+    count = count + 1;
+    from = idx + sub.length;
+  }
+  return count;
+}
+
+/**
+ * 流式 live 段收尾归一化：合成关闭未配对的结构标记（``` 代码围栏 /
+ * <markdown-custom-process-group> / 块级 $$）+ 末尾空行。
+ * 让 parseAppMarkdownFallback 对"半截块"也能产出可见元素——否则 live 段是未闭合结构块时
+ * 解析器整段丢弃，渲染元素数 el 不涨（el_stuck 卡顿根因）、新内容类型流式期不渲染。
+ * live 元素每帧重解析并替换；真闭合后跨 stable cut 冻结为正式态，故合成关闭只影响临时预览。
+ */
+function normalizeLiveForParse(live: string): string {
+  if (live.length == 0) {
+    return live;
+  }
+  let out = live;
+  // 注意：不合成关闭 ``` 代码围栏 / $$ 块级公式——这两类走 proxy-web 截图渲染，
+  // 在 live 区提前闭合会每帧重渲（mermaid/公式来回抖动、重复截图）。
+  // 让它们保持未闭合 → live 区不渲染 → 等闭合后跨 stable cut 冻结时渲一次（稳定）。
+  // 仅闭合未配对 <markdown-custom-process-group>（工具卡是 DOM 组件、重渲廉价，可提前出）
+  const gOpen = countSubstringOf(out, "<markdown-custom-process-group");
+  const gClose = countSubstringOf(out, "</markdown-custom-process-group>");
+  let gi = gClose;
+  while (gi < gOpen) {
+    out = out + "</markdown-custom-process-group>";
+    gi = gi + 1;
+  }
+  // 末尾空行：强制段落 / 表格收尾（表格需空行终止才出元素）
+  out = out + "\n\n";
+  return out;
 }
 
 /** 解析 html token 中的 markdown-custom-process 标签（引号感知，允许 name 含 >）。 */
@@ -474,7 +527,7 @@ export class AiMsgMarkdownParser {
       this.getIsLastMsg() == true;
 
     // #ifdef APP
-    if (streaming == true) {
+    if (streaming == true && INCREMENTAL_FALLBACK_ENABLED) {
       this.applyAppFallbackIncremental(body);
       return;
     }
@@ -540,14 +593,15 @@ export class AiMsgMarkdownParser {
       return;
     }
 
-    const cut = findStableMarkdownCut(body, true);
-    // 切点回退到已冻结前缀之内（异常）→ 全量，避免结构错乱
+    let cut = findStableMarkdownCut(body, true);
+    // 切点回退（findStableMarkdownCut 对结构块非单调，mixed/工具卡/mermaid 下偶发）：
+    // 不退全量（重负载下 full_parse_large 灾难性卡顿），改为钳制到已冻结前缀末尾——
+    // append-only 流式下已冻结前缀仍有效，保留 frozen 元素、只重解析 live 尾。
     if (
       this.fallbackStablePrefix.length > 0 &&
       cut < this.fallbackStablePrefix.length
     ) {
-      this.applyAppFallbackFull(body);
-      return;
+      cut = this.fallbackStablePrefix.length;
     }
 
     const onMathNotify = (): void => {
@@ -581,9 +635,13 @@ export class AiMsgMarkdownParser {
       stablePrefix = body.substring(0, cut);
     }
 
-    // 官方「整体冻结到闭合」：live 区出现未闭合块级公式（$$ / \[，代码围栏内忽略）时，
-    // 只渲染其前内容，公式及之后内容一律不上屏；等闭合后下一轮增量解析再连同后续内容一并上屏。
-    // 对齐官方 runTask：检测到公式开头但未闭合即 return 冻结，闭合后才继续解析。
+    // live 区每次重解析（通常很短）。两路保护（合并 perf-vdom 的 el_stuck 修复与官方公式冻结语义）：
+    // 1) findUnclosedBlockFormulaStart：live 出现未闭合块级公式（$$ / \[，代码围栏内忽略）时，
+    //    只取其前内容 liveToParse 上屏，公式及之后等闭合后下一轮增量解析再连同后续一并上屏
+    //    （对齐官方 runTask「整体冻结到闭合」）。
+    // 2) normalizeLiveForParse：给 liveToParse 合成关闭未配对的 <markdown-custom-process-group>
+    //    + 末尾空行，否则半截工具卡结构块被解析器整段丢弃 → el 不涨（el_stuck 卡顿根因）。
+    // KaTeX 在 live 区即派发（defer=false），重复截图由下方 WAIT 截断 + scheduleMathFlush 防抖控制。
     const live = body.substring(stablePrefix.length);
     const unclosedMathAt = findUnclosedBlockFormulaStart(live);
     const liveToParse =
@@ -591,7 +649,7 @@ export class AiMsgMarkdownParser {
     const liveEls = [] as UniAiMarkdownElItem[];
     if (liveToParse.length > 0) {
       const parsedLive = expandMarkdownImageItems(
-        parseAppMarkdownFallback(liveToParse, onMathNotify, false),
+        parseAppMarkdownFallback(normalizeLiveForParse(liveToParse), onMathNotify, false),
       );
       prefixMarkdownElIds(parsedLive, "live-");
       for (let k = 0; k < parsedLive.length; k++) {

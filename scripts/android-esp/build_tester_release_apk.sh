@@ -36,16 +36,17 @@ SKIP_DELIVER_COPY="${SKIP_DELIVER_COPY:-0}"
 STAMP="$(date +%Y%m%d-%H%M)"
 DELIVER_NAME="${DELIVER_NAME:-nuwa-zhuoda-release-${STAMP}.apk}"
 
-# 发测试固定：关 HX 调试通道 + Gradle Release 变体
-export ENABLE_HX_DEBUG=0
-export ANDROID_BUILD_TYPE=release
-export ANDROID_SIGNING_MODE=release
+# 默认发测试：关 HX 调试通道 + Release 变体；可用环境变量覆盖出 debug 可调试包（带 LeakCanary）
+#   ANDROID_BUILD_TYPE=debug ANDROID_SIGNING_MODE=debug make android-tester
+export ENABLE_HX_DEBUG="${ENABLE_HX_DEBUG:-0}"
+export ANDROID_BUILD_TYPE="${ANDROID_BUILD_TYPE:-release}"
+export ANDROID_SIGNING_MODE="${ANDROID_SIGNING_MODE:-release}"
 export SKIP_INSTALL=1
 # 不强制覆盖 ANDROID_HOME：无效路径会导致误报；由 ensure_env / package_custom_base 自动探测
 # （本机常见：~/Library/Android/sdk 或 ~/workspace/Android/sdk）
 
 OUT_DIR="$ROOT_DIR/unpackage/debug"
-RELEASE_APK="$OUT_DIR/android_release.apk"
+RELEASE_APK="$OUT_DIR/android_${ANDROID_BUILD_TYPE}.apk"
 DELIVER_APK="$OUT_DIR/$DELIVER_NAME"
 
 step() {
@@ -108,7 +109,8 @@ else
   bash "$SCRIPT_DIR/../hx-cli.sh" publish app \
     --platform APP \
     --type appResource \
-    --project "$ROOT_DIR"
+    --project "$ROOT_DIR" \
+    ${CLEAN_CACHE:+--cleanCache true}
   [[ -d "$ROOT_DIR/unpackage/resources/app-android" ]] \
     || fail "appResource 完成后仍无 unpackage/resources/app-android"
   echo "✓ 资源已导出"

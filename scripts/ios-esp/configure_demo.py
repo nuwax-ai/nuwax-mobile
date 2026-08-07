@@ -35,7 +35,7 @@ def patch_info_plist(path: str, appid: str, appkey: str | None, ipatype: int) ->
         uni = {}
         data["uniapp-x"] = uni
     uni["appid"] = appid
-    uni["uniRuntimeVersion"] = uni.get("uniRuntimeVersion") or "5.15"
+    uni["uniRuntimeVersion"] = uni.get("uniRuntimeVersion") or "5.23"
     # 官方文档：1=自定义基座(HX 调试) 2=正式包
     # https://doc.dcloud.net.cn/uni-app-x/native/use/ios.html
     uni["ipatype"] = ipatype

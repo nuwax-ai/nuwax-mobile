@@ -46,7 +46,24 @@ if [[ ! -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
   fi
 fi
 export ANDROID_ESP_WORK="${ANDROID_ESP_WORK:-$NUWAX_LOCAL_BASE_ROOT/android}"
-export ANDROID_ESP_PROJECT="${ANDROID_ESP_PROJECT:-$ANDROID_ESP_WORK/project}"
+# 按版本选 work 工程，避免两线（vdom 5.15 / vapor 5.23）共享符号链接互相污染。
+# 默认 NUWAX_HX_VERSION=5.15（vdom 线）；vapor 线在其本机环境设 NUWAX_HX_VERSION=5.23。
+# glob 匹配 build 号（14915/14987…），匹配不到则回退旧的 project 符号链接。
+if [[ -z "${ANDROID_ESP_PROJECT:-}" ]]; then
+  _NUWAX_PROJ_MATCH=""
+  for _d in "$NUWAX_LOCAL_BASE_ROOT"/android/Android-uni-app-x-SDK@*-"${NUWAX_HX_VERSION}"; do
+    if [[ -d "$_d/uniappxnativepackage" ]]; then
+      _NUWAX_PROJ_MATCH="$_d/uniappxnativepackage"
+      break
+    fi
+  done
+  if [[ -n "$_NUWAX_PROJ_MATCH" ]]; then
+    export ANDROID_ESP_PROJECT="$_NUWAX_PROJ_MATCH"
+  else
+    export ANDROID_ESP_PROJECT="$ANDROID_ESP_WORK/project"
+  fi
+  unset _d _NUWAX_PROJ_MATCH
+fi
 export ANDROID_BUNDLE_ID="${ANDROID_BUNDLE_ID:-$NUWAX_BUNDLE_ID}"
 export APPID="${APPID:-$NUWAX_APPID}"
 export ANDROID_COMPILE_SDK="${ANDROID_COMPILE_SDK:-36}"

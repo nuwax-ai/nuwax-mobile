@@ -858,6 +858,130 @@ test("增量累计成本显著低于全量 O(n²)", () => {
   assert.ok(sim.stableLen > 0, "应冻结出稳定前缀");
 });
 
+console.log("\n[6] 裸 URL 中文边界");
+
+const CJK_URL_PUNCTUATION = "，。！？；：、（）［］【】《》〈〉“”‘’「」『』";
+
+function isCjkTextCharacter(char) {
+  const code = char.charCodeAt(0);
+  return (
+    (code >= 0x3400 && code <= 0x4dbf) ||
+    (code >= 0x4e00 && code <= 0x9fff) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0x3040 && code <= 0x30ff) ||
+    (code >= 0xac00 && code <= 0xd7af)
+  );
+}
+
+function hasCompleteAsciiUrlPrefix(prefix) {
+  const schemeLength = prefix.startsWith("https://")
+    ? 8
+    : prefix.startsWith("http://")
+      ? 7
+      : 0;
+  if (schemeLength == 0) return false;
+  const remainder = prefix.substring(schemeLength);
+  if (remainder.length == 0) return false;
+  if (
+    remainder.includes("/") ||
+    remainder.includes("?") ||
+    remainder.includes("#")
+  ) {
+    return true;
+  }
+  return (
+    remainder == "localhost" ||
+    /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::[0-9]+)?$/.test(remainder)
+  );
+}
+
+function findCjkAutolinkBoundary(url) {
+  for (let i = 0; i < url.length; i++) {
+    const char = url.charAt(i);
+    if (CJK_URL_PUNCTUATION.includes(char)) return i;
+    if (
+      isCjkTextCharacter(char) &&
+      hasCompleteAsciiUrlPrefix(url.substring(0, i))
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function normalizeCjkAutolinkRow(row) {
+  const normalized = [];
+  for (const token of row) {
+    const href = token.href ?? "";
+    const text = token.text ?? "";
+    const boundary = href == text ? findCjkAutolinkBoundary(href) : -1;
+    if (boundary > 0) {
+      normalized.push({
+        ...token,
+        href: href.substring(0, boundary),
+        text: text.substring(0, boundary),
+      });
+      normalized.push({
+        type: "text",
+        href: "",
+        text: text.substring(boundary),
+        className: "text",
+      });
+    } else {
+      normalized.push(token);
+    }
+  }
+  return normalized;
+}
+
+test("中文句号及后续正文不进入 URL", () => {
+  const value = "https://www.baidu.com。需要我做什么操作？";
+  const boundary = findCjkAutolinkBoundary(value);
+  assert.equal(value.substring(0, boundary), "https://www.baidu.com");
+  assert.equal(value.substring(boundary), "。需要我做什么操作？");
+});
+
+test("无标点的后续中文也不进入 URL", () => {
+  const value = "https://example.com需要继续吗";
+  const boundary = findCjkAutolinkBoundary(value);
+  assert.equal(value.substring(0, boundary), "https://example.com");
+});
+
+test("ASCII 路径、查询参数和锚点保持完整", () => {
+  assert.equal(
+    findCjkAutolinkBoundary("https://example.com/a/b?q=hello#result"),
+    -1,
+  );
+});
+
+test("国际化域名不会被截成协议前缀", () => {
+  assert.equal(findCjkAutolinkBoundary("https://百度.com"), -1);
+  const value = "https://百度.com。继续";
+  const boundary = findCjkAutolinkBoundary(value);
+  assert.equal(value.substring(0, boundary), "https://百度.com");
+});
+
+test("cmark 裸 URL token 拆为可点击地址和普通中文正文", () => {
+  const value = "https://www.baidu.com。需要我做什么操作？";
+  const normalized = normalizeCjkAutolinkRow([
+    { type: "text", text: value, href: value, className: "text link" },
+  ]);
+  assert.deepEqual(normalized, [
+    {
+      type: "text",
+      text: "https://www.baidu.com",
+      href: "https://www.baidu.com",
+      className: "text link",
+    },
+    {
+      type: "text",
+      text: "。需要我做什么操作？",
+      href: "",
+      className: "text",
+    },
+  ]);
+});
+
 // ─── 汇总 ──────────────────────────────────────────────────────────────────
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

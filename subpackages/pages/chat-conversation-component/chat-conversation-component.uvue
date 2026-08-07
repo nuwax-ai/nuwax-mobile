@@ -92,6 +92,10 @@
     </template>
     <template v-else>
       <view class="chat-container">
+        <!-- 性能测试浮层：avgFps / maxGap（仅 perfTest 模式） -->
+        <view v-if="isPerfMock" class="perf-overlay">
+          <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
+        </view>
         <!-- 聊天内容 -->
         <view class="scroll-view-box">
           <scroll-view
@@ -454,6 +458,7 @@
   import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
   import ScrollManager from "./layers/ScrollManager.uts";
   import AgentDetailUtils from "./layers/AgentDetailUtils.uts";
+  import { isStreamPerfMockEnabled } from "./layers/mockStreamPerf.uts";
   import { ttsWebSocketPlayer } from "@/subpackages/utils/voice/ttsWebSocketPlayer";
   import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
   import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
@@ -2375,8 +2380,20 @@
     handleScrollToLastMsg(true);
   };
 
-  // 最后一条消息内容变化（非流式：状态更新 / 历史落库等）；流式期跳过
-  watch(lastMessage, handleScrollToLastMsgFromListWatch, { deep: true });
+  // 最后一条消息的 id/status/正文长度变化（非流式：状态更新 / 历史落库 / 新消息替换；
+  // 流式期正文增长也由此触发，但 handleScrollToLastMsg 内有流式期守卫）。
+  // 改标量签名 watch，避免每 flush 对末条消息对象（含大 markdownElList）做 deep 遍历。
+  watch(
+    (): string => {
+      const m = lastMessage.value;
+      if (m == null) {
+        return "||";
+      }
+      const t = m.text != null ? m.text.length : 0;
+      return `${m.id}|${m.status ?? ""}|${t}`;
+    },
+    handleScrollToLastMsgFromListWatch,
+  );
 
   // 仅监听条数变化，避免对整表 deep watch 遍历嵌套字段
   watch(
@@ -2751,6 +2768,71 @@
     });
   };
 
+  // ==================== 性能测试帧探针（perfTest 模式：avgFps / maxGap 浮层 + logcat）====================
+  // setInterval(16ms) 记主线程 tick 间隔；解析/渲染阻塞时 delta 暴涨 → 量化「卡死/掉帧」体感。
+  // 仅 isStreamPerfMockEnabled 时启动；浮层每 500ms 刷新一次，避免探针自身污染测量。
+  const isPerfMock = ref<boolean>(false);
+  const perfFpsText = ref<string>("--");
+  const perfGapText = ref<string>("--");
+  let perfLastFrameAt: number = 0;
+  let perfFrameDeltas: number[] = [] as number[];
+  let perfDisplayAccum: number = 0;
+  let perfProbeRunning: boolean = false;
+  const PERF_FRAME_WINDOW: number = 120;
+  const PERF_DISPLAY_FLUSH_MS: number = 500;
+
+  // UTS：function 自引用 / setInterval 内联箭头均有编译坑，探针改 async + while(flag) 自调度。
+  async function perfFrameTickLoop(): Promise<void> {
+    perfLastFrameAt = Date.now();
+    while (perfProbeRunning) {
+      const now = Date.now();
+      const delta = now - perfLastFrameAt;
+      perfLastFrameAt = now;
+      perfFrameDeltas.push(delta);
+      if (perfFrameDeltas.length > PERF_FRAME_WINDOW) {
+        perfFrameDeltas.splice(0, perfFrameDeltas.length - PERF_FRAME_WINDOW);
+      }
+      perfDisplayAccum += delta;
+      if (perfDisplayAccum >= PERF_DISPLAY_FLUSH_MS) {
+        perfDisplayAccum = 0;
+        let sum = 0;
+        let mx = 0;
+        for (let i = 0; i < perfFrameDeltas.length; i++) {
+          const d = perfFrameDeltas[i];
+          sum += d;
+          if (d > mx) {
+            mx = d;
+          }
+        }
+        const cnt = perfFrameDeltas.length;
+        const avg = cnt > 0 ? sum / cnt : 0;
+        const fps = avg > 0 ? 1000 / avg : 0;
+        perfFpsText.value = `${fps.toFixed(0)}`;
+        perfGapText.value = `${mx}`;
+        console.log(`[PerfProbe] fps=${fps.toFixed(0)} maxGap=${mx}ms avgDelta=${avg.toFixed(0)}ms samples=${cnt}`);
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout((): void => resolve(), 16);
+      });
+    }
+  }
+
+  function startPerfFrameProbe(): void {
+    if (perfProbeRunning) {
+      return;
+    }
+    perfFrameDeltas = [] as number[];
+    perfDisplayAccum = 0;
+    perfFpsText.value = "--";
+    perfGapText.value = "--";
+    perfProbeRunning = true;
+    perfFrameTickLoop();
+  }
+
+  function stopPerfFrameProbe(): void {
+    perfProbeRunning = false;
+  }
+
   // 聊天页可见时暂停全局 batch 事件轮询；离开聊天页（含跳转文件预览等）后恢复
   // 四端统一用页面 onShow/onHide（与上方 H5 pageResume 分流无关）
   onShow((): void => {
@@ -2774,6 +2856,7 @@
 
   onUnload((): void => {
     resumeEventPollingAfterChat();
+    stopPerfFrameProbe();
   });
 
   /**
@@ -3198,6 +3281,17 @@
     });
     // #endif
 
+    // ===== 性能测试 Mock：seed 预置历史 + 跳过真实会话拉取（纯 Mock，无网络依赖）=====
+    // isStreamPerfMockEnabled 由 pages/test-stream-perf 启动页写 storage 打开。
+    if (isStreamPerfMockEnabled()) {
+      isPerfMock.value = true;
+      service.seedMockHistoryIfNeeded();
+      startPerfFrameProbe();
+      // 自动发起 Mock 流式（无需手动发送；启动页点「开始测试」即流式）
+      service.runMockPerfStream();
+      return;
+    }
+
     // 判断是否是临时会话
     if (props.isTempChat) {
       await handleTempChatPageLoad(options);
@@ -3423,6 +3517,21 @@
 
 <style lang="scss" scoped>
   @import "./styles/index.scss";
+
+  .perf-overlay {
+    position: fixed;
+    top: 88px;
+    right: 12px;
+    z-index: 9999;
+    padding: 6px 10px;
+    background-color: rgba(0, 0, 0, 0.66);
+    border-radius: 6px;
+  }
+  .perf-overlay-text {
+    color: #00e676;
+    font-size: 22rpx;
+    font-weight: 600;
+  }
 
   .captcha-button {
     position: absolute;

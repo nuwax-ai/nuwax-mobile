@@ -7,10 +7,15 @@ import { MsgItem } from "@/types/interfaces/ai-msg";
 import {
   parseAppMarkdownFallback,
   takeLastMathFlushCount,
+  isMathConcluded,
 } from "@/subpackages/components/ai-msg/appMarkdownFallback.uts";
 import { expandMarkdownImageItems } from "@/subpackages/components/ai-msg/markdownImage.uts";
+import { normalizeCjkAutolinks } from "@/subpackages/components/ai-msg/markdownAutolink.uts";
 import { listMarkdownCustomProcessTags } from "@/utils/markdownCustomProcess.uts";
-import { findStableMarkdownCut } from "@/utils/markdownStableCut.uts";
+import {
+  findStableMarkdownCut,
+  findUnclosedBlockFormulaStart,
+} from "@/utils/markdownStableCut.uts";
 import { perfRecordParseDetail, sseStallLog } from "@/utils/perfProbe.uts";
 
 /**
@@ -229,6 +234,11 @@ export class AiMsgMarkdownParser {
    *  造成高频重渲染、与渲染帧竞争触发 ConcurrentModificationException。 */
   private mathFlushPending: boolean = false;
   private mathFlushGen: number = 0;
+  /**
+   * 官方 WAIT 语义：增量解析期间渲染列表被截断在「图尚未就绪」的公式前，
+   * 待该公式出图（scheduleMathFlush）后重新增量解析，把公式与后续内容一并上屏。
+   */
+  private pendingMathReveal: boolean = false;
 
   constructor(
     msg: Ref<MsgItem>,
@@ -270,6 +280,7 @@ export class AiMsgMarkdownParser {
   private clearFallbackIncrementalState(): void {
     this.fallbackStablePrefix = "";
     this.fallbackStableEls = [] as UniAiMarkdownElItem[];
+    this.pendingMathReveal = false;
   }
 
   /**
@@ -398,8 +409,61 @@ export class AiMsgMarkdownParser {
   }
 
   /**
+   * 单个 token 是否需要「等待出图」（官方 WAIT：等公式渲染完再继续渲染后续）。
+   * - 已出图（href/html 非空）→ 不等
+   * - 已结算（派发过 katexRender 并回调，含失败、结果为空的占位）→ 不等
+   * - 其余（在途 dispatch 未回调）→ 等
+   * displayMode：块级公式 item.type=="math" 为 true；行内公式一律 false（与 scheduleInlineMathRender 一致）。
+   */
+  private mathTokenNeedsWait(t: MarkdownToken, displayMode: boolean): boolean {
+    if (t.type != "math") {
+      // 表格等嵌套 token：递归查内层（表格单元格内的行内公式）
+      const child =
+        t.tokens != null ? t.tokens : t.items != null ? t.items : null;
+      if (child != null) {
+        for (let i = 0; i < child.length; i++) {
+          if (this.mathTokenNeedsWait(child[i], displayMode)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    const href = t.href != null ? `${t.href}` : "";
+    const html = t.html != null ? `${t.html}` : "";
+    if (href.length > 0 || html.length > 0) {
+      return false;
+    }
+    const latex = t.text != null ? `${t.text}` : "";
+    return isMathConcluded(latex, displayMode) != true;
+  }
+
+  /** 渲染列表中第一个「等待出图」的公式所在 item 索引；无则 -1。 */
+  private firstPendingMathItemIndex(items: UniAiMarkdownElItem[]): number {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const rows = item.datasList;
+      if (rows == null) {
+        continue;
+      }
+      const isBlock = item.type == "math";
+      for (let r = 0; r < rows.length; r++) {
+        const row = rows[r];
+        for (let t = 0; t < row.length; t++) {
+          if (this.mathTokenNeedsWait(row[t], isBlock)) {
+            return i;
+          }
+        }
+      }
+    }
+    return -1;
+  }
+
+  /**
    * 公式回填批量刷新（防抖）：~40ms 内多次 token 回填只整体替换 markdownElList 一次。
    * 含工具卡时拉长到 80ms，降低 ToolCallCard 挂载后列表抖动触发 Android 原生停更的概率。
+   * 若增量解析曾因未出图公式截断（pendingMathReveal），则改为重新增量解析，把公式与
+   * 后续内容一并上屏（官方 WAIT：等公式渲染完再继续）。
    */
   private scheduleMathFlush(): void {
     if (this.mathFlushPending == true) {
@@ -411,6 +475,11 @@ export class AiMsgMarkdownParser {
     setTimeout((): void => {
       this.mathFlushPending = false;
       if (gen != this.mathFlushGen) {
+        return;
+      }
+      if (this.pendingMathReveal == true) {
+        this.pendingMathReveal = false;
+        this.applyAppFallbackIncremental(this.getBodyText());
         return;
       }
       const prev = this.msg.value.markdownElList;
@@ -566,20 +635,27 @@ export class AiMsgMarkdownParser {
       stablePrefix = body.substring(0, cut);
     }
 
-    // live 区每次重解析（通常很短）；未稳定前缀 defer KaTeX（闭合公式随 cut 推进进入冻结再渲）。
-    // 用 normalizeLiveForParse 合成关闭未配对的结构块（```/group/$$）+ 末尾空行，
-    // 否则半截结构块被解析器整段丢弃 → el 不涨（el_stuck 卡顿）+ 结构内容流式期不渲染。
+    // live 区每次重解析（通常很短）。两路保护（合并 perf-vdom 的 el_stuck 修复与官方公式冻结语义）：
+    // 1) findUnclosedBlockFormulaStart：live 出现未闭合块级公式（$$ / \[，代码围栏内忽略）时，
+    //    只取其前内容 liveToParse 上屏，公式及之后等闭合后下一轮增量解析再连同后续一并上屏
+    //    （对齐官方 runTask「整体冻结到闭合」）。
+    // 2) normalizeLiveForParse：给 liveToParse 合成关闭未配对的 <markdown-custom-process-group>
+    //    + 末尾空行，否则半截工具卡结构块被解析器整段丢弃 → el 不涨（el_stuck 卡顿根因）。
+    // KaTeX 在 live 区即派发（defer=false），重复截图由下方 WAIT 截断 + scheduleMathFlush 防抖控制。
     const live = body.substring(stablePrefix.length);
+    const unclosedMathAt = findUnclosedBlockFormulaStart(live);
+    const liveToParse =
+      unclosedMathAt >= 0 ? live.substring(0, unclosedMathAt) : live;
     const liveEls = [] as UniAiMarkdownElItem[];
-    if (live.length > 0) {
+    if (liveToParse.length > 0) {
       const parsedLive = expandMarkdownImageItems(
-        parseAppMarkdownFallback(normalizeLiveForParse(live), onMathNotify, true),
+        parseAppMarkdownFallback(normalizeLiveForParse(liveToParse), onMathNotify, false),
       );
       prefixMarkdownElIds(parsedLive, "live-");
       for (let k = 0; k < parsedLive.length; k++) {
         liveEls.push(parsedLive[k]);
       }
-      parsedChars += live.length;
+      parsedChars += liveToParse.length;
     }
 
     const nextList = [] as UniAiMarkdownElItem[];
@@ -590,10 +666,25 @@ export class AiMsgMarkdownParser {
       nextList.push(liveEls[l]);
     }
 
+    // 官方 WAIT 语义：渲染列表止于第一个「图尚未就绪」的公式（含其后的后续内容），
+    // 待公式出图（scheduleMathFlush 重新增量解析）后再把公式与后续一并上屏。
+    // 避免「前文已出、公式留白、后文先到」的跳过观感（官方 runTask 未闭合公式 return 冻结、
+    // 闭合后窗口阻塞 katexRender 出图才继续，本处等价落地于 fallback 增量）。
+    const pendingIdx = this.firstPendingMathItemIndex(nextList);
+    this.pendingMathReveal = false;
+    let renderedList = nextList;
+    if (pendingIdx >= 0) {
+      this.pendingMathReveal = true;
+      renderedList = [] as UniAiMarkdownElItem[];
+      for (let p = 0; p < pendingIdx; p++) {
+        renderedList.push(nextList[p]);
+      }
+    }
+
     this.fallbackStablePrefix = stablePrefix;
     this.fallbackStableEls = stableEls;
     this.lastFallbackBody = body;
-    this.msg.value.markdownElList = nextList;
+    this.msg.value.markdownElList = renderedList;
     try {
       perfRecordParseDetail(
         "inc",
@@ -622,6 +713,7 @@ export class AiMsgMarkdownParser {
     const mapped = markdownTokenList.map((token: MarkdownToken) =>
       token2el(token),
     );
+    normalizeCjkAutolinks(mapped);
     this.msg.value.markdownElList = expandMarkdownImageItems(mapped);
   }
 

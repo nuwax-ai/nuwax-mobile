@@ -209,19 +209,24 @@ def strip_project_deps(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
     text = gradle_path.read_text()
-    for mod in SAMPLE_MODULES:
-        text = re.sub(
-            rf"\s*implementation\s+project\(':?{re.escape(mod)}'\)\s*\n",
-            "\n",
-            text,
-        )
-    # 确保注入的 UTS 模块依赖存在
+    # 读取已注入的 UTS 模块
     injected: list[str] = []
     marker = WORK / "injected-uts-modules.txt"
     if marker.is_file():
         injected = [x.strip() for x in marker.read_text().splitlines() if x.strip()]
     if not injected:
         injected = ["uts-nuwax-esp-provisioning"]
+    # app/build.gradle 的本地 project 依赖只应保留：运行时模块 uniappx + 已注入的 UTS 模块。
+    # 其余 implementation project(':...')（DCloud 示例 test-*/native-*/uni-*/app-comm，或
+    # vdom/vapor 两线共享 work 树时另一线残留的 uts-* 插件）对应的模块在 settings.gradle 已被
+    # configure_settings 裁掉 → Gradle "Project with path ':...' could not be found"。
+    # 按 keep 集全量裁剪，使依赖与 settings.gradle 自校正（不再逐个列清单，免漏）。
+    keep = {"uniappx"} | set(injected)
+    for dep in re.findall(r"implementation\s+project\(':[^']+'\)", text):
+        m = re.search(r"':([^']+)'", dep)
+        if m and m.group(1) not in keep:
+            text = re.sub(rf"[ \t]*{re.escape(dep)}[ \t]*\n", "\n", text)
+    # 确保注入的 UTS 模块依赖存在
     for name in injected:
         needle = f"implementation project(':{name}')"
         if needle not in text and "dependencies {" in text:

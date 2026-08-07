@@ -2200,27 +2200,107 @@ function renderMathToken(
  * 异步渲染 mermaid 代码块（App 流式/历史走 fallback，cmark 路径触达不到）。
  * 参考 renderMathToken 的 whenReady/回调刷帧模式：webview 未就绪则等待，结果回填 token.href（+width/height）。
  * mermaid 量少，单条直调，不进 KaTeX 并发队列。
+ *
+ * 去重/缓存（与公式 MathBatchUiRunner + mathInFlightTokens 对齐）：
+ * 流式 live 区每 flush 重解析，闭合 mermaid 块若滞留 live 区会每帧重发 proxy 截图 →
+ * 灌满 proxy 串行 mermaidQueue → 全部超时失败（"图表渲染失败"）+ href 每帧变 → 抖动。
+ * 故同 text：成功结果缓存命中直填（零 proxy 调用）、在途去重扇出、失败短期冷却不每帧重试。
  */
+
+/** mermaid 截图结果缓存：成功存 href/宽高；失败仅记 failAt 做冷却 */
+class MermaidCacheEntry {
+  href: string = "";
+  width: number = 0;
+  height: number = 0;
+  ok: boolean = false;
+  failAt: number = 0;
+}
+
+/** 在途渲染的等待者：首个 dispatch 未回调期间，后续同 text 的 token 挂这里，回调时统一扇出 */
+class MermaidWaiter {
+  token: MarkdownToken;
+  callback: MathRenderedCallback;
+  constructor(token: MarkdownToken, callback: MathRenderedCallback) {
+    this.token = token;
+    this.callback = callback;
+  }
+}
+
+/** 失败冷却：同 text 失败后 2s 内不重发，避免每帧重试打满串行队列（落代码 Tab 兜底） */
+const MERMAID_FAIL_COOLDOWN_MS: number = 2000;
+/** text → 最近一次渲染结果（成功缓存 / 失败冷却）。模块级，跨消息复用同图截图 */
+const mermaidCache: Map<string, MermaidCacheEntry> = new Map<string, MermaidCacheEntry>();
+/** text → 在途等待者列表（dispatch 中未回调） */
+const mermaidInFlight: Map<string, MermaidWaiter[]> = new Map<string, MermaidWaiter[]>();
+
 function renderMermaidToken(
   mermaidText: string,
   token: MarkdownToken,
   callback: MathRenderedCallback,
 ): void {
+  // 1) 成功缓存命中：同步回填，本次解析即带 href 上屏，零 proxy 调用、零抖动
+  const cached = mermaidCache.get(mermaidText);
+  if (cached != null) {
+    if (cached.ok == true) {
+      token.href = cached.href;
+      if (cached.width > 0) token.width = cached.width;
+      if (cached.height > 0) token.height = cached.height;
+      callback();
+      return;
+    }
+    // 2) 失败冷却期内：不重复 dispatch（避免每帧重试打满队列），落代码 Tab 兜底
+    if (Date.now() - cached.failAt < MERMAID_FAIL_COOLDOWN_MS) {
+      callback();
+      return;
+    }
+  }
+  // 3) 在途去重：同 text 已 dispatch 未回调，挂入等待列表，回调时统一扇出
+  const existing = mermaidInFlight.get(mermaidText);
+  if (existing != null) {
+    existing.push(new MermaidWaiter(token, callback));
+    return;
+  }
+  // 4) 首次 dispatch：登记在途
+  const waiters = [] as MermaidWaiter[];
+  waiters.push(new MermaidWaiter(token, callback));
+  mermaidInFlight.set(mermaidText, waiters);
+
   const doRender = (): void => {
     const param = new UTSJSONObject();
     param["action"] = "renderMermaid";
     param["mermaidText"] = mermaidText;
     proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
+      // 取出全部等待者（含首个 dispatch 的 token）后清在途登记
+      const pending = mermaidInFlight.get(mermaidText);
+      mermaidInFlight.delete(mermaidText);
       const imageData = res["imageDataURL"];
-      if (imageData != null && `${imageData}`.length > 0) {
-        token.href = `${imageData}`;
+      const hasImage = imageData != null && `${imageData}`.length > 0;
+      const entry = new MermaidCacheEntry();
+      if (hasImage) {
+        entry.href = `${imageData}`;
+        entry.ok = true;
         const widthData = res["width"];
         const heightData = res["height"];
-        if (widthData != null) token.width = widthData as number;
-        if (heightData != null) token.height = heightData as number;
+        if (widthData != null) entry.width = widthData as number;
+        if (heightData != null) entry.height = heightData as number;
+      } else {
+        // 失败：记冷却时间戳，不回填 href（渲染组件落代码 Tab）
+        entry.ok = false;
+        entry.failAt = Date.now();
       }
-      // 失败（imageDataURL 空）不回填 href，由渲染组件落代码 Tab
-      callback();
+      mermaidCache.set(mermaidText, entry);
+      // 扇出：结果写到每个等待 token（含已冻结进 stableEls 的，避免漏填后不再重解析）
+      if (pending != null) {
+        for (let i = 0; i < pending.length; i++) {
+          const w = pending[i];
+          if (hasImage) {
+            w.token.href = entry.href;
+            if (entry.width > 0) w.token.width = entry.width;
+            if (entry.height > 0) w.token.height = entry.height;
+          }
+          w.callback();
+        }
+      }
     });
   };
   if (proxyWeb.isReady() == true) {

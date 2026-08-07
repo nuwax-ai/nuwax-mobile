@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from local_base_paths import default_android_esp_work
 
 WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
-PROJ = WORK / "project"
+PROJ = Path(os.environ.get("ANDROID_ESP_PROJECT", str(WORK / "project")))
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APP_MANIFEST = json.loads((PROJECT_ROOT / "manifest.json").read_text())
 APPID = os.environ.get("APPID", "__UNI__8BF05E4")
@@ -107,18 +107,41 @@ def configure_settings() -> None:
     if marker.is_file():
         injected = {x.strip() for x in marker.read_text().splitlines() if x.strip()}
     keep = {"app", "uniappx"} | injected | {"uts-nuwax-esp-provisioning"}
+    seen: set[str] = set()
     lines = []
     for line in text.splitlines():
-        m = re.match(r"include\s+':([^']+)'", line.strip())
-        if m and m.group(1) not in keep:
-            if not line.strip().startswith("//"):
-                lines.append("// " + line + "  // stripped by configure_app")
-                continue
+        s = line.strip()
+        # 本脚本上一轮注释掉的 include：模块名现在在 keep 中则恢复为有效 include，否则保留注释
+        m_c = re.match(r"//\s*include\s+':([^']+)'", s)
+        if m_c and "stripped by configure_app" in s:
+            name = m_c.group(1)
+            if name in keep:
+                if name not in seen:
+                    lines.append(f"include ':{name}'")
+                    seen.add(name)
+            else:
+                if name not in seen:
+                    lines.append(line)
+                    seen.add(name)
+            continue
+        m = re.match(r"include\s+':([^']+)'", s)
+        if m:
+            name = m.group(1)
+            if name in keep:
+                if name not in seen:
+                    lines.append(line)
+                    seen.add(name)
+            else:
+                if name not in seen:
+                    lines.append("// " + line + "  // stripped by configure_app")
+                    seen.add(name)
+            continue
         lines.append(line)
-    text = "\n".join(lines) + "\n"
+    # 补 keep 中尚未出现的模块（以有效 include 计数 seen 为准，避免旧注释被误判为已存在）
     for name in sorted(keep - {"app", "uniappx"}):
-        if f"':{name}'" not in text:
-            text += f"include ':{name}'\n"
+        if name not in seen:
+            lines.append(f"include ':{name}'")
+    text = "\n".join(lines) + "\n"
     text = re.sub(
         r'rootProject\.name\s*=\s*"[^"]*"',
         'rootProject.name = "nuwax-mobile-android-base"',

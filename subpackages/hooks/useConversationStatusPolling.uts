@@ -4,7 +4,9 @@
  * 用途:会话页持续轮询会话状态(taskStatus),一旦发现 EXECUTING(刷新页面后 / 定时任务 /
  * 其它端同会话发消息)且非本地流式、未已订阅 sub,回调 onExecuting 让上层恢复 sub 流。
  *
- * 暂停条件:本地忙(流式 / 已订阅 sub) 或 页面不可见。
+ * 本地忙(live 流式 / 已订阅 sub)时进入「静默终态轮询」:仍每 5s 探测,但只用于检测任务被
+ * 他端结束/暂停(非 EXECUTING → onTerminalWhileBusy 强制收尾);不判用户门禁、不加速、
+ * 不触发 sub,避免本地接管本轮时空转(语音刚发送、服务端本轮用户句尚未落库等)。
  * 语音播报不挡轮询（App 开会话后 H5 续接时，播报中也要能检出 EXECUTING）。
  * - H5:visibilitychange 自动暂停/恢复
  * - 小程序/App:chat-conversation-component 内 onShow/onHide 调 resume/pause
@@ -42,6 +44,8 @@ let currentConversationId = 0;
 let onExecutingCallback: ((id: number) => void) | null = null;
 let isConversationActiveGetter: (() => boolean) | null = null;
 let isSubscribedGetter: (() => boolean) | null = null;
+/** 终态回调：本地流式/sub 期间轮询发现任务已结束（他端结束/暂停）时通知页面强制收尾。 */
+let onTerminalWhileBusyCallback: ((id: number) => void) | null = null;
 
 /**
  * 规范化 taskStatus（App 可能是字符串 / 带 value 的对象）。
@@ -110,9 +114,9 @@ async function pollOnce(): Promise<void> {
 
   // 先拷到局部再调用：UTS 可变属性不可 smart cast，且 ?.invoke 在 iOS 上可能调不到回调
   const activeGetter = isConversationActiveGetter;
-  if (activeGetter != null && activeGetter() == true) return;
+  const busy = activeGetter != null && activeGetter() == true;
   const subscribedGetter = isSubscribedGetter;
-  if (subscribedGetter != null && subscribedGetter() == true) return;
+  const subscribed = subscribedGetter != null && subscribedGetter() == true;
 
   try {
     isProcessing = true;
@@ -124,6 +128,14 @@ async function pollOnce(): Promise<void> {
     const dataObj = dataRaw as UTSJSONObject;
     const taskStatusStr = normalizeTaskStatus(dataObj['taskStatus']);
     if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
+      // 本地忙（live SSE 流式 / sub 已订阅）：本轮已由本地接管，进入「静默终态轮询」。
+      // 只保持 5s 探测（终态检测在下方非 EXECUTING 分支）；不判用户门禁、不加速、不触发 sub，
+      // 避免本地接管本轮时（语音刚发送、服务端本轮用户句尚未落库）空转「等待下次轮询」+ fast 加速。
+      if (busy == true || subscribed == true) {
+        resetWaitingUserFastPoll();
+        ensurePollingInterval(POLLING_INTERVAL);
+        return;
+      }
       const rawMessageList = dataObj['messageList'];
       if (isTurnUserReadyFromRawMessageList(rawMessageList) != true) {
         console.log(
@@ -153,6 +165,14 @@ async function pollOnce(): Promise<void> {
         cb(currentConversationId);
       }
     } else {
+      // 非 EXECUTING（终态：COMPLETE / FAILED / CANCEL）而本端仍认为在 live/sub 接收：
+      // 说明他端已结束 / 暂停任务（原 chat_finished 事件要兜的底），通知页面强制收尾。
+      if (busy == true || subscribed == true) {
+        const tcb = onTerminalWhileBusyCallback;
+        if (tcb != null) {
+          tcb(currentConversationId);
+        }
+      }
       resetWaitingUserFastPoll();
       ensurePollingInterval(POLLING_INTERVAL);
     }
@@ -191,6 +211,7 @@ export function startConversationPolling(
   onExecuting: (id: number) => void,
   isConversationActive: () => boolean,
   isSubscribed: () => boolean,
+  onTerminalWhileBusy: (id: number) => void,
 ): void {
   stopConversationPolling();
 
@@ -198,6 +219,7 @@ export function startConversationPolling(
   onExecutingCallback = onExecuting;
   isConversationActiveGetter = isConversationActive;
   isSubscribedGetter = isSubscribed;
+  onTerminalWhileBusyCallback = onTerminalWhileBusy;
   currentPollingInterval = POLLING_INTERVAL;
   resetWaitingUserFastPoll();
 
@@ -252,6 +274,7 @@ export function destroyConversationPolling(): void {
   onExecutingCallback = null;
   isConversationActiveGetter = null;
   isSubscribedGetter = null;
+  onTerminalWhileBusyCallback = null;
 
   // #ifdef H5 || WEB
   if (isVisibilityListenerInitialized) {

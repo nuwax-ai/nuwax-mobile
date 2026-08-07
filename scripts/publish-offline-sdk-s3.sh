@@ -6,14 +6,14 @@
 #   - 默认桶 nuwax-packages，前缀 mobile-offline-sdk
 #
 # 版本策略：
-#   - 版本 = NUWAX_HX_VERSION（默认 5.15）
+#   - 版本 = NUWAX_HX_VERSION（默认 5.23）
 #   - 同版本重复发布 = 覆盖；latest.json 每次指向该版本（同事不指定版本即拉最新）
 #
 # 打包内容：$NUWAX_OFFLINE_SDK_HOME/{sdk,archives}（work/ 不打包，跨机不可用）
 #
 # Usage:
 #   bash scripts/publish-offline-sdk-s3.sh
-#   bash scripts/publish-offline-sdk-s3.sh --version 5.15
+#   bash scripts/publish-offline-sdk-s3.sh --version 5.23
 #   bash scripts/publish-offline-sdk-s3.sh --dry-run
 set -euo pipefail
 
@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FETCH_SCRIPT="$SCRIPT_DIR/fetch-offline-sdk-s3.sh"
 
-VERSION="${NUWAX_HX_VERSION:-5.15}"
+VERSION="${NUWAX_HX_VERSION:-5.23}"
 DRY_RUN=0
 
 usage() {
@@ -29,7 +29,7 @@ usage() {
 Usage: bash scripts/publish-offline-sdk-s3.sh [options]
 
 Options:
-  --version VERSION   HX 版本（默认 NUWAX_HX_VERSION=5.15；同版本覆盖）
+  --version VERSION   HX 版本（默认 NUWAX_HX_VERSION=5.23；同版本覆盖）
   --dry-run           只打印计划，不上传
   -h, --help
 

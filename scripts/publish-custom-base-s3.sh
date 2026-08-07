@@ -195,7 +195,7 @@ fi
 GIT_SHA=$(cd "$ROOT_DIR" && git rev-parse HEAD 2>/dev/null || echo unknown)
 GIT_SHORT=$(cd "$ROOT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
 RELEASE_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-HX_VERSION="${NUWAX_HX_VERSION:-5.15}"
+HX_VERSION="${NUWAX_HX_VERSION:-5.23}"
 
 MANIFEST_OUT="$ARTIFACTS_DIR/manifest.json"
 {

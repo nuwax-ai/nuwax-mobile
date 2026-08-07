@@ -255,6 +255,54 @@ function findUnclosedBlockMathStart(text) {
   return openAt;
 }
 
+/** 镜像 findUnclosedBlockFormulaStart：代码围栏内忽略，$$ 成对 / \[ 需配对 \]。 */
+function findUnclosedBlockFormulaStart(text) {
+  if (text.length === 0) return -1;
+  let inFence = false;
+  let dOpen = -1;
+  let bOpen = -1;
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text.charAt(i);
+    if (inFence) {
+      if (c === "`" && i + 2 < n && text.charAt(i + 1) === "`" && text.charAt(i + 2) === "`") {
+        inFence = false;
+        i += 3;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (c === "`" && i + 2 < n && text.charAt(i + 1) === "`" && text.charAt(i + 2) === "`") {
+      inFence = true;
+      i += 3;
+      continue;
+    }
+    if (c === "$" && i + 1 < n && text.charAt(i + 1) === "$") {
+      if (dOpen < 0) dOpen = i;
+      else dOpen = -1;
+      i += 2;
+      continue;
+    }
+    if (c === "\\" && i + 1 < n && text.charAt(i + 1) === "[") {
+      if (bOpen < 0) bOpen = i;
+      i += 2;
+      continue;
+    }
+    if (c === "\\" && i + 1 < n && text.charAt(i + 1) === "]") {
+      bOpen = -1;
+      i += 2;
+      continue;
+    }
+    i++;
+  }
+  let best = -1;
+  if (dOpen >= 0) best = dOpen;
+  if (bOpen >= 0 && (best < 0 || bOpen < best)) best = bOpen;
+  return best;
+}
+
 function findTrailingOpenTableStart(text) {
   if (text.length === 0) return -1;
   const lines = text.replace(/\r\n/g, "\n").split("\n");
@@ -281,6 +329,57 @@ function lastParagraphBoundaryBefore(text, limit) {
   const idx = region.lastIndexOf("\n\n");
   if (idx < 0) return 0;
   return idx + 2;
+}
+
+function lastSoftLineBoundaryBefore(text, limit) {
+  const sliceEnd = Math.min(limit, text.length);
+  if (sliceEnd <= 0) return 0;
+  const region = text.substring(0, sliceEnd);
+  const idx = region.lastIndexOf("\n");
+  if (idx < 0) return 0;
+  return idx + 1;
+}
+
+function isWhitespaceChar_(c) {
+  return c === " " || c === "\n" || c === "\r" || c === "\t";
+}
+
+function isOrderedListItemStart(t) {
+  let i = 0;
+  const n = t.length;
+  while (i < n && t.charAt(i) >= "0" && t.charAt(i) <= "9") i++;
+  if (i === 0) return false;
+  if (i < n) {
+    const marker = t.charAt(i);
+    if (marker === "." || marker === ")" || marker === "、") {
+      if (i + 1 >= n || isWhitespaceChar_(t.charAt(i + 1))) return true;
+    }
+  }
+  return false;
+}
+
+function isSafeProseText(text) {
+  if (text.length === 0) return false;
+  if (text.indexOf("```") >= 0) return false;
+  if (text.indexOf("$$") >= 0) return false;
+  if (text.indexOf("<markdown-custom") >= 0) return false;
+  if (text.indexOf("![") >= 0) return false;
+  if (text.indexOf("\n\n") >= 0) return false;
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length === 0) return false;
+    const c = t.charAt(0);
+    if (c === "#" || c === ">" || c === "|") return false;
+    if (
+      (c === "-" || c === "*" || c === "+") &&
+      t.length > 1 &&
+      isWhitespaceChar_(t.charAt(1))
+    )
+      return false;
+    if (isOrderedListItemStart(t)) return false;
+  }
+  return true;
 }
 
 function isWhitespaceChar(ch) {
@@ -492,14 +591,17 @@ function findStableMarkdownCut(markdown, streaming = true) {
   if (streaming !== true) return markdown.length;
   let incompleteAt = -1;
   incompleteAt = earlierIndex(incompleteAt, findUnclosedCodeFenceStart(markdown));
-  incompleteAt = earlierIndex(incompleteAt, findUnclosedBlockMathStart(markdown));
+  incompleteAt = earlierIndex(incompleteAt, findUnclosedBlockFormulaStart(markdown));
   incompleteAt = earlierIndex(incompleteAt, findTrailingOpenTableStart(markdown));
   incompleteAt = earlierIndex(
     incompleteAt,
     findIncompleteCustomMarkupTailStart(markdown),
   );
   const structureLimit = incompleteAt >= 0 ? incompleteAt : markdown.length;
-  const paraCut = lastParagraphBoundaryBefore(markdown, structureLimit);
+  const region = markdown.substring(0, structureLimit);
+  const paraCut = isSafeProseText(region)
+    ? lastSoftLineBoundaryBefore(markdown, structureLimit)
+    : lastParagraphBoundaryBefore(markdown, structureLimit);
   const toolCut = endOfFinishedCustomBlocks(markdown, structureLimit);
   let cut = Math.max(paraCut, toolCut);
   const trailingTools = startOfTrailingToolCluster(markdown);
@@ -858,128 +960,363 @@ test("增量累计成本显著低于全量 O(n²)", () => {
   assert.ok(sim.stableLen > 0, "应冻结出稳定前缀");
 });
 
-console.log("\n[6] 裸 URL 中文边界");
-
-const CJK_URL_PUNCTUATION = "，。！？；：、（）［］【】《》〈〉“”‘’「」『』";
-
-function isCjkTextCharacter(char) {
-  const code = char.charCodeAt(0);
-  return (
-    (code >= 0x3400 && code <= 0x4dbf) ||
-    (code >= 0x4e00 && code <= 0x9fff) ||
-    (code >= 0xf900 && code <= 0xfaff) ||
-    (code >= 0x3040 && code <= 0x30ff) ||
-    (code >= 0xac00 && code <= 0xd7af)
+test("纯文本单段（无空行）：切点推进到最后一个 \\n（修复 O(n²)）", () => {
+  // 单段长回复，只用单个 \n 软换行，无空行 —— 修复前切点恒为 0
+  const line = "这是同一段落里的一句，讲清楚一个要点。";
+  const body = Array.from({ length: 8 }, () => line).join("\n");
+  const cut = findStableMarkdownCut(body, true);
+  const live = body.length - cut;
+  assert.ok(cut > 0, `单段长文切点应推进，got cut=${cut}`);
+  assert.ok(
+    live <= line.length + 1,
+    `只留末行 live，got live=${live}（应 ≤ ${line.length + 1}）`,
   );
-}
+  // 终态不受影响
+  assert.equal(findStableMarkdownCut(body, false), body.length);
+});
 
-function hasCompleteAsciiUrlPrefix(prefix) {
-  const schemeLength = prefix.startsWith("https://")
-    ? 8
-    : prefix.startsWith("http://")
-      ? 7
-      : 0;
-  if (schemeLength == 0) return false;
-  const remainder = prefix.substring(schemeLength);
-  if (remainder.length == 0) return false;
+test("含块结构 / 空行的文本：仍走原 \\n\\n 语义，切点不越过结构", () => {
+  // 空行多段 → 用原 \n\n 边界
+  const multi = "第一段。\n\n第二段。\n\n第三段。";
+  const cutMulti = findStableMarkdownCut(multi, true);
+  assert.equal(cutMulti, 12, `多段应冻到第一个 \\n\\n，got cut=${cutMulti}`);
+  // 含代码围栏 → 不越过 fence
+  const code = "前文。\n\n```js\nconst x = 1;\n";
+  const cutCode = findStableMarkdownCut(code, true);
+  assert.ok(
+    cutCode <= code.indexOf("```"),
+    `代码围栏前不应越界，got cut=${cutCode}`,
+  );
+  // 含列表 → 回退原 \n\n 语义（无空行则 cut=0 保持安全）
+  const list = "- 条目一\n- 条目二\n- 条目三";
+  const cutList = findStableMarkdownCut(list, true);
+  assert.equal(cutList, 0, `列表（无空行）不应按 \\n 冻结，got cut=${cutList}`);
+});
+
+test("纯文本单段增量：live 受限于单行 + 前缀持续推进（不再 O(n²)）", () => {
+  // 60 行单段：修复前每 tick 全量重解析整段（live=全文）；修复后 live 应 ≈ 单行
+  const line = "这是同一段落里的一句，讲清楚一个要点，语气平稳。";
+  const longBody = Array.from({ length: 60 }, () => line).join("\n");
+  const sim = simulateIncrementalParseCost(longBody, 24);
+  const ratio = sim.incrCum / sim.fullCum;
+  console.log(
+    `    ticks=${sim.ticks} fullCum=${sim.fullCum} incrCum=${sim.incrCum} ratio=${ratio.toFixed(2)} maxLive=${sim.maxLive} stableLen=${sim.stableLen} bodyLen=${longBody.length}`,
+  );
+  // 核心不变量：live 必须被限制在单行量级（末尾未闭合行），而非整段
+  assert.ok(
+    sim.maxLive <= line.length + 2,
+    `live 应受限于单行(≤${line.length + 2})，got maxLive=${sim.maxLive}`,
+  );
+  // 前缀持续推进到接近全文
+  assert.ok(
+    sim.stableLen >= longBody.length * 0.9,
+    `稳定前缀应推进到 ≥90% 全文，got stableLen=${sim.stableLen}/${longBody.length}`,
+  );
+  // 增量累计显著低于全量
+  assert.ok(ratio < 0.2, `增量累计应 < 全量 20%，got ${ratio.toFixed(2)}`);
+});
+
+// ─── 镜像 subpackages/components/ai-msg/appMarkdownFallback.uts ─────────────
+// promoteLatexInlineCode / looksLikeLatexInlineCode：反引号内 LaTeX 提升为行内 $...$。
+
+function looksLikeLatexInlineCode(inner) {
+  const s = inner.trim();
+  if (s.length < 2 || s.length > 800) return false;
   if (
-    remainder.includes("/") ||
-    remainder.includes("?") ||
-    remainder.includes("#")
-  ) {
-    return true;
+    s.indexOf("://") >= 0 ||
+    s.indexOf("function ") >= 0 ||
+    s.indexOf("const ") >= 0 ||
+    s.indexOf("let ") >= 0 ||
+    s.indexOf("var ") >= 0 ||
+    s.indexOf("=>") >= 0 ||
+    s.indexOf("import ") >= 0 ||
+    s.indexOf("export ") >= 0 ||
+    s.indexOf("console.") >= 0 ||
+    s.indexOf("return ") >= 0
+  )
+    return false;
+  const texcmds = [
+    "\\frac", "\\sqrt", "\\sum", "\\int", "\\iint", "\\lim", "\\begin", "\\end",
+    "\\partial", "\\infty", "\\pi", "\\pm", "\\times", "\\cdot", "\\sin", "\\cos",
+    "\\tan", "\\det", "\\mathbf", "\\mathrm", "\\text", "\\left", "\\right", "\\to",
+    "\\cap", "\\cup", "\\lambda", "\\alpha", "\\beta", "\\theta", "\\gamma", "\\Delta",
+    "\\nabla", "\\,", "\\;",
+  ];
+  for (const c of texcmds) if (s.indexOf(c) >= 0) return true;
+  if (s.indexOf("^") >= 0 || s.indexOf("_") >= 0) {
+    if (s.indexOf("=") >= 0 || (s.indexOf("+") >= 0 && s.indexOf("(") >= 0))
+      return true;
   }
-  return (
-    remainder == "localhost" ||
-    /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::[0-9]+)?$/.test(remainder)
-  );
+  return false;
 }
 
-function findCjkAutolinkBoundary(url) {
-  for (let i = 0; i < url.length; i++) {
-    const char = url.charAt(i);
-    if (CJK_URL_PUNCTUATION.includes(char)) return i;
+function promoteLatexInlineCode(markdown) {
+  if (markdown.indexOf("`") < 0) return markdown;
+  let out = "";
+  let i = 0;
+  const n = markdown.length;
+  while (i < n) {
     if (
-      isCjkTextCharacter(char) &&
-      hasCompleteAsciiUrlPrefix(url.substring(0, i))
+      i + 2 < n &&
+      markdown.charAt(i) === "`" &&
+      markdown.charAt(i + 1) === "`" &&
+      markdown.charAt(i + 2) === "`"
     ) {
-      return i;
+      const close = markdown.indexOf("```", i + 3);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + 3);
+      i = close + 3;
+      continue;
+    }
+    if (markdown.charAt(i) === "`") {
+      const close = markdown.indexOf("`", i + 1);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      const inner = markdown.substring(i + 1, close);
+      const trimmedInner = inner.trim();
+      // 反引号内已自带 $...$ 定界（模型常见输出 `` `$a^2 + b^2$` ``）：
+      // 直接去反引号保留原公式，避免二次包裹成 $$...$$ 块级（行内解析跳过 $$ → 露裸 $$）。
+      const alreadyDelimited =
+        trimmedInner.length > 2 &&
+        trimmedInner.charAt(0) === "$" &&
+        trimmedInner.charAt(trimmedInner.length - 1) === "$";
+      if (looksLikeLatexInlineCode(inner) || alreadyDelimited) {
+        out += alreadyDelimited ? trimmedInner : "$" + trimmedInner + "$";
+        i = close + 1;
+        continue;
+      }
+      out += markdown.substring(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    out += markdown.charAt(i);
+    i++;
+  }
+  return out;
+}
+
+console.log("\n[6] 反引号内 LaTeX 提升（`` `$...$` `` → 行内 $...$）");
+
+test("已自带 $ 定界的反引号公式：去反引号保留行内 $，不二次包裹", () => {
+  assert.equal(
+    promoteLatexInlineCode("1. 平方和：`$a^2 + b^2$`"),
+    "1. 平方和：$a^2 + b^2$",
+  );
+  assert.equal(
+    promoteLatexInlineCode("2. 分式：`$\\frac{a}{b}$`"),
+    "2. 分式：$\\frac{a}{b}$",
+  );
+  assert.equal(
+    promoteLatexInlineCode("16. 行列式：`$\\begin{vmatrix} a & b \\\\ c & d \\end{vmatrix} = ad - bc$`"),
+    "16. 行列式：$\\begin{vmatrix} a & b \\\\ c & d \\end{vmatrix} = ad - bc$",
+  );
+});
+
+test("无 $ 定界的 LaTeX 反引号：包成行内 $...$（原行为）", () => {
+  assert.equal(
+    promoteLatexInlineCode("x = `\\frac{a}{b}`"),
+    "x = $\\frac{a}{b}$",
+  );
+});
+
+test("普通代码 / 货币反引号不被提升", () => {
+  // 普通代码片段保持反引号原样
+  assert.equal(
+    promoteLatexInlineCode("运行 `npm install` 安装依赖"),
+    "运行 `npm install` 安装依赖",
+  );
+  // 货币 $100（无闭合 $）保持反引号原样
+  assert.equal(
+    promoteLatexInlineCode("价格是 `$100`，总量 `$200`"),
+    "价格是 `$100`，总量 `$200`",
+  );
+});
+
+test("用户报告的全量 20 公式清单：无 $$ 块级残留、无 `` `$ `` 残留", () => {
+  const list = `
+1. 平方和：\`$a^2 + b^2$\`
+2. 分式：\`$\\frac{a}{b}$\`
+3. 根式：\`$\\sqrt[n]{x}$\`
+4. 完全平方：\`$(a+b)^2$\`
+5. 求和：\`$\\sum_{i=1}^{n} a_i$\`
+6. 分段函数：\`$f(x) = \\begin{cases} x^2, & x>0 \\\\ 0, & x=0 \\end{cases}$\`
+7. 定积分：\`$\\int_{a}^{b} f(x)\\,dx$\`
+8. 导数：\`$\\frac{dy}{dx}$\`
+9. 偏导数：\`$\\frac{\\partial f}{\\partial x}$\`
+10. 极限：\`$\\lim_{x \\to 0} \\frac{\\sin x}{x}$\`
+11. 级数：\`$\\sum_{n=1}^{\\infty} \\frac{1}{n^2}$\`
+12. 二重积分：\`$\\iint_D f(x,y)\\,dx\\,dy$\`
+13. 三角恒等式：\`$\\sin^2 x + \\cos^2 x = 1$\`
+14. 和角公式：\`$\\sin(\\alpha+\\beta) = \\sin\\alpha\\cos\\beta + \\cos\\alpha\\sin\\beta$\`
+15. 重要极限：\`$\\lim_{x \\to 0} \\frac{\\sin x}{x} = 1$\`
+16. 行列式：\`$\\begin{vmatrix} a & b \\\\ c & d \\end{vmatrix} = ad - bc$\`
+17. 特征值：\`$A\\mathbf{v} = \\lambda\\mathbf{v}$\`
+18. 矩阵：\`$\\begin{bmatrix} a_{11} & a_{12} \\\\ a_{21} & a_{22} \\end{bmatrix}$\`
+19. 条件概率：\`$P(A|B) = \\frac{P(A \\cap B)}{P(B)}$\`
+20. 欧拉恒等式：\`$e^{i\\pi} + 1 = 0$\`
+`;
+  const out = promoteLatexInlineCode(list);
+  const formulaLines = out
+    .split("\n")
+    .filter((l) => /^\d+\.\s/.test(l));
+  assert.equal(formulaLines.length, 20, "20 条列表行都应保留");
+  for (const ln of formulaLines) {
+    const body = ln.replace(/^\d+\.\s+/, "");
+    assert.ok(
+      body.indexOf("$$") < 0,
+      `不得出现块级 $$：${ln}`,
+    );
+    assert.ok(
+      body.indexOf("`$") < 0,
+      `不得残留反引号包 $：${ln}`,
+    );
+    assert.ok(
+      body.split("$").length - 1 === 2,
+      `应恰为行内一对 $ 定界：${ln}`,
+    );
+  }
+});
+
+// ─── 官方 WAIT 语义：未出图公式截断后续内容，不跳过、回头补 ───────────────────
+// 镜像 aiMsgMarkdownParser.firstPendingMathItemIndex / mathTokenNeedsWait /
+// isMathConcluded：流式增量渲染列表止于第一个「图尚未就绪」的公式（含其后内容），
+// 待公式出图（scheduleMathFlush 重新增量解析）后再把公式与后续一并上屏。
+
+function mirrorTokenPending(t, displayMode, concludedSet) {
+  if (t.type !== "math") {
+    if (t.tokens) {
+      for (const c of t.tokens) {
+        if (mirrorTokenPending(c, displayMode, concludedSet)) return true;
+      }
+    }
+    return false;
+  }
+  if (
+    (t.href != null && t.href.length > 0) ||
+    (t.html != null && t.html.length > 0)
+  ) {
+    return false;
+  }
+  const key = (displayMode ? "v2d1:" : "v2d0:") + (t.text ?? "");
+  return !concludedSet.has(key);
+}
+
+function mirrorFirstPendingIndex(items, concludedSet) {
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const rows = it.datasList || [];
+    const isBlock = it.type === "math";
+    for (let r = 0; r < rows.length; r++) {
+      for (let t = 0; t < rows[r].length; t++) {
+        if (mirrorTokenPending(rows[r][t], isBlock, concludedSet)) return i;
+      }
     }
   }
   return -1;
 }
 
-function normalizeCjkAutolinkRow(row) {
-  const normalized = [];
-  for (const token of row) {
-    const href = token.href ?? "";
-    const text = token.text ?? "";
-    const boundary = href == text ? findCjkAutolinkBoundary(href) : -1;
-    if (boundary > 0) {
-      normalized.push({
-        ...token,
-        href: href.substring(0, boundary),
-        text: text.substring(0, boundary),
-      });
-      normalized.push({
-        type: "text",
-        href: "",
-        text: text.substring(boundary),
-        className: "text",
-      });
-    } else {
-      normalized.push(token);
-    }
-  }
-  return normalized;
-}
+console.log("\n[7] 官方 WAIT 语义（等公式出图再继续，不跳过、回头补）");
 
-test("中文句号及后续正文不进入 URL", () => {
-  const value = "https://www.baidu.com。需要我做什么操作？";
-  const boundary = findCjkAutolinkBoundary(value);
-  assert.equal(value.substring(0, boundary), "https://www.baidu.com");
-  assert.equal(value.substring(boundary), "。需要我做什么操作？");
+test("已出图公式不截断（前后文同屏）", () => {
+  const items = [
+    { type: "paragraph", datasList: [[{ type: "text", text: "前文" }]] },
+    { type: "math", datasList: [[{ type: "math", text: "E=mc^2", href: "data:image/png;base64,xxx" }]] },
+    { type: "paragraph", datasList: [[{ type: "text", text: "后文" }]] },
+  ];
+  assert.equal(mirrorFirstPendingIndex(items, new Set()), -1, "已出图公式不应截断");
 });
 
-test("无标点的后续中文也不进入 URL", () => {
-  const value = "https://example.com需要继续吗";
-  const boundary = findCjkAutolinkBoundary(value);
-  assert.equal(value.substring(0, boundary), "https://example.com");
+test("在途未结算公式：截断到公式前，后文暂不上屏（等出图再补）", () => {
+  const items = [
+    { type: "paragraph", datasList: [[{ type: "text", text: "前文" }]] },
+    { type: "math", datasList: [[{ type: "math", text: "E=mc^2" }]] }, // href 空且未结算
+    { type: "paragraph", datasList: [[{ type: "text", text: "后文" }]] },
+  ];
+  const idx = mirrorFirstPendingIndex(items, new Set());
+  assert.equal(idx, 1, "应截断在公式所在 item");
+  assert.deepEqual(items.slice(0, idx).map((i) => i.datasList[0][0].text), ["前文"]);
 });
 
-test("ASCII 路径、查询参数和锚点保持完整", () => {
-  assert.equal(
-    findCjkAutolinkBoundary("https://example.com/a/b?q=hello#result"),
-    -1,
-  );
+test("已结算公式（含失败缓存占位）：不截断，占位展示并继续", () => {
+  const items = [
+    { type: "math", datasList: [[{ type: "math", text: "E=mc^2" }]] },
+    { type: "paragraph", datasList: [[{ type: "text", text: "后文" }]] },
+  ];
+  // 已结算：缓存有 key（即使结果为空图）
+  const concluded = new Set(["v2d1:E=mc^2"]);
+  assert.equal(mirrorFirstPendingIndex(items, concluded), -1, "已结算公式不应截断");
 });
 
-test("国际化域名不会被截成协议前缀", () => {
-  assert.equal(findCjkAutolinkBoundary("https://百度.com"), -1);
-  const value = "https://百度.com。继续";
-  const boundary = findCjkAutolinkBoundary(value);
-  assert.equal(value.substring(0, boundary), "https://百度.com");
+test("行内公式（paragraph）同理：未出图未结算则截断其所在段", () => {
+  const items = [
+    { type: "paragraph", datasList: [[{ type: "text", text: "面积 " }, { type: "math", text: "a^2" }]] },
+    { type: "paragraph", datasList: [[{ type: "text", text: "后文" }]] },
+  ];
+  const idx = mirrorFirstPendingIndex(items, new Set());
+  assert.equal(idx, 0, "行内公式未结算应截断其所在段");
 });
 
-test("cmark 裸 URL token 拆为可点击地址和普通中文正文", () => {
-  const value = "https://www.baidu.com。需要我做什么操作？";
-  const normalized = normalizeCjkAutolinkRow([
-    { type: "text", text: value, href: value, className: "text link" },
-  ]);
-  assert.deepEqual(normalized, [
-    {
-      type: "text",
-      text: "https://www.baidu.com",
-      href: "https://www.baidu.com",
-      className: "text link",
-    },
-    {
-      type: "text",
-      text: "。需要我做什么操作？",
-      href: "",
-      className: "text",
-    },
-  ]);
+test("表格单元格行内公式：嵌套 token 同样参与判定", () => {
+  const items = [
+    { type: "table", datasList: [[{ type: "table_cell", tokens: [{ type: "math", text: "x_i" }] }]] },
+    { type: "paragraph", datasList: [[{ type: "text", text: "后文" }]] },
+  ];
+  assert.equal(mirrorFirstPendingIndex(items, new Set()), 0, "表格行内公式未结算应截断");
+  const concluded = new Set(["v2d0:x_i"]);
+  assert.equal(mirrorFirstPendingIndex(items, concluded), -1, "表格行内公式已结算不应截断");
+});
+
+// ─── 官方「整体冻结到闭合」：未闭合块级公式冻结 live，闭合后连同后续内容一并上屏 ──
+// 镜像 findUnclosedBlockFormulaStart：live 区出现未闭合 $$ / \[ 时，只渲染其前内容；
+// 代码围栏内 $$ 忽略（围栏未闭合时内部内容不视为公式）。
+
+console.log("\n[8] 官方「整体冻结到闭合」（未闭合块级公式冻结 live）");
+
+test("未闭合 $$：live 冻结到闭合（不渲染公式及后续）", () => {
+  const live = "$$\nE=mc^2";
+  const at = findUnclosedBlockFormulaStart(live);
+  assert.equal(at, 0);
+  const toParse = at >= 0 ? live.substring(0, at) : live;
+  assert.equal(toParse, "");
+});
+
+test("闭合 $$：不冻结（-1），公式 + 后续正常解析", () => {
+  assert.equal(findUnclosedBlockFormulaStart("$$\nE=mc^2\n$$\n\n后文"), -1);
+});
+
+test("未闭合 \\[：冻结；闭合 \\[ ... \\]：不冻结", () => {
+  assert.equal(findUnclosedBlockFormulaStart("\\[\\int_0^1"), 0);
+  assert.equal(findUnclosedBlockFormulaStart("\\[\\int_0^1 x\\,dx\\]"), -1);
+});
+
+test("代码围栏内 $$ 不触发冻结（围栏未闭合仍按代码展示）", () => {
+  assert.equal(findUnclosedBlockFormulaStart("```python\nprice = $$100\n"), -1);
+});
+
+test("未闭合 $$ 前导安全文本仍渲染", () => {
+  const live = "前文$$\nE=mc^2";
+  const at = findUnclosedBlockFormulaStart(live);
+  assert.equal(at, 2);
+  assert.equal(live.substring(0, at), "前文");
+});
+
+test("findStableMarkdownCut：未闭合 $$ 切点停在公式前，公式留 live 冻结", () => {
+  const body = "第一段。\n\n$$\nE=mc^2";
+  const cut = findStableMarkdownCut(body, true);
+  assert.ok(cut <= body.indexOf("$$"), `cut=${cut} 应 ≤ $$ 起点`);
+  const frozen = body.substring(0, cut);
+  assert.ok(!frozen.includes("$$"), "冻结前缀不得包含未闭合公式");
+});
+
+test("findStableMarkdownCut：闭合公式后正文可正常冻结推进", () => {
+  const body = "第一段。\n\n$$\nE=mc^2\n$$\n\n第二段。";
+  const cut = findStableMarkdownCut(body, true);
+  assert.ok(cut > body.indexOf("$$"), `闭合公式后可推进，got cut=${cut}`);
 });
 
 // ─── 汇总 ──────────────────────────────────────────────────────────────────
@@ -994,4 +1331,8 @@ console.log(`
 3. 改后：稳定前缀冻结 + 只解析 newlyFrozen/live → 累计接近 O(n)，同长样本成本可降到全量一半以下。
 4. 自适应合并窗 + 稳定 key 仍作为正交加固。
 5. 不给公式/表/代码加块级 loading；会话级 icon_loading 表示 SSE 进行中即可。
+6. [7] 官方 WAIT 语义：流式增量渲染止于第一个「图尚未就绪」的公式（含其后内容），
+   公式出图后重新增量解析，把公式与后续内容一并上屏——等公式渲染完再继续，不跳过、回头补。
+7. [8] 官方「整体冻结到闭合」：未闭合块级公式（$$ / \[）出现时，live 只渲染其前内容，
+   公式及之后内容一律不上屏；闭合后下一轮增量解析再把公式 + 后续一并上屏（对齐官方 runTask 冻结）。
 `);

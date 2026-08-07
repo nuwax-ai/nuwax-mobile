@@ -16,7 +16,7 @@ def offline_home() -> Path:
 
 
 def hx_version() -> str:
-    return os.environ.get("NUWAX_HX_VERSION", "5.15")
+    return os.environ.get("NUWAX_HX_VERSION", "5.23")
 
 
 def default_uniappx_ios_sdk() -> str:

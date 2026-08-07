@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from local_base_paths import default_android_esp_work
 
 WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
-PROJ = WORK / "project"
+PROJ = Path(os.environ.get("ANDROID_ESP_PROJECT", str(WORK / "project")))
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APP_MANIFEST = json.loads((PROJECT_ROOT / "manifest.json").read_text())
 APPID = os.environ.get("APPID", "__UNI__8BF05E4")
@@ -42,6 +42,10 @@ if not APPKEY:
 # 是否为 HBuilderX 自定义基座打入调试通道（debug-server + DCLOUD_DEBUG）。
 # 默认开启；正式发行包请设 ENABLE_HX_DEBUG=0，否则可能提示「正在加载调试框架」。
 ENABLE_HX_DEBUG = os.environ.get("ENABLE_HX_DEBUG", "1") != "0"
+# R8 代码裁剪（minifyEnabled+shrinkResources+dontobfuscate，只裁剪不改名）。
+# 默认关闭：DCloud 运行时反射重、官方无 keep 支持，属高风险；显式 NUWAX_ENABLE_R8=1 才开启。
+# 开启后须真机全量冒烟（EasyCom/支付/OAuth/分享/定位/扫码/cmark/ESP）。
+ENABLE_R8 = os.environ.get("NUWAX_ENABLE_R8", "0") == "1"
 # Android 变体签名模式：release 时 debug/release 两个变体统一使用正式证书。
 ANDROID_SIGNING_MODE = os.environ.get("ANDROID_SIGNING_MODE", "debug").strip().lower()
 if ANDROID_SIGNING_MODE not in {"debug", "release"}:
@@ -103,18 +107,41 @@ def configure_settings() -> None:
     if marker.is_file():
         injected = {x.strip() for x in marker.read_text().splitlines() if x.strip()}
     keep = {"app", "uniappx"} | injected | {"uts-nuwax-esp-provisioning"}
+    seen: set[str] = set()
     lines = []
     for line in text.splitlines():
-        m = re.match(r"include\s+':([^']+)'", line.strip())
-        if m and m.group(1) not in keep:
-            if not line.strip().startswith("//"):
-                lines.append("// " + line + "  // stripped by configure_app")
-                continue
+        s = line.strip()
+        # 本脚本上一轮注释掉的 include：模块名现在在 keep 中则恢复为有效 include，否则保留注释
+        m_c = re.match(r"//\s*include\s+':([^']+)'", s)
+        if m_c and "stripped by configure_app" in s:
+            name = m_c.group(1)
+            if name in keep:
+                if name not in seen:
+                    lines.append(f"include ':{name}'")
+                    seen.add(name)
+            else:
+                if name not in seen:
+                    lines.append(line)
+                    seen.add(name)
+            continue
+        m = re.match(r"include\s+':([^']+)'", s)
+        if m:
+            name = m.group(1)
+            if name in keep:
+                if name not in seen:
+                    lines.append(line)
+                    seen.add(name)
+            else:
+                if name not in seen:
+                    lines.append("// " + line + "  // stripped by configure_app")
+                    seen.add(name)
+            continue
         lines.append(line)
-    text = "\n".join(lines) + "\n"
+    # 补 keep 中尚未出现的模块（以有效 include 计数 seen 为准，避免旧注释被误判为已存在）
     for name in sorted(keep - {"app", "uniappx"}):
-        if f"':{name}'" not in text:
-            text += f"include ':{name}'\n"
+        if name not in seen:
+            lines.append(f"include ':{name}'")
+    text = "\n".join(lines) + "\n"
     text = re.sub(
         r'rootProject\.name\s*=\s*"[^"]*"',
         'rootProject.name = "nuwax-mobile-android-base"',
@@ -182,19 +209,24 @@ def strip_project_deps(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
     text = gradle_path.read_text()
-    for mod in SAMPLE_MODULES:
-        text = re.sub(
-            rf"\s*implementation\s+project\(':?{re.escape(mod)}'\)\s*\n",
-            "\n",
-            text,
-        )
-    # 确保注入的 UTS 模块依赖存在
+    # 读取已注入的 UTS 模块
     injected: list[str] = []
     marker = WORK / "injected-uts-modules.txt"
     if marker.is_file():
         injected = [x.strip() for x in marker.read_text().splitlines() if x.strip()]
     if not injected:
         injected = ["uts-nuwax-esp-provisioning"]
+    # app/build.gradle 的本地 project 依赖只应保留：运行时模块 uniappx + 已注入的 UTS 模块。
+    # 其余 implementation project(':...')（DCloud 示例 test-*/native-*/uni-*/app-comm，或
+    # vdom/vapor 两线共享 work 树时另一线残留的 uts-* 插件）对应的模块在 settings.gradle 已被
+    # configure_settings 裁掉 → Gradle "Project with path ':...' could not be found"。
+    # 按 keep 集全量裁剪，使依赖与 settings.gradle 自校正（不再逐个列清单，免漏）。
+    keep = {"uniappx"} | set(injected)
+    for dep in re.findall(r"implementation\s+project\(':[^']+'\)", text):
+        m = re.search(r"':([^']+)'", dep)
+        if m and m.group(1) not in keep:
+            text = re.sub(rf"[ \t]*{re.escape(dep)}[ \t]*\n", "\n", text)
+    # 确保注入的 UTS 模块依赖存在
     for name in injected:
         needle = f"implementation project(':{name}')"
         if needle not in text and "dependencies {" in text:
@@ -306,6 +338,14 @@ def configure_app_gradle() -> None:
     # compileSdk / targetSdk：对齐本机已安装 platform
     text = re.sub(r"compileSdk\s+\d+", f"compileSdk {COMPILE_SDK}", text, count=1)
     text = re.sub(r"targetSdk\s+\d+", f"targetSdk {TARGET_SDK}", text, count=1)
+    # 仅打 arm64-v8a：真机唯一需要的目标 ABI；去掉 armeabi-v7a/x86/x86_64 等约 127MB 死重量原生库。
+    if "abiFilters 'arm64-v8a'" not in text and 'abiFilters "arm64-v8a"' not in text:
+        text = re.sub(
+            r"(targetSdk\s+\d+\s*\n)",
+            r"\1        ndk {\n            abiFilters 'arm64-v8a'\n        }\n",
+            text,
+            count=1,
+        )
     # manifest.json 是应用版本的唯一来源，避免离线宿主保留 SDK 示例版本。
     text = re.sub(
         r"versionCode\s+\d+", f"versionCode {APP_VERSION_CODE}", text, count=1
@@ -651,25 +691,27 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
     text = gradle_path.read_text()
-    # 扩展 exclude 列表（保留 beizi；debug-server 仍从 SDK/libs 排除，改走 app/libs）
-    new_exclude = (
-        "exclude: ["
-        "'**/beizi_fusion_sdk_*.aar', "
-        "'**/uniad_bz_adapter_*.aar', "
-        "'**/uniad_bz-adapter*.aar', "
-        "'**/debug-server-release.aar', "
-        "'**/uniad-*.aar', "
-        "'**/uni-ad-*.aar', "
-        "'**/Baidu_MobAds_SDK.aar', "
-        "'**/GDTSDK*.aar', "
-        "'**/ks_adsdk*.aar', "
-        "'**/Funlink_adapter_uniad*.aar', "
-        "'**/advista-uniad*.aar', "
-        "'**/mm_adapter_uniad*.aar'"
-        "]"
-    )
-    if "**/uniad-*.aar" in text:
-        print(f"✓ SDK libs exclude 已含广告排除: {gradle_path.relative_to(PROJ)}")
+    # 规范化 exclude 列表：广告 SDK（App 无广告）+ 未用的直播/画布/阿里人脸安全。
+    excludes = [
+        "'**/debug-server-release.aar'",
+        "'**/beizi_fusion_sdk_*.aar'", "'**/uniad_bz_adapter_*.aar'", "'**/uniad_bz-adapter*.aar'",
+        "'**/uniad-*.aar'", "'**/uni-ad-*.aar'", "'**/Baidu_MobAds_SDK.aar'", "'**/GDTSDK*.aar'",
+        "'**/ks_adsdk*.aar'", "'**/Funlink_adapter_uniad*.aar'", "'**/advista-uniad*.aar'",
+        "'**/mm_adapter_uniad*.aar'", "'**/open_ad_sdk*.aar'", "'**/wm_ad_sdk*.aar'", "'**/windAd.aar'",
+        "'**/octopus_ad_sdk*.aar'", "'**/adalliance_adn_sdk*.aar'", "'**/Funlink_*release.aar'",
+        "'**/funlink_*release.aar'", "'**/advista-*release.aar'",
+        "'**/uni-live-pusher-release.aar'", "'**/uni-canvas-component-release.aar'",
+        "'**/APSecuritySDK-deepSec-*.aar'", "'**/Android-AliyunFaceGuard-*.aar'", "'**/aliyun-*.aar'",
+        "'**/facialRecognitionVerify-*.aar'", "'**/uni-facialVerify-*.aar'",
+    ]
+    # vapor 模式（5.21+）：运行时由 app/vapor-libs 提供，排除 SDK/libs 副本以免重复类。
+    # VDOM 模式（如 5.15）：运行时必须从 SDK/libs 取，绝不能排除，否则断运行时。
+    is_vapor = (PROJ / "app" / "vapor-libs").is_dir()
+    if is_vapor:
+        excludes = ["'**/app-runtime-release.aar'", "'**/uts-runtime-release.aar'"] + excludes
+    new_exclude = "exclude: [" + ", ".join(excludes) + "]"
+    if "**/uni-facialVerify-*.aar" in text:
+        print(f"✓ SDK libs exclude 已是规范化清单(vapor={is_vapor}): {gradle_path.relative_to(PROJ)}")
         return
     text2, n = re.subn(
         r"exclude:\s*\[[^\]]*\]",
@@ -779,11 +821,65 @@ def relocate_main_activity() -> None:
     print("✓ MainActivity 已改为直接启动业务 App，不显示 SDK 示例页")
 
 
+def patch_gradle_properties() -> None:
+    """调优 gradle.properties：抬高 JVM 堆（R8/全量构建所需）、开启并行与构建缓存。"""
+    p = PROJ / "gradle.properties"
+    if not p.is_file():
+        return
+    text = p.read_text()
+    text = re.sub(
+        r"org\.gradle\.jvmargs\s*=.*",
+        "org.gradle.jvmargs=-Xmx8g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8",
+        text,
+    )
+    for key in ("org.gradle.parallel", "org.gradle.caching"):
+        if key in text:
+            # 已存在（可能被注释）：取消注释并置 true
+            text = re.sub(r"#\s*" + re.escape(key) + r"\s*=.*", f"{key}=true", text)
+            text = re.sub(re.escape(key) + r"\s*=.*", f"{key}=true", text)
+        else:
+            text = text.rstrip() + f"\n{key}=true\n"
+    p.write_text(text)
+    print("✓ gradle.properties: jvmargs=-Xmx8g, parallel=true, caching=true")
+
+
+def apply_r8_minify() -> None:
+    """启用 R8（minifyEnabled+shrinkResources，dontobfuscate 只裁剪不改名）。
+    高风险（DCloud 反射），默认 NUWAX_ENABLE_R8=0 关闭；=1 才开启，须真机全量冒烟。
+    必须在 configure_app_gradle（含 configure_release_signing）之后运行。"""
+    if not ENABLE_R8:
+        print("• R8 未启用（默认；如需开启设 NUWAX_ENABLE_R8=1）")
+        return
+    # 1) keep 规则拷入 work 树 app/proguard-rules.pro（默认是空模板）
+    src = Path(__file__).parent / "proguard-rules.nuwax.pro"
+    dst = PROJ / "app" / "proguard-rules.pro"
+    if src.is_file():
+        dst.write_text(src.read_text())
+        print(f"✓ 拷入 keep 规则 → {dst.relative_to(PROJ)}")
+    else:
+        print(f"⚠ 找不到 {src}，R8 将用空 keep（高风险）")
+    # 2) app/build.gradle release 块翻 minify + shrink（仅 app 模块；库模块 minify 保持 false）
+    p = PROJ / "app" / "build.gradle"
+    text = p.read_text()
+    text = re.sub(r"minifyEnabled\s+false", "minifyEnabled true", text)
+    if "shrinkResources" not in text:
+        # 在 minifyEnabled true 行后插入 shrinkResources true（沿用其缩进）
+        text = re.sub(
+            r"(?m)^(\s*)minifyEnabled true\s*$",
+            r"\1minifyEnabled true" + "\n" + r"\1shrinkResources true",
+            text,
+            count=1,
+        )
+    p.write_text(text)
+    print("✓ R8 已启用：minifyEnabled true + shrinkResources true（dontobfuscate）")
+
+
 def main() -> None:
     if not (PROJ / "settings.gradle").is_file():
         die(f"找不到工程 {PROJ}，请先跑 official/setup_sdk.sh")
     configure_settings()
     configure_app_gradle()
+    apply_r8_minify()
     relocate_main_activity()
     strip_project_deps(PROJ / "app" / "build.gradle")
     strip_project_deps(PROJ / "uniappx" / "build.gradle")
@@ -794,6 +890,7 @@ def main() -> None:
     hide_leakcanary_launcher_entry()
     patch_sdk_libs_excludes(PROJ / "app" / "build.gradle")
     patch_sdk_libs_excludes(PROJ / "uniappx" / "build.gradle")
+    patch_gradle_properties()
     configure_manifest()
     configure_app_name()
     configure_splash_screen()

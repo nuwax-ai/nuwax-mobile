@@ -1,0 +1,397 @@
+/**
+ * 会话流式渲染性能测试 —— Mock 数据层（仅调试 / 性能测试用）。
+ *
+ * 目的：让真实会话页（agent-detail → chat-conversation-component → AgentDetailService → ai-msg.uvue）
+ * 用**可控 Mock 数据**跑完整条流式管线，**排除接口/网络抖动**，测纯渲染性能、可复现。
+ *
+ * 真实页渲染逻辑零改动：AgentDetailService.handleConversation 只把 `chatService.sendMessage`
+ * 换成 `startMockStream`（喂 JSON 字符串 chunk 给既有 chunkCb，draft→coalesce→flush→render 全程不变），
+ * 历史 seed 复用 `createMessageInfoFromAny`（与生产 parseMessageList 同路）。
+ *
+ * 开关约定仿 servers/vox/mockVoxData.uts：storage key 控制，默认关；正式包前须默认关 / 移除。
+ *
+ * 不考虑 vapor（见 docs/perf-conversation-stream-render.md）。
+ */
+import { createMessageInfoFromAny } from "@/subpackages/utils/messageInfoClass.uts";
+import type { MessageInfo } from "@/types/interfaces/conversationInfo";
+
+// ==================== storage keys ====================
+const PERF_MOCK_ENABLED_KEY = "PERF_STREAM_MOCK_ENABLED";
+const PERF_MOCK_MDTYPE_KEY = "PERF_STREAM_MOCK_MDTYPE";
+const PERF_MOCK_HISTORY_KEY = "PERF_STREAM_MOCK_HISTORY";
+const PERF_MOCK_STREAMLEN_KEY = "PERF_STREAM_MOCK_STREAMLEN";
+const PERF_MOCK_INTERVAL_KEY = "PERF_STREAM_MOCK_INTERVAL";
+const PERF_MOCK_CHUNK_KEY = "PERF_STREAM_MOCK_CHUNK";
+
+// ==================== 默认值 ====================
+export const PERF_MOCK_DEFAULT_MDTYPE = "mixed";
+export const PERF_MOCK_DEFAULT_HISTORY = 0;
+export const PERF_MOCK_DEFAULT_STREAMLEN = 0; // 默认 0=不流式(历史/批量渲染场景)；测流式时手动设 L>0
+export const PERF_MOCK_DEFAULT_INTERVAL_MS = 60;
+export const PERF_MOCK_DEFAULT_CHUNK = 16;
+
+export const PERF_MOCK_MDTYPES: string[] = [
+  "plain",
+  "table",
+  "formula",
+  "code",
+  "mermaid",
+  "image",
+  "tool",
+  "mixed",
+];
+
+// ==================== 开关 ====================
+
+/**
+ * 进程级激活标志：test-stream-perf 启动页 applyStreamPerfConfig 置 true，当次进程有效。
+ * 不读 storage —— 避免「-r 保留数据安装 / 测试未清理」的 storage 残留污染正常会话。
+ * 进程销毁（冷启动 / 被系统回收）自动重置为 false，无需任何业务入口介入。
+ */
+let perfMockActivated = false;
+
+/**
+ * 是否启用流式性能 Mock。纯进程内存态，默认 false（生产/正式包保持关）。
+ * 由 pages/test-stream-perf 启动页 applyStreamPerfConfig 激活（当次进程有效）。
+ */
+export function isStreamPerfMockEnabled(): boolean {
+  return perfMockActivated;
+}
+
+/** 仅写 storage 做调试可见性；实际生效与否由 perfMockActivated 控制。 */
+export function setStreamPerfMockEnabled(enabled: boolean): void {
+  uni.setStorageSync(PERF_MOCK_ENABLED_KEY, enabled ? "1" : "0");
+}
+
+/** 一次写完所有配置 + 打开开关（启动页用）。 */
+export function applyStreamPerfConfig(
+  mdType: string,
+  history: number,
+  streamLen: number,
+  intervalMs: number,
+  chunk: number,
+): void {
+  uni.setStorageSync(PERF_MOCK_MDTYPE_KEY, mdType);
+  uni.setStorageSync(PERF_MOCK_HISTORY_KEY, `${history}`);
+  uni.setStorageSync(PERF_MOCK_STREAMLEN_KEY, `${streamLen}`);
+  uni.setStorageSync(PERF_MOCK_INTERVAL_KEY, `${intervalMs}`);
+  uni.setStorageSync(PERF_MOCK_CHUNK_KEY, `${chunk}`);
+  setStreamPerfMockEnabled(true); // 调试可见性
+  perfMockActivated = true; // 实际激活（进程级，当次有效）
+}
+
+/** 关闭开关（页面销毁 / 退出测试时调；进程重启也会自动清）。 */
+export function clearStreamPerfMock(): void {
+  perfMockActivated = false;
+  setStreamPerfMockEnabled(false);
+}
+
+export class StreamPerfConfig {
+  mdType: string = PERF_MOCK_DEFAULT_MDTYPE;
+  history: number = PERF_MOCK_DEFAULT_HISTORY;
+  streamLen: number = PERF_MOCK_DEFAULT_STREAMLEN;
+  intervalMs: number = PERF_MOCK_DEFAULT_INTERVAL_MS;
+  chunk: number = PERF_MOCK_DEFAULT_CHUNK;
+}
+
+export function getStreamPerfConfig(): StreamPerfConfig {
+  const cfg = new StreamPerfConfig();
+  try {
+    const md = uni.getStorageSync(PERF_MOCK_MDTYPE_KEY);
+    if (md != null && `${md}`.length > 0) {
+      cfg.mdType = `${md}`;
+    }
+    cfg.history = parseMockInt(
+      uni.getStorageSync(PERF_MOCK_HISTORY_KEY),
+      PERF_MOCK_DEFAULT_HISTORY,
+    );
+    cfg.streamLen = parseMockInt(
+      uni.getStorageSync(PERF_MOCK_STREAMLEN_KEY),
+      PERF_MOCK_DEFAULT_STREAMLEN,
+    );
+    cfg.intervalMs = parseMockInt(
+      uni.getStorageSync(PERF_MOCK_INTERVAL_KEY),
+      PERF_MOCK_DEFAULT_INTERVAL_MS,
+    );
+    cfg.chunk = parseMockInt(
+      uni.getStorageSync(PERF_MOCK_CHUNK_KEY),
+      PERF_MOCK_DEFAULT_CHUNK,
+    );
+  } catch (_e) {
+    // ignore，用默认值
+  }
+  return cfg;
+}
+
+function parseMockInt(raw: any | null, fallback: number): number {
+  if (raw == null) return fallback;
+  const n = parseFloat(`${raw}`);
+  // n != n 判 NaN（UTS 无 isNaN）
+  if (n != n) return fallback;
+  return n as number;
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms);
+  });
+}
+
+// ==================== Mock 正文样例（按 mdType） ====================
+
+const PLAIN_SAMPLE =
+  "这是一段用于性能测试的纯文本正文。会话流式渲染需要在不同长度下保持流畅，" +
+  "我们要测量平均帧率与最大帧间隔，确保用户在阅读长回复时不会感到卡顿。" +
+  "重复段落用于把正文凑到目标字符数，便于复现。";
+
+const TABLE_SAMPLE =
+  "下面是一个 Markdown 表格示例，结构化内容会走 App 端 structural fallback 解析：\n\n" +
+  "| 指标 | 基线 | 优化后 |\n| --- | --- | --- |\n" +
+  "| 平均帧率 | 18 | 55 |\n| 最大帧间隔 | 9566ms | 40ms |\n" +
+  "| 解析耗时 | 120ms | 30ms |\n| 公式缓存命中 | 0% | 80% |\n\n" +
+  "表格行数越多，排版开销越大，是卡顿的常见来源。\n";
+
+const FORMULA_SAMPLE =
+  "行内公式 $E=mc^2$ 与 $a^2+b^2=c^2$ 混排在正文中。" +
+  "块级公式走 KaTeX 截图桥：\n\n" +
+  "$$\\int_0^1 x^2 \\, dx = \\frac{1}{3}$$\n\n" +
+  "以及矩阵：\n\n" +
+  "$$\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$$\n\n" +
+  "转义形式 \\[ \\int_0^\\infty e^{-x} dx = 1 \\] 与行内 \\( \\sqrt{2} \\) 也要覆盖。\n";
+
+const CODE_SAMPLE =
+  "代码块示例：\n\n" +
+  "```ts\nfunction resolveProcessData(item: any): any {\n  const list = item.processingList;\n" +
+  "  for (let i = 0; i < list.length; i++) {\n    // 每次循环都做一次 cast\n  }\n  return list;\n}\n```\n\n" +
+  "长代码块会触发代码高亮与宽度测量，是渲染热点之一。\n";
+
+// MIXED 改用 buildMixedSample() 组合（含 mermaid / 工具卡 / 图片），见下文。
+
+/**
+ * 10 个 Mermaid 图（flowchart/sequence/state/class/pie/er…），走 proxy-web 渲染（与公式同桥）。
+ */
+function buildMermaidSample(): string {
+  const blocks: string[] = [
+    "graph TD\n  A[开始] --> B{条件判断}\n  B -->|是| C[处理]\n  B -->|否| D[跳过]\n  C --> E[结束]",
+    "sequenceDiagram\n  participant U as 用户\n  participant S as 服务端\n  U->>S: 发起请求\n  S-->>U: 返回结果\n  U->>S: 确认",
+    "graph LR\n  X[输入] --> Y[解析] --> Z[渲染] --> W[输出]",
+    "stateDiagram-v2\n  [*] --> 待机\n  待机 --> 运行: 启动\n  运行 --> 待机: 停止\n  待机 --> [*]: 关闭",
+    "classDiagram\n  class Agent\n  Agent: +chat()\n  Agent: +stop()\n  class Tool\n  Agent --> Tool",
+    "pie title 资源占比\n  \"CPU\" : 40\n  \"内存\" : 35\n  \"IO\" : 25",
+    "flowchart TD\n  M[消息] --> N{类型}\n  N -->|文本| O[直渲]\n  N -->|公式| P[KaTeX]\n  N -->|图| Q[proxy-web]",
+    "sequenceDiagram\n  participant C as 客户端\n  participant P as Proxy\n  participant K as KaTeX\n  C->>P: render(latex)\n  P->>K: screenshot\n  K-->>P: png\n  P-->>C: image",
+    "graph TD\n  Init --> Load --> Parse --> Render --> Scroll --> Done",
+    "erDiagram\n  AGENT ||--o{ CONV : has\n  CONV ||--o{ MSG : contains\n  MSG {\n    string id\n    string text\n  }",
+  ];
+  let out = "下面是 10 个 Mermaid 图（proxy-web 渲染，重负载压测）：\n\n";
+  for (let i = 0; i < blocks.length; i++) {
+    out = out + "```mermaid\n" + blocks[i] + "\n```\n\n";
+  }
+  out = out + "Mermaid 段结束，确保末段闭合，避免增量解析误冻结。\n";
+  return out;
+}
+
+/**
+ * 10 张 Markdown 图片，测图片解码与排版开销（图片元素解析 + image 组件挂载/加载）。
+ * URL 用 picsum.photos 占位；联网则真实解码，断网则走加载失败占位（仍测排版路径）。
+ */
+function buildImageSample(): string {
+  const seeds: string[] = [
+    "alpha",
+    "bravo",
+    "charlie",
+    "delta",
+    "echo",
+    "foxtrot",
+    "golf",
+    "hotel",
+    "india",
+    "juliet",
+  ];
+  let out = "下面是 10 张图片（Markdown image），测图片解码与排版：\n\n";
+  for (let i = 0; i < seeds.length; i++) {
+    out =
+      out +
+      "![" +
+      seeds[i] +
+      "](https://picsum.photos/seed/" +
+      seeds[i] +
+      "/320/200)\n\n";
+  }
+  out = out + "图片段结束。\n";
+  return out;
+}
+
+/**
+ * 工具卡片渲染压测：一组 <markdown-custom-process>（ToolCall，FINISHED/EXECUTING 混合），
+ * 外包 <markdown-custom-process-group>。这是最重渲染路径（resolveProcessData × N、ToolCallCard×N）。
+ * 注：openui-card / agent-info 走独立 artifact 契约（extractOpenUiArtifactFromMessage），
+ * 如需可后续按真实样例报文补充专门 mdType。
+ */
+function buildToolSample(): string {
+  const tools: string[][] = [
+    ["ex1", "ToolCall", "FINISHED", "搜索知识库"],
+    ["ex2", "ToolCall", "FINISHED", "代码执行"],
+    ["ex3", "ToolCall", "FINISHED", "网页抓取"],
+    ["ex4", "ToolCall", "EXECUTING", "数据分析"],
+    ["ex5", "ToolCall", "FINISHED", "生成图表"],
+    ["ex6", "ToolCall", "EXECUTING", "调用 API"],
+    ["ex7", "ToolCall", "FINISHED", "文件读取"],
+    ["ex8", "ToolCall", "FINISHED", "数据库查询"],
+    ["ex9", "ToolCall", "EXECUTING", "模型推理"],
+    ["ex10", "ToolCall", "FINISHED", "结果汇总"],
+  ];
+  let out =
+    "下面是一组工具调用卡片（markdown-custom-process），测工具渲染重负载：\n\n<markdown-custom-process-group>\n";
+  for (let i = 0; i < tools.length; i++) {
+    const t = tools[i];
+    out =
+      out +
+      '<markdown-custom-process executeid="' +
+      t[0] +
+      '" type="' +
+      t[1] +
+      '" status="' +
+      t[2] +
+      '" name="' +
+      t[3] +
+      '"></markdown-custom-process>\n';
+  }
+  out = out + "</markdown-custom-process-group>\n\n工具段结束。\n";
+  return out;
+}
+
+/**
+ * 混合 Markdown：段落 + 表格 + 公式 + 代码 + Mermaid + 工具卡 + 图片，全类型。
+ * mermaid 去重已修（appMarkdownFallback.uts renderMermaidToken 镜像公式去重），可放回 mixed。
+ * 最贴近真实重负载消息，用于压测综合渲染路径。
+ */
+function buildMixedSample(): string {
+  let out = "下面是一段混合内容，覆盖表格、公式、代码、Mermaid、工具卡、图片：\n\n";
+  out = out + TABLE_SAMPLE + "\n";
+  out = out + FORMULA_SAMPLE + "\n";
+  out = out + CODE_SAMPLE + "\n";
+  out =
+    out +
+    "```mermaid\ngraph TD\n  A[开始] --> B{条件}\n  B -->|是| C[处理]\n  B -->|否| D[跳过]\n```\n\n";
+  out =
+    out +
+    "```mermaid\nsequenceDiagram\n  participant U as 用户\n  participant S as 服务端\n  U->>S: 请求\n  S-->>U: 响应\n```\n\n";
+  out = out + buildToolSample() + "\n";
+  out =
+    out +
+    "![](https://picsum.photos/seed/mix1/320/200)\n\n![](https://picsum.photos/seed/mix2/320/200)\n\n";
+  out = out + "收尾段，确保末段闭合完整。\n";
+  return out;
+}
+
+function sampleFor(mdType: string): string {
+  if (mdType == "plain") return PLAIN_SAMPLE;
+  if (mdType == "table") return TABLE_SAMPLE;
+  if (mdType == "formula") return FORMULA_SAMPLE;
+  if (mdType == "code") return CODE_SAMPLE;
+  if (mdType == "mermaid") return buildMermaidSample();
+  if (mdType == "image") return buildImageSample();
+  if (mdType == "tool") return buildToolSample();
+  return buildMixedSample(); // "mixed" / default
+}
+
+/**
+ * 生成 Mock 正文：按 sample **整段**重复到 >= targetLen，**不截断**（保留完整块边界）。
+ * 避免 mermaid/code/工具卡/图片被 substring 砍成半块（未闭合 ```/group/![]()）导致不渲染。
+ * 实际长度可能略大于 targetLen，可复现、无随机。
+ */
+export function getMockBody(mdType: string, targetLen: number): string {
+  if (targetLen <= 0) {
+    return ""; // L<=0：不流式（仅历史 seed，用于长历史场景）
+  }
+  const sample = sampleFor(mdType);
+  if (sample.length == 0) {
+    return sample;
+  }
+  if (targetLen <= sample.length) {
+    return sample; // 整段返回，不截断
+  }
+  let out = sample;
+  while (out.length < targetLen) {
+    out = `${out}\n\n${sample}`;
+  }
+  return out; // 不 substring：保留完整块
+}
+
+// ==================== Mock 历史（seed messageList） ====================
+
+/**
+ * 预置 H 条历史消息（user/assistant 交替），assistant 走目标 mdType 正文。
+ * 复用 createMessageInfoFromAny（与生产 parseMessageList 同一条规范化路径）。
+ */
+export function buildMockMessageList(history: number, mdType: string): MessageInfo[] {
+  const list: MessageInfo[] = [];
+  for (let i = 0; i < history; i++) {
+    const isUser = i % 2 == 0;
+    const draft = new UTSJSONObject();
+    draft["id"] = `perf-h-${i}`;
+    draft["role"] = isUser ? "USER" : "ASSISTANT";
+    draft["messageType"] = isUser ? "USER" : "ASSISTANT";
+    draft["type"] = "CHAT";
+    // 历史助手消息用完整 mdType 样例（重 cell：表格/公式/代码/工具卡/图片），
+    // 配合高 H 压"长历史"场景（scroll-view+v-for 常驻重 view 树）。
+    draft["text"] = isUser ? "（历史用户消息）请帮我分析这段内容。" : sampleFor(mdType);
+    draft["time"] = "2026-08-07 10:00:00";
+    draft["status"] = "complete";
+    draft["finished"] = true;
+    draft["index"] = history - i;
+    const msg = createMessageInfoFromAny(draft);
+    if (msg != null) {
+      list.push(msg);
+    }
+  }
+  return list;
+}
+
+// ==================== Mock SSE 驱动 ====================
+
+/**
+ * 把 Mock 正文按 chunk 切片，每 intervalMs 喂一个 MESSAGE 事件 JSON 字符串给 chunkCb。
+ * 走真实 chunkCb（内含 JSON.parse → handleChangeMessageList），故 draft→coalesce→flush→render 全程不变。
+ * 到达 streamLen 后下发 finished=true 终态事件，调 doneCb。
+ * async + await delay 循环：避开 setInterval 内联箭头 + const 自引用的 UTS 编译坑。
+ */
+export async function startMockStream(
+  chunkCb: (chunk: string) => void,
+  doneCb: () => void,
+  mdType: string,
+  streamLen: number,
+  intervalMs: number,
+  chunk: number,
+): Promise<void> {
+  const body = getMockBody(mdType, streamLen);
+  const step = chunk > 0 ? chunk : PERF_MOCK_DEFAULT_CHUNK;
+  const msgId = "perf-stream-msg";
+  const interval = intervalMs > 0 ? intervalMs : PERF_MOCK_DEFAULT_INTERVAL_MS;
+  let pos = 0;
+  while (pos < body.length) {
+    const end = pos + step;
+    const delta = body.substring(pos, end > body.length ? body.length : end);
+    pos = end;
+    chunkCb(buildMessageEventJson(delta, msgId, false));
+    // 模拟真实 SSE/网络：每个 chunk 间隔加 ±35% 抖动（latency 方差），不再是死匀速。
+    await delayMs(interval * (0.65 + Math.random() * 0.7));
+  }
+  // 终态：空正文 + finished=true
+  chunkCb(buildMessageEventJson("", msgId, true));
+  doneCb();
+}
+
+/** 构造对齐真实 SSE 的 MESSAGE 事件 JSON（handleChangeMessageList 读 eventType/data/data.text/data.id/data.finished）。 */
+function buildMessageEventJson(text: string, id: string, finished: boolean): string {
+  const data = new UTSJSONObject();
+  data["text"] = text;
+  data["id"] = id;
+  data["type"] = ""; // CHAT 正文（非 THINK / QUESTION）
+  data["finished"] = finished;
+  const evt = new UTSJSONObject();
+  evt["eventType"] = "MESSAGE";
+  evt["data"] = data;
+  return JSON.stringify(evt);
+}

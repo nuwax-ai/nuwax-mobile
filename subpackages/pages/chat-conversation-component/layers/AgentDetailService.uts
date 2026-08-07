@@ -54,6 +54,12 @@ import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { API_HEADERS } from "@/constants/api.constants";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { chatService } from "@/utils/chatService";
+import {
+  isStreamPerfMockEnabled,
+  getStreamPerfConfig,
+  startMockStream,
+  buildMockMessageList,
+} from "./mockStreamPerf.uts";
 import { StreamRequest } from "@/utils/streamRequest";
 import { isAppInBackground } from "@/utils/appLifecycle.uts";
 import {
@@ -619,11 +625,11 @@ export default class AgentDetailService {
    * 流式 UI 合并窗。正文/公式路径略宽，避免 40ms 洪峰触发 Markdown+KaTeX 堵 SSE。
    * thinkOnly 用更长合并窗（见 THINK_UI_COALESCE_MS），且早退不 parse。
    */
-  private readonly STREAM_UI_COALESCE_MS: number = 100;
+  private readonly STREAM_UI_COALESCE_MS: number = 200;
   /** THINK-only 合并窗：默认折叠不渲染，仅低频同步标题栏/数据即可 */
   private readonly THINK_UI_COALESCE_MS: number = 500;
   /** 当前 streamUiTimer 使用的合并窗（正文短窗可打断 think 长窗） */
-  private streamUiCoalesceMs: number = 100;
+  private streamUiCoalesceMs: number = 200;
   /** 待冲刷的打字机正文（与 UI 同窗口合并，避免每 SSE 字触发父组件重绘） */
   private pendingStreamingText: string = "";
   private pendingStreamingMsgId: string = "";
@@ -2192,6 +2198,54 @@ export default class AgentDetailService {
       }
       // #endif
 
+      // ===== 性能测试 Mock（默认关）=====
+      // isStreamPerfMockEnabled 由 pages/test-stream-perf 启动页写 storage 打开。
+      // 开启时用 startMockStream 把 Mock 正文按 chunk 喂给 handleChangeMessageList
+      // （draft→coalesce→flush→render 全程不变，仅数据源换成可控 Mock，排除网络抖动），
+      // 跳过真实 chatService.sendMessage。测完 clearStreamPerfMock() 即恢复正常。
+      if (isStreamPerfMockEnabled()) {
+        const mockCfg = getStreamPerfConfig();
+        const mockOnChunk = (chunk: string): void => {
+          if (streamGen != this.streamGeneration) {
+            return;
+          }
+          try {
+            perfRecordSseMessageChunk(chunk.length);
+            const resultObj = JSON.parse(chunk);
+            if (resultObj != null) {
+              this.handleChangeMessageList(resultObj, currentMessageId);
+            }
+          } catch (_eMockChunk) {
+            // ignore
+          }
+        };
+        const mockOnComplete = (): void => {
+          if (streamGen != this.streamGeneration) {
+            return;
+          }
+          // #ifdef APP
+          try {
+            perfRecordSseEvent(
+              "STREAM_COMPLETE",
+              `msg=${currentMessageId} gen=${streamGen} mock=1`,
+            );
+          } catch (_eMockDone) {
+            // ignore
+          }
+          // #endif
+          this.endStreamListDraft();
+          this.handleStreamComplete(params, isTempChat);
+        };
+        await startMockStream(
+          mockOnChunk,
+          mockOnComplete,
+          mockCfg.mdType,
+          mockCfg.streamLen,
+          mockCfg.intervalMs,
+          mockCfg.chunk,
+        );
+        return;
+      }
       await chatService.sendMessage(
         params,
         // 处理流式数据
@@ -2319,6 +2373,163 @@ export default class AgentDetailService {
     } catch (error) {
       console.error("[AgentDetailService] Chat handling failed:", error);
     }
+  }
+
+  /**
+   * 性能测试：seed 预置 Mock 历史消息（仅 isStreamPerfMockEnabled 且 messageList 为空时生效，只 seed 一次）。
+   * 由页面 onLoad 在 perfTest 模式调用，复刻长历史会话场景。
+   */
+  seedMockHistoryIfNeeded(): void {
+    if (!isStreamPerfMockEnabled()) {
+      return;
+    }
+    if (this.data.messageList.value.length > 0) {
+      return;
+    }
+    const cfg = getStreamPerfConfig();
+    if (cfg.history <= 0) {
+      return;
+    }
+    this.data.messageList.value = buildMockMessageList(cfg.history, cfg.mdType);
+    // 重置流式草稿，使其下次从新 messageList 重建
+    this.streamListDraft = null;
+    try {
+      perfRecordSseEvent(
+        "PERF_SEED_HISTORY",
+        `history=${cfg.history} mdType=${cfg.mdType}`,
+      );
+    } catch (_e) {
+      // ignore
+    }
+  }
+
+  /**
+   * 性能测试：自动发起一轮 Mock 流式（无需手动发送、无需 conversationId）。
+   * 复刻 handleSendMessage 的消息构造（用户条 + 助手 Loading 占位 + 旧 Incomplete→Complete），
+   * 然后直接喂 Mock chunk 给 handleChangeMessageList（draft→coalesce→flush→render 全程不变）。
+   * 由页面 onLoad perfTest 分支调用 —— 用户在启动页点「开始测试」即自动流式，无需再发消息。
+   * 终态走最小收尾（不走 handleStreamComplete，避免持久化/网络）。
+   */
+  async runMockPerfStream(): Promise<void> {
+    if (!isStreamPerfMockEnabled()) {
+      return;
+    }
+    const cfg = getStreamPerfConfig();
+    // L<=0：纯历史场景，不流式 —— 不建占位气泡、不置 isConversationActive，
+    // 对齐真实历史加载（接口批量返回、无 active stream）。
+    if (cfg.streamLen <= 0) {
+      return;
+    }
+    const chatMessageId = generateUniqueId();
+    const currentMessageId = generateUniqueId();
+    // 重置流代数 + 草稿 + 打字机通道
+    this.streamGeneration = this.streamGeneration + 1;
+    this.endStreamListDraft();
+    this.clearStreamingAssistantText();
+    this.data.chatSuggestList.value = [] as any[];
+
+    const nowIso = new Date().toISOString();
+    const chatMessage: UTSJSONObject = {
+      role: AssistantRoleEnum.USER,
+      type: MessageModeEnum.CHAT,
+      text: "(perf test)",
+      time: nowIso,
+      id: chatMessageId,
+      messageType: MessageTypeEnum.USER,
+    };
+    const currentMessage: UTSJSONObject = {
+      role: AssistantRoleEnum.ASSISTANT,
+      type: MessageModeEnum.CHAT,
+      text: "",
+      think: "",
+      time: nowIso,
+      id: currentMessageId,
+      messageType: MessageTypeEnum.ASSISTANT,
+      status: MessageStatusEnum.Loading,
+    };
+
+    const prev =
+      this.data.messageList.value != null
+        ? this.data.messageList.value
+        : ([] as MessageInfo[]);
+    const newMessageList: MessageInfo[] = [];
+    for (let i = 0; i < prev.length; i++) {
+      const it = prev[i];
+      if (it.status == MessageStatusEnum.Incomplete) {
+        it.status = MessageStatusEnum.Complete;
+      }
+      newMessageList.push(it);
+    }
+    const chatMsgInfo = createMessageInfoFromAny(chatMessage);
+    const currentMsgInfo = createMessageInfoFromAny(currentMessage);
+    if (chatMsgInfo != null) {
+      newMessageList.push(chatMsgInfo);
+    }
+    if (currentMsgInfo != null) {
+      newMessageList.push(currentMsgInfo);
+    }
+    this.data.messageIdRef.value = "";
+    this.data.currentConversationRequestId.value = "";
+    this.data.isConversationActive.value = true;
+    this.data.messageList.value = newMessageList;
+    this.data.streamingAssistantMessageId.value = currentMessageId;
+    this.data.streamingAssistantText.value = "";
+
+    const streamGen = this.streamGeneration;
+    const mockOnChunk = (chunk: string): void => {
+      if (streamGen != this.streamGeneration) {
+        return;
+      }
+      try {
+        perfRecordSseMessageChunk(chunk.length);
+        const resultObj = JSON.parse(chunk);
+        if (resultObj != null) {
+          this.handleChangeMessageList(resultObj, currentMessageId);
+        }
+      } catch (_eMockChunk) {
+        // ignore
+      }
+    };
+    const mockOnComplete = (): void => {
+      if (streamGen != this.streamGeneration) {
+        return;
+      }
+      // #ifdef APP
+      try {
+        perfRecordSseEvent(
+          "STREAM_COMPLETE",
+          `msg=${currentMessageId} gen=${streamGen} mock=1`,
+        );
+      } catch (_eMockDone) {
+        // ignore
+      }
+      // #endif
+      this.endStreamListDraft();
+      // 最小终态：Loading/Incomplete→Complete + 关闭会话激活（不走 handleStreamComplete，避免持久化/网络）
+      const list = this.data.messageList.value;
+      const next: MessageInfo[] = [];
+      for (let j = 0; j < list.length; j++) {
+        const m = list[j];
+        if (
+          m.status == MessageStatusEnum.Incomplete ||
+          m.status == MessageStatusEnum.Loading
+        ) {
+          m.status = MessageStatusEnum.Complete;
+        }
+        next.push(m);
+      }
+      this.data.messageList.value = next;
+      this.data.isConversationActive.value = false;
+      this.clearStreamingAssistantText();
+    };
+    await startMockStream(
+      mockOnChunk,
+      mockOnComplete,
+      cfg.mdType,
+      cfg.streamLen,
+      cfg.intervalMs,
+      cfg.chunk,
+    );
   }
 
   /**

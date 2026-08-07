@@ -44,30 +44,54 @@ let isVisibilityListenerInitialized = false;
 let pausedByChatPage = false;
 
 /**
- * 将 eventList 归一化为可遍历数组。
- * Android：res.data 常为 UTSJSONObject/Array，禁止 as interface 或带泛型的 JSON.parse。
+ * 诊断日志开关：tester 包置 true 抓 logcat 确认轮询行为，上线前置 false。
  */
-function normalizeEventList(raw: any | null): UTSJSONObject[] {
-  const result: UTSJSONObject[] = [];
+export const EVENT_POLLING_DEBUG = true;
+
+function epLog(msg: string): void {
+  if (EVENT_POLLING_DEBUG == true) {
+    console.log(msg);
+  }
+}
+
+/**
+ * 清事件失败去重：记录上一批签名，连续命中即跳过重复 emit，切断 death-spiral。
+ */
+let lastBatchSig = "";
+let consecutiveUncleared = 0;
+
+/**
+ * 把 eventList 原始数据解析成可遍历的 any[]。
+ * Android：res.data 常为 UTSJSONObject/Array，禁止 as interface 或带泛型的 JSON.parse，
+ * 故先 JSON.stringify 再 JSON.parse 成普通数组（与原 normalizeEventList 的前半段一致）。
+ * 拆出来是为了在 normalize 之前先算签名，命中“上一批没清掉”时跳过昂贵的逐条归一化与 emit。
+ */
+function parseEventItems(raw: any | null): any[] {
   if (raw == null) {
-    return result;
+    return [] as any[];
   }
-  let items: any[] = [];
   if (Array.isArray(raw)) {
-    items = raw as any[];
-  } else {
-    try {
-      const jsonStr = JSON.stringify(raw);
-      if (jsonStr != null && jsonStr.length > 0) {
-        const parsed = JSON.parse(jsonStr);
-        if (Array.isArray(parsed)) {
-          items = parsed as any[];
-        }
-      }
-    } catch (_e) {
-      return result;
-    }
+    return raw as any[];
   }
+  try {
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr != null && jsonStr.length > 0) {
+      const parsed = JSON.parse(jsonStr);
+      if (Array.isArray(parsed)) {
+        return parsed as any[];
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return [] as any[];
+}
+
+/**
+ * 逐条归一化为 UTSJSONObject（沿用原双 JSON 转换以兼容 Android 类型系统）。
+ */
+function normalizeEventItems(items: any[]): UTSJSONObject[] {
+  const result: UTSJSONObject[] = [];
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (item == null) {
@@ -89,18 +113,40 @@ function normalizeEventList(raw: any | null): UTSJSONObject[] {
 }
 
 /**
+ * 为一批事件计算廉价内容签名（条数 + 序列化字符串长度）。
+ * 用于判定 apiClearEvent 失败后“同一批事件是否再次返回”——命中则跳过重复 emit，
+ * 切断“每 5s 重发同批 + 重跑逐条 JSON + 触发徽标网络请求”的 death-spiral。
+ * 两次内容不同的批几乎不可能同时条数相同且序列化长度相同。
+ */
+function computeBatchSig(items: any[]): string {
+  const len = items.length;
+  if (len == 0) {
+    return "";
+  }
+  try {
+    const jsonStr = JSON.stringify(items);
+    return `${len}:${jsonStr.length}`;
+  } catch (_e) {
+    return `${len}`;
+  }
+}
+
+/**
  * 执行一次轮询
  */
 async function pollOnce(): Promise<void> {
   if (isProcessing == true) {
-    console.log('[EventPolling] 跳过重复的事件处理');
+    epLog('[EventPolling] 跳过重复的事件处理');
     return;
   }
+
+  const tickStart = Date.now();
 
   try {
     const response = await apiCollectEvent();
 
     if (response == null || apiResCode(response) != SUCCESS_CODE) {
+      epLog(`[EventPolling] collect 失败 code=${response == null ? "null" : apiResCode(response)} uncleared=${consecutiveUncleared}`);
       return;
     }
 
@@ -116,11 +162,28 @@ async function pollOnce(): Promise<void> {
       hasEventRaw == 1 ||
       `${hasEventRaw}` == "true";
     if (hasEvent != true) {
+      // 无事件：若之前处于 uncleared 状态，记一条恢复日志
+      if (consecutiveUncleared > 0) {
+        epLog(`[EventPolling] 事件已清空，恢复正常轮询（之前 uncleared=${consecutiveUncleared}）`);
+      }
+      lastBatchSig = "";
+      consecutiveUncleared = 0;
       return;
     }
 
-    const eventList = normalizeEventList(dataObj["eventList"]);
+    // 先解析 + 算签名；命中“上一批没清掉”则跳过 normalize/emit，切断 death-spiral
+    const items = parseEventItems(dataObj["eventList"]);
+    const sig = computeBatchSig(items);
+    if (sig.length > 0 && sig == lastBatchSig) {
+      consecutiveUncleared = consecutiveUncleared + 1;
+      epLog(`[EventPolling] 重复批未清除 sig=${sig} 连续=${consecutiveUncleared}，跳过 emit（保 5s 廉价轮询）`);
+      return;
+    }
+
+    const eventList = normalizeEventItems(items);
     if (eventList.length == 0) {
+      lastBatchSig = "";
+      consecutiveUncleared = 0;
       return;
     }
 
@@ -145,13 +208,28 @@ async function pollOnce(): Promise<void> {
         eventBus.emit(typeStr, eventPayload);
       }
 
-      await apiClearEvent();
+      // 检查清事件结果：失败则记下本批签名，下一轮若同批再次返回即去重，避免每 5s 重发
+      const clearRes = (await apiClearEvent()) as UTSJSONObject | null;
+      const clearOk = clearRes != null && apiResCode(clearRes) == SUCCESS_CODE;
+      if (clearOk) {
+        lastBatchSig = "";
+        consecutiveUncleared = 0;
+      } else {
+        lastBatchSig = sig;
+        consecutiveUncleared = consecutiveUncleared + 1;
+        epLog(`[EventPolling] clear 失败 code=${clearRes == null ? "null" : apiResCode(clearRes)} 连续=${consecutiveUncleared}，下轮将去重`);
+      }
     } catch (error) {
       console.error('[EventPolling] 处理事件时出错:', error);
+      // 处理过程中抛错同样按“本批未清”处理，下轮去重
+      lastBatchSig = sig;
+      consecutiveUncleared = consecutiveUncleared + 1;
     } finally {
       startEventPolling();
       isProcessing = false;
     }
+
+    epLog(`[EventPolling] tick size=${eventList.length} tickMs=${Date.now() - tickStart} uncleared=${consecutiveUncleared}`);
   } catch (error) {
     const errMsg = error != null ? `${error}` : "unknown";
     console.error('[EventPolling] 轮询请求失败:', errMsg);

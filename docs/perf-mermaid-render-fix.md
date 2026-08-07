@@ -73,8 +73,8 @@ mermaid 图在会话流式输出时能**正常渲染成图**（不再"图表渲�
 
 未改：`proxy-web.html`、`findStableMarkdownCut`（H3 高风险，去重已让重解析无害，不必动 stable-cut）、解析层根因（`normalizeLiveForParse` 等保持）。
 
-### 待真机验证（需自定义基座，本机无设备）
-1. `pages/test-stream-perf` → `mdType=mermaid` → mermaid **出图**且**不抖动**。
-2. **若仍稳定显示"图表渲染失败"（不抖了但不出图）** → H1 是真的 proxy/mermaid.js 环境问题（非队列爆满），按"修复方向 #1"抓 `callMethod` 请求/回包定位（proxy 未就绪 vs mermaid.render 报错 vs mermaid.min.js 未加载）。本修复是 H1 的**必要条件**（先止住队列爆满），但若 mermaid.js 在该 WebView 根本跑不起来，还需单独治。
-3. 回归：`mdType=mixed`（现不含 mermaid）仍 fps~24 / full_parse 0 / el_stuck 1；公式正常。
-4. 把 mermaid 加回 `mockStreamPerf.uts:buildMixedSample` 后 mixed 流式 mermaid 也不抖。
+### ✅ 真机已验证（2026-08-07）
+真机（自定义基座）`pages/test-stream-perf` → `mdType=mermaid`：**mermaid 正常出图、不抖动**。
+结论：H1（渲染失败）与 H2（抖动）确为同根（无去重 → 灌满 proxy 串行 mermaidQueue → 全超时 + 每帧 href 变）。dedup 缓存修完即好，mermaid.min.js 在该 WebView 本身可正常渲染，无需动 proxy-web.html。
+- 顺带修：测试页 `mdType` 原用 `<picker>`，其 `@change` 事件在 uni-app x 取不到值（`detail` 为空 → 回退当前值 → 切不动）。已改为可点 chip（`@click="onSelectType(i)"`），编译 0 UTS 错误。
+- 回归待补：`mdType=mixed`（现不含 mermaid）仍 fps~24 / full_parse 0 / el_stuck 1 / 公式正常；可把 mermaid 加回 `buildMixedSample` 做联合回归。

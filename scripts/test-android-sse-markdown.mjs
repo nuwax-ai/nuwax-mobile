@@ -1319,6 +1319,37 @@ test("findStableMarkdownCut：闭合公式后正文可正常冻结推进", () =>
   assert.ok(cut > body.indexOf("$$"), `闭合公式后可推进，got cut=${cut}`);
 });
 
+// ─── 裸 URL：数字引用尾标 ──────────────────────────────────────────────────
+
+function mirrorAutolinkBoundary(url) {
+  const schemeLength = url.startsWith("https://") ? 8 : url.startsWith("http://") ? 7 : 0;
+  for (let i = 0; i < url.length; i++) {
+    if (url.charAt(i) !== "[") continue;
+    const host = schemeLength > 0 ? url.substring(schemeLength, i) : "";
+    if (host.length === 0 || /[/?#]/.test(host)) continue;
+    let cursor = i + 1;
+    const digitStart = cursor;
+    while (cursor < url.length && /[0-9]/.test(url.charAt(cursor))) cursor++;
+    if (cursor > digitStart && (cursor === url.length || url.charAt(cursor) === "]")) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+console.log("\n[9] 裸 URL 数字引用尾标");
+
+test("域名后的 [1] 不进入 URL", () => {
+  const value = "https://www.nuwax.com[1]";
+  const boundary = mirrorAutolinkBoundary(value);
+  assert.equal(value.substring(0, boundary), "https://www.nuwax.com");
+  assert.equal(value.substring(boundary), "[1]");
+});
+
+test("URL 路径中的 [1] 保持完整", () => {
+  assert.equal(mirrorAutolinkBoundary("https://example.com/path[1]?a=1"), -1);
+});
+
 // ─── 汇总 ──────────────────────────────────────────────────────────────────
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

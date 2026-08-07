@@ -16,7 +16,7 @@
 _NUWAX_LB_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _NUWAX_REPO_ROOT="$(cd "$_NUWAX_LB_ENV_DIR/.." && pwd)"
 
-export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.15}"
+export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.23}"
 export NUWAX_WORKSPACE_ROOT="${NUWAX_WORKSPACE_ROOT:-$HOME/workspace}"
 export NUWAX_OFFLINE_SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-mobile-offline-sdk}"
 export NUWAX_SDK_ROOT="${NUWAX_SDK_ROOT:-$NUWAX_OFFLINE_SDK_HOME/sdk}"
@@ -38,16 +38,20 @@ export IOS_ESP_OUT="${IOS_ESP_OUT:-$IOS_ESP_BUILD_ROOT/out}"
 export IOS_ESP_FRAMEWORKS_DIR="${IOS_ESP_FRAMEWORKS_DIR:-$IOS_ESP_BUILD_ROOT/official/build/frameworks-iphoneos}"
 
 # ---------- Android ----------
-export UNIAPPX_ANDROID_SDK_ROOT="${UNIAPPX_ANDROID_SDK_ROOT:-$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}}"
-if [[ ! -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
-  _ALT="$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}"
-  if [[ -d "$_ALT/uniappxnativepackage" ]]; then
-    export UNIAPPX_ANDROID_SDK_ROOT="$_ALT"
-  fi
+# build 号（14915/14987…）随 HX 版本变；glob 匹配 sdk/ 下实际目录，避免硬编码 14915。
+if [[ -z "${UNIAPPX_ANDROID_SDK_ROOT:-}" ]]; then
+  _NUWAX_ANDROID_SDK=""
+  for _d in "$NUWAX_SDK_ROOT"/android/"${NUWAX_HX_VERSION}"/Android-uni-app-x-SDK@*-"${NUWAX_HX_VERSION}"; do
+    if [[ -d "$_d/uniappxnativepackage" ]]; then
+      _NUWAX_ANDROID_SDK="$_d"; break
+    fi
+  done
+  [[ -n "$_NUWAX_ANDROID_SDK" ]] && export UNIAPPX_ANDROID_SDK_ROOT="$_NUWAX_ANDROID_SDK"
+  unset _d _NUWAX_ANDROID_SDK
 fi
 export ANDROID_ESP_WORK="${ANDROID_ESP_WORK:-$NUWAX_LOCAL_BASE_ROOT/android}"
-# 按版本选 work 工程，避免两线（vdom 5.15 / vapor 5.23）共享符号链接互相污染。
-# 默认 NUWAX_HX_VERSION=5.15（vdom 线）；vapor 线在其本机环境设 NUWAX_HX_VERSION=5.23。
+# 按版本选 work 工程，避免多 checkout 共享符号链接互相污染。
+# 默认 NUWAX_HX_VERSION=5.23（当前 diff 线 VDOM 5.23）；回退其他版本时显式 export 覆盖。
 # glob 匹配 build 号（14915/14987…），匹配不到则回退旧的 project 符号链接。
 if [[ -z "${ANDROID_ESP_PROJECT:-}" ]]; then
   _NUWAX_PROJ_MATCH=""

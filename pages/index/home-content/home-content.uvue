@@ -71,6 +71,7 @@
           :refresher-enabled="true"
           :refresher-triggered="refreshing && activeTab == 'history'"
           :show-scrollbar="false"
+          @scroll="handleConversationScroll"
           @scrolltolower="handleConversationLoadMore"
           @refresherrefresh="handleConversationRefresh"
         >
@@ -391,9 +392,17 @@
   }
 
   const conversationList = ref<UTSJSONObject[]>([]);
-  const convLoading = ref<boolean>(false);
+  const convInitialLoading = ref<boolean>(false);
+  const convLoadingMore = ref<boolean>(false);
   const convHasMore = ref<boolean>(false);
   const lastId = ref<number | null>(null);
+  const pageVisible = ref<boolean>(true);
+  const resumeLoadMoreCheckPending = ref<boolean>(false);
+  let conversationRequestPromise: Promise<boolean> | null = null;
+
+  const convLoading = computed((): boolean => {
+    return convInitialLoading.value || convLoadingMore.value;
+  });
 
   function toNum(v: any | null, fallback: number = 0): number {
     if (v == null) {
@@ -505,10 +514,14 @@
     return !convLoading.value && !convHasMore.value && clLen > 8;
   });
 
-  async function fetchConversationList(isLoadMore: boolean = false): Promise<void> {
+  async function fetchConversationList(isLoadMore: boolean = false): Promise<boolean> {
     if (!props.isLoggedIn) {
-      convLoading.value = false;
-      return;
+      if (isLoadMore) {
+        convLoadingMore.value = false;
+      } else {
+        convInitialLoading.value = false;
+      }
+      return false;
     }
     try {
       const params = new ConversationListParams();
@@ -516,7 +529,6 @@
       params.lastId = isLoadMore ? lastId.value : null;
       params.limit = 20;
       const res = await apiAgentConversationList(params);
-      convLoading.value = false;
       if (apiResCode(res) == SUCCESS_CODE) {
         const newList = normalizeList(apiResData<any>(res));
         if (isLoadMore) {
@@ -539,16 +551,49 @@
         } else {
           convHasMore.value = false;
         }
+        return true;
       }
+      return false;
     } catch (error) {
-      convLoading.value = false;
+      console.error("fetchConversationList error:", error);
+      return false;
+    } finally {
+      if (isLoadMore) {
+        convLoadingMore.value = false;
+      } else {
+        convInitialLoading.value = false;
+      }
+    }
+  }
+
+  async function requestConversationList(isLoadMore: boolean): Promise<boolean> {
+    const pending = conversationRequestPromise;
+    if (pending != null) {
+      return await pending;
+    }
+
+    if (isLoadMore) {
+      if (!convHasMore.value) {
+        return false;
+      }
+      convLoadingMore.value = true;
+    } else {
+      convInitialLoading.value = true;
+    }
+
+    const requestPromise = fetchConversationList(isLoadMore);
+    conversationRequestPromise = requestPromise;
+    try {
+      return await requestPromise;
+    } finally {
+      // 单飞入口保证同一时刻只有这一笔会话列表请求。
+      conversationRequestPromise = null;
     }
   }
 
   async function loadConversation() {
-    if (convLoading.value) return;
-    convLoading.value = true;
-    await fetchConversationList(false);
+    if (conversationList.value.length > 0) return;
+    await requestConversationList(false);
   }
 
   function getConvItemByIndex(index: number): UTSJSONObject | null {
@@ -694,11 +739,11 @@
   }
 
   async function handleConversationRefresh() {
-    if (refreshing.value) return;
+    if (refreshing.value || conversationRequestPromise != null) return;
     refreshing.value = true;
     lastId.value = null;
     convHasMore.value = true;
-    await fetchConversationList(false);
+    await requestConversationList(false);
     setTimeout(() => {
       refreshing.value = false;
     }, 500);
@@ -712,17 +757,62 @@
   }
 
   function handleConversationLoadMore() {
-    if (convHasMore.value && !convLoading.value) {
-      convLoading.value = true;
-      fetchConversationList(true);
+    if (convHasMore.value && conversationRequestPromise == null) {
+      requestConversationList(true);
     }
   }
 
-  // 对外暴露：父页 onShow 时刷新当前 tab
+  /**
+   * APP 原生 list-view 在页面隐藏期间完成数据追加后，可能不会重新派发
+   * scrolltolower。仅在“分页中途离开页面”的场景记录一次补偿，用户返回后
+   * 首次继续滚动即消费，避免正常返回时无条件多加载一页。
+   */
+  async function resumeConversationLoadMore(): Promise<void> {
+    const pending = conversationRequestPromise;
+    if (pending != null) {
+      await pending;
+    }
+    if (pageVisible.value && convHasMore.value && conversationRequestPromise == null) {
+      await requestConversationList(true);
+    }
+  }
+
+  function handleConversationScroll(_e: UniScrollEvent): void {
+    if (!pageVisible.value || !resumeLoadMoreCheckPending.value) {
+      return;
+    }
+    resumeLoadMoreCheckPending.value = false;
+    resumeConversationLoadMore();
+  }
+
+  // 对外保留手动加载入口；页面恢复使用 resumeData，避免覆盖分页数据。
   async function loadData() {
     if (activeTab.value == "recent") {
       await loadRecent();
     } else {
+      await loadConversation();
+    }
+  }
+
+  /** 页面离开前记录分页是否被导航打断。 */
+  function pauseData(): void {
+    pageVisible.value = false;
+    if (convLoadingMore.value) {
+      resumeLoadMoreCheckPending.value = true;
+    }
+  }
+
+  /**
+   * 返回首页时保留当前列表、游标与滚动位置，只补首屏空数据。
+   * 不再调用 loadData 刷新第一页，避免覆盖已追加的分页结果。
+   */
+  async function resumeData(): Promise<void> {
+    pageVisible.value = true;
+    if (activeTab.value == "recent") {
+      if (recentAgentList.value.length == 0 && !recentLoading.value) {
+        await loadRecent();
+      }
+    } else if (conversationList.value.length == 0 && conversationRequestPromise == null) {
       await loadConversation();
     }
   }
@@ -753,6 +843,8 @@
 
   defineExpose({
     loadData: loadData as any,
+    pauseData: pauseData as any,
+    resumeData: resumeData as any,
     changeContentTab: changeContentTab as any,
   });
 </script>

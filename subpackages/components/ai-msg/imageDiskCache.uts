@@ -1,0 +1,520 @@
+/**
+ * App 渲染结果截图缓存（数学公式 + mermaid 流程图）：
+ * - L1 内存：SSE 同会话秒级复用，避免落盘完成前反复截图
+ * - L2 磁盘：PNG + storage 索引，冷启动可恢复；上限 FIFO=800
+ * H5：读写均为空操作。
+ *
+ * 每类渲染各自独立命名空间（storage 索引 / 缓存目录 / 文件名前缀）：
+ * - 公式：  MATH_FORMULA_DISK_CACHE_V3 + katex-cache + k_*.png（key 沿用 v2d0/v2d1 前缀，旧缓存不失效）
+ * - mermaid：MERMAID_DISK_CACHE_V1 + mermaid-cache + m_*.png
+ */
+
+const DISK_CACHE_MAX: number = 800;
+// 公式 V3：作废 V2 中因 proxy-web 错误折叠 \\→\ 而缓存的坏图（pmatrix 等）
+const MATH_INDEX_STORAGE_KEY: string = "MATH_FORMULA_DISK_CACHE_V3";
+const MERMAID_INDEX_STORAGE_KEY: string = "MERMAID_DISK_CACHE_V1";
+const MATH_CACHE_DIR_NAME: string = "katex-cache";
+const MERMAID_CACHE_DIR_NAME: string = "mermaid-cache";
+
+/** 对外缓存条目：本地路径或 dataURL + 宽高 */
+export class MathRenderCacheEntry {
+  imageDataURL: string = "";
+  width: number = 0;
+  height: number = 0;
+  resultHtml: string = "";
+}
+
+class MathDiskIndexItem {
+  key: string = "";
+  fileName: string = "";
+  width: number = 0;
+  height: number = 0;
+}
+
+function isAppDiskCacheEnabled(): boolean {
+  let enabled = false;
+  // #ifdef APP
+  enabled = true;
+  // #endif
+  return enabled;
+}
+
+function hashString(s: string): string {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    // UTS: charCodeAt 返回 Number?，需先解包
+    const codeRaw = s.charCodeAt(i);
+    const code = codeRaw != null ? codeRaw : 0;
+    h = (h * 31 + code) % 2147483647;
+    if (h < 0) {
+      h = 0 - h;
+    }
+  }
+  return h.toString(16) + "_" + s.length.toString();
+}
+
+function escapeIndexField(s: string): string {
+  return s
+    .split("%")
+    .join("%25")
+    .split("|")
+    .join("%7C")
+    .split("\n")
+    .join("%0A")
+    .split("\r")
+    .join("%0D");
+}
+
+function unescapeIndexField(s: string): string {
+  return s
+    .split("%0D")
+    .join("\r")
+    .split("%0A")
+    .join("\n")
+    .split("%7C")
+    .join("|")
+    .split("%25")
+    .join("%");
+}
+
+function parseIndexLine(line: string): MathDiskIndexItem | null {
+  if (line.length == 0) {
+    return null;
+  }
+  const p1 = line.indexOf("|");
+  if (p1 < 0) {
+    return null;
+  }
+  const p2 = line.indexOf("|", p1 + 1);
+  if (p2 < 0) {
+    return null;
+  }
+  const p3 = line.indexOf("|", p2 + 1);
+  if (p3 < 0) {
+    return null;
+  }
+  const fileName = unescapeIndexField(line.substring(0, p1));
+  const wText = line.substring(p1 + 1, p2);
+  const hText = line.substring(p2 + 1, p3);
+  const key = unescapeIndexField(line.substring(p3 + 1));
+  if (fileName.length == 0 || key.length == 0) {
+    return null;
+  }
+  const item = new MathDiskIndexItem();
+  item.fileName = fileName;
+  item.key = key;
+  item.width = parseInt(wText);
+  item.height = parseInt(hText);
+  if (isNaN(item.width) == true) {
+    item.width = 0;
+  }
+  if (isNaN(item.height) == true) {
+    item.height = 0;
+  }
+  return item;
+}
+
+function unlinkQuiet(filePath: string): void {
+  try {
+    uni.getFileSystemManager().unlink({
+      filePath: filePath,
+      fail: (_e) => {},
+    });
+  } catch (_eUnlink) {
+    // ignore
+  }
+}
+
+function fileExistsSync(filePath: string): boolean {
+  try {
+    uni.getFileSystemManager().accessSync(filePath);
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+function stripDataUrlBase64(dataUrl: string): string {
+  const marker = "base64,";
+  const idx = dataUrl.indexOf(marker);
+  if (idx >= 0) {
+    return dataUrl.substring(idx + marker.length);
+  }
+  // 已是纯 base64
+  if (dataUrl.indexOf("data:") == 0) {
+    return "";
+  }
+  return dataUrl;
+}
+
+/** 单命名空间磁盘缓存：索引 + 目录 + L1 全部独立，公式与 mermaid 互不干扰。 */
+class DiskImageCache {
+  private indexLoaded: boolean = false;
+  private indexItems: MathDiskIndexItem[] = [] as MathDiskIndexItem[];
+  private dirEnsured: boolean = false;
+  private readonly storageKey: string;
+  private readonly dirName: string;
+  private readonly filePrefix: string;
+  private readonly cacheMax: number;
+  /** 会话内 L1：key → entry（可含 dataURL，落盘后改为 filePath） */
+  private readonly memoryL1 = new Map<string, MathRenderCacheEntry>();
+  private memoryL1Keys: string[] = [] as string[];
+
+  constructor(
+    storageKey: string,
+    dirName: string,
+    filePrefix: string,
+    cacheMax: number,
+  ) {
+    this.storageKey = storageKey;
+    this.dirName = dirName;
+    this.filePrefix = filePrefix;
+    this.cacheMax = cacheMax;
+  }
+
+  private putMemoryL1(key: string, entry: MathRenderCacheEntry): void {
+    if (this.memoryL1.has(key) == false) {
+      this.memoryL1Keys.push(key);
+    }
+    this.memoryL1.set(key, entry);
+    while (this.memoryL1Keys.length > this.cacheMax) {
+      const oldKey = this.memoryL1Keys.shift();
+      if (oldKey != null && oldKey.length > 0) {
+        this.memoryL1.delete(oldKey);
+      }
+    }
+  }
+
+  private getMemoryL1(key: string): MathRenderCacheEntry | null {
+    if (this.memoryL1.has(key) == false) {
+      return null;
+    }
+    return this.memoryL1.get(key) as MathRenderCacheEntry;
+  }
+
+  private loadIndex(): void {
+    if (this.indexLoaded == true) {
+      return;
+    }
+    this.indexLoaded = true;
+    this.indexItems = [] as MathDiskIndexItem[];
+    if (isAppDiskCacheEnabled() == false) {
+      return;
+    }
+    try {
+      const raw = uni.getStorageSync(this.storageKey);
+      if (raw == null) {
+        return;
+      }
+      const text = `${raw}`;
+      if (text.length == 0) {
+        return;
+      }
+      const lines = text.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        const item = parseIndexLine(lines[i]);
+        if (item != null) {
+          this.indexItems.push(item);
+        }
+      }
+    } catch (_eLoad) {
+      this.indexItems = [] as MathDiskIndexItem[];
+    }
+  }
+
+  private persistIndex(): void {
+    if (isAppDiskCacheEnabled() == false) {
+      return;
+    }
+    try {
+      uni.setStorageSync(this.storageKey, this.serializeIndex());
+    } catch (_eSave) {
+      console.warn(
+        "[DiskImageCache] persistIndex fail key=" + this.storageKey,
+      );
+    }
+  }
+
+  private cacheRootDir(): string {
+    return `${uni.env.USER_DATA_PATH}/${this.dirName}`;
+  }
+
+  private ensureCacheDir(): string {
+    const dir = this.cacheRootDir();
+    if (this.dirEnsured == true) {
+      return dir;
+    }
+    if (isAppDiskCacheEnabled() == false) {
+      return dir;
+    }
+    try {
+      const fs = uni.getFileSystemManager();
+      try {
+        fs.accessSync(dir);
+      } catch (_eAccess) {
+        try {
+          fs.mkdirSync(dir, true);
+        } catch (_eMk) {
+          console.warn("[DiskImageCache] mkdir fail dir=" + dir);
+        }
+      }
+      this.dirEnsured = true;
+    } catch (_eFs) {
+      console.warn("[DiskImageCache] ensureCacheDir fail");
+    }
+    return dir;
+  }
+
+  private findIndexItem(key: string): MathDiskIndexItem | null {
+    for (let i = 0; i < this.indexItems.length; i++) {
+      if (this.indexItems[i].key == key) {
+        return this.indexItems[i];
+      }
+    }
+    return null;
+  }
+
+  private removeIndexAt(index: number): void {
+    if (index < 0 || index >= this.indexItems.length) {
+      return;
+    }
+    const next = [] as MathDiskIndexItem[];
+    for (let i = 0; i < this.indexItems.length; i++) {
+      if (i != index) {
+        next.push(this.indexItems[i]);
+      }
+    }
+    this.indexItems = next;
+  }
+
+  private serializeIndex(): string {
+    let out = "";
+    for (let i = 0; i < this.indexItems.length; i++) {
+      const it = this.indexItems[i];
+      if (i > 0) {
+        out += "\n";
+      }
+      out +=
+        escapeIndexField(it.fileName) +
+        "|" +
+        `${it.width}` +
+        "|" +
+        `${it.height}` +
+        "|" +
+        escapeIndexField(it.key);
+    }
+    return out;
+  }
+
+  private evictOverflow(): void {
+    while (this.indexItems.length > this.cacheMax) {
+      const old = this.indexItems.shift();
+      if (old == null) {
+        break;
+      }
+      unlinkQuiet(this.ensureCacheDir() + "/" + old.fileName);
+    }
+  }
+
+  /**
+   * 读取缓存：先 L1（SSE 防重复截图），再磁盘。
+   */
+  get(key: string): MathRenderCacheEntry | null {
+    if (isAppDiskCacheEnabled() == false) {
+      return null;
+    }
+    const mem = this.getMemoryL1(key);
+    if (mem != null && mem.imageDataURL.length > 0) {
+      return mem;
+    }
+    this.loadIndex();
+    const item = this.findIndexItem(key);
+    if (item == null) {
+      return null;
+    }
+    const filePath = this.ensureCacheDir() + "/" + item.fileName;
+    if (fileExistsSync(filePath) == false) {
+      // 文件丢失：剔除索引
+      for (let i = 0; i < this.indexItems.length; i++) {
+        if (this.indexItems[i].key == key) {
+          this.removeIndexAt(i);
+          this.persistIndex();
+          break;
+        }
+      }
+      return null;
+    }
+    const entry = new MathRenderCacheEntry();
+    entry.imageDataURL = filePath;
+    entry.width = item.width;
+    entry.height = item.height;
+    this.putMemoryL1(key, entry);
+    return entry;
+  }
+
+  /**
+   * 写入缓存：先同步进 L1（SSE 立刻可复用），再异步落盘。
+   */
+  put(key: string, res: UTSJSONObject): void {
+    if (isAppDiskCacheEnabled() == false) {
+      return;
+    }
+    const imageData = res["imageDataURL"];
+    if (imageData == null) {
+      return;
+    }
+    const dataUrl = `${imageData}`;
+    if (dataUrl.length == 0) {
+      return;
+    }
+    let width = 0;
+    let height = 0;
+    const widthData = res["width"];
+    const heightData = res["height"];
+    if (widthData != null) {
+      width = widthData as number;
+    }
+    if (heightData != null) {
+      height = heightData as number;
+    }
+    // 同步 L1：后续 SSE 重解析不再打 proxy
+    const l1 = new MathRenderCacheEntry();
+    l1.imageDataURL = dataUrl;
+    l1.width = width;
+    l1.height = height;
+    const htmlData = res["resultHtml"];
+    if (htmlData != null) {
+      l1.resultHtml = `${htmlData}`;
+    }
+    this.putMemoryL1(key, l1);
+
+    // 已是本地路径：只更新磁盘索引元数据
+    if (dataUrl.indexOf("data:") != 0) {
+      this.loadIndex();
+      const existing = this.findIndexItem(key);
+      if (existing != null) {
+        existing.width = width;
+        existing.height = height;
+        this.persistIndex();
+      }
+      return;
+    }
+    const pure = stripDataUrlBase64(dataUrl);
+    if (pure.length == 0) {
+      return;
+    }
+    this.loadIndex();
+
+    let fileName = "";
+    const existing = this.findIndexItem(key);
+    if (existing != null) {
+      fileName = existing.fileName;
+    } else {
+      fileName = this.filePrefix + hashString(key) + ".png";
+      // 哈希碰撞时换名，避免两套内容共用一个文件
+      for (let i = 0; i < this.indexItems.length; i++) {
+        if (
+          this.indexItems[i].fileName == fileName &&
+          this.indexItems[i].key != key
+        ) {
+          fileName =
+            this.filePrefix +
+            hashString(key) +
+            "_" +
+            Date.now().toString() +
+            ".png";
+          break;
+        }
+      }
+    }
+    const filePath = this.ensureCacheDir() + "/" + fileName;
+    const fs = uni.getFileSystemManager();
+    fs.writeFile({
+      filePath: filePath,
+      data: pure,
+      encoding: "base64",
+      success: () => {
+        this.loadIndex();
+        const again = this.findIndexItem(key);
+        if (again != null) {
+          again.width = width;
+          again.height = height;
+          again.fileName = fileName;
+        } else {
+          const item = new MathDiskIndexItem();
+          item.key = key;
+          item.fileName = fileName;
+          item.width = width;
+          item.height = height;
+          this.indexItems.push(item);
+        }
+        this.evictOverflow();
+        this.persistIndex();
+        // 落盘成功后 L1 改为文件路径，释放巨型 base64 字符串
+        const pathEntry = new MathRenderCacheEntry();
+        pathEntry.imageDataURL = filePath;
+        pathEntry.width = width;
+        pathEntry.height = height;
+        this.putMemoryL1(key, pathEntry);
+      },
+      fail: (err) => {
+        console.warn(
+          "[DiskImageCache] writeFile fail keyLen=" +
+            key.length +
+            " err=" +
+            `${err}`,
+        );
+      },
+    });
+  }
+}
+
+/** 公式命名空间：沿用 V3 索引与 katex-cache 目录，旧缓存不失效。 */
+const mathCache = new DiskImageCache(
+  MATH_INDEX_STORAGE_KEY,
+  MATH_CACHE_DIR_NAME,
+  "k_",
+  DISK_CACHE_MAX,
+);
+/** mermaid 命名空间：独立索引与目录。 */
+const mermaidCache = new DiskImageCache(
+  MERMAID_INDEX_STORAGE_KEY,
+  MERMAID_CACHE_DIR_NAME,
+  "m_",
+  DISK_CACHE_MAX,
+);
+
+export function getMathCache(key: string): MathRenderCacheEntry | null {
+  return mathCache.get(key);
+}
+
+export function putMathCache(key: string, res: UTSJSONObject): void {
+  mathCache.put(key, res);
+}
+
+export function getMermaidCache(key: string): MathRenderCacheEntry | null {
+  return mermaidCache.get(key);
+}
+
+export function putMermaidCache(key: string, res: UTSJSONObject): void {
+  mermaidCache.put(key, res);
+}
+
+export function cacheEntryToRes(entry: MathRenderCacheEntry): UTSJSONObject {
+  const res = new UTSJSONObject();
+  res["imageDataURL"] = entry.imageDataURL;
+  if (entry.width > 0) {
+    res["width"] = entry.width;
+  }
+  if (entry.height > 0) {
+    res["height"] = entry.height;
+  }
+  if (entry.resultHtml.length > 0) {
+    res["resultHtml"] = entry.resultHtml;
+  }
+  return res;
+}
+
+export function getMathCacheMax(): number {
+  return DISK_CACHE_MAX;
+}

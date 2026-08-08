@@ -1461,8 +1461,12 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   assert.match(aiMsg, /answer-plain-stream-text/);
   assert.match(fastText, /frozenChunks/);
   assert.match(aiMsg, /\$callMethod\("updateText"/);
-  assert.match(aiMsg, /isPlainStreamBody/);
-  assert.match(aiMsg, /plainStreamPacing/);
+  assert.match(aiMsg, /resolveStreamRenderProfile/);
+  assert.match(aiMsg, /streamDisplayPacing/);
+  const policy = readFileSync(new URL("../subpackages/components/ai-msg/streamRenderPolicy.uts", import.meta.url), "utf8");
+  assert.match(policy, /STREAM_RENDER_KIND_CODE/);
+  assert.match(policy, /STREAM_RENDER_KIND_TABLE/);
+  assert.match(policy, /STREAM_RENDER_KIND_FORMULA/);
   assert.match(service, /StreamBurstDetector/);
   assert.match(scroll, /contentMayRelayout/);
 });

@@ -1489,6 +1489,78 @@ test("正式会话固定使用 scroll-view，list-view 仅保留给性能 A/B", 
   assert.match(conversation, /v-if="isPerfMock" class="perf-overlay"/);
 });
 
+console.log("\n[12] Android 代码流式轻量代码块快通道");
+
+test("代码快通道按围栏拆分稳定段和当前活动段", () => {
+  function splitCodeSegments(body) {
+    const lines = body.split("\n");
+    const segments = [];
+    let buffer = [];
+    let inCode = false;
+    let language = "text";
+    const flush = (closed) => {
+      if (buffer.length == 0) return;
+      segments.push({
+        kind: inCode ? "code" : "prose",
+        text: buffer.join("\n"),
+        language,
+        closed,
+      });
+      buffer = [];
+    };
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!inCode && trimmed.startsWith("```")) {
+        flush(true);
+        inCode = true;
+        language = trimmed.slice(3).trim() || "text";
+      } else if (inCode && trimmed.startsWith("```")) {
+        flush(true);
+        inCode = false;
+        language = "text";
+      } else {
+        buffer.push(line);
+      }
+    }
+    flush(!inCode);
+    return segments;
+  }
+
+  const open = splitCodeSegments("说明\n```ts\nconst n = 1");
+  assert.deepEqual(open.map((item) => item.kind), ["prose", "code"]);
+  assert.equal(open[1].closed, false);
+  assert.equal(open[1].language, "ts");
+
+  const closed = splitCodeSegments("说明\n```ts\nconst n = 1\n```\n收尾");
+  assert.deepEqual(closed.map((item) => item.kind), ["prose", "code", "prose"]);
+  assert.equal(closed[1].closed, true);
+  assert.equal(closed[2].text, "收尾");
+});
+
+test("代码类型直更轻量代码叶子，终态及混合类型走完整 Markdown", () => {
+  const policy = readFileSync(
+    new URL("../subpackages/components/ai-msg/streamRenderPolicy.uts", import.meta.url),
+    "utf8",
+  );
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  const codeStream = readFileSync(
+    new URL("../subpackages/components/ai-msg/code-stream-fast-render.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(policy, /STREAM_RENDER_KIND_CODE[\s\S]*canPatchLeaf = true/);
+  assert.match(policy, /matched > 1[\s\S]*canPatchLeaf = false/);
+  assert.match(aiMsg, /CodeStreamFastRender/);
+  assert.match(aiMsg, /updateCodeStreamTarget/);
+  assert.match(codeStream, /code-stream-code-language/);
+  assert.match(codeStream, /white-space: pre/);
+  assert.doesNotMatch(codeStream, /UniAiMsgCode/);
+  assert.match(aiMsg, /UniAiXMsgRender/);
+  assert.match(codeStream, /parseCodeStreamSegments/);
+});
+
 // ─── 汇总 ──────────────────────────────────────────────────────────────────
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

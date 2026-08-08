@@ -49,7 +49,7 @@
         </view>
       </view>
 
-      <!-- AI 答复内容：结构内容走 UniAiXMsgRender，Android 纯文本流式走轻量原生 text。 -->
+      <!-- AI 答复内容：结构内容走 UniAiXMsgRender；Android 纯文本/代码流式走对应轻量叶子。 -->
       <view class="answer-container">
         <!--
           约 512 字在自然换行处冻结一个静态块，只更新有界尾块。
@@ -62,6 +62,13 @@
             :pacing="streamDisplayPacing"
             :text-style="plainStreamTextStyle"
             @caughtUp="tryFinishPlainStreamFinalization"
+          />
+        </template>
+        <template v-else-if="showCodeStreamRender">
+          <CodeStreamFastRender
+            ref="codeStreamFastRenderRef"
+            :initial-text="codeStreamInitialText"
+            @caughtUp="tryFinishCodeStreamFinalization"
           />
         </template>
         <UniAiXMsgRender
@@ -107,6 +114,7 @@
   import msgToolBar from "@/subpackages/components/msg-tool-bar/msg-tool-bar.uvue";
   import UniAiXMsgRender from "@/uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue";
   import PlainStreamFastText from "@/subpackages/components/ai-msg/plain-stream-fast-text.uvue";
+  import CodeStreamFastRender from "@/subpackages/components/ai-msg/code-stream-fast-render.uvue";
   import { stripOpenUiActionIdMarker } from "@/utils/openUiSchema.uts";
   // #ifdef APP
   import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
@@ -132,6 +140,7 @@
   import {
     resolveStreamRenderProfile,
     STREAM_RENDER_KIND_PLAIN,
+    STREAM_RENDER_KIND_CODE,
   } from "@/subpackages/components/ai-msg/streamRenderPolicy.uts";
 
   const { t: tFn } = useI18n();
@@ -624,6 +633,94 @@
     // #endif
   }
 
+  // ==================== Android 代码流式真实渲染器快通道 ====================
+  const codeStreamInitialText = ref<string>("");
+  const codeStreamFastRenderRef = ref<any | null>(null);
+  const codeStreamEngaged = ref<boolean>(false);
+  const codeStreamFinalizing = ref<boolean>(false);
+  let codeStreamTargetText = "";
+  let codeStreamFinalizeFrame = 0;
+  let codeStreamSwapFrame = 0;
+
+  const showCodeStreamRender = computed((): boolean => {
+    return (
+      (codeStreamEngaged.value == true || codeStreamFinalizing.value == true) &&
+      codeStreamTargetText.length > 0
+    );
+  });
+
+  function clearCodeStreamFinalizeFrame(): void {
+    if (codeStreamFinalizeFrame != 0) {
+      cancelAnimationFrame(codeStreamFinalizeFrame);
+      codeStreamFinalizeFrame = 0;
+    }
+    if (codeStreamSwapFrame != 0) {
+      cancelAnimationFrame(codeStreamSwapFrame);
+      codeStreamSwapFrame = 0;
+    }
+  }
+
+  function updateCodeStreamTarget(body: string): void {
+    codeStreamTargetText = body;
+    const el = codeStreamFastRenderRef.value;
+    if (el != null) {
+      try {
+        const proxy = el as ComponentPublicInstance;
+        proxy.$callMethod("updateText", body);
+        return;
+      } catch (_eUpdateCode) {
+        // 首次挂载前落回 initialText。
+      }
+    }
+    codeStreamInitialText.value = body;
+  }
+
+  function enterCodeStream(body: string): void {
+    if (codeStreamEngaged.value != true) {
+      leavePlainStreamForMarkdown();
+      clearStreamMdParseTimer();
+      markdownParser.suspendForPlainStream();
+      codeStreamEngaged.value = true;
+      codeStreamFinalizing.value = false;
+    }
+    updateCodeStreamTarget(body);
+  }
+
+  function leaveCodeStreamForMarkdown(): void {
+    clearCodeStreamFinalizeFrame();
+    codeStreamTargetText = "";
+    codeStreamInitialText.value = "";
+    codeStreamEngaged.value = false;
+    codeStreamFinalizing.value = false;
+  }
+
+  function tryFinishCodeStreamFinalization(): void {
+    if (codeStreamFinalizing.value != true) return;
+    if (markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) != true) {
+      return;
+    }
+    if (codeStreamSwapFrame == 0) {
+      codeStreamSwapFrame = requestAnimationFrame((): void => {
+        codeStreamSwapFrame = 0;
+        if (
+          codeStreamFinalizing.value == true &&
+          markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) == true
+        ) {
+          codeStreamFinalizing.value = false;
+        }
+      });
+    }
+  }
+
+  function canUseAndroidCodeStream(body: string): boolean {
+    // #ifdef APP-ANDROID
+    return resolveStreamRenderProfile(body).kind == STREAM_RENDER_KIND_CODE;
+    // #endif
+    // #ifndef APP-ANDROID
+    return false;
+    // #endif
+  }
+
   function runBodyMarkdownParseNow(forceDone: boolean): void {
     clearStreamMdParseTimer();
     // App：始终立即 parse。磁盘缓存命中可直接出图，不必再等 proxyWeb（历史长公式页可省约 1s）；
@@ -658,6 +755,10 @@
       enterPlainStream(rawBody);
       return;
     }
+    if (streaming == true && canUseAndroidCodeStream(rawBody) == true) {
+      enterCodeStream(rawBody);
+      return;
+    }
     if (streaming == false) {
       if (plainStreamEngaged.value == true) {
         plainStreamEngaged.value = false;
@@ -672,8 +773,21 @@
         });
         return;
       }
+      if (codeStreamEngaged.value == true) {
+        codeStreamEngaged.value = false;
+        codeStreamFinalizing.value = true;
+        updateCodeStreamTarget(rawBody);
+        clearCodeStreamFinalizeFrame();
+        codeStreamFinalizeFrame = requestAnimationFrame((): void => {
+          codeStreamFinalizeFrame = 0;
+          runBodyMarkdownParseNow(true);
+          tryFinishCodeStreamFinalization();
+        });
+        return;
+      }
       runBodyMarkdownParseNow(true);
       tryFinishPlainStreamFinalization();
+      tryFinishCodeStreamFinalization();
       return;
     }
     if (
@@ -681,6 +795,9 @@
       plainStreamFinalizing.value == true
     ) {
       leavePlainStreamForMarkdown();
+    }
+    if (codeStreamEngaged.value == true || codeStreamFinalizing.value == true) {
+      leaveCodeStreamForMarkdown();
     }
     // 首帧立刻出字，避免空白等节流
     if (markdownParser.resolveRenderList().length == 0) {
@@ -847,7 +964,7 @@
             return;
           }
         }
-        // Android 纯文本热路径：权威正文由 Service draft 累计；气泡内只直更叶子 text。
+        // Android 叶子热路径：权威正文由 Service draft 累计；气泡内只直更真实文本/代码 renderer。
         // 不写 msg.body / streamRevision，避免每个 24ms 窗让整个 ai-msg 参与 VDOM diff。
         const directPatch = newData as UTSJSONObject;
         const directBodyVal = directPatch["body"];
@@ -862,6 +979,14 @@
               enterPlainStream(directBody);
             } else {
               updatePlainStreamTarget(directBody);
+            }
+            return;
+          }
+          if (canUseAndroidCodeStream(directBody) == true) {
+            if (codeStreamEngaged.value != true) {
+              enterCodeStream(directBody);
+            } else {
+              updateCodeStreamTarget(directBody);
             }
             return;
           }
@@ -1055,6 +1180,7 @@
     (): string => msg.value._id,
     () => {
       resetPlainStreamState();
+      leaveCodeStreamForMarkdown();
       markdownParser.resetForNewMessage();
       thinkFrozenParts = [] as string[];
       thinkLivePart = "";
@@ -1104,11 +1230,13 @@
   /** 终态 cmark/fallback 完成会 bump revision；等可见尾字追平后再无闪烁切树。 */
   watch(streamRevision, () => {
     tryFinishPlainStreamFinalization();
+    tryFinishCodeStreamFinalization();
   });
 
   onUnmounted(() => {
     clearStreamMdParseTimer();
     clearPlainStreamFinalizeFrame();
+    clearCodeStreamFinalizeFrame();
     if (thinkTextThrottleTimer != null) {
       clearTimeout(thinkTextThrottleTimer!);
       thinkTextThrottleTimer = null;

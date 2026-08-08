@@ -4,7 +4,7 @@
 > 日期：2026-08-08
 > 计划源：`~/.claude/plans/proxy-web-mermaid-idempotent-glacier.md`
 > 关联：`perf-conversation-stream-render.md` Phase 4c（长历史列表层 / view 回收）的落地；`perf-mermaid-render-fix.md`；`handoff-chat-webview-leak-deadlock.md`
-> **状态：5 阶段代码已全部写完，尚未 HBuilderX / 自定义基座真机编译验证。**
+> **状态：迁移暂缓。2026-08-08 决定正式会话继续使用 scroll-view，先按真实渲染类型优化结构化内容；list-view 仅保留在默认关闭的性能 Mock 中做后续 A/B。**
 
 ---
 
@@ -39,7 +39,7 @@ mermaid 不再走 proxy-web 截图，当代码块显示 → 消除「异步截�
 
 - **list-view 分支**：`<list-view v-if="useListView" ...>`，消息项 `<list-item v-for :type="1" :key>` 包单个 `<view class="msg-list-item">` shell；非消息项各给独立 `:type`（90 loading-more / 91 new-conversation-set / 92 suggestions / 93 task-loading / 94 empty-state / 95 last-msg 锚点）。参考 `pages/index/home-content/home-content.uvue` 模式。
 - **scroll-view 分支**：`<scroll-view v-else ...>`，原全量渲染结构（无 list-item 包裹）。两分支内容保持同步，仅 list-item 包裹差异（模板内有 `↓↓↓/↑↑↑` 注释标注，改动任一须同步另一）。
-- **正式会话**恒走 list-view（`useListView` 默认 `true`，**不读 storage** → 测试残留不污染正常会话）。
+- **当前正式会话**恒走 scroll-view（`useListView` 默认 `false`，**不读 storage** → 测试残留不污染正常会话）；list-view 仅在性能 Mock 进程内激活后读取 A/B 配置。
 
 **两个切换入口**（核心：A/B 同机同数据）：
 

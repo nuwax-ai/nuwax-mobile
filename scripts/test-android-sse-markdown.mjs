@@ -1472,6 +1472,23 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   assert.match(scroll, /contentMayRelayout/);
 });
 
+console.log("\n[11] scroll-view 结构化渲染基线边界");
+
+test("正式会话固定使用 scroll-view，list-view 仅保留给性能 A/B", () => {
+  const conversation = readFileSync(
+    new URL("../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue", import.meta.url),
+    "utf8",
+  );
+  const mock = readFileSync(
+    new URL("../subpackages/pages/chat-conversation-component/layers/mockStreamPerf.uts", import.meta.url),
+    "utf8",
+  );
+  assert.match(conversation, /const useListView = ref<boolean>\(false\)/);
+  assert.match(mock, /PERF_MOCK_DEFAULT_USE_LISTVIEW = false/);
+  assert.doesNotMatch(conversation, /class="render-toggle-btn"/);
+  assert.match(conversation, /v-if="isPerfMock" class="perf-overlay"/);
+});
+
 // ─── 汇总 ──────────────────────────────────────────────────────────────────
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

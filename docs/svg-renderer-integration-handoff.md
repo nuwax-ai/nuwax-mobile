@@ -70,12 +70,10 @@ x-svg-renderer README 明确：「Keep LaTeX/Mermaid parsing outside the native 
 
 ## 当前两个运行时阻塞（与极致架构无关，是落地细节）
 
-### 1. 图标方框（lime-icon 读 /storage 失败）
-- apk `assets/.../www/uni_modules/lime-icon/static/icons.json` **打包齐全**（62KB）
-- 设备 `/storage/.../www/uni_modules/lime-icon/static/icons.json` **读不到**（logcat: `No such file or directory` errCode 1300002）
-- 根因：lime-icon 用 `fileSystemManager` 读 `/storage` 绝对路径，**本地 assembleDebug 基座资源在 apk assets 不落盘 /storage** → 图标方框
-- 与公式整合无关（整合只改公式代码）。云端/标准基座资源释放机制不同所以之前正常
-- 排查方向：lime-icon 改读 assets 路径 / debug 基座配置释放资源 / 换基座
+### 1. 图标方框（lime-icon，debug 基座固有限制，未解；正式包 OK）
+- 根因：lime-icon Android 用 `getFileSystemManager().readFile` 读 `uni_modules/lime-icon/static/icons.json`，uni 把它解析成 `/storage/.../www/...`；本地 assembleDebug 基座的 www 在 apk **assets 不落盘 /storage** → FileNotFound(errCode 1300002) → 图标方框
+- **试过 Android 统一 `import iconList from '../../static/icons.json'`（非 Android 的用法）→ 失败**：Android uts 对 import json 触发 `Type checking has run into a recursive problem`（uniappx/index.kt 一堆递归错），base 编译挂。这正是 lime-icon 原作者在 Android 走 readFile 而非 import 的原因。已回退 readFile（commit 2b28210e）
+- 结论：**debug 基座固有限制**。正式包 / release 基座 www 会释放到 /storage，readFile 正常，图标显示。debug 验证接受图标方框；验图标用 release 包（`ANDROID_BUILD_TYPE=release make base-android` 或 `base-ship`）
 
 ### 2. 公式不渲染（proxy_not_ready）
 - logcat: `setSetting { error: "proxy_not_ready", imageDataURL: "", resultHtml: "" }`，全程无 `[MATHSVG]` 日志

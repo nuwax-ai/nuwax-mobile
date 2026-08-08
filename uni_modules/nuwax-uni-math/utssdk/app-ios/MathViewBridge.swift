@@ -3,23 +3,25 @@
 // MathViewBridge.swift
 // nuwax-uni-math (iOS 混编 Swift 文件)
 //
-// iOS 原生数学视图桥：把 iosMath 的 MTMathView（CoreText 矢量数学排版，自带 latinmodern 等
+// iOS 原生数学视图桥：把 iosMath 的 MTMathUILabel（CoreText 矢量数学排版，自带 latinmodern 等
 // OTF 数学字体）包成 UTS 可调的静态方法，供 <x-native-math> 的 <native-view> 经 bindIOSView 绑定。
 //
 // 与 Android 端 utssdk/app-android/index.uts 的 NativeMathView 语义对齐（AndroidMath 是 iosMath
-// 的 Java/Kotlin 移植，MTMathView API 几乎一致：latex / labelMode / fontSize / textColor）。
+// 的 Java/Kotlin 移植；Android 类叫 MTMathView，iOS 原版类叫 MTMathUILabel——API 镜像但类名不同：
+// latex / labelMode / fontSize / textColor）。
 //
 // 混编约定（同 MathSvgBridge.swift / esp EspProvisioningBridge）：public final class : NSObject，
 // 纯 Swift 无 @objc，index.uts 无需 import 直接以「MathViewBridge.静态方法」调用；
 // number 跨 UTS↔Swift 边界映射为 NSNumber（fontSize / colorArgb 用 NSNumber，内部转 CGFloat/Int64）。
 //
-// ★ 待 Xcode 真机验证（本环境只能 appResource 转译，不跑 swiftc / 不解析 pod）：
-//   1. iosMath pod 版本：0.9.4 是最后的 CocoaPods 版本（1.x/2.x 已转 SPM，2.x 还把类改名 MTMathUILabel）。
-//      config.json 钉 0.9.4；若你的 pod 镜像有更高 1.x（同名 MTMathView API）可改用之；勿用 2.x。
-//   2. `import iosMath`：现代 pod 一般 DEFINES_MODULE=YES 可直接 import；若该 pod 未设模块，
-//      删掉本行、靠自动 bridging header 用 MTMathView（类名全局可见）。
-//   3. MTMathViewMode 枚举：ObjC NS_ENUM 在 Swift 下常剥前缀（kMTMathViewModeDisplay → .display）。
-//      下面用原 ObjC 名 kMTMathViewModeDisplay；若 swiftc 报错改 MTMathViewMode.display / .text。
+// ★ 已核对（搜 uni-app x 官方 + iosMath 0.9.4 头文件 + 仓库 ESP 混编范式，2026-08-08）：
+//   1. iosMath 0.9.4 主类是 MTMathUILabel（iosMath/render/MTMathUILabel.h : MTView : UIView），
+//      【不存在 MTMathView】——MTMathView 是 Android 端 com.agog.mathdisplay 的移植命名。
+//   2. `import iosMath` 正确：与同仓 esp 插件 `import ESPProvision` 同构（config.json
+//      dependencies-pods 声明 pod，.swift 里 import <模块名>）。UTS 侧无需 import 同目录 .swift
+//      的 public 类（见 uts-plugin-hybrid；ESP index.uts 即裸调 EspProvisioningBridge）。
+//   3. 枚举 MTMathUILabelMode（typedef NS_ENUM(unsigned int, ...)）：ObjC kMTMathUILabelModeDisplay/
+//      kMTMathUILabelModeText → Swift 导入剥前缀+去 k → .display / .text（与 SwiftMath 移植一致）。
 
 import Foundation
 import UIKit
@@ -27,10 +29,10 @@ import iosMath
 
 public final class MathViewBridge: NSObject {
 
-  /// 创建 MTMathView（按 app 默认配置），返回 UIView 供 UTS 侧 bindIOSView 绑定。
-  /// MTMathView 是 UIView 子类，CoreText 排版在原生层完成（不过 proxy web-view，无 evalJS 桥）。
+  /// 创建 MTMathUILabel（按 app 默认配置），返回 UIView 供 UTS 侧 bindIOSView 绑定。
+  /// MTMathUILabel : MTView : UIView，CoreText 排版在原生层完成（不过 proxy web-view，无 evalJS 桥）。
   public static func createView() -> UIView {
-    let v = MTMathView(frame: CGRect.zero)
+    let v = MTMathUILabel(frame: CGRect.zero)
     // 解析失败时把错误内联显示（红字），便于真机调试 LaTeX 覆盖度；可视情况关。
     v.displayErrorInline = true
     return v
@@ -46,10 +48,10 @@ public final class MathViewBridge: NSObject {
     _ fontSize: NSNumber,
     _ colorArgb: NSNumber
   ) {
-    guard let v = view as? MTMathView else { return }
+    guard let v = view as? MTMathUILabel else { return }
     v.latex = latex
-    // ★ 枚举名见文件头注释；若 swiftc 报错改 .display / .text。
-    v.labelMode = display ? MTMathViewMode.kMTMathViewModeDisplay : MTMathViewMode.kMTMathViewModeText
+    // MTMathUILabelMode：display=true 块级（$$ \displaystyle）/ false 行内（$ text 模式）
+    v.labelMode = display ? MTMathUILabelMode.display : MTMathUILabelMode.text
     let size = fontSize.doubleValue
     if size > 0 {
       v.fontSize = CGFloat(size)

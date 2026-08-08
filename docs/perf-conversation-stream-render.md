@@ -16,7 +16,7 @@
 - [x] **Phase 3** — 消融对比（`INCREMENTAL_FALLBACK_ENABLED` ON vs OFF）✅ 结论见下"消融结论"
 - [x] **Phase 4a（解析层治本）** — `normalizeLiveForParse`（半截块提交）+ cut-regress 钳制（不退全量）。✅ mixed@6000 验证：full_parse_large 18→3、el_stuck 73→2、解析 9ms（见下"解析层修复验证"）
 - [~] **Phase 4b（渲染层·部分）** — ✅ flush 窗 `STREAM_UI_COALESCE_MS` 100→**200ms**（maxGap 381→241ms、`sse_without_parse` 14→0）。fps~14 上限已排除事件轮询（5s 间隔、非每帧）/ 排除 flush 频率（100 与 200 都 ~14）→ 是**常驻重 view 树**（mixed@6000 一大堆原生 view），突破需 list-view 回收。`uni-ai-x-msg` 模板函数记忆化未做（mock 下 resolveProcessData 因 processingList 空、本身已快）。
-- [ ] **Phase 4c（长历史列表层 / view 回收）** — `scroll-view`→`list-view`（高风险：`:type`/`:key`/image lazy-load 无效/末条流式气泡拆独立组件；memory 已记坑）；另 `getMessageAttachments` 预算 / deep watch 收窄。**fps 流畅度的真正杠杆**。
+- [~] **Phase 4c（长历史列表层 / view 回收）** — `scroll-view`→`list-view` **代码已落地（双模板运行时切换 + mermaid 临时关闭），待真机验证**，详见 [`perf-list-view-migration.md`](./perf-list-view-migration.md)。当年 `2db9d6d2`→`bd1dfa12` 回滚根因已核实 = **mermaid 回收即崩 + 表格高度**（非公式/流式）；本次 mermaid→代码拔崩溃点 + `useListView` A/B 切换（`test-stream-perf` chip / perf 浮层）+ Phase2 `updateMessage` 自校验 id / Phase4 rebind 清解析定时器。`getMessageAttachments` 预算 / deep watch 收窄见 Phase 4 A/B/D。**fps 流畅度的真正杠杆**。
 
 ---
 

@@ -1405,19 +1405,6 @@ function mirrorShouldPace(samples) {
   return gaps[p95Index] > 100;
 }
 
-function mirrorFreezePlainStreamChunks(text, threshold = 512) {
-  const frozen = [];
-  let frozenLength = 0;
-  while (text.length - frozenLength >= threshold) {
-    const unfrozen = text.substring(frozenLength);
-    const cut = unfrozen.lastIndexOf("\n");
-    if (cut <= 0) break;
-    frozen.push(unfrozen.substring(0, cut));
-    frozenLength += cut + 1;
-  }
-  return { frozen, live: text.substring(frozenLength) };
-}
-
 console.log("\n[10] Android 纯文本流式快速通道");
 
 test("普通中英文和自然换行走纯文本快速通道", () => {
@@ -1439,12 +1426,15 @@ test("Unicode 揭示边界不会拆开 Emoji 代理对", () => {
   assert.equal(text.substring(0, mirrorSafeRevealEnd(text, 2)), "甲😀");
 });
 
-test("按自然换行冻结有界块，避免逐行节点膨胀", () => {
-  const text = `${"甲".repeat(300)}\n\n${"乙".repeat(300)}\n尾段`;
-  const split = mirrorFreezePlainStreamChunks(text);
-  assert.equal(split.frozen.length, 1);
-  assert.equal(split.frozen[0], `${"甲".repeat(300)}\n\n${"乙".repeat(300)}`);
-  assert.equal(split.live, "尾段");
+test("纯文本快速通道始终使用单个原生 text，避免冻结分段丢高度", () => {
+  const source = readFileSync(
+    new URL("../subpackages/components/ai-msg/plain-stream-fast-text.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /displayChunk\.value = text/);
+  assert.match(source, /<text v-if="displayChunk\.length > 0"/);
+  assert.doesNotMatch(source, /PlainStreamFrozenText/);
+  assert.doesNotMatch(source, /FREEZE_CHUNK_CHARS/);
 });
 
 test("仅在大块或 p95 间隔超过阈值时开启二次匀速", () => {
@@ -1474,7 +1464,7 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   const service = readFileSync(new URL("../subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts", import.meta.url), "utf8");
   const scroll = readFileSync(new URL("../subpackages/pages/chat-conversation-component/layers/ScrollManager.uts", import.meta.url), "utf8");
   assert.match(aiMsg, /answer-plain-stream-text/);
-  assert.match(fastText, /frozenChunks/);
+  assert.match(fastText, /displayChunk/);
   assert.match(fastText, /visibleBatchChars > 16/);
   assert.match(aiMsg, /\$callMethod\("updateText"/);
   assert.match(aiMsg, /resolveStreamRenderProfile/);
@@ -1501,6 +1491,62 @@ test("快速通道结束时先同步累计正文再执行 Markdown 定稿", () =
   assert.match(
     aiMsg,
     /codeStreamEngaged\.value == true\)[\s\S]*?commitFastStreamBody\(codeStreamTargetText\)[\s\S]*?runBodyMarkdownParseNow\(true\)/,
+  );
+});
+
+test("纯文本叶子以 64ms leading/trailing 通知既有滚动跟底链路", () => {
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  const fastText = readFileSync(
+    new URL("../subpackages/components/ai-msg/plain-stream-fast-text.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(fastText, /displayProgress: \[\]/);
+  assert.match(fastText, /const DISPLAY_PROGRESS_MS: number = 64/);
+  assert.match(
+    fastText,
+    /function emitDisplayProgress\(\): void[\s\S]*?progressPending = true[\s\S]*?emit\("displayProgress"\)[\s\S]*?DISPLAY_PROGRESS_MS/,
+  );
+  assert.match(aiMsg, /@displayProgress="handlePlainStreamDisplayProgress"/);
+  assert.match(
+    aiMsg,
+    /function handlePlainStreamDisplayProgress\(\): void[\s\S]*?uni\.\$emit\("streamMessageUpdate"\)/,
+  );
+});
+
+test("纯文本叶子直更不与服务层重复触发滚底", () => {
+  const service = readFileSync(
+    new URL(
+      "../subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.match(
+    service,
+    /pendingUiNeedScroll == true && leafDirectPatch != true/,
+  );
+});
+
+test("纯文本完成后保留原生文本高度，Markdown 仅完成后台定稿", () => {
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(aiMsg, /const plainStreamCompleted = ref<boolean>\(false\)/);
+  assert.match(
+    aiMsg,
+    /plainStreamCompleted\.value == true[\s\S]*?plainStreamTargetText\.length > 0/,
+  );
+  assert.match(
+    aiMsg,
+    /plainStreamCompleted\.value =[\s\S]*?resolveStreamRenderProfile\(resolveBodyText\(\)\)\.kind ==[\s\S]*?STREAM_RENDER_KIND_PLAIN/,
+  );
+  assert.match(
+    aiMsg,
+    /function enterPlainStream\([\s\S]*?plainStreamCompleted\.value = false/,
   );
 });
 

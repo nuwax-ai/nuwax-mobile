@@ -23,8 +23,10 @@ import {
 import {
   cacheEntryToRes,
   getMathCache,
+  getMermaidCache,
   putMathCache,
-} from "@/subpackages/components/ai-msg/mathFormulaDiskCache.uts";
+  putMermaidCache,
+} from "@/subpackages/components/ai-msg/imageDiskCache.uts";
 import { perfRecordMathBatchDetail } from "@/utils/perfProbe.uts";
 
 type MathRenderedCallback = () => void;
@@ -2297,6 +2299,7 @@ function renderMathToken(
  * 流式 live 区每 flush 重解析，闭合 mermaid 块若滞留 live 区会每帧重发 proxy 截图 →
  * 灌满 proxy 串行 mermaidQueue → 全部超时失败（"图表渲染失败"）+ href 每帧变 → 抖动。
  * 故同 text：成功结果缓存命中直填（零 proxy 调用）、在途去重扇出、失败短期冷却不每帧重试。
+ * 成功结果额外落盘（imageDiskCache L2，与公式同款）：冷启动再进页面直接复用截图。
  */
 
 /** mermaid 截图结果缓存：成功存 href/宽高；失败仅记 failAt 做冷却 */
@@ -2346,13 +2349,28 @@ function renderMermaidToken(
       return;
     }
   }
-  // 3) 在途去重：同 text 已 dispatch 未回调，挂入等待列表，回调时统一扇出
+  // 3) L2 磁盘缓存命中（冷启动恢复）：与公式同款，直填本地路径并预热 L1，零 proxy 调用
+  const diskCached = getMermaidCache(mermaidText);
+  if (diskCached != null && diskCached.imageDataURL.length > 0) {
+    token.href = diskCached.imageDataURL;
+    if (diskCached.width > 0) token.width = diskCached.width;
+    if (diskCached.height > 0) token.height = diskCached.height;
+    const warm = new MermaidCacheEntry();
+    warm.href = diskCached.imageDataURL;
+    warm.width = diskCached.width;
+    warm.height = diskCached.height;
+    warm.ok = true;
+    mermaidCache.set(mermaidText, warm);
+    callback();
+    return;
+  }
+  // 4) 在途去重：同 text 已 dispatch 未回调，挂入等待列表，回调时统一扇出
   const existing = mermaidInFlight.get(mermaidText);
   if (existing != null) {
     existing.push(new MermaidWaiter(token, callback));
     return;
   }
-  // 4) 首次 dispatch：登记在途
+  // 5) 首次 dispatch：登记在途
   const waiters = [] as MermaidWaiter[];
   waiters.push(new MermaidWaiter(token, callback));
   mermaidInFlight.set(mermaidText, waiters);
@@ -2375,6 +2393,8 @@ function renderMermaidToken(
         const heightData = res["height"];
         if (widthData != null) entry.width = widthData as number;
         if (heightData != null) entry.height = heightData as number;
+        // L2 落盘：下次冷启动直接复用截图（异步写，不阻塞扇出）
+        putMermaidCache(mermaidText, res);
       } else {
         // 失败：记冷却时间戳，不回填 href（渲染组件落代码 Tab）
         entry.ok = false;

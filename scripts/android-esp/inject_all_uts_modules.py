@@ -64,6 +64,39 @@ def detect_min_sdk(export_dir: Path) -> int:
     return 21
 
 
+def detect_dependencies(export_dir: Path) -> list[str]:
+    """读 config.json 的 dependencies（Maven 坐标数组），供模块编译期 compileOnly。
+
+    UTS 插件 index.kt 若 import 了三方包（如 com.caverock.androidsvg），
+    该模块自身的 build.gradle 必须声明依赖，否则 compileDebugKotlin 报
+    Unresolved reference。打包侧由 app/build.gradle 的 implementation 真正打进 APK。
+
+    坐标归一化：DCloud config.json 约定 artifactId 的 "-aar" 后缀是打包类型提示
+    （HBuilderX 生成 app/build.gradle 时同样去掉），真实 Maven artifactId 不含它。
+    例如 com.caverock:androidsvg-aar:1.4 → com.caverock:androidsvg:1.4。
+    """
+    cfg = export_dir / "config.json"
+    if cfg.is_file():
+        try:
+            data = json.loads(cfg.read_text())
+            deps = data.get("dependencies", [])
+            if isinstance(deps, list):
+                out: list[str] = []
+                for d in deps:
+                    d = str(d).strip()
+                    if not d:
+                        continue
+                    parts = d.split(":")
+                    if len(parts) >= 2 and parts[1].endswith("-aar"):
+                        parts[1] = parts[1][:-4]
+                        d = ":".join(parts)
+                    out.append(d)
+                return out
+        except Exception:
+            pass
+    return []
+
+
 def has_abi_libs(libs: Path) -> bool:
     if not libs.is_dir():
         return False
@@ -79,7 +112,7 @@ def has_abi_libs(libs: Path) -> bool:
     return False
 
 
-def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: bool) -> None:
+def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: bool, extra_deps: list[str] | None = None) -> None:
     jni_block = ""
     if jni_from_libs:
         jni_block = """
@@ -89,6 +122,8 @@ def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: 
         }
     }
 """
+    # 插件 config.json 声明的三方 Maven 依赖 → 模块编译期 compileOnly
+    extra_dep_lines = "".join(f'    compileOnly "{d}"\n' for d in (extra_deps or []))
     text = f"""plugins {{
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
@@ -129,8 +164,8 @@ dependencies {{
     compileOnly "androidx.core:core-ktx:1.10.1"
     compileOnly 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.3.8'
     compileOnly 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.3.8'
-}}
-"""
+{extra_dep_lines}}}"""
+
     (mod / "build.gradle").write_text(text)
     (mod / "consumer-rules.pro").write_text("")
     (mod / "proguard-rules.pro").write_text("")
@@ -183,6 +218,7 @@ def inject_one(export_dir: Path) -> str:
     mod = PROJ / gradle_name
     namespace = detect_namespace(export_dir)
     min_sdk = detect_min_sdk(export_dir)
+    extra_deps = detect_dependencies(export_dir)
 
     if mod.exists():
         shutil.rmtree(mod)
@@ -199,7 +235,7 @@ def inject_one(export_dir: Path) -> str:
             else:
                 shutil.copy2(item, dst)
 
-    write_module_gradle(mod, namespace, min_sdk, jni)
+    write_module_gradle(mod, namespace, min_sdk, jni, extra_deps)
     copy_manifest(export_dir, mod)
     copy_kotlin_sources(export_dir, mod)
 

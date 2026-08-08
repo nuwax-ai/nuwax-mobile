@@ -1561,6 +1561,21 @@ test("代码类型直更轻量代码叶子，终态及混合类型走完整 Mark
   assert.match(codeStream, /parseCodeStreamSegments/);
 });
 
+test("Mermaid 独立分类并复用轻量代码叶子，普通文本提及 mermaid 不误判", () => {
+  const policy = readFileSync(
+    new URL("../subpackages/components/ai-msg/streamRenderPolicy.uts", import.meta.url),
+    "utf8",
+  );
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(policy, /STREAM_RENDER_KIND_MERMAID = "mermaid"/);
+  assert.match(policy, /hasMermaidFence/);
+  assert.doesNotMatch(policy, /body\.indexOf\("mermaid"\)/);
+  assert.match(aiMsg, /kind == STREAM_RENDER_KIND_MERMAID/);
+});
+
 // ─── 汇总 ──────────────────────────────────────────────────────────────────
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

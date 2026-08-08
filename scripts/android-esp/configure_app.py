@@ -90,9 +90,9 @@ OPTIONAL_REMOTE_DEPS = [
     r'implementation\s+"androidx\.media3:media3-[^"]+"\s*\n',
     # 支付插件自带 wechat-sdk aar，去掉远程同名依赖防 Duplicate class
     r'implementation\s+"com\.tencent\.mm\.opensdk:wechat-sdk-android:[^"]+"\s*\n',
-    # nuwax-uni-math 自带 androidsvg-aar-1.4.aar（inject 后进 app/libs），去掉远程
-    # com.caverock:androidsvg Maven 防 Duplicate class（app 与 uniappx 模板都声明了它）
-    r'implementation\s+"com\.caverock:androidsvg:[^"]+"\s*\n',
+    # 注意：com.caverock:androidsvg 刻意【不】在此 strip。DCloud app-comm/uniappx
+    # 模板声明了它的 Maven 坐标，云打包无法 strip 该模板依赖；故 nuwax-uni-math 不再
+    # 自带 androidsvg-aar-1.4.aar（自带则云打包 Duplicate class），统一由 Maven 提供。
 ]
 
 
@@ -887,8 +887,9 @@ def main() -> None:
     strip_project_deps(PROJ / "app" / "build.gradle")
     strip_project_deps(PROJ / "uniappx" / "build.gradle")
     strip_optional_remote_deps(PROJ / "app" / "build.gradle")
-    # uniappx 模板的 androidsvg Maven 也要去（否则经 runtimeClasspath 仍把 Maven jar
-    # 带进 APK，与 nuwax-uni-math 的 aar 撞 Duplicate class）
+    # uniappx 模板也声明了 getui/map/media3/wechat 等远程依赖（runtimeClasspath 会
+    # 把它们带进 APK），与 app 一并 strip。androidsvg 不 strip（见 OPTIONAL_REMOTE_DEPS
+    # 注释，改由 Maven 提供）。
     strip_optional_remote_deps(PROJ / "uniappx" / "build.gradle")
     # Release 闪退修复：LeakCanary 不得进非 debuggable 包
     confine_leakcanary_to_debug(PROJ / "app" / "build.gradle")

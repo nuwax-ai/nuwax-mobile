@@ -1550,6 +1550,27 @@ test("纯文本完成后保留原生文本高度，Markdown 仅完成后台定�
   );
 });
 
+test("正式业务默认关闭性能日志并移除首页临时入口", () => {
+  const probe = readFileSync(
+    new URL("../utils/perfProbe.uts", import.meta.url),
+    "utf8",
+  );
+  const home = readFileSync(
+    new URL("../pages/index/index.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(probe, /PERF_PROBE_ENABLED_KEY: string = "PERF_STREAM_MOCK_ENABLED"/);
+  assert.match(
+    probe,
+    /function perfRecordSseMessageChunk\([\s\S]*?if \(perfProbeEnabled != true\) return/,
+  );
+  assert.match(
+    probe,
+    /function perfRecordParseDetail\([\s\S]*?if \(perfProbeEnabled != true\) return/,
+  );
+  assert.doesNotMatch(home, />\s*Pref test\s*</);
+});
+
 console.log("\n[11] scroll-view 结构化渲染基线边界");
 
 test("正式会话固定使用 scroll-view，list-view 仅保留给性能 A/B", () => {

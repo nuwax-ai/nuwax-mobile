@@ -1,120 +1,62 @@
-# SVG 公式渲染整合 — 交接存档
+# nuwax-uni-math 原生数学公式渲染 — 交接存档（终版）
 
-> 写于 2026-08-08。分支 `feat/nuwa-zhuoda-2026.07-svg-renderer`。
-> 本文供新会话/其他 agent 接手，含已完成工作、当前阻塞、极致性能架构决策。
+> 分支 `feat/nuwa-zhuoda-2026.07-native-math`。2026-08-08。本文档供新会话/agent 接手。
 
 ## 一句话现状
 
-x-svg-renderer（原生 SVG 渲染插件）已接入并修通编译；rich-text-math 的 mathjax SVG 方案已整合进当前分支；base-android 已打包上红米真机能启动。**但公式当前不显示**，卡在两个独立运行时问题（图标资源路径 + proxy-web 就绪），且经讨论确定**极致性能需走服务端预生成 SVG**。
+nuwax-uni-math（原生数学：Android AndroidMath/QuickJS+MathJax+AndroidSVG，iOS iosMath/JSContext+MathJax）已整合进当前分支；Android 公式 native 渲染链路通（全空白已修），但**块级公式显示尺寸还有一个 native logical bug 待修**（超宽公式被压成固定 640 逻辑宽，失真+不横滚），iOS 数学渲染阻塞在自定义基座（需 HBuilderX UI 打含 iosMath pod 的基座）。
 
----
+## 当前阻塞（按优先级）
 
-## 已完成（4 commit，本地未推，origin 落后 5）
+### 1. 块级公式尺寸：native logical 固定 640（真因，待修）
+`uni_modules/nuwax-uni-math/utssdk/app-android/index.uts` 的 rasterizeSvg（line ~315）：
+```ts
+const logicalW = (targetW / dpiScale + 0.5).toInt()  // targetW = clamp(natW×dpiScale, BITMAP_MAX_DIM=1600)
+result["width"] = logicalW
+```
+targetW 被 BITMAP_MAX_DIM clamp 到 1600 → logicalW 永远 = 1600/2.5 = **640**（不管 natW 是 1353 还是 6158）。超宽公式真实宽度被压成 640 → katex-el 再 /pixelRatio(~233px) 显示 → 失真 + 不触发横向滚动（640 < 容器宽）。
 
-| commit | 内容 |
-|---|---|
-| `2a15d989` | x-svg-renderer 4 bug 修复：iOS clear() 可选链赋值、组件 watch getter `(): string`、inject_all_uts_modules.py 把 config.json dependencies 注入 uts 模块 build.gradle（+ `-aar` 坐标归一化）、AGENTS.md 同步 |
-| `08606c9f` | x-svg-renderer 接入 uni-x-renderer（7 插件文件 + katex-el svg prop + test-svg-renderer 页） |
-| `adbf5294` | merge feat/nuwa-zhuoda-2026.07-rich-text-math（解 pages.json 冲突，留 test-katex + test-svg-renderer） |
-| `feeed01c` | 补最后一公里：mathjax → **svg 字符串** → katex-el `:svg` → x-svg-renderer（9 文件） |
+**修法**：分离 bmp（位图，clamp 防 OOM）与 logical（返回的显示尺寸，不 clamp）：
+- bmp = clamp(natW×dpiScale, 1600)（保持，防 OOM）
+- logicalW = natW / dpiScale（真实公式逻辑宽，不 clamp）→ 返回给 katex-el
+- katex-el（blockLogicalWidth = props.width/pixelRatio）拿到真实宽，超宽触发外层 `.msg-root-math-scroll` scroll-x 横滚，窄公式居中
 
-## 关键产物
+注意：mathjax SVG viewBox 的 natW 是数学坐标系（\sqrt{2}=1353、\int=6158），不是物理 px。确认 natW/dpiScale 后的 logical 语义（display 1x px），katex-el /pixelRatio 换 dp。可能要调基准（让短公式 ~200-260dp，超宽横滚）。
 
-- **x-svg-renderer 插件**（`uni_modules/x-svg-renderer/`）：纯渲染器，`setSvg(content)` + AndroidSVG/SVGKit 原生绘制。源码对齐 `/Users/apple/workspace/uni-x-renderer`（官方源 clone）。
-- **base-android**：`unpackage/debug/android_debug.apk`（BUILD SUCCESSFUL，dex 含 `uts.sdk.modules.xSvgRenderer` + androidsvg，mathjax 链路业务代码已编入）
-- **红米真机** `8PNNT4TKHIJVU8RO`：base 已装，app 能启动（RESUMED，需清除重装避免 splash 卡死）
-- **鸿蒙支持**：已在 `/Users/apple/workspace/uni-x-renderer` 源码仓库实现（app-harmony/ + @ohos/svg），validate.yml 自检通过，**未同步进 nuwax-mobile**，需鸿蒙模拟器/Deveco 验证
+### 2. 块级公式：左对齐（不居中）+ 仅超宽才横滚
+用户明确策略：**图片初始左对齐**（`justify-content:flex-start`，**不居中**）；**只有公式宽度超过屏幕**才横向滚动（外层 scroll-x），窄公式左对齐显示不滚。
+- rootStyle（katex-el line ~286）当前 `justify-content:center`（居中）→ 改 `flex-start`（左对齐）；`align-items` 同理左
+- 外层 `uni-ai-x-msg.uvue` 的 `.msg-root-math-inner`（min-width:100% + justify-content:center）→ 改 flex-start 左对齐；`.msg-root-math-scroll`（scroll-x）仅当公式 logical 宽 > 容器宽时触发横滚
+- 配合阻塞1（native logical = natW/dpiScale 不 clamp）：窄公式 logical < 容器 → 左对齐显示；超宽 logical > 容器 → 横滚
 
-## 架构事实（重要，避免重复误解）
+### 3. iOS 数学渲染：阻塞在自定义基座
+- iOS 代码修了（index.uts v! 解包 + super.init 内联，崩溃 EXC_BAD_ACCESS 消除）
+- 但 iOS 数学渲染报 `undefined class: UTSSDKModulesNuwaxUniMathIndexSwift 请重新打自定义基座` —— 仓库 `make base-ios-simulator` 只编 ESP 插件，**不含 nuwax-uni-math + iosMath pod**
+- **解法**：HBuilderX UI → 运行 → 运行到 iOS 模拟器 → 制作自定义基座（编译 nuwax-uni-math + pod install iosMath 0.9.4）。CLI 打不了 iOS 自定义基座（--playground custom 仅云打包）
 
-公式渲染分两步：
-1. **LaTeX → SVG 字符串**：数学排版。mathjax 是 JS 库，**只能**在 web 桥（proxy-web）跑，uni-app x **无原生 LaTeX→SVG 库**，自研数学排版引擎成本极高。
-2. **SVG 字符串 → 原生渲染**：x-svg-renderer（AndroidSVG/SVGKit）。
+## 已修复（Android，已 logcat/截图验证）
+- **全空白根因**：① `\f` 编译 bug（UTS 把 `\frac` 的 `\f` 当 form-feed 0x0C，用 String.fromCharCode(92) 拼接修）② HBuilderX 增量跳过 nuwax-uni-math 编译（缓存过期→mathRendererCore 缺失）→ `--cleanCache true` 全量重编 + mathDiskCache svg-branch 存 imageDataURL
+- **图标方框**：lime-icon readFile /storage 失败（debug 基座 www 在 assets 不落盘）→ `icons-inline.uts`（Map.set 2114 条，避开 import json 类型递归 + 常量池超限）readFile fail fallback 内联（正式包 readFile，debug 内联）
+- **iOS 崩溃**：v! 解包 + super.init 内联（旧 framework 缺 iosMath）
+- **编译错**：BITMAP_MAX_DIM number→Int、androidsvg Duplicate class（DCloud 模板 Maven，configure_app.py strip）、chat-conversation messageList?.length Number→Boolean、katex-el placeholderStyle UTS 先声明后引用
 
-x-svg-renderer README 明确：「Keep LaTeX/Mermaid parsing outside the native renderer: upstream produces SVG, this plugin renders it.」即插件只做第 2 步。
+## 待办（native 侧优化，后续）
+- **native dpiScale 几档质量**：当前固定 2.5。改 `mathRenderConfig.bitmapQuality: 'high'|'medium'|'low'` → dpiScale = pixelRatio(high)/平衡(medium)/省内存(low)。rasterizeSvg 读它
+- **块级 native logical 修**（见上 阻塞1）
+- **iOS UI 自定义基座**（见上 阻塞3）
 
-当前整合 = 第 1 步用 proxy-web mathjax（web），第 2 步原生。**省掉了旧方案的 html2canvas 截图，但 mathjax 生成仍在 web，性能提升有限**。
+## 关键约束/坑（UTS，务必遵守）
+- **先声明后引用**：uvue 函数/常量必须先定义后引用，computed/异步闭包内也一样（katex-el placeholderStyle 撞过）
+- 禁止可选链赋值 `a?.b=v`
+- watch getter 显式返回类型 `(): T =>`
+- readRawField 要 UTSJSONObject+bracket
+- 带三方依赖 uts 插件：cli launch（运行流）撞 error18，用 `make app-resource`（发布流）；base-android 含原生 aar（AndroidMath/quickjs/androidsvg）必须自定义基座
 
----
-
-## 极致性能架构（最终方案 = 整合 x-math-latex 分支）
-
-用户要极致性能 + **原生 App 客户端生成**（不走服务端、不走 proxy-web webview）。两条独立调研收敛到同一答案：
-
-**B 调研（agent ab151ab46efddaaa8 已完成）**：推荐嵌入 JS 引擎跑 mathjax —— Android HarlonWang `quickjs-wrapper:3.2.3` + 自定义 webpack mathjax headless bundle（~1.2MB，liteAdaptor 零外部依赖，暴露同步 `renderMath(latex,display)`，剥 `<mjx-container>`）+ 字节码预编译（冷启动 <200ms）+ iOS JavaScriptCore（系统 framework 零依赖）。可行，性能冷启动大胜（消除 proxy_not_ready 竞态）、稳态 iOS JSC 无 JIT 靠缓存+批量抵消。
-
-**x-math-latex 分支（`origin/feat/nuwa-zhuoda-2026.07-x-math-latex`，2 commit b4fd3fe6+acfa31cf，base=aec3e550）已经把 B 落地了**，且技术栈与调研推荐一致，还多了真原生 LaTeX：
-- `uni_modules/nuwax-uni-math/`：完整插件（mathRendererCore 后端切换 + nativeSvgBackend/proxyWebBackend 双后端 + mathDiskCache）
-- Android 原生后端 `utssdk/app-android/index.uts`（330 行）：
-  - `com.agog.mathdisplay.MTMathView`（AndroidMath.aar 4.4MB）—— **真原生 LaTeX**（纯 Canvas + FreeType 矢量字形，无 SVG/webview），比 A(JLaTeXMath)更对的轮子
-  - `com.whl.quickjs.wrapper.QuickJSContext`（quickjs-wrapper 3.2.3，**与调研推荐同一库**）+ MathJax → SVG
-  - `com.caverock.androidsvg.SVG`（AndroidSVG，与 x-svg-renderer 同款）→ 位图
-  - `MathSvgEngine`：QuickJS 单例 context 常驻（避免每次 114ms bundle load）+ 单线程 executor（QuickJS 非线程安全）+ 内存/栈上限 + console 转发 logcat
-- `native/mathjax-bundle/`：自定义 mathjax bundle 构建（build-entry.js + regen.sh）
-- mathRendererCore 注释明确架构：「APP-ANDROID nativeSvgBackend（QuickJS+MathJax→原生 SVG→位图）为主，失败兜底 proxyWebBackend」；「Phase2 native 分支根除 evalJS 桥死锁 + 公式可选/可复制」
-
-**结论：整合 x-math-latex 分支**（B 的现成 + AndroidMath 加强），不从零做 B。
-
-### 整合路径（新会话执行）
-1. `git merge origin/feat/nuwa-zhuoda-2026.07-x-math-latex` 进当前分支（base 同为 aec3e550；预判冲突：当前已合的 rich-text-math 在 uni-ai-x 的 math-render/proxy-web 公式链路 vs x-math-latex 的 nuwax-uni-math 新插件 + appMarkdownFallback，需决定保留谁——x-math-latex 是更新的原生方案，倾向以它为准，rich-text-math 的 web mathjax 降为兜底或移除）
-2. x-math-latex 的 nuwax-uni-math 含原生 aar（AndroidMath/quickjs/androidsvg）→ 必须自定义基座（`make base-android`，inject_all_uts_modules.py 已支持 config.json dependencies + libs/aar）
-3. 验证：test-katex 页（x-math-latex 带了 98 行 test-katex）切 native/proxy 后端，红米真机看原生 LaTeX 渲染 + `[MATHSVG]` 日志
-4. iOS 侧 x-math-latex 暂只有 Android 后端（mathRendererCore 注释提 iOS iosMath），iOS 需补（按 B 调研：JavaScriptCore + MathJaxBridge.swift）
-
-### 否决的替代方案
-- 服务端预生成 SVG：用户明确**不考虑**
-- lime-katex（UTS 原生，付费 88/99 + lime-shared 依赖 + 项目 lime 0.x vapor 崩）：x-math-latex 自有代码更优，否决
-- 从零做 B：x-math-latex 已实现，否决
-
----
-
-## 当前两个运行时阻塞（与极致架构无关，是落地细节）
-
-### 1. 图标方框（lime-icon，debug 基座固有限制，未解；正式包 OK）
-- 根因：lime-icon Android 用 `getFileSystemManager().readFile` 读 `uni_modules/lime-icon/static/icons.json`，uni 把它解析成 `/storage/.../www/...`；本地 assembleDebug 基座的 www 在 apk **assets 不落盘 /storage** → FileNotFound(errCode 1300002) → 图标方框
-- **试过 Android 统一 `import iconList from '../../static/icons.json'`（非 Android 的用法）→ 失败**：Android uts 对 import json 触发 `Type checking has run into a recursive problem`（uniappx/index.kt 一堆递归错），base 编译挂。这正是 lime-icon 原作者在 Android 走 readFile 而非 import 的原因。已回退 readFile（commit 2b28210e）
-- 结论：**debug 基座固有限制**。正式包 / release 基座 www 会释放到 /storage，readFile 正常，图标显示。debug 验证接受图标方框；验图标用 release 包（`ANDROID_BUILD_TYPE=release make base-android` 或 `base-ship`）
-
-### 2. 公式不渲染（proxy_not_ready）
-- logcat: `setSetting { error: "proxy_not_ready", imageDataURL: "", resultHtml: "" }`，全程无 `[MATHSVG]` 日志
-- 根因：mathjax.js 2MB async 加载 + webview 初始化慢，test-stream-perf 快速流式公式撞上 proxy-web 未就绪窗口 → 请求失败 → svg 空 + href 空（mathjax 不生成 PNG）→ 公式完全空白
-- 链路结构是通的：`runMathjaxBatch`/`runMathjaxJob`/`mathjaxSvgRenderToResult`/`MathJax.tex2svgPromise` 全部实现（proxy-web.html），svg 串→token.svg→katex-el:svg→x-svg-renderer 已接
-- 排查方向：proxy-web whenReady 重试 / mathjax 加载确认 / 正常对话（非 test-stream-perf 高速）验证
-
----
-
-## 关键代码位置
-
-- 插件：`uni_modules/x-svg-renderer/`（interface.uts / app-android/index.uts / app-ios/index.uts / 组件）
-- 公式入口：`uni_modules/uni-ai-x/sdk/math-render.uts`（mode 默认 mathjax，切回 katex 改 `mathRenderConfig.mode`）
-- proxy-web 桥：`uni_modules/uni-ai-x/sdk/proxy-web.uts` + `static/proxy-web/proxy-web.html`（mathjax action：mathjaxSvgRender / mathjaxSvgRenderBatch / runMathjaxBatch）
-- 公式回填：`subpackages/components/ai-msg/appMarkdownFallback.uts`（applyMathResultToToken：mathjax→token.svg，katex→token.href）
-- 渲染调用：`uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue`（4 处 katex-el :svg）
-- 缓存：`subpackages/components/ai-msg/mathFormulaDiskCache.uts`（mathjax svg 当前**仅 L1 内存**，未持久化）
-- 测试页：`pages/test-katex/test-katex.uvue`（默认 mathjax，M1-M3 矢量公式，切 mode）+ `pages/test-svg-renderer/`
-
-## UTS/uvue 已知坑（务必遵守，否则编译失败）
-
-- 禁止可选链赋值 `a?.b = v` → `const x = this.foo; if (x != null) x.bar = ...`
-- `watch(() => props.x, cb)` getter 必须 `(): T =>`
-- 先声明后引用（异步闭包/回调内同样）
-- readRawField 要 `new UTSJSONObject()` + bracket
-- 带三方依赖 uts 插件：cli launch（运行流）撞 error18，用 `make app-resource`（发布流）不卡
-
----
-
-## 待办（按优先级）
-
-1. **定架构方向**：极致性能 → 服务端预生成 SVG（需后端）；或先调通当前 mathjax 链路（解 proxy_not_ready）
-2. 解运行时两问题：图标 /storage 路径、proxy-web 就绪
-3. mathFormulaDiskCache 持久化 svg（极致缓存层）
-4. 验证 OK 后清 rich-text-math worktree：`git worktree remove .claude/worktrees/rich-text-math` + `git branch -d feat/nuwa-zhuoda-2026.07-rich-text-math`
-5. 发布前：mode 默认值确认（mathjax 验证后切回 katex 或保留）、移除 `[MATHSVG]` 日志、鸿蒙代码同步进 nuwax-mobile
-6. x-svg-renderer 的 4 处本地适配（iOS clear / watch getter / inject 依赖 / 坐标归一化）反哺官方源仓库 `dongdada29/uni-x-renderer`
-
-## 验证基建（已通）
-
+## 验证基建
 - `make app-resource && make base-android` → `unpackage/debug/android_debug.apk`
-- 红米 `8PNNT4TKHIJVU8RO`：`adb uninstall com.nuwax.app && adb install ...apk`（**必须清除重装**，否则 splash 卡死 Launch timeout）
-- `adb logcat | grep MATHSVG` 看公式链路；`adb exec-out screencap -p > x.png` 截图
-- 注意：am start `--es pagePath` 被 App.uvue onLaunch 登录分流覆盖，进 test 页要临时改首页重打或正常对话触发
+- 红米 `8PNNT4TKHIJVU8RO`：开发者选项→**USB 安装**（开启，需小米账号+SIM）→ adb install 全自动不弹窗；`adb uninstall && adb install`（必须清除重装，否则 splash 卡 Launch timeout）
+- `adb logcat | grep MATHSVG` 看 native 链路（renderMathAsync OK / nativeBackend cb / rasterizeSvg natW/natH/logical）
+- iOS：HBuilderX UI 制作自定义基座（含 iosMath pod）后跑模拟器
+
+## commit 链（本地未推，分支 native-math）
+整合 x-math-latex（Android+iOS+鸿蒙）+ 移除 x-svg-renderer + 改名 + 全空白/尺寸/图标/iOS 崩/编译错修复。`git log --oneline` 看完整链。

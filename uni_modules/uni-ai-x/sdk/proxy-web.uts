@@ -19,12 +19,23 @@ class ProxyReadyListener {
 	}
 }
 
+/**
+ * 已派发请求的回包超时（ms）。
+ * html2canvas 在某些机型会永久挂起、或 postMessage 在桥打满时丢失 → 回调永不触发 →
+ * callbackMap 槽永久占用 → 后续请求累积 → 桥死锁（docs/handoff-chat-webview-leak-deadlock.md 的 D）。
+ * 该超时是 app 侧兜底：超时未回则释放槽位、以 error 回调，防泄漏累积。
+ * （proxy-web.html 内部已有 8s html2canvas 超时回 error；此处是它失效/丢失时的第二道防线。）
+ */
+const PROXY_CALL_TIMEOUT_MS : number = 12000
+
 class ProxyWeb {
 	isInit : boolean = false
 	private webviewContext : WebviewContext | null = null
 	/** App 端 createWebviewContext 使用的节点 id */
 	private webviewId : string = "markdown-proxy-web"
 	callbackMap : Map<string, OnMsgFn> = new Map()
+	/** 已派发请求的回包超时定时器 key(callbackMap 同 key) → timer id */
+	private callbackTimers : Map<string, number> = new Map()
 	/** isInit 前入队，DOMContentLoaded 后一次性冲刷（避免上百次 100ms 重试刷屏） */
 	private pendingCalls : ProxyPendingCall[] = []
 	/** 等待代理就绪的监听（历史含公式消息可 defer 到就绪后再解析） */
@@ -119,6 +130,39 @@ class ProxyWeb {
 		}
 	}
 
+	/**
+	 * 给已派发请求挂回包超时：PROXY_CALL_TIMEOUT_MS 内未回包则视作挂起，
+	 * 释放 callbackMap 槽位并以 error 回调（避免槽位泄漏累积成桥死锁）。
+	 */
+	private armCallTimeout(key : string, callback : OnMsgFn): void {
+		const timer = setTimeout((): void => {
+			if (this.callbackMap.has(key)) {
+				this.callbackMap.delete(key)
+				this.callbackTimers.delete(key)
+				console.warn("[ProxyWeb] call timeout, release slot:", key)
+				const fail = new UTSJSONObject()
+				fail["error"] = "proxy_timeout"
+				fail["imageDataURL"] = ""
+				fail["resultHtml"] = ""
+				utils.uniGetDispatcher("main", (): void => {
+					callback(fail)
+				})
+			} else {
+				// 已正常回包：仅清登记
+				this.callbackTimers.delete(key)
+			}
+		}, PROXY_CALL_TIMEOUT_MS) as number
+		this.callbackTimers.set(key, timer)
+	}
+
+	private clearCallbackTimer(key : string): void {
+		const t = this.callbackTimers.get(key)
+		if (t != null) {
+			clearTimeout(t)
+			this.callbackTimers.delete(key)
+		}
+	}
+
 	private notifyReadyListeners(): void {
 		const listeners = this.readyListeners
 		this.readyListeners = []
@@ -140,6 +184,8 @@ class ProxyWeb {
 		param["requestId"] = requestId
 		const key = (param["action"] as string) + "_callback_" + requestId
 		this.callbackMap.set(key, callback)
+		// 挂回包超时：防 html2canvas/postMessage 挂起导致该槽位永不释放
+		this.armCallTimeout(key, callback)
 
 		// #ifdef APP-ANDROID
 		const code = `onMessage(${JSON.stringify(param)})`
@@ -194,6 +240,8 @@ class ProxyWeb {
 	/** 页面卸载时重置，避免单例残留 isInit=true 但 context 已失效 */
 	reset(): void {
 		this.clearSafetyFlush()
+		// 清超时登记；已在途的 setTimeout 会在回调里发现 callbackMap 已空而 no-op 自清
+		this.callbackTimers.clear()
 		this.isInit = false
 		this.webviewContext = null
 		this.callbackMap.clear()
@@ -230,6 +278,8 @@ class ProxyWeb {
 			return
 		}
 		this.callbackMap.delete(funName)
+		// 正常回包：取消该请求的超时定时器
+		this.clearCallbackTimer(funName)
 		// 回调会更新 Vue 响应式消息数据，Android 必须切回主线程。
 		utils.uniGetDispatcher("main", () => {
 			callback(res["param"] as UTSJSONObject)

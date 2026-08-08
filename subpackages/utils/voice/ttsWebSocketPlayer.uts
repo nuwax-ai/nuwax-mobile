@@ -423,6 +423,8 @@ export class TtsWebSocketPlayer {
   /** UniSocketTaskAdapter / H5NativeSocketAdapter */
   private socketTask: TtsSocketHandle | null = null;
   private audioContext: InnerAudioContext | null = null;
+  /** H5/WEB：Web Audio 解锁上下文（iOS 用 resume()+silence 解锁，data:WAV 会挂起） */
+  private webAudioCtx: any | null = null;
   private chunks: Uint8Array[] = [];
   private state: TtsPlaybackState = "idle";
   private messageId: string = "";
@@ -772,6 +774,30 @@ export class TtsWebSocketPlayer {
     } catch (e: any) {
       console.warn("[TTS] resume failed", e);
     }
+  }
+
+  /**
+   * H5：audio.play() 返回 Promise，iOS 上若 play() 被随后 pause()/stop() 打断会 reject
+   * AbortError 造成 unhandled rejection（控制台 Uncaught (in promise)）。统一吞掉。
+   */
+  private safePlay(audio: InnerAudioContext): void {
+    // #ifdef H5 || WEB
+    try {
+      const p = audio.play() as any;
+      if (p != null && typeof p.catch == "function") {
+        p.catch((e: any) => {
+          const name = e != null && (e as any).name != null ? `${(e as any).name}` : "";
+          const msg = e != null && (e as any).message != null ? `${(e as any).message}` : "";
+          console.warn("[TTS] h5.playRejected name=" + name + " msg=" + msg);
+        });
+      }
+    } catch (eSafe: any) {
+      console.warn("[TTS] h5.safePlay threw", eSafe);
+    }
+    // #endif
+    // #ifndef H5 || WEB
+    audio.play();
+    // #endif
   }
 
   /** 按当前 VoiceSettings.muted 计算目标音量 */
@@ -1256,18 +1282,21 @@ export class TtsWebSocketPlayer {
       }
       playStarted = true;
       this.switchingToReal = true;
-      try {
-        audio!.play();
-      } catch (ePlay: any) {
-        console.warn("[TTS] playSrc.play threw", ePlay);
-        playStarted = false;
-      }
+      this.safePlay(audio!);
     };
 
     audio!.onPlay(() => {
       if (reqId != this.playRequestId) {
         return;
       }
+      // #ifdef H5 || WEB
+      console.log(
+        "[TTS-H5-debug] real onPlay fired, realPlayback=" +
+          this.realPlayback +
+          " switching=" +
+          this.switchingToReal,
+      );
+      // #endif
       if (this.switchingToReal || this.realPlayback) {
         this.switchingToReal = false;
         this.realPlayback = true;
@@ -1288,6 +1317,17 @@ export class TtsWebSocketPlayer {
       if (reqId != this.playRequestId) {
         return;
       }
+      // #ifdef H5 || WEB
+      const em = err != null ? `${err.errMsg}` : "";
+      console.warn(
+        "[TTS-H5-debug] real onError errMsg=" +
+          em +
+          " switching=" +
+          this.switchingToReal +
+          " realPlayback=" +
+          this.realPlayback,
+      );
+      // #endif
       if (this.switchingToReal && this.realPlayback != true) {
         console.warn(
           "[TTS] playSrc transient error while switching",
@@ -1957,9 +1997,71 @@ export class TtsWebSocketPlayer {
       // 解锁通道时用极低音量，避免静音模式下突然出声
       audio.volume = this.getTargetVolume() > 0 ? 0.01 : 0;
       audio.src = SILENT_WAV_DATA_URI;
-      audio.play();
+      this.safePlay(audio);
     } catch (e: any) {
       console.warn("[TTS] h5.audioUnlockFailed", e);
+    }
+    // #endif
+  }
+
+  /**
+   * H5/WEB：Web Audio 解锁音频通道（iOS 标准做法）。
+   * iOS Safari 对 data:WAV 的 play() 会永久挂起（不 resolve / 不触发 onPlay），
+   * 导致真实 blob: 播放跟着挂起、被 stop 打断抛 AbortError。改用
+   * AudioContext.resume() + 播一段极短静音 buffer 解锁，不依赖 media 元素。
+   * App / 小程序为 no-op。
+   */
+  private unlockWebAudioInGesture(): void {
+    // #ifdef H5 || WEB
+    try {
+      const win = window as any;
+      const AudioCtor = win.AudioContext || win.webkitAudioContext;
+      if (AudioCtor == null) {
+        return;
+      }
+      if (this.webAudioCtx == null) {
+        this.webAudioCtx = new AudioCtor();
+      }
+      const ctx: any = this.webAudioCtx;
+      if (ctx.state == "suspended") {
+        ctx.resume().catch(() => {
+          // ignore
+        });
+      }
+      // 播一段极短静音 buffer，确保解锁生效（iOS 需要实际出声）
+      try {
+        const buf = ctx.createBuffer(1, 1, 44100);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const gain = ctx.createGain();
+        gain.gain.value = 0;
+        src.connect(gain);
+        gain.connect(ctx.destination);
+        src.start(0);
+      } catch (_eBuf) {
+        // ignore
+      }
+    } catch (e: any) {
+      console.warn("[TTS] h5.webAudioUnlockFailed", e);
+    }
+    // #endif
+  }
+
+  /**
+   * H5：在用户手势调用栈内同步解锁音频通道（工具栏播报点击时调用）。
+   * 浏览器要求 play() 落在手势栈内；TTS 合成是异步的（WebSocket 往返后才播放），
+   * 若等到合成完成才首次 play()，会被移动端浏览器拦截（NotAllowedError，iOS 最严）。
+   * 这里在点击同步阶段用同一 InnerAudioContext 播一段静音解锁，后续异步播放复用
+   * 已解锁实例即被放行。仅首次创建并解锁；重复调用为幂等。
+   * App / 小程序无需手势解锁，本方法为 no-op。
+   */
+  unlockInGesture(): void {
+    // #ifdef H5 || WEB
+    // 主解锁：Web Audio（iOS 可靠，data:WAV 的 media play() 在 iOS 会挂起）；
+    // InnerAudioContext 静音 WAV 保留作兼容兜底。
+    this.unlockWebAudioInGesture();
+    if (this.audioContext == null) {
+      this.prepareAudioContextForGesture();
     }
     // #endif
   }
@@ -2178,12 +2280,7 @@ export class TtsWebSocketPlayer {
         }
         playStarted = true;
         this.switchingToReal = true;
-        try {
-          audio!.play();
-        } catch (ePlay: any) {
-          console.warn("[TTS] audio.play threw", ePlay);
-          playStarted = false;
-        }
+        this.safePlay(audio!);
       };
 
       audio!.onPlay(() => {

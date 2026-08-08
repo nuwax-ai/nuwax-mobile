@@ -4,7 +4,7 @@
 > 日期：2026-08-08
 > 计划源：`~/.claude/plans/proxy-web-mermaid-idempotent-glacier.md`
 > 关联：`perf-conversation-stream-render.md` Phase 4c（长历史列表层 / view 回收）的落地；`perf-mermaid-render-fix.md`；`handoff-chat-webview-leak-deadlock.md`
-> **状态：迁移暂缓。2026-08-08 决定正式会话继续使用 scroll-view，先按真实渲染类型优化结构化内容；list-view 仅保留在默认关闭的性能 Mock 中做后续 A/B。**
+> **状态：2026-08-09 恢复迁移。正式会话默认使用 list-view，scroll-view 保留为性能 Mock 的 A/B 与快速回退；等待 Redmi 真实业务长会话验收。**
 
 ---
 
@@ -39,7 +39,8 @@ mermaid 不再走 proxy-web 截图，当代码块显示 → 消除「异步截�
 
 - **list-view 分支**：`<list-view v-if="useListView" ...>`，消息项 `<list-item v-for :type="1" :key>` 包单个 `<view class="msg-list-item">` shell；非消息项各给独立 `:type`（90 loading-more / 91 new-conversation-set / 92 suggestions / 93 task-loading / 94 empty-state / 95 last-msg 锚点）。参考 `pages/index/home-content/home-content.uvue` 模式。
 - **scroll-view 分支**：`<scroll-view v-else ...>`，原全量渲染结构（无 list-item 包裹）。两分支内容保持同步，仅 list-item 包裹差异（模板内有 `↓↓↓/↑↑↑` 注释标注，改动任一须同步另一）。
-- **当前正式会话**恒走 scroll-view（`useListView` 默认 `false`，**不读 storage** → 测试残留不污染正常会话）；list-view 仅在性能 Mock 进程内激活后读取 A/B 配置。
+- **当前正式会话**默认走 list-view（`useListView` 默认 `true`，**不读 storage** → 测试残留不污染正常会话）；性能 Mock 默认以 scroll-view 作为基线，并可运行时 A/B 切换。
+- 消息 `list-item` 按真实结构拆分复用池：助手消息 `type=1`、用户纯文本 `type=2`、用户附件 `type=3`；稳定 `:key` 保持不变，避免不同子树在同一缓存池复用失败。
 
 **两个切换入口**（核心：A/B 同机同数据）：
 
@@ -74,7 +75,7 @@ mermaid 不再走 proxy-web 截图，当代码块显示 → 消除「异步截�
 
 **结论**：ScrollManager 全为 prop/event 驱动（`scroll-into-view` / `@scroll` / `upper-threshold`），两模式通用，**无需改逻辑**。唯一已知限制 `ScrollManager.scrollToMessage`（加载更多历史后保位）在 list-view 下因屏外 `scroll-into-view` 不准可能降级——**无 API 可修**，属已知限制（已在代码注释，当年 `2db9d6d2` 提交信息亦自承「历史定位可能降级」）。待真机观察实际表现再决定是否补偿。
 
-> 滚底（`doScrollToLastMsg` 设 `scrollIntoView="last-msg"`，末条锚点屏内）与流式跟底不受此限制影响。
+> 滚底除 `scrollIntoView="last-msg"` 外增加交替高位 `scroll-top` 命令兜底；当末条锚点被回收时，高位值由组件 clamp 到真实底部。用户上滑仍会立即关闭自动跟随。
 
 ---
 

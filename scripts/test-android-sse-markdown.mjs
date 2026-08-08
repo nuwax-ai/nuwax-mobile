@@ -1516,7 +1516,7 @@ test("纯文本叶子以 64ms leading/trailing 通知既有滚动跟底链路", 
   );
 });
 
-test("纯文本叶子直更不与服务层重复触发滚底", () => {
+test("纯文本叶子不重复滚底，结构化直更仍由服务层跟底", () => {
   const service = readFileSync(
     new URL(
       "../subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts",
@@ -1524,9 +1524,14 @@ test("纯文本叶子直更不与服务层重复触发滚底", () => {
     ),
     "utf8",
   );
+  assert.match(service, /const leafNeedsServiceScroll =/);
   assert.match(
     service,
-    /pendingUiNeedScroll == true && leafDirectPatch != true/,
+    /leafDirectPatch == true &&[\s\S]*?renderProfile\.kind != STREAM_RENDER_KIND_PLAIN/,
+  );
+  assert.match(
+    service,
+    /pendingUiNeedScroll == true &&[\s\S]*?leafDirectPatch != true \|\| leafNeedsServiceScroll == true/,
   );
 });
 
@@ -1571,9 +1576,9 @@ test("正式业务默认关闭性能日志并移除首页临时入口", () => {
   assert.doesNotMatch(home, />\s*Pref test\s*</);
 });
 
-console.log("\n[11] scroll-view 结构化渲染基线边界");
+console.log("\n[11] list-view 长会话回收边界");
 
-test("正式会话固定使用 scroll-view，list-view 仅保留给性能 A/B", () => {
+test("正式会话默认使用 list-view，性能 Mock 仍可切回 scroll-view 对照", () => {
   const conversation = readFileSync(
     new URL("../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue", import.meta.url),
     "utf8",
@@ -1582,10 +1587,23 @@ test("正式会话固定使用 scroll-view，list-view 仅保留给性能 A/B", 
     new URL("../subpackages/pages/chat-conversation-component/layers/mockStreamPerf.uts", import.meta.url),
     "utf8",
   );
-  assert.match(conversation, /const useListView = ref<boolean>\(false\)/);
+  assert.match(conversation, /const useListView = ref<boolean>\(true\)/);
   assert.match(mock, /PERF_MOCK_DEFAULT_USE_LISTVIEW = false/);
   assert.doesNotMatch(conversation, /class="render-toggle-btn"/);
   assert.match(conversation, /v-if="isPerfMock" class="perf-overlay"/);
+});
+
+test("list-view 按真实消息结构拆分复用池并保留稳定 key", () => {
+  const conversation = readFileSync(
+    new URL("../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(conversation, /:key="`\$\{item\.id\}_\$\{item\.index\}`"/);
+  assert.match(conversation, /:type="getMessageListItemType\(item\)"/);
+  assert.match(
+    conversation,
+    /function getMessageListItemType\([\s\S]*?isAssistantMessage\(item\)[\s\S]*?return 1[\s\S]*?hasMessageAttachments\(item\)[\s\S]*?return 3[\s\S]*?return 2/,
+  );
 });
 
 console.log("\n[12] Android 代码流式轻量代码块快通道");

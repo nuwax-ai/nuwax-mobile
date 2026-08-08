@@ -1468,6 +1468,7 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   assert.match(policy, /STREAM_RENDER_KIND_TABLE/);
   assert.match(policy, /STREAM_RENDER_KIND_FORMULA/);
   assert.match(service, /StreamBurstDetector/);
+  assert.match(service, /leafDirectPatch == true\s*\? new UTSJSONObject/);
   assert.match(scroll, /contentMayRelayout/);
 });
 

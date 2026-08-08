@@ -14,6 +14,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 // ─── 镜像 utils/markdownCustomProcess.uts 关键算法 ───────────────────────────
 
@@ -1348,6 +1349,122 @@ test("域名后的 [1] 不进入 URL", () => {
 
 test("URL 路径中的 [1] 保持完整", () => {
   assert.equal(mirrorAutolinkBoundary("https://example.com/path[1]?a=1"), -1);
+});
+
+// ─── Android 纯文本流式快速通道 ───────────────────────────────────────────
+
+function mirrorIsPlainStreamBody(body) {
+  if (body.length === 0) return false;
+  if (
+    body.includes("markdown-custom-process") ||
+    body.includes(":::container") ||
+    body.includes("<task-result") ||
+    body.includes("<conversation") ||
+    body.includes("```m") ||
+    body.includes("```") ||
+    body.includes("![") ||
+    body.includes("](") ||
+    body.includes("$$") ||
+    body.includes("\\[") ||
+    body.includes("\\(") ||
+    body.includes("$") ||
+    body.includes("**") ||
+    body.includes("__") ||
+    body.includes("~~") ||
+    body.includes("`")
+  ) {
+    return false;
+  }
+  if (/^\s{0,3}(?:#{1,6}\s|>\s|[-+*]\s|\d+[.)]\s)/m.test(body)) {
+    return false;
+  }
+  if (/^\s*\|.*\|\s*$/m.test(body) && /^\s*\|?\s*:?-{3,}/m.test(body)) {
+    return false;
+  }
+  return true;
+}
+
+function mirrorSafeRevealEnd(text, requestedEnd) {
+  let end = Math.max(0, Math.min(requestedEnd, text.length));
+  if (end > 0 && end < text.length) {
+    const prev = text.charCodeAt(end - 1);
+    const next = text.charCodeAt(end);
+    if (prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+      end += 1;
+    }
+  }
+  return end;
+}
+
+function mirrorShouldPace(samples) {
+  if (samples.some((sample) => sample.size > 16)) return true;
+  const gaps = samples.map((sample) => sample.gap).filter((gap) => gap >= 0);
+  if (gaps.length < 5) return false;
+  gaps.sort((a, b) => a - b);
+  const p95Index = Math.min(gaps.length - 1, Math.ceil(gaps.length * 0.95) - 1);
+  return gaps[p95Index] > 100;
+}
+
+function mirrorFreezePlainStreamChunks(text, threshold = 512) {
+  const frozen = [];
+  let frozenLength = 0;
+  while (text.length - frozenLength >= threshold) {
+    const unfrozen = text.substring(frozenLength);
+    const cut = unfrozen.lastIndexOf("\n");
+    if (cut <= 0) break;
+    frozen.push(unfrozen.substring(0, cut));
+    frozenLength += cut + 1;
+  }
+  return { frozen, live: text.substring(frozenLength) };
+}
+
+console.log("\n[10] Android 纯文本流式快速通道");
+
+test("普通中英文和自然换行走纯文本快速通道", () => {
+  assert.equal(mirrorIsPlainStreamBody("这是普通正文。\nSecond plain line."), true);
+});
+
+test("Markdown / 公式 / 工具标记中途出现后退出快速通道", () => {
+  const prefix = "先输出一段普通文本。";
+  assert.equal(mirrorIsPlainStreamBody(prefix), true);
+  for (const tail of ["\n## 标题", "\n- 列表", " **粗体**", " $E=mc^2$", "\n```ts\nlet x = 1", "\n<markdown-custom-process"]) {
+    assert.equal(mirrorIsPlainStreamBody(prefix + tail), false, tail);
+  }
+});
+
+test("Unicode 揭示边界不会拆开 Emoji 代理对", () => {
+  const text = "甲😀乙";
+  assert.equal(text.length, 4);
+  assert.equal(mirrorSafeRevealEnd(text, 2), 3);
+  assert.equal(text.substring(0, mirrorSafeRevealEnd(text, 2)), "甲😀");
+});
+
+test("按自然换行冻结有界块，避免逐行节点膨胀", () => {
+  const text = `${"甲".repeat(300)}\n\n${"乙".repeat(300)}\n尾段`;
+  const split = mirrorFreezePlainStreamChunks(text);
+  assert.equal(split.frozen.length, 1);
+  assert.equal(split.frozen[0], `${"甲".repeat(300)}\n\n${"乙".repeat(300)}`);
+  assert.equal(split.live, "尾段");
+});
+
+test("仅在大块或 p95 间隔超过阈值时开启二次匀速", () => {
+  assert.equal(mirrorShouldPace(Array.from({ length: 8 }, () => ({ size: 4, gap: 20 }))), false);
+  assert.equal(mirrorShouldPace([{ size: 17, gap: 20 }]), true);
+  assert.equal(mirrorShouldPace(Array.from({ length: 8 }, () => ({ size: 4, gap: 120 }))), true);
+});
+
+test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
+  const aiMsg = readFileSync(new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url), "utf8");
+  const fastText = readFileSync(new URL("../subpackages/components/ai-msg/plain-stream-fast-text.uvue", import.meta.url), "utf8");
+  const service = readFileSync(new URL("../subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts", import.meta.url), "utf8");
+  const scroll = readFileSync(new URL("../subpackages/pages/chat-conversation-component/layers/ScrollManager.uts", import.meta.url), "utf8");
+  assert.match(aiMsg, /answer-plain-stream-text/);
+  assert.match(fastText, /frozenChunks/);
+  assert.match(aiMsg, /\$callMethod\("updateText"/);
+  assert.match(aiMsg, /isPlainStreamBody/);
+  assert.match(aiMsg, /plainStreamPacing/);
+  assert.match(service, /StreamBurstDetector/);
+  assert.match(scroll, /contentMayRelayout/);
 });
 
 // ─── 汇总 ──────────────────────────────────────────────────────────────────

@@ -49,10 +49,23 @@
         </view>
       </view>
 
-      <!-- AI 答复内容：流式也走 UniAiXMsgRender；解析节流避免每 SSE 字卡死 -->
+      <!-- AI 答复内容：结构内容走 UniAiXMsgRender，Android 纯文本流式走轻量原生 text。 -->
       <view class="answer-container">
+        <!--
+          约 512 字在自然换行处冻结一个静态块，只更新有界尾块。
+          避免单个累计 text 重测全部正文，也避免每行一个节点拖慢 scroll-view。
+        -->
+        <template v-if="showPlainStreamText">
+          <PlainStreamFastText
+            ref="plainStreamFastTextRef"
+            :initial-text="plainStreamInitialText"
+            :pacing="plainStreamPacing"
+            :text-style="plainStreamTextStyle"
+            @caughtUp="tryFinishPlainStreamFinalization"
+          />
+        </template>
         <UniAiXMsgRender
-          v-if="renderMarkdownElList.length > 0"
+          v-else-if="renderMarkdownElList.length > 0"
           :markdown-el-list="renderMarkdownElList"
           :processing-list="renderProcessingList"
           :conversation-id="msg.chat_id"
@@ -93,6 +106,7 @@
   import { ChatDataAdapter } from "@/utils/chatDataAdapter.uts";
   import msgToolBar from "@/subpackages/components/msg-tool-bar/msg-tool-bar.uvue";
   import UniAiXMsgRender from "@/uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue";
+  import PlainStreamFastText from "@/subpackages/components/ai-msg/plain-stream-fast-text.uvue";
   import { stripOpenUiActionIdMarker } from "@/utils/openUiSchema.uts";
   // #ifdef APP
   import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
@@ -109,12 +123,15 @@
     stripAgentInfoTags,
     stripAdaptedAgentInfoHtml,
   } from "@/subpackages/components/ai-msg/agentInfoTag.uts";
-  import { onUnmounted } from "vue";
+  import { onUnmounted, type ComponentPublicInstance } from "vue";
   // #ifdef APP
   import { perfRecordSseUi } from "@/utils/perfProbe.uts";
   // #endif
   import { toolCallProcessingListFingerprint } from "@/subpackages/utils/containerHelper.uts";
   import { applyThinkIncremental } from "@/subpackages/components/ai-msg/thinkIncrementalDisplay.uts";
+  import {
+    isPlainStreamBody,
+  } from "@/subpackages/components/ai-msg/plainStreamDisplay.uts";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -132,6 +149,8 @@
       messageTime?: string;
       /** App 可靠通道：直接传字符串，避免 MsgItem 类实例 prop 丢字段 */
       bodyText?: string;
+      /** SSE 到达呈大块/长间隔时，纯文本使用 24ms 匀速揭示。 */
+      plainStreamPacing?: boolean;
       thinkText?: string;
       /**
        * 预计算可播报正文（MessageInfo.speakableText）。
@@ -156,6 +175,7 @@
       conversationId: "",
       messageTime: "",
       bodyText: "",
+      plainStreamPacing: false,
       thinkText: "",
       speakableText: "",
       showToolBar: true,
@@ -493,6 +513,100 @@
     (): boolean => isLastMsg.value,
   );
 
+  // ==================== Android 纯文本流式快速通道 ====================
+  const plainStreamInitialText = ref<string>("");
+  const plainStreamFastTextRef = ref<any | null>(null);
+  const plainStreamEngaged = ref<boolean>(false);
+  const plainStreamFinalizing = ref<boolean>(false);
+  const plainStreamWindowWidthPx: number = uni.getSystemInfoSync().windowWidth;
+  const plainStreamWidthPx: number = Math.max(
+    1,
+    plainStreamWindowWidthPx - (plainStreamWindowWidthPx * 64) / 750,
+  );
+  const plainStreamTextStyle: string = `width:${plainStreamWidthPx}px;`;
+  let plainStreamTargetText: string = "";
+  let plainStreamFinalizeFrame: number = 0;
+
+  const showPlainStreamText = computed((): boolean => {
+    return (
+      (plainStreamEngaged.value == true ||
+        plainStreamFinalizing.value == true) &&
+      plainStreamTargetText.length > 0
+    );
+  });
+
+  function clearPlainStreamFinalizeFrame(): void {
+    if (plainStreamFinalizeFrame != 0) {
+      cancelAnimationFrame(plainStreamFinalizeFrame);
+      plainStreamFinalizeFrame = 0;
+    }
+  }
+
+  function tryFinishPlainStreamFinalization(): void {
+    if (plainStreamFinalizing.value != true) {
+      return;
+    }
+    const el = plainStreamFastTextRef.value;
+    if (el != null) {
+      try {
+        const proxy = el as ComponentPublicInstance;
+        if (proxy.$callMethod("isCaughtUp") != true) return;
+      } catch (_eCaughtUp) {
+        return;
+      }
+    }
+    if (markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) != true) {
+      return;
+    }
+    plainStreamFinalizing.value = false;
+  }
+
+  function updatePlainStreamTarget(body: string): void {
+    plainStreamTargetText = body;
+    const el = plainStreamFastTextRef.value;
+    if (el != null) {
+      try {
+        const proxy = el as ComponentPublicInstance;
+        proxy.$callMethod("updateText", body, props.plainStreamPacing == true);
+        return;
+      } catch (_eUpdateText) {
+        // 首次挂载前落回 initialText；下一次 patch 会走叶子组件方法。
+      }
+    }
+    plainStreamInitialText.value = body;
+  }
+
+  function enterPlainStream(body: string): void {
+    if (plainStreamEngaged.value != true) {
+      clearStreamMdParseTimer();
+      markdownParser.suspendForPlainStream();
+      plainStreamEngaged.value = true;
+      plainStreamFinalizing.value = false;
+    }
+    updatePlainStreamTarget(body);
+  }
+
+  function leavePlainStreamForMarkdown(): void {
+    clearPlainStreamFinalizeFrame();
+    plainStreamTargetText = "";
+    plainStreamInitialText.value = "";
+    plainStreamEngaged.value = false;
+    plainStreamFinalizing.value = false;
+  }
+
+  function resetPlainStreamState(): void {
+    leavePlainStreamForMarkdown();
+  }
+
+  function canUseAndroidPlainStream(body: string): boolean {
+    // #ifdef APP-ANDROID
+    return isPlainStreamBody(body);
+    // #endif
+    // #ifndef APP-ANDROID
+    return false;
+    // #endif
+  }
+
   function runBodyMarkdownParseNow(forceDone: boolean): void {
     clearStreamMdParseTimer();
     // App：始终立即 parse。磁盘缓存命中可直接出图，不必再等 proxyWeb（历史长公式页可省约 1s）；
@@ -522,9 +636,34 @@
   function scheduleBodyMarkdownParse(): void {
     const streaming =
       isConversationActive.value == true && isLastMsg.value == true;
-    if (streaming == false) {
-      runBodyMarkdownParseNow(true);
+    const rawBody = resolveBodyText();
+    if (streaming == true && canUseAndroidPlainStream(rawBody) == true) {
+      enterPlainStream(rawBody);
       return;
+    }
+    if (streaming == false) {
+      if (plainStreamEngaged.value == true) {
+        plainStreamEngaged.value = false;
+        plainStreamFinalizing.value = true;
+        updatePlainStreamTarget(rawBody);
+        // 先让最终纯文本尾字上屏，再在下一帧做一次完整 Markdown 定稿。
+        clearPlainStreamFinalizeFrame();
+        plainStreamFinalizeFrame = requestAnimationFrame((): void => {
+          plainStreamFinalizeFrame = 0;
+          runBodyMarkdownParseNow(true);
+          tryFinishPlainStreamFinalization();
+        });
+        return;
+      }
+      runBodyMarkdownParseNow(true);
+      tryFinishPlainStreamFinalization();
+      return;
+    }
+    if (
+      plainStreamEngaged.value == true ||
+      plainStreamFinalizing.value == true
+    ) {
+      leavePlainStreamForMarkdown();
     }
     // 首帧立刻出字，避免空白等节流
     if (markdownParser.resolveRenderList().length == 0) {
@@ -688,6 +827,25 @@
         if (selfId.length > 0) {
           const patchId = (newData as UTSJSONObject)["id"];
           if (patchId != null && `${patchId}` != selfId) {
+            return;
+          }
+        }
+        // Android 纯文本热路径：权威正文由 Service draft 累计；气泡内只直更叶子 text。
+        // 不写 msg.body / streamRevision，避免每个 24ms 窗让整个 ai-msg 参与 VDOM diff。
+        const directPatch = newData as UTSJSONObject;
+        const directBodyVal = directPatch["body"];
+        if (
+          directBodyVal != null &&
+          isConversationActive.value == true &&
+          isLastMsg.value == true
+        ) {
+          const directBody = `${directBodyVal}`;
+          if (canUseAndroidPlainStream(directBody) == true) {
+            if (plainStreamEngaged.value != true) {
+              enterPlainStream(directBody);
+            } else {
+              updatePlainStreamTarget(directBody);
+            }
             return;
           }
         }
@@ -879,6 +1037,7 @@
   watch(
     (): string => msg.value._id,
     () => {
+      resetPlainStreamState();
       markdownParser.resetForNewMessage();
       thinkFrozenParts = [] as string[];
       thinkLivePart = "";
@@ -895,12 +1054,8 @@
     (): string =>
       resolveBodyText() + "|" + `${msg.value.state}` + "|" + `${isLastMsg.value}`,
     () => {
-      if (isLastMsg.value == true && isConversationActive.value == true) {
-        scheduleBodyMarkdownParse();
-        return;
-      }
-      // 历史 / 非流式末条：定稿解析（runMarkdownParse 内部会跳过正文未变）
-      runBodyMarkdownParseNow(true);
+      // 流式纯文本 / 结构 Markdown / 终态定稿统一由一个入口决定，避免结束态绕过无闪切换。
+      scheduleBodyMarkdownParse();
     },
     { immediate: true },
   );
@@ -908,20 +1063,35 @@
   /** 仅末条关心会话 active：开始→节流解析；结束→立刻定稿。历史消息忽略 active 抖动。 */
   watch(
     (): boolean => isConversationActive.value,
-    (active: boolean) => {
+    (_active: boolean) => {
       if (isLastMsg.value != true) {
         return;
       }
-      if (active == true) {
-        scheduleBodyMarkdownParse();
-      } else {
-        runBodyMarkdownParseNow(true);
+      scheduleBodyMarkdownParse();
+    },
+  );
+
+  /** cadence 探测可能在正文不变的同一批 flush 中切换，单独响应 pacing prop。 */
+  watch(
+    (): boolean => props.plainStreamPacing == true,
+    () => {
+      if (
+        plainStreamEngaged.value == true ||
+        plainStreamFinalizing.value == true
+      ) {
+        updatePlainStreamTarget(resolveBodyText());
       }
     },
   );
 
+  /** 终态 cmark/fallback 完成会 bump revision；等可见尾字追平后再无闪烁切树。 */
+  watch(streamRevision, () => {
+    tryFinishPlainStreamFinalization();
+  });
+
   onUnmounted(() => {
     clearStreamMdParseTimer();
+    clearPlainStreamFinalizeFrame();
     if (thinkTextThrottleTimer != null) {
       clearTimeout(thinkTextThrottleTimer!);
       thinkTextThrottleTimer = null;
@@ -1028,6 +1198,14 @@
        * 取值：color #404040、font-size 32rpx、line-height 48rpx(=1.5)
        */
       width: 100%;
+
+      .answer-plain-stream-text {
+        width: 100%;
+        color: #404040;
+        font-size: 32rpx;
+        line-height: 48rpx;
+        white-space: pre-wrap;
+      }
     }
 
     .answer-fallback {

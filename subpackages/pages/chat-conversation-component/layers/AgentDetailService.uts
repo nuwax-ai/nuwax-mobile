@@ -61,6 +61,10 @@ import {
   buildMockMessageList,
 } from "./mockStreamPerf.uts";
 import { StreamRequest } from "@/utils/streamRequest";
+import {
+  isPlainStreamBody,
+  StreamBurstDetector,
+} from "@/subpackages/components/ai-msg/plainStreamDisplay.uts";
 import { isAppInBackground } from "@/utils/appLifecycle.uts";
 import {
   StreamChunk,
@@ -638,11 +642,13 @@ export default class AgentDetailService {
    *
    * thinkOnly 用更长合并窗（见 THINK_UI_COALESCE_MS），且早退不 parse。
    */
-  private readonly STREAM_UI_COALESCE_MS: number = 40;
+  private readonly STREAM_UI_COALESCE_MS: number = 24; // 逐字：40→24（纯文本冻结前缀已降每 tick 成本，可负担更密渲染）
   /** THINK-only 合并窗：默认折叠不渲染，仅低频同步标题栏/数据即可 */
   private readonly THINK_UI_COALESCE_MS: number = 500;
   /** 当前 streamUiTimer 使用的合并窗（正文短窗可打断 think 长窗） */
-  private streamUiCoalesceMs: number = 40;
+  private streamUiCoalesceMs: number = 24;
+  /** 真实 MESSAGE 到达节奏；只决定纯文本展示是否需要二次匀速，不参与权威正文累计。 */
+  private plainStreamBurstDetector: StreamBurstDetector = new StreamBurstDetector();
   /** 待冲刷的打字机正文（与 UI 同窗口合并，避免每 SSE 字触发父组件重绘） */
   private pendingStreamingText: string = "";
   private pendingStreamingMsgId: string = "";
@@ -835,20 +841,33 @@ export default class AgentDetailService {
       return;
     }
 
-    if (this.streamListDraft != null) {
+    let patchedText = "";
+    if (pendingMsg != null) {
+      patchedText = readMessageText(pendingMsg);
+    }
+    // Android VDOM：纯文本流式只 patch 最小 ai-msg 子组件。
+    // 不在每个 24ms 窗替换 messageList 大数组，也不同时更新父级打字机 ref；
+    // 权威 draft 继续即时累计，并在 endStreamListDraft 一次性落回 messageList。
+    const plainDirectPatch =
+      pendingMsg != null &&
+      patchedText.length > 0 &&
+      processingFp.length == 0 &&
+      isPlainStreamBody(patchedText) == true;
+    if (this.streamListDraft != null && plainDirectPatch != true) {
       this.publishStreamDraftLastOnly();
     }
     // 打字机通道与列表同频冲刷，避免每 token 触发 App 端整页重绘
     if (hasStreamPayload == true) {
-      this.data.streamingAssistantText.value = this.pendingStreamingText;
-      this.data.streamingAssistantMessageId.value = this.pendingStreamingMsgId;
+      if (plainDirectPatch != true) {
+        this.data.streamingAssistantText.value = this.pendingStreamingText;
+        this.data.streamingAssistantMessageId.value = this.pendingStreamingMsgId;
+      }
       this.lastPublishedStreamText = this.pendingStreamingText;
       this.lastPublishedStreamMsgId = this.pendingStreamingMsgId;
     }
     if (pendingMsg != null) {
       this.lastPublishedProcessingFp = processingFp;
       this.lastPublishedThinkLen = thinkLen;
-      const patchedText = readMessageText(pendingMsg);
       const emitData = messageToJsonObject(pendingMsg);
       emitData["body"] = handleMessageProcess(patchedText);
       // 显式带上 think，避免 Android 侧 patch 丢思考链
@@ -1744,19 +1763,17 @@ export default class AgentDetailService {
       const id = idRaw != null ? `${idRaw}` : "";
       const finishedRaw = readRawField(responseData, "finished");
       const finished = finishedRaw == true || `${finishedRaw}` == "true";
+      if (type != `${MessageModeEnum.THINK}` && text.length > 0) {
+        this.data.plainStreamPacing.value =
+          this.plainStreamBurstDetector.record(
+            currentMessageId,
+            text.length,
+            Date.now(),
+          );
+      }
       // #ifdef APP
       try {
-        const preview =
-          text.length > 40 ? text.substring(0, 40).replace(/\n/g, "\\n") : text.replace(/\n/g, "\\n");
         perfRecordSseMessageChunk(text.length);
-        const thinkSnap =
-          type == `${MessageModeEnum.THINK}`
-            ? readMessageThink(currentMessage).length + text.length
-            : readMessageThink(currentMessage).length;
-        perfRecordSseEvent(
-          "MESSAGE",
-          `msg=${currentMessageId} mode=${type} add=${text.length} bodyLen=${currentTextSnapshot.length} thinkLen=${thinkSnap} finished=${finished} dataId=${id} preview="${preview}"`,
-        );
       } catch (_eMsgEvt) {
         // ignore
       }
@@ -1915,6 +1932,8 @@ export default class AgentDetailService {
         isAssistantMessageInfo(newMessage) == true &&
         patchedText.length > 0
       ) {
+        this.data.streamContentMayRelayout.value =
+          isPlainStreamBody(patchedText) != true;
         // 固定为客户端气泡 id（currentMessageId），避免服务端改写 id 导致播报会话被 begin 重置
         this.pendingStreamingText = patchedText;
         this.pendingStreamingMsgId = currentMessageId;
@@ -2198,6 +2217,9 @@ export default class AgentDetailService {
       this.streamGeneration = this.streamGeneration + 1;
       this.pendingBackgroundReconnect = false;
       this.endStreamListDraft();
+      this.plainStreamBurstDetector.reset(currentMessageId);
+      this.data.plainStreamPacing.value = false;
+      this.data.streamContentMayRelayout.value = true;
       const streamGen = this.streamGeneration;
       // #ifdef APP
       try {
@@ -2223,7 +2245,6 @@ export default class AgentDetailService {
             return;
           }
           try {
-            perfRecordSseMessageChunk(chunk.length);
             const resultObj = JSON.parse(chunk);
             if (resultObj != null) {
               this.handleChangeMessageList(resultObj, currentMessageId);
@@ -2439,7 +2460,21 @@ export default class AgentDetailService {
     this.streamGeneration = this.streamGeneration + 1;
     this.endStreamListDraft();
     this.clearStreamingAssistantText();
+    this.plainStreamBurstDetector.reset(currentMessageId);
+    this.data.plainStreamPacing.value = false;
+    this.data.streamContentMayRelayout.value = true;
     this.data.chatSuggestList.value = [] as any[];
+    // #ifdef APP
+    try {
+      perfResetSseEventCounters();
+      perfRecordSseEvent(
+        "STREAM_START",
+        `msg=${currentMessageId} gen=${this.streamGeneration} mock=1`,
+      );
+    } catch (_eMockStart) {
+      // ignore
+    }
+    // #endif
 
     const nowIso = new Date().toISOString();
     const chatMessage: UTSJSONObject = {
@@ -2494,7 +2529,6 @@ export default class AgentDetailService {
         return;
       }
       try {
-        perfRecordSseMessageChunk(chunk.length);
         const resultObj = JSON.parse(chunk);
         if (resultObj != null) {
           this.handleChangeMessageList(resultObj, currentMessageId);

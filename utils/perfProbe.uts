@@ -42,6 +42,11 @@ let staleBodyWarnBucket: number = -1;
 let sseEventSeq: number = 0;
 let sseMsgChunkCount: number = 0;
 let sseMsgCharTotal: number = 0;
+let sseStartedAt: number = 0;
+let sseFirstChunkAt: number = 0;
+let sseLastChunkAt: number = 0;
+let sseChunkMax: number = 0;
+let sseChunkGaps: number[] = [] as number[];
 
 function nowMs(): number {
   return Date.now();
@@ -52,6 +57,11 @@ export function perfResetSseEventCounters(): void {
   sseEventSeq = 0;
   sseMsgChunkCount = 0;
   sseMsgCharTotal = 0;
+  sseStartedAt = nowMs();
+  sseFirstChunkAt = 0;
+  sseLastChunkAt = 0;
+  sseChunkMax = 0;
+  sseChunkGaps = [] as number[];
   lastSseBodyLen = 0;
   lastParseAt = 0;
   staleBodyWarnBucket = -1;
@@ -59,7 +69,8 @@ export function perfResetSseEventCounters(): void {
 
 /** 通用阶段日志 */
 export function sseStallLog(stage: string, detail: string): void {
-  console.log(`[SseStall] ${stage} ${detail}`);
+  // 高频阶段日志默认关闭。真机 4 字/20ms 流会产生数千次同步 console I/O，
+  // 探针本身足以把 scroll-view 从 50fps 拖到个位数。
 }
 
 /**
@@ -69,15 +80,43 @@ export function sseStallLog(stage: string, detail: string): void {
  */
 export function perfRecordSseEvent(eventType: string, detail: string = ""): void {
   sseEventSeq += 1;
+  // MESSAGE 的逐块统计由 perfRecordSseMessageChunk 在内存中完成，禁止逐块打印。
+  if (eventType == "MESSAGE") {
+    return;
+  }
   const extra = detail.length > 0 ? ` ${detail}` : "";
+  let summary = "";
+  if (eventType == "STREAM_COMPLETE") {
+    const sorted = sseChunkGaps.slice();
+    sorted.sort();
+    const p95Index = sorted.length > 0
+      ? Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))
+      : 0;
+    const p95Gap = sorted.length > 0 ? sorted[p95Index] : 0;
+    const firstChar = sseFirstChunkAt > 0 && sseStartedAt > 0
+      ? sseFirstChunkAt - sseStartedAt
+      : -1;
+    summary = ` firstChar=${firstChar}ms sseP95=${p95Gap}ms maxChunk=${sseChunkMax}`;
+  }
   console.log(
-    `[SseEvent] #${sseEventSeq} type=${eventType}${extra} msgChunks=${sseMsgChunkCount} msgChars=${sseMsgCharTotal}`,
+    `[SseEvent] #${sseEventSeq} type=${eventType}${extra} msgChunks=${sseMsgChunkCount} msgChars=${sseMsgCharTotal}${summary}`,
   );
 }
 
 /** MESSAGE 增量统计（有实际追加字符时调用） */
 export function perfRecordSseMessageChunk(addChars: number): void {
   if (addChars > 0) {
+    const t = nowMs();
+    if (sseFirstChunkAt == 0) {
+      sseFirstChunkAt = t;
+    }
+    if (sseLastChunkAt > 0) {
+      sseChunkGaps.push(t - sseLastChunkAt);
+    }
+    sseLastChunkAt = t;
+    if (addChars > sseChunkMax) {
+      sseChunkMax = addChars;
+    }
     sseMsgChunkCount += 1;
     sseMsgCharTotal += addChars;
   }
@@ -91,11 +130,7 @@ export function perfRecordSseUi(bodyLen: number, hint: string = ""): void {
     lastParseAt > 0 ? t - lastParseAt : lastSseAt > 0 ? t - lastSseAt : 0;
   lastSseBodyLen = bodyLen;
   lastSseAt = t;
-  const extra = hint.length > 0 ? ` ${hint}` : "";
-  console.log(
-    `[SseStall] sse_ui bodyLen=${bodyLen} delta=${delta} sinceParse=${gap}ms` +
-      extra,
-  );
+  // UI 冲刷只在内存中累计；逐次 console 会严重污染被测主线程。
   // 正文仍在涨，但超过 1.5s 没有 parse → 怀疑卡在 updateMessage/节流前或主线程饿死
   if (delta > 0 && lastParseAt > 0 && gap > 1500) {
     console.warn(

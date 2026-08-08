@@ -126,27 +126,111 @@
         return INLINE_TARGET_HEIGHT
     }
 
-    /** 宽扁公式最小展示高度：高宽比大的公式被 widthFix 压得很矮难读，至少拉到该高度。
-     *  仅对宽扁公式（aspect ≥ BLOCK_WIDE_ASPECT）生效；窄/高公式用自然高度，避免被过度放大触发横滚。 */
+    /** 块级公式展示高度兜底（width/height 缺失时）。 */
     const BLOCK_MIN_DISPLAY_HEIGHT = 44
-    const BLOCK_WIDE_ASPECT = 6
-    function resolveBlockDisplayHeight(): number {
+
+    /**
+     * 块级公式显示宽度上限（逻辑像素）。nuwax-uni-math 原生后端返回的 width/height 是
+     * MathJax SVG viewBox 像素值，单条公式可能宽达数百~上千 px（如 800px），直接当显示
+     * 尺寸会把 ~360dp 手机屏撑到不可用。这里按「窗口宽 - 两侧气泡内边距」封顶，高度等比
+     * 缩放；位图本身是 dpiScale(2.5x) 高清 rasterize，缩小后依旧清晰。取一次即可（公式
+     * 场景不关心旋转后微调）；取不到返回 0 = 不封顶，交由 image 的 max-width:100% 兜底。
+     */
+    let cachedBlockMaxWidth = -1
+    function blockMaxWidth(): number {
+        if (cachedBlockMaxWidth >= 0) {
+            return cachedBlockMaxWidth
+        }
+        let w = 0
+        // #ifdef APP
+        const info = uni.getWindowInfo()
+        const ww = info.windowWidth
+        if (ww > 0) {
+            w = Math.floor(ww) - 32
+            if (w < 120) {
+                w = 120
+            }
+        }
+        // #endif
+        cachedBlockMaxWidth = w
+        return w
+    }
+
+    /**
+     * 块级公式显示高度上限（逻辑像素）。竖向公式（如 \frac{1}{2}，h>w）仅按 width 等比缩放后
+     * height 仍可能极大（如 rawH=640 缩到 maxW 后仍 ~500px）→ 撑爆页面。取屏高 40% 封顶，
+     * 与 blockMaxWidth 双向取严，保证竖向公式不失控。取不到返回 0 = 不封顶。
+     */
+    let cachedBlockMaxHeight = -1
+    function blockMaxHeight(): number {
+        if (cachedBlockMaxHeight >= 0) {
+            return cachedBlockMaxHeight
+        }
+        let h = 0
+        // #ifdef APP
+        const info = uni.getWindowInfo()
+        const wh = info.windowHeight
+        if (wh > 0) {
+            h = Math.floor(wh * 0.4)
+            if (h < 160) {
+                h = 160
+            }
+        }
+        // #endif
+        cachedBlockMaxHeight = h
+        return h
+    }
+
+    /**
+     * 块级公式等比缩放因子：同时尊重宽度上限和高度上限，取更严（更小）的那个。
+     * resolveBlockDisplayWidth / resolveBlockDisplayHeight 共用此因子 → 宽高同比例，
+     * aspectFit 不变形。preserveSize（表格单元格）跳过 → 返回 1（原尺寸，外层 scroll-view 横滚）。
+     */
+    function blockScale(): number {
         const rawW = props.width ?? 0
         const rawH = props.height ?? 0
-        if (rawH <= 0) return BLOCK_MIN_DISPLAY_HEIGHT
-        if (rawW > 0 && rawW / rawH >= BLOCK_WIDE_ASPECT && rawH < BLOCK_MIN_DISPLAY_HEIGHT) {
+        if (rawW <= 0 || rawH <= 0) {
+            return 1
+        }
+        if (props.preserveSize == true) {
+            return 1
+        }
+        let scale = 1
+        const maxW = blockMaxWidth()
+        if (maxW > 0 && rawW > maxW) {
+            scale = Math.min(scale, maxW / rawW)
+        }
+        const maxH = blockMaxHeight()
+        if (maxH > 0 && rawH > maxH) {
+            scale = Math.min(scale, maxH / rawH)
+        }
+        return scale
+    }
+
+    /** 块级公式最终展示高度：与宽度共用 blockScale 等比缩放（双向封顶，aspectFit 不变形）。
+     *  preserveSize（表格单元格等）保持自然尺寸，由外层 scroll-view 横滚，不缩放。 */
+    function resolveBlockDisplayHeight(): number {
+        const rawH = props.height ?? 0
+        if (rawH <= 0) {
             return BLOCK_MIN_DISPLAY_HEIGHT
         }
-        return rawH
+        const rawW = props.width ?? 0
+        if (rawW <= 0 || props.preserveSize == true) {
+            return rawH
+        }
+        return Math.max(1, Math.round(rawH * blockScale()))
     }
+    /** 块级公式最终展示宽度：与高度共用 blockScale 等比缩放，双向封顶防撑爆页面。 */
     function resolveBlockDisplayWidth(): number {
         const rawW = props.width ?? 0
         const rawH = props.height ?? 0
         if (rawW <= 0 || rawH <= 0) {
             return 0
         }
-        const bh = resolveBlockDisplayHeight()
-        return Math.round(rawW * (bh / rawH))
+        if (props.preserveSize == true) {
+            return rawW
+        }
+        return Math.max(1, Math.round(rawW * blockScale()))
     }
 
     /** 是否已有可展示的公式图（出图后不再保留占位 min-height） */
@@ -215,11 +299,11 @@
 
     const imageStyle = computed((): string => {
         if (props.inline != true) {
-            // 块级：按自然尺寸 + 最小高度渲染（宽扁公式不再被 widthFix 压矮）；超宽由外层 scroll 横滚
+            // 块级：按封顶屏宽后的等比尺寸渲染（aspectFit 保比例不变形；max-width:100% 兜底防溢出容器）
             const bw = resolveBlockDisplayWidth()
             const bh = resolveBlockDisplayHeight()
             if (bw > 0) {
-                return 'width:' + bw + 'px;height:' + bh + 'px;'
+                return 'width:' + bw + 'px;height:' + bh + 'px;max-width:100%;'
             }
             return 'width:100%;height:auto;'
         }

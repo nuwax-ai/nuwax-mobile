@@ -1453,6 +1453,21 @@ test("仅在大块或 p95 间隔超过阈值时开启二次匀速", () => {
   assert.equal(mirrorShouldPace(Array.from({ length: 8 }, () => ({ size: 4, gap: 120 }))), true);
 });
 
+test("原始小块经 UI 合并成大可见批次时由叶子兜底匀速", () => {
+  const shouldPaceVisibleUpdate = (
+    displayLength,
+    previousTargetLength,
+    nextTargetLength,
+    upstreamRecommended,
+  ) =>
+    upstreamRecommended ||
+    nextTargetLength - previousTargetLength > 16 ||
+    displayLength < previousTargetLength;
+  assert.equal(shouldPaceVisibleUpdate(100, 100, 112, false), false);
+  assert.equal(shouldPaceVisibleUpdate(100, 100, 140, false), true);
+  assert.equal(shouldPaceVisibleUpdate(110, 140, 148, false), true);
+});
+
 test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   const aiMsg = readFileSync(new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url), "utf8");
   const fastText = readFileSync(new URL("../subpackages/components/ai-msg/plain-stream-fast-text.uvue", import.meta.url), "utf8");
@@ -1460,6 +1475,7 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   const scroll = readFileSync(new URL("../subpackages/pages/chat-conversation-component/layers/ScrollManager.uts", import.meta.url), "utf8");
   assert.match(aiMsg, /answer-plain-stream-text/);
   assert.match(fastText, /frozenChunks/);
+  assert.match(fastText, /visibleBatchChars > 16/);
   assert.match(aiMsg, /\$callMethod\("updateText"/);
   assert.match(aiMsg, /resolveStreamRenderProfile/);
   assert.match(aiMsg, /streamDisplayPacing/);
@@ -1470,6 +1486,22 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   assert.match(service, /StreamBurstDetector/);
   assert.match(service, /leafDirectPatch == true\s*\? new UTSJSONObject/);
   assert.match(scroll, /contentMayRelayout/);
+});
+
+test("快速通道结束时先同步累计正文再执行 Markdown 定稿", () => {
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(aiMsg, /function commitFastStreamBody\(body: string\): string/);
+  assert.match(
+    aiMsg,
+    /plainStreamEngaged\.value == true\)[\s\S]*?commitFastStreamBody\(plainStreamTargetText\)[\s\S]*?runBodyMarkdownParseNow\(true\)/,
+  );
+  assert.match(
+    aiMsg,
+    /codeStreamEngaged\.value == true\)[\s\S]*?commitFastStreamBody\(codeStreamTargetText\)[\s\S]*?runBodyMarkdownParseNow\(true\)/,
+  );
 });
 
 console.log("\n[11] scroll-view 结构化渲染基线边界");

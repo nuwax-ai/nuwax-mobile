@@ -120,6 +120,8 @@ const QUICKJS_STACK_LIMIT: number = 1024 * 1024
 /** 位图最长边像素上限：等比 clamp，防超宽/病态公式产生超大位图 → OOM。
  *  1600px × ARGB_8888 ≈ 10MB/张上限，缓存可控。 */
 const BITMAP_MAX_DIM: Int = 1600
+/** 8 CSS px/ex ÷ 442 MathJax units/ex；仅用于兼容旧/异常 bundle 的尺寸兜底。 */
+const MATHJAX_VIEWBOX_TO_PX: Float = 0.0180995475.toFloat()
 
 /**
  * QuickJS 单例引擎：context 常驻（避免每次 114ms 的 bundle load + init）。
@@ -241,10 +243,10 @@ function readMathjaxBundle(): string {
 
 /**
  * SVG → 高清位图（AndroidSVG rasterize）。
- *  - MathJax SVG 的 width/height 是 ex 单位，AndroidSVG 读不出 → 用 viewBox(px) 设文档尺寸。
+ *  - bundle 已把 MathJax 根 SVG 的 ex 尺寸换成 CSS px；viewBox 只保留作矢量坐标系。
  *  - MathJax 用 currentColor 填充，AndroidSVG 无 CSS 上下文 → 替换为显式颜色（支持主题）。
- *  - 先 probe 出自然尺寸(int)，再按 dpiScale 算目标并等比 clamp 到 BITMAP_MAX_DIM，
- *    最后 renderToPicture(targetW, targetH) 让 AndroidSVG 矢量缩放（清晰，非位图拉伸）。
+ *  - 按 CSS 尺寸 × dpiScale 算目标并等比 clamp 到 BITMAP_MAX_DIM，
+ *    最后 renderToCanvas 让 AndroidSVG 矢量缩放（清晰，非位图拉伸）。
  *  - 全程 int 维度，规避 UTS float→number 转换坑；finally recycle 位图 + 关流。
  *  返回 UTSJSONObject { imageDataURL, width, height, svg } 或 { error }。
  *
@@ -260,21 +262,21 @@ function rasterizeSvg(svg: string, dpiScale: number, color: string): UTSJSONObje
 		const svgColored = svg.split("currentColor").join(color)
 		const svgObj = SVG.getFromString(svgColored)
 		const vbox = svgObj.getDocumentViewBox()
-		if (vbox != null) {
-			svgObj.setDocumentWidth(vbox.width())
-			svgObj.setDocumentHeight(vbox.height())
+		let logicalWidth = svgObj.getDocumentWidth()
+		let logicalHeight = svgObj.getDocumentHeight()
+		// 新 bundle 把根节点 ex 显式归一为 px，AndroidSVG 可直接读出 CSS 尺寸。
+		// 旧缓存/bundle 兜底才从 viewBox 数学坐标按 442 units/ex 换算，绝不能直接当 px。
+		if ((logicalWidth <= 0 || logicalHeight <= 0) && vbox != null) {
+			logicalWidth = vbox.width() * MATHJAX_VIEWBOX_TO_PX
+			logicalHeight = vbox.height() * MATHJAX_VIEWBOX_TO_PX
 		}
-		// probe 自然尺寸（int）
-		const natural = svgObj.renderToPicture()
-		const natW = natural.getWidth()
-		const natH = natural.getHeight()
-		if (natW <= 0 || natH <= 0) {
+		if (logicalWidth <= 0 || logicalHeight <= 0) {
 			result["error"] = "rasterize_zero_size"
 			return result
 		}
-		// 目标 = 自然 × dpiScale，等比 clamp 到 BITMAP_MAX_DIM（int 运算，无溢出：≤1600×1600×...）
-		let targetW = (natW * dpiScale + 0.5).toInt()
-		let targetH = (natH * dpiScale + 0.5).toInt()
+		// 位图尺寸 = CSS 显示尺寸 × dpiScale；短公式不再无意义地撞到 1600px 上限。
+		let targetW = (logicalWidth * dpiScale + 0.5).toInt()
+		let targetH = (logicalHeight * dpiScale + 0.5).toInt()
 		if (targetW > BITMAP_MAX_DIM) {
 			targetH = targetH * BITMAP_MAX_DIM / targetW
 			targetW = BITMAP_MAX_DIM
@@ -298,31 +300,21 @@ function rasterizeSvg(svg: string, dpiScale: number, color: string): UTSJSONObje
 		bmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
 		const canvas = new Canvas(bmp)
 		svgObj.renderToCanvas(canvas)
-		// 像素抽样：确认位图非全空（alpha>0 的像素计数，粗扫每 8px 取一点）
-		var nonEmptyPx = 0
-		for (let px = 0; px < targetW; px += 8) {
-			for (let py = 0; py < targetH; py += 8) {
-				if ((bmp.getPixel(px.toInt(), py.toInt()) >>> 24) > 0) {
-					nonEmptyPx++
-				}
-			}
-		}
 		baos = new ByteArrayOutputStream()
 		bmp.compress(Bitmap.CompressFormat.WEBP, 92, baos)
 		const b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
 		result["imageDataURL"] = "data:image/webp;base64," + b64
-		// 返回公式逻辑 1x 显示尺寸：用 natW/natH（真实 viewBox，不 clamp），而非 targetW/targetH（位图被 BITMAP_MAX_DIM clamp → logical 永远 640 丢失超宽真实宽度）。
-		// bmp 仍 clamp 防 OOM；logical 不 clamp，让 katex-el 拿真实宽 → 超宽触发横滚、窄公式左对齐。
-		const logicalW = (natW / dpiScale + 0.5).toInt()
-		const logicalH = (natH / dpiScale + 0.5).toInt()
+		// 返回 CSS 1x 尺寸；位图 clamp 只限制内存，不改变布局宽高和宽高比。
+		const logicalW = (logicalWidth + 0.5).toInt()
+		const logicalH = (logicalHeight + 0.5).toInt()
 		result["width"] = logicalW
 		result["height"] = logicalH
 		result["svg"] = svg
 		console.log(
-			"[MATHSVG] rasterizeSvg ok natW=" +
-				natW +
-				" natH=" +
-				natH +
+			"[MATHSVG] rasterizeSvg ok cssW=" +
+				logicalW +
+				" cssH=" +
+				logicalH +
 				" bmp=" +
 				targetW +
 				"x" +
@@ -331,8 +323,6 @@ function rasterizeSvg(svg: string, dpiScale: number, color: string): UTSJSONObje
 				logicalW +
 				"x" +
 				logicalH +
-				" nonEmptyPx=" +
-				nonEmptyPx +
 				" webpLen=" +
 				b64.length,
 		)

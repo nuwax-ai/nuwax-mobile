@@ -1576,6 +1576,29 @@ test("Mermaid 独立分类并复用轻量代码叶子，普通文本提及 merma
   assert.match(aiMsg, /kind == STREAM_RENDER_KIND_MERMAID/);
 });
 
+console.log("\n[13] mixed 流结构边界与代码高亮隔离");
+
+test("归一化改写只回退相交的冻结批次，不直接全量替换", () => {
+  const parser = readFileSync(
+    new URL("../subpackages/components/ai-msg/aiMsgMarkdownParser.uts", import.meta.url),
+    "utf8",
+  );
+  assert.match(parser, /class FallbackStableBatch/);
+  assert.match(parser, /batch\.end > common/);
+  assert.match(parser, /this\.fallbackStableBatches = keptBatches/);
+});
+
+test("代码高亮写入脱离视图的 token，并在下一解析帧读取缓存", () => {
+  const fallback = readFileSync(
+    new URL("../subpackages/components/ai-msg/appMarkdownFallback.uts", import.meta.url),
+    "utf8",
+  );
+  assert.match(fallback, /codeHighlightCache/);
+  assert.match(fallback, /const detachedToken: MarkdownToken/);
+  assert.match(fallback, /highlightCodeBlock\(\s*detachedToken/);
+  assert.match(fallback, /setTimeout\(\(\): void => \{\s*onMathRendered\(\)/);
+});
+
 // ─── 汇总 ──────────────────────────────────────────────────────────────────
 
 console.log(`\n结果: ${passed} passed, ${failed} failed`);

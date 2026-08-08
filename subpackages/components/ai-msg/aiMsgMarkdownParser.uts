@@ -25,6 +25,17 @@ import { perfRecordParseDetail, sseStallLog } from "@/utils/perfProbe.uts";
  */
 const INCREMENTAL_FALLBACK_ENABLED: boolean = true;
 
+/**
+ * App fallback 每次冻结扩展对应的字符区间与渲染元素。
+ * mixed 流中容器归一化可能改写最近一小段正文；按批记录后只需撤回受影响的尾批，
+ * 不必替换整棵 UniAiXMsgRender。
+ */
+class FallbackStableBatch {
+  start: number = 0;
+  end: number = 0;
+  items: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
+}
+
 /** 给 fallback el 的 uniqueId 加前缀，避免 stable/live 碰撞。 */
 function prefixMarkdownElIds(
   list: UniAiMarkdownElItem[],
@@ -230,6 +241,8 @@ export class AiMsgMarkdownParser {
   private fallbackStablePrefix: string = "";
   /** App 增量 fallback：已冻结的渲染列表（不再随 SSE 重解析）。 */
   private fallbackStableEls: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
+  /** App 增量 fallback：冻结前缀的批次边界，供 mixed 归一化改写时局部回退。 */
+  private fallbackStableBatches: FallbackStableBatch[] = [] as FallbackStableBatch[];
   /** 公式回填批量刷新防抖：攒一批 token 回填后整体刷一次，避免逐条替换 markdownElList
    *  造成高频重渲染、与渲染帧竞争触发 ConcurrentModificationException。 */
   private mathFlushPending: boolean = false;
@@ -333,6 +346,7 @@ export class AiMsgMarkdownParser {
   private clearFallbackIncrementalState(): void {
     this.fallbackStablePrefix = "";
     this.fallbackStableEls = [] as UniAiMarkdownElItem[];
+    this.fallbackStableBatches = [] as FallbackStableBatch[];
     this.pendingMathReveal = false;
     this.cmarkStableEls = [] as UniAiMarkdownElItem[];
     this.cmarkStableTokenCount = 0;
@@ -644,13 +658,40 @@ export class AiMsgMarkdownParser {
    * body 非纯 append（前缀不匹配）时回退全量。
    */
   private applyAppFallbackIncremental(body: string): void {
-    // 前缀被改写 / 缩短 → 全量
+    // 容器/工具标签归一化可能在结构闭合时改写最近的稳定尾段。
+    // 找共同字符前缀并撤回与改写区相交的完整冻结批；更早的 el 对象继续复用。
     if (
       this.fallbackStablePrefix.length > 0 &&
       !body.startsWith(this.fallbackStablePrefix)
     ) {
-      this.applyAppFallbackFull(body);
-      return;
+      let common = 0;
+      const commonLimit = body.length < this.fallbackStablePrefix.length
+        ? body.length
+        : this.fallbackStablePrefix.length;
+      while (
+        common < commonLimit &&
+        body.charAt(common) == this.fallbackStablePrefix.charAt(common)
+      ) {
+        common = common + 1;
+      }
+
+      const keptBatches = [] as FallbackStableBatch[];
+      const keptEls = [] as UniAiMarkdownElItem[];
+      let keptEnd = 0;
+      for (let b = 0; b < this.fallbackStableBatches.length; b++) {
+        const batch = this.fallbackStableBatches[b];
+        if (batch.end > common) {
+          break;
+        }
+        keptBatches.push(batch);
+        keptEnd = batch.end;
+        for (let e = 0; e < batch.items.length; e++) {
+          keptEls.push(batch.items[e]);
+        }
+      }
+      this.fallbackStablePrefix = body.substring(0, keptEnd);
+      this.fallbackStableEls = keptEls;
+      this.fallbackStableBatches = keptBatches;
     }
 
     let cut = findStableMarkdownCut(body, true);
@@ -672,16 +713,18 @@ export class AiMsgMarkdownParser {
 
     let stablePrefix = this.fallbackStablePrefix;
     let stableEls = this.fallbackStableEls;
+    let stableBatches = this.fallbackStableBatches.slice();
 
     // 扩展冻结区：只 parse 新增的 newlyFrozen。
     // 已闭合公式在冻结时立刻派发 KaTeX（逐段上屏）；live 仍 defer，避免半截/重解析重复截图。
     if (cut > stablePrefix.length) {
-      const newlyFrozen = body.substring(stablePrefix.length, cut);
+      const batchStart = stablePrefix.length;
+      const newlyFrozen = body.substring(batchStart, cut);
       if (newlyFrozen.length > 0) {
         const newEls = expandMarkdownImageItems(
           parseAppMarkdownFallback(newlyFrozen, onMathNotify, false),
         );
-        prefixMarkdownElIds(newEls, `f${stablePrefix.length}-`);
+        prefixMarkdownElIds(newEls, `f${batchStart}-`);
         const merged = [] as UniAiMarkdownElItem[];
         for (let i = 0; i < stableEls.length; i++) {
           merged.push(stableEls[i]);
@@ -690,6 +733,11 @@ export class AiMsgMarkdownParser {
           merged.push(newEls[j]);
         }
         stableEls = merged;
+        const batch = new FallbackStableBatch();
+        batch.start = batchStart;
+        batch.end = cut;
+        batch.items = newEls;
+        stableBatches.push(batch);
         parsedChars += newlyFrozen.length;
       }
       stablePrefix = body.substring(0, cut);
@@ -743,6 +791,7 @@ export class AiMsgMarkdownParser {
 
     this.fallbackStablePrefix = stablePrefix;
     this.fallbackStableEls = stableEls;
+    this.fallbackStableBatches = stableBatches;
     this.lastFallbackBody = body;
     this.msg.value.markdownElList = renderedList;
     try {

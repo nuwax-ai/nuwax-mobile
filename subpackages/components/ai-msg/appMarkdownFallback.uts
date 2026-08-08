@@ -2449,6 +2449,27 @@ function renderMermaidToken(
  */
 let highlightBusy = false;
 let highlightWaiters: Array<() => void> = [] as Array<() => void>;
+/**
+ * 高亮结果只缓存不可变 token 行；禁止异步任务直接改写已交给 VDOM 的 codeToken。
+ * Android scroll-view 排版期间改写嵌套 codeTokens 会与 notifyLayout 的 ArrayList 遍历竞争。
+ */
+const codeHighlightCache: Map<string, MarkdownToken[][]> = new Map<string, MarkdownToken[][]>();
+const codeHighlightInFlight: Map<string, boolean> = new Map<string, boolean>();
+let codeHighlightCacheKeys: string[] = [] as string[];
+const CODE_HIGHLIGHT_CACHE_LIMIT: number = 64;
+
+function rememberCodeHighlight(key: string, rows: MarkdownToken[][]): void {
+  if (codeHighlightCache.has(key) != true) {
+    codeHighlightCacheKeys.push(key);
+  }
+  codeHighlightCache.set(key, rows);
+  while (codeHighlightCacheKeys.length > CODE_HIGHLIGHT_CACHE_LIMIT) {
+    const oldest = codeHighlightCacheKeys.shift();
+    if (oldest != null) {
+      codeHighlightCache.delete(oldest);
+    }
+  }
+}
 function acquireHighlight(task: () => void): void {
   if (highlightBusy) {
     highlightWaiters.push(task);
@@ -2507,6 +2528,7 @@ function highlightCodeBlock(
           // 语言不支持 / 高亮器初始化失败：保留调用方写入的纯文本 codeTokens，不再逐行尝试
           unsupported = true;
           releaseHighlight();
+          callback();
           return;
         }
         if (res.tokens.length == 0) {
@@ -2939,14 +2961,39 @@ function parseAppMarkdownFallbackInner(
           uniqueId: "fallback-code-token-" + itemIndex,
         };
         result.push(makeItem("code_block", itemIndex++, [[codeToken]]));
-        // 异步语法高亮（App + H5）：分词完成后回填 codeTokens 并刷帧；
-        // 不支持的语言保持上方纯文本 codeRows。先上纯文本再异步上色，流式友好。
-        highlightCodeBlock(
-          codeToken,
-          codeText,
-          lang.length > 0 ? lang : "text",
-          onMathRendered,
-        );
+        const highlightLang = lang.length > 0 ? lang : "text";
+        const highlightKey = highlightLang + "\n" + codeText;
+        const cachedHighlight = codeHighlightCache.get(highlightKey);
+        if (cachedHighlight != null) {
+          codeToken.codeTokens = cachedHighlight;
+        } else if (codeHighlightInFlight.has(highlightKey) != true) {
+          // 在未挂载的独立 token 上分词。完成后只写缓存，下一解析帧创建新 token 读取结果；
+          // 不对当前 VDOM 正在排版的嵌套数组做原地/异步替换。
+          codeHighlightInFlight.set(highlightKey, true);
+          const detachedToken: MarkdownToken = {
+            type: "code_block",
+            text: codeText,
+            lang: highlightLang,
+            codeTokens: codeRows,
+            uniqueId: "fallback-code-highlight-detached",
+          };
+          highlightCodeBlock(
+            detachedToken,
+            codeText,
+            highlightLang,
+            (): void => {
+              codeHighlightInFlight.delete(highlightKey);
+              const highlightedRows = detachedToken.codeTokens;
+              if (highlightedRows != null && highlightedRows.length > 0) {
+                rememberCodeHighlight(highlightKey, highlightedRows);
+              }
+              // 避免高亮器同步回调重入当前 parse/layout 批次。
+              setTimeout((): void => {
+                onMathRendered();
+              }, 0);
+            },
+          );
+        }
       }
       continue;
     }

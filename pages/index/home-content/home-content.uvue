@@ -121,8 +121,10 @@
 </template>
 
 <script setup lang="uts">
-  import { ref, computed, onMounted } from "vue";
+  import { ref, computed, onMounted, onUnmounted } from "vue";
   import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+  import eventBus from "@/utils/eventBus";
+  import { EVENT_TYPE } from "@/constants/event.constants";
   import {
     apiUserUsedAgentList,
     apiUserUsedAgentDelete,
@@ -514,6 +516,106 @@
     return !convLoading.value && !convHasMore.value && clLen > 8;
   });
 
+  let executingCheckTimerId: number | null = null;
+
+  function stopExecutingCheckTimer(): void {
+    if (executingCheckTimerId != null) {
+      clearInterval(executingCheckTimerId as number);
+      executingCheckTimerId = null;
+    }
+  }
+
+  /**
+   * 静默刷新会话列表最新数据（如执行中状态），无全屏 Loading，不打扰当前视图与已加载分页
+   */
+  async function silentFetchConversationList(): Promise<void> {
+    if (!props.isLoggedIn || conversationRequestPromise != null) return;
+    try {
+      const params = new ConversationListParams();
+      params.agentId = null;
+      params.lastId = null;
+      params.limit = 20;
+      const res = await apiAgentConversationList(params);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const newList = normalizeList(apiResData<any>(res));
+        if (newList.length > 0) {
+          const existing = conversationList.value;
+          if (existing != null && existing.length > newList.length) {
+            const merged: UTSJSONObject[] = [];
+            for (let i = 0; i < newList.length; i++) {
+              merged.push(newList[i]);
+            }
+            for (let j = newList.length; j < existing.length; j++) {
+              merged.push(existing[j]);
+            }
+            conversationList.value = merged;
+          } else {
+            conversationList.value = newList;
+          }
+          if (conversationList.value.length > 0) {
+            const last = conversationList.value[conversationList.value.length - 1];
+            lastId.value = toNum(last["id"], 0);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("silentFetchConversationList error:", error);
+    } finally {
+      if (activeTab.value != "history") {
+        let hasExecuting = false;
+        const currentList = conversationList.value;
+        if (currentList != null) {
+          for (let i = 0; i < currentList.length; i++) {
+            const item = currentList[i];
+            if (item != null && toStr(item["taskStatus"], "") == "EXECUTING") {
+              hasExecuting = true;
+              break;
+            }
+          }
+        }
+        if (!hasExecuting) {
+          stopExecutingCheckTimer();
+        }
+      }
+    }
+  }
+
+  function checkAndStartExecutingTimer(): void {
+    if (!props.isLoggedIn || !pageVisible.value) {
+      stopExecutingCheckTimer();
+      return;
+    }
+
+    const list = convRowList.value;
+    let hasExecuting = false;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].showExecuting) {
+        hasExecuting = true;
+        break;
+      }
+    }
+
+    // 处于会话记录 Tab 或存在执行中会话时保持静默轮询跟进最新状态
+    const isHistoryTab = activeTab.value == "history";
+    if (isHistoryTab || hasExecuting) {
+      if (executingCheckTimerId == null) {
+        executingCheckTimerId = setInterval(() => {
+          if ((activeTab.value == "history" || hasExecuting) && pageVisible.value) {
+            silentFetchConversationList();
+          }
+        }, 5000);
+      }
+    } else {
+      stopExecutingCheckTimer();
+    }
+  }
+
+  function handleRefreshChatMessageEvent(_data: any): void {
+    if (props.isLoggedIn && pageVisible.value) {
+      silentFetchConversationList();
+    }
+  }
+
   async function fetchConversationList(isLoadMore: boolean = false): Promise<boolean> {
     if (!props.isLoggedIn) {
       if (isLoadMore) {
@@ -551,6 +653,7 @@
         } else {
           convHasMore.value = false;
         }
+        checkAndStartExecutingTimer();
         return true;
       }
       return false;
@@ -797,6 +900,7 @@
   /** 页面离开前记录分页是否被导航打断。 */
   function pauseData(): void {
     pageVisible.value = false;
+    stopExecutingCheckTimer();
     if (convLoadingMore.value) {
       resumeLoadMoreCheckPending.value = true;
     }
@@ -854,11 +958,14 @@
   }
 
   /**
-   * 返回首页时保留当前列表、游标与滚动位置，只补首屏空数据。
-   * 不再调用 loadData 刷新第一页，避免覆盖已追加的分页结果。
+   * 返回首页时保留当前列表与滚动位置，静默刷新最新会话状态（立马同步 EXECUTING 等状态）。
    */
   async function resumeData(): Promise<void> {
     pageVisible.value = true;
+    checkAndStartExecutingTimer();
+    if (props.isLoggedIn) {
+      silentFetchConversationList();
+    }
     if (activeTab.value == "recent") {
       if (recentAgentList.value.length == 0 && !recentLoading.value) {
         await loadRecent();
@@ -874,8 +981,9 @@
     }
     activeTab.value = tab;
     emit("tab-change", tab);
-    // 切换 最近使用 或 会话记录 时重新拉取对应的最新数据
+    // 切换 最近使用 或 会话记录 时重新拉取对应的最新数据，并根据当前 Tab 启动/更新静默轮询
     refreshCurrentTab();
+    checkAndStartExecutingTimer();
   }
 
   function handleSwiperChange(e: UniSwiperChangeEvent): void {
@@ -886,6 +994,12 @@
     // 两侧数据并行预热，切换时只做原生位移动画，不临时发起首屏请求。
     loadRecent();
     loadConversation();
+    eventBus.on(`${EVENT_TYPE.RefreshChatMessage}`, handleRefreshChatMessageEvent);
+  });
+
+  onUnmounted(() => {
+    eventBus.off(`${EVENT_TYPE.RefreshChatMessage}`, handleRefreshChatMessageEvent);
+    stopExecutingCheckTimer();
   });
 
   defineExpose({
@@ -893,6 +1007,7 @@
     pauseData: pauseData as any,
     resumeData: resumeData as any,
     refreshCurrentTab: refreshCurrentTab as any,
+    silentFetchConversationList: silentFetchConversationList as any,
     changeContentTab: changeContentTab as any,
   });
 </script>

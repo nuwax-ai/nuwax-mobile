@@ -1,5 +1,6 @@
 import { nextTick } from "vue";
 import AgentDetailData from "./AgentDetailData.uts";
+import type VirtualScrollManager from "./VirtualScrollManager.uts";
 
 /**
  * 滚动管理层：专门处理滚动相关的逻辑
@@ -7,6 +8,7 @@ import AgentDetailData from "./AgentDetailData.uts";
  */
 export default class ScrollManager {
   private data: AgentDetailData;
+  private virtualScroll: VirtualScrollManager | null = null;
   // 记录上次滚动位置，用于判断滚动方向
   private lastScrollTop: number = 0;
   /** 历史首屏布局稳定截止时间（ms），期内允许因异步组件撑高而补滚 */
@@ -49,6 +51,11 @@ export default class ScrollManager {
 
   constructor(data: AgentDetailData) {
     this.data = data;
+  }
+
+  /** 注入 VirtualScrollManager（setter 防止构造期循环引用） */
+  setVirtualScroll(vs: VirtualScrollManager): void {
+    this.virtualScroll = vs;
   }
 
   /**
@@ -175,8 +182,6 @@ export default class ScrollManager {
             return;
           }
           this.data.scrollIntoView.value = "last-msg";
-          // C2 兜底：跟底补滚期间锚点也可能被回收，同帧发 scroll-top 高位哨兵
-          this.pulseScrollToBottom();
           this.data.scrollInBottom.value = true;
         });
       }, delay) as number;
@@ -292,6 +297,39 @@ export default class ScrollManager {
     this.cachedOffsetHeight = h;
     this.cachedOffsetHeightAtMs = now;
     return h;
+  }
+
+  /** 视口高度（对外暴露，VirtualScrollManager 用于窗口计算；复用 500ms 缓存） */
+  viewportH(): number {
+    return this.resolveOffsetHeight();
+  }
+
+  /**
+   * 顶部加载更多 prepend 后的视角补偿：写 scrollToBottomAnchor = oldScrollTop + insertedPx。
+   * 复用 C2 数值 scroll-top 通道（act-on-change，clamp 到 scrollHeight），视角不动；
+   * 替代旧 scroll-into-view 到旧首条——虚拟化下旧首条可能未挂载。
+   * virtualEnabled==false 时由组件走旧 scroll-into-view 路径，不调本方法。
+   */
+  compensatePrepend(oldScrollTop: number, insertedPx: number): void {
+    if (insertedPx <= 0) return;
+    const target = oldScrollTop + insertedPx;
+    this.data.scrollWithAnimation.value = false;
+    this.data.scrollToBottomAnchor.value = target;
+  }
+
+  /**
+   * 视口上方实测修正纠偏：VirtualScrollManager.applyPendingCorrection 调。
+   * 写 scrollToBottomAnchor = 当前 scrollTop + delta（scrolling==false 时应用，无感）。
+   * 交替 +1/-1 偏移保证每次命令值都变化 → scroll-top act-on-change 必触发。
+   */
+  applyScrollTopDelta(delta: number): void {
+    if (delta == 0) return;
+    const base = this.data.scrollTop.value + delta;
+    // 交替微量偏移，确保即便连续两次目标接近也能触发 scroll-top act-on-change
+    this.scrollToBottomToggle = !this.scrollToBottomToggle;
+    const target = this.scrollToBottomToggle ? base + 1 : base - 1;
+    this.data.scrollWithAnimation.value = false;
+    this.data.scrollToBottomAnchor.value = target;
   }
 
   private isHistorySettling(): boolean {
@@ -478,6 +516,14 @@ export default class ScrollManager {
   scrollToMessage(messageId: string | number): void {
     this.data.scrollWithAnimation.value = false;
     this.data.scrollIntoView.value = "";
+    // 虚拟滚动下，目标可能不在当前窗口（未挂载）→ 先 forceInclude 让其入切片挂载，再 scroll-into-view
+    const key = `${messageId}`;
+    if (this.virtualScroll != null) {
+      const vs = this.virtualScroll as VirtualScrollManager;
+      if (vs.enabled.value == true) {
+        vs.forceInclude(key);
+      }
+    }
     // 延迟设置，确保微信小程序 DOM 渲染完成后再触发定位
     setTimeout(() => {
       this.data.scrollIntoView.value = `msg-wrapper-${messageId}`;

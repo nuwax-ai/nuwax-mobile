@@ -1576,35 +1576,7 @@ test("正式业务默认关闭性能日志并移除首页临时入口", () => {
   assert.doesNotMatch(home, />\s*Pref test\s*</);
 });
 
-console.log("\n[11] list-view 长会话回收边界");
-
-test("正式会话默认使用 list-view，性能 Mock 仍可切回 scroll-view 对照", () => {
-  const conversation = readFileSync(
-    new URL("../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue", import.meta.url),
-    "utf8",
-  );
-  const mock = readFileSync(
-    new URL("../subpackages/pages/chat-conversation-component/layers/mockStreamPerf.uts", import.meta.url),
-    "utf8",
-  );
-  assert.match(conversation, /const useListView = ref<boolean>\(true\)/);
-  assert.match(mock, /PERF_MOCK_DEFAULT_USE_LISTVIEW = false/);
-  assert.doesNotMatch(conversation, /class="render-toggle-btn"/);
-  assert.match(conversation, /v-if="isPerfMock" class="perf-overlay"/);
-});
-
-test("list-view 按真实消息结构拆分复用池并保留稳定 key", () => {
-  const conversation = readFileSync(
-    new URL("../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue", import.meta.url),
-    "utf8",
-  );
-  assert.match(conversation, /:key="`\$\{item\.id\}_\$\{item\.index\}`"/);
-  assert.match(conversation, /:type="getMessageListItemType\(item\)"/);
-  assert.match(
-    conversation,
-    /function getMessageListItemType\([\s\S]*?isAssistantMessage\(item\)[\s\S]*?return 1[\s\S]*?hasMessageAttachments\(item\)[\s\S]*?return 3[\s\S]*?return 2/,
-  );
-});
+// [11] list-view 长会话回收：list-view 方案已废弃（流式抖动 + overlay 覆盖），改 scroll-view + 手动虚拟滚动；相关断言移除。
 
 console.log("\n[12] Android 代码流式轻量代码块快通道");
 
@@ -1714,6 +1686,22 @@ test("代码高亮写入脱离视图的 token，并在下一解析帧读取缓�
   assert.match(fallback, /const detachedToken: MarkdownToken/);
   assert.match(fallback, /highlightCodeBlock\(\s*detachedToken/);
   assert.match(fallback, /setTimeout\(\(\): void => \{\s*onMathRendered\(\)/);
+});
+
+console.log("\n[14] 数学公式正式会话默认后端");
+
+test("数学公式默认走 proxy，性能页仍保留 native/proxy A/B 开关", () => {
+  const core = readFileSync(
+    new URL("../uni_modules/nuwax-uni-math/sdk/mathRendererCore.uts", import.meta.url),
+    "utf8",
+  );
+  const perfPage = readFileSync(
+    new URL("../pages/test-stream-perf/test-stream-perf.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(core, /static backend: string = ['"]proxy['"]/);
+  assert.match(perfPage, /const useProxy = ref<boolean>\(true\)/);
+  assert.match(perfPage, /MathRendererCore\.backend = proxy \? "proxy" : "native"/);
 });
 
 // ─── 汇总 ──────────────────────────────────────────────────────────────────

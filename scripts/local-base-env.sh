@@ -55,11 +55,16 @@ export IOS_ESP_FRAMEWORKS_DIR="${IOS_ESP_FRAMEWORKS_DIR:-$IOS_ESP_BUILD_ROOT/off
 
 # ---------- Android ----------
 export UNIAPPX_ANDROID_SDK_ROOT="${UNIAPPX_ANDROID_SDK_ROOT:-$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@${NUWAX_ANDROID_SDK_BUILD}-${NUWAX_HX_VERSION}}"
+# 显式 build 号目录不存在时（build 号随 HX 版本变/换机），glob 匹配同 HX 版本下任意 build 号的 SDK 目录兜底
 if [[ ! -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
-  _ALT="$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@${NUWAX_ANDROID_SDK_BUILD}-${NUWAX_HX_VERSION}"
-  if [[ -d "$_ALT/uniappxnativepackage" ]]; then
-    export UNIAPPX_ANDROID_SDK_ROOT="$_ALT"
-  fi
+  _ALT=""
+  for _d in "$NUWAX_SDK_ROOT"/android/"${NUWAX_HX_VERSION}"/Android-uni-app-x-SDK@*-"${NUWAX_HX_VERSION}"; do
+    if [[ -d "$_d/uniappxnativepackage" ]]; then
+      _ALT="$_d"; break
+    fi
+  done
+  [[ -n "$_ALT" ]] && export UNIAPPX_ANDROID_SDK_ROOT="$_ALT"
+  unset _d _ALT
 fi
 export ANDROID_ESP_WORK="${ANDROID_ESP_WORK:-$NUWAX_LOCAL_BASE_ROOT/android}"
 # 按版本选 work 工程，避免多 checkout 共享符号链接互相污染。

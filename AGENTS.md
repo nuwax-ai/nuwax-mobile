@@ -241,6 +241,8 @@ bash scripts/grab-perf-stats.sh               # 性能统计
 
 ## 带三方依赖的 UTS 插件集成（以 x-svg-renderer 为例）
 
+> 改业务代码后如何选编译路径 / 绕开 error18 / adb 直装真机验证，见 [docs/android-build-verify-playbook.md](docs/android-build-verify-playbook.md)（三条路径决策表 + `make base-android → adb install` 捷径 + dex 验证 + 设备日志流）。
+
 含 Maven/CocoaPods 三方依赖的 UTS 插件（x-svg-renderer 依赖 `com.caverock:androidsvg` / SVGKit）有两套编译路径，行为不同：
 
 | 路径 | 三方依赖处理 | 用途 |

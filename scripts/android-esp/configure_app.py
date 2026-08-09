@@ -25,7 +25,7 @@ from local_base_paths import (
 )
 
 WORK = Path(os.environ.get("ANDROID_ESP_WORK", default_android_esp_work()))
-PROJ = WORK / "project"
+PROJ = Path(os.environ.get("ANDROID_ESP_PROJECT", str(WORK / "project")))
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 APP_MANIFEST = json.loads((PROJECT_ROOT / "manifest.json").read_text())
 APPID = os.environ.get("APPID", "__UNI__8BF05E4")
@@ -118,19 +118,41 @@ def configure_settings() -> None:
     # 剥离示例兄弟模块 include（uniappx 演示胶水由 strip_uniappx_demo_sources
     # 单独删除，故这些兄弟模块不再被引用、可安全注释掉），并追加注入的业务 uts 插件。
     keep = {"app", "uniappx"} | injected | {"uts-nuwax-esp-provisioning"}
+    seen: set[str] = set()
     lines = []
     for line in text.splitlines():
-        m_inc = re.match(r"include\s+':([^']+)'", line.strip())
-        if m_inc and m_inc.group(1) not in keep:
-            # 幂等：已被注释的示例 include 保持注释，未注释的注释掉
-            if not line.strip().startswith("//"):
-                lines.append("// " + line + "  // stripped by configure_app")
-                continue
+        s = line.strip()
+        # 本脚本上一轮注释掉的 include：模块名现在在 keep 中则恢复为有效 include，否则保留注释
+        m_c = re.match(r"//\s*include\s+':([^']+)'", s)
+        if m_c and "stripped by configure_app" in s:
+            name = m_c.group(1)
+            if name in keep:
+                if name not in seen:
+                    lines.append(f"include ':{name}'")
+                    seen.add(name)
+            else:
+                if name not in seen:
+                    lines.append(line)
+                    seen.add(name)
+            continue
+        m = re.match(r"include\s+':([^']+)'", s)
+        if m:
+            name = m.group(1)
+            if name in keep:
+                if name not in seen:
+                    lines.append(line)
+                    seen.add(name)
+            else:
+                if name not in seen:
+                    lines.append("// " + line + "  // stripped by configure_app")
+                    seen.add(name)
+            continue
         lines.append(line)
-    text = "\n".join(lines) + "\n"
+    # 补 keep 中尚未出现的模块（以有效 include 计数 seen 为准，避免旧注释被误判为已存在）
     for name in sorted(keep - {"app", "uniappx"}):
-        if f"':{name}'" not in text:
-            text += f"include ':{name}'\n"
+        if name not in seen:
+            lines.append(f"include ':{name}'")
+    text = "\n".join(lines) + "\n"
     text = re.sub(
         r'rootProject\.name\s*=\s*"[^"]*"',
         'rootProject.name = "nuwax-mobile-android-base"',
@@ -198,19 +220,24 @@ def strip_project_deps(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
     text = gradle_path.read_text()
-    for mod in SAMPLE_MODULES:
-        text = re.sub(
-            rf"\s*implementation\s+project\(':?{re.escape(mod)}'\)\s*\n",
-            "\n",
-            text,
-        )
-    # 确保注入的 UTS 模块依赖存在
+    # 读取已注入的 UTS 模块
     injected: list[str] = []
     marker = WORK / "injected-uts-modules.txt"
     if marker.is_file():
         injected = [x.strip() for x in marker.read_text().splitlines() if x.strip()]
     if not injected:
         injected = ["uts-nuwax-esp-provisioning"]
+    # app/build.gradle 的本地 project 依赖只应保留：运行时模块 uniappx + 已注入的 UTS 模块。
+    # 其余 implementation project(':...')（DCloud 示例 test-*/native-*/uni-*/app-comm，或
+    # vdom/vapor 两线共享 work 树时另一线残留的 uts-* 插件）对应的模块在 settings.gradle 已被
+    # configure_settings 裁掉 → Gradle "Project with path ':...' could not be found"。
+    # 按 keep 集全量裁剪，使依赖与 settings.gradle 自校正（不再逐个列清单，免漏）。
+    keep = {"uniappx"} | set(injected)
+    for dep in re.findall(r"implementation\s+project\(':[^']+'\)", text):
+        m = re.search(r"':([^']+)'", dep)
+        if m and m.group(1) not in keep:
+            text = re.sub(rf"[ \t]*{re.escape(dep)}[ \t]*\n", "\n", text)
+    # 确保注入的 UTS 模块依赖存在
     for name in injected:
         needle = f"implementation project(':{name}')"
         if needle not in text and "dependencies {" in text:
@@ -709,40 +736,28 @@ def patch_sdk_libs_excludes(gradle_path: Path) -> None:
     if not gradle_path.is_file():
         return
     text = gradle_path.read_text()
-    # 扩展 exclude 列表（保留 beizi；debug-server 仍从 SDK/libs 排除，改走 app/libs）
-    new_exclude = (
-        "exclude: ["
-        "'**/beizi_fusion_sdk_*.aar', "
-        "'**/uniad_bz_adapter_*.aar', "
-        "'**/uniad_bz-adapter*.aar', "
-        "'**/debug-server-release.aar', "
-        "'**/uniad-*.aar', "
-        "'**/uni-ad-*.aar', "
-        "'**/Baidu_MobAds_SDK.aar', "
-        "'**/GDTSDK*.aar', "
-        "'**/ks_adsdk*.aar', "
-        "'**/Funlink_adapter_uniad*.aar', "
-        "'**/advista-uniad*.aar', "
-        "'**/mm_adapter_uniad*.aar', "
-        # 本地基座无广告业务，额外排除各广告网络主包（上面的 adapter 只是聚合层）
-        "'**/open_ad_sdk*.aar', "
-        "'**/wm_ad_sdk*.aar', "
-        "'**/windAd.aar', "
-        "'**/octopus_ad_sdk*.aar', "
-        "'**/adalliance_adn_sdk*.aar', "
-        "'**/Funlink_*release.aar', "
-        "'**/funlink_*release.aar', "
-        "'**/advista-*release.aar', "
-        # 直播推流（业务无直播/推流）
-        "'**/uni-live-pusher-release.aar', "
-        # canvas 组件（业务 0 处 <canvas>；同步在 strip_canvas_registration 去注册项）
-        "'**/uni-canvas-component-release.aar', "
-        # 阿里人脸/安全（业务仅用 WebView 验证码，非人脸/KYC；确认 0 引用）
-        "'**/APSecuritySDK-deepSec-*.aar', '**/Android-AliyunFaceGuard-*.aar', '**/aliyun-*.aar', "
-        "'**/facialRecognitionVerify-*.aar', '**/uni-facialVerify-*.aar'"
-        "]"
-    )
-    # 始终用规范列表（重）写 exclude，保证新增 aar 排除项在增量构建里也能生效（幂等）。
+    # 规范化 exclude 列表：广告 SDK（App 无广告）+ 未用的直播/画布/阿里人脸安全。
+    excludes = [
+        "'**/debug-server-release.aar'",
+        "'**/beizi_fusion_sdk_*.aar'", "'**/uniad_bz_adapter_*.aar'", "'**/uniad_bz-adapter*.aar'",
+        "'**/uniad-*.aar'", "'**/uni-ad-*.aar'", "'**/Baidu_MobAds_SDK.aar'", "'**/GDTSDK*.aar'",
+        "'**/ks_adsdk*.aar'", "'**/Funlink_adapter_uniad*.aar'", "'**/advista-uniad*.aar'",
+        "'**/mm_adapter_uniad*.aar'", "'**/open_ad_sdk*.aar'", "'**/wm_ad_sdk*.aar'", "'**/windAd.aar'",
+        "'**/octopus_ad_sdk*.aar'", "'**/adalliance_adn_sdk*.aar'", "'**/Funlink_*release.aar'",
+        "'**/funlink_*release.aar'", "'**/advista-*release.aar'",
+        "'**/uni-live-pusher-release.aar'", "'**/uni-canvas-component-release.aar'",
+        "'**/APSecuritySDK-deepSec-*.aar'", "'**/Android-AliyunFaceGuard-*.aar'", "'**/aliyun-*.aar'",
+        "'**/facialRecognitionVerify-*.aar'", "'**/uni-facialVerify-*.aar'",
+    ]
+    # vapor 模式（5.21+）：运行时由 app/vapor-libs 提供，排除 SDK/libs 副本以免重复类。
+    # VDOM 模式（如 5.15）：运行时必须从 SDK/libs 取，绝不能排除，否则断运行时。
+    is_vapor = (PROJ / "app" / "vapor-libs").is_dir()
+    if is_vapor:
+        excludes = ["'**/app-runtime-release.aar'", "'**/uts-runtime-release.aar'"] + excludes
+    new_exclude = "exclude: [" + ", ".join(excludes) + "]"
+    if "**/uni-facialVerify-*.aar" in text:
+        print(f"✓ SDK libs exclude 已是规范化清单(vapor={is_vapor}): {gradle_path.relative_to(PROJ)}")
+        return
     text2, n = re.subn(
         r"exclude:\s*\[[^\]]*\]",
         new_exclude,

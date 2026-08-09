@@ -62,7 +62,8 @@
             >
               <svg-icon name="icon-message-add" size="44" />
             </view>
-            <!-- 自动播报开/关（关：SSE 不播报；工具栏手动播放仍可用） -->
+            <!-- 自动播报开/关（关：SSE 不播报；工具栏手动播放仍可用）。仅 App 端显示，H5 默认不自动语音播报 -->
+            <!-- #ifdef APP -->
             <view
               class="icon-box"
               hover-class="icon-box-hover"
@@ -75,6 +76,7 @@
               </view>
               <svg-icon v-else name="icon-voice-1" size="44" />
             </view>
+            <!-- #endif -->
           </template>
         </view>
         <!-- #endif -->
@@ -92,6 +94,10 @@
     </template>
     <template v-else>
       <view class="chat-container">
+        <!-- 性能测试浮层：avgFps / maxGap（仅 perfTest 模式） -->
+        <view v-if="isPerfMock" class="perf-overlay">
+          <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
+        </view>
         <!-- 聊天内容 -->
         <view class="scroll-view-box">
           <scroll-view
@@ -226,26 +232,41 @@
                 />
               </view>
 
-              <!-- 智能体任务执行中，显示加载中图标 -->
-              <image
-                v-if="isTaskExecuting"
-                class="icon-loading-image"
-                src="@/static/assets/icon_loading.svg"
-                alt=""
-                :show-menu-by-longpress="false"
-                @longtap.stop.prevent
-                @contextmenu.stop.prevent="true"
-                mode="widthFix"
-              />
+              <!-- 智能体任务执行中且最后一条为用户消息：显示加载中图标。
+                   APP：spin-loading 自转圆环（GIF/CSS 动画在 App image 无效）；非 APP：SVG + 自带旋转 -->
+              <view
+                v-if="isConversationActive && isLastMsgUser"
+                class="task-executing-loading"
+              >
+                <!-- #ifdef APP -->
+                <spin-loading size="48rpx" color="#3bb346" :duration-ms="800" />
+                <!-- #endif -->
+                <!-- #ifndef APP -->
+                <image
+                  class="icon-loading-image"
+                  src="@/static/assets/icon_loading.svg"
+                  alt=""
+                  :show-menu-by-longpress="false"
+                  @longtap.stop.prevent
+                  @contextmenu.stop.prevent="true"
+                  mode="widthFix"
+                />
+                <!-- #endif -->
+              </view>
             </view>
 
             <!-- 空状态内容 -->
             <view class="content" v-else>
               <view class="title-section">
-                <rich-text
-                  v-if="openingChatHtml.length > 0"
-                  :nodes="openingChatHtml"
-                  mode="web"
+                <UniAiXMsg
+                  v-if="openingChatBody.length > 0"
+                  message-id="opening-chat-message"
+                  :body-text="openingChatBody"
+                  message-status="complete"
+                  :conversation-id="`${conversationId}`"
+                  :is-last-msg="false"
+                  :is-conversation-active="false"
+                  :show-tool-bar="false"
                 />
               </view>
               <button-wrapper
@@ -261,12 +282,28 @@
 
           <!-- 滚动到底部按钮 -->
           <view
-            :style="{ visibility: scrollInBottom ? 'hidden' : 'visible' }"
             class="scroll-to-bottom"
+            :class="{ 'scroll-to-bottom--show': !scrollInBottom }"
             @click="scrollToLastMsg(true)"
           >
             <svg-icon name="icon-a-Chevrondown" />
           </view>
+
+          <!-- #ifndef APP -->
+          <!-- 首次加载历史会话：全局 loading 图标（请求成功或失败后关闭）。
+               APP：spin-loading 自转圆环（GIF 在 App image 无法渲染，CSS 动画无效）；
+               非 APP：SVG + CSS 旋转 -->
+          <view v-if="isPageLoading" class="page-loading">
+            <image
+              class="page-loading-image page-loading-spin"
+              src="@/static/assets/icon_loading.svg"
+              mode="widthFix"
+              :show-menu-by-longpress="false"
+              @longtap.stop.prevent
+              @contextmenu.stop.prevent="true"
+            />
+          </view>
+          <!-- #endif -->
         </view>
 
         <!-- Agent 干预固定栏：FIFO 队列，仅展示队首一张卡片 -->
@@ -452,6 +489,11 @@
   import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
   import ScrollManager from "./layers/ScrollManager.uts";
   import AgentDetailUtils from "./layers/AgentDetailUtils.uts";
+  import { isStreamPerfMockEnabled } from "./layers/mockStreamPerf.uts";
+  // #ifdef APP
+  // App 端 image 无法渲染 GIF/CSS 动画，用 spin-loading（与 ai-msg 会话加载图标一致）
+  import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
+  // #endif
   import { ttsWebSocketPlayer } from "@/subpackages/utils/voice/ttsWebSocketPlayer";
   import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
   import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
@@ -804,6 +846,7 @@
     sandboxDisabledText,
     isLoadingMoreMessages,
     isLoadingConversation,
+    isPageLoading,
     hasMoreMessages,
     currentModelId,
     currentModelName,
@@ -936,26 +979,73 @@
   };
 
   /**
-   * 开场白：直接交给 rich-text 渲染的 HTML。
-   * 服务端 openingChatMsg 多为 HTML，原样透传；纯文本时转义并按行转 <br>，
-   * 避免 rich-text 对纯文本 nodes(string) 在 App 端不渲染。
-   * 颜色写在节点内联样式上：App 端 mode="web" 用 WebView 渲染，外层 CSS 不生效。
+   * 将开场白中的常见 HTML 转为 Markdown。
+   * 仅使用 RegExp + 固定替换字符串，避免 Android UTS 不支持 replace 回调。
    */
-  const openingChatHtml = computed((): string => {
+  function normalizeOpeningChatHtml(source: string): string {
+    let result = source;
+    result = result.replace(/<!--[\s\S]*?-->/g, "");
+    result = result.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "");
+    result = result.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+    result = result.replace(/<br\s*\/?>/gi, "\n");
+    result = result.replace(/<hr\s*\/?>/gi, "\n\n---\n\n");
+    result = result.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, "\n# $1\n");
+    result = result.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, "\n## $1\n");
+    result = result.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, "\n### $1\n");
+    result = result.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/(strong|b)>/gi, "**$2**");
+    result = result.replace(/<(em|i)[^>]*>([\s\S]*?)<\/(em|i)>/gi, "*$2*");
+    result = result.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
+    result = result.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, "\n- $1");
+    result = result.replace(/<(div|p)[^>]*>([\s\S]*?)<\/(div|p)>/gi, "\n$2\n");
+    result = result.replace(/<\/?(ul|ol)[^>]*>/gi, "\n");
+    result = result.replace(/<a[^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
+    result = result.replace(/<[^>]+>/g, "");
+    result = result.replace(/&nbsp;/g, " ");
+    result = result.replace(/&lt;/g, "<");
+    result = result.replace(/&gt;/g, ">");
+    result = result.replace(/&quot;/g, '"');
+    result = result.replace(/&#39;|&apos;/g, "'");
+    result = result.replace(/&amp;/g, "&");
+    result = result.replace(/\n{3,}/g, "\n\n");
+    return result.trim();
+  }
+
+  /**
+   * 转换普通 HTML，同时原样保留 task-result 自定义块供消息解析器处理。
+   */
+  function normalizeOpeningChatContent(source: string): string {
+    const regex =
+      /<task-result\b[^>]*>[\s\S]*?<\/task-result>/gi;
+    const fragments = [] as string[];
+    let cursor = 0;
+    let match = regex.exec(source);
+    while (match != null) {
+      const before = source.substring(cursor, match.index);
+      if (before.length > 0) {
+        fragments.push(normalizeOpeningChatHtml(before));
+      }
+      const taskBlock = match[0] != null ? match[0]! : "";
+      if (taskBlock.length > 0) {
+        fragments.push(taskBlock);
+      }
+      cursor = regex.lastIndex;
+      match = regex.exec(source);
+    }
+    const after = source.substring(cursor);
+    if (after.length > 0) {
+      fragments.push(normalizeOpeningChatHtml(after));
+    }
+    return fragments.join("\n\n").trim();
+  }
+
+  /** 开场白统一转换为 UniAiXMsg 可解析的 Markdown。 */
+  const openingChatBody = computed((): string => {
     const source = readAgentStringField(agentInfo.value, "openingChatMsg");
-    const text = source.trim();
-    if (text.length == 0) {
+    if (source.trim().length == 0) {
       return "";
     }
-    if (/<\/?[a-zA-Z][^>]*>/.test(text)) {
-      return `<div style="color:#404040;font-size:30rpx;">${text}</div>`;
-    }
-    let escaped = text;
-    escaped = escaped.replace(/&/g, "&amp;");
-    escaped = escaped.replace(/</g, "&lt;");
-    escaped = escaped.replace(/>/g, "&gt;");
-    escaped = escaped.replace(/\n/g, "<br/>");
-    return `<p style="color:#404040;font-size:30rpx;text-align:center;">${escaped}</p>`;
+    const hasHtmlTag = /<\/?[a-zA-Z][^>]*>/.test(source);
+    return hasHtmlTag ? normalizeOpeningChatContent(source) : source;
   });
 
   // 是否显示webview（须位于 data 解构之后，showNavCreateConversation 之前）
@@ -1299,6 +1389,10 @@
     if (streamSpeakAllowed != true) {
       return;
     }
+    // #ifdef H5 || WEB
+    // H5 默认不自动语音播报（无开关入口，强制关闭）；工具栏手动播报不受影响
+    return;
+    // #endif
     const settings = loadVoiceSettings();
     // 关闭自动播报：SSE 不 begin/feed；工具栏手动播报不受影响
     if (settings.autoPlay != true) {
@@ -1476,11 +1570,6 @@
     }
     const obj = info as UTSJSONObject;
     return parseTaskStatus(obj["taskStatus"]);
-  });
-
-  /** 会话任务是否执行中（模板辅助，避免模板中引用枚举类与 ===） */
-  const isTaskExecuting = computed((): boolean => {
-    return conversationTaskStatus.value == TaskStatus.EXECUTING;
   });
 
   /** 是否图片 MIME */
@@ -1845,6 +1934,10 @@
 
   // 发送消息
   const handleSendMessage = (_data: any) => {
+    // H5：SSE 流式播报在发送后的合成/网络往返后才异步播放，离手势较远；
+    // 发送按钮点击在用户手势内，这里同步解锁 TTS 音频通道（幂等，复用同一 InnerAudioContext），
+    // 后续 SSE 播放即被移动端浏览器放行。App / 小程序为 no-op。
+    ttsWebSocketPlayer.unlockInGesture()
     // 停上一轮播报，但保持本轮可播（勿 hardStop，否则 streamSpeakFeed 会被吞掉）
     interruptStreamSpeakPlayback();
     // 发送新消息：断开 ASR 残留连接（即开即用、用完即断），避免 warm 半开连接影响后续录音
@@ -2051,6 +2144,11 @@
    * 处理创建新会话
    */
   const handleCreateNewConversation = (): void => {
+    // 新建会话前停止正在播放的语音（流式播报 / 工具栏 TTS / 音频队列），并断开 ASR/TTS 预热连接，
+    // 避免旧会话的响应在切换后继续出声（对齐 handleStopConversation 的收尾）
+    stopAllStreamSpeech(true);
+    asrWebSocketClient.disableWarmupAndDisconnect();
+    ttsWebSocketPlayer.disableWarmupAndDisconnect();
     // 中止当前 SSE / sub 连接
     chatService.abort();
     service.abortSubConversation();
@@ -2122,6 +2220,16 @@
       "files": guidePayload["files"],
       "selectedComponents": guidePayload["selectedComponents"],
     };
+
+    // 建议按钮点击是「点击」而非滚动手势：
+    // 点击本身会让 scroll-view 触发 touchstart → scrollTouch=true（touchend 后 300ms 才复位），
+    // 期间建议列表卸载 / 新消息插入引发的 scroll 事件会被 applyScrollBottomState 误判为
+    // 「用户上滑」（scrollTouch 为 true）而把 autoToLastMsg 置 false；
+    // 同时 tryScrollDuringHistorySettle 见 scrollTouch 会 clearHistorySettle，
+    // 发送链路 scrollToLastMsgAfterSend 的跟底窗口被整体取消 → 发消息后不自动滚底。
+    // 这里显式清掉触摸态，让发送后的滚底正常执行（点击不可能是上滑打断）。
+    data.scrollTouch.value = false;
+    data.mouseScroll.value = false;
 
     handleSendMessage(params);
   };
@@ -2195,6 +2303,14 @@
       return null;
     }
     return list[listLen - 1];
+  });
+  /** 最后一条消息是否为用户消息（任务执行中图标仅在最后一条为用户消息、等待助手回复时展示） */
+  const isLastMsgUser = computed((): boolean => {
+    const msg = lastMessage.value;
+    if (msg == null) {
+      return false;
+    }
+    return isAssistantMessage(msg) != true;
   });
   // 标题
   const headerTitle = computed((): string => {
@@ -2273,8 +2389,20 @@
     handleScrollToLastMsg(true);
   };
 
-  // 最后一条消息内容变化（非流式：状态更新 / 历史落库等）；流式期跳过
-  watch(lastMessage, handleScrollToLastMsgFromListWatch, { deep: true });
+  // 最后一条消息的 id/status/正文长度变化（非流式：状态更新 / 历史落库 / 新消息替换；
+  // 流式期正文增长也由此触发，但 handleScrollToLastMsg 内有流式期守卫）。
+  // 改标量签名 watch，避免每 flush 对末条消息对象（含大 markdownElList）做 deep 遍历。
+  watch(
+    (): string => {
+      const m = lastMessage.value;
+      if (m == null) {
+        return "||";
+      }
+      const t = m.text != null ? m.text.length : 0;
+      return `${m.id}|${m.status ?? ""}|${t}`;
+    },
+    handleScrollToLastMsgFromListWatch,
+  );
 
   // 仅监听条数变化，避免对整表 deep watch 遍历嵌套字段
   watch(
@@ -2684,6 +2812,71 @@
     });
   };
 
+  // ==================== 性能测试帧探针（perfTest 模式：avgFps / maxGap 浮层 + logcat）====================
+  // setInterval(16ms) 记主线程 tick 间隔；解析/渲染阻塞时 delta 暴涨 → 量化「卡死/掉帧」体感。
+  // 仅 isStreamPerfMockEnabled 时启动；浮层每 500ms 刷新一次，避免探针自身污染测量。
+  const isPerfMock = ref<boolean>(false);
+  const perfFpsText = ref<string>("--");
+  const perfGapText = ref<string>("--");
+  let perfLastFrameAt: number = 0;
+  let perfFrameDeltas: number[] = [] as number[];
+  let perfDisplayAccum: number = 0;
+  let perfProbeRunning: boolean = false;
+  const PERF_FRAME_WINDOW: number = 120;
+  const PERF_DISPLAY_FLUSH_MS: number = 500;
+
+  // UTS：function 自引用 / setInterval 内联箭头均有编译坑，探针改 async + while(flag) 自调度。
+  async function perfFrameTickLoop(): Promise<void> {
+    perfLastFrameAt = Date.now();
+    while (perfProbeRunning) {
+      const now = Date.now();
+      const delta = now - perfLastFrameAt;
+      perfLastFrameAt = now;
+      perfFrameDeltas.push(delta);
+      if (perfFrameDeltas.length > PERF_FRAME_WINDOW) {
+        perfFrameDeltas.splice(0, perfFrameDeltas.length - PERF_FRAME_WINDOW);
+      }
+      perfDisplayAccum += delta;
+      if (perfDisplayAccum >= PERF_DISPLAY_FLUSH_MS) {
+        perfDisplayAccum = 0;
+        let sum = 0;
+        let mx = 0;
+        for (let i = 0; i < perfFrameDeltas.length; i++) {
+          const d = perfFrameDeltas[i];
+          sum += d;
+          if (d > mx) {
+            mx = d;
+          }
+        }
+        const cnt = perfFrameDeltas.length;
+        const avg = cnt > 0 ? sum / cnt : 0;
+        const fps = avg > 0 ? 1000 / avg : 0;
+        perfFpsText.value = `${fps.toFixed(0)}`;
+        perfGapText.value = `${mx}`;
+        console.log(`[PerfProbe] fps=${fps.toFixed(0)} maxGap=${mx}ms avgDelta=${avg.toFixed(0)}ms samples=${cnt}`);
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout((): void => resolve(), 16);
+      });
+    }
+  }
+
+  function startPerfFrameProbe(): void {
+    if (perfProbeRunning) {
+      return;
+    }
+    perfFrameDeltas = [] as number[];
+    perfDisplayAccum = 0;
+    perfFpsText.value = "--";
+    perfGapText.value = "--";
+    perfProbeRunning = true;
+    perfFrameTickLoop();
+  }
+
+  function stopPerfFrameProbe(): void {
+    perfProbeRunning = false;
+  }
+
   // 聊天页可见时暂停全局 batch 事件轮询；离开聊天页（含跳转文件预览等）后恢复
   // 四端统一用页面 onShow/onHide（与上方 H5 pageResume 分流无关）
   onShow((): void => {
@@ -2707,6 +2900,12 @@
 
   onUnload((): void => {
     resumeEventPollingAfterChat();
+    stopPerfFrameProbe();
+    // #ifdef APP
+    // 断开 markdown-proxy 单例对 webviewContext 的强引用（GC root），
+    // 否则返回上一页后 Activity + WebView 无法回收 → 反复进聊天累积泄漏。
+    proxyWeb.reset();
+    // #endif
   });
 
   /**
@@ -3089,7 +3288,7 @@
   // 内部异步逻辑包装为同步回调，避免 Promise 类型不匹配
   const runOnLoadAsync = async (options: any): Promise<void> => {
     // 获取并更新租户配置，初始化 enableSubscription
-    await initTenantConfig();
+    void initTenantConfig();
 
     // 设置当前页面导航栏标题
     setCurrentPageNavigationBarTitle();
@@ -3129,11 +3328,28 @@
     });
     // #endif
 
-    // 判断是否是临时会话
-    if (props.isTempChat) {
-      await handleTempChatPageLoad(options);
-    } else {
-      await handlePageLoad(options);
+    // ===== 性能测试 Mock：seed 预置历史 + 跳过真实会话拉取（纯 Mock，无网络依赖）=====
+    // isStreamPerfMockEnabled 由 pages/test-stream-perf 启动页写 storage 打开。
+    if (isStreamPerfMockEnabled()) {
+      isPerfMock.value = true;
+      service.seedMockHistoryIfNeeded();
+      startPerfFrameProbe();
+      // 自动发起 Mock 流式（无需手动发送；启动页点「开始测试」即流式）
+      service.runMockPerfStream();
+      return;
+    }
+
+    // 进入页面即显示全局 loading 图标，历史会话请求成功或失败后统一关闭
+    data.isPageLoading.value = true;
+    try {
+      // 判断是否是临时会话
+      if (props.isTempChat) {
+        await handleTempChatPageLoad(options);
+      } else {
+        await handlePageLoad(options);
+      }
+    } finally {
+      data.isPageLoading.value = false;
     }
   };
   onLoad((options: any) => {
@@ -3290,6 +3506,45 @@
     runOnMountedAsync();
   });
 
+  // Activity 泄漏修复：onUnload 做全面清理（比 onUnmounted 更可靠——页面级卸载，
+  // JS 线程繁忙 / Activity 泄漏时 onUnmounted 可能不触发）。onUnmounted 保留作兜底。
+  onUnload((): void => {
+    speechSocketWarmup.teardown();
+    stopAllStreamSpeech(true);
+    chatService.abort();
+    service.abortSubConversation();
+    destroyConversationPolling();
+    scrollManager.dispose();
+
+    if (touchEndTimer != 0) {
+      clearTimeout(touchEndTimer);
+      touchEndTimer = 0;
+    }
+    clearFeedSpeakTimer();
+
+    // #ifdef H5
+    window.removeEventListener("wheel", handleH5Wheel);
+    // #endif
+
+    // #ifdef APP
+    proxyWeb.reset();
+    // #endif
+
+    // 断所有 uni.$on 事件（回调捕获 this → GC root 持 Activity）
+    uni.$off("streamMessageUpdate", handleStreamMessageUpdate);
+    uni.$off("streamSpeakFeed", handleStreamSpeakFeed);
+    uni.$off("streamSpeakInterrupt", handleStreamSpeakInterrupt);
+    uni.$off("refreshFileList", onRefreshFileList);
+    uni.$off("updateMessageComponent", handleUpdateMessageComponent);
+    uni.$off("page_preview_executing", handlePagePreviewExecuting);
+    uni.$off("page_preview_detail", handlePagePreviewDetail);
+    uni.$off("ai-msg-content-ready", handleAiMsgContentReady);
+    // #ifdef MP-WEIXIN
+    uni.$off("message-event-delegate");
+    // #endif
+    isRenderInputPhone.value = false;
+  });
+
   // 清理事件监听器
   onUnmounted(() => {
     speechSocketWarmup.teardown();
@@ -3319,6 +3574,7 @@
     uni.$off("refreshFileList", onRefreshFileList);
     uni.$off("updateMessageComponent", handleUpdateMessageComponent);
     uni.$off("page_preview_executing", handlePagePreviewExecuting);
+    uni.$off("page_preview_detail", handlePagePreviewDetail);
     uni.$off("ai-msg-content-ready", handleAiMsgContentReady);
     // #ifdef MP-WEIXIN
     uni.$off("message-event-delegate");
@@ -3354,6 +3610,56 @@
 <style lang="scss" scoped>
   @import "./styles/index.scss";
 
+  .perf-overlay {
+    position: fixed;
+    top: 88px;
+    right: 12px;
+    z-index: 9999;
+    padding: 6px 10px;
+    background-color: rgba(0, 0, 0, 0.66);
+    border-radius: 6px;
+  }
+  .perf-overlay-text {
+    color: #00e676;
+    font-size: 22rpx;
+    font-weight: 600;
+  }
+
+  /* 首次加载历史会话：全局 loading 图标（与会话加载图标一致）。
+     fixed 全屏定位：完全脱离文档流，底部组件列表先渲染也不会把图标挤走，视口居中即可。 */
+  .page-loading {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    pointer-events: none;
+  }
+
+  .page-loading-image {
+    width: 48rpx;
+    height: 48rpx;
+  }
+
+  /* #ifndef APP */
+  .page-loading-spin {
+    animation: page-loading-spin 1s linear infinite;
+  }
+
+  @keyframes page-loading-spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  /* #endif */
+
   .captcha-button {
     position: absolute;
     left: 10px;
@@ -3386,6 +3692,16 @@
     -webkit-touch-callout: none !important;
     -webkit-user-select: none !important;
     user-select: none !important;
+    /* #endif */
+  }
+
+  /* APP 端 spin-loading 无自带边距，用外层补上与 image 一致的左边距 */
+  .task-executing-loading {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    /* #ifdef APP */
+    margin-left: 32rpx;
     /* #endif */
   }
 

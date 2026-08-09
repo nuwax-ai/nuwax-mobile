@@ -441,8 +441,12 @@ export class StreamRequest {
   private sseDispatchRunning: boolean = false;
   private sseDispatchConfig: StreamRequestConfig | null = null;
   private sseDispatchOnComplete: (() => void) | null = null;
-  /** 轻负载时帧间隔；积压时会降为 0 并加大 batch */
-  private readonly SSE_DISPATCH_INTERVAL_MS: number = 16;
+  /**
+   * 轻负载时帧间隔；积压时会降为 0 并加大 batch。
+   * 调参历史：16ms → 8ms（轻负载出队上限 62 → 125 帧/s）。缩短"入栈"延迟，token 更快进 UI 合并窗；
+   * 仅摊薄 onChunk 派发节奏，不触发生成渲染（渲染仍由 AgentDetailService 的合并窗节流）。
+   */
+  private readonly SSE_DISPATCH_INTERVAL_MS: number = 4;
   /** 大包异步入队尚未完成（防止 complete 误判队列空闲） */
   private sseBurstEnqueuePending: boolean = false;
   private sseBurstTimer: number | null = null;
@@ -952,10 +956,19 @@ export class StreamRequest {
       return;
     }
 
+    // 增量边界扫描：buffer 只保留「未完成尾部」，避免每个 chunk 都对整个累积 buffer
+    // 做 split（O(n²) 字符串拷贝/分配 → 主线程 GC 风暴，见 .diag/20260807-anr/）。
+    // 切分边界语义与原 split("\n\n") + pop() 完全一致。
     this.buffer += text;
-    const messages = this.buffer.split("\n\n");
-    const pendingMessage = messages.pop();
-    this.buffer = pendingMessage != null ? pendingMessage : "";
+    const messages: string[] = [];
+    let rest = this.buffer;
+    let sepIdx = rest.indexOf("\n\n");
+    while (sepIdx >= 0) {
+      messages.push(rest.substring(0, sepIdx));
+      rest = rest.substring(sepIdx + 2);
+      sepIdx = rest.indexOf("\n\n");
+    }
+    this.buffer = rest;
 
     if (yieldBetweenMessages != true) {
       for (let mi = 0; mi < messages.length; mi++) {

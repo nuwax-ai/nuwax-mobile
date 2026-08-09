@@ -1,5 +1,5 @@
 import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
-import { findCjkAutolinkBoundary } from "@/subpackages/components/ai-msg/markdownAutolink.uts";
+import { findCjkAutolinkBoundary, CJK_URL_PUNCTUATION } from "@/subpackages/components/ai-msg/markdownAutolink.uts";
 import type {
   Align,
   MarkdownToken,
@@ -1401,20 +1401,59 @@ function findDelStart(text: string, cursor: number): number {
   return text.indexOf("~~", cursor);
 }
 
+function findWwwUrlStart(text: string, cursor: number): number {
+  let idx = text.indexOf("www.", cursor);
+  while (idx >= 0) {
+    let isValid = true;
+    if (idx > 0) {
+      const prev = text.charAt(idx - 1);
+      if (
+        (prev >= "a" && prev <= "z") ||
+        (prev >= "A" && prev <= "Z") ||
+        (prev >= "0" && prev <= "9") ||
+        prev == "/" ||
+        prev == "@" ||
+        prev == ":" ||
+        prev == "." ||
+        prev == "-" ||
+        prev == "_" ||
+        prev == "(" ||
+        prev == "<" ||
+        prev == "=" ||
+        prev == "\"" ||
+        prev == "'"
+      ) {
+        isValid = false;
+      }
+    }
+    if (isValid) {
+      return idx;
+    }
+    idx = text.indexOf("www.", idx + 1);
+  }
+  return -1;
+}
+
 /**
- * 查找裸 URL 起点（http/https，remark-gfm autolink 对齐）。
- * 返回 scheme 下标，找不到返回 -1。闭合（URL 结束）由调用处按空白/标点截断。
+ * 查找裸 URL 起点（http/https 或 www.，remark-gfm autolink 对齐）。
+ * 返回 scheme/www. 下标，找不到返回 -1。闭合（URL 结束）由调用处按空白/标点截断。
  */
 function findBareUrlStart(text: string, cursor: number): number {
   const httpIdx = text.indexOf("http://", cursor);
   const httpsIdx = text.indexOf("https://", cursor);
-  if (httpIdx < 0) {
-    return httpsIdx;
+  const wwwIdx = findWwwUrlStart(text, cursor);
+
+  let minIdx = -1;
+  if (httpIdx >= 0) {
+    minIdx = httpIdx;
   }
-  if (httpsIdx < 0) {
-    return httpIdx;
+  if (httpsIdx >= 0 && (minIdx < 0 || httpsIdx < minIdx)) {
+    minIdx = httpsIdx;
   }
-  return httpIdx < httpsIdx ? httpIdx : httpsIdx;
+  if (wwwIdx >= 0 && (minIdx < 0 || wwwIdx < minIdx)) {
+    minIdx = wwwIdx;
+  }
+  return minIdx;
 }
 
 /** 判断裸 URL 起点前一字是否为 `(` `<` `=` 引号（即已在 markdown 链接/属性内），避免重复识别。 */
@@ -1449,9 +1488,29 @@ function extractBareUrl(text: string, urlStart: number): string {
     }
     end++;
   }
-  const candidate = text.substring(urlStart, end);
+  let candidate = text.substring(urlStart, end);
   const cjkBoundary = findCjkAutolinkBoundary(candidate);
-  return cjkBoundary > 0 ? candidate.substring(0, cjkBoundary) : candidate;
+  if (cjkBoundary > 0) {
+    candidate = candidate.substring(0, cjkBoundary);
+  }
+  // 剥除末尾标点（如逗号、句号、分号等，避免包含在 URL 中）
+  while (candidate.length > 0) {
+    const lastChar = candidate.charAt(candidate.length - 1);
+    if (
+      lastChar == "," ||
+      lastChar == "." ||
+      lastChar == ";" ||
+      lastChar == ":" ||
+      lastChar == "!" ||
+      lastChar == "?" ||
+      CJK_URL_PUNCTUATION.indexOf(lastChar) >= 0
+    ) {
+      candidate = candidate.substring(0, candidate.length - 1);
+      continue;
+    }
+    break;
+  }
+  return candidate;
 }
 
 /** 从 from 起找斜体闭合 `*`（同样跳过 `**`）。 */
@@ -1685,10 +1744,14 @@ function parseInline(text: string): MarkdownToken[] {
         result.push(makeTextToken(text.substring(nextStart)));
         break;
       }
+      const rawHref = text.substring(labelEnd + 2, hrefEnd);
+      const href = (rawHref.startsWith("http://") || rawHref.startsWith("https://") || rawHref.startsWith("conversation://"))
+        ? rawHref
+        : "http://" + rawHref;
       result.push({
         type: "link",
         text: text.substring(nextStart + 1, labelEnd),
-        href: text.substring(labelEnd + 2, hrefEnd),
+        href: href,
         className: "link",
       });
       cursor = hrefEnd + 1;
@@ -1698,10 +1761,13 @@ function parseInline(text: string): MarkdownToken[] {
       // 裸 URL autolink：截到空白/结构字符，文本即 URL
       const url = extractBareUrl(text, nextStart);
       if (url.length > 0) {
+        const href = (url.startsWith("http://") || url.startsWith("https://"))
+          ? url
+          : "http://" + url;
         result.push({
           type: "link",
           text: url,
-          href: url,
+          href: href,
           className: "link",
         });
         cursor = nextStart + url.length;
@@ -2226,27 +2292,107 @@ function renderMathToken(
  * 异步渲染 mermaid 代码块（App 流式/历史走 fallback，cmark 路径触达不到）。
  * 参考 renderMathToken 的 whenReady/回调刷帧模式：webview 未就绪则等待，结果回填 token.href（+width/height）。
  * mermaid 量少，单条直调，不进 KaTeX 并发队列。
+ *
+ * 去重/缓存（与公式 MathBatchUiRunner + mathInFlightTokens 对齐）：
+ * 流式 live 区每 flush 重解析，闭合 mermaid 块若滞留 live 区会每帧重发 proxy 截图 →
+ * 灌满 proxy 串行 mermaidQueue → 全部超时失败（"图表渲染失败"）+ href 每帧变 → 抖动。
+ * 故同 text：成功结果缓存命中直填（零 proxy 调用）、在途去重扇出、失败短期冷却不每帧重试。
  */
+
+/** mermaid 截图结果缓存：成功存 href/宽高；失败仅记 failAt 做冷却 */
+class MermaidCacheEntry {
+  href: string = "";
+  width: number = 0;
+  height: number = 0;
+  ok: boolean = false;
+  failAt: number = 0;
+}
+
+/** 在途渲染的等待者：首个 dispatch 未回调期间，后续同 text 的 token 挂这里，回调时统一扇出 */
+class MermaidWaiter {
+  token: MarkdownToken;
+  callback: MathRenderedCallback;
+  constructor(token: MarkdownToken, callback: MathRenderedCallback) {
+    this.token = token;
+    this.callback = callback;
+  }
+}
+
+/** 失败冷却：同 text 失败后 2s 内不重发，避免每帧重试打满串行队列（落代码 Tab 兜底） */
+const MERMAID_FAIL_COOLDOWN_MS: number = 2000;
+/** text → 最近一次渲染结果（成功缓存 / 失败冷却）。模块级，跨消息复用同图截图 */
+const mermaidCache: Map<string, MermaidCacheEntry> = new Map<string, MermaidCacheEntry>();
+/** text → 在途等待者列表（dispatch 中未回调） */
+const mermaidInFlight: Map<string, MermaidWaiter[]> = new Map<string, MermaidWaiter[]>();
+
 function renderMermaidToken(
   mermaidText: string,
   token: MarkdownToken,
   callback: MathRenderedCallback,
 ): void {
+  // 1) 成功缓存命中：同步回填，本次解析即带 href 上屏，零 proxy 调用、零抖动
+  const cached = mermaidCache.get(mermaidText);
+  if (cached != null) {
+    if (cached.ok == true) {
+      token.href = cached.href;
+      if (cached.width > 0) token.width = cached.width;
+      if (cached.height > 0) token.height = cached.height;
+      callback();
+      return;
+    }
+    // 2) 失败冷却期内：不重复 dispatch（避免每帧重试打满队列），落代码 Tab 兜底
+    if (Date.now() - cached.failAt < MERMAID_FAIL_COOLDOWN_MS) {
+      callback();
+      return;
+    }
+  }
+  // 3) 在途去重：同 text 已 dispatch 未回调，挂入等待列表，回调时统一扇出
+  const existing = mermaidInFlight.get(mermaidText);
+  if (existing != null) {
+    existing.push(new MermaidWaiter(token, callback));
+    return;
+  }
+  // 4) 首次 dispatch：登记在途
+  const waiters = [] as MermaidWaiter[];
+  waiters.push(new MermaidWaiter(token, callback));
+  mermaidInFlight.set(mermaidText, waiters);
+
   const doRender = (): void => {
     const param = new UTSJSONObject();
     param["action"] = "renderMermaid";
     param["mermaidText"] = mermaidText;
     proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
+      // 取出全部等待者（含首个 dispatch 的 token）后清在途登记
+      const pending = mermaidInFlight.get(mermaidText);
+      mermaidInFlight.delete(mermaidText);
       const imageData = res["imageDataURL"];
-      if (imageData != null && `${imageData}`.length > 0) {
-        token.href = `${imageData}`;
+      const hasImage = imageData != null && `${imageData}`.length > 0;
+      const entry = new MermaidCacheEntry();
+      if (hasImage) {
+        entry.href = `${imageData}`;
+        entry.ok = true;
         const widthData = res["width"];
         const heightData = res["height"];
-        if (widthData != null) token.width = widthData as number;
-        if (heightData != null) token.height = heightData as number;
+        if (widthData != null) entry.width = widthData as number;
+        if (heightData != null) entry.height = heightData as number;
+      } else {
+        // 失败：记冷却时间戳，不回填 href（渲染组件落代码 Tab）
+        entry.ok = false;
+        entry.failAt = Date.now();
       }
-      // 失败（imageDataURL 空）不回填 href，由渲染组件落代码 Tab
-      callback();
+      mermaidCache.set(mermaidText, entry);
+      // 扇出：结果写到每个等待 token（含已冻结进 stableEls 的，避免漏填后不再重解析）
+      if (pending != null) {
+        for (let i = 0; i < pending.length; i++) {
+          const w = pending[i];
+          if (hasImage) {
+            w.token.href = entry.href;
+            if (entry.width > 0) w.token.width = entry.width;
+            if (entry.height > 0) w.token.height = entry.height;
+          }
+          w.callback();
+        }
+      }
     });
   };
   if (proxyWeb.isReady() == true) {

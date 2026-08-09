@@ -35,9 +35,14 @@ class TtsListenerEntry {
   }
 }
 
-/** 极短静音 WAV，仅用于 H5 在用户点击时解锁音频通道 */
+/**
+ * 极短静音 WAV，仅用于 H5 在用户点击时解锁音频通道。
+ * 必须是带真实采样（非 0 时长）的合法 WAV：iOS 只有元素真正播放过一段有效音频才算解锁，
+ * 0 采样空壳 WAV 不会被判定为“播放过”，解锁无效 → 后续异步 play() 仍被拦截。
+ * 此处为 0.05s / 8kHz / 16bit mono 全零采样（800 字节 data）。
+ */
 const SILENT_WAV_DATA_URI =
-  "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+  "data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
 function createTtsWebSocketUrl(token: string): string {
   let baseUrl = getApiBaseUrl();
@@ -867,18 +872,6 @@ export class TtsWebSocketPlayer {
         resolve(ok);
       };
       timerId = setTimeout(() => {
-        console.warn(
-          "[TTS] playAndWait timeout gen=",
-          expectedGeneration,
-          "state=",
-          this.state,
-          "chunks=",
-          this.chunks.length,
-          "pendingBinary=",
-          this.pendingBinary,
-          "finishRequested=",
-          this.finishRequested,
-        );
         if (expectedGeneration == this.generation) {
           // 超时收尾：收回待命并进入闲置关闭，不再强制补预热
           this.prepareForNextUtterance(true);
@@ -1905,11 +1898,19 @@ export class TtsWebSocketPlayer {
         }
       }
     } else {
+      // H5/WEB：保留已解锁的 InnerAudioContext（手势内解锁过即持续放行），
+      // 仅 stop 当前音频，不销毁。若在此 destroy，下一次播放会重建一个未被手势解锁的
+      // 新元素，被移动端浏览器拦截（NotAllowedError，iOS 最严）。
+      // 销毁推迟到 disableWarmupAndDisconnect（离开页面 / 停会话）。
+      // #ifndef H5 || WEB
       this.audioContext = null;
+      // #endif
       if (audio != null) {
         try {
           audio!.stop();
+          // #ifndef H5 || WEB
           audio!.destroy();
+          // #endif
         } catch (_eAudio) {
           // ignore
         }
@@ -1960,6 +1961,22 @@ export class TtsWebSocketPlayer {
       audio.play();
     } catch (e: any) {
       console.warn("[TTS] h5.audioUnlockFailed", e);
+    }
+    // #endif
+  }
+
+  /**
+   * H5：在用户手势调用栈内同步解锁音频通道（工具栏播报点击时调用）。
+   * 浏览器要求 play() 落在手势栈内；TTS 合成是异步的（WebSocket 往返后才播放），
+   * 若等到合成完成才首次 play()，会被移动端浏览器拦截（NotAllowedError，iOS 最严）。
+   * 这里在点击同步阶段用同一 InnerAudioContext 播一段静音解锁，后续异步播放复用
+   * 已解锁实例即被放行。仅首次创建并解锁；重复调用为幂等。
+   * App / 小程序无需手势解锁，本方法为 no-op。
+   */
+  unlockInGesture(): void {
+    // #ifdef H5 || WEB
+    if (this.audioContext == null) {
+      this.prepareAudioContextForGesture();
     }
     // #endif
   }

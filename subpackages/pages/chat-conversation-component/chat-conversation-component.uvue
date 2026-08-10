@@ -100,18 +100,27 @@
         </view>
         <!-- 聊天内容 -->
         <view class="scroll-view-box">
-          <list-view
-            direction="vertical"
+          <!-- 触摸状态跟踪：z-paging-x 不转发 touch 事件，在包裹层监听（原生事件冒泡）。
+               msg-list 类名保留在包裹层，让 styles/index.scss 中 .msg-list 下的消息样式继续命中 -->
+          <view
             class="msg-list"
-            :scroll-into-view="scrollIntoViewTarget"
-            id="msg-list"
-            :scroll-with-animation="scrollWithAnimation"
-            :upper-threshold="50"
-            @scrolltoupper="handleScrollToUpper"
-            @scroll="onScroll"
             @touchstart="handleTouchStart"
             @touchend="handleTouchEnd"
             @touchcancel="handleTouchEnd"
+          >
+          <!-- z-paging-x 仅作滚动容器（layout-only 纯布局：不自动请求/无下拉刷新/无底部加载更多/隐藏空图），
+               历史消息加载仍走 scrolltoupper → handleScrollToUpper；list-id 保持 ScrollManager 的 getElementById("msg-list") 可用 -->
+          <z-paging-x
+            ref="pagingXRef"
+            list-is="list-view"
+            list-id="msg-list"
+            :layout-only="true"
+            :auto="false"
+            :refresher-enabled="false"
+            :load-more-enabled="false"
+            :scroll-with-animation="scrollWithAnimation"
+            @scrolltoupper="handleScrollToUpper"
+            @scroll="onScroll"
           >
             <!-- 加载更多历史消息提示 -->
             <list-item v-if="isLoadingMoreMessages" :type="1">
@@ -294,12 +303,12 @@
               </view>
             </list-item>
 
-            <!-- 滚底锚点：保留极小高度保证 scroll-into-view 稳定，避免底部大块空白。
-                 显式 key：与既有 list-view 用法（home-content）一致，避免原生列表对无 key 静态行复用错乱 -->
+            <!-- 底部占位：保留极小高度，让最后一条消息与底部之间留出呼吸空间（滚底走 z-paging-x scrollToBottom，锚点仅作占位） -->
             <list-item :type="8" id="last-msg" :key="8">
               <view style="height: 12px"></view>
             </list-item>
-          </list-view>
+          </z-paging-x>
+          </view>
 
           <!-- 滚动到底部按钮 -->
           <view
@@ -575,6 +584,8 @@
   import ToolDetailsModal from "./components/tool-details-modal/tool-details-modal.uvue";
   // 显式导入 uni-ai-x-msg 组件（H5 上 easycom 扫描不到 uni_modules/uni-ai-x，需手动注册）
   import UniAiXMsg from "@/subpackages/components/ai-msg/ai-msg.uvue";
+  // 显式导入 z-paging-x（聊天列表滚动容器，H5 上避免依赖 easycom 扫描）
+  import ZPagingX from "@/uni_modules/z-paging-x/components/z-paging-x/z-paging-x.uvue";
   import VoiceConversationPanel from "@/subpackages/components/voice-conversation-panel/voice-conversation-panel.uvue";
   import AcpPermissionCard from "@/components/agent-intervention/acp-permission-card/acp-permission-card.uvue";
   import McpAskQuestionCard from "@/components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue";
@@ -793,7 +804,10 @@
   data.isTempChat.value = props.isTempChat;
   const service = new AgentDetailService(data);
   const componentManager = new ComponentManager(data);
-  const scrollManager = new ScrollManager(data);
+  // z-paging-x 模板引用：滚动指令由 ScrollManager 通过闭包获取（Android 禁止跨组件直接类型化）。
+  // 闭包返回用 as any 去空：UTS any 优化下 ref<any|null>.value(Any?) 直传会被判类型不匹配（error1）
+  const pagingXRef = ref<any | null>(null);
+  const scrollManager = new ScrollManager(data, () => pagingXRef.value as any);
 
   /** 非空字符串兜底 */
   const coalesceNonEmptyString = (
@@ -816,17 +830,6 @@
     }
     return data.autoToLastMsg.value == true;
   };
-
-  /**
-   * 传给 list-view 的 scroll-into-view 目标。
-   * list-view 原生实现不允许空字符串："" 会走 getElementById("") → null 查找，
-   * 触发「get(...) must not be null」崩溃（scroll-view 容忍 ""，list-view 不）。
-   * ScrollManager 用 "" 作重置中间态，这里统一过滤，null 表示不滚动。
-   */
-  const scrollIntoViewTarget = computed((): string | null => {
-    const v = data.scrollIntoView.value;
-    return v != null && v.length > 0 ? v : null;
-  });
 
   // ==================== 暴露方法给模板 ====================
 
@@ -854,7 +857,6 @@
     variables,
     userFillVariables,
     processingList,
-    scrollIntoView,
     scrollInBottom,
     scrollWithAnimation,
     scrollTouch,
@@ -1924,14 +1926,13 @@
     // #endif
     scrollManager.onScroll(e);
   };
-  const scrollToMessage = (messageId: string | number) =>
-    scrollManager.scrollToMessage(messageId);
-
   // 加载更多历史消息
   const handleLoadMoreMessages = () => service.handleLoadMoreMessages();
 
   /**
-   * 处理上滑到顶部事件，加载更多历史消息
+   * 处理上滑到顶部事件，加载更多历史消息。
+   * z-paging-x 无 scroll-into-view：加载前记录滚动基座，加载后由 ScrollManager
+   * 按前插内容高度差补偿恢复视角（原生 list-view 会回收离屏 cell，无法逐个测量元素矩形）。
    */
   const handleScrollToUpper = async () => {
     const canLoadMore = hasMoreMessages.value == true;
@@ -1947,24 +1948,17 @@
       return;
     }
 
-    // 记录当前第一条可见消息的 ID 和 游标，用于加载完成后保持滚动位置
-    const firstMessage = messageList.value[0];
-    let firstVisibleMessageId = "";
-    if (firstMessage != null) {
-      firstVisibleMessageId = `${firstMessage.id}_${firstMessage.index}`;
-    }
-
     // 临时禁用自动滚动，避免加载更多时触发自动滚动到底部
     const previousAutoToLastMsg = data.autoToLastMsg.value;
     data.autoToLastMsg.value = false;
 
+    // 记录加载前滚动基座（scrollTop / scrollHeight），必须在向头部前插旧消息之前调用
+    scrollManager.captureHistoryPrependBase();
     await handleLoadMoreMessages();
 
-    // 加载完成后，滚动到之前的第一条消息位置，保持用户视角不变
-    if (firstVisibleMessageId.length > 0) {
-      await nextTick();
-      scrollToMessage(firstVisibleMessageId);
-    }
+    // 加载完成后，按内容高度差恢复滚动位置，保持用户视角不变
+    await nextTick();
+    scrollManager.restoreScrollAfterHistoryPrepend();
 
     // 恢复自动滚动状态
     data.autoToLastMsg.value = previousAutoToLastMsg;
@@ -2078,31 +2072,17 @@
         sandboxId = otherSandboxId;
       }
 
-      const mergedFiles: UTSJSONObject[] = [];
-      for (let f = 0; f < otherFiles.length; f++) {
-        mergedFiles.push(otherFiles[f] as UTSJSONObject);
-      }
-      for (let g = 0; g < otherAttachmentsFiles.length; g++) {
-        mergedFiles.push(otherAttachmentsFiles[g]);
-      }
-      for (let h = 0; h < dataFiles.length; h++) {
-        mergedFiles.push(dataFiles[h] as UTSJSONObject);
-      }
+      const mergedFiles: UTSJSONObject[] = [
+        ...(otherFiles as UTSJSONObject[]),
+        ...otherAttachmentsFiles,
+        ...(dataFiles as UTSJSONObject[]),
+      ];
 
-      const mergedSelected: AgentSelectedComponentInfo[] = [];
-      for (let sc = 0; sc < _selectedComponents.length; sc++) {
-        mergedSelected.push(_selectedComponents[sc]);
-      }
-      for (let dc = 0; dc < dataSelected.length; dc++) {
-        mergedSelected.push(dataSelected[dc]);
-      }
-      const mergedSkillIds: number[] = [];
-      for (let sk = 0; sk < otherSkillIds.length; sk++) {
-        mergedSkillIds.push(otherSkillIds[sk]);
-      }
-      for (let dk = 0; dk < dataSkillIds.length; dk++) {
-        mergedSkillIds.push(dataSkillIds[dk]);
-      }
+      const mergedSelected: AgentSelectedComponentInfo[] = [
+        ..._selectedComponents,
+        ...dataSelected,
+      ];
+      const mergedSkillIds: number[] = [...otherSkillIds, ...dataSkillIds];
 
       const paramsObj: UTSJSONObject = {};
       // 复制 _data 的原始字段

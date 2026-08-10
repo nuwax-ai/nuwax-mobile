@@ -1,14 +1,20 @@
-import { nextTick } from "vue";
+import { nextTick, type ComponentPublicInstance } from "vue";
 import AgentDetailData from "./AgentDetailData.uts";
 
 /**
  * 滚动管理层：专门处理滚动相关的逻辑
  * 兼容微信小程序和 H5/App
+ * 滚动执行统一走 z-paging-x 的 scrollToY/scrollToBottom（其无 scroll-into-view）。
  */
 export default class ScrollManager {
   private data: AgentDetailData;
+  /** z-paging-x 实例获取器（视图层构造时注入模板 ref；UTS any 优化下避免 any|null，用 any 判空） */
+  private getPagingX: () => any;
   // 记录上次滚动位置，用于判断滚动方向
   private lastScrollTop: number = 0;
+  /** 加载更多历史前记录的滚动基座（scrollTop / scrollHeight），加载完成后按高度差补偿恢复视角 */
+  private prependBaseScrollTop: number = 0;
+  private prependBaseScrollHeight: number = 0;
   /** 历史首屏布局稳定截止时间（ms），期内允许因异步组件撑高而补滚 */
   private historySettleUntil: number = 0;
   /** 历史首屏分批滚底定时器 */
@@ -40,13 +46,42 @@ export default class ScrollManager {
   private cachedOffsetHeightAtMs: number = 0;
   private readonly OFFSET_HEIGHT_CACHE_MS: number = 500;
 
-  constructor(data: AgentDetailData) {
+  constructor(data: AgentDetailData, getPagingX: () => any) {
     this.data = data;
+    this.getPagingX = getPagingX;
+  }
+
+  /** 调用 z-paging-x scrollToBottom（Android：$callMethod 调 defineExpose 方法） */
+  private invokeScrollToBottom(animate: boolean): void {
+    const paging = this.getPagingX();
+    if (paging == null) {
+      return;
+    }
+    try {
+      const proxy = paging as ComponentPublicInstance;
+      proxy.$callMethod("scrollToBottom", animate);
+    } catch (_e) {
+      // z-paging-x 未挂载 / 已卸载时忽略
+    }
+  }
+
+  /** 调用 z-paging-x scrollToY（滚动到内容中指定 Y） */
+  private invokeScrollToY(y: number, animate: boolean): void {
+    const paging = this.getPagingX();
+    if (paging == null) {
+      return;
+    }
+    try {
+      const proxy = paging as ComponentPublicInstance;
+      proxy.$callMethod("scrollToY", y, animate);
+    } catch (_e) {
+      // ignore
+    }
   }
 
   /**
    * 滚动到最后一条消息
-   * 使用 scroll-into-view 方式，兼容所有平台
+   * 走 z-paging-x scrollToBottom，兼容所有平台
    * @param userClick 是否用户点击触发；true 时启用滚动动画并立刻执行，
    *   并重新开启短时跟底稳定期（上滑打断后点回底，晚撑高 / 流式输出才能继续跟）
    */
@@ -76,13 +111,12 @@ export default class ScrollManager {
     }, this.SCROLL_THROTTLE_MS) as number;
   }
 
-  /** 实际执行 scroll-into-view 滚底（官方推荐） */
+  /** 实际执行滚底（z-paging-x 无 scroll-into-view，走 scrollToBottom） */
   private doScrollToLastMsg(userClick: boolean): void {
     this.data.autoToLastMsg.value = true;
-    this.data.scrollIntoView.value = "";
     this.data.scrollWithAnimation.value = userClick;
     nextTick(() => {
-      this.data.scrollIntoView.value = "last-msg";
+      this.invokeScrollToBottom(userClick);
       this.data.scrollInBottom.value = true;
     });
     // 自动跟底：布局晚到（工具调用卡片等）时短时补滚，避免「先停一会再跳」
@@ -127,18 +161,9 @@ export default class ScrollManager {
         if (this.data.scrollTouch.value == true) {
           return;
         }
-        // 绕过节流，直接 into-view，吃到晚到的高度（补滚沿用流式动画设置，平滑补位）
-        this.data.scrollIntoView.value = "";
-        nextTick(() => {
-          if (this.data.autoToLastMsg.value != true) {
-            return;
-          }
-          if (this.data.scrollTouch.value == true) {
-            return;
-          }
-          this.data.scrollIntoView.value = "last-msg";
-          this.data.scrollInBottom.value = true;
-        });
+        // 绕过节流，直接滚底，吃到晚到的高度（补滚沿用流式动画设置，平滑补位）
+        this.invokeScrollToBottom(false);
+        this.data.scrollInBottom.value = true;
       }, delay) as number;
       this.streamFollowTimers.push(timerId);
     }
@@ -210,7 +235,7 @@ export default class ScrollManager {
   /**
    * 发送消息后滚底（含语音转写发送）。
    * 须在用户/助手气泡已写入 messageList 之后调用：
-   * 发送前那次 scroll-into-view 打在旧锚点上；流式期 list watch 又会跳过滚底，
+   * 发送前那次滚底打在旧布局上；流式期 list watch 又会跳过滚底，
    * iOS 上语音发送后常见停在旧位置。短窗口分批补滚覆盖布局晚到。
    */
   scrollToLastMsgAfterSend(): void {
@@ -284,7 +309,7 @@ export default class ScrollManager {
       this.clearHistorySettle();
       return;
     }
-    // 历史首屏：绕过 throttle，每次补滚都真正执行 scroll-into-view
+    // 历史首屏：绕过 throttle，每次补滚都真正滚到底
     this.clearScrollThrottle();
     this.doScrollToLastMsg(false);
   }
@@ -426,15 +451,52 @@ export default class ScrollManager {
   }
 
   /**
-   * 滚动到指定消息位置
-   * 用于加载更多历史消息后保持滚动位置
+   * 加载更多历史前记录滚动基座（scrollTop / scrollHeight）。
+   * 须在向 messageList 头部前插旧消息之前调用，恢复视角靠加载后的高度差补偿。
    */
-  scrollToMessage(messageId: string | number): void {
-    this.data.scrollWithAnimation.value = false;
-    this.data.scrollIntoView.value = "";
-    // 延迟设置，确保微信小程序 DOM 渲染完成后再触发定位
-    setTimeout(() => {
-      this.data.scrollIntoView.value = `msg-wrapper-${messageId}`;
-    }, 150);
+  captureHistoryPrependBase(): void {
+    const list = uni.getElementById("msg-list");
+    if (list == null) {
+      return;
+    }
+    this.prependBaseScrollTop = list.scrollTop;
+    this.prependBaseScrollHeight = list.scrollHeight;
+  }
+
+  /**
+   * 加载更多历史后恢复滚动视角。
+   * z-paging-x 无 scroll-into-view，且前插的消息离屏后会被原生 list-view 回收，
+   * 无法逐个测量元素矩形。改为：加载后内容高度增量 + 加载前 scrollTop 即为目标 Y。
+   * 平台若在插入时自动补偿滚动（iOS 系），该公式结果与当前视角一致，不会二次跳转。
+   */
+  restoreScrollAfterHistoryPrepend(): void {
+    this.doRestoreScrollAfterHistoryPrepend(0);
+  }
+
+  /** 高度差补偿恢复视角；布局未就绪时最多重试 2 次 */
+  private doRestoreScrollAfterHistoryPrepend(attempt: number): void {
+    if (this.prependBaseScrollHeight <= 0) {
+      return;
+    }
+    const list = uni.getElementById("msg-list");
+    if (list == null) {
+      return;
+    }
+    const newScrollHeight = list.scrollHeight;
+    const added = newScrollHeight - this.prependBaseScrollHeight;
+    if (added <= 0) {
+      // 原生布局可能晚于 setState 完成：短重试，吃到更新后的 scrollHeight
+      if (attempt < 2) {
+        setTimeout(() => {
+          this.doRestoreScrollAfterHistoryPrepend(attempt + 1);
+        }, 160);
+      }
+      return;
+    }
+    let target = this.prependBaseScrollTop + added;
+    if (target < 0) {
+      target = 0;
+    }
+    this.invokeScrollToY(target, false);
   }
 }

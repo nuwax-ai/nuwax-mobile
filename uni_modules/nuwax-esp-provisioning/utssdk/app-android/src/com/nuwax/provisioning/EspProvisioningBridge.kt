@@ -1,5 +1,6 @@
 package com.nuwax.provisioning
 
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.le.ScanResult
 import android.content.Context
@@ -68,19 +69,41 @@ class EspProvisioningBridge(context: Context) {
   /** 是否应持续扫描：scanCompleted 时据此决定是否重启扫描窗口，stopScan 置 false。 */
   @Volatile
   private var scanning = false
+  /**
+   * 每次 start/stop 都递增代次，防止上一轮 BleScanListener 的迟到回调复活旧扫描。
+   * Android 对短时间内反复 startScan 有频率限制；ESP SDK 单窗口约 6 秒，
+   * 窗口间增加冷却后，每 30 秒最多启动 4 次，避免 SCAN_FAILED_SCANNING_TOO_FREQUENTLY(6)。
+   */
+  @Volatile
+  private var scanGeneration = 0L
+  private var scanRestart: Runnable? = null
+  private val scanRestartCooldownMs = 2_000L
 
   fun startScan(prefix: String, requiredServiceUuid: String, callback: BridgeScanCallback) {
     registerEvents()
+    stopScan()
     peripherals.clear()
+    val generation = scanGeneration + 1
+    scanGeneration = generation
     scanning = true
     val listener = object : BleScanListener {
       override fun scanStartFailed() {
+        if (!isCurrentScan(generation)) return
+        scanning = false
+        val bluetoothEnabled = runCatching {
+          BluetoothAdapter.getDefaultAdapter()?.isEnabled == true
+        }.getOrDefault(false)
         dispatchToMain {
-          callback.onFailure("BLUETOOTH_OFF", "Bluetooth is disabled")
+          if (bluetoothEnabled) {
+            callback.onFailure("SCAN_FAILED", "Bluetooth scanner could not start; retry after cooldown")
+          } else {
+            callback.onFailure("BLUETOOTH_OFF", "Bluetooth is disabled")
+          }
         }
       }
 
       override fun onPeripheralFound(device: BluetoothDevice, scanResult: ScanResult) {
+        if (!isCurrentScan(generation)) return
         val record = scanResult.scanRecord ?: return
         val name = record.deviceName ?: runCatching { device.name }.getOrNull().orEmpty()
         if (!name.startsWith(prefix)) return
@@ -91,19 +114,29 @@ class EspProvisioningBridge(context: Context) {
         val address = runCatching { device.address }.getOrNull() ?: return
         peripherals[address] = CachedPeripheral(device, matchedUuid)
         dispatchToMain {
-          callback.onDevice(address, name, scanResult.rssi, matchedUuid)
+          if (isCurrentScan(generation)) {
+            callback.onDevice(address, name, scanResult.rssi, matchedUuid)
+          }
         }
       }
 
       override fun scanCompleted() {
         // ESP 库默认扫描窗口较短（实测 ~6s），单次易漏掉广播间隔较长的设备。
-        // 窗口结束但仍在 scanning（未被 stopScan）时自动重启，直到找到设备或上层超时调用 stopScan。
-        if (scanning) {
-          manager.searchBleEspDevices(prefix, this)
+        // 迟到的旧 listener 不得复活；窗口间冷却，避免 Android status=6 扫描限流。
+        if (!isCurrentScan(generation)) return
+        val listener = this
+        val restart = Runnable {
+          if (!isCurrentScan(generation)) return@Runnable
+          manager.searchBleEspDevices(prefix, listener)
         }
+        scanRestart?.let { mainHandler.removeCallbacks(it) }
+        scanRestart = restart
+        mainHandler.postDelayed(restart, scanRestartCooldownMs)
       }
 
       override fun onFailure(error: Exception) {
+        if (!isCurrentScan(generation)) return
+        scanning = false
         val message = safeMessage(error)
         dispatchToMain {
           callback.onFailure("SCAN_FAILED", message)
@@ -115,8 +148,14 @@ class EspProvisioningBridge(context: Context) {
 
   fun stopScan() {
     scanning = false
+    scanGeneration += 1
+    scanRestart?.let { mainHandler.removeCallbacks(it) }
+    scanRestart = null
     manager.stopBleScan()
   }
+
+  private fun isCurrentScan(generation: Long): Boolean =
+    scanning && generation == scanGeneration
 
   fun connect(
     deviceId: String,

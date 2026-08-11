@@ -1,0 +1,185 @@
+/**
+ * nuwax-virtual-list 动态高度虚拟列表引擎
+ *
+ * 核心思想：
+ * - sizes[i]：第 i 项的「有效高度」（已实测取实测值，未实测取预估高度 itemHeight）
+ * - offsets[i]：前缀和，第 i 项顶部相对列表内容顶部的距离（offsets[i] = sum(sizes[0..i-1])）
+ * - totalHeight：内容总高，作为「撑杆」撑开滚动条，配合绝对定位的可视窗口实现虚拟滚动
+ * - 实测高度按 key 缓存（measuredMap），当前插/整体替换数据导致下标整体平移时，
+ *   用 key 重灌高度，避免已测量项回到预估高度造成滚动跳动
+ *
+ * 只读纯数据类（不依赖 Vue 响应式），由组件负责把结果同步到 ref 驱动渲染。
+ * 全端通用：H5 / 微信小程序 / App(Android/iOS) 用同一份 UTS 代码。
+ */
+
+/** 可视窗口范围（start 闭 / end 开） */
+export class Range {
+  start: number
+  end: number
+  constructor(start: number, end: number) {
+    this.start = start
+    this.end = end
+  }
+}
+
+export class VirtualListEngine {
+  /** 每项有效高度（px） */
+  sizes: number[] = []
+  /** 前缀和：offsets[i] = 第 i 项顶部距内容顶部（px） */
+  offsets: number[] = []
+  /** 内容总高（px），即撑杆高度 */
+  totalHeight: number = 0
+  /** 未测量项使用的预估高度（px） */
+  estimatedHeight: number = 100
+  /** 可视区外缓冲条数 */
+  bufferCount: number = 8
+
+  /** 首个数据的 key：识别「前插历史 / 整体替换」，此时下标与缓存高度失配 */
+  private firstKey: string = ""
+  /** 已实测高度，按 key 缓存（Map<string, number>） */
+  private measured: Map<string, number> = new Map()
+
+  /** 全量初始化（数据整体替换 / reload 时调用，会清空测量缓存） */
+  init(count: number, estimated: number, buffer: number): void {
+    this.estimatedHeight = estimated > 0 ? estimated : 100
+    this.bufferCount = buffer >= 0 ? buffer : 8
+    this.measured = new Map()
+    this.syncData(count, null, (i: number): string => `${i}`)
+  }
+
+  /** 清空全部状态 */
+  reset(): void {
+    this.sizes = []
+    this.offsets = []
+    this.totalHeight = 0
+    this.firstKey = ""
+    this.measured = new Map()
+  }
+
+  /**
+   * 数据变化（长度增减 / 前插 / 整体替换）时同步。
+   * - 首 key 未变（追加 / 尾部更新）：保留既有下标对应的高度，新下标用预估
+   * - 首 key 变化（前插历史 / 整体替换）：按 key 从测量缓存重灌，未测的用预估
+   */
+  syncData(count: number, firstKey: string | null, keyOf: (index: number) => string): void {
+    if (count <= 0) {
+      this.sizes = []
+      this.offsets = []
+      this.totalHeight = 0
+      this.firstKey = ""
+      return
+    }
+    const prevFirst = this.firstKey
+    const shifted = prevFirst.length > 0 && firstKey != null && firstKey.length > 0 && prevFirst != firstKey
+    const newSizes: number[] = []
+    const oldLen = this.sizes.length
+    for (let i = 0; i < count; i++) {
+      if (shifted) {
+        const k = keyOf(i)
+        const m = this.measured.get(k)
+        newSizes.push(m != null && m > 0 ? m : this.estimatedHeight)
+      } else if (i < oldLen && this.sizes[i] > 0) {
+        newSizes.push(this.sizes[i])
+      } else {
+        newSizes.push(this.estimatedHeight)
+      }
+    }
+    this.sizes = newSizes
+    this.firstKey = firstKey != null ? firstKey : ""
+    this.rebuildOffsets()
+  }
+
+  /** 更新一项的实测高度。返回 true 表示高度确实变化并已重排。 */
+  setMeasuredHeight(index: number, key: string, height: number): boolean {
+    if (height <= 0 || index < 0 || index >= this.sizes.length) {
+      return false
+    }
+    this.measured.set(key, height)
+    const cur = this.sizes[index]
+    if (Math.abs(cur - height) < 0.5) {
+      return false
+    }
+    this.sizes[index] = height
+    this.rebuildOffsets()
+    return true
+  }
+
+  /** 根据滚动位置 + 视口高度计算需要渲染的窗口 [start, end) */
+  getRange(scrollTop: number, viewport: number): Range {
+    const count = this.sizes.length
+    if (count == 0) {
+      return new Range(0, 0)
+    }
+    const buf = this.bufferCount * this.estimatedHeight
+    const topTarget = scrollTop - buf
+    const bottomTarget = scrollTop + viewport + buf
+    let start = this.findIndexForOffset(topTarget)
+    let end = this.findIndexForOffset(bottomTarget) + 1
+    if (start < 0) start = 0
+    if (start >= count) start = Math.max(0, count - 1)
+    if (end < 0) end = 0
+    if (end > count) end = count
+    if (end < start) end = start
+    return new Range(start, end)
+  }
+
+  /** 第 index 项顶部距内容顶部的距离（px） */
+  getOffset(index: number): number {
+    if (index <= 0) return 0
+    if (index >= this.offsets.length) return this.totalHeight
+    return this.offsets[index]
+  }
+
+  /** 第 index 项底部距内容顶部的距离（px） */
+  getBottom(index: number): number {
+    if (index < 0) return 0
+    if (index >= this.offsets.length) return this.totalHeight
+    return this.offsets[index] + this.sizes[index]
+  }
+
+  /** 滚动到第 index 项所需的 scrollTop（px） */
+  getScrollOffsetForIndex(index: number): number {
+    return this.getOffset(index)
+  }
+
+  /** 读某项已实测高度（未测返回 0） */
+  getMeasured(key: string): number {
+    const v = this.measured.get(key)
+    return v != null ? v : 0
+  }
+
+  /** 重建前缀和与总高（sizes 变化后调用） */
+  private rebuildOffsets(): void {
+    const n = this.sizes.length
+    const offs: number[] = []
+    let acc = 0
+    for (let i = 0; i < n; i++) {
+      offs.push(acc)
+      acc += this.sizes[i]
+    }
+    this.offsets = offs
+    this.totalHeight = acc
+  }
+
+  /**
+   * 二分查找：第一个满足 offsets[i] <= offset 的最大 i。
+   * offset 在首项之前 → 0；offset 超过总高 → count（越界哨兵）。
+   */
+  private findIndexForOffset(offset: number): number {
+    const count = this.offsets.length
+    if (count == 0) return 0
+    if (offset <= this.offsets[0]) return 0
+    if (offset >= this.totalHeight) return count
+    let lo = 0
+    let hi = count - 1
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1
+      if (this.offsets[mid] <= offset) {
+        lo = mid
+      } else {
+        hi = mid - 1
+      }
+    }
+    return lo
+  }
+}

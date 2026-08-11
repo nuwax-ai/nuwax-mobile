@@ -1,0 +1,315 @@
+<template>
+	<view
+		class="nk-root"
+		:class="isInline ? 'nk-root-inline' : 'nk-root-block'"
+		:style="rootStyle"
+	>
+		<!-- #ifdef WEB -->
+		<view v-if="html.length > 0" class="nk-html" v-html="html"></view>
+		<!-- #endif -->
+		<!-- #ifdef MP-WEIXIN -->
+		<rich-text v-if="html.length > 0" class="nk-rich" :nodes="html"></rich-text>
+		<!-- #endif -->
+		<!-- #ifdef APP -->
+		<web-view
+			v-if="webviewSrc.length > 0"
+			:id="webviewId"
+			class="nk-webview"
+			:src="webviewSrc"
+			:style="webviewStyle"
+			@contentheightchange="onContentHeightChange"
+			@message="onWebviewMessage"
+		></web-view>
+		<!-- #endif -->
+	</view>
+</template>
+
+<script lang="uts" setup>
+	import { computed, onMounted, ref, watch } from 'vue'
+	// 平台实现：H5/小程序返回 KaTeX HTML；App 端为占位（渲染由下方 web-view 完成）
+	import { renderLatex } from '@/uni_modules/nuwax-katex'
+	import type { KatexRenderOptions, KatexRenderRes } from '@/uni_modules/nuwax-katex/utssdk/interface.uts'
+
+	// 每实例唯一 web-view id（uni.createWebviewContext 按 id 取上下文）
+	let instanceSeq = 0
+	const webviewId = 'nk-katex-' + (++instanceSeq)
+
+	const props = defineProps<{
+		/** 原始 LaTeX（不含 $ 定界符），如 '\frac{a}{b}' */
+		tex: string
+		/** 块级（displayMode）或行内；缺省行内 */
+		displayMode?: boolean
+		/** 字号（px），作用于容器/公式根；缺省行内 16、块级 13 */
+		fontSize?: number
+		/** 公式颜色；缺省 #404040 */
+		color?: string
+	}>()
+
+	const emit = defineEmits<{
+		(e: 'load', detail: UTSJSONObject): void
+		(e: 'error', detail: UTSJSONObject): void
+	}>()
+
+	const isInline = computed((): boolean => {
+		return props.displayMode != true
+	})
+
+	/** 实际渲染字号：行内 16px、块级 13px（与 katex-el H5 行为对齐） */
+	const resolveFontSize = computed((): number => {
+		if (props.fontSize != null && props.fontSize > 0) {
+			return props.fontSize
+		}
+		return props.displayMode == true ? 13 : 16
+	})
+
+	/** 根样式：字号/颜色作用于容器（H5/MP 的 KaTeX 根以 1.21em 相对缩放；App web-view 内由页面应用） */
+	const rootStyle = computed((): string => {
+		let s = ''
+		if (props.color != null && props.color.length > 0) {
+			s += 'color:' + props.color + ';'
+		}
+		return s
+	})
+
+	/** H5/MP：KaTeX HTML */
+	const html = ref('')
+
+	// ---------- App：web-view 承载（KaTeX 实时渲染，非截图） ----------
+	const webviewSrc = ref('')
+	let webReady = false
+	let webviewContext: WebviewContext | null = null
+	/** web-view 未就绪期间暂存的最新渲染载荷（就绪后一次冲刷） */
+	let pendingPayloadJson = ''
+	/** 公式内容尺寸（由页面 postMessage 上报）。必须为响应式 ref——webviewStyle computed 依赖它，
+	 *  普通 let 更新不会触发 computed 重算，web-view 宽度会一直停在 fallback（公式被挤压）。 */
+	const contentWidth = ref<number>(0)
+	const contentHeight = ref<number>(0)
+
+	const webviewStyle = computed((): string => {
+		let s = ''
+		if (isInline.value == true) {
+			// 行内：宽高=内容尺寸。**初始宽度必须给足**——web-view 宽度决定 web 内容布局宽度，
+			// 初始 60px 会让公式在 60px 里布局（被挤压）→ 上报的也是挤压宽 → 永不收敛。
+			// 初始给足后公式完整布局 → 上报真实宽 → web-view 收缩到公式宽（保持行内宽度=内容）。
+			const w = contentWidth.value > 0 ? contentWidth.value : 320
+			const h = contentHeight.value > 0 ? contentHeight.value : 48
+			s = 'width:' + w + 'px;height:' + h + 'px;margin:0;'
+		} else {
+			// 块级：宽度=容器宽（100%），公式在 web-view 内居中（index.html nk-block flex center）。
+			// 不依赖「上报内容宽后收缩」——Android 上收缩/布局跟随不可靠，固定容器宽保证完整；
+			// 高度仍用上报的公式高度（不够时占位）。
+			const h = contentHeight.value > 0 ? contentHeight.value : 96
+			s = 'width:100%;height:' + h + 'px;margin:0;'
+		}
+		return s
+	})
+
+	function buildWebviewSrc(): string {
+		let q = '/uni_modules/nuwax-katex/static/index.html?'
+		q += 'tex=' + encodeURIComponent(props.tex ?? '')
+		q += '&display=' + (props.displayMode == true ? '1' : '0')
+		q += '&size=' + resolveFontSize.value
+		q += '&color=' + encodeURIComponent(props.color ?? '')
+		return q
+	}
+
+	function ensureContext(): WebviewContext | null {
+		if (webviewContext == null) {
+			// #ifdef APP
+			try {
+				webviewContext = uni.createWebviewContext(webviewId)
+			} catch (e) {
+				webviewContext = null
+			}
+			// #endif
+		}
+		return webviewContext
+	}
+
+	/** 构建渲染载荷（字符串 -> evalJS 注入，避免 UTS 对象与 JS 对象互转问题） */
+	function buildPayloadJson(): string {
+		const payload = new UTSJSONObject()
+		payload['tex'] = props.tex ?? ''
+		payload['displayMode'] = props.displayMode == true
+		payload['fontSize'] = resolveFontSize.value
+		payload['color'] = props.color ?? ''
+		return JSON.stringify(payload)
+	}
+
+	function flushPending(): void {
+		if (pendingPayloadJson.length == 0) {
+			return
+		}
+		const ctx = ensureContext()
+		if (ctx == null) {
+			return
+		}
+		// #ifdef APP
+		ctx.evalJS('window.nkRender(' + pendingPayloadJson + ')')
+		// #endif
+		pendingPayloadJson = ''
+	}
+
+	/** tex/displayMode/fontSize/color 变化 -> 实时重渲染 */
+	function scheduleRender(): void {
+		// #ifndef APP
+		const res = renderLatex(props.tex ?? '', {
+			displayMode: props.displayMode == true,
+			errorColor: '#cc0000',
+		} as KatexRenderOptions)
+		if (res.errMsg.length > 0) {
+			const err = new UTSJSONObject()
+			err['errMsg'] = res.errMsg
+			emit('error', err)
+		} else {
+			html.value = res.html
+			const ok = new UTSJSONObject()
+			ok['width'] = 0
+			ok['height'] = 0
+			emit('load', ok)
+		}
+		// #endif
+		// #ifdef APP
+		pendingPayloadJson = buildPayloadJson()
+		if (webReady == true) {
+			flushPending()
+		}
+		// #endif
+	}
+
+	/** App：web-view 内容高度变化（原生事件，兜底尺寸上报） */
+	function onContentHeightChange(e: UniWebViewContentHeightChangeEvent): void {
+		webReady = true
+		ensureContext()
+		const h = e.detail.height as number
+		if (h > 0) {
+			contentHeight.value = h
+		}
+		flushPending()
+	}
+
+	/** App：页面 postMessage（尺寸上报；也作为 web-view 已就绪的信号） */
+	function onWebviewMessage(e: UniWebViewMessageEvent): void {
+		webReady = true
+		ensureContext()
+		const data = e.detail.data as Array<UTSJSONObject>
+		if (data.length > 0) {
+			const msg = data[0] as UTSJSONObject
+			const type = msg['type'] as string
+			if (type == 'debug') {
+				// 诊断：分数公式渲染排查（katex CSS/字体加载状态）
+				console.log("[nuwax-katex] debug:", JSON.stringify(msg))
+				return
+			}
+			if (type == 'size') {
+				const w = msg['width'] as number
+				const h = msg['height'] as number
+				if (w != null && w > 0) {
+					contentWidth.value = w
+				}
+				if (h != null && h > 0) {
+					contentHeight.value = h
+				}
+				const ok = new UTSJSONObject()
+				ok['width'] = contentWidth.value
+				ok['height'] = contentHeight.value
+				emit('load', ok)
+			}
+		}
+		flushPending()
+	}
+
+	// watch 的 getter 源在 App(Kotlin) 编译对基本类型返回值有类型问题，
+	// 统一用 computed 包成 Ref 再 watch（与 ai-msg.uvue 的 props computed 写法一致）
+	const watchedTex = computed((): string => props.tex ?? '')
+	const watchedDisplayMode = computed((): boolean => props.displayMode == true)
+	const watchedFontSize = computed((): number => props.fontSize ?? 0)
+	const watchedColor = computed((): string => props.color ?? '')
+
+	watch(watchedTex, () => {
+		scheduleRender()
+	})
+	watch(watchedDisplayMode, () => {
+		scheduleRender()
+	})
+	watch(watchedFontSize, () => {
+		scheduleRender()
+	})
+	watch(watchedColor, () => {
+		scheduleRender()
+	})
+
+	onMounted(() => {
+		// #ifndef APP
+		scheduleRender()
+		// #endif
+		// #ifdef WEB
+		// scss @import 的 KaTeX 字体资源 vite 未注入 H5 页面（@font-face 丢失 → 字体 404），
+		// 动态加载完整 katex.min.css（含 @font-face，相对 url 指向 static/fonts）
+		loadKatexCss()
+		// #endif
+		// #ifdef APP
+		webviewSrc.value = buildWebviewSrc()
+		ensureContext()
+		// #endif
+	})
+
+	// #ifdef WEB
+	function loadKatexCss(): void {
+		try {
+			const link = document.createElement('link')
+			link.rel = 'stylesheet'
+			link.href = '/m/uni_modules/nuwax-katex/static/katex.min.css'
+			document.head.appendChild(link)
+		} catch (_e) {
+			// ignore
+		}
+	}
+	// #endif
+</script>
+
+<style lang="scss">
+	// KaTeX 样式仅 H5 使用（v-html 注入的真实 DOM 需要）；
+	// App 走 web-view 内 katex.min.css，小程序走 JS 内联，均不需要组件级 KaTeX CSS。
+	// #ifdef WEB
+	@import './katex.min.scss';
+	// #endif
+
+	// 基础布局
+	.nk-root {
+		width: 100%;
+	}
+
+	// 块级：flex 居中；内容超宽时（margin auto 的 web-view）左锚定供外层横滚
+	.nk-root-block {
+		display: flex;
+		flex-direction: row;
+		justify-content: center;
+		align-items: center;
+	}
+
+	// 行内：H5 用 inline-flex 嵌入文本流；App/小程序用 flex（uni-app x 无 inline 布局，由外层 flex 行对齐）
+	// #ifdef WEB
+	.nk-root-inline {
+		width: auto;
+		display: inline-flex;
+		flex-direction: row;
+		align-items: center;
+		vertical-align: middle;
+		flex-shrink: 0;
+	}
+	// #endif
+	// #ifndef WEB
+	.nk-root-inline {
+		width: auto;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		flex-shrink: 0;
+	}
+	// #endif
+
+	.nk-webview {
+		flex-shrink: 0;
+	}
+</style>

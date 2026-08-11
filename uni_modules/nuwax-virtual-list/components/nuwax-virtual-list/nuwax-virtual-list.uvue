@@ -42,8 +42,8 @@
       @refresherabort="onRefresherAbort"
     >
       <slot name="header" />
-      <list-item v-for="(item, index) in data" :key="keyOfItem(index)">
-        <slot name="item" :item="item" :index="index" />
+      <list-item v-for="(part, index) in renderPartsRef" :key="part.key">
+        <slot name="item" :item="data[part.parentIndex]" :index="index" :part-index="part.partIndex" :part-text="part.partText" :is-last-part="part.isLastPart" />
       </list-item>
       <slot name="footer" />
       <list-item v-if="data.length == 0" class="nvwl-empty-cell">
@@ -89,7 +89,7 @@
             :key="vitem.key"
             :id="itemDomId(vitem.index)"
           >
-            <slot name="item" :item="vitem.item" :index="vitem.index" />
+            <slot name="item" :item="vitem.item" :index="vitem.index" :part-index="vitem.partIndex" :part-text="vitem.partText" :is-last-part="vitem.isLastPart" />
           </view>
         </view>
       </view>
@@ -126,8 +126,8 @@
       @refresherabort="onRefresherAbort"
     >
       <slot name="header" />
-      <view v-for="(item, index) in data" :key="keyOfItem(index)">
-        <slot name="item" :item="item" :index="index" />
+      <view v-for="(part, index) in renderPartsRef" :key="part.key">
+        <slot name="item" :item="data[part.parentIndex]" :index="index" :part-index="part.partIndex" :part-text="part.partText" :is-last-part="part.isLastPart" />
       </view>
       <slot name="footer" />
       <view v-if="data.length == 0" class="nvwl-empty">
@@ -156,6 +156,7 @@
     measureItemHeights,
     measureViewportHeight,
   } from "@/uni_modules/nuwax-virtual-list/js_sdk/modules/measure.uts";
+  import { TextSplitter } from "@/uni_modules/nuwax-virtual-list/js_sdk/modules/text-splitter.uts";
 
   // ==================== 平台标记 ====================
   // #ifdef APP
@@ -171,10 +172,48 @@
     key: string = "";
     item: any | null = null;
     index: number = 0;
-    constructor(key: string, item: any | null, index: number) {
+    /** 拆分序号：-1 表示未拆分（整条渲染） */
+    partIndex: number = -1;
+    /** 拆分片段文本（未拆分时为空串） */
+    partText: string = "";
+    /** 是否父消息的最后一段（未拆分恒 true；拆分后仅末段 true） */
+    isLastPart: boolean = true;
+    constructor(
+      key: string,
+      item: any | null,
+      index: number,
+      partIndex: number,
+      partText: string,
+      isLastPart: boolean,
+    ) {
       this.key = key;
       this.item = item;
       this.index = index;
+      this.partIndex = partIndex;
+      this.partText = partText;
+      this.isLastPart = isLastPart;
+    }
+  }
+
+  /** 拆分后的渲染项：指向原始数据 + 片段信息（引擎/窗口基于拆分后数量运行） */
+  class RenderPart {
+    parentIndex: number = 0;
+    partIndex: number = -1;
+    partText: string = "";
+    key: string = "";
+    isLastPart: boolean = true;
+    constructor(
+      parentIndex: number,
+      partIndex: number,
+      partText: string,
+      key: string,
+      isLastPart: boolean,
+    ) {
+      this.parentIndex = parentIndex;
+      this.partIndex = partIndex;
+      this.partText = partText;
+      this.key = key;
+      this.isLastPart = isLastPart;
     }
   }
 
@@ -229,6 +268,21 @@
        * 仅初始化时生效，之后由用户滚动接管。
        */
       initScrollToBottom?: boolean;
+      /**
+       * 长文本拆分：开启后，正文长度超过 split-max-chars 的数据项会被拆分成多条子项渲染。
+       * 代码块（含 mermaid 流程图）/ 表格 / 图片 / 成对自定义标签为原子单位，绝不在内部切断；
+       * 超长模块单独成段。item 插槽新增 part-index / part-text / parent-index 供父组件渲染片段。
+       */
+      enableSplit?: boolean;
+      /** 拆分阈值：单条正文超过该字符数才拆分 */
+      splitMaxChars?: number;
+      /** 拆分的正文字段名（如消息正文是 "text" / "bodyText"）；留空则不拆 */
+      splitTextField?: string;
+      /**
+       * 最后一条不拆分（流式场景）：true 时跳过对最后一条数据的拆分（整条渲染），
+       * 避免流式期每 40ms 重拆片段导致 DOM 频繁增删。切换时自动全量重建拆分结果。
+       */
+      noSplitLast?: boolean;
     }>(),
     {
       data: (): Array<any> => [] as Array<any>,
@@ -255,12 +309,16 @@
       loadMoreNoMore: false,
       loadMoreLoading: false,
       initScrollToBottom: false,
+      enableSplit: false,
+      splitMaxChars: 2000,
+      splitTextField: "",
+      noSplitLast: false,
     },
   );
 
   // ==================== 插槽与事件 ====================
   defineSlots<{
-    item(props: { item: any | null; index: number }): any;
+    item(props: { item: any | null; index: number; partIndex: number; partText: string; isLastPart: boolean }): any;
     empty(props: {}): any;
     header(props: {}): any;
     footer(props: {}): any;
@@ -291,6 +349,8 @@
 
   const engine = new VirtualListEngine();
   engine.init(props.data.length, props.itemHeight, props.bufferCount);
+  /** 长文本拆分器（enableSplit 时使用） */
+  const textSplitter = new TextSplitter();
 
   // ==================== 响应式状态 ====================
   const visibleItems = ref<VirtualItem[]>([] as VirtualItem[]);
@@ -302,6 +362,12 @@
   const viewportHeight = ref<number>(600);
   /** 动画临时覆盖：-1 跟随 props.scrollWithAnimation，0/1 强制 关/开 */
   const animOverride = ref<number>(-1);
+
+  // ==================== 拆分数据层 ====================
+  /** 拆分后的渲染项（引擎/窗口/测量均基于此数量运行；非响应式热路径） */
+  let renderParts: Array<RenderPart> = [];
+  /** 模板 v-for 用的响应式镜像（仅 native/full-render 分支需要） */
+  const renderPartsRef = ref<RenderPart[]>([] as RenderPart[]);
 
   // ==================== 非响应式运行态（热路径，避免触发渲染） ====================
   let lastStart = 0;
@@ -359,20 +425,42 @@
 
   // ==================== 工具方法 ====================
   /** 安全读取任意字段（any 通道，兼容 UTSJSONObject 与业务类实例） */
+  /**
+   * 通用字段读取：1) Map（Android Gson / 网络层）→ 2) UTSJSONObject bracket。
+   * 业务类实例（如 MessageInfo）需由调用方先规范化为 UTSJSONObject 再传入（聊天页用 normalizeMessageRawToJson）。
+   */
   function readField(item: any | null, key: string): any | null {
     if (item == null) return null;
+    // 1) Map
+    try {
+      const m = item as Map<string, any | null>;
+      if (m != null) {
+        if (m.has(key) == true) {
+          return m.get(key);
+        }
+        const fromGet = m.get(key);
+        if (fromGet != null) {
+          return fromGet;
+        }
+      }
+    } catch (_eMap) {
+      // 非 Map
+    }
+    // 2) UTSJSONObject bracket
     try {
       const obj = item as UTSJSONObject;
-      const v = obj[key];
-      if (v != null) return v;
-    } catch (_e) {
-      // 类型不匹配时忽略
+      const fromBracket = obj[key];
+      if (fromBracket != null) {
+        return fromBracket;
+      }
+    } catch (_eObj) {
+      // ignore
     }
     return null;
   }
 
-  /** 稳定 key：优先 keyField，缺省回退下标 */
-  function keyOfItem(index: number): string {
+  /** 稳定 key：优先 keyField，缺省回退下标（读原始 data[index]） */
+  function keyOfParent(index: number): string {
     const kf = props.keyField;
     if (kf.length > 0 && index >= 0 && index < props.data.length) {
       const raw = readField(props.data[index], kf);
@@ -389,6 +477,107 @@
       if (raw != null) return `${raw}`;
     }
     return "";
+  }
+
+  /** 拆分后渲染项的稳定 key（含父 key + 子序号） */
+  function keyOfPart(index: number): string {
+    if (index >= 0 && index < renderParts.length) {
+      return renderParts[index].key;
+    }
+    return `${index}`;
+  }
+
+  /** 拆分结果缓存（按父 key + 文本长度指纹，流式期只重拆变化的最后一条） */
+  let splitFragCache: Map<string, Array<string>> = new Map();
+  let splitLenCache: Map<string, number> = new Map();
+  /** 每条消息的拆分片段数（增量 rebuild 时按前缀复用） */
+  let partCounts: Array<number> = [];
+  /** 上一轮 data 元素引用（引用相同 = 内容未变 = 拆分结果可复用） */
+  let lastDataRefs: Array<any> = [];
+
+  /** 从 data 重建拆分后的渲染项（enableSplit 且正文超长时拆分；否则每项一条） */
+  function rebuildRenderParts(): void {
+    const oldParts = renderParts;
+    const oldCounts = partCounts;
+    const newParts: Array<RenderPart> = [];
+    const newCounts: Array<number> = [];
+    const enable = props.enableSplit && props.splitTextField.length > 0;
+    const maxChars = props.splitMaxChars > 0 ? props.splitMaxChars : 2000;
+    // 前缀复用：data 引用与上轮一致的消息，其 RenderPart 直接沿用（不重建对象）
+    const common = lastDataRefs.length < props.data.length ? lastDataRefs.length : props.data.length;
+    let prefix = 0;
+    while (prefix < common && props.data[prefix] === lastDataRefs[prefix]) {
+      prefix++;
+    }
+    if (prefix > 0) {
+      let oldStart = 0;
+      for (let i = 0; i < prefix; i++) {
+        const cnt = i < oldCounts.length ? oldCounts[i] : 1;
+        for (let p = 0; p < cnt; p++) {
+          if (oldStart + p < oldParts.length) {
+            newParts.push(oldParts[oldStart + p]);
+          }
+        }
+        newCounts.push(cnt);
+        oldStart += cnt;
+      }
+    }
+    // 重建变化部分（prefix 之后）
+    let splitCount = 0;
+    const noSplitLast = props.noSplitLast;
+    for (let i = prefix; i < props.data.length; i++) {
+      const parentKey = keyOfParent(i);
+      let cnt = 1;
+      // 流式场景：最后一条不拆分（整条渲染），避免每 40ms 重拆片段
+      const shouldSplit = enable && !(noSplitLast && i == props.data.length - 1);
+      if (shouldSplit) {
+        // 文本长度指纹不变则复用缓存，避免反复重拆
+        const raw = readField(props.data[i], props.splitTextField);
+        const body = raw != null ? `${raw}` : "";
+        const bodyLen = body.length;
+        const cachedLen = splitLenCache.get(parentKey);
+        if (cachedLen != null && cachedLen == bodyLen) {
+          const frags = splitFragCache.get(parentKey);
+          if (frags != null) {
+            cnt = frags.length;
+            splitCount += cnt;
+            for (let p = 0; p < cnt; p++) {
+              newParts.push(new RenderPart(i, p, frags[p], `${parentKey}_p${p}`, p == cnt - 1));
+            }
+            newCounts.push(cnt);
+            continue;
+          }
+        } else {
+          splitLenCache.set(parentKey, bodyLen);
+          if (bodyLen > maxChars) {
+            const frags = textSplitter.split(body, maxChars);
+            splitFragCache.set(parentKey, frags);
+            cnt = frags.length;
+            splitCount += cnt;
+            for (let p = 0; p < cnt; p++) {
+              newParts.push(new RenderPart(i, p, frags[p], `${parentKey}_p${p}`, p == cnt - 1));
+            }
+            newCounts.push(cnt);
+            continue;
+          }
+          splitFragCache.delete(parentKey);
+        }
+      }
+      newParts.push(new RenderPart(i, -1, "", parentKey, true));
+      newCounts.push(cnt);
+    }
+    // 更新引用快照
+    const refs: Array<any> = [];
+    for (let i = 0; i < props.data.length; i++) {
+      refs.push(props.data[i]);
+    }
+    lastDataRefs = refs;
+    partCounts = newCounts;
+    renderParts = newParts;
+    renderPartsRef.value = newParts;
+    if (enable && splitCount > 0) {
+      console.log("[nvwl-split] data=" + props.data.length + " parts=" + renderParts.length + " splitFrags=" + splitCount);
+    }
   }
 
   /** H5 同步测量用的节点 id（带实例 uid 防冲突） */
@@ -412,8 +601,11 @@
     lastEnd = range.end;
     const items: VirtualItem[] = [];
     for (let i = range.start; i < range.end; i++) {
-      if (i < props.data.length) {
-        items.push(new VirtualItem(keyOfItem(i), props.data[i], i));
+      if (i < renderParts.length && renderParts[i].parentIndex < props.data.length) {
+        const part = renderParts[i];
+        items.push(
+          new VirtualItem(part.key, props.data[part.parentIndex], i, part.partIndex, part.partText, part.isLastPart),
+        );
       }
     }
     visibleItems.value = items;
@@ -541,67 +733,70 @@
       keys.push(v.key);
     }
     const heights = await measureItemHeights(proxy, itemSelector(), ids);
-    let changed = false;
+    // 批量更新高度：一次测量只重建一次前缀和（避免逐条全量重建，大列表下滑动/流式卡顿主因）
     const minLen = heights.length < indexes.length ? heights.length : indexes.length;
-    for (let i = 0; i < minLen; i++) {
-      const h = heights[i];
-      if (h > 0) {
-        if (engine.setMeasuredHeight(indexes[i], keys[i], h)) {
-          changed = true;
+    const changed = minLen > 0
+      ? engine.updateHeights(indexes, keys, heights, minLen)
+      : false;
+    measuring = false;
+    // 测量回调（selector query exec）在渲染批次内直接改 DOM 会与布局通知并发冲突
+    // （java.util.ConcurrentModificationException），延迟到下一事件循环再执行窗口/滚动/高度更新
+    setTimeout(() => {
+      poleHeight.value = engine.totalHeight;
+      if (changed) {
+        correctScrollAfterMeasure();
+      }
+      maybeReflow();
+      // 前插（加载历史）测量完成：按实际高度差精确校准滚动位置，保持视角
+      if (pendingPrepend) {
+        pendingPrepend = false;
+        const actualDelta = engine.totalHeight - prependBaseHeight;
+        const target = prependBaseTop + actualDelta;
+        if (Math.abs(target - nativeScrollTop) > 1) {
+          applyScrollTop(target, false);
         }
       }
-    }
-    poleHeight.value = engine.totalHeight;
-    if (changed) {
-      correctScrollAfterMeasure();
-    }
-    measuring = false;
-    maybeReflow();
-    // 前插（加载历史）测量完成：按实际高度差精确校准滚动位置，保持视角
-    if (pendingPrepend) {
-      pendingPrepend = false;
-      const actualDelta = engine.totalHeight - prependBaseHeight;
-      const target = prependBaseTop + actualDelta;
-      if (Math.abs(target - nativeScrollTop) > 1) {
-        applyScrollTop(target, false);
+      // init-scroll-to-bottom：迭代校准到真实底部。
+      // totalHeight = 窗口内实测 + 窗口外估计，初始定位是"估计底部"，需多轮「滚底→测量→再滚底」逼近真实底部；
+      // 连续两轮窗口位置(start)与 totalHeight 都无变化才认为收敛（避免在错误位置提前终止）。
+      if (initBottomPending) {
+        const viewport = viewportHeight.value;
+        const atBottom =
+          viewport > 0 && nativeScrollTop + viewport >= engine.totalHeight - 2;
+        const bottomTarget = engine.totalHeight - viewport;
+        const startChanged = lastStart != initBottomPrevStart;
+        const totalChanged = Math.abs(engine.totalHeight - initBottomPrevTotal) > 0.5;
+        initBottomPrevStart = lastStart;
+        initBottomPrevTotal = engine.totalHeight;
+        if (!atBottom && bottomTarget > 0) {
+          applyScrollTop(bottomTarget, false);
+        }
+        if (startChanged || totalChanged || changed) {
+          // 本轮窗口下移 / 高度更新 → 尚未到达真实底部，继续快速迭代
+          measuring = true;
+          nextTick(() => {
+            doMeasure();
+          });
+        } else {
+          // 收敛：已到达真实底部（窗口内项目均已实测）
+          initBottomPending = false;
+        }
       }
-    }
-    // init-scroll-to-bottom：迭代校准到真实底部。
-    // totalHeight = 窗口内实测 + 窗口外估计，初始定位是"估计底部"，需多轮「滚底→测量→再滚底」逼近真实底部；
-    // 连续两轮窗口位置(start)与 totalHeight 都无变化才认为收敛（避免在错误位置提前终止）。
-    if (initBottomPending) {
-      const viewport = viewportHeight.value;
-      const atBottom =
-        viewport > 0 && nativeScrollTop + viewport >= engine.totalHeight - 2;
-      const bottomTarget = engine.totalHeight - viewport;
-      const startChanged = lastStart != initBottomPrevStart;
-      const totalChanged = Math.abs(engine.totalHeight - initBottomPrevTotal) > 0.5;
-      initBottomPrevStart = lastStart;
-      initBottomPrevTotal = engine.totalHeight;
-      if (!atBottom && bottomTarget > 0) {
-        applyScrollTop(bottomTarget, false);
-      }
-      if (startChanged || totalChanged || changed) {
-        // 本轮窗口下移 / 高度更新 → 尚未到达真实底部，继续快速迭代
-        // 内联 nextTick 递归（UTS 函数不提升，避免与 scheduleMeasure 互相前向引用）
-        measuring = true;
-        nextTick(() => {
-          doMeasure();
-        });
-      } else {
-        // 收敛：已到达真实底部（窗口内项目均已实测）
-        initBottomPending = false;
-      }
-    }
+    }, 0);
   }
 
-  /** 触发一次测量（合并到下一帧，去重） */
+  /** 触发一次测量（100ms 防抖合并：流式期数据每 40ms 替换，测量只做低频一次） */
+  let measureDebounceTimer = 0;
   function scheduleMeasure(): void {
-    if (measuring) return;
-    measuring = true;
-    nextTick(() => {
-      doMeasure();
-    });
+    if (measureDebounceTimer != 0) return;
+    measureDebounceTimer = setTimeout(() => {
+      measureDebounceTimer = 0;
+      if (measuring) return;
+      measuring = true;
+      nextTick(() => {
+        doMeasure();
+      });
+    }, 100);
   }
 
   /** 滚动停稳后补一次测量，捕捉滚动期间被延迟的内容高度变化 */
@@ -666,7 +861,12 @@
   /** 重置测量缓存并回到顶部（数据整体替换后调用） */
   function reload(): void {
     engine.reset();
-    engine.init(props.data.length, props.itemHeight, props.bufferCount);
+    splitFragCache = new Map();
+    splitLenCache = new Map();
+    partCounts = [];
+    lastDataRefs = [];
+    rebuildRenderParts();
+    engine.init(renderParts.length, props.itemHeight, props.bufferCount);
     poleHeight.value = engine.totalHeight;
     lastStart = 0;
     lastEnd = 0;
@@ -757,15 +957,17 @@
     // 前插检测：有旧数组、首条 key 与旧首条不同（顶部加载历史）
     let isPrepend = false;
     if (oldData != null && oldData.length > 0 && props.data.length > 0) {
-      isPrepend = keyOfRaw(oldData[0]) != keyOfItem(0);
+      isPrepend = keyOfRaw(oldData[0]) != keyOfParent(0);
     }
     if (isPrepend) {
       prependBaseTop = nativeScrollTop;
       prependBaseHeight = prevTotal;
       pendingPrepend = true;
     }
-    const firstKey = props.data.length > 0 ? keyOfItem(0) : null;
-    engine.syncData(props.data.length, firstKey, (i: number): string => keyOfItem(i));
+    // 重建拆分后的渲染项（enableSplit 时按最大字符拆分，保证模块完整）
+    rebuildRenderParts();
+    const firstKey = renderParts.length > 0 ? keyOfPart(0) : null;
+    engine.syncData(renderParts.length, firstKey, (i: number): string => keyOfPart(i));
     poleHeight.value = engine.totalHeight;
     // 数据变化前在底部 + follow-bottom：标记跟随，测量完成后滚底（见 correctScrollAfterMeasure）
     if (props.followBottom && wasAtBottom) {
@@ -792,15 +994,21 @@
   }
 
   /** 数据变化（引用替换 或 长度变化）→ onDataChanged；引用替换时带旧数组用于前插检测 */
+  let lastDataRef: Array<any> | null = null;
   watch(dataSource, (newVal: Array<any>, oldVal: Array<any>) => {
+    lastDataRef = newVal;
     onDataChanged(oldVal);
   });
   watch(dataLen, (newVal: number) => {
-    onDataChanged(null);
+    // 原地 push/增删（引用未变）才需处理；引用已替换时 dataSource watch 已处理，跳过避免双触发
+    if (dataSource.value === lastDataRef) {
+      onDataChanged(null);
+    }
   });
 
   const itemHeightSource = computed((): number => props.itemHeight);
   const bufferCountSource = computed((): number => props.bufferCount);
+  const noSplitLastSource = computed((): boolean => props.noSplitLast);
 
   watch(itemHeightSource, (v: number) => {
     if (v > 0) engine.estimatedHeight = v;
@@ -810,6 +1018,21 @@
     if (v >= 0) engine.bufferCount = v;
   });
 
+  watch(noSplitLastSource, (v: boolean) => {
+    // noSplitLast 切换（流式开始/结束）→ 清增量缓存强制全量重建拆分结果
+    lastDataRefs = [];
+    partCounts = [];
+    rebuildRenderParts();
+    const firstKey = renderParts.length > 0 ? keyOfPart(0) : null;
+    engine.syncData(renderParts.length, firstKey, (i: number): string => keyOfPart(i));
+    poleHeight.value = engine.totalHeight;
+    if (lastStart >= engine.sizes.length) {
+      refreshWindow();
+    } else {
+      maybeReflow();
+    }
+  });
+
   // ==================== 生命周期 ====================
   onMounted(() => {
     measureViewportHeight(proxy, props.listId).then((h: number) => {
@@ -817,6 +1040,10 @@
         viewportHeight.value = h;
         viewportMeasured = true;
       }
+      // 初始数据：重建拆分后的渲染项并同步引擎（setup 时 engine.init 用的是未拆分长度）
+      rebuildRenderParts();
+      const initFirstKey = renderParts.length > 0 ? keyOfPart(0) : null;
+      engine.syncData(renderParts.length, initFirstKey, (i: number): string => keyOfPart(i));
       poleHeight.value = engine.totalHeight;
       if (props.initScrollToBottom && useVirtualEngine.value) {
         // 初始直接从底部渲染：首屏窗口=底部窗口，上方历史消息完全不创建 vnode。
@@ -843,6 +1070,7 @@
 
   onUnmounted(() => {
     if (idleTimer != 0) clearTimeout(idleTimer);
+    if (measureDebounceTimer != 0) clearTimeout(measureDebounceTimer);
   });
 
   // ==================== 对外暴露 ====================

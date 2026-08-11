@@ -1,0 +1,168 @@
+/**
+ * nuwax-virtual-list 长文本拆分器
+ *
+ * 按模块拆分（避免切断连载内容）：
+ * - 受保护模块是硬边界，独立成段且永不切断：
+ *   · 代码块（含 mermaid 流程图）、块级/行内数学公式、图片、markdown 表格
+ * - 模块之间的普通文本作为整体保留；仅当单个文本段超过 maxChars 时才按断点内部切分
+ *
+ * 注意：不保护自定义标签（<div>/<task-result> 等）——聊天 SSE 文本中的标签常不完整/零散，
+ * 栈式配对易误判，按普通文本切分更稳。
+ */
+
+class Segment {
+  content: string = "";
+  isProtected: boolean = false;
+  constructor(content: string, isProtected: boolean) {
+    this.content = content;
+    this.isProtected = isProtected;
+  }
+}
+
+export class TextSplitter {
+  /**
+   * 拆分长文本为多个可独立渲染的片段。
+   *
+   * 策略：
+   * - 受保护模块（代码块含 mermaid 流程图、表格、图片、数学公式）是**硬边界**，
+   *   每个模块**独立成段且永不切断**（哪怕超长也不切内部）
+   * - 模块之间的普通文本段作为**整体保留**；**仅当单个文本段超过 maxChars** 时，
+   *   才在该段内部按断点（换行/句读/空格）切分
+   *
+   * @param text 原始文本
+   * @param maxChars 单段最大字符数（仅约束普通文本段；模块不受限）
+   * @returns 片段数组；文本未超长时返回单元素数组
+   */
+  split(text: string, maxChars: number): Array<string> {
+    const parts: Array<string> = [];
+    if (maxChars <= 0 || text.length <= maxChars) {
+      parts.push(text);
+      return parts;
+    }
+    const segments = this.scanSegments(text);
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      if (seg.isProtected) {
+        // 受保护模块：独立成段，永不切断
+        parts.push(seg.content);
+      } else {
+        // 普通文本段：整体保留；仅本段超过阈值时内部切分
+        let t = seg.content;
+        while (t.length > maxChars) {
+          const cut = this.findBreak(t, maxChars);
+          parts.push(t.substring(0, cut));
+          t = t.substring(cut);
+        }
+        if (t.length > 0) {
+          parts.push(t);
+        }
+      }
+    }
+    return parts;
+  }
+
+  /**
+   * 扫描文本为「受保护模块 / 普通文本」交替段。
+   * 受保护模块仅限：代码块（含 mermaid 流程图）、块级/行内数学公式、图片、表格块。
+   * 自定义标签不保护（聊天 SSE 文本中的标签常不完整/零散，栈式匹配易误判，按普通文本切分更稳）。
+   */
+  private scanSegments(text: string): Array<Segment> {
+    const segments: Array<Segment> = [];
+    this.scanSimpleModules(segments, text);
+    return segments;
+  }
+
+  /** 简单模块（代码块/公式/图片，无嵌套问题用正则）+ 剩余文本的表格识别 */
+  private scanSimpleModules(segments: Array<Segment>, text: string): void {
+    if (text.length == 0) return;
+    let cursor = 0;
+    const protoRe = new RegExp(
+      "```[\\s\\S]*?```|\\$\\$[\\s\\S]*?\\$\\$|\\$[^\\s$\\n][^\\n$]*?\\$|!\\[[^\\]]*\\]\\([^)]*\\)",
+      "g",
+    );
+    let m = protoRe.exec(text);
+    while (m != null) {
+      const start = m.index;
+      const content = m[0] as string;
+      const end = start + content.length;
+      if (start > cursor) {
+        this.pushTextSegments(segments, text.substring(cursor, start));
+      }
+      segments.push(new Segment(content, true));
+      cursor = end;
+      m = protoRe.exec(text);
+    }
+    if (cursor < text.length) {
+      this.pushTextSegments(segments, text.substring(cursor));
+    }
+  }
+
+  /**
+   * 普通文本段内部按行识别表格块（连续含 | 的行合并为受保护块）。
+   * 表格行判定：行内 | 出现 ≥ 2 次（markdown 表头/分隔行/数据行均满足）。
+   */
+  private pushTextSegments(segments: Array<Segment>, text: string): void {
+    if (text.length == 0) return;
+    const lines = text.split("\n");
+    let tableBuffer: Array<string> = [];
+    let textBuffer = "";
+    const flushTable = (): void => {
+      if (tableBuffer.length > 0) {
+        segments.push(new Segment(tableBuffer.join("\n"), true));
+        tableBuffer = [];
+      }
+    };
+    const flushText = (): void => {
+      if (textBuffer.length > 0) {
+        segments.push(new Segment(textBuffer, false));
+        textBuffer = "";
+      }
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const isTableRow = this.isTableRow(line);
+      if (isTableRow) {
+        flushText();
+        tableBuffer.push(line);
+      } else {
+        flushTable();
+        textBuffer += line;
+        // 保留换行语义（非表格行分隔）
+        if (i < lines.length - 1) {
+          textBuffer += "\n";
+        }
+      }
+    }
+    flushText();
+    flushTable();
+  }
+
+  /** 表格行判定：行内 | 出现 ≥ 2 次 */
+  private isTableRow(line: string): boolean {
+    let count = 0;
+    const n = line.length;
+    for (let i = 0; i < n; i++) {
+      if (line.charCodeAt(i) == 124) {
+        count++;
+        if (count >= 2) return true;
+      }
+    }
+    return false;
+  }
+
+  /** 在 maxChars 内找最近断点（换行/句读/空格），找不到则硬切 */
+  private findBreak(text: string, maxChars: number): number {
+    const limit = maxChars < text.length ? maxChars : text.length;
+    for (let i = limit; i > 0; i--) {
+      const c = text.charCodeAt(i - 1);
+      // \n \r 。 ！ ？ ； ， 空格
+      if (
+        c == 10 || c == 13 || c == 12290 || c == 65281 || c == 65311 ||
+        c == 65307 || c == 65292 || c == 32
+      ) {
+        return i;
+      }
+    }
+    return limit;
+  }
+}

@@ -114,13 +114,17 @@
                历史消息加载仍走 scrolltoupper → handleScrollToUpper；list-id 保持 ScrollManager 的 getElementById("msg-list") 可用 -->
           <nuwax-virtual-list
             ref="pagingXRef"
-            :data="messageList"
+            :data="virtualListData"
             :item-height="virtualListItemHeight"
             :buffer-count="10"
             list-id="msg-list"
             key-field="id"
             :native-list="false"
             :scroll-with-animation="scrollWithAnimation"
+            :enable-split="true"
+            :split-max-chars="2000"
+            split-text-field="text"
+            :no-split-last="isConversationActive"
             @scrolltoupper="handleScrollToUpper"
             @scroll="onScroll"
           >
@@ -153,8 +157,8 @@
                 <UniAiXMsg
                   v-if="isAssistantMessage(sp.item)"
                   :message-id="getMsgId(sp.item)"
-                  :body-text="resolveAssistantBodyText(sp.item, sp.index)"
-                  :think-text="getAssistantThinkText(sp.item)"
+                  :body-text="sp.partIndex >= 0 ? sp.partText : resolveAssistantBodyText(sp.item, sp.index)"
+                  :think-text="sp.partIndex > 0 ? '' : getAssistantThinkText(sp.item)"
                   :speakable-text="getAssistantSpeakableText(sp.item)"
                   :message-status="getMsgStatus(sp.item)"
                   :processing-list="getAssistantProcessingList(sp.item)"
@@ -164,8 +168,9 @@
                   :message-time="getMsgTime(sp.item)"
                   :is-last-msg="isLastMessage(sp.index)"
                   :is-conversation-active="isConversationActive"
-                  :show-tool-bar="!(isConversationActive && isLastMessage(sp.index))"
+                  :show-tool-bar="sp.partIndex >= 0 && !sp.isLastPart ? false : !(isConversationActive && isLastMessage(sp.index))"
                   :task-status="getConversationTaskStatus()"
+                  :hide-loading="sp.partIndex >= 0 && !sp.isLastPart"
                   @longpress="onlongTapMsg(sp.item)"
                   @changeThinkContent="changeThinkContent"
                   :id="`msg-item-${getMsgId(sp.item)}_${sp.index}`"
@@ -176,7 +181,7 @@
                   <!-- 图片以及文件（Android：attachments 元素多为 UTSJSONObject，禁止当 AttachmentFile 用） -->
                   <scroll-view
                     class="files-container"
-                    v-if="hasMessageAttachments(sp.item)"
+                    v-if="hasMessageAttachments(sp.item) && sp.partIndex <= 0"
                     direction="horizontal"
                     :scroll-x="true"
                     :scroll-y="false"
@@ -223,11 +228,11 @@
                   <!-- App：rich-text 对纯文本 nodes(string) 常不渲染，H5 正常；用户消息用 text -->
                   <view
                     class="user-msg"
-                    v-if="hasUserMessageText(sp.item)"
+                    v-if="sp.partIndex >= 0 ? sp.partText.length > 0 : hasUserMessageText(sp.item)"
                     :id="`msg-item-${getMsgId(sp.item)}_${sp.index}`"
                   >
                     <text class="user-msg-text" selectable="true">{{
-                      getUserMessageText(sp.item)
+                      sp.partIndex >= 0 ? sp.partText : getUserMessageText(sp.item)
                     }}</text>
                   </view>
                 </template>
@@ -875,6 +880,69 @@
     localCalledTrialCount,
   } = data;
 
+  // ==================== 虚拟列表数据规范化 ====================
+  // nuwax-virtual-list 的 key-field / split-text-field 用 UTSJSONObject bracket 读字段，
+  // MessageInfo 类实例读不到 → 这里显式构造含业务字段的 UTSJSONObject 再传入。
+  // 用 readRawField（三层 fallback 保证读到 MessageInfo 字段）逐字段复制，
+  // 不用 normalizeMessageRawToJson（其 JSON.stringify 对类实例在 Android 可能失效丢 text）。
+  // 用 watch + ref（对齐 activeInterventionQueue 模式），避免 computed 每 40ms 触发渲染 effect。
+  const VIRTUAL_MSG_FIELDS: string[] = [
+    "id", "text", "think", "time", "status", "speakableText",
+    "attachments", "messageType", "role", "index",
+    "processingList", "markdownElList",
+  ];
+  /** 规范化结果缓存（按数组索引）：流式期只有最后一条变化，前面消息复用缓存，避免每 40ms 全量复制 */
+  const virtualMsgCache = new Map<string, UTSJSONObject>();
+  let virtualMsgCacheLen = -1;
+  const virtualListData = ref<Array<UTSJSONObject>>([] as Array<UTSJSONObject>);
+  watch(
+    messageList,
+    (list: MessageInfo[]) => {
+      // 长度跳变（前插/清空/删除）→ 索引错位，清缓存全量重建；流式 append/增长长度稳定
+      if (Math.abs(list.length - virtualMsgCacheLen) > 1) {
+        virtualMsgCache.clear();
+      }
+      virtualMsgCacheLen = list.length;
+      const next: Array<UTSJSONObject> = [];
+      const lastIdx = list.length - 1;
+      for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        const cacheKey = `${i}`;
+        const cached = virtualMsgCache.get(cacheKey);
+        if (cached != null) {
+          if (i == lastIdx) {
+            // 最后一条（流式增长/状态变化）：全量重建保证字段最新
+            const fresh = new UTSJSONObject();
+            for (let k = 0; k < VIRTUAL_MSG_FIELDS.length; k++) {
+              const key = VIRTUAL_MSG_FIELDS[k];
+              const v = readRawField(item, key);
+              if (v != null) {
+                fresh[key] = v;
+              }
+            }
+            virtualMsgCache.set(cacheKey, fresh);
+            next.push(fresh);
+          } else {
+            next.push(cached);
+          }
+          continue;
+        }
+        const o = new UTSJSONObject();
+        for (let k = 0; k < VIRTUAL_MSG_FIELDS.length; k++) {
+          const key = VIRTUAL_MSG_FIELDS[k];
+          const v = readRawField(item, key);
+          if (v != null) {
+            o[key] = v;
+          }
+        }
+        virtualMsgCache.set(cacheKey, o);
+        next.push(o);
+      }
+      virtualListData.value = next;
+    },
+    { immediate: true },
+  );
+
   // ==================== 干预审批 FIFO 队列（dockpanel） ====================
   // 队首 frontInterventionItem 为最早待审批项；badge 显示后续排队数量。
   // 关键性能：activeInterventionQueue 必须是 ref + watch 闸，不能是依赖 messageList 的 computed。
@@ -1163,15 +1231,12 @@
     if (item == null) {
       return false;
     }
-    const msg = item as MessageInfo;
-    if (msg.messageType == MessageTypeEnum.ASSISTANT) {
-      return true;
-    }
-    if (msg.role == AssistantRoleEnum.ASSISTANT) {
-      return true;
-    }
-    const typeStr = `${msg.messageType}`;
-    const roleStr = `${msg.role}`;
+    // 兼容两种形态：MessageInfo 类实例（原始 messageList）与 UTSJSONObject（virtualListData 规范化后）。
+    // 勿 `as MessageInfo`——UTSJSONObject 强转会 CCE。
+    const typeVal = readRawField(item, "messageType");
+    const roleVal = readRawField(item, "role");
+    const typeStr = typeVal != null ? `${typeVal}` : "";
+    const roleStr = roleVal != null ? `${roleVal}` : "";
     if (typeStr == "ASSISTANT" || roleStr == "ASSISTANT") {
       return true;
     }
@@ -1179,7 +1244,7 @@
       return true;
     }
     // 明确排除 USER，避免误判
-    if (msg.messageType == MessageTypeEnum.USER || msg.role == AssistantRoleEnum.USER) {
+    if (typeStr == "USER" || roleStr == "USER") {
       return false;
     }
     if (typeStr.indexOf("USER") >= 0 || roleStr.indexOf("USER") >= 0) {

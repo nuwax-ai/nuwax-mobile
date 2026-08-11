@@ -73,15 +73,46 @@
 | `load-more-no-more` | `boolean` | `false` | 没有更多了：true 时停止触发 `loadmore`（最后一页后置 true） |
 | `load-more-loading` | `boolean` | `false` | 请求中：true 时暂停触发 `loadmore`（请求期间置 true 防重复） |
 | `init-scroll-to-bottom` | `boolean` | `false` | 初始即从底部渲染：首屏窗口直接定位内容底部（只渲染底部附近几条），测量后自动校准到真实底部。适合「进入即显示最后一条历史会话」——上方历史完全不创建 vnode，减少首屏渲染消耗 |
+| `enable-split` | `boolean` | `false` | 长文本拆分：正文超 `split-max-chars` 时拆成多条子项渲染，避免单条超长（SSE 富媒体）整条渲染导致线程压力 |
+| `split-max-chars` | `number` | `2000` | 拆分阈值（字符数） |
+| `split-text-field` | `string` | `''` | 拆分的正文字段名（如消息正文是 `"text"` / `"bodyText"`）；留空不拆 |
 
 ## Slots
 
 | 插槽 | 作用域 | 说明 |
 |---|---|---|
-| `item` | `{ item, index }` | 列表项渲染（必填） |
+| `item` | `{ item, index, partIndex, partText }` | 列表项渲染（必填）。`partIndex >= 0` 表示该项是拆分片段，`partText` 为该片段文本，`item` 始终是原始数据 |
 | `empty` | - | 空状态 |
 | `header` / `footer` | - | 随内容滚动的头/尾 |
 | `refresher` | `{ refresherStatus }` | 自定义下拉刷新 |
+
+## 长文本拆分（防单条超长崩溃）
+
+SSE 会话内容可能单条极长（几万字符 + 表格/代码块/流程图/图片/自定义标签），即使虚拟列表只渲染视口，**单条 item 内部的 markdown 解析与 DOM 构建**本身也会造成线程压力。开启拆分后，超长条目自动拆成多条子项（每子项独立渲染、独立测高、独立参与虚拟窗口）：
+
+```html
+<nuwax-virtual-list
+  :data="list"
+  key-field="id"
+  :enable-split="true"
+  :split-max-chars="3000"
+  split-text-field="text"
+>
+  <template #item="sp">
+    <!-- partIndex >= 0：渲染拆分片段；否则整条 -->
+    <my-msg :body="sp.partIndex >= 0 ? sp.partText : readBody(sp.item)" />
+  </template>
+</nuwax-virtual-list>
+```
+
+**拆分规则（按模块拆分，避免切断连载内容）**：
+- **受保护模块**是**硬边界**，每个模块**独立成段且永不切断**（哪怕超长也不切内部）：
+  - 代码块（```` ``` ```` 含 mermaid 流程图）、表格、图片（`![](url)`）、**数学公式（块级 `$$...$$` / 行内 `$...$`）**；
+  - 自定义标签不保护（聊天 SSE 文本中的标签常不完整/零散，栈式配对易误判，按普通文本切分更稳）；
+- **模块之间的普通文本**：作为**整体保留**（短文本不拆），**仅当单个文本段超过 `split-max-chars`** 时才在换行 / 句读（。！？；，）/ 空格断点处切分——不会因跨模块累积而误切连载的文字或公式；
+- 短条目不拆分（零额外开销）。
+
+> 拆分在数据变更时增量执行，仅重拆文本变化的条目；配合 `init-scroll-to-bottom` 时，超长历史消息拆成多条子项后首屏窗口只渲染底部子项。
 
 ## Methods（ref / $callMethod 调用）
 

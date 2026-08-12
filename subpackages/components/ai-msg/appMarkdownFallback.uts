@@ -20,330 +20,19 @@ import {
   findNextMarkdownCustomProcessTag,
   listMarkdownCustomProcessTags,
 } from "@/utils/markdownCustomProcess.uts";
-import {
-  cacheEntryToRes,
-  getMathCache,
-} from "@/uni_modules/nuwax-uni-math/sdk/mathDiskCache.uts";
-import { MathRenderResult } from "@/uni_modules/nuwax-uni-math/sdk/mathRenderer.uts";
-import mathRenderer, { MathRendererCore } from "@/uni_modules/nuwax-uni-math/sdk/mathRendererCore.uts";
-import { perfRecordMathBatchDetail } from "@/utils/perfProbe.uts";
 import { MERMAID_RENDER_ENABLED } from "@/uni_modules/uni-ai-x/sdk/math-render.uts";
 
 type MathRenderedCallback = () => void;
 
-/** 解析期收集的公式任务，解析结束后一次 batch 提交给 proxy */
-class PendingMathJob {
-  id: string;
-  latex: string;
-  token: MarkdownToken;
-  displayMode: boolean;
-  constructor(
-    id: string,
-    latex: string,
-    token: MarkdownToken,
-    displayMode: boolean,
-  ) {
-    this.id = id;
-    this.latex = latex;
-    this.token = token;
-    this.displayMode = displayMode;
-  }
-}
-
 /**
- * 公式队列栈：每个根 parse 一帧，递归分段复用栈顶；
- * 多条历史消息并发 parse 时互不串台。
- */
-class MathJobFrame {
-  jobs: PendingMathJob[] = [] as PendingMathJob[];
-}
-let mathJobStack: MathJobFrame[] = [] as MathJobFrame[];
-let mathJobSeq: number = 0;
-
-function currentMathJobs(): PendingMathJob[] | null {
-  if (mathJobStack.length == 0) {
-    return null;
-  }
-  return mathJobStack[mathJobStack.length - 1].jobs;
-}
-
-function applyMathResultToToken(token: MarkdownToken, res: UTSJSONObject): void {
-  const imageData = res["imageDataURL"];
-  const htmlData = res["resultHtml"];
-  const widthData = res["width"];
-  const heightData = res["height"];
-  const svgData = res["svg"];
-  const hrefLen = imageData != null ? `${imageData}`.length : 0;
-  const svgLen = svgData != null ? `${svgData}`.length : 0;
-  if (imageData != null) token.href = `${imageData}`;
-  if (htmlData != null) token.html = `${htmlData}`;
-  if (widthData != null) token.width = widthData as number;
-  if (heightData != null) token.height = heightData as number;
-  console.log(
-    "[MATHSVG] applyMathResultToToken hrefLen=" +
-      hrefLen +
-      " svgLen=" +
-      svgLen +
-      " w=" +
-      (widthData != null ? `${widthData}` : "null") +
-      " h=" +
-      (heightData != null ? `${heightData}` : "null") +
-      (hrefLen == 0 ? " (NO-IMG -> blank)" : ""),
-  );
-}
-
-function mathCacheKey(latex: string, displayMode: boolean): string {
-  // 与 MathRendererCore 完全同键：后端 A/B 必须隔离，否则 Markdown 层永远查不到
-  // Core 已写入的 px:/nv: 缓存，会把每次增量 parse 都误判成未命中并重复触发 UI 回填。
-  const backendTag = MathRendererCore.backend == "proxy" ? "px" : "nv";
-  const cacheVersion = backendTag == "nv" ? "v4" : "v2";
-  if (displayMode == true) {
-    return backendTag + ":" + cacheVersion + "d1:" + latex;
-  }
-  return backendTag + ":" + cacheVersion + "d0:" + latex;
-}
-
-/** 最近一次根 parse 提交的公式数（0 表示无 batch） */
-let lastMathFlushCount: number = 0;
-
-/** 截图结果暂存：凑满一批再写 token，避免逐条重绘抖动 */
-class PendingMathResult {
-  token: MarkdownToken;
-  res: UTSJSONObject;
-  constructor(token: MarkdownToken, res: UTSJSONObject) {
-    this.token = token;
-    this.res = res;
-  }
-}
-
-/** 同一 latex 去重：一次截图扇出到多个 token */
-class MathDedupeGroup {
-  key: string = "";
-  latex: string = "";
-  displayMode: boolean = true;
-  tokens: MarkdownToken[] = [] as MarkdownToken[];
-}
-
-/** KaTeX 并发上限：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥队列（公式多时卡死） */
-const MAX_CONCURRENT_KATEX: number = 2;
-
-/**
- * 跨 frame 在途公式（已 dispatch 未回调）key → 等待的同 key token。
- * 堵「首个 dispatch 在途、L1 未写，下一 chunk 全量解析又遇同一闭合公式」的重复 dispatch。
- * 命中时 token 挂入等待列表，dispatch 回调统一扇出，不再重复 evalJS。
- */
-let mathInFlightTokens: Map<string, MarkdownToken[]> = new Map<string, MarkdownToken[]>();
-
-/**
- * App 专用：并行派发 katexRender（proxy 多槽）。
- * 命中磁盘缓存则跳过截图；相同 latex 去重；按 chunk 上屏减轻抖动。
- */
-class MathBatchUiRunner {
-  jobs: PendingMathJob[];
-  onChunkReady: MathRenderedCallback;
-  pending: number = 0;
-  buffered: PendingMathResult[] = [] as PendingMathResult[];
-  /** 多条一起刷会拖慢「闭合即见」；流式逐个上屏用 1 */
-  chunkSize: number = 1;
-  /** KaTeX 并发闸：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥队列 → 卡死 */
-  inFlight: number = 0;
-  queue: MathDedupeGroup[] = [] as MathDedupeGroup[];
-
-  constructor(jobs: PendingMathJob[], onChunkReady: MathRenderedCallback) {
-    this.jobs = jobs;
-    this.onChunkReady = onChunkReady;
-  }
-
-  start(): void {
-    const groups = [] as MathDedupeGroup[];
-    const hitResults = [] as PendingMathResult[];
-    for (let i = 0; i < this.jobs.length; i++) {
-      const job = this.jobs[i];
-      const key = mathCacheKey(job.latex, job.displayMode);
-      const cached = getMathCache(key);
-      if (cached != null) {
-        hitResults.push(
-          new PendingMathResult(job.token, cacheEntryToRes(cached)),
-        );
-        continue;
-      }
-      // 跨 frame 在途去重：该 latex 已在 dispatch 未回调 → 挂等待列表，不再重复 dispatch
-      const inFlightWaiters = mathInFlightTokens.get(key);
-      if (inFlightWaiters != null) {
-        inFlightWaiters.push(job.token);
-        continue;
-      }
-      let group: MathDedupeGroup | null = null;
-      for (let g = 0; g < groups.length; g++) {
-        if (groups[g].key == key) {
-          group = groups[g];
-          break;
-        }
-      }
-      if (group == null) {
-        const created = new MathDedupeGroup();
-        created.key = key;
-        created.latex = job.latex;
-        created.displayMode = job.displayMode;
-        groups.push(created);
-        group = created;
-      }
-      group.tokens.push(job.token);
-    }
-
-    if (hitResults.length > 0) {
-      for (let hi = 0; hi < hitResults.length; hi++) {
-        applyMathResultToToken(hitResults[hi].token, hitResults[hi].res);
-      }
-      // App：缓存命中已在解析期写回 token.href，本次 markdownElList 赋值即可上屏，
-      // 勿再 onChunkReady 触发整表 flush（流式增量下会放大主线程抖动）。
-      let skipCacheFlush = false;
-      // #ifdef APP
-      skipCacheFlush = true;
-      // #endif
-      if (skipCacheFlush != true) {
-        this.onChunkReady();
-      }
-    }
-
-    this.pending = groups.length;
-    this.buffered = [] as PendingMathResult[];
-    // [PerfProbe] 观测：公式 batch 缓存命中数 vs 实际 dispatch 数（性能排查，可关）
-    try {
-      perfRecordMathBatchDetail(
-        hitResults.length,
-        groups.length,
-        proxyWeb.isReady(),
-      );
-    } catch (_e) {
-      // 埋点失败静默
-    }
-    if (groups.length == 0) {
-      return;
-    }
-    // 并发闸：入队后按 MAX_CONCURRENT_KATEX 匀速 pump，不再一次性全 dispatch 打满 WebView 桥
-    this.queue = groups;
-    this.inFlight = 0;
-    this.pump();
-  }
-
-  /** 按并发上限持续派发队列中的 group；每个 dispatch 回调后再 pump 续发 */
-  pump(): void {
-    while (
-      this.inFlight < MAX_CONCURRENT_KATEX &&
-      this.queue.length > 0
-    ) {
-      const group = this.queue.shift();
-      if (group == null) {
-        break;
-      }
-      this.inFlight = this.inFlight + 1;
-      this.dispatchGroup(group);
-    }
-  }
-
-  /** 把当前缓冲写回 token 并通知 UI 刷一帧 */
-  flushBuffered(): void {
-    const all = this.buffered;
-    if (all.length == 0) {
-      return;
-    }
-    this.buffered = [] as PendingMathResult[];
-    for (let bi = 0; bi < all.length; bi++) {
-      applyMathResultToToken(all[bi].token, all[bi].res);
-    }
-    this.onChunkReady();
-  }
-
-  dispatchGroup(group: MathDedupeGroup): void {
-    const runner = this;
-    const cacheKey = group.key;
-    const tokens = group.tokens;
-    const latex = group.latex;
-    const displayMode = group.displayMode;
-    // 登记在途：同 key 后续 chunk 会挂入 mathInFlightTokens 等待列表而非重复 dispatch
-    mathInFlightTokens.set(cacheKey, tokens);
-    // 走 MathRendererCore：APP-ANDROID nativeSvgBackend（QuickJS+MathJax→原生 SVG→位图）为主，
-    // 失败兜底 proxyWebBackend（隐藏 web-view KaTeX 截图）。Core 内部统一做缓存写入 / 在途去重 /
-    // 并发闸 / proxy 就绪等待，此处不再直接调 proxyWeb.callMethod。
-    mathRenderer.render(latex, displayMode, (res: MathRenderResult): void => {
-      // MathRenderResult → UTSJSONObject（applyMathResultToToken / 缓存命中路径统一读 UTSJSONObject）
-      const u = new UTSJSONObject();
-      if (res.href.length > 0) {
-        u["imageDataURL"] = res.href;
-      }
-      if (res.html.length > 0) {
-        u["resultHtml"] = res.html;
-      }
-      if (res.width > 0) {
-        u["width"] = res.width;
-      }
-      if (res.height > 0) {
-        u["height"] = res.height;
-      }
-      // 扇出给 group.tokens + 跨 frame 挂入的等待 token（同一 list 引用，含已追加的等待者）
-      const fanout = mathInFlightTokens.get(cacheKey);
-      mathInFlightTokens.delete(cacheKey);
-      const targets = fanout != null ? fanout : tokens;
-      for (let ti = 0; ti < targets.length; ti++) {
-        runner.buffered.push(new PendingMathResult(targets[ti], u));
-      }
-      runner.pending = runner.pending - 1;
-      runner.inFlight = runner.inFlight - 1;
-      if (
-        runner.buffered.length >= runner.chunkSize ||
-        runner.pending == 0
-      ) {
-        runner.flushBuffered();
-      }
-      // 一个回调完成，续发队列中下一个（保持 ≤MAX_CONCURRENT_KATEX 在途）
-      runner.pump();
-    });
-  }
-}
-
-/**
- * App：将收集到的公式并行交给 proxy；磁盘缓存命中/去重后按 chunk 回调上屏。
- * 无任务时不回调。
- * @returns 提交的公式条数（含仅走缓存的条数）
- */
-function flushMathJobs(onChunkReady: MathRenderedCallback): number {
-  const frame =
-    mathJobStack.length > 0 ? mathJobStack[mathJobStack.length - 1] : null;
-  if (frame == null) {
-    lastMathFlushCount = 0;
-    return 0;
-  }
-  const jobs = frame.jobs;
-  if (jobs.length == 0) {
-    lastMathFlushCount = 0;
-    return 0;
-  }
-  lastMathFlushCount = jobs.length;
-  new MathBatchUiRunner(jobs, onChunkReady).start();
-  return jobs.length;
-}
-
-/** 读取并清零最近一次 fallback 公式 batch 数量 */
-export function takeLastMathFlushCount(): number {
-  const n = lastMathFlushCount;
-  lastMathFlushCount = 0;
-  return n;
-}
-
-/**
- * 某公式是否已「结算」：已派发过 katexRender 并回调（成功或失败，结果已入磁盘/内存缓存）。
- * 用于流式增量「官方 WAIT」语义：尚未结算（在途）的公式要等出图再继续渲染后续内容；
- * 已结算（含渲染失败、结果为空）则不再等待，按占位展示并继续。
+ * 某公式是否已「结算」：nuwax-katex 实时渲染，无截图出图等待。
+ * 恒 true —— 渲染层直接消费 token.text，官方 WAIT 语义不再需要。
  */
 export function isMathConcluded(
   latex: string,
   displayMode: boolean,
 ): boolean {
-  if (latex.length == 0) {
-    return false;
-  }
-  return getMathCache(mathCacheKey(latex, displayMode)) != null;
+  return true;
 }
 
 /** 是否为无序或有序列表行。 */
@@ -1119,7 +808,7 @@ function prepareMarkdownForFallback(markdown: string): string {
 }
 
 /**
- * 将段落中的 $$...$$ / \\[...\\] 拆成独立行，适配 katex-el 块级渲染。
+ * 将段落中的 $$...$$ / \\[...\\] 拆成独立行，适配块级公式渲染。
  * 注意：若行内已有块级定界符，不能整行跳过，否则会连同前后正文一起留在段落里显示源码。
  * 真正的表格管道行跳过，避免拆散 | cell | $math$ |。
  */
@@ -1144,7 +833,7 @@ function normalizeInlineMath(markdown: string): string {
       output.push(line);
       continue;
     }
-    // 标题行：保留行内 $a_1$，由 heading + katex-el 混排渲染
+    // 标题行：保留行内 $a_1$，由 heading + nuwax-katex 混排渲染
     const headingTrim = line.trim();
     let headingMarks = 0;
     while (
@@ -2262,6 +1951,11 @@ function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
   return extraction;
 }
 
+/**
+ * 数学公式渲染：nuwax-katex 实时渲染，只消费 token.text（LaTeX）。
+ * 不再派发截图（原生 SVG / proxy katexRender），也不再回填 html/href/width/height，
+ * 渲染层（uni-ai-x-msg / uni-ai-msg-table）直接以 :tex 交给 nuwax-katex。
+ */
 function renderMathToken(
   latex: string,
   token: MarkdownToken,
@@ -2272,66 +1966,14 @@ function renderMathToken(
   if (token.text != safeLatex) {
     token.text = safeLatex;
   }
-  // 磁盘缓存命中：解析阶段直接写回本地路径，冷启动亦可秒开
-  const cacheKey = mathCacheKey(safeLatex, displayMode);
-  const cached = getMathCache(cacheKey);
-  if (cached != null) {
-    applyMathResultToToken(token, cacheEntryToRes(cached));
-    let useAppQueueHit = false;
-    // #ifdef APP
-    useAppQueueHit = true;
-    // #endif
-    if (useAppQueueHit == false) {
-      callback();
-    }
-    return;
-  }
-  // App：解析期入队，出口批量截图；H5：不入队，单条即时 katexRender → resultHtml
-  let useAppQueue = false;
-  // #ifdef APP
-  useAppQueue = true;
-  // #endif
-  if (useAppQueue == true) {
-    const queue = currentMathJobs();
-    if (queue != null) {
-      mathJobSeq = mathJobSeq + 1;
-      const id =
-        (token.uniqueId != null && `${token.uniqueId}`.length > 0
-          ? `${token.uniqueId}`
-          : "math") +
-        "-" +
-        mathJobSeq;
-      queue.push(new PendingMathJob(id, safeLatex, token, displayMode));
-      return;
-    }
-  }
-  // H5 / 无队列：单条即时渲染。走 MathRendererCore（H5/MP 走 proxyWebBackend 出 resultHtml）
-  mathRenderer.render(safeLatex, displayMode, (res: MathRenderResult): void => {
-    const u = new UTSJSONObject();
-    if (res.href.length > 0) {
-      u["imageDataURL"] = res.href;
-    }
-    if (res.html.length > 0) {
-      u["resultHtml"] = res.html;
-    }
-    if (res.width > 0) {
-      u["width"] = res.width;
-    }
-    if (res.height > 0) {
-      u["height"] = res.height;
-    }
-    applyMathResultToToken(token, u);
-    callback();
-  });
+  // 忽略 displayMode/callback：nuwax-katex 由渲染位置决定块级/行内，无需等待异步出图。
 }
 
 /**
  * 异步渲染 mermaid 代码块（App 流式/历史走 fallback，cmark 路径触达不到）。
- * 参考 renderMathToken 的 whenReady/回调刷帧模式：webview 未就绪则等待，结果回填 token.href（+width/height）。
- * mermaid 量少，单条直调，不进 KaTeX 并发队列。
+ * webview 未就绪则等待，结果回填 token.href（+width/height）。mermaid 量少，单条直调。
  *
- * 去重/缓存（与公式 MathBatchUiRunner + mathInFlightTokens 对齐）：
- * 流式 live 区每 flush 重解析，闭合 mermaid 块若滞留 live 区会每帧重发 proxy 截图 →
+ * 去重/缓存：流式 live 区每 flush 重解析，闭合 mermaid 块若滞留 live 区会每帧重发 proxy 截图 →
  * 灌满 proxy 串行 mermaidQueue → 全部超时失败（"图表渲染失败"）+ href 每帧变 → 抖动。
  * 故同 text：成功结果缓存命中直填（零 proxy 调用）、在途去重扇出、失败短期冷却不每帧重试。
  */
@@ -2545,7 +2187,7 @@ function highlightCodeBlock(
   });
 }
 
-/** 为行内 math token 触发 KaTeX 渲染（异步回填 html/href/width/height）。 */
+/** 为行内 math token 写入 LaTeX（nuwax-katex 由渲染层从 token.text 实时渲染）。 */
 function scheduleInlineMathRender(
   tokens: MarkdownToken[],
   onMathRendered: MathRenderedCallback,
@@ -2677,10 +2319,8 @@ function tryAppendTableContinuation(
 /**
  * 标准 App 基座缺少 uni-cmark 原生库时的纯 UTS Markdown 解析。
  * 支持标题、段落、粗体、行内代码、分隔线、表格、代码块及块级数学公式。
- * - App：根调用收集公式 → 并行截图 → 按 chunk（默认 8）分批回调上屏
- * - H5：不走批量队列，解析中单条 katexRender（resultHtml + v-html，原逻辑）
- * @param deferMathFlush App 流式 live 区：只建 math token、不派发 KaTeX/WebView；
- *   冻结前缀（已闭合公式）应传 false，逐段 flush。终态 full parse 也传 false。
+ * 公式由 nuwax-katex 实时渲染（token 只带 text），无需截图批处理与出图等待。
+ * @param deferMathFlush 保留兼容位：nuwax-katex 无延迟派发语义，忽略。
  */
 export function parseAppMarkdownFallback(
   markdown: string,
@@ -2689,24 +2329,7 @@ export function parseAppMarkdownFallback(
 ): UniAiMarkdownElItem[] {
   // #ifdef APP
   try {
-    let useAppBatch = false;
-    useAppBatch = true;
-    if (useAppBatch != true) {
-      lastMathFlushCount = 0;
-      return parseAppMarkdownFallbackInner(markdown, onMathRendered);
-    }
-    mathJobStack.push(new MathJobFrame());
-    const parsed = parseAppMarkdownFallbackInner(markdown, onMathRendered);
-    if (deferMathFlush == true) {
-      // live：丢弃本帧 jobs，token 保留 latex 占位；进入冻结区 / 终态再截图
-      mathJobStack.pop();
-      lastMathFlushCount = 0;
-      return parsed;
-    }
-    const jobCount = flushMathJobs(onMathRendered);
-    mathJobStack.pop();
-    lastMathFlushCount = jobCount;
-    return parsed;
+    return parseAppMarkdownFallbackInner(markdown, onMathRendered);
   } catch (e) {
     // 终极兜底（仅 APP）：fallback 解析任何异常都不得让整条消息空白，
     // 回退为纯文本段落，保证后续内容 / 消息主体可渲染。
@@ -2714,18 +2337,11 @@ export function parseAppMarkdownFallback(
       "[MarkdownFallback] parse crashed, fallback to plain text. err=" +
         (e != null ? `${e}` : "unknown"),
     );
-    try {
-      mathJobStack.pop();
-    } catch (_ePop) {
-      // ignore
-    }
-    lastMathFlushCount = 0;
     return buildPlainTextFallbackItems(markdown);
   }
   // #endif
   // #ifndef APP
   // 非 APP（H5/小程序）：保持原逻辑，不引入 try/catch 兜底，行为严格不变。
-  lastMathFlushCount = 0;
   return parseAppMarkdownFallbackInner(markdown, onMathRendered);
   // #endif
 }

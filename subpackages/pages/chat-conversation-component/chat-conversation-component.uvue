@@ -99,16 +99,6 @@
           <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
           <text class="perf-overlay-chip" @click="toggleVirtualScroll">虚拟滚动 ·点击切换</text>
         </view>
-        <!-- 虚拟滚动调试浮层（always-on 开发期）：fps/maxGap + 窗口化指标 -->
-        <view v-if="showVsxDebug" class="vsx-debug-overlay" @click="toggleVirtualScroll">
-          <text class="vsx-debug-title">virtual-scroll-x · 点击{{ virtualEnabled ? '关闭' : '开启' }}</text>
-          <text class="vsx-debug-line">fps {{ vsxDebugFps }} · maxGap {{ vsxDebugMaxGap }}ms</text>
-          <text class="vsx-debug-line">total {{ vsxStats['total'] ?? 0 }} · mounted {{ vsxStats['mounted'] ?? 0 }}</text>
-          <text class="vsx-debug-line">range [{{ vsxStats['winStart'] ?? 0 }}, {{ vsxStats['winEnd'] ?? 0 }})</text>
-          <text class="vsx-debug-line">top {{ vsxStats['topSpacer'] ?? 0 }}px · bottom {{ vsxStats['bottomSpacer'] ?? 0 }}px</text>
-          <text class="vsx-debug-line">preload {{ (((vsxStats['topSpacer'] ?? 0) as number) + ((vsxStats['bottomSpacer'] ?? 0) as number)) }}px</text>
-          <text class="vsx-debug-line">scroll {{ vsxStats['scrollTop'] ?? 0 }} · vp {{ vsxStats['viewport'] ?? 0 }}</text>
-        </view>
         <!-- 聊天内容 -->
         <view class="scroll-view-box">
           <!-- 触摸状态跟踪：z-paging-x 不转发 touch 事件，在包裹层监听（原生事件冒泡）。
@@ -127,12 +117,16 @@
             ref="pagingXRef"
             :data="virtualListData"
             :item-height="virtualListItemHeight"
-            :buffer-count="10"
+            :buffer-count="VIRTUAL_BUFFER_COUNT"
             list-id="msg-list"
             key-field="id"
             :native-list="false"
             :virtual-scroll="virtualEnabled"
             :scroll-with-animation="scrollWithAnimation"
+            :enable-split="true"
+            :split-max-chars="SPLIT_MAX_CHARS"
+            split-text-field="splitText"
+            :no-split-last="isConversationActive"
             @scrolltoupper="handleScrollToUpper"
             @scroll="onVsxScroll"
           >
@@ -155,18 +149,19 @@
               />
             </template>
 
-            <!-- 消息列表（虚拟窗口渲染，仅可视区 ± buffer） -->
+            <!-- 消息列表（虚拟窗口渲染，仅可视区 ± buffer；enable-split 时超大助手消息按正文片段拆分，
+                 每个片段是独立虚拟单元，片段之间无气泡间隔） -->
             <template #item="sp">
               <view
                 class="msg-list-item"
-                :class="isLastMessage(sp.index) ? 'msg-list-item--last' : ''"
+                :class="resolveItemClassName(sp.item, sp.partIndex, sp.isLastPart)"
               >
                 <!-- 智能体会话消息 -->
                 <UniAiXMsg
                   v-if="isAssistantMessage(sp.item)"
-                  :message-id="getMsgId(sp.item)"
-                  :body-text="resolveAssistantBodyText(sp.item, sp.index)"
-                  :think-text="getAssistantThinkText(sp.item)"
+                  :message-id="resolveItemMessageId(sp.item, sp.partIndex)"
+                  :body-text="resolveItemBodyText(sp.item, sp.partIndex, sp.partText)"
+                  :think-text="resolveItemThinkText(sp.item, sp.partIndex)"
                   :speakable-text="getAssistantSpeakableText(sp.item)"
                   :message-status="getMsgStatus(sp.item)"
                   :processing-list="getAssistantProcessingList(sp.item)"
@@ -174,14 +169,14 @@
                   :conversation-id="`${conversationId}`"
                   :is-app-details="isAppDetails"
                   :message-time="getMsgTime(sp.item)"
-                  :is-last-msg="isLastMessage(sp.index)"
+                  :is-last-msg="isLastMsgItem(sp.item) && sp.isLastPart"
                   :is-conversation-active="isConversationActive"
-                  :show-tool-bar="!(isConversationActive && isLastMessage(sp.index))"
+                  :show-tool-bar="resolveShowToolBar(sp.item, sp.partIndex, sp.isLastPart)"
                   :task-status="getConversationTaskStatus()"
                   @longpress="onlongTapMsg(sp.item)"
                   @changeThinkContent="changeThinkContent"
-                  :id="`msg-item-${getMsgId(sp.item)}_${sp.index}`"
-                  :ref="(el: any) => setMessageRef(el, `${getMsgId(sp.item)}_${sp.index}`)"
+                  :id="`msg-item-${resolveItemRefKey(sp.item, sp.partIndex, sp.isLastPart)}`"
+                  :ref="(el: any) => setMessageRef(el, resolveItemRefKey(sp.item, sp.partIndex, sp.isLastPart))"
                 ></UniAiXMsg>
                 <!-- 用户消息 -->
                 <template v-else>
@@ -807,8 +802,19 @@
   // z-paging-x 模板引用：滚动指令由 ScrollManager 通过闭包获取（Android 禁止跨组件直接类型化）。
   // 闭包返回用 as any 去空：UTS any 优化下 ref<any|null>.value(Any?) 直传会被判类型不匹配（error1）
   const pagingXRef = ref<any | null>(null);
-  const scrollManager = new ScrollManager(data, () => pagingXRef.value as any);
-  /** 消息项预估高度(px)：历史富媒体消息（文本/公式/table/图片）差异大，取较大均值减少初始估计误差 */
+  // ★ 运行时坑：value 未挂载（初入页历史滚底早于列表 mount）时为 null，直接 `as any` 会 NPE
+  // （null cannot be cast to Any）。必须声明可空返回 any|null 并先判空，由 ScrollManager
+  //  的 paging==null 兜底跳过。注意返回类型必须显式写 any|null——UTS 里 `as any` 会推断成
+  //  非空 Any，不写可空声明则 `return null` 编译不过。
+  const scrollManager = new ScrollManager(data, (): any | null => {
+    const v = pagingXRef.value;
+    if (v == null) {
+      return null;
+    }
+    return v as any;
+  });
+  /** 消息项预估高度(px)：历史富媒体消息（文本/公式/table/图片）差异大，取较大均值减少初始估计误差；
+   *   enable-split 后每项为 ≤800 字片段，220 为合理估算，实测后引擎按 key 校准 */
   const virtualListItemHeight = 220;
 
   /** 非空字符串兜底 */
@@ -897,11 +903,59 @@
   // 用 readRawField（三层 fallback 保证读到 MessageInfo 字段）逐字段复制，
   // 不用 normalizeMessageRawToJson（其 JSON.stringify 对类实例在 Android 可能失效丢 text）。
   // 用 watch + ref（对齐 activeInterventionQueue 模式），避免 computed 每 40ms 触发渲染 effect。
+  /** 虚拟窗口缓冲条数（拆分后每片为小单元，缓冲 5 条即可覆盖预渲染；原 10 会一次挂载更多片段） */
+  const VIRTUAL_BUFFER_COUNT: number = 5;
+  /** enable-split 拆分阈值：单条助手正文超过该字符数才拆（代码块/表格/公式为原子单位不切断）。
+   *  800 字 ≈ 1~2 屏，保证每个拆分片段的挂载/解析/公式成本有界。 */
+  const SPLIT_MAX_CHARS: number = 800;
   const VIRTUAL_MSG_FIELDS: string[] = [
     "id", "text", "think", "time", "status", "speakableText",
     "attachments", "messageType", "role", "index",
     "processingList", "markdownElList",
   ];
+  /** 是否助手消息（const 箭头，须先于 virtualListData watch 声明；isAssistantMessage 在其后定义） */
+  const isAssistantRawItem = (item: any | null): boolean => {
+    if (item == null) {
+      return false;
+    }
+    const typeVal = readRawField(item, "messageType");
+    const roleVal = readRawField(item, "role");
+    const typeStr = typeVal != null ? `${typeVal}` : "";
+    const roleStr = roleVal != null ? `${roleVal}` : "";
+    return typeStr.indexOf("ASSISTANT") >= 0 || roleStr.indexOf("ASSISTANT") >= 0;
+  };
+  /** 拆分安全判定：含自定义标签（tool 卡/容器/会话卡）的消息不拆。
+   *  TextSplitter 不保护自定义标签，片段边界切断标签会导致工具卡残缺；
+   * 且此类消息通常不是公式/表格/代码密集，单条挂载成本可控。
+   *  检测面与 aiMsgMarkdownParser.hasCustomMarkup 对齐。 */
+  const canSplitBody = (body: string): boolean => {
+    return (
+      body.indexOf("markdown-custom-process") < 0 &&
+      body.indexOf(":::container") < 0 &&
+      body.indexOf("<task-result") < 0 &&
+      body.indexOf("<conversation") < 0
+    );
+  };
+
+  /** 构造虚拟列表项：业务字段快照 + splitText（仅助手消息填充，供 enable-split 按正文拆分；
+   *  用户气泡留空 → 永不拆分，避免长用户消息被切成多个气泡） */
+  const buildVirtualMsg = (item: MessageInfo): UTSJSONObject => {
+    const o = new UTSJSONObject();
+    for (let k = 0; k < VIRTUAL_MSG_FIELDS.length; k++) {
+      const key = VIRTUAL_MSG_FIELDS[k];
+      const v = readRawField(item, key);
+      if (v != null) {
+        o[key] = v;
+      }
+    }
+    if (isAssistantRawItem(item)) {
+      const textRaw = readRawField(item, "text");
+      if (textRaw != null && canSplitBody(`${textRaw}`)) {
+        o["splitText"] = textRaw;
+      }
+    }
+    return o;
+  };
   /** 规范化结果缓存（按数组索引）：流式期只有最后一条变化，前面消息复用缓存，避免每 40ms 全量复制 */
   const virtualMsgCache = new Map<string, UTSJSONObject>();
   let virtualMsgCacheLen = -1;
@@ -923,14 +977,7 @@
         if (cached != null) {
           if (i == lastIdx) {
             // 最后一条（流式增长/状态变化）：全量重建保证字段最新
-            const fresh = new UTSJSONObject();
-            for (let k = 0; k < VIRTUAL_MSG_FIELDS.length; k++) {
-              const key = VIRTUAL_MSG_FIELDS[k];
-              const v = readRawField(item, key);
-              if (v != null) {
-                fresh[key] = v;
-              }
-            }
+            const fresh = buildVirtualMsg(item);
             virtualMsgCache.set(cacheKey, fresh);
             next.push(fresh);
           } else {
@@ -938,14 +985,7 @@
           }
           continue;
         }
-        const o = new UTSJSONObject();
-        for (let k = 0; k < VIRTUAL_MSG_FIELDS.length; k++) {
-          const key = VIRTUAL_MSG_FIELDS[k];
-          const v = readRawField(item, key);
-          if (v != null) {
-            o[key] = v;
-          }
-        }
+        const o = buildVirtualMsg(item);
         virtualMsgCache.set(cacheKey, o);
         next.push(o);
       }
@@ -1302,13 +1342,82 @@
     return raw != null ? `${raw}` : "";
   }
 
+  /** 是否消息列表最后一条（按 id 判定）。enable-split 后 sp.index 是片段下标，不再等于 messageList 下标 */
+  const isLastMsgItem = (item: any | null): boolean => {
+    const list = messageList.value;
+    if (list.length == 0 || item == null) {
+      return false;
+    }
+    const lastId = getMsgId(list[list.length - 1]);
+    return lastId.length > 0 && lastId == getMsgId(item);
+  };
+
+  /**
+   * 消息 ref 稳定键：与 Service 层 updateMessageComponent emit 键（`${msgId}_${message.index}`）对齐。
+   * 拆分片段非末片追加 `_p{partIndex}`（末片用基础键，保证流式末条能被叶子 patch 命中）；
+   * 不用 sp.index（拆分后与 messageList 下标错位，且 emit 键与下标无关）。
+   */
+  function resolveItemRefKey(
+    item: any | null,
+    partIndex: number,
+    isLastPart: boolean,
+  ): string {
+    const msgId = getMsgId(item);
+    const idxRaw = readRawField(item, "index");
+    const idx = idxRaw != null ? `${idxRaw}` : "null";
+    if (partIndex >= 0 && isLastPart != true) {
+      return `${msgId}_${idx}_p${partIndex}`;
+    }
+    return `${msgId}_${idx}`;
+  }
+
+  /** 消息组件 messageId（拆分片段带片段后缀：历史错峰解析按末位 hash 错开，避免同消息多片段同帧解析） */
+  function resolveItemMessageId(item: any | null, partIndex: number): string {
+    const msgId = getMsgId(item);
+    if (partIndex >= 0) {
+      return `${msgId}_p${partIndex}`;
+    }
+    return msgId;
+  }
+
+  /** 工具条：活跃流式末条隐藏；拆分消息仅末片段展示（工具条位于气泡底部） */
+  function resolveShowToolBar(
+    item: any | null,
+    partIndex: number,
+    isLastPart: boolean,
+  ): boolean {
+    if (isConversationActive.value && isLastMsgItem(item)) {
+      return false;
+    }
+    if (partIndex >= 0) {
+      return isLastPart;
+    }
+    return true;
+  }
+
+  /** item 类名：末条消息去除底部间距；拆分片段非末片也去除（同气泡视觉连续，无分隔） */
+  function resolveItemClassName(
+    item: any | null,
+    partIndex: number,
+    isLastPart: boolean,
+  ): string {
+    let cls = "msg-list-item";
+    if (isLastMsgItem(item) && isLastPart == true) {
+      cls += " msg-list-item--last";
+    }
+    if (partIndex >= 0 && isLastPart != true) {
+      cls += " msg-list-item--part";
+    }
+    return cls;
+  }
+
   /**
    * 流式会话中最后一条助手消息优先走 streamingAssistantText，
    * 避免 iOS / H5 上 MessageInfo 批量更新或 Markdown 打字机导致气泡不刷新。
    * 服务端可能改写助手 id，故不能仅做严格 id 相等；新一轮发送前会 clear 通道防串文。
-   * 不拆分后 listIndex 与 messageList 下标对齐，用索引判定末条。
+   * enable-split 后 sp.index 不再等于 messageList 下标，末条判定改用 id 比对。
    */
-  function resolveAssistantBodyText(item: any | null, listIndex: number): string {
+  function resolveAssistantBodyText(item: any | null): string {
     // Android 活跃流由 updateMessage → 叶子 renderer 直更。若模板再读取
     // streamingAssistantText，每个 chunk 都会让整层会话组件参与 VDOM diff，
     // 抵消叶子快通道；首次挂载/离屏回挂由 item 快照 + ComponentManager 补齐。
@@ -1317,26 +1426,22 @@
       return getAssistantBodyText(item);
     }
     // #endif
-    if (isConversationActive.value) {
-      const list = messageList.value;
-      if (list.length - 1 == listIndex) {
-        const streamText = streamingAssistantText.value;
-        if (streamText.length > 0) {
-          const streamMsgId = streamingAssistantMessageId.value;
-          const itemIdRaw = readRawField(item, "id");
-          const itemId = itemIdRaw != null ? `${itemIdRaw}` : "";
-          if (
-            streamMsgId.length == 0 ||
-            itemId.length == 0 ||
-            itemId == streamMsgId
-          ) {
-            return streamText;
-          }
-          // id 已被服务端改写，但流式正文不短于列表项：仍走打字机通道
-          const itemText = getAssistantBodyText(item);
-          if (streamText.length >= itemText.length) {
-            return streamText;
-          }
+    if (isConversationActive.value && isLastMsgItem(item)) {
+      const streamText = streamingAssistantText.value;
+      if (streamText.length > 0) {
+        const streamMsgId = streamingAssistantMessageId.value;
+        const itemId = getMsgId(item);
+        if (
+          streamMsgId.length == 0 ||
+          itemId.length == 0 ||
+          itemId == streamMsgId
+        ) {
+          return streamText;
+        }
+        // id 已被服务端改写，但流式正文不短于列表项：仍走打字机通道
+        const itemText = getAssistantBodyText(item);
+        if (streamText.length >= itemText.length) {
+          return streamText;
         }
       }
     }
@@ -1353,6 +1458,26 @@
       return `${thinkRaw}`;
     }
     return "";
+  }
+
+  /** 思考区：仅首片段展示（思考位于消息顶部，其余片段不重复渲染） */
+  function resolveItemThinkText(item: any | null, partIndex: number): string {
+    if (partIndex >= 0 && partIndex != 0) {
+      return "";
+    }
+    return getAssistantThinkText(item);
+  }
+
+  /** 正文：拆分片段用片段文本（每片独立解析、独立渲染）；未拆分走原逻辑（流式末条打字机通道） */
+  function resolveItemBodyText(
+    item: any | null,
+    partIndex: number,
+    partText: string,
+  ): string {
+    if (partIndex >= 0) {
+      return partText;
+    }
+    return resolveAssistantBodyText(item);
   }
 
   /** 预计算的可播报正文（工具栏优先使用，避免点击时再过滤） */
@@ -1654,10 +1779,6 @@
     feedHeadlessStreamSpeakNow(false, bodyText, messageId);
   }
 
-  /** 是否消息列表最后一条（不拆分后 renderParts 下标 == messageList 下标，直接用索引判定） */
-  const isLastMessage = (listIndex: number): boolean => {
-    return messageList.value.length - 1 == listIndex;
-  };
 
   /** Android：API 返回字符串，禁止 string as TaskStatus；const 箭头函数不可递归 */
   const parseTaskStatus = (val: any | null): TaskStatus | null => {
@@ -2021,7 +2142,6 @@
     }
     const scrollTop = e.detail.scrollTop;
     data.scrollTop.value = scrollTop;
-    // 调试浮层窗口范围由 vsx 调试探针 pullVsxStats() 每 500ms 拉取（scroll 高频路径不重复调用）
     // 读滚动容器 metrics（nuwax-virtual-list 根容器 list-id=msg-list；uni.getElementById 取栈顶页元素，
     // 聊天页为当前页时可达，与原 msg-list 读取方式一致）
     let scrollHeight = 0;
@@ -3033,92 +3153,11 @@
     perfProbeRunning = false;
   }
 
-  // ==================== 虚拟滚动调试浮层（always-on 开发期）====================
-  // 与 perfMock 探针独立：无论是否 Mock 模式，进会话页即展示虚拟滚动窗口实时状态 +
-  // 帧率（fps/maxGap）。便于滚动 / 流式时直观观察窗口化效果与掉帧。
-  const showVsxDebug = ref<boolean>(true);
-  const vsxDebugFps = ref<string>("--");
-  const vsxDebugMaxGap = ref<string>("--");
-  const vsxStats = ref<UTSJSONObject>({
-    total: 0,
-    winStart: 0,
-    winEnd: 0,
-    mounted: 0,
-    topSpacer: 0,
-    bottomSpacer: 0,
-    scrollTop: 0,
-    viewport: 0,
-    enabled: true,
-  } as UTSJSONObject);
   /** 虚拟滚动总开关（perf 浮层 A/B：虚拟滚动 vs 全量渲染，绑 nuwax-virtual-list :virtual-scroll） */
   const virtualEnabled = ref<boolean>(true);
   const toggleVirtualScroll = (): void => {
     virtualEnabled.value = !virtualEnabled.value;
   };
-  let vsxDebugProbeOn = false;
-  let vsxFpsLastAt = 0;
-  let vsxFrames = [] as number[];
-  let vsxFpsAccum = 0;
-  let vsxMaxGap = 0;
-  const VSX_DEBUG_FLUSH_MS = 500;
-
-  /** 从列表 ref 拉一次统计（$callMethod 字符串调度，UTS 约定）。
-   *  nuwax-virtual-list 暂未 expose getStats（仅 getScrollTop），$callMethod 返回 null →
-   *  vsxStats 保持默认（窗口区显示 0）；后续给组件补 getStats expose 后再启用。 */
-  const pullVsxStats = (): void => {
-    const v = pagingXRef.value;
-    if (v == null) return;
-    try {
-      const s = (v as ComponentPublicInstance).$callMethod("getStats") as UTSJSONObject;
-      if (s != null) vsxStats.value = s;
-    } catch (_e) {}
-  };
-
-  /**
-   * 调试帧探针：async + while(flag) 自调度（与 perfMock 探针同模式，UTS 编译安全）。
-   * - 帧间隔滑窗 120 样本 → fps / maxGap
-   * - 每 VSX_DEBUG_FLUSH_MS(500ms) flush 一次浮层 + 拉一次 getStats()
-   */
-  async function vsxDebugTickLoop(): Promise<void> {
-    vsxFpsLastAt = Date.now();
-    while (vsxDebugProbeOn) {
-      const now = Date.now();
-      const delta = now - vsxFpsLastAt;
-      vsxFpsLastAt = now;
-      vsxFrames.push(delta);
-      if (vsxFrames.length > 120) vsxFrames.splice(0, vsxFrames.length - 120);
-      vsxFpsAccum += delta;
-      if (delta > vsxMaxGap) vsxMaxGap = delta;
-      if (vsxFpsAccum >= VSX_DEBUG_FLUSH_MS) {
-        let sum = 0;
-        for (let i = 0; i < vsxFrames.length; i++) sum += vsxFrames[i];
-        const cnt = vsxFrames.length;
-        const avg = cnt > 0 ? sum / cnt : 0;
-        const fps = avg > 0 ? 1000 / avg : 0;
-        vsxDebugFps.value = `${fps.toFixed(0)}`;
-        vsxDebugMaxGap.value = `${vsxMaxGap}`;
-        vsxFpsAccum = 0;
-        vsxMaxGap = 0;
-        pullVsxStats();
-      }
-      await new Promise<void>((resolve) => {
-        setTimeout((): void => resolve(), 16);
-      });
-    }
-  }
-
-  function startVsxDebugProbe(): void {
-    if (vsxDebugProbeOn) return;
-    vsxFrames = [] as number[];
-    vsxFpsAccum = 0;
-    vsxMaxGap = 0;
-    vsxDebugProbeOn = true;
-    vsxDebugTickLoop();
-  }
-
-  function stopVsxDebugProbe(): void {
-    vsxDebugProbeOn = false;
-  }
 
   watch(
     (): boolean => isConversationActive.value == true,
@@ -3154,7 +3193,6 @@
   onUnload((): void => {
     resumeEventPollingAfterChat();
     stopPerfFrameProbe();
-    stopVsxDebugProbe();
     // #ifdef APP
     // 断开 markdown-proxy 单例对 webviewContext 的强引用（GC root），
     // 否则返回上一页后 Activity + WebView 无法回收 → 反复进聊天累积泄漏。
@@ -3789,7 +3827,7 @@
     runOnMountedAsync();
   });
 
-  // 虚拟滚动实测由 <virtual-scroll-x> 插件内部 onUpdated + measureNow 自行调度
+  // 虚拟滚动实测由 nuwax-virtual-list 内部 onUpdated + measureNow 自行调度
   // （含 stickToBottom 末条每轮重测，覆盖流式高度增长）；组件不再手动 measureNow。
 
   // Activity 泄漏修复：onUnload 做全面清理（比 onUnmounted 更可靠——页面级卸载，
@@ -3919,29 +3957,6 @@
     border-radius: 4px;
   }
 
-  /* 虚拟滚动调试浮层（左上角，与 perf-overlay 分置两侧） */
-  .vsx-debug-overlay {
-    position: fixed;
-    top: 88px;
-    left: 12px;
-    z-index: 9999;
-    padding: 8px 10px;
-    background-color: rgba(0, 0, 0, 0.7);
-    border-radius: 8px;
-    flex-direction: column;
-  }
-  .vsx-debug-title {
-    color: #4fc3f7;
-    font-size: 22rpx;
-    font-weight: 600;
-    margin-bottom: 4px;
-  }
-  .vsx-debug-line {
-    color: #00e676;
-    font-size: 20rpx;
-    line-height: 28rpx;
-  }
-
   /* 首次加载历史会话：全局 loading 图标（与会话加载图标一致）。
      fixed 全屏定位：完全脱离文档流，底部组件列表先渲染也不会把图标挤走，视口居中即可。 */
   .page-loading {
@@ -4030,7 +4045,7 @@
   }
 
   /*
-   * 非消息态浮层：消息列表改由 <virtual-scroll-x> 托管后，loading-more / suggest /
+   * 非消息态浮层：消息列表改由 nuwax-virtual-list 托管后，loading-more / suggest /
    * task-executing-loading 不再进入虚拟切片，改为 .scroll-view-box（position:relative）内绝对定位浮层。
    */
   .msg-overlay {
@@ -4060,7 +4075,7 @@
     right: auto;
   }
 
-  /* 空状态：无消息时替换 <virtual-scroll-x>，填充 .msg-list 并纵向布局。
+  /* 空状态：无消息时替换 nuwax-virtual-list，填充 .msg-list 并纵向布局。
      uvue <view> 不可滚动；new-conversation-set 内部自带 scroll-view，空态整体较短无需外滚。 */
   .msg-list-empty {
     flex: 1;

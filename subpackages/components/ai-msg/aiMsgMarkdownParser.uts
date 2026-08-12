@@ -6,7 +6,6 @@ import { initCmark, isCmarkReady, md2json } from "@/uni_modules/uni-cmark";
 import { MsgItem } from "@/types/interfaces/ai-msg";
 import {
   parseAppMarkdownFallback,
-  takeLastMathFlushCount,
   isMathConcluded,
 } from "@/subpackages/components/ai-msg/appMarkdownFallback.uts";
 import { expandMarkdownImageItems } from "@/subpackages/components/ai-msg/markdownImage.uts";
@@ -403,11 +402,88 @@ export class AiMsgMarkdownParser {
   }
 
   /**
+   * 流式行内 $...$ 判定（与 fallback parseInline 的 findInlineMathStart 语义对齐）：
+   * 找到一对「闭合且非 $$」的 $ 定界，且内容像 LaTeX 才算命中。
+   * 内容判定保持保守，避免 $100 / $var / "$5 and $10" 这类误入 fallback。
+   * 未闭合（流式半截）直接判无，等闭合后再由本轮 body 变化重新触发判定。
+   */
+  private bodyHasInlineMathDollar(body: string): boolean {
+    const n = body.length;
+    let i = 0;
+    while (i < n) {
+      if (body.charAt(i) != "$") {
+        i++;
+        continue;
+      }
+      // $$ 块公式跳过（外层已有单独判定）
+      if (i + 1 < n && body.charAt(i + 1) == "$") {
+        i += 2;
+        continue;
+      }
+      const end = body.indexOf("$", i + 1);
+      if (end <= i + 1) {
+        // 流式半截 / 空公式：视为未闭合
+        return false;
+      }
+      // 闭合 $ 后紧跟另一个 $（成 $$）不是行内公式，跳过继续找
+      if (end + 1 < n && body.charAt(end + 1) == "$") {
+        i = end + 2;
+        continue;
+      }
+      const inner = body.substring(i + 1, end);
+      if (this.inlineMathInnerLooksLikeLatex(inner) == true) {
+        return true;
+      }
+      i = end + 1;
+    }
+    return false;
+  }
+
+  /** 行内 $...$ 内容是否像 LaTeX：反斜杠命令 / 上下标 / 花括号 / 含字母的等号式 / 字母数字混排。 */
+  private inlineMathInnerLooksLikeLatex(inner: string): boolean {
+    if (inner.length < 1 || inner.length > 800) {
+      return false;
+    }
+    if (inner.indexOf("\\") >= 0) {
+      return true;
+    }
+    if (inner.indexOf("^") >= 0 || inner.indexOf("_") >= 0) {
+      return true;
+    }
+    if (inner.indexOf("{") >= 0 || inner.indexOf("}") >= 0) {
+      return true;
+    }
+    if (inner.indexOf("=") >= 0) {
+      // E=mc^2 / y = kx + b
+      for (let i = 0; i < inner.length; i++) {
+        const ch = inner.charAt(i);
+        if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")) {
+          return true;
+        }
+      }
+    }
+    // 字母数字混排：x2 / 2x / k1（覆盖 $2x + 3y$ 这类）
+    for (let i = 0; i + 1 < inner.length; i++) {
+      const c = inner.charAt(i);
+      const d = inner.charAt(i + 1);
+      const cIsDigit = c >= "0" && c <= "9";
+      const dIsDigit = d >= "0" && d <= "9";
+      const cIsLetter = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+      const dIsLetter = (d >= "a" && d <= "z") || (d >= "A" && d <= "Z");
+      if ((cIsLetter && dIsDigit) || (cIsDigit && dIsLetter)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * App：结构块优先走 fallback（与 code 对齐）。
    * 判定尽量收窄，避免普通正文里的单个 `|` / `$100` 误触发：
    * - code：```
    * - 图片：![
    * - 块级公式：$$ / \[ / \(
+   * - 行内公式：$...$ 且内容像 LaTeX（App 流式无 $$ 时也能命中，走 nuwax-katex）
    * - 表格：同时出现 | 与对齐分隔（---|:-- 等）
    * - 反引号内常见 LaTeX（\frac 等）：须 promote 后走 KaTeX
    */
@@ -419,6 +495,11 @@ export class AiMsgMarkdownParser {
       return true;
     }
     if (body.indexOf("$$") >= 0) {
+      return true;
+    }
+    // 行内 $...$（无 $$ / \[ / \( 的裸行内公式）：命中才进 fallback → nuwax-katex，
+    // 否则 App 流式 cmark 会把 $x^2$ 当纯文本露出裸源码
+    if (this.bodyHasInlineMathDollar(body) == true) {
       return true;
     }
     if (body.indexOf("\\[") >= 0 || body.indexOf("\\(") >= 0) {
@@ -482,7 +563,7 @@ export class AiMsgMarkdownParser {
     return false;
   }
 
-  /** fallback 结果是否已含结构组件（code/math/table/image）。 */
+  /** fallback 结果是否已含结构组件（code/math/table/image）或行内公式 token。 */
   private renderListHasStructuralEl(): boolean {
     const list = this.msg.value.markdownElList;
     for (let i = 0; i < list.length; i++) {
@@ -495,6 +576,17 @@ export class AiMsgMarkdownParser {
         type == "image"
       ) {
         return true;
+      }
+      // 行内公式（paragraph/list/heading/block_quote 混排）：math token 也算结构，
+      // 否则「仅行内 $ 公式」的消息在 applyAppFallback 早退判断里 structuralOk=false，每 tick 重复全量解析
+      const datasList = list[i].datasList;
+      for (let rowIndex = 0; rowIndex < datasList.length; rowIndex++) {
+        const row = datasList[rowIndex];
+        for (let tokenIndex = 0; tokenIndex < row.length; tokenIndex++) {
+          if (row[tokenIndex].type == "math") {
+            return true;
+          }
+        }
       }
     }
     return false;
@@ -666,9 +758,8 @@ export class AiMsgMarkdownParser {
     this.msg.value.rendered = true;
     this.lastFinishedBody = body;
     this.bumpRevision();
-    if (takeLastMathFlushCount() == 0) {
-      uni.$emit("ai-msg-content-ready", null);
-    }
+    // nuwax-katex 无异步截图回填，解析完成即内容就绪
+    uni.$emit("ai-msg-content-ready", null);
   }
 
   /**
@@ -828,9 +919,8 @@ export class AiMsgMarkdownParser {
     this.msg.value.rendered = true;
     this.lastFinishedBody = body;
     this.bumpRevision();
-    if (takeLastMathFlushCount() == 0) {
-      uni.$emit("ai-msg-content-ready", null);
-    }
+    // nuwax-katex 无异步截图回填，解析完成即内容就绪
+    uni.$emit("ai-msg-content-ready", null);
   }
 
   /** cmark 回调 token 列表的便宜指纹：长度 + 末 token 的 uniqueId|text。

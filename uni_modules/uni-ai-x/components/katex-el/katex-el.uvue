@@ -3,6 +3,7 @@
         class="katex-el"
         :class="[`ui-theme-${uiTheme}`, inline == true ? 'katex-el-inline' : '']"
         :style="rootStyle"
+        @longpress="onLongPress"
     >
         <!-- #ifdef WEB -->
         <view class="katex" v-if="html != null && html.length > 0" v-html="html"></view>
@@ -44,6 +45,13 @@
         preserveSize?: boolean
     }>()
 
+    /** 根 view 上的原生 longpress 向上 emit，供父级（如 <x-math>）做导出/复制。
+     *  uvue 自定义组件边界不自动冒泡原生手势，故在此显式转发。 */
+    const emit = defineEmits(['longpress'])
+    const onLongPress = (): void => {
+        emit('longpress')
+    }
+
     /**
      * 行内公式目标高度（约等于正文 15~16px 字号下的 KaTeX 行盒）。
      * 标题等场景若回传物理像素/大画布尺寸，按此高度等比缩小。
@@ -67,7 +75,8 @@
         return htmlLen == 0 && hrefLen == 0
     })
 
-    /** 占位：优先用已知 height（缓存预填），减少出图后高度跳动 */
+    /** 占位：优先用已知 height（缓存预填），减少出图后高度跳动。
+     *  块级用逻辑展示高（natH/pixelRatio + 纵向封顶，与 imageStyle 一致），避免物理 px 占位 → 逻辑 px 出图的 2.5x 高度跳。 */
     const placeholderStyle = computed((): string => {
         const knownH = props.height ?? 0
         if (props.inline == true) {
@@ -77,6 +86,7 @@
             return 'width:120rpx;min-height:' + appInlineMinHeight + ';background-color:transparent;'
         }
         if (knownH > 0) {
+            // 块级占位先用 props.height（物理 px）临时占位（UTS 先声明后引用：此处先于 resolveBlockDisplayHeight 定义，不能引用它）；出图后 imageStyle 切到逻辑 dp
             return 'width:100%;height:' + knownH + 'px;background-color:transparent;'
         }
         return 'width:100%;min-height:' + appBlockMinHeight + ';background-color:transparent;'
@@ -118,27 +128,143 @@
         return INLINE_TARGET_HEIGHT
     }
 
-    /** 宽扁公式最小展示高度：高宽比大的公式被 widthFix 压得很矮难读，至少拉到该高度。
-     *  仅对宽扁公式（aspect ≥ BLOCK_WIDE_ASPECT）生效；窄/高公式用自然高度，避免被过度放大触发横滚。 */
+    /** 块级公式展示高度兜底（width/height 缺失时）。 */
     const BLOCK_MIN_DISPLAY_HEIGHT = 44
-    const BLOCK_WIDE_ASPECT = 6
-    function resolveBlockDisplayHeight(): number {
-        const rawW = props.width ?? 0
-        const rawH = props.height ?? 0
-        if (rawH <= 0) return BLOCK_MIN_DISPLAY_HEIGHT
-        if (rawW > 0 && rawW / rawH >= BLOCK_WIDE_ASPECT && rawH < BLOCK_MIN_DISPLAY_HEIGHT) {
-            return BLOCK_MIN_DISPLAY_HEIGHT
+
+    /**
+     * 设备 pixelRatio（物理 px / 逻辑 dp），cached。nuwax-uni-math 原生返回的 natW/natH 是
+     * MathJax viewBox 物理像素，直接当显示尺寸会巨大（E=mc² natW=640 在 360dp 屏占 1.78 屏）。
+     * 除以 pixelRatio 换算到逻辑 dp：640/2.5=256dp，短公式适配屏宽且位图 1:1 清晰。
+     * getWindowInfo 取不到时兜底 2（常见最低密度），保证短公式仍换算不巨大。
+     * 注：native rasterizeSvg 固定 dpiScale=2.5，与设备 pixelRatio(2.0/2.75/3.0) 不完全匹配——
+     * 位图倍率后续可在 native 侧按 pixelRatio 分档优化（见报告），katex-el 此处先保证显示尺寸正确。
+     */
+    let cachedDevicePixelRatio = 0
+    function devicePixelRatio(): number {
+        if (cachedDevicePixelRatio > 0) {
+            return cachedDevicePixelRatio
         }
-        return rawH
+        let pr = 2
+        // #ifdef APP
+        const info = uni.getWindowInfo()
+        const prVal = info.pixelRatio
+        if (prVal > 0) {
+            pr = prVal
+        }
+        // #endif
+        cachedDevicePixelRatio = pr
+        return pr
     }
-    function resolveBlockDisplayWidth(): number {
+
+    /**
+     * 块级公式纵向高度上限（逻辑像素）。横向滚动解决超宽，但竖向公式（h>w）的逻辑高度可能极大，
+     * 直接用会撑爆纵向布局。取屏高 50% 封顶：超限时等比缩放（width 同比，aspectFit 不变形）。
+     * 取不到返回 0 = 不封顶。
+     */
+    let cachedBlockMaxHeight = -1
+    function blockMaxHeight(): number {
+        if (cachedBlockMaxHeight >= 0) {
+            return cachedBlockMaxHeight
+        }
+        let h = 0
+        // #ifdef APP
+        const info = uni.getWindowInfo()
+        const wh = info.windowHeight
+        if (wh > 0) {
+            h = Math.floor(wh * 0.5)
+            if (h < 200) {
+                h = 200
+            }
+        }
+        // #endif
+        cachedBlockMaxHeight = h
+        return h
+    }
+
+    /**
+     * 块级公式逻辑宽度（dp）= natW / pixelRatio。把 native 返回的物理像素换算到逻辑像素：
+     * 短公式（E=mc² 640/2.5=256dp、\frac 794/2.5=318dp）适配 ~328dp 容器宽不巨大；超宽公式
+     * （如长等式 2000/2.5=800dp）原尺寸交外层 scroll-view 横滚（参考 H5 .katex-display
+     * max-width:none + 外层 overflow-x:auto）。位图是 native dpiScale(2.5x) 高清 rasterize，
+     * 逻辑尺寸下接近 1:1 清晰。
+     */
+    function blockLogicalWidth(): number {
         const rawW = props.width ?? 0
-        const rawH = props.height ?? 0
-        if (rawW <= 0 || rawH <= 0) {
+        if (rawW <= 0) {
             return 0
         }
-        const bh = resolveBlockDisplayHeight()
-        return Math.round(rawW * (bh / rawH))
+        return rawW / devicePixelRatio()
+    }
+    /** 块级公式逻辑高度（dp）= natH / pixelRatio。语义同 blockLogicalWidth。 */
+    function blockLogicalHeight(): number {
+        const rawH = props.height ?? 0
+        if (rawH <= 0) {
+            return 0
+        }
+        return rawH / devicePixelRatio()
+    }
+
+    /**
+     * 块级公式纵向缩放因子：仅当逻辑高度 > 屏高 50% 时等比缩放（防极端竖向公式撑爆纵向）。
+     * 宽度不缩——超宽公式保留逻辑原宽，交外层 .msg-root-math-scroll scroll-view 横滚查看，
+     * 不死缩到看不清（参考 H5 .katex-display max-width:none + overflow-x:auto）。
+     * preserveSize（表格单元格）始终 1（表格自管尺寸，不经逻辑换算）。
+     */
+    function blockHeightScale(): number {
+        if (props.preserveSize == true) {
+            return 1
+        }
+        const lh = blockLogicalHeight()
+        if (lh <= 0) {
+            return 1
+        }
+        const maxH = blockMaxHeight()
+        if (maxH > 0 && lh > maxH) {
+            return maxH / lh
+        }
+        return 1
+    }
+
+    /**
+     * 块级公式最终展示宽度（逻辑 dp）：natW / pixelRatio × blockHeightScale。
+     *   - preserveSize（表格单元格）：原 natW（不经逻辑换算，表格自管）
+     *   - 块级：逻辑原宽（超宽交外层 scroll-view 横滚），仅在逻辑高度撑爆纵向时同比缩
+     * 缺 width 返回 0（imageStyle 兜底 width:100%）。
+     */
+    function resolveBlockDisplayWidth(): number {
+        const rawW = props.width ?? 0
+        if (rawW <= 0) {
+            return 0
+        }
+        if (props.preserveSize == true) {
+            return rawW
+        }
+        const lw = blockLogicalWidth()
+        if (lw <= 0) {
+            return 0
+        }
+        return Math.max(1, Math.round(lw * blockHeightScale()))
+    }
+
+    /**
+     * 块级公式最终展示高度（逻辑 dp）：natH / pixelRatio × blockHeightScale。
+     *   - preserveSize（表格单元格）：原 natH
+     *   - 块级：逻辑原高，超过屏高 50% 时封顶（与 width 同比，aspectFit 不变形）
+     * 缺 height 返回 BLOCK_MIN_DISPLAY_HEIGHT 兜底。
+     */
+    function resolveBlockDisplayHeight(): number {
+        const rawH = props.height ?? 0
+        if (rawH <= 0) {
+            return BLOCK_MIN_DISPLAY_HEIGHT
+        }
+        if (props.preserveSize == true) {
+            return rawH
+        }
+        const lh = blockLogicalHeight()
+        if (lh <= 0) {
+            return BLOCK_MIN_DISPLAY_HEIGHT
+        }
+        return Math.max(1, Math.round(lh * blockHeightScale()))
     }
 
     /** 是否已有可展示的公式图（出图后不再保留占位 min-height） */
@@ -148,13 +274,15 @@
 
     const rootStyle = computed((): string => {
         if (props.inline != true) {
-            // App：仅占位阶段占高；优先用已知 height，出图后收起避免底部留白
+            // App：仅占位阶段占高；优先用已知 height（逻辑 dp），出图后收起避免底部留白
             if (hasFormulaImage() == false) {
                 const knownH = props.height ?? 0
                 if (knownH > 0) {
+                    // 块级：用逻辑展示高（natH/pixelRatio + 纵向封顶），与 imageStyle 一致防跳动
+                    const ph = resolveBlockDisplayHeight()
                     return (
                         'height:' +
-                        knownH +
+                        ph +
                         'px;display:flex;flex-direction:column;align-items:center;justify-content:center;'
                     )
                 }
@@ -166,8 +294,9 @@
                     )
                 }
             }
-            // 块级公式已有图：按内容宽度（width:auto），由外层 scroll-view 负责居中/横滚，不再铺满 100%
-            return 'width:auto;'
+            // 块级公式已有图：按内容宽度（width:auto），由外层 .msg-root-math-scroll scroll-view
+            //   负责窄公式居中 / 超宽公式横滚；flex-shrink:0 防 flex 收缩，让超宽横滚生效
+            return 'width:auto;flex-shrink:0;'
         }
         const w = resolveInlineDisplayWidth()
         const h = resolveInlineDisplayHeight()
@@ -207,11 +336,19 @@
 
     const imageStyle = computed((): string => {
         if (props.inline != true) {
-            // 块级：按自然尺寸 + 最小高度渲染（宽扁公式不再被 widthFix 压矮）；超宽由外层 scroll 横滚
-            const bw = resolveBlockDisplayWidth()
-            const bh = resolveBlockDisplayHeight()
-            if (bw > 0) {
-                return 'width:' + bw + 'px;height:' + bh + 'px;'
+            // 块级：容器宽（屏宽-边距）+ 按位图比例 height。native 的 natW/natH 是 mathjax viewBox
+            // 数学坐标（非物理 px），直接当显示尺寸会巨大；但 natH/natW 比例正确 → 用容器宽 + 比例算 height，
+            // aspectFit 不变形、不巨大。超宽公式先缩到容器（保证不撑爆；横滚后续优化）。
+            const rawW = props.width ?? 0
+            const rawH = props.height ?? 0
+            if (rawW > 0 && rawH > 0) {
+                // 块级：目标高度 48px（字号基准），width = 48 × (rawW/rawH) 等比。
+                // 超宽公式（width > 容器）不缩，flex-shrink:0 撑开外层 .msg-root-math-scroll scroll-view 横滚
+                // （scroll-view 初始左对齐）；窄公式（width < 容器）由 .msg-root-math-inner 居中。
+                const targetH = 48
+                const ih = targetH
+                const cw = Math.max(1, Math.round(targetH * rawW / rawH))
+                return 'width:' + cw + 'px;height:' + ih + 'px;flex-shrink:0;'
             }
             return 'width:100%;height:auto;'
         }
@@ -240,6 +377,21 @@
 
 <style lang="scss">
 @import '@/uni_modules/uni-ai-x/static/css/variables.scss';
+    /* 临时渲染标记（N=nnative 绿 / P=proxy 红），右上角小标，验证后统一关闭 */
+    .katex-el-render-mark {
+        position: absolute;
+        right: 0;
+        top: 0;
+        z-index: 999;
+        font-size: 18rpx;
+        color: #ffffff;
+        background-color: #4caf50;
+        padding: 0 6rpx;
+        border-radius: 6rpx;
+    }
+    .katex-el-render-mark-proxy {
+        background-color: #f44336;
+    }
     // #ifdef WEB
     @import './katex.min.scss';
     // 与会话正文一致：白底 + #404040，不跟随 dark theme

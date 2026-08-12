@@ -25,6 +25,17 @@ import { perfRecordParseDetail, sseStallLog } from "@/utils/perfProbe.uts";
  */
 const INCREMENTAL_FALLBACK_ENABLED: boolean = true;
 
+/**
+ * App fallback 每次冻结扩展对应的字符区间与渲染元素。
+ * mixed 流中容器归一化可能改写最近一小段正文；按批记录后只需撤回受影响的尾批，
+ * 不必替换整棵 UniAiXMsgRender。
+ */
+class FallbackStableBatch {
+  start: number = 0;
+  end: number = 0;
+  items: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
+}
+
 /** 给 fallback el 的 uniqueId 加前缀，避免 stable/live 碰撞。 */
 function prefixMarkdownElIds(
   list: UniAiMarkdownElItem[],
@@ -230,6 +241,8 @@ export class AiMsgMarkdownParser {
   private fallbackStablePrefix: string = "";
   /** App 增量 fallback：已冻结的渲染列表（不再随 SSE 重解析）。 */
   private fallbackStableEls: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
+  /** App 增量 fallback：冻结前缀的批次边界，供 mixed 归一化改写时局部回退。 */
+  private fallbackStableBatches: FallbackStableBatch[] = [] as FallbackStableBatch[];
   /** 公式回填批量刷新防抖：攒一批 token 回填后整体刷一次，避免逐条替换 markdownElList
    *  造成高频重渲染、与渲染帧竞争触发 ConcurrentModificationException。 */
   private mathFlushPending: boolean = false;
@@ -239,6 +252,14 @@ export class AiMsgMarkdownParser {
    * 待该公式出图（scheduleMathFlush）后重新增量解析，把公式与后续内容一并上屏。
    */
   private pendingMathReveal: boolean = false;
+  /** cmark 增量打字机：已冻结前缀的渲染元素（同对象引用复用，使 v-for keyed-diff 跳过稳定项）。
+   *  对应 fallback 路径的 fallbackStableEls；纯文本流式把每 tick 的全量 token2el O(n) 降为 O(tail)。 */
+  private cmarkStableEls: UniAiMarkdownElItem[] = [] as UniAiMarkdownElItem[];
+  /** cmark 冻结前缀已覆盖的 token 数（cmarkStableEls 是 image 展开后的元素，二者非 1:1）。 */
+  private cmarkStableTokenCount: number = 0;
+  /** cmark 空转短路指纹：上次 apply 的 (token 长度 + 末 token uniqueId|text)。
+   *  打字机 !isParseDone 时每 40ms 自 tick，无新内容也整树重渲；指纹未变则跳过 apply/bumpRevision。 */
+  private cmarkLastAppliedFp: string = "";
 
   constructor(
     msg: Ref<MsgItem>,
@@ -262,25 +283,92 @@ export class AiMsgMarkdownParser {
     return [] as UniAiMarkdownElItem[];
   }
 
+  /** 当前可见列表中已越过 fallback 稳定切点的元素数；公式展示层据此冻结不可变前缀。 */
+  resolveStableRenderCount(): number {
+    const renderedCount = this.msg.value.markdownElList.length;
+    const stableCount = this.fallbackStableEls.length;
+    return stableCount < renderedCount ? stableCount : renderedCount;
+  }
+
   resetForNewMessage(): void {
     this.abortIncrementalParse();
     this.cmarkParseEnabled = true;
     this.cmarkProbeDone = false;
     this.cmarkProbeOk = true;
-    this.lastFallbackBody = "";
-    this.lastFinishedBody = "";
     this.clearFallbackIncrementalState();
     // 作废任何在途的批量刷新，避免新消息被旧回调刷到半截
     this.mathFlushGen = this.mathFlushGen + 1;
     this.mathFlushPending = false;
     this.parseMarkdown = this.createParseMarkdown();
+    // list-view 回收 rebind：切回的历史消息若已终态渲染（markdownElList 已权威、rendered=true），
+    // 保留"已完成"标记 lastFinishedBody/lastFallbackBody=当前正文，让 runMarkdownParse 的终态短路生效，
+    // 避免清掉记忆后全量重解析 → 重建一整条消息组件（含公式 KaTeX）→ 主线程冻死/ANR。
+    // 仅对非"正在流式的末条消息"保留：流式末条正文还在长，不能凭 rendered 冻结半截；
+    // 且纯文本流式走 fast-path、markdownElList 常空，会落到 else 正常清零。
+    const body = this.getBodyText();
+    const isStreamingLast =
+      this.getIsConversationActive() == true && this.getIsLastMsg() == true;
+    if (
+      body.length > 0 &&
+      isStreamingLast != true &&
+      this.msg.value.rendered == true &&
+      this.msg.value.markdownElList.length > 0
+    ) {
+      this.lastFinishedBody = body;
+      this.lastFallbackBody = body;
+    } else {
+      this.lastFallbackBody = "";
+      this.lastFinishedBody = "";
+    }
   }
 
-  /** 清空 App 增量 fallback 冻结区。 */
+  /**
+   * Android 纯文本快速通道启用时暂停 cmark 打字机。
+   * 权威正文仍在外层累计；退出快速通道或终态定稿时 runMarkdownParse 会按需重建解析器。
+   */
+  suspendForPlainStream(): void {
+    this.abortIncrementalParse();
+    this.parseMarkdown = null;
+    this.msg.value.rendered = false;
+    this.lastFinishedBody = "";
+  }
+
+  /** 终态 Markdown 是否已与给定权威正文完全对齐。 */
+  isFinishedBodyRendered(body: string): boolean {
+    return (
+      body.length > 0 &&
+      this.lastFinishedBody == body &&
+      this.msg.value.rendered == true &&
+      this.msg.value.markdownElList.length > 0
+    );
+  }
+
+  /**
+   * 表格/code/Mermaid 轻量叶子结束时复用流式期冻结前缀，只补最终 live 尾段。
+   * 仅在确实没有可复用前缀时回到完整定稿；公式/工具等仍走原链路。
+   */
+  finalizeStructuralStream(): void {
+    const body = this.getBodyText();
+    if (
+      body.length > 0 &&
+      this.fallbackStablePrefix.length > 0 &&
+      body.startsWith(this.fallbackStablePrefix)
+    ) {
+      this.applyAppFallbackIncremental(body);
+      return;
+    }
+    this.runMarkdownParse(true);
+  }
+
+  /** 清空 App 增量 fallback 冻结区（顺带清空 cmark 冻结前缀，二者同为增量态）。 */
   private clearFallbackIncrementalState(): void {
     this.fallbackStablePrefix = "";
     this.fallbackStableEls = [] as UniAiMarkdownElItem[];
+    this.fallbackStableBatches = [] as FallbackStableBatch[];
     this.pendingMathReveal = false;
+    this.cmarkStableEls = [] as UniAiMarkdownElItem[];
+    this.cmarkStableTokenCount = 0;
+    this.cmarkLastAppliedFp = "";
   }
 
   /**
@@ -294,6 +382,10 @@ export class AiMsgMarkdownParser {
     if (pm != null) {
       pm.abort();
     }
+    // 打字机已中止，其冻结前缀缓存随之失效；清空避免残留覆盖下一次渲染
+    this.cmarkStableEls = [] as UniAiMarkdownElItem[];
+    this.cmarkStableTokenCount = 0;
+    this.cmarkLastAppliedFp = "";
   }
 
   private bumpRevision(): void {
@@ -584,13 +676,40 @@ export class AiMsgMarkdownParser {
    * body 非纯 append（前缀不匹配）时回退全量。
    */
   private applyAppFallbackIncremental(body: string): void {
-    // 前缀被改写 / 缩短 → 全量
+    // 容器/工具标签归一化可能在结构闭合时改写最近的稳定尾段。
+    // 找共同字符前缀并撤回与改写区相交的完整冻结批；更早的 el 对象继续复用。
     if (
       this.fallbackStablePrefix.length > 0 &&
       !body.startsWith(this.fallbackStablePrefix)
     ) {
-      this.applyAppFallbackFull(body);
-      return;
+      let common = 0;
+      const commonLimit = body.length < this.fallbackStablePrefix.length
+        ? body.length
+        : this.fallbackStablePrefix.length;
+      while (
+        common < commonLimit &&
+        body.charAt(common) == this.fallbackStablePrefix.charAt(common)
+      ) {
+        common = common + 1;
+      }
+
+      const keptBatches = [] as FallbackStableBatch[];
+      const keptEls = [] as UniAiMarkdownElItem[];
+      let keptEnd = 0;
+      for (let b = 0; b < this.fallbackStableBatches.length; b++) {
+        const batch = this.fallbackStableBatches[b];
+        if (batch.end > common) {
+          break;
+        }
+        keptBatches.push(batch);
+        keptEnd = batch.end;
+        for (let e = 0; e < batch.items.length; e++) {
+          keptEls.push(batch.items[e]);
+        }
+      }
+      this.fallbackStablePrefix = body.substring(0, keptEnd);
+      this.fallbackStableEls = keptEls;
+      this.fallbackStableBatches = keptBatches;
     }
 
     let cut = findStableMarkdownCut(body, true);
@@ -612,16 +731,18 @@ export class AiMsgMarkdownParser {
 
     let stablePrefix = this.fallbackStablePrefix;
     let stableEls = this.fallbackStableEls;
+    let stableBatches = this.fallbackStableBatches.slice();
 
     // 扩展冻结区：只 parse 新增的 newlyFrozen。
     // 已闭合公式在冻结时立刻派发 KaTeX（逐段上屏）；live 仍 defer，避免半截/重解析重复截图。
     if (cut > stablePrefix.length) {
-      const newlyFrozen = body.substring(stablePrefix.length, cut);
+      const batchStart = stablePrefix.length;
+      const newlyFrozen = body.substring(batchStart, cut);
       if (newlyFrozen.length > 0) {
         const newEls = expandMarkdownImageItems(
           parseAppMarkdownFallback(newlyFrozen, onMathNotify, false),
         );
-        prefixMarkdownElIds(newEls, `f${stablePrefix.length}-`);
+        prefixMarkdownElIds(newEls, `f${batchStart}-`);
         const merged = [] as UniAiMarkdownElItem[];
         for (let i = 0; i < stableEls.length; i++) {
           merged.push(stableEls[i]);
@@ -630,6 +751,11 @@ export class AiMsgMarkdownParser {
           merged.push(newEls[j]);
         }
         stableEls = merged;
+        const batch = new FallbackStableBatch();
+        batch.start = batchStart;
+        batch.end = cut;
+        batch.items = newEls;
+        stableBatches.push(batch);
         parsedChars += newlyFrozen.length;
       }
       stablePrefix = body.substring(0, cut);
@@ -683,6 +809,7 @@ export class AiMsgMarkdownParser {
 
     this.fallbackStablePrefix = stablePrefix;
     this.fallbackStableEls = stableEls;
+    this.fallbackStableBatches = stableBatches;
     this.lastFallbackBody = body;
     this.msg.value.markdownElList = renderedList;
     try {
@@ -706,10 +833,72 @@ export class AiMsgMarkdownParser {
     }
   }
 
-  private applyMarkdownTokenList(markdownTokenList: MarkdownToken[]): void {
+  /** cmark 回调 token 列表的便宜指纹：长度 + 末 token 的 uniqueId|text。
+   *  末 token 是流式 live 边，随正文流入而变；指纹未变即视为本帧无新内容（空转）。 */
+  private cmarkTokenFp(tokens: MarkdownToken[]): string {
+    const n = tokens.length;
+    if (n == 0) {
+      return "0";
+    }
+    const last = tokens[n - 1];
+    const lastId = last.uniqueId != null ? `${last.uniqueId}` : "";
+    const lastText = last.text != null ? `${last.text}` : "";
+    return `${n}|${lastId}|${lastText}`;
+  }
+
+  /**
+   * cmark 增量路径（stablePrefixLen>0）：复用冻结前缀元素【同一对象引用】，只对 live 尾部做 token2el。
+   * 全量路径（stablePrefixLen==0，parseFullBodyMarkdown/兜底）：原逻辑，并清空 cmark 缓存。
+   * normalizeCjkAutolinks 逐元素且幂等：前缀只施加一次、尾部每帧施加，等价于原全量施加。
+   * 前缀元素引用不变 ⇒ 父级 v-for 按 uniqueId keyed-diff 跳过稳定项 ⇒ 渲染层也降到 O(tail)。
+   */
+  private applyMarkdownTokenList(
+    markdownTokenList: MarkdownToken[],
+    stablePrefixLen: number = 0,
+  ): void {
     if (markdownTokenList.length == 0) {
+      this.cmarkStableTokenCount = 0;
+      this.cmarkStableEls = [] as UniAiMarkdownElItem[];
       return;
     }
+    let spl = stablePrefixLen;
+    if (spl > markdownTokenList.length) {
+      spl = markdownTokenList.length;
+    }
+    if (spl > 0) {
+      // 边界回退（append-only 下不应发生）：重建缓存
+      if (spl < this.cmarkStableTokenCount) {
+        this.cmarkStableTokenCount = 0;
+        this.cmarkStableEls = [] as UniAiMarkdownElItem[];
+      }
+      // 新冻结的 token 一次性转元素并入缓存（image 展开可能 1→多）
+      while (this.cmarkStableTokenCount < spl) {
+        const frozenToken = markdownTokenList[this.cmarkStableTokenCount];
+        const expanded = expandMarkdownImageItems([token2el(frozenToken)]);
+        normalizeCjkAutolinks(expanded);
+        for (let i = 0; i < expanded.length; i++) {
+          this.cmarkStableEls.push(expanded[i]);
+        }
+        this.cmarkStableTokenCount = this.cmarkStableTokenCount + 1;
+      }
+      // live 尾部：每帧重转
+      const tailTokens = markdownTokenList.slice(spl);
+      const tailMapped = tailTokens.map((token: MarkdownToken) =>
+        token2el(token),
+      );
+      normalizeCjkAutolinks(tailMapped);
+      const tailEls = expandMarkdownImageItems(tailMapped);
+      // 拼接：冻结前缀（同引用）+ 尾部新元素；浅拷贝前缀，避免把尾部污染进缓存
+      const next = this.cmarkStableEls.slice();
+      for (let i = 0; i < tailEls.length; i++) {
+        next.push(tailEls[i]);
+      }
+      this.msg.value.markdownElList = next;
+      return;
+    }
+    // 全量路径
+    this.cmarkStableTokenCount = 0;
+    this.cmarkStableEls = [] as UniAiMarkdownElItem[];
     const mapped = markdownTokenList.map((token: MarkdownToken) =>
       token2el(token),
     );
@@ -765,8 +954,22 @@ export class AiMsgMarkdownParser {
     if (body.length == 0) {
       return;
     }
-    // App：终态统一 fallback（结构块更稳，且无打字机）
+    // App：纯文本终态用 cmark 全量一次（比 JS fallback 快、与流式期一致，避免 full_parse_large 收尾卡顿）；
+    //   含结构块 / 公式 / $ / 自定义标签的仍走 fallback（结构块更稳）。
     // #ifdef APP
+    if (
+      this.cmarkParseEnabled == true &&
+      this.hasCustomMarkup(body) != true &&
+      this.prefersAppStructuralFallback(body) != true &&
+      body.indexOf("$") < 0
+    ) {
+      if (this.ensureCmarkAvailable() == true && this.parseFullBodyMarkdown(body) == true) {
+        this.msg.value.rendered = true;
+        this.lastFinishedBody = body;
+        this.bumpRevision();
+        return;
+      }
+    }
     this.applyAppFallback(true);
     return;
     // #endif
@@ -880,7 +1083,19 @@ export class AiMsgMarkdownParser {
       if (gen != this.parseGeneration) {
         return;
       }
-      this.applyMarkdownTokenList(markdownTokenList);
+      // 冻结前缀长度由 parseMarkdown.runTask 计算并存于实例字段（避免改 callback 签名牵连 worker）。
+      const pm0 = this.parseMarkdown;
+      const spl = pm0 != null ? pm0.lastStablePrefixLen : 0;
+      // 空转短路：流式期(!isParseDone)打字机每 40ms 自 tick；token 指纹未变(无新内容)则
+      // 跳过 apply + bumpRevision，避免每 40ms 整树 v-for 重渲（renderMarkdownElList 依赖 streamRevision）。
+      if (isParseDone != true) {
+        const fp = this.cmarkTokenFp(markdownTokenList);
+        if (fp == this.cmarkLastAppliedFp) {
+          return;
+        }
+        this.cmarkLastAppliedFp = fp;
+      }
+      this.applyMarkdownTokenList(markdownTokenList, spl);
       if (isParseDone) {
         this.msg.value.rendered = true;
         const body = this.getBodyText();

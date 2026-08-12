@@ -1,6 +1,7 @@
 import { md2json, ParseMdRes, MarkdownToken } from '@/uni_modules/uni-cmark'
 import { parseLineCode, ParseLineCodeRes} from '@/uni_modules/uni-ai-x/sdk/parseCode.uts'
 import proxyWeb from '@/uni_modules/uni-ai-x/sdk/proxy-web.uts'
+import { MERMAID_RENDER_ENABLED } from '@/uni_modules/uni-ai-x/sdk/math-render.uts'
 import utils from '@/uni_modules/uni-ai-x/sdk/utils.uts'
 type UpdateCallBack = (markdownTokenList : MarkdownToken[], isParseDone: boolean) => void
 type Md2JsonCallBack = (markdownTokenList : MarkdownToken[]) => void
@@ -47,6 +48,9 @@ export default class ParseMarkdown {
 	lastMathEndIndex : number = 0
 	// 与msgBody的区别在于：数学公式部分被二次加工
 	myMarkdownText : string = ''
+	/** 最近一次 runTask 的冻结前缀 token 数：[0, N) 已闭合、本 tick 未被触碰，上层可缓存复用其渲染元素。
+	 *  用字段而非回调参数，避免改 UpdateCallBack 签名牵连 worker(requestAiWorker)。 */
+	lastStablePrefixLen : number = 0
 	constructor(updateCallBack : UpdateCallBack) {
 		this.updateCallBack = updateCallBack
 		this.parseLock = false
@@ -157,14 +161,18 @@ export default class ParseMarkdown {
 				this.startLineIndex = this.endLineIndex
 				newJsonList[0].isClose = 1
 			} else {
-				// 流式平滑：每步推进 2 行（原 1 行），配合下方 100→40ms 定时，文本更连续、减少"一段一段"
-				this.endLineIndex += 2
+				// 流式逐字：每步推进 1 行（原 2 行）；冻结前缀已把每 tick 成本降到 O(tail)，可负担更细粒度
+				this.endLineIndex += 1
 			}
 			if (this.endLineIndex > msgBodyLines.length) {
 				this.endLineIndex = msgBodyLines.length
 			}
 			// 找到最后一个未闭合的元素
 			const lastUnCloseTokenIndex = this.markdownTokenList.findIndex((item : MarkdownToken) => item.isClose == 0)
+			// 冻结前缀长度 = 其前的 token 本 tick 未被触碰（已闭合、永不再变），上层可缓存复用。
+			// 全部已闭合(lastUnCloseTokenIndex==-1) ⇒ 旧列表全长；否则 ⇒ 第一个未闭合 token 的下标。
+			const stablePrefixLen = lastUnCloseTokenIndex == -1 ? this.markdownTokenList.length : lastUnCloseTokenIndex
+			this.lastStablePrefixLen = stablePrefixLen
 			if (lastUnCloseTokenIndex != -1) {
 				for (let i = 0; i < newJsonList.length; i++) {
 					const index = lastUnCloseTokenIndex + i
@@ -184,7 +192,7 @@ export default class ParseMarkdown {
 			if (!isParseDone) {
 				setTimeout(() => {
 					this.runTask(msgBody)
-				}, 40)
+				}, 24)
 			}
 			// console.log('markdownText', markdownText)
 			this.doUpdateCallBack(isParseDone)
@@ -324,6 +332,11 @@ export default class ParseMarkdown {
 		callBack()
 		//#endif
 		// #ifndef MP-WEIXIN
+		// 临时关闭 mermaid 出图（MERMAID_RENDER_ENABLED）：当代码块显示，不走 proxy-web（避免 list-view 回收即崩）
+		if (!MERMAID_RENDER_ENABLED) {
+			callBack()
+			return
+		}
 		// 闭合才渲染：代码块未闭合（流式半截）不触发 render，避免半截 mermaid 反复报错/重渲
 		if (mermaidToken.isClose == 0) {
 			callBack()

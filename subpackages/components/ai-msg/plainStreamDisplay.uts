@@ -1,0 +1,161 @@
+/**
+ * Android 纯文本流式展示辅助。
+ *
+ * 权威正文仍由会话消息累计；这里只决定是否可绕过 Markdown 树，以及在上游突发时
+ * 如何按 Unicode 安全边界匀速揭示。结构标记判定有意保守：宁可回到 Markdown，
+ * 也不在快速通道里把 Markdown 语法当普通文字长期展示。
+ */
+
+export const PLAIN_STREAM_TICK_MS: number = 24;
+export const PLAIN_STREAM_MAX_LAG_MS: number = 250;
+export const PLAIN_STREAM_MAX_DIRECT_CHUNK: number = 16;
+export const PLAIN_STREAM_MAX_DIRECT_GAP_MS: number = 100;
+
+/** 是否可在流式期间直接用单个原生 text 展示。 */
+export function isPlainStreamBody(body: string): boolean {
+  if (body.length == 0) {
+    return false;
+  }
+  if (
+    body.indexOf("markdown-custom-process") >= 0 ||
+    body.indexOf(":::container") >= 0 ||
+    body.indexOf("<task-result") >= 0 ||
+    body.indexOf("<conversation") >= 0 ||
+    body.indexOf("```") >= 0 ||
+    body.indexOf("![") >= 0 ||
+    body.indexOf("](") >= 0 ||
+    body.indexOf("$$") >= 0 ||
+    body.indexOf("\\[") >= 0 ||
+    body.indexOf("\\(") >= 0 ||
+    body.indexOf("$") >= 0 ||
+    body.indexOf("**") >= 0 ||
+    body.indexOf("__") >= 0 ||
+    body.indexOf("~~") >= 0 ||
+    body.indexOf("`") >= 0
+  ) {
+    return false;
+  }
+  if (/^\s{0,3}(?:#{1,6}\s|>\s|[-+*]\s|\d+[.)]\s)/m.test(body)) {
+    return false;
+  }
+  if (
+    /^\s*\|.*\|\s*$/m.test(body) &&
+    /^\s*\|?\s*:?-{3,}/m.test(body)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** requestedEnd 落在 UTF-16 代理对中间时向后扩一位，避免 Emoji 半个字符闪烁。 */
+export function safePlainStreamRevealEnd(
+  text: string,
+  requestedEnd: number,
+): number {
+  let end = requestedEnd;
+  if (end < 0) {
+    end = 0;
+  }
+  if (end > text.length) {
+    end = text.length;
+  }
+  if (end > 0 && end < text.length) {
+    const prev: number = text.charCodeAt(end - 1) ?? 0;
+    const next: number = text.charCodeAt(end) ?? 0;
+    if (
+      prev >= 0xd800 &&
+      prev <= 0xdbff &&
+      next >= 0xdc00 &&
+      next <= 0xdfff
+    ) {
+      end = end + 1;
+    }
+  }
+  return end;
+}
+
+/**
+ * 根据当前积压计算下一帧结束位置。按剩余 250ms 内追平计算每帧预算；
+ * 大突发会加速，但仍分多帧展示，不会长期落后权威正文。
+ */
+export function nextPlainStreamRevealEnd(
+  currentLength: number,
+  target: string,
+): number {
+  if (currentLength >= target.length) {
+    return target.length;
+  }
+  const backlog = target.length - currentLength;
+  const steps = Math.ceil(PLAIN_STREAM_MAX_LAG_MS / PLAIN_STREAM_TICK_MS);
+  let take = Math.ceil(backlog / steps);
+  if (take < 1) {
+    take = 1;
+  }
+  return safePlainStreamRevealEnd(target, currentLength + take);
+}
+
+/** 单轮 SSE 的真实 MESSAGE 到达节奏采样器。 */
+export class StreamBurstDetector {
+  private messageId: string = "";
+  private lastAt: number = 0;
+  private gaps: number[] = [] as number[];
+  private pacing: boolean = false;
+
+  reset(messageId: string = ""): void {
+    this.messageId = messageId;
+    this.lastAt = 0;
+    this.gaps = [] as number[];
+    this.pacing = false;
+  }
+
+  record(
+    messageId: string,
+    addChars: number,
+    atMs: number = Date.now(),
+  ): boolean {
+    if (messageId != this.messageId) {
+      this.reset(messageId);
+    }
+    if (addChars > PLAIN_STREAM_MAX_DIRECT_CHUNK) {
+      this.pacing = true;
+    }
+    if (this.lastAt > 0) {
+      const gap = atMs - this.lastAt;
+      if (gap >= 0) {
+        this.gaps.push(gap);
+        if (this.gaps.length > 32) {
+          this.gaps.splice(0, this.gaps.length - 32);
+        }
+      }
+    }
+    this.lastAt = atMs;
+    if (this.pacing != true && this.gaps.length >= 5) {
+      const sorted = this.gaps.slice();
+      // UTS 各端对 number sort comparator 的推断不一致，样本最多 32 个，手排更稳。
+      for (let i = 0; i < sorted.length; i++) {
+        for (let j = i + 1; j < sorted.length; j++) {
+          if (sorted[j] < sorted[i]) {
+            const tmp = sorted[i];
+            sorted[i] = sorted[j];
+            sorted[j] = tmp;
+          }
+        }
+      }
+      let p95Index = Math.ceil(sorted.length * 0.95) - 1;
+      if (p95Index < 0) {
+        p95Index = 0;
+      }
+      if (p95Index >= sorted.length) {
+        p95Index = sorted.length - 1;
+      }
+      if (sorted[p95Index] > PLAIN_STREAM_MAX_DIRECT_GAP_MS) {
+        this.pacing = true;
+      }
+    }
+    return this.pacing;
+  }
+
+  get recommended(): boolean {
+    return this.pacing;
+  }
+}

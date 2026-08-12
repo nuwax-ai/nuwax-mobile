@@ -231,7 +231,51 @@ pnpm hx:ios:simulators     # iOS 模拟器列表
 pnpm hx:ios:sim -- --deviceId <UDID>      # 跑模拟器（须指定 UDID）
 pnpm hx:ios:device -- --deviceId <序列号>  # 跑真机
 pnpm hx:ios:log            # iOS 应用日志
+
+# 卡顿/崩溃/性能诊断（grab-* 抓 logcat + bugreport 全线程栈 + HANG 主线程栈 + 内存，归档到 .diag/<tag>/）
+bash scripts/grab-diag.sh [tag]               # 默认 Redmi 真机 8PNNT4TKHIJVU8RO；定位卡死看 main-stacks.txt（at uni.* / at uts.*）
+PERF_DEV=<serial> bash scripts/grab-diag.sh   # 多设备指定
+bash scripts/grab-freeze-state.sh             # 冻结/ANR 状态
+bash scripts/grab-perf-stats.sh               # 性能统计
+# 注：grab-* 含全角字符，macOS 自带 bash 3.2 + set -u 会误报 "unbound variable"，
+#     用 zsh 直接跑、或 brew install bash 用 bash 5+、或临时 set +u
 ```
+
+## 带三方依赖的 UTS 插件集成（以 x-svg-renderer 为例）
+
+> 改业务代码后如何选编译路径 / 绕开 error18 / adb 直装真机验证，见 [docs/android-build-verify-playbook.md](docs/android-build-verify-playbook.md)（三条路径决策表 + `make base-android → adb install` 捷径 + dex 验证 + 设备日志流）。
+
+含 Maven/CocoaPods 三方依赖的 UTS 插件（x-svg-renderer 依赖 `com.caverock:androidsvg` / SVGKit）有两套编译路径，行为不同：
+
+| 路径 | 三方依赖处理 | 用途 |
+|---|---|---|
+| `cli launch` 运行流（`pnpm hx:android` / `--compile` / `--playground custom`） | 重编 uni_modules UTS 插件，**需 HBuilderX【设置-运行配置】配 Gradle/JDK/Android SDK**，否则 error18「找不到名称」 | 日常运行调试 |
+| `cli publish appResource`（`make app-resource`） | 不卡（三方依赖留给离线 SDK Gradle） | 打基座/打包前置 |
+
+**本地打含三方依赖插件的自定义基座**（解决"基座只有依赖库没插件产物 → 运行必 error18"）：
+
+```bash
+make app-resource && make base-android        # iOS 模拟器：make base-ios-simulator（免签）
+```
+
+- `scripts/android-esp/inject_all_uts_modules.py` 把每个插件 config.json 的 `dependencies` 以 `compileOnly` 注入对应 uts 模块 build.gradle；DCloud 约定坐标 `-aar` 后缀是打包类型提示，真实 artifactId 不含（`androidsvg-aar`→`androidsvg`）
+- 打出的基座 dex 含插件产物（`uts/sdk/modules/<Plugin>/`），运行不再重编插件
+
+**带三方依赖插件的 HBuilderX 运行配置**（cli launch 必需，本机已知路径）：
+
+- Gradle 7.5~8.x：`~/.gradle/wrapper/dists/gradle-8.14.3-bin/*/gradle-8.14.3/bin/gradle`
+- JDK 17：`/opt/homebrew/opt/openjdk@17`（`ensure_env.sh` 只认这个 + Android Studio jbr，不认 HBuilderX corretto）
+- Android SDK：`~/workspace/Android/sdk`（需 platforms android-30+ / build-tools 30+；**不是**空的 `~/Library/Android/sdk`）
+
+填到 HBuilderX【工具 → 设置 → 运行配置】。
+
+**UTS 编译已知坑**（带三方依赖/原生插件常踩）：
+
+- 禁止可选链赋值 `a?.b = v`（报 `left-hand side must be a variable`；Swift 允许但 UTS 禁）→ `const x = this.foo; if (x != null) x.bar = ...`
+- `watch(() => props.x, cb)` 的 getter 必须显式返回类型 `(): T =>`，否则泛型推断退化为 Unit 报 `Return type mismatch`
+- 先声明后引用（异步闭包 / showModal 回调内同样）
+
+**每个仓库需自己的 `scripts/local-secrets.env`**（gitignore，含 DCLOUD_APPKEY + Android/iOS 签名）：`local-base-env.sh` 只 source 同目录的；缺则 `make base-android` configure 阶段报「未设置 DCLOUD_APPKEY」。从 `nuwax-mobile_diff` 或 `~/workspace/nuwax-signing` 复制（同机同一套密钥）。
 
 ## 工程约定
 

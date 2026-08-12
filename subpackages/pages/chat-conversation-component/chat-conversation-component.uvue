@@ -96,7 +96,7 @@
       <view class="chat-container">
         <!-- 调试性能浮层：真实会话与 perfTest 均常驻 -->
         <view v-if="isPerfMock" class="perf-overlay">
-          <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
+		  <text class="perf-overlay-text">fps {{ perfFpsText }} · p95 {{ perfP95Text }}ms · maxGap {{ perfGapText }}ms</text>
           <!-- 热滚动状态只显示 500ms 快照。若直接绑定这些 ref，原生 scroll
                每一帧都会使聊天父组件重新 render，浮窗本身会污染 FPS 测量。 -->
           <text class="perf-overlay-text">{{ perfScrollSnapshot }}</text>
@@ -166,6 +166,11 @@
                     :message-status="item.status"
                     :processing-list="getAssistantProcessingList(item)"
                     :initial-markdown-el-list="getAssistantMarkdownElList(item)"
+					:render-unit-start="assistantRenderUnitStart(item, renderedMessageGlobalIndex(visibleIndex))"
+					:render-unit-end="assistantRenderUnitEnd(item, renderedMessageGlobalIndex(visibleIndex))"
+					:render-unit-top-placeholder="assistantRenderUnitTop(item, renderedMessageGlobalIndex(visibleIndex))"
+					:render-unit-bottom-placeholder="assistantRenderUnitBottom(item, renderedMessageGlobalIndex(visibleIndex))"
+					:render-unit-key-prefix="assistantRenderUnitPrefix(item, renderedMessageGlobalIndex(visibleIndex))"
                     :conversation-id="`${conversationId}`"
                     :is-app-details="isAppDetails"
                     :message-time="item.time"
@@ -176,6 +181,7 @@
                     :task-status="conversationTaskStatus"
                     @longpress="onlongTapMsg(item)"
                     @changeThinkContent="changeThinkContent"
+					@renderUnitsReady="handleRenderUnitsReady"
                     :id="`msg-item-${item.id}_${item.index}`"
                     :ref="(el: any) => setMessageRef(el, `${item.id}_${item.index}`)"
                   ></UniAiXMsg>
@@ -514,6 +520,7 @@
     VirtualMessageAnchor,
   } from "./layers/VirtualMessageListManager.uts";
   import { RenderUnitShadowLayout } from "./render-units/RenderUnitShadowLayout.uts";
+	import { MessageRenderUnitWindow } from "./render-units/RenderUnitModels.uts";
   import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
   import ScrollManager from "./layers/ScrollManager.uts";
   import AgentDetailUtils from "./layers/AgentDetailUtils.uts";
@@ -542,7 +549,7 @@
     MessageModeEnum,
   } from "@/types/enums/agent";
   import type { ChatInputPhoneRef } from "@/types/interfaces/chat.uts";
-  import type { MessageInfo } from "@/types/interfaces/conversationInfo.uts";
+  import type { MessageInfo, markdownElItem } from "@/types/interfaces/conversationInfo.uts";
   import type {
     AcpPermissionInteraction,
     AcpPermissionResponse,
@@ -834,6 +841,12 @@
   const shadowUnitCount = ref<number>(0);
   const shadowRangeText = ref<string>("0-0");
   const shadowHeightDelta = ref<number>(0);
+	const renderUnitMountedCount = ref<number>(0);
+	const renderUnitWindowRevision = ref<number>(0);
+	let renderUnitWindowCache: Map<string, MessageRenderUnitWindow> =
+	  new Map<string, MessageRenderUnitWindow>();
+	const pendingParsedRenderUnits: Map<string, any[]> = new Map<string, any[]>();
+	let renderUnitWindowFingerprint: string = "";
   const virtualMountedCount = computed((): number =>
     Math.max(0, virtualEndIndex.value - virtualStartIndex.value),
   );
@@ -866,6 +879,9 @@
   // 6 -> 5 屏意味着大约每滚动一屏 push 一小批新行，避免等到视口逼近
   // 1.5 屏硬边界时一次挂载四五屏 mixed 富内容。
   const VIRTUAL_REFILL_SCREENS: number = 5;
+	/** 短消息拆 Unit 只会增加组件数；至少 12 个稳定 Markdown block 才启用内部窗口。 */
+	const RENDER_UNIT_MIN_BLOCKS: number = 12;
+	const RENDER_UNIT_ID_PREFIX: string = "render-unit-block-";
   const virtualBufferConfigText = computed((): string =>
     `${VIRTUAL_OVERSCAN_SCREENS}屏/边 · 低于${VIRTUAL_REFILL_SCREENS}屏即补`,
   );
@@ -900,6 +916,80 @@
     return Math.max(0, rawScrollTop - virtualContentOrigin.value);
   }
 
+	function refreshRenderUnitWindows(): void {
+	  const nextCache = new Map<string, MessageRenderUnitWindow>();
+	  let nextMountedCount = 0;
+	  let nextFingerprint = "";
+	  const list = data.messageList.value;
+	  const viewportTop = effectiveVirtualScrollTop(virtualLastScrollTop.value);
+	  const internalOverscan = Math.max(900, virtualViewportHeight.value * 2);
+	  for (let i = virtualStartIndex.value; i < virtualEndIndex.value && i < list.length; i++) {
+		const item = list[i];
+		const role = readRawField(item, "role");
+		const type = readRawField(item, "messageType");
+		const assistant =
+		  (role != null && `${role}`.indexOf("ASSISTANT") >= 0) ||
+		  (type != null && `${type}`.indexOf("ASSISTANT") >= 0);
+		if (assistant != true) continue;
+		// 当前流式消息必须维持唯一解析器 + Frozen/Live Tail，不进入历史 Unit 窗口。
+		if (data.isConversationActive.value == true && i == list.length - 1) continue;
+		const key = virtualMessageKey(item);
+		const window = renderUnitShadow.messageWindowAt(
+		  key,
+		  viewportTop - virtualMessageManager.offsetAt(i),
+		  virtualViewportHeight.value,
+		  internalOverscan,
+		  RENDER_UNIT_MIN_BLOCKS,
+		);
+		if (window.enabled == true) {
+		  nextCache.set(key, window);
+		  nextMountedCount += window.mountedCount;
+		  nextFingerprint += `|${key}:${window.start}-${window.end}:${window.topPlaceholder.toFixed(0)}:${window.bottomPlaceholder.toFixed(0)}`;
+		}
+	  }
+	  if (nextFingerprint == renderUnitWindowFingerprint) return;
+	  renderUnitWindowFingerprint = nextFingerprint;
+	  renderUnitWindowCache = nextCache;
+	  renderUnitMountedCount.value = nextMountedCount;
+	  renderUnitWindowRevision.value = renderUnitWindowRevision.value + 1;
+	}
+
+	function assistantRenderUnitWindow(item: any | null, _listIndex: number): MessageRenderUnitWindow | null {
+	  const _revision = renderUnitWindowRevision.value;
+	  if (useVirtualScroll.value != true || item == null) return null;
+	  const cached = renderUnitWindowCache.get(virtualMessageKey(item));
+	  return cached != null && cached.enabled == true ? cached : null;
+	}
+
+	function assistantRenderUnitStart(item: any | null, listIndex: number): number {
+	  const window = assistantRenderUnitWindow(item, listIndex);
+	  return window != null ? window.start : 0;
+	}
+
+	function assistantRenderUnitEnd(item: any | null, listIndex: number): number {
+	  const window = assistantRenderUnitWindow(item, listIndex);
+	  if (window != null) return window.end;
+	  if (item == null) return 0;
+	  const raw = readRawField(item, "markdownElList");
+	  return raw != null && Array.isArray(raw) ? (raw as any[]).length : 0;
+	}
+
+	function assistantRenderUnitTop(item: any | null, listIndex: number): number {
+	  const window = assistantRenderUnitWindow(item, listIndex);
+	  return window != null ? window.topPlaceholder : 0;
+	}
+
+	function assistantRenderUnitBottom(item: any | null, listIndex: number): number {
+	  const window = assistantRenderUnitWindow(item, listIndex);
+	  return window != null ? window.bottomPlaceholder : 0;
+	}
+
+	function assistantRenderUnitPrefix(item: any | null, listIndex: number): string {
+	  return assistantRenderUnitWindow(item, listIndex) != null
+		? RENDER_UNIT_ID_PREFIX + virtualMessageKey(item) + "__"
+		: "";
+	}
+
   function updateRenderUnitShadowMetrics(): void {
     shadowUnitCount.value = renderUnitShadow.index.count();
     const effectiveTop = effectiveVirtualScrollTop(virtualLastScrollTop.value);
@@ -911,6 +1001,7 @@
     shadowRangeText.value = `${range.start}-${range.end}`;
     shadowHeightDelta.value =
       renderUnitShadow.index.totalHeight() - virtualMessageManager.totalHeight();
+	refreshRenderUnitWindows();
   }
 
   function syncRenderUnitShadow(): void {
@@ -928,6 +1019,22 @@
     renderUnitShadow.sync(list as any[], liveKey, viewportWidth);
     updateRenderUnitShadowMetrics();
   }
+
+	function commitParsedRenderUnits(item: any | null, listIndex: number, list: any[]): boolean {
+	  if (item == null) return false;
+	  const key = virtualMessageKey(item);
+	  if (virtualMessageManager.isHeightMeasured(key) != true) return false;
+	  const typed = item as MessageInfo;
+	  typed.markdownElList = list as markdownElItem[];
+	  syncRenderUnitShadow();
+	  const cachedRowHeight = virtualMessageManager.heightAt(listIndex);
+	  if (cachedRowHeight > 0) {
+		renderUnitShadow.reconcileMessageHeight(key, cachedRowHeight);
+	  }
+	  pendingParsedRenderUnits.delete(key);
+	  updateRenderUnitShadowMetrics();
+	  return true;
+	}
 
   function scheduleRenderUnitShadowSync(): void {
     if (renderUnitShadowSyncTimer != 0) return;
@@ -1158,11 +1265,13 @@
     query.select("#msg-list").boundingClientRect();
     query.select("#virtual-msg-content").boundingClientRect();
     query.selectAll(".virtual-msg-row").boundingClientRect();
+	query.selectAll(".render-unit-measure").boundingClientRect();
     query.exec((results: any[]) => {
-      if (results == null || results.length < 3) return;
+	  if (results == null || results.length < 3) return;
       const scroller = results[0] as any | null;
       const content = results[1] as any | null;
       const rows = results[2] as any[] | null;
+	  const unitRows = results.length > 3 ? results[3] as any[] | null : null;
       if (scroller != null) {
         const h = readRawField(scroller, "height");
         if (h != null && (h as number) > 0) virtualViewportHeight.value = h as number;
@@ -1198,6 +1307,10 @@
             key,
             (heightRaw as number) + gap,
           );
+		  const pendingUnits = pendingParsedRenderUnits.get(key);
+		  if (pendingUnits != null) {
+			commitParsedRenderUnits(data.messageList.value[globalIndex], globalIndex, pendingUnits);
+		  }
           renderUnitShadow.reconcileMessageHeight(
             key,
             (heightRaw as number) + gap,
@@ -1209,6 +1322,32 @@
         }
       }
       virtualLastMeasureDelta.value = measuredDelta;
+	  let unitHeightChanged = false;
+	  if (unitRows != null) {
+		for (let i = 0; i < unitRows.length; i++) {
+		  const row = unitRows[i];
+		  const idRaw = readRawField(row, "id");
+		  const heightRaw = readRawField(row, "height");
+		  if (idRaw == null || heightRaw == null) continue;
+		  const id = `${idRaw}`;
+		  if (id.indexOf(RENDER_UNIT_ID_PREFIX) != 0) continue;
+		  const payload = id.substring(RENDER_UNIT_ID_PREFIX.length);
+		  const split = payload.lastIndexOf("__");
+		  if (split <= 0) continue;
+		  const messageKey = payload.substring(0, split);
+		  const sourceIndex = parseInt(payload.substring(split + 2));
+		  if (sourceIndex != sourceIndex) continue;
+		  const unitDelta = renderUnitShadow.commitMarkdownHeight(
+			messageKey,
+			sourceIndex,
+			heightRaw as number,
+		  );
+		  if (unitDelta != 0) unitHeightChanged = true;
+		}
+	  }
+	  if (unitHeightChanged == true) {
+		updateRenderUnitShadowMetrics();
+	  }
       updateRenderUnitShadowMetrics();
       if (heightChanged == true) {
         applyVirtualRange(virtualLastScrollTop.value, true);
@@ -1837,6 +1976,28 @@
       ? raw as any[]
       : emptyAssistantMarkdownElList;
   }
+
+	/** 历史本地解析完成后只回传稳定 block 清单，供持久 Unit 索引与二次窗口使用。 */
+	function handleRenderUnitsReady(messageId: string, list: any[]): void {
+	  if (messageId.length == 0 || list.length < RENDER_UNIT_MIN_BLOCKS) return;
+	  const messages = data.messageList.value;
+	  for (let i = 0; i < messages.length; i++) {
+		const item = messages[i];
+		const idRaw = readRawField(item, "id");
+		if (idRaw == null || `${idRaw}` != messageId) continue;
+		const current = readRawField(item, "markdownElList");
+		if (current != null && Array.isArray(current) && (current as any[]).length == list.length) {
+		  return;
+		}
+		// 必须先用该消息已经缓存的真实行高校准 Unit，再开放二次窗口。
+		// 若解析先于首次测高，则暂存清单，measureVirtualRows 同批提交后再切片。
+		const key = virtualMessageKey(item);
+		pendingParsedRenderUnits.set(key, list.slice());
+		commitParsedRenderUnits(item, i, list);
+		nextTick((): void => scheduleVirtualMeasure(32));
+		return;
+	  }
+	}
 
   /** 用户消息是否有可展示文本 */
   function hasUserMessageText(item: any | null): boolean {
@@ -3470,6 +3631,7 @@
   const isPerfMock = ref<boolean>(true);
   const perfFpsText = ref<string>("--");
   const perfGapText = ref<string>("--");
+	const perfP95Text = ref<string>("--");
   const perfScrollSnapshot = ref<string>("scroll 0 · vp 0 · idle");
   const perfNativeSnapshot = ref<string>("native height 0 · bottom gap 0");
   const perfFollowSnapshot = ref<string>("touch 0 · moving 0 · follow 0");
@@ -3512,7 +3674,13 @@
         const cnt = perfFrameDeltas.length;
         const avg = cnt > 0 ? sum / cnt : 0;
         const fps = avg > 0 ? 1000 / avg : 0;
+		const sorted = perfFrameDeltas.slice().sort((a: number, b: number): number => a - b);
+		const p95Index = sorted.length > 0
+		  ? Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))
+		  : 0;
+		const p95 = sorted.length > 0 ? sorted[p95Index] : 0;
         perfFpsText.value = `${fps.toFixed(0)}`;
+		perfP95Text.value = `${p95}`;
         perfGapText.value = `${mx}`;
         // 同一个低频窗口刷新浮层的全部诊断值，避免 scroll 事件热路径直接
         // 成为模板依赖，进而触发聊天页父组件逐帧 diff。
@@ -3524,7 +3692,7 @@
         perfPreloadSnapshot.value = `preload ${virtualBufferConfigText.value}`;
         perfRangeSnapshot.value = `range ${virtualStartIndex.value}-${virtualEndIndex.value} · top ${virtualTopSpacerHeight.value} · bottom ${virtualBottomSpacerHeight.value}`;
         perfMeasureSnapshot.value = `measure Δ${virtualLastMeasureDelta.value.toFixed(0)} · anchor Δ${virtualLastAnchorDelta.value.toFixed(0)}`;
-        perfShadowSnapshot.value = `RU ${shadowUnitCount.value} · range ${shadowRangeText.value} · height Δ${shadowHeightDelta.value.toFixed(0)}`;
+		perfShadowSnapshot.value = `RU ${renderUnitMountedCount.value}/${shadowUnitCount.value} · range ${shadowRangeText.value} · height Δ${shadowHeightDelta.value.toFixed(0)}`;
       }
       await new Promise<void>((resolve) => {
         setTimeout((): void => resolve(), 16);

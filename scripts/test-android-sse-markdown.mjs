@@ -1584,6 +1584,8 @@ test("性能浮窗以低频快照读取滚动热状态", () => {
     conversation,
     /if \(perfDisplayAccum >= PERF_DISPLAY_FLUSH_MS\)[\s\S]*?perfScrollSnapshot\.value/,
   );
+	assert.match(conversation, /perfP95Text/);
+	assert.match(conversation, /Math\.floor\(sorted\.length \* 0\.95\)/);
 });
 
 test("纯文本无换行长段也会封顶 live 节点", () => {
@@ -1671,6 +1673,40 @@ test("虚拟 scroll-view 仅挂载窗口切片并用聚合 spacer 占位", () =>
   assert.match(conversation, /virtualBottomSpacerHeight/);
   assert.match(conversation, /new VirtualMessageListManager\(\)/);
   assert.doesNotMatch(conversation, /<list-view/);
+});
+
+test("超长历史 Assistant 按 Markdown RenderUnit 二次窗口化", () => {
+  const conversation = readFileSync(
+    new URL(
+      "../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const shadow = readFileSync(
+    new URL(
+      "../subpackages/pages/chat-conversation-component/render-units/RenderUnitShadowLayout.uts",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(conversation, /RENDER_UNIT_MIN_BLOCKS: number = 12/);
+  assert.match(conversation, /messageWindowAt\(/);
+  assert.match(conversation, /query\.selectAll\("\.render-unit-measure"\)/);
+  assert.match(conversation, /当前流式消息必须维持唯一解析器/);
+  assert.match(shadow, /commitMarkdownHeight\(/);
+  assert.match(shadow, /localViewportTop: number/);
+  assert.match(aiMsg, /return list\.slice\(start, end\)/);
+  assert.match(aiMsg, /answer-render-unit-placeholder/);
+  assert.match(aiMsg, /emit\("renderUnitsReady", msg\.value\._id, list\.slice\(\) as any\[\]\)/);
+  assert.match(conversation, /function handleRenderUnitsReady\(/);
+  assert.match(conversation, /必须先用该消息已经缓存的真实行高校准 Unit/);
+  assert.match(conversation, /virtualMessageManager\.isHeightMeasured\(key\)/);
+  assert.match(conversation, /pendingParsedRenderUnits/);
 });
 
 console.log("\n[12] Android 代码流式轻量代码块快通道");

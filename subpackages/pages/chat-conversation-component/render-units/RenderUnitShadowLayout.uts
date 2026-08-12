@@ -1,6 +1,10 @@
 import { ConversationLayoutIndex } from "./ConversationLayoutIndex.uts";
 import { buildMessageRenderUnits } from "./MessageRenderUnitBuilder.uts";
-import { RenderUnitLayoutSignature, RenderUnitRange } from "./RenderUnitModels.uts";
+import {
+  MessageRenderUnitWindow,
+  RenderUnitLayoutSignature,
+  RenderUnitRange,
+} from "./RenderUnitModels.uts";
 
 class MessageUnitSpan {
   start: number = 0;
@@ -46,24 +50,169 @@ export class RenderUnitShadowLayout {
     const span = this.spanByMessage.get(messageGroupKey);
     if (span == null) return 0;
     let estimateTotal = 0;
+	let committedTotal = 0;
     for (let i = span.start; i < span.end; i++) {
       const unit = this.index.unitAt(i);
       if (unit != null) {
-        estimateTotal = estimateTotal + unit.effectiveHeight();
+		if (unit.layoutState == "committed") {
+		  committedTotal = committedTotal + unit.effectiveHeight();
+		} else {
+		  estimateTotal = estimateTotal + unit.effectiveHeight();
+		}
       }
     }
     if (estimateTotal <= 0) return 0;
+	const remainingHeight = Math.max(24, measuredHeight - committedTotal);
     let committed = 0;
     for (let i = span.start; i < span.end; i++) {
       const unit = this.index.unitAt(i);
-      if (unit != null) {
-        const target = measuredHeight * unit.effectiveHeight() / estimateTotal;
+	  if (unit != null && unit.layoutState != "committed") {
+		const target = remainingHeight * unit.effectiveHeight() / estimateTotal;
         committed = committed + this.index.commitHeight(
           unit.key, unit.layoutVersion, target, this.signature,
         );
       }
     }
     return committed;
+  }
+
+  /** 提交单个已挂载 Markdown block 的真实高度，旧版本仍由 LayoutIndex 门禁。 */
+  commitMarkdownHeight(
+    messageGroupKey: string,
+    sourceIndex: number,
+    measuredHeight: number,
+  ): number {
+    const span = this.spanByMessage.get(messageGroupKey);
+    if (span == null || measuredHeight <= 0) return 0;
+    for (let i = span.start; i < span.end; i++) {
+      const unit = this.index.unitAt(i);
+      if (unit != null && unit.sourceIndex == sourceIndex) {
+        return this.index.commitHeight(
+          unit.key,
+          unit.layoutVersion,
+          measuredHeight,
+          this.signature,
+        );
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 返回消息内部 Markdown block 的真实挂载窗口。非 Markdown Unit（思考、工具栏）
+   * 仍由消息壳渲染，不计入正文 placeholder。
+   */
+  messageWindow(
+    messageGroupKey: string,
+    globalRange: RenderUnitRange,
+    minimumUnitCount: number,
+  ): MessageRenderUnitWindow {
+    const result = new MessageRenderUnitWindow();
+    const span = this.spanByMessage.get(messageGroupKey);
+    if (span == null) return result;
+    let total = 0;
+    let firstMounted = -1;
+    let lastMounted = -1;
+    let top = 0;
+    let bottom = 0;
+    for (let i = span.start; i < span.end; i++) {
+      const unit = this.index.unitAt(i);
+      if (unit == null || unit.sourceIndex < 0) continue;
+      const inRange = i >= globalRange.start && i < globalRange.end;
+      if (inRange == true) {
+        if (firstMounted < 0) firstMounted = unit.sourceIndex;
+        lastMounted = unit.sourceIndex + 1;
+      }
+      total = total + 1;
+    }
+    result.totalCount = total;
+    if (total < minimumUnitCount) return result;
+    result.enabled = true;
+    if (firstMounted < 0) {
+      // 消息壳处于外层 retained window，但正文离当前 Unit safety window 很远。
+      // 全部正文用 placeholder 保位，不挂载复杂 block。
+      for (let i = span.start; i < span.end; i++) {
+        const unit = this.index.unitAt(i);
+        if (unit != null && unit.sourceIndex >= 0) bottom += unit.effectiveHeight();
+      }
+      result.bottomPlaceholder = bottom;
+      return result;
+    }
+    result.start = firstMounted;
+    result.end = lastMounted;
+    result.mountedCount = Math.max(0, lastMounted - firstMounted);
+    for (let i = span.start; i < span.end; i++) {
+      const unit = this.index.unitAt(i);
+      if (unit == null || unit.sourceIndex < 0) continue;
+      if (unit.sourceIndex < firstMounted) top += unit.effectiveHeight();
+      else if (unit.sourceIndex >= lastMounted) bottom += unit.effectiveHeight();
+    }
+    result.topPlaceholder = top;
+    result.bottomPlaceholder = bottom;
+    return result;
+  }
+
+  /**
+   * 以“消息内部坐标”计算窗口，避免全会话历史估高误差累积后把长消息切到错误 block。
+   * localViewportTop 可为负数，表示消息顶部仍在视口下方。
+   */
+  messageWindowAt(
+    messageGroupKey: string,
+    localViewportTop: number,
+    viewportHeight: number,
+    overscan: number,
+    minimumUnitCount: number,
+  ): MessageRenderUnitWindow {
+    const result = new MessageRenderUnitWindow();
+    const span = this.spanByMessage.get(messageGroupKey);
+    if (span == null) return result;
+    let total = 0;
+    let markdownHeight = 0;
+    for (let i = span.start; i < span.end; i++) {
+      const unit = this.index.unitAt(i);
+      if (unit != null && unit.sourceIndex >= 0) {
+        total = total + 1;
+        markdownHeight = markdownHeight + unit.effectiveHeight();
+      }
+    }
+    result.totalCount = total;
+    if (total < minimumUnitCount) return result;
+    result.enabled = true;
+	const safeLocalTop = Math.max(
+	  0,
+	  Math.min(Math.max(0, markdownHeight - 1), localViewportTop),
+	);
+    const startOffset = Math.max(0, safeLocalTop - overscan);
+    const endOffset = Math.min(
+      markdownHeight,
+	  safeLocalTop + Math.max(1, viewportHeight) + overscan,
+    );
+    let cursor = 0;
+    let firstMounted = -1;
+    let lastMounted = -1;
+    for (let i = span.start; i < span.end; i++) {
+      const unit = this.index.unitAt(i);
+      if (unit == null || unit.sourceIndex < 0) continue;
+      const next = cursor + unit.effectiveHeight();
+      if (next > startOffset && cursor < endOffset) {
+        if (firstMounted < 0) firstMounted = unit.sourceIndex;
+        lastMounted = unit.sourceIndex + 1;
+      }
+      cursor = next;
+    }
+	if (firstMounted < 0) return result;
+    result.start = firstMounted;
+    result.end = lastMounted;
+    result.mountedCount = Math.max(0, lastMounted - firstMounted);
+    cursor = 0;
+    for (let i = span.start; i < span.end; i++) {
+      const unit = this.index.unitAt(i);
+      if (unit == null || unit.sourceIndex < 0) continue;
+      if (unit.sourceIndex < firstMounted) result.topPlaceholder += unit.effectiveHeight();
+      else if (unit.sourceIndex >= lastMounted) result.bottomPlaceholder += unit.effectiveHeight();
+      cursor += unit.effectiveHeight();
+    }
+    return result;
   }
 
   range(scrollTop: number, viewportHeight: number, overscan: number): RenderUnitRange {

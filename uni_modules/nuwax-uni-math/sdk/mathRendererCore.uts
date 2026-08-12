@@ -2,6 +2,7 @@ import { MathRenderResult } from "@/uni_modules/nuwax-uni-math/sdk/mathRenderer.
 import { proxyWebBackend } from "@/uni_modules/nuwax-uni-math/sdk/backends/proxyWebBackend.uts"
 // #ifdef APP-ANDROID || APP-IOS
 import { nativeSvgBackend } from "@/uni_modules/nuwax-uni-math/sdk/backends/nativeSvgBackend.uts"
+import { ratexBackend } from "@/uni_modules/nuwax-uni-math/sdk/backends/ratexBackend.uts"
 // #endif
 import {
   cacheEntryToRes,
@@ -10,9 +11,12 @@ import {
 } from "@/uni_modules/nuwax-uni-math/sdk/mathDiskCache.uts"
 import utils from "@/uni_modules/uni-ai-x/sdk/utils.uts"
 
-/** 并发上限：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥（公式多时卡死）。
+/** 并发上限：WebView / QuickJS 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥（公式多时卡死）。
  *  与 appMarkdownFallback.MAX_CONCURRENT_KATEX 同值。 */
 const MAX_CONCURRENT_MATH: number = 2
+/** ratex 并发上限：Rust 引擎无状态 + 插件内 Executors.newFixedThreadPool(4)，无单线程瓶颈，
+ *  放开 Core 闸让更多公式并行入队（实际并发仍由 ratex 内部 4 线程决定）。仅 ratex 路径生效。 */
+const MAX_CONCURRENT_MATH_RATEX: number = 8
 
 /** 并发队列项 */
 class MathQueueItem {
@@ -57,10 +61,15 @@ function sanitizeLatexText(latex: string): string {
 /** 缓存 key：与 appMarkdownFallback.mathCacheKey 同格式。
  *  保证独立 <x-math> 与聊天管线共享同一缓存条目（一处渲染，两处复用）。 */
 function mathCacheKey(latex: string, displayMode: boolean): string {
-  // 加 backend 前缀：切 native/proxy 后 key 变，缓存不命中 → 重渲染（A/B 对比切换生效，不读旧 backend 的缓存）
-  const backendTag = MathRendererCore.backend == 'proxy' ? 'px' : 'nv'
-  // native v5：Android 位图改为 PNG，隔离旧 WebP 缓存，避免部分真机 image 不解码。
-  const cacheVersion = backendTag == 'nv' ? 'v5' : 'v2'
+  // 加 backend 前缀：切 native/proxy/ratex 后 key 变，缓存不命中 → 重渲染
+  // （A/B 对比切换生效，不读旧 backend 的缓存）
+  const backendTag: string =
+    MathRendererCore.backend == 'proxy' ? 'px' :
+    MathRendererCore.backend == 'ratex' ? 'rx' : 'nv'
+  // native v5 / ratex v1：保留多行公式真实换行，隔离旧 backend 的错误截图缓存。
+  const cacheVersion: string =
+    backendTag == 'nv' ? 'v5' :
+    backendTag == 'rx' ? 'v1' : 'v2'
   if (displayMode == true) {
     return backendTag + ":" + cacheVersion + "d1:" + latex
   }
@@ -96,7 +105,10 @@ function resToResult(res: UTSJSONObject): MathRenderResult {
  * 走 native 时不再依赖 proxy web-view（根除数学的 evalJS 桥死锁 + 公式可选/可复制）。
  */
 export class MathRendererCore {
-  /** 运行时后端选择（test-stream-perf A/B 对比用）：'native'（默认，nuwax-uni-math 原生）| 'proxy'（老 proxy-web katex）*/
+  /** 运行时后端选择（A/B 对比用）：
+   *  'native'（静态默认）= QuickJS/JSContext + MathJax→SVG→位图（APP 安全兜底，标准基座可用）；
+   *  'ratex'  = Rust 原生布局 + Canvas 直绘（APP 生产默认，App.uvue 启动 2s 后切此；需自定义基座含 libratex_ffi）；
+   *  'proxy'  = 隐藏 web-view + KaTeX（H5/MP 主路径，APP 兜底）。 */
   static backend: string = 'native'
   /** 在途 key → 等待回调列表（含首个 dispatch 的请求） */
   private inFlight: Map<string, MathWaiter[]> = new Map<string, MathWaiter[]>()
@@ -161,8 +173,20 @@ export class MathRendererCore {
     )
   }
 
+  /** 并发闸上限：ratex 自带 4 线程 Rust executor，放开到 8（仅 ratex 路径）；
+   *  proxy/native 受 WebView/QuickJS 单线程限制维持 2。 */
+  private maxInFlight(): number {
+    // #ifdef APP-ANDROID || APP-IOS
+    if (MathRendererCore.backend == 'ratex') {
+      return MAX_CONCURRENT_MATH_RATEX
+    }
+    // #endif
+    return MAX_CONCURRENT_MATH
+  }
+
   private pump(): void {
-    while (this.inFlightCount < MAX_CONCURRENT_MATH && this.queue.length > 0) {
+    const limit = this.maxInFlight()
+    while (this.inFlightCount < limit && this.queue.length > 0) {
       const item = this.queue.shift()
       if (item == null) {
         break
@@ -191,13 +215,14 @@ export class MathRendererCore {
   }
 
   /**
-   * 后端派发：
-   *   APP-ANDROID / APP-IOS / APP-HARMONY —— nativeSvgBackend（原生 JS 引擎 + MathJax→SVG→位图）为主，
-   *                  失败兜底 proxyWebBackend。native 不过隐藏 web-view，根除数学的 evalJS 桥死锁；
-   *                  产出含 svg 字段（可导出）。
+   * 后端派发（运行时由 MathRendererCore.backend 选择）：
+   *   'ratex'  —— APP-ANDROID/APP-IOS：ratexBackend（Rust 原生布局 + Canvas 直绘，无 JS/SVG/webview）；
+   *               失败兜底 dispatchNativeOrProxy（→ nativeSvg → proxy）。生产默认（App.uvue 2s 后切）。
+   *   'native' —— APP-ANDROID/APP-IOS/APP-HARMONY：nativeSvgBackend（QuickJS/JSContext + MathJax→SVG→位图）；
+   *               失败兜底 proxyWebBackend。不过隐藏 web-view，根除数学的 evalJS 桥死锁；产出含 svg 字段。
    *     · 鸿蒙端 nativeSvgBackend 当前为 stub（回 { error }）→ 自动兜底 proxyWebBackend，
    *       即鸿蒙现状 = WebView 链路；待 utssdk/app-harmony 真机填实后无缝切原生 SVG 位图。
-   *   其余平台（H5/MP）—— proxyWebBackend（隐藏 web-view + KaTeX + html2canvas / v-html）。
+   *   'proxy'  —— 全平台：proxyWebBackend（隐藏 web-view + KaTeX + html2canvas / v-html）。
    *
    * 注意：UTS 中导出函数名不是一等值（不能赋给函数类型字段），故此处直接调用而非通过字段间接。
    */
@@ -206,13 +231,46 @@ export class MathRendererCore {
     displayMode: boolean,
     callback: MathBackendCallback,
   ): void {
-    // 运行时 backend 切换（test-stream-perf A/B 对比用）：MathRendererCore.backend='proxy' 强制走老 proxy-web 链路
+    // 运行时 backend 切换（test-stream-perf / A/B 对比用）
     if (MathRendererCore.backend == 'proxy') {
       proxyWebBackend(latex, displayMode, (proxyRes: UTSJSONObject): void => {
         callback(proxyRes)
       })
       return
     }
+    // #ifdef APP-ANDROID || APP-IOS
+    if (MathRendererCore.backend == 'ratex') {
+      ratexBackend(latex, displayMode, (ratexRes: UTSJSONObject): void => {
+        const rerr = ratexRes["error"]
+        if (rerr != null) {
+          // ratex 失败（Rust 引擎异常/不支持的宏/.so 缺失）→ 兜底走 native→proxy 链
+          console.warn(
+            "[MATHSVG] core RATEX-FAIL -> fallback NATIVE err=" + `${rerr}`,
+          )
+          this.dispatchNativeOrProxy(latex, displayMode, callback)
+        } else {
+          callback(ratexRes)
+        }
+      })
+      return
+    }
+    // #endif
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    this.dispatchNativeOrProxy(latex, displayMode, callback)
+    // #else
+    proxyWebBackend(latex, displayMode, callback)
+    // #endif
+  }
+
+  /**
+   * nativeSvg 为主，失败（bundle 缺失/渲染异常/鸿蒙 stub）兜底 proxyWeb。
+   * ratex 失败与默认 native 路径共用本链，保证生产兜底一致。
+   */
+  private dispatchNativeOrProxy(
+    latex: string,
+    displayMode: boolean,
+    callback: MathBackendCallback,
+  ): void {
     // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
     nativeSvgBackend(latex, displayMode, (nativeRes: UTSJSONObject): void => {
       const err = nativeRes["error"]

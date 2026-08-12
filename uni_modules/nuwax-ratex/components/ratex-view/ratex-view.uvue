@@ -1,0 +1,207 @@
+<template>
+	<view
+		class="rx-root"
+		:class="isInline ? 'rx-root-inline' : 'rx-root-block'"
+	>
+		<!-- 渲染成功：原生位图（RaTeX Rust 引擎产出 WebP dataURL） -->
+		<image
+			v-if="imageDataURL.length > 0"
+			class="rx-img"
+			:class="isInline ? 'rx-img-inline' : ''"
+			:src="imageDataURL"
+			:style="imgStyle"
+			mode="aspectFit"
+			:show-menu-by-longpress="false"
+		/>
+		<!-- 降级：渲染失败时显示原始 LaTeX 文本，避免公式区域空白 -->
+		<text v-else-if="errMsg.length > 0" class="rx-fallback" :selectable="true">{{ tex }}</text>
+		<!-- 加载中：占位（块级给最小高度，避免布局抖动） -->
+		<view v-else class="rx-placeholder" :style="placeholderStyle" />
+	</view>
+</template>
+
+<script lang="uts" setup>
+	import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+	import { renderLatexAsync } from '@/uni_modules/nuwax-ratex'
+	import type { RatexRenderOptions } from '@/uni_modules/nuwax-ratex/utssdk/interface.uts'
+
+	const props = defineProps<{
+		/** 原始 LaTeX（不含 $ 定界符），如 '\frac{a}{b}' */
+		tex: string
+		/** true=块级（display style），false/缺省=行内 */
+		displayMode?: boolean
+		/** 字号 px；缺省行内 16、块级 13（与 nuwax-katex 一致） */
+		fontSize?: number
+		/** 公式颜色；缺省 #404040（聊天正文色） */
+		color?: string
+	}>()
+
+	const emit = defineEmits<{
+		(e: 'load', detail: UTSJSONObject): void
+		(e: 'error', detail: UTSJSONObject): void
+	}>()
+
+	const isInline = computed((): boolean => {
+		return props.displayMode != true
+	})
+
+	/** 实际渲染字号：显式优先，否则行内 16 / 块级 13 */
+	const resolveFontSize = computed((): number => {
+		if (props.fontSize != null && props.fontSize > 0) {
+			return props.fontSize
+		}
+		return props.displayMode == true ? 13 : 16
+	})
+
+	/** 实际颜色：显式优先，否则 #404040 */
+	const resolveColor = computed((): string => {
+		if (props.color != null && props.color.length > 0) {
+			return props.color
+		}
+		return '#404040'
+	})
+
+	const imageDataURL = ref('')
+	const imgWidth = ref<number>(0)
+	const imgHeight = ref<number>(0)
+	const errMsg = ref('')
+
+	const imgStyle = computed((): string => {
+		if (imgWidth.value > 0 && imgHeight.value > 0) {
+			return 'width:' + imgWidth.value + 'px;height:' + imgHeight.value + 'px;'
+		}
+		return 'width:auto;height:auto;'
+	})
+
+	/** 加载中占位样式：块级给最小高度防布局抖动，行内给最小宽度 */
+	const placeholderStyle = computed((): string => {
+		if (isInline.value == true) {
+			return 'min-width:60px;min-height:20px;'
+		}
+		return 'width:100%;min-height:24px;'
+	})
+
+	// ---- 流式防抖 + 过期丢弃 ----
+	// tex 在 SSE 流式下高频变化，16ms（约一帧）合并；renderToken 保证只采纳最新一次结果。
+	let renderToken = 0
+	let debounceTimer = 0
+
+	function scheduleRender(): void {
+		if (debounceTimer != 0) {
+			clearTimeout(debounceTimer)
+		}
+		debounceTimer = setTimeout((): void => {
+			debounceTimer = 0
+			const texVal = props.tex ?? ''
+			if (texVal.length == 0) {
+				imageDataURL.value = ''
+				errMsg.value = ''
+				return
+			}
+			renderToken = renderToken + 1
+			const myToken = renderToken
+			const t0 = Date.now()
+			const opts: RatexRenderOptions = {
+				displayMode: props.displayMode == true,
+				fontSize: resolveFontSize.value,
+				color: resolveColor.value,
+			}
+			renderLatexAsync(texVal, opts, (res): void => {
+				// 过期结果丢弃（流式已推进到更新的 tex）
+				if (myToken != renderToken) {
+					return
+				}
+				const elapsed = Date.now() - t0
+				if (res.errMsg.length > 0) {
+					imageDataURL.value = ''
+					errMsg.value = res.errMsg
+					const err = new UTSJSONObject()
+					err['errMsg'] = res.errMsg
+					emit('error', err)
+				} else {
+					imageDataURL.value = res.imageDataURL
+					imgWidth.value = res.width
+					imgHeight.value = res.height
+					errMsg.value = ''
+					const ok = new UTSJSONObject()
+					ok['width'] = res.width
+					ok['height'] = res.height
+					ok['elapsed'] = elapsed
+					emit('load', ok)
+				}
+			})
+		}, 16) as number
+	}
+
+	// watch 的 getter 源在 Android(Kotlin) 编译对基本类型返回值有类型问题，
+	// 统一用 computed 包成 Ref 再 watch（与 nuwax-katex / ai-msg.uvue 写法一致）
+	const watchedTex = computed((): string => props.tex ?? '')
+	const watchedDisplayMode = computed((): boolean => props.displayMode == true)
+	const watchedFontSize = computed((): number => props.fontSize ?? 0)
+	const watchedColor = computed((): string => props.color ?? '')
+
+	watch(watchedTex, (): void => {
+		scheduleRender()
+	})
+	watch(watchedDisplayMode, (): void => {
+		scheduleRender()
+	})
+	watch(watchedFontSize, (): void => {
+		scheduleRender()
+	})
+	watch(watchedColor, (): void => {
+		scheduleRender()
+	})
+
+	onMounted((): void => {
+		scheduleRender()
+	})
+
+	onUnmounted((): void => {
+		// 虚拟列表回收组件时取消 pending 渲染，防止 executor 队列无限堆积
+		if (debounceTimer != 0) {
+			clearTimeout(debounceTimer)
+			debounceTimer = 0
+		}
+		renderToken = -1
+	})
+</script>
+
+<style lang="scss">
+	// 块级：居中（超宽横滚由外层 scroll-view 负责，组件内不滚）
+	.rx-root {
+		width: 100%;
+	}
+	.rx-root-block {
+		display: flex;
+		flex-direction: row;
+		justify-content: center;
+		align-items: center;
+	}
+	// 行内：flex 嵌入文本流（uni-app x 无 inline，外层 flex 行对齐）
+	.rx-root-inline {
+		width: auto;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		flex-shrink: 0;
+	}
+
+	.rx-img {
+		flex-shrink: 0;
+		background-color: transparent;
+	}
+	.rx-img-inline {
+		background-color: transparent;
+	}
+
+	.rx-fallback {
+		font-size: 28rpx;
+		color: #999;
+		line-height: 40rpx;
+	}
+
+	.rx-placeholder {
+		background-color: transparent;
+	}
+</style>

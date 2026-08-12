@@ -1426,15 +1426,15 @@ test("Unicode 揭示边界不会拆开 Emoji 代理对", () => {
   assert.equal(text.substring(0, mirrorSafeRevealEnd(text, 2)), "甲😀");
 });
 
-test("纯文本快速通道始终使用单个原生 text，避免冻结分段丢高度", () => {
+test("纯文本快速通道冻结长前缀，仅直写短 live 尾部", () => {
   const source = readFileSync(
     new URL("../subpackages/components/ai-msg/plain-stream-fast-text.uvue", import.meta.url),
     "utf8",
   );
-  assert.match(source, /displayChunk\.value = text/);
-  assert.match(source, /<text v-if="displayChunk\.length > 0"/);
-  assert.doesNotMatch(source, /PlainStreamFrozenText/);
-  assert.doesNotMatch(source, /FREEZE_CHUNK_CHARS/);
+  assert.match(source, /v-for="\(chunk, index\) in frozenChunks"/);
+  assert.match(source, /v-if="liveChunk\.length > 0"/);
+  assert.match(source, /const FREEZE_TARGET_CHARS: number = 512/);
+  assert.match(source, /liveEl\.value = nextLive/);
 });
 
 test("仅在大块或 p95 间隔超过阈值时开启二次匀速", () => {
@@ -1464,7 +1464,8 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   const service = readFileSync(new URL("../subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts", import.meta.url), "utf8");
   const scroll = readFileSync(new URL("../subpackages/pages/chat-conversation-component/layers/ScrollManager.uts", import.meta.url), "utf8");
   assert.match(aiMsg, /answer-plain-stream-text/);
-  assert.match(fastText, /displayChunk/);
+  assert.match(fastText, /frozenChunks/);
+  assert.match(fastText, /liveChunk/);
   assert.match(fastText, /visibleBatchChars > 16/);
   assert.match(aiMsg, /\$callMethod\("updateText"/);
   assert.match(aiMsg, /resolveStreamRenderProfile/);
@@ -1494,7 +1495,7 @@ test("快速通道结束时先同步累计正文再执行 Markdown 定稿", () =
   );
 });
 
-test("纯文本叶子以 64ms leading/trailing 通知既有滚动跟底链路", () => {
+test("纯文本叶子以 240ms leading/trailing 通知既有滚动跟底链路", () => {
   const aiMsg = readFileSync(
     new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
     "utf8",
@@ -1504,7 +1505,7 @@ test("纯文本叶子以 64ms leading/trailing 通知既有滚动跟底链路", 
     "utf8",
   );
   assert.match(fastText, /displayProgress: \[\]/);
-  assert.match(fastText, /const DISPLAY_PROGRESS_MS: number = 64/);
+  assert.match(fastText, /const DISPLAY_PROGRESS_MS: number = 240/);
   assert.match(
     fastText,
     /function emitDisplayProgress\(\): void[\s\S]*?progressPending = true[\s\S]*?emit\("displayProgress"\)[\s\S]*?DISPLAY_PROGRESS_MS/,
@@ -1512,7 +1513,7 @@ test("纯文本叶子以 64ms leading/trailing 通知既有滚动跟底链路", 
   assert.match(aiMsg, /@displayProgress="handlePlainStreamDisplayProgress"/);
   assert.match(
     aiMsg,
-    /function handlePlainStreamDisplayProgress\(\): void[\s\S]*?uni\.\$emit\("streamMessageUpdate"\)/,
+    /function handlePlainStreamDisplayProgress\(\): void[\s\S]*?uni\.\$emit\("streamMessageUpdate", "leaf"\)/,
   );
 });
 
@@ -1576,9 +1577,9 @@ test("正式业务默认关闭性能日志并移除首页临时入口", () => {
   assert.doesNotMatch(home, />\s*Pref test\s*</);
 });
 
-console.log("\n[11] list-view 长会话回收边界");
+console.log("\n[11] scroll-view 虚拟列表边界");
 
-test("正式会话默认使用 list-view，性能 Mock 仍可切回 scroll-view 对照", () => {
+test("正式会话默认使用虚拟 scroll-view，性能 Mock 可切 full-scroll 对照", () => {
   const conversation = readFileSync(
     new URL("../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue", import.meta.url),
     "utf8",
@@ -1587,23 +1588,24 @@ test("正式会话默认使用 list-view，性能 Mock 仍可切回 scroll-view 
     new URL("../subpackages/pages/chat-conversation-component/layers/mockStreamPerf.uts", import.meta.url),
     "utf8",
   );
-  assert.match(conversation, /const useListView = ref<boolean>\(true\)/);
-  assert.match(mock, /PERF_MOCK_DEFAULT_USE_LISTVIEW = false/);
+  assert.match(conversation, /const useVirtualScroll = ref<boolean>\(true\)/);
+  assert.match(mock, /PERF_MOCK_DEFAULT_USE_VIRTUAL_SCROLL = false/);
   assert.doesNotMatch(conversation, /class="render-toggle-btn"/);
   assert.match(conversation, /v-if="isPerfMock" class="perf-overlay"/);
+  assert.match(conversation, /virtual-scroll' : 'full-scroll/);
 });
 
-test("list-view 按真实消息结构拆分复用池并保留稳定 key", () => {
+test("虚拟 scroll-view 仅挂载窗口切片并用聚合 spacer 占位", () => {
   const conversation = readFileSync(
     new URL("../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue", import.meta.url),
     "utf8",
   );
   assert.match(conversation, /:key="`\$\{item\.id\}_\$\{item\.index\}`"/);
-  assert.match(conversation, /:type="getMessageListItemType\(item\)"/);
-  assert.match(
-    conversation,
-    /function getMessageListItemType\([\s\S]*?isAssistantMessage\(item\)[\s\S]*?return 1[\s\S]*?hasMessageAttachments\(item\)[\s\S]*?return 3[\s\S]*?return 2/,
-  );
+  assert.match(conversation, /v-for="\(item, visibleIndex\) in renderedMessages"/);
+  assert.match(conversation, /virtualTopSpacerHeight/);
+  assert.match(conversation, /virtualBottomSpacerHeight/);
+  assert.match(conversation, /new VirtualMessageListManager\(\)/);
+  assert.doesNotMatch(conversation, /<list-view/);
 });
 
 console.log("\n[12] Android 代码流式轻量代码块快通道");
@@ -1678,6 +1680,30 @@ test("代码类型直更轻量代码叶子，终态及混合类型走完整 Mark
   assert.match(codeStream, /parseCodeStreamSegments/);
 });
 
+test("mixed 流不进入纯文本源码预览，正文增长只作为流式证据", () => {
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  const plainRoute = aiMsg.slice(
+    aiMsg.indexOf("function canUseAndroidPlainStream"),
+    aiMsg.indexOf("// ==================== Android 代码流式真实渲染器快通道"),
+  );
+  const scheduleRoute = aiMsg.slice(
+    aiMsg.indexOf("function scheduleBodyMarkdownParse"),
+    aiMsg.indexOf("const renderMarkdownElList"),
+  );
+  assert.match(plainRoute, /kind == STREAM_RENDER_KIND_PLAIN/);
+  assert.doesNotMatch(
+    plainRoute,
+    /STREAM_RENDER_KIND_(?:TABLE|FORMULA|MIXED)/,
+  );
+  assert.doesNotMatch(
+    scheduleRoute,
+    /canUseAndroidPlainStream\(rawBody\)[\s\S]{0,80}\|\|\s*bodyGrowing/,
+  );
+});
+
 test("Mermaid 独立分类并复用轻量代码叶子，普通文本提及 mermaid 不误判", () => {
   const policy = readFileSync(
     new URL("../subpackages/components/ai-msg/streamRenderPolicy.uts", import.meta.url),
@@ -1687,10 +1713,31 @@ test("Mermaid 独立分类并复用轻量代码叶子，普通文本提及 merma
     new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
     "utf8",
   );
+  const mathRender = readFileSync(
+    new URL("../uni_modules/uni-ai-x/sdk/math-render.uts", import.meta.url),
+    "utf8",
+  );
+  const conversation = readFileSync(
+    new URL(
+      "../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue",
+      import.meta.url,
+    ),
+    "utf8",
+  );
   assert.match(policy, /STREAM_RENDER_KIND_MERMAID = "mermaid"/);
   assert.match(policy, /hasMermaidFence/);
   assert.doesNotMatch(policy, /body\.indexOf\("mermaid"\)/);
   assert.match(aiMsg, /kind == STREAM_RENDER_KIND_MERMAID/);
+  assert.match(mathRender, /MERMAID_RENDER_ENABLED: boolean = true/);
+  assert.match(conversation, /:src="markdownProxySrc"/);
+  assert.match(
+    conversation,
+    /file:\/\/\/android_asset\/apps\/__UNI__8BF05E4\/www\/uni_modules\/uni-ai-x\/static\/proxy-web\/proxy-web\.html/,
+  );
+  assert.match(
+    conversation,
+    /handleProxyWebError[\s\S]{0,500}markdownProxySrc\.value = MARKDOWN_PROXY_ANDROID_ASSET_PATH/,
+  );
 });
 
 console.log("\n[13] mixed 流结构边界与代码高亮隔离");

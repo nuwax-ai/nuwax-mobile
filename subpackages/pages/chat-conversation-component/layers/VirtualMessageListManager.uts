@@ -1,0 +1,180 @@
+/**
+ * scroll-view 消息虚拟布局。
+ * 屏外消息只保留 key/height/offset；DOM 只需要 top/bottom 两个聚合 spacer。
+ */
+export class VirtualMessageRange {
+  start: number = 0;
+  end: number = 0;
+  topSpacer: number = 0;
+  bottomSpacer: number = 0;
+  totalHeight: number = 0;
+}
+
+export class VirtualMessageAnchor {
+  key: string = "";
+  offsetInRow: number = 0;
+}
+
+export default class VirtualMessageListManager {
+  private keys: string[] = [];
+  private heights: number[] = [];
+  /** offsets[i] 是第 i 行顶部；offsets[length] 是总高度。 */
+  private offsets: number[] = [0];
+  private indexByKey: Map<string, number> = new Map<string, number>();
+
+  sync(keys: string[], estimates: number[]): void {
+    const oldHeightByKey = new Map<string, number>();
+    for (let i = 0; i < this.keys.length; i++) {
+      oldHeightByKey.set(this.keys[i], this.heights[i]);
+    }
+
+    const nextKeys: string[] = [];
+    const nextHeights: number[] = [];
+    const nextIndex = new Map<string, number>();
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      nextKeys.push(key);
+      nextIndex.set(key, i);
+      const measured = oldHeightByKey.get(key);
+      const estimate = i < estimates.length ? estimates[i] : 120;
+      nextHeights.push(measured != null ? measured : Math.max(24, estimate));
+    }
+    this.keys = nextKeys;
+    this.heights = nextHeights;
+    this.indexByKey = nextIndex;
+    this.rebuildOffsets(0);
+  }
+
+  count(): number {
+    return this.keys.length;
+  }
+
+  totalHeight(): number {
+    return this.offsets.length > 0 ? this.offsets[this.offsets.length - 1] : 0;
+  }
+
+  keyAt(index: number): string {
+    if (index < 0 || index >= this.keys.length) return "";
+    return this.keys[index];
+  }
+
+  offsetAt(index: number): number {
+    if (index <= 0) return 0;
+    if (index >= this.offsets.length) return this.totalHeight();
+    return this.offsets[index];
+  }
+
+  offsetForKey(key: string): number {
+    const index = this.indexByKey.get(key);
+    return index != null ? this.offsetAt(index) : -1;
+  }
+
+  indexForKey(key: string): number {
+    const index = this.indexByKey.get(key);
+    return index != null ? index : -1;
+  }
+
+  /** 返回高度差；小于 1px 的布局噪声忽略。 */
+  recordHeight(key: string, height: number): number {
+    const index = this.indexByKey.get(key);
+    if (index == null || height <= 0) return 0;
+    const normalized = Math.max(24, height);
+    const delta = normalized - this.heights[index];
+    if (Math.abs(delta) < 1) return 0;
+    this.heights[index] = normalized;
+    this.rebuildOffsets(index);
+    return delta;
+  }
+
+  /** 流式行离屏时只允许估算高度向上增长；重新挂载后由 recordHeight 精确校正。 */
+  growEstimatedHeight(key: string, height: number): number {
+    const index = this.indexByKey.get(key);
+    if (index == null || height <= this.heights[index]) return 0;
+    const delta = height - this.heights[index];
+    this.heights[index] = height;
+    this.rebuildOffsets(index);
+    return delta;
+  }
+
+  calculateRange(
+    scrollTop: number,
+    viewportHeight: number,
+    overscan: number,
+  ): VirtualMessageRange {
+    const result = new VirtualMessageRange();
+    const count = this.keys.length;
+    const total = this.totalHeight();
+    result.totalHeight = total;
+    if (count == 0) return result;
+
+    const safeViewport = Math.max(1, viewportHeight);
+    const startOffset = Math.max(0, scrollTop - overscan);
+    const endOffset = Math.min(total, scrollTop + safeViewport + overscan);
+    const start = this.findIndexAtOffset(startOffset);
+    let end = this.findIndexAtOffset(endOffset) + 1;
+    if (end > count) end = count;
+    if (end <= start) end = Math.min(count, start + 1);
+
+    result.start = start;
+    result.end = end;
+    result.topSpacer = this.offsetAt(start);
+    result.bottomSpacer = Math.max(0, total - this.offsetAt(end));
+    return result;
+  }
+
+  captureAnchor(scrollTop: number): VirtualMessageAnchor {
+    const anchor = new VirtualMessageAnchor();
+    if (this.keys.length == 0) return anchor;
+    const index = this.findIndexAtOffset(Math.max(0, scrollTop));
+    anchor.key = this.keys[index];
+    anchor.offsetInRow = Math.max(0, scrollTop - this.offsetAt(index));
+    return anchor;
+  }
+
+  restoreAnchor(anchor: VirtualMessageAnchor): number {
+    if (anchor.key.length == 0) return -1;
+    const offset = this.offsetForKey(anchor.key);
+    return offset >= 0 ? offset + anchor.offsetInRow : -1;
+  }
+
+  private rebuildOffsets(startIndex: number): void {
+    if (startIndex <= 0 || this.offsets.length != this.heights.length + 1) {
+      this.offsets = [0];
+      startIndex = 0;
+    }
+    for (let i = startIndex; i < this.heights.length; i++) {
+      const previous = i == 0 ? 0 : this.offsets[i];
+      if (this.offsets.length > i + 1) {
+        this.offsets[i + 1] = previous + this.heights[i];
+      } else {
+        this.offsets.push(previous + this.heights[i]);
+      }
+    }
+    if (this.offsets.length > this.heights.length + 1) {
+      this.offsets = this.offsets.slice(0, this.heights.length + 1);
+    }
+  }
+
+  private findIndexAtOffset(offset: number): number {
+    const count = this.keys.length;
+    if (count <= 1) return 0;
+    if (offset <= 0) return 0;
+    if (offset >= this.totalHeight()) return count - 1;
+
+    let low = 0;
+    let high = count - 1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const top = this.offsets[mid];
+      const bottom = this.offsets[mid + 1];
+      if (offset < top) {
+        high = mid - 1;
+      } else if (offset >= bottom) {
+        low = mid + 1;
+      } else {
+        return mid;
+      }
+    }
+    return Math.max(0, Math.min(count - 1, low));
+  }
+}

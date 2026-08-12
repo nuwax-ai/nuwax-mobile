@@ -31,8 +31,12 @@ export default class ScrollManager {
    * 让每次动画有空间完成——过小（32）动画频繁打断呈抖动，过大（如 100）跟底滞后「慢一步」。
    */
   private readonly SCROLL_THROTTLE_MS: number = 32;
+  /** 结构化流无需按 chunk 滚动；跟随 Markdown 合并提交节奏即可。 */
+  private readonly STRUCT_SCROLL_THROTTLE_MS: number = 180;
   /** 流式内容晚撑高（工具卡片 / Markdown）后的短补滚定时器 */
   private streamFollowTimers: number[] = [];
+  /** 同一时间只允许一组晚撑高补滚，避免每个 chunk 清理并重建多个 timer。 */
+  private streamFollowScheduled: boolean = false;
   /** setIsInScrollBottom 节流 */
   private bottomCheckTimer: number = 0;
   private pendingBottomEvent: UniScrollEvent | null = null;
@@ -81,6 +85,9 @@ export default class ScrollManager {
     this.scrollThrottleMayRelayout = contentMayRelayout;
     this.doScrollToLastMsg(false, contentMayRelayout);
     this.scrollThrottlePending = false;
+    const throttleMs = contentMayRelayout == true
+      ? this.STRUCT_SCROLL_THROTTLE_MS
+      : this.SCROLL_THROTTLE_MS;
     this.scrollThrottleTimer = setTimeout((): void => {
       this.scrollThrottleTimer = 0;
       if (this.scrollThrottlePending == true) {
@@ -89,7 +96,7 @@ export default class ScrollManager {
         this.scrollThrottleMayRelayout = false;
         this.doScrollToLastMsg(false, mayRelayout);
       }
-    }, this.SCROLL_THROTTLE_MS) as number;
+    }, throttleMs) as number;
   }
 
   /** 实际执行 scroll-into-view 滚底（官方推荐） */
@@ -99,7 +106,12 @@ export default class ScrollManager {
   ): void {
     this.data.autoToLastMsg.value = true;
     this.data.scrollIntoView.value = "";
-    this.data.scrollWithAnimation.value = userClick;
+    // 纯文本/轻量叶子流（contentMayRelayout=false）按低频进度事件跟底。
+    // 若仍关闭动画，每次 scroll-into-view 都是一次离散跳跃，视觉上约 240ms 卡一下；
+    // 让原生 scroll-view 在相邻锚点间补间，形成连续跟随。结构化内容仍保持无动画，
+    // 避免异步撑高时动画目标持续变化。
+    this.data.scrollWithAnimation.value =
+      userClick == true || contentMayRelayout != true;
     nextTick(() => {
       this.data.scrollIntoView.value = "last-msg";
       // C2：用户上滑后回到底时，type=95 的 last-msg 锚点可能已被 list-view 回收/detach，
@@ -142,6 +154,7 @@ export default class ScrollManager {
       clearTimeout(this.streamFollowTimers[i]);
     }
     this.streamFollowTimers = [];
+    this.streamFollowScheduled = false;
   }
 
   /**
@@ -149,15 +162,21 @@ export default class ScrollManager {
    * 用户上滑（autoToLastMsg=false / scrollTouch）时立刻停。
    */
   private scheduleStreamFollowRetries(): void {
-    this.clearStreamFollowRetries();
-    // 流式期 doScroll 每 ~64ms 触发一次；公式图 / 工具卡异步回填常在渲染后 100~300ms 撑高，
-    // 单次 120ms 兜底可能错过（锚点已按旧高度定位，底部留白 = 慢一步）。
-    // 加密为 3 批（60/180/420）持续吃到异步撑高；每次补滚前都校验 autoToLastMsg/scrollTouch，
-    // 用户上滑立即停，故窗口内多个 pending 定时器不会叠加成滚动风暴。
-    const delays = [120, 140, 160];
+    if (this.streamFollowScheduled == true) {
+      return;
+    }
+    this.streamFollowScheduled = true;
+    // 结构化流的 Markdown 本身已按 280~720ms 合并提交；每个 chunk 并发安排三次
+    // scroll-into-view 会持续打断原生 scroll-view 布局。保留一次 220ms 晚撑高补滚，
+    // 公式图 / 工具卡继续由 content-ready 和下一次结构提交兜底。
+    const delays = [220];
     for (let i = 0; i < delays.length; i++) {
       const delay = delays[i];
       const timerId = setTimeout((): void => {
+        if (i == delays.length - 1) {
+          this.streamFollowTimers = [];
+          this.streamFollowScheduled = false;
+        }
         if (this.data.autoToLastMsg.value != true) {
           this.clearStreamFollowRetries();
           return;
@@ -175,8 +194,6 @@ export default class ScrollManager {
             return;
           }
           this.data.scrollIntoView.value = "last-msg";
-          // C2 兜底：跟底补滚期间锚点也可能被回收，同帧发 scroll-top 高位哨兵
-          this.pulseScrollToBottom();
           this.data.scrollInBottom.value = true;
         });
       }, delay) as number;

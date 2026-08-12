@@ -1,5 +1,16 @@
 <template>
-  <text v-if="displayChunk.length > 0" class="plain-stream-live-text" :style="textStyle">{{ displayChunk }}</text>
+  <view v-if="hasDisplayText" class="plain-stream-text-stack" :style="textStyle">
+    <text
+      v-for="(chunk, index) in frozenChunks"
+      :key="`frozen-${index}`"
+      class="plain-stream-frozen-text"
+    >{{ chunk }}</text>
+    <text
+      v-if="liveChunk.length > 0"
+      ref="liveTextRef"
+      class="plain-stream-live-text"
+    >{{ liveChunk }}</text>
+  </view>
 </template>
 
 <script lang="uts" setup>
@@ -26,13 +37,21 @@
     displayProgress: [];
   }>();
 
-  const displayChunk = ref<string>("");
+  const frozenChunks = ref<string[]>([] as string[]);
+  const liveChunk = ref<string>("");
+  const liveTextRef = ref<UniTextElement | null>(null);
+  const hasDisplayText = computed((): boolean => {
+    return frozenChunks.value.length > 0 || liveChunk.value.length > 0;
+  });
   let displayText: string = "";
   let targetText: string = "";
+  let frozenTextLength: number = 0;
   let timer: number = 0;
   let progressTimer: number = 0;
   let progressPending: boolean = false;
-  const DISPLAY_PROGRESS_MS: number = 64;
+  const DISPLAY_PROGRESS_MS: number = 240;
+  /** live 尾部达到该长度后，在自然换行处冻结，避免累计 text 每次刷新全文重排。 */
+  const FREEZE_TARGET_CHARS: number = 512;
 
   function clearTimer(): void {
     if (timer != 0) {
@@ -42,10 +61,10 @@
   }
 
   /**
-   * 可见正文增长只需按跟底窗口报告，不应跟 24ms paint 同频触发 scroll-view。
+   * 可见正文增长只需按跟底窗口报告，不应跟文本 paint 同频触发 scroll-view。
    * 否则一次字符 patch 紧跟一次 scroll-into-view，会把 Android DOM 批处理拖成
    * 160～250ms 的反馈环，反而表现为整块上屏。这里使用 leading + trailing，
-   * 连续输出最多每 64ms 通知一次，结束尾帧也不会丢。
+   * 连续输出最多每 240ms 通知一次，约等于正文新增一行的节奏；结束尾帧也不会丢。
    */
   function emitDisplayProgress(): void {
     if (progressTimer != 0) {
@@ -71,10 +90,34 @@
   }
 
   function paint(text: string): void {
+    if (text.indexOf(displayText) != 0 || text.length < frozenTextLength) {
+      frozenChunks.value = [] as string[];
+      frozenTextLength = 0;
+    }
     displayText = text;
-    // 单个原生 text 始终持有累计正文。拆成跨组件 fragment 后，Android 在冻结段
-    // 替换 live 尾段时可能只按尾段重算高度，导致 scroll-view 流式过程中高度骤减。
-    displayChunk.value = text;
+    let remaining = text.length - frozenTextLength;
+    let frozeChunk = false;
+    while (remaining >= FREEZE_TARGET_CHARS) {
+      const preferredEnd = frozenTextLength + FREEZE_TARGET_CHARS;
+      let cut = text.indexOf("\n", preferredEnd);
+      if (cut < 0) break;
+      cut = cut + 1;
+      const next = frozenChunks.value.slice();
+      next.push(text.substring(frozenTextLength, cut));
+      frozenChunks.value = next;
+      frozenTextLength = cut;
+      frozeChunk = true;
+      remaining = text.length - frozenTextLength;
+    }
+    const nextLive = text.substring(frozenTextLength);
+    const liveEl = liveTextRef.value;
+    if (liveEl != null && frozeChunk != true) {
+      // 高频热路径直写原生 text，避免 liveChunk.value 每次触发 Vue 子树 diff。
+      liveEl.value = nextLive;
+    } else {
+      // 首次挂载 / 冻结边界仍提交一次响应式状态，同步新 frozen 块。
+      liveChunk.value = nextLive;
+    }
     emitDisplayProgress();
     if (displayText == targetText) {
       emit("caughtUp");
@@ -100,7 +143,7 @@
     const wasBehindPreviousTarget = displayText.length < previousTargetLength;
     const visibleBatchChars = text.length - previousTargetLength;
     targetText = text;
-    // 原始 SSE 可能是密集小块，但经过 24ms UI 合并后形成一次几十字的可见突发。
+    // 原始 SSE 可能是密集小块，但经过 UI 合并后形成一次几十字的可见突发。
     // 在叶子层按实际目标增量兜底，避免只看 raw chunk 的 p95/maxChunk 时误判为无需匀速。
     const shouldPace =
       pacing == true ||
@@ -134,6 +177,19 @@
 
 <style lang="scss">
   .plain-stream-live-text {
+    width: 100%;
+    color: #404040;
+    font-size: 32rpx;
+    line-height: 48rpx;
+    white-space: pre-wrap;
+  }
+
+  .plain-stream-text-stack {
+    width: 100%;
+    flex-direction: column;
+  }
+
+  .plain-stream-frozen-text {
     width: 100%;
     color: #404040;
     font-size: 32rpx;

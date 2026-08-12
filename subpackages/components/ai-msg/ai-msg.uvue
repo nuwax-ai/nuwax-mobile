@@ -61,7 +61,7 @@
             :initial-text="plainStreamInitialText"
             :pacing="streamDisplayPacing"
             :text-style="plainStreamTextStyle"
-            @caughtUp="tryFinishPlainStreamFinalization"
+            @caughtUp="handlePlainStreamCaughtUp"
             @displayProgress="handlePlainStreamDisplayProgress"
           />
         </template>
@@ -87,7 +87,7 @@
           :markdown-el-list="renderMarkdownElList"
           :processing-list="renderProcessingList"
           :conversation-id="msg.chat_id"
-          :body-text="resolveBodyText()"
+          :body-text="markdownRenderBodyText"
           :is-app-details="isAppDetails"
         />
       </view>
@@ -156,6 +156,7 @@
     STREAM_RENDER_KIND_MERMAID,
     STREAM_RENDER_KIND_TABLE,
     STREAM_RENDER_KIND_FORMULA,
+    STREAM_RENDER_KIND_MIXED,
   } from "@/subpackages/components/ai-msg/streamRenderPolicy.uts";
 
   const { t: tFn } = useI18n();
@@ -184,6 +185,8 @@
       speakableText?: string;
       // 会话是否正在进行中（有消息正在处理）
       isConversationActive?: boolean;
+      /** 权威 SSE 叶子目标；虚拟窗口中比 active/last/status 派生状态更稳定。 */
+      isStreamingMsg?: boolean;
       taskStatus?: TaskStatus;
       // 是否是最后一条消息
       isLastMsg?: boolean;
@@ -308,6 +311,13 @@
   const msg = ref<MsgItem>(new MsgItem());
   /** App 流式：强制触发正文 markdown / UniAiXMsgRender 失效 */
   const streamRevision = ref<number>(0);
+  /**
+   * 与 markdownElList 同批提交给重渲染子树的正文快照。
+   * 权威 body 仍可按 SSE chunk 高频增长，但 OpenUI 等需要正文上下文的渲染器
+   * 只应在 Markdown 解析提交时看到新值，否则 bodyText prop 会绕开解析合并窗，
+   * 让整个 UniAiXMsgRender 在每个 chunk 上空转更新。
+   */
+  const markdownRenderBodyText = ref<string>("");
 
   function mergeMsgFromProps(incoming: MsgItem): void {
     const cur = msg.value;
@@ -414,6 +424,21 @@
   const isLastMsg = computed((): boolean => props.isLastMsg == true);
   const isConversationActive = computed((): boolean => props.isConversationActive == true);
   const showToolBar = computed((): boolean => props.showToolBar == true);
+
+  /**
+   * 虚拟窗口挂载/换窗时 active 与 last 两个 prop 可能分帧到达；当前气泡自身的
+   * Loading/Incomplete 状态更早且不会命中历史完成消息。真实 SSE 中间事件偶尔
+   * 提前写 Complete 时，仍由父级 active + last 兜底。
+   */
+  function isActiveStreamMessage(): boolean {
+    if (props.isStreamingMsg == true) {
+      return true;
+    }
+    if (msg.value.state == 1 || msg.value.state == 2) {
+      return true;
+    }
+    return isConversationActive.value == true && isLastMsg.value == true;
+  }
   const showLoadingIcon = computed((): boolean => {
     // 本地 Loading 态优先：占位气泡的 messageStatus=Loading 同步传入 → 本地 state=1 立即可知。
     // Android 上 isConversationActive / isLastMsg 两个 props 都可能晚几百 ms 才传到子组件
@@ -568,8 +593,54 @@
   );
   const plainStreamTextStyle: string = `width:${plainStreamWidthPx}px;`;
   let plainStreamTargetText: string = "";
+  /** 快通道显示可清洗，但终态定稿必须保留完整 SSE 原文。 */
+  let plainStreamAuthoritativeBody: string = "";
   let plainStreamFinalizeFrame: number = 0;
   let plainStreamSwapFrame: number = 0;
+  let plainStreamCaughtUp: boolean = false;
+  let observedStreamBodyLength: number = -1;
+  let bodyGrowthStreamingUntil: number = 0;
+  let bodyGrowthSettleTimer: number = 0;
+  const bodyGrowthSettleRevision = ref<number>(0);
+  let bodyGrowthForceSettle: boolean = false;
+
+  function clearBodyGrowthSettleTimer(): void {
+    if (bodyGrowthSettleTimer != 0) {
+      clearTimeout(bodyGrowthSettleTimer);
+      bodyGrowthSettleTimer = 0;
+    }
+  }
+
+  /**
+   * 不依赖父级 active/last/status：同一挂载正文连续变长就是最直接的流式证据。
+   * 历史正文只在首次挂载出现一次，不会命中；停止增长后补一次终态定稿。
+   */
+  function observeStreamingBodyGrowth(body: string): boolean {
+    const previousLength = observedStreamBodyLength;
+    // 虚拟行可能从长历史消息 rebind 到新流式气泡；长度回退即建立新基线。
+    if (previousLength >= 0 && body.length < previousLength) {
+      observedStreamBodyLength = body.length;
+      bodyGrowthStreamingUntil = 0;
+      clearBodyGrowthSettleTimer();
+      return false;
+    }
+    if (body.length > previousLength) {
+      observedStreamBodyLength = body.length;
+      if (previousLength >= 0) {
+        bodyGrowthForceSettle = false;
+        bodyGrowthStreamingUntil = Date.now() + 1500;
+        clearBodyGrowthSettleTimer();
+        bodyGrowthSettleTimer = setTimeout((): void => {
+          bodyGrowthSettleTimer = 0;
+          bodyGrowthStreamingUntil = 0;
+          bodyGrowthForceSettle = true;
+          bodyGrowthSettleRevision.value = bodyGrowthSettleRevision.value + 1;
+        }, 1500) as number;
+        return true;
+      }
+    }
+    return Date.now() < bodyGrowthStreamingUntil;
+  }
 
   const showPlainStreamText = computed((): boolean => {
     return (
@@ -595,15 +666,9 @@
     if (plainStreamFinalizing.value != true) {
       return;
     }
-    const el = plainStreamFastTextRef.value;
-    if (el != null) {
-      try {
-        const proxy = el as ComponentPublicInstance;
-        if (proxy.$callMethod("isCaughtUp") != true) return;
-      } catch (_eCaughtUp) {
-        return;
-      }
-    }
+    // Android 跨组件 $callMethod 的同步返回值可能为 null，即使子组件方法实际返回 true。
+    // 以 caughtUp 事件维护本地状态，避免终态 Markdown 已就绪却永久停在纯文本预览。
+    if (plainStreamCaughtUp != true) return;
     if (markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) != true) {
       return;
     }
@@ -625,13 +690,18 @@
     }
   }
 
+  function handlePlainStreamCaughtUp(): void {
+    plainStreamCaughtUp = true;
+    tryFinishPlainStreamFinalization();
+  }
+
   /**
-   * 纯文本叶子的 24ms 匀速 paint 不经过 AgentDetailService 的 UI 冲刷，
+   * 纯文本叶子的匀速 paint 不经过 AgentDetailService 的 UI 冲刷，
    * 需要复用既有 streamMessageUpdate → ScrollManager 跟底链路报告可见高度增长。
    * 是否允许跟底仍由上层 autoToLastMsg / scrollTouch 守卫决定。
    */
   function handlePlainStreamDisplayProgress(): void {
-    if (isLastMsg.value != true) {
+    if (isActiveStreamMessage() != true) {
       return;
     }
     if (
@@ -640,22 +710,25 @@
     ) {
       return;
     }
-    uni.$emit("streamMessageUpdate");
+    uni.$emit("streamMessageUpdate", "leaf");
   }
 
   function updatePlainStreamTarget(body: string): void {
-    plainStreamTargetText = body;
+    plainStreamAuthoritativeBody = body;
+    const preview = body;
+    plainStreamCaughtUp = false;
+    plainStreamTargetText = preview;
     const el = plainStreamFastTextRef.value;
     if (el != null) {
       try {
         const proxy = el as ComponentPublicInstance;
-        proxy.$callMethod("updateText", body, props.streamDisplayPacing == true);
+        proxy.$callMethod("updateText", preview, props.streamDisplayPacing == true);
         return;
       } catch (_eUpdateText) {
         // 首次挂载前落回 initialText；下一次 patch 会走叶子组件方法。
       }
     }
-    plainStreamInitialText.value = body;
+    plainStreamInitialText.value = preview;
   }
 
   /**
@@ -664,13 +737,16 @@
    * 可能读取到父级尚未刷新的旧 body，并用旧内容替换已经正确显示的原生文本。
    */
   function commitFastStreamBody(body: string): string {
-    if (body.length == 0) {
+    const authoritative = plainStreamAuthoritativeBody.length > 0
+      ? plainStreamAuthoritativeBody
+      : body;
+    if (authoritative.length == 0) {
       return resolveBodyText();
     }
-    if (msg.value.body != body) {
-      msg.value.body = body;
+    if (msg.value.body != authoritative) {
+      msg.value.body = authoritative;
     }
-    return body;
+    return authoritative;
   }
 
   function enterPlainStream(body: string): void {
@@ -687,19 +763,28 @@
   function leavePlainStreamForMarkdown(): void {
     clearPlainStreamFinalizeFrame();
     plainStreamTargetText = "";
+    plainStreamAuthoritativeBody = "";
     plainStreamInitialText.value = "";
     plainStreamEngaged.value = false;
     plainStreamFinalizing.value = false;
     plainStreamCompleted.value = false;
+    plainStreamCaughtUp = false;
   }
 
   function resetPlainStreamState(): void {
     leavePlainStreamForMarkdown();
+    observedStreamBodyLength = -1;
+    bodyGrowthStreamingUntil = 0;
+    bodyGrowthForceSettle = false;
+    clearBodyGrowthSettleTimer();
   }
 
   function canUseAndroidPlainStream(body: string): boolean {
     // #ifdef APP-ANDROID
-    return resolveStreamRenderProfile(body).kind == STREAM_RENDER_KIND_PLAIN;
+    const kind = resolveStreamRenderProfile(body).kind;
+    // 只有真正的纯文本进入叶子快路。表格/公式/mixed 必须交给增量 fallback：
+    // 已闭合块冻结复用，只重解析短 live 尾部，流式期间即可显示结构化组件。
+    return kind == STREAM_RENDER_KIND_PLAIN;
     // #endif
     // #ifndef APP-ANDROID
     return false;
@@ -875,6 +960,7 @@
 
   function runBodyMarkdownParseNow(forceDone: boolean): void {
     clearStreamMdParseTimer();
+    markdownRenderBodyText.value = resolveBodyText();
     // App：始终立即 parse。磁盘缓存命中可直接出图，不必再等 proxyWeb（历史长公式页可省约 1s）；
     // 未命中公式由 flushMathJobs 在 proxy 就绪后再截图，占位过渡即可。
     // 注意：parser.applyAppFallback / bumpRevision 已会抬 streamRevision，此处勿再 bump，
@@ -894,16 +980,23 @@
         return;
       }
       streamMdParsePending = false;
+      markdownRenderBodyText.value = resolveBodyText();
       markdownParser.runMarkdownParse(false);
     }, intervalMs);
   }
 
   /** 流式：合并高频 chunk 后再解析；非流式：立即解析；首帧无结果时立即解析 */
   function scheduleBodyMarkdownParse(): void {
-    const streaming =
-      isConversationActive.value == true && isLastMsg.value == true;
     let rawBody = resolveBodyText();
-    if (streaming == true && canUseAndroidPlainStream(rawBody) == true) {
+    const bodyGrowing = observeStreamingBodyGrowth(rawBody);
+    const streaming =
+      isActiveStreamMessage() == true ||
+      bodyGrowing == true ||
+      (plainStreamEngaged.value == true && bodyGrowthForceSettle != true);
+    if (
+      streaming == true &&
+      canUseAndroidPlainStream(rawBody) == true
+    ) {
       enterPlainStream(rawBody);
       return;
     }
@@ -1130,8 +1223,8 @@
         const directBodyVal = directPatch["body"];
         if (
           directBodyVal != null &&
-          isConversationActive.value == true &&
-          isLastMsg.value == true
+          (isActiveStreamMessage() == true ||
+            observeStreamingBodyGrowth(`${directBodyVal}`) == true)
         ) {
           const directBody = `${directBodyVal}`;
           if (canUseAndroidPlainStream(directBody) == true) {
@@ -1194,11 +1287,15 @@
             thinkStreamRevision.value = thinkStreamRevision.value + 1;
           }
         }
-        if (bodyChanged == true || procChanged == true) {
+        // 正文到达只负责更新权威文本并安排合并解析；真正生成新渲染树时，
+        // AiMsgMarkdownParser 会 bump streamRevision。若每个 SSE patch 都先 bump，
+        // mixed 的旧 Markdown 子树会在 20ms chunk 频率下空转重绘，完全绕过
+        // 下方 280~720ms 的结构化解析合并窗。
+        if (procChanged == true) {
           streamRevision.value = streamRevision.value + 1;
-          if (bodyChanged == true) {
-            scheduleBodyMarkdownParse();
-          }
+        }
+        if (bodyChanged == true || procChanged == true) {
+          scheduleBodyMarkdownParse();
         }
       }
     } catch (error) {
@@ -1222,10 +1319,22 @@
         // list-view 回收 rebind：组件被复用给另一条消息，清掉旧消息挂起的解析定时器，
         // 避免旧延迟解析（runMarkdownParse）跑到新消息上造成串内容/错乱。
         clearStreamMdParseTimer();
+        // UTS 对 watch(ref.value._id) 的嵌套字段变更并不可靠，必须在权威 prop
+        // rebind 入口直接重置，否则长历史消息的 parser/快通道状态会污染新流。
+        resetPlainStreamState();
+        leaveCodeStreamForMarkdown();
+        resetFormulaStreamRenderer();
+        markdownParser.resetForNewMessage();
+        thinkFrozenParts = [] as string[];
+        thinkLivePart = "";
+        thinkPaintedRaw = "";
+        thinkTextPending = "";
+        thinkDisplayText.value = "";
         const next = new MsgItem();
         next._id = messageId;
         next.from_uid = "assistant";
         msg.value = next;
+        markdownRenderBodyText.value = "";
       }
     },
     { immediate: true },
@@ -1342,6 +1451,7 @@
       resetPlainStreamState();
       leaveCodeStreamForMarkdown();
       resetFormulaStreamRenderer();
+      markdownRenderBodyText.value = "";
       markdownParser.resetForNewMessage();
       thinkFrozenParts = [] as string[];
       thinkLivePart = "";
@@ -1363,6 +1473,10 @@
     },
     { immediate: true },
   );
+
+  watch(bodyGrowthSettleRevision, () => {
+    scheduleBodyMarkdownParse();
+  });
 
   /** 仅末条关心会话 active：开始→节流解析；结束→立刻定稿。历史消息忽略 active 抖动。 */
   watch(
@@ -1399,6 +1513,7 @@
     clearStreamMdParseTimer();
     clearPlainStreamFinalizeFrame();
     clearCodeStreamFinalizeFrame();
+    clearBodyGrowthSettleTimer();
     if (thinkTextThrottleTimer != null) {
       clearTimeout(thinkTextThrottleTimer!);
       thinkTextThrottleTimer = null;

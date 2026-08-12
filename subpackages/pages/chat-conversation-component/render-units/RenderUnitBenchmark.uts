@@ -1,0 +1,153 @@
+import { ConversationLayoutIndex } from "./ConversationLayoutIndex.uts";
+import { ConversationScrollState } from "./ConversationScrollState.uts";
+import {
+  RenderUnit,
+  RenderUnitLayoutSignature,
+} from "./RenderUnitModels.uts";
+
+export class RenderUnitBenchmarkResult {
+  passed: boolean = false;
+  unitCount: number = 0;
+  buildMs: number = 0;
+  queryMs: number = 0;
+  mutationMs: number = 0;
+  totalHeight: number = 0;
+  assertions: number = 0;
+  failure: string = "";
+}
+
+function ensure(condition: boolean, message: string): void {
+  if (condition != true) throw new Error(message);
+}
+
+function makeSignature(width: number): RenderUnitLayoutSignature {
+  const signature = new RenderUnitLayoutSignature();
+  signature.viewportWidth = width;
+  signature.fontScale = 1;
+  signature.platform = "android";
+  signature.rendererVersion = "render-unit-v1";
+  signature.expandedState = "collapsed";
+  return signature;
+}
+
+function makeUnits(count: number): RenderUnit[] {
+  const units = [] as RenderUnit[];
+  for (let i = 0; i < count; i++) {
+    const unit = new RenderUnit();
+    unit.key = `msg-${Math.floor(i / 5)}:block-${i}`;
+    unit.messageId = `${Math.floor(i / 5)}`;
+    unit.messageGroupKey = `msg-${unit.messageId}`;
+    unit.position = i % 5 == 0 ? "first" : i % 5 == 4 ? "last" : "middle";
+    unit.kind = i % 11 == 0 ? "formula" : i % 7 == 0 ? "code" : "markdown";
+    unit.frozen = i < count - 1;
+    unit.contentVersion = 1;
+    unit.layoutVersion = 1;
+    unit.layoutState = "estimated";
+    unit.estimatedHeight = 52 + (i % 9) * 18;
+    units.push(unit);
+  }
+  return units;
+}
+
+/** 在 App 真机内运行，无 Node/Vitest 依赖。失败直接写入 result.failure。 */
+export function runRenderUnitBenchmark(unitCount: number): RenderUnitBenchmarkResult {
+  const result = new RenderUnitBenchmarkResult();
+  result.unitCount = unitCount;
+  try {
+    const count = Math.max(100, unitCount);
+    const units = makeUnits(count);
+    const index = new ConversationLayoutIndex();
+    const buildStart = Date.now();
+    index.setUnits(units);
+    result.buildMs = Date.now() - buildStart;
+
+    ensure(index.count() == count, "setUnits count mismatch");
+    result.assertions++;
+    ensure(index.totalHeight() > count * 24, "totalHeight invalid");
+    result.assertions++;
+    const emptyIndex = new ConversationLayoutIndex();
+    ensure(emptyIndex.indexAt(0) == -1, "empty indexAt must return -1");
+    result.assertions++;
+
+    const queryStart = Date.now();
+    for (let i = 0; i < 5000; i++) {
+      const offset = index.totalHeight() * (i % 1000) / 1000;
+      const found = index.indexAt(offset);
+      ensure(found >= 0 && found < count, "indexAt out of range");
+    }
+    result.queryMs = Date.now() - queryStart;
+    result.assertions++;
+
+    const duplicateIndex = new ConversationLayoutIndex();
+    let duplicateRejected = false;
+    try {
+      const duplicated = makeUnits(2);
+      duplicated[1].key = duplicated[0].key;
+      duplicateIndex.setUnits(duplicated);
+    } catch (_error) {
+      duplicateRejected = true;
+    }
+    ensure(duplicateRejected, "duplicate unit key accepted");
+    result.assertions++;
+
+    const signature = makeSignature(1080);
+    const anchorOffset = index.offsetAt(Math.floor(count / 2)) + 17;
+    const anchor = index.captureAnchor(anchorOffset);
+    const before = index.restoreAnchor(anchor);
+    const mutationStart = Date.now();
+    const first = index.unitAt(0);
+    ensure(first != null, "first unit missing");
+    result.assertions++;
+    if (first != null) {
+      const delta = index.commitHeight(
+        first.key,
+        first.layoutVersion,
+        first.effectiveHeight() + 80,
+        signature,
+      );
+      ensure(Math.abs(delta - 80) < 0.1, "height delta mismatch");
+      result.assertions++;
+      const after = index.restoreAnchor(anchor);
+      ensure(Math.abs((after - before) - 80) < 0.1, "anchor compensation mismatch");
+      result.assertions++;
+      const stale = index.commitHeight(
+        first.key,
+        first.layoutVersion - 1,
+        999,
+        signature,
+      );
+      ensure(stale == 0, "stale layout version accepted");
+      result.assertions++;
+    }
+    result.mutationMs = Date.now() - mutationStart;
+
+    const range = index.rangeBetween(anchorOffset - 500, anchorOffset + 500);
+    ensure(range.start < range.end, "range is empty");
+    result.assertions++;
+    ensure(
+      Math.abs(range.topPlaceholder +
+        (index.offsetAt(range.end) - index.offsetAt(range.start)) +
+        range.bottomPlaceholder - index.totalHeight()) < 0.1,
+      "placeholder invariant failed",
+    );
+    result.assertions++;
+
+    const scroll = new ConversationScrollState();
+    ensure(scroll.mode() == "initializing", "initial state invalid");
+    scroll.historyReady();
+    ensure(scroll.shouldFollowBottom(), "historyReady must follow bottom");
+    scroll.beginTouch();
+    ensure(scroll.mode() == "free-scroll" && !scroll.shouldFollowBottom(), "touch must release follow");
+    scroll.endTouch();
+    scroll.reachedBottom();
+    ensure(scroll.shouldFollowBottom(), "manual bottom must restore follow");
+    result.assertions = result.assertions + 4;
+
+    result.totalHeight = index.totalHeight();
+    result.passed = true;
+  } catch (error) {
+    result.failure = `${error}`;
+    result.passed = false;
+  }
+  return result;
+}

@@ -1,0 +1,176 @@
+import {
+  RenderUnit,
+  RenderUnitAnchor,
+  RenderUnitLayoutSignature,
+  RenderUnitRange,
+} from "./RenderUnitModels.uts";
+
+/**
+ * 与 Vue/Markdown/scroll-view 无关的持久布局索引。
+ * V1 使用 prefix offsets；append/整批 set 为 O(n)，单点高度提交重建后缀。
+ * API 稳定后可把内部替换成分块前缀和/Fenwick Tree，不影响调用方。
+ */
+export class ConversationLayoutIndex {
+  private units: RenderUnit[] = [] as RenderUnit[];
+  private offsets: number[] = [0] as number[];
+  private indexByKey: Map<string, number> = new Map<string, number>();
+
+  setUnits(nextUnits: RenderUnit[]): void {
+    const oldByKey = new Map<string, RenderUnit>();
+    for (let i = 0; i < this.units.length; i++) {
+      oldByKey.set(this.units[i].key, this.units[i]);
+    }
+    const normalized = [] as RenderUnit[];
+    const nextIndex = new Map<string, number>();
+    for (let i = 0; i < nextUnits.length; i++) {
+      const incoming = nextUnits[i];
+      if (nextIndex.has(incoming.key)) {
+        throw new Error(`duplicate RenderUnit key: ${incoming.key}`);
+      }
+      const old = oldByKey.get(incoming.key);
+      if (
+        old != null &&
+        incoming.committedHeight <= 0 &&
+        incoming.contentVersion == old.contentVersion
+      ) {
+        incoming.committedHeight = old.committedHeight;
+        incoming.layoutState = old.layoutState;
+        incoming.layoutSignatureKey = old.layoutSignatureKey;
+        incoming.layoutVersion = Math.max(incoming.layoutVersion, old.layoutVersion);
+      }
+      normalized.push(incoming);
+      nextIndex.set(incoming.key, i);
+    }
+    this.units = normalized;
+    this.indexByKey = nextIndex;
+    this.rebuildOffsets(0);
+  }
+
+  count(): number { return this.units.length; }
+
+  unitAt(index: number): RenderUnit | null {
+    return index >= 0 && index < this.units.length ? this.units[index] : null;
+  }
+
+  indexForKey(key: string): number {
+    const index = this.indexByKey.get(key);
+    return index != null ? index : -1;
+  }
+
+  totalHeight(): number {
+    return this.offsets.length > 0 ? this.offsets[this.offsets.length - 1] : 0;
+  }
+
+  offsetAt(index: number): number {
+    if (index <= 0) return 0;
+    if (index >= this.offsets.length) return this.totalHeight();
+    return this.offsets[index];
+  }
+
+  offsetForKey(key: string): number {
+    const index = this.indexForKey(key);
+    return index >= 0 ? this.offsetAt(index) : -1;
+  }
+
+  /** 返回高度 delta；异步旧版本或错误签名直接拒绝。 */
+  commitHeight(
+    key: string,
+    version: number,
+    height: number,
+    signature: RenderUnitLayoutSignature,
+  ): number {
+    const index = this.indexForKey(key);
+    if (index < 0 || height <= 0) return 0;
+    const unit = this.units[index];
+    if (version != unit.layoutVersion) return 0;
+    const normalized = Math.max(24, height);
+    const previous = unit.effectiveHeight();
+    const delta = normalized - previous;
+    unit.committedHeight = normalized;
+    unit.layoutSignatureKey = signature.cacheKey();
+    unit.layoutState = "committed";
+    if (Math.abs(delta) < 1) return 0;
+    this.rebuildOffsets(index);
+    return delta;
+  }
+
+  invalidateForSignature(signature: RenderUnitLayoutSignature): number {
+    const key = signature.cacheKey();
+    let changed = 0;
+    for (let i = 0; i < this.units.length; i++) {
+      const unit = this.units[i];
+      if (unit.layoutState == "committed" && unit.layoutSignatureKey != key) {
+        unit.invalidateLayout();
+        changed = changed + 1;
+      }
+    }
+    if (changed > 0) this.rebuildOffsets(0);
+    return changed;
+  }
+
+  indexAt(offset: number): number {
+    const count = this.units.length;
+    if (count == 0) return -1;
+    if (count <= 1) return 0;
+    if (offset <= 0) return 0;
+    if (offset >= this.totalHeight()) return count - 1;
+    let low = 0;
+    let high = count - 1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      if (offset < this.offsets[mid]) {
+        high = mid - 1;
+      } else if (offset >= this.offsets[mid + 1]) {
+        low = mid + 1;
+      } else {
+        return mid;
+      }
+    }
+    return Math.max(0, Math.min(count - 1, low));
+  }
+
+  rangeBetween(startOffset: number, endOffset: number): RenderUnitRange {
+    const range = new RenderUnitRange();
+    range.totalHeight = this.totalHeight();
+    if (this.units.length == 0) return range;
+    const start = this.indexAt(Math.max(0, startOffset));
+    let end = this.indexAt(Math.max(startOffset, endOffset)) + 1;
+    if (end > this.units.length) end = this.units.length;
+    range.start = start;
+    range.end = Math.max(start + 1, end);
+    range.topPlaceholder = this.offsetAt(range.start);
+    range.bottomPlaceholder = Math.max(0, this.totalHeight() - this.offsetAt(range.end));
+    return range;
+  }
+
+  captureAnchor(scrollTop: number): RenderUnitAnchor {
+    const anchor = new RenderUnitAnchor();
+    if (this.units.length == 0) return anchor;
+    const index = this.indexAt(Math.max(0, scrollTop));
+    anchor.key = this.units[index].key;
+    anchor.offsetInUnit = Math.max(0, scrollTop - this.offsetAt(index));
+    return anchor;
+  }
+
+  restoreAnchor(anchor: RenderUnitAnchor): number {
+    if (anchor.key.length == 0) return -1;
+    const offset = this.offsetForKey(anchor.key);
+    return offset >= 0 ? offset + anchor.offsetInUnit : -1;
+  }
+
+  private rebuildOffsets(startIndex: number): void {
+    if (startIndex <= 0 || this.offsets.length != this.units.length + 1) {
+      this.offsets = [0] as number[];
+      startIndex = 0;
+    }
+    for (let i = startIndex; i < this.units.length; i++) {
+      const previous = i == 0 ? 0 : this.offsets[i];
+      const next = previous + this.units[i].effectiveHeight();
+      if (this.offsets.length > i + 1) this.offsets[i + 1] = next;
+      else this.offsets.push(next);
+    }
+    if (this.offsets.length > this.units.length + 1) {
+      this.offsets = this.offsets.slice(0, this.units.length + 1);
+    }
+  }
+}

@@ -131,13 +131,10 @@
             list-id="msg-list"
             key-field="id"
             :native-list="false"
+            :virtual-scroll="virtualEnabled"
             :scroll-with-animation="scrollWithAnimation"
-            :enable-split="true"
-            :split-max-chars="2000"
-            split-text-field="text"
-            :no-split-last="isConversationActive"
             @scrolltoupper="handleScrollToUpper"
-            @scroll="onScroll"
+            @scroll="onVsxScroll"
           >
             <!-- 顶部常驻：加载更多历史提示 + 变量设置表单（不参与虚拟窗口，表单快照上提逻辑不变） -->
             <template #header>
@@ -168,8 +165,8 @@
                 <UniAiXMsg
                   v-if="isAssistantMessage(sp.item)"
                   :message-id="getMsgId(sp.item)"
-                  :body-text="sp.partIndex >= 0 ? sp.partText : resolveAssistantBodyText(sp.item, sp.index)"
-                  :think-text="sp.partIndex > 0 ? '' : getAssistantThinkText(sp.item)"
+                  :body-text="resolveAssistantBodyText(sp.item, sp.index)"
+                  :think-text="getAssistantThinkText(sp.item)"
                   :speakable-text="getAssistantSpeakableText(sp.item)"
                   :message-status="getMsgStatus(sp.item)"
                   :processing-list="getAssistantProcessingList(sp.item)"
@@ -179,9 +176,8 @@
                   :message-time="getMsgTime(sp.item)"
                   :is-last-msg="isLastMessage(sp.index)"
                   :is-conversation-active="isConversationActive"
-                  :show-tool-bar="sp.partIndex >= 0 && !sp.isLastPart ? false : !(isConversationActive && isLastMessage(sp.index))"
+                  :show-tool-bar="!(isConversationActive && isLastMessage(sp.index))"
                   :task-status="getConversationTaskStatus()"
-                  :hide-loading="sp.partIndex >= 0 && !sp.isLastPart"
                   @longpress="onlongTapMsg(sp.item)"
                   @changeThinkContent="changeThinkContent"
                   :id="`msg-item-${getMsgId(sp.item)}_${sp.index}`"
@@ -192,7 +188,7 @@
                   <!-- 图片以及文件（Android：attachments 元素多为 UTSJSONObject，禁止当 AttachmentFile 用） -->
                   <scroll-view
                     class="files-container"
-                    v-if="hasMessageAttachments(sp.item) && sp.partIndex <= 0"
+                    v-if="hasMessageAttachments(sp.item)"
                     direction="horizontal"
                     :scroll-x="true"
                     :scroll-y="false"
@@ -239,11 +235,11 @@
                   <!-- App：rich-text 对纯文本 nodes(string) 常不渲染，H5 正常；用户消息用 text -->
                   <view
                     class="user-msg"
-                    v-if="sp.partIndex >= 0 ? sp.partText.length > 0 : hasUserMessageText(sp.item)"
+                    v-if="hasUserMessageText(sp.item)"
                     :id="`msg-item-${getMsgId(sp.item)}_${sp.index}`"
                   >
                     <text class="user-msg-text" selectable="true">{{
-                      sp.partIndex >= 0 ? sp.partText : getUserMessageText(sp.item)
+                      getUserMessageText(sp.item)
                     }}</text>
                   </view>
                 </template>
@@ -896,7 +892,7 @@
   } = data;
 
   // ==================== 虚拟列表数据规范化 ====================
-  // nuwax-virtual-list 的 key-field / split-text-field 用 UTSJSONObject bracket 读字段，
+  // nuwax-virtual-list 的 key-field 用 UTSJSONObject bracket 读字段，
   // MessageInfo 类实例读不到 → 这里显式构造含业务字段的 UTSJSONObject 再传入。
   // 用 readRawField（三层 fallback 保证读到 MessageInfo 字段）逐字段复制，
   // 不用 normalizeMessageRawToJson（其 JSON.stringify 对类实例在 Android 可能失效丢 text）。
@@ -1310,12 +1306,20 @@
    * 流式会话中最后一条助手消息优先走 streamingAssistantText，
    * 避免 iOS / H5 上 MessageInfo 批量更新或 Markdown 打字机导致气泡不刷新。
    * 服务端可能改写助手 id，故不能仅做严格 id 相等；新一轮发送前会 clear 通道防串文。
+   * 不拆分后 listIndex 与 messageList 下标对齐，用索引判定末条。
    */
-  function resolveAssistantBodyText(item: any | null): string {
+  function resolveAssistantBodyText(item: any | null, listIndex: number): string {
+    // Android 活跃流由 updateMessage → 叶子 renderer 直更。若模板再读取
+    // streamingAssistantText，每个 chunk 都会让整层会话组件参与 VDOM diff，
+    // 抵消叶子快通道；首次挂载/离屏回挂由 item 快照 + ComponentManager 补齐。
+    // #ifdef APP-ANDROID
+    if (isConversationActive.value) {
+      return getAssistantBodyText(item);
+    }
+    // #endif
     if (isConversationActive.value) {
       const list = messageList.value;
-      // 切片后 listIndex 不再等于全表下标，改用 item 身份判定是否为列表末条
-      if (list.length > 0 && list[list.length - 1] == item) {
+      if (list.length - 1 == listIndex) {
         const streamText = streamingAssistantText.value;
         if (streamText.length > 0) {
           const streamMsgId = streamingAssistantMessageId.value;
@@ -1650,11 +1654,9 @@
     feedHeadlessStreamSpeakNow(false, bodyText, messageId);
   }
 
-  /** 是否消息列表最后一条（切片后改用 item 身份判定，listIndex 不再等于全表下标） */
-  const isLastMessage = (item: any | null): boolean => {
-    const list = messageList.value;
-    if (list.length == 0) return false;
-    return list[list.length - 1] == item;
+  /** 是否消息列表最后一条（不拆分后 renderParts 下标 == messageList 下标，直接用索引判定） */
+  const isLastMessage = (listIndex: number): boolean => {
+    return messageList.value.length - 1 == listIndex;
   };
 
   /** Android：API 返回字符串，禁止 string as TaskStatus；const 箭头函数不可递归 */
@@ -2006,26 +2008,26 @@
   const lockAutoToLastMsg = () => scrollManager.lockAutoToLastMsg();
 
   /**
-   * 插件 @scroll(scrollTop, winStart, winEnd) 处理：
-   * 插件内部 scroll-view 滚动时触发（已非原始 UniScrollEvent）。
+   * nuwax-virtual-list @scroll(UniScrollEvent) 处理：
+   * 组件内部 scroll-view/list-view 滚动时触发（标准 UniScrollEvent）。
    * - 记录 scrollTop（prepend 补偿基线用；命令值仅写不被回写，无环路）
-   * - 读插件容器 #vsx-container 的 scrollHeight/offsetHeight，喂 ScrollManager 状态机
+   * - 读滚动容器 #msg-list 的 scrollHeight/offsetHeight，喂 ScrollManager 状态机
    *   （回到底按钮可见性 / 上滑打断 / 跟底判定）
    * - 维护 data.scrolling（手势进行中）的 500ms 静默复位
    */
-  const onVsxScroll = (
-    scrollTop: number,
-    _winStart: number,
-    _winEnd: number,
-  ) => {
+  const onVsxScroll = (e: UniScrollEvent) => {
+    if (e == null || e.detail == null) {
+      return;
+    }
+    const scrollTop = e.detail.scrollTop;
     data.scrollTop.value = scrollTop;
     // 调试浮层窗口范围由 vsx 调试探针 pullVsxStats() 每 500ms 拉取（scroll 高频路径不重复调用）
-    // 读插件容器 metrics（插件自带 #vsx-container；uni.getElementById 取栈顶页元素，
+    // 读滚动容器 metrics（nuwax-virtual-list 根容器 list-id=msg-list；uni.getElementById 取栈顶页元素，
     // 聊天页为当前页时可达，与原 msg-list 读取方式一致）
     let scrollHeight = 0;
     let offsetHeight = 0;
     // #ifndef MP-WEIXIN
-    const containerEl = uni.getElementById("vsx-container");
+    const containerEl = uni.getElementById("msg-list");
     scrollHeight = containerEl?.scrollHeight ?? 0;
     offsetHeight = containerEl?.offsetHeight ?? 0;
     // #endif
@@ -2965,6 +2967,9 @@
   // ==================== 性能测试帧探针（正常会话与 perfTest 模式：avgFps / maxGap 浮层 + logcat）====================
   // setInterval(16ms) 记主线程 tick 间隔；解析/渲染阻塞时 delta 暴涨 → 量化「卡死/掉帧」体感。
   // 进入聊天页即启动；浮层每 500ms 刷新一次，避免探针自身污染测量。
+  // isPerfMock：perfTest（Mock 流式）模式标记——会话结束（isConversationActive=false）后
+  // 延迟 800ms 停探针，避免空闲页持续刷 [PerfProbe] 日志；正常会话不停（保持持续测量）。
+  const isPerfMock = ref<boolean>(false);
   const showPerfOverlay = ref<boolean>(false);
   const perfFpsText = ref<string>("--");
   const perfGapText = ref<string>("--");
@@ -3045,6 +3050,11 @@
     viewport: 0,
     enabled: true,
   } as UTSJSONObject);
+  /** 虚拟滚动总开关（perf 浮层 A/B：虚拟滚动 vs 全量渲染，绑 nuwax-virtual-list :virtual-scroll） */
+  const virtualEnabled = ref<boolean>(true);
+  const toggleVirtualScroll = (): void => {
+    virtualEnabled.value = !virtualEnabled.value;
+  };
   let vsxDebugProbeOn = false;
   let vsxFpsLastAt = 0;
   let vsxFrames = [] as number[];
@@ -3052,9 +3062,11 @@
   let vsxMaxGap = 0;
   const VSX_DEBUG_FLUSH_MS = 500;
 
-  /** 从插件 ref 拉一次 getStats()（$callMethod 字符串调度，UTS 约定） */
+  /** 从列表 ref 拉一次统计（$callMethod 字符串调度，UTS 约定）。
+   *  nuwax-virtual-list 暂未 expose getStats（仅 getScrollTop），$callMethod 返回 null →
+   *  vsxStats 保持默认（窗口区显示 0）；后续给组件补 getStats expose 后再启用。 */
   const pullVsxStats = (): void => {
-    const v = vsxRef.value;
+    const v = pagingXRef.value;
     if (v == null) return;
     try {
       const s = (v as ComponentPublicInstance).$callMethod("getStats") as UTSJSONObject;
@@ -3576,6 +3588,7 @@
     // ===== 性能测试 Mock：seed 预置历史 + 跳过真实会话拉取（纯 Mock，无网络依赖）=====
     // isStreamPerfMockEnabled 由 pages/test-stream-perf 启动页写 storage 打开。
     if (isStreamPerfMockEnabled()) {
+      isPerfMock.value = true;
       service.seedMockHistoryIfNeeded();
       // 自动发起 Mock 流式（无需手动发送；启动页点「开始测试」即流式）
       service.runMockPerfStream();

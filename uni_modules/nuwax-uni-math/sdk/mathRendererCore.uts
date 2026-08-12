@@ -1,0 +1,247 @@
+import { MathRenderResult } from "@/uni_modules/nuwax-uni-math/sdk/mathRenderer.uts"
+import { proxyWebBackend } from "@/uni_modules/nuwax-uni-math/sdk/backends/proxyWebBackend.uts"
+// #ifdef APP-ANDROID || APP-IOS
+import { nativeSvgBackend } from "@/uni_modules/nuwax-uni-math/sdk/backends/nativeSvgBackend.uts"
+// #endif
+import {
+  cacheEntryToRes,
+  getMathCache,
+  putMathCache,
+} from "@/uni_modules/nuwax-uni-math/sdk/mathDiskCache.uts"
+import utils from "@/uni_modules/uni-ai-x/sdk/utils.uts"
+
+/** 并发上限：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥（公式多时卡死）。
+ *  与 appMarkdownFallback.MAX_CONCURRENT_KATEX 同值。 */
+const MAX_CONCURRENT_MATH: number = 2
+
+/** 并发队列项 */
+class MathQueueItem {
+  key: string = ""
+  latex: string = ""
+  displayMode: boolean = false
+}
+
+/** 在途去重的等待回调：同 key 首个 dispatch 未回调期间，后续请求挂这里，回调时统一扇出 */
+class MathWaiter {
+  callback: (res: MathRenderResult) => void
+  constructor(callback: (res: MathRenderResult) => void) {
+    this.callback = callback
+  }
+}
+
+type MathBackendCallback = (res: UTSJSONObject) => void
+
+/** 保留多行公式的真实换行，并还原 JSON 转义误伤的其余控制字符。
+ *  与 appMarkdownFallback.sanitizeLatexText 等价（Task 6 管线接入后可统一为此处单一来源）。 */
+function sanitizeLatexText(latex: string): string {
+  let out = ""
+  for (let i = 0; i < latex.length; i++) {
+    const code = latex.charCodeAt(i)
+    if (code == 10) {
+      out += "\n"
+    } else if (code == 9) {
+      out += "\\t"
+    } else if (code == 13) {
+      out += "\n"
+    } else if (code == 12) {
+      out += "\\f"
+    } else if (code == 8) {
+      out += "\\b"
+    } else {
+      out += latex.charAt(i)
+    }
+  }
+  return out
+}
+
+/** 缓存 key：与 appMarkdownFallback.mathCacheKey 同格式。
+ *  保证独立 <x-math> 与聊天管线共享同一缓存条目（一处渲染，两处复用）。 */
+function mathCacheKey(latex: string, displayMode: boolean): string {
+  // 加 backend 前缀：切 native/proxy 后 key 变，缓存不命中 → 重渲染（A/B 对比切换生效，不读旧 backend 的缓存）
+  const backendTag = MathRendererCore.backend == 'proxy' ? 'px' : 'nv'
+  // native v4：在 v3 尺寸归一基础上保留多行公式真实换行，隔离旧的 `\\n` 错误截图缓存。
+  const cacheVersion = backendTag == 'nv' ? 'v4' : 'v2'
+  if (displayMode == true) {
+    return backendTag + ":" + cacheVersion + "d1:" + latex
+  }
+  return backendTag + ":" + cacheVersion + "d0:" + latex
+}
+
+/** proxy 回包 UTSJSONObject → 对外 MathRenderResult（缓存 / 后端边界统一转换） */
+function resToResult(res: UTSJSONObject): MathRenderResult {
+  const r = new MathRenderResult()
+  const imageData = res["imageDataURL"]
+  const htmlData = res["resultHtml"]
+  const widthData = res["width"]
+  const heightData = res["height"]
+  const errorData = res["error"]
+  if (imageData != null) r.href = `${imageData}`
+  if (htmlData != null) r.html = `${htmlData}`
+  if (widthData != null) r.width = widthData as number
+  if (heightData != null) r.height = heightData as number
+  if (errorData != null) r.error = `${errorData}`
+  const svgData = res["svg"]
+  if (svgData != null) r.svg = `${svgData}`
+  return r
+}
+
+/**
+ * 数学渲染核心：缓存命中 / 在途去重 / 并发闸 / 错误兜底 统一在此。
+ *
+ * 对外：render(latex, displayMode, callback)。
+ * <x-math> 组件与（Task 6 后的）聊天管线共用本 Core —— 一处去重 / 缓存 / 并发。
+ *
+ * 后端选择（renderViaBackend）：Phase1 全平台走 proxyWebBackend（隐藏 web-view + KaTeX）；
+ * Phase2 在 APP 端加 native 分支（Android AndroidMath / iOS iosMath 真原生矢量排版），
+ * 走 native 时不再依赖 proxy web-view（根除数学的 evalJS 桥死锁 + 公式可选/可复制）。
+ */
+export class MathRendererCore {
+  /** 运行时后端选择（test-stream-perf A/B 对比用）：正式会话默认 'proxy'；'native' 仅保留手动 A/B。 */
+  static backend: string = 'proxy'
+  /** 在途 key → 等待回调列表（含首个 dispatch 的请求） */
+  private inFlight: Map<string, MathWaiter[]> = new Map<string, MathWaiter[]>()
+  /** 并发队列 */
+  private queue: MathQueueItem[] = [] as MathQueueItem[]
+  private inFlightCount: number = 0
+
+  /**
+   * 渲染一条公式：
+   *   1) 缓存命中（App 磁盘/L1）→ 立即回；
+   *   2) 同 key 在途 → 挂等待列表，回调时扇出（不重复 dispatch）；
+   *   3) 否则入队，按 MAX_CONCURRENT_MATH 并发派发后端。
+   * 回调统一在主线程触发（App 上更新 Vue 响应式必须主线程）。
+   */
+  render(
+    latex: string,
+    displayMode: boolean,
+    callback: (res: MathRenderResult) => void,
+  ): void {
+    if (latex.length == 0) {
+      const empty = new MathRenderResult()
+      empty.error = "empty latex"
+      this.dispatchCallback(callback, empty)
+      return
+    }
+    const safe = sanitizeLatexText(latex)
+    const key = mathCacheKey(safe, displayMode)
+
+    // 1) 缓存命中
+    const cached = getMathCache(key)
+    if (cached != null) {
+      this.dispatchCallback(callback, resToResult(cacheEntryToRes(cached)))
+      return
+    }
+
+    // 2) 在途去重
+    const existing = this.inFlight.get(key)
+    if (existing != null) {
+      existing.push(new MathWaiter(callback))
+      return
+    }
+
+    // 3) 首次：登记在途 + 入队
+    const waiters = [] as MathWaiter[]
+    waiters.push(new MathWaiter(callback))
+    this.inFlight.set(key, waiters)
+    const item = new MathQueueItem()
+    item.key = key
+    item.latex = safe
+    item.displayMode = displayMode
+    this.queue.push(item)
+    this.pump()
+  }
+
+  /** 某公式是否已结算（命中缓存）：供流式 WAIT 语义判断，对齐 isMathConcluded。 */
+  isConcluded(latex: string, displayMode: boolean): boolean {
+    if (latex.length == 0) {
+      return false
+    }
+    return (
+      getMathCache(mathCacheKey(sanitizeLatexText(latex), displayMode)) != null
+    )
+  }
+
+  private pump(): void {
+    while (this.inFlightCount < MAX_CONCURRENT_MATH && this.queue.length > 0) {
+      const item = this.queue.shift()
+      if (item == null) {
+        break
+      }
+      this.inFlightCount = this.inFlightCount + 1
+      this.dispatch(item)
+    }
+  }
+
+  private dispatch(item: MathQueueItem): void {
+    const core = this
+    const key = item.key
+    this.renderViaBackend(item.latex, item.displayMode, (res: UTSJSONObject): void => {
+      putMathCache(key, res)
+      const result = resToResult(res)
+      const waiters = core.inFlight.get(key)
+      core.inFlight.delete(key)
+      if (waiters != null) {
+        for (let i = 0; i < waiters.length; i++) {
+          core.dispatchCallback(waiters[i].callback, result)
+        }
+      }
+      core.inFlightCount = core.inFlightCount - 1
+      core.pump()
+    })
+  }
+
+  /**
+   * 后端派发：
+   *   APP-ANDROID / APP-IOS / APP-HARMONY —— nativeSvgBackend（原生 JS 引擎 + MathJax→SVG→位图）为主，
+   *                  失败兜底 proxyWebBackend。native 不过隐藏 web-view，根除数学的 evalJS 桥死锁；
+   *                  产出含 svg 字段（可导出）。
+   *     · 鸿蒙端 nativeSvgBackend 当前为 stub（回 { error }）→ 自动兜底 proxyWebBackend，
+   *       即鸿蒙现状 = WebView 链路；待 utssdk/app-harmony 真机填实后无缝切原生 SVG 位图。
+   *   其余平台（H5/MP）—— proxyWebBackend（隐藏 web-view + KaTeX + html2canvas / v-html）。
+   *
+   * 注意：UTS 中导出函数名不是一等值（不能赋给函数类型字段），故此处直接调用而非通过字段间接。
+   */
+  private renderViaBackend(
+    latex: string,
+    displayMode: boolean,
+    callback: MathBackendCallback,
+  ): void {
+    // 运行时 backend 切换（test-stream-perf A/B 对比用）：MathRendererCore.backend='proxy' 强制走老 proxy-web 链路
+    if (MathRendererCore.backend == 'proxy') {
+      proxyWebBackend(latex, displayMode, (proxyRes: UTSJSONObject): void => {
+        callback(proxyRes)
+      })
+      return
+    }
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    nativeSvgBackend(latex, displayMode, (nativeRes: UTSJSONObject): void => {
+      const err = nativeRes["error"]
+      if (err != null) {
+        // native 失败（bundle 缺失/渲染异常/鸿蒙 stub 未实现）→ 兜底回 proxy web-view KaTeX 链路
+        console.warn(
+          "[MATHSVG] core NATIVE-FAIL -> fallback PROXY err=" + `${err}`,
+        )
+        proxyWebBackend(latex, displayMode, (proxyRes: UTSJSONObject): void => {
+          callback(proxyRes)
+        })
+      } else {
+        callback(nativeRes)
+      }
+    })
+    // #else
+    proxyWebBackend(latex, displayMode, callback)
+    // #endif
+  }
+
+  /** 回调切回主线程（App 上更新 Vue 响应式必须主线程；与 proxy-web.emitMsg 同模式） */
+  private dispatchCallback(
+    callback: (res: MathRenderResult) => void,
+    result: MathRenderResult,
+  ): void {
+    utils.uniGetDispatcher("main", (): void => {
+      callback(result)
+    })
+  }
+}
+
+export default new MathRendererCore()

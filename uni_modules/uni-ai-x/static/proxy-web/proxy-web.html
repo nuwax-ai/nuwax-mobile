@@ -26,6 +26,14 @@
     <script type="text/javascript" src="./libs/html2canvas1.4.1.js"></script>
     <script defer src="./libs/mhchem.min.js"></script>
     <script async src="./libs/mermaid.min.js"></script>
+    <!-- mathjax v3 SVG 输出（tex-svg）：App 公式 SVG data URI 链路。defer 异步加载，不阻塞代理就绪 -->
+    <script type="text/javascript">
+      window.MathJax = {
+        tex: { inlineMath: [['$', '$']], displayMath: [['$$', '$$']] },
+        svg: { fontCache: 'local' }
+      };
+    </script>
+    <script defer src="./libs/mathjax-tex-svg.js"></script>
 		
     <script type="text/javascript">
         let parentIsAppAndroid = false;
@@ -92,6 +100,17 @@
               // interactive/complete：同步脚本已跑完，立刻就绪（勿再等 async mermaid）
               send();
             }
+          }
+
+          /**
+           * App 侧 evalJS 主动触发：重发 DOMContentLoaded_callback。
+           * 首帧自动 signalHostReady 可能在 web-view @message 桥就绪前发出而丢失，
+           * 或页面因 @error 重载后自动信号已带 _hostReadySent=true 不再重发。
+           * App 绑定上下文 / 收到 @load 后 evalJS 调本方法兜底恢复握手。
+           */
+          signalReady() {
+            this._hostReadySent = false;
+            this.signalHostReady();
           }
           setSetting(e) {
             this.setting = e.data;
@@ -218,6 +237,32 @@
                   param: {
                     results: [],
                     error: error != null && error.message != null ? error.message : 'katex_batch_failed'
+                  }
+                });
+              });
+              return;
+            }
+
+            // MathJax SVG：App 公式 SVG data URI 链路（与 katex PNG 并行，由宿主 MATH_RENDER_MODE 切换）
+            if (action === 'mathjaxSvgRender') {
+              this.runMathjaxJob(param).catch(error => {
+                this.postMessage({
+                  action: `${action}_callback_${param.requestId}`,
+                  param: {
+                    imageDataURL: '',
+                    error: error != null && error.message != null ? error.message : 'mathjax_queue_failed'
+                  }
+                });
+              });
+              return;
+            }
+            if (action === 'mathjaxSvgRenderBatch') {
+              this.runMathjaxBatch(param).catch(error => {
+                this.postMessage({
+                  action: `${action}_callback_${param.requestId}`,
+                  param: {
+                    results: [],
+                    error: error != null && error.message != null ? error.message : 'mathjax_batch_failed'
                   }
                 });
               });
@@ -572,6 +617,157 @@
                 }
               });
             }
+          }
+
+          /** 等 async 加载的 mathjax-tex-svg.js 就绪（2MB，比 mermaid 大）。
+           *  轮询最多 5s；超时返回 false → 空图。不阻塞 proxy 就绪。 */
+          waitForMathjax() {
+            return new Promise((resolve) => {
+              if (typeof MathJax !== 'undefined' && MathJax != null && typeof MathJax.tex2svgPromise === 'function') {
+                resolve(true);
+                return;
+              }
+              let waited = 0;
+              const tick = () => {
+                if (typeof MathJax !== 'undefined' && MathJax != null && typeof MathJax.tex2svgPromise === 'function') {
+                  resolve(true);
+                  return;
+                }
+                if (waited >= 5000) {
+                  resolve(false);
+                  return;
+                }
+                waited += 100;
+                setTimeout(tick, 100);
+              };
+              tick();
+            });
+          }
+
+          /** 离屏量取 mathjax SVG 像素尺寸的容器（复用，不参与 html2canvas） */
+          getMathjaxMeasureEl() {
+            let el = document.getElementById('mjxMeasure');
+            if (el == null) {
+              el = document.createElement('div');
+              el.id = 'mjxMeasure';
+              el.style.position = 'absolute';
+              el.style.left = '0';
+              el.style.top = '0';
+              el.style.visibility = 'hidden';
+              el.style.pointerEvents = 'none';
+              document.body.appendChild(el);
+            }
+            return el;
+          }
+
+          /** MathJax 渲染单条公式 → 纯 SVG 字符串（App 端交给 x-svg-renderer 矢量渲染） */
+          async mathjaxSvgRenderToResult(item) {
+            const id = item != null && item.id != null ? item.id : '';
+            const pureMathText = item != null && item.pureMathText != null ? item.pureMathText : '';
+            const useDisplayMode = item == null || item.displayMode !== false;
+            const ready = await this.waitForMathjax();
+            if (ready != true) {
+              return {
+                id,
+                svg: '',
+                width: null,
+                height: null,
+                resultHtml: '',
+                error: 'mathjax_not_ready'
+              };
+            }
+            try {
+              const container = await MathJax.tex2svgPromise(pureMathText, { display: useDisplayMode });
+              if (container == null) {
+                return { id, svg: '', width: null, height: null, resultHtml: '', error: 'mathjax_empty' };
+              }
+              const svgEl = container.querySelector != null ? container.querySelector('svg') : null;
+              if (svgEl == null) {
+                return { id, svg: '', width: null, height: null, resultHtml: '', error: 'no_svg' };
+              }
+              // 离屏挂载量像素尺寸（MathJax SVG 用 ex 单位，需布局后测）
+              const measureEl = this.getMathjaxMeasureEl();
+              measureEl.style.fontSize = '16px';
+              measureEl.style.lineHeight = '1.25';
+              measureEl.innerHTML = '';
+              measureEl.appendChild(container);
+              const rect = svgEl.getBoundingClientRect();
+              const cssWidth = Math.ceil(rect.width);
+              const cssHeight = Math.ceil(rect.height);
+              measureEl.innerHTML = '';
+              // 序列化为纯 SVG 字符串：交给 App 端 x-svg-renderer 矢量渲染（native <image> 不解码 SVG）
+              const svgString = new XMLSerializer().serializeToString(svgEl);
+              return {
+                id,
+                svg: svgString,
+                width: cssWidth > 0 ? cssWidth : null,
+                height: cssHeight > 0 ? cssHeight : null,
+                resultHtml: '',
+                error: svgString.length < 32 ? 'empty_svg' : ''
+              };
+            } catch (error) {
+              return {
+                id,
+                svg: '',
+                width: null,
+                height: null,
+                resultHtml: '',
+                error: error != null && error.message != null ? error.message : 'mathjax_render_failed'
+              };
+            }
+          }
+
+          async runMathjaxJob(param) {
+            const slot = await this.acquireKatexSlot();
+            try {
+              await this.mathjaxSvgRender(param, slot);
+            } finally {
+              this.releaseKatexSlot(slot);
+            }
+          }
+
+          async mathjaxSvgRender({ pureMathText, requestId, displayMode }) {
+            try {
+              const param = await this.mathjaxSvgRenderToResult({ id: '', pureMathText, displayMode });
+              this.postMessage({
+                action: 'mathjaxSvgRender_callback_' + requestId,
+                param
+              });
+            } catch (error) {
+              this.postMessage({
+                action: 'mathjaxSvgRender_callback_' + requestId,
+                param: {
+                  imageDataURL: '',
+                  resultHtml: '',
+                  width: null,
+                  height: null,
+                  error: error != null && error.message != null ? error.message : 'mathjaxSvgRender_failed'
+                }
+              });
+            }
+          }
+
+          async runMathjaxBatch(param) {
+            const requestId = param.requestId;
+            const items = param.items != null && Array.isArray(param.items) ? param.items : [];
+            const results = new Array(items.length);
+            await Promise.all(
+              items.map(async (item, index) => {
+                try {
+                  results[index] = await this.mathjaxSvgRenderToResult(item);
+                } catch (error) {
+                  results[index] = {
+                    id: item != null && item.id != null ? item.id : '' + index,
+                    imageDataURL: '',
+                    error: error != null && error.message != null ? error.message : 'mathjax_item_failed'
+                  };
+                }
+              })
+            );
+            this.postMessage({
+              action: 'mathjaxSvgRenderBatch_callback_' + requestId,
+              param: { results }
+            });
           }
         }
 

@@ -1,0 +1,581 @@
+<template>
+  <scroll-view
+    id="vsx-container"
+    class="vsx-container"
+    direction="vertical"
+    :scroll-top="scrollTopCmd"
+    :scroll-into-view="scrollIntoViewCmd"
+    :scroll-with-animation="animCmd"
+    :upper-threshold="upperThreshold"
+    :lower-threshold="lowerThreshold"
+    @scroll="onScroll"
+    @scrolltoupper="onUpper"
+    @scrolltolower="onLower"
+  >
+    <!-- 顶占位：视口上方数据的高度占位（不挂真实子树） -->
+    <view v-if="virtualOn" class="vsx-spacer" :style="{ height: topSpacerPx + 'px' }"></view>
+    <view
+      v-for="(item, i) in renderList"
+      :key="keyOfItem(item, indexOf(i))"
+      :id="`vsx-item-${keyOfItem(item, indexOf(i))}`"
+      class="vsx-item"
+    >
+      <slot :item="item" :index="indexOf(i)"></slot>
+    </view>
+    <!-- 底占位：视口下方数据的高度占位 -->
+    <view v-if="virtualOn" class="vsx-spacer" :style="{ height: bottomSpacerPx + 'px' }"></view>
+    <!-- 恒挂载底锚点：scrollToBottom / scroll-into-view 跟底用 -->
+    <view id="vsx-bottom-anchor" class="vsx-anchor"></view>
+  </scroll-view>
+</template>
+
+<script lang="uts" setup>
+import {
+  ref,
+  computed,
+  watch,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  onUpdated,
+  getCurrentInstance,
+} from "vue";
+import { VirtualScrollEngine } from "../../common/engine.uts";
+
+/**
+ * virtual-scroll-x —— uni-app x 通用动态高度虚拟滚动组件。
+ *
+ * 数据约定：
+ *  - items 每项通过 itemKey（默认 "id"）字段取稳定 key；
+ *  - 可选 `__vh` 字段给单条估算高度（父级按内容预计算），缺省用 estimatedHeight。
+ *
+ * 平台实测策略：
+ *  - App / H5：onUpdated 后同步 uni.getElementById().offsetHeight 批量实测；
+ *  - 微信小程序：createSelectorQuery 异步批量实测（比 App 慢一拍，但同样收敛）。
+ *
+ * 内置修复（相对入门方案 & 早期生产版）：
+ *  - notifyItemChanged(key)：内容变高后标记重测（think 展开 / 图片加载 / 编辑）；
+ *  - 实测 0 高度有限重试，静止页面不漏测；
+ *  - overscan / 迟滞按视口倍数，不按固定像素；
+ *  - 滚动静默 120ms 后自动应用视口上方纠偏；
+ *  - notifyPrepended(count) 内置顶部加载的 scrollTop 补偿。
+ */
+
+const props = withDefaults(
+  defineProps<{
+    /** 全量数据（引擎持有引用做窗口切片；流式场景每帧换引用安全） */
+    items: any[];
+    /** key 字段名，默认 "id"；缺字段回退索引 key */
+    itemKey?: string;
+    /**
+     * 自定义取 key 函数（优先于 itemKey 字段读取）。
+     * items 为 class 实例（非 UTSJSONObject/Map，如 MessageInfoClass）时必传，
+     * 否则 key 回退为索引（流式/历史插入会错位）。签名：(item, index) => key。
+     */
+    keyGetter?: (item: any, index: number) => string;
+    /** 单条估算高度兜底（px），item.__vh 优先 */
+    estimatedHeight?: number;
+    /** overscan 缓冲（视口倍数） */
+    overscanScreens?: number;
+    /** fling 迟滞（视口倍数） */
+    hysteresisScreens?: number;
+    /** 极小列表全量渲染阈值（屏数） */
+    smallListScreens?: number;
+    /** 流式/聊天跟底：末条恒在切片 */
+    stickToBottom?: boolean;
+    /** 虚拟滚动开关（false = 全量渲染，A/B 与降级用） */
+    enabled?: boolean;
+    /** 距顶部多少 px 触发 scrolltoupper */
+    upperThreshold?: number;
+    /** 距底部多少 px 触发 scrolltolower */
+    lowerThreshold?: number;
+    /** 编程式滚动（scrollToKey/scrollToBottom）是否带动画 */
+    scrollWithAnimation?: boolean;
+  }>(),
+  {
+    itemKey: "id",
+    estimatedHeight: 80,
+    overscanScreens: 1.5,
+    hysteresisScreens: 0.5,
+    smallListScreens: 2,
+    stickToBottom: false,
+    enabled: true,
+    upperThreshold: 50,
+    lowerThreshold: 50,
+    scrollWithAnimation: false,
+  },
+);
+
+const emit = defineEmits([
+  "scrolltoupper",
+  "scrolltolower",
+  "scroll",
+  "correction",
+]);
+
+// ==================== key / 估算 ====================
+
+/**
+ * 通用安全取字段：兼容 UTSJSONObject / Map / class 实例。
+ * items 来自宿主（如 MessageInfoClass 是 class，非 UTSJSONObject），
+ * 直接 `as UTSJSONObject` 会抛 ClassCastException，必须 try/catch 渐进式读取。
+ */
+const safeGet = (item: any, key: string): any | null => {
+  if (item == null || key.length == 0) return null;
+  // 1) UTSJSONObject bracket
+  try {
+    const o = item as UTSJSONObject;
+    const v = o[key];
+    if (v != null) return v;
+  } catch (_eObj) {
+    // 非 UTSJSONObject（class 实例会 CCE，吞掉继续）
+  }
+  // 2) Map.get（Android Gson / 网络层常见）
+  try {
+    const m = item as Map<string, any | null>;
+    if (m.has(key)) return m.get(key);
+    const fromGet = m.get(key);
+    if (fromGet != null) return fromGet;
+  } catch (_eMap) {
+    // 非 Map
+  }
+  return null;
+};
+
+const keyOfItem = (item: any, index: number): string => {
+  if (item == null) return `i_${index}`;
+  // 优先用宿主注入的 keyGetter（items 为 class 实例时必传）
+  if (props.keyGetter != null) {
+    const k = props.keyGetter(item, index);
+    if (k != null && k.length > 0) return k;
+  }
+  // 回退：itemKey 字段读取（UTSJSONObject / Map）
+  const v = safeGet(item, props.itemKey);
+  if (v == null) return `i_${index}`;
+  return `${v}`;
+};
+
+const estimateItem = (item: any, _index: number): number => {
+  if (item != null) {
+    const hint = safeGet(item, "__vh");
+    if (hint != null) {
+      const n = parseFloat(`${hint}`);
+      if (n > 0) return n;
+    }
+  }
+  return props.estimatedHeight;
+};
+
+const engine = new VirtualScrollEngine(keyOfItem, estimateItem);
+engine.overscanScreens = props.overscanScreens;
+engine.hysteresisScreens = props.hysteresisScreens;
+engine.smallListScreens = props.smallListScreens;
+engine.enabled.value = props.enabled;
+engine.stickToBottom = props.stickToBottom;
+
+// ==================== 模板绑定 ====================
+
+const renderList = computed((): any[] => engine.visibleSlice.value);
+const topSpacerPx = engine.topSpacerPx;
+const bottomSpacerPx = engine.bottomSpacerPx;
+const virtualOn = engine.enabled;
+const indexOf = (i: number): number => engine.winStart.value + i;
+
+/** 滚动命令通道（数值 scroll-top 与 scroll-into-view 二轨制，与生产版 C2 通道一致） */
+const scrollTopCmd = ref<number>(0);
+const scrollIntoViewCmd = ref<string>("");
+const animCmd = ref<boolean>(false);
+
+let lastScrollTop = 0;
+let idleTimer = 0;
+let measureRetry = 0;
+
+// ==================== 视口高度 ====================
+
+let cachedVp = 0;
+let cachedVpAt = 0;
+const VP_CACHE_MS = 200;
+
+const inst = getCurrentInstance();
+
+// #ifndef MP-WEIXIN
+/**
+ * 取元素：优先当前 UniPage 的 getElementById。
+ * uni.getElementById 拿的是"栈顶页"元素——多页面/dialogPage 场景会拿到别页同名元素，
+ * $page.getElementById 才是当前组件所在页（官方推荐写法，VDOM/Vapor 均支持）。
+ */
+const findEl = (id: string): UniElement | null => {
+  const proxy = inst?.proxy;
+  if (proxy != null) {
+    const page = proxy.$page;
+    if (page != null) {
+      const el = page.getElementById(id);
+      if (el != null) return el;
+    }
+  }
+  return uni.getElementById(id);
+};
+// #endif
+
+// #ifdef MP-WEIXIN
+const fillViewportAsync = () => {
+  const proxy = inst?.proxy;
+  if (proxy == null) return;
+  uni.createSelectorQuery()
+    .in(proxy)
+    .select("#vsx-container")
+    .boundingClientRect((rect: any) => {
+      if (rect != null) {
+        const h = parseFloat(`${rect["height"] ?? 0}`);
+        if (h > 0) {
+          cachedVp = h;
+          cachedVpAt = Date.now();
+        }
+      }
+    })
+    .exec();
+};
+// #endif
+
+/** 视口高度（200ms 缓存；App/H5 同步读，MP 走挂载时异步回填 + 缓存兜底） */
+const queryViewport = (): number => {
+  const now = Date.now();
+  if (cachedVp > 0 && now - cachedVpAt < VP_CACHE_MS) return cachedVp;
+  // #ifndef MP-WEIXIN
+  const el = findEl("vsx-container");
+  const h = el?.offsetHeight ?? 0;
+  if (h > 0) {
+    cachedVp = h;
+    cachedVpAt = now;
+    return h;
+  }
+  // #endif
+  if (cachedVp > 0) return cachedVp;
+  return 600; // 首帧兜底
+};
+
+// ==================== 实测 ====================
+
+/**
+ * 批量实测当前切片：
+ *  - 未实测项 → 读真实高度回填（修正估算/spacer/前缀和）
+ *  - stickToBottom 末条 → 每轮重测（流式高度随内容增长）
+ * offsetHeight==0（未布局完）跳过，由 scheduleMeasure 有限重试兜底。
+ */
+const measureNow = () => {
+  if (props.enabled != true) return;
+  const start = engine.winStart.value;
+  const end = engine.winEnd.value;
+  if (end <= start) return;
+  const slice = engine.visibleSlice.value;
+  const total = props.items.length;
+
+  // #ifndef MP-WEIXIN
+  const keys = [] as string[];
+  const hs = [] as number[];
+  const idxs = [] as number[];
+  for (let i = start; i < end; i++) {
+    const item = slice[i - start];
+    if (item == null) continue;
+    const key = keyOfItem(item, i);
+    const isLast = i == total - 1;
+    const needRemeasure = isLast && props.stickToBottom;
+    if (engine.isMeasured(key) && !needRemeasure) continue;
+    const el = findEl(`vsx-item-${key}`);
+    const h = el?.offsetHeight ?? 0;
+    if (h <= 0) continue;
+    keys.push(key);
+    hs.push(h);
+    idxs.push(i);
+  }
+  if (keys.length > 0) engine.onItemsMeasured(keys, hs, idxs);
+  // #endif
+
+  // #ifdef MP-WEIXIN
+  // 微信小程序：无同步 getElementById，用 selector query 异步批量实测（慢一拍但收敛）
+  const proxy = inst?.proxy;
+  if (proxy == null) return;
+  uni.createSelectorQuery()
+    .in(proxy)
+    .selectAll(".vsx-item")
+    .fields({ id: true, size: true }, (res: any) => {
+      if (res == null) return;
+      const nodes = res as any[];
+      const keys = [] as string[];
+      const hs = [] as number[];
+      const idxs = [] as number[];
+      for (let p = 0; p < nodes.length; p++) {
+        const node = nodes[p];
+        if (node == null) continue;
+        const idStr = `${node["id"] ?? ""}`;
+        const h = parseFloat(`${node["height"] ?? 0}`);
+        if (h <= 0) continue;
+        const key = idStr.replace("vsx-item-", "");
+        const index = start + p; // selectAll 结果按文档顺序，与切片顺序一致
+        const isLast = index == total - 1;
+        if (engine.isMeasured(key) && !(isLast && props.stickToBottom)) continue;
+        keys.push(key);
+        hs.push(h);
+        idxs.push(index);
+      }
+      if (keys.length > 0) engine.onItemsMeasured(keys, hs, idxs);
+    })
+    .exec();
+  // #endif
+};
+
+/** 调度实测：nextTick 一次 + 未布局完时最多 3 次 60ms 重试（静止页面不漏测） */
+function scheduleMeasure(): void {
+  nextTick(() => {
+    measureNow();
+    if (engine.hasUnmeasuredInWindow() && measureRetry < 3) {
+      measureRetry++;
+      setTimeout((): void => scheduleMeasure(), 60);
+    } else {
+      measureRetry = 0;
+    }
+  });
+}
+
+// ==================== 纠偏 ====================
+
+/** 滚动空闲时应用视口上方累计纠偏（无感写 scroll-top，动画强制关） */
+const applyCorrectionNow = () => {
+  const delta = engine.takePendingCorrection();
+  if (delta == 0) return;
+  const target = lastScrollTop + delta;
+  lastScrollTop = target;
+  animCmd.value = false;
+  scrollTopCmd.value = target;
+  // 同步引擎视角，避免下一帧 @scroll 用旧值回弹
+  engine.onScroll(target, queryViewport());
+  emit("correction", delta);
+};
+
+const scheduleIdleApply = () => {
+  if (idleTimer != 0) clearTimeout(idleTimer);
+  idleTimer = setTimeout((): void => {
+    idleTimer = 0;
+    applyCorrectionNow();
+  }, 120);
+};
+
+// ==================== 滚动事件 ====================
+
+const onScroll = (e: UniScrollEvent) => {
+  const st = e?.detail?.scrollTop ?? 0;
+  lastScrollTop = st;
+  const changed = engine.onScroll(st, queryViewport());
+  if (changed) scheduleMeasure();
+  scheduleIdleApply();
+  emit("scroll", st, engine.winStart.value, engine.winEnd.value);
+};
+
+const onUpper = () => emit("scrolltoupper");
+const onLower = () => emit("scrolltolower");
+
+// ==================== watch / 生命周期 ====================
+
+watch(
+  (): any[] => props.items,
+  (list: any[]) => {
+    engine.setItems(list);
+    scheduleMeasure();
+  },
+  { immediate: true },
+);
+
+watch(
+  (): boolean => props.enabled,
+  (b: boolean) => {
+    engine.setEnabled(b);
+    scheduleMeasure();
+  },
+);
+
+watch(
+  (): boolean => props.stickToBottom,
+  (b: boolean) => engine.applyStickToBottom(b),
+);
+
+watch(
+  (): number => props.overscanScreens,
+  (v: number) => {
+    engine.overscanScreens = v;
+    engine.refreshWindow();
+  },
+);
+
+watch(
+  (): number => props.hysteresisScreens,
+  (v: number) => {
+    engine.hysteresisScreens = v;
+    engine.refreshWindow();
+  },
+);
+
+onMounted(() => {
+  // #ifdef MP-WEIXIN
+  fillViewportAsync();
+  // #endif
+  // #ifdef H5 || MP-WEIXIN
+  // 视口变化（窗口缩放 / 横竖屏 / 折叠屏）：失效缓存并重算窗口。
+  // App 键盘弹起不改窗口尺寸，键盘场景请父级调 refreshViewport()。
+  uni.onWindowResize((): void => {
+    cachedVp = 0;
+    // #ifdef MP-WEIXIN
+    fillViewportAsync();
+    // #endif
+    engine.onScroll(lastScrollTop, queryViewport());
+    scheduleMeasure();
+  });
+  // #endif
+  queryViewport();
+  scheduleMeasure();
+});
+
+onUpdated(() => {
+  // 每次 patch 后补一轮实测（流式末条增高、invalidate 后重测都走这里收敛）
+  if (props.enabled) measureNow();
+});
+
+onUnmounted(() => {
+  if (idleTimer != 0) {
+    clearTimeout(idleTimer);
+    idleTimer = 0;
+  }
+});
+
+// ==================== 暴露 API ====================
+
+/** 滚动到指定 key 项（先 forceInclude 确保挂载，再 scroll-into-view） */
+const scrollToKey = (key: string) => {
+  if (key.length == 0) return;
+  engine.forceInclude(key);
+  nextTick(() => {
+    animCmd.value = props.scrollWithAnimation;
+    scrollIntoViewCmd.value = `vsx-item-${key}`;
+    setTimeout((): void => {
+      scrollIntoViewCmd.value = "";
+      animCmd.value = false;
+    }, 400);
+  });
+};
+
+/** 滚动到底部锚点（锚点恒挂载在切片之外，虚拟化下仍可达） */
+const scrollToBottom = () => {
+  animCmd.value = props.scrollWithAnimation;
+  scrollIntoViewCmd.value = "vsx-bottom-anchor";
+  setTimeout((): void => {
+    scrollIntoViewCmd.value = "";
+    animCmd.value = false;
+  }, 400);
+};
+
+/**
+ * 顶部 prepend 补偿（聊天加载历史）：
+ * 在父级把新数据前插到 items 后调用，返回补偿像素；内部已写 scroll-top 保持视角不动。
+ */
+const notifyPrepended = (count: number): number => {
+  engine.setItems(props.items); // 同步一次，防 watch 未 flush 时按旧数据估算
+  const px = engine.onItemsPrepended(count);
+  if (px > 0) {
+    lastScrollTop = lastScrollTop + px;
+    animCmd.value = false;
+    scrollTopCmd.value = lastScrollTop;
+  }
+  scheduleMeasure();
+  return px;
+};
+
+/** 内容高度变化后标记重测（think 展开、图片加载完成、消息编辑等） */
+const notifyItemChanged = (key: string) => {
+  engine.invalidate(key);
+  scheduleMeasure();
+};
+
+/** 全局高度变化（字号/主题切换、字体加载完成）→ 全量重测 */
+const invalidateAll = () => {
+  engine.invalidateAll();
+  scheduleMeasure();
+};
+
+/** 清高度缓存（估算模型更换 / 会话切换） */
+const clearCache = () => {
+  engine.clearHeights();
+  scheduleMeasure();
+};
+
+/** 全量重置（组件复用到另一份数据前调用） */
+const reset = () => {
+  engine.reset();
+  lastScrollTop = 0;
+  scrollTopCmd.value = 0;
+};
+
+/** 视口变化手动刷新（App 键盘弹起、分屏等不触发 onWindowResize 的场景） */
+const refreshViewport = () => {
+  cachedVp = 0;
+  // #ifdef MP-WEIXIN
+  fillViewportAsync();
+  // #endif
+  engine.onScroll(lastScrollTop, queryViewport());
+  scheduleMeasure();
+};
+
+const snapshot = (): string => engine.snapshotDebug();
+
+/**
+ * 结构化窗口统计（供宿主 perf 浮层实时展示，免解析 snapshot 字符串）。
+ * - total: items 总数
+ * - winStart/winEnd: 当前渲染窗口 [start, end[
+ * - mounted: 实际挂载切片条数（= winEnd - winStart，含 forceInclude）
+ * - topSpacer/bottomSpacer: 视口上/下占位高度 px（即 preload 的视觉度量）
+ * - scrollTop/viewport: 当前滚动位与视口高
+ * - enabled: 虚拟滚动开关
+ */
+const getStats = (): UTSJSONObject => {
+  return {
+    total: props.items.length,
+    winStart: engine.winStart.value,
+    winEnd: engine.winEnd.value,
+    mounted: engine.visibleSlice.value.length,
+    topSpacer: engine.topSpacerPx.value,
+    bottomSpacer: engine.bottomSpacerPx.value,
+    scrollTop: lastScrollTop,
+    viewport: queryViewport(),
+    enabled: engine.enabled.value,
+  } as UTSJSONObject;
+};
+
+defineExpose({
+  scrollToKey,
+  scrollToBottom,
+  notifyPrepended,
+  notifyItemChanged,
+  invalidateAll,
+  clearCache,
+  reset,
+  refreshViewport,
+  measureNow,
+  snapshot,
+  getStats,
+});
+</script>
+
+<style scoped>
+.vsx-container {
+  width: 100%;
+  height: 100%;
+}
+.vsx-spacer {
+  width: 100%;
+}
+.vsx-item {
+  width: 100%;
+}
+.vsx-anchor {
+  width: 100%;
+  height: 1px;
+}
+</style>

@@ -49,10 +49,41 @@
         </view>
       </view>
 
-      <!-- AI 答复内容：流式也走 UniAiXMsgRender；解析节流避免每 SSE 字卡死 -->
+      <!-- AI 答复内容：结构内容走 UniAiXMsgRender；Android 纯文本/代码流式走对应轻量叶子。 -->
       <view class="answer-container">
+        <!--
+          约 512 字在自然换行处冻结一个静态块，只更新有界尾块。
+          避免单个累计 text 重测全部正文，也避免每行一个节点拖慢 scroll-view。
+        -->
+        <template v-if="showPlainStreamText">
+          <PlainStreamFastText
+            ref="plainStreamFastTextRef"
+            :initial-text="plainStreamInitialText"
+            :pacing="streamDisplayPacing"
+            :text-style="plainStreamTextStyle"
+            @caughtUp="tryFinishPlainStreamFinalization"
+            @displayProgress="handlePlainStreamDisplayProgress"
+          />
+        </template>
+        <template v-else-if="showCodeStreamRender">
+          <CodeStreamFastRender
+            ref="codeStreamFastRenderRef"
+            :initial-text="codeStreamInitialText"
+            @caughtUp="tryFinishCodeStreamFinalization"
+          />
+        </template>
+        <FormulaStreamFrozenRender
+          v-else-if="showFormulaStreamRender"
+          ref="formulaStreamFrozenRenderRef"
+          :initial-list="formulaStreamInitialList"
+          :initial-stable-count="formulaStreamInitialStableCount"
+          :processing-list="formulaStreamInitialProcessingList"
+          :conversation-id="formulaStreamInitialConversationId"
+          :body-text="formulaStreamInitialBodyText"
+          :is-app-details="isAppDetails"
+        />
         <UniAiXMsgRender
-          v-if="renderMarkdownElList.length > 0"
+          v-else-if="renderMarkdownElList.length > 0"
           :markdown-el-list="renderMarkdownElList"
           :processing-list="renderProcessingList"
           :conversation-id="msg.chat_id"
@@ -93,6 +124,9 @@
   import { ChatDataAdapter } from "@/utils/chatDataAdapter.uts";
   import msgToolBar from "@/subpackages/components/msg-tool-bar/msg-tool-bar.uvue";
   import UniAiXMsgRender from "@/uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue";
+  import PlainStreamFastText from "@/subpackages/components/ai-msg/plain-stream-fast-text.uvue";
+  import CodeStreamFastRender from "@/subpackages/components/ai-msg/code-stream-fast-render.uvue";
+  import FormulaStreamFrozenRender from "@/subpackages/components/ai-msg/formula-stream-frozen-render.uvue";
   import { stripOpenUiActionIdMarker } from "@/utils/openUiSchema.uts";
   // #ifdef APP
   import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
@@ -109,12 +143,20 @@
     stripAgentInfoTags,
     stripAdaptedAgentInfoHtml,
   } from "@/subpackages/components/ai-msg/agentInfoTag.uts";
-  import { onUnmounted } from "vue";
+  import { onUnmounted, type ComponentPublicInstance } from "vue";
   // #ifdef APP
   import { perfRecordSseUi } from "@/utils/perfProbe.uts";
   // #endif
   import { toolCallProcessingListFingerprint } from "@/subpackages/utils/containerHelper.uts";
   import { applyThinkIncremental } from "@/subpackages/components/ai-msg/thinkIncrementalDisplay.uts";
+  import {
+    resolveStreamRenderProfile,
+    STREAM_RENDER_KIND_PLAIN,
+    STREAM_RENDER_KIND_CODE,
+    STREAM_RENDER_KIND_MERMAID,
+    STREAM_RENDER_KIND_TABLE,
+    STREAM_RENDER_KIND_FORMULA,
+  } from "@/subpackages/components/ai-msg/streamRenderPolicy.uts";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -133,6 +175,8 @@
       messageTime?: string;
       /** App 可靠通道：直接传字符串，避免 MsgItem 类实例 prop 丢字段 */
       bodyText?: string;
+      /** SSE 到达呈大块/长间隔时，纯文本使用 24ms 匀速揭示。 */
+      streamDisplayPacing?: boolean;
       thinkText?: string;
       /**
        * 预计算可播报正文（MessageInfo.speakableText）。
@@ -162,6 +206,7 @@
       conversationId: "",
       messageTime: "",
       bodyText: "",
+      streamDisplayPacing: false,
       thinkText: "",
       speakableText: "",
       showToolBar: true,
@@ -406,6 +451,10 @@
   const STREAM_MD_STRUCT_INTERVAL_BASE_MS: number = 280;
   let streamMdParseTimer: number = 0;
   let streamMdParsePending: boolean = false;
+  /** 历史消息延迟解析定时器（错峰分批，避免首屏 N 条同时全量解析打满主线程） */
+  let historyParseDeferredTimer: number = 0;
+  /** 已解析标记：延迟到期前为 false，防止 watch 多次触发重复延迟 */
+  let historyParseDone: boolean = false;
 
   function clearStreamMdParseTimer(): void {
     if (streamMdParseTimer != 0) {
@@ -516,13 +565,361 @@
     (): boolean => isLastMsg.value,
   );
 
+  // ==================== Android 纯文本流式快速通道 ====================
+  const plainStreamInitialText = ref<string>("");
+  const plainStreamFastTextRef = ref<any | null>(null);
+  const plainStreamEngaged = ref<boolean>(false);
+  const plainStreamFinalizing = ref<boolean>(false);
+  /**
+   * 本次挂载中已完成的纯文本继续保留原生 text。
+   * cmark 会折叠普通单换行，若完成时换树会让消息高度骤减、scroll-view 跳动。
+   * Markdown 定稿仍照常生成；历史重新挂载时未命中此状态，仍走标准 Markdown。
+   */
+  const plainStreamCompleted = ref<boolean>(false);
+  const plainStreamWindowWidthPx: number = uni.getSystemInfoSync().windowWidth;
+  const plainStreamWidthPx: number = Math.max(
+    1,
+    plainStreamWindowWidthPx - (plainStreamWindowWidthPx * 64) / 750,
+  );
+  const plainStreamTextStyle: string = `width:${plainStreamWidthPx}px;`;
+  let plainStreamTargetText: string = "";
+  let plainStreamFinalizeFrame: number = 0;
+  let plainStreamSwapFrame: number = 0;
+
+  const showPlainStreamText = computed((): boolean => {
+    return (
+      (plainStreamEngaged.value == true ||
+        plainStreamFinalizing.value == true ||
+        plainStreamCompleted.value == true) &&
+      plainStreamTargetText.length > 0
+    );
+  });
+
+  function clearPlainStreamFinalizeFrame(): void {
+    if (plainStreamFinalizeFrame != 0) {
+      cancelAnimationFrame(plainStreamFinalizeFrame);
+      plainStreamFinalizeFrame = 0;
+    }
+    if (plainStreamSwapFrame != 0) {
+      cancelAnimationFrame(plainStreamSwapFrame);
+      plainStreamSwapFrame = 0;
+    }
+  }
+
+  function tryFinishPlainStreamFinalization(): void {
+    if (plainStreamFinalizing.value != true) {
+      return;
+    }
+    const el = plainStreamFastTextRef.value;
+    if (el != null) {
+      try {
+        const proxy = el as ComponentPublicInstance;
+        if (proxy.$callMethod("isCaughtUp") != true) return;
+      } catch (_eCaughtUp) {
+        return;
+      }
+    }
+    if (markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) != true) {
+      return;
+    }
+    // parse 完成与 Markdown 树挂载分到相邻两帧，避免同一主线程任务叠峰。
+    if (plainStreamSwapFrame == 0) {
+      plainStreamSwapFrame = requestAnimationFrame((): void => {
+        plainStreamSwapFrame = 0;
+        if (
+          plainStreamFinalizing.value == true &&
+          markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) == true
+        ) {
+          // 最终仍为纯文本时不切换几何高度不同的 Markdown 段落树。
+          plainStreamCompleted.value =
+            resolveStreamRenderProfile(resolveBodyText()).kind ==
+            STREAM_RENDER_KIND_PLAIN;
+          plainStreamFinalizing.value = false;
+        }
+      });
+    }
+  }
+
+  /**
+   * 纯文本叶子的 24ms 匀速 paint 不经过 AgentDetailService 的 UI 冲刷，
+   * 需要复用既有 streamMessageUpdate → ScrollManager 跟底链路报告可见高度增长。
+   * 是否允许跟底仍由上层 autoToLastMsg / scrollTouch 守卫决定。
+   */
+  function handlePlainStreamDisplayProgress(): void {
+    if (isLastMsg.value != true) {
+      return;
+    }
+    if (
+      plainStreamEngaged.value != true &&
+      plainStreamFinalizing.value != true
+    ) {
+      return;
+    }
+    uni.$emit("streamMessageUpdate");
+  }
+
+  function updatePlainStreamTarget(body: string): void {
+    plainStreamTargetText = body;
+    const el = plainStreamFastTextRef.value;
+    if (el != null) {
+      try {
+        const proxy = el as ComponentPublicInstance;
+        proxy.$callMethod("updateText", body, props.streamDisplayPacing == true);
+        return;
+      } catch (_eUpdateText) {
+        // 首次挂载前落回 initialText；下一次 patch 会走叶子组件方法。
+      }
+    }
+    plainStreamInitialText.value = body;
+  }
+
+  /**
+   * 叶子直更期间故意不写 msg.body，避免每个 SSE 合并窗触发整棵消息树 diff。
+   * 会话结束时必须把叶子持有的权威累计正文同步一次，否则终态 Markdown
+   * 可能读取到父级尚未刷新的旧 body，并用旧内容替换已经正确显示的原生文本。
+   */
+  function commitFastStreamBody(body: string): string {
+    if (body.length == 0) {
+      return resolveBodyText();
+    }
+    if (msg.value.body != body) {
+      msg.value.body = body;
+    }
+    return body;
+  }
+
+  function enterPlainStream(body: string): void {
+    if (plainStreamEngaged.value != true) {
+      clearStreamMdParseTimer();
+      markdownParser.suspendForPlainStream();
+      plainStreamEngaged.value = true;
+      plainStreamFinalizing.value = false;
+      plainStreamCompleted.value = false;
+    }
+    updatePlainStreamTarget(body);
+  }
+
+  function leavePlainStreamForMarkdown(): void {
+    clearPlainStreamFinalizeFrame();
+    plainStreamTargetText = "";
+    plainStreamInitialText.value = "";
+    plainStreamEngaged.value = false;
+    plainStreamFinalizing.value = false;
+    plainStreamCompleted.value = false;
+  }
+
+  function resetPlainStreamState(): void {
+    leavePlainStreamForMarkdown();
+  }
+
+  function canUseAndroidPlainStream(body: string): boolean {
+    // #ifdef APP-ANDROID
+    return resolveStreamRenderProfile(body).kind == STREAM_RENDER_KIND_PLAIN;
+    // #endif
+    // #ifndef APP-ANDROID
+    return false;
+    // #endif
+  }
+
+  // ==================== Android 代码流式真实渲染器快通道 ====================
+  const codeStreamInitialText = ref<string>("");
+  const codeStreamFastRenderRef = ref<any | null>(null);
+  const codeStreamEngaged = ref<boolean>(false);
+  const codeStreamFinalizing = ref<boolean>(false);
+  let codeStreamTargetText = "";
+  let codeStreamFinalizeFrame = 0;
+  let codeStreamSwapFrame = 0;
+
+  const showCodeStreamRender = computed((): boolean => {
+    return (
+      (codeStreamEngaged.value == true || codeStreamFinalizing.value == true) &&
+      codeStreamTargetText.length > 0
+    );
+  });
+
+  function clearCodeStreamFinalizeFrame(): void {
+    if (codeStreamFinalizeFrame != 0) {
+      cancelAnimationFrame(codeStreamFinalizeFrame);
+      codeStreamFinalizeFrame = 0;
+    }
+    if (codeStreamSwapFrame != 0) {
+      cancelAnimationFrame(codeStreamSwapFrame);
+      codeStreamSwapFrame = 0;
+    }
+  }
+
+  function updateCodeStreamTarget(body: string): void {
+    codeStreamTargetText = body;
+    const el = codeStreamFastRenderRef.value;
+    if (el != null) {
+      try {
+        const proxy = el as ComponentPublicInstance;
+        proxy.$callMethod("updateText", body);
+        return;
+      } catch (_eUpdateCode) {
+        // 首次挂载前落回 initialText。
+      }
+    }
+    codeStreamInitialText.value = body;
+  }
+
+  function enterCodeStream(body: string): void {
+    if (codeStreamEngaged.value != true) {
+      leavePlainStreamForMarkdown();
+      clearStreamMdParseTimer();
+      markdownParser.suspendForPlainStream();
+      codeStreamEngaged.value = true;
+      codeStreamFinalizing.value = false;
+    }
+    updateCodeStreamTarget(body);
+  }
+
+  function leaveCodeStreamForMarkdown(): void {
+    clearCodeStreamFinalizeFrame();
+    codeStreamTargetText = "";
+    codeStreamInitialText.value = "";
+    codeStreamEngaged.value = false;
+    codeStreamFinalizing.value = false;
+  }
+
+  function tryFinishCodeStreamFinalization(): void {
+    if (codeStreamFinalizing.value != true) return;
+    if (markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) != true) {
+      return;
+    }
+    if (codeStreamSwapFrame == 0) {
+      codeStreamSwapFrame = requestAnimationFrame((): void => {
+        codeStreamSwapFrame = 0;
+        if (
+          codeStreamFinalizing.value == true &&
+          markdownParser.isFinishedBodyRendered(resolveRenderableBodyText()) == true
+        ) {
+          codeStreamFinalizing.value = false;
+        }
+      });
+    }
+  }
+
+  function canUseAndroidCodeStream(body: string): boolean {
+    // #ifdef APP-ANDROID
+    const kind = resolveStreamRenderProfile(body).kind;
+    return (
+      kind == STREAM_RENDER_KIND_CODE || kind == STREAM_RENDER_KIND_MERMAID
+    );
+    // #endif
+    // #ifndef APP-ANDROID
+    return false;
+    // #endif
+  }
+
+  // ==================== Android 公式流式冻结前缀 ====================
+  // 只在展示适配层切分 renderer；消息正文、parser 与终态定稿仍保持原职责。
+  const formulaStreamFrozenRenderRef = ref<any | null>(null);
+  const formulaStreamEngaged = ref<boolean>(false);
+  const formulaStreamInitialList = ref<UniAiMarkdownElItem[]>(
+    [] as UniAiMarkdownElItem[],
+  );
+  const formulaStreamInitialStableCount = ref<number>(0);
+  const formulaStreamInitialProcessingList = ref<any[]>([] as any[]);
+  const formulaStreamInitialConversationId = ref<string>("");
+  const formulaStreamInitialBodyText = ref<string>("");
+
+  const showFormulaStreamRender = computed((): boolean => {
+    return (
+      formulaStreamEngaged.value == true &&
+      formulaStreamInitialList.value.length > 0
+    );
+  });
+
+  function canUseFormulaStreamRenderer(): boolean {
+    // #ifdef APP-ANDROID
+    if (
+      isConversationActive.value != true ||
+      isLastMsg.value != true
+    ) {
+      return false;
+    }
+    return (
+      resolveStreamRenderProfile(resolveBodyText()).kind ==
+        STREAM_RENDER_KIND_FORMULA ||
+      formulaStreamEngaged.value == true
+    );
+    // #endif
+    // #ifndef APP-ANDROID
+    return false;
+    // #endif
+  }
+
+  function resetFormulaStreamRenderer(): void {
+    formulaStreamEngaged.value = false;
+    formulaStreamInitialList.value = [] as UniAiMarkdownElItem[];
+    formulaStreamInitialStableCount.value = 0;
+    formulaStreamInitialProcessingList.value = [] as any[];
+    formulaStreamInitialConversationId.value = "";
+    formulaStreamInitialBodyText.value = "";
+  }
+
+  function syncFormulaStreamRenderer(): void {
+    if (canUseFormulaStreamRenderer() != true) {
+      if (formulaStreamEngaged.value == true) {
+        resetFormulaStreamRenderer();
+      }
+      return;
+    }
+    const list = markdownParser.resolveRenderList();
+    if (list.length == 0) return;
+    const stableCount = markdownParser.resolveStableRenderCount();
+    if (formulaStreamEngaged.value != true) {
+      formulaStreamInitialList.value = list.slice();
+      formulaStreamInitialStableCount.value = stableCount;
+      formulaStreamInitialProcessingList.value = renderProcessingList.value.slice();
+      formulaStreamInitialConversationId.value = msg.value.chat_id;
+      formulaStreamInitialBodyText.value = resolveBodyText();
+      formulaStreamEngaged.value = true;
+      return;
+    }
+    const el = formulaStreamFrozenRenderRef.value;
+    if (el == null) return;
+    try {
+      const proxy = el as ComponentPublicInstance;
+      proxy.$callMethod("updateRenderList", list, stableCount);
+    } catch (_eFormulaStream) {
+      // 首次挂载前 initialList 已覆盖；下一 revision 再走叶子方法。
+    }
+  }
+
   function runBodyMarkdownParseNow(forceDone: boolean): void {
     clearStreamMdParseTimer();
-    // App：始终立即 parse。磁盘缓存命中可直接出图，不必再等 proxyWeb（历史长公式页可省约 1s）；
-    // 未命中公式由 flushMathJobs 在 proxy 就绪后再截图，占位过渡即可。
-    // 注意：parser.applyAppFallback / bumpRevision 已会抬 streamRevision，此处勿再 bump，
-    // 避免一次 parse 触发 2～3 次整树失效。
     markdownParser.runMarkdownParse(forceDone);
+  }
+
+  /**
+   * 历史消息延迟分批解析。
+   * 用 messageId 末位字符算确定性偏移（0~7 × 16ms ≈ 0~112ms），
+   * 使同屏多条历史的解析自然分散到不同帧，而非同一帧全部全量解析。
+   * requestAnimationFrame 让出当前帧，让 loading 动画/流式 chunk 有机会渲染。
+   */
+  function scheduleHistoryParseDeferred(): void {
+    if (historyParseDone == true) return;
+    if (historyParseDeferredTimer != 0) return; // 已排程
+    let tailDigit = 0;
+    const rawId = props.messageId;
+    const idStr = rawId != null ? `${rawId}` : "";
+    if (idStr.length > 0) {
+      const lastChar = idStr.charCodeAt(idStr.length - 1);
+      if (lastChar != null) {
+        tailDigit = (lastChar as number) % 8; // 0~7
+      }
+    }
+    const delay = tailDigit * 16;
+    requestAnimationFrame((): void => {
+      historyParseDeferredTimer = setTimeout((): void => {
+        historyParseDeferredTimer = 0;
+        if (historyParseDone == true) return;
+        historyParseDone = true;
+        runBodyMarkdownParseNow(true);
+      }, delay) as number;
+    });
   }
 
   /** 合并高频 chunk 后解析：intervalMs 合并窗内多次调用只解析一次 */
@@ -545,9 +942,71 @@
   function scheduleBodyMarkdownParse(): void {
     const streaming =
       isConversationActive.value == true && isLastMsg.value == true;
-    if (streaming == false) {
-      runBodyMarkdownParseNow(true);
+    let rawBody = resolveBodyText();
+    if (streaming == true && canUseAndroidPlainStream(rawBody) == true) {
+      enterPlainStream(rawBody);
       return;
+    }
+    if (streaming == true && canUseAndroidCodeStream(rawBody) == true) {
+      enterCodeStream(rawBody);
+      return;
+    }
+    if (streaming == false) {
+      if (plainStreamEngaged.value == true) {
+        rawBody = commitFastStreamBody(plainStreamTargetText);
+        plainStreamEngaged.value = false;
+        plainStreamFinalizing.value = true;
+        updatePlainStreamTarget(rawBody);
+        // 先让最终纯文本尾字上屏，再在下一帧做一次完整 Markdown 定稿。
+        clearPlainStreamFinalizeFrame();
+        plainStreamFinalizeFrame = requestAnimationFrame((): void => {
+          plainStreamFinalizeFrame = 0;
+          runBodyMarkdownParseNow(true);
+          tryFinishPlainStreamFinalization();
+        });
+        return;
+      }
+      if (codeStreamEngaged.value == true) {
+        rawBody = commitFastStreamBody(codeStreamTargetText);
+        codeStreamEngaged.value = false;
+        codeStreamFinalizing.value = true;
+        updateCodeStreamTarget(rawBody);
+        clearCodeStreamFinalizeFrame();
+        codeStreamFinalizeFrame = requestAnimationFrame((): void => {
+          codeStreamFinalizeFrame = 0;
+          runBodyMarkdownParseNow(true);
+          tryFinishCodeStreamFinalization();
+        });
+        return;
+      }
+      if (formulaStreamEngaged.value == true) {
+        clearStreamMdParseTimer();
+        // 公式流已经持续维护冻结前缀；终态只补最终 live 尾段，避免长正文再做一次 full fallback。
+        markdownParser.finalizeStructuralStream();
+        return;
+      }
+      // 非末条历史消息：延迟分批解析，避免首屏 N 条历史同时全量解析打满主线程。
+      // 已解析的历史消息不再重复 parse（watch 因 body/state 抖动多次触发时直接跳过，
+      // 避免 8 条消息被 parse 59 次的重复开销）。
+      if (isLastMsg.value != true) {
+        if (historyParseDone != true) {
+          scheduleHistoryParseDeferred();
+        }
+        return;
+      }
+      runBodyMarkdownParseNow(true);
+      tryFinishPlainStreamFinalization();
+      tryFinishCodeStreamFinalization();
+      return;
+    }
+    if (
+      plainStreamEngaged.value == true ||
+      plainStreamFinalizing.value == true
+    ) {
+      leavePlainStreamForMarkdown();
+    }
+    if (codeStreamEngaged.value == true || codeStreamFinalizing.value == true) {
+      leaveCodeStreamForMarkdown();
     }
     // 首帧立刻出字，避免空白等节流
     if (markdownParser.resolveRenderList().length == 0) {
@@ -704,6 +1163,43 @@
   const updateMessage = (newData: any) => {
     try {
       if (newData != null) {
+        // list-view 回收防御：回收复用时本组件可能已绑到别的消息（:ref 回调不保证随 rebind 重触发）。
+        // patch 的 id 与自身 _id 不符 → 这是打到错位实例的陈旧 patch，直接跳过；
+        // 数据源 messageList/streamingAssistantText 已权威更新，跳过 in-place patch 不丢内容。
+        const selfId = msg.value._id;
+        if (selfId.length > 0) {
+          const patchId = (newData as UTSJSONObject)["id"];
+          if (patchId != null && `${patchId}` != selfId) {
+            return;
+          }
+        }
+        // Android 叶子热路径：权威正文由 Service draft 累计；气泡内只直更真实文本/代码 renderer。
+        // 不写 msg.body / streamRevision，避免每个 24ms 窗让整个 ai-msg 参与 VDOM diff。
+        const directPatch = newData as UTSJSONObject;
+        const directBodyVal = directPatch["body"];
+        if (
+          directBodyVal != null &&
+          isConversationActive.value == true &&
+          isLastMsg.value == true
+        ) {
+          const directBody = `${directBodyVal}`;
+          if (canUseAndroidPlainStream(directBody) == true) {
+            if (plainStreamEngaged.value != true) {
+              enterPlainStream(directBody);
+            } else {
+              updatePlainStreamTarget(directBody);
+            }
+            return;
+          }
+          if (canUseAndroidCodeStream(directBody) == true) {
+            if (codeStreamEngaged.value != true) {
+              enterCodeStream(directBody);
+            } else {
+              updateCodeStreamTarget(directBody);
+            }
+            return;
+          }
+        }
         const bodyBefore = resolveBodyText();
         const thinkBefore = resolveThinkText();
         const procBefore = toolCallProcessingListFingerprint(
@@ -772,6 +1268,9 @@
     (messageId: string) => {
       if (messageId.length == 0) return;
       if (msg.value._id != messageId) {
+        // list-view 回收 rebind：组件被复用给另一条消息，清掉旧消息挂起的解析定时器，
+        // 避免旧延迟解析（runMarkdownParse）跑到新消息上造成串内容/错乱。
+        clearStreamMdParseTimer();
         const next = new MsgItem();
         next._id = messageId;
         next.from_uid = "assistant";
@@ -889,6 +1388,9 @@
   watch(
     (): string => msg.value._id,
     () => {
+      resetPlainStreamState();
+      leaveCodeStreamForMarkdown();
+      resetFormulaStreamRenderer();
       markdownParser.resetForNewMessage();
       thinkFrozenParts = [] as string[];
       thinkLivePart = "";
@@ -905,12 +1407,8 @@
     (): string =>
       resolveBodyText() + "|" + `${msg.value.state}` + "|" + `${isLastMsg.value}`,
     () => {
-      if (isLastMsg.value == true && isConversationActive.value == true) {
-        scheduleBodyMarkdownParse();
-        return;
-      }
-      // 历史 / 非流式末条：定稿解析（runMarkdownParse 内部会跳过正文未变）
-      runBodyMarkdownParseNow(true);
+      // 流式纯文本 / 结构 Markdown / 终态定稿统一由一个入口决定，避免结束态绕过无闪切换。
+      scheduleBodyMarkdownParse();
     },
     { immediate: true },
   );
@@ -918,20 +1416,42 @@
   /** 仅末条关心会话 active：开始→节流解析；结束→立刻定稿。历史消息忽略 active 抖动。 */
   watch(
     (): boolean => isConversationActive.value,
-    (active: boolean) => {
+    (_active: boolean) => {
       if (isLastMsg.value != true) {
         return;
       }
-      if (active == true) {
-        scheduleBodyMarkdownParse();
-      } else {
-        runBodyMarkdownParseNow(true);
+      scheduleBodyMarkdownParse();
+    },
+  );
+
+  /** cadence 探测可能在正文不变的同一批 flush 中切换，单独响应 pacing prop。 */
+  watch(
+    (): boolean => props.streamDisplayPacing == true,
+    () => {
+      if (
+        plainStreamEngaged.value == true ||
+        plainStreamFinalizing.value == true
+      ) {
+        updatePlainStreamTarget(resolveBodyText());
       }
     },
   );
 
+  /** 终态 cmark/fallback 完成会 bump revision；等可见尾字追平后再无闪烁切树。 */
+  watch(streamRevision, () => {
+    syncFormulaStreamRenderer();
+    tryFinishPlainStreamFinalization();
+    tryFinishCodeStreamFinalization();
+  });
+
   onUnmounted(() => {
     clearStreamMdParseTimer();
+    clearPlainStreamFinalizeFrame();
+    clearCodeStreamFinalizeFrame();
+    if (historyParseDeferredTimer != 0) {
+      clearTimeout(historyParseDeferredTimer);
+      historyParseDeferredTimer = 0;
+    }
     if (thinkTextThrottleTimer != null) {
       clearTimeout(thinkTextThrottleTimer!);
       thinkTextThrottleTimer = null;
@@ -1038,6 +1558,14 @@
        * 取值：color #404040、font-size 32rpx、line-height 48rpx(=1.5)
        */
       width: 100%;
+
+      .answer-plain-stream-text {
+        width: 100%;
+        color: #404040;
+        font-size: 32rpx;
+        line-height: 48rpx;
+        white-space: pre-wrap;
+      }
     }
 
     .answer-fallback {

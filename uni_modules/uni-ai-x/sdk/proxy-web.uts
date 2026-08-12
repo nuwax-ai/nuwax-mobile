@@ -1,4 +1,5 @@
 import utils from '@/uni_modules/uni-ai-x/sdk/utils.uts'
+import { type ComponentPublicInstance } from 'vue'
 type OnMsgFn = (e : UTSJSONObject) => void
 
 /** 代理未就绪时暂存的调用 */
@@ -19,17 +20,37 @@ class ProxyReadyListener {
 	}
 }
 
+/**
+ * 已派发请求的回包超时（ms）。
+ * html2canvas 在某些机型会永久挂起、或 postMessage 在桥打满时丢失 → 回调永不触发 →
+ * callbackMap 槽永久占用 → 后续请求累积 → 桥死锁（docs/handoff-chat-webview-leak-deadlock.md 的 D）。
+ * 该超时是 app 侧兜底：超时未回则释放槽位、以 error 回调，防泄漏累积。
+ * （proxy-web.html 内部已有 8s html2canvas 超时回 error；此处是它失效/丢失时的第二道防线。）
+ */
+const PROXY_CALL_TIMEOUT_MS : number = 12000
+
+/** evalJS 主动触发 web 侧重发 DOMContentLoaded 的探测上限（每次间隔 1.2s，约 7.2s 内 6 次）。
+ *  超过后放弃，由 armSafetyFlush 8s 兜底失败回调。 */
+const READY_PROBE_MAX : number = 6
+
 class ProxyWeb {
 	isInit : boolean = false
 	private webviewContext : WebviewContext | null = null
 	/** App 端 createWebviewContext 使用的节点 id */
 	private webviewId : string = "markdown-proxy-web"
+	/** 宿主组件实例：web-view 在子组件内时，createWebviewContext 必须传 component
+	 * 才能在子组件树里定位节点；否则只在「页面栈顶部」找 → 返回 null（历史 ctx 绑失败主因）。 */
+	private hostComponent : ComponentPublicInstance | null = null
 	callbackMap : Map<string, OnMsgFn> = new Map()
+	/** 已派发请求的回包超时定时器 key(callbackMap 同 key) → timer id */
+	private callbackTimers : Map<string, number> = new Map()
 	/** isInit 前入队，DOMContentLoaded 后一次性冲刷（避免上百次 100ms 重试刷屏） */
 	private pendingCalls : ProxyPendingCall[] = []
 	/** 等待代理就绪的监听（历史含公式消息可 defer 到就绪后再解析） */
 	private readyListeners : ProxyReadyListener[] = []
 	private safetyFlushTimer : number = 0
+	/** evalJS 主动触发 web 侧重发 DOMContentLoaded 的探测计数（上限避免无限重试） */
+	private readyProbeCount : number = 0
 
 	constructor() {
 		// #ifdef WEB
@@ -53,19 +74,75 @@ class ProxyWeb {
 		}
 		// #ifdef APP
 		try {
-			const ctx = uni.createWebviewContext(this.webviewId)
+			const ctx = uni.createWebviewContext(this.webviewId, this.hostComponent)
 			if (ctx != null) {
 				this.webviewContext = ctx
+				// 上下文刚绑定：若代理仍未就绪，主动 evalJS 触发 web 侧重发 DOMContentLoaded。
+				// web 侧首帧自动 signalHostReady 可能在 @message 桥就绪前发出而丢失，
+				// 或页面 @error 重载后 _hostReadySent 已 true 不再重发 —— 此处兜底恢复握手。
+				if (this.isInit != true) {
+					this.requestReadySignal()
+				}
 			}
 		} catch (e) {
-			// ignore：后续 callMethod / DOMContentLoaded 会再补绑
+			console.warn("[ProxyWeb] bind context failed: " + `${e}`)
 		}
 		// #endif
+	}
+
+	/**
+	 * 主动 evalJS 触发 web 侧 signalReady() 重发 DOMContentLoaded_callback。
+	 * 解决首帧 postMessage 在 @message 桥就绪前发出而丢失、或页面重载后不再重发的问题。
+	 * 有计数上限：超过 READY_PROBE_MAX 次仍未就绪则放弃（由 armSafetyFlush 8s 兜底失败回调）。
+	 */
+	requestReadySignal(): void {
+		if (this.isReady() == true) {
+			return
+		}
+		if (this.webviewContext == null) {
+			return
+		}
+		this.readyProbeCount = this.readyProbeCount + 1
+		const probe = this.readyProbeCount
+		// #ifdef APP
+		this.webviewContext!.evalJS("window.proxyWebHandler && window.proxyWebHandler.signalReady && window.proxyWebHandler.signalReady()")
+		// #endif
+		// 仍未就绪且未超上限：1.2s 后重试（web 可能刚 @load 但 JS 上下文尚未就绪）
+		if (this.isInit != true && probe < READY_PROBE_MAX) {
+			setTimeout((): void => {
+				if (this.isInit != true && this.webviewContext != null) {
+					this.requestReadySignal()
+				}
+			}, 1200)
+		}
+	}
+
+	/**
+	 * web-view @load 回调入口：加载完成时由宿主组件调用。
+	 * 此时页面 JS 已存在，evalJS signalReady 必能命中 → 恢复就绪握手。
+	 * 同时补绑 context（@load 时机比 onMounted 更可靠）。
+	 */
+	onProxyWebLoaded(): void {
+		this.ensureAppContext(this.webviewId)
+		if (this.isReady() == true) {
+			return
+		}
+		// 重置探测计数，给 @load 路径独立的重试预算
+		this.readyProbeCount = 0
+		this.requestReadySignal()
 	}
 
 	/** 代理是否可立刻 evalJS */
 	isReady(): boolean {
 		return this.isInit == true && this.webviewContext != null
+	}
+
+	/**
+	 * 宿主组件登记自身实例（web-view 所在的子组件）。
+	 * 必须在首次 ensureAppContext 前调用：createWebviewContext 需 component 才能在子组件树定位节点。
+	 */
+	setHostComponent(comp : ComponentPublicInstance | null): void {
+		this.hostComponent = comp
 	}
 
 	/**
@@ -119,6 +196,39 @@ class ProxyWeb {
 		}
 	}
 
+	/**
+	 * 给已派发请求挂回包超时：PROXY_CALL_TIMEOUT_MS 内未回包则视作挂起，
+	 * 释放 callbackMap 槽位并以 error 回调（避免槽位泄漏累积成桥死锁）。
+	 */
+	private armCallTimeout(key : string, callback : OnMsgFn): void {
+		const timer = setTimeout((): void => {
+			if (this.callbackMap.has(key)) {
+				this.callbackMap.delete(key)
+				this.callbackTimers.delete(key)
+				console.warn("[ProxyWeb] call timeout, release slot:", key)
+				const fail = new UTSJSONObject()
+				fail["error"] = "proxy_timeout"
+				fail["imageDataURL"] = ""
+				fail["resultHtml"] = ""
+				utils.uniGetDispatcher("main", (): void => {
+					callback(fail)
+				})
+			} else {
+				// 已正常回包：仅清登记
+				this.callbackTimers.delete(key)
+			}
+		}, PROXY_CALL_TIMEOUT_MS) as number
+		this.callbackTimers.set(key, timer)
+	}
+
+	private clearCallbackTimer(key : string): void {
+		const t = this.callbackTimers.get(key)
+		if (t != null) {
+			clearTimeout(t)
+			this.callbackTimers.delete(key)
+		}
+	}
+
 	private notifyReadyListeners(): void {
 		const listeners = this.readyListeners
 		this.readyListeners = []
@@ -140,6 +250,8 @@ class ProxyWeb {
 		param["requestId"] = requestId
 		const key = (param["action"] as string) + "_callback_" + requestId
 		this.callbackMap.set(key, callback)
+		// 挂回包超时：防 html2canvas/postMessage 挂起导致该槽位永不释放
+		this.armCallTimeout(key, callback)
 
 		// #ifdef APP-ANDROID
 		const code = `onMessage(${JSON.stringify(param)})`
@@ -188,17 +300,25 @@ class ProxyWeb {
 			this.clearSafetyFlush()
 			this.flushPendingCalls()
 			this.notifyReadyListeners()
+		} else if (this.webviewContext != null && this.isInit != true) {
+			// context 刚绑但 DOMContentLoaded 还没到（@load 早于 onMounted 绑定、
+			// 或首帧 postMessage 丢失）：主动 evalJS 触发 web 侧重发就绪信号。
+			this.requestReadySignal()
 		}
 	}
 
 	/** 页面卸载时重置，避免单例残留 isInit=true 但 context 已失效 */
 	reset(): void {
 		this.clearSafetyFlush()
+		// 清超时登记；已在途的 setTimeout 会在回调里发现 callbackMap 已空而 no-op 自清
+		this.callbackTimers.clear()
 		this.isInit = false
 		this.webviewContext = null
 		this.callbackMap.clear()
 		this.pendingCalls = []
 		this.readyListeners = []
+		this.readyProbeCount = 0
+		this.hostComponent = null
 	}
 
 	onWebMsg(e : UniWebViewMessageEvent) {
@@ -216,6 +336,7 @@ class ProxyWeb {
 	emitMsg(res : UTSJSONObject) {
 		if (res["action"] == "DOMContentLoaded_callback") {
 			this.isInit = true
+			this.readyProbeCount = 0
 			this.ensureAppContext(this.webviewId)
 			this.clearSafetyFlush()
 			// 先冲刷已入队的 katex，再通知「等就绪再 parse」的历史消息
@@ -230,6 +351,8 @@ class ProxyWeb {
 			return
 		}
 		this.callbackMap.delete(funName)
+		// 正常回包：取消该请求的超时定时器
+		this.clearCallbackTimer(funName)
 		// 回调会更新 Vue 响应式消息数据，Android 必须切回主线程。
 		utils.uniGetDispatcher("main", () => {
 			callback(res["param"] as UTSJSONObject)

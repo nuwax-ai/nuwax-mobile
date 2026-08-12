@@ -4,15 +4,12 @@ import AgentDetailData from "./AgentDetailData.uts";
 /**
  * 滚动管理层：专门处理跟底 / 编程式滚 / 上滑打断 状态机。
  *
- * 重构后：滚动容器由 <virtual-scroll-x> 插件拥有（插件内部 scroll-view），
- * 本类不再写 data.scrollIntoView / data.scrollToBottomAnchor（无 scroll-view 绑定这些）。
- * 「执行滚动」改为调插件 expose：scrollToBottom() / scrollToKey()，经 setVsxCallbacks 注入的回调发出。
- * 「滚动状态输入」由组件 onVsxScroll 读取插件容器 (#vsx-container) 的 scrollTop/scrollHeight/offsetHeight
- * 后调 applyScrollStateThrottled(...) 喂入本状态机（不再依赖 UniScrollEvent）。
+ * 滚动容器为组件内原生 <scroll-view #msg-list>（全量渲染，不虚拟化）。
+ * 「执行滚动」写 C2 数值通道：data.scrollToBottomAnchor（:scroll-top 高位哨兵，clamp 即到底）/ data.scrollIntoView（:scroll-into-view，定位到某消息）。
+ * 「滚动状态输入」由组件 onScroll 读 UniScrollEvent.detail + #msg-list offsetHeight 后调
+ * applyScrollStateThrottled(...) 喂入本状态机。
  *
  * 保留：流式跟底节流、历史首屏稳定窗口分批补滚、上滑打断、回到底逻辑、公式上屏补滚防抖。
- * 移除：视口高度查询（插件自带）、pendingCorrection 应用（插件自处理 @correction）、
- *       prepend 补偿（插件 notifyPrepended 内部完成）、content-grow 重新滚（settle 定时补滚覆盖）。
  */
 export default class ScrollManager {
   private data: AgentDetailData;
@@ -44,40 +41,39 @@ export default class ScrollManager {
   private pendingScrollHeight: number = 0;
   private pendingOffsetHeight: number = 0;
   private readonly BOTTOM_CHECK_MS: number = 80;
-
-  /** 插件 expose 执行回调（组件注入；读取 vsxRef.value 后调 scrollToBottom/scrollToKey） */
-  private scrollBottomCb: (() => void) | null = null;
-  private scrollKeyCb: ((key: string) => void) | null = null;
+  /** scroll-top 高位哨兵：两值均远超任何 scrollHeight，clamp 即到底；
+   *  交替 HI/LO 保证每次命令值都变化 → scroll-top act-on-change 必触发。 */
+  private readonly SCROLL_TO_BOTTOM_HI: number = 100000000;
+  private readonly SCROLL_TO_BOTTOM_LO: number = 99999999;
+  /** 哨兵交替开关 */
+  private scrollToBottomToggle: boolean = false;
 
   constructor(data: AgentDetailData) {
     this.data = data;
   }
 
   /**
-   * 注入插件 expose 执行回调。
-   * - bottomCb: 调 vsxRef.value?.scrollToBottom()
-   * - keyCb:    调 vsxRef.value?.scrollToKey(key)
-   * 回调内部自行判空 vsxRef（流式期组件已挂载，正常非空）。
+   * 滚到底（跟底 / 回到底 / 流式补滚）：写 :scroll-top 高位哨兵（act-on-change，clamp 到
+   * scrollHeight 即到底，不锁位、不与用户手动滚动冲突）。scroll-view 全量渲染，#last-msg 锚点恒挂载，
+   * 亦可 scroll-into-view；但数值哨兵对连续跟底（流式每帧）更稳，故用为主通道。
    */
-  setVsxCallbacks(bottomCb: () => void, keyCb: (key: string) => void): void {
-    this.scrollBottomCb = bottomCb;
-    this.scrollKeyCb = keyCb;
-  }
-
-  /** 调插件 scrollToBottom（跟底 / 回到底 / 流式补滚） */
   private runScrollToBottom(): void {
-    const cb = this.scrollBottomCb;
-    if (cb != null) {
-      (cb as () => void)();
-    }
+    this.scrollToBottomToggle = !this.scrollToBottomToggle;
+    this.data.scrollToBottomAnchor.value = this.scrollToBottomToggle
+      ? this.SCROLL_TO_BOTTOM_HI
+      : this.SCROLL_TO_BOTTOM_LO;
   }
 
-  /** 调插件 scrollToKey（加载更多后定位 / 跳转某消息） */
+  /**
+   * 滚到指定消息（加载更多后定位 / 跳转某消息）：写 :scroll-into-view 到
+   * `msg-wrapper-${key}`（scroll-view 全量渲染，目标 wrapper 恒挂载，稳定可达）。
+   * 清空再赋值（nextTick）保证 act-on-change：同一 key 连续两次调用也必触发。
+   */
   private runScrollToKey(key: string): void {
-    const cb = this.scrollKeyCb;
-    if (cb != null) {
-      (cb as (k: string) => void)(key);
-    }
+    this.data.scrollIntoView.value = "";
+    nextTick((): void => {
+      this.data.scrollIntoView.value = "msg-wrapper-" + key;
+    });
   }
 
   /**
@@ -119,7 +115,7 @@ export default class ScrollManager {
     }, this.SCROLL_THROTTLE_MS) as number;
   }
 
-  /** 实际执行滚底：置 autoToLastMsg + 调插件 scrollToBottom（动画由 :scroll-with-animation prop 控制） */
+  /** 实际执行滚底：置 autoToLastMsg + 写 :scroll-top 哨兵滚到底 */
   private doScrollToLastMsg(
     _userClick: boolean,
     contentMayRelayout: boolean,
@@ -169,7 +165,7 @@ export default class ScrollManager {
         if (this.data.scrollTouch.value == true) {
           return;
         }
-        // 绕过节流，直接调插件 scrollToBottom，吃到晚到的高度（插件实测末条 + 自纠偏）
+        // 绕过节流，直接写 :scroll-top 哨兵滚到底，吃到晚到的高度
         this.runScrollToBottom();
       }, delay) as number;
       this.streamFollowTimers.push(timerId);
@@ -198,7 +194,7 @@ export default class ScrollManager {
   /**
    * 历史消息加载后延迟滚到底部（无动画）。
    * 首屏含数学公式 / table / 卡片等异步撑高时，单次滚底往往已过期，
-   * 故在稳定窗口内分批重试。插件 scrollToBottom 锚点恒挂载（#vsx-bottom-anchor），虚拟化下仍可达。
+   * 故在稳定窗口内分批重试。scroll-view 全量渲染，#last-msg 锚点恒挂载，稳定可达。
    */
   scrollToLastMsgAfterHistoryLoad(): void {
     this.armFollowSettle(7000, [0, 200, 800, 1600, 2800, 4500, 6500]);
@@ -292,7 +288,7 @@ export default class ScrollManager {
   }
 
   /**
-   * 滚动状态输入（组件 onVsxScroll 读取插件 #vsx-container 的 metrics 后调用）。
+   * 滚动状态输入（组件 onScroll 读 UniScrollEvent.detail + #msg-list offsetHeight 后调用）。
    * - 历史稳定期内立即处理；流式期 80ms 节流。
    * - 维护 scrollInBottom（回到底按钮可见性）/ autoToLastMsg（上滑打断）状态机。
    */
@@ -373,16 +369,13 @@ export default class ScrollManager {
 
   /**
    * 滚动到指定消息位置（加载更多历史后保持滚动位置）。
-   * 插件 scrollToKey：先 forceInclude 目标入切片挂载，再 scroll-into-view 到 vsx-item-<key>。
-   * key 为 message id（插件 item-key="id"）；messageId 可能为 "id" 或 "id_index"，取 "_" 前。
+   * 写 :scroll-into-view 到 `msg-wrapper-${id}_${index}`（scroll-view 全量渲染，目标恒挂载）。
    */
   scrollToMessage(messageId: string | number): void {
-    let key = `${messageId}`;
-    const underScoreIdx = key.indexOf("_");
-    if (underScoreIdx >= 0) {
-      key = key.substring(0, underScoreIdx);
-    }
-    // 延迟一帧调用，确保插件 items 已更新（prepend 后 watch flush）
+    // scroll-view 全量渲染：目标 wrapper id = `msg-wrapper-${id}_${index}` 恒挂载；
+    // messageId 需为完整 `id_index`（prepend 补偿传 firstVisibleMessageId 即此格式）。
+    // 延迟一帧确保 prepend 后 watch flush / DOM 更新完成。
+    const key = `${messageId}`;
     setTimeout((): void => {
       this.runScrollToKey(key);
     }, 150);

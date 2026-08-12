@@ -94,12 +94,7 @@
     </template>
     <template v-else>
       <view class="chat-container">
-        <!-- 性能测试浮层：avgFps / maxGap（仅 perfTest 模式） -->
-        <view v-if="isPerfMock" class="perf-overlay">
-          <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
-          <text class="perf-overlay-chip" @click="toggleVirtualScroll">虚拟滚动 ·点击切换</text>
-        </view>
-        <!-- 虚拟滚动调试浮层（always-on 开发期）：fps/maxGap + 窗口化指标 -->
+        <!-- 虚拟滚动 + 性能 调试浮层（合并；always-on 开发期）：fps/窗口/前后缓冲/解析缓存 -->
         <view v-if="showVsxDebug" class="vsx-debug-overlay" @click="toggleVirtualScroll">
           <text class="vsx-debug-title">virtual-scroll-x · 点击{{ virtualEnabled ? '关闭' : '开启' }}</text>
           <text class="vsx-debug-line">fps {{ vsxDebugFps }} · maxGap {{ vsxDebugMaxGap }}ms</text>
@@ -108,6 +103,7 @@
           <text class="vsx-debug-line">top {{ vsxStats['topSpacer'] ?? 0 }}px · bottom {{ vsxStats['bottomSpacer'] ?? 0 }}px</text>
           <text class="vsx-debug-line">preload {{ (((vsxStats['topSpacer'] ?? 0) as number) + ((vsxStats['bottomSpacer'] ?? 0) as number)) }}px</text>
           <text class="vsx-debug-line">scroll {{ vsxStats['scrollTop'] ?? 0 }} · vp {{ vsxStats['viewport'] ?? 0 }}</text>
+          <text class="vsx-debug-line">缓冲 前{{ vsxBufferAbove }}/后{{ vsxBufferBelow }} · 解析缓存 {{ vsxCacheSize }}</text>
         </view>
         <!-- 聊天内容 -->
         <view class="scroll-view-box">
@@ -164,6 +160,7 @@
                     :task-status="conversationTaskStatus"
                     @longpress="onlongTapMsg(item)"
                     @changeThinkContent="changeThinkContent"
+                    @parsed-markdown-el-list="(elList: any[]) => cacheParsedElList(item, elList)"
                     :id="`msg-item-${vsxItemId(item)}_${vsxItemIndex(item)}`"
                     :ref="(el: any) => setMessageRef(el, `${vsxItemId(item)}_${vsxItemIndex(item)}`)"
                   ></UniAiXMsg>
@@ -1336,6 +1333,14 @@
 
   const emptyAssistantProcessingList = [] as any[];
   const emptyAssistantMarkdownElList = [] as any[];
+  /**
+   * 跨重挂解析缓存：messageId → 已解析 el-list。
+   *  绕开 readRawField 读不出 MessageInfo class 字段的坑（item.markdownElList 永远读空）。
+   *  ai-msg 终态解析后 emit 回灌（cacheParsedElList）；重挂时 getAssistantMarkdownElList 从此取，
+   *  配合 ai-msg initialMarkdownElList watch 设 historyParseDone=true → 跳过全量重解析。
+   *  上限 64 条（超则清空，最多重解析一次）防长会话内存膨胀。
+   */
+  const parsedElListCache = new Map<string, any[]>();
 
   /** 助手工具调用数据直接透传，避免先构造 MsgItem。 */
   function getAssistantProcessingList(item: any | null): any[] {
@@ -1349,11 +1354,32 @@
   /** 接口若已携带 Markdown 元素则直接透传，由消息组件按需规范化。 */
   function getAssistantMarkdownElList(item: any | null): any[] {
     if (item == null) return emptyAssistantMarkdownElList;
-    const raw = readRawField(item, "markdownElList");
-    return raw != null && Array.isArray(raw)
-      ? raw as any[]
-      : emptyAssistantMarkdownElList;
+    const id = vsxItemId(item);
+    if (id.length > 0) {
+      const cached = parsedElListCache.get(id);
+      if (cached != null && cached.length > 0) return cached;
+    }
+    return emptyAssistantMarkdownElList;
   }
+
+  /** ai-msg 终态解析后回灌 el-list 到缓存（按 messageId）；超 64 条清空防膨胀 */
+  const cacheParsedElList = (item: any | null, elList: any[]): void => {
+    if (item == null) return;
+    if (elList == null || elList.length == 0) return;
+    const id = vsxItemId(item);
+    if (id.length == 0) return;
+    if (parsedElListCache.size > 64) parsedElListCache.clear();
+    parsedElListCache.set(id, elList);
+    console.log(`[VSCACHE] set id=${id} size=${parsedElListCache.size}`);
+  };
+
+  // 切换会话（API 分页重进/换会话）：清解析缓存，防跨会话 messageId 碰撞 + 陈旧
+  watch(
+    (): string => `${conversationId.value != null ? conversationId.value : ""}`,
+    () => {
+      parsedElListCache.clear();
+    },
+  );
 
   /** 用户消息是否有可展示文本 */
   function hasUserMessageText(item: any | null): boolean {
@@ -3031,6 +3057,18 @@
     viewport: 0,
     enabled: true,
   } as UTSJSONObject);
+  // 视口前后缓冲（overscan 各挂几条）+ 解析缓存大小（Phase 2），供浮层合并显示
+  const vsxBufferAbove = computed((): number => {
+    const s = vsxStats.value;
+    return ((s["vpStart"] ?? 0) as number) - ((s["winStart"] ?? 0) as number);
+  });
+  const vsxBufferBelow = computed((): number => {
+    const s = vsxStats.value;
+    return ((s["winEnd"] ?? 0) as number) - ((s["vpEnd"] ?? 0) as number);
+  });
+  const vsxCacheSize = computed((): number => {
+    return (vsxStats.value["cacheSize"] ?? 0) as number;
+  });
   let vsxDebugProbeOn = false;
   let vsxFpsLastAt = 0;
   let vsxFrames = [] as number[];
@@ -3044,7 +3082,10 @@
     if (v == null) return;
     try {
       const s = (v as ComponentPublicInstance).$callMethod("getStats") as UTSJSONObject;
-      if (s != null) vsxStats.value = s;
+      if (s != null) {
+        s["cacheSize"] = parsedElListCache.size; // 页面级 el-list 解析缓存大小（Phase 2）
+        vsxStats.value = s;
+      }
     } catch (_e) {}
   };
 

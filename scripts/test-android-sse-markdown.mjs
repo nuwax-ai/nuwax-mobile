@@ -1548,6 +1548,44 @@ test("纯文本叶子不重复滚底，结构化直更仍由服务层跟底", ()
   );
 });
 
+test("流式自动跟底不启用重叠动画", () => {
+  const scroll = readFileSync(
+    new URL(
+      "../subpackages/pages/chat-conversation-component/layers/ScrollManager.uts",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.match(
+    scroll,
+    /this\.data\.scrollWithAnimation\.value = userClick == true/,
+  );
+  assert.doesNotMatch(
+    scroll,
+    /scrollWithAnimation\.value\s*=\s*[\s\S]{0,80}contentMayRelayout != true/,
+  );
+});
+
+test("性能浮窗以低频快照读取滚动热状态", () => {
+  const conversation = readFileSync(
+    new URL(
+      "../subpackages/pages/chat-conversation-component/chat-conversation-component.uvue",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.match(conversation, /\{\{ perfScrollSnapshot \}\}/);
+  assert.match(conversation, /\{\{ perfNativeSnapshot \}\}/);
+  assert.doesNotMatch(
+    conversation,
+    /class="perf-overlay-text">scroll \{\{ virtualLastScrollTop/,
+  );
+  assert.match(
+    conversation,
+    /if \(perfDisplayAccum >= PERF_DISPLAY_FLUSH_MS\)[\s\S]*?perfScrollSnapshot\.value/,
+  );
+});
+
 test("纯文本完成后保留原生文本高度，Markdown 仅完成后台定稿", () => {
   const aiMsg = readFileSync(
     new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),

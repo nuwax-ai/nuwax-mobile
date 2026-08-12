@@ -1,0 +1,140 @@
+import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+import { RenderUnit, type RenderUnitKind } from "./RenderUnitModels.uts";
+
+function rawString(source: any | null, field: string): string {
+  if (source == null) return "";
+  const value = readRawField(source, field);
+  return value != null ? `${value}` : "";
+}
+
+function rawArray(source: any | null, field: string): any[] {
+  if (source == null) return [] as any[];
+  const value = readRawField(source, field);
+  return value != null && Array.isArray(value) ? value as any[] : [] as any[];
+}
+
+function messageKey(message: any | null): string {
+  const index = rawString(message, "index");
+  return `${rawString(message, "id")}_${index.length > 0 ? index : "0"}`;
+}
+
+function isAssistant(message: any | null): boolean {
+  const role = rawString(message, "role");
+  const type = rawString(message, "messageType");
+  return role.indexOf("ASSISTANT") >= 0 || type.indexOf("ASSISTANT") >= 0;
+}
+
+function kindForMarkdownType(type: string): RenderUnitKind {
+  if (type == "table") return "table";
+  if (type == "code_block") return "code";
+  if (type == "math") return "formula";
+  if (type == "markdown_image" || type == "image") return "image";
+  if (type == "task_result" || type.indexOf("custom_process") >= 0) return "tool";
+  return "markdown";
+}
+
+function estimateForKind(kind: RenderUnitKind, textLength: number = 0): number {
+  if (kind == "user") return Math.max(72, 58 + Math.ceil(textLength / 24) * 24);
+  if (kind == "thinking") return Math.max(64, 44 + Math.ceil(textLength / 28) * 22);
+  if (kind == "table") return 220;
+  if (kind == "code") return 240;
+  if (kind == "formula") return 92;
+  if (kind == "image") return 260;
+  if (kind == "tool") return 128;
+  if (kind == "toolbar") return 52;
+  return Math.max(48, 28 + Math.ceil(textLength / 28) * 24);
+}
+
+function appendUnit(
+  output: RenderUnit[],
+  groupKey: string,
+  suffix: string,
+  kind: RenderUnitKind,
+  frozen: boolean,
+  contentVersion: number,
+  estimate: number,
+): void {
+  const unit = new RenderUnit();
+  unit.key = `${groupKey}:${suffix}`;
+  unit.messageId = groupKey;
+  unit.messageGroupKey = groupKey;
+  unit.kind = kind;
+  unit.frozen = frozen;
+  unit.contentVersion = contentVersion;
+  unit.layoutVersion = 1;
+  unit.layoutState = "estimated";
+  unit.estimatedHeight = estimate;
+  output.push(unit);
+}
+
+/**
+ * 把真实 MessageInfo 投影为稳定 RenderUnit。只读取已有解析产物，不触发 Markdown 解析。
+ * frozen prefix 的版本固定；仅 live tail 随正文长度推进版本。
+ */
+export function buildMessageRenderUnits(
+  messages: any[],
+  liveMessageKey: string,
+): RenderUnit[] {
+  const output = [] as RenderUnit[];
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+    const message = messages[messageIndex];
+    const groupKey = messageKey(message);
+    const live = groupKey == liveMessageKey;
+    const body = rawString(message, "text");
+    if (isAssistant(message) != true) {
+      appendUnit(output, groupKey, "user", "user", !live, live ? body.length + 1 : 1,
+        estimateForKind("user", body.length));
+      continue;
+    }
+
+    const think = rawString(message, "think");
+    if (think.length > 0) {
+      appendUnit(output, groupKey, "thinking", "thinking", !live,
+        live ? think.length + 1 : 1, estimateForKind("thinking", think.length));
+    }
+
+    const processing = rawArray(message, "processingList");
+    for (let processIndex = 0; processIndex < processing.length; processIndex++) {
+      const process = processing[processIndex];
+      let processKey = rawString(process, "executeId");
+      if (processKey.length == 0) processKey = rawString(process, "targetId");
+      if (processKey.length == 0) processKey = `${processIndex}`;
+      appendUnit(output, groupKey, `tool-${processKey}`, "tool", !live, live ? body.length + processIndex + 1 : 1,
+        estimateForKind("tool"));
+    }
+
+    const markdown = rawArray(message, "markdownElList");
+    if (markdown.length == 0) {
+      appendUnit(output, groupKey, "body", "markdown", !live, live ? body.length + 1 : 1,
+        estimateForKind("markdown", body.length));
+    } else {
+      for (let blockIndex = 0; blockIndex < markdown.length; blockIndex++) {
+        const block = markdown[blockIndex];
+        const type = rawString(block, "type");
+        let blockKey = rawString(block, "uniqueId");
+        if (blockKey.length == 0) blockKey = `block-${blockIndex}`;
+        const kind = kindForMarkdownType(type);
+        // Markdown 仅允许末块回改；稳定前缀保持版本 1，避免流式全文长度使全表失效。
+        const mutableTail = live && blockIndex == markdown.length - 1;
+        appendUnit(output, groupKey, `md-${blockKey}`, kind, !mutableTail,
+          mutableTail ? body.length + 1 : 1, estimateForKind(kind));
+      }
+    }
+
+    if (live != true) {
+      appendUnit(output, groupKey, "toolbar", "toolbar", true, 1, estimateForKind("toolbar"));
+    }
+  }
+
+  // position 是消息组内语义，跨 Unit 窗口切割后仍可恢复圆角/间距。
+  for (let i = 0; i < output.length; i++) {
+    const previousSame = i > 0 && output[i - 1].messageGroupKey == output[i].messageGroupKey;
+    const nextSame = i + 1 < output.length && output[i + 1].messageGroupKey == output[i].messageGroupKey;
+    output[i].position = !previousSame && !nextSame ? "single" : !previousSame ? "first" : !nextSame ? "last" : "middle";
+  }
+  return output;
+}
+
+export function renderUnitMessageKey(message: any | null): string {
+  return messageKey(message);
+}

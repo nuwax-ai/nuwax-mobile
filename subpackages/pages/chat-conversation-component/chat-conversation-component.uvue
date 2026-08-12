@@ -104,6 +104,7 @@
           <text class="perf-overlay-text">preload {{ virtualBufferConfigText }}</text>
           <text class="perf-overlay-text">range {{ virtualStartIndex }}-{{ virtualEndIndex }} · top {{ virtualTopSpacerHeight }} · bottom {{ virtualBottomSpacerHeight }}</text>
           <text class="perf-overlay-text">measure Δ{{ virtualLastMeasureDelta.toFixed(0) }} · anchor Δ{{ virtualLastAnchorDelta.toFixed(0) }}</text>
+          <text class="perf-overlay-text">RU {{ shadowUnitCount }} · range {{ shadowRangeText }} · height Δ{{ shadowHeightDelta.toFixed(0) }}</text>
           <text class="perf-overlay-toggle" @click="toggleVirtualScroll">{{ useVirtualScroll ? 'virtual-scroll' : 'full-scroll' }} ·点击切换</text>
         </view>
         <!-- 聊天内容 -->
@@ -509,6 +510,7 @@
   import VirtualMessageListManager, {
     VirtualMessageAnchor,
   } from "./layers/VirtualMessageListManager.uts";
+  import { RenderUnitShadowLayout } from "./render-units/RenderUnitShadowLayout.uts";
   import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
   import ScrollManager from "./layers/ScrollManager.uts";
   import AgentDetailUtils from "./layers/AgentDetailUtils.uts";
@@ -810,6 +812,7 @@
   const componentManager = new ComponentManager(data);
   const scrollManager = new ScrollManager(data);
   const virtualMessageManager = new VirtualMessageListManager();
+  const renderUnitShadow = new RenderUnitShadowLayout();
   const useVirtualScroll = ref<boolean>(true);
   const virtualStartIndex = ref<number>(0);
   const virtualEndIndex = ref<number>(0);
@@ -823,6 +826,9 @@
   const virtualSettleState = ref<string>("idle");
   const virtualLastMeasureDelta = ref<number>(0);
   const virtualLastAnchorDelta = ref<number>(0);
+  const shadowUnitCount = ref<number>(0);
+  const shadowRangeText = ref<string>("0-0");
+  const shadowHeightDelta = ref<number>(0);
   const perfAutoFollow = computed((): boolean =>
     data.autoToLastMsg.value == true,
   );
@@ -843,6 +849,7 @@
   );
   let virtualMeasureTimer: number = 0;
   let virtualWindowSettleTimer: number = 0;
+  let renderUnitShadowSyncTimer: number = 0;
   let pendingVirtualAnchor: VirtualMessageAnchor | null = null;
   /** 历史冷开：末尾窗口完成首次真实测高后，只执行一次最终滚底。 */
   let virtualInitialBottomPending: boolean = false;
@@ -884,6 +891,43 @@
 
   function effectiveVirtualScrollTop(rawScrollTop: number): number {
     return Math.max(0, rawScrollTop - virtualContentOrigin.value);
+  }
+
+  function syncRenderUnitShadow(): void {
+    const list = data.messageList.value;
+    let liveKey = "";
+    if (data.isConversationActive.value == true && list.length > 0) {
+      liveKey = virtualMessageKey(list[list.length - 1]);
+    }
+    let viewportWidth = 0;
+    try {
+      viewportWidth = uni.getSystemInfoSync().windowWidth;
+    } catch (_error) {
+      viewportWidth = 0;
+    }
+    renderUnitShadow.sync(list as any[], liveKey, viewportWidth);
+    updateRenderUnitShadowMetrics();
+  }
+
+  function scheduleRenderUnitShadowSync(): void {
+    if (renderUnitShadowSyncTimer != 0) return;
+    renderUnitShadowSyncTimer = setTimeout((): void => {
+      renderUnitShadowSyncTimer = 0;
+      syncRenderUnitShadow();
+    }, 250) as number;
+  }
+
+  function updateRenderUnitShadowMetrics(): void {
+    shadowUnitCount.value = renderUnitShadow.index.count();
+    const effectiveTop = effectiveVirtualScrollTop(virtualLastScrollTop.value);
+    const range = renderUnitShadow.range(
+      effectiveTop,
+      virtualViewportHeight.value,
+      virtualViewportHeight.value * VIRTUAL_OVERSCAN_SCREENS,
+    );
+    shadowRangeText.value = `${range.start}-${range.end}`;
+    shadowHeightDelta.value =
+      renderUnitShadow.index.totalHeight() - virtualMessageManager.totalHeight();
   }
 
   function applyVirtualRange(rawScrollTop: number, force: boolean): boolean {
@@ -1106,6 +1150,10 @@
             key,
             (heightRaw as number) + gap,
           );
+          renderUnitShadow.reconcileMessageHeight(
+            key,
+            (heightRaw as number) + gap,
+          );
           if (rowDelta != 0) {
             heightChanged = true;
             measuredDelta = measuredDelta + rowDelta;
@@ -1113,6 +1161,7 @@
         }
       }
       virtualLastMeasureDelta.value = measuredDelta;
+      updateRenderUnitShadowMetrics();
       if (heightChanged == true) {
         applyVirtualRange(virtualLastScrollTop.value, true);
         if (
@@ -1163,6 +1212,7 @@
       estimates.push(estimateVirtualMessageHeight(list[i]));
     }
     virtualMessageManager.sync(keys, estimates);
+    syncRenderUnitShadow();
     if (anchor != null && data.autoToLastMsg.value != true) {
       const restored = virtualMessageManager.restoreAnchor(anchor);
       if (restored >= 0) {
@@ -1185,6 +1235,7 @@
   function handleVirtualScroll(e: UniScrollEvent): void {
     if (e == null || e.detail == null) return;
     virtualLastScrollTop.value = e.detail.scrollTop;
+    updateRenderUnitShadowMetrics();
     virtualSettleState.value = "scroll";
     if (applyVirtualRange(virtualLastScrollTop.value, false)) {
       if (data.scrollTouch.value != true && data.scrolling.value != true) {
@@ -3933,6 +3984,7 @@
       }
     }
     updateMessageComponent(messageId, dataVal);
+    scheduleRenderUnitShadowSync();
   };
 
   // 触摸结束延迟计时器
@@ -4136,6 +4188,10 @@
       clearTimeout(virtualWindowSettleTimer);
       virtualWindowSettleTimer = 0;
     }
+    if (renderUnitShadowSyncTimer != 0) {
+      clearTimeout(renderUnitShadowSyncTimer);
+      renderUnitShadowSyncTimer = 0;
+    }
     componentManager.clearStreamPatchSnapshots();
 
     if (touchEndTimer != 0) {
@@ -4182,6 +4238,10 @@
     if (virtualWindowSettleTimer != 0) {
       clearTimeout(virtualWindowSettleTimer);
       virtualWindowSettleTimer = 0;
+    }
+    if (renderUnitShadowSyncTimer != 0) {
+      clearTimeout(renderUnitShadowSyncTimer);
+      renderUnitShadowSyncTimer = 0;
     }
     componentManager.clearStreamPatchSnapshots();
 

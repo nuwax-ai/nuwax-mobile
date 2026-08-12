@@ -1586,6 +1586,21 @@ test("性能浮窗以低频快照读取滚动热状态", () => {
   );
 });
 
+test("纯文本无换行长段也会封顶 live 节点", () => {
+  const fastText = readFileSync(
+    new URL(
+      "../subpackages/components/ai-msg/plain-stream-fast-text.uvue",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  assert.match(fastText, /const FREEZE_BOUNDARY_LOOKAHEAD: number = 128/);
+  assert.match(fastText, /function nextFreezeCut\(/);
+  assert.match(fastText, /text\.indexOf\(" ", preferredEnd\)/);
+  assert.match(fastText, /safePlainStreamRevealEnd\(text, preferredEnd\)/);
+  assert.match(fastText, /const cut = nextFreezeCut\(text, preferredEnd\)/);
+});
+
 test("纯文本完成后保留原生文本高度，Markdown 仅完成后台定稿", () => {
   const aiMsg = readFileSync(
     new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),

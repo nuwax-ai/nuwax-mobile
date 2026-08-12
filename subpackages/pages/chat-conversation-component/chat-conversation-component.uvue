@@ -98,6 +98,7 @@
         <view v-if="isPerfMock" class="perf-overlay">
           <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
           <text class="perf-overlay-text">scroll {{ virtualLastScrollTop.toFixed(0) }} · vp {{ virtualViewportHeight.toFixed(0) }} · {{ virtualSettleState }}</text>
+          <text class="perf-overlay-text">native height {{ virtualNativeScrollHeight.toFixed(0) }} · bottom gap {{ virtualNativeBottomGap.toFixed(0) }}</text>
           <text class="perf-overlay-text">touch {{ scrollTouch ? '1' : '0' }} · moving {{ scrolling ? '1' : '0' }} · follow {{ perfAutoFollow ? '1' : '0' }}</text>
           <text class="perf-overlay-text">mounted {{ virtualMountedCount }} / {{ messageList.length }}</text>
           <text class="perf-overlay-text">visible {{ virtualVisibleStartIndex }}-{{ virtualVisibleEndIndex }} · buffer ↑{{ virtualBufferBeforeCount }} ↓{{ virtualBufferAfterCount }}</text>
@@ -823,6 +824,8 @@
   const virtualViewportHeight = ref<number>(600);
   const virtualContentOrigin = ref<number>(0);
   const virtualLastScrollTop = ref<number>(0);
+  const virtualNativeScrollHeight = ref<number>(0);
+  const virtualNativeBottomGap = ref<number>(0);
   const virtualSettleState = ref<string>("idle");
   const virtualLastMeasureDelta = ref<number>(0);
   const virtualLastAnchorDelta = ref<number>(0);
@@ -851,8 +854,13 @@
   let virtualWindowSettleTimer: number = 0;
   let renderUnitShadowSyncTimer: number = 0;
   let pendingVirtualAnchor: VirtualMessageAnchor | null = null;
-  /** 历史冷开：末尾窗口完成首次真实测高后，只执行一次最终滚底。 */
+  /** 历史冷开：末尾窗口完成首次真实测高后，等原生 scroll 事件确认真正到底。 */
   let virtualInitialBottomPending: boolean = false;
+  let virtualInitialBottomAttempts: number = 0;
+  let virtualInitialBottomTimer: number = 0;
+  let virtualBottomPulseToggle: boolean = false;
+  const VIRTUAL_BOTTOM_SCROLL_HI: number = 100000000;
+  const VIRTUAL_BOTTOM_SCROLL_LO: number = 99999999;
   const VIRTUAL_ROW_GAP_PX: number = 18;
   const VIRTUAL_OVERSCAN_SCREENS: number = 6;
   // 已挂载窗口的前后缓冲低于该值时立即渐进补齐到 overscan。
@@ -1064,6 +1072,18 @@
   }
 
   /**
+   * scroll-top 是 act-on-change 命令：交替超大值由原生 scroll-view clamp 到真实底部。
+   * 不能用估算 totalHeight 作为最终滚动值，否则 Markdown 真实高度大于估高时会被拉回中间。
+   */
+  function pulseVirtualScrollToBottom(): void {
+    virtualBottomPulseToggle = !virtualBottomPulseToggle;
+    data.scrollWithAnimation.value = false;
+    data.scrollToBottomAnchor.value = virtualBottomPulseToggle
+      ? VIRTUAL_BOTTOM_SCROLL_HI
+      : VIRTUAL_BOTTOM_SCROLL_LO;
+  }
+
+  /**
    * 滚底命令发出前先让末尾行进入虚拟窗口。
    * 否则 last-msg 尚未挂载，scroll-into-view 会静默失效，长历史冷开停在顶部。
    */
@@ -1076,20 +1096,49 @@
     const rawTop = effectiveTop + virtualContentOrigin.value;
     virtualLastScrollTop.value = rawTop;
     applyVirtualRange(rawTop, true);
-    setVirtualScrollTop(rawTop);
+    pulseVirtualScrollToBottom();
+  }
+
+  function clearVirtualInitialBottomTimer(): void {
+    if (virtualInitialBottomTimer != 0) {
+      clearTimeout(virtualInitialBottomTimer);
+      virtualInitialBottomTimer = 0;
+    }
+  }
+
+  function issueVirtualInitialBottom(): void {
+    if (virtualInitialBottomPending != true) return;
+    if (data.scrollTouch.value == true) return;
+    virtualInitialBottomAttempts = virtualInitialBottomAttempts + 1;
+    prepareVirtualBottomRange();
+    data.scrollIntoView.value = "";
+    nextTick((): void => {
+      if (virtualInitialBottomPending != true) return;
+      if (data.scrollTouch.value == true) return;
+      data.scrollIntoView.value = "last-msg";
+      pulseVirtualScrollToBottom();
+    });
+    clearVirtualInitialBottomTimer();
+    if (virtualInitialBottomAttempts < 3) {
+      virtualInitialBottomTimer = setTimeout((): void => {
+        virtualInitialBottomTimer = 0;
+        issueVirtualInitialBottom();
+      }, 180) as number;
+    } else {
+      // 最多只覆盖首屏提交的短窗口，不在用户开始浏览后长时间抢滚动权。
+      virtualInitialBottomTimer = setTimeout((): void => {
+        virtualInitialBottomTimer = 0;
+        virtualInitialBottomPending = false;
+      }, 180) as number;
+    }
   }
 
   function commitVirtualInitialBottom(): void {
     if (virtualInitialBottomPending != true) return;
-    virtualInitialBottomPending = false;
-    prepareVirtualBottomRange();
-    data.scrollWithAnimation.value = false;
-    data.scrollIntoView.value = "";
-    nextTick((): void => {
-      data.scrollIntoView.value = "last-msg";
-      data.scrollInBottom.value = true;
-      data.autoToLastMsg.value = true;
-    });
+    virtualInitialBottomAttempts = 0;
+    data.scrollInBottom.value = false;
+    data.autoToLastMsg.value = true;
+    issueVirtualInitialBottom();
   }
 
   function measureVirtualRows(): void {
@@ -1235,6 +1284,21 @@
   function handleVirtualScroll(e: UniScrollEvent): void {
     if (e == null || e.detail == null) return;
     virtualLastScrollTop.value = e.detail.scrollTop;
+    virtualNativeScrollHeight.value = e.detail.scrollHeight;
+    virtualNativeBottomGap.value = Math.max(
+      0,
+      e.detail.scrollHeight - e.detail.scrollTop - virtualViewportHeight.value,
+    );
+    if (
+      virtualInitialBottomPending == true &&
+      virtualNativeBottomGap.value < 50
+    ) {
+      virtualInitialBottomPending = false;
+      virtualInitialBottomAttempts = 0;
+      clearVirtualInitialBottomTimer();
+      data.scrollInBottom.value = true;
+      data.autoToLastMsg.value = true;
+    }
     updateRenderUnitShadowMetrics();
     virtualSettleState.value = "scroll";
     if (applyVirtualRange(virtualLastScrollTop.value, false)) {
@@ -2366,6 +2430,8 @@
     if (useVirtualScroll.value == true) {
       // 旧逻辑会在 7 秒内反复补滚；用户已经开始浏览后仍会被拉回底部。
       // 虚拟列表先挂末尾窗口，首次真实测高结束后再一次性落底。
+      clearVirtualInitialBottomTimer();
+      virtualInitialBottomAttempts = 0;
       virtualInitialBottomPending = true;
       prepareVirtualBottomRange();
       nextTick((): void => scheduleVirtualMeasure(0));
@@ -2416,6 +2482,18 @@
     }
     // #endif
     scrollManager.onScroll(e);
+    if (useVirtualScroll.value == true) {
+      // ScrollManager 兼容层通过 getElementById().offsetHeight 取视口，Android
+      // scroll-view 上该值与 scroll 事件的坐标系不一致，会把已到底误判为未到底。
+      // 虚拟滚动使用 selectorQuery 实测的同坐标视口高度作为最终状态。
+      const isNativeBottom = virtualNativeBottomGap.value < 50;
+      nextTick((): void => {
+        data.scrollInBottom.value = isNativeBottom;
+        if (isNativeBottom == true) {
+          data.autoToLastMsg.value = true;
+        }
+      });
+    }
   };
   const scrollToMessage = (messageId: string | number) =>
     scrollManager.scrollToMessage(messageId);
@@ -4004,6 +4082,8 @@
     data.scrollTouch.value = true;
     // 用户已经接管滚动后，禁止冷开测高回调再把页面拉到底。
     virtualInitialBottomPending = false;
+    virtualInitialBottomAttempts = 0;
+    clearVirtualInitialBottomTimer();
     // 自动跟底期只挂载末尾消息；触摸开始、滚动尚未发生时先同步扩成
     // 前后六屏缓冲，避免第一次向上拖动直接进入顶部 spacer 空白区。
     if (useVirtualScroll.value == true) {
@@ -4188,6 +4268,7 @@
       clearTimeout(virtualWindowSettleTimer);
       virtualWindowSettleTimer = 0;
     }
+    clearVirtualInitialBottomTimer();
     if (renderUnitShadowSyncTimer != 0) {
       clearTimeout(renderUnitShadowSyncTimer);
       renderUnitShadowSyncTimer = 0;
@@ -4239,6 +4320,7 @@
       clearTimeout(virtualWindowSettleTimer);
       virtualWindowSettleTimer = 0;
     }
+    clearVirtualInitialBottomTimer();
     if (renderUnitShadowSyncTimer != 0) {
       clearTimeout(renderUnitShadowSyncTimer);
       renderUnitShadowSyncTimer = 0;

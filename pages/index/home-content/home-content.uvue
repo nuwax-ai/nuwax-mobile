@@ -39,7 +39,7 @@
                   :showModifiedTime="isLoggedIn"
                   :paymentRequired="info.paymentRequired && enableSubscription == 1"
                   :subscribed="info.subscribed"
-                  @click="handleRecentClick(info)"
+                  @click="handleRecentClick(info, index)"
                   @longpress="handleRecentLongPress(info)"
                 />
               </view>
@@ -74,7 +74,6 @@
           :refresher-triggered="refreshing && activeTab == 'history'"
           :show-scrollbar="false"
           :scroll-top="convScrollTop"
-          @scroll="handleConversationScroll"
           @scrolltolower="handleConversationLoadMore"
           @refresherrefresh="handleConversationRefresh"
         >
@@ -183,6 +182,8 @@
   let recentRequestGeneration = 0;
   let recentSilentRequestPending = false;
   let recentRefreshPending = false;
+  const resumeRecentLoadMorePending = ref<boolean>(false);
+  let resumeRecentListLength = 0;
   let conversationRefreshPending = false;
   const refreshDrainTick = ref<number>(0);
 
@@ -355,15 +356,24 @@
         if (page > 1) {
           const existing = recentAgentList.value != null ? recentAgentList.value : ([] as AgentListItem[]);
           for (let k = 0; k < newList.length; k++) {
-            existing.push(newList[k]);
+            const candidate = newList[k];
+            let duplicated = false;
+            for (let m = 0; m < existing.length; m++) {
+              if (existing[m].agentId == candidate.agentId) {
+                duplicated = true;
+                break;
+              }
+            }
+            if (!duplicated) existing.push(candidate);
           }
         } else {
           reconcileRecentAgentList(newList);
         }
-        recentHasMore.value = newList.length > 0;
+        recentHasMore.value = newList.length >= pageSize;
         currentPage.value = page;
         return dataRaw;
       }
+      return false;
     } catch (error) {
       console.error("fetchUserUsedAgentList error:", error);
       return false;
@@ -441,7 +451,16 @@
     });
   }
 
-  function handleRecentClick(info: AgentListItem) {
+  function markRecentLoadMoreForResume(): void {
+    if (!recentHasMore.value || resumeRecentLoadMorePending.value) return;
+    resumeRecentLoadMorePending.value = true;
+    resumeRecentListLength = recentAgentList.value.length;
+  }
+
+  function handleRecentClick(info: AgentListItem, index: number) {
+    if (index == recentAgentList.value.length - 1) {
+      markRecentLoadMoreForResume();
+    }
     emit("agent-click", toRecentPayload(info));
   }
 
@@ -495,7 +514,8 @@
   const convHasMore = ref<boolean>(false);
   const lastId = ref<number | null>(null);
   const pageVisible = ref<boolean>(true);
-  const resumeLoadMoreCheckPending = ref<boolean>(false);
+  const resumeConversationLoadMorePending = ref<boolean>(false);
+  let resumeConversationListLength = 0;
   let conversationRequestPromise: Promise<boolean> | null = null;
   let conversationRequestGeneration = 0;
   let conversationSilentRequestPending = false;
@@ -614,9 +634,7 @@
     return !convLoading.value && !convHasMore.value && clLen > 8;
   });
 
-  /**
-   * 静默刷新“最近使用”第一页，无全屏 Loading/下拉刷新框，并按 PC 逻辑重置分页游标。
-   */
+  /** 静默刷新“最近使用”已加载窗口，不改变分页深度与滚动位置。 */
   async function silentFetchRecentList(): Promise<void> {
     if (!pageVisible.value || recentLoading.value || recentSilentRequestPending) return;
     recentSilentRequestPending = true;
@@ -624,8 +642,9 @@
     try {
       if (props.isLoggedIn) {
         const params = new ListParams();
+        const loadedSize = Math.max(20, currentPage.value * 20, recentAgentList.value.length);
         params.pageIndex = 1;
-        params.size = 20;
+        params.size = loadedSize;
         const res = await apiUserUsedAgentList(params);
         const code = apiResCode(res);
         const dataRaw = apiResData<any>(res);
@@ -637,8 +656,8 @@
             newList.push(mapToAgentListItem(rawList[j] as UTSJSONObject, false));
           }
           reconcileRecentAgentList(newList);
-          currentPage.value = 1;
-          recentHasMore.value = newList.length > 0;
+          // 返回详情时刷新完整的已加载窗口，不重置页码或裁掉后续分页。
+          recentHasMore.value = newList.length >= loadedSize;
         }
       } else {
         const params = new SquarePublishedListParams();
@@ -670,23 +689,22 @@
     }
   }
 
-  /**
-   * 静默刷新会话列表第一页（如执行中状态），无全屏 Loading，并按 PC 逻辑重置分页游标。
-   */
+  /** 静默刷新会话列表已加载窗口（如执行中状态），保留末尾游标。 */
   async function silentFetchConversationList(): Promise<void> {
     if (!props.isLoggedIn || conversationRequestPromise != null || conversationSilentRequestPending) return;
     conversationSilentRequestPending = true;
     const requestGeneration = conversationRequestGeneration;
     try {
       const params = new ConversationListParams();
+      const loadedLimit = Math.max(20, conversationList.value.length);
       params.agentId = null;
       params.lastId = null;
-      params.limit = 20;
+      params.limit = loadedLimit;
       const res = await apiAgentConversationList(params);
       if (apiResCode(res) == SUCCESS_CODE && requestGeneration == conversationRequestGeneration) {
         const newList = normalizeList(apiResData<any>(res));
         conversationList.value = newList;
-        convHasMore.value = newList.length >= 20;
+        convHasMore.value = newList.length >= loadedLimit;
         if (newList.length > 0) {
           const last = newList[newList.length - 1];
           lastId.value = toNum(last["id"], 0);
@@ -701,22 +719,6 @@
       refreshDrainTick.value = refreshDrainTick.value + 1;
     }
   }
-
-  watch(refreshDrainTick, (_tick: number) => {
-    if (!pageVisible.value) return;
-    if (recentRefreshPending && !recentLoading.value && !recentSilentRequestPending) {
-      recentRefreshPending = false;
-      silentFetchRecentList();
-    }
-    if (conversationRefreshPending) {
-      if (!props.isLoggedIn) {
-        conversationRefreshPending = false;
-      } else if (conversationRequestPromise == null && !conversationSilentRequestPending) {
-        conversationRefreshPending = false;
-        silentFetchConversationList();
-      }
-    }
-  });
 
   /** 仅将当前打开的 Tab 加入静默刷新队列。 */
   function queueActiveTabSilentRefresh(): void {
@@ -765,7 +767,16 @@
             combined.push(existing[i]);
           }
           for (let j = 0; j < newList.length; j++) {
-            combined.push(newList[j]);
+            const candidate = newList[j];
+            const candidateId = toNum(candidate["id"], 0);
+            let duplicated = false;
+            for (let k = 0; k < combined.length; k++) {
+              if (toNum(combined[k]["id"], 0) == candidateId) {
+                duplicated = true;
+                break;
+              }
+            }
+            if (!duplicated) combined.push(candidate);
           }
           conversationList.value = combined;
         } else {
@@ -832,9 +843,18 @@
     return list[index];
   }
 
+  function markConversationLoadMoreForResume(): void {
+    if (!convHasMore.value || resumeConversationLoadMorePending.value) return;
+    resumeConversationLoadMorePending.value = true;
+    resumeConversationListLength = conversationList.value.length;
+  }
+
   function handleConvClick(index: number) {
     const item = getConvItemByIndex(index);
     if (item != null) {
+      if (index == conversationList.value.length - 1) {
+        markConversationLoadMoreForResume();
+      }
       emit("conversation-click", item);
     }
   }
@@ -953,6 +973,7 @@
     if (refreshing.value) {
       return;
     }
+    resumeRecentLoadMorePending.value = false;
     refreshing.value = true;
     currentPage.value = 1;
     recentHasMore.value = true;
@@ -968,6 +989,7 @@
 
   async function handleConversationRefresh() {
     if (refreshing.value || conversationRequestPromise != null) return;
+    resumeConversationLoadMorePending.value = false;
     refreshing.value = true;
     lastId.value = null;
     convHasMore.value = true;
@@ -977,41 +999,62 @@
     }, 500);
   }
 
-  function handleRecentLoadMore() {
+  function handleRecentLoadMore(): void {
     if (recentHasMore.value && !recentLoading.value) {
       recentLoading.value = true;
       fetchUserUsedAgentList(currentPage.value + 1);
     }
   }
 
-  function handleConversationLoadMore() {
+  function handleConversationLoadMore(): void {
     if (convHasMore.value && conversationRequestPromise == null) {
       requestConversationList(true);
     }
   }
 
   /**
-   * APP 原生 list-view 在页面隐藏期间完成数据追加后，可能不会重新派发
-   * scrolltolower。仅在“分页中途离开页面”的场景记录一次补偿，用户返回后
-   * 首次继续滚动即消费，避免正常返回时无条件多加载一页。
+   * Android list-view 返回页面时可能仍处于 lower-threshold 内，不会重新派发
+   * scrolltolower。若点击末项后分页没有成功追加，则在所有冲突请求结束后主动补偿一次。
    */
-  async function resumeConversationLoadMore(): Promise<void> {
-    const pending = conversationRequestPromise;
-    if (pending != null) {
-      await pending;
+  function drainResumeLoadMore(): void {
+    if (!pageVisible.value) return;
+
+    if (activeTab.value == "recent" && resumeRecentLoadMorePending.value) {
+      if (recentAgentList.value.length > resumeRecentListLength || !recentHasMore.value) {
+        resumeRecentLoadMorePending.value = false;
+      } else if (!recentLoading.value && !recentSilentRequestPending) {
+        resumeRecentLoadMorePending.value = false;
+        handleRecentLoadMore();
+      }
     }
-    if (pageVisible.value && convHasMore.value && conversationRequestPromise == null) {
-      await requestConversationList(true);
+
+    if (activeTab.value == "history" && resumeConversationLoadMorePending.value) {
+      if (conversationList.value.length > resumeConversationListLength || !convHasMore.value) {
+        resumeConversationLoadMorePending.value = false;
+      } else if (conversationRequestPromise == null && !conversationSilentRequestPending) {
+        resumeConversationLoadMorePending.value = false;
+        handleConversationLoadMore();
+      }
     }
   }
 
-  function handleConversationScroll(_e: UniScrollEvent): void {
-    if (!pageVisible.value || !resumeLoadMoreCheckPending.value) {
-      return;
+  // UTS/Kotlin 不支持此处依赖的函数前向引用，须在所有回调定义完成后注册 watcher。
+  watch(refreshDrainTick, (_tick: number) => {
+    if (!pageVisible.value) return;
+    if (recentRefreshPending && !recentLoading.value && !recentSilentRequestPending) {
+      recentRefreshPending = false;
+      silentFetchRecentList();
     }
-    resumeLoadMoreCheckPending.value = false;
-    resumeConversationLoadMore();
-  }
+    if (conversationRefreshPending) {
+      if (!props.isLoggedIn) {
+        conversationRefreshPending = false;
+      } else if (conversationRequestPromise == null && !conversationSilentRequestPending) {
+        conversationRefreshPending = false;
+        silentFetchConversationList();
+      }
+    }
+    drainResumeLoadMore();
+  });
 
   // 对外保留手动加载入口；页面恢复使用 resumeData，避免覆盖分页数据。
   async function loadData() {
@@ -1025,8 +1068,11 @@
   /** 页面离开前记录分页是否被导航打断。 */
   function pauseData(): void {
     pageVisible.value = false;
+    if (activeTab.value == "recent" && recentLoading.value) {
+      markRecentLoadMoreForResume();
+    }
     if (convLoadingMore.value) {
-      resumeLoadMoreCheckPending.value = true;
+      markConversationLoadMoreForResume();
     }
   }
 
@@ -1049,6 +1095,7 @@
 
   async function refreshRecent(): Promise<void> {
     if (recentLoading.value) return;
+    resumeRecentLoadMorePending.value = false;
     recentLoading.value = true;
     await initTenantConfig();
     currentPage.value = 1;
@@ -1062,6 +1109,7 @@
 
   async function refreshHistory(): Promise<void> {
     if (conversationRequestPromise != null) return;
+    resumeConversationLoadMorePending.value = false;
     lastId.value = null;
     convHasMore.value = true;
     await requestConversationList(false);

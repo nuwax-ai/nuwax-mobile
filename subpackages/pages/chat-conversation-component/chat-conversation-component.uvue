@@ -94,13 +94,16 @@
     </template>
     <template v-else>
       <view class="chat-container">
-        <!-- 性能测试浮层：avgFps / maxGap（仅 perfTest 模式） -->
+        <!-- 调试性能浮层：真实会话与 perfTest 均常驻 -->
         <view v-if="isPerfMock" class="perf-overlay">
           <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
+          <text class="perf-overlay-text">scroll {{ virtualLastScrollTop.toFixed(0) }} · vp {{ virtualViewportHeight.toFixed(0) }} · {{ virtualSettleState }}</text>
+          <text class="perf-overlay-text">touch {{ scrollTouch ? '1' : '0' }} · moving {{ scrolling ? '1' : '0' }} · follow {{ perfAutoFollow ? '1' : '0' }}</text>
           <text class="perf-overlay-text">mounted {{ virtualMountedCount }} / {{ messageList.length }}</text>
           <text class="perf-overlay-text">visible {{ virtualVisibleStartIndex }}-{{ virtualVisibleEndIndex }} · buffer ↑{{ virtualBufferBeforeCount }} ↓{{ virtualBufferAfterCount }}</text>
           <text class="perf-overlay-text">preload {{ virtualBufferConfigText }}</text>
           <text class="perf-overlay-text">range {{ virtualStartIndex }}-{{ virtualEndIndex }} · top {{ virtualTopSpacerHeight }} · bottom {{ virtualBottomSpacerHeight }}</text>
+          <text class="perf-overlay-text">measure Δ{{ virtualLastMeasureDelta.toFixed(0) }} · anchor Δ{{ virtualLastAnchorDelta.toFixed(0) }}</text>
           <text class="perf-overlay-toggle" @click="toggleVirtualScroll">{{ useVirtualScroll ? 'virtual-scroll' : 'full-scroll' }} ·点击切换</text>
         </view>
         <!-- 聊天内容 -->
@@ -817,6 +820,12 @@
   const virtualViewportHeight = ref<number>(600);
   const virtualContentOrigin = ref<number>(0);
   const virtualLastScrollTop = ref<number>(0);
+  const virtualSettleState = ref<string>("idle");
+  const virtualLastMeasureDelta = ref<number>(0);
+  const virtualLastAnchorDelta = ref<number>(0);
+  const perfAutoFollow = computed((): boolean =>
+    data.autoToLastMsg.value == true,
+  );
   const virtualMountedCount = computed((): number =>
     Math.max(0, virtualEndIndex.value - virtualStartIndex.value),
   );
@@ -835,6 +844,8 @@
   let virtualMeasureTimer: number = 0;
   let virtualWindowSettleTimer: number = 0;
   let pendingVirtualAnchor: VirtualMessageAnchor | null = null;
+  /** 历史冷开：末尾窗口完成首次真实测高后，只执行一次最终滚底。 */
+  let virtualInitialBottomPending: boolean = false;
   const VIRTUAL_ROW_GAP_PX: number = 18;
   const VIRTUAL_OVERSCAN_SCREENS: number = 6;
   // 已挂载窗口的前后缓冲低于该值时立即渐进补齐到 overscan。
@@ -1024,6 +1035,19 @@
     setVirtualScrollTop(rawTop);
   }
 
+  function commitVirtualInitialBottom(): void {
+    if (virtualInitialBottomPending != true) return;
+    virtualInitialBottomPending = false;
+    prepareVirtualBottomRange();
+    data.scrollWithAnimation.value = false;
+    data.scrollIntoView.value = "";
+    nextTick((): void => {
+      data.scrollIntoView.value = "last-msg";
+      data.scrollInBottom.value = true;
+      data.autoToLastMsg.value = true;
+    });
+  }
+
   function measureVirtualRows(): void {
     if (useVirtualScroll.value != true) return;
     // selectorQuery 会强制读取布局；连续滚动期间执行会与原生 scroll 帧抢主线程。
@@ -1063,6 +1087,7 @@
         effectiveVirtualScrollTop(virtualLastScrollTop.value),
       );
       let heightChanged = false;
+      let measuredDelta = 0;
       if (rows != null) {
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
@@ -1077,24 +1102,42 @@
           const gap = globalIndex == virtualMessageManager.count() - 1
             ? 0
             : VIRTUAL_ROW_GAP_PX;
-          if (virtualMessageManager.recordHeight(key, (heightRaw as number) + gap) != 0) {
+          const rowDelta = virtualMessageManager.recordHeight(
+            key,
+            (heightRaw as number) + gap,
+          );
+          if (rowDelta != 0) {
             heightChanged = true;
+            measuredDelta = measuredDelta + rowDelta;
           }
         }
       }
+      virtualLastMeasureDelta.value = measuredDelta;
       if (heightChanged == true) {
         applyVirtualRange(virtualLastScrollTop.value, true);
-        if (data.autoToLastMsg.value != true) {
+        if (
+          data.autoToLastMsg.value == true &&
+          data.scrollTouch.value != true &&
+          data.scrolling.value != true
+        ) {
+          // 已在底部时，真实测高会改变 totalHeight。若保留旧 scrollTop，视觉位置会
+          // 相对新底部向上弹；按新总高度重算一次底部，保持 stick-to-bottom。
+          prepareVirtualBottomRange();
+        } else if (data.autoToLastMsg.value != true) {
           if (data.scrollTouch.value == true) {
             pendingVirtualAnchor = anchor;
           } else {
             const restored = virtualMessageManager.restoreAnchor(anchor);
             if (restored >= 0) {
+              virtualLastAnchorDelta.value =
+                restored - effectiveVirtualScrollTop(virtualLastScrollTop.value);
               setVirtualScrollTop(restored + virtualContentOrigin.value);
             }
           }
         }
       }
+      virtualSettleState.value = heightChanged == true ? "measured" : "stable";
+      commitVirtualInitialBottom();
     });
   }
 
@@ -1142,6 +1185,7 @@
   function handleVirtualScroll(e: UniScrollEvent): void {
     if (e == null || e.detail == null) return;
     virtualLastScrollTop.value = e.detail.scrollTop;
+    virtualSettleState.value = "scroll";
     if (applyVirtualRange(virtualLastScrollTop.value, false)) {
       if (data.scrollTouch.value != true && data.scrolling.value != true) {
         nextTick((): void => scheduleVirtualMeasure(80));
@@ -1152,9 +1196,12 @@
     }
     virtualWindowSettleTimer = setTimeout((): void => {
       virtualWindowSettleTimer = 0;
+      virtualSettleState.value = "settle";
       const changed = applyVirtualRange(virtualLastScrollTop.value, true);
       if (changed == true) {
         nextTick((): void => scheduleVirtualMeasure(80));
+      } else {
+        virtualSettleState.value = "stable";
       }
     }, 650) as number;
   }
@@ -2265,7 +2312,14 @@
   ) => scrollManager.scrollToLastMsg(userClick, contentMayRelayout);
   /** 历史会话首屏加载后延迟无动画滚底 */
   const scrollToLastMsgAfterHistoryLoad = () => {
-    prepareVirtualBottomRange();
+    if (useVirtualScroll.value == true) {
+      // 旧逻辑会在 7 秒内反复补滚；用户已经开始浏览后仍会被拉回底部。
+      // 虚拟列表先挂末尾窗口，首次真实测高结束后再一次性落底。
+      virtualInitialBottomPending = true;
+      prepareVirtualBottomRange();
+      nextTick((): void => scheduleVirtualMeasure(0));
+      return;
+    }
     nextTick((): void => scrollManager.scrollToLastMsgAfterHistoryLoad());
   };
   /** 发送后（气泡已入列表）滚底，含 iOS 语音发送补滚 */
@@ -3282,10 +3336,10 @@
     });
   };
 
-  // ==================== 性能测试帧探针（perfTest 模式：avgFps / maxGap 浮层 + logcat）====================
+  // ==================== 性能测试帧探针（调试分支真实会话常驻）====================
   // setInterval(16ms) 记主线程 tick 间隔；解析/渲染阻塞时 delta 暴涨 → 量化「卡死/掉帧」体感。
-  // 仅 isStreamPerfMockEnabled 时启动；浮层每 500ms 刷新一次，避免探针自身污染测量。
-  const isPerfMock = ref<boolean>(false);
+  // 浮层每 500ms 刷新一次，避免探针自身污染测量。
+  const isPerfMock = ref<boolean>(true);
   const perfFpsText = ref<string>("--");
   const perfGapText = ref<string>("--");
   let perfLastFrameAt: number = 0;
@@ -3323,7 +3377,6 @@
         const fps = avg > 0 ? 1000 / avg : 0;
         perfFpsText.value = `${fps.toFixed(0)}`;
         perfGapText.value = `${mx}`;
-        console.log(`[PerfProbe] fps=${fps.toFixed(0)} maxGap=${mx}ms avgDelta=${avg.toFixed(0)}ms samples=${cnt}`);
       }
       await new Promise<void>((resolve) => {
         setTimeout((): void => resolve(), 16);
@@ -3346,16 +3399,6 @@
   function stopPerfFrameProbe(): void {
     perfProbeRunning = false;
   }
-
-  watch(
-    (): boolean => isConversationActive.value == true,
-    (active: boolean): void => {
-      if (isPerfMock.value == true && active != true) {
-        // 保留完成态/Markdown 定稿的一小段尾部窗口，再停止探针，避免空闲页持续刷日志。
-        setTimeout((): void => stopPerfFrameProbe(), 800);
-      }
-    },
-  );
 
   // 聊天页可见时暂停全局 batch 事件轮询；离开聊天页（含跳转文件预览等）后恢复
   // 四端统一用页面 onShow/onHide（与上方 H5 pageResume 分流无关）
@@ -3780,6 +3823,7 @@
     }
     // 进入页面后渲染输入框组件
     isRenderInputPhone.value = true;
+    startPerfFrameProbe();
 
     // 微信小程序事件绑定
     // #ifdef MP-WEIXIN
@@ -3906,6 +3950,8 @@
       virtualWindowSettleTimer = 0;
     }
     data.scrollTouch.value = true;
+    // 用户已经接管滚动后，禁止冷开测高回调再把页面拉到底。
+    virtualInitialBottomPending = false;
     // 自动跟底期只挂载末尾消息；触摸开始、滚动尚未发生时先同步扩成
     // 前后六屏缓冲，避免第一次向上拖动直接进入顶部 spacer 空白区。
     if (useVirtualScroll.value == true) {

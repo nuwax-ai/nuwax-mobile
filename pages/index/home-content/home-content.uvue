@@ -26,6 +26,7 @@
             <list-item
               v-for="(info, index) in recentAgentList"
               :key="info.agentId"
+              :item-key="info.agentId"
               :type="3"
               class="recent-item"
             >
@@ -38,7 +39,7 @@
                   :showModifiedTime="isLoggedIn"
                   :paymentRequired="info.paymentRequired && enableSubscription == 1"
                   :subscribed="info.subscribed"
-                  @click="handleRecentClick(info)"
+                  @click="handleRecentClick(info, index)"
                   @longpress="handleRecentLongPress(info)"
                 />
               </view>
@@ -73,7 +74,6 @@
           :refresher-triggered="refreshing && activeTab == 'history'"
           :show-scrollbar="false"
           :scroll-top="convScrollTop"
-          @scroll="handleConversationScroll"
           @scrolltolower="handleConversationLoadMore"
           @refresherrefresh="handleConversationRefresh"
         >
@@ -121,7 +121,7 @@
 </template>
 
 <script setup lang="uts">
-  import { ref, computed, onMounted, onUnmounted } from "vue";
+  import { ref, computed, watch, onMounted, onUnmounted } from "vue";
   import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
   import eventBus from "@/utils/eventBus";
   import { EVENT_TYPE } from "@/constants/event.constants";
@@ -138,7 +138,11 @@
     apiAgentConversationDelete,
   } from "@/servers/conversation";
   import { ConversationListParams } from "@/types/interfaces/conversationInfo";
-  import { AgentConversationUpdateParams, AgentListItem } from "@/types/interfaces/agent";
+  import {
+    AgentConversationUpdateParams,
+    AgentListItem,
+    AgentRecentConversationListItem,
+  } from "@/types/interfaces/agent";
   import { apiTenantConfig } from "@/servers/account";
   import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { ListParams } from "@/types/interfaces/common";
@@ -175,6 +179,13 @@
   const recentHasMore = ref<boolean>(false);
   const currentPage = ref<number>(1);
   const tenantConfigInfo = ref<any | null>(null);
+  let recentRequestGeneration = 0;
+  let recentSilentRequestPending = false;
+  let recentRefreshPending = false;
+  const resumeRecentLoadMorePending = ref<boolean>(false);
+  let resumeRecentListLength = 0;
+  let conversationRefreshPending = false;
+  const refreshDrainTick = ref<number>(0);
 
   const enableSubscription = computed((): number => {
     const tc = tenantConfigInfo.value;
@@ -221,7 +232,91 @@
     item.agentType = readStr(src, "agentType");
     item.paymentRequired = readBool(src, "paymentRequired");
     item.subscribed = readBool(src, "subscribed");
+    const conversationListRaw = src["conversationList"];
+    const conversations = conversationListRaw != null && Array.isArray(conversationListRaw)
+      ? (conversationListRaw as any[])
+      : ([] as any[]);
+    const mappedConversations = [] as AgentRecentConversationListItem[];
+    for (let i = 0; i < conversations.length; i++) {
+      const conversationRaw = conversations[i];
+      if (conversationRaw == null) continue;
+      const conversationObj = conversationRaw as UTSJSONObject;
+      const conversation = new AgentRecentConversationListItem();
+      conversation.id = readStr(conversationObj, "id");
+      conversation.topic = readStr(conversationObj, "topic");
+      conversation.taskStatus = readStr(conversationObj, "taskStatus");
+      mappedConversations.push(conversation);
+    }
+    item.conversationList = mappedConversations;
     return item;
+  }
+
+  /**
+   * 更新已有列表项但保留对象身份。
+   * Android 原生 list-view 会复用 list-item；用新对象整体替换列表时，即使 icon URL
+   * 没有变化，也可能重新绑定 image 并在解码期间短暂清空已显示的纹理。
+   */
+  function updateRecentAgentItem(
+    target: AgentListItem,
+    source: AgentListItem,
+  ): void {
+    if (target.id != source.id) target.id = source.id;
+    if (target.lastConversationId != source.lastConversationId) target.lastConversationId = source.lastConversationId;
+    if (target.name != source.name) target.name = source.name;
+    // 图标 URL 可能由后端动态生成，不能通过 URL 结构判断资源是否变化。
+    // 始终同步接口新值；agent-icon 会先在隐藏层加载完成，再无闪烁切换。
+    if (target.icon != source.icon) {
+      target.icon = source.icon;
+    }
+    if (target.description != source.description) target.description = source.description;
+    // modified 未变化时不因“xx小时前”的自然流逝刷新整行，避免 Android list-item
+    // 在页面恢复时重新绑定内部 image。真正产生新会话时再同步时间文案。
+    if (target.modified != source.modified) {
+      target.modified = source.modified;
+      target.modifiedTimeText = source.modifiedTimeText;
+    }
+    if (target.agentType != source.agentType) target.agentType = source.agentType;
+    if (target.paymentRequired != source.paymentRequired) target.paymentRequired = source.paymentRequired;
+    if (target.subscribed != source.subscribed) target.subscribed = source.subscribed;
+    // conversationList 当前不参与最近使用列表渲染；不要用每次请求生成的新数组
+    // 覆盖它，否则会让所有 list-item 在页面恢复时都被判定为已更新。
+  }
+
+  /** 按 agentId 原位协调列表，避免刷新时销毁并重建所有原生图片节点。 */
+  function reconcileRecentAgentList(incoming: AgentListItem[]): void {
+    const current = recentAgentList.value;
+    for (let i = 0; i < incoming.length; i++) {
+      const source = incoming[i];
+      let target: AgentListItem | null = null;
+
+      if (i < current.length && current[i].agentId == source.agentId) {
+        target = current[i];
+      } else {
+        let existingIndex = -1;
+        for (let j = 0; j < current.length; j++) {
+          if (current[j].agentId == source.agentId) {
+            existingIndex = j;
+            break;
+          }
+        }
+        if (existingIndex >= 0) {
+          target = current[existingIndex];
+          current.splice(existingIndex, 1);
+          current.splice(i, 0, target);
+        } else {
+          current.splice(i, 0, source);
+          target = source;
+        }
+      }
+
+      if (target != null && target !== source) {
+        updateRecentAgentItem(target, source);
+      }
+    }
+
+    if (current.length > incoming.length) {
+      current.splice(incoming.length, current.length - incoming.length);
+    }
   }
 
   function toRecentPayload(info: AgentListItem): UTSJSONObject {
@@ -239,13 +334,17 @@
     return obj;
   }
 
-  async function fetchUserUsedAgentList(page: number = 1, pageSize: number = 20): Promise<any> {
+  async function fetchUserUsedAgentList(
+    page: number = 1,
+    pageSize: number = 20,
+  ): Promise<any> {
+    // 正常加载请求优先于静默刷新；用于丢弃并发静默请求的过期响应。
+    recentRequestGeneration = recentRequestGeneration + 1;
     try {
       const params = new ListParams();
       params.pageIndex = page;
       params.size = pageSize;
       const res = await apiUserUsedAgentList(params);
-      recentLoading.value = false;
       const code = apiResCode(res);
       const dataRaw = apiResData<any>(res);
       if (code == SUCCESS_CODE) {
@@ -256,24 +355,31 @@
         }
         if (page > 1) {
           const existing = recentAgentList.value != null ? recentAgentList.value : ([] as AgentListItem[]);
-          const combined = [] as AgentListItem[];
-          for (let i = 0; i < existing.length; i++) {
-            combined.push(existing[i]);
-          }
           for (let k = 0; k < newList.length; k++) {
-            combined.push(newList[k]);
+            const candidate = newList[k];
+            let duplicated = false;
+            for (let m = 0; m < existing.length; m++) {
+              if (existing[m].agentId == candidate.agentId) {
+                duplicated = true;
+                break;
+              }
+            }
+            if (!duplicated) existing.push(candidate);
           }
-          recentAgentList.value = combined;
         } else {
-          recentAgentList.value = newList;
+          reconcileRecentAgentList(newList);
         }
-        recentHasMore.value = newList.length > 0;
+        recentHasMore.value = newList.length >= pageSize;
         currentPage.value = page;
         return dataRaw;
       }
+      return false;
     } catch (error) {
       console.error("fetchUserUsedAgentList error:", error);
       return false;
+    } finally {
+      recentLoading.value = false;
+      refreshDrainTick.value = refreshDrainTick.value + 1;
     }
   }
 
@@ -298,7 +404,7 @@
         for (let i = 0; i < records.length; i++) {
           agentList.push(mapToAgentListItem(records[i] as UTSJSONObject, true));
         }
-        recentAgentList.value = agentList;
+        reconcileRecentAgentList(agentList);
         recentHasMore.value = false;
         currentPage.value = 1;
         return agentList;
@@ -345,7 +451,16 @@
     });
   }
 
-  function handleRecentClick(info: AgentListItem) {
+  function markRecentLoadMoreForResume(): void {
+    if (!recentHasMore.value || resumeRecentLoadMorePending.value) return;
+    resumeRecentLoadMorePending.value = true;
+    resumeRecentListLength = recentAgentList.value.length;
+  }
+
+  function handleRecentClick(info: AgentListItem, index: number) {
+    if (index == recentAgentList.value.length - 1) {
+      markRecentLoadMoreForResume();
+    }
     emit("agent-click", toRecentPayload(info));
   }
 
@@ -399,8 +514,11 @@
   const convHasMore = ref<boolean>(false);
   const lastId = ref<number | null>(null);
   const pageVisible = ref<boolean>(true);
-  const resumeLoadMoreCheckPending = ref<boolean>(false);
+  const resumeConversationLoadMorePending = ref<boolean>(false);
+  let resumeConversationListLength = 0;
   let conversationRequestPromise: Promise<boolean> | null = null;
+  let conversationRequestGeneration = 0;
+  let conversationSilentRequestPending = false;
 
   const convLoading = computed((): boolean => {
     return convInitialLoading.value || convLoadingMore.value;
@@ -516,37 +634,30 @@
     return !convLoading.value && !convHasMore.value && clLen > 8;
   });
 
-  let executingCheckTimerId: number | null = null;
-
-  function stopExecutingCheckTimer(): void {
-    if (executingCheckTimerId != null) {
-      clearInterval(executingCheckTimerId as number);
-      executingCheckTimerId = null;
-    }
-  }
-
-  /**
-   * 静默刷新“最近使用”列表最新数据，无全屏 Loading/下拉刷新框，不打扰当前视图与已加载分页
-   */
+  /** 静默刷新“最近使用”已加载窗口，不改变分页深度与滚动位置。 */
   async function silentFetchRecentList(): Promise<void> {
-    if (!pageVisible.value) return;
+    if (!pageVisible.value || recentLoading.value || recentSilentRequestPending) return;
+    recentSilentRequestPending = true;
+    const requestGeneration = recentRequestGeneration;
     try {
       if (props.isLoggedIn) {
         const params = new ListParams();
+        const loadedSize = Math.max(20, currentPage.value * 20, recentAgentList.value.length);
         params.pageIndex = 1;
-        const pageSize = 20 * currentPage.value;
-        params.size = pageSize;
+        params.size = loadedSize;
         const res = await apiUserUsedAgentList(params);
         const code = apiResCode(res);
         const dataRaw = apiResData<any>(res);
-        if (code == SUCCESS_CODE) {
+        // 分页请求已开始时丢弃旧静默响应，避免第一页结果覆盖追加后的列表。
+        if (code == SUCCESS_CODE && requestGeneration == recentRequestGeneration) {
           const rawList = dataRaw != null ? (dataRaw as any[]) : ([] as any[]);
           const newList = [] as AgentListItem[];
           for (let j = 0; j < rawList.length; j++) {
             newList.push(mapToAgentListItem(rawList[j] as UTSJSONObject, false));
           }
-          recentAgentList.value = newList;
-          recentHasMore.value = rawList.length >= pageSize;
+          reconcileRecentAgentList(newList);
+          // 返回详情时刷新完整的已加载窗口，不重置页码或裁掉后续分页。
+          recentHasMore.value = newList.length >= loadedSize;
         }
       } else {
         const params = new SquarePublishedListParams();
@@ -567,110 +678,67 @@
           for (let i = 0; i < records.length; i++) {
             newList.push(mapToAgentListItem(records[i] as UTSJSONObject, true));
           }
-          recentAgentList.value = newList;
+          reconcileRecentAgentList(newList);
         }
       }
     } catch (error) {
       console.error("silentFetchRecentList error:", error);
+    } finally {
+      recentSilentRequestPending = false;
+      refreshDrainTick.value = refreshDrainTick.value + 1;
     }
   }
 
-  /**
-   * 静默刷新会话列表最新数据（如执行中状态），无全屏 Loading，不打扰当前视图与已加载分页
-   */
+  /** 静默刷新会话列表已加载窗口（如执行中状态），保留末尾游标。 */
   async function silentFetchConversationList(): Promise<void> {
-    if (!props.isLoggedIn || conversationRequestPromise != null) return;
+    if (!props.isLoggedIn || conversationRequestPromise != null || conversationSilentRequestPending) return;
+    conversationSilentRequestPending = true;
+    const requestGeneration = conversationRequestGeneration;
     try {
       const params = new ConversationListParams();
+      const loadedLimit = Math.max(20, conversationList.value.length);
       params.agentId = null;
       params.lastId = null;
-      params.limit = 20;
+      params.limit = loadedLimit;
       const res = await apiAgentConversationList(params);
-      if (apiResCode(res) == SUCCESS_CODE) {
+      if (apiResCode(res) == SUCCESS_CODE && requestGeneration == conversationRequestGeneration) {
         const newList = normalizeList(apiResData<any>(res));
+        conversationList.value = newList;
+        convHasMore.value = newList.length >= loadedLimit;
         if (newList.length > 0) {
-          const existing = conversationList.value;
-          if (existing != null && existing.length > newList.length) {
-            const merged: UTSJSONObject[] = [];
-            for (let i = 0; i < newList.length; i++) {
-              merged.push(newList[i]);
-            }
-            for (let j = newList.length; j < existing.length; j++) {
-              merged.push(existing[j]);
-            }
-            conversationList.value = merged;
-          } else {
-            conversationList.value = newList;
-          }
-          if (conversationList.value.length > 0) {
-            const last = conversationList.value[conversationList.value.length - 1];
-            lastId.value = toNum(last["id"], 0);
-          }
+          const last = newList[newList.length - 1];
+          lastId.value = toNum(last["id"], 0);
+        } else {
+          lastId.value = null;
         }
       }
     } catch (error) {
       console.error("silentFetchConversationList error:", error);
     } finally {
-      if (activeTab.value != "history") {
-        let hasExecuting = false;
-        const currentList = conversationList.value;
-        if (currentList != null) {
-          for (let i = 0; i < currentList.length; i++) {
-            const item = currentList[i];
-            if (item != null && toStr(item["taskStatus"], "") == "EXECUTING") {
-              hasExecuting = true;
-              break;
-            }
-          }
-        }
-        if (!hasExecuting && activeTab.value != "recent") {
-          stopExecutingCheckTimer();
-        }
-      }
+      conversationSilentRequestPending = false;
+      refreshDrainTick.value = refreshDrainTick.value + 1;
     }
   }
 
-  function checkAndStartExecutingTimer(): void {
-    if (!pageVisible.value) {
-      stopExecutingCheckTimer();
-      return;
-    }
-
-    const list = convRowList.value;
-    let hasExecuting = false;
-    for (let i = 0; i < list.length; i++) {
-      if (list[i].showExecuting) {
-        hasExecuting = true;
-        break;
-      }
-    }
-
-    // 处于最近使用/会话记录 Tab 或存在执行中会话时保持静默轮询跟进最新状态
-    const isHistoryTab = activeTab.value == "history";
-    const isRecentTab = activeTab.value == "recent";
-    if (isRecentTab || isHistoryTab || hasExecuting) {
-      if (executingCheckTimerId == null) {
-        executingCheckTimerId = setInterval(() => {
-          if (!pageVisible.value) return;
-          if (activeTab.value == "recent") {
-            silentFetchRecentList();
-          } else if (activeTab.value == "history" || hasExecuting) {
-            silentFetchConversationList();
-          }
-        }, 5000);
-      }
+  /** 仅将当前打开的 Tab 加入静默刷新队列。 */
+  function queueActiveTabSilentRefresh(): void {
+    if (activeTab.value == "recent") {
+      recentRefreshPending = true;
+      conversationRefreshPending = false;
     } else {
-      stopExecutingCheckTimer();
+      recentRefreshPending = false;
+      conversationRefreshPending = true;
     }
+    refreshDrainTick.value = refreshDrainTick.value + 1;
   }
 
-  function handleRefreshChatMessageEvent(_data: any): void {
-    if (pageVisible.value) {
-      silentFetchRecentList();
-      if (props.isLoggedIn) {
-        silentFetchConversationList();
-      }
-    }
+  /**
+   * 消费全局 batch 轮询分发的 ChatFinished。
+   * 移动端没有 PC 端的 EXECUTING 乐观写入链路，因此必须常驻订阅；否则事件会在首页订阅前被 clear。
+   * 仅静默更新当前打开的首页 Tab；页面隐藏时保留标记，返回首页后再刷新。
+   */
+  function handleChatFinishedEvent(_data: any | null): void {
+    queueActiveTabSilentRefresh();
   }
 
   async function fetchConversationList(isLoadMore: boolean = false): Promise<boolean> {
@@ -682,6 +750,8 @@
       }
       return false;
     }
+    // 用户主动刷新/分页优先，令并发的旧静默响应失效。
+    conversationRequestGeneration = conversationRequestGeneration + 1;
     try {
       const params = new ConversationListParams();
       params.agentId = null;
@@ -697,7 +767,16 @@
             combined.push(existing[i]);
           }
           for (let j = 0; j < newList.length; j++) {
-            combined.push(newList[j]);
+            const candidate = newList[j];
+            const candidateId = toNum(candidate["id"], 0);
+            let duplicated = false;
+            for (let k = 0; k < combined.length; k++) {
+              if (toNum(combined[k]["id"], 0) == candidateId) {
+                duplicated = true;
+                break;
+              }
+            }
+            if (!duplicated) combined.push(candidate);
           }
           conversationList.value = combined;
         } else {
@@ -710,7 +789,6 @@
         } else {
           convHasMore.value = false;
         }
-        checkAndStartExecutingTimer();
         return true;
       }
       return false;
@@ -748,6 +826,7 @@
     } finally {
       // 单飞入口保证同一时刻只有这一笔会话列表请求。
       conversationRequestPromise = null;
+      refreshDrainTick.value = refreshDrainTick.value + 1;
     }
   }
 
@@ -764,9 +843,18 @@
     return list[index];
   }
 
+  function markConversationLoadMoreForResume(): void {
+    if (!convHasMore.value || resumeConversationLoadMorePending.value) return;
+    resumeConversationLoadMorePending.value = true;
+    resumeConversationListLength = conversationList.value.length;
+  }
+
   function handleConvClick(index: number) {
     const item = getConvItemByIndex(index);
     if (item != null) {
+      if (index == conversationList.value.length - 1) {
+        markConversationLoadMoreForResume();
+      }
       emit("conversation-click", item);
     }
   }
@@ -885,11 +973,12 @@
     if (refreshing.value) {
       return;
     }
+    resumeRecentLoadMorePending.value = false;
     refreshing.value = true;
     currentPage.value = 1;
     recentHasMore.value = true;
     if (props.isLoggedIn) {
-      await fetchUserUsedAgentList();
+      await fetchUserUsedAgentList(1, 20);
     } else {
       await fetchPublishedAgentList();
     }
@@ -900,6 +989,7 @@
 
   async function handleConversationRefresh() {
     if (refreshing.value || conversationRequestPromise != null) return;
+    resumeConversationLoadMorePending.value = false;
     refreshing.value = true;
     lastId.value = null;
     convHasMore.value = true;
@@ -909,41 +999,62 @@
     }, 500);
   }
 
-  function handleRecentLoadMore() {
+  function handleRecentLoadMore(): void {
     if (recentHasMore.value && !recentLoading.value) {
       recentLoading.value = true;
       fetchUserUsedAgentList(currentPage.value + 1);
     }
   }
 
-  function handleConversationLoadMore() {
+  function handleConversationLoadMore(): void {
     if (convHasMore.value && conversationRequestPromise == null) {
       requestConversationList(true);
     }
   }
 
   /**
-   * APP 原生 list-view 在页面隐藏期间完成数据追加后，可能不会重新派发
-   * scrolltolower。仅在“分页中途离开页面”的场景记录一次补偿，用户返回后
-   * 首次继续滚动即消费，避免正常返回时无条件多加载一页。
+   * Android list-view 返回页面时可能仍处于 lower-threshold 内，不会重新派发
+   * scrolltolower。若点击末项后分页没有成功追加，则在所有冲突请求结束后主动补偿一次。
    */
-  async function resumeConversationLoadMore(): Promise<void> {
-    const pending = conversationRequestPromise;
-    if (pending != null) {
-      await pending;
+  function drainResumeLoadMore(): void {
+    if (!pageVisible.value) return;
+
+    if (activeTab.value == "recent" && resumeRecentLoadMorePending.value) {
+      if (recentAgentList.value.length > resumeRecentListLength || !recentHasMore.value) {
+        resumeRecentLoadMorePending.value = false;
+      } else if (!recentLoading.value && !recentSilentRequestPending) {
+        resumeRecentLoadMorePending.value = false;
+        handleRecentLoadMore();
+      }
     }
-    if (pageVisible.value && convHasMore.value && conversationRequestPromise == null) {
-      await requestConversationList(true);
+
+    if (activeTab.value == "history" && resumeConversationLoadMorePending.value) {
+      if (conversationList.value.length > resumeConversationListLength || !convHasMore.value) {
+        resumeConversationLoadMorePending.value = false;
+      } else if (conversationRequestPromise == null && !conversationSilentRequestPending) {
+        resumeConversationLoadMorePending.value = false;
+        handleConversationLoadMore();
+      }
     }
   }
 
-  function handleConversationScroll(_e: UniScrollEvent): void {
-    if (!pageVisible.value || !resumeLoadMoreCheckPending.value) {
-      return;
+  // UTS/Kotlin 不支持此处依赖的函数前向引用，须在所有回调定义完成后注册 watcher。
+  watch(refreshDrainTick, (_tick: number) => {
+    if (!pageVisible.value) return;
+    if (recentRefreshPending && !recentLoading.value && !recentSilentRequestPending) {
+      recentRefreshPending = false;
+      silentFetchRecentList();
     }
-    resumeLoadMoreCheckPending.value = false;
-    resumeConversationLoadMore();
-  }
+    if (conversationRefreshPending) {
+      if (!props.isLoggedIn) {
+        conversationRefreshPending = false;
+      } else if (conversationRequestPromise == null && !conversationSilentRequestPending) {
+        conversationRefreshPending = false;
+        silentFetchConversationList();
+      }
+    }
+    drainResumeLoadMore();
+  });
 
   // 对外保留手动加载入口；页面恢复使用 resumeData，避免覆盖分页数据。
   async function loadData() {
@@ -957,9 +1068,11 @@
   /** 页面离开前记录分页是否被导航打断。 */
   function pauseData(): void {
     pageVisible.value = false;
-    stopExecutingCheckTimer();
+    if (activeTab.value == "recent" && recentLoading.value) {
+      markRecentLoadMoreForResume();
+    }
     if (convLoadingMore.value) {
-      resumeLoadMoreCheckPending.value = true;
+      markConversationLoadMoreForResume();
     }
   }
 
@@ -982,6 +1095,7 @@
 
   async function refreshRecent(): Promise<void> {
     if (recentLoading.value) return;
+    resumeRecentLoadMorePending.value = false;
     recentLoading.value = true;
     await initTenantConfig();
     currentPage.value = 1;
@@ -995,6 +1109,7 @@
 
   async function refreshHistory(): Promise<void> {
     if (conversationRequestPromise != null) return;
+    resumeConversationLoadMorePending.value = false;
     lastId.value = null;
     convHasMore.value = true;
     await requestConversationList(false);
@@ -1015,15 +1130,12 @@
   }
 
   /**
-   * 返回首页时保留当前列表与滚动位置，静默刷新最新数据（最近使用与会话状态）。
+   * 从会话/详情页返回首页时保留滚动位置，并静默更新当前打开的 Tab。
+   * 统一进入待刷新队列；若分页请求尚未结束，会在请求完成后自动补刷。
    */
   async function resumeData(): Promise<void> {
     pageVisible.value = true;
-    checkAndStartExecutingTimer();
-    silentFetchRecentList();
-    if (props.isLoggedIn) {
-      silentFetchConversationList();
-    }
+    queueActiveTabSilentRefresh();
     if (activeTab.value == "recent") {
       if (recentAgentList.value.length == 0 && !recentLoading.value) {
         await loadRecent();
@@ -1039,9 +1151,8 @@
     }
     activeTab.value = tab;
     emit("tab-change", tab);
-    // 切换 最近使用 或 会话记录 时重新拉取对应的最新数据，并根据当前 Tab 启动/更新静默轮询
+    // 用户主动切换时刷新当前列表；后台静默更新统一由全局 batch 轮询事件驱动。
     refreshCurrentTab();
-    checkAndStartExecutingTimer();
   }
 
   function handleSwiperChange(e: UniSwiperChangeEvent): void {
@@ -1049,15 +1160,14 @@
   }
 
   onMounted(() => {
+    eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedEvent);
     // 两侧数据并行预热，切换时只做原生位移动画，不临时发起首屏请求。
     loadRecent();
     loadConversation();
-    eventBus.on(`${EVENT_TYPE.RefreshChatMessage}`, handleRefreshChatMessageEvent);
   });
 
   onUnmounted(() => {
-    eventBus.off(`${EVENT_TYPE.RefreshChatMessage}`, handleRefreshChatMessageEvent);
-    stopExecutingCheckTimer();
+    eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedEvent);
   });
 
   defineExpose({

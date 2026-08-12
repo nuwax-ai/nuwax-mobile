@@ -1,45 +1,28 @@
 import { MTMathView } from 'com.agog.mathdisplay'
-import QuickJSContext from 'com.whl.quickjs.wrapper.QuickJSContext'
-import JSFunction from 'com.whl.quickjs.wrapper.JSFunction'
-import QuickJSLoader from 'com.whl.quickjs.android.QuickJSLoader'
-import SVG from 'com.caverock.androidsvg.SVG'
-import Bitmap from 'android.graphics.Bitmap'
-import Canvas from 'android.graphics.Canvas'
-import Base64 from 'android.util.Base64'
-import ByteArrayOutputStream from 'java.io.ByteArrayOutputStream'
-import BufferedReader from 'java.io.BufferedReader'
-import InputStreamReader from 'java.io.InputStreamReader'
-import ExecutorService from 'java.util.concurrent.ExecutorService'
-import Executors from 'java.util.concurrent.Executors'
-import Exception from 'java.lang.Exception'
 
 /**
- * Android 原生数学渲染后端（标准模式 UTS 组件，仓库首例组件式 UTS 插件）。
+ * Android 原生数学视图（UTS 组件式插件）。
  *
  * 把 AndroidMath 的 MTMathView（com.agog.mathdisplay：纯 Canvas + FreeType 矢量字形，
  * 自带 latinmodern / texgyretermes / xits OTF 数学字体）绑定到 uvue 的 <native-view>。
- * 数学排版在原生层完成，不再过隐藏 proxy web-view → 根除数学渲染的 evalJS 桥死锁，
- * 且公式文字原生可选 / 可复制、高 DPI 清晰、可跟随暗色主题。
- *
- * 范式参考 DCloud 官方 native-button（标准模式组件首例）：构造接 UniNativeViewElement，
- * getAndroidActivity() 取 Context 建原生 View，bindAndroidView 绑定，方法下发 props，
- * onUnmounted 调 destroy 释放。iOS（iosMath）/ 鸿蒙后端待后续补 utssdk/app-ios、app-harmony。
+ * 数学排版在原生层完成，不过隐藏 proxy web-view。
  *
  * ★ 重要：MTMathView 是 Kotlin 类，latex/fontSize/labelMode/textColor/textAlignment/
  * displayErrorInline 都是 Kotlin var 属性（不是 Java setter）。UTS→Kotlin 里必须用
- * 「属性赋值 view.latex = x」，写 view.setLatex(x) 会被 kotlinc 判 Unresolved reference
- * （Kotlin 不允许调用自身属性的合成 setter）。继承自 android.view.View 的 requestLayout()/
- * invalidate() 是 Java 方法，照常方法调用。
+ * 「属性赋值 view.latex = x」，写 view.setLatex(x) 会被 kotlinc 判 Unresolved reference。
+ * 继承自 android.view.View 的 requestLayout()/invalidate() 是 Java 方法，照常调用。
  *
- * 本文件同时提供函数式导出 renderMathAsync（QuickJS+MathJax 原生 SVG→位图），用于
- * NativeSvgBackend（批量/缓存位图显示，适配 list 回收；见 sdk/backends/nativeSvgBackend.uts）。
- * MTMathView（NativeMathView）保留作单条原生矢量兜底。
+ * 注：nativeSvg 后端（QuickJS + MathJax → AndroidSVG 位图，原 renderMathAsync 的真实实现）
+ * 在当前分支为 WIP，其依赖 com.caverock:androidsvg 在标准基座下无法解析（Maven 拉取失败）。
+ * 已暂时移除该实现，下方 renderMathAsync 为占位：返回 error，由 MathRendererCore 自动兜底
+ * 回 proxyWebBackend（默认后端，不受影响）。待 nativeSvg 依赖修复后再恢复真实实现。
  */
 export class NativeMathView {
 	$element: UniNativeViewElement
 	private view: MTMathView | null = null
 
 	constructor(element: UniNativeViewElement) {
+		// iOS（Swift）两段初始化禁止 super.init 前对 self 调方法；Android 无此限制，可抽 bindView。
 		this.$element = element
 		this.bindView()
 	}
@@ -103,225 +86,12 @@ export class NativeMathView {
 	}
 }
 
-// ===========================================================================
-// 原生 SVG 渲染（QuickJS + MathJax tex-svg → AndroidSVG 位图）
-// ===========================================================================
-
-/** 自包含 MathJax bundle 在 APK assets 里的路径（uni-app x 把 uni_modules/<m>/static/
- *  镜像到 apps/__UNI__8BF05E4/www/uni_modules/<m>/static/）。appid 取自 manifest.json。 */
-const MATHJAX_BUNDLE_ASSET_PATH: string =
-	"apps/__UNI__8BF05E4/www/uni_modules/nuwax-uni-math/static/x-math/mathjax-tex-svg.js"
-
-/** QuickJS 内存上限（字节）：防病态/超长 LaTeX 在 JS 侧爆堆拖垮进程。
- *  MathJax bundle 本身 + 正常渲染远低于此；超限会抛异常被捕获→回退 proxy。 */
-const QUICKJS_MEMORY_LIMIT: number = 256 * 1024 * 1024
-/** QuickJS 栈上限（字节）。 */
-const QUICKJS_STACK_LIMIT: number = 1024 * 1024
-/** 位图最长边像素上限：等比 clamp，防超宽/病态公式产生超大位图 → OOM。
- *  1600px × ARGB_8888 ≈ 10MB/张上限，缓存可控。 */
-const BITMAP_MAX_DIM: Int = 1600
-/** 8 CSS px/ex ÷ 442 MathJax units/ex；仅用于兼容旧/异常 bundle 的尺寸兜底。 */
-const MATHJAX_VIEWBOX_TO_PX: Float = 0.0180995475.toFloat()
-
 /**
- * QuickJS 单例引擎：context 常驻（避免每次 114ms 的 bundle load + init）。
+ * 原生 SVG 渲染（QuickJS + MathJax tex-svg → AndroidSVG 位图）占位。
  *
- * 线程模型（关键）：QuickJS 单 context 非线程安全，且 context 须在「创建它的线程」上使用。
- * 故本引擎持一个 {@link Executors#newSingleThreadExecutor}，所有 QuickJS eval + rasterize
- * 都经它串行执行 → 同一线程创建并使用 context，且天然串行（无需依赖 uni-app x 命名 dispatcher
- * 的线程模型，那个无法从源码确认）。渲染结果由调用方切回主线程回调。
- */
-class MathSvgEngine {
-	executor: ExecutorService = Executors.newSingleThreadExecutor()!
-	private ctx: QuickJSContext | null = null
-	private renderFn: JSFunction | null = null
-	loaded: boolean = false
-	loadError: string = ""
-
-	/**
-	 * 首次渲染时加载 native lib + 建 context + eval bundle。
-	 * 必须在 executor 的单线程上调用（由 renderSvg 保证）→ 与 context 创建线程一致，无并发。
-	 */
-	private ensureLoaded(): void {
-		if (this.loaded) {
-			return
-		}
-		this.loaded = true
-		let context: QuickJSContext | null = null
-		try {
-			QuickJSLoader.init()
-			context = QuickJSContext.create()
-			context.setMemoryLimit(QUICKJS_MEMORY_LIMIT.toInt())
-			context.setMaxStackSize(QUICKJS_STACK_LIMIT.toInt())
-			// 把 QuickJS 内 console.* 转发到 logcat（调试 bundle 加载 / 渲染异常用）
-			QuickJSLoader.initConsoleLog(context)
-			const bundle = readMathjaxBundle()
-			if (bundle.length == 0) {
-				this.loadError = "bundle_empty:" + MATHJAX_BUNDLE_ASSET_PATH
-				console.error("[MATHSVG] engine load fail: bundle_empty")
-				context.destroy()
-				return
-			}
-			// belt-and-suspenders：MathJax bundle 已用 --define:PACKAGE_VERSION 跳过 node require 分支，
-			// 仍预置 require/dirname/module 存根，兜底 esbuild CJS shim 里 eval("require") 的探测。
-			const stub =
-				"var require=function(){return{}};var __dirname='/';var module={exports:{}};var global=globalThis;"
-			context.evaluate(stub + bundle, "mathjax-tex-svg.js")
-			this.renderFn = context.getGlobalObject().getJSFunction("renderLatexToSvg")
-			this.ctx = context
-		} catch (e: Exception) {
-			this.loadError = "load_failed:" + e.toString()
-			console.error("[MATHSVG] engine load fail: " + this.loadError)
-			// 半途失败：销毁已建的 context，避免持有损坏的 context
-			if (context != null) {
-				context.destroy()
-			}
-		}
-	}
-
-	/** 调 bundle 的 renderLatexToSvg(latex, display) → SVG 字符串；失败返回空串。
-	 *  须在 executor 单线程上调用（首次调用同线程触发 ensureLoaded）。 */
-	renderSvg(latex: string, display: boolean): string {
-		this.ensureLoaded()
-		const fn = this.renderFn
-		if (fn == null) {
-			console.error("[MATHSVG] renderSvg fn=null loadError=" + this.loadError)
-			return ""
-		}
-		try {
-			const svgObj = fn.call(latex, display)
-			if (svgObj == null) {
-				console.warn("[MATHSVG] renderSvg returned empty result")
-				return ""
-			}
-			const svgStr = `${svgObj}`
-			return svgStr
-		} catch (e: Exception) {
-			console.error("[MATHSVG] renderSvg throw: " + e.toString())
-			return ""
-		}
-	}
-}
-
-/** 模块级单例（eager：只建 executor，不加载 QuickJS；首次渲染时在 executor 线程懒加载）。 */
-const engine: MathSvgEngine = new MathSvgEngine()
-
-/** 从 APK assets 读 MathJax bundle 为字符串（1.78MB，行拼接 + \n，JS 忽略多余空白）。
- *  finally 关闭 reader（含底层 InputStream），异常路径不泄漏 fd。 */
-function readMathjaxBundle(): string {
-	const appCtx = UTSAndroid.getAppContext()
-	if (appCtx == null) {
-		return ""
-	}
-	let reader: BufferedReader | null = null
-	try {
-		const input = appCtx.getAssets().open(MATHJAX_BUNDLE_ASSET_PATH)
-		reader = new BufferedReader(new InputStreamReader(input, "UTF-8"))
-		const sb = new StringBuffer()
-		let line = reader.readLine()
-		while (line != null) {
-			sb.append(line)
-			sb.append("\n")
-			line = reader.readLine()
-		}
-		return sb.toString()
-	} finally {
-		if (reader != null) {
-			reader.close()
-		}
-	}
-}
-
-/**
- * SVG → 高清位图（AndroidSVG rasterize）。
- *  - bundle 已把 MathJax 根 SVG 的 ex 尺寸换成 CSS px；viewBox 只保留作矢量坐标系。
- *  - MathJax 用 currentColor 填充，AndroidSVG 无 CSS 上下文 → 替换为显式颜色（支持主题）。
- *  - 按 CSS 尺寸 × dpiScale 算目标并等比 clamp 到 BITMAP_MAX_DIM，
- *    最后 renderToCanvas 让 AndroidSVG 矢量缩放（清晰，非位图拉伸）。
- *  - 全程 int 维度，规避 UTS float→number 转换坑；finally recycle 位图 + 关流。
- *  返回 UTSJSONObject { imageDataURL, width, height, svg } 或 { error }。
- *
- *  位图格式用 WebP（显示用）：编码比 PNG 快数倍、体积约 1/3，Q92 对屏幕渲染文字足够；
- *  导出走 svg 矢量（无损），不受影响。若真机 <image> 不支持 WebP dataURL，把
- *  Bitmap.CompressFormat.WEBP 改 PNG 即可。
- */
-function rasterizeSvg(svg: string, dpiScale: number, color: string): UTSJSONObject {
-	const result = new UTSJSONObject()
-	let bmp: Bitmap | null = null
-	let baos: ByteArrayOutputStream | null = null
-	try {
-		const svgColored = svg.split("currentColor").join(color)
-		const svgObj = SVG.getFromString(svgColored)
-		const vbox = svgObj.getDocumentViewBox()
-		let logicalWidth = svgObj.getDocumentWidth()
-		let logicalHeight = svgObj.getDocumentHeight()
-		// 新 bundle 把根节点 ex 显式归一为 px，AndroidSVG 可直接读出 CSS 尺寸。
-		// 旧缓存/bundle 兜底才从 viewBox 数学坐标按 442 units/ex 换算，绝不能直接当 px。
-		if ((logicalWidth <= 0 || logicalHeight <= 0) && vbox != null) {
-			logicalWidth = vbox.width() * MATHJAX_VIEWBOX_TO_PX
-			logicalHeight = vbox.height() * MATHJAX_VIEWBOX_TO_PX
-		}
-		if (logicalWidth <= 0 || logicalHeight <= 0) {
-			result["error"] = "rasterize_zero_size"
-			return result
-		}
-		// 位图尺寸 = CSS 显示尺寸 × dpiScale；短公式不再无意义地撞到 1600px 上限。
-		let targetW = (logicalWidth * dpiScale + 0.5).toInt()
-		let targetH = (logicalHeight * dpiScale + 0.5).toInt()
-		if (targetW > BITMAP_MAX_DIM) {
-			targetH = targetH * BITMAP_MAX_DIM / targetW
-			targetW = BITMAP_MAX_DIM
-		}
-		if (targetH > BITMAP_MAX_DIM) {
-			targetW = targetW * BITMAP_MAX_DIM / targetH
-			targetH = BITMAP_MAX_DIM
-		}
-		if (targetW < 1) {
-			targetW = 1
-		}
-		if (targetH < 1) {
-			targetH = 1
-		}
-		// ★ 关键修复：renderToPicture(targetW, targetH) 在本机 AndroidSVG 版本只裁剪 viewBox 左上角，
-		//   不缩放内容（natW=12431 → targetW=1600 只露 13% 宽度，恰好是公式左侧空白 → 位图全透明）。
-		//   改法：先把 documentWidth/Height 重置为目标尺寸，再 renderToCanvas 直接画到位图，
-		//   AndroidSVG 会按 document 尺寸等比缩放 viewBox 内容填满目标位图。
-		svgObj.setDocumentWidth(targetW.toFloat())
-		svgObj.setDocumentHeight(targetH.toFloat())
-		bmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
-		const canvas = new Canvas(bmp)
-		svgObj.renderToCanvas(canvas)
-		baos = new ByteArrayOutputStream()
-		bmp.compress(Bitmap.CompressFormat.WEBP, 92, baos)
-		const b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-		result["imageDataURL"] = "data:image/webp;base64," + b64
-		// 返回 CSS 1x 尺寸；位图 clamp 只限制内存，不改变布局宽高和宽高比。
-		const logicalW = (logicalWidth + 0.5).toInt()
-		const logicalH = (logicalHeight + 0.5).toInt()
-		result["width"] = logicalW
-		result["height"] = logicalH
-		result["svg"] = svg
-	} catch (e: Exception) {
-		result["error"] = "rasterize_failed:" + e.toString()
-	} finally {
-		if (bmp != null) {
-			bmp.recycle()
-		}
-		if (baos != null) {
-			baos.close()
-		}
-	}
-	return result
-}
-
-/**
- * 原生渲染一条公式 → 异步回调 UTSJSONObject { imageDataURL, width, height, svg } 或 { error }。
- *
- * 在 engine.executor 的单线程上串行执行 QuickJS eval（~3ms）+ rasterize（~数 ms），
- * 完成后 onResult 在该工作线程触发；调用方（NativeSvgBackend）负责切回主线程。
- * 失败（bundle 缺失 / 渲染异常 / 超内存）回 { error }，由 Core 兜底回 proxy。
- *
- * dpiScale 位图高清倍数（2~3），color 填充色（如 "#1A1A1A"）。
+ * nativeSvg 后端在当前分支 WIP 不可用（com.caverock:androidsvg Maven 依赖无法解析）。
+ * 占位返回 { error }，调用方（nativeSvgBackend → MathRendererCore）会自动兜底回
+ * proxyWebBackend。签名保持不变，待依赖修复后恢复真实实现即可，无需改调用方。
  */
 export function renderMathAsync(
 	latex: string,
@@ -330,29 +100,7 @@ export function renderMathAsync(
 	color: string,
 	onResult: (res: UTSJSONObject) => void,
 ): void {
-	engine.executor.execute((): void => {
-		let res: UTSJSONObject = new UTSJSONObject()
-		try {
-			const svg = engine.renderSvg(latex, display)
-			if (engine.loadError.length > 0) {
-				res["error"] = engine.loadError
-			} else if (svg.length == 0) {
-				res["error"] = "render_empty"
-			} else {
-				res = rasterizeSvg(svg, dpiScale, color)
-			}
-		} catch (e: Exception) {
-			res["error"] = "render_failed:" + e.toString()
-		}
-		const errField = res["error"]
-		if (errField != null) {
-			console.warn(
-				"[MATHSVG] renderMathAsync FAIL latex=" +
-					latex.substring(0, 24) +
-					" err=" +
-					`${errField}`,
-			)
-		}
-		onResult(res)
-	})
+	const res = new UTSJSONObject()
+	res["error"] = "nativesvg_disabled_wip"
+	onResult(res)
 }

@@ -1,0 +1,423 @@
+import { ref, type Ref } from "vue";
+
+/**
+ * VirtualScrollEngine —— uni-app x 通用动态高度虚拟滚动引擎（纯逻辑层，无平台 API 依赖）。
+ *
+ * 与组件层（virtual-scroll-x.uvue）的职责划分：
+ *  - 引擎：高度模型（估算 + 实测）、前缀和 offsets、二分定位、窗口平移（overscan + fling 迟滞）、
+ *    视口上方纠偏累计、prepend 补偿、stickToBottom / forceInclude。
+ *  - 组件：scroll-view 交互、spacer 渲染、实测（各平台差异化）、纠偏/补偿写 scroll-top 命令。
+ *
+ * 关键设计（对比固定高度入门方案）：
+ *  1. 动态高度：每条 key 独立高度，未实测用 estimateFn 估算，实测后回填，误差通过
+ *     pendingCorrection（视口上方）在滚动空闲时无感纠偏收敛。
+ *  2. 高度可变：`invalidate(key)` 标记重测（think 展开、图片加载完成、消息编辑等场景），
+ *     解决"已实测项内容变化后 spacer 漂移"问题。
+ *  3. overscan / 迟滞均为视口高度倍数，不随分辨率/折叠屏失真。
+ *  4. setItems 指纹短路（长度 + 首末 key）：流式场景每帧替换数组引用不触发 O(n) 重建。
+ *
+ * UTS 约束：不用可选链赋值；watch getter 显式返回类型；先声明后引用。
+ */
+
+export type VSXKeyOf = (item: any, index: number) => string;
+export type VSXEstimate = (item: any, index: number) => number;
+
+export class VirtualScrollEngine {
+  private keyOfFn: VSXKeyOf;
+  private estimateFn: VSXEstimate;
+
+  /** overscan：视口上下额外渲染的缓冲（视口高度倍数） */
+  overscanScreens: number = 1.5;
+  /** fling 迟滞：窗口边界收缩阈值（视口高度倍数），防快速滚动 mount/unmount 抖动 */
+  hysteresisScreens: number = 0.5;
+  /** 极小列表阈值：估算总高 < 该屏数则全量渲染（等价未虚拟化） */
+  smallListScreens: number = 2;
+  /** 纠偏应用阈值：|delta| < 该值忽略（防微抖） */
+  minCorrectPx: number = 4;
+  /** 单条估算高度上限（防单条估算过大导致窗口过窄） */
+  estimateCapPx: number = 6000;
+
+  /** 流式/聊天跟底：true 时末条恒在切片内（补丁可直达 + scroll-into-view 跟底） */
+  stickToBottom: boolean = false;
+
+  private items: any[] = [] as any[];
+  /** key → 当前已知高度（实测优先，否则估算） */
+  private heights: Map<string, number> = new Map<string, number>();
+  /** 已实测 key 集合（区分实测与估算；invalidate 从此移除触发重测） */
+  private measured: Set<string> = new Set<string>();
+  /** 前缀和：offsets[i] = 前 i 条总高，offsets[n] = 总高 */
+  private offsets: number[] = [0] as number[];
+  /** 数据指纹：`${n}:${firstKey}:${lastKey}`，setItems 短路用 */
+  private lastFingerprint: string = "";
+
+  /** 窗口起止（含 overscan），半开 [winStart, winEnd[ */
+  winStart: Ref<number> = ref<number>(0);
+  winEnd: Ref<number> = ref<number>(0);
+  /** 实际渲染切片 == items.slice(winStart, winEnd) */
+  visibleSlice: Ref<any[]> = ref<any[]>([] as any[]);
+  /** 顶/底占位高度（视口外总高） */
+  topSpacerPx: Ref<number> = ref<number>(0);
+  bottomSpacerPx: Ref<number> = ref<number>(0);
+  /** 虚拟滚动总开关（A/B 对比、降级用） */
+  enabled: Ref<boolean> = ref<boolean>(true);
+
+  /** 视口上方未消费的高度修正（实测 - 估算），滚动空闲时由组件写 scroll-top 纠偏 */
+  private pendingCorrection: number = 0;
+  private lastScrollTop: number = 0;
+  private viewportH: number = 0;
+  /** 上次窗口上/下边界 offset，fling 迟滞用 */
+  private lastTopBoundaryPx: number = 0;
+  private lastBottomBoundaryPx: number = 0;
+  /** forceInclude 单条 key（scrollToKey 目标，确保挂载后再 scroll-into-view） */
+  private forceIncludeKey: string = "";
+
+  constructor(keyOfFn: VSXKeyOf, estimateFn: VSXEstimate) {
+    this.keyOfFn = keyOfFn;
+    this.estimateFn = estimateFn;
+  }
+
+  // ==================== 高度模型 ====================
+
+  /** 取第 index 条当前已知高度（实测优先 → 估算，惰性写入 heights） */
+  private heightOf(index: number): number {
+    if (index < 0 || index >= this.items.length) return 0;
+    const item = this.items[index];
+    const key = this.keyOfFn(item, index);
+    const cached = this.heights.get(key);
+    if (cached != null) return cached as number;
+    let est = this.estimateFn(item, index);
+    if (est > this.estimateCapPx) est = this.estimateCapPx;
+    if (est <= 0) est = 1;
+    this.heights.set(key, est);
+    return est;
+  }
+
+  /** 重建前缀和 offsets（O(n)；数据/高度变化时调用） */
+  private rebuildOffsets(): void {
+    const n = this.items.length;
+    const offsets = [] as number[];
+    let acc = 0;
+    for (let i = 0; i < n; i++) {
+      offsets.push(acc);
+      acc += this.heightOf(i);
+    }
+    offsets.push(acc);
+    this.offsets = offsets;
+  }
+
+  /** 二分：找最小的 i 使 offsets[i+1] > target */
+  private findIndexAtOffset(target: number): number {
+    const offsets = this.offsets;
+    const itemCount = offsets.length - 1;
+    if (itemCount <= 0) return 0;
+    if (target <= 0) return 0;
+    let lo = 0;
+    let hi = itemCount - 1;
+    while (lo < hi) {
+      const mid = lo + Math.floor((hi - lo) / 2);
+      if (offsets[mid + 1] > target) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return lo;
+  }
+
+  // ==================== 数据入口 ====================
+
+  /**
+   * 全量数据替换。指纹（长度 + 首/末 key）不变则仅更新引用跳过重建——
+   * 流式每帧替换数组引用的场景靠它避免 O(n) 重算风暴；中间项内容变更用 invalidate(key)。
+   */
+  setItems(items: any[]): void {
+    const n = items.length;
+    let fp = "0";
+    if (n > 0) {
+      fp = `${n}:${this.keyOfFn(items[0], 0)}:${this.keyOfFn(items[n - 1], n - 1)}`;
+    }
+    if (fp == this.lastFingerprint && this.offsets.length == n + 1) {
+      this.items = items;
+      return;
+    }
+    this.lastFingerprint = fp;
+    this.items = items;
+    if (n == 0) {
+      this.resetWindow();
+      return;
+    }
+    this.rebuildOffsets();
+    this.recomputeWindow(this.lastScrollTop);
+  }
+
+  /**
+   * 顶部 prepend 补偿（聊天加载历史）：估算前 count 条总高，内部平移 lastScrollTop
+   * 并按新位置重算窗口，返回 insertedPx 供组件写 scroll-top 命令。
+   * 调用前请确保 props.items 已更新（组件内会先同步一次 setItems）。
+   */
+  onItemsPrepended(count: number): number {
+    if (count <= 0) return 0;
+    const n = this.items.length;
+    if (n == 0) return 0;
+    const c = count > n ? n : count;
+    let px = 0;
+    for (let i = 0; i < c; i++) {
+      px += this.heightOf(i);
+    }
+    this.lastScrollTop += px;
+    this.recomputeWindow(this.lastScrollTop);
+    return px;
+  }
+
+  /** 全量重置（会话切换 / 组件复用时调用，清高度缓存防跨数据膨胀） */
+  reset(): void {
+    this.items = [] as any[];
+    this.heights.clear();
+    this.measured.clear();
+    this.offsets = [0] as number[];
+    this.lastFingerprint = "";
+    this.pendingCorrection = 0;
+    this.lastScrollTop = 0;
+    this.forceIncludeKey = "";
+    this.resetWindow();
+  }
+
+  /** 清高度缓存但保留数据（估算模型更换后用） */
+  clearHeights(): void {
+    this.heights.clear();
+    this.measured.clear();
+    this.rebuildOffsets();
+    this.recomputeWindow(this.lastScrollTop);
+  }
+
+  private resetWindow(): void {
+    this.winStart.value = 0;
+    this.winEnd.value = 0;
+    this.visibleSlice.value = [] as any[];
+    this.topSpacerPx.value = 0;
+    this.bottomSpacerPx.value = 0;
+    this.lastTopBoundaryPx = 0;
+    this.lastBottomBoundaryPx = 0;
+  }
+
+  // ==================== 窗口计算 ====================
+
+  /**
+   * 根据 scrollTop 重算窗口 [winStart, winEnd[ 与 spacers。
+   * overscan/迟滞均为视口高度倍数；enabled=false 或极小列表 → 全量渲染。
+   */
+  private recomputeWindow(scrollTop: number): void {
+    const n = this.items.length;
+    if (n == 0) {
+      this.resetWindow();
+      return;
+    }
+    const totalH = this.offsets[n];
+    const vp = this.viewportH > 0 ? this.viewportH : 600;
+
+    // 关闭虚拟化 / 极小列表：全量渲染，spacer=0
+    if (this.enabled.value != true || totalH < vp * this.smallListScreens) {
+      const changed = this.winStart.value != 0 || this.winEnd.value != n || this.visibleSlice.value.length != n;
+      this.winStart.value = 0;
+      this.winEnd.value = n;
+      if (changed) {
+        this.visibleSlice.value = this.items.slice(0, n);
+      }
+      this.topSpacerPx.value = 0;
+      this.bottomSpacerPx.value = 0;
+      this.lastTopBoundaryPx = 0;
+      this.lastBottomBoundaryPx = totalH;
+      return;
+    }
+
+    const overscanPx = vp * this.overscanScreens;
+    const hysteresisPx = vp * this.hysteresisScreens;
+
+    const upper = scrollTop - overscanPx;
+    const lower = scrollTop + vp + overscanPx;
+    let start = this.findIndexAtOffset(upper > 0 ? upper : 0);
+    let end = this.findIndexAtOffset(lower) + 1;
+    if (end > n) end = n;
+    if (start < 0) start = 0;
+    if (end < start + 1) end = start + 1;
+
+    // fling 迟滞：边界仅在超出旧边界 hysteresisPx 时才收缩，减少快速滚动抖动
+    const newTopBoundaryPx = this.offsets[start];
+    const newBottomBoundaryPx = this.offsets[end];
+    if (this.lastBottomBoundaryPx - newBottomBoundaryPx < hysteresisPx) {
+      const keepEnd = this.findIndexAtOffset(this.lastBottomBoundaryPx) + 1;
+      if (keepEnd > end) end = keepEnd;
+      if (end > n) end = n;
+    }
+    if (newTopBoundaryPx - this.lastTopBoundaryPx < hysteresisPx) {
+      const keepStart = this.findIndexAtOffset(this.lastTopBoundaryPx);
+      if (keepStart < start) start = keepStart;
+      if (start < 0) start = 0;
+    }
+
+    // 流式跟底：末条恒在切片内
+    if (this.stickToBottom && end < n) end = n;
+
+    // forceInclude 单条（scrollToKey 目标，确保挂载后再 scroll-into-view）
+    if (this.forceIncludeKey.length > 0) {
+      for (let i = start; i < end; i++) {
+        if (this.keyOfFn(this.items[i], i) == this.forceIncludeKey) {
+          this.forceIncludeKey = "";
+          break;
+        }
+      }
+      if (this.forceIncludeKey.length > 0) {
+        for (let i = 0; i < n; i++) {
+          if (this.keyOfFn(this.items[i], i) == this.forceIncludeKey) {
+            if (i < start) start = i;
+            if (i + 1 > end) end = i + 1;
+            break;
+          }
+        }
+        this.forceIncludeKey = "";
+      }
+    }
+
+    const sliceChanged = start != this.winStart.value || end != this.winEnd.value;
+    this.winStart.value = start;
+    this.winEnd.value = end;
+    if (sliceChanged) {
+      this.visibleSlice.value = this.items.slice(start, end);
+    }
+    this.topSpacerPx.value = this.offsets[start];
+    this.bottomSpacerPx.value = this.offsets[n] - this.offsets[end];
+    this.lastTopBoundaryPx = this.offsets[start];
+    this.lastBottomBoundaryPx = this.offsets[end];
+  }
+
+  /** 配置变更后刷新窗口（overscanScreens 等运行时可调） */
+  refreshWindow(): void {
+    this.recomputeWindow(this.lastScrollTop);
+  }
+
+  // ==================== 滚动 ====================
+
+  /**
+   * @scroll 处理：记录 scrollTop/viewportH 并平移窗口。
+   * @returns 窗口是否变化（组件据此决定是否调度实测）
+   */
+  onScroll(scrollTop: number, viewportH: number): boolean {
+    this.lastScrollTop = scrollTop;
+    if (viewportH > 0) this.viewportH = viewportH;
+    const prevStart = this.winStart.value;
+    const prevEnd = this.winEnd.value;
+    this.recomputeWindow(scrollTop);
+    return this.winStart.value != prevStart || this.winEnd.value != prevEnd;
+  }
+
+  // ==================== 实测 ====================
+
+  isMeasured(key: string): boolean {
+    return this.measured.has(key);
+  }
+
+  /** 窗口内是否存在未实测项（组件据此决定是否重试实测） */
+  hasUnmeasuredInWindow(): boolean {
+    const start = this.winStart.value;
+    const end = this.winEnd.value;
+    const n = this.items.length;
+    for (let i = start; i < end && i < n; i++) {
+      const item = this.items[i];
+      if (item == null) continue;
+      if (this.measured.has(this.keyOfFn(item, i)) != true) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 批量实测回填（组件一次窗口扫描后调用，单次 rebuildOffsets）。
+   * index < winStart（视口上方）的高度差累计进 pendingCorrection，滚动空闲时无感纠偏。
+   */
+  onItemsMeasured(keys: string[], realHeights: number[], indexes: number[]): void {
+    if (keys.length == 0) return;
+    let anyDelta = false;
+    for (let k = 0; k < keys.length; k++) {
+      const realH = realHeights[k];
+      if (realH <= 0) continue; // 未布局完，下轮重试
+      const index = indexes[k];
+      if (index < 0 || index >= this.items.length) continue;
+      const item = this.items[index];
+      if (item == null) continue;
+      const key = this.keyOfFn(item, index);
+      if (key != keys[k]) continue; // 数据已换，丢弃过期测量
+      const prev = this.heights.get(key);
+      const prevH = prev != null ? (prev as number) : this.estimateFn(item, index);
+      this.heights.set(key, realH);
+      this.measured.add(key);
+      const delta = realH - prevH;
+      if (delta != 0) {
+        anyDelta = true;
+        if (index < this.winStart.value) {
+          this.pendingCorrection += delta;
+        }
+      }
+    }
+    if (anyDelta) {
+      this.rebuildOffsets();
+      this.recomputeWindow(this.lastScrollTop);
+    }
+  }
+
+  /**
+   * 标记某 key 需重测（think 展开/收起、图片加载完成、内容编辑等导致的高度变化）。
+   * 组件随后调度一次窗口实测即收敛。
+   */
+  invalidate(key: string): void {
+    if (key.length == 0) return;
+    const tmp = this.measured;
+    if (tmp.has(key)) tmp.delete(key);
+  }
+
+  /** 全量标记重测（字体加载完成、主题/字号切换等全局高度变化） */
+  invalidateAll(): void {
+    this.measured.clear();
+  }
+
+  /**
+   * 取出视口上方累计纠偏量（调用即清零）。
+   * 组件在滚动空闲（touchend / 静默超时）时调用并写 scroll-top；|delta| < minCorrectPx 返回 0。
+   */
+  takePendingCorrection(): number {
+    const d = this.pendingCorrection;
+    this.pendingCorrection = 0;
+    if (Math.abs(d) < this.minCorrectPx) return 0;
+    return d;
+  }
+
+  // ==================== 编程式滚动辅助 ====================
+
+  /** 强制将某 key 项纳入切片（scrollToKey 前调用，确保 scroll-into-view 目标已挂载） */
+  forceInclude(key: string): void {
+    if (key.length == 0) return;
+    this.forceIncludeKey = key;
+    this.recomputeWindow(this.lastScrollTop);
+  }
+
+  applyStickToBottom(b: boolean): void {
+    if (this.stickToBottom == b) return;
+    this.stickToBottom = b;
+    this.recomputeWindow(this.lastScrollTop);
+  }
+
+  setEnabled(b: boolean): void {
+    if (this.enabled.value == b) return;
+    this.enabled.value = b;
+    this.recomputeWindow(this.lastScrollTop);
+  }
+
+  // ==================== 调试 ====================
+
+  snapshotDebug(): string {
+    const n = this.items.length;
+    const totalH = this.offsets.length > 0 ? this.offsets[this.offsets.length - 1] : 0;
+    return `[VSX] n=${n} win=[${this.winStart.value},${this.winEnd.value}] ` +
+      `top=${this.topSpacerPx.value} bottom=${this.bottomSpacerPx.value} ` +
+      `total=${totalH} measured=${this.measured.size} pending=${this.pendingCorrection} ` +
+      `scrollTop=${this.lastScrollTop} vp=${this.viewportH} enabled=${this.enabled.value}`;
+  }
+}

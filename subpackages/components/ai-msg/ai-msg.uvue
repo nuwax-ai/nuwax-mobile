@@ -440,6 +440,10 @@
   const STREAM_MD_STRUCT_INTERVAL_BASE_MS: number = 280;
   let streamMdParseTimer: number = 0;
   let streamMdParsePending: boolean = false;
+  /** 历史消息延迟解析定时器（错峰分批，避免首屏 N 条同时全量解析打满主线程） */
+  let historyParseDeferredTimer: number = 0;
+  /** 已解析标记：延迟到期前为 false，防止 watch 多次触发重复延迟 */
+  let historyParseDone: boolean = false;
 
   function clearStreamMdParseTimer(): void {
     if (streamMdParseTimer != 0) {
@@ -875,11 +879,36 @@
 
   function runBodyMarkdownParseNow(forceDone: boolean): void {
     clearStreamMdParseTimer();
-    // App：始终立即 parse。磁盘缓存命中可直接出图，不必再等 proxyWeb（历史长公式页可省约 1s）；
-    // 未命中公式由 flushMathJobs 在 proxy 就绪后再截图，占位过渡即可。
-    // 注意：parser.applyAppFallback / bumpRevision 已会抬 streamRevision，此处勿再 bump，
-    // 避免一次 parse 触发 2～3 次整树失效。
     markdownParser.runMarkdownParse(forceDone);
+  }
+
+  /**
+   * 历史消息延迟分批解析。
+   * 用 messageId 末位字符算确定性偏移（0~7 × 16ms ≈ 0~112ms），
+   * 使同屏多条历史的解析自然分散到不同帧，而非同一帧全部全量解析。
+   * requestAnimationFrame 让出当前帧，让 loading 动画/流式 chunk 有机会渲染。
+   */
+  function scheduleHistoryParseDeferred(): void {
+    if (historyParseDone == true) return;
+    if (historyParseDeferredTimer != 0) return; // 已排程
+    let tailDigit = 0;
+    const rawId = props.messageId;
+    const idStr = rawId != null ? `${rawId}` : "";
+    if (idStr.length > 0) {
+      const lastChar = idStr.charCodeAt(idStr.length - 1);
+      if (lastChar != null) {
+        tailDigit = (lastChar as number) % 8; // 0~7
+      }
+    }
+    const delay = tailDigit * 16;
+    requestAnimationFrame((): void => {
+      historyParseDeferredTimer = setTimeout((): void => {
+        historyParseDeferredTimer = 0;
+        if (historyParseDone == true) return;
+        historyParseDone = true;
+        runBodyMarkdownParseNow(true);
+      }, delay) as number;
+    });
   }
 
   /** 合并高频 chunk 后解析：intervalMs 合并窗内多次调用只解析一次 */
@@ -943,6 +972,15 @@
         clearStreamMdParseTimer();
         // 公式流已经持续维护冻结前缀；终态只补最终 live 尾段，避免长正文再做一次 full fallback。
         markdownParser.finalizeStructuralStream();
+        return;
+      }
+      // 非末条历史消息：延迟分批解析，避免首屏 N 条历史同时全量解析打满主线程。
+      // 已解析的历史消息不再重复 parse（watch 因 body/state 抖动多次触发时直接跳过，
+      // 避免 8 条消息被 parse 59 次的重复开销）。
+      if (isLastMsg.value != true) {
+        if (historyParseDone != true) {
+          scheduleHistoryParseDeferred();
+        }
         return;
       }
       runBodyMarkdownParseNow(true);
@@ -1399,6 +1437,10 @@
     clearStreamMdParseTimer();
     clearPlainStreamFinalizeFrame();
     clearCodeStreamFinalizeFrame();
+    if (historyParseDeferredTimer != 0) {
+      clearTimeout(historyParseDeferredTimer);
+      historyParseDeferredTimer = 0;
+    }
     if (thinkTextThrottleTimer != null) {
       clearTimeout(thinkTextThrottleTimer!);
       thinkTextThrottleTimer = null;

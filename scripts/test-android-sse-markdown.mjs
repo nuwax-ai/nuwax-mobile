@@ -1479,6 +1479,18 @@ test("快速通道已接入 ai-msg、SSE cadence 与滚动分流", () => {
   assert.match(scroll, /contentMayRelayout/);
 });
 
+test("纯文本快通道忽略重复目标和迟到的旧前缀", () => {
+  const aiMsg = readFileSync(
+    new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),
+    "utf8",
+  );
+  assert.match(aiMsg, /body == plainStreamAuthoritativeBody/);
+  assert.match(
+    aiMsg,
+    /body\.length < plainStreamAuthoritativeBody\.length[\s\S]*?plainStreamAuthoritativeBody\.indexOf\(body\) == 0/,
+  );
+});
+
 test("快速通道结束时先同步累计正文再执行 Markdown 定稿", () => {
   const aiMsg = readFileSync(
     new URL("../subpackages/components/ai-msg/ai-msg.uvue", import.meta.url),

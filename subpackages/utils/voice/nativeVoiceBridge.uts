@@ -1,0 +1,409 @@
+/**
+ * App web-view 内嵌页原生语音桥（H5 侧）。
+ *
+ * 当 H5 页面被 App 端 web-view 内嵌（isAppWebView=true）时，录音（ASR）与语音播报（TTS）
+ * 不走 H5 内部 getUserMedia / WebSocket 方案，而是通过 uni.webView.postMessage 把指令
+ * 发给 App 原生侧执行，原生结果再经 evalJS 注入的全局回调回传：
+ *
+ *   H5 → 原生：{type:'record', action:'start'|'stop'}
+ *              {type:'tts',   action:'begin'|'feed'|'stop'|'speak'|'setMuted', ...}
+ *   原生 → H5：window.__onNativeRecordStart()
+ *              window.__onNativeRecordStop({success, text, error})
+ *              window.__onNativeRecordError({message})
+ *              window.__onNativeTtsState({state:'speaking'|'end'|'error', messageId, message})
+ *
+ * 参见 docs「webview-录音走原生方案」（share sk=9c550ca9c9aa46018d9fe5e2816934c9）：
+ * JSSDK 约定 uni.webView.postMessage 的内容必须写在 data 字段内；
+ * 原生 @message 收到的 event.detail.data 是消息数组。
+ */
+
+export type NativeTtsBridgeState = "speaking" | "end" | "error"
+
+/** 原生录音开始回调 */
+export type NativeRecordStartHandler = () => void
+/** 原生录音结束回调（success=false 时 error 携带原因） */
+export type NativeRecordStopHandler = (
+  success: boolean,
+  text: string,
+  error: string,
+) => void
+/** 原生录音失败回调 */
+export type NativeRecordErrorHandler = (message: string) => void
+/** 原生 TTS 状态回调 */
+export type NativeTtsStateHandler = (
+  state: NativeTtsBridgeState,
+  messageId: string,
+  message: string,
+) => void
+
+class NativeTtsListenerEntry {
+  id: number
+  callback: NativeTtsStateHandler
+
+  constructor(id: number, callback: NativeTtsStateHandler) {
+    this.id = id
+    this.callback = callback
+  }
+}
+
+class NativeVoiceBridge {
+  /** 是否已启用（chat-conversation-component 在 isAppWebView=true 时 setup） */
+  private enabled: boolean = false
+  /** 全局回调是否已注册（幂等） */
+  private globalsRegistered: boolean = false
+  /** 是否已尝试注入 uni.webview JSSDK（幂等） */
+  private jssdkInjected: boolean = false
+
+  /** 录音回调（由 voice-recorder-button 注入） */
+  private onRecordStartHandler: NativeRecordStartHandler | null = null
+  private onRecordStopHandler: NativeRecordStopHandler | null = null
+  private onRecordErrorHandler: NativeRecordErrorHandler | null = null
+
+  /** TTS 镜像状态：原生播报是否进行中 / 所属 messageId */
+  private ttsBusy: boolean = false
+  private ttsMessageId: string = ""
+  /** TTS 状态订阅（msg-tool-bar 等刷新播报 UI 用） */
+  private ttsListeners: NativeTtsListenerEntry[] = []
+  private nextTtsListenerId: number = 1
+  /** JSSDK 未就绪时待补发的消息队列 / 刷新定时器 / 重试计数 */
+  private pendingPosts: UTSJSONObject[] = []
+  private postFlushTimer: number = 0
+  private postAttempts: number = 0
+  private static readonly POST_MAX_ATTEMPTS: number = 25
+
+  isActive(): boolean {
+    return this.enabled
+  }
+
+  /** 启用桥并注册全局回调；仅 App web-view 内嵌页调用（幂等） */
+  setup(): void {
+    if (this.enabled == true) {
+      return
+    }
+    this.enabled = true
+    this.injectJssdk()
+    this.registerGlobals()
+  }
+
+  // ==================== 录音 ====================
+
+  /** 通知原生开始录音；录制完成（含上传转写）经 __onNativeRecordStop 回传转写文本 */
+  startRecord(): void {
+    this.post({
+      "type": "record",
+      "action": "start",
+    } as UTSJSONObject)
+  }
+
+  /**
+   * 通知原生停止录音。
+   * 始终下发：轻触/取消（markDiscarded）与正常松手都会走到这里；
+   * 原生侧用 recordingActive 守卫「未 start 不 stop」，并处理「stop 先于授权完成」的竞态。
+   */
+  stopRecord(): void {
+    this.post({
+      "type": "record",
+      "action": "stop",
+    } as UTSJSONObject)
+  }
+
+  /** 作废本轮录音（轻触/取消）：当前为无操作占位，保留给调用方统一语义 */
+  resetRecordSession(): void {
+    // no-op
+  }
+
+  /** 注入录音结果回调（voice-recorder-button 挂载时调用；重复注入覆盖） */
+  setRecordHandlers(
+    onStart: NativeRecordStartHandler | null,
+    onStop: NativeRecordStopHandler | null,
+    onError: NativeRecordErrorHandler | null,
+  ): void {
+    this.onRecordStartHandler = onStart
+    this.onRecordStopHandler = onStop
+    this.onRecordErrorHandler = onError
+  }
+
+  // ==================== TTS ====================
+
+  /** 开启一轮流式播报（对应当前 H5 侧 ensureHeadlessStreamSpeak 的 begin） */
+  ttsBegin(messageId: string, settings: UTSJSONObject | null): void {
+    this.ttsBusy = true
+    this.ttsMessageId = messageId
+    const payload = {
+      "type": "tts",
+      "action": "begin",
+      "messageId": messageId,
+    } as UTSJSONObject
+    if (settings != null) {
+      payload["settings"] = settings
+    }
+    this.post(payload)
+  }
+
+  /** 喂入累计文本（finished=true 表示本轮流式输出结束，原生冲刷尾句） */
+  ttsFeed(messageId: string, text: string, finished: boolean): void {
+    this.post({
+      "type": "tts",
+      "action": "feed",
+      "messageId": messageId,
+      "text": text,
+      "finished": finished,
+    } as UTSJSONObject)
+  }
+
+  /** 工具栏单条播报：一次喂入整段文本（原生侧走 speakPrepared 分句播报） */
+  ttsSpeak(messageId: string, text: string, settings: UTSJSONObject | null): void {
+    this.ttsBusy = true
+    this.ttsMessageId = messageId
+    const payload = {
+      "type": "tts",
+      "action": "speak",
+      "messageId": messageId,
+      "text": text,
+    } as UTSJSONObject
+    if (settings != null) {
+      payload["settings"] = settings
+    }
+    this.post(payload)
+  }
+
+  /** 硬停止当前播报（原生侧幂等） */
+  ttsStop(): void {
+    this.ttsBusy = false
+    this.ttsMessageId = ""
+    this.post({
+      "type": "tts",
+      "action": "stop",
+    } as UTSJSONObject)
+  }
+
+  /** 全局静音切换（原生侧 setMuted，幂等） */
+  setMuted(muted: boolean): void {
+    this.post({
+      "type": "tts",
+      "action": "setMuted",
+      "muted": muted,
+    } as UTSJSONObject)
+  }
+
+  /** 原生播报是否进行中（镜像状态，由 __onNativeTtsState 驱动） */
+  isTtsBusy(): boolean {
+    return this.ttsBusy
+  }
+
+  getTtsMessageId(): string {
+    return this.ttsMessageId
+  }
+
+  /** 订阅原生 TTS 状态变化（注册后立即回调一次当前状态） */
+  subscribeTts(callback: NativeTtsStateHandler): number {
+    const id = this.nextTtsListenerId
+    this.nextTtsListenerId += 1
+    this.ttsListeners.push(new NativeTtsListenerEntry(id, callback))
+    const state: NativeTtsBridgeState = this.ttsBusy ? "speaking" : "end"
+    callback(state, this.ttsMessageId, "")
+    return id
+  }
+
+  unsubscribeTts(listenerId: number): void {
+    this.ttsListeners = this.ttsListeners.filter(
+      (entry: NativeTtsListenerEntry): boolean => entry.id != listenerId,
+    )
+  }
+
+  // ==================== 内部 ====================
+
+  /** H5 → 原生：uni.webView.postMessage（内容须放在 data 字段，见 JSSDK 约定） */
+  private post(payload: UTSJSONObject): void {
+    if (this.enabled != true) {
+      return
+    }
+    if (this.tryPost(payload) != true) {
+      // JSSDK 尚未就绪（原生侧 evalJS 注入的脚本可能仍在加载）：入队稍后补发
+      this.pendingPosts.push(payload)
+      this.schedulePostFlush()
+    } else {
+      // 补发成功：清掉积压队列
+      this.pendingPosts = []
+      this.postAttempts = 0
+    }
+  }
+
+  /** 单次发送；返回是否真正发出 */
+  private tryPost(payload: UTSJSONObject): boolean {
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null) {
+        return false
+      }
+      const uniGlobal = w.uni
+      if (
+        uniGlobal == null ||
+        uniGlobal.webView == null ||
+        uniGlobal.webView.postMessage == null
+      ) {
+        // JSSDK 尚未就绪：再尝试注入一次（原生侧 evalJS 也会注入，双保险）
+        this.injectJssdk()
+        return false
+      }
+      uniGlobal.webView.postMessage({ "data": payload })
+      return true
+    } catch (e) {
+      console.warn("[native-voice] postMessage failed", e)
+      return false
+    }
+    // #endif
+    // 非 H5 平台（App / 小程序）：桥不启用，视为未发出
+    return false
+  }
+
+  /** 定时补发积压消息（JSSDK 加载完成后自动排空；上限后丢弃，避免无限重试） */
+  private schedulePostFlush(): void {
+    if (this.postFlushTimer != 0) {
+      return
+    }
+    this.postFlushTimer = setTimeout((): void => {
+      this.postFlushTimer = 0
+      if (this.postAttempts >= NativeVoiceBridge.POST_MAX_ATTEMPTS) {
+        this.pendingPosts = []
+        this.postAttempts = 0
+        return
+      }
+      this.postAttempts += 1
+      const pending = this.pendingPosts
+      this.pendingPosts = []
+      for (let i = 0; i < pending.length; i++) {
+        this.post(pending[i])
+      }
+    }, 200) as number
+  }
+
+  /**
+   * 确保 uni.webview.1.5.5.js 已注入到当前文档（幂等）。
+   * 脚本随 H5 构建发布在 static/ 下（相对路径 ./static/... 按文档 base 解析，
+   * 部署在 /m/ 或根路径都能命中），不依赖线上 nginx 根 /static/ 目录。
+   */
+  private injectJssdk(): void {
+    if (this.jssdkInjected == true) {
+      return
+    }
+    this.jssdkInjected = true
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null || w.document == null || w.document.head == null) {
+        return
+      }
+      if (w.uni != null && w.uni.webView != null) {
+        return
+      }
+      const script = w.document.createElement("script")
+      script.src = "./static/uni.webview.1.5.5.js"
+      w.document.head.appendChild(script)
+    } catch (e) {
+      console.warn("[native-voice] inject jssdk failed", e)
+    }
+    // #endif
+  }
+
+  /** 注册原生 evalJS 回传的全局回调（幂等） */
+  private registerGlobals(): void {
+    if (this.globalsRegistered == true) {
+      return
+    }
+    this.globalsRegistered = true
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null) {
+        return
+      }
+      w.__onNativeRecordStart = (): void => {
+        const h = this.onRecordStartHandler
+        if (h != null) {
+          h()
+        }
+      }
+      w.__onNativeRecordStop = (res: any): void => {
+        const h = this.onRecordStopHandler
+        if (h == null) {
+          return
+        }
+        let success = false
+        let text = ""
+        let error = ""
+        try {
+          if (res != null) {
+            success = res.success == true
+            text = res.text != null ? `${res.text}` : ""
+            error = res.error != null ? `${res.error}` : ""
+          }
+        } catch (_e) {
+          // ignore
+        }
+        h(success, text, error)
+      }
+      w.__onNativeRecordError = (err: any): void => {
+        const h = this.onRecordErrorHandler
+        if (h == null) {
+          return
+        }
+        let message = ""
+        try {
+          if (err != null) {
+            message =
+              err.message != null ? `${err.message}` : `${err}`
+          }
+        } catch (_e) {
+          message = `${err}`
+        }
+        h(message)
+      }
+      w.__onNativeTtsState = (res: any): void => {
+        let state: NativeTtsBridgeState = "end"
+        let messageId = ""
+        let message = ""
+        try {
+          if (res != null) {
+            const stateStr = `${res.state}`
+            if (stateStr == "speaking") {
+              state = "speaking"
+            } else if (stateStr == "error") {
+              state = "error"
+            } else {
+              state = "end"
+            }
+            messageId = res.messageId != null ? `${res.messageId}` : ""
+            message = res.message != null ? `${res.message}` : ""
+          }
+        } catch (_e) {
+          // ignore
+        }
+        if (state == "speaking") {
+          this.ttsBusy = true
+          if (messageId.length > 0) {
+            this.ttsMessageId = messageId
+          }
+        } else {
+          this.ttsBusy = false
+          this.ttsMessageId = ""
+        }
+        for (let i = 0; i < this.ttsListeners.length; i++) {
+          const entry = this.ttsListeners[i]
+          try {
+            entry.callback(state, messageId, message)
+          } catch (_eCb) {
+            // ignore
+          }
+        }
+      }
+    } catch (_e) {
+      // ignore
+    }
+    // #endif
+  }
+}
+
+/** 全局单例 */
+export const nativeVoiceBridge = new NativeVoiceBridge()

@@ -8,8 +8,8 @@
 	<web-view
 		id="agent-detail-webview"
 		class="w-full"
-		v-if="agentDetailWebUrl.length > 0"
 		:src="agentDetailWebUrl"
+		@load="handleWebViewLoad"
 	/>
 	<!-- #endif -->
 </template>
@@ -20,7 +20,7 @@
 	import { getCurrentPageFullPath } from '@/utils/common'
 	import { onAddToFavorites, onShow, onHide, onShareAppMessage } from '@dcloudio/uni-app'
 	// #ifdef APP
-	import { onLoad } from '@dcloudio/uni-app'
+	import { onLoad, onReady } from '@dcloudio/uni-app'
 	import { getApiBaseUrl } from '@/constants/config'
 	import { ACCESS_TOKEN } from '@/constants/home.constants'
 	// #endif
@@ -35,46 +35,78 @@
 	let appWebViewBridgeTimer: number = 0
 	let appWebViewBridgeAttempts: number = 0
 
+	/** 幂等注入脚本：ticket cookie + localStorage 的 ACCESS_TOKEN（H5 请求层走 uni storage）+ 内嵌标记方法 */
+	function buildBridgeCode(tokenLiteral: string): string {
+		return `try{document.cookie='ticket='+${tokenLiteral}+'; path=/';}catch(e){} try{localStorage.setItem('ACCESS_TOKEN',${tokenLiteral});}catch(e){} window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();`
+	}
+
 	/**
-	 * 向 H5 内嵌页注入登录态并标记「App web-view 内嵌」。
-	 * - 将 ACCESS_TOKEN 写入 H5 cookie 的 ticket 字段（H5 生产环境登录态约定，
-	 *   HTTP / SSE / 语音 WS 均由浏览器自动携带该 cookie 完成鉴权）
-	 * - 调用 H5 侧暴露的全局方法 window.__nuwaxSetAppEmbedded()，置 isAppWebView = true
-	 * H5 SPA 就绪前 evalJS 可能落在 about:blank 或方法未注册状态，故按固定周期
-	 * 轮询重试（脚本幂等，可重复执行，cookie 覆盖写无副作用）。
+	 * 单次注入（自动轮询 / 调试按钮共用）。
+	 * 返回 true 仅代表「拿到 ctx 且 evalJS 未抛异常」；是否真正生效取决于 webview 是否
+	 * 已加载到目标 H5 页且 __nuwaxSetAppEmbedded 已注册。
 	 */
-	function injectAppWebViewBridge(): void {
+	function injectBridgeOnce(): boolean {
 		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
 		if (tokenRaw == null) {
-			return
+			return false
 		}
 		const token = `${tokenRaw}`
 		if (token.length == 0) {
-			return
+			return false
 		}
 		// JSON.stringify 生成带引号的 JS 字符串字面量，任意 token 都能安全嵌入脚本
-		const tokenLiteral = JSON.stringify(token)
-		// 幂等脚本：ticket cookie + localStorage 的 ACCESS_TOKEN（H5 请求层走 uni storage）+ 内嵌标记方法
-		const code = `try{document.cookie='ticket='+${tokenLiteral}+'; path=/';}catch(e){} try{localStorage.setItem('ACCESS_TOKEN',${tokenLiteral});}catch(e){} window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();`
-		if (appWebViewBridgeTimer != 0) {
+		const code = buildBridgeCode(JSON.stringify(token))
+		// 官方示例传组件实例辅助平台绑定，避免创建 context 失败
+		const ctx = uni.createWebviewContext("agent-detail-webview", instance?.proxy)
+		if (ctx == null) {
+			return false
+		}
+		// Android 上加载中页面 evalJS 可能抛异常，必须 try-catch 保护轮询回调
+		try {
+			ctx.evalJS(code)
+		} catch (e) {
+			console.error("[webview-inject] evalJS 异常:", `${e}`)
+			return false
+		}
+		return true
+	}
+
+	/**
+	 * 启动 web-view 桥注入并标记「App web-view 内嵌」。
+	 * 仅在 web-view 已挂载且 URL 已生成后调用（onReady / @load），且幂等可重入：
+	 * - @load 表示 webview 已到达目标 H5 origin，此时写 cookie / localStorage 才真正生效
+	 *   （加载中页面按 origin 隔离，写入会随导航丢失，Android 上极易踩）
+	 * - H5 SPA 的 __nuwaxSetAppEmbedded 注册可能晚于文档 load 事件，故轮询窗口放宽到
+	 *   30s；脚本幂等可重复执行，每次 onReady / @load 触发只是重开窗口。
+	 */
+	function startAppWebViewBridge(): void {
+		// URL 尚未生成（onLoad 未执行 / 无 id 参数）时不启动
+		if (agentDetailWebUrl.value.length == 0) {
 			return
+		}
+		// 幂等重启：onReady / @load 可重复触发，只重开轮询窗口
+		if (appWebViewBridgeTimer != 0) {
+			clearInterval(appWebViewBridgeTimer)
+			appWebViewBridgeTimer = 0
 		}
 		appWebViewBridgeAttempts = 0
 		appWebViewBridgeTimer = setInterval((): void => {
-			const ctx = uni.createWebviewContext("agent-detail-webview")
-			if (ctx != null) {
-				ctx.evalJS(code)
-			}
 			appWebViewBridgeAttempts++
-			if (appWebViewBridgeAttempts >= 40) {
+			injectBridgeOnce()
+			// Android 冷启动 + 弱网下 H5 SPA 就绪可能 >10s；@load 每次加载完成会重开窗口，此上限仅兜底
+			if (appWebViewBridgeAttempts >= 120) {
 				clearInterval(appWebViewBridgeTimer)
 				appWebViewBridgeTimer = 0
 			}
 		}, 250) as number
 	}
 
+	/** webview 加载完成（已处于目标 H5 origin）：重开一轮注入，cookie/localStorage 此时才真正落在目标域名 */
+	function handleWebViewLoad(_event: UniWebViewLoadEvent): void {
+		startAppWebViewBridge()
+	}
+
 	onLoad((options: any) => {
-		injectAppWebViewBridge()
 		const optionsObj = options as UTSJSONObject
 		const idRaw = optionsObj["id"]
 		const convRaw = optionsObj["conversationId"]
@@ -88,6 +120,11 @@
 			webUrl = `${webUrl}&conversationId=${conversationId}`
 		}
 		agentDetailWebUrl.value = webUrl
+	})
+
+	onReady(() => {
+		// 首帧渲染完成：web-view 已挂载且 URL 已生成（onLoad 已同步赋值），开始注入
+		startAppWebViewBridge()
 	})
 	// #endif
 

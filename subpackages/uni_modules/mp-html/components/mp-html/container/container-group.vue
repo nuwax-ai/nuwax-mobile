@@ -1,5 +1,13 @@
 <template>
-  <view class="markdown-custom-process-group">
+  <!--
+    主路径：groupMarkdownContainers 已把 OpenUI 留在组外，本组件只渲普通工具。
+    兜底：历史正文若仍把 OpenUI 包进 group，且 processCount=0，跳过折叠壳，
+    避免 group-content 折叠态把原位 openui-card 藏死。
+  -->
+  <view v-if="processCount == 0" class="openui-loose-group">
+    <slot />
+  </view>
+  <view v-else class="markdown-custom-process-group">
     <view class="group-header" @tap="toggleExpanded">
       <view class="header-left">
         <text class="group-title">{{
@@ -16,7 +24,10 @@
         ></text>
       </view>
     </view>
-    <view class="group-content" :class="{ 'is-expanded': isExpanded }">
+    <view
+      class="group-content"
+      :class="{ 'is-expanded': isExpanded, 'has-openui': hasOpenUiChild }"
+    >
       <slot />
     </view>
   </view>
@@ -25,6 +36,7 @@
 <script>
   import { t } from "@/utils/i18n";
   import { getProcessingDataByPriority } from "./utils";
+  import { isOpenUiRenderToolName } from "@/utils/openUiSchema.uts";
 
   export default {
     name: "MarkdownContainerGroup",
@@ -52,7 +64,7 @@
     computed: {
       processCount() {
         // 与 markdown-container 渲染一致：先按 executeId 从 processingList 取最终数据，
-        // 再排除 container.vue 中不会展示的 Event 类型，避免标题数量和展开项不一致。
+        // 再排除 Event 与 OpenUI（后者走 openui-card，不计普通工具数）。
         return (this.childs || []).filter((n) => {
           if (!(
             n.name === "container" || n.name === "markdown-custom-process"
@@ -60,8 +72,28 @@
             return false;
           }
           const data = this.getRenderData(n);
-          return data?.type !== "Event";
+          if (data?.type === "Event") {
+            // OpenUI renderUI 可能仍带 Event type，但由 openui-card 展示，不计入工具数
+            return false;
+          }
+          const name = `${data?.name || ""}`;
+          if (isOpenUiRenderToolName(name)) {
+            return false;
+          }
+          return true;
         }).length;
+      },
+      /** 组内是否仍含 OpenUI（历史正文可能已包进 group） */
+      hasOpenUiChild() {
+        return (this.childs || []).some((n) => {
+          if (
+            !(n.name === "container" || n.name === "markdown-custom-process")
+          ) {
+            return false;
+          }
+          const data = this.getRenderData(n);
+          return isOpenUiRenderToolName(`${data?.name || ""}`);
+        });
       },
     },
     methods: {
@@ -104,8 +136,21 @@
       autoCollapse: {
         immediate: true,
         handler(value) {
+          // 组内有 OpenUI 时禁止折叠，否则 openui-card 会被 opacity:0 藏住
+          if (this.hasOpenUiChild) {
+            this.isExpanded = true;
+            return;
+          }
           if (`${value}`.toLowerCase() === "true") {
             this.isExpanded = false;
+          }
+        },
+      },
+      hasOpenUiChild: {
+        immediate: true,
+        handler(v) {
+          if (v) {
+            this.isExpanded = true;
           }
         },
       },
@@ -114,6 +159,10 @@
 </script>
 
 <style lang="scss" scoped>
+  .openui-loose-group {
+    width: 100%;
+  }
+
   .markdown-custom-process-group {
     margin: 16rpx 0;
     border-radius: 12rpx;
@@ -181,6 +230,12 @@
         padding: 12rpx 24rpx;
         border-top-width: 1rpx;
         opacity: 1;
+      }
+
+      /* 含 OpenUI 时放开高度，避免多卡被 500rpx 裁切 */
+      &.is-expanded.has-openui {
+        max-height: none;
+        overflow: visible;
       }
     }
   }

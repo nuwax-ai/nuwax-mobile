@@ -1,5 +1,8 @@
 <template>
-  <view v-if="toolCall?.type !== 'Event'" class="tool-call-status">
+  <view
+    v-if="toolCall?.type !== 'Event' && !isOpenUiTool"
+    class="tool-call-status"
+  >
     <!-- Plan 类型：直接显示任务列表 -->
     <template v-if="isPlanType">
       <!-- Plan 头部信息 -->
@@ -153,6 +156,7 @@
     getFileDiffLines,
   } from "@/utils/fileChangeDiff.uts";
   import DiffContentView from "@/components/diff-list-view/components/diff-content-view/diff-content-view.uvue";
+  import { isOpenUiRenderToolName } from "@/utils/openUiSchema.uts";
 
   export default {
     name: "Container",
@@ -176,6 +180,15 @@
       };
     },
     computed: {
+      /**
+       * OpenUI 渲染工具由 node 层 openui-card 承载，此处不展示普通工具条
+       *（对齐 tool-call-card.isVisible）。
+       */
+      isOpenUiTool() {
+        const name = `${this.toolCall?.name || ""}`;
+        return isOpenUiRenderToolName(name);
+      },
+
       // 判断是否为 Plan 类型
       isPlanType() {
         return (

@@ -170,6 +170,8 @@
   const activeTab = ref<string>("recent");
   const activeTabIndex = computed((): number => activeTab.value == "history" ? 1 : 0);
   const refreshing = ref<boolean>(false);
+  const NORMAL_PAGE_SIZE = 20;
+  const SILENT_HEAD_SIZE = 10;
 
   // ============================================================
   // 最近使用（agent-list-content 逻辑移植）
@@ -319,6 +321,50 @@
     }
   }
 
+  /** 将静默查询到的头部数据置顶，并保留之前已经加载的分页数据。 */
+  function mergeRecentAgentHead(incoming: AgentListItem[]): void {
+    const current = recentAgentList.value != null ? recentAgentList.value : ([] as AgentListItem[]);
+    const merged = [] as AgentListItem[];
+
+    for (let i = 0; i < incoming.length; i++) {
+      const source = incoming[i];
+      let target: AgentListItem | null = null;
+      for (let j = 0; j < current.length; j++) {
+        if (current[j].agentId == source.agentId) {
+          target = current[j];
+          break;
+        }
+      }
+      if (target != null) {
+        updateRecentAgentItem(target, source);
+      } else {
+        target = source;
+      }
+
+      let duplicated = false;
+      for (let k = 0; k < merged.length; k++) {
+        if (merged[k].agentId == target.agentId) {
+          duplicated = true;
+          break;
+        }
+      }
+      if (!duplicated) merged.push(target);
+    }
+
+    for (let i = 0; i < current.length; i++) {
+      const candidate = current[i];
+      let duplicated = false;
+      for (let j = 0; j < merged.length; j++) {
+        if (merged[j].agentId == candidate.agentId) {
+          duplicated = true;
+          break;
+        }
+      }
+      if (!duplicated) merged.push(candidate);
+    }
+    recentAgentList.value = merged;
+  }
+
   function toRecentPayload(info: AgentListItem): UTSJSONObject {
     const obj = new UTSJSONObject();
     obj["id"] = info.id;
@@ -336,7 +382,7 @@
 
   async function fetchUserUsedAgentList(
     page: number = 1,
-    pageSize: number = 20,
+    pageSize: number = NORMAL_PAGE_SIZE,
   ): Promise<any> {
     // 正常加载请求优先于静默刷新；用于丢弃并发静默请求的过期响应。
     recentRequestGeneration = recentRequestGeneration + 1;
@@ -498,7 +544,7 @@
     recentLoading.value = true;
     await initTenantConfig();
     if (props.isLoggedIn) {
-      await fetchUserUsedAgentList(1, 20 * currentPage.value);
+      await fetchUserUsedAgentList(1, NORMAL_PAGE_SIZE);
     } else {
       await fetchPublishedAgentList();
     }
@@ -641,17 +687,16 @@
     return !convLoading.value && !convHasMore.value && clLen > 8;
   });
 
-  /** 静默刷新“最近使用”已加载窗口，不改变分页深度与滚动位置。 */
+  /** 静默查询“最近使用”头部 10 条，置顶去重且保留已加载分页数据。 */
   async function silentFetchRecentList(): Promise<void> {
-    if (!pageVisible.value || recentLoading.value || recentSilentRequestPending) return;
+    if (!pageVisible.value || recentAgentList.value.length == 0 || recentLoading.value || recentSilentRequestPending) return;
     recentSilentRequestPending = true;
     const requestGeneration = recentRequestGeneration;
     try {
       if (props.isLoggedIn) {
         const params = new ListParams();
-        const loadedSize = Math.max(20, currentPage.value * 20, recentAgentList.value.length);
         params.pageIndex = 1;
-        params.size = loadedSize;
+        params.size = SILENT_HEAD_SIZE;
         const res = await apiUserUsedAgentList(params);
         const code = apiResCode(res);
         const dataRaw = apiResData<any>(res);
@@ -662,15 +707,15 @@
           for (let j = 0; j < rawList.length; j++) {
             newList.push(mapToAgentListItem(rawList[j] as UTSJSONObject, false));
           }
-          reconcileRecentAgentList(newList);
-          // 静默刷新只更新已加载窗口，不根据返回条数覆盖正常分页得出的 hasMore。
+          mergeRecentAgentHead(newList);
+          // 静默响应可能少于 10 条，不能据此判断是否还有下一页，也不改分页游标。
         }
       } else {
         const params = new SquarePublishedListParams();
         params.targetType = "Agent";
         params.targetSubType = "ChatBot";
         params.page = 1;
-        params.pageSize = 10;
+        params.pageSize = SILENT_HEAD_SIZE;
         params.category = "";
         params.kw = "";
         const res = await apiPublishedAgentList(params);
@@ -684,7 +729,7 @@
           for (let i = 0; i < records.length; i++) {
             newList.push(mapToAgentListItem(records[i] as UTSJSONObject, true));
           }
-          reconcileRecentAgentList(newList);
+          mergeRecentAgentHead(newList);
         }
       }
     } catch (error) {
@@ -695,28 +740,54 @@
     }
   }
 
-  /** 静默刷新会话列表已加载窗口（如执行中状态），保留末尾游标。 */
+  /** 将会话头部增量置顶去重，保留原列表尾部及其分页游标。 */
+  function mergeConversationHead(incoming: UTSJSONObject[]): void {
+    const current = conversationList.value != null ? conversationList.value : ([] as UTSJSONObject[]);
+    const merged: UTSJSONObject[] = [];
+
+    for (let i = 0; i < incoming.length; i++) {
+      const candidate = incoming[i];
+      const candidateId = toNum(candidate["id"], 0);
+      let duplicated = false;
+      for (let j = 0; j < merged.length; j++) {
+        if (toNum(merged[j]["id"], 0) == candidateId) {
+          duplicated = true;
+          break;
+        }
+      }
+      if (!duplicated) merged.push(candidate);
+    }
+
+    for (let i = 0; i < current.length; i++) {
+      const candidate = current[i];
+      const candidateId = toNum(candidate["id"], 0);
+      let duplicated = false;
+      for (let j = 0; j < merged.length; j++) {
+        if (toNum(merged[j]["id"], 0) == candidateId) {
+          duplicated = true;
+          break;
+        }
+      }
+      if (!duplicated) merged.push(candidate);
+    }
+    conversationList.value = merged;
+  }
+
+  /** 静默查询会话头部 10 条，保留已加载列表、末尾游标和分页状态。 */
   async function silentFetchConversationList(): Promise<void> {
-    if (!props.isLoggedIn || conversationRequestPromise != null || conversationSilentRequestPending) return;
+    if (!props.isLoggedIn || conversationList.value.length == 0 || conversationRequestPromise != null || conversationSilentRequestPending) return;
     conversationSilentRequestPending = true;
     const requestGeneration = conversationRequestGeneration;
     try {
       const params = new ConversationListParams();
-      const loadedLimit = Math.max(20, conversationList.value.length);
       params.agentId = null;
       params.lastId = null;
-      params.limit = loadedLimit;
+      params.limit = SILENT_HEAD_SIZE;
       const res = await apiAgentConversationList(params);
       if (apiResCode(res) == SUCCESS_CODE && requestGeneration == conversationRequestGeneration) {
         const newList = normalizeList(apiResData<any>(res));
-        conversationList.value = newList;
-        convHasMore.value = newList.length >= loadedLimit;
-        if (newList.length > 0) {
-          const last = newList[newList.length - 1];
-          lastId.value = toNum(last["id"], 0);
-        } else {
-          lastId.value = null;
-        }
+        mergeConversationHead(newList);
+        // 静默响应可能少于 10 条，不能据此覆盖正常分页状态与末尾游标。
       }
     } catch (error) {
       console.error("silentFetchConversationList error:", error);
@@ -762,7 +833,7 @@
       const params = new ConversationListParams();
       params.agentId = null;
       params.lastId = isLoadMore ? lastId.value : null;
-      params.limit = 20;
+      params.limit = NORMAL_PAGE_SIZE;
       const res = await apiAgentConversationList(params);
       if (apiResCode(res) == SUCCESS_CODE) {
         const newList = normalizeList(apiResData<any>(res));
@@ -791,7 +862,8 @@
         if (newList.length > 0) {
           const last = newList[newList.length - 1];
           lastId.value = toNum(last["id"], 0);
-          convHasMore.value = newList.length >= 20;
+          // 接口可能返回不足 20 条但仍存在下一页，只有空页才能确认到底。
+          convHasMore.value = true;
         } else {
           convHasMore.value = false;
         }
@@ -984,7 +1056,7 @@
     currentPage.value = 1;
     recentHasMore.value = true;
     if (props.isLoggedIn) {
-      await fetchUserUsedAgentList(1, 20);
+      await fetchUserUsedAgentList(1, NORMAL_PAGE_SIZE);
     } else {
       await fetchPublishedAgentList();
     }
@@ -1107,7 +1179,7 @@
     currentPage.value = 1;
     recentHasMore.value = true;
     if (props.isLoggedIn) {
-      await fetchUserUsedAgentList(1, 20);
+      await fetchUserUsedAgentList(1, NORMAL_PAGE_SIZE);
     } else {
       await fetchPublishedAgentList();
     }
@@ -1157,8 +1229,17 @@
     }
     activeTab.value = tab;
     emit("tab-change", tab);
-    // 用户主动切换时刷新当前列表；后台静默更新统一由全局 batch 轮询事件驱动。
-    refreshCurrentTab();
+    // Tab 切换保留各自已加载的数据、分页游标和滚动位置，仅静默合并头部 10 条。
+    // 首次切到尚无数据的 Tab 时仍按正常首屏规格查询 20 条；若预热请求正在进行，
+    // 待请求结束后 refreshDrainTick 会自动补一次静默头部刷新。
+    queueActiveTabSilentRefresh();
+    if (activeTab.value == "recent") {
+      if (recentAgentList.value.length == 0 && !recentLoading.value) {
+        loadRecent();
+      }
+    } else if (conversationList.value.length == 0 && conversationRequestPromise == null) {
+      loadConversation();
+    }
   }
 
   function handleSwiperChange(e: UniSwiperChangeEvent): void {

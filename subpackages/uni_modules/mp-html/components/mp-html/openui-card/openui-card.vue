@@ -86,7 +86,7 @@
     align-items: center;
     width: 100%;
     min-height: 72rpx;
-    margin: 8rpx 0;
+    margin: 16rpx 0 0 0;
     padding: 10rpx 14rpx;
     border-radius: 10rpx;
     background-color: rgba(12, 20, 102, 0.045);

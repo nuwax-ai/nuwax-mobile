@@ -6,7 +6,7 @@
   <view
     v-if="!isEmptyMdBlockShell"
     :id="attrs.id"
-    :class="'_block _' + name + ' ' + attrs.class"
+    :class="['_block', '_' + name, attrs.class, isOpenUiOnlyMdP ? 'md-p--openui' : '']"
     :style="attrs.style"
   >
     <block v-for="(n, i) in childs" v-bind:key="i">
@@ -373,7 +373,7 @@
       <view
         v-else-if="n.c === 2 && !isChildEmptyBlockShell(n)"
         :id="n.attrs.id"
-        :class="'_block _' + n.name + ' ' + n.attrs.class"
+        :class="['_block', '_' + n.name, n.attrs.class, isChildOpenUiOnlyMdP(n) ? 'md-p--openui' : '']"
         :style="n.f + ';' + n.attrs.style"
       >
         <node
@@ -444,7 +444,8 @@
     isOpenUiProcessNode as resolveIsOpenUiProcessNode,
     openuiArtifactIdOfNode as resolveOpenuiArtifactId,
     openuiTitleOfNode as resolveOpenuiTitle,
-    isBlockShellEmpty as resolveIsBlockShellEmpty
+    isBlockShellEmpty as resolveIsBlockShellEmpty,
+    isOpenUiOnlyParagraph as resolveIsOpenUiOnlyParagraph
   } from '../openui/openui-node-helpers.js'
   export default {
     name: 'node',
@@ -526,6 +527,17 @@
        */
       isEmptyMdBlockShell () {
         return this.isBlockShellEmpty(this.name, this.childs)
+      },
+      /**
+       * 段落内仅有 OpenUI 卡：去掉 md-p 默认 1em 上下边距。
+       */
+      isOpenUiOnlyMdP () {
+        return resolveIsOpenUiOnlyParagraph(
+          this.name,
+          this.childs,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
       }
     },
     methods:{
@@ -562,6 +574,18 @@
           return false
         }
         return resolveIsBlockShellEmpty(
+          n.name,
+          n.children,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
+      },
+      /** c=2 子块是否为「仅 OpenUI」段落，与根 isOpenUiOnlyMdP 同规则。 */
+      isChildOpenUiOnlyMdP (n) {
+        if (n == null) {
+          return false
+        }
+        return resolveIsOpenUiOnlyParagraph(
           n.name,
           n.children,
           (attrs) => this.getRenderData(attrs),

@@ -3,7 +3,7 @@
 移动端 OpenUI 统一「**点击 → 全屏 webview**」展示（小程序 `<web-view>` 不能局部内嵌，
 故 inline/sidecar 一致处理）。web runtime 已具备移动端布局（横排→竖排），webview 加载即可。
 
-表单提交只读问题见 [openui-h5-submit-fix.md](./openui-h5-submit-fix.md)。
+表单提交只读问题见 [openui-h5-submit-form.md](./openui-h5-submit-form.md)。
 
 ## 当前产品渲染路径（重要）
 
@@ -30,7 +30,12 @@ App 会话详情通过 `agent-detail` 的 `<web-view>` **内嵌 H5 同页**；H5
 - `scripts/verify-openui-contract.mjs` — 契约校验：`node scripts/verify-openui-contract.mjs`。
 
 修改（渲染与数据）：
-- `utils/system.uts` — `openOpenUiArtifact(conversationId, artifactId, title)` → `file-preview-page`。
+- `utils/system.uts` — `openOpenUiArtifact` / `jumpToFilePreviewPage`；App 内嵌时走
+  `uni.webView.navigateTo`（注入的 uni.webview.js）开原生预览页。
+- `utils/pendingOpenUiAction.uts` — 暂存 + `consumeLatestPendingOpenUiAction`（原生壳回传用）。
+- `subpackages/pages/agent-detail/agent-detail.uvue` — onShow 消费 latest → evalJS
+  `__nuwaxOnOpenUiResume`。
+- `subpackages/pages/chat-conversation-component/...` — 注册 `__nuwaxOnOpenUiResume`。
 - `subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts` — PROCESSING 优先
   `normalizeRenderUiProcessingData`，按 `executeId` 合并执行态/完成态；历史回补 OpenUI ref。
 - `subpackages/components/ai-msg/ai-msg.uvue` — H5/MP 用 `<mp-html :processing-list :conversation-id>`。
@@ -72,26 +77,31 @@ SSE PROCESSING + subEventType=RENDER_UI
 ```
 H5 chat（agent-detail 内嵌 chat-conversation-component）
   → 点击 openui-card
-  → H5 navigateTo file-preview-page（仍在同一 H5 SPA / 同源 storage）
-  → iframe 加载 /static/file-preview.html?…&_ticket=… 或 ?sk=…&mode=preview
+  → jumpToFilePreviewPage：检测到 App 内嵌 → uni.webView.navigateTo（注入的 uni.webview.js）
+  → 原生新开 file-preview-page（与 H5 SPA 栈分离）
+  → web-view 加载 /static/file-preview.html?...&_ticket=... 或 ?sk=...&mode=preview
   → 用户提交表单
   → file-preview-openui.js：isChat → notifyParent({ type:'OPENUI_ACTION', event })
-  → H5 file-preview-page：window.message → parseOpenUiActionData → savePendingOpenUiAction(cid)
+  → 原生 file-preview-page：@message → parseOpenUiActionData → savePendingOpenUiAction(cid)
+     （同时写 pendingOpenUiAction:{cid} 与 pendingOpenUiAction:latest）
   → uni.navigateBack
-  → agent-detail.onShow → triggerResume → handlePendingOpenUiAction
-     （组件自身 onShow 也会再试一次；consume 读后删，幂等）
-  → handleSendMessage(续作文本) 发出用户消息
+  → 原生 agent-detail.onShow
+     → consumeLatestPendingOpenUiAction()
+     → evalJS(window.__nuwaxOnOpenUiResume(message))
+  → 内嵌 H5：__nuwaxOnOpenUiResume → handleSendMessage(续作文本)
 ```
 
 要点：
-- App 壳只负责加载 H5；**预览与回写都在 H5 内完成**，不跨原生/H5 storage。
+- **打开**走注入 JSSDK `uni.webView.navigateTo`，预览是原生页（有导航栏/返回），不是 web-view 内 H5 SPA 跳转。
+- **续作**跨原生/H5 storage：原生暂存 → onShow evalJS 注入；不依赖 URL 上 conversationId 是否仍准确（用 `latest` key）。
+- 纯浏览器 H5 / 小程序：仍 `uni.navigateTo` + 同 storage `consumePending`，行为不变。
 - 网关 `isChat = !!(_ticket || mode===preview)`：ticket 失败回退 `sk+mode=preview` 仍可提交。
 - 纯分享链接（仅顶层 `sk`、无 `mode=preview`）只读，不会 `notifyParent` OPENUI_ACTION。
 
 - **App / 小程序原生 web-view 预览**：`<web-view @message>` 接收网关 `notifyParent` / `uni.webView.postMessage`
 - **H5 iframe 预览**：`window.message` 接收 `parent.postMessage`（与网关 `notifyParent` 同源路径）
 - 会话内预览须带 `_ticket` 或 `mode=preview` 才允许提交；真分享链接 `?sk=` 见
-  [openui-h5-submit-fix.md](./openui-h5-submit-fix.md)
+  [openui-h5-submit-form.md](./openui-h5-submit-form.md)
 
 App/小程序/H5 均打开网关 `/static/file-preview.html`；该页面识别 `.openui.json` 后，
 在同源 iframe 中加载 `/static/openui-runtime/index.html` 并转发提交事件。
@@ -106,6 +116,7 @@ App/小程序/H5 均打开网关 `/static/file-preview.html`；该页面识别 `
    `.openui-card`；且同工具不应再出现普通工具条。
 4. `ai-msg` 传入的 `conversation-id` 非空（`mpHtmlConversationId`），否则点击会 toast
    「无法打开 OpenUI」。
+5. App 内嵌：点击卡片应新开**原生**预览页；表单提交返回后会话应自动发出续作消息。
 
 ## 校验
 

@@ -999,10 +999,13 @@ def generate_index_kt_stub() -> None:
     d.mkdir(parents=True, exist_ok=True)
     (d / "index.kt").write_text(
         f"package {pkg}\n\n"
-        f"// vapor: IndexKt 存根。运行时要本类存在（业务入口在字节码 app-service.js）。\n"
-        f"val __vapor_index_stub: Boolean = true\n"
+        f"import io.dcloud.uniapp.runtime.UniNativeApp\n\n"
+        f"// vapor: IndexKt 引导。业务入口在字节码 app-service.js（fnJS 加载），\n"
+        f"// 本 main 仅满足运行时反射查找 uni.<appid>.IndexKt.main(UniNativeApp)。\n"
+        f"fun main(app: UniNativeApp) {{\n"
+        f"}}\n"
     )
-    print(f"✓ 生成 {pkg}.index.kt 存根（IndexKt 引导用）")
+    print(f"✓ 生成 {pkg}.index.kt（IndexKt.main(UniNativeApp) 桥接）")
 
 
 def patch_gradle_properties() -> None:

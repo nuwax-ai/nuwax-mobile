@@ -1,5 +1,17 @@
 <template>
+	<!-- #ifndef APP -->
+	<!-- 非 App 端（H5 / 小程序）：原生渲染聊天会话组件 -->
 	<chat-conversation-component ref="chatConversationComponentRef" />
+	<!-- #endif -->
+	<!-- #ifdef APP -->
+	<!-- App 端：通过 web-view 内嵌 H5 同页（H5 侧渲染聊天组件），透传当前页 agentId / conversationId -->
+	<web-view
+		id="agent-detail-webview"
+		class="w-full"
+		v-if="agentDetailWebUrl.length > 0"
+		:src="agentDetailWebUrl"
+	/>
+	<!-- #endif -->
 </template>
 
 <script setup lang="uts">
@@ -7,9 +19,77 @@
 	import { ref, onUnmounted, getCurrentInstance, type ComponentPublicInstance } from 'vue'
 	import { getCurrentPageFullPath } from '@/utils/common'
 	import { onAddToFavorites, onShow, onHide, onShareAppMessage } from '@dcloudio/uni-app'
+	// #ifdef APP
+	import { onLoad } from '@dcloudio/uni-app'
+	import { getApiBaseUrl } from '@/constants/config'
+	import { ACCESS_TOKEN } from '@/constants/home.constants'
+	// #endif
 
 	const instance = getCurrentInstance()
 	const chatConversationComponentRef = ref<any | null>(null)
+
+	// #ifdef APP
+	/** App 端 web-view 加载的 H5 同页地址，形如 {API_BASE_URL}/m/#/subpackages/pages/agent-detail/agent-detail?id=xxx&conversationId=yyy */
+	const agentDetailWebUrl = ref<string>("")
+	/** web-view 桥注入轮询定时器 / 次数（setup 作用域 let，闭包捕获模块级变量避免 UTS 提升问题） */
+	let appWebViewBridgeTimer: number = 0
+	let appWebViewBridgeAttempts: number = 0
+
+	/**
+	 * 向 H5 内嵌页注入登录态并标记「App web-view 内嵌」。
+	 * - 将 ACCESS_TOKEN 写入 H5 cookie 的 ticket 字段（H5 生产环境登录态约定，
+	 *   HTTP / SSE / 语音 WS 均由浏览器自动携带该 cookie 完成鉴权）
+	 * - 调用 H5 侧暴露的全局方法 window.__nuwaxSetAppEmbedded()，置 isAppWebView = true
+	 * H5 SPA 就绪前 evalJS 可能落在 about:blank 或方法未注册状态，故按固定周期
+	 * 轮询重试（脚本幂等，可重复执行，cookie 覆盖写无副作用）。
+	 */
+	function injectAppWebViewBridge(): void {
+		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
+		if (tokenRaw == null) {
+			return
+		}
+		const token = `${tokenRaw}`
+		if (token.length == 0) {
+			return
+		}
+		// JSON.stringify 生成带引号的 JS 字符串字面量，任意 token 都能安全嵌入脚本
+		const tokenLiteral = JSON.stringify(token)
+		// 幂等脚本：ticket cookie + localStorage 的 ACCESS_TOKEN（H5 请求层走 uni storage）+ 内嵌标记方法
+		const code = `try{document.cookie='ticket='+${tokenLiteral}+'; path=/';}catch(e){} try{localStorage.setItem('ACCESS_TOKEN',${tokenLiteral});}catch(e){} window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();`
+		if (appWebViewBridgeTimer != 0) {
+			return
+		}
+		appWebViewBridgeAttempts = 0
+		appWebViewBridgeTimer = setInterval((): void => {
+			const ctx = uni.createWebviewContext("agent-detail-webview")
+			if (ctx != null) {
+				ctx.evalJS(code)
+			}
+			appWebViewBridgeAttempts++
+			if (appWebViewBridgeAttempts >= 40) {
+				clearInterval(appWebViewBridgeTimer)
+				appWebViewBridgeTimer = 0
+			}
+		}, 250) as number
+	}
+
+	onLoad((options: any) => {
+		injectAppWebViewBridge()
+		const optionsObj = options as UTSJSONObject
+		const idRaw = optionsObj["id"]
+		const convRaw = optionsObj["conversationId"]
+		const agentId = idRaw != null ? `${idRaw}` : ""
+		if (agentId.length == 0) {
+			return
+		}
+		let webUrl = `${getApiBaseUrl()}/m/#/subpackages/pages/agent-detail/agent-detail?id=${agentId}`
+		const conversationId = convRaw != null ? `${convRaw}` : ""
+		if (conversationId.length > 0) {
+			webUrl = `${webUrl}&conversationId=${conversationId}`
+		}
+		agentDetailWebUrl.value = webUrl
+	})
+	// #endif
 
 	/** Android：Gen* 组件禁止 as UTSJSONObject，用 $callMethod */
 	function callChatMethod(methodName: string): void {
@@ -48,6 +128,13 @@
 	})
 
 	onUnmounted(() => {
+		// #ifdef APP
+		// 离开页面即停止 web-view 桥注入轮询，避免对已销毁的 webview 继续 evalJS
+		if (appWebViewBridgeTimer != 0) {
+			clearInterval(appWebViewBridgeTimer)
+			appWebViewBridgeTimer = 0
+		}
+		// #endif
 		/**
 		 * 事件监听, 刷新首页，重新请求我的收藏数据
 		 * 智能体主页中点击收藏或取消收藏后，返回首页，需要刷新首页数据

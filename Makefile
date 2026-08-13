@@ -3,8 +3,8 @@
 .PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch app-resource android-tester android-release
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-# 蒸汽模式 vapor 需 5.21+，默认用 Alpha；稳定版可 HX_CLI=/Applications/HBuilderX.app/Contents/MacOS/cli 覆盖
-HX_CLI ?= /Applications/HBuilderX-Alpha.app/Contents/MacOS/cli
+# 蒸汽模式 vapor 需 5.21+，默认用稳定版 HBuilderX.app（5.23+ 即可，无需 Alpha）；Alpha 可 HX_CLI 覆盖
+HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
 
 help:
 	@echo "自定义基座 · 只生成包 → unpackage/debug/"

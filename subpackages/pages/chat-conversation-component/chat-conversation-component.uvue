@@ -532,12 +532,14 @@
   import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
   import { asrWebSocketClient } from "@/subpackages/utils/voice/asrWebSocketClient";
   import { speechSocketWarmup, CHAT_PAGE_LONG_HIDE_MS } from "@/subpackages/utils/voice/speechSocketWarmup";
+  import { nativeVoiceBridge } from "@/subpackages/utils/voice/nativeVoiceBridge";
   import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
   import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
   import {
     loadVoiceSettings,
     saveVoiceSettings,
     cloneVoiceSettings,
+    VoiceSettings,
   } from "@/subpackages/utils/voice/voiceTypes";
 
   // 类型定义
@@ -603,7 +605,7 @@
     TEMP_CHAT_KEY,
   } from "@/constants/common.constants";
   import docImage from "@/static/assets/doc_image.png";
-  import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
+  import { ACCESS_TOKEN, TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { getApiBaseUrl } from "@/constants/config";
 
   // ==================== API ====================
@@ -764,14 +766,82 @@
    */
   const isAppWebView = ref<boolean>(false);
   // #ifdef H5 || WEB
+  /**
+   * 幂等标记 App web-view 内嵌：置 isAppWebView + 启用原生语音桥。
+   * 录音（ASR）与语音播报（TTS）仅在此时走 App 原生侧；否则回退 H5 getUserMedia / WebSocket。
+   */
+  function markAppEmbedded(): void {
+    if (isAppWebView.value == true) {
+      return;
+    }
+    isAppWebView.value = true;
+    nativeVoiceBridge.setup();
+  }
+
+  /**
+   * 自检 App web-view 内嵌态：uni-app x 运行时会向 web-view 注入
+   * window.__uniapp_x_postMessage / __uniapp_x_ 全局（JSSDK 依赖它们收发消息），
+   * 页面只要在 App web-view 内即存在。App 端 evalJS 只在 @load 后 5s 窗口内轮询注入，
+   * 组件重挂载（新建会话 / 页面重进 / 会话切换）后 ref 会重置，若不恢复，
+   * 录音会静默回退到 H5 getUserMedia 弹浏览器权限框。故每次挂载自检一次。
+   */
+  function detectAppWebViewFromGlobals(): boolean {
+    try {
+      const w = window as any;
+      if (w.__uniapp_x_postMessage != null || w.__uniapp_x_ != null) {
+        return true;
+      }
+    } catch (_e) {
+      // ignore
+    }
+    return false;
+  }
+
+  /** 内嵌态持久化 key（sessionStorage：webview 单会话内跨重挂载存活） */
+  const APP_WEBVIEW_FLAG_KEY: string = "__nuwax_app_webview";
+
+  function readAppWebviewFlag(): boolean {
+    try {
+      const w = window as any;
+      if (w.sessionStorage == null) {
+        return false;
+      }
+      const value = w.sessionStorage.getItem(APP_WEBVIEW_FLAG_KEY);
+      return value == "1";
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function writeAppWebviewFlag(): void {
+    try {
+      const w = window as any;
+      if (w.sessionStorage != null) {
+        w.sessionStorage.setItem(APP_WEBVIEW_FLAG_KEY, "1");
+      }
+    } catch (_e) {
+      // ignore
+    }
+  }
+
+  // setup 自检：优先全局桥标记，其次 sessionStorage 持久化标记（幂等）
+  if (detectAppWebViewFromGlobals() == true || readAppWebviewFlag() == true) {
+    markAppEmbedded();
+    writeAppWebviewFlag();
+  }
+
   // 暴露给 App 端 evalJS 的全局方法：置 isAppWebView = true（幂等，可重复调用）
   ;(window as any).__nuwaxSetAppEmbedded = (): void => {
-    isAppWebView.value = true;
-
-    uni.showToast({
-      title: "App 端 web-view 内嵌",
-      icon: "success",
-    });
+    // 幂等：URL 参数透传与 App 端 evalJS 注入可能双触发，已内嵌则跳过，避免重复弹 toast
+    const wasEmbedded = isAppWebView.value == true;
+    markAppEmbedded();
+    writeAppWebviewFlag();
+    if (wasEmbedded == false) {
+      uni.showToast({
+        title: "App 端 web-view 内嵌",
+        icon: "success",
+      });
+    }
   };
   // #endif
   /** 关闭自动播报时为 true（持久化于 VoiceSettings.autoPlay） */
@@ -1403,17 +1473,39 @@
     }
   }
 
+  /** VoiceSettings → 桥接消息 settings 字段（App 原生侧据此构造 VoiceSettings） */
+  function voiceSettingsToBridgeJson(settings: VoiceSettings): UTSJSONObject {
+    const obj = {} as UTSJSONObject;
+    obj["autoPlay"] = settings.autoPlay;
+    obj["muted"] = settings.muted;
+    obj["includeThinkContent"] = settings.includeThinkContent;
+    obj["includeCodeBlocks"] = settings.includeCodeBlocks;
+    obj["includeLinkUrl"] = settings.includeLinkUrl;
+    obj["keepEmoji"] = settings.keepEmoji;
+    return obj;
+  }
+
+  /** 停止当前语音播报：App web-view 内嵌页走原生桥，其余走本地 TTS 栈 */
+  function stopCurrentSpeechPlayback(): void {
+    if (isAppWebView.value == true) {
+      nativeVoiceBridge.ttsStop();
+      return;
+    }
+    stopAllSpeechPlayback();
+  }
+
   /** 仅停播并清空喂入状态，不改 streamSpeakAllowed */
   function interruptStreamSpeakPlayback(): void {
     clearFeedSpeakTimer();
     headlessStreamSpeakId = "";
     feedSpeakBodyText = "";
     feedSpeakMsgId = "";
-    stopAllSpeechPlayback();
+    stopCurrentSpeechPlayback();
   }
 
   function stopAllStreamSpeech(hardStop: boolean): void {
     clearFeedSpeakTimer();
+    const speakMsgId = headlessStreamSpeakId;
     headlessStreamSpeakId = "";
     const tailBody = feedSpeakBodyText;
     feedSpeakBodyText = "";
@@ -1421,12 +1513,18 @@
     if (hardStop == true) {
       // 用户点停止 / 离页：禁止迟到 feed 再 begin
       streamSpeakAllowed = false;
-      stopAllSpeechPlayback();
+      stopCurrentSpeechPlayback();
     } else {
       // 正常结束：冲刷尾句，已入队音频继续播完
       const body =
         tailBody.length > 0 ? tailBody : assistantStreamText.value;
-      voiceStreamSpeaker.onStreamChunk(body, "", true);
+      if (isAppWebView.value == true) {
+        if (speakMsgId.length > 0 && body.length > 0) {
+          nativeVoiceBridge.ttsFeed(speakMsgId, body, true);
+        }
+      } else {
+        voiceStreamSpeaker.onStreamChunk(body, "", true);
+      }
     }
   }
 
@@ -1474,6 +1572,34 @@
       }
     }
     if (msgId.length == 0) {
+      return;
+    }
+    if (isAppWebView.value == true) {
+      // App web-view 内嵌页：播报走原生桥，busy 状态以原生回传镜像为准
+      const busy = nativeVoiceBridge.isTtsBusy();
+      const busyId = nativeVoiceBridge.getTtsMessageId();
+      // 本轮同消息已在播：只同步 tracking，禁止二次 begin
+      if (busy == true && busyId == msgId) {
+        headlessStreamSpeakId = msgId;
+        return;
+      }
+      if (busy != true && headlessStreamSpeakId == msgId) {
+        return;
+      }
+      // 续接 / 新流 / 工具栏旧播报：先停再播目标消息
+      nativeVoiceBridge.ttsStop();
+      headlessStreamSpeakId = msgId;
+      nativeVoiceBridge.ttsBegin(msgId, voiceSettingsToBridgeJson(settings));
+      // preferMsgId 已指定时：正文以 preferBody 为准（可空），禁止回落到上一条助手全文
+      let body = assistantStreamText.value;
+      if (preferMsgId.length > 0) {
+        body = preferBody;
+      } else if (preferBody.length > 0) {
+        body = preferBody;
+      }
+      if (body.length > 0) {
+        nativeVoiceBridge.ttsFeed(msgId, body, false);
+      }
       return;
     }
     const busy = voiceStreamSpeaker.isBusy() == true;
@@ -1530,6 +1656,11 @@
       return;
     }
     if (body.length == 0 && finished != true) {
+      return;
+    }
+    if (isAppWebView.value == true) {
+      // App web-view 内嵌页：正文喂原生侧 VoiceStreamSpeaker 播报
+      nativeVoiceBridge.ttsFeed(headlessStreamSpeakId, body, finished);
       return;
     }
     voiceStreamSpeaker.onStreamChunk(body, "", finished);
@@ -2187,7 +2318,7 @@
       // 只停播，保留 feed 快照，便于中途再打开时续播
       clearFeedSpeakTimer();
       headlessStreamSpeakId = "";
-      stopAllSpeechPlayback();
+      stopCurrentSpeechPlayback();
     } else if (isConversationActive.value == true) {
       // SSE 未结束：用当前流式正文立刻 begin（后续仍由 streamSpeakFeed 续喂）
       let msgId = streamingAssistantMessageId.value;
@@ -2667,7 +2798,11 @@
     } else if (data.isConversationActive.value == true) {
       // 流已断但会话态未清：只清态；若仍在播报则停（避免误伤「正常结束后的尾句播报」）
       data.isConversationActive.value = false;
-      if (voiceStreamSpeaker.isBusy() == true) {
+      const speechBusy =
+        isAppWebView.value == true
+          ? nativeVoiceBridge.isTtsBusy()
+          : voiceStreamSpeaker.isBusy() == true;
+      if (speechBusy == true) {
         stopAllStreamSpeech(true);
       }
     }
@@ -2837,6 +2972,30 @@
   const isPageHidden = pageResumeResult.isHidden;
 
   /**
+   * OpenUI 表单提交续作：从 file-preview-page 返回时，消费按 conversationId 暂存的一次性
+   * 续作消息，复用既有发送链路发出（与 pendingChatDraft 同一 storage-and-consume 模式）。
+   * 平台无关定义：consume 读后删（幂等），onShow / triggerResume 双触发亦无害。
+   *
+   * 内嵌 H5（App web-view 加载 /m/ 同页）场景：预览页与会话页同属 H5 SPA，
+   * storage 同源；返回时 agent-detail.onShow → triggerResume 与组件 onShow 都会走到此处。
+   */
+  const handlePendingOpenUiAction = (): void => {
+    const cid = data.conversationId.value;
+    if (cid == null) return;
+    const message = consumePendingOpenUiAction(cid);
+    if (message.length == 0) return;
+    const sendPayload: UTSJSONObject = {
+      messageInfo: message,
+      selectedComponents: data.selectedComponents.value,
+      modelId: data.currentModelId.value,
+      sandboxId: data.currentSandboxId.value,
+    };
+    nextTick(() => {
+      handleSendMessage(sendPayload);
+    });
+  };
+
+  /**
    * UTS error18：onHide/onShow 嵌套回调不能引用同作用域 const。
    * Android/Kotlin 类属性函数用 .invoke()；iOS/H5/小程序直接 () 调用。
    */
@@ -2855,31 +3014,10 @@
     // #ifndef APP-ANDROID
     pageResumeResult.triggerResume();
     // #endif
+    // 页面级 onShow（agent-detail → triggerResume）也消费 OpenUI 续作，
+    // 避免仅依赖子组件 onShow（内嵌 H5 返回预览时更稳）。
+    handlePendingOpenUiAction();
   }
-
-  // App/小程序：统一走 triggerHide/Resume（与 pageResume 回调同一条链路）
-  // H5/WEB 只靠 visibilitychange，避免与页面 onShow/onHide 双触发
-  /**
-   * OpenUI 表单提交续作：从 file-preview-page 返回时，消费按 conversationId 暂存的一次性
-   * 续作消息，复用既有发送链路发出（与 pendingChatDraft 同一 storage-and-consume 模式）。
-   * 平台无关定义：consume 读后删（幂等），onShow 双触发亦无害。
-   */
-  const handlePendingOpenUiAction = (): void => {
-    const cid = data.conversationId.value;
-    if (cid == null) return;
-    const message = consumePendingOpenUiAction(cid);
-    console.log(`[OpenUI] handlePendingOpenUiAction cid=${cid} consumed=${message.length > 0}`);
-    if (message.length == 0) return;
-    const sendPayload: UTSJSONObject = {
-      messageInfo: message,
-      selectedComponents: data.selectedComponents.value,
-      modelId: data.currentModelId.value,
-      sandboxId: data.currentSandboxId.value,
-    };
-    nextTick(() => {
-      handleSendMessage(sendPayload);
-    });
-  };
 
   // ==================== 性能测试帧探针（perfTest 模式：avgFps / maxGap 浮层 + logcat）====================
   // setInterval(16ms) 记主线程 tick 间隔；解析/渲染阻塞时 delta 暴涨 → 量化「卡死/掉帧」体感。
@@ -3356,6 +3494,23 @@
   // ==================== 生命周期 ====================
   // 内部异步逻辑包装为同步回调，避免 Promise 类型不匹配
   const runOnLoadAsync = async (options: any): Promise<void> => {
+    // App 端 web-view 内嵌时，App 会把登录态追加到 URL fragment（accessToken 参数）。
+    // 在页面加载期直接写入 storage / ticket cookie / 内嵌标记 —— 确定性应用，
+    // 不再依赖 App 侧 createWebviewContext + evalJS 的注入时机（Android 上不可靠）。
+    // #ifdef H5 || WEB
+    const accessTokenVal = (options as UTSJSONObject)["accessToken"];
+    if (accessTokenVal != null) {
+      const accessToken = `${accessTokenVal}`;
+      if (accessToken.length > 0) {
+        uni.setStorageSync(ACCESS_TOKEN, accessToken);
+        // ticket cookie：H5 生产环境 SSE / 语音 WS 的登录态约定（HTTP 走 Authorization，见 request 层）
+        document.cookie = `ticket=${accessToken}; path=/`;
+        // 标记 App web-view 内嵌（幂等；__nuwaxSetAppEmbedded 已由本组件 setup 注册）
+        window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();
+      }
+    }
+    // #endif
+
     // 获取并更新租户配置，初始化 enableSubscription
     void initTenantConfig();
 
@@ -3672,6 +3827,8 @@
   defineExpose({
     triggerResume: invokeTriggerResume as any,
     triggerHide: invokeTriggerHide as any,
+    /** 供页面显式消费 OpenUI 续作（与 triggerResume 内调用等价，幂等）。 */
+    handlePendingOpenUiAction: handlePendingOpenUiAction as any,
     getAgentInfo: exposedGetAgentInfo as any,
   });
 </script>

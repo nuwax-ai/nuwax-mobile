@@ -148,3 +148,28 @@ export function isBlockShellEmpty (tagName, children, getRenderData, processingL
   }
   return true
 }
+
+/**
+ * 段落可见内容是否「只有」OpenUI 原位卡。
+ * 用于去掉 md-p 默认 1em 上下边距，避免卡片前后空隙过大。
+ * 空白文本等不可见子可忽略；一旦有其它可见块（正文/工具组等）则不收紧。
+ */
+export function isOpenUiOnlyParagraph (tagName, children, getRenderData, processingList) {
+  const tag = tagName != null ? `${tagName}` : ''
+  if (tag !== 'p') {
+    return false
+  }
+  const kids = children != null && Array.isArray(children) ? children : []
+  let openUiCount = 0
+  for (let i = 0; i < kids.length; i++) {
+    const kid = kids[i]
+    if (isOpenUiProcessNode(kid, getRenderData, processingList)) {
+      openUiCount += 1
+      continue
+    }
+    if (childNodeHasVisibleContent(kid, getRenderData, processingList)) {
+      return false
+    }
+  }
+  return openUiCount > 0
+}

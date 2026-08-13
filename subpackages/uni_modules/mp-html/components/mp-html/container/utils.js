@@ -15,10 +15,20 @@ export const getProcessingDataByPriority = (
     return {};
   }
 
-  // 过滤出匹配 executeId 的项目
-  const matchedItems = processingList.filter(
-    (item) => item.executeId === executeId
-  );
+  // 过滤出匹配 executeId 的项目（统一转字符串：后端 id 常为 number，HTML attrs 为 string）
+  // 兼容 executeId / executeid（HTML 标签属性常小写）
+  const execKey = executeId != null ? `${executeId}` : "";
+  const matchedItems = processingList.filter((item) => {
+    if (item == null) return false;
+    const raw =
+      item.executeId != null
+        ? item.executeId
+        : item.executeid != null
+          ? item.executeid
+          : null;
+    const itemId = raw != null ? `${raw}` : "";
+    return execKey.length > 0 && itemId === execKey;
+  });
 
   if (matchedItems.length === 0) {
     return {};

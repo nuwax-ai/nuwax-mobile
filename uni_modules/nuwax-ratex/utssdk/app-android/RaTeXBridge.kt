@@ -91,8 +91,13 @@ object RaTeXBridge {
             val logicalW = (w / density).toInt()
             val logicalH = (h / density).toInt()
             return "data:image/webp;base64," + b64 + "|" + logicalW + "|" + logicalH
-        } catch (e: Exception) {
-            return "ERR:" + (e.message ?: "unknown")
+        } catch (e: Throwable) {
+            // 捕 Throwable（含 Error）：模拟器 16KB page 下 RaTeXEngine.<clinit> 加载
+            // libratex_ffi.so 抛 UnsatisfiedLinkError（Error 子类，非 Exception），原 catch(Exception)
+            // 不捕获 → 穿透到 UTS/index.uts（其 catch 也只 Exception）→ 线程池 FATAL 杀进程
+            // （进含公式会话即闪退）。此处 Kotlin catch(Throwable) 捕获后返回 ERR，由 UTS 侧
+            // 走 errMsg → mathRendererCore 回退 native→proxy，不崩。
+            return "ERR:" + (e.message ?: "ratex_link_error")
         }
     }
 }

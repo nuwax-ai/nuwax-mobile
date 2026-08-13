@@ -3,8 +3,8 @@
  * 服务端下发 PCM16 LE mono；客户端收齐后封装为 WAV，再交给 InnerAudioContext 播放。
  *
  * H5 注意：浏览器要求 play() 落在用户手势链路内。TTS 合成是异步的，
- * 因此在 play() 同步阶段先用同一 InnerAudioContext 播一段静音解锁，
- * 合成完成后再切到真实 WAV，避免“动画在播、实际无声”。
+ * 因此在 play() 同步阶段先用同一 InnerAudioContext 播一段静音 WAV 解锁
+ * （SILENT_WAV_DATA_URI，宽限期防被打断），合成完成后再切到真实 WAV。
  */
 import { getApiBaseUrl } from "@/constants/config";
 import { resolveSpeechAccessToken } from "./speechToken";
@@ -37,9 +37,9 @@ class TtsListenerEntry {
 
 /**
  * 极短静音 WAV，仅用于 H5 在用户点击时解锁音频通道。
- * 必须是带真实采样（非 0 时长）的合法 WAV：iOS 只有元素真正播放过一段有效音频才算解锁，
- * 0 采样空壳 WAV 不会被判定为“播放过”，解锁无效 → 后续异步 play() 仍被拦截。
- * 此处为 0.05s / 8kHz / 16bit mono 全零采样（800 字节 data）。
+ * 结构完全合法：0.05s / 8kHz / 16bit mono，44 字节 RIFF 头 + 800 字节全零 PCM，
+ * 可正常解码并“播放”0.05s 数字静音，没有任何可闻声音（unlock-tone 的提示音会漏出）。
+ * 也带真实播放时长（非 0 data 空壳），iOS 判定元素“播放过”即可放行后续异步 play()。
  */
 const SILENT_WAV_DATA_URI =
   "data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
@@ -112,6 +112,15 @@ function buildPcm16Wav(chunks: Uint8Array[], sampleRate: number): ArrayBuffer {
   }
   return buffer;
 }
+
+/**
+ * H5 手势解锁播放宽限期（ms）：
+ * unlockInGesture 启动的解锁 play() 是异步 pending 的，若在同一同步栈内（toggleSpeech 的
+ * stop / begin 的 stop）立即 audio.stop()，会打断它 → 每次必抛 AbortError，且 iOS 判定元素
+ * 从未真正播放过 → 后续异步 play() 仍被拦截。宽限期内 stopSharedAudio 跳过 stop，让解锁
+ * 片段（约 0.05s）自然播完。真实播放开始（synth 至少数百 ms 后）时早已超窗，不受影响。
+ */
+const UNLOCK_PLAY_GRACE_MS: number = 500;
 
 async function saveWavFile(buffer: ArrayBuffer): Promise<string> {
   // #ifdef H5 || WEB
@@ -496,6 +505,8 @@ export class TtsWebSocketPlayer {
   private lastFailToastAtMs: number = 0;
   /** 最近一次合成 PCM 估算时长（ms）；H5 blob URL 长度不能反映音频时长 */
   private lastSynthDurationMs: number = 0;
+  /** H5：最近一次手势解锁 play() 的发起时刻；宽限期内 stopSharedAudio 跳过 stop */
+  private unlockPlayAtMs: number = 0;
 
   /**
    * 录音 onStart 后预热：建连但不发合成请求（轻触未开录勿调）。
@@ -793,11 +804,11 @@ export class TtsWebSocketPlayer {
         p.catch((e: any) => {
           const name = e != null && (e as any).name != null ? `${(e as any).name}` : "";
           const msg = e != null && (e as any).message != null ? `${(e as any).message}` : "";
-          console.warn("[TTS] h5.playRejected name=" + name + " msg=" + msg);
+          console.error("[H5Voice] safePlay rejected name=" + name + " msg=" + msg);
         });
       }
     } catch (eSafe: any) {
-      console.warn("[TTS] h5.safePlay threw", eSafe);
+      console.error("[H5Voice] safePlay threw", eSafe);
     }
     // #endif
     // #ifndef H5 || WEB
@@ -1252,11 +1263,7 @@ export class TtsWebSocketPlayer {
     }
     // #endif
 
-    try {
-      audio!.stop();
-    } catch (_eStop) {
-      // ignore
-    }
+    this.stopSharedAudio();
     audio!.volume = this.getTargetVolume();
     // #ifdef APP-IOS
     audio!.obeyMuteSwitch = false;
@@ -1308,10 +1315,6 @@ export class TtsWebSocketPlayer {
         return;
       }
       if (this.switchingToReal && this.realPlayback != true) {
-        console.warn(
-          "[TTS] playSrc transient error while switching",
-          err.errMsg ?? err,
-        );
         return;
       }
       if (this.realPlayback) {
@@ -1418,14 +1421,7 @@ export class TtsWebSocketPlayer {
    */
   private endPlaybackKeepSynth(): void {
     this.clearSynthStallWatchdog();
-    const audio = this.audioContext;
-    if (audio != null) {
-      try {
-        audio!.stop();
-      } catch (_eStop) {
-        // ignore
-      }
-    }
+    this.stopSharedAudio();
     this.revokeBlobUrl();
     this.realPlayback = false;
     this.switchingToReal = false;
@@ -1903,6 +1899,28 @@ export class TtsWebSocketPlayer {
    * 结束当前播报会话；TCP 收回待命并进入闲置关闭倒计时。
    * @param keepAudio true：仅 stop、保留 InnerAudioContext（H5 串行分句复用已解锁通道）
    */
+  /**
+   * H5：停止共享 InnerAudioContext。解锁播放刚启动（<UNLOCK_PLAY_GRACE_MS）时跳过 stop，
+   * 让解锁片段自然播完——避免打断 pending play() 抛 AbortError，并确保 iOS 判定元素
+   * “真正播放过”从而放行后续异步 play()。非 H5 平台行为与直接 stop() 一致。
+   */
+  private stopSharedAudio(): void {
+    const audio = this.audioContext;
+    if (audio == null) {
+      return;
+    }
+    // #ifdef H5 || WEB
+    if (this.unlockPlayAtMs > 0 && Date.now() - this.unlockPlayAtMs < UNLOCK_PLAY_GRACE_MS) {
+      return;
+    }
+    // #endif
+    try {
+      audio!.stop();
+    } catch (_eStop) {
+      // ignore
+    }
+  }
+
   private prepareForNextUtterance(keepAudio: boolean): void {
     this.generation += 1;
     this.synthEpoch += 1;
@@ -1914,33 +1932,25 @@ export class TtsWebSocketPlayer {
     this.switchingToReal = false;
     this.pausedByMute = false;
     this.recycleSessionToWarm();
-    const audio = this.audioContext;
     if (keepAudio == true) {
-      if (audio != null) {
-        try {
-          audio!.stop();
-        } catch (_eStop) {
-          // ignore
-        }
-      }
+      this.stopSharedAudio();
     } else {
       // H5/WEB：保留已解锁的 InnerAudioContext（手势内解锁过即持续放行），
       // 仅 stop 当前音频，不销毁。若在此 destroy，下一次播放会重建一个未被手势解锁的
       // 新元素，被移动端浏览器拦截（NotAllowedError，iOS 最严）。
       // 销毁推迟到 disableWarmupAndDisconnect（离开页面 / 停会话）。
+      this.stopSharedAudio();
       // #ifndef H5 || WEB
+      const audio = this.audioContext;
       this.audioContext = null;
-      // #endif
       if (audio != null) {
         try {
-          audio!.stop();
-          // #ifndef H5 || WEB
           audio!.destroy();
-          // #endif
         } catch (_eAudio) {
           // ignore
         }
       }
+      // #endif
     }
     this.revokeBlobUrl();
     this.chunks = [] as Uint8Array[];
@@ -1970,7 +1980,9 @@ export class TtsWebSocketPlayer {
   }
 
   /**
-   * 用户手势同步阶段创建 InnerAudioContext，并在 H5 上播静音片段解锁。
+   * 用户手势同步阶段创建 InnerAudioContext，并播放一段静音 WAV 解锁媒体通道。
+   * 用 SILENT_WAV_DATA_URI（0.05s 全零静音，无任何可闻声音），并记下 unlockPlayAtMs
+   * 宽限期，保证它不被同一同步栈内的 stop() 打断。
    */
   private prepareAudioContextForGesture(): void {
     const audio = uni.createInnerAudioContext();
@@ -1981,16 +1993,13 @@ export class TtsWebSocketPlayer {
     // #endif
     // #ifdef H5 || WEB
     try {
-      // 已用 WebAudio 解锁（unlockInGesture 手势内 resume）则不再用 data:WAV 触发媒体解锁：
-      // iOS Safari 对 data:WAV 的 play() 会永久挂起，随后被 stop()/换源打断即抛 AbortError。
-      if (this.webAudioCtx == null) {
-        // 解锁通道时用极低音量，避免静音模式下突然出声
-        audio.volume = this.getTargetVolume() > 0 ? 0.01 : 0;
-        audio.src = SILENT_WAV_DATA_URI;
-        this.safePlay(audio);
-      }
+      // 静音 WAV 本身无声，音量置最低兜底
+      audio.volume = this.getTargetVolume() > 0 ? 0.01 : 0;
+      audio.src = SILENT_WAV_DATA_URI;
+      this.unlockPlayAtMs = Date.now();
+      this.safePlay(audio);
     } catch (e: any) {
-      console.warn("[TTS] h5.audioUnlockFailed", e);
+      console.error("[H5Voice] audioUnlockFailed", e);
     }
     // #endif
   }
@@ -1999,9 +2008,9 @@ export class TtsWebSocketPlayer {
    * H5：在用户手势调用栈内同步解锁音频通道（工具栏播报点击时调用）。
    * 浏览器要求 play() 落在手势栈内；TTS 合成是异步的（WebSocket 往返后才播放），
    * 若等到合成完成才首次 play()，会被移动端浏览器拦截（NotAllowedError，iOS 最严）。
-   * 这里在点击同步阶段用同一 InnerAudioContext 播一段静音解锁，后续异步播放复用
-   * 已解锁实例即被放行。仅首次创建并解锁；重复调用为幂等。
-   * App / 小程序无需手势解锁，本方法为 no-op。
+   * 这里在点击同步阶段用同一 InnerAudioContext 播一段静音 WAV 解锁（unlockPlayAtMs
+   * 宽限期保证它不被随后的 stop() 打断），后续异步播放复用已解锁实例即被放行。
+   * 仅首次创建并解锁；重复调用为幂等。App / 小程序无需手势解锁，本方法为 no-op。
    */
   unlockInGesture(): void {
     // #ifdef H5 || WEB

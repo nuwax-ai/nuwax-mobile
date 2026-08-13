@@ -8,9 +8,13 @@
 	<web-view
 		id="agent-detail-webview"
 		class="w-full"
-		v-if="agentDetailWebUrl.length > 0"
 		:src="agentDetailWebUrl"
+		@load="handleWebViewLoad"
+		@message="handleWebViewMessage"
 	/>
+	<!-- 不可见 sibling 占位（勿删）：Android 上页面仅有 web-view 单节点时走全屏原生层，
+	     createWebviewContext 拿不到 context，evalJS 注入失效；该占位使 web-view 保持普通节点模式。 -->
+	<view class="webview-node-placeholder" />
 	<!-- #endif -->
 </template>
 
@@ -23,58 +27,616 @@
 	import { onLoad } from '@dcloudio/uni-app'
 	import { getApiBaseUrl } from '@/constants/config'
 	import { ACCESS_TOKEN } from '@/constants/home.constants'
+	// App web-view 内嵌页原生语音：录音（RecorderManager + 上传转写）与 TTS 播报
+	import { voiceStreamSpeaker } from '@/subpackages/utils/voice/voiceStreamSpeaker'
+	import {
+		ttsWebSocketPlayer,
+		type TtsPlaybackState,
+	} from '@/subpackages/utils/voice/ttsWebSocketPlayer'
+	import { audioPlayerManager } from '@/subpackages/utils/voice/audioPlayerManager'
+	import { stopAllSpeechPlayback } from '@/subpackages/utils/voice/stopAllSpeechPlayback'
+	import { VoiceSettings } from '@/subpackages/utils/voice/voiceTypes'
+	import {
+		createAudioUploader,
+		AudioFile as NativeAudioFile,
+		AudioUploader,
+	} from '@/servers/audioUploader'
 	// #endif
 
 	const instance = getCurrentInstance()
 	const chatConversationComponentRef = ref<any | null>(null)
 
 	// #ifdef APP
-	/** App 端 web-view 加载的 H5 同页地址，形如 {API_BASE_URL}/m/#/subpackages/pages/agent-detail/agent-detail?id=xxx&conversationId=yyy */
+	/** App 端 web-view 加载的 H5 同页地址，形如 {API_BASE_URL}/m/#/subpackages/pages/agent-detail/agent-detail?id=xxx&conversationId=yyy&accessToken=xxx */
 	const agentDetailWebUrl = ref<string>("")
-	/** web-view 桥注入轮询定时器 / 次数（setup 作用域 let，闭包捕获模块级变量避免 UTS 提升问题） */
+	/** @load 后注入短轮询定时器 / 次数 / 成功上报标记 */
 	let appWebViewBridgeTimer: number = 0
 	let appWebViewBridgeAttempts: number = 0
+	let appWebViewBridgeReported: boolean = false
+	/** 已创建的 webview context 缓存：原生语音桥 evalJS 回传与注入共用 */
+	let appWebViewBridgeContext: WebviewContext | null = null
 
 	/**
-	 * 向 H5 内嵌页注入登录态并标记「App web-view 内嵌」。
-	 * - 将 ACCESS_TOKEN 写入 H5 cookie 的 ticket 字段（H5 生产环境登录态约定，
-	 *   HTTP / SSE / 语音 WS 均由浏览器自动携带该 cookie 完成鉴权）
-	 * - 调用 H5 侧暴露的全局方法 window.__nuwaxSetAppEmbedded()，置 isAppWebView = true
-	 * H5 SPA 就绪前 evalJS 可能落在 about:blank 或方法未注册状态，故按固定周期
-	 * 轮询重试（脚本幂等，可重复执行，cookie 覆盖写无副作用）。
+	 * 幂等注入脚本：uni.webview JSSDK（网页 → 原生 postMessage 桥）+ ticket cookie
+	 * + localStorage 的 ACCESS_TOKEN + 内嵌标记方法。
+	 * JSSDK 与既有 uni-app H5 运行时会合并（保留现有 uni 全局），仅内嵌 App web-view 时生效。
+	 * 脚本随 H5 构建发布在 static/ 下（相对路径 ./static/... 按文档 base 解析，
+	 * 部署在 /m/ 或根路径都能命中），不依赖线上 nginx 根 /static/ 目录。
 	 */
-	function injectAppWebViewBridge(): void {
+	function buildBridgeCode(tokenLiteral: string): string {
+		return `try{if(!window.uni||!uni.webView){var s=document.createElement('script');s.src='./static/uni.webview.1.5.5.js';document.head.appendChild(s);}}catch(e){}try{document.cookie='ticket='+${tokenLiteral}+'; path=/';}catch(e){} try{localStorage.setItem('ACCESS_TOKEN',${tokenLiteral});}catch(e){} window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();`
+	}
+
+	/**
+	 * 单次注入。返回 true 仅代表「拿到 ctx 且 evalJS 未抛异常」。
+	 * createWebviewContext / evalJS 在 webview 未就绪时可能抛异常（见 proxy-web.uts），
+	 * 必须 try-catch 保护，避免异常打断轮询回调。
+	 */
+	function injectBridgeOnce(): boolean {
 		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
 		if (tokenRaw == null) {
-			return
+			return false
 		}
 		const token = `${tokenRaw}`
 		if (token.length == 0) {
-			return
+			return false
 		}
 		// JSON.stringify 生成带引号的 JS 字符串字面量，任意 token 都能安全嵌入脚本
-		const tokenLiteral = JSON.stringify(token)
-		// 幂等脚本：ticket cookie + localStorage 的 ACCESS_TOKEN（H5 请求层走 uni storage）+ 内嵌标记方法
-		const code = `try{document.cookie='ticket='+${tokenLiteral}+'; path=/';}catch(e){} try{localStorage.setItem('ACCESS_TOKEN',${tokenLiteral});}catch(e){} window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();`
-		if (appWebViewBridgeTimer != 0) {
+		const code = buildBridgeCode(JSON.stringify(token))
+		let ctx: WebviewContext | null = appWebViewBridgeContext
+		if (ctx == null) {
+			try {
+				// 官方示例传组件实例辅助平台绑定，避免创建 context 失败
+				ctx = uni.createWebviewContext("agent-detail-webview", instance?.proxy)
+				appWebViewBridgeContext = ctx
+			} catch (e) {
+				return false
+			}
+			if (ctx == null) {
+				return false
+			}
+		}
+		try {
+			ctx.evalJS(code)
+		} catch (e) {
+			return false
+		}
+		if (!appWebViewBridgeReported) {
+			appWebViewBridgeReported = true
+			console.log("[webview-inject] 注入执行成功（evalJS 未抛异常）")
+		}
+		return true
+	}
+
+	/**
+	 * @load 后启动注入短轮询。核心：注入只在 webview「文档已加载」后发生，
+	 * 避免 Android 上加载期 evalJS 落在 about:blank / 中间文档、被后续导航丢弃
+	 * （此前自动注入失败根因）。短窗口 5s 覆盖 H5 异步分包延迟注册 __nuwaxSetAppEmbedded 的情况。
+	 */
+	function startAppWebViewBridge(): void {
+		// URL 尚未生成（onLoad 未执行 / 无 id 参数）时不启动
+		if (agentDetailWebUrl.value.length == 0) {
 			return
 		}
+		// 幂等重启：@load 重复触发只重开窗口
+		if (appWebViewBridgeTimer != 0) {
+			clearInterval(appWebViewBridgeTimer)
+			appWebViewBridgeTimer = 0
+		}
 		appWebViewBridgeAttempts = 0
+		appWebViewBridgeReported = false
 		appWebViewBridgeTimer = setInterval((): void => {
-			const ctx = uni.createWebviewContext("agent-detail-webview")
-			if (ctx != null) {
-				ctx.evalJS(code)
-			}
 			appWebViewBridgeAttempts++
-			if (appWebViewBridgeAttempts >= 40) {
+			injectBridgeOnce()
+			// 20 × 250ms = 5s；@load 已保证文档就绪，无需长窗口
+			if (appWebViewBridgeAttempts >= 20) {
 				clearInterval(appWebViewBridgeTimer)
 				appWebViewBridgeTimer = 0
 			}
 		}, 250) as number
 	}
 
+	/** webview 文档加载完成（已处于目标 H5 origin）：此时注入 cookie/localStorage 才真正生效 */
+	function handleWebViewLoad(_event: UniWebViewLoadEvent): void {
+		startAppWebViewBridge()
+	}
+
+	// ==================== 原生语音桥（H5 postMessage → 原生执行 → evalJS 回传） ====================
+	// 注意：UTS 要求先声明后使用，本区块内所有函数按被引用顺序自上而下排列。
+
+	/** evalJS 回传 H5（失败忽略；H5 侧有兜底逻辑，不依赖本回调必达） */
+	function evalBridgeJS(js: string): void {
+		try {
+			let ctx = appWebViewBridgeContext
+			if (ctx == null) {
+				ctx = uni.createWebviewContext("agent-detail-webview", instance?.proxy)
+				appWebViewBridgeContext = ctx
+			}
+			if (ctx != null) {
+				ctx.evalJS(js)
+			}
+		} catch (e) {
+			// ignore
+		}
+	}
+
+	function jsonStringifyForBridge(obj: UTSJSONObject): string {
+		try {
+			const text = JSON.stringify(obj)
+			return text != null ? text : "{}"
+		} catch (_e) {
+			return "{}"
+		}
+	}
+
+	/** 安全读取 webview 消息对象（Android 原生对象禁止无守卫强转） */
+	function asBridgeRecord(value: any | null): UTSJSONObject | null {
+		if (value == null || typeof value != "object") {
+			return null
+		}
+		if (Array.isArray(value)) {
+			return null
+		}
+		try {
+			return value as UTSJSONObject
+		} catch (_e) {
+			return null
+		}
+	}
+
+	/**
+	 * H5 → 原生消息解析：event.detail.data 可能为 [msg] / [[msg]] / [{data:[msg]}]，
+	 * 逐层取最后一项或 data 字段（对齐 parseOpenUiActionData 的兼容策略）。
+	 */
+	function parseWebViewBridgeMessage(data: any | null): UTSJSONObject | null {
+		let current: any | null = data
+		let depth = 0
+		while (current != null && depth < 8) {
+			depth += 1
+			if (Array.isArray(current)) {
+				const arr = current as any[]
+				if (arr.length == 0) {
+					return null
+				}
+				current = arr[arr.length - 1]
+				continue
+			}
+			const obj = asBridgeRecord(current)
+			if (obj == null) {
+				return null
+			}
+			if (obj["type"] != null) {
+				return obj
+			}
+			const nested = obj["data"]
+			if (nested == null) {
+				return null
+			}
+			current = nested
+		}
+		return null
+	}
+
+	// ---- 录音结果读取辅助（APP 原生对象禁止 as UTSJSONObject，逐字段强转） ----
+
+	type NativeRecorderStopResult = {
+		tempFilePath?: string | null
+		duration?: number | null
+		fileSize?: number | null
+		format?: string | null
+	}
+
+	type NativeRecorderFail = {
+		errCode?: number | null
+		errMsg?: string | null
+		errSubject?: string | null
+	}
+
+	function readRecorderStopString(res: any | null, key: string): string {
+		if (res == null) {
+			return ""
+		}
+		try {
+			const stopRes = res as NativeRecorderStopResult
+			if (key == "tempFilePath" && stopRes.tempFilePath != null) {
+				return `${stopRes.tempFilePath}`
+			}
+			if (key == "format" && stopRes.format != null) {
+				return `${stopRes.format}`
+			}
+		} catch (_eNative) {
+			// ignore
+		}
+		try {
+			const jsonStr = JSON.stringify(res)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+				const parsed = JSON.parse(jsonStr) as UTSJSONObject
+				const value = parsed[key]
+				return value != null ? `${value}` : ""
+			}
+		} catch (_eJson) {
+			// ignore
+		}
+		return ""
+	}
+
+	function readRecorderStopNumber(res: any | null, key: string, fallback: number = 0): number {
+		if (res == null) {
+			return fallback
+		}
+		try {
+			const stopRes = res as NativeRecorderStopResult
+			if (key == "duration" && stopRes.duration != null) {
+				const durationVal = stopRes.duration as number
+				return isNaN(durationVal) ? fallback : durationVal
+			}
+			if (key == "fileSize" && stopRes.fileSize != null) {
+				const sizeVal = stopRes.fileSize as number
+				return isNaN(sizeVal) ? fallback : sizeVal
+			}
+		} catch (_eNative) {
+			// ignore
+		}
+		try {
+			const jsonStr = JSON.stringify(res)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+				const parsed = JSON.parse(jsonStr) as UTSJSONObject
+				const value = parsed[key]
+				if (value == null) {
+					return fallback
+				}
+				const num = parseFloat(`${value}`)
+				return isNaN(num) ? fallback : num
+			}
+		} catch (_eJson) {
+			// ignore
+		}
+		return fallback
+	}
+
+	function readRecorderErrorMessage(error: any | null): string {
+		if (error == null) {
+			return ""
+		}
+		try {
+			const fail = error as NativeRecorderFail
+			if (fail.errMsg != null && `${fail.errMsg}`.length > 0) {
+				return `${fail.errMsg}`
+			}
+		} catch (_eFail) {
+			// ignore
+		}
+		try {
+			const err = error as Error
+			if (err.message != null && `${err.message}`.length > 0) {
+				return `${err.message}`
+			}
+		} catch (_eErr) {
+			// ignore
+		}
+		const text = `${error}`
+		if (text.length > 0 && text != "null") {
+			return text
+		}
+		return ""
+	}
+
+	// ---- 原生录音：RecorderManager + 上传转写 ----
+
+	let nativeRecorderManager: RecorderManager | null = null
+	let nativeRecorderUploader: AudioUploader | null = null
+	/** stop 是否已到达（授权期间松手时抑制随后的 start） */
+	let nativeRecordingStopArrived: boolean = false
+	/** 录音是否正在进行（onStart 后为 true） */
+	let nativeRecordingActive: boolean = false
+
+	/** 申请麦克风权限（Android 用 UTSAndroid；iOS 检查授权状态） */
+	async function ensureNativeMicPermission(): Promise<boolean> {
+		// #ifdef APP-ANDROID
+		return await new Promise<boolean>((resolve) => {
+			const activity = UTSAndroid.getUniActivity()
+			if (activity == null) {
+				resolve(false)
+				return
+			}
+			const permission = ["android.permission.RECORD_AUDIO"] as string[]
+			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
+				resolve(true)
+				return
+			}
+			UTSAndroid.requestSystemPermission(
+				activity,
+				permission,
+				(allGranted: boolean, _granted: string[]) => {
+					resolve(allGranted)
+				},
+				(_doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(false)
+				},
+			)
+		})
+		// #endif
+		// #ifdef APP-IOS
+		const authSetting = uni.getAppAuthorizeSetting()
+		if (authSetting.microphoneAuthorized == "authorized") {
+			return true
+		}
+		if (authSetting.microphoneAuthorized == "denied") {
+			return false
+		}
+		// not determined：start 时系统才弹窗，先放行
+		return true
+		// #endif
+	}
+
+	function handleNativeRecordStart(_res: any | null): void {
+		nativeRecordingActive = true
+		evalBridgeJS(`window.__onNativeRecordStart && window.__onNativeRecordStart()`)
+	}
+
+	function handleNativeRecorderError(err: any | null): void {
+		nativeRecordingActive = false
+		const message = readRecorderErrorMessage(err)
+		evalBridgeJS(
+			`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": message } as UTSJSONObject)})`,
+		)
+	}
+
+	/** 原生侧上传录音并转写，把转写文本经 evalJS 回传 H5 */
+	async function nativeUploadAndTranscribe(
+		tempFilePath: string,
+		duration: number,
+		fileSize: number,
+		format: string,
+	): Promise<void> {
+		let success = false
+		let text = ""
+		let error = ""
+		try {
+			if (nativeRecorderUploader == null) {
+				nativeRecorderUploader = createAudioUploader()
+			}
+			const audioFile = new NativeAudioFile(tempFilePath, duration, fileSize, format)
+			const result = await nativeRecorderUploader.uploadAudio(audioFile, null)
+			success = result.success
+			text = result.text
+			error = result.error
+		} catch (e: any) {
+			const errText = readRecorderErrorMessage(e)
+			error = errText.length > 0 ? errText : "识别失败"
+		}
+		const payload = {
+			"success": success,
+			"text": text,
+			"error": error,
+		} as UTSJSONObject
+		evalBridgeJS(
+			`window.__onNativeRecordStop && window.__onNativeRecordStop(${jsonStringifyForBridge(payload)})`,
+		)
+	}
+
+	function handleNativeRecorderStop(res: any | null): void {
+		nativeRecordingActive = false
+		const tempFilePath = readRecorderStopString(res, "tempFilePath")
+		if (tempFilePath.length == 0) {
+			evalBridgeJS(
+				`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "录音失败" } as UTSJSONObject)})`,
+			)
+			return
+		}
+		const duration = readRecorderStopNumber(res, "duration", 0)
+		const fileSize = readRecorderStopNumber(res, "fileSize", 0)
+		let format = readRecorderStopString(res, "format")
+		if (format.length == 0) {
+			const dotIndex = tempFilePath.lastIndexOf(".")
+			format = dotIndex >= 0 ? tempFilePath.slice(dotIndex + 1).toLowerCase() : "mp3"
+		}
+		nativeUploadAndTranscribe(tempFilePath, duration, fileSize, format)
+	}
+
+	function ensureNativeRecorder(): RecorderManager {
+		if (nativeRecorderManager == null) {
+			nativeRecorderManager = uni.getRecorderManager()
+			nativeRecorderManager!.onStart(handleNativeRecordStart)
+			nativeRecorderManager!.onStop(handleNativeRecorderStop)
+			nativeRecorderManager!.onError(handleNativeRecorderError)
+		}
+		return nativeRecorderManager!
+	}
+
+	function nativeStartRecord(): void {
+		nativeRecordingStopArrived = false
+		ensureNativeRecorder()
+		ensureNativeMicPermission().then((ok: boolean) => {
+			if (ok != true) {
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "需要麦克风权限" } as UTSJSONObject)})`,
+				)
+				return
+			}
+			// 授权期间已收到 stop（轻触/松手）：禁止再 start
+			if (nativeRecordingStopArrived == true) {
+				return
+			}
+			// 开录前停掉正在播的 TTS，避免抢录音音频焦点（录到弱音 → 转写空）
+			stopAllSpeechPlayback()
+			try {
+				const recorder = ensureNativeRecorder()
+				const options = {
+					duration: 600000,
+					sampleRate: 44100,
+					numberOfChannels: 1,
+					encodeBitRate: 192000,
+					format: "mp3",
+				} as RecorderManagerStartOptions
+				recorder.start(options)
+			} catch (e) {
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "录音启动失败" } as UTSJSONObject)})`,
+				)
+			}
+		})
+	}
+
+	function nativeStopRecord(): void {
+		nativeRecordingStopArrived = true
+		if (nativeRecordingActive != true) {
+			return
+		}
+		nativeRecordingActive = false
+		try {
+			ensureNativeRecorder().stop()
+		} catch (_e) {
+			// ignore
+		}
+	}
+
+	// ---- 原生 TTS：复用现有 VoiceStreamSpeaker / ttsWebSocketPlayer 栈，状态回传 H5 ----
+
+	let nativeTtsStateListenerId: number = 0
+	/** 是否已回传 H5「播报中」（分句间隙 player 会 transient idle，用 isBusy 兜底判定） */
+	let nativeTtsReportedBusy: boolean = false
+
+	function readBridgeBool(raw: any | null, fallback: boolean): boolean {
+		if (raw == null) {
+			return fallback
+		}
+		if (raw == true) {
+			return true
+		}
+		if (raw == false) {
+			return false
+		}
+		const text = `${raw}`
+		if (text == "true" || text == "1") {
+			return true
+		}
+		if (text == "false" || text == "0") {
+			return false
+		}
+		return fallback
+	}
+
+	function bridgeSettingsToVoiceSettings(settingsObj: UTSJSONObject | null): VoiceSettings {
+		const settings = new VoiceSettings()
+		if (settingsObj == null) {
+			settings.autoPlay = true
+			return settings
+		}
+		settings.autoPlay = readBridgeBool(settingsObj["autoPlay"], true)
+		settings.muted = readBridgeBool(settingsObj["muted"], false)
+		settings.includeThinkContent = readBridgeBool(settingsObj["includeThinkContent"], false)
+		settings.includeCodeBlocks = readBridgeBool(settingsObj["includeCodeBlocks"], false)
+		settings.includeLinkUrl = readBridgeBool(settingsObj["includeLinkUrl"], false)
+		settings.keepEmoji = readBridgeBool(settingsObj["keepEmoji"], false)
+		return settings
+	}
+
+	/** 汇总当前播报状态并回传 H5（整轮是否进行中以 voiceStreamSpeaker.isBusy 为准） */
+	function reportNativeTtsState(): void {
+		const roundBusy = voiceStreamSpeaker.isBusy()
+		if (roundBusy == true) {
+			if (nativeTtsReportedBusy != true) {
+				nativeTtsReportedBusy = true
+				const mid = voiceStreamSpeaker.getMessageId()
+				evalBridgeJS(
+					`window.__onNativeTtsState && window.__onNativeTtsState(${jsonStringifyForBridge({ "state": "speaking", "messageId": mid } as UTSJSONObject)})`,
+				)
+			}
+			return
+		}
+		if (nativeTtsReportedBusy == true) {
+			nativeTtsReportedBusy = false
+			evalBridgeJS(
+				`window.__onNativeTtsState && window.__onNativeTtsState(${jsonStringifyForBridge({ "state": "end", "messageId": "" } as UTSJSONObject)})`,
+			)
+		}
+	}
+
+	function nativeTtsInitListener(): void {
+		if (nativeTtsStateListenerId != 0) {
+			return
+		}
+		nativeTtsStateListenerId = ttsWebSocketPlayer.subscribe(
+			(_state: TtsPlaybackState, _messageId: string): void => {
+				reportNativeTtsState()
+			},
+		)
+	}
+
+	function nativeTtsBegin(messageId: string, settingsObj: UTSJSONObject | null): void {
+		nativeTtsInitListener()
+		const settings = bridgeSettingsToVoiceSettings(settingsObj)
+		audioPlayerManager.setMuted(settings.muted)
+		voiceStreamSpeaker.begin(messageId, settings)
+	}
+
+	function nativeTtsFeed(_messageId: string, text: string, finished: boolean): void {
+		voiceStreamSpeaker.onStreamChunk(text, "", finished)
+	}
+
+	function nativeTtsSpeak(messageId: string, text: string, settingsObj: UTSJSONObject | null): void {
+		nativeTtsInitListener()
+		const settings = bridgeSettingsToVoiceSettings(settingsObj)
+		// 工具栏手动播报：不受自动播报/静音开关影响，始终出声
+		settings.autoPlay = true
+		settings.muted = false
+		audioPlayerManager.setMuted(false)
+		voiceStreamSpeaker.speakPrepared(messageId, settings, text)
+	}
+
+	function nativeTtsStop(): void {
+		stopAllSpeechPlayback()
+		reportNativeTtsState()
+	}
+
+	function nativeTtsSetMuted(muted: boolean): void {
+		audioPlayerManager.setMuted(muted)
+	}
+
+	// ---- 消息分发 ----
+
+	/** web-view @message：分发原生语音指令（录音 / TTS） */
+	function handleWebViewMessage(e: UniWebViewMessageEvent): void {
+		const msg = parseWebViewBridgeMessage(e.detail.data)
+		if (msg == null) {
+			return
+		}
+		const type = `${msg["type"]}`
+		if (type == "record") {
+			const action = `${msg["action"]}`
+			if (action == "start") {
+				nativeStartRecord()
+			} else if (action == "stop") {
+				nativeStopRecord()
+			}
+			return
+		}
+		if (type == "tts") {
+			const action = `${msg["action"]}`
+			if (action == "begin") {
+				nativeTtsBegin(`${msg["messageId"]}`, asBridgeRecord(msg["settings"]))
+			} else if (action == "feed") {
+				nativeTtsFeed(
+					`${msg["messageId"]}`,
+					`${msg["text"]}`,
+					msg["finished"] == true,
+				)
+			} else if (action == "speak") {
+				nativeTtsSpeak(
+					`${msg["messageId"]}`,
+					`${msg["text"]}`,
+					asBridgeRecord(msg["settings"]),
+				)
+			} else if (action == "stop") {
+				nativeTtsStop()
+			} else if (action == "setMuted") {
+				nativeTtsSetMuted(msg["muted"] == true)
+			}
+		}
+	}
+
 	onLoad((options: any) => {
-		injectAppWebViewBridge()
 		const optionsObj = options as UTSJSONObject
 		const idRaw = optionsObj["id"]
 		const convRaw = optionsObj["conversationId"]
@@ -86,6 +648,14 @@
 		const conversationId = convRaw != null ? `${convRaw}` : ""
 		if (conversationId.length > 0) {
 			webUrl = `${webUrl}&conversationId=${conversationId}`
+		}
+		// URL 参数兜底透传登录态：追加到 hash fragment（# 后内容仅客户端可见，不会随 HTTP 请求发往服务端）。
+		// H5 侧聊天组件 onLoad 读取并写入 storage / ticket cookie。
+		// 与 @load evalJS 注入互为备份：任一成功即可完成登录态透传（脚本幂等，重复无副作用）。
+		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
+		const accessToken = tokenRaw != null ? `${tokenRaw}` : ""
+		if (accessToken.length > 0) {
+			webUrl = `${webUrl}&accessToken=${encodeURIComponent(accessToken)}`
 		}
 		agentDetailWebUrl.value = webUrl
 	})
@@ -129,10 +699,28 @@
 
 	onUnmounted(() => {
 		// #ifdef APP
-		// 离开页面即停止 web-view 桥注入轮询，避免对已销毁的 webview 继续 evalJS
+		// 离开页面即停止注入短轮询，避免对已销毁的 webview 继续 evalJS
 		if (appWebViewBridgeTimer != 0) {
 			clearInterval(appWebViewBridgeTimer)
 			appWebViewBridgeTimer = 0
+		}
+		// 停掉原生语音：断开 TTS 状态订阅并停止播报/录音，避免残留播放与监听
+		if (nativeTtsStateListenerId != 0) {
+			try {
+				ttsWebSocketPlayer.unsubscribe(nativeTtsStateListenerId)
+			} catch (_e) {
+				// ignore
+			}
+			nativeTtsStateListenerId = 0
+		}
+		stopAllSpeechPlayback()
+		if (nativeRecordingActive == true) {
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_e) {
+				// ignore
+			}
 		}
 		// #endif
 		/**
@@ -167,4 +755,14 @@
 </script>
 
 <style lang="scss" scoped>
+	/* Android web-view 兄弟占位：不可见、不拦截触摸，仅用于让 web-view 保持普通节点模式（见模板注释，勿删） */
+	.webview-node-placeholder {
+		position: fixed;
+		top: 0;
+		left: 0;
+		width: 1px;
+		height: 1px;
+		opacity: 0;
+		pointer-events: none;
+	}
 </style>

@@ -57,6 +57,8 @@
   import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
   import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
   import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
+  // App web-view 内嵌页原生语音桥：录音 / TTS 走原生
+  import { nativeVoiceBridge } from "@/subpackages/utils/voice/nativeVoiceBridge";
 
   const { t: tFn } = useI18n();
   function t(key: string): string {
@@ -71,6 +73,8 @@
     isConversationActive?: boolean
     /** 是否启用实时 WebSocket ASR（仅 App 原生录音路径使用；App web-view 内嵌页为 true） */
     enableAsr?: boolean
+    /** 是否 App web-view 内嵌页（isAppWebView）：录音 / 转写走原生桥（postMessage + evalJS） */
+    nativeBridge?: boolean
   }
 
   // 录音状态类型
@@ -87,6 +91,11 @@
   /** enableAsr 缺省视为启用（对齐 getDuration 的默认值写法） */
   function isAsrEnabled(): boolean {
     return props.enableAsr != false;
+  }
+
+  /** 是否 App web-view 内嵌页：录音 / 转写走原生桥 */
+  function isNativeBridge(): boolean {
+    return props.nativeBridge == true;
   }
 
   /**
@@ -224,6 +233,11 @@
   // #endif
 
   function callRecorderStop() {
+    // App web-view 内嵌页：录音由原生侧 RecorderManager 执行
+    if (isNativeBridge() == true) {
+      nativeVoiceBridge.stopRecord()
+      return
+    }
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
       (h5RecorderManager as any).stop()
@@ -237,6 +251,13 @@
   }
 
   function callRecorderStart() {
+    // App web-view 内嵌页：录音由原生侧 RecorderManager 执行
+    if (isNativeBridge() == true) {
+      console.log("[VoiceRecord] start via native bridge")
+      nativeVoiceBridge.startRecord()
+      return
+    }
+    console.log("[VoiceRecord] start via h5 recorder")
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
       (h5RecorderManager as any).start(buildH5RecorderStartOptions())
@@ -303,6 +324,7 @@
   /** 标记本轮作废：忽略后续 onStart/onStop/ASR error */
   function markDiscarded(): void {
     ignoreNextStopResult = true
+    nativeVoiceBridge.resetRecordSession()
     // #ifdef APP
     suppressAsrError = true
     asrSessionActive = false
@@ -636,6 +658,58 @@
   }
   // #endif
 
+  /**
+   * 原生桥：录音结束回调（App web-view 内嵌页）。
+   * 原生侧完成录制 + 上传转写后，经 evalJS __onNativeRecordStop 回传转写文本。
+   */
+  function handleNativeRecordStop(
+    success: boolean,
+    text: string,
+    error: string,
+  ): void {
+    hideConnectingLoading()
+    // 轻触/取消后的迟到回调：UI 多半已复位，勿再 silentDismiss（会二次 mark）
+    if (ignoreNextStopResult == true || holdDurationMs() < MIN_HOLD_MS) {
+      ignoreNextStopResult = false
+      nativeVoiceBridge.resetRecordSession()
+      ensureIdlePaint()
+      return
+    }
+    if (success == true && text.length > 0) {
+      currentState.value = "success"
+      emit("onRecordStop", text)
+      resetState()
+      return
+    }
+    // 短按无有效语音：静默；较长按住仍无字才提示
+    if (holdDurationMs() < MIN_HOLD_MS) {
+      nativeVoiceBridge.resetRecordSession()
+      silentDismiss()
+      return
+    }
+    const errMsg =
+      error.length > 0 ? error : t("Mobile.Voice.noSpeechDetected")
+    hideConnectingLoading()
+    nativeVoiceBridge.resetRecordSession()
+    resetState()
+    emit("onError", new Error(errMsg))
+  }
+
+  /** 原生桥：录音失败回调（权限拒绝 / 原生 Recorder 错误） */
+  function handleNativeRecordError(message: string): void {
+    hideConnectingLoading()
+    if (ignoreNextStopResult == true || holdDurationMs() < MIN_HOLD_MS) {
+      ignoreNextStopResult = false
+      nativeVoiceBridge.resetRecordSession()
+      ensureIdlePaint()
+      return
+    }
+    nativeVoiceBridge.resetRecordSession()
+    handleRecordError(
+      new Error(message.length > 0 ? message : t("Mobile.Voice.recordFailed")),
+    )
+  }
+
   // 使用audioUploader转换音频
   async function uploadAndConvertWithService(
     audioFile: UploaderAudioFile,
@@ -734,6 +808,12 @@
 
   /** 各端录音权限：uni-app x APP 不支持 uni.getSetting，Android 用 UTSAndroid */
   async function ensureRecordPermission(): Promise<boolean> {
+    // App web-view 内嵌页：麦克风权限由原生侧申请，错误经 __onNativeRecordError 回传
+    if (isNativeBridge() == true) {
+      console.log("[VoiceRecord] ensureRecordPermission -> native (nativeBridge=true)")
+      return true
+    }
+    console.log("[VoiceRecord] ensureRecordPermission -> h5 getUserMedia (nativeBridge=false)")
     // #ifdef APP-ANDROID
     return await new Promise<boolean>((resolve) => {
       const activity = UTSAndroid.getUniActivity();
@@ -1125,6 +1205,21 @@
   }
 
   function bindRecorderEvents() {
+    // App web-view 内嵌页：结果经原生桥回调（evalJS 注入的全局函数）
+    if (isNativeBridge() == true) {
+      nativeVoiceBridge.setRecordHandlers(
+        (): void => {
+          handleRecordStart(null)
+        },
+        (success: boolean, text: string, error: string): void => {
+          handleNativeRecordStop(success, text, error)
+        },
+        (message: string): void => {
+          handleNativeRecordError(message)
+        },
+      )
+      return
+    }
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
       (h5RecorderManager as any).onStart(handleRecordStart)
@@ -1142,6 +1237,11 @@
   }
 
   function unbindRecorderEvents() {
+    // App web-view 内嵌页：解绑原生桥回调
+    if (isNativeBridge() == true) {
+      nativeVoiceBridge.setRecordHandlers(null, null, null)
+      return
+    }
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
       const rm = h5RecorderManager as any
@@ -1171,6 +1271,11 @@
       return
     }
     recorderInitialized = true
+    // App web-view 内嵌页：不创建 H5 jzRecorder，录音走原生桥
+    if (isNativeBridge() == true) {
+      bindRecorderEvents()
+      return
+    }
     // #ifdef H5 || WEB
     h5RecorderManager = jzRecorder.getRecorderManager()
     // #endif

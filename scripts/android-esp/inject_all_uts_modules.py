@@ -53,7 +53,9 @@ VAPOR_SDK_LIBS_EXCLUDE = [
 VAPOR_RUNTIME_SRC = Path(
     os.environ.get(
         "HX_VAPOR_RUNTIME_DIR",
-        "/Applications/HBuilderX-Alpha.app/Contents/HBuilderX/plugins/"
+        # 默认走稳定版 HBuilderX.app（5.23+ 含 vapor runtime）；本机无 Alpha。
+        # vapor 需 5.21+，稳定版 5.23 即可（见 docs/vapor-tech-debt.md / memory vapor-branch-tooling）。
+        "/Applications/HBuilderX.app/Contents/HBuilderX/plugins/"
         "uniapp-runextension/libVapor",
     )
 )

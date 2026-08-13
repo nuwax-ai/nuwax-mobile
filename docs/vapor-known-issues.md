@@ -1,6 +1,6 @@
 # vapor（蒸汽模式）已知问题与处理方案归档
 
-> 2026-08 将 nuwax-mobile 移植到 vapor（HBuilderX-Alpha 5.23 + uni-app-x SDK@14987-5.23）实战踩坑汇总。**遇到新渲染/编译异常，先按此对号入座。** 配套记忆：`vapor-offline-base-runtime` / `vapor-style-isolation-blocks-global` / `vapor-template-gotchas` / `lime-v4-acquisition-gated` / `vapor-style-bem-methodology`。
+> 2026-08 将 nuwax-mobile 移植到 vapor（HBuilderX 5.23 + uni-app-x SDK@14987-5.23；移植期用 Alpha，2026-08-13 起统一走稳定版 5.23）实战踩坑汇总。**遇到新渲染/编译异常，先按此对号入座。** 配套记忆：`vapor-offline-base-runtime` / `vapor-style-isolation-blocks-global` / `vapor-template-gotchas` / `lime-v4-acquisition-gated` / `vapor-style-bem-methodology`。
 
 ---
 
@@ -9,7 +9,7 @@
 ### A1. 下错 SDK 包（legacy uni-app vs uni-app x）
 - **症状**：`Android-SDK@5.23.xxxxx_xxxxxx.zip` 解压后是 `lib.5plus` / `uniapp-v8`（WebView 运行时），编译 uni-app x 项目失败。
 - **根因**：DCloud 有两条 SDK 线，下载页各一个：`Android-SDK@` = 旧版 uni-app/5+；`Android-uni-app-x-SDK@<build>-<ver>` = uni-app x（`app-runtime-release`/`framework-release`）。nuwax 是 uni-app x（827 个 .uvue/.uts），只能用后者。
-- **修法**：用 `Android-uni-app-x-SDK@14987-5.23`（与 HBuilderX-Alpha 5.23.2026080313-alpha 配套）。判断口诀：看 `SDK/libs` 运行时 aar 名，不看版本号。
+- **修法**：用 `Android-uni-app-x-SDK@14987-5.23`（与 HBuilderX 5.23 配套；移植期 Alpha，现统一稳定版）。判断口诀：看 `SDK/libs` 运行时 aar 名，不看版本号。
 - **排查信号**：包里有 `lib.5plus.base-release.aar` / `uniapp-v8-release.aar` → 下错线。
 
 ### A2. vapor 运行时缺失（uts 插件报 uniappxv / fnJS / JVM17）
@@ -113,7 +113,7 @@
 
 ## F. vapor 基线环境
 
-- HBuilderX-Alpha `5.23.2026080313-alpha`（非稳定版）
+- HBuilderX 稳定版 `5.23`（蒸汽模式 vapor 需 5.21+，稳定版 5.23 即可；2026-08-13 起统一稳定版，无需 Alpha）
 - Android 离线 SDK `Android-uni-app-x-SDK@14987-5.23`（与 HX 严格配套）
 - manifest：`uni-app-x: { vapor:true, styleIsolationVersion:"2", vapor-render-target:"bytecode" }`
 - 打包：`make app-resource`（HX）→ `make base-android`（gradle 离线基座）；vapor 业务编成 `app-service.js` 字节码，业务不落 .kt

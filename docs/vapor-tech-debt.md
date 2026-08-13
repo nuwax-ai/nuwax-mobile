@@ -26,7 +26,7 @@
 | 项 | 值 | 验证 |
 |---|---|---|
 | 分支 | 工作分支 `feat/nuwa-zhuoda-2026.07-vapor`；正式发布须 `release/nuwa-zhuoda`（`build_store_release.sh:95` 强校验，可用 `ALLOW_NON_RELEASE_BRANCH=1` 绕过仅验包） | `git branch --show-current` |
-| HBuilderX | **Alpha `5.23.2026080313-alpha`**（不是稳定版 5.15）。CLI：`/Applications/HBuilderX-Alpha.app/Contents/MacOS/cli` | `cli --version` |
+| HBuilderX | **稳定版 `5.23`**（蒸汽模式 vapor 需 5.21+，稳定版 5.23 即可，无需 Alpha；2026-08-13 起统一走稳定版）。CLI：`/Applications/HBuilderX.app/Contents/MacOS/cli` | `cli --version` |
 | Android 离线 SDK | `Android-uni-app-x-SDK@14987-5.23`（须与 HX 严格配套） | `ls ~/workspace/nuwax-mobile-offline-sdk/sdk/android/5.23/` |
 | manifest | `uni-app-x: { vapor:true, styleIsolationVersion:"2", vapor-render-target:"bytecode" }` | `python3 -c "import json;print(json.load(open('manifest.json'))['uni-app-x'])"` |
 | 密钥 | `$NUWAX_SIGNING_HOME/local-secrets.env`（由同目录 `.example` 生成；仅本地 Git）含 `DCLOUD_APPKEY` + `ANDROID_RELEASE_*` 等 | 见 `docs/pre-release-checklist.md` |

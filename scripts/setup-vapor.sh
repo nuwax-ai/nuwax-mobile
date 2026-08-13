@@ -15,15 +15,15 @@ warn() { echo -e "${Y}[⚠]${N} $1"; }
 err()  { echo -e "${R}[✗]${N} $1"; exit 1; }
 step() { echo -e "\n${B}━━━ $1 ━━━${N}"; }
 
-step "1/3 检查 HBuilderX Alpha 5.23"
-HX_ALPHA="/Applications/HBuilderX-Alpha.app"
-if [ -d "$HX_ALPHA" ]; then
-  HX_VER="$("$HX_ALPHA/Contents/MacOS/cli" --version 2>/dev/null | head -1)"
-  log "HBuilderX Alpha: $HX_VER"
-  [[ "$HX_VER" == *"5.23"* ]] || warn "版本非 5.23（vapor 需要 Alpha 5.23+）"
+step "1/3 检查 HBuilderX 5.23+（稳定版含蒸汽模式）"
+HX_APP="/Applications/HBuilderX.app"
+if [ -d "$HX_APP" ]; then
+  HX_VER="$("$HX_APP/Contents/MacOS/cli" --version 2>/dev/null | head -1)"
+  log "HBuilderX: $HX_VER"
+  [[ "$HX_VER" == *"5.23"* ]] || warn "版本非 5.23（vapor 需稳定版 5.23+）"
 else
-  warn "未安装 HBuilderX Alpha（不能用稳定版 5.15！）"
-  echo "  下载：https://www.dcloud.io/hbuilderx-alpha.html"
+  warn "未安装 HBuilderX（需稳定版 5.23+ 含蒸汽模式）"
+  echo "  下载：https://www.dcloud.io/hbuilderx.html"
   read -p "  安装好后继续？(y/N) " yn; [[ "$yn" =~ ^[Yy]$ ]] || exit 0
 fi
 
@@ -46,11 +46,11 @@ ls "$ROOT/unpackage/debug/"*vapor*.apk >/dev/null 2>&1 && log "vapor 基座 APK 
 
 echo ""
 echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-echo -e "${G}  ✅ 就绪！在 HBuilderX Alpha 里运行：${N}"
+echo -e "${G}  ✅ 就绪！在 HBuilderX 里运行：${N}"
 echo -e "${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 cat <<'EOF'
 
-  1. 启动 HBuilderX Alpha（必须 Alpha 5.23+）
+  1. 启动 HBuilderX（稳定版 5.23+）
   2. 打开项目 nuwax-mobile
   3. 运行 → 运行到 Android App 基座 → 选「自定义基座」
   4. 选 unpackage/debug/ 下的 vapor 基座 apk

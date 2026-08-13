@@ -58,7 +58,7 @@ vapor 运行时**整条丢弃**伪类选择器（`:last-child`/`:active`/`:hover
 | `subpackages/pages/my-subscriptions/.../subscribed-{agents,credits,skills}.uvue` | `.agent-card` / `.credit-card` / `.skill-card` |
 | `components/radio-list-drawer/radio-list-drawer.uvue` | `.radio-item`（rowList，已有 index） |
 
-> ⚠️ 本次改动**未在 vapor 下编译验证**（本机 `_diff` checkout 为 vdom/5.15，无 HBuilderX-Alpha 5.23）。请在 vapor 机 `pnpm uni:build` 或自定义基座走查确认。
+> ⚠️ 本次改动**未在 vapor 下编译验证**（本机 `_diff` checkout 为 vdom/5.15，无 HBuilderX 5.23 稳定版）。请在 vapor 机 `pnpm uni:build` 或自定义基座走查确认。
 
 ### 3.3 剩余待处理（21 条，按处理方式分类）
 

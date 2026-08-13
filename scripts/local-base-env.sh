@@ -20,7 +20,7 @@
 _NUWAX_LB_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _NUWAX_REPO_ROOT="$(cd "$_NUWAX_LB_ENV_DIR/.." && pwd)"
 
-# 版本默认对齐本机 HBuilderX-Alpha（蒸汽模式 vapor 需 Android 编译器 5.21+，见 docs）
+# 版本默认对齐本机 HBuilderX 稳定版（蒸汽模式 vapor 需 Android 编译器 5.21+，稳定版 5.23 即可，见 docs）
 export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.23}"
 # Android 离线 SDK 构建号（官方包名 Android-uni-app-x-SDK@<build>-<ver>；5.23=14987，5.15=14915）
 export NUWAX_ANDROID_SDK_BUILD="${NUWAX_ANDROID_SDK_BUILD:-14987}"

@@ -925,7 +925,8 @@ def generate_uni_app_config() -> None:
 VAPOR_RUNTIME_SRC = Path(
     os.environ.get(
         "HX_VAPOR_RUNTIME_DIR",
-        "/Applications/HBuilderX-Alpha.app/Contents/HBuilderX/plugins/"
+        # 默认走稳定版 HBuilderX.app（5.23+ 含 vapor runtime）；本机无 Alpha。
+        "/Applications/HBuilderX.app/Contents/HBuilderX/plugins/"
         "uniapp-runextension/libVapor",
     )
 )

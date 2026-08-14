@@ -34,6 +34,7 @@
 	import { onLoad, onBackPress } from '@dcloudio/uni-app'
 	import { getApiBaseUrl } from '@/constants/config'
 	import { ACCESS_TOKEN } from '@/constants/home.constants'
+	import { getUploadFileAction } from '@/constants/common.constants'
 	import { getStatusBarHeight } from '@/utils/system.uts'
 	import { consumeLatestPendingOpenUiAction } from '@/utils/pendingOpenUiAction.uts'
 	// App web-view 内嵌页原生语音：录音（RecorderManager + 上传转写）与 TTS 播报
@@ -913,6 +914,137 @@
 		)
 	}
 
+	/** 安全读上传响应字段（null/空串回退 fallback） */
+	function bridgeFieldString(obj: UTSJSONObject | null, key: string, fallback: string): string {
+		if (obj == null) {
+			return fallback
+		}
+		const val = obj[key]
+		if (val == null) {
+			return fallback
+		}
+		const text = `${val}`
+		return text.length > 0 ? text : fallback
+	}
+
+	/** 解析 uni.uploadFile 响应：{code, data:{key,fileName,mimeType,size,url}} */
+	function parseNativeUploadResponse(raw: any | null): UTSJSONObject | null {
+		if (raw == null) {
+			return null
+		}
+		if (typeof raw == "string") {
+			const text = `${raw}`.trim()
+			if (text.length == 0) {
+				return null
+			}
+			try {
+				return JSON.parse(text) as UTSJSONObject
+			} catch (_eStr) {
+				return null
+			}
+		}
+		try {
+			const obj = raw as UTSJSONObject
+			if (obj["code"] != null || obj["data"] != null) {
+				return obj
+			}
+		} catch (_eObj) {
+			// ignore
+		}
+		try {
+			const jsonStr = JSON.stringify(raw)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "null") {
+				return JSON.parse(jsonStr) as UTSJSONObject
+			}
+		} catch (_eJson) {
+			// ignore
+		}
+		return null
+	}
+
+	/**
+	 * 原生侧直接上传媒体文件（web-view 内嵌 H5 无法读取原生临时路径，
+	 * 与录音链路一致：原生上传，只把上传结果回传 H5）。
+	 * 全部成功/部分成功：回传成功项 {url,key,name,type,size}；全部失败才报错。
+	 */
+	function nativeUploadMediaFiles(action: string, files: UTSJSONObject[]): void {
+		if (files.length == 0) {
+			evalNativeMediaFiles(true, action, false, "", [] as UTSJSONObject[])
+			return
+		}
+		const token = uni.getStorageSync(ACCESS_TOKEN)
+		const header = new UTSJSONObject()
+		header["Authorization"] = `Bearer ${token}`
+		const formData = new UTSJSONObject()
+		formData["type"] = "tmp"
+		const results: UTSJSONObject[] = []
+		let pending = files.length
+		const settle = (): void => {
+			pending = pending - 1
+			if (pending > 0) {
+				return
+			}
+			if (results.length == 0) {
+				evalNativeMediaFiles(false, action, false, "上传失败", [] as UTSJSONObject[])
+				return
+			}
+			evalNativeMediaFiles(true, action, false, "", results)
+		}
+		for (let i = 0; i < files.length; i++) {
+			const fileObj = files[i] as UTSJSONObject
+			const filePath = `${fileObj["path"]}`
+			// App 端 chooseImage 的 name 字段可能为空，用路径末段兜底真实文件名
+			let fileName = bridgeFieldString(fileObj, "name", "")
+			if (fileName.length == 0) {
+				const pathParts = filePath.split("/")
+				const lastPart = pathParts.length > 0 ? pathParts[pathParts.length - 1] : ""
+				fileName = lastPart.length > 0 ? lastPart : "file"
+			}
+			try {
+				uni.uploadFile({
+					url: getUploadFileAction(),
+					filePath: filePath,
+					name: "file",
+					header: header,
+					formData: formData,
+					success: (res) => {
+						const resultObj = parseNativeUploadResponse(res.data)
+						const dataObj =
+							resultObj != null ? (resultObj["data"] as UTSJSONObject | null) : null
+						if (dataObj != null) {
+							const item = new UTSJSONObject()
+							item["url"] = bridgeFieldString(dataObj, "url", "")
+							item["key"] = bridgeFieldString(dataObj, "key", "")
+							const nameVal = bridgeFieldString(dataObj, "fileName", fileName)
+							item["name"] = nameVal.length > 0 ? nameVal : fileName
+							item["type"] = bridgeFieldString(
+								dataObj,
+								"mimeType",
+								"application/octet-stream",
+							)
+							const sizeRaw = dataObj["size"]
+							let sizeNum = 0
+							if (sizeRaw != null) {
+								sizeNum = parseFloat(`${sizeRaw}`)
+								if (isNaN(sizeNum)) {
+									sizeNum = 0
+								}
+							}
+							item["size"] = sizeNum
+							results.push(item)
+						}
+						settle()
+					},
+					fail: (_err) => {
+						settle()
+					},
+				})
+			} catch (_eUpload) {
+				settle()
+			}
+		}
+	}
+
 	function invokeNativeChooseImage(sourceType: string, maxCount: number): void {
 		const sourceTypes = (sourceType == "camera"
 			? (["camera"] as ("album" | "camera")[])
@@ -923,7 +1055,8 @@
 			count: maxCount,
 			success: (res: any) => {
 				const files = extractNativeMediaFiles(res)
-				evalNativeMediaFiles(true, "chooseImage", false, "", files)
+				// 原生上传后再回传结果（web-view 内嵌 H5 读不了原生临时路径）
+				nativeUploadMediaFiles("chooseImage", files)
 			},
 			fail: (err: any) => {
 				const errMsg = readRecorderErrorMessage(err)
@@ -988,7 +1121,8 @@
 			count: maxCount,
 			success: (res: any) => {
 				const files = extractNativeMediaFiles(res)
-				evalNativeMediaFiles(true, "chooseFile", false, "", files)
+				// 原生上传后再回传结果（web-view 内嵌 H5 读不了原生临时路径）
+				nativeUploadMediaFiles("chooseFile", files)
 			},
 			fail: (err: any) => {
 				const errMsg = readRecorderErrorMessage(err)

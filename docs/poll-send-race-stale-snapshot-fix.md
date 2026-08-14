@@ -307,6 +307,10 @@ Mobile 请在 `useConversationStatusPolling.uts` 的 `pollOnce` await 之后做�
 - **同步 bump**：发送入口直接 bump，不存在 PC `latestRef` 一帧滞后问题（`isConversationActive` 是同步 ref 写）。
 - **既有三层保护保留不动**：`pollOnce` EXECUTING 分支的 await 后复检、页面 `onExecuting` 回调里的 `isLocalConversationBusy()` 复检、`handleSubConversation` reload 后的 `isSubscribed/isCurrentlyStreaming` 复检。
 
+### 与 `29019dcb`（终态两轮确认）的合并形态
+
+同日另一实现（`29019dcb` 高频连续发送保护）合入后，`pollOnce` 现为**多套防护叠加**，顺序：pollGeneration 整段丢弃（本修复）→ `streamGeneration` 快照对比（await 前后流代数变化 = 新一轮已发出）→ 忙判定复核 → 终态「连续两轮确认」（`pendingTerminalObserved`，单轮陈旧终态不触发强制收尾）。两套机制互补不冲突：generation 挡「发送瞬间的在途回包」，两轮确认挡「高频连发时上一轮任务的陈旧终态回包」。
+
 ### 日志（自证修复生效）
 
 前缀 `[ConversationStatusPolling]`：

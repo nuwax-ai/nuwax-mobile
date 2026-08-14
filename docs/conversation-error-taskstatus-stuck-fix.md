@@ -264,16 +264,23 @@ if (eventTypeStr == `${ConversationEventTypeEnum.ERROR}`) {
 
 ### 改动（`AgentDetailService.uts`）
 
+> 2026-08-15 合并 `29019dcb`（高频连续发送保护：fail 不关态 → 续接 / 阈值强关）后，本节 1 的语义有调整，以合并后为准：
+
 1. **`finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, isRealError)`**：
-   - live SSE 错误回调（真实网络错误）→ `isRealError=true` → 延时收尾落 **FAILED**
-   - timeout / 异常关闭（H5 onClose 等，多为「流结束但缺 FINAL_RESULT」兜底）→ `isRealError=false` → 保持 COMPLETE，由 `scheduleRecoverIfAssistantLoading` 拉详情纠正
+   - 临时会话：无法续接，延时收尾（`isRealError` 区分 FAILED/COMPLETE 语义保留在签名上；临时会话通常无 conversationInfo，实为空操作）
+   - 普通会话（合并后最终形态）：fail **不关态**（保持 loading 视觉，避免「消失→续接→又出现」翻转），置 `streamResumePending` 并立即 `scheduleRecoverIfAssistantLoading` 续接；**FAILED 终态不在 fail 时刻写**——若立即落 FAILED，网络抖动后续接成功时会与「任务实际仍在执行」矛盾。终态出口：
+     - 续接成功 → sub 接管，任务继续
+     - 后端已结束 / 不能续接 → 收尾关态
+     - 连续续接失败达 `MAX_RESUME_FAIL_STREAK` → 强制关态并落 **FAILED**（`cleanupSub` 阈值路径）
+     - 轮询终态两轮确认（`29019dcb`）→ `onTerminalWhileBusy` 收尾
+   - `isRealError` 现用于日志区分来源（真实网络 error vs timeout/异常关闭兜底）
 2. **ERROR 事件分支**：新增 `patchDraftExecutingProcessingToFailed(m)`，消息标 `error` 的同时把 EXECUTING 工具卡置 FAILED（live 路径原先漏了这步，工具卡会一直旋转；sub 路径原已由 `cleanupSub(true)→finalizeTerminalAssistantMessage` 覆盖，现幂等）。
 3. **`finalizeTerminalAssistantMessage`** 内联的 processing 收口重构为同一个 `patchDraftExecutingProcessingToFailed`（返回转换数量），消除重复。
 
 ### 日志（确认修复生效）
 
 - `[AgentDetailService] ERROR event terminal: taskStatus->FAILED toolsFailed=N msgId=...` —— ERROR 事件即终态，N 为收口的 EXECUTING 工具卡数
-- `[SSE-Stream] abnormal finalize: isRealError=0|1 gen=N` —— live 异常收尾走了哪个分支
+- `[SSE-Stream] abnormal finalize: isRealError=0|1 gen=N -> resumePending` —— live 异常收尾进入保持态续接（isRealError 区分真实网络 error / timeout 兜底）
 - `[AgentDetailService] taskStatus terminal: EXECUTING -> FAILED|COMPLETE|CANCEL convId=...` —— 终态真实写入
 - `[AgentDetailService] taskStatus terminal skip: cur=... next=...` —— 未写入（当前本就不在 EXECUTING；排查固化时 `cur=` 是关键证据）
 

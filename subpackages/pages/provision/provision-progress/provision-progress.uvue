@@ -117,7 +117,7 @@
   import { getProvisionDevice, getProvisionCredentials, clearProvisionSession, getReprovisionTarget, getQrPayload, getProvisionReturnUrl } from "@/utils/provisionSession";
   import { EspProvisioningPhaseEnum } from "@/types/enums/espProvisioning";
   import { ProvisionRetryActionEnum } from "@/types/enums/provision";
-  import { apiVoxDeviceDetail } from "@/servers/vox/voxDevice";
+  import { apiVoxDeviceDetail, apiVoxDeviceBindingDetail } from "@/servers/vox/voxDevice";
   import { apiResCode, apiResData } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
 
@@ -255,7 +255,8 @@
     uni.reLaunch({ url: entryUrl });
   };
 
-  // ===== 配网写入后轮询检测设备上线（最长 30s，上线后自动返回，失败后手动返回）=====
+  // ===== 配网写入后轮询检测设备上线（最长 30s，每 5s 探测绑定记录 bindingStatus==BOUND；
+  //       上线自动回终端页，超时手动返回终端页）=====
   const ONLINE_TIMEOUT_SEC = 30;
   const onlineCountdown = ref<number>(ONLINE_TIMEOUT_SEC);
   const deviceOnline = ref<boolean>(false);
@@ -264,6 +265,8 @@
   let pollTimerId = 0;
   const pollTick = ref<number>(0);
   let pollSessionId = 0;
+  /** 在线确认后的自动返回定时器（先展示成功提示，再跳终端页） */
+  let autoReturnTimer = 0;
   const isCheckingOnline = computed((): boolean => isSuccess.value && !deviceOnline.value && !onlineCheckFailed.value);
   const onlineIndicatorStep = computed((): number => pollTick.value % 4);
 
@@ -291,11 +294,24 @@
     }
   };
 
+  /** 在线确认完成后的固定去向：统一回终端页（终端 onShow 会静默刷新设备列表）。 */
+  const returnToTerminal = () => {
+    releaseEspProvisioning();
+    clearProvisionSession();
+    uni.switchTab({
+      url: "/pages/terminal/terminal",
+      fail: () => {
+        // 兜底：H5 等无 terminal tab 的环境退化为重开页面
+        uni.reLaunch({ url: "/pages/terminal/terminal" });
+      },
+    });
+  };
+
   const onDone = () => {
     if (hasDone) return;
     hasDone = true;
     stopOnlinePolling();
-    returnToSource();
+    returnToTerminal();
   };
 
   const leaveProvision = () => {
@@ -324,6 +340,21 @@
     return true;
   });
 
+  const markDeviceOnline = () => {
+    deviceOnline.value = true;
+    stopOnlinePolling();
+    // 先弹出「配网成功」提示并短暂展示成功态，再自动返回终端页，避免毫无过渡的直接跳转。
+    uni.showToast({
+      title: t("Mobile.Provision.Result.successTitle"),
+      icon: "success",
+      duration: 1500,
+    });
+    autoReturnTimer = setTimeout(() => {
+      autoReturnTimer = 0;
+      onDone();
+    }, 1500) as number;
+  };
+
   const checkDeviceOnline = async (sessionId: number) => {
     const info = controller.deviceInfo.value;
     if (info == null || info.serialNumber == "") {
@@ -334,6 +365,26 @@
       return;
     }
     try {
+      const bindingId = controller.getBoundBindingId();
+      if (bindingId != "") {
+        // 主路径：按绑定记录查询设备信息，bindingStatus == BOUND 表示设备已连接
+        const res = await apiVoxDeviceBindingDetail(bindingId);
+        if (sessionId != pollSessionId || !pollingOnline.value) return;
+        if (apiResCode(res) == SUCCESS_CODE) {
+          const raw = apiResData<any>(res);
+          const d = raw != null ? (raw as UTSJSONObject) : null;
+          if (d != null) {
+            const statusVal = d["bindingStatus"];
+            if (statusVal != null && `${statusVal}` == "BOUND") {
+              markDeviceOnline();
+              return;
+            }
+          }
+        }
+        // 绑定记录存在但尚未 BOUND：本轮结束，等下一个 5s tick
+        return;
+      }
+      // 兜底：bind 响应未携带绑定记录 id（如 mock 环境）时退回设备详情 online 判断
       const res = await apiVoxDeviceDetail(info.serialNumber);
       if (sessionId != pollSessionId || !pollingOnline.value) return;
       if (apiResCode(res) == SUCCESS_CODE) {
@@ -342,10 +393,7 @@
         if (d != null) {
           const onlineVal = d["online"];
           if (onlineVal != null && (onlineVal as boolean)) {
-            deviceOnline.value = true;
-            stopOnlinePolling();
-            // 30 秒窗口内确认成功立即返回；成功态不显示任何操作按钮。
-            onDone();
+            markDeviceOnline();
           }
         }
       }
@@ -365,8 +413,8 @@
     pollTimerId = setInterval(() => {
       pollTick.value = pollTick.value + 1;
       onlineCountdown.value = onlineCountdown.value - 1;
-      // 每 2 个 tick（约 2s）探测一次
-      if (pollTick.value % 2 == 0) {
+      // 每 5 个 tick（约 5s）探测一次
+      if (pollTick.value % 5 == 0) {
         checkDeviceOnline(sessionId);
       }
       // 倒计时结束后停留在结果页，仅此时提供手动返回。
@@ -375,7 +423,7 @@
         onlineCheckFailed.value = true;
       }
     }, 1000) as number;
-    // 进入结果页立即查询一次，后续每 2 秒继续确认。
+    // 进入结果页立即查询一次，后续每 5 秒继续确认。
     checkDeviceOnline(sessionId);
   };
 
@@ -385,6 +433,10 @@
 
   onUnmounted(() => {
     stopOnlinePolling();
+    if (autoReturnTimer != 0) {
+      clearTimeout(autoReturnTimer);
+      autoReturnTimer = 0;
+    }
   });
 
   onLoad((_options: OnLoadOptions) => {

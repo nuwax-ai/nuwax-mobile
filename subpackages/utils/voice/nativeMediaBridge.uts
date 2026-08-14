@@ -1,0 +1,216 @@
+/**
+ * App web-view 内嵌页原生媒体桥（H5 侧）。
+ *
+ * 当 H5 页面被 App 端 web-view 内嵌（isAppWebView=true）时，拍照 / 相册 / 文件选择
+ * 不走 H5 内部 <input type="file">（WebView 文件选择器体验差、拍照权限不可靠），
+ * 而是通过 uni.webView.postMessage 把指令发给 App 原生侧执行，原生结果再经 evalJS
+ * 注入的全局回调回传：
+ *
+ *   H5 → 原生：{type:'media', action:'chooseImage'|'chooseFile', sourceType, maxCount}
+ *   原生 → H5：window.__onNativeMediaResult({success, action, cancelled, error, files:[{path,name,size,type}]})
+ *
+ * 非内嵌（浏览器直接打开 / App 原生页 / 小程序）不使用本桥，仍走 uni.chooseImage/chooseFile。
+ * JSSDK 约定 uni.webView.postMessage 的内容必须写在 data 字段内。
+ */
+
+/** 原生选择的单个文件信息 */
+export class NativeMediaPickedFile {
+  path: string
+  name: string
+  size: number
+  type: string
+
+  constructor(path: string, name: string, size: number, type: string) {
+    this.path = path
+    this.name = name
+    this.size = size
+    this.type = type
+  }
+}
+
+/** 原生媒体选择结果回调（cancelled=true 时静默；error 携带失败文案） */
+export type NativeMediaResultHandler = (
+  success: boolean,
+  action: string,
+  files: NativeMediaPickedFile[],
+  cancelled: boolean,
+  error: string,
+) => void
+
+class NativeMediaBridge {
+  /** 是否已启用（chat-input-phone 在 isAppWebView=true 时 setup） */
+  private enabled: boolean = false
+  /** 全局回调是否已注册（幂等） */
+  private globalsRegistered: boolean = false
+  /** 是否已尝试注入 uni.webview JSSDK（幂等） */
+  private jssdkInjected: boolean = false
+
+  /** 选择结果回调（由 chat-input-phone 注入） */
+  private resultHandler: NativeMediaResultHandler | null = null
+
+  isActive(): boolean {
+    return this.enabled
+  }
+
+  /** 启用桥并注册全局回调；仅 App web-view 内嵌页调用（幂等） */
+  setup(): void {
+    if (this.enabled == true) {
+      return
+    }
+    this.enabled = true
+    this.injectJssdk()
+    this.registerGlobals()
+  }
+
+  /** 注入结果回调（重复注入覆盖；传 null 解绑） */
+  setResultHandler(handler: NativeMediaResultHandler | null): void {
+    this.resultHandler = handler
+  }
+
+  /** 拍照 / 相册：原生选择图片后回传文件列表 */
+  chooseImage(sourceType: string, maxCount: number): void {
+    this.post({
+      "type": "media",
+      "action": "chooseImage",
+      "sourceType": sourceType,
+      "maxCount": maxCount,
+    } as UTSJSONObject)
+  }
+
+  /** 文件选择：原生选择后回传文件列表 */
+  chooseFile(maxCount: number): void {
+    this.post({
+      "type": "media",
+      "action": "chooseFile",
+      "maxCount": maxCount,
+    } as UTSJSONObject)
+  }
+
+  // ==================== 内部 ====================
+
+  /** H5 → 原生：uni.webView.postMessage（内容须放在 data 字段，见 JSSDK 约定） */
+  private post(payload: UTSJSONObject): void {
+    if (this.enabled != true) {
+      return
+    }
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null) {
+        return
+      }
+      const uniGlobal = w.uni
+      if (
+        uniGlobal == null ||
+        uniGlobal.webView == null ||
+        uniGlobal.webView.postMessage == null
+      ) {
+        // JSSDK 尚未就绪：再尝试注入一次（原生侧 evalJS 也会注入，双保险）
+        this.injectJssdk()
+        return
+      }
+      uniGlobal.webView.postMessage({ "data": payload })
+    } catch (e) {
+      console.warn("[native-media] postMessage failed", e)
+    }
+    // #endif
+  }
+
+  /**
+   * 确保 uni.webview.1.5.5.js 已注入到当前文档（幂等）。
+   * 脚本随 H5 构建发布在 static/ 下（相对路径 ./static/... 按文档 base 解析）。
+   */
+  private injectJssdk(): void {
+    if (this.jssdkInjected == true) {
+      return
+    }
+    this.jssdkInjected = true
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null || w.document == null || w.document.head == null) {
+        return
+      }
+      if (w.uni != null && w.uni.webView != null) {
+        return
+      }
+      const script = w.document.createElement("script")
+      script.src = "./static/uni.webview.1.5.5.js"
+      w.document.head.appendChild(script)
+    } catch (e) {
+      console.warn("[native-media] inject jssdk failed", e)
+    }
+    // #endif
+  }
+
+  /** 注册原生 evalJS 回传的全局回调（幂等） */
+  private registerGlobals(): void {
+    if (this.globalsRegistered == true) {
+      return
+    }
+    this.globalsRegistered = true
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null) {
+        return
+      }
+      w.__onNativeMediaResult = (res: any): void => {
+        const h = this.resultHandler
+        if (h == null) {
+          return
+        }
+        let success = false
+        let action = ""
+        let cancelled = false
+        let error = ""
+        const files: NativeMediaPickedFile[] = []
+        try {
+          if (res != null) {
+            success = res.success == true
+            action = res.action != null ? `${res.action}` : ""
+            cancelled = res.cancelled == true
+            error = res.error != null ? `${res.error}` : ""
+            const filesRaw = res.files
+            if (filesRaw != null) {
+              for (let i = 0; i < filesRaw.length; i++) {
+                const f = filesRaw[i]
+                if (f == null) {
+                  continue
+                }
+                const path = f.path != null ? `${f.path}` : ""
+                if (path.length == 0) {
+                  continue
+                }
+                let size = 0
+                try {
+                  const num = parseFloat(`${f.size}`)
+                  size = isNaN(num) ? 0 : num
+                } catch (_eSize) {
+                  size = 0
+                }
+                files.push(
+                  new NativeMediaPickedFile(
+                    path,
+                    f.name != null ? `${f.name}` : "",
+                    size,
+                    f.type != null ? `${f.type}` : "",
+                  ),
+                )
+              }
+            }
+          }
+        } catch (_e) {
+          // ignore
+        }
+        h(success, action, files, cancelled, error)
+      }
+    } catch (_e) {
+      // ignore
+    }
+    // #endif
+  }
+}
+
+/** 全局单例 */
+export const nativeMediaBridge = new NativeMediaBridge()

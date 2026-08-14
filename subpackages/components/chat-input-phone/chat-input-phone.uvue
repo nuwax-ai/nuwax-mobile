@@ -66,18 +66,6 @@
         }}</text>
       </view>
 
-      <!-- 订阅限制蒙层 -->
-      <!-- <view
-        class="permission-mask clickable"
-        v-else-if="subscriptionRequired"
-        @tap="handleOpenSubscription"
-      >
-        <text class="permission-text text-blue">{{
-          t("Mobile.Chat.subscriptionRequiredTip")
-        }}</text>
-        <text class="sub-arrow">➔</text>
-      </view> -->
-
       <!-- 录音波形 -->
       <view v-if="isRecording" class="waveform">
         <view
@@ -318,6 +306,11 @@
   import { speechSocketWarmup } from "@/subpackages/utils/voice/speechSocketWarmup";
   import { nativeVoiceBridge } from "@/subpackages/utils/voice/nativeVoiceBridge";
   import {
+    nativeMediaBridge,
+    type NativeMediaPickedFile,
+  } from "@/subpackages/utils/voice/nativeMediaBridge";
+  import { isAppWebViewEmbedded } from "@/utils/system.uts";
+  import {
     AgentManualComponentInfo,
     AgentSelectedComponentInfo,
   } from "@/types/interfaces/agent.uts";
@@ -540,7 +533,7 @@
       agentId?: number;
       agentType?: string;
       isTempChat?: boolean;
-      subscriptionRequired?: boolean;
+      // subscriptionRequired?: boolean;
       // 是否允许用户选择自动/审批模式
       allowChooseMode?: number;
       // 是否启用语音输入（录音 + ASR）；仅 App web-view 内嵌页为 true
@@ -566,7 +559,7 @@
       agentId: 0,
       agentType: "ChatBot",
       isTempChat: false,
-      subscriptionRequired: false,
+      // subscriptionRequired: false,
       allowChooseMode: 0,
       enableVoice: true,
     },
@@ -629,7 +622,6 @@
     (e: 'onOpenFileTree'): void;
     (e: 'onSandboxChange', sandboxId: string): void;
     (e: 'onModelChange', modelId: number, name: string): void;
-    (e: 'onOpenSubscription'): void;
     (e: 'onScrollToLastMsg', smooth: boolean): void;
   }>();
 
@@ -641,11 +633,6 @@
   // 切换模型
   const handleModelChange = (modelId: number, name: string) => {
     emit("onModelChange", modelId, name);
-  };
-
-  // 触发打开订阅弹窗
-  const handleOpenSubscription = () => {
-    emit("onOpenSubscription");
   };
 
   // 打开文件树
@@ -773,6 +760,7 @@
   // 组件卸载时清理资源
   onUnmounted(() => {
     stopDurationTimer();
+    nativeMediaBridge.setResultHandler(null);
     uni.$off("NuwaxAgentModeChanged", handleNuwaxAgentModeChanged);
     // #ifdef APP
     if (appKeyboardHeightListenerId != 0) {
@@ -1034,6 +1022,87 @@
   // 前置间接引用（uploadMultipleFiles 定义在下方，UTS 不支持函数声明提升）
   let _uploadMultipleFiles: ((filePaths: string[]) => Promise<void>) | null = null;
 
+  /**
+   * App web-view 内嵌页原生媒体选择结果：把原生返回的文件列表喂给现有上传流程。
+   * 非内嵌（浏览器/原生页/小程序）走 uni.chooseImage/chooseFile 的路径不受影响。
+   */
+  const handleNativeMediaResult = (
+    success: boolean,
+    action: string,
+    pickedFiles: NativeMediaPickedFile[],
+    cancelled: boolean,
+    error: string,
+  ) => {
+    pageSystemOverlay.end();
+    if (cancelled == true) {
+      return;
+    }
+    if (success != true || pickedFiles.length == 0) {
+      if (error.length > 0) {
+        uni.showToast({
+          title: error,
+          position: "bottom",
+        });
+      }
+      return;
+    }
+    const isImage = action == "chooseImage";
+    const _files = [] as UTSJSONObject[];
+    const filePaths = [] as string[];
+    for (let i = 0; i < pickedFiles.length; i++) {
+      const f = pickedFiles[i];
+      const filePath = f.path;
+      const fileSize = f.size;
+      let resolvedName = f.name;
+      if (resolvedName.length == 0) {
+        const pathParts = filePath.split("/");
+        if (pathParts.length > 0) {
+          resolvedName = pathParts[pathParts.length - 1];
+        }
+        if (resolvedName.length == 0) {
+          resolvedName = isImage ? "image.jpg" : "file";
+        }
+      }
+      let resolvedType = f.type;
+      if (
+        resolvedType.length == 0 ||
+        (isImage && resolvedType.indexOf("image/") < 0)
+      ) {
+        if (isImage) {
+          resolvedType = guessImageMimeFromPath(filePath);
+          if (resolvedType.indexOf("image/") < 0) {
+            resolvedType = guessImageMimeFromPath(resolvedName);
+          }
+          if (resolvedType.indexOf("image/") < 0) {
+            resolvedType = "image/jpeg";
+          }
+        } else if (
+          looksLikeImageFileName(resolvedName) == true ||
+          looksLikeImageFileName(filePath) == true
+        ) {
+          resolvedType = guessImageMimeFromPath(
+            resolvedName.length > 0 ? resolvedName : filePath,
+          );
+        }
+      }
+      const uploadFile = new UTSJSONObject();
+      uploadFile["url"] = filePath;
+      uploadFile["name"] = resolvedName;
+      uploadFile["type"] = resolvedType;
+      uploadFile["size"] = fileSize;
+      uploadFile["status"] = UploadFileStatus.uploading;
+      uploadFile["uid"] = getFileUid();
+      _files.push(uploadFile);
+      filePaths.push(filePath);
+    }
+    files.value = [...files.value, ..._files];
+    if (_uploadMultipleFiles != null) {
+      _uploadMultipleFiles!(filePaths);
+    } else {
+      console.error("[Upload] _uploadMultipleFiles is null");
+    }
+  };
+
   // 选择文件
   const chooseFile = () => {
     // 如果已选择文件数量大于等于默认文件数量，则提示
@@ -1049,6 +1118,16 @@
     // 标记 overlay：避免选文件触发的 onHide 误暂停轮询 / 长隐藏恢复（与 ASR·TTS 无关）
     // Android 常先 App Show、后 complete；endOnNextShow 防 depth 泄漏
     pageSystemOverlay.begin("chooseFile", true);
+    // App web-view 内嵌页：文件选择走原生（权限/系统选择器由原生处理），
+    // 结果经 __onNativeMediaResult 回传复用现有上传流程；浏览器/原生页逻辑不变。
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded() == true) {
+      nativeMediaBridge.setup();
+      nativeMediaBridge.setResultHandler(handleNativeMediaResult);
+      nativeMediaBridge.chooseFile(maxCount);
+      return;
+    }
+    // #endif
     uni.chooseFile({
       type: "file",
       count: maxCount,
@@ -1273,6 +1352,16 @@
     // 标记 overlay：避免相册/相机 onHide 误暂停轮询 / 长隐藏恢复（与 ASR·TTS 无关）
     // endOnNextShow 兜底 complete 晚于 onShow 的机型
     pageSystemOverlay.begin("chooseImage." + sourceTypeItem, true);
+    // App web-view 内嵌页：拍照/相册走原生（权限 + 系统选择器由原生处理），
+    // 结果经 __onNativeMediaResult 回传复用现有上传流程；浏览器/原生页逻辑不变。
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded() == true) {
+      nativeMediaBridge.setup();
+      nativeMediaBridge.setResultHandler(handleNativeMediaResult);
+      nativeMediaBridge.chooseImage(sourceTypeItem, maxCount);
+      return;
+    }
+    // #endif
     uni.chooseImage({
       sourceType: [sourceTypeItem],
       sizeType: ["compressed"],
@@ -2291,24 +2380,6 @@
         text-align: center;
       }
     }
-
-    // #ifdef H5
-    .sub-arrow {
-      color: #007aff;
-      font-size: 32rpx;
-      margin-left: 12rpx;
-      /* #ifndef APP */
-      animation: bounceRight 1.5s infinite ease-in-out;
-      /* #endif */
-    }
-    // #endif
-    // #ifndef H5
-    .sub-arrow {
-      color: #007aff;
-      font-size: 32rpx;
-      margin-left: 12rpx;
-    }
-    // #endif
   }
 
   // #ifdef H5

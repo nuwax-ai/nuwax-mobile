@@ -1,0 +1,122 @@
+/**
+ * 远程 SVG 在 App 端 <image> 的适配工具。
+ *
+ * 根因：App 端（原生渲染）把 SVG 按声明尺寸（如 width="200" height="200"）光栅化后 1:1 绘制，
+ * mode=aspectFit / CSS 宽高缩放对 SVG 失效：容器小于声明尺寸时只显示局部（看起来被裁切/放大），
+ * 容器大于声明尺寸时图标显得严重偏小。H5（含 web-view 内嵌页）由浏览器渲染，无此问题。
+ *
+ * 方案：仅 App 端生效——
+ * 1. 下载 SVG 文本（uni.request responseType:text，8s 超时，按 URL 缓存文本）；
+ * 2. moveDefsToFront：把 <defs> 块前移到 <svg> 开标签后（修复前向引用导致的渲染缺失）；
+ * 3. setSvgSize：把开标签 width/height 改写为「容器 rpx → 物理像素（×pixelRatio）」；
+ * 4. 生成 data:image/svg+xml URL，按「宽x高|URL」缓存；失败回退原 URL。
+ *
+ * 注意：App 端为 1:1 绘制，每个显示尺寸必须各自调用（各自生成对应物理像素的 data URL）。
+ * 非 App 平台（H5 / 小程序）原样透传 URL，不产生额外请求。
+ */
+
+// #ifdef APP
+const svgTextCache = new Map<string, string>();
+const svgDataUrlCache = new Map<string, string>();
+
+function downloadSvgText(url: string, timeoutMs: number): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    uni.request({
+      url: url,
+      method: "GET",
+      timeout: timeoutMs,
+      responseType: "text",
+      success: (res) => {
+        const data = res.data;
+        if (data == null) {
+          reject(new Error("svg response empty"));
+          return;
+        }
+        if (typeof data == "string") {
+          const text = data as string;
+          if (text.trim().length == 0) {
+            reject(new Error("svg response empty"));
+            return;
+          }
+          resolve(text);
+          return;
+        }
+        const s = JSON.stringify(data);
+        resolve(s != null ? s : "");
+      },
+      fail: (_err) => {
+        reject(new Error("svg download failed"));
+      },
+    });
+  });
+}
+
+/** 把 <defs>…</defs> 块前移到 <svg> 开标签之后，修复前向引用（rect 在 defs 前）导致的渲染缺失 */
+function moveDefsToFront(svg: string): string {
+  const openTagEnd = svg.indexOf(">");
+  const defsStart = svg.indexOf("<defs");
+  const defsEnd = svg.indexOf("</defs>");
+  if (openTagEnd < 0 || defsStart < 0 || defsEnd < 0) return svg;
+  // defs 已在开标签内/之前，无需移动
+  if (defsStart < openTagEnd) return svg;
+  const defsBlock = svg.substring(defsStart, defsEnd + "</defs>".length);
+  const without = svg.substring(0, defsStart) + svg.substring(defsEnd + "</defs>".length);
+  return without.substring(0, openTagEnd + 1) + defsBlock + without.substring(openTagEnd + 1);
+}
+
+/** 移除开标签已有 width/height，改写为容器物理像素（保证 1:1 光栅化正好等于容器尺寸） */
+function setSvgSize(svg: string, widthPx: number, heightPx: number): string {
+  const lower = svg.toLowerCase();
+  if (lower.indexOf("<svg") < 0) return svg;
+  const openTagEnd = svg.indexOf(">");
+  if (openTagEnd < 0) return svg;
+  let openTag = svg.substring(0, openTagEnd + 1);
+  openTag = openTag.replace(/width\s*=\s*"[^"]*"/g, "");
+  openTag = openTag.replace(/height\s*=\s*"[^"]*"/g, "");
+  const attrs = ' width="' + widthPx.toString() + '" height="' + heightPx.toString() + '"';
+  return openTag.substring(0, openTag.length - 1) + attrs + ">" + svg.substring(openTagEnd + 1);
+}
+// #endif
+
+/**
+ * 解析远程 SVG 在 App 端 <image> 的可用 URL。
+ * @param url 原始 URL
+ * @param widthRpx 容器宽度（rpx）
+ * @param heightRpx 容器高度（rpx）
+ * @returns App 端返回按容器物理像素改写后的 data URL；非 App 端原样返回
+ */
+export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx: number): Promise<string> {
+  // #ifdef APP
+  if (url.length == 0) return url;
+  const lower = url.toLowerCase();
+  // 非 SVG 资源（png/jpg/data URL 等）直接透传
+  if (!lower.endsWith(".svg") && !lower.includes(".svg?")) return url;
+  if (lower.startsWith("data:image/svg")) return url;
+  const sys = uni.getSystemInfoSync();
+  const windowWidth = sys.windowWidth > 0 ? sys.windowWidth : 375;
+  const pixelRatio = sys.pixelRatio > 0 ? sys.pixelRatio : 2;
+  const widthPx = Math.round((widthRpx * windowWidth) / 750 * pixelRatio);
+  const heightPx = Math.round((heightRpx * windowWidth) / 750 * pixelRatio);
+  const cacheKey = widthPx.toString() + "x" + heightPx.toString() + "|" + url;
+  const cached = svgDataUrlCache.get(cacheKey);
+  if (cached != null && cached.length > 0) return cached;
+  try {
+    let text = svgTextCache.get(url);
+    if (text == null || text.length == 0) {
+      text = await downloadSvgText(url, 8000);
+      svgTextCache.set(url, text);
+    }
+    let processed = moveDefsToFront(text);
+    processed = setSvgSize(processed, widthPx, heightPx);
+    const dataUrl = "data:image/svg+xml;utf8," + encodeURIComponent(processed);
+    svgDataUrlCache.set(cacheKey, dataUrl);
+    return dataUrl;
+  } catch (_e) {
+    // 下载/处理失败回退原始 URL（仍按 App 默认行为渲染）
+    return url;
+  }
+  // #endif
+  // #ifndef APP
+  return url;
+  // #endif
+}

@@ -29,6 +29,7 @@ import {
   ESP_PROV_CONNECT_TIMEOUT_MS,
   ESP_PROV_DEFAULT_DEVICE_PREFIX,
   ESP_PROV_DEFAULT_SERVICE_UUID,
+  ESP_PROV_PERMISSION_TIMEOUT_MS,
   ESP_PROV_SCAN_TIMEOUT_MS,
   ESP_PROV_STATUS_TIMEOUT_MS,
   ESP_PROV_REQUIRED_CAPABILITY,
@@ -128,10 +129,7 @@ export class EspProvisioningController {
     this.scannedDevices.value = [] as EspProvisioningDevice[];
     this.busy.value = true;
     try {
-      if (!this.initialized) {
-        await this.client.initialize(this.config);
-        this.initialized = true;
-      }
+      await this.ensureInitialized();
       this.phase.value = EspProvisioningPhaseEnum.SCANNING;
       await this.client.startScan();
     } catch (e) {
@@ -178,10 +176,7 @@ export class EspProvisioningController {
     }
 
     try {
-      if (!this.initialized) {
-        await this.client.initialize(this.config);
-        this.initialized = true;
-      }
+      await this.ensureInitialized();
     } catch (e) {
       this.fail(this.asEspError(e), ProvisionRetryActionEnum.RECONNECT);
       return false;
@@ -282,10 +277,7 @@ export class EspProvisioningController {
     this.busy.value = true;
 
     try {
-      if (!this.initialized) {
-        await this.client.initialize(this.config);
-        this.initialized = true;
-      }
+      await this.ensureInitialized();
     } catch (e) {
       this.fail(this.asEspError(e), ProvisionRetryActionEnum.RECONNECT);
       return false;
@@ -443,6 +435,16 @@ export class EspProvisioningController {
       await this.startScan();
       return;
     }
+    if (this.retryAction == ProvisionRetryActionEnum.RETRY_BIND) {
+      // 绑定/下发密钥失败（网络/网关错误）：BLE 会话仍存活，直接重试绑定，
+      // 无需重连 BLE（否则每次重试都走一遍扫描+连接+读设备信息，长时间停在绑定节点）。
+      // 若期间会话已失效，bindAndDeliverSecret 内部会按 RECONNECT 失败，下轮重试自动重连。
+      const delivered = await this.bindAndDeliverSecret("");
+      if (!delivered) {
+        console.warn('[ProvisionRetry] RETRY_BIND 未成功，失败态已由内部 fail 设置');
+        return;
+      }
+    }
     if (this.retryAction == ProvisionRetryActionEnum.RECONNECT) {
       const device = this.currentDevice;
       const ok = device != null
@@ -529,13 +531,14 @@ export class EspProvisioningController {
       try {
         const res = await apiVoxBindDevice(params);
         if (apiResCode(res) != SUCCESS_CODE) {
+          // BLE 会话仍存活：重试动作走 RETRY_BIND（直接重绑），无需 BLE 重连
           this.fail(new EspProvisioningError(
             EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
             '设备绑定失败',
             `bind code=${apiResCode(res)} msg=${apiResMessage(res)}`,
             0,
             true,
-          ), ProvisionRetryActionEnum.RECONNECT);
+          ), ProvisionRetryActionEnum.RETRY_BIND);
           return false;
         }
         const raw = apiResData<any>(res);
@@ -548,8 +551,16 @@ export class EspProvisioningController {
         bindingId = bindingIdVal != null ? `${bindingIdVal}` : '';
       } catch (e) {
         const err = this.asEspError(e);
-        console.error(`[VoxBind] bind 异常 deviceId=${deviceId} | code=${err.code} | detail=${err.detail} | nativeCode=${err.nativeCode}`);
-        this.fail(err, ProvisionRetryActionEnum.RECONNECT);
+        // try 块内异常均来自绑定请求（网络/超时/网关 502 等，业务码走上面的响应分支）；
+        // 归为可重试的网络错误，重试动作 RETRY_BIND（BLE 会话仍存活，直接重绑）。
+        console.error(`[VoxBind] bind 网络异常 deviceId=${deviceId} | code=${err.code} | detail=${err.detail} | nativeCode=${err.nativeCode}`);
+        this.fail(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.NETWORK_ERROR,
+          '网络异常，绑定请求失败',
+          err.detail,
+          err.nativeCode,
+          true,
+        ), ProvisionRetryActionEnum.RETRY_BIND);
         return false;
       }
       if (secret == '') {
@@ -559,7 +570,7 @@ export class EspProvisioningController {
           'bind response missing deviceSecret',
           0,
           true,
-        ), ProvisionRetryActionEnum.RECONNECT);
+        ), ProvisionRetryActionEnum.RETRY_BIND);
         return false;
       }
       if (websocketUrl == '') {
@@ -569,7 +580,7 @@ export class EspProvisioningController {
           'bind response missing websocketUrl',
           0,
           true,
-        ), ProvisionRetryActionEnum.RECONNECT);
+        ), ProvisionRetryActionEnum.RETRY_BIND);
         return false;
       }
       // 缓存绑定结果供本次会话 RECONNECT 复用（仅内存，不落盘）
@@ -660,6 +671,55 @@ export class EspProvisioningController {
   /** 本次会话 bind 接口返回的绑定记录 ID（在线轮询用；仅内存，dispose 清空）。 */
   getBoundBindingId(): string {
     return this.boundBindingId;
+  }
+
+  /**
+   * 入口页预请求平台运行时权限（仅申请权限，不初始化桥）。
+   * BLE 弹窗若等到 connect 页 onLoad 才触发，会紧跟扫码的相机权限弹窗，
+   * Android 可能延后显示甚至丢弃第二次请求 → initialize 永不返回、卡「正在连接设备…」。
+   * 失败静默：正式流程的 ensureInitialized 会再次校验并给出可重试失败态。
+   */
+  prewarmPermissions(): void {
+    this.client.ensurePermissions().catch((err) => {
+      console.warn('[EspProvisioning] prewarm permissions failed:', err);
+    });
+  }
+
+  /**
+   * 初始化 + 蓝牙权限申请超时兜底。
+   * 首次授权时权限弹窗可能停留数十秒；若回调因页面跳转 / 回调对象 GC 等原因丢失，
+   * 15s 后按 NO_PERMISSION 失败进入失败态（可重试；重试时权限已授予会立即通过），
+   * 避免界面卡死在「正在连接设备…」。
+   */
+  private async ensureInitialized(): Promise<void> {
+    if (this.initialized) return;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.NO_PERMISSION,
+          '蓝牙权限申请超时，请重试',
+          'permission request timed out',
+          0,
+          true,
+        ));
+      }, ESP_PROV_PERMISSION_TIMEOUT_MS) as number;
+      this.client.initialize(this.config).then(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.initialized = true;
+        resolve();
+      }).catch((err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        // UTSPromise.catch 参数为 Any?，显式 any 类型不匹配；转 any 后交给 asEspError 归一化
+        reject(this.asEspError(err as any));
+      });
+    });
   }
 
   private createDefaultConfig(): EspProvisioningConfig {
@@ -780,6 +840,7 @@ export class EspProvisioningController {
     if (code == EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED) return 'Mobile.Provision.Error.writeFailed';
     if (code == EspProvisioningErrorCodeEnum.VOX_CONFIG_INVALID) return 'Mobile.Provision.Error.voxConfigInvalid';
     if (code == EspProvisioningErrorCodeEnum.VOX_CONFIG_PERSIST_FAILED) return 'Mobile.Provision.Error.voxConfigPersistFailed';
+    if (code == EspProvisioningErrorCodeEnum.NETWORK_ERROR) return 'Mobile.Provision.Error.networkError';
     return 'Mobile.Provision.Error.unknown';
   }
 

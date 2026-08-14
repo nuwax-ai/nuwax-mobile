@@ -1,8 +1,10 @@
 /**
- * 边生成边播报器：AI 回复流式生成过程中，增量文本分句后顺序播报。
+ * 边生成边播报器：AI 回复流式生成过程中，增量文本分句后喂给流式 TTS 会话顺序播报。
  *
- * 播放链路：synthesizeToSrc + playSrcAndWait；播放当前句时串行预合成队列中后续句子
- * （ready 缓冲，深度见 MAX_READY_BUFFER），避免「只预取一句」仍跟不上播速。
+ * 播放链路（一次 start 的流式会话，协议见 docs/app-asr-tts.md 5.1）：
+ * - kickFeed 把合并后的句子喂给 ttsWebSocketPlayer.feedStreamText（多次 text，结束 flush）；
+ * - 服务端边收边合成回 PCM，player 按阈值切段成 WAV，回调推入 readySegments；
+ * - kickPlay 顺序 playSrcAndWait 播放；tts_end 后段队列排空即 finishRound（本地播完才算完）。
  *
  * 文本侧：
  * - 双通道（body / think）按「可朗读快照」增量消费（consumedSpeakable）；
@@ -21,19 +23,19 @@ import { ttsWebSocketPlayer } from "./ttsWebSocketPlayer";
 import { audioPlayerManager } from "./audioPlayerManager";
 import { clearMessageIdRewrite } from "./speechIdRewrite";
 
-/** 单次 TTS 最短字数：更短以便更快出声 */
+/** 单次喂入最短字数：更短以便更快出声 */
 const MIN_UTTERANCE_CHARS = 3;
 
-/** 短句合并上限，避免一次合成过长 */
+/** 短句合并上限，避免单次喂入过长 */
 const MAX_MERGED_UTTERANCE_CHARS = 40;
 
 /**
- * 播放时最多提前合成的句数。
- * 首句开播前会尽量预填，避免「第一句播完还要等下一句合成」。
+ * 等待段/会话结束的兜底超时：服务端中途停流（无新帧且不发 tts_end）时
+ * 强制结束本轮，防止播放循环永久悬挂、图标不复位。
  */
-const MAX_READY_BUFFER = 3;
+const STREAM_SEGMENT_WAIT_TIMEOUT_MS = 15000;
 
-/** 已合成待播条目 */
+/** 会话切好的待播段（src + 估算时长） */
 class ReadyUtterance {
   sentence: string = "";
   src: string = "";
@@ -82,8 +84,26 @@ export class VoiceStreamSpeaker {
   private onPendingEnqueued: (() => void) | null = null;
   /** SSE 已结束（尾句入队后仍可能在播） */
   private streamFinished: boolean = false;
+  /** 流式会话已结束（tts_end / flush 看门狗 / 停止；之后不再有新段） */
+  private streamEnded: boolean = false;
+  /** 会话切好的待播段（由会话回调推入，kickPlay 顺序消费） */
+  private readySegments: ReadyUtterance[] = [];
+  /** 文本喂入循环运行标记 */
+  private feeding: boolean = false;
+  /** 段就绪 / 会话结束的等待器（kickPlay 挂起，回调唤醒） */
+  private segmentWaiter: (() => void) | null = null;
+  /** 段等待兜底超时（停流时强制收尾，防悬挂） */
+  private segmentWaitTimer: number = 0;
   /** 待处理快照（只保留最新一份） */
   private queuedChunk: ChunkSnapshot | null = null;
+
+  /** 清掉段等待兜底定时器（换轮/结束时必须 clearTimeout，防旧轮定时器误杀新会话） */
+  private clearSegmentWaitTimer(): void {
+    if (this.segmentWaitTimer != 0) {
+      clearTimeout(this.segmentWaitTimer);
+      this.segmentWaitTimer = 0;
+    }
+  }
 
   /**
    * 开始一轮流式播报（新一轮会话开始时调用）
@@ -100,12 +120,40 @@ export class VoiceStreamSpeaker {
     this.bodyChannel = new StreamChannel();
     this.thinkChannel = new StreamChannel();
     this.pendingSentences = [];
+    this.readySegments = [];
     this.segmentIndex = 0;
     this.queuedChunk = null;
     this.streamFinished = false;
+    this.streamEnded = false;
     this.playLooping = false;
+    this.feeding = false;
+    this.segmentWaiter = null;
+    this.clearSegmentWaitTimer();
     this.onPendingEnqueued = null;
     this.active = true;
+    // 注册流式会话回调（段就绪 → 播放队列；会话结束 → 排空即整轮结束）
+    const expectedRound = this.round;
+    ttsWebSocketPlayer.setStreamSessionHandlers(
+      (src: string, durationMs: number): void => {
+        if (expectedRound != this.round) {
+          return;
+        }
+        const item = new ReadyUtterance();
+        item.src = src;
+        item.durationMs = durationMs;
+        this.readySegments.push(item);
+        this.notifySegmentWaiter();
+      },
+      (): void => {
+        if (expectedRound != this.round) {
+          return;
+        }
+        this.streamEnded = true;
+        this.notifySegmentWaiter();
+      },
+    );
+    // 一次 start 的流式会话：后续 onStreamChunk 增量喂 text，flush 后 tts_end 收尾
+    ttsWebSocketPlayer.beginStreamSession(messageId);
   }
 
   /**
@@ -157,21 +205,27 @@ export class VoiceStreamSpeaker {
         logText,
     );
     this.begin(messageId, settings);
-    // finished=true：整段按句/软切分入队，kickPlay 逐段 synthesize
+    // finished=true：整段按句/软切分入队，kickFeed 逐句喂入流式会话，播放由段队列驱动
     this.onStreamChunk(trimmed, "", true);
   }
 
   /** 停止流式播报（会话停止/新轮次/手动停止时调用） */
   stop(): void {
-    // 作废在途 kickPlay / 预合成，避免 stop 后 await 返回又 playSrcAndWait
+    // 作废在途 kickPlay / 喂入，避免 stop 后 await 返回又 playSrcAndWait
     this.round += 1;
     this.active = false;
     this.queuedChunk = null;
     this.pendingSentences = [];
+    this.readySegments = [];
     this.streamFinished = false;
+    this.streamEnded = true;
     this.playLooping = false;
+    this.feeding = false;
     this.onPendingEnqueued = null;
+    this.segmentWaiter = null;
+    this.clearSegmentWaitTimer();
     this.messageId = "";
+    // 会话结束（发 close + 唤醒等待者）；内部 ttsWebSocketPlayer.stop() 再收尾连接
     ttsWebSocketPlayer.stop();
     audioPlayerManager.stop();
   }
@@ -213,8 +267,12 @@ export class VoiceStreamSpeaker {
     this.active = false;
     this.playLooping = false;
     this.streamFinished = false;
+    this.streamEnded = false;
     this.pendingSentences = [];
+    this.readySegments = [];
     this.queuedChunk = null;
+    this.segmentWaiter = null;
+    this.clearSegmentWaitTimer();
     this.messageId = "";
     ttsWebSocketPlayer.notifyUiIdle();
   }
@@ -275,16 +333,100 @@ export class VoiceStreamSpeaker {
     if (snap.finished == true) {
       this.streamFinished = true;
     }
-    // 不 await：文本继续吃 SSE，播放在独立循环里流水线执行
+    // 不 await：文本继续吃 SSE，喂入与播放都在独立循环里执行
     this.kickPlay(snap.round);
-    if (
-      this.streamFinished == true &&
-      this.playLooping != true &&
-      this.pendingSentences.length == 0
-    ) {
-      // 无待播内容（空正文 / 全被过滤）：立刻复位工具栏
-      this.finishRound();
+    this.kickFeed(snap.round);
+  }
+
+  /** 等待新的段 / 会话结束（kickPlay 挂起处；回调唤醒；超时兜底收尾） */
+  private waitForSegment(): Promise<void> {
+    if (this.readySegments.length > 0 || this.streamEnded == true) {
+      return Promise.resolve();
     }
+    return new Promise<void>((resolve) => {
+      this.segmentWaiter = (): void => {
+        resolve();
+      };
+      // 停流兜底：服务端无新帧且不发 tts_end 时强制结束本轮，防悬挂
+      this.segmentWaitTimer = setTimeout((): void => {
+        this.segmentWaitTimer = 0;
+        if (this.streamEnded != true) {
+          this.streamEnded = true;
+          // 通知 TTS 层收尾（发 close + 复位会话）
+          try {
+            ttsWebSocketPlayer.closeStreamSession();
+          } catch (_eC) {
+            // ignore
+          }
+        }
+        resolve();
+      }, STREAM_SEGMENT_WAIT_TIMEOUT_MS) as number;
+    });
+  }
+
+  private notifySegmentWaiter(): void {
+    if (this.segmentWaitTimer != 0) {
+      clearTimeout(this.segmentWaitTimer);
+      this.segmentWaitTimer = 0;
+    }
+    const waiter = this.segmentWaiter;
+    this.segmentWaiter = null;
+    if (waiter != null) {
+      try {
+        waiter();
+      } catch (_eW) {
+        // ignore
+      }
+    }
+  }
+
+  /**
+   * 文本喂入循环：把合并好的句子串行喂给流式会话（一次 start 的会话内多次 text）；
+   * 流结束冲刷尾包（flush）。让出主线程，避免 SSE 洪峰饿死 TTS WS / 音频回调。
+   */
+  private async kickFeed(expectedRound: number): Promise<void> {
+    if (this.feeding) {
+      return;
+    }
+    this.feeding = true;
+    try {
+      while (
+        this.active == true &&
+        this.streamEnded != true &&
+        expectedRound == this.round
+      ) {
+        if (this.pendingSentences.length == 0) {
+          break;
+        }
+        const utt = this.takeNextUtterance();
+        if (utt == null) {
+          // 队列里还有被放回的短句 → 等更多 SSE；队列空则静默退出
+          break;
+        }
+        if (utt.trim().length == 0) {
+          continue;
+        }
+        ttsWebSocketPlayer.feedStreamText(utt, false);
+        // 让出主线程：SSE 洪峰时否则 TTS WS / 音频回调要等会话结束后才被调度
+        await new Promise<void>((resolve) => {
+          setTimeout(() => {
+            resolve();
+          }, 0);
+        });
+      }
+      if (
+        expectedRound == this.round &&
+        this.streamFinished == true &&
+        this.pendingSentences.length == 0 &&
+        this.active == true &&
+        this.streamEnded != true
+      ) {
+        ttsWebSocketPlayer.flushStreamSession();
+      }
+    } catch (eFeed: any) {
+      console.warn("[VoiceStreamSpeaker] feed failed", eFeed);
+    }
+    this.feeding = false;
   }
 
   /**
@@ -331,225 +473,59 @@ export class VoiceStreamSpeaker {
   }
 
   /**
-   * 流水线播放：播当前句的同时，把 pending 队列里后续句串行预合成进 ready 缓冲。
+   * 段播放循环：消费流式会话切好的段，顺序播放。
+   * 段由会话回调推入 readySegments；会话结束（streamEnded）后队列排空即整轮结束。
+   * tts_end 只表示服务端已发完，本地段队列播完才 finishRound —— 这正是
+   * 「tts_end 不表示本地已播完」的收尾语义。
    */
   private async kickPlay(expectedRound: number): Promise<void> {
     if (this.playLooping) {
       return;
     }
     this.playLooping = true;
-    // 短句暂缓（等更多 SSE 文本）时勿在末尾同步重入，否则会无限递归撑爆栈
-    let waitingForMoreText = false;
-    const ready: ReadyUtterance[] = [];
-    let fillTask: Promise<void> | null = null;
-    let fillFailed = false;
-
-    /** 串行把 pending 填进 ready，最多 MAX_READY_BUFFER 条；播放中须 preserve=true */
-    const fillReadyBuffer = async (preserve: boolean): Promise<void> => {
+    try {
       while (
         expectedRound == this.round &&
-        fillFailed != true &&
-        ready.length < MAX_READY_BUFFER &&
-        (this.active == true || this.streamFinished == true)
+        (this.active == true || this.streamFinished == true) &&
+        (this.readySegments.length > 0 || this.streamEnded != true)
       ) {
-        const utt = this.takeNextUtterance();
-        if (utt == null) {
-          // 队列里还有被放回的短句 → 等更多 SSE；队列空则静默退出，入队时再唤醒
-          if (this.pendingSentences.length > 0) {
-            waitingForMoreText = true;
+        if (this.readySegments.length == 0) {
+          // 段未到：挂起等会话回调（新段 / tts_end / flush 看门狗 / 停止）
+          await this.waitForSegment();
+          if (expectedRound != this.round) {
+            break;
           }
-          break;
-        }
-        if (utt.trim().length == 0) {
           continue;
         }
+        const item = this.readySegments.shift()!;
+        let ok = false;
         try {
-          const src = await ttsWebSocketPlayer.synthesizeToSrc(utt, preserve);
-          if (expectedRound != this.round) {
-            break;
-          }
-          if (src.trim().length == 0) {
-            continue;
-          }
-          const item = new ReadyUtterance();
-          item.sentence = utt;
-          item.src = src;
-          item.durationMs = ttsWebSocketPlayer.getLastSynthDurationMs();
-          ready.push(item);
-          // 缓冲里已有条目后，后续合成一律 preserve，避免打断正在播的音频
-          preserve = true;
-        } catch (eFill: any) {
-          const errMsg =
-            eFill != null && (eFill as Error).message != null
-              ? `${(eFill as Error).message}`
-              : `${eFill}`;
-          // session busy：放回句子，稍后重试，禁止 fillFailed 打断整条流水线（否则首句后空等数秒）
-          if (errMsg.indexOf("session busy") >= 0) {
-            this.pendingSentences.unshift(utt);
-            console.warn("[StreamSpeak] prefetch busy, retry later");
-            break;
-          }
-          console.warn("[StreamSpeak] prefetch synthesize failed", eFill);
-          fillFailed = true;
+          ok = await ttsWebSocketPlayer.playSrcAndWait(
+            this.messageId,
+            item.src,
+            item.durationMs,
+          );
+        } catch (ePlay: any) {
+          console.warn("[VoiceStreamSpeaker] playSrcAndWait failed", ePlay);
+          ok = false;
+        }
+        if (expectedRound != this.round) {
+          break;
+        }
+        if (ok != true) {
+          console.warn(
+            "[StreamSpeak] segment play failed, drop remaining segments=",
+            this.readySegments.length,
+          );
+          this.readySegments = [];
+          ttsWebSocketPlayer.releaseIdleConnection();
+          this.finishRound();
           break;
         }
       }
-    };
-
-    const ensureFillTask = (preserve: boolean): void => {
-      if (fillTask != null) {
-        return;
-      }
-      if (ready.length >= MAX_READY_BUFFER) {
-        return;
-      }
-      if (this.pendingSentences.length == 0) {
-        return;
-      }
-      fillTask = fillReadyBuffer(preserve).then(
-        () => {
-          fillTask = null;
-        },
-        () => {
-          fillTask = null;
-        },
-      );
-    };
-
-    // 首句合成完成前禁止 onPendingEnqueued 触发预取：单路 TTS WebSocket 并发合成会双开
-    this.onPendingEnqueued = null;
-
-    while (
-      expectedRound == this.round &&
-      (ready.length > 0 || this.pendingSentences.length > 0) &&
-      (this.active == true || this.streamFinished == true) &&
-      fillFailed != true
-    ) {
-      // 缓冲空：等在途 fill，或独占合成首条
-      if (ready.length == 0) {
-        if (fillTask != null) {
-          await fillTask;
-          fillTask = null;
-        }
-        if (ready.length == 0) {
-          const nextUtt = this.takeNextUtterance();
-          if (nextUtt == null) {
-            waitingForMoreText = true;
-            break;
-          }
-          if (nextUtt.trim().length == 0) {
-            continue;
-          }
-          let src = "";
-          try {
-            src = await ttsWebSocketPlayer.synthesizeToSrc(nextUtt, false);
-          } catch (eSynth: any) {
-            console.warn("[StreamSpeak] synthesize failed, retry once", eSynth);
-            ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-            try {
-              src = await ttsWebSocketPlayer.synthesizeToSrc(nextUtt, false);
-            } catch (eRetry: any) {
-              console.warn(
-                "[VoiceStreamSpeaker] synthesize retry failed",
-                eRetry,
-              );
-              this.pendingSentences = [];
-              // 失败立刻停 TTS，并清 messageId 通知工具栏复位
-              try {
-                ttsWebSocketPlayer.stop();
-              } catch (_eStop) {
-                // ignore
-              }
-              this.finishRound();
-              break;
-            }
-          }
-          if (expectedRound != this.round) {
-            break;
-          }
-          if (src.trim().length == 0) {
-            continue;
-          }
-          const first = new ReadyUtterance();
-          first.sentence = nextUtt;
-          first.src = src;
-          first.durationMs = ttsWebSocketPlayer.getLastSynthDurationMs();
-          ready.push(first);
-        }
-      }
-
-      // 首条就绪立刻开播：禁止再等预填 2～3 句（否则首声晚数秒，长 SSE 更像「结束后才播」）
-      // 预取放到播放期间串行做
-
-      // 首条就绪后再允许入队回调预取（与当前播放串行占同一条 WS）
-      if (this.onPendingEnqueued == null) {
-        this.onPendingEnqueued = (): void => {
-          if (expectedRound != this.round) {
-            return;
-          }
-          ensureFillTask(true);
-        };
-      }
-
-      const item = ready.shift()!;
-      const playPromise = ttsWebSocketPlayer.playSrcAndWait(
-        this.messageId,
-        item.src,
-        item.durationMs,
-      );
-
-      // 播放期间把队列后续句尽量预合成进缓冲
-      ensureFillTask(true);
-
-      let ok = false;
-      try {
-        ok = await playPromise;
-      } catch (ePlay: any) {
-        console.warn("[VoiceStreamSpeaker] playSrcAndWait failed", ePlay);
-        ok = false;
-      }
-      if (ok != true) {
-        console.warn(
-          "[StreamSpeak] TTS play failed, drop remaining segments=",
-          this.pendingSentences.length,
-        );
-        ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-        if (fillTask != null) {
-          await fillTask;
-          fillTask = null;
-        }
-        ready.splice(0, ready.length);
-        this.pendingSentences = [];
-        ttsWebSocketPlayer.releaseIdleConnection();
-        this.finishRound();
-        break;
-      }
-      if (expectedRound != this.round) {
-        ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-        if (fillTask != null) {
-          await fillTask;
-          fillTask = null;
-        }
-        ready.splice(0, ready.length);
-        break;
-      }
-
-      // 下一句尚未就绪：播完后再补一轮预取，缩短空窗
-      if (ready.length == 0 && this.pendingSentences.length > 0) {
-        await fillReadyBuffer(false);
-      } else {
-        ensureFillTask(true);
-      }
+    } catch (eKick: any) {
+      console.warn("[VoiceStreamSpeaker] kickPlay error", eKick);
     }
-
-    // 退出时收尾在途预取，避免脏 socket
-    this.onPendingEnqueued = null;
-    if (fillTask != null) {
-      ttsWebSocketPlayer.cancelInFlightPreserveSynth();
-      await fillTask;
-      fillTask = null;
-    }
-    ready.splice(0, ready.length);
 
     // 已被 stop/begin 换轮：勿动 playLooping / messageId（新轮可能已在跑）
     if (expectedRound != this.round) {
@@ -561,25 +537,26 @@ export class VoiceStreamSpeaker {
       return;
     }
     this.playLooping = false;
+    // streamEnded 即服务端已发完（tts_end / flush 看门狗 / 停流强制收尾）：
+    // 段队列已空且无滞留快照 → 整轮结束（本地缓冲播完才到这里）。
     if (
-      this.streamFinished == true &&
-      this.pendingSentences.length == 0 &&
+      this.streamEnded == true &&
+      this.readySegments.length == 0 &&
       this.queuedChunk == null
     ) {
-      // 整轮播报结束：释放连接 + 清 messageId + 强制 idle 通知工具栏
+      // 释放连接 + 清 messageId + 强制 idle 通知工具栏
       ttsWebSocketPlayer.releaseIdleConnection();
       this.finishRound();
     } else if (
-      waitingForMoreText != true &&
-      (this.active == true || this.streamFinished == true) &&
-      this.pendingSentences.length > 0
+      this.readySegments.length > 0 ||
+      (this.streamEnded != true && this.active == true)
     ) {
-      // 播放期间又入队了新句；异步再入，避免同步递归
+      // 写段回调在循环退出后入队 / 会话仍在出段：异步再入，避免同步递归
       setTimeout(() => {
         this.kickPlay(expectedRound);
       }, 0);
     }
-    // waitingForMoreText：短句已放回队列，等下一次 processChunk → kickPlay
+    // streamEnded 但 queuedChunk 未消费：等下一次 processChunk → kickPlay
   }
 
   /**

@@ -508,6 +508,48 @@ export class TtsWebSocketPlayer {
   /** H5：最近一次手势解锁 play() 的发起时刻；宽限期内 stopSharedAudio 跳过 stop */
   private unlockPlayAtMs: number = 0;
 
+  // ==================== 流式会话（一次 start / 多次 text / flush） ====================
+  // 协议见 docs/app-asr-tts.md 5.1：
+  //   start → tts_ready → text(×N, 最后 flush:true) → tts_begin → PCM 帧 → tts_end → close
+  // tts_end 仅表示服务端已发完；本地缓冲播完（段队列排空）才结束本轮，之后才能再 start。
+  // 用户停止播放：closeStreamSession 发 close。
+  /** 流式会话已开启（start 已发，socket 可能仍在 connect） */
+  private streamSessionActive: boolean = false;
+  /** 已收到 tts_ready（可喂 text） */
+  private streamReady: boolean = false;
+  /** 已收到 tts_begin 或已有 PCM（本轮音频开始） */
+  private streamAudioStarted: boolean = false;
+  /** 已发 flush（服务端收尾；tts_end 后不再有音频） */
+  private streamFlushSent: boolean = false;
+  /** 已收到 tts_end 或 flush 看门狗超时（服务端已发完，本地段队列播完即整轮结束） */
+  private streamEnded: boolean = false;
+  /** 会话所属 messageId */
+  private streamMessageId: string = "";
+  /** 当前待切段的 PCM 累计字节数 */
+  private streamPcmBytes: number = 0;
+  /** 是否已产出首段（首段更早切，保证首声快） */
+  private streamFirstSegmentDone: boolean = false;
+  /** 正在写段文件（串行化切段，保证回调顺序） */
+  private streamCutting: boolean = false;
+  /** tts_end 时仍有缓冲未切（写段/pendingBinary 中）：等当前写完后强制切尾段，防丢音频 */
+  private streamFinalPending: boolean = false;
+  /** tts_ready 前积压的 text 帧 */
+  private pendingFeedTexts: string[] = [];
+  /** 段就绪回调（voiceStreamSpeaker 注入） */
+  private streamSegmentHandler:
+    | ((src: string, durationMs: number) => void)
+    | null = null;
+  /** 会话结束回调（tts_end / flush 超时 / 停止 / 失败；voiceStreamSpeaker 注入） */
+  private streamEndHandler: (() => void) | null = null;
+  /** flush 后等待 tts_end 的超时（flush 无音频产出时服务端不发 tts_end，需兜底） */
+  private flushEndTimerId: number = 0;
+  /** 首段切段阈值（音频 ms）；更小 → 首声更早 */
+  private readonly STREAM_FIRST_SEGMENT_MS: number = 1000;
+  /** 后续段切段阈值（音频 ms）；更大 → 段更少、边界更少 */
+  private readonly STREAM_SEGMENT_MS: number = 4000;
+  /** flush 后等 tts_end 的看门狗 */
+  private readonly STREAM_FLUSH_END_WATCHDOG_MS: number = 5000;
+
   /**
    * 录音 onStart 后预热：建连但不发合成请求（轻触未开录勿调）。
    * 防重连风暴：已有 warm / 建连中则直接返回。
@@ -535,6 +577,7 @@ export class TtsWebSocketPlayer {
     this.generation += 1;
     this.warmGeneration += 1;
     this.clearSynthStallWatchdog();
+    this.resetStreamSessionState(true);
     this.closeWarmSocket();
     this.closeSessionSocketOnly();
     this.keepalive.resume();
@@ -973,6 +1016,359 @@ export class TtsWebSocketPlayer {
     this.pendingBinary = 0;
     this.chunks = [] as Uint8Array[];
     this.recycleSessionToWarm();
+  }
+
+  // ==================== 流式会话实现 ====================
+
+  /** 注册会话段/结束回调（voiceStreamSpeaker 注入；重复调用覆盖） */
+  setStreamSessionHandlers(
+    onSegment: ((src: string, durationMs: number) => void) | null,
+    onEnd: (() => void) | null,
+  ): void {
+    this.streamSegmentHandler = onSegment;
+    this.streamEndHandler = onEnd;
+  }
+
+  /**
+   * 开启一轮流式会话：一次 start，之后多次 feedStreamText，flush 后 tts_end 收尾。
+   * 异步打开连接并发送 start；tts_ready 前 feed 的文本会排队，就绪后自动冲刷。
+   * 会打断当前播报（含工具栏单条播放），语义与 synthesizeToSrc(preserve=false) 一致。
+   */
+  beginStreamSession(messageId: string): void {
+    // 旧会话先收尾（清字段、防双 sink）。注意：不 notify ——
+    // 旧轮等待者由调用方（voiceStreamSpeaker.begin → ttsWebSocketPlayer.stop → closeStreamSession）
+    // 负责唤醒；若在此 notify，会命中「刚注册的本轮 end handler」，把 speaker.streamEnded 误置 true，
+    // 导致整轮立即 finishRound 不出声。
+    this.resetStreamSessionState(false);
+    this.prepareForNextUtterance(true);
+    this.streamMessageId = messageId;
+    this.messageId = messageId;
+    this.streamSessionActive = true;
+    this.streamReady = false;
+    this.streamEnded = false;
+    this.streamFlushSent = false;
+    this.pendingFeedTexts = [] as string[];
+    this.setState("connecting");
+    const accessToken = resolveSpeechAccessToken();
+    if (accessToken.length == 0) {
+      this.fail("登录状态已失效");
+      return;
+    }
+    this.generation += 1;
+    const expectedGeneration = this.generation;
+    this.takeOrOpenSessionSocket(accessToken, expectedGeneration).then(
+      (): void => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        // 覆盖 bindSessionHandlers 装的 play 路径 sink：会话独立处理 tts_ready 排队 / 切段
+        this.installStreamSessionSink(expectedGeneration);
+        this.sendJson(buildTtsControlMessage("start", null, this.sampleRate));
+      },
+      (e: any): void => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        const msg =
+          e != null && (e as Error).message != null
+            ? `${(e as Error).message}`
+            : "TTS 连接失败";
+        this.fail(msg);
+      },
+    );
+  }
+
+  /**
+   * 喂入一段待合成文本。
+   * @param flush true：本条为尾段（等价 flush），服务端收尾并回 tts_end
+   */
+  feedStreamText(text: string, flush: boolean): void {
+    if (this.streamSessionActive != true || this.streamEnded == true) {
+      return;
+    }
+    if (flush == true) {
+      this.streamFlushSent = true;
+    }
+    if (this.streamReady != true) {
+      this.pendingFeedTexts.push(text);
+      return;
+    }
+    this.sendFeedTextFrame(text, flush);
+  }
+
+  /** 冲刷尾包（独立 flush 帧；feed 的尾段带 flush:true 后无需再调） */
+  flushStreamSession(): void {
+    if (this.streamSessionActive != true || this.streamFlushSent == true) {
+      return;
+    }
+    this.streamFlushSent = true;
+    if (this.streamReady == true) {
+      this.sendFlushFrame();
+    }
+    // ready 前 flush：由 tts_ready → flushPendingFeedTexts 补发
+  }
+
+  /** 用户停止 / 离开：结束流式会话（发 close；服务端回 tts_closed 后 socket 收回待命） */
+  closeStreamSession(): void {
+    this.clearFlushEndWatchdog();
+    const active = this.streamSessionActive == true;
+    const socketAlive = this.socketTask != null;
+    this.resetStreamSessionState(false);
+    if (active == true && socketAlive == true) {
+      const payload = new UTSJSONObject();
+      payload["type"] = "close";
+      this.sendJson(payload);
+    }
+    // 通知会话端（voiceStreamSpeaker 的 kickPlay 靠它退出）
+    this.notifyStreamEnd();
+  }
+
+  private sendFeedTextFrame(text: string, flush: boolean): void {
+    this.sendJson(buildTtsControlMessage("text", text, 0, flush));
+    if (flush == true) {
+      this.armFlushEndWatchdog();
+    }
+  }
+
+  private sendFlushFrame(): void {
+    const payload = new UTSJSONObject();
+    payload["type"] = "flush";
+    this.sendJson(payload);
+    this.armFlushEndWatchdog();
+  }
+
+  private flushPendingFeedTexts(): void {
+    const pending = this.pendingFeedTexts;
+    this.pendingFeedTexts = [] as string[];
+    for (let i = 0; i < pending.length; i++) {
+      this.sendFeedTextFrame(pending[i], false);
+    }
+    if (this.streamFlushSent == true) {
+      this.sendFlushFrame();
+    }
+  }
+
+  /** 会话消息处理：与 play 路径的 handleSocketMessage 平级 */
+  private handleStreamSessionMessage(res: OnSocketMessageCallbackResult): void {
+    if (typeof res.data != "string") {
+      this.appendStreamChunk(res.data);
+      return;
+    }
+    let message: UTSJSONObject | null = null;
+    try {
+      message = JSON.parse<UTSJSONObject>(res.data as string);
+    } catch (_eJson) {
+      this.fail("TTS 返回了无效消息");
+      return;
+    }
+    if (message == null) {
+      return;
+    }
+    const typeVal = message!["type"];
+    const type = typeVal != null ? `${typeVal}` : "";
+    if (type == "ping" || type == "pong") {
+      return;
+    }
+    if (type == "tts_ready") {
+      this.streamReady = true;
+      this.setState("synthesizing");
+      this.armSynthStallWatchdog();
+      this.flushPendingFeedTexts();
+    } else if (type == "tts_begin") {
+      this.streamAudioStarted = true;
+      this.setState("synthesizing");
+    } else if (type == "tts_end") {
+      this.clearFlushEndWatchdog();
+      this.streamEnded = true;
+      // 收尾剩余缓冲（final=true 强制切，即便不足阈值）
+      this.tryCutStreamSegment(true);
+      this.notifyStreamEnd();
+    } else if (type == "error") {
+      const codeVal = message!["code"];
+      const messageVal = message!["message"];
+      const code = codeVal != null ? `${codeVal}` : "";
+      const msg = messageVal != null ? `${messageVal}` : "TTS 合成失败";
+      if (
+        code == "UNKNOWN_TYPE" &&
+        (msg.indexOf("ping") >= 0 || msg.indexOf("pong") >= 0)
+      ) {
+        this.keepalive.markRejectedByServer();
+        return;
+      }
+      this.fail(msg);
+    } else if (type.length > 0) {
+      console.warn("[TTS] stream unknown ctrl type=", type);
+    }
+  }
+
+  /** 会话二进制帧：追加并尝试按阈值切段 */
+  private appendStreamChunk(data: any): void {
+    const syncBuffer = tryAsArrayBufferSync(data);
+    if (syncBuffer != null) {
+      if (syncBuffer!.byteLength > 0) {
+        this.chunks.push(new Uint8Array(syncBuffer!));
+        this.streamPcmBytes += syncBuffer!.byteLength;
+        this.clearSynthStallWatchdog();
+        this.tryCutStreamSegment(false);
+      } else {
+        console.warn("[TTS] stream skip empty binary frame");
+      }
+      return;
+    }
+    this.pendingBinary += 1;
+    toArrayBufferAsync(data).then((buffer: ArrayBuffer | null): void => {
+      this.pendingBinary -= 1;
+      if (this.pendingBinary < 0) {
+        this.pendingBinary = 0;
+      }
+      if (buffer != null && buffer!.byteLength > 0) {
+        this.chunks.push(new Uint8Array(buffer!));
+        this.streamPcmBytes += buffer!.byteLength;
+        this.clearSynthStallWatchdog();
+      } else {
+        console.warn("[TTS] stream skip empty/unrecognized binary frame");
+      }
+      this.tryCutStreamSegment(false);
+    });
+  }
+
+  /**
+   * 按阈值把已积累 PCM 切为一段 WAV 并交给 streamSegmentHandler。
+   * 串行化：streamCutting 置位期间不重复切，保证段回调顺序与音频顺序一致。
+   * @param final tts_end/flush 超时时强制切掉剩余缓冲
+   */
+  private tryCutStreamSegment(final: boolean): void {
+    // tts_end/flush 超时：标记尾段待切，等写段/pendingBinary 结束后兜底切掉，防剩余 PCM 丢失
+    if (final == true && this.chunks.length > 0) {
+      this.streamFinalPending = true;
+    }
+    if (this.pendingBinary > 0 || this.streamCutting == true) {
+      return;
+    }
+    const isFinal = this.streamFinalPending == true;
+    if (isFinal) {
+      this.streamFinalPending = false;
+    }
+    if (this.chunks.length == 0) {
+      return;
+    }
+    if (isFinal != true) {
+      const targetMs = this.streamFirstSegmentDone
+        ? this.STREAM_SEGMENT_MS
+        : this.STREAM_FIRST_SEGMENT_MS;
+      const durMs = Math.floor(
+        (this.streamPcmBytes * 1000) / (this.sampleRate * 2),
+      );
+      if (durMs < targetMs) {
+        return;
+      }
+    }
+    // 快照并清空累积，后续 PCM 进入下一段
+    const segChunks: Uint8Array[] = [];
+    for (let i = 0; i < this.chunks.length; i++) {
+      segChunks.push(this.chunks[i]);
+    }
+    this.chunks = [] as Uint8Array[];
+    this.streamPcmBytes = 0;
+    this.streamCutting = true;
+    let pcmBytes = 0;
+    for (let i = 0; i < segChunks.length; i++) {
+      pcmBytes += segChunks[i].length;
+    }
+    const durMs = Math.floor((pcmBytes * 1000) / (this.sampleRate * 2));
+    const wav = buildPcm16Wav(segChunks, this.sampleRate);
+    saveWavFile(wav).then(
+      (src: string): void => {
+        this.streamCutting = false;
+        this.lastSynthDurationMs = durMs > 0 ? durMs : 0;
+        this.streamFirstSegmentDone = true;
+        const handler = this.streamSegmentHandler;
+        if (handler != null) {
+          try {
+            handler(src, this.lastSynthDurationMs);
+          } catch (_eH) {
+            // ignore
+          }
+        }
+        // 写段期间又积累了新 PCM：继续切（final 场景已由 tts_end/flush 看门狗兜底）
+        this.tryCutStreamSegment(false);
+      },
+      (e: any | null): void => {
+        this.streamCutting = false;
+        let msg = "TTS 音频保存失败";
+        if (e != null) {
+          const em = (e as UTSJSONObject)["message"];
+          if (em != null && `${em}`.length > 0) {
+            msg = `${em}`;
+          }
+        }
+        this.fail(msg);
+      },
+    );
+  }
+
+  private armFlushEndWatchdog(): void {
+    this.clearFlushEndWatchdog();
+    this.flushEndTimerId = setTimeout((): void => {
+      this.flushEndTimerId = 0;
+      // flush 后无音频产出时服务端不发 tts_begin/tts_end（doc 5.3）：按已结束收尾
+      this.streamEnded = true;
+      this.tryCutStreamSegment(true);
+      this.notifyStreamEnd();
+    }, this.STREAM_FLUSH_END_WATCHDOG_MS) as number;
+  }
+
+  private clearFlushEndWatchdog(): void {
+    if (this.flushEndTimerId > 0) {
+      clearTimeout(this.flushEndTimerId);
+      this.flushEndTimerId = 0;
+    }
+  }
+
+  private notifyStreamEnd(): void {
+    const handler = this.streamEndHandler;
+    if (handler != null) {
+      try {
+        handler();
+      } catch (_eH) {
+        // ignore
+      }
+    }
+  }
+
+  private resetStreamSessionState(notify: boolean): void {
+    this.streamSessionActive = false;
+    this.streamReady = false;
+    this.streamAudioStarted = false;
+    this.streamFlushSent = false;
+    this.streamEnded = true;
+    this.streamMessageId = "";
+    this.streamPcmBytes = 0;
+    this.streamFirstSegmentDone = false;
+    this.streamCutting = false;
+    this.streamFinalPending = false;
+    this.pendingFeedTexts = [] as string[];
+    this.clearFlushEndWatchdog();
+    if (notify == true) {
+      this.notifyStreamEnd();
+    }
+  }
+
+  /** 会话 sink：与 play 路径互斥，覆盖 bindSessionHandlers 装的 handleSocketMessage */
+  private installStreamSessionSink(expectedGeneration: number): void {
+    const socketTask = this.socketTask;
+    if (socketTask == null) {
+      return;
+    }
+    this.socketMessageSink = (res: OnSocketMessageCallbackResult): void => {
+      if (
+        expectedGeneration != this.generation ||
+        this.streamSessionActive != true
+      ) {
+        return;
+      }
+      this.handleStreamSessionMessage(res);
+    };
   }
 
   /**
@@ -1961,6 +2357,12 @@ export class TtsWebSocketPlayer {
   }
 
   stop(): void {
+    // 流式会话：先发 close 结束服务端会话，再收尾
+    if (this.streamSessionActive == true) {
+      this.closeStreamSession();
+    } else {
+      this.notifyStreamEnd();
+    }
     this.prepareForNextUtterance(false);
     // 显式停止：立刻释放连接，不保留空闲长连
     this.releaseIdleConnection();
@@ -2315,6 +2717,16 @@ export class TtsWebSocketPlayer {
   private fail(message: string): void {
     console.error("[TTS] " + message);
     this.clearSynthStallWatchdog();
+    this.clearFlushEndWatchdog();
+    // 流式会话：置结束并唤醒等待者（voiceStreamSpeaker 的 kickPlay 靠它退出）
+    if (this.streamSessionActive == true || this.streamEnded == true) {
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+    }
+    this.streamSessionActive = false;
+    this.streamReady = false;
+    this.streamAudioStarted = false;
+    this.streamFlushSent = false;
     // 保留 messageId 直到 idle 通知结束，便于工具栏按消息匹配并退出播报态
     this.setState("error");
     // 流式多句连续 stall 时只弹一次，避免连环 toast

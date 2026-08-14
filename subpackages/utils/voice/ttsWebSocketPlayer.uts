@@ -547,8 +547,20 @@ export class TtsWebSocketPlayer {
   private readonly STREAM_FIRST_SEGMENT_MS: number = 1000;
   /** 后续段切段阈值（音频 ms）；更大 → 段更少、边界更少 */
   private readonly STREAM_SEGMENT_MS: number = 4000;
+  /** 按需切段的最小段长（音频 ms）：播放端等待时也须攒够最小段，避免逐帧切成碎片段 */
+  private readonly STREAM_FORCED_SEGMENT_MIN_MS: number = 500;
   /** flush 后等 tts_end 的看门狗 */
   private readonly STREAM_FLUSH_END_WATCHDOG_MS: number = 5000;
+  /** 播放端队列排空时请求的按需切段标记：有标记则切段不再等阈值（成功切段后清除） */
+  private streamForcePending: boolean = false;
+
+  // ---- 流式段播放：双 InnerAudioContext 交替，前一段播放期间预置下一段 src ----
+  /** 备用 InnerAudioContext（与 audioContext 交替使用） */
+  private streamAltAudioContext: InnerAudioContext | null = null;
+  /** 交替相位：true=本次用备用 context 播放 */
+  private streamUseAlt: boolean = false;
+  /** 已预置到「下次将播放的 context」上的 src（匹配则无需重新 set，直接 play） */
+  private streamPreloadedSrc: string = "";
 
   /**
    * 录音 onStart 后预热：建连但不发合成请求（轻触未开录勿调）。
@@ -591,6 +603,17 @@ export class TtsWebSocketPlayer {
         audio!.stop();
         audio!.destroy();
       } catch (_eAudio) {
+        // ignore
+      }
+    }
+    const alt = this.streamAltAudioContext;
+    this.streamAltAudioContext = null;
+    this.streamPreloadedSrc = "";
+    if (alt != null) {
+      try {
+        alt!.stop();
+        alt!.destroy();
+      } catch (_eAlt) {
         // ignore
       }
     }
@@ -787,6 +810,10 @@ export class TtsWebSocketPlayer {
     const audio = this.audioContext;
     if (audio != null) {
       audio!.volume = muted ? 0 : 1;
+    }
+    const alt = this.streamAltAudioContext;
+    if (alt != null) {
+      alt!.volume = muted ? 0 : 1;
     }
   }
 
@@ -1237,6 +1264,19 @@ export class TtsWebSocketPlayer {
    * 串行化：streamCutting 置位期间不重复切，保证段回调顺序与音频顺序一致。
    * @param final tts_end/flush 超时时强制切掉剩余缓冲
    */
+  /**
+   * 播放端队列排空时请求按需切段：立即把已缓冲音频切出（无需凑满 STREAM_SEGMENT_MS），
+   * 消除「凑段等待」造成的段边界停顿。force 标记在成功切段后清除；缓冲不足最小段时保留，
+   * 等下一帧到达再切。
+   */
+  requestStreamSegment(): void {
+    if (this.streamSessionActive != true || this.streamEnded == true) {
+      return;
+    }
+    this.streamForcePending = true;
+    this.tryCutStreamSegment(false);
+  }
+
   private tryCutStreamSegment(final: boolean): void {
     // tts_end/flush 超时：标记尾段待切，等写段/pendingBinary 结束后兜底切掉，防剩余 PCM 丢失
     if (final == true && this.chunks.length > 0) {
@@ -1253,16 +1293,29 @@ export class TtsWebSocketPlayer {
       return;
     }
     if (isFinal != true) {
-      const targetMs = this.streamFirstSegmentDone
-        ? this.STREAM_SEGMENT_MS
-        : this.STREAM_FIRST_SEGMENT_MS;
       const durMs = Math.floor(
         (this.streamPcmBytes * 1000) / (this.sampleRate * 2),
       );
-      if (durMs < targetMs) {
-        return;
+      if (this.streamForcePending == true) {
+        // 按需切段：不等满阈值，但须攒够最小段，避免逐帧切成碎片段
+        if (durMs < this.STREAM_FORCED_SEGMENT_MIN_MS) {
+          return;
+        }
+      } else {
+        const targetMs = this.streamFirstSegmentDone
+          ? this.STREAM_SEGMENT_MS
+          : this.STREAM_FIRST_SEGMENT_MS;
+        if (durMs < targetMs) {
+          return;
+        }
       }
     }
+    this.streamForcePending = false;
+    this.cutStreamSegmentNow();
+  }
+
+  /** 把当前累积 PCM 切为一段 WAV 并交给 streamSegmentHandler（串行化，保证回调顺序） */
+  private cutStreamSegmentNow(): void {
     // 快照并清空累积，后续 PCM 进入下一段
     const segChunks: Uint8Array[] = [];
     for (let i = 0; i < this.chunks.length; i++) {
@@ -1347,6 +1400,8 @@ export class TtsWebSocketPlayer {
     this.streamFirstSegmentDone = false;
     this.streamCutting = false;
     this.streamFinalPending = false;
+    this.streamForcePending = false;
+    this.streamPreloadedSrc = "";
     this.pendingFeedTexts = [] as string[];
     this.clearFlushEndWatchdog();
     if (notify == true) {
@@ -1809,6 +1864,201 @@ export class TtsWebSocketPlayer {
           finish(true);
         }
       });
+    });
+  }
+
+  /**
+   * 流式段播放（双 InnerAudioContext 交替）：前一段播放期间已把本段 src 预置到
+   * 本次 context（preloadSrc），换段仅 play() 即可出声，消除换源 prepare 的空窗。
+   * H5 回退 playSrcAndWait（blob revoke / 手势解锁机制成熟），双 context 主要利好 Android。
+   * @param preloadSrc 下一段的 src：本次播放期间预置到空闲 context（可为空）
+   * @returns true=正常播完；false=error/超时
+   */
+  async playStreamSegment(
+    messageId: string,
+    src: string,
+    expectedDurationMs: number,
+    preloadSrc: string,
+  ): Promise<boolean> {
+    // #ifdef H5 || WEB
+    return await this.playSrcAndWait(messageId, src, expectedDurationMs);
+    // #endif
+    if (src.trim().length == 0) {
+      return true;
+    }
+    audioPlayerManager.stop();
+    this.clearSynthStallWatchdog();
+    this.messageId = messageId;
+    this.finishRequested = false;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
+
+    // 本段 src 是否已在上一段播放时被预置到本次 context（判断须在预置覆盖前取值）
+    const prepared = this.streamPreloadedSrc == src;
+
+    // 交替选择本次播放的 context；另一个（空闲）用于预置下一段 src
+    const useAlt = this.streamUseAlt;
+    this.streamUseAlt = !useAlt;
+    let active = useAlt == true ? this.streamAltAudioContext : this.audioContext;
+    if (active == null) {
+      active = uni.createInnerAudioContext();
+      // #ifdef APP-IOS
+      active!.obeyMuteSwitch = false;
+      // #endif
+      if (useAlt == true) {
+        this.streamAltAudioContext = active;
+      } else {
+        this.audioContext = active;
+      }
+    }
+    // 预置下一段到空闲 context（提前 set src 让它 prepare，换段时 play 即出声）
+    if (preloadSrc.length > 0) {
+      let idle = useAlt == true ? this.audioContext : this.streamAltAudioContext;
+      if (idle == null) {
+        idle = uni.createInnerAudioContext();
+        // #ifdef APP-IOS
+        idle!.obeyMuteSwitch = false;
+        // #endif
+        if (useAlt == true) {
+          this.audioContext = idle;
+        } else {
+          this.streamAltAudioContext = idle;
+        }
+      }
+      if (this.streamPreloadedSrc != preloadSrc) {
+        this.streamPreloadedSrc = preloadSrc;
+        try {
+          idle!.stop();
+          idle!.src = preloadSrc;
+        } catch (_ePre) {
+          // ignore
+        }
+      }
+    } else {
+      this.streamPreloadedSrc = "";
+    }
+
+    try {
+      if (prepared != true) {
+        active!.stop();
+        active!.src = src;
+      }
+    } catch (_eSet) {
+      // ignore
+    }
+    active!.volume = this.getTargetVolume();
+
+    this.playRequestId = this.playRequestId + 1;
+    const reqId = this.playRequestId;
+    let playStarted = false;
+    const startPlay = (): void => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (playStarted) {
+        return;
+      }
+      playStarted = true;
+      this.switchingToReal = true;
+      try {
+        active!.play();
+      } catch (ePlay: any) {
+        console.warn("[TTS] stream play threw", ePlay);
+        playStarted = false;
+      }
+    };
+
+    // 超时兜底（同 playSrcAndWait）：段长 + 15s，下限 20s
+    let durationHint = expectedDurationMs;
+    if (durationHint <= 0) {
+      durationHint = this.lastSynthDurationMs;
+    }
+    let waitMs = 60000;
+    if (durationHint > 0) {
+      waitMs = durationHint + 15000;
+    }
+    if (waitMs < 20000) {
+      waitMs = 20000;
+    }
+    if (waitMs > 300000) {
+      waitMs = 300000;
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let timerId = 0;
+      const finish = (ok: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timerId > 0) {
+          clearTimeout(timerId);
+          timerId = 0;
+        }
+        resolve(ok);
+      };
+
+      active!.onPlay(() => {
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        if (this.switchingToReal || this.realPlayback) {
+          this.switchingToReal = false;
+          this.realPlayback = true;
+          this.setState("playing");
+        }
+      });
+      active!.onEnded(() => {
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        if (this.realPlayback != true) {
+          return;
+        }
+        // 段播完：清 messageId、idle（供工具栏/回传按消息复位），保留 context 复用
+        this.realPlayback = false;
+        this.switchingToReal = false;
+        this.pausedByMute = false;
+        this.messageId = "";
+        this.setState("idle");
+        finish(true);
+      });
+      active!.onError((err) => {
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        if (this.switchingToReal && this.realPlayback != true) {
+          return;
+        }
+        if (this.realPlayback) {
+          this.fail(err.errMsg ?? "TTS 音频播放失败");
+          finish(false);
+        }
+      });
+
+      startPlay();
+      timerId = setTimeout(() => {
+        console.warn(
+          "[TTS] stream segment timeout reqId=",
+          reqId,
+          "waitMs=",
+          waitMs,
+        );
+        finish(false);
+        if (reqId == this.playRequestId) {
+          try {
+            active!.stop();
+          } catch (_eStop) {
+            // ignore
+          }
+          this.realPlayback = false;
+          this.switchingToReal = false;
+          this.messageId = "";
+          this.setState("idle");
+        }
+      }, waitMs) as number;
     });
   }
 
@@ -2343,6 +2593,18 @@ export class TtsWebSocketPlayer {
         try {
           audio!.destroy();
         } catch (_eAudio) {
+          // ignore
+        }
+      }
+      // 双 context 交替：备用 context 一并销毁，避免流式段残留播放
+      const alt = this.streamAltAudioContext;
+      this.streamAltAudioContext = null;
+      this.streamPreloadedSrc = "";
+      if (alt != null) {
+        try {
+          alt!.stop();
+          alt!.destroy();
+        } catch (_eAlt) {
           // ignore
         }
       }

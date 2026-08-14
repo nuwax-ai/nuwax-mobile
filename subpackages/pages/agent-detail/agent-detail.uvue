@@ -38,7 +38,7 @@
 	import { getUploadFileAction } from '@/constants/common.constants'
 	import { getStatusBarHeight } from '@/utils/system.uts'
 	import { consumeLatestPendingOpenUiAction } from '@/utils/pendingOpenUiAction.uts'
-	// App web-view 内嵌页原生语音：录音（RecorderManager + 上传转写）与 TTS 播报
+	// App web-view 内嵌页原生语音：录音（RecorderManager + 流式 ASR 转写）与 TTS 播报
 	import { voiceStreamSpeaker } from '@/subpackages/utils/voice/voiceStreamSpeaker'
 	import {
 		ttsWebSocketPlayer,
@@ -47,11 +47,12 @@
 	import { audioPlayerManager } from '@/subpackages/utils/voice/audioPlayerManager'
 	import { stopAllSpeechPlayback } from '@/subpackages/utils/voice/stopAllSpeechPlayback'
 	import { VoiceSettings } from '@/subpackages/utils/voice/voiceTypes'
+	// 流式 ASR（与 TTS 同一套 WS 基建）：内嵌页录音走 PCM→WS 转写，不再 HTTP 上传音频文件
 	import {
-		createAudioUploader,
-		AudioFile as NativeAudioFile,
-		AudioUploader,
-	} from '@/servers/audioUploader'
+		asrWebSocketClient,
+		ASR_SAMPLE_RATE,
+	} from '@/subpackages/utils/voice/asrWebSocketClient'
+	import { streamLocalAudioFileToAsr } from '@/subpackages/utils/voice/pcmStreamRecorder'
 	// 文件树「下载全部」：内嵌 H5 改走原生下载（下载到系统公共目录）
 	import { downloadFileInApp } from '@/subpackages/utils/fileTree'
 	// Android 内嵌 H5 字体放大修复：强制 webview textZoom = 100%
@@ -383,10 +384,13 @@
 		return ""
 	}
 
-	// ---- 原生录音：RecorderManager + 上传转写 ----
+	// ---- 原生录音：RecorderManager + 流式 ASR 转写 ----
 
 	let nativeRecorderManager: RecorderManager | null = null
-	let nativeRecorderUploader: AudioUploader | null = null
+	/** 流式 ASR 会话已 begin（松手后），等待 asr_ready / 结果 */
+	let nativeAsrSessionActive: boolean = false
+	/** 已发 stop，等待 asr_result */
+	let nativeAsrWaitingResult: boolean = false
 	/** stop 是否已到达（授权期间松手时抑制随后的 start） */
 	let nativeRecordingStopArrived: boolean = false
 	/** 录音是否正在进行（onStart 后为 true） */
@@ -573,6 +577,8 @@
 		clearNativeRecordStartWatchdog()
 		nativeRecordingActive = true
 		nativeRecordingStartPending = false
+		// 开录后预热 ASR WS（只建连不发 start）：松手 begin 时复用连接，减少首字等待
+		asrWebSocketClient.preheatConnect()
 		evalBridgeJS(`window.__onNativeRecordStart && window.__onNativeRecordStart()`)
 	}
 
@@ -586,29 +592,8 @@
 		)
 	}
 
-	/** 原生侧上传录音并转写，把转写文本经 evalJS 回传 H5 */
-	async function nativeUploadAndTranscribe(
-		tempFilePath: string,
-		duration: number,
-		fileSize: number,
-		format: string,
-	): Promise<void> {
-		let success = false
-		let text = ""
-		let error = ""
-		try {
-			if (nativeRecorderUploader == null) {
-				nativeRecorderUploader = createAudioUploader()
-			}
-			const audioFile = new NativeAudioFile(tempFilePath, duration, fileSize, format)
-			const result = await nativeRecorderUploader.uploadAudio(audioFile, null)
-			success = result.success
-			text = result.text
-			error = result.error
-		} catch (e: any) {
-			const errText = readRecorderErrorMessage(e)
-			error = errText.length > 0 ? errText : t("Mobile.AgentDetail.recognizeFailed")
-		}
+	/** 统一把转写结果经 evalJS 回传 H5（与既有 __onNativeRecordStop payload 结构一致） */
+	function nativeReportRecordStop(success: boolean, text: string, error: string): void {
 		const payload = {
 			"success": success,
 			"text": text,
@@ -617,6 +602,80 @@
 		evalBridgeJS(
 			`window.__onNativeRecordStop && window.__onNativeRecordStop(${jsonStringifyForBridge(payload)})`,
 		)
+	}
+
+	function nativeHandleAsrResult(text: string, ok: boolean, errorMessage: string): void {
+		nativeAsrSessionActive = false
+		nativeAsrWaitingResult = false
+		if (ok == true && text.length > 0) {
+			nativeReportRecordStop(true, text, "")
+		} else {
+			const errMsg = errorMessage.length > 0 ? errorMessage : t("Mobile.Voice.noSpeechDetected")
+			nativeReportRecordStop(false, "", errMsg)
+		}
+	}
+
+	function nativeHandleAsrError(message: string): void {
+		nativeAsrSessionActive = false
+		nativeAsrWaitingResult = false
+		nativeReportRecordStop(
+			false,
+			"",
+			message.length > 0 ? message : t("Mobile.AgentDetail.recognizeFailed"),
+		)
+	}
+
+	/** asr_ready 后切帧推完整 PCM 文件并 finish（须在 nativeBeginAsrAndPushFile 之前定义，避免 UTS error18） */
+	function nativePushRecordedFileThenFinish(tempFilePath: string): void {
+		if (nativeAsrSessionActive != true) {
+			return
+		}
+		streamLocalAudioFileToAsr(
+			tempFilePath,
+			(frame: ArrayBuffer): Promise<boolean> => {
+				return asrWebSocketClient.sendPcmAsync(frame)
+			},
+			(ok: boolean): void => {
+				if (nativeAsrSessionActive != true) {
+					return
+				}
+				if (ok == true) {
+					nativeAsrWaitingResult = true
+					// 略延后 stop，给底层 WS 刷新 binary 的时间
+					setTimeout((): void => {
+						if (nativeAsrSessionActive != true) {
+							return
+						}
+						asrWebSocketClient.finish()
+					}, 40)
+				} else {
+					asrWebSocketClient.abort()
+					nativeAsrSessionActive = false
+					nativeReportRecordStop(false, "", t("Mobile.AudioUploader.fileEmpty"))
+				}
+			},
+		)
+	}
+
+	/** 原生侧流式 ASR：松手后 begin → asr_ready → 推 PCM 文件 → finish → 回传最终文本 */
+	function nativeBeginAsrAndPushFile(tempFilePath: string): void {
+		if (nativeAsrSessionActive == true) {
+			return
+		}
+		nativeAsrSessionActive = true
+		asrWebSocketClient.begin(
+			(): void => {
+				// asr_ready 后立刻切帧推完整文件
+				nativePushRecordedFileThenFinish(tempFilePath)
+			},
+			(text: string, ok: boolean, errorMessage: string): void => {
+				nativeHandleAsrResult(text, ok, errorMessage)
+			},
+			(message: string): void => {
+				nativeHandleAsrError(message)
+			},
+		)
+		asrWebSocketClient.watchReadyAfterStop()
 	}
 
 	function handleNativeRecorderStop(res: any | null): void {
@@ -633,14 +692,8 @@
 			)
 			return
 		}
-		const duration = readRecorderStopNumber(res, "duration", 0)
-		const fileSize = readRecorderStopNumber(res, "fileSize", 0)
-		let format = readRecorderStopString(res, "format")
-		if (format.length == 0) {
-			const dotIndex = tempFilePath.lastIndexOf(".")
-			format = dotIndex >= 0 ? tempFilePath.slice(dotIndex + 1).toLowerCase() : "mp3"
-		}
-		nativeUploadAndTranscribe(tempFilePath, duration, fileSize, format)
+		// 原生侧流式 ASR：begin → asr_ready → 推 PCM → finish → __onNativeRecordStop 回传最终文本
+		nativeBeginAsrAndPushFile(tempFilePath)
 	}
 
 	function ensureNativeRecorder(): RecorderManager {
@@ -690,6 +743,12 @@
 				// ignore
 			}
 		}
+		// 上一轮 ASR 会话未收尾（结果/错误尚未回传）：abort 掉，避免迟到回调污染新一轮录音
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			asrWebSocketClient.abort()
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+		}
 		nativeRecordingStopArrived = false
 		nativeRecordingStartPending = true
 		ensureNativeRecorder()
@@ -719,26 +778,15 @@
 			stopAllSpeechPlayback()
 			try {
 				const recorder = ensureNativeRecorder()
-				// #ifdef APP-IOS
-				// iOS 不支持 mp3 编码（uni-app x RecorderManager format 支持表：mp3 iOS=x），
-				// 用 aac，否则录出的文件格式不对，上传 STT 会被服务端拒绝（"File upload failed"）
+				// 流式 ASR 需 16kHz mono PCM（asrWebSocketClient 硬编码 sample_rate=16000 / 20ms 帧）。
+				// iOS 同样支持 pcm（与 chat-input 的 App 分支录音参数对齐），不再走 mp3/aac 上传
 				const options = {
 					duration: 600000,
-					sampleRate: 44100,
+					sampleRate: ASR_SAMPLE_RATE,
 					numberOfChannels: 1,
-					encodeBitRate: 192000,
-					format: "aac",
+					encodeBitRate: 48000,
+					format: "pcm",
 				} as RecorderManagerStartOptions
-				// #endif
-				// #ifndef APP-IOS
-				const options = {
-					duration: 600000,
-					sampleRate: 44100,
-					numberOfChannels: 1,
-					encodeBitRate: 192000,
-					format: "mp3",
-				} as RecorderManagerStartOptions
-				// #endif
 				recorder.start(options)
 				// onStart 未到则看门狗兜底（回传错误 + 重建 recorder）
 				armNativeRecordStartWatchdog()
@@ -1445,6 +1493,21 @@
 			} catch (_e) {
 				// ignore
 			}
+		}
+		// 收尾原生流式 ASR：中止未完成会话并断开预热连接
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+			try {
+				asrWebSocketClient.abort()
+			} catch (_eAsr) {
+				// ignore
+			}
+		}
+		try {
+			asrWebSocketClient.disableWarmupAndDisconnect()
+		} catch (_eDis) {
+			// ignore
 		}
 		// #endif
 		/**

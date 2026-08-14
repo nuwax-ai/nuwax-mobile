@@ -1,20 +1,19 @@
-/** 乐鑫 Provisioning 二维码解析与生产安全校验。 */
+/** Nuwax 配网二维码（URL 方案）解析与生产安全校验。 */
 import {
   EspProvisioningQrParseResult,
   EspProvisioningQrPayload,
 } from '@/types/interfaces/espProvisioning';
 import { EspProvisioningSecurityEnum } from '@/types/enums/espProvisioning';
 
-function stringField(obj: UTSJSONObject, key: string): string {
-  const value = obj[key];
-  return value != null ? `${value}` : '';
-}
+/** 二维码链接允许的主机：nuwax.com 及其子域名（覆盖 dev/staging 测试环境）。 */
+const PROVISION_QR_HOST = 'nuwax.com';
+/** 二维码链接固定路径。 */
+const PROVISION_QR_PATH = '/lz.html';
 
 /**
  * 清洗扫码原始文本：按码点过滤 BOM / 零宽 / 格式字符 / 控制字符 + 首尾空白。
- * Android 部分机型 scanCode 会在 JSON 里注入 U+FEFF、零宽连接符(U+200C/D)、NBSP(U+A0)、
- * 字连接符(U+2060) 等不可见字符，导致 JSON.parse 直接失败（iOS 同一 QR 不受影响）。
- * ESP QR 取值均为 ASCII，按码点剥掉这些不可见/控制字符是安全的。
+ * Android 部分机型 scanCode 会在结果里注入 U+FEFF、零宽连接符(U+200C/D)、NBSP(U+A0)、
+ * 字连接符(U+2060) 等不可见字符。链接取值均为 ASCII，按码点剥掉这些不可见/控制字符是安全的。
  */
 function sanitizeQrRaw(raw: string): string {
   let out = '';
@@ -31,70 +30,137 @@ function sanitizeQrRaw(raw: string): string {
   return out.trim();
 }
 
+/** URL 结构视图（纯字符串解析，不依赖平台 URL 类，保证 Android/iOS/H5 行为一致）。 */
+class ParsedUrl {
+  scheme: string;
+  host: string;
+  path: string;
+  query: string;
+
+  constructor(scheme: string, host: string, path: string, query: string) {
+    this.scheme = scheme;
+    this.host = host;
+    this.path = path;
+    this.query = query;
+  }
+}
+
 /**
- * 解析二维码。失败只返回稳定错误码，不回传原始文本，避免调用方误写敏感日志。
+ * 把清洗后的文本拆成 scheme/host/path/query。
+ * 无 `://`、scheme 为空或 host 为空时返回 null（不是合法链接结构）。
+ * host 去除 userinfo（user:pass@host）与端口（host:8080）后统一小写；
+ * fragment（#…）对配网无意义，直接丢弃。
  */
-export function parseEspProvisioningQr(raw: string, allowSecurity0: boolean = false): EspProvisioningQrParseResult {
+function parseUrlStructure(raw: string): ParsedUrl | null {
+  const schemeSep = raw.indexOf('://');
+  if (schemeSep <= 0) return null;
+  const scheme = raw.substring(0, schemeSep).toLowerCase();
+  let rest = raw.substring(schemeSep + 3);
+  const fragmentIdx = rest.indexOf('#');
+  if (fragmentIdx >= 0) rest = rest.substring(0, fragmentIdx);
+  const queryIdx = rest.indexOf('?');
+  const pathAndHost = queryIdx >= 0 ? rest.substring(0, queryIdx) : rest;
+  const query = queryIdx >= 0 ? rest.substring(queryIdx + 1) : '';
+  const slashIdx = pathAndHost.indexOf('/');
+  let hostRaw = slashIdx >= 0 ? pathAndHost.substring(0, slashIdx) : pathAndHost;
+  const path = slashIdx >= 0 ? pathAndHost.substring(slashIdx) : '';
+  const atIdx = hostRaw.lastIndexOf('@');
+  if (atIdx >= 0) hostRaw = hostRaw.substring(atIdx + 1);
+  const colonIdx = hostRaw.lastIndexOf(':');
+  if (colonIdx >= 0) hostRaw = hostRaw.substring(0, colonIdx);
+  const host = hostRaw.toLowerCase();
+  if (host == '') return null;
+  return new ParsedUrl(scheme, host, path, query);
+}
+
+/** 解码单个 query 组件；percent 序列非法时返回 null（视为无效二维码）。 */
+function decodeQueryComponent(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 解析 query 为参数表。同名参数取第一个出现；key/value 任一处 percent 编码非法
+ * 即整体返回 null。未知参数忽略，保留前向扩展空间。
+ */
+function parseQueryParams(query: string): Map<string, string> | null {
+  const map = new Map<string, string>();
+  if (query == '') return map;
+  const pairs = query.split('&');
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    if (pair == '') continue;
+    const eqIdx = pair.indexOf('=');
+    const rawKey = eqIdx >= 0 ? pair.substring(0, eqIdx) : pair;
+    const rawValue = eqIdx >= 0 ? pair.substring(eqIdx + 1) : '';
+    const key = decodeQueryComponent(rawKey);
+    if (key == null) return null;
+    const value = decodeQueryComponent(rawValue);
+    if (value == null) return null;
+    if (!map.has(key)) map.set(key, value);
+  }
+  return map;
+}
+
+/**
+ * 解析配网二维码链接（新 URL 方案）：
+ *
+ *   https://nuwax.com/lz.html?n=PROV_A1B2C3&u=NX-A1B2-C3D4-E5F6&p=<PoP>
+ *
+ *  - n = name：广播名（PROV_ + STA MAC 后三字节大写十六进制）
+ *  - u = username：设备 UID（Security 2 SRP6a 用户名，须与固件一致）
+ *  - p = pop：逐设备随机 PoP（Security 2 证明密钥）
+ *
+ * transport/network/security 不再由二维码携带，按本期冻结契约固定为
+ * ble / wifi / Security 2（不允许降级）。
+ *
+ * 失败只返回稳定错误码，不回传原始文本，避免调用方误写敏感日志（URL 内含 PoP）。
+ */
+export function parseNuwaxProvisionUrl(raw: string): EspProvisioningQrParseResult {
   const cleaned = sanitizeQrRaw(raw);
   if (cleaned == '') return new EspProvisioningQrParseResult(null, 'QR_EMPTY');
-  try {
-    const obj = JSON.parse(cleaned) as UTSJSONObject;
-    const version = stringField(obj, 'ver');
-    // 契约要求大写；扫码/贴纸偶发小写 hex，归一化后再校验与下游使用
-    const name = stringField(obj, 'name').toUpperCase();
-    const transport = stringField(obj, 'transport').toLowerCase();
-    const network = stringField(obj, 'network').toLowerCase();
-    const username = stringField(obj, 'username');
-    const pop = stringField(obj, 'pop');
-    const securityRaw = stringField(obj, 'security');
-    const securityNumber = securityRaw != '' ? parseInt(securityRaw) : 2;
 
-    if (version != 'v1') return new EspProvisioningQrParseResult(null, 'QR_VERSION_UNSUPPORTED');
-    if (name == '') return new EspProvisioningQrParseResult(null, 'QR_NAME_REQUIRED');
-    // 冻结契约 §2：设备名必须 PROV_ + STA MAC 后三字节大写十六进制（PROV_XXXXXX）
-    const namePattern = new RegExp('^PROV_[0-9A-F]{6}$');
-    if (!namePattern.test(name)) return new EspProvisioningQrParseResult(null, 'QR_NAME_INVALID');
-    if (transport != 'ble') return new EspProvisioningQrParseResult(null, 'QR_TRANSPORT_UNSUPPORTED');
-    if (network != '' && network != 'wifi') return new EspProvisioningQrParseResult(null, 'QR_NETWORK_UNSUPPORTED');
-    // securityRaw 非空但 parseInt 失败时，UTS/JS 可能得到 NaN；NaN 与自身比较恒为 false
-    if (securityNumber != securityNumber || securityNumber < 0 || securityNumber > 2) {
-      return new EspProvisioningQrParseResult(null, 'QR_SECURITY_UNSUPPORTED');
-    }
-    if (securityNumber == 0 && !allowSecurity0) {
-      return new EspProvisioningQrParseResult(null, 'QR_SECURITY0_FORBIDDEN');
-    }
-    if (securityNumber == 1 && pop == '') {
-      return new EspProvisioningQrParseResult(null, 'QR_POP_REQUIRED');
-    }
-    if (securityNumber == 2 && (username == '' || pop == '')) {
-      return new EspProvisioningQrParseResult(null, 'QR_SECURITY2_CREDENTIALS_REQUIRED');
-    }
-
-    // number → enum 显式映射：UTS/Android 不允许 number as enum（抛 ClassCastException；
-    // iOS 宽容，故此前只在 Android 暴露）。securityNumber 已校验为 0/1/2。
-    let securityEnum: EspProvisioningSecurityEnum = EspProvisioningSecurityEnum.SECURITY_2;
-    if (securityNumber == 0) {
-      securityEnum = EspProvisioningSecurityEnum.SECURITY_0;
-    } else if (securityNumber == 1) {
-      securityEnum = EspProvisioningSecurityEnum.SECURITY_1;
-    }
-
-    return new EspProvisioningQrParseResult(
-      new EspProvisioningQrPayload(
-        version,
-        name,
-        transport,
-        network != '' ? network : 'wifi',
-        securityEnum,
-        username,
-        pop,
-      ),
-    );
-  } catch (e) {
-    // 仅记错误信息 + 结构特征，不回打 QR 全文（含 PoP）
-    console.warn(`[EspQr] JSON.parse failed; cleaned len=${cleaned.length} first="${cleaned.length > 0 ? cleaned.substring(0, 1) : ""}" last="${cleaned.length > 0 ? cleaned.substring(cleaned.length - 1) : ""}"`, e);
-    return new EspProvisioningQrParseResult(null, 'QR_JSON_INVALID');
+  const url = parseUrlStructure(cleaned);
+  if (url == null) return new EspProvisioningQrParseResult(null, 'QR_URL_INVALID');
+  if (url.scheme != 'https' && url.scheme != 'http') {
+    return new EspProvisioningQrParseResult(null, 'QR_SCHEME_UNSUPPORTED');
   }
+  // 域名白名单：防误扫普通网页二维码被当作配网码
+  if (url.host != PROVISION_QR_HOST && !url.host.endsWith('.' + PROVISION_QR_HOST)) {
+    return new EspProvisioningQrParseResult(null, 'QR_HOST_INVALID');
+  }
+  if (url.path != PROVISION_QR_PATH) {
+    return new EspProvisioningQrParseResult(null, 'QR_PATH_INVALID');
+  }
+
+  const params = parseQueryParams(url.query);
+  if (params == null) return new EspProvisioningQrParseResult(null, 'QR_QUERY_INVALID');
+
+  const name = params.get('n') ?? '';
+  const username = params.get('u') ?? '';
+  const pop = params.get('p') ?? '';
+  // 契约要求大写；扫码/贴纸偶发小写 hex，归一化后再校验与下游使用
+  const normalizedName = name.toUpperCase();
+  const namePattern = new RegExp('^PROV_[0-9A-F]{6}$');
+  if (normalizedName == '') return new EspProvisioningQrParseResult(null, 'QR_NAME_REQUIRED');
+  if (!namePattern.test(normalizedName)) return new EspProvisioningQrParseResult(null, 'QR_NAME_INVALID');
+  if (username == '') return new EspProvisioningQrParseResult(null, 'QR_USERNAME_REQUIRED');
+  if (pop == '') return new EspProvisioningQrParseResult(null, 'QR_POP_REQUIRED');
+
+  return new EspProvisioningQrParseResult(
+    new EspProvisioningQrPayload(
+      'v1',
+      normalizedName,
+      'ble',
+      'wifi',
+      EspProvisioningSecurityEnum.SECURITY_2,
+      username,
+      pop,
+    ),
+  );
 }
 
 /** 设备 ID 日志脱敏：仅保留首尾各 2 个字符。 */

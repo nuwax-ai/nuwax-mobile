@@ -397,11 +397,11 @@
 		// #endif
 	}
 
-	/** 永久拒绝麦克风权限：弹窗引导去系统设置开启（Android 跳应用权限页；iOS 跳系统设置） */
-	function guideNativeMicPermissionSettings(): void {
+	/** 永久拒绝权限：弹窗引导去系统设置开启（Android 跳应用权限页；iOS 跳系统设置） */
+	function guideNativePermissionSettings(title: string, content: string, permissionName: string): void {
 		uni.showModal({
-			title: "需要麦克风权限",
-			content: "录音功能需要访问你的麦克风，请在系统设置中开启录音权限",
+			title: title,
+			content: content,
 			confirmText: "去设置",
 			cancelText: "取消",
 			success: (res) => {
@@ -411,7 +411,7 @@
 					if (activity != null) {
 						UTSAndroid.gotoSystemPermissionActivity(
 							activity,
-							["android.permission.RECORD_AUDIO"] as string[],
+							[permissionName] as string[],
 						)
 					}
 					// #endif
@@ -421,6 +421,56 @@
 				}
 			},
 		})
+	}
+
+	/** 永久拒绝麦克风权限：弹窗引导去系统设置开启 */
+	function guideNativeMicPermissionSettings(): void {
+		guideNativePermissionSettings(
+			"需要麦克风权限",
+			"录音功能需要访问你的麦克风，请在系统设置中开启录音权限",
+			"android.permission.RECORD_AUDIO",
+		)
+	}
+
+	/** 申请相机权限（Android 用 UTSAndroid；iOS 检查授权状态）
+	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
+	async function ensureNativeCameraPermission(): Promise<NativeMicPermissionResult> {
+		// #ifdef APP-ANDROID
+		return await new Promise<NativeMicPermissionResult>((resolve) => {
+			const activity = UTSAndroid.getUniActivity()
+			if (activity == null) {
+				resolve(new NativeMicPermissionResult(false, false))
+				return
+			}
+			const permission = ["android.permission.CAMERA"] as string[]
+			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
+				resolve(new NativeMicPermissionResult(true, false))
+				return
+			}
+			UTSAndroid.requestSystemPermission(
+				activity,
+				permission,
+				(allGranted: boolean, _granted: string[]) => {
+					resolve(new NativeMicPermissionResult(allGranted, false))
+				},
+				(doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(new NativeMicPermissionResult(false, doNotAskAgain))
+				},
+			)
+		})
+		// #endif
+		// #ifdef APP-IOS
+		const authSetting = uni.getAppAuthorizeSetting()
+		if (authSetting.cameraAuthorized == "authorized") {
+			return new NativeMicPermissionResult(true, false)
+		}
+		if (authSetting.cameraAuthorized == "denied") {
+			// iOS 拒绝后同样无法再弹授权窗，须去系统设置开启
+			return new NativeMicPermissionResult(false, true)
+		}
+		// not determined：chooseImage 时系统才弹窗，先放行
+		return new NativeMicPermissionResult(true, false)
+		// #endif
 	}
 
 	function clearNativeRecordStartWatchdog(): void {
@@ -739,6 +789,159 @@
 		audioPlayerManager.setMuted(muted)
 	}
 
+	// ---- 原生媒体选择（拍照 / 相册 / 文件）：H5 内嵌页经 postMessage 调起 ----
+
+	/** 取消选择判定（Android/iOS 的 cancel 文案） */
+	function isNativeChooseCancelled(errMsg: string): boolean {
+		const lower = errMsg.toLowerCase()
+		return lower.indexOf("cancel") >= 0
+	}
+
+	/** 提取原生选择结果文件列表（path/name/size/type），空列表表示无文件 */
+	function extractNativeMediaFiles(res: any | null): UTSJSONObject[] {
+		const files = [] as UTSJSONObject[]
+		if (res == null) {
+			return files
+		}
+		let tempFiles: any[] = []
+		let paths: string[] = []
+		try {
+			const jsonStr = JSON.stringify(res)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+				const parsed = JSON.parse(jsonStr) as UTSJSONObject
+				const tf = parsed["tempFiles"]
+				if (tf != null) {
+					tempFiles = tf as any[]
+				}
+				const tp = parsed["tempFilePaths"]
+				if (tp != null) {
+					paths = tp as string[]
+				}
+			}
+		} catch (_e) {
+			tempFiles = []
+			paths = []
+		}
+		const count = tempFiles.length > 0 ? tempFiles.length : paths.length
+		for (let i = 0; i < count; i++) {
+			const file = new UTSJSONObject()
+			let path = ""
+			let name = ""
+			let type = ""
+			let size = 0
+			if (i < tempFiles.length) {
+				path = readRecorderStopString(tempFiles[i], "path")
+				name = readRecorderStopString(tempFiles[i], "name")
+				type = readRecorderStopString(tempFiles[i], "type")
+				size = readRecorderStopNumber(tempFiles[i], "size", 0)
+			}
+			if (path.length == 0 && i < paths.length) {
+				path = paths[i]
+			}
+			if (path.length == 0) {
+				continue
+			}
+			file["path"] = path
+			file["name"] = name
+			file["size"] = size
+			file["type"] = type
+			files.push(file)
+		}
+		return files
+	}
+
+	/** 把原生选择结果经 evalJS 回传 H5 __onNativeMediaResult */
+	function evalNativeMediaFiles(
+		success: boolean,
+		action: string,
+		cancelled: boolean,
+		error: string,
+		files: UTSJSONObject[],
+	): void {
+		const payload = new UTSJSONObject()
+		payload["success"] = success
+		payload["action"] = action
+		payload["cancelled"] = cancelled
+		payload["error"] = error
+		payload["files"] = files
+		evalBridgeJS(
+			`window.__onNativeMediaResult && window.__onNativeMediaResult(${jsonStringifyForBridge(payload)})`,
+		)
+	}
+
+	function invokeNativeChooseImage(sourceType: string, maxCount: number): void {
+		const sourceTypes = (sourceType == "camera"
+			? (["camera"] as ("album" | "camera")[])
+			: (["album"] as ("album" | "camera")[]))
+		uni.chooseImage({
+			sourceType: sourceTypes,
+			sizeType: ["compressed"],
+			count: maxCount,
+			success: (res: any) => {
+				const files = extractNativeMediaFiles(res)
+				evalNativeMediaFiles(true, "chooseImage", false, "", files)
+			},
+			fail: (err: any) => {
+				const errMsg = readRecorderErrorMessage(err)
+				const cancelled = isNativeChooseCancelled(errMsg)
+				evalNativeMediaFiles(
+					false,
+					"chooseImage",
+					cancelled,
+					cancelled ? "" : errMsg,
+					[] as UTSJSONObject[],
+				)
+			},
+		})
+	}
+
+	/** 拍照 / 相册（App 内嵌 H5）：Android 拍照先申请相机权限，永久拒绝则引导去设置 */
+	function nativeChooseImage(sourceType: string, maxCount: number): void {
+		// #ifdef APP-ANDROID
+		if (sourceType == "camera") {
+			ensureNativeCameraPermission().then((result: NativeMicPermissionResult) => {
+				if (result.granted != true) {
+					if (result.deniedForever == true) {
+						guideNativePermissionSettings(
+							"需要相机权限",
+							"拍照需要访问你的相机，请在系统设置中开启相机权限",
+							"android.permission.CAMERA",
+						)
+					}
+					evalNativeMediaFiles(false, "chooseImage", true, "", [] as UTSJSONObject[])
+					return
+				}
+				invokeNativeChooseImage(sourceType, maxCount)
+			})
+			return
+		}
+		// #endif
+		invokeNativeChooseImage(sourceType, maxCount)
+	}
+
+	/** 文件选择（App 内嵌 H5）：走系统文件选择器 */
+	function nativeChooseFile(maxCount: number): void {
+		uni.chooseFile({
+			type: "file",
+			count: maxCount,
+			success: (res: any) => {
+				const files = extractNativeMediaFiles(res)
+				evalNativeMediaFiles(true, "chooseFile", false, "", files)
+			},
+			fail: (err: any) => {
+				const errMsg = readRecorderErrorMessage(err)
+				const cancelled = isNativeChooseCancelled(errMsg)
+				evalNativeMediaFiles(
+					false,
+					"chooseFile",
+					cancelled,
+					cancelled ? "" : errMsg,
+					[] as UTSJSONObject[],
+				)
+			},
+		})
+	}
+
 	/**
 	 * 原生 file-preview-page 提交 OpenUI 表单后 navigateBack → 本页 onShow。
 	 * 从原生 storage 消费续作消息，经 evalJS 注入内嵌 H5 的 __nuwaxOnOpenUiResume。
@@ -758,7 +961,7 @@
 
 	// ---- 消息分发 ----
 
-	/** web-view @message：分发原生语音指令（录音 / TTS） */
+	/** web-view @message：分发原生语音指令（录音 / TTS）与媒体选择（拍照 / 相册 / 文件） */
 	function handleWebViewMessage(e: UniWebViewMessageEvent): void {
 		const msg = parseWebViewBridgeMessage(e.detail.data)
 		if (msg == null) {
@@ -771,6 +974,25 @@
 				nativeStartRecord()
 			} else if (action == "stop") {
 				nativeStopRecord()
+			}
+			return
+		}
+		if (type == "media") {
+			const action = `${msg["action"]}`
+			const sourceType = msg["sourceType"] != null ? `${msg["sourceType"]}` : "album"
+			let maxCount = 9
+			try {
+				const mc = parseFloat(`${msg["maxCount"]}`)
+				if (!isNaN(mc) && mc > 0) {
+					maxCount = mc
+				}
+			} catch (_e) {
+				maxCount = 9
+			}
+			if (action == "chooseImage") {
+				nativeChooseImage(sourceType, maxCount)
+			} else if (action == "chooseFile") {
+				nativeChooseFile(maxCount)
 			}
 			return
 		}

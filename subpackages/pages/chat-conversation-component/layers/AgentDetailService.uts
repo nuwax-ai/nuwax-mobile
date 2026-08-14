@@ -1,4 +1,5 @@
 import { nextTick } from "vue";
+import { setMessageIdRewrite } from "@/subpackages/utils/voice/speechIdRewrite";
 import {
   MessageInfo,
   ConversationChatParams,
@@ -618,6 +619,16 @@ export default class AgentDetailService {
   private data: AgentDetailData;
   /** 流式会话代数：abort/新开流时递增，用于丢弃旧 SSE 回调 */
   private streamGeneration: number = 0;
+  /**
+   * live/sub fail 后置 true：保持 isConversationActive 视觉态（loading 不消失），
+   * 同时标记「需恢复」，busy 判断据此放行轮询 / 立即续接；
+   * 续接成功 / 正常收尾 / 强制关态 / 用户停止 / 新发送时复位。
+   */
+  private streamResumePending: boolean = false;
+  /** 续接连续失败次数：达到阈值强制关态，避免保持态无限 loading */
+  private resumeFailStreak: number = 0;
+  /** 保持态下续接连续失败阈值 */
+  private readonly MAX_RESUME_FAIL_STREAK: number = 3;
   /**
    * SSE 流式期间的消息列表草稿：始终保存最新态，避免未 flush 时下一帧读到旧 list。
    * 对 messageList / updateMessageComponent 做短时合并，减轻主线程卡顿。
@@ -1843,6 +1854,9 @@ export default class AgentDetailService {
             ) {
               this.data.streamingAssistantMessageId.value = id;
             }
+            // 记录播报 id 改写（客户端临时 id → 服务端真实 id）：
+            // msg-tool-bar 据此判定「最后一条兜底亮灯」是否指向在播消息，避免切换播报后旧图标残留
+            setMessageIdRewrite(currentMessageId, id);
           } else {
             m["status"] = MessageStatusEnum.Complete;
             newMessage = buildMessageInfoFromDraft(m);
@@ -2645,16 +2659,29 @@ export default class AgentDetailService {
       return;
     }
 
-    // 与正常 complete 对齐：延后 inactive，让 ai-msg 走 fallback_full + KaTeX 终态刷图
-    const genAtAbnormal = this.streamGeneration;
-    setTimeout(() => {
-      if (genAtAbnormal != this.streamGeneration) {
-        return;
+    if (isTempChat == true) {
+      // 临时会话无 conversationId，无法续接：与正常 complete 对齐，延后 inactive，
+      // 让 ai-msg 走 fallback_full + KaTeX 终态刷图
+      const genAtAbnormal = this.streamGeneration;
+      setTimeout(() => {
+        if (genAtAbnormal != this.streamGeneration) {
+          return;
+        }
+        this.data.isConversationActive.value = false;
+        this.markConversationTaskCompleteIfExecuting();
+      }, 150);
+      if (onTimeout != null) {
+        (onTimeout as () => void)();
       }
-      this.data.isConversationActive.value = false;
-      this.markConversationTaskCompleteIfExecuting();
-    }, 150);
-    this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
+      return;
+    }
+
+    // 普通会话：fail 不关态（保持 loading 视觉，避免「消失→续接→又出现」翻转）。
+    // 标记「需恢复」并立即续接；能否续接由 scheduleRecoverIfAssistantLoading 判断
+    // （能 → sub 恢复；不能 / 后端已结束 → 收尾关态），连续失败达阈值强制关态。
+    this.streamResumePending = true;
+    this.resumeFailStreak = this.resumeFailStreak + 1;
+    this.scheduleRecoverIfAssistantLoading(false, streamGen);
     if (onTimeout != null) {
       (onTimeout as () => void)();
     }
@@ -2702,8 +2729,10 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
-    // 正常结束：清后台续接标记
+    // 正常结束：清后台续接标记与保持态标记
     this.pendingBackgroundReconnect = false;
+    this.streamResumePending = false;
+    this.resumeFailStreak = 0;
     // 完成回调里已同步 endStreamListDraft；此处再调一次幂等兜底（异常入口/竞态）
     this.endStreamListDraft();
 
@@ -2824,7 +2853,6 @@ export default class AgentDetailService {
     isTempChat: boolean,
     streamGenAtSchedule: number,
   ): void {
-    // #ifdef APP
     if (isTempChat == true) {
       return;
     }
@@ -2850,6 +2878,16 @@ export default class AgentDetailService {
       }
     }
     if (needRecover != true && this.pendingBackgroundReconnect != true) {
+      // 无需恢复（正文已生成完 / 已是终态）：结束保持态，收尾关态
+      this.streamResumePending = false;
+      const genAtNoRecover = this.streamGeneration;
+      setTimeout(() => {
+        if (genAtNoRecover != this.streamGeneration) {
+          return;
+        }
+        this.data.isConversationActive.value = false;
+        this.markConversationTaskCompleteIfExecuting();
+      }, 150);
       return;
     }
     setTimeout(() => {
@@ -2862,8 +2900,11 @@ export default class AgentDetailService {
       }
       this.resumeConversationState().then((needSub: boolean) => {
         if (needSub != true) {
-          // 后端已结束：清 pending，避免前台反复空转
+          // 后端已结束：清 pending，结束保持态，收尾关态（避免保持态无限 loading）
           this.pendingBackgroundReconnect = false;
+          this.streamResumePending = false;
+          this.data.isConversationActive.value = false;
+          this.markConversationTaskCompleteIfExecuting();
           return;
         }
         if (streamGenAtSchedule != this.streamGeneration) {
@@ -2879,7 +2920,6 @@ export default class AgentDetailService {
         this.handleSubConversation(cid, null);
       });
     }, 400);
-    // #endif
   }
 
   /**
@@ -2950,7 +2990,7 @@ export default class AgentDetailService {
     };
 
     let isCleanedUp = false;
-    const cleanupSub = (finalizeMessage: boolean): void => {
+    const cleanupSub = (finalizeMessage: boolean, keepActive: boolean): void => {
       if (isCleanedUp) {
         return;
       }
@@ -2966,7 +3006,22 @@ export default class AgentDetailService {
       }
       // 与 live SSE 完成对齐：先冲刷 TTS 终态，再关会话态（否则播报图标卡住）
       this.sealStreamingAssistantBeforeClear();
-      this.data.isConversationActive.value = false;
+      if (keepActive == true) {
+        // 续接失败：保持进行中视觉（loading 不消失），标记待恢复由轮询再续接；
+        // 连续失败达阈值才强制关态，避免后端一直 EXECUTING 且 sub 一直失败时无限 loading。
+        this.streamResumePending = true;
+        this.resumeFailStreak = this.resumeFailStreak + 1;
+        if (this.resumeFailStreak >= this.MAX_RESUME_FAIL_STREAK) {
+          this.streamResumePending = false;
+          this.resumeFailStreak = 0;
+          this.data.isConversationActive.value = false;
+          this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
+        }
+      } else {
+        this.streamResumePending = false;
+        this.resumeFailStreak = 0;
+        this.data.isConversationActive.value = false;
+      }
       this.clearStreamingAssistantText();
       removeEmptyPlaceholder();
       if (onSubClose != null) {
@@ -3007,12 +3062,13 @@ export default class AgentDetailService {
         return;
       }
       if (apiResCode(result) != SUCCESS_CODE) {
-        cleanupSub(false);
+        // reload 失败：保持态（不关 loading），等待轮询再续接
+        cleanupSub(false, true);
         return;
       }
       const dataRaw = apiResData<any>(result);
       if (dataRaw == null) {
-        cleanupSub(false);
+        cleanupSub(false, true);
         return;
       }
       const dataObj = dataRaw as UTSJSONObject;
@@ -3028,7 +3084,8 @@ export default class AgentDetailService {
           this.isSubscribed = false;
           return;
         }
-        cleanupSub(true);
+        // 后端已非执行中：正常收尾关态
+        cleanupSub(true, false);
         return;
       }
       const rawMessageList = dataObj["messageList"];
@@ -3061,10 +3118,14 @@ export default class AgentDetailService {
         isTurnUserReadyFromMessageInfoList(this.data.messageList.value) !=
         true
       ) {
-        cleanupSub(false);
+        // 用户未就绪：保持态，等下一轮轮询门禁通过后再续接
+        cleanupSub(false, true);
         return;
       }
 
+      // 续接成功接管：清除保持态标记与失败计数
+      this.streamResumePending = false;
+      this.resumeFailStreak = 0;
       this.data.isConversationActive.value = true;
     } catch (error) {
       // await 期间本地已接管（用户发消息 → live SSE）：直接放弃续接，避免 cleanupSub 误关
@@ -3077,7 +3138,8 @@ export default class AgentDetailService {
         "[AgentDetailService] handleSubConversation reload failed:",
         error,
       );
-      cleanupSub(false);
+      // reload 失败：保持态，等待轮询再续接
+      cleanupSub(false, true);
       return;
     }
 
@@ -3180,7 +3242,8 @@ export default class AgentDetailService {
         const eventTypeStr =
           eventTypeRaw != null ? `${eventTypeRaw}` : "";
         if (eventTypeStr == `${ConversationEventTypeEnum.ERROR}`) {
-          cleanupSub(true);
+          // 服务端明确报错：正常收尾关态
+          cleanupSub(true, false);
         }
       } catch (e) {
       }
@@ -3189,7 +3252,8 @@ export default class AgentDetailService {
       // sub SSE 正常结束：立刻关掉 Loading（不等 ChatFinished / 详情回拉）
       this.pendingBackgroundReconnect = false;
       this.markConversationTaskCompleteIfExecuting();
-      cleanupSub(true);
+      // 正常完成：收尾关态
+      cleanupSub(true, false);
     };
     requestConfig.onError = (error: any) => {
       if (isAppInBackground() == true) {
@@ -3197,8 +3261,8 @@ export default class AgentDetailService {
         return;
       }
       this.pendingBackgroundReconnect = false;
-      this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
-      cleanupSub(true);
+      // sub 流失败：保持态（不关 loading），由轮询再续接；连续失败达阈值才收尾
+      cleanupSub(false, true);
     };
     requestConfig.onTimeout = () => {
       if (isAppInBackground() == true) {
@@ -3206,8 +3270,8 @@ export default class AgentDetailService {
         return;
       }
       this.pendingBackgroundReconnect = false;
-      this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
-      cleanupSub(true);
+      // sub 超时：保持态，等待轮询再续接
+      cleanupSub(false, true);
     };
 
     try {
@@ -3216,7 +3280,8 @@ export default class AgentDetailService {
       if (isAppInBackground() == true && isCleanedUp != true) {
         softCleanupSubWhileBackground();
       } else {
-        cleanupSub(true);
+        // sub 请求异常：保持态，等待轮询再续接
+        cleanupSub(false, true);
       }
     }
   }
@@ -3235,6 +3300,21 @@ export default class AgentDetailService {
   /** sub 是否已订阅（执行中） */
   get isSubConversationSubscribed(): boolean {
     return this.isSubscribed;
+  }
+
+  /**
+   * 当前流代数（每次 live 发送 / mock 流 +1）。
+   * 轮询发起时快照本值，响应返回后对比：代数增长说明 await 期间本地已触发新一轮
+   * （用户新发送），旧轮询响应是发起时刻的快照，不得据此续接或强制收尾。
+   * 注：sub 续接不改代数（复用同一轮），避免续接被误判为新会话。
+   */
+  get currentStreamGeneration(): number {
+    return this.streamGeneration;
+  }
+
+  /** 是否处于「fail 保持态、等待续接」：页面 busy 判断据此放行轮询续接 */
+  get isStreamResumePending(): boolean {
+    return this.streamResumePending;
   }
 
   /**
@@ -3343,6 +3423,8 @@ export default class AgentDetailService {
    */
   handleRemoteConversationTerminal(): void {
     this.pendingBackgroundReconnect = false;
+    this.streamResumePending = false;
+    this.resumeFailStreak = 0;
     this.streamGeneration = this.streamGeneration + 1;
     this.endStreamListDraft();
     chatService.abort();
@@ -3360,8 +3442,10 @@ export default class AgentDetailService {
     // 停止会话后，清空问题建议列表（对齐 PC handleClearSideEffect：停止即清空，防止旧建议残留）
     this.data.chatSuggestList.value = [];
 
-    // 用户主动停止：取消后台续接
+    // 用户主动停止：取消后台续接与保持态
     this.pendingBackgroundReconnect = false;
+    this.streamResumePending = false;
+    this.resumeFailStreak = 0;
 
     const wasConversationActive = this.data.isConversationActive.value;
 
@@ -3688,6 +3772,9 @@ export default class AgentDetailService {
       await this.handleQueryConversation(res);
 
       if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
+        // 恢复检查确认后端仍在执行：清除保持态标记（正式接管由 handleSubConversation 完成）
+        this.streamResumePending = false;
+        this.resumeFailStreak = 0;
         this.data.isConversationActive.value = true;
         return true;
       }
@@ -3868,6 +3955,9 @@ export default class AgentDetailService {
       newMessageList = [...newMessageList, currentMsgInfo];
     }
     // AgentDetailUtils.checkConversationActive(newMessageList, this.data)
+    // 新发送接管：清除保持态标记与失败计数
+    this.streamResumePending = false;
+    this.resumeFailStreak = 0;
     this.data.isConversationActive.value = true;
     this.data.messageList.value = newMessageList;
     // 会话一开始就绑定流式播报目标（不等首包正文），H5/App 均可立刻 begin

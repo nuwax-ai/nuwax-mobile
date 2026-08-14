@@ -3,8 +3,9 @@
     主路径：groupMarkdownContainers 已把 OpenUI 留在组外，本组件只渲普通工具。
     兜底：历史正文若仍把 OpenUI 包进 group，且 processCount=0，跳过折叠壳，
     避免 group-content 折叠态把原位 openui-card 藏死。
+    processCount<=1 同样不加折叠壳：单工具不显示「1 项」组头（与 App 端一致）。
   -->
-  <view v-if="processCount == 0" class="openui-loose-group">
+  <view v-if="processCount <= 1" class="openui-loose-group">
     <slot />
   </view>
   <view v-else class="markdown-custom-process-group">

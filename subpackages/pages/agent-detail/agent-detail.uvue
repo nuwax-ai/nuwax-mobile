@@ -75,6 +75,10 @@
 	let appWebViewBridgeContext: WebviewContext | null = null
 	/** H5 内嵌页是否正有弹窗打开（由 H5 postMessage 同步，onBackPress 拦截用） */
 	let appWebViewPopupOpen: boolean = false
+	/** 原生侧键盘高度监听 id（onKeyboardHeightChange 返回值），桥接给内嵌 H5 */
+	let appKeyboardHeightListenerId: number = 0
+	/** 最近一次键盘高度：webview 未就绪时随注入轮询补发（默认 0 = 键盘收起） */
+	let latestInjectedKeyboardHeight: number = 0
 
 	/**
 	 * 幂等注入脚本：uni.webview JSSDK（网页 → 原生 postMessage 桥）+ ticket cookie
@@ -85,6 +89,16 @@
 	 */
 	function buildBridgeCode(tokenLiteral: string): string {
 		return `try{if(!window.uni||!uni.webView){var s=document.createElement('script');s.src='./static/uni.webview.1.5.5.js';document.head.appendChild(s);}}catch(e){}try{document.cookie='ticket='+${tokenLiteral}+'; path=/';}catch(e){} try{localStorage.setItem('ACCESS_TOKEN',${tokenLiteral});}catch(e){} window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();`
+	}
+
+	/**
+	 * 生成键盘高度注入脚本：写全局 + 派发 CustomEvent（幂等，事件注入 / 注入轮询两路复用）。
+	 * H5 运行时不会派发 keyboardheightchange，内嵌页的 keyboardHeight 只能由原生侧桥接进来，
+	 * H5 侧 chat-input-phone 监听 'nuwax:keyboardHeightChange' 后顶起底部输入区。
+	 */
+	function buildKeyboardHeightInjectCode(h: number): string {
+		const heightNum = `${Math.round(h)}`
+		return `(function(){try{window.__nuwaxKeyboardHeight=${heightNum};window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:${heightNum}}}));}catch(e){}})()`
 	}
 
 	/**
@@ -117,7 +131,9 @@
 			}
 		}
 		try {
-			ctx.evalJS(code)
+			// 注入轮询顺带补发键盘高度：@load 前键盘已弹起、事件早于 webview 就绪时，
+			// 高度先缓存在 latestInjectedKeyboardHeight，随桥脚本一起落到 H5。
+			ctx.evalJS(code + buildKeyboardHeightInjectCode(latestInjectedKeyboardHeight))
 		} catch (e) {
 			return false
 		}
@@ -180,6 +196,30 @@
 		} catch (e) {
 			// ignore
 		}
+	}
+
+	/**
+	 * 原生侧键盘高度变化 → 注入内嵌 H5，驱动 H5 聊天页 keyboard-cover 顶起输入区。
+	 * Android 窗口全屏、键盘弹出时不收缩，输入区必须手动上抬；
+	 * H5 运行时无 keyboardheightchange 事件，此桥是内嵌页 keyboardHeight 的唯一来源。
+	 */
+	function onAppKeyboardHeightChangeForWebView(res: any): void {
+		let h = 0
+		try {
+			const obj = res as UTSJSONObject
+			const raw = obj["height"]
+			if (raw != null) {
+				const n = parseFloat(`${raw}`)
+				if (!isNaN(n) && n > 0) {
+					h = n
+				}
+			}
+		} catch (_eObj) {
+			// ignore
+		}
+		latestInjectedKeyboardHeight = h
+		console.log("[kb-bridge] reported keyboard height =", h)
+		evalBridgeJS(buildKeyboardHeightInjectCode(h))
 	}
 
 	function jsonStringifyForBridge(obj: UTSJSONObject): string {
@@ -1318,6 +1358,14 @@
 		agentDetailWebUrl.value = webUrl
 		// 尽早复位 webview textZoom：webview 挂载后立刻生效，避免 H5 首帧以放大字号渲染
 		fixAppWebviewTextZoom()
+		// 键盘高度桥：系统键盘高度 → 内嵌 H5（幂等注册，onUnmounted 注销）
+		// 仅 Android：Android 键盘高度值（不含底部安全区）与 webview 内容底边正好对齐；
+		// iOS 的 onKeyboardHeightChange 值语义不同，保持现状不动。
+		// #ifdef APP-ANDROID
+		if (appKeyboardHeightListenerId == 0) {
+			appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChangeForWebView)
+		}
+		// #endif
 	})
 	// #endif
 
@@ -1369,6 +1417,17 @@
 			clearInterval(appWebViewBridgeTimer)
 			appWebViewBridgeTimer = 0
 		}
+		// 注销键盘高度桥监听（与 onLoad 注册的 APP-ANDROID 条件对齐）
+		// #ifdef APP-ANDROID
+		if (appKeyboardHeightListenerId != 0) {
+			try {
+				uni.offKeyboardHeightChange(appKeyboardHeightListenerId)
+			} catch (_e) {
+				// ignore
+			}
+			appKeyboardHeightListenerId = 0
+		}
+		// #endif
 		// 停掉原生语音：断开 TTS 状态订阅并停止播报/录音，避免残留播放与监听
 		if (nativeTtsStateListenerId != 0) {
 			try {

@@ -54,6 +54,17 @@ const RESTART_COOLDOWN_MS = 3000;
 let onExecutingCallback: ((id: number) => void) | null = null;
 let isConversationActiveGetter: (() => boolean) | null = null;
 let isSubscribedGetter: (() => boolean) | null = null;
+/**
+ * 流代数 getter：pollOnce await 详情期间本地可能已触发新一轮（用户新发送），
+ * 代数增长则响应是发起时刻的旧快照，不得据此续接或强制收尾（误掐刚发送的流 →
+ * loading 消失 → 续接又出现）。sub 续接不改代数，复用同一轮。
+ */
+let streamGenerationGetter: (() => number | null) | null = null;
+/**
+ * 保持态 getter：live/sub fail 后本地保持「需恢复」（loading 不消失、busy 判定放行），
+ * 轮询读到终态时须据此收尾关态，否则保持态失去出口（loading 一直转）。
+ */
+let isResumePendingGetter: (() => boolean) | null = null;
 /** 终态回调：本地流式/sub 期间轮询发现任务已结束（他端结束/暂停）时通知页面强制收尾。 */
 let onTerminalWhileBusyCallback: ((id: number) => void) | null = null;
 /**
@@ -135,11 +146,23 @@ async function pollOnce(): Promise<void> {
   const busy = activeGetter != null && activeGetter() == true;
   const subscribedGetter = isSubscribedGetter;
   const subscribed = subscribedGetter != null && subscribedGetter() == true;
+  // 发起前快照：await 期间本地可能已触发新一轮（用户新发送 → 流代数 +1）。
+  // UTS 可变属性不可 smart cast，先拷局部再调用。
+  const genGetterSnapshot = streamGenerationGetter;
+  const genSnapshot = genGetterSnapshot != null ? genGetterSnapshot() : null;
+  // 保持态快照：fail 后本地保持「需恢复」（loading 不消失、busy 判定放行续接）
+  const resumePendingGetter = isResumePendingGetter;
+  const resumePending = resumePendingGetter != null && resumePendingGetter() == true;
 
   try {
     isProcessing = true;
     const response = await apiAgentConversation(currentConversationId);
     if (apiResCode(response) != SUCCESS_CODE) return;
+
+    // await 后流代数：增长说明本地已接管新一轮，响应为发起时刻的旧快照，一律作废
+    const genGetterNow = streamGenerationGetter;
+    const genNow = genGetterNow != null ? genGetterNow() : null;
+    const genChanged = genSnapshot != null && genNow != null && genNow != genSnapshot;
 
     const dataRaw = apiResData<any>(response);
     if (dataRaw == null) return;
@@ -149,6 +172,11 @@ async function pollOnce(): Promise<void> {
       // 服务端已回到执行态：上一轮终态观察作废（可能是旧任务的陈旧回包）
       pendingTerminalObserved = false;
       pendingTerminalCid = 0;
+      // await 期间本地已触发新一轮（用户新发送）：旧响应不得续接 / 加速 / 进 fast poll，
+      // 等下一轮再按新状态判断。
+      if (genChanged == true) {
+        return;
+      }
       // 本地忙（live SSE 流式 / sub 已订阅）：本轮已由本地接管，进入「静默终态轮询」。
       // 只保持 5s 探测（终态检测在下方非 EXECUTING 分支）；不判用户门禁、不加速、不触发 sub，
       // 避免本地接管本轮时（语音刚发送、服务端本轮用户句尚未落库）空转「等待下次轮询」+ fast 加速。
@@ -210,6 +238,27 @@ async function pollOnce(): Promise<void> {
       ) {
         pendingTerminalObserved = false;
         pendingTerminalCid = 0;
+      // await 期间本地可能已突变（用户刚发送 / 续接接管）：旧快照响应不得触发强制收尾，
+      // 否则会掐掉刚发送的 live SSE（loading 消失 → 后续续接又出现，反复翻转）。
+      if (genChanged == true) {
+        return;
+      }
+      const activeAfterTerminal = isConversationActiveGetter;
+      const busyAfterTerminal =
+        activeAfterTerminal != null && activeAfterTerminal() == true;
+      const subscribedAfterTerminal = isSubscribedGetter;
+      const subscribedAfterTerminalVal =
+        subscribedAfterTerminal != null && subscribedAfterTerminal() == true;
+      if (
+        (busy == false && busyAfterTerminal == true) ||
+        (subscribed == false && subscribedAfterTerminalVal == true)
+      ) {
+        // await 前空闲、await 后进入忙：本地刚接管（发送/续接），响应是旧快照
+        return;
+      }
+      // 保持态（fail 后等待续接）也算「本地在收流」：读到终态同样需要收尾关态，
+      // 否则保持态失去出口（loading 一直转、后端已结束无人关态）。
+      if (busy == true || subscribed == true || resumePending == true) {
         const tcb = onTerminalWhileBusyCallback;
         if (tcb != null) {
           tcb(currentConversationId);
@@ -257,6 +306,8 @@ export function startConversationPolling(
   isConversationActive: () => boolean,
   isSubscribed: () => boolean,
   onTerminalWhileBusy: (id: number) => void,
+  getStreamGeneration: (() => number | null) | null = null,
+  getIsResumePending: (() => boolean) | null = null,
 ): void {
   stopConversationPolling();
 
@@ -264,6 +315,8 @@ export function startConversationPolling(
   onExecutingCallback = onExecuting;
   isConversationActiveGetter = isConversationActive;
   isSubscribedGetter = isSubscribed;
+  streamGenerationGetter = getStreamGeneration;
+  isResumePendingGetter = getIsResumePending;
   onTerminalWhileBusyCallback = onTerminalWhileBusy;
   currentPollingInterval = POLLING_INTERVAL;
   resetWaitingUserFastPoll();
@@ -332,6 +385,8 @@ export function destroyConversationPolling(): void {
   onExecutingCallback = null;
   isConversationActiveGetter = null;
   isSubscribedGetter = null;
+  streamGenerationGetter = null;
+  isResumePendingGetter = null;
   onTerminalWhileBusyCallback = null;
 
   // #ifdef H5 || WEB

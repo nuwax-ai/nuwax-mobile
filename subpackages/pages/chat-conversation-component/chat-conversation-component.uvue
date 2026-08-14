@@ -174,7 +174,6 @@
                     :is-app-details="isAppDetails"
                     :message-time="item.time"
                     :is-last-msg="isLastMessage(listIndex)"
-                    :speaker-msg-in-list="speakerMsgInList"
                     :is-conversation-active="isConversationActive"
                     :show-tool-bar="!(isConversationActive && isLastMessage(listIndex))"
                     :enable-voice="voiceFeatureEnabled"
@@ -750,6 +749,49 @@
   const isAppWebView = ref<boolean>(false);
   // #ifdef H5 || WEB
   /**
+   * 文档滚动锁（幂等布尔）：聊天页为整页 App 式布局——导航栏/输入框固定、
+   * 仅中间消息区滚动，html/body 不应成为滚动容器。否则内容不足一屏时
+   * 触摸手势落到文档层，导航栏与输入框会整体位移，页面显得不稳定。
+   * 仅在 App web-view 内嵌（isAppWebView）时加锁：浏览器 H5 的输入框
+   * 依赖浏览器自动滚动文档来露出焦点，锁死会破坏键盘体验。
+   */
+  let h5DocScrollLocked: boolean = false;
+  const lockH5DocumentScroll = (): void => {
+    if (h5DocScrollLocked == true) {
+      return;
+    }
+    h5DocScrollLocked = true;
+    try {
+      const doc = document.documentElement;
+      if (doc != null) {
+        doc.style.setProperty("overflow", "hidden");
+      }
+      if (document.body != null) {
+        document.body.style.setProperty("overflow", "hidden");
+      }
+    } catch (_eLock) {
+      // ignore
+    }
+  };
+  const unlockH5DocumentScroll = (): void => {
+    if (h5DocScrollLocked != true) {
+      return;
+    }
+    h5DocScrollLocked = false;
+    try {
+      const doc = document.documentElement;
+      if (doc != null) {
+        doc.style.setProperty("overflow", "");
+      }
+      if (document.body != null) {
+        document.body.style.setProperty("overflow", "");
+      }
+    } catch (_eUnlock) {
+      // ignore
+    }
+  };
+
+  /**
    * 幂等标记 App web-view 内嵌：置 isAppWebView + 启用原生语音桥。
    * 录音（ASR）与语音播报（TTS）仅在此时走 App 原生侧；否则回退 H5 getUserMedia / WebSocket。
    */
@@ -759,6 +801,8 @@
     }
     isAppWebView.value = true;
     nativeVoiceBridge.setup();
+    // 内嵌确认即锁死文档滚动（见 lockH5DocumentScroll 注释）；浏览器 H5 永不触发
+    lockH5DocumentScroll();
   }
 
   /**
@@ -1765,35 +1809,6 @@
     return list.length - 1 == listIndex;
   };
 
-  /**
-   * 正在播报的消息是否仍在消息列表中（msg-tool-bar 兜底亮灯判定用）。
-   * 流式 id 被服务端改写后，播报器仍持有旧的临时 id，此时列表中不存在该 id →
-   * 兜底允许最后一条亮灯（即被改写的那条）；若在播消息还在列表里（新轮占位/新消息
-   * 已 push 但播报器未切换），精确匹配已能点亮它，禁止最后一条再走兜底，避免双图标。
-   */
-  const speakerMsgInList = computed((): boolean => {
-    let speakerId = "";
-    if (isAppWebView.value == true) {
-      // App web-view 内嵌页：以原生播报镜像状态为准
-      if (nativeVoiceBridge.isTtsBusy() == true) {
-        speakerId = nativeVoiceBridge.getTtsMessageId();
-      }
-    } else if (voiceStreamSpeaker.isBusy() == true) {
-      speakerId = voiceStreamSpeaker.getMessageId();
-    }
-    if (speakerId.length == 0) {
-      return false;
-    }
-    const list = messageList.value;
-    for (let i = 0; i < list.length; i++) {
-      const item = list[i];
-      if (item != null && item.id != null && `${item.id}` == speakerId) {
-        return true;
-      }
-    }
-    return false;
-  });
-
   /** Android：API 返回字符串，禁止 string as TaskStatus；const 箭头函数不可递归 */
   const parseTaskStatus = (val: any | null): TaskStatus | null => {
     if (val == null) {
@@ -2342,10 +2357,11 @@
     service.abortSubConversation();
 
     service.handleSendMessage(params, props.isTempChat, () => {
-      // 软断流 / 超时收尾：只复位按钮态。
+      // 软断流 / 超时收尾：只复位按钮态。会话态由 service 管理——
+      // 普通会话 fail 保持态（不关 loading，避免「消失→续接→又出现」翻转），
+      // 续接成功后继续；失败兜底 / 正常收尾才关态。
       // 不要在这里 abort——streamRequest 软收尾前还要排空 MESSAGE 队列；
       // abort 会 reset 队列，导致已收到但未派发的正文 delta 丢失（iOS 语音后常见只剩末尾几字）。
-      data.isConversationActive.value = false;
       data.isStoppingConversation.value = false;
     });
     // 用户/助手气泡已入列表后再滚底（含短时补滚，覆盖 iOS 布局晚到）
@@ -2824,7 +2840,8 @@
     }
     if (
       data.isConversationActive.value == true &&
-      service.needsBackgroundReconnect != true
+      service.needsBackgroundReconnect != true &&
+      service.isStreamResumePending != true
     ) {
       return true;
     }
@@ -2897,6 +2914,15 @@
       },
       (finishedCid: number) => {
         handleRemoteTaskFinished(finishedCid);
+      },
+      // 流代数 getter：轮询 await 期间用户新发送 → 代数 +1，旧响应作废，
+      // 避免「发送后 loading 消失 → 续接又出现」的误收尾竞态
+      (): number | null => {
+        return service.currentStreamGeneration;
+      },
+      // 保持态 getter：fail 后本地保持「需恢复」，轮询读到终态时也据此收尾关态
+      (): boolean => {
+        return service.isStreamResumePending;
       },
     );
   }
@@ -3176,12 +3202,24 @@
     invokeTriggerResume();
     // #endif
 
+    // #ifdef H5
+    // 重新可见时恢复文档锁（onHide 已解锁）。首次 onShow 时内嵌检测可能尚未完成，
+    // markAppEmbedded 确认后也会补锁，二者幂等。
+    if (isAppWebView.value == true) {
+      lockH5DocumentScroll();
+    }
+    // #endif
+
     // H5/WEB：不挂 triggerHide/Resume（避免与 visibilitychange 双触发），
     // 但 OpenUI 续作消费必须执行——单独注册 onShow 只做消费。
     handlePendingOpenUiAction();
   });
 
   onHide((): void => {
+    // #ifdef H5
+    // 离开聊天页（跳转其他 H5 页面等）先解锁文档，避免锁住被覆盖页面的滚动
+    unlockH5DocumentScroll();
+    // #endif
     // #ifndef H5 || WEB
     invokeTriggerHide();
     // #endif
@@ -3809,6 +3847,13 @@
     // #ifdef APP || WEB
     bindMarkdownProxyWeb();
     // #endif
+    // #ifdef H5
+    // App 内嵌时锁死文档滚动（幂等）：滚动只允许发生在中间消息区 scroll-view 内，
+    // 导航栏/输入框固定不动（见 lockH5DocumentScroll 注释；浏览器 H5 不加锁）
+    if (isAppWebView.value == true) {
+      lockH5DocumentScroll();
+    }
+    // #endif
     runOnMountedAsync();
   });
 
@@ -3830,6 +3875,7 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
+    unlockH5DocumentScroll();
     // #endif
 
     // #ifdef APP
@@ -3868,6 +3914,7 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
+    unlockH5DocumentScroll();
     // #endif
 
     // #ifdef APP

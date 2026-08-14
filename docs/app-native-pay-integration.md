@@ -61,13 +61,15 @@ interface AppNativePayBridge {
 - Android 包名与签名、iOS Bundle ID、HarmonyOS bundleName 已在微信开放平台登记并审核通过。
 - manifest 中启用对应微信 OpenSDK 模块。
 
+> **同域复用**：`link.nuwax.com` 同时承载业务外部唤起（`/open/*`）。AASA / assetlinks 部署时须一并覆盖业务 path。权威说明见 [app-deeplink-integration.md](./app-deeplink-integration.md)。
+
 真实资质数据不应写入公开文档；建议通过私有打包配置注入。
 
 ## TODO：原生支付上线前确认
 
 - [ ] 创建并解析 `link.nuwax.com`，确认公网 HTTPS 可访问。
 - [ ] 部署 `https://link.nuwax.com/.well-known/apple-app-site-association`，确认直接返回 HTTP 200 且没有重定向。
-- [ ] 确认 AASA 使用真实的 Apple Team ID 和 iOS Bundle ID，并覆盖 `/wechat/*`。
+- [ ] 确认 AASA 使用真实的 Apple Team ID 和 iOS Bundle ID，并覆盖 `/wechat/*` 与 `/open/*`（业务深链，见 deeplink 文档）。
 - [x] 配置 Android 微信开放平台移动应用 AppID：`wxbdaaa9ecab166aee`。
 - [ ] 确认 Android 包名与签名、iOS Bundle ID 与 Universal Links、HarmonyOS bundleName 均已登记并审核通过。
 - [ ] 将真实 AppID 和 Universal Links 写入私有打包配置及 `manifest.json`。

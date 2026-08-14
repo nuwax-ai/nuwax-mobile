@@ -1,0 +1,274 @@
+/**
+ * 业务深链（外部唤起）解析 / 分流 / 跳转 —— 内聚的深链模块。
+ *
+ * 对外只暴露两个生命周期入口（供 App.uvue 各调用一行）：
+ *   - onLaunchDeepLink()  冷启动：读 getLaunchOptionsSync，业务深链落盘 pending
+ *   - onShowDeepLink()    热启动 / 回前台：读 getEnterOptionsSync，登录态就绪时消费跳转
+ * 另导出 extractBusinessUrl / parseDeepLink 便于单测与调试（纯函数、无副作用）。
+ *
+ * 分流（与支付同域 path 互不抢）：
+ *   - nuwax://open/...                  → 业务
+ *   - https://link.nuwax.com/open/...   → 业务
+ *   - https://link.nuwax.com/wechat/... → 支付（忽略，留给支付线入站，见 appNativePay）
+ *   - pay.nuwax.com://...               → 支付（忽略）
+ *   - 其余                              → 非深链（忽略）
+ *
+ * 幂等：本进程内记 lastHandledUrl，热启动 resume 时 getEnterOptionsSync 可能回吐旧值，
+ * 同一 URL 不重复暂存 / 不重复跳转。
+ *
+ * 设计文档：docs/app-deeplink-integration.md；实施细化：docs/app-deeplink-implementation.md
+ */
+import { jumpToAgentDetailPage } from "@/utils/commonBusiness";
+import {
+  savePendingDeepLink,
+  consumePendingDeepLink,
+} from "@/utils/pendingDeepLink";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+
+/** 业务深链解析结果。 */
+export type DeepLinkAction = {
+  kind: string; // "agent"（后续扩展在 /open/{action} 加分支）
+  agentId: number;
+  conversationId: number | null;
+  raw: string;
+};
+
+/** 本进程内最近处理过的业务深链，用于幂等去重。 */
+let lastHandledUrl = "";
+
+/**
+ * 从 appScheme / appLink 提取「业务深链」完整 URL；非业务返回 ""。
+ * 注意：uni-app x 的 appScheme 是完整 scheme URL（如 nuwax://open/agent?id=1），
+ * appLink 是完整 HTTPS URL。
+ */
+export function extractBusinessUrl(appScheme: string, appLink: string): string {
+  // 优先 appLink（HTTPS Universal Links / App Links）
+  if (appLink.length > 0) {
+    const normalized = appLink.toLowerCase();
+    if (normalized.indexOf("link.nuwax.com") < 0) {
+      return ""; // 非业务域名
+    }
+    if (normalized.indexOf("link.nuwax.com/wechat") >= 0) {
+      return ""; // 支付回跳
+    }
+    if (normalized.indexOf("link.nuwax.com/open") >= 0) {
+      return appLink; // 业务
+    }
+    return ""; // 同域但非业务 path
+  }
+  // 其次 appScheme（自定义 scheme）
+  if (appScheme.length > 0) {
+    const lower = appScheme.toLowerCase();
+    if (lower.indexOf("pay.nuwax.com") == 0) {
+      return ""; // 支付回跳 scheme
+    }
+    if (lower.indexOf("nuwax://") == 0) {
+      return appScheme; // 业务
+    }
+    return "";
+  }
+  return "";
+}
+
+/** 手动解析 query（UTS 无全局 URL 对象）。返回 key→string。 */
+function parseQuery(q: string): UTSJSONObject {
+  const obj = {} as UTSJSONObject;
+  if (q.length == 0) {
+    return obj;
+  }
+  const pairs = q.split("&");
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    const eq = pair.indexOf("=");
+    if (eq < 0) {
+      continue;
+    }
+    const k = pair.substring(0, eq);
+    const v = pair.substring(eq + 1);
+    if (k.length > 0) {
+      obj[k] = v;
+    }
+  }
+  return obj;
+}
+
+/**
+ * 解析业务深链 URL → DeepLinkAction；不识别的 action / 缺 id 返回 null。
+ *   nuwax://open/agent?id=1&conversationId=2
+ *   https://link.nuwax.com/open/agent?id=1
+ */
+export function parseDeepLink(url: string): DeepLinkAction | null {
+  if (url.length == 0) {
+    return null;
+  }
+  const lowerUrl = url.toLowerCase();
+
+  // 1) 去掉 scheme，得到「host+path+query」或「path+query」
+  let afterScheme = url;
+  const sm = lowerUrl.indexOf("://");
+  if (sm >= 0) {
+    afterScheme = url.substring(sm + 3);
+  }
+
+  // 2) 区分 HTTPS 形态（有 host 段）与自定义 scheme 形态（直接是 path）
+  let pathPart = "";
+  if (lowerUrl.indexOf("http://") == 0 || lowerUrl.indexOf("https://") == 0) {
+    // HTTPS：afterScheme 形如 link.nuwax.com/open/agent?id=1，去掉 host 段
+    const firstSlash = afterScheme.indexOf("/");
+    if (firstSlash >= 0) {
+      pathPart = afterScheme.substring(firstSlash + 1); // open/agent?id=1
+    } else {
+      pathPart = ""; // 只有 host 无 path
+    }
+  } else {
+    // 自定义 scheme：afterScheme 形如 open/agent?id=1，直接当 path
+    pathPart = afterScheme;
+  }
+
+  // 3) 拆 query
+  let queryPart = "";
+  const qIdx = pathPart.indexOf("?");
+  if (qIdx >= 0) {
+    queryPart = pathPart.substring(qIdx + 1);
+    pathPart = pathPart.substring(0, qIdx);
+  }
+  // pathPart 现在形如 "open/agent"
+  const segments = pathPart.split("/");
+  const query = parseQuery(queryPart);
+
+  // 4) 找 "open" 段之后的 action 段
+  let foundOpen = false;
+  let actionSeg = "";
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i].toLowerCase();
+    if (!foundOpen) {
+      if (seg == "open") {
+        foundOpen = true;
+      }
+      continue;
+    }
+    if (seg.length > 0) {
+      actionSeg = seg;
+      break;
+    }
+  }
+
+  if (actionSeg != "agent") {
+    return null; // 暂只支持 /open/agent
+  }
+  const idRaw = `${(query["id"] as string | null) ?? ""}`;
+  if (idRaw.length == 0) {
+    return null; // agent 必须带 id
+  }
+  const agentId = parseInt(idRaw);
+  // parseInt 非数字返回 NaN；NaN 与任意数比较恒为 false，故用「> 0」正向判定，同时挡住 NaN/0/负数
+  if (!(agentId > 0)) {
+    return null;
+  }
+  let conversationId: number | null = null;
+  const cidRaw = `${(query["conversationId"] as string | null) ?? ""}`;
+  if (cidRaw.length > 0) {
+    const cid = parseInt(cidRaw);
+    if (cid > 0) {
+      conversationId = cid;
+    }
+  }
+  const action: DeepLinkAction = {
+    kind: "agent",
+    agentId: agentId,
+    conversationId: conversationId,
+    raw: url,
+  };
+  return action;
+}
+
+/** 已登录时执行跳转（复用 jumpToAgentDetailPage）。agentType 默认 ChatBot（深链暂不带类型）。 */
+function navigateDeepLink(action: DeepLinkAction): void {
+  if (action.kind != "agent") {
+    return;
+  }
+  // fire-and-forget：jumpToAgentDetailPage 对 ChatBot 仅 uni.navigateTo
+  jumpToAgentDetailPage(action.agentId, action.conversationId, "ChatBot", "");
+}
+
+/** 从 appScheme / appLink 提取业务 URL，幂等去重后暂存 pending。 */
+function handleDeepLink(appScheme: string, appLink: string): void {
+  const url = extractBusinessUrl(appScheme, appLink);
+  if (url.length == 0) {
+    return;
+  }
+  if (url == lastHandledUrl) {
+    return; // 幂等：本进程已处理过同一条（防热启动 resume 回吐旧值重复跳转）
+  }
+  lastHandledUrl = url;
+  console.log(`[DeepLink] captured: ${url}`);
+  savePendingDeepLink(url);
+}
+
+/** 读 ACCESS_TOKEN，非空视为已登录。 */
+function isLoggedIn(): boolean {
+  const raw = uni.getStorageSync(ACCESS_TOKEN);
+  const token = raw != null ? `${raw}`.trim() : "";
+  return token.length > 0;
+}
+
+/** 登录态就绪时消费 pending 并跳转（pending 存在 storage，consume 即删，幂等）。 */
+function consumeAndNavigateIfPending(): void {
+  if (!isLoggedIn()) {
+    return; // 未登录：保留 pending，等登录后回前台 onShow 再消费
+  }
+  const url = consumePendingDeepLink();
+  if (url.length == 0) {
+    return;
+  }
+  console.log(`[DeepLink] consuming: ${url}`);
+  const action = parseDeepLink(url);
+  if (action == null) {
+    console.log(`[DeepLink] unsupported/expired, dropped: ${url}`);
+    return;
+  }
+  navigateDeepLink(action);
+}
+
+// ───────────────────── 对外生命周期入口（App.uvue 各调一行） ─────────────────────
+
+/**
+ * 冷启动入口（App.onLaunch）：读 getLaunchOptionsSync，业务深链落盘 pending。
+ * 必须在 reLaunch 登录页之前调用 —— reLaunch 会丢 launch options，pending 存 storage 才存活。
+ *
+ * try/catch：深链是增强能力，绝不能因 launch options API 异常（如编译器与基座版本不一致、
+ * 旧基座未实现）阻塞启动/回前台主流程。
+ */
+export function onLaunchDeepLink(): void {
+  let scheme = "";
+  let link = "";
+  try {
+    const opts = uni.getLaunchOptionsSync();
+    scheme = `${opts.appScheme ?? ""}`;
+    link = `${opts.appLink ?? ""}`;
+  } catch (_e) {
+    console.log("[DeepLink] getLaunchOptionsSync unavailable");
+  }
+  console.log(`[DeepLink] onLaunch appScheme=${scheme} appLink=${link}`);
+  handleDeepLink(scheme, link);
+}
+
+/**
+ * 热启动 / 回前台入口（App.onShow）：读 getEnterOptionsSync 捕获新深链，
+ * 并在登录态就绪时消费 pending 跳转。登录页零改动 —— 所有登录路径写 token 后回前台都触发 onShow。
+ * try/catch 原因同 onLaunchDeepLink。
+ */
+export function onShowDeepLink(): void {
+  let scheme = "";
+  let link = "";
+  try {
+    const opts = uni.getEnterOptionsSync();
+    scheme = `${opts.appScheme ?? ""}`;
+    link = `${opts.appLink ?? ""}`;
+  } catch (_e) {
+    console.log("[DeepLink] getEnterOptionsSync unavailable");
+  }
+  console.log(`[DeepLink] onShow appScheme=${scheme} appLink=${link}`);
+  handleDeepLink(scheme, link);
+  consumeAndNavigateIfPending();
+}

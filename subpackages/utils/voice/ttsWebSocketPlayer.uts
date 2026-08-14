@@ -548,9 +548,9 @@ export class TtsWebSocketPlayer {
   /** 后续段切段阈值（音频 ms）；更大 → 段更少、边界更少 */
   private readonly STREAM_SEGMENT_MS: number = 4000;
   /** 按需切段的最小段长（音频 ms）：播放端等待时也须攒够最小段，避免逐帧切成碎片段 */
-  private readonly STREAM_FORCED_SEGMENT_MIN_MS: number = 500;
+  private readonly STREAM_FORCED_SEGMENT_MIN_MS: number = 400;
   /** flush 后等 tts_end 的看门狗 */
-  private readonly STREAM_FLUSH_END_WATCHDOG_MS: number = 5000;
+  private readonly STREAM_FLUSH_END_WATCHDOG_MS: number = 8000;
   /** 播放端队列排空时请求的按需切段标记：有标记则切段不再等阈值（成功切段后清除） */
   private streamForcePending: boolean = false;
 
@@ -2063,6 +2063,45 @@ export class TtsWebSocketPlayer {
   }
 
   /**
+   * 新段就绪时预置到「下次将播放的 context」：若正在播上一段，趁播放期让该段提前 prepare，
+   * 换段时仅 play() 即出声。voiceStreamSpeaker 的段回调在切段完成后调用。
+   * @param src 下一段（readySegments 队首）的 src；已预置过则跳过
+   */
+  preloadNextStreamSegment(src: string): void {
+    if (
+      this.streamSessionActive != true ||
+      this.streamEnded == true ||
+      src.length == 0
+    ) {
+      return;
+    }
+    if (this.streamPreloadedSrc == src) {
+      return;
+    }
+    // 下次将播放的 context：streamUseAlt 已在最近一次 playStreamSegment 里切换为下一相位
+    const nextActiveIsAlt = this.streamUseAlt;
+    let idle = nextActiveIsAlt == true ? this.streamAltAudioContext : this.audioContext;
+    if (idle == null) {
+      idle = uni.createInnerAudioContext();
+      // #ifdef APP-IOS
+      idle!.obeyMuteSwitch = false;
+      // #endif
+      if (nextActiveIsAlt == true) {
+        this.streamAltAudioContext = idle;
+      } else {
+        this.audioContext = idle;
+      }
+    }
+    this.streamPreloadedSrc = src;
+    try {
+      idle!.stop();
+      idle!.src = src;
+    } catch (_ePre) {
+      // ignore
+    }
+  }
+
+  /**
    * 播放结束且预取合成仍在进行：停音频、idle，但不 recycle / 不清 PCM / 不取消合成。
    */
   private endPlaybackKeepSynth(): void {
@@ -2345,7 +2384,10 @@ export class TtsWebSocketPlayer {
       this.fail(errMsg);
     });
     socketTask!.onClose((_res: OnSocketCloseCallbackResult) => {
-      if (this.socketTask == null) {
+      // 仅处理「当前会话 socket」的关闭：旧 socket（换轮/回收后关闭）的 close 事件
+      // 可能晚于新会话 socket 就位，若按 socketTask 非空就清理，会把新会话的 socketTask
+      // 清空 → 新会话文本发不出去、无音频、最终超时复位。
+      if (this.socketTask != socketTask) {
         return;
       }
       // 已在播 / 暂停：只清 socket，继续本地音频；绝不触碰 chat SSE

@@ -63,6 +63,7 @@ import {
 } from "./mockStreamPerf.uts";
 import { StreamRequest } from "@/utils/streamRequest";
 import { isAppInBackground } from "@/utils/appLifecycle.uts";
+import { bumpPollGeneration } from "@/subpackages/hooks/useConversationStatusPolling.uts";
 import {
   StreamChunk,
   StreamRequestConfig,
@@ -1179,6 +1180,16 @@ export default class AgentDetailService {
     }
     const taskStatusRaw = readRawField(stopConvInfo, "taskStatus");
     if (taskStatusRaw == null || `${taskStatusRaw}` != `${TaskStatus.EXECUTING}`) {
+      // 预期 EXECUTING 才写：skip 日志用于确认「没写入是因为本来就不在执行中」，
+      // 而不是路径没走到（排查固化 EXECUTING 时 cur= 值是关键证据）
+      console.log(
+        "[AgentDetailService] taskStatus terminal skip: cur=" +
+          `${taskStatusRaw}` +
+          " next=" +
+          `${nextStatus}` +
+          " convId=" +
+          `${this.data.conversationId.value}`,
+      );
       return;
     }
     try {
@@ -1192,6 +1203,12 @@ export default class AgentDetailService {
       }
       convObj["taskStatus"] = nextStatus;
       this.data.conversationInfo.value = convObj as any;
+      console.log(
+        "[AgentDetailService] taskStatus terminal: EXECUTING -> " +
+          `${nextStatus}` +
+          " convId=" +
+          `${this.data.conversationId.value}`,
+      );
     } catch (_e) {
       // ignore
     }
@@ -1916,9 +1933,17 @@ export default class AgentDetailService {
       // #endif
       const m = cloneMessageInfoDraft(currentMessage);
       m["status"] = "error";
+      // 出错即终态：EXECUTING 工具卡置 FAILED，否则旋转 loading 不消失（对齐 PC onError）
+      const failedTools = this.patchDraftExecutingProcessingToFailed(m);
       newMessage = buildMessageInfoFromDraft(m);
       this.data.isConversationActive.value = false;
       this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
+      console.log(
+        "[AgentDetailService] ERROR event terminal: taskStatus->FAILED toolsFailed=" +
+          `${failedTools}` +
+          " msgId=" +
+          `${currentMessageId}`,
+      );
     }
 
     // 更新消息列表草稿
@@ -2391,7 +2416,7 @@ export default class AgentDetailService {
             "[AgentDetailService] Chat stream error callback:",
             error,
           );
-          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout);
+          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, true);
         },
         isTempChat,
         // 超时 / 连接异常关闭回调（H5 onClose、App 无 SSE 终态的 HTTP complete）
@@ -2400,7 +2425,7 @@ export default class AgentDetailService {
             return;
           }
           console.warn("[SSE-Stream] stream abnormal close / timeout");
-          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout);
+          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, false);
         },
       );
     } catch (error) {
@@ -2628,6 +2653,7 @@ export default class AgentDetailService {
     isTempChat: boolean,
     streamGen: number,
     onTimeout: NullableTimeoutCallback,
+    isRealError: boolean,
   ): void {
     this.endStreamListDraft();
     this.sealStreamingAssistantBeforeClear();
@@ -2652,7 +2678,20 @@ export default class AgentDetailService {
         return;
       }
       this.data.isConversationActive.value = false;
-      this.markConversationTaskCompleteIfExecuting();
+      // 对齐 PC（b8ec155a3）：真实网络错误落 FAILED，避免后端落库延迟仍返回 EXECUTING
+      // 时本地 taskStatus 固化在执行中；timeout/异常关闭多为「流结束但缺 FINAL_RESULT」
+      // 的兜底，保持 COMPLETE，由 scheduleRecover 拉详情纠正。
+      console.log(
+        "[SSE-Stream] abnormal finalize: isRealError=" +
+          `${isRealError}` +
+          " gen=" +
+          `${genAtAbnormal}`,
+      );
+      if (isRealError == true) {
+        this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
+      } else {
+        this.markConversationTaskCompleteIfExecuting();
+      }
     }, 150);
     this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
     if (onTimeout != null) {
@@ -3238,6 +3277,36 @@ export default class AgentDetailService {
   }
 
   /**
+   * 把消息草稿 processingList 中 EXECUTING 的工具卡置为 FAILED，返回转换数量。
+   * 停止 / 出错即终态：断流后不会再有工具终态事件，EXECUTING 残留会让工具卡一直旋转
+   * （对齐 PC onError 的 processing 收口）。
+   */
+  private patchDraftExecutingProcessingToFailed(draft: UTSJSONObject): number {
+    const sourceRaw = draft["processingList"];
+    const sourceList = sourceRaw != null ? sourceRaw as any[] : [] as any[];
+    if (sourceList.length == 0) {
+      return 0;
+    }
+    let failedCount = 0;
+    const stoppedList: ProcessingInfo[] = [];
+    for (let i = 0; i < sourceList.length; i++) {
+      const processing = sourceList[i];
+      const normalized = normalizeToolCallProcessingData(processing);
+      const statusRaw = readRawField(normalized, "status");
+      const status = statusRaw != null ? `${statusRaw}` : "";
+      if (status == `${ProcessingEnum.EXECUTING}`) {
+        normalized["status"] = ProcessingEnum.FAILED;
+        failedCount = failedCount + 1;
+        stoppedList.push(normalized as ProcessingInfo);
+      } else {
+        stoppedList.push(processing as ProcessingInfo);
+      }
+    }
+    draft["processingList"] = stoppedList;
+    return failedCount;
+  }
+
+  /**
    * 会话停止 / 结束时立即收口当前助手消息。
    *
    * stop 会先断开 SSE，因此不能再等服务端的 FINAL_RESULT / 工具终态事件来刷 UI：
@@ -3305,25 +3374,7 @@ export default class AgentDetailService {
       draft["status"] = MessageStatusEnum.Complete;
     }
 
-    const sourceProcessingList = target.processingList != null
-      ? target.processingList as any[]
-      : [] as any[];
-    if (sourceProcessingList.length > 0) {
-      const stoppedProcessingList: ProcessingInfo[] = [];
-      for (let i = 0; i < sourceProcessingList.length; i++) {
-        const processing = sourceProcessingList[i];
-        const normalized = normalizeToolCallProcessingData(processing);
-        const statusRaw = readRawField(normalized, "status");
-        const status = statusRaw != null ? `${statusRaw}` : "";
-        if (status == `${ProcessingEnum.EXECUTING}`) {
-          normalized["status"] = ProcessingEnum.FAILED;
-          stoppedProcessingList.push(normalized as ProcessingInfo);
-        } else {
-          stoppedProcessingList.push(processing as ProcessingInfo);
-        }
-      }
-      draft["processingList"] = stoppedProcessingList;
-    }
+    this.patchDraftExecutingProcessingToFailed(draft);
 
     const stoppedMessage = buildMessageInfoFromDraft(draft);
     if (stoppedMessage == null) {
@@ -3805,6 +3856,9 @@ export default class AgentDetailService {
     chatService.abort();
     this.abortSubConversation();
     this.clearStreamingAssistantText();
+    // 轮询代际同步 bump（与 isConversationActive=true 同一调用栈，对齐 PC pollGeneration）：
+    // 在途轮询回包整段丢弃，避免旧快照误开 sub / 旧终态误触 onTerminalWhileBusy 掐死本轮
+    bumpPollGeneration();
 
     // 构造消息
     const chatMessage: UTSJSONObject = {

@@ -12,6 +12,9 @@
  * - 小程序/App:chat-conversation-component 内 onShow/onHide 调 resume/pause
  *
  * 本轮用户门禁见 subResumeGate.uts（与 handleSubConversation 共用，四端一致）。
+ *
+ * 竞态防护：发送入口同步 bumpPollGeneration()，在途回包代际不符时整段丢弃
+ * （对齐 PC useConversationStreamResume 的 poll generation 修复）。
  */
 import { apiAgentConversation } from '@/servers/conversation';
 import { SUCCESS_CODE } from '@/constants/codes.constants';
@@ -44,6 +47,11 @@ let currentConversationId = 0;
 /** 最近一次触发 onExecuting 续接的时刻：sub 关闭后重启轮询据此进入冷却 */
 let lastOnExecutingTime = 0;
 /**
+ * 轮询代际（对齐 PC pollGeneration）：发送入口同步 bump，
+ * 在途旧回包整段丢弃，避免误开 sub 续接或过期终态误触 onTerminalWhileBusy。
+ */
+let pollGeneration = 0;
+/**
  * 续接重启冷却：sub 刚失败/关闭（onSubClose）会立即走到 startConversationPolling，
  * 而该函数会同步 pollOnce → 立即续接 → 立即失败 → 再重启，形成无间隔自激循环。
  * 冷却期内跳过「立即 pollOnce」，让循环退回到 interval 间隔（常态 5s）。
@@ -73,6 +81,20 @@ function normalizeTaskStatus(val: any | null): string {
     // not object
   }
   return `${raw}`;
+}
+
+/**
+ * 本地开始发送消息时同步递增轮询代际（发送入口 isConversationActive=true 同一调用栈调用）。
+ * 代际变化后，此前在途的轮询回包将被 pollOnce 整段丢弃（不写终态、不触发 onExecuting）。
+ */
+export function bumpPollGeneration(): void {
+  pollGeneration = pollGeneration + 1;
+  // 与 discard stale poll result 成对出现即可自证竞态修复生效（对齐 PC cancel/discard 日志对）；
+  // 只有 bump 没有 discard 也算修复有效：说明发送时轮询本就不在途。
+  console.log(
+    "[ConversationStatusPolling] bump: local send started gen=" +
+      `${pollGeneration}`,
+  );
 }
 
 /**
@@ -128,7 +150,20 @@ async function pollOnce(): Promise<void> {
 
   try {
     isProcessing = true;
+    // 请求发出时打戳代际：await 期间若本地已发消息（bumpPollGeneration），回包即过期
+    const requestGeneration = pollGeneration;
     const response = await apiAgentConversation(currentConversationId);
+    // 代际不一致 = 发送已在途/已接管本轮：旧回包整段丢弃（终态/onExecuting 都不许触发），
+    // 否则旧 EXECUTING 会误开 sub、旧终态会误触 onTerminalWhileBusy 掐死刚发出的新一轮。
+    if (requestGeneration != pollGeneration) {
+      console.log(
+        "[ConversationStatusPolling] discard stale poll result gen=" +
+          `${requestGeneration}` +
+          " cur=" +
+          `${pollGeneration}`,
+      );
+      return;
+    }
     if (apiResCode(response) != SUCCESS_CODE) return;
 
     const dataRaw = apiResData<any>(response);

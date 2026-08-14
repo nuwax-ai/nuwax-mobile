@@ -51,6 +51,11 @@
         type: Array,
         default: () => [],
       },
+      // 仅当前 SSE 消息允许根据执行态自动展开；历史消息始终从折叠态加载。
+      isCurrentStreaming: {
+        type: Boolean,
+        default: false,
+      },
       // 流式正文开始输出时由 Markdown 分组层传入，表示当前工具调用组已完成。
       autoCollapse: {
         type: [Boolean, String],
@@ -132,8 +137,39 @@
       toggleExpanded() {
         this.isExpanded = !this.isExpanded;
       },
+      syncExecutionExpanded() {
+        if (!this.isCurrentStreaming) {
+          this.isExpanded = false;
+          return;
+        }
+        const hasExecuting = (this.childs || []).some((n) => {
+          if (!(n.name === "container" || n.name === "markdown-custom-process")) {
+            return false;
+          }
+          const data = this.getRenderData(n);
+          const name = `${data?.name || ""}`;
+          if (data?.type === "Event" || isOpenUiRenderToolName(name)) {
+            return false;
+          }
+          return data?.status !== "FINISHED" && data?.status !== "FAILED";
+        });
+        this.isExpanded = hasExecuting;
+      },
     },
     watch: {
+      processingList: {
+        deep: true,
+        immediate: true,
+        handler() {
+          this.syncExecutionExpanded();
+        },
+      },
+      isCurrentStreaming: {
+        immediate: true,
+        handler() {
+          this.syncExecutionExpanded();
+        },
+      },
       autoCollapse: {
         immediate: true,
         handler(value) {

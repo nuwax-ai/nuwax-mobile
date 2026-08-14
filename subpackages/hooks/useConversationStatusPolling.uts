@@ -7,6 +7,8 @@
  * 本地忙(live 流式 / 已订阅 sub)时进入「静默终态轮询」:仍每 5s 探测,但只用于检测任务被
  * 他端结束/暂停(非 EXECUTING → onTerminalWhileBusy 强制收尾);不判用户门禁、不加速、
  * 不触发 sub,避免本地接管本轮时空转(语音刚发送、服务端本轮用户句尚未落库等)。
+ * 高频连续发送保护：终态须「连续两轮」观察到才回调（详见 pendingTerminalObserved），
+ * 单轮终态可能是上一轮任务被打断后的陈旧回包，不能据此掐断新一轮流。
  * 语音播报不挡轮询（App 开会话后 H5 续接时，播报中也要能检出 EXECUTING）。
  * - H5:visibilitychange 自动暂停/恢复
  * - 小程序/App:chat-conversation-component 内 onShow/onHide 调 resume/pause
@@ -65,6 +67,14 @@ let streamGenerationGetter: (() => number | null) | null = null;
 let isResumePendingGetter: (() => boolean) | null = null;
 /** 终态回调：本地流式/sub 期间轮询发现任务已结束（他端结束/暂停）时通知页面强制收尾。 */
 let onTerminalWhileBusyCallback: ((id: number) => void) | null = null;
+/**
+ * 终态「两轮确认」：本地忙时单次终态响应可能是上一轮任务的陈旧回包
+ * （高频连续发送：新 send abort 旧 SSE → 服务端旧任务被打断成终态，
+ * 而本轮 GET 可能早于新任务注册发出）。须连续两轮都观察到终态才回调，
+ * 否则一轮陈旧终态就会误杀刚启动的新一轮流式。
+ */
+let pendingTerminalObserved = false;
+let pendingTerminalCid = 0;
 
 /**
  * 规范化 taskStatus（App 可能是字符串 / 带 value 的对象）。
@@ -159,6 +169,9 @@ async function pollOnce(): Promise<void> {
     const dataObj = dataRaw as UTSJSONObject;
     const taskStatusStr = normalizeTaskStatus(dataObj['taskStatus']);
     if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
+      // 服务端已回到执行态：上一轮终态观察作废（可能是旧任务的陈旧回包）
+      pendingTerminalObserved = false;
+      pendingTerminalCid = 0;
       // await 期间本地已触发新一轮（用户新发送）：旧响应不得续接 / 加速 / 进 fast poll，
       // 等下一轮再按新状态判断。
       if (genChanged == true) {
@@ -207,6 +220,24 @@ async function pollOnce(): Promise<void> {
       // 非 EXECUTING（终态：COMPLETE / FAILED / CANCEL）而本端仍认为在 live/sub 接收：
       // 说明他端已结束 / 暂停任务，通知页面强制收尾。
       // 空闲时不主动回调，避免旧轮询响应误中止刚开始的新会话。
+      //
+      // 高频连续发送保护：终态响应可能是上一轮任务的陈旧回包（新 send abort 旧 SSE
+      // 后服务端旧任务被打断成终态，而本轮 GET 可能早于新任务注册发出）。
+      // 因此：1) 以 await 后的实时 busy 为准（await 期间可能已开新一轮流）；
+      //      2) 连续两轮都观察到终态才回调，单轮陈旧终态不触发强制收尾。
+      const activeAfter2 = isConversationActiveGetter;
+      const busyNow =
+        (activeAfter2 != null && activeAfter2() == true) ||
+        (subscribedGetter != null && subscribedGetter() == true);
+      if (busyNow != true) {
+        pendingTerminalObserved = false;
+        pendingTerminalCid = 0;
+      } else if (
+        pendingTerminalObserved == true &&
+        pendingTerminalCid == currentConversationId
+      ) {
+        pendingTerminalObserved = false;
+        pendingTerminalCid = 0;
       // await 期间本地可能已突变（用户刚发送 / 续接接管）：旧快照响应不得触发强制收尾，
       // 否则会掐掉刚发送的 live SSE（loading 消失 → 后续续接又出现，反复翻转）。
       if (genChanged == true) {
@@ -232,6 +263,9 @@ async function pollOnce(): Promise<void> {
         if (tcb != null) {
           tcb(currentConversationId);
         }
+      } else {
+        pendingTerminalObserved = true;
+        pendingTerminalCid = currentConversationId;
       }
       resetWaitingUserFastPoll();
       ensurePollingInterval(POLLING_INTERVAL);
@@ -313,6 +347,9 @@ export function stopConversationPolling(): void {
   }
   currentPollingInterval = POLLING_INTERVAL;
   resetWaitingUserFastPoll();
+  // 停轮询即作废上一轮终态观察（切换会话 / 暂停 / 销毁后都从零重新确认）
+  pendingTerminalObserved = false;
+  pendingTerminalCid = 0;
 }
 
 /**

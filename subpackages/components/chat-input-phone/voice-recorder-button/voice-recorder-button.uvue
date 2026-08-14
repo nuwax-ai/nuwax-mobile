@@ -177,10 +177,19 @@
   const isTapped = ref<boolean>(false)
   /** Android 轻触粘紫：idle 时 bump key 重建节点 */
   const panelRenderKey = ref<number>(0)
+  /**
+   * 可出波浪线标记：权限已确认（含按下瞬间快检命中 / ensure 授权成功）才允许按下即出录音态。
+   * 避免「未授权时按下 → 授权弹窗期间就出现波浪线」；真正开录（recording）不受此门控。
+   */
+  const recordVisualReady = ref<boolean>(false)
+  /** 本会话已成功授权过麦克风（原生桥路径无同步权限查询，靠此缓存实现「有权限立即出波浪线」） */
+  let recordPermissionCached: boolean = false
   const isRecorderActive = computed((): boolean => {
     return (
       currentState.value == 'recording' ||
-      (currentState.value == 'default' && isTapped.value)
+      (currentState.value == 'default' &&
+        isTapped.value &&
+        recordVisualReady.value)
     );
   })
   const isUploadingVisual = computed((): boolean => {
@@ -360,6 +369,7 @@
     hideConnectingLoading()
     isTapped.value = false
     currentState.value = 'default'
+    recordVisualReady.value = false
     clearNativeStopWatchdog()
     // #ifdef APP
     asrWaitingResult = false
@@ -938,6 +948,56 @@
     return true;
   }
 
+  /**
+   * 按下瞬间快检权限是否已授权（不弹窗）：
+   * - 已授权 → recordVisualReady=true，立即出波浪线；
+   * - 未授权/不可快检 → false，波浪线延迟到授权成功（ensure 回调）后出现。
+   * App web-view 内嵌页无法同步查原生权限，用本会话授权缓存代替。
+   */
+  async function hasRecordPermissionAlready(): Promise<boolean> {
+    // App web-view 内嵌页：权限由原生侧管理，无同步查询；缓存命中即视为已授权
+    if (isNativeBridge() == true) {
+      return recordPermissionCached;
+    }
+    // #ifdef APP-ANDROID
+    try {
+      const activity = UTSAndroid.getUniActivity();
+      if (activity != null) {
+        return UTSAndroid.checkSystemPermissionGranted(
+          activity,
+          ["android.permission.RECORD_AUDIO"] as string[],
+        );
+      }
+    } catch (_eAndroid) {
+      // ignore
+    }
+    return false;
+    // #endif
+    // #ifdef APP-IOS
+    try {
+      const authSetting = uni.getAppAuthorizeSetting();
+      return authSetting.microphoneAuthorized == "authorized";
+    } catch (_eIos) {
+      return false;
+    }
+    // #endif
+    // #ifdef H5 || WEB
+    // 仅用 permissions.query（不弹窗）；不支持权限 API 时交给 ensure（getUserMedia 弹窗）
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const permission = await navigator.permissions.query({
+          name: "microphone" as PermissionName,
+        });
+        return permission.state == "granted";
+      }
+    } catch (_eH5) {
+      // ignore
+    }
+    return false;
+    // #endif
+    return false;
+  }
+
   function openRecordPermissionSettings(): void {
     // #ifdef APP-ANDROID
     const activity = UTSAndroid.getUniActivity();
@@ -1012,9 +1072,19 @@
     vibrateOnRecordPress()
     emit('onRecordPress')
 
+    // 权限已授权：按下立即出波浪线；未授权：波浪线延迟到授权成功后再出现
+    const permissionAlreadyGranted = await hasRecordPermissionAlready();
+    if (permissionAlreadyGranted == true) {
+      recordVisualReady.value = true
+    }
+
     showConnectingLoading()
 
     const permitted = await ensureRecordPermission();
+    if (permitted == true) {
+      // 本会话授权成功：原生桥等无同步查询的路径后续按下可立即出波浪线
+      recordPermissionCached = true
+    }
     // 权限等待期间用户已松手：禁止再 start，避免 Other errors / 样式卡死
     if (isTapped.value != true || ignoreNextStopResult == true) {
       hideConnectingLoading()
@@ -1029,6 +1099,11 @@
       paintIdleAndNotify()
       showRecordPermissionModal();
       return;
+    }
+
+    // 授权成功（可能由 ensure 弹窗流程确认）：此刻起可出波浪线，随后 callRecorderStart
+    if (recordVisualReady.value != true) {
+      recordVisualReady.value = true
     }
 
     try {

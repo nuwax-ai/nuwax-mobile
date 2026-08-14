@@ -40,8 +40,9 @@
 5. **新增 scheme 是原生/打包级改动 → 必须重打自定义基座才能真机验证**。
    按 [[custom-base-rebuild-rule]]：改业务 uvue/uts 不用重打，但 **scheme 注册改的是 AndroidManifest.xml / Info.plist，属原生配置**，`--playground custom` 热推 www 不会更新已装基座的 manifest。P0 真机验证需 `make app-resource` → `make base-android`（+ iOS）→ 重装。标准基座测试可走官方 `https://uniappx.dcloud.net.cn/scheme.html`，但本 App 用自定义基座（含支付/ESP 原生模块）。
 
-6. **`App.onShow` 是统一的 consume 入口，无需改任何登录页**。
-   全部登录路径（`login.uvue`、`login-form.uvue`、`login-weixin.uvue`）写 token 后都会回到前台触发 `App.onShow`。把 `consumePendingDeepLink` 放在 `App.onShow`（token 就绪时消费），可覆盖**所有**登录方式（包括 `login-weixin` 直写 `setStorageSync(ACCESS_TOKEN)` 那条），比设计 §8「在登录成功路径 consume」更省、更稳。本文按此实现。
+6. **~~`App.onShow` 是统一的 consume 入口，无需改任何登录页~~（已校正，见修订记录 2026-08-14 代码评审修复）**。
+   原假设「登录后一定回前台触发 `App.onShow`」**不成立**：登录流程是在**前台**通过 `redirectTo`→`reLaunch` 落地首页完成的，全程 App 未离开前台，**不会再触发 `onShow`**，pending 深链可能永远不被消费。
+   → **校正**：`deepLinkRouter` 新增 `resumeDeepLinkAfterLogin()`，在**三条登录成功路径**（`login.uvue`、`login-form.uvue` ×2、`login-weixin.uvue`）`redirectTo` 之后各显式调一次（`// #ifdef APP-ANDROID || APP-IOS`）。三处都走同一个 `redirectTo`（仅这 3 个登录文件用它），故接入点收敛。`onShow` 仍保留（覆盖「已登录 + 后台点链接回前台」路径），两者靠 consume 即删 + 短时窗口去重不重复跳转。
 
 7. **隐私合规（合规弹窗）不阻塞深链读取，但约束敏感 API**。
    uni-app x 隐私政策弹窗是 `onLaunch` 内 `openDialogPage` 的**非阻塞**弹层，不影响 `appScheme` 读取（[合规文档](https://doc.dcloud.net.cn/uni-app-x/tutorial/compliance.html)）。当前 `App.uvue` 未挂全局合规弹窗（仅 `login-weixin` 有勾选协议），P0 无冲突；但深链目标若用到相机/定位/设备信息等，需先 `uni.getPrivacySetting()` —— 暂不涉及（agent-detail 无敏感 API），记为后续注意点。
@@ -229,6 +230,7 @@ adb install -r unpackage/debug/android_debug.apk
 | `utils/pendingDeepLink.uts` | **新建**（仿 `pendingOpenUiAction.uts`） | P0 |
 | `utils/deepLinkRouter.uts` | **新建**（parse + 分流 + navigate） | P0 |
 | `App.uvue` | `onLaunch` 捕获→落盘；`onShow` 捕获+消费跳转 | P0 |
+| `login.uvue` / `login-form.uvue` / `login-weixin.uvue` | 登录成功 `redirectTo` 后调 `resumeDeepLinkAfterLogin()`（APP 条件编译） | P0（评审修复） |
 | `harmony-configs/entry/src/main/module.json5` | **新建** skills `nuwax` | P0/P2 |
 | 原生 `AndroidManifest.xml`（intent-filter autoVerify） | App Links | P1 |
 | `link.nuwax.com` AASA / assetlinks / 落地页 | 运维/后端 | P1 |
@@ -277,3 +279,21 @@ adb install -r unpackage/debug/android_debug.apk
 4. 未登录 pending 流（登录后进目标页）：需真机短信登录，留作人工用例。
 
 **iOS（待办）**：scheme 注册走 HBuilderX 可视化（manifest.json 源码无字段），需在 HX「App iOS 配置 → URL Types」加 `nuwax` 后重出 iOS 基座（真机另需证书）。
+
+### 2026-08-14：代码评审修复（PR-1 复盘）
+
+对 `utils/deepLinkRouter.uts` / `utils/pendingDeepLink.uts` / `App.uvue` 做评审后，落地以下修复（均为纯业务 uts/uvue 改动，**不需重打基座**，HX 热推即可验）：
+
+| # | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| 1 | 高 | 登录成功未必再触发 `App.onShow`（前台 `reLaunch` 落地），pending 可能永不消费 | 新增 `resumeDeepLinkAfterLogin()`，在三条登录成功路径 `redirectTo` 后显式调用（APP 条件编译）。详见校正项 6 |
+| 2 | 高 | `lastHandledUrl` 永久去重 → 同进程内同一深链**永远无法二次唤起** | 改为 `lastHandledUrl + lastHandledAt` **短时窗口去重**（`DEDUP_WINDOW_MS=3000`）：只挡冷启动 `onLaunch+onShow` 双触发 / resume 回吐旧值，窗口外允许再次唤起 |
+| 3 | 中 | HTTPS host 用 `indexOf` 子串匹配 → `https://evil.com/link.nuwax.com/open/...` 可绕过 | 抽 `extractHttpsHost()` 做 **host 精确等于** `link.nuwax.com`，再按 path `/open`（业务）`/wechat`（支付忽略）分流 |
+| 4 | 中 | `appLink.length>0` 提前返回：出现无关 appLink 时会吞掉有效 appScheme | 拆 `extractFromHttpsLink` / `extractFromScheme`，appLink 非业务时**回退**再看 appScheme |
+| 5 | 低 | query 值未 `decodeURIComponent` | `parseQuery` 值统一 `decodeUri()`（try/catch 保底原值） |
+
+**仍未做（有意保留）**
+
+- **热启动新深链在 5.23 基座不生效**（已知平台限制，见上「已知限制 1」）：等 5.24 SDK/基座。短时窗口去重不影响该结论。
+- **单测**：`extractBusinessUrl` / `parseDeepLink` 是纯函数，已具备可测性；单测用例（含混淆 host、encode query、fallthrough）待补 `pages/test-*` 或独立测试位。
+- **`navigateDeepLink` 仍复用 `jumpToAgentDetailPage`**（保留未来 agentType 分支能力），未内联 `navigateTo` 的 fail 回调；深链目前只 `/open/agent`（ChatBot），失败概率低，暂不加。

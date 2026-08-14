@@ -672,6 +672,13 @@ export default class AgentDetailService {
    * 为 true 时不把本地 taskStatus 误标 COMPLETE/FAILED。
    */
   private pendingBackgroundReconnect: boolean = false;
+  /**
+   * 最近一轮 live 流启动时刻（handleConversation 开新流时刷新）。
+   * 远端终态强制收尾的宽限期依据：新流启动后 REMOTE_TERMINAL_GRACE_MS 内
+   * 轮询报来的终态大概率是上一轮任务被打断后的陈旧回包，不能据此掐断新流。
+   */
+  private liveStreamStartedAt: number = 0;
+  private readonly REMOTE_TERMINAL_GRACE_MS: number = 15000;
 
   constructor(data: AgentDetailData) {
     this.data = data;
@@ -2216,6 +2223,9 @@ export default class AgentDetailService {
       this.streamGeneration = this.streamGeneration + 1;
       this.pendingBackgroundReconnect = false;
       this.endStreamListDraft();
+      // 记录本轮流启动时刻：轮询远端终态强制收尾的宽限期依据
+      // （防止上一轮任务被打断后的陈旧终态误杀本轮新流）
+      this.liveStreamStartedAt = Date.now();
       const streamGen = this.streamGeneration;
       // #ifdef APP
       try {
@@ -3340,8 +3350,30 @@ export default class AgentDetailService {
   /**
    * 轮询发现会话已被其它设备结束时，收口本地流与消息状态。
    * 与本机点击停止一样，远端终态到达后本地 SSE 不会再可靠地补齐 UI 终态。
+   *
+   * 高频连续发送保护：轮询的终态响应可能来自上一轮任务——新 send abort 旧 SSE 后，
+   * 服务端旧任务被打断成终态，而轮询 GET 可能早于新任务注册发出。
+   * live 流刚启动（REMOTE_TERMINAL_GRACE_MS 内）时收到终态一律视为陈旧回包，
+   * 不强制收尾、不掐断新流（返回 false），避免刚发出的消息被意外取消。
+   *
+   * @returns 是否执行了强制收尾（false = 判定为陈旧终态，已忽略）
    */
-  handleRemoteConversationTerminal(): void {
+  handleRemoteConversationTerminal(): boolean {
+    if (chatService.isCurrentlyStreaming) {
+      const startedAt = this.liveStreamStartedAt;
+      if (startedAt > 0) {
+        const streamAge = Date.now() - startedAt;
+        if (streamAge < this.REMOTE_TERMINAL_GRACE_MS) {
+          console.warn(
+            "[RemoteTerminal] skip stale terminal force-close, streamAge=" +
+              `${streamAge}` +
+              "ms < grace=" +
+              `${this.REMOTE_TERMINAL_GRACE_MS}`,
+          );
+          return false;
+        }
+      }
+    }
     this.pendingBackgroundReconnect = false;
     this.streamGeneration = this.streamGeneration + 1;
     this.endStreamListDraft();
@@ -3350,6 +3382,7 @@ export default class AgentDetailService {
     this.finalizeTerminalAssistantMessage();
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
+    return true;
   }
 
   /**

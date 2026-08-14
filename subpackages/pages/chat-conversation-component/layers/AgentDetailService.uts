@@ -188,6 +188,23 @@ function readMessageThink(msg: MessageInfo | null): string {
   return raw != null ? `${raw}` : "";
 }
 
+/** 助手消息是否还有未收口的工具调用。 */
+function hasExecutingToolCall(message: MessageInfo | null): boolean {
+  if (message == null || message.processingList == null) {
+    return false;
+  }
+  const list = message.processingList as any[];
+  for (let i = 0; i < list.length; i++) {
+    const normalized = normalizeToolCallProcessingData(list[i]);
+    const statusRaw = readRawField(normalized, "status");
+    const status = statusRaw != null ? `${statusRaw}` : "";
+    if (status == `${ProcessingEnum.EXECUTING}`) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function waitForOpenUiHydrate(delayMs: number): Promise<void> {
   return new Promise<void>((resolve) => {
     setTimeout(() => resolve(), delayMs);
@@ -2918,7 +2935,7 @@ export default class AgentDetailService {
     };
 
     let isCleanedUp = false;
-    const cleanupSub = (): void => {
+    const cleanupSub = (finalizeMessage: boolean = false): void => {
       if (isCleanedUp) {
         return;
       }
@@ -2929,6 +2946,9 @@ export default class AgentDetailService {
         this.subStreamRequest = null;
       }
       this.isSubscribed = false;
+      if (finalizeMessage == true) {
+        this.finalizeTerminalAssistantMessage();
+      }
       // 与 live SSE 完成对齐：先冲刷 TTS 终态，再关会话态（否则播报图标卡住）
       this.sealStreamingAssistantBeforeClear();
       this.data.isConversationActive.value = false;
@@ -2993,7 +3013,7 @@ export default class AgentDetailService {
           this.isSubscribed = false;
           return;
         }
-        cleanupSub();
+        cleanupSub(true);
         return;
       }
       const rawMessageList = dataObj["messageList"];
@@ -3145,7 +3165,7 @@ export default class AgentDetailService {
         const eventTypeStr =
           eventTypeRaw != null ? `${eventTypeRaw}` : "";
         if (eventTypeStr == `${ConversationEventTypeEnum.ERROR}`) {
-          cleanupSub();
+          cleanupSub(true);
         }
       } catch (e) {
       }
@@ -3154,7 +3174,7 @@ export default class AgentDetailService {
       // sub SSE 正常结束：立刻关掉 Loading（不等 ChatFinished / 详情回拉）
       this.pendingBackgroundReconnect = false;
       this.markConversationTaskCompleteIfExecuting();
-      cleanupSub();
+      cleanupSub(true);
     };
     requestConfig.onError = (error: any) => {
       if (isAppInBackground() == true) {
@@ -3163,7 +3183,7 @@ export default class AgentDetailService {
       }
       this.pendingBackgroundReconnect = false;
       this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
-      cleanupSub();
+      cleanupSub(true);
     };
     requestConfig.onTimeout = () => {
       if (isAppInBackground() == true) {
@@ -3172,7 +3192,7 @@ export default class AgentDetailService {
       }
       this.pendingBackgroundReconnect = false;
       this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
-      cleanupSub();
+      cleanupSub(true);
     };
 
     try {
@@ -3181,7 +3201,7 @@ export default class AgentDetailService {
       if (isAppInBackground() == true && isCleanedUp != true) {
         softCleanupSubWhileBackground();
       } else {
-        cleanupSub();
+        cleanupSub(true);
       }
     }
   }
@@ -3203,6 +3223,121 @@ export default class AgentDetailService {
   }
 
   /**
+   * 会话停止 / 结束时立即收口当前助手消息。
+   *
+   * stop 会先断开 SSE，因此不能再等服务端的 FINAL_RESULT / 工具终态事件来刷 UI：
+   * - 消息 Loading 需转为 Complete，否则 ai-msg 会因 state=1 继续显示底部 loading；
+   * - 工具 EXECUTING 需转为 FAILED，否则工具卡会一直显示旋转 loading。
+   *
+   * 仅修改本轮最后一条进行中的助手消息，避免污染历史消息。
+   */
+  private finalizeTerminalAssistantMessage(): void {
+    const messageList = this.data.messageList.value;
+    if (messageList == null || messageList.length == 0) {
+      return;
+    }
+
+    let targetIndex = -1;
+    const streamMessageId = this.data.streamingAssistantMessageId.value;
+    const fallbackMessageId = this.data.messageIdRef.value;
+    if (streamMessageId.length > 0 || fallbackMessageId.length > 0) {
+      const primaryMessageId = streamMessageId.length > 0
+        ? streamMessageId
+        : fallbackMessageId;
+      targetIndex = findMessageIndexById(
+        messageList,
+        primaryMessageId,
+        fallbackMessageId,
+      );
+    }
+
+    // id 可能在 SSE 中途被服务端改写；找不到时回退到最后一条进行中助手消息。
+    if (
+      targetIndex < 0 ||
+      isAssistantMessageInfo(messageList[targetIndex]) != true ||
+      (
+        messageList[targetIndex].status != MessageStatusEnum.Loading &&
+        messageList[targetIndex].status != MessageStatusEnum.Incomplete &&
+        hasExecutingToolCall(messageList[targetIndex]) != true
+      )
+    ) {
+      targetIndex = -1;
+      for (let i = messageList.length - 1; i >= 0; i--) {
+        const item = messageList[i];
+        if (
+          isAssistantMessageInfo(item) == true &&
+          (
+            item.status == MessageStatusEnum.Loading ||
+            item.status == MessageStatusEnum.Incomplete ||
+            hasExecutingToolCall(item) == true
+          )
+        ) {
+          targetIndex = i;
+          break;
+        }
+      }
+    }
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const target = messageList[targetIndex];
+    const draft = cloneMessageInfoDraft(target);
+    if (
+      target.status == MessageStatusEnum.Loading ||
+      target.status == MessageStatusEnum.Incomplete
+    ) {
+      draft["status"] = MessageStatusEnum.Complete;
+    }
+
+    const sourceProcessingList = target.processingList != null
+      ? target.processingList as any[]
+      : [] as any[];
+    if (sourceProcessingList.length > 0) {
+      const stoppedProcessingList: ProcessingInfo[] = [];
+      for (let i = 0; i < sourceProcessingList.length; i++) {
+        const processing = sourceProcessingList[i];
+        const normalized = normalizeToolCallProcessingData(processing);
+        const statusRaw = readRawField(normalized, "status");
+        const status = statusRaw != null ? `${statusRaw}` : "";
+        if (status == `${ProcessingEnum.EXECUTING}`) {
+          normalized["status"] = ProcessingEnum.FAILED;
+          stoppedProcessingList.push(normalized as ProcessingInfo);
+        } else {
+          stoppedProcessingList.push(processing as ProcessingInfo);
+        }
+      }
+      draft["processingList"] = stoppedProcessingList;
+    }
+
+    const stoppedMessage = buildMessageInfoFromDraft(draft);
+    if (stoppedMessage == null) {
+      return;
+    }
+    const updatedMessages: MessageInfo[] = [];
+    for (let i = 0; i < messageList.length; i++) {
+      updatedMessages.push(i == targetIndex ? stoppedMessage : messageList[i]);
+    }
+    // 替换数组和消息引用，确保 H5/App web-view 的 status watcher 与工具指纹立即刷新。
+    this.data.messageList.value = updatedMessages;
+  }
+
+  /**
+   * 轮询发现会话已被其它设备结束时，收口本地流与消息状态。
+   * 与本机点击停止一样，远端终态到达后本地 SSE 不会再可靠地补齐 UI 终态。
+   */
+  handleRemoteConversationTerminal(): void {
+    this.pendingBackgroundReconnect = false;
+    this.streamGeneration = this.streamGeneration + 1;
+    this.endStreamListDraft();
+    chatService.abort();
+    this.abortSubConversation();
+    this.finalizeTerminalAssistantMessage();
+    this.data.isConversationActive.value = false;
+    this.clearStreamingAssistantText();
+  }
+
+  /**
    * 停止会话
    * @param isTempChat 是否是临时会话
    */
@@ -3213,14 +3348,20 @@ export default class AgentDetailService {
     // 用户主动停止：取消后台续接
     this.pendingBackgroundReconnect = false;
 
+    const wasConversationActive = this.data.isConversationActive.value;
+
     // 无论 UI 是否已标为结束，都先中止本地 SSE / sub，避免 chunk 回调继续跑
     this.streamGeneration = this.streamGeneration + 1;
     this.endStreamListDraft();
     chatService.abort();
     this.abortSubConversation();
 
+    // 断流后不会再收到消息/工具终态，必须在本地同步收口。
+    // 即使 active 已被其他回调提前清掉，也要先清理可能残留的 Loading/EXECUTING。
+    this.finalizeTerminalAssistantMessage();
+
     // 如果会话已经不活跃，说明会话已经结束，无需调用 stop 接口
-    if (!this.data.isConversationActive.value) {
+    if (!wasConversationActive) {
       this.clearStreamingAssistantText();
       this.data.isStoppingConversation.value = false;
       return;
@@ -3270,56 +3411,6 @@ export default class AgentDetailService {
     } catch (error) {
       this.data.isStoppingConversation.value = false;
     }
-  }
-
-  /**
-   * 将正在执行的工具调用状态更新为失败
-   * 用于超时或异常中断时的状态更新
-   */
-  updateProcessingListToFailed(): void {
-
-    const messageList = this.data.messageList.value;
-    if (messageList == null || messageList.length == 0) {
-      return;
-    }
-
-    // 查找正在处理中的消息（状态为 Loading 或 Incomplete）
-    const updatedMessages = messageList.map((message: MessageInfo): MessageInfo => {
-      // 只处理正在进行中的助手消息
-      if (
-        (message.status == MessageStatusEnum.Loading ||
-          message.status == MessageStatusEnum.Incomplete) &&
-        message.processingList != null &&
-        message.processingList.length > 0
-      ) {
-
-        // 更新 processingList 中的状态
-        const procList = message.processingList as ProcessingInfo[];
-        const updatedProcessingList = procList.map(
-          (processing: ProcessingInfo): ProcessingInfo => {
-            // 将所有 EXECUTING 状态的工具调用改为 FAILED（兼容 status 在 result 内）
-            const pObj = normalizeToolCallProcessingData(processing);
-            const statusRaw = readRawField(pObj, "status");
-            const statusStr = statusRaw != null ? `${statusRaw}` : "";
-            if (statusStr == `${ProcessingEnum.EXECUTING}`) {
-              pObj["status"] = ProcessingEnum.FAILED;
-              return pObj as ProcessingInfo;
-            }
-            return processing;
-          },
-        );
-
-        // 返回更新后的消息
-        const mObj = JSON.parse(JSON.stringify(message)) as UTSJSONObject;
-        mObj["processingList"] = updatedProcessingList;
-        return mObj as MessageInfo;
-      }
-
-      return message;
-    });
-
-    // 更新消息列表
-    this.data.messageList.value = updatedMessages;
   }
 
   /**

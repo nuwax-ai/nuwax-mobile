@@ -749,45 +749,53 @@
   const isAppWebView = ref<boolean>(false);
   // #ifdef H5 || WEB
   /**
-   * 文档滚动锁（幂等布尔）：聊天页为整页 App 式布局——导航栏/输入框固定、
-   * 仅中间消息区滚动，html/body 不应成为滚动容器。否则内容不足一屏时
-   * 触摸手势落到文档层，导航栏与输入框会整体位移，页面显得不稳定。
-   * 仅在 App web-view 内嵌（isAppWebView）时加锁：浏览器 H5 的输入框
-   * 依赖浏览器自动滚动文档来露出焦点，锁死会破坏键盘体验。
+   * 文档滚动锁（class + !important）：聊天页为整页 App 式布局——导航栏/输入框固定、
+   * 仅中间消息区滚动，html/body 不应成为滚动容器。否则内容不足一屏时触摸手势
+   * 落到文档层，导航栏与输入框会整体位移，页面显得不稳定。
+   * 仅 App web-view 内嵌（isAppWebView）时加锁：浏览器 H5 的输入框依赖浏览器
+   * 自动滚动文档露出焦点，锁死会破坏键盘体验。
+   * 用 class 而非行内样式：防止运行时/其他脚本重写 html/body 行内样式时锁被冲掉；
+   * CSS 规则在 global.scss（html/body.nuwax-doc-locked { overflow: hidden !important }）。
    */
-  let h5DocScrollLocked: boolean = false;
-  const lockH5DocumentScroll = (): void => {
-    if (h5DocScrollLocked == true) {
-      return;
-    }
-    h5DocScrollLocked = true;
+  const DOC_LOCK_CLASS: string = "nuwax-doc-locked";
+  /** 页面自身是否处于可见态（onShow/onHide 驱动），看门狗只在可见且内嵌时重挂锁 */
+  let h5PageActive: boolean = false;
+  let h5DocLockWatchdog: number = 0;
+  const assertH5DocLock = (): void => {
     try {
       const doc = document.documentElement;
       if (doc != null) {
-        doc.style.setProperty("overflow", "hidden");
+        doc.classList.add(DOC_LOCK_CLASS);
       }
-      if (document.body != null) {
-        document.body.style.setProperty("overflow", "hidden");
-      }
-    } catch (_eLock) {
+    } catch (_eAssert) {
       // ignore
     }
   };
-  const unlockH5DocumentScroll = (): void => {
-    if (h5DocScrollLocked != true) {
-      return;
-    }
-    h5DocScrollLocked = false;
+  const releaseH5DocLock = (): void => {
     try {
       const doc = document.documentElement;
       if (doc != null) {
-        doc.style.setProperty("overflow", "");
+        doc.classList.remove(DOC_LOCK_CLASS);
       }
-      if (document.body != null) {
-        document.body.style.setProperty("overflow", "");
-      }
-    } catch (_eUnlock) {
+    } catch (_eRelease) {
       // ignore
+    }
+  };
+  /** 看门狗：内嵌且页面可见时每 2s 重挂一次锁，防任何原因导致锁被摘掉后无法恢复 */
+  const startH5DocLockWatchdog = (): void => {
+    if (h5DocLockWatchdog != 0) {
+      return;
+    }
+    h5DocLockWatchdog = setInterval((): void => {
+      if (h5PageActive == true && isAppWebView.value == true) {
+        assertH5DocLock();
+      }
+    }, 2000) as number;
+  };
+  const stopH5DocLockWatchdog = (): void => {
+    if (h5DocLockWatchdog != 0) {
+      clearInterval(h5DocLockWatchdog);
+      h5DocLockWatchdog = 0;
     }
   };
 
@@ -801,8 +809,11 @@
     }
     isAppWebView.value = true;
     nativeVoiceBridge.setup();
-    // 内嵌确认即锁死文档滚动（见 lockH5DocumentScroll 注释）；浏览器 H5 永不触发
-    lockH5DocumentScroll();
+    // 内嵌确认即锁死文档滚动（见 assertH5DocLock 注释）；浏览器 H5 永不触发。
+    // 锁是粘性的：只在页面销毁（onUnload/onUnmounted）时释放，onHide 不释放——
+    // 否则 Android 键盘/原生层切换触发 hide 序列后可能不再恢复，出现「刚开始好、突然失效」。
+    assertH5DocLock();
+    startH5DocLockWatchdog();
   }
 
   /**
@@ -3203,10 +3214,11 @@
     // #endif
 
     // #ifdef H5
-    // 重新可见时恢复文档锁（onHide 已解锁）。首次 onShow 时内嵌检测可能尚未完成，
-    // markAppEmbedded 确认后也会补锁，二者幂等。
+    // 页面可见：置活跃标记 + 断言文档锁（幂等）。首次 onShow 时内嵌检测可能尚未完成，
+    // markAppEmbedded 确认后也会补锁并启动看门狗。
+    h5PageActive = true;
     if (isAppWebView.value == true) {
-      lockH5DocumentScroll();
+      assertH5DocLock();
     }
     // #endif
 
@@ -3217,8 +3229,9 @@
 
   onHide((): void => {
     // #ifdef H5
-    // 离开聊天页（跳转其他 H5 页面等）先解锁文档，避免锁住被覆盖页面的滚动
-    unlockH5DocumentScroll();
+    // 页面不可见：仅置非活跃（看门狗停止重挂），不释放锁——
+    // 锁为粘性，只在页面销毁时释放，避免 Android hide/show 序列后锁丢失
+    h5PageActive = false;
     // #endif
     // #ifndef H5 || WEB
     invokeTriggerHide();
@@ -3849,9 +3862,9 @@
     // #endif
     // #ifdef H5
     // App 内嵌时锁死文档滚动（幂等）：滚动只允许发生在中间消息区 scroll-view 内，
-    // 导航栏/输入框固定不动（见 lockH5DocumentScroll 注释；浏览器 H5 不加锁）
+    // 导航栏/输入框固定不动（见 assertH5DocLock 注释；浏览器 H5 不加锁）
     if (isAppWebView.value == true) {
-      lockH5DocumentScroll();
+      assertH5DocLock();
     }
     // #endif
     runOnMountedAsync();
@@ -3875,7 +3888,10 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
-    unlockH5DocumentScroll();
+    // 页面销毁：释放文档锁并停止看门狗
+    h5PageActive = false;
+    releaseH5DocLock();
+    stopH5DocLockWatchdog();
     // #endif
 
     // #ifdef APP
@@ -3914,7 +3930,10 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
-    unlockH5DocumentScroll();
+    // 页面销毁：释放文档锁并停止看门狗
+    h5PageActive = false;
+    releaseH5DocLock();
+    stopH5DocLockWatchdog();
     // #endif
 
     // #ifdef APP

@@ -41,6 +41,14 @@ let currentPollingInterval = POLLING_INTERVAL;
 let waitingUserFastPollCount = 0;
 
 let currentConversationId = 0;
+/** 最近一次触发 onExecuting 续接的时刻：sub 关闭后重启轮询据此进入冷却 */
+let lastOnExecutingTime = 0;
+/**
+ * 续接重启冷却：sub 刚失败/关闭（onSubClose）会立即走到 startConversationPolling，
+ * 而该函数会同步 pollOnce → 立即续接 → 立即失败 → 再重启，形成无间隔自激循环。
+ * 冷却期内跳过「立即 pollOnce」，让循环退回到 interval 间隔（常态 5s）。
+ */
+const RESTART_COOLDOWN_MS = 3000;
 let onExecutingCallback: ((id: number) => void) | null = null;
 let isConversationActiveGetter: (() => boolean) | null = null;
 let isSubscribedGetter: (() => boolean) | null = null;
@@ -160,6 +168,9 @@ async function pollOnce(): Promise<void> {
       }
       resetWaitingUserFastPoll();
       ensurePollingInterval(POLLING_INTERVAL);
+      // 记录续接触发时刻：sub 关闭后 startConversationPolling / resume 据此进入冷却，
+      // 避免「续接失败 → 立即 pollOnce → 立即续接」的无间隔自激循环。
+      lastOnExecutingTime = Date.now();
       const cb = onExecutingCallback;
       if (cb != null) {
         cb(currentConversationId);
@@ -228,7 +239,12 @@ export function startConversationPolling(
 
   if (pollingTimerId !== null) return;
 
-  pollOnce();
+  // 冷却：sub 刚失败（onSubClose → 立即重启）时跳过立即 pollOnce，
+  // 让重试退回到 interval 间隔，避免自激紧密循环（pollOnce → 续接 → 失败 → 重启）。
+  const sinceLastExecuting = Date.now() - lastOnExecutingTime;
+  if (sinceLastExecuting >= RESTART_COOLDOWN_MS) {
+    pollOnce();
+  }
 
   pollingTimerId = setInterval((): void => {
     pollOnce();
@@ -253,7 +269,11 @@ export function stopConversationPolling(): void {
 export function resumeConversationPolling(): void {
   if (!currentConversationId) return;
   if (pollingTimerId !== null) return;
-  pollOnce();
+  // 与 startConversationPolling 同冷却：hide→show 恰逢 sub 刚失败时，避免立即 pollOnce 复燃循环
+  const sinceLastExecuting = Date.now() - lastOnExecutingTime;
+  if (sinceLastExecuting >= RESTART_COOLDOWN_MS) {
+    pollOnce();
+  }
   pollingTimerId = setInterval((): void => {
     pollOnce();
   }, currentPollingInterval) as number;
@@ -272,6 +292,7 @@ export function pauseConversationPolling(): void {
 export function destroyConversationPolling(): void {
   stopConversationPolling();
   currentConversationId = 0;
+  lastOnExecutingTime = 0;
   onExecutingCallback = null;
   isConversationActiveGetter = null;
   isSubscribedGetter = null;

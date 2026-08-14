@@ -306,6 +306,7 @@
         "
         :childs="n.children"
         :processing-list="processingList"
+        :is-current-streaming="isCurrentStreaming"
         :auto-collapse="
           n.attrs &&
           (n.attrs['auto-collapse'] ||
@@ -317,6 +318,7 @@
           :childs="n.children"
           :opts="opts"
           :processing-list="processingList"
+          :is-current-streaming="isCurrentStreaming"
         />
       </markdown-container-group>
       <!-- task-result 任务结果组件 -->
@@ -385,6 +387,7 @@
           :childs="n2.children"
           :opts="opts"
           :processing-list="processingList"
+          :is-current-streaming="isCurrentStreaming"
           :copy-text="n2._copyText"
         />
       </view>
@@ -397,6 +400,7 @@
         :childs="n.children"
         :opts="opts"
         :processing-list="processingList"
+        :is-current-streaming="isCurrentStreaming"
         :copy-text="n._copyText"
       />
     </block>
@@ -469,6 +473,7 @@
     props: {
       name: String,
       processingList: Array,
+      isCurrentStreaming: Boolean,
       attrs: {
         type: Object,
         default () {

@@ -338,29 +338,47 @@
 	let nativeRecordingStopArrived: boolean = false
 	/** 录音是否正在进行（onStart 后为 true） */
 	let nativeRecordingActive: boolean = false
+	/** 录音启动是否在途（权限确认 / recorder.start 未完成）：stop 早到时由启动路径统一回传取消 */
+	let nativeRecordingStartPending: boolean = false
+	/** 孤儿录音（H5 已复位但原生未收到 stop）的 stop 回调抑制：防止打扰新会话 */
+	let nativeSuppressNextStop: boolean = false
+	/** 录音启动超时看门狗：start 后 onStart 未到则回传错误并重建 recorder，避免缓存实例坏掉后反复失败 */
+	let nativeRecordStartTimer: number = 0
+	const NATIVE_RECORD_START_TIMEOUT_MS: number = 3000
 
-	/** 申请麦克风权限（Android 用 UTSAndroid；iOS 检查授权状态） */
-	async function ensureNativeMicPermission(): Promise<boolean> {
+	/** 麦克风权限检查结果：granted 已授权；deniedForever 已永久拒绝（勾选「不再询问」/ 连续拒绝，系统不再弹授权窗） */
+	class NativeMicPermissionResult {
+		granted: boolean
+		deniedForever: boolean
+		constructor(granted: boolean, deniedForever: boolean) {
+			this.granted = granted
+			this.deniedForever = deniedForever
+		}
+	}
+
+	/** 申请麦克风权限（Android 用 UTSAndroid；iOS 检查授权状态）
+	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
+	async function ensureNativeMicPermission(): Promise<NativeMicPermissionResult> {
 		// #ifdef APP-ANDROID
-		return await new Promise<boolean>((resolve) => {
+		return await new Promise<NativeMicPermissionResult>((resolve) => {
 			const activity = UTSAndroid.getUniActivity()
 			if (activity == null) {
-				resolve(false)
+				resolve(new NativeMicPermissionResult(false, false))
 				return
 			}
 			const permission = ["android.permission.RECORD_AUDIO"] as string[]
 			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
-				resolve(true)
+				resolve(new NativeMicPermissionResult(true, false))
 				return
 			}
 			UTSAndroid.requestSystemPermission(
 				activity,
 				permission,
 				(allGranted: boolean, _granted: string[]) => {
-					resolve(allGranted)
+					resolve(new NativeMicPermissionResult(allGranted, false))
 				},
-				(_doNotAskAgain: boolean, _denied: string[]) => {
-					resolve(false)
+				(doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(new NativeMicPermissionResult(false, doNotAskAgain))
 				},
 			)
 		})
@@ -368,23 +386,61 @@
 		// #ifdef APP-IOS
 		const authSetting = uni.getAppAuthorizeSetting()
 		if (authSetting.microphoneAuthorized == "authorized") {
-			return true
+			return new NativeMicPermissionResult(true, false)
 		}
 		if (authSetting.microphoneAuthorized == "denied") {
-			return false
+			// iOS 拒绝后同样无法再弹授权窗，须去系统设置开启
+			return new NativeMicPermissionResult(false, true)
 		}
 		// not determined：start 时系统才弹窗，先放行
-		return true
+		return new NativeMicPermissionResult(true, false)
 		// #endif
 	}
 
+	/** 永久拒绝麦克风权限：弹窗引导去系统设置开启（Android 跳应用权限页；iOS 跳系统设置） */
+	function guideNativeMicPermissionSettings(): void {
+		uni.showModal({
+			title: "需要麦克风权限",
+			content: "录音功能需要访问你的麦克风，请在系统设置中开启录音权限",
+			confirmText: "去设置",
+			cancelText: "取消",
+			success: (res) => {
+				if (res.confirm == true) {
+					// #ifdef APP-ANDROID
+					const activity = UTSAndroid.getUniActivity()
+					if (activity != null) {
+						UTSAndroid.gotoSystemPermissionActivity(
+							activity,
+							["android.permission.RECORD_AUDIO"] as string[],
+						)
+					}
+					// #endif
+					// #ifdef APP-IOS
+					uni.openAppAuthorizeSetting({})
+					// #endif
+				}
+			},
+		})
+	}
+
+	function clearNativeRecordStartWatchdog(): void {
+		if (nativeRecordStartTimer != 0) {
+			clearTimeout(nativeRecordStartTimer)
+			nativeRecordStartTimer = 0
+		}
+	}
+
 	function handleNativeRecordStart(_res: any | null): void {
+		clearNativeRecordStartWatchdog()
 		nativeRecordingActive = true
+		nativeRecordingStartPending = false
 		evalBridgeJS(`window.__onNativeRecordStart && window.__onNativeRecordStart()`)
 	}
 
 	function handleNativeRecorderError(err: any | null): void {
+		clearNativeRecordStartWatchdog()
 		nativeRecordingActive = false
+		nativeRecordingStartPending = false
 		const message = readRecorderErrorMessage(err)
 		evalBridgeJS(
 			`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": message } as UTSJSONObject)})`,
@@ -426,6 +482,11 @@
 
 	function handleNativeRecorderStop(res: any | null): void {
 		nativeRecordingActive = false
+		// 孤儿录音（新会话启动前被强制停掉的旧录音）的 stop 回调：丢弃，不打扰新会话
+		if (nativeSuppressNextStop == true) {
+			nativeSuppressNextStop = false
+			return
+		}
 		const tempFilePath = readRecorderStopString(res, "tempFilePath")
 		if (tempFilePath.length == 0) {
 			evalBridgeJS(
@@ -453,18 +514,66 @@
 		return nativeRecorderManager!
 	}
 
+	/**
+	 * 启动超时看门狗：recorder.start() 后 onStart 未到（Android 偶发）时，
+	 * 强制停掉并重建 recorder（缓存实例可能已不可用），回传错误让 H5 复位。
+	 * 否则 H5 一直等不到回调，且后续 start 会因实例坏掉而反复失败。
+	 */
+	function armNativeRecordStartWatchdog(): void {
+		clearNativeRecordStartWatchdog()
+		nativeRecordStartTimer = setTimeout((): void => {
+			nativeRecordStartTimer = 0
+			if (nativeRecordingActive == true) {
+				return
+			}
+			nativeRecordingStartPending = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_e) {
+				// ignore
+			}
+			nativeRecorderManager = null
+			evalBridgeJS(
+				`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "录音启动失败" } as UTSJSONObject)})`,
+			)
+		}, NATIVE_RECORD_START_TIMEOUT_MS) as number
+	}
+
 	function nativeStartRecord(): void {
+		// 上一轮录音未正常结束（H5 侧已复位但原生仍在录）：先停掉孤儿录音，
+		// 否则缓存 recorder 处于已启动状态，后续 start 会失败/不触发 onStart
+		if (nativeRecordingActive == true) {
+			nativeSuppressNextStop = true
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_eOrphan) {
+				// ignore
+			}
+		}
 		nativeRecordingStopArrived = false
+		nativeRecordingStartPending = true
 		ensureNativeRecorder()
-		ensureNativeMicPermission().then((ok: boolean) => {
-			if (ok != true) {
+		ensureNativeMicPermission().then((result: NativeMicPermissionResult) => {
+			if (result.granted != true) {
+				nativeRecordingStartPending = false
 				evalBridgeJS(
 					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "需要麦克风权限" } as UTSJSONObject)})`,
 				)
+				// 永久拒绝（勾选「不再询问」/ 连续拒绝）：系统不会再弹授权窗，
+				// 引导去系统设置开启，否则用户无法再录音
+				if (result.deniedForever == true) {
+					guideNativeMicPermissionSettings()
+				}
 				return
 			}
-			// 授权期间已收到 stop（轻触/松手）：禁止再 start
+			// 授权期间已收到 stop（轻触/松手）：禁止再 start，且回传「已取消」，
+			// 否则 H5 收不到任何回调会卡死在 uploading，后续录音无法开始
 			if (nativeRecordingStopArrived == true) {
+				nativeRecordingStartPending = false
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "已取消" } as UTSJSONObject)})`,
+				)
 				return
 			}
 			// 开录前停掉正在播的 TTS，避免抢录音音频焦点（录到弱音 → 转写空）
@@ -492,7 +601,13 @@
 				} as RecorderManagerStartOptions
 				// #endif
 				recorder.start(options)
+				// onStart 未到则看门狗兜底（回传错误 + 重建 recorder）
+				armNativeRecordStartWatchdog()
 			} catch (e) {
+				nativeRecordingStartPending = false
+				clearNativeRecordStartWatchdog()
+				// start 抛异常：重建 recorder，避免缓存实例坏掉后反复失败
+				nativeRecorderManager = null
 				evalBridgeJS(
 					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "录音启动失败" } as UTSJSONObject)})`,
 				)
@@ -502,14 +617,22 @@
 
 	function nativeStopRecord(): void {
 		nativeRecordingStopArrived = true
-		if (nativeRecordingActive != true) {
+		clearNativeRecordStartWatchdog()
+		if (nativeRecordingActive == true) {
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_e) {
+				// ignore
+			}
 			return
 		}
-		nativeRecordingActive = false
-		try {
-			ensureNativeRecorder().stop()
-		} catch (_e) {
-			// ignore
+		// 录音未开始：启动仍在途（权限/start 未完成）时由 nativeStartRecord 权限回调统一回传
+		// 「已取消」，避免双发；启动已不在途则这里补发一次，保证 H5 一定能收到回调复位
+		if (nativeRecordingStartPending != true) {
+			evalBridgeJS(
+				`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": "已取消" } as UTSJSONObject)})`,
+			)
 		}
 	}
 

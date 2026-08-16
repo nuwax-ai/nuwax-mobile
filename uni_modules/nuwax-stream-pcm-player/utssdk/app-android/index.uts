@@ -1,0 +1,222 @@
+/**
+ * Nuwax Stream PCM Player（App-Android）
+ *
+ * 基于 Android AudioTrack（MODE_STREAM）的流式 PCM16 播放器：
+ * TTS 服务端推来的 PCM 帧直接 write 进 AudioTrack，边推边播，
+ * 无 WAV 文件、无段边界 → 消除 InnerAudioContext 分段播放的换源卡顿。
+ *
+ * 用法：
+ *   const player = new StreamPcmPlayer();
+ *   player.init(16000);            // 16kHz mono PCM16
+ *   player.push(frame);            // 每帧 Uint8Array（PCM16 LE）
+ *   player.ensurePlaying();        // 攒够起始缓冲后 play()
+ *   player.flushPending();         // 周期性冲刷（非阻塞写满时的积压）
+ *   player.isDrained();            // 已写入的 PCM 是否全部播完
+ *   player.release();              // 结束释放
+ */
+import AudioTrack from 'android.media.AudioTrack'
+import ByteBuffer from 'java.nio.ByteBuffer'
+
+/** 开始播放前的最小缓冲（音频 ms）：略攒一点再播，减少开局 underrun */
+const START_PLAY_MS = 150
+
+// Android AudioTrack 常量（Java 静态字段在 UTS 互操作中不可直接引用，用稳定字面量）
+const AUDIO_STREAM_MUSIC = 3
+const AUDIO_CHANNEL_OUT_MONO = 4
+const AUDIO_ENCODING_PCM_16BIT = 2
+const AUDIO_MODE_STREAM = 1
+const AUDIO_WRITE_NON_BLOCKING = 0
+/** 数字 0（UTS 中 0.toInt() 会被解析成小数，须用具名常量） */
+const INT_ZERO = 0
+
+export class StreamPcmPlayer {
+  private track: AudioTrack | null = null
+  private sampleRate: number = 16000
+  /** 已成功写入 AudioTrack 的总字节数 */
+  private totalWrittenBytes: number = 0
+  /** 是否已开始播放（play() 已调） */
+  private started: boolean = false
+  /** 非阻塞写满时积压的帧（AudioTrack 内部缓冲消化后再冲刷） */
+  private pendingChunks: Uint8Array[] = []
+
+  /**
+   * 创建并配置 AudioTrack（MODE_STREAM，16bit mono）。
+   * 缓冲取 getMinBufferSize 与「1s 容量」的较大者，吸收服务端突发与主线程抖动。
+   */
+  init(sampleRate: number): void {
+    this.release()
+    this.sampleRate = sampleRate > 0 ? sampleRate : 16000
+    let minBuf = 0
+    try {
+      minBuf = AudioTrack.getMinBufferSize(
+        this.sampleRate.toInt(),
+        AUDIO_CHANNEL_OUT_MONO.toInt(),
+        AUDIO_ENCODING_PCM_16BIT.toInt(),
+      )
+    } catch (_eMin) {
+      minBuf = 0
+    }
+    // 1s 容量：sampleRate * 2 字节；叠加 minBuf 保证系统下限
+    let bufSize = this.sampleRate * 2
+    if (bufSize < minBuf) {
+      bufSize = minBuf
+    }
+    try {
+      this.track = new AudioTrack(
+        AUDIO_STREAM_MUSIC.toInt(),
+        this.sampleRate.toInt(),
+        AUDIO_CHANNEL_OUT_MONO.toInt(),
+        AUDIO_ENCODING_PCM_16BIT.toInt(),
+        bufSize.toInt(),
+        AUDIO_MODE_STREAM.toInt(),
+      )
+    } catch (eInit: any) {
+      console.error('[StreamPcmPlayer] init failed', eInit)
+      this.track = null
+    }
+    this.totalWrittenBytes = 0
+    this.started = false
+    this.pendingChunks = [] as Uint8Array[]
+  }
+
+  /** 推入一帧 PCM16 LE 字节；非阻塞写入，写不进的进积压队列 */
+  push(chunk: Uint8Array): void {
+    if (this.track == null || chunk == null || chunk.length == 0) {
+      return
+    }
+    this.pendingChunks.push(chunk)
+    this.flushPending()
+  }
+
+  /** 冲刷积压：非阻塞写入，写满即停（下次 push / 轮询再刷） */
+  flushPending(): void {
+    const track = this.track
+    if (track == null) {
+      return
+    }
+    while (this.pendingChunks.length > 0) {
+      const chunk = this.pendingChunks[0]
+      let written = 0
+      try {
+        // 只读 ByteBuffer 直接给 AudioTrack.write 会 ReadOnlyBufferException；
+        // 且逐字节 put(chunk[i].toByte()) 每帧 640 次 UTS→Java 调用（50 帧/s = 3.2 万次/s）会卡死主线程。
+        // 改为：可写 ByteBuffer.allocate + put(src) 整块 memcpy（一次调用）。
+        const src = chunk.buffer != null ? chunk.buffer!.toByteBuffer() : null
+        if (src == null) {
+          break
+        }
+        const len = chunk.byteLength.toInt()
+        const bb = ByteBuffer.allocate(len)
+        bb.put(src)
+        bb.rewind()
+        written = track.write(
+          bb,
+          len,
+          AUDIO_WRITE_NON_BLOCKING.toInt(),
+        )
+      } catch (eWrite: any) {
+        console.warn('[StreamPcmPlayer] write failed', eWrite)
+        break
+      }
+      if (written <= 0) {
+        break
+      }
+      this.totalWrittenBytes += written
+      this.pendingChunks.shift()
+    }
+  }
+
+  /** 攒够起始缓冲后开始播放（幂等） */
+  ensurePlaying(): void {
+    const track = this.track
+    if (track == null || this.started == true) {
+      return
+    }
+    if (this.getWrittenMs() < START_PLAY_MS) {
+      return
+    }
+    this.playNow()
+  }
+
+  /** 立即开始播放（幂等；输入结束时强制用，避免短音频因起始缓冲未达而不出声） */
+  playNow(): void {
+    const track = this.track
+    if (track == null || this.started == true) {
+      return
+    }
+    this.started = true
+    try {
+      track.play()
+    } catch (ePlay: any) {
+      console.warn('[StreamPcmPlayer] play failed', ePlay)
+      this.started = false
+    }
+  }
+
+  /** 静音开关：音量 0 / 1（AudioTrack 不破坏播放流） */
+  setMuted(muted: boolean): void {
+    const track = this.track
+    if (track == null) {
+      return
+    }
+    try {
+      const vol = muted == true ? 0 : 1
+      track.setVolume(vol.toFloat())
+    } catch (_eVol) {
+      // ignore
+    }
+  }
+
+  /** 已写入的 PCM 时长（ms） */
+  getWrittenMs(): number {
+    return Math.floor((this.totalWrittenBytes * 1000) / (this.sampleRate * 2))
+  }
+
+  /** 已播放的 PCM 时长（ms）——基于播放头位置 */
+  getPlayedMs(): number {
+    const track = this.track
+    if (track == null) {
+      return 0
+    }
+    try {
+      const frames = track.getPlaybackHeadPosition()
+      return Math.floor((frames * 1000) / this.sampleRate)
+    } catch (_ePos) {
+      return 0
+    }
+  }
+
+  /** 写入的音频是否已全部播完（排空判定用；留 50ms 容差） */
+  isDrained(): boolean {
+    return this.getPlayedMs() + 50 >= this.getWrittenMs()
+  }
+
+  /** 是否仍有未排空的音频（会话看门狗重置用） */
+  hasPendingAudio(): boolean {
+    if (this.pendingChunks.length > 0) {
+      return true
+    }
+    return this.getWrittenMs() > this.getPlayedMs() + 50
+  }
+
+  /** 停止并释放 AudioTrack（幂等） */
+  release(): void {
+    const track = this.track
+    this.track = null
+    this.pendingChunks = [] as Uint8Array[]
+    this.totalWrittenBytes = 0
+    this.started = false
+    if (track != null) {
+      try {
+        track.stop()
+      } catch (_eStop) {
+        // ignore
+      }
+      try {
+        track.release()
+      } catch (_eRel) {
+        // ignore
+      }
+    }
+  }
+}

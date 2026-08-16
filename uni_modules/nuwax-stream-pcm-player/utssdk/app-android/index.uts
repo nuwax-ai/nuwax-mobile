@@ -2,15 +2,16 @@
  * Nuwax Stream PCM Player（App-Android）
  *
  * 基于 Android AudioTrack（MODE_STREAM）的流式 PCM16 播放器：
- * TTS 推来的 PCM 帧主线程仅入队，**AudioTrack.write 全部在后台线程执行**，
- * 彻底解放主线程（WS 帧回调只做一次队列 put）。
+ * - 主线程读取 Uint8Array 并转成 ByteArray（Kotlin 数组直接下标存储，快且可靠；
+ *   绝不能跨线程读 Uint8Array——uni-app x typed-array 跨线程读会返回 0/乱码）
+ * - 后台线程只做 `AudioTrack.write(ByteArray, ...)`（阻塞写，线程自己等缓冲腾位）
  *
  * 用法：
  *   const player = new StreamPcmPlayer();
  *   player.init(16000);            // 16kHz mono PCM16
- *   player.push(frame);            // 每帧 Uint8Array（PCM16 LE），主线程快速入队
+ *   player.push(frame);            // 每帧 Uint8Array（PCM16 LE）
  *   player.ensurePlaying();        // 攒够起始缓冲后 play()
- *   player.isDrained();            // 已写入的 PCM 是否全部播完
+ *   player.isDrained();            // 已入队的 PCM 是否全部播完（含队列积压）
  *   player.release();              // 结束释放（唤醒并 join 后台线程）
  */
 import AudioTrack from 'android.media.AudioTrack'
@@ -27,27 +28,41 @@ const AUDIO_STREAM_MUSIC = 3
 const AUDIO_CHANNEL_OUT_MONO = 4
 const AUDIO_ENCODING_PCM_16BIT = 2
 const AUDIO_MODE_STREAM = 1
-/** 后台线程用阻塞写：线程自己等 AudioTrack 缓冲腾出空间，主线程不受影响 */
-const AUDIO_WRITE_BLOCKING = 1
+/** 非阻塞写：写不进就留在重试队列，避免阻塞写把写入线程永久挂死（track 冻结时） */
+const AUDIO_WRITE_NON_BLOCKING = 0
+/** 数字 0（UTS 中 0.toInt() 会被解析成小数，须用具名常量） */
+const INT_ZERO = 0
+
+/** 待写帧：主线程读出的字节数组 + 字节数（纯 Kotlin 数组，跨线程安全） */
+class PcmFrame {
+  nums: number[] = []
+  len: number = 0
+}
 
 export class StreamPcmPlayer {
   private track: AudioTrack | null = null
   private sampleRate: number = 16000
-  /** 后台写入线程（从队列取帧 → 写 AudioTrack） */
+  /** 后台写入线程（取帧 → 阻塞写 AudioTrack） */
   private writerThread: Thread | null = null
   /** 待写 PCM 帧队列（无界，主线程 put 不阻塞） */
   private queue: LinkedBlockingQueue<any> | null = null
+  /** 非阻塞写未写满的重试帧（写入线程先消费它，防止丢帧） */
+  private retryFrame: PcmFrame | null = null
   private running: boolean = false
   /** 后台线程已成功写入的字节数（线程安全计数） */
   private writtenBytes: AtomicLong | null = null
+  /** 主线程已入队的总字节数（含队列积压；排空判定用它，避免队列未清空就提前结束） */
+  private enqueuedBytes: AtomicLong | null = null
   private started: boolean = false
+  /** 诊断：已写入帧数（release 日志用） */
+  private framesWritten: number = 0
 
   /**
    * 创建 AudioTrack（MODE_STREAM，16bit mono），缓冲取 getMinBufferSize 与「1s 容量」较大者；
    * 启动后台写入线程。
    */
   init(sampleRate: number): void {
-    this.release()
+    this.releasePlayer()
     this.sampleRate = sampleRate > 0 ? sampleRate : 16000
     let minBuf = 0
     try {
@@ -77,55 +92,88 @@ export class StreamPcmPlayer {
       this.track = null
     }
     this.writtenBytes = new AtomicLong(0)
+    this.enqueuedBytes = new AtomicLong(0)
     this.started = false
+    this.framesWritten = 0
     this.queue = new LinkedBlockingQueue()
     this.running = true
     const q = this.queue
     const track = this.track
     this.writerThread = new Thread((): void => {
+      // 诊断：打印写入线程名，检测是否存在重复的写入线程（重复写=打架）
+      try {
+        console.log(
+          '[StreamPcmPlayer] writer thread=' +
+            Thread.currentThread().getName(),
+        )
+      } catch (_eT) {
+        // ignore
+      }
       while (this.running) {
         if (q == null || track == null) {
           break
         }
-        let item: any
+        let frame = this.retryFrame
+        this.retryFrame = null
+        if (frame == null) {
+          let item: any
+          try {
+            item = q.take()
+          } catch (_eTake) {
+            break
+          }
+          if (item == null) {
+            break
+          }
+          frame = item as PcmFrame
+        }
+        // len=0 空帧 = release 哨兵
+        if (frame == null || frame.len <= 0 || frame.nums.length == 0) {
+          break
+        }
         try {
-          item = q.take()
-        } catch (_eTake) {
-          break
-        }
-        if (item == null) {
-          break
-        }
-        const u8 = item as Uint8Array
-        // 空帧 = release 哨兵
-        if (u8 == null || u8.length == 0) {
-          break
-        }
-        try {
-          const src = u8.buffer != null ? u8.buffer!.toByteBuffer() : null
-          if (src != null) {
-            const len = u8.byteLength.toInt()
-            const bb = ByteBuffer.allocate(len)
-            bb.put(src)
-            bb.rewind()
-            const written = track.write(
-              bb,
-              len,
-              AUDIO_WRITE_BLOCKING.toInt(),
-            )
-            if (written > 0) {
-              this.writtenBytes!.addAndGet(written.toLong())
+          // 后台线程：把主线程读出的 number[] 转成可写 ByteBuffer（逐字节，成本全在后台）
+          const len = frame.len.toInt()
+          const bb = ByteBuffer.allocate(len)
+          for (let i = 0; i < frame.len; i++) {
+            bb.put(frame.nums[i].toByte())
+          }
+          bb.rewind()
+          const written = track.write(
+            bb,
+            len,
+            AUDIO_WRITE_NON_BLOCKING.toInt(),
+          )
+          if (written >= len) {
+            this.writtenBytes!.addAndGet(len.toLong())
+            this.framesWritten += 1
+          } else if (written > 0) {
+            // 部分写入：写入的字节计数，剩余留在重试（不再阻塞）
+            this.writtenBytes!.addAndGet(written.toLong())
+            this.retryFrame = frame
+            this.framesWritten += 1
+          } else {
+            // 缓冲满：整个帧留待重试；小睡让 track 腾缓冲，避免忙等
+            this.retryFrame = frame
+            try {
+              Thread.sleep(10)
+            } catch (_eSleep) {
+              // ignore
             }
           }
         } catch (eWrite: any) {
           console.warn('[StreamPcmPlayer] write failed', eWrite)
+          this.retryFrame = frame
         }
       }
     })
     this.writerThread!.start()
   }
 
-  /** 推入一帧 PCM16 LE 字节（主线程仅入队，不阻塞） */
+  /**
+   * 推入一帧 PCM16 LE 字节：主线程把 Uint8Array 逐字节转成 ByteArray（直接数组下标存储，
+   * 快且可靠），只把纯 Java 对象入队交给后台线程写。
+   */
   push(chunk: Uint8Array): void {
     const q = this.queue
     if (
@@ -136,8 +184,19 @@ export class StreamPcmPlayer {
     ) {
       return
     }
+    const len = chunk.length
+    // 主线程读 Uint8Array 元素（uni-app x 共享游标：同一 buffer 只能读一次，重复读返回 0），
+    // 只读这一次转成 number[] 入队，此后绝不再碰该 Uint8Array。
+    const nums: number[] = []
+    for (let i = 0; i < len; i++) {
+      nums.push(chunk[i])
+    }
+    const frame = new PcmFrame()
+    frame.nums = nums
+    frame.len = len
     try {
-      q.put(chunk)
+      q.put(frame)
+      this.enqueuedBytes!.addAndGet(len.toLong())
     } catch (_ePut) {
       // ignore
     }
@@ -198,6 +257,15 @@ export class StreamPcmPlayer {
     return Math.floor((wb.get().toDouble() * 1000) / (this.sampleRate * 2))
   }
 
+  /** 已入队（含队列积压）的 PCM 总时长（ms）；排空判定用它 */
+  getEnqueuedMs(): number {
+    const eb = this.enqueuedBytes
+    if (eb == null) {
+      return 0
+    }
+    return Math.floor((eb.get().toDouble() * 1000) / (this.sampleRate * 2))
+  }
+
   /** 已播放的 PCM 时长（ms）——基于播放头位置（线程安全） */
   getPlayedMs(): number {
     const track = this.track
@@ -213,24 +281,41 @@ export class StreamPcmPlayer {
     }
   }
 
-  /** 写入的音频是否已全部播完（排空判定用；留 50ms 容差） */
+  /**
+   * 写入的音频是否已全部播完（排空判定用；留 50ms 容差）。
+   * 用「已入队总量」而非「已写入量」——WRITE_BLOCKING 会让队列积压，
+   * 只看已写入会在积压时提前结束、丢弃剩余音频。
+   */
   isDrained(): boolean {
-    return this.getPlayedMs() + 50 >= this.getWrittenMs()
+    return this.getPlayedMs() + 50 >= this.getEnqueuedMs()
   }
 
-  /** 是否仍有未排空的音频 */
+  /** 是否仍有未排空的音频（含队列积压） */
   hasPendingAudio(): boolean {
-    return this.getWrittenMs() > this.getPlayedMs() + 50
+    return this.getEnqueuedMs() > this.getPlayedMs() + 50
   }
 
   /** 停止后台线程并释放 AudioTrack（幂等） */
-  release(): void {
+  releasePlayer(): void {
+    // 诊断：释放时的终态（enqueued/written/played/帧数）
+    console.log(
+      '[StreamPcmPlayer] release frames=' +
+        this.framesWritten +
+        ' enqueuedMs=' +
+        this.getEnqueuedMs() +
+        ' writtenMs=' +
+        this.getWrittenMs() +
+        ' playedMs=' +
+        this.getPlayedMs(),
+    )
     this.running = false
     const q = this.queue
     if (q != null) {
-      // 唤醒阻塞中的 take()：塞空帧哨兵
+      // 唤醒阻塞中的 take()：塞 len=0 空帧哨兵
+      const sentinel = new PcmFrame()
+      sentinel.len = 0
       try {
-        q.put(new Uint8Array(0))
+        q.put(sentinel)
       } catch (_ePut) {
         // ignore
       }
@@ -248,6 +333,7 @@ export class StreamPcmPlayer {
     const track = this.track
     this.track = null
     this.writtenBytes = null
+    this.enqueuedBytes = null
     this.started = false
     if (track != null) {
       try {

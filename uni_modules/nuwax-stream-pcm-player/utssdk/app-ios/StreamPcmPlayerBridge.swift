@@ -19,9 +19,10 @@ public class StreamPcmPlayerBridge {
 
     public init() {}
 
-    public func initPlayer(_ sampleRate: Int) {
+    public func initPlayer(_ sampleRate: NSNumber) {
         releasePlayer()
-        self.sampleRate = sampleRate > 0 ? Double(sampleRate) : 16000
+        let sr = sampleRate.doubleValue
+        self.sampleRate = sr > 0 ? sr : 16000
         let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16,
                                 sampleRate: self.sampleRate,
                                 channels: 1,
@@ -45,11 +46,11 @@ public class StreamPcmPlayerBridge {
         }
     }
 
-    /// UTS 侧把 Uint8Array 逐字节转成 number[] 传入（[Double]）
-    public func push(_ bytes: [Double]) {
+    /// UTS 侧把 Uint8Array 逐字节转成 number[] 传入（[NSNumber]）
+    public func push(_ bytes: [NSNumber]) {
         var data = Data(capacity: bytes.count)
         for v in bytes {
-            data.append(UInt8(v))
+            data.append(UInt8(truncating: v))
         }
         pending.append(data)
         writtenBytes += Int64(data.count)
@@ -92,9 +93,17 @@ public class StreamPcmPlayerBridge {
         })
     }
 
+    private func writtenMs() -> Double {
+        return Double(writtenBytes) * 1000.0 / (sampleRate * 2)
+    }
+
+    private func playedMs() -> Double {
+        return Double(playedBytes) * 1000.0 / (sampleRate * 2)
+    }
+
     public func ensurePlaying() {
         if started { return }
-        if getWrittenMs() >= 150 {
+        if writtenMs() >= 150 {
             playNow()
         }
     }
@@ -110,20 +119,20 @@ public class StreamPcmPlayerBridge {
         player?.volume = muted ? 0 : 1
     }
 
-    public func getWrittenMs() -> Double {
-        return Double(writtenBytes) * 1000.0 / (sampleRate * 2)
+    public func getWrittenMs() -> NSNumber {
+        return NSNumber(value: writtenMs())
     }
 
-    public func getPlayedMs() -> Double {
-        return Double(playedBytes) * 1000.0 / (sampleRate * 2)
+    public func getPlayedMs() -> NSNumber {
+        return NSNumber(value: playedMs())
     }
 
     public func isDrained() -> Bool {
-        return getPlayedMs() + 50 >= getWrittenMs()
+        return playedMs() + 50 >= writtenMs()
     }
 
     public func hasPendingAudio() -> Bool {
-        return !pending.isEmpty || getWrittenMs() > getPlayedMs() + 50
+        return !pending.isEmpty || writtenMs() > playedMs() + 50
     }
 
     public func releasePlayer() {

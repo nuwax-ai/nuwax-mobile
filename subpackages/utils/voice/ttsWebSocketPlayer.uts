@@ -11,6 +11,11 @@ import { resolveSpeechAccessToken } from "./speechToken";
 import { audioPlayerManager } from "./audioPlayerManager";
 import { loadVoiceSettings } from "./voiceTypes";
 import { SpeechWsKeepalive } from "./speechWsKeepalive";
+// #ifdef APP
+// 原生流式播放器：PCM 边推边播，无 WAV 文件/段边界 → 消除分段换源卡顿
+// （Android: AudioTrack / iOS: AVAudioEngine；模块按平台解析 app-android/app-ios 实现）
+import { StreamPcmPlayer } from "@/uni_modules/nuwax-stream-pcm-player";
+// #endif
 
 export type TtsPlaybackState =
   | "idle"
@@ -561,6 +566,20 @@ export class TtsWebSocketPlayer {
   private streamUseAlt: boolean = false;
   /** 已预置到「下次将播放的 context」上的 src（匹配则无需重新 set，直接 play） */
   private streamPreloadedSrc: string = "";
+  // #ifdef APP
+  /** 原生流式播放模式：PCM 直推 AudioTrack（无文件/段边界）；false 回退分段 WAV 播放 */
+  private streamNativeActive: boolean = false;
+  /** AudioTrack 流式播放器实例 */
+  private streamPcmPlayer: StreamPcmPlayer | null = null;
+  /** 已收到 tts_end / flush 看门狗（不再有新 PCM 到来） */
+  private streamInputDone: boolean = false;
+  /** 不再有新 PCM 的时刻（排空兜底 deadline 基准） */
+  private streamInputDoneAtMs: number = 0;
+  /** 排空轮询定时器 */
+  private streamDrainTimerId: number = 0;
+  /** 原生模式「tts_ready 后无任何 PCM 帧」看门狗（防止图标卡死） */
+  private nativeNoAudioTimerId: number = 0;
+  // #endif
 
   /**
    * 录音 onStart 后预热：建连但不发合成请求（轻触未开录勿调）。
@@ -815,6 +834,12 @@ export class TtsWebSocketPlayer {
     if (alt != null) {
       alt!.volume = muted ? 0 : 1;
     }
+    // #ifdef APP
+    const player = this.streamPcmPlayer;
+    if (player != null) {
+      player!.setMuted(muted);
+    }
+    // #endif
   }
 
   /**
@@ -1075,6 +1100,10 @@ export class TtsWebSocketPlayer {
     this.streamEnded = false;
     this.streamFlushSent = false;
     this.pendingFeedTexts = [] as string[];
+    // #ifdef APP
+    // 原生流式播放：PCM 直推 AudioTrack（无文件/段边界），分段 WAV 路径仅作兜底
+    this.streamNativeActive = true;
+    // #endif
     this.setState("connecting");
     const accessToken = resolveSpeechAccessToken();
     if (accessToken.length == 0) {
@@ -1199,13 +1228,29 @@ export class TtsWebSocketPlayer {
     if (type == "tts_ready") {
       this.streamReady = true;
       this.setState("synthesizing");
-      this.armSynthStallWatchdog();
+      // 原生流式：不用 12s stall 看门狗（长音频合法播放会超时），改用「无任何 PCM 帧」看门狗
+      if (this.isStreamNativeMode() == true) {
+        // #ifdef APP
+        this.armNativeNoAudioWatchdog();
+        // #endif
+      } else {
+        this.armSynthStallWatchdog();
+      }
       this.flushPendingFeedTexts();
     } else if (type == "tts_begin") {
       this.streamAudioStarted = true;
       this.setState("synthesizing");
     } else if (type == "tts_end") {
       this.clearFlushEndWatchdog();
+      // #ifdef APP
+      if (this.streamNativeActive == true) {
+        // 原生流式：tts_end 只表示不再有新 PCM，交给排空轮询播完即收尾
+        this.streamInputDone = true;
+        this.streamInputDoneAtMs = Date.now();
+        this.armStreamDrainPoll();
+        return;
+      }
+      // #endif
       this.streamEnded = true;
       // 收尾剩余缓冲（final=true 强制切，即便不足阈值）
       this.tryCutStreamSegment(true);
@@ -1230,6 +1275,17 @@ export class TtsWebSocketPlayer {
 
   /** 会话二进制帧：追加并尝试按阈值切段 */
   private appendStreamChunk(data: any): void {
+    // #ifdef APP
+    if (this.streamNativeActive == true) {
+      // 原生流式：PCM 直推 AudioTrack，不切段、不写文件
+      const syncBuffer = tryAsArrayBufferSync(data);
+      if (syncBuffer != null && syncBuffer!.byteLength > 0) {
+        this.pushToNativePlayer(new Uint8Array(syncBuffer!));
+        this.clearSynthStallWatchdog();
+      }
+      return;
+    }
+    // #endif
     const syncBuffer = tryAsArrayBufferSync(data);
     if (syncBuffer != null) {
       if (syncBuffer!.byteLength > 0) {
@@ -1258,6 +1314,117 @@ export class TtsWebSocketPlayer {
       this.tryCutStreamSegment(false);
     });
   }
+
+  /** 原生流式是否启用（Android AudioTrack 边推边播；其他平台恒 false，走分段 WAV 路径） */
+  isStreamNativeMode(): boolean {
+    // #ifdef APP
+    return this.streamNativeActive == true;
+    // #endif
+    // #ifndef APP
+    return false;
+    // #endif
+  }
+
+  // #ifdef APP
+  /** 把一帧 PCM 直推 AudioTrack（懒创建播放器 + 启动播放 + 挂排空轮询） */
+  private pushToNativePlayer(frame: Uint8Array): void {
+    if (this.streamPcmPlayer == null) {
+      const player = new StreamPcmPlayer();
+      player.init(this.sampleRate);
+      this.streamPcmPlayer = player;
+    }
+    this.clearNativeNoAudioWatchdog();
+    this.streamPcmPlayer!.push(frame);
+    this.streamPcmPlayer!.ensurePlaying();
+    this.armStreamDrainPoll();
+  }
+
+  private armNativeNoAudioWatchdog(): void {
+    this.clearNativeNoAudioWatchdog();
+    this.nativeNoAudioTimerId = setTimeout((): void => {
+      this.nativeNoAudioTimerId = 0;
+      // tts_ready 后 12s 无任何 PCM 帧：按失败收尾，防原生模式下图标卡死
+      if (this.streamPcmPlayer == null || this.streamPcmPlayer!.getWrittenMs() <= 0) {
+        this.fail("TTS 服务未返回音频");
+      }
+    }, 12000) as number;
+  }
+
+  private clearNativeNoAudioWatchdog(): void {
+    if (this.nativeNoAudioTimerId != 0) {
+      clearTimeout(this.nativeNoAudioTimerId);
+      this.nativeNoAudioTimerId = 0;
+    }
+  }
+
+  private armStreamDrainPoll(): void {
+    if (this.streamDrainTimerId != 0) {
+      return;
+    }
+    this.streamDrainTimerId = setTimeout((): void => {
+      this.streamDrainTimerId = 0;
+      this.checkNativeDrain();
+    }, 200) as number;
+  }
+
+  private clearStreamDrainPoll(): void {
+    if (this.streamDrainTimerId != 0) {
+      clearTimeout(this.streamDrainTimerId);
+      this.streamDrainTimerId = 0;
+    }
+  }
+
+  /** 排空轮询：输入结束后写入的 PCM 播完即整轮结束；带「写入时长+30s」兜底防播放头卡死 */
+  private checkNativeDrain(): void {
+    const player = this.streamPcmPlayer;
+    if (player == null) {
+      this.clearStreamDrainPoll();
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+      return;
+    }
+    player.flushPending();
+    player.ensurePlaying();
+    if (this.streamInputDone == true) {
+      // 输入结束：即便不足起始缓冲也强制开播，避免短音频不出声
+      player.playNow();
+    }
+    if (this.streamInputDone == true && player.isDrained() == true) {
+      this.clearStreamDrainPoll();
+      this.releaseStreamPcmPlayer();
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+      return;
+    }
+    if (this.streamInputDone == true) {
+      const deadline =
+        this.streamInputDoneAtMs + player.getWrittenMs() + 30000;
+      if (Date.now() > deadline) {
+        this.clearStreamDrainPoll();
+        this.releaseStreamPcmPlayer();
+        this.streamEnded = true;
+        this.notifyStreamEnd();
+        return;
+      }
+    }
+    this.armStreamDrainPoll();
+  }
+
+  /** 释放原生播放器并停掉排空轮询（幂等） */
+  private releaseStreamPcmPlayer(): void {
+    this.clearStreamDrainPoll();
+    this.clearNativeNoAudioWatchdog();
+    const player = this.streamPcmPlayer;
+    this.streamPcmPlayer = null;
+    if (player != null) {
+      try {
+        player.release();
+      } catch (_eRel) {
+        // ignore
+      }
+    }
+  }
+  // #endif
 
   /**
    * 按阈值把已积累 PCM 切为一段 WAV 并交给 streamSegmentHandler。
@@ -1364,6 +1531,15 @@ export class TtsWebSocketPlayer {
     this.clearFlushEndWatchdog();
     this.flushEndTimerId = setTimeout((): void => {
       this.flushEndTimerId = 0;
+      // #ifdef APP
+      if (this.streamNativeActive == true) {
+        // 原生流式：flush 后无 tts_end 视为「不再有新音频」，已推入的 PCM 仍播完再收尾
+        this.streamInputDone = true;
+        this.streamInputDoneAtMs = Date.now();
+        this.armStreamDrainPoll();
+        return;
+      }
+      // #endif
       // flush 后无音频产出时服务端不发 tts_begin/tts_end（doc 5.3）：按已结束收尾
       this.streamEnded = true;
       this.tryCutStreamSegment(true);
@@ -1402,6 +1578,12 @@ export class TtsWebSocketPlayer {
     this.streamFinalPending = false;
     this.streamForcePending = false;
     this.streamPreloadedSrc = "";
+    // #ifdef APP
+    this.streamNativeActive = false;
+    this.streamInputDone = false;
+    this.streamInputDoneAtMs = 0;
+    this.releaseStreamPcmPlayer();
+    // #endif
     this.pendingFeedTexts = [] as string[];
     this.clearFlushEndWatchdog();
     if (notify == true) {
@@ -3022,6 +3204,9 @@ export class TtsWebSocketPlayer {
     console.error("[TTS] " + message);
     this.clearSynthStallWatchdog();
     this.clearFlushEndWatchdog();
+    // #ifdef APP
+    this.releaseStreamPcmPlayer();
+    // #endif
     // 流式会话：置结束并唤醒等待者（voiceStreamSpeaker 的 kickPlay 靠它退出）
     if (this.streamSessionActive == true || this.streamEnded == true) {
       this.streamEnded = true;

@@ -559,6 +559,8 @@ export class TtsWebSocketPlayer {
   private readonly STREAM_FORCED_SEGMENT_MIN_MS: number = 150;
   /** flush 后等 tts_end 的看门狗 */
   private readonly STREAM_FLUSH_END_WATCHDOG_MS: number = 8000;
+  /** no-audio 看门狗续等次数上限：超过仍无任何 PCM 即判死（默认 12s × (1+2) ≈ 36s） */
+  private readonly NATIVE_NO_AUDIO_REARM_LIMIT: number = 2;
   /** 播放端队列排空时请求的按需切段标记：有标记则切段不再等阈值（成功切段后清除） */
   private streamForcePending: boolean = false;
 
@@ -582,6 +584,8 @@ export class TtsWebSocketPlayer {
   private streamDrainTimerId: number = 0;
   /** 原生模式「tts_ready 后无任何 PCM 帧」看门狗（防止图标卡死） */
   private nativeNoAudioTimerId: number = 0;
+  /** 该看门狗已续等次数（NATIVE_NO_AUDIO_REARM_LIMIT 封顶，防无反馈时无限 re-arm） */
+  private nativeNoAudioRearmCount: number = 0;
   // #endif
 
   /**
@@ -1414,14 +1418,20 @@ export class TtsWebSocketPlayer {
             ? this.streamPcmPlayer!.getWrittenMs()
             : -1),
       );
-      // 续等：SSE 尚未收尾（正文可能还在流 / 网络延迟 / 中途工具调用），
-      // 不判死，重新武装再看一轮——音频迟到（网络抖动）应能等到而非误停
-      if (this.streamFlushSent != true && this.streamSessionActive == true) {
+      // 续等：正文可能还在流 / 网络延迟 / 中途工具调用，音频迟到应能等到而非误停；
+      // 但续等有总上限（NATIVE_NO_AUDIO_REARM_LIMIT），超限仍无任何 PCM 即判死——
+      // 防「无音频反馈 + 会话不收尾」时无限 re-arm、图标永久卡住。
+      if (
+        this.streamFlushSent != true &&
+        this.streamSessionActive == true &&
+        this.nativeNoAudioRearmCount < NATIVE_NO_AUDIO_REARM_LIMIT
+      ) {
+        this.nativeNoAudioRearmCount += 1;
         console.warn("[TTS] no-audio: SSE still streaming, re-arm watchdog");
         this.armNativeNoAudioWatchdog();
         return;
       }
-      // 已收尾（flush 已发 / 会话结束）仍无任何 PCM 帧：按失败收尾，防原生模式下图标卡死
+      // 已收尾（flush 已发 / 会话结束）或续等超限仍无任何 PCM 帧：按失败收尾，防原生模式下图标卡死
       if (this.streamPcmPlayer == null || this.streamPcmPlayer!.getWrittenMs() <= 0) {
         this.fail("TTS 服务未返回音频");
       }
@@ -1680,6 +1690,7 @@ export class TtsWebSocketPlayer {
     this.streamNativeActive = false;
     this.streamInputDone = false;
     this.streamInputDoneAtMs = 0;
+    this.nativeNoAudioRearmCount = 0;
     this.releaseStreamPcmPlayer();
     // #endif
     this.pendingFeedTexts = [] as string[];

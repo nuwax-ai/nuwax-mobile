@@ -50,6 +50,13 @@ const FEED_PACING_BUFFER_MS = 12000;
 /** 生产节流轮询间隔：缓冲未达标时每 200ms 复查一次 */
 const FEED_PACING_POLL_MS = 200;
 
+/**
+ * 首个 PCM 到达前最多喂入的句子数（启动上限）。
+ * 播放器未创建（无音频反馈）时无缓冲可节流，但不能无限喂——手动播报全文已入队时，
+ * 无上限会把整段文本一次性灌给后端。给到足够触发服务端开流的量即可（正常 1~2 句即回 PCM）。
+ */
+const MAX_STARTUP_FEED_UTTERANCES = 3;
+
 /** 会话切好的待播段（src + 估算时长） */
 class ReadyUtterance {
   sentence: string = "";
@@ -105,8 +112,8 @@ export class VoiceStreamSpeaker {
   private readySegments: ReadyUtterance[] = [];
   /** 文本喂入循环运行标记 */
   private feeding: boolean = false;
-  /** 原生流式：本轮是否已喂出首个 feed（首个无条件放行触发服务端合成，之后按缓冲节流） */
-  private nativeFeedStarted: boolean = false;
+  /** 首个 PCM 到达前已喂入句数（begin 重置；首个 PCM 到达后不再参与节流） */
+  private startupFeedCount: number = 0;
   /** 段就绪 / 会话结束的等待器（kickPlay 挂起，回调唤醒） */
   private segmentWaiter: (() => void) | null = null;
   /** 段等待兜底超时（停流时强制收尾，防悬挂） */
@@ -144,7 +151,7 @@ export class VoiceStreamSpeaker {
     this.streamEnded = false;
     this.playLooping = false;
     this.feeding = false;
-    this.nativeFeedStarted = false;
+    this.startupFeedCount = 0;
     this.segmentWaiter = null;
     this.clearSegmentWaitTimer();
     this.onPendingEnqueued = null;
@@ -452,9 +459,8 @@ export class VoiceStreamSpeaker {
         // 生产节流（原生流式）：缓冲未低于阈值前不喂下一句。
         // 让服务端只合成即将播放的内容：中途停止浪费 ≤ 在途 1~2 句；
         // 队列保持秒级 → 长文本不积压、不丢帧。非原生（isStreamNativeMode=false）不节流。
-        // 注意：getNativeBufferedMs()=-1 表示播放器尚未创建（首个音频帧未到）。
-        // 若此时放行，会在开局把整篇句子一次灌给服务端 → 服务端快速合成整篇 → 积压丢帧。
-        // 仅会话首个 feed 无条件放行（触发服务端开始合成），此后 -1 也等待播放器就绪。
+        // 播放器未创建（buffered=-1）时无缓冲可测：首帧反馈前只放行启动上限句数
+        // （MAX_STARTUP_FEED_UTTERANCES），详见循环内注释。
         if (ttsWebSocketPlayer.isStreamNativeMode()) {
           while (
             this.active == true &&
@@ -462,10 +468,17 @@ export class VoiceStreamSpeaker {
             expectedRound == this.round
           ) {
             const buffered = ttsWebSocketPlayer.getNativeBufferedMs();
-            if (buffered < 0 && this.nativeFeedStarted != true) {
-              break;
-            }
-            if (buffered >= 0 && buffered < FEED_PACING_BUFFER_MS) {
+            if (buffered < 0) {
+              // 播放器未创建（buffered<0）= 尚无首个 PCM 反馈：无缓冲可节流，
+              // 但不能无限喂——首个 PCM 前最多喂 MAX_STARTUP_FEED_UTTERANCES 句，
+              // 之后等首个 PCM 建立反馈（到达即恢复正常缓冲节流；不来由 no-audio watchdog 判死）。
+              // 播放器是「喂文本 → 服务端回 PCM」的结果，不是喂入前提；
+              // 但无反馈确认时不能无限提交，否则手动播报全文入队会把整段文本一次灌给后端。
+              if (this.startupFeedCount < MAX_STARTUP_FEED_UTTERANCES) {
+                break;
+              }
+            } else if (buffered < FEED_PACING_BUFFER_MS) {
+              // 缓冲低于阈值：放行下一句
               break;
             }
             await new Promise<void>((resolve) => {
@@ -483,7 +496,7 @@ export class VoiceStreamSpeaker {
           break;
         }
         ttsWebSocketPlayer.feedStreamText(utt, false);
-        this.nativeFeedStarted = true;
+        this.startupFeedCount += 1;
         // 让出主线程：SSE 洪峰时否则 TTS WS / 音频回调要等会话结束后才被调度
         await new Promise<void>((resolve) => {
           setTimeout(() => {

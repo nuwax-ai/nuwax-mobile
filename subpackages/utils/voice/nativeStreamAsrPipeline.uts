@@ -20,6 +20,11 @@
  *
  * 内存：number[] 装箱（~8x）被上限约束在 2.5s 音频以内（约 80KB 原始 → 亚 MB 级），
  * 不会像长 TTS 队列那样无界增长；超限丢最旧帧并置 truncated，正确性交给文件兜底。
+ *
+ * 性能陷阱（已修复，勿回退）：UTSArray 的 splice(start, deleteCount) 是逐元素 remove(index)，
+ * 每删一个都整体前移 → O(删N × 数组长) 平方级。预滚环满 / 背压溢出 / 发包切队列时若用
+ * splice(0, N) 删大数组头部，会把主线程钉死数秒（Android 录音卡死的直接根因）。
+ * 一律改用 slice 只读切片 + 尾部重建（摊还 O(1)/字节）。
  */
 import { ASR_FRAME_BYTES, ASR_SAMPLE_RATE } from './asrWebSocketClient'
 
@@ -151,12 +156,25 @@ export class NativeStreamAsrPipeline {
       this.acc.push(u8[i])
     }
     const g = this.generation
-    while (this.acc.length >= ASR_FRAME_BYTES) {
+    // 用只读 offset 切窗口，收尾一次性压缩；不能用 splice(0, 640)——
+    // UTSArray 的 splice 是逐元素 remove(index)（每删一元素整体前移），O(删N × 数组长) 平方级，
+    // acc 一涨就把主线程钉死（Android 卡死的直接原因）。
+    let winStart = 0
+    while (this.acc.length - winStart >= ASR_FRAME_BYTES) {
       if (g != this.generation) {
         return
       }
-      const win = this.acc.splice(0, ASR_FRAME_BYTES)
+      const win = this.acc.slice(winStart, winStart + ASR_FRAME_BYTES)
       this.processWindow(win, g)
+      winStart += ASR_FRAME_BYTES
+    }
+    if (winStart > 0) {
+      const remain = this.acc.length - winStart
+      if (remain == 0) {
+        this.acc = []
+      } else {
+        this.acc = this.acc.slice(winStart, this.acc.length)
+      }
     }
   }
 
@@ -221,7 +239,11 @@ export class NativeStreamAsrPipeline {
         this.preRoll.push(win[i])
       }
       if (this.preRoll.length > this.preRollMaxBytes) {
-        this.preRoll.splice(0, this.preRoll.length - this.preRollMaxBytes)
+        // 保留尾部（slice 摊还 O(1)/字节；splice 前删是 O(n²)，会卡死主线程）
+        this.preRoll = this.preRoll.slice(
+          this.preRoll.length - this.preRollMaxBytes,
+          this.preRoll.length,
+        )
       }
       if (
         this.voicedStreak >= ASR_PIPE_VAD_MIN_VOICED_FRAMES &&
@@ -241,7 +263,11 @@ export class NativeStreamAsrPipeline {
         this.preReady.push(win[i])
       }
       if (this.preReady.length > ASR_PIPE_PRE_READY_MAX_BYTES) {
-        this.preReady.splice(0, ASR_FRAME_BYTES)
+        // 保留尾部（splice 前删 O(n²)，会卡死主线程）
+        this.preReady = this.preReady.slice(
+          this.preReady.length - ASR_PIPE_PRE_READY_MAX_BYTES,
+          this.preReady.length,
+        )
         if (this.truncated != true) {
           console.warn("[ASR-live] pre-ready 溢出丢帧，置 truncated")
         }
@@ -259,7 +285,11 @@ export class NativeStreamAsrPipeline {
     }
     // 背压：WS 慢于实时时 txBuf 上限 2s，溢出丢最旧（发送由 sender 定时器负责，不在此处 send）
     if (this.txBuf.length > ASR_PIPE_PRE_READY_MAX_BYTES) {
-      this.txBuf.splice(0, ASR_FRAME_BYTES)
+      // 保留尾部（splice 前删 O(n²)，背压期间每秒几十次会把主线程钉死 → Android 卡死）
+      this.txBuf = this.txBuf.slice(
+        this.txBuf.length - ASR_PIPE_PRE_READY_MAX_BYTES,
+        this.txBuf.length,
+      )
       if (this.truncated != true) {
         console.warn("[ASR-live] txBuf 背压溢出丢帧，置 truncated")
       }
@@ -336,7 +366,13 @@ export class NativeStreamAsrPipeline {
       for (let i = 0; i < take; i++) {
         out[i] = this.txBuf[i]
       }
-      this.txBuf.splice(0, take)
+      // 丢弃已发前缀：slice 尾部重建（splice 前删 O(n²)，包越大主线程越卡；slice 摊还 O(1)/字节）
+      const pendingAfter = this.txBuf.length - take
+      if (pendingAfter == 0) {
+        this.txBuf = []
+      } else {
+        this.txBuf = this.txBuf.slice(take, this.txBuf.length)
+      }
       this.outstandingBytes += take
       const sentNow = take
       this.sendFrame(packet).then(

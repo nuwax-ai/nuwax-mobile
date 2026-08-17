@@ -146,6 +146,7 @@ manifest.json:111 配置 `universalLink: https://link.nuwax.com/wechat/`。
 
 ## 变更记录
 
+- **2026-08-17（夜间崩溃攻关，未解，已隔离）**：iOS 26.6 高频闪退（BFL/FrameState IPC 内存损坏族，12+ 次）。**已证伪**：grace 延时退出（150/300ms + 防重入加固后仍崩）、enablePageCache 页面缓存、H5 内容参与（空白页 webview 亦崩，待横幅复核）。**已确认**：与 agent-detail 无强绑定（未进会话亦可崩）；**S3 基座与云打包包均缺 `unimoduleNuwaxUniMath`（ratex）框架** → iOS 公式渲染必走 uni-ai-x proxy 隐藏 webview（native 解不了 SVG 亦回落 proxy），proxy webview 为全 App 级嫌疑源（7 月老包同族崩互证）。⚠️ **ratex 三方 lib 只在离线 SDK，云打包永远带不了 → 云打包提审包自带此崩溃基因，除非转本地离线打包（手动补隐私清单，方案见第 3 节）或 DCloud 修 WebKit 竞态**。明日：①HX 运行会话收有效 ips（新二进制 UUID）定位 BFL 所属 webview；②发 DCloud 工单；③候选修复：离线打包含 ratex / proxy 总闸实验（`uni-ai-x/sdk/proxy-web.uts`）/ webview 常驻收敛。首页 TEMP-BUILD-TAG 横幅保留至问题关闭。
 - **2026-08-17（三轮，对齐备案口径）**：iOS「我的订单」菜单项整个隐藏；终端 tab 硬件购买列表（产品购买卡）隐藏 —— iOS 全端无支付/订单链路，落实备案备注「不含支付功能」A 方案。`NuwaxApp(Dev).08172016` 云打包经 JS 标记验证为**二轮前旧包**（含 `setStorageSync("SUB_BACK_URL"`），仅一轮改动，不可用于回归/提审。
 - **2026-08-17（二轮，按产品细化口径）**：「我的订阅」菜单项整个隐藏（mine）；订单卡「去支付」限 `bizType == DESK_BUDDY`；应用详情侧栏增购 action + 立即订阅按钮隐藏；确认「会议订阅弹窗」= 会话详情 agent-subscription-modal（一轮已挡自动弹出与入口）。
 - **2026-08-17（一轮）**：方案 A 实施（5 处支付入口条件编译）+ logout 两处补 `APP-IOS` + 新增 `nativeResources/ios/PrivacyInfo.xcprivacy` + 打包路线定云打包。云打包 profile 侧 associated-domains 已修复（Identifiers 开能力 + regenerate profile）。

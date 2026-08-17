@@ -594,6 +594,8 @@ export class TtsWebSocketPlayer {
   private lastDrainProgressAtMs: number = 0;
   /** 排空进度检测：窗口起点时的 playedMs */
   private lastDrainPlayedMs: number = 0;
+  /** 排空兜底：inputDone 时刻的「剩余积压」快照（-1=未初始化；固定不随播放推进变，防 deadline 被追上误切） */
+  private nativeDrainRemainingAtInputDoneMs: number = -1;
   // #endif
 
   /**
@@ -1502,10 +1504,18 @@ export class TtsWebSocketPlayer {
       return;
     }
     if (this.streamInputDone == true) {
-      // 兜底 deadline 按「剩余积压」算（入队总量 − 已播部分）：
-      // 若按入队总量算，长音频在播放头卡住时 deadline = 整段时长+30s，判死要等几分钟，形同虚设。
-      const remainingMs = player.getEnqueuedMs() - player.getPlayedMs();
-      const deadline = this.streamInputDoneAtMs + remainingMs + 30000;
+      // 兜底 deadline 基准 = inputDone 时刻的「剩余积压」一次性快照（固定，不随播放推进变化）：
+      // 若用检查时刻的剩余（随播放递减），长音频播放到一半 deadline 会被「追上」而误切
+      // （实测 enqueued 194s，播到 128s 时剩余 66s+30s 余量 < 已过 96s → 误触发切断）。
+      // 快照后 deadline 恒在「剩余音频播完 + 30s」：正常播放由 isDrained 先行结束，
+      // 仅播放头卡死（剩余不再减少）时在预期播完后 30s 兜底触发。
+      if (this.nativeDrainRemainingAtInputDoneMs < 0) {
+        const snapRem = player.getEnqueuedMs() - player.getPlayedMs();
+        this.nativeDrainRemainingAtInputDoneMs = snapRem > 0 ? snapRem : 0;
+      }
+      const remainingNowMs = player.getEnqueuedMs() - player.getPlayedMs();
+      const deadline =
+        this.streamInputDoneAtMs + this.nativeDrainRemainingAtInputDoneMs + 30000;
       if (Date.now() > deadline) {
         // 诊断：兜底超时触发（播放头可能卡住未推进）
         console.warn(
@@ -1515,8 +1525,10 @@ export class TtsWebSocketPlayer {
             player.getWrittenMs() +
             " playedMs=" +
             player.getPlayedMs() +
-            " remainingMs=" +
-            remainingMs,
+            " remainingSnapshotMs=" +
+            this.nativeDrainRemainingAtInputDoneMs +
+            " remainingNowMs=" +
+            remainingNowMs,
         );
         this.clearStreamDrainPoll();
         this.releaseStreamPcmPlayer();
@@ -1735,6 +1747,7 @@ export class TtsWebSocketPlayer {
     this.nativeNoAudioRearmCount = 0;
     this.lastDrainProgressAtMs = 0;
     this.lastDrainPlayedMs = 0;
+    this.nativeDrainRemainingAtInputDoneMs = -1;
     this.releaseStreamPcmPlayer();
     // #endif
     this.pendingFeedTexts = [] as string[];

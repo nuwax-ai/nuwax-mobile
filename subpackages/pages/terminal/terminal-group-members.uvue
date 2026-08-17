@@ -80,9 +80,8 @@
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { apiGetGroupMembers, apiAddGroupMember, apiRemoveGroupMember } from "@/servers/terminalAgent";
-  import { apiPublishedAgentList } from "@/servers/square";
+  import { apiHomeCategoryList } from "@/servers/agentDev";
   import { GroupMemberAddParams } from "@/types/interfaces/terminalGroupMember";
-  import { SquarePublishedListParams } from "@/types/interfaces/square";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
 
@@ -127,6 +126,22 @@
     if (v == null) return 0;
     const n = parseFloat(`${v}`);
     return !isNaN(n) ? (n as number) : 0;
+  };
+
+  const readBool = (obj: UTSJSONObject, key: string): boolean => {
+    const v = obj[key];
+    return v != null && `${v}` == "true";
+  };
+
+  /** 取嵌套对象字段（非对象或缺失返回 null） */
+  const readObj = (obj: UTSJSONObject, key: string): UTSJSONObject | null => {
+    const v = obj[key];
+    if (v == null) return null;
+    try {
+      return v as UTSJSONObject;
+    } catch (_e) {
+      return null;
+    }
   };
 
   /**
@@ -187,33 +202,49 @@
 
   /**
    * 拉取候选智能体并排除已在组内的成员。
-   * 数据源与智联录一致：apiPublishedAgentList（POST /api/published/agent/list，已发布智能体广场），
-   * records 中 targetType=Agent 时 targetId 即 agentId。
+   * 数据源与智联录一致：apiHomeCategoryList（GET /api/home/list）。
+   * 返回体 data.categoryItems 是以分类 key 分组的 map（我的收藏 AGENT_COLLECT、官方推荐 AGENT_RECOMMEND、
+   * 空间 SPACE_<spaceId> 等，空间 key 随用户变化故遍历全部 key），同一智能体可能同时出现在多个分类下，
+   * 需按 targetId 去重；targetType=Agent 时 targetId 即 agentId。
    * @param memberIds 已在组内的 agentId
    */
   const fetchCandidates = async (memberIds: number[]): Promise<void> => {
     try {
-      const params = new SquarePublishedListParams();
-      params.targetType = "Agent";
-      params.targetSubType = "ChatBot";
-      params.page = 1;
-      params.pageSize = 50;
-      params.category = "";
-      params.kw = "";
-      const res = await apiPublishedAgentList(params);
+      const res = await apiHomeCategoryList();
       if (apiResCode(res) == SUCCESS_CODE) {
-        const pageDataRaw = apiResData<any>(res);
-        const pageObj = pageDataRaw != null ? (pageDataRaw as UTSJSONObject) : null;
-        const recordsRaw = pageObj != null ? pageObj["records"] : null;
-        const arr = recordsRaw != null ? (recordsRaw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        // 直接以 UTSJSONObject 操作，避免 Gson 反序列化 interface 崩溃
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const itemsObj = dataObj != null ? readObj(dataObj, "categoryItems") : null;
+        // 展平所有分类下的智能体
+        const all: UTSJSONObject[] = [] as UTSJSONObject[];
+        if (itemsObj != null) {
+          const keys = UTSJSONObject.keys(itemsObj);
+          for (let ki = 0; ki < keys.length; ki++) {
+            const valueRaw = itemsObj[keys[ki]];
+            if (valueRaw == null) continue;
+            const group = valueRaw as UTSJSONObject[];
+            for (let gi = 0; gi < group.length; gi++) {
+              all.push(group[gi]);
+            }
+          }
+        }
         const rows: MemberRow[] = [] as MemberRow[];
-        for (let i = 0; i < arr.length; i++) {
-          const src = arr[i];
+        // 跨分类去重：记录已收录的 targetId
+        const seen = new Map<number, boolean>();
+        for (let i = 0; i < all.length; i++) {
+          const src = all[i];
           // targetId（targetType=Agent 时即 agentId）
           const aid = readNum(src, "targetId");
           if (aid <= 0) continue;
+          if (seen.get(aid) != null) continue;
           // 宿主自身与已在组内的不进候选
           if (aid == hostAgentId.value) continue;
+          // 网页应用不能作为组员
+          if (readStr(src, "agentType") == "PageApp") continue;
+          // 设备智能体（灵珠等）不能作为组员
+          const extra = readObj(src, "extra");
+          if (extra != null && readBool(extra, "isDeviceAgent")) continue;
           let inGroup = false;
           for (let j = 0; j < memberIds.length; j++) {
             if (memberIds[j] == aid) {
@@ -222,6 +253,7 @@
             }
           }
           if (inGroup) continue;
+          seen.set(aid, true);
           rows.push(
             new MemberRow(aid, readStr(src, "name"), readStr(src, "description"), readStr(src, "icon")),
           );

@@ -37,6 +37,11 @@ export class StreamPcmRecorderBridge {
   private onStartCb: (() => void) | null = null
   private onStopCb: ((filePath: string, byteLength: number) => void) | null = null
   private onErrorCb: ((message: string) => void) | null = null
+  /** 实时 PCM 帧回调（主线程）：边说边传 ASR 消费采集帧（与文件写入并行，文件仍为兜底） */
+  private onFrameCb: ((data: ArrayBuffer) => void) | null = null
+  /** 帧批量派发：readData 系统线程只入队拷贝，setTimeout 跳主线程一次性回调 */
+  private dispatchScheduled: boolean = false
+  private pendingFrames: Array<ArrayBuffer> = []
 
   isRecording(): boolean {
     return this.running
@@ -52,6 +57,10 @@ export class StreamPcmRecorderBridge {
 
   setOnError(callback: ((message: string) => void) | null): void {
     this.onErrorCb = callback
+  }
+
+  setOnFrame(callback: ((data: ArrayBuffer) => void) | null): void {
+    this.onFrameCb = callback
   }
 
   /**
@@ -181,6 +190,39 @@ export class StreamPcmRecorderBridge {
           this.stopInternal(true)
         }
       }, 0)
+      return
+    }
+    // 实时帧转发（写文件成功前提下）：
+    // readData 在系统线程，仅把拷贝（ArrayBuffer.slice 即深拷贝，对主线程安全）入队；
+    // setTimeout 跳主线程批派 onFrame，避免系统线程触发页面逻辑。
+    const copy = data.slice(0)
+    this.pendingFrames.push(copy)
+    if (this.dispatchScheduled != true) {
+      this.dispatchScheduled = true
+      setTimeout((): void => {
+        this.flushPendingFrames()
+      }, 0)
+    }
+  }
+
+  /** 主线程批派：取空队列逐帧回调 onFrame；stop 时同步调用以排空尾帧（幂等） */
+  private flushPendingFrames(): void {
+    this.dispatchScheduled = false
+    const frames = this.pendingFrames
+    this.pendingFrames = []
+    const cb = this.onFrameCb
+    if (cb == null) {
+      return
+    }
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i]
+      if (frame != null && frame.byteLength > 0) {
+        try {
+          cb(frame)
+        } catch (_eCb) {
+          // ignore
+        }
+      }
     }
   }
 
@@ -225,6 +267,8 @@ export class StreamPcmRecorderBridge {
     }
     // 仅在真正开录后回传 onStop（stop 早于 onStart 的看门狗场景不发，避免空文件推 ASR）
     if (emitStop && wasStarted) {
+      // 停止前同步排空残留帧：onFrame 消费者先拿全尾帧，再收 onStop（保证松手尾音不丢）
+      this.flushPendingFrames()
       const stopCb = this.onStopCb
       if (stopCb != null) {
         stopCb(this.filePath, this.recordedBytes)

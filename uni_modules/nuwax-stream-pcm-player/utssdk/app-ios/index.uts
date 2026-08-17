@@ -81,3 +81,185 @@ export class StreamPcmPlayer {
     this.bridge.releasePlayer()
   }
 }
+
+// ==================== 原生录音（AVAudioEngine inputNode tap → PCM 文件 + 实时帧转发） ====================
+
+/** 录音开始回调（res 无内容，仅通知「已开录」，对齐 RecorderManager.onStart 语义） */
+export type NativeRecorderStartCallback = (res: UTSJSONObject | null) => void
+/** 录音结束回调（res 携带 tempFilePath/duration/fileSize/format，对齐 RecorderManager.onStop） */
+export type NativeRecorderStopCallback = (res: UTSJSONObject | null) => void
+/** 录音失败回调（err 携带 errMsg） */
+export type NativeRecorderErrorCallback = (err: UTSJSONObject | null) => void
+/** 实时 PCM 帧回调（chunk 为 16kHz mono PCM16 LE 裸字节；主线程回调；一次性全新 ArrayBuffer） */
+export type NativeRecorderFrameCallback = (chunk: ArrayBuffer) => void
+
+/**
+ * 原生录音器（App-iOS）
+ *
+ * 包装 StreamPcmRecorderBridge.swift（AVAudioEngine inputNode tap，16kHz mono Int16 隐式 SRC）。
+ * 与 Player 桥一致采用「纯拉取式」：PCM 帧走 base64 字符串跨桥（Uint8Array 跨桥当 model 解析会崩，
+ * 见 StreamPcmPlayer.pushBase64 注释），UTS 侧 20ms 轮询拉取 onStart/onFrame/onError/onStop 状态。
+ * 录音与 TTS 播放共用 AVAudioSession（.playAndRecord），与 Android/鸿蒙 StreamPcmRecorder 接口一致。
+ */
+export class StreamPcmRecorder {
+  private bridge: StreamPcmRecorderBridge = new StreamPcmRecorderBridge()
+  private polling: boolean = false
+  private pollTimer: number = 0
+  private onStartCb: NativeRecorderStartCallback | null = null
+  private onStopCb: NativeRecorderStopCallback | null = null
+  private onErrorCb: NativeRecorderErrorCallback | null = null
+  private onFrameCb: NativeRecorderFrameCallback | null = null
+  /** 是否已回传 onStart（幂等） */
+  private startReported: boolean = false
+  /** 是否已回传 onStop（幂等） */
+  private stopReported: boolean = false
+  /** 是否已回传 onError（幂等） */
+  private errorReported: boolean = false
+
+  onStart(callback: NativeRecorderStartCallback | null): void {
+    this.onStartCb = callback
+  }
+
+  onStop(callback: NativeRecorderStopCallback | null): void {
+    this.onStopCb = callback
+  }
+
+  onError(callback: NativeRecorderErrorCallback | null): void {
+    this.onErrorCb = callback
+  }
+
+  /**
+   * 注册实时 PCM 帧回调（边说边传 ASR 用）：写文件与帧转发并行，文件仍为兜底。
+   * chunk 为 16kHz mono PCM16 LE 裸字节（长度任意偶数），主线程回调，一次性 ArrayBuffer。
+   */
+  onFrame(callback: NativeRecorderFrameCallback | null): void {
+    this.onFrameCb = callback
+  }
+
+  isRecording(): boolean {
+    return this.bridge.isRecording()
+  }
+
+  /**
+   * 开始录音。options 仅取 duration（毫秒，到时自动停止）；采样率/声道/格式固定
+   * 16kHz mono PCM16（ASR 协议硬编码）。录音文件写 NSTemporaryDirectory/nuwax_voice_record.pcm。
+   */
+  start(options: RecorderManagerStartOptions | null): void {
+    // 复用实例：先收尾旧轮（不回传 onStop，避免旧回调污染新会话）
+    this.stopPolling()
+    let durationMs = 600000
+    if (options != null) {
+      try {
+        const durRaw = options!.duration
+        if (durRaw != null) {
+          const durNum = parseFloat(`${durRaw}`)
+          if (!isNaN(durNum) && durNum > 0) {
+            durationMs = Math.min(durNum, 600000)
+          }
+        }
+      } catch (_eDur) {
+        // ignore
+      }
+    }
+    this.startReported = false
+    this.stopReported = false
+    this.errorReported = false
+    this.bridge.start(durationMs)
+    this.polling = true
+    this.pollTimer = setInterval((): void => {
+      this.pollOnce()
+    }, 20) as number
+  }
+
+  /** 停止录音（松手）：桥内收尾后同步补一轮轮询，立刻回传尾帧与 onStop */
+  stop(): void {
+    this.bridge.stop()
+    this.pollOnce()
+    this.stopPolling()
+  }
+
+  /** 释放（页面销毁 / 弃用）：不回传 onStop */
+  release(): void {
+    this.stopPolling()
+    this.bridge.release()
+  }
+
+  /** 20ms 轮询：拉取 onError / onStart / onFrame / onStop 状态（stop 时同步调一次立即生效） */
+  private pollOnce(): void {
+    if (this.polling != true) {
+      return
+    }
+    // 错误优先：桥内错误 → 回传一次 onError 并停止轮询
+    if (this.errorReported != true) {
+      const err = this.bridge.takeError()
+      if (err.length > 0) {
+        this.errorReported = true
+        this.stopPolling()
+        const cb = this.onErrorCb
+        if (cb != null) {
+          const errObj = new UTSJSONObject()
+          errObj["errMsg"] = err
+          errObj["errSubject"] = "StreamPcmRecorder"
+          cb(errObj)
+        }
+        return
+      }
+    }
+    // onStart：引擎启动且首帧已到
+    if (this.startReported != true && this.bridge.hasStarted() == true) {
+      this.startReported = true
+      const cb = this.onStartCb
+      if (cb != null) {
+        cb(null)
+      }
+    }
+    // 帧：拉空 pending（base64 → ArrayBuffer → onFrame）
+    while (this.bridge.hasPendingChunk() == true) {
+      const b64 = this.bridge.takePendingChunk()
+      if (b64.length == 0) {
+        break
+      }
+      let ab: ArrayBuffer | null = null
+      try {
+        ab = uni.base64ToArrayBuffer(b64)
+      } catch (_eB64) {
+        ab = null
+      }
+      if (ab != null && ab!.byteLength > 0) {
+        const cb = this.onFrameCb
+        if (cb != null) {
+          try {
+            cb(ab!)
+          } catch (_eCb) {
+            // ignore
+          }
+        }
+      }
+    }
+    // onStop：桥已停止（曾真正开录）
+    if (this.stopReported != true && this.bridge.hasStopped() == true) {
+      this.stopReported = true
+      this.stopPolling()
+      const stopCb = this.onStopCb
+      if (stopCb != null) {
+        const filePath = this.bridge.stopFilePath()
+        const byteLength = this.bridge.stopByteLength()
+        const res = new UTSJSONObject()
+        res["tempFilePath"] = filePath
+        // 16kHz mono PCM16 = 32000 B/s → 时长(ms) = 字节数 / 32
+        res["duration"] = Math.floor(byteLength / 32)
+        res["fileSize"] = byteLength
+        res["format"] = "pcm"
+        stopCb(res)
+      }
+    }
+  }
+
+  private stopPolling(): void {
+    if (this.pollTimer != 0) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = 0
+    }
+    this.polling = false
+  }
+}

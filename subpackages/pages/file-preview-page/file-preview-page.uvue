@@ -84,6 +84,12 @@
             </view>
             <text class="share-option-label">{{ t("Mobile.FilePreview.shareToWechat") }}</text>
           </view>
+          <view class="share-sheet-option" @tap="handleShareSystem">
+            <view class="share-option-icon share-option-icon--system">
+              <svg-icon name="icon-ShareAltOutlined" size="44" color="#ffffff" />
+            </view>
+            <text class="share-option-label">{{ t("Mobile.FilePreview.shareSystem") }}</text>
+          </view>
           <!-- #endif -->
         </view>
         <view class="share-sheet-cancel" @tap="closeShareSheet">
@@ -216,17 +222,23 @@
     });
   };
 
+  /** 分享链接缓存：同一页面生命周期内只请求一次 shareKey，避免每次操作重复创建分享 */
+  let shareUrlCache: string | null = null;
+  const sharePopupRef = ref<any | null>(null);
+
   /**
-   * 分享流程守卫：从发起（含 getConversationShareKey 网络请求）到系统分享面板关闭期间
-   * 忽略重复点击，防止连点重复唤起多个分享面板。
+   * 分享流程守卫：分享面板打开期间忽略分享图标的重复点击，防止连点重复弹层；
+   * 面板关闭（onShareSheetVisible 回传 false）时解除。
    */
   let isSharing = false;
 
-  // 分享文件
-  const handleShare = async () => {
-    // 连点守卫：上一次分享尚未结束（分享链接请求中 / 系统面板未关闭）时直接忽略
-    if (isSharing) return;
-
+  /** 生成分享链接：纯 ?sk=，并经 stripPreviewMode 兜底——绝不让会话内预览标记 mode=preview 外泄到分享场景 */
+  const getShareUrl = async (): Promise<string> => {
+    // shareUrlCache 是异步闭包内会改写的 let，不能直接智能判空（Kotlin smart cast 限制），先取快照
+    const cached = shareUrlCache;
+    if (cached != null && cached.length > 0) {
+      return cached;
+    }
     if (baseUrl.length == 0) {
       throw new Error(t("Mobile.FilePreview.shareDomainMissing"));
     }
@@ -248,9 +260,6 @@
     if (refVal == null) {
       return;
     }
-
-    isSharing = true;
-
     try {
       const proxy = refVal as ComponentPublicInstance;
       proxy.$callMethod(methodName);
@@ -263,11 +272,52 @@
     callSharePopupMethod("open");
   };
 
-      // #ifdef APP
-      // App 端（Android / iOS / 鸿蒙）：唤起系统分享面板，把链接分享到设备上已安装的 App。
-      // uni.shareWithSystem 为内置 API（Android/iOS 4.33+，鸿蒙 4.61+ 走系统 Share Kit），
-      // 无需 manifest 配置分享模块、也无需重打自定义基座。
-      // Android 分享到微信时链接以纯文本呈现（微信会自动识别 URL），iOS 可生成链接卡片。
+  const closeShareSheet = (): void => {
+    callSharePopupMethod("close");
+  };
+
+  // 分享：展开底部面板（复制链接 / 分享到微信 / 系统分享）
+  const handleShare = (): void => {
+    // 连点守卫：面板已打开时忽略重复点击
+    if (isSharing) return;
+    // 面板未挂载时不置守卫，避免无处解锁导致分享按钮永久失灵
+    if ((sharePopupRef.value as any | null) == null) return;
+    isSharing = true;
+    openShareSheet();
+  };
+
+  // 与 uni-modal-popup 内部 visible 同步：面板关闭（取消/遮罩/下滑/选中项后 close）时解除连点守卫
+  const onShareSheetVisible = (visible: boolean): void => {
+    if (!visible) {
+      isSharing = false;
+    }
+  };
+
+  // 复制分享链接
+  const handleCopyLink = async (): Promise<void> => {
+    closeShareSheet();
+    try {
+      const previewUrlValue = await getShareUrl();
+      copyShareLinkToClipboard(previewUrlValue, t("Mobile.FilePreview.shareSuccess"));
+    } catch (error) {
+      console.error("复制链接失败:", error);
+      uni.showToast({
+        title: t("Mobile.FilePreview.shareFailed"),
+        icon: "none",
+        duration: 2000,
+      });
+    }
+  };
+
+  // #ifdef APP
+  // 系统分享：唤起系统分享面板，把链接分享到设备上已安装的任意 App。
+  // uni.shareWithSystem 为内置 API（Android/iOS 4.33+，鸿蒙 4.61+ 走系统 Share Kit），
+  // 无需 manifest 配置、无需重打基座。Android 分享到微信为纯文本（微信自动识别 URL），
+  // 要微信卡片请用面板上一项「分享到微信」（uni.share + 微信 SDK）。
+  const handleShareSystem = async (): Promise<void> => {
+    closeShareSheet();
+    try {
+      const previewUrlValue = await getShareUrl();
       uni.shareWithSystem({
         type: "text",
         summary: getShareTitle(),
@@ -279,22 +329,9 @@
           console.warn("[FilePreview] shareWithSystem failed:", res);
           copyShareLinkToClipboard(previewUrlValue, t("Mobile.FilePreview.shareFallbackCopied"));
         },
-        // 面板关闭（送出/取消/失败均触发 complete）后解除连点守卫
-        complete: (_res: any) => {
-          isSharing = false;
-        },
       });
-      // #endif
-
-      // #ifndef APP
-      // H5/WEB：无系统分享面板，保持复制链接到剪贴板
-      copyShareLinkToClipboard(previewUrlValue, t("Mobile.FilePreview.shareSuccess"));
-      isSharing = false;
-      // #endif
     } catch (error) {
-      // shareKey 请求失败等异常：解除守卫，允许用户重试
-      isSharing = false;
-      console.error("分享失败:", error);
+      console.error("系统分享失败:", error);
       uni.showToast({
         title: t("Mobile.FilePreview.shareFailed"),
         icon: "none",
@@ -302,6 +339,7 @@
       });
     }
   };
+  // #endif
 
   // #ifdef APP
   // 分享到微信：uni.share 图文卡片，聊天场景
@@ -676,6 +714,10 @@
 
             &.share-option-icon--wechat {
               background: #07c160;
+            }
+
+            &.share-option-icon--system {
+              background: #5856d6;
             }
           }
 

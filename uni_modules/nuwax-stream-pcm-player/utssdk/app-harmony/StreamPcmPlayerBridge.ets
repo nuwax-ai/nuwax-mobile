@@ -17,11 +17,12 @@ import { audio } from '@kit.AudioKit'
 /** 开始播放前的最小缓冲（音频 ms）：略攒一点再播，减少开局 underrun（对齐 Android START_PLAY_MS） */
 const START_PLAY_MS = 150
 /**
- * 队列积压字节上限（约 60s 音频 @16kHz mono16 = 1.92MB）。
+ * 队列积压字节上限（约 10 分钟音频 @16kHz mono16 = 19.2MB，对齐 Android）。
  * 生产（WS 投递）快于播放实时速度时队列会积压，超上限丢弃本帧（背压），保证不崩。
- * 鸿蒙侧 ArrayBuffer 为紧凑表示（1x 内存），上限主要为防积压本身失控。
+ * 10 分钟积压仅 ~19MB 堆，长回复（几分钟）不会触发丢帧；仅超长音频/极端生产过快才丢帧兜底。
+ * 旧值 1.92MB（60s）会让几十秒以上的长文本在服务端投递快于实时时大量丢帧，播放一分钟左右出现空洞卡顿。
  */
-const MAX_QUEUED_BYTES = 1920000
+const MAX_QUEUED_BYTES = 19200000
 /** renderer 内部缓冲时长估计（ms）：getBufferSize() 读取失败时的回退值 */
 const FALLBACK_TAIL_MS = 200
 /** 写循环空队列 / 未就绪时的轮询间隔（ms） */

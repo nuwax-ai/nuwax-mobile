@@ -32,11 +32,23 @@ const AUDIO_MODE_STREAM = 1
 const AUDIO_WRITE_NON_BLOCKING = 0
 /** 数字 0（UTS 中 0.toInt() 会被解析成小数，须用具名常量） */
 const INT_ZERO = 0
+/**
+ * 队列积压字节上限（约 60s 音频 @16kHz mono16 = 1.92MB）。
+ * 生产（WS 投递）快于播放实时速度时队列会积压，number[] 装箱表示 ~20x 放大内存，
+ * 无上限会在长音频（~4 分钟）把堆撑爆 OOM。超上限丢弃本帧（背压），保证不崩。
+ */
+const MAX_QUEUED_BYTES = 1920000
 
-/** 待写帧：主线程读出的字节数组 + 字节数（纯 Kotlin 数组，跨线程安全） */
+/** 待写帧：主线程读出的字节数组 + 字节数（纯 Kotlin 数组，跨线程安全）。
+ *  offset = 部分写入后的续写起点；totalLen = 入队时原始字节数（队列计数用）。 */
 class PcmFrame {
   nums: number[] = []
+  /** 剩余待写字节数（部分写入后递减） */
   len: number = 0
+  /** 续写偏移：从 nums[offset] 起写剩余字节 */
+  offset: number = 0
+  /** 入队时总字节数（队列背压计数用，写完整帧后释放） */
+  totalLen: number = 0
 }
 
 export class StreamPcmPlayer {
@@ -53,15 +65,19 @@ export class StreamPcmPlayer {
   private writtenBytes: AtomicLong | null = null
   /** 主线程已入队的总字节数（含队列积压；排空判定用它，避免队列未清空就提前结束） */
   private enqueuedBytes: AtomicLong | null = null
+  /** 当前在队（未写完整帧）的字节数：背压上限判定用，写完整帧后递减 */
+  private queuedBytes: AtomicLong | null = null
   private started: boolean = false
   /** 诊断：已写入帧数（release 日志用） */
   private framesWritten: number = 0
+  /** 诊断：因队列超上限被丢弃的帧数（正常播放应为 0，>0 说明生产远快于播放） */
+  private droppedFrames: number = 0
 
   /**
    * 创建 AudioTrack（MODE_STREAM，16bit mono），缓冲取 getMinBufferSize 与「1s 容量」较大者；
    * 启动后台写入线程。
    */
-  init(sampleRate: number): void {
+  initPlayer(sampleRate: number): void {
     this.releasePlayer()
     this.sampleRate = sampleRate > 0 ? sampleRate : 16000
     let minBuf = 0
@@ -93,8 +109,10 @@ export class StreamPcmPlayer {
     }
     this.writtenBytes = new AtomicLong(0)
     this.enqueuedBytes = new AtomicLong(0)
+    this.queuedBytes = new AtomicLong(0)
     this.started = false
     this.framesWritten = 0
+    this.droppedFrames = 0
     this.queue = new LinkedBlockingQueue()
     this.running = true
     const q = this.queue
@@ -127,33 +145,36 @@ export class StreamPcmPlayer {
           }
           frame = item as PcmFrame
         }
-        // len=0 空帧 = release 哨兵
-        if (frame == null || frame.len <= 0 || frame.nums.length == 0) {
+        // len<=0 空帧 = release 哨兵；offset 越界防御（不应发生，兜底）
+        if (frame == null || frame.len <= 0 || frame.offset >= frame.nums.length) {
           break
         }
         try {
-          // 后台线程：把主线程读出的 number[] 转成可写 ByteBuffer（逐字节，成本全在后台）
-          const len = frame.len.toInt()
-          const bb = ByteBuffer.allocate(len)
-          for (let i = 0; i < frame.len; i++) {
-            bb.put(frame.nums[i].toByte())
+          // 后台线程：从 frame.offset 起把剩余 number[] 转成可写 ByteBuffer（逐字节，成本全在后台）
+          const remaining = frame.len.toInt()
+          const bb = ByteBuffer.allocate(remaining)
+          for (let i = 0; i < remaining; i++) {
+            bb.put(frame.nums[frame.offset + i].toByte())
           }
           bb.rewind()
           const written = track.write(
             bb,
-            len,
+            remaining,
             AUDIO_WRITE_NON_BLOCKING.toInt(),
           )
-          if (written >= len) {
-            this.writtenBytes!.addAndGet(len.toLong())
+          if (written >= remaining) {
+            // 整帧写完：释放队列字节计数（背压额度归还），进度按原始总长累加
+            this.queuedBytes!.addAndGet(-frame.totalLen.toLong())
+            this.writtenBytes!.addAndGet(frame.totalLen.toLong())
             this.framesWritten += 1
           } else if (written > 0) {
-            // 部分写入：写入的字节计数，剩余留在重试（不再阻塞）
+            // 部分写入：偏移前进、剩余递减，下一轮从新偏移续写（不再整帧重写）
+            frame.offset += written
+            frame.len = remaining - written
             this.writtenBytes!.addAndGet(written.toLong())
             this.retryFrame = frame
-            this.framesWritten += 1
           } else {
-            // 缓冲满：整个帧留待重试；小睡让 track 腾缓冲，避免忙等
+            // 缓冲满：整帧留待重试；小睡让 track 腾缓冲，避免忙等
             this.retryFrame = frame
             try {
               Thread.sleep(10)
@@ -185,6 +206,13 @@ export class StreamPcmPlayer {
       return
     }
     const len = chunk.length
+    // 背压：队列在队字节超上限时丢弃本帧，防长音频/生产过快导致 OOM。
+    // 正常播放（消费 ≈ 实时）不会触发；触发时音频有短暂缺口但 app 不崩。
+    const qb = this.queuedBytes
+    if (qb == null || qb.get() + len > MAX_QUEUED_BYTES) {
+      this.droppedFrames += 1
+      return
+    }
     // 主线程读 Uint8Array 元素（uni-app x 共享游标：同一 buffer 只能读一次，重复读返回 0），
     // 只读这一次转成 number[] 入队，此后绝不再碰该 Uint8Array。
     const nums: number[] = []
@@ -194,8 +222,10 @@ export class StreamPcmPlayer {
     const frame = new PcmFrame()
     frame.nums = nums
     frame.len = len
+    frame.totalLen = len
     try {
       q.put(frame)
+      qb.addAndGet(len.toLong())
       this.enqueuedBytes!.addAndGet(len.toLong())
     } catch (_ePut) {
       // ignore
@@ -297,10 +327,12 @@ export class StreamPcmPlayer {
 
   /** 停止后台线程并释放 AudioTrack（幂等） */
   releasePlayer(): void {
-    // 诊断：释放时的终态（enqueued/written/played/帧数）
+    // 诊断：释放时的终态（enqueued/written/played/帧数/丢弃帧）
     console.log(
       '[StreamPcmPlayer] release frames=' +
         this.framesWritten +
+        ' droppedFrames=' +
+        this.droppedFrames +
         ' enqueuedMs=' +
         this.getEnqueuedMs() +
         ' writtenMs=' +
@@ -334,6 +366,7 @@ export class StreamPcmPlayer {
     this.track = null
     this.writtenBytes = null
     this.enqueuedBytes = null
+    this.queuedBytes = null
     this.started = false
     if (track != null) {
       try {

@@ -16,8 +16,8 @@ public class StreamPcmPlayerBridge {
     private var started = false
     private var pending = Data()
     private let bytesPerFrame: Int64 = 2 // PCM16 mono
-    /** 背压上限：已推送未播放积压超过该字节数时丢弃新帧（~60s 音频 @16kHz mono16，与 Android 上限一致） */
-    private let maxBacklogBytes: Int64 = 60 * 32000
+    /** 背压上限：已推送未播放积压超过该字节数时丢弃新帧（~10 分钟音频 @16kHz mono16，对齐 Android；旧值 60s 会让长文本投递快于实时时丢帧卡顿） */
+    private let maxBacklogBytes: Int64 = 600 * 32000
     /** 诊断：因积压超上限被丢弃的字节数（正常播放应为 0） */
     private var droppedBytes: Int64 = 0
 

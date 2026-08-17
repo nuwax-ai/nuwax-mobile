@@ -16,6 +16,10 @@ public class StreamPcmPlayerBridge {
     private var started = false
     private var pending = Data()
     private let bytesPerFrame: Int64 = 2 // PCM16 mono
+    /** 背压上限：已推送未播放积压超过该字节数时丢弃新帧（~60s 音频 @16kHz mono16，与 Android 上限一致） */
+    private let maxBacklogBytes: Int64 = 60 * 32000
+    /** 诊断：因积压超上限被丢弃的字节数（正常播放应为 0） */
+    private var droppedBytes: Int64 = 0
 
     public init() {}
 
@@ -38,6 +42,7 @@ public class StreamPcmPlayerBridge {
         self.playedBytes = 0
         self.started = false
         self.pending = Data()
+        self.droppedBytes = 0
         do {
             try engine.start()
         } catch {
@@ -49,12 +54,23 @@ public class StreamPcmPlayerBridge {
     /// UTS 侧以 base64 字符串传入 PCM16 字节（iOS 桥接 Uint8Array 参数会崩，统一走 base64）
     public func pushBase64(_ b64: String) {
         guard let data = Data(base64Encoded: b64), !data.isEmpty else { return }
+        // 背压：已推送未播放积压超过上限时丢弃本帧，防长音频/生产过快导致内存无限增长。
+        // 正常播放（消费≈实时）不会触发；触发时音频有短暂缺口但 app 不崩。
+        if writtenBytes - playedBytes > maxBacklogBytes {
+            droppedBytes += Int64(data.count)
+            return
+        }
         pending.append(data)
         writtenBytes += Int64(data.count)
         // 攒够 ~100ms(3200B) 再调度，避免每帧 scheduleBuffer 卡顿
         if pending.count >= 3200 {
             flushPending()
         }
+    }
+
+    /// 诊断：因积压超上限被丢弃的字节数
+    public func getDroppedBytes() -> NSNumber {
+        return NSNumber(value: droppedBytes)
     }
 
     public func flushPending() {

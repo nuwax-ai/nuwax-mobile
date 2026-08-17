@@ -11,7 +11,7 @@
 | 🔴 阻断 | 积分/订阅在 iOS 走微信/支付宝 | 3.1.1 / 3.1.2（数字商品须 IAP） | ✅ 已处理（2026-08-17 方案 A，条件编译屏蔽） |
 | 🔴 阻断 | 缺「删除账号」入口 | 5.1.1(v) | ⏳ 后端确认已有 API，等接口契约后接 UI |
 | 🔴 阻断 | 隐私清单 / Info.plist | ITMS-91053 / 权限崩溃 | ✅ 打包路线定为**云打包**；已建 `nativeResources/ios/PrivacyInfo.xcprivacy`，manifest 权限描述云打包直接生效 |
-| 🔴 阻断 | 中国区上架需 ICP 备案 | App Store 中国区政策 | ⏳ 待确认备案状态 |
+| 🔴 阻断 | 中国区上架需 ICP 备案 | App Store 中国区政策 | ✅ 已确认：蜀ICP备20012194号-11A |
 | 🟡 缺陷 | iOS 退出登录后不跳转登录页 | —（审核员可感知） | ✅ 已修复（mine + history-conversation-popup 两处补 `APP-IOS`） |
 | 🟡 确认 | 微信分享 Universal Link / AASA | 分享回调失效 | ⏳ 待线上验证（profile 已含 associated-domains，云打包已通过） |
 | 🟢 就绪 | 权限描述 / 隐私政策 / 图标等 | — | 见下文清单 |
@@ -40,16 +40,17 @@
 - [x] 方案 A（快，**已实施 2026-08-17**）：iOS 端条件编译屏蔽积分/订阅购买入口，保留查看（订单/订阅状态只读）；实物订单不动。**入口清单（按产品确认口径）**：
   - 「我的」tab：
     - 「我的订阅」菜单项整个隐藏 → `pages/mine/mine.uvue`（模板层 `#ifndef APP-IOS`）
+    - 「我的订单」菜单项整个隐藏（2026-08-17 三轮：iOS 全端无订单/支付链路，与备案备注「不含支付」对齐）→ 同上
     - 积分卡「增购」按钮隐藏 → `components/credits-breakdown/credits-breakdown.uvue`（模板 + emit 双保险；mine.uvue 的 `handleAddPurchase` 同步条件编译）
-    - 「我的订单」保留入口，订单卡「去支付」仅 `bizType == DESK_BUDDY` 展示，`CREDIT_PURCHASE` / `SUBSCRIPTION` 类型不展示 → `subpackages/pages/my-orders/components/order-card/order-card.uvue` `showPayButton`
   - 应用详情页侧栏（`subpackages/pages/app-details/history-conversation-popup/`）：
     - 积分区「增购」action 隐藏（总积分仍展示）、跳转 my-subscriptions 的 `handleGoSubscriptions` 不编译
     - 「立即订阅」按钮隐藏（`app-details.uvue` 的 agent-subscription-modal 仅由此触发，源头已断）
   - 会话详情（chat-conversation-component）：
     - more-popup「我的订阅」菜单项 iOS 隐藏（`payEntryBlocked` + 弹窗高度联动）
     - `AgentDetailService.uts` `handleCheckSubscriptionLimit` iOS 不自动弹订阅（支付/会议订阅）弹窗、不禁用输入框（避免无支付渠道时用户被锁死在会话中，超额由后端错误提示）
-  - 防御层：`subpackages/pages/my-subscriptions/my-subscriptions.uvue` onLoad 强制 `hidePlans = true`（即使有残留路径进入也只显示订阅状态，无购买卡片）
-  - 保留：`pages/terminal/components/desk-buddy-order-modal.uvue`（实物设备订单，3.1.5(a) 合法走微信/支付宝）
+  - 终端 tab（三轮新增）：硬件购买列表（产品购买卡，`pages/terminal/terminal.uvue`）iOS 整体隐藏，`desk-buddy-order-modal` 失去触发入口
+  - 防御层：`subpackages/pages/my-subscriptions/my-subscriptions.uvue` onLoad 强制 `hidePlans = true`（即使有残留路径进入也只显示订阅状态，无购买卡片）；`order-card.uvue` 「去支付」限 `DESK_BUDDY`（入口已隐藏，纯防御保留）
+  - ~~保留 desk-buddy 实物订单~~（三轮推翻：iOS 全端无支付，与备案备注「不含支付功能」完全一致；实物购买待备案变更后再放开）
 - [ ] 方案 B（长）：接入 Apple IAP（消耗型积分 + 自动续订订阅），后端增加 IAP 收据校验与发货（后续版本再议）
 
 ### 2. 缺「删除账号」功能 —— Guideline 5.1.1(v)
@@ -81,10 +82,11 @@
 
 > 离线打包路线（UniAppXDemo 空 `<dict/>` 隐私清单 + Info.plist 缺权限描述）**已弃用**，仅调试基座继续用本地打包，与提审无关。
 
-### 4. 中国大陆区上架需 ICP 备案
+### 4. 中国大陆区上架需 ICP 备案（✅ 已确认 2026-08-17）
 
-- 2023-10 起 App Store 中国区强制要求填写 ICP 备案号，无备案只能上非中国区店面
-- [ ] 确认 `nuwax.com` 主备案 + App 作为服务形式列入备案（App 备案，非仅网站备案）；未完成前提审选择除中国大陆外的发行区域
+- App 备案号：**蜀ICP备20012194号-11A**（蜀 = 四川，`-11A` 后缀 = App 备案形态）
+- App Store Connect → App 信息 → 「ICP 备案号」字段填写此号（中国区发行必填，填写后苹果会向工信部核验，通常数分钟~1 天生效）
+- 注意：提审包的 bundle id `com.nuwax.app` 须与备案登记的 App 名称/包名一致，不一致会被驳回
 
 ---
 
@@ -144,6 +146,7 @@ manifest.json:111 配置 `universalLink: https://link.nuwax.com/wechat/`。
 
 ## 变更记录
 
+- **2026-08-17（三轮，对齐备案口径）**：iOS「我的订单」菜单项整个隐藏；终端 tab 硬件购买列表（产品购买卡）隐藏 —— iOS 全端无支付/订单链路，落实备案备注「不含支付功能」A 方案。`NuwaxApp(Dev).08172016` 云打包经 JS 标记验证为**二轮前旧包**（含 `setStorageSync("SUB_BACK_URL"`），仅一轮改动，不可用于回归/提审。
 - **2026-08-17（二轮，按产品细化口径）**：「我的订阅」菜单项整个隐藏（mine）；订单卡「去支付」限 `bizType == DESK_BUDDY`；应用详情侧栏增购 action + 立即订阅按钮隐藏；确认「会议订阅弹窗」= 会话详情 agent-subscription-modal（一轮已挡自动弹出与入口）。
 - **2026-08-17（一轮）**：方案 A 实施（5 处支付入口条件编译）+ logout 两处补 `APP-IOS` + 新增 `nativeResources/ios/PrivacyInfo.xcprivacy` + 打包路线定云打包。云打包 profile 侧 associated-domains 已修复（Identifiers 开能力 + regenerate profile）。
 

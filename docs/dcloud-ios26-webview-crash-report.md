@@ -79,6 +79,7 @@ WebKit  WebKit::WebBackForwardList::didReceiveMessage(IPC::Connection&, IPC::Dec
 
 ## 参考
 
+- **DCloud 反馈 #32189**（2026-08-17 14:10，状态：待确认/沟通中）：「【App-iOS】后台切回前台发生批量 SIGPIPE，主线程集中在 WebKit/JavaScriptCore」，5.24 运行时 —— **疑似同族**（同为 iOS + 5.24 + WebKit/JSC 主线程崩溃，触发路径不同：本 issue 为 web-view 建销，彼为前后台切换）。建议合并排查。
 - react-native-webview #3918「iOS crash: EXC_BAD_ACCESS in iOS 26+ when mounting/dismounting WebView」同族（iOS 26 WKWebView 挂载/卸载回归）
 - Apple Developer Forums thread 823093
 

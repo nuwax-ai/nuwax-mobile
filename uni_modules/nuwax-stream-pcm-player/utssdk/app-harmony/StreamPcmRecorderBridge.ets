@@ -16,6 +16,7 @@
 
 import { audio } from '@kit.AudioKit'
 import { fileIo as fs } from '@kit.CoreFileKit'
+import { BusinessError } from '@kit.BasicServicesKit'
 
 export class StreamPcmRecorderBridge {
   private capturer: audio.AudioCapturer | null = null
@@ -126,7 +127,13 @@ export class StreamPcmRecorderBridge {
         }, durationMs)
       }
     } catch (eInit) {
-      console.error('[StreamPcmRecorderBridge] createAudioCapturer failed', eInit)
+      // 该 try 同时含 createAudioCapturer / fs.openSync / capturer.start，勿误导归因到 capturer
+      // 记录 BusinessError.code：13900020=文件路径非法、401/201/6800301=capturer 参数/权限/设备
+      const errInfo = eInit as BusinessError
+      console.error(
+        '[StreamPcmRecorderBridge] initCapturer failed code=' + errInfo.code,
+        eInit,
+      )
       const file = this.file
       this.file = null
       if (file != null) {

@@ -561,6 +561,10 @@ export class TtsWebSocketPlayer {
   private readonly STREAM_FLUSH_END_WATCHDOG_MS: number = 8000;
   /** no-audio 看门狗续等次数上限：超过仍无任何 PCM 即判死（默认 12s × (1+2) ≈ 36s） */
   private readonly NATIVE_NO_AUDIO_REARM_LIMIT: number = 2;
+  /** 排空进度检测窗口（ms）：inputDone 后每窗口结算一次播放头推进 */
+  private readonly NATIVE_DRAIN_PROGRESS_WINDOW_MS: number = 5000;
+  /** 排空进度检测：单窗口内播放头最小推进（ms），低于视为渲染器/写循环卡死 */
+  private readonly NATIVE_DRAIN_MIN_PROGRESS_MS: number = 500;
   /** 播放端队列排空时请求的按需切段标记：有标记则切段不再等阈值（成功切段后清除） */
   private streamForcePending: boolean = false;
 
@@ -586,6 +590,10 @@ export class TtsWebSocketPlayer {
   private nativeNoAudioTimerId: number = 0;
   /** 该看门狗已续等次数（NATIVE_NO_AUDIO_REARM_LIMIT 封顶，防无反馈时无限 re-arm） */
   private nativeNoAudioRearmCount: number = 0;
+  /** 排空进度检测：窗口起点时刻（0=未初始化，inputDone 后首个检查初始化） */
+  private lastDrainProgressAtMs: number = 0;
+  /** 排空进度检测：窗口起点时的 playedMs */
+  private lastDrainPlayedMs: number = 0;
   // #endif
 
   /**
@@ -1494,9 +1502,10 @@ export class TtsWebSocketPlayer {
       return;
     }
     if (this.streamInputDone == true) {
-      // 用入队总量算 deadline（含队列积压），避免长音频在积压未播完时被兜底掐断
-      const deadline =
-        this.streamInputDoneAtMs + player.getEnqueuedMs() + 30000;
+      // 兜底 deadline 按「剩余积压」算（入队总量 − 已播部分）：
+      // 若按入队总量算，长音频在播放头卡住时 deadline = 整段时长+30s，判死要等几分钟，形同虚设。
+      const remainingMs = player.getEnqueuedMs() - player.getPlayedMs();
+      const deadline = this.streamInputDoneAtMs + remainingMs + 30000;
       if (Date.now() > deadline) {
         // 诊断：兜底超时触发（播放头可能卡住未推进）
         console.warn(
@@ -1505,13 +1514,46 @@ export class TtsWebSocketPlayer {
             " writtenMs=" +
             player.getWrittenMs() +
             " playedMs=" +
-            player.getPlayedMs(),
+            player.getPlayedMs() +
+            " remainingMs=" +
+            remainingMs,
         );
         this.clearStreamDrainPoll();
         this.releaseStreamPcmPlayer();
         this.streamEnded = true;
         this.notifyStreamEnd();
         return;
+      }
+      // 播放头进度冻结检测：写循环卡死/渲染器不消费时 playedMs 停止推进。
+      // 每窗口结算一次；窗口内推进不足即判定卡死，快速收尾复位图标（而非等 deadline）。
+      if (this.lastDrainProgressAtMs == 0) {
+        this.lastDrainProgressAtMs = Date.now();
+        this.lastDrainPlayedMs = player.getPlayedMs();
+      } else if (
+        Date.now() - this.lastDrainProgressAtMs >=
+        NATIVE_DRAIN_PROGRESS_WINDOW_MS
+      ) {
+        const advanced = player.getPlayedMs() - this.lastDrainPlayedMs;
+        this.lastDrainProgressAtMs = Date.now();
+        this.lastDrainPlayedMs = player.getPlayedMs();
+        if (advanced < NATIVE_DRAIN_MIN_PROGRESS_MS) {
+          console.warn(
+            "[TTS] native drain stalled: playedMs=" +
+              player.getPlayedMs() +
+              " writtenMs=" +
+              player.getWrittenMs() +
+              " advanced=" +
+              advanced +
+              " in " +
+              NATIVE_DRAIN_PROGRESS_WINDOW_MS +
+              "ms",
+          );
+          this.clearStreamDrainPoll();
+          this.releaseStreamPcmPlayer();
+          this.streamEnded = true;
+          this.notifyStreamEnd();
+          return;
+        }
       }
     }
     this.armStreamDrainPoll();
@@ -1691,6 +1733,8 @@ export class TtsWebSocketPlayer {
     this.streamInputDone = false;
     this.streamInputDoneAtMs = 0;
     this.nativeNoAudioRearmCount = 0;
+    this.lastDrainProgressAtMs = 0;
+    this.lastDrainPlayedMs = 0;
     this.releaseStreamPcmPlayer();
     // #endif
     this.pendingFeedTexts = [] as string[];

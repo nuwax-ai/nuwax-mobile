@@ -24,19 +24,31 @@ import { audioPlayerManager } from "./audioPlayerManager";
 import { clearMessageIdRewrite } from "./speechIdRewrite";
 
 /** 单次喂入最短字数：更短以便更快出声 */
-const MIN_UTTERANCE_CHARS = 3;
+const MIN_UTTERANCE_CHARS = 2;
 
 /**
- * 单次喂入文本上限（字符）。服务端按 text 帧逐句合成、逐帧推流，帧与帧之间有任务切换间隙；
- * 合并成大块喂入可把任务数降一个量级（300 字 ≈ 每句 16 字的 19 倍），从而显著减少帧间停顿。
+ * 单次喂入文本上限（字符）。生产节流（FEED_PACING_BUFFER_MS=12s）后单块不宜过大：
+ * 300 字 ≈ 1 分钟音频会把缓冲顶到 ~60s、停止浪费一整块合成。
+ * 80 字 ≈ 3~4 句 / ~18s 音频，与节流缓冲同量级——稳态缓冲 12~18s，
+ * 既消除短句碎片（80/16 ≈ 5 倍任务削减），又保持「在途 3~4 句」的目标。
  */
-const MAX_MERGED_UTTERANCE_CHARS = 300;
+const MAX_MERGED_UTTERANCE_CHARS = 80;
 
 /**
  * 等待段/会话结束的兜底超时：服务端中途停流（无新帧且不发 tts_end）时
  * 强制结束本轮，防止播放循环永久悬挂、图标不复位。
  */
 const STREAM_SEGMENT_WAIT_TIMEOUT_MS = 15000;
+
+/**
+ * 生产节流阈值（原生流式）：播放缓冲（enqueuedMs − playedMs）低于该值才喂下一句。
+ * 服务端只合成「即将播放」的 2~3 句（典型句 3~4s）——中途停止浪费有限；
+ * PCM 到达匹配播放节奏 → 队列不积压 → 长文本不再逼近背压上限、不丢帧。
+ * 句长突发（长句/合并块一次回 10s+）会短暂超出该值，但受句子长度而非文本总长约束。
+ */
+const FEED_PACING_BUFFER_MS = 10000;
+/** 生产节流轮询间隔：缓冲未达标时每 200ms 复查一次 */
+const FEED_PACING_POLL_MS = 200;
 
 /** 会话切好的待播段（src + 估算时长） */
 class ReadyUtterance {
@@ -433,6 +445,31 @@ export class VoiceStreamSpeaker {
         }
         if (utt.trim().length == 0) {
           continue;
+        }
+        // 生产节流（原生流式）：缓冲未低于阈值前不喂下一句。
+        // 让服务端只合成即将播放的内容：中途停止浪费 ≤ 在途 1~2 句；
+        // 队列保持秒级 → 长文本不积压、不丢帧。非原生（getNativeBufferedMs=-1）不节流。
+        while (
+          this.active == true &&
+          this.streamEnded != true &&
+          expectedRound == this.round
+        ) {
+          const buffered = ttsWebSocketPlayer.getNativeBufferedMs();
+          if (buffered < 0 || buffered < FEED_PACING_BUFFER_MS) {
+            break;
+          }
+          await new Promise<void>((resolve) => {
+            setTimeout(() => {
+              resolve();
+            }, FEED_PACING_POLL_MS);
+          });
+        }
+        if (
+          this.active != true ||
+          this.streamEnded == true ||
+          expectedRound != this.round
+        ) {
+          break;
         }
         ttsWebSocketPlayer.feedStreamText(utt, false);
         // 让出主线程：SSE 洪峰时否则 TTS WS / 音频回调要等会话结束后才被调度

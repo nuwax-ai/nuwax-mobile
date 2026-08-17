@@ -1,48 +1,39 @@
 /**
  * 通用分享 Hook
  *
- * 从 file-preview-page 抽出的分享交互逻辑，统一：
- * - H5/WEB：展开自绘底部面板，仅「复制链接」
+ * 统一 H5/WEB 与 App 的分享交互：
+ * - H5/WEB：点击分享直接复制链接到剪贴板并 toast 提示
  * - App：直接唤起系统分享面板（uni.shareWithSystem），失败兜底复制链接
  * - MP-WEIXIN：不适用本 Hook，小程序分享统一走原生 onShareAppMessage / onAddToFavorites，
  *   调用方无需（也不应）在小程序端渲染分享按钮
  *
  * 分享链接怎么来（是否需要网络请求、是否需要缓存）由调用方通过 getShareUrl 决定，
- * Hook 本身只负责交互层：面板开合、系统分享调起、防重、复制成功/失败提示。
+ * Hook 本身只负责交互层：复制/系统分享调起、防重、成功/失败提示。
  *
- * 使用方式（与仓库内其它 hooks 一致的“hook 出状态 + 页面持有同名变量供模板 ref 绑定”模式）：
+ * 使用方式（与仓库内其它 hooks 一致的“hook 出状态 + 页面持有同名变量”模式）：
  * 入参须 `new ShareLinkOptions()` 后逐字段赋值，不能传内联对象字面量（见 ShareLinkOptions 注释）。
  *
  *   const shareOptions = new ShareLinkOptions();
  *   shareOptions.getShareTitle = () => pageTitle.value;
  *   shareOptions.getShareUrl = async () => buildShareUrl();
  *   const share = useShareLink(shareOptions);
- *   const sharePopupRef = share.sharePopupRef;
  *   const handleShare = share.handleShare;
- *   const closeShareSheet = share.closeShareSheet;
- *   const handleCopyLink = share.handleCopyLink;
  *
  * 模板：
  *   导航栏右侧分享入口 —— <svg-icon name="icon-ShareAltOutlined" size="48" @click="handleShare" />
- *   H5/WEB 专用底部面板（App 不渲染此层，点击分享直接唤起系统面板）：
- *     <!-- #ifdef H5 || WEB -->
- *     <uni-modal-popup ref="sharePopupRef" ...>
- *       ... @tap="handleCopyLink" ... @tap="closeShareSheet"
- *     </uni-modal-popup>
- *     <!-- #endif -->
+ *   无需额外渲染任何分享面板组件，H5/WEB 点击即直接复制。
  */
-import { ref, type ComponentPublicInstance, type Ref } from "vue";
 import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
 
 const _params = emptyI18nParams();
 const t = (key: string): string => translateFn(key, _params, "");
 
 /**
- * 分享防重：基于「面板打开时间戳」的节流窗口（毫秒），距离上次面板打开不足窗口期的点击直接忽略。
+ * 分享防重：基于「上次分享触发时间戳」的节流窗口（毫秒），距离上次触发不足窗口期的点击直接忽略。
  * 刻意不依赖系统面板回调解锁：Android 端 shareWithSystem 的 complete 可能在面板刚打开时就回调，
  * 不能作为「面板已关闭」的可靠信号（曾因此连点复现多面板）。
- * 时间戳只在「面板真正打开前」刷新：App 在 launchSystemShare 调用 shareWithSystem 前；
- * H5 在 openShareSheet 前（同步，等价于打开时刻）。
+ * 时间戳只在「真正触发分享前」刷新：App 在 launchSystemShare 调用 shareWithSystem 前；
+ * H5/WEB 在发起复制前（同步，等价于触发时刻）。
  */
 const SHARE_DEBOUNCE_WINDOW_MS = 1000;
 
@@ -64,25 +55,11 @@ export class ShareLinkOptions {
 
 /** Hook 返回值（class 避免 UTS interface 对象字面量限制，与仓库内其它 hooks 一致） */
 export class ShareLinkResult {
-  /** H5/WEB 底部分享面板（uni-modal-popup）ref；App 端不使用，但统一声明便于调用方模板绑定 */
-  sharePopupRef: Ref<any | null>;
-  /** 导航栏分享按钮点击入口：H5/WEB 展开底部面板；App 直接唤起系统分享 */
+  /** 导航栏分享按钮点击入口：H5/WEB 直接复制链接；App 直接唤起系统分享 */
   handleShare: () => void;
-  /** 关闭 H5/WEB 分享面板 */
-  closeShareSheet: () => void;
-  /** H5/WEB 面板内「复制链接」选项 */
-  handleCopyLink: () => Promise<void>;
 
-  constructor(
-    sharePopupRef: Ref<any | null>,
-    handleShare: () => void,
-    closeShareSheet: () => void,
-    handleCopyLink: () => Promise<void>,
-  ) {
-    this.sharePopupRef = sharePopupRef;
+  constructor(handleShare: () => void) {
     this.handleShare = handleShare;
-    this.closeShareSheet = closeShareSheet;
-    this.handleCopyLink = handleCopyLink;
   }
 }
 
@@ -91,9 +68,6 @@ export function useShareLink(options: ShareLinkOptions): ShareLinkResult {
   const getShareUrl = options.getShareUrl;
 
   let lastSharePanelOpenAt = 0;
-
-  /** H5/WEB 自绘分享面板 ref；App/小程序不使用，统一声明避免调用方按平台分支取值 */
-  const sharePopupRef = ref<any | null>(null);
 
   /** 复制分享链接到剪贴板：H5/WEB 的分享主路径，App 端系统分享失败时的兜底 */
   const copyShareLinkToClipboard = (url: string, successTitle: string): void => {
@@ -116,31 +90,8 @@ export function useShareLink(options: ShareLinkOptions): ShareLinkResult {
     });
   };
 
-  // #ifdef H5 || WEB
-  /** Android：Gen* 组件 ref 禁止 as UTSJSONObject，用 $callMethod 调 uni-modal-popup */
-  const callSharePopupMethod = (methodName: string): void => {
-    const refVal = sharePopupRef.value as any | null;
-    if (refVal == null) {
-      return;
-    }
-    try {
-      const proxy = refVal as ComponentPublicInstance;
-      proxy.$callMethod(methodName);
-    } catch (_e) {
-      // ignore
-    }
-  };
-
-  const openShareSheet = (): void => {
-    callSharePopupMethod("open");
-  };
-
-  const closeShareSheet = (): void => {
-    callSharePopupMethod("close");
-  };
-
-  const handleCopyLink = async (): Promise<void> => {
-    closeShareSheet();
+  /** 取链接并复制到剪贴板：H5/WEB 分享的唯一路径 */
+  const copyShareLink = async (): Promise<void> => {
     try {
       const shareUrlValue = await getShareUrl();
       copyShareLinkToClipboard(shareUrlValue, t("Mobile.Share.shareSuccess"));
@@ -153,11 +104,6 @@ export function useShareLink(options: ShareLinkOptions): ShareLinkResult {
       });
     }
   };
-  // #endif
-  // #ifndef H5 || WEB
-  const closeShareSheet = (): void => {};
-  const handleCopyLink = async (): Promise<void> => {};
-  // #endif
 
   // #ifdef APP
   /**
@@ -170,7 +116,7 @@ export function useShareLink(options: ShareLinkOptions): ShareLinkResult {
   const launchSystemShare = async (): Promise<void> => {
     try {
       const shareUrlValue = await getShareUrl();
-      // 面板打开前去重：并发流程（多次连点穿过入口检查）在此收敛为一次；
+      // 分享前去重：并发流程（多次连点穿过入口检查）在此收敛为一次；
       // 通过后刷新时间戳，面板展示期间（SHARE_DEBOUNCE_WINDOW_MS 内）的点击都会被入口拦截。
       const nowMs = Date.now();
       if (nowMs - lastSharePanelOpenAt < SHARE_DEBOUNCE_WINDOW_MS) {
@@ -200,17 +146,14 @@ export function useShareLink(options: ShareLinkOptions): ShareLinkResult {
   };
   // #endif
 
-  // 分享：H5/WEB 展开底部面板（复制链接）；App 直接唤起系统分享面板
+  // 分享：H5/WEB 直接复制链接；App 直接唤起系统分享面板
   const handleShare = (): void => {
-    // 节流入口：距上次面板打开不足窗口期的连点直接忽略（不依赖任何回调解锁）
+    // 节流入口：距上次触发不足窗口期的连点直接忽略（不依赖任何回调解锁）
     if (Date.now() - lastSharePanelOpenAt < SHARE_DEBOUNCE_WINDOW_MS) return;
 
     // #ifdef H5 || WEB
-    // 面板未挂载时不刷新时间戳，用户可稍后重试
-    if ((sharePopupRef.value as any | null) == null) return;
-    // 打开是同步操作，此处刷新等价于「面板打开时刻」
     lastSharePanelOpenAt = Date.now();
-    openShareSheet();
+    copyShareLink();
     // #endif
 
     // #ifdef APP
@@ -218,7 +161,7 @@ export function useShareLink(options: ShareLinkOptions): ShareLinkResult {
     // #endif
   };
 
-  return new ShareLinkResult(sharePopupRef, handleShare, closeShareSheet, handleCopyLink);
+  return new ShareLinkResult(handleShare);
 }
 
 export default useShareLink;

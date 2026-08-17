@@ -105,6 +105,8 @@ export class VoiceStreamSpeaker {
   private readySegments: ReadyUtterance[] = [];
   /** 文本喂入循环运行标记 */
   private feeding: boolean = false;
+  /** 原生流式：本轮是否已喂出首个 feed（首个无条件放行触发服务端合成，之后按缓冲节流） */
+  private nativeFeedStarted: boolean = false;
   /** 段就绪 / 会话结束的等待器（kickPlay 挂起，回调唤醒） */
   private segmentWaiter: (() => void) | null = null;
   /** 段等待兜底超时（停流时强制收尾，防悬挂） */
@@ -142,6 +144,7 @@ export class VoiceStreamSpeaker {
     this.streamEnded = false;
     this.playLooping = false;
     this.feeding = false;
+    this.nativeFeedStarted = false;
     this.segmentWaiter = null;
     this.clearSegmentWaitTimer();
     this.onPendingEnqueued = null;
@@ -448,21 +451,29 @@ export class VoiceStreamSpeaker {
         }
         // 生产节流（原生流式）：缓冲未低于阈值前不喂下一句。
         // 让服务端只合成即将播放的内容：中途停止浪费 ≤ 在途 1~2 句；
-        // 队列保持秒级 → 长文本不积压、不丢帧。非原生（getNativeBufferedMs=-1）不节流。
-        while (
-          this.active == true &&
-          this.streamEnded != true &&
-          expectedRound == this.round
-        ) {
-          const buffered = ttsWebSocketPlayer.getNativeBufferedMs();
-          if (buffered < 0 || buffered < FEED_PACING_BUFFER_MS) {
-            break;
+        // 队列保持秒级 → 长文本不积压、不丢帧。非原生（isStreamNativeMode=false）不节流。
+        // 注意：getNativeBufferedMs()=-1 表示播放器尚未创建（首个音频帧未到）。
+        // 若此时放行，会在开局把整篇句子一次灌给服务端 → 服务端快速合成整篇 → 积压丢帧。
+        // 仅会话首个 feed 无条件放行（触发服务端开始合成），此后 -1 也等待播放器就绪。
+        if (ttsWebSocketPlayer.isStreamNativeMode()) {
+          while (
+            this.active == true &&
+            this.streamEnded != true &&
+            expectedRound == this.round
+          ) {
+            const buffered = ttsWebSocketPlayer.getNativeBufferedMs();
+            if (buffered < 0 && this.nativeFeedStarted != true) {
+              break;
+            }
+            if (buffered >= 0 && buffered < FEED_PACING_BUFFER_MS) {
+              break;
+            }
+            await new Promise<void>((resolve) => {
+              setTimeout(() => {
+                resolve();
+              }, FEED_PACING_POLL_MS);
+            });
           }
-          await new Promise<void>((resolve) => {
-            setTimeout(() => {
-              resolve();
-            }, FEED_PACING_POLL_MS);
-          });
         }
         if (
           this.active != true ||
@@ -472,6 +483,7 @@ export class VoiceStreamSpeaker {
           break;
         }
         ttsWebSocketPlayer.feedStreamText(utt, false);
+        this.nativeFeedStarted = true;
         // 让出主线程：SSE 洪峰时否则 TTS WS / 音频回调要等会话结束后才被调度
         await new Promise<void>((resolve) => {
           setTimeout(() => {

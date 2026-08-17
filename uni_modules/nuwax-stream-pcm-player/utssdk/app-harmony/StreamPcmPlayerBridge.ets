@@ -127,7 +127,7 @@ export class StreamPcmPlayerBridge {
     }
   }
 
-  /** 推入一帧 PCM16 LE 字节（Uint8Array 直传；转精确尺寸 ArrayBuffer 交给 renderer.write） */
+  /** 推入一帧 PCM16 LE 字节（拷贝成独立 ArrayBuffer 入队，绝不复用接收缓冲——对齐 Android 逐帧拷贝） */
   push(chunk: Uint8Array): void {
     if (!this.running || chunk == null || chunk.byteLength == 0) {
       return
@@ -138,12 +138,9 @@ export class StreamPcmPlayerBridge {
       this.droppedBytes += len
       return
     }
-    let ab: ArrayBuffer
-    if (chunk.byteOffset == 0 && chunk.buffer.byteLength == len) {
-      ab = chunk.buffer
-    } else {
-      ab = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + len)
-    }
+    // slice 返回精确尺寸的新 ArrayBuffer；若直传 chunk.buffer（零拷贝快路径），
+    // 底层缓冲被 WS 接收层复用/覆盖时会污染已入队帧，导致播放出杂音或静音
+    const ab: ArrayBuffer = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + len)
     this.queue.push(ab)
     this.queuedBytes += len
     this.enqueuedBytes += len
@@ -172,7 +169,7 @@ export class StreamPcmPlayerBridge {
     if (renderer == null) {
       return
     }
-    renderer.setVolume(muted ? 0 : 1).catch((e) => {
+    renderer.setVolume(muted ? 0 : 1).catch((e: Error) => {
       console.warn('[StreamPcmPlayerBridge] setVolume failed', e)
     })
   }
@@ -229,11 +226,11 @@ export class StreamPcmPlayerBridge {
     const renderer = this.renderer
     this.renderer = null
     if (renderer != null) {
-      renderer.stop().catch((e) => {
+      renderer.stop().catch((e: Error) => {
         console.warn('[StreamPcmPlayerBridge] stop failed', e)
       })
       // release 不可逆，可在任意状态调用；stop 未完成时调用由框架兜底
-      renderer.release().catch((e) => {
+      renderer.release().catch((e: Error) => {
         console.warn('[StreamPcmPlayerBridge] release failed', e)
       })
     }

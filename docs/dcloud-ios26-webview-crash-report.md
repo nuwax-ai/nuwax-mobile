@@ -18,12 +18,18 @@
 | 系统 | iOS 26.6 (23G71)；7 月在 iOS 26.5 亦有同族崩溃记录 |
 | 业务代码 | **与业务无关**（见最小复现） |
 
-## 最小复现步骤
+## 最小复现步骤（四场景矩阵，`pages/test-webview-crash/`，commit 2a600c2f+）
 
-1. 新建 uni-app x 项目，加入以下测试页并注册路由
-2. iOS 真机（iOS 26.x）运行
-3. 点击「A: 纯建销 ×20」按钮
-4. **约第 4~5 轮 mount 时应用崩溃**（实测日志：第 5 轮 `mount` 后进程死亡）
+测试页加载 `https://baidu.com`（中性第三方页面），四按钮对照：
+
+| 场景 | 操作 | 结果 |
+|---|---|---|
+| A 纯建销 ×50 | 仅 v-if 挂载/卸载，无脚本 | **安全**（50 轮完成） |
+| B pushState 风暴 ×200 | 单 webview 常驻，`history.pushState` 每 30ms | **安全** |
+| C 混合 | 建销 + 每轮 10× pushState | **崩溃**（约 2~5 轮） |
+| D C+熄火 | C 同款，卸载前停止 pushState 静默 600ms | **崩溃**（第 3 轮 pushState 阶段，即上一轮卸载完成后） |
+
+**结论：崩溃 = web-view 销毁 × 活跃 history/BFL 的组合，二者缺一不可；销毁前静默（600ms）无法避免** —— 指向销毁后 WebContent 进程仍异步回传 BackForwardList 状态（栈中 `WebProcessProxy::didReceiveMessage`），与已释放的 UI 侧接收器竞态。加载本方 H5（uni-app H5 hash 路由，加载即有 history 流量）时同样复现且更快（约 5 轮内）。
 
 ## 最小复现代码
 
@@ -71,11 +77,12 @@ WebKit  WebKit::WebBackForwardList::didReceiveMessage(IPC::Connection&, IPC::Dec
 
 ## 已排除的要素（均为有效二进制样本验证）
 
-- 业务代码 / H5 页面内容：最小复现无业务代码
-- 脚本注入（evalJS/postMessage）：纯建销即崩
+- 业务代码 / H5 页面内容：中性第三方页面（baidu.com）同样复现
+- 纯建销本身：安静页面 50 轮建销安全
+- 纯 BFL 流量：常驻 webview 200 次 pushState 安全
+- **销毁前静默 600ms（熄火协议）：无效**（D 场景第 3 轮仍崩）
 - 卸载时机：先卸载再延时 150/300ms 导航、防重入加固，无效
 - 页面缓存（enablePageCache）：无效
-- 加载内容换成静态资源：仍崩
 
 ## 参考
 

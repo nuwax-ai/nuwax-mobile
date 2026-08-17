@@ -127,7 +127,7 @@ export class StreamPcmPlayerBridge {
     }
   }
 
-  /** 推入一帧 PCM16 LE 字节（Uint8Array 直传；转精确尺寸 ArrayBuffer 交给 renderer.write） */
+  /** 推入一帧 PCM16 LE 字节（拷贝成独立 ArrayBuffer 入队，绝不复用接收缓冲——对齐 Android 逐帧拷贝） */
   push(chunk: Uint8Array): void {
     if (!this.running || chunk == null || chunk.byteLength == 0) {
       return
@@ -138,14 +138,9 @@ export class StreamPcmPlayerBridge {
       this.droppedBytes += len
       return
     }
-    let ab: ArrayBuffer
-    const srcBuffer = chunk.buffer
-    // ArkTS 下 Uint8Array.buffer 类型为 ArrayBufferLike，需 instanceof 缩窄后才能赋给 ArrayBuffer
-    if (srcBuffer instanceof ArrayBuffer && chunk.byteOffset == 0 && srcBuffer.byteLength == len) {
-      ab = srcBuffer
-    } else {
-      ab = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + len)
-    }
+    // slice 返回精确尺寸的新 ArrayBuffer；若直传 chunk.buffer（零拷贝快路径），
+    // 底层缓冲被 WS 接收层复用/覆盖时会污染已入队帧，导致播放出杂音或静音
+    const ab: ArrayBuffer = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + len)
     this.queue.push(ab)
     this.queuedBytes += len
     this.enqueuedBytes += len

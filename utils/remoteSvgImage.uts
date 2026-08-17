@@ -7,9 +7,12 @@
  *
  * 方案：仅 App 端生效——
  * 1. 下载 SVG 文本（uni.request responseType:text，8s 超时，按 URL 缓存文本）；
- * 2. moveDefsToFront：把 <defs> 块前移到 <svg> 开标签后（修复前向引用导致的渲染缺失）；
- * 3. setSvgSize：把开标签 width/height 改写为「容器 rpx → 物理像素（×pixelRatio）」；
- * 4. 生成 data:image/svg+xml URL，按「宽x高|URL」缓存；失败回退原 URL。
+ * 2. stripPreamble：丢弃 <svg 前的 <?xml ?> 声明 / 注释等前置内容，避免后两步的
+ *    indexOf(">") 误定位到前置内容里的 ">"，改写/前移到错误位置而破坏 XML 结构；
+ * 3. moveDefsToFront：把 <defs> 块前移到 <svg> 开标签后（修复前向引用导致的渲染缺失）；
+ * 4. setSvgSize：把开标签 width/height 改写为「容器 rpx → 物理像素（×pixelRatio）」，
+ *    同时兼容单引号/双引号属性写法，避免重复 width/height 属性导致 XML 不合法；
+ * 5. 生成 data:image/svg+xml URL，按「宽x高|URL」缓存；失败回退原 URL。
  *
  * 注意：App 端为 1:1 绘制，每个显示尺寸必须各自调用（各自生成对应物理像素的 data URL）。
  * 非 App 平台（H5 / 小程序）原样透传 URL，不产生额外请求。
@@ -51,6 +54,18 @@ function downloadSvgText(url: string, timeoutMs: number): Promise<string> {
   });
 }
 
+/**
+ * 丢弃 <svg 之前的一切内容（<?xml ?> 声明 / 注释 / DOCTYPE 等）。
+ * moveDefsToFront / setSvgSize 都用 indexOf(">") 定位「<svg 开标签的结束位置」，
+ * 如果源文件在 <svg 前还有这些前置内容，第一个 ">" 会误命中前置内容里的 ">"，
+ * 导致后续插入 / 前移的内容落在错误位置，破坏 XML 结构（原生解析器比浏览器严格，
+ * 结构一旦不合法就会解码失败，图标显示为默认头像）。
+ */
+function stripPreamble(svg: string): string {
+  const idx = svg.toLowerCase().indexOf("<svg");
+  return idx > 0 ? svg.substring(idx) : svg;
+}
+
 /** 把 <defs>…</defs> 块前移到 <svg> 开标签之后，修复前向引用（rect 在 defs 前）导致的渲染缺失 */
 function moveDefsToFront(svg: string): string {
   const openTagEnd = svg.indexOf(">");
@@ -71,8 +86,10 @@ function setSvgSize(svg: string, widthPx: number, heightPx: number): string {
   const openTagEnd = svg.indexOf(">");
   if (openTagEnd < 0) return svg;
   let openTag = svg.substring(0, openTagEnd + 1);
-  openTag = openTag.replace(/width\s*=\s*"[^"]*"/g, "");
-  openTag = openTag.replace(/height\s*=\s*"[^"]*"/g, "");
+  // 同时兼容单引号 / 双引号属性值：只处理双引号会漏删单引号写法的原属性，
+  // 导致同一标签上残留一份旧的 + 追加一份新的 width/height（重复属性，非法 XML）。
+  openTag = openTag.replace(/width\s*=\s*("[^"]*"|'[^']*')/g, "");
+  openTag = openTag.replace(/height\s*=\s*("[^"]*"|'[^']*')/g, "");
   const attrs = ' width="' + widthPx.toString() + '" height="' + heightPx.toString() + '"';
   return openTag.substring(0, openTag.length - 1) + attrs + ">" + svg.substring(openTagEnd + 1);
 }
@@ -106,7 +123,8 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
       text = await downloadSvgText(url, 8000);
       svgTextCache.set(url, text);
     }
-    let processed = moveDefsToFront(text);
+    let processed = stripPreamble(text);
+    processed = moveDefsToFront(processed);
     processed = setSvgSize(processed, widthPx, heightPx);
     const dataUrl = "data:image/svg+xml;utf8," + encodeURIComponent(processed);
     svgDataUrlCache.set(cacheKey, dataUrl);

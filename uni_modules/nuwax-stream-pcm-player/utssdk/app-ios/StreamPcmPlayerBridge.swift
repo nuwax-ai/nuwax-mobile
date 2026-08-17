@@ -46,15 +46,15 @@ public class StreamPcmPlayerBridge {
         }
     }
 
-    /// UTS 侧把 Uint8Array 逐字节转成 number[] 传入（[NSNumber]）
-    public func push(_ bytes: [NSNumber]) {
-        var data = Data(capacity: bytes.count)
-        for v in bytes {
-            data.append(UInt8(truncating: v))
-        }
+    /// UTS 侧以 base64 字符串传入 PCM16 字节（iOS 桥接 Uint8Array 参数会崩，统一走 base64）
+    public func pushBase64(_ b64: String) {
+        guard let data = Data(base64Encoded: b64), !data.isEmpty else { return }
         pending.append(data)
         writtenBytes += Int64(data.count)
-        flushPending()
+        // 攒够 ~100ms(3200B) 再调度，避免每帧 scheduleBuffer 卡顿
+        if pending.count >= 3200 {
+            flushPending()
+        }
     }
 
     public func flushPending() {

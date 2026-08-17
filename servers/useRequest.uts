@@ -27,6 +27,11 @@ import {
 
 import { handleExternalLink } from "@/utils/system";
 import { getCurrentPageFullPath } from "@/utils/common";
+import {
+  LOGIN_PAGE_PATH,
+  LOGIN_WEIXIN_PAGE_PATH,
+  redirectToLoginOnce,
+} from "@/utils/authNavigation";
 import { orObject, orString } from "@/utils/utsCoalesce";
 
 // 请求/响应日志开关：开发环境(HBuilderX 运行=development)自动开，发行打包(NODE_ENV=production，如打 APK)自动关
@@ -129,7 +134,11 @@ export default function request(options: any): Promise<any> {
   // uni.request<UTSJSONObject> 顶层宽松解析；禁止 JSON.parse<T>（Gson 无法实例化 interface）。
   // 自定义 RequestOptions 已改名为 ApiRequestOptions，避免与 SDK RequestOptions 冲突。
     const fullUrl = baseUrl + url;
-    const isVox = baseUrl == getVoxBaseUrl();
+    // Vox 网关已跟随主域名（config.uts 中 VOX_BASE_URL == API_BASE_URL），仅比较 baseUrl 取值
+    // 会把所有主站请求误判成 vox 请求，导致下方 4010 分支的 `!isVoxUrl` 守卫恒不成立、
+    // 踢登录逻辑对全部接口失效（表现为接口反复返回 4010 却永不跳登录页）。
+    // servers/vox/* 均显式传入 baseUrl: VOX_BASE_URL，主站接口不传，故以「调用方是否显式指定」区分。
+    const isVox = baseUrlRaw != null && baseUrl == getVoxBaseUrl();
     const logTag = isVox ? "[VoxReq]" : "[ApiReq]";
     const hasToken = accessToken != null && accessToken != "";
     let reqBodyStr = "";
@@ -181,24 +190,30 @@ export default function request(options: any): Promise<any> {
           resolve(responseData as any);
         } else if (code == USER_NO_LOGIN && !isVoxUrl) {
           // 用户未登录，跳转到登录页
-          uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
-          clearStoragePreservingApiBaseUrl(); // 清空业务缓存，保留企业域名
-
+          // 仅在本地确实存有登录态时才清缓存：游客冷启动时多个接口都会返回 4010，
+          // 无条件 clearStorage 会把 i18n 文案与租户配置缓存一并清掉，登录页文案/站点名
+          // 先落默认值再被接口刷新，直观表现就是闪烁。
+          const hadToken = accessToken != null && `${accessToken}`.length > 0;
+          if (hadToken) {
+            uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+            clearStoragePreservingApiBaseUrl(); // 清空业务缓存，保留企业域名
+          }
+          // 并发/连续多个接口返回 4010 时，跳转由 redirectToLoginOnce 去重，
+          // 已在登录页则完全不再 reLaunch，避免登录页被反复重建。
           // #ifdef H5 || WEB || APP
-          uni.reLaunch({
-            url: "/subpackages/pages/login/login",
-          });
+          redirectToLoginOnce(LOGIN_PAGE_PATH);
           // #endif
           // #ifdef MP-WEIXIN
-          uni.reLaunch({
-            url: "/subpackages/pages/login-weixin/login-weixin",
-          });
+          redirectToLoginOnce(LOGIN_WEIXIN_PAGE_PATH);
           // #endif
           resolve(responseData as any);
         } else if (code == REDIRECT_LOGIN) {
           // 重定向到登录页
-          uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
-          clearStoragePreservingApiBaseUrl(); // 清空业务缓存，保留企业域名
+          // 与 4010 分支同理：本地没有登录态时不清缓存（否则会连带清掉 i18n/租户配置缓存）
+          if (accessToken != null && `${accessToken}`.length > 0) {
+            uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+            clearStoragePreservingApiBaseUrl(); // 清空业务缓存，保留企业域名
+          }
           let redirectUrl = errorMessage;
           let resolvedEarly = false;
           // 如果错误信息包含/login开头，则替换为登录页，否则直接打开完整链接
@@ -211,9 +226,9 @@ export default function request(options: any): Promise<any> {
             } else {
               redirectUrl = errorMessage.replace(
                 "/login",
-                "/subpackages/pages/login/login",
+                LOGIN_PAGE_PATH,
               );
-              uni.reLaunch({ url: redirectUrl });
+              redirectToLoginOnce(redirectUrl);
             }
             // #endif
 
@@ -223,19 +238,19 @@ export default function request(options: any): Promise<any> {
             if (currentUrl != null && currentUrl != "") {
               if (globalThis.appConfig.redirectUrl != null && globalThis.appConfig.redirectUrl != "") {
                 const otherQueryStr = globalThis.appConfig.redirectUrl;
-                uni.reLaunch({
-                  url:
-                    "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                redirectToLoginOnce(
+                  LOGIN_WEIXIN_PAGE_PATH +
+                    "?redirect=" +
                     encodeURIComponent(
                       "/subpackages/pages/webview/webview?url=" + otherQueryStr,
                     ),
-                });
+                );
               } else {
-                uni.reLaunch({
-                  url:
-                    "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                redirectToLoginOnce(
+                  LOGIN_WEIXIN_PAGE_PATH +
+                    "?redirect=" +
                     encodeURIComponent(currentUrl),
-                });
+                );
               }
             }
             // #endif
@@ -249,9 +264,7 @@ export default function request(options: any): Promise<any> {
             // #ifdef APP
             // APP 端无法也无需跳 H5 登录 URL：登录态已在上方清理，
             // 这里必须回到原生登录页，否则用户停留在已清态的页面上（无任何跳转）。
-            uni.reLaunch({
-              url: "/subpackages/pages/login/login",
-            });
+            redirectToLoginOnce(LOGIN_PAGE_PATH);
             // #endif
           }
           if (!resolvedEarly) {

@@ -8,8 +8,14 @@
  * - 开口前：帧滚动进 500ms 预滚环 + VAD 判定（RMS 阈值 + 连续 3×20ms 有声）
  * - 开口：回调 onSpeechStart → 上层 begin()（发 start，消除「按住空等被服务端截断」）
  * - 开口后未 ready：进 pre-ready 有限队列（2s，溢出丢最旧 → truncated）
- * - onReady：预滚 + pre-ready + 实时帧统一走 640 对齐 packetizer（100ms/包，单包在途）
- * - 追踪 sentBytes（仅成功发送、恒 640 对齐）供文件兜底续推偏移
+ * - onReady：预滚 + pre-ready + 实时帧统一进 txBuf，由独立 sender 定时器窗口化发送
+ *
+ * 发送模型（关键）：
+ * - feed 只做 VAD + 攒包，绝不 send——发送与录音热路径解耦，慢 ack 不卡帧处理
+ * - sender 定时器（40ms）驱动：每 tick 至多发一包（窗口化，在途 ~3 包），
+ *   单包在途 + 每包等 ack 在弱网下吞吐只有实时的 ~1/2（曾实测卡死）；窗口化保证不饿死、不失控
+ * - ack 只记账（outstanding/sent），不阻塞；同步 ack（UTS Promise 极端情况）由 sendChainActive 重入守卫终止
+ * - 追踪 sentBytes（仅成功发送，诊断用）
  * - 句内静音：默认持续推静音帧直到松手（ASR_PIPE_SILENCE_MS=0 禁用主动 finish）
  *
  * 内存：number[] 装箱（~8x）被上限约束在 2.5s 音频以内（约 80KB 原始 → 亚 MB 级），
@@ -19,8 +25,14 @@ import { ASR_FRAME_BYTES, ASR_SAMPLE_RATE } from './asrWebSocketClient'
 
 /** 预滚环时长（ms）：开口前保留的音频，补偿 VAD 判定延迟与阈值延迟 */
 const ASR_PIPE_PRE_ROLL_MS: number = 500
-/** 实时推流包（ms）：100ms = 3200B = 5×640 */
-const ASR_PIPE_PACKET_MS: number = 100
+/** 实时推流包（ms）：200ms = 6400B = 10×640（加大包减少发送频率，缓解慢 ack） */
+const ASR_PIPE_PACKET_MS: number = 200
+/** 在途未 ack 字节上限（≈3 包）：窗口化发送，慢 ack 不饿死、背压不失控 */
+const ASR_PIPE_SEND_WINDOW_BYTES: number = 19200
+/** sender 定时器周期（ms）：与帧热路径解耦的发送节拍 */
+const ASR_PIPE_SENDER_INTERVAL_MS: number = 40
+/** flush 超时（ms）：ack 一直不回的极端情况强制收尾，避免卡在识别中 */
+const ASR_PIPE_FLUSH_TIMEOUT_MS: number = 5000
 /** pre-ready 有限队列上限（2s = 64000B）：溢出丢最旧 */
 const ASR_PIPE_PRE_READY_MAX_BYTES: number = 64000
 /** VAD RMS 阈值（int16；静默 <1000、语音 >2000，取 1200，可按联调微调） */
@@ -52,15 +64,21 @@ export class NativeStreamAsrPipeline {
   private preRoll: number[] = []
   /** 开口后、ready 前的暂存队列（2s 上限） */
   private preReady: number[] = []
-  /** 待发送字节（640 对齐；ready 后实时帧直接入队） */
+  /** 待发送字节（640 对齐；ready 后实时帧直接入队，由 sender 定时器消费） */
   private txBuf: number[] = []
   private speechDetected: boolean = false
   private readyReached: boolean = false
-  private inFlight: boolean = false
+  /** 独立发送定时器 id（onReady 启动，flush 完成 / reset 停止） */
+  private senderTimer: number = 0
+  /** 在途未 ack 字节数（窗口上限内可多包在途） */
+  private outstandingBytes: number = 0
+  /** 发送重入守卫：防同步 ack 导致 sendPacket→ack→pump 递归失控 */
+  private sendChainActive: boolean = false
   private pushFailed: boolean = false
   private flushing: boolean = false
   private flushDone: AsrPipelineFlushDone | null = null
-  /** 已成功发送字节数（恒 640 对齐）：文件兜底续推偏移依据 */
+  private flushStartAt: number = 0
+  /** 已成功发送字节数（诊断用） */
   private sent: number = 0
   /** 丢过帧（pre-ready/txBuf 溢出、发送失败）→ 松手走文件兜底 */
   private truncated: boolean = false
@@ -85,16 +103,19 @@ export class NativeStreamAsrPipeline {
   /** 新一轮会话：清空全部状态（generation 递增，作废在途回调） */
   reset(): void {
     this.generation += 1
+    this.stopSender()
     this.acc = []
     this.preRoll = []
     this.preReady = []
     this.txBuf = []
     this.speechDetected = false
     this.readyReached = false
-    this.inFlight = false
+    this.outstandingBytes = 0
+    this.sendChainActive = false
     this.pushFailed = false
     this.flushing = false
     this.flushDone = null
+    this.flushStartAt = 0
     this.sent = 0
     this.truncated = false
     this.voicedStreak = 0
@@ -120,7 +141,7 @@ export class NativeStreamAsrPipeline {
     return this.sent
   }
 
-  /** 灌入一帧 PCM（主线程；chunk 为一次性 ArrayBuffer，只读一次） */
+  /** 灌入一帧 PCM（主线程；chunk 为一次性 ArrayBuffer，只读一次；只攒包不发送） */
   feed(chunk: ArrayBuffer): void {
     if (chunk == null || chunk.byteLength == 0) {
       return
@@ -139,7 +160,7 @@ export class NativeStreamAsrPipeline {
     }
   }
 
-  /** asr_ready 到达：预滚 + pre-ready 排到发送队首，转实时 */
+  /** asr_ready 到达：预滚 + pre-ready 排到发送队首，启动 sender 定时器转实时 */
   onReady(): void {
     console.log(
       "[ASR-live] pipeline onReady preRoll=" +
@@ -163,13 +184,15 @@ export class NativeStreamAsrPipeline {
     this.preRoll = []
     this.preReady = []
     this.txBuf = merged
+    this.startSender()
     this.pump(g)
   }
 
-  /** 松手冲刷：剩余待发字节全部发完（或放弃）后回调 done，供上层 finish */
+  /** 松手冲刷：剩余待发字节全部发完（或超时放弃）后回调 done，供上层 finish */
   flushPending(done: AsrPipelineFlushDone): void {
     this.flushing = true
     this.flushDone = done
+    this.flushStartAt = Date.now()
     this.pump(this.generation)
   }
 
@@ -234,7 +257,7 @@ export class NativeStreamAsrPipeline {
     for (let i = 0; i < win.length; i++) {
       this.txBuf.push(win[i])
     }
-    // 背压：WS 慢于实时时 txBuf 上限 2s，溢出丢最旧
+    // 背压：WS 慢于实时时 txBuf 上限 2s，溢出丢最旧（发送由 sender 定时器负责，不在此处 send）
     if (this.txBuf.length > ASR_PIPE_PRE_READY_MAX_BYTES) {
       this.txBuf.splice(0, ASR_FRAME_BYTES)
       if (this.truncated != true) {
@@ -242,13 +265,45 @@ export class NativeStreamAsrPipeline {
       }
       this.truncated = true
     }
-    this.pump(g)
   }
 
-  /** 按 640 对齐出包（100ms/包），单包在途；success 后再发下一包 */
+  /** 启动独立发送定时器（幂等）：onReady 时开启，flush 完成 / reset 时停止 */
+  private startSender(): void {
+    if (this.senderTimer != 0) {
+      return
+    }
+    this.senderTimer = setInterval((): void => {
+      if (this.flushing == true) {
+        // flush 超时兜底：ack 一直不回的极端情况强制收尾，避免卡在识别中
+        if (
+          this.flushStartAt != 0 &&
+          Date.now() - this.flushStartAt > ASR_PIPE_FLUSH_TIMEOUT_MS
+        ) {
+          this.forceCompleteFlush()
+          return
+        }
+      }
+      this.pump(this.generation)
+    }, ASR_PIPE_SENDER_INTERVAL_MS) as number
+  }
+
+  private stopSender(): void {
+    if (this.senderTimer != 0) {
+      clearInterval(this.senderTimer)
+      this.senderTimer = 0
+    }
+  }
+
+  /**
+   * 窗口化发送：每 tick 至多发一包（重入安全），下次发送由 sender 定时器 / ack 回调驱动。
+   * 绝不在本函数内 send 后立即再 pump——同步 ack 会导致 sendPacket→ack→pump 死循环。
+   */
   private pump(g: number): void {
     if (g != this.generation) {
       this.maybeCompleteFlush()
+      return
+    }
+    if (this.sendChainActive == true) {
       return
     }
     if (this.pushFailed == true) {
@@ -256,7 +311,7 @@ export class NativeStreamAsrPipeline {
       this.maybeCompleteFlush()
       return
     }
-    if (this.inFlight == true) {
+    if (this.outstandingBytes >= ASR_PIPE_SEND_WINDOW_BYTES) {
       return
     }
     if (this.txBuf.length == 0) {
@@ -264,57 +319,93 @@ export class NativeStreamAsrPipeline {
       return
     }
     const target = this.packetBytesTarget
-    const take = this.txBuf.length > target ? target : this.txBuf.length
-    const packet = new ArrayBuffer(take)
-    const out = new Uint8Array(packet)
-    for (let i = 0; i < take; i++) {
-      out[i] = this.txBuf[i]
+    // flush 模式：不足整包的余量也发（640 对齐）；否则攒够整包才发
+    if (this.flushing != true && this.txBuf.length < target) {
+      return
     }
-    this.txBuf.splice(0, take)
-    this.inFlight = true
-    const sentNow = take
-    this.sendFrame(packet).then(
-      (ok: boolean) => {
-        if (g != this.generation) {
-          return
-        }
-        this.inFlight = false
-        if (ok == true) {
-          this.sent += sentNow
+    const take = this.txBuf.length > target ? target : this.txBuf.length
+    this.sendPacket(g, take)
+  }
+
+  /** 发出一个包：从 txBuf 切出 → 组装全新 ArrayBuffer → sendFrame；ack 只记账不阻塞 */
+  private sendPacket(g: number, take: number): void {
+    this.sendChainActive = true
+    try {
+      const packet = new ArrayBuffer(take)
+      const out = new Uint8Array(packet)
+      for (let i = 0; i < take; i++) {
+        out[i] = this.txBuf[i]
+      }
+      this.txBuf.splice(0, take)
+      this.outstandingBytes += take
+      const sentNow = take
+      this.sendFrame(packet).then(
+        (ok: boolean) => {
+          if (g != this.generation) {
+            return
+          }
+          this.outstandingBytes -= sentNow
+          if (ok == true) {
+            this.sent += sentNow
+          } else {
+            // 发送失败：停发实时，剩余丢弃（松手走文件兜底全量重推）
+            console.warn("[ASR-live] sendFrame 失败，停发实时 sent=" + this.sent)
+            this.pushFailed = true
+            this.truncated = true
+            this.txBuf = []
+          }
+          this.maybeCompleteFlush()
           this.pump(g)
-        } else {
-          // 发送失败：停发实时，剩余丢弃（松手走文件兜底全量重推）
-          console.warn(
-            "[ASR-live] sendFrame 失败，停发实时 sent=" + this.sent,
-          )
+        },
+        (_e: any | null) => {
+          if (g != this.generation) {
+            return
+          }
+          this.outstandingBytes -= sentNow
+          console.warn("[ASR-live] sendFrame 异常，停发实时 sent=" + this.sent)
           this.pushFailed = true
           this.truncated = true
           this.txBuf = []
           this.maybeCompleteFlush()
-        }
-      },
-      (_e: any | null) => {
-        if (g != this.generation) {
-          return
-        }
-        this.inFlight = false
-        console.warn("[ASR-live] sendFrame 异常，停发实时 sent=" + this.sent)
-        this.pushFailed = true
-        this.truncated = true
-        this.txBuf = []
-        this.maybeCompleteFlush()
-      },
-    )
+          this.pump(g)
+        },
+      )
+    } catch (_eSend) {
+      // sendFrame 同步抛异常：视为发送失败，不打断主线程热路径
+      this.outstandingBytes = 0
+      this.pushFailed = true
+      this.truncated = true
+      this.txBuf = []
+      console.warn("[ASR-live] sendFrame 同步异常，停发实时")
+    } finally {
+      this.sendChainActive = false
+    }
   }
 
   private maybeCompleteFlush(): void {
     if (this.flushing != true) {
       return
     }
-    if (this.inFlight == true || this.txBuf.length > 0) {
+    if (this.outstandingBytes > 0 || this.txBuf.length > 0) {
       return
     }
     this.flushing = false
+    this.stopSender()
+    const done = this.flushDone
+    this.flushDone = null
+    if (done != null) {
+      done()
+    }
+  }
+
+  /** flush 超时兜底：放弃剩余待发字节并强制收尾（ack 一直不回的极端情况） */
+  private forceCompleteFlush(): void {
+    console.warn(
+      "[ASR-live] flush 超时强制收尾 outstanding=" + this.outstandingBytes,
+    )
+    this.flushing = false
+    this.txBuf = []
+    this.stopSender()
     const done = this.flushDone
     this.flushDone = null
     if (done != null) {

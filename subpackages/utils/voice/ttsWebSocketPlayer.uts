@@ -526,6 +526,8 @@ export class TtsWebSocketPlayer {
   private streamAudioStarted: boolean = false;
   /** 已发 flush（服务端收尾；tts_end 后不再有音频） */
   private streamFlushSent: boolean = false;
+  /** 本轮「无音频」看门狗是否已武装（首次 text 喂出时置位，防止 tts_ready 空等正文时误判） */
+  private streamNoAudioArmed: boolean = false;
   /** 已收到 tts_end 或 flush 看门狗超时（服务端已发完，本地段队列播完即整轮结束） */
   private streamEnded: boolean = false;
   /** 会话所属 messageId */
@@ -1181,8 +1183,26 @@ export class TtsWebSocketPlayer {
 
   private sendFeedTextFrame(text: string, flush: boolean): void {
     this.sendJson(buildTtsControlMessage("text", text, 0, flush));
+    // 文本真正喂出后才武装「无音频」看门狗（每轮仅首帧一次，PCM 到达即清除）：
+    // tts_ready 时可能正文还没到（工具调用/思考期），从那时起算会把合法空等判死。
+    this.armStreamNoAudioWatchdogOnce();
     if (flush == true) {
       this.armFlushEndWatchdog();
+    }
+  }
+
+  /** 流式会话「喂出文本后无 PCM」看门狗：每轮首次喂 text 时武装一次（原生/分段路径各自计时） */
+  private armStreamNoAudioWatchdogOnce(): void {
+    if (this.streamNoAudioArmed == true) {
+      return;
+    }
+    this.streamNoAudioArmed = true;
+    if (this.isStreamNativeMode() == true) {
+      // #ifdef APP
+      this.armNativeNoAudioWatchdog();
+      // #endif
+    } else {
+      this.armSynthStallWatchdog();
     }
   }
 
@@ -1228,21 +1248,18 @@ export class TtsWebSocketPlayer {
     if (type == "tts_ready") {
       this.streamReady = true;
       this.setState("synthesizing");
-      // 原生流式：不用 12s stall 看门狗（长音频合法播放会超时），改用「无任何 PCM 帧」看门狗
-      if (this.isStreamNativeMode() == true) {
-        // #ifdef APP
-        this.armNativeNoAudioWatchdog();
-        // #endif
-      } else {
-        this.armSynthStallWatchdog();
-      }
+      // 「无音频」看门狗不在此武装：会话可能在正文产出前 begin（发送即 pre-begin，工具调用/思考期无文本），
+      // 从 tts_ready 起算 12s 会把合法空等判死。改为首次实际喂出 text 帧时武装（sendFeedTextFrame）。
       this.flushPendingFeedTexts();
     } else if (type == "tts_begin") {
       this.streamAudioStarted = true;
       this.setState("synthesizing");
     } else if (type == "tts_end") {
       this.clearFlushEndWatchdog();
+      // 本轮已结束：解除「无音频」看门狗（避免空合成 / 已播完回合在 12s 后补弹）
+      this.clearSynthStallWatchdog();
       // #ifdef APP
+      this.clearNativeNoAudioWatchdog();
       if (this.streamNativeActive == true) {
         // 原生流式：tts_end 只表示不再有新 PCM，交给排空轮询播完即收尾
         console.log("[TTS] native inputDone via tts_end");
@@ -1252,6 +1269,7 @@ export class TtsWebSocketPlayer {
         return;
       }
       // #endif
+      this.streamNoAudioArmed = false;
       this.streamEnded = true;
       // 收尾剩余缓冲（final=true 强制切，即便不足阈值）
       this.tryCutStreamSegment(true);
@@ -1620,6 +1638,7 @@ export class TtsWebSocketPlayer {
     this.streamReady = false;
     this.streamAudioStarted = false;
     this.streamFlushSent = false;
+    this.streamNoAudioArmed = false;
     this.streamEnded = true;
     this.streamMessageId = "";
     this.streamPcmBytes = 0;
@@ -3266,6 +3285,7 @@ export class TtsWebSocketPlayer {
     this.streamReady = false;
     this.streamAudioStarted = false;
     this.streamFlushSent = false;
+    this.streamNoAudioArmed = false;
     // 保留 messageId 直到 idle 通知结束，便于工具栏按消息匹配并退出播报态
     this.setState("error");
     // 流式多句连续 stall 时只弹一次，避免连环 toast

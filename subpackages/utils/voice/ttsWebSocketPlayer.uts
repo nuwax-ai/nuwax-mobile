@@ -565,6 +565,8 @@ export class TtsWebSocketPlayer {
   private readonly NATIVE_DRAIN_PROGRESS_WINDOW_MS: number = 5000;
   /** 排空进度检测：单窗口内播放头最小推进（ms），低于视为渲染器/写循环卡死 */
   private readonly NATIVE_DRAIN_MIN_PROGRESS_MS: number = 500;
+  /** 排空尾部余量（ms）：全部字节已入硬件后，额外等待硬件缓冲播完的余量（防缓冲时长低估误切） */
+  private readonly NATIVE_DRAIN_TAIL_MARGIN_MS: number = 1000;
   /** 播放端队列排空时请求的按需切段标记：有标记则切段不再等阈值（成功切段后清除） */
   private streamForcePending: boolean = false;
 
@@ -594,6 +596,10 @@ export class TtsWebSocketPlayer {
   private lastDrainProgressAtMs: number = 0;
   /** 排空进度检测：窗口起点时的 writtenMs（单调递增，比 playedMs 可靠——模拟器播放头可能跳变/回退） */
   private lastDrainWrittenMs: number = 0;
+  // #ifdef APP-ANDROID
+  /** 排空尾部：首次观察到「全部字节已写入硬件」的时刻（0=未观察到；inputDone 后有效） */
+  private nativeDrainWriteCompleteAtMs: number = 0;
+  // #endif
   // #endif
 
   /**
@@ -1501,6 +1507,41 @@ export class TtsWebSocketPlayer {
       this.notifyStreamEnd();
       return;
     }
+    // #ifdef APP-ANDROID
+    // 播放头不可靠时的尾部排空（实测部分 Android 机型 getPlaybackHeadPosition 长期为负/跳变，
+    // isDrained 永不成立——单靠 deadline 要等 enqueuedMs+30s，播完图标卡住不恢复）。
+    // 改用与播放头无关的判据：全部字节已入硬件（written >= enqueued，队列/重试帧为空）后，
+    // 剩余音频只在硬件缓冲里，播完时长相上界 = getBufferMs()。距观察到写入完成
+    // ≥ 缓冲时长 + 余量即视为播完——只等硬件缓冲自然放完，不切仍在管道里可能出声的音频。
+    if (this.streamInputDone == true && player.isWriteComplete() == true) {
+      if (this.nativeDrainWriteCompleteAtMs == 0) {
+        this.nativeDrainWriteCompleteAtMs = Date.now();
+      }
+      if (
+        Date.now() - this.nativeDrainWriteCompleteAtMs >=
+        player.getBufferMs() + this.NATIVE_DRAIN_TAIL_MARGIN_MS
+      ) {
+        console.log(
+          "[TTS] native drained via write-complete tail: enqueuedMs=" +
+            player.getEnqueuedMs() +
+            " writtenMs=" +
+            player.getWrittenMs() +
+            " playedMs=" +
+            player.getPlayedMs() +
+            " bufferMs=" +
+            player.getBufferMs(),
+        );
+        this.clearStreamDrainPoll();
+        this.releaseStreamPcmPlayer();
+        this.streamEnded = true;
+        this.notifyStreamEnd();
+        return;
+      }
+    } else {
+      // 写入未完成（新音频仍可能入队 / 硬件未接受全部）：重置完成观察点，避免上一轮残留误判
+      this.nativeDrainWriteCompleteAtMs = 0;
+    }
+    // #endif
     if (this.streamInputDone == true) {
       // 兜底 deadline 用「入队总量 + 30s」（回归原公式，不依赖 playedMs）：
       // 模拟器上 getPlayedMs（播放头）可能跳变/回退（实测 enqueued 194s 时
@@ -1741,6 +1782,9 @@ export class TtsWebSocketPlayer {
     this.nativeNoAudioRearmCount = 0;
     this.lastDrainProgressAtMs = 0;
     this.lastDrainWrittenMs = 0;
+    // #ifdef APP-ANDROID
+    this.nativeDrainWriteCompleteAtMs = 0;
+    // #endif
     this.releaseStreamPcmPlayer();
     // #endif
     this.pendingFeedTexts = [] as string[];

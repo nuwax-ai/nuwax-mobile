@@ -40,16 +40,17 @@
 - [x] 方案 A（快，**已实施 2026-08-17**）：iOS 端条件编译屏蔽积分/订阅购买入口，保留查看（订单/订阅状态只读）；实物订单不动。**入口清单（按产品确认口径）**：
   - 「我的」tab：
     - 「我的订阅」菜单项整个隐藏 → `pages/mine/mine.uvue`（模板层 `#ifndef APP-IOS`）
+    - 「我的订单」菜单项整个隐藏（2026-08-17 三轮：iOS 全端无订单/支付链路，与备案备注「不含支付」对齐）→ 同上
     - 积分卡「增购」按钮隐藏 → `components/credits-breakdown/credits-breakdown.uvue`（模板 + emit 双保险；mine.uvue 的 `handleAddPurchase` 同步条件编译）
-    - 「我的订单」保留入口，订单卡「去支付」仅 `bizType == DESK_BUDDY` 展示，`CREDIT_PURCHASE` / `SUBSCRIPTION` 类型不展示 → `subpackages/pages/my-orders/components/order-card/order-card.uvue` `showPayButton`
   - 应用详情页侧栏（`subpackages/pages/app-details/history-conversation-popup/`）：
     - 积分区「增购」action 隐藏（总积分仍展示）、跳转 my-subscriptions 的 `handleGoSubscriptions` 不编译
     - 「立即订阅」按钮隐藏（`app-details.uvue` 的 agent-subscription-modal 仅由此触发，源头已断）
   - 会话详情（chat-conversation-component）：
     - more-popup「我的订阅」菜单项 iOS 隐藏（`payEntryBlocked` + 弹窗高度联动）
     - `AgentDetailService.uts` `handleCheckSubscriptionLimit` iOS 不自动弹订阅（支付/会议订阅）弹窗、不禁用输入框（避免无支付渠道时用户被锁死在会话中，超额由后端错误提示）
-  - 防御层：`subpackages/pages/my-subscriptions/my-subscriptions.uvue` onLoad 强制 `hidePlans = true`（即使有残留路径进入也只显示订阅状态，无购买卡片）
-  - 保留：`pages/terminal/components/desk-buddy-order-modal.uvue`（实物设备订单，3.1.5(a) 合法走微信/支付宝）
+  - 终端 tab（三轮新增）：硬件购买列表（产品购买卡，`pages/terminal/terminal.uvue`）iOS 整体隐藏，`desk-buddy-order-modal` 失去触发入口
+  - 防御层：`subpackages/pages/my-subscriptions/my-subscriptions.uvue` onLoad 强制 `hidePlans = true`（即使有残留路径进入也只显示订阅状态，无购买卡片）；`order-card.uvue` 「去支付」限 `DESK_BUDDY`（入口已隐藏，纯防御保留）
+  - ~~保留 desk-buddy 实物订单~~（三轮推翻：iOS 全端无支付，与备案备注「不含支付功能」完全一致；实物购买待备案变更后再放开）
 - [ ] 方案 B（长）：接入 Apple IAP（消耗型积分 + 自动续订订阅），后端增加 IAP 收据校验与发货（后续版本再议）
 
 ### 2. 缺「删除账号」功能 —— Guideline 5.1.1(v)
@@ -145,6 +146,7 @@ manifest.json:111 配置 `universalLink: https://link.nuwax.com/wechat/`。
 
 ## 变更记录
 
+- **2026-08-17（三轮，对齐备案口径）**：iOS「我的订单」菜单项整个隐藏；终端 tab 硬件购买列表（产品购买卡）隐藏 —— iOS 全端无支付/订单链路，落实备案备注「不含支付功能」A 方案。`NuwaxApp(Dev).08172016` 云打包经 JS 标记验证为**二轮前旧包**（含 `setStorageSync("SUB_BACK_URL"`），仅一轮改动，不可用于回归/提审。
 - **2026-08-17（二轮，按产品细化口径）**：「我的订阅」菜单项整个隐藏（mine）；订单卡「去支付」限 `bizType == DESK_BUDDY`；应用详情侧栏增购 action + 立即订阅按钮隐藏；确认「会议订阅弹窗」= 会话详情 agent-subscription-modal（一轮已挡自动弹出与入口）。
 - **2026-08-17（一轮）**：方案 A 实施（5 处支付入口条件编译）+ logout 两处补 `APP-IOS` + 新增 `nativeResources/ios/PrivacyInfo.xcprivacy` + 打包路线定云打包。云打包 profile 侧 associated-domains 已修复（Identifiers 开能力 + regenerate profile）。
 

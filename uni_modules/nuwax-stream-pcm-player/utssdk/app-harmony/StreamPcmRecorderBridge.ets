@@ -208,11 +208,11 @@ export class StreamPcmRecorderBridge {
     const capturer = this.capturer
     this.capturer = null
     if (capturer != null) {
-      capturer.stop().catch((e) => {
+      capturer.stop().catch((e: Error) => {
         console.warn('[StreamPcmRecorderBridge] stop failed', e)
       })
       // release 不可逆，可在任意状态调用；stop 未完成时调用由框架兜底
-      capturer.release().catch((e) => {
+      capturer.release().catch((e: Error) => {
         console.warn('[StreamPcmRecorderBridge] release failed', e)
       })
     }

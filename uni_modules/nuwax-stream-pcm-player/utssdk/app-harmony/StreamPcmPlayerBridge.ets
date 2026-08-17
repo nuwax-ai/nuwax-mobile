@@ -139,8 +139,10 @@ export class StreamPcmPlayerBridge {
       return
     }
     let ab: ArrayBuffer
-    if (chunk.byteOffset == 0 && chunk.buffer.byteLength == len) {
-      ab = chunk.buffer
+    const srcBuffer = chunk.buffer
+    // ArkTS 下 Uint8Array.buffer 类型为 ArrayBufferLike，需 instanceof 缩窄后才能赋给 ArrayBuffer
+    if (srcBuffer instanceof ArrayBuffer && chunk.byteOffset == 0 && srcBuffer.byteLength == len) {
+      ab = srcBuffer
     } else {
       ab = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + len)
     }
@@ -172,7 +174,7 @@ export class StreamPcmPlayerBridge {
     if (renderer == null) {
       return
     }
-    renderer.setVolume(muted ? 0 : 1).catch((e) => {
+    renderer.setVolume(muted ? 0 : 1).catch((e: Error) => {
       console.warn('[StreamPcmPlayerBridge] setVolume failed', e)
     })
   }
@@ -229,11 +231,11 @@ export class StreamPcmPlayerBridge {
     const renderer = this.renderer
     this.renderer = null
     if (renderer != null) {
-      renderer.stop().catch((e) => {
+      renderer.stop().catch((e: Error) => {
         console.warn('[StreamPcmPlayerBridge] stop failed', e)
       })
       // release 不可逆，可在任意状态调用；stop 未完成时调用由框架兜底
-      renderer.release().catch((e) => {
+      renderer.release().catch((e: Error) => {
         console.warn('[StreamPcmPlayerBridge] release failed', e)
       })
     }

@@ -9,7 +9,7 @@
 | 级别 | 项 | 审核条款 / 错误码 | 状态 |
 |---|---|---|---|
 | 🔴 阻断 | 积分/订阅在 iOS 走微信/支付宝 | 3.1.1 / 3.1.2（数字商品须 IAP） | ✅ 已处理（2026-08-17 方案 A，条件编译屏蔽） |
-| 🔴 阻断 | 缺「删除账号」入口 | 5.1.1(v) | ⏳ 后端确认已有 API，等接口契约后接 UI |
+| 🔴 阻断 | 缺「删除账号」入口 | 5.1.1(v) | ✅ 已实现（2026-08-17 四轮：入口+二次确认+四语言文案） |
 | 🔴 阻断 | 隐私清单 / Info.plist | ITMS-91053 / 权限崩溃 | ✅ 打包路线定为**云打包**；已建 `nativeResources/ios/PrivacyInfo.xcprivacy`，manifest 权限描述云打包直接生效 |
 | 🔴 阻断 | 中国区上架需 ICP 备案 | App Store 中国区政策 | ✅ 已确认：蜀ICP备20012194号-11A |
 | 🟡 缺陷 | iOS 退出登录后不跳转登录页 | —（审核员可感知） | ✅ 已修复（mine + history-conversation-popup 两处补 `APP-IOS`） |
@@ -59,13 +59,18 @@
 
 **要求**：App 支持账号注册（手机号/邮箱验证码注册），就必须提供**应用内可发现**的删除账号入口。跳转小程序、客服工单、仅邮件申请均不合格。
 
-**进展（2026-08-17）**：后端确认已有注销 API，接口契约待提供，到货后接 UI。
+**进展（2026-08-17 四轮，已实现）**：
+
+- 接口：`POST /api/user/account/delete`（knife4j：`test-nvwa-api.xspaceagi.com/doc.html` → 用户相关接口 → 删除账号接口；无参，返回 `ReqResultVoid`，鉴权同其他用户接口）
+- UI：「我的」页底部新增「删除账号」入口（登录态可见，退出登录卡片下方，同款红色危险样式）
+- 交互：点击 → **弹窗二次确认**（红色确认键，文案明示数据不可恢复、手机号/邮箱不可再登录）→ 调接口 → 成功才清本地态回登录页（含 `APP-IOS` 分支）；失败保留登录态仅 toast
+- i18n：`Mobile.Header.deleteAccount*` 5 个键，zh-cn / zh-tw / zh-hk / en-us 四语言已配，`i18n:audit` 新键零告警
 
 **处理方案**：
 
-- [x] 后端提供注销 API（已确认存在，**等契约文档**）
-- [ ] 「我的」→ 设置/账号与安全 → 删除账号，入口层级不超过两级（含二次确认 + 注销后果提示）
-- [ ] 注销文案与隐私政策 `https://nuwax.com/privacy.html` 对齐
+- [x] 后端注销 API（`POST /api/user/account/delete`）
+- [x] 「我的」页删除账号入口 + 二次确认 + 注销后果提示
+- [ ] 注销说明与隐私政策 `https://nuwax.com/privacy.html` 对齐（法务侧确认政策文本提及注销渠道）
 
 ### 3. 隐私清单 / Info.plist（打包路线：**已定为云打包**）
 
@@ -146,6 +151,7 @@ manifest.json:111 配置 `universalLink: https://link.nuwax.com/wechat/`。
 
 ## 变更记录
 
+- **2026-08-17（四轮）**：接删除账号功能 —— `servers/account.uts` 新增 `apiDeleteAccount`（POST /api/user/account/delete）；「我的」页新增删除账号入口 + 弹窗二次确认 + 成功清态回登录页（失败保留登录态）；i18n 四语言 5 键。
 - **2026-08-17（三轮，对齐备案口径）**：iOS「我的订单」菜单项整个隐藏；终端 tab 硬件购买列表（产品购买卡）隐藏 —— iOS 全端无支付/订单链路，落实备案备注「不含支付功能」A 方案。`NuwaxApp(Dev).08172016` 云打包经 JS 标记验证为**二轮前旧包**（含 `setStorageSync("SUB_BACK_URL"`），仅一轮改动，不可用于回归/提审。
 - **2026-08-17（二轮，按产品细化口径）**：「我的订阅」菜单项整个隐藏（mine）；订单卡「去支付」限 `bizType == DESK_BUDDY`；应用详情侧栏增购 action + 立即订阅按钮隐藏；确认「会议订阅弹窗」= 会话详情 agent-subscription-modal（一轮已挡自动弹出与入口）。
 - **2026-08-17（一轮）**：方案 A 实施（5 处支付入口条件编译）+ logout 两处补 `APP-IOS` + 新增 `nativeResources/ios/PrivacyInfo.xcprivacy` + 打包路线定云打包。云打包 profile 侧 associated-domains 已修复（Identifiers 开能力 + regenerate profile）。

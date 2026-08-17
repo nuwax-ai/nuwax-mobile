@@ -11,6 +11,7 @@
 		<web-view
 			id="agent-detail-webview"
 			class="webview-fill"
+			v-if="webViewAlive"
 			:src="agentDetailWebUrl"
 			@load="handleWebViewLoad"
 			@message="handleWebViewMessage"
@@ -56,6 +57,13 @@
 	import { downloadFileInApp } from '@/subpackages/utils/fileTree'
 	// Android 内嵌 H5 字体放大修复：强制 webview textZoom = 100%
 	import { fixAppWebviewTextZoom } from '@/subpackages/utils/webviewTextZoom'
+	// #ifdef APP-HARMONY
+	// 鸿蒙原生录音：uni.getRecorderManager 在鸿蒙不可靠，改用 StreamPcmRecorder（AudioCapturer 采 16kHz PCM→文件）
+	import {
+		StreamPcmRecorder,
+		openHarmonyMicPermissionSettings,
+	} from '@/uni_modules/nuwax-stream-pcm-player'
+	// #endif
 	// #endif
 
 	const instance = getCurrentInstance()
@@ -67,6 +75,9 @@
 	// #ifdef APP
 	/** App 端 web-view 加载的 H5 同页地址，形如 {API_BASE_URL}/m/#/subpackages/pages/agent-detail/agent-detail?id=xxx&conversationId=yyy&accessToken=xxx */
 	const agentDetailWebUrl = ref<string>("")
+	/** iOS 26 WKWebView 释放竞态缓解：退出页面前先卸载 web-view 节点（v-if），
+	 *  延时后再执行真实导航，把 webview 销毁从页面栈 pop 的关键路径上摘出来。 */
+	const webViewAlive = ref<boolean>(true)
 	/** @load 后注入短轮询定时器 / 次数 / 成功上报标记 */
 	let appWebViewBridgeTimer: number = 0
 	let appWebViewBridgeAttempts: number = 0
@@ -199,9 +210,11 @@
 	}
 
 	/**
-	 * 原生侧键盘高度变化 → 注入内嵌 H5，驱动 H5 聊天页 keyboard-cover 顶起输入区。
-	 * Android 窗口全屏、键盘弹出时不收缩，输入区必须手动上抬；
+	 * 原生侧键盘高度变化 → 注入内嵌 H5（写 window.__nuwaxKeyboardHeight + CustomEvent）。
 	 * H5 运行时无 keyboardheightchange 事件，此桥是内嵌页 keyboardHeight 的唯一来源。
+	 * H5 侧已随布局视口收缩自动抬升输入区（index.html interactive-widget=resizes-content
+	 * + App.uvue --vh 跟随收缩），注入高度主要作兜底：仅老 WebView 视口不收缩时
+	 * chat-input-phone 才用 keyboard-cover 顶起；同时键盘事件顺带重放主桥脚本（isAppWebView 标记）。
 	 */
 	function onAppKeyboardHeightChangeForWebView(res: any): void {
 		let h = 0
@@ -403,9 +416,14 @@
 		return ""
 	}
 
-	// ---- 原生录音：RecorderManager + 流式 ASR 转写 ----
+	// ---- 原生录音：RecorderManager / StreamPcmRecorder + 流式 ASR 转写 ----
 
+	// Android/iOS：uni RecorderManager（format:'pcm'）
 	let nativeRecorderManager: RecorderManager | null = null
+	// #ifdef APP-HARMONY
+	/** 鸿蒙原生录音器（AudioCapturer → PCM 文件）；uni.getRecorderManager 在鸿蒙不可靠，不走它 */
+	let nativeHarmonyRecorder: StreamPcmRecorder | null = null
+	// #endif
 	/** 流式 ASR 会话已 begin（松手后），等待 asr_ready / 结果 */
 	let nativeAsrSessionActive: boolean = false
 	/** 已发 stop，等待 asr_result */
@@ -473,6 +491,21 @@
 		// not determined：start 时系统才弹窗，先放行
 		return new NativeMicPermissionResult(true, false)
 		// #endif
+		// #ifdef APP-HARMONY
+		// 鸿蒙：UTSHarmony.requestSystemPermission 弹系统授权窗（已授权时不重复弹）。
+		// 无静默预检 API，直接请求；拒绝（含「不再询问」）由 fail 回调返回。
+		return await new Promise<NativeMicPermissionResult>((resolve) => {
+			UTSHarmony.requestSystemPermission(
+				["ohos.permission.MICROPHONE"] as string[],
+				(allRight: boolean, _granted: string[]) => {
+					resolve(new NativeMicPermissionResult(allRight, false))
+				},
+				(doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(new NativeMicPermissionResult(false, doNotAskAgain))
+				},
+			)
+		})
+		// #endif
 	}
 
 	/** 永久拒绝权限：弹窗引导去系统设置开启（Android 跳应用权限页；iOS 跳系统设置） */
@@ -495,6 +528,10 @@
 					// #endif
 					// #ifdef APP-IOS
 					uni.openAppAuthorizeSetting({})
+					// #endif
+					// #ifdef APP-HARMONY
+					// 鸿蒙：跳转应用权限设置页（录音权限被永久拒绝时引导）
+					openHarmonyMicPermissionSettings()
 					// #endif
 				}
 			},
@@ -722,6 +759,34 @@
 		nativeBeginAsrAndPushFile(tempFilePath)
 	}
 
+	/** 丢弃并重建录音器（start 抛异常 / 看门狗超时后，缓存实例可能已不可用） */
+	function resetNativeRecorder(): void {
+		// #ifdef APP-HARMONY
+		nativeHarmonyRecorder = null
+		// #endif
+		// #ifndef APP-HARMONY
+		nativeRecorderManager = null
+		// #endif
+	}
+
+	/**
+	 * 获取原生录音器：Android/iOS 用 uni RecorderManager（format:'pcm'）；
+	 * 鸿蒙用 StreamPcmRecorder（AudioCapturer 采 16kHz PCM 写文件，行为对齐 RecorderManager）。
+	 * 两端接口一致（onStart/onStop/onError/start/stop），按平台条件编译各保留一个具体返回类型
+	 * （UTS 下返回 any 会令 Android Kotlin 编译无法解析方法调用）。
+	 */
+	// #ifdef APP-HARMONY
+	function ensureNativeRecorder(): StreamPcmRecorder {
+		if (nativeHarmonyRecorder == null) {
+			nativeHarmonyRecorder = new StreamPcmRecorder()
+			nativeHarmonyRecorder!.onStart(handleNativeRecordStart)
+			nativeHarmonyRecorder!.onStop(handleNativeRecorderStop)
+			nativeHarmonyRecorder!.onError(handleNativeRecorderError)
+		}
+		return nativeHarmonyRecorder!
+	}
+	// #endif
+	// #ifndef APP-HARMONY
 	function ensureNativeRecorder(): RecorderManager {
 		if (nativeRecorderManager == null) {
 			nativeRecorderManager = uni.getRecorderManager()
@@ -731,6 +796,7 @@
 		}
 		return nativeRecorderManager!
 	}
+	// #endif
 
 	/**
 	 * 启动超时看门狗：recorder.start() 后 onStart 未到（Android 偶发）时，
@@ -750,7 +816,7 @@
 			} catch (_e) {
 				// ignore
 			}
-			nativeRecorderManager = null
+			resetNativeRecorder()
 			evalBridgeJS(
 				`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordStartFailed") } as UTSJSONObject)})`,
 			)
@@ -830,7 +896,7 @@
 				nativeRecordingStartPending = false
 				clearNativeRecordStartWatchdog()
 				// start 抛异常：重建 recorder，避免缓存实例坏掉后反复失败
-				nativeRecorderManager = null
+				resetNativeRecorder()
 				evalBridgeJS(
 					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordStartFailed") } as UTSJSONObject)})`,
 				)
@@ -1339,6 +1405,25 @@
 	// ---- 消息分发 ----
 
 	/** web-view @message：分发原生语音指令（录音 / TTS）与媒体选择（拍照 / 相册 / 文件） */
+	/**
+	 * 返回首页的“优雅退出”：iOS 26 WKWebView 释放竞态缓解（2026-08-17 崩溃分析：
+	 * WebBackForwardList/FrameState IPC 与 webview 释放竞态，来回切换 agent 高频复现）。
+	 * 先 v-if 卸载 web-view，延时 150ms 再 switchTab，错开销毁窗口；
+	 * Android 无此崩溃，编译为直接导航保持原行为。
+	 */
+	function graceExitToHome(): void {
+		// #ifdef APP-IOS
+		if (webViewAlive.value) {
+			webViewAlive.value = false
+			setTimeout(() => {
+				uni.switchTab({ url: "/pages/index/index" })
+			}, 150)
+			return
+		}
+		// #endif
+		uni.switchTab({ url: "/pages/index/index" })
+	}
+
 	function handleWebViewMessage(e: UniWebViewMessageEvent): void {
 		const msg = parseWebViewBridgeMessage(e.detail.data)
 		if (msg == null) {
@@ -1383,6 +1468,11 @@
 					nativeDownloadAllFiles(cId)
 				}
 			}
+			return
+		}
+		if (type == "app-exit") {
+			// H5 内嵌页请求退出回首页：走 grace 卸载，避免直接导航触发 webview 销毁竞态
+			graceExitToHome()
 			return
 		}
 		if (type == "popup-back") {
@@ -1440,6 +1530,13 @@
 			closeH5TopPopup()
 			return true
 		}
+		// #ifdef APP-IOS
+		// iOS 26 WKWebView 释放竞态缓解：系统返回/侧滑先走 grace 卸载再延时退出
+		if (webViewAlive.value) {
+			graceExitToHome()
+			return true
+		}
+		// #endif
 		return false
 	})
 
@@ -1558,6 +1655,17 @@
 				// ignore
 			}
 		}
+		// #ifdef APP-HARMONY
+		// 鸿蒙：释放 AudioCapturer 录音器（含启动在途的异步创建流程），避免残留占麦
+		if (nativeHarmonyRecorder != null) {
+			try {
+				nativeHarmonyRecorder.release()
+			} catch (_eRel) {
+				// ignore
+			}
+			nativeHarmonyRecorder = null
+		}
+		// #endif
 		// 收尾原生流式 ASR：中止未完成会话并断开预热连接
 		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
 			nativeAsrSessionActive = false

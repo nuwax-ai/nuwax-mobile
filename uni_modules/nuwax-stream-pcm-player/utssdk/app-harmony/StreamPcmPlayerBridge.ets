@@ -29,6 +29,14 @@ const FALLBACK_TAIL_MS = 200
 const IDLE_POLL_MS = 20
 /** 写失败 / 0 字节写入后的重试间隔（ms），避免忙等 */
 const RETRY_POLL_MS = 10
+/**
+ * 单次 write() 超时（ms）：渲染器卡死时 write 的 Promise 可能永久挂起，
+ * 写循环被堵死 → 上层 playedMs 冻结 → 排空永不完成、图标卡在播报态。
+ * 超时后按停滞处理：放弃积压让上层 isDrained 收尾（release 会使挂起的 write 结算）。
+ */
+const WRITE_STALL_MS = 5000
+/** 0 字节写/写失败连续次数：超过即判定渲染器停滞（500×10ms ≈ 5s，对齐 WRITE_STALL_MS） */
+const ZERO_WRITE_STALL_POLLS = 500
 
 export class StreamPcmPlayerBridge {
   private renderer: audio.AudioRenderer | null = null
@@ -52,6 +60,12 @@ export class StreamPcmPlayerBridge {
   /** 代次令牌：initPlayer 自增，写循环/异步回调校验，防止旧实例的异步流程串代 */
   private gen: number = 0
   private lastWriteMs: number = 0
+  /** 连续 0 字节写/写失败次数（判定渲染器停滞，超 ZERO_WRITE_STALL_POLLS 放弃） */
+  private zeroWriteCount: number = 0
+  /** 单次 write() 超时标记（WRITE_STALL_MS 内未结算置位；每次写前重置） */
+  private writeTimedOut: boolean = false
+  /** 停滞诊断日志已打标记（防刷屏） */
+  private stallLogged: boolean = false
   /** 待写队列（ArrayBuffer，紧凑表示；push 追加、写循环顺序消费） */
   private queue: Array<ArrayBuffer> = []
 
@@ -70,6 +84,9 @@ export class StreamPcmPlayerBridge {
     this.draining = false
     this.forceStart = false
     this.lastWriteMs = 0
+    this.zeroWriteCount = 0
+    this.writeTimedOut = false
+    this.stallLogged = false
     this.queue = []
     this.running = true
     this.initRenderer(g)
@@ -247,6 +264,26 @@ export class StreamPcmPlayerBridge {
     this.drainLoop(g)
   }
 
+  /**
+   * 渲染器停滞处理：清空积压并停止写循环，让上层 isDrained 判定结束（release 由上层触发，
+   * 挂起中的 write 会随之结算）。仅停滞场景调用，正常播放不经过。
+   */
+  private giveUpOnStall(reason: string): void {
+    if (!this.stallLogged) {
+      console.error(
+        '[StreamPcmPlayerBridge] renderer stalled: ' +
+          reason +
+          ', give up queue (' +
+          this.queuedBytes +
+          'B) to let drain conclude',
+      )
+      this.stallLogged = true
+    }
+    this.queue = []
+    this.queuedBytes = 0
+    this.running = false
+  }
+
   /** 单异步写循环：顺序 `await renderer.write(ab)`，write 的 Promise 自带背压 */
   private async drainLoop(g: number): Promise<void> {
     try {
@@ -284,13 +321,39 @@ export class StreamPcmPlayerBridge {
           // writeData 回调运行在系统线程且不能 async，跨线程访问队列有损坏风险；write() 的
           // Promise 自带背压且全部在主线程，与 Android/iOS 的 push 架构一致。废弃≠移除，
           // API 12+ 仍可用；若未来 SDK 移除再迁移 writeData。
-          written = await renderer.write(ab)
+          // 写超时保护：write 的 Promise 本身不带超时，渲染器一旦卡死会永久堵死写循环 →
+          // 上层 playedMs 冻结、排空永不完成。单次写给 WRITE_STALL_MS 超时，超时按停滞放弃。
+          this.writeTimedOut = false
+          const writeP: Promise<number> = renderer.write(ab)
+          const timeoutP: Promise<number> = this.sleepMs(WRITE_STALL_MS).then(
+            (): number => {
+              this.writeTimedOut = true
+              return -1
+            },
+          )
+          written = await Promise.race<number>([writeP, timeoutP])
+          if (this.writeTimedOut) {
+            // 写挂起：放弃积压并停止写循环；等待原 write 结算（上层 release 会使其 reject），
+            // 期间不前进到下一帧，避免乱序
+            this.giveUpOnStall('write hung > ' + WRITE_STALL_MS + 'ms')
+            try {
+              await writeP
+            } catch (_eHung) {
+              // ignore
+            }
+            continue
+          }
         } catch (eWrite) {
           console.warn('[StreamPcmPlayerBridge] write failed', eWrite)
           if (this.running) {
-            // 写失败：退回队列首，避免丢帧，稍候重试
+            // 写失败：退回队列首，避免丢帧，稍候重试；连续失败判定停滞
             this.queue.unshift(ab)
-            await this.sleepMs(RETRY_POLL_MS)
+            this.zeroWriteCount += 1
+            if (this.zeroWriteCount >= ZERO_WRITE_STALL_POLLS) {
+              this.giveUpOnStall('write failed x' + this.zeroWriteCount)
+            } else {
+              await this.sleepMs(RETRY_POLL_MS)
+            }
           }
           continue
         }
@@ -298,17 +361,24 @@ export class StreamPcmPlayerBridge {
           this.queuedBytes -= totalLen
           this.writtenBytes += totalLen
           this.lastWriteMs = Date.now()
+          this.zeroWriteCount = 0
         } else if (written > 0) {
           // 部分写入：剩余字节偏移续写（不再整帧重写）
           const remain = ab.slice(written, totalLen)
           this.queuedBytes -= written
           this.writtenBytes += written
           this.lastWriteMs = Date.now()
+          this.zeroWriteCount = 0
           this.queue.unshift(remain)
         } else {
-          // 0 字节：缓冲满，整帧留待重试，稍候再写避免忙等
+          // 0 字节：缓冲满，整帧留待重试，稍候再写避免忙等；连续 0 字节判定停滞
           this.queue.unshift(ab)
-          await this.sleepMs(RETRY_POLL_MS)
+          this.zeroWriteCount += 1
+          if (this.zeroWriteCount >= ZERO_WRITE_STALL_POLLS) {
+            this.giveUpOnStall('0-byte write x' + this.zeroWriteCount)
+          } else {
+            await this.sleepMs(RETRY_POLL_MS)
+          }
         }
       }
     } finally {

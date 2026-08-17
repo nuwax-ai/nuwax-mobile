@@ -8,12 +8,12 @@
 
 | 级别 | 项 | 审核条款 / 错误码 | 状态 |
 |---|---|---|---|
-| 🔴 阻断 | 积分/订阅在 iOS 走微信/支付宝 | 3.1.1 / 3.1.2（数字商品须 IAP） | 未处理 |
-| 🔴 阻断 | 缺「删除账号」入口 | 5.1.1(v) | 未处理（需后端 API） |
-| 🔴 阻断 | 离线打包隐私清单/Info.plist 为空 | ITMS-91053 / 权限崩溃 | 未处理（仅影响离线路线） |
-| 🔴 阻断 | 中国区上架需 ICP 备案 | App Store 中国区政策 | 待确认备案状态 |
-| 🟡 缺陷 | iOS 退出登录后不跳转登录页 | —（审核员可感知） | 未处理 |
-| 🟡 确认 | 微信分享 Universal Link / AASA | 分享回调失效 | 待线上验证 |
+| 🔴 阻断 | 积分/订阅在 iOS 走微信/支付宝 | 3.1.1 / 3.1.2（数字商品须 IAP） | ✅ 已处理（2026-08-17 方案 A，条件编译屏蔽） |
+| 🔴 阻断 | 缺「删除账号」入口 | 5.1.1(v) | ⏳ 后端确认已有 API，等接口契约后接 UI |
+| 🔴 阻断 | 隐私清单 / Info.plist | ITMS-91053 / 权限崩溃 | ✅ 打包路线定为**云打包**；已建 `nativeResources/ios/PrivacyInfo.xcprivacy`，manifest 权限描述云打包直接生效 |
+| 🔴 阻断 | 中国区上架需 ICP 备案 | App Store 中国区政策 | ⏳ 待确认备案状态 |
+| 🟡 缺陷 | iOS 退出登录后不跳转登录页 | —（审核员可感知） | ✅ 已修复（mine + history-conversation-popup 两处补 `APP-IOS`） |
+| 🟡 确认 | 微信分享 Universal Link / AASA | 分享回调失效 | ⏳ 待线上验证（profile 已含 associated-domains，云打包已通过） |
 | 🟢 就绪 | 权限描述 / 隐私政策 / 图标等 | — | 见下文清单 |
 
 ---
@@ -37,8 +37,20 @@
 
 **处理方案（二选一）**：
 
-- [ ] 方案 A（快）：iOS 端条件编译屏蔽积分/订阅购买入口（增购积分按钮、订阅套餐页购买按钮、agent 订阅弹窗），保留查看（订单/订阅状态只读）；实物订单不动
-- [ ] 方案 B（长）：接入 Apple IAP（消耗型积分 + 自动续订订阅），后端增加 IAP 收据校验与发货
+- [x] 方案 A（快，**已实施 2026-08-17**）：iOS 端条件编译屏蔽积分/订阅购买入口，保留查看（订单/订阅状态只读）；实物订单不动。**入口清单（按产品确认口径）**：
+  - 「我的」tab：
+    - 「我的订阅」菜单项整个隐藏 → `pages/mine/mine.uvue`（模板层 `#ifndef APP-IOS`）
+    - 积分卡「增购」按钮隐藏 → `components/credits-breakdown/credits-breakdown.uvue`（模板 + emit 双保险；mine.uvue 的 `handleAddPurchase` 同步条件编译）
+    - 「我的订单」保留入口，订单卡「去支付」仅 `bizType == DESK_BUDDY` 展示，`CREDIT_PURCHASE` / `SUBSCRIPTION` 类型不展示 → `subpackages/pages/my-orders/components/order-card/order-card.uvue` `showPayButton`
+  - 应用详情页侧栏（`subpackages/pages/app-details/history-conversation-popup/`）：
+    - 积分区「增购」action 隐藏（总积分仍展示）、跳转 my-subscriptions 的 `handleGoSubscriptions` 不编译
+    - 「立即订阅」按钮隐藏（`app-details.uvue` 的 agent-subscription-modal 仅由此触发，源头已断）
+  - 会话详情（chat-conversation-component）：
+    - more-popup「我的订阅」菜单项 iOS 隐藏（`payEntryBlocked` + 弹窗高度联动）
+    - `AgentDetailService.uts` `handleCheckSubscriptionLimit` iOS 不自动弹订阅（支付/会议订阅）弹窗、不禁用输入框（避免无支付渠道时用户被锁死在会话中，超额由后端错误提示）
+  - 防御层：`subpackages/pages/my-subscriptions/my-subscriptions.uvue` onLoad 强制 `hidePlans = true`（即使有残留路径进入也只显示订阅状态，无购买卡片）
+  - 保留：`pages/terminal/components/desk-buddy-order-modal.uvue`（实物设备订单，3.1.5(a) 合法走微信/支付宝）
+- [ ] 方案 B（长）：接入 Apple IAP（消耗型积分 + 自动续订订阅），后端增加 IAP 收据校验与发货（后续版本再议）
 
 ### 2. 缺「删除账号」功能 —— Guideline 5.1.1(v)
 
@@ -46,33 +58,28 @@
 
 **要求**：App 支持账号注册（手机号/邮箱验证码注册），就必须提供**应用内可发现**的删除账号入口。跳转小程序、客服工单、仅邮件申请均不合格。
 
+**进展（2026-08-17）**：后端确认已有注销 API，接口契约待提供，到货后接 UI。
+
 **处理方案**：
 
-- [ ] 后端提供注销 API（如 `/api/user/delete`，含二次确认 + 冷静期逻辑由后端定）
-- [ ] 「我的」→ 设置/账号与安全 → 删除账号，入口层级不超过两级
+- [x] 后端提供注销 API（已确认存在，**等契约文档**）
+- [ ] 「我的」→ 设置/账号与安全 → 删除账号，入口层级不超过两级（含二次确认 + 注销后果提示）
 - [ ] 注销文案与隐私政策 `https://nuwax.com/privacy.html` 对齐
 
-### 3. 离线打包路线：隐私清单与 Info.plist 为空
+### 3. 隐私清单 / Info.plist（打包路线：**已定为云打包**）
 
-**现状**：
+**决定（2026-08-17）**：iOS 提审走 **HBuilderX 云打包**（profile `NuwaxAppProfileDistribution` 已含 associated-domains，打包通过）。云打包下：
 
-- 项目根**无** `nativeResources/ios/PrivacyInfo.xcprivacy`
-- 本仓 iOS 走本地离线打包（ESP 配网等 UTS 插件本地注入），而离线工程模板 `UniAppXDemo/UniAppXDemo/PrivacyInfo.xcprivacy` 是**空 `<dict/>`**
-- 离线模板 `Info.plist` 中**没有**本 App 的 NSMicrophone/Camera/Bluetooth 等权限描述（仅 demo 默认的 NFC/推送项）
-- manifest.json:177 的 `app-plus.distribute.ios.privacyDescription` **只对云打包生效**，离线工程需手动同步
-- `uni_modules/` 下全部自研 UTS 插件（`nuwax-esp-provisioning`、`nuwax-uni-math` 等）均未内置 PrivacyInfo.xcprivacy（`utssdk/app-ios` 目录）
+- [x] manifest.json:177 的 `app-plus.distribute.ios.privacyDescription`（7 条权限描述）**直接生效**，无需手动改 Info.plist
+- [x] 已创建 `nativeResources/ios/PrivacyInfo.xcprivacy`（随云打包提交，HX 4.13+ 支持）：
+  - `NSPrivacyTracking=false`、无跟踪域名
+  - 采集声明：手机号 / 邮箱 / 用户 ID / 用户内容（对话） / 购买记录（均 AppFunctionality、linked、非跟踪）
+  - required-reason API：UserDefaults（CA92.1）、FileTimestamp（C617.1）
+  - ⚠️ 口径需与 App Store Connect「App 隐私」标签保持一致；后续接 IAP/推送/统计须同步更新
+- [x] 权限面核查：全仓无定位 / 本地网络 / 语音识别调用，现有 7 条描述已覆盖（若未来启用 ESP SoftAP 配网，需补 `NSLocalNetworkUsageDescription` + `NSBonjourServiceTypes`）
+- [ ] （可选加固）自研 UTS 插件（esp-provisioning / uni-math 等）在 `utssdk/app-ios` 内置各自 PrivacyInfo——云打包会自动合并；当前被拒风险低，可观察首轮审核结果再补
 
-**后果**：
-
-- 提审包缺 required-reason API 声明（UserDefaults 等）→ 上传 App Store Connect 时 **ITMS-91053 直接拒收**
-- 缺权限描述 → 审核员一点语音输入 / 扫码 / BLE 配网即闪退
-
-**处理方案（若走离线打包）**：
-
-- [ ] 在离线工程补 `PrivacyInfo.xcprivacy`：`NSPrivacyAccessedAPITypes` 至少声明 UserDefaults（CA92.1）、FileTimestamp（C617.1 等按实际情况）；`NSPrivacyTracking=false`
-- [ ] 离线工程 `Info.plist` 同步 manifest 中的 7 条权限描述 + `UIBackgroundModes=audio`
-- [ ] 自研 UTS 插件按文档在 `utssdk/app-ios` 内置各自隐私清单（云打包会自动合并）
-- [ ] 若改走**云打包**（HX 5.15）：DCloud 按 manifest 自动生成 App 级隐私清单，ESP 插件以 uni_modules 源码参与云编译——可绕开本项大部分手工工作
+> 离线打包路线（UniAppXDemo 空 `<dict/>` 隐私清单 + Info.plist 缺权限描述）**已弃用**，仅调试基座继续用本地打包，与提审无关。
 
 ### 4. 中国大陆区上架需 ICP 备案
 
@@ -83,11 +90,14 @@
 
 ## 🟡 功能缺陷与待确认
 
-### 5. iOS 退出登录后不跳转
+### 5. iOS 退出登录后不跳转（✅ 已修复 2026-08-17）
 
-`pages/mine/mine.uvue` `performLogout` 的 `reLaunch` 仅有三个条件编译分支：`H5 || WEB`、`APP-ANDROID`、`MP-WEIXIN`，**缺 `APP-IOS`**。iOS 上退出后仅弹 toast、停留在原页。
+`performLogout` 的 `reLaunch` 缺 `APP-IOS` 分支。已在两处补齐 `// #ifdef APP-IOS` → `uni.reLaunch({ url: "/subpackages/pages/login/login" })`：
 
-- [ ] 补 `// #ifdef APP-IOS` 分支 `uni.reLaunch({ url: "/subpackages/pages/login/login" })`（审核员几乎必测登出）
+- `pages/mine/mine.uvue`
+- `subpackages/pages/app-details/history-conversation-popup/history-conversation-popup.uvue`（同款 logout 逻辑，一并修复）
+
+> 备注：`performLogout` 同样没有 `APP-HARMONY` 分支（鸿蒙 App 退出后同样不跳转），本次未动，鸿蒙上线前需补。
 
 ### 6. 微信分享 Universal Link
 
@@ -121,14 +131,20 @@ manifest.json:111 配置 `universalLink: https://link.nuwax.com/wechat/`。
 - [ ] App Store Connect「App 隐私」标签如实勾选：电话号码、邮箱、用户内容（聊天记录/AI 对话）、购买记录、设备标识符等，与隐私政策口径一致
 - [ ] 截图 / 预览（6.7" 必须，可选 6.5"/iPad 按发行设备）、关键词、描述、分级问卷（AI 聊天内容注意分级勾选）
 - [ ] 版权信息 / 技术支持 URL
-- [ ] 打包路线决策：**云打包**（隐私清单自动生成，推荐首次提审用）vs **离线打包**（需先完成第 3 项）
+- [x] 打包路线决策：**云打包**（2026-08-17 定；隐私清单 `nativeResources/ios/PrivacyInfo.xcprivacy` 随包提交，权限描述走 manifest）
 
 ## 建议处理顺序
 
-1. 代码侧小改：iOS 支付入口屏蔽（方案 A）+ logout 补 APP-IOS 分支
-2. 后端排期：注销 API + 审核测试账号
-3. 打包路线定夺 → 云打包直接走 / 离线打包先补隐私清单与 Info.plist
-4. ICP 备案确认（决定发行区域）
-5. 最后过一遍 [pre-release-checklist.md](./pre-release-checklist.md) 清调试残留
+1. ~~代码侧小改：iOS 支付入口屏蔽（方案 A）+ logout 补 APP-IOS 分支~~ ✅ 2026-08-17 完成
+2. ~~打包路线定夺~~ ✅ 已定云打包，`nativeResources/ios/PrivacyInfo.xcprivacy` 已就位
+3. ⏳ 注销 API 契约到货 → 接「我的」页删除账号入口
+4. ⏳ ICP 备案确认（决定发行区域）
+5. ⏳ 云打包出新包 → 真机回归（支付入口不可见 / logout 跳转 / 语音扫码权限）
+6. 提审前最后过一遍 [pre-release-checklist.md](./pre-release-checklist.md) 清调试残留
+
+## 变更记录
+
+- **2026-08-17（二轮，按产品细化口径）**：「我的订阅」菜单项整个隐藏（mine）；订单卡「去支付」限 `bizType == DESK_BUDDY`；应用详情侧栏增购 action + 立即订阅按钮隐藏；确认「会议订阅弹窗」= 会话详情 agent-subscription-modal（一轮已挡自动弹出与入口）。
+- **2026-08-17（一轮）**：方案 A 实施（5 处支付入口条件编译）+ logout 两处补 `APP-IOS` + 新增 `nativeResources/ios/PrivacyInfo.xcprivacy` + 打包路线定云打包。云打包 profile 侧 associated-domains 已修复（Identifiers 开能力 + regenerate profile）。
 
 > 关联文档：[pre-release-checklist.md](./pre-release-checklist.md) · [ios-esp-provisioning-local-base.md](./ios-esp-provisioning-local-base.md) · [local-custom-base-maintenance.md](./local-custom-base-maintenance.md)

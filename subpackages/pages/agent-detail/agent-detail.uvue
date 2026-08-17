@@ -5,22 +5,92 @@
 	<!-- #endif -->
 	<!-- #ifdef APP -->
 	<!-- App 端：通过 web-view 内嵌 H5 同页（H5 侧渲染聊天组件），透传当前页 agentId / conversationId。
-	     webview 全屏铺满（含状态栏/刘海区域），顶部刘海由内嵌 H5 的 custom-nav-bar 内部
-	     safety-zone 依据 URL fragment 注入的 statusBarHeight 自行占位（原生不再加 status-bar-spacer）。 -->
+	     原生 custom-nav-bar 位于 web-view 之外，position:fixed 固定于视口顶部（uni-app x 键盘弹起
+	     默认 transform 上移页面，fixed 视图锚定窗口不受影响），彻底解决「键盘弹出把顶部导航栏顶走」；
+	     H5 侧检测到内嵌（isAppWebView）时隐藏内部导航栏。
+	     原生导航事件经 evalJS 调 window.__nuwaxNavAction 通知 H5 执行；
+	     标题/图标/按钮显隐/播报开关由 H5 经 postMessage 回传 navSync 同步。 -->
 	<view class="app-webview-root">
-		<web-view
-			id="agent-detail-webview"
-			class="webview-fill"
-			v-if="webViewAlive"
-			:src="agentDetailWebUrl"
-			@load="handleWebViewLoad"
-			@message="handleWebViewMessage"
-			:bounces="false"
-			:android-nested-scroll="'none'"
+		<!-- 原生导航栏 position:fixed 固定于视口顶部：uni-app x 键盘弹起默认「transform 上移页面」，
+		     fixed 视图锚定窗口不受影响（官方键盘上推专题推荐写法）；下方同高占位顶开 webview。
+		     H5 内嵌页弹窗打开时（popup-back open）v-show 隐藏导航栏与占位，弹窗铺满整屏。 -->
+		<custom-nav-bar
+			v-show="nativeNavVisible"
+			class="app-webview-nav"
+			:title="nativeNavTitle"
+			:icon="nativeNavIcon"
+			show-back
+			has-safety-zone
+			title-align="left"
+			intercept-back
+			@back="handleNativeNavBack"
+		>
+			<template v-slot:left>
+				<!-- 智能体首页内嵌（isShowWebView）模式：返回首页（与 H5 内部导航栏 Home 一致） -->
+				<view
+					v-if="nativeShowHome"
+					class="icon-box"
+					hover-class="icon-box-hover"
+					@tap="handleNativeNavHome"
+				>
+					<svg-icon name="icon-Home" size="44" />
+				</view>
+			</template>
+			<template v-slot:right>
+				<view class="right-buttons">
+					<view
+						v-if="nativeShowMore"
+						class="icon-box"
+						hover-class="icon-box-hover"
+						@tap="handleNativeNavMore"
+					>
+						<svg-icon name="icon-More" size="44" />
+					</view>
+					<view
+						v-if="nativeShowCreateConversation"
+						class="icon-box"
+						hover-class="icon-box-hover"
+						@tap="handleNativeNavCreateConversation"
+					>
+						<svg-icon name="icon-message-add" size="44" />
+					</view>
+					<view
+						v-if="nativeShowVoiceToggle"
+						class="icon-box"
+						hover-class="icon-box-hover"
+						@tap="handleNativeNavToggleVoice"
+					>
+						<!-- 关闭态：自动播报图标 + 斜线（与 H5 内部导航栏样式一致） -->
+						<view v-if="nativeVoiceAutoPlayOff" class="voice-off-wrap">
+							<svg-icon name="icon-voice-1" size="44" />
+							<view class="voice-off-slash" />
+						</view>
+						<svg-icon v-else name="icon-voice-1" size="44" />
+					</view>
+				</view>
+			</template>
+		</custom-nav-bar>
+		<!-- 导航栏同高占位（fixed 脱离文档流后顶开下方内容）：状态栏 + 导航条高度 -->
+		<view
+			v-show="nativeNavVisible"
+			class="app-webview-nav-placeholder"
+			:style="{ height: nativeNavPlaceholderHeight + 'px' }"
 		/>
-		<!-- 不可见 sibling 占位（勿删）：Android 上页面仅有 web-view 单节点时走全屏原生层，
-		     createWebviewContext 拿不到 context，evalJS 注入失效；该占位使 web-view 保持普通节点模式。 -->
-		<view class="webview-node-placeholder" />
+		<view class="app-webview-wrap">
+			<web-view
+				id="agent-detail-webview"
+				class="webview-fill"
+				v-if="webViewAlive"
+				:src="agentDetailWebUrl"
+				@load="handleWebViewLoad"
+				@message="handleWebViewMessage"
+				:bounces="false"
+				:android-nested-scroll="'none'"
+			/>
+			<!-- 不可见 sibling 占位（勿删）：Android 上页面仅有 web-view 单节点时走全屏原生层，
+			     createWebviewContext 拿不到 context，evalJS 注入失效；该占位使 web-view 保持普通节点模式。 -->
+			<view class="webview-node-placeholder" />
+		</view>
 	</view>
 	<!-- #endif -->
 </template>
@@ -52,18 +122,23 @@
 		asrWebSocketClient,
 		ASR_SAMPLE_RATE,
 	} from '@/subpackages/utils/voice/asrWebSocketClient'
-	import { streamLocalAudioFileToAsr } from '@/subpackages/utils/voice/pcmStreamRecorder'
+	import { streamLocalAudioFileToAsrFrom } from '@/subpackages/utils/voice/pcmStreamRecorder'
+	// 实时推流管道（边说边传）：VAD + 预滚 + packetizer + sentBytes
+	import { NativeStreamAsrPipeline } from '@/subpackages/utils/voice/nativeStreamAsrPipeline'
 	// 文件树「下载全部」：内嵌 H5 改走原生下载（下载到系统公共目录）
 	import { downloadFileInApp } from '@/subpackages/utils/fileTree'
 	// Android 内嵌 H5 字体放大修复：强制 webview textZoom = 100%
 	import { fixAppWebviewTextZoom } from '@/subpackages/utils/webviewTextZoom'
-	// #ifdef APP-HARMONY
-	// 鸿蒙原生录音：uni.getRecorderManager 在鸿蒙不可靠，改用 StreamPcmRecorder（AudioCapturer 采 16kHz PCM→文件）
-	import {
-		StreamPcmRecorder,
-		openHarmonyMicPermissionSettings,
-	} from '@/uni_modules/nuwax-stream-pcm-player'
+	// App 原生导航栏（位于 web-view 之外，键盘行为无法影响）：事件经 evalJS 通知 H5
+	import CustomNavBar from '@/components/custom-nav-bar/custom-nav-bar.uvue'
+	import SvgIcon from '@/components/svg-icon/svg-icon.uvue'
+	import agentImage from '@/static/assets/agent_image.png'
+	// App 三端原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发，边说边传 ASR）
+	import { StreamPcmRecorder } from '@/uni_modules/nuwax-stream-pcm-player'
 	// #endif
+	// #ifdef APP-HARMONY
+	// 鸿蒙专属：录音权限被永久拒绝时跳转应用权限设置页
+	import { openHarmonyMicPermissionSettings } from '@/uni_modules/nuwax-stream-pcm-player'
 	// #endif
 
 	const instance = getCurrentInstance()
@@ -90,6 +165,36 @@
 	let appKeyboardHeightListenerId: number = 0
 	/** 最近一次键盘高度：webview 未就绪时随注入轮询补发（默认 0 = 键盘收起） */
 	let latestInjectedKeyboardHeight: number = 0
+
+	// ==================== App 原生导航栏（位于 web-view 之外） ====================
+	// 状态全部由 H5 内嵌页 postMessage 回传 navSync 同步（标题/图标/按钮显隐/播报开关）。
+	/** 导航栏标题（H5 headerTitle 同步） */
+	const nativeNavTitle = ref<string>("")
+	/** 导航栏图标（H5 headerIcon 同步；空串 = 不显示图标） */
+	const nativeNavIcon = ref<string>(agentImage)
+	/** 更多按钮显隐（H5: !isTempChat && !isAppDetails） */
+	const nativeShowMore = ref<boolean>(false)
+	/** 新建会话按钮显隐（H5: !isShowWebView && !isDeviceAgent && messageList.length > 0 && 非「仅一条无 id 消息」） */
+	const nativeShowCreateConversation = ref<boolean>(false)
+	/** 自动播报开关按钮显隐（H5: voiceFeatureEnabled） */
+	const nativeShowVoiceToggle = ref<boolean>(false)
+	/** 返回首页按钮显隐（H5: isShowWebView 智能体首页内嵌模式） */
+	const nativeShowHome = ref<boolean>(false)
+	/** 自动播报关闭态（斜线样式，H5 voiceAutoPlayOff 同步） */
+	const nativeVoiceAutoPlayOff = ref<boolean>(false)
+	/** 原生导航栏可见性：H5 内嵌页弹窗打开时隐藏（v-show），让弹窗铺满整屏 */
+	const nativeNavVisible = ref<boolean>(true)
+	/** 导航栏同高占位高度：状态栏 + 导航条（104rpx 按屏宽/750 换算 px，uni-app x App 不支持 uni.upx2px） */
+	let nativeNavBarPx: number = 104 / 750 * 375
+	try {
+		const sysInfo = uni.getSystemInfoSync()
+		if (sysInfo != null && sysInfo.screenWidth != null) {
+			nativeNavBarPx = 104 / 750 * (sysInfo.screenWidth as number)
+		}
+	} catch (_eNavBar) {
+		// ignore（默认按 375 屏宽兜底）
+	}
+	const nativeNavPlaceholderHeight = ref<number>(getStatusBarHeight() + nativeNavBarPx)
 
 	/**
 	 * 幂等注入脚本：uni.webview JSSDK（网页 → 原生 postMessage 桥）+ ticket cookie
@@ -416,15 +521,11 @@
 		return ""
 	}
 
-	// ---- 原生录音：RecorderManager / StreamPcmRecorder + 流式 ASR 转写 ----
+	// ---- 原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发）+ 边说边传流式 ASR ----
 
-	// Android/iOS：uni RecorderManager（format:'pcm'）
-	let nativeRecorderManager: RecorderManager | null = null
-	// #ifdef APP-HARMONY
-	/** 鸿蒙原生录音器（AudioCapturer → PCM 文件）；uni.getRecorderManager 在鸿蒙不可靠，不走它 */
-	let nativeHarmonyRecorder: StreamPcmRecorder | null = null
-	// #endif
-	/** 流式 ASR 会话已 begin（松手后），等待 asr_ready / 结果 */
+	/** App 三端原生录音器（StreamPcmRecorder）；uni.getRecorderManager 无逐帧回调，改原生采集 */
+	let nativeRecorderInstance: StreamPcmRecorder | null = null
+	/** 流式 ASR 会话已 begin（VAD 开口时），等待 asr_ready / 结果 */
 	let nativeAsrSessionActive: boolean = false
 	/** 已发 stop，等待 asr_result */
 	let nativeAsrWaitingResult: boolean = false
@@ -441,6 +542,31 @@
 	/** 录音启动超时看门狗：start 后 onStart 未到则回传错误并重建 recorder，避免缓存实例坏掉后反复失败 */
 	let nativeRecordStartTimer: number = 0
 	const NATIVE_RECORD_START_TIMEOUT_MS: number = 3000
+	/** VAD 已触发（按住中已 begin ASR） */
+	let nativeVadSpeechDetected: boolean = false
+	/** 已收 asr_ready，可推音频 */
+	let nativeReadyReached: boolean = false
+	/** ready 超时 / 连接失败 / 推流失败 → 松手读文件从已发偏移兜底 */
+	let nativeStreamFallbackArmed: boolean = false
+	/** 推流中丢过帧（pre-ready 溢出 / 实时背压 / 发送失败）→ 兜底 */
+	let nativeAudioTruncated: boolean = false
+	/** 开口检测看门狗：按住 N 秒无语音 → 停录并回传 no_speech */
+	let nativeNoSpeechTimer: number = 0
+	const NATIVE_NO_SPEECH_TIMEOUT_MS: number = 6000
+	/** 开口回调转发：VAD 触发时由 beginStreamAsr 接管（延迟绑定，规避 UTS 先声明后使用） */
+	let nativeStreamOnSpeechStart: (() => void) | null = null
+	/** 实时推流管道（边说边传）：VAD + 预滚 + pre-ready + packetizer + sentBytes */
+	let nativeStreamPipeline: NativeStreamAsrPipeline | null = new NativeStreamAsrPipeline(
+		(frame: ArrayBuffer): Promise<boolean> => {
+			return asrWebSocketClient.sendPcmAsync(frame)
+		},
+		(): void => {
+			const h = nativeStreamOnSpeechStart
+			if (h != null) {
+				h()
+			}
+		},
+	)
 
 	/** 麦克风权限检查结果：granted 已授权；deniedForever 已永久拒绝（勾选「不再询问」/ 连续拒绝，系统不再弹授权窗） */
 	class NativeMicPermissionResult {
@@ -635,7 +761,7 @@
 		clearNativeRecordStartWatchdog()
 		nativeRecordingActive = true
 		nativeRecordingStartPending = false
-		// 开录后预热 ASR WS（只建连不发 start）：松手 begin 时复用连接，减少首字等待
+		// 开录后预热 ASR WS（只建连不发 start）：VAD 开口 begin 时复用连接，减少首字等待
 		asrWebSocketClient.preheatConnect()
 		evalBridgeJS(`window.__onNativeRecordStart && window.__onNativeRecordStart()`)
 	}
@@ -644,6 +770,29 @@
 		clearNativeRecordStartWatchdog()
 		nativeRecordingActive = false
 		nativeRecordingStartPending = false
+		// 录音底层失败：中止进行中的实时 ASR 会话并重置管道，避免迟到回调污染后续会话
+		// （不清 no-speech 看门狗：nativeRecordingActive=false 后其回调自愈返回）
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			try {
+				asrWebSocketClient.abort()
+			} catch (_eAsr) {
+				// ignore
+			}
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+		}
+		const pipeline = nativeStreamPipeline
+		if (pipeline != null) {
+			try {
+				pipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
+		}
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
 		const message = readRecorderErrorMessage(err)
 		evalBridgeJS(
 			`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": message } as UTSJSONObject)})`,
@@ -676,6 +825,12 @@
 	function nativeHandleAsrError(message: string): void {
 		nativeAsrSessionActive = false
 		nativeAsrWaitingResult = false
+		if (nativeRecordingActive == true) {
+			// 按住中出错（begin/ready/推流失败）：不打断 UI，置兜底态，松手走文件兜底
+			console.warn("[ASR-live] 按住中 ASR 出错，置兜底态: " + message)
+			nativeStreamFallbackArmed = true
+			return
+		}
 		nativeReportRecordStop(
 			false,
 			"",
@@ -683,13 +838,60 @@
 		)
 	}
 
-	/** asr_ready 后切帧推完整 PCM 文件并 finish（须在 nativeBeginAsrAndPushFile 之前定义，避免 UTS error18） */
-	function nativePushRecordedFileThenFinish(tempFilePath: string): void {
+	/** 实时 PCM 帧（主线程，采集器逐帧转发）：喂给推流管道（VAD + 预滚 + packetizer） */
+	function handleNativeRecorderFrame(chunk: ArrayBuffer): void {
+		const pipeline = nativeStreamPipeline
+		if (pipeline == null) {
+			return
+		}
+		try {
+			pipeline.feed(chunk)
+		} catch (_eFeed) {
+			// ignore
+		}
+	}
+
+	/** asr_ready：管道转实时推流（先推预滚 500ms + pre-ready 队列） */
+	function nativeHandleAsrReady(): void {
+		console.log("[ASR-live] asr_ready，转实时推流")
+		nativeReadyReached = true
+		const pipeline = nativeStreamPipeline
+		if (pipeline != null) {
+			try {
+				pipeline.onReady()
+			} catch (_eReady) {
+				// ignore
+			}
+		}
+	}
+
+	/** VAD 开口：按住中 begin → asr_ready → 边说边传（消除「按住空等被服务端截断」） */
+	function beginStreamAsr(): void {
+		if (nativeAsrSessionActive == true || nativeRecordingDiscarded == true) {
+			return
+		}
+		console.log("[ASR-live] VAD 开口，按住中 begin")
+		nativeAsrSessionActive = true
+		nativeVadSpeechDetected = true
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
+		asrWebSocketClient.begin(
+			nativeHandleAsrReady,
+			nativeHandleAsrResult,
+			nativeHandleAsrError,
+		)
+		asrWebSocketClient.watchReadyAfterStop()
+	}
+
+	/** asr_ready 后从偏移切帧推剩余文件并 finish（须在 nativeBeginAsrAndPushFileFrom 之前定义，避免 UTS error18） */
+	function nativePushRecordedFileThenFinishFrom(tempFilePath: string, skipBytes: number): void {
 		if (nativeAsrSessionActive != true) {
 			return
 		}
-		streamLocalAudioFileToAsr(
+		streamLocalAudioFileToAsrFrom(
 			tempFilePath,
+			skipBytes,
 			(frame: ArrayBuffer): Promise<boolean> => {
 				return asrWebSocketClient.sendPcmAsync(frame)
 			},
@@ -715,16 +917,25 @@
 		)
 	}
 
-	/** 原生侧流式 ASR：松手后 begin → asr_ready → 推 PCM 文件 → finish → 回传最终文本 */
-	function nativeBeginAsrAndPushFile(tempFilePath: string): void {
+	/**
+	 * 松手兜底：中止残留会话后 begin → asr_ready → 推文件。
+	 * skipBytes 仅在同一会话内续推时才 >0；跨会话（abort 后新 begin）必须传 0
+	 * （服务端每次 start 关闭上一会话，新会话收不到 [0, skipBytes) → 漏首段）。
+	 */
+	function nativeBeginAsrAndPushFileFrom(tempFilePath: string, skipBytes: number): void {
 		if (nativeAsrSessionActive == true) {
-			return
+			asrWebSocketClient.abort()
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
 		}
 		nativeAsrSessionActive = true
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = true
+		nativeVadSpeechDetected = true
 		asrWebSocketClient.begin(
 			(): void => {
-				// asr_ready 后立刻切帧推完整文件
-				nativePushRecordedFileThenFinish(tempFilePath)
+				nativeReadyReached = true
+				nativePushRecordedFileThenFinishFrom(tempFilePath, skipBytes)
 			},
 			(text: string, ok: boolean, errorMessage: string): void => {
 				nativeHandleAsrResult(text, ok, errorMessage)
@@ -736,8 +947,27 @@
 		asrWebSocketClient.watchReadyAfterStop()
 	}
 
+	/** 兼容旧入口：完整推文件（skipBytes=0） */
+	function nativePushRecordedFileThenFinish(tempFilePath: string): void {
+		nativePushRecordedFileThenFinishFrom(tempFilePath, 0)
+	}
+
+	/** 兼容旧入口：整段推文件（skipBytes=0） */
+	function nativeBeginAsrAndPushFile(tempFilePath: string): void {
+		nativeBeginAsrAndPushFileFrom(tempFilePath, 0)
+	}
+
+	function clearNativeNoSpeechWatchdog(): void {
+		if (nativeNoSpeechTimer != 0) {
+			clearTimeout(nativeNoSpeechTimer)
+			nativeNoSpeechTimer = 0
+		}
+	}
+
 	function handleNativeRecorderStop(res: any | null): void {
 		nativeRecordingActive = false
+		clearNativeRecordStartWatchdog()
+		clearNativeNoSpeechWatchdog()
 		// 孤儿录音（新会话启动前被强制停掉的旧录音）的 stop 回调：丢弃，不打扰新会话
 		if (nativeSuppressNextStop == true) {
 			nativeSuppressNextStop = false
@@ -746,6 +976,18 @@
 		// 已作废的录音（H5 轻触/取消）：跳过 ASR 转写，避免白跑一次 WS 识别
 		if (nativeRecordingDiscarded == true) {
 			nativeRecordingDiscarded = false
+			const pipeline = nativeStreamPipeline
+			if (pipeline != null) {
+				try {
+					pipeline.reset()
+				} catch (_ePipe) {
+					// ignore
+				}
+			}
+			nativeVadSpeechDetected = false
+			nativeReadyReached = false
+			nativeStreamFallbackArmed = false
+			nativeAudioTruncated = false
 			return
 		}
 		const tempFilePath = readRecorderStopString(res, "tempFilePath")
@@ -755,48 +997,88 @@
 			)
 			return
 		}
-		// 原生侧流式 ASR：begin → asr_ready → 推 PCM → finish → __onNativeRecordStop 回传最终文本
-		nativeBeginAsrAndPushFile(tempFilePath)
+		const pipeline = nativeStreamPipeline
+		const pipelineTruncated =
+			pipeline != null &&
+			(pipeline.isTruncated() == true || pipeline.isPushFailed() == true)
+		// 分支1：实时链路健康（VAD 开口已 begin、已 ready、未兜底、未丢帧）→ flush 剩余 → finish
+		const liveHealthy =
+			nativeAsrSessionActive == true &&
+			nativeReadyReached == true &&
+			nativeStreamFallbackArmed != true &&
+			pipelineTruncated != true
+		if (liveHealthy == true && pipeline != null) {
+			try {
+				console.log("[ASR-live] 松手：实时链路健康，flush+finish sent=" + pipeline.getSentBytes())
+				pipeline.flushPending((): void => {
+					if (nativeAsrSessionActive != true) {
+						return
+					}
+					nativeAsrWaitingResult = true
+					// 略延后 stop，给底层 WS 刷新 binary 的时间
+					setTimeout((): void => {
+						if (nativeAsrSessionActive != true) {
+							return
+						}
+						asrWebSocketClient.finish()
+					}, 40)
+				})
+			} catch (_eFlush) {
+				// flush 异常：走兜底全量推文件（与分支2一致）
+				nativeBeginAsrAndPushFileFrom(tempFilePath, 0)
+			}
+			return
+		}
+		// 分支2：兜底（无语音未 begin / ready 未达 / 推流截断或失败 / 连接断开）
+		console.warn("[ASR-live] 松手：走兜底全量推文件 session=" + (nativeAsrSessionActive == true ? 1 : 0) + " ready=" + (nativeReadyReached == true ? 1 : 0) + " fallbackArmed=" + (nativeStreamFallbackArmed == true ? 1 : 0) + " truncated=" + (pipelineTruncated == true ? 1 : 0))
+		// 必须「中止旧会话 → 开新会话 → 从 0 全量推文件」：
+		// 服务端每次 start 关闭上一会话并开新会话（docs 3.3），会话间不共享音频；
+		// 若按已发偏移（sentBytes）续推，新会话将永远缺失开头 [0, sentBytes) → 漏首段。
+		// 全量重推 = 旧版已验证行为，代价仅是重传已发字节（仅在异常兜底路径发生）。
+		nativeBeginAsrAndPushFileFrom(tempFilePath, 0)
 	}
 
 	/** 丢弃并重建录音器（start 抛异常 / 看门狗超时后，缓存实例可能已不可用） */
 	function resetNativeRecorder(): void {
-		// #ifdef APP-HARMONY
-		nativeHarmonyRecorder = null
-		// #endif
-		// #ifndef APP-HARMONY
-		nativeRecorderManager = null
-		// #endif
+		nativeRecorderInstance = null
 	}
 
 	/**
-	 * 获取原生录音器：Android/iOS 用 uni RecorderManager（format:'pcm'）；
-	 * 鸿蒙用 StreamPcmRecorder（AudioCapturer 采 16kHz PCM 写文件，行为对齐 RecorderManager）。
-	 * 两端接口一致（onStart/onStop/onError/start/stop），按平台条件编译各保留一个具体返回类型
-	 * （UTS 下返回 any 会令 Android Kotlin 编译无法解析方法调用）。
+	 * 获取原生录音器：App 三端统一 StreamPcmRecorder
+	 * （Android AudioRecord / iOS AVAudioEngine tap / 鸿蒙 AudioCapturer，接口一致：
+	 * onStart/onStop/onError/onFrame/start/stop/release）。注册逐帧回调走边说边传推流。
 	 */
-	// #ifdef APP-HARMONY
 	function ensureNativeRecorder(): StreamPcmRecorder {
-		if (nativeHarmonyRecorder == null) {
-			nativeHarmonyRecorder = new StreamPcmRecorder()
-			nativeHarmonyRecorder!.onStart(handleNativeRecordStart)
-			nativeHarmonyRecorder!.onStop(handleNativeRecorderStop)
-			nativeHarmonyRecorder!.onError(handleNativeRecorderError)
+		if (nativeRecorderInstance == null) {
+			nativeRecorderInstance = new StreamPcmRecorder()
+			nativeRecorderInstance!.onStart(handleNativeRecordStart)
+			nativeRecorderInstance!.onStop(handleNativeRecorderStop)
+			nativeRecorderInstance!.onError(handleNativeRecorderError)
+			nativeRecorderInstance!.onFrame(handleNativeRecorderFrame)
 		}
-		return nativeHarmonyRecorder!
+		return nativeRecorderInstance!
 	}
-	// #endif
-	// #ifndef APP-HARMONY
-	function ensureNativeRecorder(): RecorderManager {
-		if (nativeRecorderManager == null) {
-			nativeRecorderManager = uni.getRecorderManager()
-			nativeRecorderManager!.onStart(handleNativeRecordStart)
-			nativeRecorderManager!.onStop(handleNativeRecorderStop)
-			nativeRecorderManager!.onError(handleNativeRecorderError)
-		}
-		return nativeRecorderManager!
+
+	/** 按住 N 秒仍无语音：停录并回传 no_speech（VAD 未触发，无 ASR 会话可 abort） */
+	function armNativeNoSpeechWatchdog(): void {
+		clearNativeNoSpeechWatchdog()
+		nativeNoSpeechTimer = setTimeout((): void => {
+			nativeNoSpeechTimer = 0
+			if (nativeRecordingActive != true || nativeVadSpeechDetected == true) {
+				return
+			}
+			// 无语音：作废本轮并复位（走孤儿 stop 抑制，避免打扰后续会话）
+			console.warn("[ASR-live] 按住 " + NATIVE_NO_SPEECH_TIMEOUT_MS + "ms 无语音，停录回传 no_speech")
+			nativeSuppressNextStop = true
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_eStop) {
+				// ignore
+			}
+			nativeReportRecordStop(false, "", t("Mobile.Voice.noSpeechDetected"))
+		}, NATIVE_NO_SPEECH_TIMEOUT_MS) as number
 	}
-	// #endif
 
 	/**
 	 * 启动超时看门狗：recorder.start() 后 onStart 未到（Android 偶发）时，
@@ -840,6 +1122,21 @@
 			asrWebSocketClient.abort()
 			nativeAsrSessionActive = false
 			nativeAsrWaitingResult = false
+		}
+		// 新一轮实时会话：重置推流管道 + 绑定开口回调（VAD 触发 → beginStreamAsr）
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
+		clearNativeNoSpeechWatchdog()
+		nativeStreamOnSpeechStart = beginStreamAsr
+		const streamPipeline = nativeStreamPipeline
+		if (streamPipeline != null) {
+			try {
+				streamPipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
 		}
 		nativeRecordingStopArrived = false
 		nativeRecordingDiscarded = false
@@ -892,6 +1189,8 @@
 				recorder.start(options)
 				// onStart 未到则看门狗兜底（回传错误 + 重建 recorder）
 				armNativeRecordStartWatchdog()
+				// 按住 N 秒无语音 → 停录回传 no_speech（边说边传的开口兜底）
+				armNativeNoSpeechWatchdog()
 			} catch (e) {
 				nativeRecordingStartPending = false
 				clearNativeRecordStartWatchdog()
@@ -911,6 +1210,29 @@
 	 */
 	function nativeRecordDiscard(): void {
 		nativeRecordingDiscarded = true
+		clearNativeNoSpeechWatchdog()
+		// 中止进行中的实时 ASR 会话 + 重置管道，避免迟到回调污染新一轮录音
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			try {
+				asrWebSocketClient.abort()
+			} catch (_eAsrDiscard) {
+				// ignore
+			}
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+		}
+		const pipeline = nativeStreamPipeline
+		if (pipeline != null) {
+			try {
+				pipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
+		}
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
 		if (nativeRecordingActive == true) {
 			nativeSuppressNextStop = true
 			nativeRecordingActive = false
@@ -925,6 +1247,7 @@
 	function nativeStopRecord(): void {
 		nativeRecordingStopArrived = true
 		clearNativeRecordStartWatchdog()
+		clearNativeNoSpeechWatchdog()
 		if (nativeRecordingActive == true) {
 			nativeRecordingActive = false
 			try {
@@ -1476,9 +1799,11 @@
 			return
 		}
 		if (type == "popup-back") {
-			// H5 内嵌页弹窗开合状态同步（uni-modal-popup 经 popupBackRegistry 上报）
+			// H5 内嵌页弹窗开合状态同步（uni-modal-popup 经 popupBackRegistry 上报）；
+			// 弹窗打开时隐藏原生导航栏（v-show），导航栏让位给弹窗遮罩（导航栏在弹窗下面）
 			const action = `${msg["action"]}`
 			appWebViewPopupOpen = action == "open"
+			nativeNavVisible.value = !appWebViewPopupOpen
 			return
 		}
 		if (type == "tts") {
@@ -1503,6 +1828,24 @@
 				nativeTtsSetMuted(msg["muted"] == true)
 			}
 		}
+		if (type == "navSync") {
+			// H5 内嵌页导航状态同步 → 原生导航栏（标题/图标/按钮显隐/播报开关）
+			const titleRaw = msg["title"]
+			if (titleRaw != null) {
+				nativeNavTitle.value = `${titleRaw}`
+			}
+			const iconRaw = msg["icon"]
+			if (iconRaw != null) {
+				// 空串 = 不显示图标（临时会话/未配置图标），与 H5 内部导航栏行为一致
+				nativeNavIcon.value = `${iconRaw}`
+			}
+			nativeShowMore.value = msg["showMore"] == true
+			nativeShowCreateConversation.value = msg["showCreateConversation"] == true
+			nativeShowVoiceToggle.value = msg["showVoiceToggle"] == true
+			nativeShowHome.value = msg["showHome"] == true
+			nativeVoiceAutoPlayOff.value = msg["voiceAutoPlayOff"] == true
+			return
+		}
 	}
 
 	/** 通知 H5 关闭顶层弹窗（fire-and-forget；状态回传走 popup-back 消息自校正） */
@@ -1519,6 +1862,53 @@
 			// ignore
 		}
 	}
+
+	// ==================== App 原生导航栏事件 → H5 ====================
+
+	/** evalJS 通知 H5 执行导航动作（window.__nuwaxNavAction，H5 侧分发到对应处理器） */
+	function evalNavAction(action: string): void {
+		evalBridgeJS(
+			`try{window.__nuwaxNavAction && window.__nuwaxNavAction('${action}')}catch(e){}`,
+		)
+	}
+
+	/** 返回：与 onBackPress 同策略——H5 有弹窗先关弹窗；iOS 走 grace 卸载缓解释放竞态；否则通知 H5 abort 流式后由 JSSDK 弹回 */
+	function handleNativeNavBack(): void {
+		if (appWebViewPopupOpen == true) {
+			closeH5TopPopup()
+			return
+		}
+		// #ifdef APP-IOS
+		// iOS 26 WKWebView 释放竞态缓解：与 onBackPress 一致，先卸载 webview 再延时退出
+		if (webViewAlive.value) {
+			graceExitToHome()
+			return
+		}
+		// #endif
+		evalNavAction("back")
+	}
+
+	/** 更多：通知 H5 打开 more-popup（弹窗渲染在 H5 内部） */
+	function handleNativeNavMore(): void {
+		evalNavAction("more")
+	}
+
+	/** 新建会话：通知 H5 发起新会话 */
+	function handleNativeNavCreateConversation(): void {
+		evalNavAction("createConversation")
+	}
+
+	/** 自动播报开/关：通知 H5 切换（状态经 navSync 回传更新图标） */
+	function handleNativeNavToggleVoice(): void {
+		evalNavAction("toggleVoice")
+	}
+
+	/** 返回首页（isShowWebView 智能体首页内嵌模式）：通知 H5 走 app-exit 原生 grace 退出 */
+	function handleNativeNavHome(): void {
+		evalNavAction("home")
+	}
+
+
 
 	/**
 	 * 返回拦截：H5 内嵌页有弹窗打开时先关弹窗，避免 Android 返回手势
@@ -1647,6 +2037,7 @@
 			nativeTtsStateListenerId = 0
 		}
 		stopAllSpeechPlayback()
+		clearNativeNoSpeechWatchdog()
 		if (nativeRecordingActive == true) {
 			nativeRecordingActive = false
 			try {
@@ -1655,17 +2046,27 @@
 				// ignore
 			}
 		}
-		// #ifdef APP-HARMONY
-		// 鸿蒙：释放 AudioCapturer 录音器（含启动在途的异步创建流程），避免残留占麦
-		if (nativeHarmonyRecorder != null) {
+		// App 三端：释放录音器（含 Android/iOS 采集线程与鸿蒙启动在途的异步创建流程），避免残留占麦
+		if (nativeRecorderInstance != null) {
 			try {
-				nativeHarmonyRecorder.release()
+				nativeRecorderInstance!.release()
 			} catch (_eRel) {
 				// ignore
 			}
-			nativeHarmonyRecorder = null
+			nativeRecorderInstance = null
 		}
-		// #endif
+		// 重置推流管道（作废在途 sendFrame 回调）
+		if (nativeStreamPipeline != null) {
+			try {
+				nativeStreamPipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
+		}
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
 		// 收尾原生流式 ASR：中止未完成会话并断开预热连接
 		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
 			nativeAsrSessionActive = false
@@ -1714,7 +2115,8 @@
 </script>
 
 <style lang="scss" scoped>
-	/* App web-view 容器：webview 全屏铺满（含状态栏/刘海区域），顶部刘海由内嵌 H5 导航栏内部处理 */
+	/* App web-view 容器：顶部为原生 custom-nav-bar，下方 webview 内容区（不再全屏铺满）。
+	   原生导航栏位于 web-view 之外，键盘/WebView 引擎行为影响不到它。 */
 	.app-webview-root {
 		display: flex;
 		flex-direction: column;
@@ -1723,10 +2125,77 @@
 		overflow: hidden;
 	}
 
-	/* webview 占满整个页面 */
-	.webview-fill {
-		flex: 1;
+	/* 原生导航栏：position:fixed 锚定窗口顶部，键盘弹起页面上推（transform）时不受影响；
+	   背景不透明（白色），盖住下方被上推的 webview 内容 */
+	.app-webview-nav {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		z-index: 100;
+		background-color: #ffffff;
+	}
+
+	/* 导航栏同高占位：fixed 脱离文档流后，占位在文档流中顶开 webview 到导航栏下方 */
+	.app-webview-nav-placeholder {
 		width: 100%;
+		flex-shrink: 0;
+	}
+
+	/* webview 内容区：占满导航栏下方剩余空间 */
+	.app-webview-wrap {
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
+	}
+
+	/* webview 占满内容区 */
+	.webview-fill {
+		width: 100%;
+		height: 100%;
+	}
+
+	/* 导航栏右侧按钮（与 H5 聊天页 styles/index.scss 保持一致） */
+	.right-buttons {
+		display: flex;
+		flex-direction: row;
+	}
+
+	.icon-box {
+		width: 80rpx;
+		height: 80rpx;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 12rpx;
+
+		&-hover {
+			background-color: rgba(12, 20, 102, 0.04);
+		}
+	}
+
+	/* 自动播报关闭态：icon-voice-1 上叠加斜线（与 H5 内部导航栏一致） */
+	.voice-off-wrap {
+		position: relative;
+		width: 64rpx;
+		height: 64rpx;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		overflow: visible;
+	}
+
+	.voice-off-slash {
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		width: 42rpx;
+		height: 4rpx;
+		margin-left: -18rpx;
+		margin-top: -2rpx;
+		border-radius: 2rpx;
+		background-color: #000;
+		transform: rotate(45deg);
 	}
 
 	/* Android web-view 兄弟占位：不可见、不拦截触摸，仅用于让 web-view 保持普通节点模式（见模板注释，勿删） */

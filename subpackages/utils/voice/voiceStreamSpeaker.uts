@@ -41,14 +41,25 @@ const MAX_MERGED_UTTERANCE_CHARS = 50;
 const STREAM_SEGMENT_WAIT_TIMEOUT_MS = 15000;
 
 /**
- * 生产节流阈值（原生流式）：播放缓冲（enqueuedMs − playedMs）低于该值才喂下一句。
+ * 生产节流阈值（原生流式）：播放缓冲（Android=enqueuedMs−writtenMs 写队列深度，单调可靠；
+ * iOS/鸿蒙=enqueuedMs−playedMs）低于该值才喂下一句。
  * 服务端只合成「即将播放」的 2~3 句（单块 ≤50 字 ≈11s < 阈值）——中途停止浪费有限；
  * PCM 到达匹配播放节奏 → 队列不积压 → 长文本不再逼近背压上限、不丢帧。
  * 句长突发（长句一次回 10s+）会短暂超出该值，但受句子长度而非文本总长约束。
+ * 注：该阈值只决定队列深度；喂入节奏由闸门B（等完整到达）钉死在播放速度上。
  */
 const FEED_PACING_BUFFER_MS = 12000;
 /** 生产节流轮询间隔：缓冲未达标时每 200ms 复查一次 */
 const FEED_PACING_POLL_MS = 200;
+
+/**
+ * 闸门B超时（ms）：喂出上一句后等它「完整到达」的最长等待。
+ * 节流闸门只能测到已送达播放器的音频，测不到服务端正在合成的——合成延迟窗口内
+ * 连喂多句会一次性承诺几百秒音频、队列照样顶满背压丢帧。故放行下一句前须等上一句
+ * 音频完整到达（enqueued 增长 ≥ 估算时长）；但估算可能偏高（标点/表格多）或服务端
+ * 慢速送达，超时兜底放行，防停喂导致当前语音中断。
+ */
+const FEED_FULL_DELIVERY_TIMEOUT_MS = 5000;
 
 /**
  * 首个 PCM 到达前最多喂入的句子数（启动上限）。
@@ -114,6 +125,12 @@ export class VoiceStreamSpeaker {
   private feeding: boolean = false;
   /** 首个 PCM 到达前已喂入句数（begin 重置；首个 PCM 到达后不再参与节流） */
   private startupFeedCount: number = 0;
+  /** 上次喂出句子的时刻（闸门B判定用；0=本轮尚未喂过） */
+  private lastFeedAtMs: number = 0;
+  /** 上次喂出句子时的 enqueuedMs（闸门B判定用；-1=无播放器/未喂过，不阻塞） */
+  private lastFeedEnqueuedMs: number = -1;
+  /** 上次喂出句子的估算音频时长（ms）：enqueued 相对上次增长 ≥ 此值视为完整到达 */
+  private lastFeedExpectedMs: number = 0;
   /** 段就绪 / 会话结束的等待器（kickPlay 挂起，回调唤醒） */
   private segmentWaiter: (() => void) | null = null;
   /** 段等待兜底超时（停流时强制收尾，防悬挂） */
@@ -152,6 +169,9 @@ export class VoiceStreamSpeaker {
     this.playLooping = false;
     this.feeding = false;
     this.startupFeedCount = 0;
+    this.lastFeedAtMs = 0;
+    this.lastFeedEnqueuedMs = -1;
+    this.lastFeedExpectedMs = 0;
     this.segmentWaiter = null;
     this.clearSegmentWaitTimer();
     this.onPendingEnqueued = null;
@@ -484,8 +504,26 @@ export class VoiceStreamSpeaker {
                 break;
               }
             } else if (buffered < FEED_PACING_BUFFER_MS) {
-              // 缓冲低于阈值：放行下一句
-              break;
+              // 缓冲低于阈值：放行下一句，但须闸门B——节流只能测到已送达播放器的
+              // 音频，测不到服务端正在合成的：合成延迟窗口内连喂多句（每句≈11s）
+              // 会一次性承诺几百秒音频，队列照样顶满背压丢帧。上一句音频「完整到达」
+              // （enqueued 相对上次喂入增长 ≥ 估算时长，单调只增）或超时兜底
+              // （估算偏高/服务端慢速期放行，防停喂中断当前语音）才真正放行。
+              const enqueuedNow = ttsWebSocketPlayer.getNativeEnqueuedMs();
+              const delivered = enqueuedNow - this.lastFeedEnqueuedMs;
+              const fullDelivered =
+                this.lastFeedExpectedMs > 0 &&
+                delivered >= this.lastFeedExpectedMs;
+              const waitTimeout =
+                Date.now() - this.lastFeedAtMs >=
+                FEED_FULL_DELIVERY_TIMEOUT_MS;
+              if (
+                this.lastFeedEnqueuedMs < 0 ||
+                fullDelivered ||
+                waitTimeout
+              ) {
+                break;
+              }
             }
             await new Promise<void>((resolve) => {
               setTimeout(() => {
@@ -503,6 +541,17 @@ export class VoiceStreamSpeaker {
         }
         ttsWebSocketPlayer.feedStreamText(utt, false);
         this.startupFeedCount += 1;
+        // 闸门B基线：记录本次喂出时刻、当时的 enqueuedMs 与本句估算音频时长。
+        // 下一句放行前须看到 enqueued 相对本基线增长 ≥ 估算时长（完整到达）；
+        // 播放器未创建时 getNativeEnqueuedMs=-1，启动期不受此闸门限制（由上方
+        // MAX_STARTUP_FEED_UTTERANCES 约束）。估算 ~170ms/字（中文 TTS 约 5~6 字/s），
+        // 下限 2s 防止过短句过早放行。
+        this.lastFeedAtMs = Date.now();
+        this.lastFeedEnqueuedMs = ttsWebSocketPlayer.getNativeEnqueuedMs();
+        this.lastFeedExpectedMs = Math.max(
+          2000,
+          Math.floor(utt.length * 170),
+        );
         // 让出主线程：SSE 洪峰时否则 TTS WS / 音频回调要等会话结束后才被调度
         await new Promise<void>((resolve) => {
           setTimeout(() => {

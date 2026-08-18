@@ -7,10 +7,10 @@
 
 | 违规类 | 数量 | 处置 |
 |---|---|---|
-| 纯后代嵌套（R1，运行时丢样式） | **74 处 / 6 文件** | 人工反嵌套（本清单） |
-| 复合 `.a.b`（R3） | 2 处 | file-preview-h5 等，模板加条件类 |
+| 纯后代嵌套（R1，运行时丢样式） | ~~74~~ **35 处 / 4 文件**（初版扫描器注释行误报已修正） | ✅ 已全部修复（2026-08-18） |
+| 复合 `.a.b`（R3） | 1 处业务 | ✅ file-preview-h5 已拆条件类（katex-el 属 uni_modules 上游） |
 | 伪类 `:active/:hover/:last-child` | ~46 处 | **可放弃渐进增强**（规则原文），不修 |
-| `defineOptions({styleIsolation})` 缺失 | 19 文件 | 补 `app`（terminal 系 + about-me 系为主） |
+| `defineOptions({styleIsolation})` 缺失 | 18 文件（example 已删） | ✅ 已全部补齐 |
 | `android.*` 业务 import | 0 | webviewTextZoom 已 `#ifndef APP-ANDROID` 门控 ✅ |
 | 模板多行属性 | 0 | ✅ |
 | 三方 uni_modules（lime/uni-ai-x 嵌套 ~1000 处） | 上游债 | 走上游升级（lime-v4 对齐另案） |

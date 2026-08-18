@@ -147,7 +147,7 @@ public class StreamPcmRecorderBridge {
     }
 
     /// 释放（页面销毁 / 弃用）：不回传 onStop
-    public func release() {
+    public func dispose() {
         finishInternal()
         lock.lock()
         pendingChunks.removeAll()

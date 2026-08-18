@@ -34,11 +34,12 @@ public class RaTeXBridge: NSObject {
      把一条 LaTeX 渲染成 PNG dataURL（同步，建议在后台队列或 setTimeout 内调用）。
      - returns: 编码结果串（见文件头约定）
      */
+    /* uts 侧按位调用（UTS 无 Swift 参数标签语法），标签全部下划线化 */
     @objc public static func renderToPngDataUrl(
         _ tex: String,
-        displayMode: Bool,
-        fontSizePx: CGFloat,
-        colorHex: String
+        _ displayMode: Bool,
+        _ fontSizePx: CGFloat,
+        _ colorHex: String
     ) -> String {
         ensureFonts()
         let color = UIColor.ratex_fromHex(colorHex)

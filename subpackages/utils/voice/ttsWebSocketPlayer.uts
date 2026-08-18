@@ -835,17 +835,46 @@ export class TtsWebSocketPlayer {
   }
 
   /**
-   * 原生流式：已投递播放器但尚未播完的 PCM 时长（ms）= enqueued − played。
-   * 供 voiceStreamSpeaker.kickFeed 做「生产节流」：缓冲低于阈值才喂下一句，
-   * 让服务端只合成即将播放的内容。非原生 / 播放器未创建返回 -1（不可用，不节流）。
+   * 原生流式：已投递播放器但尚未播完的 PCM 时长（ms）。
+   * Android 用 enqueued − written（写队列深度，单调可靠）：播放头 getPlaybackHeadPosition
+   * 在部分机型为负/跳变，负值使节流闸门永不关（队列排不空、喂入卡死），虚报大值使闸门
+   * 永不开（竞速无约束）；written 只增不减且按播放实时推进，绕开播放头。
+   * iOS/鸿蒙播放头可靠，维持 enqueued − played 语义。
+   * 供 voiceStreamSpeaker.kickFeed 做「生产节流」：缓冲低于阈值才喂下一句。
+   * 非原生 / 播放器未创建返回 -1（不可用，不节流）。
    */
   getNativeBufferedMs(): number {
-    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    // #ifdef APP-ANDROID
+    const p = this.streamPcmPlayer;
+    if (p == null) {
+      return -1;
+    }
+    return p.getEnqueuedMs() - p.getWrittenMs();
+    // #endif
+    // #ifdef APP-IOS || APP-HARMONY
     const p = this.streamPcmPlayer;
     if (p == null) {
       return -1;
     }
     return p.getEnqueuedMs() - p.getPlayedMs();
+    // #endif
+    // #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
+    return -1;
+    // #endif
+  }
+
+  /**
+   * 原生流式：已投递播放器的 PCM 总时长（ms）；播放器未创建返回 -1。
+   * 供 kickFeed 闸门B判定「上一句音频是否完整到达」——enqueued 单调递增，
+   * 相对上次喂入的增长量即已送达的音频量。
+   */
+  getNativeEnqueuedMs(): number {
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    const p = this.streamPcmPlayer;
+    if (p == null) {
+      return -1;
+    }
+    return p.getEnqueuedMs();
     // #endif
     // #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
     return -1;
@@ -1438,7 +1467,7 @@ export class TtsWebSocketPlayer {
       if (
         this.streamFlushSent != true &&
         this.streamSessionActive == true &&
-        this.nativeNoAudioRearmCount < NATIVE_NO_AUDIO_REARM_LIMIT
+        this.nativeNoAudioRearmCount < this.NATIVE_NO_AUDIO_REARM_LIMIT
       ) {
         this.nativeNoAudioRearmCount += 1;
         console.warn("[TTS] no-audio: SSE still streaming, re-arm watchdog");
@@ -1572,7 +1601,7 @@ export class TtsWebSocketPlayer {
         this.lastDrainWrittenMs = player.getWrittenMs();
       } else if (
         Date.now() - this.lastDrainProgressAtMs >=
-        NATIVE_DRAIN_PROGRESS_WINDOW_MS
+        this.NATIVE_DRAIN_PROGRESS_WINDOW_MS
       ) {
         const written = player.getWrittenMs();
         const advanced = written - this.lastDrainWrittenMs;
@@ -1580,7 +1609,7 @@ export class TtsWebSocketPlayer {
         this.lastDrainWrittenMs = written;
         if (
           written < player.getEnqueuedMs() &&
-          advanced < NATIVE_DRAIN_MIN_PROGRESS_MS
+          advanced < this.NATIVE_DRAIN_MIN_PROGRESS_MS
         ) {
           console.warn(
             "[TTS] native drain stalled: writtenMs=" +
@@ -1592,7 +1621,7 @@ export class TtsWebSocketPlayer {
               " advanced=" +
               advanced +
               " in " +
-              NATIVE_DRAIN_PROGRESS_WINDOW_MS +
+              this.NATIVE_DRAIN_PROGRESS_WINDOW_MS +
               "ms",
           );
           this.clearStreamDrainPoll();
@@ -2782,6 +2811,29 @@ export class TtsWebSocketPlayer {
         this.state != "paused" &&
         this.state != "idle"
       ) {
+        // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+        // 原生流式：连接断开但音频已入播放器时，不硬切——置 inputDone 让已入队的
+        // 播完（排空轮询自然收尾），避免「服务端断连/网络抖动」直接把正在播的声音
+        // 掐断（鸿蒙实测连接中途断开会导致播报 2~8s 即断）。未入任何音频
+        // （player 未创建 / enqueued==0）才按失败收尾。
+        if (
+          this.streamNativeActive == true &&
+          this.streamPcmPlayer != null &&
+          this.streamPcmPlayer!.getEnqueuedMs() > 0
+        ) {
+          console.warn(
+            "[TTS] session socket closed mid-stream, drain buffered audio enqueuedMs=" +
+              this.streamPcmPlayer!.getEnqueuedMs(),
+          );
+          this.socketTask = null;
+          this.stopKeepalive();
+          this.streamInputDone = true;
+          this.streamInputDoneAtMs = Date.now();
+          this.clearFlushEndWatchdog();
+          this.armStreamDrainPoll();
+          return;
+        }
+        // #endif
         this.fail("TTS 连接已关闭");
       } else {
         this.socketTask = null;
@@ -3046,6 +3098,13 @@ export class TtsWebSocketPlayer {
   }
 
   stop(): void {
+    // 诊断：定位「播报被静默掐断」的 stop 来源（resetStreamSessionState 释放无声）
+    console.warn(
+      "[TTS] ttsWebSocketPlayer.stop streamSessionActive=" +
+        this.streamSessionActive +
+        " messageId=" +
+        this.messageId,
+    );
     // 流式会话：先发 close 结束服务端会话，再收尾
     if (this.streamSessionActive == true) {
       this.closeStreamSession();

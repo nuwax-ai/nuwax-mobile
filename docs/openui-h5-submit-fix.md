@@ -1,5 +1,8 @@
 # OpenUI H5 表单无法提交修复
 
+> 接入总览、H5/`mp-html` 卡片与**内嵌 H5 回写会话**链路见
+> [openui-mobile-integration.md](./openui-mobile-integration.md)。
+
 ## 问题
 H5 和 App 场景下，OpenUI 生成的页面均无法提交表单，顶部提示「Share preview is read-only and cannot submit forms.」。
 

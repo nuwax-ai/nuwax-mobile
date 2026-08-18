@@ -96,21 +96,17 @@ key: sec2_verifier   (blob, current buffer maximum 384 bytes)
 
 ### 4.3 二维码
 
-双方采用以下 Nuwax v1 payload：
+双方采用 Nuwax URL 方案（旧 JSON v1 payload 已废弃，APP 只接受 URL）：
 
-```json
-{
-  "ver": "v1",
-  "name": "PROV_A1B2C3",
-  "transport": "ble",
-  "network": "wifi",
-  "security": 2,
-  "username": "NX-A1B2-C3D4-E5F6",
-  "pop": "PER_DEVICE_RANDOM_POP"
-}
+```text
+https://nuwax.com/lz.html?n=PROV_A1B2C3&u=NX-A1B2-C3D4-E5F6&p=<逐设备随机PoP>
 ```
 
-`security` 是 Nuwax 扩展字段。Android 解析器必须接受该字段；其余字段与 Espressif Security 2 provisioning 语义一致。生产 PoP 不通过 BLE、串口日志或 `device-info` 回传。
+- `n`：广播名 `PROV_` + STA MAC 后三字节大写十六进制。
+- `u`：Security 2 username（设备 UID，如 `NX-A1B2-C3D4-E5F6`）。
+- `p`：Security 2 逐设备随机 PoP。
+
+APP 只接受 `nuwax.com` 及其子域名、路径 `/lz.html` 的链接，防止误扫普通网页二维码。`transport` / `network` / `security` 不再由二维码携带，按冻结契约固定为 ble / wifi / Security 2（不降级）。生产 PoP 不通过 BLE、串口日志或 `device-info` 回传。
 
 ## 5. Endpoint 与 capabilities
 

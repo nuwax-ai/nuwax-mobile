@@ -21,6 +21,7 @@
         @onOpenPagePreview="handleOpenPagePreview"
         @onOpenFileTree="handleOpenFileTree"
         :is-task-agent="isTaskAgentVal"
+        :is-device-agent="isDeviceAgentVal"
         :sandbox-list="sandboxListVal"
         :current-sandbox-id="currentSandboxId"
         :is-sandbox-switch-disabled="isSandboxSwitchDisabled"
@@ -66,18 +67,6 @@
         }}</text>
       </view>
 
-      <!-- 订阅限制蒙层 -->
-      <!-- <view
-        class="permission-mask clickable"
-        v-else-if="subscriptionRequired"
-        @tap="handleOpenSubscription"
-      >
-        <text class="permission-text text-blue">{{
-          t("Mobile.Chat.subscriptionRequiredTip")
-        }}</text>
-        <text class="sub-arrow">➔</text>
-      </view> -->
-
       <!-- 录音波形 -->
       <view v-if="isRecording" class="waveform">
         <view
@@ -103,6 +92,8 @@
           class="voice-recorder-button-full"
           :duration="600000"
           :is-conversation-active="isConversationActive"
+          :enable-asr="enableVoice"
+          :native-bridge="enableVoice"
           @onRecordPress="handleVoicePress"
           @onRecordStart="handleVoiceStart"
           @onRecordStop="handleVoiceStop"
@@ -292,11 +283,11 @@
     <view
       class="ai-generate-text-container"
       :class="{ 'ios-wechat': isIOSWechatMiniProgram }"
-      ><text class="ai-generate-text">{{
-        t("Mobile.Chat.aiGeneratedDisclaimer")
-      }}</text></view
-    >
+      >
+      <text class="ai-generate-text">{{t("Mobile.Chat.aiGeneratedDisclaimer")}}</text>
+    </view>
     <view
+      class="keyboard-cover"
       :style="{ height: keyboardHeight + 'px' }"
     ></view>
     <!-- 技能选择模态框 -->
@@ -322,6 +313,12 @@
   import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
   import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
   import { speechSocketWarmup } from "@/subpackages/utils/voice/speechSocketWarmup";
+  import { nativeVoiceBridge } from "@/subpackages/utils/voice/nativeVoiceBridge";
+  import {
+    nativeMediaBridge,
+    type NativeMediaPickedFile,
+  } from "@/subpackages/utils/voice/nativeMediaBridge";
+  import { isAppWebViewEmbedded } from "@/utils/system.uts";
   import {
     AgentManualComponentInfo,
     AgentSelectedComponentInfo,
@@ -458,6 +455,31 @@
   }
   // #endif
 
+  // #ifdef H5 || WEB
+  /**
+   * App web-view 内嵌页专用：接收原生壳注入的键盘高度。
+   * H5 运行时不会派发 keyboardheightchange，由 agent-detail 原生页监听
+   * uni.onKeyboardHeightChange 后 evalJS 注入（写 window.__nuwaxKeyboardHeight
+   * 并派发 'nuwax:keyboardHeightChange' CustomEvent）。
+   */
+  function onInjectedKeyboardHeightChange(evt: any): void {
+    try {
+      const detail = (evt as any)["detail"] as UTSJSONObject | null;
+      if (detail != null) {
+        const raw = detail["height"];
+        if (raw != null) {
+          const h = parseFloat(`${raw}`);
+          if (!isNaN(h)) {
+            keyboardHeight.value = h > 0 ? h : 0;
+          }
+        }
+      }
+    } catch (_eObj) {
+      // ignore
+    }
+  }
+  // #endif
+
   // 是否显示额外功能栏
   const showExtraContainer = ref<boolean>(false);
   // 输入方式
@@ -530,6 +552,8 @@
       // 是否默认展开扩展页面区域
       expandPageArea?: number;
       isTaskAgent?: boolean;
+      /** 是否设备智能体（设备智能体不显示工作台入口） */
+      isDeviceAgent?: boolean;
       sandboxList?: SandboxInfo[];
       currentSandboxId?: string;
       isSandboxSwitchDisabled?: boolean;
@@ -545,9 +569,11 @@
       agentId?: number;
       agentType?: string;
       isTempChat?: boolean;
-      subscriptionRequired?: boolean;
+      // subscriptionRequired?: boolean;
       // 是否允许用户选择自动/审批模式
       allowChooseMode?: number;
+      // 是否启用语音输入（录音 + ASR）；仅 App web-view 内嵌页为 true
+      enableVoice?: boolean;
     }>(),
     {
       manualComponents: () => [],
@@ -555,6 +581,7 @@
       isStoppingConversation: false,
       wholeDisabled: false,
       isTaskAgent: false,
+      isDeviceAgent: false,
       sandboxList: () => [],
       currentSandboxId: "",
       isSandboxSwitchDisabled: false,
@@ -569,8 +596,9 @@
       agentId: 0,
       agentType: "ChatBot",
       isTempChat: false,
-      subscriptionRequired: false,
+      // subscriptionRequired: false,
       allowChooseMode: 0,
+      enableVoice: true,
     },
   );
 
@@ -631,7 +659,6 @@
     (e: 'onOpenFileTree'): void;
     (e: 'onSandboxChange', sandboxId: string): void;
     (e: 'onModelChange', modelId: number, name: string): void;
-    (e: 'onOpenSubscription'): void;
     (e: 'onScrollToLastMsg', smooth: boolean): void;
   }>();
 
@@ -643,11 +670,6 @@
   // 切换模型
   const handleModelChange = (modelId: number, name: string) => {
     emit("onModelChange", modelId, name);
-  };
-
-  // 触发打开订阅弹窗
-  const handleOpenSubscription = () => {
-    emit("onOpenSubscription");
   };
 
   // 打开文件树
@@ -745,6 +767,24 @@
     // #ifdef APP
     appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChange);
     // #endif
+
+    // #ifdef H5 || WEB
+    // App web-view 内嵌页：接收原生壳注入的键盘高度（evalJS 写全局 + CustomEvent）
+    try {
+      const w = window as any;
+      w.addEventListener("nuwax:keyboardHeightChange", onInjectedKeyboardHeightChange);
+      // 桥注入可能早于本组件挂载（evalJS 先于渲染），读全局兜底一次
+      const cached = w.__nuwaxKeyboardHeight;
+      if (cached != null) {
+        const h = parseFloat(`${cached}`);
+        if (!isNaN(h)) {
+          keyboardHeight.value = h > 0 ? h : 0;
+        }
+      }
+    } catch (_eObj) {
+      // ignore
+    }
+    // #endif
   });
 
   // 更新波形动画
@@ -775,11 +815,23 @@
   // 组件卸载时清理资源
   onUnmounted(() => {
     stopDurationTimer();
+    nativeMediaBridge.setResultHandler(null);
     uni.$off("NuwaxAgentModeChanged", handleNuwaxAgentModeChanged);
     // #ifdef APP
     if (appKeyboardHeightListenerId != 0) {
       uni.offKeyboardHeightChange(appKeyboardHeightListenerId);
       appKeyboardHeightListenerId = 0;
+    }
+    // #endif
+
+    // #ifdef H5 || WEB
+    try {
+      (window as any).removeEventListener(
+        "nuwax:keyboardHeightChange",
+        onInjectedKeyboardHeightChange,
+      );
+    } catch (_eObj) {
+      // ignore
     }
     // #endif
   });
@@ -963,6 +1015,7 @@
 
   /** APP 端向子组件传递 boolean/string props 时使用 computed */
   const isTaskAgentVal = computed((): boolean => props.isTaskAgent == true);
+  const isDeviceAgentVal = computed((): boolean => props.isDeviceAgent == true);
   const allowOtherModelVal = computed((): boolean => props.allowOtherModel == true);
   const readonlyVal = computed((): boolean => props.readonly == true);
   const pageHomeIndexVal = computed((): string => {
@@ -1036,6 +1089,73 @@
   // 前置间接引用（uploadMultipleFiles 定义在下方，UTS 不支持函数声明提升）
   let _uploadMultipleFiles: ((filePaths: string[]) => Promise<void>) | null = null;
 
+  /**
+   * App web-view 内嵌页原生媒体选择结果：把原生返回的文件列表喂给现有上传流程。
+   * 非内嵌（浏览器/原生页/小程序）走 uni.chooseImage/chooseFile 的路径不受影响。
+   */
+  const handleNativeMediaResult = (
+    success: boolean,
+    action: string,
+    pickedFiles: NativeMediaPickedFile[],
+    cancelled: boolean,
+    error: string,
+  ) => {
+    pageSystemOverlay.end();
+    if (cancelled == true) {
+      return;
+    }
+    if (success != true || pickedFiles.length == 0) {
+      if (error.length > 0) {
+        uni.showToast({
+          title: error,
+          position: "bottom",
+        });
+      }
+      return;
+    }
+    const isImage = action == "chooseImage";
+    const _files = [] as UTSJSONObject[];
+    for (let i = 0; i < pickedFiles.length; i++) {
+      const f = pickedFiles[i];
+      // 原生侧已上传完成：url/key 为后端返回结果，path 仅兜底
+      const fileUrl = f.url;
+      const resolvedUrl = fileUrl.length > 0 ? fileUrl : f.path;
+      const fileSize = f.size;
+      let resolvedName = f.name;
+      if (resolvedName.length == 0) {
+        const pathParts = resolvedUrl.split("/");
+        if (pathParts.length > 0) {
+          resolvedName = pathParts[pathParts.length - 1];
+        }
+        if (resolvedName.length == 0) {
+          resolvedName = isImage ? "image.jpg" : "file";
+        }
+      }
+      let resolvedType = f.type;
+      if (resolvedType.length == 0) {
+        resolvedType = isImage ? "image/jpeg" : "application/octet-stream";
+      } else if (isImage && resolvedType.indexOf("image/") < 0) {
+        // 后端未给 image/* 时按文件名扩展名兜底
+        const guessed = guessImageMimeFromPath(resolvedName);
+        if (guessed.indexOf("image/") >= 0) {
+          resolvedType = guessed;
+        }
+      }
+      const uploadFile = new UTSJSONObject();
+      uploadFile["url"] = resolvedUrl;
+      uploadFile["key"] = f.key;
+      uploadFile["name"] = resolvedName;
+      uploadFile["type"] = resolvedType;
+      uploadFile["size"] = fileSize;
+      uploadFile["status"] = UploadFileStatus.done;
+      uploadFile["percent"] = 100;
+      uploadFile["uid"] = getFileUid();
+      _files.push(uploadFile);
+    }
+    files.value = [...files.value, ..._files];
+    console.log("[Upload] native done count=" + _files.length);
+  };
+
   // 选择文件
   const chooseFile = () => {
     // 如果已选择文件数量大于等于默认文件数量，则提示
@@ -1051,6 +1171,16 @@
     // 标记 overlay：避免选文件触发的 onHide 误暂停轮询 / 长隐藏恢复（与 ASR·TTS 无关）
     // Android 常先 App Show、后 complete；endOnNextShow 防 depth 泄漏
     pageSystemOverlay.begin("chooseFile", true);
+    // App web-view 内嵌页：文件选择走原生（权限/系统选择器由原生处理），
+    // 结果经 __onNativeMediaResult 回传复用现有上传流程；浏览器/原生页逻辑不变。
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded() == true) {
+      nativeMediaBridge.setup();
+      nativeMediaBridge.setResultHandler(handleNativeMediaResult);
+      nativeMediaBridge.chooseFile(maxCount);
+      return;
+    }
+    // #endif
     uni.chooseFile({
       type: "file",
       count: maxCount,
@@ -1275,6 +1405,16 @@
     // 标记 overlay：避免相册/相机 onHide 误暂停轮询 / 长隐藏恢复（与 ASR·TTS 无关）
     // endOnNextShow 兜底 complete 晚于 onShow 的机型
     pageSystemOverlay.begin("chooseImage." + sourceTypeItem, true);
+    // App web-view 内嵌页：拍照/相册走原生（权限 + 系统选择器由原生处理），
+    // 结果经 __onNativeMediaResult 回传复用现有上传流程；浏览器/原生页逻辑不变。
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded() == true) {
+      nativeMediaBridge.setup();
+      nativeMediaBridge.setResultHandler(handleNativeMediaResult);
+      nativeMediaBridge.chooseImage(sourceTypeItem, maxCount);
+      return;
+    }
+    // #endif
     uni.chooseImage({
       sourceType: [sourceTypeItem],
       sizeType: ["compressed"],
@@ -1800,6 +1940,10 @@
     // 仅在确实在播时打断。无播报勿调 stop（会拆掉子组件刚 preheat 的空闲连）。
     // 若打断了正在播的 TTS：stop 会 release 连接，而此前 preheat 因已有业务连直接 return，
     // 需再预热一次，保证本轮回复仍能复用预热连。
+    if (nativeVoiceBridge.isActive() == true && nativeVoiceBridge.isTtsBusy() == true) {
+      // App web-view 内嵌页：原生播报由原生侧在开录时自行打断，这里双保险
+      nativeVoiceBridge.ttsStop();
+    }
     if (voiceStreamSpeaker.isBusy() == true) {
       stopAllSpeechPlayback();
       uni.$emit("streamSpeakInterrupt", {});
@@ -2264,6 +2408,17 @@
     right: 0;
     // margin-bottom: env(safe-area-inset-bottom);
   }
+
+  // 键盘占位：高度跟随软键盘，抬起底部输入区
+  // Android 的键盘高度不包含安全区域高度，其他平台包含
+  .keyboard-cover {
+    // #ifdef APP-ANDROID
+    margin-bottom: env(safe-area-inset-bottom);
+    // #endif
+    // #ifndef APP-ANDROID
+    padding-bottom: env(safe-area-inset-bottom);
+    // #endif
+  }
   .ai-generate-text {
     font-size: 18rpx;
     color: #999;
@@ -2317,19 +2472,6 @@
     margin-left: 12rpx;
   }
   // #endif
-
-  // vapor: 原 &.clickable（.permission-mask 复合）hoist 为顶层单类
-  .clickable {
-    /* #ifndef APP */
-    cursor: pointer;
-    /* #endif */
-    background-color: rgba(247, 250, 255, 0.95);
-    border: 1px dashed rgba(0, 122, 255, 0.3);
-    padding: 0 16rpx;
-  }
-  .clickable:active {
-    background-color: rgba(235, 243, 255, 0.98);
-  }
 
   // #ifdef H5
   /* #ifndef APP */

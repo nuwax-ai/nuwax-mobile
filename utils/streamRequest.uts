@@ -78,6 +78,10 @@ function sseTextLooksTerminal(text: string): boolean {
   if (lower.indexOf("\"completed\":\"1\"") >= 0) {
     return true;
   }
+  // FINAL_RESULT 事件同样表示整轮结束（业务终态，可能不带 completed 字段）
+  if (lower.indexOf("\"eventtype\":\"final_result\"") >= 0) {
+    return true;
+  }
   return false;
 }
 
@@ -120,6 +124,21 @@ function isCompletedPayload(data: any): boolean {
   }
   const completedStr = completedRaw != null ? `${completedRaw}` : "";
   return completedStr == "true" || completedStr == "1";
+}
+
+/**
+ * 判断 SSE 载荷是否为业务终态事件 FINAL_RESULT（顶层 eventType）。
+ * 正常会话只要进入 FINAL_RESULT 即整轮结束（即使未带 completed 字段），
+ * 此前流式层不识别该事件，导致连接正常关闭时走 onTimeout 误判异常
+ * （loading 反复翻转 / sub 续接自激循环）。该帧携带 finalResult 载荷，
+ * 与 completed 帧不同，须先派发业务层落库，再标终态收尾。
+ */
+function isFinalResultPayload(data: any): boolean {
+  if (data == null) {
+    return false;
+  }
+  const eventTypeRaw = readRawField(data, "eventType");
+  return eventTypeRaw != null && `${eventTypeRaw}` == "FINAL_RESULT";
 }
 
 /** 心跳包，不含 data */
@@ -549,6 +568,19 @@ export class StreamRequest {
               return;
             }
 
+            // FINAL_RESULT：业务终态事件（正常会话进入即整轮结束，可能不带 completed）。
+            // 与 completed 帧不同，其携带 finalResult 载荷，须先派发业务层再标终态收尾。
+            if (isFinalResultPayload(data)) {
+              const finalChunk = createContentChunk(
+                data != null ? JSON.stringify(data) : "",
+              );
+              config.onChunk?.(finalChunk);
+              this.receivedTerminalMarker = true;
+              this.clearTimeoutMonitor();
+              config.onComplete?.();
+              return;
+            }
+
             if (shouldSkipSsePayloadEmit(data)) {
               return;
             }
@@ -862,7 +894,8 @@ export class StreamRequest {
       if (looksLikeJSON) {
         try {
           const data = JSON.parse(content) as UTSJSONObject;
-          if (isCompletedPayload(data)) {
+          // FINAL_RESULT 同样为终态帧：留给终态流程统一处理（含业务层落库），不在此当普通帧排空
+          if (isCompletedPayload(data) || isFinalResultPayload(data)) {
             this.sseDispatchQueue.unshift(content);
             break;
           }
@@ -1039,12 +1072,24 @@ export class StreamRequest {
       // 尝试解析 JSON 数据
       try {
         const data = JSON.parse(content) as UTSJSONObject;
-        if (isCompletedPayload(data)) {
+        const isFinalResultEvent = isFinalResultPayload(data);
+        if (isCompletedPayload(data) || isFinalResultEvent) {
+          // 终态已标记（[DONE] / completed / FINAL_RESULT 多路径）：FINAL_RESULT 帧
+          // 仍携带 finalResult 载荷，须派发业务层落库，但不重复收尾。
           if (this.receivedTerminalMarker == true) {
+            if (isFinalResultEvent == true) {
+              config.onChunk?.(createContentChunk(content));
+            }
             return;
           }
+          // 先排空积压的非终态帧（前置 MESSAGE delta 先落库），再派发 FINAL_RESULT
+          // 载荷（标 Complete + 写 finalResult），最后标终态收尾——避免连接正常关闭时
+          // 被误判为 onTimeout → finalizeStreamAbnormally（loading 翻转 / sub 续接循环）。
           this.materializeBurstRestToQueue(config, onStreamComplete);
           this.flushQueuedNonTerminalBeforeComplete(config, onStreamComplete);
+          if (isFinalResultEvent == true) {
+            config.onChunk?.(createContentChunk(content));
+          }
           this.receivedTerminalMarker = true;
 
           // 清除超时监控
@@ -1722,6 +1767,13 @@ export class StreamRequest {
           try {
             const parseData = JSON.parse(content) as UTSJSONObject;
             if (isCompletedPayload(parseData)) {
+              config.onComplete?.();
+              return;
+            }
+            // FINAL_RESULT：业务终态事件，先派发载荷再 complete（与 completed 帧不同）
+            if (isFinalResultPayload(parseData)) {
+              const chunk = createContentChunk(content);
+              config.onChunk?.(chunk);
               config.onComplete?.();
               return;
             }

@@ -1,0 +1,877 @@
+/**
+ * Nuwax Stream PCM Player（App-Android）
+ *
+ * 基于 Android AudioTrack（MODE_STREAM）的流式 PCM16 播放器：
+ * - 主线程读取 Uint8Array 并逐字节写入紧凑 ByteBuffer（1x 内存，跨线程安全；
+ *   绝不能跨线程读 Uint8Array——uni-app x typed-array 跨线程读会返回 0/乱码，
+ *   且同一 buffer 只能读一次，重复读返回全 0）
+ * - 后台线程只做 `AudioTrack.write(ByteBuffer, ...)`（非阻塞写，缓冲满时 sleep 重试）
+ *
+ * 用法：
+ *   const player = new StreamPcmPlayer();
+ *   player.init(16000);            // 16kHz mono PCM16
+ *   player.push(frame);            // 每帧 Uint8Array（PCM16 LE）
+ *   player.ensurePlaying();        // 攒够起始缓冲后 play()
+ *   player.isDrained();            // 已入队的 PCM 是否全部播完（含队列积压）
+ *   player.release();              // 结束释放（唤醒并 join 后台线程）
+ */
+import AudioTrack from 'android.media.AudioTrack'
+import AudioRecord from 'android.media.AudioRecord'
+import ByteBuffer from 'java.nio.ByteBuffer'
+import Thread from 'java.lang.Thread'
+import LinkedBlockingQueue from 'java.util.concurrent.LinkedBlockingQueue'
+import AtomicLong from 'java.util.concurrent.atomic.AtomicLong'
+import FileOutputStream from 'java.io.FileOutputStream'
+
+/** 开始播放前的最小缓冲（音频 ms）：略攒一点再播，减少开局 underrun */
+const START_PLAY_MS = 150
+
+// Android AudioTrack 常量（Java 静态字段在 UTS 互操作中不可直接引用，用稳定字面量）
+const AUDIO_STREAM_MUSIC = 3
+const AUDIO_CHANNEL_OUT_MONO = 4
+const AUDIO_ENCODING_PCM_16BIT = 2
+const AUDIO_MODE_STREAM = 1
+/** 非阻塞写：写不进就留在重试队列，避免阻塞写把写入线程永久挂死（track 冻结时） */
+const AUDIO_WRITE_NON_BLOCKING = 0
+/** 数字 0（UTS 中 0.toInt() 会被解析成小数，须用具名常量） */
+const INT_ZERO = 0
+/**
+ * 队列积压字节上限（约 10 分钟音频 @16kHz mono16 = 19.2MB）。
+ * 生产（WS 投递）快于播放实时速度时队列会积压；帧内用紧凑 ByteBuffer（1x 内存），
+ * 10 分钟积压仅 ~19MB 堆，长回复（几分钟）不会触发丢帧。仅超长音频/极端生产过快才丢帧兜底。
+ */
+const MAX_QUEUED_BYTES = 19200000
+
+/** 待写帧：主线程读出的紧凑 ByteBuffer + 字节数（跨线程安全，1x 内存）。
+ *  offset = 部分写入后的续写起点；totalLen = 入队时原始字节数（队列计数用）。 */
+class PcmFrame {
+  /** 待写数据（主线程一次性写入；每次写前 position=offset） */
+  data: ByteBuffer | null = null
+  /** 剩余待写字节数（部分写入后递减） */
+  len: number = 0
+  /** 续写偏移：从 data[offset] 起写剩余字节 */
+  offset: number = 0
+  /** 入队时总字节数（队列背压计数用，写完整帧后释放） */
+  totalLen: number = 0
+}
+
+export class StreamPcmPlayer {
+  private track: AudioTrack | null = null
+  private sampleRate: number = 16000
+  /** 后台写入线程（取帧 → 阻塞写 AudioTrack） */
+  private writerThread: Thread | null = null
+  /** 待写 PCM 帧队列（无界，主线程 put 不阻塞） */
+  private queue: LinkedBlockingQueue<any> | null = null
+  /** 非阻塞写未写满的重试帧（写入线程先消费它，防止丢帧） */
+  private retryFrame: PcmFrame | null = null
+  private running: boolean = false
+  /** 后台线程已成功写入的字节数（线程安全计数） */
+  private writtenBytes: AtomicLong | null = null
+  /** 主线程已入队的总字节数（含队列积压；排空判定用它，避免队列未清空就提前结束） */
+  private enqueuedBytes: AtomicLong | null = null
+  /** 当前在队（未写完整帧）的字节数：背压上限判定用，写完整帧后递减 */
+  private queuedBytes: AtomicLong | null = null
+  private started: boolean = false
+  /** 诊断：已写入帧数（release 日志用） */
+  private framesWritten: number = 0
+  /** 诊断：因队列超上限被丢弃的帧数（正常播放应为 0，>0 说明生产远快于播放） */
+  private droppedFrames: number = 0
+  /** 构造时请求的 AudioTrack 缓冲字节数（排空尾部时长上界计算用） */
+  private bufferBytes: number = 0
+
+  /**
+   * 创建 AudioTrack（MODE_STREAM，16bit mono），缓冲取 getMinBufferSize 与「1s 容量」较大者；
+   * 启动后台写入线程。
+   */
+  initPlayer(sampleRate: number): void {
+    this.releasePlayer()
+    this.sampleRate = sampleRate > 0 ? sampleRate : 16000
+    let minBuf = 0
+    try {
+      minBuf = AudioTrack.getMinBufferSize(
+        this.sampleRate.toInt(),
+        AUDIO_CHANNEL_OUT_MONO.toInt(),
+        AUDIO_ENCODING_PCM_16BIT.toInt(),
+      )
+    } catch (_eMin) {
+      minBuf = 0
+    }
+    let bufSize = this.sampleRate * 2
+    if (bufSize < minBuf) {
+      bufSize = minBuf
+    }
+    this.bufferBytes = bufSize.toInt()
+    try {
+      this.track = new AudioTrack(
+        AUDIO_STREAM_MUSIC.toInt(),
+        this.sampleRate.toInt(),
+        AUDIO_CHANNEL_OUT_MONO.toInt(),
+        AUDIO_ENCODING_PCM_16BIT.toInt(),
+        bufSize.toInt(),
+        AUDIO_MODE_STREAM.toInt(),
+      )
+    } catch (eInit: any) {
+      console.error('[StreamPcmPlayer] init failed', eInit)
+      this.track = null
+    }
+    this.writtenBytes = new AtomicLong(0)
+    this.enqueuedBytes = new AtomicLong(0)
+    this.queuedBytes = new AtomicLong(0)
+    this.started = false
+    this.framesWritten = 0
+    this.droppedFrames = 0
+    this.queue = new LinkedBlockingQueue()
+    this.running = true
+    const q = this.queue
+    const track = this.track
+    this.writerThread = new Thread((): void => {
+      // 诊断：打印写入线程名，检测是否存在重复的写入线程（重复写=打架）
+      try {
+        console.log(
+          '[StreamPcmPlayer] writer thread=' +
+            Thread.currentThread().getName(),
+        )
+      } catch (_eT) {
+        // ignore
+      }
+      while (this.running) {
+        if (q == null || track == null) {
+          break
+        }
+        let frame = this.retryFrame
+        this.retryFrame = null
+        if (frame == null) {
+          let item: any
+          try {
+            item = q.take()
+          } catch (_eTake) {
+            break
+          }
+          if (item == null) {
+            break
+          }
+          frame = item as PcmFrame
+        }
+        // len<=0 空帧 = release 哨兵；offset 越界防御（不应发生，兜底）
+        if (frame == null || frame.len <= 0 || frame.data == null || frame.offset >= frame.len) {
+          break
+        }
+        try {
+          // 后台线程：从紧凑 ByteBuffer 的 offset 起把剩余字节直接写 AudioTrack
+          // （无需逐字节转换；每次写前显式 position=offset，NON_BLOCKING 写会推进 position）
+          const remaining = frame.len.toInt()
+          const bb = frame.data
+          bb!.position(frame.offset.toInt())
+          const written = track.write(
+            bb!,
+            remaining,
+            AUDIO_WRITE_NON_BLOCKING.toInt(),
+          )
+          if (written >= remaining) {
+            // 整帧写完：释放队列字节计数（背压额度归还）；进度只计本次写完的剩余字节
+            // （部分写已累计过，勿再按 totalLen 加，否则 writtenMs 翻倍）
+            this.queuedBytes!.addAndGet(-frame.totalLen.toLong())
+            this.writtenBytes!.addAndGet(remaining.toLong())
+            this.framesWritten += 1
+          } else if (written > 0) {
+            // 部分写入：偏移前进、剩余递减，下一轮从新偏移续写（不再整帧重写）
+            frame.offset += written
+            frame.len = remaining - written
+            this.writtenBytes!.addAndGet(written.toLong())
+            this.retryFrame = frame
+          } else {
+            // 缓冲满：整帧留待重试；小睡让 track 腾缓冲，避免忙等
+            this.retryFrame = frame
+            try {
+              Thread.sleep(10)
+            } catch (_eSleep) {
+              // ignore
+            }
+          }
+        } catch (eWrite: any) {
+          console.warn('[StreamPcmPlayer] write failed', eWrite)
+          this.retryFrame = frame
+        }
+      }
+    })
+    this.writerThread!.start()
+  }
+
+  /**
+   * 推入一帧 PCM16 LE 字节：主线程把 Uint8Array 逐字节写入紧凑 ByteBuffer（1x 内存，
+   * 替代逐字节装箱 number[] 的 ~20x 放大——这是长音频不 OOM 且能提高背压上限的前提），
+   * 只把纯 Java 对象入队交给后台线程写。
+   */
+  push(chunk: Uint8Array): void {
+    const q = this.queue
+    if (
+      this.running != true ||
+      q == null ||
+      chunk == null ||
+      chunk.length == 0
+    ) {
+      return
+    }
+    const len = chunk.length
+    // 背压：队列在队字节超上限时丢弃本帧，防极端生产过快导致内存膨胀。
+    // 上限已提至 ~10 分钟音频，正常长回复不触发；触发时音频有短暂缺口但 app 不崩。
+    const qb = this.queuedBytes
+    if (qb == null || qb.get() + len > MAX_QUEUED_BYTES) {
+      this.droppedFrames += 1
+      return
+    }
+    // 主线程读 Uint8Array 元素（uni-app x 共享游标：同一 buffer 只能读一次，重复读返回 0），
+    // 只读这一次写入紧凑 ByteBuffer，此后绝不再碰该 Uint8Array。
+    const bb = ByteBuffer.allocate(len.toInt())
+    for (let i = 0; i < len; i++) {
+      bb.put(chunk[i].toByte())
+    }
+    bb.rewind()
+    const frame = new PcmFrame()
+    frame.data = bb
+    frame.len = len
+    frame.totalLen = len
+    try {
+      q.put(frame)
+      qb.addAndGet(len.toLong())
+      this.enqueuedBytes!.addAndGet(len.toLong())
+    } catch (_ePut) {
+      // ignore
+    }
+    this.ensurePlaying()
+  }
+
+  /** 后台线程持续消费队列，无需额外冲刷 */
+  flushPending(): void {
+    // no-op
+  }
+
+  /** 攒够起始缓冲后开始播放（幂等） */
+  ensurePlaying(): void {
+    if (this.started == true) {
+      return
+    }
+    if (this.getWrittenMs() < START_PLAY_MS) {
+      return
+    }
+    this.playNow()
+  }
+
+  /** 立即开始播放（幂等；输入结束时强制用，避免短音频不出声） */
+  playNow(): void {
+    const track = this.track
+    if (track == null || this.started == true) {
+      return
+    }
+    this.started = true
+    try {
+      track.play()
+    } catch (ePlay: any) {
+      console.warn('[StreamPcmPlayer] play failed', ePlay)
+      this.started = false
+    }
+  }
+
+  /** 静音开关：音量 0 / 1 */
+  setMuted(muted: boolean): void {
+    const track = this.track
+    if (track == null) {
+      return
+    }
+    try {
+      const vol = muted == true ? 0 : 1
+      track.setVolume(vol.toFloat())
+    } catch (_eVol) {
+      // ignore
+    }
+  }
+
+  /** 后台线程已写入的 PCM 时长（ms） */
+  getWrittenMs(): number {
+    const wb = this.writtenBytes
+    if (wb == null) {
+      return 0
+    }
+    return Math.floor((wb.get().toDouble() * 1000) / (this.sampleRate * 2))
+  }
+
+  /** 已入队（含队列积压）的 PCM 总时长（ms）；排空判定用它 */
+  getEnqueuedMs(): number {
+    const eb = this.enqueuedBytes
+    if (eb == null) {
+      return 0
+    }
+    return Math.floor((eb.get().toDouble() * 1000) / (this.sampleRate * 2))
+  }
+
+  /** 已播放的 PCM 时长（ms）——基于播放头位置（线程安全） */
+  getPlayedMs(): number {
+    const track = this.track
+    if (track == null) {
+      return 0
+    }
+    try {
+      return Math.floor(
+        (track.getPlaybackHeadPosition() * 1000) / this.sampleRate,
+      )
+    } catch (_ePos) {
+      return 0
+    }
+  }
+
+  /**
+   * 写入的音频是否已全部播完（排空判定用；留 50ms 容差）。
+   * 用「已入队总量」而非「已写入量」——WRITE_BLOCKING 会让队列积压，
+   * 只看已写入会在积压时提前结束、丢弃剩余音频。
+   */
+  isDrained(): boolean {
+    return this.getPlayedMs() + 50 >= this.getEnqueuedMs()
+  }
+
+  /** 是否仍有未排空的音频（含队列积压） */
+  hasPendingAudio(): boolean {
+    return this.getEnqueuedMs() > this.getPlayedMs() + 50
+  }
+
+  /** 全部已入队字节是否都已被硬件接受（写队列 + 重试帧为空）。
+   *  此后剩余音频只在 AudioTrack 硬件缓冲里，播完时长相上界 = getBufferMs()。
+   *  排空判定用它，可完全绕开不可靠的 getPlayedMs（播放头）。 */
+  isWriteComplete(): boolean {
+    const wb = this.writtenBytes
+    const eb = this.enqueuedBytes
+    if (wb == null || eb == null) {
+      return false
+    }
+    return wb.get() >= eb.get()
+  }
+
+  /** 硬件缓冲可容纳的音频时长（ms）：全部写入后「尾部播完」的时长上界。
+   *  取 track 实际缓冲帧数与构造请求字节数的较大者，避免低估导致排空误切。 */
+  getBufferMs(): number {
+    const track = this.track
+    let frames = 0
+    if (track != null) {
+      try {
+        frames = track.getBufferSizeInFrames()
+      } catch (_eBf) {
+        frames = 0
+      }
+    }
+    const requestedFrames = Math.floor(this.bufferBytes / 2)
+    const safeFrames = Math.max(frames, requestedFrames)
+    if (safeFrames > 0) {
+      return Math.floor((safeFrames * 1000) / this.sampleRate)
+    }
+    return 1000
+  }
+
+  /** 停止后台线程并释放 AudioTrack（幂等） */
+  releasePlayer(): void {
+    // 诊断：释放时的终态（enqueued/written/played/帧数/丢弃帧）
+    console.log(
+      '[StreamPcmPlayer] release frames=' +
+        this.framesWritten +
+        ' droppedFrames=' +
+        this.droppedFrames +
+        ' enqueuedMs=' +
+        this.getEnqueuedMs() +
+        ' writtenMs=' +
+        this.getWrittenMs() +
+        ' playedMs=' +
+        this.getPlayedMs(),
+    )
+    this.running = false
+    const q = this.queue
+    if (q != null) {
+      // 唤醒阻塞中的 take()：塞 len=0 空帧哨兵
+      const sentinel = new PcmFrame()
+      sentinel.len = 0
+      try {
+        q.put(sentinel)
+      } catch (_ePut) {
+        // ignore
+      }
+    }
+    const t = this.writerThread
+    this.writerThread = null
+    if (t != null) {
+      try {
+        t.join(500)
+      } catch (_eJoin) {
+        // ignore
+      }
+    }
+    this.queue = null
+    const track = this.track
+    this.track = null
+    this.writtenBytes = null
+    this.enqueuedBytes = null
+    this.queuedBytes = null
+    this.started = false
+    if (track != null) {
+      try {
+        track.stop()
+      } catch (_eStop) {
+        // ignore
+      }
+      try {
+        track.release()
+      } catch (_eRel) {
+        // ignore
+      }
+    }
+  }
+}
+
+// ==================== 原生录音（AudioRecord → PCM 文件 + 实时帧转发） ====================
+
+/** 录音开始回调（res 无内容，仅通知「已开录」，对齐 RecorderManager.onStart 语义） */
+export type NativeRecorderStartCallback = (res: UTSJSONObject | null) => void
+/** 录音结束回调（res 携带 tempFilePath/duration/fileSize/format，对齐 RecorderManager.onStop） */
+export type NativeRecorderStopCallback = (res: UTSJSONObject | null) => void
+/** 录音失败回调（err 携带 errMsg） */
+export type NativeRecorderErrorCallback = (err: UTSJSONObject | null) => void
+/** 实时 PCM 帧回调（chunk 为 16kHz mono PCM16 LE 裸字节；主线程回调；一次性全新 ArrayBuffer） */
+export type NativeRecorderFrameCallback = (chunk: ArrayBuffer) => void
+
+// Android AudioRecord 常量（Java 静态字段在 UTS 互操作中不可直接引用，用稳定字面量）
+const RECORD_SOURCE_MIC = 1
+const RECORD_CHANNEL_IN_MONO = 0x10
+const RECORD_ENCODING_PCM_16BIT = 2
+/** 采样率：与 ASR 协议硬编码 16kHz 一致 */
+const RECORD_SAMPLE_RATE = 16000
+/** 读块大小：100ms = 16000/1000*100*2 = 3200B */
+const RECORD_READ_BYTES = 3200
+/** 后台→主线程帧队列在队字节上限（约 2s）：超限丢最旧帧并计数 */
+const RECORD_QUEUE_MAX_BYTES = 64000
+
+/** 待消费帧：后台线程产出的 Java ByteArray（跨线程安全），主线程消费并转为全新 ArrayBuffer */
+class RecPcmFrame {
+  data: ByteArray | null = null
+  len: number = 0
+}
+
+/**
+ * 原生录音器（App-Android）
+ *
+ * AudioRecord 采 16kHz mono PCM16：
+ * - 后台读线程 read 循环 → 同步写临时文件（兜底，与鸿蒙 StreamPcmRecorder 双路语义一致）
+ * - 同时每帧拷贝入队 → 主线程 20ms 定时器消费 → onFrame(全新 ArrayBuffer) 供边说边传 ASR
+ *
+ * 线程模型与 StreamPcmPlayer 一致：后台线程只碰 Java 对象（跨线程安全），
+ * typed-array 只在主线程组装；后台线程异常时不直接回调 JS，setTimeout 跳主线程统一收尾。
+ * 接口对齐 uni RecorderManager（onStart/onStop/onError/onFrame/start/stop/release）。
+ */
+export class StreamPcmRecorder {
+  private audioRecord: AudioRecord | null = null
+  private outStream: FileOutputStream | null = null
+  private filePath: string = ""
+  private running: boolean = false
+  private started: boolean = false
+  /** 后台线程累计写入文件字节数（stop 回传，供上层算时长/大小） */
+  private recordedBytes: number = 0
+  private readerThread: Thread | null = null
+  private queue: LinkedBlockingQueue<any> | null = null
+  /** 主线程消费定时器 id */
+  private consumeTimer: number = 0
+  /** 在队未消费字节数（背压判定；跨线程近似计数，Java 字段写入原子） */
+  private queuedBytes: AtomicLong | null = null
+  /** 诊断：因队列超上限被丢弃的帧字节数（正常为 0） */
+  private droppedBytes: AtomicLong | null = null
+  private durationTimer: number = 0
+
+  private onStartCb: NativeRecorderStartCallback | null = null
+  private onStopCb: NativeRecorderStopCallback | null = null
+  private onErrorCb: NativeRecorderErrorCallback | null = null
+  private onFrameCb: NativeRecorderFrameCallback | null = null
+
+  onStart(callback: NativeRecorderStartCallback | null): void {
+    this.onStartCb = callback
+  }
+
+  onStop(callback: NativeRecorderStopCallback | null): void {
+    this.onStopCb = callback
+  }
+
+  onError(callback: NativeRecorderErrorCallback | null): void {
+    this.onErrorCb = callback
+  }
+
+  /**
+   * 注册实时 PCM 帧回调（边说边传 ASR 用）：写文件与帧转发并行，文件仍为兜底。
+   * chunk 为 16kHz mono PCM16 LE 裸字节（长度任意偶数），主线程回调，一次性 ArrayBuffer。
+   */
+  onFrame(callback: NativeRecorderFrameCallback | null): void {
+    this.onFrameCb = callback
+  }
+
+  isRecording(): boolean {
+    return this.running == true && this.started == true
+  }
+
+  /**
+   * 开始录音。options 仅取 duration（毫秒，到时自动停止）；采样率/声道/格式固定
+   * 16kHz mono PCM16（ASR 协议硬编码）。录音文件写沙箱 filesDir/nuwax_voice_record.pcm
+   * （TRUNC 覆盖），与鸿蒙 StreamPcmRecorder 路径语义一致。
+   */
+  start(options: RecorderManagerStartOptions | null): void {
+    // 复用实例时先完全清旧状态（上一轮未正常结束 / 重新 start）
+    this.stopInternal(false)
+
+    let durationMs = 600000
+    if (options != null) {
+      try {
+        const durRaw = options!.duration
+        if (durRaw != null) {
+          const durNum = parseFloat(`${durRaw}`)
+          if (!isNaN(durNum) && durNum > 0) {
+            durationMs = Math.min(durNum, 600000)
+          }
+        }
+      } catch (_eDur) {
+        // ignore
+      }
+    }
+
+    // 真实沙箱 filesDir（uni.env.USER_DATA_PATH 部分平台带 scheme，原生 FileOutputStream 不认）
+    let filePath = ""
+    try {
+      const activity = UTSAndroid.getUniActivity()
+      if (activity == null) {
+        this.emitError("录音启动失败")
+        return
+      }
+      const filesDir = activity.getApplicationContext().getFilesDir()
+      filePath = filesDir.getAbsolutePath() + "/nuwax_voice_record.pcm"
+    } catch (_ePath) {
+      this.emitError("录音启动失败")
+      return
+    }
+    this.filePath = filePath
+    this.running = true
+    this.started = false
+    this.recordedBytes = 0
+    this.queuedBytes = new AtomicLong(0)
+    this.droppedBytes = new AtomicLong(0)
+
+    try {
+      this.outStream = new FileOutputStream(filePath)
+    } catch (_eFile) {
+      this.running = false
+      this.emitError("录音启动失败")
+      return
+    }
+
+    let minBuf = 0
+    try {
+      minBuf = AudioRecord.getMinBufferSize(
+        RECORD_SAMPLE_RATE.toInt(),
+        RECORD_CHANNEL_IN_MONO.toInt(),
+        RECORD_ENCODING_PCM_16BIT.toInt(),
+      )
+    } catch (_eMin) {
+      minBuf = 0
+    }
+    let bufSize = RECORD_READ_BYTES * 2
+    if (bufSize < minBuf) {
+      bufSize = minBuf
+    }
+    let record: AudioRecord | null = null
+    try {
+      record = new AudioRecord(
+        RECORD_SOURCE_MIC.toInt(),
+        RECORD_SAMPLE_RATE.toInt(),
+        RECORD_CHANNEL_IN_MONO.toInt(),
+        RECORD_ENCODING_PCM_16BIT.toInt(),
+        bufSize.toInt(),
+      )
+    } catch (eInit: any) {
+      console.error("[StreamPcmRecorder] AudioRecord init failed", eInit)
+      record = null
+    }
+    if (record == null || record.getState() != 1) {
+      // STATE_INITIALIZED=1：初始化失败（无权限 / 设备被占用）
+      this.running = false
+      this.closeFile()
+      this.emitError("录音启动失败")
+      return
+    }
+    this.audioRecord = record
+    this.queue = new LinkedBlockingQueue()
+
+    // 主线程消费定时器：后台产帧 → 主线程转 ArrayBuffer → onFrame
+    this.consumeTimer = setInterval((): void => {
+      this.consumePendingFrames()
+    }, 20) as number
+
+    try {
+      record.startRecording()
+    } catch (eStart: any) {
+      console.error("[StreamPcmRecorder] startRecording failed", eStart)
+      this.stopInternal(false)
+      this.emitError("录音启动失败")
+      return
+    }
+    this.started = true
+    this.startReaderThread(record)
+    this.emitStart()
+
+    if (durationMs > 0) {
+      this.durationTimer = setTimeout((): void => {
+        this.durationTimer = 0
+        if (this.running == true) {
+          this.stopInternal(true)
+        }
+      }, durationMs) as number
+    }
+  }
+
+  /** 停止录音（松手）：排空残留帧后回传 onStop（未真正开录时静默，不发 onStop） */
+  stop(): void {
+    this.stopInternal(true)
+  }
+
+  /** 释放（页面销毁 / 弃用）：不回传 onStop */
+  release(): void {
+    this.stopInternal(false)
+  }
+
+  /** 后台读线程：read 循环 → 写文件 + 拷贝入队 */
+  private startReaderThread(record: AudioRecord): void {
+    this.readerThread = new Thread((): void => {
+      const buf = new ByteArray(RECORD_READ_BYTES.toInt())
+      let zeroReads = 0
+      while (this.running == true) {
+        let read = 0
+        try {
+          read = record.read(buf, 0, RECORD_READ_BYTES.toInt())
+        } catch (_eRead) {
+          read = -1
+        }
+        if (read > 0) {
+          zeroReads = 0
+          try {
+            this.outStream!.write(buf, 0, read.toInt())
+            this.recordedBytes += read
+          } catch (_eWrite) {
+            this.scheduleFaultStop("录音写入失败")
+            break
+          }
+          this.enqueueFrame(buf, read)
+        } else if (read == 0) {
+          zeroReads += 1
+          if (zeroReads >= 10) {
+            this.scheduleFaultStop("录音无数据")
+            break
+          }
+          try {
+            Thread.sleep(10)
+          } catch (_eSleep) {
+            // ignore
+          }
+        } else {
+          // read < 0：采集错误（设备被占用 / 释放 / 来电抢焦点）
+          this.scheduleFaultStop("录音采集异常")
+          break
+        }
+      }
+    })
+    this.readerThread!.start()
+  }
+
+  /** 采集错误：跳主线程统一收尾（后台线程不直接调 stopInternal，避免自 join 死锁） */
+  private scheduleFaultStop(message: string): void {
+    setTimeout((): void => {
+      if (this.running != true) {
+        return
+      }
+      this.stopInternal(false)
+      this.emitError(message)
+    }, 0)
+  }
+
+  /** 拷贝入队（跨线程安全：读线程复用同一 buf，入队前必须复制为新数组） */
+  private enqueueFrame(src: ByteArray, len: number): void {
+    const q = this.queue
+    const qb = this.queuedBytes
+    if (q == null || len <= 0) {
+      return
+    }
+    // 背压：在队字节超上限时丢最旧帧（正常 20ms 消费不触发；触发说明主线程卡住，
+    // 丢的是新帧，文件兜底仍保证正确性）
+    if (qb != null && qb.get() + len > RECORD_QUEUE_MAX_BYTES) {
+      const db = this.droppedBytes
+      if (db != null) {
+        db.addAndGet(len.toLong())
+      }
+      try {
+        const old = q.poll()
+        if (old != null) {
+          const oldFrame = old as RecPcmFrame
+          if (oldFrame != null && oldFrame.len > 0) {
+            qb.addAndGet(-oldFrame.len.toLong())
+          }
+        }
+      } catch (_ePoll) {
+        // ignore
+      }
+    }
+    // 复制：src 会被读线程下一轮覆盖，必须拷贝（ByteArray 索引须 Int，循环变量须 toInt）
+    const copy = new ByteArray(len.toInt())
+    for (let i = 0; i < len; i++) {
+      copy[i.toInt()] = src[i.toInt()].toByte()
+    }
+    const frame = new RecPcmFrame()
+    frame.data = copy
+    frame.len = len
+    try {
+      q.put(frame)
+      qb!.addAndGet(len.toLong())
+    } catch (_ePut) {
+      // ignore
+    }
+  }
+
+  /** 主线程消费：poll 到空队为止，每帧转全新 ArrayBuffer 交 onFrame */
+  private consumePendingFrames(): void {
+    const q = this.queue
+    if (q == null) {
+      return
+    }
+    while (true) {
+      let item: any
+      try {
+        item = q.poll()
+      } catch (_ePoll) {
+        break
+      }
+      if (item == null) {
+        break
+      }
+      this.dispatchFrame(item as RecPcmFrame)
+    }
+  }
+
+  private dispatchFrame(frame: RecPcmFrame | null): void {
+    const qb = this.queuedBytes
+    if (frame == null || frame.data == null || frame.len <= 0) {
+      return
+    }
+    const data = frame.data!
+    const len = frame.len
+    if (qb != null) {
+      qb.addAndGet(-len.toLong())
+    }
+    // 主线程组装全新 ArrayBuffer（typed-array 只能主线程读写；一次性交给 onFrame 消费者）
+    const ab = new ArrayBuffer(len)
+    const u8 = new Uint8Array(ab)
+    for (let i = 0; i < len; i++) {
+      u8[i] = data[i.toInt()] & 0xff
+    }
+    const cb = this.onFrameCb
+    if (cb != null) {
+      try {
+        cb(ab)
+      } catch (_eCb) {
+        // ignore
+      }
+    }
+  }
+
+  private clearConsumeTimer(): void {
+    if (this.consumeTimer != 0) {
+      clearInterval(this.consumeTimer)
+      this.consumeTimer = 0
+    }
+  }
+
+  private clearDurationTimer(): void {
+    if (this.durationTimer != 0) {
+      clearTimeout(this.durationTimer)
+      this.durationTimer = 0
+    }
+  }
+
+  private closeFile(): void {
+    const out = this.outStream
+    this.outStream = null
+    if (out != null) {
+      try {
+        out.flush()
+      } catch (_eF) {
+        // ignore
+      }
+      try {
+        out.close()
+      } catch (_eC) {
+        // ignore
+      }
+    }
+  }
+
+  /** 真正收尾：停采集 → join 读线程 → 关文件 → 排空残留帧 →（可选）onStop */
+  private stopInternal(emitStop: boolean): void {
+    this.running = false
+    this.clearConsumeTimer()
+    this.clearDurationTimer()
+    const record = this.audioRecord
+    this.audioRecord = null
+    if (record != null) {
+      // 先 stop 以唤醒阻塞中的 read（否则 join 会等满一个读周期）
+      try {
+        record.stop()
+      } catch (_eStop) {
+        // ignore
+      }
+      try {
+        record.release()
+      } catch (_eRel) {
+        // ignore
+      }
+    }
+    const t = this.readerThread
+    this.readerThread = null
+    if (t != null) {
+      try {
+        t.join(500)
+      } catch (_eJoin) {
+        // ignore
+      }
+    }
+    this.closeFile()
+    // 停止前同步排空残留帧：onFrame 消费者先拿全尾帧，再收 onStop（保证松手尾音不丢）
+    this.consumePendingFrames()
+    this.queue = null
+    const wasStarted = this.started
+    this.started = false
+    if (emitStop == true && wasStarted == true) {
+      const stopCb = this.onStopCb
+      if (stopCb != null) {
+        const res = new UTSJSONObject()
+        res["tempFilePath"] = this.filePath
+        // 16kHz mono PCM16 = 32000 B/s → 时长(ms) = 字节数 / 32
+        res["duration"] = Math.floor(this.recordedBytes / 32)
+        res["fileSize"] = this.recordedBytes
+        res["format"] = "pcm"
+        stopCb(res)
+      }
+    }
+  }
+
+  private emitStart(): void {
+    const cb = this.onStartCb
+    if (cb != null) {
+      cb(null)
+    }
+  }
+
+  private emitError(message: string): void {
+    const cb = this.onErrorCb
+    if (cb != null) {
+      const err = new UTSJSONObject()
+      err["errMsg"] = message
+      err["errSubject"] = "StreamPcmRecorder"
+      cb(err)
+    }
+  }
+}

@@ -15,7 +15,13 @@
         </view>
         <view class="row-item" v-for="(member, index) in memberList" :key="member.agentId" :class="index === memberList.length - 1 ? 'row-item--last' : ''">
           <view class="row-avatar">
-            <image v-if="isIconUrl(member.icon)" class="row-avatar-img" :src="member.icon" mode="aspectFill" />
+            <!-- 显隐仍以原始 icon 判定（解析后的 data URL 不是 http 地址）；src 优先用解析结果 -->
+            <image
+              v-if="isIconUrl(member.icon)"
+              class="row-avatar-img"
+              :src="member.resolvedIcon.length > 0 ? member.resolvedIcon : member.icon"
+              mode="aspectFill"
+            />
             <text v-else class="row-avatar-emoji">{{ member.icon != "" ? member.icon : "🤖" }}</text>
           </view>
           <view class="row-info">
@@ -44,7 +50,12 @@
           :key="agent.agentId"
         >
           <view class="row-avatar row-avatar-add">
-            <image v-if="isIconUrl(agent.icon)" class="row-avatar-img" :src="agent.icon" mode="aspectFill" />
+            <image
+              v-if="isIconUrl(agent.icon)"
+              class="row-avatar-img"
+              :src="agent.resolvedIcon.length > 0 ? agent.resolvedIcon : agent.icon"
+              mode="aspectFill"
+            />
             <text v-else class="row-avatar-plus">+</text>
           </view>
           <view class="row-info">
@@ -80,11 +91,11 @@
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { apiGetGroupMembers, apiAddGroupMember, apiRemoveGroupMember } from "@/servers/terminalAgent";
-  import { apiPublishedAgentList } from "@/servers/square";
+  import { apiHomeCategoryList } from "@/servers/agentDev";
   import { GroupMemberAddParams } from "@/types/interfaces/terminalGroupMember";
-  import { SquarePublishedListParams } from "@/types/interfaces/square";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { resolveAppSvgUrl } from "@/utils/remoteSvgImage";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -94,6 +105,8 @@
     name: string = "";
     desc: string = "";
     icon: string = "";
+    /** App 端远程 SVG 按行内尺寸解析后的 data URL（见 resolveRowIcons）；未解析时为空串 */
+    resolvedIcon: string = "";
     constructor(agentId: number, name: string, desc: string, icon: string) {
       this.agentId = agentId;
       this.name = name;
@@ -111,6 +124,23 @@
   const addingAgentId = ref<number>(0);
   const removingAgentId = ref<number>(0);
 
+  /**
+   * 批量解析行头像：App 端 <image> 渲染远程 SVG 时按声明尺寸 1:1 光栅化，
+   * CSS 宽高 / mode 缩放对其失效（显示为裁切放大或严重偏小），需按行内尺寸（72rpx）
+   * 解析为 data URL 写回 resolvedIcon；H5 / 小程序与 PNG/JPG / emoji 原样透传，不产生额外请求。
+   * 并行解析，避免多行 SVG 串行下载拖慢首屏。
+   */
+  const resolveRowIcons = async (rows: MemberRow[]): Promise<void> => {
+    const tasks: Promise<string>[] = [] as Promise<string>[];
+    for (let i = 0; i < rows.length; i++) {
+      tasks.push(resolveAppSvgUrl(rows[i].icon, 72, 72));
+    }
+    const resolved = await Promise.all(tasks);
+    for (let i = 0; i < rows.length; i++) {
+      rows[i].resolvedIcon = resolved[i];
+    }
+  };
+
   /** icon 是否为图片 URL（否则按 emoji / 占位文本渲染） */
   const isIconUrl = (icon: string): boolean => {
     if (icon == "") return false;
@@ -127,6 +157,22 @@
     if (v == null) return 0;
     const n = parseFloat(`${v}`);
     return !isNaN(n) ? (n as number) : 0;
+  };
+
+  const readBool = (obj: UTSJSONObject, key: string): boolean => {
+    const v = obj[key];
+    return v != null && `${v}` == "true";
+  };
+
+  /** 取嵌套对象字段（非对象或缺失返回 null） */
+  const readObj = (obj: UTSJSONObject, key: string): UTSJSONObject | null => {
+    const v = obj[key];
+    if (v == null) return null;
+    try {
+      return v as UTSJSONObject;
+    } catch (_e) {
+      return null;
+    }
   };
 
   /**
@@ -173,6 +219,7 @@
             ids.push(row.agentId);
           }
         }
+        await resolveRowIcons(rows);
         memberList.value = rows;
       } else {
         const msg = apiResMessage(res);
@@ -187,33 +234,49 @@
 
   /**
    * 拉取候选智能体并排除已在组内的成员。
-   * 数据源与智联录一致：apiPublishedAgentList（POST /api/published/agent/list，已发布智能体广场），
-   * records 中 targetType=Agent 时 targetId 即 agentId。
+   * 数据源与智联录一致：apiHomeCategoryList（GET /api/home/list）。
+   * 返回体 data.categoryItems 是以分类 key 分组的 map（我的收藏 AGENT_COLLECT、官方推荐 AGENT_RECOMMEND、
+   * 空间 SPACE_<spaceId> 等，空间 key 随用户变化故遍历全部 key），同一智能体可能同时出现在多个分类下，
+   * 需按 targetId 去重；targetType=Agent 时 targetId 即 agentId。
    * @param memberIds 已在组内的 agentId
    */
   const fetchCandidates = async (memberIds: number[]): Promise<void> => {
     try {
-      const params = new SquarePublishedListParams();
-      params.targetType = "Agent";
-      params.targetSubType = "ChatBot";
-      params.page = 1;
-      params.pageSize = 50;
-      params.category = "";
-      params.kw = "";
-      const res = await apiPublishedAgentList(params);
+      const res = await apiHomeCategoryList();
       if (apiResCode(res) == SUCCESS_CODE) {
-        const pageDataRaw = apiResData<any>(res);
-        const pageObj = pageDataRaw != null ? (pageDataRaw as UTSJSONObject) : null;
-        const recordsRaw = pageObj != null ? pageObj["records"] : null;
-        const arr = recordsRaw != null ? (recordsRaw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        // 直接以 UTSJSONObject 操作，避免 Gson 反序列化 interface 崩溃
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const itemsObj = dataObj != null ? readObj(dataObj, "categoryItems") : null;
+        // 展平所有分类下的智能体
+        const all: UTSJSONObject[] = [] as UTSJSONObject[];
+        if (itemsObj != null) {
+          const keys = UTSJSONObject.keys(itemsObj);
+          for (let ki = 0; ki < keys.length; ki++) {
+            const valueRaw = itemsObj[keys[ki]];
+            if (valueRaw == null) continue;
+            const group = valueRaw as UTSJSONObject[];
+            for (let gi = 0; gi < group.length; gi++) {
+              all.push(group[gi]);
+            }
+          }
+        }
         const rows: MemberRow[] = [] as MemberRow[];
-        for (let i = 0; i < arr.length; i++) {
-          const src = arr[i];
+        // 跨分类去重：记录已收录的 targetId
+        const seen = new Map<number, boolean>();
+        for (let i = 0; i < all.length; i++) {
+          const src = all[i];
           // targetId（targetType=Agent 时即 agentId）
           const aid = readNum(src, "targetId");
           if (aid <= 0) continue;
+          if (seen.get(aid) != null) continue;
           // 宿主自身与已在组内的不进候选
           if (aid == hostAgentId.value) continue;
+          // 网页应用不能作为组员
+          if (readStr(src, "agentType") == "PageApp") continue;
+          // 设备智能体（灵珠等）不能作为组员
+          const extra = readObj(src, "extra");
+          if (extra != null && readBool(extra, "isDeviceAgent")) continue;
           let inGroup = false;
           for (let j = 0; j < memberIds.length; j++) {
             if (memberIds[j] == aid) {
@@ -222,10 +285,12 @@
             }
           }
           if (inGroup) continue;
+          seen.set(aid, true);
           rows.push(
             new MemberRow(aid, readStr(src, "name"), readStr(src, "description"), readStr(src, "icon")),
           );
         }
+        await resolveRowIcons(rows);
         candidateList.value = rows;
       } else {
         const msg = apiResMessage(res);

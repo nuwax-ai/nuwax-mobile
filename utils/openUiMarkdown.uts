@@ -1,0 +1,193 @@
+/**
+ * OpenUI 正文过程标签同步（从 markdown.uts 抽出，降低通用 markdown 侵入）。
+ *
+ * 职责：
+ * - 同 executeId 只保留一处 OpenUI 标签
+ * - status/type/name 以 processingList（componentExecutedList）为最终态回写
+ *
+ * 调用时机：groupMarkdownContainers 之后（标签已规范化成 HTML process）。
+ */
+
+import { orEmpty } from "@/utils/utsCoalesce";
+import {
+  listMarkdownCustomProcessTags,
+  toMarkdownCustomProcessHtml,
+} from "@/utils/markdownCustomProcess.uts";
+import { isOpenUiRenderToolName } from "@/utils/openUiSchema.uts";
+
+/**
+ * 过程状态优先级：数字越小越优先（对齐 mp-html getProcessingDataByPriority）。
+ * FINISHED > FAILED > EXECUTING；未知状态垫底。
+ */
+export function openUiStatusPriority(status: string): number {
+  const s = orEmpty(status).toUpperCase();
+  if (s == "FINISHED") {
+    return 1;
+  }
+  if (s == "FAILED") {
+    return 2;
+  }
+  if (s == "EXECUTING") {
+    return 3;
+  }
+  return 999;
+}
+
+/**
+ * 从 processingList 按 executeId 取权威项（同 id 多条时按状态优先级）。
+ */
+export function findOpenUiProcessingItemByExecuteId(
+  list: any[] | null,
+  executeId: string,
+): any | null {
+  if (list == null || executeId.length == 0) {
+    return null;
+  }
+  const execKey = `${executeId}`.trim();
+  if (execKey.length == 0) {
+    return null;
+  }
+  let best: any | null = null;
+  let bestPri = 9999;
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    if (item == null || typeof item != "object") {
+      continue;
+    }
+    const obj = item as UTSJSONObject;
+    const raw =
+      obj["executeId"] != null
+        ? obj["executeId"]
+        : obj["executeid"] != null
+          ? obj["executeid"]
+          : null;
+    const itemId = raw != null ? `${raw}`.trim() : "";
+    if (itemId != execKey) {
+      continue;
+    }
+    const st = obj["status"] != null ? `${obj["status"]}` : "";
+    const pri = openUiStatusPriority(st);
+    if (pri < bestPri) {
+      bestPri = pri;
+      best = item;
+    }
+  }
+  return best;
+}
+
+/**
+ * OpenUI 过程标签：同 executeId 只保留一处；终态以 processingList 为准回写。
+ * @param text groupMarkdownContainers 之后的正文
+ * @param processingList componentExecutedList 转换 / SSE upsert 结果
+ */
+export function syncOpenUiProcessTagsWithProcessingList(
+  text: string,
+  processingList: any[] | null,
+): string {
+  if (text.length == 0) {
+    return "";
+  }
+  // group 后 OpenUI 已是扁平 HTML process，枚举即可（无需再扫 :::container）
+  const tags = listMarkdownCustomProcessTags(text);
+  if (tags.length == 0) {
+    return text;
+  }
+
+  const keepIndexByExec = new Map<string, number>();
+  const openUiIndices: number[] = [];
+  for (let i = 0; i < tags.length; i++) {
+    const m = tags[i];
+    if (isOpenUiRenderToolName(m.name) != true) {
+      continue;
+    }
+    openUiIndices.push(i);
+    const execId = orEmpty(m.executeId).trim();
+    if (execId.length == 0) {
+      continue;
+    }
+    const prevIdx = keepIndexByExec.get(execId);
+    if (prevIdx == null) {
+      keepIndexByExec.set(execId, i);
+      continue;
+    }
+    const listItem = findOpenUiProcessingItemByExecuteId(processingList, execId);
+    const listPri =
+      listItem != null
+        ? openUiStatusPriority(
+            (listItem as UTSJSONObject)["status"] != null
+              ? `${(listItem as UTSJSONObject)["status"]}`
+              : "",
+          )
+        : 999;
+    const prev = tags[prevIdx];
+    const prevPri = openUiStatusPriority(prev.status);
+    const curPri = openUiStatusPriority(m.status);
+    if (listPri <= 2) {
+      if (m.index >= prev.index) {
+        keepIndexByExec.set(execId, i);
+      }
+      continue;
+    }
+    if (curPri < prevPri || (curPri == prevPri && m.index >= prev.index)) {
+      keepIndexByExec.set(execId, i);
+    }
+  }
+
+  if (openUiIndices.length == 0) {
+    return text;
+  }
+
+  const ignore = new Set<number>();
+  for (let k = 0; k < openUiIndices.length; k++) {
+    const idx = openUiIndices[k];
+    const m = tags[idx];
+    const execId = orEmpty(m.executeId).trim();
+    if (execId.length == 0) {
+      continue;
+    }
+    if (keepIndexByExec.get(execId) != idx) {
+      ignore.add(idx);
+    }
+  }
+
+  let out = "";
+  let lastPos = 0;
+  for (let i = 0; i < tags.length; i++) {
+    const m = tags[i];
+    if (ignore.has(i)) {
+      out += text.slice(lastPos, m.index);
+      lastPos = m.endIndex;
+      continue;
+    }
+    if (isOpenUiRenderToolName(m.name) != true) {
+      continue;
+    }
+    out += text.slice(lastPos, m.index);
+    let status = orEmpty(m.status);
+    let type = orEmpty(m.type);
+    let name = orEmpty(m.name);
+    const listItem = findOpenUiProcessingItemByExecuteId(
+      processingList,
+      m.executeId,
+    );
+    if (listItem != null) {
+      const obj = listItem as UTSJSONObject;
+      if (obj["status"] != null && `${obj["status"]}`.length > 0) {
+        status = `${obj["status"]}`;
+      }
+      if (obj["name"] != null && `${obj["name"]}`.length > 0) {
+        name = `${obj["name"]}`;
+      }
+      type = "ToolCall";
+    }
+    out += toMarkdownCustomProcessHtml(
+      m.executeId,
+      type.length > 0 ? type : "ToolCall",
+      status,
+      name,
+    );
+    lastPos = m.endIndex;
+  }
+  out += text.slice(lastPos);
+  return out;
+}

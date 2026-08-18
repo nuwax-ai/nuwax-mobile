@@ -51,8 +51,8 @@ Authorization: Bearer <access_token>
 ### 2\.2 Query（浏览器 / 部分原生 SDK 不便带 Header 时）
 
 ```Plaintext
-wss://{host}/api/app/asr/ws?access_token=<access_token>
-wss://{host}/api/app/tts/ws?access_token=<access_token>
+wss://{host}/api/speech/asr/ws?access_token=<access_token>
+wss://{host}/api/speech/tts/ws?access_token=<access_token>
 ```
 
 `access_token` 为平台登录后的用户 Token（与 App BFF / agent\-platform 一致）。服务端会在握手时校验用户有效性。
@@ -218,7 +218,7 @@ App                                              Server
 ### 4\.5 伪代码
 
 ```JavaScript
-const ws = new WebSocket(`wss://${host}/api/app/asr/ws?access_token=${token}`);
+const ws = new WebSocket(`wss://${host}/api/speech/asr/ws?access_token=${token}`);
 ws.binaryType = "arraybuffer";
 
 ws.onopen = () => {

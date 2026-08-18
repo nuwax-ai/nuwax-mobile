@@ -1,0 +1,451 @@
+/**
+ * 实时 ASR 推流管道（边说边传）。
+ *
+ * 纯计算 + 注入回调：不 import asrWebSocketClient，begin/finish/send 由 agent-detail 注入，
+ * 避免跨文件 UTS 声明顺序问题；主线程运行（onFrame 本就在主线程回调）。
+ *
+ * 时序：
+ * - 开口前：帧滚动进 500ms 预滚环 + VAD 判定（RMS 阈值 + 连续 3×20ms 有声）
+ * - 开口：回调 onSpeechStart → 上层 begin()（发 start，消除「按住空等被服务端截断」）
+ * - 开口后未 ready：进 pre-ready 有限队列（2s，溢出丢最旧 → truncated）
+ * - onReady：预滚 + pre-ready + 实时帧统一进 txBuf，由独立 sender 定时器窗口化发送
+ *
+ * 发送模型（关键）：
+ * - feed 只做 VAD + 攒包，绝不 send——发送与录音热路径解耦，慢 ack 不卡帧处理
+ * - sender 定时器（40ms）驱动：每 tick 至多发一包（窗口化，在途 ~3 包），
+ *   单包在途 + 每包等 ack 在弱网下吞吐只有实时的 ~1/2（曾实测卡死）；窗口化保证不饿死、不失控
+ * - ack 只记账（outstanding/sent），不阻塞；同步 ack（UTS Promise 极端情况）由 sendChainActive 重入守卫终止
+ * - 追踪 sentBytes（仅成功发送，诊断用）
+ * - 句内静音：默认持续推静音帧直到松手（ASR_PIPE_SILENCE_MS=0 禁用主动 finish）
+ *
+ * 内存：number[] 装箱（~8x）被上限约束在 2.5s 音频以内（约 80KB 原始 → 亚 MB 级），
+ * 不会像长 TTS 队列那样无界增长；超限丢最旧帧并置 truncated，正确性交给文件兜底。
+ *
+ * 性能陷阱（已修复，勿回退）：UTSArray 的 splice(start, deleteCount) 是逐元素 remove(index)，
+ * 每删一个都整体前移 → O(删N × 数组长) 平方级。预滚环满 / 背压溢出 / 发包切队列时若用
+ * splice(0, N) 删大数组头部，会把主线程钉死数秒（Android 录音卡死的直接根因）。
+ * 一律改用 slice 只读切片 + 尾部重建（摊还 O(1)/字节）。
+ */
+import { ASR_FRAME_BYTES, ASR_SAMPLE_RATE } from './asrWebSocketClient'
+
+/** 预滚环时长（ms）：开口前保留的音频，补偿 VAD 判定延迟与阈值延迟 */
+const ASR_PIPE_PRE_ROLL_MS: number = 500
+/** 实时推流包（ms）：200ms = 6400B = 10×640（加大包减少发送频率，缓解慢 ack） */
+const ASR_PIPE_PACKET_MS: number = 200
+/** 在途未 ack 字节上限（≈3 包）：窗口化发送，慢 ack 不饿死、背压不失控 */
+const ASR_PIPE_SEND_WINDOW_BYTES: number = 19200
+/** sender 定时器周期（ms）：与帧热路径解耦的发送节拍 */
+const ASR_PIPE_SENDER_INTERVAL_MS: number = 40
+/** flush 超时（ms）：ack 一直不回的极端情况强制收尾，避免卡在识别中 */
+const ASR_PIPE_FLUSH_TIMEOUT_MS: number = 5000
+/** pre-ready 有限队列上限（2s = 64000B）：溢出丢最旧 */
+const ASR_PIPE_PRE_READY_MAX_BYTES: number = 64000
+/** VAD RMS 阈值（int16；静默 <1000、语音 >2000，取 1200，可按联调微调） */
+const ASR_PIPE_VAD_RMS_THRESHOLD: number = 1200
+/** VAD 最小连续有声帧数（20ms/帧），防瞬时噪声误触发 */
+const ASR_PIPE_VAD_MIN_VOICED_FRAMES: number = 3
+/**
+ * 句内静音主动 finish 阈值（ms）：0 = 禁用（默认，按住期间持续推静音帧，整句一次结果）。
+ * 若联调发现服务端上游对句内停顿做端点检测提前截断，可改为 2000（静音超阈值主动收尾）。
+ */
+const ASR_PIPE_SILENCE_MS: number = 0
+
+/** 异步发送一帧（成功 resolve true；复用 asrWebSocketClient.sendPcmAsync 语义） */
+export type AsrPipelineSendFrame = (frame: ArrayBuffer) => Promise<boolean>
+/** VAD 开口回调：上层在此 begin()（发 start） */
+export type AsrPipelineOnSpeechStart = () => void
+/** flushPending 完成回调：剩余字节已全部成功发送（或已放弃） */
+export type AsrPipelineFlushDone = () => void
+
+export class NativeStreamAsrPipeline {
+  private sendFrame: AsrPipelineSendFrame
+  private onSpeechStart: AsrPipelineOnSpeechStart | null = null
+  /** 代次令牌：reset 递增，作废旧会话在途回调 */
+  private generation: number = 0
+
+  /** 不足 20ms 的残量缓冲 */
+  private acc: number[] = []
+  /** 开口前 500ms 预滚环（冻结后由 onReady 合并发送） */
+  private preRoll: number[] = []
+  /** 开口后、ready 前的暂存队列（2s 上限） */
+  private preReady: number[] = []
+  /** 待发送字节（640 对齐；ready 后实时帧直接入队，由 sender 定时器消费） */
+  private txBuf: number[] = []
+  private speechDetected: boolean = false
+  private readyReached: boolean = false
+  /** 独立发送定时器 id（onReady 启动，flush 完成 / reset 停止） */
+  private senderTimer: number = 0
+  /** 在途未 ack 字节数（窗口上限内可多包在途） */
+  private outstandingBytes: number = 0
+  /** 发送重入守卫：防同步 ack 导致 sendPacket→ack→pump 递归失控 */
+  private sendChainActive: boolean = false
+  private pushFailed: boolean = false
+  private flushing: boolean = false
+  private flushDone: AsrPipelineFlushDone | null = null
+  private flushStartAt: number = 0
+  /** 已成功发送字节数（诊断用） */
+  private sent: number = 0
+  /** 丢过帧（pre-ready/txBuf 溢出、发送失败）→ 松手走文件兜底 */
+  private truncated: boolean = false
+  private voicedStreak: number = 0
+  private preRollMaxBytes: number
+  private packetBytesTarget: number
+
+  constructor(
+    sendFrame: AsrPipelineSendFrame,
+    onSpeechStart: AsrPipelineOnSpeechStart | null,
+  ) {
+    this.sendFrame = sendFrame
+    this.onSpeechStart = onSpeechStart
+    this.preRollMaxBytes = Math.floor(
+      (ASR_SAMPLE_RATE * 2 * ASR_PIPE_PRE_ROLL_MS) / 1000,
+    )
+    this.packetBytesTarget = Math.floor(
+      (ASR_SAMPLE_RATE * 2 * ASR_PIPE_PACKET_MS) / 1000,
+    )
+  }
+
+  /** 新一轮会话：清空全部状态（generation 递增，作废在途回调） */
+  reset(): void {
+    this.generation += 1
+    this.stopSender()
+    this.acc = []
+    this.preRoll = []
+    this.preReady = []
+    this.txBuf = []
+    this.speechDetected = false
+    this.readyReached = false
+    this.outstandingBytes = 0
+    this.sendChainActive = false
+    this.pushFailed = false
+    this.flushing = false
+    this.flushDone = null
+    this.flushStartAt = 0
+    this.sent = 0
+    this.truncated = false
+    this.voicedStreak = 0
+  }
+
+  isSpeechDetected(): boolean {
+    return this.speechDetected
+  }
+
+  isReadyReached(): boolean {
+    return this.readyReached
+  }
+
+  isTruncated(): boolean {
+    return this.truncated
+  }
+
+  isPushFailed(): boolean {
+    return this.pushFailed
+  }
+
+  getSentBytes(): number {
+    return this.sent
+  }
+
+  /** 灌入一帧 PCM（主线程；chunk 为一次性 ArrayBuffer，只读一次；只攒包不发送） */
+  feed(chunk: ArrayBuffer): void {
+    if (chunk == null || chunk.byteLength == 0) {
+      return
+    }
+    const u8 = new Uint8Array(chunk)
+    for (let i = 0; i < u8.length; i++) {
+      this.acc.push(u8[i])
+    }
+    const g = this.generation
+    // 用只读 offset 切窗口，收尾一次性压缩；不能用 splice(0, 640)——
+    // UTSArray 的 splice 是逐元素 remove(index)（每删一元素整体前移），O(删N × 数组长) 平方级，
+    // acc 一涨就把主线程钉死（Android 卡死的直接原因）。
+    let winStart = 0
+    while (this.acc.length - winStart >= ASR_FRAME_BYTES) {
+      if (g != this.generation) {
+        return
+      }
+      const win = this.acc.slice(winStart, winStart + ASR_FRAME_BYTES)
+      this.processWindow(win, g)
+      winStart += ASR_FRAME_BYTES
+    }
+    if (winStart > 0) {
+      const remain = this.acc.length - winStart
+      if (remain == 0) {
+        this.acc = []
+      } else {
+        this.acc = this.acc.slice(winStart, this.acc.length)
+      }
+    }
+  }
+
+  /** asr_ready 到达：预滚 + pre-ready 排到发送队首，启动 sender 定时器转实时 */
+  onReady(): void {
+    console.log(
+      "[ASR-live] pipeline onReady preRoll=" +
+        this.preRoll.length +
+        " preReady=" +
+        this.preReady.length,
+    )
+    this.readyReached = true
+    const g = this.generation
+    const merged: number[] = []
+    let i: number
+    for (i = 0; i < this.preRoll.length; i++) {
+      merged.push(this.preRoll[i])
+    }
+    for (i = 0; i < this.preReady.length; i++) {
+      merged.push(this.preReady[i])
+    }
+    for (i = 0; i < this.txBuf.length; i++) {
+      merged.push(this.txBuf[i])
+    }
+    this.preRoll = []
+    this.preReady = []
+    this.txBuf = merged
+    this.startSender()
+    this.pump(g)
+  }
+
+  /** 松手冲刷：剩余待发字节全部发完（或超时放弃）后回调 done，供上层 finish */
+  flushPending(done: AsrPipelineFlushDone): void {
+    this.flushing = true
+    this.flushDone = done
+    this.flushStartAt = Date.now()
+    this.pump(this.generation)
+  }
+
+  private processWindow(win: number[], g: number): void {
+    if (this.speechDetected != true) {
+      // 开口前：VAD 判定 + 滚动进预滚环
+      let sum = 0
+      for (let i = 0; i < win.length; i += 2) {
+        const lo = win[i]
+        const hi = win[i + 1]
+        let sample = (hi << 8) | lo
+        if (sample >= 0x8000) {
+          sample -= 0x10000
+        }
+        sum += sample * sample
+      }
+      const rms = Math.sqrt(sum / (win.length / 2))
+      if (rms >= ASR_PIPE_VAD_RMS_THRESHOLD) {
+        this.voicedStreak += 1
+      } else {
+        this.voicedStreak = 0
+      }
+      // 窗口先入预滚环（含触发开口的窗口：它包含语音起点）。
+      // 注意：onSpeechStart 若同步触发 onReady，预滚环此时已含本窗口，合并发送不漏帧。
+      for (let i = 0; i < win.length; i++) {
+        this.preRoll.push(win[i])
+      }
+      if (this.preRoll.length > this.preRollMaxBytes) {
+        // 保留尾部（slice 摊还 O(1)/字节；splice 前删是 O(n²)，会卡死主线程）
+        this.preRoll = this.preRoll.slice(
+          this.preRoll.length - this.preRollMaxBytes,
+          this.preRoll.length,
+        )
+      }
+      if (
+        this.voicedStreak >= ASR_PIPE_VAD_MIN_VOICED_FRAMES &&
+        this.speechDetected != true
+      ) {
+        this.speechDetected = true
+        const cb = this.onSpeechStart
+        if (cb != null) {
+          cb()
+        }
+      }
+      return
+    }
+    if (this.readyReached != true) {
+      // 开口后未 ready：暂存 pre-ready（2s 上限，溢出丢最旧 → truncated）
+      for (let i = 0; i < win.length; i++) {
+        this.preReady.push(win[i])
+      }
+      if (this.preReady.length > ASR_PIPE_PRE_READY_MAX_BYTES) {
+        // 保留尾部（splice 前删 O(n²)，会卡死主线程）
+        this.preReady = this.preReady.slice(
+          this.preReady.length - ASR_PIPE_PRE_READY_MAX_BYTES,
+          this.preReady.length,
+        )
+        if (this.truncated != true) {
+          console.warn("[ASR-live] pre-ready 溢出丢帧，置 truncated")
+        }
+        this.truncated = true
+      }
+      return
+    }
+    // ready 后：推流已失败则丢弃（兜底由文件重推覆盖）
+    if (this.pushFailed == true) {
+      this.truncated = true
+      return
+    }
+    for (let i = 0; i < win.length; i++) {
+      this.txBuf.push(win[i])
+    }
+    // 背压：WS 慢于实时时 txBuf 上限 2s，溢出丢最旧（发送由 sender 定时器负责，不在此处 send）
+    if (this.txBuf.length > ASR_PIPE_PRE_READY_MAX_BYTES) {
+      // 保留尾部（splice 前删 O(n²)，背压期间每秒几十次会把主线程钉死 → Android 卡死）
+      this.txBuf = this.txBuf.slice(
+        this.txBuf.length - ASR_PIPE_PRE_READY_MAX_BYTES,
+        this.txBuf.length,
+      )
+      if (this.truncated != true) {
+        console.warn("[ASR-live] txBuf 背压溢出丢帧，置 truncated")
+      }
+      this.truncated = true
+    }
+  }
+
+  /** 启动独立发送定时器（幂等）：onReady 时开启，flush 完成 / reset 时停止 */
+  private startSender(): void {
+    if (this.senderTimer != 0) {
+      return
+    }
+    this.senderTimer = setInterval((): void => {
+      if (this.flushing == true) {
+        // flush 超时兜底：ack 一直不回的极端情况强制收尾，避免卡在识别中
+        if (
+          this.flushStartAt != 0 &&
+          Date.now() - this.flushStartAt > ASR_PIPE_FLUSH_TIMEOUT_MS
+        ) {
+          this.forceCompleteFlush()
+          return
+        }
+      }
+      this.pump(this.generation)
+    }, ASR_PIPE_SENDER_INTERVAL_MS) as number
+  }
+
+  private stopSender(): void {
+    if (this.senderTimer != 0) {
+      clearInterval(this.senderTimer)
+      this.senderTimer = 0
+    }
+  }
+
+  /**
+   * 窗口化发送：每 tick 至多发一包（重入安全），下次发送由 sender 定时器 / ack 回调驱动。
+   * 绝不在本函数内 send 后立即再 pump——同步 ack 会导致 sendPacket→ack→pump 死循环。
+   */
+  private pump(g: number): void {
+    if (g != this.generation) {
+      this.maybeCompleteFlush()
+      return
+    }
+    if (this.sendChainActive == true) {
+      return
+    }
+    if (this.pushFailed == true) {
+      this.txBuf = []
+      this.maybeCompleteFlush()
+      return
+    }
+    if (this.outstandingBytes >= ASR_PIPE_SEND_WINDOW_BYTES) {
+      return
+    }
+    if (this.txBuf.length == 0) {
+      this.maybeCompleteFlush()
+      return
+    }
+    const target = this.packetBytesTarget
+    // flush 模式：不足整包的余量也发（640 对齐）；否则攒够整包才发
+    if (this.flushing != true && this.txBuf.length < target) {
+      return
+    }
+    const take = this.txBuf.length > target ? target : this.txBuf.length
+    this.sendPacket(g, take)
+  }
+
+  /** 发出一个包：从 txBuf 切出 → 组装全新 ArrayBuffer → sendFrame；ack 只记账不阻塞 */
+  private sendPacket(g: number, take: number): void {
+    this.sendChainActive = true
+    try {
+      const packet = new ArrayBuffer(take)
+      const out = new Uint8Array(packet)
+      for (let i = 0; i < take; i++) {
+        out[i] = this.txBuf[i]
+      }
+      // 丢弃已发前缀：slice 尾部重建（splice 前删 O(n²)，包越大主线程越卡；slice 摊还 O(1)/字节）
+      const pendingAfter = this.txBuf.length - take
+      if (pendingAfter == 0) {
+        this.txBuf = []
+      } else {
+        this.txBuf = this.txBuf.slice(take, this.txBuf.length)
+      }
+      this.outstandingBytes += take
+      const sentNow = take
+      this.sendFrame(packet).then(
+        (ok: boolean) => {
+          if (g != this.generation) {
+            return
+          }
+          this.outstandingBytes -= sentNow
+          if (ok == true) {
+            this.sent += sentNow
+          } else {
+            // 发送失败：停发实时，剩余丢弃（松手走文件兜底全量重推）
+            console.warn("[ASR-live] sendFrame 失败，停发实时 sent=" + this.sent)
+            this.pushFailed = true
+            this.truncated = true
+            this.txBuf = []
+          }
+          this.maybeCompleteFlush()
+          this.pump(g)
+        },
+        (_e: any | null) => {
+          if (g != this.generation) {
+            return
+          }
+          this.outstandingBytes -= sentNow
+          console.warn("[ASR-live] sendFrame 异常，停发实时 sent=" + this.sent)
+          this.pushFailed = true
+          this.truncated = true
+          this.txBuf = []
+          this.maybeCompleteFlush()
+          this.pump(g)
+        },
+      )
+    } catch (_eSend) {
+      // sendFrame 同步抛异常：视为发送失败，不打断主线程热路径
+      this.outstandingBytes = 0
+      this.pushFailed = true
+      this.truncated = true
+      this.txBuf = []
+      console.warn("[ASR-live] sendFrame 同步异常，停发实时")
+    } finally {
+      this.sendChainActive = false
+    }
+  }
+
+  private maybeCompleteFlush(): void {
+    if (this.flushing != true) {
+      return
+    }
+    if (this.outstandingBytes > 0 || this.txBuf.length > 0) {
+      return
+    }
+    this.flushing = false
+    this.stopSender()
+    const done = this.flushDone
+    this.flushDone = null
+    if (done != null) {
+      done()
+    }
+  }
+
+  /** flush 超时兜底：放弃剩余待发字节并强制收尾（ack 一直不回的极端情况） */
+  private forceCompleteFlush(): void {
+    console.warn(
+      "[ASR-live] flush 超时强制收尾 outstanding=" + this.outstandingBytes,
+    )
+    this.flushing = false
+    this.txBuf = []
+    this.stopSender()
+    const done = this.flushDone
+    this.flushDone = null
+    if (done != null) {
+      done()
+    }
+  }
+}

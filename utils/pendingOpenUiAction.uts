@@ -3,12 +3,60 @@
  * 的 OPENUI_ACTION 后，把构建好的「续作消息」按 conversationId 暂存；用户返回 chat 页 onShow 时
  * 消费并由既有发送链路发出。对齐 utils/pendingChatDraft.uts 的 storage-and-consume 模式
  * （App 内无事件总线，跨页数据走 storage）。
+ *
+ * App 内嵌 H5 场景：预览走原生 file-preview-page（uni.webView.navigateTo），
+ * 暂存在原生 storage；返回后由 agent-detail 用 consumeLatestPendingOpenUiAction
+ * 再 evalJS 注入 H5（__nuwaxOnOpenUiResume）。
  */
 const PREFIX = "pendingOpenUiAction:";
+/** 最新一条续作（供原生壳不依赖 URL conversationId 时消费） */
+const LATEST_KEY = PREFIX + "latest";
 const TTL_MS = 10 * 60 * 1000;
 
 function storageKey(conversationId: number): string {
   return PREFIX + conversationId;
+}
+
+function parsePendingPayload(raw: any | null): UTSJSONObject | null {
+  if (raw == null || `${raw}`.length == 0) {
+    return null;
+  }
+  try {
+    return JSON.parse<UTSJSONObject>(`${raw}`);
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * 校验 payload TTL / message，通过则返回 message，否则空串。
+ * @param removeKeys 成功或失败后要删掉的 storage key
+ */
+function takeValidMessage(
+  parsed: UTSJSONObject | null,
+  removeKeys: string[],
+  expectCid: number = 0,
+): string {
+  for (let i = 0; i < removeKeys.length; i++) {
+    try {
+      uni.removeStorageSync(removeKeys[i]);
+    } catch (_e) {
+      // ignore
+    }
+  }
+  if (parsed == null) {
+    return "";
+  }
+  const cid = (parsed["conversationId"] as number | null) ?? 0;
+  const createdAt = (parsed["createdAt"] as number | null) ?? 0;
+  const message = `${(parsed["message"] as string | null) ?? ""}`;
+  if (Date.now() - createdAt > TTL_MS) {
+    return "";
+  }
+  if (expectCid > 0 && cid != expectCid) {
+    return "";
+  }
+  return message;
 }
 
 export function savePendingOpenUiAction(
@@ -19,30 +67,35 @@ export function savePendingOpenUiAction(
   payload["conversationId"] = conversationId;
   payload["message"] = message;
   payload["createdAt"] = Date.now();
-  uni.setStorageSync(storageKey(conversationId), JSON.stringify(payload));
+  const text = JSON.stringify(payload);
+  uni.setStorageSync(storageKey(conversationId), text);
+  // 同步写 latest，供 App 原生壳从预览返回时不依赖 URL 上的 conversationId
+  uni.setStorageSync(LATEST_KEY, text);
 }
 
 /**
  * 读取并删除暂存的 OpenUI 续作消息；conversationId 不匹配或超时（10min）返回空串。
+ * 用于 H5 SPA / 小程序等同 storage 场景。
  */
 export function consumePendingOpenUiAction(conversationId: number): string {
   const key = storageKey(conversationId);
   const raw = uni.getStorageSync(key);
-  if (raw == null || `${raw}`.length == 0) return "";
-  try {
-    const parsed = JSON.parse<UTSJSONObject>(`${raw}`);
-    if (parsed == null) {
-      uni.removeStorageSync(key);
-      return "";
-    }
-    const cid = (parsed["conversationId"] as number | null) ?? 0;
-    const createdAt = (parsed["createdAt"] as number | null) ?? 0;
-    const message = `${(parsed["message"] as string | null) ?? ""}`;
-    uni.removeStorageSync(key);
-    if (cid != conversationId || Date.now() - createdAt > TTL_MS) return "";
-    return message;
-  } catch (_e) {
-    uni.removeStorageSync(key);
-    return "";
+  const parsed = parsePendingPayload(raw);
+  // 一并清 latest，避免原生壳稍后误消费同一条
+  return takeValidMessage(parsed, [key, LATEST_KEY], conversationId);
+}
+
+/**
+ * App 原生壳从预览页返回时用：读 latest，不依赖 URL conversationId 是否仍准确。
+ * 读后删 latest + 对应 cid key（幂等）。
+ */
+export function consumeLatestPendingOpenUiAction(): string {
+  const raw = uni.getStorageSync(LATEST_KEY);
+  const parsed = parsePendingPayload(raw);
+  const cid = parsed != null ? ((parsed["conversationId"] as number | null) ?? 0) : 0;
+  const keys: string[] = [LATEST_KEY];
+  if (cid > 0) {
+    keys.push(storageKey(cid));
   }
+  return takeValidMessage(parsed, keys, 0);
 }

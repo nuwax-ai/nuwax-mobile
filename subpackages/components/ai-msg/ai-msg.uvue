@@ -86,7 +86,8 @@
           v-else-if="renderMarkdownElList.length > 0"
           :markdown-el-list="renderMarkdownElList"
           :processing-list="renderProcessingList"
-          :conversation-id="msg.chat_id"
+          :is-current-streaming="isConversationActive && isLastMsg"
+          :conversation-id="mpHtmlConversationId"
           :body-text="resolveBodyText()"
           :is-app-details="isAppDetails"
         />
@@ -114,6 +115,7 @@
       :msg="msg"
       :is-last-msg="isLastMsg"
       :speak-text="resolveSpeakableBodyText()"
+      :enable-voice="enableVoice"
     />
   </view>
 </template>
@@ -126,6 +128,9 @@
   import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
   import { ChatDataAdapter } from "@/utils/chatDataAdapter.uts";
   import msgToolBar from "@/subpackages/components/msg-tool-bar/msg-tool-bar.uvue";
+  // #ifdef H5 || MP-WEIXIN
+  import mpHtml from "@/subpackages/uni_modules/mp-html/components/mp-html/mp-html.vue";
+  // #endif
   import UniAiXMsgRender from "@/uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue";
   import PlainStreamFastText from "@/subpackages/components/ai-msg/plain-stream-fast-text.uvue";
   import CodeStreamFastRender from "@/subpackages/components/ai-msg/code-stream-fast-render.uvue";
@@ -138,6 +143,11 @@
   import { TaskStatus } from "@/types/enums/agent";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { groupMarkdownContainers } from "@/utils/markdown.uts";
+  import { syncOpenUiProcessTagsWithProcessingList } from "@/utils/openUiMarkdown.uts";
+  // #ifdef H5 || MP-WEIXIN
+  import { replaceMathBracket } from "@/utils/markdown.uts";
+  import { handleExternalLink } from "@/utils/system.uts";
+  // #endif
   import { stripIncompleteCustomMarkupTail, stripOrphanCustomProcessGroupCloseTags } from "@/utils/markdownCustomProcess.uts";
   import {
     stripMarkdownImages,
@@ -194,6 +204,8 @@
       showToolBar?: boolean;
       /** 当前是否为应用详情会话，决定任务详情跳转页。 */
       isAppDetails?: boolean;
+      /** 是否启用语音播报按钮（仅 App web-view 内嵌页为 true）。 */
+      enableVoice?: boolean;
     }>(),
     {
       msg: null,
@@ -208,6 +220,7 @@
       speakableText: "",
       showToolBar: true,
       isAppDetails: false,
+      enableVoice: true,
     },
   );
 
@@ -370,16 +383,25 @@
     return propText.length > 0 ? propText : msgBody;
   }
 
-  /** 工具标签规范化；未闭合自定义标签只剥真尾巴，完整图片留在原位。 */
+  /** 工具标签规范化；未闭合自定义标签只剥真尾巴，完整图片留在原位。
+   * OpenUI：同 executeId 去重，status 以 processingList（componentExecutedList）为最终态。
+   */
   function resolveRenderableBodyText(): string {
+    const grouped = groupMarkdownContainers(resolveBodyText());
+    const list =
+      msg.value.processingList != null
+        ? (msg.value.processingList as any[])
+        : null;
+    const withOpenUiSync = syncOpenUiProcessTagsWithProcessingList(
+      grouped,
+      list,
+    );
     return stripOpenUiActionIdMarker(
       stripMarkdownImages(
         stripAdaptedAgentInfoHtml(
           stripAgentInfoTags(
             stripOrphanCustomProcessGroupCloseTags(
-              stripIncompleteCustomMarkupTail(
-                groupMarkdownContainers(resolveBodyText()),
-              ),
+              stripIncompleteCustomMarkupTail(withOpenUiSync),
             ),
           ),
         ),
@@ -419,19 +441,37 @@
   const isLastMsg = computed((): boolean => props.isLastMsg == true);
   const isConversationActive = computed((): boolean => props.isConversationActive == true);
   const showToolBar = computed((): boolean => props.showToolBar == true);
-  const showLoadingIcon = computed((): boolean => {
-    // 本地 Loading 态优先：占位气泡的 messageStatus=Loading 同步传入 → 本地 state=1 立即可知。
-    // Android 上 isConversationActive / isLastMsg 两个 props 都可能晚几百 ms 才传到子组件
-    // （与 isLastMsg 既有兜底同源），若等它们，发送瞬间会出现「气泡已渲染但无 loading」。
-    // 会话结束 / 历史消息的 state 为 Complete/Failed（≠1），不会误显。
-    if (msg.value.state == 1) {
-      return true;
+
+  /**
+   * 传给 mp-html / uni-ai-x-msg 的会话 ID。
+   * 优先 msg.chat_id（conversationId watch 已写回），否则回退 props 并补 chat- 前缀，
+   * 避免 openui-card 点击时 cid 为空 toast「无法打开 OpenUI」。
+   */
+  const mpHtmlConversationId = computed((): string => {
+    const fromMsg =
+      msg.value.chat_id != null && `${msg.value.chat_id}`.length > 0
+        ? `${msg.value.chat_id}`
+        : "";
+    if (fromMsg.length > 0) {
+      return fromMsg;
     }
-    // 会话未活跃不显示 loading
+    const fromProp =
+      props.conversationId != null ? `${props.conversationId}` : "";
+    if (fromProp.length == 0) {
+      return "";
+    }
+    return fromProp.startsWith("chat-") ? fromProp : "chat-" + fromProp;
+  });
+
+  const showLoadingIcon = computed((): boolean => {
+    // 会话级终态是 loading 的硬门禁。跨设备停止 / sub 断开时，
+    // 父级 active 会先变 false，子组件内部 state 可能仍短暂停在 1；
+    // 若 state=1 优先，就会在输入框已恢复后仍永久显示 loading。
     if (isConversationActive.value != true) {
       return false;
     }
-    // 活跃会话的最后一条（正文流式中 state=2）保持 loading，直到会话结束
+    // 只有当前轮最后一条助手消息可显示 loading；
+    // 避免新一轮开始时，历史上残留 state=1 的消息重新转圈。
     return isLastMsg.value == true;
   });
 
@@ -1027,6 +1067,37 @@
     return markdownParser.resolveRenderList();
   });
 
+  // #ifdef H5 || MP-WEIXIN
+  /**
+   * H5/小程序：mp-html 渲染正文（对齐 dev 的 markdown-msg / uni-ai-x-msg 做法）。
+   * 复用 resolveRenderableBodyText 清洗链路（剥 agent-info、未闭合自定义标记尾部，
+   * 保留完整图片语法交由 mp-html 原位渲染），再 replaceMathBracket 把 \\( \\) \\[ \\]
+   * 公式定界符转成 $ / $$，供 mp-html 的 latex 插件解析。
+   */
+  const mpHtmlContent = computed((): string => {
+    const _rev = streamRevision.value;
+    return replaceMathBracket(resolveRenderableBodyText());
+  });
+
+  /** 长文本换行，避免 mp-html 内 p/li/div/span 换行失效（对齐 dev tag-style）。 */
+  const mpHtmlTagStyle = {
+    p: "word-break: break-all; overflow-wrap: break-word;",
+    li: "word-break: break-all; overflow-wrap: break-word;",
+    div: "word-break: break-all; overflow-wrap: break-word;",
+    span: "word-break: break-all; overflow-wrap: break-word;",
+  };
+
+  /** mp-html 链接点击：外部链接统一跳转（对齐 dev markdown-msg handleLinkTap）。 */
+  const handleMpHtmlLinkTap = (event: any): void => {
+    const detail = event != null ? event.detail : null;
+    const href =
+      detail != null && detail.href != null ? `${detail.href}` : "";
+    if (href.length > 0) {
+      handleExternalLink(href);
+    }
+  };
+  // #endif
+
   /** 仅驱动思考区 rich-text，与正文 streamRevision 解耦，避免 THINK 流空刷答案树 */
   const thinkStreamRevision = ref<number>(0);
 
@@ -1609,12 +1680,14 @@
     /* #ifndef APP */
     word-break: break-all;
     overflow-wrap: anywhere;
+    /* #ifndef APP-HARMONY */
     max-width: 100%;
     /* #endif */
     /* #ifdef H5 */
     // vapor: 原 `.paragraph-box .text` H5 专属 width:auto / word-break 并入
     width: auto;
     word-break: break-all;
+    /* #endif */
     /* #endif */
   }
   .strong {
@@ -1762,7 +1835,9 @@
 
   .list-inline-image-box {
     /* #ifndef APP */
+    /* #ifndef APP-HARMONY */
     max-width: 100%;
+    /* #endif */
     display: block;
     /* #endif */
   }

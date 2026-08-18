@@ -34,18 +34,21 @@ public class RaTeXBridge: NSObject {
      把一条 LaTeX 渲染成 PNG dataURL（同步，建议在后台队列或 setTimeout 内调用）。
      - returns: 编码结果串（见文件头约定）
      */
-    /* uts 侧按位调用（UTS 无 Swift 参数标签语法），标签全部下划线化 */
+    /* uts 侧按位调用（UTS 无 Swift 参数标签语法），标签全部下划线化。
+       fontSize 用 NSNumber 而非 CGFloat：UTS number 在 Swift 桥下是 NSNumber，
+       不会隐式转 CGFloat（HX5.24 起编译器不再代劳），对齐 MathViewBridge/StreamPcmPlayerBridge 惯例。 */
     @objc public static func renderToPngDataUrl(
         _ tex: String,
         _ displayMode: Bool,
-        _ fontSizePx: CGFloat,
+        _ fontSizePx: NSNumber,
         _ colorHex: String
     ) -> String {
         ensureFonts()
         let color = UIColor.ratex_fromHex(colorHex)
+        let fontSize = fontSizePx.doubleValue > 0 ? fontSizePx.doubleValue : 16.0
         do {
             let dl = try RaTeXEngine.shared.parse(tex, displayMode: displayMode, color: color)
-            let renderer = RaTeXRenderer(displayList: dl, fontSize: fontSizePx)
+            let renderer = RaTeXRenderer(displayList: dl, fontSize: fontSize)
             var w = Int(ceil(renderer.width))
             var h = Int(ceil(renderer.totalHeight))
             if w < 1 { w = 1 }

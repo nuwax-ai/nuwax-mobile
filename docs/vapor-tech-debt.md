@@ -93,7 +93,7 @@ unzip -l unpackage/debug/android_release.apk | grep -iE "native-view|HelloUniApp
 
 ## 3. 样式坍塌重构（✅ 已近下限：2745 → 176）
 
-> **进度**：经多轮 BEM 反嵌套（commits `804044ce`/`3517886c`/`09dd4328`/`f4c997f5` 等）已从 ~2745 条降到 **176 条**（2026-08-06 实测）。后代/复合选择器基本清完，**残差 176 条已非 BEM 可治**：~112 条是伪类（`:last-child`×64、`:active`×34、`:focus-within`×6 等——vapor 根本丢弃，需模板 `:class` 状态绑定逐处改；`:active`/`:hover` 属可放弃的渐进增强），~112 条在第三方 uni_modules（lime-* ≈64 等 v4 升级、uni-ai-x ≈48 走上游）。继续 SCSS 反嵌套收益已很低；若要再降，仅针对业务代码 `:last-child` 做模板状态类，第三方随 [[vapor-lime-alignment-plan]] / lime v4 解决。
+> **进度**：经多轮 BEM 反嵌套（commits `804044ce`/`3517886c`/`09dd4328`/`f4c997f5` 等）已从 ~2745 条降到 **176 条**（2026-08-06 实测）。后代/复合选择器基本清完，**残差 176 条已非 BEM 可治**：~112 条是伪类（`:last-child`×64、`:active`×34、`:focus-within`×6 等——vapor 根本丢弃，需模板 `:class` 状态绑定逐处改；`:active`/`:hover` 属可放弃的渐进增强），~112 条在第三方 uni_modules（lime-* ≈64 等 v4 升级、uni-ai-x ≈48 走上游）。继续 SCSS 反嵌套收益已很低；若要再降，仅针对业务代码 `:last-child` 做模板状态类，第三方随 [[archive/vapor-lime-alignment-plan]]（已归档，重启 lime 对齐时取出） / lime v4 解决。
 
 **问题（背景）**：vapor styleIsolation 2.0（**官方强制，无 1.0 可选**）不支持以下 CSS，相关规则**整条丢弃**（非警告是真丢）：
 - 后代选择器 `.a .b`、复合选择器 `.a.b`（**已基本清完**）
@@ -121,7 +121,7 @@ unzip -l unpackage/debug/android_release.apk | grep -iE "native-view|HelloUniApp
 |---|---|---|---|---|
 | 4.1 | `subpackages/utils/fileTree.uts` | 删 `copyToPublicDownload()` + `java.io.File`/`android.os.Environment`，下载只返回 `res.tempFilePath` | 下载文件不进系统「下载/Downloads」 | ✅ **已恢复**——新增 uts 插件 `uni_modules/nuwax-android-downloads`，`fileTree.uts:632` 调 `copyToPublicDownload(tempFilePath, filename)`（commit `bc3c200f`） |
 | 4.2 | `uni_modules/uni-notice-bar/.../uni-notice-bar.vue` | 删 weex/`$getAppWebview`/CSS 动画跑马灯 | 长通告文本不滚动 | ✅ **已恢复**——vapor 下改用 `scroll-view` + JS 驱动 `transform: translateX` 实现跑马灯（组件 25–45 行） |
-| 4.3 | `uni_modules/lime-color/common/util.uts`、`uni_modules/lime-shared/floatMul/index.ts` | `java.math.BigDecimal` 改 `` `${n}` `` 模板串 | 大数/科学计数法精度不准（普通小数无碍） | ⚠️ **仍降级**（低优；在 lime-* 第三方，随 [[vapor-lime-alignment-plan]] v4 升级解决，不手改） |
+| 4.3 | `uni_modules/lime-color/common/util.uts`、`uni_modules/lime-shared/floatMul/index.ts` | `java.math.BigDecimal` 改 `` `${n}` `` 模板串 | 大数/科学计数法精度不准（普通小数无碍） | ⚠️ **仍降级**（低优；在 lime-* 第三方，随 [[archive/vapor-lime-alignment-plan]]（已归档，重启 lime 对齐时取出） v4 升级解决，不手改） |
 
 **4.1 恢复参考**（下载进公共目录）：新建/复用一个 uts 插件封装 `MediaStore`/`Environment` 拷贝，fileTree.uts 改为调插件接口。
 

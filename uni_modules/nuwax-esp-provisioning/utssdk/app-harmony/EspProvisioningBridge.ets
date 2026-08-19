@@ -75,10 +75,15 @@ export class EspProvisioningBridge {
       ble.on('BLEDeviceFind', this.scanCb)
       const options: ble.ScanOptions = {
         interval: 0,
-        dutyMode: ble.ScanDuty.SCAN_MODE_LOW_POWER,
+        dutyMode: ble.ScanDuty.SCAN_MODE_BALANCED,
         matchMode: ble.MatchMode.MATCH_MODE_AGGRESSIVE
       }
-      ble.startBLEScan([], options)
+      // HarmonyOS 6 原生层拒绝空 filters 数组（ParseScanFilterParameters: Requires array length > 0，
+      // StartBLEScan napi assert failed，扫描静默不启动）——放一个全匹配的空过滤器；
+      // 名称前缀 / serviceUuid 过滤仍由 onScan 客户端侧完成
+      const wildcard: ble.ScanFilter = {}
+      const filters: Array<ble.ScanFilter> = [wildcard]
+      ble.startBLEScan(filters, options)
       this.emit('scan_start prefix=' + prefix + ' uuid=' + this.serviceUuid)
     } catch (e) {
       this.scanning = false

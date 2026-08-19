@@ -74,6 +74,13 @@ class IapCallResult {
   orders: PurchaseSummary[] = []
 }
 
+/** 各方法 catch 分支共用的错误填充（needRecover 仅 createPurchase 的补单场景为 true）。 */
+function fillCallError(r: IapCallResult, err: BusinessError, needRecover: boolean): void {
+  r.code = err.code
+  r.message = err.message
+  r.needRecover = needRecover
+}
+
 /** JWS payload 解码（base64url → utf-8）。不验签，验签由服务端完成。 */
 function decodeJwsPayload(data: string): string {
   const parts: string[] = data.split('.')
@@ -148,14 +155,12 @@ export class HarmonyIapBridge {
       await iap.queryEnvironmentStatus(context)
       r.ok = true
     } catch (err) {
-      const e: BusinessError = err as BusinessError
-      r.code = e.code
-      r.message = e.message
+      fillCallError(r, err as BusinessError, false)
     }
     return JSON.stringify(r)
   }
 
-  /** 查询 AGC 配置的商品信息，成功时 orders 字段携带商品数组。 */
+  /** 查询 AGC 配置的商品信息，成功时 payload 字段携带商品数组 JSON。 */
   async queryProducts(context: common.UIAbilityContext, productType: number, productIds: string[]): Promise<string> {
     const r: IapCallResult = new IapCallResult()
     try {
@@ -167,9 +172,7 @@ export class HarmonyIapBridge {
       r.ok = true
       r.payload = JSON.stringify(products)
     } catch (err) {
-      const e: BusinessError = err as BusinessError
-      r.code = e.code
-      r.message = e.message
+      fillCallError(r, err as BusinessError, false)
     }
     return JSON.stringify(r)
   }
@@ -192,9 +195,7 @@ export class HarmonyIapBridge {
       r.summary = summary
     } catch (err) {
       const e: BusinessError = err as BusinessError
-      r.code = e.code
-      r.message = e.message
-      r.needRecover = e.code === iap.IAPErrorCode.PRODUCT_OWNED || e.code === iap.IAPErrorCode.SYSTEM_ERROR
+      fillCallError(r, e, e.code === iap.IAPErrorCode.PRODUCT_OWNED || e.code === iap.IAPErrorCode.SYSTEM_ERROR)
     }
     return JSON.stringify(r)
   }
@@ -217,9 +218,7 @@ export class HarmonyIapBridge {
       }
       r.ok = true
     } catch (err) {
-      const e: BusinessError = err as BusinessError
-      r.code = e.code
-      r.message = e.message
+      fillCallError(r, err as BusinessError, false)
     }
     return JSON.stringify(r)
   }
@@ -236,9 +235,7 @@ export class HarmonyIapBridge {
       await iap.finishPurchase(context, param)
       r.ok = true
     } catch (err) {
-      const e: BusinessError = err as BusinessError
-      r.code = e.code
-      r.message = e.message
+      fillCallError(r, err as BusinessError, false)
     }
     return JSON.stringify(r)
   }

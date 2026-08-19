@@ -11,6 +11,8 @@
 //
 // 混编约定（同 esp-provisioning / stream-pcm-player）：index.uts import 本文件
 // （uts 依赖 ets，ets 不引用 uts），context 由 UTS 层经 UTSHarmony.getUIAbilityContext() 传入。
+//
+// 安全约束：小程序启动参数（含网关支付凭据 Base64）仅透传微信 SDK，不写日志、不持久化。
 
 import { WXAPIFactory, LaunchMiniProgramReq, WXApi } from '@tencent/wechat_open_sdk'
 import { common, Want } from '@kit.AbilityKit'

@@ -1,7 +1,7 @@
 # DCloud Bug 报告：uni-app x iOS 端 web-view 反复创建/销毁导致必现崩溃（iOS 26）
 
-> 状态：待提交至 ask.dcloud.net.cn / dcloudio/uni-app issues
-> 附件：崩溃日志 .ips ×15（`unpackage/logs/ios/00008140-000C1D01028B001C/`）
+> 状态：已提交 —— DCloud 工单 **[#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215)**（经 HBuilderX 反馈渠道，2026-08-19）
+> 附件：崩溃日志 .ips ×15（`unpackage/logs/ios/00008140-000C1D01028B001C/`，提交时随附；本地目录已清理，取证件见 .ips 归档说明）
 
 ## 标题
 

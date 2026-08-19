@@ -59,8 +59,6 @@
 	import { downloadFileInApp } from '@/subpackages/utils/fileTree'
 	// Android 内嵌 H5 字体放大修复：强制 webview textZoom = 100%
 	import { fixAppWebviewTextZoom } from '@/subpackages/utils/webviewTextZoom'
-	// Android 窗口 softInputMode 常量（SOFT_INPUT_ADJUST_NOTHING 等）
-	import WindowManager from 'android.view.WindowManager'
 	// App 三端原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发，边说边传 ASR）
 	import { StreamPcmRecorder } from '@/uni_modules/nuwax-stream-pcm-player'
 	// #endif
@@ -93,58 +91,6 @@
 	let appKeyboardHeightListenerId: number = 0
 	/** 最近一次键盘高度：webview 未就绪时随注入轮询补发（默认 0 = 键盘收起） */
 	let latestInjectedKeyboardHeight: number = 0
-
-	// #ifdef APP-ANDROID
-	/** 页内窗口原 softInputMode（锁 ADJUST_NOTHING 前保存，onHide 恢复），-1 表示未保存 */
-	let appWindowSavedSoftInputMode: Int = -1
-
-	/**
-	 * 锁窗口 softInputMode = ADJUST_NOTHING：键盘弹出时窗口既不缩放也不平移。
-	 * 根因：web-view 整窗平移/缩放会把顶部导航栏（H5 内 fixed）顶出屏幕；
-	 * 与 DeepSeek 方案同源——不让系统自动调整布局，改由 H5 内部键盘高度桥
-	 * + keyboard-cover 自行抬升输入区（见 chat-input-phone）。onShow 幂等。
-	 */
-	function lockAppWebviewWindowSoftInput(): void {
-		try {
-			const activity = UTSAndroid.getUniActivity()
-			if (activity == null) {
-				return
-			}
-			const window = activity.getWindow()
-			if (window == null) {
-				return
-			}
-			if (appWindowSavedSoftInputMode < 0) {
-				const attrs = window.getAttributes()
-				if (attrs != null) {
-					appWindowSavedSoftInputMode = attrs.softInputMode
-				}
-			}
-			window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
-		} catch (_eSoftInput) {
-			// ignore
-		}
-	}
-
-	/** 恢复页面进入前窗口 softInputMode（onHide / onUnmounted 调用，幂等） */
-	function restoreAppWebviewWindowSoftInput(): void {
-		try {
-			if (appWindowSavedSoftInputMode < 0) {
-				return
-			}
-			const activity = UTSAndroid.getUniActivity()
-			if (activity != null) {
-				const window = activity.getWindow()
-				if (window != null) {
-					window.setSoftInputMode(appWindowSavedSoftInputMode)
-				}
-			}
-			appWindowSavedSoftInputMode = -1
-		} catch (_eRestore) {
-			// ignore
-		}
-	}
-	// #endif
 
 	/**
 	 * 幂等注入脚本：uni.webview JSSDK（网页 → 原生 postMessage 桥）+ ticket cookie
@@ -448,6 +394,17 @@
 		if (error == null) {
 			return ""
 		}
+		// 优先按 uni-app x 统一错误 UniError 读 errMsg：UTS 对象字面量 as 强转在 Android
+		// 编译成 Kotlin 接口，Java 类（UniError 等）不实现该接口会抛 ClassCastException，
+		// 只能拿到字符串化的 toString（如 "UniError(errSubject:...errMsg:...)"），取不到字段。
+		try {
+			const ue = error as UniError
+			if (ue.errMsg != null && `${ue.errMsg}`.length > 0) {
+				return `${ue.errMsg}`
+			}
+		} catch (_eUni) {
+			// ignore
+		}
 		try {
 			const fail = error as NativeRecorderFail
 			if (fail.errMsg != null && `${fail.errMsg}`.length > 0) {
@@ -664,10 +621,29 @@
 		// #endif
 	}
 
+	// #ifdef APP-ANDROID
+	/** 解析相册媒体权限：targetSdk>=33 用 READ_MEDIA_IMAGES，否则用旧 READ_EXTERNAL_STORAGE。
+	 *  uni-app x 运行时对两侧都做硬校验——targetSdk<33 请求新媒体权限抛 IllegalStateException
+	 *  （本生产基座 targetSdk=32 实测），targetSdk>=33 请求旧权限抛 IllegalArgumentException，
+	 *  必须按运行时 targetSdkVersion 分流，不能固定只请求某一个。 */
+	function resolveAlbumMediaPermission(): string {
+		try {
+			const activity = UTSAndroid.getUniActivity()
+			const appInfo = activity?.getApplicationInfo()
+			if (appInfo != null && appInfo.targetSdkVersion >= 33) {
+				return "android.permission.READ_MEDIA_IMAGES"
+			}
+		} catch (_eResolve) {
+			// 读取失败按旧权限兜底（当前生产基座 targetSdk=32）
+		}
+		return "android.permission.READ_EXTERNAL_STORAGE"
+	}
+	// #endif
+
 	/** 申请相册/媒体读取权限。
-	 *  注意：targetSdk>=33 时请求 READ_EXTERNAL_STORAGE 必抛 IllegalArgumentException，
-	 *  因此统一只请求 READ_MEDIA_IMAGES（Android 13+ 正确；旧版系统不认识该权限会返回拒绝，
-	 *  不抛异常）。临时拒绝 → 下次点击系统会再次弹授权框；永久拒绝 → 引导去系统设置。
+	 *  权限按运行时 targetSdkVersion 分流（见 resolveAlbumMediaPermission）：
+	 *  targetSdk>=33 请求 READ_MEDIA_IMAGES，否则 READ_EXTERNAL_STORAGE。
+	 *  临时拒绝 → 下次点击系统会再次弹授权框；永久拒绝 → 引导去系统设置。
 	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
 	async function ensureNativeAlbumPermission(): Promise<NativeMicPermissionResult> {
 		// #ifdef APP-ANDROID
@@ -677,7 +653,7 @@
 				resolve(new NativeMicPermissionResult(false, false))
 				return
 			}
-			const permission = ["android.permission.READ_MEDIA_IMAGES"] as string[]
+			const permission = [resolveAlbumMediaPermission()] as string[]
 			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
 				resolve(new NativeMicPermissionResult(true, false))
 				return
@@ -1326,13 +1302,18 @@
 
 	// ---- 原生媒体选择（拍照 / 相册 / 文件）：H5 内嵌页经 postMessage 调起 ----
 
-	/** 取消选择判定（Android/iOS 的 cancel / abort / 中文「取消」文案） */
+	/** 取消选择判定（Android/iOS 的 cancel / abort / 中文「取消」文案）。
+	 *  注意：uni-app x 内置选图器在 Android「进相机后直接返回、未拍照」时报的是
+	 *  camera error / camera_cancel 而非 cancel（H5 侧 isImageChooseCancelled 同规则），
+	 *  漏判会把 UniError 当失败提示给用户。 */
 	function isNativeChooseCancelled(errMsg: string): boolean {
 		const lower = errMsg.toLowerCase()
 		return (
 			lower.indexOf("cancel") >= 0 ||
 			lower.indexOf("abort") >= 0 ||
-			lower.indexOf("取消") >= 0
+			lower.indexOf("取消") >= 0 ||
+			lower.indexOf("camera error") >= 0 ||
+			lower.indexOf("camera_cancel") >= 0
 		)
 	}
 
@@ -1589,15 +1570,15 @@
 			})
 			return
 		}
-		// Android 相册：先申请媒体读取权限（统一 READ_MEDIA_IMAGES，避免 targetSdk>=33 下
-		// 请求 READ_EXTERNAL_STORAGE 抛 IllegalArgumentException），否则 uni.chooseImage 未授权会直接报 UniError
+		// Android 相册：先申请媒体读取权限（按 targetSdkVersion 分流 READ_MEDIA_IMAGES /
+		// READ_EXTERNAL_STORAGE，见 resolveAlbumMediaPermission），否则 uni.chooseImage 未授权会直接报 UniError
 		ensureNativeAlbumPermission().then((result: NativeMicPermissionResult) => {
 			if (result.granted != true) {
 				if (result.deniedForever == true) {
 					guideNativePermissionSettings(
 						t("Mobile.AgentDetail.albumPermissionTitle"),
 						t("Mobile.AgentDetail.albumPermissionSystemContent"),
-						"android.permission.READ_MEDIA_IMAGES",
+						resolveAlbumMediaPermission(),
 					)
 				}
 				// 临时拒绝：静默，下次点击系统会再次弹授权框
@@ -1847,8 +1828,6 @@
 		if (appKeyboardHeightListenerId == 0) {
 			appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChangeForWebView)
 		}
-		// 锁窗口 softInputMode（幂等）：键盘弹出不整窗平移/缩放，顶部导航栏不再被顶走
-		lockAppWebviewWindowSoftInput()
 		// #endif
 	})
 	// #endif
@@ -1868,10 +1847,6 @@
 		// 从原生 OpenUI 预览返回：把暂存续作注入内嵌 H5（须在 callChatMethod 之前，
 		// App 壳无原生 chat 组件，triggerResume 对内嵌场景无效）
 		deliverPendingOpenUiResumeToH5()
-		// #ifdef APP-ANDROID
-		// 重新可见时重锁窗口 softInputMode（onHide 已恢复，幂等）
-		lockAppWebviewWindowSoftInput()
-		// #endif
 		// #endif
         // #ifndef MP-WEIXIN
         callChatMethod("triggerResume")
@@ -1886,10 +1861,6 @@
         // #endif
 	})
 	onHide(() => {
-		// #ifdef APP-ANDROID
-		// 离开页面恢复窗口 softInputMode，避免影响其他页面的键盘行为
-		restoreAppWebviewWindowSoftInput()
-		// #endif
         // #ifndef MP-WEIXIN
         callChatMethod("triggerHide")
         // #endif
@@ -1919,8 +1890,6 @@
 			}
 			appKeyboardHeightListenerId = 0
 		}
-		// 兜底恢复窗口 softInputMode（onHide 已恢复，幂等）
-		restoreAppWebviewWindowSoftInput()
 		// #endif
 		// 停掉原生语音：断开 TTS 状态订阅并停止播报/录音，避免残留播放与监听
 		if (nativeTtsStateListenerId != 0) {

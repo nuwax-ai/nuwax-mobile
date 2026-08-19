@@ -1,13 +1,14 @@
 /**
- * 封装 BLE 设备信息，对上层仅暴露 name/mac/rssi/serviceUuid，不暴露 FastBLE 的 BleDevice，
- * 使 entry 等模块无需依赖 @ohos/fastble。
- * 库内部在连接时通过 getRawDevice() 取得原始 BleDevice。
+ * nuwax 重写（相对上游 esp-idf-provisioning-harmony）：
+ * 上游包装 @ohos/fastble 的 BleDevice；本项目为消除 fastble 依赖（其异步 GATT 读名过滤、
+ * MTU 请求值伪回调等问题见 commit 记录），改为直接包装 @ohos.bluetooth.ble 的 ScanResult。
+ * 对上层暴露 name/mac/rssi/serviceUuid/scanRecord，不暴露系统类型。
  */
-import { BleDevice } from '@ohos/fastble'
+import { ble } from '@kit.ConnectivityKit'
 
-/** 从广播数据解析第一个 128-bit Service UUID */
+/** 从广播数据解析第一个 128-bit Service UUID（AD type 0x06/0x07，little-endian） */
 function parseScanRecordForServiceUuid(scanRecord: Uint8Array): string {
-  if (!scanRecord || scanRecord.length < 18) {
+  if (scanRecord.length < 18) {
     return ''
   }
   let i = 0
@@ -32,45 +33,42 @@ function formatUuid128(b: Uint8Array): string {
 }
 
 export class ESPScanDevice {
-  private rawDevice: BleDevice
-  private _name: string
   private _mac: string
+  private _name: string
   private _rssi: number
   private _serviceUuid: string
+  private _scanRecord: Uint8Array
 
-  constructor(raw: BleDevice) {
-    this.rawDevice = raw
-    this._name = raw.getName() ?? 'Unknown'
-    this._mac = raw.getMac()
-    this._rssi = raw.getRssi()
-    const scanRecord = raw.getScanRecord()
-    this._serviceUuid = (scanRecord && scanRecord.length >= 18)
-      ? parseScanRecordForServiceUuid(scanRecord)
-      : ''
+  constructor(result: ble.ScanResult) {
+    this._mac = result.deviceId
+    // 鸿蒙系统对广播名的解析不可靠（常为空），名字以上层从广播数据解析为准；
+    // 此处保留系统值供日志/兜底。
+    this._name = result.deviceName ?? ''
+    this._rssi = result.rssi
+    this._scanRecord = new Uint8Array(result.data)
+    this._serviceUuid = parseScanRecordForServiceUuid(this._scanRecord)
+  }
+
+  /** 设备地址（鸿蒙为随机 MAC，仅作本次会话寻址，不得作为永久设备身份） */
+  getMac(): string {
+    return this._mac
   }
 
   getName(): string {
     return this._name
   }
 
-  getMac(): string {
-    return this._mac
-  }
-
   getRssi(): number {
     return this._rssi
   }
 
-  /** 从广播解析的 primary service UUID，空则需调用方使用默认值 */
+  /** 从广播数据解析的 128-bit Service UUID；未广播则为空串 */
   getServiceUuid(): string {
     return this._serviceUuid
   }
 
-  /**
-   * 库内部使用，用于连接时传入 BLETransport。
-   * 上层业务不要依赖此方法。
-   */
-  getRawDevice(): BleDevice {
-    return this.rawDevice
+  /** 原始广播数据（供上层解析广播名等 AD 结构） */
+  getScanRecord(): Uint8Array {
+    return this._scanRecord
   }
 }

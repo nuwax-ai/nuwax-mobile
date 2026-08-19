@@ -30,7 +30,7 @@ import { BleScanListener } from './esp/listeners/BleScanListener'
 import { SessionListener } from './esp/listeners/SessionListener'
 import { ProvisionListener } from './esp/listeners/ProvisionListener'
 import { WiFiScanListener } from './esp/listeners/WiFiScanListener'
-import { BleManager } from '@ohos/fastble'
+import { access } from '@kit.ConnectivityKit'
 import { util } from '@kit.ArkTS'
 
 const TAG = 'EspBridge'
@@ -51,7 +51,7 @@ class WifiNetworkPayload {
 
 export class EspProvisioningBridge {
   private manager: ESPProvisionManager = ESPProvisionManager.getInstance()
-  /** 扫描结果缓存：mac → 扫描到的设备（连接时取出，不向 UTS 泄漏 fastble 对象） */
+  /** 扫描结果缓存：mac → 扫描到的设备（连接时取出，不向 UTS 泄漏系统对象） */
   private peripherals: Map<string, ESPScanDevice> = new Map()
   private espDevice: ESPDevice | null = null
 
@@ -60,7 +60,7 @@ export class EspProvisioningBridge {
   /** 每次 start/stop 递增，防止上一轮监听器的迟到回调复活旧扫描（对齐 Android 桥）。 */
   private scanGeneration: number = 0
   private scanRestartTimer: number = -1
-  /** fastble 扫描窗口（ESPScanFilter.scanTimeOutMs）；窗口间冷却，避免系统扫描限流。 */
+  /** 扫描窗口（ESPScanFilter.scanTimeOutMs）；窗口间冷却，避免系统扫描限流。 */
   private static readonly SCAN_WINDOW_MS: number = 10000
   private static readonly SCAN_RESTART_COOLDOWN_MS: number = 2000
 
@@ -77,10 +77,8 @@ export class EspProvisioningBridge {
     this.scanGeneration = generation
     this.scanning = true
 
-    // 不设置 name 过滤（deviceNames 留空）：fastble 的 checkDevice 依赖异步 GATT
-    // getDeviceName() 结果匹配名字前缀，而鸿蒙系统对 ESP32 广播名的解析常为空/失败，
-    // 导致 PROV_ 设备在 fastble 层被静默丢弃。过滤改在下方 onPeripheralFound 内
-    // 直接解析广播数据完成（同步、可靠）。
+    // 系统层不过滤：鸿蒙对 ESP32 广播名的解析常为空/失败，名字/UUID 过滤
+    // 在下方 onPeripheralFound 内从原始广播数据解析完成（同步、可靠）。
     const filter = ESPScanFilter.builder()
       .setScanTimeOutMs(EspProvisioningBridge.SCAN_WINDOW_MS)
       .build()
@@ -89,7 +87,7 @@ export class EspProvisioningBridge {
       scanStartFailed: () => {
         if (!this.isCurrentScan(generation)) return
         this.scanning = false
-        const bluetoothEnabled = BleManager.getInstance().isBlueEnable()
+        const bluetoothEnabled = access.getState() === access.BluetoothState.STATE_ON
         if (bluetoothEnabled) {
           onFail('SCAN_FAILED', 'Bluetooth scanner could not start; retry after cooldown')
         } else {
@@ -99,8 +97,8 @@ export class EspProvisioningBridge {
       onPeripheralFound: (device: ESPScanDevice) => {
         if (!this.isCurrentScan(generation)) return
         const mac = device.getMac()
-        // fastble 异步 GATT 读名不可靠：广播名直接从原始广播数据解析
-        const record = device.getRawDevice().getScanRecord()
+        // 鸿蒙系统对广播名的解析不可靠：名字直接从原始广播数据解析
+        const record = device.getScanRecord()
         const parsedName = parseAdvertisedName(record)
         const advertisedUuid = device.getServiceUuid()
         const firstSeen = !this.peripherals.has(mac)

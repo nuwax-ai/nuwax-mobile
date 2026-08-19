@@ -10,6 +10,9 @@ configure_app.*
 build_device_base.sh
 ```
 
+配网 UTS 插件鸿蒙端已在 `uni_modules/nuwax-esp-provisioning/utssdk/app-harmony/`（HarmonyOS NEXT API 20）。
+Security 2 / 配网全链路已按 [esp-idf-provisioning-harmony](https://gitcode.com/Z_Heart/esp-idf-provisioning-harmony) 源码内置落地（方案：[docs/engineering/harmony-esp-provisioning-integration.md](../../docs/engineering/harmony-esp-provisioning-integration.md)），ArkTS 编译已验证；基座打包脚本仍未实现。
+
 在此之前请使用：
 
 ```bash

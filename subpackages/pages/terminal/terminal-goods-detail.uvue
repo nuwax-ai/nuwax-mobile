@@ -1,0 +1,331 @@
+<template>
+  <view class="goods-detail-page page-container">
+    <custom-nav-bar class="goods-detail-nav" :title="navTitle" hasSafetyZone showBack />
+
+    <view class="goods-detail-content">
+      <web-view
+        v-if="url.length != 0"
+        id="terminal-goods-webview"
+        class="goods-detail-webview"
+        :src="url"
+        @load="handleWebViewLoad"
+        @message="handleWebViewMessage"
+      ></web-view>
+      <!-- 不可见 sibling 占位（勿删）：Android 上页面内容区仅有 web-view 单节点时会走全屏原生层，
+           createWebviewContext 拿不到 context，evalJS 注入（buy 覆写）会失效。 -->
+      <view class="goods-detail-webview-placeholder" />
+    </view>
+
+    <!-- 订单弹窗：详情页内「立即购买」经原生桥回传后打开，与终端产品卡共用同一组件 -->
+    <desk-buddy-order-modal
+      ref="orderModalRef"
+      :product-title="productTitle"
+      :product-subtitle="productSubtitle"
+      :product-price-text="productPriceText"
+      :product-image-url="productImageUrl"
+      :product-highlights="productHighlights"
+    />
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, getCurrentInstance, type ComponentPublicInstance } from "vue";
+  import { onLoad, onShow, onUnload } from "@dcloudio/uni-app";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiVoxListGoods } from "@/servers/vox/voxDevice";
+  import { apiResCode, apiResData } from "@/utils/common";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { getApiBaseUrl } from "@/constants/config";
+  import { formatNumber } from "@/utils/system";
+  import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
+  import { goToLogin } from "@/utils/authNavigation";
+  import DeskBuddyOrderModal from "@/pages/terminal/components/desk-buddy-order-modal.uvue";
+  // App 端内嵌 H5 字体放大修复：Android 强制 webview textZoom = 100%
+  import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+  const { hasToken } = useAuthInterceptor();
+  const instance = getCurrentInstance();
+
+  /** 商品详情页地址（接口 device-goods 的 link 字段下发） */
+  const url = ref<string>("");
+  /** 当前商品 ID：下单时随订单回传；为空时取商品列表首项 */
+  const goodsId = ref<string>("");
+  const navTitle = ref<string>("");
+
+  // 订单弹窗展示数据：与终端产品卡同源（GET /api/app/device-goods），本页按 goodsId 取对应项
+  const productTitle = ref<string>("");
+  const productSubtitle = ref<string>("");
+  const productPriceText = ref<string>("0");
+  const productImageUrl = ref<string>("");
+  const productHighlights = ref<string[]>([]);
+  /** 商品详情是否已就绪：未就绪时点击购买先拉一次再弹窗 */
+  const goodsLoaded = ref<boolean>(false);
+
+  const orderModalRef = ref<any | null>(null);
+
+  // ==================== 商品数据 ====================
+
+  /**
+   * 拉取商品列表并回填弹窗展示数据。
+   * 接口需登录态，未登录时静默跳过（登录返回本页后 onShow 会重试）。
+   */
+  const loadGoods = async (): Promise<boolean> => {
+    if (!(await hasToken())) return false;
+    try {
+      const res = await apiVoxListGoods();
+      if (apiResCode(res) != SUCCESS_CODE) return false;
+      const raw = apiResData<any>(res);
+      const arr = raw != null ? (raw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+      if (arr.length == 0) return false;
+      // 指定 goodsId 优先；未命中（或未带参）时退回首项，与终端产品卡的展示口径一致
+      let target: UTSJSONObject = arr[0];
+      if (goodsId.value.length > 0) {
+        for (let i = 0; i < arr.length; i++) {
+          const item = arr[i];
+          const idVal = item["goodsId"];
+          if (idVal != null && `${idVal}` == goodsId.value) {
+            target = item;
+            break;
+          }
+        }
+      }
+      const idVal = target["goodsId"];
+      if (idVal != null) goodsId.value = `${idVal}`;
+      productTitle.value = target["title"] != null ? `${target["title"]}` : "";
+      productSubtitle.value = target["subtitle"] != null ? `${target["subtitle"]}` : "";
+      const priceVal = target["priceYuan"];
+      productPriceText.value = formatNumber(priceVal != null ? (priceVal as number) : 0, 0);
+      productImageUrl.value = target["imageUrl"] != null ? `${target["imageUrl"]}` : "";
+      const hlRaw = target["highlights"];
+      if (hlRaw != null) {
+        const hl = hlRaw as string[];
+        productHighlights.value = hl;
+      }
+      if (navTitle.value.length == 0) navTitle.value = productTitle.value;
+      goodsLoaded.value = true;
+      return true;
+    } catch (e) {
+      console.error("terminal-goods-detail loadGoods error", e);
+      return false;
+    }
+  };
+
+  // ==================== 购买（H5 buy() → 原生桥 → 订单弹窗） ====================
+
+  /** 打开订单弹窗；未登录先去登录，商品数据未就绪先补拉一次 */
+  const openOrderModal = async (): Promise<void> => {
+    if (!(await hasToken())) {
+      goToLogin();
+      return;
+    }
+    if (!goodsLoaded.value) {
+      await loadGoods();
+    }
+    const modal = orderModalRef.value;
+    if (modal == null) return;
+    // Android：组件 ref 是 Gen* 类，须用 $callMethod 调 defineExpose 方法并带参
+    (modal as ComponentPublicInstance).$callMethod("open", goodsId.value);
+  };
+
+  // ==================== web-view 脚本注入 ====================
+
+  // #ifdef APP
+  /** 注入短轮询定时器 / 次数 */
+  let injectTimer: number = 0;
+  let injectAttempts: number = 0;
+  /** webview context 缓存（createWebviewContext 每次新建有失败风险，取到即复用） */
+  let webViewContext: WebviewContext | null = null;
+
+  /**
+   * 覆写详情页的全局 buy()：页面上「立即购买」为 <a onclick="return buy()">，
+   * 覆写后点击不再跳网页购买页，而是 postMessage 回原生，由本页唤起订单弹窗。
+   * 脚本幂等（注入轮询会重复执行），全部逻辑挂在 window.__nuwaxBuyBridge 上。
+   *
+   * 消息通道优先级：uni-app x 原生桥全局（__uniapp_x_，Android addJavascriptInterface /
+   * iOS WKUserScript 注入）→ 旧 App-plus 桥 → uni.webview JSSDK；全部缺失时才远程加载
+   * JSSDK 兜底（详情页是第三方静态站，不会自带 JSSDK，故由客户端注入）。
+   */
+  function buildBuyBridgeCode(goodsIdLiteral: string, sdkUrlLiteral: string): string {
+    return (
+      "(function(){try{" +
+      "if(window.__nuwaxBuyBridge==null){window.__nuwaxBuyBridge={lastAt:0,hooked:false,sdkLoading:false};}" +
+      "var B=window.__nuwaxBuyBridge;" +
+      "B.goodsId=" + goodsIdLiteral + ";" +
+      // 实际投递：uni-app x 原生桥全局（App 侧注入，无需联网）→ 旧 App-plus 桥 → JSSDK；
+      // 均不可用返回 false 由外层重试。各通道的 payload 形态照抄 uni.webview JSSDK：
+      // uni-app x 为 {data: payload}（iOS 走全局函数、Android 走 JSON 字符串），旧桥为 {data: [payload]}。
+      // 原生侧统一取 data 后包成数组下发，故 @message 的 detail.data 恒为数组。
+      "B.send=function(){" +
+      "var payload={action:'nuwaxDeskBuddyBuy',goodsId:B.goodsId};" +
+      "try{if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:payload});return true;}}catch(e){}" +
+      "try{if(window.__uniapp_x_&&window.__uniapp_x_.postMessage){window.__uniapp_x_.postMessage(JSON.stringify({data:payload}));return true;}}catch(e){}" +
+      "try{if(window.__dcloud_weex_postMessage){window.__dcloud_weex_postMessage({data:[payload]});return true;}}catch(e){}" +
+      "try{if(window.__dcloud_weex_&&window.__dcloud_weex_.postMessage){window.__dcloud_weex_.postMessage(JSON.stringify({data:[payload]}));return true;}}catch(e){}" +
+      "try{if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:payload});return true;}}catch(e){}" +
+      "return false;};" +
+      // 800ms 去重：buy() 覆写与链接兜底可能同时命中，避免弹两次；
+      // 通道未就绪（JSSDK 仍在加载）时按 100ms × 20 重试，点击不丢。
+      "B.post=function(retry){" +
+      "var n=retry||0;" +
+      "if(n===0){var now=Date.now();if(now-B.lastAt<800){return;}B.lastAt=now;}" +
+      "if(B.send()){return;}" +
+      "if(n<20){setTimeout(function(){B.post(n+1);},100);}else{B.lastAt=0;}" +
+      "};" +
+      // 主路径：覆写页面自带 buy()，返回 false 阻止 <a> 默认跳转
+      "window.buy=function(){B.post();return false;};" +
+      // 兜底：页面若改写法（不再走 buy()），捕获阶段拦截指向购买页的链接
+      "if(!B.hooked){B.hooked=true;document.addEventListener('click',function(ev){try{var n=ev.target;" +
+      "while(n!=null&&n!==document){if(n.tagName==='A'&&(n.getAttribute('href')||'').indexOf('buy.html')>=0){" +
+      "ev.preventDefault();ev.stopPropagation();B.post();return;}n=n.parentNode;}}catch(e){}},true);}" +
+      // JSSDK 兜底加载：仅在原生桥全局全部缺失时才需要（正常 App 内不会走到）
+      "if(!window.__uniapp_x_postMessage&&!window.__uniapp_x_&&!window.__dcloud_weex_postMessage&&!window.__dcloud_weex_&&!(window.uni&&window.uni.webView)&&!B.sdkLoading){" +
+      "B.sdkLoading=true;var s=document.createElement('script');s.src=" + sdkUrlLiteral + ";" +
+      "s.onerror=function(){B.sdkLoading=false;};document.head.appendChild(s);}" +
+      "}catch(e){}})()"
+    );
+  }
+
+  /**
+   * 单次注入。返回 true 仅代表「拿到 context 且 evalJS 未抛异常」。
+   * webview 未就绪时 createWebviewContext / evalJS 可能抛异常，必须 try-catch 保护。
+   */
+  function injectBuyBridgeOnce(): boolean {
+    let ctx: WebviewContext | null = webViewContext;
+    if (ctx == null) {
+      try {
+        ctx = uni.createWebviewContext("terminal-goods-webview", instance?.proxy);
+        webViewContext = ctx;
+      } catch (e) {
+        return false;
+      }
+      if (ctx == null) return false;
+    }
+    const sdkUrl = `${getApiBaseUrl()}/m/static/uni.webview.1.5.5.js`;
+    try {
+      ctx.evalJS(buildBuyBridgeCode(JSON.stringify(goodsId.value), JSON.stringify(sdkUrl)));
+    } catch (e) {
+      return false;
+    }
+    return true;
+  }
+
+  function stopInjectPolling(): void {
+    if (injectTimer != 0) {
+      clearInterval(injectTimer);
+      injectTimer = 0;
+    }
+  }
+
+  /**
+   * @load 后启动注入短轮询：注入只在文档已加载后发生，避免 Android 上 evalJS
+   * 落在 about:blank / 中间文档被后续导航丢弃；页面内跳转后 @load 会重开窗口。
+   */
+  function startInjectPolling(): void {
+    stopInjectPolling();
+    injectAttempts = 0;
+    injectBuyBridgeOnce();
+    injectTimer = setInterval((): void => {
+      injectAttempts++;
+      injectBuyBridgeOnce();
+      // 12 × 250ms = 3s，覆盖详情页脚本延迟定义 buy() 的情况
+      if (injectAttempts >= 12) stopInjectPolling();
+    }, 250) as number;
+  }
+  // #endif
+
+  function handleWebViewLoad(_e: any): void {
+    // Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
+    fixAppWebviewTextZoom();
+    // #ifdef APP
+    // webview 内跳转会重建文档，context 需重取
+    webViewContext = null;
+    startInjectPolling();
+    // #endif
+  }
+
+  // #ifdef APP
+  /**
+   * 详情页 postMessage 回传：命中购买动作即唤起订单弹窗。
+   * App 端事件是原生类 UniWebViewMessageEvent，禁止 as UTSJSONObject（Kotlin 侧直接 ClassCastException），
+   * 只能走类型化的 e.detail.data；原生已把 payload 包成数组下发，故这里遍历取。
+   */
+  function handleWebViewMessage(e: UniWebViewMessageEvent): void {
+    const arr = e.detail.data;
+    for (let i = 0; i < arr.length; i++) {
+      const action = arr[i]["action"];
+      if (action != null && `${action}` == "nuwaxDeskBuddyBuy") {
+        openOrderModal();
+        return;
+      }
+    }
+  }
+  // #endif
+
+  // #ifndef APP
+  /** 非 App 端不注入 buy 桥（跨域页面无法注入脚本），不会收到本页约定的消息 */
+  function handleWebViewMessage(_e: any): void {}
+  // #endif
+
+  onLoad((options: OnLoadOptions) => {
+    const urlVal = options["url"];
+    if (urlVal != null) {
+      const decoded = decodeURIComponent(`${urlVal}`);
+      url.value = decoded != null ? decoded : "";
+    }
+    const idVal = options["goodsId"];
+    if (idVal != null) goodsId.value = `${idVal}`;
+    const titleVal = options["title"];
+    if (titleVal != null) {
+      const decodedTitle = decodeURIComponent(`${titleVal}`);
+      navTitle.value = decodedTitle != null ? decodedTitle : "";
+    }
+    if (navTitle.value.length == 0) navTitle.value = t("Mobile.Terminal.productName");
+    loadGoods();
+    fixAppWebviewTextZoom();
+  });
+
+  onShow(() => {
+    // 登录页返回后补拉一次商品数据（未登录时 loadGoods 内部直接跳过）
+    if (!goodsLoaded.value) loadGoods();
+  });
+
+  onUnload(() => {
+    // #ifdef APP
+    stopInjectPolling();
+    webViewContext = null;
+    // #endif
+  });
+</script>
+
+<style lang="scss" scoped>
+  .goods-detail-page {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .goods-detail-nav {
+    flex-shrink: 0;
+    position: relative;
+    z-index: 20;
+    background: #fff;
+  }
+
+  .goods-detail-content {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .goods-detail-webview {
+    width: 100%;
+    height: 100%;
+  }
+
+  .goods-detail-webview-placeholder {
+    width: 1rpx;
+    height: 1rpx;
+    opacity: 0;
+  }
+</style>

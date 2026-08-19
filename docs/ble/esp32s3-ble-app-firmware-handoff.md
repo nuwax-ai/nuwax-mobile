@@ -348,3 +348,13 @@ Firmware total window: 300 seconds
 | 生产逐设备密钥/二维码 | 未完成 | 待产线协议 | 阻塞量产 |
 
 双方完成真机测试并填写 APP commit、固件 commit、测试设备和签字人后，本契约状态方可从 `FIRMWARE_IMPLEMENTED_FIRST_INTEGRATION` 更新为 `INTEGRATION_VERIFIED`。
+
+## 14. 平台联调记录
+
+### 鸿蒙（2026-08-19，正路径全链路通过）
+
+- 设备：HUAWEI Pura 70 Pro+（HarmonyOS 6.0.0.130）；APP 分支 `feat/nuwa-zhuoda-2026.08-harmony-esp-prov`（commit `701354d8`）
+- 链路：扫码 → BLE 扫描（广播名+Service UUID 双匹配）→ GATT 连接 → MTU 512 → endpoint 发现（0x2901）→ proto-ver（sec_ver=2）→ Security 2 会话 → 设备 WiFi 扫描（12 AP）→ bind → `vox-config` 下发（WiFi 凭据前，契约顺序）→ WiFi 配网成功（state=0/GOT_IP）；扫码到联网约 52s
+- 鸿蒙端实现与联调沉淀见 [harmony-esp-provisioning-local-base.md](../engineering/harmony-esp-provisioning-local-base.md)
+- 联调期间固件侧变更：ATT MTU 提升至 512（SRP6a Cmd0 415 字节要求 ≥419）
+- 待办：负路径（错 PoP / 错 WiFi 密码 / 蓝牙关闭）未在鸿蒙端验证

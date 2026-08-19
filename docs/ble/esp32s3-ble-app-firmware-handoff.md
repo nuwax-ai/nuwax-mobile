@@ -357,4 +357,5 @@ Firmware total window: 300 seconds
 - 链路：扫码 → BLE 扫描（广播名+Service UUID 双匹配）→ GATT 连接 → MTU 512 → endpoint 发现（0x2901）→ proto-ver（sec_ver=2）→ Security 2 会话 → 设备 WiFi 扫描（12 AP）→ bind → `vox-config` 下发（WiFi 凭据前，契约顺序）→ WiFi 配网成功（state=0/GOT_IP）；扫码到联网约 52s
 - 鸿蒙端实现与联调沉淀见 [harmony-esp-provisioning-local-base.md](../engineering/harmony-esp-provisioning-local-base.md)
 - 联调期间固件侧变更：ATT MTU 提升至 512（SRP6a Cmd0 415 字节要求 ≥419）
-- 待办：负路径（错 PoP / 错 WiFi 密码 / 蓝牙关闭）未在鸿蒙端验证
+- 待办：错 PoP / 蓝牙关闭路径未在鸿蒙端验证（错误映射与已验证路径同构）
+- 负路径已验（2026-08-19 补充）：错 WiFi 密码 → `state=3 failReason=0` → `WIFI_AUTH_FAILED`（约 16s 返还明确原因）；同窗口内重试正确密码 → 配网成功（bind/密钥会话内去重，不重复下发）

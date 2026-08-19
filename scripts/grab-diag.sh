@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键归档崩溃 / 性能日志到 docs/perf-baseline/diag-<tag>/（方便后续分析）。
+# 一键归档崩溃 / 性能日志到 .diag/<tag>/（方便后续分析；历史基线在 docs/archive/perf-baseline/）。
 #
 # 抓取内容：
 #   1. logcat（GC / 流式 StreamRequest / PerfProbe / SseStall / FATAL / ANR）

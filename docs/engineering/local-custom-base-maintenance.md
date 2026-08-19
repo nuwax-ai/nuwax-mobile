@@ -21,7 +21,7 @@
 
 ```text
 nuwax-mobile/                          # Git
-├── docs/local-custom-base-maintenance.md
+├── docs/engineering/local-custom-base-maintenance.md
 ├── scripts/local-base-env.sh
 ├── scripts/{ios,android,harmony}-esp/
 └── Makefile
@@ -135,4 +135,4 @@ rm -rf "$NUWAX_OFFLINE_SDK_HOME/work/ios"
 
 ## 8. 鸿蒙预留
 
-`sdk/harmony/`、`work/harmony/`、`scripts/harmony-esp/`、`docs/harmony-esp-provisioning-local-base.md` 已占位；官方 SDK 就绪后按 Android/iOS 同构补齐。
+`sdk/harmony/`、`work/harmony/`、`scripts/harmony-esp/`、`docs/engineering/harmony-esp-provisioning-local-base.md` 已占位；官方 SDK 就绪后按 Android/iOS 同构补齐。

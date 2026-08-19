@@ -78,10 +78,12 @@ export class BLETransport implements Transport {
           if (settled) return
           settled = true
           clearTimeout(timer)
-          gatt.off('BLEConnectionStateChange', handler)
+          // nuwax 修改：连接成功后保留事件监听（不 off），断连时打日志——诊断
+          // SRP6a 会话中途设备断开类问题（此前断开静默，写失败只见 2900099）。
           console.info(TAG, 'Connected successfully')
           resolve()
         } else if (data.state === constant.ProfileConnectionState.STATE_DISCONNECTED) {
+          console.warn(TAG, `Disconnected (state event) settled=${settled}`)
           if (settled) return
           settled = true
           clearTimeout(timer)
@@ -309,10 +311,21 @@ export class BLETransport implements Transport {
     if (data.length > 509) {
       throw new Error(`Data length ${data.length} exceeds single-write limit (MTU 512)`);
     }
-    characteristic.characteristicValue = toArrayBuffer(data)
     // 固定用 WRITE（带响应）：protocomm 依赖「写确认 → 设备处理 → 读响应」的时序，
     // WRITE_NO_RESPONSE 会导致读响应过早、取不到结果。
-    await gatt.writeCharacteristicValue(characteristic, ble.GattWriteType.WRITE)
+    characteristic.characteristicValue = toArrayBuffer(data)
+    try {
+      await gatt.writeCharacteristicValue(characteristic, ble.GattWriteType.WRITE)
+    } catch (e) {
+      // 写失败自动重试一次：ESP32 忙于 3072-bit SRP 服务端运算期间，鸿蒙系统会以
+      // 2900099（Operation failed）立即拒绝写请求；延迟重试可自愈。
+      const err = e as BusinessError
+      console.warn(TAG, `write failed code=${err.code}, retrying after 300ms (len=${data.length})`)
+      await this.delayMs(300)
+      // 重设 value 后重试（2900099 为系统本地拒绝，未到达设备，重试不会重复消息）
+      characteristic.characteristicValue = toArrayBuffer(data)
+      await gatt.writeCharacteristicValue(characteristic, ble.GattWriteType.WRITE)
+    }
   }
 
   private async readCharacteristic(charUuid: string): Promise<Uint8Array> {
@@ -322,6 +335,9 @@ export class BLETransport implements Transport {
       throw new Error('Device not connected or characteristic missing')
     }
     const result = await gatt.readCharacteristicValue(characteristic)
+    // 读操作返回系统最新的特征对象；回写缓存，后续写用最新对象——
+    // 避免复用读前的旧对象触发鸿蒙内部状态校验导致写被拒（2900099）。
+    this.charMap.set(charUuid, result)
     return new Uint8Array(result.characteristicValue)
   }
 

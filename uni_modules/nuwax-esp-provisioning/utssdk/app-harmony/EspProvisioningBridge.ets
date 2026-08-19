@@ -88,6 +88,7 @@ export class EspProvisioningBridge {
         if (!this.isCurrentScan(generation)) return
         this.scanning = false
         const bluetoothEnabled = access.getState() === access.BluetoothState.STATE_ON
+        console.error(`[${TAG}] scanStartFailed bluetoothEnabled=${bluetoothEnabled}`)
         if (bluetoothEnabled) {
           onFail('SCAN_FAILED', 'Bluetooth scanner could not start; retry after cooldown')
         } else {
@@ -134,10 +135,17 @@ export class EspProvisioningBridge {
       onFailure: (e: Error) => {
         if (!this.isCurrentScan(generation)) return
         this.scanning = false
+        console.error(`[${TAG}] scanFailure: ${safeMessage(e)}`)
         onFail('SCAN_FAILED', safeMessage(e))
       },
     }
-    this.manager.searchBleEspDevices(filter, listener)
+    try {
+      this.manager.searchBleEspDevices(filter, listener)
+    } catch (e) {
+      console.error(`[${TAG}] startScan sync error: ${safeMessage(e as Error)}`)
+      this.scanning = false
+      onFail('SCAN_FAILED', safeMessage(e as Error))
+    }
   }
 
   stopScan(): void {

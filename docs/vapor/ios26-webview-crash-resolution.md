@@ -33,7 +33,7 @@ iOS 26 真机上，从「最近使用」agent 列表进入会话详情（整页 
 
 ## 三、根因结论
 
-**Apple iOS 26 WebKit 回归：WebContent 进程销毁回传竞态**（销毁后仍向宿主回传 BFL/FrameState 消息，主线程消费已死对象）。高频创建/销毁整页 WKWebView 把该回归放大到必现；页面侧无从拆雷，HBuilderX 5.24 / alpha 均无修复。属平台级缺陷，**已提交 DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215)**（经 HBuilderX 反馈渠道；工单材料全文见 [dcloud-ios26-webview-crash-report.md](dcloud-ios26-webview-crash-report.md)：四场景矩阵 + .ips 附件清单；另关联同族反馈 #32189）。**官方暂未回复工单，跟进中**；另官方推荐使用 vapor，与本线选型一致。
+**Apple iOS 26 WebKit 回归：WebContent 进程销毁回传竞态**（销毁后仍向宿主回传 BFL/FrameState 消息，主线程消费已死对象）。高频创建/销毁整页 WKWebView 把该回归放大到必现；页面侧无从拆雷，HBuilderX 5.24 / alpha 均无修复。属平台级缺陷，已提交 DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215)（经 HBuilderX 反馈渠道；工单材料全文见 [dcloud-ios26-webview-crash-report.md](dcloud-ios26-webview-crash-report.md)：四场景矩阵 + .ips 附件清单；另关联同族反馈 #32189）。**官方已回复：建议切换 vapor——与我方解决方案一致**。
 
 ## 四、解决方案（已落地，主线与 vapor 线共有）
 
@@ -54,7 +54,7 @@ iOS 26 真机上，从「最近使用」agent 列表进入会话详情（整页 
 崩溃根因在**底层框架层**（DCloud 运行时 / iOS 26 WebKit 的 WebContent 销毁回传竞态），**非业务代码可根治**——四场景与 E 系列实验已证明页面侧手段全部无效。当前处置：
 
 - **我方**：vapor 方案承载 + 退出路径缓解已落地，问题已解决，**无自研根治排期**；
-- **框架方**：DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215) 已提交、**官方暂未回复（跟进中）**，待其修复版本后按第六节验收标准回归一遍。
+- **框架方**：DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215) **官方已回复——建议切换 vapor，与我方现行做法一致**（方案获官方背书，无需额外动作）。
 
 > 实验结论存档：常驻 webview「不销毁则不崩」（B 场景）是框架外的规避手段，仅当未来必须重度使用整页 webview 时才需纳入考量，当前架构无此需求。
 

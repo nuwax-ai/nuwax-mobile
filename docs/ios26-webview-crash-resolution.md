@@ -44,7 +44,7 @@ iOS 26 真机上，从「最近使用」agent 列表进入会话详情（整页 
 3. **配套桥接**：登录态双路透传（URL 参数 + `@load` 后 evalJS 注入，vapor 下 `createWebviewContext().evalJS` 不可用已加元素级 `UniWebViewElement.evalJS` 兜底）、键盘高度桥、Android webview textZoom 复位。
 
 **选这个方案的原因**：
-1. 原生（mp-html）路线此前因性能与需求实现工期被搁置，H5 同页复用让功能即开即用、双端表现一致；
+1. 原生组件渲染路线（uni-app x 原生链路，`chat-conversation-component` → ai-msg → cmark 解析渲染）此前因性能与需求实现工期被搁置，H5 同页复用让功能即开即用、双端表现一致；
 2. 崩溃缓解只动退出路径时序，改动小、当版可发，不影响 Android / H5 路径；
 3. 承载线（vapor）与 DCloud 官方主推的 App 渲染方向一致，官方已确认收到崩溃反馈，可预期平台侧修复支持。
 

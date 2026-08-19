@@ -238,7 +238,7 @@ App 工程师需了解的固侧行为（实现由固件团队负责）：
 - 首轮联调操作与验收矩阵：[`esp32s3-ble-first-integration-handoff.md`](./esp32s3-ble-first-integration-handoff.md)
 - 机器可读契约：[`esp32s3-idf6-provisioning-contract.json`](./esp32s3-idf6-provisioning-contract.json)（`1.3-dynamic-vox-config`）
 - App 代码分层：[`esp32s3-idf6-provisioning-code-plan.md`](./esp32s3-idf6-provisioning-code-plan.md)
-- Vox 后端 / 网关集成要点：[`app-asr-tts.md`](./app-asr-tts.md)、`servers/vox/voxDevice.uts`（绑定接口）
+- Vox 后端 / 网关集成要点：[`app-asr-tts.md`](../integration/app-asr-tts.md)、`servers/vox/voxDevice.uts`（绑定接口）
 - 上游硬件交接包：`ble-vox-config-formal-handoff-2026-07-26`（外部，仅供参考）
 
 核心代码：

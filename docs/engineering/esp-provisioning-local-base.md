@@ -32,4 +32,4 @@ make base-fetch            # 同事拉最新
 `unpackage/debug/` 中 **iOS 真机与模拟器是两套包**，勿混用。S3 说明见 [custom-base-distribution-s3.md](./custom-base-distribution-s3.md)。
 
 阅读顺序：本总览 → [维护规范](./local-custom-base-maintenance.md) → 对应平台方案文档 → 脚本 README。  
-业务契约见 [esp32s3-ble-first-integration-handoff.md](./esp32s3-ble-first-integration-handoff.md)。
+业务契约见 [esp32s3-ble-first-integration-handoff.md](../ble/esp32s3-ble-first-integration-handoff.md)。

@@ -35,6 +35,14 @@ const MIN_UTTERANCE_CHARS = 2;
 const MAX_MERGED_UTTERANCE_CHARS = 50;
 
 /**
+ * 喂出块的最低舒适长度（字符）：流已结束（全文已入队，无首音延迟顾虑）且
+ * 当前块低于该值、下一个句子又放不下整个时，从其软停顿处切一段补进来再喂——
+ * 避免 17~26 字的小碎片单独喂出（实测多次出现），减少每句 TTS 往返。
+ * 流式（未结束）不适用：首音延迟优先，短句即刻喂出。
+ */
+const MIN_COMFORT_UTTERANCE_CHARS = 30;
+
+/**
  * 等待段/会话结束的兜底超时：服务端中途停流（无新帧且不发 tts_end）时
  * 强制结束本轮，防止播放循环永久悬挂、图标不复位。
  */
@@ -55,9 +63,10 @@ const FEED_PACING_POLL_MS = 200;
 /**
  * 方向A逃逸阈值（ms）：上一块未完整到达时，写队列缓冲低于该值视为「将尽」，
  * 提前放行下一句防停喂。写队列 + AudioTrack 硬件缓冲（~1s）双保险，
- * 3s 队列 ≈ 4s 可播余量。
+ * 5s 队列 ≈ 6s 可播余量。原 3s 偏激进：实测 75% 放行都触到该线、缓冲见底才喂，
+ * 对服务端单句延迟尖峰余量不足，放到 5s 多留 ~2s。
  */
-const FEED_UNDERRUN_BUFFER_MS = 3000;
+const FEED_UNDERRUN_BUFFER_MS = 5000;
 /**
  * 逃逸放行的最小间隔（ms）：缓冲将尽时至少隔这么久才再放行，
  * 避免服务端停流/极慢时把剩余文本快速灌成多块在途（在途增长受限）。
@@ -675,6 +684,28 @@ export class VoiceStreamSpeaker {
       }
       this.pendingSentences.shift();
       utterance = utterance + next;
+    }
+    // 当前块过短且流已结束（全文已入队，无首音延迟顾虑）：下一个句子放不下整个时，
+    // 从其软停顿处切一段补进来再喂，避免 17~26 字的小碎片单独喂出（减少每句往返）。
+    // 切法与上方超长句一致（splitOversizedUtterance），补满后剩余部分放回队首续喂。
+    if (
+      this.streamFinished == true &&
+      utterance.trim().length < MIN_COMFORT_UTTERANCE_CHARS &&
+      this.pendingSentences.length > 0
+    ) {
+      const remaining = MAX_MERGED_UTTERANCE_CHARS - utterance.length;
+      if (remaining > 0) {
+        const pieces = splitOversizedUtterance(
+          this.pendingSentences[0],
+          remaining,
+        );
+        // pieces.length==1 意味着下一句整个放得下，上面的合并循环早已吞掉它，走不到这
+        this.pendingSentences.shift();
+        for (let i = pieces.length - 1; i >= 1; i--) {
+          this.pendingSentences.unshift(pieces[i]);
+        }
+        utterance = utterance + pieces[0];
+      }
     }
     // 单句超长（合并上限对整句不生效）：按软停顿切回 ≤MAX 块，本次喂首块、
     // 其余放回队首续喂。否则一块 100+ 字（≈20s+ 音频）会令闸门A放行后缓冲

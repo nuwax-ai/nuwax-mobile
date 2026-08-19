@@ -47,17 +47,28 @@ export class HarmonyPayBridge {
     }
   }
 
-  /** 打开支付宝收银台 URL；失败抛错（无应用可处理该链接）。 */
+  /**
+   * 打开支付宝收银台 URL；失败抛错（无应用可处理该链接）。
+   * openLink(appLinkingOnly:false) 官方语义：https 先按 App Linking 匹配，无匹配
+   * 降级 Deep Linking（自定义 scheme，如 alipays://），仍无匹配则用浏览器打开——
+   * 覆盖收银台全部形态；openLink 抛错时自定义 scheme 再走隐式 Want 兜底。
+   */
   async openPayUrl(context: common.UIAbilityContext, url: string): Promise<void> {
-    const lower = url.toLowerCase()
-    if (lower.startsWith('http://') || lower.startsWith('https://')) {
+    const lower: string = url.toLowerCase()
+    const isCustomScheme: boolean = !lower.startsWith('http://') && !lower.startsWith('https://')
+    try {
       await context.openLink(url, { appLinkingOnly: false })
       return
+    } catch (err) {
+      if (!isCustomScheme) {
+        // arkts-limited-throw：catch 参数为 unknown，须断言为 Error 再抛。
+        throw err as Error
+      }
+      const want: Want = {
+        action: 'ohos.want.action.viewData',
+        uri: url
+      }
+      await context.startAbility(want)
     }
-    const want: Want = {
-      action: 'ohos.want.action.viewData',
-      uri: url
-    }
-    await context.startAbility(want)
   }
 }

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const contractPath = resolve(process.cwd(), 'docs/esp32s3-idf6-provisioning-contract.json');
+const contractPath = resolve(process.cwd(), 'docs/ble/esp32s3-idf6-provisioning-contract.json');
 const contract = JSON.parse(readFileSync(contractPath, 'utf8'));
 const errors = [];
 

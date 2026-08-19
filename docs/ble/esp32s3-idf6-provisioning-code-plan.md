@@ -50,7 +50,7 @@ provision-scan / provision-wifi / provision-progress
 - `utils/provisioning/espProvisioningClient.uts`
 - `utils/provisioning/espProvisioningClientFactory.uts`
 - `constants/espProvisioning.constants.uts`
-- `docs/esp32s3-idf6-provisioning-contract.json`
+- `docs/ble/esp32s3-idf6-provisioning-contract.json`
 - `scripts/check-esp-provisioning-contract.mjs`
 
 当前已完成：统一 Client/Factory、跨页面单 Controller、BLE Mock Client、页面迁移、QR 安全校验、Android UTS 原生插件、乐鑫官方客户端适配和 Provider 自动注册。真实 Provider 固定使用 `com.github.espressif:esp-idf-provisioning-android:lib-2.4.4`。

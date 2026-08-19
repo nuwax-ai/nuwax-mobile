@@ -17,5 +17,5 @@ make base-harmony
 # → 打印未实现说明
 ```
 
-文档：[docs/harmony-esp-provisioning-local-base.md](../../docs/harmony-esp-provisioning-local-base.md)  
-维护规范：[docs/local-custom-base-maintenance.md](../../docs/local-custom-base-maintenance.md)
+文档：[docs/engineering/harmony-esp-provisioning-local-base.md](../../docs/engineering/harmony-esp-provisioning-local-base.md)  
+维护规范：[docs/engineering/local-custom-base-maintenance.md](../../docs/engineering/local-custom-base-maintenance.md)

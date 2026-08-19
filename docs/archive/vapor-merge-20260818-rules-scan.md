@@ -1,6 +1,6 @@
 # Vapor 规则全仓扫描报告（2026-08-18，合并主线 tip b327d594 后）
 
-> 扫描依据：[vapor-scss-flatten-rules.md](./vapor-scss-flatten-rules.md)（R1 纯后代/R2 融合 amp/R3 撞色）+ [vapor-known-issues.md](./vapor-known-issues.md)（B1 styleIsolation/B2 选择器丢弃/A 工具链）。
+> 扫描依据：[vapor-scss-flatten-rules.md](../vapor/vapor-scss-flatten-rules.md)（R1 纯后代/R2 融合 amp/R3 撞色）+ [vapor-known-issues.md](../vapor/vapor-known-issues.md)（B1 styleIsolation/B2 选择器丢弃/A 工具链）。
 > 定位：合并主线 36603849 后的**增量债务清单**（修复按规则人工逐文件，不上脚本）。
 
 ## 结论总览

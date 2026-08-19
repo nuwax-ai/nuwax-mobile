@@ -1,6 +1,6 @@
 # Vapor（蒸汽模式）交付就绪评估与收尾记录
 
-> 2026-08-10。配套权威文档 [`vapor-tech-debt.md`](./vapor-tech-debt.md)（Android 离线打包交接）、[`vapor-known-issues.md`](./vapor-known-issues.md)（踩坑归档）。本文聚焦"能不能交付 / 还剩什么"。
+> 2026-08-10。配套权威文档 [`vapor-tech-debt.md`](../vapor/vapor-tech-debt.md)（Android 离线打包交接）、[`vapor-known-issues.md`](../vapor/vapor-known-issues.md)（踩坑归档）。本文聚焦"能不能交付 / 还剩什么"。
 
 ---
 
@@ -8,7 +8,7 @@
 
 **决定性事实（用户 2026-08-10 实测）：DCloud 云打包能产出可正常启动的 vapor 包。**
 
-这解除了 [`vapor-tech-debt.md` §8](./vapor-tech-debt.md) 的头号硬阻塞——「独立离线 vapor APK 卡启动屏」。§8 是 **path-a 死胡同**（`configure_app.py:1081 inject_vapor_runtime_into_app()` 注释停用；根因 = 离线 SDK 只有 VDM 版 aar、无 vapor-runtime aar 含 Android 资源）。**关键区分：§8 仅限「本机离线 SDK 自己组装 APK」，不挡生产发版**——生产上线走 DCloud 云打包即绕开（云端用与编译器匹配的运行时，无 offline SDK 的 aar 错配）。
+这解除了 [`vapor-tech-debt.md` §8](../vapor/vapor-tech-debt.md) 的头号硬阻塞——「独立离线 vapor APK 卡启动屏」。§8 是 **path-a 死胡同**（`configure_app.py:1081 inject_vapor_runtime_into_app()` 注释停用；根因 = 离线 SDK 只有 VDM 版 aar、无 vapor-runtime aar 含 Android 资源）。**关键区分：§8 仅限「本机离线 SDK 自己组装 APK」，不挡生产发版**——生产上线走 DCloud 云打包即绕开（云端用与编译器匹配的运行时，无 offline SDK 的 aar 错配）。
 
 旁证（非直接断言但一致）：
 - 官方云打包文档 <https://doc.dcloud.net.cn/uni-app-x/tutorial/app-package.html> 对 vapor 无任何限制说明。

@@ -1,17 +1,19 @@
+/**
+ * nuwax 重写（相对上游 esp-idf-provisioning-harmony）：
+ * 上游经 @ohos/fastble 做连接/读写，其 setMtu 用「请求值」立即回调（系统协商结果
+ * 丢失），写 416 字节的 SRP6a 会话首包时在协商完成前被拒（2900099）。本实现直连
+ * @ohos.bluetooth.ble：
+ *  - MTU：setBLEMtuSize 后等待系统 BLEMtuChange 事件（真实协商值），3s 超时兜底；
+ *  - 读写：writeCharacteristicValue/readCharacteristicValue 均用 Promise 形态，
+ *    写固定使用 WRITE（带响应，protocomm 时序要求写确认后再读响应）；
+ *  - descriptor 读不再绕 fastble，直接用本连接的 GattClientDevice。
+ */
 import { Transport } from './Transport'
-import {
-  BleDevice,
-  BleException,
-  BleGattCallback,
-  BleManager,
-  BleMtuChangedCallback,
-  BleReadCallback,
-  BleWriteCallback
-} from '@ohos/fastble'
-import { ble } from '@kit.ConnectivityKit'
+import { ble, constant } from '@kit.ConnectivityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { USER_DESCRIPTION_UUID, HANDLER_PROTO_VER } from '../ESPConstants'
 import { bytesToString, stringToBytes } from '../utils/HexUtil'
+import { ESPScanDevice } from '../ESPScanDevice'
 
 const TAG = 'BLETransport'
 
@@ -20,120 +22,31 @@ function normalizeUuid(uuid: string): string {
   return uuid.replace(/-/g, '').toLowerCase()
 }
 
-class ConnectGattCallback extends BleGattCallback {
-  private resolve: () => void
-  private reject: (e: Error) => void
-
-  constructor(resolve: () => void, reject: (e: Error) => void) {
-    super()
-    this.resolve = resolve
-    this.reject = reject
-  }
-
-  override onStartConnect(): void {
-    console.info(TAG, 'Connecting...')
-  }
-
-  override onConnectFail(_device: BleDevice, exception: BleException): void {
-    this.reject(new Error('Connect failed: ' + exception.getDescription()))
-  }
-
-  override onConnectSuccess(_device: BleDevice, _gatt: ble.GattClientDevice, _status: number): void {
-    console.info(TAG, 'Connected successfully')
-    this.resolve()
-  }
-
-  override onDisConnected(_isActive: boolean, _device: BleDevice, _gatt: ble.GattClientDevice, _status: number): void {
-    console.info(TAG, 'Disconnected')
-  }
-}
-
-class MtuChangedCallback extends BleMtuChangedCallback {
-  private resolve: () => void
-  private resolved: boolean = false
-
-  constructor(resolve: () => void) {
-    super()
-    this.resolve = resolve
-  }
-
-  override onMtuChanged(_mtu: number): void {
-    // nuwax 修改（相对上游）：fastble 的 setMtu 会先用「请求值」立即回调一次，
-    // 系统真实协商结果随后以 BLEMtuChange 事件再回调一次（相同签名，无法区分来源）。
-    // 第一次回调（请求值 512）不能当作协商完成——写 SRP6a 会话首包（416 字节）时
-    // 若协商未完成/实际值更小（固件契约 Preferred MTU 256），系统将拒绝写入（2900099）。
-    // 因此延迟 500ms 等系统协商事件落地后再继续服务发现。
-    console.info(TAG, `MTU changed to ${_mtu}`)
-    if (this.resolved) return
-    this.resolved = true
-    setTimeout(() => {
-      this.resolve()
-    }, 500)
-  }
-
-  override onSetMTUFailure(_exception: BleException): void {
-    console.warn(TAG, 'MTU change failed, continuing anyway')
-    if (this.resolved) return
-    this.resolved = true
-    this.resolve()
-  }
-}
-
-class WriteResultCallback extends BleWriteCallback {
-  private resolve: () => void
-  private reject: (e: Error) => void
-
-  constructor(resolve: () => void, reject: (e: Error) => void) {
-    super()
-    this.resolve = resolve
-    this.reject = reject
-  }
-
-  override onWriteSuccess(_current: number, _total: number, _justWrite: Uint8Array): void {
-    this.resolve()
-  }
-
-  override onWriteFailure(exception: BleException): void {
-     this.reject(new Error('Write failed: ' + exception.getDescription()))
-  }
-}
-
-class ReadResultCallback extends BleReadCallback {
-  private resolve: (data: Uint8Array) => void
-  private reject: (e: Error) => void
-
-  constructor(resolve: (data: Uint8Array) => void, reject: (e: Error) => void) {
-    super()
-    this.resolve = resolve
-    this.reject = reject
-  }
-
-  override onReadSuccess(data: Uint8Array): void {
-    this.resolve(data)
-  }
-
-  override onReadFailure(exception: BleException): void {
-    this.reject(new Error('Read failed: ' + exception.getDescription()))
-  }
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+  return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
 }
 
 export class BLETransport implements Transport {
-  private bleDevice: BleDevice | null = null
+  private deviceId: string = ''
+  private gatt: ble.GattClientDevice | null = null
   private serviceUuid: string = ''
+  /** endpoint 名 → characteristic UUID（由 0x2901 descriptor 发现） */
   private uuidMap: Map<string, string> = new Map()
+  /** characteristic UUID → 服务发现缓存的特征对象（写/读时取值） */
+  private charMap: Map<string, ble.BLECharacteristic> = new Map()
   private sending: boolean = false
 
   deviceCapabilities: string[] = []
   versionInfo: string = ''
 
-  /** 与 Android 不同：Harmony 侧 write 需等待系统回调，系统层可能延迟（如 ConvertBLEDescriptorToJS），默认 5s 易超时，故提高 operate 超时 */
-  private static readonly PROVISION_OPERATE_TIMEOUT_MS = 20000
+  /** 连接/MTU 协商的超时保护（毫秒） */
+  private static readonly CONNECT_TIMEOUT_MS = 15000
+  private static readonly MTU_EVENT_TIMEOUT_MS = 3000
 
-  async connect(device: BleDevice, primaryServiceUuid: string): Promise<void> {
-    this.bleDevice = device
+  async connect(device: ESPScanDevice, primaryServiceUuid: string): Promise<void> {
+    this.deviceId = device.getMac()
     this.serviceUuid = primaryServiceUuid
-
-    BleManager.getInstance().setOperateTimeout(BLETransport.PROVISION_OPERATE_TIMEOUT_MS)
+    this.gatt = ble.createGattClientDevice(this.deviceId)
     await this.connectDevice()
     await this.requestMtu(512)
     await this.discoverAndMapPaths()
@@ -147,76 +60,121 @@ export class BLETransport implements Transport {
 
   private connectDevice(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      if (!this.bleDevice) {
+      const gatt = this.gatt
+      if (gatt === null) {
         reject(new Error('No device to connect'))
         return
       }
-
-      const callback = new ConnectGattCallback(resolve, reject)
-      BleManager.getInstance().connect(this.bleDevice, callback)
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        gatt.off('BLEConnectionStateChange', handler)
+        reject(new Error('Connect timed out'))
+      }, BLETransport.CONNECT_TIMEOUT_MS)
+      const handler = (data: ble.BLEConnectionChangeState): void => {
+        if (data.deviceId !== this.deviceId) return
+        if (data.state === constant.ProfileConnectionState.STATE_CONNECTED) {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          gatt.off('BLEConnectionStateChange', handler)
+          console.info(TAG, 'Connected successfully')
+          resolve()
+        } else if (data.state === constant.ProfileConnectionState.STATE_DISCONNECTED) {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          gatt.off('BLEConnectionStateChange', handler)
+          reject(new Error('Connect failed: device disconnected'))
+        }
+      }
+      gatt.on('BLEConnectionStateChange', handler)
+      console.info(TAG, 'Connecting...')
+      try {
+        gatt.connect()
+      } catch (e) {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        gatt.off('BLEConnectionStateChange', handler)
+        reject(new Error('Connect failed: ' + (e as Error).message))
+      }
     })
   }
 
+  /** 请求 MTU 并等待系统 BLEMtuChange 事件（真实协商值）；事件超时则继续（小包仍可用）。 */
   private requestMtu(mtu: number): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      if (!this.bleDevice) {
-        reject(new Error('Device not connected'))
+    return new Promise<void>((resolve, _reject) => {
+      const gatt = this.gatt
+      if (gatt === null) {
+        resolve()
         return
       }
-
-      const callback = new MtuChangedCallback(resolve)
-      BleManager.getInstance().setMtu(this.bleDevice, mtu, callback)
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        gatt.off('BLEMtuChange', handler)
+        console.warn(TAG, 'MTU negotiation event timeout, continuing with default MTU')
+        resolve()
+      }, BLETransport.MTU_EVENT_TIMEOUT_MS)
+      const handler = (negotiatedMtu: number): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        gatt.off('BLEMtuChange', handler)
+        console.info(TAG, `MTU negotiated to ${negotiatedMtu}`)
+        resolve()
+      }
+      gatt.on('BLEMtuChange', handler)
+      try {
+        gatt.setBLEMtuSize(mtu)
+      } catch (e) {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        gatt.off('BLEMtuChange', handler)
+        console.warn(TAG, 'setBLEMtuSize failed, continuing: ' + (e as Error).message)
+        resolve()
+      }
     })
   }
 
-  private discoverAndMapPaths(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      if (!this.bleDevice) {
-        reject(new Error('Device not connected'))
-        return
+  private async discoverAndMapPaths(): Promise<void> {
+    const gatt = this.gatt
+    if (gatt === null) {
+      throw new Error('Device not connected')
+    }
+    const services = await gatt.getServices()
+    const wanted = normalizeUuid(this.serviceUuid)
+    const targetService = services.find((s: ble.GattService) => normalizeUuid(s.serviceUuid) === wanted)
+    if (!targetService) {
+      const available = services.map((s: ble.GattService) => s.serviceUuid).join(', ')
+      console.warn(TAG, 'Available service UUIDs: ' + available)
+      throw new Error('Primary service not found: ' + this.serviceUuid)
+    }
+    // 使用 discovery 返回的原始 UUID 字符串（后续按特征对象寻址，不再拼字符串匹配）
+    this.serviceUuid = targetService.serviceUuid
+
+    for (const characteristic of targetService.characteristics) {
+      const charUuid = characteristic.characteristicUuid
+      this.charMap.set(charUuid, characteristic)
+      for (const descriptor of characteristic.descriptors) {
+        if (descriptor.descriptorUuid.toUpperCase().startsWith(USER_DESCRIPTION_UUID.toUpperCase())) {
+          if (descriptor.descriptorValue.byteLength > 0) {
+            const pathName = bytesToString(new Uint8Array(descriptor.descriptorValue))
+            this.uuidMap.set(pathName, charUuid)
+            console.info(TAG, `Path mapping: ${pathName} -> ${charUuid}`)
+          }
+        }
       }
+    }
 
-          BleManager.getInstance().getBluetoothGattServices(this.bleDevice,
-        (err: Object, services: ble.GattService[]) => {
-          if (err) {
-            reject(new Error('Failed to get services: ' + JSON.stringify(err)))
-            return
-          }
-
-          const wanted = normalizeUuid(this.serviceUuid)
-          const targetService = services.find(s => normalizeUuid(s.serviceUuid) === wanted)
-
-          if (!targetService) {
-            const available = services.map((s: ble.GattService) => s.serviceUuid).join(', ')
-            console.warn(TAG, 'Available service UUIDs: ' + available)
-            reject(new Error('Primary service not found: ' + this.serviceUuid))
-            return
-          }
-
-          // FastBLE 的 BleConnector 用严格相等匹配 serviceUuid/characteristicUuid，必须使用 discovery 返回的原始字符串
-          this.serviceUuid = targetService.serviceUuid
-
-          for (const characteristic of targetService.characteristics) {
-            const charUuid = characteristic.characteristicUuid
-            for (const descriptor of characteristic.descriptors) {
-              if (descriptor.descriptorUuid.toUpperCase().startsWith(USER_DESCRIPTION_UUID.toUpperCase())) {
-                if (descriptor.descriptorValue && descriptor.descriptorValue.byteLength > 0) {
-                  const pathName = bytesToString(new Uint8Array(descriptor.descriptorValue))
-                  this.uuidMap.set(pathName, charUuid)
-                  console.info(TAG, `Path mapping: ${pathName} -> ${charUuid}`)
-                }
-              }
-            }
-          }
-
-          if (this.uuidMap.size === 0) {
-            console.warn(TAG, 'No path mappings from discovery (descriptorValue empty), reading via connected GATT client')
-            this.readDescriptorsManually(targetService).then(resolve).catch(reject)
-          } else {
-            resolve()
-          }
-        })
-    })
+    if (this.uuidMap.size === 0) {
+      console.warn(TAG, 'No path mappings from discovery (descriptorValue empty), reading descriptors manually')
+      await this.readDescriptorsManually(targetService)
+    }
   }
 
   /** 延迟 ms 毫秒，用于避免 BLE 设备 busy（如 2900011） */
@@ -225,18 +183,13 @@ export class BLETransport implements Transport {
   }
 
   /**
-   * 用已连接的 GATT 客户端读 User Description 描述符。
-   * 必须使用 FastBLE 里连接并发现服务的那一个 GattClientDevice；且 discovery 刚结束立即读会报 2900011（设备忙），
-   * 需在开始读前和每次读之间加短延迟。
+   * 用本连接的 GATT 客户端读 User Description 描述符。
+   * discovery 刚结束立即读会报 2900011（设备忙），需在开始读前和每次读之间加短延迟。
    */
   private async readDescriptorsManually(service: ble.GattService): Promise<void> {
-    if (!this.bleDevice) {
+    const gatt = this.gatt
+    if (gatt === null) {
       throw new Error('Device not connected')
-    }
-
-    const gattClient = BleManager.getInstance().getBleBluetooth(this.bleDevice)?.getBluetoothGatt() ?? null
-    if (!gattClient) {
-      throw new Error('Connected GATT client not found; cannot read descriptors')
     }
 
     // discovery 刚结束立刻读 descriptor 容易 2900011，先等栈稳定
@@ -247,11 +200,11 @@ export class BLETransport implements Transport {
       for (const descriptor of characteristic.descriptors) {
         if (descriptor.descriptorUuid.toUpperCase().startsWith(USER_DESCRIPTION_UUID.toUpperCase())) {
           const readOnce = (): Promise<ble.BLEDescriptor> => {
-            return gattClient.readDescriptorValue(descriptor)
+            return gatt.readDescriptorValue(descriptor)
           }
           try {
             let readResult = await readOnce()
-            if (readResult.descriptorValue && readResult.descriptorValue.byteLength > 0) {
+            if (readResult.descriptorValue.byteLength > 0) {
               const pathName = bytesToString(new Uint8Array(readResult.descriptorValue))
               this.uuidMap.set(pathName, charUuid)
               console.info(TAG, `Path mapping (read): ${pathName} -> ${charUuid}`)
@@ -262,7 +215,7 @@ export class BLETransport implements Transport {
               await this.delayMs(350)
               try {
                 const readResult = await readOnce()
-                if (readResult.descriptorValue && readResult.descriptorValue.byteLength > 0) {
+                if (readResult.descriptorValue.byteLength > 0) {
                   const pathName = bytesToString(new Uint8Array(readResult.descriptorValue))
                   this.uuidMap.set(pathName, charUuid)
                   console.info(TAG, `Path mapping (read retry): ${pathName} -> ${charUuid}`)
@@ -325,8 +278,7 @@ export class BLETransport implements Transport {
     if (!charUuid) {
       throw new Error(`No characteristic found for path: ${path}`)
     }
-
-    if (!this.bleDevice) {
+    if (this.gatt === null) {
       throw new Error('Device not connected')
     }
 
@@ -336,41 +288,55 @@ export class BLETransport implements Transport {
     this.sending = true
 
     try {
-      await this.writeCharacteristic(this.bleDevice, this.serviceUuid, charUuid, data)
-      const response = await this.readCharacteristic(this.bleDevice, this.serviceUuid, charUuid)
-      return response
+      await this.writeCharacteristic(charUuid, data)
+      return await this.readCharacteristic(charUuid)
     } finally {
       this.sending = false
     }
   }
 
   /**
-   * 始终单包写入（useSplit false），避免 SplitWriter 触发 2900099。MTU 已请求 512，单次在 MTU-3 内可发送。
+   * 单包写入（protocomm 协议要求「一次写请求 = 一个完整 protobuf 消息」，
+   * 不可应用层分包）。数据长度必须 ≤ MTU-3；SRP6a 会话首包 416 字节要求协商 MTU ≥ 419，
+   * 固件侧需将 ATT MTU 配置为 512（见 docs/ble handoff 契约）。
    */
-  private writeCharacteristic(device: BleDevice, serviceUuid: string, charUuid: string,
-    data: Uint8Array): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const callback = new WriteResultCallback(resolve, reject)
-      BleManager.getInstance().write(device, serviceUuid, charUuid, data,
-        false, true, 0, callback)
-    })
+  private async writeCharacteristic(charUuid: string, data: Uint8Array): Promise<void> {
+    const gatt = this.gatt
+    const characteristic = this.charMap.get(charUuid)
+    if (gatt === null || characteristic === undefined) {
+      throw new Error('Device not connected or characteristic missing')
+    }
+    if (data.length > 509) {
+      throw new Error(`Data length ${data.length} exceeds single-write limit (MTU 512)`);
+    }
+    characteristic.characteristicValue = toArrayBuffer(data)
+    // 固定用 WRITE（带响应）：protocomm 依赖「写确认 → 设备处理 → 读响应」的时序，
+    // WRITE_NO_RESPONSE 会导致读响应过早、取不到结果。
+    await gatt.writeCharacteristicValue(characteristic, ble.GattWriteType.WRITE)
   }
 
-  private readCharacteristic(device: BleDevice, serviceUuid: string,
-    charUuid: string): Promise<Uint8Array> {
-    return new Promise<Uint8Array>((resolve, reject) => {
-      const callback = new ReadResultCallback(resolve, reject)
-      BleManager.getInstance().read(device, serviceUuid, charUuid, callback)
-    })
+  private async readCharacteristic(charUuid: string): Promise<Uint8Array> {
+    const gatt = this.gatt
+    const characteristic = this.charMap.get(charUuid)
+    if (gatt === null || characteristic === undefined) {
+      throw new Error('Device not connected or characteristic missing')
+    }
+    const result = await gatt.readCharacteristicValue(characteristic)
+    return new Uint8Array(result.characteristicValue)
   }
 
   disconnect(): void {
-    if (this.bleDevice) {
-      BleManager.getInstance().disconnect(this.bleDevice)
-      this.bleDevice = null
+    if (this.gatt !== null) {
+      try {
+        this.gatt.close()
+      } catch (e) {
+        console.warn(TAG, `close error: ${(e as Error).message}`)
+      }
+      this.gatt = null
     }
-    BleManager.getInstance().setOperateTimeout(5000)
+    this.deviceId = ''
     this.uuidMap.clear()
+    this.charMap.clear()
     this.deviceCapabilities = []
     this.versionInfo = ''
   }

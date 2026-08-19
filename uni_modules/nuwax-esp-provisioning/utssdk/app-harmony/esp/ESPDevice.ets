@@ -20,7 +20,6 @@ import {
   prepareGetWiFiScanStatusMsg,
   prepareWiFiConfigMsg,
   prepareWiFiScanStartMsg } from './utils/MessageHelper'
-import { BleDevice } from '@ohos/fastble'
 
 const TAG = 'ESPDevice'
 const WIFI_SCAN_BATCH_SIZE = 4
@@ -64,8 +63,7 @@ export class ESPDevice {
 
   async connectBLEDevice(device: ESPScanDevice, serviceUuid: string): Promise<void> {
     this.primaryServiceUuid = serviceUuid
-    const raw: BleDevice = device.getRawDevice()
-    await this.transport.connect(raw, serviceUuid)
+    await this.transport.connect(device, serviceUuid)
     console.info(TAG, `Device connected: ${device.getName()}`)
   }
 

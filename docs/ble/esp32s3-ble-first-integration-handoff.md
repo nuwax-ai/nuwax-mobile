@@ -195,8 +195,8 @@ Log location:
 
 含原生依赖的配网插件无法注入标准基座，日常联调走本地离线自定义基座：
 
-- 总览：[esp-provisioning-local-base.md](./esp-provisioning-local-base.md)
-- 维护规范：[local-custom-base-maintenance.md](./local-custom-base-maintenance.md)
-- Android：[android-esp-provisioning-local-base.md](./android-esp-provisioning-local-base.md)
-- iOS：[ios-esp-provisioning-local-base.md](./ios-esp-provisioning-local-base.md)
-- 鸿蒙（预留）：[harmony-esp-provisioning-local-base.md](./harmony-esp-provisioning-local-base.md)
+- 总览：[esp-provisioning-local-base.md](../engineering/esp-provisioning-local-base.md)
+- 维护规范：[local-custom-base-maintenance.md](../engineering/local-custom-base-maintenance.md)
+- Android：[android-esp-provisioning-local-base.md](../engineering/android-esp-provisioning-local-base.md)
+- iOS：[ios-esp-provisioning-local-base.md](../engineering/ios-esp-provisioning-local-base.md)
+- 鸿蒙（预留）：[harmony-esp-provisioning-local-base.md](../engineering/harmony-esp-provisioning-local-base.md)

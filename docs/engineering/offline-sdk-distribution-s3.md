@@ -2,7 +2,7 @@
 
 > 把 `nuwax-mobile-offline-sdk`（DCloud uni-app x 离线 SDK + 乐鑫配网依赖等）放到 Nuwax S3（MinIO），团队成员一条命令拉取，**方便同事在本机打自定义基座**（不必每人自己找官方包、也不靠 clone 维护者本机 Git）。
 >
-> **本机目录说明**（本地 Git vs S3）：[`nuwax-mobile-offline-sdk/README.md`](../../nuwax-mobile-offline-sdk/README.md) · [LOCAL-AND-S3.md](../../nuwax-mobile-offline-sdk/docs/LOCAL-AND-S3.md)  
+> **本机目录说明**（本地 Git vs S3）：[`nuwax-mobile-offline-sdk/README.md`](../../../nuwax-mobile-offline-sdk/README.md) · [LOCAL-AND-S3.md](../../../nuwax-mobile-offline-sdk/docs/LOCAL-AND-S3.md)  
 > 与自定义基座分发同构：[custom-base-distribution-s3.md](./custom-base-distribution-s3.md)。维护规范：[local-custom-base-maintenance.md](./local-custom-base-maintenance.md)。
 >
 > **注意**：S3 是团队分发通道；维护者本机对该目录另有**仅本地 Git**（禁 push）。二者不互相替代。

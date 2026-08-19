@@ -1,7 +1,7 @@
 # Android 改动 · 编译验证与真机运行 Playbook
 
 > 本仓含**带三方依赖的 UTS 插件**（`nuwax-uni-math` 依赖 `com.caverock:androidsvg`、quickjs），改完 `.uvue/.uts` 后「如何编译验证 + 真机跑」有若干坑。本文记录 2026-08-09 调试 list-view 默认化时踩出的可复用流程。
-> 相关：基座维护见 [local-custom-base-maintenance.md](local-custom-base-maintenance.md)；性能验证矩阵见 [perf-verification-plan.md](archive/perf-verification-plan.md)；list-view 迁移见 [perf-list-view-migration.md](archive/perf-list-view-migration.md)；CLAUDE.md「带三方依赖的 UTS 插件集成」。
+> 相关：基座维护见 [local-custom-base-maintenance.md](local-custom-base-maintenance.md)；性能验证矩阵见 [perf-verification-plan.md](../archive/perf-verification-plan.md)；list-view 迁移见 [perf-list-view-migration.md](../archive/perf-list-view-migration.md)；CLAUDE.md「带三方依赖的 UTS 插件集成」。
 
 ## 0. 一句话结论
 
@@ -86,11 +86,11 @@ $ADB -s $DEV logcat -v threadtime --pid=$PID > /tmp/nuwax-test.log &   # 后台�
 - 编译残留：`error18` / `找不到名称`（运行期不该再出现）
 - 量化汇总：`bash scripts/grab-perf-stats.sh`（解析 logcat 的 fps/maxGap/full_parse/el_stuck/render fail 成表）
 
-> 对比基线（scroll-view，Redmi）：H=100 mixed `fps≈10 / maxGap≈760ms`。list-view 目标 `fps≥25 / maxGap<300`。详见 [perf-verification-plan.md](archive/perf-verification-plan.md)。
+> 对比基线（scroll-view，Redmi）：H=100 mixed `fps≈10 / maxGap≈760ms`。list-view 目标 `fps≥25 / maxGap<300`。详见 [perf-verification-plan.md](../archive/perf-verification-plan.md)。
 
 ## 5. 本次 list-view 默认化的验证矩阵（示例）
 
-`make base-android` → `adb install` 后，按 [perf-list-view-migration.md](archive/perf-list-view-migration.md) / 计划跑：
+`make base-android` → `adb install` 后，按 [perf-list-view-migration.md](../archive/perf-list-view-migration.md) / 计划跑：
 - **case-c（阻塞用例）**：流式中上滑 3 屏 → 点回到底。验 C1（流式期跳过整表刷新风暴）/ C2（scroll-top 锚点兜底）/ C4（code/mermaid 跟底）。**不过不可交付**。
 - case-a 长历史滚动、case-b 连续多轮（验后段性能退化是否消除）、case-d 历史定位、case-e 回收存活（table/code/image）。
 - 控制变量：`pages/test-stream-perf`（chips: mdType/H/L/list-view/proxy）+ 页内 perf 浮层实时切。

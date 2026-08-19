@@ -3,7 +3,7 @@
 移动端 OpenUI 统一「**点击 → 全屏 webview**」展示（小程序 `<web-view>` 不能局部内嵌，
 故 inline/sidecar 一致处理）。web runtime 已具备移动端布局（横排→竖排），webview 加载即可。
 
-表单提交只读问题见 [openui-h5-submit-form.md](./openui-h5-submit-form.md)。
+表单提交只读问题见 [openui-h5-submit-form.md](../archive/openui-h5-submit-fix.md)。
 
 ## 当前产品渲染路径（重要）
 
@@ -101,7 +101,7 @@ H5 chat（agent-detail 内嵌 chat-conversation-component）
 - **App / 小程序原生 web-view 预览**：`<web-view @message>` 接收网关 `notifyParent` / `uni.webView.postMessage`
 - **H5 iframe 预览**：`window.message` 接收 `parent.postMessage`（与网关 `notifyParent` 同源路径）
 - 会话内预览须带 `_ticket` 或 `mode=preview` 才允许提交；真分享链接 `?sk=` 见
-  [openui-h5-submit-form.md](./openui-h5-submit-form.md)
+  [openui-h5-submit-form.md](../archive/openui-h5-submit-fix.md)
 
 App/小程序/H5 均打开网关 `/static/file-preview.html`；该页面识别 `.openui.json` 后，
 在同源 iframe 中加载 `/static/openui-runtime/index.html` 并转发提交事件。

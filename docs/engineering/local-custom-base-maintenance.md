@@ -8,7 +8,7 @@
 | 项目 | 路径 | Git | 职责 |
 |------|------|-----|------|
 | 业务仓 | `nuwax-mobile` | ✅ 可推远程 | 插件、脚本、文档、契约、`Makefile`；`local-secrets.env.example` 仅模板 |
-| 离线 SDK（本机） | `nuwax-mobile-offline-sdk` | ✅ **仅本地**（禁 push）；**团队同步走 S3** | 官方 SDK + `work/` + `archives/`；**不含任何证书**。说明见该目录 [README.md](../../nuwax-mobile-offline-sdk/README.md) |
+| 离线 SDK（本机） | `nuwax-mobile-offline-sdk` | ✅ **仅本地**（禁 push）；**团队同步走 S3** | 官方 SDK + `work/` + `archives/`；**不含任何证书**。说明见该目录 [README.md](../../../nuwax-mobile-offline-sdk/README.md) |
 | 签名材料（本机） | `nuwax-signing`（`NUWAX_SIGNING_HOME`） | ✅ **仅本地**（禁 remote / push） | 签名实体 + **`local-secrets.env` / `local-secrets.env.example`**；永不进业务仓远程 / SDK / S3 |
 
 关系：`local-base-env.sh` 派生 SDK 路径 → **优先** source `$NUWAX_SIGNING_HOME/local-secrets.env`。首次配置：`cp $NUWAX_SIGNING_HOME/local-secrets.env.example $NUWAX_SIGNING_HOME/local-secrets.env`。业务仓 `scripts/local-secrets.env.example` 为同步空模板（便于查阅，勿填真实值推远程）。

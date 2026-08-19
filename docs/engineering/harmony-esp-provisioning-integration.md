@@ -162,13 +162,14 @@ hvigorw --mode module -p module=library@default -p product=default -p buildMode=
 - `throw e` 必须写 `throw e as Error`（arkts-limited-throw）
 - SDK class 不能 `as Record<string, Object>`（如 ble.ScanResult，且其本无 deviceName 字段）
 - BigInt、元组返回值在此编译层级可用
+- **UTS 层（index.uts）不在本 harness 覆盖内**：OHOS Promise 的回调参数须用真实 SDK 类型（如 `requestPermissionsFromUser().then((data: PermissionRequestResult))`），不能想当然写 `UTSJSONObject`；HX 会把 index.uts 转换到 dist 的同名 index.ets 再编译。真机运行前的完整验证 = HX「运行到鸿蒙」或对 `unpackage/dist/dev/app-harmony` 跑 `hvigorw --mode module -p module=uni_modules__nuwax_esp_provisioning@default assembleHar`（**勿在 HX 正在跑编译时执行**，会争抢产物目录）
 
 ## 9. 验证状态与真机验收清单
 
 | 项 | 状态 |
 |---|---|
 | 协议核验（字段号/算法/流程 vs 官方源码） | ✅ 本文 §2 |
-| ArkTS 编译（DevEco hvigor，HAR 模块） | ✅ BUILD SUCCESSFUL 零 error（产物 library.har；含错误码对齐后复验） |
+| ArkTS 编译（DevEco hvigor，HAR 模块） | ✅ 零 error：隔离 harness + HX 产物工程插件模块双验证（含 UTS 转换层 PermissionRequestResult 修复后复验） |
 | 脱敏审计 | ✅ grep 审计通过（无 PoP/密码/deviceSecret 输出路径） |
 | Android/iOS 回归 | 无共享文件改动，签名层零影响 |
 | 纯血 HarmonyOS 6 真机全流程 | ⏳ 待设备 |

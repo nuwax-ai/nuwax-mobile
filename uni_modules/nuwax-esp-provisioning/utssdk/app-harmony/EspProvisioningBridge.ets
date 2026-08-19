@@ -129,6 +129,7 @@ export class EspProvisioningBridge {
     this.versionInfo = ''
     this.capabilities = []
     let done = false
+    let sawConnected = false
     const rejectOnce = (code: string, message: string): void => {
       if (done) {
         return
@@ -151,11 +152,19 @@ export class EspProvisioningBridge {
       this.transport.attach(client)
       this.connCb = (state: ble.BLEConnectionChangeState): void => {
         const st = state.state as number
-        this.emit('gatt_state id=' + this.redact(deviceId) + ' state=' + st)
+        this.emit('gatt_state id=' + this.redact(deviceId) + ' state=' + st + ' sawConnected=' + sawConnected)
         if (st == GATT_CONNECTED) {
-          this.afterConnected(client, username, pop, resolveOnce, rejectOnce)
+          if (!sawConnected) {
+            sawConnected = true
+            this.afterConnected(client, username, pop, resolveOnce, rejectOnce)
+          }
         } else if (st == GATT_DISCONNECTED) {
-          rejectOnce('DISCONNECTED', 'BLE 连接已断开')
+          // OHOS 订阅后可能先推一次 DISCONNECTED 基线事件；连接前不判死，交给超时或重连
+          if (sawConnected) {
+            rejectOnce('DISCONNECTED', 'BLE 连接已断开')
+          } else {
+            this.emit('gatt_disconnect_before_connected')
+          }
         }
       }
       client.on('BLEConnectionStateChange', this.connCb)
@@ -163,8 +172,19 @@ export class EspProvisioningBridge {
       this.timer = setTimeout((): void => {
         rejectOnce('CONNECT_FAILED', 'GATT/Security2 连接超时')
       }, wait)
-      client.connect()
-      this.emit('gatt_connect id=' + this.redact(deviceId))
+      // OHOS：刚 stopScan 立即 connect 易栈忙，稍作停顿再发起
+      setTimeout((): void => {
+        if (done) {
+          return
+        }
+        try {
+          client.connect()
+          this.emit('gatt_connect id=' + this.redact(deviceId))
+        } catch (e) {
+          const err = e as BusinessError
+          rejectOnce('CONNECT_FAILED', 'connect: ' + err.code + ' ' + err.message)
+        }
+      }, 200)
     } catch (e) {
       const err = e as BusinessError
       rejectOnce('CONNECT_FAILED', 'createGattClientDevice: ' + err.code + ' ' + err.message)
@@ -240,47 +260,58 @@ export class EspProvisioningBridge {
     this.emit('dispose')
   }
 
-  private afterConnected(
+  private async afterConnected(
     client: ble.GattClientDevice,
     username: string,
     pop: string,
     resolveOnce: () => void,
     rejectOnce: (code: string, message: string) => void,
-  ): void {
-    client.getServices().then(async (services: Array<ble.GattService>) => {
-      try {
-        await this.transport.requestMtu(512)
-        await this.transport.ingestServices(services, this.serviceUuid)
-        this.emit('gatt_discovered endpoints=' + this.transport.pathNames())
-        await this.fetchVersionInfo()
-        const secVer = this.parseSecVer()
-        if (secVer != 2) {
-          rejectOnce('SECURITY_MISMATCH', 'firmware sec_ver=' + secVer + ', require 2')
-          return
+  ): Promise<void> {
+    try {
+      // CONNECTED 事件后服务发现可能未完成，稍等并对空列表重试
+      await this.delay(200)
+      let services: Array<ble.GattService> = []
+      for (let attempt = 0; attempt < 5; attempt++) {
+        services = await client.getServices()
+        if (services != null && services.length > 0) {
+          break
         }
-        const patch = this.parseSecPatch()
-        const security = new Security2(username, pop, patch)
-        const session = new Session(this.transport, security)
-        await new Promise<void>((resolve: () => void, reject: (e: Error) => void) => {
-          session.init({
-            onSessionEstablished: () => {
-              resolve()
-            },
-            onSessionEstablishFailed: (e: Error) => {
-              reject(e)
-            }
-          })
-        })
-        this.session = session
-        this.emit('sec2_established')
-        resolveOnce()
-      } catch (e) {
-        const err = e as Error
-        rejectOnce(this.mapSessionError(err.message), err.message)
+        this.emit('gatt_services_empty retry=' + (attempt + 1))
+        await this.delay(300)
       }
-    }).catch((e: BusinessError) => {
-      rejectOnce('SERVICE_MISMATCH', 'getServices: ' + e.code + ' ' + e.message)
-    })
+      if (services == null || services.length == 0) {
+        rejectOnce('SERVICE_MISMATCH', 'GATT service discovery returned empty')
+        return
+      }
+      await this.transport.requestMtu(512)
+      await this.transport.ingestServices(services, this.serviceUuid)
+      this.emit('gatt_discovered endpoints=' + this.transport.pathNames())
+      await this.fetchVersionInfo()
+      const secVer = this.parseSecVer()
+      if (secVer != 2) {
+        rejectOnce('SECURITY_MISMATCH', 'firmware sec_ver=' + secVer + ', require 2')
+        return
+      }
+      const patch = this.parseSecPatch()
+      const security = new Security2(username, pop, patch)
+      const session = new Session(this.transport, security)
+      await new Promise<void>((resolve: () => void, reject: (e: Error) => void) => {
+        session.init({
+          onSessionEstablished: () => {
+            resolve()
+          },
+          onSessionEstablishFailed: (e: Error) => {
+            reject(e)
+          }
+        })
+      })
+      this.session = session
+      this.emit('sec2_established')
+      resolveOnce()
+    } catch (e) {
+      const err = e as Error
+      rejectOnce(this.mapSessionError(err.message), err.message)
+    }
   }
 
   private async fetchVersionInfo(): Promise<void> {

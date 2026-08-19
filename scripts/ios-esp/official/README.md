@@ -1,6 +1,6 @@
 # 官方对齐脚本（A–C）
 
-见上级 [README.md](../README.md) 与 [docs/ios-esp-provisioning-local-base.md](../../../docs/ios-esp-provisioning-local-base.md)。
+见上级 [README.md](../README.md) 与 [docs/engineering/ios-esp-provisioning-local-base.md](../../../docs/engineering/ios-esp-provisioning-local-base.md)。
 
 ```bash
 ./setup_extapi.sh

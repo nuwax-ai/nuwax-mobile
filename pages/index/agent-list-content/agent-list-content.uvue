@@ -1,6 +1,8 @@
 <template>
   <!-- 内容区域 -->
   <scroll-view
+    v-if="listMounted"
+    :key="listKey"
     class="flex-1 h-full"
     scroll-y="true"
     @scrolltolower="handleLoadMore"
@@ -8,6 +10,8 @@
     :refresher-enabled="true"
     :refresher-triggered="refreshing"
     @refresherrefresh="handleRefresh"
+    @refresherrestore="resetRefresher"
+    @refresherabort="resetRefresher"
     :show-scrollbar="false"
     :enhanced="true"
   >
@@ -61,7 +65,7 @@
 <script setup lang="uts">
   // vapor styleIsolation 2.0 默认 isolated，放开接收全局样式（工具类/iconfont 等全局 class）
   defineOptions({ styleIsolation: 'app' });
-
+  import { ref, computed, nextTick, onMounted, onUnmounted } from "vue";
   import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
   import {
     apiUserUsedAgentList,
@@ -158,13 +162,11 @@
   const recentAgentList = ref<AgentListItem[]>([] as AgentListItem[]);
   const loading = ref<boolean>(false);
   const refreshing = ref<boolean>(false);
-  // 置 true 与置 false 必须落在不同渲染批次，否则 Vue 侧无 diff、原生收不到结束指令。
-  const REFRESH_SETTLE_DELAY = 300;
-  // 请求长时间不回（弱网/网关挂起）时的兜底，防止菊花一直转且后续下拉全被守卫吞掉。
-  const REFRESH_WATCHDOG_TIMEOUT = 15000;
-  let refreshWatchdog = 0;
-  let refreshSettleTimer = 0;
+  // 首帧延后创建，刷新结束时重建原生节点，清除 Android 遗留的下拉刷新层。
+  const listMounted = ref<boolean>(false);
+  const listKey = ref<number>(0);
   let refreshInFlight = false;
+  let requestPromise: Promise<any> | null = null;
   const hasMore = ref<boolean>(false);
   const currentPage = ref<number>(1);
   const tenantConfigInfo = ref<any | null>(null);
@@ -196,7 +198,6 @@
       params.pageIndex = page;
       params.size = pageSize;
       const res = await apiUserUsedAgentList(params);
-      loading.value = false;
       const code = apiResCode(res);
       const dataRaw = apiResData<any>(res);
       if (code == SUCCESS_CODE) {
@@ -238,7 +239,6 @@
       params.category = "";
       params.kw = "";
       const res = await apiPublishedAgentList(params);
-      loading.value = false;
       const code = apiResCode(res);
       if (code == SUCCESS_CODE) {
         const pageDataRaw = apiResData<any>(res);
@@ -299,77 +299,6 @@
     }
   }
 
-  /**
-   * Android 原生下拉刷新态只能靠 refresher-triggered 的 true→false 变更收起：
-   * 用户手势触发 refresherrefresh 时原生已自行进入刷新态，Vue 侧渲染值仍是 false。
-   * 所以任何分支都必须先置 true 再在后续批次置 false；旧代码的并发守卫直接 return，
-   * Vue 侧值恒为 false、diff 不成立，结束指令永远下发不到原生，菊花会一直转。
-   */
-  function beginRefresh(): void {
-    // 上一轮的收尾定时器必须撤掉，否则会在本轮刷新途中把菊花提前收起来。
-    if (refreshSettleTimer != 0) {
-      clearTimeout(refreshSettleTimer);
-      refreshSettleTimer = 0;
-    }
-    refreshing.value = true;
-    if (refreshWatchdog != 0) {
-      clearTimeout(refreshWatchdog);
-    }
-    refreshWatchdog = setTimeout((): void => {
-      refreshWatchdog = 0;
-      refreshInFlight = false;
-      refreshing.value = false;
-    }, REFRESH_WATCHDOG_TIMEOUT);
-  }
-
-  function endRefresh(): void {
-    if (refreshWatchdog != 0) {
-      clearTimeout(refreshWatchdog);
-      refreshWatchdog = 0;
-    }
-    if (refreshSettleTimer != 0) {
-      clearTimeout(refreshSettleTimer);
-    }
-    refreshSettleTimer = setTimeout((): void => {
-      refreshSettleTimer = 0;
-      refreshing.value = false;
-    }, REFRESH_SETTLE_DELAY);
-  }
-
-  async function performRefresh(): Promise<void> {
-    try {
-      currentPage.value = 1;
-      hasMore.value = true;
-      if (props.isLoggedIn) {
-        await fetchUserUsedAgentList();
-      } else {
-        await fetchPublishedAgentList();
-      }
-    } catch (error) {
-      console.error("performRefresh error:", error);
-    } finally {
-      refreshInFlight = false;
-      endRefresh();
-    }
-  }
-
-  // 模板事件回调保持同步：Android 侧 async handler 返回 Promise 与 Unit 不匹配。
-  function handleRefresh(): void {
-    // 先无条件置 true：这是原生刷新态唯一的解锁前提。
-    beginRefresh();
-    // 已有在途刷新时不重复发请求，收尾交给它的 finally；watchdog 兜底防止永远不回。
-    if (refreshInFlight) return;
-    refreshInFlight = true;
-    performRefresh();
-  }
-
-  function handleLoadMore() {
-    if (hasMore.value && !loading.value) {
-      const nextPage = currentPage.value + 1;
-      fetchUserUsedAgentList(nextPage);
-    }
-  }
-
   function handleAgentClick(info: AgentListItem) {
     emit("agent-click", toEmitPayload(info));
   }
@@ -396,18 +325,103 @@
     await fetchTenantConfig();
   }
 
-  async function loadData() {
-    loading.value = true;
-    await initTenantConfig();
+  async function executeAgentListRequest(
+    page: number,
+    pageSize: number,
+    shouldInitTenantConfig: boolean,
+  ): Promise<any> {
+    if (shouldInitTenantConfig) {
+      await initTenantConfig();
+    }
     if (props.isLoggedIn) {
-      await fetchUserUsedAgentList(1, 20 * currentPage.value);
-    } else {
-      await fetchPublishedAgentList();
+      return await fetchUserUsedAgentList(page, pageSize);
+    }
+    return await fetchPublishedAgentList();
+  }
+
+  async function requestAgentList(
+    page: number,
+    pageSize: number = 20,
+    shouldInitTenantConfig: boolean = false,
+  ): Promise<any> {
+    const pending = requestPromise;
+    if (pending != null) {
+      return await pending;
+    }
+
+    loading.value = true;
+    const currentRequest = executeAgentListRequest(page, pageSize, shouldInitTenantConfig);
+    requestPromise = currentRequest;
+    try {
+      return await currentRequest;
+    } finally {
+      requestPromise = null;
+      loading.value = false;
     }
   }
 
+  async function releaseRefresher(): Promise<void> {
+    refreshing.value = false;
+    listKey.value = listKey.value + 1;
+    await nextTick();
+  }
+
+  async function performRefresh(): Promise<void> {
+    try {
+      await nextTick();
+      const pending = requestPromise;
+      if (pending != null) {
+        await pending;
+      }
+      currentPage.value = 1;
+      hasMore.value = true;
+      await requestAgentList(1, 20);
+    } catch (error) {
+      console.error("performRefresh error:", error);
+    } finally {
+      refreshInFlight = false;
+      await releaseRefresher();
+    }
+  }
+
+  function resetRefresher(): void {
+    refreshing.value = false;
+  }
+
+  function handleRefresh(): void {
+    if (refreshInFlight) {
+      releaseRefresher();
+      return;
+    }
+    refreshing.value = true;
+    refreshInFlight = true;
+    performRefresh();
+  }
+
+  function handleLoadMore(): void {
+    if (hasMore.value && requestPromise == null) {
+      const nextPage = currentPage.value + 1;
+      requestAgentList(nextPage);
+    }
+  }
+
+  async function loadData() {
+    await requestAgentList(1, 20 * currentPage.value, true);
+  }
+
+  async function mountListAfterFirstRender(): Promise<void> {
+    await nextTick();
+    listMounted.value = true;
+  }
+
   onMounted(() => {
+    mountListAfterFirstRender();
     loadData();
+  });
+
+  onUnmounted(() => {
+    refreshing.value = false;
+    listMounted.value = false;
   });
 
   defineExpose({

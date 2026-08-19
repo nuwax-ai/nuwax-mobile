@@ -407,6 +407,17 @@
 		if (error == null) {
 			return ""
 		}
+		// 优先按 uni-app x 统一错误 UniError 读 errMsg：UTS 对象字面量 as 强转在 Android
+		// 编译成 Kotlin 接口，Java 类（UniError 等）不实现该接口会抛 ClassCastException，
+		// 只能拿到字符串化的 toString（如 "UniError(errSubject:...errMsg:...)"），取不到字段。
+		try {
+			const ue = error as UniError
+			if (ue.errMsg != null && `${ue.errMsg}`.length > 0) {
+				return `${ue.errMsg}`
+			}
+		} catch (_eUni) {
+			// ignore
+		}
 		try {
 			const fail = error as NativeRecorderFail
 			if (fail.errMsg != null && `${fail.errMsg}`.length > 0) {
@@ -623,10 +634,29 @@
 		// #endif
 	}
 
+	// #ifdef APP-ANDROID
+	/** 解析相册媒体权限：targetSdk>=33 用 READ_MEDIA_IMAGES，否则用旧 READ_EXTERNAL_STORAGE。
+	 *  uni-app x 运行时对两侧都做硬校验——targetSdk<33 请求新媒体权限抛 IllegalStateException
+	 *  （本生产基座 targetSdk=32 实测），targetSdk>=33 请求旧权限抛 IllegalArgumentException，
+	 *  必须按运行时 targetSdkVersion 分流，不能固定只请求某一个。 */
+	function resolveAlbumMediaPermission(): string {
+		try {
+			const activity = UTSAndroid.getUniActivity()
+			const appInfo = activity?.getApplicationInfo()
+			if (appInfo != null && appInfo.targetSdkVersion >= 33) {
+				return "android.permission.READ_MEDIA_IMAGES"
+			}
+		} catch (_eResolve) {
+			// 读取失败按旧权限兜底（当前生产基座 targetSdk=32）
+		}
+		return "android.permission.READ_EXTERNAL_STORAGE"
+	}
+	// #endif
+
 	/** 申请相册/媒体读取权限。
-	 *  注意：targetSdk>=33 时请求 READ_EXTERNAL_STORAGE 必抛 IllegalArgumentException，
-	 *  因此统一只请求 READ_MEDIA_IMAGES（Android 13+ 正确；旧版系统不认识该权限会返回拒绝，
-	 *  不抛异常）。临时拒绝 → 下次点击系统会再次弹授权框；永久拒绝 → 引导去系统设置。
+	 *  权限按运行时 targetSdkVersion 分流（见 resolveAlbumMediaPermission）：
+	 *  targetSdk>=33 请求 READ_MEDIA_IMAGES，否则 READ_EXTERNAL_STORAGE。
+	 *  临时拒绝 → 下次点击系统会再次弹授权框；永久拒绝 → 引导去系统设置。
 	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
 	async function ensureNativeAlbumPermission(): Promise<NativeMicPermissionResult> {
 		// #ifdef APP-ANDROID
@@ -636,7 +666,7 @@
 				resolve(new NativeMicPermissionResult(false, false))
 				return
 			}
-			const permission = ["android.permission.READ_MEDIA_IMAGES"] as string[]
+			const permission = [resolveAlbumMediaPermission()] as string[]
 			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
 				resolve(new NativeMicPermissionResult(true, false))
 				return
@@ -1285,13 +1315,31 @@
 
 	// ---- 原生媒体选择（拍照 / 相册 / 文件）：H5 内嵌页经 postMessage 调起 ----
 
-	/** 取消选择判定（Android/iOS 的 cancel / abort / 中文「取消」文案） */
+	/** 鸿蒙专属：uni-app x 拍照/相册/文件选择器取消时 reject 空 message，
+	 *  框架只拼出无详情的裸「chooseImage:fail / chooseFile:fail」，
+	 *  真错误必带详情后缀（如 No Permission）。其余平台恒 false，
+	 *  避免把 Android/iOS 的真错误（恰好也是裸 fail 前缀）当取消吞掉。 */
+	function isHarmonyBareChooseFail(errMsg: string): boolean {
+		// #ifdef APP-HARMONY
+		return errMsg == "chooseimage:fail" || errMsg == "choosefile:fail"
+		// #endif
+		return false
+	}
+
+	/** 取消选择判定（Android/iOS 的 cancel / abort / 中文「取消」文案；
+	 *  鸿蒙拍照取消时 uni-app x 运行时只回裸 chooseImage:fail，见 isHarmonyBareChooseFail）。
+	 *  注意：uni-app x 内置选图器在 Android「进相机后直接返回、未拍照」时报的是
+	 *  camera error / camera_cancel 而非 cancel（H5 侧 isImageChooseCancelled 同规则），
+	 *  漏判会把 UniError 当失败提示给用户。 */
 	function isNativeChooseCancelled(errMsg: string): boolean {
 		const lower = errMsg.toLowerCase()
 		return (
 			lower.indexOf("cancel") >= 0 ||
 			lower.indexOf("abort") >= 0 ||
-			lower.indexOf("取消") >= 0
+			lower.indexOf("取消") >= 0 ||
+			lower.indexOf("camera error") >= 0 ||
+			lower.indexOf("camera_cancel") >= 0 ||
+			isHarmonyBareChooseFail(lower)
 		)
 	}
 
@@ -1548,15 +1596,15 @@
 			})
 			return
 		}
-		// Android 相册：先申请媒体读取权限（统一 READ_MEDIA_IMAGES，避免 targetSdk>=33 下
-		// 请求 READ_EXTERNAL_STORAGE 抛 IllegalArgumentException），否则 uni.chooseImage 未授权会直接报 UniError
+		// Android 相册：先申请媒体读取权限（按 targetSdkVersion 分流 READ_MEDIA_IMAGES /
+		// READ_EXTERNAL_STORAGE，见 resolveAlbumMediaPermission），否则 uni.chooseImage 未授权会直接报 UniError
 		ensureNativeAlbumPermission().then((result: NativeMicPermissionResult) => {
 			if (result.granted != true) {
 				if (result.deniedForever == true) {
 					guideNativePermissionSettings(
 						t("Mobile.AgentDetail.albumPermissionTitle"),
 						t("Mobile.AgentDetail.albumPermissionSystemContent"),
-						"android.permission.READ_MEDIA_IMAGES",
+						resolveAlbumMediaPermission(),
 					)
 				}
 				// 临时拒绝：静默，下次点击系统会再次弹授权框
@@ -1896,7 +1944,7 @@
 		// App 三端：释放录音器（含 Android/iOS 采集线程与鸿蒙启动在途的异步创建流程），避免残留占麦
 		if (nativeRecorderInstance != null) {
 			try {
-				nativeRecorderInstance!.release()
+				nativeRecorderInstance!.releaseRecorder()
 			} catch (_eRel) {
 				// ignore
 			}

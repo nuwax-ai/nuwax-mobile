@@ -14,6 +14,9 @@
  *    同时兼容单引号/双引号属性写法，避免重复 width/height 属性导致 XML 不合法；
  * 5. 生成 data:image/svg+xml URL，按「宽x高|URL」缓存；失败回退原 URL。
  *
+ * 长列表保护：同一 URL 的在途请求会共用一次下载（去重），整体下载并发受闸门限制（默认 5），
+ * 失败 URL 记入负缓存不再重试；调用方应按需（可见行）解析，不要一次性 await 全量列表。
+ *
  * 注意：App 端为 1:1 绘制，每个显示尺寸必须各自调用（各自生成对应物理像素的 data URL）。
  * 非 App 平台（H5 / 小程序）原样透传 URL，不产生额外请求。
  */
@@ -21,6 +24,42 @@
 // #ifdef APP
 const svgTextCache = new Map<string, string>();
 const svgDataUrlCache = new Map<string, string>();
+/** 下载失败（含超时）的 URL：不再重复发起，直接回退原图，避免长列表反复卡在 8s 超时上 */
+const svgFailedCache = new Map<string, boolean>();
+/** 同一 URL 的在途下载：多行共用同一张图时只发一次请求 */
+const svgPendingRequests = new Map<string, Promise<string>>();
+
+/**
+ * 并发闸门：长列表一次性解析上百个图标时，若全部并发发起请求会把网络队列打满，
+ * 每个请求都要等前面的排队（叠加 8s 超时）→ 页面长时间停在「加载中」。
+ * 这里限制同时进行的 SVG 下载数，超出的排队等待。
+ */
+const MAX_CONCURRENT_SVG_REQUESTS = 5;
+let activeSvgRequests = 0;
+const svgRequestWaiters: Array<() => void> = [] as Array<() => void>;
+
+function acquireSvgSlot(): Promise<boolean> {
+  return new Promise<boolean>((resolve, _reject) => {
+    if (activeSvgRequests < MAX_CONCURRENT_SVG_REQUESTS) {
+      activeSvgRequests++;
+      resolve(true);
+      return;
+    }
+    svgRequestWaiters.push(() => {
+      activeSvgRequests++;
+      resolve(true);
+    });
+  });
+}
+
+function releaseSvgSlot(): void {
+  activeSvgRequests--;
+  if (svgRequestWaiters.length > 0) {
+    const next = svgRequestWaiters[0];
+    svgRequestWaiters.splice(0, 1);
+    next();
+  }
+}
 
 function downloadSvgText(url: string, timeoutMs: number): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -98,6 +137,33 @@ function setSvgSize(svg: string, widthPx: number, heightPx: number): string {
 }
 // #endif
 
+/** 受并发闸门约束的下载 */
+async function downloadSvgTextLimited(url: string, timeoutMs: number): Promise<string> {
+  await acquireSvgSlot();
+  try {
+    return await downloadSvgText(url, timeoutMs);
+  } finally {
+    releaseSvgSlot();
+  }
+}
+
+/** 带缓存 + 在途去重的 SVG 文本获取 */
+async function fetchSvgText(url: string, timeoutMs: number): Promise<string> {
+  const cached = svgTextCache.get(url);
+  if (cached != null && cached.length > 0) return cached;
+  const pending = svgPendingRequests.get(url);
+  if (pending != null) return await pending;
+  const task = downloadSvgTextLimited(url, timeoutMs);
+  svgPendingRequests.set(url, task);
+  try {
+    const text = await task;
+    svgTextCache.set(url, text);
+    return text;
+  } finally {
+    svgPendingRequests.delete(url);
+  }
+}
+
 /**
  * 解析远程 SVG 在 App 端 <image> 的可用 URL。
  * @param url 原始 URL
@@ -120,12 +186,10 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
   const cacheKey = widthPx.toString() + "x" + heightPx.toString() + "|" + url;
   const cached = svgDataUrlCache.get(cacheKey);
   if (cached != null && cached.length > 0) return cached;
+  // 之前已确认下载不到：直接回退，不再排队重试
+  if (svgFailedCache.get(url) != null) return url;
   try {
-    let text = svgTextCache.get(url);
-    if (text == null || text.length == 0) {
-      text = await downloadSvgText(url, 8000);
-      svgTextCache.set(url, text);
-    }
+    const text = await fetchSvgText(url, 8000);
     let processed = stripPreamble(text);
     processed = moveDefsToFront(processed);
     processed = setSvgSize(processed, widthPx, heightPx);
@@ -133,7 +197,8 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
     svgDataUrlCache.set(cacheKey, dataUrl);
     return dataUrl;
   } catch (_e) {
-    // 下载/处理失败回退原始 URL（仍按 App 默认行为渲染）
+    // 下载/处理失败回退原始 URL（仍按 App 默认行为渲染），并记入失败缓存避免重复重试
+    svgFailedCache.set(url, true);
     return url;
   }
   // #endif

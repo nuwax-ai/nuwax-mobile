@@ -1,7 +1,7 @@
 # Android ESP 本地自定义基座（官方对齐）
 
-配合 [docs/android-esp-provisioning-local-base.md](../../docs/android-esp-provisioning-local-base.md)  
-维护规范：[docs/local-custom-base-maintenance.md](../../docs/local-custom-base-maintenance.md)
+配合 [docs/engineering/android-esp-provisioning-local-base.md](../../docs/engineering/android-esp-provisioning-local-base.md)  
+维护规范：[docs/engineering/local-custom-base-maintenance.md](../../docs/engineering/local-custom-base-maintenance.md)
 
 ## 脚本
 

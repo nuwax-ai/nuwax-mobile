@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 性能测试采数：从 logcat 解析 fps / maxGap / full_parse_large / el_stuck / render:fail。
 # 配合 pages/test-stream-perf：每条 case「跑前 clear、跑完 grab」。
-# 指标字符串约定见 docs/perf-verification-plan.md（[PerfProbe]/[SseStall] 探针输出）。
+# 指标字符串约定见 docs/archive/perf-verification-plan.md（[PerfProbe]/[SseStall] 探针输出）。
 #
 # 用法：
 #   bash scripts/grab-perf-stats.sh clear            # 跑 case 前清缓冲

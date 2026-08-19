@@ -1,10 +1,9 @@
 <template>
-  <view ref="msgListContentRef" class="agent-detail-container page-container">
-    <!-- 性能浮窗（常驻）：右上角 FPS / 最大帧间隔 maxGap。PERF_OVERLAY_ON 开发期默认开，发版前置 false。 -->
-    <view v-if="perfOverlayVisible" class="perf-overlay">
-      <text class="perf-overlay-text">FPS {{ perfFpsText }}</text>
-      <text class="perf-overlay-chip">{{ perfGapText }}ms</text>
-    </view>
+  <view
+    ref="msgListContentRef"
+    class="agent-detail-container page-container"
+    :style="embeddedPageStyle"
+  >
     <!-- 导航栏 -->
     <!-- 临时会话不显示Logo, 显示标题`和xxx开始会话` -->
     <custom-nav-bar
@@ -369,6 +368,8 @@
           v-if="isRenderInputPhone"
           key="agent-details-chat-input"
           ref="agentDetailInputPhoneRef"
+          :enable-voice="voiceFeatureEnabled"
+          :layout-handles-keyboard="isAppWebView"
           :page-home-index="inputPageHomeIndex"
           :expand-page-area="inputExpandPageArea"
           :whole-disabled="wholeDisabled"
@@ -579,7 +580,6 @@
   import McpAskQuestionCard from "@/components/agent-intervention/mcp-ask-question-card/mcp-ask-question-card.uvue";
   import { voiceConfig } from "@/subpackages/utils/voice/voiceConfig";
   import proxyWeb from "@/uni_modules/uni-ai-x/sdk/proxy-web.uts";
-  import { MERMAID_RENDER_ENABLED } from "@/uni_modules/uni-ai-x/sdk/math-render.uts";
 
   // 常量
   import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -743,6 +743,195 @@
   const msgListRef = ref<any | null>(null);
   // 用户临时票据
   const ticket = ref<string>("");
+  /**
+   * 当前页面是否由 App 端通过 web-view 内嵌（App 端 evalJS 调用全局方法
+   * __nuwaxSetAppEmbedded 后置 true）。用于区分「浏览器直接打开」与「App web-view 内嵌」。
+   */
+  const isAppWebView = ref<boolean>(false);
+
+  /**
+   * DeepSeek 方案：键盘弹出不做「文档滚动 / 整窗平移」，改为显式计算内容区高度
+   * = 键盘上方可见高度，驱动根容器高度——导航栏 fixed 顶部不动，输入区随容器底部抬到键盘上方。
+   * 高度来源见 updateEmbeddedPageHeight（min(innerHeight, visualViewport.height)），
+   * 不依赖原生键盘高度桥（本环境实测 onKeyboardHeightChange 恒 0）。
+   * 仅 Android web-view 内嵌生效（iOS 键盘为覆盖层、WKWebView 自行露出，不收缩防抖动；
+   * 浏览器直开 H5 不启用，保持文档自动滚动露输入框的既有行为）。0 = 不生效。
+   */
+  const embeddedPageHeight = ref<number>(0);
+
+  /** 根容器样式：内嵌时显式定高（DeepSeek 计算），否则空对象走 --vh 默认高度 */
+  const embeddedPageStyle = computed((): UTSJSONObject => {
+    const style = new UTSJSONObject();
+    const h = embeddedPageHeight.value;
+    if (h > 0) {
+      style["height"] = `${h}px`;
+    }
+    return style;
+  });
+
+  // #ifdef H5 || WEB
+  /** onLoad 暂存的状态栏（刘海）高度：确认内嵌（markAppEmbedded）后才 applyEmbedded 生效 */
+  let pendingEmbeddedStatusBarHeight: number = 0;
+
+  /**
+   * 运行时是否 Android WebView（H5 编译产物同一份跑在 Android/iOS 两个 web-view 里，
+   * 编译期条件编译无法区分，须运行时 UA 探测）。供 DeepSeek 显式高度（updateEmbeddedPageHeight）判断。
+   */
+  let h5RuntimeIsAndroid: boolean = false;
+  try {
+    const ua = navigator.userAgent.toLowerCase();
+    h5RuntimeIsAndroid = ua.indexOf("android") >= 0;
+  } catch (_eUa) {
+    h5RuntimeIsAndroid = false;
+  }
+
+  /**
+   * 刷新内嵌页高度 = min(innerHeight, visualViewport.height)，仅 Android 内嵌生效：
+   *  - 窗口被压缩（ADJUST_RESIZE 生效）：innerHeight 收缩；
+   *  - 键盘覆盖（沉浸式全屏下 adjustResize 不生效，真机实测 onKeyboardHeightChange 恒 0）：
+   *    visualViewport.height 收缩（DCloud 对 web-view 场景的官方推荐——H5 内部自行同步键盘高度）。
+   */
+  function updateEmbeddedPageHeight(): void {
+    if (isAppWebView.value != true || h5RuntimeIsAndroid != true) {
+      embeddedPageHeight.value = 0;
+      return;
+    }
+    try {
+      const w = window as any;
+      let h = w.innerHeight;
+      const vv = w.visualViewport;
+      if (vv != null && vv.height > 0 && vv.height < h) {
+        h = vv.height;
+      }
+      embeddedPageHeight.value = h > 0 ? h : 0;
+    } catch (_eVh) {
+      // ignore
+    }
+  }
+
+  /** 视口变化（键盘弹出/收起 / 窗口压缩）→ 重算内嵌页高度 */
+  function onEmbeddedViewportResize(): void {
+    updateEmbeddedPageHeight();
+  }
+
+  /**
+   * 幂等标记 App web-view 内嵌：置 isAppWebView + 启用原生语音桥。
+   * 录音（ASR）与语音播报（TTS）仅在此时走 App 原生侧；否则回退 H5 getUserMedia / WebSocket。
+   * 注意：onLoad 的状态栏（刘海）高度由调用方直接 setEmbeddedStatusBarHeight，不依赖本函数——
+   * 本函数在 isAppWebView 已置位时会提前 return，暂存高度不会经它应用。
+   */
+  function markAppEmbedded(): void {
+    if (isAppWebView.value == true) {
+      return;
+    }
+    isAppWebView.value = true;
+    // 幂等补应用 onLoad 暂存的状态栏（刘海）高度（覆盖 setup 先置位、onLoad 后到的时序）
+    if (pendingEmbeddedStatusBarHeight > 0) {
+      setEmbeddedStatusBarHeight(pendingEmbeddedStatusBarHeight);
+    }
+    nativeVoiceBridge.setup();
+    // 内嵌确认即按当前视口刷新显式高度（键盘若已弹起则首帧即为可见高度）
+    updateEmbeddedPageHeight();
+  }
+
+  /**
+   * 自检 App web-view 内嵌态：uni-app x 运行时会向 web-view 注入
+   * window.__uniapp_x_postMessage / __uniapp_x_ 全局（JSSDK 依赖它们收发消息），
+   * 页面只要在 App web-view 内即存在。App 端 evalJS 只在 @load 后 5s 窗口内轮询注入，
+   * 组件重挂载（新建会话 / 页面重进 / 会话切换）后 ref 会重置，若不恢复，
+   * 录音会静默回退到 H5 getUserMedia 弹浏览器权限框。故每次挂载自检一次。
+   */
+  function detectAppWebViewFromGlobals(): boolean {
+    try {
+      const w = window as any;
+      if (w.__uniapp_x_postMessage != null || w.__uniapp_x_ != null) {
+        return true;
+      }
+      // 补充信号：原生侧 evalJS 注入的 uni.webview JSSDK 会挂 uni.webView，
+      // 纯浏览器无（uni-app H5 运行时本身不提供 webView，需 JSSDK 注入才有）
+      const uniGlobal = w.uni;
+      if (uniGlobal != null && uniGlobal.webView != null) {
+        return true;
+      }
+    } catch (_e) {
+      // ignore
+    }
+    return false;
+  }
+
+  /** 内嵌态持久化 key（sessionStorage：webview 单会话内跨重挂载存活） */
+  const APP_WEBVIEW_FLAG_KEY: string = "__nuwax_app_webview";
+
+  function readAppWebviewFlag(): boolean {
+    try {
+      const w = window as any;
+      if (w.sessionStorage == null) {
+        return false;
+      }
+      const value = w.sessionStorage.getItem(APP_WEBVIEW_FLAG_KEY);
+      return value == "1";
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function writeAppWebviewFlag(): void {
+    try {
+      const w = window as any;
+      if (w.sessionStorage != null) {
+        w.sessionStorage.setItem(APP_WEBVIEW_FLAG_KEY, "1");
+      }
+    } catch (_e) {
+      // ignore
+    }
+  }
+
+  // setup 自检：原生桥全局是「真内嵌」的首要信号（仅 App web-view 内存在）；
+  // sessionStorage 标记作次要（它只会在确认桥全局 / evalJS 后写入，且是 per-tab 会话存储，
+  // 浏览器拿不到，不会误判——上一轮 accessToken 直接标记已改为需桥全局确认）。
+  if (detectAppWebViewFromGlobals() == true || readAppWebviewFlag() == true) {
+    markAppEmbedded();
+    writeAppWebviewFlag();
+  }
+
+  // 兜底轮询：部分机型（三星/小米/荣耀等）uni-app x 桥全局注入偏晚，setup 自检可能漏判。
+  // 短窗口内重复探测，出现后再标记（浏览器永不出现该全局，不会误判）。
+  let appWebViewDetectTimer: number = 0
+  let appWebViewDetectCount: number = 0
+  const APP_WEBVIEW_DETECT_ATTEMPTS: number = 12
+  appWebViewDetectTimer = setInterval((): void => {
+    appWebViewDetectCount++
+    if (isAppWebView.value == true) {
+      clearInterval(appWebViewDetectTimer)
+      appWebViewDetectTimer = 0
+      return
+    }
+
+    // 检测 App web-view 内嵌态
+    if (detectAppWebViewFromGlobals() == true) {
+      markAppEmbedded()
+      writeAppWebviewFlag()
+      clearInterval(appWebViewDetectTimer)
+      appWebViewDetectTimer = 0
+      return
+    }
+
+    // 如果检测次数达到最大值，则清除定时器
+    if (appWebViewDetectCount >= APP_WEBVIEW_DETECT_ATTEMPTS) {
+      clearInterval(appWebViewDetectTimer)
+      appWebViewDetectTimer = 0
+    }
+  }, 300) as number
+
+  // 暴露给 App 端 evalJS 的全局方法：置 isAppWebView = true（幂等，可重复调用）
+  // 分号的作用
+  // ;(window...) 里的分号只是语句终止符，强制把 (window as any).__nuwaxSetAppEmbedded = ... 作为独立新语句开始。它没有任何运行时副作用，赋值行为完全正常。
+  // 这是 JS 生态的经典防御写法（jQuery 开头的 ;(function(){...})()、React/Babel 产物、压缩器都这么写）。
+  ;(window as any).__nuwaxSetAppEmbedded = (): void => {
+    markAppEmbedded();
+    writeAppWebviewFlag();
+  };
+  // #endif
   /** 关闭自动播报时为 true（持久化于 VoiceSettings.autoPlay） */
   const voiceAutoPlayOff = ref<boolean>(loadVoiceSettings().autoPlay != true);
 
@@ -801,6 +990,26 @@
     const v = readRawField(item, "id");
     return v != null ? `${v}` : "";
   };
+
+  // #ifdef H5 || WEB
+  /** 原生桥注入键盘高度 → data.keyboardHeight（仅用于键盘弹起滚到底；本环境实测恒 0，布局高度不依赖它） */
+  function onInjectedChatKeyboardHeightChange(evt: any): void {
+    try {
+      const detail = (evt as any)["detail"] as UTSJSONObject | null;
+      if (detail != null) {
+        const raw = detail["height"];
+        if (raw != null) {
+          const h = parseFloat(`${raw}`);
+          if (!isNaN(h)) {
+            data.keyboardHeight.value = h > 0 ? h : 0;
+          }
+        }
+      }
+    } catch (_eObj) {
+      // ignore
+    }
+  }
+  // #endif
 
   /** 非空字符串兜底 */
   const coalesceNonEmptyString = (
@@ -2987,6 +3196,10 @@
     if (PERF_OVERLAY_ON) {
       startPerfFrameProbe();
     }
+    // #ifdef H5 || WEB
+    // 回到前台时按当前视口重算内嵌页高度（键盘状态可能已变化）
+    updateEmbeddedPageHeight();
+    // #endif
 
     // #ifndef H5 || WEB
     invokeTriggerResume();
@@ -3648,18 +3861,43 @@
   onMounted(() => {
     // 仅标记会话页活跃；ASR/TTS 改为按录音预热 / 合成时建连（不再进页预连）
     speechSocketWarmup.warmup();
-    // mermaid 关闭时（vapor proxy web evalJS 不可用）不绑 markdown-proxy-web，
-    // 避免 createWebviewContext.evalJS TypeError + 会话卡顿。mermaid 开启时再绑。
-    if (MERMAID_RENDER_ENABLED) {
-      // #ifdef APP || WEB
-      bindMarkdownProxyWeb();
-      // #endif
-      // #ifdef APP-ANDROID || APP-IOS
-      setTimeout((): void => {
-        proxyWeb.ensureAppContext("markdown-proxy-web");
-      }, 2000);
-      // #endif
+    // #ifdef H5
+    // 键盘高度来源（DeepSeek 显式布局）：window resize + visualViewport resize →
+    // min(innerHeight, visualViewport.height) 驱动根容器高度，不依赖原生键盘高度桥（实测恒 0）。
+    try {
+      const w = window as any;
+      w.addEventListener("resize", onEmbeddedViewportResize);
+      const vv = w.visualViewport;
+      if (vv != null) {
+        vv.addEventListener("resize", onEmbeddedViewportResize);
+      }
+    } catch (_eResize) {
+      // ignore
     }
+    // 先按当前视口算一次（键盘已弹起则首帧即可见高度）
+    updateEmbeddedPageHeight();
+    // 键盘高度桥（仅用于键盘弹起滚到底）：接收原生壳注入（仅 App web-view 内嵌触发），
+    // 桥注入可能早于本组件挂载（evalJS 先于渲染），读全局兜底一次
+    try {
+      const w = window as any;
+      w.addEventListener(
+        "nuwax:keyboardHeightChange",
+        onInjectedChatKeyboardHeightChange,
+      );
+      const cached = w.__nuwaxKeyboardHeight;
+      if (cached != null) {
+        const h = parseFloat(`${cached}`);
+        if (!isNaN(h)) {
+          data.keyboardHeight.value = h > 0 ? h : 0;
+        }
+      }
+    } catch (_eKb) {
+      // ignore
+    }
+    // #endif
+    // #ifdef APP || WEB
+    bindMarkdownProxyWeb();
+    // #endif
     runOnMountedAsync();
   });
 
@@ -3681,6 +3919,21 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
+    // 注销视口监听（DeepSeek 显式布局）与键盘高度桥
+    try {
+      const w = window as any;
+      w.removeEventListener("resize", onEmbeddedViewportResize);
+      const vv = w.visualViewport;
+      if (vv != null) {
+        vv.removeEventListener("resize", onEmbeddedViewportResize);
+      }
+      w.removeEventListener(
+        "nuwax:keyboardHeightChange",
+        onInjectedChatKeyboardHeightChange,
+      );
+    } catch (_eKb) {
+      // ignore
+    }
     // #endif
 
     // #ifdef APP
@@ -3719,6 +3972,21 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
+    // 注销视口监听（DeepSeek 显式布局）与键盘高度桥
+    try {
+      const w = window as any;
+      w.removeEventListener("resize", onEmbeddedViewportResize);
+      const vv = w.visualViewport;
+      if (vv != null) {
+        vv.removeEventListener("resize", onEmbeddedViewportResize);
+      }
+      w.removeEventListener(
+        "nuwax:keyboardHeightChange",
+        onInjectedChatKeyboardHeightChange,
+      );
+    } catch (_eKb) {
+      // ignore
+    }
     // #endif
 
     // #ifdef APP

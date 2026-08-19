@@ -1536,6 +1536,26 @@ export class TtsWebSocketPlayer {
       this.notifyStreamEnd();
       return;
     }
+    // #ifdef APP-HARMONY
+    // 播放器停滞检测（仅鸿蒙）：鸿蒙桥 write() 挂起/重建穷尽时（giveUpOnStall 清 in-queue、
+    // 不清 enqueuedBytes）表现为 isDrained()=true 且 written<enqueued，命中即整轮收尾复位图标，
+    // 避免工具栏卡在播报态。Android/iOS 不加：Android 有独立的 write-complete 排空路径且
+    // 播放头在部分机型会跳变；iOS 的 isDrained 只比 written 部分、主线程繁忙时 writer 短暂
+    // 滞后也会短暂满足该条件 → 会误杀会话。
+    if (player.isDrained() == true && player.getWrittenMs() < player.getEnqueuedMs()) {
+      console.warn(
+        "[TTS] native player stalled, end round: writtenMs=" +
+          player.getWrittenMs() +
+          " enqueuedMs=" +
+          player.getEnqueuedMs(),
+      );
+      this.clearStreamDrainPoll();
+      this.releaseStreamPcmPlayer();
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+      return;
+    }
+    // #endif
     // #ifdef APP-ANDROID
     // 播放头不可靠时的尾部排空（实测部分 Android 机型 getPlaybackHeadPosition 长期为负/跳变，
     // isDrained 永不成立——单靠 deadline 要等 enqueuedMs+30s，播完图标卡住不恢复）。
@@ -2795,6 +2815,27 @@ export class TtsWebSocketPlayer {
       if (err.errMsg != null && err.errMsg.length > 0) {
         errMsg = err.errMsg;
       }
+      // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+      // 连接错误但音频已入播放器：与 onClose 中断路径一致，先排空缓冲再收尾，
+      // 避免「网络抖动 / 平台 WS 超时」（鸿蒙实测长播报被 request timeout 中断）
+      // 把正在播的声音直接掐断。未入任何音频才按失败收尾。
+      if (
+        this.streamNativeActive == true &&
+        this.streamPcmPlayer != null &&
+        this.streamPcmPlayer!.getEnqueuedMs() > 0
+      ) {
+        console.warn(
+          "[TTS] session socket error mid-stream, drain buffered audio: " +
+            errMsg +
+            " enqueuedMs=" +
+            this.streamPcmPlayer!.getEnqueuedMs() +
+            " feedActive=" +
+            this.streamSessionActive,
+        );
+        this.drainBufferedAudioOnDisconnect();
+        return;
+      }
+      // #endif
       this.fail(errMsg);
     });
     socketTask!.onClose((_res: OnSocketCloseCallbackResult) => {
@@ -2825,12 +2866,7 @@ export class TtsWebSocketPlayer {
             "[TTS] session socket closed mid-stream, drain buffered audio enqueuedMs=" +
               this.streamPcmPlayer!.getEnqueuedMs(),
           );
-          this.socketTask = null;
-          this.stopKeepalive();
-          this.streamInputDone = true;
-          this.streamInputDoneAtMs = Date.now();
-          this.clearFlushEndWatchdog();
-          this.armStreamDrainPoll();
+          this.drainBufferedAudioOnDisconnect();
           return;
         }
         // #endif
@@ -2840,6 +2876,18 @@ export class TtsWebSocketPlayer {
         this.stopKeepalive();
       }
     });
+  }
+
+  /** 连接中断/错误但播放器仍有缓冲音频：置 inputDone 让已入队音频播完（排空轮询自然收尾），
+   *  避免「服务端断连/网络抖动」直接把正在播的声音掐断。未入音频走 fail 收尾。
+   *  调用前需已确认 streamNativeActive && player != null && enqueuedMs > 0。 */
+  private drainBufferedAudioOnDisconnect(): void {
+    this.socketTask = null;
+    this.stopKeepalive();
+    this.streamInputDone = true;
+    this.streamInputDoneAtMs = Date.now();
+    this.clearFlushEndWatchdog();
+    this.armStreamDrainPoll();
   }
 
   private ensureWarmSocketAsync(): void {

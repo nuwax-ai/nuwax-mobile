@@ -1,6 +1,6 @@
 # 自定义基座 · S3 分发（Nuwax MinIO）
 
-对齐 [nuwa-cli `docs/distribution-s3.md`](../../nuwa-cli/docs/distribution-s3.md)：基座二进制**不进 Git**，走公开读桶，同事免本地打自定义基座。
+对齐 [nuwa-cli `docs/distribution-s3.md`](../../../nuwa-cli/docs/distribution-s3.md)：基座二进制**不进 Git**，走公开读桶，同事免本地打自定义基座。
 
 相关： [local-custom-base-maintenance.md](./local-custom-base-maintenance.md) · [esp-provisioning-local-base.md](./esp-provisioning-local-base.md)
 

@@ -173,11 +173,11 @@ make base-ios-simulator              # → Pandora_simulator_debug.app（模拟�
 - iOS 真机与模拟器是**两套包**，勿混用；模拟器包免签但不能验支付/推送等原生链路。
 - **改了 UTS 原生插件** → Step 0/1 免（SDK 不变），从 Step 2 重跑（重新生成本地资源 + Step 3 重打基座）。
 - **仅改 uvue/uts 业务代码** → 直接 HX「使用自定义基座运行」热更，不必重打基座。
-- 详细：[docs/local-custom-base-maintenance.md](docs/local-custom-base-maintenance.md)、[offline-sdk-distribution-s3.md](docs/offline-sdk-distribution-s3.md)、各平台 [android](docs/android-esp-provisioning-local-base.md) / [ios](docs/ios-esp-provisioning-local-base.md)。
+- 详细：[docs/engineering/local-custom-base-maintenance.md](docs/engineering/local-custom-base-maintenance.md)、[offline-sdk-distribution-s3.md](docs/engineering/offline-sdk-distribution-s3.md)、各平台 [android](docs/engineering/android-esp-provisioning-local-base.md) / [ios](docs/engineering/ios-esp-provisioning-local-base.md)。
 
 ## 自定义基座同步更新
 
-含原生插件联调时，从 S3 拉最新基座到 `unpackage/debug/`（**不指定版本 = 最新**）。详情：[docs/custom-base-distribution-s3.md](docs/custom-base-distribution-s3.md)。
+含原生插件联调时，从 S3 拉最新基座到 `unpackage/debug/`（**不指定版本 = 最新**）。详情：[docs/engineering/custom-base-distribution-s3.md](docs/engineering/custom-base-distribution-s3.md)。
 
 ```bash
 pnpm base:fetch
@@ -191,7 +191,7 @@ HX：运行 → **使用自定义基座运行** → 选 `unpackage/debug/` 下 a
 
 ## 离线 SDK 同步
 
-本地自定义基座需要 uni-app x 离线 SDK + 乐鑫配网依赖。从 S3 拉取到 `NUWAX_OFFLINE_SDK_HOME`（默认 `$HOME/workspace/nuwax-mobile-offline-sdk`）：**只含 `sdk/ + archives/`，不含 `work/`（跨机不可用，由构建脚本生成），也不含 iOS 证书**。详情：[docs/offline-sdk-distribution-s3.md](docs/offline-sdk-distribution-s3.md)。
+本地自定义基座需要 uni-app x 离线 SDK + 乐鑫配网依赖。从 S3 拉取到 `NUWAX_OFFLINE_SDK_HOME`（默认 `$HOME/workspace/nuwax-mobile-offline-sdk`）：**只含 `sdk/ + archives/`，不含 `work/`（跨机不可用，由构建脚本生成），也不含 iOS 证书**。详情：[docs/engineering/offline-sdk-distribution-s3.md](docs/engineering/offline-sdk-distribution-s3.md)。
 
 ```bash
 make sdk-fetch

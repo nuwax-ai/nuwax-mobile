@@ -38,7 +38,7 @@ Markdown / 自定义标签文本
 
 更多用法见：
 
-- [`subpackages/components/tool-call/README.md`](../subpackages/components/tool-call/README.md)
+- [`subpackages/components/tool-call/README.md`](../../subpackages/components/tool-call/README.md)
 - [`docs/agent_integration_guide.md`](./agent_integration_guide.md)
 
 ## 扩展建议

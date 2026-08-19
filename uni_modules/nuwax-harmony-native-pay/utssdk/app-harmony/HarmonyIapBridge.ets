@@ -23,6 +23,9 @@ import { BusinessError } from '@kit.BasicServicesKit'
 
 const BASE64_PADDING_MOD: number = 4
 const FINISH_STATUS_FINISHED: string = '1'
+/** base64url → base64 的字母表替换（模块级复用，避免每次解码重建）。 */
+const BASE64URL_MINUS: RegExp = new RegExp('-', 'g')
+const BASE64URL_UNDERSCORE: RegExp = new RegExp('_', 'g')
 
 /** IAP purchaseData（JSON 字符串）顶层结构。 */
 interface PurchaseDataRaw {
@@ -65,16 +68,10 @@ class IapCallResult {
   message: string = ''
   /** 官方建议：createPurchase 报 PRODUCT_OWNED / SYSTEM_ERROR 时需走未完成订单补单。 */
   needRecover: boolean = false
+  /** 成功载荷：queryProducts 为商品数组 JSON，其余为空。 */
+  payload: string = ''
   summary: PurchaseSummary | null = null
   orders: PurchaseSummary[] = []
-}
-
-function toErrResult(err: BusinessError, needRecover: boolean): string {
-  const r = new IapCallResult()
-  r.code = err.code
-  r.message = err.message
-  r.needRecover = needRecover
-  return JSON.stringify(r)
 }
 
 /** JWS payload 解码（base64url → utf-8）。不验签，验签由服务端完成。 */
@@ -83,7 +80,7 @@ function decodeJwsPayload(data: string): string {
   if (parts.length < 3) {
     return ''
   }
-  let payload: string = parts[1].replace(new RegExp('-', 'g'), '+').replace(new RegExp('_', 'g'), '/')
+  let payload: string = parts[1].replace(BASE64URL_MINUS, '+').replace(BASE64URL_UNDERSCORE, '/')
   const pad: number = payload.length % BASE64_PADDING_MOD
   if (pad === 1) {
     return ''
@@ -168,8 +165,7 @@ export class HarmonyIapBridge {
       }
       const products = await iap.queryProducts(context, param)
       r.ok = true
-      // 复用 orders 字段承载商品列表（iap.Product 数组），业务层按需读取。
-      r.message = JSON.stringify(products)
+      r.payload = JSON.stringify(products)
     } catch (err) {
       const e: BusinessError = err as BusinessError
       r.code = e.code

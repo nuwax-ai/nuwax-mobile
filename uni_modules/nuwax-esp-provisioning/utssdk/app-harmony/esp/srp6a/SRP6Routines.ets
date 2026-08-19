@@ -90,6 +90,8 @@ export function computeSessionKey(params: SRP6CryptoParams, x: bigint, u: bigint
 }
 
 // M1 = H(H(N) XOR H(g) | H(I) | s | A | B | K)
+// nuwax 对齐固件（esp_srp.c exchange_proofs）：session_key = SHA512(S 的自然字节宽)，
+// 不是 PAD(S, 384)——固件 psa_hash_update(bytes_S, len_S) 用 mbedtls sizeof(S)。
 export function computeClientEvidence(params: SRP6CryptoParams, identity: string, salt: Uint8Array,
   A: bigint, B: bigint, S: bigint): bigint {
   const encoder = new TextEncoder()
@@ -110,28 +112,28 @@ export function computeClientEvidence(params: SRP6CryptoParams, identity: string
   const aBytes = padTo(bigIntegerToBytes(A), nLen)
   const bBytes = padTo(bigIntegerToBytes(B), nLen)
 
-  const sessionKey = hashToBytes(params.H, padTo(bigIntegerToBytes(S), nLen))
+  const sessionKey = computeHashedSessionKey(params, S)
 
   const m1Hash = hashToBytes(params.H, hNxorHg, hI, salt, aBytes, bBytes, sessionKey)
   return bigIntegerFromBytes(m1Hash)
 }
 
-// M2 = H(A | M1 | K)
+// M2 = H(A | M1 | K)（同上：K 用自然字节宽 S 的哈希）
 export function computeServerEvidence(params: SRP6CryptoParams, A: bigint, M1: bigint,
   S: bigint): bigint {
   const nLen = bigIntegerToBytes(params.N).length
   const aBytes = padTo(bigIntegerToBytes(A), nLen)
   const m1Bytes = bigIntegerToBytes(M1)
-  const sessionKey = hashToBytes(params.H, padTo(bigIntegerToBytes(S), nLen))
+  const sessionKey = computeHashedSessionKey(params, S)
 
   const m2Hash = hashToBytes(params.H, aBytes, m1Bytes, sessionKey)
   return bigIntegerFromBytes(m2Hash)
 }
 
-// Session key K = H(S)
+// Session key K = SHA512(S 自然字节宽)——对齐固件 esp_srp_get_session_key 的
+// psa_hash_update(bytes_S, len_S)（len_S = mbedtls_mpi_sizeof，无 PAD）。
 export function computeHashedSessionKey(params: SRP6CryptoParams, S: bigint): Uint8Array {
-  const nLen = bigIntegerToBytes(params.N).length
-  return hashToBytes(params.H, padTo(bigIntegerToBytes(S), nLen))
+  return hashToBytes(params.H, bigIntegerToBytes(S))
 }
 
 // Generate random private value 'a' (256 bits)

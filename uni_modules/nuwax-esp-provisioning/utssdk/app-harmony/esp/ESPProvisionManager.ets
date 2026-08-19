@@ -7,6 +7,7 @@
  *  - BLEDeviceFind 每次回调可能携带多台设备，逐台转 ESPScanDevice 上报。
  */
 import { ble } from '@kit.ConnectivityKit'
+import { BusinessError } from '@kit.BasicServicesKit'
 import { BleScanListener } from './listeners/BleScanListener'
 import { ESPDevice } from './ESPDevice'
 import { SecurityType } from './ESPConstants'
@@ -63,12 +64,20 @@ export class ESPProvisionManager {
     }
     ble.on('BLEDeviceFind', this.findHandler)
     try {
-      // 不设系统层 ScanFilter（鸿蒙对 deviceName/serviceUuid 的系统过滤解析不可靠），
-      // 全量接收由上层过滤。低功耗模式扫描间隔更省电，发现速度满足配网场景。
-      ble.startBLEScan([], { interval: 0, dutyMode: ble.ScanDuty.SCAN_MODE_LOW_POWER })
+      // 不设系统层过滤：传空 ScanFilter（匹配所有设备），由上层从广播数据过滤。
+      // 注意：传空数组 [] 会报 401 Invalid parameter；系统无过滤语义的正确形态是
+      // 一个无字段的 filter 对象（fastble 的 JS 实现传 null 可行，ArkTS 严格类型不可）。
+      const matchAll = [{}] as Array<ble.ScanFilter>
+      ble.startBLEScan(matchAll, { interval: 0, dutyMode: ble.ScanDuty.SCAN_MODE_LOW_POWER })
       console.info(TAG, 'BLE scan started')
     } catch (e) {
-      ble.off('BLEDeviceFind', this.findHandler)
+      const err = e as BusinessError
+      console.error(TAG, `startBLEScan threw: code=${err.code} message=${err.message}`)
+      try {
+        ble.off('BLEDeviceFind', this.findHandler)
+      } catch (e2) {
+        console.warn(TAG, `off BLEDeviceFind threw: code=${(e2 as BusinessError).code} message=${(e2 as BusinessError).message}`)
+      }
       this.scanning = false
       this.scanListener = null
       listener.scanStartFailed()

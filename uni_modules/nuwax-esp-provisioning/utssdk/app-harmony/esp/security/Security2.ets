@@ -45,6 +45,16 @@ function toArrayBuffer(data: Uint8Array): ArrayBuffer {
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
 }
 
+/** 左侧补零到目标长度（SRP 协议字段要求固定字节宽，bigint 转换会丢前导零） */
+function padLeftTo(value: Uint8Array, targetLength: number): Uint8Array {
+  if (value.length >= targetLength) {
+    return value
+  }
+  const padded = new Uint8Array(targetLength)
+  padded.set(value, targetLength - value.length)
+  return padded
+}
+
 export class Security2 implements Security {
   private sessionState: number = SESSION_STATE_REQUEST1
   private userName: string
@@ -90,7 +100,10 @@ export class Security2 implements Security {
   private getStep0Request(): Uint8Array {
     const params = SRP6CryptoParams.getInstance(3072, 'SHA-512')
     this.clientPublicKey = this.client.getClientPublicKey(params)
-    const publicKeyA = bigIntegerToBytes(this.clientPublicKey)
+    // nuwax 修复（相对上游）：client_pubkey 必须固定 384 字节（NG_3072 公钥长度）。
+    // bigIntegerToBytes 丢失前导零字节时（~1/256 概率）会得到 383 字节，
+    // 固件校验 len == 384 失败并主动断连（protocomm_ble "Invalid content received"）。
+    const publicKeyA = padLeftTo(bigIntegerToBytes(this.clientPublicKey), 384)
 
     const encoder = new util.TextEncoder()
     const usernameBytes = new Uint8Array(encoder.encodeInto(this.userName))
@@ -141,7 +154,10 @@ export class Security2 implements Security {
     const params = SRP6CryptoParams.getInstance(3072, 'SHA-512')
     const credentials = this.client.step2ForClientEvidence(params, salt, devicePublicKey,
       deviceSaltBytes)
-    this.clientProof = bigIntegerToBytes(credentials.M1)
+    // nuwax 修复（相对上游）：client_proof 必须固定 64 字节（SHA-512 长度）。
+    // M1 经 bigint 转换丢失前导零字节时（哈希首字节 < 0x80，概率 1/2）会得到 63 字节，
+    // 固件校验 len == 64 失败并主动断连——这正是真机 Security 2 握手失败的直接原因。
+    this.clientProof = padLeftTo(bigIntegerToBytes(credentials.M1), 64)
   }
 
   private processStep1Response(hexData: Uint8Array): void {

@@ -33,27 +33,28 @@ iOS 26 真机上，从「最近使用」agent 列表进入会话详情（整页 
 
 ## 三、根因结论
 
-**Apple iOS 26 WebKit 回归：WebContent 进程销毁回传竞态**（销毁后仍向宿主回传 BFL/FrameState 消息，主线程消费已死对象）。高频创建/销毁整页 WKWebView 把该回归放大到必现；页面侧无从拆雷，HBuilderX 5.24 / alpha 均无修复。属平台级缺陷，**已提交 DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215)**（经 HBuilderX 反馈渠道；工单材料全文见 [dcloud-ios26-webview-crash-report.md](dcloud-ios26-webview-crash-report.md)：四场景矩阵 + .ips 附件清单；另关联同族反馈 #32189）。**DCloud 已确认收到反馈，且官方同样推荐使用 vapor**——平台方向与本线选型一致，此类早期磨合问题可预期获得官方侧修复支持。
+**Apple iOS 26 WebKit 回归：WebContent 进程销毁回传竞态**（销毁后仍向宿主回传 BFL/FrameState 消息，主线程消费已死对象）。高频创建/销毁整页 WKWebView 把该回归放大到必现；页面侧无从拆雷，HBuilderX 5.24 / alpha 均无修复。属平台级缺陷，**已提交 DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215)**（经 HBuilderX 反馈渠道；工单材料全文见 [dcloud-ios26-webview-crash-report.md](dcloud-ios26-webview-crash-report.md)：四场景矩阵 + .ips 附件清单；另关联同族反馈 #32189）。**官方暂未回复工单，跟进中**；另官方推荐使用 vapor，与本线选型一致。
 
 ## 四、解决方案（已落地，主线与 vapor 线共有）
 
 **方案在主线引入并落地**（`feat/nuwa-zhuoda-2026.07`，commit `1ff8cda8`，2026-08-13「支持 App 端通过 web-view 加载 H5 聊天组件」），vapor 线经合并同步携带（`a57e2e96` 含本文件的 webUrl 基准地址、`:src` 接线、vapor evalJS 兜底等补全）——**属产品级架构，非 vapor 分支专属修改**。组成：
 
 1. **架构层**：App 端会话页 = 整页 web-view 加载 `{API_BASE}/m/#/` 同页路由，透传 `agentId / conversationId / statusBarHeight / accessToken`；H5 / 小程序端保持原生组件渲染（`#ifndef APP`）。
-2. **崩溃缓解（关键）**：退出会话页时**先卸载 web-view 节点、延时后再执行真实导航**（`webViewAlive`：返回键 / 退出路径先置 `false` 让 `v-if` 卸载，把 WKWebView 销毁从页面栈 pop 的同步关键路径上摘出来，销毁竞态降级到空闲窗口）。
-3. **配套桥接**：登录态双路透传（URL 参数 + `@load` 后 evalJS 注入，vapor 下 `createWebviewContext().evalJS` 不可用已加元素级 `UniWebViewElement.evalJS` 兜底）、键盘高度桥、Android webview textZoom 复位。
+2. **解决关键 = 使用 vapor**：该崩溃**仅在 iOS 26 真机发现，Android 端从未出现**；App 采用 vapor 方案后问题解决。
+3. **iOS 端配套缓解**：退出会话页时先卸载 web-view 节点、延时后再执行真实导航（`webViewAlive`：返回键 / 退出路径先置 `false` 让 `v-if` 卸载，把 WKWebView 销毁从页面栈 pop 的同步关键路径上摘出来，销毁竞态降级到空闲窗口）。
+4. **配套桥接**：登录态双路透传（URL 参数 + `@load` 后 evalJS 注入，vapor 下 `createWebviewContext().evalJS` 不可用已加元素级 `UniWebViewElement.evalJS` 兜底）、键盘高度桥、Android webview textZoom 复位。
 
 **选这个方案的原因**：
 1. 原生组件渲染路线（uni-app x 原生链路，`chat-conversation-component` → ai-msg → cmark 解析渲染）此前因性能与需求实现工期被搁置，H5 同页复用让功能即开即用、双端表现一致；
-2. 崩溃缓解只动退出路径时序，改动小、当版可发，不影响 Android / H5 路径；
-3. 承载线（vapor）与 DCloud 官方主推的 App 渲染方向一致，官方已确认收到崩溃反馈，可预期平台侧修复支持。
+2. vapor 为 DCloud 官方主推的 App 渲染方向，崩溃问题在 vapor 方案下解决（且 Android 本就无此问题，仅 iOS 受影响）；
+3. iOS 端缓解只动退出路径时序，改动小、当版可发，不影响 Android / H5 路径。
 
 ## 五、根治归属：底层框架问题，由框架方跟进
 
 崩溃根因在**底层框架层**（DCloud 运行时 / iOS 26 WebKit 的 WebContent 销毁回传竞态），**非业务代码可根治**——四场景与 E 系列实验已证明页面侧手段全部无效。当前处置：
 
 - **我方**：vapor 方案承载 + 退出路径缓解已落地，问题已解决，**无自研根治排期**；
-- **框架方**：DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215) 已提交并确认收到，跟进其修复版本即可（升级运行时/基座后按第六节验收标准回归一遍）。
+- **框架方**：DCloud 工单 [#32215](https://issues.dcloud.net.cn/pages/issues/detail?id=32215) 已提交、**官方暂未回复（跟进中）**，待其修复版本后按第六节验收标准回归一遍。
 
 > 实验结论存档：常驻 webview「不销毁则不崩」（B 场景）是框架外的规避手段，仅当未来必须重度使用整页 webview 时才需纳入考量，当前架构无此需求。
 

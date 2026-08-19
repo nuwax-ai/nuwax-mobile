@@ -68,6 +68,41 @@ const FEED_FULL_DELIVERY_TIMEOUT_MS = 5000;
  */
 const MAX_STARTUP_FEED_UTTERANCES = 3;
 
+/**
+ * 超长句切块用的软停顿字符（与 textFilter.SOFT_BREAK_CHARS 对齐）。
+ * 分句在 flush 模式只按强句末切、不限制整句长度（16 字上限仅作用于句末残留），
+ * 文章里的整句可达 100+ 字；若整块喂入，节流闸门A放行后缓冲会堆到
+ * 12s + 整块时长（30s+），喂入间隔随之逼近第三方 TTS 的 23s「无新文本」超时。
+ */
+const UTTERANCE_SOFT_BREAK_CHARS = "，,、；;\n";
+
+/**
+ * 超长单句按软停顿切回 ≤maxLen 的块（无软停顿处硬切，与 flush 尾段切分同法）。
+ * 返回 ≥1 块，顺序与原文一致；调用方喂出首块、把其余块放回队首续喂。
+ */
+function splitOversizedUtterance(text: string, maxLen: number): string[] {
+  const pieces: string[] = [];
+  let tail = text.trim();
+  while (tail.length > maxLen) {
+    let cut = maxLen;
+    for (let k = maxLen - 1; k >= 1; k--) {
+      if (UTTERANCE_SOFT_BREAK_CHARS.indexOf(tail.charAt(k)) >= 0) {
+        cut = k + 1;
+        break;
+      }
+    }
+    const piece = tail.substring(0, cut).trim();
+    if (piece.length > 0) {
+      pieces.push(piece);
+    }
+    tail = tail.substring(cut).trim();
+  }
+  if (tail.length > 0) {
+    pieces.push(tail);
+  }
+  return pieces;
+}
+
 /** 会话切好的待播段（src + 估算时长） */
 class ReadyUtterance {
   sentence: string = "";
@@ -125,6 +160,10 @@ export class VoiceStreamSpeaker {
   private feeding: boolean = false;
   /** 首个 PCM 到达前已喂入句数（begin 重置；首个 PCM 到达后不再参与节流） */
   private startupFeedCount: number = 0;
+  /** 诊断：本轮累计已喂出字符数（feed 进度汇总用；begin 重置） */
+  private totalFedChars: number = 0;
+  /** 诊断：本轮待播文本总长度（speakPrepared 设置；流式未知为 0，仅汇总展示用） */
+  private totalTextLen: number = 0;
   /** 上次喂出句子的时刻（闸门B判定用；0=本轮尚未喂过） */
   private lastFeedAtMs: number = 0;
   /** 上次喂出句子时的 enqueuedMs（闸门B判定用；-1=无播放器/未喂过，不阻塞） */
@@ -169,6 +208,8 @@ export class VoiceStreamSpeaker {
     this.playLooping = false;
     this.feeding = false;
     this.startupFeedCount = 0;
+    this.totalFedChars = 0;
+    this.totalTextLen = 0;
     this.lastFeedAtMs = 0;
     this.lastFeedEnqueuedMs = -1;
     this.lastFeedExpectedMs = 0;
@@ -266,6 +307,7 @@ export class VoiceStreamSpeaker {
         logText,
     );
     this.begin(messageId, settings);
+    this.totalTextLen = trimmed.length;
     // finished=true：整段按句/软切分入队，kickFeed 逐句喂入流式会话，播放由段队列驱动
     this.onStreamChunk(trimmed, "", true);
   }
@@ -539,8 +581,23 @@ export class VoiceStreamSpeaker {
         ) {
           break;
         }
+        // 诊断：喂入间隔监控——第三方 TTS 对「23s 无新文本」会判超时并让后端重连，
+        // 间隔逼近阈值时告警（超长句/缓冲积压都会拉长间隔，便于复现定位）
+        const feedGapMs = Date.now() - this.lastFeedAtMs;
+        if (this.lastFeedAtMs > 0 && feedGapMs > 15000) {
+          console.warn(
+            "[TTS] feed gap " +
+              feedGapMs +
+              "ms chunkLen=" +
+              utt.length +
+              " bufferedMs=" +
+              ttsWebSocketPlayer.getNativeBufferedMs() +
+              " (3rd-party no-text timeout 23000ms)",
+          );
+        }
         ttsWebSocketPlayer.feedStreamText(utt, false);
         this.startupFeedCount += 1;
+        this.totalFedChars += utt.length;
         // 闸门B基线：记录本次喂出时刻、当时的 enqueuedMs 与本句估算音频时长。
         // 下一句放行前须看到 enqueued 相对本基线增长 ≥ 估算时长（完整到达）；
         // 播放器未创建时 getNativeEnqueuedMs=-1，启动期不受此闸门限制（由上方
@@ -566,6 +623,14 @@ export class VoiceStreamSpeaker {
         this.active == true &&
         this.streamEnded != true
       ) {
+        // 诊断：喂入完成汇总（对比 toolbar.full 的 textLen 可确认全文是否喂完）
+        console.log(
+          "[TTS] feed done fedChars=" +
+            this.totalFedChars +
+            (this.totalTextLen > 0 ? " of " + this.totalTextLen : "") +
+            " bufferedMs=" +
+            ttsWebSocketPlayer.getNativeBufferedMs(),
+        );
         ttsWebSocketPlayer.flushStreamSession();
       }
     } catch (eFeed: any) {
@@ -603,6 +668,19 @@ export class VoiceStreamSpeaker {
       }
       this.pendingSentences.shift();
       utterance = utterance + next;
+    }
+    // 单句超长（合并上限对整句不生效）：按软停顿切回 ≤MAX 块，本次喂首块、
+    // 其余放回队首续喂。否则一块 100+ 字（≈20s+ 音频）会令闸门A放行后缓冲
+    // 堆到 30s+，喂入间隔逼近第三方 TTS 的 23s「无新文本」超时。
+    if (utterance.length > MAX_MERGED_UTTERANCE_CHARS) {
+      const pieces = splitOversizedUtterance(
+        utterance,
+        MAX_MERGED_UTTERANCE_CHARS,
+      );
+      for (let i = pieces.length - 1; i > 0; i--) {
+        this.pendingSentences.unshift(pieces[i]);
+      }
+      utterance = pieces[0];
     }
     // 仍过短且流未结束：放回队列，等后续分句再合
     if (

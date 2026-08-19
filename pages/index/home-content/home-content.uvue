@@ -16,7 +16,7 @@
           direction="vertical"
           :lower-threshold="50"
           :refresher-enabled="true"
-          :refresher-triggered="refreshing && activeTab == 'recent'"
+          :refresher-triggered="recentRefreshing"
           :show-scrollbar="false"
           :scroll-top="recentScrollTop"
           @scrolltolower="handleRecentLoadMore"
@@ -45,13 +45,13 @@
               </view>
             </list-item>
           </template>
-          <list-item v-else-if="!recentLoading && !(refreshing && activeTab == 'recent')" :type="93" class="state-item">
+          <list-item v-else-if="!recentLoading && !recentRefreshing" :type="93" class="state-item">
             <view class="empty-state">
               <image :src="noData" class="empty-image" :alt="t('Mobile.Common.noDataImageAlt')" />
               <text class="empty-text">{{ t("Mobile.Common.noData") }}</text>
             </view>
           </list-item>
-          <list-item v-else-if="!(refreshing && activeTab == 'recent')" :type="94" class="state-item">
+          <list-item v-else-if="!recentRefreshing" :type="94" class="state-item">
             <view class="loading-state">
               <text class="loading-text">{{ t("Mobile.Page.loadingMore") }}</text>
             </view>
@@ -71,7 +71,7 @@
           direction="vertical"
           :lower-threshold="50"
           :refresher-enabled="true"
-          :refresher-triggered="refreshing && activeTab == 'history'"
+          :refresher-triggered="convRefreshing"
           :show-scrollbar="false"
           :scroll-top="convScrollTop"
           @scrolltolower="handleConversationLoadMore"
@@ -98,13 +98,13 @@
               </view>
             </list-item>
           </template>
-          <list-item v-else-if="!convLoading && !(refreshing && activeTab == 'history')" :type="90" class="state-item">
+          <list-item v-else-if="!convLoading && !convRefreshing" :type="90" class="state-item">
             <view class="empty-state">
               <image :src="noData" class="empty-image" :alt="t('Mobile.Common.noDataImageAlt')" />
               <text class="empty-text">{{ t("Mobile.Common.noData") }}</text>
             </view>
           </list-item>
-          <list-item v-else-if="!(refreshing && activeTab == 'history')" :type="91" class="state-item">
+          <list-item v-else-if="!convRefreshing" :type="91" class="state-item">
             <view class="loading-state">
               <text class="loading-text">{{ t("Mobile.Page.loadingMore") }}</text>
             </view>
@@ -172,7 +172,20 @@
   // ===== tab 状态（最近使用在左，会话记录在右） =====
   const activeTab = ref<string>("recent");
   const activeTabIndex = computed((): number => activeTab.value == "history" ? 1 : 0);
-  const refreshing = ref<boolean>(false);
+  // 两个列表各自持有下拉刷新态：共用一个 refreshing 会让「另一个 Tab」被动进入刷新态，
+  // 且切 Tab 时守卫互相误判，是安卓菊花卡死的诱因之一。
+  const recentRefreshing = ref<boolean>(false);
+  const convRefreshing = ref<boolean>(false);
+  // 置 true 与置 false 必须落在不同渲染批次，否则 Vue 侧无 diff、原生收不到结束指令。
+  const REFRESH_SETTLE_DELAY = 300;
+  // 请求长时间不回（弱网/网关挂起）时的兜底，防止菊花一直转且后续下拉全被守卫吞掉。
+  const REFRESH_WATCHDOG_TIMEOUT = 15000;
+  let recentRefreshWatchdog = 0;
+  let convRefreshWatchdog = 0;
+  let recentRefreshSettleTimer = 0;
+  let convRefreshSettleTimer = 0;
+  let recentRefreshInFlight = false;
+  let convRefreshInFlight = false;
   const NORMAL_PAGE_SIZE = 20;
   const SILENT_HEAD_SIZE = 10;
 
@@ -1050,34 +1063,127 @@
   // ============================================================
   // 刷新 / 加载更多（两个常驻列表各自处理，避免后台页误触发当前页请求）
   // ============================================================
-  async function handleRecentRefresh() {
-    if (refreshing.value) {
-      return;
+  /**
+   * Android 原生 list-view 的下拉刷新态只能靠 refresher-triggered 的 true→false 变更收起：
+   * 用户手势触发 refresherrefresh 时原生已自行进入刷新态，但 Vue 侧渲染值仍是 false。
+   * 因此任何进入 refresherrefresh 的分支都必须先置 true，再在后续批次置 false；
+   * 一旦某条分支直接 return（旧代码的并发守卫就是如此），Vue 侧值始终为 false、
+   * diff 不成立、结束指令永远下发不到原生，菊花就会一直转，且之后每次下拉都被守卫吞掉。
+   */
+  function beginRecentRefresh(): void {
+    // 上一轮的收尾定时器必须撤掉，否则会在本轮刷新途中把菊花提前收起来。
+    if (recentRefreshSettleTimer != 0) {
+      clearTimeout(recentRefreshSettleTimer);
+      recentRefreshSettleTimer = 0;
     }
-    resumeRecentLoadMorePending.value = false;
-    refreshing.value = true;
-    currentPage.value = 1;
-    recentHasMore.value = true;
-    if (props.isLoggedIn) {
-      await fetchUserUsedAgentList(1, NORMAL_PAGE_SIZE);
-    } else {
-      await fetchPublishedAgentList();
+    recentRefreshing.value = true;
+    if (recentRefreshWatchdog != 0) {
+      clearTimeout(recentRefreshWatchdog);
     }
-    setTimeout(() => {
-      refreshing.value = false;
-    }, 500);
+    recentRefreshWatchdog = setTimeout((): void => {
+      recentRefreshWatchdog = 0;
+      recentRefreshInFlight = false;
+      recentRefreshing.value = false;
+    }, REFRESH_WATCHDOG_TIMEOUT);
   }
 
-  async function handleConversationRefresh() {
-    if (refreshing.value || conversationRequestPromise != null) return;
-    resumeConversationLoadMorePending.value = false;
-    refreshing.value = true;
-    lastId.value = null;
-    convHasMore.value = true;
-    await requestConversationList(false);
-    setTimeout(() => {
-      refreshing.value = false;
-    }, 500);
+  function endRecentRefresh(): void {
+    if (recentRefreshWatchdog != 0) {
+      clearTimeout(recentRefreshWatchdog);
+      recentRefreshWatchdog = 0;
+    }
+    if (recentRefreshSettleTimer != 0) {
+      clearTimeout(recentRefreshSettleTimer);
+    }
+    recentRefreshSettleTimer = setTimeout((): void => {
+      recentRefreshSettleTimer = 0;
+      recentRefreshing.value = false;
+    }, REFRESH_SETTLE_DELAY);
+  }
+
+  function beginConvRefresh(): void {
+    if (convRefreshSettleTimer != 0) {
+      clearTimeout(convRefreshSettleTimer);
+      convRefreshSettleTimer = 0;
+    }
+    convRefreshing.value = true;
+    if (convRefreshWatchdog != 0) {
+      clearTimeout(convRefreshWatchdog);
+    }
+    convRefreshWatchdog = setTimeout((): void => {
+      convRefreshWatchdog = 0;
+      convRefreshInFlight = false;
+      convRefreshing.value = false;
+    }, REFRESH_WATCHDOG_TIMEOUT);
+  }
+
+  function endConvRefresh(): void {
+    if (convRefreshWatchdog != 0) {
+      clearTimeout(convRefreshWatchdog);
+      convRefreshWatchdog = 0;
+    }
+    if (convRefreshSettleTimer != 0) {
+      clearTimeout(convRefreshSettleTimer);
+    }
+    convRefreshSettleTimer = setTimeout((): void => {
+      convRefreshSettleTimer = 0;
+      convRefreshing.value = false;
+    }, REFRESH_SETTLE_DELAY);
+  }
+
+  async function performRecentRefresh(): Promise<void> {
+    try {
+      resumeRecentLoadMorePending.value = false;
+      currentPage.value = 1;
+      recentHasMore.value = true;
+      if (props.isLoggedIn) {
+        await fetchUserUsedAgentList(1, NORMAL_PAGE_SIZE);
+      } else {
+        await fetchPublishedAgentList();
+      }
+    } catch (error) {
+      console.error("performRecentRefresh error:", error);
+    } finally {
+      recentRefreshInFlight = false;
+      endRecentRefresh();
+    }
+  }
+
+  async function performConversationRefresh(): Promise<void> {
+    try {
+      // 会话列表是单飞入口：有在途请求时先等它收口，否则 requestConversationList
+      // 会直接复用旧 promise 返回，下拉刷新等于没刷。
+      const pending = conversationRequestPromise;
+      if (pending != null) {
+        await pending;
+      }
+      resumeConversationLoadMorePending.value = false;
+      lastId.value = null;
+      convHasMore.value = true;
+      await requestConversationList(false);
+    } catch (error) {
+      console.error("performConversationRefresh error:", error);
+    } finally {
+      convRefreshInFlight = false;
+      endConvRefresh();
+    }
+  }
+
+  // 模板事件回调保持同步：Android 侧 async handler 返回 Promise 与 Unit 不匹配。
+  function handleRecentRefresh(): void {
+    // 先无条件置 true：这是原生刷新态唯一的解锁前提。
+    beginRecentRefresh();
+    // 已有在途刷新时不重复发请求，收尾交给它的 finally；watchdog 兜底防止永远不回。
+    if (recentRefreshInFlight) return;
+    recentRefreshInFlight = true;
+    performRecentRefresh();
+  }
+
+  function handleConversationRefresh(): void {
+    beginConvRefresh();
+    if (convRefreshInFlight) return;
+    convRefreshInFlight = true;
+    performConversationRefresh();
   }
 
   function handleRecentLoadMore(): void {
@@ -1258,6 +1364,22 @@
 
   onUnmounted(() => {
     eventBus.off(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedEvent);
+    if (recentRefreshWatchdog != 0) {
+      clearTimeout(recentRefreshWatchdog);
+      recentRefreshWatchdog = 0;
+    }
+    if (convRefreshWatchdog != 0) {
+      clearTimeout(convRefreshWatchdog);
+      convRefreshWatchdog = 0;
+    }
+    if (recentRefreshSettleTimer != 0) {
+      clearTimeout(recentRefreshSettleTimer);
+      recentRefreshSettleTimer = 0;
+    }
+    if (convRefreshSettleTimer != 0) {
+      clearTimeout(convRefreshSettleTimer);
+      convRefreshSettleTimer = 0;
+    }
   });
 
   defineExpose({

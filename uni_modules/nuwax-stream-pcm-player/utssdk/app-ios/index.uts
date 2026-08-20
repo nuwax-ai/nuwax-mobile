@@ -115,6 +115,8 @@ export class StreamPcmRecorder {
   private stopReported: boolean = false
   /** 是否已回传 onError（幂等） */
   private errorReported: boolean = false
+  /** 诊断拉取节拍（每 25 轮 ≈ 500ms 拉一次 Swift 诊断缓冲，绕开 NSLog 不进 App 日志的问题） */
+  private diagTick: number = 0
 
   onStart(callback: NativeRecorderStartCallback | null): void {
     this.onStartCb = callback
@@ -137,7 +139,11 @@ export class StreamPcmRecorder {
   }
 
   isRecording(): boolean {
-    return this.bridge.isRecording()
+    const v = this.bridge.isRecording()
+    if (v) {
+      return true
+    }
+    return false
   }
 
   /**
@@ -147,35 +153,67 @@ export class StreamPcmRecorder {
   start(options: RecorderManagerStartOptions | null): void {
     // 复用实例：先收尾旧轮（不回传 onStop，避免旧回调污染新会话）
     this.stopPolling()
-    let durationMs = 600000
-    if (options != null) {
-      try {
-        const durRaw = options!.duration
-        if (durRaw != null) {
-          const durNum = parseFloat(`${durRaw}`)
-          if (!isNaN(durNum) && durNum > 0) {
-            durationMs = Math.min(durNum, 600000)
-          }
-        }
-      } catch (_eDur) {
-        // ignore
-      }
-    }
+    // iOS 桥对 RecorderManagerStartOptions 对象参数跨桥不可靠（曾 startByJs 恒报
+    // method call failed、Swift start 从未进入）：改调无参 Swift start()（时长固定 600000ms，
+    // 与 UTS 默认值/上限一致）。options 仅作兼容保留，本实现不再读取。
+    console.log(`[PCMRec-UTS] wrapper start() called options=${options != null}`)
     this.startReported = false
     this.stopReported = false
     this.errorReported = false
-    this.bridge.start(durationMs)
+    this.diagTick = 0
+    this.bridge.start()
+    console.log("[PCMRec-UTS] bridge.start() returned")
+    const d0 = this.bridge.takeDiag()
+    if (d0.length > 0) {
+      console.log("[PCMRec-DIAG] " + d0)
+    }
     this.polling = true
     this.pollTimer = setInterval((): void => {
       this.pollOnce()
     }, 20) as number
   }
 
-  /** 停止录音（松手）：桥内收尾后同步补一轮轮询，立刻回传尾帧与 onStop */
+  /** 停止录音（松手）：桥内收尾后先直接投递 onStop（不依赖 pollOnce 帧循环可能阻塞），再补拉尾帧 */
   stop(): void {
     this.bridge.stop()
+    console.log(`[PCMRec-UTS] stop() hs=${this.bridge.hasStopped()} polling=${this.polling} stopCb=${this.onStopCb != null}`)
+    // stop 后轮询即将停止，先拉一次诊断（含 finishInternal 的 running/started 状态），
+    // 否则 onStop 是否真的触发的关键状态会随轮询停止而丢失
+    const d = this.bridge.takeDiag()
+    if (d.length > 0) {
+      console.log("[PCMRec-DIAG] " + d)
+    }
+    // 先投递 onStop（帧循环在 pollOnce 里且可能因 pipeline.feed/WS 发送而慢，会拖住 onStop）
+    this.deliverStopIfStopped()
     this.pollOnce()
     this.stopPolling()
+  }
+
+  /**
+   * 主动请求麦克风权限（首次按下预检）：触发系统授权窗。
+   * 结果经 permissionResolved / permissionGranted 轮询拉取。
+   * 仅 app-ios 有实现（Android/鸿蒙权限走 UTSAndroid/UTSHarmony，不调用本方法）。
+   */
+  requestRecordPermission(): void {
+    this.bridge.requestRecordPermission()
+  }
+
+  /** 系统授权是否已出结果（用户已应答 / 状态已确定）。真值判断（iOS 桥 Bool == true 恒不成立） */
+  permissionResolved(): boolean {
+    const v = this.bridge.permissionResolved()
+    if (v) {
+      return true
+    }
+    return false
+  }
+
+  /** 授权结果：true 已授权 / false 拒绝（仅在 permissionResolved 后有效）。真值判断同上 */
+  permissionGranted(): boolean {
+    const v = this.bridge.permissionGranted()
+    if (v) {
+      return true
+    }
+    return false
   }
 
   /** 释放（页面销毁 / 弃用）：不回传 onStop */
@@ -205,16 +243,33 @@ export class StreamPcmRecorder {
         return
       }
     }
-    // onStart：引擎启动且首帧已到
-    if (this.startReported != true && this.bridge.hasStarted() == true) {
-      this.startReported = true
-      const cb = this.onStartCb
-      if (cb != null) {
-        cb(null)
+    // 诊断：每 25 轮（≈500ms）拉一次 Swift 诊断缓冲并打印（仅拉取非空，避免刷屏）
+    this.diagTick += 1
+    if (this.diagTick % 25 == 0) {
+      const d = this.bridge.takeDiag()
+      if (d.length > 0) {
+        console.log("[PCMRec-DIAG] " + d)
+      }
+      console.log(`[PCMRec-UTS] poll started=${this.bridge.hasStarted()} running=${this.bridge.isRunningNow()} startRpt=${this.startReported} errRpt=${this.errorReported}`)
+    }
+    // onStart：引擎启动且首帧已到（局部变量 + 拆开判断，规避 UTS 内联求值差异）
+    if (this.startReported == false) {
+      const hs = this.bridge.hasStarted()
+      if (hs) {
+        console.log("[PCMRec-UTS] onStart delivered")
+        this.startReported = true
+        const cb = this.onStartCb
+        if (cb != null) {
+          cb(null)
+        }
       }
     }
-    // 帧：拉空 pending（base64 → ArrayBuffer → onFrame）
-    while (this.bridge.hasPendingChunk() == true) {
+    // 帧：拉空 pending（base64 → ArrayBuffer → onFrame）。
+    // 注意：iOS 桥返回的 Swift Bool 用 `== true` 严格比较恒不成立（装箱值），
+    // 必须取局部变量用真值判断——此前 `hasPendingChunk() == true` 让帧从不交给
+    // VAD/管线，是「说话却不触发 VAD」的根因。
+    let hasChunk = this.bridge.hasPendingChunk()
+    while (hasChunk) {
       const b64 = this.bridge.takePendingChunk()
       if (b64.length == 0) {
         break
@@ -235,15 +290,44 @@ export class StreamPcmRecorder {
           }
         }
       }
+      hasChunk = this.bridge.hasPendingChunk()
     }
-    // onStop：桥已停止（曾真正开录）
-    if (this.stopReported != true && this.bridge.hasStopped() == true) {
+    // onStop：桥已停止（曾真正开录）。同样用真值判断（iOS 桥 Bool == true 恒不成立）。
+    this.deliverStopIfStopped()
+  }
+
+  /** onStop 投递：hasStopped 真值判断 + 显式 parseFloat（NSNumber 兜底）。
+   *  幂等（stopReported 守卫）。iOS 桥 Bool 用 `== true` 严格比较恒不成立，必须真值判断。 */
+  private deliverStopIfStopped(): void {
+    if (this.stopReported == true) {
+      console.log("[PCMRec-UTS] deliverStop skipped (already reported)")
+      return
+    }
+    const hasStopped = this.bridge.hasStopped()
+    // 注意：iOS 桥 Bool 的 `== true` / `!= true` 都不可用（装箱值），只能真值判断
+    if (!hasStopped) {
+      console.log("[PCMRec-UTS] deliverStop skipped (hasStopped falsy)")
+      return
+    }
+    {
       this.stopReported = true
       this.stopPolling()
       const stopCb = this.onStopCb
       if (stopCb != null) {
         const filePath = this.bridge.stopFilePath()
-        const byteLength = this.bridge.stopByteLength()
+        // NSNumber 返回值在 UTS→Swift 桥可能不自动转 number（iOS 曾卡 onStop 投递）：
+        // 显式 parseFloat 兜底，避免 Math.floor(NSNumber/32) 运行时抛错吞掉整个 onStop
+        let byteLength = 0
+        try {
+          const blRaw = this.bridge.stopByteLength()
+          const blNum = parseFloat(`${blRaw}`)
+          if (!isNaN(blNum) && blNum > 0) {
+            byteLength = blNum
+          }
+        } catch (_eBl) {
+          byteLength = 0
+        }
+        console.log(`[PCMRec-UTS] onStop file=${filePath} bytes=${byteLength}`)
         const res = new UTSJSONObject()
         res["tempFilePath"] = filePath
         // 16kHz mono PCM16 = 32000 B/s → 时长(ms) = 字节数 / 32

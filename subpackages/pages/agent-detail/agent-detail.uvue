@@ -449,6 +449,9 @@
 	/** 录音启动超时看门狗：start 后 onStart 未到则回传错误并重建 recorder，避免缓存实例坏掉后反复失败 */
 	let nativeRecordStartTimer: number = 0
 	const NATIVE_RECORD_START_TIMEOUT_MS: number = 3000
+	/** 启动看门狗自动重试次数：iOS 首次激活常被系统自惹中断打断导致无首帧，重试一次可靠（第二次必成功） */
+	let nativeRecordStartRetries: number = 0
+	const NATIVE_RECORD_START_MAX_RETRIES: number = 1
 	/** VAD 已触发（按住中已 begin ASR） */
 	let nativeVadSpeechDetected: boolean = false
 	/** 已收 asr_ready，可推音频 */
@@ -485,7 +488,12 @@
 		}
 	}
 
-	/** 申请麦克风权限（Android 用 UTSAndroid；iOS 检查授权状态）
+	// #ifdef APP-IOS
+	/** iOS not-determined 时主动请求系统授权（延迟绑定：ensureNativeRecorder 声明在其后，UTS 须先声明后使用） */
+	let iosRequestMicPermissionFn: (() => Promise<NativeMicPermissionResult>) | null = null
+	// #endif
+
+	/** 申请麦克风权限（Android 用 UTSAndroid；iOS 检查授权状态 + not-determined 主动请求）
 	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
 	async function ensureNativeMicPermission(): Promise<NativeMicPermissionResult> {
 		// #ifdef APP-ANDROID
@@ -521,7 +529,12 @@
 			// iOS 拒绝后同样无法再弹授权窗，须去系统设置开启
 			return new NativeMicPermissionResult(false, true)
 		}
-		// not determined：start 时系统才弹窗，先放行
+		// not determined：主动请求系统授权（首次按下弹窗；拒绝即永久，须去设置开启）
+		const requestFn = iosRequestMicPermissionFn
+		if (requestFn != null) {
+			return await requestFn()
+		}
+		// 兜底：请求函数未绑定（理论不可达）时放行，交给 start 时系统弹窗
 		return new NativeMicPermissionResult(true, false)
 		// #endif
 		// #ifdef APP-HARMONY
@@ -687,6 +700,7 @@
 		clearNativeRecordStartWatchdog()
 		nativeRecordingActive = true
 		nativeRecordingStartPending = false
+		console.log("[ASR-live] onStart 到达（原生录音已开录，首帧已到）")
 		// 开录后预热 ASR WS（只建连不发 start）：VAD 开口 begin 时复用连接，减少首字等待
 		asrWebSocketClient.preheatConnect()
 		evalBridgeJS(`window.__onNativeRecordStart && window.__onNativeRecordStart()`)
@@ -720,6 +734,7 @@
 		nativeStreamFallbackArmed = false
 		nativeAudioTruncated = false
 		const message = readRecorderErrorMessage(err)
+		console.warn("[ASR-live] 录音底层错误回调: " + message)
 		evalBridgeJS(
 			`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": message } as UTSJSONObject)})`,
 		)
@@ -964,9 +979,19 @@
 		nativeBeginAsrAndPushFileFrom(tempFilePath, 0)
 	}
 
-	/** 丢弃并重建录音器（start 抛异常 / 看门狗超时后，缓存实例可能已不可用） */
+	/** 丢弃并重建录音器（start 抛异常 / 看门狗超时后，缓存实例可能已不可用）。
+	 *  必须 releaseRecorder() 停掉旧实例的轮询与观察者——只置空会让旧实例的泄漏轮询
+	 *  继续投递迟到的 onStart/onStop，污染新一轮录音（已实测：onStart 出现在 start 之前）。 */
 	function resetNativeRecorder(): void {
+		const old = nativeRecorderInstance
 		nativeRecorderInstance = null
+		if (old != null) {
+			try {
+				old.releaseRecorder()
+			} catch (_eRelease) {
+				// ignore
+			}
+		}
 	}
 
 	/**
@@ -984,6 +1009,49 @@
 		}
 		return nativeRecorderInstance!
 	}
+
+	/** 构造原生录音参数（流式 ASR 需 16kHz mono PCM；Android/鸿蒙用，iOS 走无参 Swift start） */
+	function buildNativeRecordOptions(): RecorderManagerStartOptions {
+		return {
+			duration: 600000,
+			sampleRate: ASR_SAMPLE_RATE,
+			numberOfChannels: 1,
+			encodeBitRate: 48000,
+			format: "pcm",
+		} as RecorderManagerStartOptions
+	}
+
+	// #ifdef APP-IOS
+	/** iOS 主动请求麦克风授权：走 StreamPcmRecorder 桥的 requestRecordPermission，轮询直到用户应答（60s 兜底） */
+	iosRequestMicPermissionFn = (): Promise<NativeMicPermissionResult> => {
+		const recorder = ensureNativeRecorder()
+		recorder.requestRecordPermission()
+		console.log("[ASR-live] iOS 已发起麦克风授权请求，等待系统弹窗应答")
+		return new Promise<NativeMicPermissionResult>((resolve) => {
+			let pollTimer = 0
+			pollTimer = setInterval((): void => {
+				if (recorder.permissionResolved() == true) {
+					clearInterval(pollTimer)
+					pollTimer = 0
+					console.log("[ASR-live] iOS 授权应答 granted=" + (recorder.permissionGranted() == true))
+					resolve(
+						recorder.permissionGranted() == true
+							? new NativeMicPermissionResult(true, false)
+							: new NativeMicPermissionResult(false, true),
+					)
+				}
+			}, 50) as number
+			// 兜底：授权窗长时间无应答（理论不会）按拒绝处理，避免调用方一直等待
+			setTimeout((): void => {
+				if (pollTimer != 0) {
+					clearInterval(pollTimer)
+					pollTimer = 0
+					resolve(new NativeMicPermissionResult(false, true))
+				}
+			}, 60000) as number
+		})
+	}
+	// #endif
 
 	/** 按住 N 秒仍无语音：停录并回传 no_speech（VAD 未触发，无 ASR 会话可 abort） */
 	function armNativeNoSpeechWatchdog(): void {
@@ -1018,7 +1086,44 @@
 			if (nativeRecordingActive == true) {
 				return
 			}
+			// 用户在等待期间已松开/取消：不重试，按取消处理
+			if (nativeRecordingStopArrived == true || nativeRecordingDiscarded == true) {
+				nativeRecordingStartPending = false
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordCancelled") } as UTSJSONObject)})`,
+				)
+				return
+			}
+			// 自动重试：iOS 首次激活常被系统自惹中断打断导致无首帧（第二次必成功），
+			// 复用同一实例重新 start 一次，避免用户首按就报「录音启动失败」。
+			// 切勿 resetNativeRecorder() 新建实例：新实例会影子旧实例，
+			// 松手 stop 打到新实例，真正在录的旧实例永远收不到 stop → 卡「语音识别中」（已实测）。
+			if (nativeRecordStartRetries < NATIVE_RECORD_START_MAX_RETRIES) {
+				nativeRecordStartRetries++
+				console.warn("[ASR-live] 启动看门狗：3s 未到 onStart，自动重试第 " + nativeRecordStartRetries + " 次")
+				nativeRecordingStartPending = true
+				try {
+					const recorder = ensureNativeRecorder()
+					// #ifdef APP-IOS
+					recorder.start(null)
+					// #endif
+					// #ifndef APP-IOS
+					recorder.start(buildNativeRecordOptions())
+					// #endif
+					armNativeRecordStartWatchdog()
+					armNativeNoSpeechWatchdog()
+				} catch (e) {
+					nativeRecordingStartPending = false
+					console.error("[ASR-live] 重试 start 抛异常: " + readRecorderErrorMessage(e))
+					evalBridgeJS(
+						`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordStartFailed") } as UTSJSONObject)})`,
+					)
+				}
+				return
+			}
+			// 重试也失败：停录重建，回传错误让 H5 复位
 			nativeRecordingStartPending = false
+			console.warn("[ASR-live] 启动看门狗：重试后仍未收到 onStart，停录重建 recorder")
 			try {
 				ensureNativeRecorder().stop()
 			} catch (_e) {
@@ -1032,6 +1137,9 @@
 	}
 
 	function nativeStartRecord(): void {
+		console.log("[ASR-live] nativeStartRecord 收到 start")
+		// 新一轮：重置启动重试计数
+		nativeRecordStartRetries = 0
 		// 上一轮录音未正常结束（H5 侧已复位但原生仍在录）：先停掉孤儿录音，
 		// 否则缓存 recorder 处于已启动状态，后续 start 会失败/不触发 onStart
 		if (nativeRecordingActive == true) {
@@ -1069,6 +1177,7 @@
 		nativeRecordingStartPending = true
 		ensureNativeRecorder()
 		ensureNativeMicPermission().then((result: NativeMicPermissionResult) => {
+			console.log("[ASR-live] 权限结果 granted=" + result.granted + " deniedForever=" + result.deniedForever)
 			if (result.granted != true) {
 				nativeRecordingStartPending = false
 				evalBridgeJS(
@@ -1105,27 +1214,46 @@
 				const recorder = ensureNativeRecorder()
 				// 流式 ASR 需 16kHz mono PCM（asrWebSocketClient 硬编码 sample_rate=16000 / 20ms 帧）。
 				// iOS 同样支持 pcm（与 chat-input 的 App 分支录音参数对齐），不再走 mp3/aac 上传
-				const options = {
-					duration: 600000,
-					sampleRate: ASR_SAMPLE_RATE,
-					numberOfChannels: 1,
-					encodeBitRate: 48000,
-					format: "pcm",
-				} as RecorderManagerStartOptions
+				const options = buildNativeRecordOptions()
+				// #ifdef APP-IOS
+				// iOS 桥对 RecorderManagerStartOptions 对象参数跨桥不可靠（startByJs method call failed），
+				// 走无参默认时长路径（Swift start() 固定 600000ms）；Android/鸿蒙照常传 options
+				recorder.start(null)
+				// #endif
+				// #ifndef APP-IOS
 				recorder.start(options)
-				// onStart 未到则看门狗兜底（回传错误 + 重建 recorder）
+				// #endif
+				// onStart 未到则看门狗兜底（回传错误 + 重建 recorder；iOS 首按自动重试一次）
 				armNativeRecordStartWatchdog()
 				// 按住 N 秒无语音 → 停录回传 no_speech（边说边传的开口兜底）
 				armNativeNoSpeechWatchdog()
 			} catch (e) {
 				nativeRecordingStartPending = false
 				clearNativeRecordStartWatchdog()
+				console.error("[ASR-live] recorder.start 抛异常: " + readRecorderErrorMessage(e))
 				// start 抛异常：重建 recorder，避免缓存实例坏掉后反复失败
 				resetNativeRecorder()
 				evalBridgeJS(
 					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordStartFailed") } as UTSJSONObject)})`,
 				)
 			}
+		})
+	}
+
+	/**
+	 * H5 按下前的权限预检（requestPermission 消息）：把真实授权结果回传 H5。
+	 * granted/deniedForever 决定 H5 是否显示波浪线/引导弹窗
+	 * （Android/鸿蒙/iOS 统一走 ensureNativeMicPermission，iOS not-determined 会在此弹系统授权窗）。
+	 */
+	function nativeRequestRecordPermission(): void {
+		ensureNativeMicPermission().then((result: NativeMicPermissionResult) => {
+			const payload = {
+				"granted": result.granted,
+				"deniedForever": result.deniedForever,
+			} as UTSJSONObject
+			evalBridgeJS(
+				`window.__onNativeRecordPermission && window.__onNativeRecordPermission(${jsonStringifyForBridge(payload)})`,
+			)
 		})
 	}
 
@@ -1705,6 +1833,12 @@
 				nativeStopRecord()
 			} else if (action == "discard") {
 				nativeRecordDiscard()
+			} else if (action == "requestPermission") {
+				// H5 按下前权限预检：回传真实授权结果（首次 iOS 在此弹系统授权窗）
+				nativeRequestRecordPermission()
+			} else if (action == "openSettings") {
+				// H5 引导弹窗确认「去设置」：打开系统设置页（iOS/Android/鸿蒙通用）
+				uni.openAppAuthorizeSetting({})
 			}
 			return
 		}

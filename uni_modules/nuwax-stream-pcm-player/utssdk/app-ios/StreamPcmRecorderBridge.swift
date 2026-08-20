@@ -23,10 +23,45 @@ public class StreamPcmRecorderBridge {
     private var stopped = false
     private var errorMessage = ""
     private var durationTimer: Timer?
-    private var sessionConfigured = false
     private var observersAdded = false
+    /** 麦克风授权：是否已发起请求 / 是否已出结果 / 是否已授权（iOS 每安装仅弹一次系统授权窗） */
+    private var permissionRequested = false
+    private var permissionResolvedFlag = false
+    private var permissionGrantedFlag = false
+    /** 诊断行缓冲：Swift NSLog 不进 App 日志（HX logcat 只收 UTS console），诊断改经 takeDiag 由 UTS 轮询拉取 */
+    private var diagLines: [String] = []
+    /** 首帧诊断只记一次（避免每个 tap buffer 刷屏） */
+    private var diagFirstFrameLogged = false
+    /** 启动窗口截止：start 后 ~3s 内的 interruption 视为会话激活的系统自惹事件，一律忽略
+     *  （真机实测：无论 isOtherAudioPlaying 真假，start 后约 1s 必来一次 .began） */
+    private var interruptSuppressDeadline: Date?
 
     public init() {}
+
+    // ==================== 诊断（UTS 轮询拉取） ====================
+
+    private func appendDiag(_ line: String) {
+        lock.lock()
+        diagLines.append(line)
+        if diagLines.count > 60 { diagLines.removeFirst() }
+        lock.unlock()
+    }
+
+    /// 拉取并清空诊断行（调用方不应持有 lock）
+    public func takeDiag() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let joined = diagLines.joined(separator: "\n")
+        diagLines.removeAll()
+        return joined
+    }
+
+    /// 引擎是否仍在运行（UTS 诊断用）
+    public func isRunningNow() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return running
+    }
 
     // ==================== UTS 拉取 API ====================
 
@@ -77,8 +112,13 @@ public class StreamPcmRecorderBridge {
 
     // ==================== 控制 ====================
 
-    /// 开始录音：durationMs 毫秒后自动停止（<=0 不限）。采样率/声道/格式固定 16kHz mono PCM16。
-    public func start(_ durationMs: NSNumber) {
+    /// 开始录音（时长固定 600000ms = UTS 侧默认/上限）。
+    /// 无参跨桥：uni-app x UTS→Swift 桥对 RecorderManagerStartOptions 对象与 number 参数
+    /// 的转换不可靠（曾致 startByJs 恒报 method call failed、Swift start 从未进入），
+    /// 去掉全部参数即无转换可失败。
+    public func start() {
+        NSLog("[PCMRec] start() called")
+        appendDiag("start() called")
         // 复用实例：先收尾旧轮（不回传旧 stopped，避免污染新会话）
         finishInternal()
         lock.lock()
@@ -90,6 +130,15 @@ public class StreamPcmRecorderBridge {
 
         configureSession()
         addObservers()
+
+        guard AVAudioSession.sharedInstance().isInputAvailable else {
+            lock.lock()
+            errorMessage = "麦克风输入不可用"
+            lock.unlock()
+            NSLog("[PCMRec] isInputAvailable=false，中止 start（避免 inputNode 抛 NSException）")
+            appendDiag("isInputAvailable=false，中止 start")
+            return
+        }
 
         filePath = NSTemporaryDirectory() + "nuwax_voice_record.pcm"
         do {
@@ -105,35 +154,39 @@ public class StreamPcmRecorderBridge {
             return
         }
 
-        guard let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                                      sampleRate: 16000,
-                                      channels: 1,
-                                      interleaved: false) else {
-            lock.lock()
-            errorMessage = "录音启动失败"
-            lock.unlock()
-            return
-        }
         let engine = AVAudioEngine()
         self.engine = engine
         let input = engine.inputNode
-        // tap 格式指定 16kHz：AVAudioEngine 从硬件采样率隐式重采样（SRC）
-        input.installTap(onBus: 0, bufferSize: 3200, format: fmt) { [weak self] buffer, _ in
+        // 用硬件原生格式挂 tap：iOS 上以 16k Int16 自定义格式 installTap 会抛
+        // "Failed to create tap due to format mismatch"（无隐式 SRC），
+        // 改在 handleTap 里手动重采样到 16kHz mono Int16（线性插值，支持任意采样率比）。
+        let inputFormat = input.inputFormat(forBus: 0)
+        NSLog("[PCMRec] inputFormat sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)")
+        appendDiag("inputFormat sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)")
+        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             self?.handleTap(buffer)
         }
         running = true
         do {
             try engine.start()
+            NSLog("[PCMRec] engine.start ok")
+            appendDiag("engine.start ok")
+            // 会话激活后系统会自惹一次 interruption(.began)，抑制窗口内一律忽略
+            interruptSuppressDeadline = Date().addingTimeInterval(3.0)
         } catch {
             running = false
+            NSLog("[PCMRec] engine.start FAIL: \(error)")
+            appendDiag("engine.start FAIL: \(error)")
             lock.lock()
             errorMessage = "录音启动失败"
             lock.unlock()
             stopEngineAndCloseFile()
             return
         }
-        if durationMs.doubleValue > 0 {
-            let t = Timer(timeInterval: durationMs.doubleValue / 1000.0, repeats: false) { [weak self] _ in
+        // 时长固定 600000ms（10 分钟，对齐 UTS 侧默认值与上限）
+        let durationMs: Double = 600000
+        if durationMs > 0 {
+            let t = Timer(timeInterval: durationMs / 1000.0, repeats: false) { [weak self] _ in
                 self?.finishInternal()
             }
             RunLoop.main.add(t, forMode: .common)
@@ -155,21 +208,60 @@ public class StreamPcmRecorderBridge {
         removeObservers()
     }
 
-    // ==================== 内部 ====================
+    // ==================== 麦克风授权（首次按下主动请求） ====================
 
-    /// tap 回调（音频渲染线程）：PCM 帧写文件 + 入队（NSLock 保护）
-    private func handleTap(_ buffer: AVAudioPCMBuffer) {
-        guard running else { return }
-        guard let channelData = buffer.int16ChannelData?[0] else { return }
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return }
-        let byteCount = frameCount * 2
-        var data = Data(count: byteCount)
-        data.withUnsafeMutableBytes { raw in
-            if let base = raw.baseAddress {
-                memcpy(base, channelData, byteCount)
+    /// 主动请求麦克风权限：iOS 17+ 用 AVAudioApplication，旧版本用 AVAudioSession。
+    /// 结果经 permissionResolved() / permissionGranted() 拉取（与现有 UTS 轮询模式一致）。
+    /// 每安装仅弹一次系统授权窗；已确定（授权/拒绝）后直接回结果不再弹窗。
+    public func requestRecordPermission() {
+        lock.lock()
+        guard !permissionRequested else {
+            lock.unlock()
+            return
+        }
+        permissionRequested = true
+        lock.unlock()
+        if #available(iOS 17.0, *) {
+            AVAudioApplication.requestRecordPermission { [weak self] granted in
+                self?.setPermissionResult(granted)
+            }
+        } else {
+            AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
+                self?.setPermissionResult(granted)
             }
         }
+    }
+
+    /// 系统授权是否已出结果（用户已应答 / 状态已确定）
+    public func permissionResolved() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return permissionResolvedFlag
+    }
+
+    /// 授权结果：true 已授权 / false 拒绝（仅在 permissionResolved() 后有效）
+    public func permissionGranted() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return permissionGrantedFlag
+    }
+
+    private func setPermissionResult(_ granted: Bool) {
+        lock.lock()
+        permissionGrantedFlag = granted
+        permissionResolvedFlag = true
+        lock.unlock()
+    }
+
+    // ==================== 内部 ====================
+
+    /// tap 回调（音频渲染线程）：硬件格式 → 16kHz mono Int16，写文件 + 入队（NSLock 保护）
+    private func handleTap(_ buffer: AVAudioPCMBuffer) {
+        guard running else { return }
+        let pcm16 = convertToPcm16Mono16k(buffer)
+        guard !pcm16.isEmpty else { return }
+        let byteCount = pcm16.count * 2
+        let data = Data(bytes: pcm16, count: byteCount)
         // 写文件（仅 tap 线程写，无锁竞争）
         fileHandle?.write(data)
         lock.lock()
@@ -182,12 +274,63 @@ public class StreamPcmRecorderBridge {
         }
         if !started {
             started = true
+            NSLog("[PCMRec] first tap frame received")
         }
         lock.unlock()
+        if started && diagFirstFrameLogged != true {
+            diagFirstFrameLogged = true
+            appendDiag("first tap frame received")
+        }
+    }
+
+    /// 任意采样率/格式 → 16kHz mono Int16（线性插值重采样；支持 Float32/Int16 输入与任意采样率比）。
+    /// 只取第一声道；多声道输入丢弃其余声道。
+    private func convertToPcm16Mono16k(_ buffer: AVAudioPCMBuffer) -> [Int16] {
+        let srcRate = buffer.format.sampleRate
+        let srcCh = Int(buffer.format.channelCount)
+        let frameCount = Int(buffer.frameLength)
+        guard srcRate > 0, srcCh > 0, frameCount > 0 else { return [] }
+
+        // 第一声道 → Float32（[-1,1]）
+        var floatSamples = [Float](repeating: 0, count: frameCount)
+        if buffer.format.commonFormat == .pcmFormatFloat32 {
+            guard let ch = buffer.floatChannelData?[0] else { return [] }
+            for i in 0..<frameCount { floatSamples[i] = ch[i] }
+        } else if buffer.format.commonFormat == .pcmFormatInt16 {
+            guard let ch = buffer.int16ChannelData?[0] else { return [] }
+            for i in 0..<frameCount { floatSamples[i] = Float(ch[i]) / 32768.0 }
+        } else {
+            return []
+        }
+
+        // 重采样到 16kHz（线性插值）
+        let ratio = srcRate / 16000.0
+        if abs(ratio - 1.0) < 0.0001 {
+            var out = [Int16](repeating: 0, count: frameCount)
+            for i in 0..<frameCount {
+                let v = floatSamples[i]
+                out[i] = Int16(max(-1.0, min(1.0, v)) * 32767.0)
+            }
+            return out
+        }
+        let outCount = Int(Double(frameCount) / ratio)
+        guard outCount > 0 else { return [] }
+        var out = [Int16](repeating: 0, count: outCount)
+        for i in 0..<outCount {
+            let pos = Double(i) * ratio
+            let i0 = Int(pos)
+            let i1 = min(i0 + 1, frameCount - 1)
+            let frac = Float(pos - Double(i0))
+            let v = floatSamples[i0] * (1 - frac) + floatSamples[i1] * frac
+            out[i] = Int16(max(-1.0, min(1.0, v)) * 32767.0)
+        }
+        return out
     }
 
     /// 正常收尾：停引擎、关文件、标记 stopped（曾开录时）；保留 pendingChunks 供 UTS 拉尾帧
     private func finishInternal() {
+        NSLog("[PCMRec] finishInternal called running=\(running) started=\(started)")
+        appendDiag("finishInternal called running=\(running) started=\(started)")
         guard running else { return }
         running = false
         stopEngineAndCloseFile()
@@ -212,13 +355,39 @@ public class StreamPcmRecorderBridge {
 
     /// AVAudioSession：录音与 TTS 播放共存，统一 .playAndRecord（首次配置一次）
     private func configureSession() {
-        guard !sessionConfigured else { return }
-        sessionConfigured = true
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord,
-                                 mode: .default,
-                                 options: [.defaultToSpeaker, .allowBluetoothHFP])
-        try? session.setActive(true)
+        // 必须 setActive(false) 再重配：会话可能已被 App 其他音频激活过，直接改 category 激活时
+        // 输入路由不真正建立 → 永不产帧（已实测 17:21：无 deactivate 时 engine.start ok 但无首帧）。
+        // deactivate 会触发系统 interruption(.began)（自惹中断，与 notify 无关），
+        // 由 handleInterruption 的 isOtherAudioPlaying 守卫忽略。
+        do {
+            try session.setActive(false)
+            NSLog("[PCMRec] deactivate session ok")
+            appendDiag("deactivate session ok")
+        } catch {
+            NSLog("[PCMRec] deactivate session fail(continue): \(error)")
+            appendDiag("deactivate session fail: \(error)")
+        }
+        do {
+            try session.setCategory(.playAndRecord,
+                                    mode: .default,
+                                    options: [.defaultToSpeaker])
+            NSLog("[PCMRec] setCategory(.playAndRecord) ok")
+            appendDiag("setCategory(.playAndRecord) ok")
+        } catch {
+            NSLog("[PCMRec] setCategory(.playAndRecord) FAIL: \(error)")
+            appendDiag("setCategory FAIL: \(error)")
+        }
+        do {
+            try session.setActive(true)
+            NSLog("[PCMRec] setActive(true) ok")
+            appendDiag("setActive(true) ok")
+        } catch {
+            NSLog("[PCMRec] setActive(true) FAIL: \(error)")
+            appendDiag("setActive(true) FAIL: \(error)")
+        }
+        NSLog("[PCMRec] session category=\(session.category.rawValue) inputAvailable=\(session.isInputAvailable) otherAudio=\(session.isOtherAudioPlaying)")
+        appendDiag("session category=\(session.category.rawValue) inputAvailable=\(session.isInputAvailable) otherAudio=\(session.isOtherAudioPlaying)")
     }
 
     private func addObservers() {
@@ -245,23 +414,51 @@ public class StreamPcmRecorderBridge {
                                                   object: nil)
     }
 
-    /// 来电等系统中断：优雅收尾（等价松手），跳主线程避免在任意线程碰 AVAudioEngine
+    /// 来电等系统中断：优雅收尾（等价松手），跳主线程避免在任意线程碰 AVAudioEngine。
+    /// 三层守卫：
+    /// 1) 启动窗口（start 后 3s）：会话激活的系统自惹 .began（真机实测无论 otherAudio 真假必来一次）→ 忽略；
+    /// 2) started==false（首帧未到）→ 忽略；
+    /// 3) isOtherAudioPlaying==false（无其他 App 在播）→ 视为自惹，忽略。
+    /// 只有过了启动窗口、已开录、且确有其他 App 音频在播（真抢占）才收尾。
     @objc private func handleInterruption(_ notification: Notification) {
         guard let info = notification.userInfo,
               let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: typeRaw),
-              type == .began else { return }
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+        NSLog("[PCMRec] interruption notification type=\(type.rawValue) (\(type == .began ? "began" : "ended"))")
+        appendDiag("interruption type=\(type.rawValue)")
+        guard type == .began else { return }
+        if let deadline = interruptSuppressDeadline, Date() < deadline {
+            appendDiag("interruption began ignored (startup window)")
+            return
+        }
+        interruptSuppressDeadline = nil
+        guard started else {
+            appendDiag("interruption began ignored (started=false)")
+            return
+        }
+        let otherAudio = AVAudioSession.sharedInstance().isOtherAudioPlaying
+        appendDiag("interruption began otherAudio=\(otherAudio)")
+        guard otherAudio else {
+            appendDiag("interruption began ignored (no other audio playing)")
+            return
+        }
         DispatchQueue.main.async { [weak self] in
             self?.finishInternal()
         }
     }
 
-    /// 路由变更（耳机拔插）导致旧设备不可用：优雅收尾
+    /// 路由变更（耳机拔插）导致旧设备不可用：优雅收尾。同样加 started 守卫。
     @objc private func handleRouteChange(_ notification: Notification) {
         guard let info = notification.userInfo,
               let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
-              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw),
-              reason == .oldDeviceUnavailable else { return }
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else { return }
+        NSLog("[PCMRec] routeChange notification reason=\(reason.rawValue)")
+        appendDiag("routeChange reason=\(reason.rawValue)")
+        guard reason == .oldDeviceUnavailable else { return }
+        guard started else {
+            appendDiag("routeChange oldDeviceUnavailable ignored (started=false)")
+            return
+        }
         DispatchQueue.main.async { [weak self] in
             self?.finishInternal()
         }

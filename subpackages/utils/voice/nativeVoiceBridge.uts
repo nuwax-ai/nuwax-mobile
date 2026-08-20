@@ -38,6 +38,12 @@ export type NativeTtsStateHandler = (
   message: string,
 ) => void
 
+/** 原生授权预检结果（H5 按下前 requestPermission 回传） */
+export class NativeRecordPermissionResult {
+  granted: boolean = false
+  deniedForever: boolean = false
+}
+
 class NativeTtsListenerEntry {
   id: number
   callback: NativeTtsStateHandler
@@ -55,6 +61,8 @@ class NativeVoiceBridge {
   private globalsRegistered: boolean = false
   /** 是否已尝试注入 uni.webview JSSDK（幂等） */
   private jssdkInjected: boolean = false
+  /** 授权预检待回传的解析器（单飞：同时只有一个 requestPermission 在途） */
+  private permissionResolver: ((result: NativeRecordPermissionResult) => void) | null = null
 
   /** 录音回调（由 voice-recorder-button 注入） */
   private onRecordStartHandler: NativeRecordStartHandler | null = null
@@ -117,6 +125,38 @@ class NativeVoiceBridge {
     this.post({
       "type": "record",
       "action": "discard",
+    } as UTSJSONObject)
+  }
+
+  /**
+   * 请求麦克风权限并等待原生回传（H5 按下前预检）。
+   * 首次按下会触发原生侧系统授权窗；结果经 evalJS __onNativeRecordPermission 回传。
+   * 调用方（voice-recorder-button）在已缓存授权时会直接跳过，不会走到这里。
+   */
+  requestRecordPermission(): Promise<NativeRecordPermissionResult> {
+    return new Promise<NativeRecordPermissionResult>((resolve) => {
+      // 上一次请求未回传（异常）：先丢弃，避免解析错乱
+      this.permissionResolver = resolve
+      this.post({
+        "type": "record",
+        "action": "requestPermission",
+      } as UTSJSONObject)
+      // 兜底超时：原生未回传（evalJS 失败等）时按未授权处理，避免 H5 一直卡在 connecting
+      setTimeout((): void => {
+        const resolver = this.permissionResolver
+        if (resolver != null) {
+          this.permissionResolver = null
+          resolver(new NativeRecordPermissionResult())
+        }
+      }, 30000) as number
+    })
+  }
+
+  /** 打开系统设置页（引导弹窗确认后调用）：原生侧 uni.openAppAuthorizeSetting（H5 内无法跳原生设置页） */
+  openPermissionSettings(): void {
+    this.post({
+      "type": "record",
+      "action": "openSettings",
     } as UTSJSONObject)
   }
 
@@ -391,6 +431,23 @@ class NativeVoiceBridge {
           message = `${err}`
         }
         h(message)
+      }
+      w.__onNativeRecordPermission = (res: any): void => {
+        const resolver = this.permissionResolver
+        this.permissionResolver = null
+        if (resolver == null) {
+          return
+        }
+        const result = new NativeRecordPermissionResult()
+        try {
+          if (res != null) {
+            result.granted = res.granted == true
+            result.deniedForever = res.deniedForever == true
+          }
+        } catch (_ePerm) {
+          // ignore
+        }
+        resolver(result)
       }
       w.__onNativeTtsState = (res: any): void => {
         let state: NativeTtsBridgeState = "end"

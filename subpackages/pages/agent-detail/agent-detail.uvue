@@ -91,32 +91,14 @@
 	let appKeyboardHeightListenerId: number = 0
 	/** 最近一次键盘高度：webview 未就绪时随注入轮询补发（默认 0 = 键盘收起） */
 	let latestInjectedKeyboardHeight: number = 0
-	/** 底部手势条/导航条高度（safeAreaInsets.bottom）：Android 键盘不覆盖手势条，
-	    内嵌页视口收缩量少这一截，注入 H5 供 updateEmbeddedPageHeight 补偿页面高度 */
+	/** 底部手势条/导航条高度（safeAreaInsets.bottom）：onKeyboardHeightChange 兜底值归一化为完整 IME 时使用 */
 	let latestInjectedSafeAreaBottom: number = 0
-	/** 键盘测量基线：键盘收起时的 windowHeight。实测 uni.onKeyboardHeightChange 恒 0、
-	    H5 侧 innerHeight/visualViewport 均不随键盘变化，尝试用窗口高度差测真实键盘高度 */
-	let kbBaselineWindowHeight: number = 0
-
-	/** 读取当前窗口高度（px） */
-	function readCurrentWindowHeight(): number {
-		try {
-			const sysInfo = uni.getSystemInfoSync()
-			const wh = sysInfo.windowHeight
-			if (wh != null) {
-				return parseFloat(`${wh}`)
-			}
-		} catch (_e) {
-			// ignore
-		}
-		return 0
-	}
 
 	/**
 	 * 直接读 WindowInsets 的 IME 高度（device px → css px）。
-	 * 本环境实测：uni.onKeyboardHeightChange 恒 0、H5 innerHeight/visualViewport 不随键盘变化、
-	 * windowHeight 只收缩约 39px（系统栏噪声）——键盘以覆盖层形式出现且不被任何 resize 反映。
-	 * WindowInsets 的 IME insets 在 API 30+ 上与 softInputMode 无关地派发，是唯一可靠读数。
+	 * 本环境实测：uni.onKeyboardHeightChange 恒 0、H5 innerHeight/visualViewport 不随键盘变化——
+	 * 键盘以覆盖层形式出现且不被任何 resize 反映，WindowInsets 的 IME insets 在 API 30+ 上
+	 * 与 softInputMode 无关地派发，是唯一可靠读数。
 	 */
 	function readAndroidImeHeight(): number {
 		try {
@@ -187,8 +169,7 @@
 	 * 生成键盘高度 + 底部手势条高度注入脚本：写全局 + 派发 CustomEvent（幂等，事件注入 / 注入轮询两路复用）。
 	 * H5 运行时不会派发 keyboardheightchange，内嵌页的 keyboardHeight 只能由原生侧桥接进来，
 	 * H5 侧 chat-input-phone 监听 'nuwax:keyboardHeightChange' 后顶起底部输入区。
-	 * safeBottom：Android 底部手势条/导航条高度，H5 侧 updateEmbeddedPageHeight 用它补偿
-	 * 页面高度（键盘不覆盖手势条，视口收缩量少这一截）。
+	 * safeBottom：Android 底部手势条/导航条高度，onKeyboardHeightChange 兜底值归一化时使用。
 	 */
 	function buildKeyboardHeightInjectCode(h: number, safeBottom: number): string {
 		const heightNum = `${Math.round(h)}`
@@ -345,17 +326,13 @@
 	function onAppKeyboardHeightChangeForWebView(res: any): void {
 		let h = 0
 		// #ifdef APP-ANDROID
-		// 测量：窗口高度差法。实测 uni.onKeyboardHeightChange 恒 0（adjustResize 下装饰视图与
-		// 可见区同步收缩、差值恒 0）、H5 侧 innerHeight/visualViewport 均不随键盘变化——
-		// 若 windowHeight 本身随 adjustResize 收缩，则 height = 基线 − 当前值 即真实键盘高度。
-		let usedHeightDiff = false
-		// 优先：WindowInsets 直接读 IME 高度（权威；实测其他信号均测不出真实键盘高）
+		// 优先：WindowInsets 直接读 IME 高度（完整 IME，权威读数）
+		let usedImeRead = false
 		try {
 			const imeCss = readAndroidImeHeight()
 			if (imeCss > 0) {
 				h = imeCss
-				usedHeightDiff = true
-				console.log("[ime-diag] imeCss=" + imeCss)
+				usedImeRead = true
 				// 键盘动画期间取值可能偏小：短轮询取动画结束后的完整 IME 高
 				imePollMax = imeCss
 				imePollCount = 0
@@ -368,26 +345,9 @@
 		} catch (_eIme) {
 			// ignore
 		}
-		// 兜底：窗口高度差（实测只反映系统栏噪声约 39px，保留便于对比）
-		try {
-			const wh = readCurrentWindowHeight()
-			if (wh > kbBaselineWindowHeight) {
-				kbBaselineWindowHeight = wh
-			}
-			const kbByDiff = kbBaselineWindowHeight - wh
-			console.log(
-				"[kb-diag] base=" + kbBaselineWindowHeight + " wh=" + wh + " kb=" + kbByDiff
-			)
-			if (kbByDiff > 0 && !usedHeightDiff) {
-				h = kbByDiff
-				usedHeightDiff = true
-			}
-		} catch (_eWh) {
-			// ignore
-		}
 		// #endif
 		if (h <= 0) {
-			// 仅当更优来源（WindowInsets / 窗口高度差）未给出值时，才采纳 onKeyboardHeightChange
+			// 兜底：onKeyboardHeightChange（值语义 ≈ IME − 手势条，见下方手势条归一化）
 			try {
 				const obj = res as UTSJSONObject
 				const raw = obj["height"]
@@ -401,12 +361,11 @@
 				// ignore
 			}
 		}
-		// webview 全屏铺满后内容底边含手势条区域：onKeyboardHeightChange 高度是 IME 减去底部
-		// 安全区（手势条）后的值，差一个 safeAreaInsets.bottom，补上输入框才完全露出键盘
-		//（内嵌 H5 的 env(safe-area-inset-bottom) 在全屏 webview 下为 0，无法自行补偿）。
-		// 用窗口高度差测得的高度已是全 IME 高，不再叠加手势条。
 		// #ifdef APP-ANDROID
-		if (!usedHeightDiff) {
+		// 非 IME 直读路径（onKeyboardHeightChange 兜底）：高度不含底部安全区，补手势条
+		// 归一化为完整 IME（内嵌 H5 的 env(safe-area-inset-bottom) 在全屏 webview 下为 0，
+		// 无法自行补偿）。WindowInsets 直读已是完整 IME，不再叠加。
+		if (!usedImeRead) {
 			try {
 				const sysInfo = uni.getSystemInfoSync()
 				const safeInset = sysInfo.safeAreaInsets
@@ -421,7 +380,6 @@
 		}
 		// #endif
 		injectKeyboardHeightToH5(h)
-		console.log("[kb-bridge] reported keyboard height =", h)
 	}
 
 	function jsonStringifyForBridge(obj: UTSJSONObject): string {
@@ -2142,8 +2100,6 @@
 		// #ifdef APP-ANDROID
 		// 先算一次底部手势条高度，随注入轮询落到 H5（@load 前键盘已弹起时也带得上）
 		latestInjectedSafeAreaBottom = readAndroidSafeAreaBottom()
-		// 键盘测量基线：页面加载时窗口未收缩（键盘收起），记录全高
-		kbBaselineWindowHeight = readCurrentWindowHeight()
 		if (appKeyboardHeightListenerId == 0) {
 			appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChangeForWebView)
 		}

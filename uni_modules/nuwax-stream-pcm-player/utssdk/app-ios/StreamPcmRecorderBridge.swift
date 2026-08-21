@@ -110,6 +110,15 @@ public class StreamPcmRecorderBridge {
         return NSNumber(value: recordedBytes)
     }
 
+    /// 当前已采字节数（UTS 轮询拉取：tap 断流自愈检测用，bytes 长时间不涨 = tap 静默断流）。
+    /// 注意：不能叫 recordedBytes()——与私有属性 recordedBytes 同名在 UTS→ObjC 桥接层
+    /// 会生成重复 selector（属性 getter + 方法都映射为 recordedBytes）报 redeclaration。
+    public func currentRecordedBytes() -> NSNumber {
+        lock.lock()
+        defer { lock.unlock() }
+        return NSNumber(value: recordedBytes)
+    }
+
     // ==================== 控制 ====================
 
     /// 开始录音（时长固定 600000ms = UTS 侧默认/上限）。

@@ -92,6 +92,9 @@ export type NativeRecorderStopCallback = (res: UTSJSONObject | null) => void
 export type NativeRecorderErrorCallback = (err: UTSJSONObject | null) => void
 /** 实时 PCM 帧回调（chunk 为 16kHz mono PCM16 LE 裸字节；主线程回调；一次性全新 ArrayBuffer） */
 export type NativeRecorderFrameCallback = (chunk: ArrayBuffer) => void
+/** tap 断流自愈：recordedBytes 连续多少轮（20ms/轮）不增长判定断流（60 轮 ≈ 1.2s）。
+ *   AVAudioEngine tap 静默断流无错误、running 仍 true，只能靠 bytes 停滞探测。 */
+const SELF_HEAL_STALL_ROUNDS = 60
 
 /**
  * 原生录音器（App-iOS）
@@ -117,6 +120,12 @@ export class StreamPcmRecorder {
   private errorReported: boolean = false
   /** 诊断拉取节拍（每 25 轮 ≈ 500ms 拉一次 Swift 诊断缓冲，绕开 NSLog 不进 App 日志的问题） */
   private diagTick: number = 0
+  /** tap 断流自愈：已静默重启次数（每轮录音最多 1 次；第二次 start 已验证必成功） */
+  private selfHealCount: number = 0
+  /** tap 断流自愈：上次轮询记录的已采字节数（-1 表示未初始化） */
+  private lastRecordedBytes: number = -1
+  /** tap 断流自愈：bytes 持续不增长的轮数（20ms/轮） */
+  private stallRounds: number = 0
 
   onStart(callback: NativeRecorderStartCallback | null): void {
     this.onStartCb = callback
@@ -161,6 +170,9 @@ export class StreamPcmRecorder {
     this.stopReported = false
     this.errorReported = false
     this.diagTick = 0
+    this.selfHealCount = 0
+    this.lastRecordedBytes = -1
+    this.stallRounds = 0
     this.bridge.start()
     console.log("[PCMRec-UTS] bridge.start() returned")
     const d0 = this.bridge.takeDiag()
@@ -292,6 +304,30 @@ export class StreamPcmRecorder {
       }
       hasChunk = this.bridge.hasPendingChunk()
     }
+    // —— tap 断流自愈：已开录但 recordedBytes 长时间不涨 = AVAudioEngine tap 静默断流
+    //   （无错误、running 仍 true；iOS 会话激活抖动高发，典型症状首按只采 1 buffer 即停）。
+    //   复刻「第二次 start 已验证成功」路径：静默重启一次，业务层/H5 无感知——
+    //   startReported 保持 true 不重复投递 onStart，stopReported 保持 false。
+    //   isRecording() 守卫：stop() 里也会同步调一次 pollOnce，此时 stopped=true，
+    //   不能再触发自愈（否则松手后重启出无人停的新 session）。
+    if (this.startReported == true && this.isRecording() && this.selfHealCount < 1) {
+      const rawBytes = this.bridge.currentRecordedBytes()
+      const nowBytes = parseFloat(`${rawBytes}`)
+      if (isNaN(nowBytes) || nowBytes < 0) {
+        this.stallRounds = 0
+      } else if (nowBytes != this.lastRecordedBytes) {
+        this.lastRecordedBytes = nowBytes
+        this.stallRounds = 0
+      } else {
+        this.stallRounds += 1
+        if (this.stallRounds >= SELF_HEAL_STALL_ROUNDS) {
+          this.stallRounds = 0
+          this.selfHealCount += 1
+          console.warn("[PCMRec-UTS] tap 断流自愈：bytes 长时间不涨，静默重启录音 session")
+          this.silentRestart()
+        }
+      }
+    }
     // onStop：桥已停止（曾真正开录）。同样用真值判断（iOS 桥 Bool == true 恒不成立）。
     this.deliverStopIfStopped()
   }
@@ -343,5 +379,25 @@ export class StreamPcmRecorder {
       this.pollTimer = 0
     }
     this.polling = false
+  }
+
+  /**
+   * 静默重启录音 session（tap 断流自愈）：桥内 stop + start 同步执行，
+   * 同一轮 pollOnce 内完成，deliverStopIfStopped 看不到中间的 stopped=true。
+   * 不投递 onStart/onStop，业务层/H5 无感知；startReported 保持 true。
+   */
+  private silentRestart(): void {
+    this.bridge.stop()
+    const d1 = this.bridge.takeDiag()
+    if (d1.length > 0) {
+      console.log("[PCMRec-DIAG] " + d1)
+    }
+    this.lastRecordedBytes = -1
+    this.stallRounds = 0
+    this.bridge.start()
+    const d2 = this.bridge.takeDiag()
+    if (d2.length > 0) {
+      console.log("[PCMRec-DIAG] " + d2)
+    }
   }
 }

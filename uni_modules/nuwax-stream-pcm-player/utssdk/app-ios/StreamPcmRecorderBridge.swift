@@ -149,7 +149,12 @@ public class StreamPcmRecorderBridge {
             return
         }
 
-        filePath = NSTemporaryDirectory() + "nuwax_voice_record.pcm"
+        // 写 uni-app x 的 usr 空间（Documents）而非 NSTemporaryDirectory：uni 的
+        // getFileSystemManager.readFile 对 Swift 的 /private/var/mobile/.../tmp 路径
+        // getRealPath 匹配不上（实测读文件恒失败 → 兜底误报「音频文件为空」），
+        // 而 Documents 是 unifile://usr/ 的物理目录，下游 readFile 一定能读。
+        let docsDir = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
+        filePath = (docsDir ?? NSTemporaryDirectory()) + "/nuwax_voice_record.pcm"
         do {
             if FileManager.default.fileExists(atPath: filePath) {
                 try FileManager.default.removeItem(atPath: filePath)

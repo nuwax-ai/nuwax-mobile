@@ -92,9 +92,14 @@ export type NativeRecorderStopCallback = (res: UTSJSONObject | null) => void
 export type NativeRecorderErrorCallback = (err: UTSJSONObject | null) => void
 /** 实时 PCM 帧回调（chunk 为 16kHz mono PCM16 LE 裸字节；主线程回调；一次性全新 ArrayBuffer） */
 export type NativeRecorderFrameCallback = (chunk: ArrayBuffer) => void
-/** tap 断流自愈：recordedBytes 连续多少轮（20ms/轮）不增长判定断流（60 轮 ≈ 1.2s）。
- *   AVAudioEngine tap 静默断流无错误、running 仍 true，只能靠 bytes 停滞探测。 */
-const SELF_HEAL_STALL_ROUNDS = 60
+/** tap 断流自愈（启动期）：首帧未到（onStart 未投递）时的停滞窗口（75 轮 ≈ 1.5s）。
+ *   iOS 每次 configureSession（deactivate→setActive 重新激活）后 tap 产首帧可能需
+ *   0.5~1.5s，bytes 从 0 起步——窗口太短会把正常启动误判为断流（实测 0.5s 时每次
+ *   按下都自愈重启一次，首句还丢 ~0.5s）。1.5s 覆盖正常首帧延迟，仅真断流触发。 */
+const SELF_HEAL_STARTUP_ROUNDS = 75
+/** tap 断流自愈（开录后）：onStart 已投递后的停滞窗口（25 轮 ≈ 0.5s）。
+ *   此时引擎已在产帧，bytes 停滞 0.5s 即真断流，快速静默重启减少漏话。 */
+const SELF_HEAL_ACTIVE_ROUNDS = 25
 
 /**
  * 原生录音器（App-iOS）
@@ -315,6 +320,9 @@ export class StreamPcmRecorder {
     const shRunning = this.bridge.isRunningNow()
     const shStopped = this.bridge.hasStopped()
     if (shRunning && !shStopped && this.selfHealCount < 1) {
+      // 启动期（首帧未到）窗口放宽到 1.5s（iOS 重新激活会话后产首帧可能 0.5~1.5s，
+      // bytes 从 0 起步，短窗口会误判正常启动）；onStart 已投递后用 0.5s 快救真断流。
+      const stallLimit = this.startReported == true ? SELF_HEAL_ACTIVE_ROUNDS : SELF_HEAL_STARTUP_ROUNDS
       const rawBytes = this.bridge.currentRecordedBytes()
       const nowBytes = parseFloat(`${rawBytes}`)
       if (isNaN(nowBytes) || nowBytes < 0) {
@@ -324,7 +332,7 @@ export class StreamPcmRecorder {
         this.stallRounds = 0
       } else {
         this.stallRounds += 1
-        if (this.stallRounds >= SELF_HEAL_STALL_ROUNDS) {
+        if (this.stallRounds >= stallLimit) {
           this.stallRounds = 0
           this.selfHealCount += 1
           console.warn("[PCMRec-UTS] tap 断流自愈：bytes 长时间不涨，静默重启录音 session")
@@ -337,7 +345,11 @@ export class StreamPcmRecorder {
   }
 
   /** onStop 投递：hasStopped 真值判断 + 显式 parseFloat（NSNumber 兜底）。
-   *  幂等（stopReported 守卫）。iOS 桥 Bool 用 `== true` 严格比较恒不成立，必须真值判断。 */
+   *  幂等（stopReported 守卫）。iOS 桥 Bool 用 `== true` 严格比较恒不成立，必须真值判断。
+   *  特殊兜底：曾开录（onStart 已投递）但当前 session 未 started（tap 断流自愈重启后
+   *  首帧未到就松手）——Swift 因 started=false 不置 stopped，hasStopped()=false 不投
+   *  onStop 会让业务层永远卡「语音识别中」。此时必须兜底投 onStop 收尾（文件可能极小，
+   *  但至少退出识别中状态，Documents 兜底推文件还能救回已采内容）。 */
   private deliverStopIfStopped(): void {
     if (this.stopReported == true) {
       console.log("[PCMRec-UTS] deliverStop skipped (already reported)")
@@ -346,8 +358,13 @@ export class StreamPcmRecorder {
     const hasStopped = this.bridge.hasStopped()
     // 注意：iOS 桥 Bool 的 `== true` / `!= true` 都不可用（装箱值），只能真值判断
     if (!hasStopped) {
-      console.log("[PCMRec-UTS] deliverStop skipped (hasStopped falsy)")
-      return
+      if (this.startReported == true) {
+        // 自愈重启后首帧未到即松手：兜底收尾，避免业务层卡「语音识别中」
+        console.warn("[PCMRec-UTS] 兜底投递 onStop（曾开录但重启后未到首帧即松手）")
+      } else {
+        console.log("[PCMRec-UTS] deliverStop skipped (hasStopped falsy)")
+        return
+      }
     }
     this.stopReported = true
     this.stopPolling()

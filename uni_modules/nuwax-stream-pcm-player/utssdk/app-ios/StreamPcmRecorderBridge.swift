@@ -35,6 +35,12 @@ public class StreamPcmRecorderBridge {
     /** 启动窗口截止：start 后 ~3s 内的 interruption 视为会话激活的系统自惹事件，一律忽略
      *  （真机实测：无论 isOtherAudioPlaying 真假，start 后约 1s 必来一次 .began） */
     private var interruptSuppressDeadline: Date?
+    /** 已配成 playAndRecord 并激活过：后续 start 跳过 deactivate / setActive，避免自惹 interruption */
+    private var sessionWarmed = false
+    /** prepareSession 正在空跑 engine，等首帧后停引擎、保留 session */
+    private var priming = false
+    /** IO 已空跑出过首帧：用户按下后的 engine.start 是「第二次」，首帧应立即到达 */
+    private var ioPrimed = false
 
     public init() {}
 
@@ -133,68 +139,18 @@ public class StreamPcmRecorderBridge {
         lock.lock()
         pendingChunks.removeAll()
         errorMessage = ""
+        recordedBytes = 0
         lock.unlock()
         started = false
         stopped = false
+        diagFirstFrameLogged = false
+        priming = false
 
         configureSession()
         addObservers()
-
-        guard AVAudioSession.sharedInstance().isInputAvailable else {
-            lock.lock()
-            errorMessage = "麦克风输入不可用"
-            lock.unlock()
-            NSLog("[PCMRec] isInputAvailable=false，中止 start（避免 inputNode 抛 NSException）")
-            appendDiag("isInputAvailable=false，中止 start")
-            return
-        }
-
-        // 写 uni-app x 的 usr 空间（Documents）而非 NSTemporaryDirectory：uni 的
-        // getFileSystemManager.readFile 对 Swift 的 /private/var/mobile/.../tmp 路径
-        // getRealPath 匹配不上（实测读文件恒失败 → 兜底误报「音频文件为空」），
-        // 而 Documents 是 unifile://usr/ 的物理目录，下游 readFile 一定能读。
-        let docsDir = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
-        filePath = (docsDir ?? NSTemporaryDirectory()) + "/nuwax_voice_record.pcm"
-        do {
-            if FileManager.default.fileExists(atPath: filePath) {
-                try FileManager.default.removeItem(atPath: filePath)
-            }
-            FileManager.default.createFile(atPath: filePath, contents: nil, attributes: nil)
-            fileHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: filePath))
-        } catch {
-            lock.lock()
-            errorMessage = "录音启动失败"
-            lock.unlock()
-            return
-        }
-
-        let engine = AVAudioEngine()
-        self.engine = engine
-        let input = engine.inputNode
-        // 用硬件原生格式挂 tap：iOS 上以 16k Int16 自定义格式 installTap 会抛
-        // "Failed to create tap due to format mismatch"（无隐式 SRC），
-        // 改在 handleTap 里手动重采样到 16kHz mono Int16（线性插值，支持任意采样率比）。
-        let inputFormat = input.inputFormat(forBus: 0)
-        NSLog("[PCMRec] inputFormat sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)")
-        appendDiag("inputFormat sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)")
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.handleTap(buffer)
-        }
-        running = true
-        do {
-            try engine.start()
-            NSLog("[PCMRec] engine.start ok")
-            appendDiag("engine.start ok")
-            // 会话激活后系统会自惹一次 interruption(.began)，抑制窗口内一律忽略
-            interruptSuppressDeadline = Date().addingTimeInterval(3.0)
-        } catch {
-            running = false
-            NSLog("[PCMRec] engine.start FAIL: \(error)")
-            appendDiag("engine.start FAIL: \(error)")
-            lock.lock()
-            errorMessage = "录音启动失败"
-            lock.unlock()
-            stopEngineAndCloseFile()
+        openRecordFile()
+        startEngineAndTap()
+        if !running {
             return
         }
         // 时长固定 600000ms（10 分钟，对齐 UTS 侧默认值与上限）
@@ -206,6 +162,22 @@ public class StreamPcmRecorderBridge {
             RunLoop.main.add(t, forMode: .common)
             durationTimer = t
         }
+    }
+
+    /// 页面进入时预热：bounce 一次 session，并空跑 engine 直到首帧。
+    /// 把「第一次 engine.start 必自惹 interruption、首帧晚 1s」消耗在进页阶段；
+    /// 用户按下时只重新挂 tap，对齐 Android/鸿蒙按下即采。
+    public func prepareSession() {
+        appendDiag("prepareSession")
+        configureSession()
+        addObservers()
+        if ioPrimed || priming || running {
+            appendDiag("prepareSession skip prime (already primed/running)")
+            return
+        }
+        priming = true
+        startEngineAndTap()
+        appendDiag("prepareSession priming engine")
     }
 
     /// 停止录音（松手 / 上层 discard）：收尾但保留已采尾帧，UTS 轮询拉完后回传 onStop
@@ -272,6 +244,22 @@ public class StreamPcmRecorderBridge {
     /// tap 回调（音频渲染线程）：硬件格式 → 16kHz mono Int16，写文件 + 入队（NSLock 保护）
     private func handleTap(_ buffer: AVAudioPCMBuffer) {
         guard running else { return }
+        if priming {
+            priming = false
+            ioPrimed = true
+            appendDiag("prime first frame, io primed")
+            NSLog("[PCMRec] prime first frame, io primed")
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                // 用户若已正式 start（有文件句柄），不要停掉正在录的引擎
+                if self.fileHandle == nil && self.running {
+                    self.running = false
+                    self.started = false
+                    self.stopEngineOnly()
+                }
+            }
+            return
+        }
         let pcm16 = convertToPcm16Mono16k(buffer)
         guard !pcm16.isEmpty else { return }
         let byteCount = pcm16.count * 2
@@ -288,6 +276,7 @@ public class StreamPcmRecorderBridge {
         }
         if !started {
             started = true
+            ioPrimed = true
             NSLog("[PCMRec] first tap frame received")
         }
         lock.unlock()
@@ -353,10 +342,80 @@ public class StreamPcmRecorderBridge {
         }
     }
 
-    private func stopEngineAndCloseFile() {
+    /// 写 uni-app x 的 usr 空间（Documents）而非 NSTemporaryDirectory：uni 的
+    /// getFileSystemManager.readFile 对 Swift 的 /private/var/mobile/.../tmp 路径
+    /// getRealPath 匹配不上（实测读文件恒失败 → 兜底误报「音频文件为空」），
+    /// 而 Documents 是 unifile://usr/ 的物理目录，下游 readFile 一定能读。
+    private func openRecordFile() {
+        if let fh = fileHandle {
+            try? fh.close()
+            fileHandle = nil
+        }
+        let docsDir = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
+        filePath = (docsDir ?? NSTemporaryDirectory()) + "/nuwax_voice_record.pcm"
+        do {
+            if FileManager.default.fileExists(atPath: filePath) {
+                try FileManager.default.removeItem(atPath: filePath)
+            }
+            FileManager.default.createFile(atPath: filePath, contents: nil, attributes: nil)
+            fileHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: filePath))
+        } catch {
+            lock.lock()
+            errorMessage = "录音启动失败"
+            lock.unlock()
+        }
+    }
+
+    /// 创建 AVAudioEngine、挂 tap 并 start。不碰 session、不重置文件。
+    private func startEngineAndTap() {
+        guard AVAudioSession.sharedInstance().isInputAvailable else {
+            lock.lock()
+            errorMessage = "麦克风输入不可用"
+            lock.unlock()
+            NSLog("[PCMRec] isInputAvailable=false，中止 start（避免 inputNode 抛 NSException）")
+            appendDiag("isInputAvailable=false，中止 start")
+            running = false
+            return
+        }
+        let engine = AVAudioEngine()
+        self.engine = engine
+        let input = engine.inputNode
+        // 用硬件原生格式挂 tap：iOS 上以 16k Int16 自定义格式 installTap 会抛
+        // "Failed to create tap due to format mismatch"（无隐式 SRC），
+        // 改在 handleTap 里手动重采样到 16kHz mono Int16。
+        let inputFormat = input.inputFormat(forBus: 0)
+        NSLog("[PCMRec] inputFormat sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)")
+        appendDiag("inputFormat sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)")
+        // 1024 ≈ 21ms @48kHz，比 4096 更快吐出首帧（系统仍可能忽略 hint）
+        input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+            self?.handleTap(buffer)
+        }
+        running = true
+        do {
+            try engine.start()
+            NSLog("[PCMRec] engine.start ok")
+            appendDiag("engine.start ok")
+            interruptSuppressDeadline = Date().addingTimeInterval(3.0)
+        } catch {
+            running = false
+            NSLog("[PCMRec] engine.start FAIL: \(error)")
+            appendDiag("engine.start FAIL: \(error)")
+            lock.lock()
+            errorMessage = "录音启动失败"
+            lock.unlock()
+            stopEngineOnly()
+        }
+    }
+
+    /// 只停引擎、卸 tap；保留文件与 durationTimer
+    private func stopEngineOnly() {
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
+    }
+
+    private func stopEngineAndCloseFile() {
+        stopEngineOnly()
         if let t = durationTimer {
             t.invalidate()
             durationTimer = nil
@@ -367,13 +426,19 @@ public class StreamPcmRecorderBridge {
         }
     }
 
-    /// AVAudioSession：录音与 TTS 播放共存，统一 .playAndRecord（首次配置一次）
+    /// AVAudioSession：录音与 TTS 播放共存，统一 .playAndRecord + mixWithOthers。
+    /// 已是 playAndRecord：什么都不做（连 setActive(true) 都不要）——
+    /// 再次 setActive 也会在部分机型上自惹 interruption，按下后首帧空等 1s。
     private func configureSession() {
         let session = AVAudioSession.sharedInstance()
-        // 必须 setActive(false) 再重配：会话可能已被 App 其他音频激活过，直接改 category 激活时
-        // 输入路由不真正建立 → 永不产帧（已实测 17:21：无 deactivate 时 engine.start ok 但无首帧）。
-        // deactivate 会触发系统 interruption(.began)（自惹中断，与 notify 无关），
-        // 由 handleInterruption 的 isOtherAudioPlaying 守卫忽略。
+        if session.category == .playAndRecord && session.isInputAvailable {
+            sessionWarmed = true
+            NSLog("[PCMRec] configureSession skip (already playAndRecord)")
+            appendDiag("configureSession skip (already playAndRecord)")
+            return
+        }
+        // 冷启动 / 从其他 category 切过来：必须 setActive(false) 再重配，
+        // 否则输入路由不真正建立 → 永不产帧（已实测）。
         do {
             try session.setActive(false)
             NSLog("[PCMRec] deactivate session ok")
@@ -385,7 +450,7 @@ public class StreamPcmRecorderBridge {
         do {
             try session.setCategory(.playAndRecord,
                                     mode: .default,
-                                    options: [.defaultToSpeaker])
+                                    options: [.defaultToSpeaker, .mixWithOthers])
             NSLog("[PCMRec] setCategory(.playAndRecord) ok")
             appendDiag("setCategory(.playAndRecord) ok")
         } catch {
@@ -396,6 +461,7 @@ public class StreamPcmRecorderBridge {
             try session.setActive(true)
             NSLog("[PCMRec] setActive(true) ok")
             appendDiag("setActive(true) ok")
+            sessionWarmed = true
         } catch {
             NSLog("[PCMRec] setActive(true) FAIL: \(error)")
             appendDiag("setActive(true) FAIL: \(error)")
@@ -443,6 +509,8 @@ public class StreamPcmRecorderBridge {
         guard type == .began else { return }
         if let deadline = interruptSuppressDeadline, Date() < deadline {
             appendDiag("interruption began ignored (startup window)")
+            // 只忽略，不要 restartCapture：自惹中断时重挂 engine 会再触发
+            // interruption/routeChange，tap 卡在首帧（~3200B）→ 松手 no_speech。
             return
         }
         interruptSuppressDeadline = nil

@@ -92,14 +92,6 @@ export type NativeRecorderStopCallback = (res: UTSJSONObject | null) => void
 export type NativeRecorderErrorCallback = (err: UTSJSONObject | null) => void
 /** 实时 PCM 帧回调（chunk 为 16kHz mono PCM16 LE 裸字节；主线程回调；一次性全新 ArrayBuffer） */
 export type NativeRecorderFrameCallback = (chunk: ArrayBuffer) => void
-/** tap 断流自愈（启动期）：首帧未到（onStart 未投递）时的停滞窗口（75 轮 ≈ 1.5s）。
- *   iOS 每次 configureSession（deactivate→setActive 重新激活）后 tap 产首帧可能需
- *   0.5~1.5s，bytes 从 0 起步——窗口太短会把正常启动误判为断流（实测 0.5s 时每次
- *   按下都自愈重启一次，首句还丢 ~0.5s）。1.5s 覆盖正常首帧延迟，仅真断流触发。 */
-const SELF_HEAL_STARTUP_ROUNDS = 75
-/** tap 断流自愈（开录后）：onStart 已投递后的停滞窗口（25 轮 ≈ 0.5s）。
- *   此时引擎已在产帧，bytes 停滞 0.5s 即真断流，快速静默重启减少漏话。 */
-const SELF_HEAL_ACTIVE_ROUNDS = 25
 
 /**
  * 原生录音器（App-iOS）
@@ -123,14 +115,12 @@ export class StreamPcmRecorder {
   private stopReported: boolean = false
   /** 是否已回传 onError（幂等） */
   private errorReported: boolean = false
+  /** 本轮是否由业务层显式 stop()（松手 / discard）。
+   *  仅此时才允许「曾开录但 Swift 未置 stopped」的 onStop 兜底；
+   *  轮询中 startReported && !hasStopped 是正常在录，绝不能当松手。 */
+  private userStopRequested: boolean = false
   /** 诊断拉取节拍（每 25 轮 ≈ 500ms 拉一次 Swift 诊断缓冲，绕开 NSLog 不进 App 日志的问题） */
   private diagTick: number = 0
-  /** tap 断流自愈：已静默重启次数（每轮录音最多 1 次；第二次 start 已验证必成功） */
-  private selfHealCount: number = 0
-  /** tap 断流自愈：上次轮询记录的已采字节数（-1 表示未初始化） */
-  private lastRecordedBytes: number = -1
-  /** tap 断流自愈：bytes 持续不增长的轮数（20ms/轮） */
-  private stallRounds: number = 0
 
   onStart(callback: NativeRecorderStartCallback | null): void {
     this.onStartCb = callback
@@ -152,12 +142,12 @@ export class StreamPcmRecorder {
     this.onFrameCb = callback
   }
 
-  isRecording(): boolean {
-    const v = this.bridge.isRecording()
-    if (v) {
-      return true
-    }
-    return false
+  /**
+   * 进入会话页时预热：配好 playAndRecord，并空跑一次 engine 打掉自惹 interruption。
+   * 用户按下后只重新挂 tap，首帧不再空等 1s、也不会被自愈重启切掉开头。
+   */
+  prepareSession(): void {
+    this.bridge.prepareSession()
   }
 
   /**
@@ -174,10 +164,8 @@ export class StreamPcmRecorder {
     this.startReported = false
     this.stopReported = false
     this.errorReported = false
+    this.userStopRequested = false
     this.diagTick = 0
-    this.selfHealCount = 0
-    this.lastRecordedBytes = -1
-    this.stallRounds = 0
     this.bridge.start()
     console.log("[PCMRec-UTS] bridge.start() returned")
     const d0 = this.bridge.takeDiag()
@@ -192,6 +180,7 @@ export class StreamPcmRecorder {
 
   /** 停止录音（松手）：桥内收尾后先直接投递 onStop（不依赖 pollOnce 帧循环可能阻塞），再补拉尾帧 */
   stop(): void {
+    this.userStopRequested = true
     this.bridge.stop()
     console.log(`[PCMRec-UTS] stop() hs=${this.bridge.hasStopped()} polling=${this.polling} stopCb=${this.onStopCb != null}`)
     // stop 后轮询即将停止，先拉一次诊断（含 finishInternal 的 running/started 状态），
@@ -269,7 +258,9 @@ export class StreamPcmRecorder {
       }
       console.log(`[PCMRec-UTS] poll started=${this.bridge.hasStarted()} running=${this.bridge.isRunningNow()} startRpt=${this.startReported} errRpt=${this.errorReported}`)
     }
-    // onStart：引擎启动且首帧已到（局部变量 + 拆开判断，规避 UTS 内联求值差异）
+    // onStart：必须等首帧（hasStarted）。引擎 running 不等于已在采音——
+    // iOS 自惹 interruption 期间 engine.start ok 但 tap 可能暂停，过早 onStart
+    // 会让自愈窗口切到 0.5s，把正常抖动误判成断流并 restartCapture → 只剩 100ms 音频。
     if (this.startReported == false) {
       const hs = this.bridge.hasStarted()
       if (hs) {
@@ -309,60 +300,30 @@ export class StreamPcmRecorder {
       }
       hasChunk = this.bridge.hasPendingChunk()
     }
-    // —— tap 断流自愈：running（engine 已启动）但长时间不产帧 = AVAudioEngine tap 静默断流
-    //   （无错误；iOS 会话激活抖动高发，实测症状①首次 start 空转 3s 等业务层看门狗）：
-    //   ① 首帧未到：started=false、bytes=0 停摆 → onStart 永不投递
-    //   ② 首帧后断流：startReported=true、bytes 停在首帧量
-    //   复刻「第二次 start 已验证成功」路径：静默重启一次，业务层/H5 无感知
-    //   （场景② startReported 保持 true 不重复投递 onStart；场景①重启后首帧到会正常投递 onStart）。
-    //   !hasStopped() 守卫：stop() 里也会同步调一次 pollOnce，此时 stopped=true，
-    //   不能再触发自愈（否则松手后重启出无人停的新 session）。
-    const shRunning = this.bridge.isRunningNow()
-    const shStopped = this.bridge.hasStopped()
-    if (shRunning && !shStopped && this.selfHealCount < 1) {
-      // 启动期（首帧未到）窗口放宽到 1.5s（iOS 重新激活会话后产首帧可能 0.5~1.5s，
-      // bytes 从 0 起步，短窗口会误判正常启动）；onStart 已投递后用 0.5s 快救真断流。
-      const stallLimit = this.startReported == true ? SELF_HEAL_ACTIVE_ROUNDS : SELF_HEAL_STARTUP_ROUNDS
-      const rawBytes = this.bridge.currentRecordedBytes()
-      const nowBytes = parseFloat(`${rawBytes}`)
-      if (isNaN(nowBytes) || nowBytes < 0) {
-        this.stallRounds = 0
-      } else if (nowBytes != this.lastRecordedBytes) {
-        this.lastRecordedBytes = nowBytes
-        this.stallRounds = 0
-      } else {
-        this.stallRounds += 1
-        if (this.stallRounds >= stallLimit) {
-          this.stallRounds = 0
-          this.selfHealCount += 1
-          console.warn("[PCMRec-UTS] tap 断流自愈：bytes 长时间不涨，静默重启录音 session")
-          this.silentRestart()
-        }
-      }
-    }
-    // onStop：桥已停止（曾真正开录）。同样用真值判断（iOS 桥 Bool == true 恒不成立）。
+    // 不再做 tap 断流自愈：UTS 里 `inHoldoff != true` 对比较结果恒成立，
+    // 自愈会在自惹 interruption 期间 restartCapture，切掉开头 1~2s → 丢字 / loading。
+    // 真死流交给业务层 3s 启动看门狗。Android/鸿蒙无此逻辑。
     this.deliverStopIfStopped()
   }
 
   /** onStop 投递：hasStopped 真值判断 + 显式 parseFloat（NSNumber 兜底）。
    *  幂等（stopReported 守卫）。iOS 桥 Bool 用 `== true` 严格比较恒不成立，必须真值判断。
-   *  特殊兜底：曾开录（onStart 已投递）但当前 session 未 started（tap 断流自愈重启后
-   *  首帧未到就松手）——Swift 因 started=false 不置 stopped，hasStopped()=false 不投
-   *  onStop 会让业务层永远卡「语音识别中」。此时必须兜底投 onStop 收尾（文件可能极小，
-   *  但至少退出识别中状态，Documents 兜底推文件还能救回已采内容）。 */
+   *  特殊兜底（必须同时 userStopRequested）：曾开录（onStart 已投递）但当前 session
+   *  未 started（tap 断流自愈重启后首帧未到就松手）——Swift 因 started=false 不置
+   *  stopped，hasStopped()=false 不投 onStop 会让业务层永远卡「语音识别中」。
+   *  切勿把轮询中的「startReported && !hasStopped」（正常在录）当成松手：
+   *  首帧一到就会立刻 onStop，ASR 只收到 ~100ms 空音频 → 马上 no_speech（iOS 真机已复现）。 */
   private deliverStopIfStopped(): void {
     if (this.stopReported == true) {
-      console.log("[PCMRec-UTS] deliverStop skipped (already reported)")
       return
     }
     const hasStopped = this.bridge.hasStopped()
     // 注意：iOS 桥 Bool 的 `== true` / `!= true` 都不可用（装箱值），只能真值判断
     if (!hasStopped) {
-      if (this.startReported == true) {
+      if (this.userStopRequested == true && this.startReported == true) {
         // 自愈重启后首帧未到即松手：兜底收尾，避免业务层卡「语音识别中」
         console.warn("[PCMRec-UTS] 兜底投递 onStop（曾开录但重启后未到首帧即松手）")
       } else {
-        console.log("[PCMRec-UTS] deliverStop skipped (hasStopped falsy)")
         return
       }
     }
@@ -400,25 +361,5 @@ export class StreamPcmRecorder {
       this.pollTimer = 0
     }
     this.polling = false
-  }
-
-  /**
-   * 静默重启录音 session（tap 断流自愈）：桥内 stop + start 同步执行，
-   * 同一轮 pollOnce 内完成，deliverStopIfStopped 看不到中间的 stopped=true。
-   * 不投递 onStart/onStop，业务层/H5 无感知；startReported 保持 true。
-   */
-  private silentRestart(): void {
-    this.bridge.stop()
-    const d1 = this.bridge.takeDiag()
-    if (d1.length > 0) {
-      console.log("[PCMRec-DIAG] " + d1)
-    }
-    this.lastRecordedBytes = -1
-    this.stallRounds = 0
-    this.bridge.start()
-    const d2 = this.bridge.takeDiag()
-    if (d2.length > 0) {
-      console.log("[PCMRec-DIAG] " + d2)
-    }
   }
 }

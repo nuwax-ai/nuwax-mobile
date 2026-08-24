@@ -17,7 +17,7 @@ export UNIAPPX_IPATYPE="${UNIAPPX_IPATYPE:-1}"
 
 DEVICE_ID="${DEVICE_ID:-}"
 if [[ -z "$DEVICE_ID" ]]; then
-  DEVICE_ID="$(xcrun xctrace list devices 2>/dev/null | awk '/LLD|iPhone/{print}' | rg -v 'Simulator|——' | head -1 | sed -E 's/.*\(([^)]+)\).*/\1/' || true)"
+  DEVICE_ID="$(xcrun xctrace list devices 2>/dev/null | awk '/LLD|iPhone/{print}' | grep -Ev 'Simulator|——' | head -1 | sed -E 's/.*\(([^)]+)\).*/\1/' || true)"
 fi
 if [[ -z "$DEVICE_ID" ]]; then
   echo "✗ 未找到真机，请 USB 连接并信任，或设置 DEVICE_ID=<UDID>" >&2

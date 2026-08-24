@@ -91,6 +91,68 @@
 	let appKeyboardHeightListenerId: number = 0
 	/** 最近一次键盘高度：webview 未就绪时随注入轮询补发（默认 0 = 键盘收起） */
 	let latestInjectedKeyboardHeight: number = 0
+	/** 底部手势条/导航条高度（safeAreaInsets.bottom）：onKeyboardHeightChange 兜底值归一化为完整 IME 时使用 */
+	let latestInjectedSafeAreaBottom: number = 0
+
+	/**
+	 * 直接读 WindowInsets 的 IME 高度（device px → css px）。
+	 * 本环境实测：uni.onKeyboardHeightChange 恒 0、H5 innerHeight/visualViewport 不随键盘变化——
+	 * 键盘以覆盖层形式出现且不被任何 resize 反映，WindowInsets 的 IME insets 在 API 30+ 上
+	 * 与 softInputMode 无关地派发，是唯一可靠读数。
+	 */
+	function readAndroidImeHeight(): number {
+		try {
+			const activity = UTSAndroid.getUniActivity()
+			if (activity == null) {
+				return 0
+			}
+			const win = activity.getWindow()
+			if (win == null) {
+				return 0
+			}
+			const decor = win.getDecorView()
+			if (decor == null) {
+				return 0
+			}
+			const insets = decor.getRootWindowInsets()
+			if (insets == null) {
+				return 0
+			}
+			// WindowInsets.Type.ime() = 1 << 3 = 8（API 30+）；返回值是 Insets，取 bottom 字段
+			const ime = insets.getInsets(8)
+			if (ime == null) {
+				return 0
+			}
+			const px = ime.bottom
+			if (px <= 0) {
+				return 0
+			}
+			// device px → css px（与 uni-app x 键盘监听一致的换算）
+			const css = UTSAndroid.devicePX2px(px)
+			return css > 0 ? css : 0
+		} catch (_eIme) {
+			// ignore
+		}
+		return 0
+	}
+
+	/**
+	 * 读取 Android 底部手势条/导航条高度（safe-area-inset-bottom）。
+	 * 全屏 webview 下 H5 无法可靠读取（env() 通常为 0），由原生侧读取并注入。
+	 */
+	function readAndroidSafeAreaBottom(): number {
+		let bottom = 0
+		try {
+			const sysInfo = uni.getSystemInfoSync()
+			const safeInset = sysInfo.safeAreaInsets
+			if (safeInset != null && safeInset.bottom != null) {
+				bottom = safeInset.bottom as number
+			}
+		} catch (_eInset) {
+			// ignore
+		}
+		return bottom
+	}
 
 	/**
 	 * 幂等注入脚本：uni.webview JSSDK（网页 → 原生 postMessage 桥）+ ticket cookie
@@ -104,13 +166,85 @@
 	}
 
 	/**
-	 * 生成键盘高度注入脚本：写全局 + 派发 CustomEvent（幂等，事件注入 / 注入轮询两路复用）。
-	 * H5 运行时不会派发 keyboardheightchange，内嵌页的 keyboardHeight 只能由原生侧桥接进来，
-	 * H5 侧 chat-input-phone 监听 'nuwax:keyboardHeightChange' 后顶起底部输入区。
+	 * 生成键盘高度注入脚本（字符串拼接，避免 UTS 模板字符串误解析 {}）。
+	 * @param withDomFix iOS/鸿蒙为 true 时：安装 focus 跟手抬升 + 用桥接终值校正；
+	 *   桥接轮询传 false（仍安装 focus 预测逻辑，但不按终值改 cover，避免刷屏）。
 	 */
-	function buildKeyboardHeightInjectCode(h: number): string {
+	function buildKeyboardHeightInjectCode(
+		h: number,
+		safeBottom: number,
+		withDomFix: boolean,
+	): string {
 		const heightNum = `${Math.round(h)}`
-		return `(function(){try{window.__nuwaxKeyboardHeight=${heightNum};window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:${heightNum}}}));}catch(e){}})()`
+		const safeBottomNum = `${Math.round(safeBottom)}`
+		let cachedLastH = 0
+		try {
+			const raw = uni.getStorageSync("NUWAX_KB_LAST_H")
+			if (raw != null) {
+				const n = parseFloat(`${raw}`)
+				if (!isNaN(n) && n > 0) {
+					cachedLastH = n
+				}
+			}
+		} catch (_eCache) {
+			// ignore
+		}
+		if (cachedLastH <= 0 && latestInjectedKeyboardHeight > 0) {
+			cachedLastH = latestInjectedKeyboardHeight
+		}
+		const cachedLastNum = `${Math.round(cachedLastH)}`
+		let platform = "unknown"
+		// #ifdef APP-ANDROID
+		platform = "android"
+		// #endif
+		// #ifdef APP-IOS
+		platform = "ios"
+		// #endif
+		// #ifdef APP-HARMONY
+		platform = "harmony"
+		// #endif
+
+		// 基础：写全局 + 派发事件
+		let code =
+			"(function(){try{window.__nuwaxKeyboardHeight=" +
+			heightNum +
+			";window.__nuwaxSafeAreaBottom=" +
+			safeBottomNum +
+			";window.__nuwaxKbPlatform='" +
+			platform +
+			"';window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:" +
+			heightNum +
+			",safeAreaBottom:" +
+			safeBottomNum +
+			",platform:'" +
+			platform +
+			"'}}));}catch(e){}"
+
+		// #ifdef APP-IOS || APP-HARMONY
+		// 首次：无缓存时系统可能先 pan（整页跟键盘），桥接终值再垫 cover →「底部晚出现」。
+		// 再次：有 LastH，focusin 立刻抬 cover+锁滚，不再依赖系统 pan。
+		// 此处：尽早恢复 LastH；桥接终值若 cover 仍为 0 则瞬间校正（禁止晚到的 0→h 动画）。
+		code =
+			code +
+			"try{window.__nuwaxKbCoverTrans='height 0.25s cubic-bezier(0.2,0.9,0.2,1)';try{if(!(window.__nuwaxKbLastH>0)){var __ls=localStorage.getItem('__nuwaxKbLastH');if(__ls){var __ln=parseFloat(__ls);if(!isNaN(__ln)&&__ln>0)window.__nuwaxKbLastH=__ln;}}}catch(_ls){}if(!(window.__nuwaxKbLastH>0)&&" +
+			cachedLastNum +
+			">0){window.__nuwaxKbLastH=" +
+			cachedLastNum +
+			";}window.__nuwaxKbDefaultH=Math.max(300,Math.round((window.innerHeight||700)*0.475));window.__nuwaxKbPersistLast=function(h){try{if(h>0){window.__nuwaxKbLastH=h;localStorage.setItem('__nuwaxKbLastH',''+Math.round(h));}}catch(_p){}};window.__nuwaxKbApplyCover=function(h,anim){try{var covers=document.querySelectorAll('.keyboard-cover');for(var i=0;i<covers.length;i++){covers[i].style.transition=anim?window.__nuwaxKbCoverTrans:'none';covers[i].style.setProperty('height',(h>0?h:0)+'px','important');}}catch(_a){}};window.__nuwaxKbCoverCur=function(){try{var c=document.querySelector('.keyboard-cover');return c?c.getBoundingClientRect().height:0;}catch(_c){return 0;}};window.__nuwaxKbLockDoc=function(){try{var html=document.documentElement;var body=document.body;if(html)html.style.overflow='hidden';if(body)body.style.overflow='hidden';if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();}catch(_l){}};window.__nuwaxKbDispatch=function(h){try{window.__nuwaxKeyboardHeight=h;window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:h,safeAreaBottom:window.__nuwaxSafeAreaBottom||0,platform:window.__nuwaxKbPlatform||'ios'}}));}catch(_d){}};window.__nuwaxKbUnlockPage=function(){try{if(window.__nuwaxKbUnlockTimer){clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=0;}window.__nuwaxKbFocusLock=false;var html=document.documentElement;var body=document.body;if(html){html.style.overflow='';html.style.height='';html.style.position='';}if(body){body.style.overflow='';body.style.position='';body.style.width='';body.style.top='';body.style.left='';body.style.height='';body.style.bottom='';}var covers=document.querySelectorAll('.keyboard-cover');for(var i=0;i<covers.length;i++){covers[i].style.transition='';covers[i].style.removeProperty('height');}var navs=document.querySelectorAll('.layout-fixed');for(var j=0;j<navs.length;j++){navs[j].style.transform='';navs[j].style.top='';}try{window.scrollTo(0,0);}catch(_s){}try{window.dispatchEvent(new Event('resize'));}catch(_r){}}catch(_u){}};window.__nuwaxKbPredictOpen=function(){try{if(window.__nuwaxKbUnlockTimer){clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=0;}window.__nuwaxKbFocusLock=true;var target=window.__nuwaxKbLastH>0?window.__nuwaxKbLastH:window.__nuwaxKbDefaultH;window.__nuwaxKbDomH=target;window.__nuwaxKbLockDoc();window.__nuwaxKbApplyCover(target,true);window.__nuwaxKbDispatch(target);var n=0;var tick=function(){if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();if(++n<30)requestAnimationFrame(tick);};requestAnimationFrame(tick);}catch(_o){}};window.__nuwaxKbPredictClose=function(){try{window.__nuwaxKbFocusLock=false;window.__nuwaxKbDomH=0;window.__nuwaxKbApplyCover(0,true);window.__nuwaxKbDispatch(0);if(window.__nuwaxKbUnlockTimer)clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=setTimeout(function(){window.__nuwaxKbUnlockTimer=0;if((window.__nuwaxKeyboardHeight||0)>0)return;if(window.__nuwaxKbUnlockPage)window.__nuwaxKbUnlockPage();},280);}catch(_c){}};if(!window.__nuwaxKbLockInstalled){window.__nuwaxKbLockInstalled=true;window.__nuwaxKbLockScroll=function(){if((window.__nuwaxKeyboardHeight||0)<=0&&window.__nuwaxKbFocusLock!=true)return;try{if(window.scrollY)window.scrollTo(0,0);var de=document.documentElement;if(de)de.scrollTop=0;var b=document.body;if(b)b.scrollTop=0;}catch(_l){}};window.addEventListener('scroll',window.__nuwaxKbLockScroll,true);if(window.visualViewport){window.visualViewport.addEventListener('scroll',window.__nuwaxKbLockScroll);window.visualViewport.addEventListener('resize',window.__nuwaxKbLockScroll);}document.addEventListener('focusin',function(ev){try{var t=ev&&ev.target;var tag=t&&t.tagName?(''+t.tagName).toLowerCase():'';if(tag!=='textarea'&&tag!=='input')return;if(window.__nuwaxKbPredictOpen)window.__nuwaxKbPredictOpen();}catch(_f){}},true);document.addEventListener('focusout',function(){try{setTimeout(function(){var a=document.activeElement;var tag=a&&a.tagName?(''+a.tagName).toLowerCase():'';if(tag==='textarea'||tag==='input')return;if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();},30);}catch(_o){}},true);}}catch(_inst){}"
+
+		if (withDomFix == true) {
+			// 终值校正：已跟手则微调；cover 仍为 0 说明首次未预测成功——瞬间贴齐，禁止晚到动画
+			code =
+				code +
+				"try{var __h=" +
+				heightNum +
+				";var __plat='" +
+				platform +
+				"';if(__h>0){if(window.__nuwaxKbPersistLast)window.__nuwaxKbPersistLast(__h);else window.__nuwaxKbLastH=__h;}if(window.__nuwaxKbDomH===__h){try{if(__h>0){window.__nuwaxKbLockDoc();if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();}else if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();}catch(_r){}}else{window.__nuwaxKbDomH=__h;if(__h>0){if(window.__nuwaxKbUnlockTimer){clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=0;}window.__nuwaxKbFocusLock=true;window.__nuwaxKbLockDoc();var cur=window.__nuwaxKbCoverCur?window.__nuwaxKbCoverCur():0;var needAnim=cur>__h*0.2&&cur<__h*0.9;window.__nuwaxKbApplyCover(__h,needAnim);var navs=document.querySelectorAll('.layout-fixed');for(var j=0;j<navs.length;j++){navs[j].style.transform='';navs[j].style.top='0px';}var n=0;var tick=function(){if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();if(++n<20)requestAnimationFrame(tick);};requestAnimationFrame(tick);}else{if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();}if(window.__nuwaxKbLastDiagH!==__h){window.__nuwaxKbLastDiagH=__h;var sy=window.scrollY||0;var vv=window.visualViewport;var vvTop=vv&&vv.offsetTop!=null?vv.offsetTop:0;var nav=document.querySelector('.layout-fixed');var navTop=nav?nav.getBoundingClientRect().top:0;var curH=window.__nuwaxKbCoverCur?window.__nuwaxKbCoverCur():0;var payload={type:'kb-diag',tag:'inject-dom',platform:__plat,injH:__h,coverH:(__h>0?__h:0),coverCur:Math.round(curH),navOff:0,vvTop:vvTop,navTop:navTop,scrollY:sy,pan:false,mode:'predict-cover',embedded:true};if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:payload});}else if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:payload});}}}}catch(e2){}"
+		}
+		// #endif
+		code = code + "})()"
+		return code
 	}
 
 	/**
@@ -145,7 +279,7 @@
 		try {
 			// 注入轮询顺带补发键盘高度：@load 前键盘已弹起、事件早于 webview 就绪时，
 			// 高度先缓存在 latestInjectedKeyboardHeight，随桥脚本一起落到 H5。
-			ctx.evalJS(code + buildKeyboardHeightInjectCode(latestInjectedKeyboardHeight))
+			ctx.evalJS(code + buildKeyboardHeightInjectCode(latestInjectedKeyboardHeight, latestInjectedSafeAreaBottom, false))
 		} catch (e) {
 			return false
 		}
@@ -210,50 +344,165 @@
 		}
 	}
 
-	/**
-	 * 原生侧键盘高度变化 → 注入内嵌 H5（写 window.__nuwaxKeyboardHeight + CustomEvent）。
-	 * H5 运行时无 keyboardheightchange 事件，此桥是内嵌页 keyboardHeight 的唯一来源。
-	 * H5 侧已随布局视口收缩自动抬升输入区（index.html interactive-widget=resizes-content
-	 * + App.uvue --vh 跟随收缩），注入高度主要作兜底：仅老 WebView 视口不收缩时
-	 * chat-input-phone 才用 keyboard-cover 顶起；同时键盘事件顺带重放主桥脚本（isAppWebView 标记）。
-	 */
-	function onAppKeyboardHeightChangeForWebView(res: any): void {
-		let h = 0
-		try {
-			const obj = res as UTSJSONObject
-			const raw = obj["height"]
-			if (raw != null) {
-				const n = parseFloat(`${raw}`)
-				if (!isNaN(n) && n > 0) {
-					h = n
-				}
-			}
-		} catch (_eObj) {
-			// ignore
-		}
-		// webview 全屏铺满后内容底边含手势条区域：onKeyboardHeightChange 高度是 IME 减去底部
-		// 安全区（手势条）后的值，差一个 safeAreaInsets.bottom，补上输入框才完全露出键盘
-		//（内嵌 H5 的 env(safe-area-inset-bottom) 在全屏 webview 下为 0，无法自行补偿）。
-		// #ifdef APP-ANDROID || APP-HARMONY
-		try {
-			const sysInfo = uni.getSystemInfoSync()
-			const safeInset = sysInfo.safeAreaInsets
-			if (safeInset != null && safeInset.bottom != null) {
-				h = h + (safeInset.bottom as number)
-			}
-		} catch (_eInset) {
-			// ignore
-		}
-		// #endif
+	/** 把键盘高度注入内嵌 H5（桥脚本 + 高度），事件回调与 IME 轮询复用 */
+	function injectKeyboardHeightToH5(h: number): void {
 		latestInjectedKeyboardHeight = h
-		console.log("[kb-bridge] reported keyboard height =", h)
+		const injectLog =
+			"[kb-bridge] inject H5 h=" +
+			`${Math.round(h)}` +
+			" safeBottom=" +
+			`${Math.round(latestInjectedSafeAreaBottom)}`
+		console.log(injectLog)
 		// 键盘高度可成功注入说明 webview 上下文可用：前置重放桥脚本（幂等），
 		// 兜底 @load 注入失败/偏晚导致 isAppWebView 未置位——导航栏 fixed 与文档滚动锁都依赖它。
 		// 不依赖 ACCESS_TOKEN 为空时也照常注入键盘高度。
 		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
 		const token = tokenRaw != null ? `${tokenRaw}` : ""
 		const bridgeCode = token.length > 0 ? buildBridgeCode(JSON.stringify(token)) : ""
-		evalBridgeJS(bridgeCode + buildKeyboardHeightInjectCode(h))
+		evalBridgeJS(bridgeCode + buildKeyboardHeightInjectCode(h, latestInjectedSafeAreaBottom, true))
+	}
+
+	/** IME 高度短轮询（仅 Android 有实际逻辑；函数本身各端都声明，避免嵌套 ifdef 裁掉定义后闭包仍引用） */
+	let imePollTimer: number = 0
+	let imePollCount: number = 0
+	let imePollMax: number = 0
+	function pollImeHeightOnce(): void {
+		// #ifdef APP-ANDROID
+		try {
+			const v = readAndroidImeHeight()
+			if (v > imePollMax) {
+				imePollMax = v
+				injectKeyboardHeightToH5(v)
+			}
+			imePollCount++
+			if (imePollCount < 5 && v > 0) {
+				imePollTimer = setTimeout((): void => {
+					pollImeHeightOnce()
+				}, 100) as number
+			} else {
+				imePollTimer = 0
+				imePollCount = 0
+				imePollMax = 0
+			}
+		} catch (_ePoll) {
+			imePollTimer = 0
+			imePollCount = 0
+			imePollMax = 0
+		}
+		// #endif
+	}
+
+	/**
+	 * 原生侧键盘高度变化 → 注入内嵌 H5（写 window.__nuwaxKeyboardHeight + CustomEvent）。
+	 * H5 运行时无 keyboardheightchange 事件，此桥是内嵌页 keyboardHeight 的唯一来源。
+	 * Android：WindowInsets 直读完整 IME；iOS / 鸿蒙：用 onKeyboardHeightChange 高度原样注入。
+	 * H5 侧 chat-input-phone 用 keyboard-cover 顶起输入区，避免系统整页 pan 把固定导航栏顶出屏。
+	 */
+	function onAppKeyboardHeightChangeForWebView(res: any): void {
+		let h = 0
+		let rawFromEvent = -1
+		let usedImeRead = false
+		let imeCssLog = -1
+		// #ifdef APP-ANDROID
+		// 优先：WindowInsets 直接读 IME 高度（完整 IME，权威读数）
+		try {
+			const imeCss = readAndroidImeHeight()
+			imeCssLog = imeCss
+			if (imeCss > 0) {
+				h = imeCss
+				usedImeRead = true
+				// 键盘动画期间取值可能偏小：短轮询取动画结束后的完整 IME 高
+				imePollMax = imeCss
+				imePollCount = 0
+				if (imePollTimer == 0) {
+					imePollTimer = setTimeout((): void => {
+						pollImeHeightOnce()
+					}, 100) as number
+				}
+			}
+		} catch (_eIme) {
+			// ignore
+		}
+		// #endif
+		if (h <= 0) {
+			// Android 兜底 / iOS / 鸿蒙：onKeyboardHeightChange
+			try {
+				const obj = res as UTSJSONObject
+				const raw = obj["height"]
+				if (raw != null) {
+					const n = parseFloat(`${raw}`)
+					if (!isNaN(n)) {
+						rawFromEvent = n
+						if (n > 0) {
+							h = n
+						}
+					}
+				}
+			} catch (_eObj) {
+				// ignore
+			}
+		}
+		// #ifdef APP-ANDROID
+		// 非 IME 直读路径（onKeyboardHeightChange 兜底）：高度不含底部安全区，补手势条
+		if (!usedImeRead) {
+			try {
+				const sysInfo = uni.getSystemInfoSync()
+				const safeInset = sysInfo.safeAreaInsets
+				if (safeInset != null && safeInset.bottom != null) {
+					const safeBottom = safeInset.bottom as number
+					latestInjectedSafeAreaBottom = safeBottom
+					h = h + safeBottom
+				}
+			} catch (_eInset) {
+				// ignore
+			}
+		}
+		// #endif
+		// 诊断日志：先拼成单字符串再 log，避免 UTS 给 console.log 插 sourceMap 参数时拆坏多行/尾逗号
+		let winH = -1
+		let scrH = -1
+		let safeBottomLog = latestInjectedSafeAreaBottom
+		try {
+			const sysInfo = uni.getSystemInfoSync()
+			const safeInset = sysInfo.safeAreaInsets
+			if (safeInset != null && safeInset.bottom != null) {
+				safeBottomLog = safeInset.bottom as number
+				// iOS/鸿蒙也记下 safeBottom，便于对照；不叠加进 h（避免双重垫高）
+				latestInjectedSafeAreaBottom = safeBottomLog
+			}
+			if (sysInfo.windowHeight != null) {
+				winH = sysInfo.windowHeight as number
+			}
+			if (sysInfo.screenHeight != null) {
+				scrH = sysInfo.screenHeight as number
+			}
+		} catch (_eSys) {
+			// ignore
+		}
+		const kbLog =
+			"[kb-bridge] rawEvent=" +
+			`${rawFromEvent}` +
+			" imeCss=" +
+			`${imeCssLog}` +
+			" usedIme=" +
+			`${usedImeRead}` +
+			" h=" +
+			`${Math.round(h)}` +
+			" safeBottom=" +
+			`${Math.round(safeBottomLog)}` +
+			" windowH=" +
+			`${winH}` +
+			" screenH=" +
+			`${scrH}`
+		console.log(kbLog)
+		if (h > 0) {
+			try {
+				uni.setStorageSync("NUWAX_KB_LAST_H", Math.round(h))
+			} catch (_eStore) {
+				// ignore
+			}
+		}
+		injectKeyboardHeightToH5(h)
 	}
 
 	function jsonStringifyForBridge(obj: UTSJSONObject): string {
@@ -1210,6 +1459,8 @@
 			}
 			// 开录前停掉正在播的 TTS，避免抢录音音频焦点（录到弱音 → 转写空）
 			stopAllSpeechPlayback()
+			// 与 recorder.start 并行预热 ASR WS（不必等 onStart/首帧），缩短 VAD 开口后的 asr_ready 等待
+			asrWebSocketClient.preheatConnect()
 			try {
 				const recorder = ensureNativeRecorder()
 				// 流式 ASR 需 16kHz mono PCM（asrWebSocketClient 硬编码 sample_rate=16000 / 20ms 帧）。
@@ -1254,6 +1505,15 @@
 			evalBridgeJS(
 				`window.__onNativeRecordPermission && window.__onNativeRecordPermission(${jsonStringifyForBridge(payload)})`,
 			)
+			// #ifdef APP-IOS
+			if (result.granted == true) {
+				try {
+					ensureNativeRecorder().prepareSession()
+				} catch (_eWarmPerm) {
+					// ignore
+				}
+			}
+			// #endif
 		})
 	}
 
@@ -1882,6 +2142,44 @@
 			appWebViewPopupOpen = action == "open"
 			return
 		}
+		if (type == "kb-diag") {
+			// H5 键盘/视口诊断回传：先拼单字符串再 log，避免 UTS sourceMap 拆坏多行 console.log
+			const diagLog =
+				"[kb-diag][native] tag=" +
+				`${msg["tag"]}` +
+				" platform=" +
+				`${msg["platform"]}` +
+				" injH=" +
+				`${msg["injH"]}` +
+				" coverH=" +
+				`${msg["coverH"]}` +
+				" navOff=" +
+				`${msg["navOff"]}` +
+				" pan=" +
+				`${msg["pan"]}` +
+				" mode=" +
+				`${msg["mode"]}` +
+				" navTop=" +
+				`${msg["navTop"]}` +
+				" shrink=" +
+				`${msg["shrink"]}` +
+				" coverExtra=" +
+				`${msg["coverExtra"]}` +
+				" vvTop=" +
+				`${msg["vvTop"]}` +
+				" vvH=" +
+				`${msg["vvH"]}` +
+				" innerH=" +
+				`${msg["innerH"]}` +
+				" scrollY=" +
+				`${msg["scrollY"]}` +
+				" locked=" +
+				`${msg["locked"]}` +
+				" embedded=" +
+				`${msg["embedded"]}`
+			console.log(diagLog)
+			return
+		}
 		if (type == "tts") {
 			const action = `${msg["action"]}`
 			if (action == "begin") {
@@ -1989,13 +2287,15 @@
 		// 尽早复位 webview textZoom：webview 挂载后立刻生效，避免 H5 首帧以放大字号渲染
 		fixAppWebviewTextZoom()
 		// 键盘高度桥：系统键盘高度 → 内嵌 H5（幂等注册，onUnmounted 注销）
-		// Android / 鸿蒙：键盘高度与 webview 内容底边对齐，供 H5 显式高度兜底（鸿蒙 visualViewport 可能不收缩）。
-		// iOS 的 onKeyboardHeightChange 值语义不同，保持现状不动。
-		// #ifdef APP-ANDROID || APP-HARMONY
+		// Android / iOS / 鸿蒙均注入：H5 keyboard-cover 抬升输入区，避免系统 pan 把固定导航顶出屏。
+		// #ifdef APP-ANDROID
+		// 先算一次底部手势条高度，随注入轮询落到 H5（@load 前键盘已弹起时也带得上）
+		latestInjectedSafeAreaBottom = readAndroidSafeAreaBottom()
+		// #endif
 		if (appKeyboardHeightListenerId == 0) {
 			appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChangeForWebView)
+			console.log("[kb-bridge] onKeyboardHeightChange registered (android/ios/harmony)")
 		}
-		// #endif
 	})
 	// #endif
 
@@ -2014,6 +2314,14 @@
 		// 从原生 OpenUI 预览返回：把暂存续作注入内嵌 H5（须在 callChatMethod 之前，
 		// App 壳无原生 chat 组件，triggerResume 对内嵌场景无效）
 		deliverPendingOpenUiResumeToH5()
+		// #endif
+		// #ifdef APP-IOS
+		// 预热 AVAudioSession：把冷启动 deactivate/自惹中断提前打完，按下后只 start engine
+		try {
+			ensureNativeRecorder().prepareSession()
+		} catch (_eWarm) {
+			// ignore
+		}
 		// #endif
         // #ifndef MP-WEIXIN
         callChatMethod("triggerResume")
@@ -2047,8 +2355,7 @@
 			clearInterval(appWebViewBridgeTimer)
 			appWebViewBridgeTimer = 0
 		}
-		// 注销键盘高度桥监听（与 onLoad 注册的 APP-ANDROID || APP-HARMONY 条件对齐）
-		// #ifdef APP-ANDROID || APP-HARMONY
+		// 注销键盘高度桥监听（Android / iOS / 鸿蒙均在 onLoad 注册）
 		if (appKeyboardHeightListenerId != 0) {
 			try {
 				uni.offKeyboardHeightChange(appKeyboardHeightListenerId)
@@ -2057,7 +2364,11 @@
 			}
 			appKeyboardHeightListenerId = 0
 		}
-		// #endif
+		// 停掉 IME 高度短轮询（变量各端均有；仅 Android 会真正启动）
+		if (imePollTimer != 0) {
+			clearTimeout(imePollTimer)
+			imePollTimer = 0
+		}
 		// 停掉原生语音：断开 TTS 状态订阅并停止播报/录音，避免残留播放与监听
 		if (nativeTtsStateListenerId != 0) {
 			try {

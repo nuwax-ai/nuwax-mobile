@@ -2,13 +2,13 @@
   <view
     ref="msgListContentRef"
     class="agent-detail-container page-container"
-    :style="embeddedPageStyle"
   >
     <!-- 导航栏 -->
     <!-- 临时会话不显示Logo, 显示标题`和xxx开始会话` -->
     <!-- 仅 App 内嵌 H5（isAppWebView）：fixed prop 让导航栏 position:fixed 固定在视口顶部。
-         Android / 鸿蒙 web-view 内输入框聚焦弹键盘时，文档会被自动滚动把输入框露出键盘，
-         文档流顶部的导航栏会被顶出屏幕；固定后不再随文档滚动（组件内部会渲染同高占位）。
+         Android：web-view 内输入框聚焦弹键盘时文档会被自动滚动，fixed 后不再随文档滚走。
+         iOS / 鸿蒙：系统常 pan 视觉视口，另由原生键盘高度桥 + keyboard-cover + 文档滚动锁
+         + visualViewport 偏移补偿共同保证导航栏钉在屏顶（见 appWebViewKeyboardChrome）。
          浏览器直开 H5 / App 原生 / 小程序不启用：浏览器靠文档自动滚动露出输入框，导航栏随之滚动为既有行为。 -->
     <custom-nav-bar
       :fixed="isAppWebView"
@@ -381,7 +381,6 @@
           key="agent-details-chat-input"
           ref="agentDetailInputPhoneRef"
           :enable-voice="voiceFeatureEnabled"
-          :layout-handles-keyboard="isAppWebView"
           :page-home-index="inputPageHomeIndex"
           :expand-page-area="inputExpandPageArea"
           :whole-disabled="wholeDisabled"
@@ -631,6 +630,7 @@
   import { handleExternalLink } from "@/utils/system.uts";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system.uts";
   import { setEmbeddedStatusBarHeight } from "@/utils/system.uts";
+  import { applyAppWebViewKeyboardChrome, dumpKeyboardDiag } from "@/utils/appWebViewKeyboardChrome.uts";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { getUniLoadMoreContentText, UniLoadMoreContentText } from "@/utils/i18n-third-party";
   import { hasUploadErrorInFiles } from "@/subpackages/components/chat-input-phone/chatInputActions.uts";
@@ -761,100 +761,9 @@
    */
   const isAppWebView = ref<boolean>(false);
 
-  /**
-   * DeepSeek 方案：键盘弹出不做「文档滚动 / 整窗平移」，改为显式计算内容区高度
-   * = 键盘上方可见高度，驱动根容器高度——导航栏 fixed 顶部不动，输入区随容器底部抬到键盘上方。
-   * 高度来源见 updateEmbeddedPageHeight（min(innerHeight, visualViewport.height)，
-   * 鸿蒙另可用原生键盘高度桥兜底）。
-   * 仅 Android / 鸿蒙 web-view 内嵌生效（iOS 键盘为覆盖层、WKWebView 自行露出，不收缩防抖动；
-   * 浏览器直开 H5 不启用，保持文档自动滚动露输入框的既有行为）。0 = 不生效。
-   */
-  const embeddedPageHeight = ref<number>(0);
-
-  /** 根容器样式：内嵌时显式定高（DeepSeek 计算），否则空对象走 --vh 默认高度 */
-  const embeddedPageStyle = computed((): UTSJSONObject => {
-    const style = new UTSJSONObject();
-    const h = embeddedPageHeight.value;
-    if (h > 0) {
-      style["height"] = `${h}px`;
-    }
-    return style;
-  });
-
   // #ifdef H5 || WEB
   /** onLoad 暂存的状态栏（刘海）高度：确认内嵌（markAppEmbedded）后才 applyEmbedded 生效 */
   let pendingEmbeddedStatusBarHeight: number = 0;
-
-  /**
-   * 运行时是否需要 DeepSeek 显式高度（Android / HarmonyOS WebView）。
-   * H5 同一份产物跑在多端 web-view，编译期条件编译无法区分，须 UA 探测。
-   * 鸿蒙 NEXT UA 通常不含 android，须识别 harmonyos / openharmony / arkweb。
-   */
-  let h5RuntimeNeedsExplicitPageHeight: boolean = false;
-  try {
-    const ua = navigator.userAgent.toLowerCase();
-    const isAndroid = ua.indexOf("android") >= 0;
-    const isHarmony =
-      ua.indexOf("harmonyos") >= 0 ||
-      ua.indexOf("openharmony") >= 0 ||
-      ua.indexOf("arkweb") >= 0;
-    h5RuntimeNeedsExplicitPageHeight = isAndroid || isHarmony;
-  } catch (_eUa) {
-    h5RuntimeNeedsExplicitPageHeight = false;
-  }
-
-  /** 原生桥注入的键盘高度（鸿蒙 ArkWeb visualViewport 不收缩时的兜底减高） */
-  let embeddedKeyboardHeight: number = 0;
-  /** 键盘收起时的可见高度基线，用于判断 OS 是否已自行收缩视口（避免双重减高） */
-  let embeddedPageHeightBaseline: number = 0;
-
-  /**
-   * 刷新内嵌页高度 = 键盘上方可见高度，仅 Android / 鸿蒙内嵌生效：
-   *  - 窗口被压缩（ADJUST_RESIZE 生效）：innerHeight 收缩；
-   *  - 键盘覆盖（沉浸式全屏下 adjustResize 不生效）：visualViewport.height 收缩；
-   *  - 鸿蒙兜底：visualViewport 未上报收缩时，用原生桥键盘高度相对基线减高，
-   *    避免 WebView 整页上推把 fixed 导航栏顶出屏幕。
-   */
-  function updateEmbeddedPageHeight(): void {
-    if (
-      isAppWebView.value != true ||
-      h5RuntimeNeedsExplicitPageHeight != true
-    ) {
-      embeddedPageHeight.value = 0;
-      return;
-    }
-    try {
-      const w = window as any;
-      let h = w.innerHeight as number;
-      const vv = w.visualViewport;
-      if (vv != null && vv.height > 0 && vv.height < h) {
-        h = vv.height;
-      }
-      const kb = embeddedKeyboardHeight;
-      if (kb <= 0) {
-        if (h > 0) {
-          embeddedPageHeightBaseline = h;
-        }
-      } else if (embeddedPageHeightBaseline > 0) {
-        const shrunkByOs = embeddedPageHeightBaseline - h;
-        // OS / visualViewport 未明显收缩时，用基线减键盘高度
-        if (shrunkByOs < kb * 0.5) {
-          const byKb = embeddedPageHeightBaseline - kb;
-          if (byKb > 0 && byKb < h) {
-            h = byKb;
-          }
-        }
-      }
-      embeddedPageHeight.value = h > 0 ? h : 0;
-    } catch (_eVh) {
-      // ignore
-    }
-  }
-
-  /** 视口变化（键盘弹出/收起 / 窗口压缩）→ 重算内嵌页高度 */
-  function onEmbeddedViewportResize(): void {
-    updateEmbeddedPageHeight();
-  }
 
   /**
    * 幂等标记 App web-view 内嵌：置 isAppWebView + 启用原生语音桥。
@@ -872,8 +781,6 @@
       setEmbeddedStatusBarHeight(pendingEmbeddedStatusBarHeight);
     }
     nativeVoiceBridge.setup();
-    // 内嵌确认即按当前视口刷新显式高度（键盘若已弹起则首帧即为可见高度）
-    updateEmbeddedPageHeight();
   }
 
   /**
@@ -1058,10 +965,7 @@
   const scrollManager = new ScrollManager(data);
 
   // #ifdef H5 || WEB
-  /**
-   * 原生桥注入键盘高度 → data.keyboardHeight（弹起滚到底）+ embeddedKeyboardHeight（鸿蒙显式高度兜底）。
-   * Android 真机布局侧实测恒 0，主要靠 visualViewport；鸿蒙可能有有效高度。
-   */
+  /** 原生桥注入键盘高度 → data.keyboardHeight（滚到底）+ 文档滚动锁；布局抬升由 chat-input-phone keyboard-cover 承担 */
   function onInjectedChatKeyboardHeightChange(evt: any): void {
     try {
       const detail = (evt as any)["detail"] as UTSJSONObject | null;
@@ -1072,8 +976,8 @@
           if (!isNaN(h)) {
             const next = h > 0 ? h : 0;
             data.keyboardHeight.value = next;
-            embeddedKeyboardHeight = next;
-            updateEmbeddedPageHeight();
+            applyAppWebViewKeyboardChrome(next);
+            dumpKeyboardDiag("chat-page-kb", next, next);
           }
         }
       }
@@ -3332,11 +3236,6 @@
   onShow((): void => {
     pauseEventPollingForChat();
 
-    // #ifdef H5 || WEB
-    // 回到前台时按当前视口重算内嵌页高度（键盘状态可能已变化）
-    updateEmbeddedPageHeight();
-    // #endif
-
     // #ifndef H5 || WEB
     invokeTriggerResume();
     // #endif
@@ -3995,22 +3894,8 @@
     // 仅标记会话页活跃；ASR/TTS 改为按录音预热 / 合成时建连（不再进页预连）
     speechSocketWarmup.warmup();
     // #ifdef H5
-    // 键盘高度来源（DeepSeek 显式布局）：window resize + visualViewport resize →
-    // min(innerHeight, visualViewport.height) 驱动根容器高度，不依赖原生键盘高度桥（实测恒 0）。
-    try {
-      const w = window as any;
-      w.addEventListener("resize", onEmbeddedViewportResize);
-      const vv = w.visualViewport;
-      if (vv != null) {
-        vv.addEventListener("resize", onEmbeddedViewportResize);
-      }
-    } catch (_eResize) {
-      // ignore
-    }
-    // 先按当前视口算一次（键盘已弹起则首帧即可见高度）
-    updateEmbeddedPageHeight();
-    // 键盘高度桥（仅用于键盘弹起滚到底）：接收原生壳注入（仅 App web-view 内嵌触发），
-    // 桥注入可能早于本组件挂载（evalJS 先于渲染），读全局兜底一次
+    // 键盘高度桥：滚到底 + 文档滚动锁；布局抬升由 chat-input-phone keyboard-cover 承担。
+    // Android / iOS / 鸿蒙均由 agent-detail 原生壳注入。
     try {
       const w = window as any;
       w.addEventListener(
@@ -4023,8 +3908,7 @@
         if (!isNaN(h)) {
           const next = h > 0 ? h : 0;
           data.keyboardHeight.value = next;
-          embeddedKeyboardHeight = next;
-          updateEmbeddedPageHeight();
+          applyAppWebViewKeyboardChrome(next);
         }
       }
     } catch (_eKb) {
@@ -4055,18 +3939,13 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
-    // 注销视口监听（DeepSeek 显式布局）与键盘高度桥
+    // 注销键盘高度桥并解除文档滚动锁
     try {
-      const w = window as any;
-      w.removeEventListener("resize", onEmbeddedViewportResize);
-      const vv = w.visualViewport;
-      if (vv != null) {
-        vv.removeEventListener("resize", onEmbeddedViewportResize);
-      }
-      w.removeEventListener(
+      (window as any).removeEventListener(
         "nuwax:keyboardHeightChange",
         onInjectedChatKeyboardHeightChange,
       );
+      applyAppWebViewKeyboardChrome(0);
     } catch (_eKb) {
       // ignore
     }
@@ -4108,18 +3987,13 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
-    // 注销视口监听（DeepSeek 显式布局）与键盘高度桥
+    // 注销键盘高度桥并解除文档滚动锁
     try {
-      const w = window as any;
-      w.removeEventListener("resize", onEmbeddedViewportResize);
-      const vv = w.visualViewport;
-      if (vv != null) {
-        vv.removeEventListener("resize", onEmbeddedViewportResize);
-      }
-      w.removeEventListener(
+      (window as any).removeEventListener(
         "nuwax:keyboardHeightChange",
         onInjectedChatKeyboardHeightChange,
       );
+      applyAppWebViewKeyboardChrome(0);
     } catch (_eKb) {
       // ignore
     }

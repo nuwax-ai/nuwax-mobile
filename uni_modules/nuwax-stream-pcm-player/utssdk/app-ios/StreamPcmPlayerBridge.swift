@@ -24,9 +24,28 @@ public class StreamPcmPlayerBridge {
     public init() {}
 
     public func initPlayer(_ sampleRate: NSNumber) {
-        releasePlayer()
         let sr = sampleRate.doubleValue
-        self.sampleRate = sr > 0 ? sr : 16000
+        let nextSr = sr > 0 ? sr : 16000
+        // 复用已有引擎：不要 release 再重建。engine.stop() 会自惹 AVAudioSession
+        // interruption，紧接着按住说话会空等 1~2s 首帧（第二次录音 loading）。
+        if engine != nil && player != nil && abs(self.sampleRate - nextSr) < 0.1 {
+            player?.stop()
+            self.writtenBytes = 0
+            self.playedBytes = 0
+            self.started = false
+            self.pending = Data()
+            self.droppedBytes = 0
+            if engine?.isRunning != true {
+                do { try engine?.start() } catch { /* keep existing graph */ }
+            }
+            return
+        }
+        player?.stop()
+        engine?.stop()
+        player = nil
+        engine = nil
+        format = nil
+        self.sampleRate = nextSr
         let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16,
                                 sampleRate: self.sampleRate,
                                 channels: 1,
@@ -153,13 +172,11 @@ public class StreamPcmPlayerBridge {
 
     public func releasePlayer() {
         player?.stop()
-        engine?.stop()
-        player = nil
-        engine = nil
-        format = nil
-        started = false
         pending = Data()
         writtenBytes = 0
         playedBytes = 0
+        started = false
+        // 不停 AVAudioEngine：engine.stop() 会自惹 session interruption，
+        // 随后立刻开录音会丢开头 1~2s。下次 initPlayer 复用同一引擎。
     }
 }

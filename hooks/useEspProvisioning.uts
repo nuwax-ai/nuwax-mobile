@@ -36,6 +36,7 @@ import {
   ESP_PROV_OPTIONAL_SCAN_CAPABILITY,
 } from '@/constants/espProvisioning.constants';
 import { validatePassword, validateSsid } from '@/utils/provisionProtocol';
+import { espErrorCodeFromText } from '@/utils/provisioning/espErrorCode';
 import { parseNuwaxProvisionUrl } from '@/utils/provisioning/espProvisioningQr';
 import { getQrPayload } from '@/utils/provisionSession';
 import { apiVoxBindDevice } from '@/servers/vox/voxDevice';
@@ -72,6 +73,10 @@ export class EspProvisioningController {
   private boundSecret = '';
   private boundWebsocketUrl = '';
   private boundBindingId = '';
+  // 平台实现最近一次上报的错误码副本（见 onLog / asEspError），取用即失效。
+  private lastClientErrorCode = '';
+  private lastClientErrorMessage = '';
+  private lastClientErrorAt = 0;
   private config: EspProvisioningConfig;
 
   constructor() {
@@ -92,6 +97,13 @@ export class EspProvisioningController {
     this.client.onProgress((progress: EspProvisioningProgress) => this.handleProgress(progress));
     this.client.onLog((level: string, event: string, detail: string) => {
       console.log(`[EspProvisioning][${level}] ${event} ${detail}`);
+      // 平台实现在构造错误时会同步打一条 error 日志，event 即错误码。
+      // reject 的对象穿过 await 的 any 边界后 instanceof 会失效，这里留一份可靠副本。
+      if (level == 'error') {
+        this.lastClientErrorCode = event;
+        this.lastClientErrorMessage = detail;
+        this.lastClientErrorAt = Date.now();
+      }
     });
   }
 
@@ -348,6 +360,8 @@ export class EspProvisioningController {
           lastError!!.code == EspProvisioningErrorCodeEnum.DEVICE_NOT_FOUND ||
           lastError!!.code == EspProvisioningErrorCodeEnum.SCAN_FAILED ||
           lastError!!.code == EspProvisioningErrorCodeEnum.BLUETOOTH_OFF ||
+          lastError!!.code == EspProvisioningErrorCodeEnum.LOCATION_OFF ||
+          lastError!!.code == EspProvisioningErrorCodeEnum.UNSUPPORTED ||
           lastError!!.code == EspProvisioningErrorCodeEnum.NO_PERMISSION
         ) break;
         if (attempt < 2) await this.sleep(1000 * (attempt + 1));
@@ -699,13 +713,15 @@ export class EspProvisioningController {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        reject(new EspProvisioningError(
+        const timeoutError = new EspProvisioningError(
           EspProvisioningErrorCodeEnum.NO_PERMISSION,
           '蓝牙权限申请超时，请重试',
           'permission request timed out',
           0,
           true,
-        ));
+        );
+        this.recordError(timeoutError);
+        reject(timeoutError);
       }, ESP_PROV_PERMISSION_TIMEOUT_MS) as number;
       this.client.initialize(this.config).then(() => {
         if (settled) return;
@@ -824,6 +840,7 @@ export class EspProvisioningController {
 
   private errorI18nKey(code: EspProvisioningErrorCodeEnum): string {
     if (code == EspProvisioningErrorCodeEnum.BLUETOOTH_OFF) return 'Mobile.Provision.Error.bluetoothOff';
+    if (code == EspProvisioningErrorCodeEnum.LOCATION_OFF) return 'Mobile.Provision.Error.locationOff';
     if (code == EspProvisioningErrorCodeEnum.NO_PERMISSION) return 'Mobile.Provision.Scan.noPermission';
     if (code == EspProvisioningErrorCodeEnum.SCAN_FAILED) return 'Mobile.Provision.Error.scanFailed';
     if (code == EspProvisioningErrorCodeEnum.UNSUPPORTED) return 'Mobile.Provision.Error.serviceUnavailable';
@@ -845,12 +862,51 @@ export class EspProvisioningController {
     return 'Mobile.Provision.Error.unknown';
   }
 
+  /**
+   * 归一化 catch 到的任意值。
+   * UTS/Android 上 Promise reject 的普通类实例经 await 抛出后 instanceof 判定会失效
+   * （实测华为机上 BLUETOOTH_OFF 被降级成 UNKNOWN，界面只剩「配网失败，请重试」，
+   * 而且 selectAndPrepareFromQr 的「环境类错误不重试」判断也随之失效，白等三轮）。
+   * 因此 instanceof 落空时回退到平台实现刚上报的错误码副本。
+   */
   private asEspError(value: any): EspProvisioningError {
-    if (value instanceof EspProvisioningError) return value;
+    if (value instanceof EspProvisioningError) {
+      const typed = value as EspProvisioningError;
+      this.recordError(typed);
+      return typed;
+    }
+    const recovered = this.recentClientError();
+    if (recovered != null) {
+      this.recordError(recovered!!);
+      return recovered!!;
+    }
     return new EspProvisioningError(
       EspProvisioningErrorCodeEnum.UNKNOWN,
       '未知配网错误',
       `${value}`,
+    );
+  }
+
+  /**
+   * 记下当前错误码，供它下一次穿过 await 边界后还原。
+   * ensureInitialized 这类链路会归一化两次（内层 reject、外层 catch 各一次），
+   * 所以副本是「每次归一化都刷新」而不是「取用即失效」。
+   */
+  private recordError(err: EspProvisioningError): void {
+    this.lastClientErrorCode = `${err.code}`;
+    this.lastClientErrorMessage = err.message;
+    this.lastClientErrorAt = Date.now();
+  }
+
+  /** 最近 3 秒内上报过的错误码副本；超时视为与本次失败无关，宁可退回 UNKNOWN。 */
+  private recentClientError(): EspProvisioningError | null {
+    const code = this.lastClientErrorCode;
+    if (code == '' || Date.now() - this.lastClientErrorAt > 3000) return null;
+    const message = this.lastClientErrorMessage;
+    return new EspProvisioningError(
+      espErrorCodeFromText(code),
+      message != '' ? message : '配网失败',
+      `recovered:${code}`,
     );
   }
 

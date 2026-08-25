@@ -3,9 +3,7 @@
     <view
       class="layout"
       :class="[(className != null ? className : ''), fixed == true ? 'layout-fixed' : '']"
-      :style="{
-        backgroundColor: transparentBackground == true ? 'transparent' : backgroundColor,
-      }"
+      :style="layoutStyle"
     >
       <!-- 微信安全区 -->
       <safety-zone v-if="hasSafetyZone"></safety-zone>
@@ -26,6 +24,7 @@
             <!-- 图标 -->
             <view class="logo" v-if="icon != null && icon != ''">
               <image
+                v-if="currentIcon.length > 0"
                 class="logo__image"
                 :src="currentIcon"
                 mode="aspectFill"
@@ -76,12 +75,16 @@
 // vapor styleIsolation 2.0 默认 isolated，放开接收全局样式（工具类/iconfont 等全局 class）
 defineOptions({ styleIsolation: 'app' });
 
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, onMounted, onUnmounted } from "vue";
 import { chatService } from "@/utils/chatService";
 import agentImage from "@/static/assets/agent_image.png";
 import { translateText, t as translateFn, emptyI18nParams } from "@/utils/i18n";
 import { isAppWebViewEmbedded } from "@/utils/system.uts";
 import { resolveAppSvgUrl } from "@/utils/remoteSvgImage";
+import {
+  dumpKeyboardDiag,
+  resolveNavKeyboardOffset,
+} from "@/utils/appWebViewKeyboardChrome.uts";
 const _params = emptyI18nParams();
 const t = (key: string): string => translateFn(key, _params, "");
 
@@ -110,12 +113,122 @@ const displayTitle = computed<string>(() => {
   return translateText(props.title != null ? props.title : "");
 });
 
+// #ifdef H5 || WEB
+/**
+ * iOS / 鸿蒙：cover-lock 下导航不做 translateY（navOff 恒 0）；
+ * Android：offsetTop 多为 0。保留监听仅用于诊断。
+ */
+const visualViewportOffsetTop = ref<number>(0);
+/** 导航补偿日志节流 */
+let lastNavDiagAt: number = 0;
+let lastNavDiagTop: number = -1;
+
+function syncVisualViewportOffset(): void {
+  if (props.fixed != true) {
+    visualViewportOffsetTop.value = 0;
+    return;
+  }
+  const next = resolveNavKeyboardOffset();
+  visualViewportOffsetTop.value = next;
+  const now = Date.now();
+  if (next != lastNavDiagTop || now - lastNavDiagAt > 400) {
+    lastNavDiagTop = next;
+    lastNavDiagAt = now;
+    const navLog =
+      "[kb-diag] nav-bar fixed=" +
+      `${props.fixed == true}` +
+      " navOff=" +
+      `${next}` +
+      " transform=none";
+    console.log(navLog);
+    dumpKeyboardDiag("nav-bar-sync", -1, -1);
+  }
+}
+
+function onNavKeyboardHeightChange(_evt: any): void {
+  syncVisualViewportOffset();
+}
+
+function bindVisualViewportSync(): void {
+  try {
+    window.addEventListener("scroll", syncVisualViewportOffset, true);
+    const vv = window.visualViewport;
+    if (vv != null) {
+      vv.addEventListener("resize", syncVisualViewportOffset);
+      vv.addEventListener("scroll", syncVisualViewportOffset);
+    }
+    window.addEventListener(
+      "nuwax:keyboardHeightChange",
+      onNavKeyboardHeightChange,
+    );
+  } catch (_e) {
+    // ignore
+  }
+}
+
+function unbindVisualViewportSync(): void {
+  try {
+    window.removeEventListener("scroll", syncVisualViewportOffset, true);
+    const vv = window.visualViewport;
+    if (vv != null) {
+      vv.removeEventListener("resize", syncVisualViewportOffset);
+      vv.removeEventListener("scroll", syncVisualViewportOffset);
+    }
+    window.removeEventListener(
+      "nuwax:keyboardHeightChange",
+      onNavKeyboardHeightChange,
+    );
+  } catch (_e) {
+    // ignore
+  }
+}
+
+onMounted((): void => {
+  if (props.fixed == true) {
+    bindVisualViewportSync();
+    syncVisualViewportOffset();
+  }
+});
+
+onUnmounted((): void => {
+  unbindVisualViewportSync();
+});
+
+watch(
+  (): boolean => props.fixed == true,
+  (enabled: boolean): void => {
+    if (enabled == true) {
+      bindVisualViewportSync();
+      syncVisualViewportOffset();
+    } else {
+      unbindVisualViewportSync();
+      visualViewportOffsetTop.value = 0;
+    }
+  },
+);
+// #endif
+
+/** 导航栏内联样式：仅背景色。
+ * H5 fixed 的 visualViewport 补偿改由 appWebViewKeyboardChrome
+ * 每帧直接写 DOM transform（!important），避免 Vue :style 滞后造成「先顶走再弹回」。
+ */
+const layoutStyle = computed((): UTSJSONObject => {
+  const style: UTSJSONObject = {
+    backgroundColor:
+      props.transparentBackground == true ? "transparent" : props.backgroundColor,
+  } as UTSJSONObject;
+  return style;
+});
+
 // 当前显示的图标（用于处理加载失败时使用默认图片）
 // App 端 <image> 渲染远程 SVG 时按声明尺寸 1:1 光栅化，CSS 宽高/mode 缩放失效（显示为裁切或过小），
 // 需按容器尺寸走 resolveAppSvgUrl 解析为 data URL（H5/小程序原样透传，不产生额外请求）。
 // 尺寸取 .logo 容器 64rpx × .image 的 106%（overscan）≈ 68rpx，保证 1:1 绘制正好铺满。
 const NAV_ICON_RPX = 68;
-const currentIcon = ref<string>(agentImage);
+// 解析完成前不给 <image> 任何 src（初始为空串）：iOS 端替换 src 会取消上一张的在途请求并补发一次 error，
+// 事件无法区分是哪个 src 失败，handleImageError 会把刚解析好的图标误判为加载失败而换回默认图。
+// 详见 components/agent-icon/agent-icon.uvue 的同类说明。
+const currentIcon = ref<string>("");
 // 解析竞态序号：图标连续变化时，过期的异步解析结果不得覆盖新目标
 let iconResolveSeq = 0;
 
@@ -143,9 +256,9 @@ const onBackClick = () => {
   // 中止当前会话
   chatService.abort();
   // #ifdef H5 || WEB
-  // App web-view 内嵌：导航以原生栈为准 —— 返回直接经 uni.webView.navigateBack
-  // 弹掉 webview 所在原生页（agent-detail），回到 App 首页；
-  // 不做 H5 栈内返回（那只在 webview 内跳转，App 端体验不对）。
+  // App web-view 内嵌：勿用 uni.webView.navigateBack——JSSDK 在 JavaBridge 线程调原生
+  // navigateBack，Android 上常出现 getCurrentPages 为空 → errCode=4 未捕获 Promise。
+  // 改为 postMessage，由承载页（agent-detail）在原生主路径按页面栈安全 pop / switchTab。
   if (isAppWebViewEmbedded() == true) {
     try {
       const w = window as any;
@@ -153,9 +266,11 @@ const onBackClick = () => {
         w != null &&
         w.uni != null &&
         w.uni.webView != null &&
-        w.uni.webView.navigateBack != null
+        w.uni.webView.postMessage != null
       ) {
-        w.uni.webView.navigateBack({ delta: 1 });
+        w.uni.webView.postMessage({
+          data: { "type": "app-nav-back" } as UTSJSONObject,
+        });
         return;
       }
     } catch (_e) {
@@ -188,6 +303,8 @@ const onBackClick = () => {
  * 当图片加载失败时，使用默认图片
  */
 const handleImageError = () => {
+  // 尚未给出 src（解析中）时收到的 error 一定不属于当前图标，忽略
+  if (currentIcon.value.length == 0) return;
   // 作废进行中的解析，避免过期结果把兜底图重新覆盖回加载失败的地址
   iconResolveSeq++;
   currentIcon.value = agentImage;
@@ -198,8 +315,8 @@ watch(
   () : string | null => props.icon as string | null,
   (newIcon : string | null) => {
     const nextIcon = newIcon != null && newIcon != "" ? newIcon : agentImage;
-    // App 端远程 SVG 先占位默认头像，等解析出 data URL 再显示；其余情况立即显示
-    currentIcon.value = needsSvgResolve(nextIcon) ? agentImage : nextIcon;
+    // App 端远程 SVG 解析完成前不给 src（给了会先闪一帧裁切图，且换 src 时会触发 iOS 的假 error）；其余情况立即显示
+    currentIcon.value = needsSvgResolve(nextIcon) ? "" : nextIcon;
     const seq = ++iconResolveSeq;
     resolveAppSvgUrl(nextIcon, NAV_ICON_RPX, NAV_ICON_RPX).then((resolved : string) => {
       if (seq == iconResolveSeq) {
@@ -222,6 +339,12 @@ watch(
 }
 
 /* #ifdef H5 */
+/* 固定定位（fixed prop 启用）：聊天页键盘弹出时导航栏钉在屏顶。
+   Android：对抗文档自动滚动；iOS / 鸿蒙：配合 visualViewport translateY 补偿与文档滚动锁。
+   状态栏/刘海高度由组件内部 safety-zone 依据注入值自行占位，无需外部传入。
+   背景用不透明白色（勿用 var(--background-color-content)：uni-app x 运行时未配置 backgroundColorContent
+   时该变量默认为 transparent，兜底 #fff 不生效，滚动时内容会透过导航栏）；!important 压过根 :style
+   的 backgroundColor 绑定（未传时为 undefined）。 */
 .layout-fixed {
   position: fixed;
   top: 0;
@@ -229,6 +352,9 @@ watch(
   right: 0;
   z-index: 100;
   background-color: #ffffff !important;
+  /* cover-lock：不做 vv translateY；transform 保持 none */
+  transform: none !important;
+  transition: none !important;
 }
 
 .layout-placeholder {

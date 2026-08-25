@@ -76,7 +76,20 @@ public final class EspProvisioningBridge: NSObject {
   fileprivate static func fwd(_ format: String, _ args: CVarArg...) {
     let s = String(format: format, arguments: args)
     NSLog("%@", s)
-    logSink?(s)
+    onUts { logSink?(s) }
+  }
+
+  /// 跨 UTS 边界的回调统一串行到主线程（与 Android EspProvisioningBridge.dispatchToMain 对齐）。
+  ///
+  /// UTS 回调会继续 resolve/reject 上层 Promise 并触发 Vue 响应式调度与页面更新，只能在主线程执行。
+  /// CoreBluetooth 的委托队列、ESPProvision 的 sendData / scanWifiList / provision 完成回调都不在
+  /// 主线程；若直接回调 UTS，事件会被丢弃或崩溃 → 上层 Promise 永不 settle，界面卡在「正在连接设备…」。
+  fileprivate static func onUts(_ action: @escaping () -> Void) {
+    if Thread.isMainThread {
+      action()
+    } else {
+      DispatchQueue.main.async(execute: action)
+    }
   }
 
   // BLE 扫描（CoreBluetooth 直接扫，逐台回调）
@@ -95,8 +108,8 @@ public final class EspProvisioningBridge: NSObject {
   private var connectFail: EspFailure?
   private var connectTimeoutWork: DispatchWorkItem?
 
-  // BLE 回调与连接完成的串行队列
-  private let workQueue = DispatchQueue(label: "com.nuwax.provisioning.bridge")
+  // 桥内状态（discovered / espDevice / connectSuccess…）全部主线程访问：
+  // UTS 侧在主线程调用本桥，CoreBluetooth 与 ESPProvision 的回调也统一回主线程，无需再加锁。
 
   private override init() {
     super.init()
@@ -120,7 +133,7 @@ public final class EspProvisioningBridge: NSObject {
     discovered.removeAll()
     EspProvisioningBridge.fwd("[EspBridge] startScan prefix=%@ uuid=%@ centralState=%d", prefix, requiredServiceUuid, central?.state.rawValue ?? -99)
     if central == nil {
-      central = CBCentralManager(delegate: self, queue: workQueue)
+      central = CBCentralManager(delegate: self, queue: .main)
     } else if central?.state == .poweredOn {
       beginBleScan()
     }
@@ -184,7 +197,7 @@ public final class EspProvisioningBridge: NSObject {
       self.espDevice?.disconnect()
     }
     connectTimeoutWork = work
-    workQueue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs.intValue), execute: work)
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs.intValue), execute: work)
 
     EspProvisioningBridge.fwd("[EspBridge] connect start name=%@ user=%@ timeout=%dms centralState=%d fromDiscovered=%@",
           name, username, timeoutMs.intValue, central?.state.rawValue ?? -1, (discovered[deviceId] != nil ? "Y" : "N"))
@@ -207,14 +220,14 @@ public final class EspProvisioningBridge: NSObject {
           self.espDevice = device
           // device.connect 内部 Security 2 握手走 main.async，从主线程发起以确保 runloop 正常推进
           device.connect(delegate: self.sec2Delegate) { status in
-            self.workQueue.async { self.handleConnectStatus(status) }
+            EspProvisioningBridge.onUts { self.handleConnectStatus(status) }
           }
         } else {
           let msg = error?.localizedDescription ?? "device create failed"
           let dom = error.map { ($0 as NSError).domain } ?? "nil"
           let code = error.map { ($0 as NSError).code } ?? -1
           EspProvisioningBridge.fwd("[EspBridge] createESPDevice FAIL domain=%@ code=%d desc=%@", dom, code, msg)
-          self.workQueue.async {
+          EspProvisioningBridge.onUts {
             self.failPendingConnect("DEVICE_NOT_FOUND", self.safe(msg))
           }
         }
@@ -295,7 +308,7 @@ public final class EspProvisioningBridge: NSObject {
     }
     let data = Data(payload.utf8)
     device.sendData(path: endpoint, data: data) { response, error in
-      self.workQueue.async {
+      EspProvisioningBridge.onUts {
         if let response {
           success(String(data: response, encoding: .utf8) ?? "")
         } else {
@@ -317,7 +330,7 @@ public final class EspProvisioningBridge: NSObject {
       return
     }
     device.scanWifiList { networks, error in
-      self.workQueue.async {
+      EspProvisioningBridge.onUts {
         if let networks {
           let list: [[String: Any]] = networks.map {
             [
@@ -362,11 +375,11 @@ public final class EspProvisioningBridge: NSObject {
     let timeoutWork = DispatchWorkItem {
       finish { fail("STATUS_TIMEOUT", "Provisioning status timed out") }
     }
-    workQueue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs.intValue), execute: timeoutWork)
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs.intValue), execute: timeoutWork)
 
     progress("SENDING_CREDENTIALS")
     device.provision(ssid: ssid, passPhrase: password) { status in
-      self.workQueue.async {
+      EspProvisioningBridge.onUts {
         switch status {
         case .configApplied:
           progress("APPLYING_CONFIG")

@@ -1,0 +1,599 @@
+/**
+ * App web-view 内嵌 H5：键盘弹起时锁定文档滚动，并输出诊断日志（真机排障用）。
+ * 日志前缀统一 `[kb-diag]`；H5 侧会经 postMessage 回传原生，便于 Xcode / HX logcat 查看。
+ * 仅 H5/WEB 生效；其它端为空实现。
+ *
+ * iOS / 鸿蒙：onKeyboardHeightChange 多在键盘动画结束后才给终值；
+ * 跟手依赖 focusin/focusout 预测抬升（见 agent-detail inject），本工具负责锁滚与诊断。
+ * Android：WindowInsets / 轮询驱动 cover。
+ */
+import { isAppWebViewEmbedded } from "@/utils/system.uts";
+
+/** 当前是否处于键盘弹起锁滚状态 */
+let keyboardChromeLocked: boolean = false;
+/** visualViewport / window 监听是否已挂 */
+let viewportListenersBound: boolean = false;
+/** 诊断节流：同一组关键字段 300ms 内不重复刷屏 */
+let lastDiagKey: string = "";
+let lastDiagAt: number = 0;
+/** iOS/鸿蒙收起时延迟清 overflow，避免 cover 高度过渡被瞬间打断 */
+let chromeUnlockTimerId: number = 0;
+/** 锁定期每帧按 vvTop 收 cover 高度（消除空白），不碰导航 */
+let keyboardCoverRafId: number = 0;
+/** 上次写入的 cover 高度，避免无意义 DOM 写入 */
+let lastSyncedCoverPx: number = -1;
+
+/** 与系统键盘动画接近的 cover 过渡时长（毫秒） */
+const KB_COVER_ANIM_MS: number = 280;
+
+/**
+ * iOS / 鸿蒙：高度常一次跳到终值，cover 需 CSS 过渡才不生硬。
+ */
+export function shouldAnimateKeyboardCover(): boolean {
+  const p = readNuwaxKbPlatform();
+  return p == "ios" || p == "harmony";
+}
+
+/**
+ * 读取原生注入的键盘平台标记（android / ios / harmony）。
+ */
+export function readNuwaxKbPlatform(): string {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    const p = w.__nuwaxKbPlatform;
+    if (p != null) {
+      const s = `${p}`;
+      if (s.length > 0) {
+        return s;
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  try {
+    const ua = navigator.userAgent;
+    if (ua.indexOf("Android") >= 0) {
+      return "android";
+    }
+    if (
+      ua.indexOf("iPhone") >= 0 ||
+      ua.indexOf("iPad") >= 0 ||
+      ua.indexOf("iPod") >= 0
+    ) {
+      return "ios";
+    }
+    if (
+      ua.indexOf("Harmony") >= 0 ||
+      ua.indexOf("OpenHarmony") >= 0 ||
+      ua.indexOf("ArkWeb") >= 0
+    ) {
+      return "harmony";
+    }
+  } catch (_eUa) {
+    // ignore
+  }
+  // #endif
+  return "unknown";
+}
+
+/**
+ * iOS / 鸿蒙内嵌页（历史）：曾因系统 pan 将 cover 置 0；现已改为 cover-lock，
+ * 本函数保留兼容调用方，恒为 false（实际高度见 resolveKeyboardCoverHeight）。
+ */
+export function shouldZeroKeyboardCoverOnPlatform(): boolean {
+  return false;
+}
+
+/**
+ * 实际用于垫高输入区的 cover 高度。
+ * - 无 pan（vvTop≈0）：用满高注入 IME，抬输入区、稳住导航（勿因 shrink 清零，否则会逼出大 pan）。
+ * - 有 pan（vvTop>0）：可见空白 ≈ cover - shrink + vvTop；令 cover = inj - vvTop，
+ *   则空白 ≈ inj - shrink（shrink≈inj 时为 0）。必须改布局 height，不能用 transform
+ *  （transform 不释放占位，空白仍在）。
+ */
+export function resolveKeyboardCoverHeight(injectedH: number): number {
+  if (injectedH <= 0) {
+    return 0;
+  }
+  // #ifdef H5 || WEB
+  const platform = readNuwaxKbPlatform();
+  if (platform == "harmony" || platform == "ios") {
+    const vvTop = readVisualViewportOffsetTop();
+    if (vvTop > 2) {
+      const next = injectedH - vvTop;
+      return next > 2 ? Math.round(next) : 0;
+    }
+  }
+  // #endif
+  return injectedH;
+}
+
+/**
+ * 把 cover 布局高度写回 DOM（!important 压过 Vue）。禁止 transition，以便跟手 vvTop。
+ */
+function syncKeyboardCoverDom(coverPx: number): void {
+  // #ifdef H5 || WEB
+  try {
+    const covers = document.querySelectorAll(".keyboard-cover");
+    const h = coverPx > 0 ? coverPx : 0;
+    for (let i = 0; i < covers.length; i++) {
+      const el = covers[i] as HTMLElement | null;
+      if (el == null) {
+        continue;
+      }
+      el.style.setProperty("transition", "none", "important");
+      el.style.setProperty("transform", "none", "important");
+      el.style.setProperty("height", `${h}px`, "important");
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+function stopKeyboardCoverRaf(): void {
+  // #ifdef H5 || WEB
+  if (keyboardCoverRafId != 0) {
+    try {
+      cancelAnimationFrame(keyboardCoverRafId);
+    } catch (_e) {
+      // ignore
+    }
+    keyboardCoverRafId = 0;
+  }
+  lastSyncedCoverPx = -1;
+  // #endif
+}
+
+function tickKeyboardCoverRaf(): void {
+  // #ifdef H5 || WEB
+  keyboardCoverRafId = 0;
+  if (keyboardChromeLocked != true) {
+    return;
+  }
+  resetWindowScroll();
+  applyNavKeyboardOffsetDom(0);
+  const inj = readInjectedKeyboardHeight();
+  const cover = inj > 0 ? resolveKeyboardCoverHeight(inj) : 0;
+  if (cover != lastSyncedCoverPx) {
+    lastSyncedCoverPx = cover;
+    syncKeyboardCoverDom(cover);
+  }
+  try {
+    keyboardCoverRafId = requestAnimationFrame(tickKeyboardCoverRaf) as number;
+  } catch (_e) {
+    keyboardCoverRafId = 0;
+  }
+  // #endif
+}
+
+function startKeyboardCoverRaf(): void {
+  // #ifdef H5 || WEB
+  if (keyboardCoverRafId != 0) {
+    return;
+  }
+  lastSyncedCoverPx = -1;
+  try {
+    keyboardCoverRafId = requestAnimationFrame(tickKeyboardCoverRaf) as number;
+  } catch (_e) {
+    keyboardCoverRafId = 0;
+  }
+  // #endif
+}
+
+/**
+ * 兼容旧调用：导航不做 translateY（恒钉顶）。
+ */
+export function applyNavKeyboardOffsetDom(_offsetTop: number): void {
+  // #ifdef H5 || WEB
+  try {
+    const navs = document.querySelectorAll(".layout-fixed");
+    for (let i = 0; i < navs.length; i++) {
+      const el = navs[i] as HTMLElement | null;
+      if (el == null) {
+        continue;
+      }
+      el.style.setProperty("transition", "none", "important");
+      el.style.top = "0px";
+      el.style.setProperty("transform", "none", "important");
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * 读取注入的键盘高度（window.__nuwaxKeyboardHeight）。
+ */
+export function readInjectedKeyboardHeight(): number {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    const cached = w.__nuwaxKeyboardHeight;
+    if (cached != null) {
+      const n = parseFloat(`${cached}`);
+      if (!isNaN(n) && n > 0) {
+        return n;
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+  return 0;
+}
+
+/**
+ * 读取 visualViewport.offsetTop。
+ */
+export function readVisualViewportOffsetTop(): number {
+  // #ifdef H5 || WEB
+  try {
+    const vv = window.visualViewport;
+    if (vv != null) {
+      const top = vv.offsetTop;
+      if (top != null && top > 0) {
+        return top;
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+  return 0;
+}
+
+/**
+ * 导航栏钉顶补偿量：cover-lock 模式下恒为 0。
+ * 导航靠 position:fixed + 满高 keyboard-cover 维持，不做 translateY（否则必现「先顶走再滑回」）。
+ */
+export function resolveNavKeyboardOffset(): number {
+  return 0;
+}
+
+function resetWindowScroll(): void {
+  // #ifdef H5 || WEB
+  try {
+    if (window.scrollY != 0 || window.pageYOffset != 0) {
+      window.scrollTo(0, 0);
+    }
+    const el = document.documentElement;
+    if (el != null && el.scrollTop != 0) {
+      el.scrollTop = 0;
+    }
+    const body = document.body;
+    if (body != null && body.scrollTop != 0) {
+      body.scrollTop = 0;
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+function onViewportShift(): void {
+  if (keyboardChromeLocked != true) {
+    return;
+  }
+  resetWindowScroll();
+  applyNavKeyboardOffsetDom(0);
+  const inj = readInjectedKeyboardHeight();
+  if (inj > 0) {
+    syncKeyboardCoverDom(resolveKeyboardCoverHeight(inj));
+  }
+  dumpKeyboardDiag("viewport-shift", -1, -1);
+}
+
+function bindViewportListeners(): void {
+  // #ifdef H5 || WEB
+  if (viewportListenersBound == true) {
+    return;
+  }
+  viewportListenersBound = true;
+  try {
+    window.addEventListener("scroll", onViewportShift, true);
+    const vv = window.visualViewport;
+    if (vv != null) {
+      vv.addEventListener("scroll", onViewportShift);
+      vv.addEventListener("resize", onViewportShift);
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+function unbindViewportListeners(): void {
+  // #ifdef H5 || WEB
+  if (viewportListenersBound != true) {
+    return;
+  }
+  viewportListenersBound = false;
+  try {
+    window.removeEventListener("scroll", onViewportShift, true);
+    const vv = window.visualViewport;
+    if (vv != null) {
+      vv.removeEventListener("scroll", onViewportShift);
+      vv.removeEventListener("resize", onViewportShift);
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * 采集当前键盘/视口诊断快照（H5）。
+ */
+export function dumpKeyboardDiag(
+  tag: string,
+  injectedH: number = -1,
+  coverH: number = -1,
+): void {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    let inj = injectedH;
+    if (inj < 0) {
+      inj = readInjectedKeyboardHeight();
+    }
+    let cover = coverH;
+    if (cover < 0) {
+      cover = resolveKeyboardCoverHeight(inj);
+    }
+    const platform = readNuwaxKbPlatform();
+
+    const innerH = window.innerHeight;
+    const outerH = window.outerHeight;
+    const docEl = document.documentElement;
+    const clientH = docEl != null ? docEl.clientHeight : 0;
+    const scrollY = window.scrollY;
+    const pageY = window.pageYOffset;
+
+    let vvH = -1;
+    let vvTop = 0;
+    let vvLeft = 0;
+    let vvScale = 1;
+    const vv = window.visualViewport;
+    if (vv != null) {
+      vvH = vv.height;
+      vvTop = vv.offsetTop != null ? vv.offsetTop : 0;
+      vvLeft = vv.offsetLeft != null ? vv.offsetLeft : 0;
+      vvScale = vv.scale != null ? vv.scale : 1;
+    }
+
+    const shrink =
+      vvH > 0 ? Math.max(0, Math.round(innerH - vvH)) : -1;
+    const coverExtra =
+      shrink >= 0 ? Math.round(cover - shrink) : -1;
+    const navOffset = resolveNavKeyboardOffset();
+
+    let cssVh = "";
+    try {
+      cssVh = getComputedStyle(docEl).getPropertyValue("--vh");
+    } catch (_eCss) {
+      cssVh = "";
+    }
+
+    const embedded = isAppWebViewEmbedded() == true;
+    const locked = keyboardChromeLocked == true;
+
+    const key =
+      tag +
+      "|" +
+      inj +
+      "|" +
+      cover +
+      "|" +
+      Math.round(vvTop) +
+      "|" +
+      navOffset +
+      "|" +
+      shrink;
+    const now = Date.now();
+    const isShift = tag.indexOf("viewport") >= 0;
+    if (isShift == true && key == lastDiagKey && now - lastDiagAt < 300) {
+      return;
+    }
+    lastDiagKey = key;
+    lastDiagAt = now;
+
+    const line =
+      "[kb-diag] " +
+      tag +
+      " platform=" +
+      platform +
+      " embedded=" +
+      embedded +
+      " locked=" +
+      locked +
+      " injH=" +
+      inj +
+      " coverH=" +
+      cover +
+      " navOff=" +
+      navOffset +
+      " shrink=" +
+      shrink +
+      " coverExtra=" +
+      coverExtra +
+      " vvTop=" +
+      Math.round(vvTop * 100) / 100 +
+      " vvH=" +
+      Math.round(vvH) +
+      " innerH=" +
+      Math.round(innerH) +
+      " clientH=" +
+      Math.round(clientH) +
+      " outerH=" +
+      Math.round(outerH) +
+      " scrollY=" +
+      Math.round(scrollY) +
+      " pageY=" +
+      Math.round(pageY) +
+      " vvLeft=" +
+      Math.round(vvLeft * 100) / 100 +
+      " vvScale=" +
+      vvScale +
+      " --vh=" +
+      cssVh.trim();
+    console.log(line);
+
+    try {
+      const payload: UTSJSONObject = {
+        "type": "kb-diag",
+        "tag": tag,
+        "platform": platform,
+        "embedded": embedded,
+        "locked": locked,
+        "injH": inj,
+        "coverH": cover,
+        "navOff": navOffset,
+        "shrink": shrink,
+        "coverExtra": coverExtra,
+        "vvTop": vvTop,
+        "vvH": vvH,
+        "innerH": innerH,
+        "clientH": clientH,
+        "scrollY": scrollY,
+        "cssVh": cssVh.trim(),
+      } as UTSJSONObject;
+      if (
+        w.uni != null &&
+        w.uni.webView != null &&
+        w.uni.webView.postMessage != null
+      ) {
+        w.uni.webView.postMessage({ "data": payload });
+      } else if (w.__uniapp_x_postMessage != null) {
+        w.__uniapp_x_postMessage({ "data": payload });
+      }
+    } catch (_ePost) {
+      // ignore
+    }
+  } catch (_e) {
+    console.log("[kb-diag] dump failed: " + tag);
+  }
+  // #endif
+}
+
+/**
+ * 按键盘高度开关文档滚动锁（仅 App web-view 内嵌页）。
+ */
+function clearChromeUnlockTimer(): void {
+  // #ifdef H5 || WEB
+  if (chromeUnlockTimerId != 0) {
+    try {
+      clearTimeout(chromeUnlockTimerId);
+    } catch (_e) {
+      // ignore
+    }
+    chromeUnlockTimerId = 0;
+  }
+  // #endif
+}
+
+function unlockKeyboardChromeStyles(): void {
+  // #ifdef H5 || WEB
+  stopKeyboardCoverRaf();
+  applyNavKeyboardOffsetDom(0);
+  try {
+    unbindViewportListeners();
+    const html = document.documentElement;
+    const body = document.body;
+    if (html != null) {
+      html.style.overflow = "";
+      html.style.height = "";
+      html.style.position = "";
+    }
+    if (body != null) {
+      body.style.overflow = "";
+      body.style.position = "";
+      body.style.width = "";
+      body.style.top = "";
+      body.style.left = "";
+      body.style.height = "";
+      body.style.bottom = "";
+    }
+    syncKeyboardCoverDom(0);
+    resetWindowScroll();
+    try {
+      window.dispatchEvent(new Event("resize"));
+    } catch (_eResize) {
+      // ignore
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * 按键盘高度开关文档滚动锁（仅 App web-view 内嵌页）。
+ */
+export function applyAppWebViewKeyboardChrome(height: number): void {
+  // #ifdef H5 || WEB
+  if (isAppWebViewEmbedded() != true) {
+    dumpKeyboardDiag(
+      "chrome-skip-not-embedded",
+      height,
+      resolveKeyboardCoverHeight(height),
+    );
+    return;
+  }
+  const lock = height > 0;
+  const cover = resolveKeyboardCoverHeight(height);
+  if (lock == keyboardChromeLocked) {
+    if (lock == true) {
+      resetWindowScroll();
+      syncKeyboardCoverDom(cover);
+      applyNavKeyboardOffsetDom(0);
+      startKeyboardCoverRaf();
+    }
+    dumpKeyboardDiag("chrome-same-state", height, cover);
+    return;
+  }
+  keyboardChromeLocked = lock;
+  try {
+    const html = document.documentElement;
+    const body = document.body;
+    if (lock == true) {
+      clearChromeUnlockTimer();
+      bindViewportListeners();
+      resetWindowScroll();
+      if (html != null) {
+        html.style.overflow = "hidden";
+      }
+      // 勿用 body.position=fixed：收起键盘后 iOS WebKit 易留下大片空白
+      if (body != null) {
+        body.style.overflow = "hidden";
+      }
+      syncKeyboardCoverDom(cover);
+      applyNavKeyboardOffsetDom(0);
+      startKeyboardCoverRaf();
+      dumpKeyboardDiag("chrome-lock", height, cover);
+    } else if (shouldAnimateKeyboardCover() == true) {
+      // 先让 cover 高度过渡，再清 overflow，避免「啪」一下回落
+      stopKeyboardCoverRaf();
+      applyNavKeyboardOffsetDom(0);
+      clearChromeUnlockTimer();
+      chromeUnlockTimerId = setTimeout(() => {
+        chromeUnlockTimerId = 0;
+        if (keyboardChromeLocked == true) {
+          return;
+        }
+        unlockKeyboardChromeStyles();
+        dumpKeyboardDiag("chrome-unlock-delayed", height, cover);
+      }, KB_COVER_ANIM_MS) as number;
+      dumpKeyboardDiag("chrome-unlock-pending", height, cover);
+    } else {
+      clearChromeUnlockTimer();
+      unlockKeyboardChromeStyles();
+      dumpKeyboardDiag("chrome-unlock", height, cover);
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}

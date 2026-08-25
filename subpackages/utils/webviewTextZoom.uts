@@ -9,6 +9,9 @@
  *
  * 用法：在包含 <web-view> 的页面 onLoad / onReady / @load 中调用 fixAppWebviewTextZoom()；
  * 内部带 100ms × 30 次短轮询，兼容 webview 尚未挂载的时序。
+ *
+ * 线程：web-view @load 可能在 JavaBridge 线程回调；WebView.settings 必须在主线程改，
+ * 否则抛 “A WebView method was called on thread 'JavaBridge'”。
  */
 
 // vapor 蒸汽模式编译器不解析纯 uts 文件的 android.* 业务 import（已知债务，见 docs/vapor/vapor-known-issues.md），
@@ -45,7 +48,9 @@ function findFirstWebView(view: View | null): WebView | null {
   return null
 }
 
-/** 单次尝试：找到 WebView 并设置 textZoom；未找到返回 false（由调用方轮询重试）。 */
+/**
+ * 单次尝试（须在主线程调用）：找到 WebView 并设置 textZoom；未找到返回 false。
+ */
 function applyWebviewTextZoomOnce(): boolean {
   const activity = UTSAndroid.getUniActivity()
   if (activity == null) {
@@ -63,8 +68,30 @@ function applyWebviewTextZoomOnce(): boolean {
   if (webView == null) {
     return false
   }
-  webView.settings.textZoom = 100
+  try {
+    webView.settings.textZoom = 100
+  } catch (_eZoom) {
+    return false
+  }
   return true
+}
+
+/** 把一次 apply 投递到主线程；ok 表示本轮已找到并改写成功。 */
+function applyWebviewTextZoomOnMain(onDone: (ok: boolean) => void): void {
+  const activity = UTSAndroid.getUniActivity()
+  if (activity == null) {
+    onDone(false)
+    return
+  }
+  activity.runOnUiThread((): void => {
+    let ok = false
+    try {
+      ok = applyWebviewTextZoomOnce()
+    } catch (_eApply) {
+      ok = false
+    }
+    onDone(ok)
+  })
 }
 // #endif
 
@@ -74,21 +101,41 @@ function applyWebviewTextZoomOnce(): boolean {
  */
 export function fixAppWebviewTextZoom(): void {
   // #ifdef APP-ANDROID && !VUE3-VAPOR
-  if (applyWebviewTextZoomOnce()) {
-    return
-  }
-  // 短轮询：webview 尚未挂载时每 100ms 重试，最多 30 次（3s）
   let attempts = 0
   let timer: number = 0
-  timer = setInterval((): void => {
-    attempts++
-    if (applyWebviewTextZoomOnce()) {
-      clearInterval(timer)
+  let stopped = false
+
+  const stopPoll = (): void => {
+    if (stopped == true) {
       return
     }
-    if (attempts >= 30) {
+    stopped = true
+    if (timer != 0) {
       clearInterval(timer)
+      timer = 0
     }
+  }
+
+  const tick = (): void => {
+    if (stopped == true) {
+      return
+    }
+    applyWebviewTextZoomOnMain((ok: boolean): void => {
+      if (ok == true) {
+        stopPoll()
+        return
+      }
+      attempts++
+      if (attempts >= 30) {
+        stopPoll()
+      }
+    })
+  }
+
+  // 立即投递一次（@load 时 WebView 多半已挂载），再短轮询兜底
+  tick()
+  timer = setInterval((): void => {
+    tick()
   }, 100) as number
   // #endif
 }

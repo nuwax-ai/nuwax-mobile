@@ -283,11 +283,18 @@
     <view
       class="ai-generate-text-container"
       :class="{ 'ios-wechat': isIOSWechatMiniProgram }"
+
+
+
+
+
+      :style="aiGenerateBottomStyle"
       >
       <text class="ai-generate-text">{{t("Mobile.Chat.aiGeneratedDisclaimer")}}</text>
     </view>
     <view
       class="keyboard-cover"
+      :class="{ 'keyboard-cover--animate': keyboardCoverAnimate }"
       :style="{ height: keyboardCoverHeight + 'px' }"
     ></view>
     <!-- 技能选择模态框 -->
@@ -319,6 +326,12 @@
     type NativeMediaPickedFile,
   } from "@/subpackages/utils/voice/nativeMediaBridge";
   import { isAppWebViewEmbedded } from "@/utils/system.uts";
+  import {
+    applyAppWebViewKeyboardChrome,
+    dumpKeyboardDiag,
+    resolveKeyboardCoverHeight,
+    shouldAnimateKeyboardCover,
+  } from "@/utils/appWebViewKeyboardChrome.uts";
   import {
     AgentManualComponentInfo,
     AgentSelectedComponentInfo,
@@ -424,6 +437,30 @@
   const isMultiLine = ref<boolean>(false);
   // 键盘高度
   const keyboardHeight = ref<number>(0);
+  /**
+   * 原生注入的底部安全区（px）。App web-view 内嵌优先用它，
+   * 避免鸿蒙 WebView/模拟器 env(safe-area-inset-bottom) 虚高。
+   * -1 = 尚未注入。
+   */
+  const injectedSafeAreaBottom = ref<number>(-1);
+
+  function readCachedInjectedSafeAreaBottom(): number {
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any;
+      const raw = w.__nuwaxSafeAreaBottom;
+      if (raw != null) {
+        const n = parseFloat(`${raw}`);
+        if (!isNaN(n) && n >= 0) {
+          return n;
+        }
+      }
+    } catch (_e) {
+      // ignore
+    }
+    // #endif
+    return -1;
+  }
 
   // #ifdef APP
   /** App 全局键盘高度监听 id（onKeyboardHeightChange 返回值） */
@@ -457,20 +494,43 @@
 
   // #ifdef H5 || WEB
   /**
-   * App web-view 内嵌页专用：接收原生壳注入的键盘高度。
-   * H5 运行时不会派发 keyboardheightchange，由 agent-detail 原生页监听
-   * uni.onKeyboardHeightChange 后 evalJS 注入（写 window.__nuwaxKeyboardHeight
-   * 并派发 'nuwax:keyboardHeightChange' CustomEvent）。
+   * App web-view 内嵌页：接收原生壳注入的键盘高度。
+   * Android / iOS / 鸿蒙均由 agent-detail 原生页 onKeyboardHeightChange（Android 另有
+   * WindowInsets 直读）注入完整 IME 高；H5 只存值驱动 keyboard-cover，并锁定文档滚动，
+   * 避免 iOS / 鸿蒙整页 pan 把固定导航栏顶出屏。
    */
   function onInjectedKeyboardHeightChange(evt: any): void {
     try {
       const detail = (evt as any)["detail"] as UTSJSONObject | null;
       if (detail != null) {
         const raw = detail["height"];
+        const safeRaw = detail["safeAreaBottom"];
         if (raw != null) {
           const h = parseFloat(`${raw}`);
           if (!isNaN(h)) {
-            keyboardHeight.value = h > 0 ? h : 0;
+            const next = h > 0 ? h : 0;
+            const safeN =
+              safeRaw != null ? parseFloat(`${safeRaw}`) : -1;
+            if (!isNaN(safeN) && safeN >= 0) {
+              injectedSafeAreaBottom.value = safeN;
+            }
+            console.log(
+              "[kb-diag] chat-input recv injH=" +
+                `${next}` +
+                " coverH=" +
+                `${resolveKeyboardCoverHeight(next)}` +
+                " safeBottom=" +
+                `${safeN}` +
+                " prevInj=" +
+                `${keyboardHeight.value}`,
+            );
+            keyboardHeight.value = next;
+            applyAppWebViewKeyboardChrome(next);
+            dumpKeyboardDiag(
+              "chat-input-cover",
+              next,
+              resolveKeyboardCoverHeight(next),
+            );
           }
         }
       }
@@ -574,8 +634,6 @@
       allowChooseMode?: number;
       // 是否启用语音输入（录音 + ASR）；仅 App web-view 内嵌页为 true
       enableVoice?: boolean;
-      /** 键盘抬升是否由外层布局接管（DeepSeek 方案：页面容器已按 屏高-键盘高 显式收缩时置 0，防双重位移） */
-      layoutHandlesKeyboard?: boolean;
     }>(),
     {
       manualComponents: () => [],
@@ -601,7 +659,6 @@
       // subscriptionRequired: false,
       allowChooseMode: 0,
       enableVoice: true,
-      layoutHandlesKeyboard: false,
     },
   );
 
@@ -610,11 +667,42 @@
    * 输入区随容器底部自然抬到键盘上方，再撑 cover 会造成双重位移）；
    * 否则用注入键盘高度顶起输入区（浏览器直开 / 旧 WebView 兜底）。
    */
+  /** 键盘占位高度：用注入 IME 高顶起输入区（iOS/鸿蒙与 Android 同为 cover-lock）。 */
   const keyboardCoverHeight = computed((): number => {
-    if (props.layoutHandlesKeyboard == true) {
-      return 0;
+    return resolveKeyboardCoverHeight(keyboardHeight.value);
+  });
+
+  /**
+   * 免责声明底部间距：
+   * - 键盘弹起：清零（由 keyboard-cover 垫高）；
+   * - App 内嵌：用原生 safeBottom，不用虚高的 env()；
+   * - 浏览器直开：走 CSS env(safe-area-inset-bottom)。
+   */
+  const aiGenerateBottomStyle = computed((): UTSJSONObject => {
+    const style: UTSJSONObject = {} as UTSJSONObject;
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded() == true) {
+      if (keyboardCoverHeight.value > 0) {
+        style["marginBottom"] = "0px";
+        return style;
+      }
+      let px = injectedSafeAreaBottom.value;
+      if (px < 0) {
+        px = readCachedInjectedSafeAreaBottom();
+        if (px >= 0) {
+          injectedSafeAreaBottom.value = px;
+        }
+      }
+      // 注入前也不用 env()，避免首屏虚高闪一下
+      style["marginBottom"] = px >= 0 ? `${Math.round(px)}px` : "0px";
     }
-    return keyboardHeight.value;
+    // #endif
+    return style;
+  });
+
+  /** iOS/鸿蒙：高度一次跳变，靠 CSS transition 对齐系统键盘动画 */
+  const keyboardCoverAnimate = computed((): boolean => {
+    return shouldAnimateKeyboardCover() == true;
   });
 
   /**
@@ -784,16 +872,23 @@
     // #endif
 
     // #ifdef H5 || WEB
-    // App web-view 内嵌页：接收原生壳注入的键盘高度（evalJS 写全局 + CustomEvent）
+    // 内嵌 / 浏览器直开统一：接收原生壳注入的键盘高度（evalJS 写全局 + CustomEvent）。
+    // Android / iOS / 鸿蒙内嵌由 agent-detail 注入；浏览器直开无原生壳，事件不触发，无副作用。
     try {
       const w = window as any;
       w.addEventListener("nuwax:keyboardHeightChange", onInjectedKeyboardHeightChange);
       // 桥注入可能早于本组件挂载（evalJS 先于渲染），读全局兜底一次
+      const cachedSafe = readCachedInjectedSafeAreaBottom();
+      if (cachedSafe >= 0) {
+        injectedSafeAreaBottom.value = cachedSafe;
+      }
       const cached = w.__nuwaxKeyboardHeight;
       if (cached != null) {
         const h = parseFloat(`${cached}`);
         if (!isNaN(h)) {
-          keyboardHeight.value = h > 0 ? h : 0;
+          const next = h > 0 ? h : 0;
+          keyboardHeight.value = next;
+          applyAppWebViewKeyboardChrome(next);
         }
       }
     } catch (_eObj) {
@@ -845,6 +940,8 @@
         "nuwax:keyboardHeightChange",
         onInjectedKeyboardHeightChange,
       );
+      // 组件卸载时解除文档滚动锁，避免残留 overflow:hidden
+      applyAppWebViewKeyboardChrome(0);
     } catch (_eObj) {
       // ignore
     }
@@ -2438,9 +2535,11 @@
     // #ifdef APP-ANDROID
     margin-bottom: env(safe-area-inset-bottom);
     // #endif
-    // #ifndef APP-ANDROID
-    padding-bottom: env(safe-area-inset-bottom);
-    // #endif
+
+    // App 内嵌 iOS/鸿蒙：原生事件常一次给终值，用过渡对齐系统键盘约 280ms 动画
+    &--animate {
+      transition: height 0.28s cubic-bezier(0.33, 1, 0.68, 1);
+    }
   }
   .ai-generate-text {
     font-size: 18rpx;

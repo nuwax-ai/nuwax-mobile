@@ -38,6 +38,167 @@ import { orObject, orString } from "@/utils/utsCoalesce";
 // 请求/响应日志开关：开发环境(HBuilderX 运行=development)自动开，发行打包(NODE_ENV=production，如打 APK)自动关
 // const ENABLE_REQUEST_LOG = process.env.NODE_ENV !== "production";
 
+/**
+ * 规范化 cookie 票据值：尝试 URL 解码 + 去 Bearer 前缀（与 speechToken.normalizeAccessToken 对齐）。
+ */
+function normalizeTicketValue(value: string): string {
+  let v = value;
+  try {
+    const decoded = decodeURIComponent(v);
+    if (decoded != null) {
+      v = decoded;
+    }
+  } catch (_eDecode) {
+    // JWT 等未编码值时 decodeURIComponent 可能抛错：原样保留
+  }
+  if (v.startsWith("Bearer ")) {
+    v = v.substring(7);
+  }
+  return v;
+}
+
+/** 从一条 Set-Cookie 指令中提取 ticket 值（形如 ticket=xxx; Path=/; HttpOnly；无则空串） */
+function extractTicketFromSetCookie(setCookieStr: string): string {
+  if (setCookieStr == null || setCookieStr.length == 0) {
+    return "";
+  }
+  // 只取第一个分号前（name=value），避免 Expires 等属性值里的分号干扰
+  const segEnd = setCookieStr.indexOf(";");
+  const nameValue = segEnd >= 0 ? setCookieStr.substring(0, segEnd) : setCookieStr;
+  const eq = nameValue.indexOf("=");
+  if (eq < 0) {
+    return "";
+  }
+  const name = nameValue.substring(0, eq).trim();
+  if (name != "ticket") {
+    return "";
+  }
+  return normalizeTicketValue(nameValue.substring(eq + 1).trim());
+}
+
+/**
+ * 从 header 的 Set-Cookie 字段提取 ticket 值。
+ * okhttp 会把多个 Set-Cookie 聚合为逗号分隔的一个字符串，而 cookie 属性值（Expires 等）
+ * 自身也可能含逗号，不能按逗号切分还原；直接在整个串里扫描 "ticket=" 更稳。
+ * JWT 值不含 ; / , / 空格，可安全截取到第一个分隔符。
+ */
+function extractTicketFromSetCookieHeader(headerValue: string): string {
+  if (headerValue == null || headerValue.length == 0) {
+    return "";
+  }
+  const needle = "ticket=";
+  let searchFrom = 0;
+  while (true) {
+    const idx = headerValue.indexOf(needle, searchFrom);
+    if (idx < 0) {
+      return "";
+    }
+    // 须是独立 cookie 名（前面为串首、空格或分号），避免 x_ticket= 等子串误命中
+    const before = idx == 0 ? ";" : headerValue.charAt(idx - 1);
+    if (before == ";" || before == " ") {
+      const start = idx + needle.length;
+      let end = start;
+      while (end < headerValue.length) {
+        const ch = headerValue.charAt(end);
+        if (ch == ";" || ch == "," || ch == " ") {
+          break;
+        }
+        end++;
+      }
+      return normalizeTicketValue(headerValue.substring(start, end));
+    }
+    searchFrom = idx + needle.length;
+  }
+}
+
+/** H5：从 document.cookie 读 ticket（仅非 HttpOnly 可读） */
+// #ifdef H5 || WEB
+function readDocumentCookieTicket(): string {
+  try {
+    const raw = document.cookie;
+    if (raw == null || raw.length == 0) {
+      return "";
+    }
+    const parts = raw.split(";");
+    const prefix = "ticket=";
+    for (let i = 0; i < parts.length; i++) {
+      let part = parts[i];
+      while (part.length > 0 && part.charAt(0) == " ") {
+        part = part.substring(1);
+      }
+      if (part.indexOf(prefix) == 0) {
+        return normalizeTicketValue(part.substring(prefix.length));
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return "";
+}
+// #endif
+
+/**
+ * 登录票据（ticket）同步：把响应/环境里的 ticket 写入本地 token（ACCESS_TOKEN）。
+ * 优先级：
+ * 1. 响应 Set-Cookie（App 端 res.cookies 是 uni-app x 官方解析数组，每条一项）
+ * 2. document.cookie（H5 端：Set-Cookie 响应头属浏览器禁用头不暴露给 JS，
+ *    同源下浏览器已自动写入，直接从 cookie 读即可）
+ * 未取得 ticket 时保持原 token 不动。
+ */
+function syncTicketToLocalToken(
+  resHeader: UTSJSONObject | null,
+  setCookies: Array<string> | null,
+): void {
+  // #ifdef APP
+  // 1. 优先：响应 header 里的 Set-Cookie（原始头；key 大小写不确定，两个写法都试）
+  try {
+    if (resHeader != null) {
+      let setCookieRaw = resHeader["Set-Cookie"];
+      if (setCookieRaw == null) {
+        setCookieRaw = resHeader["set-cookie"];
+      }
+      if (setCookieRaw != null) {
+        // Set-Cookie 存在但里面没有 ticket 时返回空，不会误写
+        const ticket = extractTicketFromSetCookieHeader(`${setCookieRaw}`);
+        if (ticket.length > 0) {
+          uni.setStorageSync(ACCESS_TOKEN, ticket);
+          return;
+        }
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // 2. 兜底：res.cookies（uni-app x 官方 Set-Cookie 解析数组，每条一项；
+  //    若 uni-app x 已把 Set-Cookie 从 header 剥离交给 CookieManager，此路兜上）
+  try {
+    if (setCookies != null && setCookies.length > 0) {
+      for (let i = 0; i < setCookies.length; i++) {
+        const ticket = extractTicketFromSetCookie(`${setCookies[i]}`);
+        if (ticket.length > 0) {
+          uni.setStorageSync(ACCESS_TOKEN, ticket);
+          return;
+        }
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+  // #ifdef H5 || WEB
+  // H5：Set-Cookie 响应头属浏览器禁用头不暴露给 JS，同源下浏览器已自动写入，直接从 cookie 读
+  try {
+    const ticket = readDocumentCookieTicket();
+    if (ticket.length > 0) {
+      uni.setStorageSync(ACCESS_TOKEN, ticket);
+      return;
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
 // 微信小程序：request
 // 参数/返回值均用 any：Android 运行时对象字面量与响应体均为 UTSJSONObject，禁止 interface 强转
 export default function request(options: any): Promise<any> {
@@ -160,6 +321,15 @@ export default function request(options: any): Promise<any> {
       timeout: timeoutNum,
       header: header,
       success: (res) => {
+        // 登录票据同步：优先从响应 Set-Cookie 提取 ticket 写入本地 token（ACCESS_TOKEN），
+        // 无 Set-Cookie 时退回 document.cookie（H5 端 Set-Cookie 头不暴露给 JS，浏览器已自动写入）。
+        // #ifdef APP
+        // res.header 类型为 any，须断言为 UTSJSONObject（UTS 不允许 any → UTSJSONObject? 隐式传参）
+        syncTicketToLocalToken(res.header as UTSJSONObject, res.cookies);
+        // #endif
+        // #ifndef APP
+        syncTicketToLocalToken(null, null);
+        // #endif
         // res.data 已是 UTSJSONObject，禁止 JSON.parse<T> 或强转为 interface
         const responseData = res.data;
         const respObj = responseData != null ? (responseData as UTSJSONObject) : null;

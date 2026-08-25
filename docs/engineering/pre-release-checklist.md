@@ -14,7 +14,7 @@
   - 脱敏扫码日志 `[provision-entry] scan raw ... / parse ...`：正式版可降级或移除。
 - [ ] **`uni_modules/nuwax-esp-provisioning/.../EspProvisioningBridge.swift` + `utils/provisioning/iosEspProvisioningClient.uts`**
   - `[EspBridge→UTS]` 原生日志通道（`fwd` → `logSink` → `console.log`）：非密钥（不打 PoP/密码），但属调试噪声。正式版建议**降级为只在异常时输出**，或加 debug 开关。
-- [ ] **`@UTSJS.keepAlive`**（`setNativeEspLog` / `startNativeEspScan` / `provisionNativeEspDevice`）：保留（修的是真 bug，非调试残留）。
+- [ ] **`@UTSJS.keepAlive`**（iOS `index.uts` 全部异步回调导出：`setNativeEspLog` / `startNativeEspScan` / `connectNativeEspDevice` / `getNativeEspCapabilities` / `getNativeEspDeviceInfo` / `sendNativeEspCustomData` / `scanNativeEspNetworks` / `provisionNativeEspDevice`）：保留（修的是真 bug，非调试残留）。与 Android `index.uts` 逐个对齐，新增异步导出必须同步补标。
 
 ## 🔑 密钥与签名（已处理，发布前复核）
 

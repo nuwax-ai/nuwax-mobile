@@ -18,6 +18,10 @@ let lastDiagKey: string = "";
 let lastDiagAt: number = 0;
 /** iOS/鸿蒙收起时延迟清 overflow，避免 cover 高度过渡被瞬间打断 */
 let chromeUnlockTimerId: number = 0;
+/** 锁定期每帧按 vvTop 收 cover 高度（消除空白），不碰导航 */
+let keyboardCoverRafId: number = 0;
+/** 上次写入的 cover 高度，避免无意义 DOM 写入 */
+let lastSyncedCoverPx: number = -1;
 
 /** 与系统键盘动画接近的 cover 过渡时长（毫秒） */
 const KB_COVER_ANIM_MS: number = 280;
@@ -83,14 +87,121 @@ export function shouldZeroKeyboardCoverOnPlatform(): boolean {
 
 /**
  * 实际用于垫高输入区的 cover 高度。
- * iOS/鸿蒙与 Android 对齐：一律用注入 IME 高垫高；滚动由原生 inject-dom 锁住，
- * 不再用「先 pan 再 translateY」以免导航飞出回弹。
+ * - 无 pan（vvTop≈0）：用满高注入 IME，抬输入区、稳住导航（勿因 shrink 清零，否则会逼出大 pan）。
+ * - 有 pan（vvTop>0）：可见空白 ≈ cover - shrink + vvTop；令 cover = inj - vvTop，
+ *   则空白 ≈ inj - shrink（shrink≈inj 时为 0）。必须改布局 height，不能用 transform
+ *  （transform 不释放占位，空白仍在）。
  */
 export function resolveKeyboardCoverHeight(injectedH: number): number {
   if (injectedH <= 0) {
     return 0;
   }
+  // #ifdef H5 || WEB
+  const platform = readNuwaxKbPlatform();
+  if (platform == "harmony" || platform == "ios") {
+    const vvTop = readVisualViewportOffsetTop();
+    if (vvTop > 2) {
+      const next = injectedH - vvTop;
+      return next > 2 ? Math.round(next) : 0;
+    }
+  }
+  // #endif
   return injectedH;
+}
+
+/**
+ * 把 cover 布局高度写回 DOM（!important 压过 Vue）。禁止 transition，以便跟手 vvTop。
+ */
+function syncKeyboardCoverDom(coverPx: number): void {
+  // #ifdef H5 || WEB
+  try {
+    const covers = document.querySelectorAll(".keyboard-cover");
+    const h = coverPx > 0 ? coverPx : 0;
+    for (let i = 0; i < covers.length; i++) {
+      const el = covers[i] as HTMLElement | null;
+      if (el == null) {
+        continue;
+      }
+      el.style.setProperty("transition", "none", "important");
+      el.style.setProperty("transform", "none", "important");
+      el.style.setProperty("height", `${h}px`, "important");
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+function stopKeyboardCoverRaf(): void {
+  // #ifdef H5 || WEB
+  if (keyboardCoverRafId != 0) {
+    try {
+      cancelAnimationFrame(keyboardCoverRafId);
+    } catch (_e) {
+      // ignore
+    }
+    keyboardCoverRafId = 0;
+  }
+  lastSyncedCoverPx = -1;
+  // #endif
+}
+
+function tickKeyboardCoverRaf(): void {
+  // #ifdef H5 || WEB
+  keyboardCoverRafId = 0;
+  if (keyboardChromeLocked != true) {
+    return;
+  }
+  resetWindowScroll();
+  applyNavKeyboardOffsetDom(0);
+  const inj = readInjectedKeyboardHeight();
+  const cover = inj > 0 ? resolveKeyboardCoverHeight(inj) : 0;
+  if (cover != lastSyncedCoverPx) {
+    lastSyncedCoverPx = cover;
+    syncKeyboardCoverDom(cover);
+  }
+  try {
+    keyboardCoverRafId = requestAnimationFrame(tickKeyboardCoverRaf) as number;
+  } catch (_e) {
+    keyboardCoverRafId = 0;
+  }
+  // #endif
+}
+
+function startKeyboardCoverRaf(): void {
+  // #ifdef H5 || WEB
+  if (keyboardCoverRafId != 0) {
+    return;
+  }
+  lastSyncedCoverPx = -1;
+  try {
+    keyboardCoverRafId = requestAnimationFrame(tickKeyboardCoverRaf) as number;
+  } catch (_e) {
+    keyboardCoverRafId = 0;
+  }
+  // #endif
+}
+
+/**
+ * 兼容旧调用：导航不做 translateY（恒钉顶）。
+ */
+export function applyNavKeyboardOffsetDom(_offsetTop: number): void {
+  // #ifdef H5 || WEB
+  try {
+    const navs = document.querySelectorAll(".layout-fixed");
+    for (let i = 0; i < navs.length; i++) {
+      const el = navs[i] as HTMLElement | null;
+      if (el == null) {
+        continue;
+      }
+      el.style.setProperty("transition", "none", "important");
+      el.style.top = "0px";
+      el.style.setProperty("transform", "none", "important");
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
 }
 
 /**
@@ -135,7 +246,8 @@ export function readVisualViewportOffsetTop(): number {
 }
 
 /**
- * 导航栏钉顶补偿量：cover-lock 模式下恒为 0（导航靠 position:fixed 钉住）。
+ * 导航栏钉顶补偿量：cover-lock 模式下恒为 0。
+ * 导航靠 position:fixed + 满高 keyboard-cover 维持，不做 translateY（否则必现「先顶走再滑回」）。
  */
 export function resolveNavKeyboardOffset(): number {
   return 0;
@@ -166,6 +278,11 @@ function onViewportShift(): void {
     return;
   }
   resetWindowScroll();
+  applyNavKeyboardOffsetDom(0);
+  const inj = readInjectedKeyboardHeight();
+  if (inj > 0) {
+    syncKeyboardCoverDom(resolveKeyboardCoverHeight(inj));
+  }
   dumpKeyboardDiag("viewport-shift", -1, -1);
 }
 
@@ -379,6 +496,8 @@ function clearChromeUnlockTimer(): void {
 
 function unlockKeyboardChromeStyles(): void {
   // #ifdef H5 || WEB
+  stopKeyboardCoverRaf();
+  applyNavKeyboardOffsetDom(0);
   try {
     unbindViewportListeners();
     const html = document.documentElement;
@@ -397,7 +516,7 @@ function unlockKeyboardChromeStyles(): void {
       body.style.height = "";
       body.style.bottom = "";
     }
-    // 不在此 removeProperty(height)：交给 Vue style / 原生 softClose 做过渡
+    syncKeyboardCoverDom(0);
     resetWindowScroll();
     try {
       window.dispatchEvent(new Event("resize"));
@@ -428,6 +547,9 @@ export function applyAppWebViewKeyboardChrome(height: number): void {
   if (lock == keyboardChromeLocked) {
     if (lock == true) {
       resetWindowScroll();
+      syncKeyboardCoverDom(cover);
+      applyNavKeyboardOffsetDom(0);
+      startKeyboardCoverRaf();
     }
     dumpKeyboardDiag("chrome-same-state", height, cover);
     return;
@@ -447,9 +569,14 @@ export function applyAppWebViewKeyboardChrome(height: number): void {
       if (body != null) {
         body.style.overflow = "hidden";
       }
+      syncKeyboardCoverDom(cover);
+      applyNavKeyboardOffsetDom(0);
+      startKeyboardCoverRaf();
       dumpKeyboardDiag("chrome-lock", height, cover);
     } else if (shouldAnimateKeyboardCover() == true) {
       // 先让 cover 高度过渡，再清 overflow，避免「啪」一下回落
+      stopKeyboardCoverRaf();
+      applyNavKeyboardOffsetDom(0);
       clearChromeUnlockTimer();
       chromeUnlockTimerId = setTimeout(() => {
         chromeUnlockTimerId = 0;

@@ -9,10 +9,12 @@ import {
   apiPayWechatJsapi,
   apiPayH5Web,
   apiPayAppNative,
+  apiPayHuaweiIap,
 } from "@/subpackages/servers/subscription";
 import {
   PayMode,
   PayChannel,
+  PayOrderKind,
 } from "@/subpackages/types/interfaces/subscription";
 import { orEmpty, orString } from "@/utils/utsCoalesce.uts";
 
@@ -21,6 +23,18 @@ import {
   launchAnxinfuMiniProgramNative,
   openPayUrlNative,
 } from "@/uni_modules/nuwax-android-native-pay";
+// #endif
+
+// #ifdef APP-HARMONY
+import {
+  launchAnxinfuMiniProgramNative,
+  openPayUrlNative,
+  iapQueryEnvironmentNative,
+  iapCreatePurchaseNative,
+  iapQueryPurchasesNative,
+  iapFinishPurchaseNative,
+  IAP_PRODUCT_TYPE_AUTORENEWABLE,
+} from "@/uni_modules/nuwax-harmony-native-pay";
 // #endif
 
 const ANXINFU_MINIPROGRAM_USER_NAME = "gh_cd6acad9a40d";
@@ -96,7 +110,15 @@ export function launchAnxinfuMiniProgram(redirectUrl: string): Promise<any> {
   );
   // #endif
 
-  // #ifndef APP-ANDROID
+  // #ifdef APP-HARMONY
+  // 同 Android：直调鸿蒙原生插件，避免依赖跨分包的桥注册状态。
+  return launchAnxinfuMiniProgramNative(
+    options.getString("userName") ?? "",
+    options.getString("path") ?? "",
+  );
+  // #endif
+
+  // #ifndef APP-ANDROID || APP-HARMONY
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native wx.miniapp bridge is unavailable"));
@@ -112,7 +134,11 @@ export function openAppPayUrl(url: string): Promise<any> {
   return openPayUrlNative(url);
   // #endif
 
-  // #ifndef APP-ANDROID
+  // #ifdef APP-HARMONY
+  return openPayUrlNative(url);
+  // #endif
+
+  // #ifndef APP-ANDROID || APP-HARMONY
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native pay url bridge is unavailable"));
@@ -950,6 +976,9 @@ async function executeWebH5PayFlow(
 /**
  * App 原生支付流程：选择渠道 → app-native → 原生桥 → 服务端结算轮询。
  * 原生桥回调只代表客户端动作，业务成功始终以 settlement-status 为准。
+ *
+ * 鸿蒙端虚拟商品（orderKind=VIRTUAL）按华为政策强制走华为 IAP（executeHarmonyIapPayFlow）；
+ * 实物商品及 Android / iOS 保持微信 / 支付宝双渠道 ActionSheet。
  */
 export async function executeAppNativePayFlow(
   orderId: number,
@@ -957,8 +986,16 @@ export async function executeAppNativePayFlow(
   loading: Ref<boolean>,
   t: (key: string) => string,
   onSuccess?: () => void,
+  orderKind: PayOrderKind = PayOrderKind.PHYSICAL,
 ): Promise<void> {
   uni.hideLoading();
+
+  // #ifdef APP-HARMONY
+  if (HARMONY_IAP_ENABLED && orderKind == PayOrderKind.VIRTUAL) {
+    await executeHarmonyIapPayFlow(orderId, processingId, loading, t, onSuccess);
+    return;
+  }
+  // #endif
 
   const handleSelectedChannel = async (tapIndex: number): Promise<void> => {
     const payChannel = tapIndex == 1
@@ -973,7 +1010,9 @@ export async function executeAppNativePayFlow(
     try {
       const requestData = new UTSJSONObject();
       requestData["orderId"] = orderId as any;
-      requestData["payChannel"] = payChannel.value as any;
+      // PayChannel 为 string 枚举：Android 的 UTS Kotlin enum 带 .value 扩展，
+      // 鸿蒙 ArkTS 端没有（.value 为 undefined 且后端无法路由渠道），统一字符串化。
+      requestData["payChannel"] = `${payChannel}` as any;
       console.log('start:',requestData)
       const payRes = await apiPayAppNative(requestData);
       console.log('end:',payRes)
@@ -1027,6 +1066,14 @@ export async function executeAppNativePayFlow(
     }
   };
 
+  // #ifdef APP-HARMONY
+  // 微信 OpenSDK 鸿蒙配置未就绪时屏蔽微信渠道：单一渠道不弹选择框，直接走支付宝。
+  if (!HARMONY_WECHAT_PAY_ENABLED) {
+    await handleSelectedChannel(1);
+    return;
+  }
+  // #endif
+
   uni.showActionSheet({
     itemList: [
       t("Mobile.MySubscriptions.wechatPay"),
@@ -1040,6 +1087,184 @@ export async function executeAppNativePayFlow(
     },
   });
 }
+
+// ========== 华为 IAP 工具函数（App-Harmony 虚拟商品）==========
+// #ifdef APP-HARMONY
+
+/**
+ * 华为 IAP 总开关：false 时鸿蒙虚拟商品暂走微信/支付宝（与 Android 一致）。
+ * AGC（商户服务 / 应用内购买服务 / 商品配置 + 后端验票接口）就绪后置 true。
+ * ⚠️ 上架 AppGallery 前必须置 true——华为政策要求虚拟商品走 IAP，届时
+ * 「我的订单」继续支付也需按订单真实类别精确分流（依赖后端下发 orderKind）。
+ */
+const HARMONY_IAP_ENABLED = false;
+
+/**
+ * 鸿蒙微信支付开关：false 时鸿蒙端跳过渠道选择直接走支付宝。
+ * 微信开放平台鸿蒙配置（移动应用 wxe2a12018505241ba 的鸿蒙平台信息，
+ * 包名 com.nuwax.apphm）审核通过后置 true，恢复「微信/支付宝」双渠道弹框。
+ */
+const HARMONY_WECHAT_PAY_ENABLED = false;
+
+/**
+ * 华为 IAP 商品 productId 占位：AGC 商品配置与「订单 → productId」后端映射接口
+ * 均在办理中，下发后替换 getHarmonyIapProductId 的实现（配置未就绪时购买会被 IAP 拒绝，
+ * 属预期行为，不影响其他渠道）。
+ */
+const HARMONY_IAP_PLACEHOLDER_PRODUCT_ID = "nuwax_iap_product_placeholder";
+
+/** IAP 商品类型：自动续期订阅（充值/消耗型接入时改用 IAP_PRODUCT_TYPE_CONSUMABLE 并按订单细分）。 */
+const HARMONY_IAP_PRODUCT_TYPE = IAP_PRODUCT_TYPE_AUTORENEWABLE;
+
+function getHarmonyIapProductId(_orderId: number): string {
+  // TODO(pay): 后端「订单 → AGC productId」映射接口就绪后替换占位。
+  return HARMONY_IAP_PLACEHOLDER_PRODUCT_ID;
+}
+
+/**
+ * IAP 购买结果交服务端验票，验票通过（后端发货）后 finishPurchase 确认。
+ * 返回 true 表示验票 + 确认均成功；失败时已自行提示并返回 false。
+ */
+async function settleIapPurchase(
+  orderId: number,
+  summary: UTSJSONObject,
+  t: (key: string) => string,
+): Promise<boolean> {
+  const requestData = new UTSJSONObject();
+  requestData["orderId"] = orderId as any;
+  requestData["purchaseData"] = summary["purchaseData"];
+  requestData["purchaseToken"] = summary["purchaseToken"];
+  requestData["purchaseOrderId"] = summary["purchaseOrderId"];
+  requestData["productId"] = summary["productId"];
+  // TODO(pay): apiPayHuaweiIap 为占位 URL；后端上线前验票必失败（安全兜底：不发货不 finish）。
+  const verifyRes = await apiPayHuaweiIap(requestData);
+  if (apiResCode(verifyRes) != SUCCESS_CODE) {
+    uni.hideLoading();
+    uni.showToast({
+      title: orString(
+        verifyRes["message"],
+        t("Mobile.MySubscriptions.payFailed"),
+      ),
+      icon: "none",
+    });
+    return false;
+  }
+  // finishPurchase 前置校验：JWS payload 字段缺失时不可默认兜底（productType 若
+  // 默认 0 会以消耗型错误确认订单），跳过 finish 留待 queryPurchases(UNFINISHED) 补单。
+  const productTypeRaw = `${summary["productType"] ?? ""}`;
+  const purchaseToken = `${summary["purchaseToken"] ?? ""}`;
+  const purchaseOrderId = `${summary["purchaseOrderId"] ?? ""}`;
+  if (
+    productTypeRaw.length == 0 ||
+    Number.isNaN(Number(productTypeRaw)) ||
+    purchaseToken.length == 0 ||
+    purchaseOrderId.length == 0
+  ) {
+    console.error("harmony iap purchase summary incomplete, skip finishPurchase");
+    return true;
+  }
+  const finishRes = await iapFinishPurchaseNative(
+    Number(productTypeRaw),
+    purchaseToken,
+    purchaseOrderId,
+  );
+  if (finishRes["ok"] != true) {
+    console.error("harmony iap finishPurchase failed:", finishRes["code"], finishRes["message"]);
+    // finish 失败不阻断：订单已由后端发货，未确认项可经 queryPurchases(UNFINISHED) 补单。
+  }
+  return true;
+}
+
+/** 官方建议的补单路径：查询未完成订单并逐单走验票 + finish。 */
+async function recoverUnfinishedIapPurchases(
+  orderId: number,
+  t: (key: string) => string,
+): Promise<void> {
+  const res = await iapQueryPurchasesNative(HARMONY_IAP_PRODUCT_TYPE, true);
+  if (res["ok"] != true) {
+    console.error("harmony iap queryPurchases failed:", res["code"], res["message"]);
+    return;
+  }
+  const orders = res["orders"] as Array<any>;
+  for (let i = 0; i < orders.length; i++) {
+    const summary = orders[i] as UTSJSONObject;
+    // TODO(pay): 补单订单与业务订单的归属应由后端按 purchaseToken 匹配，当前透传触发订单 id。
+    await settleIapPurchase(orderId, summary, t);
+  }
+}
+
+/** 鸿蒙虚拟商品支付主流程：环境检查 → IAP 收银台 → 服务端验票 → finish → 结算轮询。 */
+async function executeHarmonyIapPayFlow(
+  orderId: number,
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+  t: (key: string) => string,
+  onSuccess?: () => void,
+): Promise<void> {
+  processingId.value = orderId;
+  loading.value = true;
+  uni.showLoading({
+    title: t("Mobile.MySubscriptions.payPending"),
+    mask: true,
+  });
+  try {
+    const env = await iapQueryEnvironmentNative();
+    if (env["ok"] != true) {
+      // 华为账号未登录 / 服务不可用等统一提示失败；专属引导文案待 i18n 需求补齐。
+      // 常见错误码（DevEco SDK IAPErrorCode）：1001860002 APP_NOT_AUTHORIZED =
+      // AGC 未开通/未生效「应用内购买服务」（占位期联调的预期表现，配置完成后即通）；
+      // 1001860050 ACCOUNT_NOT_LOGGED_IN = 测试机未登录华为账号。
+      uni.hideLoading();
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.payFailed"),
+        icon: "none",
+      });
+      console.error("harmony iap environment unavailable:", env["code"], env["message"]);
+      return;
+    }
+
+    const purchase = await iapCreatePurchaseNative(
+      getHarmonyIapProductId(orderId),
+      HARMONY_IAP_PRODUCT_TYPE,
+    );
+    if (purchase["ok"] != true) {
+      if (purchase["needRecover"] == true) {
+        await recoverUnfinishedIapPurchases(orderId, t);
+      } else {
+        console.error("harmony iap createPurchase failed:", purchase["code"], purchase["message"]);
+      }
+      uni.hideLoading();
+      uni.showToast({
+        title: t("Mobile.MySubscriptions.payFailed"),
+        icon: "none",
+      });
+      return;
+    }
+
+    const summary = purchase["summary"] as UTSJSONObject;
+    const settled = await settleIapPurchase(orderId, summary, t);
+    if (!settled) {
+      return;
+    }
+
+    const result = await pollPayResult(orderId);
+    uni.hideLoading();
+    handlePayResultToast(result, t, onSuccess);
+  } catch (e) {
+    uni.hideLoading();
+    uni.showToast({
+      title: t("Mobile.MySubscriptions.payFailed"),
+      icon: "none",
+    });
+    console.error("harmony iap payment flow error:", e);
+  } finally {
+    uni.hideLoading();
+    processingId.value = null;
+    loading.value = false;
+  }
+}
+
+// #endif
 
 // #endif
 
@@ -1170,12 +1395,17 @@ export async function executeMinipayFlow(
 /**
  * 跨端统一支付执行分流入口（自动自适应小程序或 H5/Web 环境并分发执行流程）
  */
+/**
+ * 跨端统一支付执行分流入口（自动自适应小程序或 H5/Web 环境并分发执行流程）。
+ * orderKind 默认 PHYSICAL；鸿蒙端虚拟商品（订阅/充值）传 VIRTUAL 走华为 IAP。
+ */
 export async function executePayFlow(
   orderId: number,
   processingId: Ref<number | null>,
   loading: Ref<boolean>,
   t: (key: string) => string,
   onSuccess?: () => void,
+  orderKind: PayOrderKind = PayOrderKind.PHYSICAL,
 ): Promise<void> {
   // #ifdef MP-WEIXIN
   await executeMinipayFlow(orderId, processingId, t, onSuccess);
@@ -1184,7 +1414,7 @@ export async function executePayFlow(
   await executeWebPayFlow(orderId, processingId, loading, t, onSuccess);
   // #endif
   // #ifdef APP
-  await executeAppNativePayFlow(orderId, processingId, loading, t, onSuccess);
+  await executeAppNativePayFlow(orderId, processingId, loading, t, onSuccess, orderKind);
   // #endif
 }
 

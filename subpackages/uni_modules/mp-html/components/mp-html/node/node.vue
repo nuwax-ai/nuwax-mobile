@@ -730,7 +730,7 @@
         // #endif
         // 自动预览图片
         if (this.root.previewImg) {
-          uni.previewImage({
+          const previewOpts = {
             // #ifdef MP-WEIXIN
             showmenu: this.root.showImgMenu,
             // #endif
@@ -740,7 +740,15 @@
             // #endif
             current: parseInt(node.attrs.i),
             urls: this.root.imgList
-          })
+          }
+          // App 内嵌 H5：uni.previewImage 关闭会 history.back / navigateBack，把原生聊天页弹回首页
+          try {
+            if (typeof window !== 'undefined' && typeof window.__nuwaxPreviewImage === 'function') {
+              window.__nuwaxPreviewImage(previewOpts)
+              return
+            }
+          } catch (ePrev) {}
+          uni.previewImage(previewOpts)
         }
       },
 

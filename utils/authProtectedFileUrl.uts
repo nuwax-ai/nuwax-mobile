@@ -1,6 +1,7 @@
 /**
  * 受保护文件 URL 鉴权拉取与打开
  * 对齐 nuwax Web 版 authProtectedFileUrl.ts
+ * pathname 用字符串切分，避免 App/Kotlin 不支持 Web URL 与可选链。
  */
 import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
@@ -8,34 +9,77 @@ import { jumpToFilePreviewPage } from "@/utils/system.uts";
 
 const AUTH_PROTECTED_FILE_PATH_RE = /\/api\/f\//i;
 
+function isHttpUrl(url: string): boolean {
+  return url.indexOf("http://") == 0 || url.indexOf("https://") == 0;
+}
+
+/**
+ * 从 URL 中提取 pathname（去掉协议、host、query、hash）。
+ * 不依赖 Web URL API，兼容 App/Kotlin。
+ */
+function extractPathname(url: string): string {
+  let path = url;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    path = path.substring(0, hashIdx);
+  }
+  const queryIdx = path.indexOf("?");
+  if (queryIdx >= 0) {
+    path = path.substring(0, queryIdx);
+  }
+  if (isHttpUrl(path)) {
+    const protoIdx = path.indexOf("://");
+    const afterProto = path.substring(protoIdx + 3);
+    const slashIdx = afterProto.indexOf("/");
+    if (slashIdx >= 0) {
+      return afterProto.substring(slashIdx);
+    }
+    return "/";
+  }
+  if (path.length == 0) {
+    return "/";
+  }
+  if (path.indexOf("/") != 0) {
+    return `/${path}`;
+  }
+  return path;
+}
+
+function extractFileNameFromUrl(url: string): string {
+  const path = extractPathname(url);
+  const lastSlash = path.lastIndexOf("/");
+  if (lastSlash >= 0 && lastSlash < path.length - 1) {
+    return path.substring(lastSlash + 1);
+  }
+  return "download";
+}
+
 /** 判断 URL 是否为需 Bearer 鉴权才能加载的文件地址。 */
-export function isAuthProtectedFileUrl(url: string | undefined): boolean {
-  if (!url?.trim()) {
+export function isAuthProtectedFileUrl(url: string): boolean {
+  if (url.length == 0) {
     return false;
   }
-  try {
-    const parsed = /^https?:\/\//i.test(url)
-      ? new URL(url)
-      : new URL(url.startsWith("/") ? url : `/${url}`, getApiBaseUrl());
-    return AUTH_PROTECTED_FILE_PATH_RE.test(parsed.pathname);
-  } catch {
-    return AUTH_PROTECTED_FILE_PATH_RE.test(url);
+  const trimmed = url.trim();
+  if (trimmed.length == 0) {
+    return false;
   }
+  return AUTH_PROTECTED_FILE_PATH_RE.test(extractPathname(trimmed));
 }
 
 /** 将相对或绝对文件 URL 规范化为可请求的完整地址。 */
 export function resolveAuthProtectedFileFetchUrl(url: string): string {
-  if (/^https?:\/\//i.test(url)) {
+  if (isHttpUrl(url)) {
     return url;
   }
-  const normalizedPath = url.startsWith("/") ? url : `/${url}`;
+  const normalizedPath = url.indexOf("/") == 0 ? url : `/${url}`;
   return `${getApiBaseUrl()}${normalizedPath}`;
 }
 
 function buildAuthHeaders(): UTSJSONObject {
-  const token = uni.getStorageSync(ACCESS_TOKEN) ?? "";
+  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+  const token = tokenRaw != null ? `${tokenRaw}` : "";
   const header = {} as UTSJSONObject;
-  if (token) {
+  if (token.length > 0) {
     header["Authorization"] = `Bearer ${token}`;
   }
   return header;
@@ -43,11 +87,7 @@ function buildAuthHeaders(): UTSJSONObject {
 
 /** 从绝对 URL 提取 pathname，供 file-preview 使用。 */
 export function extractPathnameFromRemoteUrl(url: string): string {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    return url;
-  }
+  return extractPathname(url);
 }
 
 /**
@@ -62,8 +102,9 @@ export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
       url: fetchUrl,
       header,
       success: (res) => {
-        if (res.statusCode === 200 && res.tempFilePath) {
-          resolve(res.tempFilePath);
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+          resolve(tempPath);
           return;
         }
         reject(new Error());
@@ -85,13 +126,13 @@ export function openRemoteFileUrl(
   conversationId?: string | number,
 ): Promise<void> {
   const resolvedName =
-    fileName ||
-    url.split("/").filter(Boolean).pop()?.split("?")[0] ||
-    "download";
+    fileName != null && fileName.length > 0
+      ? fileName
+      : extractFileNameFromUrl(url);
 
-  if (conversationId && isAuthProtectedFileUrl(url)) {
+  if (conversationId != null && isAuthProtectedFileUrl(url)) {
     const path = extractPathnameFromRemoteUrl(url);
-    jumpToFilePreviewPage(String(conversationId), path);
+    jumpToFilePreviewPage(`${conversationId}`, path);
     return Promise.resolve();
   }
 
@@ -105,10 +146,11 @@ export function openRemoteFileUrl(
         header,
         success: (res) => {
           uni.hideLoading();
-          if (res.statusCode === 200 && res.tempFilePath) {
+          const tempPath = res.tempFilePath;
+          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
             // #ifdef MP || APP-PLUS || APP-ANDROID || APP-IOS
             uni.openDocument({
-              filePath: res.tempFilePath,
+              filePath: tempPath,
               showMenu: true,
               success: () => {
                 resolve();
@@ -120,7 +162,7 @@ export function openRemoteFileUrl(
             // #endif
             // #ifdef H5 || WEB
             const link = document.createElement("a");
-            link.href = res.tempFilePath;
+            link.href = tempPath;
             link.download = resolvedName;
             link.target = "_blank";
             link.click();
@@ -147,20 +189,25 @@ export function openRemoteFileUrl(
     uni.downloadFile({
       url,
       success: (res) => {
-        if (res.statusCode === 200 && res.tempFilePath) {
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
           uni.openDocument({
-            filePath: res.tempFilePath,
+            filePath: tempPath,
             showMenu: true,
             success: () => {
               resolve();
             },
-            fail: reject,
+            fail: (err) => {
+              reject(err);
+            },
           });
         } else {
           reject(new Error());
         }
       },
-      fail: reject,
+      fail: (err) => {
+        reject(err);
+      },
     });
     // #endif
   });

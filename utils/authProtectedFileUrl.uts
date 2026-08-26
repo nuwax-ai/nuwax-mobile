@@ -1,6 +1,7 @@
 /**
  * 受保护文件 URL 鉴权拉取与打开
- * 对齐 nuwax Web 版 authProtectedFileUrl.ts（UTS 兼容实现，勿用 URL / 可选链）
+ * 对齐 nuwax Web 版 authProtectedFileUrl.ts
+ * pathname 用字符串切分，避免 App/Kotlin 不支持 Web URL 与可选链。
  */
 import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
@@ -51,21 +52,61 @@ function containsAuthProtectedPath(url: string): boolean {
   return url.toLowerCase().indexOf(AUTH_PROTECTED_MARKER) >= 0;
 }
 
+function isHttpUrl(url: string): boolean {
+  return url.indexOf("http://") == 0 || url.indexOf("https://") == 0;
+}
+
+/**
+ * 从 URL 中提取 pathname（去掉协议、host、query、hash）。
+ * 不依赖 Web URL API，兼容 App/Kotlin。
+ */
+function extractPathname(url: string): string {
+  let path = url;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    path = path.substring(0, hashIdx);
+  }
+  const queryIdx = path.indexOf("?");
+  if (queryIdx >= 0) {
+    path = path.substring(0, queryIdx);
+  }
+  if (isHttpUrl(path)) {
+    const protoIdx = path.indexOf("://");
+    const afterProto = path.substring(protoIdx + 3);
+    const slashIdx = afterProto.indexOf("/");
+    if (slashIdx >= 0) {
+      return afterProto.substring(slashIdx);
+    }
+    return "/";
+  }
+  if (path.length == 0) {
+    return "/";
+  }
+  if (path.indexOf("/") != 0) {
+    return `/${path}`;
+  }
+  return path;
+}
+
+function extractFileNameFromUrl(url: string): string {
+  const path = extractPathname(url);
+  const lastSlash = path.lastIndexOf("/");
+  if (lastSlash >= 0 && lastSlash < path.length - 1) {
+    return path.substring(lastSlash + 1);
+  }
+  return "download";
+}
+
 /** 判断 URL 是否为需 Bearer 鉴权才能加载的文件地址。 */
-export function isAuthProtectedFileUrl(url: string | null): boolean {
-  if (url == null) {
+export function isAuthProtectedFileUrl(url: string): boolean {
+  if (url.length == 0) {
     return false;
   }
   const trimmed = url.trim();
   if (trimmed.length == 0) {
     return false;
   }
-  try {
-    const pathname = extractPathnameFromRemoteUrl(trimmed);
-    return containsAuthProtectedPath(pathname);
-  } catch (_e) {
-    return containsAuthProtectedPath(trimmed);
-  }
+  return AUTH_PROTECTED_FILE_PATH_RE.test(extractPathname(trimmed));
 }
 
 /** 将相对或绝对文件 URL 规范化为可请求的完整地址。 */
@@ -80,26 +121,16 @@ export function resolveAuthProtectedFileFetchUrl(url: string): string {
 function buildAuthHeaders(): UTSJSONObject {
   const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
   const token = tokenRaw != null ? `${tokenRaw}` : "";
-  const header = new UTSJSONObject();
+  const header = {} as UTSJSONObject;
   if (token.length > 0) {
     header["Authorization"] = `Bearer ${token}`;
   }
   return header;
 }
 
-function resolveDownloadFileName(url: string, fileName: string | null): string {
-  if (fileName != null && fileName.length > 0) {
-    return fileName;
-  }
-  const cleaned = stripQueryAndHash(url);
-  const parts = cleaned.split("/");
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const part = parts[i];
-    if (part != null && part.length > 0) {
-      return part;
-    }
-  }
-  return "download";
+/** 从绝对 URL 提取 pathname，供 file-preview 使用。 */
+export function extractPathnameFromRemoteUrl(url: string): string {
+  return extractPathname(url);
 }
 
 /**
@@ -114,9 +145,9 @@ export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
       url: fetchUrl,
       header: header,
       success: (res) => {
-        const path = res.tempFilePath;
-        if (res.statusCode == 200 && path != null && `${path}`.length > 0) {
-          resolve(`${path}`);
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+          resolve(tempPath);
           return;
         }
         reject(new Error("download failed"));
@@ -129,6 +160,15 @@ export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
 }
 
 /**
+ * 解析可直接用于 image 的地址：公开图片原样返回，受保护图片携带 Bearer 下载到本地。
+ * 受保护图片下载失败时保持 reject，由调用方决定使用默认图还是其他降级方案。
+ */
+export async function resolveAuthProtectedImageDisplayUrl(url: string): Promise<string> {
+  if (!isAuthProtectedFileUrl(url)) return url;
+  return await fetchAuthProtectedFileDisplayUrl(url);
+}
+
+/**
  * 打开或下载远程文件。
  * 受保护地址带 Bearer 下载；若提供 conversationId 则优先跳转预览页。
  */
@@ -137,11 +177,12 @@ export function openRemoteFileUrl(
   fileName: string | null = null,
   conversationId: string | number | null = null,
 ): Promise<void> {
-  const resolvedName = resolveDownloadFileName(url, fileName);
-  const hasConversationId =
-    conversationId != null && `${conversationId}`.length > 0;
+  const resolvedName =
+    fileName != null && fileName.length > 0
+      ? fileName
+      : extractFileNameFromUrl(url);
 
-  if (hasConversationId && isAuthProtectedFileUrl(url)) {
+  if (conversationId != null && isAuthProtectedFileUrl(url)) {
     const path = extractPathnameFromRemoteUrl(url);
     jumpToFilePreviewPage(`${conversationId}`, path);
     return Promise.resolve();
@@ -157,11 +198,11 @@ export function openRemoteFileUrl(
         header: header,
         success: (res) => {
           uni.hideLoading();
-          const path = res.tempFilePath;
-          if (res.statusCode == 200 && path != null && `${path}`.length > 0) {
-            // #ifdef MP-WEIXIN || APP
+          const tempPath = res.tempFilePath;
+          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+            // #ifdef MP || APP-PLUS || APP-ANDROID || APP-IOS
             uni.openDocument({
-              filePath: `${path}`,
+              filePath: tempPath,
               showMenu: true,
               success: (_ok) => {
                 resolve();
@@ -172,16 +213,12 @@ export function openRemoteFileUrl(
             });
             // #endif
             // #ifdef H5 || WEB
-            try {
-              const link = document.createElement("a");
-              link.href = `${path}`;
-              link.download = resolvedName;
-              link.target = "_blank";
-              link.click();
-              resolve();
-            } catch (eH5) {
-              reject(eH5);
-            }
+            const link = document.createElement("a");
+            link.href = tempPath;
+            link.download = resolvedName;
+            link.target = "_blank";
+            link.click();
+            resolve();
             // #endif
             return;
           }
@@ -208,10 +245,10 @@ export function openRemoteFileUrl(
     uni.downloadFile({
       url: url,
       success: (res) => {
-        const path = res.tempFilePath;
-        if (res.statusCode == 200 && path != null && `${path}`.length > 0) {
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
           uni.openDocument({
-            filePath: `${path}`,
+            filePath: tempPath,
             showMenu: true,
             success: (_ok) => {
               resolve();

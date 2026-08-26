@@ -23,6 +23,16 @@ import {
 } from "@/uni_modules/nuwax-android-native-pay";
 // #endif
 
+// #ifdef APP-HARMONY
+import {
+  launchAnxinfuMiniProgramNative as launchAnxinfuMiniProgramHarmony,
+  openPayUrlNative as openPayUrlHarmony,
+  // scheme 兜底（开放平台鸿蒙应用未就绪时启用），见
+  // uni_modules/nuwax-harmony-native-pay/README.md：
+  // launchAnxinfuMiniProgramBySchemeNative as launchAnxinfuMiniProgramBySchemeHarmony,
+} from "@/uni_modules/nuwax-harmony-native-pay";
+// #endif
+
 const ANXINFU_MINIPROGRAM_USER_NAME = "gh_cd6acad9a40d";
 const ANXINFU_MINIPROGRAM_PATH = "ipay/main";
 const ACTIVE_APP_PAY_ORDER_ID = "ACTIVE_APP_PAY_ORDER_ID";
@@ -86,6 +96,8 @@ export function launchAnxinfuMiniProgram(redirectUrl: string): Promise<any> {
     userName: ANXINFU_MINIPROGRAM_USER_NAME,
     path: ANXINFU_MINIPROGRAM_PATH + "?" + param,
     miniprogramType: 0,
+    // 鸿蒙 scheme 兜底实现需要网关原始 redirectUrl，Android / iOS 不使用。
+    redirectUrl: redirectUrl,
   } as UTSJSONObject;
 
   // #ifdef APP-ANDROID
@@ -96,7 +108,15 @@ export function launchAnxinfuMiniProgram(redirectUrl: string): Promise<any> {
   );
   // #endif
 
-  // #ifndef APP-ANDROID
+  // #ifdef APP-HARMONY
+  // 同 Android：鸿蒙也存在分包独立 UTS 模块实例的问题，直接调原生插件不依赖桥注册状态。
+  return launchAnxinfuMiniProgramHarmony(
+    options.getString("userName") ?? "",
+    options.getString("path") ?? "",
+  );
+  // #endif
+
+  // #ifndef APP-ANDROID || APP-HARMONY
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native wx.miniapp bridge is unavailable"));
@@ -112,7 +132,11 @@ export function openAppPayUrl(url: string): Promise<any> {
   return openPayUrlNative(url);
   // #endif
 
-  // #ifndef APP-ANDROID
+  // #ifdef APP-HARMONY
+  return openPayUrlHarmony(url);
+  // #endif
+
+  // #ifndef APP-ANDROID || APP-HARMONY
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native pay url bridge is unavailable"));
@@ -964,6 +988,10 @@ export async function executeAppNativePayFlow(
     const payChannel = tapIndex == 1
       ? PayChannel.AliPay
       : PayChannel.WxPay;
+    // 不要用 payChannel.value：UTS 枚举只在 Android/iOS（Kotlin/Swift）下带 value
+    // 属性，鸿蒙编译为 TS string enum，成员本身即字符串，.value 取到 undefined，
+    // 接口会报 "payChannel is required"。
+    const payChannelValue = tapIndex == 1 ? "AliPay" : "WxPay";
     loading.value = true;
     uni.showLoading({
       title: t("Mobile.MySubscriptions.payPending"),
@@ -973,7 +1001,7 @@ export async function executeAppNativePayFlow(
     try {
       const requestData = new UTSJSONObject();
       requestData["orderId"] = orderId as any;
-      requestData["payChannel"] = payChannel.value as any;
+      requestData["payChannel"] = payChannelValue as any;
       console.log('start:',requestData)
       const payRes = await apiPayAppNative(requestData);
       console.log('end:',payRes)
@@ -1006,22 +1034,22 @@ export async function executeAppNativePayFlow(
         await openAppPayUrl(redirectUrl);
       }
 
-      uni.showLoading({
-        title: t("Mobile.MySubscriptions.payPending"),
-        mask: true,
-      });
-      const result = await pollPayResult(orderId);
-      uni.hideLoading();
-      handlePayResultToast(result, t, onSuccess);
+      // 拉起收银台后立即结束本流程：不再阻塞式轮询。
+      // 用户在收银台取消并切回 App 时，若此处还占着 processingId / loading，
+      // 会把再次发起支付锁死到轮询超时为止（H5 端早有 pageshow 重置，App 端缺失）。
+      // 支付结果改由 App 回前台时的 checkActiveAppPayOrder 判定。
     } catch (e) {
       uni.hideLoading();
+      // 拉起失败的订单不留给回前台检查，避免下次进页面误报旧订单结果。
+      uni.removeStorageSync(ACTIVE_APP_PAY_ORDER_ID);
       console.error("App native payment flow error:", e);
       uni.showToast({
         title: t("Mobile.MySubscriptions.payFailed"),
         icon: "none",
       });
     } finally {
-      uni.removeStorageSync(ACTIVE_APP_PAY_ORDER_ID);
+      // 这里不清 ACTIVE_APP_PAY_ORDER_ID：拉起成功的订单要留给 checkActiveAppPayOrder
+      // 在回前台时核对结算状态（拉起失败的已在 catch 里清掉）。
       loading.value = false;
       processingId.value = null;
     }
@@ -1039,6 +1067,50 @@ export async function executeAppNativePayFlow(
       processingId.value = null;
     },
   });
+}
+
+/** 回前台核对结算状态的轮询次数（约 2s × 8 = 16s，覆盖支付回调延迟）。 */
+const APP_RETURN_POLL_ATTEMPTS = 8;
+
+/**
+ * App 从收银台切回前台时调用。
+ *
+ * 两件事，顺序不能反：
+ * 1. 无条件解除支付锁（用户可能只是取消支付返回），让用户能立刻重新发起；
+ * 2. 若存在拉起过的活跃订单，后台短轮询核对结算状态——不上锁、不加遮罩。
+ *
+ * 对应 H5 端的 pageshow / visibilitychange 处理（见 useSubscriptionPurchase.uts）。
+ */
+export async function checkActiveAppPayOrder(
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+  t: (key: string) => string,
+  onSuccess?: () => void,
+): Promise<void> {
+  // 1. 先解锁，且不依赖后续查询是否成功
+  uni.hideLoading();
+  loading.value = false;
+  processingId.value = null;
+
+  // 2. 核对活跃订单
+  const raw = uni.getStorageSync(ACTIVE_APP_PAY_ORDER_ID);
+  const rawText = raw != null ? `${raw}` : "";
+  if (rawText.length == 0) {
+    return;
+  }
+  const orderId = parseInt(rawText);
+  if (isNaN(orderId) || orderId <= 0) {
+    uni.removeStorageSync(ACTIVE_APP_PAY_ORDER_ID);
+    return;
+  }
+
+  const result = await pollPayResult(orderId, APP_RETURN_POLL_ATTEMPTS);
+  if (result == "pending") {
+    // 用户多半是取消了支付，订单仍待支付：保留标记，静默放行，不打扰。
+    return;
+  }
+  uni.removeStorageSync(ACTIVE_APP_PAY_ORDER_ID);
+  handlePayResultToast(result, t, onSuccess);
 }
 
 // #endif
@@ -1192,8 +1264,11 @@ export async function executePayFlow(
  * 轮询结算状态，最多 60 次，间隔 2 秒
  * @returns "success" | "failed" | "pending"
  */
-export async function pollPayResult(orderId: number): Promise<string> {
-  const maxAttempts = 60;
+export async function pollPayResult(
+  orderId: number,
+  attempts: number = 60,
+): Promise<string> {
+  const maxAttempts = attempts;
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise<void>((resolve) => {
       setTimeout(() => {

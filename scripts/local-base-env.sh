@@ -16,7 +16,7 @@
 _NUWAX_LB_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _NUWAX_REPO_ROOT="$(cd "$_NUWAX_LB_ENV_DIR/.." && pwd)"
 
-export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.23}"
+export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.24}"
 export NUWAX_WORKSPACE_ROOT="${NUWAX_WORKSPACE_ROOT:-$HOME/workspace}"
 export NUWAX_OFFLINE_SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-mobile-offline-sdk}"
 export NUWAX_SDK_ROOT="${NUWAX_SDK_ROOT:-$NUWAX_OFFLINE_SDK_HOME/sdk}"
@@ -51,7 +51,7 @@ if [[ -z "${UNIAPPX_ANDROID_SDK_ROOT:-}" ]]; then
 fi
 export ANDROID_ESP_WORK="${ANDROID_ESP_WORK:-$NUWAX_LOCAL_BASE_ROOT/android}"
 # 按版本选 work 工程，避免多 checkout 共享符号链接互相污染。
-# 默认 NUWAX_HX_VERSION=5.23（当前 diff 线 VDOM 5.23）；回退其他版本时显式 export 覆盖。
+# 默认 NUWAX_HX_VERSION=5.24（与当前 HBuilderX 对齐）；回退其他版本时显式 export 覆盖。
 # glob 匹配 build 号（14915/14987…），匹配不到则回退旧的 project 符号链接。
 if [[ -z "${ANDROID_ESP_PROJECT:-}" ]]; then
   _NUWAX_PROJ_MATCH=""

@@ -127,6 +127,21 @@ else
 fi
 
 [[ -d "$ROOT_DIR/unpackage/resources/app-android" ]] || fail "未生成 app-android 资源"
+RESOURCE_MANIFEST="$ROOT_DIR/unpackage/resources/app-android/$APPID/www/manifest.json"
+[[ -f "$RESOURCE_MANIFEST" ]] || fail "缺少 appResource manifest: $RESOURCE_MANIFEST"
+RESOURCE_COMPILER_VERSION="$(python3 - "$RESOURCE_MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    manifest = json.load(stream)
+print(str(manifest.get("uni-app-x", {}).get("compilerVersion", "")).strip())
+PY
+)"
+[[ -n "$RESOURCE_COMPILER_VERSION" ]] || fail "无法读取 appResource compilerVersion"
+[[ "$RESOURCE_COMPILER_VERSION" == "$NUWAX_HX_VERSION" ]] \
+  || fail "版本不一致：appResource 由 HBuilderX ${RESOURCE_COMPILER_VERSION} 生成，但 NUWAX_HX_VERSION=${NUWAX_HX_VERSION}"
+
 # 即使 SKIP_APP_RESOURCE=1 使用了 tester 留下的资源，也必须恢复为生产接口。
 python3 "$SCRIPT_DIR/set_app_resource_api_env.py" \
   production "$ROOT_DIR/unpackage/resources/app-android"
@@ -136,10 +151,17 @@ export ANDROID_BUILD_TYPE=release
 export ANDROID_SIGNING_MODE=release
 export SKIP_INSTALL=1
 
-if [[ ! -e "$PROJ/settings.gradle" ]]; then
+SDK_WORK_ROOT="$(cd "$PROJ/.." 2>/dev/null && pwd -P || true)"
+SDK_WORK_NAME="$(basename "$SDK_WORK_ROOT")"
+if [[ ! -e "$PROJ/settings.gradle" || "$SDK_WORK_NAME" != Android-uni-app-x-SDK@*-"$RESOURCE_COMPILER_VERSION" ]]; then
   echo "==== 2) 初始化 Android 离线 SDK 工作副本 ===="
-  bash "$SCRIPT_DIR/official/setup_sdk.sh"
+  FORCE_BOOTSTRAP=1 bash "$SCRIPT_DIR/official/setup_sdk.sh"
 fi
+SDK_WORK_ROOT="$(cd "$PROJ/.." 2>/dev/null && pwd -P || true)"
+SDK_WORK_NAME="$(basename "$SDK_WORK_ROOT")"
+[[ "$SDK_WORK_NAME" == Android-uni-app-x-SDK@*-"$RESOURCE_COMPILER_VERSION" ]] \
+  || fail "版本不一致：appResource=${RESOURCE_COMPILER_VERSION}，Android 离线 SDK=${SDK_WORK_NAME:-unknown}。请用同版本 SDK 重新初始化工作副本"
+echo "✓ HBuilderX/appResource/Android SDK 版本一致: $RESOURCE_COMPILER_VERSION"
 ensure_gradle_wrapper_jar "$PROJ"
 write_local_properties "$PROJ"
 

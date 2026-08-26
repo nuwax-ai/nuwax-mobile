@@ -614,7 +614,6 @@ def find_debug_server_aar() -> Path | None:
     """在离线 SDK 中定位 debug-server-release.aar（HX 日志/资源同步依赖）。"""
     candidates = [
         WORK / "sdk-root" / "SDK" / "libs" / "debug-server-release.aar",
-        WORK / "Android-uni-app-x-SDK@14915-5.15" / "SDK" / "libs" / "debug-server-release.aar",
         # project/app → ../../SDK/libs（官方示例相对路径）
         PROJ / ".." / "SDK" / "libs" / "debug-server-release.aar",
     ]

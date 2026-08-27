@@ -32,6 +32,15 @@
 	import { ACCESS_TOKEN } from '@/constants/home.constants'
 	import { getUploadFileAction } from '@/constants/common.constants'
 	import { consumeLatestPendingOpenUiAction } from '@/utils/pendingOpenUiAction.uts'
+	import { openExternalLinkPage } from '@/utils/system.uts'
+	import {
+		acknowledgeAppNativePayResult,
+		beginAppNativePaySession,
+		checkActiveAppPayResult,
+		getStoredAppNativePayResult,
+		launchAppNativePayByChannel,
+		storeAppNativePayResult,
+	} from '@/subpackages/utils/paymentUtils.uts'
 	// App web-view 内嵌页原生语音：录音（RecorderManager + 流式 ASR 转写）与 TTS 播报
 	import { voiceStreamSpeaker } from '@/subpackages/utils/voice/voiceStreamSpeaker'
 	import {
@@ -106,6 +115,8 @@
 	let latestInjectedKeyboardHeight: number = 0
 	/** 底部手势条/导航条高度（safeAreaInsets.bottom）：onKeyboardHeightChange 兜底值归一化为完整 IME 时使用 */
 	let latestInjectedSafeAreaBottom: number = 0
+	/** 防止多次 onShow 并发核对同一笔支付订单。 */
+	let nativePayResultChecking: boolean = false
 
 
 
@@ -564,6 +575,20 @@
 			// 再写进 __nuwaxKeyboardHeight——否则进页会幽灵垫高一块键盘高空白。
 			// 真实 IME 高度只由 onKeyboardHeightChange / WindowInsets 回调注入。
 			ctx.evalJS(code + buildKeyboardHeightInjectCode(0, latestInjectedSafeAreaBottom, false))
+			// 原生已拿到结算结果、但 H5 尚未 ACK：随 @load 注入窗口重复补发。
+			// ACK 到达后 storage 被清理，后续轮询自然停止重放。
+			const paySnapshot = getStoredAppNativePayResult()
+			if (paySnapshot != null) {
+				const requestId = paySnapshot["requestId"] != null ? `${paySnapshot["requestId"]}` : ""
+				const result = paySnapshot["result"] != null ? `${paySnapshot["result"]}` : ""
+				if (requestId.indexOf("app_pay_") == 0 && result.length > 0) {
+					const requestLiteral = JSON.stringify(requestId)
+					const resultLiteral = JSON.stringify(result)
+					ctx.evalJS(
+						`try{window.__nuwaxOnNativePayResult&&window.__nuwaxOnNativePayResult(${requestLiteral},${resultLiteral});}catch(e){}`,
+					)
+				}
+			}
 		} catch (e) {
 			return false
 		}
@@ -2338,6 +2363,84 @@
 		)
 	}
 
+	function isEmbeddedNativePayRequestId(requestId: string): boolean {
+		return requestId.indexOf("app_pay_") == 0
+	}
+
+	/** 确认原生已持久化支付请求，使 H5 停止重发。 */
+	function notifyH5NativePayAccepted(requestId: string): void {
+		const literal = JSON.stringify(requestId)
+		evalBridgeJS(
+			`try{window.__nuwaxOnNativePayAccepted&&window.__nuwaxOnNativePayAccepted(${literal});}catch(e){}`,
+		)
+	}
+
+	/** 将持久化的原生支付状态回传 H5；未收到 ACK 时会在 @load 注入窗口补发。 */
+	function notifyH5NativePayResult(requestId: string, result: string): void {
+		const requestLiteral = JSON.stringify(requestId)
+		const resultLiteral = JSON.stringify(result)
+		evalBridgeJS(
+			`try{window.__nuwaxOnNativePayResult&&window.__nuwaxOnNativePayResult(${requestLiteral},${resultLiteral});}catch(e){}`,
+		)
+	}
+
+	/** 确认原生已处理同步请求；即使当前没有结果，也让 H5 停止重试。 */
+	function notifyH5NativePaySyncComplete(consumerId: string): void {
+		const literal = JSON.stringify(consumerId)
+		evalBridgeJS(
+			`try{window.__nuwaxOnNativePaySyncComplete&&window.__nuwaxOnNativePaySyncComplete(${literal});}catch(e){}`,
+		)
+	}
+
+	/** 接收 H5 已选择的渠道；requestId 重发只确认，不重复拉起收银台。 */
+	async function handleNativePayRequest(
+		orderId: number,
+		requestId: string,
+		payChannel: string,
+	): Promise<void> {
+		const isNew = beginAppNativePaySession(orderId, requestId, payChannel)
+		notifyH5NativePayAccepted(requestId)
+		if (isNew != true) {
+			const stored = getStoredAppNativePayResult()
+			if (stored != null) {
+				const result = stored["result"] != null ? `${stored["result"]}` : ""
+				if (result.length > 0) {
+					notifyH5NativePayResult(requestId, result)
+				}
+			}
+			return
+		}
+		try {
+			await launchAppNativePayByChannel(orderId, payChannel, requestId)
+		} catch (error) {
+			console.error("[native-pay] launch failed", error)
+			storeAppNativePayResult(requestId, "failed")
+			notifyH5NativePayResult(requestId, "failed")
+		}
+	}
+
+	/** 从微信/支付宝回到 App 后核对服务端结算状态。 */
+	async function checkNativePayOnResume(): Promise<void> {
+		if (nativePayResultChecking == true) {
+			return
+		}
+		nativePayResultChecking = true
+		try {
+			const snapshot = await checkActiveAppPayResult()
+			if (snapshot != null) {
+				const requestId = snapshot["requestId"] != null ? `${snapshot["requestId"]}` : ""
+				const result = snapshot["result"] != null ? `${snapshot["result"]}` : ""
+				if (isEmbeddedNativePayRequestId(requestId) && result.length > 0) {
+					notifyH5NativePayResult(requestId, result)
+				}
+			}
+		} catch (error) {
+			console.warn("[native-pay] settlement check failed", error)
+		} finally {
+			nativePayResultChecking = false
+		}
+	}
+
 	// ---- 消息分发 ----
 
 	/** web-view @message：分发原生语音指令（录音 / TTS）与媒体选择（拍照 / 相册 / 文件） */
@@ -2371,6 +2474,50 @@
 			return
 		}
 		const type = `${msg["type"]}`
+		if (type == "native-pay") {
+			const orderId = parseInt(`${msg["orderId"]}`)
+			const requestId = msg["requestId"] != null ? `${msg["requestId"]}` : ""
+			const payChannel = msg["payChannel"] != null ? `${msg["payChannel"]}` : ""
+			if (
+				!isNaN(orderId) &&
+				orderId > 0 &&
+				isEmbeddedNativePayRequestId(requestId) &&
+				(payChannel == "WxPay" || payChannel == "AliPay")
+			) {
+				handleNativePayRequest(orderId, requestId, payChannel).catch((): void => {})
+			} else {
+				if (requestId.length > 0) {
+					storeAppNativePayResult(requestId, "failed")
+					notifyH5NativePayResult(requestId, "failed")
+				}
+			}
+			return
+		}
+		if (type == "native-pay-result-ack") {
+			const requestId = msg["requestId"] != null ? `${msg["requestId"]}` : ""
+			if (isEmbeddedNativePayRequestId(requestId)) {
+				acknowledgeAppNativePayResult(requestId)
+			}
+			return
+		}
+		if (type == "native-pay-result-sync") {
+			const consumerId = msg["consumerId"] != null ? `${msg["consumerId"]}` : ""
+			const stored = getStoredAppNativePayResult()
+			let deliveredResult = false
+			if (stored != null) {
+				const requestId = stored["requestId"] != null ? `${stored["requestId"]}` : ""
+				const result = stored["result"] != null ? `${stored["result"]}` : ""
+				if (isEmbeddedNativePayRequestId(requestId) && result.length > 0) {
+					notifyH5NativePayResult(requestId, result)
+					deliveredResult = true
+				}
+			}
+			// 有结果时等待 H5 ACK；下一次同步确认 storage 已清理后再结束重试。
+			if (consumerId.length > 0 && deliveredResult != true) {
+				notifyH5NativePaySyncComplete(consumerId)
+			}
+			return
+		}
 		if (type == "record") {
 			const action = `${msg["action"]}`
 			if (action == "start") {
@@ -2453,6 +2600,14 @@
 			handleAppNavBackFromH5()
 			return
 		}
+		if (type == "app-open-external-link") {
+			const href = msg["url"] != null ? `${msg["url"]}` : ""
+			const title = msg["title"] != null ? `${msg["title"]}` : ""
+			if (href.length > 0) {
+				openExternalLinkPage(href, title)
+			}
+			return
+		}
 		if (type == "popup-back") {
 			// H5 内嵌页弹窗开合状态同步（uni-modal-popup 经 popupBackRegistry 上报）
 			const action = `${msg["action"]}`
@@ -2526,6 +2681,7 @@
 		if (!shellVisible.value) {
 			return
 		}
+		checkNativePayOnResume().catch((): void => {})
 		deliverPendingOpenUiResumeToH5()
 		// #ifdef APP-IOS
 		suppressHideUnmount = false

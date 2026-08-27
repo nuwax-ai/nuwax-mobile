@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# 阶段 A：校验 / 引导 UniAppX Android 5.15 离线 SDK 工作副本
-#
-# 官方包：Android-uni-app-x-SDK@14915-5.15
-# 下载：https://web-ext-storage.dcloud.net.cn/uni-app-x/sdk/Android/Android-uni-app-x-SDK@14915-5.15.zip
+# 阶段 A：校验 / 引导指定 HBuilderX 版本的 UniAppX Android 离线 SDK 工作副本
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -10,10 +7,23 @@ WT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # shellcheck source=../../local-base-env.sh
 source "$SCRIPT_DIR/../../local-base-env.sh"
 
-UNIAPPX_ANDROID_SDK_ROOT="${UNIAPPX_ANDROID_SDK_ROOT}"
+SDK_BUILD="${ANDROID_SDK_BUILD:-}"
+if [[ -z "$SDK_BUILD" ]]; then
+  case "$NUWAX_HX_VERSION" in
+    5.15) SDK_BUILD="14915" ;;
+    5.23) SDK_BUILD="14987" ;;
+    5.24) SDK_BUILD="15006" ;;
+  esac
+fi
+[[ -n "$SDK_BUILD" || -n "${UNIAPPX_ANDROID_SDK_ROOT:-}" ]] || {
+  echo "✗ 未知 HBuilderX ${NUWAX_HX_VERSION} 对应的 Android SDK 构建号。" >&2
+  echo "  请设置 ANDROID_SDK_BUILD 或 UNIAPPX_ANDROID_SDK_ROOT。" >&2
+  exit 1
+}
+UNIAPPX_ANDROID_SDK_ROOT="${UNIAPPX_ANDROID_SDK_ROOT:-$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@${SDK_BUILD}-${NUWAX_HX_VERSION}}"
 ANDROID_ESP_WORK="${ANDROID_ESP_WORK}"
 SDK_ZIP="${ANDROID_SDK_ZIP:-$NUWAX_SDK_ARCHIVES/UniAppX-Android-${NUWAX_HX_VERSION}.zip}"
-SDK_URL="${ANDROID_SDK_URL:-https://web-ext-storage.dcloud.net.cn/uni-app-x/sdk/Android/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}.zip}"
+SDK_URL="${ANDROID_SDK_URL:-https://web-ext-storage.dcloud.net.cn/uni-app-x/sdk/Android/Android-uni-app-x-SDK@${SDK_BUILD}-${NUWAX_HX_VERSION}.zip}"
 
 download_sdk() {
   if [[ -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
@@ -22,7 +32,7 @@ download_sdk() {
   fi
   mkdir -p "$(dirname "$SDK_ZIP")"
   if [[ ! -f "$SDK_ZIP" ]]; then
-    echo "下载 Android SDK 5.15 ..."
+    echo "下载 Android SDK ${NUWAX_HX_VERSION} ..."
     curl -L --fail --progress-bar -o "$SDK_ZIP" "$SDK_URL"
   fi
   local dest
@@ -34,7 +44,13 @@ download_sdk() {
 
 bootstrap_work() {
   mkdir -p "$ANDROID_ESP_WORK"
-  local target="$ANDROID_ESP_WORK/Android-uni-app-x-SDK@14915-5.15"
+  local sdk_dir_name target
+  sdk_dir_name="$(basename "$UNIAPPX_ANDROID_SDK_ROOT")"
+  [[ "$sdk_dir_name" == Android-uni-app-x-SDK@*-"$NUWAX_HX_VERSION" ]] || {
+    echo "✗ Android SDK 目录版本与 NUWAX_HX_VERSION=${NUWAX_HX_VERSION} 不一致: $sdk_dir_name" >&2
+    exit 1
+  }
+  target="$ANDROID_ESP_WORK/$sdk_dir_name"
   if [[ ! -d "$target/uniappxnativepackage" ]] || [[ "${FORCE_BOOTSTRAP:-0}" == "1" ]]; then
     echo "同步工作副本 → $target"
     rm -rf "$target"
@@ -49,13 +65,6 @@ bootstrap_work() {
 }
 
 download_sdk
-# 若用户只解压了 zip，校正 ROOT
-if [[ ! -d "$UNIAPPX_ANDROID_SDK_ROOT/uniappxnativepackage" ]]; then
-  ALT="$NUWAX_SDK_ROOT/android/${NUWAX_HX_VERSION}/Android-uni-app-x-SDK@14915-${NUWAX_HX_VERSION}"
-  if [[ -d "$ALT/uniappxnativepackage" ]]; then
-    UNIAPPX_ANDROID_SDK_ROOT="$ALT"
-  fi
-fi
 bootstrap_work
 
 # 基本校验

@@ -1,0 +1,356 @@
+/**
+ * App web-view 内嵌 H5 的图片预览。
+ *
+ * uni.previewImage 在 H5 关闭时会 history.back / uni.navigateBack，
+ * 内嵌 WebView 里会把承载页（agent-detail）一并弹掉，表现为回到首页。
+ * 仅内嵌场景走自绘遮罩；浏览器直开 H5 不拦截、不改 uni.previewImage。
+ */
+import { getApiBaseUrl } from "@/constants/config";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+
+type PreviewOpenHandler = (urls: string[], current: string) => void;
+
+let previewHostOpen: PreviewOpenHandler | null = null;
+let previewHookInstalled: boolean = false;
+
+function isAlreadyAbsoluteMediaUrl(url: string): boolean {
+  if (url.indexOf("http://") == 0 || url.indexOf("https://") == 0) {
+    return true;
+  }
+  if (url.indexOf("data:") == 0 || url.indexOf("blob:") == 0) {
+    return true;
+  }
+  if (
+    url.indexOf("file://") == 0 ||
+    url.indexOf("wxfile://") == 0 ||
+    url.indexOf("content://") == 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isUsableHttpOrigin(origin: string): boolean {
+  if (origin.length == 0 || origin == "null") {
+    return false;
+  }
+  if (origin.indexOf("http://") == 0 || origin.indexOf("https://") == 0) {
+    return true;
+  }
+  return false;
+}
+
+function resolvePageOrigin(): string {
+  // #ifdef H5 || WEB
+  try {
+    const loc = window.location;
+    if (loc != null) {
+      const protocol = `${loc.protocol}`;
+      const host = `${loc.host}`;
+      // Android WebView 上 origin 偶发为 null / file://，host 仍可用
+      if (
+        protocol.length > 0 &&
+        host.length > 0 &&
+        protocol.indexOf("http") == 0
+      ) {
+        return `${protocol}//${host}`;
+      }
+      const origin = `${loc.origin}`;
+      if (isUsableHttpOrigin(origin) == true) {
+        return origin;
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+  const apiBase = getApiBaseUrl();
+  if (isUsableHttpOrigin(apiBase) == true) {
+    return apiBase;
+  }
+  return "";
+}
+
+function extractHttpOrigin(url: string): string {
+  if (url.indexOf("http://") != 0 && url.indexOf("https://") != 0) {
+    return "";
+  }
+  const protoIdx = url.indexOf("://");
+  if (protoIdx < 0) {
+    return "";
+  }
+  const after = url.substring(protoIdx + 3);
+  const slashIdx = after.indexOf("/");
+  if (slashIdx < 0) {
+    return url;
+  }
+  return url.substring(0, protoIdx + 3 + slashIdx);
+}
+
+/** 站点根路径（/api/...、/static/... 等）或当前页 / 接口同源地址。第三方 CDN 不算。 */
+function isSameOriginPreviewUrl(url: string): boolean {
+  if (url.indexOf("/") == 0 && url.indexOf("//") != 0) {
+    return true;
+  }
+  const urlOrigin = extractHttpOrigin(url);
+  if (urlOrigin.length == 0) {
+    return false;
+  }
+  const pageOrigin = resolvePageOrigin();
+  if (pageOrigin.length > 0 && urlOrigin == pageOrigin) {
+    return true;
+  }
+  const apiBase = getApiBaseUrl();
+  if (apiBase.length > 0 && urlOrigin == apiBase) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 同源接口图依赖登录态。正文 <img> 会带 Cookie；Android 预览组件常不带，补 _ticket。
+ * 不限定 /api/computer/static，任意站点根路径或同源地址都补；外链 CDN 不补。
+ */
+function withSameOriginTicket(url: string): string {
+  if (isSameOriginPreviewUrl(url) != true) {
+    return url;
+  }
+  if (url.indexOf("_ticket=") >= 0) {
+    return url;
+  }
+  try {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    const token = tokenRaw != null ? `${tokenRaw}` : "";
+    if (token.length == 0) {
+      return url;
+    }
+    const sep = url.indexOf("?") >= 0 ? "&" : "?";
+    return `${url}${sep}_ticket=${encodeURIComponent(token)}`;
+  } catch (_eToken) {
+    return url;
+  }
+}
+
+function toAbsolutePreviewUrl(url: string): string {
+  if (url.length == 0) {
+    return url;
+  }
+  if (isAlreadyAbsoluteMediaUrl(url) == true) {
+    return url;
+  }
+  if (url.indexOf("//") == 0) {
+    // #ifdef H5 || WEB
+    try {
+      const proto = window.location.protocol;
+      if (proto != null && proto.length > 0) {
+        return `${proto}${url}`;
+      }
+    } catch (_eProto) {
+      // ignore
+    }
+    // #endif
+    return `https:${url}`;
+  }
+  const path = url.indexOf("/") == 0 ? url : `/${url}`;
+  const origin = resolvePageOrigin();
+  if (origin.length == 0) {
+    return path;
+  }
+  return `${origin}${path}`;
+}
+
+/**
+ * 预览必须用绝对 URL：页面内 img 可用 /api/... 等根路径，
+ * uni.previewImage 会把根路径当成本地资源，出现黑底裂图（如 3/3 刷新图标）。
+ */
+export function normalizePreviewImageUrl(url: string): string {
+  return withSameOriginTicket(toAbsolutePreviewUrl(url));
+}
+
+function normalizePreviewImageUrls(urls: string[]): string[] {
+  const out: string[] = [];
+  const len = urls.length;
+  for (let i = 0; i < len; i++) {
+    out.push(normalizePreviewImageUrl(urls[i]));
+  }
+  return out;
+}
+
+/**
+ * 会话页预览遮罩挂载 / 卸载时登记。
+ */
+export function setAppWebViewImagePreviewHost(
+  open: PreviewOpenHandler | null,
+): void {
+  previewHostOpen = open;
+}
+
+function toUrlList(raw: any): string[] {
+  const urls: string[] = [];
+  if (raw == null) {
+    return urls;
+  }
+  try {
+    const arr = raw as string[];
+    const len = arr.length;
+    for (let i = 0; i < len; i++) {
+      const item = arr[i];
+      if (item != null) {
+        const text = `${item}`;
+        if (text.length > 0) {
+          urls.push(text);
+        }
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return urls;
+}
+
+function resolveCurrentUrl(urls: string[], currentRaw: any): string {
+  if (urls.length == 0) {
+    return "";
+  }
+  if (currentRaw == null) {
+    return urls[0];
+  }
+  if (typeof currentRaw == "number") {
+    const idx = currentRaw as number;
+    if (idx >= 0 && idx < urls.length) {
+      return urls[idx];
+    }
+    return urls[0];
+  }
+  const text = `${currentRaw}`;
+  if (text.length == 0) {
+    return urls[0];
+  }
+  for (let i = 0; i < urls.length; i++) {
+    if (urls[i] == text) {
+      return text;
+    }
+  }
+  const asNum = parseFloat(text);
+  if (!isNaN(asNum) && asNum >= 0 && asNum < urls.length) {
+    const idx = asNum as number;
+    return urls[idx];
+  }
+  return text;
+}
+
+function tryOpenHost(urls: string[], current: string): boolean {
+  if (isAppWebViewEmbedded() != true) {
+    return false;
+  }
+  // #ifdef H5 || WEB
+  const opener = previewHostOpen;
+  if (opener == null) {
+    return false;
+  }
+  if (current.length == 0 && urls.length == 0) {
+    return false;
+  }
+  const next = current.length > 0 ? current : urls[0];
+  opener(urls, next);
+  return true;
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/**
+ * 解析 uni.previewImage 入参并尝试走内嵌遮罩。
+ * 相对路径先转成绝对 URL，再交给遮罩。
+ * @returns 已由遮罩承接时为 true
+ */
+export function tryOpenAppWebViewImagePreview(options: any): boolean {
+  if (options == null) {
+    return false;
+  }
+  const obj = options as UTSJSONObject;
+  const rawUrls = toUrlList(obj["urls"]);
+  const rawCurrent = resolveCurrentUrl(rawUrls, obj["current"]);
+  const urls = normalizePreviewImageUrls(rawUrls);
+  const current = normalizePreviewImageUrl(rawCurrent);
+  return tryOpenHost(urls, current);
+}
+
+/**
+ * 与 uni.previewImage 同语义；相对路径转为绝对地址后再预览。
+ * App 内嵌 H5 走自绘遮罩，其它端走官方预览。
+ */
+export function previewImageCompat(urls: string[], current: string): void {
+  const absUrls = normalizePreviewImageUrls(urls);
+  const absCurrent = normalizePreviewImageUrl(current);
+  if (tryOpenHost(absUrls, absCurrent) == true) {
+    return;
+  }
+  uni.previewImage({
+    urls: absUrls,
+    current: absCurrent,
+  });
+}
+
+function previewWithNormalizedOptions(options: any): void {
+  if (options == null) {
+    return;
+  }
+  const obj = options as UTSJSONObject;
+  const rawUrls = toUrlList(obj["urls"]);
+  const rawCurrent = resolveCurrentUrl(rawUrls, obj["current"]);
+  const absUrls = normalizePreviewImageUrls(rawUrls);
+  const absCurrent = normalizePreviewImageUrl(rawCurrent);
+  if (tryOpenHost(absUrls, absCurrent) == true) {
+    return;
+  }
+  uni.previewImage({
+    urls: absUrls,
+    current: absCurrent,
+  });
+}
+
+/**
+ * 挂 window.__nuwaxPreviewImage，供 mp-html 走自绘遮罩。
+ * 不改写 uni.previewImage。是否内嵌在点击时再判断，避免 setup 时桥未注入而漏挂。
+ * 浏览器直开会立刻回落到 uni.previewImage，行为与原来一致。
+ */
+export function installAppWebViewImagePreviewHook(): void {
+  // #ifdef H5 || WEB
+  if (previewHookInstalled == true) {
+    return;
+  }
+  try {
+    const w = window as any;
+    if (w == null) {
+      return;
+    }
+    w.__nuwaxPreviewImage = (options: any): void => {
+      previewWithNormalizedOptions(options);
+    };
+    previewHookInstalled = true;
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+/** 页面卸载时去掉 hook，避免残留影响后续非内嵌页。 */
+export function uninstallAppWebViewImagePreviewHook(): void {
+  // #ifdef H5 || WEB
+  if (previewHookInstalled != true) {
+    return;
+  }
+  try {
+    const w = window as any;
+    if (w != null) {
+      w.__nuwaxPreviewImage = null;
+    }
+  } catch (_e) {
+    // ignore
+  }
+  previewHookInstalled = false;
+  // #endif
+}

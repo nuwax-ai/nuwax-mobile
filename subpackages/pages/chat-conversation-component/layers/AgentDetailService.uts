@@ -155,6 +155,24 @@ type NullableTimeoutCallback = any | null;
 const MESSAGE_LIST_SIZE = 10;
 
 /**
+ * resumeConversationState 的返回：续接判定 + 本次拉取的会话详情响应。
+ * 续接链（resume → sub → 订阅检查）复用同一份响应，避免三次全量详情请求。
+ * response 在「早退未拉取」时为 null，调用方需自行补拉。
+ */
+export class ConversationResumeResult {
+  needResume: boolean = false;
+  response: RequestResponse<ConversationInfo> | null = null;
+
+  constructor(
+    needResume: boolean,
+    response: RequestResponse<ConversationInfo> | null,
+  ) {
+    this.needResume = needResume;
+    this.response = response;
+  }
+}
+
+/**
  * 为助手草稿写入可播报缓存（工具栏点击时直接用，避免重复清洗）。
  * 仅在 SSE 会话结束后（persistLastAssistantSpeakableText）写入；
  * 加载历史会话不预计算，播报时由工具栏对 body 现场清洗兜底。
@@ -692,6 +710,11 @@ export default class AgentDetailService {
    */
   private liveStreamStartedAt: number = 0;
   private readonly REMOTE_TERMINAL_GRACE_MS: number = 15000;
+  /**
+   * 最近一次 handleQueryConversation 重建后的会话指纹（taskStatus + 消息数 + 末条 id/textLen）。
+   * 回前台续接时若服务端指纹与本地一致，说明会话未变化，跳过整表重建（长历史省整份 parse/adapt）。
+   */
+  private lastListFingerprint: string = "";
 
   constructor(data: AgentDetailData) {
     this.data = data;
@@ -1274,6 +1297,53 @@ export default class AgentDetailService {
   }
 
   /**
+   * 会话详情轻量指纹：taskStatus + 消息数 + 末条 id/text 长度。
+   * 只读原始字段（不 parseMessageList / 不 adaptHistoryMessage），用于判断
+   * 回前台时服务端会话是否变化，避免空闲场景整表重建。
+   */
+  private fingerprintConversationData(dataObj: UTSJSONObject | null): string {
+    if (dataObj == null) {
+      return "";
+    }
+    let taskStatusStr = "";
+    const taskStatusRaw = dataObj["taskStatus"];
+    if (taskStatusRaw != null) {
+      try {
+        const nested = (taskStatusRaw as UTSJSONObject)["value"];
+        if (nested != null) {
+          taskStatusStr = `${nested}`;
+        } else {
+          taskStatusStr = `${taskStatusRaw}`;
+        }
+      } catch (_e) {
+        taskStatusStr = `${taskStatusRaw}`;
+      }
+    }
+    const listRaw = dataObj["messageList"];
+    let listLen = 0;
+    let lastFp = "none";
+    if (listRaw != null && Array.isArray(listRaw)) {
+      const list = listRaw as any[];
+      listLen = list.length;
+      if (listLen > 0) {
+        const last = list[listLen - 1] as UTSJSONObject;
+        let lastId = "";
+        const lastIdRaw = last["id"];
+        if (lastIdRaw != null) {
+          lastId = `${lastIdRaw}`;
+        }
+        let lastTextLen = 0;
+        const lastTextRaw = last["text"];
+        if (lastTextRaw != null) {
+          lastTextLen = `${lastTextRaw}`.length;
+        }
+        lastFp = `${lastId}:${lastTextLen}`;
+      }
+    }
+    return `${taskStatusStr}|${listLen}|${lastFp}`;
+  }
+
+  /**
    * 处理查询会话
    */
   async handleQueryConversation(
@@ -1405,6 +1475,8 @@ export default class AgentDetailService {
       this.fillChatSuggestFromAgent(responseObj);
     }
     this.data.isLoadingConversation.value = false;
+    // 记录会话指纹：后续回前台续接据此判断是否跳过整表重建（须在 messageList 落盘后记录）
+    this.lastListFingerprint = this.fingerprintConversationData(responseDataRaw);
 
     // 获取沙盒列表
     this.handleGetSandboxList();
@@ -2945,27 +3017,30 @@ export default class AgentDetailService {
       if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
         return;
       }
-      this.resumeConversationState().then((needSub: boolean) => {
-        if (needSub != true) {
-          // 后端已结束：清 pending，结束保持态，收尾关态（避免保持态无限 loading）
-          this.pendingBackgroundReconnect = false;
-          this.streamResumePending = false;
-          this.data.isConversationActive.value = false;
-          this.markConversationTaskCompleteIfExecuting();
-          return;
-        }
-        if (streamGenAtSchedule != this.streamGeneration) {
-          return;
-        }
-        if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
-          return;
-        }
-        const cid = this.data.conversationId.value;
-        if (cid == null || cid == 0) {
-          return;
-        }
-        this.handleSubConversation(cid, null);
-      });
+      this.resumeConversationState().then(
+        (resumeResult: ConversationResumeResult) => {
+          if (resumeResult.needResume != true) {
+            // 后端已结束：清 pending，结束保持态，收尾关态（避免保持态无限 loading）
+            this.pendingBackgroundReconnect = false;
+            this.streamResumePending = false;
+            this.data.isConversationActive.value = false;
+            this.markConversationTaskCompleteIfExecuting();
+            return;
+          }
+          if (streamGenAtSchedule != this.streamGeneration) {
+            return;
+          }
+          if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
+            return;
+          }
+          const cid = this.data.conversationId.value;
+          if (cid == null || cid == 0) {
+            return;
+          }
+          // 复用 resume 刚拉取的详情响应：跳过 sub 内部重拉与整表重建（列表已由 resume 重建）
+          this.handleSubConversation(cid, null, resumeResult.response, true);
+        },
+      );
     }, 400);
   }
 
@@ -2973,15 +3048,23 @@ export default class AgentDetailService {
    * 订阅 sub 流恢复 EXECUTING 会话的流式输出（刷新/重进/断流回补/跨端续接）。
    *
    * 四端（H5 / iOS / Android / 微信小程序）同一路径：
-   * 1) reload 会话详情 → 2) subResumeGate 确认本轮用户已在列表 →
-   * 3) ensurePlaceholder（复用进行中助手或新建）→ 4) GET /chat/sub →
-   * 5) handleChangeMessageList 写 UI + streamSpeakFeed（TTS）
+   * 1) reload 会话详情（续接链已拉过新鲜详情时复用 preloadedResponse，跳过二次全量请求）→
+   * 2) subResumeGate 确认本轮用户已在列表 → 3) ensurePlaceholder（复用进行中助手或新建）→
+   * 4) GET /chat/sub → 5) handleChangeMessageList 写 UI + streamSpeakFeed（TTS）
    *
-   * onSubClose: sub 关闭（完成/错误/超时）时回调，页面据此恢复轮询。
+   * @param preloadedResponse 续接链（resumeConversationState / 进页 / 轮询）刚拉取的新鲜详情响应，
+   *                          非 null 时跳过方法内的 apiAgentConversation 重拉。
+   * @param skipListRebuild   true 时跳过 messageList 整表重建（仅当调用方已用同一响应重建过列表，
+   *                         如 resume/进页路径；轮询路径因未重建必须传 false）。
+   * @param onSubClose        sub 关闭（完成/错误/超时）时回调，页面据此恢复轮询。
    */
   async handleSubConversation(
     conversationId: number,
     onSubClose: any | null = null,
+    // 轮询等调用方可能以 any 持有该响应（UTS 不做 any→UTSJSONObject 隐式转换），故放宽为 any，
+    // 使用处显式 cast（见下方 result 赋值），避免 error17。
+    preloadedResponse: any | null = null,
+    skipListRebuild: boolean = false,
   ): Promise<void> {
     // 防重 / live SSE 在跑时不订阅
     if (this.isSubscribed) {
@@ -3097,9 +3180,16 @@ export default class AgentDetailService {
       }
     };
 
-    // 1. reload 历史（拿最新 messageList）
+    // 1. 拿最新会话详情（拿最新 messageList）。
+    // 续接链（resume / 进页 / 轮询）已有新鲜响应时复用，跳过二次全量请求；
+    // 否则仍自拉一次（兜底）。
     try {
-      const result = await apiAgentConversation(conversationId);
+      let result: RequestResponse<ConversationInfo> | null = null;
+      if (preloadedResponse != null) {
+        result = preloadedResponse as RequestResponse<ConversationInfo>;
+      } else {
+        result = await apiAgentConversation(conversationId);
+      }
       // await 期间本地可能已接管（用户发消息 → live SSE / 新一轮发送 abort 本 sub）：
       // 放弃续接，避免用 reload 的旧列表覆盖本地刚写入的用户+Loading 气泡（ai-msg 闪没），
       // 或形成 live+sub 双流。此时 send 流程已 abort 本 sub（isSubscribed=false），无需 cleanupSub。
@@ -3108,12 +3198,12 @@ export default class AgentDetailService {
         this.isSubscribed = false;
         return;
       }
-      if (apiResCode(result) != SUCCESS_CODE) {
+      if (apiResCode(result!) != SUCCESS_CODE) {
         // reload 失败：保持态（不关 loading），等待轮询再续接
         cleanupSub(false, true);
         return;
       }
-      const dataRaw = apiResData<any>(result);
+      const dataRaw = apiResData<any>(result!);
       if (dataRaw == null) {
         cleanupSub(false, true);
         return;
@@ -3124,40 +3214,46 @@ export default class AgentDetailService {
         taskStatusRaw != null ? `${taskStatusRaw}` : "";
       // 轮询与详情之间任务可能已结束；此时不可再建立 sub 或插入占位
       if (taskStatusStr != `${TaskStatus.EXECUTING}`) {
-        // 仍刷新一次列表，避免界面停在半截字
-        await this.handleQueryConversation(result);
-        // 刷新期间本地可能已接管（用户新发送）：放弃收尾，避免覆盖新会话状态
-        if (this.isSubscribed == false || chatService.isCurrentlyStreaming == true) {
-          this.isSubscribed = false;
-          return;
+        // 仍刷新一次列表，避免界面停在半截字；复用响应且列表已由调用方整表重建时跳过
+        if (skipListRebuild != true) {
+          await this.handleQueryConversation(result!);
+          // 刷新期间本地可能已接管（用户新发送）：放弃收尾，避免覆盖新会话状态
+          if (this.isSubscribed == false || chatService.isCurrentlyStreaming == true) {
+            this.isSubscribed = false;
+            return;
+          }
         }
         // 后端已非执行中：正常收尾关态
         cleanupSub(true, false);
         return;
       }
-      const rawMessageList = dataObj["messageList"];
-      const parsedList = parseMessageList(rawMessageList);
-      if (parsedList.length > 0) {
-        const processed: MessageInfo[] = [];
-        for (let mi = 0; mi < parsedList.length; mi++) {
-          const message = parsedList[mi];
-          const adaptedMessage = adaptHistoryMessage(message);
-          let rawText = "";
-          if (adaptedMessage.text != null) {
-            rawText = `${adaptedMessage.text}`;
+      // skipListRebuild=true：列表已由调用方（resume/进页的 handleQueryConversation）
+      // 用同一响应重建过，此处不再重复 parse，仅复用其重建结果。
+      if (skipListRebuild != true) {
+        const rawMessageList = dataObj["messageList"];
+        const parsedList = parseMessageList(rawMessageList);
+        if (parsedList.length > 0) {
+          const processed: MessageInfo[] = [];
+          for (let mi = 0; mi < parsedList.length; mi++) {
+            const message = parsedList[mi];
+            const adaptedMessage = adaptHistoryMessage(message);
+            let rawText = "";
+            if (adaptedMessage.text != null) {
+              rawText = `${adaptedMessage.text}`;
+            }
+            const text = handleMessageProcess(rawText);
+            let id = generateUniqueId();
+            if (adaptedMessage.id != null) {
+              id = `${adaptedMessage.id}`;
+            }
+            adaptedMessage.text = text;
+            adaptedMessage.id = id;
+            processed.push(adaptedMessage);
           }
-          const text = handleMessageProcess(rawText);
-          let id = generateUniqueId();
-          if (adaptedMessage.id != null) {
-            id = `${adaptedMessage.id}`;
-          }
-          adaptedMessage.text = text;
-          adaptedMessage.id = id;
-          processed.push(adaptedMessage);
+          // sub 重载的历史可能携带 pending 审批/提问：reconcile 后才进入可渲染队列（对齐 main）
+          this.data.messageList.value =
+            reconcileAcpPermissionStatusesInMessageList(processed);
         }
-        // sub 重载的历史可能携带 pending 审批/提问：reconcile 后才进入可渲染队列（对齐 main）
-        this.data.messageList.value =
-          reconcileAcpPermissionStatusesInMessageList(processed);
       }
 
       // 与轮询门禁共用 subResumeGate：本轮用户未进列表则不开 sub（四端一致）
@@ -3809,26 +3905,26 @@ export default class AgentDetailService {
    *
    * @returns 是否需要订阅 sub（后端 EXECUTING）
    */
-  async resumeConversationState(): Promise<boolean> {
+  async resumeConversationState(): Promise<ConversationResumeResult> {
     // 1. 检查会话ID
     const conversationId = this.data.conversationId.value;
     if ((conversationId == null || conversationId == 0) || this.data.isTempChat.value) {
-      return false;
+      return new ConversationResumeResult(false, null);
     }
 
     // 2. 用户正在主动停止 / 本地 live 或 sub 已在跑 → 不抢
     if (this.data.isStoppingConversation.value) {
-      return false;
+      return new ConversationResumeResult(false, null);
     }
     if (chatService.isCurrentlyStreaming || this.isSubscribed) {
-      return false;
+      return new ConversationResumeResult(false, null);
     }
 
     try {
       // 3. 始终拉一次详情：跨端时本地气泡可能已是 Complete，不能只靠「异常中断」判断
       const res = await apiAgentConversation(conversationId);
       if (apiResCode(res) != SUCCESS_CODE) {
-        return false;
+        return new ConversationResumeResult(false, null);
       }
       const convData = apiResData<ConversationInfo>(res);
       const convObj = convData != null ? (convData as UTSJSONObject) : null;
@@ -3850,23 +3946,27 @@ export default class AgentDetailService {
         }
       }
 
-      // 刷新消息列表（其它端新消息 / 半截字终态）
-      await this.handleQueryConversation(res);
+      // 刷新消息列表（其它端新消息 / 半截字终态）。
+      // 指纹与本地一致说明会话未变化（空闲回前台常见），跳过整表重建，
+      // 长历史会话可省整份 parseMessageList + adaptHistoryMessage。
+      if (this.fingerprintConversationData(convObj) != this.lastListFingerprint) {
+        await this.handleQueryConversation(res);
+      }
 
       if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
         // 恢复检查确认后端仍在执行：清除保持态标记（正式接管由 handleSubConversation 完成）
         this.streamResumePending = false;
         this.resumeFailStreak = 0;
         this.data.isConversationActive.value = true;
-        return true;
+        return new ConversationResumeResult(true, res);
       }
       this.pendingBackgroundReconnect = false;
       this.data.isConversationActive.value = false;
-      return false;
+      return new ConversationResumeResult(false, res);
     } catch (error) {
       console.error("[SessionResume] 恢复会话状态失败:", error);
       this.data.isConversationActive.value = false;
-      return false;
+      return new ConversationResumeResult(false, null);
     }
   }
 
@@ -4706,10 +4806,17 @@ export default class AgentDetailService {
   /**
    * 刷新或重新查询会话订阅与限制状态
    */
-  async handleCheckSubscriptionLimit(): Promise<void> {
+  async handleCheckSubscriptionLimit(
+    preloadedResponse: RequestResponse<ConversationInfo> | null = null,
+  ): Promise<void> {
     const id = this.data.conversationId.value;
     if (id != null && id != 0) {
-      const res = await apiAgentConversation(id);
+      // 续接链已拉过新鲜详情时复用，跳过二次全量请求；
+      // 购买成功回调等「必须最新」的场景不传 preloadedResponse，走自拉。
+      const res =
+        preloadedResponse != null
+          ? preloadedResponse
+          : await apiAgentConversation(id);
       const convRaw = apiResData<any>(res);
       if (apiResCode(res) == SUCCESS_CODE && convRaw != null) {
         // Android Gson 不能实例化 ConversationInfo interface，直接按 JSON 对象读取。

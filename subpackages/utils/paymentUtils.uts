@@ -1278,6 +1278,12 @@ export async function checkH5PayCallback(
     if (isNaN(orderId)) return;
 
     cleanH5Params();
+    // 用户已手动关闭过该订单的确认框就不再重弹（含 bfcache 回退到带参历史条目）
+    if (isPayConfirmDismissed(orderId)) {
+      uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
+      processingId.value = null;
+      return;
+    }
     // 支付回跳后不再阻塞式轮询（原实现最长遮罩 120s 且不可取消），
     // 改为解锁页面并弹出确认框，由用户主动点「我已支付」查单。
     uni.hideLoading();
@@ -1312,18 +1318,23 @@ export async function checkActiveOrderCallback(
     uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
   }
   if (orderId <= 0) {
-    // 用户点过「关闭」后再次切回页面时，靠确认会话恢复
+    // 同一次支付里切出去又切回来（未走 URL 回跳）时，靠确认会话恢复
     orderId = getPayConfirmSessionOrderId();
   }
   if (orderId <= 0) {
+    return;
+  }
+  // 用户已手动关闭过该订单的确认框：即便未支付也不再骚扰，
+  // 需要复查请从订单列表重新发起支付（会重建会话并重置该标记）。
+  if (isPayConfirmDismissed(orderId)) {
     return;
   }
 
   // 确保 URL 干净，清除可能存在的 H5 拼接参数
   cleanH5Params();
 
-  // 不再上 h5_pay_lock：重复进入由 openPayAwaitConfirmDialog 的单例守卫拦截，
-  // 且用户关掉确认框后仍应能在下次切回页面时重新弹出。
+  // 不再上 h5_pay_lock：重复进入由 openPayAwaitConfirmDialog 的单例守卫
+  // 与上面的 dismissed 判断共同拦截。
   uni.hideLoading();
   processingId.value = null;
   await openPayAwaitConfirmDialog(
@@ -2106,8 +2117,40 @@ export function beginPayConfirmSession(
   session["orderId"] = orderId as any;
   session["payChannel"] = payChannelValue;
   session["autoResult"] = "";
+  // 每次重新发起支付都重置，用户上一轮点过「关闭」不影响新一轮弹窗
+  session["dismissed"] = "";
   session["createdAt"] = Date.now() as any;
   uni.setStorageSync(PAY_CONFIRM_SESSION, JSON.stringify(session));
+}
+
+/**
+ * 标记用户已手动关闭确认框。
+ * 会话保留（TTL 内仍可承接后台查单结果），但不再自动重弹——
+ * 用户主动关掉的弹窗，不该在他每次进入页面时又被推到脸上。
+ */
+export function markPayConfirmDismissed(orderId: number): void {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return;
+  }
+  if (readPayConfirmSessionOrderIdOf(session) != orderId) {
+    return;
+  }
+  session["dismissed"] = "1";
+  uni.setStorageSync(PAY_CONFIRM_SESSION, JSON.stringify(session));
+}
+
+/** 该订单的确认框是否已被用户手动关闭过。 */
+export function isPayConfirmDismissed(orderId: number): boolean {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return false;
+  }
+  if (readPayConfirmSessionOrderIdOf(session) != orderId) {
+    return false;
+  }
+  const raw = session["dismissed"];
+  return raw != null && `${raw}` == "1";
 }
 
 /** 无活跃会话返回 0。 */
@@ -2299,7 +2342,10 @@ export async function openPayAwaitConfirmDialog(
         if (cached.length > 0) {
           clearPayConfirmSession(orderId);
           emitPayResultToast(cached, t, onSuccess);
+          return;
         }
+        // 没有结果就是用户主动放弃本轮查单：记下来，后续进页面不再自动重弹
+        markPayConfirmDismissed(orderId);
         return;
       }
 

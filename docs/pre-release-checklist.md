@@ -19,7 +19,7 @@
 
 ## 🔑 密钥与签名（已处理，发布前复核）
 
-- [x] 开发 PoP 已从文档脱敏（4 处 → `<DEV_POP（受控渠道获取）>`）。
+- [x] 开发 PoP 等敏感值统一放 `scripts/local-secrets.env`（gitignore），文档/契约仅引用 `ESP_DEV_POP` 变量名。
 - [x] `DCLOUD_APPKEY` / `IOS_DEVELOPMENT_TEAM` / `IOS_PROVISIONING_PROFILE_UUID` 已移出仓库 → `scripts/local-secrets.env`（已 gitignore）；提交模板 `local-secrets.env.example`。
 - [x] 无 `.p12/.mobileprovision/.cer/.pem/.key` 进仓库；无私钥内容；无模型 API key（前端不持有）。
 - [ ] **git 历史残留**：dev PoP + 旧 AppKey/UUID 在历史 commit（`git log -S` 可查）。**私有仓可不动**；若仓库转为公开/外包，需 `git filter-repo` 清洗历史并强制推送。
@@ -27,13 +27,17 @@
 ## 📦 打包前自检
 
 ```bash
-# 1. 确认无敏感值进入跟踪文件
-git grep -n -e "<REDACTED>" -e "<REDACTED>" -e "<REDACTED>" -e "<REDACTED>"   # 应为空
-# 2. 确认 local-secrets.env 被忽略
+# 1. 契约中不得含 developmentPoP 字段
+git grep -n '"developmentPoP"' -- docs/
+# 2. 跟踪文件中不得出现 export DCLOUD_APPKEY= 赋值（example 模板除外）
+git grep -n 'export DCLOUD_APPKEY=' -- . ':!scripts/local-secrets.env.example'
+# 3. 不得提交证书/私钥
+git ls-files | rg -i '\.(p12|pem|mobileprovision|jks|keystore)$'
+# 4. 确认 local-secrets.env 被忽略
 git check-ignore scripts/local-secrets.env
-# 3. 确认 config.uts 的 test 域名 TODO 已删
+# 5. 确认 config.uts 的 test 域名 TODO 已删
 grep -n "打包正式环境时要删除" constants/config.uts   # 应为空
-# 4. 确认 prod 环境分支正确（NODE_ENV=production 时走 agent.nuwax.com）
+# 6. 确认 prod 环境分支正确（NODE_ENV=production 时走 agent.nuwax.com）
 ```
 
 > 关联：[offline-sdk-distribution-s3.md](./offline-sdk-distribution-s3.md) · [local-custom-base-maintenance.md](./local-custom-base-maintenance.md)

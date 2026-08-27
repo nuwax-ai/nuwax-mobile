@@ -748,6 +748,24 @@
               return
             }
           } catch (ePrev) {}
+          // #ifdef H5
+          // 相对路径（如 /api/computer/static/...）在页面 img 能显示，
+          // uni.previewImage 会当成本地资源导致黑底裂图，预览前补当前 origin。
+          try {
+            const origin = (typeof location !== 'undefined' && location.origin) ? location.origin : ''
+            const list = previewOpts.urls
+            if (origin && origin !== 'null' && list && list.length) {
+              previewOpts.urls = list.map(src => {
+                if (!src || /^(https?:|data:|blob:|file:|wxfile:|content:)/i.test(src)) return src
+                if (src.indexOf('//') === 0) {
+                  const proto = location.protocol || 'https:'
+                  return proto + src
+                }
+                return origin + (src.charAt(0) === '/' ? src : '/' + src)
+              })
+            }
+          } catch (eAbs) {}
+          // #endif
           uni.previewImage(previewOpts)
         }
       },

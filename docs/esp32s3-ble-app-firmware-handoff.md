@@ -65,12 +65,12 @@ Security 2 使用 SRP6a 完成认证和密钥协商，并使用 AES-GCM 保护�
 ```text
 security = 2
 username = 设备 UID，例如 NX-A1B2-C3D4-E5F6
-password/PoP = <REDACTED>
+password/PoP = scripts/local-secrets.env 中的 ESP_DEV_POP（勿入仓库）
 ```
 
 固件由 eFuse factory MAC、产品域字符串和 SHA-256 派生设备 UID，不直接将原始 MAC 作为 UID。username 必须与生成 SRP6a salt/verifier 时使用的 username 完全一致。
 
-开发 PoP 是共享测试密钥，只允许用于受控联调固件，不能进入生产版本。
+开发 PoP 是共享测试密钥，只允许用于受控联调固件，不能进入生产版本。本机从 `scripts/local-secrets.env.example` 复制为 `scripts/local-secrets.env` 后填写 `ESP_DEV_POP`。
 
 ### 4.2 生产逐设备方案
 
@@ -280,7 +280,7 @@ Service UUID: 0000ffff-0000-1000-8000-00805f9b34fb
 Name prefix: PROV_
 Transport: ble
 Security: 2
-Development PoP: <REDACTED>
+Development PoP: scripts/local-secrets.env → ESP_DEV_POP
 Username: device UID from serial log
 Required capability: wifi_prov
 Optional capability: wifi_scan

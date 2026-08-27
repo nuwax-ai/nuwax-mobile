@@ -23,7 +23,26 @@
  * （data:image/svg+xml 无论 ;utf8, 还是 ;base64, 都直接触发 error，图标显示为默认图），
  * 但它支持远程 .svg 地址且按组件尺寸正确缩放（没有 Android / iOS 的 1:1 光栅化问题），
  * 因此鸿蒙不需要也不能走 data URL 方案。H5 / 小程序同样原样透传，不产生额外请求。
+ *
+ * 鉴权：/api/f/ 受保护 SVG 的文本下载会自动补 Bearer 头并把相对地址补全为绝对地址，
+ * 因此**不要**先用 downloadFile 把它落成本地文件再传进来——本地 file:// 既取不到文本，
+ * 也会退回原生 1:1 光栅化，Android 上表现为头像被裁切 / 尺寸错乱。混合场景请直接用
+ * resolveDisplayImageUrl（受保护 + SVG 的组合已在其中按平台处理）。
  */
+import {
+  buildAuthProtectedFileHeaders,
+  fetchAuthProtectedFileDisplayUrl,
+  isAuthProtectedFileUrl,
+  resolveAuthProtectedFileFetchUrl,
+} from "@/utils/authProtectedFileUrl";
+
+/** 是否为需要按尺寸重写的远程 SVG 地址（data: 协议已是可直接渲染的内联图，排除在外） */
+export function isRemoteSvgUrl(url: string): boolean {
+  if (url.length == 0) return false;
+  const lower = url.toLowerCase();
+  if (lower.startsWith("data:")) return false;
+  return lower.endsWith(".svg") || lower.includes(".svg?");
+}
 
 // #ifdef APP-ANDROID || APP-IOS
 const svgTextCache = new Map<string, string>();
@@ -66,10 +85,15 @@ function releaseSvgSlot(): void {
 }
 
 function downloadSvgText(url: string, timeoutMs: number): Promise<string> {
+  // /api/f/ 受保护 SVG：补全为绝对地址并携带 Bearer，否则拿到的是未鉴权响应（图标显示为默认图）
+  const isProtected = isAuthProtectedFileUrl(url);
+  const requestUrl = isProtected ? resolveAuthProtectedFileFetchUrl(url) : url;
+  const header = isProtected ? buildAuthProtectedFileHeaders() : ({} as UTSJSONObject);
   return new Promise<string>((resolve, reject) => {
     uni.request({
-      url: url,
+      url: requestUrl,
       method: "GET",
+      header: header,
       timeout: timeoutMs,
       responseType: "text",
       // 鸿蒙端 responseType 不跳过 JSON 自动解析（uni-network 默认 dataType=json），
@@ -178,10 +202,8 @@ async function fetchSvgText(url: string, timeoutMs: number): Promise<string> {
 export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx: number): Promise<string> {
   // #ifdef APP-ANDROID || APP-IOS
   if (url.length == 0) return url;
-  const lower = url.toLowerCase();
   // 非 SVG 资源（png/jpg/data URL 等）直接透传
-  if (!lower.endsWith(".svg") && !lower.includes(".svg?")) return url;
-  if (lower.startsWith("data:image/svg")) return url;
+  if (!isRemoteSvgUrl(url)) return url;
   const sys = uni.getSystemInfoSync();
   const windowWidth = sys.windowWidth > 0 ? sys.windowWidth : 375;
   const pixelRatio = sys.pixelRatio > 0 ? sys.pixelRatio : 2;
@@ -209,4 +231,41 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
   // #ifndef APP-ANDROID || APP-IOS
   return url;
   // #endif
+}
+
+/**
+ * 解析可直接绑定给 <image> 的地址：一次处理「受保护文件」与「远程 SVG」两种异步场景。
+ *
+ * 两者的顺序不能颠倒：Android / iOS 上 SVG 必须走「取文本 → 改尺寸 → data URL」，
+ * 若先 downloadFile 落成本地 file://，既无法再取文本（uni.request 不支持 file 协议），
+ * 也会退回原生 1:1 光栅化 → 头像显示异常。鸿蒙 / H5 的 <image> 能正确缩放远程 SVG，
+ * 受保护地址走 downloadFile 拿本地临时文件即可。
+ *
+ * @param url 原始地址（可为相对路径的 /api/f/ 文件）
+ * @param widthRpx 容器宽度（rpx）
+ * @param heightRpx 容器高度（rpx）
+ * @returns 可直接展示的地址；解析失败回退原地址，由调用方决定是否换默认图
+ */
+export async function resolveDisplayImageUrl(
+  url: string,
+  widthRpx: number,
+  heightRpx: number,
+): Promise<string> {
+  if (url.length == 0) return url;
+  // #ifdef APP-ANDROID || APP-IOS
+  if (isRemoteSvgUrl(url)) {
+    const resolved = await resolveAppSvgUrl(url, widthRpx, heightRpx);
+    // 解析成功（已是 data URL）直接用；失败时受保护地址再退回 downloadFile 兜底
+    if (resolved != url) return resolved;
+  }
+  // #endif
+  if (isAuthProtectedFileUrl(url)) {
+    try {
+      return await fetchAuthProtectedFileDisplayUrl(url);
+    } catch (_e) {
+      // 保留各平台原生图片缓存 / Cookie 命中的机会
+      return url;
+    }
+  }
+  return await resolveAppSvgUrl(url, widthRpx, heightRpx);
 }

@@ -63,7 +63,7 @@
 	import { downloadFileInApp } from '@/subpackages/utils/fileTree'
 	// Android 内嵌 H5 字体放大修复：强制 webview textZoom = 100%
 	import { fixAppWebviewTextZoom } from '@/subpackages/utils/webviewTextZoom'
-	import { RESIDENT_CHAT_EVENT, setResidentChatVisibleFlag, setResidentChatCoverActive, rememberResidentChatSession, isResidentChatVisible, hideResidentChat, navigateAfterResidentChatHidden } from '@/utils/residentChatShell'
+	import { RESIDENT_CHAT_EVENT, setResidentChatVisibleFlag, setResidentChatCoverActive, rememberResidentChatSession, isResidentChatVisible, hideResidentChat, navigateAfterResidentChatHidden, setResidentChatBackHandler } from '@/utils/residentChatShell'
 	// App 三端原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发，边说边传 ASR）
 	import { StreamPcmRecorder } from '@/uni_modules/nuwax-stream-pcm-player'
 	// #endif
@@ -119,6 +119,10 @@
 	let latestInjectedKeyboardHeight: number = 0
 	/** 底部手势条/导航条高度（safeAreaInsets.bottom）：onKeyboardHeightChange 兜底值归一化为完整 IME 时使用 */
 	let latestInjectedSafeAreaBottom: number = 0
+	/** IME 高度短轮询（仅 Android；声明靠前避免 UTS 前向引用） */
+	let imePollTimer: number = 0
+	let imePollCount: number = 0
+	let imePollMax: number = 0
 	/** 防止多次 onShow 并发核对同一笔支付订单。 */
 	let nativePayResultChecking: boolean = false
 
@@ -178,6 +182,15 @@
 		}
 	}
 
+	/**
+	 * 尽快撤掉首页 opening-cover（z-index 高于壳）。
+	 * 壳已 visible / WebView 已刷白后，再等 H5 API 只会让用户多盯一块白板。
+	 * 防闪旧内容靠：壳白底 + navigate 刷白 + H5 boot loading；不靠长时间盖住首页遮罩。
+	 */
+	function releaseOpeningCover(): void {
+		setResidentChatCoverActive(false)
+	}
+
 	/** 揭开常驻壳（换会话完成后 / 兜底）。桥注入由调用方在 startAppWebViewBridge 声明后触发。 */
 	function revealChatShellOnMain(): void {
 		clearRevealFallbackTimer()
@@ -185,7 +198,7 @@
 		pendingRevealAgentId = ""
 		shellVisible.value = true
 		shellContentReady.value = true
-		setResidentChatCoverActive(false)
+		releaseOpeningCover()
 		fixAppWebviewTextZoom()
 		// 进页清掉残留键盘高度，避免 disclaimer / keyboard-cover 幽灵垫高
 		latestInjectedKeyboardHeight = 0
@@ -215,8 +228,9 @@
 	}
 
 	/**
-	 * 换会话：先把当前文档刷成白底，再 location.replace。
-	 * 避免在遮罩缝隙 / 原生层合成时仍画出上一会话。
+	 * 换会话：先把当前文档刷成白底，再 location.replace（带 _rs 强制整页导航）。
+	 * 禁止仅改 hash / SPA soft-nav：Android WebView 常不重载文档，会一直显示旧会话。
+	 * 也不做 idle 预热隐藏 web-view：Android 原生层常无视 CSS 显隐，会盖住首页导致「回首页空白」。
 	 */
 	function navigateWebViewToUrl(url: string): void {
 		try {
@@ -227,6 +241,7 @@
 			}
 			if (ctx != null) {
 				const literal = JSON.stringify(url)
+				// 刷白 + 简易 loading，随后整页 replace；首页 opening-cover 可在刷白后立刻撤掉
 				ctx.evalJS(
 					"try{document.documentElement.style.background='#fff';var b=document.body;if(b){b.style.background='#fff';b.style.minHeight='100vh';b.innerHTML='';}}catch(_c){}try{location.replace(" +
 						literal +
@@ -249,8 +264,7 @@
 	/**
 	 * 打开/切换会话。
 	 * - 同会话：直接揭开（内容已是目标，勿重载）
-	 * - 异会话：白遮罩盖住壳 → 页内刷白 + replace → 等 app-chat-ready / @load 再揭开
-	 *   （勿先 shellVisible=false：Android 原生 web-view 常无视 CSS 显隐，反而会露出旧画）。
+	 * - 异会话：白遮罩 → 整页 replace(_rs) → H5 清空后 app-chat-cleared 早揭（loading），ready 校正
 	 */
 	function openChatOnMain(agentId: string, conversationId: string, url: string): void {
 		if (agentId.length == 0) {
@@ -268,7 +282,7 @@
 		hideTabBarSafe()
 
 		if (!alreadyCreated) {
-			// 首次：先盖白，等首屏 @load / ready 再揭，避免空 web-view 闪一下
+			// 首次：壳立刻盖住首页；opening-cover 只挡极短一瞬，勿等 H5 整页/API
 			setResidentChatCoverActive(true)
 			shellContentReady.value = false
 			pendingRevealAfterLoad = true
@@ -282,6 +296,9 @@
 			rememberResidentChatSession(agentId, conversationId)
 			shellVisible.value = true
 			fixAppWebviewTextZoom()
+			setTimeout((): void => {
+				releaseOpeningCover()
+			}, 40)
 			scheduleRevealFallback(5000)
 			return
 		}
@@ -292,7 +309,7 @@
 			clearRevealFallbackTimer()
 			shellContentReady.value = true
 			shellVisible.value = true
-			setResidentChatCoverActive(false)
+			releaseOpeningCover()
 			fixAppWebviewTextZoom()
 			// 同会话再开不重载 H5：须主动清掉可能残留的键盘垫高
 			latestInjectedKeyboardHeight = 0
@@ -309,7 +326,7 @@
 			return
 		}
 
-		// 换会话：遮罩必须先盖住，再刷白 + 导航；壳保持 visible
+		// 换会话：先盖 opening-cover → 刷白+replace → 立刻撤 cover（防闪旧内容已由刷白完成）
 		setResidentChatCoverActive(true)
 		shellContentReady.value = false
 		shellVisible.value = true
@@ -323,6 +340,9 @@
 		appWebViewBridgeReported = false
 		navigateWebViewToUrl(url)
 		fixAppWebviewTextZoom()
+		setTimeout((): void => {
+			releaseOpeningCover()
+		}, 80)
 		scheduleRevealFallback(5000)
 	}
 
@@ -527,8 +547,8 @@
 		}
 		code = code + "}catch(e){}"
 
-		// Android / iOS / 鸿蒙：focusin 立刻用 LastH/DefaultH 顶 cover，避免等 IME/桥接首帧为 0。
-		// #ifdef APP-IOS || APP-HARMONY || APP-ANDROID
+		// 对齐 zhuoda：PredictOpen 仅 iOS / 鸿蒙（Android 见下方单独 ApplyCover，不预测抬升）。
+		// #ifdef APP-IOS || APP-HARMONY
 		// 首次：无缓存时系统可能先 pan（整页跟键盘），桥接终值再垫 cover →「底部晚出现」。
 		// 再次：有 LastH，focusin 立刻抬 cover+锁滚，不再依赖系统 pan。
 		// 此处：尽早恢复 LastH；桥接终值若 cover 仍为 0 则瞬间校正（禁止晚到的 0→h 动画）。
@@ -551,6 +571,22 @@
 				"';if(__h>0){if(window.__nuwaxKbPersistLast)window.__nuwaxKbPersistLast(__h);else window.__nuwaxKbLastH=__h;}if(window.__nuwaxKbDomH===__h){try{if(__h>0){window.__nuwaxKbLockDoc();if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();}else if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();}catch(_r){}}else{window.__nuwaxKbDomH=__h;if(__h>0){if(window.__nuwaxKbUnlockTimer){clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=0;}window.__nuwaxKbFocusLock=true;window.__nuwaxKbLockDoc();var cur=window.__nuwaxKbCoverCur?window.__nuwaxKbCoverCur():0;var needAnim=cur>__h*0.2&&cur<__h*0.9;window.__nuwaxKbApplyCover(__h,needAnim);if(window.__nuwaxKbSyncNav)window.__nuwaxKbSyncNav();var n=0;var tick=function(){if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();if(window.__nuwaxKbSyncNav)window.__nuwaxKbSyncNav();if(++n<20)requestAnimationFrame(tick);};requestAnimationFrame(tick);}else{if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();}if(window.__nuwaxKbLastDiagH!==__h){window.__nuwaxKbLastDiagH=__h;var sy=window.scrollY||0;var vv=window.visualViewport;var vvTop=vv&&vv.offsetTop!=null?vv.offsetTop:0;var nav=document.querySelector('.layout-fixed');var navTop=nav?nav.getBoundingClientRect().top:0;var curH=window.__nuwaxKbCoverCur?window.__nuwaxKbCoverCur():0;var payload={type:'kb-diag',tag:'inject-dom',platform:__plat,injH:__h,coverH:(__h>0?__h:0),coverCur:Math.round(curH),navOff:0,vvTop:vvTop,navTop:navTop,scrollY:sy,pan:false,mode:'predict-cover',embedded:true};if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:payload});}else if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:payload});}}}}catch(e2){}"
 		}
 		// #endif
+
+		// #ifdef APP-ANDROID
+		// 常驻壳挂在 Tab 首页：softinputMode=nothing 对内层 WebView 不如 zhuoda 独立页可靠。
+		// 不装 PredictOpen（折叠键/左滑无 blur 时不会悬空），但注入高度时 ApplyCover 强制贴齐 IME。
+		code =
+			code +
+			"try{window.__nuwaxKbApplyCover=function(h,_anim){try{var covers=document.querySelectorAll('.keyboard-cover');for(var i=0;i<covers.length;i++){covers[i].style.setProperty('transition','none','important');covers[i].style.setProperty('transform','none','important');covers[i].style.setProperty('height',(h>0?h:0)+'px','important');}}catch(_a){}};window.__nuwaxKbLockDoc=function(){try{var html=document.documentElement;var body=document.body;if(html)html.style.overflow='hidden';if(body)body.style.overflow='hidden';}catch(_l){}};window.__nuwaxKbUnlockPage=function(){try{var html=document.documentElement;var body=document.body;if(html)html.style.overflow='';if(body)body.style.overflow='';var covers=document.querySelectorAll('.keyboard-cover');for(var i=0;i<covers.length;i++){covers[i].style.transition='';covers[i].style.removeProperty('height');}}catch(_u){}};}catch(_instA){}"
+		if (withDomFix == true) {
+			code =
+				code +
+				"try{var __hA=" +
+				heightNum +
+				";if(__hA>0){if(window.__nuwaxKbLockDoc)window.__nuwaxKbLockDoc();if(window.__nuwaxKbApplyCover)window.__nuwaxKbApplyCover(__hA,false);var __navs=document.querySelectorAll('.layout-fixed');for(var __j=0;__j<__navs.length;__j++){__navs[__j].style.setProperty('transition','none','important');__navs[__j].style.top='0px';__navs[__j].style.setProperty('transform','none','important');}}else{if(window.__nuwaxKbApplyCover)window.__nuwaxKbApplyCover(0,false);if(window.__nuwaxKbUnlockPage)window.__nuwaxKbUnlockPage();}}catch(_e2A){}"
+		}
+		// #endif
+
 		code = code + "})()"
 		return code
 	}
@@ -654,7 +690,27 @@
 		}, 0)
 	}
 
-	/** webview 文档加载完成：启桥；换会话时优先等 H5 app-chat-ready 再揭开遮罩 */
+	function tryRevealPendingChat(agentId: string): void {
+		if (pendingRevealAfterLoad != true) {
+			return
+		}
+		if (
+			pendingRevealAgentId.length > 0 &&
+			agentId.length > 0 &&
+			agentId != pendingRevealAgentId
+		) {
+			return
+		}
+		deferAfterWebViewEvent((): void => {
+			if (!pendingRevealAfterLoad) {
+				return
+			}
+			revealChatShellOnMain()
+			startAppWebViewBridge()
+		})
+	}
+
+	/** webview 文档加载完成：启桥；@load 即可揭壳（勿再等 600ms / 整段 API） */
 	function handleWebViewLoad(_event: UniWebViewLoadEvent): void {
 		deferAfterWebViewEvent((): void => {
 			if (!shellVisible.value && !pendingRevealAfterLoad) {
@@ -662,16 +718,10 @@
 			}
 			fixAppWebviewTextZoom()
 			startAppWebViewBridge()
+			releaseOpeningCover()
 			if (pendingRevealAfterLoad) {
-				// 给 H5 一点时间发出 app-chat-ready；若迟迟不到，兜底揭开
-				setTimeout((): void => {
-					runOnMainThread((): void => {
-						if (!pendingRevealAfterLoad) {
-							return
-						}
-						revealChatShellOnMain()
-					})
-				}, 600)
+				// 文档已到：揭开壳内 mask，H5 侧 boot loading / 消息加载继续进行
+				revealChatShellOnMain()
 			} else {
 				shellContentReady.value = true
 			}
@@ -709,10 +759,6 @@
 		evalBridgeJS(bridgeCode + buildKeyboardHeightInjectCode(h, latestInjectedSafeAreaBottom, true, true))
 	}
 
-	/** IME 高度短轮询（仅 Android 有实际逻辑；函数本身各端都声明，避免嵌套 ifdef 裁掉定义后闭包仍引用） */
-	let imePollTimer: number = 0
-	let imePollCount: number = 0
-	let imePollMax: number = 0
 	function pollImeHeightOnce(): void {
 		// #ifdef APP-ANDROID
 		try {
@@ -727,11 +773,11 @@
 				injectKeyboardHeightToH5(v)
 			}
 			imePollCount++
-			// 首次弹出时 IME insets 常滞后几帧仍为 0；旧逻辑在 v==0 时立刻停轮询，cover 永远起不来。
-			if (imePollCount < 8) {
+			// 对齐 zhuoda：仅在已读到正高度时继续短轮询，最多 5 次
+			if (imePollCount < 5 && v > 0) {
 				imePollTimer = setTimeout((): void => {
 					pollImeHeightOnce()
-				}, 50) as number
+				}, 100) as number
 			} else {
 				imePollTimer = 0
 				imePollCount = 0
@@ -747,27 +793,33 @@
 
 	/**
 	 * 原生侧键盘高度变化 → 注入内嵌 H5（写 window.__nuwaxKeyboardHeight + CustomEvent）。
-	 * H5 运行时无 keyboardheightchange 事件，此桥是内嵌页 keyboardHeight 的唯一来源。
+	 * 对齐 zhuoda agent-detail：高度原样注入（含 0），不做「首帧 0 跳过 / 强制 PredictClose」补丁。
 	 * Android：WindowInsets 直读完整 IME；iOS / 鸿蒙：用 onKeyboardHeightChange 高度原样注入。
-	 * H5 侧 chat-input-phone 用 keyboard-cover 顶起输入区，避免系统整页 pan 把固定导航栏顶出屏。
+	 * 宿主页须 softinputMode=nothing，由 keyboard-cover 抬升输入区。
 	 */
 	function onAppKeyboardHeightChangeForWebView(res: any): void {
 		let h = 0
 		let usedImeRead = false
 		// #ifdef APP-ANDROID
-		// 优先：WindowInsets 直接读 IME 高度（完整 IME，权威读数）
 		try {
 			const imeCss = readAndroidImeHeight()
 			if (imeCss > 0) {
 				h = imeCss
 				usedImeRead = true
+				// 键盘动画期间取值可能偏小：短轮询取动画结束后的完整 IME 高
+				imePollMax = imeCss
+				imePollCount = 0
+				if (imePollTimer == 0) {
+					imePollTimer = setTimeout((): void => {
+						pollImeHeightOnce()
+					}, 100) as number
+				}
 			}
 		} catch (_eIme) {
 			// ignore
 		}
 		// #endif
 		if (h <= 0) {
-			// Android 兜底 / iOS / 鸿蒙：onKeyboardHeightChange
 			try {
 				const obj = res as UTSJSONObject
 				const raw = obj["height"]
@@ -782,7 +834,8 @@
 			}
 		}
 		// #ifdef APP-ANDROID
-		// 非 IME 直读路径（onKeyboardHeightChange 兜底）：高度不含底部安全区，补手势条
+		// 非 IME 直读路径：高度不含底部安全区，补手势条。
+		// h==0（折叠收起）不能再加 safeBottom，否则 cover 落不回底部。
 		if (!usedImeRead && h > 0) {
 			try {
 				const sysInfo = uni.getSystemInfoSync()
@@ -797,7 +850,6 @@
 			}
 		}
 		// #endif
-		// iOS/鸿蒙：记下 safeBottom 供注入对照；不叠加进 h（避免双重垫高）
 		try {
 			const sysInfo = uni.getSystemInfoSync()
 			const safeInset = sysInfo.safeAreaInsets
@@ -813,43 +865,8 @@
 			} catch (_eStore) {
 				// ignore
 			}
-			// #ifdef APP-ANDROID
-			// 键盘动画期间 IME 可能仍偏小：短轮询取完整高度
-			imePollMax = h
-			imePollCount = 0
-			if (imePollTimer == 0) {
-				imePollTimer = setTimeout((): void => {
-					pollImeHeightOnce()
-				}, 50) as number
-			}
-			// #endif
-			injectKeyboardHeightToH5(h)
-			return
 		}
-		// h==0：可能是真收起，也可能是弹出瞬间首帧（IME insets / 系统回调尚未到位）。
-		// 首帧打 0 会把 H5 focusin 预测抬升和后续真实高度都冲掉，表现为「第一次不顶、再点就正常」。
-		if (latestInjectedKeyboardHeight > 0) {
-			// #ifdef APP-ANDROID
-			if (imePollTimer != 0) {
-				clearTimeout(imePollTimer)
-				imePollTimer = 0
-			}
-			imePollCount = 0
-			imePollMax = 0
-			// #endif
-			injectKeyboardHeightToH5(0)
-			return
-		}
-		// #ifdef APP-ANDROID
-		// 尚未注入过正高度：当作弹出过程，等 WindowInsets，不要先灌 0。
-		imePollCount = 0
-		imePollMax = 0
-		if (imePollTimer == 0) {
-			imePollTimer = setTimeout((): void => {
-				pollImeHeightOnce()
-			}, 50) as number
-		}
-		// #endif
+		injectKeyboardHeightToH5(h)
 	}
 
 	function jsonStringifyForBridge(obj: UTSJSONObject): string {
@@ -2615,6 +2632,7 @@
 	/**
 	 * 壳内返回：有弹窗先关弹窗；否则 H5 多层 history.back，根页改发 app-exit 关壳。
 	 * （纯 history.back 在根页常无效果，表现为导航栏返回「无效」。）
+	 * 系统左滑 / 返回键经首页 onBackPress → handleResidentChatBackPress 也会走到这里。
 	 */
 	function handleAppNavBackFromH5(): void {
 		if (appWebViewPopupOpen == true) {
@@ -2628,6 +2646,15 @@
 		evalBridgeJS(
 			"try{var ps=(typeof getCurrentPages==='function')?getCurrentPages():[];if(ps&&ps.length>1){history.back();}else if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:{type:'app-exit'}});}else{history.back();}}catch(e){try{window.uni&&window.uni.webView&&window.uni.webView.postMessage({data:{type:'app-exit'}})}catch(e2){}}",
 		)
+	}
+
+	/** 首页 onBackPress 回调：壳可见则消费返回事件 */
+	function onResidentChatSystemBack(): boolean {
+		if (shellVisible.value != true && isResidentChatVisible() != true) {
+			return false
+		}
+		handleAppNavBackFromH5()
+		return true
 	}
 
 	/**
@@ -2740,27 +2767,22 @@
 			navigateAfterResidentChatHidden()
 			return
 		}
-		if (type == "app-chat-ready") {
-			// H5 当前智能体头图/标题已就绪：若仍在等揭开且 id 匹配，延后揭开
+		if (type == "app-chat-cleared") {
 			if (pendingRevealAfterLoad != true) {
 				return
 			}
-			const readyId = msg["agentId"] != null ? `${msg["agentId"]}` : ""
-			if (
-				pendingRevealAgentId.length > 0 &&
-				readyId.length > 0 &&
-				readyId != pendingRevealAgentId
-			) {
+			const clearedId = msg["agentId"] != null ? `${msg["agentId"]}` : ""
+			tryRevealPendingChat(clearedId)
+			return
+		}
+		if (type == "app-chat-ready") {
+			// 头图/标题就绪；若 cleared 已揭过则只校正桥接
+			if (pendingRevealAfterLoad != true) {
+				startAppWebViewBridge()
 				return
 			}
-			// 必须 defer：@message 同步路径里改壳状态会触发 web-view 重绑 :src → NPE
-			deferAfterWebViewEvent((): void => {
-				if (!pendingRevealAfterLoad) {
-					return
-				}
-				revealChatShellOnMain()
-				startAppWebViewBridge()
-			})
+			const readyId = msg["agentId"] != null ? `${msg["agentId"]}` : ""
+			tryRevealPendingChat(readyId)
 			return
 		}
 		if (type == "app-nav-back") {
@@ -2833,12 +2855,17 @@
 	}
 
 	// 返回键由首页 pages/index onBackPress 代理（组件级 onBackPress 不可靠）
+	setResidentChatBackHandler(onResidentChatSystemBack)
 
 	uni.$on(RESIDENT_CHAT_EVENT, onResidentChatEvent)
 
 	// 对齐 chat-input-phone：在回调函数声明之后、onMounted 内注册键盘监听
 	onMounted(() => {
 		// #ifdef APP
+		// #ifdef APP-ANDROID
+		// 与 zhuoda agent-detail 一致：监听前先写入手势条高度，供首帧注入带上
+		latestInjectedSafeAreaBottom = readAndroidSafeAreaBottom()
+		// #endif
 		if (appKeyboardHeightListenerId == 0) {
 			appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChangeForWebView)
 		}
@@ -2866,6 +2893,7 @@
 	})
 
 	onUnmounted(() => {
+		setResidentChatBackHandler(null)
 		uni.$off(RESIDENT_CHAT_EVENT, onResidentChatEvent)
 		stopWebViewBridge()
 		// #ifdef APP

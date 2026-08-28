@@ -119,6 +119,12 @@
     </template>
     <template v-else>
       <view class="chat-container">
+        <!-- App 内嵌：换会话/首屏加载占位（原生遮罩揭开后仍避免空白） -->
+        <!-- #ifdef H5 || WEB -->
+        <view v-if="isAppWebView && residentChatBootLoading" class="resident-chat-boot-loading">
+          <spin-loading size="48rpx" color="#3bb346" :duration-ms="800" />
+        </view>
+        <!-- #endif -->
         <!-- 性能测试浮层：avgFps / maxGap（仅 perfTest 模式） -->
         <view v-if="isPerfMock" class="perf-overlay">
           <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
@@ -636,7 +642,7 @@
   import { handleExternalLink } from "@/utils/system.uts";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system.uts";
   import { setEmbeddedStatusBarHeight } from "@/utils/system.uts";
-  import { notifyResidentChatReady } from "@/utils/system.uts";
+  import { notifyResidentChatReady, notifyResidentChatCleared } from "@/utils/system.uts";
   import { previewImageCompat } from "@/utils/appWebViewImagePreview.uts";
   import { applyAppWebViewKeyboardChrome, dumpKeyboardDiag } from "@/utils/appWebViewKeyboardChrome.uts";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
@@ -768,6 +774,15 @@
    * __nuwaxSetAppEmbedded 后置 true）。用于区分「浏览器直接打开」与「App web-view 内嵌」。
    */
   const isAppWebView = ref<boolean>(false);
+  /** App 内嵌：换会话/首屏数据加载中（配合 app-chat-cleared 早揭原生遮罩） */
+  const residentChatBootLoading = ref<boolean>(false);
+
+  function finishResidentChatBoot(agentId: number | null): void {
+    if (isAppWebView.value == true) {
+      residentChatBootLoading.value = false;
+    }
+    notifyResidentChatReady(agentId);
+  }
 
   // #ifdef H5 || WEB
   /** onLoad 暂存的状态栏（刘海）高度：确认内嵌（markAppEmbedded）后才 applyEmbedded 生效 */
@@ -814,6 +829,17 @@
       // ignore
     }
     return false;
+  }
+
+  function beginResidentChatBoot(agentId: number | null): void {
+    if (isAppWebView.value != true && detectAppWebViewFromGlobals() != true) {
+      return;
+    }
+    if (isAppWebView.value != true) {
+      markAppEmbedded();
+    }
+    residentChatBootLoading.value = true;
+    notifyResidentChatCleared(agentId);
   }
 
   /** 内嵌态持久化 key（sessionStorage：webview 单会话内跨重挂载存活） */
@@ -2065,7 +2091,9 @@
   function getPublishedAgentInfo(appParams: OpenAppParams | null) {
     // Android：禁止 null as OpenAppParams；服务层参数改为可空
     service.getPublishedAgentInfo(appParams).then((): void => {
-      notifyResidentChatReady(data.agentId.value);
+      finishResidentChatBoot(data.agentId.value);
+    }).catch((): void => {
+      finishResidentChatBoot(data.agentId.value);
     });
   }
   const handleCollect = () => service.handleCollect();
@@ -3294,15 +3322,13 @@
     // #endif
   });
 
-  /**
-   * 处理页面加载
-   */
   const handlePageLoad = async (options: any): Promise<void> => {
     // 换智能体 / 常驻壳复用：先清空头图与标题，避免 SPA 软路由时短暂显示上一次智能体
     data.agentInfo.value = null;
     data.agentName.value = "";
     data.messageList.value = [];
     data.conversationInfo.value = null;
+    data.conversationId.value = null;
 
     // 智能体id
     const idVal = (options as UTSJSONObject)["id"];
@@ -3311,6 +3337,9 @@
     } else {
       data.agentId.value = null;
     }
+    // #ifdef H5 || WEB
+    beginResidentChatBoot(data.agentId.value);
+    // #endif
 
     // 如果存在会话id，则初始化ParseMarkdown，查询历史会话信息
     const convIdVal = (options as UTSJSONObject)["conversationId"];
@@ -3336,8 +3365,7 @@
             }
           }
           await handleQueryConversation(res);
-          // 常驻壳：头信息已写入，通知原生可揭开（避免闪旧智能体）
-          notifyResidentChatReady(data.agentId.value);
+          finishResidentChatBoot(data.agentId.value);
           // 历史消息首屏布局完成后再无动画滚到底（watch 可能早于 DOM 就绪）
           if (data.messageList.value.length > 0) {
             scrollToLastMsgAfterHistoryLoad();
@@ -3409,9 +3437,11 @@
               startResumePolling();
             }
           }
+        } else {
+          finishResidentChatBoot(data.agentId.value);
         }
-      } catch (_e) {
-        // ignore
+      } catch (_eConv) {
+        finishResidentChatBoot(data.agentId.value);
       }
     } else {
       let paramsData: OpenAppParams | null = null;
@@ -3424,6 +3454,46 @@
       getPublishedAgentInfo(paramsData);
     }
   };
+
+  // #ifdef H5 || WEB
+  /** 常驻壳页内换会话：写入 token / 状态栏并复用 handlePageLoad */
+  function applyResidentChatAccessFromOptions(options: UTSJSONObject): void {
+    const accessTokenVal = options["accessToken"];
+    if (accessTokenVal != null) {
+      const accessToken = `${accessTokenVal}`;
+      if (accessToken.length > 0) {
+        uni.setStorageSync(ACCESS_TOKEN, accessToken);
+        document.cookie = `ticket=${accessToken}; path=/`;
+        if (detectAppWebViewFromGlobals() == true) {
+          markAppEmbedded();
+        }
+      }
+    }
+    const statusBarRaw = options["statusBarHeight"];
+    if (statusBarRaw != null) {
+      const statusBarNum = parseFloat(`${statusBarRaw}`);
+      if (!isNaN(statusBarNum)) {
+        pendingEmbeddedStatusBarHeight = statusBarNum;
+        setEmbeddedStatusBarHeight(statusBarNum);
+        markAppEmbedded();
+      }
+    }
+  }
+
+  function stopInFlightChatForResidentSwitch(): void {
+    stopAllStreamSpeech(true);
+    chatService.abort();
+    service.abortSubConversation();
+    stopConversationPolling();
+  }
+
+  function applyResidentChatOpenFromNative(options: any): void {
+    const opts = options as UTSJSONObject;
+    applyResidentChatAccessFromOptions(opts);
+    stopInFlightChatForResidentSwitch();
+    void handlePageLoad(opts);
+  }
+  // #endif
 
   /**
    * 使用chatKey、captchaVerifyParam创建临时会话
@@ -3970,6 +4040,9 @@
         data.keyboardHeight.value = 0;
         applyAppWebViewKeyboardChrome(0);
       }
+      w.__nuwaxOpenResidentChat = (raw: any): void => {
+        applyResidentChatOpenFromNative(raw);
+      };
     } catch (_eKb) {
       // ignore
     }
@@ -4171,5 +4244,18 @@
     justify-content: center;
     align-items: center;
     padding: 24rpx 0;
+  }
+
+  .resident-chat-boot-loading {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: #ffffff;
+    z-index: 20;
   }
 </style>

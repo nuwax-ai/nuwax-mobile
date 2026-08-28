@@ -460,13 +460,15 @@
 
 	/**
 	 * 生成键盘高度注入脚本（字符串拼接，避免 UTS 模板字符串误解析 {}）。
-	 * @param withDomFix iOS/鸿蒙为 true 时：安装 focus 跟手抬升 + 用桥接终值校正；
-	 *   桥接轮询传 false（仍安装 focus 预测逻辑，但不按终值改 cover，避免刷屏）。
+	 * @param withDomFix 为 true 时：安装 focus 跟手抬升 + 用桥接终值校正 cover。
+	 * @param emitHeight 为 false 时只装脚本/写 safeBottom，不改 __nuwaxKeyboardHeight、
+	 *   也不派发高度事件。桥轮询必须传 false，否则进页 5s 内反复打 0 会把首次聚焦刚顶起的输入框压回去。
 	 */
 	function buildKeyboardHeightInjectCode(
 		h: number,
 		safeBottom: number,
 		withDomFix: boolean,
+		emitHeight: boolean,
 	): string {
 		const heightNum = `${Math.round(h)}`
 		const safeBottomNum = `${Math.round(safeBottom)}`
@@ -497,26 +499,36 @@
 		platform = "harmony"
 		// #endif
 
-		// 基础：写全局 + CSS 变量（H5 env(safe-area-inset-bottom) 在鸿蒙 WebView/模拟器常虚高）
-		// + 派发事件
-		let code =
-			"(function(){try{window.__nuwaxKeyboardHeight=" +
-			heightNum +
-			";window.__nuwaxSafeAreaBottom=" +
+		// 基础：写 CSS 变量（H5 env(safe-area-inset-bottom) 在鸿蒙 WebView/模拟器常虚高）
+		// emitHeight 时才写全局高度并派发事件
+		let code = "(function(){try{"
+		if (emitHeight == true) {
+			code = code + "window.__nuwaxKeyboardHeight=" + heightNum + ";"
+		}
+		code =
+			code +
+			"window.__nuwaxSafeAreaBottom=" +
 			safeBottomNum +
 			";try{document.documentElement.style.setProperty('--nuwax-safe-area-bottom','" +
 			safeBottomNum +
 			"px');}catch(_css){}window.__nuwaxKbPlatform='" +
 			platform +
-			"';window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:" +
-			heightNum +
-			",safeAreaBottom:" +
-			safeBottomNum +
-			",platform:'" +
-			platform +
-			"'}}));}catch(e){}"
+			"';"
+		if (emitHeight == true) {
+			code =
+				code +
+				"window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:" +
+				heightNum +
+				",safeAreaBottom:" +
+				safeBottomNum +
+				",platform:'" +
+				platform +
+				"'}}));"
+		}
+		code = code + "}catch(e){}"
 
-		// #ifdef APP-IOS || APP-HARMONY
+		// Android / iOS / 鸿蒙：focusin 立刻用 LastH/DefaultH 顶 cover，避免等 IME/桥接首帧为 0。
+		// #ifdef APP-IOS || APP-HARMONY || APP-ANDROID
 		// 首次：无缓存时系统可能先 pan（整页跟键盘），桥接终值再垫 cover →「底部晚出现」。
 		// 再次：有 LastH，focusin 立刻抬 cover+锁滚，不再依赖系统 pan。
 		// 此处：尽早恢复 LastH；桥接终值若 cover 仍为 0 则瞬间校正（禁止晚到的 0→h 动画）。
@@ -575,10 +587,10 @@
 			}
 		}
 		try {
-			// 桥轮询只注入 cookie / 内嵌标记 / safeBottom，不要把上次残留的键盘高度当「正在弹起」
-			// 再写进 __nuwaxKeyboardHeight——否则进页会幽灵垫高一块键盘高空白。
+			// 桥轮询只注入 cookie / 内嵌标记 / safeBottom / 键盘跟手脚本。
+			// 不要 dispatch 高度 0：进页 5s 窗口内用户常已点输入框，打 0 会把刚顶起的 cover 压回去。
 			// 真实 IME 高度只由 onKeyboardHeightChange / WindowInsets 回调注入。
-			ctx.evalJS(code + buildKeyboardHeightInjectCode(0, latestInjectedSafeAreaBottom, false))
+			ctx.evalJS(code + buildKeyboardHeightInjectCode(0, latestInjectedSafeAreaBottom, false, false))
 			// 原生已拿到结算结果、但 H5 尚未 ACK：随 @load 注入窗口重复补发。
 			// ACK 到达后 storage 被清理，后续轮询自然停止重放。
 			const paySnapshot = getStoredAppNativePayResult()
@@ -694,7 +706,7 @@
 		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
 		const token = tokenRaw != null ? `${tokenRaw}` : ""
 		const bridgeCode = token.length > 0 ? buildBridgeCode(JSON.stringify(token)) : ""
-		evalBridgeJS(bridgeCode + buildKeyboardHeightInjectCode(h, latestInjectedSafeAreaBottom, true))
+		evalBridgeJS(bridgeCode + buildKeyboardHeightInjectCode(h, latestInjectedSafeAreaBottom, true, true))
 	}
 
 	/** IME 高度短轮询（仅 Android 有实际逻辑；函数本身各端都声明，避免嵌套 ifdef 裁掉定义后闭包仍引用） */
@@ -707,13 +719,19 @@
 			const v = readAndroidImeHeight()
 			if (v > imePollMax) {
 				imePollMax = v
+				try {
+					uni.setStorageSync("NUWAX_KB_LAST_H", Math.round(v))
+				} catch (_eStore) {
+					// ignore
+				}
 				injectKeyboardHeightToH5(v)
 			}
 			imePollCount++
-			if (imePollCount < 5 && v > 0) {
+			// 首次弹出时 IME insets 常滞后几帧仍为 0；旧逻辑在 v==0 时立刻停轮询，cover 永远起不来。
+			if (imePollCount < 8) {
 				imePollTimer = setTimeout((): void => {
 					pollImeHeightOnce()
-				}, 100) as number
+				}, 50) as number
 			} else {
 				imePollTimer = 0
 				imePollCount = 0
@@ -743,14 +761,6 @@
 			if (imeCss > 0) {
 				h = imeCss
 				usedImeRead = true
-				// 键盘动画期间取值可能偏小：短轮询取动画结束后的完整 IME 高
-				imePollMax = imeCss
-				imePollCount = 0
-				if (imePollTimer == 0) {
-					imePollTimer = setTimeout((): void => {
-						pollImeHeightOnce()
-					}, 100) as number
-				}
 			}
 		} catch (_eIme) {
 			// ignore
@@ -773,7 +783,7 @@
 		}
 		// #ifdef APP-ANDROID
 		// 非 IME 直读路径（onKeyboardHeightChange 兜底）：高度不含底部安全区，补手势条
-		if (!usedImeRead) {
+		if (!usedImeRead && h > 0) {
 			try {
 				const sysInfo = uni.getSystemInfoSync()
 				const safeInset = sysInfo.safeAreaInsets
@@ -803,8 +813,43 @@
 			} catch (_eStore) {
 				// ignore
 			}
+			// #ifdef APP-ANDROID
+			// 键盘动画期间 IME 可能仍偏小：短轮询取完整高度
+			imePollMax = h
+			imePollCount = 0
+			if (imePollTimer == 0) {
+				imePollTimer = setTimeout((): void => {
+					pollImeHeightOnce()
+				}, 50) as number
+			}
+			// #endif
+			injectKeyboardHeightToH5(h)
+			return
 		}
-		injectKeyboardHeightToH5(h)
+		// h==0：可能是真收起，也可能是弹出瞬间首帧（IME insets / 系统回调尚未到位）。
+		// 首帧打 0 会把 H5 focusin 预测抬升和后续真实高度都冲掉，表现为「第一次不顶、再点就正常」。
+		if (latestInjectedKeyboardHeight > 0) {
+			// #ifdef APP-ANDROID
+			if (imePollTimer != 0) {
+				clearTimeout(imePollTimer)
+				imePollTimer = 0
+			}
+			imePollCount = 0
+			imePollMax = 0
+			// #endif
+			injectKeyboardHeightToH5(0)
+			return
+		}
+		// #ifdef APP-ANDROID
+		// 尚未注入过正高度：当作弹出过程，等 WindowInsets，不要先灌 0。
+		imePollCount = 0
+		imePollMax = 0
+		if (imePollTimer == 0) {
+			imePollTimer = setTimeout((): void => {
+				pollImeHeightOnce()
+			}, 50) as number
+		}
+		// #endif
 	}
 
 	function jsonStringifyForBridge(obj: UTSJSONObject): string {

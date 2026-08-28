@@ -135,14 +135,19 @@
     </view>
     <!-- #endif -->
 
-    <!-- #ifdef APP-ANDROID -->
-    <view v-if="showAndroidCaptcha" class="android-captcha-mask">
-      <view class="android-captcha-backdrop" @click="closeAndroidCaptcha"></view>
+    <!-- #ifdef APP -->
+    <!-- App 三端共用的验证码弹层；首次打开后 web-view 常驻，关闭只隐藏不卸载 -->
+    <view
+      v-if="appCaptchaAlive"
+      class="app-captcha-mask"
+      :class="{ 'app-captcha-mask-hidden': !showAppCaptcha }"
+    >
+      <view class="app-captcha-backdrop" @click="closeAppCaptcha"></view>
       <web-view
         id="login-aliyun-captcha-webview"
-        class="android-captcha-webview"
-        :src="androidCaptchaUrl"
-        @message="handleAndroidCaptchaMessage"
+        class="app-captcha-webview"
+        :src="appCaptchaUrl"
+        @message="handleAppCaptchaMessage"
       ></web-view>
     </view>
     <!-- #endif -->
@@ -173,6 +178,7 @@
   import AgreementCheckbox from "@/components/agreement-checkbox/agreement-checkbox.uvue";
   import { redirectTo } from "@/utils/common";
   import { getApiBaseUrl } from "@/constants/config";
+  import { extractCaptchaVerifyParam } from "@/utils/aliyunCaptcha";
   import { saveAccessToken } from "@/utils/authSession";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import enterpriseLoginIcon from "@/static/icons/enterprise_login.svg";
@@ -310,11 +316,22 @@
   });
   // 阿里云验证码按钮id
   const buttonId = ref<string>("aliyun-captcha-id");
+  // #ifdef MP-WEIXIN
   const captchaResultEvent = "login_aliyun_captcha_result";
   let waitingCaptchaResult = false;
-  // #ifdef APP-ANDROID
-  const showAndroidCaptcha = ref<boolean>(false);
-  const androidCaptchaUrl = computed((): string => getApiBaseUrl() + "/static/aliyun-captcha.html");
+  // #endif
+  // #ifdef APP
+  // App 三端（Android / iOS / 鸿蒙）统一用页内弹层加载阿里云验证码，不再跳独立页。
+  // web-view 一经挂载就常驻到登录页销毁：iOS 26 下 WKWebView 反复建销必现
+  // WebKit BackForwardList 释放竞态闪退（见 docs/vapor/dcloud-ios26-webview-crash-report.md，
+  // 报告实测「常驻不销毁」是唯一安全形态），因此关闭弹层只隐藏，重新打开靠
+  // 改写 src 让同一个 webview 实例重新加载验证码页。
+  const appCaptchaAlive = ref<boolean>(false);
+  const showAppCaptcha = ref<boolean>(false);
+  const appCaptchaReloadToken = ref<number>(0);
+  const appCaptchaUrl = computed((): string => {
+    return `${getApiBaseUrl()}/static/aliyun-captcha.html?t=${appCaptchaReloadToken.value}`;
+  });
   // #endif
 
   // 分段器相关数据
@@ -688,12 +705,40 @@
     }
   }
 
-  // ====== App / 微信小程序阿里云验证码跳转 ======
+  // ====== App 端阿里云验证码弹层（Android / iOS / 鸿蒙同一实现） ======
+  // #ifdef APP
+  const openAppCaptcha = () => {
+    // 每次打开都换 token 触发 src 变更，让常驻的 webview 重新加载验证码页；
+    // 不用 v-if 重建，避免 iOS 端 WKWebView 建销竞态闪退。
+    appCaptchaReloadToken.value = appCaptchaReloadToken.value + 1;
+    appCaptchaAlive.value = true;
+    showAppCaptcha.value = true;
+  };
+
+  const closeAppCaptcha = () => {
+    showAppCaptcha.value = false;
+    loading.value = false;
+  };
+
+  const handleAppCaptchaMessage = (event: UniWebViewMessageEvent) => {
+    const messages = event.detail.data;
+    if (messages.length == 0) {
+      return;
+    }
+    const captchaVerifyParam = extractCaptchaVerifyParam(
+      messages[messages.length - 1] as any
+    );
+    if (captchaVerifyParam.length == 0) {
+      return;
+    }
+    showAppCaptcha.value = false;
+    handlerSuccess(captchaVerifyParam);
+  };
+  // #endif
+
+  // ====== 微信小程序阿里云验证码跳转（小程序不支持页内弹层 web-view 叠加） ======
+  // #ifdef MP-WEIXIN
   const handleClickAliyunCaptcha = () => {
-    // #ifdef APP-ANDROID
-    showAndroidCaptcha.value = true;
-    return;
-    // #endif
     waitingCaptchaResult = true;
     uni.navigateTo({
       url: "/subpackages/pages/aliyun-captcha/aliyun-captcha",
@@ -707,28 +752,6 @@
       },
     });
   };
-
-  // #ifdef APP-ANDROID
-  const closeAndroidCaptcha = () => {
-    showAndroidCaptcha.value = false;
-    loading.value = false;
-  };
-
-  const handleAndroidCaptchaMessage = (event: UniWebViewMessageEvent) => {
-    const messages = event.detail.data;
-    if (messages.length == 0) {
-      return;
-    }
-    const payload = messages[messages.length - 1] as UTSJSONObject;
-    const value = payload["captchaVerifyParam"];
-    const captchaVerifyParam = value != null ? `${value}` : "";
-    if (captchaVerifyParam.length == 0) {
-      return;
-    }
-    showAndroidCaptcha.value = false;
-    handlerSuccess(captchaVerifyParam);
-  };
-  // #endif
 
   const handleCaptchaVerifyResult = (captchaVerifyParam: any) => {
     if (!waitingCaptchaResult) {
@@ -746,13 +769,21 @@
     }
     handlerSuccess(verifyParam);
   };
+  // #endif
 
   onMounted(() => {
+    // #ifdef MP-WEIXIN
+    // 页面被 reLaunch 销毁时 onUnmounted 未必触发，注册前先摘一次，
+    // 防止「退出登录 → 重新登录」后全局事件总线上叠加已销毁实例的监听。
+    uni.$off(captchaResultEvent, handleCaptchaVerifyResult);
     uni.$on(captchaResultEvent, handleCaptchaVerifyResult);
+    // #endif
   });
 
   onUnmounted(() => {
+    // #ifdef MP-WEIXIN
     uni.$off(captchaResultEvent, handleCaptchaVerifyResult);
+    // #endif
     clearCodeCountdown();
   });
 
@@ -788,8 +819,12 @@
         loading.value = false;
       }
       // #endif
-      // #ifdef MP-WEIXIN || APP
-      // 原生端通过 web-view 加载验证码页，校验结果经页面消息回传。
+      // #ifdef APP
+      // App 三端：页内弹层加载验证码页，校验结果经 web-view message 回传。
+      openAppCaptcha();
+      // #endif
+      // #ifdef MP-WEIXIN
+      // 小程序：跳独立验证码页，校验结果经全局事件回传。
       handleClickAliyunCaptcha();
       // #endif
     } else {
@@ -1199,7 +1234,7 @@
       opacity: 0;
     }
 
-    .android-captcha-mask {
+    .app-captcha-mask {
       position: fixed;
       left: 0;
       top: 0;
@@ -1212,7 +1247,19 @@
       background-color: rgba(0, 0, 0, 0.45);
     }
 
-    .android-captcha-webview {
+    /*
+     * 关闭态：不卸载 web-view（iOS 反复建销会闪退），只把弹层整体收掉。
+     * top:0 + bottom:100% 使高度塌陷为 0，overflow 裁掉常驻的 webview，
+     * visibility 再兜一层，确保既不遮挡登录页也不吃点击。
+     */
+    .app-captcha-mask-hidden {
+      bottom: 100%;
+      overflow: hidden;
+      visibility: hidden;
+      background-color: transparent;
+    }
+
+    .app-captcha-webview {
       z-index: 1;
       width: 700rpx;
       height: 180rpx;
@@ -1221,7 +1268,7 @@
       overflow: hidden;
     }
 
-    .android-captcha-backdrop {
+    .app-captcha-backdrop {
       position: absolute;
       left: 0;
       top: 0;

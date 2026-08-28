@@ -67,6 +67,9 @@
 	// App 三端原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发，边说边传 ASR）
 	import { StreamPcmRecorder } from '@/uni_modules/nuwax-stream-pcm-player'
 	// #endif
+	// #ifdef APP-IOS
+	import { IosMediaPermission } from '@/uni_modules/nuwax-stream-pcm-player'
+	// #endif
 	// #ifdef APP-HARMONY
 	// 鸿蒙专属：录音权限被永久拒绝时跳转应用权限设置页
 	import { openHarmonyMicPermissionSettings } from '@/uni_modules/nuwax-stream-pcm-player'
@@ -1036,9 +1039,45 @@
 		}
 	}
 
+	/** iOS getAppAuthorizeSetting 状态：已授权（含相册有限访问） */
+	function iosAuthorizeIsGranted(status: string): boolean {
+		return status == "authorized" || status == "limited"
+	}
+
+	/** iOS 已拒绝 / 配置缺失 / 受限：系统不会再弹授权窗 */
+	function iosAuthorizeIsDenied(status: string): boolean {
+		return status == "denied" || status == "config error" || status == "restricted"
+	}
+
+	/** uni.chooseImage/chooseFile 因无权限失败。
+	 *  与下方 isNativeChooseCancelled 不是同一件事：
+	 *  zhuoda agent-detail 里条件更多的是「用户取消选图」（cancel/abort/camera error），
+	 *  本函数只认权限拒绝，命中后弹去设置，不能把取消误判进来。 */
+	function isNativePermissionDeniedError(errMsg: string): boolean {
+		if (errMsg.length == 0) {
+			return false
+		}
+		const lower = errMsg.toLowerCase()
+		return (
+			lower.indexOf("no permission") >= 0 ||
+			lower.indexOf("permission denied") >= 0 ||
+			lower.indexOf("unauthorized") >= 0 ||
+			lower.indexOf("not authorized") >= 0 ||
+			lower.indexOf("auth deny") >= 0 ||
+			lower.indexOf("auth denied") >= 0 ||
+			lower.indexOf("access denied") >= 0 ||
+			lower.indexOf("user denied") >= 0 ||
+			lower.indexOf("authorize:fail") >= 0 ||
+			errMsg.indexOf("没有权限") >= 0 ||
+			errMsg.indexOf("权限被拒") >= 0 ||
+			errMsg.indexOf("权限拒绝") >= 0
+		)
+	}
+
 	// #ifdef APP-IOS
 	/** iOS not-determined 时主动请求系统授权（延迟绑定：ensureNativeRecorder 声明在其后，UTS 须先声明后使用） */
 	let iosRequestMicPermissionFn: (() => Promise<NativeMicPermissionResult>) | null = null
+	let iosRequestCameraPermissionFn: (() => Promise<NativeMicPermissionResult>) | null = null
 	// #endif
 
 	/** 申请麦克风权限（Android 用 UTSAndroid；iOS 检查授权状态 + not-determined 主动请求）
@@ -1171,16 +1210,21 @@
 		// #endif
 		// #ifdef APP-IOS
 		const authSetting = uni.getAppAuthorizeSetting()
-		if (authSetting.cameraAuthorized == "authorized") {
+		if (iosAuthorizeIsGranted(authSetting.cameraAuthorized)) {
 			return new NativeMicPermissionResult(true, false)
 		}
-		if (authSetting.cameraAuthorized == "denied") {
-			// iOS 拒绝后同样无法再弹授权窗，须去系统设置开启
+		if (iosAuthorizeIsDenied(authSetting.cameraAuthorized)) {
+			// 已拒绝 / 配置缺失：系统不会再弹授权窗，须去设置开启
 			return new NativeMicPermissionResult(false, true)
 		}
-		// not determined：chooseImage 时系统才弹窗，先放行
+		// not determined：主动请求系统授权（首次点击弹窗；拒绝即永久）
+		const requestFn = iosRequestCameraPermissionFn
+		if (requestFn != null) {
+			return await requestFn()
+		}
 		return new NativeMicPermissionResult(true, false)
 		// #endif
+		return new NativeMicPermissionResult(true, false)
 	}
 
 	// #ifdef APP-ANDROID
@@ -1233,9 +1277,22 @@
 		})
 		// #endif
 		// #ifdef APP-IOS
-		// iOS 相册权限由 uni.chooseImage 内部申请（系统弹窗），无需预申请
+		// 官方字段是 albumAuthorized（不是 photoLibraryAuthorized）。
+		// 读错字段会得到空串，既不是 granted 也不是 denied，误走「未询问」；
+		// 若再去调未打进自定义基座的 Swift 桥，点击相册就会完全没反应。
+		const albumSetting = uni.getAppAuthorizeSetting()
+		const albumStatus = `${albumSetting.albumAuthorized}`
+		if (iosAuthorizeIsGranted(albumStatus)) {
+			return new NativeMicPermissionResult(true, false)
+		}
+		if (iosAuthorizeIsDenied(albumStatus)) {
+			return new NativeMicPermissionResult(false, true)
+		}
+		// not determined：与 zhuoda 原生页一致，交给 uni.chooseImage 弹系统授权窗，
+		// 不在这里走自定义 Swift 预申请（自定义基座未重打时会静默失败）。
 		return new NativeMicPermissionResult(true, false)
 		// #endif
+		return new NativeMicPermissionResult(true, false)
 	}
 
 	function clearNativeRecordStartWatchdog(): void {
@@ -1571,26 +1628,32 @@
 	}
 
 	// #ifdef APP-IOS
-	/** iOS 主动请求麦克风授权：走 StreamPcmRecorder 桥的 requestRecordPermission，轮询直到用户应答（60s 兜底） */
-	iosRequestMicPermissionFn = (): Promise<NativeMicPermissionResult> => {
-		const recorder = ensureNativeRecorder()
-		recorder.requestRecordPermission()
-		console.log("[ASR-live] iOS 已发起麦克风授权请求，等待系统弹窗应答")
+	let iosMediaPermissionInstance: IosMediaPermission | null = null
+	function ensureIosMediaPermission(): IosMediaPermission {
+		if (iosMediaPermissionInstance == null) {
+			iosMediaPermissionInstance = new IosMediaPermission()
+		}
+		return iosMediaPermissionInstance!
+	}
+
+	/** 轮询 iOS 桥授权结果（桥 Bool 须真值判断，不能 == true） */
+	function pollIosMediaPermission(
+		isResolved: () => boolean,
+		isGranted: () => boolean,
+	): Promise<NativeMicPermissionResult> {
 		return new Promise<NativeMicPermissionResult>((resolve) => {
 			let pollTimer = 0
 			pollTimer = setInterval((): void => {
-				if (recorder.permissionResolved() == true) {
+				if (isResolved()) {
 					clearInterval(pollTimer)
 					pollTimer = 0
-					console.log("[ASR-live] iOS 授权应答 granted=" + (recorder.permissionGranted() == true))
 					resolve(
-						recorder.permissionGranted() == true
+						isGranted()
 							? new NativeMicPermissionResult(true, false)
 							: new NativeMicPermissionResult(false, true),
 					)
 				}
 			}, 50) as number
-			// 兜底：授权窗长时间无应答（理论不会）按拒绝处理，避免调用方一直等待
 			setTimeout((): void => {
 				if (pollTimer != 0) {
 					clearInterval(pollTimer)
@@ -1599,6 +1662,34 @@
 				}
 			}, 60000) as number
 		})
+	}
+
+	/** iOS 主动请求麦克风授权：走 StreamPcmRecorder 桥的 requestRecordPermission，轮询直到用户应答（60s 兜底） */
+	iosRequestMicPermissionFn = (): Promise<NativeMicPermissionResult> => {
+		const recorder = ensureNativeRecorder()
+		recorder.requestRecordPermission()
+		console.log("[ASR-live] iOS 已发起麦克风授权请求，等待系统弹窗应答")
+		return pollIosMediaPermission(
+			(): boolean => {
+				return recorder.permissionResolved()
+			},
+			(): boolean => {
+				return recorder.permissionGranted()
+			},
+		)
+	}
+
+	iosRequestCameraPermissionFn = (): Promise<NativeMicPermissionResult> => {
+		const helper = ensureIosMediaPermission()
+		helper.requestCameraPermission()
+		return pollIosMediaPermission(
+			(): boolean => {
+				return helper.cameraPermissionResolved()
+			},
+			(): boolean => {
+				return helper.cameraPermissionGranted()
+			},
+		)
 	}
 	// #endif
 
@@ -2243,6 +2334,16 @@
 			},
 			fail: (err: any) => {
 				const errMsg = readRecorderErrorMessage(err)
+				if (isNativePermissionDeniedError(errMsg)) {
+					const isCamera = sourceType == "camera"
+					guideNativePermissionSettings(
+						t(isCamera ? "Mobile.AgentDetail.cameraPermissionTitle" : "Mobile.AgentDetail.albumPermissionTitle"),
+						t(isCamera ? "Mobile.AgentDetail.cameraPermissionSystemContent" : "Mobile.AgentDetail.albumPermissionSystemContent"),
+						isCamera ? "android.permission.CAMERA" : "android.permission.READ_EXTERNAL_STORAGE",
+					)
+					evalNativeMediaFiles(false, "chooseImage", true, "", [] as UTSJSONObject[])
+					return
+				}
 				const cancelled = isNativeChooseCancelled(errMsg)
 				evalNativeMediaFiles(
 					false,
@@ -2255,9 +2356,9 @@
 		})
 	}
 
-	/** 拍照 / 相册（App 内嵌 H5）：Android 先申请对应权限（相机 CAMERA / 相册媒体读取），永久拒绝则引导去设置 */
+	/** 拍照 / 相册（App 内嵌 H5）：先申请对应权限，永久拒绝则引导去设置（Android / iOS） */
 	function nativeChooseImage(sourceType: string, maxCount: number): void {
-		// #ifdef APP-ANDROID
+		// #ifdef APP-ANDROID || APP-IOS
 		if (sourceType == "camera") {
 			ensureNativeCameraPermission().then((result: NativeMicPermissionResult) => {
 				if (result.granted != true) {
@@ -2275,18 +2376,23 @@
 			})
 			return
 		}
-		// Android 相册：先申请媒体读取权限（按 targetSdkVersion 分流 READ_MEDIA_IMAGES /
-		// READ_EXTERNAL_STORAGE，见 resolveAlbumMediaPermission），否则 uni.chooseImage 未授权会直接报 UniError
+		// 相册：Android 先申请媒体读取权限；iOS 先申请相册权限。
+		// 未授权时 uni.chooseImage 会直接报 UniError（iOS 常见裸文案 No Permission）。
 		ensureNativeAlbumPermission().then((result: NativeMicPermissionResult) => {
 			if (result.granted != true) {
 				if (result.deniedForever == true) {
 					guideNativePermissionSettings(
 						t("Mobile.AgentDetail.albumPermissionTitle"),
 						t("Mobile.AgentDetail.albumPermissionSystemContent"),
+						// #ifdef APP-ANDROID
 						resolveAlbumMediaPermission(),
+						// #endif
+						// #ifndef APP-ANDROID
+						"android.permission.READ_EXTERNAL_STORAGE",
+						// #endif
 					)
 				}
-				// 临时拒绝：静默，下次点击系统会再次弹授权框
+				// 临时拒绝：静默，下次点击系统会再次弹授权框（Android）；iOS 拒绝即永久，上面已引导
 				evalNativeMediaFiles(false, "chooseImage", true, "", [] as UTSJSONObject[])
 				return
 			}

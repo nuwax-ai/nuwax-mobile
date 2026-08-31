@@ -13,7 +13,7 @@
  */
 import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
-import { getCurrentPageFullPath } from "@/utils/common";
+import { buildQueryParams, getCurrentPageFullPath } from "@/utils/common";
 import { getStatusBarHeight } from "@/utils/system.uts";
 
 /** uni.$emit / $on 事件名：首页壳组件监听 */
@@ -44,6 +44,11 @@ let loadedConversationId: string = "";
  * 空字符串 = 从首页打开，隐藏后留在首页。
  */
 let returnAfterHideUrl: string = "";
+/**
+ * 打开聊天前栈为 [Tab, 分包页] 时，关壳应先 switchTab 回该 Tab 再 navigateTo 分包页。
+ * 否则会从首页 navigateTo 分包，栈变成 [首页, 分包]，返回误落首页（如「我的 → 收藏列表 → 聊天」）。
+ */
+let returnViaTabUrl: string = "";
 
 export function isResidentChatVisible(): boolean {
   return shellVisibleFlag;
@@ -195,33 +200,9 @@ function buildFullPathFromPage(page: UniPage | null): string {
     if (opts == null) {
       return url;
     }
-    const optJson = JSON.stringify(opts);
-    if (optJson == null || optJson.length < 3 || optJson == "{}") {
-      return url;
-    }
-    const parsed = JSON.parse(optJson) as UTSJSONObject | null;
-    if (parsed == null) {
-      return url;
-    }
-    const parts: string[] = [];
-    const keyMap = parsed.toMap();
-    const keysJson = JSON.stringify(keyMap);
-    const pairRegex = /"([^"]+)"\s*:/g;
-    let match = pairRegex.exec(keysJson);
-    while (match != null) {
-      const key = match[1];
-      if (key != null) {
-        const rawVal = parsed[key];
-        if (rawVal != null && `${rawVal}`.length > 0) {
-          parts.push(
-            `${encodeURIComponent(key)}=${encodeURIComponent(`${rawVal}`)}`,
-          );
-        }
-      }
-      match = pairRegex.exec(keysJson);
-    }
-    if (parts.length > 0) {
-      url = `${url}?${parts.join("&")}`;
+    const query = buildQueryParams(opts);
+    if (query.length > 0) {
+      url = `${url}${query}`;
     }
   } catch (_eBuild) {
     // ignore
@@ -229,10 +210,43 @@ function buildFullPathFromPage(page: UniPage | null): string {
   return url;
 }
 
+/** 取页面 route 的 path 部分（不含 query） */
+function tabPathFromPage(page: UniPage | null): string {
+  if (page == null) {
+    return "";
+  }
+  const route = `${page.route}`;
+  if (route.length == 0) {
+    return "";
+  }
+  return `/${route}`;
+}
+
+/**
+ * 若打开聊天前为 [Tab, 当前页]，记下 Tab path，供关壳时先回 Tab。
+ */
+function captureReturnViaTab(pages: UniPage[], returnUrl: string): void {
+  returnViaTabUrl = "";
+  if (returnUrl.length == 0 || pages.length < 2) {
+    return;
+  }
+  const q = returnUrl.indexOf("?");
+  const pathOnly = q >= 0 ? returnUrl.substring(0, q) : returnUrl;
+  if (isAppTabPath(pathOnly)) {
+    return;
+  }
+  const prev = pages[pages.length - 2];
+  const prevPath = tabPathFromPage(prev);
+  if (prevPath.length > 0 && isAppTabPath(prevPath)) {
+    returnViaTabUrl = prevPath;
+  }
+}
+
 /**
  * switchTab 前记下真正来源页（排除首页、agent-detail 中转页）。
  */
 function captureReturnPageBeforeSwitch(): void {
+  returnViaTabUrl = "";
   if (isCurrentPageIndex()) {
     returnAfterHideUrl = "";
     return;
@@ -265,6 +279,7 @@ function captureReturnPageBeforeSwitch(): void {
       return;
     }
     returnAfterHideUrl = buildFullPathFromPage(prev);
+    captureReturnViaTab(pages, returnAfterHideUrl);
     return;
   }
   // 优先用页面实例拼 URL，避免 getCurrentPageFullPath 丢 options 导致回搜索后 backUrl 为空
@@ -274,7 +289,9 @@ function captureReturnPageBeforeSwitch(): void {
   }
   if (returnAfterHideUrl.indexOf("/pages/index/index") == 0) {
     returnAfterHideUrl = "";
+    return;
   }
+  captureReturnViaTab(pages, returnAfterHideUrl);
 }
 
 /**
@@ -293,12 +310,38 @@ function clearCoverSoon(): void {
   }, 120);
 }
 
+/** navigateTo / redirectTo 分包页，成功后卸壳 */
+function navigateToReturnSubpackage(url: string): void {
+  uni.navigateTo({
+    url: url,
+    success: (_resNav: any | null) => {
+      emitHideShell(false);
+      clearCoverSoon();
+    },
+    fail: (_eNav: any | null) => {
+      uni.redirectTo({
+        url: url,
+        success: (_resRed: any | null) => {
+          emitHideShell(false);
+          clearCoverSoon();
+        },
+        fail: (_eRed: any | null) => {
+          emitHideShell(true);
+          setResidentChatCoverActive(false);
+        },
+      });
+    },
+  });
+}
+
 /**
  * 先跳回源页（壳仍盖住首页），成功后再卸壳 —— 避免左滑/返回先闪首页。
  */
 function navigateThenHideShell(): void {
   const url = returnAfterHideUrl;
+  const tabUrl = returnViaTabUrl;
   returnAfterHideUrl = "";
+  returnViaTabUrl = "";
   if (url.length == 0) {
     emitHideShell(true);
     setResidentChatCoverActive(false);
@@ -321,27 +364,19 @@ function navigateThenHideShell(): void {
     });
     return;
   }
-  uni.navigateTo({
-    url: url,
-    success: (_resNav: any | null) => {
-      // 搜索等分包已在上层：再卸掉首页上的壳，用户看不到首页
-      emitHideShell(false);
-      clearCoverSoon();
-    },
-    fail: (_eNav: any | null) => {
-      uni.redirectTo({
-        url: url,
-        success: (_resRed: any | null) => {
-          emitHideShell(false);
-          clearCoverSoon();
-        },
-        fail: (_eRed: any | null) => {
-          emitHideShell(true);
-          setResidentChatCoverActive(false);
-        },
-      });
-    },
-  });
+  if (tabUrl.length > 0) {
+    uni.switchTab({
+      url: tabUrl,
+      success: (_resTab: any | null) => {
+        navigateToReturnSubpackage(url);
+      },
+      fail: (_eTab: any | null) => {
+        navigateToReturnSubpackage(url);
+      },
+    });
+    return;
+  }
+  navigateToReturnSubpackage(url);
 }
 
 function emitOpen(agentId: string, conversationId: string): void {
@@ -444,6 +479,7 @@ function resetResidentChatModuleState(): void {
   loadedAgentId = "";
   loadedConversationId = "";
   returnAfterHideUrl = "";
+  returnViaTabUrl = "";
   setResidentChatCoverActive(false);
 }
 

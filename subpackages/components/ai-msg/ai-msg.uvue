@@ -183,6 +183,14 @@
       isAppDetails?: boolean;
       /** 是否启用语音播报按钮（仅 App web-view 内嵌页为 true）。 */
       enableVoice?: boolean;
+      /**
+       * 历史消息懒解析：为 true 时挂载不立刻解析 markdown，
+       * 等滚近视口（IntersectionObserver）再解析。仅 H5/WEB 生效。
+       * 流式末条 / 非 H5 端不受影响（恒立即解析）。
+       */
+      deferParse?: boolean;
+      /** 懒解析定位 key：对应父级消息包裹元素 id 后缀（`${id}_${index}`）。 */
+      deferKey?: string;
     }>(),
     {
       msg: null,
@@ -197,6 +205,8 @@
       showToolBar: true,
       isAppDetails: false,
       enableVoice: true,
+      deferParse: false,
+      deferKey: "",
     },
   );
 
@@ -577,6 +587,141 @@
     // 避免一次 parse 触发 2～3 次整树失效。
     markdownParser.runMarkdownParse(forceDone);
   }
+
+  // #ifdef H5 || WEB
+  /**
+   * 历史消息懒解析：deferParse 消息挂载时先不解析，等滚近视口（含 300px 提前量）
+   * 再解析。大历史会话首屏只解析视口内消息，避免全量 markdown 解析阻塞主线程。
+   * 实现：模块级注册表 + document scroll 捕获监听 + getBoundingClientRect 判可见
+   * （不用 IntersectionObserver，规避 UTS 对浏览器构造器类型的依赖）。
+   */
+  interface LazyMarkdownEntry {
+    el: any;
+    done: boolean;
+    cb: () => void;
+  }
+  const LAZY_VIEWPORT_BUFFER: number = 300;
+  let lazyMarkdownRegistry: LazyMarkdownEntry[] = [] as LazyMarkdownEntry[];
+  let lazyScrollBound = false;
+  let lazyCheckTimer: number = 0;
+  /** 懒解析已完成（含兜底立即解析），避免 body 未变时反复注册。 */
+  let lazyMarkdownDone = false;
+  /** 本组件是否已注册（卸载时按此移除）。 */
+  let lazyMarkdownRegistered = false;
+  let lazyMarkdownRegisteredEl: any = null;
+
+  function checkLazyMarkdownVisibility(): void {
+    const w = window as any;
+    const vh = w != null && w.innerHeight != null ? (w.innerHeight as number) : 800;
+    const remaining: LazyMarkdownEntry[] = [] as LazyMarkdownEntry[];
+    const list = lazyMarkdownRegistry;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (item == null || item.done == true || item.el == null) {
+        continue;
+      }
+      try {
+        const rect = item.el.getBoundingClientRect() as any;
+        if (rect != null && rect.top < vh + LAZY_VIEWPORT_BUFFER && rect.bottom > -LAZY_VIEWPORT_BUFFER) {
+          item.done = true;
+          item.cb();
+        } else {
+          remaining.push(item);
+        }
+      } catch (_eRect) {
+        item.done = true;
+        item.cb();
+      }
+    }
+    lazyMarkdownRegistry = remaining;
+  }
+
+  function onLazyMarkdownScroll(): void {
+    if (lazyCheckTimer != 0) {
+      return;
+    }
+    lazyCheckTimer = setTimeout((): void => {
+      lazyCheckTimer = 0;
+      checkLazyMarkdownVisibility();
+    }, 60) as number;
+  }
+
+  function ensureLazyMarkdownScrollListener(): void {
+    if (lazyScrollBound == true) {
+      return;
+    }
+    lazyScrollBound = true;
+    try {
+      const w = window as any;
+      if (w != null && w.document != null && w.document.addEventListener != null) {
+        // capture=true：捕获到任意滚动容器（含消息 scroll-view）的 scroll 事件
+        w.document.addEventListener("scroll", onLazyMarkdownScroll, true);
+      }
+    } catch (_eBound) {
+      // ignore
+    }
+  }
+
+  function teardownLazyMarkdownParse(): void {
+    if (lazyMarkdownRegistered == true) {
+      const el = lazyMarkdownRegisteredEl;
+      const list = lazyMarkdownRegistry;
+      const next: LazyMarkdownEntry[] = [] as LazyMarkdownEntry[];
+      for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        if (item == null || item.el == el) {
+          continue;
+        }
+        next.push(item);
+      }
+      lazyMarkdownRegistry = next;
+      lazyMarkdownRegistered = false;
+      lazyMarkdownRegisteredEl = null;
+    }
+  }
+
+  function finishLazyMarkdownParse(): void {
+    lazyMarkdownDone = true;
+    teardownLazyMarkdownParse();
+    runBodyMarkdownParseNow(true);
+  }
+
+  function setupLazyMarkdownParse(): void {
+    if (lazyMarkdownRegistered == true) {
+      return;
+    }
+    try {
+      const w = window as any;
+      if (w == null || w.document == null || w.document.getElementById == null) {
+        finishLazyMarkdownParse();
+        return;
+      }
+      const key = `${props.deferKey}`;
+      if (key.length == 0) {
+        finishLazyMarkdownParse();
+        return;
+      }
+      const rootEl = w.document.getElementById(`msg-wrapper-${key}`);
+      if (rootEl == null) {
+        // 包裹元素未就绪：立即解析兜底，避免消息一直空白
+        finishLazyMarkdownParse();
+        return;
+      }
+      lazyMarkdownRegisteredEl = rootEl;
+      lazyMarkdownRegistered = true;
+      lazyMarkdownRegistry.push({
+        el: rootEl,
+        done: false,
+        cb: (): void => finishLazyMarkdownParse(),
+      } as LazyMarkdownEntry);
+      ensureLazyMarkdownScrollListener();
+      // 已可见的消息（如首屏底部几条）立即解析，不必等滚动
+      checkLazyMarkdownVisibility();
+    } catch (_eObs) {
+      finishLazyMarkdownParse();
+    }
+  }
+  // #endif
 
   /** 合并高频 chunk 后解析：intervalMs 合并窗内多次调用只解析一次 */
   function scheduleMergedParse(intervalMs: number): void {
@@ -1066,6 +1211,14 @@
         scheduleBodyMarkdownParse();
         return;
       }
+      // #ifdef H5 || WEB
+      // 历史 / 非流式末条：deferParse 历史消息先懒解析（滚近视口再解析），
+      // 大历史会话避免首屏全量 markdown 解析阻塞主线程。
+      if (props.deferParse == true && lazyMarkdownDone == false) {
+        setupLazyMarkdownParse();
+        return;
+      }
+      // #endif
       // 历史 / 非流式末条：定稿解析（runMarkdownParse 内部会跳过正文未变）
       runBodyMarkdownParseNow(true);
     },
@@ -1089,6 +1242,9 @@
 
   onUnmounted(() => {
     clearStreamMdParseTimer();
+    // #ifdef H5 || WEB
+    teardownLazyMarkdownParse();
+    // #endif
     if (thinkTextThrottleTimer != null) {
       clearTimeout(thinkTextThrottleTimer!);
       thinkTextThrottleTimer = null;

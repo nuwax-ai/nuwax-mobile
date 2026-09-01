@@ -3,11 +3,14 @@
  *
  * uni.previewImage 在 H5 关闭时会 history.back / uni.navigateBack，
  * 内嵌 WebView 里会把承载页（agent-detail）一并弹掉，表现为回到首页。
- * 仅内嵌场景走自绘遮罩；浏览器直开 H5 不拦截、不改 uni.previewImage。
+ * H5（浏览器直开 + App 内嵌）统一走自绘遮罩，带计数、切图和下载。
  */
 import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+
+const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
 type PreviewOpenHandler = (urls: string[], current: string) => void;
 
@@ -153,6 +156,10 @@ function toAbsolutePreviewUrl(url: string): string {
     return `https:${url}`;
   }
   const path = url.indexOf("/") == 0 ? url : `/${url}`;
+  const apiBase = getApiBaseUrl();
+  if (path.indexOf("/api/") == 0 && isUsableHttpOrigin(apiBase) == true) {
+    return `${apiBase}${path}`;
+  }
   const origin = resolvePageOrigin();
   if (origin.length == 0) {
     return path;
@@ -241,9 +248,6 @@ function resolveCurrentUrl(urls: string[], currentRaw: any): string {
 }
 
 function tryOpenHost(urls: string[], current: string): boolean {
-  if (isAppWebViewEmbedded() != true) {
-    return false;
-  }
   // #ifdef H5 || WEB
   const opener = previewHostOpen;
   if (opener == null) {
@@ -280,7 +284,7 @@ export function tryOpenAppWebViewImagePreview(options: any): boolean {
 
 /**
  * 与 uni.previewImage 同语义；相对路径转为绝对地址后再预览。
- * App 内嵌 H5 走自绘遮罩，其它端走官方预览。
+ * H5 走自绘遮罩（含下载），其它端走官方预览。
  */
 export function previewImageCompat(urls: string[], current: string): void {
   const absUrls = normalizePreviewImageUrls(urls);
@@ -314,8 +318,7 @@ function previewWithNormalizedOptions(options: any): void {
 
 /**
  * 挂 window.__nuwaxPreviewImage，供 mp-html 走自绘遮罩。
- * 不改写 uni.previewImage。是否内嵌在点击时再判断，避免 setup 时桥未注入而漏挂。
- * 浏览器直开会立刻回落到 uni.previewImage，行为与原来一致。
+ * 不改写 uni.previewImage。H5 会话页挂载遮罩后由此承接，带下载按钮。
  */
 export function installAppWebViewImagePreviewHook(): void {
   // #ifdef H5 || WEB
@@ -354,3 +357,239 @@ export function uninstallAppWebViewImagePreviewHook(): void {
   previewHookInstalled = false;
   // #endif
 }
+
+function guessPreviewImageFileName(url: string): string {
+  let path = url;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    path = path.substring(0, hashIdx);
+  }
+  const queryIdx = path.indexOf("?");
+  if (queryIdx >= 0) {
+    path = path.substring(0, queryIdx);
+  }
+  const slashIdx = path.lastIndexOf("/");
+  if (slashIdx >= 0 && slashIdx < path.length - 1) {
+    const name = path.substring(slashIdx + 1);
+    if (name.length > 0 && name.indexOf(".") >= 0) {
+      return name;
+    }
+  }
+  return `nuwax_image_${Date.now()}.jpg`;
+}
+
+function resolvePreviewDownloadMimeType(header: any | null): string {
+  if (header == null) {
+    return "image/jpeg";
+  }
+  const obj = header as UTSJSONObject;
+  let ct = obj["content-type"];
+  if (ct == null) {
+    ct = obj["Content-Type"];
+  }
+  if (ct != null && `${ct}`.length > 0) {
+    return `${ct}`;
+  }
+  return "image/jpeg";
+}
+
+// #ifdef H5 || WEB
+function triggerBrowserImageDownload(blobUrl: string, fileName: string): void {
+  try {
+    const doc = document;
+    const anchor = doc.createElement("a");
+    anchor.href = blobUrl;
+    anchor.download = fileName;
+    anchor.style.display = "none";
+    doc.body.appendChild(anchor);
+    anchor.click();
+    doc.body.removeChild(anchor);
+  } catch (_e) {
+    // ignore
+  }
+}
+
+/**
+ * 预览页 → 原生：保存当前图到相册。
+ * 不走 nativeDownloadBridge（那是文件树 zip 下载桥）。
+ */
+function postPreviewSaveImageToNative(url: string, fileName: string): boolean {
+  try {
+    const w = window as any;
+    if (w == null) {
+      return false;
+    }
+    const uniGlobal = w.uni;
+    if (
+      uniGlobal == null ||
+      uniGlobal.webView == null ||
+      uniGlobal.webView.postMessage == null
+    ) {
+      return false;
+    }
+    uniGlobal.webView.postMessage({
+      "data": {
+        "type": "download",
+        "action": "saveImage",
+        "url": url,
+        "filename": fileName,
+      } as UTSJSONObject,
+    });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+// #endif
+
+/**
+ * 预览页下载当前图片。
+ * App 内嵌 H5：走原生保存相册（WebView 会忽略 a[download]）。
+ * 浏览器直开：仍走 blob 下载。
+ */
+export function downloadPreviewImage(url: string): void {
+  if (url.length == 0) {
+    return;
+  }
+  // #ifdef H5 || WEB
+  const fileName = guessPreviewImageFileName(url);
+
+  if (
+    isAppWebViewEmbedded() == true &&
+    url.indexOf("data:") != 0 &&
+    url.indexOf("blob:") != 0
+  ) {
+    if (postPreviewSaveImageToNative(url, fileName) == true) {
+      return;
+    }
+  }
+
+  uni.showLoading({ title: t("Mobile.FileTree.downloading"), mask: true });
+
+  if (url.indexOf("data:") == 0 || url.indexOf("blob:") == 0) {
+    triggerBrowserImageDownload(url, fileName);
+    uni.hideLoading();
+    uni.showToast({
+      title: t("Mobile.FileTree.downloadComplete"),
+      icon: "success",
+    });
+    return;
+  }
+
+  uni.request({
+    url: url,
+    method: "GET",
+    responseType: "arraybuffer",
+    dataType: "text",
+    success: (res) => {
+      uni.hideLoading();
+      if (res.statusCode == 200 && res.data != null) {
+        try {
+          const mimeType = resolvePreviewDownloadMimeType(res.header);
+          const blob = new Blob([res.data as ArrayBuffer], { type: mimeType });
+          const objectUrl = URL.createObjectURL(blob);
+          triggerBrowserImageDownload(objectUrl, fileName);
+          setTimeout((): void => {
+            URL.revokeObjectURL(objectUrl);
+          }, 2000);
+          uni.showToast({
+            title: t("Mobile.FileTree.downloadComplete"),
+            icon: "none",
+          });
+          return;
+        } catch (_eBlob) {
+          // fallthrough
+        }
+      }
+      uni.showToast({
+        title: t("Mobile.FileTree.downloadNetworkFailed"),
+        icon: "none",
+      });
+    },
+    fail: (_err) => {
+      uni.hideLoading();
+      uni.showToast({
+        title: t("Mobile.FileTree.downloadNetworkFailed"),
+        icon: "none",
+      });
+    },
+  });
+  // #endif
+}
+
+/**
+ * APP 原生：下载预览图并保存到系统相册。
+ * 仅由内嵌 WebView 壳在收到预览页 saveImage 消息后调用。
+ */
+// #ifdef APP
+export function savePreviewImageToAlbumInApp(downloadUrl: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (downloadUrl.length == 0) {
+      reject(new Error(t("Mobile.FileTree.downloadNetworkFailed")));
+      return;
+    }
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    const token = tokenRaw != null ? `${tokenRaw}` : "";
+    const header = new UTSJSONObject();
+    // 对象存储 / CDN 图不能带业务 JWT：S3/MinIO 会直接 400 Bad Request
+    const attachAuth = isSameOriginPreviewUrl(downloadUrl) == true && token.length > 0;
+    if (attachAuth == true) {
+      header.set("Authorization", `Bearer ${token}`);
+    }
+
+    uni.showLoading({ title: t("Mobile.FileTree.downloading"), mask: true });
+    uni.downloadFile({
+      url: downloadUrl,
+      header: header,
+      success: (res) => {
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+          uni.saveImageToPhotosAlbum({
+            filePath: tempPath,
+            success: (_saveRes) => {
+              uni.hideLoading();
+              uni.showToast({
+                title: t("Mobile.ImagePreview.savedToAlbum"),
+                icon: "success",
+              });
+              resolve();
+            },
+            fail: (saveErr) => {
+              uni.hideLoading();
+              console.error("保存预览图到相册失败:", saveErr);
+              uni.showToast({
+                title: t("Mobile.FileTree.saveFailed"),
+                icon: "none",
+              });
+              reject(saveErr);
+            },
+          });
+          return;
+        }
+        uni.hideLoading();
+        uni.showToast({
+          title: t("Mobile.FileTree.downloadNetworkFailed"),
+          icon: "none",
+        });
+        reject(new Error(t("Mobile.FileTree.downloadNetworkFailed")));
+      },
+      fail: (err) => {
+        uni.hideLoading();
+        let errLog = "";
+        try {
+          errLog = JSON.stringify(err);
+        } catch (_eErrLog) {
+          errLog = `${err}`;
+        }
+
+        console.error("下载预览图失败:", err);
+        uni.showToast({
+          title: t("Mobile.FileTree.downloadNetworkFailed"),
+          icon: "none",
+        });
+        reject(err);
+      },
+    });
+  });
+}
+// #endif

@@ -7,7 +7,7 @@ import { getCurrentPageFullPath } from "@/utils/common";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 import { t } from "@/utils/i18n";
 import { orEmpty } from "@/utils/utsCoalesce";
-import { navigateViaWebViewSdk } from "@/utils/system.uts";
+import { navigateViaWebViewSdk, navigateEmbeddedH5HashRoute, requestResidentChatOpenFromEmbeddedH5 } from "@/utils/system.uts";
 import { isAppWebViewEmbedded, isIosAppWebView } from "@/utils/appWebViewDetect";
 // #ifdef APP-IOS
 import { openResidentChat } from "@/utils/residentChatShell";
@@ -120,6 +120,44 @@ export async function addTicketAndJumpToWebviewWithoutShare(
   });
 }
 
+/** 防并发 navigateTo：框架未完成上次跳转时再调会报 errCode 4 locked（Android / iOS / 鸿蒙通用） */
+let agentDetailNavInFlight: boolean = false;
+let lastAgentDetailJumpKey: string = "";
+let lastAgentDetailJumpAt: number = 0;
+
+function shouldSkipAgentDetailJump(
+  agentId: number,
+  conversationId: number | null,
+): boolean {
+  if (agentDetailNavInFlight) {
+    return true;
+  }
+  const convKey =
+    conversationId != null && conversationId > 0 ? `${conversationId}` : "";
+  const key = `${agentId}:${convKey}`;
+  const now = Date.now();
+  if (key == lastAgentDetailJumpKey && now - lastAgentDetailJumpAt < 800) {
+    return true;
+  }
+  lastAgentDetailJumpKey = key;
+  lastAgentDetailJumpAt = now;
+  return false;
+}
+
+/** 原生侧打开 agent-detail（Android / 鸿蒙 / 小程序 / 浏览器 H5 直开） */
+function navigateToAgentDetailNative(url: string): void {
+  if (agentDetailNavInFlight) {
+    return;
+  }
+  agentDetailNavInFlight = true;
+  uni.navigateTo({
+    url: url,
+    complete: (_res: any | null) => {
+      agentDetailNavInFlight = false;
+    },
+  });
+}
+
 // 跳转至智能体详情页面
 export async function jumpToAgentDetailPage(
   agentId: number,
@@ -135,22 +173,24 @@ export async function jumpToAgentDetailPage(
 
   // 问答型智能体、任务型智能体直接跳转至智能体详情页面
   if (agentType == "ChatBot" || agentType == "TaskAgent") {
+    if (shouldSkipAgentDetailJump(agentId, conversationId)) {
+      return;
+    }
     // App 内嵌 H5（web-view 内）：
-    // - iOS 常驻壳：只做 SPA navigateTo，禁止 uni.webView.navigateTo 再压一层原生
-    //   agent-detail（会再创建一个 WKWebView，触发 iOS 26 #32215）。
-    // - Android / 鸿蒙独立页壳：走 uni.webView.navigateTo 压原生栈（zhuoda 原逻辑）。
+    // - iOS 常驻壳：postMessage 换会话，禁止压原生 agent-detail。
+    // - Android / 鸿蒙：走 uni.webView.navigateTo 压原生栈；JSSDK 未就绪时用 hash 软导航，
+    //   禁止回退 uni.navigateTo（会桥接到原生，与外层并发时触发 locked）。
     if (isAppWebViewEmbedded()) {
       // #ifdef H5 || WEB
-      // 同一份 H5 构建同时服务两套壳，编译期无法区分运行宿主，按注入平台标记运行时分流
       if (isIosAppWebView() == true) {
-        uni.navigateTo({ url });
+        requestResidentChatOpenFromEmbeddedH5(agentId, conversationId);
         return;
       }
       if (navigateViaWebViewSdk(url)) {
         return;
       }
+      navigateEmbeddedH5HashRoute(url);
       // #endif
-      uni.navigateTo({ url });
       return;
     }
     // #ifdef APP
@@ -160,12 +200,12 @@ export async function jumpToAgentDetailPage(
     return;
     // #endif
     // #ifndef APP-IOS
-    // App 原生侧（Android / 鸿蒙）：直接 navigateTo 独立页（zhuoda 原逻辑）
-    uni.navigateTo({ url });
+    // App 原生侧（Android / 鸿蒙）：直接 navigateTo 独立页
+    navigateToAgentDetailNative(url);
     return;
     // #endif
     // #endif
-    uni.navigateTo({ url });
+    navigateToAgentDetailNative(url);
     return;
   }
 

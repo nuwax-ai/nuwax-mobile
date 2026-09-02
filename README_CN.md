@@ -63,6 +63,8 @@ pnpm install
 yarn install
 ```
 
+> **Git 远程约定**：内部开发者 `origin` 指内网主仓（`git.yichamao.com/agent-platform/agent-platform-front-weapp`），`github` 指公开镜像仓，详见 [docs/archive/switch-git-remote.md](docs/archive/switch-git-remote.md)。
+
 ### 开发
 
 #### H5 开发

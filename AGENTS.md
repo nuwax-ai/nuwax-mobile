@@ -62,6 +62,19 @@ feat/nuwa-zhuoda-<YYYY.MM>[-<slug>]   →  release/nuwa-zhuoda  →  生产发�
 
 旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
 
+## Git 远程约定（2026-09 起）
+
+与主仓（nuwax）统一命名，**remote 名固定用途，不再「切换 origin 地址」**：
+
+| remote 名 | 仓库 | 说明 |
+|---|---|---|
+| `origin` | `https://git.yichamao.com/agent-platform/agent-platform-front-weapp.git`（内网 GitLab） | **默认拉/推主仓** |
+| `github` | `https://github.com/nuwax-ai/nuwax-mobile.git` | 公开镜像 |
+
+- ⚠️ **push 前先想清楚推哪个 remote**；默认 `git push` 走 `origin`（内网），推 GitHub 需显式 `git push github <分支>`
+- 旧命名克隆（`origin`=GitHub、`gitlab`=内网）迁移：`git remote rename origin github && git remote rename gitlab origin && git fetch --all --prune`
+- 两端同名分支可能分叉（如 `dev`、`main`），同步前先看领先落后；配置详情见 [docs/archive/switch-git-remote.md](docs/archive/switch-git-remote.md)
+
 ## 构建工具链（重要）
 
 **本项目没有 `uni` CLI / vite 的 npm scripts，所有平台的编译、运行、打包都必须通过 HBuilderX 完成**（本机安装版本 5.15，路径 `/Applications/HBuilderX.app`）。uni-app x 的 uts/uvue 编译依赖 HBuilderX 内置的编译器，不要尝试 `npx vite build` 或 `npm run dev` 来跑 App 端。

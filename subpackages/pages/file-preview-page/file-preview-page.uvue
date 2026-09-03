@@ -37,13 +37,26 @@
         ></iframe>
         <!-- #endif -->
 
-        <!-- #ifdef MP-WEIXIN || APP -->
+        <!-- #ifdef MP-WEIXIN -->
         <web-view
           class="w-full h-full"
           :src="previewUrl"
           id="webview"
           @message="onWebViewMessage"
         ></web-view>
+        <!-- #endif -->
+
+        <!-- #ifdef APP -->
+        <web-view
+          class="w-full h-full"
+          :src="previewUrl"
+          id="file-preview-webview"
+          @load="handleAppWebViewLoad"
+          @message="onWebViewMessage"
+        ></web-view>
+        <!-- 不可见 sibling 占位（勿删）：Android 上内容区仅有 web-view 单节点时会走全屏原生层，
+             createWebviewContext 拿不到 context，evalJS 注入平台/下载桥会失效。 -->
+        <view class="file-preview-webview-placeholder" />
         <!-- #endif -->
       </template>
 
@@ -52,7 +65,7 @@
 </template>
 
 <script setup lang="uts">
-  import { ref, computed, onMounted, onUnmounted } from 'vue';
+  import { ref, computed, onMounted, onUnmounted, getCurrentInstance } from 'vue';
   import { onLoad } from "@dcloudio/uni-app";
   // #ifndef APP-ANDROID
   import { onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
@@ -86,6 +99,10 @@
 
   // 环境配置
   import { getApiBaseUrl } from "@/constants/config";
+  // #ifdef APP
+  import { downloadFileInApp } from "@/subpackages/utils/fileTree";
+  import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
+  // #endif
 
   const previewUrl = ref<string>(""); // 预览地址
   const fileName = ref<string>(""); // 文件名
@@ -103,6 +120,11 @@
   // #endif
   // #ifndef H5 || WEB
   const isDev = false;
+  // #endif
+
+  const instance = getCurrentInstance();
+  // #ifdef APP
+  let previewDownloadBusy = false;
   // #endif
 
   // 页面 navigationStyle=custom，uni.setNavigationBarTitle 不会作用于顶部自绘导航栏，
@@ -409,10 +431,124 @@
     uni.navigateBack({ delta: 1 });
   };
 
-  // <web-view> @message：收到 OpenUI 表单提交（OPENUI_ACTION）→ 构建续作消息并按 cId 暂存。
+  // #ifdef APP
+  /**
+   * App 预览 web-view：load 完成后写入平台；收到下载约定后走原生 downloadFileInApp。
+   */
+  function getAppPreviewPlatform(): string {
+    // #ifdef APP-IOS
+    return "ios";
+    // #endif
+    // #ifdef APP-HARMONY
+    return "harmony";
+    // #endif
+    return "android";
+  }
+
+  /** web-view @load：注入 window.__nuwaxAppPlatform。 */
+  function handleAppWebViewLoad(_e: any): void {
+    fixAppWebviewTextZoom();
+    try {
+      const ctx = uni.createWebviewContext(
+        "file-preview-webview",
+        instance != null ? instance.proxy : null,
+      );
+      if (ctx == null) {
+        return;
+      }
+      ctx.evalJS(
+        "(function(){try{window.__nuwaxAppPlatform='" +
+          getAppPreviewPlatform() +
+          "';}catch(e){}})()",
+      );
+    } catch (_err) {
+      // web-view 未就绪时 createWebviewContext / evalJS 可能抛错
+    }
+  }
+
+  /**
+   * 原生 @message 的 detail.data 一般为数组，偶发再包一层 { data }。
+   * 命中 { type:'download', action:'downloadCurrentFile' } 则为下载约定。
+   */
+  function isPreviewDownloadMessage(data: any | null): boolean {
+    if (data == null) {
+      return false;
+    }
+    let items: any[] = [];
+    if (Array.isArray(data)) {
+      items = data as any[];
+    } else {
+      items = [data];
+    }
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item == null) {
+        continue;
+      }
+      try {
+        const obj = item as UTSJSONObject;
+        const typeStr = obj["type"] != null ? `${obj["type"]}` : "";
+        const actionStr = obj["action"] != null ? `${obj["action"]}` : "";
+        if (typeStr == "download" && actionStr == "downloadCurrentFile") {
+          return true;
+        }
+        const nested = obj["data"];
+        if (nested != null) {
+          const inner = nested as UTSJSONObject;
+          const nestedType = inner["type"] != null ? `${inner["type"]}` : "";
+          const nestedAction = inner["action"] != null ? `${inner["action"]}` : "";
+          if (nestedType == "download" && nestedAction == "downloadCurrentFile") {
+            return true;
+          }
+        }
+      } catch (_e) {
+        continue;
+      }
+    }
+    return false;
+  }
+
+  /** 下载当前预览文件（与工作台同一套 downloadFileInApp）。 */
+  function runCurrentFileDownload(): void {
+    if (previewDownloadBusy) {
+      return;
+    }
+    const path = fileProxyUrl.value;
+    if (path.length == 0) {
+      uni.showToast({
+        title: t("Mobile.FilePreview.invalidParams"),
+        icon: "none",
+      });
+      return;
+    }
+    let url = `${baseUrl}${path}`;
+    const skVal = sk.value;
+    if (skVal.length > 0) {
+      url = url + (url.indexOf("?") >= 0 ? "&" : "?") + "sk=" + skVal;
+    }
+    const name = fileName.value.length > 0 ? fileName.value : "file";
+    previewDownloadBusy = true;
+    downloadFileInApp(url, name).then(
+      (_saved: string) => {
+        previewDownloadBusy = false;
+      },
+      (_err: any) => {
+        previewDownloadBusy = false;
+      },
+    );
+  }
+  // #endif
+
+  // <web-view> @message：OpenUI 表单提交，或 App 预览页下载当前文件。
   const onWebViewMessage = (e: UniWebViewMessageEvent): void => {
     // UniWebViewMessageEvent 是原生强类型对象，Android 上不可整体强转 UTSJSONObject；
     // 直接读取其公开字段，再交给跨平台解析器处理消息数组。
+    // #ifdef APP
+    if (isPreviewDownloadMessage(e.detail.data)) {
+      runCurrentFileDownload();
+      return;
+    }
+    // #endif
     const action = parseOpenUiActionData(e.detail.data);
     if (action == null) return;
     handleOpenUiAction(action);
@@ -494,6 +630,13 @@
 
     .file-preview-content {
       flex: 1;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .file-preview-webview-placeholder {
+      width: 0;
+      height: 0;
       overflow: hidden;
     }
 

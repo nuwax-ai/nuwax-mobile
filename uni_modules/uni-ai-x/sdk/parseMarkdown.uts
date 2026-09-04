@@ -58,10 +58,12 @@ export default class ParseMarkdown {
 		this.endLineIndex = 1
 	}
 	doUpdateCallBack(isParseDone: boolean) {
-		// 计算拷贝耗时
-		// const startTime = Date.now()
-		const copyMarkdownTokenList = JSON.parseArray<MarkdownToken>(JSON.stringify(this.markdownTokenList)) as MarkdownToken[]
-		// console.log('拷贝耗时', Date.now() - startTime)
+		// 性能：流式期本回调每次触发。原实现对整棵 token 树做 JSON.stringify+parseArray 深拷贝，
+		// 随正文长度 O(n) 且在 Android 主线程，是流式卡顿/输出不全的最大热点。
+		// 下游 applyMarkdownTokenList → token2el 只读 token 构造新对象，不 mutate；
+		// 后续增量只 push / 按下标替换 markdownTokenList[index]，不原地改已发出 token。
+		// 故 .slice() 浅拷贝数组即可隔离，无需整树 JSON 往返。
+		const copyMarkdownTokenList = this.markdownTokenList.slice()
 		this.updateCallBack(copyMarkdownTokenList, isParseDone)
 		// #ifdef WEB
 		window.markdownTokenList = copyMarkdownTokenList
@@ -109,6 +111,8 @@ export default class ParseMarkdown {
 			if (mathStartIndex != -1) {
 				// 获取开头标记
 				const startToken: string = withFindMathText.match(mathStartPattern)![0]!
+				// 行内公式标记：$...$ 或 \(...\) 是行内（displayMode:false）；$$、\[...\]、\begin{} 是块级
+				const isInlineMath = startToken == '$' || startToken == '\\('
 				// console.error('发现数学公式开头', startToken, mathStartIndex)
 				// 定义结尾标记
 				const endToken: string = mathMarkMap.get(startToken) ?? '';
@@ -120,7 +124,10 @@ export default class ParseMarkdown {
 				if (hasMathEndTag) {
 					const mathEndIndex = _index + mathStartIndex + startToken.length
 					const mathText = withFindMathText.slice(startToken.length + mathStartIndex, mathEndIndex)
-					const mathCodeText = "\n```math\n" + mathText + "\n```\n"
+					// 行内公式用 ```math-inline 标记，md2jsonTask 据此设 displayMode:false（两端统一 inline 渲染）
+					const mathCodeText = isInlineMath
+						? "\n```math-inline\n" + mathText + "\n```\n"
+						: "\n```math\n" + mathText + "\n```\n"
 					this.myMarkdownText = this.myMarkdownText.slice(0, this.lastMathEndIndex + lastCodeTagIndex) + 
 									withFindMathText.slice(0, mathStartIndex) + mathCodeText +
 									withFindMathText.slice(mathEndIndex + endToken.length)
@@ -150,7 +157,8 @@ export default class ParseMarkdown {
 				this.startLineIndex = this.endLineIndex
 				newJsonList[0].isClose = 1
 			} else {
-				this.endLineIndex += 1
+				// 流式平滑：每步推进 2 行（原 1 行），配合下方 100→40ms 定时，文本更连续、减少"一段一段"
+				this.endLineIndex += 2
 			}
 			if (this.endLineIndex > msgBodyLines.length) {
 				this.endLineIndex = msgBodyLines.length
@@ -169,15 +177,27 @@ export default class ParseMarkdown {
 			} else {
 				this.markdownTokenList.push(...newJsonList)
 			}
-			if (!isParseDone && !this.userAbort) {
+			if (this.userAbort) {
+				this.parseLock = false
+				return
+			}
+			if (!isParseDone) {
 				setTimeout(() => {
 					this.runTask(msgBody)
-				}, 100)
+				}, 40)
 			}
 			// console.log('markdownText', markdownText)
 			this.doUpdateCallBack(isParseDone)
 			this.parseLock = false
 		})
+	}
+	/** 中止增量打字机：切到工具容器 fallback / 新消息时须调用，避免旧回调覆盖渲染结果 */
+	abort(): void {
+		this.userAbort = true
+		if (this.nextTaskTimer != 0) {
+			clearTimeout(this.nextTaskTimer)
+			this.nextTaskTimer = 0
+		}
 	}
 	md2jsonTask(markdownText : string, md2JsonCallBack: Md2JsonCallBack ) {
 		try {
@@ -217,7 +237,13 @@ export default class ParseMarkdown {
 						beforeDone()
 					} else {
 						const lang = item.lang ?? 'text'
-						if (lang == 'math') {
+						// 行内公式 fence 用 ```math-inline（wasm 取 info 首词为 lang，无空格故完整保留）。
+						// 防御：lang 可能被个别端规整（去连字符/截断），统一小写后判断含 inline 即行内。
+						const langLower = lang.toLowerCase()
+						const isMathBlock = langLower == 'math' || langLower.indexOf('math') == 0
+						if (isMathBlock) {
+							// math-inline / mathinline → 行内 displayMode:false（两端统一 inline 渲染）；math → 块级 displayMode:true
+							item.displayMode = langLower.indexOf('inline') >= 0 ? false : true
 							const index = i
 							this.parseMath(item, (latexEl: MarkdownToken | null)=>{
 								if (latexEl != null) {
@@ -230,6 +256,8 @@ export default class ParseMarkdown {
 								beforeDone()
 							})
 						} else {
+							// 代码块语法高亮（App + H5 统一）：逐行 parseLineCode 分词回填 codeTokens。
+							// H5 原刻意跳过（纯文本），现对齐 PC web 一并高亮；不支持的语言由 parseLineCode 返回 error，渲染层降级纯文本。
 							this.parseCodehighlight(item, ()=>{
 								beforeDone()
 							})
@@ -296,6 +324,11 @@ export default class ParseMarkdown {
 		callBack()
 		//#endif
 		// #ifndef MP-WEIXIN
+		// 闭合才渲染：代码块未闭合（流式半截）不触发 render，避免半截 mermaid 反复报错/重渲
+		if (mermaidToken.isClose == 0) {
+			callBack()
+			return
+		}
 		proxyWeb.callMethod({
 			action: 'renderMermaid',
 			mermaidText: mermaidToken.text
@@ -303,6 +336,10 @@ export default class ParseMarkdown {
 			const imageDataURL : string = param['imageDataURL'] as string
 			if (imageDataURL.length > 0) {
 				mermaidToken.href = imageDataURL
+				const width = param['width'] as number | null
+				const height = param['height'] as number | null
+				if (width != null) mermaidToken.width = width
+				if (height != null) mermaidToken.height = height
 			}
 			callBack()
 		})
@@ -315,10 +352,15 @@ export default class ParseMarkdown {
 		// #endif
 		// #ifndef MP-WEIXIN
 		mathToken.text = mathToken.text?.trim()
+		// 官方行为：无条件渲染（true 短路），公式被 runTask 替换成 ```math 围栏后一进入解析即 katexRender。
+		// 进入本方法的公式必然是完整闭合的（runTask 仅在 hasMathEndTag 时才替换成围栏），
+		// 因此无需依赖 isClose 判断；isClose=0 仅表示"是 md2json 输出最后一个 token"，
+		// 若据此跳过会把回复末尾的公式漏渲（攒到最后/不显示），违背按 SSE 顺序依次渲染。
 		if (true || mathToken.isClose == 1) {
 			proxyWeb.callMethod({
 				action: 'katexRender',
-				pureMathText: mathToken.text!
+				pureMathText: mathToken.text!,
+				displayMode: mathToken.displayMode ?? true
 			}, (param : UTSJSONObject) => {
 				// console.error('katexRender-callback', param)
 				const imageDataURL = param['imageDataURL'] as string | null
@@ -334,6 +376,7 @@ export default class ParseMarkdown {
 					width: width,
 					height: height,
 					isClose: 0,
+					displayMode: mathToken.displayMode ?? true,
 					uniqueId: mathToken.uniqueId!
 				}
 				callBack(latexEl)
@@ -382,12 +425,35 @@ export default class ParseMarkdown {
 		// #endif
 	}
 	createBeforeDone(totalCount: number, callBack: CallBack){
+		// #ifdef APP
+		// 防御（仅 APP）：totalCount<=0（空表格 / 空单元格）时无子项可等，必须立即回调，
+		// 否则 md2JsonCallBack 永不触发 → 后续内容全部不渲染。
+		if (totalCount <= 0) {
+			callBack()
+			return () => {}
+		}
 		let parseCount = 0;
+		let done = false;
 		return () => {
+			if (done) {
+				return
+			}
 			parseCount++
-			if (parseCount == totalCount) {
+			// >= 而非 ==：防御回调次数因异步竞态超出 totalCount 时永不收敛
+			if (parseCount >= totalCount) {
+				done = true
 				callBack()
 			}
 		}
+		// #endif
+		// #ifndef APP
+		let parseCount2 = 0;
+		return () => {
+			parseCount2++
+			if (parseCount2 == totalCount) {
+				callBack()
+			}
+		}
+		// #endif
 	}
 }

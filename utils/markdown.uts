@@ -1,4 +1,11 @@
-import { firstNullableString, orEmpty } from "@/utils/utsCoalesce";
+import { orEmpty } from "@/utils/utsCoalesce";
+import {
+  findNextMarkdownContainerFence,
+  findNextMarkdownCustomProcessTag,
+  toMarkdownCustomProcessHtml,
+} from "@/utils/markdownCustomProcess.uts";
+import { isOpenUiRenderToolName } from "@/utils/openUiSchema.uts";
+import { openUiStatusPriority } from "@/utils/openUiMarkdown.uts";
 
 class MathDelimiter {
   left: string = "";
@@ -107,16 +114,7 @@ function escapedBracketRule(delimiters: MathDelimiter[]) {
   };
 }
 
-/**
- * 根据规则将连续的过程标签（ToolCall, Skill等）合并
- * 规则：
- * 1. 连续 2 个及以上的过程标签合并
- * 2. 中间包含“执行计划”的不合并（作为分隔符）
- * 3. 标签间只包含空白字符时不中断合并
- * 4. 支持 :::container 语法和 PC 端的 HTML 标签语法
- * @param text - 待处理的 Markdown 文本
- * @returns 处理后的文本
- */
+/** groupMarkdownContainers / dedupe 用的过程块匹配结果。 */
 class MarkdownContainerMatch {
   index: number = 0;
   endIndex: number = 0;
@@ -124,48 +122,122 @@ class MarkdownContainerMatch {
   fullMatch: string = "";
   tagMatch: string = "";
   isPlan: boolean = false;
+  type: string = "";
+  status: string = "";
+  name: string = "";
+}
+
+function expandLeadingWhitespace(text: string, index: number): number {
+  let i = index;
+  while (i > 0) {
+    const ch = text.charAt(i - 1);
+    if (ch == " " || ch == "\n" || ch == "\r" || ch == "\t") {
+      i--;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+/** 按出现顺序收集 HTML / :::container 过程块（引号感知，允许 name 含 >）。 */
+function collectMarkdownContainerMatches(
+  text: string,
+): MarkdownContainerMatch[] {
+  const matches: MarkdownContainerMatch[] = [];
+  let from = 0;
+  while (from < text.length) {
+    const htmlTag = findNextMarkdownCustomProcessTag(text, from);
+    const fence = findNextMarkdownContainerFence(text, from);
+    const htmlFound = htmlTag.found == true;
+    const fenceFound = fence.found == true;
+    if (htmlFound != true && fenceFound != true) {
+      break;
+    }
+    let useHtml = false;
+    if (htmlFound == true && fenceFound == true) {
+      useHtml = htmlTag.index <= fence.index;
+    } else {
+      useHtml = htmlFound == true;
+    }
+    const item = new MarkdownContainerMatch();
+    if (useHtml == true) {
+      if (htmlTag.executeId.length == 0) {
+        from = htmlTag.endIndex > from ? htmlTag.endIndex : from + 1;
+        continue;
+      }
+      item.index = expandLeadingWhitespace(text, htmlTag.index);
+      item.endIndex = htmlTag.endIndex;
+      item.executeId = htmlTag.executeId;
+      item.fullMatch = text.substring(item.index, item.endIndex);
+      item.tagMatch = htmlTag.tagMatch;
+      item.type = htmlTag.type;
+      item.status = htmlTag.status;
+      item.name = htmlTag.name;
+      item.isPlan = htmlTag.type == "Plan";
+      matches.push(item);
+      from = htmlTag.endIndex > from ? htmlTag.endIndex : from + 1;
+    } else {
+      if (fence.executeId.length == 0) {
+        from = fence.endIndex > from ? fence.endIndex : from + 1;
+        continue;
+      }
+      item.index = expandLeadingWhitespace(text, fence.index);
+      item.endIndex = fence.endIndex;
+      item.executeId = fence.executeId;
+      item.fullMatch = text.substring(item.index, item.endIndex);
+      item.tagMatch = fence.fullMatch;
+      item.type = fence.type;
+      item.status = fence.status;
+      item.name = fence.name;
+      item.isPlan = fence.type == "Plan";
+      matches.push(item);
+      from = fence.endIndex > from ? fence.endIndex : from + 1;
+    }
+  }
+  return matches;
+}
+
+function normalizeContainerTag(m: MarkdownContainerMatch): string {
+  return toMarkdownCustomProcessHtml(
+    m.executeId,
+    orEmpty(m.type),
+    orEmpty(m.status),
+    orEmpty(m.name),
+  );
 }
 
 function dedupeMarkdownContainers(text: string): string {
   if (text.length === 0) return "";
 
-  const blockRegex =
-    /(?:[\r\n\s]*)(?:(?:<(?:div|p)\b[^>]*>)?\s*(<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>|\/>)?)\s*(?:<\/(?:div|p)>)?|(:::container\b[^\n]*?\n:::))/g;
-
-  const matches: MarkdownContainerMatch[] = [];
-
-  const lastIndexMap = new Map<string, number>();
-  let match = blockRegex.exec(text);
-  while (match != null) {
-    const fullMatch = match[0];
-    // Android：未命中的捕获组为 null，禁止 as any
-    const g1 = match.length > 1 ? match[1] : null;
-    const g2 = match.length > 2 ? match[2] : null;
-    const tagMatch = firstNullableString([g1, g2]);
-    const executeId = extractAttribute(tagMatch, "executeId");
-
-    if (executeId.length > 0) {
-      const type = extractAttribute(tagMatch, "type");
-      const isPlan = type === "Plan";
-
-      const item = new MarkdownContainerMatch();
-      item.index = match.index;
-      item.endIndex = blockRegex.lastIndex;
-      item.executeId = executeId;
-      item.fullMatch = orEmpty(fullMatch);
-      item.tagMatch = tagMatch;
-      item.isPlan = isPlan;
-      matches.push(item);
-      lastIndexMap.set(executeId, match.index);
+  const matches = collectMarkdownContainerMatches(text);
+  // 普通工具：同 executeId 保留最后一次；OpenUI：优先更好 status（策略在 openUiMarkdown）
+  const keepIndexMap = new Map<string, number>();
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i];
+    const execId = m.executeId;
+    const prevIdx = keepIndexMap.get(execId);
+    if (prevIdx == null) {
+      keepIndexMap.set(execId, i);
+      continue;
     }
-    match = blockRegex.exec(text);
+    if (isOpenUiRenderToolName(m.name) == true) {
+      const prev = matches[prevIdx];
+      const prevPri = openUiStatusPriority(prev.status);
+      const curPri = openUiStatusPriority(m.status);
+      if (curPri < prevPri || (curPri == prevPri && m.index >= prev.index)) {
+        keepIndexMap.set(execId, i);
+      }
+    } else {
+      keepIndexMap.set(execId, i);
+    }
   }
 
   const ignoreMatchIndices = new Set<number>();
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
 
-    if (lastIndexMap.get(m.executeId) !== m.index) {
+    if (keepIndexMap.get(m.executeId) !== i) {
       ignoreMatchIndices.add(i);
       continue;
     }
@@ -207,13 +279,13 @@ function dedupeMarkdownContainers(text: string): string {
 }
 
 /**
- * 根据规则将连续的过程标签（ToolCall, Skill等）合并
- * 规则：
- * 1. 连续 2 个及以上的过程标签合并
- * 2. 中间包含“执行计划”的不合并（作为分隔符）
- * 3. 标签间只包含空白字符时不中断合并
- * 4. 支持 :::container 语法和 PC 端的 HTML 标签语法
- * @param text - 待处理 of Markdown 文本
+ * 根据规则将连续的过程标签（ToolCall, Skill等）合并。
+ * 1. 仅 ≥2 个连续过程标签才合成 process-group；单工具始终独立卡
+ *    （流式期与完成态渲染一致，避免「流式组内 1 项 → 会话完成后移出组单独显示」的跳动）
+ * 2. Plan 作分隔符不进组；Event 默认跳过（OpenUI renderUI 例外，需保留供 openui-card）
+ * 3. 标签间仅空白时不中断合并
+ * 4. 支持 :::container 与 HTML 过程标签
+ * @param text - 待处理的 Markdown 文本
  * @returns 处理后的文本
  */
 export function groupMarkdownContainers(text: string): string {
@@ -221,11 +293,7 @@ export function groupMarkdownContainers(text: string): string {
 
   // 预处理：合并连续相同的 Plan 并去重重复的自定义容器
   const dedupedText = dedupeMarkdownContainers(text);
-
-  // 1. 匹配 HTML 格式的过程标签 (markdown-custom-process)
-  // 2. 匹配 :::container 格式的标签
-  const blockRegex =
-    /(?:[\r\n\s]*)(?:(?:<(?:div|p)\b[^>]*>)?\s*(<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>|\/>)?)\s*(?:<\/(?:div|p)>)?|(:::container\b[^\n]*?\n:::))/g;
+  const matches = collectMarkdownContainerMatches(dedupedText);
 
   let result = "";
   let lastIndex = 0;
@@ -234,13 +302,12 @@ export function groupMarkdownContainers(text: string): string {
 
   const flushGroup = () => {
     if (currentGroup.length > 0) {
+      // ≥2 才合组；单工具始终独立卡（与完成态渲染一致）
       if (currentGroup.length >= 2) {
-        // 多个时，为了支持层级，必须使用规范化后的 HTML 标签
         const groupContent = `\n\n<markdown-custom-process-group>\n${normalizedGroup.join("\n")}\n</markdown-custom-process-group>\n\n`;
         result += groupContent;
       } else {
-        // 只有一个工具时，直接输出规范化后的 HTML 标签，避免 H5 上 markdown-it 容器插件将 ::: 转为 <container data={JSON}>
-        // 导致 <markdown-container> 组件取到的 data 为字符串而非对象，无法渲染属性
+        // 单工具：规范化 HTML，避免 H5 :::container 插件把 data 弄成字符串
         result += `\n\n${normalizedGroup[0]}\n\n`;
       }
       currentGroup = [] as string[];
@@ -248,11 +315,21 @@ export function groupMarkdownContainers(text: string): string {
     }
   };
 
-  let count = 0;
-  let match = blockRegex.exec(dedupedText);
-  while (match != null) {
-    count++;
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
     const textBefore = dedupedText.slice(lastIndex, match.index);
+
+    // Event：内部事件默认跳过；OpenUI renderUI 例外——需保留标签供 mp-html 渲染 openui-card。
+    if (match.type == "Event" && isOpenUiRenderToolName(match.name) != true) {
+      if (textBefore.trim() !== "") {
+        flushGroup();
+        result += textBefore;
+      } else if (currentGroup.length === 0) {
+        result += textBefore;
+      }
+      lastIndex = match.endIndex;
+      continue;
+    }
 
     if (textBefore.trim() !== "") {
       flushGroup();
@@ -263,71 +340,32 @@ export function groupMarkdownContainers(text: string): string {
       }
     }
 
-    // Android：未命中的捕获组为 null，禁止 as any
-    const g1b = match.length > 1 ? match[1] : null;
-    const g2b = match.length > 2 ? match[2] : null;
-    let tagMatch = firstNullableString([g1b, g2b]);
+    const tagMatch = match.tagMatch;
+    const normalizedTag = normalizeContainerTag(match);
 
-    // 为了分组显示，我们依然需要一份规范化后的 HTML 标签
-    let normalizedTag = "";
-    if (tagMatch.startsWith(":::container")) {
-      const executeId = extractAttribute(tagMatch, "executeId");
-      const type = extractAttribute(tagMatch, "type");
-      const status = extractAttribute(tagMatch, "status");
-      const name = extractAttribute(tagMatch, "name");
-      const safeName = name.replace(/"/g, "&quot;");
-      normalizedTag = `<markdown-custom-process executeid="${executeId}" type="${orEmpty(type)}" status="${orEmpty(status)}" name="${safeName}"></markdown-custom-process>`;
-    } else {
-      normalizedTag = tagMatch;
-      if (
-        !normalizedTag.includes("</markdown-custom-process>") &&
-        !normalizedTag.endsWith("/>")
-      ) {
-        normalizedTag = normalizedTag.replace(
-          ">",
-          "></markdown-custom-process>",
-        );
-      }
-    }
-
-    const isPlan = /type=["']Plan["']/.test(normalizedTag);
-    if (isPlan) {
+    if (match.isPlan == true) {
+      // Plan 定界前面的工具簇，自身不进组
       flushGroup();
-      // Plan 类型保持原样输出
-      result += `\n\n${tagMatch}\n\n`;
+      result += `\n\n${normalizedTag}\n\n`;
+    } else if (isOpenUiRenderToolName(match.name) == true) {
+      // OpenUI 独立渲染：禁止塞进 markdown-custom-process-group。
+      // group-content 默认/折叠态 max-height:0 + opacity:0，会把 openui-card 完全藏住。
+      flushGroup();
+      result += `\n\n${normalizedTag}\n\n`;
     } else {
       currentGroup.push(tagMatch);
       normalizedGroup.push(normalizedTag);
     }
 
-    lastIndex = blockRegex.lastIndex;
-    match = blockRegex.exec(dedupedText);
+    lastIndex = match.endIndex;
   }
 
+  const trailingText = dedupedText.slice(lastIndex);
   flushGroup();
-  result += dedupedText.slice(lastIndex);
+  result += trailingText;
 
   const finalResult = result.replace(/\n{3,}/g, "\n\n").trim();
   return finalResult;
-}
-
-/**
- * 从属性字符串中提取指定属性的值
- */
-function extractAttribute(attrString: string, attrName: string): string {
-  // 先尝试双引号
-  let regex = new RegExp(`${attrName}="([^"]*)"`);
-  let match = attrString.match(regex);
-  if (match != null) {
-    return orEmpty(match[1]).replace(/&quot;/g, '"');
-  }
-  // 再尝试单引号
-  regex = new RegExp(`${attrName}='([^']*)'`);
-  match = attrString.match(regex);
-  if (match != null) {
-    return orEmpty(match[1]).replace(/&quot;/g, '"');
-  }
-  return "";
 }
 
 // 新的数学公式替换函数 - 直接替换为 $$ 分隔符

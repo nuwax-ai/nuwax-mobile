@@ -15,9 +15,9 @@
 
 ### 2.2 Markdown / HTML
 *   **PC 实现**：`react-markdown`, `iframe`。
-*   **移动端/小程序方案**：项目已集成 **`mp-html`** 组件。
-    *   直接复用 `mp-html` 渲染 Markdown (需开启 markdown 插件) 和 HTML 内容。
-    *   H5 端也可使用 `mp-html` 保持一致性。
+*   **移动端/小程序方案**：会话内 Markdown 由 **`ai-msg` / `uni-ai-x`** 解析渲染；文件预览页优先走 H5 `file-preview` / `uni.openDocument`。
+    *   聊天消息：`subpackages/components/ai-msg/ai-msg.uvue`
+    *   代码块等节点：`uni_modules/uni-ai-x` 内对应渲染组件
 
 ### 2.3 多媒体 (图片/视频/音频)
 *   **PC 实现**：`<img>`, `<video>`, `<audio>` 标签。
@@ -30,7 +30,7 @@
 *   **PC 实现**：`<pre><code>`。
 *   **移动端/小程序方案**：
     *   简单查看：`<text>` + `<scroll-view>`，配合 `white-space: pre-wrap`。
-    *   富文本高亮：通过 `mp-html` 的 markdown 插件支持代码高亮。
+    *   富文本高亮：复用 `uni-ai-x` 的代码高亮组件（如 `uni-ai-msg-code`）。
 
 ## 3. UI 适配
 *   **Ant Design** -> **uni-ui / 原生组件**：
@@ -42,7 +42,7 @@
 ## 4. 依赖库处理
 | PC 库 | 移动端状态 | 替代方案 |
 | :--- | :--- | :--- |
-| `react-markdown` | ❌ 不可用 | `mp-html` |
+| `react-markdown` | ❌ 不可用 | `ai-msg` / `uni-ai-x` |
 | `@js-preview/*` (docx/excel/pdf) | ❌ 不可用 (依赖 DOM) | `uni.openDocument` |
 | `pptx-preview` | ❌ 不可用 (依赖 DOM) | `uni.openDocument` |
 | `antd` | ❌ 不可用 | `uni-ui` / 原生 |
@@ -54,7 +54,7 @@
     *   **Office/PDF**：渲染为一个"点击预览"的卡片文件（类似微信聊天记录中的文件气泡），点击后触发 `uni.downloadFile` -> `uni.openDocument`。
     *   **Image**：直接显示缩略图，点击调用 `uni.previewImage`。
     *   **Audio/Video**：使用原生组件直接渲染。
-    *   **Text/MD/HTML**：使用 `<mp-html>` 渲染。
+    *   **Text/MD/HTML**：会话内用 `ai-msg`；独立预览优先 H5 `file-preview` 或系统打开。
 4.  **下载/另存为**：小程序中 `uni.saveFile` (保存到本地) 或 `uni.opensDocument` (右上角菜单转发/保存)。
 
 ## 6. 代码复用度

@@ -6,7 +6,15 @@
     stopEventPolling,
   } from "@/hooks/useEventPolling";
   import { loadI18n, t, bootstrapI18nCache } from "@/utils/i18n";
+  import { refreshSystemMessageBadge } from "@/utils/notificationBadge";
+  import eventBus from "@/utils/eventBus";
+  import { EVENT_TYPE } from "@/constants/event.constants";
   import { initCmark } from "@/uni_modules/uni-cmark";
+  import { setAppInBackground } from "@/utils/appLifecycle.uts";
+  import { notifyStreamAppForeground } from "@/utils/streamRequest.uts";
+  // #ifdef H5 || WEB
+  import { bootstrapH5AccessTokenFromUrl } from "@/utils/authSession";
+  // #endif
   // #ifdef APP-IOS || APP-ANDROID
   import { bootstrapAppNativePay } from "@/subpackages/utils/appNativePay.uts";
   // #endif
@@ -15,6 +23,9 @@
   // #endif
   // #ifdef APP-IOS
   import { registerIosEspProvisioningProvider } from "@/utils/provisioning/iosEspProvisioningClient.uts";
+  // #endif
+  // #ifdef APP-HARMONY
+  import { registerHarmonyEspProvisioningProvider } from "@/utils/provisioning/harmonyEspProvisioningClient.uts";
   // #endif
   // #ifdef MP-WEIXIN
   import { htmlToMarkdown } from "@/utils/htmlToMarkdown";
@@ -35,16 +46,22 @@
       return;
     }
 
+    // 取 layout 视口（innerHeight）与视觉视口的较小值，且不四舍五入：
+    // 键盘收起 / WebView 布局过渡期 visualViewport 可能短暂偏高，Math.round 放大后
+    // 会让 --vh 大于实际可见高度 → 文档层多出几像素可滚动余量（配合聊天页文档滚动锁，
+    // 余量虽不会再被滚动，但会把底部输入框向下裁切掉几像素）。
     let vh = window.innerHeight;
     if (window.visualViewport && window.visualViewport.height) {
-      vh = Math.round(window.visualViewport.height);
-    } else {
-      vh = window.innerHeight;
+      const visualH = Math.min(vh, window.visualViewport.height);
+      if (visualH > 0) {
+        vh = visualH;
+      }
     }
     document.documentElement.style.setProperty("--vh", `${vh}px`);
   }
   fix100vh();
   window.addEventListener("resize", fix100vh);
+  window.addEventListener("orientationchange", fix100vh);
   // 解决iOS键盘问题的代码 使用Visual Viewport API
   window.visualViewport &&
     window.visualViewport.addEventListener("resize", fix100vh);
@@ -55,8 +72,31 @@
   // #endif
   export default {
     onLaunch: function () {
-      // 优先从缓存初始化国际化状态并快速应用 TabBar 翻译
-      bootstrapI18nCache();
+  // #ifdef H5 || WEB
+  // 常驻壳把纯 token 放在 hash query 的 accessToken 上；请求前写入 storage 并标记内嵌，才能带 Bearer。
+  bootstrapH5AccessTokenFromUrl();
+  // #endif
+
+  // 优先从缓存初始化国际化状态并快速应用 TabBar 翻译
+  bootstrapI18nCache();
+
+      // #ifdef H5 || WEB
+      // uni-app x H5 运行时 InnerAudioContext.play() 丢弃 play() Promise（play(){this._audio.play()}），
+      // 被后续 pause()/stop()/换源打断的 AbortError 在 UTS 层无法 catch，只能全局兜底吞掉。
+      // 仅过滤 HTMLMediaElement.play() 的 rejection，不掩盖 fetch/其他 AbortError。
+      window.addEventListener("unhandledrejection", (e: any) => {
+        const reason = e != null ? e.reason : null;
+        const name = reason != null && reason.name != null ? `${reason.name}` : "";
+        const msg = reason != null && reason.message != null ? `${reason.message}` : "";
+        if (msg.indexOf("play()") >= 0 && (name == "AbortError" || name == "NotAllowedError")) {
+          console.warn("[H5] swallow media play rejection", name, msg);
+          e.preventDefault();
+        }
+      });
+      // #endif
+
+      // App（Android / iOS / 鸿蒙）冷启动登录态分流已前移到启动页 pages/launch/launch：
+      // 在 onLaunch 里 reLaunch 无法阻止首页被创建渲染，只能做到「先进首页再跳登录页」。
 
       // 异步加载语言包（不阻塞 onLaunch 生命周期）
       loadI18n();
@@ -74,6 +114,12 @@
       // #endif
       // #ifdef APP-IOS
       registerIosEspProvisioningProvider();
+      // #endif
+      // #ifdef APP-HARMONY
+      registerHarmonyEspProvisioningProvider();
+      // 不在此注册鸿蒙支付桥：appNativePay.uts 在分包内，鸿蒙编译成独立 JS chunk，
+      // 主包 import 会被丢弃（bootstrapAppNativePay is not defined）。
+      // 鸿蒙支付走 paymentUtils.uts 的 #ifdef APP-HARMONY 直连插件分支，不依赖桥注册。
       // #endif
 
 
@@ -120,6 +166,18 @@
       // 小程序: 需要依赖 onHide/onShow 手动控制
       initEventPolling();
 
+      // 初始化未读徽标，并在服务端推送新系统消息时立即刷新。
+      refreshSystemMessageBadge();
+      // H5 刷新时 App 生命周期会早于首个 Tab 页挂载，路由稳定后补一次刷新。
+      // #ifdef H5 || WEB
+      setTimeout(() => {
+        refreshSystemMessageBadge();
+      }, 200);
+      // #endif
+      eventBus.on(`${EVENT_TYPE.NewNotifyMessage}`, (_event: any) => {
+        refreshSystemMessageBadge();
+      });
+
       // #ifdef APP-IOS
       // 注册 iOS 原生支付桥（支付宝 openURL / 微信 scheme 兜底）
       bootstrapAppNativePay();
@@ -127,13 +185,18 @@
     },
     onShow: function () {
       console.log("App Show");
+      setAppInBackground(false);
+      // 回前台：活跃 SSE 恢复空闲超时监控并刷新 lastChunk 时间
+      notifyStreamAppForeground();
       // #ifndef H5
       // 非 H5 端：从后台回到前台，恢复轮询（H5 由 visibilitychange 自动处理）
       startEventPolling();
       // #endif
+      refreshSystemMessageBadge();
     },
     onHide: function () {
       console.log("App Hide");
+      setAppInBackground(true);
       // #ifndef H5
       // 非 H5 端：切换到后台，暂停轮询（H5 由 visibilitychange 自动处理）
       stopEventPolling();
@@ -165,7 +228,19 @@
 
 <style lang="scss">
   /* #ifdef APP */
-  @import "@/static/iconfont/iconfont-app.css";
+  /* iconfont：App 端直接内联 @font-face（不走 @import 外联 .css），且 src 用根路径 "/static/..."。
+    原先 @import iconfont-app.css 且 url 用 "@/static/..."，编译后 "@/" 不被改写，
+     App 原生渲染引擎无法解析该路径 → 字体未注册 → 所有 iconfont 图标变 tofu（方框）。
+     对齐 DCloud 官方 uni-ai-x 组件写法（src: url('/uni_modules/...')，内联在 <style>）。 */
+  @font-face {
+    font-family: "iconfont";
+    src: url('/static/iconfont/iconfont.ttf');
+  }
+  .iconfont {
+    font-family: "iconfont" !important;
+    font-size: 16px;
+    font-style: normal;
+  }
   /* #endif */
   /* #ifndef APP */
   @import "@/static/iconfont/iconfont.css";

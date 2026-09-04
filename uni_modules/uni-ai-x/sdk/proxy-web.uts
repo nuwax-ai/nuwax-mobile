@@ -1,9 +1,36 @@
 import utils from '@/uni_modules/uni-ai-x/sdk/utils.uts'
 type OnMsgFn = (e : UTSJSONObject) => void
+
+/** 代理未就绪时暂存的调用 */
+class ProxyPendingCall {
+	param : UTSJSONObject
+	callback : OnMsgFn
+	constructor(param : UTSJSONObject, callback : OnMsgFn) {
+		this.param = param
+		this.callback = callback
+	}
+}
+
+/** 等待代理就绪的监听（UTS 避免直接存函数数组） */
+class ProxyReadyListener {
+	fn : () => void
+	constructor(fn : () => void) {
+		this.fn = fn
+	}
+}
+
 class ProxyWeb {
 	isInit : boolean = false
 	private webviewContext : WebviewContext | null = null
+	/** App 端 createWebviewContext 使用的节点 id */
+	private webviewId : string = "markdown-proxy-web"
 	callbackMap : Map<string, OnMsgFn> = new Map()
+	/** isInit 前入队，DOMContentLoaded 后一次性冲刷（避免上百次 100ms 重试刷屏） */
+	private pendingCalls : ProxyPendingCall[] = []
+	/** 等待代理就绪的监听（历史含公式消息可 defer 到就绪后再解析） */
+	private readyListeners : ProxyReadyListener[] = []
+	private safetyFlushTimer : number = 0
+
 	constructor() {
 		// #ifdef WEB
 		window.addEventListener('message', (event) => {
@@ -13,75 +40,199 @@ class ProxyWeb {
 		}, false)
 		// #endif
 	}
-	callMethod(param : UTSJSONObject, callback : OnMsgFn) {
-		// 先判断 isInit 是否为 true
-		if (this.isInit == false) {
-			if (param['action'] == 'katexRender') {
-				console.log('[MathRender] proxy not ready, retry after 1s')
-			}
-			// console.log('isInit false , wait 1s')
-			setTimeout(() => {
-				this.callMethod(param, callback)
-			}, 1000)
+
+	/**
+	 * iOS 上 onMounted 时 createWebviewContext 常为 null，需在消息到达或重试时再绑定。
+	 */
+	ensureAppContext(webviewId : string = ""): void {
+		if (webviewId.length > 0) {
+			this.webviewId = webviewId
+		}
+		if (this.webviewContext != null) {
 			return
 		}
-		// console.log('callMethod', param)
-		const requestId = Date.now() + Math.random().toString(36).substring(2, 15)
-		param['requestId'] = requestId
-		const key = (param['action'] as string) + '_callback_' + requestId
-		this.callbackMap.set(key, callback)
-		if (param['action'] == 'katexRender') {
-			console.log('[MathRender] proxy dispatch requestId=' + requestId)
+		// #ifdef APP
+		try {
+			const ctx = uni.createWebviewContext(this.webviewId)
+			if (ctx != null) {
+				this.webviewContext = ctx
+			}
+		} catch (e) {
+			// ignore：后续 callMethod / DOMContentLoaded 会再补绑
 		}
+		// #endif
+	}
+
+	/** 代理是否可立刻 evalJS */
+	isReady(): boolean {
+		return this.isInit == true && this.webviewContext != null
+	}
+
+	/**
+	 * 代理就绪后执行；已就绪则同步调用。
+	 * 用于历史会话：含公式时等 webview 再 parse，避免先出文本、公式空转重试。
+	 */
+	whenReady(listener : () => void): void {
+		if (this.isReady() == true) {
+			listener()
+			return
+		}
+		this.readyListeners.push(new ProxyReadyListener(listener))
+		this.ensureAppContext(this.webviewId)
+		this.armSafetyFlush()
+	}
+
+	private armSafetyFlush(): void {
+		if (this.safetyFlushTimer != 0) {
+			return
+		}
+		// 若 DOMContentLoaded 丢失，最多 8s 后放弃排队并回调失败
+		this.safetyFlushTimer = setTimeout((): void => {
+			this.safetyFlushTimer = 0
+			if (this.isReady() == true) {
+				return
+			}
+			const pending = this.pendingCalls
+			this.pendingCalls = []
+			for (let i = 0; i < pending.length; i++) {
+				const fail = new UTSJSONObject()
+				fail["error"] = "proxy_not_ready"
+				fail["imageDataURL"] = ""
+				fail["resultHtml"] = ""
+				const cb = pending[i].callback
+				utils.uniGetDispatcher("main", () => {
+					cb(fail)
+				})
+			}
+			const listeners = this.readyListeners
+			this.readyListeners = []
+			for (let j = 0; j < listeners.length; j++) {
+				listeners[j].fn()
+			}
+		}, 8000) as number
+	}
+
+	private clearSafetyFlush(): void {
+		if (this.safetyFlushTimer != 0) {
+			clearTimeout(this.safetyFlushTimer)
+			this.safetyFlushTimer = 0
+		}
+	}
+
+	private notifyReadyListeners(): void {
+		const listeners = this.readyListeners
+		this.readyListeners = []
+		for (let i = 0; i < listeners.length; i++) {
+			listeners[i].fn()
+		}
+	}
+
+	private flushPendingCalls(): void {
+		const pending = this.pendingCalls
+		this.pendingCalls = []
+		for (let i = 0; i < pending.length; i++) {
+			this.dispatchCall(pending[i].param, pending[i].callback)
+		}
+	}
+
+	private dispatchCall(param : UTSJSONObject, callback : OnMsgFn): void {
+		const requestId = Date.now() + Math.random().toString(36).substring(2, 15)
+		param["requestId"] = requestId
+		const key = (param["action"] as string) + "_callback_" + requestId
+		this.callbackMap.set(key, callback)
 
 		// #ifdef APP-ANDROID
-		const code = `onMessage(${JSON.stringify(param)})`;
+		const code = `onMessage(${JSON.stringify(param)})`
 		// #endif
 		// #ifndef APP-ANDROID
-		const code = `onMessage("${encodeURIComponent(JSON.stringify(param))}")`;
+		const code = `onMessage("${encodeURIComponent(JSON.stringify(param))}")`
 		// #endif
-		// console.log('code', code)
+
 		/* #ifdef APP */
-		this.webviewContext?.evalJS(code)
-			/* #endif */
-			/* #ifdef WEB */
-			(this.webviewContext as any)?.contentWindow.eval(code)
+		this.webviewContext!.evalJS(code)
+		/* #endif */
+		/* #ifdef WEB */
+		;(this.webviewContext as any)?.contentWindow.eval(code)
 		/* #endif */
 	}
-	init(webviewContext : WebviewContext) {
-		this.webviewContext = webviewContext
-	}
-	onWebMsg(e : UniWebViewMessageEvent) {
-		// console.log('onWebMsg', e)
-		const event = e.detail.data[0] as UTSJSONObject
-		const action = event['action'] as string
-		const param = event['param'] as UTSJSONObject
-		this.emitMsg({
-			action,
-			param
-		})
-	}
-	emitMsg(res : UTSJSONObject) {
-		if (res['action'] == 'DOMContentLoaded_callback') {
-			this.isInit = true
-			console.log('[MathRender] proxy DOMContentLoaded')
+
+	callMethod(param : UTSJSONObject, callback : OnMsgFn, _retryCount : number = 0) {
+		// #ifdef APP
+		if (this.webviewContext == null) {
+			this.ensureAppContext(this.webviewId)
+		}
+		// #endif
+		// 未就绪：入队等待 DOMContentLoaded 一次冲刷（禁止每条公式独立 setTimeout 重试）
+		if (this.isReady() != true) {
+			this.pendingCalls.push(new ProxyPendingCall(param, callback))
+			this.armSafetyFlush()
 			return
 		}
-		const funName = res['action']! as string
-		// console.log('funName', funName)
-		const callback = this.callbackMap.get(funName)
-		if (funName.startsWith('katexRender_callback_')) {
-			console.log('[MathRender] proxy callback action=' + funName)
+
+		this.dispatchCall(param, callback)
+	}
+
+	init(webviewContext : WebviewContext | null, webviewId : string = "") {
+		if (webviewId.length > 0) {
+			this.webviewId = webviewId
 		}
+		if (webviewContext != null) {
+			this.webviewContext = webviewContext
+		} else {
+			// #ifdef APP
+			this.ensureAppContext(this.webviewId)
+			// #endif
+		}
+		// 若 webview 已就绪（热更/二次进入），立刻冲刷
+		if (this.isReady() == true) {
+			this.clearSafetyFlush()
+			this.flushPendingCalls()
+			this.notifyReadyListeners()
+		}
+	}
+
+	/** 页面卸载时重置，避免单例残留 isInit=true 但 context 已失效 */
+	reset(): void {
+		this.clearSafetyFlush()
+		this.isInit = false
+		this.webviewContext = null
+		this.callbackMap.clear()
+		this.pendingCalls = []
+		this.readyListeners = []
+	}
+
+	onWebMsg(e : UniWebViewMessageEvent) {
+		// 任意消息到达都说明 web-view 已挂载，趁机补绑 context（iOS 关键）
+		this.ensureAppContext(this.webviewId)
+		const event = e.detail.data[0] as UTSJSONObject
+		const action = event["action"] as string
+		const param = event["param"] as UTSJSONObject
+		this.emitMsg({
+			action,
+			param,
+		} as UTSJSONObject)
+	}
+
+	emitMsg(res : UTSJSONObject) {
+		if (res["action"] == "DOMContentLoaded_callback") {
+			this.isInit = true
+			this.ensureAppContext(this.webviewId)
+			this.clearSafetyFlush()
+			// 先冲刷已入队的 katex，再通知「等就绪再 parse」的历史消息
+			this.flushPendingCalls()
+			this.notifyReadyListeners()
+			return
+		}
+		const funName = res["action"]! as string
+		const callback = this.callbackMap.get(funName)
 		if (callback == null) {
-			console.error('callback is null', funName)
+			console.error("callback is null", funName)
 			return
 		}
 		this.callbackMap.delete(funName)
 		// 回调会更新 Vue 响应式消息数据，Android 必须切回主线程。
-		// 在 io 线程修改 markdownElList 会与渲染依赖遍历并发，触发 ConcurrentModificationException。
-		utils.uniGetDispatcher('main',()=>{
-			callback(res['param'] as UTSJSONObject)
+		utils.uniGetDispatcher("main", () => {
+			callback(res["param"] as UTSJSONObject)
 		})
 	}
 }

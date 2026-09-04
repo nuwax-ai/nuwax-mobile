@@ -1,12 +1,13 @@
 <template>
-  <button
+  <!-- 使用 view 而非原生 button：App（尤其 iOS）原生 button 会盖住父级绝对定位图标，无法做到「按钮铺满 + 右侧图标悬浮」 -->
+  <view
+    :key="panelRenderKey"
     class="voice-recorder-container"
     :class="{
-      'is-recording': isRecorderActive,
-      'is-uploading': currentState == 'uploading'
+      'is-recording': isRecorderVisualActive,
+      'is-uploading': isUploadingVisual
     }"
-    :style="{ backgroundColor: isRecorderActive ? 'rgb(108, 101, 244)' : '#ffffff' }"
-    hover-class="none"
+    :style="{ backgroundColor: panelBgColor }"
     @touchstart="handleTouchStart"
     @touchend="handleTouchEnd"
     @touchcancel="cancelRecording"
@@ -17,12 +18,13 @@
   >
     <text
       class="voice-recorder-prompt-text"
+      :class="{ 'is-active-text': isRecorderVisualActive }"
       @touchstart.stop="handleTouchStart"
       @touchend.stop="handleTouchEnd"
       @touchcancel.stop="cancelRecording"
       @touchmove.stop="handleTouchMove"
     >{{ recorderPromptText }}</text>
-  </button>
+  </view>
 </template>
 
 <script lang="uts" setup>
@@ -30,7 +32,7 @@
   import jzRecorder from '@/uni_modules/jz-h5-recorder-manager'
   // #endif
 
-  import { ref, computed, onMounted, onUnmounted } from 'vue';
+  import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
   import { onShow, onHide } from "@dcloudio/uni-app";
   import {
     createAudioUploader,
@@ -40,7 +42,24 @@
     type UploadProgress
   } from '@/servers/audioUploader'
   import { MicrophonePermissionHelper, type PermissionState } from '@/utils/permissionHelper'
+  import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+  import { pageSystemOverlay } from "@/subpackages/utils/pageSystemOverlay.uts";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
+  // #ifdef APP
+  import { speechSocketWarmup } from "@/subpackages/utils/voice/speechSocketWarmup";
+  import {
+    asrWebSocketClient,
+    ASR_SAMPLE_RATE,
+  } from "@/subpackages/utils/voice/asrWebSocketClient";
+  import { streamLocalAudioFileToAsr } from "@/subpackages/utils/voice/pcmStreamRecorder";
+  // #endif
+  // TTS 打断 / 手势解锁：App 与 H5 共用
+  import { ttsWebSocketPlayer } from "@/subpackages/utils/voice/ttsWebSocketPlayer";
+  import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
+  import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
+  import { stopAllSpeechPlayback } from "@/subpackages/utils/voice/stopAllSpeechPlayback";
+  // App web-view 内嵌页原生语音桥：录音 / TTS 走原生
+  import { nativeVoiceBridge } from "@/subpackages/utils/voice/nativeVoiceBridge";
 
   const { t: tFn } = useI18n();
   function t(key: string): string {
@@ -53,6 +72,10 @@
     duration?: number        // 最大录音时长 (ms)
     // 会话是否正在进行中（有消息正在处理）
     isConversationActive?: boolean
+    /** 是否启用实时 WebSocket ASR（仅 App 原生录音路径使用；App web-view 内嵌页为 true） */
+    enableAsr?: boolean
+    /** 是否 App web-view 内嵌页（isAppWebView）：录音 / 转写走原生桥（postMessage + evalJS） */
+    nativeBridge?: boolean
   }
 
   // 录音状态类型
@@ -66,53 +89,52 @@
     return props.duration != null ? props.duration! : 600000;
   }
 
+  /** enableAsr 缺省视为启用（对齐 getDuration 的默认值写法） */
+  function isAsrEnabled(): boolean {
+    return props.enableAsr != false;
+  }
+
+  /** 是否 App web-view 内嵌页：录音 / 转写走原生桥 */
+  function isNativeBridge(): boolean {
+    if (props.nativeBridge == true) {
+      return true;
+    }
+    // 兜底：部分机型（三星/小米/荣耀等）uni-app x 桥全局注入偏晚，组件挂载时
+    // nativeBridge prop 可能尚未置位。按下时动态探测桥全局——该全局仅 App web-view
+    // 存在，浏览器/原生页不会命中，不会误判。
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded() == true) {
+      return true;
+    }
+    // #endif
+    return false;
+  }
+
   /**
-   * 各端录音参数（须满足官方采样率-码率表，否则 iOS 报 1107603）
+   * 各端录音参数（须满足官方采样率-码率表，否则报 1107603）
+   * encodeBitRate 须满足：24000 < bitrate < 96000
    * @see https://doc.dcloud.net.cn/uni-app-x/api/get-recorder-manager.html
    */
   function buildNativeRecorderStartOptions(): RecorderManagerStartOptions {
     const duration = Math.min(getDuration(), 600000);
-    // #ifdef APP-IOS
-    // 使用平台默认采样率，并选择官方表中匹配的编码码率。
-    const iosOptions = {
-      duration: duration,
-      sampleRate: 44100,
-      numberOfChannels: 2,
-      encodeBitRate: 64000,
-      format: "aac",
-    } as RecorderManagerStartOptions;
-    return iosOptions;
-    // #endif
-    // #ifdef APP-ANDROID
-    const androidOptions = {
-      duration: duration,
-      sampleRate: 16000,
-      numberOfChannels: 1,
-      encodeBitRate: 96000,
-      format: "mp3",
-    } as RecorderManagerStartOptions;
-    return androidOptions;
-    // #endif
     // #ifdef APP
-    // #ifndef APP-ANDROID
-    // #ifndef APP-IOS
-    const appFallbackOptions = {
+    // App：16kHz mono PCM，走 WebSocket ASR（非 HTTP 上传）
+    const appAsrOptions = {
       duration: duration,
-      sampleRate: 16000,
-      numberOfChannels: 2,
+      sampleRate: ASR_SAMPLE_RATE,
+      numberOfChannels: 1,
       encodeBitRate: 48000,
-      format: "aac",
+      format: "pcm",
     } as RecorderManagerStartOptions;
-    return appFallbackOptions;
-    // #endif
-    // #endif
+    return appAsrOptions;
     // #endif
     // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    // 小程序录音参数对齐 dev 分支（encodeBitRate 192000）
     const mpOptions = {
       duration: duration,
       sampleRate: 44100,
       numberOfChannels: 1,
-      encodeBitRate: 128000,
+      encodeBitRate: 192000,
       format: "mp3",
     } as RecorderManagerStartOptions;
     return mpOptions;
@@ -121,20 +143,20 @@
       duration: duration,
       sampleRate: 44100,
       numberOfChannels: 1,
-      encodeBitRate: 128000,
+      encodeBitRate: 192000,
       format: "mp3",
     } as RecorderManagerStartOptions;
     return fallbackOptions;
   }
 
-  // 构建H5录音参数
+  // 构建H5录音参数（对齐 dev 分支：mp3 + 192000）
   function buildH5RecorderStartOptions(): UTSJSONObject {
     const duration = Math.min(getDuration(), 600000);
     const options = new UTSJSONObject();
     options["duration"] = duration;
     options["sampleRate"] = 44100;
     options["numberOfChannels"] = 1;
-    options["encodeBitRate"] = 128000;
+    options["encodeBitRate"] = 192000;
     options["format"] = "default";
     return options;
   }
@@ -146,22 +168,43 @@
     (e: 'onError', error: any): void
     (e: 'onUploadProgress', progress: number): void
     (e: 'onRecordCancel'): void
-    (e: 'onRecordEnd'): void
+    /** 紫色录音态：父级 isRecording 唯一跟随源 */
+    (e: 'onVisualActive', active: boolean): void
   }>()
 
   // 响应式状态
   const currentState = ref<RecordState>('default')
-  const isCancelled = ref<boolean>(false)
-  // 是否点击
   const isTapped = ref<boolean>(false)
+  /** Android 轻触粘紫：idle 时 bump key 重建节点 */
+  const panelRenderKey = ref<number>(0)
+  /**
+   * 可出波浪线标记：权限已确认（含按下瞬间快检命中 / ensure 授权成功）才允许按下即出录音态。
+   * 避免「未授权时按下 → 授权弹窗期间就出现波浪线」；真正开录（recording）不受此门控。
+   */
+  const recordVisualReady = ref<boolean>(false)
+  /** 本会话已成功授权过麦克风（原生桥路径无同步权限查询，靠此缓存实现「有权限立即出波浪线」） */
+  let recordPermissionCached: boolean = false
   const isRecorderActive = computed((): boolean => {
     return (
       currentState.value == 'recording' ||
-      (currentState.value == 'default' && isTapped.value)
+      (currentState.value == 'default' &&
+        isTapped.value &&
+        recordVisualReady.value)
     );
   })
+  const isUploadingVisual = computed((): boolean => {
+    return currentState.value == 'uploading';
+  })
+  const isRecorderVisualActive = computed((): boolean => {
+    return isRecorderActive.value || isUploadingVisual.value;
+  })
+  const panelBgColor = computed((): string => {
+    return isRecorderVisualActive.value == true
+      ? "rgb(108, 101, 244)"
+      : "#ffffff";
+  })
   const recorderPromptText = computed((): string => {
-    if (currentState.value == 'uploading') {
+    if (isUploadingVisual.value == true) {
       return t("Mobile.Voice.recognizing")
     }
     if (isRecorderActive.value) {
@@ -169,13 +212,37 @@
     }
     return t("Mobile.Voice.holdToTalk")
   })
+
+  watch(isRecorderVisualActive, (active: boolean) => {
+    emit("onVisualActive", active);
+  });
   // 手指在 RecorderManager.onStart 前松开时，忽略随后返回的空录音文件。
   let ignoreNextStopResult: boolean = false
   // iOS 原生 button 在状态切换后可能补发一组紧邻的触摸事件。
   let lastTouchEndAt: number = 0
+  /** 本次按下时间戳；用于短按静默取消（勿 toast） */
+  let pressStartedAtMs: number = 0
+  /** 有效按住阈值：低于此视为轻触，不识别、不报错 */
+  const MIN_HOLD_MS: number = 350
+  /** 两次按住之间的最小间隔，降低连点状态错乱 */
+  const MIN_PRESS_GAP_MS: number = 300
+  // #ifdef APP
+  /** App：ASR 会话已 begin（松手后），等待 asr_ready / 结果 */
+  let asrSessionActive: boolean = false
+  /** App：已发 stop，等待 asr_result */
+  let asrWaitingResult: boolean = false
+  /** 轻触取消 / abort 后：忽略迟到的 ASR onError（避免 asr_error toast） */
+  let suppressAsrError: boolean = false
+  // #endif
   // 音频上传服务
   let audioUploadService: AudioUploader | null = null
   let recorderInitialized: boolean = false
+  /** 原生桥录音 stop 后等待回调的看门狗：原生可能因竞态（权限未回 / onStart 未触发）静默无回调，
+   *  超时强制复位，避免 currentState 卡在 uploading 导致后续录音无法开始。
+   *  原生已改走流式 ASR（录 PCM 推送 + 服务端识别），长录音识别时长可达数十秒，须盖过
+   *  asrWebSocketClient 的 result 超时（60s），否则迟到结果会被 markDiscarded 静默丢弃 */
+  let nativeStopWatchdogTimer: number = 0
+  const NATIVE_STOP_WATCHDOG_MS: number = 70000
   // #ifdef H5 || WEB
   let h5RecorderManager: any | null = null
   // #endif
@@ -193,6 +260,11 @@
   // #endif
 
   function callRecorderStop() {
+    // App web-view 内嵌页：录音由原生侧 RecorderManager 执行
+    if (isNativeBridge() == true) {
+      nativeVoiceBridge.stopRecord()
+      return
+    }
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
       (h5RecorderManager as any).stop()
@@ -206,6 +278,13 @@
   }
 
   function callRecorderStart() {
+    // App web-view 内嵌页：录音由原生侧 RecorderManager 执行
+    if (isNativeBridge() == true) {
+      console.log("[VoiceRecord] start via native bridge")
+      nativeVoiceBridge.startRecord()
+      return
+    }
+    console.log("[VoiceRecord] start via h5 recorder")
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
       (h5RecorderManager as any).start(buildH5RecorderStartOptions())
@@ -214,7 +293,6 @@
     // #ifndef H5
     if (nativeRecorderManager != null) {
       const options = buildNativeRecorderStartOptions();
-      console.log("[VoiceRecord] invoking native RecorderManager.start,开启录音参数：", options);
       nativeRecorderManager!.start(options)
     } else {
       console.error("[VoiceRecord] native RecorderManager is null");
@@ -222,20 +300,171 @@
     // #endif
   }
 
+  /** App 按下录音：轻触感反馈（失败忽略；模拟器/静音/关触感可能无震动） */
+  function vibrateOnRecordPress(): void {
+    // #ifdef APP
+    try {
+      uni.vibrateShort({
+        type: "light",
+        fail: (_err) => {
+          // ignore
+        },
+      })
+    } catch (_eVibrate) {
+      // ignore
+    }
+    // #endif
+  }
+
+  /** 是否已展示「连接中」loading；避免重复 hideLoading 触发 H5 uncaught Promise */
+  let connectingLoadingVisible = false
+
+  function showConnectingLoading(): void {
+    connectingLoadingVisible = true
+    uni.showLoading({
+      title: t("Mobile.Voice.connecting"),
+    })
+  }
+
   // 重置状态
   function hideConnectingLoading(): void {
+    if (connectingLoadingVisible == false) {
+      return
+    }
+    connectingLoadingVisible = false
+    // #ifdef H5 || WEB
+    // H5：无 loading / 已取消时 hideLoading 会 reject，须吞掉，勿只用 try/catch
+    Promise.resolve(uni.hideLoading() as any).then(
+      (): void => {},
+      (): void => {},
+    )
+    // #endif
+    // #ifndef H5 || WEB
     try {
       uni.hideLoading()
     } catch (_e) {
       // ignore
     }
+    // #endif
   }
 
-  function resetState() {
+  /** 标记本轮作废：忽略后续 onStart/onStop/ASR error */
+  function markDiscarded(): void {
+    ignoreNextStopResult = true
+    nativeVoiceBridge.resetRecordSession()
+    // #ifdef APP
+    suppressAsrError = true
+    asrSessionActive = false
+    asrWaitingResult = false
+    asrWebSocketClient.abort()
+    // #endif
+  }
+
+  function clearNativeStopWatchdog(): void {
+    if (nativeStopWatchdogTimer != 0) {
+      clearTimeout(nativeStopWatchdogTimer)
+      nativeStopWatchdogTimer = 0
+    }
+  }
+
+  function resetState(): void {
     hideConnectingLoading()
-    currentState.value = 'default'
-    isCancelled.value = false
     isTapped.value = false
+    currentState.value = 'default'
+    recordVisualReady.value = false
+    clearNativeStopWatchdog()
+    // #ifdef APP
+    asrWaitingResult = false
+    // #endif
+  }
+
+  /** 原生桥看门狗：进入 uploading 后若迟迟等不到 __onNativeRecordStop/Error，强制复位 */
+  function armNativeStopWatchdog(): void {
+    clearNativeStopWatchdog()
+    if (isNativeBridge() != true) {
+      return
+    }
+    nativeStopWatchdogTimer = setTimeout((): void => {
+      nativeStopWatchdogTimer = 0
+      console.warn("[VoiceRecord] 原生桥 stop 回调超时，强制复位（录音可能未真正开始）")
+      markDiscarded()
+      resetState()
+    }, NATIVE_STOP_WATCHDOG_MS) as number
+  }
+
+  /** 仅复位 UI + 通知父级（不改 discard 标记，避免迟到回调再次 mark） */
+  function paintIdleAndNotify(): void {
+    // #ifdef H5 || WEB
+    setH5TouchEndCancelFlag(false)
+    // #endif
+    resetState()
+    panelRenderKey.value = panelRenderKey.value + 1
+    // 状态可能本就 idle，watch 不触发，需显式拉一次
+    emit("onVisualActive", false)
+    emit("onRecordCancel")
+  }
+
+  /** 已 idle 则只补父级；否则完整复位 */
+  function ensureIdlePaint(): void {
+    if (isTapped.value == true || currentState.value != 'default') {
+      paintIdleAndNotify()
+      return
+    }
+    emit("onVisualActive", false)
+  }
+
+  /**
+   * 静默收尾（轻触/取消/良性错误）：
+   * discard → 复位 → bump key 防 Android 粘紫 → 通知父级。
+   */
+  function silentDismiss(): void {
+    markDiscarded()
+    paintIdleAndNotify()
+  }
+
+  /** 未开录或按住过短：停录（若已 start）并静默复位 */
+  function dismissShortHold(): void {
+    markDiscarded()
+    if (currentState.value == 'recording' || currentState.value == 'uploading') {
+      try {
+        callRecorderStop()
+      } catch (_eStop) {
+        // ignore
+      }
+    }
+    paintIdleAndNotify()
+  }
+
+  function holdDurationMs(): number {
+    if (pressStartedAtMs <= 0) {
+      return 0
+    }
+    return Date.now() - pressStartedAtMs
+  }
+
+  /** 轻触 / 系统 Recorder 竞态类错误：不应打扰用户 */
+  function isBenignRecorderError(message: string): boolean {
+    if (message.length == 0) {
+      return false
+    }
+    const lower = message.toLowerCase()
+    if (lower.indexOf("other error") >= 0) {
+      return true
+    }
+    if (lower.indexOf("not start") >= 0 || lower.indexOf("not started") >= 0) {
+      return true
+    }
+    if (lower.indexOf("not recording") >= 0) {
+      return true
+    }
+    if (lower.indexOf("is not recording") >= 0) {
+      return true
+    }
+    // 中文常见：录音未开始就 stop
+    if (message.indexOf("未开始") >= 0 || message.indexOf("没有开始") >= 0) {
+      return true
+    }
+    return false
   }
 
   /** RecorderManager.onError 回调结构（禁止 as UTSJSONObject） */
@@ -306,12 +535,226 @@
     } catch (_eJson) {
       rawError = `${err}`;
     }
-    console.error("[VoiceRecord] recorder error message=" + readErrorMessage(err, "") + " raw=" + rawError);
+    const errText = readErrorMessage(err, "");
+    console.error("[VoiceRecord] recorder error message=" + errText + " raw=" + rawError);
+    // iOS 首次权限等：若仍挂着 overlay 则释放（depth=0 时 end 为空操作）
+    if (pageSystemOverlay.isActive() == true) {
+      pageSystemOverlay.end();
+    }
+    // #ifdef APP
+    asrWebSocketClient.abort()
+    asrSessionActive = false
+    asrWaitingResult = false
+    // #endif
+    // 短按 / 竞态 stop：静默复位，避免「Other errors」打扰
+    if (
+      ignoreNextStopResult == true ||
+      holdDurationMs() < MIN_HOLD_MS ||
+      isBenignRecorderError(errText) == true
+    ) {
+      markDiscarded()
+      ensureIdlePaint()
+      return
+    }
     resetState()
     // #ifdef H5 || WEB
     setH5TouchEndCancelFlag(false)
     // #endif
     emit('onError', normalizeRecorderFail(err))
+  }
+
+  // #ifdef APP
+  function handleAsrResult(text: string, ok: boolean, errorMessage: string): void {
+    asrSessionActive = false
+    asrWaitingResult = false
+    if (suppressAsrError == true || ignoreNextStopResult == true) {
+      suppressAsrError = false
+      ensureIdlePaint()
+      return
+    }
+    if (ok == true && text.length > 0) {
+      currentState.value = "success"
+      emit("onRecordStop", text)
+      resetState()
+    } else {
+      // asr_result 路径已随录随关；勿再 abort
+      // 短按无有效语音：静默；较长按住仍无字才提示
+      if (holdDurationMs() < MIN_HOLD_MS) {
+        silentDismiss()
+        return
+      }
+      const errMsg =
+        errorMessage.length > 0
+          ? errorMessage
+          : t("Mobile.Voice.noSpeechDetected")
+      hideConnectingLoading()
+      resetState()
+      emit("onError", new Error(errMsg))
+    }
+  }
+
+  function handleAsrError(message: string): void {
+    asrSessionActive = false
+    asrWaitingResult = false
+    try {
+      callRecorderStop()
+    } catch (_eStop) {
+      // ignore
+    }
+    // 轻触取消 / 未进入有效识别：绝不走 onError（日志里也不应再冒泡为业务 asr_error）
+    if (
+      suppressAsrError == true ||
+      ignoreNextStopResult == true ||
+      holdDurationMs() < MIN_HOLD_MS
+    ) {
+      suppressAsrError = false
+      console.warn("[VoiceRecord] ignore ASR error after short/cancel: " + message)
+      ensureIdlePaint()
+      return
+    }
+    handleRecordError(new Error(message.length > 0 ? message : t("Mobile.Voice.recordFailed")))
+  }
+
+  /** App：asr_ready 后立刻切帧推完整文件并 finish（须在 begin 之前定义，避免 UTS error18） */
+  function pushRecordedFileThenFinish(tempFilePath: string): void {
+    if (asrSessionActive != true || suppressAsrError == true) {
+      return
+    }
+    currentState.value = "uploading"
+    streamLocalAudioFileToAsr(
+      tempFilePath,
+      (frame: ArrayBuffer): Promise<boolean> => {
+        return asrWebSocketClient.sendPcmAsync(frame)
+      },
+      (ok: boolean) => {
+        if (asrSessionActive != true || suppressAsrError == true) {
+          return
+        }
+        if (ok == true) {
+          asrWaitingResult = true
+          // 略延后 stop，给底层 WS 刷新 binary 的时间
+          setTimeout(() => {
+            if (asrSessionActive != true || suppressAsrError == true) {
+              return
+            }
+            asrWebSocketClient.finish()
+          }, 40)
+        } else {
+          asrWebSocketClient.abort()
+          asrSessionActive = false
+          if (holdDurationMs() < MIN_HOLD_MS || suppressAsrError == true) {
+            silentDismiss()
+            return
+          }
+          handleRecordError(new Error(t("Mobile.AudioUploader.fileEmpty")))
+        }
+      },
+    )
+  }
+
+  /** App：Recorder 真正 onStart 后再 connect 预热（轻触未开录不碰 ASR） */
+  function preheatAppAsrConnect(): void {
+    // ASR 被屏蔽（非 App web-view 内嵌页）：不预热 WS
+    if (suppressAsrError == true || ignoreNextStopResult == true || isAsrEnabled() != true) {
+      return
+    }
+    asrWebSocketClient.preheatConnect()
+  }
+
+  /**
+   * App：松手后再发业务 start → asr_ready → 推完整 PCM。
+   * 轻触 / 已取消：直接静默返回，禁止 begin（否则 abort 后仍可能回调 asr_error）。
+   */
+  function beginAppAsrAndPushFile(tempFilePath: string): void {
+    // ASR 被屏蔽（非 App web-view 内嵌页）：录音静默丢弃，不发起 WS 识别
+    if (isAsrEnabled() != true) {
+      markDiscarded()
+      ensureIdlePaint()
+      return
+    }
+    if (
+      ignoreNextStopResult == true ||
+      suppressAsrError == true ||
+      holdDurationMs() < MIN_HOLD_MS ||
+      tempFilePath.length == 0
+    ) {
+      markDiscarded()
+      ensureIdlePaint()
+      return
+    }
+    suppressAsrError = false
+    asrSessionActive = true
+    asrWaitingResult = false
+    currentState.value = "uploading"
+    asrWebSocketClient.begin(
+      () => {
+        if (asrSessionActive != true || suppressAsrError == true) {
+          return
+        }
+        pushRecordedFileThenFinish(tempFilePath)
+      },
+      (text: string, ok: boolean, errorMessage: string) => {
+        if (suppressAsrError == true) {
+          return
+        }
+        handleAsrResult(text, ok, errorMessage)
+      },
+      (message: string) => {
+        handleAsrError(message)
+      },
+    )
+    // ready 超时在松手后启动（按下预热阶段不挂，避免长按误伤）
+    asrWebSocketClient.watchReadyAfterStop()
+  }
+  // #endif
+
+  /**
+   * 原生桥：录音结束回调（App web-view 内嵌页）。
+   * 原生侧完成录制 + 上传转写后，经 evalJS __onNativeRecordStop 回传转写文本。
+   */
+  function handleNativeRecordStop(
+    success: boolean,
+    text: string,
+    error: string,
+  ): void {
+    clearNativeStopWatchdog()
+    hideConnectingLoading()
+    // 轻触/取消后的迟到回调：UI 多半已复位，勿再 silentDismiss（会二次 mark）
+    if (ignoreNextStopResult == true || holdDurationMs() < MIN_HOLD_MS) {
+      ignoreNextStopResult = false
+      ensureIdlePaint()
+      return
+    }
+    if (success == true && text.length > 0) {
+      currentState.value = "success"
+      emit("onRecordStop", text)
+      resetState()
+      return
+    }
+    // 短按无有效语音：静默；较长按住仍无字才提示
+    if (holdDurationMs() < MIN_HOLD_MS) {
+      silentDismiss()
+      return
+    }
+    const errMsg =
+      error.length > 0 ? error : t("Mobile.Voice.noSpeechDetected")
+    hideConnectingLoading()
+    resetState()
+    emit("onError", new Error(errMsg))
+  }
+
+  /** 原生桥：录音失败回调（权限拒绝 / 原生 Recorder 错误） */
+  function handleNativeRecordError(message: string): void {
+    clearNativeStopWatchdog()
+    hideConnectingLoading()
+    if (ignoreNextStopResult == true || holdDurationMs() < MIN_HOLD_MS) {
+      ignoreNextStopResult = false
+      ensureIdlePaint()
+      return
+    }
+    handleRecordError(
+      new Error(message.length > 0 ? message : t("Mobile.Voice.recordFailed")),
+    )
   }
 
   // 使用audioUploader转换音频
@@ -330,47 +773,45 @@
     }
   }
 
-  // 取消录音
+  // 取消录音（上滑取消等入口复用短按收尾）
   function cancelRecording() {
-    ignoreNextStopResult = true
-    if (currentState.value != 'default') {
-      callRecorderStop()
-    }
-    resetState()
-    // #ifdef H5 || WEB
-    setH5TouchEndCancelFlag(false)
-    // #endif
-    emit('onRecordCancel')
+    dismissShortHold()
   }
 
-  // 停止录音
+  // 停止录音（有效按住）；短按兜底走 dismissShortHold
   function stopRecording() {
-    const neverStarted = currentState.value == 'default'
-    if (neverStarted) {
-      ignoreNextStopResult = true
-      console.log("[VoiceRecord] released before onStart, wait for onStart then stop")
-      resetState()
-      emit('onRecordCancel')
+    if (currentState.value == 'default' || holdDurationMs() < MIN_HOLD_MS) {
+      dismissShortHold()
       return
     }
     try {
+      // 进入识别中，等 onStop 推流/转写；勿立刻 reset
+      currentState.value = "uploading"
+      isTapped.value = false
       callRecorderStop()
-      emit('onRecordEnd')
+      // 原生桥可能静默无回调：起看门狗兜底复位（见 armNativeStopWatchdog）
+      armNativeStopWatchdog()
     } catch (error: any) {
-      // #ifdef H5 || WEB
-      setH5TouchEndCancelFlag(false)
+      // #ifdef APP
+      asrWebSocketClient.abort()
+      asrSessionActive = false
       // #endif
+      if (
+        holdDurationMs() < MIN_HOLD_MS ||
+        isBenignRecorderError(readErrorMessage(error, "")) == true
+      ) {
+        silentDismiss()
+        return
+      }
       currentState.value = 'error'
       emit('onError', normalizeRecorderFail(error))
+      resetState()
     }
-    resetState()
   }
 
   // 录音中结束
   function handleTouchEnd() {
-    console.log('录音中结束handleTouchEnd')
     if (isTapped.value == false && currentState.value == 'default') {
-      console.log("[VoiceRecord] ignored duplicated touchend")
       return
     }
     lastTouchEndAt = Date.now()
@@ -379,16 +820,21 @@
     // #ifdef H5 || WEB
     setH5TouchEndCancelFlag(true)
     // #endif
+    // 轻触（未 onStart / 按住过短）：统一走 dismissShortHold
+    if (currentState.value == 'default' || holdDurationMs() < MIN_HOLD_MS) {
+      dismissShortHold()
+      return
+    }
     isTapped.value = false;
-    // 如果正在上传，则不停止录音
     if (currentState.value == 'uploading') {
       return
     }
-    if (isCancelled.value) {
-      cancelRecording()
-    } else {
-      stopRecording()
+    // #ifdef APP
+    if (asrWaitingResult == true) {
+      return
     }
+    // #endif
+    stopRecording()
   }
 
   /** Android 模拟器短点击偶尔不派发 touchend，使用 click 补齐状态收尾。 */
@@ -396,7 +842,6 @@
     if (isTapped.value == false) {
       return
     }
-    console.log("[VoiceRecord] click fallback dispatches touchend")
     handleTouchEnd()
   }
 
@@ -412,6 +857,29 @@
 
   /** 各端录音权限：uni-app x APP 不支持 uni.getSetting，Android 用 UTSAndroid */
   async function ensureRecordPermission(): Promise<boolean> {
+    // App web-view 内嵌页：按下前先向原生预检授权（首次弹系统授权窗），拿真实结果决定波浪线/引导弹窗
+    if (isNativeBridge() == true) {
+      console.log("[VoiceRecord] ensureRecordPermission -> native round-trip (cached=" + recordPermissionCached + ")")
+      // 本会话已确认授权：直接放行（后续按下立即出波浪线）
+      if (recordPermissionCached == true) {
+        return true
+      }
+      // 系统授权窗可能触发页面 onHide：overlay 标记，避免被当作真实退出
+      pageSystemOverlay.begin("bridge.recordPermission", true)
+      try {
+        const result = await nativeVoiceBridge.requestRecordPermission()
+        if (result.granted == true) {
+          // 仅真实授权成功才缓存：未授权按下不显示波浪线
+          recordPermissionCached = true
+          return true
+        }
+        // 拒绝（iOS 即永久）：返回 false，调用方走引导弹窗去系统设置开启；不缓存
+        return false
+      } finally {
+        pageSystemOverlay.end()
+      }
+    }
+    console.log("[VoiceRecord] ensureRecordPermission -> h5 getUserMedia (nativeBridge=false)")
     // #ifdef APP-ANDROID
     return await new Promise<boolean>((resolve) => {
       const activity = UTSAndroid.getUniActivity();
@@ -424,13 +892,17 @@
         resolve(true);
         return;
       }
+      // 系统权限弹窗会 onHide：标记 overlay
+      pageSystemOverlay.begin("android.recordPermission", true);
       UTSAndroid.requestSystemPermission(
         activity,
         permissionCheck,
         (allGranted: boolean, _granted: string[]) => {
+          pageSystemOverlay.end();
           resolve(allGranted);
         },
         (_doNotAskAgain: boolean, _denied: string[]) => {
+          pageSystemOverlay.end();
           resolve(false);
         },
       );
@@ -445,7 +917,9 @@
     if (authSetting.microphoneAuthorized == "denied") {
       return false;
     }
-    // not determined：首次录音时系统弹窗
+    // not determined：start 时系统才弹窗，可能触发 onHide。
+    // endOnNextShow 兜底；无 hide 的应用内弹窗则在 onStart/onError 里 end。
+    pageSystemOverlay.begin("ios.recordPermission", true);
     return true;
     // #endif
 
@@ -458,10 +932,17 @@
             resolve(true);
             return;
           }
+          pageSystemOverlay.begin("mp.authorize.record");
           uni.authorize({
             scope: "scope.record",
-            success: () => resolve(true),
-            fail: () => resolve(false),
+            success: () => {
+              pageSystemOverlay.end();
+              resolve(true);
+            },
+            fail: () => {
+              pageSystemOverlay.end();
+              resolve(false);
+            },
           });
         },
         fail: () => resolve(false),
@@ -470,25 +951,94 @@
     // #endif
 
     // #ifdef H5 || WEB
-    return await MicrophonePermissionHelper.ensure(false);
+    pageSystemOverlay.begin("h5.micPermission");
+    try {
+      return await MicrophonePermissionHelper.ensure(false);
+    } finally {
+      pageSystemOverlay.end();
+    }
     // #endif
 
     return true;
   }
 
+  /**
+   * 按下瞬间快检权限是否已授权（不弹窗）：
+   * - 已授权 → recordVisualReady=true，立即出波浪线；
+   * - 未授权/不可快检 → false，波浪线延迟到授权成功（ensure 回调）后出现。
+   * App web-view 内嵌页无法同步查原生权限，用本会话授权缓存代替。
+   */
+  async function hasRecordPermissionAlready(): Promise<boolean> {
+    // App web-view 内嵌页：权限由原生侧管理，无同步查询；缓存命中即视为已授权
+    if (isNativeBridge() == true) {
+      return recordPermissionCached;
+    }
+    // #ifdef APP-ANDROID
+    try {
+      const activity = UTSAndroid.getUniActivity();
+      if (activity != null) {
+        return UTSAndroid.checkSystemPermissionGranted(
+          activity,
+          ["android.permission.RECORD_AUDIO"] as string[],
+        );
+      }
+    } catch (_eAndroid) {
+      // ignore
+    }
+    return false;
+    // #endif
+    // #ifdef APP-IOS
+    try {
+      const authSetting = uni.getAppAuthorizeSetting();
+      return authSetting.microphoneAuthorized == "authorized";
+    } catch (_eIos) {
+      return false;
+    }
+    // #endif
+    // #ifdef H5 || WEB
+    // 仅用 permissions.query（不弹窗）；不支持权限 API 时交给 ensure（getUserMedia 弹窗）
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const permission = await navigator.permissions.query({
+          name: "microphone" as PermissionName,
+        });
+        return permission.state == "granted";
+      }
+    } catch (_eH5) {
+      // ignore
+    }
+    return false;
+    // #endif
+    return false;
+  }
+
   function openRecordPermissionSettings(): void {
+    // App web-view 内嵌页：跳系统设置走原生桥（H5 内无法跳原生设置页）
+    if (isNativeBridge() == true) {
+      // 系统设置页会触发页面 onHide：overlay 标记，返回时 endOnNextShow 自动收
+      pageSystemOverlay.begin("bridge.recordSettings", true)
+      nativeVoiceBridge.openPermissionSettings()
+      return
+    }
     // #ifdef APP-ANDROID
     const activity = UTSAndroid.getUniActivity();
     if (activity != null) {
       const permissionNeed = ["android.permission.RECORD_AUDIO"] as string[];
+      pageSystemOverlay.begin("android.permissionSettings", true);
       UTSAndroid.gotoSystemPermissionActivity(activity, permissionNeed);
     }
     // #endif
     // #ifdef APP-IOS
+    pageSystemOverlay.begin("ios.authorizeSetting", true);
     uni.openAppAuthorizeSetting({});
     // #endif
     // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
-    uni.openSetting({});
+    pageSystemOverlay.begin("mp.openSetting");
+    uni.openSetting({
+      complete: () => {
+        pageSystemOverlay.end();
+      },
+    });
     // #endif
     // #ifdef H5 || WEB
     MicrophonePermissionHelper.showGuide();
@@ -511,10 +1061,14 @@
 
   // 开始录音
   async function handleTouchStart(e: UniTouchEvent) {
-    console.log('开始录音handleTouchStart')
+    // #ifdef APP || H5 || WEB || MP-WEIXIN
+    // H5：SSE 流式播报在录音→转写→发送之后才异步播放，离手势很远；
+    // 这里在手指按下的同步阶段先解锁 TTS 音频通道（幂等，复用同一 InnerAudioContext），
+    // 之后 SSE 播放即被移动端浏览器放行。App / 小程序为 no-op。
+    ttsWebSocketPlayer.unlockInGesture()
+    // #endif
     const touchStartAt = Date.now()
-    if (touchStartAt - lastTouchEndAt < 100) {
-      console.log("[VoiceRecord] ignored duplicated touchstart after touchend")
+    if (touchStartAt - lastTouchEndAt < MIN_PRESS_GAP_MS) {
       return
     }
     // #ifdef H5 || WEB
@@ -530,24 +1084,60 @@
       return
     }
 
+    pressStartedAtMs = touchStartAt
     isTapped.value = true;
     ignoreNextStopResult = false;
+    // #ifdef APP
+    suppressAsrError = false
+    // #endif
+    vibrateOnRecordPress()
     emit('onRecordPress')
 
-    uni.showLoading({
-      title: t("Mobile.Voice.connecting"),
-    })
+    // 权限已授权：按下立即出波浪线；未授权：波浪线延迟到授权成功后再出现
+    const permissionAlreadyGranted = await hasRecordPermissionAlready();
+    if (permissionAlreadyGranted == true) {
+      recordVisualReady.value = true
+    }
+
+    // 原生桥且已授权：不必等 onStart 才关 loading（iOS 首帧可能晚到，会空转「正在连接」）
+    if (isNativeBridge() != true || permissionAlreadyGranted != true) {
+      showConnectingLoading()
+    }
 
     const permitted = await ensureRecordPermission();
+    if (permitted == true) {
+      // 本会话授权成功：原生桥等无同步查询的路径后续按下可立即出波浪线
+      recordPermissionCached = true
+    }
+    // 权限等待期间用户已松手：禁止再 start，避免 Other errors / 样式卡死
+    if (isTapped.value != true || ignoreNextStopResult == true) {
+      hideConnectingLoading()
+      markDiscarded()
+      ensureIdlePaint()
+      return
+    }
     if (permitted == false) {
       hideConnectingLoading();
-      resetState();
+      // 只复位样式；权限引导用 Modal，避免再叠一条 toast
+      markDiscarded()
+      paintIdleAndNotify()
       showRecordPermissionModal();
-      emit("onError", new Error(t("Mobile.Voice.permissionRequired")));
       return;
     }
 
+    // 授权成功（可能由 ensure 弹窗流程确认）：此刻起可出波浪线，随后 callRecorderStart
+    if (recordVisualReady.value != true) {
+      recordVisualReady.value = true
+    }
+
     try {
+      // 二次确认：start 前已松手则不开录；TTS/ASR 都推迟到 onStart
+      if (isTapped.value != true || ignoreNextStopResult == true) {
+        hideConnectingLoading()
+        markDiscarded()
+        ensureIdlePaint()
+        return
+      }
       callRecorderStart()
     } catch (error: any) {
       console.error("[VoiceRecord] RecorderManager.start threw message=" + readErrorMessage(error, ""));
@@ -557,16 +1147,48 @@
 
   // 监听录音开始
   function handleRecordStart(_res: any | null) {
-    console.log('[VoiceRecord] onStart received')
-    if (ignoreNextStopResult) {
-      console.log("[VoiceRecord] onStart arrived after release, stopping without upload")
-      callRecorderStop()
-      resetState()
+    // 权限弹窗已过（含 iOS not-determined 无 hide 场景），释放 overlay
+    if (pageSystemOverlay.isActive() == true) {
+      pageSystemOverlay.end();
+    }
+    // 轻触在 onStart 前已松开：不开录、不预热 TTS/ASR
+    if (ignoreNextStopResult == true || isTapped.value != true) {
+      try {
+        callRecorderStop()
+      } catch (_eStop) {
+        // ignore
+      }
+      markDiscarded()
+      ensureIdlePaint()
       return
     }
     hideConnectingLoading()
     // 设置状态，开始录音，并触发事件
     currentState.value = 'recording'
+    // 真正开录后再预热：轻触未走到此处则不会建 TTS/ASR
+    // #ifdef APP || H5 || WEB || MP-WEIXIN
+    // 修复：确认真正开录后，若上一轮 AI 播报仍在跑，先停掉，避免录音与播报抢音频焦点
+    // （App Android 会被抢焦点录到弱音 → no_speech；H5 浏览器会互相打断）。
+    // 仅在播报中才停；无播报则不打断（避免无谓重建预热连接）。
+    const ttsStateAtStart = ttsWebSocketPlayer.getState()
+    const streamBusyAtStart = voiceStreamSpeaker.isBusy()
+    const audioManagerBusyAtStart = audioPlayerManager.getState() == "playing"
+    const speechBusy =
+      ttsStateAtStart == "connecting" ||
+      ttsStateAtStart == "synthesizing" ||
+      ttsStateAtStart == "playing" ||
+      streamBusyAtStart == true ||
+      audioManagerBusyAtStart == true
+    // 诊断：录音瞬间是否仍有 TTS 播报占用音频焦点（排查 no_speech）
+    console.log("[VoiceRecord] onStart ttsState=" + ttsStateAtStart + " streamBusy=" + streamBusyAtStart + " audioMgrBusy=" + audioManagerBusyAtStart);
+    if (speechBusy == true) {
+      stopAllSpeechPlayback()
+    }
+    // #endif
+    // #ifdef APP
+    speechSocketWarmup.preheatTtsForRecording()
+    preheatAppAsrConnect()
+    // #endif
     emit('onRecordStart')
   }
 
@@ -665,59 +1287,80 @@
    */
   function handleRecordStop(res: any | null): void {
     hideConnectingLoading()
-    if (ignoreNextStopResult) {
+    // 轻触/取消后的迟到 onStop：UI 多半已复位，勿再 silentDismiss（会二次 mark）
+    if (ignoreNextStopResult == true || holdDurationMs() < MIN_HOLD_MS) {
       ignoreNextStopResult = false
-      console.log("[VoiceRecord] ignored empty/cancelled stop result")
-      resetState()
+      // #ifdef APP
+      asrWebSocketClient.abort()
+      asrSessionActive = false
+      // #endif
+      ensureIdlePaint()
       return
     }
-    if (res == null) return;
+    if (res == null) {
+      silentDismiss()
+      return
+    }
     let rawStopResult = ""
     try {
       rawStopResult = JSON.stringify(res) ?? ""
     } catch (_eJson) {
       rawStopResult = `${res}`
     }
-    console.log("[VoiceRecord] onStop result=" + rawStopResult)
 
-    // 录音总时长：H5 为秒；小程序/APP 原生为毫秒
-    let duration = readRecorderStopNumber(res, "duration", 0);
-
-    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ || APP
-    duration = duration / 1000;
-    // #endif
-
-    const fileSize = readRecorderStopNumber(res, "fileSize", 0);
     const tempFilePath = readRecorderStopString(res, "tempFilePath");
-    let formatStr = readRecorderStopString(res, "format");
-    if (formatStr.length == 0) {
-      const dotIndex = tempFilePath.lastIndexOf(".");
-      formatStr = dotIndex >= 0 ? tempFilePath.slice(dotIndex + 1).toLowerCase() : "mp3";
-    }
     if (tempFilePath.length == 0) {
       handleRecordError(new Error(t("Mobile.Voice.recordFailed")));
       return;
     }
 
+    // #ifdef APP
+    // App：松手后再 start → ready → 立刻推完整 PCM（避免按住期间服务端空等截断长句）
+    beginAppAsrAndPushFile(tempFilePath)
+    // #endif
+
+    // #ifndef APP
+    // H5 / 小程序：上传文件转写
+    let duration = readRecorderStopNumber(res, "duration", 0);
+    // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+    duration = duration / 1000;
+    // #endif
+    const fileSize = readRecorderStopNumber(res, "fileSize", 0);
+    let formatStr = readRecorderStopString(res, "format");
+    if (formatStr.length == 0) {
+      const dotIndex = tempFilePath.lastIndexOf(".");
+      formatStr = dotIndex >= 0 ? tempFilePath.slice(dotIndex + 1).toLowerCase() : "mp3";
+    }
     const audioFile = new UploaderAudioFile(
       tempFilePath,
       duration,
       fileSize,
       formatStr,
     );
-
-    // 重置触摸结束取消录音标志
     // #ifdef H5 || WEB
     setH5TouchEndCancelFlag(false)
     // #endif
-
-    // 立即显示上传中状态，给用户明确反馈
     currentState.value = 'uploading'
-
     runUploadAfterStop(audioFile)
+    // #endif
   }
 
   function bindRecorderEvents() {
+    // App web-view 内嵌页：结果经原生桥回调（evalJS 注入的全局函数）
+    if (isNativeBridge() == true) {
+      nativeVoiceBridge.setRecordHandlers(
+        (): void => {
+          handleRecordStart(null)
+        },
+        (success: boolean, text: string, error: string): void => {
+          handleNativeRecordStop(success, text, error)
+        },
+        (message: string): void => {
+          handleNativeRecordError(message)
+        },
+      )
+      return
+    }
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
       (h5RecorderManager as any).onStart(handleRecordStart)
@@ -735,11 +1378,24 @@
   }
 
   function unbindRecorderEvents() {
+    // App web-view 内嵌页：解绑原生桥回调
+    if (isNativeBridge() == true) {
+      nativeVoiceBridge.setRecordHandlers(null, null, null)
+      return
+    }
     // #ifdef H5 || WEB
     if (h5RecorderManager != null) {
-      (h5RecorderManager as any).offStart(handleRecordStart)
-      ;(h5RecorderManager as any).offStop(handleRecordStop)
-      ;(h5RecorderManager as any).offError(handleRecordError)
+      const rm = h5RecorderManager as any
+      // jz-h5-recorder 早期版本可能缺少部分 off*，逐个防护
+      if (typeof rm.offStart == "function") {
+        rm.offStart(handleRecordStart)
+      }
+      if (typeof rm.offStop == "function") {
+        rm.offStop(handleRecordStop)
+      }
+      if (typeof rm.offError == "function") {
+        rm.offError(handleRecordError)
+      }
     }
     // #endif
     // #ifndef H5
@@ -756,6 +1412,11 @@
       return
     }
     recorderInitialized = true
+    // App web-view 内嵌页：不创建 H5 jzRecorder，录音走原生桥
+    if (isNativeBridge() == true) {
+      bindRecorderEvents()
+      return
+    }
     // #ifdef H5 || WEB
     h5RecorderManager = jzRecorder.getRecorderManager()
     // #endif
@@ -774,7 +1435,16 @@
       return
     }
     recorderInitialized = false
+    const needNotifyIdle =
+      isTapped.value == true ||
+      currentState.value == "recording" ||
+      currentState.value == "uploading"
+    markDiscarded()
     resetState()
+    if (needNotifyIdle == true) {
+      emit("onVisualActive", false)
+      emit("onRecordCancel")
+    }
     unbindRecorderEvents()
     // #ifdef H5 || WEB
     h5RecorderManager = null
@@ -829,22 +1499,16 @@
     align-items: center;
     justify-content: center;
     height: 90rpx;
-    // height: 112rpx;
     border-radius: 24rpx;
     transition: all 0.15s ease;
     /* #ifndef APP */
     -webkit-touch-callout: none;
     /* #endif */
-    color: #000;
-    font-size: 32rpx;
-    font-weight: 400;
+    /* App：color/font-* /line-height 不能写在 view 上，只能写在内部 text */
     background-color: #ffffff;
     margin: 0;
-    padding: 0; // 删除uni-button默认padding
-    line-height: normal;
-    /* #ifdef APP-IOS */
-    line-height: 90rpx;
-    /* #endif */
+    padding: 0;
+    box-sizing: border-box;
     /* #ifndef APP */
     user-select: none;
     -webkit-user-select: none;
@@ -852,33 +1516,27 @@
     /* #endif */
     border: none;
 
-    &::after {
-      border: none !important;
-    }
-
     .voice-recorder-prompt-text {
       width: 100%;
       height: 90rpx;
       line-height: 90rpx;
+      display: flex;
+      flex-direction: row;
       align-self: center;
-      text-align: center;
+      justify-content: center;
       font-size: 32rpx;
+      font-weight: 400;
       color: #000000;
-    }
 
-    &.is-recording {
-      background-color: rgb(108, 101, 244);
-      z-index: 100;
-
-      .voice-recorder-prompt-text {
+      &.is-active-text {
         color: #ffffff;
       }
     }
 
+    &.is-recording,
     &.is-uploading {
-      .voice-recorder-prompt-text {
-        color: #666666;
-      }
+      /* 底色以 :style 为准；此处仅抬层级 */
+      z-index: 1;
     }
   }
 </style>

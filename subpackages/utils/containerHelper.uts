@@ -4,6 +4,11 @@
  */
 
 import { orEmpty } from "@/utils/utsCoalesce.uts";
+import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+import {
+  coerceOpenUiToolCallType,
+  tryAppendOpenUiProcessHtml,
+} from "@/subpackages/utils/containerOpenUi.uts";
 
 /** 工具调用自定义块属性 */
 export interface ToolCallBlockData {
@@ -48,46 +53,277 @@ export function getBlockName(): string {
   return `container`;
 }
 
+/** 安全读字符串：兼容 App 端 Map / UTSJSONObject，禁止 typeof==="string" */
+function readToolFieldString(raw: any | null, key: string): string {
+  const val = readRawField(raw, key);
+  if (val == null) {
+    return "";
+  }
+  return `${val}`;
+}
+
 /**
- * 生成工具调用自定义块
- * @param beforeText 之前的文本内容
- * @param toolCallData 工具调用数据
- * @returns 包含自定义块的完整文本
+ * 将 PROCESSING 事件规范为顶层含 executeId/status/type 的对象。
+ * App SSE 常把这些字段放在 result 内；若不提升，processingList 无法按 executeId 匹配，
+ * 卡片会一直读标签上的 EXECUTING，重进历史页才显示 FINISHED。
+ */
+export function normalizeToolCallProcessingData(toolCallData: any): UTSJSONObject {
+  const out = new UTSJSONObject();
+  if (toolCallData == null) {
+    return out;
+  }
+
+  // 尽量保留原始顶层字段（含 cardBindConfig 等）
+  try {
+    const keys = UTSJSONObject.keys(toolCallData as UTSJSONObject);
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      const value = readRawField(toolCallData, key);
+      if (value != null) {
+        out[key] = value;
+      }
+    }
+  } catch (_eKeys) {
+    // Map / 类实例：按字段逐个提升
+  }
+
+  let type = readToolFieldString(toolCallData, "type");
+  let executeId = readToolFieldString(toolCallData, "executeId");
+  let status = readToolFieldString(toolCallData, "status");
+  let name = readToolFieldString(toolCallData, "name");
+  const resultVal = readRawField(toolCallData, "result");
+  if (resultVal != null) {
+    out["result"] = resultVal;
+    if (executeId.length == 0) {
+      executeId = readToolFieldString(resultVal, "executeId");
+    }
+    if (name.length == 0) {
+      name = readToolFieldString(resultVal, "name");
+    }
+    if (status.length == 0) {
+      status = readToolFieldString(resultVal, "status");
+    }
+    if (type.length == 0) {
+      type = readToolFieldString(resultVal, "type");
+    }
+  }
+  if (type.length > 0) {
+    out["type"] = type;
+  }
+  if (executeId.length > 0) {
+    out["executeId"] = executeId;
+  }
+  if (status.length > 0) {
+    out["status"] = status;
+  }
+  if (name.length > 0) {
+    out["name"] = name;
+  }
+  return out;
+}
+
+/**
+ * 同 executeId 时是否应用新状态（对齐 PC shouldReplaceProcessingItem）。
+ * 优先级：FINISHED > FAILED > EXECUTING。
+ */
+export function shouldReplaceToolCallProcessing(
+  existingStatus: string,
+  nextStatus: string,
+): boolean {
+  if (existingStatus.length == 0) {
+    return nextStatus.length > 0;
+  }
+  if (nextStatus.length == 0) {
+    return false;
+  }
+  if (existingStatus == "EXECUTING" && nextStatus != "EXECUTING") {
+    return true;
+  }
+  if (existingStatus == "FAILED" && nextStatus == "FINISHED") {
+    return true;
+  }
+  if (existingStatus == "FINISHED" && nextStatus == "FAILED") {
+    return false;
+  }
+  // 同状态 / 其它组合：不替换（避免 FINISHED 重复 PROCESSING 每秒空刷 Android UI）
+  return false;
+}
+
+/**
+ * processingList 轻量指纹：用于判断 UI 是否需要刷新。
+ * 只取影响工具卡展示的字段，避免 result 大对象引用抖动。
+ */
+export function toolCallProcessingListFingerprint(list: any[]): string {
+  if (list == null || list.length == 0) {
+    return "";
+  }
+  let fp = "";
+  for (let i = 0; i < list.length; i++) {
+    const norm = normalizeToolCallProcessingData(list[i]);
+    fp +=
+      readToolFieldString(norm, "executeId") +
+      "|" +
+      readToolFieldString(norm, "status") +
+      "|" +
+      readToolFieldString(norm, "type") +
+      "|" +
+      readToolFieldString(norm, "name") +
+      ";";
+  }
+  return fp;
+}
+
+/**
+ * 按 executeId 合并 PROCESSING 列表，终态覆盖执行中。
+ * @returns 若与 oldList 展示态一致则直接返回 oldList（保持引用，避免 Vue watch 空触发）
+ */
+export function upsertToolCallProcessingList(
+  oldList: any[],
+  nextItem: any,
+): any[] {
+  const normalized = normalizeToolCallProcessingData(nextItem);
+  const nextId = readToolFieldString(normalized, "executeId");
+  const nextStatus = readToolFieldString(normalized, "status");
+  const out: any[] = [];
+  let replaced = false;
+  let mutated = false;
+  for (let i = 0; i < oldList.length; i++) {
+    const oldItem = oldList[i];
+    const oldNorm = normalizeToolCallProcessingData(oldItem);
+    const oldId = readToolFieldString(oldNorm, "executeId");
+    if (nextId.length > 0 && oldId == nextId) {
+      const oldStatus = readToolFieldString(oldNorm, "status");
+      if (shouldReplaceToolCallProcessing(oldStatus, nextStatus)) {
+        out.push(normalized);
+        mutated = true;
+      } else {
+        out.push(oldNorm);
+      }
+      replaced = true;
+    } else {
+      out.push(oldNorm);
+    }
+  }
+  if (!replaced) {
+    out.push(normalized);
+    mutated = true;
+  }
+  if (mutated != true) {
+    return oldList;
+  }
+  return out;
+}
+
+/**
+ * 更新已有容器块上的 status 属性（同 executeId 不重复插入时用）。
+ * 同时兼容 :::container 的 executeId= 与 HTML 标签的 executeid=。
+ */
+function updateExistingBlockStatus(
+  beforeText: string,
+  executeId: string,
+  status: string,
+): string {
+  if (status.length == 0) {
+    return beforeText;
+  }
+  let marker = `executeId="${executeId}"`;
+  let markerIdx = beforeText.indexOf(marker);
+  if (markerIdx < 0) {
+    marker = `executeid="${executeId}"`;
+    markerIdx = beforeText.indexOf(marker);
+  }
+  if (markerIdx < 0) {
+    return beforeText;
+  }
+  // 同一标签内 status 通常紧跟 executeId/type；限制搜索窗口避免误改其它块
+  const windowEnd = markerIdx + 240;
+  const end = windowEnd < beforeText.length ? windowEnd : beforeText.length;
+  const slice = beforeText.substring(markerIdx, end);
+  const statusKey = 'status="';
+  const statusRel = slice.indexOf(statusKey);
+  if (statusRel < 0) {
+    return beforeText;
+  }
+  const valueStart = markerIdx + statusRel + statusKey.length;
+  const valueEnd = beforeText.indexOf('"', valueStart);
+  if (valueEnd <= valueStart) {
+    return beforeText;
+  }
+  const oldStatus = beforeText.substring(valueStart, valueEnd);
+  if (oldStatus == status) {
+    return beforeText;
+  }
+  return (
+    beforeText.substring(0, valueStart) +
+    status +
+    beforeText.substring(valueEnd)
+  );
+}
+
+/**
+ * 生成工具调用自定义块。
+ * App（尤其 iOS）：PROCESSING data 常为 Map，且 executeId 在 result 内；
+ * 旧逻辑 `as UTSJSONObject` + `typeof === "string"` 会导致 type/executeId 为空，
+ * 容器块写不进正文 → 工具调用 UI 不渲染（日志里 PROCESSING 的 textLen 一直为 0）。
  */
 export function getCustomBlock(
   beforeText: string,
   toolCallData: any,
 ): string {
-  const dataObj = toolCallData as UTSJSONObject;
-  const typeVal = dataObj["type"];
-  const executeIdVal = dataObj["executeId"];
-  const type =
-    typeVal != null && typeof typeVal === "string" ? (typeVal as string) : "";
-  const executeId =
-    executeIdVal != null && typeof executeIdVal === "string"
-      ? (executeIdVal as string)
-      : "";
+  if (toolCallData == null) {
+    return beforeText;
+  }
+
+  const normalized = normalizeToolCallProcessingData(toolCallData);
+  let type = readToolFieldString(normalized, "type");
+  const executeId = readToolFieldString(normalized, "executeId");
+  const status = readToolFieldString(normalized, "status");
+  const name = readToolFieldString(normalized, "name");
+
+  // OpenUI Event → ToolCall（详见 containerOpenUi）
+  type = coerceOpenUiToolCallType(name, type);
 
   // 如果 type 或 executeId 不存在，则返回原文本
   if (type.length === 0 || executeId.length === 0) {
+    console.warn(
+      "[ToolCall] skip container: type=",
+      type,
+      "executeIdLen=",
+      executeId.length,
+      "name=",
+      name,
+    );
     return beforeText;
+  }
+
+  const hasBlock =
+    beforeText.includes(`executeId="${executeId}"`) ||
+    beforeText.includes(`executeid="${executeId}"`);
+
+  if (hasBlock) {
+    // 已存在同 executeId 块：更新 status，避免标签长期停在 EXECUTING
+    return updateExistingBlockStatus(beforeText, executeId, status);
+  }
+
+  // OpenUI：扁平 HTML；其它工具：:::container
+  const openUiAppended = tryAppendOpenUiProcessHtml(
+    beforeText,
+    executeId,
+    type,
+    status,
+    name,
+  );
+  if (openUiAppended.length > 0) {
+    return openUiAppended;
   }
 
   const blockName = getBlockName();
-  const hasBlock = beforeText.includes(`executeId="${executeId}"`);
-
-  if (hasBlock) {
-    // 如果已经存在相同的执行ID，则不重复添加
-    return beforeText;
-  }
-
   const blockData = new UTSJSONObject();
-  blockData["executeId"] = executeId as any;
-  blockData["type"] = type as any;
-  blockData["status"] = orEmpty(dataObj["status"]);
-  blockData["name"] = orEmpty(dataObj["name"]);
+  blockData["executeId"] = executeId;
+  blockData["type"] = type;
+  blockData["status"] = orEmpty(status);
+  blockData["name"] = orEmpty(name);
   const blockContent = getBlockWrapper(blockName, blockData);
 
   return `${beforeText}${blockContent}`;
 }
-

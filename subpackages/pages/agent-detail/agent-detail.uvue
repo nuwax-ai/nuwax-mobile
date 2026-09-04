@@ -1,5 +1,35 @@
 <template>
+	<!-- #ifndef APP -->
+	<!-- 非 App 端（H5 / 小程序）：原生渲染聊天会话组件 -->
 	<chat-conversation-component ref="chatConversationComponentRef" />
+	<!-- #endif -->
+	<!-- #ifdef APP -->
+	<!-- #ifdef APP-IOS -->
+	<!-- iOS：聊天已迁至首页常驻 web-view 壳（resident-chat-shell）。
+	     若仍有旧链接 navigateTo 本页，则转开常驻壳并回到首页 Tab，避免再创建/销毁 WKWebView。 -->
+	<view class="app-redirect-placeholder"></view>
+	<!-- #endif -->
+	<!-- #ifndef APP-IOS -->
+	<!-- App 端（Android / 鸿蒙）：通过 web-view 内嵌 H5 同页（H5 侧渲染聊天组件），透传当前页 agentId / conversationId。
+	     webview 全屏铺满（含状态栏/刘海区域），顶部刘海由内嵌 H5 的 custom-nav-bar 内部
+	     safety-zone 依据 URL fragment 注入的 statusBarHeight 自行占位（原生不再加 status-bar-spacer）。 -->
+	<view class="app-webview-root">
+		<web-view
+			id="agent-detail-webview"
+			class="webview-fill"
+			v-if="webViewAlive"
+			:src="agentDetailWebUrl"
+			@load="handleWebViewLoad"
+			@message="handleWebViewMessage"
+			:bounces="false"
+			:android-nested-scroll="'none'"
+		/>
+		<!-- 不可见 sibling 占位（勿删）：Android 上页面仅有 web-view 单节点时走全屏原生层，
+		     createWebviewContext 拿不到 context，evalJS 注入失效；该占位使 web-view 保持普通节点模式。 -->
+		<view class="webview-node-placeholder" />
+	</view>
+	<!-- #endif -->
+	<!-- #endif -->
 </template>
 
 <script setup lang="uts">
@@ -7,9 +37,2540 @@
 	import { ref, onUnmounted, getCurrentInstance, type ComponentPublicInstance } from 'vue'
 	import { getCurrentPageFullPath } from '@/utils/common'
 	import { onAddToFavorites, onShow, onHide, onShareAppMessage } from '@dcloudio/uni-app'
+	import { useI18n, emptyI18nParams } from '@/utils/i18n'
+	// #ifdef APP-IOS
+	// iOS：本页仅作旧链接兜底，转开首页常驻壳
+	import { onLoad } from '@dcloudio/uni-app'
+	import { openResidentChat } from '@/utils/residentChatShell'
+	// #endif
+	// #ifdef APP
+	// #ifndef APP-IOS
+	import { onLoad, onBackPress } from '@dcloudio/uni-app'
+	import { getApiBaseUrl } from '@/constants/config'
+	import { ACCESS_TOKEN } from '@/constants/home.constants'
+	import { getUploadFileAction } from '@/constants/common.constants'
+	import { getStatusBarHeight, openExternalLinkPage } from '@/utils/system.uts'
+	import { consumeLatestPendingOpenUiAction } from '@/utils/pendingOpenUiAction.uts'
+	import {
+		acknowledgeAppNativePayResult,
+		beginAppNativePaySession,
+		checkActiveAppPayResult,
+		getStoredAppNativePayResult,
+		launchAppNativePayRedirect,
+		requestAppNativePayRedirect,
+		storeAppNativePayResult,
+	} from '@/subpackages/utils/paymentUtils.uts'
+	// App web-view 内嵌页原生语音：录音（RecorderManager + 流式 ASR 转写）与 TTS 播报
+	import { voiceStreamSpeaker } from '@/subpackages/utils/voice/voiceStreamSpeaker'
+	import {
+		ttsWebSocketPlayer,
+		type TtsPlaybackState,
+	} from '@/subpackages/utils/voice/ttsWebSocketPlayer'
+	import { audioPlayerManager } from '@/subpackages/utils/voice/audioPlayerManager'
+	import { stopAllSpeechPlayback } from '@/subpackages/utils/voice/stopAllSpeechPlayback'
+	import { VoiceSettings } from '@/subpackages/utils/voice/voiceTypes'
+	// 流式 ASR（与 TTS 同一套 WS 基建）：内嵌页录音走 PCM→WS 转写，不再 HTTP 上传音频文件
+	import {
+		asrWebSocketClient,
+		ASR_SAMPLE_RATE,
+	} from '@/subpackages/utils/voice/asrWebSocketClient'
+	import { streamLocalAudioFileToAsrFrom } from '@/subpackages/utils/voice/pcmStreamRecorder'
+	// 实时推流管道（边说边传）：VAD + 预滚 + packetizer + sentBytes
+	import { NativeStreamAsrPipeline } from '@/subpackages/utils/voice/nativeStreamAsrPipeline'
+	// 文件树「下载全部」：内嵌 H5 改走原生下载（下载到系统公共目录）
+	import { downloadFileInApp } from '@/subpackages/utils/fileTree'
+	import { savePreviewImageToAlbumInApp } from '@/utils/appWebViewImagePreview.uts'
+	// Android 内嵌 H5 字体放大修复：强制 webview textZoom = 100%
+	import { fixAppWebviewTextZoom } from '@/subpackages/utils/webviewTextZoom'
+	// App 三端原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发，边说边传 ASR）
+	import { StreamPcmRecorder } from '@/uni_modules/nuwax-stream-pcm-player'
+	// #endif
+	// #endif
+	// #ifdef APP-HARMONY
+	// 鸿蒙专属：录音权限被永久拒绝时跳转应用权限设置页
+	import { openHarmonyMicPermissionSettings } from '@/uni_modules/nuwax-stream-pcm-player'
+	// #endif
 
 	const instance = getCurrentInstance()
 	const chatConversationComponentRef = ref<any | null>(null)
+
+	const { t: tFn } = useI18n()
+	const t = (key: string): string => tFn(key, emptyI18nParams(), "")
+	// 分享标题兜底（MP 分享/收藏用）
+	const name = t('Mobile.Common.appName')
+
+	// #ifdef APP
+	// #ifndef APP-IOS
+	/** App 端 web-view 加载的 H5 同页地址，形如 {API_BASE_URL}/m/#/subpackages/pages/agent-detail/agent-detail?id=xxx&conversationId=yyy&accessToken=xxx */
+	const agentDetailWebUrl = ref<string>("")
+	/** iOS 26 WKWebView 释放竞态缓解：退出页面前先卸载 web-view 节点（v-if），
+	 *  延时后再执行真实导航，把 webview 销毁从页面栈 pop 的关键路径上摘出来。 */
+	const webViewAlive = ref<boolean>(true)
+	/** @load 后注入短轮询定时器 / 次数 / 成功上报标记 */
+	let appWebViewBridgeTimer: number = 0
+	let appWebViewBridgeAttempts: number = 0
+	let appWebViewBridgeReported: boolean = false
+	/** 已创建的 webview context 缓存：原生语音桥 evalJS 回传与注入共用 */
+	let appWebViewBridgeContext: WebviewContext | null = null
+	/** H5 内嵌页是否正有弹窗打开（由 H5 postMessage 同步，onBackPress 拦截用） */
+	let appWebViewPopupOpen: boolean = false
+	/** 原生侧键盘高度监听 id（onKeyboardHeightChange 返回值），桥接给内嵌 H5 */
+	let appKeyboardHeightListenerId: number = 0
+	/** 最近一次键盘高度：webview 未就绪时随注入轮询补发（默认 0 = 键盘收起） */
+	let latestInjectedKeyboardHeight: number = 0
+	/** 底部手势条/导航条高度（safeAreaInsets.bottom）：onKeyboardHeightChange 兜底值归一化为完整 IME 时使用 */
+	let latestInjectedSafeAreaBottom: number = 0
+	/** 防止多次 onShow 并发核对同一笔支付订单。 */
+	let nativePayResultChecking: boolean = false
+
+	/**
+	 * 直接读 WindowInsets 的 IME 高度（device px → css px）。
+	 * 本环境实测：uni.onKeyboardHeightChange 恒 0、H5 innerHeight/visualViewport 不随键盘变化——
+	 * 键盘以覆盖层形式出现且不被任何 resize 反映，WindowInsets 的 IME insets 在 API 30+ 上
+	 * 与 softInputMode 无关地派发，是唯一可靠读数。
+	 */
+	function readAndroidImeHeight(): number {
+		try {
+			const activity = UTSAndroid.getUniActivity()
+			if (activity == null) {
+				return 0
+			}
+			const win = activity.getWindow()
+			if (win == null) {
+				return 0
+			}
+			const decor = win.getDecorView()
+			if (decor == null) {
+				return 0
+			}
+			const insets = decor.getRootWindowInsets()
+			if (insets == null) {
+				return 0
+			}
+			// WindowInsets.Type.ime() = 1 << 3 = 8（API 30+）；返回值是 Insets，取 bottom 字段
+			const ime = insets.getInsets(8)
+			if (ime == null) {
+				return 0
+			}
+			const px = ime.bottom
+			if (px <= 0) {
+				return 0
+			}
+			// device px → css px（与 uni-app x 键盘监听一致的换算）
+			const css = UTSAndroid.devicePX2px(px)
+			return css > 0 ? css : 0
+		} catch (_eIme) {
+			// ignore
+		}
+		return 0
+	}
+
+	/**
+	 * 读取原生底部安全区（手势条）。全平台通用；H5 env() 在鸿蒙 WebView/模拟器不可靠。
+	 */
+	function readNativeSafeAreaBottom(): number {
+		let bottom = 0
+		try {
+			const sysInfo = uni.getSystemInfoSync()
+			const safeInset = sysInfo.safeAreaInsets
+			if (safeInset != null && safeInset.bottom != null) {
+				bottom = safeInset.bottom as number
+			}
+		} catch (_eInset) {
+			// ignore
+		}
+		return bottom > 0 ? bottom : 0
+	}
+
+	/**
+	 * 读取 Android 底部手势条/导航条高度（safe-area-inset-bottom）。
+	 * 全屏 webview 下 H5 无法可靠读取（env() 通常为 0），由原生侧读取并注入。
+	 */
+	function readAndroidSafeAreaBottom(): number {
+		return readNativeSafeAreaBottom()
+	}
+
+	/**
+	 * 幂等注入脚本：uni.webview JSSDK（网页 → 原生 postMessage 桥）+ ticket cookie
+	 * + localStorage 的 ACCESS_TOKEN + 内嵌标记方法。
+	 * JSSDK 与既有 uni-app H5 运行时会合并（保留现有 uni 全局），仅内嵌 App web-view 时生效。
+	 * 脚本随 H5 构建发布在 static/ 下（相对路径 ./static/... 按文档 base 解析，
+	 * 部署在 /m/ 或根路径都能命中），不依赖线上 nginx 根 /static/ 目录。
+	 */
+	function buildBridgeCode(tokenLiteral: string): string {
+		return `try{if(!window.uni||!uni.webView){var s=document.createElement('script');s.src='./static/uni.webview.1.5.5.js';document.head.appendChild(s);}}catch(e){}try{document.cookie='ticket='+${tokenLiteral}+'; path=/';}catch(e){} try{localStorage.setItem('ACCESS_TOKEN',${tokenLiteral});}catch(e){} window.__nuwaxSetAppEmbedded && window.__nuwaxSetAppEmbedded();`
+	}
+
+	/**
+	 * 生成键盘高度注入脚本（字符串拼接，避免 UTS 模板字符串误解析 {}）。
+	 * @param withDomFix iOS/鸿蒙为 true 时：安装 focus 跟手抬升 + 用桥接终值校正；
+	 *   桥接轮询传 false（仍安装 focus 预测逻辑，但不按终值改 cover，避免刷屏）。
+	 */
+	function buildKeyboardHeightInjectCode(
+		h: number,
+		safeBottom: number,
+		withDomFix: boolean,
+	): string {
+		const heightNum = `${Math.round(h)}`
+		const safeBottomNum = `${Math.round(safeBottom)}`
+		let cachedLastH = 0
+		try {
+			const raw = uni.getStorageSync("NUWAX_KB_LAST_H")
+			if (raw != null) {
+				const n = parseFloat(`${raw}`)
+				if (!isNaN(n) && n > 0) {
+					cachedLastH = n
+				}
+			}
+		} catch (_eCache) {
+			// ignore
+		}
+		if (cachedLastH <= 0 && latestInjectedKeyboardHeight > 0) {
+			cachedLastH = latestInjectedKeyboardHeight
+		}
+		const cachedLastNum = `${Math.round(cachedLastH)}`
+		let platform = "unknown"
+		// #ifdef APP-ANDROID
+		platform = "android"
+		// #endif
+		// #ifdef APP-IOS
+		platform = "ios"
+		// #endif
+		// #ifdef APP-HARMONY
+		platform = "harmony"
+		// #endif
+
+		// 基础：写全局 + CSS 变量（H5 env(safe-area-inset-bottom) 在鸿蒙 WebView/模拟器常虚高）
+		// + 派发事件
+		let code =
+			"(function(){try{window.__nuwaxKeyboardHeight=" +
+			heightNum +
+			";window.__nuwaxSafeAreaBottom=" +
+			safeBottomNum +
+			";try{document.documentElement.style.setProperty('--nuwax-safe-area-bottom','" +
+			safeBottomNum +
+			"px');}catch(_css){}window.__nuwaxKbPlatform='" +
+			platform +
+			"';window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:" +
+			heightNum +
+			",safeAreaBottom:" +
+			safeBottomNum +
+			",platform:'" +
+			platform +
+			"'}}));}catch(e){}"
+
+		// #ifdef APP-IOS || APP-HARMONY
+		// 首次：无缓存时系统可能先 pan（整页跟键盘），桥接终值再垫 cover →「底部晚出现」。
+		// 再次：有 LastH，focusin 立刻抬 cover+锁滚，不再依赖系统 pan。
+		// 此处：尽早恢复 LastH；桥接终值若 cover 仍为 0 则瞬间校正（禁止晚到的 0→h 动画）。
+		code =
+			code +
+			"try{window.__nuwaxKbCoverTrans='height 0.25s cubic-bezier(0.2,0.9,0.2,1)';try{if(!(window.__nuwaxKbLastH>0)){var __ls=localStorage.getItem('__nuwaxKbLastH');if(__ls){var __ln=parseFloat(__ls);if(!isNaN(__ln)&&__ln>0)window.__nuwaxKbLastH=__ln;}}}catch(_ls){}if(!(window.__nuwaxKbLastH>0)&&" +
+			cachedLastNum +
+			">0){window.__nuwaxKbLastH=" +
+			cachedLastNum +
+			";}window.__nuwaxKbDefaultH=Math.max(300,Math.round((window.innerHeight||700)*0.475));window.__nuwaxKbPersistLast=function(h){try{if(h>0){window.__nuwaxKbLastH=h;localStorage.setItem('__nuwaxKbLastH',''+Math.round(h));}}catch(_p){}};window.__nuwaxKbResolveCover=function(h){try{if(!(h>0))return 0;var plat=window.__nuwaxKbPlatform||'';if(plat!=='harmony'&&plat!=='ios')return h;var top=0;var vv=window.visualViewport;if(vv&&vv.offsetTop!=null&&vv.offsetTop>2)top=vv.offsetTop;if(top>2){var next=h-top;return next>2?Math.round(next):0;}return h;}catch(_rc){return h>0?h:0;}};window.__nuwaxKbApplyCover=function(h,anim){try{var cover=window.__nuwaxKbResolveCover?window.__nuwaxKbResolveCover(h):(h>0?h:0);var covers=document.querySelectorAll('.keyboard-cover');for(var i=0;i<covers.length;i++){covers[i].style.setProperty('transition','none','important');covers[i].style.setProperty('transform','none','important');covers[i].style.setProperty('height',(cover>0?cover:0)+'px','important');}}catch(_a){}};window.__nuwaxKbSyncCoverFromVv=function(){try{var ih=window.__nuwaxKeyboardHeight||0;if(window.__nuwaxKbApplyCover)window.__nuwaxKbApplyCover(ih,false);}catch(_sv){}};window.__nuwaxKbSyncNav=function(){try{var navs=document.querySelectorAll('.layout-fixed');for(var j=0;j<navs.length;j++){navs[j].style.setProperty('transition','none','important');navs[j].style.top='0px';navs[j].style.setProperty('transform','none','important');}}catch(_n){}};window.__nuwaxKbCoverCur=function(){try{var c=document.querySelector('.keyboard-cover');return c?c.getBoundingClientRect().height:0;}catch(_c){return 0;}};window.__nuwaxKbLockDoc=function(){try{var html=document.documentElement;var body=document.body;if(html)html.style.overflow='hidden';if(body)body.style.overflow='hidden';if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();}catch(_l){}};window.__nuwaxKbDispatch=function(h){try{window.__nuwaxKeyboardHeight=h;window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:h,safeAreaBottom:window.__nuwaxSafeAreaBottom||0,platform:window.__nuwaxKbPlatform||'ios'}}));}catch(_d){}};window.__nuwaxKbUnlockPage=function(){try{if(window.__nuwaxKbUnlockTimer){clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=0;}window.__nuwaxKbFocusLock=false;var html=document.documentElement;var body=document.body;if(html){html.style.overflow='';html.style.height='';html.style.position='';}if(body){body.style.overflow='';body.style.position='';body.style.width='';body.style.top='';body.style.left='';body.style.height='';body.style.bottom='';}var covers=document.querySelectorAll('.keyboard-cover');for(var i=0;i<covers.length;i++){covers[i].style.transition='';covers[i].style.removeProperty('height');}var navs=document.querySelectorAll('.layout-fixed');for(var j=0;j<navs.length;j++){navs[j].style.transform='';navs[j].style.top='';}try{window.scrollTo(0,0);}catch(_s){}try{window.dispatchEvent(new Event('resize'));}catch(_r){}}catch(_u){}};window.__nuwaxKbPredictOpen=function(){try{if(window.__nuwaxKbUnlockTimer){clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=0;}window.__nuwaxKbFocusLock=true;var target=window.__nuwaxKbLastH>0?window.__nuwaxKbLastH:window.__nuwaxKbDefaultH;window.__nuwaxKbDomH=target;window.__nuwaxKbLockDoc();window.__nuwaxKbApplyCover(target,true);window.__nuwaxKbDispatch(target);var n=0;var tick=function(){if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();if(window.__nuwaxKbSyncNav)window.__nuwaxKbSyncNav();if(++n<30)requestAnimationFrame(tick);};requestAnimationFrame(tick);}catch(_o){}};window.__nuwaxKbPredictClose=function(){try{window.__nuwaxKbFocusLock=false;window.__nuwaxKbDomH=0;window.__nuwaxKbApplyCover(0,true);window.__nuwaxKbDispatch(0);if(window.__nuwaxKbUnlockTimer)clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=setTimeout(function(){window.__nuwaxKbUnlockTimer=0;if((window.__nuwaxKeyboardHeight||0)>0)return;if(window.__nuwaxKbUnlockPage)window.__nuwaxKbUnlockPage();},280);}catch(_c){}};if(!window.__nuwaxKbLockInstalled){window.__nuwaxKbLockInstalled=true;window.__nuwaxKbLockScroll=function(){if((window.__nuwaxKeyboardHeight||0)<=0&&window.__nuwaxKbFocusLock!=true)return;try{if(window.scrollY)window.scrollTo(0,0);var de=document.documentElement;if(de)de.scrollTop=0;var b=document.body;if(b)b.scrollTop=0;}catch(_l){}};window.addEventListener('scroll',window.__nuwaxKbLockScroll,true);if(window.visualViewport){window.visualViewport.addEventListener('scroll',window.__nuwaxKbLockScroll);window.visualViewport.addEventListener('resize',function(){if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();if(window.__nuwaxKbSyncCoverFromVv)window.__nuwaxKbSyncCoverFromVv();if(window.__nuwaxKbSyncNav)window.__nuwaxKbSyncNav();});}document.addEventListener('focusin',function(ev){try{var t=ev&&ev.target;var tag=t&&t.tagName?(''+t.tagName).toLowerCase():'';if(tag!=='textarea'&&tag!=='input')return;if(window.__nuwaxKbPredictOpen)window.__nuwaxKbPredictOpen();}catch(_f){}},true);document.addEventListener('focusout',function(){try{setTimeout(function(){var a=document.activeElement;var tag=a&&a.tagName?(''+a.tagName).toLowerCase():'';if(tag==='textarea'||tag==='input')return;if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();},30);}catch(_o){}},true);}}catch(_inst){}"
+
+		if (withDomFix == true) {
+			// 终值校正：已跟手则微调；cover 仍为 0 说明首次未预测成功——瞬间贴齐，禁止晚到动画
+			code =
+				code +
+				"try{var __h=" +
+				heightNum +
+				";var __plat='" +
+				platform +
+				"';if(__h>0){if(window.__nuwaxKbPersistLast)window.__nuwaxKbPersistLast(__h);else window.__nuwaxKbLastH=__h;}if(window.__nuwaxKbDomH===__h){try{if(__h>0){window.__nuwaxKbLockDoc();if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();}else if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();}catch(_r){}}else{window.__nuwaxKbDomH=__h;if(__h>0){if(window.__nuwaxKbUnlockTimer){clearTimeout(window.__nuwaxKbUnlockTimer);window.__nuwaxKbUnlockTimer=0;}window.__nuwaxKbFocusLock=true;window.__nuwaxKbLockDoc();var cur=window.__nuwaxKbCoverCur?window.__nuwaxKbCoverCur():0;var needAnim=cur>__h*0.2&&cur<__h*0.9;window.__nuwaxKbApplyCover(__h,needAnim);if(window.__nuwaxKbSyncNav)window.__nuwaxKbSyncNav();var n=0;var tick=function(){if(window.__nuwaxKbLockScroll)window.__nuwaxKbLockScroll();if(window.__nuwaxKbSyncNav)window.__nuwaxKbSyncNav();if(++n<20)requestAnimationFrame(tick);};requestAnimationFrame(tick);}else{if(window.__nuwaxKbPredictClose)window.__nuwaxKbPredictClose();}if(window.__nuwaxKbLastDiagH!==__h){window.__nuwaxKbLastDiagH=__h;var sy=window.scrollY||0;var vv=window.visualViewport;var vvTop=vv&&vv.offsetTop!=null?vv.offsetTop:0;var nav=document.querySelector('.layout-fixed');var navTop=nav?nav.getBoundingClientRect().top:0;var curH=window.__nuwaxKbCoverCur?window.__nuwaxKbCoverCur():0;var payload={type:'kb-diag',tag:'inject-dom',platform:__plat,injH:__h,coverH:(__h>0?__h:0),coverCur:Math.round(curH),navOff:0,vvTop:vvTop,navTop:navTop,scrollY:sy,pan:false,mode:'predict-cover',embedded:true};if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:payload});}else if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:payload});}}}}catch(e2){}"
+		}
+		// #endif
+		code = code + "})()"
+		return code
+	}
+
+	/**
+	 * 单次注入。返回 true 仅代表「拿到 ctx 且 evalJS 未抛异常」。
+	 * createWebviewContext / evalJS 在 webview 未就绪时可能抛异常（见 proxy-web.uts），
+	 * 必须 try-catch 保护，避免异常打断轮询回调。
+	 */
+	function injectBridgeOnce(): boolean {
+		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
+		if (tokenRaw == null) {
+			return false
+		}
+		const token = `${tokenRaw}`
+		if (token.length == 0) {
+			return false
+		}
+		// 进页即注入原生 safeBottom，避免 H5 依赖虚高的 env(safe-area-inset-bottom)
+		latestInjectedSafeAreaBottom = readNativeSafeAreaBottom()
+		// JSON.stringify 生成带引号的 JS 字符串字面量，任意 token 都能安全嵌入脚本
+		const code = buildBridgeCode(JSON.stringify(token))
+		let ctx: WebviewContext | null = appWebViewBridgeContext
+		if (ctx == null) {
+			try {
+				// 官方示例传组件实例辅助平台绑定，避免创建 context 失败
+				ctx = uni.createWebviewContext("agent-detail-webview", instance?.proxy)
+				appWebViewBridgeContext = ctx
+			} catch (e) {
+				return false
+			}
+			if (ctx == null) {
+				return false
+			}
+		}
+		try {
+			// 注入轮询顺带补发键盘高度：@load 前键盘已弹起、事件早于 webview 就绪时，
+			// 高度先缓存在 latestInjectedKeyboardHeight，随桥脚本一起落到 H5。
+			ctx.evalJS(code + buildKeyboardHeightInjectCode(latestInjectedKeyboardHeight, latestInjectedSafeAreaBottom, false))
+			// 原生已拿到结算结果、但 H5 尚未 ACK：随 @load 注入窗口重复补发。
+			// ACK 到达后 storage 被清理，后续轮询自然停止重放。
+			const paySnapshot = getStoredAppNativePayResult()
+			if (paySnapshot != null) {
+				const requestId = paySnapshot["requestId"] != null ? `${paySnapshot["requestId"]}` : ""
+				const result = paySnapshot["result"] != null ? `${paySnapshot["result"]}` : ""
+				if (requestId.indexOf("app_pay_") == 0 && result.length > 0) {
+					const requestLiteral = JSON.stringify(requestId)
+					const resultLiteral = JSON.stringify(result)
+					ctx.evalJS(
+						`try{window.__nuwaxOnNativePayResult&&window.__nuwaxOnNativePayResult(${requestLiteral},${resultLiteral});}catch(e){}`,
+					)
+				}
+			}
+		} catch (e) {
+			return false
+		}
+		if (!appWebViewBridgeReported) {
+			appWebViewBridgeReported = true
+		}
+		return true
+	}
+
+	/**
+	 * @load 后启动注入短轮询。核心：注入只在 webview「文档已加载」后发生，
+	 * 避免 Android 上加载期 evalJS 落在 about:blank / 中间文档、被后续导航丢弃
+	 * （此前自动注入失败根因）。短窗口 5s 覆盖 H5 异步分包延迟注册 __nuwaxSetAppEmbedded 的情况。
+	 */
+	function startAppWebViewBridge(): void {
+		// URL 尚未生成（onLoad 未执行 / 无 id 参数）时不启动
+		if (agentDetailWebUrl.value.length == 0) {
+			return
+		}
+		// 幂等重启：@load 重复触发只重开窗口
+		if (appWebViewBridgeTimer != 0) {
+			clearInterval(appWebViewBridgeTimer)
+			appWebViewBridgeTimer = 0
+		}
+		appWebViewBridgeAttempts = 0
+		appWebViewBridgeReported = false
+		appWebViewBridgeTimer = setInterval((): void => {
+			appWebViewBridgeAttempts++
+			injectBridgeOnce()
+			// 20 × 250ms = 5s；@load 已保证文档就绪，无需长窗口
+			if (appWebViewBridgeAttempts >= 20) {
+				clearInterval(appWebViewBridgeTimer)
+				appWebViewBridgeTimer = 0
+			}
+		}, 250) as number
+	}
+
+	/** webview 文档加载完成（已处于目标 H5 origin）：此时注入 cookie/localStorage 才真正生效 */
+	function handleWebViewLoad(_event: UniWebViewLoadEvent): void {
+		// Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
+		fixAppWebviewTextZoom()
+		startAppWebViewBridge()
+	}
+
+	// ==================== 原生语音桥（H5 postMessage → 原生执行 → evalJS 回传） ====================
+	// 注意：UTS 要求先声明后使用，本区块内所有函数按被引用顺序自上而下排列。
+
+	/** evalJS 回传 H5（失败忽略；H5 侧有兜底逻辑，不依赖本回调必达） */
+	function evalBridgeJS(js: string): void {
+		try {
+			let ctx = appWebViewBridgeContext
+			if (ctx == null) {
+				ctx = uni.createWebviewContext("agent-detail-webview", instance?.proxy)
+				appWebViewBridgeContext = ctx
+			}
+			if (ctx != null) {
+				ctx.evalJS(js)
+			}
+		} catch (e) {
+			// ignore
+		}
+	}
+
+	/** 把键盘高度注入内嵌 H5（桥脚本 + 高度），事件回调与 IME 轮询复用 */
+	function injectKeyboardHeightToH5(h: number): void {
+		latestInjectedKeyboardHeight = h
+		// 键盘高度可成功注入说明 webview 上下文可用：前置重放桥脚本（幂等），
+		// 兜底 @load 注入失败/偏晚导致 isAppWebView 未置位——导航栏 fixed 与文档滚动锁都依赖它。
+		// 不依赖 ACCESS_TOKEN 为空时也照常注入键盘高度。
+		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
+		const token = tokenRaw != null ? `${tokenRaw}` : ""
+		const bridgeCode = token.length > 0 ? buildBridgeCode(JSON.stringify(token)) : ""
+		evalBridgeJS(bridgeCode + buildKeyboardHeightInjectCode(h, latestInjectedSafeAreaBottom, true))
+	}
+
+	/** IME 高度短轮询（仅 Android 有实际逻辑；函数本身各端都声明，避免嵌套 ifdef 裁掉定义后闭包仍引用） */
+	let imePollTimer: number = 0
+	let imePollCount: number = 0
+	let imePollMax: number = 0
+	function pollImeHeightOnce(): void {
+		// #ifdef APP-ANDROID
+		try {
+			const v = readAndroidImeHeight()
+			if (v > imePollMax) {
+				imePollMax = v
+				injectKeyboardHeightToH5(v)
+			}
+			imePollCount++
+			if (imePollCount < 5 && v > 0) {
+				imePollTimer = setTimeout((): void => {
+					pollImeHeightOnce()
+				}, 100) as number
+			} else {
+				imePollTimer = 0
+				imePollCount = 0
+				imePollMax = 0
+			}
+		} catch (_ePoll) {
+			imePollTimer = 0
+			imePollCount = 0
+			imePollMax = 0
+		}
+		// #endif
+	}
+
+	/**
+	 * 原生侧键盘高度变化 → 注入内嵌 H5（写 window.__nuwaxKeyboardHeight + CustomEvent）。
+	 * H5 运行时无 keyboardheightchange 事件，此桥是内嵌页 keyboardHeight 的唯一来源。
+	 * Android：WindowInsets 直读完整 IME；iOS / 鸿蒙：用 onKeyboardHeightChange 高度原样注入。
+	 * H5 侧 chat-input-phone 用 keyboard-cover 顶起输入区，避免系统整页 pan 把固定导航栏顶出屏。
+	 */
+	function onAppKeyboardHeightChangeForWebView(res: any): void {
+		let h = 0
+		let usedImeRead = false
+		// #ifdef APP-ANDROID
+		// 优先：WindowInsets 直接读 IME 高度（完整 IME，权威读数）
+		try {
+			const imeCss = readAndroidImeHeight()
+			if (imeCss > 0) {
+				h = imeCss
+				usedImeRead = true
+				// 键盘动画期间取值可能偏小：短轮询取动画结束后的完整 IME 高
+				imePollMax = imeCss
+				imePollCount = 0
+				if (imePollTimer == 0) {
+					imePollTimer = setTimeout((): void => {
+						pollImeHeightOnce()
+					}, 100) as number
+				}
+			}
+		} catch (_eIme) {
+			// ignore
+		}
+		// #endif
+		if (h <= 0) {
+			// Android 兜底 / iOS / 鸿蒙：onKeyboardHeightChange
+			try {
+				const obj = res as UTSJSONObject
+				const raw = obj["height"]
+				if (raw != null) {
+					const n = parseFloat(`${raw}`)
+					if (!isNaN(n) && n > 0) {
+						h = n
+					}
+				}
+			} catch (_eObj) {
+				// ignore
+			}
+		}
+		// #ifdef APP-ANDROID
+		// 非 IME 直读路径（onKeyboardHeightChange 兜底）：高度不含底部安全区，补手势条
+		if (!usedImeRead) {
+			try {
+				const sysInfo = uni.getSystemInfoSync()
+				const safeInset = sysInfo.safeAreaInsets
+				if (safeInset != null && safeInset.bottom != null) {
+					const safeBottom = safeInset.bottom as number
+					latestInjectedSafeAreaBottom = safeBottom
+					h = h + safeBottom
+				}
+			} catch (_eInset) {
+				// ignore
+			}
+		}
+		// #endif
+		// iOS/鸿蒙：记下 safeBottom 供注入对照；不叠加进 h（避免双重垫高）
+		try {
+			const sysInfo = uni.getSystemInfoSync()
+			const safeInset = sysInfo.safeAreaInsets
+			if (safeInset != null && safeInset.bottom != null) {
+				latestInjectedSafeAreaBottom = safeInset.bottom as number
+			}
+		} catch (_eSys) {
+			// ignore
+		}
+		if (h > 0) {
+			try {
+				uni.setStorageSync("NUWAX_KB_LAST_H", Math.round(h))
+			} catch (_eStore) {
+				// ignore
+			}
+		}
+		injectKeyboardHeightToH5(h)
+	}
+
+	function jsonStringifyForBridge(obj: UTSJSONObject): string {
+		try {
+			const text = JSON.stringify(obj)
+			return text != null ? text : "{}"
+		} catch (_e) {
+			return "{}"
+		}
+	}
+
+	/** 安全读取 webview 消息对象（Android 原生对象禁止无守卫强转） */
+	function asBridgeRecord(value: any | null): UTSJSONObject | null {
+		if (value == null || typeof value != "object") {
+			return null
+		}
+		if (Array.isArray(value)) {
+			return null
+		}
+		try {
+			return value as UTSJSONObject
+		} catch (_e) {
+			return null
+		}
+	}
+
+	/**
+	 * H5 → 原生消息解析：event.detail.data 可能为 [msg] / [[msg]] / [{data:[msg]}]，
+	 * 逐层取最后一项或 data 字段（对齐 parseOpenUiActionData 的兼容策略）。
+	 */
+	function parseWebViewBridgeMessage(data: any | null): UTSJSONObject | null {
+		let current: any | null = data
+		let depth = 0
+		while (current != null && depth < 8) {
+			depth += 1
+			if (Array.isArray(current)) {
+				const arr = current as any[]
+				if (arr.length == 0) {
+					return null
+				}
+				current = arr[arr.length - 1]
+				continue
+			}
+			const obj = asBridgeRecord(current)
+			if (obj == null) {
+				return null
+			}
+			if (obj["type"] != null) {
+				return obj
+			}
+			const nested = obj["data"]
+			if (nested == null) {
+				return null
+			}
+			current = nested
+		}
+		return null
+	}
+
+	// ---- 录音结果读取辅助（APP 原生对象禁止 as UTSJSONObject，逐字段强转） ----
+
+	type NativeRecorderStopResult = {
+		tempFilePath?: string | null
+		duration?: number | null
+		fileSize?: number | null
+		format?: string | null
+	}
+
+	type NativeRecorderFail = {
+		errCode?: number | null
+		errMsg?: string | null
+		errSubject?: string | null
+	}
+
+	function readRecorderStopString(res: any | null, key: string): string {
+		if (res == null) {
+			return ""
+		}
+		try {
+			const stopRes = res as NativeRecorderStopResult
+			if (key == "tempFilePath" && stopRes.tempFilePath != null) {
+				return `${stopRes.tempFilePath}`
+			}
+			if (key == "format" && stopRes.format != null) {
+				return `${stopRes.format}`
+			}
+		} catch (_eNative) {
+			// ignore
+		}
+		try {
+			const jsonStr = JSON.stringify(res)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+				const parsed = JSON.parse(jsonStr) as UTSJSONObject
+				const value = parsed[key]
+				return value != null ? `${value}` : ""
+			}
+		} catch (_eJson) {
+			// ignore
+		}
+		return ""
+	}
+
+	function readRecorderStopNumber(res: any | null, key: string, fallback: number = 0): number {
+		if (res == null) {
+			return fallback
+		}
+		try {
+			const stopRes = res as NativeRecorderStopResult
+			if (key == "duration" && stopRes.duration != null) {
+				const durationVal = stopRes.duration as number
+				return isNaN(durationVal) ? fallback : durationVal
+			}
+			if (key == "fileSize" && stopRes.fileSize != null) {
+				const sizeVal = stopRes.fileSize as number
+				return isNaN(sizeVal) ? fallback : sizeVal
+			}
+		} catch (_eNative) {
+			// ignore
+		}
+		try {
+			const jsonStr = JSON.stringify(res)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+				const parsed = JSON.parse(jsonStr) as UTSJSONObject
+				const value = parsed[key]
+				if (value == null) {
+					return fallback
+				}
+				const num = parseFloat(`${value}`)
+				return isNaN(num) ? fallback : num
+			}
+		} catch (_eJson) {
+			// ignore
+		}
+		return fallback
+	}
+
+	function readRecorderErrorMessage(error: any | null): string {
+		if (error == null) {
+			return ""
+		}
+		// 优先按 uni-app x 统一错误 UniError 读 errMsg：UTS 对象字面量 as 强转在 Android
+		// 编译成 Kotlin 接口，Java 类（UniError 等）不实现该接口会抛 ClassCastException，
+		// 只能拿到字符串化的 toString（如 "UniError(errSubject:...errMsg:...)"），取不到字段。
+		try {
+			const ue = error as UniError
+			if (ue.errMsg != null && `${ue.errMsg}`.length > 0) {
+				return `${ue.errMsg}`
+			}
+		} catch (_eUni) {
+			// ignore
+		}
+		try {
+			const fail = error as NativeRecorderFail
+			if (fail.errMsg != null && `${fail.errMsg}`.length > 0) {
+				return `${fail.errMsg}`
+			}
+		} catch (_eFail) {
+			// ignore
+		}
+		try {
+			const err = error as Error
+			if (err.message != null && `${err.message}`.length > 0) {
+				return `${err.message}`
+			}
+		} catch (_eErr) {
+			// ignore
+		}
+		const text = `${error}`
+		if (text.length > 0 && text != "null") {
+			return text
+		}
+		return ""
+	}
+
+	// ---- 原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发）+ 边说边传流式 ASR ----
+
+	/** App 三端原生录音器（StreamPcmRecorder）；uni.getRecorderManager 无逐帧回调，改原生采集 */
+	let nativeRecorderInstance: StreamPcmRecorder | null = null
+	/** 流式 ASR 会话已 begin（VAD 开口时），等待 asr_ready / 结果 */
+	let nativeAsrSessionActive: boolean = false
+	/** 已发 stop，等待 asr_result */
+	let nativeAsrWaitingResult: boolean = false
+	/** stop 是否已到达（授权期间松手时抑制随后的 start） */
+	let nativeRecordingStopArrived: boolean = false
+	/** 录音是否正在进行（onStart 后为 true） */
+	let nativeRecordingActive: boolean = false
+	/** 录音启动是否在途（权限确认 / recorder.start 未完成）：stop 早到时由启动路径统一回传取消 */
+	let nativeRecordingStartPending: boolean = false
+	/** 孤儿录音（H5 已复位但原生未收到 stop）的 stop 回调抑制：防止打扰新会话 */
+	let nativeSuppressNextStop: boolean = false
+	/** 本轮录音已作废（H5 轻触/取消，record discard）：onStop/权限回调看到即跳过 ASR 转写 */
+	let nativeRecordingDiscarded: boolean = false
+	/** 录音启动超时看门狗：start 后 onStart 未到则回传错误并重建 recorder，避免缓存实例坏掉后反复失败 */
+	let nativeRecordStartTimer: number = 0
+	const NATIVE_RECORD_START_TIMEOUT_MS: number = 3000
+	/** 启动看门狗自动重试次数：iOS 首次激活常被系统自惹中断打断导致无首帧，重试一次可靠（第二次必成功） */
+	let nativeRecordStartRetries: number = 0
+	const NATIVE_RECORD_START_MAX_RETRIES: number = 1
+	/** VAD 已触发（按住中已 begin ASR） */
+	let nativeVadSpeechDetected: boolean = false
+	/** 已收 asr_ready，可推音频 */
+	let nativeReadyReached: boolean = false
+	/** ready 超时 / 连接失败 / 推流失败 → 松手读文件从已发偏移兜底 */
+	let nativeStreamFallbackArmed: boolean = false
+	/** 推流中丢过帧（pre-ready 溢出 / 实时背压 / 发送失败）→ 兜底 */
+	let nativeAudioTruncated: boolean = false
+	/** 开口检测看门狗：按住 N 秒无语音 → 停录并回传 no_speech */
+	let nativeNoSpeechTimer: number = 0
+	const NATIVE_NO_SPEECH_TIMEOUT_MS: number = 6000
+	/** 开口回调转发：VAD 触发时由 beginStreamAsr 接管（延迟绑定，规避 UTS 先声明后使用） */
+	let nativeStreamOnSpeechStart: (() => void) | null = null
+	/** 实时推流管道（边说边传）：VAD + 预滚 + pre-ready + packetizer + sentBytes */
+	let nativeStreamPipeline: NativeStreamAsrPipeline | null = new NativeStreamAsrPipeline(
+		(frame: ArrayBuffer): Promise<boolean> => {
+			return asrWebSocketClient.sendPcmAsync(frame)
+		},
+		(): void => {
+			const h = nativeStreamOnSpeechStart
+			if (h != null) {
+				h()
+			}
+		},
+	)
+
+	/** 麦克风权限检查结果：granted 已授权；deniedForever 已永久拒绝（勾选「不再询问」/ 连续拒绝，系统不再弹授权窗） */
+	class NativeMicPermissionResult {
+		granted: boolean
+		deniedForever: boolean
+		constructor(granted: boolean, deniedForever: boolean) {
+			this.granted = granted
+			this.deniedForever = deniedForever
+		}
+	}
+
+	// #ifdef APP-IOS
+	/** iOS not-determined 时主动请求系统授权（延迟绑定：ensureNativeRecorder 声明在其后，UTS 须先声明后使用） */
+	let iosRequestMicPermissionFn: (() => Promise<NativeMicPermissionResult>) | null = null
+	// #endif
+
+	/** 申请麦克风权限（Android 用 UTSAndroid；iOS 检查授权状态 + not-determined 主动请求）
+	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
+	async function ensureNativeMicPermission(): Promise<NativeMicPermissionResult> {
+		// #ifdef APP-ANDROID
+		return await new Promise<NativeMicPermissionResult>((resolve) => {
+			const activity = UTSAndroid.getUniActivity()
+			if (activity == null) {
+				resolve(new NativeMicPermissionResult(false, false))
+				return
+			}
+			const permission = ["android.permission.RECORD_AUDIO"] as string[]
+			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
+				resolve(new NativeMicPermissionResult(true, false))
+				return
+			}
+			UTSAndroid.requestSystemPermission(
+				activity,
+				permission,
+				(allGranted: boolean, _granted: string[]) => {
+					resolve(new NativeMicPermissionResult(allGranted, false))
+				},
+				(doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(new NativeMicPermissionResult(false, doNotAskAgain))
+				},
+			)
+		})
+		// #endif
+		// #ifdef APP-IOS
+		const authSetting = uni.getAppAuthorizeSetting()
+		if (authSetting.microphoneAuthorized == "authorized") {
+			return new NativeMicPermissionResult(true, false)
+		}
+		if (authSetting.microphoneAuthorized == "denied") {
+			// iOS 拒绝后同样无法再弹授权窗，须去系统设置开启
+			return new NativeMicPermissionResult(false, true)
+		}
+		// not determined：主动请求系统授权（首次按下弹窗；拒绝即永久，须去设置开启）
+		const requestFn = iosRequestMicPermissionFn
+		if (requestFn != null) {
+			return await requestFn()
+		}
+		// 兜底：请求函数未绑定（理论不可达）时放行，交给 start 时系统弹窗
+		return new NativeMicPermissionResult(true, false)
+		// #endif
+		// #ifdef APP-HARMONY
+		// 鸿蒙：UTSHarmony.requestSystemPermission 弹系统授权窗（已授权时不重复弹）。
+		// 无静默预检 API，直接请求；拒绝（含「不再询问」）由 fail 回调返回。
+		return await new Promise<NativeMicPermissionResult>((resolve) => {
+			UTSHarmony.requestSystemPermission(
+				["ohos.permission.MICROPHONE"] as string[],
+				(allRight: boolean, _granted: string[]) => {
+					resolve(new NativeMicPermissionResult(allRight, false))
+				},
+				(doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(new NativeMicPermissionResult(false, doNotAskAgain))
+				},
+			)
+		})
+		// #endif
+	}
+
+	/** 永久拒绝权限：弹窗引导去系统设置开启（Android 跳应用权限页；iOS 跳系统设置） */
+	function guideNativePermissionSettings(title: string, content: string, permissionName: string): void {
+		uni.showModal({
+			title: title,
+			content: content,
+			confirmText: t("Mobile.Voice.goToSettings"),
+			cancelText: t("Mobile.Common.cancel"),
+			success: (res) => {
+				if (res.confirm == true) {
+					// #ifdef APP-ANDROID
+					const activity = UTSAndroid.getUniActivity()
+					if (activity != null) {
+						UTSAndroid.gotoSystemPermissionActivity(
+							activity,
+							[permissionName] as string[],
+						)
+					}
+					// #endif
+					// #ifdef APP-IOS
+					uni.openAppAuthorizeSetting({})
+					// #endif
+					// #ifdef APP-HARMONY
+					// 鸿蒙：跳转应用权限设置页（录音权限被永久拒绝时引导）
+					openHarmonyMicPermissionSettings()
+					// #endif
+				}
+			},
+		})
+	}
+
+	/** 永久拒绝麦克风权限：弹窗引导去系统设置开启 */
+	function guideNativeMicPermissionSettings(): void {
+		guideNativePermissionSettings(
+			t("Mobile.Permission.microphoneTitle"),
+			t("Mobile.AgentDetail.micPermissionSystemContent"),
+			"android.permission.RECORD_AUDIO",
+		)
+	}
+
+	/** 申请相机权限（Android 用 UTSAndroid；iOS 检查授权状态）
+	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
+	async function ensureNativeCameraPermission(): Promise<NativeMicPermissionResult> {
+		// #ifdef APP-ANDROID
+		return await new Promise<NativeMicPermissionResult>((resolve) => {
+			const activity = UTSAndroid.getUniActivity()
+			if (activity == null) {
+				resolve(new NativeMicPermissionResult(false, false))
+				return
+			}
+			const permission = ["android.permission.CAMERA"] as string[]
+			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
+				resolve(new NativeMicPermissionResult(true, false))
+				return
+			}
+			UTSAndroid.requestSystemPermission(
+				activity,
+				permission,
+				(allGranted: boolean, _granted: string[]) => {
+					resolve(new NativeMicPermissionResult(allGranted, false))
+				},
+				(doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(new NativeMicPermissionResult(false, doNotAskAgain))
+				},
+			)
+		})
+		// #endif
+		// #ifdef APP-IOS
+		const authSetting = uni.getAppAuthorizeSetting()
+		if (authSetting.cameraAuthorized == "authorized") {
+			return new NativeMicPermissionResult(true, false)
+		}
+		if (authSetting.cameraAuthorized == "denied") {
+			// iOS 拒绝后同样无法再弹授权窗，须去系统设置开启
+			return new NativeMicPermissionResult(false, true)
+		}
+		// not determined：chooseImage 时系统才弹窗，先放行
+		return new NativeMicPermissionResult(true, false)
+		// #endif
+	}
+
+	// #ifdef APP-ANDROID
+	/** 解析相册媒体权限：targetSdk>=33 用 READ_MEDIA_IMAGES，否则用旧 READ_EXTERNAL_STORAGE。
+	 *  uni-app x 运行时对两侧都做硬校验——targetSdk<33 请求新媒体权限抛 IllegalStateException
+	 *  （本生产基座 targetSdk=32 实测），targetSdk>=33 请求旧权限抛 IllegalArgumentException，
+	 *  必须按运行时 targetSdkVersion 分流，不能固定只请求某一个。 */
+	function resolveAlbumMediaPermission(): string {
+		try {
+			const activity = UTSAndroid.getUniActivity()
+			const appInfo = activity?.getApplicationInfo()
+			if (appInfo != null && appInfo.targetSdkVersion >= 33) {
+				return "android.permission.READ_MEDIA_IMAGES"
+			}
+		} catch (_eResolve) {
+			// 读取失败按旧权限兜底（当前生产基座 targetSdk=32）
+		}
+		return "android.permission.READ_EXTERNAL_STORAGE"
+	}
+	// #endif
+
+	/** 申请相册/媒体读取权限。
+	 *  权限按运行时 targetSdkVersion 分流（见 resolveAlbumMediaPermission）：
+	 *  targetSdk>=33 请求 READ_MEDIA_IMAGES，否则 READ_EXTERNAL_STORAGE。
+	 *  临时拒绝 → 下次点击系统会再次弹授权框；永久拒绝 → 引导去系统设置。
+	 *  deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启 */
+	async function ensureNativeAlbumPermission(): Promise<NativeMicPermissionResult> {
+		// #ifdef APP-ANDROID
+		return await new Promise<NativeMicPermissionResult>((resolve) => {
+			const activity = UTSAndroid.getUniActivity()
+			if (activity == null) {
+				resolve(new NativeMicPermissionResult(false, false))
+				return
+			}
+			const permission = [resolveAlbumMediaPermission()] as string[]
+			if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
+				resolve(new NativeMicPermissionResult(true, false))
+				return
+			}
+			UTSAndroid.requestSystemPermission(
+				activity,
+				permission,
+				(allGranted: boolean, _granted: string[]) => {
+					resolve(new NativeMicPermissionResult(allGranted, false))
+				},
+				(doNotAskAgain: boolean, _denied: string[]) => {
+					resolve(new NativeMicPermissionResult(false, doNotAskAgain))
+				},
+			)
+		})
+		// #endif
+		// #ifdef APP-IOS
+		// iOS 相册权限由 uni.chooseImage 内部申请（系统弹窗），无需预申请
+		return new NativeMicPermissionResult(true, false)
+		// #endif
+	}
+
+	function clearNativeRecordStartWatchdog(): void {
+		if (nativeRecordStartTimer != 0) {
+			clearTimeout(nativeRecordStartTimer)
+			nativeRecordStartTimer = 0
+		}
+	}
+
+	function handleNativeRecordStart(_res: any | null): void {
+		clearNativeRecordStartWatchdog()
+		nativeRecordingActive = true
+		nativeRecordingStartPending = false
+		console.log("[ASR-live] onStart 到达（原生录音已开录，首帧已到）")
+		// 开录后预热 ASR WS（只建连不发 start）：VAD 开口 begin 时复用连接，减少首字等待
+		asrWebSocketClient.preheatConnect()
+		evalBridgeJS(`window.__onNativeRecordStart && window.__onNativeRecordStart()`)
+	}
+
+	function handleNativeRecorderError(err: any | null): void {
+		clearNativeRecordStartWatchdog()
+		nativeRecordingActive = false
+		nativeRecordingStartPending = false
+		// 录音底层失败：中止进行中的实时 ASR 会话并重置管道，避免迟到回调污染后续会话
+		// （不清 no-speech 看门狗：nativeRecordingActive=false 后其回调自愈返回）
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			try {
+				asrWebSocketClient.abort()
+			} catch (_eAsr) {
+				// ignore
+			}
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+		}
+		const pipeline = nativeStreamPipeline
+		if (pipeline != null) {
+			try {
+				pipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
+		}
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
+		const message = readRecorderErrorMessage(err)
+		console.warn("[ASR-live] 录音底层错误回调: " + message)
+		evalBridgeJS(
+			`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": message } as UTSJSONObject)})`,
+		)
+	}
+
+	/** 统一把转写结果经 evalJS 回传 H5（与既有 __onNativeRecordStop payload 结构一致） */
+	function nativeReportRecordStop(success: boolean, text: string, error: string): void {
+		const payload = {
+			"success": success,
+			"text": text,
+			"error": error,
+		} as UTSJSONObject
+		evalBridgeJS(
+			`window.__onNativeRecordStop && window.__onNativeRecordStop(${jsonStringifyForBridge(payload)})`,
+		)
+	}
+
+	function nativeHandleAsrResult(text: string, ok: boolean, errorMessage: string): void {
+		nativeAsrSessionActive = false
+		nativeAsrWaitingResult = false
+		if (ok == true && text.length > 0) {
+			nativeReportRecordStop(true, text, "")
+		} else {
+			const errMsg = errorMessage.length > 0 ? errorMessage : t("Mobile.Voice.noSpeechDetected")
+			nativeReportRecordStop(false, "", errMsg)
+		}
+	}
+
+	function nativeHandleAsrError(message: string): void {
+		nativeAsrSessionActive = false
+		nativeAsrWaitingResult = false
+		if (nativeRecordingActive == true) {
+			// 按住中出错（begin/ready/推流失败）：不打断 UI，置兜底态，松手走文件兜底
+			console.warn("[ASR-live] 按住中 ASR 出错，置兜底态: " + message)
+			nativeStreamFallbackArmed = true
+			return
+		}
+		nativeReportRecordStop(
+			false,
+			"",
+			message.length > 0 ? message : t("Mobile.AgentDetail.recognizeFailed"),
+		)
+	}
+
+	/** 实时 PCM 帧（主线程，采集器逐帧转发）：喂给推流管道（VAD + 预滚 + packetizer） */
+	function handleNativeRecorderFrame(chunk: ArrayBuffer): void {
+		const pipeline = nativeStreamPipeline
+		if (pipeline == null) {
+			return
+		}
+		try {
+			pipeline.feed(chunk)
+		} catch (_eFeed) {
+			// ignore
+		}
+	}
+
+	/** asr_ready：管道转实时推流（先推预滚 500ms + pre-ready 队列） */
+	function nativeHandleAsrReady(): void {
+		console.log("[ASR-live] asr_ready，转实时推流")
+		nativeReadyReached = true
+		const pipeline = nativeStreamPipeline
+		if (pipeline != null) {
+			try {
+				pipeline.onReady()
+			} catch (_eReady) {
+				// ignore
+			}
+		}
+	}
+
+	/** VAD 开口：按住中 begin → asr_ready → 边说边传（消除「按住空等被服务端截断」） */
+	function beginStreamAsr(): void {
+		if (nativeAsrSessionActive == true || nativeRecordingDiscarded == true) {
+			return
+		}
+		console.log("[ASR-live] VAD 开口，按住中 begin")
+		nativeAsrSessionActive = true
+		nativeVadSpeechDetected = true
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
+		asrWebSocketClient.begin(
+			nativeHandleAsrReady,
+			nativeHandleAsrResult,
+			nativeHandleAsrError,
+		)
+		asrWebSocketClient.watchReadyAfterStop()
+	}
+
+	/** asr_ready 后从偏移切帧推剩余文件并 finish（须在 nativeBeginAsrAndPushFileFrom 之前定义，避免 UTS error18） */
+	function nativePushRecordedFileThenFinishFrom(tempFilePath: string, skipBytes: number): void {
+		if (nativeAsrSessionActive != true) {
+			return
+		}
+		streamLocalAudioFileToAsrFrom(
+			tempFilePath,
+			skipBytes,
+			(frame: ArrayBuffer): Promise<boolean> => {
+				return asrWebSocketClient.sendPcmAsync(frame)
+			},
+			(ok: boolean): void => {
+				if (nativeAsrSessionActive != true) {
+					return
+				}
+				if (ok == true) {
+					nativeAsrWaitingResult = true
+					// 略延后 stop，给底层 WS 刷新 binary 的时间
+					setTimeout((): void => {
+						if (nativeAsrSessionActive != true) {
+							return
+						}
+						asrWebSocketClient.finish()
+					}, 40)
+				} else {
+					asrWebSocketClient.abort()
+					nativeAsrSessionActive = false
+					nativeReportRecordStop(false, "", t("Mobile.AudioUploader.fileEmpty"))
+				}
+			},
+		)
+	}
+
+	/**
+	 * 松手兜底：中止残留会话后 begin → asr_ready → 推文件。
+	 * skipBytes 仅在同一会话内续推时才 >0；跨会话（abort 后新 begin）必须传 0
+	 * （服务端每次 start 关闭上一会话，新会话收不到 [0, skipBytes) → 漏首段）。
+	 */
+	function nativeBeginAsrAndPushFileFrom(tempFilePath: string, skipBytes: number): void {
+		if (nativeAsrSessionActive == true) {
+			asrWebSocketClient.abort()
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+		}
+		nativeAsrSessionActive = true
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = true
+		nativeVadSpeechDetected = true
+		asrWebSocketClient.begin(
+			(): void => {
+				nativeReadyReached = true
+				nativePushRecordedFileThenFinishFrom(tempFilePath, skipBytes)
+			},
+			(text: string, ok: boolean, errorMessage: string): void => {
+				nativeHandleAsrResult(text, ok, errorMessage)
+			},
+			(message: string): void => {
+				nativeHandleAsrError(message)
+			},
+		)
+		asrWebSocketClient.watchReadyAfterStop()
+	}
+
+	/** 兼容旧入口：完整推文件（skipBytes=0） */
+	function nativePushRecordedFileThenFinish(tempFilePath: string): void {
+		nativePushRecordedFileThenFinishFrom(tempFilePath, 0)
+	}
+
+	/** 兼容旧入口：整段推文件（skipBytes=0） */
+	function nativeBeginAsrAndPushFile(tempFilePath: string): void {
+		nativeBeginAsrAndPushFileFrom(tempFilePath, 0)
+	}
+
+	function clearNativeNoSpeechWatchdog(): void {
+		if (nativeNoSpeechTimer != 0) {
+			clearTimeout(nativeNoSpeechTimer)
+			nativeNoSpeechTimer = 0
+		}
+	}
+
+	function handleNativeRecorderStop(res: any | null): void {
+		nativeRecordingActive = false
+		clearNativeRecordStartWatchdog()
+		clearNativeNoSpeechWatchdog()
+		// 孤儿录音（新会话启动前被强制停掉的旧录音）的 stop 回调：丢弃，不打扰新会话
+		if (nativeSuppressNextStop == true) {
+			nativeSuppressNextStop = false
+			return
+		}
+		// 已作废的录音（H5 轻触/取消）：跳过 ASR 转写，避免白跑一次 WS 识别
+		if (nativeRecordingDiscarded == true) {
+			nativeRecordingDiscarded = false
+			const pipeline = nativeStreamPipeline
+			if (pipeline != null) {
+				try {
+					pipeline.reset()
+				} catch (_ePipe) {
+					// ignore
+				}
+			}
+			nativeVadSpeechDetected = false
+			nativeReadyReached = false
+			nativeStreamFallbackArmed = false
+			nativeAudioTruncated = false
+			return
+		}
+		const tempFilePath = readRecorderStopString(res, "tempFilePath")
+		if (tempFilePath.length == 0) {
+			evalBridgeJS(
+				`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.Voice.recordFailed") } as UTSJSONObject)})`,
+			)
+			return
+		}
+		const pipeline = nativeStreamPipeline
+		const pipelineTruncated =
+			pipeline != null &&
+			(pipeline.isTruncated() == true || pipeline.isPushFailed() == true)
+		// 分支1：实时链路健康（VAD 开口已 begin、已 ready、未兜底、未丢帧）→ flush 剩余 → finish
+		const liveHealthy =
+			nativeAsrSessionActive == true &&
+			nativeReadyReached == true &&
+			nativeStreamFallbackArmed != true &&
+			pipelineTruncated != true
+		if (liveHealthy == true && pipeline != null) {
+			try {
+				console.log("[ASR-live] 松手：实时链路健康，flush+finish sent=" + pipeline.getSentBytes())
+				pipeline.flushPending((): void => {
+					if (nativeAsrSessionActive != true) {
+						return
+					}
+					nativeAsrWaitingResult = true
+					// 略延后 stop，给底层 WS 刷新 binary 的时间
+					setTimeout((): void => {
+						if (nativeAsrSessionActive != true) {
+							return
+						}
+						asrWebSocketClient.finish()
+					}, 40)
+				})
+			} catch (_eFlush) {
+				// flush 异常：走兜底全量推文件（与分支2一致）
+				nativeBeginAsrAndPushFileFrom(tempFilePath, 0)
+			}
+			return
+		}
+		// 分支2：兜底（无语音未 begin / ready 未达 / 推流截断或失败 / 连接断开）
+		console.warn("[ASR-live] 松手：走兜底全量推文件 session=" + (nativeAsrSessionActive == true ? 1 : 0) + " ready=" + (nativeReadyReached == true ? 1 : 0) + " fallbackArmed=" + (nativeStreamFallbackArmed == true ? 1 : 0) + " truncated=" + (pipelineTruncated == true ? 1 : 0))
+		// 必须「中止旧会话 → 开新会话 → 从 0 全量推文件」：
+		// 服务端每次 start 关闭上一会话并开新会话（docs 3.3），会话间不共享音频；
+		// 若按已发偏移（sentBytes）续推，新会话将永远缺失开头 [0, sentBytes) → 漏首段。
+		// 全量重推 = 旧版已验证行为，代价仅是重传已发字节（仅在异常兜底路径发生）。
+		nativeBeginAsrAndPushFileFrom(tempFilePath, 0)
+	}
+
+	/** 丢弃并重建录音器（start 抛异常 / 看门狗超时后，缓存实例可能已不可用）。
+	 *  必须 releaseRecorder() 停掉旧实例的轮询与观察者——只置空会让旧实例的泄漏轮询
+	 *  继续投递迟到的 onStart/onStop，污染新一轮录音（已实测：onStart 出现在 start 之前）。 */
+	function resetNativeRecorder(): void {
+		const old = nativeRecorderInstance
+		nativeRecorderInstance = null
+		if (old != null) {
+			try {
+				old.releaseRecorder()
+			} catch (_eRelease) {
+				// ignore
+			}
+		}
+	}
+
+	/**
+	 * 获取原生录音器：App 三端统一 StreamPcmRecorder
+	 * （Android AudioRecord / iOS AVAudioEngine tap / 鸿蒙 AudioCapturer，接口一致：
+	 * onStart/onStop/onError/onFrame/start/stop/release）。注册逐帧回调走边说边传推流。
+	 */
+	function ensureNativeRecorder(): StreamPcmRecorder {
+		if (nativeRecorderInstance == null) {
+			nativeRecorderInstance = new StreamPcmRecorder()
+			nativeRecorderInstance!.onStart(handleNativeRecordStart)
+			nativeRecorderInstance!.onStop(handleNativeRecorderStop)
+			nativeRecorderInstance!.onError(handleNativeRecorderError)
+			nativeRecorderInstance!.onFrame(handleNativeRecorderFrame)
+		}
+		return nativeRecorderInstance!
+	}
+
+	/** 构造原生录音参数（流式 ASR 需 16kHz mono PCM；Android/鸿蒙用，iOS 走无参 Swift start） */
+	function buildNativeRecordOptions(): RecorderManagerStartOptions {
+		return {
+			duration: 600000,
+			sampleRate: ASR_SAMPLE_RATE,
+			numberOfChannels: 1,
+			encodeBitRate: 48000,
+			format: "pcm",
+		} as RecorderManagerStartOptions
+	}
+
+	// #ifdef APP-IOS
+	/** iOS 主动请求麦克风授权：走 StreamPcmRecorder 桥的 requestRecordPermission，轮询直到用户应答（60s 兜底） */
+	iosRequestMicPermissionFn = (): Promise<NativeMicPermissionResult> => {
+		const recorder = ensureNativeRecorder()
+		recorder.requestRecordPermission()
+		console.log("[ASR-live] iOS 已发起麦克风授权请求，等待系统弹窗应答")
+		return new Promise<NativeMicPermissionResult>((resolve) => {
+			let pollTimer = 0
+			pollTimer = setInterval((): void => {
+				if (recorder.permissionResolved() == true) {
+					clearInterval(pollTimer)
+					pollTimer = 0
+					console.log("[ASR-live] iOS 授权应答 granted=" + (recorder.permissionGranted() == true))
+					resolve(
+						recorder.permissionGranted() == true
+							? new NativeMicPermissionResult(true, false)
+							: new NativeMicPermissionResult(false, true),
+					)
+				}
+			}, 50) as number
+			// 兜底：授权窗长时间无应答（理论不会）按拒绝处理，避免调用方一直等待
+			setTimeout((): void => {
+				if (pollTimer != 0) {
+					clearInterval(pollTimer)
+					pollTimer = 0
+					resolve(new NativeMicPermissionResult(false, true))
+				}
+			}, 60000) as number
+		})
+	}
+	// #endif
+
+	/** 按住 N 秒仍无语音：停录并回传 no_speech（VAD 未触发，无 ASR 会话可 abort） */
+	function armNativeNoSpeechWatchdog(): void {
+		clearNativeNoSpeechWatchdog()
+		nativeNoSpeechTimer = setTimeout((): void => {
+			nativeNoSpeechTimer = 0
+			if (nativeRecordingActive != true || nativeVadSpeechDetected == true) {
+				return
+			}
+			// 无语音：作废本轮并复位（走孤儿 stop 抑制，避免打扰后续会话）
+			console.warn("[ASR-live] 按住 " + NATIVE_NO_SPEECH_TIMEOUT_MS + "ms 无语音，停录回传 no_speech")
+			nativeSuppressNextStop = true
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_eStop) {
+				// ignore
+			}
+			nativeReportRecordStop(false, "", t("Mobile.Voice.noSpeechDetected"))
+		}, NATIVE_NO_SPEECH_TIMEOUT_MS) as number
+	}
+
+	/**
+	 * 启动超时看门狗：recorder.start() 后 onStart 未到（Android 偶发）时，
+	 * 强制停掉并重建 recorder（缓存实例可能已不可用），回传错误让 H5 复位。
+	 * 否则 H5 一直等不到回调，且后续 start 会因实例坏掉而反复失败。
+	 */
+	function armNativeRecordStartWatchdog(): void {
+		clearNativeRecordStartWatchdog()
+		nativeRecordStartTimer = setTimeout((): void => {
+			nativeRecordStartTimer = 0
+			if (nativeRecordingActive == true) {
+				return
+			}
+			// 用户在等待期间已松开/取消：不重试，按取消处理
+			if (nativeRecordingStopArrived == true || nativeRecordingDiscarded == true) {
+				nativeRecordingStartPending = false
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordCancelled") } as UTSJSONObject)})`,
+				)
+				return
+			}
+			// 自动重试：iOS 首次激活常被系统自惹中断打断导致无首帧（第二次必成功），
+			// 复用同一实例重新 start 一次，避免用户首按就报「录音启动失败」。
+			// 切勿 resetNativeRecorder() 新建实例：新实例会影子旧实例，
+			// 松手 stop 打到新实例，真正在录的旧实例永远收不到 stop → 卡「语音识别中」（已实测）。
+			if (nativeRecordStartRetries < NATIVE_RECORD_START_MAX_RETRIES) {
+				nativeRecordStartRetries++
+				console.warn("[ASR-live] 启动看门狗：3s 未到 onStart，自动重试第 " + nativeRecordStartRetries + " 次")
+				nativeRecordingStartPending = true
+				try {
+					const recorder = ensureNativeRecorder()
+					// #ifdef APP-IOS
+					recorder.start(null)
+					// #endif
+					// #ifndef APP-IOS
+					recorder.start(buildNativeRecordOptions())
+					// #endif
+					armNativeRecordStartWatchdog()
+					armNativeNoSpeechWatchdog()
+				} catch (e) {
+					nativeRecordingStartPending = false
+					console.error("[ASR-live] 重试 start 抛异常: " + readRecorderErrorMessage(e))
+					evalBridgeJS(
+						`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordStartFailed") } as UTSJSONObject)})`,
+					)
+				}
+				return
+			}
+			// 重试也失败：停录重建，回传错误让 H5 复位
+			nativeRecordingStartPending = false
+			console.warn("[ASR-live] 启动看门狗：重试后仍未收到 onStart，停录重建 recorder")
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_e) {
+				// ignore
+			}
+			resetNativeRecorder()
+			evalBridgeJS(
+				`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordStartFailed") } as UTSJSONObject)})`,
+			)
+		}, NATIVE_RECORD_START_TIMEOUT_MS) as number
+	}
+
+	function nativeStartRecord(): void {
+		console.log("[ASR-live] nativeStartRecord 收到 start")
+		// 新一轮：重置启动重试计数
+		nativeRecordStartRetries = 0
+		// 上一轮录音未正常结束（H5 侧已复位但原生仍在录）：先停掉孤儿录音，
+		// 否则缓存 recorder 处于已启动状态，后续 start 会失败/不触发 onStart
+		if (nativeRecordingActive == true) {
+			nativeSuppressNextStop = true
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_eOrphan) {
+				// ignore
+			}
+		}
+		// 上一轮 ASR 会话未收尾（结果/错误尚未回传）：abort 掉，避免迟到回调污染新一轮录音
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			asrWebSocketClient.abort()
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+		}
+		// 新一轮实时会话：重置推流管道 + 绑定开口回调（VAD 触发 → beginStreamAsr）
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
+		clearNativeNoSpeechWatchdog()
+		nativeStreamOnSpeechStart = beginStreamAsr
+		const streamPipeline = nativeStreamPipeline
+		if (streamPipeline != null) {
+			try {
+				streamPipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
+		}
+		nativeRecordingStopArrived = false
+		nativeRecordingDiscarded = false
+		nativeRecordingStartPending = true
+		ensureNativeRecorder()
+		ensureNativeMicPermission().then((result: NativeMicPermissionResult) => {
+			console.log("[ASR-live] 权限结果 granted=" + result.granted + " deniedForever=" + result.deniedForever)
+			if (result.granted != true) {
+				nativeRecordingStartPending = false
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.Permission.microphoneTitle") } as UTSJSONObject)})`,
+				)
+				// 永久拒绝（勾选「不再询问」/ 连续拒绝）：系统不会再弹授权窗，
+				// 引导去系统设置开启，否则用户无法再录音
+				if (result.deniedForever == true) {
+					guideNativeMicPermissionSettings()
+				}
+				return
+			}
+			// 授权期间已收到 stop（轻触/松手）：禁止再 start，且回传「已取消」，
+			// 否则 H5 收不到任何回调会卡死在 uploading，后续录音无法开始
+			if (nativeRecordingStopArrived == true) {
+				nativeRecordingStartPending = false
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordCancelled") } as UTSJSONObject)})`,
+				)
+				return
+			}
+			// 授权期间已作废（轻触/取消，record discard）：同样禁止再 start
+			if (nativeRecordingDiscarded == true) {
+				nativeRecordingStartPending = false
+				nativeRecordingDiscarded = false
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordCancelled") } as UTSJSONObject)})`,
+				)
+				return
+			}
+			// 开录前停掉正在播的 TTS，避免抢录音音频焦点（录到弱音 → 转写空）
+			stopAllSpeechPlayback()
+			// 与 recorder.start 并行预热 ASR WS（不必等 onStart/首帧），缩短 VAD 开口后的 asr_ready 等待
+			asrWebSocketClient.preheatConnect()
+			try {
+				const recorder = ensureNativeRecorder()
+				// 流式 ASR 需 16kHz mono PCM（asrWebSocketClient 硬编码 sample_rate=16000 / 20ms 帧）。
+				// iOS 同样支持 pcm（与 chat-input 的 App 分支录音参数对齐），不再走 mp3/aac 上传
+				const options = buildNativeRecordOptions()
+				// #ifdef APP-IOS
+				// iOS 桥对 RecorderManagerStartOptions 对象参数跨桥不可靠（startByJs method call failed），
+				// 走无参默认时长路径（Swift start() 固定 600000ms）；Android/鸿蒙照常传 options
+				recorder.start(null)
+				// #endif
+				// #ifndef APP-IOS
+				recorder.start(options)
+				// #endif
+				// onStart 未到则看门狗兜底（回传错误 + 重建 recorder；iOS 首按自动重试一次）
+				armNativeRecordStartWatchdog()
+				// 按住 N 秒无语音 → 停录回传 no_speech（边说边传的开口兜底）
+				armNativeNoSpeechWatchdog()
+			} catch (e) {
+				nativeRecordingStartPending = false
+				clearNativeRecordStartWatchdog()
+				console.error("[ASR-live] recorder.start 抛异常: " + readRecorderErrorMessage(e))
+				// start 抛异常：重建 recorder，避免缓存实例坏掉后反复失败
+				resetNativeRecorder()
+				evalBridgeJS(
+					`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordStartFailed") } as UTSJSONObject)})`,
+				)
+			}
+		})
+	}
+
+	/**
+	 * H5 按下前的权限预检（requestPermission 消息）：把真实授权结果回传 H5。
+	 * granted/deniedForever 决定 H5 是否显示波浪线/引导弹窗
+	 * （Android/鸿蒙/iOS 统一走 ensureNativeMicPermission，iOS not-determined 会在此弹系统授权窗）。
+	 */
+	function nativeRequestRecordPermission(): void {
+		ensureNativeMicPermission().then((result: NativeMicPermissionResult) => {
+			const payload = {
+				"granted": result.granted,
+				"deniedForever": result.deniedForever,
+			} as UTSJSONObject
+			evalBridgeJS(
+				`window.__onNativeRecordPermission && window.__onNativeRecordPermission(${jsonStringifyForBridge(payload)})`,
+			)
+			// #ifdef APP-IOS
+			if (result.granted == true) {
+				try {
+					ensureNativeRecorder().prepareSession()
+				} catch (_eWarmPerm) {
+					// ignore
+				}
+			}
+			// #endif
+		})
+	}
+
+	/**
+	 * 本轮录音作废（H5 轻触/取消）：置 discard 标记，onStop 到达时跳过 ASR 转写；
+	 * 若录音仍在进行（例如 H5 看门狗超时只发 discard 未发 stop），顺手停掉，
+	 * 并按孤儿 stop 抑制其回调，避免打扰后续会话。
+	 */
+	function nativeRecordDiscard(): void {
+		nativeRecordingDiscarded = true
+		clearNativeNoSpeechWatchdog()
+		// 中止进行中的实时 ASR 会话 + 重置管道，避免迟到回调污染新一轮录音
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			try {
+				asrWebSocketClient.abort()
+			} catch (_eAsrDiscard) {
+				// ignore
+			}
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+		}
+		const pipeline = nativeStreamPipeline
+		if (pipeline != null) {
+			try {
+				pipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
+		}
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
+		if (nativeRecordingActive == true) {
+			nativeSuppressNextStop = true
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_eDiscard) {
+				// ignore
+			}
+		}
+	}
+
+	function nativeStopRecord(): void {
+		nativeRecordingStopArrived = true
+		clearNativeRecordStartWatchdog()
+		clearNativeNoSpeechWatchdog()
+		if (nativeRecordingActive == true) {
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_e) {
+				// ignore
+			}
+			return
+		}
+		// 录音未开始：启动仍在途（权限/start 未完成）时由 nativeStartRecord 权限回调统一回传
+		// 「已取消」，避免双发；启动已不在途则这里补发一次，保证 H5 一定能收到回调复位
+		if (nativeRecordingStartPending != true) {
+			evalBridgeJS(
+				`window.__onNativeRecordError && window.__onNativeRecordError(${jsonStringifyForBridge({ "message": t("Mobile.AgentDetail.recordCancelled") } as UTSJSONObject)})`,
+			)
+		}
+	}
+
+	// ---- 原生 TTS：复用现有 VoiceStreamSpeaker / ttsWebSocketPlayer 栈，状态回传 H5 ----
+
+	let nativeTtsStateListenerId: number = 0
+	/** 是否已回传 H5「播报中」（分句间隙 player 会 transient idle，用 isBusy 兜底判定） */
+	let nativeTtsReportedBusy: boolean = false
+
+	function readBridgeBool(raw: any | null, fallback: boolean): boolean {
+		if (raw == null) {
+			return fallback
+		}
+		if (raw == true) {
+			return true
+		}
+		if (raw == false) {
+			return false
+		}
+		const text = `${raw}`
+		if (text == "true" || text == "1") {
+			return true
+		}
+		if (text == "false" || text == "0") {
+			return false
+		}
+		return fallback
+	}
+
+	function bridgeSettingsToVoiceSettings(settingsObj: UTSJSONObject | null): VoiceSettings {
+		const settings = new VoiceSettings()
+		if (settingsObj == null) {
+			settings.autoPlay = true
+			return settings
+		}
+		settings.autoPlay = readBridgeBool(settingsObj["autoPlay"], true)
+		settings.muted = readBridgeBool(settingsObj["muted"], false)
+		settings.includeThinkContent = readBridgeBool(settingsObj["includeThinkContent"], false)
+		settings.includeCodeBlocks = readBridgeBool(settingsObj["includeCodeBlocks"], false)
+		settings.includeLinkUrl = readBridgeBool(settingsObj["includeLinkUrl"], false)
+		settings.keepEmoji = readBridgeBool(settingsObj["keepEmoji"], false)
+		return settings
+	}
+
+	/** 汇总当前播报状态并回传 H5（整轮是否进行中以 voiceStreamSpeaker.isBusy 为准） */
+	function reportNativeTtsState(): void {
+		const roundBusy = voiceStreamSpeaker.isBusy()
+		if (roundBusy == true) {
+			if (nativeTtsReportedBusy != true) {
+				nativeTtsReportedBusy = true
+				const mid = voiceStreamSpeaker.getMessageId()
+				evalBridgeJS(
+					`window.__onNativeTtsState && window.__onNativeTtsState(${jsonStringifyForBridge({ "state": "speaking", "messageId": mid } as UTSJSONObject)})`,
+				)
+			}
+			return
+		}
+		if (nativeTtsReportedBusy == true) {
+			nativeTtsReportedBusy = false
+			evalBridgeJS(
+				`window.__onNativeTtsState && window.__onNativeTtsState(${jsonStringifyForBridge({ "state": "end", "messageId": "" } as UTSJSONObject)})`,
+			)
+		}
+	}
+
+	function nativeTtsInitListener(): void {
+		if (nativeTtsStateListenerId != 0) {
+			return
+		}
+		nativeTtsStateListenerId = ttsWebSocketPlayer.subscribe(
+			(_state: TtsPlaybackState, _messageId: string): void => {
+				reportNativeTtsState()
+			},
+		)
+	}
+
+	function nativeTtsBegin(messageId: string, settingsObj: UTSJSONObject | null): void {
+		nativeTtsInitListener()
+		const settings = bridgeSettingsToVoiceSettings(settingsObj)
+		audioPlayerManager.setMuted(settings.muted)
+		console.log("[TTS] native begin messageId=" + messageId + " autoPlay=" + settings.autoPlay)
+		voiceStreamSpeaker.begin(messageId, settings)
+		// 对齐 H5 直连路径（chat-conversation-component ensureHeadlessStreamSpeak）：
+		// begin 会拆掉录音预热的 TTS 连接，立刻重建，避免首句合成卡在建连上被 SSE 饿死
+		ttsWebSocketPlayer.enableWarmupAndConnect()
+	}
+
+	function nativeTtsFeed(_messageId: string, text: string, finished: boolean): void {
+		console.log("[TTS] native feed msgId=" + _messageId + " textLen=" + text.length + " finished=" + finished)
+		voiceStreamSpeaker.onStreamChunk(text, "", finished)
+	}
+
+	function nativeTtsSpeak(messageId: string, text: string, settingsObj: UTSJSONObject | null): void {
+		nativeTtsInitListener()
+		const settings = bridgeSettingsToVoiceSettings(settingsObj)
+		// 工具栏手动播报：不受自动播报/静音开关影响，始终出声
+		settings.autoPlay = true
+		settings.muted = false
+		audioPlayerManager.setMuted(false)
+		voiceStreamSpeaker.speakPrepared(messageId, settings, text)
+	}
+
+	function nativeTtsStop(): void {
+		stopAllSpeechPlayback()
+		reportNativeTtsState()
+	}
+
+	function nativeTtsSetMuted(muted: boolean): void {
+		audioPlayerManager.setMuted(muted)
+	}
+
+	// ---- 原生媒体选择（拍照 / 相册 / 文件）：H5 内嵌页经 postMessage 调起 ----
+
+	/** 鸿蒙专属：uni-app x 拍照/相册/文件选择器取消时 reject 空 message，
+	 *  框架只拼出无详情的裸「chooseImage:fail / chooseFile:fail」，
+	 *  真错误必带详情后缀（如 No Permission）。其余平台恒 false，
+	 *  避免把 Android/iOS 的真错误（恰好也是裸 fail 前缀）当取消吞掉。 */
+	function isHarmonyBareChooseFail(errMsg: string): boolean {
+		// #ifdef APP-HARMONY
+		return errMsg == "chooseimage:fail" || errMsg == "choosefile:fail"
+		// #endif
+		return false
+	}
+
+	/** 取消选择判定（Android/iOS 的 cancel / abort / 中文「取消」文案；
+	 *  鸿蒙拍照取消时 uni-app x 运行时只回裸 chooseImage:fail，见 isHarmonyBareChooseFail）。
+	 *  注意：uni-app x 内置选图器在 Android「进相机后直接返回、未拍照」时报的是
+	 *  camera error / camera_cancel 而非 cancel（H5 侧 isImageChooseCancelled 同规则），
+	 *  漏判会把 UniError 当失败提示给用户。 */
+	function isNativeChooseCancelled(errMsg: string): boolean {
+		const lower = errMsg.toLowerCase()
+		return (
+			lower.indexOf("cancel") >= 0 ||
+			lower.indexOf("abort") >= 0 ||
+			lower.indexOf("取消") >= 0 ||
+			lower.indexOf("camera error") >= 0 ||
+			lower.indexOf("camera_cancel") >= 0 ||
+			isHarmonyBareChooseFail(lower)
+		)
+	}
+
+	/** 提取原生选择结果文件列表（path/name/size/type），空列表表示无文件 */
+	function extractNativeMediaFiles(res: any | null): UTSJSONObject[] {
+		const files = [] as UTSJSONObject[]
+		if (res == null) {
+			return files
+		}
+		let tempFiles: any[] = []
+		let paths: string[] = []
+		try {
+			const jsonStr = JSON.stringify(res)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "{}" && jsonStr != "null") {
+				const parsed = JSON.parse(jsonStr) as UTSJSONObject
+				const tf = parsed["tempFiles"]
+				if (tf != null) {
+					tempFiles = tf as any[]
+				}
+				const tp = parsed["tempFilePaths"]
+				if (tp != null) {
+					paths = tp as string[]
+				}
+			}
+		} catch (_e) {
+			tempFiles = []
+			paths = []
+		}
+		const count = tempFiles.length > 0 ? tempFiles.length : paths.length
+		for (let i = 0; i < count; i++) {
+			const file = new UTSJSONObject()
+			let path = ""
+			let name = ""
+			let type = ""
+			let size = 0
+			if (i < tempFiles.length) {
+				path = readRecorderStopString(tempFiles[i], "path")
+				name = readRecorderStopString(tempFiles[i], "name")
+				type = readRecorderStopString(tempFiles[i], "type")
+				size = readRecorderStopNumber(tempFiles[i], "size", 0)
+			}
+			if (path.length == 0 && i < paths.length) {
+				path = paths[i]
+			}
+			if (path.length == 0) {
+				continue
+			}
+			file["path"] = path
+			file["name"] = name
+			file["size"] = size
+			file["type"] = type
+			files.push(file)
+		}
+		return files
+	}
+
+	/** 把原生选择结果经 evalJS 回传 H5 __onNativeMediaResult */
+	function evalNativeMediaFiles(
+		success: boolean,
+		action: string,
+		cancelled: boolean,
+		error: string,
+		files: UTSJSONObject[],
+	): void {
+		const payload = new UTSJSONObject()
+		payload["success"] = success
+		payload["action"] = action
+		payload["cancelled"] = cancelled
+		payload["error"] = error
+		payload["files"] = files
+		evalBridgeJS(
+			`window.__onNativeMediaResult && window.__onNativeMediaResult(${jsonStringifyForBridge(payload)})`,
+		)
+	}
+
+	/** 安全读上传响应字段（null/空串回退 fallback） */
+	function bridgeFieldString(obj: UTSJSONObject | null, key: string, fallback: string): string {
+		if (obj == null) {
+			return fallback
+		}
+		const val = obj[key]
+		if (val == null) {
+			return fallback
+		}
+		const text = `${val}`
+		return text.length > 0 ? text : fallback
+	}
+
+	/** 解析 uni.uploadFile 响应：{code, data:{key,fileName,mimeType,size,url}} */
+	function parseNativeUploadResponse(raw: any | null): UTSJSONObject | null {
+		if (raw == null) {
+			return null
+		}
+		if (typeof raw == "string") {
+			const text = `${raw}`.trim()
+			if (text.length == 0) {
+				return null
+			}
+			try {
+				return JSON.parse(text) as UTSJSONObject
+			} catch (_eStr) {
+				return null
+			}
+		}
+		try {
+			const obj = raw as UTSJSONObject
+			if (obj["code"] != null || obj["data"] != null) {
+				return obj
+			}
+		} catch (_eObj) {
+			// ignore
+		}
+		try {
+			const jsonStr = JSON.stringify(raw)
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "null") {
+				return JSON.parse(jsonStr) as UTSJSONObject
+			}
+		} catch (_eJson) {
+			// ignore
+		}
+		return null
+	}
+
+	/**
+	 * 原生侧直接上传媒体文件（web-view 内嵌 H5 无法读取原生临时路径，
+	 * 与录音链路一致：原生上传，只把上传结果回传 H5）。
+	 * 全部成功/部分成功：回传成功项 {url,key,name,type,size}；全部失败才报错。
+	 */
+	function nativeUploadMediaFiles(action: string, files: UTSJSONObject[]): void {
+		if (files.length == 0) {
+			evalNativeMediaFiles(true, action, false, "", [] as UTSJSONObject[])
+			return
+		}
+		const token = uni.getStorageSync(ACCESS_TOKEN)
+		const header = new UTSJSONObject()
+		header["Authorization"] = `Bearer ${token}`
+		const formData = new UTSJSONObject()
+		formData["type"] = "tmp"
+		const results: UTSJSONObject[] = []
+		let pending = files.length
+		const settle = (): void => {
+			pending = pending - 1
+			if (pending > 0) {
+				return
+			}
+			if (results.length == 0) {
+				evalNativeMediaFiles(false, action, false, t("Mobile.FileUploader.uploadFailed"), [] as UTSJSONObject[])
+				return
+			}
+			evalNativeMediaFiles(true, action, false, "", results)
+		}
+		for (let i = 0; i < files.length; i++) {
+			const fileObj = files[i] as UTSJSONObject
+			const filePath = `${fileObj["path"]}`
+			// App 端 chooseImage 的 name 字段可能为空，用路径末段兜底真实文件名
+			let fileName = bridgeFieldString(fileObj, "name", "")
+			if (fileName.length == 0) {
+				const pathParts = filePath.split("/")
+				const lastPart = pathParts.length > 0 ? pathParts[pathParts.length - 1] : ""
+				fileName = lastPart.length > 0 ? lastPart : "file"
+			}
+			try {
+				uni.uploadFile({
+					url: getUploadFileAction(),
+					filePath: filePath,
+					name: "file",
+					header: header,
+					formData: formData,
+					success: (res) => {
+						const resultObj = parseNativeUploadResponse(res.data)
+						const dataObj =
+							resultObj != null ? (resultObj["data"] as UTSJSONObject | null) : null
+						if (dataObj != null) {
+							const item = new UTSJSONObject()
+							// 保留原生临时路径兜底：H5 桥 __onNativeMediaResult 以 path 非空为接收门槛，
+							// 且 H5 侧 url 为空时仍以 path 兜底展示（见 NativeMediaPickedFile 注释），勿删
+							item["path"] = filePath
+							item["url"] = bridgeFieldString(dataObj, "url", "")
+							item["key"] = bridgeFieldString(dataObj, "key", "")
+							const nameVal = bridgeFieldString(dataObj, "fileName", fileName)
+							item["name"] = nameVal.length > 0 ? nameVal : fileName
+							item["type"] = bridgeFieldString(
+								dataObj,
+								"mimeType",
+								"application/octet-stream",
+							)
+							const sizeRaw = dataObj["size"]
+							let sizeNum = 0
+							if (sizeRaw != null) {
+								sizeNum = parseFloat(`${sizeRaw}`)
+								if (isNaN(sizeNum)) {
+									sizeNum = 0
+								}
+							}
+							item["size"] = sizeNum
+							results.push(item)
+						}
+						settle()
+					},
+					fail: (_err) => {
+						settle()
+					},
+				})
+			} catch (_eUpload) {
+				settle()
+			}
+		}
+	}
+
+	function invokeNativeChooseImage(sourceType: string, maxCount: number): void {
+		const sourceTypes = (sourceType == "camera"
+			? (["camera"] as ("album" | "camera")[])
+			: (["album"] as ("album" | "camera")[]))
+		uni.chooseImage({
+			sourceType: sourceTypes,
+			sizeType: ["compressed"],
+			count: maxCount,
+			success: (res: any) => {
+				const files = extractNativeMediaFiles(res)
+				// 原生上传后再回传结果（web-view 内嵌 H5 读不了原生临时路径）
+				nativeUploadMediaFiles("chooseImage", files)
+			},
+			fail: (err: any) => {
+				const errMsg = readRecorderErrorMessage(err)
+				const cancelled = isNativeChooseCancelled(errMsg)
+				evalNativeMediaFiles(
+					false,
+					"chooseImage",
+					cancelled,
+					cancelled ? "" : errMsg,
+					[] as UTSJSONObject[],
+				)
+			},
+		})
+	}
+
+	/** 拍照 / 相册（App 内嵌 H5）：Android 先申请对应权限（相机 CAMERA / 相册媒体读取），永久拒绝则引导去设置 */
+	function nativeChooseImage(sourceType: string, maxCount: number): void {
+		// #ifdef APP-ANDROID
+		if (sourceType == "camera") {
+			ensureNativeCameraPermission().then((result: NativeMicPermissionResult) => {
+				if (result.granted != true) {
+					if (result.deniedForever == true) {
+						guideNativePermissionSettings(
+							t("Mobile.AgentDetail.cameraPermissionTitle"),
+							t("Mobile.AgentDetail.cameraPermissionSystemContent"),
+							"android.permission.CAMERA",
+						)
+					}
+					evalNativeMediaFiles(false, "chooseImage", true, "", [] as UTSJSONObject[])
+					return
+				}
+				invokeNativeChooseImage(sourceType, maxCount)
+			})
+			return
+		}
+		// Android 相册：先申请媒体读取权限（按 targetSdkVersion 分流 READ_MEDIA_IMAGES /
+		// READ_EXTERNAL_STORAGE，见 resolveAlbumMediaPermission），否则 uni.chooseImage 未授权会直接报 UniError
+		ensureNativeAlbumPermission().then((result: NativeMicPermissionResult) => {
+			if (result.granted != true) {
+				if (result.deniedForever == true) {
+					guideNativePermissionSettings(
+						t("Mobile.AgentDetail.albumPermissionTitle"),
+						t("Mobile.AgentDetail.albumPermissionSystemContent"),
+						resolveAlbumMediaPermission(),
+					)
+				}
+				// 临时拒绝：静默，下次点击系统会再次弹授权框
+				evalNativeMediaFiles(false, "chooseImage", true, "", [] as UTSJSONObject[])
+				return
+			}
+			invokeNativeChooseImage(sourceType, maxCount)
+		})
+		return
+		// #endif
+		invokeNativeChooseImage(sourceType, maxCount)
+	}
+
+	/** 文件选择（App 内嵌 H5）：走系统文件选择器 */
+	function nativeChooseFile(maxCount: number): void {
+		uni.chooseFile({
+			type: "file",
+			count: maxCount,
+			success: (res: any) => {
+				const files = extractNativeMediaFiles(res)
+				// 原生上传后再回传结果（web-view 内嵌 H5 读不了原生临时路径）
+				nativeUploadMediaFiles("chooseFile", files)
+			},
+			fail: (err: any) => {
+				const errMsg = readRecorderErrorMessage(err)
+				const cancelled = isNativeChooseCancelled(errMsg)
+				evalNativeMediaFiles(
+					false,
+					"chooseFile",
+					cancelled,
+					cancelled ? "" : errMsg,
+					[] as UTSJSONObject[],
+				)
+			},
+		})
+	}
+
+	// ---- 原生下载（文件树「下载全部」zip）：内嵌 H5 经 postMessage 调起 ----
+
+	/** 下载全部文件（zip）：原生 uni.downloadFile + 保存公共目录，结果回传 H5 */
+	function nativeDownloadAllFiles(cId: string): void {
+		// #ifdef APP
+		const downloadUrl = `${getApiBaseUrl()}/api/computer/static/download-all-files?cId=${cId}`
+		const filename = `chat-${cId}.zip`
+		downloadFileInApp(downloadUrl, filename).then(
+			(_path: string) => {
+				evalBridgeJS(
+					`window.__onNativeDownloadResult && window.__onNativeDownloadResult(${jsonStringifyForBridge({ "success": true, "error": "" } as UTSJSONObject)})`,
+				)
+			},
+			(err: any) => {
+				const errMsg = readRecorderErrorMessage(err)
+				evalBridgeJS(
+					`window.__onNativeDownloadResult && window.__onNativeDownloadResult(${jsonStringifyForBridge({ "success": false, "error": errMsg } as UTSJSONObject)})`,
+				)
+			},
+		)
+		// #endif
+	}
+
+	/** 预览图保存到相册：原生 downloadFile + saveImageToPhotosAlbum，结果回传 H5 */
+	function nativeSavePreviewImage(url: string): void {
+		// #ifdef APP
+		savePreviewImageToAlbumInApp(url).then(
+			() => {
+				evalBridgeJS(
+					`window.__onNativeDownloadResult && window.__onNativeDownloadResult(${jsonStringifyForBridge({ "success": true, "error": "" } as UTSJSONObject)})`,
+				)
+			},
+			(err: any) => {
+				const errMsg = readRecorderErrorMessage(err)
+				evalBridgeJS(
+					`window.__onNativeDownloadResult && window.__onNativeDownloadResult(${jsonStringifyForBridge({ "success": false, "error": errMsg } as UTSJSONObject)})`,
+				)
+			},
+		)
+		// #endif
+	}
+
+	/**
+	 * 原生 file-preview-page 提交 OpenUI 表单后 navigateBack → 本页 onShow。
+	 * 从原生 storage 消费续作消息，经 evalJS 注入内嵌 H5 的 __nuwaxOnOpenUiResume。
+	 * （H5 与原生 storage 不共享，不能指望内嵌页自己 consumePending。）
+	 */
+	function deliverPendingOpenUiResumeToH5(): void {
+		const message = consumeLatestPendingOpenUiAction()
+		if (message.length == 0) {
+			return
+		}
+		// JSON.stringify 生成安全 JS 字符串字面量（含引号/换行/中文）
+		const literal = JSON.stringify(message)
+		evalBridgeJS(
+			`try{window.__nuwaxOnOpenUiResume&&window.__nuwaxOnOpenUiResume(${literal});}catch(e){}`,
+		)
+	}
+
+	// ---- 消息分发 ----
+
+	function isEmbeddedNativePayRequestId(requestId: string): boolean {
+		return requestId.indexOf("app_pay_") == 0
+	}
+
+	/** 确认原生已持久化支付请求，使 H5 停止重发。 */
+	function notifyH5NativePayAccepted(requestId: string): void {
+		const literal = JSON.stringify(requestId)
+		evalBridgeJS(
+			`try{window.__nuwaxOnNativePayAccepted&&window.__nuwaxOnNativePayAccepted(${literal});}catch(e){}`,
+		)
+	}
+
+	/** 告知 H5 收银台参数已就位、即将切走：撤「支付处理中」遮罩、弹支付确认框。 */
+	function notifyH5NativePayLaunched(requestId: string): void {
+		const literal = JSON.stringify(requestId)
+		evalBridgeJS(
+			`try{window.__nuwaxOnNativePayLaunched&&window.__nuwaxOnNativePayLaunched(${literal});}catch(e){}`,
+		)
+	}
+
+	/** 将持久化的原生支付状态回传 H5；未收到 ACK 时会在 @load 注入窗口补发。 */
+	function notifyH5NativePayResult(requestId: string, result: string): void {
+		const requestLiteral = JSON.stringify(requestId)
+		const resultLiteral = JSON.stringify(result)
+		evalBridgeJS(
+			`try{window.__nuwaxOnNativePayResult&&window.__nuwaxOnNativePayResult(${requestLiteral},${resultLiteral});}catch(e){}`,
+		)
+	}
+
+	/** 确认原生已处理同步请求；即使当前没有结果，也让 H5 停止重试。 */
+	function notifyH5NativePaySyncComplete(consumerId: string): void {
+		const literal = JSON.stringify(consumerId)
+		evalBridgeJS(
+			`try{window.__nuwaxOnNativePaySyncComplete&&window.__nuwaxOnNativePaySyncComplete(${literal});}catch(e){}`,
+		)
+	}
+
+	/** 接收 H5 已选择的渠道；requestId 重发只确认，不重复拉起收银台。 */
+	async function handleNativePayRequest(
+		orderId: number,
+		requestId: string,
+		payChannel: string,
+	): Promise<void> {
+		const isNew = beginAppNativePaySession(orderId, requestId, payChannel)
+		notifyH5NativePayAccepted(requestId)
+		if (isNew != true) {
+			const stored = getStoredAppNativePayResult()
+			if (stored != null) {
+				const result = stored["result"] != null ? `${stored["result"]}` : ""
+				if (result.length > 0) {
+					notifyH5NativePayResult(requestId, result)
+				}
+			}
+			return
+		}
+		try {
+			// 两段式：先取收银台参数（H5 侧此时还压着「支付处理中」遮罩），
+			// 拿到后先通知 H5 撤遮罩、弹确认框，再真正切到第三方 App。
+			const redirectUrl = await requestAppNativePayRedirect(
+				orderId,
+				payChannel,
+				requestId,
+			)
+			notifyH5NativePayLaunched(requestId)
+			await launchAppNativePayRedirect(payChannel, redirectUrl)
+		} catch (error) {
+			console.error("[native-pay] launch failed", error)
+			storeAppNativePayResult(requestId, "failed")
+			notifyH5NativePayResult(requestId, "failed")
+		}
+	}
+
+	/** 从微信/支付宝回到 App 后核对服务端结算状态。 */
+	async function checkNativePayOnResume(): Promise<void> {
+		if (nativePayResultChecking == true) {
+			return
+		}
+		nativePayResultChecking = true
+		try {
+			const snapshot = await checkActiveAppPayResult()
+			if (snapshot != null) {
+				const requestId = snapshot["requestId"] != null ? `${snapshot["requestId"]}` : ""
+				const result = snapshot["result"] != null ? `${snapshot["result"]}` : ""
+				if (isEmbeddedNativePayRequestId(requestId) && result.length > 0) {
+					notifyH5NativePayResult(requestId, result)
+				}
+			}
+		} catch (error) {
+			console.warn("[native-pay] settlement check failed", error)
+		} finally {
+			nativePayResultChecking = false
+		}
+	}
+
+	/** web-view @message：分发原生语音指令（录音 / TTS）与媒体选择（拍照 / 相册 / 文件） */
+	/**
+	 * 返回首页的“优雅退出”：iOS 26 WKWebView 释放竞态缓解（2026-08-17 崩溃分析：
+	 * WebBackForwardList/FrameState IPC 与 webview 释放竞态，来回切换 agent 高频复现）。
+	 * 先 v-if 卸载 web-view，延时 150ms 再 switchTab，错开销毁窗口；
+	 * Android 无此崩溃，编译为直接导航保持原行为。
+	 */
+	function graceExitToHome(): void {
+		// #ifdef APP-IOS
+		if (webViewAlive.value) {
+			webViewAlive.value = false
+			setTimeout(() => {
+				uni.switchTab({ url: "/pages/index/index" })
+			}, 150)
+			return
+		}
+		// #endif
+		uni.switchTab({ url: "/pages/index/index" })
+	}
+
+	/**
+	 * 「优雅 pop」：与 graceExitToHome 同源的 iOS 26 WKWebView 释放竞态缓解，
+	 * 区别是回到页面栈里真实的上一页（如系统消息列表），而不是无条件回首页。
+	 * 先卸载 web-view 再 navigateBack；二次进入 onBackPress 时 webViewAlive 已为 false，
+	 * 会直接放行给框架 pop，不会递归。
+	 */
+	function graceNavigateBack(): void {
+		// #ifdef APP-IOS
+		if (webViewAlive.value) {
+			webViewAlive.value = false
+			setTimeout(() => {
+				uni.navigateBack({
+					delta: 1,
+					fail: (_err: any | null) => {
+						graceExitToHome()
+					},
+				})
+			}, 150)
+			return
+		}
+		// #endif
+		uni.navigateBack({
+			delta: 1,
+			fail: (_err: any | null) => {
+				graceExitToHome()
+			},
+		})
+	}
+
+	/**
+	 * H5 导航栏返回 / 需原生代劳的 pop：在原生侧读页面栈，避免 uni.webView.navigateBack
+	 * 走 JavaBridge 时 getCurrentPages 为空（Android：navigateBack fail errCode=4）。
+	 * - 上一页仍是聊天壳：navigateBack（fail 则回首页）
+	 * - 否则 / 栈不足：graceExitToHome（switchTab）
+	 */
+	function handleAppNavBackFromH5(): void {
+		if (appWebViewPopupOpen == true) {
+			// 与 closeH5TopPopup 同语义（本函数须在 closeH5TopPopup 声明前可用，走已有 evalBridgeJS）
+			evalBridgeJS(
+				"try{window.__nuwaxCloseTopPopup && window.__nuwaxCloseTopPopup()}catch(e){}",
+			)
+			return
+		}
+		const pages = getCurrentPages()
+		if (pages.length > 1) {
+			const prevPage = pages[pages.length - 2]
+			if (prevPage != null) {
+				const prevRoute = `${prevPage.route}`
+				if (
+					prevRoute.indexOf("agent-detail") >= 0 ||
+					prevRoute.indexOf("chat-temp") >= 0 ||
+					prevRoute.indexOf("app-details") >= 0
+				) {
+					uni.navigateBack({
+						delta: 1,
+						fail: (_err: any | null) => {
+							graceExitToHome()
+						},
+					})
+					return
+				}
+			}
+			// 上一页是 Tab/列表等（如系统消息列表）：pop 回去；失败则回首页
+			graceNavigateBack()
+			return
+		}
+		graceExitToHome()
+	}
+
+	function handleWebViewMessage(e: UniWebViewMessageEvent): void {
+		const msg = parseWebViewBridgeMessage(e.detail.data)
+		if (msg == null) {
+			return
+		}
+		const type = `${msg["type"]}`
+		if (type == "native-pay") {
+			const orderId = parseInt(`${msg["orderId"]}`)
+			const requestId = msg["requestId"] != null ? `${msg["requestId"]}` : ""
+			const payChannel = msg["payChannel"] != null ? `${msg["payChannel"]}` : ""
+			if (
+				!isNaN(orderId) &&
+				orderId > 0 &&
+				isEmbeddedNativePayRequestId(requestId) &&
+				(payChannel == "WxPay" || payChannel == "AliPay")
+			) {
+				handleNativePayRequest(orderId, requestId, payChannel).catch((): void => {})
+			} else {
+				if (requestId.length > 0) {
+					storeAppNativePayResult(requestId, "failed")
+					notifyH5NativePayResult(requestId, "failed")
+				}
+			}
+			return
+		}
+		if (type == "native-pay-result-ack") {
+			const requestId = msg["requestId"] != null ? `${msg["requestId"]}` : ""
+			if (isEmbeddedNativePayRequestId(requestId)) {
+				acknowledgeAppNativePayResult(requestId)
+			}
+			return
+		}
+		if (type == "native-pay-result-sync") {
+			const consumerId = msg["consumerId"] != null ? `${msg["consumerId"]}` : ""
+			const stored = getStoredAppNativePayResult()
+			let deliveredResult = false
+			if (stored != null) {
+				const requestId = stored["requestId"] != null ? `${stored["requestId"]}` : ""
+				const result = stored["result"] != null ? `${stored["result"]}` : ""
+				if (isEmbeddedNativePayRequestId(requestId) && result.length > 0) {
+					notifyH5NativePayResult(requestId, result)
+					deliveredResult = true
+				}
+			}
+			// 有结果时等待 H5 ACK；下一次同步确认 storage 已清理后再结束重试。
+			if (consumerId.length > 0 && deliveredResult != true) {
+				notifyH5NativePaySyncComplete(consumerId)
+			}
+			return
+		}
+		if (type == "record") {
+			const action = `${msg["action"]}`
+			if (action == "start") {
+				nativeStartRecord()
+			} else if (action == "stop") {
+				nativeStopRecord()
+			} else if (action == "discard") {
+				nativeRecordDiscard()
+			} else if (action == "requestPermission") {
+				// H5 按下前权限预检：回传真实授权结果（首次 iOS 在此弹系统授权窗）
+				nativeRequestRecordPermission()
+			} else if (action == "openSettings") {
+				// H5 引导弹窗确认「去设置」：打开系统设置页（iOS/Android/鸿蒙通用）
+				uni.openAppAuthorizeSetting({})
+			}
+			return
+		}
+		if (type == "media") {
+			const action = `${msg["action"]}`
+			const sourceType = msg["sourceType"] != null ? `${msg["sourceType"]}` : "album"
+			let maxCount = 9
+			try {
+				const mc = parseFloat(`${msg["maxCount"]}`)
+				if (!isNaN(mc) && mc > 0) {
+					maxCount = mc
+				}
+			} catch (_e) {
+				maxCount = 9
+			}
+			if (action == "chooseImage") {
+				nativeChooseImage(sourceType, maxCount)
+			} else if (action == "chooseFile") {
+				nativeChooseFile(maxCount)
+			}
+			return
+		}
+		if (type == "download") {
+			const action = `${msg["action"]}`
+			if (action == "downloadAllFiles") {
+				const cId = msg["cId"] != null ? `${msg["cId"]}` : ""
+				if (cId.length > 0) {
+					nativeDownloadAllFiles(cId)
+				}
+			} else if (action == "saveImage") {
+				const imageUrl = msg["url"] != null ? `${msg["url"]}` : ""
+				if (imageUrl.length > 0) {
+					nativeSavePreviewImage(imageUrl)
+				}
+			}
+			return
+		}
+		if (type == "app-exit") {
+			// H5 内嵌页请求退出回首页：走 grace 卸载，避免直接导航触发 webview 销毁竞态
+			graceExitToHome()
+			return
+		}
+		if (type == "app-nav-back") {
+			// H5 导航栏返回：原生侧安全 pop / 回首页（见 handleAppNavBackFromH5）
+			handleAppNavBackFromH5()
+			return
+		}
+		if (type == "app-open-external-link") {
+			const href = msg["url"] != null ? `${msg["url"]}` : ""
+			const title = msg["title"] != null ? `${msg["title"]}` : ""
+			if (href.length > 0) {
+				openExternalLinkPage(href, title)
+			}
+			return
+		}
+		if (type == "popup-back") {
+			// H5 内嵌页弹窗开合状态同步（uni-modal-popup 经 popupBackRegistry 上报）
+			const action = `${msg["action"]}`
+			appWebViewPopupOpen = action == "open"
+			return
+		}
+		if (type == "kb-diag") {
+			// H5 键盘/视口诊断回传：仅吞掉消息，不再打控制台
+			return
+		}
+		if (type == "tts") {
+			const action = `${msg["action"]}`
+			if (action == "begin") {
+				nativeTtsBegin(`${msg["messageId"]}`, asBridgeRecord(msg["settings"]))
+			} else if (action == "feed") {
+				nativeTtsFeed(
+					`${msg["messageId"]}`,
+					`${msg["text"]}`,
+					msg["finished"] == true,
+				)
+			} else if (action == "speak") {
+				nativeTtsSpeak(
+					`${msg["messageId"]}`,
+					`${msg["text"]}`,
+					asBridgeRecord(msg["settings"]),
+				)
+			} else if (action == "stop") {
+				nativeTtsStop()
+			} else if (action == "setMuted") {
+				nativeTtsSetMuted(msg["muted"] == true)
+			}
+		}
+	}
+
+	/** 通知 H5 关闭顶层弹窗（fire-and-forget；状态回传走 popup-back 消息自校正） */
+	function closeH5TopPopup(): void {
+		const ctx = appWebViewBridgeContext
+		if (ctx == null) {
+			return
+		}
+		try {
+			ctx.evalJS(
+				"try{window.__nuwaxCloseTopPopup && window.__nuwaxCloseTopPopup()}catch(e){}",
+			)
+		} catch (e) {
+			// ignore
+		}
+	}
+
+	/**
+	 * 返回拦截：H5 内嵌页有弹窗打开时先关弹窗，避免 Android 返回手势
+	 * （page-container 在 Android 不拦截返回）直接弹掉整个 agent-detail 页面。
+	 * 弹窗真正关闭后 H5 会回传 popup-back close 同步 appWebViewPopupOpen=false。
+	 *
+	 * 历史会话经 uni.webView.navigateTo 压了多层原生 agent-detail 时：
+	 * 侧滑 / 返回键须 return false 交给框架 pop（对齐 Android），才能回到上一聊天页；
+	 * 仅在即将退出聊天壳回首页时，iOS 才走 grace 卸载 webview。
+	 */
+	onBackPress((_options: OnBackPressOptions): boolean => {
+		if (appWebViewPopupOpen == true) {
+			closeH5TopPopup()
+			return true
+		}
+		// 上一页仍是聊天壳（历史会话再开一层）：不拦截，原生栈 pop → 上一聊天页
+		// 鸿蒙右→左侧滑、Android 返回键均走此路径（H5 导航栏改走 app-nav-back postMessage）
+		const pages = getCurrentPages()
+		if (pages.length > 1) {
+			const prevPage = pages[pages.length - 2]
+			if (prevPage != null) {
+				const prevRoute = `${prevPage.route}`
+				if (
+					prevRoute.indexOf("agent-detail") >= 0 ||
+					prevRoute.indexOf("chat-temp") >= 0 ||
+					prevRoute.indexOf("app-details") >= 0
+				) {
+					return false
+				}
+			}
+		}
+		// 栈只剩本页或为空：不能再 navigateBack（会报 getCurrentPage is empty），改回首页
+		if (pages.length <= 1) {
+			graceExitToHome()
+			return true
+		}
+		// #ifdef APP-IOS
+		// iOS 26 WKWebView 释放竞态缓解：先优雅卸载 webview 再导航。
+		// 注意 onBackPress 对 uni.navigateBack 同样会触发，这里必须 pop 回栈里真实的上一页，
+		// 不能无条件 switchTab 回首页 —— 否则从系统消息列表进来的会话，返回会落到首页
+		// （Android 无此分支，直接 return false 交给框架 pop，所以只有 iOS 有该问题）。
+		if (webViewAlive.value) {
+			graceNavigateBack()
+			return true
+		}
+		// #endif
+		return false
+	})
+
+	onLoad((options: any) => {
+		const optionsObj = options as UTSJSONObject
+		const idRaw = optionsObj["id"]
+		const convRaw = optionsObj["conversationId"]
+		const agentId = idRaw != null ? `${idRaw}` : ""
+		if (agentId.length == 0) {
+			return
+		}
+		let webUrl = `${getApiBaseUrl()}/m/#/subpackages/pages/agent-detail/agent-detail?id=${agentId}&appEmbedded=1`
+		const conversationId = convRaw != null ? `${convRaw}` : ""
+		if (conversationId.length > 0) {
+			webUrl = `${webUrl}&conversationId=${conversationId}`
+		}
+		// 状态栏（刘海）高度注入：webview 全屏铺满后顶部刘海区域由 H5 内部导航栏处理，
+		// 此参数供内嵌 H5 的 custom-nav-bar safety-zone 在页面内做状态栏占位（见 getEmbeddedStatusBarHeight）。
+		webUrl = `${webUrl}&statusBarHeight=${getStatusBarHeight()}`
+		// URL 参数兜底透传登录态：追加到 hash fragment（# 后内容仅客户端可见，不会随 HTTP 请求发往服务端）。
+		// H5 侧聊天组件 onLoad 读取并写入 storage / ticket cookie。
+		// 与 @load evalJS 注入互为备份：任一成功即可完成登录态透传（脚本幂等，重复无副作用）。
+		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
+		const accessToken = tokenRaw != null ? `${tokenRaw}` : ""
+		if (accessToken.length > 0) {
+			webUrl = `${webUrl}&accessToken=${encodeURIComponent(accessToken)}`
+		}
+		agentDetailWebUrl.value = webUrl
+		// 尽早复位 webview textZoom：webview 挂载后立刻生效，避免 H5 首帧以放大字号渲染
+		fixAppWebviewTextZoom()
+		// 键盘高度桥：系统键盘高度 → 内嵌 H5（幂等注册，onUnmounted 注销）
+		// Android / iOS / 鸿蒙均注入：H5 keyboard-cover 抬升输入区，避免系统 pan 把固定导航顶出屏。
+		// #ifdef APP-ANDROID
+		// 先算一次底部手势条高度，随注入轮询落到 H5（@load 前键盘已弹起时也带得上）
+		latestInjectedSafeAreaBottom = readAndroidSafeAreaBottom()
+		// #endif
+		if (appKeyboardHeightListenerId == 0) {
+			appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChangeForWebView)
+		}
+	})
+	// #endif
+	// #endif
+
+	// #ifdef APP-IOS
+	// iOS：旧链接兜底 → 转开首页常驻壳（若仍在首页则 emit，否则内部 switchTab 回首页）。
+	// 禁止在本页再 switchTab（Android 会 NPE），统一交给 openResidentChat。
+	onLoad((options: any) => {
+		const optionsObj = options as UTSJSONObject
+		const idRaw = optionsObj['id']
+		const convRaw = optionsObj['conversationId']
+		const agentIdText = idRaw != null ? `${idRaw}` : ''
+		if (agentIdText.length == 0) {
+			uni.switchTab({ url: '/pages/index/index' })
+			return
+		}
+		let agentIdNum = 0
+		try {
+			agentIdNum = parseInt(agentIdText)
+			if (agentIdNum != agentIdNum) {
+				agentIdNum = 0
+			}
+		} catch (_e) {
+			agentIdNum = 0
+		}
+		if (agentIdNum <= 0) {
+			uni.switchTab({ url: '/pages/index/index' })
+			return
+		}
+		let conversationId: number | null = null
+		if (convRaw != null && `${convRaw}`.length > 0) {
+			try {
+				const c = parseInt(`${convRaw}`)
+				if (c == c && c > 0) {
+					conversationId = c
+				}
+			} catch (_eConv) {
+				conversationId = null
+			}
+		}
+		openResidentChat(agentIdNum, conversationId)
+	})
+	// #endif
 
 	/** Android：Gen* 组件禁止 as UTSJSONObject，用 $callMethod */
 	function callChatMethod(methodName: string): void {
@@ -22,6 +2583,17 @@
 	}
 
 	onShow(() => {
+		// #ifdef APP
+		// #ifndef APP-IOS
+		// 微信/支付宝返回前台：以服务端结算状态为准，并把结果回传内嵌 H5。
+		checkNativePayOnResume().catch((): void => {})
+		// 从原生 OpenUI 预览返回：把暂存续作注入内嵌 H5（须在 callChatMethod 之前，
+		// App 壳无原生 chat 组件，triggerResume 对内嵌场景无效）
+		deliverPendingOpenUiResumeToH5()
+		// #endif
+		// #endif
+		// 注：AVAudioSession 预热（ensureNativeRecorder().prepareSession）已迁至
+		// 常驻壳（iOS）统一处理；Android / 鸿蒙本就不编译该方法（仅 iOS 插件提供）。
         // #ifndef MP-WEIXIN
         callChatMethod("triggerResume")
         // #endif
@@ -48,6 +2620,84 @@
 	})
 
 	onUnmounted(() => {
+		// #ifdef APP
+		// #ifndef APP-IOS
+		// 离开页面即停止注入短轮询，避免对已销毁的 webview 继续 evalJS
+		if (appWebViewBridgeTimer != 0) {
+			clearInterval(appWebViewBridgeTimer)
+			appWebViewBridgeTimer = 0
+		}
+		// 注销键盘高度桥监听（Android / iOS / 鸿蒙均在 onLoad 注册）
+		if (appKeyboardHeightListenerId != 0) {
+			try {
+				uni.offKeyboardHeightChange(appKeyboardHeightListenerId)
+			} catch (_e) {
+				// ignore
+			}
+			appKeyboardHeightListenerId = 0
+		}
+		// 停掉 IME 高度短轮询（变量各端均有；仅 Android 会真正启动）
+		if (imePollTimer != 0) {
+			clearTimeout(imePollTimer)
+			imePollTimer = 0
+		}
+		// 停掉原生语音：断开 TTS 状态订阅并停止播报/录音，避免残留播放与监听
+		if (nativeTtsStateListenerId != 0) {
+			try {
+				ttsWebSocketPlayer.unsubscribe(nativeTtsStateListenerId)
+			} catch (_e) {
+				// ignore
+			}
+			nativeTtsStateListenerId = 0
+		}
+		stopAllSpeechPlayback()
+		clearNativeNoSpeechWatchdog()
+		if (nativeRecordingActive == true) {
+			nativeRecordingActive = false
+			try {
+				ensureNativeRecorder().stop()
+			} catch (_e) {
+				// ignore
+			}
+		}
+		// App 三端：释放录音器（含 Android/iOS 采集线程与鸿蒙启动在途的异步创建流程），避免残留占麦
+		if (nativeRecorderInstance != null) {
+			try {
+				nativeRecorderInstance!.releaseRecorder()
+			} catch (_eRel) {
+				// ignore
+			}
+			nativeRecorderInstance = null
+		}
+		// 重置推流管道（作废在途 sendFrame 回调）
+		if (nativeStreamPipeline != null) {
+			try {
+				nativeStreamPipeline.reset()
+			} catch (_ePipe) {
+				// ignore
+			}
+		}
+		nativeVadSpeechDetected = false
+		nativeReadyReached = false
+		nativeStreamFallbackArmed = false
+		nativeAudioTruncated = false
+		// 收尾原生流式 ASR：中止未完成会话并断开预热连接
+		if (nativeAsrSessionActive == true || nativeAsrWaitingResult == true) {
+			nativeAsrSessionActive = false
+			nativeAsrWaitingResult = false
+			try {
+				asrWebSocketClient.abort()
+			} catch (_eAsr) {
+				// ignore
+			}
+		}
+		try {
+			asrWebSocketClient.disableWarmupAndDisconnect()
+		} catch (_eDis) {
+			// ignore
+		}
+		// #endif
+		// #endif
 		/**
 		 * 事件监听, 刷新首页，重新请求我的收藏数据
 		 * 智能体主页中点击收藏或取消收藏后，返回首页，需要刷新首页数据
@@ -80,4 +2730,36 @@
 </script>
 
 <style lang="scss" scoped>
+	/* App web-view 容器：webview 全屏铺满（含状态栏/刘海区域），顶部刘海由内嵌 H5 导航栏内部处理 */
+	.app-webview-root {
+		display: flex;
+		flex-direction: column;
+		width: 100%;
+		height: 100%;
+		overflow: hidden;
+	}
+
+	/* webview 占满整个页面 */
+	.webview-fill {
+		flex: 1;
+		width: 100%;
+	}
+
+	/* Android web-view 兄弟占位：不可见、不拦截触摸，仅用于让 web-view 保持普通节点模式（见模板注释，勿删） */
+	.webview-node-placeholder {
+		position: fixed;
+		top: 0;
+		left: 0;
+		width: 1px;
+		height: 1px;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	/* iOS 旧链接兜底占位：本页仅作中转，无可见内容 */
+	.app-redirect-placeholder {
+		width: 1px;
+		height: 1px;
+		opacity: 0;
+	}
 </style>

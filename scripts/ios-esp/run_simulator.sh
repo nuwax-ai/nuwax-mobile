@@ -39,12 +39,12 @@ xcodebuild -project "$PROJ" -scheme UniAppX -configuration "$CONFIGURATION" \
   build
 
 echo "==== install + launch ===="
-xcrun simctl uninstall "$SIM_UDID" com.nuwax.nuwa 2>/dev/null || true
+xcrun simctl uninstall "$SIM_UDID" com.nuwax.app 2>/dev/null || true
 xcrun simctl install "$SIM_UDID" "$APP"
-xcrun simctl launch "$SIM_UDID" com.nuwax.nuwa
+xcrun simctl launch "$SIM_UDID" com.nuwax.app
 
-echo "✓ 已在模拟器启动 com.nuwax.nuwa"
+echo "✓ 已在模拟器启动 com.nuwax.app"
 echo "  检查 Frameworks："
-xcrun simctl get_app_container "$SIM_UDID" com.nuwax.nuwa | while read -r c; do
+xcrun simctl get_app_container "$SIM_UDID" com.nuwax.app | while read -r c; do
   ls "$c/Frameworks" 2>/dev/null | grep -E 'ESPProvision|SwiftProtobuf|NuwaxEsp' || true
 done

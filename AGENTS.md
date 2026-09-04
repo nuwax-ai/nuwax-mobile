@@ -62,6 +62,19 @@ feat/nuwa-zhuoda-<YYYY.MM>[-<slug>]   →  release/nuwa-zhuoda  →  生产发�
 
 旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
 
+## Git 远程约定（2026-09 起）
+
+与主仓（nuwax）统一命名，**remote 名固定用途，不再「切换 origin 地址」**：
+
+| remote 名 | 仓库 | 说明 |
+|---|---|---|
+| `origin` | `https://git.yichamao.com/agent-platform/agent-platform-front-weapp.git`（内网 GitLab） | **默认拉/推主仓** |
+| `github` | `https://github.com/nuwax-ai/nuwax-mobile.git` | 公开镜像 |
+
+- ⚠️ **push 前先想清楚推哪个 remote**；默认 `git push` 走 `origin`（内网），推 GitHub 需显式 `git push github <分支>`
+- 旧命名克隆（`origin`=GitHub、`gitlab`=内网）迁移：`git remote rename origin github && git remote rename gitlab origin && git fetch --all --prune`
+- 两端同名分支可能分叉（如 `dev`、`main`），同步前先看领先落后；配置详情见 [docs/archive/switch-git-remote.md](docs/archive/switch-git-remote.md)
+
 ## 构建工具链（重要）
 
 **本项目没有 `uni` CLI / vite 的 npm scripts，所有平台的编译、运行、打包都必须通过 HBuilderX 完成**（本机安装版本 5.15，路径 `/Applications/HBuilderX.app`）。uni-app x 的 uts/uvue 编译依赖 HBuilderX 内置的编译器，不要尝试 `npx vite build` 或 `npm run dev` 来跑 App 端。
@@ -153,8 +166,8 @@ make sdk-fetch                       # → NUWAX_OFFLINE_SDK_HOME（sdk/ + archi
 # Step 1  派生各平台路径（UNIAPPX_*_SDK_ROOT / *_ESP_WORK 等）
 source scripts/local-base-env.sh     # 若提示缺 SDK，回到 Step 0
 
-# Step 2  HBuilderX 生成本地打包 App 资源（GUI，不可跳过）
-#   HX：发行 → 原生App-本地打包 → 生成本地打包App资源（iOS / Android）
+# Step 2  生成本地打包 App 资源（HX CLI，iOS+Android 一起出；需 HBuilderX 已启动 + 项目已导入）
+make app-resource                 # = cli publish app --type appResource --project <本仓绝对路径>
 #   产物：unpackage/resources/app-ios、app-android
 
 # Step 3  出基座（按目标选一个）
@@ -173,11 +186,11 @@ make base-ios-simulator              # → Pandora_simulator_debug.app（模拟�
 - iOS 真机与模拟器是**两套包**，勿混用；模拟器包免签但不能验支付/推送等原生链路。
 - **改了 UTS 原生插件** → Step 0/1 免（SDK 不变），从 Step 2 重跑（重新生成本地资源 + Step 3 重打基座）。
 - **仅改 uvue/uts 业务代码** → 直接 HX「使用自定义基座运行」热更，不必重打基座。
-- 详细：[docs/local-custom-base-maintenance.md](docs/local-custom-base-maintenance.md)、[offline-sdk-distribution-s3.md](docs/offline-sdk-distribution-s3.md)、各平台 [android](docs/android-esp-provisioning-local-base.md) / [ios](docs/ios-esp-provisioning-local-base.md)。
+- 详细：[docs/engineering/local-custom-base-maintenance.md](docs/engineering/local-custom-base-maintenance.md)、[offline-sdk-distribution-s3.md](docs/engineering/offline-sdk-distribution-s3.md)、各平台 [android](docs/engineering/android-esp-provisioning-local-base.md) / [ios](docs/engineering/ios-esp-provisioning-local-base.md)。
 
 ## 自定义基座同步更新
 
-含原生插件联调时，从 S3 拉最新基座到 `unpackage/debug/`（**不指定版本 = 最新**）。详情：[docs/custom-base-distribution-s3.md](docs/custom-base-distribution-s3.md)。
+含原生插件联调时，从 S3 拉最新基座到 `unpackage/debug/`（**不指定版本 = 最新**）。详情：[docs/engineering/custom-base-distribution-s3.md](docs/engineering/custom-base-distribution-s3.md)。
 
 ```bash
 pnpm base:fetch
@@ -191,7 +204,7 @@ HX：运行 → **使用自定义基座运行** → 选 `unpackage/debug/` 下 a
 
 ## 离线 SDK 同步
 
-本地自定义基座需要 uni-app x 离线 SDK + 乐鑫配网依赖。从 S3 拉取到 `NUWAX_OFFLINE_SDK_HOME`（默认 `$HOME/workspace/nuwax-mobile-offline-sdk`）：**只含 `sdk/ + archives/`，不含 `work/`（跨机不可用，由构建脚本生成），也不含 iOS 证书**。详情：[docs/offline-sdk-distribution-s3.md](docs/offline-sdk-distribution-s3.md)。
+本地自定义基座需要 uni-app x 离线 SDK + 乐鑫配网依赖。从 S3 拉取到 `NUWAX_OFFLINE_SDK_HOME`（默认 `$HOME/workspace/nuwax-mobile-offline-sdk`）：**只含 `sdk/ + archives/`，不含 `work/`（跨机不可用，由构建脚本生成），也不含 iOS 证书**。详情：[docs/engineering/offline-sdk-distribution-s3.md](docs/engineering/offline-sdk-distribution-s3.md)。
 
 ```bash
 make sdk-fetch

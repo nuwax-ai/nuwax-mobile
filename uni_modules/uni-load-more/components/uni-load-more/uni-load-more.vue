@@ -54,16 +54,44 @@
 		t
 	} = initVueI18n(messages)
 	// #endif
-	// #ifdef APP-ANDROID
-	// uni-app x Android 不支持 @dcloudio/uni-i18n，这里给一个空 fallback
-	const t = (key: string): string => { return ""; }
-	// #endif
 
 	/** 本组件默认 contentText 类型（UTS：禁止对 any 点属性 / 下标） */
 	class LoadMoreContentText {
 		contentdown: string = "";
 		contentrefresh: string = "";
 		contentnomore: string = "";
+	}
+
+	/**
+	 * contentText 为空时的默认文案。
+	 * Android：Options API computed 里不能引用外层 const t（会编成 IndexKt.t 静态调用 → NoSuchMethodError），
+	 * 因此 App-Android 直接返回本地默认，勿再调 t()。
+	 */
+	function resolveLoadMoreFallbackText(kind: string): string {
+		// #ifdef APP-ANDROID
+		if (kind == "contentdown") {
+			return "上拉显示更多";
+		}
+		if (kind == "contentrefresh") {
+			return "正在加载...";
+		}
+		if (kind == "contentnomore") {
+			return "没有更多数据了";
+		}
+		return "";
+		// #endif
+		// #ifndef APP-ANDROID
+		if (kind == "contentdown") {
+			return t("uni-load-more.contentdown");
+		}
+		if (kind == "contentrefresh") {
+			return t("uni-load-more.contentrefresh");
+		}
+		if (kind == "contentnomore") {
+			return t("uni-load-more.contentnomore");
+		}
+		return "";
+		// #endif
 	}
 
 	/**
@@ -196,21 +224,21 @@
 				if (text != "") {
 					return text;
 				}
-				return t("uni-load-more.contentdown");
+				return resolveLoadMoreFallbackText("contentdown");
 			},
 			contentrefreshText() {
 				const text = readContentTextField(this.contentText as any, "contentrefresh");
 				if (text != "") {
 					return text;
 				}
-				return t("uni-load-more.contentrefresh");
+				return resolveLoadMoreFallbackText("contentrefresh");
 			},
 			contentnomoreText() {
 				const text = readContentTextField(this.contentText as any, "contentnomore");
 				if (text != "") {
 					return text;
 				}
-				return t("uni-load-more.contentnomore");
+				return resolveLoadMoreFallbackText("contentnomore");
 			},
 			/** 是否展示 Android 圆环 loading */
 			showAndroidCircleLoading() {

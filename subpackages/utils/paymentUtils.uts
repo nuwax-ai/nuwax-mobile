@@ -1,5 +1,6 @@
 import { Ref } from "vue";
 import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
 import type { WxPayParams } from "@/subpackages/types/interfaces/subscription";
 import {
   apiGetSettlementStatus,
@@ -22,9 +23,49 @@ import {
 } from "@/uni_modules/nuwax-android-native-pay";
 // #endif
 
+// #ifdef APP-HARMONY
+import {
+  launchAnxinfuMiniProgramNative as launchAnxinfuMiniProgramHarmony,
+  openPayUrlNative as openPayUrlHarmony,
+  // scheme 兜底（开放平台鸿蒙应用未就绪时启用），见
+  // uni_modules/nuwax-harmony-native-pay/README.md：
+  // launchAnxinfuMiniProgramBySchemeNative as launchAnxinfuMiniProgramBySchemeHarmony,
+} from "@/uni_modules/nuwax-harmony-native-pay";
+// #endif
+
 const ANXINFU_MINIPROGRAM_USER_NAME = "gh_cd6acad9a40d";
 const ANXINFU_MINIPROGRAM_PATH = "ipay/main";
-const ACTIVE_APP_PAY_ORDER_ID = "ACTIVE_APP_PAY_ORDER_ID";
+const ACTIVE_APP_PAY_SESSION = "ACTIVE_APP_PAY_SESSION";
+const APP_PAY_SESSION_TTL_MS = 30 * 60 * 1000;
+
+/** H5 是否运行在 App 的内嵌 web-view 中。 */
+export function isEmbeddedAppWebView(): boolean {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    const href = window.location.href;
+    if (
+      href.indexOf("appEmbedded=1") >= 0 ||
+      href.indexOf("appEmbedded%3D1") >= 0
+    ) {
+      return true;
+    }
+    const uniGlobal = w.uni;
+    if (
+      w.__uniapp_x_postMessage != null ||
+      w.__uniapp_x_ != null ||
+      (uniGlobal != null && uniGlobal.webView != null)
+    ) {
+      return true;
+    }
+    return w.sessionStorage != null &&
+      w.sessionStorage.getItem("__nuwax_app_webview") == "1";
+  } catch (_error) {
+    return false;
+  }
+  // #endif
+  return false;
+}
 
 /** 从网关 weixin:// redirectUrl 中提取 query= 后的 Base64 原文。 */
 export function parseAnxinfuMiniProgramParam(redirectUrl: string | null): string {
@@ -85,6 +126,8 @@ export function launchAnxinfuMiniProgram(redirectUrl: string): Promise<any> {
     userName: ANXINFU_MINIPROGRAM_USER_NAME,
     path: ANXINFU_MINIPROGRAM_PATH + "?" + param,
     miniprogramType: 0,
+    // 鸿蒙 scheme 兜底实现需要网关原始 redirectUrl，Android / iOS 不使用。
+    redirectUrl: redirectUrl,
   } as UTSJSONObject;
 
   // #ifdef APP-ANDROID
@@ -95,7 +138,15 @@ export function launchAnxinfuMiniProgram(redirectUrl: string): Promise<any> {
   );
   // #endif
 
-  // #ifndef APP-ANDROID
+  // #ifdef APP-HARMONY
+  // 同 Android：鸿蒙也存在分包独立 UTS 模块实例的问题，直接调原生插件不依赖桥注册状态。
+  return launchAnxinfuMiniProgramHarmony(
+    options.getString("userName") ?? "",
+    options.getString("path") ?? "",
+  );
+  // #endif
+
+  // #ifndef APP-ANDROID || APP-HARMONY
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native wx.miniapp bridge is unavailable"));
@@ -111,7 +162,11 @@ export function openAppPayUrl(url: string): Promise<any> {
   return openPayUrlNative(url);
   // #endif
 
-  // #ifndef APP-ANDROID
+  // #ifdef APP-HARMONY
+  return openPayUrlHarmony(url);
+  // #endif
+
+  // #ifndef APP-ANDROID || APP-HARMONY
   if (appNativePayBridge == null) {
     return new Promise((_resolve, reject) => {
       reject(new Error("native pay url bridge is unavailable"));
@@ -121,10 +176,582 @@ export function openAppPayUrl(url: string): Promise<any> {
   // #endif
 }
 
+function readAppPaySession(): UTSJSONObject | null {
+  const raw = uni.getStorageSync(ACTIVE_APP_PAY_SESSION);
+  const text = raw != null ? `${raw}` : "";
+  if (text.length == 0) {
+    return null;
+  }
+  try {
+    const session = JSON.parse<UTSJSONObject>(text);
+    if (session == null) {
+      uni.removeStorageSync(ACTIVE_APP_PAY_SESSION);
+      return null;
+    }
+    const createdAtRaw = session["createdAt"];
+    const createdAt = createdAtRaw != null ? parseFloat(`${createdAtRaw}`) : 0;
+    if (
+      createdAt <= 0 ||
+      Date.now() - createdAt > APP_PAY_SESSION_TTL_MS
+    ) {
+      uni.removeStorageSync(ACTIVE_APP_PAY_SESSION);
+      return null;
+    }
+    return session;
+  } catch (_error) {
+    uni.removeStorageSync(ACTIVE_APP_PAY_SESSION);
+    return null;
+  }
+}
+
+function writeAppPaySession(session: UTSJSONObject): void {
+  uni.setStorageSync(ACTIVE_APP_PAY_SESSION, JSON.stringify(session));
+}
+
+/** 原生收到 H5 请求时先持久化，重复 requestId 只确认、不重复拉起。 */
+export function beginAppNativePaySession(
+  orderId: number,
+  requestId: string,
+  payChannel: string,
+): boolean {
+  const current = readAppPaySession();
+  if (
+    current != null &&
+    current["requestId"] != null &&
+    `${current["requestId"]}` == requestId
+  ) {
+    return false;
+  }
+  const session = new UTSJSONObject();
+  session["orderId"] = orderId as any;
+  session["requestId"] = requestId;
+  session["payChannel"] = payChannel;
+  session["state"] = "REQUESTED";
+  session["result"] = "";
+  session["createdAt"] = Date.now() as any;
+  writeAppPaySession(session);
+  return true;
+}
+
+/** 记录可重放的终态结果；pending 继续保持为可查询会话。 */
+export function storeAppNativePayResult(
+  requestId: string,
+  result: string,
+): void {
+  const session = readAppPaySession();
+  if (session == null) {
+    return;
+  }
+  const storedRequestId = session["requestId"] != null
+    ? `${session["requestId"]}`
+    : "";
+  if (requestId.length > 0 && storedRequestId != requestId) {
+    return;
+  }
+  if (result == "pending") {
+    session["state"] = "LAUNCHED";
+    session["result"] = "";
+    writeAppPaySession(session);
+    return;
+  }
+  session["state"] = "SETTLED";
+  session["result"] = result;
+  writeAppPaySession(session);
+}
+
+/** 获取已产生、但 H5 尚未确认消费的结果。 */
+export function getStoredAppNativePayResult(): UTSJSONObject | null {
+  const session = readAppPaySession();
+  if (session == null) {
+    return null;
+  }
+  const result = session["result"] != null ? `${session["result"]}` : "";
+  if (result.length == 0) {
+    return null;
+  }
+  return session;
+}
+
+/** H5 确认消费后清理；requestId 不匹配时禁止误删其他订单。 */
+export function acknowledgeAppNativePayResult(requestId: string): void {
+  const session = readAppPaySession();
+  if (session == null) {
+    return;
+  }
+  const storedRequestId = session["requestId"] != null
+    ? `${session["requestId"]}`
+    : "";
+  if (storedRequestId == requestId) {
+    uni.removeStorageSync(ACTIVE_APP_PAY_SESSION);
+  }
+}
+
+/**
+ * 请求 app-native 收银台参数并落盘 LAUNCHED，返回 redirectUrl。
+ *
+ * 与拉起动作拆开，是为了让调用方能在「网络请求」和「切到第三方 App」之间
+ * 精确控制 loading：请求期间保持「支付处理中」遮罩，拿到参数后立刻撤掉。
+ */
+export async function requestAppNativePayRedirect(
+  orderId: number,
+  payChannelValue: string,
+  requestId: string,
+): Promise<string> {
+  const effectiveRequestId = requestId.length > 0
+    ? requestId
+    : `native_${orderId}_${Date.now()}`;
+  let current = readAppPaySession();
+  const currentRequestId = current != null && current["requestId"] != null
+    ? `${current["requestId"]}`
+    : "";
+  if (current == null || currentRequestId != effectiveRequestId) {
+    beginAppNativePaySession(orderId, effectiveRequestId, payChannelValue);
+    current = readAppPaySession();
+  }
+  const requestData = new UTSJSONObject();
+  requestData["orderId"] = orderId as any;
+  requestData["payChannel"] = payChannelValue as any;
+  const payRes = await apiPayAppNative(requestData);
+  const payData = apiResData<any>(payRes) as UTSJSONObject | null;
+  if (apiResCode(payRes) != SUCCESS_CODE || payData == null) {
+    throw new Error(orString(payRes["message"], "app-native pay failed"));
+  }
+
+  const redirectUrlRaw = payData["redirectUrl"];
+  const redirectUrl = redirectUrlRaw != null ? `${redirectUrlRaw}` : "";
+  if (redirectUrl.length == 0) {
+    throw new Error("app-native redirectUrl is missing");
+  }
+
+  // 必须在切出 App 前落盘。部分原生插件会等第三方页面返回后才 resolve，
+  // 若返回后再写，页面 onShow 会先执行并因状态仍是 REQUESTED 而漏掉查单。
+  const latest = readAppPaySession();
+  const latestRequestId = latest != null && latest["requestId"] != null
+    ? `${latest["requestId"]}`
+    : "";
+  if (latest == null || latestRequestId != effectiveRequestId) {
+    throw new Error("app-native pay session was superseded");
+  }
+  latest["state"] = "LAUNCHED";
+  writeAppPaySession(latest);
+
+  return redirectUrl;
+}
+
+/** 用已拿到的 redirectUrl 拉起第三方收银台（微信小程序 / 支付宝）。 */
+export async function launchAppNativePayRedirect(
+  payChannelValue: string,
+  redirectUrl: string,
+): Promise<void> {
+  if (payChannelValue == "WxPay") {
+    if (redirectUrl.indexOf("weixin://") != 0) {
+      throw new Error("wechat app-native redirectUrl is invalid");
+    }
+    await launchAnxinfuMiniProgram(redirectUrl);
+  } else {
+    await openAppPayUrl(redirectUrl);
+  }
+}
+
+/**
+ * 按指定渠道请求 app-native 参数并拉起原生收银台。
+ * 保留原签名给旧调用方；常驻壳走 request + launched 通知 + launch 两段式。
+ */
+export async function launchAppNativePayByChannel(
+  orderId: number,
+  payChannelValue: string,
+  requestId: string = "",
+): Promise<void> {
+  const redirectUrl = await requestAppNativePayRedirect(
+    orderId,
+    payChannelValue,
+    requestId,
+  );
+  await launchAppNativePayRedirect(payChannelValue, redirectUrl);
+}
+
 // #endif
 
 // ========== H5 / WEB 工具函数 ==========
 // #ifdef H5 || WEB
+
+/** 同一次第三方回跳结果只提示一次，避免 pageshow / mounted 重复弹 Toast。 */
+const alertedKeys = new Set<string>();
+
+class EmbeddedAppPayContext {
+  requestId: string;
+  orderId: number;
+  payChannel: string;
+  processingId: Ref<number | null>;
+  loading: Ref<boolean>;
+  t: (key: string) => string;
+  onSuccess: (() => void) | null;
+  accepted: boolean = false;
+  launched: boolean = false;
+  attempts: number = 0;
+  retryTimer: number = 0;
+  launchTimer: number = 0;
+
+  constructor(
+    requestId: string,
+    orderId: number,
+    payChannel: string,
+    processingId: Ref<number | null>,
+    loading: Ref<boolean>,
+    t: (key: string) => string,
+    onSuccess?: () => void,
+  ) {
+    this.requestId = requestId;
+    this.orderId = orderId;
+    this.payChannel = payChannel;
+    this.processingId = processingId;
+    this.loading = loading;
+    this.t = t;
+    this.onSuccess = onSuccess != null ? onSuccess : null;
+  }
+}
+
+class EmbeddedAppPayResultConsumer {
+  id: string;
+  processingId: Ref<number | null>;
+  loading: Ref<boolean>;
+  t: (key: string) => string;
+  onSuccess: (() => void) | null;
+  syncAttempts: number = 0;
+  syncTimer: number = 0;
+
+  constructor(
+    id: string,
+    processingId: Ref<number | null>,
+    loading: Ref<boolean>,
+    t: (key: string) => string,
+    onSuccess?: () => void,
+  ) {
+    this.id = id;
+    this.processingId = processingId;
+    this.loading = loading;
+    this.t = t;
+    this.onSuccess = onSuccess != null ? onSuccess : null;
+  }
+}
+
+const embeddedAppPayContexts = new Map<string, EmbeddedAppPayContext>();
+const consumedEmbeddedAppPayRequestIds = new Set<string>();
+let embeddedAppPayGlobalsInstalled = false;
+let embeddedAppPayResultConsumer: EmbeddedAppPayResultConsumer | null = null;
+
+/** H5 → App：优先 JSSDK，未注入完成时直接使用 uni-app x 底层桥。 */
+function postEmbeddedAppPayMessage(payload: UTSJSONObject): boolean {
+  try {
+    const w = window as any;
+    const uniGlobal = w.uni;
+    if (
+      uniGlobal != null &&
+      uniGlobal.webView != null &&
+      uniGlobal.webView.postMessage != null
+    ) {
+      uniGlobal.webView.postMessage({ "data": payload });
+      return true;
+    }
+    const envelope = { "data": payload } as UTSJSONObject;
+    if (w.__uniapp_x_postMessage != null) {
+      w.__uniapp_x_postMessage(envelope);
+      return true;
+    }
+    if (
+      w.__uniapp_x_ != null &&
+      w.__uniapp_x_.postMessage != null
+    ) {
+      w.__uniapp_x_.postMessage(JSON.stringify(envelope));
+      return true;
+    }
+  } catch (error) {
+    console.warn("[native-pay] postMessage failed", error);
+  }
+  return false;
+}
+
+function sendEmbeddedAppPayResultAck(requestId: string): void {
+  postEmbeddedAppPayMessage({
+    "type": "native-pay-result-ack",
+    "requestId": requestId,
+  } as UTSJSONObject);
+}
+
+function clearEmbeddedAppPayContext(context: EmbeddedAppPayContext): void {
+  if (context.retryTimer != 0) {
+    clearTimeout(context.retryTimer);
+    context.retryTimer = 0;
+  }
+  if (context.launchTimer != 0) {
+    clearTimeout(context.launchTimer);
+    context.launchTimer = 0;
+  }
+  embeddedAppPayContexts.delete(context.requestId);
+}
+
+function failEmbeddedAppPayRequest(context: EmbeddedAppPayContext): void {
+  clearEmbeddedAppPayContext(context);
+  uni.hideLoading();
+  context.loading.value = false;
+  context.processingId.value = null;
+  uni.showToast({
+    title: context.t("Mobile.MySubscriptions.payFailed"),
+    icon: "none",
+  });
+}
+
+function consumeEmbeddedAppPayResult(
+  result: string,
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+  t: (key: string) => string,
+  onSuccess: (() => void) | null,
+): void {
+  clearPayConfirmSession(0);
+  uni.hideLoading();
+  loading.value = false;
+  processingId.value = null;
+  if (onSuccess != null) {
+    handlePayResultToast(result, t, onSuccess);
+  } else {
+    handlePayResultToast(result, t);
+  }
+}
+
+function releaseEmbeddedAppPayLock(
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+): void {
+  uni.hideLoading();
+  loading.value = false;
+  processingId.value = null;
+}
+
+function stopEmbeddedAppPayResultSync(
+  consumer: EmbeddedAppPayResultConsumer,
+): void {
+  if (consumer.syncTimer != 0) {
+    clearTimeout(consumer.syncTimer);
+    consumer.syncTimer = 0;
+  }
+}
+
+function scheduleEmbeddedAppPayResultSync(
+  consumer: EmbeddedAppPayResultConsumer,
+): void {
+  consumer.syncAttempts += 1;
+  postEmbeddedAppPayMessage({
+    "type": "native-pay-result-sync",
+    "consumerId": consumer.id,
+  } as UTSJSONObject);
+  consumer.syncTimer = setTimeout((): void => {
+    consumer.syncTimer = 0;
+    const activeConsumer = embeddedAppPayResultConsumer;
+    if (
+      activeConsumer == null ||
+      activeConsumer.id != consumer.id ||
+      consumer.syncAttempts >= 10
+    ) {
+      return;
+    }
+    scheduleEmbeddedAppPayResultSync(consumer);
+  }, 300) as number;
+}
+
+/** 旧版 App 壳不发 launched 时的兜底：最多压 8 秒遮罩就切确认框。 */
+const EMBEDDED_LAUNCH_FALLBACK_MS = 8000;
+
+/** 原生已拿到收银台参数、即将切走：撤遮罩、解锁、弹支付确认框。 */
+function handleEmbeddedAppPayLaunched(requestId: string): void {
+  const context = embeddedAppPayContexts.get(requestId);
+  if (context == null || context.launched == true) {
+    return;
+  }
+  context.launched = true;
+  if (context.launchTimer != 0) {
+    clearTimeout(context.launchTimer);
+    context.launchTimer = 0;
+  }
+  // 解锁：用户可能只是在收银台取消，不该被锁到超时
+  uni.hideLoading();
+  context.loading.value = false;
+  context.processingId.value = null;
+  beginPayConfirmSession(context.orderId, context.payChannel);
+  openPayAwaitConfirmDialog(
+    context.orderId,
+    context.payChannel,
+    context.t,
+    context.onSuccess,
+  ).catch((): void => {});
+}
+
+function scheduleEmbeddedAppPayRequest(context: EmbeddedAppPayContext): void {
+  if (context.accepted == true) {
+    return;
+  }
+  context.attempts += 1;
+  postEmbeddedAppPayMessage({
+    "type": "native-pay",
+    "requestId": context.requestId,
+    "orderId": context.orderId,
+    "payChannel": context.payChannel,
+  } as UTSJSONObject);
+  context.retryTimer = setTimeout((): void => {
+    context.retryTimer = 0;
+    if (context.accepted == true) {
+      return;
+    }
+    if (context.attempts >= 10) {
+      failEmbeddedAppPayRequest(context);
+      return;
+    }
+    scheduleEmbeddedAppPayRequest(context);
+  }, 300) as number;
+}
+
+function ensureEmbeddedAppPayGlobals(): void {
+  if (embeddedAppPayGlobalsInstalled == true) {
+    return;
+  }
+  embeddedAppPayGlobalsInstalled = true;
+  const w = window as any;
+  w.__nuwaxOnNativePayAccepted = (requestId: string): void => {
+    const context = embeddedAppPayContexts.get(requestId);
+    if (context == null) {
+      return;
+    }
+    context.accepted = true;
+    if (context.retryTimer != 0) {
+      clearTimeout(context.retryTimer);
+      context.retryTimer = 0;
+    }
+    // 原生只是「收到请求」，收银台参数还在请求中：继续压着「支付处理中」遮罩，
+    // 等 launched 再切确认框，避免用户先看到确认框、几秒后才被切走。
+    // 旧版 App 壳不发 launched（H5 会先于 App 发版），用看门狗兜底。
+    context.launchTimer = setTimeout((): void => {
+      context.launchTimer = 0;
+      handleEmbeddedAppPayLaunched(context.requestId);
+    }, EMBEDDED_LAUNCH_FALLBACK_MS) as number;
+  };
+  w.__nuwaxOnNativePayLaunched = (requestId: string): void => {
+    handleEmbeddedAppPayLaunched(requestId);
+  };
+  w.__nuwaxOnNativePaySyncComplete = (consumerId: string): void => {
+    const consumer = embeddedAppPayResultConsumer;
+    if (consumer != null && consumer.id == consumerId) {
+      stopEmbeddedAppPayResultSync(consumer);
+    }
+  };
+  w.__nuwaxOnNativePayResult = (
+    requestId: string,
+    result: string,
+  ): void => {
+    if (consumedEmbeddedAppPayRequestIds.has(requestId)) {
+      sendEmbeddedAppPayResultAck(requestId);
+      return;
+    }
+    const context = embeddedAppPayContexts.get(requestId);
+    if (result == "pending") {
+      if (context != null) {
+        clearEmbeddedAppPayContext(context);
+        releaseEmbeddedAppPayLock(context.processingId, context.loading);
+      } else if (embeddedAppPayResultConsumer != null) {
+        const consumer = embeddedAppPayResultConsumer;
+        releaseEmbeddedAppPayLock(consumer.processingId, consumer.loading);
+      }
+      // pending 只解除 H5 交互锁，原生会话继续保留供后续 onShow 查单。
+      return;
+    }
+    const dialogOrderId = context != null
+      ? context.orderId
+      : getPayConfirmSessionOrderId();
+    if (isPayConfirmDialogOpen() && dialogOrderId > 0) {
+      // 用户正对着确认框：缓存终态并 ACK，等他点按钮时秒回结果
+      storePayConfirmAutoResult(dialogOrderId, result);
+      if (context != null) {
+        clearEmbeddedAppPayContext(context);
+      }
+      consumedEmbeddedAppPayRequestIds.add(requestId);
+      sendEmbeddedAppPayResultAck(requestId);
+      return;
+    }
+    let consumed = false;
+    if (context != null) {
+      clearEmbeddedAppPayContext(context);
+      try {
+        consumeEmbeddedAppPayResult(
+          result,
+          context.processingId,
+          context.loading,
+          context.t,
+          context.onSuccess,
+        );
+        consumed = true;
+      } catch (error) {
+        console.error("[native-pay] result consumer failed", error);
+      }
+    } else if (embeddedAppPayResultConsumer != null) {
+      const consumer = embeddedAppPayResultConsumer;
+      try {
+        consumeEmbeddedAppPayResult(
+          result,
+          consumer.processingId,
+          consumer.loading,
+          consumer.t,
+          consumer.onSuccess,
+        );
+        consumed = true;
+      } catch (error) {
+        console.error("[native-pay] recovered result consumer failed", error);
+      }
+    }
+    // 只有页面已刷新/提示结果后才能确认消费；没有消费者时让原生继续保留并重放。
+    if (consumed == true) {
+      consumedEmbeddedAppPayRequestIds.add(requestId);
+      sendEmbeddedAppPayResultAck(requestId);
+    }
+  };
+}
+
+/** 页面挂载即注册恢复消费者，并主动向原生请求重放未 ACK 的结果。 */
+export function registerEmbeddedAppPayResultConsumer(
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+  t: (key: string) => string,
+  onSuccess?: () => void,
+): string {
+  if (isEmbeddedAppWebView() != true) {
+    return "";
+  }
+  ensureEmbeddedAppPayGlobals();
+  const previousConsumer = embeddedAppPayResultConsumer;
+  if (previousConsumer != null) {
+    stopEmbeddedAppPayResultSync(previousConsumer);
+  }
+  const consumerId = `app_pay_consumer_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+  embeddedAppPayResultConsumer = new EmbeddedAppPayResultConsumer(
+    consumerId,
+    processingId,
+    loading,
+    t,
+    onSuccess,
+  );
+  const registeredConsumer = embeddedAppPayResultConsumer;
+  if (registeredConsumer != null) {
+    scheduleEmbeddedAppPayResultSync(registeredConsumer);
+  }
+  return consumerId;
+}
+
+/** 只注销当前组件自己的消费者，避免旧组件卸载时清掉新页面注册项。 */
+export function unregisterEmbeddedAppPayResultConsumer(consumerId: string): void {
+  const consumer = embeddedAppPayResultConsumer;
+  if (consumerId.length > 0 && consumer != null && consumer.id == consumerId) {
+    stopEmbeddedAppPayResultSync(consumer);
+    embeddedAppPayResultConsumer = null;
+  }
+}
 
 export interface PayResultFromUrl {
   payResult: string;
@@ -476,6 +1103,7 @@ export async function renderQrCodeModal(
   uni.hideLoading();
 
   closeHandler();
+  handlePayResultToast(payStatus, t, onSuccess);
 }
 
 /**
@@ -550,11 +1178,12 @@ export async function checkWechatOaPayCallback(
         orderId: orderId,
       });
 
+      const payParamsData = apiResData<any>(payParamsRes) as UTSJSONObject | null;
+      const wxPayParams = payParamsData != null ? payParamsData["wxPayParams"] : null;
       if (
-        payParamsRes.code === SUCCESS_CODE &&
-        payParamsRes.data?.wxPayParams != null
+        apiResCode(payParamsRes) == SUCCESS_CODE &&
+        wxPayParams != null
       ) {
-        const wxPayParams = payParamsRes.data.wxPayParams;
         uni.hideLoading();
 
         // 调起微信 JSAPI 支付
@@ -566,13 +1195,25 @@ export async function checkWechatOaPayCallback(
 
         if (errMsg.indexOf("ok") !== -1) {
           uni.showLoading({
-            title: t("Mobile.MySubscriptions.payPending"),
+            title: t("Mobile.MySubscriptions.payChecking"),
             mask: true,
           });
-          // 轮询结果
-          const result = await pollPayResult(orderId);
+          // JSAPI 已回调成功，短轮询等结算回调（约 10s）
+          const result = await pollPayResult(orderId, 5);
           uni.hideLoading();
-          handlePayResultToast(result, t, onSuccess);
+          if (result == "pending") {
+            // 结算回调迟到：交给确认框，由用户主动复查，不再长时间遮罩
+            beginPayConfirmSession(orderId, "WxPay");
+            processingId.value = null;
+            await openPayAwaitConfirmDialog(
+              orderId,
+              "WxPay",
+              t,
+              onSuccess != null ? onSuccess : null,
+            );
+          } else {
+            handlePayResultToast(result, t, onSuccess);
+          }
         } else if (errMsg.indexOf("cancel") !== -1) {
           uni.showToast({
             title: t("Mobile.MySubscriptions.payCancelled"),
@@ -636,31 +1277,24 @@ export async function checkH5PayCallback(
     const orderId = parseInt(h5OrderIdStr);
     if (isNaN(orderId)) return;
 
-    const lockKey = `h5_pay_lock_${orderId}`;
-    if (uni.getStorageSync(lockKey) === "1") return;
-    uni.setStorageSync(lockKey, "1");
-
     cleanH5Params();
-
-    processingId.value = orderId;
-    uni.showLoading({
-      title: t("Mobile.MySubscriptions.payPending"),
-      mask: true,
-    });
-
-    try {
-      const result = await pollPayResult(orderId);
-      uni.hideLoading();
-      handlePayResultToast(result, t, onSuccess);
-    } catch (e) {
-      uni.hideLoading();
-      uni.showToast({
-        title: t("Mobile.MySubscriptions.payFailed"),
-        icon: "none",
-      });
-    } finally {
+    // 用户已手动关闭过该订单的确认框就不再重弹（含 bfcache 回退到带参历史条目）
+    if (isPayConfirmDismissed(orderId)) {
+      uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
       processingId.value = null;
+      return;
     }
+    // 支付回跳后不再阻塞式轮询（原实现最长遮罩 120s 且不可取消），
+    // 改为解锁页面并弹出确认框，由用户主动点「我已支付」查单。
+    uni.hideLoading();
+    processingId.value = null;
+    uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
+    await openPayAwaitConfirmDialog(
+      orderId,
+      getPayConfirmSessionChannel(),
+      t,
+      onSuccess != null ? onSuccess : null,
+    );
   }
 }
 
@@ -673,41 +1307,42 @@ export async function checkActiveOrderCallback(
   t: (key: string) => string,
   onSuccess?: () => void,
 ): Promise<void> {
+  let orderId = 0;
   const activeOrderIdStr = uni.getStorageSync("ACTIVE_PAY_ORDER_ID");
   if (activeOrderIdStr) {
-    const orderId = parseInt(activeOrderIdStr as string);
-    if (isNaN(orderId)) return;
-
-    // 一旦提取成功，立即清除该订单的支付中缓存，避免重复拉起轮询
-    uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
-
-    const lockKey = `h5_pay_lock_${orderId}`;
-    if (uni.getStorageSync(lockKey) === "1") return;
-    uni.setStorageSync(lockKey, "1");
-
-    // 确保 URL 干净，清除可能存在的 H5 拼接参数
-    cleanH5Params();
-
-    processingId.value = orderId;
-    uni.showLoading({
-      title: t("Mobile.MySubscriptions.payPending"),
-      mask: true,
-    });
-
-    try {
-      const result = await pollPayResult(orderId);
-      uni.hideLoading();
-      handlePayResultToast(result, t, onSuccess);
-    } catch (e) {
-      uni.hideLoading();
-      uni.showToast({
-        title: t("Mobile.MySubscriptions.payFailed"),
-        icon: "none",
-      });
-    } finally {
-      processingId.value = null;
+    const parsed = parseInt(activeOrderIdStr as string);
+    if (!isNaN(parsed)) {
+      orderId = parsed;
     }
+    // 一旦提取成功，立即清除该订单的支付中缓存，避免重复拉起
+    uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
   }
+  if (orderId <= 0) {
+    // 同一次支付里切出去又切回来（未走 URL 回跳）时，靠确认会话恢复
+    orderId = getPayConfirmSessionOrderId();
+  }
+  if (orderId <= 0) {
+    return;
+  }
+  // 用户已手动关闭过该订单的确认框：即便未支付也不再骚扰，
+  // 需要复查请从订单列表重新发起支付（会重建会话并重置该标记）。
+  if (isPayConfirmDismissed(orderId)) {
+    return;
+  }
+
+  // 确保 URL 干净，清除可能存在的 H5 拼接参数
+  cleanH5Params();
+
+  // 不再上 h5_pay_lock：重复进入由 openPayAwaitConfirmDialog 的单例守卫
+  // 与上面的 dismissed 判断共同拦截。
+  uni.hideLoading();
+  processingId.value = null;
+  await openPayAwaitConfirmDialog(
+    orderId,
+    getPayConfirmSessionChannel(),
+    t,
+    onSuccess != null ? onSuccess : null,
+  );
 }
 
 /**
@@ -720,21 +1355,65 @@ export async function executeWebPayFlow(
   t: (key: string) => string,
   onSuccess?: () => void,
 ): Promise<void> {
+  if (isEmbeddedAppWebView()) {
+    await executeEmbeddedAppPayFlow(
+      orderId,
+      processingId,
+      loading,
+      t,
+      onSuccess,
+    );
+    return;
+  }
   const clientEnv = detectClientEnv();
   if (clientEnv.isWeChat) {
-    // 暂时不支持微信内置浏览器支付，给予友好提示并引导用户
-    // await executeWebWxPayFlow(orderId, processingId, loading, t);
-    uni.hideLoading();
-    processingId.value = null;
-    uni.showModal({
-      title: t("Mobile.Common.tip"),
-      content: t("Mobile.MySubscriptions.wechatBrowserPayUnsupported"),
-      showCancel: false,
-      confirmText: t("Mobile.Common.confirm"),
-    });
+    await executeWebWxPayFlow(orderId, processingId, loading, t);
   } else {
     await executeWebH5PayFlow(orderId, processingId, loading, t, onSuccess);
   }
+}
+
+/** App 内嵌 H5：选择渠道后把订单交给原生宿主，禁止在 WebView 内打开收银台。 */
+async function executeEmbeddedAppPayFlow(
+  orderId: number,
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+  t: (key: string) => string,
+  onSuccess?: () => void,
+): Promise<void> {
+  uni.hideLoading();
+
+  uni.showActionSheet({
+    itemList: [
+      t("Mobile.MySubscriptions.wechatPay"),
+      t("Mobile.MySubscriptions.alipay"),
+    ],
+    success: (res) => {
+      const payChannel = res.tapIndex == 1 ? "AliPay" : "WxPay";
+      const requestId = `app_pay_${orderId}_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+      const context = new EmbeddedAppPayContext(
+        requestId,
+        orderId,
+        payChannel,
+        processingId,
+        loading,
+        t,
+        onSuccess,
+      );
+      embeddedAppPayContexts.set(requestId, context);
+      ensureEmbeddedAppPayGlobals();
+      loading.value = true;
+      // 遮罩一直压到原生 launched（收银台参数就位），再换成支付确认框
+      uni.showLoading({
+        title: t("Mobile.MySubscriptions.payPending"),
+        mask: true,
+      });
+      scheduleEmbeddedAppPayRequest(context);
+    },
+    fail: () => {
+      processingId.value = null;
+    },
+  });
 }
 
 /**
@@ -763,8 +1442,9 @@ async function executeWebWxPayFlow(
       state: String(orderId),
     });
 
-    if (oauthRes.code === SUCCESS_CODE && oauthRes.data != null) {
-      const authorizeUrl = oauthRes.data.authorizeUrl;
+    const oauthData = apiResData<any>(oauthRes) as UTSJSONObject | null;
+    const authorizeUrl = oauthData != null && oauthData["authorizeUrl"] != null ? `${oauthData["authorizeUrl"]}` : "";
+    if (apiResCode(oauthRes) == SUCCESS_CODE && authorizeUrl != "") {
       uni.hideLoading();
       window.location.href = authorizeUrl;
       setTimeout(() => {
@@ -811,6 +1491,7 @@ async function executeWebH5PayFlow(
     ],
     success: async (res) => {
       let payChannel = PayChannel.WxPay;
+      const payChannelValue = res.tapIndex === 1 ? "AliPay" : "WxPay";
       if (res.tapIndex === 1) {
         payChannel = PayChannel.AliPay;
       }
@@ -829,6 +1510,8 @@ async function executeWebH5PayFlow(
 
         // 发起支付前，将正在支付的订单 ID 写入缓存，双重保障 Chrome 唤起 App 切回或 bfcache 恢复
         uni.setStorageSync("ACTIVE_PAY_ORDER_ID", String(orderId));
+        // 同时登记支付确认会话：整页跳转回来后据此重建「我已支付」确认框
+        beginPayConfirmSession(orderId, payChannelValue);
 
         const payRes = await apiPayH5Web({
           orderId,
@@ -838,9 +1521,9 @@ async function executeWebH5PayFlow(
 
         uni.hideLoading();
 
-        if (payRes.code === SUCCESS_CODE && payRes.data != null) {
-          const payData = payRes.data as Record<string, any>;
-          const invokeType = payData["invokeType"] as string;
+        const payData = apiResData<any>(payRes) as Record<string, any> | null;
+        if (apiResCode(payRes) == SUCCESS_CODE && payData != null) {
+          const invokeType = payData["invokeType"] != null ? `${payData["invokeType"]}` : "";
           const formHtml = payData["formHtml"] as string | null;
           const redirectUrl = payData["redirectUrl"] as string | null;
           const qrCodeContent = payData["qrCodeContent"] as string | null;
@@ -893,6 +1576,9 @@ async function executeWebH5PayFlow(
               processingId.value = null;
             }, 300);
           } else if (invokeType === "QRCODE_FALLBACK") {
+            // 扫码兜底不跳出页面，沿用二维码弹窗内的轮询，撤销确认会话
+            clearPayConfirmSession(orderId);
+            uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
             if (qrCodeContent != null && qrCodeContent !== "") {
               await renderQrCodeModal(
                 qrCodeContent,
@@ -914,6 +1600,9 @@ async function executeWebH5PayFlow(
             throw new Error("unknown invokeType: " + invokeType);
           }
         } else {
+          // 收银台参数请求失败：撤销刚登记的确认会话，避免回到页面弹出无效确认框
+          clearPayConfirmSession(orderId);
+          uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
           uni.showToast({
             title: orString(
               payRes.message,
@@ -925,6 +1614,8 @@ async function executeWebH5PayFlow(
         }
       } catch (e) {
         uni.hideLoading();
+        clearPayConfirmSession(orderId);
+        uni.removeStorageSync("ACTIVE_PAY_ORDER_ID");
         uni.showToast({
           title: t("Mobile.MySubscriptions.payFailed"),
           icon: "none",
@@ -958,9 +1649,10 @@ export async function executeAppNativePayFlow(
   uni.hideLoading();
 
   const handleSelectedChannel = async (tapIndex: number): Promise<void> => {
-    const payChannel = tapIndex == 1
-      ? PayChannel.AliPay
-      : PayChannel.WxPay;
+    // 不要用 payChannel.value：UTS 枚举只在 Android/iOS（Kotlin/Swift）下带 value
+    // 属性，鸿蒙编译为 TS string enum，成员本身即字符串，.value 取到 undefined，
+    // 接口会报 "payChannel is required"。
+    const payChannelValue = tapIndex == 1 ? "AliPay" : "WxPay";
     loading.value = true;
     uni.showLoading({
       title: t("Mobile.MySubscriptions.payPending"),
@@ -968,57 +1660,51 @@ export async function executeAppNativePayFlow(
     });
 
     try {
-      const requestData = new UTSJSONObject();
-      requestData["orderId"] = orderId as any;
-      requestData["payChannel"] = payChannel.value as any;
-      console.log('start:',requestData)
-      const payRes = await apiPayAppNative(requestData);
-      console.log('end:',payRes)
-      const payData = payRes["data"] as UTSJSONObject | null;
-      if (payRes["code"] != SUCCESS_CODE || payData == null) {
-        throw new Error(orString(
-          payRes["message"],
-          t("Mobile.MySubscriptions.payParamsFailed"),
-        ));
-      }
-
-      const redirectUrlRaw = payData["redirectUrl"];
-      const redirectUrl = redirectUrlRaw != null ? `${redirectUrlRaw}` : null;
-      uni.setStorageSync(ACTIVE_APP_PAY_ORDER_ID, `${orderId}`);
+      // /pay/app-native 有可能耗时几秒，遮罩必须盖住整个请求窗口：
+      // 早期实现在这里就 hideLoading，用户选完渠道会看到一段无反馈的空白。
+      const redirectUrl = await requestAppNativePayRedirect(
+        orderId,
+        payChannelValue,
+        "",
+      );
+      // 参数已就位，马上要切到第三方 App，先撤遮罩
       uni.hideLoading();
+      beginPayConfirmSession(orderId, payChannelValue);
+      await launchAppNativePayRedirect(payChannelValue, redirectUrl);
 
-      if (payChannel == PayChannel.WxPay) {
-        if (
-          redirectUrl == null ||
-          redirectUrl.length == 0 ||
-          redirectUrl.indexOf("weixin://") != 0
-        ) {
-          throw new Error("wechat app-native redirectUrl is missing");
-        }
-        await launchAnxinfuMiniProgram(redirectUrl);
-      } else {
-        if (redirectUrl == null || redirectUrl.length == 0) {
-          throw new Error("alipay app-native redirectUrl is missing");
-        }
-        await openAppPayUrl(redirectUrl);
+      // 拉起收银台后立即结束本流程：不再阻塞式轮询。
+      // 用户在收银台取消并切回 App 时，若此处还占着 processingId / loading，
+      // 会把再次发起支付锁死到轮询超时为止（H5 端早有 pageshow 重置，App 端缺失）。
+      // 支付结果由用户在确认框主动查单判定，checkActiveAppPayOrder 做静默兜底。
+      //
+      // 部分原生插件要等第三方页面返回后才 resolve：此时 onShow 的静默查单可能
+      // 已经出过终态并清掉会话，那就不该再弹确认框（否则重复提示一次）。
+      if (getPayConfirmSessionOrderId() == orderId) {
+        openPayAwaitConfirmDialog(
+          orderId,
+          payChannelValue,
+          t,
+          onSuccess != null ? onSuccess : null,
+        ).catch((): void => {});
       }
-
-      uni.showLoading({
-        title: t("Mobile.MySubscriptions.payPending"),
-        mask: true,
-      });
-      const result = await pollPayResult(orderId);
-      uni.hideLoading();
-      handlePayResultToast(result, t, onSuccess);
     } catch (e) {
       uni.hideLoading();
+      const failedSession = readAppPaySession();
+      const failedRequestId = failedSession != null && failedSession["requestId"] != null
+        ? `${failedSession["requestId"]}`
+        : "";
+      storeAppNativePayResult(failedRequestId, "failed");
+      clearPayConfirmSession(orderId);
       console.error("App native payment flow error:", e);
       uni.showToast({
         title: t("Mobile.MySubscriptions.payFailed"),
         icon: "none",
       });
+      if (failedRequestId.length > 0) {
+        acknowledgeAppNativePayResult(failedRequestId);
+      }
     } finally {
-      uni.removeStorageSync(ACTIVE_APP_PAY_ORDER_ID);
+      // 拉起成功的会话留给 checkActiveAppPayOrder 在回前台时核对。
       loading.value = false;
       processingId.value = null;
     }
@@ -1036,6 +1722,112 @@ export async function executeAppNativePayFlow(
       processingId.value = null;
     },
   });
+}
+
+/** 回前台核对结算状态的轮询次数（约 2s × 8 = 16s，覆盖支付回调延迟）。 */
+const APP_RETURN_POLL_ATTEMPTS = 8;
+
+/** 读取并核对原生侧活跃支付会话；结果由 H5 ACK 或原生消费后清理。 */
+export async function checkActiveAppPayResult(): Promise<UTSJSONObject | null> {
+  const session = readAppPaySession();
+  if (session == null) {
+    return null;
+  }
+  const storedResult = session["result"] != null ? `${session["result"]}` : "";
+  if (storedResult.length > 0) {
+    return session;
+  }
+  const state = session["state"] != null ? `${session["state"]}` : "";
+  if (state != "LAUNCHED") {
+    return null;
+  }
+  const orderRaw = session["orderId"];
+  const orderId = orderRaw != null ? parseInt(`${orderRaw}`) : 0;
+  if (isNaN(orderId) || orderId <= 0) {
+    uni.removeStorageSync(ACTIVE_APP_PAY_SESSION);
+    return null;
+  }
+
+  const result = await pollPayResult(orderId, APP_RETURN_POLL_ATTEMPTS);
+  const requestId = session["requestId"] != null ? `${session["requestId"]}` : "";
+  if (result == "pending") {
+    // pending 只是本轮查询超时，不是业务终态。保留空结果与可查询状态，
+    // 后续 onShow / 主动同步仍可继续核对迟到的服务端结算结果。
+    const latest = readAppPaySession();
+    const latestRequestId = latest != null && latest["requestId"] != null
+      ? `${latest["requestId"]}`
+      : "";
+    if (latest != null && latestRequestId == requestId) {
+      latest["state"] = "LAUNCHED";
+      latest["result"] = "";
+      // 返回给当前调用方的 pending 仅用于解除 H5 锁，不持久化为可 ACK 结果。
+      latest["result"] = "pending";
+      return latest;
+    }
+    return null;
+  }
+  storeAppNativePayResult(requestId, result);
+  const stored = readAppPaySession();
+  const storedRequestId = stored != null && stored["requestId"] != null
+    ? `${stored["requestId"]}`
+    : "";
+  return stored != null && storedRequestId == requestId ? stored : null;
+}
+
+/**
+ * App 从收银台切回前台时调用。
+ *
+ * 两件事，顺序不能反：
+ * 1. 无条件解除支付锁（用户可能只是取消支付返回），让用户能立刻重新发起；
+ * 2. 若存在拉起过的活跃订单，后台短轮询核对结算状态——不上锁、不加遮罩。
+ *
+ * 对应 H5 端的 pageshow / visibilitychange 处理（见 useSubscriptionPurchase.uts）。
+ */
+export async function checkActiveAppPayOrder(
+  processingId: Ref<number | null>,
+  loading: Ref<boolean>,
+  t: (key: string) => string,
+  onSuccess?: () => void,
+): Promise<void> {
+  // 1. 先解锁，且不依赖后续查询是否成功
+  uni.hideLoading();
+  loading.value = false;
+  processingId.value = null;
+
+  // 2. 核对活跃订单
+  const snapshot = await checkActiveAppPayResult();
+  if (snapshot == null) {
+    return;
+  }
+  const result = snapshot["result"] != null ? `${snapshot["result"]}` : "";
+  const requestId = snapshot["requestId"] != null ? `${snapshot["requestId"]}` : "";
+  if (result.length == 0) {
+    return;
+  }
+  if (result == "pending") {
+    // 交互锁已在函数开头解除；保留原生会话供后续 onShow 继续查单。
+    return;
+  }
+  const orderRaw = snapshot["orderId"];
+  const settledOrderId = orderRaw != null ? parseInt(`${orderRaw}`) : 0;
+  if (
+    isPayConfirmDialogOpen() &&
+    !isNaN(settledOrderId) &&
+    settledOrderId == getPayConfirmSessionOrderId()
+  ) {
+    // 用户正对着确认框：静默缓存结果，等他点「我已支付」时秒回，
+    // 避免 Toast 与关不掉的系统弹窗叠在一起（uni.showModal 无法程序化关闭）。
+    storePayConfirmAutoResult(settledOrderId, result);
+    if (requestId.length > 0) {
+      acknowledgeAppNativePayResult(requestId);
+    }
+    return;
+  }
+  clearPayConfirmSession(!isNaN(settledOrderId) ? settledOrderId : 0);
+  handlePayResultToast(result, t, onSuccess);
+  if (requestId.length > 0) {
+    acknowledgeAppNativePayResult(requestId);
+  }
 }
 
 // #endif
@@ -1122,10 +1914,12 @@ export async function executeMinipayFlow(
       wxLoginCode,
     });
 
+    const minipayData = apiResData<any>(minipayRes) as UTSJSONObject | null;
+    const wxPayParams = minipayData != null ? minipayData["wxPayParams"] as WxPayParams | null : null;
     if (
-      minipayRes.code !== SUCCESS_CODE ||
-      minipayRes.data == null ||
-      minipayRes.data!.wxPayParams == null
+      apiResCode(minipayRes) != SUCCESS_CODE ||
+      minipayData == null ||
+      wxPayParams == null
     ) {
       uni.hideLoading();
       uni.showToast({
@@ -1134,8 +1928,6 @@ export async function executeMinipayFlow(
       });
       return;
     }
-
-    const wxPayParams = minipayRes.data!.wxPayParams!;
     uni.hideLoading();
 
     const paySuccess = await requestWxPayment(wxPayParams, t);
@@ -1189,37 +1981,21 @@ export async function executePayFlow(
  * 轮询结算状态，最多 60 次，间隔 2 秒
  * @returns "success" | "failed" | "pending"
  */
-export async function pollPayResult(orderId: number): Promise<string> {
-  const maxAttempts = 60;
+export async function pollPayResult(
+  orderId: number,
+  attempts: number = 60,
+): Promise<string> {
+  const maxAttempts = attempts;
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise<void>((resolve) => {
       setTimeout(() => {
         resolve();
       }, 2000);
     });
-    try {
-      const requestData = new UTSJSONObject();
-      requestData["orderId"] = orderId as any;
-      const res = await apiGetSettlementStatus(requestData);
-      const data = res["data"] as UTSJSONObject | null;
-      if (res["code"] === SUCCESS_CODE && data != null) {
-        const settled = data["settled"] === true;
-        const orderStatus = data["orderStatus"] != null ? `${data["orderStatus"]}` : "";
-        const payStatus = data["payStatus"] != null ? `${data["payStatus"]}` : "";
-        const terminalFailed = data["terminalFailed"] === true;
-        if (
-          settled ||
-          orderStatus === "PAID" ||
-          payStatus === "SUCCESS"
-        ) {
-          return "success";
-        }
-        if (terminalFailed || orderStatus === "CANCELLED") {
-          return "failed";
-        }
-      }
-    } catch (e) {
-      // 网络异常忽略，继续重试
+    // 判定规则集中在 fetchSettlementResult，手动查单与轮询共用一份
+    const result = await fetchSettlementResult(orderId);
+    if (result != "pending") {
+      return result;
     }
   }
   return "pending";
@@ -1265,9 +2041,13 @@ export function getPayMode(): PayMode {
 
   // #ifdef H5 || WEB
   payMode = PayMode.h5;
-  const env = detectClientEnv();
-  if (env.isWeChat) {
-    payMode = PayMode.minipay;
+  if (isEmbeddedAppWebView()) {
+    payMode = PayMode.app;
+  } else {
+    const env = detectClientEnv();
+    if (env.isWeChat) {
+      payMode = PayMode.minipay;
+    }
   }
   // #endif
 
@@ -1277,4 +2057,331 @@ export function getPayMode(): PayMode {
   // #endif
 
   return payMode;
+}
+
+// ========== 支付确认弹窗（跳转前提示 + 回来手动查单） ==========
+
+/**
+ * 支付确认会话：跨端共用，记录「已拉起收银台、等用户手动查单」的订单。
+ * 与 APP 端的 ACTIVE_APP_PAY_SESSION 是两套：后者服务于原生拉起与结果重放，
+ * 这里只服务于用户可见的确认框，H5 整页跳转回来后也能靠它重建弹窗。
+ */
+const PAY_CONFIRM_SESSION = "PAY_CONFIRM_SESSION";
+const PAY_CONFIRM_SESSION_TTL_MS = 30 * 60 * 1000;
+
+/** 确认框同一时刻只允许一个，避免 pageshow / visibilitychange / onShow 重复弹出。 */
+let payConfirmDialogOpen = false;
+
+/** 后台静默查单据此判断：弹窗开着就只缓存结果，不抢在用户点按钮前弹 Toast。 */
+export function isPayConfirmDialogOpen(): boolean {
+  return payConfirmDialogOpen;
+}
+
+function readPayConfirmSession(): UTSJSONObject | null {
+  const raw = uni.getStorageSync(PAY_CONFIRM_SESSION);
+  const text = raw != null ? `${raw}` : "";
+  if (text.length == 0) {
+    return null;
+  }
+  try {
+    const session = JSON.parse<UTSJSONObject>(text);
+    if (session == null) {
+      uni.removeStorageSync(PAY_CONFIRM_SESSION);
+      return null;
+    }
+    const createdAtRaw = session["createdAt"];
+    const createdAt = createdAtRaw != null ? parseFloat(`${createdAtRaw}`) : 0;
+    if (createdAt <= 0 || Date.now() - createdAt > PAY_CONFIRM_SESSION_TTL_MS) {
+      uni.removeStorageSync(PAY_CONFIRM_SESSION);
+      return null;
+    }
+    return session;
+  } catch (_error) {
+    uni.removeStorageSync(PAY_CONFIRM_SESSION);
+    return null;
+  }
+}
+
+function readPayConfirmSessionOrderIdOf(session: UTSJSONObject): number {
+  const raw = session["orderId"];
+  const orderId = raw != null ? parseInt(`${raw}`) : 0;
+  return isNaN(orderId) ? 0 : orderId;
+}
+
+/** 拉起收银台成功后登记；用户回到页面时据此重建确认框。 */
+export function beginPayConfirmSession(
+  orderId: number,
+  payChannelValue: string,
+): void {
+  const session = new UTSJSONObject();
+  session["orderId"] = orderId as any;
+  session["payChannel"] = payChannelValue;
+  session["autoResult"] = "";
+  // 每次重新发起支付都重置，用户上一轮点过「关闭」不影响新一轮弹窗
+  session["dismissed"] = "";
+  session["createdAt"] = Date.now() as any;
+  uni.setStorageSync(PAY_CONFIRM_SESSION, JSON.stringify(session));
+}
+
+/**
+ * 标记用户已手动关闭确认框。
+ * 会话保留（TTL 内仍可承接后台查单结果），但不再自动重弹——
+ * 用户主动关掉的弹窗，不该在他每次进入页面时又被推到脸上。
+ */
+export function markPayConfirmDismissed(orderId: number): void {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return;
+  }
+  if (readPayConfirmSessionOrderIdOf(session) != orderId) {
+    return;
+  }
+  session["dismissed"] = "1";
+  uni.setStorageSync(PAY_CONFIRM_SESSION, JSON.stringify(session));
+}
+
+/** 该订单的确认框是否已被用户手动关闭过。 */
+export function isPayConfirmDismissed(orderId: number): boolean {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return false;
+  }
+  if (readPayConfirmSessionOrderIdOf(session) != orderId) {
+    return false;
+  }
+  const raw = session["dismissed"];
+  return raw != null && `${raw}` == "1";
+}
+
+/** 无活跃会话返回 0。 */
+export function getPayConfirmSessionOrderId(): number {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return 0;
+  }
+  return readPayConfirmSessionOrderIdOf(session);
+}
+
+/** 无活跃会话时回退到微信，仅用于弹窗文案。 */
+export function getPayConfirmSessionChannel(): string {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return "WxPay";
+  }
+  const raw = session["payChannel"];
+  const channel = raw != null ? `${raw}` : "";
+  return channel.length > 0 ? channel : "WxPay";
+}
+
+/** 后台静默查单命中终态时缓存；用户点「我已支付」即可秒回结果。 */
+export function storePayConfirmAutoResult(orderId: number, result: string): void {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return;
+  }
+  if (readPayConfirmSessionOrderIdOf(session) != orderId) {
+    return;
+  }
+  session["autoResult"] = result;
+  uni.setStorageSync(PAY_CONFIRM_SESSION, JSON.stringify(session));
+}
+
+/** 读取后台静默查单的终态缓存；无缓存返回空串。 */
+export function readPayConfirmAutoResult(orderId: number): string {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return "";
+  }
+  if (readPayConfirmSessionOrderIdOf(session) != orderId) {
+    return "";
+  }
+  const resultRaw = session["autoResult"];
+  return resultRaw != null ? `${resultRaw}` : "";
+}
+
+/** 终态已提示给用户后清理；orderId 不匹配时禁止误删其他订单的会话。 */
+export function clearPayConfirmSession(orderId: number): void {
+  const session = readPayConfirmSession();
+  if (session == null) {
+    return;
+  }
+  if (orderId > 0 && readPayConfirmSessionOrderIdOf(session) != orderId) {
+    return;
+  }
+  uni.removeStorageSync(PAY_CONFIRM_SESSION);
+}
+
+function showPayModal(
+  title: string,
+  content: string,
+  confirmText: string,
+  cancelText: string,
+  showCancel: boolean,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    uni.showModal({
+      title: title,
+      content: content,
+      showCancel: showCancel,
+      cancelText: cancelText,
+      confirmText: confirmText,
+      success: (res) => {
+        resolve(res.confirm != null && res.confirm != false);
+      },
+      fail: () => {
+        resolve(false);
+      },
+    });
+  });
+}
+
+/** 单次结算查询，不做等待；判定规则与 pollPayResult 共用。 */
+export async function fetchSettlementResult(orderId: number): Promise<string> {
+  try {
+    const requestData = new UTSJSONObject();
+    requestData["orderId"] = orderId as any;
+    const res = await apiGetSettlementStatus(requestData);
+    const code = apiResCode(res);
+    const data = apiResData<any>(res) as UTSJSONObject | null;
+    if (code == SUCCESS_CODE && data != null) {
+      const settled = data["settled"] == true || `${data["settled"]}` == "true";
+      const orderStatus = data["orderStatus"] != null ? `${data["orderStatus"]}` : "";
+      const payStatus = data["payStatus"] != null ? `${data["payStatus"]}` : "";
+      const terminalFailed = data["terminalFailed"] == true || `${data["terminalFailed"]}` == "true";
+      if (settled || orderStatus == "PAID" || payStatus == "SUCCESS") {
+        return "success";
+      }
+      if (
+        terminalFailed ||
+        orderStatus == "CANCELLED" ||
+        payStatus == "FAILED" ||
+        payStatus == "CLOSED"
+      ) {
+        return "failed";
+      }
+    }
+  } catch (_e) {
+    // 网络异常按未出结果处理，交给调用方决定是否重试
+  }
+  return "pending";
+}
+
+/**
+ * 用户主动查单：立刻查一次，未出终态再补两次（+1.5s / +3s）。
+ * 不能直接用 pollPayResult —— 它是「先等 2 秒再请求」，手动点按钮会明显卡顿。
+ */
+export async function checkPayResultOnDemand(orderId: number): Promise<string> {
+  for (let i = 0; i < 3; i++) {
+    if (i > 0) {
+      const wait = i == 1 ? 1500 : 3000;
+      await new Promise<void>((resolve) => {
+        setTimeout(() => {
+          resolve();
+        }, wait);
+      });
+    }
+    const result = await fetchSettlementResult(orderId);
+    if (result != "pending") {
+      return result;
+    }
+  }
+  return "pending";
+}
+
+function emitPayResultToast(
+  result: string,
+  t: (key: string) => string,
+  onSuccess: (() => void) | null,
+): void {
+  // Android：UTS 不给可选参数生成重载，少传参会编译失败（error: No value passed
+  // for parameter 'onSuccess'），无回调时传空实现而不是省略。
+  if (onSuccess != null) {
+    handlePayResultToast(result, t, onSuccess);
+  } else {
+    handlePayResultToast(result, t, (): void => {});
+  }
+}
+
+/**
+ * 支付确认框：拉起收银台后展示，用户支付完切回来点「我已支付」查单。
+ *
+ * - 未查到结果时换文案继续等待，用户可反复点「再查一次」；
+ * - 点「关闭」只关闭弹窗，会话保留，后台静默查单仍会兜底；
+ * - 关闭前若后台已查到终态（autoResult），直接提示，不让结果丢失。
+ */
+export async function openPayAwaitConfirmDialog(
+  orderId: number,
+  payChannelValue: string,
+  t: (key: string) => string,
+  onSuccess: (() => void) | null,
+): Promise<void> {
+  if (orderId <= 0 || payConfirmDialogOpen == true) {
+    return;
+  }
+  payConfirmDialogOpen = true;
+  try {
+    const tipKey = payChannelValue == "AliPay"
+      ? "Mobile.MySubscriptions.payConfirmTipAlipay"
+      : "Mobile.MySubscriptions.payConfirmTipWechat";
+    let title = t("Mobile.MySubscriptions.payConfirmTitle");
+    let content = t(tipKey);
+    let confirmText = t("Mobile.MySubscriptions.payConfirmDone");
+    let cancelText = t("Mobile.MySubscriptions.payConfirmLater");
+
+    while (true) {
+      const confirmed = await showPayModal(
+        title,
+        content,
+        confirmText,
+        cancelText,
+        true,
+      );
+      if (confirmed != true) {
+        // 用户关掉弹窗：把后台已经查到的终态补提示出来，避免结果石沉大海。
+        const cached = readPayConfirmAutoResult(orderId);
+        if (cached.length > 0) {
+          clearPayConfirmSession(orderId);
+          emitPayResultToast(cached, t, onSuccess);
+          return;
+        }
+        // 没有结果就是用户主动放弃本轮查单：记下来，后续进页面不再自动重弹
+        markPayConfirmDismissed(orderId);
+        return;
+      }
+
+      let result = readPayConfirmAutoResult(orderId);
+      if (result.length == 0) {
+        uni.showLoading({
+          title: t("Mobile.MySubscriptions.payChecking"),
+          mask: true,
+        });
+        result = await checkPayResultOnDemand(orderId);
+        uni.hideLoading();
+      }
+
+      if (result == "success") {
+        clearPayConfirmSession(orderId);
+        emitPayResultToast("success", t, onSuccess);
+        return;
+      }
+      if (result == "failed") {
+        clearPayConfirmSession(orderId);
+        await showPayModal(
+          t("Mobile.MySubscriptions.payFailed"),
+          t("Mobile.MySubscriptions.payClosedTip"),
+          t("Mobile.MySubscriptions.payCloseDialog"),
+          "",
+          false,
+        );
+        return;
+      }
+
+      title = t("Mobile.MySubscriptions.payNotFoundTitle");
+      content = t("Mobile.MySubscriptions.payNotFoundTip");
+      confirmText = t("Mobile.MySubscriptions.payRetryCheck");
+      cancelText = t("Mobile.MySubscriptions.payCloseDialog");
+    }
+  } finally {
+    payConfirmDialogOpen = false;
+  }
 }

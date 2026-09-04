@@ -1,17 +1,24 @@
 import {
   COMMON_HEADERS,
 } from "@/constants/common.constants";
-import { ACCESS_TOKEN, EXPIRE_DATE } from "../constants/home.constants";
+import { API_TIMEOUT } from "@/constants/api.constants";
+import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN, EXPIRE_DATE } from "../constants/home.constants";
 import {
   DEFAULT_LANG,
   I18N_LANG_STORAGE_KEY,
 } from "@/constants/i18n.constants";
-import { API_BASE_URL, LOGIN_WHITELIST_URL, VOX_BASE_URL } from "../constants/config";
+import {
+  LOGIN_WHITELIST_URL,
+  clearStoragePreservingApiBaseUrl,
+  getApiBaseUrl,
+  getVoxBaseUrl,
+} from "../constants/config";
 import {
   REDIRECT_LOGIN,
   SUCCESS_CODE,
   USER_NO_LOGIN,
 } from "@/constants/codes.constants";
+import { applyBearerAuthorization, bootstrapH5AccessTokenFromUrl } from "@/utils/authSession";
 
 // #ifdef H5 || WEB
 import {
@@ -22,7 +29,15 @@ import {
 
 import { handleExternalLink } from "@/utils/system";
 import { getCurrentPageFullPath } from "@/utils/common";
+import {
+  LOGIN_PAGE_PATH,
+  LOGIN_WEIXIN_PAGE_PATH,
+  redirectToLoginOnce,
+} from "@/utils/authNavigation";
 import { orObject, orString } from "@/utils/utsCoalesce";
+
+// 请求/响应日志开关：开发环境(HBuilderX 运行=development)自动开，发行打包(NODE_ENV=production，如打 APK)自动关
+// const ENABLE_REQUEST_LOG = process.env.NODE_ENV !== "production";
 
 // 微信小程序：request
 // 参数/返回值均用 any：Android 运行时对象字面量与响应体均为 UTSJSONObject，禁止 interface 强转
@@ -53,14 +68,24 @@ export default function request(options: any): Promise<any> {
     }
   }
   const timeoutRaw = opts["timeout"];
-  let timeoutNum: number | null = null;
+  // 所有普通 API 都必须有确定的结束边界，避免页面 await 永久悬挂并锁住交互状态。
+  let timeoutNum = API_TIMEOUT;
   if (timeoutRaw != null) {
     timeoutNum = timeoutRaw as number;
   }
   // 可选 baseUrl 覆盖（如 Nuwax Vox 网关 VOX_BASE_URL），缺省走主站 API_BASE_URL
   const baseUrlRaw = opts["baseUrl"];
-  const baseUrl = baseUrlRaw != null ? `${baseUrlRaw}` : API_BASE_URL;
+  const baseUrl = baseUrlRaw != null ? `${baseUrlRaw}` : getApiBaseUrl();
+  const skipAuthRaw = opts["skipAuth"];
+  const skipAuth = skipAuthRaw == true;
+  // #ifdef H5 || WEB
+  bootstrapH5AccessTokenFromUrl();
+  // #endif
   const accessToken = uni.getStorageSync(ACCESS_TOKEN);
+  const accessTokenOriginRaw = uni.getStorageSync(ACCESS_TOKEN_ORIGIN);
+  const accessTokenOrigin = accessTokenOriginRaw != null ? `${accessTokenOriginRaw}` : "";
+  // 兼容升级前没有 origin 标记的旧 Token；新登录均会写入该标记。
+  const tokenMatchesOrigin = accessTokenOrigin.length == 0 || accessTokenOrigin == baseUrl;
   const _rawLang = uni.getStorageSync(I18N_LANG_STORAGE_KEY);
   let currentLang = (_rawLang != null ? _rawLang : DEFAULT_LANG) as string;
   currentLang = (currentLang != null ? currentLang : DEFAULT_LANG).toLowerCase();
@@ -79,23 +104,20 @@ export default function request(options: any): Promise<any> {
     }
   }
 
-  // 根据客户端平台条件动态添加 X-Client-Type Header ("ios" / "android")
+  // 根据客户端平台条件动态添加 X-Client-Type Header ("ios" / "android" / "harmony")
+  // 服务端据此判定 App 内调用；缺失会被当成手机浏览器（app-native 支付会被拒）。
   // #ifdef APP-IOS
   header["X-Client-Type"] = "ios";
   // #endif
   // #ifdef APP-ANDROID
   header["X-Client-Type"] = "android";
   // #endif
-  if (accessToken != null && accessToken != "") {
-    // #ifdef H5 || WEB
-    if (process.env.NODE_ENV === "development") {
-      header["Authorization"] = `Bearer ${accessToken}`;
-    }
-    // #endif
-
-    // #ifdef MP-WEIXIN || APP
-    header["Authorization"] = `Bearer ${accessToken}`;
-    // #endif
+  // #ifdef APP-HARMONY
+  header["X-Client-Type"] = "harmony";
+  // #endif
+  // App / 小程序 / H5 开发 / App 内嵌 H5 → Bearer；浏览器 H5 生产仍走 Cookie ticket
+  if (!skipAuth && tokenMatchesOrigin) {
+    applyBearerAuthorization(header, accessToken != null ? `${accessToken}` : null);
   }
 
   // uEnvProd
@@ -115,17 +137,12 @@ export default function request(options: any): Promise<any> {
   // uni.request<UTSJSONObject> 顶层宽松解析；禁止 JSON.parse<T>（Gson 无法实例化 interface）。
   // 自定义 RequestOptions 已改名为 ApiRequestOptions，避免与 SDK RequestOptions 冲突。
     const fullUrl = baseUrl + url;
-    const isVox = baseUrl == VOX_BASE_URL;
+    // Vox 网关已跟随主域名（config.uts 中 VOX_BASE_URL == API_BASE_URL），仅比较 baseUrl 取值
+    // 会把所有主站请求误判成 vox 请求，导致下方 4010 分支的 `!isVoxUrl` 守卫恒不成立、
+    // 踢登录逻辑对全部接口失效（表现为接口反复返回 4010 却永不跳登录页）。
+    // servers/vox/* 均显式传入 baseUrl: VOX_BASE_URL，主站接口不传，故以「调用方是否显式指定」区分。
+    const isVox = baseUrlRaw != null && baseUrl == getVoxBaseUrl();
     const logTag = isVox ? "[VoxReq]" : "[ApiReq]";
-    const hasToken = accessToken != null && accessToken != "";
-    let reqBodyStr = "";
-    if (requestData != null && typeof requestData != "string") {
-      const s = JSON.stringify(requestData);
-      reqBodyStr = s != null ? s : "";
-    } else if (typeof requestData == "string") {
-      reqBodyStr = requestData as string;
-    }
-    console.log(`${logTag} → ${method} ${fullUrl} | token=${hasToken ? "yes" : "no"} | body=${reqBodyStr != "" ? reqBodyStr : "(empty)"}`);
     uni.request<UTSJSONObject>({
       url: fullUrl,
       method: method,
@@ -134,6 +151,8 @@ export default function request(options: any): Promise<any> {
       timeout: timeoutNum,
       header: header,
       success: (res) => {
+        // 登录态（ACCESS_TOKEN）不再从响应 Set-Cookie 同步：登录/内嵌注入即权威，cookie 轮换不得覆盖
+        // （防止进入聊天页时带入被服务端 cookie 轮换淘汰的旧 token → 4010 弹登录）。
         // res.data 已是 UTSJSONObject，禁止 JSON.parse<T> 或强转为 interface
         const responseData = res.data;
         const respObj = responseData != null ? (responseData as UTSJSONObject) : null;
@@ -141,42 +160,45 @@ export default function request(options: any): Promise<any> {
         const code = codeVal != null ? `${codeVal}` : null;
         const msgVal = respObj != null ? respObj["message"] : null;
         const errorMessage = msgVal != null ? `${msgVal}` : "";
-        let respBodyStr = "";
-        if (respObj != null) {
-          const s = JSON.stringify(respObj);
-          respBodyStr = s != null ? s : "";
-        }
-        // 响应体截断，避免长列表刷屏
-        const respPreview = respBodyStr.length > 800 ? respBodyStr.substring(0, 800) + "…(truncated)" : respBodyStr;
-        console.log(`${logTag} ← ${method} ${fullUrl} | http=${res.statusCode} | code=${code != null ? code : "null"} | msg=${errorMessage} | data=${respPreview != "" ? respPreview : "(empty)"}`);
         // UTS→Kotlin: `===` 引用相等，业务码比较一律 `==`。
 
-        // batch 接口不做错误消息与跳转相关逻辑
-        const isBatchUrl = url != null && url.includes("/api/notify/event/collect/batch");
+        // 登录跳转豁免接口：batch 事件上报、多语言列表、租户配置信息。
+        // 后两者是登录页挂载即调的游客接口，若参与踢登录页会在登录页自身形成
+        // 「挂载→请求返回鉴权码→踢登录页→再挂载」的重定向循环；调用方按非成功码自行处理即可。
+        const isAuthKickExemptUrl = url != null &&
+          (url.includes("/api/notify/event/collect/batch") ||
+            url.includes("/api/i18n/lang/list") ||
+            url.includes("/api/tenant/config"));
         // vox 网关未登录响应不踢主站登录态（可能未实现主站 token 校验代理，避免误清 storage）
         const isVoxUrl = isVox;
-        if (isBatchUrl) {
+        if (isAuthKickExemptUrl) {
           resolve(responseData as any);
         } else if (code == USER_NO_LOGIN && !isVoxUrl) {
           // 用户未登录，跳转到登录页
-          uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
-          uni.clearStorageSync(); // 清空所有缓存
-
+          // 仅在本地确实存有登录态时才清缓存：游客冷启动时多个接口都会返回 4010，
+          // 无条件 clearStorage 会把 i18n 文案与租户配置缓存一并清掉，登录页文案/站点名
+          // 先落默认值再被接口刷新，直观表现就是闪烁。
+          const hadToken = accessToken != null && `${accessToken}`.length > 0;
+          if (hadToken) {
+            uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+            clearStoragePreservingApiBaseUrl(); // 清空业务缓存，保留企业域名
+          }
+          // 并发/连续多个接口返回 4010 时，跳转由 redirectToLoginOnce 去重，
+          // 已在登录页则完全不再 reLaunch，避免登录页被反复重建。
           // #ifdef H5 || WEB || APP
-          uni.reLaunch({
-            url: "/subpackages/pages/login/login",
-          });
+          redirectToLoginOnce(LOGIN_PAGE_PATH);
           // #endif
           // #ifdef MP-WEIXIN
-          uni.reLaunch({
-            url: "/subpackages/pages/login-weixin/login-weixin",
-          });
+          redirectToLoginOnce(LOGIN_WEIXIN_PAGE_PATH);
           // #endif
           resolve(responseData as any);
         } else if (code == REDIRECT_LOGIN) {
           // 重定向到登录页
-          uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
-          uni.clearStorageSync(); // 清空所有缓存
+          // 与 4010 分支同理：本地没有登录态时不清缓存（否则会连带清掉 i18n/租户配置缓存）
+          if (accessToken != null && `${accessToken}`.length > 0) {
+            uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
+            clearStoragePreservingApiBaseUrl(); // 清空业务缓存，保留企业域名
+          }
           let redirectUrl = errorMessage;
           let resolvedEarly = false;
           // 如果错误信息包含/login开头，则替换为登录页，否则直接打开完整链接
@@ -189,9 +211,9 @@ export default function request(options: any): Promise<any> {
             } else {
               redirectUrl = errorMessage.replace(
                 "/login",
-                "/subpackages/pages/login/login",
+                LOGIN_PAGE_PATH,
               );
-              uni.reLaunch({ url: redirectUrl });
+              redirectToLoginOnce(redirectUrl);
             }
             // #endif
 
@@ -201,19 +223,19 @@ export default function request(options: any): Promise<any> {
             if (currentUrl != null && currentUrl != "") {
               if (globalThis.appConfig.redirectUrl != null && globalThis.appConfig.redirectUrl != "") {
                 const otherQueryStr = globalThis.appConfig.redirectUrl;
-                uni.reLaunch({
-                  url:
-                    "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                redirectToLoginOnce(
+                  LOGIN_WEIXIN_PAGE_PATH +
+                    "?redirect=" +
                     encodeURIComponent(
                       "/subpackages/pages/webview/webview?url=" + otherQueryStr,
                     ),
-                });
+                );
               } else {
-                uni.reLaunch({
-                  url:
-                    "/subpackages/pages/login-weixin/login-weixin?redirect=" +
+                redirectToLoginOnce(
+                  LOGIN_WEIXIN_PAGE_PATH +
+                    "?redirect=" +
                     encodeURIComponent(currentUrl),
-                });
+                );
               }
             }
             // #endif
@@ -223,6 +245,11 @@ export default function request(options: any): Promise<any> {
             // #endif
             // #ifdef MP
             handleExternalLink(errorMessage);
+            // #endif
+            // #ifdef APP
+            // APP 端无法也无需跳 H5 登录 URL：登录态已在上方清理，
+            // 这里必须回到原生登录页，否则用户停留在已清态的页面上（无任何跳转）。
+            redirectToLoginOnce(LOGIN_PAGE_PATH);
             // #endif
           }
           if (!resolvedEarly) {
@@ -268,9 +295,10 @@ export function createSSEConnection<T = any>(options: SSEOptions<T>) {
     headers["Accept-Language"] = currentLang;
     if (options.headers != null) {
       const optHeaders = options.headers as UTSJSONObject;
-      const headerKeys = Object.keys(optHeaders);
+      const headerKeys = UTSJSONObject.keys(optHeaders);
       for (let hi = 0; hi < headerKeys.length; hi++) {
-        headers[headerKeys[hi]] = optHeaders[headerKeys[hi]];
+        const hk = headerKeys[hi];
+        headers[hk] = optHeaders[hk];
       }
     }
     if (fragment != null && fragment != "") {
@@ -355,10 +383,22 @@ export function createSSEConnection<T = any>(options: SSEOptions<T>) {
 
   // #ifdef APP-PLUS || APP
   let buffer = "";
+  // 与 H5 分支一致：合并调用方 headers（含 Authorization），勿传空对象导致鉴权丢失
+  const appSseHeaders = new UTSJSONObject(COMMON_HEADERS);
+  appSseHeaders["Content-Type"] = "application/json";
+  appSseHeaders["Accept-Language"] = currentLang;
+  if (options.headers != null) {
+    const optHeaders = options.headers as UTSJSONObject;
+    const headerKeys = UTSJSONObject.keys(optHeaders);
+    for (let hi = 0; hi < headerKeys.length; hi++) {
+      const hk = headerKeys[hi];
+      appSseHeaders[hk] = optHeaders[hk];
+    }
+  }
   const task = uni.request({
     url: options.url,
     method: options.method != null ? options.method : "POST",
-    header: new UTSJSONObject(),
+    header: appSseHeaders,
     data:
       options.body != null && typeof options.body === "object"
         ? JSON.stringify(options.body)
@@ -388,8 +428,9 @@ export function createSSEConnection<T = any>(options: SSEOptions<T>) {
     },
   });
 
-  task.onChunkReceived((res: any) => {
-    const arrayBuffer = res as ArrayBuffer;
+  // Android：必须用官方 RequestTaskOnChunkReceivedListenerResult，勿 as ArrayBuffer / UTSJSONObject
+  task.onChunkReceived((res: RequestTaskOnChunkReceivedListenerResult) => {
+    const arrayBuffer = res.data as ArrayBuffer;
     try {
       const text = arrayBufferToString(arrayBuffer);
       buffer += text;

@@ -1,13 +1,1108 @@
 import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
+import { findCjkAutolinkBoundary, CJK_URL_PUNCTUATION } from "@/subpackages/components/ai-msg/markdownAutolink.uts";
 import type {
   Align,
   MarkdownToken,
 } from "@/uni_modules/uni-cmark/utssdk/interface.uts";
 import proxyWeb from "@/uni_modules/uni-ai-x/sdk/proxy-web.uts";
+import {
+  parseLineCode,
+  ParseLineCodeRes,
+} from "@/uni_modules/uni-ai-x/sdk/parseCode.uts";
+import {
+  isIncompleteMarkdownImageLine,
+  parseMarkdownImageAt,
+  parseStandaloneMarkdownImageLine,
+} from "@/subpackages/components/ai-msg/markdownImage.uts";
+import {
+  extractConversationTagAttribute,
+  extractMarkdownCustomProcessAttribute,
+  findNextMarkdownContainerFence,
+  findNextMarkdownCustomProcessTag,
+  listMarkdownCustomProcessTags,
+} from "@/utils/markdownCustomProcess.uts";
+import {
+  cacheEntryToRes,
+  getMathCache,
+  putMathCache,
+} from "@/subpackages/components/ai-msg/mathFormulaDiskCache.uts";
+import { perfRecordMathBatchDetail } from "@/utils/perfProbe.uts";
 
 type MathRenderedCallback = () => void;
 
-/** 将段落中的 $...$ 拆为独立公式块，适配当前 katex-el 的块级渲染。 */
+/** 解析期收集的公式任务，解析结束后一次 batch 提交给 proxy */
+class PendingMathJob {
+  id: string;
+  latex: string;
+  token: MarkdownToken;
+  displayMode: boolean;
+  constructor(
+    id: string,
+    latex: string,
+    token: MarkdownToken,
+    displayMode: boolean,
+  ) {
+    this.id = id;
+    this.latex = latex;
+    this.token = token;
+    this.displayMode = displayMode;
+  }
+}
+
+/**
+ * 公式队列栈：每个根 parse 一帧，递归分段复用栈顶；
+ * 多条历史消息并发 parse 时互不串台。
+ */
+class MathJobFrame {
+  jobs: PendingMathJob[] = [] as PendingMathJob[];
+}
+let mathJobStack: MathJobFrame[] = [] as MathJobFrame[];
+let mathJobSeq: number = 0;
+
+function currentMathJobs(): PendingMathJob[] | null {
+  if (mathJobStack.length == 0) {
+    return null;
+  }
+  return mathJobStack[mathJobStack.length - 1].jobs;
+}
+
+function applyMathResultToToken(token: MarkdownToken, res: UTSJSONObject): void {
+  const imageData = res["imageDataURL"];
+  const htmlData = res["resultHtml"];
+  const widthData = res["width"];
+  const heightData = res["height"];
+  if (imageData != null) token.href = `${imageData}`;
+  if (htmlData != null) token.html = `${htmlData}`;
+  if (widthData != null) token.width = widthData as number;
+  if (heightData != null) token.height = heightData as number;
+}
+
+function mathCacheKey(latex: string, displayMode: boolean): string {
+  // v2：与磁盘缓存 V3 对齐，避免内存 L1 仍命中「\\ 被折叠」时期的坏截图
+  if (displayMode == true) {
+    return "v2d1:" + latex;
+  }
+  return "v2d0:" + latex;
+}
+
+/** 最近一次根 parse 提交的公式数（0 表示无 batch） */
+let lastMathFlushCount: number = 0;
+
+/** 截图结果暂存：凑满一批再写 token，避免逐条重绘抖动 */
+class PendingMathResult {
+  token: MarkdownToken;
+  res: UTSJSONObject;
+  constructor(token: MarkdownToken, res: UTSJSONObject) {
+    this.token = token;
+    this.res = res;
+  }
+}
+
+/** 同一 latex 去重：一次截图扇出到多个 token */
+class MathDedupeGroup {
+  key: string = "";
+  latex: string = "";
+  displayMode: boolean = true;
+  tokens: MarkdownToken[] = [] as MarkdownToken[];
+}
+
+/** KaTeX 并发上限：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥队列（公式多时卡死） */
+const MAX_CONCURRENT_KATEX: number = 2;
+
+/**
+ * 跨 frame 在途公式（已 dispatch 未回调）key → 等待的同 key token。
+ * 堵「首个 dispatch 在途、L1 未写，下一 chunk 全量解析又遇同一闭合公式」的重复 dispatch。
+ * 命中时 token 挂入等待列表，dispatch 回调统一扇出，不再重复 evalJS。
+ */
+let mathInFlightTokens: Map<string, MarkdownToken[]> = new Map<string, MarkdownToken[]>();
+
+/**
+ * App 专用：并行派发 katexRender（proxy 多槽）。
+ * 命中磁盘缓存则跳过截图；相同 latex 去重；按 chunk 上屏减轻抖动。
+ */
+class MathBatchUiRunner {
+  jobs: PendingMathJob[];
+  onChunkReady: MathRenderedCallback;
+  pending: number = 0;
+  buffered: PendingMathResult[] = [] as PendingMathResult[];
+  /** 多条一起刷会拖慢「闭合即见」；流式逐个上屏用 1 */
+  chunkSize: number = 1;
+  /** KaTeX 并发闸：WebView 单线程，>2 无吞吐收益反而打满 evalJS/callback 桥队列 → 卡死 */
+  inFlight: number = 0;
+  queue: MathDedupeGroup[] = [] as MathDedupeGroup[];
+
+  constructor(jobs: PendingMathJob[], onChunkReady: MathRenderedCallback) {
+    this.jobs = jobs;
+    this.onChunkReady = onChunkReady;
+  }
+
+  start(): void {
+    const groups = [] as MathDedupeGroup[];
+    const hitResults = [] as PendingMathResult[];
+    for (let i = 0; i < this.jobs.length; i++) {
+      const job = this.jobs[i];
+      const key = mathCacheKey(job.latex, job.displayMode);
+      const cached = getMathCache(key);
+      if (cached != null) {
+        hitResults.push(
+          new PendingMathResult(job.token, cacheEntryToRes(cached)),
+        );
+        continue;
+      }
+      // 跨 frame 在途去重：该 latex 已在 dispatch 未回调 → 挂等待列表，不再重复 dispatch
+      const inFlightWaiters = mathInFlightTokens.get(key);
+      if (inFlightWaiters != null) {
+        inFlightWaiters.push(job.token);
+        continue;
+      }
+      let group: MathDedupeGroup | null = null;
+      for (let g = 0; g < groups.length; g++) {
+        if (groups[g].key == key) {
+          group = groups[g];
+          break;
+        }
+      }
+      if (group == null) {
+        const created = new MathDedupeGroup();
+        created.key = key;
+        created.latex = job.latex;
+        created.displayMode = job.displayMode;
+        groups.push(created);
+        group = created;
+      }
+      group.tokens.push(job.token);
+    }
+
+    if (hitResults.length > 0) {
+      for (let hi = 0; hi < hitResults.length; hi++) {
+        applyMathResultToToken(hitResults[hi].token, hitResults[hi].res);
+      }
+      // App：缓存命中已在解析期写回 token.href，本次 markdownElList 赋值即可上屏，
+      // 勿再 onChunkReady 触发整表 flush（流式增量下会放大主线程抖动）。
+      let skipCacheFlush = false;
+      // #ifdef APP
+      skipCacheFlush = true;
+      // #endif
+      if (skipCacheFlush != true) {
+        this.onChunkReady();
+      }
+    }
+
+    this.pending = groups.length;
+    this.buffered = [] as PendingMathResult[];
+    // [PerfProbe] 观测：公式 batch 缓存命中数 vs 实际 dispatch 数（性能排查，可关）
+    try {
+      perfRecordMathBatchDetail(
+        hitResults.length,
+        groups.length,
+        proxyWeb.isReady(),
+      );
+    } catch (_e) {
+      // 埋点失败静默
+    }
+    if (groups.length == 0) {
+      return;
+    }
+    // 并发闸：入队后按 MAX_CONCURRENT_KATEX 匀速 pump，不再一次性全 dispatch 打满 WebView 桥
+    this.queue = groups;
+    this.inFlight = 0;
+    this.pump();
+  }
+
+  /** 按并发上限持续派发队列中的 group；每个 dispatch 回调后再 pump 续发 */
+  pump(): void {
+    while (
+      this.inFlight < MAX_CONCURRENT_KATEX &&
+      this.queue.length > 0
+    ) {
+      const group = this.queue.shift();
+      if (group == null) {
+        break;
+      }
+      this.inFlight = this.inFlight + 1;
+      this.dispatchGroup(group);
+    }
+  }
+
+  /** 把当前缓冲写回 token 并通知 UI 刷一帧 */
+  flushBuffered(): void {
+    const all = this.buffered;
+    if (all.length == 0) {
+      return;
+    }
+    this.buffered = [] as PendingMathResult[];
+    for (let bi = 0; bi < all.length; bi++) {
+      applyMathResultToToken(all[bi].token, all[bi].res);
+    }
+    this.onChunkReady();
+  }
+
+  dispatchGroup(group: MathDedupeGroup): void {
+    const runner = this;
+    const cacheKey = group.key;
+    const tokens = group.tokens;
+    const latex = group.latex;
+    const displayMode = group.displayMode;
+    const doDispatch = (): void => {
+      // 登记在途：同 key 后续 chunk 会挂入 mathInFlightTokens 等待列表而非重复 dispatch
+      mathInFlightTokens.set(cacheKey, tokens);
+      const param = new UTSJSONObject();
+      param["action"] = "katexRender";
+      param["pureMathText"] = latex;
+      param["displayMode"] = displayMode;
+      proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
+        putMathCache(cacheKey, res);
+        // 扇出给 group.tokens + 跨 frame 挂入的等待 token（同一 list 引用，含已追加的等待者）
+        const fanout = mathInFlightTokens.get(cacheKey);
+        mathInFlightTokens.delete(cacheKey);
+        const targets = fanout != null ? fanout : tokens;
+        for (let ti = 0; ti < targets.length; ti++) {
+          runner.buffered.push(new PendingMathResult(targets[ti], res));
+        }
+        runner.pending = runner.pending - 1;
+        runner.inFlight = runner.inFlight - 1;
+        if (
+          runner.buffered.length >= runner.chunkSize ||
+          runner.pending == 0
+        ) {
+          runner.flushBuffered();
+        }
+        // 一个回调完成，续发队列中下一个（保持 ≤MAX_CONCURRENT_KATEX 在途）
+        runner.pump();
+      });
+    };
+    // 未命中磁盘缓存才需要 proxy；未就绪时等 webview，避免 callMethod 空转
+    if (proxyWeb.isReady() == true) {
+      doDispatch();
+    } else {
+      proxyWeb.whenReady((): void => {
+        doDispatch();
+      });
+    }
+  }
+}
+
+/**
+ * App：将收集到的公式并行交给 proxy；磁盘缓存命中/去重后按 chunk 回调上屏。
+ * 无任务时不回调。
+ * @returns 提交的公式条数（含仅走缓存的条数）
+ */
+function flushMathJobs(onChunkReady: MathRenderedCallback): number {
+  const frame =
+    mathJobStack.length > 0 ? mathJobStack[mathJobStack.length - 1] : null;
+  if (frame == null) {
+    lastMathFlushCount = 0;
+    return 0;
+  }
+  const jobs = frame.jobs;
+  if (jobs.length == 0) {
+    lastMathFlushCount = 0;
+    return 0;
+  }
+  lastMathFlushCount = jobs.length;
+  new MathBatchUiRunner(jobs, onChunkReady).start();
+  return jobs.length;
+}
+
+/** 读取并清零最近一次 fallback 公式 batch 数量 */
+export function takeLastMathFlushCount(): number {
+  const n = lastMathFlushCount;
+  lastMathFlushCount = 0;
+  return n;
+}
+
+/**
+ * 某公式是否已「结算」：已派发过 katexRender 并回调（成功或失败，结果已入磁盘/内存缓存）。
+ * 用于流式增量「官方 WAIT」语义：尚未结算（在途）的公式要等出图再继续渲染后续内容；
+ * 已结算（含渲染失败、结果为空）则不再等待，按占位展示并继续。
+ */
+export function isMathConcluded(
+  latex: string,
+  displayMode: boolean,
+): boolean {
+  if (latex.length == 0) {
+    return false;
+  }
+  return getMathCache(mathCacheKey(latex, displayMode)) != null;
+}
+
+/** 是否为无序或有序列表行。 */
+function isFallbackListLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (/^[-+*]\s+/.test(trimmed)) {
+    return true;
+  }
+  return /^\d+[.)]\s+/.test(trimmed);
+}
+
+/**
+ * 行内是否存在「表格管道」：忽略 $...$ / $$...$$ 内的 |（如 $|\Psi|^2$）。
+ * 避免把绝对值公式误判成 Markdown 表格。
+ * 流式：以 | 开头的行一律视为表格行（即使单元格内 $ 未闭合），防止拆表后后续行丢失。
+ */
+function lineHasMarkdownTablePipe(line: string): boolean {
+  const trimmed = line.trim();
+  // 标准 GFM 表行列以 | 起手；流式半截公式行也必须保住表格上下文
+  if (trimmed.startsWith("|")) {
+    return true;
+  }
+  let i = 0;
+  while (i < line.length) {
+    const ch = line.charAt(i);
+    if (ch == "$") {
+      const isDouble =
+        i + 1 < line.length && line.charAt(i + 1) == "$";
+      if (isDouble) {
+        const end = line.indexOf("$$", i + 2);
+        if (end < 0) {
+          // 未闭合块公式：其后 | 视为公式内，不再扫描
+          return false;
+        }
+        i = end + 2;
+        continue;
+      }
+      const end = line.indexOf("$", i + 1);
+      if (end < 0) {
+        return false;
+      }
+      i = end + 1;
+      continue;
+    }
+    if (ch == "|") {
+      return true;
+    }
+    i++;
+  }
+  return false;
+}
+
+/**
+ * LaTeX 命令名在字母后结束的判定（后接非字母即可）。
+ */
+function isLatexCommandNameEnd(ch: string): boolean {
+  if (ch.length == 0) {
+    return true;
+  }
+  const c = ch.charAt(0);
+  if (c >= "a" && c <= "z") {
+    return false;
+  }
+  if (c >= "A" && c <= "Z") {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 公式区内：把「换行 + 原 \n… 命令后缀」还原为 \n… 命令。
+ * JSON/JS 转义常把 \nabla 吃成换行 + "abla"，导致 $$ 被拆行无法渲染。
+ */
+function repairNewlinesInMathLatex(latex: string): string {
+  if (latex.indexOf("\n") < 0 && latex.indexOf("\r") < 0) {
+    return latex;
+  }
+  // \nabla / \neq / \nu … 被误解析后，换行后面剩下的后缀（最长优先）
+  const afterN = [
+    "ormalsize",
+    "subseteq",
+    "supseteq",
+    "parallel",
+    "approx",
+    "ewline",
+    "ewpage",
+    "abla",
+    "otin",
+    "cong",
+    "leq",
+    "geq",
+    "mid",
+    "sim",
+    "eq",
+    "eg",
+    "u",
+  ];
+  let out = "";
+  let i = 0;
+  while (i < latex.length) {
+    const ch = latex.charAt(i);
+    if (ch != "\n" && ch != "\r") {
+      out += ch;
+      i++;
+      continue;
+    }
+    // 消费 \r\n 或 \n / \r
+    if (ch == "\r" && i + 1 < latex.length && latex.charAt(i + 1) == "\n") {
+      i += 2;
+    } else {
+      i++;
+    }
+    let matched = "";
+    for (let s = 0; s < afterN.length; s++) {
+      const suf = afterN[s];
+      if (latex.substring(i, i + suf.length) != suf) {
+        continue;
+      }
+      const next =
+        i + suf.length < latex.length ? latex.charAt(i + suf.length) : "";
+      if (isLatexCommandNameEnd(next) == true) {
+        matched = suf;
+        break;
+      }
+    }
+    if (matched.length > 0) {
+      // "\\n" + "abla" => \nabla
+      out += "\\n" + matched;
+      i += matched.length;
+    } else {
+      out += "\n";
+    }
+  }
+  return out;
+}
+
+/**
+ * 仅在 $ / $$ / \( / \[ 公式定界内修复 \nabla 等转义误伤。
+ */
+function repairLatexEscapedNewlineCommands(markdown: string): string {
+  if (markdown.indexOf("\n") < 0 && markdown.indexOf("\r") < 0) {
+    return markdown;
+  }
+  let out = "";
+  let i = 0;
+  const n = markdown.length;
+  while (i < n) {
+    if (i + 1 < n && markdown.charAt(i) == "$" && markdown.charAt(i + 1) == "$") {
+      const end = markdown.indexOf("$$", i + 2);
+      if (end < 0) {
+        out += "$$" + repairNewlinesInMathLatex(markdown.substring(i + 2));
+        break;
+      }
+      out +=
+        "$$" +
+        repairNewlinesInMathLatex(markdown.substring(i + 2, end)) +
+        "$$";
+      i = end + 2;
+      continue;
+    }
+    if (
+      i + 1 < n &&
+      markdown.charAt(i) == "\\" &&
+      markdown.charAt(i + 1) == "["
+    ) {
+      const end = markdown.indexOf("\\]", i + 2);
+      if (end < 0) {
+        out += "\\[" + repairNewlinesInMathLatex(markdown.substring(i + 2));
+        break;
+      }
+      out +=
+        "\\[" +
+        repairNewlinesInMathLatex(markdown.substring(i + 2, end)) +
+        "\\]";
+      i = end + 2;
+      continue;
+    }
+    if (
+      i + 1 < n &&
+      markdown.charAt(i) == "\\" &&
+      markdown.charAt(i + 1) == "("
+    ) {
+      const end = markdown.indexOf("\\)", i + 2);
+      if (end < 0) {
+        out += "\\(" + repairNewlinesInMathLatex(markdown.substring(i + 2));
+        break;
+      }
+      out +=
+        "\\(" +
+        repairNewlinesInMathLatex(markdown.substring(i + 2, end)) +
+        "\\)";
+      i = end + 2;
+      continue;
+    }
+    if (markdown.charAt(i) == "$") {
+      const end = markdown.indexOf("$", i + 1);
+      if (end < 0) {
+        out += "$" + repairNewlinesInMathLatex(markdown.substring(i + 1));
+        break;
+      }
+      out +=
+        "$" + repairNewlinesInMathLatex(markdown.substring(i + 1, end)) + "$";
+      i = end + 1;
+      continue;
+    }
+    out += markdown.charAt(i);
+    i++;
+  }
+  return out;
+}
+
+/**
+ * 裸 LaTeX 命令白名单：仅这些可自动包成 $...$（避免 Windows 路径等误伤）。
+ */
+function isAllowedBareLatexCommand(cmd: string): boolean {
+  if (
+    cmd == "alpha" ||
+    cmd == "beta" ||
+    cmd == "gamma" ||
+    cmd == "Gamma" ||
+    cmd == "delta" ||
+    cmd == "Delta" ||
+    cmd == "epsilon" ||
+    cmd == "varepsilon" ||
+    cmd == "zeta" ||
+    cmd == "eta" ||
+    cmd == "theta" ||
+    cmd == "Theta" ||
+    cmd == "iota" ||
+    cmd == "kappa" ||
+    cmd == "lambda" ||
+    cmd == "Lambda" ||
+    cmd == "mu" ||
+    cmd == "nu" ||
+    cmd == "xi" ||
+    cmd == "Xi" ||
+    cmd == "pi" ||
+    cmd == "Pi" ||
+    cmd == "rho" ||
+    cmd == "sigma" ||
+    cmd == "Sigma" ||
+    cmd == "tau" ||
+    cmd == "upsilon" ||
+    cmd == "phi" ||
+    cmd == "varphi" ||
+    cmd == "Phi" ||
+    cmd == "chi" ||
+    cmd == "psi" ||
+    cmd == "Psi" ||
+    cmd == "omega" ||
+    cmd == "Omega"
+  ) {
+    return true;
+  }
+  if (
+    cmd == "infty" ||
+    cmd == "hbar" ||
+    cmd == "partial" ||
+    cmd == "nabla" ||
+    cmd == "cdots" ||
+    cmd == "ldots" ||
+    cmd == "dots" ||
+    cmd == "times" ||
+    cmd == "cdot" ||
+    cmd == "pm" ||
+    cmd == "mp" ||
+    cmd == "leq" ||
+    cmd == "geq" ||
+    cmd == "neq" ||
+    cmd == "approx" ||
+    cmd == "equiv" ||
+    cmd == "sim" ||
+    cmd == "simeq" ||
+    cmd == "propto" ||
+    cmd == "in" ||
+    cmd == "notin" ||
+    cmd == "subset" ||
+    cmd == "subseteq" ||
+    cmd == "cup" ||
+    cmd == "cap" ||
+    cmd == "emptyset" ||
+    cmd == "forall" ||
+    cmd == "exists" ||
+    cmd == "rightarrow" ||
+    cmd == "leftarrow" ||
+    cmd == "Rightarrow" ||
+    cmd == "Leftarrow" ||
+    cmd == "to" ||
+    cmd == "mapsto"
+  ) {
+    return true;
+  }
+  if (
+    cmd == "sin" ||
+    cmd == "cos" ||
+    cmd == "tan" ||
+    cmd == "cot" ||
+    cmd == "sec" ||
+    cmd == "csc" ||
+    cmd == "arcsin" ||
+    cmd == "arccos" ||
+    cmd == "arctan" ||
+    cmd == "sinh" ||
+    cmd == "cosh" ||
+    cmd == "tanh" ||
+    cmd == "log" ||
+    cmd == "ln" ||
+    cmd == "exp" ||
+    cmd == "det" ||
+    cmd == "dim" ||
+    cmd == "lim" ||
+    cmd == "max" ||
+    cmd == "min" ||
+    cmd == "sup" ||
+    cmd == "inf" ||
+    cmd == "gcd" ||
+    cmd == "Pr" ||
+    cmd == "arg" ||
+    cmd == "deg" ||
+    cmd == "ker"
+  ) {
+    return true;
+  }
+  if (
+    cmd == "text" ||
+    cmd == "mathrm" ||
+    cmd == "mathbf" ||
+    cmd == "mathit" ||
+    cmd == "mathbb" ||
+    cmd == "mathcal" ||
+    cmd == "mathsf" ||
+    cmd == "mathtt" ||
+    cmd == "boldsymbol" ||
+    cmd == "operatorname"
+  ) {
+    return true;
+  }
+  if (
+    cmd == "frac" ||
+    cmd == "dfrac" ||
+    cmd == "tfrac" ||
+    cmd == "sqrt" ||
+    cmd == "sum" ||
+    cmd == "prod" ||
+    cmd == "int" ||
+    cmd == "iint" ||
+    cmd == "iiint" ||
+    cmd == "oint" ||
+    cmd == "binom" ||
+    cmd == "dbinom"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** 命令后应吸收的 `{...}` 组数。 */
+function bareLatexBraceArity(cmd: string): number {
+  if (
+    cmd == "frac" ||
+    cmd == "dfrac" ||
+    cmd == "tfrac" ||
+    cmd == "binom" ||
+    cmd == "dbinom"
+  ) {
+    return 2;
+  }
+  if (
+    cmd == "sqrt" ||
+    cmd == "text" ||
+    cmd == "mathrm" ||
+    cmd == "mathbf" ||
+    cmd == "mathit" ||
+    cmd == "mathbb" ||
+    cmd == "mathcal" ||
+    cmd == "mathsf" ||
+    cmd == "mathtt" ||
+    cmd == "boldsymbol" ||
+    cmd == "operatorname"
+  ) {
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * 从 openIdx（指向 `{`）匹配成组花括号；失败返回 -1。
+ */
+function absorbLatexBraceGroup(text: string, openIdx: number): number {
+  if (openIdx >= text.length || text.charAt(openIdx) != "{") {
+    return -1;
+  }
+  let depth = 0;
+  let k = openIdx;
+  while (k < text.length) {
+    const c = text.charAt(k);
+    if (c == "\\") {
+      k += 2;
+      continue;
+    }
+    if (c == "{") {
+      depth++;
+    } else if (c == "}") {
+      depth--;
+      if (depth == 0) {
+        return k + 1;
+      }
+    }
+    k++;
+  }
+  return -1;
+}
+
+/**
+ * 从 openIdx（指向 `(`）匹配成组圆括号；失败返回 -1。
+ */
+function absorbLatexParenGroup(text: string, openIdx: number): number {
+  if (openIdx >= text.length || text.charAt(openIdx) != "(") {
+    return -1;
+  }
+  let depth = 0;
+  let k = openIdx;
+  while (k < text.length) {
+    const c = text.charAt(k);
+    if (c == "\\") {
+      k += 2;
+      continue;
+    }
+    if (c == "(") {
+      depth++;
+    } else if (c == ")") {
+      depth--;
+      if (depth == 0) {
+        return k + 1;
+      }
+    }
+    k++;
+  }
+  return -1;
+}
+
+/**
+ * 从反斜杠处匹配一段可自动包裹的裸 LaTeX；失败返回 -1。
+ * 形如 \pi / \Gamma(n+1) / \text{Re}(s) / \frac{a}{b}
+ */
+function tryMatchBareLatexSpan(text: string, from: number): number {
+  if (from >= text.length || text.charAt(from) != "\\") {
+    return -1;
+  }
+  // 转义反斜杠 \\ 或已有定界 \( \[
+  if (from + 1 < text.length) {
+    const n1 = text.charAt(from + 1);
+    if (n1 == "\\" || n1 == "(" || n1 == "[") {
+      return -1;
+    }
+  }
+  let j = from + 1;
+  while (j < text.length) {
+    const c = text.charAt(j);
+    if (
+      (c >= "a" && c <= "z") ||
+      (c >= "A" && c <= "Z")
+    ) {
+      j++;
+      continue;
+    }
+    break;
+  }
+  if (j <= from + 1) {
+    return -1;
+  }
+  const cmd = text.substring(from + 1, j);
+  if (isAllowedBareLatexCommand(cmd) != true) {
+    return -1;
+  }
+  let end = j;
+  // \sqrt[n]{...}
+  if (cmd == "sqrt" && end < text.length && text.charAt(end) == "[") {
+    const bracketClose = text.indexOf("]", end + 1);
+    if (bracketClose < 0) {
+      return -1;
+    }
+    end = bracketClose + 1;
+  }
+  const arity = bareLatexBraceArity(cmd);
+  for (let b = 0; b < arity; b++) {
+    if (end >= text.length || text.charAt(end) != "{") {
+      // 无花括号的 \sqrt a 等过于宽松，放弃
+      if (arity > 0) {
+        return -1;
+      }
+      break;
+    }
+    const next = absorbLatexBraceGroup(text, end);
+    if (next < 0) {
+      return -1;
+    }
+    end = next;
+  }
+  // 紧跟的一层 (...)：\Gamma(n+1) / \text{Re}(s) / \sin(x)
+  if (end < text.length && text.charAt(end) == "(") {
+    const parenEnd = absorbLatexParenGroup(text, end);
+    if (parenEnd >= 0) {
+      end = parenEnd;
+    }
+  }
+  // 一层上下标：\sin^2 / x_i 紧跟在命令后
+  if (end < text.length) {
+    const su = text.charAt(end);
+    if (su == "^" || su == "_") {
+      let p = end + 1;
+      if (p < text.length && text.charAt(p) == "{") {
+        const be = absorbLatexBraceGroup(text, p);
+        if (be >= 0) {
+          end = be;
+        }
+      } else if (p < text.length && text.charAt(p) == "\\") {
+        const nested = tryMatchBareLatexSpan(text, p);
+        if (nested >= 0) {
+          end = nested;
+        }
+      } else if (p < text.length) {
+        end = p + 1;
+      }
+    }
+  }
+  return end;
+}
+
+/**
+ * 行内 code 内容是否像 LaTeX 公式（反引号清单场景）。
+ * 保守：需有明确 TeX 痕迹；排除常见代码/URL。
+ */
+function looksLikeLatexInlineCode(inner: string): boolean {
+  const s = inner.trim();
+  if (s.length < 2 || s.length > 800) {
+    return false;
+  }
+  if (
+    s.indexOf("://") >= 0 ||
+    s.indexOf("function ") >= 0 ||
+    s.indexOf("const ") >= 0 ||
+    s.indexOf("let ") >= 0 ||
+    s.indexOf("var ") >= 0 ||
+    s.indexOf("=>") >= 0 ||
+    s.indexOf("import ") >= 0 ||
+    s.indexOf("export ") >= 0 ||
+    s.indexOf("console.") >= 0 ||
+    s.indexOf("return ") >= 0
+  ) {
+    return false;
+  }
+  // 明确 TeX 命令 / 环境 / 间距
+  if (
+    s.indexOf("\\frac") >= 0 ||
+    s.indexOf("\\sqrt") >= 0 ||
+    s.indexOf("\\sum") >= 0 ||
+    s.indexOf("\\int") >= 0 ||
+    s.indexOf("\\iint") >= 0 ||
+    s.indexOf("\\lim") >= 0 ||
+    s.indexOf("\\begin") >= 0 ||
+    s.indexOf("\\end") >= 0 ||
+    s.indexOf("\\partial") >= 0 ||
+    s.indexOf("\\infty") >= 0 ||
+    s.indexOf("\\pi") >= 0 ||
+    s.indexOf("\\pm") >= 0 ||
+    s.indexOf("\\times") >= 0 ||
+    s.indexOf("\\cdot") >= 0 ||
+    s.indexOf("\\sin") >= 0 ||
+    s.indexOf("\\cos") >= 0 ||
+    s.indexOf("\\tan") >= 0 ||
+    s.indexOf("\\det") >= 0 ||
+    s.indexOf("\\mathbf") >= 0 ||
+    s.indexOf("\\mathrm") >= 0 ||
+    s.indexOf("\\text") >= 0 ||
+    s.indexOf("\\left") >= 0 ||
+    s.indexOf("\\right") >= 0 ||
+    s.indexOf("\\to") >= 0 ||
+    s.indexOf("\\cap") >= 0 ||
+    s.indexOf("\\cup") >= 0 ||
+    s.indexOf("\\lambda") >= 0 ||
+    s.indexOf("\\alpha") >= 0 ||
+    s.indexOf("\\beta") >= 0 ||
+    s.indexOf("\\theta") >= 0 ||
+    s.indexOf("\\gamma") >= 0 ||
+    s.indexOf("\\Delta") >= 0 ||
+    s.indexOf("\\nabla") >= 0 ||
+    s.indexOf("\\,") >= 0 ||
+    s.indexOf("\\;") >= 0
+  ) {
+    return true;
+  }
+  // 无反斜杠但有上下标的代数式：`(a+b)^2 = a^2 + 2ab + b^2`
+  if (s.indexOf("^") >= 0 || s.indexOf("_") >= 0) {
+    if (
+      s.indexOf("=") >= 0 ||
+      (s.indexOf("+") >= 0 && s.indexOf("(") >= 0)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 将「内容像公式」的行内 `code` 提升为 $...$，否则原样保留。
+ * 覆盖模型把 LaTeX 清单写成反引号的常见输出（块代码 fence 不动）。
+ * 统一用行内 $，以便列表/段落内走 parseInline；KaTeX 仍可渲染 cases/vmatrix。
+ */
+function promoteLatexInlineCode(markdown: string): string {
+  if (markdown.indexOf("`") < 0) {
+    return markdown;
+  }
+  let out = "";
+  let i = 0;
+  const n = markdown.length;
+  while (i < n) {
+    // 块代码不动
+    if (
+      i + 2 < n &&
+      markdown.charAt(i) == "`" &&
+      markdown.charAt(i + 1) == "`" &&
+      markdown.charAt(i + 2) == "`"
+    ) {
+      const close = markdown.indexOf("```", i + 3);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + 3);
+      i = close + 3;
+      continue;
+    }
+    if (markdown.charAt(i) == "`") {
+      const close = markdown.indexOf("`", i + 1);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      const inner = markdown.substring(i + 1, close);
+      const trimmedInner = inner.trim();
+      // 反引号内已自带 $...$ 定界（模型常见输出 `` `$a^2 + b^2$` ``）：
+      // 直接去反引号保留原公式。若再套一层 $ 会变 $$...$$ 块级，而行内解析会跳过 $$，
+      // 列表/段落里会露出裸 $$；同时 $a^2 + b^2$ 这类无反斜杠公式（无 = 与 (）原判 False。
+      const alreadyDelimited =
+        trimmedInner.length > 2 &&
+        trimmedInner.charAt(0) == "$" &&
+        trimmedInner.charAt(trimmedInner.length - 1) == "$";
+      if (looksLikeLatexInlineCode(inner) == true || alreadyDelimited == true) {
+        out += alreadyDelimited ? trimmedInner : "$" + trimmedInner + "$";
+        i = close + 1;
+        continue;
+      }
+      out += markdown.substring(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    out += markdown.charAt(i);
+    i++;
+  }
+  return out;
+}
+
+/**
+ * 保守规则：正文中未定界的白名单 LaTeX（\pi / \Gamma / \text{...} 等）自动包成 $...$。
+ * 跳过已有公式定界、行内/块代码、HTML 标签，降低误伤。
+ */
+function autoWrapBareLatexCommands(markdown: string): string {
+  if (markdown.indexOf("\\") < 0) {
+    return markdown;
+  }
+  let out = "";
+  let i = 0;
+  const n = markdown.length;
+  while (i < n) {
+    // 块代码 ```
+    if (
+      i + 2 < n &&
+      markdown.charAt(i) == "`" &&
+      markdown.charAt(i + 1) == "`" &&
+      markdown.charAt(i + 2) == "`"
+    ) {
+      const close = markdown.indexOf("```", i + 3);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + 3);
+      i = close + 3;
+      continue;
+    }
+    // 行内代码 `
+    if (markdown.charAt(i) == "`") {
+      const close = markdown.indexOf("`", i + 1);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    // $$ 块
+    if (i + 1 < n && markdown.charAt(i) == "$" && markdown.charAt(i + 1) == "$") {
+      const close = markdown.indexOf("$$", i + 2);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + 2);
+      i = close + 2;
+      continue;
+    }
+    // 行内 $
+    if (markdown.charAt(i) == "$") {
+      const close = markdown.indexOf("$", i + 1);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    // \(...\) / \[...\]
+    if (
+      i + 1 < n &&
+      markdown.charAt(i) == "\\" &&
+      (markdown.charAt(i + 1) == "(" || markdown.charAt(i + 1) == "[")
+    ) {
+      const closer = markdown.charAt(i + 1) == "(" ? "\\)" : "\\]";
+      const close = markdown.indexOf(closer, i + 2);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + closer.length);
+      i = close + closer.length;
+      continue;
+    }
+    // HTML / 自定义标签整段跳过，避免改 executeId 等属性
+    if (markdown.charAt(i) == "<") {
+      const close = markdown.indexOf(">", i + 1);
+      if (close < 0) {
+        out += markdown.substring(i);
+        break;
+      }
+      out += markdown.substring(i, close + 1);
+      i = close + 1;
+      continue;
+    }
+    if (markdown.charAt(i) == "\\") {
+      const end = tryMatchBareLatexSpan(markdown, i);
+      if (end > i) {
+        out += "$" + markdown.substring(i, end) + "$";
+        i = end;
+        continue;
+      }
+    }
+    out += markdown.charAt(i);
+    i++;
+  }
+  return out;
+}
+
+/** fallback 解析前统一预处理：转义修复 → 反引号公式提升 → 裸公式包裹 → 行内 $$ 拆行。 */
+function prepareMarkdownForFallback(markdown: string): string {
+  return normalizeInlineMath(
+    autoWrapBareLatexCommands(
+      promoteLatexInlineCode(repairLatexEscapedNewlineCommands(markdown)),
+    ),
+  );
+}
+
+/**
+ * 将行内 $...$ / $$...$$ 拆成独立行（整行 $$latex$$），适配 katex-el 块级渲染。
+ * 注意：若行内已有 $$，不能整行跳过，否则会连同前后正文一起留在段落里显示为裸 $$。
+ * 真正的表格管道行跳过，避免拆散 | cell | $math$ |。
+ */
 function normalizeInlineMath(markdown: string): string {
   const sourceLines = markdown.replace(/\r\n/g, "\n").split("\n");
   const output = [] as string[];
@@ -18,36 +1113,120 @@ function normalizeInlineMath(markdown: string): string {
       output.push("");
       continue;
     }
-    if (line.indexOf("$$") >= 0) {
+    // 真正的表格管道行：单元格内公式留给 parseInline，不能拆成独立 $$ 行
+    // 注意：勿用 indexOf("|")，$|\Psi|^2$ 里的 | 不是表管道
+    if (lineHasMarkdownTablePipe(line) == true) {
+      output.push(line);
+      continue;
+    }
+    // 列表行：保留行内 $...$，由 list + parseInline 混排（含 $|\Psi|^2$）
+    if (isFallbackListLine(line)) {
+      output.push(line);
+      continue;
+    }
+    // 标题行：保留行内 $a_1$，由 heading + katex-el 混排渲染
+    const headingTrim = line.trim();
+    let headingMarks = 0;
+    while (
+      headingMarks < headingTrim.length &&
+      headingTrim.charAt(headingMarks) == "#"
+    ) {
+      headingMarks++;
+    }
+    if (
+      headingMarks > 0 &&
+      headingMarks <= 6 &&
+      headingTrim.length > headingMarks &&
+      headingTrim.charAt(headingMarks) == " "
+    ) {
+      output.push(line);
+      continue;
+    }
+    // 段落行：仅块级 $$...$$ 拆成独立行（块级公式须独占行渲染）；
+    // 行内 $...$ / \(...\) 保留在段落内混排（不再拆成块级，否则行内公式被强制换行）。
+    // 若整行不含 $$，直接原样保留（行内公式交给 parseInline 混排）。
+    if (line.indexOf("$$") < 0) {
       output.push(line);
       continue;
     }
     let cursor = 0;
     let foundMath = false;
     while (cursor < line.length) {
-      const start = line.indexOf("$", cursor);
+      const start = line.indexOf("$$", cursor);
       if (start < 0) {
         const tail = line.substring(cursor);
-        if (tail.length > 0 || !foundMath) output.push(tail);
+        if (tail.length > 0 || !foundMath) {
+          output.push(tail);
+        }
         break;
       }
-      const end = line.indexOf("$", start + 1);
+      const end = line.indexOf("$$", start + 2);
       if (end < 0) {
         output.push(line.substring(cursor));
         break;
       }
       const before = line.substring(cursor, start);
-      const latex = line.substring(start + 1, end).trim();
-      if (before.length > 0) output.push(before);
+      const latex = line.substring(start + 2, end).trim();
+      if (before.length > 0) {
+        output.push(before);
+      }
       if (latex.length > 0) {
         output.push("$$" + latex + "$$");
         foundMath = true;
       }
-      cursor = end + 1;
-      if (cursor == line.length && !foundMath) output.push("");
+      cursor = end + 2;
     }
   }
   return output.join("\n");
+}
+
+/** 整行是否为独立公式（normalize 后的 $$...$$ / $...$ / \[...\]）。 */
+function isStandaloneMathLine(trimmed: string): boolean {
+  if (trimmed.length <= 2) {
+    return false;
+  }
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("$$") &&
+    trimmed.endsWith("$$")
+  ) {
+    return true;
+  }
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("\\[") &&
+    trimmed.endsWith("\\]")
+  ) {
+    return true;
+  }
+  if (trimmed.startsWith("$") && trimmed.endsWith("$") && !trimmed.startsWith("$$")) {
+    const inner = trimmed.substring(1, trimmed.length - 1);
+    // 整行单个 $...$，内部不再含 $
+    return inner.length > 0 && inner.indexOf("$") < 0;
+  }
+  return false;
+}
+
+/** 从整行公式文本提取 latex（不含定界符）。 */
+function extractStandaloneMathLatex(trimmed: string): string {
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("$$") &&
+    trimmed.endsWith("$$")
+  ) {
+    return trimmed.substring(2, trimmed.length - 2).trim();
+  }
+  if (
+    trimmed.length > 4 &&
+    trimmed.startsWith("\\[") &&
+    trimmed.endsWith("\\]")
+  ) {
+    return trimmed.substring(2, trimmed.length - 2).trim();
+  }
+  if (trimmed.startsWith("$") && trimmed.endsWith("$") && trimmed.length > 2) {
+    return trimmed.substring(1, trimmed.length - 1).trim();
+  }
+  return "";
 }
 
 function makeTextToken(text: string, className: string = "text"): MarkdownToken {
@@ -58,10 +1237,50 @@ function makeTextToken(text: string, className: string = "text"): MarkdownToken 
   };
 }
 
+/** 查找下一个已闭合 Markdown 图片起点 `![alt](url)`。 */
+function findInlineImageStart(text: string, start: number): number {
+  let markerStart = text.indexOf("![", start);
+  while (markerStart >= 0) {
+    if (parseMarkdownImageAt(text, markerStart) != null) {
+      return markerStart;
+    }
+    markerStart = text.indexOf("![", markerStart + 2);
+  }
+  return -1;
+}
+
+/** 构造原位图片 token（由 UniAiXMsg 渲染为 <image>）。 */
+function makeImageToken(alt: string, url: string): MarkdownToken {
+  return {
+    type: "image",
+    text: alt,
+    href: url,
+    className: "image",
+  };
+}
+
+/** 构造原位图片 Markdown 元素。 */
+function makeMarkdownImageItem(
+  index: number,
+  alt: string,
+  url: string,
+): UniAiMarkdownElItem {
+  return {
+    uniqueId: "fallback-markdown-image-" + index,
+    type: "markdown_image",
+    datasList: [[makeImageToken(alt, url)]],
+  };
+}
+
 /** 查找下一个合法 Markdown 链接起点。 */
 function findInlineLinkStart(text: string, start: number): number {
   let bracketStart = text.indexOf("[", start);
   while (bracketStart >= 0) {
+    // 跳过图片语法中的 [
+    if (bracketStart > 0 && text.charAt(bracketStart - 1) == "!") {
+      bracketStart = text.indexOf("[", bracketStart + 1);
+      continue;
+    }
     const labelEnd = text.indexOf("](", bracketStart + 1);
     if (labelEnd >= 0) {
       const hrefEnd = text.indexOf(")", labelEnd + 2);
@@ -74,28 +1293,352 @@ function findInlineLinkStart(text: string, start: number): number {
   return -1;
 }
 
+type ConversationReference = {
+  conversationId: string;
+  agentId: string;
+  end: number;
+};
+
+/** 查找已完整输出的会话详情标签，流式半截标签暂不渲染。 */
+function findInlineConversationStart(text: string, start: number): number {
+  return text.toLowerCase().indexOf("<conversation", start);
+}
+
+/** 将 <conversation> 标签转换为可被文本渲染器识别的内部链接。 */
+function parseConversationReferenceAt(
+  text: string,
+  start: number,
+): ConversationReference | null {
+  const source = text.substring(start);
+  const match = source.match(
+    /^<conversation\b([^>]*?)(?:\/\s*>|>\s*<\/conversation\s*>)/i,
+  );
+  if (match == null || match.length < 2 || match[1] == null) {
+    return null;
+  }
+  const attributes = match[1]!;
+  // 属性可能带转义引号（id=\"1\"），用会话标签专用解析
+  const conversationId = extractConversationTagAttribute(attributes, "id");
+  const agentId = extractConversationTagAttribute(attributes, "agentId");
+  if (conversationId.length == 0 || agentId.length == 0) {
+    return null;
+  }
+  return {
+    conversationId,
+    agentId,
+    end: start + match[0]!.length,
+  };
+}
+
+/** 查找可配对的行内 `$...$` 起点（跳过 `$$`）。 */
+function findInlineMathStart(text: string, cursor: number): number {
+  let i = cursor;
+  while (i < text.length) {
+    if (text.charAt(i) != "$") {
+      i++;
+      continue;
+    }
+    if (i + 1 < text.length && text.charAt(i + 1) == "$") {
+      i += 2;
+      continue;
+    }
+    const end = text.indexOf("$", i + 1);
+    if (end > i + 1) {
+      // 闭合 `$` 前若紧邻另一个 `$`（形成 $$），不是行内公式
+      if (end + 1 < text.length && text.charAt(end + 1) == "$") {
+        i = end + 2;
+        continue;
+      }
+      return i;
+    }
+    return -1;
+  }
+  return -1;
+}
+
+/**
+ * 查找可配对的行内 `\(...\)` 起点（PC bracket 模式的行内定界符）。
+ * 与 `$...$` 同级；返回 `\(` 的下标，未闭合返回 -1。
+ */
+function findInlineParenMathStart(text: string, cursor: number): number {
+  let i = text.indexOf("\\(", cursor);
+  while (i >= 0) {
+    // 闭合 \) 必须存在；未闭合（流式半截）不算行内公式起点
+    const end = text.indexOf("\\)", i + 2);
+    if (end < 0) {
+      return -1;
+    }
+    // 空公式 \(\) 跳过，继续找下一个
+    if (end == i + 2) {
+      i = text.indexOf("\\(", i + 2);
+      continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * 查找斜体单个 `*` 起点（跳过 `**` 粗体）。返回星号下标，找不到返回 -1。
+ * 仅定位起点；闭合由调用处按同样规则查找。
+ */
+function findSingleStarStart(text: string, cursor: number): number {
+  let i = text.indexOf("*", cursor);
+  while (i >= 0) {
+    const prevIsStar = i > 0 && text.charAt(i - 1) == "*";
+    const nextIsStar = i + 1 < text.length && text.charAt(i + 1) == "*";
+    if (!prevIsStar && !nextIsStar) {
+      return i;
+    }
+    i = text.indexOf("*", i + 1);
+  }
+  return -1;
+}
+
+/** 查找 `~~` 删除线起点。返回下标，找不到返回 -1。 */
+function findDelStart(text: string, cursor: number): number {
+  return text.indexOf("~~", cursor);
+}
+
+function findWwwUrlStart(text: string, cursor: number): number {
+  let idx = text.indexOf("www.", cursor);
+  while (idx >= 0) {
+    let isValid = true;
+    if (idx > 0) {
+      const prev = text.charAt(idx - 1);
+      if (
+        (prev >= "a" && prev <= "z") ||
+        (prev >= "A" && prev <= "Z") ||
+        (prev >= "0" && prev <= "9") ||
+        prev == "/" ||
+        prev == "@" ||
+        prev == ":" ||
+        prev == "." ||
+        prev == "-" ||
+        prev == "_" ||
+        prev == "(" ||
+        prev == "<" ||
+        prev == "=" ||
+        prev == "\"" ||
+        prev == "'"
+      ) {
+        isValid = false;
+      }
+    }
+    if (isValid) {
+      return idx;
+    }
+    idx = text.indexOf("www.", idx + 1);
+  }
+  return -1;
+}
+
+/**
+ * 查找裸 URL 起点（http/https 或 www.，remark-gfm autolink 对齐）。
+ * 返回 scheme/www. 下标，找不到返回 -1。闭合（URL 结束）由调用处按空白/标点截断。
+ */
+function findBareUrlStart(text: string, cursor: number): number {
+  const httpIdx = text.indexOf("http://", cursor);
+  const httpsIdx = text.indexOf("https://", cursor);
+  const wwwIdx = findWwwUrlStart(text, cursor);
+
+  let minIdx = -1;
+  if (httpIdx >= 0) {
+    minIdx = httpIdx;
+  }
+  if (httpsIdx >= 0 && (minIdx < 0 || httpsIdx < minIdx)) {
+    minIdx = httpsIdx;
+  }
+  if (wwwIdx >= 0 && (minIdx < 0 || wwwIdx < minIdx)) {
+    minIdx = wwwIdx;
+  }
+  return minIdx;
+}
+
+/** 判断裸 URL 起点前一字是否为 `(` `<` `=` 引号（即已在 markdown 链接/属性内），避免重复识别。 */
+function isBareUrlInLinkContext(text: string, urlStart: number): boolean {
+  if (urlStart <= 0) {
+    return false;
+  }
+  const prev = text.charAt(urlStart - 1);
+  // [label](http://...) 的 ( 、 ![alt](http://...) 的 ( 、 <http://...> 的 < 、属性引号
+  return prev == "(" || prev == "<" || prev == "=" || prev == "\"" || prev == "'";
+}
+
+/** 从 urlStart 起截取裸 URL 文本（到空白或 markdown 结构字符为止）。 */
+function extractBareUrl(text: string, urlStart: number): string {
+  let end = urlStart;
+  while (end < text.length) {
+    const ch = text.charAt(end);
+    // 空白、换行、markdown 结构字符终止 URL
+    if (
+      ch == " " ||
+      ch == "\t" ||
+      ch == "\n" ||
+      ch == "\r" ||
+      ch == ")" ||
+      ch == "]" ||
+      ch == "<" ||
+      ch == ">" ||
+      ch == "\"" ||
+      ch == "'"
+    ) {
+      break;
+    }
+    end++;
+  }
+  let candidate = text.substring(urlStart, end);
+  const cjkBoundary = findCjkAutolinkBoundary(candidate);
+  if (cjkBoundary > 0) {
+    candidate = candidate.substring(0, cjkBoundary);
+  }
+  // 剥除末尾标点（如逗号、句号、分号等，避免包含在 URL 中）
+  while (candidate.length > 0) {
+    const lastChar = candidate.charAt(candidate.length - 1);
+    if (
+      lastChar == "," ||
+      lastChar == "." ||
+      lastChar == ";" ||
+      lastChar == ":" ||
+      lastChar == "!" ||
+      lastChar == "?" ||
+      CJK_URL_PUNCTUATION.indexOf(lastChar) >= 0
+    ) {
+      candidate = candidate.substring(0, candidate.length - 1);
+      continue;
+    }
+    break;
+  }
+  return candidate;
+}
+
+/** 从 from 起找斜体闭合 `*`（同样跳过 `**`）。 */
+function findSingleStarEnd(text: string, from: number): number {
+  let i = text.indexOf("*", from);
+  while (i >= 0) {
+    const prevIsStar = i > 0 && text.charAt(i - 1) == "*";
+    const nextIsStar = i + 1 < text.length && text.charAt(i + 1) == "*";
+    if (!prevIsStar && !nextIsStar) {
+      return i;
+    }
+    i = text.indexOf("*", i + 1);
+  }
+  return -1;
+}
+
+/**
+ * 还原被 JSON/转义误伤的 LaTeX 控制符。
+ * 例如 `\nabla` 若被当成 `\n`+`abla`，显示会变成 abla。
+ */
+function sanitizeLatexText(latex: string): string {
+  let out = "";
+  for (let i = 0; i < latex.length; i++) {
+    const code = latex.charCodeAt(i);
+    // \n \t \r \f \b → 还原为 \\n \\t …
+    if (code == 10) {
+      out += "\\n";
+    } else if (code == 9) {
+      out += "\\t";
+    } else if (code == 13) {
+      out += "\\r";
+    } else if (code == 12) {
+      out += "\\f";
+    } else if (code == 8) {
+      out += "\\b";
+    } else {
+      out += latex.charAt(i);
+    }
+  }
+  return out;
+}
+
 function parseInline(text: string): MarkdownToken[] {
   const result = [] as MarkdownToken[];
   let cursor = 0;
   while (cursor < text.length) {
     const strongStart = text.indexOf("**", cursor);
     const codeStart = text.indexOf("`", cursor);
+    const imageStart = findInlineImageStart(text, cursor);
     const linkStart = findInlineLinkStart(text, cursor);
+    const conversationStart = findInlineConversationStart(text, cursor);
+    const mathStart = findInlineMathStart(text, cursor);
+    const parenMathStart = findInlineParenMathStart(text, cursor);
+    // 行内公式取 $...$ 与 \(...\) 中更早出现者
+    const anyMathStart =
+      mathStart >= 0 && (parenMathStart < 0 || mathStart <= parenMathStart)
+        ? mathStart
+        : parenMathStart;
+    const emStart = findSingleStarStart(text, cursor);
+    const delStart = findDelStart(text, cursor);
+    const bareUrlStart = findBareUrlStart(text, cursor);
     let nextStart = -1;
     let marker = "";
     if (
+      conversationStart >= 0 &&
+      (imageStart < 0 || conversationStart <= imageStart) &&
+      (strongStart < 0 || conversationStart <= strongStart) &&
+      (codeStart < 0 || conversationStart <= codeStart) &&
+      (linkStart < 0 || conversationStart <= linkStart) &&
+      (anyMathStart < 0 || conversationStart <= anyMathStart)
+    ) {
+      nextStart = conversationStart;
+      marker = "<conversation";
+    } else if (
+      imageStart >= 0 &&
+      (strongStart < 0 || imageStart <= strongStart) &&
+      (codeStart < 0 || imageStart <= codeStart) &&
+      (linkStart < 0 || imageStart <= linkStart) &&
+      (anyMathStart < 0 || imageStart <= anyMathStart)
+    ) {
+      nextStart = imageStart;
+      marker = "![";
+    } else if (
+      anyMathStart >= 0 &&
+      (strongStart < 0 || anyMathStart <= strongStart) &&
+      (codeStart < 0 || anyMathStart <= codeStart) &&
+      (linkStart < 0 || anyMathStart <= linkStart)
+    ) {
+      nextStart = anyMathStart;
+      // 区分 $...$ 与 \(...\) 两种行内公式定界符
+      marker =
+        mathStart >= 0 && anyMathStart == mathStart ? "$" : "\\(";
+    } else if (
       strongStart >= 0 &&
       (codeStart < 0 || strongStart <= codeStart) &&
+      (emStart < 0 || strongStart <= emStart) &&
+      (delStart < 0 || strongStart <= delStart) &&
       (linkStart < 0 || strongStart <= linkStart)
     ) {
       nextStart = strongStart;
       marker = "**";
+    } else if (
+      delStart >= 0 &&
+      (codeStart < 0 || delStart <= codeStart) &&
+      (emStart < 0 || delStart <= emStart) &&
+      (linkStart < 0 || delStart <= linkStart)
+    ) {
+      nextStart = delStart;
+      marker = "~~";
+    } else if (
+      emStart >= 0 &&
+      (codeStart < 0 || emStart <= codeStart) &&
+      (linkStart < 0 || emStart <= linkStart)
+    ) {
+      nextStart = emStart;
+      marker = "*";
     } else if (codeStart >= 0 && (linkStart < 0 || codeStart <= linkStart)) {
       nextStart = codeStart;
       marker = "`";
     } else if (linkStart >= 0) {
       nextStart = linkStart;
       marker = "[";
+    } else if (
+      bareUrlStart >= 0 &&
+      isBareUrlInLinkContext(text, bareUrlStart) != true
+    ) {
+      // 裸 URL autolink：最低优先级兜底，且不在 [t](url) 链接上下文内
+      nextStart = bareUrlStart;
+      marker = "bareurl";
     }
     if (nextStart < 0) {
       result.push(makeTextToken(text.substring(cursor)));
@@ -103,6 +1646,94 @@ function parseInline(text: string): MarkdownToken[] {
     }
     if (nextStart > cursor) {
       result.push(makeTextToken(text.substring(cursor, nextStart)));
+    }
+    if (marker == "$") {
+      const end = text.indexOf("$", nextStart + 1);
+      if (end <= nextStart + 1) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const latex = sanitizeLatexText(
+        text.substring(nextStart + 1, end).trim(),
+      );
+      if (latex.length > 0) {
+        result.push({
+          type: "math",
+          text: latex,
+          uniqueId:
+            "fallback-inline-math-" + nextStart + "-" + latex.length,
+        });
+      }
+      cursor = end + 1;
+      continue;
+    }
+    if (marker == "\\(") {
+      // \(...\) 行内公式（PC bracket 模式）
+      const end = text.indexOf("\\)", nextStart + 2);
+      if (end <= nextStart + 2) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const latex = sanitizeLatexText(
+        text.substring(nextStart + 2, end).trim(),
+      );
+      if (latex.length > 0) {
+        result.push({
+          type: "math",
+          text: latex,
+          uniqueId:
+            "fallback-inline-paren-math-" + nextStart + "-" + latex.length,
+        });
+      }
+      cursor = end + 2;
+      continue;
+    }
+    if (marker == "*") {
+      // 斜体 *text*：闭合跳过 **
+      const end = findSingleStarEnd(text, nextStart + 1);
+      if (end < 0) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const emText = text.substring(nextStart + 1, end);
+      if (emText.length > 0) {
+        result.push({
+          type: "em",
+          text: emText,
+          className: "em",
+        });
+      }
+      cursor = end + 1;
+      continue;
+    }
+    if (marker == "~~") {
+      // 删除线 ~~text~~
+      const end = text.indexOf("~~", nextStart + 2);
+      if (end < 0) {
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      const delText = text.substring(nextStart + 2, end);
+      if (delText.length > 0) {
+        result.push({
+          type: "del",
+          text: delText,
+          className: "del",
+        });
+      }
+      cursor = end + 2;
+      continue;
+    }
+    if (marker == "![") {
+      const parsed = parseMarkdownImageAt(text, nextStart);
+      if (parsed == null) {
+        // 流式未闭合：保留后续原文，避免整行后半截被吞掉导致「只渲染几个字」
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      result.push(makeImageToken(parsed.alt, parsed.url));
+      cursor = parsed.end;
+      continue;
     }
     if (marker == "[") {
       const labelEnd = text.indexOf("](", nextStart + 1);
@@ -112,13 +1743,56 @@ function parseInline(text: string): MarkdownToken[] {
         result.push(makeTextToken(text.substring(nextStart)));
         break;
       }
+      const rawHref = text.substring(labelEnd + 2, hrefEnd);
+      const href = (rawHref.startsWith("http://") || rawHref.startsWith("https://") || rawHref.startsWith("conversation://"))
+        ? rawHref
+        : "http://" + rawHref;
       result.push({
         type: "link",
         text: text.substring(nextStart + 1, labelEnd),
-        href: text.substring(labelEnd + 2, hrefEnd),
+        href: href,
         className: "link",
       });
       cursor = hrefEnd + 1;
+      continue;
+    }
+    if (marker == "bareurl") {
+      // 裸 URL autolink：截到空白/结构字符，文本即 URL
+      const url = extractBareUrl(text, nextStart);
+      if (url.length > 0) {
+        const href = (url.startsWith("http://") || url.startsWith("https://"))
+          ? url
+          : "http://" + url;
+        result.push({
+          type: "link",
+          text: url,
+          href: href,
+          className: "link",
+        });
+        cursor = nextStart + url.length;
+        continue;
+      }
+      result.push(makeTextToken(text.substring(nextStart)));
+      break;
+    }
+    if (marker == "<conversation") {
+      const reference = parseConversationReferenceAt(text, nextStart);
+      if (reference == null) {
+        // SSE 尚未输出完整闭合标签时，保留后续正文，避免半截标签吞掉整行
+        result.push(makeTextToken(text.substring(nextStart)));
+        break;
+      }
+      result.push({
+        type: "conversation",
+        text: "",
+        href:
+          "conversation://id=" +
+          reference.conversationId +
+          "&agentId=" +
+          reference.agentId,
+        className: "conversation-link",
+      });
+      cursor = reference.end;
       continue;
     }
     const contentStart = nextStart + marker.length;
@@ -138,15 +1812,6 @@ function parseInline(text: string): MarkdownToken[] {
     result.push(makeTextToken(text.length > 0 ? text : " "));
   }
   return result;
-}
-
-/** 是否为无序或有序列表行。 */
-function isFallbackListLine(line: string): boolean {
-  const trimmed = line.trim();
-  if (/^[-+*]\s+/.test(trimmed)) {
-    return true;
-  }
-  return /^\d+[.)]\s+/.test(trimmed);
 }
 
 /** 提取列表标记后的正文。 */
@@ -192,8 +1857,13 @@ function splitTableRow(line: string): string[] {
 }
 
 function isTableSeparator(line: string): boolean {
+  // 裸 --- 是水平线，不是 GFM 表头分隔；至少要有一个管道
+  if (line.indexOf("|") < 0) {
+    return false;
+  }
   const cells = splitTableRow(line);
-  if (cells.length == 0) {
+  // 至少两列，避免误伤
+  if (cells.length < 2) {
     return false;
   }
   for (let i = 0; i < cells.length; i++) {
@@ -211,17 +1881,27 @@ function isTableSeparator(line: string): boolean {
  * 部分模型会把 Markdown 分隔行输出到数据行末尾，需要兼容恢复。
  */
 function findTableSeparatorIndex(lines: string[], startIndex: number): number {
+  // 列表行里的 $|\Psi|^2$ 不是表头
+  if (isFallbackListLine(lines[startIndex])) {
+    return -1;
+  }
+  if (lineHasMarkdownTablePipe(lines[startIndex]) != true) {
+    return -1;
+  }
   for (let i = startIndex + 1; i < lines.length; i++) {
     const line = lines[i].trim();
     // 历史消息中可能在每个表格行之间插入空行，空行不终止候选表格。
     if (line.length == 0) {
       continue;
     }
-    // 无管道的 --- 也可能是历史数据中的表格分隔行，须先判断再终止扫描。
     if (isTableSeparator(line)) {
       return i;
     }
-    if (line.indexOf("|") < 0) {
+    // 列表行 / 仅公式内含 | 的行，终止表格扫描
+    if (isFallbackListLine(line)) {
+      break;
+    }
+    if (lineHasMarkdownTablePipe(line) != true) {
       break;
     }
   }
@@ -244,24 +1924,6 @@ function tableAligns(separatorLine: string): Align[] {
   return aligns;
 }
 
-function makeTableRow(line: string): MarkdownToken {
-  const cells = splitTableRow(line);
-  const cellTokens = [] as MarkdownToken[];
-  for (let i = 0; i < cells.length; i++) {
-    const inline = parseInline(cells[i]);
-    const width = Math.max(56, Math.min(300, cells[i].length * 15 + 24));
-    cellTokens.push({
-      type: "table_cell",
-      tokens: inline,
-      width,
-    });
-  }
-  return {
-    type: "table_row",
-    tokens: cellTokens,
-  };
-}
-
 function makeItem(
   type: string,
   index: number,
@@ -274,52 +1936,63 @@ function makeItem(
   };
 }
 
-/** 读取 markdown-custom-process 标签属性。 */
+/** 读取标签属性（与 markdown-custom-process 共用引号规则）。 */
 function extractCustomProcessAttribute(
   attributes: string,
   name: string,
 ): string {
-  let regex = new RegExp(`${name}="([^"]*)"`, "i");
-  let match = attributes.match(regex);
-  if (match != null && match.length > 1) {
-    const value = match[1];
-    return value != null ? value.replace(/&quot;/g, '"') : "";
-  }
-  regex = new RegExp(`${name}='([^']*)'`, "i");
-  match = attributes.match(regex);
-  if (match != null && match.length > 1) {
-    const value = match[1];
-    return value != null ? value.replace(/&quot;/g, '"') : "";
-  }
-  return "";
+  return extractMarkdownCustomProcessAttribute(attributes, name);
 }
 
-/** 解析一个或多个工具调用标签。 */
+/** 从属性串构造工具调用对象。 */
+function buildCustomProcessItem(attributes: string): UTSJSONObject {
+  const item = new UTSJSONObject();
+  let executeId = extractCustomProcessAttribute(attributes, "executeId");
+  if (executeId.length == 0) {
+    executeId = extractCustomProcessAttribute(attributes, "executeid");
+  }
+  item["executeId"] = executeId;
+  item["type"] = extractCustomProcessAttribute(attributes, "type");
+  item["status"] = extractCustomProcessAttribute(attributes, "status");
+  item["name"] = extractCustomProcessAttribute(attributes, "name");
+  return item;
+}
+
+/** 解析一个或多个工具调用标签（HTML 与 :::container；引号感知）。 */
 function parseCustomProcessTags(source: string): any[] {
   const result: any[] = [];
-  const regex =
-    /<markdown-custom-process(?!-group)\b([^>]*)>(?:<\/markdown-custom-process>)?|<markdown-custom-process(?!-group)\b([^>]*?)\/>/gi;
-  let match = regex.exec(source);
-  while (match != null) {
-    const firstAttrs = match.length > 1 ? match[1] : null;
-    const secondAttrs = match.length > 2 ? match[2] : null;
-    const attributes =
-      firstAttrs != null && firstAttrs.length > 0
-        ? firstAttrs
-        : secondAttrs != null
-          ? secondAttrs
-          : "";
-    const item = new UTSJSONObject();
-    let executeId = extractCustomProcessAttribute(attributes, "executeId");
-    if (executeId.length == 0) {
-      executeId = extractCustomProcessAttribute(attributes, "executeid");
+  const tags = listMarkdownCustomProcessTags(source);
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tags[i];
+    if (tag.executeId.length == 0) {
+      continue;
     }
-    item["executeId"] = executeId;
-    item["type"] = extractCustomProcessAttribute(attributes, "type");
-    item["status"] = extractCustomProcessAttribute(attributes, "status");
-    item["name"] = extractCustomProcessAttribute(attributes, "name");
+    const item = new UTSJSONObject();
+    item["executeId"] = tag.executeId;
+    item["type"] = tag.type;
+    item["status"] = tag.status;
+    item["name"] = tag.name;
     result.push(item);
-    match = regex.exec(source);
+  }
+  if (result.length > 0) {
+    return result;
+  }
+  // 兼容历史适配后的 :::container 语法（可跨多行属性）
+  let from = 0;
+  while (from < source.length) {
+    const fence = findNextMarkdownContainerFence(source, from);
+    if (fence.found != true) {
+      break;
+    }
+    if (fence.executeId.length > 0) {
+      const item = new UTSJSONObject();
+      item["executeId"] = fence.executeId;
+      item["type"] = fence.type;
+      item["status"] = fence.status;
+      item["name"] = fence.name;
+      result.push(item);
+    }
+    from = fence.endIndex > from ? fence.endIndex : from + 1;
   }
   return result;
 }
@@ -330,8 +2003,34 @@ function makeCustomProcessItem(
   index: number,
   processList: any[],
 ): UniAiMarkdownElItem {
+  // 优先用 executeId 做稳定 uniqueId，避免 SSE 重解析后 :key 漂移触发组件错位复用
+  let uid = "fallback-" + type + "-" + index;
+  if (processList.length > 0) {
+    const ids = [] as string[];
+    for (let i = 0; i < processList.length; i++) {
+      const raw = processList[i];
+      if (raw == null) {
+        continue;
+      }
+      try {
+        const obj = raw as UTSJSONObject;
+        let eid = obj["executeId"];
+        if (eid == null || `${eid}`.length == 0) {
+          eid = obj["executeid"];
+        }
+        if (eid != null && `${eid}`.length > 0) {
+          ids.push(`${eid}`);
+        }
+      } catch (_e) {
+        // ignore
+      }
+    }
+    if (ids.length > 0) {
+      uid = "fallback-" + type + "-" + ids.join("_");
+    }
+  }
   return {
-    uniqueId: "fallback-" + type + "-" + index,
+    uniqueId: uid,
     type,
     datasList: [] as MarkdownToken[][],
     customProcessList: processList,
@@ -395,24 +2094,110 @@ class CustomProcessExtraction {
   hasCustomBlock: boolean = false;
 }
 
+class CustomBlockHit {
+  index: number = 0;
+  endIndex: number = 0;
+  fullMatch: string = "";
+  kind: string = ""; // process | group | container | task_result
+}
+
+/** 在 from 处找最近的自定义块（引号感知 process / group / container / task-result）。 */
+function findNextCustomBlock(markdown: string, from: number): CustomBlockHit {
+  const hit = new CustomBlockHit();
+  const process = findNextMarkdownCustomProcessTag(markdown, from);
+  const fence = findNextMarkdownContainerFence(markdown, from);
+  const groupMarker = "<markdown-custom-process-group>";
+  const groupIdx = markdown.indexOf(groupMarker, from);
+  const taskIdx = markdown.indexOf("<task-result", from);
+
+  let bestIdx = -1;
+  let kind = "";
+  if (process.found == true) {
+    bestIdx = process.index;
+    kind = "process";
+  }
+  if (fence.found == true && (bestIdx < 0 || fence.index < bestIdx)) {
+    bestIdx = fence.index;
+    kind = "container";
+  }
+  if (groupIdx >= 0 && (bestIdx < 0 || groupIdx < bestIdx)) {
+    bestIdx = groupIdx;
+    kind = "group";
+  }
+  if (taskIdx >= 0 && (bestIdx < 0 || taskIdx < bestIdx)) {
+    bestIdx = taskIdx;
+    kind = "task_result";
+  }
+  if (bestIdx < 0 || kind.length == 0) {
+    return hit;
+  }
+
+  if (kind == "process") {
+    hit.index = process.index;
+    hit.endIndex = process.endIndex;
+    hit.fullMatch = process.fullMatch;
+    hit.kind = kind;
+    return hit;
+  }
+  if (kind == "container") {
+    hit.index = fence.index;
+    hit.endIndex = fence.endIndex;
+    hit.fullMatch = fence.fullMatch;
+    hit.kind = kind;
+    return hit;
+  }
+  if (kind == "group") {
+    const closeMarker = "</markdown-custom-process-group>";
+    const closeIdx = markdown.indexOf(closeMarker, groupIdx + groupMarker.length);
+    if (closeIdx < 0) {
+      // 残缺 group 开标签：跳过继续找，避免挡住后续合法块
+      return findNextCustomBlock(markdown, groupIdx + 1);
+    }
+    hit.index = groupIdx;
+    hit.endIndex = closeIdx + closeMarker.length;
+    hit.fullMatch = markdown.substring(hit.index, hit.endIndex);
+    hit.kind = kind;
+    return hit;
+  }
+  // task_result：沿用非贪婪闭合
+  const taskSlice = markdown.substring(taskIdx);
+  const taskMatch = taskSlice.match(
+    /^<task-result\b[^>]*>[\s\S]*?<\/task-result>/i,
+  );
+  if (taskMatch == null || taskMatch[0] == null) {
+    return findNextCustomBlock(markdown, taskIdx + 1);
+  }
+  hit.index = taskIdx;
+  hit.endIndex = taskIdx + taskMatch[0]!.length;
+  hit.fullMatch = taskMatch[0]!;
+  hit.kind = kind;
+  return hit;
+}
+
 /**
  * 将正文结构化拆分为 Markdown 片段与工具片段。
  * 不向原文注入任何占位字符串。
+ * 同时识别：
+ * - <div><markdown-custom-process/></div>（PC/历史原文；name 可含 >）
+ * - <markdown-custom-process/> / group
+ * - :::container ...\n:::（历史适配后的移动端语法）
+ * - <task-result>
  */
 function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
   const extraction = new CustomProcessExtraction();
-  const regex =
-    /<markdown-custom-process-group>[\s\S]*?<\/markdown-custom-process-group>|<markdown-custom-process(?!-group)\b[^>]*?>(?:<\/markdown-custom-process>)?|<task-result\b[^>]*>[\s\S]*?<\/task-result>/gi;
   let cursor = 0;
-  let match = regex.exec(markdown);
-  while (match != null) {
-    const fullMatch = match[0] != null ? match[0]! : "";
-    const markdownBefore = markdown.substring(cursor, match.index);
+  while (cursor < markdown.length) {
+    const hit = findNextCustomBlock(markdown, cursor);
+    if (hit.kind.length == 0) {
+      break;
+    }
+    const markdownBefore = markdown.substring(cursor, hit.index);
     if (markdownBefore.length > 0) {
       const markdownSegment = new CustomProcessSegment();
       markdownSegment.markdown = markdownBefore;
       extraction.segments.push(markdownSegment);
     }
+    const fullMatch = hit.fullMatch;
     const taskResultData = parseFallbackTaskResultData(fullMatch);
     const processList = parseCustomProcessTags(fullMatch);
     if (taskResultData != null || processList.length > 0) {
@@ -421,8 +2206,8 @@ function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
         block.type = "task_result";
         block.taskResultData = taskResultData;
       } else {
+        // ≥2 才按组渲染；组标记内仅 1 个工具时按单卡渲染，与完成态一致
         block.type =
-          fullMatch.indexOf("<markdown-custom-process-group>") >= 0 ||
           processList.length > 1
             ? "markdown_custom_process_group"
             : "markdown_custom_process";
@@ -437,8 +2222,7 @@ function extractCustomProcessBlocks(markdown: string): CustomProcessExtraction {
       fallbackSegment.markdown = fullMatch;
       extraction.segments.push(fallbackSegment);
     }
-    cursor = regex.lastIndex;
-    match = regex.exec(markdown);
+    cursor = hit.endIndex > cursor ? hit.endIndex : cursor + 1;
   }
   const markdownAfter = markdown.substring(cursor);
   if (markdownAfter.length > 0) {
@@ -453,51 +2237,477 @@ function renderMathToken(
   latex: string,
   token: MarkdownToken,
   callback: MathRenderedCallback,
+  displayMode: boolean,
 ): void {
-  console.log(
-    "[MathRender] request latexLen=" +
-      latex.length +
-      " tokenId=" +
-      (token.uniqueId ?? ""),
-  );
+  // App 端关闭原生公式渲染（2026-08-17：会话渲染已走内嵌 H5/浏览器侧，原生 proxy 公式链为遗留；
+  // 其隐藏 proxy webview 是 iOS 26 BFL/FrameState 崩溃的头号嫌疑源，整体关断。
+  // 关断后公式以解析期已有的纯文本呈现，不再入队、不再产生任何 proxy 截图调用。）
+  let nativeMathRenderDisabled = false;
+  // #ifdef APP
+  nativeMathRenderDisabled = true;
+  // #endif
+  if (nativeMathRenderDisabled) {
+    callback();
+    return;
+  }
+  const safeLatex = sanitizeLatexText(latex);
+  if (token.text != safeLatex) {
+    token.text = safeLatex;
+  }
+  // 磁盘缓存命中：解析阶段直接写回本地路径，冷启动亦可秒开
+  const cacheKey = mathCacheKey(safeLatex, displayMode);
+  const cached = getMathCache(cacheKey);
+  if (cached != null) {
+    applyMathResultToToken(token, cacheEntryToRes(cached));
+    let useAppQueueHit = false;
+    // #ifdef APP
+    useAppQueueHit = true;
+    // #endif
+    if (useAppQueueHit == false) {
+      callback();
+    }
+    return;
+  }
+  // App：解析期入队，出口批量截图；H5：不入队，单条即时 katexRender → resultHtml
+  let useAppQueue = false;
+  // #ifdef APP
+  useAppQueue = true;
+  // #endif
+  if (useAppQueue == true) {
+    const queue = currentMathJobs();
+    if (queue != null) {
+      mathJobSeq = mathJobSeq + 1;
+      const id =
+        (token.uniqueId != null && `${token.uniqueId}`.length > 0
+          ? `${token.uniqueId}`
+          : "math") +
+        "-" +
+        mathJobSeq;
+      queue.push(new PendingMathJob(id, safeLatex, token, displayMode));
+      return;
+    }
+  }
+  // H5 / 无队列：保持原单条请求逻辑
   const param = new UTSJSONObject();
   param["action"] = "katexRender";
-  param["pureMathText"] = latex;
+  param["pureMathText"] = safeLatex;
+  param["displayMode"] = displayMode;
   proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
-    const imageData = res["imageDataURL"];
-    const htmlData = res["resultHtml"];
-    const widthData = res["width"];
-    const heightData = res["height"];
-    if (imageData != null) token.href = `${imageData}`;
-    if (htmlData != null) token.html = `${htmlData}`;
-    if (widthData != null) token.width = widthData as number;
-    if (heightData != null) token.height = heightData as number;
-    const imageLength = imageData != null ? `${imageData}`.length : 0;
-    const htmlLength = htmlData != null ? `${htmlData}`.length : 0;
-    const errorData = res["error"];
-    console.log(
-      "[MathRender] callback tokenId=" +
-        (token.uniqueId ?? "") +
-        " imageLen=" +
-        imageLength +
-        " htmlLen=" +
-        htmlLength +
-        " width=" +
-        (token.width ?? 0) +
-        " height=" +
-        (token.height ?? 0) +
-        " error=" +
-        (errorData != null ? `${errorData}` : ""),
-    );
+    putMathCache(cacheKey, res);
+    applyMathResultToToken(token, res);
     callback();
   });
 }
 
 /**
+ * 异步渲染 mermaid 代码块（App 流式/历史走 fallback，cmark 路径触达不到）。
+ * 参考 renderMathToken 的 whenReady/回调刷帧模式：webview 未就绪则等待，结果回填 token.href（+width/height）。
+ * mermaid 量少，单条直调，不进 KaTeX 并发队列。
+ *
+ * 去重/缓存（与公式 MathBatchUiRunner + mathInFlightTokens 对齐）：
+ * 流式 live 区每 flush 重解析，闭合 mermaid 块若滞留 live 区会每帧重发 proxy 截图 →
+ * 灌满 proxy 串行 mermaidQueue → 全部超时失败（"图表渲染失败"）+ href 每帧变 → 抖动。
+ * 故同 text：成功结果缓存命中直填（零 proxy 调用）、在途去重扇出、失败短期冷却不每帧重试。
+ */
+
+/** mermaid 截图结果缓存：成功存 href/宽高；失败仅记 failAt 做冷却 */
+class MermaidCacheEntry {
+  href: string = "";
+  width: number = 0;
+  height: number = 0;
+  ok: boolean = false;
+  failAt: number = 0;
+}
+
+/** 在途渲染的等待者：首个 dispatch 未回调期间，后续同 text 的 token 挂这里，回调时统一扇出 */
+class MermaidWaiter {
+  token: MarkdownToken;
+  callback: MathRenderedCallback;
+  constructor(token: MarkdownToken, callback: MathRenderedCallback) {
+    this.token = token;
+    this.callback = callback;
+  }
+}
+
+/** 失败冷却：同 text 失败后 2s 内不重发，避免每帧重试打满串行队列（落代码 Tab 兜底） */
+const MERMAID_FAIL_COOLDOWN_MS: number = 2000;
+/** text → 最近一次渲染结果（成功缓存 / 失败冷却）。模块级，跨消息复用同图截图 */
+const mermaidCache: Map<string, MermaidCacheEntry> = new Map<string, MermaidCacheEntry>();
+/** text → 在途等待者列表（dispatch 中未回调） */
+const mermaidInFlight: Map<string, MermaidWaiter[]> = new Map<string, MermaidWaiter[]>();
+
+function renderMermaidToken(
+  mermaidText: string,
+  token: MarkdownToken,
+  callback: MathRenderedCallback,
+): void {
+  // App 端关闭原生 mermaid 渲染（同 renderMathToken：proxy webview 关断，代码块按纯文本呈现）
+  let nativeMathRenderDisabled = false;
+  // #ifdef APP
+  nativeMathRenderDisabled = true;
+  // #endif
+  if (nativeMathRenderDisabled) {
+    callback();
+    return;
+  }
+  // 1) 成功缓存命中：同步回填，本次解析即带 href 上屏，零 proxy 调用、零抖动
+  const cached = mermaidCache.get(mermaidText);
+  if (cached != null) {
+    if (cached.ok == true) {
+      token.href = cached.href;
+      if (cached.width > 0) token.width = cached.width;
+      if (cached.height > 0) token.height = cached.height;
+      callback();
+      return;
+    }
+    // 2) 失败冷却期内：不重复 dispatch（避免每帧重试打满队列），落代码 Tab 兜底
+    if (Date.now() - cached.failAt < MERMAID_FAIL_COOLDOWN_MS) {
+      callback();
+      return;
+    }
+  }
+  // 3) 在途去重：同 text 已 dispatch 未回调，挂入等待列表，回调时统一扇出
+  const existing = mermaidInFlight.get(mermaidText);
+  if (existing != null) {
+    existing.push(new MermaidWaiter(token, callback));
+    return;
+  }
+  // 4) 首次 dispatch：登记在途
+  const waiters = [] as MermaidWaiter[];
+  waiters.push(new MermaidWaiter(token, callback));
+  mermaidInFlight.set(mermaidText, waiters);
+
+  const doRender = (): void => {
+    const param = new UTSJSONObject();
+    param["action"] = "renderMermaid";
+    param["mermaidText"] = mermaidText;
+    proxyWeb.callMethod(param, (res: UTSJSONObject): void => {
+      // 取出全部等待者（含首个 dispatch 的 token）后清在途登记
+      const pending = mermaidInFlight.get(mermaidText);
+      mermaidInFlight.delete(mermaidText);
+      const imageData = res["imageDataURL"];
+      const hasImage = imageData != null && `${imageData}`.length > 0;
+      const entry = new MermaidCacheEntry();
+      if (hasImage) {
+        entry.href = `${imageData}`;
+        entry.ok = true;
+        const widthData = res["width"];
+        const heightData = res["height"];
+        if (widthData != null) entry.width = widthData as number;
+        if (heightData != null) entry.height = heightData as number;
+      } else {
+        // 失败：记冷却时间戳，不回填 href（渲染组件落代码 Tab）
+        entry.ok = false;
+        entry.failAt = Date.now();
+      }
+      mermaidCache.set(mermaidText, entry);
+      // 扇出：结果写到每个等待 token（含已冻结进 stableEls 的，避免漏填后不再重解析）
+      if (pending != null) {
+        for (let i = 0; i < pending.length; i++) {
+          const w = pending[i];
+          if (hasImage) {
+            w.token.href = entry.href;
+            if (entry.width > 0) w.token.width = entry.width;
+            if (entry.height > 0) w.token.height = entry.height;
+          }
+          w.callback();
+        }
+      }
+    });
+  };
+  if (proxyWeb.isReady() == true) {
+    doRender();
+  } else {
+    proxyWeb.whenReady((): void => {
+      doRender();
+    });
+  }
+}
+
+/**
+ * 全局串行化代码块高亮。
+ * App 原生 libscopeparser 非线程安全：多个代码块并发 tokenizeLine 会抛
+ * java.util.ConcurrentModificationException。一次只高亮一个块（块内逐行本就串行）即可避免。
+ * H5 单线程无此问题，串行化也无害（仅顺序化）。
+ */
+let highlightBusy = false;
+let highlightWaiters: Array<() => void> = [] as Array<() => void>;
+function acquireHighlight(task: () => void): void {
+  if (highlightBusy) {
+    highlightWaiters.push(task);
+    return;
+  }
+  highlightBusy = true;
+  task();
+}
+function releaseHighlight(): void {
+  if (highlightWaiters.length > 0) {
+    const next = highlightWaiters.shift();
+    if (next != null) {
+      // 锁交接给下一个任务，保持互斥
+      next();
+      return;
+    }
+  }
+  highlightBusy = false;
+}
+
+/**
+ * 异步语法高亮：逐行 parseLineCode 分词，全部完成后回填 codeToken.codeTokens 并回调刷帧。
+ * 与 SDK parseMarkdown.uts 的 parseCodehighlight 等价，供 fallback 独立使用（无增量缓存）。
+ * 语言不在 grammarList 时首行即返回 error → 保持调用方已写入的纯文本 codeTokens，不逐行空跑。
+ * 回填后走 onMathRendered（与 mermaid/math 同一 flushMathUi 链路）触发重渲染上色。
+ */
+function highlightCodeBlock(
+  codeToken: MarkdownToken,
+  codeText: string,
+  lang: string,
+  callback: MathRenderedCallback,
+): void {
+  if (codeText.length == 0) {
+    return;
+  }
+  acquireHighlight((): void => {
+    const lines = codeText.split("\n");
+    const highlighted = [] as MarkdownToken[][];
+    let lineIndex = 0;
+    let unsupported = false;
+    function parseNext(): void {
+      if (unsupported) {
+        releaseHighlight();
+        return;
+      }
+      if (lineIndex >= lines.length) {
+        // 全部行分词完成 → 回填新数组（新引用，触发子组件重渲染）并刷帧
+        codeToken.codeTokens = highlighted;
+        releaseHighlight();
+        callback();
+        return;
+      }
+      const lineText = lines[lineIndex];
+      parseLineCode((res: ParseLineCodeRes): void => {
+        if (res.error != null) {
+          // 语言不支持 / 高亮器初始化失败：保留调用方写入的纯文本 codeTokens，不再逐行尝试
+          unsupported = true;
+          releaseHighlight();
+          return;
+        }
+        if (res.tokens.length == 0) {
+          // 空行/无分词：降级为纯文本行，避免该行被吞
+          highlighted.push([makeTextToken(lineText, "text")]);
+        } else {
+          highlighted.push(res.tokens);
+        }
+        lineIndex = lineIndex + 1;
+        parseNext();
+      }, lineText, lang);
+    }
+    parseNext();
+  });
+}
+
+/** 为行内 math token 触发 KaTeX 渲染（异步回填 html/href/width/height）。 */
+function scheduleInlineMathRender(
+  tokens: MarkdownToken[],
+  onMathRendered: MathRenderedCallback,
+): void {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.type != "math") {
+      continue;
+    }
+    const latex = token.text ?? "";
+    if (latex.length == 0) {
+      continue;
+    }
+    // 已渲染过则跳过，避免流式重复请求
+    if (
+      (token.html != null && `${token.html}`.length > 0) ||
+      (token.href != null && `${token.href}`.length > 0)
+    ) {
+      continue;
+    }
+    // 行内公式（表格单元格 / 标题）使用 displayMode=false
+    renderMathToken(latex, token, onMathRendered, false);
+  }
+}
+
+/**
+ * 下一非空行是否为三级标题（###）。
+ * 用于把「数列公式」这类紧挨 ### 小节的短行提升为二级标题，避免误伤普通短句。
+ */
+function nextNonEmptyIsH3(lines: string[], fromIndex: number): boolean {
+  for (let i = fromIndex; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length == 0) {
+      continue;
+    }
+    return t.startsWith("### ") && !t.startsWith("####");
+  }
+  return false;
+}
+
+function makeTableRow(
+  line: string,
+  onMathRendered: MathRenderedCallback,
+): MarkdownToken {
+  const cells = splitTableRow(line);
+  const cellTokens = [] as MarkdownToken[];
+  for (let i = 0; i < cells.length; i++) {
+    const inline = parseInline(cells[i]);
+    scheduleInlineMathRender(inline, onMathRendered);
+    const width = Math.max(56, Math.min(300, cells[i].length * 15 + 24));
+    cellTokens.push({
+      type: "table_cell",
+      tokens: inline,
+      width,
+    });
+  }
+  return {
+    type: "table_row",
+    tokens: cellTokens,
+  };
+}
+
+/**
+ * 工具标签把表格拆成两段后，后段往往只有数据行（无 |---|" 分隔）。
+ * 若整段都是管道行，则续接到结果列表末尾的表格。
+ */
+function tryAppendTableContinuation(
+  result: UniAiMarkdownElItem[],
+  markdown: string,
+  onMathRendered: MathRenderedCallback,
+): boolean {
+  if (result.length == 0) {
+    return false;
+  }
+  const prev = result[result.length - 1];
+  if (
+    prev.type != "table" ||
+    prev.datasList.length == 0 ||
+    prev.datasList[0].length == 0
+  ) {
+    return false;
+  }
+  const tableToken = prev.datasList[0][0];
+  if (tableToken.type != "table") {
+    return false;
+  }
+  const lines = prepareMarkdownForFallback(markdown).split("\n");
+  let start = 0;
+  while (start < lines.length && lines[start].trim().length == 0) {
+    start++;
+  }
+  if (start >= lines.length) {
+    return false;
+  }
+  if (lineHasMarkdownTablePipe(lines[start].trim()) != true) {
+    return false;
+  }
+  // 自带表头分隔 → 独立新表，不续接
+  if (findTableSeparatorIndex(lines, start) >= 0) {
+    return false;
+  }
+  for (let i = start; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length == 0) {
+      continue;
+    }
+    if (isTableSeparator(t)) {
+      continue;
+    }
+    if (lineHasMarkdownTablePipe(t) != true || isFallbackListLine(t)) {
+      return false;
+    }
+  }
+  let rowTokens = tableToken.tokens;
+  if (rowTokens == null) {
+    rowTokens = [] as MarkdownToken[];
+    tableToken.tokens = rowTokens;
+  }
+  for (let i = start; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.length == 0 || isTableSeparator(t)) {
+      continue;
+    }
+    rowTokens.push(makeTableRow(lines[i], onMathRendered));
+  }
+  return true;
+}
+
+/**
  * 标准 App 基座缺少 uni-cmark 原生库时的纯 UTS Markdown 解析。
  * 支持标题、段落、粗体、行内代码、分隔线、表格、代码块及块级数学公式。
+ * - App：根调用收集公式 → 并行截图 → 按 chunk（默认 8）分批回调上屏
+ * - H5：不走批量队列，解析中单条 katexRender（resultHtml + v-html，原逻辑）
+ * @param deferMathFlush App 流式 live 区：只建 math token、不派发 KaTeX/WebView；
+ *   冻结前缀（已闭合公式）应传 false，逐段 flush。终态 full parse 也传 false。
  */
 export function parseAppMarkdownFallback(
+  markdown: string,
+  onMathRendered: MathRenderedCallback,
+  deferMathFlush: boolean = false,
+): UniAiMarkdownElItem[] {
+  // #ifdef APP
+  try {
+    let useAppBatch = false;
+    useAppBatch = true;
+    if (useAppBatch != true) {
+      lastMathFlushCount = 0;
+      return parseAppMarkdownFallbackInner(markdown, onMathRendered);
+    }
+    mathJobStack.push(new MathJobFrame());
+    const parsed = parseAppMarkdownFallbackInner(markdown, onMathRendered);
+    if (deferMathFlush == true) {
+      // live：丢弃本帧 jobs，token 保留 latex 占位；进入冻结区 / 终态再截图
+      mathJobStack.pop();
+      lastMathFlushCount = 0;
+      return parsed;
+    }
+    const jobCount = flushMathJobs(onMathRendered);
+    mathJobStack.pop();
+    lastMathFlushCount = jobCount;
+    return parsed;
+  } catch (e) {
+    // 终极兜底（仅 APP）：fallback 解析任何异常都不得让整条消息空白，
+    // 回退为纯文本段落，保证后续内容 / 消息主体可渲染。
+    console.warn(
+      "[MarkdownFallback] parse crashed, fallback to plain text. err=" +
+        (e != null ? `${e}` : "unknown"),
+    );
+    try {
+      mathJobStack.pop();
+    } catch (_ePop) {
+      // ignore
+    }
+    lastMathFlushCount = 0;
+    return buildPlainTextFallbackItems(markdown);
+  }
+  // #endif
+  // #ifndef APP
+  // 非 APP（H5/小程序）：保持原逻辑，不引入 try/catch 兜底，行为严格不变。
+  lastMathFlushCount = 0;
+  return parseAppMarkdownFallbackInner(markdown, onMathRendered);
+  // #endif
+}
+
+// #ifdef APP
+/** 极简纯文本兜底：异常时保证至少渲染原文，不因解析失败而空白。仅 APP 端使用。 */
+function buildPlainTextFallbackItems(markdown: string): UniAiMarkdownElItem[] {
+  const result = [] as UniAiMarkdownElItem[];
+  const text = markdown != null ? `${markdown}` : "";
+  if (text.length > 0) {
+    const token: MarkdownToken = {
+      type: "text",
+      text: text,
+    };
+    result.push(makeItem("paragraph", 0, [[token]]));
+  }
+  return result;
+}
+// #endif
+
+function parseAppMarkdownFallbackInner(
   markdown: string,
   onMathRendered: MathRenderedCallback,
 ): UniAiMarkdownElItem[] {
@@ -534,7 +2744,17 @@ export function parseAppMarkdownFallback(
       if (segment.markdown.trim().length == 0) {
         continue;
       }
-      const markdownItems = parseAppMarkdownFallback(
+      // 自定义标签拆段后：后段若仅为无分隔行的管道表，续接到上一段表格
+      if (
+        tryAppendTableContinuation(
+          segmentedResult,
+          segment.markdown,
+          onMathRendered,
+        ) == true
+      ) {
+        continue;
+      }
+      const markdownItems = parseAppMarkdownFallbackInner(
         segment.markdown,
         onMathRendered,
       );
@@ -555,7 +2775,7 @@ export function parseAppMarkdownFallback(
   }
 
   const result = [] as UniAiMarkdownElItem[];
-  const lines = normalizeInlineMath(markdown).split("\n");
+  const lines = prepareMarkdownForFallback(markdown).split("\n");
   let index = 0;
   let itemIndex = 0;
 
@@ -564,6 +2784,12 @@ export function parseAppMarkdownFallback(
     const trimmed = line.trim();
 
     if (trimmed.length == 0) {
+      index++;
+      continue;
+    }
+
+    if (trimmed.startsWith("</markdown-custom-process-group")) {
+      // 孤立结束标签（工具已在 processingList）：勿当正文
       index++;
       continue;
     }
@@ -583,7 +2809,10 @@ export function parseAppMarkdownFallback(
       if (processList.length > 0) {
         result.push(
           makeCustomProcessItem(
-            "markdown_custom_process_group",
+            // ≥2 才按组渲染；组标记内仅 1 个工具时按单卡渲染，与完成态一致
+            processList.length > 1
+              ? "markdown_custom_process_group"
+              : "markdown_custom_process",
             itemIndex++,
             processList,
           ),
@@ -607,16 +2836,60 @@ export function parseAppMarkdownFallback(
       continue;
     }
 
+    // :::container attrs + 下一行 :::
+    if (trimmed.startsWith(":::container")) {
+      let block = trimmed;
+      if (index + 1 < lines.length && lines[index + 1].trim() == ":::") {
+        block = trimmed + "\n:::";
+        index += 2;
+      } else {
+        index++;
+      }
+      const processList = parseCustomProcessTags(block);
+      if (processList.length > 0) {
+        result.push(
+          makeCustomProcessItem(
+            "markdown_custom_process",
+            itemIndex++,
+            processList,
+          ),
+        );
+      }
+      continue;
+    }
+
     if (trimmed.startsWith("```")) {
       const lang = trimmed.substring(3).trim();
       const codeLines = [] as string[];
       index++;
-      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+      let fenceClosed = false;
+      while (index < lines.length) {
+        if (lines[index].trim().startsWith("```")) {
+          fenceClosed = true;
+          index++;
+          break;
+        }
         codeLines.push(lines[index]);
         index++;
       }
-      if (index < lines.length) index++;
       const codeText = codeLines.join("\n");
+      // 流式未闭合 ```：while 已吃到文末。必须输出临时 code_block 并 continue，
+      // 禁止回落段落——段落遇空行会拆断，表现为代码/流程图「渲染到一半就停」。
+      if (fenceClosed != true) {
+        const codeRows = [] as MarkdownToken[][];
+        for (let ci = 0; ci < codeLines.length; ci++) {
+          codeRows.push([makeTextToken(codeLines[ci], "text")]);
+        }
+        const pendingToken: MarkdownToken = {
+          type: "code_block",
+          text: codeText,
+          lang: lang.length > 0 ? lang : "text",
+          codeTokens: codeRows,
+          uniqueId: "fallback-code-pending-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[pendingToken]]));
+        continue;
+      }
       if (lang == "math") {
         const mathToken: MarkdownToken = {
           type: "math",
@@ -624,7 +2897,18 @@ export function parseAppMarkdownFallback(
           uniqueId: "fallback-math-token-" + itemIndex,
         };
         result.push(makeItem("math", itemIndex++, [[mathToken]]));
-        renderMathToken(codeText, mathToken, onMathRendered);
+        renderMathToken(codeText, mathToken, onMathRendered, true);
+      } else if (lang == "mermaid") {
+        // mermaid：仅闭合后出图；未闭合走上方 pending 纯文本
+        const mermaidToken: MarkdownToken = {
+          type: "code_block",
+          text: codeText,
+          lang: "mermaid",
+          codeTokens: [] as MarkdownToken[][],
+          uniqueId: "fallback-mermaid-token-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[mermaidToken]]));
+        renderMermaidToken(codeText, mermaidToken, onMathRendered);
       } else {
         const codeRows = [] as MarkdownToken[][];
         for (let ci = 0; ci < codeLines.length; ci++) {
@@ -638,6 +2922,14 @@ export function parseAppMarkdownFallback(
           uniqueId: "fallback-code-token-" + itemIndex,
         };
         result.push(makeItem("code_block", itemIndex++, [[codeToken]]));
+        // 异步语法高亮（App + H5）：分词完成后回填 codeTokens 并刷帧；
+        // 不支持的语言保持上方纯文本 codeRows。先上纯文本再异步上色，流式友好。
+        highlightCodeBlock(
+          codeToken,
+          codeText,
+          lang.length > 0 ? lang : "text",
+          onMathRendered,
+        );
       }
       continue;
     }
@@ -646,74 +2938,125 @@ export function parseAppMarkdownFallback(
       const closeMarker = trimmed == "$$" ? "$$" : "\\]";
       const mathLines = [] as string[];
       index++;
-      while (index < lines.length && lines[index].trim() != closeMarker) {
+      let closed = false;
+      while (index < lines.length) {
+        if (lines[index].trim() == closeMarker) {
+          closed = true;
+          index++;
+          break;
+        }
         mathLines.push(lines[index]);
         index++;
       }
-      if (index < lines.length) index++;
       const latex = mathLines.join("\n").trim();
-      console.log(
-        "[MathRender] fallback block math index=" +
-          itemIndex +
-          " latex=" +
-          latex,
-      );
-      const mathToken: MarkdownToken = {
-        type: "math",
-        text: latex,
-        uniqueId: "fallback-math-token-" + itemIndex,
-      };
-      result.push(makeItem("math", itemIndex++, [[mathToken]]));
-      renderMathToken(latex, mathToken, onMathRendered);
+      if (closed && latex.length > 0) {
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: latex,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(latex, mathToken, onMathRendered, true);
+        continue;
+      }
+      if (!closed) {
+        // 流式未闭合 $$ / \[：临时 code 展示，禁止回落段落（空行拆断 + 半截 katex）
+        const rawLatex = mathLines.join("\n");
+        const codeRows = [] as MarkdownToken[][];
+        for (let mi = 0; mi < mathLines.length; mi++) {
+          codeRows.push([makeTextToken(mathLines[mi], "text")]);
+        }
+        if (codeRows.length == 0) {
+          codeRows.push([makeTextToken("", "text")]);
+        }
+        const pendingMath: MarkdownToken = {
+          type: "code_block",
+          text: rawLatex,
+          lang: "math",
+          codeTokens: codeRows,
+          uniqueId: "fallback-math-pending-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[pendingMath]]));
+        continue;
+      }
+      // 闭合但内容为空
       continue;
     }
 
-    let inlineBlockMath = "";
+    // $$latex... 开头但未在本行闭合：跨行收到闭合 $$（含 \nabla 被拆行的场景）
     if (
-      trimmed.length > 4 &&
-      trimmed.startsWith("$$") &&
-      trimmed.endsWith("$$")
+      trimmed.startsWith("$$") == true &&
+      isStandaloneMathLine(trimmed) != true
     ) {
-      inlineBlockMath = trimmed.substring(2, trimmed.length - 2).trim();
-    } else if (
-      trimmed.length > 4 &&
-      trimmed.startsWith("\\[") &&
-      trimmed.endsWith("\\]")
-    ) {
-      inlineBlockMath = trimmed.substring(2, trimmed.length - 2).trim();
-    } else if (
-      trimmed.length > 2 &&
-      trimmed.startsWith("$") &&
-      trimmed.endsWith("$")
-    ) {
-      inlineBlockMath = trimmed.substring(1, trimmed.length - 1).trim();
-    }
-    if (inlineBlockMath.length > 0) {
-      console.log(
-        "[MathRender] fallback same-line math index=" +
-          itemIndex +
-          " latex=" +
-          inlineBlockMath,
-      );
-      const mathToken: MarkdownToken = {
-        type: "math",
-        text: inlineBlockMath,
-        uniqueId: "fallback-math-token-" + itemIndex,
-      };
-      result.push(makeItem("math", itemIndex++, [[mathToken]]));
-      renderMathToken(inlineBlockMath, mathToken, onMathRendered);
+      let latexBuf = trimmed.substring(2);
       index++;
+      let closedSpan = false;
+      while (index < lines.length) {
+        const rawLine = lines[index];
+        const closeAt = rawLine.indexOf("$$");
+        if (closeAt >= 0) {
+          const before = rawLine.substring(0, closeAt);
+          if (latexBuf.length > 0 && before.length > 0) {
+            latexBuf += "\n";
+          }
+          latexBuf += before;
+          closedSpan = true;
+          index++;
+          break;
+        }
+        if (latexBuf.length > 0) {
+          latexBuf += "\n";
+        }
+        latexBuf += rawLine;
+        index++;
+      }
+      const spanLatex = latexBuf.trim();
+      if (closedSpan == true && spanLatex.length > 0) {
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: spanLatex,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(spanLatex, mathToken, onMathRendered, true);
+        continue;
+      }
+      if (closedSpan != true && spanLatex.length > 0) {
+        const pendingMath: MarkdownToken = {
+          type: "code_block",
+          text: spanLatex,
+          lang: "math",
+          codeTokens: [[makeTextToken(spanLatex, "text")]],
+          uniqueId: "fallback-math-pending-" + itemIndex,
+        };
+        result.push(makeItem("code_block", itemIndex++, [[pendingMath]]));
+        continue;
+      }
       continue;
+    }
+
+    if (isStandaloneMathLine(trimmed)) {
+      const inlineBlockMath = extractStandaloneMathLatex(trimmed);
+      if (inlineBlockMath.length > 0) {
+        const mathToken: MarkdownToken = {
+          type: "math",
+          text: inlineBlockMath,
+          uniqueId: "fallback-math-token-" + itemIndex,
+        };
+        result.push(makeItem("math", itemIndex++, [[mathToken]]));
+        renderMathToken(inlineBlockMath, mathToken, onMathRendered, true);
+        index++;
+        continue;
+      }
     }
 
     const tableSeparatorIndex =
-      trimmed.indexOf("|") >= 0
+      lineHasMarkdownTablePipe(trimmed) == true
         ? findTableSeparatorIndex(lines, index)
         : -1;
     if (tableSeparatorIndex >= 0) {
       const tableRows = [] as MarkdownToken[];
       const aligns = tableAligns(lines[tableSeparatorIndex]);
-      const tableStartIndex = index;
       while (index < lines.length) {
         const tableLine = lines[index].trim();
         if (tableLine.length == 0) {
@@ -724,20 +3067,16 @@ export function parseAppMarkdownFallback(
           index++;
           continue;
         }
-        if (tableLine.indexOf("|") < 0) {
+        if (lineHasMarkdownTablePipe(tableLine) != true) {
           break;
         }
-        tableRows.push(makeTableRow(lines[index]));
+        // 列表项闯入时结束表格，避免把 - $|\Psi|^2$ 吞进表
+        if (isFallbackListLine(tableLine)) {
+          break;
+        }
+        tableRows.push(makeTableRow(lines[index], onMathRendered));
         index++;
       }
-      console.log(
-        "[MdRender] fallback table recovered start=" +
-          tableStartIndex +
-          " separator=" +
-          tableSeparatorIndex +
-          " rows=" +
-          tableRows.length,
-      );
       const tableToken: MarkdownToken = {
         type: "table",
         tokens: tableRows,
@@ -748,12 +3087,96 @@ export function parseAppMarkdownFallback(
       continue;
     }
 
+    // 无表头分隔行：若上一块已是表格，把连续管道行续接上去。
+    // 常见于：工具自定义标签把表格拆成两段，后段只有数据行。
+    if (
+      lineHasMarkdownTablePipe(trimmed) == true &&
+      isFallbackListLine(trimmed) != true &&
+      result.length > 0
+    ) {
+      const prev = result[result.length - 1];
+      if (
+        prev.type == "table" &&
+        prev.datasList.length > 0 &&
+        prev.datasList[0].length > 0
+      ) {
+        const tableToken = prev.datasList[0][0];
+        if (tableToken.type == "table") {
+          let rowTokens = tableToken.tokens;
+          if (rowTokens == null) {
+            rowTokens = [] as MarkdownToken[];
+            tableToken.tokens = rowTokens;
+          }
+          while (index < lines.length) {
+            const tableLine = lines[index].trim();
+            if (tableLine.length == 0) {
+              index++;
+              continue;
+            }
+            if (lineHasMarkdownTablePipe(tableLine) != true) {
+              break;
+            }
+            if (isFallbackListLine(tableLine)) {
+              break;
+            }
+            // 续接段里偶发重复分隔行：跳过
+            if (isTableSeparator(tableLine)) {
+              index++;
+              continue;
+            }
+            rowTokens.push(makeTableRow(lines[index], onMathRendered));
+            index++;
+          }
+          continue;
+        }
+      }
+    }
+
+    // 忽略 Markdown 水平线（如 $$ 后跟 ---），避免思考/正文出现多余中横线
     if (trimmed == "---" || trimmed == "***" || trimmed == "___") {
-      const hrToken: MarkdownToken = {
-        type: "thematic_break",
-        uniqueId: "fallback-hr-token-" + itemIndex,
-      };
-      result.push(makeItem("thematic_break", itemIndex++, [[hrToken]]));
+      index++;
+      continue;
+    }
+
+    // 引用块：连续 > 行，剥离前缀后逐行 parseInline（支持引用内行内公式/斜体/删除线）
+    if (trimmed.startsWith(">")) {
+      const quoteRows = [] as MarkdownToken[][];
+      while (index < lines.length) {
+        const qline = lines[index].trim();
+        if (!qline.startsWith(">")) {
+          break;
+        }
+        // 剥离 > 及一个可选空格
+        let content = qline.substring(1);
+        if (content.startsWith(" ")) {
+          content = content.substring(1);
+        }
+        const rowTokens = parseInline(content);
+        scheduleInlineMathRender(rowTokens, onMathRendered);
+        quoteRows.push(rowTokens);
+        index++;
+      }
+      if (quoteRows.length > 0) {
+        result.push(makeItem("block_quote", itemIndex++, quoteRows));
+      }
+      continue;
+    }
+
+    // 独立图片行：原位 markdown_image（勿抽到消息末尾）
+    const standaloneImage = parseStandaloneMarkdownImageLine(trimmed);
+    if (standaloneImage != null) {
+      result.push(
+        makeMarkdownImageItem(
+          itemIndex++,
+          standaloneImage.alt,
+          standaloneImage.url,
+        ),
+      );
+      index++;
+      continue;
+    }
+    // 流式未闭合图片行：跳过，避免原文泄漏
+    if (isIncompleteMarkdownImageLine(trimmed)) {
       index++;
       continue;
     }
@@ -770,11 +3193,42 @@ export function parseAppMarkdownFallback(
     ) {
       const headingText = trimmed.substring(headingDepth + 1);
       const headingTokens = parseInline(headingText);
+      scheduleInlineMathRender(headingTokens, onMathRendered);
       for (let hi = 0; hi < headingTokens.length; hi++) {
-        const oldClass = headingTokens[hi].className ?? "text";
-        headingTokens[hi].className = oldClass + " depth-" + headingDepth;
+        if (headingTokens[hi].type == "math") {
+          headingTokens[hi].className = "math depth-" + headingDepth;
+        } else {
+          const oldClass = headingTokens[hi].className ?? "text";
+          headingTokens[hi].className = oldClass + " depth-" + headingDepth;
+        }
       }
       result.push(makeItem("heading", itemIndex++, [headingTokens]));
+      index++;
+      continue;
+    }
+
+    // 「数列公式」这类单独成行、紧跟 ### 标题的短文，提升为二级标题（贴近图二）
+    if (
+      trimmed.length > 0 &&
+      trimmed.length <= 40 &&
+      trimmed.indexOf("|") < 0 &&
+      !trimmed.startsWith("```") &&
+      !trimmed.endsWith("。") &&
+      !trimmed.endsWith("！") &&
+      !trimmed.endsWith("？") &&
+      nextNonEmptyIsH3(lines, index + 1)
+    ) {
+      const titleTokens = parseInline(trimmed);
+      scheduleInlineMathRender(titleTokens, onMathRendered);
+      for (let ti = 0; ti < titleTokens.length; ti++) {
+        if (titleTokens[ti].type == "math") {
+          titleTokens[ti].className = "math depth-2";
+        } else {
+          const oldClass = titleTokens[ti].className ?? "text";
+          titleTokens[ti].className = oldClass + " depth-2";
+        }
+      }
+      result.push(makeItem("heading", itemIndex++, [titleTokens]));
       index++;
       continue;
     }
@@ -791,12 +3245,15 @@ export function parseAppMarkdownFallback(
           ),
         );
         const inlineTokens = parseInline(fallbackListContent(listLine));
+        // 列表行内公式需走 KaTeX（与标题/表格一致），否则 H5/App 会露出裸 \Psi
+        scheduleInlineMathRender(inlineTokens, onMathRendered);
         for (let li = 0; li < inlineTokens.length; li++) {
           rowTokens.push(inlineTokens[li]);
         }
         listRows.push(rowTokens);
         index++;
       }
+      // H5 上兄弟 text 默认 inline，行间需要 \\n；App 端在 uni-ai-text-md 里会过滤 linebreak，避免多占一行。
       for (let rowIndex = 0; rowIndex < listRows.length - 1; rowIndex++) {
         listRows[rowIndex].push(makeTextToken("\n", "linebreak"));
       }
@@ -809,13 +3266,18 @@ export function parseAppMarkdownFallback(
     index++;
     while (index < lines.length && lines[index].trim().length > 0) {
       const next = lines[index].trim();
+      // 独立公式行必须留给后续 math 分支，不能并进段落（否则会显示裸 $$latex$$）
       if (
         next.startsWith("```") ||
         next == "$$" ||
         next == "\\[" ||
+        isStandaloneMathLine(next) ||
         next == "---" ||
+        next.startsWith(">") ||
         isFallbackListLine(lines[index]) ||
-        (next.indexOf("|") >= 0 &&
+        parseStandaloneMarkdownImageLine(next) != null ||
+        isIncompleteMarkdownImageLine(next) ||
+        (lineHasMarkdownTablePipe(next) == true &&
           findTableSeparatorIndex(lines, index) >= 0)
       ) {
         break;
@@ -827,6 +3289,8 @@ export function parseAppMarkdownFallback(
     for (let pi = 0; pi < paragraphLines.length; pi++) {
       if (pi > 0) paragraphTokens.push(makeTextToken("\n"));
       const inline = parseInline(paragraphLines[pi]);
+      // 段落行内公式需触发 KaTeX 渲染（与列表/标题一致），否则露出裸 latex
+      scheduleInlineMathRender(inline, onMathRendered);
       for (let ii = 0; ii < inline.length; ii++) {
         paragraphTokens.push(inline[ii]);
       }
@@ -834,11 +3298,5 @@ export function parseAppMarkdownFallback(
     result.push(makeItem("paragraph", itemIndex++, [paragraphTokens]));
   }
 
-  console.log(
-    "[MdRender] appFallback parsed bodyLen=" +
-      markdown.length +
-      " elCount=" +
-      result.length,
-  );
   return result;
 }

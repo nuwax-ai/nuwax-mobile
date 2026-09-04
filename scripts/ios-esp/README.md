@@ -1,7 +1,7 @@
 # iOS ESP 本地自定义基座脚本
 
-配合 [docs/ios-esp-provisioning-local-base.md](../../docs/ios-esp-provisioning-local-base.md)  
-维护规范：[docs/local-custom-base-maintenance.md](../../docs/local-custom-base-maintenance.md)
+配合 [docs/engineering/ios-esp-provisioning-local-base.md](../../docs/engineering/ios-esp-provisioning-local-base.md)  
+维护规范：[docs/engineering/local-custom-base-maintenance.md](../../docs/engineering/local-custom-base-maintenance.md)
 
 ## 官方对齐脚本（优先）
 

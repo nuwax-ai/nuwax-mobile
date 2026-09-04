@@ -240,15 +240,3 @@ MCP in queue =  responseStatus ∈ {pending, submitting}
 | 历史状态恢复 | `hydrateMcpAskInteractionsInMessageList` | `applyMcpAskResumeStatusesInMessageList` |
 | ACP 抑制 MCP Ask | `permissionPendingToolCallIds` + `permissionPendingAskRequestIds` | 同左 |
 | 卡片渲染方式 | `DockPanel` FIFO 队首单卡 | `intervention-dock` FIFO 队首单卡 |
-
----
-
-## 十、示例页面
-
-| 环境 | 地址 |
-|---|---|
-| 路由 path | `/pages/test-intervention/test-intervention` |
-| 代码跳转 | `uni.navigateTo({ url: '/pages/test-intervention/test-intervention' })` |
-
-示例页源码：`pages/test-intervention/test-intervention.uvue`  
-Mock 数据：`utils/mockInterventionData.uts`

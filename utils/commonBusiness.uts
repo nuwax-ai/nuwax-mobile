@@ -1,12 +1,17 @@
 import { apiPublishedAgentInfo } from "@/servers/agentDev";
 import { HideChatAreaEnum, ExpandPageAreaEnum } from "@/types/enums/agent";
-import { API_BASE_URL } from "@/constants/config";
+import { getApiBaseUrl } from "@/constants/config";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { apiUserTicketCreate } from "@/servers/agentDev";
 import { getCurrentPageFullPath } from "@/utils/common";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 import { t } from "@/utils/i18n";
 import { orEmpty } from "@/utils/utsCoalesce";
+import { navigateViaWebViewSdk, navigateEmbeddedH5HashRoute, requestResidentChatOpenFromEmbeddedH5 } from "@/utils/system.uts";
+import { isAppWebViewEmbedded, isIosAppWebView } from "@/utils/appWebViewDetect";
+// #ifdef APP-IOS
+import { openResidentChat } from "@/utils/residentChatShell";
+// #endif
 
 /**
  * 获取ticket
@@ -45,19 +50,21 @@ export const getCurrentPagePath = () => {
 };
 
 /**
- * 将ticket添加到url并跳转至webview页面
- * @param url
- * @param jump_type
- * @returns
+ * 构造带 ticket 的 webview 目标地址（已 encodeURIComponent，可直接作为 webview 页 url 参数值）。
+ *
+ * 注意：本函数与两个 jump 包装函数保持「各自独立、参数固定」的形态，不要合并成一个带
+ * 可选参数的导出函数。UTS→Kotlin 的默认参数会把形参个数编译进方法签名，给已被主包/分包
+ * 多处引用的导出函数增删参数，会在增量编译的旧 dex 上触发
+ * NoSuchMethodError: No static method addTicketAndJumpToWebview(...)。
  */
-export async function addTicketAndJumpToWebview(
+async function buildTicketWebviewUrl(
   url: string,
-  jump_type: "inner" | "outer" = "inner",
-  title: string = "",
-): Promise<void> {
+  jump_type: string,
+  title: string,
+): Promise<string> {
   const resolvedTitle = title != null && title != "" ? title : t("Mobile.Common.appName");
   const andStr = url.includes("?") ? "&" : "?";
-  const baseWebviewUrl = `${API_BASE_URL}${url}${andStr}title=${resolvedTitle}`;
+  const baseWebviewUrl = `${getApiBaseUrl()}${url}${andStr}title=${resolvedTitle}`;
   let webviewUrl = "";
   // #ifdef H5 || WEB
   // 当前页面地址
@@ -76,8 +83,78 @@ export async function addTicketAndJumpToWebview(
   webviewUrl = encodedApp != null ? encodedApp : "";
   // #endif
 
+  return webviewUrl;
+}
+
+/**
+ * 将ticket添加到url并跳转至webview页面
+ * @param url
+ * @param jump_type
+ * @returns
+ */
+export async function addTicketAndJumpToWebview(
+  url: string,
+  jump_type: "inner" | "outer" = "inner",
+  title: string = "",
+): Promise<void> {
+  const webviewUrl = await buildTicketWebviewUrl(url, jump_type, title);
+  uni.hideLoading();
   uni.navigateTo({
     url: `/subpackages/pages/webview/webview?url=${webviewUrl}`,
+  });
+}
+
+/**
+ * 同 addTicketAndJumpToWebview，但隐藏 webview 导航栏右侧的分享按钮（纯展示页用）。
+ * hideShare 挂在 webview 页自身的路由参数上，不进目标网页 URL，避免污染业务页 query。
+ */
+export async function addTicketAndJumpToWebviewWithoutShare(
+  url: string,
+  jump_type: "inner" | "outer" = "inner",
+  title: string = "",
+): Promise<void> {
+  const webviewUrl = await buildTicketWebviewUrl(url, jump_type, title);
+  uni.hideLoading();
+  uni.navigateTo({
+    url: `/subpackages/pages/webview/webview?url=${webviewUrl}&hideShare=1`,
+  });
+}
+
+/** 防并发 navigateTo：框架未完成上次跳转时再调会报 errCode 4 locked（Android / iOS / 鸿蒙通用） */
+let agentDetailNavInFlight: boolean = false;
+let lastAgentDetailJumpKey: string = "";
+let lastAgentDetailJumpAt: number = 0;
+
+function shouldSkipAgentDetailJump(
+  agentId: number,
+  conversationId: number | null,
+): boolean {
+  if (agentDetailNavInFlight) {
+    return true;
+  }
+  const convKey =
+    conversationId != null && conversationId > 0 ? `${conversationId}` : "";
+  const key = `${agentId}:${convKey}`;
+  const now = Date.now();
+  if (key == lastAgentDetailJumpKey && now - lastAgentDetailJumpAt < 800) {
+    return true;
+  }
+  lastAgentDetailJumpKey = key;
+  lastAgentDetailJumpAt = now;
+  return false;
+}
+
+/** 原生侧打开 agent-detail（Android / 鸿蒙 / 小程序 / 浏览器 H5 直开） */
+function navigateToAgentDetailNative(url: string): void {
+  if (agentDetailNavInFlight) {
+    return;
+  }
+  agentDetailNavInFlight = true;
+  uni.navigateTo({
+    url: url,
+    complete: (_res: any | null) => {
+      agentDetailNavInFlight = false;
+    },
   });
 }
 
@@ -96,7 +173,39 @@ export async function jumpToAgentDetailPage(
 
   // 问答型智能体、任务型智能体直接跳转至智能体详情页面
   if (agentType == "ChatBot" || agentType == "TaskAgent") {
-    uni.navigateTo({ url });
+    if (shouldSkipAgentDetailJump(agentId, conversationId)) {
+      return;
+    }
+    // App 内嵌 H5（web-view 内）：
+    // - iOS 常驻壳：postMessage 换会话，禁止压原生 agent-detail。
+    // - Android / 鸿蒙：走 uni.webView.navigateTo 压原生栈；JSSDK 未就绪时用 hash 软导航，
+    //   禁止回退 uni.navigateTo（会桥接到原生，与外层并发时触发 locked）。
+    if (isAppWebViewEmbedded()) {
+      // #ifdef H5 || WEB
+      if (isIosAppWebView() == true) {
+        requestResidentChatOpenFromEmbeddedH5(agentId, conversationId);
+        return;
+      }
+      if (navigateViaWebViewSdk(url)) {
+        return;
+      }
+      navigateEmbeddedH5HashRoute(url);
+      // #endif
+      return;
+    }
+    // #ifdef APP
+    // #ifdef APP-IOS
+    // App 原生侧（iOS）：打开首页常驻壳（永不销毁 web-view）
+    openResidentChat(agentId, conversationId);
+    return;
+    // #endif
+    // #ifndef APP-IOS
+    // App 原生侧（Android / 鸿蒙）：直接 navigateTo 独立页
+    navigateToAgentDetailNative(url);
+    return;
+    // #endif
+    // #endif
+    navigateToAgentDetailNative(url);
     return;
   }
 
@@ -139,13 +248,94 @@ export async function jumpToAgentDetailPage(
   }
 }
 
-// 判断当前页面是否是tab页面
+/**
+ * 取路由 path（去掉 query / hash），供 isTabPage、switchTab 使用。
+ * switchTab 不能带参数；带 query 的 backUrl 直接 includes 会误判成非 Tab。
+ */
+export function tabPathOnly(url: string): string {
+  let path = url;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    path = path.substring(0, hashIdx);
+  }
+  const qIdx = path.indexOf("?");
+  if (qIdx >= 0) {
+    path = path.substring(0, qIdx);
+  }
+  return path;
+}
+
+// 判断当前页面是否是tab页面（允许传入带 query 的完整 backUrl）
 export const isTabPage = (url: string) => {
+  const path = tabPathOnly(url);
   const tabPageList = [
     "/pages/index/index", // 对话（首页）
-    "/pages/terminal/terminal", // 终端
+    "/pages/agent-union-record/agent-union-record", // 智联录
+    "/pages/terminal/terminal", // 终端（桌搭）
     "/pages/agent-list/agent-list", // 智能体
     "/pages/mine/mine", // 我的
   ];
-  return tabPageList.includes(url);
+  return tabPageList.includes(path);
+};
+
+/** 统一页面 route 为带前导 / 的 path（忽略 query） */
+export function normalizePageRoute(route: string): string {
+  if (route.length == 0) {
+    return "";
+  }
+  const pathOnly = tabPathOnly(route);
+  return pathOnly.indexOf("/") == 0 ? pathOnly : `/${pathOnly}`;
+}
+
+/**
+ * 页面栈上一页是否与 backUrl 指向同一路由（仅比 path）。
+ * 用于搜索/WebView 取消：栈深 >1 但上一页可能是 Tab 首页而非应用页，不可盲目 navigateBack。
+ */
+export function isPreviousPageRoute(backUrl: string): boolean {
+  const pages = getCurrentPages();
+  if (pages.length <= 1) {
+    return false;
+  }
+  const prev = pages[pages.length - 2];
+  if (prev == null) {
+    return false;
+  }
+  const prevRoute = normalizePageRoute(`${prev.route}`);
+  const targetPath = normalizePageRoute(backUrl);
+  return prevRoute.length > 0 && prevRoute == targetPath;
+}
+
+/**
+ * App 显式 hideTabBar 后，回到 Tab 页必须再 show，否则底栏会一直消失。
+ * （常驻聊天关壳回分包时 restoreTabBar=false，从收藏/搜索再回「我的」会踩中。）
+ */
+export function ensureAppTabBarVisible(): void {
+  // #ifdef APP
+  try {
+    uni.showTabBar({ animation: false });
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * 搜索/ WebView「取消」回跳：Tab 页用 switchTab 并恢复 TabBar；
+ * 非 Tab 用 redirectTo。
+ *
+ * App 常驻聊天从搜索打开时会 hideTabBar，关壳回搜索时故意不恢复（避免 TabBar 闪到分包上）；
+ * 因此离开搜索回到 Tab 时必须显式 showTabBar，否则会出现「回到某 Tab 但底栏消失」。
+ */
+export function navigateBackByBackUrl(toUrl: string): void {
+  let target = toUrl;
+  if (target.length == 0) {
+    target = "/pages/index/index";
+  }
+  const pathOnly = tabPathOnly(target);
+  if (isTabPage(pathOnly)) {
+    ensureAppTabBarVisible();
+    uni.switchTab({ url: pathOnly });
+    return;
+  }
+  uni.redirectTo({ url: target });
 };

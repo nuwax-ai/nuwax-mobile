@@ -1,0 +1,542 @@
+/**
+ * iOS 常驻聊天 web-view 壳控制器（仅 iOS 使用；Android / 鸿蒙走 zhuoda 独立页逻辑）。
+ *
+ * 根治 DCloud #32215 / iOS 26 WKWebView 进出会话闪退：
+ * 崩溃 = 销毁 web-view × 活跃 history/BFL。业务侧规避 = 永不销毁页面级 WKWebView，
+ * 仅 show/hide + 同实例内换 H5 地址。
+ *
+ * 仅被 APP-IOS 分支代码引用；非 App（H5 / 小程序）不使用本模块。
+ *
+ * 从搜索 / 智能体等非首页进入时会 switchTab 到首页开壳。各 Tab 有独立页面栈：
+ * 源 Tab（如智能体）上的搜索页通常仍保留。关壳时应先 switchTab 回源 Tab；
+ * 若栈顶已是来源页则直接卸壳，切勿再 navigateTo，否则会叠一层空页面（关键词/列表丢失，取消错乱）。
+ * 仅当源页已被清掉时，才 navigateTo 重建。
+ */
+import { getApiBaseUrl } from "@/constants/config";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { buildQueryParams, getCurrentPageFullPath } from "@/utils/common";
+import { getStatusBarHeight } from "@/utils/system.uts";
+
+/** uni.$emit / $on 事件名：首页壳组件监听 */
+export const RESIDENT_CHAT_EVENT: string = "nuwax:resident-chat";
+
+/** 首页打开过程白遮罩（switchTab 前就置位，避免露出首页内容） */
+export const RESIDENT_CHAT_COVER_EVENT: string = "nuwax:resident-chat-cover";
+
+/** 打开参数（pending：从其它 Tab switchTab 回首页后再消费） */
+let pendingAgentId: string = "";
+let pendingConversationId: string = "";
+let hasPendingOpen: boolean = false;
+/** 壳是否可见（供首页 onBackPress / 其它原生逻辑查询） */
+let shellVisibleFlag: boolean = false;
+/**
+ * 打开聊天过渡遮罩：从点列表到壳揭开之间为 true。
+ * 首页据此盖白底，避免先看到对话 Tab 内容。
+ */
+let coverActiveFlag: boolean = false;
+/**
+ * 壳内当前已加载的会话（按 agentId + conversationId，忽略 URL 上的 _rs 时间戳）。
+ * 用于「再次进入同一会话」只揭开、不整页重载，避免先闪旧页/白屏再渲染。
+ */
+let loadedAgentId: string = "";
+let loadedConversationId: string = "";
+/**
+ * 隐藏壳后要回到的页面（打开前捕获）。
+ * 空字符串 = 从首页打开，隐藏后留在首页。
+ */
+let returnAfterHideUrl: string = "";
+/**
+ * 打开聊天前栈为 [Tab, 分包页] 时，关壳应先 switchTab 回该 Tab。
+ * 栈顶若仍是来源分包页则只卸壳；已被清掉时再 navigateTo 重建。
+ */
+let returnViaTabUrl: string = "";
+
+export function isResidentChatVisible(): boolean {
+  return shellVisibleFlag;
+}
+
+export function setResidentChatVisibleFlag(visible: boolean): void {
+  shellVisibleFlag = visible;
+}
+
+/**
+ * 首页 onBackPress 代理：壳组件注册「有弹窗先关、否则关壳/history.back」。
+ * 组件级 onBackPress 不可靠，故由 pages/index 调用本函数。
+ */
+type ResidentChatBackHandler = () => boolean;
+let residentChatBackHandler: ResidentChatBackHandler | null = null;
+
+export function setResidentChatBackHandler(
+  handler: ResidentChatBackHandler | null,
+): void {
+  residentChatBackHandler = handler;
+}
+
+/**
+ * @returns true 表示已消费返回（拦截系统左滑/返回键）；false 走默认行为
+ */
+export function handleResidentChatBackPress(): boolean {
+  if (shellVisibleFlag != true) {
+    return false;
+  }
+  const handler = residentChatBackHandler;
+  if (handler != null) {
+    return handler();
+  }
+  hideResidentChat();
+  return true;
+}
+
+export function isResidentChatCoverActive(): boolean {
+  return coverActiveFlag;
+}
+
+/**
+ * 是否与壳内已加载会话相同（忽略 _rs nonce）。
+ */
+export function isSameResidentChatSession(
+  agentId: string,
+  conversationId: string,
+): boolean {
+  if (loadedAgentId.length == 0) {
+    return false;
+  }
+  return loadedAgentId == agentId && loadedConversationId == conversationId;
+}
+
+/**
+ * 壳打开/换会话成功后记录当前会话。
+ */
+export function rememberResidentChatSession(
+  agentId: string,
+  conversationId: string,
+): void {
+  loadedAgentId = agentId;
+  loadedConversationId = conversationId;
+}
+
+/**
+ * 开关首页过渡遮罩（同步 + 事件，供 index 在 switchTab 前/后保持盖住）。
+ */
+export function setResidentChatCoverActive(active: boolean): void {
+  if (coverActiveFlag == active) {
+    return;
+  }
+  coverActiveFlag = active;
+  uni.$emit(RESIDENT_CHAT_COVER_EVENT, active);
+}
+
+function hideTabBarSafe(): void {
+  try {
+    uni.hideTabBar({ animation: false });
+  } catch (_e) {
+    // ignore
+  }
+}
+
+/**
+ * 拼接内嵌 H5 聊天地址（与历史 agent-detail onLoad 一致）。
+ *
+ * 注意：H5 为 hash 路由。Android WebView 在仅变更 `#/...` 时经常**不重新加载**文档，
+ * 常驻壳换会话会一直停在第一次打开的页面。因此在 hash 前加一次性 `_rs` query，
+ * 强制文档级导航；H5 路由仍只读 hash，不受影响。
+ * 勿改用 SPA soft-nav / idle 预热隐藏 web-view：Android 原生层常无视 CSS 显隐，会盖住首页。
+ */
+export function buildResidentChatH5Url(
+  agentId: string,
+  conversationId: string,
+): string {
+  const navNonce = `${Date.now()}`;
+  let webUrl = `${getApiBaseUrl()}/m/?_rs=${navNonce}#/subpackages/pages/agent-detail/agent-detail?id=${agentId}`;
+  if (conversationId.length > 0) {
+    webUrl = `${webUrl}&conversationId=${conversationId}`;
+  }
+  webUrl = `${webUrl}&statusBarHeight=${getStatusBarHeight()}`;
+  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+  const accessToken = tokenRaw != null ? `${tokenRaw}` : "";
+  if (accessToken.length > 0) {
+    webUrl = `${webUrl}&accessToken=${encodeURIComponent(accessToken)}`;
+  }
+  return webUrl;
+}
+
+function isCurrentPageIndex(): boolean {
+  const pages = getCurrentPages();
+  if (pages.length == 0) {
+    return false;
+  }
+  const cur = pages[pages.length - 1];
+  if (cur == null) {
+    return false;
+  }
+  const route = `${cur.route}`;
+  return route.indexOf("pages/index/index") >= 0;
+}
+
+function isAppTabPath(path: string): boolean {
+  return (
+    path == "/pages/index/index" ||
+    path == "/pages/agent-list/agent-list" ||
+    path == "/pages/agent-union-record/agent-union-record" ||
+    path == "/pages/terminal/terminal" ||
+    path == "/pages/mine/mine"
+  );
+}
+
+/**
+ * 从页面实例拼完整 path+query（关壳回搜索时必须带上 backUrl，否则取消会误回首页）。
+ * UTS：参数必须是 UniPage，勿用 any，否则 .route / .options 编译报「找不到名称」。
+ */
+function buildFullPathFromPage(page: UniPage | null): string {
+  if (page == null) {
+    return "";
+  }
+  const route = `${page.route}`;
+  if (route.length == 0) {
+    return "";
+  }
+  let url = `/${route}`;
+  try {
+    const opts = page.options;
+    if (opts == null) {
+      return url;
+    }
+    const query = buildQueryParams(opts);
+    if (query.length > 0) {
+      url = `${url}${query}`;
+    }
+  } catch (_eBuild) {
+    // ignore
+  }
+  return url;
+}
+
+/** 取页面 route 的 path 部分（不含 query） */
+function tabPathFromPage(page: UniPage | null): string {
+  if (page == null) {
+    return "";
+  }
+  const route = `${page.route}`;
+  if (route.length == 0) {
+    return "";
+  }
+  return `/${route}`;
+}
+
+/**
+ * 当前栈顶 path 是否与目标 url（可带 query）的 path 一致。
+ * 关壳时判断源 Tab 栈是否仍留着搜索页。
+ */
+function isTopPageMatchingReturnUrl(targetUrl: string): boolean {
+  const pages = getCurrentPages();
+  if (pages.length == 0 || targetUrl.length == 0) {
+    return false;
+  }
+  const cur = pages[pages.length - 1];
+  const curPath = tabPathFromPage(cur);
+  if (curPath.length == 0) {
+    return false;
+  }
+  const q = targetUrl.indexOf("?");
+  let pathOnly = q >= 0 ? targetUrl.substring(0, q) : targetUrl;
+  if (pathOnly.length == 0) {
+    return false;
+  }
+  if (pathOnly.charAt(0) != "/") {
+    pathOnly = `/${pathOnly}`;
+  }
+  return curPath == pathOnly;
+}
+
+/**
+ * 若打开聊天前为 [Tab, 当前页]，记下 Tab path，供关壳时先回 Tab。
+ */
+function captureReturnViaTab(pages: UniPage[], returnUrl: string): void {
+  returnViaTabUrl = "";
+  if (returnUrl.length == 0 || pages.length < 2) {
+    return;
+  }
+  const q = returnUrl.indexOf("?");
+  const pathOnly = q >= 0 ? returnUrl.substring(0, q) : returnUrl;
+  if (isAppTabPath(pathOnly)) {
+    return;
+  }
+  const prev = pages[pages.length - 2];
+  const prevPath = tabPathFromPage(prev);
+  if (prevPath.length > 0 && isAppTabPath(prevPath)) {
+    returnViaTabUrl = prevPath;
+  }
+}
+
+/**
+ * switchTab 前记下真正来源页（排除首页、agent-detail 中转页）。
+ */
+function captureReturnPageBeforeSwitch(): void {
+  returnViaTabUrl = "";
+  if (isCurrentPageIndex()) {
+    returnAfterHideUrl = "";
+    return;
+  }
+  const pages = getCurrentPages();
+  if (pages.length == 0) {
+    returnAfterHideUrl = "";
+    return;
+  }
+  const cur = pages[pages.length - 1];
+  if (cur == null) {
+    returnAfterHideUrl = "";
+    return;
+  }
+  const curRoute = `${cur.route}`;
+  // agent-detail 中转页：返回上一页完整 path+query（搜索页必须保留 backUrl）
+  if (curRoute.indexOf("agent-detail") >= 0) {
+    if (pages.length < 2) {
+      returnAfterHideUrl = "";
+      return;
+    }
+    const prev = pages[pages.length - 2];
+    if (prev == null) {
+      returnAfterHideUrl = "";
+      return;
+    }
+    const prevRoute = `${prev.route}`;
+    if (prevRoute.length == 0 || prevRoute.indexOf("pages/index/index") >= 0) {
+      returnAfterHideUrl = "";
+      return;
+    }
+    returnAfterHideUrl = buildFullPathFromPage(prev);
+    captureReturnViaTab(pages, returnAfterHideUrl);
+    return;
+  }
+  // 优先用页面实例拼 URL，避免 getCurrentPageFullPath 丢 options 导致回搜索后 backUrl 为空
+  returnAfterHideUrl = buildFullPathFromPage(cur);
+  if (returnAfterHideUrl.length == 0) {
+    returnAfterHideUrl = getCurrentPageFullPath();
+  }
+  if (returnAfterHideUrl.indexOf("/pages/index/index") == 0) {
+    returnAfterHideUrl = "";
+    return;
+  }
+  captureReturnViaTab(pages, returnAfterHideUrl);
+}
+
+/**
+ * 通知壳隐藏。restoreTabBar：回 Tab/留在首页时 true；回搜索等分包页时 false（避免 TabBar 闪到分包上）。
+ */
+function emitHideShell(restoreTabBar: boolean): void {
+  const payload = new UTSJSONObject();
+  payload["action"] = "hide";
+  payload["restoreTabBar"] = restoreTabBar;
+  uni.$emit(RESIDENT_CHAT_EVENT, payload);
+}
+
+function clearCoverSoon(): void {
+  setTimeout((): void => {
+    setResidentChatCoverActive(false);
+  }, 120);
+}
+
+/** navigateTo / redirectTo 分包页，成功后卸壳 */
+function navigateToReturnSubpackage(url: string): void {
+  uni.navigateTo({
+    url: url,
+    success: (_resNav: any | null) => {
+      emitHideShell(false);
+      clearCoverSoon();
+    },
+    fail: (_eNav: any | null) => {
+      uni.redirectTo({
+        url: url,
+        success: (_resRed: any | null) => {
+          emitHideShell(false);
+          clearCoverSoon();
+        },
+        fail: (_eRed: any | null) => {
+          emitHideShell(true);
+          setResidentChatCoverActive(false);
+        },
+      });
+    },
+  });
+}
+
+/**
+ * 先跳回源页（壳仍盖住首页），成功后再卸壳 —— 避免左滑/返回先闪首页。
+ */
+function navigateThenHideShell(): void {
+  const url = returnAfterHideUrl;
+  const tabUrl = returnViaTabUrl;
+  returnAfterHideUrl = "";
+  returnViaTabUrl = "";
+  if (url.length == 0) {
+    emitHideShell(true);
+    setResidentChatCoverActive(false);
+    return;
+  }
+  setResidentChatCoverActive(true);
+  const q = url.indexOf("?");
+  const pathOnly = q >= 0 ? url.substring(0, q) : url;
+  if (isAppTabPath(pathOnly)) {
+    uni.switchTab({
+      url: pathOnly,
+      success: (_res: any | null) => {
+        emitHideShell(true);
+        clearCoverSoon();
+      },
+      fail: (_e: any | null) => {
+        emitHideShell(true);
+        setResidentChatCoverActive(false);
+      },
+    });
+    return;
+  }
+  if (tabUrl.length > 0) {
+    uni.switchTab({
+      url: tabUrl,
+      success: (_resTab: any | null) => {
+        // 源 Tab 栈通常仍保留搜索页：直接卸壳，保留关键词与列表，避免叠一层空搜索。
+        if (isTopPageMatchingReturnUrl(url)) {
+          emitHideShell(false);
+          clearCoverSoon();
+          return;
+        }
+        navigateToReturnSubpackage(url);
+      },
+      fail: (_eTab: any | null) => {
+        navigateToReturnSubpackage(url);
+      },
+    });
+    return;
+  }
+  navigateToReturnSubpackage(url);
+}
+
+function emitOpen(agentId: string, conversationId: string): void {
+  const payload = new UTSJSONObject();
+  payload["action"] = "open";
+  payload["agentId"] = agentId;
+  payload["conversationId"] = conversationId;
+  payload["url"] = buildResidentChatH5Url(agentId, conversationId);
+  uni.$emit(RESIDENT_CHAT_EVENT, payload);
+}
+
+/**
+ * 打开（或切换）常驻聊天壳。
+ * - 已在首页：直接 emit open（返回时留在首页）
+ * - 其它 Tab / 页面：记下返回地址，再 switchTab 回首页开壳
+ */
+export function openResidentChat(
+  agentId: number,
+  conversationId: number | null = null,
+): void {
+  const id = `${agentId}`;
+  if (id.length == 0 || id == "0") {
+    return;
+  }
+  const conv = conversationId != null ? `${conversationId}` : "";
+  pendingAgentId = id;
+  pendingConversationId = conv;
+  hasPendingOpen = true;
+  const sameSession = isSameResidentChatSession(id, conv);
+  hideTabBarSafe();
+  if (isCurrentPageIndex()) {
+    returnAfterHideUrl = "";
+    hasPendingOpen = false;
+    // 已在首页且同会话：直接揭开，勿先盖白遮罩再闪一下
+    if (!sameSession) {
+      setResidentChatCoverActive(true);
+    }
+    emitOpen(id, conv);
+    return;
+  }
+  // 跨 Tab / 分包回首页：过渡期仍盖白底，避免露出对话 Tab
+  setResidentChatCoverActive(true);
+  captureReturnPageBeforeSwitch();
+  // 只 switchTab 一次；success 里 flush，避免仅依赖 onShow 时序
+  uni.switchTab({
+    url: "/pages/index/index",
+    success: (_res: any | null) => {
+      flushPendingResidentChat();
+    },
+    fail: (_err: any | null) => {
+      hasPendingOpen = false;
+      setResidentChatCoverActive(false);
+      emitOpen(id, conv);
+    },
+  });
+}
+
+/**
+ * 首页 onShow 调用：消费跨 Tab 打开的 pending。
+ */
+export function flushPendingResidentChat(): void {
+  if (!hasPendingOpen) {
+    return;
+  }
+  hasPendingOpen = false;
+  emitOpen(pendingAgentId, pendingConversationId);
+}
+
+/**
+ * 关壳前：若即将回到非首页，先盖白遮罩（navigate 前同步调用）。
+ */
+export function prepareResidentChatReturnCover(): void {
+  if (returnAfterHideUrl.length > 0) {
+    setResidentChatCoverActive(true);
+  }
+}
+
+/**
+ * 隐藏常驻壳；若从搜索等进入则先跳回再卸壳。
+ */
+export function hideResidentChat(): void {
+  prepareResidentChatReturnCover();
+  navigateThenHideShell();
+}
+
+/**
+ * 原生侧 app-exit：先跳回源页再卸壳（壳先留着盖住首页）。
+ */
+export function navigateAfterResidentChatHidden(): void {
+  prepareResidentChatReturnCover();
+  navigateThenHideShell();
+}
+
+/** 清空模块级 pending / 会话 / 遮罩（logout 前调用，避免 reLaunch 后 stale 状态）。 */
+function resetResidentChatModuleState(): void {
+  pendingAgentId = "";
+  pendingConversationId = "";
+  hasPendingOpen = false;
+  shellVisibleFlag = false;
+  loadedAgentId = "";
+  loadedConversationId = "";
+  returnAfterHideUrl = "";
+  returnViaTabUrl = "";
+  setResidentChatCoverActive(false);
+}
+
+/**
+ * 退出登录 / 踢登录前：通知首页壳 blank + 销毁 WKWebView，并等待 WebKit 释放。
+ *
+ * 登录态内进出聊天刻意不销毁 web-view（规避 #32215）；但 logout 的 reLaunch 仍会拆掉
+ * Tab 栈上的首页。若不在 reLaunch 前主动 teardown，聊天 WKWebView 带着 H5 history 被
+ * 系统强杀，下次登录再建验证码 web-view 时 iOS 易立刻崩溃。
+ */
+export function teardownResidentChatForLogout(): Promise<void> {
+  resetResidentChatModuleState();
+  const payload = new UTSJSONObject();
+  payload["action"] = "teardown";
+  uni.$emit(RESIDENT_CHAT_EVENT, payload);
+  return new Promise<void>((resolve, _reject) => {
+    let delayMs = 280;
+    // #ifdef APP-IOS
+    delayMs = 520;
+    // #endif
+    // #ifdef APP-HARMONY
+    delayMs = 420;
+    // #endif
+    setTimeout((): void => {
+      resolve();
+    }, delayMs);
+  });
+}

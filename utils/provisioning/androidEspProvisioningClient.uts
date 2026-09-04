@@ -25,6 +25,7 @@ import {
   connectNativeEspDevice,
   disconnectNativeEspDevice,
   disposeNativeEspProvisioning,
+  ensureNativeEspPermissions,
   getNativeEspCapabilities,
   getNativeEspDeviceInfo,
   initializeNativeEspProvisioning,
@@ -34,6 +35,13 @@ import {
   startNativeEspScan,
   stopNativeEspScan,
 } from '@/uni_modules/nuwax-esp-provisioning';
+import {
+  androidBleEnvironmentSummary,
+  androidBleScanNeedsLocation,
+  hasAndroidBluetoothAdapter,
+  isAndroidBluetoothEnabled,
+  isAndroidLocationEnabled,
+} from '@/utils/provisioning/androidBleEnvironment';
 import { ESP_PROV_QR_CONNECT_TIMEOUT_MS } from '@/constants/espProvisioning.constants';
 
 function jsonString(obj: UTSJSONObject, key: string): string {
@@ -75,7 +83,12 @@ export class AndroidEspProvisioningClient implements EspProvisioningClient {
         (_value: string) => {
           this.initialized = true;
           this.disposed = false;
-          this.log('info', 'android_provider_initialized', 'lib-2.4.4');
+          this.log('info', 'android_provider_initialized', `lib-2.4.4 ${androidBleEnvironmentSummary()}`);
+          const blocked = this.preflight();
+          if (blocked != null) {
+            reject(blocked!!);
+            return;
+          }
           resolve();
         },
         (code: string, message: string) => reject(this.error(code, message)),
@@ -83,11 +96,43 @@ export class AndroidEspProvisioningClient implements EspProvisioningClient {
     });
   }
 
+  /** 入口页预请求蓝牙权限（不创建桥）；失败由入口页静默吞掉，正式流程会再次校验。 */
+  ensurePermissions(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      ensureNativeEspPermissions(
+        (_value: string) => resolve(),
+        (code: string, message: string) => reject(this.error(code, message)),
+      );
+    });
+  }
+
+  /**
+   * 扫描前的运行环境预检：蓝牙主开关关闭时乐鑫库只会静默回调 scanStartFailed，
+   * 业务层拿到的错误与「附近没有设备」难以区分，因此提前拦截并给出确定的错误码。
+   * 华为 / 鸿蒙机型常见：系统把适配器留在 BLE_ON 底座状态，用户以为蓝牙是开的。
+   */
+  private preflight(): EspProvisioningError | null {
+    if (!hasAndroidBluetoothAdapter()) {
+      return this.error('UNSUPPORTED', '当前设备没有可用的蓝牙适配器');
+    }
+    if (!isAndroidBluetoothEnabled()) {
+      return this.error('BLUETOOTH_OFF', '手机蓝牙未开启，无法搜索配网设备');
+    }
+    // 位置信息总开关只在「扫描窗口超时、一个广播都没收到」时作为归因提示（见 connectFromQr），
+    // 这里不拦截：该机型是否真的需要定位尚无真机确证，硬拦会误伤本可成功的配网。
+    return null;
+  }
+
   startScan(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const config = this.config;
       if (!this.initialized || config == null || this.disposed) {
         reject(this.error('SCAN_FAILED', 'Android Provider 尚未初始化'));
+        return;
+      }
+      const blocked = this.preflight();
+      if (blocked != null) {
+        reject(blocked!!);
         return;
       }
       startNativeEspScan(
@@ -121,12 +166,30 @@ export class AndroidEspProvisioningClient implements EspProvisioningClient {
         reject(this.error('CONNECT_FAILED', 'Android Provider 尚未初始化'));
         return;
       }
+      const blocked = this.preflight();
+      if (blocked != null) {
+        reject(blocked!!);
+        return;
+      }
+      // 扫码页可能由上一轮 WiFi 页返回；先清理遗留扫描和 GATT，确保本轮只有一个扫描会话。
+      stopNativeEspScan();
+      disconnectNativeEspDevice();
       this.progress(EspProvisioningPhaseEnum.CONNECTING, `qr:${qr.name}`);
       let settled = false;
       const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
         stopNativeEspScan();
+        // 扫描窗口内一个广播都没收到时，先区分「环境不允许扫」和「设备真的不在」：
+        // 蓝牙被中途关掉、或华为这类必须开位置信息的 ROM 关着定位，扫描是静默无结果的。
+        if (!isAndroidBluetoothEnabled()) {
+          reject(this.error('BLUETOOTH_OFF', '搜索期间蓝牙被关闭，请开启蓝牙后重试'));
+          return;
+        }
+        if (androidBleScanNeedsLocation() && !isAndroidLocationEnabled()) {
+          reject(this.error('LOCATION_OFF', `未搜索到 ${qr.name}；该机型关闭位置信息时可能收不到蓝牙广播`));
+          return;
+        }
         reject(this.error('DEVICE_NOT_FOUND', `按二维码名称 ${qr.name} 未找到设备，请在设备上点击 BLE 配网按钮后重试`));
       }, ESP_PROV_QR_CONNECT_TIMEOUT_MS) as number;
       startNativeEspScan(
@@ -152,6 +215,7 @@ export class AndroidEspProvisioningClient implements EspProvisioningClient {
           if (settled) return;
           settled = true;
           clearTimeout(timeoutId);
+          stopNativeEspScan();
           reject(this.error(code, message));
         },
       );
@@ -321,12 +385,19 @@ export class AndroidEspProvisioningClient implements EspProvisioningClient {
     if (this.logCb != null) this.logCb!!(level, event, detail);
   }
 
+  /**
+   * 构造错误的同时经日志通道上报一次错误码。
+   * UTS/Android 下 Promise reject 的对象穿过 await 的 any 边界后 instanceof 判定会失效，
+   * 上层只能拿到 UNKNOWN；这条 error 级日志是错误码的可靠副本（见 useEspProvisioning.asEspError）。
+   */
   private error(code: string, message: string): EspProvisioningError {
+    this.log('error', code, message);
     return new EspProvisioningError(this.errorCode(code), message, `android:${code}`);
   }
 
   private errorCode(code: string): EspProvisioningErrorCodeEnum {
     if (code == 'BLUETOOTH_OFF') return EspProvisioningErrorCodeEnum.BLUETOOTH_OFF;
+    if (code == 'LOCATION_OFF') return EspProvisioningErrorCodeEnum.LOCATION_OFF;
     if (code == 'NO_PERMISSION') return EspProvisioningErrorCodeEnum.NO_PERMISSION;
     if (code == 'SCAN_FAILED') return EspProvisioningErrorCodeEnum.SCAN_FAILED;
     if (code == 'DEVICE_NOT_FOUND') return EspProvisioningErrorCodeEnum.DEVICE_NOT_FOUND;

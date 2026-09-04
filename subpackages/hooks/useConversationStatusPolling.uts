@@ -2,37 +2,172 @@
  * 会话状态轮询（sub 流式恢复用）
  *
  * 用途:会话页持续轮询会话状态(taskStatus),一旦发现 EXECUTING(刷新页面后 / 定时任务 /
- * 其它入口触发同一会话)且非本地流式、未已订阅 sub,回调 onExecuting 让上层恢复 sub 流。
- * 与 PC useConversationStreamResume 的轮询部分对齐(不考虑多页签,简化版)。
+ * 其它端同会话发消息)且非本地流式、未已订阅 sub,回调 onExecuting 让上层恢复 sub 流。
  *
- * 暂停条件(对齐 PC):会话执行中(本地流式 / sub 已订阅) 或 页面不可见。
+ * 本地忙(live 流式 / 已订阅 sub)时进入「静默终态轮询」:仍每 5s 探测,但只用于检测任务被
+ * 他端结束/暂停(非 EXECUTING → onTerminalWhileBusy 强制收尾);不判用户门禁、不加速、
+ * 不触发 sub,避免本地接管本轮时空转(语音刚发送、服务端本轮用户句尚未落库等)。
+ * 高频连续发送保护：终态须「连续两轮」观察到才回调（详见 pendingTerminalObserved），
+ * 单轮终态可能是上一轮任务被打断后的陈旧回包，不能据此掐断新一轮流。
+ * 语音播报不挡轮询（App 开会话后 H5 续接时，播报中也要能检出 EXECUTING）。
  * - H5:visibilitychange 自动暂停/恢复
  * - 小程序/App:chat-conversation-component 内 onShow/onHide 调 resume/pause
  *
- * 使用:
- * - 会话页 onLoad: startConversationPolling(...)
- * - 会话页 onUnload/onUnmounted: destroyConversationPolling()
+ * 本轮用户门禁见 subResumeGate.uts（与 handleSubConversation 共用，四端一致）。
+ *
+ * 竞态防护：发送入口同步 bumpPollGeneration()，在途回包代际不符时整段丢弃
+ * （对齐 PC useConversationStreamResume 的 poll generation 修复）。
  */
 import { apiAgentConversation } from '@/servers/conversation';
 import { SUCCESS_CODE } from '@/constants/codes.constants';
 import { TaskStatus } from '@/types/enums/agent';
+import { apiResCode, apiResData } from '@/utils/apiResponse';
+import { RequestResponse } from '@/types/interfaces/request';
+import { ConversationInfo } from '@/types/interfaces/conversationInfo';
+import {
+  describeTurnUserGate,
+  isTurnUserReadyFromRawMessageList,
+} from '@/subpackages/utils/subResumeGate.uts';
 
-// 轮询间隔(ms),与 PC GLOBAL_POLLING_INTERVAL 一致
+/** 常态轮询间隔 */
 const POLLING_INTERVAL = 5000;
+/** EXECUTING 但本轮用户未就绪时的加速间隔（控制负载，取 2–3s 中位） */
+const POLLING_INTERVAL_WAITING_USER = 2500;
+/**
+ * 加速轮询最多连续次数；超出后回到 5s，避免门禁长期不过时一直密打详情接口。
+ * 6 × 2.5s ≈ 15s 覆盖语音/跨端用户落库短窗。
+ */
+const MAX_FAST_POLLS_WHILE_WAITING_USER = 6;
 
-// 轮询定时器 ID
 let pollingTimerId: number | null = null;
-// 是否正在处理(避免并发)
 let isProcessing = false;
-// 是否已初始化 H5 可见性监听
 let isVisibilityListenerInitialized = false;
+/** 当前定时器间隔；等待用户时切到更快间隔 */
+let currentPollingInterval = POLLING_INTERVAL;
+/** 本轮 EXECUTING 门禁未过期间，已使用的加速轮询次数 */
+let waitingUserFastPollCount = 0;
 
-// 当前轮询的会话配置
 let currentConversationId = 0;
-let onExecutingCallback: ((id: number) => void) | null = null;
-// 状态 getter(由外部注入,避免闭包过期)
+/** 最近一次触发 onExecuting 续接的时刻：sub 关闭后重启轮询据此进入冷却 */
+let lastOnExecutingTime = 0;
+/**
+ * 轮询代际（对齐 PC pollGeneration）：发送入口同步 bump，
+ * 在途旧回包整段丢弃，避免误开 sub 续接或过期终态误触 onTerminalWhileBusy。
+ */
+let pollGeneration = 0;
+/**
+ * 续接重启冷却：sub 刚失败/关闭（onSubClose）会立即走到 startConversationPolling，
+ * 而该函数会同步 pollOnce → 立即续接 → 立即失败 → 再重启，形成无间隔自激循环。
+ * 冷却期内跳过「立即 pollOnce」，让循环退回到 interval 间隔（常态 5s）。
+ */
+const RESTART_COOLDOWN_MS = 3000;
+/**
+ * EXECUTING 回调：参数二为本次轮询拉到的全量详情响应（UTSJSONObject），
+ * 供页面把「刚拉的新鲜详情」直接透传给 handleSubConversation 复用，
+ * 跳过续接时的二次全量请求（轮询本身没重建 messageList，sub 需据此重建）。
+ */
+let onExecutingCallback:
+  | ((id: number, response: RequestResponse<ConversationInfo> | null) => void)
+  | null = null;
 let isConversationActiveGetter: (() => boolean) | null = null;
 let isSubscribedGetter: (() => boolean) | null = null;
+/**
+ * 流代数 getter：pollOnce await 详情期间本地可能已触发新一轮（用户新发送），
+ * 代数增长则响应是发起时刻的旧快照，不得据此续接或强制收尾（误掐刚发送的流 →
+ * loading 消失 → 续接又出现）。sub 续接不改代数，复用同一轮。
+ */
+let streamGenerationGetter: (() => number | null) | null = null;
+/**
+ * 保持态 getter：live/sub fail 后本地保持「需恢复」（loading 不消失、busy 判定放行），
+ * 轮询读到终态时须据此收尾关态，否则保持态失去出口（loading 一直转）。
+ */
+let isResumePendingGetter: (() => boolean) | null = null;
+/** 终态回调：本地流式/sub 期间轮询发现任务已结束（他端结束/暂停）时通知页面强制收尾。 */
+let onTerminalWhileBusyCallback: ((id: number) => void) | null = null;
+/**
+ * 终态「两轮确认」：本地忙时单次终态响应可能是上一轮任务的陈旧回包
+ * （高频连续发送：新 send abort 旧 SSE → 服务端旧任务被打断成终态，
+ * 而本轮 GET 可能早于新任务注册发出）。须连续两轮都观察到终态才回调，
+ * 否则一轮陈旧终态就会误杀刚启动的新一轮流式。
+ */
+let pendingTerminalObserved = false;
+let pendingTerminalCid = 0;
+
+/**
+ * 规范化 taskStatus（App 可能是字符串 / 带 value 的对象）。
+ */
+function normalizeTaskStatus(val: any | null): string {
+  if (val == null) {
+    return '';
+  }
+  let raw: any | null = val;
+  try {
+    const obj = val as UTSJSONObject;
+    const nested = obj['value'];
+    if (nested != null) {
+      raw = nested;
+    }
+  } catch (_e) {
+    // not object
+  }
+  return `${raw}`;
+}
+
+/**
+ * 本地开始发送消息时同步递增轮询代际（发送入口 isConversationActive=true 同一调用栈调用）。
+ * 代际变化后，此前在途的轮询回包将被 pollOnce 整段丢弃（不写终态、不触发 onExecuting）。
+ */
+export function bumpPollGeneration(): void {
+  pollGeneration = pollGeneration + 1;
+  // 新发送同时作废已武装的终态「两轮确认」：上一轮观察到的单次终态属于旧任务，
+  // 不得计入新一轮的确认（genChanged 只覆盖 poll 在途窗口内的发送，间隙发送靠这里补）。
+  pendingTerminalObserved = false;
+  pendingTerminalCid = 0;
+  // 与 discard stale poll result 成对出现即可自证竞态修复生效（对齐 PC cancel/discard 日志对）；
+  // 只有 bump 没有 discard 也算修复有效：说明发送时轮询本就不在途。
+  console.log(
+    "[ConversationStatusPolling] bump: local send started gen=" +
+      `${pollGeneration}`,
+  );
+}
+
+/**
+ * 按目标间隔重启定时器（仅 interval 变化时）。
+ */
+function ensurePollingInterval(intervalMs: number): void {
+  if (currentPollingInterval == intervalMs && pollingTimerId != null) {
+    return;
+  }
+  currentPollingInterval = intervalMs;
+  if (pollingTimerId != null) {
+    clearInterval(pollingTimerId!);
+    pollingTimerId = null;
+  }
+  if (!currentConversationId) {
+    return;
+  }
+  pollingTimerId = setInterval((): void => {
+    pollOnce();
+  }, currentPollingInterval) as number;
+}
+
+/** 门禁通过 / 非 EXECUTING / 停止轮询时复位加速计数 */
+function resetWaitingUserFastPoll(): void {
+  waitingUserFastPollCount = 0;
+}
+
+/**
+ * EXECUTING 但用户未就绪：有限次加速，超出后回常态间隔。
+ */
+function scheduleWaitingUserPoll(): void {
+  if (waitingUserFastPollCount < MAX_FAST_POLLS_WHILE_WAITING_USER) {
+    waitingUserFastPollCount = waitingUserFastPollCount + 1;
+    ensurePollingInterval(POLLING_INTERVAL_WAITING_USER);
+    return;
+  }
+  // 加速额度用尽：回 5s，避免长时间密轮询
+  ensurePollingInterval(POLLING_INTERVAL);
+}
 
 /**
  * 执行一次轮询:查会话状态,EXECUTING + 非本地流式 + 未订阅 → onExecuting
@@ -40,22 +175,155 @@ let isSubscribedGetter: (() => boolean) | null = null;
 async function pollOnce(): Promise<void> {
   if (isProcessing) return;
   if (!currentConversationId) return;
-  // 本地流式(live SSE 在跑) or sub 已订阅(执行中) → 跳过(执行中不轮询)
-  if (isConversationActiveGetter != null && isConversationActiveGetter()) return;
-  if (isSubscribedGetter != null && isSubscribedGetter()) return;
+
+  // 先拷到局部再调用：UTS 可变属性不可 smart cast，且 ?.invoke 在 iOS 上可能调不到回调
+  const activeGetter = isConversationActiveGetter;
+  const busy = activeGetter != null && activeGetter() == true;
+  const subscribedGetter = isSubscribedGetter;
+  const subscribed = subscribedGetter != null && subscribedGetter() == true;
+  // 发起前快照：await 期间本地可能已触发新一轮（用户新发送 → 流代数 +1）。
+  // UTS 可变属性不可 smart cast，先拷局部再调用。
+  const genGetterSnapshot = streamGenerationGetter;
+  const genSnapshot = genGetterSnapshot != null ? genGetterSnapshot() : null;
+  // 保持态快照：fail 后本地保持「需恢复」（loading 不消失、busy 判定放行续接）
+  const resumePendingGetter = isResumePendingGetter;
+  const resumePending = resumePendingGetter != null && resumePendingGetter() == true;
 
   try {
     isProcessing = true;
+    // 请求发出时打戳代际：await 期间若本地已发消息（bumpPollGeneration），回包即过期
+    const requestGeneration = pollGeneration;
     const response = await apiAgentConversation(currentConversationId);
-    const data = response as any;
-    if (!data || data.code !== SUCCESS_CODE) return;
+    // 代际不一致 = 发送已在途/已接管本轮：旧回包整段丢弃（终态/onExecuting 都不许触发），
+    // 否则旧 EXECUTING 会误开 sub、旧终态会误触 onTerminalWhileBusy 掐死刚发出的新一轮。
+    if (requestGeneration != pollGeneration) {
+      console.log(
+        "[ConversationStatusPolling] discard stale poll result gen=" +
+          `${requestGeneration}` +
+          " cur=" +
+          `${pollGeneration}`,
+      );
+      return;
+    }
+    if (apiResCode(response) != SUCCESS_CODE) return;
 
-    const taskStatus = (data.data as any)?.taskStatus as string | undefined;
-    if (taskStatus === TaskStatus.EXECUTING) {
-      // 会话执行中 + 非本地流式 + 未订阅 → 恢复 sub 流
-      if (onExecutingCallback != null) {
-        onExecutingCallback(currentConversationId);
+    // await 后流代数：增长说明本地已接管新一轮，响应为发起时刻的旧快照，一律作废
+    const genGetterNow = streamGenerationGetter;
+    const genNow = genGetterNow != null ? genGetterNow() : null;
+    const genChanged = genSnapshot != null && genNow != null && genNow != genSnapshot;
+
+    const dataRaw = apiResData<any>(response);
+    if (dataRaw == null) return;
+    const dataObj = dataRaw as UTSJSONObject;
+    const taskStatusStr = normalizeTaskStatus(dataObj['taskStatus']);
+    if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
+      // 服务端已回到执行态：上一轮终态观察作废（可能是旧任务的陈旧回包）
+      pendingTerminalObserved = false;
+      pendingTerminalCid = 0;
+      // await 期间本地已触发新一轮（用户新发送）：旧响应不得续接 / 加速 / 进 fast poll，
+      // 等下一轮再按新状态判断。
+      if (genChanged == true) {
+        return;
       }
+      // 本地忙（live SSE 流式 / sub 已订阅）：本轮已由本地接管，进入「静默终态轮询」。
+      // 只保持 5s 探测（终态检测在下方非 EXECUTING 分支）；不判用户门禁、不加速、不触发 sub，
+      // 避免本地接管本轮时（语音刚发送、服务端本轮用户句尚未落库）空转「等待下次轮询」+ fast 加速。
+      if (busy == true || subscribed == true) {
+        resetWaitingUserFastPoll();
+        ensurePollingInterval(POLLING_INTERVAL);
+        return;
+      }
+      const rawMessageList = dataObj['messageList'];
+      if (isTurnUserReadyFromRawMessageList(rawMessageList) != true) {
+        console.log(
+          '[ConversationStatusPolling] EXECUTING 但本轮用户未进 messageList，等待下次轮询 ' +
+            describeTurnUserGate(rawMessageList) +
+            ' fast=' +
+            `${waitingUserFastPollCount}` +
+            '/' +
+            `${MAX_FAST_POLLS_WHILE_WAITING_USER}`,
+        );
+        scheduleWaitingUserPoll();
+        return;
+      }
+      // await 期间用户可能已发消息进入本地会话：再检一次，避免误开 sub 续接
+      const activeAfter = isConversationActiveGetter;
+      if (activeAfter != null && activeAfter() == true) {
+        return;
+      }
+      const subscribedAfter = isSubscribedGetter;
+      if (subscribedAfter != null && subscribedAfter() == true) {
+        return;
+      }
+      resetWaitingUserFastPoll();
+      ensurePollingInterval(POLLING_INTERVAL);
+      // 记录续接触发时刻：sub 关闭后 startConversationPolling / resume 据此进入冷却，
+      // 避免「续接失败 → 立即 pollOnce → 立即续接」的无间隔自激循环。
+      lastOnExecutingTime = Date.now();
+      const cb = onExecutingCallback;
+      if (cb != null) {
+        // 透传刚拉取的全量详情响应：续接可直接复用，避免 sub 前二次全量请求
+        cb(currentConversationId, response);
+      }
+    } else {
+      // 非 EXECUTING（终态：COMPLETE / FAILED / CANCEL）而本端仍认为在 live/sub 接收：
+      // 说明他端已结束 / 暂停任务，通知页面强制收尾。
+      // 空闲时不主动回调，避免旧轮询响应误中止刚开始的新会话。
+      //
+      // 陈旧回包防护（多套方案合并）：
+      // 1) await 期间本地已突变（代数增长 = 用户新发送 / 续接接管）→ 旧快照作废；
+      // 2) await 前空闲、await 后进入忙（本地刚接管）→ 旧快照作废；
+      // 3) 终态须连续两轮都观察到才回调（两轮确认），单轮陈旧终态不触发强制收尾。
+      if (genChanged == true) {
+        // 本地已开新一轮：本轮终态观察作废（含上一轮已武装的确认态）
+        pendingTerminalObserved = false;
+        pendingTerminalCid = 0;
+        return;
+      }
+      const activeAfterTerminal = isConversationActiveGetter;
+      const busyAfterTerminal =
+        activeAfterTerminal != null && activeAfterTerminal() == true;
+      const subscribedGetterAfterTerminal = isSubscribedGetter;
+      const subscribedAfterTerminal =
+        subscribedGetterAfterTerminal != null &&
+        subscribedGetterAfterTerminal() == true;
+      if (
+        (busy == false && busyAfterTerminal == true) ||
+        (subscribed == false && subscribedAfterTerminal == true)
+      ) {
+        // await 前空闲、await 后进入忙：本地刚接管（发送/续接），响应是旧快照
+        pendingTerminalObserved = false;
+        pendingTerminalCid = 0;
+        return;
+      }
+      // 保持态（fail 后等待续接）也算「本地在收流」：读到终态同样需要收尾关态，
+      // 否则保持态失去出口（loading 一直转、后端已结束无人关态）。
+      const busyNow =
+        busyAfterTerminal ||
+        subscribedAfterTerminal ||
+        resumePending == true;
+      if (busyNow != true) {
+        // 本地已空闲：无需强制收尾，确认态作废
+        pendingTerminalObserved = false;
+        pendingTerminalCid = 0;
+      } else if (
+        pendingTerminalObserved == true &&
+        pendingTerminalCid == currentConversationId
+      ) {
+        // 连续第二轮终态：确认强制收尾
+        pendingTerminalObserved = false;
+        pendingTerminalCid = 0;
+        const tcb = onTerminalWhileBusyCallback;
+        if (tcb != null) {
+          tcb(currentConversationId);
+        }
+      } else {
+        // 第一轮终态：仅记录，下一轮仍是终态才回调
+        pendingTerminalObserved = true;
+        pendingTerminalCid = currentConversationId;
+      }
+      resetWaitingUserFastPoll();
+      ensurePollingInterval(POLLING_INTERVAL);
     }
   } catch (error) {
     console.error('[ConversationStatusPolling] 轮询失败:', error);
@@ -64,9 +332,6 @@ async function pollOnce(): Promise<void> {
   }
 }
 
-/**
- * H5 页面可见性变化:不可见暂停,可见恢复
- */
 function handleVisibilityChange(): void {
   // #ifdef H5 || WEB
   if (document.hidden) {
@@ -92,28 +357,39 @@ function initVisibilityListener(): void {
  */
 export function startConversationPolling(
   conversationId: number,
-  onExecuting: (id: number) => void,
+  onExecuting: (id: number, response: RequestResponse<ConversationInfo> | null) => void,
   isConversationActive: () => boolean,
   isSubscribed: () => boolean,
+  onTerminalWhileBusy: (id: number) => void,
+  getStreamGeneration: (() => number | null) | null = null,
+  getIsResumePending: (() => boolean) | null = null,
 ): void {
-  // 停止旧轮询
   stopConversationPolling();
 
   currentConversationId = conversationId;
   onExecutingCallback = onExecuting;
   isConversationActiveGetter = isConversationActive;
   isSubscribedGetter = isSubscribed;
+  streamGenerationGetter = getStreamGeneration;
+  isResumePendingGetter = getIsResumePending;
+  onTerminalWhileBusyCallback = onTerminalWhileBusy;
+  currentPollingInterval = POLLING_INTERVAL;
+  resetWaitingUserFastPoll();
 
   initVisibilityListener();
 
   if (pollingTimerId !== null) return;
 
-  // 立即执行一次
-  pollOnce();
-
-  pollingTimerId = setInterval(() => {
+  // 冷却：sub 刚失败（onSubClose → 立即重启）时跳过立即 pollOnce，
+  // 让重试退回到 interval 间隔，避免自激紧密循环（pollOnce → 续接 → 失败 → 重启）。
+  const sinceLastExecuting = Date.now() - lastOnExecutingTime;
+  if (sinceLastExecuting >= RESTART_COOLDOWN_MS) {
     pollOnce();
-  }, POLLING_INTERVAL) as unknown as number;
+  }
+
+  pollingTimerId = setInterval((): void => {
+    pollOnce();
+  }, currentPollingInterval) as number;
 }
 
 /**
@@ -121,9 +397,14 @@ export function startConversationPolling(
  */
 export function stopConversationPolling(): void {
   if (pollingTimerId !== null) {
-    clearInterval(pollingTimerId);
+    clearInterval(pollingTimerId!);
     pollingTimerId = null;
   }
+  currentPollingInterval = POLLING_INTERVAL;
+  resetWaitingUserFastPoll();
+  // 停轮询即作废上一轮终态观察（切换会话 / 暂停 / 销毁后都从零重新确认）
+  pendingTerminalObserved = false;
+  pendingTerminalCid = 0;
 }
 
 /**
@@ -132,10 +413,14 @@ export function stopConversationPolling(): void {
 export function resumeConversationPolling(): void {
   if (!currentConversationId) return;
   if (pollingTimerId !== null) return;
-  pollOnce();
-  pollingTimerId = setInterval(() => {
+  // 与 startConversationPolling 同冷却：hide→show 恰逢 sub 刚失败时，避免立即 pollOnce 复燃循环
+  const sinceLastExecuting = Date.now() - lastOnExecutingTime;
+  if (sinceLastExecuting >= RESTART_COOLDOWN_MS) {
     pollOnce();
-  }, POLLING_INTERVAL) as unknown as number;
+  }
+  pollingTimerId = setInterval((): void => {
+    pollOnce();
+  }, currentPollingInterval) as number;
 }
 
 /**
@@ -151,9 +436,13 @@ export function pauseConversationPolling(): void {
 export function destroyConversationPolling(): void {
   stopConversationPolling();
   currentConversationId = 0;
+  lastOnExecutingTime = 0;
   onExecutingCallback = null;
   isConversationActiveGetter = null;
   isSubscribedGetter = null;
+  streamGenerationGetter = null;
+  isResumePendingGetter = null;
+  onTerminalWhileBusyCallback = null;
 
   // #ifdef H5 || WEB
   if (isVisibilityListenerInitialized) {

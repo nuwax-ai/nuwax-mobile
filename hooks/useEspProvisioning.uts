@@ -29,25 +29,27 @@ import {
   ESP_PROV_CONNECT_TIMEOUT_MS,
   ESP_PROV_DEFAULT_DEVICE_PREFIX,
   ESP_PROV_DEFAULT_SERVICE_UUID,
+  ESP_PROV_PERMISSION_TIMEOUT_MS,
   ESP_PROV_SCAN_TIMEOUT_MS,
   ESP_PROV_STATUS_TIMEOUT_MS,
   ESP_PROV_REQUIRED_CAPABILITY,
   ESP_PROV_OPTIONAL_SCAN_CAPABILITY,
 } from '@/constants/espProvisioning.constants';
 import { validatePassword, validateSsid } from '@/utils/provisionProtocol';
-import { parseEspProvisioningQr } from '@/utils/provisioning/espProvisioningQr';
+import { espErrorCodeFromText } from '@/utils/provisioning/espErrorCode';
+import { parseNuwaxProvisionUrl } from '@/utils/provisioning/espProvisioningQr';
 import { getQrPayload } from '@/utils/provisionSession';
 import { apiVoxBindDevice } from '@/servers/vox/voxDevice';
 import { AppDeviceBindParams } from '@/types/interfaces/voxDevice';
 import { apiResCode, apiResData, apiResMessage } from '@/utils/common';
 import { SUCCESS_CODE } from '@/constants/codes.constants';
-import { VOX_DEVICE_WS_URL } from '@/constants/config';
 
 /** 固件接收 vox 配置的自定义 endpoint（deviceSecret + gatewayUrl） */
 const VOX_CONFIG_ENDPOINT = 'vox-config';
 
 export class EspProvisioningController {
   phase: Ref<EspProvisioningPhaseEnum>;
+  failedPhase: Ref<EspProvisioningPhaseEnum>;
   scannedDevices: Ref<EspProvisioningDevice[]>;
   error: Ref<ProvisionError | null>;
   connectedSsid: Ref<string>;
@@ -62,6 +64,19 @@ export class EspProvisioningController {
   private pendingSsid = '';
   private pendingPassword = '';
   private retryAction: ProvisionRetryActionEnum = ProvisionRetryActionEnum.NONE;
+  // 仅当本次 WiFi 下发已开始、等待结果时发生断连，才允许重连后恢复设备终态。
+  // 用户修改 WiFi 后发起的是新尝试，不能消费 device-info 中上一次遗留的失败结果。
+  private recoverOutcomeOnReconnect = false;
+  // 本次配网会话内已绑定设备的缓存：RECONNECT 重连后跳过二次 bind，复用已下发密钥，
+  // 避免后端对已绑设备返错（mock 1002）或重置 secret。仅内存持有，dispose 清空。
+  private boundDeviceId = '';
+  private boundSecret = '';
+  private boundWebsocketUrl = '';
+  private boundBindingId = '';
+  // 平台实现最近一次上报的错误码副本（见 onLog / asEspError），取用即失效。
+  private lastClientErrorCode = '';
+  private lastClientErrorMessage = '';
+  private lastClientErrorAt = 0;
   private config: EspProvisioningConfig;
 
   constructor() {
@@ -69,6 +84,7 @@ export class EspProvisioningController {
       ? new MockEspProvisioningClient()
       : (hasEspProvisioningClientProvider() ? createEspProvisioningClient() : new UnavailableEspProvisioningClient());
     this.phase = ref<EspProvisioningPhaseEnum>(EspProvisioningPhaseEnum.IDLE);
+    this.failedPhase = ref<EspProvisioningPhaseEnum>(EspProvisioningPhaseEnum.IDLE);
     this.scannedDevices = ref<EspProvisioningDevice[]>([] as EspProvisioningDevice[]);
     this.error = ref<ProvisionError | null>(null);
     this.connectedSsid = ref<string>('');
@@ -81,6 +97,13 @@ export class EspProvisioningController {
     this.client.onProgress((progress: EspProvisioningProgress) => this.handleProgress(progress));
     this.client.onLog((level: string, event: string, detail: string) => {
       console.log(`[EspProvisioning][${level}] ${event} ${detail}`);
+      // 平台实现在构造错误时会同步打一条 error 日志，event 即错误码。
+      // reject 的对象穿过 await 的 any 边界后 instanceof 会失效，这里留一份可靠副本。
+      if (level == 'error') {
+        this.lastClientErrorCode = event;
+        this.lastClientErrorMessage = detail;
+        this.lastClientErrorAt = Date.now();
+      }
     });
   }
 
@@ -97,9 +120,9 @@ export class EspProvisioningController {
     if (deviceNamePrefix != '') this.config.deviceNamePrefix = deviceNamePrefix;
   }
 
-  /** 生产扫码入口：解析后只把 Security 2 材料保存在当前内存会话。 */
+  /** 生产扫码入口：解析 nuwax.com/lz.html 链接，只把 Security 2 材料保存在当前内存会话。 */
   configureFromQr(raw: string): EspProvisioningQrParseResult {
-    const result = parseEspProvisioningQr(raw, false);
+    const result = parseNuwaxProvisionUrl(raw);
     const payload = result.payload;
     if (payload != null) {
       this.configureSecurity(
@@ -118,10 +141,7 @@ export class EspProvisioningController {
     this.scannedDevices.value = [] as EspProvisioningDevice[];
     this.busy.value = true;
     try {
-      if (!this.initialized) {
-        await this.client.initialize(this.config);
-        this.initialized = true;
-      }
+      await this.ensureInitialized();
       this.phase.value = EspProvisioningPhaseEnum.SCANNING;
       await this.client.startScan();
     } catch (e) {
@@ -143,6 +163,8 @@ export class EspProvisioningController {
     ssid: string = '',
     password: string = '',
   ): Promise<boolean> {
+    const recoverPreviousOutcome = this.recoverOutcomeOnReconnect;
+    this.recoverOutcomeOnReconnect = false;
     this.ensureActive();
     this.stopScan();
     this.currentDevice = device;
@@ -166,10 +188,7 @@ export class EspProvisioningController {
     }
 
     try {
-      if (!this.initialized) {
-        await this.client.initialize(this.config);
-        this.initialized = true;
-      }
+      await this.ensureInitialized();
     } catch (e) {
       this.fail(this.asEspError(e), ProvisionRetryActionEnum.RECONNECT);
       return false;
@@ -224,7 +243,9 @@ export class EspProvisioningController {
           return false;
         }
         this.deviceInfo.value = info;
-        if (this.applyRecoveredOutcome(info)) return false;
+        // lastProvisioningOutcome 是设备保存的最近一次终态。仅断连恢复当前尝试时消费；
+        // 新凭据尝试若无条件消费，会被上一次 auth_failed 提前中止，导致新密码根本没有下发。
+        if (recoverPreviousOutcome && this.applyRecoveredOutcome(info)) return false;
         this.phase.value = EspProvisioningPhaseEnum.READY;
         this.busy.value = false;
         return true;
@@ -249,6 +270,8 @@ export class EspProvisioningController {
    * 后续校验 capabilities / 读 device-info 与 selectAndPrepare 一致。成功 phase=READY。
    */
   async selectAndPrepareFromQr(): Promise<boolean> {
+    const recoverPreviousOutcome = this.recoverOutcomeOnReconnect;
+    this.recoverOutcomeOnReconnect = false;
     this.ensureActive();
     const qr = getQrPayload();
     if (qr == null) {
@@ -266,10 +289,7 @@ export class EspProvisioningController {
     this.busy.value = true;
 
     try {
-      if (!this.initialized) {
-        await this.client.initialize(this.config);
-        this.initialized = true;
-      }
+      await this.ensureInitialized();
     } catch (e) {
       this.fail(this.asEspError(e), ProvisionRetryActionEnum.RECONNECT);
       return false;
@@ -326,12 +346,24 @@ export class EspProvisioningController {
           return false;
         }
         this.deviceInfo.value = info;
-        if (this.applyRecoveredOutcome(info)) return false;
+        // 与手动扫描链路一致：新尝试忽略历史终态，仅断连恢复当前尝试时消费。
+        if (recoverPreviousOutcome && this.applyRecoveredOutcome(info)) return false;
         this.phase.value = EspProvisioningPhaseEnum.READY;
         this.busy.value = false;
         return true;
       } catch (e) {
         lastError = this.asEspError(e);
+        console.log(`[EspProvisioning] connectFromQr attempt=${attempt} FAIL code=${lastError!!.code} detail=${lastError!!.detail} message=${lastError!!.message}`);
+        // 未发现设备或扫描器启动失败时，重复完整的 30 秒发现窗口只会放大等待时间，
+        // 还可能触发 Android BLE 扫描频率限制；仅真实连接/握手失败才进入重试。
+        if (
+          lastError!!.code == EspProvisioningErrorCodeEnum.DEVICE_NOT_FOUND ||
+          lastError!!.code == EspProvisioningErrorCodeEnum.SCAN_FAILED ||
+          lastError!!.code == EspProvisioningErrorCodeEnum.BLUETOOTH_OFF ||
+          lastError!!.code == EspProvisioningErrorCodeEnum.LOCATION_OFF ||
+          lastError!!.code == EspProvisioningErrorCodeEnum.UNSUPPORTED ||
+          lastError!!.code == EspProvisioningErrorCodeEnum.NO_PERMISSION
+        ) break;
         if (attempt < 2) await this.sleep(1000 * (attempt + 1));
       }
     }
@@ -354,6 +386,10 @@ export class EspProvisioningController {
     const caps = this.capabilities.value;
     if (caps == null || !caps.has(ESP_PROV_OPTIONAL_SCAN_CAPABILITY)) {
       return [] as EspWifiNetwork[];
+    }
+    this.error.value = null;
+    if (this.phase.value == EspProvisioningPhaseEnum.FAILED) {
+      this.phase.value = EspProvisioningPhaseEnum.READY;
     }
     try {
       return await this.client.scanNetworks();
@@ -390,6 +426,7 @@ export class EspProvisioningController {
     this.pendingPassword = password;
     this.error.value = null;
     this.busy.value = true;
+    this.recoverOutcomeOnReconnect = false;
     try {
       await this.client.provision(ssid, password);
       this.connectedSsid.value = ssid;
@@ -397,6 +434,7 @@ export class EspProvisioningController {
       this.retryAction = ProvisionRetryActionEnum.NONE;
     } catch (e) {
       const err = this.asEspError(e);
+      this.recoverOutcomeOnReconnect = err.code == EspProvisioningErrorCodeEnum.DISCONNECTED;
       const action = err.code == EspProvisioningErrorCodeEnum.DISCONNECTED
         ? ProvisionRetryActionEnum.RECONNECT
         : ProvisionRetryActionEnum.REWRITE;
@@ -412,11 +450,51 @@ export class EspProvisioningController {
       await this.startScan();
       return;
     }
+    if (this.retryAction == ProvisionRetryActionEnum.RETRY_BIND) {
+      // 绑定/下发密钥失败（网络/网关错误）：BLE 会话仍存活，直接重试绑定，
+      // 无需重连 BLE（否则每次重试都走一遍扫描+连接+读设备信息，长时间停在绑定节点）。
+      // 若期间会话已失效，bindAndDeliverSecret 内部会按 RECONNECT 失败，下轮重试自动重连。
+      const delivered = await this.bindAndDeliverSecret("");
+      if (!delivered) {
+        console.warn('[ProvisionRetry] RETRY_BIND 未成功，失败态已由内部 fail 设置');
+        return;
+      }
+    }
     if (this.retryAction == ProvisionRetryActionEnum.RECONNECT) {
       const device = this.currentDevice;
-      if (device == null) return;
-      const ok = await this.selectAndPrepare(device);
-      if (!ok) return;
+      const ok = device != null
+        ? await this.selectAndPrepare(device)
+        : (getQrPayload() != null ? await this.selectAndPrepareFromQr() : false);
+      if (!ok) {
+        // gap B 修复：selectAndPrepare 失败若因 applyRecoveredOutcome 命中设备上次失败终态
+        //（auth_failed/network_not_found/timeout 等），retryAction 已被置 REWRITE，而 BLE 会话
+        // 实际已就绪 → 清失败态 fall-through 继续 provision，避免「重新连接」要点两次才生效。
+        if (this.retryAction == ProvisionRetryActionEnum.REWRITE) {
+          this.error.value = null;
+          this.phase.value = EspProvisioningPhaseEnum.READY;
+          this.busy.value = true;
+          console.log('[ProvisionRetry] RECONNECT 命中设备上次失败终态，fall-through 直接 provision');
+        } else {
+          if (device == null && getQrPayload() == null) {
+            this.fail(new EspProvisioningError(
+              EspProvisioningErrorCodeEnum.CONNECT_FAILED,
+              '设备未连接，请重新选择设备后配网',
+              'retry RECONNECT without device or QR payload',
+              0,
+              false,
+            ), ProvisionRetryActionEnum.NONE);
+          }
+          console.warn('[ProvisionRetry] selectAndPrepare 未就绪，失败态已由内部 fail 设置');
+          return;
+        }
+      }
+      // 重连后 Security 2 会话重建，须在 provision 前重新下发 vox-config；
+      // bindAndDeliverSecret 内部对已绑定设备复用缓存密钥，跳过二次 bind。
+      const delivered = await this.bindAndDeliverSecret("");
+      if (!delivered) {
+        console.warn('[ProvisionRetry] bindAndDeliverSecret 未成功，失败态已由内部 fail 设置');
+        return;
+      }
     }
     await this.provision(this.pendingSsid, this.pendingPassword);
   }
@@ -427,47 +505,161 @@ export class EspProvisioningController {
   }
 
   /**
-   * WiFi 配网成功后调用：绑定设备到 App 账号并把 deviceSecret + gatewayUrl
-   * 经加密会话下发到固件 vox-config 端点（不再下发 apiBaseUrl，固件侧不需要）。
-   * 失败不阻断 WiFi 成功态（返回 false，页面自行 toast），须在配网成功后 BLE 窗口内尽快调用。
+   * WiFi 配网前调用：绑定设备到 App 账号并把 deviceSecret + gatewayUrl
+   * 经加密会话下发到固件 vox-config 端点。必须在 provision 之前（Security 2 会话还活着），
+   * WiFi 一成功 SDK 会清理会话，之后再 sendCustomData 会 SECURITY_AUTH_FAILED。
+   * 失败进失败页（fail），由 retry 重做整个流程。
    */
   async bindAndDeliverSecret(displayName: string): Promise<boolean> {
     this.ensureActive();
     const info = this.deviceInfo.value;
     if (info == null || info.serialNumber == '') {
-      console.error('[VoxBind] 缺少 serialNumber，跳过设备绑定');
+      this.fail(new EspProvisioningError(
+        EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
+        '缺少 serialNumber，无法绑定设备',
+        'device-info missing serialNumber',
+        0,
+        true,
+      ), ProvisionRetryActionEnum.RECONNECT);
       return false;
     }
     this.phase.value = EspProvisioningPhaseEnum.BINDING_DEVICE;
     const deviceId = info.serialNumber;
-    try {
+    // 三字段来源：
+    //   deviceId     = device-info.serialNumber
+    //   deviceSecret = bind 接口返回的最新值（不生成/不改写/不写死）
+    //   gatewayUrl   = bind 接口返回的 websocketUrl（不在前端拼接）
+    // 任一来源失败即停止，不得继续下发 Wi-Fi 凭据。
+    let secret = '';
+    let websocketUrl = '';
+    let bindingId = '';
+    // RECONNECT 重连后：同一设备本次会话已绑定过则复用密钥，跳过二次 bind，
+    // 避免后端对已绑设备返错（mock 1002）或重置 secret。
+    if (this.boundDeviceId == deviceId && this.boundSecret != '' && this.boundWebsocketUrl != '') {
+      secret = this.boundSecret;
+      websocketUrl = this.boundWebsocketUrl;
+      console.log(`[VoxBind] 复用本次会话已下发密钥，跳过二次 bind deviceId=${deviceId}`);
+    } else {
       const params = new AppDeviceBindParams();
       params.deviceId = deviceId;
       params.displayName = displayName != '' ? displayName : deviceId;
-      const res = await apiVoxBindDevice(params);
-      if (apiResCode(res) != SUCCESS_CODE) {
-        console.error(`[VoxBind] 绑定失败 code=${apiResCode(res)} msg=${apiResMessage(res)}`);
+      try {
+        const res = await apiVoxBindDevice(params);
+        if (apiResCode(res) != SUCCESS_CODE) {
+          // BLE 会话仍存活：重试动作走 RETRY_BIND（直接重绑），无需 BLE 重连
+          this.fail(new EspProvisioningError(
+            EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
+            '设备绑定失败',
+            `bind code=${apiResCode(res)} msg=${apiResMessage(res)}`,
+            0,
+            true,
+          ), ProvisionRetryActionEnum.RETRY_BIND);
+          return false;
+        }
+        const raw = apiResData<any>(res);
+        const data = raw != null ? (raw as UTSJSONObject) : null;
+        const secretVal = data != null ? data['deviceSecret'] : null;
+        const websocketUrlVal = data != null ? data['websocketUrl'] : null;
+        const bindingIdVal = data != null ? data['id'] : null;
+        secret = secretVal != null ? `${secretVal}` : '';
+        websocketUrl = websocketUrlVal != null ? `${websocketUrlVal}` : '';
+        bindingId = bindingIdVal != null ? `${bindingIdVal}` : '';
+      } catch (e) {
+        const err = this.asEspError(e);
+        // try 块内异常均来自绑定请求（网络/超时/网关 502 等，业务码走上面的响应分支）；
+        // 归为可重试的网络错误，重试动作 RETRY_BIND（BLE 会话仍存活，直接重绑）。
+        console.error(`[VoxBind] bind 网络异常 deviceId=${deviceId} | code=${err.code} | detail=${err.detail} | nativeCode=${err.nativeCode}`);
+        this.fail(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.NETWORK_ERROR,
+          '网络异常，绑定请求失败',
+          err.detail,
+          err.nativeCode,
+          true,
+        ), ProvisionRetryActionEnum.RETRY_BIND);
         return false;
       }
-      const raw = apiResData<any>(res);
-      const data = raw != null ? (raw as UTSJSONObject) : null;
-      const secretVal = data != null ? data['deviceSecret'] : null;
-      const secret = secretVal != null ? `${secretVal}` : '';
       if (secret == '') {
-        console.error('[VoxBind] 绑定响应缺少 deviceSecret');
+        this.fail(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
+          '绑定响应缺少 deviceSecret',
+          'bind response missing deviceSecret',
+          0,
+          true,
+        ), ProvisionRetryActionEnum.RETRY_BIND);
         return false;
       }
-      // deviceSecret 仅内存持有，随 payload 下发后即弃，勿写 storage / 日志
-      const payload = new UTSJSONObject();
-      payload['deviceId'] = deviceId;
-      payload['deviceSecret'] = secret;
-      payload['gatewayUrl'] = VOX_DEVICE_WS_URL;
-      const payloadJson = JSON.stringify(payload);
+      if (websocketUrl == '') {
+        this.fail(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED,
+          '绑定响应缺少 websocketUrl',
+          'bind response missing websocketUrl',
+          0,
+          true,
+        ), ProvisionRetryActionEnum.RETRY_BIND);
+        return false;
+      }
+      // 缓存绑定结果供本次会话 RECONNECT 复用（仅内存，不落盘）
+      this.boundDeviceId = deviceId;
+      this.boundSecret = secret;
+      this.boundWebsocketUrl = websocketUrl;
+      this.boundBindingId = bindingId;
+      console.log(`[VoxBind] bind 成功 deviceId=${deviceId} bindingId=${bindingId}`);
+    }
+    // 扁平 payload：仅 deviceId/gatewayUrl/deviceSecret，无 op/bundle/credentialId/signature。
+    // deviceSecret 仅内存持有，随 payload 下发后即弃，勿写 storage / 日志。
+    const payload = new UTSJSONObject();
+    payload['deviceId'] = deviceId;
+    payload['gatewayUrl'] = websocketUrl;
+    payload['deviceSecret'] = secret;
+    const payloadJson = JSON.stringify(payload);
+    console.log(`[VoxBind] 下发 vox-config deviceId=${deviceId} gatewayUrl=${websocketUrl}`);
+    try {
       const resp = await this.client.sendCustomData(VOX_CONFIG_ENDPOINT, payloadJson);
-      console.log(`[VoxBind] vox-config 下发成功 deviceId=${deviceId} resp=${resp}`);
+      // 响应必须为 {ok:true,state:'active',deviceId}，且不得回显 deviceSecret
+      let parsed = null as UTSJSONObject | null;
+      try {
+        parsed = JSON.parse(resp) as UTSJSONObject;
+      } catch (e) {
+        this.fail(new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.VOX_CONFIG_INVALID,
+          'vox-config 响应解析失败',
+          'non-JSON response',
+          0,
+          true,
+        ), ProvisionRetryActionEnum.RECONNECT);
+        return false;
+      }
+      const respObj = parsed!!;
+      const okVal = respObj['ok'];
+      const ok = okVal != null && `${okVal}` == 'true';
+      const stateVal = respObj['state'];
+      const state = stateVal != null ? `${stateVal}` : '';
+      const respDeviceIdVal = respObj['deviceId'];
+      const respDeviceId = respDeviceIdVal != null ? `${respDeviceIdVal}` : '';
+      if (!ok || state != 'active' || respDeviceId != deviceId) {
+        const errVal = respObj['error'];
+        const errStr = errVal != null ? `${errVal}` : `ok=${ok} state=${state} deviceId=${respDeviceId}`;
+        // 设备报告写 NVS 失败 → PERSIST_FAILED，其余字段/身份非法 → INVALID
+        const lower = errStr.toLowerCase();
+        const isPersist = lower.indexOf('persist') >= 0 || lower.indexOf('nvs') >= 0;
+        this.fail(new EspProvisioningError(
+          isPersist
+            ? EspProvisioningErrorCodeEnum.VOX_CONFIG_PERSIST_FAILED
+            : EspProvisioningErrorCodeEnum.VOX_CONFIG_INVALID,
+          isPersist ? '设备保存配置失败' : 'vox-config 被设备拒绝',
+          errStr,
+          0,
+          true,
+        ), ProvisionRetryActionEnum.RECONNECT);
+        return false;
+      }
+      console.log(`[VoxBind] vox-config 下发成功 deviceId=${deviceId} state=${state}`);
       return true;
     } catch (e) {
-      console.error(`[VoxBind] 绑定/密钥下发异常 deviceId=${deviceId}`, e);
+      const err = this.asEspError(e);
+      // err.message = 原生 ESPSessionError.description（sessionNotEstablished/securityMismatch/encryptionError/sendDataError）
+      console.error(`[VoxBind] vox-config 下发异常 deviceId=${deviceId} | code=${err.code} | msg=${err.message} | detail=${err.detail} | nativeCode=${err.nativeCode}`);
+      this.fail(err, ProvisionRetryActionEnum.RECONNECT);
       return false;
     }
   }
@@ -483,7 +675,68 @@ export class EspProvisioningController {
     this.client.dispose();
     this.pendingSsid = '';
     this.pendingPassword = '';
+    this.recoverOutcomeOnReconnect = false;
     this.currentDevice = null;
+    this.boundDeviceId = '';
+    this.boundSecret = '';
+    this.boundWebsocketUrl = '';
+    this.boundBindingId = '';
+  }
+
+  /** 本次会话 bind 接口返回的绑定记录 ID（在线轮询用；仅内存，dispose 清空）。 */
+  getBoundBindingId(): string {
+    return this.boundBindingId;
+  }
+
+  /**
+   * 入口页预请求平台运行时权限（仅申请权限，不初始化桥）。
+   * BLE 弹窗若等到 connect 页 onLoad 才触发，会紧跟扫码的相机权限弹窗，
+   * Android 可能延后显示甚至丢弃第二次请求 → initialize 永不返回、卡「正在连接设备…」。
+   * 失败静默：正式流程的 ensureInitialized 会再次校验并给出可重试失败态。
+   */
+  prewarmPermissions(): void {
+    this.client.ensurePermissions().catch((err) => {
+      console.warn('[EspProvisioning] prewarm permissions failed:', err);
+    });
+  }
+
+  /**
+   * 初始化 + 蓝牙权限申请超时兜底。
+   * 首次授权时权限弹窗可能停留数十秒；若回调因页面跳转 / 回调对象 GC 等原因丢失，
+   * 15s 后按 NO_PERMISSION 失败进入失败态（可重试；重试时权限已授予会立即通过），
+   * 避免界面卡死在「正在连接设备…」。
+   */
+  private async ensureInitialized(): Promise<void> {
+    if (this.initialized) return;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        const timeoutError = new EspProvisioningError(
+          EspProvisioningErrorCodeEnum.NO_PERMISSION,
+          '蓝牙权限申请超时，请重试',
+          'permission request timed out',
+          0,
+          true,
+        );
+        this.recordError(timeoutError);
+        reject(timeoutError);
+      }, ESP_PROV_PERMISSION_TIMEOUT_MS) as number;
+      this.client.initialize(this.config).then(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.initialized = true;
+        resolve();
+      }).catch((err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        // UTSPromise.catch 参数为 Any?，显式 any 类型不匹配；转 any 后交给 asEspError 归一化
+        reject(this.asEspError(err as any));
+      });
+    });
   }
 
   private createDefaultConfig(): EspProvisioningConfig {
@@ -571,6 +824,9 @@ export class EspProvisioningController {
   }
 
   private fail(err: EspProvisioningError, retryAction: ProvisionRetryActionEnum): void {
+    if (this.phase.value != EspProvisioningPhaseEnum.FAILED) {
+      this.failedPhase.value = this.phase.value;
+    }
     this.retryAction = retryAction;
     this.error.value = new ProvisionError(
       this.errorI18nKey(err.code),
@@ -584,6 +840,11 @@ export class EspProvisioningController {
 
   private errorI18nKey(code: EspProvisioningErrorCodeEnum): string {
     if (code == EspProvisioningErrorCodeEnum.BLUETOOTH_OFF) return 'Mobile.Provision.Error.bluetoothOff';
+    if (code == EspProvisioningErrorCodeEnum.LOCATION_OFF) return 'Mobile.Provision.Error.locationOff';
+    if (code == EspProvisioningErrorCodeEnum.NO_PERMISSION) return 'Mobile.Provision.Scan.noPermission';
+    if (code == EspProvisioningErrorCodeEnum.SCAN_FAILED) return 'Mobile.Provision.Error.scanFailed';
+    if (code == EspProvisioningErrorCodeEnum.UNSUPPORTED) return 'Mobile.Provision.Error.serviceUnavailable';
+    if (code == EspProvisioningErrorCodeEnum.DEVICE_NOT_FOUND) return 'Mobile.Provision.Error.deviceNotFound';
     if (code == EspProvisioningErrorCodeEnum.CONNECT_FAILED) return 'Mobile.Provision.Error.connectFailed';
     if (code == EspProvisioningErrorCodeEnum.DISCONNECTED) return 'Mobile.Provision.Error.disconnected';
     if (code == EspProvisioningErrorCodeEnum.AUTH_FAILED || code == EspProvisioningErrorCodeEnum.WIFI_AUTH_FAILED) return 'Mobile.Provision.Error.wrongPassword';
@@ -595,15 +856,57 @@ export class EspProvisioningController {
     if (code == EspProvisioningErrorCodeEnum.BUSY) return 'Mobile.Provision.Error.busy';
     if (code == EspProvisioningErrorCodeEnum.SERVICE_MISMATCH) return 'Mobile.Provision.Error.firmwareMismatch';
     if (code == EspProvisioningErrorCodeEnum.SEND_CONFIG_FAILED) return 'Mobile.Provision.Error.writeFailed';
+    if (code == EspProvisioningErrorCodeEnum.VOX_CONFIG_INVALID) return 'Mobile.Provision.Error.voxConfigInvalid';
+    if (code == EspProvisioningErrorCodeEnum.VOX_CONFIG_PERSIST_FAILED) return 'Mobile.Provision.Error.voxConfigPersistFailed';
+    if (code == EspProvisioningErrorCodeEnum.NETWORK_ERROR) return 'Mobile.Provision.Error.networkError';
     return 'Mobile.Provision.Error.unknown';
   }
 
+  /**
+   * 归一化 catch 到的任意值。
+   * UTS/Android 上 Promise reject 的普通类实例经 await 抛出后 instanceof 判定会失效
+   * （实测华为机上 BLUETOOTH_OFF 被降级成 UNKNOWN，界面只剩「配网失败，请重试」，
+   * 而且 selectAndPrepareFromQr 的「环境类错误不重试」判断也随之失效，白等三轮）。
+   * 因此 instanceof 落空时回退到平台实现刚上报的错误码副本。
+   */
   private asEspError(value: any): EspProvisioningError {
-    if (value instanceof EspProvisioningError) return value;
+    if (value instanceof EspProvisioningError) {
+      const typed = value as EspProvisioningError;
+      this.recordError(typed);
+      return typed;
+    }
+    const recovered = this.recentClientError();
+    if (recovered != null) {
+      this.recordError(recovered!!);
+      return recovered!!;
+    }
     return new EspProvisioningError(
       EspProvisioningErrorCodeEnum.UNKNOWN,
       '未知配网错误',
       `${value}`,
+    );
+  }
+
+  /**
+   * 记下当前错误码，供它下一次穿过 await 边界后还原。
+   * ensureInitialized 这类链路会归一化两次（内层 reject、外层 catch 各一次），
+   * 所以副本是「每次归一化都刷新」而不是「取用即失效」。
+   */
+  private recordError(err: EspProvisioningError): void {
+    this.lastClientErrorCode = `${err.code}`;
+    this.lastClientErrorMessage = err.message;
+    this.lastClientErrorAt = Date.now();
+  }
+
+  /** 最近 3 秒内上报过的错误码副本；超时视为与本次失败无关，宁可退回 UNKNOWN。 */
+  private recentClientError(): EspProvisioningError | null {
+    const code = this.lastClientErrorCode;
+    if (code == '' || Date.now() - this.lastClientErrorAt > 3000) return null;
+    const message = this.lastClientErrorMessage;
+    return new EspProvisioningError(
+      espErrorCodeFromText(code),
+      message != '' ? message : '配网失败',
+      `recovered:${code}`,
     );
   }
 

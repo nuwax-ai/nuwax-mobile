@@ -1,16 +1,30 @@
 /**
  * App TTS WebSocket 播放器。
  * 服务端下发 PCM16 LE mono；客户端收齐后封装为 WAV，再交给 InnerAudioContext 播放。
+ *
+ * H5 注意：浏览器要求 play() 落在用户手势链路内。TTS 合成是异步的，
+ * 因此在 play() 同步阶段先用同一 InnerAudioContext 播一段静音 WAV 解锁
+ * （SILENT_WAV_DATA_URI，宽限期防被打断），合成完成后再切到真实 WAV。
  */
-import { ACCESS_TOKEN } from "@/constants/home.constants";
-import { API_BASE_URL } from "@/constants/config";
+import { getApiBaseUrl } from "@/constants/config";
+import { resolveSpeechAccessToken } from "./speechToken";
 import { audioPlayerManager } from "./audioPlayerManager";
+import { loadVoiceSettings } from "./voiceTypes";
+import { SpeechWsKeepalive } from "./speechWsKeepalive";
+import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+// 原生流式播放器：PCM 边推边播，无 WAV 文件/段边界 → 消除分段换源卡顿
+// （Android: AudioTrack / iOS: AVAudioEngine / 鸿蒙: AudioRenderer；
+//   模块按平台解析 app-android/app-ios/app-harmony 实现）
+import { StreamPcmPlayer } from "@/uni_modules/nuwax-stream-pcm-player";
+// #endif
 
 export type TtsPlaybackState =
   | "idle"
   | "connecting"
   | "synthesizing"
   | "playing"
+  | "paused"
   | "error";
 
 export type TtsPlaybackListener = (
@@ -28,20 +42,33 @@ class TtsListenerEntry {
   }
 }
 
+/**
+ * 极短静音 WAV，仅用于 H5 在用户点击时解锁音频通道。
+ * 结构完全合法：0.05s / 8kHz / 16bit mono，44 字节 RIFF 头 + 800 字节全零 PCM，
+ * 可正常解码并“播放”0.05s 数字静音，没有任何可闻声音（unlock-tone 的提示音会漏出）。
+ * 也带真实播放时长（非 0 data 空壳），iOS 判定元素“播放过”即可放行后续异步 play()。
+ */
+const SILENT_WAV_DATA_URI =
+  "data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
 function createTtsWebSocketUrl(token: string): string {
-  let baseUrl = API_BASE_URL;
+  let baseUrl = getApiBaseUrl();
   if (baseUrl.startsWith("https://")) {
     baseUrl = "wss://" + baseUrl.substring(8);
   } else if (baseUrl.startsWith("http://")) {
     baseUrl = "ws://" + baseUrl.substring(7);
   }
-  let url = baseUrl + "/api/app/tts/ws";
-  // 浏览器无法可靠传递自定义握手 Header，使用 Query 鉴权；App（含 iOS）走 Header。
+  // 与 ASR 一致，使用 /api/speech/*（不以旧文档 /api/app/* 为准）
+  let url = baseUrl + "/api/speech/tts/ws";
+  // 仅「浏览器 H5」用 Query：原生 WebSocket 无法带自定义握手 Header。
+  // App / 小程序 / App 内嵌 H5：URL 不带 token，走 Authorization Header。
   // #ifdef H5 || WEB
-  const encodedTokenRaw = encodeURIComponent(token);
-  const encodedToken =
-    encodedTokenRaw != null ? encodedTokenRaw : token;
-  url += "?access_token=" + encodedToken;
+  if (isAppWebViewEmbedded() == false) {
+    const encodedTokenRaw = encodeURIComponent(token);
+    const encodedToken =
+      encodedTokenRaw != null ? encodedTokenRaw : token;
+    url += "?access_token=" + encodedToken;
+  }
   // #endif
   return url;
 }
@@ -84,14 +111,26 @@ function buildPcm16Wav(chunks: Uint8Array[], sampleRate: number): ArrayBuffer {
 
   const output = new Uint8Array(buffer);
   let offset = 44;
+  // App UTS 不支持 TypedArray.set(array, offset)；H5 虽可用 set，统一按下标写入保证各端 WAV 有真实 PCM。
+  // （曾用条件编译混写 set/loop，App 上易出现「有头无数据」导致播不出声）
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     for (let j = 0; j < chunk.length; j++) {
-      output[offset++] = chunk[j];
+      output[offset + j] = chunk[j];
     }
+    offset += chunk.length;
   }
   return buffer;
 }
+
+/**
+ * H5 手势解锁播放宽限期（ms）：
+ * unlockInGesture 启动的解锁 play() 是异步 pending 的，若在同一同步栈内（toggleSpeech 的
+ * stop / begin 的 stop）立即 audio.stop()，会打断它 → 每次必抛 AbortError，且 iOS 判定元素
+ * 从未真正播放过 → 后续异步 play() 仍被拦截。宽限期内 stopSharedAudio 跳过 stop，让解锁
+ * 片段（约 0.05s）自然播完。真实播放开始（synth 至少数百 ms 后）时早已超窗，不受影响。
+ */
+const UNLOCK_PLAY_GRACE_MS: number = 500;
 
 async function saveWavFile(buffer: ArrayBuffer): Promise<string> {
   // #ifdef H5 || WEB
@@ -99,7 +138,7 @@ async function saveWavFile(buffer: ArrayBuffer): Promise<string> {
   return URL.createObjectURL(blob);
   // #endif
 
-  // #ifndef H5
+  // #ifndef H5 || WEB
   return await new Promise<string>((resolve, reject) => {
     const filePath =
       uni.env.USER_DATA_PATH + "/tts-" + Date.now().toString() + ".wav";
@@ -113,8 +152,311 @@ async function saveWavFile(buffer: ArrayBuffer): Promise<string> {
   // #endif
 }
 
+/**
+ * 同步识别 ArrayBuffer / TypedArray（避免 UTS 里 Promise.then 丢失）。
+ * Blob 无法同步读取，返回 null 走异步路径。
+ */
+function tryAsArrayBufferSync(data: any | null): ArrayBuffer | null {
+  if (data == null) {
+    return null;
+  }
+  // #ifdef H5 || WEB
+  try {
+    const dataObj = data as UTSJSONObject;
+    const byteOffsetVal = dataObj["byteOffset"];
+    const sizeVal = dataObj["size"];
+    // Blob：有 size，需 FileReader
+    if (typeof sizeVal == "number" && typeof byteOffsetVal != "number") {
+      return null;
+    }
+    // TypedArray
+    if (typeof byteOffsetVal == "number" && dataObj["buffer"] != null) {
+      const maybeView = data as Uint8Array;
+      const out = new Uint8Array(maybeView.byteLength);
+      for (let i = 0; i < maybeView.byteLength; i++) {
+        out[i] = maybeView[i];
+      }
+      return out.buffer as ArrayBuffer;
+    }
+  } catch (_eSync) {
+    // fallthrough
+  }
+  // #endif
+  const asBuffer = data as ArrayBuffer;
+  if (typeof asBuffer.byteLength == "number") {
+    return asBuffer;
+  }
+  return null;
+}
+
+/**
+ * 将 WebSocket 二进制帧规范为 ArrayBuffer。
+ * H5 上常见为 Blob，不能直接当 ArrayBuffer 读 byteLength。
+ * 注意：本函数对外不 reject，避免 UTS 对 Promise.catch 回调签名的限制。
+ * Android：禁止对 ArrayBuffer 使用 `as Uint8Array`（会 ClassCastException）。
+ */
+function toArrayBufferAsync(data: any): Promise<ArrayBuffer | null> {
+  if (data == null) {
+    return Promise.resolve(null);
+  }
+  const sync = tryAsArrayBufferSync(data);
+  if (sync != null) {
+    return Promise.resolve(sync);
+  }
+  // #ifdef H5 || WEB
+  try {
+    const dataObj = data as UTSJSONObject;
+    const sizeVal = dataObj["size"];
+    if (typeof sizeVal == "number") {
+      const blobCandidate = data as Blob;
+      return new Promise<ArrayBuffer | null>((resolve) => {
+        try {
+          const reader = new FileReader();
+          reader.onload = (): void => {
+            const result = reader.result;
+            if (
+              result != null &&
+              typeof (result as ArrayBuffer).byteLength == "number"
+            ) {
+              resolve(result as ArrayBuffer);
+            } else {
+              resolve(null);
+            }
+          };
+          reader.onerror = (): void => {
+            resolve(null);
+          };
+          reader.readAsArrayBuffer(blobCandidate);
+        } catch (_eRead) {
+          if (typeof blobCandidate.arrayBuffer == "function") {
+            blobCandidate
+              .arrayBuffer()
+              .then((buf: ArrayBuffer): void => {
+                resolve(buf);
+              })
+              .catch((): void => {
+                resolve(null);
+              });
+          } else {
+            resolve(null);
+          }
+        }
+      });
+    }
+  } catch (_eAsync) {
+    // fallthrough
+  }
+  // #endif
+  return Promise.resolve(null);
+}
+
+/** 构造 TTS JSON 控制帧（避免 object literal as UTSJSONObject 序列化丢字段） */
+function buildTtsControlMessage(
+  type: string,
+  text: string | null = null,
+  sampleRate: number = 0,
+  flush: boolean = false,
+): UTSJSONObject {
+  const payload = new UTSJSONObject();
+  payload["type"] = type;
+  if (type == "start") {
+    payload["sample_rate"] = sampleRate;
+    payload["frame_duration_ms"] = 20;
+  } else if (type == "text") {
+    payload["text"] = text != null ? text! : "";
+    payload["flush"] = flush;
+  }
+  return payload;
+}
+
+/**
+ * TTS Socket 统一抽象。
+ * Android UTS 不能把任意类 as interface，故用可继承基类，避免 ClassCastException。
+ */
+type TtsSocketOpenCallback = (result: OnSocketOpenCallbackResult) => void;
+type TtsSocketMessageCallback = (result: OnSocketMessageCallbackResult) => void;
+type TtsSocketErrorCallback = (result: GeneralCallbackResult) => void;
+type TtsSocketCloseCallback = (result: OnSocketCloseCallbackResult) => void;
+
+class TtsSocketHandle {
+  send(_options: SendSocketMessageOptions): void {}
+  close(_options: CloseSocketOptions): void {}
+  onOpen(_callback: TtsSocketOpenCallback): void {}
+  onMessage(_callback: TtsSocketMessageCallback): void {}
+  onError(_callback: TtsSocketErrorCallback): void {}
+  onClose(_callback: TtsSocketCloseCallback): void {}
+}
+
+/**
+ * App / 小程序：包装 uni.SocketTask。
+ */
+class UniSocketTaskAdapter extends TtsSocketHandle {
+  private task: SocketTask;
+
+  constructor(task: SocketTask) {
+    super();
+    this.task = task;
+  }
+
+  override onOpen(cb: TtsSocketOpenCallback): void {
+    this.task.onOpen(cb);
+  }
+
+  override onMessage(cb: TtsSocketMessageCallback): void {
+    this.task.onMessage(cb);
+  }
+
+  override onError(cb: TtsSocketErrorCallback): void {
+    this.task.onError(cb);
+  }
+
+  override onClose(cb: TtsSocketCloseCallback): void {
+    // 编译期签名是 (Any)=>void；运行期实参是 OnSocketCloseCallbackResult
+    this.task.onClose((result: any): void => {
+      cb(result as OnSocketCloseCallbackResult);
+    });
+  }
+
+  override send(options: SendSocketMessageOptions): void {
+    this.task.send(options);
+  }
+
+  override close(options: CloseSocketOptions): void {
+    this.task.close(options);
+  }
+}
+
+/**
+ * H5 原生 WebSocket 适配器（API 对齐 SocketTask 常用方法）。
+ * uni.connectSocket 在部分 H5 环境会出现：能收 tts_ready，后续 PCM/tts_end 全部丢失。
+ */
+// #ifdef H5 || WEB
+class H5NativeSocketAdapter extends TtsSocketHandle {
+  private ws: any | null = null;
+  private openCbs: TtsSocketOpenCallback[] = [];
+  private messageCbs: TtsSocketMessageCallback[] = [];
+  private errorCbs: TtsSocketErrorCallback[] = [];
+  private closeCbs: TtsSocketCloseCallback[] = [];
+
+  constructor(url: string) {
+    super();
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+    ws.onopen = (): void => {
+      const openResult = {} as OnSocketOpenCallbackResult;
+      for (let i = 0; i < this.openCbs.length; i++) {
+        this.openCbs[i](openResult);
+      }
+    };
+    ws.onmessage = (ev: any): void => {
+      const res = {
+        data: ev.data,
+      } as OnSocketMessageCallbackResult;
+      for (let i = 0; i < this.messageCbs.length; i++) {
+        this.messageCbs[i](res);
+      }
+    };
+    ws.onerror = (): void => {
+      const err = {
+        errMsg: "TTS WebSocket 错误",
+      } as GeneralCallbackResult;
+      for (let i = 0; i < this.errorCbs.length; i++) {
+        this.errorCbs[i](err);
+      }
+    };
+    ws.onclose = (): void => {
+      const closeResult = {
+        code: 1000,
+        reason: "TTS WebSocket closed",
+      } as OnSocketCloseCallbackResult;
+      for (let i = 0; i < this.closeCbs.length; i++) {
+        this.closeCbs[i](closeResult);
+      }
+    };
+  }
+
+  override onOpen(cb: TtsSocketOpenCallback): void {
+    this.openCbs.push(cb);
+  }
+
+  override onMessage(cb: TtsSocketMessageCallback): void {
+    this.messageCbs.push(cb);
+  }
+
+  override onError(cb: TtsSocketErrorCallback): void {
+    this.errorCbs.push(cb);
+  }
+
+  override onClose(cb: TtsSocketCloseCallback): void {
+    this.closeCbs.push(cb);
+  }
+
+  override send(options: SendSocketMessageOptions): void {
+    const ws = this.ws;
+    if (ws == null) {
+      return;
+    }
+    // readyState 1 = OPEN
+    if (ws.readyState == 1) {
+      ws.send(options.data);
+    } else {
+      console.warn("[TTS] native send skip readyState=", ws.readyState);
+    }
+  }
+
+  override close(_options: CloseSocketOptions): void {
+    try {
+      if (this.ws != null) {
+        this.ws.close();
+      }
+    } catch (_eClose) {
+      // ignore
+    }
+  }
+}
+// #endif
+
+/** 创建 TTS Socket：浏览器 H5 走原生 WebSocket（query 鉴权）；App / 内嵌 H5 / 小程序走 uni.connectSocket + Header */
+function createTtsSocket(
+  accessToken: string,
+  onFail: (errMsg: string) => void,
+): TtsSocketHandle | null {
+  const url = createTtsWebSocketUrl(accessToken);
+  // #ifdef H5 || WEB
+  // App 内嵌：与原生 App 一致，用 uni.connectSocket + Authorization Header
+  if (isAppWebViewEmbedded()) {
+    const embTask = uni.connectSocket({
+      url: url,
+      header: createTtsWebSocketHeaders(accessToken),
+      fail: (err) => {
+        onFail(err.errMsg ?? "TTS 连接失败");
+      },
+    });
+    return new UniSocketTaskAdapter(embTask);
+  }
+  try {
+    return new H5NativeSocketAdapter(url);
+  } catch (e: any) {
+    onFail(e != null && e.message != null ? `${e.message}` : "TTS 连接失败");
+    return null;
+  }
+  // #endif
+  // #ifndef H5 || WEB
+  const task = uni.connectSocket({
+    url: url,
+    header: createTtsWebSocketHeaders(accessToken),
+    fail: (err) => {
+      onFail(err.errMsg ?? "TTS 连接失败");
+    },
+  });
+  return new UniSocketTaskAdapter(task);
+  // #endif
+}
+
 export class TtsWebSocketPlayer {
-  private socketTask: SocketTask | null = null;
+  /** UniSocketTaskAdapter / H5NativeSocketAdapter */
+  private socketTask: TtsSocketHandle | null = null;
   private audioContext: InnerAudioContext | null = null;
   private chunks: Uint8Array[] = [];
   private state: TtsPlaybackState = "idle";
@@ -124,6 +466,367 @@ export class TtsWebSocketPlayer {
   private listeners: TtsListenerEntry[] = [];
   private nextListenerId: number = 1;
   private readonly sampleRate: number = 16000;
+  /** 尚未完成 ArrayBuffer 转换的二进制帧数（H5 Blob） */
+  private pendingBinary: number = 0;
+  /** 已收到 tts_end，等待 pendingBinary 清零后再封装播放 */
+  private finishRequested: boolean = false;
+  /** 是否已切入真实 TTS 音频（避免静音解锁片段的 onEnded 误停） */
+  private realPlayback: boolean = false;
+  /** 正在从解锁片段切换到真实音频，期间忽略 abort 类错误 */
+  private switchingToReal: boolean = false;
+  /** 因静音而暂停，取消静音后可 resume */
+  private pausedByMute: boolean = false;
+  /** H5 blob: URL，stop 时 revoke */
+  private blobUrl: string = "";
+  /**
+   * 允许预热建连（按下录音时开启；非进页长连）。
+   * false 时 ensureWarmSocketAsync 不再建连。
+   */
+  private warmupEnabled: boolean = false;
+  /** 预热待命连接（已 open，尚未 send start） */
+  private warmSocketTask: TtsSocketHandle | null = null;
+  private warmOpen: boolean = false;
+  private warmGeneration: number = 0;
+  /** 等待预热 open 的回调（避免覆盖 socket.onOpen） */
+  private warmOpenWaiters: ((ok: boolean) => void)[] = [];
+  /** 闲置关闭定时器：播报结束后延迟释放 TCP */
+  private idleCloseTimerId: number = 0;
+  /**
+   * 播报/合成空闲后关闭连接的等待（ms）。
+   * 分句间隙会取消重计；完整播报结束后也可由 releaseIdleConnection 立刻关。
+   */
+  private readonly IDLE_CLOSE_MS: number = 30000;
+  /**
+   * 每次 finishSynthesis 递增；H5/WEB 上 InnerAudioContext 的 onCanplay 会叠加，
+   * 旧回调用过期 id 直接 return，避免双重 play 重启。
+   */
+  private playRequestId: number = 0;
+  /**
+   * 边播边合成取消令牌：仅 bump 本字段，禁止动 generation / 当前音频。
+   * 流式分句在播 A 时预取合成 B。
+   */
+  private synthEpoch: number = 0;
+  /** 是否有 preservePlayingAudio 合成占用 session socket */
+  private synthInFlight: boolean = false;
+  /**
+   * 单一消息出口：每个 SocketTask 只注册一次 onMessage，业务通过替换 sink 切换。
+   * 避免 warm 空回调 + bindSession 二次 onMessage 在 H5 上叠层/后者被忽略。
+   */
+  private socketMessageSink: ((res: OnSocketMessageCallbackResult) => void) | null =
+    null;
+  /** 已安装 router 的 socket，避免重复 onMessage */
+  private socketRouterInstalledFor: TtsSocketHandle | null = null;
+  /** 预热连接 open 时刻，用于丢弃过久空闲连接 */
+  private warmOpenedAtMs: number = 0;
+  /** tts_ready 后合成卡住检测定时器 */
+  private synthStallTimerId: number = 0;
+  /** 预热 / 会话连接成功后的心跳保活 */
+  private keepalive: SpeechWsKeepalive = new SpeechWsKeepalive();
+  /** fail toast 节流，避免流式多句连续弹窗 */
+  private lastFailToastAtMs: number = 0;
+  /** 最近一次合成 PCM 估算时长（ms）；H5 blob URL 长度不能反映音频时长 */
+  private lastSynthDurationMs: number = 0;
+  /** H5：最近一次手势解锁 play() 的发起时刻；宽限期内 stopSharedAudio 跳过 stop */
+  private unlockPlayAtMs: number = 0;
+
+  // ==================== 流式会话（一次 start / 多次 text / flush） ====================
+  // 协议见 docs/app-asr-tts.md 5.1：
+  //   start → tts_ready → text(×N, 最后 flush:true) → tts_begin → PCM 帧 → tts_end → close
+  // tts_end 仅表示服务端已发完；本地缓冲播完（段队列排空）才结束本轮，之后才能再 start。
+  // 用户停止播放：closeStreamSession 发 close。
+  /** 流式会话已开启（start 已发，socket 可能仍在 connect） */
+  private streamSessionActive: boolean = false;
+  /** 已收到 tts_ready（可喂 text） */
+  private streamReady: boolean = false;
+  /** 已收到 tts_begin 或已有 PCM（本轮音频开始） */
+  private streamAudioStarted: boolean = false;
+  /** 已发 flush（服务端收尾；tts_end 后不再有音频） */
+  private streamFlushSent: boolean = false;
+  /** 本轮「无音频」看门狗是否已武装（首次 text 喂出时置位，防止 tts_ready 空等正文时误判） */
+  private streamNoAudioArmed: boolean = false;
+  /** 已收到 tts_end 或 flush 看门狗超时（服务端已发完，本地段队列播完即整轮结束） */
+  private streamEnded: boolean = false;
+  /** 会话所属 messageId */
+  private streamMessageId: string = "";
+  /** 当前待切段的 PCM 累计字节数 */
+  private streamPcmBytes: number = 0;
+  /** 是否已产出首段（首段更早切，保证首声快） */
+  private streamFirstSegmentDone: boolean = false;
+  /** 正在写段文件（串行化切段，保证回调顺序） */
+  private streamCutting: boolean = false;
+  /** tts_end 时仍有缓冲未切（写段/pendingBinary 中）：等当前写完后强制切尾段，防丢音频 */
+  private streamFinalPending: boolean = false;
+  /** tts_ready 前积压的 text 帧 */
+  private pendingFeedTexts: string[] = [];
+  /** 段就绪回调（voiceStreamSpeaker 注入） */
+  private streamSegmentHandler:
+    | ((src: string, durationMs: number) => void)
+    | null = null;
+  /** 会话结束回调（tts_end / flush 超时 / 停止 / 失败；voiceStreamSpeaker 注入） */
+  private streamEndHandler: (() => void) | null = null;
+  /** flush 后等待 tts_end 的超时（flush 无音频产出时服务端不发 tts_end，需兜底） */
+  private flushEndTimerId: number = 0;
+  /** 首段切段阈值（音频 ms）：略大以攒足初始缓冲，盖过服务端切首帧后的合成间隙 */
+  private readonly STREAM_FIRST_SEGMENT_MS: number = 1500;
+  /** 后续段切段阈值（音频 ms）；更大 → 段更少、边界更少 */
+  private readonly STREAM_SEGMENT_MS: number = 4000;
+  /** 按需切段的最小段长（音频 ms）：播放端等待时尽量早切，把最坏停顿压到 ~150ms */
+  private readonly STREAM_FORCED_SEGMENT_MIN_MS: number = 150;
+  /** flush 后等 tts_end 的看门狗 */
+  private readonly STREAM_FLUSH_END_WATCHDOG_MS: number = 8000;
+  /** no-audio 看门狗续等次数上限：超过仍无任何 PCM 即判死（默认 12s × (1+2) ≈ 36s） */
+  private readonly NATIVE_NO_AUDIO_REARM_LIMIT: number = 2;
+  /** 排空进度检测窗口（ms）：inputDone 后每窗口结算一次播放头推进 */
+  private readonly NATIVE_DRAIN_PROGRESS_WINDOW_MS: number = 5000;
+  /** 排空进度检测：单窗口内播放头最小推进（ms），低于视为渲染器/写循环卡死 */
+  private readonly NATIVE_DRAIN_MIN_PROGRESS_MS: number = 500;
+  /** 排空尾部余量（ms）：全部字节已入硬件后，额外等待硬件缓冲播完的余量（防缓冲时长低估误切） */
+  private readonly NATIVE_DRAIN_TAIL_MARGIN_MS: number = 1000;
+  /** 播放端队列排空时请求的按需切段标记：有标记则切段不再等阈值（成功切段后清除） */
+  private streamForcePending: boolean = false;
+
+  // ---- 流式段播放：双 InnerAudioContext 交替，前一段播放期间预置下一段 src ----
+  /** 备用 InnerAudioContext（与 audioContext 交替使用） */
+  private streamAltAudioContext: InnerAudioContext | null = null;
+  /** 交替相位：true=本次用备用 context 播放 */
+  private streamUseAlt: boolean = false;
+  /** 已预置到「下次将播放的 context」上的 src（匹配则无需重新 set，直接 play） */
+  private streamPreloadedSrc: string = "";
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+  /** 原生流式播放模式：PCM 直推 AudioTrack / AVAudioEngine / AudioRenderer（无文件/段边界）；false 回退分段 WAV 播放 */
+  private streamNativeActive: boolean = false;
+  /** AudioTrack 流式播放器实例 */
+  private streamPcmPlayer: StreamPcmPlayer | null = null;
+  /** 已收到 tts_end / flush 看门狗（不再有新 PCM 到来） */
+  private streamInputDone: boolean = false;
+  /** 不再有新 PCM 的时刻（排空兜底 deadline 基准） */
+  private streamInputDoneAtMs: number = 0;
+  /** 排空轮询定时器 */
+  private streamDrainTimerId: number = 0;
+  /** 原生模式「tts_ready 后无任何 PCM 帧」看门狗（防止图标卡死） */
+  private nativeNoAudioTimerId: number = 0;
+  /** 该看门狗已续等次数（NATIVE_NO_AUDIO_REARM_LIMIT 封顶，防无反馈时无限 re-arm） */
+  private nativeNoAudioRearmCount: number = 0;
+  /** 排空进度检测：窗口起点时刻（0=未初始化，inputDone 后首个检查初始化） */
+  private lastDrainProgressAtMs: number = 0;
+  /** 排空进度检测：窗口起点时的 writtenMs（单调递增，比 playedMs 可靠——模拟器播放头可能跳变/回退） */
+  private lastDrainWrittenMs: number = 0;
+  // #ifdef APP-ANDROID
+  /** 排空尾部：首次观察到「全部字节已写入硬件」的时刻（0=未观察到；inputDone 后有效） */
+  private nativeDrainWriteCompleteAtMs: number = 0;
+  // #endif
+  // #endif
+
+  /**
+   * 录音 onStart 后预热：建连但不发合成请求（轻触未开录勿调）。
+   * 防重连风暴：已有 warm / 建连中则直接返回。
+   */
+  enableWarmupAndConnect(): void {
+    this.warmupEnabled = true;
+    this.cancelIdleClose();
+    if (this.isWarmOpen() == true) {
+      return;
+    }
+    if (this.warmSocketTask != null) {
+      return;
+    }
+    if (this.socketTask != null) {
+      // 会话进行中已有连接，无需再预热
+      return;
+    }
+    this.ensureWarmSocketAsync();
+  }
+
+  /** 离开会话页 / 停止会话：关闭预热与业务连接（前后台 Hide 不要调） */
+  disableWarmupAndDisconnect(): void {
+    this.warmupEnabled = false;
+    this.cancelIdleClose();
+    this.generation += 1;
+    this.warmGeneration += 1;
+    this.clearSynthStallWatchdog();
+    this.resetStreamSessionState(true);
+    this.closeWarmSocket();
+    this.closeSessionSocketOnly();
+    this.keepalive.resume();
+    this.stopKeepalive();
+    this.keepalive.resetServerReject();
+    // 销毁音频，但不经由 recycle（上面已关连）
+    const audio = this.audioContext;
+    this.audioContext = null;
+    if (audio != null) {
+      try {
+        audio!.stop();
+        audio!.destroy();
+      } catch (_eAudio) {
+        // ignore
+      }
+    }
+    const alt = this.streamAltAudioContext;
+    this.streamAltAudioContext = null;
+    this.streamPreloadedSrc = "";
+    if (alt != null) {
+      try {
+        alt!.stop();
+        alt!.destroy();
+      } catch (_eAlt) {
+        // ignore
+      }
+    }
+    this.revokeBlobUrl();
+    this.chunks = [] as Uint8Array[];
+    this.text = "";
+    this.messageId = "";
+    this.setState("idle");
+  }
+
+  /**
+   * 整轮播报结束后释放空闲连接（流式分句全部播完 / 工具栏播完）。
+   * 分句之间请勿调用——应继续复用 warm TCP。
+   */
+  releaseIdleConnection(): void {
+    this.cancelIdleClose();
+    // 合成或播放进行中：改走闲置超时，避免掐断尾句
+    if (
+      this.state == "connecting" ||
+      this.state == "synthesizing" ||
+      this.state == "playing" ||
+      this.synthInFlight == true
+    ) {
+      this.scheduleIdleClose(this.IDLE_CLOSE_MS);
+      return;
+    }
+    this.closeWarmSocket();
+    this.closeSessionSocketOnly();
+    this.stopKeepalive();
+  }
+
+  private cancelIdleClose(): void {
+    if (this.idleCloseTimerId != 0) {
+      clearTimeout(this.idleCloseTimerId);
+      this.idleCloseTimerId = 0;
+    }
+  }
+
+  /** 空闲后关闭 warm/session TCP；busy 时由调用方改用更长 delay */
+  private scheduleIdleClose(delayMs: number): void {
+    this.cancelIdleClose();
+    let wait = delayMs;
+    if (wait < 0) {
+      wait = 0;
+    }
+    this.idleCloseTimerId = setTimeout((): void => {
+      this.idleCloseTimerId = 0;
+      if (
+        this.state == "connecting" ||
+        this.state == "synthesizing" ||
+        this.state == "playing" ||
+        this.synthInFlight == true
+      ) {
+        // 仍忙：再延一档
+        this.scheduleIdleClose(this.IDLE_CLOSE_MS);
+        return;
+      }
+      this.closeWarmSocket();
+      this.closeSessionSocketOnly();
+      this.stopKeepalive();
+    }, wait) as number;
+  }
+
+  /**
+   * 当前应保活的 socket：会话优先，否则预热。
+   * open 成功或 socket 角色切换后调用。
+   */
+  private refreshKeepalive(): void {
+    const sock =
+      this.socketTask != null ? this.socketTask : this.warmSocketTask;
+    if (sock == null) {
+      this.stopKeepalive();
+      return;
+    }
+    this.keepalive.start(
+      "TTS",
+      (payloadJson: string): boolean => {
+        const active =
+          this.socketTask != null ? this.socketTask : this.warmSocketTask;
+        if (active == null) {
+          return false;
+        }
+        try {
+          const sendOpts = {
+            data: payloadJson,
+          } as SendSocketMessageOptions;
+          active!.send(sendOpts);
+          return true;
+        } catch (_eSend) {
+          return false;
+        }
+      },
+      (): void => {
+        // 心跳成功则刷新预热空闲计时，避免误判 stale 半死连接
+        if (this.socketTask == null && this.warmSocketTask != null) {
+          this.warmOpenedAtMs = Date.now();
+        }
+      },
+    );
+  }
+
+  private stopKeepalive(): void {
+    this.keepalive.stop();
+  }
+
+  /** SSE 进行中暂停 TTS 心跳（不断连、不打断合成） */
+  pauseKeepalive(): void {
+    this.keepalive.pause();
+  }
+
+  /** SSE 结束后恢复 TTS 心跳 */
+  resumeKeepalive(): void {
+    this.keepalive.resume();
+  }
+
+  /**
+   * 识别服务端 UNKNOWN_TYPE(ping)：仅降噪标记，返回 true 表示本帧已消费。
+   * 不关连接、不停业务、不触碰 chat SSE。
+   */
+  private tryHandleKeepaliveReject(raw: string): boolean {
+    if (raw.indexOf("UNKNOWN_TYPE") < 0) {
+      return false;
+    }
+    if (raw.indexOf("ping") < 0 && raw.indexOf("pong") < 0) {
+      return false;
+    }
+    let message: UTSJSONObject | null = null;
+    try {
+      message = JSON.parse<UTSJSONObject>(raw);
+    } catch (_eJson) {
+      return false;
+    }
+    if (message == null) {
+      return false;
+    }
+    const typeVal = message!["type"];
+    const type = typeVal != null ? `${typeVal}` : "";
+    if (type != "error") {
+      return false;
+    }
+    const codeVal = message!["code"];
+    const msgVal = message!["message"];
+    const code = codeVal != null ? `${codeVal}` : "";
+    const msg = msgVal != null ? `${msgVal}` : "";
+    if (
+      code == "UNKNOWN_TYPE" &&
+      (msg.indexOf("ping") >= 0 || msg.indexOf("pong") >= 0)
+    ) {
+      this.keepalive.markRejectedByServer();
+      return true;
+    }
+    return false;
+  }
+
+  /** 是否已有可用预热连接 */
+  isWarmOpen(): boolean {
+    return this.warmOpen == true && this.warmSocketTask != null;
+  }
 
   subscribe(callback: TtsPlaybackListener): number {
     const id = this.nextListenerId++;
@@ -146,19 +849,164 @@ export class TtsWebSocketPlayer {
     return this.messageId;
   }
 
+  /**
+   * 原生流式：已投递播放器但尚未播完的 PCM 时长（ms）。
+   * Android 用 enqueued − written（写队列深度，单调可靠）：播放头 getPlaybackHeadPosition
+   * 在部分机型为负/跳变，负值使节流闸门永不关（队列排不空、喂入卡死），虚报大值使闸门
+   * 永不开（竞速无约束）；written 只增不减且按播放实时推进，绕开播放头。
+   * iOS/鸿蒙播放头可靠，维持 enqueued − played 语义。
+   * 供 voiceStreamSpeaker.kickFeed 做「生产节流」：缓冲低于阈值才喂下一句。
+   * 非原生 / 播放器未创建返回 -1（不可用，不节流）。
+   */
+  getNativeBufferedMs(): number {
+    // #ifdef APP-ANDROID
+    const p = this.streamPcmPlayer;
+    if (p == null) {
+      return -1;
+    }
+    return p.getEnqueuedMs() - p.getWrittenMs();
+    // #endif
+    // #ifdef APP-IOS || APP-HARMONY
+    const p = this.streamPcmPlayer;
+    if (p == null) {
+      return -1;
+    }
+    return p.getEnqueuedMs() - p.getPlayedMs();
+    // #endif
+    // #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
+    return -1;
+    // #endif
+  }
+
+  /**
+   * 原生流式：已投递播放器的 PCM 总时长（ms）；播放器未创建返回 -1。
+   * 供 kickFeed 闸门B判定「上一句音频是否完整到达」——enqueued 单调递增，
+   * 相对上次喂入的增长量即已送达的音频量。
+   */
+  getNativeEnqueuedMs(): number {
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    const p = this.streamPcmPlayer;
+    if (p == null) {
+      return -1;
+    }
+    return p.getEnqueuedMs();
+    // #endif
+    // #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
+    return -1;
+    // #endif
+  }
+
+  /**
+   * 最近一次 synthesizeToSrc 完成时的 PCM 估算时长（ms）。
+   * H5 blob: URL 的 string.length 不能反映音频时长，播放超时请用此值或 playSrcAndWait 的 durationMs 入参。
+   */
+  getLastSynthDurationMs(): number {
+    return this.lastSynthDurationMs;
+  }
+
+  /**
+   * 全局静音：调节当前音频音量。
+   * 静音期间点播会以 volume=0 继续播；取消静音时调用本方法即可恢复出声，无需 stop/resume。
+   */
+  setMuted(muted: boolean): void {
+    const audio = this.audioContext;
+    if (audio != null) {
+      audio!.volume = muted ? 0 : 1;
+    }
+    const alt = this.streamAltAudioContext;
+    if (alt != null) {
+      alt!.volume = muted ? 0 : 1;
+    }
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    const player = this.streamPcmPlayer;
+    if (player != null) {
+      player!.setMuted(muted);
+    }
+    // #endif
+  }
+
+  /**
+   * 暂停当前播报（用于切到静音时）。
+   * - 已在播放：pause 音频，状态改为 paused
+   * - 仍在连接/合成：直接 stop，避免静音后继续合成
+   */
+  pause(): void {
+    if (this.state == "playing" && this.audioContext != null) {
+      try {
+        this.audioContext!.pause();
+      } catch (e: any) {
+        console.warn("[TTS] pause failed", e);
+      }
+      this.pausedByMute = true;
+      this.setState("paused");
+      return;
+    }
+    if (this.state == "connecting" || this.state == "synthesizing") {
+      this.stop();
+    }
+  }
+
+  /**
+   * 恢复因静音暂停的播报。
+   */
+  resume(): void {
+    if (
+      this.pausedByMute != true ||
+      this.state != "paused" ||
+      this.audioContext == null
+    ) {
+      return;
+    }
+    const audio = this.audioContext!;
+    audio.volume = this.getTargetVolume();
+    this.pausedByMute = false;
+    this.setState("playing");
+    try {
+      audio.play();
+    } catch (e: any) {
+      console.warn("[TTS] resume failed", e);
+    }
+  }
+
+  /**
+   * H5：audio.play() 在 uni-app x 运行时内被丢弃（play(){this._audio.play()}），返回值恒为
+   * undefined，因此这里 catch 不到任何东西——被 pause()/stop()/换源打断的 AbortError 只能靠
+   * App.uvue 的全局 unhandledrejection 兜底吞掉。本方法保留：一是防御未来运行时返回 Promise，
+   * 二是非 H5 平台正常同步 play()。
+   */
+  private safePlay(audio: InnerAudioContext): void {
+    // #ifdef H5 || WEB
+    try {
+      const p = audio.play() as any;
+      if (p != null && typeof p.catch == "function") {
+        p.catch((e: any) => {
+          const name = e != null && (e as any).name != null ? `${(e as any).name}` : "";
+          const msg = e != null && (e as any).message != null ? `${(e as any).message}` : "";
+          console.error("[H5Voice] safePlay rejected name=" + name + " msg=" + msg);
+        });
+      }
+    } catch (eSafe: any) {
+      console.error("[H5Voice] safePlay threw", eSafe);
+    }
+    // #endif
+    // #ifndef H5 || WEB
+    audio.play();
+    // #endif
+  }
+
+  /** 按当前 VoiceSettings.muted 计算目标音量 */
+  private getTargetVolume(): number {
+    return loadVoiceSettings().muted == true ? 0 : 1;
+  }
+
   async play(messageId: string, text: string): Promise<void> {
-    this.stop();
+    // 串行分句时复用已解锁的 InnerAudioContext，避免 H5 第二句再走手势解锁失败后卡住
+    // 只结束上一句会话音频状态，禁止动预热 TCP（recycle 空 session 为 no-op）
+    this.prepareForNextUtterance(true);
     if (text.trim().length == 0) {
       throw new Error("没有可播报的文本");
     }
-    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
-    if (tokenRaw == null) {
-      throw new Error("登录状态已失效");
-    }
-    let accessToken = tokenRaw as string;
-    if (accessToken.startsWith("Bearer ")) {
-      accessToken = accessToken.substring(7);
-    }
+    const accessToken = resolveSpeechAccessToken();
     if (accessToken.length == 0) {
       throw new Error("登录状态已失效");
     }
@@ -168,110 +1016,2244 @@ export class TtsWebSocketPlayer {
     this.messageId = messageId;
     this.text = text;
     this.chunks = [] as Uint8Array[];
+    this.pendingBinary = 0;
+    this.finishRequested = false;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
     this.setState("connecting");
 
-    await new Promise<void>((resolve, reject) => {
-      let socketTask: SocketTask;
-      // 浏览器使用 URL Query 鉴权。
-      // #ifdef H5 || WEB
-      socketTask = uni.connectSocket({
-        url: createTtsWebSocketUrl(accessToken),
-        fail: (err) => reject(new Error(err.errMsg ?? "TTS 连接失败")),
-      });
-      // #endif
-      // App（含 iOS）/小程序使用 Bearer Header。
-      // #ifndef H5 || WEB
-      socketTask = uni.connectSocket({
-        url: createTtsWebSocketUrl(accessToken),
-        header: createTtsWebSocketHeaders(accessToken),
-        fail: (err) => reject(new Error(err.errMsg ?? "TTS 连接失败")),
-      });
-      // #endif
-      this.socketTask = socketTask;
+    // 仅首次创建并解锁；后续句子复用同一 audio，否则无手势下 H5 会拦截且 playAndWait 永不结束
+    if (this.audioContext == null) {
+      this.prepareAudioContextForGesture();
+    }
 
-      socketTask.onOpen(() => {
+    // 预热丢失（上次 fail 关连 / 对端掐断）时先补待命再取用，避免业务路径直接 new WebSocket
+    if (
+      this.warmupEnabled == true &&
+      this.isWarmOpen() != true &&
+      this.warmSocketTask == null
+    ) {
+      console.warn("[TTS] warm missing before play → ensure warm");
+      this.ensureWarmSocketAsync();
+      await this.waitForWarmOpen(3000);
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+    }
+
+    await this.takeOrOpenSessionSocket(accessToken, expectedGeneration);
+    if (expectedGeneration != this.generation) {
+      return;
+    }
+    this.sendJson(buildTtsControlMessage("start", null, this.sampleRate));
+  }
+
+  /**
+   * 与工具栏 play 同一套合成+播报，并等到本轮结束（idle/error）再返回。
+   * @returns true=正常播完；false=error/超时/无音频（调用方应停掉后续分句）
+   */
+  async playAndWait(messageId: string, text: string): Promise<boolean> {
+    const trimmed = text.trim();
+    if (trimmed.length == 0) {
+      return true;
+    }
+    await this.play(messageId, trimmed);
+    const expectedGeneration = this.generation;
+    // 防止 H5 起播失败时永远卡在 synthesizing（听感=播完一句就停）
+    let waitMs = 30000 + trimmed.length * 80;
+    if (waitMs > 180000) {
+      waitMs = 180000;
+    }
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let seenActive = false;
+      let succeeded = true;
+      let listenerId = 0;
+      let timerId = 0;
+      const finish = (ok: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timerId > 0) {
+          clearTimeout(timerId);
+          timerId = 0;
+        }
+        if (listenerId > 0) {
+          this.unsubscribe(listenerId);
+          listenerId = 0;
+        }
+        resolve(ok);
+      };
+      timerId = setTimeout(() => {
+        if (expectedGeneration == this.generation) {
+          // 超时收尾：收回待命并进入闲置关闭，不再强制补预热
+          this.prepareForNextUtterance(true);
+        }
+        finish(false);
+      }, waitMs);
+      listenerId = this.subscribe((state: TtsPlaybackState, _mid: string) => {
+        // 正常播完：onEnded → prepareForNextUtterance 会先 bump generation 再 idle。
+        // 若此处一律按 generation 不等判失败，流式首句播完会被当成 TTS failed，后续分句全部丢弃。
         if (expectedGeneration != this.generation) {
-          return;
-        }
-        this.sendJson({
-          type: "start",
-          sample_rate: this.sampleRate,
-          frame_duration_ms: 20,
-        } as UTSJSONObject);
-        resolve();
-      });
-      socketTask.onMessage((res: OnSocketMessageCallbackResult) => {
-        if (expectedGeneration != this.generation) {
-          return;
-        }
-        this.handleSocketMessage(res);
-      });
-      socketTask.onError((err) => {
-        if (
-          expectedGeneration != this.generation ||
-          this.socketTask == null
-        ) {
-          return;
-        }
-        this.fail(err.errMsg ?? "TTS WebSocket 错误");
-        reject(new Error(err.errMsg ?? "TTS WebSocket 错误"));
-      });
-      socketTask.onClose(() => {
-        if (this.socketTask == null) {
+          if (seenActive == true && (state == "idle" || state == "error")) {
+            finish(state != "error");
+          } else if (seenActive != true) {
+            finish(false);
+          }
           return;
         }
         if (
-          expectedGeneration == this.generation &&
-          this.state != "playing" &&
-          this.state != "idle"
+          state == "connecting" ||
+          state == "synthesizing" ||
+          state == "playing"
         ) {
-          this.fail("TTS 连接已关闭");
+          seenActive = true;
+          return;
+        }
+        if (state == "error") {
+          succeeded = false;
+          finish(false);
+          return;
+        }
+        if (seenActive == true && state == "idle") {
+          finish(succeeded);
         }
       });
     });
   }
 
-  stop(): void {
+  /** 当前合成/取连接操作是否已取消 */
+  private isSynthOpCancelled(
+    preservePlayingAudio: boolean,
+    expectedGeneration: number,
+    expectedSynthEpoch: number,
+  ): boolean {
+    if (preservePlayingAudio == true) {
+      return expectedSynthEpoch != this.synthEpoch;
+    }
+    return expectedGeneration != this.generation;
+  }
+
+  /**
+   * 取消边播边合成（不打断当前音频播放）。
+   * kickPlay 失败 / 换轮次时调用。
+   */
+  cancelInFlightPreserveSynth(): void {
+    if (this.synthInFlight != true) {
+      return;
+    }
+    this.synthEpoch += 1;
+    this.synthInFlight = false;
+    this.clearSynthStallWatchdog();
+    this.finishRequested = false;
+    this.pendingBinary = 0;
+    this.chunks = [] as Uint8Array[];
+    this.recycleSessionToWarm();
+  }
+
+  // ==================== 流式会话实现 ====================
+
+  /** 注册会话段/结束回调（voiceStreamSpeaker 注入；重复调用覆盖） */
+  setStreamSessionHandlers(
+    onSegment: ((src: string, durationMs: number) => void) | null,
+    onEnd: (() => void) | null,
+  ): void {
+    this.streamSegmentHandler = onSegment;
+    this.streamEndHandler = onEnd;
+  }
+
+  /**
+   * 开启一轮流式会话：一次 start，之后多次 feedStreamText，flush 后 tts_end 收尾。
+   * 异步打开连接并发送 start；tts_ready 前 feed 的文本会排队，就绪后自动冲刷。
+   * 会打断当前播报（含工具栏单条播放），语义与 synthesizeToSrc(preserve=false) 一致。
+   */
+  beginStreamSession(messageId: string): void {
+    // 旧会话先收尾（清字段、防双 sink）。注意：不 notify ——
+    // 旧轮等待者由调用方（voiceStreamSpeaker.begin → ttsWebSocketPlayer.stop → closeStreamSession）
+    // 负责唤醒；若在此 notify，会命中「刚注册的本轮 end handler」，把 speaker.streamEnded 误置 true，
+    // 导致整轮立即 finishRound 不出声。
+    this.resetStreamSessionState(false);
+    this.prepareForNextUtterance(true);
+    this.streamMessageId = messageId;
+    this.messageId = messageId;
+    this.streamSessionActive = true;
+    this.streamReady = false;
+    this.streamEnded = false;
+    this.streamFlushSent = false;
+    this.pendingFeedTexts = [] as string[];
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    // 原生流式播放：PCM 直推 AudioTrack（无文件/段边界），分段 WAV 路径仅作兜底
+    this.streamNativeActive = true;
+    // #endif
+    this.setState("connecting");
+    const accessToken = resolveSpeechAccessToken();
+    if (accessToken.length == 0) {
+      this.fail("登录状态已失效");
+      return;
+    }
     this.generation += 1;
+    const expectedGeneration = this.generation;
+    this.takeOrOpenSessionSocket(accessToken, expectedGeneration).then(
+      (): void => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        // 覆盖 bindSessionHandlers 装的 play 路径 sink：会话独立处理 tts_ready 排队 / 切段
+        this.installStreamSessionSink(expectedGeneration);
+        this.sendJson(buildTtsControlMessage("start", null, this.sampleRate));
+      },
+      (e: any): void => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        const msg =
+          e != null && (e as Error).message != null
+            ? `${(e as Error).message}`
+            : "TTS 连接失败";
+        this.fail(msg);
+      },
+    );
+  }
+
+  /**
+   * 喂入一段待合成文本。
+   * @param flush true：本条为尾段（等价 flush），服务端收尾并回 tts_end
+   */
+  feedStreamText(text: string, flush: boolean): void {
+    if (this.streamSessionActive != true || this.streamEnded == true) {
+      return;
+    }
+    if (flush == true) {
+      this.streamFlushSent = true;
+    }
+    if (this.streamReady != true) {
+      this.pendingFeedTexts.push(text);
+      return;
+    }
+    this.sendFeedTextFrame(text, flush);
+  }
+
+  /** 冲刷尾包（独立 flush 帧；feed 的尾段带 flush:true 后无需再调） */
+  flushStreamSession(): void {
+    if (this.streamSessionActive != true || this.streamFlushSent == true) {
+      return;
+    }
+    this.streamFlushSent = true;
+    if (this.streamReady == true) {
+      this.sendFlushFrame();
+    }
+    // ready 前 flush：由 tts_ready → flushPendingFeedTexts 补发
+  }
+
+  /** 用户停止 / 离开：结束流式会话（发 close；服务端回 tts_closed 后 socket 收回待命） */
+  closeStreamSession(): void {
+    this.clearFlushEndWatchdog();
+    const active = this.streamSessionActive == true;
+    const socketAlive = this.socketTask != null;
+    this.resetStreamSessionState(false);
+    if (active == true && socketAlive == true) {
+      const payload = new UTSJSONObject();
+      payload["type"] = "close";
+      this.sendJson(payload);
+    }
+    // 通知会话端（voiceStreamSpeaker 的 kickPlay 靠它退出）
+    this.notifyStreamEnd();
+  }
+
+  private sendFeedTextFrame(text: string, flush: boolean): void {
+    this.sendJson(buildTtsControlMessage("text", text, 0, flush));
+    // 文本真正喂出后才武装「无音频」看门狗（每轮仅首帧一次，PCM 到达即清除）：
+    // tts_ready 时可能正文还没到（工具调用/思考期），从那时起算会把合法空等判死。
+    this.armStreamNoAudioWatchdogOnce();
+    if (flush == true) {
+      this.armFlushEndWatchdog();
+    }
+  }
+
+  /** 流式会话「喂出文本后无 PCM」看门狗：每轮首次喂 text 时武装一次（原生/分段路径各自计时） */
+  private armStreamNoAudioWatchdogOnce(): void {
+    if (this.streamNoAudioArmed == true) {
+      return;
+    }
+    this.streamNoAudioArmed = true;
+    if (this.isStreamNativeMode() == true) {
+      // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+      this.armNativeNoAudioWatchdog();
+      // #endif
+    } else {
+      this.armSynthStallWatchdog();
+    }
+  }
+
+  private sendFlushFrame(): void {
+    const payload = new UTSJSONObject();
+    payload["type"] = "flush";
+    this.sendJson(payload);
+    this.armFlushEndWatchdog();
+  }
+
+  private flushPendingFeedTexts(): void {
+    const pending = this.pendingFeedTexts;
+    this.pendingFeedTexts = [] as string[];
+    for (let i = 0; i < pending.length; i++) {
+      this.sendFeedTextFrame(pending[i], false);
+    }
+    if (this.streamFlushSent == true) {
+      this.sendFlushFrame();
+    }
+  }
+
+  /** 会话消息处理：与 play 路径的 handleSocketMessage 平级 */
+  private handleStreamSessionMessage(res: OnSocketMessageCallbackResult): void {
+    if (typeof res.data != "string") {
+      this.appendStreamChunk(res.data);
+      return;
+    }
+    let message: UTSJSONObject | null = null;
+    try {
+      message = JSON.parse<UTSJSONObject>(res.data as string);
+    } catch (_eJson) {
+      this.fail("TTS 返回了无效消息");
+      return;
+    }
+    if (message == null) {
+      return;
+    }
+    const typeVal = message!["type"];
+    const type = typeVal != null ? `${typeVal}` : "";
+    if (type == "ping" || type == "pong") {
+      return;
+    }
+    if (type == "tts_ready") {
+      this.streamReady = true;
+      this.setState("synthesizing");
+      // 「无音频」看门狗不在此武装：会话可能在正文产出前 begin（发送即 pre-begin，工具调用/思考期无文本），
+      // 从 tts_ready 起算 12s 会把合法空等判死。改为首次实际喂出 text 帧时武装（sendFeedTextFrame）。
+      this.flushPendingFeedTexts();
+    } else if (type == "tts_begin") {
+      this.streamAudioStarted = true;
+      this.setState("synthesizing");
+    } else if (type == "tts_end") {
+      this.clearFlushEndWatchdog();
+      // 本轮已结束：解除「无音频」看门狗（避免空合成 / 已播完回合在 12s 后补弹）
+      this.clearSynthStallWatchdog();
+      // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+      this.clearNativeNoAudioWatchdog();
+      if (this.streamNativeActive == true) {
+        // 原生流式：tts_end 只表示不再有新 PCM，交给排空轮询播完即收尾
+        console.log("[TTS] native inputDone via tts_end");
+        this.streamInputDone = true;
+        this.streamInputDoneAtMs = Date.now();
+        this.armStreamDrainPoll();
+        return;
+      }
+      // #endif
+      this.streamNoAudioArmed = false;
+      this.streamEnded = true;
+      // 收尾剩余缓冲（final=true 强制切，即便不足阈值）
+      this.tryCutStreamSegment(true);
+      this.notifyStreamEnd();
+    } else if (type == "error") {
+      const codeVal = message!["code"];
+      const messageVal = message!["message"];
+      const code = codeVal != null ? `${codeVal}` : "";
+      const msg = messageVal != null ? `${messageVal}` : "TTS 合成失败";
+      if (
+        code == "UNKNOWN_TYPE" &&
+        (msg.indexOf("ping") >= 0 || msg.indexOf("pong") >= 0)
+      ) {
+        this.keepalive.markRejectedByServer();
+        return;
+      }
+      this.fail(msg);
+    } else if (type.length > 0) {
+      console.warn("[TTS] stream unknown ctrl type=", type);
+    }
+  }
+
+  /** 会话二进制帧：追加并尝试按阈值切段 */
+  private appendStreamChunk(data: any): void {
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    if (this.streamNativeActive == true) {
+      // 原生流式：PCM 直推 AudioTrack，不切段、不写文件。
+      // 注意：Uint8Array 元素读取只能做一次（uni-app x 共享游标，重复读返回 0），
+      // 这里只 new 一次交给 pushToNativePlayer，绝不在入口再读。
+      const syncBuffer = tryAsArrayBufferSync(data);
+      if (syncBuffer != null && syncBuffer!.byteLength > 0) {
+        this.pushToNativePlayer(new Uint8Array(syncBuffer!));
+        this.clearSynthStallWatchdog();
+      }
+      return;
+    }
+    // #endif
+    const syncBuffer = tryAsArrayBufferSync(data);
+    if (syncBuffer != null) {
+      if (syncBuffer!.byteLength > 0) {
+        this.chunks.push(new Uint8Array(syncBuffer!));
+        this.streamPcmBytes += syncBuffer!.byteLength;
+        this.clearSynthStallWatchdog();
+        this.tryCutStreamSegment(false);
+      } else {
+        console.warn("[TTS] stream skip empty binary frame");
+      }
+      return;
+    }
+    this.pendingBinary += 1;
+    toArrayBufferAsync(data).then((buffer: ArrayBuffer | null): void => {
+      this.pendingBinary -= 1;
+      if (this.pendingBinary < 0) {
+        this.pendingBinary = 0;
+      }
+      if (buffer != null && buffer!.byteLength > 0) {
+        this.chunks.push(new Uint8Array(buffer!));
+        this.streamPcmBytes += buffer!.byteLength;
+        this.clearSynthStallWatchdog();
+      } else {
+        console.warn("[TTS] stream skip empty/unrecognized binary frame");
+      }
+      this.tryCutStreamSegment(false);
+    });
+  }
+
+  /** 原生流式是否启用（Android AudioTrack 边推边播；其他平台恒 false，走分段 WAV 路径） */
+  isStreamNativeMode(): boolean {
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    return this.streamNativeActive == true;
+    // #endif
+    // #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
+    return false;
+    // #endif
+  }
+
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+  /** 把一帧 PCM 直推 AudioTrack（懒创建播放器 + 启动播放 + 挂排空轮询） */
+  private pushToNativePlayer(frame: Uint8Array): void {
+    if (this.streamPcmPlayer == null) {
+      const player = new StreamPcmPlayer();
+      player.initPlayer(this.sampleRate);
+      this.streamPcmPlayer = player;
+    }
+    this.clearNativeNoAudioWatchdog();
+    // iOS 桥接直接把 Uint8Array 传进插件参数会在 model 解析时崩（SIGILL），
+    // iOS 走 base64 字符串跨桥；Android/HarmonyOS 直传 Uint8Array
+    // （鸿蒙 UTS 直编 ArkTS，无跨桥，typed-array 安全直传）。
+    // #ifdef APP-IOS
+    const raw = frame.buffer;
+    if (raw != null && raw.byteLength > 0) {
+      const b64 = uni.arrayBufferToBase64(raw);
+      if (b64 != null && b64.length > 0) {
+        this.streamPcmPlayer!.pushBase64(b64);
+      }
+    }
+    // #endif
+    // #ifdef APP-ANDROID || APP-HARMONY
+    this.streamPcmPlayer!.push(frame);
+    // #endif
+    this.streamPcmPlayer!.ensurePlaying();
+    this.armStreamDrainPoll();
+  }
+
+  private armNativeNoAudioWatchdog(): void {
+    this.clearNativeNoAudioWatchdog();
+    this.nativeNoAudioTimerId = setTimeout((): void => {
+      this.nativeNoAudioTimerId = 0;
+      // 诊断：无音频时打会话状态（socket/session/player）
+      console.warn(
+        "[TTS] no-audio watchdog: sessionActive=" +
+          this.streamSessionActive +
+          " ready=" +
+          this.streamReady +
+          " flushSent=" +
+          this.streamFlushSent +
+          " socketTask=" +
+          (this.socketTask != null) +
+          " playerCreated=" +
+          (this.streamPcmPlayer != null) +
+          " writtenMs=" +
+          (this.streamPcmPlayer != null
+            ? this.streamPcmPlayer!.getWrittenMs()
+            : -1),
+      );
+      // 续等：正文可能还在流 / 网络延迟 / 中途工具调用，音频迟到应能等到而非误停；
+      // 但续等有总上限（NATIVE_NO_AUDIO_REARM_LIMIT），超限仍无任何 PCM 即判死——
+      // 防「无音频反馈 + 会话不收尾」时无限 re-arm、图标永久卡住。
+      if (
+        this.streamFlushSent != true &&
+        this.streamSessionActive == true &&
+        this.nativeNoAudioRearmCount < this.NATIVE_NO_AUDIO_REARM_LIMIT
+      ) {
+        this.nativeNoAudioRearmCount += 1;
+        console.warn("[TTS] no-audio: SSE still streaming, re-arm watchdog");
+        this.armNativeNoAudioWatchdog();
+        return;
+      }
+      // 已收尾（flush 已发 / 会话结束）或续等超限仍无任何 PCM 帧：按失败收尾，防原生模式下图标卡死
+      if (this.streamPcmPlayer == null || this.streamPcmPlayer!.getWrittenMs() <= 0) {
+        this.fail("TTS 服务未返回音频");
+      }
+    }, 12000) as number;
+  }
+
+  private clearNativeNoAudioWatchdog(): void {
+    if (this.nativeNoAudioTimerId != 0) {
+      clearTimeout(this.nativeNoAudioTimerId);
+      this.nativeNoAudioTimerId = 0;
+    }
+  }
+
+  private armStreamDrainPoll(): void {
+    if (this.streamDrainTimerId != 0) {
+      return;
+    }
+    this.streamDrainTimerId = setTimeout((): void => {
+      this.streamDrainTimerId = 0;
+      this.checkNativeDrain();
+    }, 200) as number;
+  }
+
+  private clearStreamDrainPoll(): void {
+    if (this.streamDrainTimerId != 0) {
+      clearTimeout(this.streamDrainTimerId);
+      this.streamDrainTimerId = 0;
+    }
+  }
+
+  /** 排空轮询：输入结束后写入的 PCM 播完即整轮结束；带「写入时长+30s」兜底防播放头卡死 */
+  private checkNativeDrain(): void {
+    const player = this.streamPcmPlayer;
+    if (player == null) {
+      this.clearStreamDrainPoll();
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+      return;
+    }
+    player.flushPending();
+    player.ensurePlaying();
+    if (this.streamInputDone == true) {
+      // 输入结束：即便不足起始缓冲也强制开播，避免短音频不出声
+      player.playNow();
+    }
+    if (this.streamInputDone == true && player.isDrained() == true) {
+      // 诊断：排空结束时的 written/played（判断是否提前排空）
+      console.log(
+        "[TTS] native drained: writtenMs=" +
+          player.getWrittenMs() +
+          " playedMs=" +
+          player.getPlayedMs() +
+          " inputDoneAt=" +
+          (Date.now() - this.streamInputDoneAtMs),
+      );
+      this.clearStreamDrainPoll();
+      this.releaseStreamPcmPlayer();
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+      return;
+    }
+    // #ifdef APP-HARMONY
+    // 播放器停滞检测（仅鸿蒙）：鸿蒙桥 write() 挂起/重建穷尽时（giveUpOnStall 清 in-queue、
+    // 不清 enqueuedBytes）表现为 isDrained()=true 且 written<enqueued，命中即整轮收尾复位图标，
+    // 避免工具栏卡在播报态。Android/iOS 不加：Android 有独立的 write-complete 排空路径且
+    // 播放头在部分机型会跳变；iOS 的 isDrained 只比 written 部分、主线程繁忙时 writer 短暂
+    // 滞后也会短暂满足该条件 → 会误杀会话。
+    if (player.isDrained() == true && player.getWrittenMs() < player.getEnqueuedMs()) {
+      console.warn(
+        "[TTS] native player stalled, end round: writtenMs=" +
+          player.getWrittenMs() +
+          " enqueuedMs=" +
+          player.getEnqueuedMs(),
+      );
+      this.clearStreamDrainPoll();
+      this.releaseStreamPcmPlayer();
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+      return;
+    }
+    // #endif
+    // #ifdef APP-ANDROID
+    // 播放头不可靠时的尾部排空（实测部分 Android 机型 getPlaybackHeadPosition 长期为负/跳变，
+    // isDrained 永不成立——单靠 deadline 要等 enqueuedMs+30s，播完图标卡住不恢复）。
+    // 改用与播放头无关的判据：全部字节已入硬件（written >= enqueued，队列/重试帧为空）后，
+    // 剩余音频只在硬件缓冲里，播完时长相上界 = getBufferMs()。距观察到写入完成
+    // ≥ 缓冲时长 + 余量即视为播完——只等硬件缓冲自然放完，不切仍在管道里可能出声的音频。
+    if (this.streamInputDone == true && player.isWriteComplete() == true) {
+      if (this.nativeDrainWriteCompleteAtMs == 0) {
+        this.nativeDrainWriteCompleteAtMs = Date.now();
+      }
+      if (
+        Date.now() - this.nativeDrainWriteCompleteAtMs >=
+        player.getBufferMs() + this.NATIVE_DRAIN_TAIL_MARGIN_MS
+      ) {
+        console.log(
+          "[TTS] native drained via write-complete tail: enqueuedMs=" +
+            player.getEnqueuedMs() +
+            " writtenMs=" +
+            player.getWrittenMs() +
+            " playedMs=" +
+            player.getPlayedMs() +
+            " bufferMs=" +
+            player.getBufferMs(),
+        );
+        this.clearStreamDrainPoll();
+        this.releaseStreamPcmPlayer();
+        this.streamEnded = true;
+        this.notifyStreamEnd();
+        return;
+      }
+    } else {
+      // 写入未完成（新音频仍可能入队 / 硬件未接受全部）：重置完成观察点，避免上一轮残留误判
+      this.nativeDrainWriteCompleteAtMs = 0;
+    }
+    // #endif
+    if (this.streamInputDone == true) {
+      // 兜底 deadline 用「入队总量 + 30s」（回归原公式，不依赖 playedMs）：
+      // 模拟器上 getPlayedMs（播放头）可能跳变/回退（实测 enqueued 194s 时
+      // remainingSnapshot 42.6s / remainingNow 89.4s 自相矛盾），任何基于它的
+      // 剩余预估都会在长音频正常播放时误切。此 deadline 只做「已入队音频远超预期
+      // 仍未播完」的极限兜底；写循环卡死由下方 writtenMs 进度检测负责（~5-10s 判死）。
+      const deadline = this.streamInputDoneAtMs + player.getEnqueuedMs() + 30000;
+      if (Date.now() > deadline) {
+        // 诊断：兜底超时触发（入队音频远超预期仍未播完）
+        console.warn(
+          "[TTS] native drain deadline: enqueuedMs=" +
+            player.getEnqueuedMs() +
+            " writtenMs=" +
+            player.getWrittenMs() +
+            " playedMs=" +
+            player.getPlayedMs(),
+        );
+        this.clearStreamDrainPoll();
+        this.releaseStreamPcmPlayer();
+        this.streamEnded = true;
+        this.notifyStreamEnd();
+        return;
+      }
+      // 写循环进度冻结检测：writtenMs 单调递增（比 playedMs 可靠，模拟器播放头不可靠）。
+      // 仍有未写音频（written<enqueued）且 5s 窗口内几乎无推进 → 渲染器不消费，判死复位图标。
+      if (this.lastDrainProgressAtMs == 0) {
+        this.lastDrainProgressAtMs = Date.now();
+        this.lastDrainWrittenMs = player.getWrittenMs();
+      } else if (
+        Date.now() - this.lastDrainProgressAtMs >=
+        this.NATIVE_DRAIN_PROGRESS_WINDOW_MS
+      ) {
+        const written = player.getWrittenMs();
+        const advanced = written - this.lastDrainWrittenMs;
+        this.lastDrainProgressAtMs = Date.now();
+        this.lastDrainWrittenMs = written;
+        if (
+          written < player.getEnqueuedMs() &&
+          advanced < this.NATIVE_DRAIN_MIN_PROGRESS_MS
+        ) {
+          console.warn(
+            "[TTS] native drain stalled: writtenMs=" +
+              written +
+              " enqueuedMs=" +
+              player.getEnqueuedMs() +
+              " playedMs=" +
+              player.getPlayedMs() +
+              " advanced=" +
+              advanced +
+              " in " +
+              this.NATIVE_DRAIN_PROGRESS_WINDOW_MS +
+              "ms",
+          );
+          this.clearStreamDrainPoll();
+          this.releaseStreamPcmPlayer();
+          this.streamEnded = true;
+          this.notifyStreamEnd();
+          return;
+        }
+      }
+    }
+    this.armStreamDrainPoll();
+  }
+
+  /** 释放原生播放器并停掉排空轮询（幂等） */
+  private releaseStreamPcmPlayer(): void {
+    this.clearStreamDrainPoll();
+    this.clearNativeNoAudioWatchdog();
+    const player = this.streamPcmPlayer;
+    this.streamPcmPlayer = null;
+    if (player != null) {
+      try {
+        player.releasePlayer();
+      } catch (_eRel) {
+        // ignore
+      }
+    }
+  }
+  // #endif
+
+  /**
+   * 按阈值把已积累 PCM 切为一段 WAV 并交给 streamSegmentHandler。
+   * 串行化：streamCutting 置位期间不重复切，保证段回调顺序与音频顺序一致。
+   * @param final tts_end/flush 超时时强制切掉剩余缓冲
+   */
+  /**
+   * 播放端队列排空时请求按需切段：立即把已缓冲音频切出（无需凑满 STREAM_SEGMENT_MS），
+   * 消除「凑段等待」造成的段边界停顿。force 标记在成功切段后清除；缓冲不足最小段时保留，
+   * 等下一帧到达再切。
+   */
+  requestStreamSegment(): void {
+    if (this.streamSessionActive != true || this.streamEnded == true) {
+      return;
+    }
+    this.streamForcePending = true;
+    this.tryCutStreamSegment(false);
+  }
+
+  private tryCutStreamSegment(final: boolean): void {
+    // tts_end/flush 超时：标记尾段待切，等写段/pendingBinary 结束后兜底切掉，防剩余 PCM 丢失
+    if (final == true && this.chunks.length > 0) {
+      this.streamFinalPending = true;
+    }
+    if (this.pendingBinary > 0 || this.streamCutting == true) {
+      return;
+    }
+    const isFinal = this.streamFinalPending == true;
+    if (isFinal) {
+      this.streamFinalPending = false;
+    }
+    if (this.chunks.length == 0) {
+      return;
+    }
+    if (isFinal != true) {
+      const durMs = Math.floor(
+        (this.streamPcmBytes * 1000) / (this.sampleRate * 2),
+      );
+      if (this.streamForcePending == true) {
+        // 按需切段：不等满阈值，但须攒够最小段，避免逐帧切成碎片段
+        if (durMs < this.STREAM_FORCED_SEGMENT_MIN_MS) {
+          return;
+        }
+      } else {
+        const targetMs = this.streamFirstSegmentDone
+          ? this.STREAM_SEGMENT_MS
+          : this.STREAM_FIRST_SEGMENT_MS;
+        if (durMs < targetMs) {
+          return;
+        }
+      }
+    }
+    this.streamForcePending = false;
+    this.cutStreamSegmentNow();
+  }
+
+  /** 把当前累积 PCM 切为一段 WAV 并交给 streamSegmentHandler（串行化，保证回调顺序） */
+  private cutStreamSegmentNow(): void {
+    // 快照并清空累积，后续 PCM 进入下一段
+    const segChunks: Uint8Array[] = [];
+    for (let i = 0; i < this.chunks.length; i++) {
+      segChunks.push(this.chunks[i]);
+    }
+    this.chunks = [] as Uint8Array[];
+    this.streamPcmBytes = 0;
+    this.streamCutting = true;
+    let pcmBytes = 0;
+    for (let i = 0; i < segChunks.length; i++) {
+      pcmBytes += segChunks[i].length;
+    }
+    const durMs = Math.floor((pcmBytes * 1000) / (this.sampleRate * 2));
+    const wav = buildPcm16Wav(segChunks, this.sampleRate);
+    saveWavFile(wav).then(
+      (src: string): void => {
+        this.streamCutting = false;
+        this.lastSynthDurationMs = durMs > 0 ? durMs : 0;
+        this.streamFirstSegmentDone = true;
+        const handler = this.streamSegmentHandler;
+        if (handler != null) {
+          try {
+            handler(src, this.lastSynthDurationMs);
+          } catch (_eH) {
+            // ignore
+          }
+        }
+        // 写段期间又积累了新 PCM：继续切（final 场景已由 tts_end/flush 看门狗兜底）
+        this.tryCutStreamSegment(false);
+      },
+      (e: any | null): void => {
+        this.streamCutting = false;
+        let msg = "TTS 音频保存失败";
+        if (e != null) {
+          const em = (e as UTSJSONObject)["message"];
+          if (em != null && `${em}`.length > 0) {
+            msg = `${em}`;
+          }
+        }
+        this.fail(msg);
+      },
+    );
+  }
+
+  private armFlushEndWatchdog(): void {
+    this.clearFlushEndWatchdog();
+    this.flushEndTimerId = setTimeout((): void => {
+      this.flushEndTimerId = 0;
+      // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+      if (this.streamNativeActive == true) {
+        // 原生流式：flush 后无 tts_end 视为「不再有新音频」，已推入的 PCM 仍播完再收尾
+        this.streamInputDone = true;
+        this.streamInputDoneAtMs = Date.now();
+        this.armStreamDrainPoll();
+        return;
+      }
+      // #endif
+      // flush 后无音频产出时服务端不发 tts_begin/tts_end（doc 5.3）：按已结束收尾
+      this.streamEnded = true;
+      this.tryCutStreamSegment(true);
+      this.notifyStreamEnd();
+    }, this.STREAM_FLUSH_END_WATCHDOG_MS) as number;
+  }
+
+  private clearFlushEndWatchdog(): void {
+    if (this.flushEndTimerId > 0) {
+      clearTimeout(this.flushEndTimerId);
+      this.flushEndTimerId = 0;
+    }
+  }
+
+  private notifyStreamEnd(): void {
+    const handler = this.streamEndHandler;
+    if (handler != null) {
+      try {
+        handler();
+      } catch (_eH) {
+        // ignore
+      }
+    }
+  }
+
+  private resetStreamSessionState(notify: boolean): void {
+    this.streamSessionActive = false;
+    this.streamReady = false;
+    this.streamAudioStarted = false;
+    this.streamFlushSent = false;
+    this.streamNoAudioArmed = false;
+    this.streamEnded = true;
+    this.streamMessageId = "";
+    this.streamPcmBytes = 0;
+    this.streamFirstSegmentDone = false;
+    this.streamCutting = false;
+    this.streamFinalPending = false;
+    this.streamForcePending = false;
+    this.streamPreloadedSrc = "";
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    this.streamNativeActive = false;
+    this.streamInputDone = false;
+    this.streamInputDoneAtMs = 0;
+    this.nativeNoAudioRearmCount = 0;
+    this.lastDrainProgressAtMs = 0;
+    this.lastDrainWrittenMs = 0;
+    // #ifdef APP-ANDROID
+    this.nativeDrainWriteCompleteAtMs = 0;
+    // #endif
+    this.releaseStreamPcmPlayer();
+    // #endif
+    this.pendingFeedTexts = [] as string[];
+    this.clearFlushEndWatchdog();
+    if (notify == true) {
+      this.notifyStreamEnd();
+    }
+  }
+
+  /** 会话 sink：与 play 路径互斥，覆盖 bindSessionHandlers 装的 handleSocketMessage */
+  private installStreamSessionSink(expectedGeneration: number): void {
+    const socketTask = this.socketTask;
+    if (socketTask == null) {
+      return;
+    }
+    this.socketMessageSink = (res: OnSocketMessageCallbackResult): void => {
+      if (
+        expectedGeneration != this.generation ||
+        this.streamSessionActive != true
+      ) {
+        return;
+      }
+      this.handleStreamSessionMessage(res);
+    };
+  }
+
+  /**
+   * 只合成可播放 src，不播报（供 audioPlayerManager / 流式边播边合成）。
+   * @param preservePlayingAudio true：不 stop 当前音频、不 bump generation；供播 A 时预取 B
+   */
+  async synthesizeToSrc(
+    text: string,
+    preservePlayingAudio: boolean = false,
+  ): Promise<string> {
+    const trimmed = text.trim();
+    if (trimmed.length == 0) {
+      return "";
+    }
+    const accessToken = resolveSpeechAccessToken();
+    if (accessToken.length == 0) {
+      throw new Error("登录状态已失效");
+    }
+
+    if (preservePlayingAudio == true) {
+      // 取消上一笔预取合成；保留正在播放的音频与 generation
+      // 主句仍在占用 session 时禁止并发开第二条 WS（否则双连接 + 帧风暴 → ANR）
+      if (this.socketTask != null) {
+        console.warn("[TTS] refuse preserve synth while session busy");
+        throw new Error("TTS session busy");
+      }
+      this.synthEpoch += 1;
+      this.synthInFlight = true;
+      this.clearSynthStallWatchdog();
+      this.chunks = [] as Uint8Array[];
+      this.pendingBinary = 0;
+      this.finishRequested = false;
+      this.text = trimmed;
+      // 不改 messageId / realPlayback：当前句仍在播
+    } else {
+      // 与工具栏互斥：结束上一会话，但保留已解锁 InnerAudioContext（H5）
+      this.prepareForNextUtterance(true);
+      this.messageId = "";
+      this.text = trimmed;
+      this.chunks = [] as Uint8Array[];
+      this.pendingBinary = 0;
+      this.finishRequested = false;
+      this.realPlayback = false;
+      this.switchingToReal = false;
+      this.pausedByMute = false;
+    }
+
+    const expectedGeneration = this.generation;
+    const expectedSynthEpoch = this.synthEpoch;
+    const preserve = preservePlayingAudio == true;
+
+    await this.takeOrOpenSessionSocket(
+      accessToken,
+      expectedGeneration,
+      preserve,
+      expectedSynthEpoch,
+    );
+    if (
+      this.isSynthOpCancelled(preserve, expectedGeneration, expectedSynthEpoch)
+    ) {
+      if (preserve == true) {
+        this.synthInFlight = false;
+        this.recycleSessionToWarm();
+      }
+      throw new Error("TTS 会话已取消");
+    }
+
+    return await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      /** 对端已关闭时不可 recycle */
+      let canRecycle = true;
+      const fail = (message: string): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (preserve == true) {
+          this.synthInFlight = false;
+        }
+        // 失败不断连：收回待命，心跳继续；不碰当前播放音频
+        this.recycleSessionToWarm();
+        reject(new Error(message));
+      };
+
+      const tryFinishSrc = (): void => {
+        if (!this.finishRequested || this.pendingBinary > 0 || settled) {
+          return;
+        }
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
+          return;
+        }
+        settled = true;
+        if (preserve == true) {
+          this.synthInFlight = false;
+        }
+        if (this.chunks.length == 0) {
+          this.recycleSessionToWarm();
+          reject(new Error("TTS 未返回音频"));
+          return;
+        }
+        let pcmBytes = 0;
+        for (let ci = 0; ci < this.chunks.length; ci++) {
+          pcmBytes += this.chunks[ci].length;
+        }
+        // PCM16 mono：时长 = bytes / (sampleRate * 2)
+        const durMs = Math.floor((pcmBytes * 1000) / (this.sampleRate * 2));
+        this.lastSynthDurationMs = durMs > 0 ? durMs : 0;
+        const wav = buildPcm16Wav(this.chunks, this.sampleRate);
+        if (canRecycle == true) {
+          this.recycleSessionToWarm();
+        } else {
+          this.socketTask = null;
+        }
+        saveWavFile(wav).then(
+          (src: string) => {
+            resolve(src);
+          },
+          (e: any | null) => {
+            let msg = "TTS 音频保存失败";
+            if (e != null) {
+              const em = (e as UTSJSONObject)["message"];
+              if (em != null && `${em}`.length > 0) {
+                msg = `${em}`;
+              }
+            }
+            reject(new Error(msg));
+          },
+        );
+      };
+
+      // 临时覆盖消息处理：合成路径不走播放（经 socketMessageSink，不二次 onMessage）
+      const sock = this.socketTask;
+      if (sock == null) {
+        fail("TTS 连接失败");
+        return;
+      }
+      this.installSocketRouter(sock!);
+      this.socketMessageSink = (res: OnSocketMessageCallbackResult): void => {
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
+          return;
+        }
+        if (typeof res.data != "string") {
+          this.pendingBinary += 1;
+          toArrayBufferAsync(res.data).then((buffer: ArrayBuffer | null): void => {
+            this.pendingBinary -= 1;
+            if (this.pendingBinary < 0) {
+              this.pendingBinary = 0;
+            }
+            if (
+              this.isSynthOpCancelled(
+                preserve,
+                expectedGeneration,
+                expectedSynthEpoch,
+              )
+            ) {
+              tryFinishSrc();
+              return;
+            }
+            if (buffer != null && buffer!.byteLength > 0) {
+              this.chunks.push(new Uint8Array(buffer!));
+            }
+            tryFinishSrc();
+          });
+          return;
+        }
+        let message: UTSJSONObject | null = null;
+        try {
+          message = JSON.parse<UTSJSONObject>(res.data as string);
+        } catch (_eJson) {
+          fail("TTS 返回了无效消息");
+          return;
+        }
+        if (message == null) {
+          return;
+        }
+        const typeVal = message!["type"];
+        const type = typeVal != null ? `${typeVal}` : "";
+        if (type == "ping" || type == "pong") {
+          return;
+        }
+        if (type == "tts_ready") {
+          this.sendJson(buildTtsControlMessage("text", trimmed, 0, true));
+        } else if (type == "tts_begin") {
+          // 服务端正常生命周期：每句合成开始都会推一次，流式多句会多次出现，无需告警
+          return;
+        } else if (type == "tts_end") {
+          this.finishRequested = true;
+          tryFinishSrc();
+        } else if (type == "error") {
+          const codeVal = message!["code"];
+          const messageVal = message!["message"];
+          const code = codeVal != null ? `${codeVal}` : "";
+          const msg = messageVal != null ? `${messageVal}` : "TTS 合成失败";
+          if (
+            code == "UNKNOWN_TYPE" &&
+            (msg.indexOf("ping") >= 0 || msg.indexOf("pong") >= 0)
+          ) {
+            this.keepalive.markRejectedByServer();
+            return;
+          }
+          fail(msg);
+        } else if (type.length > 0) {
+          console.warn("[TTS] synthesize unknown type=", type);
+        }
+      };
+      sock!.onError((err: GeneralCallbackResult) => {
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
+          return;
+        }
+        fail(err.errMsg ?? "TTS WebSocket 错误");
+      });
+      sock!.onClose((_res: OnSocketCloseCallbackResult) => {
+        if (
+          this.isSynthOpCancelled(
+            preserve,
+            expectedGeneration,
+            expectedSynthEpoch,
+          ) ||
+          settled
+        ) {
+          return;
+        }
+        canRecycle = false;
+        this.finishRequested = true;
+        tryFinishSrc();
+      });
+
+      this.sendJson(buildTtsControlMessage("start", null, this.sampleRate));
+    });
+  }
+
+  /**
+   * 播放已合成的 src，并等到结束（供流式边播边合成，避免串行 playAndWait 的合成空窗）。
+   * @param expectedDurationMs 该 src 对应 PCM 估算时长；深预取时 lastSynthDurationMs 会被后续句覆盖，必须传本条目时长。
+   * @returns true=正常播完；false=error/超时
+   */
+  async playSrcAndWait(
+    messageId: string,
+    src: string,
+    expectedDurationMs: number = 0,
+  ): Promise<boolean> {
+    if (src.trim().length == 0) {
+      return true;
+    }
+    audioPlayerManager.stop();
+    // 不 bump generation / 不 recycle：预取合成可能占用 socket
+    this.clearSynthStallWatchdog();
+    this.messageId = messageId;
+    this.finishRequested = false;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
+
+    if (this.audioContext == null) {
+      this.prepareAudioContextForGesture();
+    }
+    let audio = this.audioContext;
+    if (audio == null) {
+      audio = uni.createInnerAudioContext();
+      this.audioContext = audio;
+      // #ifdef APP-IOS
+      audio.obeyMuteSwitch = false;
+      // #endif
+    }
+
+    // #ifdef H5 || WEB
+    this.revokeBlobUrl();
+    if (src.indexOf("blob:") == 0) {
+      this.blobUrl = src;
+    }
+    // #endif
+
+    this.stopSharedAudio();
+    audio!.volume = this.getTargetVolume();
+    // #ifdef APP-IOS
+    audio!.obeyMuteSwitch = false;
+    // #endif
+
+    this.playRequestId = this.playRequestId + 1;
+    const reqId = this.playRequestId;
+    const waitGeneration = this.generation;
+    let playStarted = false;
+    const startPlay = (): void => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (playStarted) {
+        return;
+      }
+      playStarted = true;
+      this.switchingToReal = true;
+      try {
+        audio!.play();
+      } catch (ePlay: any) {
+        console.warn("[TTS] playSrc.play threw", ePlay);
+        playStarted = false;
+      }
+    };
+
+    audio!.onPlay(() => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (this.switchingToReal || this.realPlayback) {
+        this.switchingToReal = false;
+        this.realPlayback = true;
+        this.setState("playing");
+      }
+    });
+    audio!.onEnded(() => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (this.realPlayback != true) {
+        return;
+      }
+      // 流水线预取可能紧接下一句合成：播放收尾一律不 recycle，避免清掉 in-flight PCM
+      this.endPlaybackKeepSynth();
+    });
+    audio!.onError((err) => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (this.switchingToReal && this.realPlayback != true) {
+        return;
+      }
+      if (this.realPlayback) {
+        this.fail(err.errMsg ?? "TTS 音频播放失败");
+      }
+    });
+
+    // #ifdef H5 || WEB
+    audio!.onCanplay(() => {
+      startPlay();
+    });
+    audio!.src = src;
+    setTimeout(() => {
+      startPlay();
+    }, 80);
+    // #endif
+
+    // #ifndef H5
+    // #ifndef WEB
+    audio!.src = src;
+    startPlay();
+    // #endif
+    // #endif
+
+    // H5 blob: URL 的 src.length≈63，旧公式几乎总是 ~30s，长音频会被误掐断
+    let durationHint = expectedDurationMs;
+    if (durationHint <= 0) {
+      durationHint = this.lastSynthDurationMs;
+    }
+    let waitMs = 60000;
+    if (durationHint > 0) {
+      waitMs = durationHint + 15000;
+    }
+    if (waitMs < 20000) {
+      waitMs = 20000;
+    }
+    if (waitMs > 300000) {
+      waitMs = 300000;
+    }
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let seenActive = false;
+      let listenerId = 0;
+      let timerId = 0;
+      const finish = (ok: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timerId > 0) {
+          clearTimeout(timerId);
+          timerId = 0;
+        }
+        if (listenerId > 0) {
+          this.unsubscribe(listenerId);
+          listenerId = 0;
+        }
+        resolve(ok);
+      };
+      timerId = setTimeout(() => {
+        console.warn(
+          "[TTS] playSrcAndWait timeout reqId=",
+          reqId,
+          "state=",
+          this.state,
+          "waitMs=",
+          waitMs,
+          "durationHint=",
+          durationHint,
+        );
+        // 必须先 finish(false)：若先 endPlayback→idle，订阅会抢成 finish(true)
+        finish(false);
+        if (reqId == this.playRequestId) {
+          this.endPlaybackKeepSynth();
+        }
+      }, waitMs);
+      listenerId = this.subscribe((state: TtsPlaybackState, _mid: string) => {
+        // endPlaybackKeepSynth 不 bump generation；外部 stop/synthesize(false) 才会 bump
+        if (waitGeneration != this.generation) {
+          if (seenActive == true && (state == "idle" || state == "error")) {
+            finish(state != "error");
+          } else if (seenActive != true) {
+            finish(false);
+          }
+          return;
+        }
+        if (state == "playing") {
+          seenActive = true;
+          return;
+        }
+        if (state == "error") {
+          finish(false);
+          return;
+        }
+        if (state == "idle" && seenActive == true) {
+          finish(true);
+        }
+      });
+    });
+  }
+
+  /**
+   * 流式段播放（双 InnerAudioContext 交替）：前一段播放期间已把本段 src 预置到
+   * 本次 context（preloadSrc），换段仅 play() 即可出声，消除换源 prepare 的空窗。
+   * H5 回退 playSrcAndWait（blob revoke / 手势解锁机制成熟），双 context 主要利好 Android。
+   * @param preloadSrc 下一段的 src：本次播放期间预置到空闲 context（可为空）
+   * @returns true=正常播完；false=error/超时
+   */
+  async playStreamSegment(
+    messageId: string,
+    src: string,
+    expectedDurationMs: number,
+    preloadSrc: string,
+  ): Promise<boolean> {
+    // #ifdef H5 || WEB
+    return await this.playSrcAndWait(messageId, src, expectedDurationMs);
+    // #endif
+    if (src.trim().length == 0) {
+      return true;
+    }
+    audioPlayerManager.stop();
+    this.clearSynthStallWatchdog();
+    this.messageId = messageId;
+    this.finishRequested = false;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
+
+    // 本段 src 是否已在上一段播放时被预置到本次 context（判断须在预置覆盖前取值）
+    const prepared = this.streamPreloadedSrc == src;
+
+    // 交替选择本次播放的 context；另一个（空闲）用于预置下一段 src
+    const useAlt = this.streamUseAlt;
+    this.streamUseAlt = !useAlt;
+    let active = useAlt == true ? this.streamAltAudioContext : this.audioContext;
+    if (active == null) {
+      active = uni.createInnerAudioContext();
+      // #ifdef APP-IOS
+      active!.obeyMuteSwitch = false;
+      // #endif
+      if (useAlt == true) {
+        this.streamAltAudioContext = active;
+      } else {
+        this.audioContext = active;
+      }
+    }
+    // 预置下一段到空闲 context（提前 set src 让它 prepare，换段时 play 即出声）
+    if (preloadSrc.length > 0) {
+      let idle = useAlt == true ? this.audioContext : this.streamAltAudioContext;
+      if (idle == null) {
+        idle = uni.createInnerAudioContext();
+        // #ifdef APP-IOS
+        idle!.obeyMuteSwitch = false;
+        // #endif
+        if (useAlt == true) {
+          this.audioContext = idle;
+        } else {
+          this.streamAltAudioContext = idle;
+        }
+      }
+      if (this.streamPreloadedSrc != preloadSrc) {
+        this.streamPreloadedSrc = preloadSrc;
+        try {
+          idle!.stop();
+          idle!.src = preloadSrc;
+        } catch (_ePre) {
+          // ignore
+        }
+      }
+    } else {
+      this.streamPreloadedSrc = "";
+    }
+
+    try {
+      if (prepared != true) {
+        active!.stop();
+        active!.src = src;
+      }
+    } catch (_eSet) {
+      // ignore
+    }
+    active!.volume = this.getTargetVolume();
+
+    this.playRequestId = this.playRequestId + 1;
+    const reqId = this.playRequestId;
+    let playStarted = false;
+    const startPlay = (): void => {
+      if (reqId != this.playRequestId) {
+        return;
+      }
+      if (playStarted) {
+        return;
+      }
+      playStarted = true;
+      this.switchingToReal = true;
+      try {
+        active!.play();
+      } catch (ePlay: any) {
+        console.warn("[TTS] stream play threw", ePlay);
+        playStarted = false;
+      }
+    };
+
+    // 超时兜底（同 playSrcAndWait）：段长 + 15s，下限 20s
+    let durationHint = expectedDurationMs;
+    if (durationHint <= 0) {
+      durationHint = this.lastSynthDurationMs;
+    }
+    let waitMs = 60000;
+    if (durationHint > 0) {
+      waitMs = durationHint + 15000;
+    }
+    if (waitMs < 20000) {
+      waitMs = 20000;
+    }
+    if (waitMs > 300000) {
+      waitMs = 300000;
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let timerId = 0;
+      const finish = (ok: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timerId > 0) {
+          clearTimeout(timerId);
+          timerId = 0;
+        }
+        resolve(ok);
+      };
+
+      active!.onPlay(() => {
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        if (this.switchingToReal || this.realPlayback) {
+          this.switchingToReal = false;
+          this.realPlayback = true;
+          this.setState("playing");
+        }
+      });
+      active!.onEnded(() => {
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        if (this.realPlayback != true) {
+          return;
+        }
+        // 段播完：清 messageId、idle（供工具栏/回传按消息复位），保留 context 复用
+        this.realPlayback = false;
+        this.switchingToReal = false;
+        this.pausedByMute = false;
+        this.messageId = "";
+        this.setState("idle");
+        finish(true);
+      });
+      active!.onError((err) => {
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        if (this.switchingToReal && this.realPlayback != true) {
+          return;
+        }
+        if (this.realPlayback) {
+          this.fail(err.errMsg ?? "TTS 音频播放失败");
+          finish(false);
+        }
+      });
+
+      startPlay();
+      timerId = setTimeout(() => {
+        console.warn(
+          "[TTS] stream segment timeout reqId=",
+          reqId,
+          "waitMs=",
+          waitMs,
+        );
+        finish(false);
+        if (reqId == this.playRequestId) {
+          try {
+            active!.stop();
+          } catch (_eStop) {
+            // ignore
+          }
+          this.realPlayback = false;
+          this.switchingToReal = false;
+          this.messageId = "";
+          this.setState("idle");
+        }
+      }, waitMs) as number;
+    });
+  }
+
+  /**
+   * 新段就绪时预置到「下次将播放的 context」：若正在播上一段，趁播放期让该段提前 prepare，
+   * 换段时仅 play() 即出声。voiceStreamSpeaker 的段回调在切段完成后调用。
+   * @param src 下一段（readySegments 队首）的 src；已预置过则跳过
+   */
+  preloadNextStreamSegment(src: string): void {
+    if (
+      this.streamSessionActive != true ||
+      this.streamEnded == true ||
+      src.length == 0
+    ) {
+      return;
+    }
+    if (this.streamPreloadedSrc == src) {
+      return;
+    }
+    // 下次将播放的 context：streamUseAlt 已在最近一次 playStreamSegment 里切换为下一相位
+    const nextActiveIsAlt = this.streamUseAlt;
+    let idle = nextActiveIsAlt == true ? this.streamAltAudioContext : this.audioContext;
+    if (idle == null) {
+      idle = uni.createInnerAudioContext();
+      // #ifdef APP-IOS
+      idle!.obeyMuteSwitch = false;
+      // #endif
+      if (nextActiveIsAlt == true) {
+        this.streamAltAudioContext = idle;
+      } else {
+        this.audioContext = idle;
+      }
+    }
+    this.streamPreloadedSrc = src;
+    try {
+      idle!.stop();
+      idle!.src = src;
+    } catch (_ePre) {
+      // ignore
+    }
+  }
+
+  /**
+   * 播放结束且预取合成仍在进行：停音频、idle，但不 recycle / 不清 PCM / 不取消合成。
+   */
+  private endPlaybackKeepSynth(): void {
+    this.clearSynthStallWatchdog();
+    this.stopSharedAudio();
+    this.revokeBlobUrl();
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
+    this.messageId = "";
+    this.setState("idle");
+  }
+
+  private notifyWarmOpenWaiters(ok: boolean): void {
+    const waiters = this.warmOpenWaiters.slice();
+    this.warmOpenWaiters = [] as ((ok: boolean) => void)[];
+    for (let i = 0; i < waiters.length; i++) {
+      waiters[i](ok);
+    }
+  }
+
+  /** 等待预热连接 open；超时返回 false。不替换已有 onOpen。 */
+  private waitForWarmOpen(timeoutMs: number): Promise<boolean> {
+    if (this.warmOpen == true && this.warmSocketTask != null) {
+      return Promise.resolve(true);
+    }
+    if (this.warmSocketTask == null) {
+      return Promise.resolve(false);
+    }
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (ok: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(ok);
+      };
+      this.warmOpenWaiters.push(done);
+      setTimeout(() => {
+        done(false);
+      }, timeoutMs);
+    });
+  }
+
+  /** 取预热连接或新建会话连接，并绑好播放用消息回调 */
+  private async takeOrOpenSessionSocket(
+    accessToken: string,
+    expectedGeneration: number,
+    preservePlayingAudio: boolean = false,
+    expectedSynthEpoch: number = 0,
+  ): Promise<void> {
+    // 即将使用连接：取消闲置关闭
+    this.cancelIdleClose();
+    // 合成路径允许在无预热时临时建连（文本发送未按过录音）
+    if (this.warmupEnabled != true) {
+      this.warmupEnabled = true;
+    }
+    const cancelled = (): boolean => {
+      return this.isSynthOpCancelled(
+        preservePlayingAudio,
+        expectedGeneration,
+        expectedSynthEpoch,
+      );
+    };
+    // 预热已就绪 → 直接复用；若仍在连 → 短等；否则新建
+    if (this.warmOpen != true || this.warmSocketTask == null) {
+      if (this.warmSocketTask != null) {
+        const ok = await this.waitForWarmOpen(5000);
+        if (cancelled()) {
+          return;
+        }
+        // 超时也不主动 close：继续等 open 回调；若仍不可用再走新建
+        if (ok != true && this.warmOpen != true) {
+          console.warn("[TTS] warm still not open after wait");
+        }
+      }
+    }
+    if (this.warmOpen == true && this.warmSocketTask != null) {
+      this.socketTask = this.warmSocketTask;
+      this.warmSocketTask = null;
+      this.warmOpen = false;
+      this.warmOpenedAtMs = 0;
+      // preserve 合成会立刻覆盖 sink；仍 bind 以保证 socket router 就绪
+      this.bindSessionHandlers(expectedGeneration);
+      this.refreshKeepalive();
+      return;
+    }
+    // 已有未 open 完的 warm：禁止再 new，避免双连接
+    if (this.warmSocketTask != null) {
+      console.warn("[TTS] warm connecting, skip openSession");
+      const ok = await this.waitForWarmOpen(5000);
+      if (cancelled()) {
+        return;
+      }
+      if (ok == true && this.warmSocketTask != null) {
+        this.socketTask = this.warmSocketTask;
+        this.warmSocketTask = null;
+        this.warmOpen = false;
+        this.warmOpenedAtMs = 0;
+        this.bindSessionHandlers(expectedGeneration);
+        this.refreshKeepalive();
+        return;
+      }
+    }
+    await this.openSessionSocketOnce(
+      accessToken,
+      expectedGeneration,
+      preservePlayingAudio,
+      expectedSynthEpoch,
+    );
+  }
+
+  /** 建立会话 Socket（open 后 bindSessionHandlers） */
+  private openSessionSocketOnce(
+    accessToken: string,
+    expectedGeneration: number,
+    preservePlayingAudio: boolean = false,
+    expectedSynthEpoch: number = 0,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const socketTask = createTtsSocket(accessToken, (errMsg: string) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(new Error(errMsg));
+      });
+      if (socketTask == null) {
+        return;
+      }
+      this.socketTask = socketTask;
+      this.installSocketRouter(socketTask);
+      this.preferArrayBufferBinaryType(socketTask);
+      socketTask.onOpen((_openRes: OnSocketOpenCallbackResult) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (
+          this.isSynthOpCancelled(
+            preservePlayingAudio,
+            expectedGeneration,
+            expectedSynthEpoch,
+          )
+        ) {
+          reject(new Error("TTS 会话已取消"));
+          return;
+        }
+        this.preferArrayBufferBinaryType(socketTask);
+        this.bindSessionHandlers(expectedGeneration);
+        this.refreshKeepalive();
+        resolve();
+      });
+      socketTask.onError((err: GeneralCallbackResult) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        const errMsg =
+          err.errMsg != null && err.errMsg.length > 0
+            ? err.errMsg
+            : "TTS WebSocket 错误";
+        reject(new Error(errMsg));
+      });
+      // 握手超时：避免挂死在半开连接
+      setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(new Error("TTS 连接超时"));
+      }, 8000);
+    });
+  }
+
+  /**
+   * 每个 Socket 只装一次 onMessage，转发到 socketMessageSink。
+   * 切换 warm/session 时只改 sink，不再二次 onMessage（H5 上后者可能无效或叠层）。
+   */
+  private installSocketRouter(socketTask: TtsSocketHandle): void {
+    if (this.socketRouterInstalledFor == socketTask) {
+      return;
+    }
+    this.socketRouterInstalledFor = socketTask;
+    socketTask.onMessage((res: OnSocketMessageCallbackResult) => {
+      const dataType = typeof res.data;
+      // 仅处理「当前会话 socket」或「当前预热 socket」的消息，避免旧连接串扰
+      const isSession = this.socketTask == socketTask;
+      const isWarm = this.warmSocketTask == socketTask;
+      // 预热期 sink=null，须在此识别服务端拒绝 ping，否则心跳会一直打
+      if (
+        dataType == "string" &&
+        (isSession || isWarm) &&
+        this.tryHandleKeepaliveReject(res.data as string)
+      ) {
+        return;
+      }
+      if (!isSession && !isWarm) {
+        return;
+      }
+      const sink = this.socketMessageSink;
+      if (sink == null) {
+        // 预热待命期 sink 故意为 null；会话期若为空则属异常
+        if (isSession) {
+          const dataType = typeof res.data;
+          let hint = dataType;
+          if (dataType == "string") {
+            const s = res.data as string;
+            hint = s.length > 80 ? s.substring(0, 80) : s;
+          } else {
+            const sync = tryAsArrayBufferSync(res.data);
+            if (sync != null) {
+              hint = "bin:" + sync.byteLength.toString();
+            }
+          }
+          console.warn(
+            "[TTS] drop msg: session sink=null data=",
+            hint,
+          );
+        }
+        return;
+      }
+      // 预热 socket 在待命期不应处理业务；若误装 sink 也忽略
+      if (isWarm && !isSession) {
+        return;
+      }
+      sink(res);
+    });
+  }
+
+  /** H5 uni.SocketTask：尽量用 arraybuffer；原生适配器构造时已设置，此处为兼容 */
+  private preferArrayBufferBinaryType(socketTask: TtsSocketHandle): void {
+    // #ifdef H5 || WEB
+    try {
+      const anySock = socketTask as any;
+      if (anySock == null) {
+        return;
+      }
+      anySock.binaryType = "arraybuffer";
+      const nestedKeys = ["ws", "_webSocket", "socket", "_socket"];
+      for (let i = 0; i < nestedKeys.length; i++) {
+        const nested = anySock[nestedKeys[i]];
+        if (nested != null) {
+          try {
+            nested.binaryType = "arraybuffer";
+          } catch (_eNested) {
+            // ignore
+          }
+        }
+      }
+    } catch (_eBin) {
+      // ignore
+    }
+    // #endif
+  }
+
+  private bindSessionHandlers(expectedGeneration: number): void {
+    const socketTask = this.socketTask;
+    if (socketTask == null) {
+      return;
+    }
+    this.installSocketRouter(socketTask!);
+    this.preferArrayBufferBinaryType(socketTask!);
+    this.socketMessageSink = (res: OnSocketMessageCallbackResult): void => {
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      this.handleSocketMessage(res);
+    };
+    socketTask!.onError((err: GeneralCallbackResult) => {
+      if (expectedGeneration != this.generation || this.socketTask == null) {
+        return;
+      }
+      let errMsg = "TTS WebSocket 错误";
+      if (err.errMsg != null && err.errMsg.length > 0) {
+        errMsg = err.errMsg;
+      }
+      // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+      // 连接错误但音频已入播放器：与 onClose 中断路径一致，先排空缓冲再收尾，
+      // 避免「网络抖动 / 平台 WS 超时」（鸿蒙实测长播报被 request timeout 中断）
+      // 把正在播的声音直接掐断。未入任何音频才按失败收尾。
+      if (
+        this.streamNativeActive == true &&
+        this.streamPcmPlayer != null &&
+        this.streamPcmPlayer!.getEnqueuedMs() > 0
+      ) {
+        console.warn(
+          "[TTS] session socket error mid-stream, drain buffered audio: " +
+            errMsg +
+            " enqueuedMs=" +
+            this.streamPcmPlayer!.getEnqueuedMs() +
+            " feedActive=" +
+            this.streamSessionActive,
+        );
+        this.drainBufferedAudioOnDisconnect();
+        return;
+      }
+      // #endif
+      this.fail(errMsg);
+    });
+    socketTask!.onClose((_res: OnSocketCloseCallbackResult) => {
+      // 仅处理「当前会话 socket」的关闭：旧 socket（换轮/回收后关闭）的 close 事件
+      // 可能晚于新会话 socket 就位，若按 socketTask 非空就清理，会把新会话的 socketTask
+      // 清空 → 新会话文本发不出去、无音频、最终超时复位。
+      if (this.socketTask != socketTask) {
+        return;
+      }
+      // 已在播 / 暂停：只清 socket，继续本地音频；绝不触碰 chat SSE
+      if (
+        expectedGeneration == this.generation &&
+        this.state != "playing" &&
+        this.state != "paused" &&
+        this.state != "idle"
+      ) {
+        // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+        // 原生流式：连接断开但音频已入播放器时，不硬切——置 inputDone 让已入队的
+        // 播完（排空轮询自然收尾），避免「服务端断连/网络抖动」直接把正在播的声音
+        // 掐断（鸿蒙实测连接中途断开会导致播报 2~8s 即断）。未入任何音频
+        // （player 未创建 / enqueued==0）才按失败收尾。
+        if (
+          this.streamNativeActive == true &&
+          this.streamPcmPlayer != null &&
+          this.streamPcmPlayer!.getEnqueuedMs() > 0
+        ) {
+          console.warn(
+            "[TTS] session socket closed mid-stream, drain buffered audio enqueuedMs=" +
+              this.streamPcmPlayer!.getEnqueuedMs(),
+          );
+          this.drainBufferedAudioOnDisconnect();
+          return;
+        }
+        // #endif
+        this.fail("TTS 连接已关闭");
+      } else {
+        this.socketTask = null;
+        this.stopKeepalive();
+      }
+    });
+  }
+
+  /** 连接中断/错误但播放器仍有缓冲音频：置 inputDone 让已入队音频播完（排空轮询自然收尾），
+   *  避免「服务端断连/网络抖动」直接把正在播的声音掐断。未入音频走 fail 收尾。
+   *  调用前需已确认 streamNativeActive && player != null && enqueuedMs > 0。 */
+  private drainBufferedAudioOnDisconnect(): void {
+    this.socketTask = null;
+    this.stopKeepalive();
+    this.streamInputDone = true;
+    this.streamInputDoneAtMs = Date.now();
+    this.clearFlushEndWatchdog();
+    this.armStreamDrainPoll();
+  }
+
+  private ensureWarmSocketAsync(): void {
+    if (this.warmupEnabled != true) {
+      return;
+    }
+    this.cancelIdleClose();
+    // 会话进行中禁止新建预热：会抢 router / 误清 sink，导致 tts_ready 后收不到 PCM
+    if (this.socketTask != null) {
+      return;
+    }
+    if (this.warmOpen == true && this.warmSocketTask != null) {
+      return;
+    }
+    if (this.warmSocketTask != null) {
+      // connecting：防重连风暴
+      return;
+    }
+    const accessToken = resolveSpeechAccessToken();
+    if (accessToken.length == 0) {
+      console.warn("[TTS] warmup skip: no token");
+      return;
+    }
+    this.warmGeneration += 1;
+    const expectedWarm = this.warmGeneration;
+    const socketTask = createTtsSocket(accessToken, (errMsg: string) => {
+      console.warn("[TTS] warmup fail (no auto-retry)", errMsg);
+      if (expectedWarm == this.warmGeneration) {
+        this.warmSocketTask = null;
+        this.warmOpen = false;
+        this.notifyWarmOpenWaiters(false);
+      }
+    });
+    if (socketTask == null) {
+      return;
+    }
+    this.warmSocketTask = socketTask;
+    this.warmOpen = false;
+    this.warmOpenedAtMs = 0;
+    this.installSocketRouter(socketTask);
+    this.preferArrayBufferBinaryType(socketTask);
+    // 待命期：仅当当前没有会话 sink 时才清空，绝不能打断正在合成的会话
+    if (this.socketTask == null) {
+      this.socketMessageSink = null;
+    }
+    socketTask.onOpen((_openRes: OnSocketOpenCallbackResult) => {
+      if (expectedWarm != this.warmGeneration) {
+        return;
+      }
+      this.warmOpen = true;
+      this.warmOpenedAtMs = Date.now();
+      this.preferArrayBufferBinaryType(socketTask);
+      this.refreshKeepalive();
+      this.notifyWarmOpenWaiters(true);
+      // 预热后若长时间无合成，按闲置策略关闭
+      this.scheduleIdleClose(this.IDLE_CLOSE_MS);
+    });
+    socketTask.onError((_err: GeneralCallbackResult) => {
+      if (expectedWarm != this.warmGeneration) {
+        return;
+      }
+      // 不主动 close：等 onClose 清状态
+      console.warn("[TTS] warmup error (wait peer close)");
+      this.notifyWarmOpenWaiters(false);
+    });
+    socketTask.onClose((_res: OnSocketCloseCallbackResult) => {
+      if (expectedWarm != this.warmGeneration) {
+        return;
+      }
+      this.warmSocketTask = null;
+      this.warmOpen = false;
+      this.warmOpenedAtMs = 0;
+      if (this.socketRouterInstalledFor == socketTask && this.socketTask == null) {
+        this.socketRouterInstalledFor = null;
+        this.socketMessageSink = null;
+      }
+      this.refreshKeepalive();
+      this.notifyWarmOpenWaiters(false);
+      // 用完即关：对端关闭后不再自动重连，等下次按录音预热或合成时再建
+    });
+  }
+
+  /**
+   * 仅离开会话页时关预热连接。
+   */
+  private closeWarmSocket(): void {
+    this.warmGeneration += 1;
+    const sock = this.warmSocketTask;
+    this.warmSocketTask = null;
+    this.warmOpen = false;
+    this.warmOpenedAtMs = 0;
+    this.notifyWarmOpenWaiters(false);
+    if (sock != null) {
+      // 勿清会话 sink：预热与会话可能先后共用 router 标记
+      if (this.socketRouterInstalledFor == sock && this.socketTask == null) {
+        this.socketRouterInstalledFor = null;
+        this.socketMessageSink = null;
+      } else if (this.socketRouterInstalledFor == sock) {
+        this.socketRouterInstalledFor = null;
+      }
+      try {
+        sock!.close({} as CloseSocketOptions);
+      } catch (_e) {
+        // ignore
+      }
+    }
+    this.refreshKeepalive();
+  }
+
+  /**
+   * 仅离开会话页时关会话连接。
+   * 业务 fail/stall/stop 禁止调用——应走 recycleSessionToWarm。
+   */
+  private closeSessionSocketOnly(): void {
     const socket = this.socketTask;
     this.socketTask = null;
     if (socket != null) {
+      if (this.socketRouterInstalledFor == socket) {
+        this.socketRouterInstalledFor = null;
+        this.socketMessageSink = null;
+      }
       try {
-        socket!.close({});
+        socket!.close({} as CloseSocketOptions);
       } catch (_eSocket) {
         // ignore
       }
     }
-    const audio = this.audioContext;
-    this.audioContext = null;
-    if (audio != null) {
-      try {
-        audio!.stop();
-        audio!.destroy();
-      } catch (_eAudio) {
-        // ignore
-      }
+    this.refreshKeepalive();
+  }
+
+  /**
+   * 本轮合成/播报间隙：不立刻关 TCP，收回预热池供下一分句复用；
+   * 并启动闲置关闭计时（下一句合成会 cancel）。
+   */
+  private recycleSessionToWarm(): void {
+    const sock = this.socketTask;
+    this.socketTask = null;
+    this.socketMessageSink = null;
+    if (sock == null) {
+      this.refreshKeepalive();
+      this.scheduleIdleClose(this.IDLE_CLOSE_MS);
+      return;
     }
+    // 已有待命：保留当前会话 sock 作为 warm（不主动 close 任一端）
+    if (this.warmSocketTask != null && this.warmSocketTask != sock) {
+      console.warn(
+        "[TTS] dual socket on recycle; keep session TCP as warm (no close)",
+      );
+    }
+    this.warmGeneration += 1;
+    const expectedWarm = this.warmGeneration;
+    this.warmSocketTask = sock;
+    this.warmOpen = true;
+    this.warmOpenedAtMs = Date.now();
+    this.installSocketRouter(sock!);
+    this.socketMessageSink = null;
+    sock!.onError((_err: GeneralCallbackResult) => {
+      if (expectedWarm != this.warmGeneration) {
+        return;
+      }
+      console.warn("[TTS] warm error after recycle (wait peer close)");
+    });
+    sock!.onClose((_res: OnSocketCloseCallbackResult) => {
+      if (expectedWarm != this.warmGeneration) {
+        return;
+      }
+      this.warmSocketTask = null;
+      this.warmOpen = false;
+      this.warmOpenedAtMs = 0;
+      if (this.socketRouterInstalledFor == sock && this.socketTask == null) {
+        this.socketRouterInstalledFor = null;
+        this.socketMessageSink = null;
+      }
+      this.refreshKeepalive();
+      // 不再自动重连
+    });
+    this.refreshKeepalive();
+    this.scheduleIdleClose(this.IDLE_CLOSE_MS);
+  }
+
+  /**
+   * 结束当前播报会话；TCP 收回待命并进入闲置关闭倒计时。
+   * @param keepAudio true：仅 stop、保留 InnerAudioContext（H5 串行分句复用已解锁通道）
+   */
+  /**
+   * H5：停止共享 InnerAudioContext。解锁播放刚启动（<UNLOCK_PLAY_GRACE_MS）时跳过 stop，
+   * 让解锁片段自然播完——避免打断 pending play() 抛 AbortError，并确保 iOS 判定元素
+   * “真正播放过”从而放行后续异步 play()。非 H5 平台行为与直接 stop() 一致。
+   */
+  private stopSharedAudio(): void {
+    const audio = this.audioContext;
+    if (audio == null) {
+      return;
+    }
+    // #ifdef H5 || WEB
+    if (this.unlockPlayAtMs > 0 && Date.now() - this.unlockPlayAtMs < UNLOCK_PLAY_GRACE_MS) {
+      return;
+    }
+    // #endif
+    try {
+      audio!.stop();
+    } catch (_eStop) {
+      // ignore
+    }
+  }
+
+  private prepareForNextUtterance(keepAudio: boolean): void {
+    this.generation += 1;
+    this.synthEpoch += 1;
+    this.synthInFlight = false;
+    this.clearSynthStallWatchdog();
+    this.finishRequested = false;
+    this.pendingBinary = 0;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    this.pausedByMute = false;
+    this.recycleSessionToWarm();
+    if (keepAudio == true) {
+      this.stopSharedAudio();
+    } else {
+      // H5/WEB：保留已解锁的 InnerAudioContext（手势内解锁过即持续放行），
+      // 仅 stop 当前音频，不销毁。若在此 destroy，下一次播放会重建一个未被手势解锁的
+      // 新元素，被移动端浏览器拦截（NotAllowedError，iOS 最严）。
+      // 销毁推迟到 disableWarmupAndDisconnect（离开页面 / 停会话）。
+      this.stopSharedAudio();
+      // #ifndef H5 || WEB
+      const audio = this.audioContext;
+      this.audioContext = null;
+      if (audio != null) {
+        try {
+          audio!.destroy();
+        } catch (_eAudio) {
+          // ignore
+        }
+      }
+      // 双 context 交替：备用 context 一并销毁，避免流式段残留播放
+      const alt = this.streamAltAudioContext;
+      this.streamAltAudioContext = null;
+      this.streamPreloadedSrc = "";
+      if (alt != null) {
+        try {
+          alt!.stop();
+          alt!.destroy();
+        } catch (_eAlt) {
+          // ignore
+        }
+      }
+      // #endif
+    }
+    this.revokeBlobUrl();
     this.chunks = [] as Uint8Array[];
     this.text = "";
-    this.messageId = "";
+    // 先带原 messageId 通知 idle，工具栏才能按消息匹配退出播报态
     this.setState("idle");
+    this.messageId = "";
+  }
+
+  stop(): void {
+    // 诊断：定位「播报被静默掐断」的 stop 来源（resetStreamSessionState 释放无声）
+    console.warn(
+      "[TTS] ttsWebSocketPlayer.stop streamSessionActive=" +
+        this.streamSessionActive +
+        " messageId=" +
+        this.messageId,
+    );
+    // 流式会话：先发 close 结束服务端会话，再收尾
+    if (this.streamSessionActive == true) {
+      this.closeStreamSession();
+    } else {
+      this.notifyStreamEnd();
+    }
+    this.prepareForNextUtterance(false);
+    // 显式停止：立刻释放连接，不保留空闲长连
+    this.releaseIdleConnection();
+  }
+
+  private revokeBlobUrl(): void {
+    // #ifdef H5 || WEB
+    if (this.blobUrl.length > 0) {
+      try {
+        URL.revokeObjectURL(this.blobUrl);
+      } catch (_eRevoke) {
+        // ignore
+      }
+      this.blobUrl = "";
+    }
+    // #endif
+  }
+
+  /**
+   * 用户手势同步阶段创建 InnerAudioContext，并播放一段静音 WAV 解锁媒体通道。
+   * 用 SILENT_WAV_DATA_URI（0.05s 全零静音，无任何可闻声音），并记下 unlockPlayAtMs
+   * 宽限期，保证它不被同一同步栈内的 stop() 打断。
+   */
+  private prepareAudioContextForGesture(): void {
+    const audio = uni.createInnerAudioContext();
+    this.audioContext = audio;
+    audio.volume = this.getTargetVolume();
+    // #ifdef APP-IOS
+    audio.obeyMuteSwitch = false;
+    // #endif
+    // #ifdef H5 || WEB
+    try {
+      // 静音 WAV 本身无声，音量置最低兜底
+      audio.volume = this.getTargetVolume() > 0 ? 0.01 : 0;
+      audio.src = SILENT_WAV_DATA_URI;
+      this.unlockPlayAtMs = Date.now();
+      this.safePlay(audio);
+    } catch (e: any) {
+      console.error("[H5Voice] audioUnlockFailed", e);
+    }
+    // #endif
+  }
+
+  /**
+   * H5：在用户手势调用栈内同步解锁音频通道（工具栏播报点击时调用）。
+   * 浏览器要求 play() 落在手势栈内；TTS 合成是异步的（WebSocket 往返后才播放），
+   * 若等到合成完成才首次 play()，会被移动端浏览器拦截（NotAllowedError，iOS 最严）。
+   * 这里在点击同步阶段用同一 InnerAudioContext 播一段静音 WAV 解锁（unlockPlayAtMs
+   * 宽限期保证它不被随后的 stop() 打断），后续异步播放复用已解锁实例即被放行。
+   * 仅首次创建并解锁；重复调用为幂等。App / 小程序无需手势解锁，本方法为 no-op。
+   */
+  unlockInGesture(): void {
+    // #ifdef H5 || WEB
+    if (this.audioContext == null) {
+      this.prepareAudioContextForGesture();
+    }
+    // #endif
   }
 
   private sendJson(data: UTSJSONObject): void {
     const socket = this.socketTask;
     if (socket == null) {
+      console.warn("[TTS] sendJson skip: no socket");
       return;
     }
-    socket!.send({ data: JSON.stringify(data) });
+    const payload = JSON.stringify(data);
+    const typeVal = data["type"];
+    const type = typeVal != null ? `${typeVal}` : "";
+    try {
+      socket!.send({ data: payload } as SendSocketMessageOptions);
+    } catch (e: any) {
+      console.error("[TTS] send throw type=", type, e);
+      this.fail("TTS 发送失败");
+    }
   }
 
   private handleSocketMessage(res: OnSocketMessageCallbackResult): void {
     if (typeof res.data != "string") {
-      const buffer = res.data as ArrayBuffer;
-      if (buffer.byteLength > 0) {
-        this.chunks.push(new Uint8Array(buffer));
-      }
+      const sync = tryAsArrayBufferSync(res.data);
+      this.appendBinaryChunk(res.data);
       return;
     }
 
@@ -287,21 +3269,127 @@ export class TtsWebSocketPlayer {
     }
     const typeVal = message!["type"];
     const type = typeVal != null ? `${typeVal}` : "";
+    if (type == "ping" || type == "pong") {
+      return;
+    }
     if (type == "tts_ready") {
       this.setState("synthesizing");
-      this.sendJson({
-        type: "text",
-        text: this.text,
-        flush: true,
-      } as UTSJSONObject);
+      // 冒烟协议：单帧 text + flush:true
+      this.sendJson(buildTtsControlMessage("text", this.text, 0, true));
+      this.armSynthStallWatchdog();
     } else if (type == "tts_begin") {
       this.setState("synthesizing");
     } else if (type == "tts_end") {
-      this.finishSynthesis();
+      this.clearSynthStallWatchdog();
+      this.finishRequested = true;
+      this.tryFinishSynthesis();
     } else if (type == "error") {
+      const codeVal = message!["code"];
       const messageVal = message!["message"];
-      this.fail(messageVal != null ? `${messageVal}` : "TTS 合成失败");
+      const code = codeVal != null ? `${codeVal}` : "";
+      const msg = messageVal != null ? `${messageVal}` : "TTS 合成失败";
+      // 服务端不支持应用层 ping：停心跳，不断连 / 不中断合成
+      if (
+        code == "UNKNOWN_TYPE" &&
+        (msg.indexOf("ping") >= 0 || msg.indexOf("pong") >= 0)
+      ) {
+        this.keepalive.markRejectedByServer();
+        return;
+      }
+      this.clearSynthStallWatchdog();
+      this.fail(msg);
+    } else if (type.length > 0) {
+      console.warn("[TTS] unknown ctrl type=", type);
     }
+  }
+
+  /** 合成卡住检测：tts_ready 后若长时间无 PCM/tts_end，打诊断并失败 */
+  private armSynthStallWatchdog(): void {
+    this.clearSynthStallWatchdog();
+    const expectedGeneration = this.generation;
+    this.synthStallTimerId = setTimeout(() => {
+      this.synthStallTimerId = 0;
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      if (this.state != "synthesizing" && this.state != "connecting") {
+        return;
+      }
+      console.warn(
+        "[TTS] synth stall: server produced no audio (no tts_begin/pcm/tts_end)",
+        "state=",
+        this.state,
+        "chunks=",
+        this.chunks.length,
+        "pendingBinary=",
+        this.pendingBinary,
+        "textLen=",
+        this.text.length,
+      );
+      // 续等：流式会话 SSE 尚未收尾（正文可能还在流 / 网络延迟），不判死，重新武装再看一轮。
+      // 注意：legacy 单句路径（synthesizeToSrc/playAndWait）streamSessionActive=false，此处不续等、直接判死。
+      if (this.streamFlushSent != true && this.streamSessionActive == true) {
+        console.warn("[TTS] synth stall: SSE still streaming, re-arm watchdog");
+        this.armSynthStallWatchdog();
+        return;
+      }
+      // 文档：flush 后若无音频产出，服务端不发 tts_begin/tts_end
+      this.fail("TTS 服务未返回音频，请检查后端 speech.tts 配置");
+    }, 12000);
+  }
+
+  private clearSynthStallWatchdog(): void {
+    if (this.synthStallTimerId > 0) {
+      clearTimeout(this.synthStallTimerId);
+      this.synthStallTimerId = 0;
+    }
+  }
+
+  private appendBinaryChunk(data: any): void {
+    const expectedGeneration = this.generation;
+    // 同步路径：ArrayBuffer / TypedArray，避免 Promise.then 在 UTS 丢失
+    const syncBuffer = tryAsArrayBufferSync(data);
+    if (syncBuffer != null) {
+      if (expectedGeneration != this.generation) {
+        return;
+      }
+      if (syncBuffer!.byteLength > 0) {
+        this.chunks.push(new Uint8Array(syncBuffer!));
+        this.clearSynthStallWatchdog();
+      } else {
+        console.warn("[TTS] skip empty binary frame");
+      }
+      this.tryFinishSynthesis();
+      return;
+    }
+
+    this.pendingBinary += 1;
+    toArrayBufferAsync(data).then((buffer: ArrayBuffer | null): void => {
+      // 无论 generation 是否变化都要减计数，否则 pendingBinary 卡死无法 finish
+      this.pendingBinary -= 1;
+      if (this.pendingBinary < 0) {
+        this.pendingBinary = 0;
+      }
+      if (expectedGeneration != this.generation) {
+        this.tryFinishSynthesis();
+        return;
+      }
+      if (buffer != null && buffer!.byteLength > 0) {
+        this.chunks.push(new Uint8Array(buffer!));
+        this.clearSynthStallWatchdog();
+      } else {
+        console.warn("[TTS] skip empty/unrecognized binary frame");
+      }
+      this.tryFinishSynthesis();
+    });
+  }
+
+  private tryFinishSynthesis(): void {
+    if (!this.finishRequested || this.pendingBinary > 0) {
+      return;
+    }
+    this.finishRequested = false;
+    this.finishSynthesis();
   }
 
   private async finishSynthesis(): Promise<void> {
@@ -311,40 +3399,221 @@ export class TtsWebSocketPlayer {
       return;
     }
     try {
+      let pcmBytes = 0;
+      for (let i = 0; i < this.chunks.length; i++) {
+        pcmBytes += this.chunks[i].length;
+      }
       const wav = buildPcm16Wav(this.chunks, this.sampleRate);
       const src = await saveWavFile(wav);
       if (expectedGeneration != this.generation) {
         return;
       }
+      // #ifdef H5 || WEB
+      this.revokeBlobUrl();
+      this.blobUrl = src;
+      // #endif
       const socket = this.socketTask;
       if (socket != null) {
-        this.sendJson({ type: "close" } as UTSJSONObject);
+        // 合成完收回 TCP 待命，播放期复用；闲置超时后关闭
+        this.recycleSessionToWarm();
       }
-      this.socketTask = null;
-      const audio = uni.createInnerAudioContext();
-      this.audioContext = audio;
-      audio.onEnded(() => {
-        if (expectedGeneration == this.generation) {
-          this.stop();
+
+      // H5/WEB 与 App 起播路径互斥：
+      // Web 跑在 /m/ 时平台宏常是 WEB 而非 H5；旧逻辑 #ifndef H5 会立刻 play，
+      // 同时 onCanplay 再 play → 1ms 内双重起播、听感断续。
+      // playRequestId 挡住叠加的旧 onCanplay（InnerAudioContext 无法移除监听）。
+      let audio = this.audioContext;
+      if (audio == null) {
+        audio = uni.createInnerAudioContext();
+        this.audioContext = audio;
+        // #ifdef APP-IOS
+        audio.obeyMuteSwitch = false;
+        // #endif
+      }
+      // 换源前 stop，降低 H5 上旧 src 与新 play 打架的概率
+      try {
+        audio!.stop();
+      } catch (eStop: any) {}
+      audio!.volume = this.getTargetVolume();
+      // #ifdef APP-IOS
+      audio!.obeyMuteSwitch = false;
+      // #endif
+
+      this.playRequestId = this.playRequestId + 1;
+      const reqId = this.playRequestId;
+      let playStarted = false;
+      const startPlay = (): void => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        if (playStarted) {
+          return;
+        }
+        playStarted = true;
+        this.switchingToReal = true;
+        try {
+          audio!.play();
+        } catch (ePlay: any) {
+          console.warn("[TTS] audio.play threw", ePlay);
+          playStarted = false;
+        }
+      };
+
+      audio!.onPlay(() => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        // 解锁静音片段的 onPlay 忽略；真实音频才切状态
+        if (this.switchingToReal || this.realPlayback) {
+          this.switchingToReal = false;
+          this.realPlayback = true;
+          this.setState("playing");
         }
       });
-      audio.onError((err) => {
-        if (expectedGeneration == this.generation) {
+      audio!.onEnded(() => {
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        // 忽略 H5 解锁静音片段结束；真实播报结束：idle 但保留 audio，供下一句复用
+        if (
+          expectedGeneration == this.generation &&
+          this.realPlayback
+        ) {
+          this.prepareForNextUtterance(true);
+          // 预热已在 finishSynthesis 收回，此处不再 ensureWarm / connectSocket
+        }
+      });
+      audio!.onError((err) => {
+        if (expectedGeneration != this.generation) {
+          return;
+        }
+        if (reqId != this.playRequestId) {
+          return;
+        }
+        // 切换 src 时常见 abort，尚未真正起播则忽略
+        if (this.switchingToReal && this.realPlayback != true) {
+          console.warn(
+            "[TTS] audio transient error while switching",
+            err.errMsg ?? err,
+          );
+          return;
+        }
+        if (this.realPlayback) {
           this.fail(err.errMsg ?? "TTS 音频播放失败");
         }
       });
-      audio.src = src;
-      this.setState("playing");
-      audio.play();
+
+      // #ifdef H5 || WEB
+      audio!.onCanplay(() => {
+        startPlay();
+      });
+      audio!.src = src;
+      // canplay 偶发不来时兜底；已起播则 startPlay 直接 return
+      setTimeout(() => {
+        startPlay();
+      }, 80);
+      // #endif
+
+      // #ifndef H5
+      // #ifndef WEB
+      // App：onCanplay 常不触发，主动 play
+      audio!.src = src;
+      startPlay();
+      // #endif
+      // #endif
     } catch (e: any) {
       this.fail(e.message ?? "TTS 音频处理失败");
     }
   }
 
   private fail(message: string): void {
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    // 尾部容错：会话已收尾（flush 已发 / 输入已结束）或第三方「无新文本」超时，且已
+    // 有音频入队时，弹错 + 立即 release 会把剩余尾部音频硬切（长播报末尾最明显）。
+    // 改为置输入结束并交给排空轮询：把已入队缓冲自然播完再走正常收尾，不再弹一闪
+    // 而过的超时 toast（会话已死，播完剩余音频是此时唯一正确的收尾方式）。
+    if (
+      this.isStreamNativeMode() == true &&
+      this.streamPcmPlayer != null &&
+      this.streamPcmPlayer!.getWrittenMs() > 0 &&
+      (this.streamFlushSent == true ||
+        this.streamInputDone == true ||
+        message.indexOf("timeout") >= 0 ||
+        message.indexOf("超时") >= 0)
+    ) {
+      console.warn("[TTS] tail error, drain gracefully: " + message);
+      this.clearSynthStallWatchdog();
+      this.clearFlushEndWatchdog();
+      this.clearNativeNoAudioWatchdog();
+      this.streamInputDone = true;
+      this.streamInputDoneAtMs = Date.now();
+      this.armStreamDrainPoll();
+      // 会话已死：收掉连接（排空轮询负责播完剩余音频后 release + notifyStreamEnd）
+      this.cancelIdleClose();
+      this.closeWarmSocket();
+      this.closeSessionSocketOnly();
+      this.stopKeepalive();
+      this.chunks = [] as Uint8Array[];
+      this.text = "";
+      this.finishRequested = false;
+      this.pendingBinary = 0;
+      this.realPlayback = false;
+      this.switchingToReal = false;
+      return;
+    }
+    // #endif
     console.error("[TTS] " + message);
+    this.clearSynthStallWatchdog();
+    this.clearFlushEndWatchdog();
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    this.releaseStreamPcmPlayer();
+    // #endif
+    // 流式会话：置结束并唤醒等待者（voiceStreamSpeaker 的 kickPlay 靠它退出）
+    if (this.streamSessionActive == true || this.streamEnded == true) {
+      this.streamEnded = true;
+      this.notifyStreamEnd();
+    }
+    this.streamSessionActive = false;
+    this.streamReady = false;
+    this.streamAudioStarted = false;
+    this.streamFlushSent = false;
+    this.streamNoAudioArmed = false;
+    // 保留 messageId 直到 idle 通知结束，便于工具栏按消息匹配并退出播报态
     this.setState("error");
-    uni.showToast({ title: message, icon: "none" });
+    // 流式多句连续 stall 时只弹一次，避免连环 toast
+    const now = Date.now();
+    if (now - this.lastFailToastAtMs > 8000) {
+      this.lastFailToastAtMs = now;
+      uni.showToast({ title: message, icon: "none" });
+    }
+    // 出错即断（即开即用、用完即断）：不留 warm / 长连，避免半开连接残留导致后续 no_speech / asr_error
+    this.cancelIdleClose();
+    this.closeWarmSocket();
+    this.closeSessionSocketOnly();
+    this.stopKeepalive();
+    this.chunks = [] as Uint8Array[];
+    this.text = "";
+    this.finishRequested = false;
+    this.pendingBinary = 0;
+    this.realPlayback = false;
+    this.switchingToReal = false;
+    // 仍带原 messageId 通知 idle，避免监听方因 id 已空而跳过复位
+    this.setState("idle");
+    this.messageId = "";
+  }
+
+  /**
+   * 强制通知 idle（即使当前已是 idle）。
+   * 流式整轮结束后 TTS 往往已 idle 不会再发事件，工具栏需靠这次回调复位。
+   */
+  notifyUiIdle(): void {
+    this.setState("idle");
   }
 
   private setState(state: TtsPlaybackState): void {
@@ -357,3 +3626,14 @@ export class TtsWebSocketPlayer {
 }
 
 export const ttsWebSocketPlayer = new TtsWebSocketPlayer();
+
+/**
+ * 单句合成：优先复用预热 TTS WebSocket，收齐 PCM 后封装为可播放 src（不播报）。
+ * @param preservePlayingAudio true 时不打断当前音频（流式边播边合成）
+ */
+export async function synthesizeSpeechToSrc(
+  text: string,
+  preservePlayingAudio: boolean = false,
+): Promise<string> {
+  return await ttsWebSocketPlayer.synthesizeToSrc(text, preservePlayingAudio);
+}

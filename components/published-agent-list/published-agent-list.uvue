@@ -4,12 +4,12 @@
     <custom-nav-bar :title="title" hasSafetyZone :showBack="showBack">
       <!-- #ifdef MP-WEIXIN -->
       <template v-slot:left>
-        <svg-icon name="icon-Search" size="48" @click="handleSearch" />
+        <svg-icon v-if="isLoggedIn" name="icon-Search" size="48" @click="handleSearch" />
       </template>
       <!-- #endif -->
       <!-- #ifndef MP-WEIXIN -->
       <template v-slot:right>
-        <svg-icon name="icon-Search" size="48" @click="handleSearch" />
+        <svg-icon v-if="isLoggedIn" name="icon-Search" size="48" @click="handleSearch" />
       </template>
       <!-- #endif -->
     </custom-nav-bar>
@@ -31,10 +31,12 @@
             :id="category.key"
             v-for="(category, index) in categories"
             :key="category.key"
-            :class="`category-item ${activeCategory === category.key ? 'active' : ''}`"
+            :class="activeCategory == category.key ? 'category-item active' : 'category-item'"
             @click="handleCategoryClick(category.key, index)"
           >
-            <text class="category-text">{{
+            <text
+              :class="activeCategory == category.key ? 'category-text category-text-active' : 'category-text'"
+            >{{
               translate(category.label)
             }}</text>
           </view>
@@ -72,7 +74,7 @@
               >
                 <template v-if="agentType == 'PageApp'">
                   <page-card
-                    :coverImg="info.icon"
+                    :coverImg="getCoverImg(info)"
                     :name="info.name"
                     :avatar="getPublishUserAvatar(info)"
                     :userName="getPublishUserName(info)"
@@ -160,7 +162,7 @@
 </template>
 
 <script setup lang="uts">
-  import { ref, computed, onMounted, onUnmounted } from 'vue';
+  import { ref, computed, onMounted, onUnmounted, type ComponentPublicInstance } from 'vue';
   // #ifdef MP-WEIXIN
   import { onShow, onUnload } from "@dcloudio/uni-app";
   // #endif
@@ -175,7 +177,8 @@
   import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { apiTenantConfig } from "@/servers/account";
   import { getCurrentPagePath } from "@/utils/commonBusiness";
-  import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
+  import { apiResCode, apiResData, apiResMessage, getCurrentPageFullPath } from "@/utils/common";
+  import { goToLogin } from "@/utils/authNavigation";
   import CustomNavBar from "@/components/custom-nav-bar/custom-nav-bar.uvue";
   import { apiUnCollectAgent, apiCollectAgent } from "@/servers/agentDev";
   import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
@@ -209,6 +212,30 @@
   const loginPopupRef = authInterceptor.loginPopupRef;
   const baseHandleAgentClick = authInterceptor.handleAgentClick as (info : any) => void;
   const checkAuthAndShowPopup = authInterceptor.checkAuthAndShowPopup as () => Promise<boolean>;
+  const hasToken = authInterceptor.hasToken as () => Promise<boolean>;
+
+  // 登录态
+  const isLoggedIn = ref<boolean>(false);
+
+  // Android：组件 ref 是 Gen* 类，禁止 as UTSJSONObject 或直接点方法；用 $callMethod 调 defineExpose 方法
+  function callRefMethod(inst: any | null, methodName: string): void {
+    if (inst == null) {
+      return;
+    }
+    const proxy = inst as ComponentPublicInstance;
+    proxy.$callMethod(methodName);
+  }
+
+  // 登录
+  const handleLogin = () => {
+    // #ifdef MP-WEIXIN
+    callRefMethod(loginPopupRef.value, "open");
+    // #endif
+
+    // #ifdef H5 || WEB || APP
+    goToLogin();
+    // #endif
+  };
 
   // 当前分类
   const activeCategory = ref<string>(CONST_ALL);
@@ -341,6 +368,25 @@
         new PublishedCategoryItem(CONST_ALL, "Mobile.Common.all", true),
         ...categoryData,
       ];
+
+      // 保持当前选中的 activeCategory 对应 activeSwiperIndex 和 scrollIntoView 同步
+      if (categories.value.length > 0) {
+        let foundIndex = -1;
+        for (let i = 0; i < categories.value.length; i++) {
+          if (categories.value[i].key == activeCategory.value) {
+            foundIndex = i;
+            break;
+          }
+        }
+        if (foundIndex >= 0) {
+          activeSwiperIndex.value = foundIndex;
+          scrollIntoView.value = activeCategory.value;
+        } else {
+          activeCategory.value = CONST_ALL;
+          activeSwiperIndex.value = 0;
+          scrollIntoView.value = CONST_ALL;
+        }
+      }
     } else if (apiResCode(response) != USER_NO_LOGIN && apiResCode(response) != REDIRECT_LOGIN) {
       uni.showToast({
         title: t("Mobile.AgentList.fetchCategoryFailed"),
@@ -349,11 +395,72 @@
     }
   };
 
+  /** 获取发布列表项的稳定身份，兼容接口同时存在 id / targetId 的情况。 */
+  const getPublishedAgentKey = (item: UTSJSONObject): string => {
+    const id = item["id"];
+    if (id != null) return `id:${id}`;
+    const targetId = item["targetId"];
+    return targetId != null ? `target:${targetId}` : "";
+  };
+
+  /**
+   * 自动刷新只更新业务数据，不更新已有图片 src。
+   * 上传图片经对象存储/鉴权代理后，签名 query 可能随请求变化；Android Fresco
+   * 会将新 URL 当作新资源并短暂清空旧 Drawable，表现为切换分类 Tab 时闪烁。
+   */
+  const stabilizePublishedImageUrls = (
+    category: string,
+    incoming: UTSJSONObject[],
+    refreshExistingImages: boolean,
+  ): UTSJSONObject[] => {
+    if (refreshExistingImages) return incoming;
+    const rawExisting = agentListMap.value[category];
+    const existing = rawExisting != null ? rawExisting : ([] as UTSJSONObject[]);
+    if (existing.length == 0) return incoming;
+
+    for (let i = 0; i < incoming.length; i++) {
+      const nextItem = incoming[i];
+      const nextKey = getPublishedAgentKey(nextItem);
+      if (nextKey.length == 0) continue;
+
+      let oldItem: UTSJSONObject | null = null;
+      for (let j = 0; j < existing.length; j++) {
+        if (getPublishedAgentKey(existing[j]) == nextKey) {
+          oldItem = existing[j];
+          break;
+        }
+      }
+      if (oldItem == null) continue;
+
+      const oldIcon = oldItem["icon"];
+      if (oldIcon != null && `${oldIcon}`.length > 0) {
+        nextItem["icon"] = oldIcon;
+      }
+      const oldCover = oldItem["coverImg"];
+      if (oldCover != null && `${oldCover}`.length > 0) {
+        nextItem["coverImg"] = oldCover;
+      }
+
+      const oldPublisherRaw = oldItem["publishUser"];
+      const nextPublisherRaw = nextItem["publishUser"];
+      if (oldPublisherRaw != null && nextPublisherRaw != null) {
+        const oldPublisher = oldPublisherRaw as UTSJSONObject;
+        const nextPublisher = nextPublisherRaw as UTSJSONObject;
+        const oldAvatar = oldPublisher["avatar"];
+        if (oldAvatar != null && `${oldAvatar}`.length > 0) {
+          nextPublisher["avatar"] = oldAvatar;
+        }
+      }
+    }
+    return incoming;
+  };
+
   // 获取智能体列表
   const fetchAgentList = async (
     category: string,
     pageNum: number,
     keyword: string,
+    refreshExistingImages: boolean,
   ) => {
     if (loadingMap.value[category] != null && loadingMap.value[category] == true) return;
     // 设置加载状态
@@ -388,7 +495,11 @@
           const existingList: UTSJSONObject[] = raw != null ? raw : ([] as UTSJSONObject[]);
           agentListMap.value[category] = [...existingList, ...newList];
         } else {
-          agentListMap.value[category] = newList;
+          agentListMap.value[category] = stabilizePublishedImageUrls(
+            category,
+            newList,
+            refreshExistingImages,
+          );
         }
         const pages: number = pageData != null ? (pageData["pages"] as number) : 1;
         hasMoreMap.value[category] = pageData != null && pages > pageNum;
@@ -408,6 +519,7 @@
   };
 
   const initData = async () => {
+    isLoggedIn.value = await hasToken();
     // 获取分类列表
     fetchCategories();
     // 1. 首先尝试从本地缓存读取，以实现秒开级的初始渲染，防止 siteName 等标题闪烁
@@ -426,10 +538,18 @@
     await fetchTenantConfig();
   };
 
+  /**
+   * 静默刷新当前分类的智能体列表
+   */
+  const refreshData = () => {
+    initData();
+    const currentCat = activeCategory.value != "" ? activeCategory.value : CONST_ALL;
+    fetchAgentList(currentCat, 1, searchKeyword.value, false);
+  };
+
   // #ifdef MP-WEIXIN
   onShow(() => {
-    initData();
-    fetchAgentList(CONST_ALL, 1, searchKeyword.value);
+    refreshData();
   });
 
   onUnload(() => {
@@ -441,8 +561,7 @@
 
   // #ifndef MP-WEIXIN
   onMounted(() => {
-    initData();
-    fetchAgentList(CONST_ALL, 1, searchKeyword.value);
+    refreshData();
   });
 
   onUnmounted(() => {
@@ -451,6 +570,12 @@
     }
   });
   // #endif
+
+  defineExpose({
+    refreshData,
+    initData,
+    fetchAgentList,
+  });
 
   // 点击智能体分类标签
   const handleCategoryClick = (key: string, index: number) => {
@@ -461,20 +586,17 @@
     // 滚动到对应的分类标签
     scrollIntoView.value = key;
 
-    // 如果该分类还没有数据，则加载数据
-    const rawList = agentListMap.value[key];
-    if (rawList == null || rawList.length == 0) {
-      pageMap.value[key] = 1;
-      hasMoreMap.value[key] = true;
-      fetchAgentList(key, 1, searchKeyword.value);
-    }
+    // 每次切换头部 Tab 均静默刷新当前 Tab 下的列表数据
+    pageMap.value[key] = 1;
+    hasMoreMap.value[key] = true;
+    fetchAgentList(key, 1, searchKeyword.value, false);
   };
 
   // 处理Swiper切换
   const handleSwiperChange = (e: UniSwiperChangeEvent) => {
     const index = e.detail.current;
     const category = categories.value[index];
-    if (category != null && category.key !== activeCategory.value) {
+    if (category != null && category.key != activeCategory.value) {
       // 当前分类
       activeCategory.value = category.key;
       // 当前swiper索引
@@ -484,13 +606,10 @@
       const id = categories.value[index].key;
       scrollIntoView.value = id;
 
-      // 如果该分类还没有数据，则加载数据
-      const catRaw = agentListMap.value[category.key];
-      if (catRaw == null || catRaw.length == 0) {
-        pageMap.value[category.key] = 1;
-        hasMoreMap.value[category.key] = true;
-        fetchAgentList(category.key, 1, searchKeyword.value);
-      }
+      // 每次切换头部 Tab 均静默刷新当前 Tab 下的列表数据
+      pageMap.value[category.key] = 1;
+      hasMoreMap.value[category.key] = true;
+      fetchAgentList(category.key, 1, searchKeyword.value, false);
     }
   };
 
@@ -511,6 +630,11 @@
 
   // 跳转到智能体详情页
   const handleAgentClick = (agentInfo: UTSJSONObject) => {
+    // 检查登录状态，如果未登录则显示登录弹窗
+    if (!isLoggedIn.value) {
+      handleLogin();
+      return;
+    }
     // 使用登录拦截逻辑处理点击
     baseHandleAgentClick({
       targetId: agentInfo["targetId"],
@@ -519,6 +643,11 @@
       icon: agentInfo["icon"],
       description: agentInfo["description"],
     });
+  };
+
+  const getCoverImg = (info: UTSJSONObject): string => {
+    const cover = info["coverImg"];
+    return cover != null ? `${cover}` : '';
   };
 
   // 安全获取发布用户信息（UTSJSONObject 需要使用方括号访问属性）
@@ -621,7 +750,7 @@
     refreshingMap.value[currentCategory] = true;
     pageMap.value[currentCategory] = 1;
     hasMoreMap.value[currentCategory] = true;
-    fetchAgentList(currentCategory, 1, searchKeyword.value).finally(() => {
+    fetchAgentList(currentCategory, 1, searchKeyword.value, true).finally(() => {
       // 添加延迟，让loading效果更明显
       setTimeout(() => {
         refreshingMap.value[currentCategory] = false;
@@ -636,7 +765,7 @@
     const currentLoading = loadingMap.value[activeCategory.value];
 
     if (currentHasMore && currentLoading != true) {
-      fetchAgentList(activeCategory.value, currentPage + 1, searchKeyword.value);
+      fetchAgentList(activeCategory.value, currentPage + 1, searchKeyword.value, false);
     }
   };
 </script>
@@ -702,25 +831,23 @@
         cursor: pointer;
         user-select: none;
         /* #endif */
-        transition: all 0.3s ease;
         color: #5e6470;
         font-size: 32rpx;
         font-weight: 400;
 
         &.active {
           background-color: #f2f2ff;
-
-          .category-text {
-            color: #5147ff;
-          }
         }
 
         .category-text {
           font-size: 32rpx;
           font-weight: 400;
           color: #5e6470;
-          transition: color 0.3s ease;
           white-space: nowrap;
+        }
+
+        .category-text-active {
+          color: #5147ff;
         }
       }
     }

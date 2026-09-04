@@ -333,6 +333,10 @@ class H5RecorderManager {
     this._removeCallback('onStop', callback);
   }
 
+  offError(callback) {
+    this._removeCallback('onError', callback);
+  }
+
   offFrameRecorded(callback) {
     this._removeCallback('onFrameRecorded', callback);
   }
@@ -445,6 +449,7 @@ function getRecorderManager() {
         'onInterruptionEnd',
         'offStart',
         'offStop',
+        'offError',
         'offPause',
         'offResume',
         'offFrameRecorded',

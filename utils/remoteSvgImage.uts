@@ -1,0 +1,271 @@
+/**
+ * 远程 SVG 在 App 端 <image> 的适配工具。
+ *
+ * 根因：App 端（原生渲染）把 SVG 按声明尺寸（如 width="200" height="200"）光栅化后 1:1 绘制，
+ * mode=aspectFit / CSS 宽高缩放对 SVG 失效：容器小于声明尺寸时只显示局部（看起来被裁切/放大），
+ * 容器大于声明尺寸时图标显得严重偏小。H5（含 web-view 内嵌页）由浏览器渲染，无此问题。
+ *
+ * 方案：仅 Android / iOS 生效——
+ * 1. 下载 SVG 文本（uni.request responseType:text，8s 超时，按 URL 缓存文本）；
+ * 2. stripPreamble：丢弃 <svg 前的 <?xml ?> 声明 / 注释等前置内容，避免后两步的
+ *    indexOf(">") 误定位到前置内容里的 ">"，改写/前移到错误位置而破坏 XML 结构；
+ * 3. moveDefsToFront：把 <defs> 块前移到 <svg> 开标签后（修复前向引用导致的渲染缺失）；
+ * 4. setSvgSize：把开标签 width/height 改写为「容器 rpx → 物理像素（×pixelRatio）」，
+ *    同时兼容单引号/双引号属性写法，避免重复 width/height 属性导致 XML 不合法；
+ * 5. 生成 data:image/svg+xml URL，按「宽x高|URL」缓存；失败回退原 URL。
+ *
+ * 长列表保护：同一 URL 的在途请求会共用一次下载（去重），整体下载并发受闸门限制（默认 5），
+ * 失败 URL 记入负缓存不再重试；调用方应按需（可见行）解析，不要一次性 await 全量列表。
+ *
+ * 注意：Android / iOS 为 1:1 绘制，每个显示尺寸必须各自调用（各自生成对应物理像素的 data URL）。
+ *
+ * 鸿蒙（APP-HARMONY）例外，原样透传 URL：ArkUI 的 <image> 不支持 SVG 的 data URL
+ * （data:image/svg+xml 无论 ;utf8, 还是 ;base64, 都直接触发 error，图标显示为默认图），
+ * 但它支持远程 .svg 地址且按组件尺寸正确缩放（没有 Android / iOS 的 1:1 光栅化问题），
+ * 因此鸿蒙不需要也不能走 data URL 方案。H5 / 小程序同样原样透传，不产生额外请求。
+ *
+ * 鉴权：/api/f/ 受保护 SVG 的文本下载会自动补 Bearer 头并把相对地址补全为绝对地址，
+ * 因此**不要**先用 downloadFile 把它落成本地文件再传进来——本地 file:// 既取不到文本，
+ * 也会退回原生 1:1 光栅化，Android 上表现为头像被裁切 / 尺寸错乱。混合场景请直接用
+ * resolveDisplayImageUrl（受保护 + SVG 的组合已在其中按平台处理）。
+ */
+import {
+  buildAuthProtectedFileHeaders,
+  fetchAuthProtectedFileDisplayUrl,
+  isAuthProtectedFileUrl,
+  resolveAuthProtectedFileFetchUrl,
+} from "@/utils/authProtectedFileUrl";
+
+/** 是否为需要按尺寸重写的远程 SVG 地址（data: 协议已是可直接渲染的内联图，排除在外） */
+export function isRemoteSvgUrl(url: string): boolean {
+  if (url.length == 0) return false;
+  const lower = url.toLowerCase();
+  if (lower.startsWith("data:")) return false;
+  return lower.endsWith(".svg") || lower.includes(".svg?");
+}
+
+// #ifdef APP-ANDROID || APP-IOS
+const svgTextCache = new Map<string, string>();
+const svgDataUrlCache = new Map<string, string>();
+/** 下载失败（含超时）的 URL：不再重复发起，直接回退原图，避免长列表反复卡在 8s 超时上 */
+const svgFailedCache = new Map<string, boolean>();
+/** 同一 URL 的在途下载：多行共用同一张图时只发一次请求 */
+const svgPendingRequests = new Map<string, Promise<string>>();
+
+/**
+ * 并发闸门：长列表一次性解析上百个图标时，若全部并发发起请求会把网络队列打满，
+ * 每个请求都要等前面的排队（叠加 8s 超时）→ 页面长时间停在「加载中」。
+ * 这里限制同时进行的 SVG 下载数，超出的排队等待。
+ */
+const MAX_CONCURRENT_SVG_REQUESTS = 5;
+let activeSvgRequests = 0;
+const svgRequestWaiters: Array<() => void> = [] as Array<() => void>;
+
+function acquireSvgSlot(): Promise<boolean> {
+  return new Promise<boolean>((resolve, _reject) => {
+    if (activeSvgRequests < MAX_CONCURRENT_SVG_REQUESTS) {
+      activeSvgRequests++;
+      resolve(true);
+      return;
+    }
+    svgRequestWaiters.push(() => {
+      activeSvgRequests++;
+      resolve(true);
+    });
+  });
+}
+
+function releaseSvgSlot(): void {
+  activeSvgRequests--;
+  if (svgRequestWaiters.length > 0) {
+    const next = svgRequestWaiters[0];
+    svgRequestWaiters.splice(0, 1);
+    next();
+  }
+}
+
+function downloadSvgText(url: string, timeoutMs: number): Promise<string> {
+  // /api/f/ 受保护 SVG：补全为绝对地址并携带 Bearer，否则拿到的是未鉴权响应（图标显示为默认图）
+  const isProtected = isAuthProtectedFileUrl(url);
+  const requestUrl = isProtected ? resolveAuthProtectedFileFetchUrl(url) : url;
+  const header = isProtected ? buildAuthProtectedFileHeaders() : ({} as UTSJSONObject);
+  return new Promise<string>((resolve, reject) => {
+    uni.request({
+      url: requestUrl,
+      method: "GET",
+      header: header,
+      timeout: timeoutMs,
+      responseType: "text",
+      // 鸿蒙端 responseType 不跳过 JSON 自动解析（uni-network 默认 dataType=json），
+      // 不显式 dataType 会把 SVG/XML 文本当 JSON parse 并上报错误
+      dataType: "text",
+      success: (res) => {
+        const data = res.data;
+        if (data == null) {
+          reject(new Error("svg response empty"));
+          return;
+        }
+        if (typeof data == "string") {
+          const text = data as string;
+          if (text.trim().length == 0) {
+            reject(new Error("svg response empty"));
+            return;
+          }
+          resolve(text);
+          return;
+        }
+        const s = JSON.stringify(data);
+        resolve(s != null ? s : "");
+      },
+      fail: (_err) => {
+        reject(new Error("svg download failed"));
+      },
+    });
+  });
+}
+
+/**
+ * 丢弃 <svg 之前的一切内容（<?xml ?> 声明 / 注释 / DOCTYPE 等）。
+ * moveDefsToFront / setSvgSize 都用 indexOf(">") 定位「<svg 开标签的结束位置」，
+ * 如果源文件在 <svg 前还有这些前置内容，第一个 ">" 会误命中前置内容里的 ">"，
+ * 导致后续插入 / 前移的内容落在错误位置，破坏 XML 结构（原生解析器比浏览器严格，
+ * 结构一旦不合法就会解码失败，图标显示为默认头像）。
+ */
+function stripPreamble(svg: string): string {
+  const idx = svg.toLowerCase().indexOf("<svg");
+  return idx > 0 ? svg.substring(idx) : svg;
+}
+
+/** 把 <defs>…</defs> 块前移到 <svg> 开标签之后，修复前向引用（rect 在 defs 前）导致的渲染缺失 */
+function moveDefsToFront(svg: string): string {
+  const openTagEnd = svg.indexOf(">");
+  const defsStart = svg.indexOf("<defs");
+  const defsEnd = svg.indexOf("</defs>");
+  if (openTagEnd < 0 || defsStart < 0 || defsEnd < 0) return svg;
+  // defs 已在开标签内/之前，无需移动
+  if (defsStart < openTagEnd) return svg;
+  const defsBlock = svg.substring(defsStart, defsEnd + "</defs>".length);
+  const without = svg.substring(0, defsStart) + svg.substring(defsEnd + "</defs>".length);
+  return without.substring(0, openTagEnd + 1) + defsBlock + without.substring(openTagEnd + 1);
+}
+
+/** 移除开标签已有 width/height，改写为容器物理像素（保证 1:1 光栅化正好等于容器尺寸） */
+function setSvgSize(svg: string, widthPx: number, heightPx: number): string {
+  const lower = svg.toLowerCase();
+  if (lower.indexOf("<svg") < 0) return svg;
+  const openTagEnd = svg.indexOf(">");
+  if (openTagEnd < 0) return svg;
+  let openTag = svg.substring(0, openTagEnd + 1);
+  // 同时兼容单引号 / 双引号属性值：只处理双引号会漏删单引号写法的原属性，
+  // 导致同一标签上残留一份旧的 + 追加一份新的 width/height（重复属性，非法 XML）。
+  openTag = openTag.replace(/width\s*=\s*("[^"]*"|'[^']*')/g, "");
+  openTag = openTag.replace(/height\s*=\s*("[^"]*"|'[^']*')/g, "");
+  const attrs = ' width="' + widthPx.toString() + '" height="' + heightPx.toString() + '"';
+  return openTag.substring(0, openTag.length - 1) + attrs + ">" + svg.substring(openTagEnd + 1);
+}
+
+/** 受并发闸门约束的下载 */
+async function downloadSvgTextLimited(url: string, timeoutMs: number): Promise<string> {
+  await acquireSvgSlot();
+  try {
+    return await downloadSvgText(url, timeoutMs);
+  } finally {
+    releaseSvgSlot();
+  }
+}
+
+/** 带缓存 + 在途去重的 SVG 文本获取 */
+async function fetchSvgText(url: string, timeoutMs: number): Promise<string> {
+  const cached = svgTextCache.get(url);
+  if (cached != null && cached.length > 0) return cached;
+  const pending = svgPendingRequests.get(url);
+  if (pending != null) return await pending;
+  const task = downloadSvgTextLimited(url, timeoutMs);
+  svgPendingRequests.set(url, task);
+  try {
+    const text = await task;
+    svgTextCache.set(url, text);
+    return text;
+  } finally {
+    svgPendingRequests.delete(url);
+  }
+}
+// #endif
+
+/**
+ * 解析远程 SVG 在 App 端 <image> 的可用 URL。
+ * @param url 原始 URL
+ * @param widthRpx 容器宽度（rpx）
+ * @param heightRpx 容器高度（rpx）
+ * @returns Android / iOS 返回按容器物理像素改写后的 data URL；鸿蒙与非 App 端原样返回
+ */
+export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx: number): Promise<string> {
+  // #ifdef APP-ANDROID || APP-IOS
+  if (url.length == 0) return url;
+  // 非 SVG 资源（png/jpg/data URL 等）直接透传
+  if (!isRemoteSvgUrl(url)) return url;
+  const sys = uni.getSystemInfoSync();
+  const windowWidth = sys.windowWidth > 0 ? sys.windowWidth : 375;
+  const pixelRatio = sys.pixelRatio > 0 ? sys.pixelRatio : 2;
+  const widthPx = Math.round((widthRpx * windowWidth) / 750 * pixelRatio);
+  const heightPx = Math.round((heightRpx * windowWidth) / 750 * pixelRatio);
+  const cacheKey = widthPx.toString() + "x" + heightPx.toString() + "|" + url;
+  const cached = svgDataUrlCache.get(cacheKey);
+  if (cached != null && cached.length > 0) return cached;
+  // 之前已确认下载不到：直接回退，不再排队重试
+  if (svgFailedCache.get(url) != null) return url;
+  try {
+    const text = await fetchSvgText(url, 8000);
+    let processed = stripPreamble(text);
+    processed = moveDefsToFront(processed);
+    processed = setSvgSize(processed, widthPx, heightPx);
+    const dataUrl = "data:image/svg+xml;utf8," + encodeURIComponent(processed);
+    svgDataUrlCache.set(cacheKey, dataUrl);
+    return dataUrl;
+  } catch (_e) {
+    // 下载/处理失败回退原始 URL（仍按 App 默认行为渲染），并记入失败缓存避免重复重试
+    svgFailedCache.set(url, true);
+    return url;
+  }
+  // #endif
+  // #ifndef APP-ANDROID || APP-IOS
+  return url;
+  // #endif
+}
+
+/**
+ * 解析可直接绑定给 <image> 的地址：一次处理「受保护文件」与「远程 SVG」两种异步场景。
+ *
+ * 两者的顺序不能颠倒：Android / iOS 上 SVG 必须走「取文本 → 改尺寸 → data URL」，
+ * 若先 downloadFile 落成本地 file://，既无法再取文本（uni.request 不支持 file 协议），
+ * 也会退回原生 1:1 光栅化 → 头像显示异常。鸿蒙 / H5 的 <image> 能正确缩放远程 SVG，
+ * 受保护地址走 downloadFile 拿本地临时文件即可。
+ *
+ * @param url 原始地址（可为相对路径的 /api/f/ 文件）
+ * @param widthRpx 容器宽度（rpx）
+ * @param heightRpx 容器高度（rpx）
+ * @returns 可直接展示的地址；解析失败回退原地址，由调用方决定是否换默认图
+ */
+export async function resolveDisplayImageUrl(
+  url: string,
+  widthRpx: number,
+  heightRpx: number,
+): Promise<string> {
+  if (url.length == 0) return url;
+  // #ifdef APP-ANDROID || APP-IOS
+  if (isRemoteSvgUrl(url)) {
+    const resolved = await resolveAppSvgUrl(url, widthRpx, heightRpx);
+    // 解析成功（已是 data URL）直接用；失败时受保护地址再退回 downloadFile 兜底
+    if (resolved != url) return resolved;
+  }
+  // #endif
+  if (isAuthProtectedFileUrl(url)) {
+    try {
+      return await fetchAuthProtectedFileDisplayUrl(url);
+    } catch (_e) {
+      // 保留各平台原生图片缓存 / Cookie 命中的机会
+      return url;
+    }
+  }
+  return await resolveAppSvgUrl(url, widthRpx, heightRpx);
+}

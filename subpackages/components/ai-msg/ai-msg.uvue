@@ -36,48 +36,74 @@
           :class="{ 'hide-think-content': hideThinkContent }"
         >
           <view class="text-box">
-            <UniAiXMsgRender
-              v-if="renderThinkMarkdownElList.length > 0"
-              :markdown-el-list="renderThinkMarkdownElList"
-              :processing-list="renderProcessingList"
-              :conversation-id="msg.chat_id"
-            />
+            <!--
+              单 text 展示：UTS 对 ref 数组 v-for 不稳定（会报找不到 thinkFrozenParts）。
+              增量逻辑仍在 paintThinkIncremental 内维护 frozen/live，仅拼接后绑定。
+            -->
             <text
-              v-else-if="thinkContent.length > 0"
+              v-if="thinkDisplayText.length > 0"
               class="think-plain-text"
-              selectable="true"
-            >{{ thinkContent }}</text>
+              :selectable="true"
+            >{{ thinkDisplayText }}</text>
           </view>
         </view>
       </view>
 
-      <!-- AI 答复内容（uni-cmark → UniAiMarkdownElItem[] → uni-ai-x-msg） -->
+      <!-- AI 答复内容：H5/小程序用 mp-html 渲染 markdown，App 端走 UniAiXMsgRender -->
       <view class="answer-container">
+        <!-- #ifdef H5 || MP-WEIXIN -->
+        <mp-html
+          v-if="mpHtmlContent.length > 0"
+          :content="mpHtmlContent"
+          :processing-list="renderProcessingList"
+          :is-current-streaming="isConversationActive && isLastMsg"
+          :conversation-id="mpHtmlConversationId"
+          :markdown="true"
+          :selectable="true"
+          :container-style="'width: 100%;'"
+          :tag-style="mpHtmlTagStyle"
+          :scroll-table="true"
+          :copy-link="false"
+          @linktap="handleMpHtmlLinkTap"
+        />
+        <!-- OpenUI 只在 mp-html 正文过程标签原位渲染，不在气泡底部旁路出卡 -->
+        <!-- #endif -->
+        <!-- #ifndef H5 || MP-WEIXIN -->
         <UniAiXMsgRender
           v-if="renderMarkdownElList.length > 0"
           :markdown-el-list="renderMarkdownElList"
           :processing-list="renderProcessingList"
-          :conversation-id="msg.chat_id"
+          :is-current-streaming="isConversationActive && isLastMsg"
+          :conversation-id="mpHtmlConversationId"
+          :body-text="resolveBodyText()"
+          :is-app-details="isAppDetails"
         />
+        <!-- #endif -->
       </view>
     </template>
+    <!-- APP：CSS animation 对 image 无效，用 transition 自转（1s/圈，对齐 H5） -->
+    <!-- #ifdef APP -->
+    <view v-if="showLoadingIcon" class="icon-loading-wrap">
+      <spin-loading size="48rpx" color="#3bb346" :duration-ms="800" />
+    </view>
+    <!-- #endif -->
+    <!-- #ifndef APP -->
     <image
       v-if="showLoadingIcon"
-      class="icon-loading-image"
+      class="icon-loading-image icon-loading-spin"
       src="@/static/assets/icon_loading.svg"
       :show-menu-by-longpress="false"
       @longtap.stop.prevent
       @contextmenu.stop.prevent="true"
       mode="widthFix"
     />
+    <!-- #endif -->
     <msg-tool-bar
-      v-if="
-        showToolBar &&
-        ((!isConversationActive || !isLastMsg) && hasBodyOrText) ||
-        (showToolBar && msg.state === 3)
-      "
+      v-if="shouldShowMsgToolBar"
       :msg="msg"
-      :speak-text="resolveBodyText()"
+      :is-last-msg="isLastMsg"
+      :speak-text="resolveSpeakableBodyText()"
+      :enable-voice="enableVoice"
     />
   </view>
 </template>
@@ -87,22 +113,65 @@
   import type { UniAiMarkdownElItem } from "@/uni_modules/uni-ai-x/types.uts";
   import { ChatDataAdapter } from "@/utils/chatDataAdapter.uts";
   import msgToolBar from "@/subpackages/components/msg-tool-bar/msg-tool-bar.uvue";
+  // #ifdef H5 || MP-WEIXIN
+  import mpHtml from "@/subpackages/uni_modules/mp-html/components/mp-html/mp-html.vue";
+  // #endif
   import UniAiXMsgRender from "@/uni_modules/uni-ai-x/components/uni-ai-x-msg/uni-ai-x-msg.uvue";
+  import {
+    stripOpenUiActionIdMarker,
+  } from "@/utils/openUiSchema.uts";
+  // #ifdef APP
+  import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
+  // #endif
   import { AiMsgMarkdownParser } from "@/subpackages/components/ai-msg/aiMsgMarkdownParser.uts";
   import { TaskStatus } from "@/types/enums/agent";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { groupMarkdownContainers } from "@/utils/markdown.uts";
+  import { syncOpenUiProcessTagsWithProcessingList } from "@/utils/openUiMarkdown.uts";
+  // #ifdef H5 || MP-WEIXIN
+  import { replaceMathBracket } from "@/utils/markdown.uts";
+  import { handleExternalLink } from "@/utils/system.uts";
+  // #endif
+  import { stripIncompleteCustomMarkupTail, stripOrphanCustomProcessGroupCloseTags } from "@/utils/markdownCustomProcess.uts";
+  // #ifdef H5 || MP-WEIXIN
+  import { replaceConversationDetailTags } from "@/utils/markdownCustomProcess.uts";
+  // #endif
+  import {
+    stripMarkdownImages,
+  } from "@/subpackages/components/ai-msg/markdownImage.uts";
+  import {
+    stripAgentInfoTags,
+    stripAdaptedAgentInfoHtml,
+  } from "@/subpackages/components/ai-msg/agentInfoTag.uts";
+  import { onUnmounted } from "vue";
+  // #ifdef APP
+  import { perfRecordSseUi } from "@/utils/perfProbe.uts";
+  // #endif
+  import { toolCallProcessingListFingerprint } from "@/subpackages/utils/containerHelper.uts";
+  import { applyThinkIncremental } from "@/subpackages/components/ai-msg/thinkIncrementalDisplay.uts";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
 
   const props = withDefaults(
     defineProps<{
-      /** App：父组件传入时编译器常推成 Any，内部再 as MsgItem */
-      msg: any;
+      /** 兼容开场白等旧调用；会话列表改走下方基础字段。 */
+      msg?: any;
+      /** 消息基础字段，避免模板热路径反复 MessageInfo → MsgItem。 */
+      messageId?: string;
+      messageStatus?: any;
+      processingList?: any[];
+      initialMarkdownElList?: any[];
+      conversationId?: string;
+      messageTime?: string;
       /** App 可靠通道：直接传字符串，避免 MsgItem 类实例 prop 丢字段 */
       bodyText?: string;
       thinkText?: string;
+      /**
+       * 预计算可播报正文（MessageInfo.speakableText）。
+       * 非空时工具栏直接播报，不再二次过滤。
+       */
+      speakableText?: string;
       // 会话是否正在进行中（有消息正在处理）
       isConversationActive?: boolean;
       taskStatus?: TaskStatus;
@@ -110,11 +179,34 @@
       isLastMsg?: boolean;
       /** 是否显示复制、语音播报等消息工具栏。 */
       showToolBar?: boolean;
+      /** 当前是否为应用详情会话，决定任务详情跳转页。 */
+      isAppDetails?: boolean;
+      /** 是否启用语音播报按钮（仅 App web-view 内嵌页为 true）。 */
+      enableVoice?: boolean;
+      /**
+       * 历史消息懒解析：为 true 时挂载不立刻解析 markdown，
+       * 等滚近视口（IntersectionObserver）再解析。仅 H5/WEB 生效。
+       * 流式末条 / 非 H5 端不受影响（恒立即解析）。
+       */
+      deferParse?: boolean;
+      /** 懒解析定位 key：对应父级消息包裹元素 id 后缀（`${id}_${index}`）。 */
+      deferKey?: string;
     }>(),
     {
+      msg: null,
+      messageId: "",
+      processingList: (): any[] => [] as any[],
+      initialMarkdownElList: (): any[] => [] as any[],
+      conversationId: "",
+      messageTime: "",
       bodyText: "",
       thinkText: "",
+      speakableText: "",
       showToolBar: true,
+      isAppDetails: false,
+      enableVoice: true,
+      deferParse: false,
+      deferKey: "",
     },
   );
 
@@ -137,6 +229,8 @@
     next.error_msg = source.error_msg;
     next.rendered = source.rendered;
     next.processingList = source.processingList;
+    next.openuiArtifactId = source.openuiArtifactId;
+    next.openuiTitle = source.openuiTitle;
     return next;
   }
 
@@ -201,14 +295,21 @@
     if (renderedVal != null) {
       target.rendered = renderedVal as boolean;
     }
+
+    const openuiArtifactIdVal = p["openuiArtifactId"];
+    if (openuiArtifactIdVal != null) {
+      target.openuiArtifactId = `${openuiArtifactIdVal}`;
+    }
+    const openuiTitleVal = p["openuiTitle"];
+    if (openuiTitleVal != null) {
+      target.openuiTitle = `${openuiTitleVal}`;
+    }
   }
 
   // 内部响应式副本；App 上必须 watch props.msg，否则历史消息 body 可能一直为空
   const msg = ref<MsgItem>(new MsgItem());
-  /** App 流式：强制触发 appPlainText 重算 */
+  /** App 流式：强制触发正文 markdown / UniAiXMsgRender 失效 */
   const streamRevision = ref<number>(0);
-  /** 每次 props 同步后递增，驱动 markdown 解析（避免 UTS watch immediate 未触发） */
-  const markdownParseTick = ref<number>(0);
 
   function mergeMsgFromProps(incoming: MsgItem): void {
     const cur = msg.value;
@@ -220,33 +321,30 @@
     }
     cur.state = incoming.state;
     cur.processingList = incoming.processingList;
+    if (incoming.openuiArtifactId.length > 0) {
+      cur.openuiArtifactId = incoming.openuiArtifactId;
+      cur.openuiTitle = incoming.openuiTitle;
+    }
     if (incoming.error_msg.length > 0) {
       cur.error_msg = incoming.error_msg;
     }
     if (incoming.markdownElList.length > 0) {
       cur.markdownElList = incoming.markdownElList.slice();
     }
-    console.log("[MdRender] mergeMsgFromProps id=" + cur._id + " bodyLen=" + cur.body.length + " elCount=" + cur.markdownElList.length);
   }
 
   function syncMsgFromProps(source: any | null): void {
     if (source == null) {
-      msg.value = new MsgItem();
-      markdownParseTick.value = markdownParseTick.value + 1;
       return;
     }
     const incoming = source as MsgItem;
     const incomingId = incoming._id;
-    const propBodyLen =
-      props.bodyText != null ? `${props.bodyText}`.length : 0;
     const sameId = incomingId.length > 0 && incomingId == msg.value._id;
-    console.log("[MdRender] syncMsgFromProps id=" + incomingId + " sameId=" + sameId + " bodyLen=" + incoming.body.length + " thinkLen=" + incoming.thinkContent.length + " processingCount=" + incoming.processingList.length + " incomingEl=" + incoming.markdownElList.length + " propBodyLen=" + propBodyLen);
     if (sameId) {
       mergeMsgFromProps(incoming);
     } else {
       msg.value = cloneMsgItem(incoming);
     }
-    markdownParseTick.value = markdownParseTick.value + 1;
   }
 
   /**
@@ -269,9 +367,44 @@
     return propText.length > 0 ? propText : msgBody;
   }
 
-  /** 将连续工具标签规范化为单项或分组标签，普通文本会中断分组。 */
+  /** 工具标签规范化；未闭合自定义标签只剥真尾巴，完整图片留在原位。
+   * OpenUI：同 executeId 去重，status 以 processingList（componentExecutedList）为最终态。
+   */
   function resolveRenderableBodyText(): string {
-    return groupMarkdownContainers(resolveBodyText());
+    const grouped = groupMarkdownContainers(resolveBodyText());
+    const list =
+      msg.value.processingList != null
+        ? (msg.value.processingList as any[])
+        : null;
+    const withOpenUiSync = syncOpenUiProcessTagsWithProcessingList(
+      grouped,
+      list,
+    );
+    return stripOpenUiActionIdMarker(
+      stripMarkdownImages(
+        stripAdaptedAgentInfoHtml(
+          stripAgentInfoTags(
+            stripOrphanCustomProcessGroupCloseTags(
+              stripIncompleteCustomMarkupTail(withOpenUiSync),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /**
+   * 工具栏播报文本：优先 MessageInfo.speakableText（已清洗）。
+   * 为空时返回 ""，由工具栏回落 body 再过滤一次。
+   */
+  function resolveSpeakableBodyText(): string {
+    if (
+      props.speakableText != null &&
+      `${props.speakableText}`.trim().length > 0
+    ) {
+      return `${props.speakableText}`;
+    }
+    return "";
   }
 
   function resolveThinkText(): string {
@@ -289,21 +422,92 @@
     return propThink.length > 0 ? propThink : msgThink;
   }
 
-  /** 思考内容与正文使用相同的工具标签分组预处理。 */
-  function resolveRenderableThinkText(): string {
-    return groupMarkdownContainers(resolveThinkText());
-  }
-
   const isLastMsg = computed((): boolean => props.isLastMsg == true);
   const isConversationActive = computed((): boolean => props.isConversationActive == true);
   const showToolBar = computed((): boolean => props.showToolBar == true);
-  const showLoadingIcon = computed((): boolean => {
-    return (
-      isConversationActive.value &&
-      isLastMsg.value &&
-      props.taskStatus != TaskStatus.EXECUTING
-    );
+
+  /**
+   * 传给 mp-html / uni-ai-x-msg 的会话 ID。
+   * 优先 msg.chat_id（conversationId watch 已写回），否则回退 props 并补 chat- 前缀，
+   * 避免 openui-card 点击时 cid 为空 toast「无法打开 OpenUI」。
+   */
+  const mpHtmlConversationId = computed((): string => {
+    const fromMsg =
+      msg.value.chat_id != null && `${msg.value.chat_id}`.length > 0
+        ? `${msg.value.chat_id}`
+        : "";
+    if (fromMsg.length > 0) {
+      return fromMsg;
+    }
+    const fromProp =
+      props.conversationId != null ? `${props.conversationId}` : "";
+    if (fromProp.length == 0) {
+      return "";
+    }
+    return fromProp.startsWith("chat-") ? fromProp : "chat-" + fromProp;
   });
+
+  const showLoadingIcon = computed((): boolean => {
+    // 会话级终态是 loading 的硬门禁。跨设备停止 / sub 断开时，
+    // 父级 active 会先变 false，子组件内部 state 可能仍短暂停在 1；
+    // 若 state=1 优先，就会在输入框已恢复后仍永久显示 loading。
+    if (isConversationActive.value != true) {
+      return false;
+    }
+    // 只有当前轮最后一条助手消息可显示 loading；
+    // 避免新一轮开始时，历史上残留 state=1 的消息重新转圈。
+    return isLastMsg.value == true;
+  });
+
+  /**
+   * 流式 Markdown 解析：
+   * - 纯文本：20ms 合并（对齐服务层 STREAM_UI_COALESCE_MS，接近逐字）
+   * - 含公式/代码/表/工具：自适应合并窗（正文越长间隔越大）
+   *   旧固定 80ms 对长 SSE 做全量 O(n) fallback → 累计 O(n²) 打满主线程后「卡顿停更」
+   */
+  const STREAM_MD_TEXT_INTERVAL_MS: number = 20;
+  const STREAM_MD_STRUCT_INTERVAL_BASE_MS: number = 280;
+  let streamMdParseTimer: number = 0;
+  let streamMdParsePending: boolean = false;
+
+  function clearStreamMdParseTimer(): void {
+    if (streamMdParseTimer != 0) {
+      clearTimeout(streamMdParseTimer);
+      streamMdParseTimer = 0;
+    }
+    streamMdParsePending = false;
+  }
+
+  function bodyHasStructuralMarkup(body: string): boolean {
+    return (
+      body.indexOf("markdown-custom-process") >= 0 ||
+      body.indexOf(":::container") >= 0 ||
+      body.indexOf("<task-result") >= 0 ||
+      body.indexOf("$") >= 0 ||
+      body.indexOf("|") >= 0 ||
+      body.indexOf("![") >= 0 ||
+      body.indexOf("```") >= 0 ||
+      body.indexOf("mermaid") >= 0
+    );
+  }
+
+  /**
+   * 结构化内容解析合并窗：随正文变长加大，压低全量 fallback 频率。
+   * 含 `$` 公式时基线更高（Android KaTeX/WebView 桥极贵）。
+   * 阈值：小于 2k→280ms；小于 8k→400ms；小于 20k→560ms；更长→720ms
+   */
+  function resolveStructParseIntervalMs(bodyLen: number): number {
+    if (bodyLen < 2000) {
+      return STREAM_MD_STRUCT_INTERVAL_BASE_MS;
+    }
+    if (bodyLen < 8000) {
+      return 400;
+    }
+    if (bodyLen < 20000) {
+      return 560;
+    }
+    return 720;
+  }
 
   // 思考内容是否隐藏（默认隐藏）
   const hideThinkContent = ref<boolean>(true);
@@ -321,18 +525,41 @@
     // #endif
   });
 
-  const thinkContent = computed((): string => {
-    return resolveThinkText();
-  });
-
   /** componentExecutedList 经历史适配后保存为 processingList，由工具调用组件渲染。 */
   const renderProcessingList = computed((): any[] => {
+    // MsgItem 是 UTS class，Android 上替换 class 字段不一定被 Vue 深层追踪；
+    // updateMessage/watch 每次都会递增 revision，以此显式使 PROCESSING 终态列表失效重算。
+    const _rev = streamRevision.value;
     const list = msg.value.processingList;
     return list != null ? list : [] as any[];
   });
 
   const hasBodyOrText = computed((): boolean => {
     return resolveBodyText().trim().length > 0;
+  });
+
+  /**
+   * 底部工具栏显隐。
+   * 不以 msg.state / messageStatus 为准：SSE 中间段 CHAT 也可能 finished→complete，
+   * 整轮结束以父组件 isConversationActive=false 为准（FINAL_RESULT / 流完成 / 停止 / 超时）。
+   * - 历史消息（非最后一条）：有正文即显示
+   * - 当前最后一条：仅会话结束后显示
+   */
+  const shouldShowMsgToolBar = computed((): boolean => {
+    if (showToolBar.value != true) {
+      return false;
+    }
+    if (hasBodyOrText.value != true) {
+      return false;
+    }
+    // 流式输出 / loading 中不显示复制、语音播报
+    if (showLoadingIcon.value == true) {
+      return false;
+    }
+    if (isLastMsg.value == true && isConversationActive.value == true) {
+      return false;
+    }
+    return true;
   });
 
   // 思考是否已完成：如果正文已经有内容，或者会话已结束，或者不是最后一条消息，则认为思考已完成
@@ -352,36 +579,482 @@
     (): boolean => isLastMsg.value,
   );
 
+  function runBodyMarkdownParseNow(forceDone: boolean): void {
+    clearStreamMdParseTimer();
+    // App：始终立即 parse。磁盘缓存命中可直接出图，不必再等 proxyWeb（历史长公式页可省约 1s）；
+    // 未命中公式由 flushMathJobs 在 proxy 就绪后再截图，占位过渡即可。
+    // 注意：parser.applyAppFallback / bumpRevision 已会抬 streamRevision，此处勿再 bump，
+    // 避免一次 parse 触发 2～3 次整树失效。
+    markdownParser.runMarkdownParse(forceDone);
+  }
+
+  // #ifdef H5 || WEB
+  /**
+   * 历史消息懒解析：deferParse 消息挂载时先不解析，等滚近视口（含 300px 提前量）
+   * 再解析。大历史会话首屏只解析视口内消息，避免全量 markdown 解析阻塞主线程。
+   * 实现：模块级注册表 + document scroll 捕获监听 + getBoundingClientRect 判可见
+   * （不用 IntersectionObserver，规避 UTS 对浏览器构造器类型的依赖）。
+   */
+  interface LazyMarkdownEntry {
+    el: any;
+    done: boolean;
+    cb: () => void;
+  }
+  const LAZY_VIEWPORT_BUFFER: number = 300;
+  let lazyMarkdownRegistry: LazyMarkdownEntry[] = [] as LazyMarkdownEntry[];
+  let lazyScrollBound = false;
+  let lazyCheckTimer: number = 0;
+  /** 懒解析已完成（含兜底立即解析），避免 body 未变时反复注册。 */
+  let lazyMarkdownDone = false;
+  /** 本组件是否已注册（卸载时按此移除）。 */
+  let lazyMarkdownRegistered = false;
+  let lazyMarkdownRegisteredEl: any = null;
+
+  function checkLazyMarkdownVisibility(): void {
+    const w = window as any;
+    const vh = w != null && w.innerHeight != null ? (w.innerHeight as number) : 800;
+    const remaining: LazyMarkdownEntry[] = [] as LazyMarkdownEntry[];
+    const list = lazyMarkdownRegistry;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (item == null || item.done == true || item.el == null) {
+        continue;
+      }
+      try {
+        const rect = item.el.getBoundingClientRect() as any;
+        if (rect != null && rect.top < vh + LAZY_VIEWPORT_BUFFER && rect.bottom > -LAZY_VIEWPORT_BUFFER) {
+          item.done = true;
+          item.cb();
+        } else {
+          remaining.push(item);
+        }
+      } catch (_eRect) {
+        item.done = true;
+        item.cb();
+      }
+    }
+    lazyMarkdownRegistry = remaining;
+  }
+
+  function onLazyMarkdownScroll(): void {
+    if (lazyCheckTimer != 0) {
+      return;
+    }
+    lazyCheckTimer = setTimeout((): void => {
+      lazyCheckTimer = 0;
+      checkLazyMarkdownVisibility();
+    }, 60) as number;
+  }
+
+  function ensureLazyMarkdownScrollListener(): void {
+    if (lazyScrollBound == true) {
+      return;
+    }
+    lazyScrollBound = true;
+    try {
+      const w = window as any;
+      if (w != null && w.document != null && w.document.addEventListener != null) {
+        // capture=true：捕获到任意滚动容器（含消息 scroll-view）的 scroll 事件
+        w.document.addEventListener("scroll", onLazyMarkdownScroll, true);
+      }
+    } catch (_eBound) {
+      // ignore
+    }
+  }
+
+  function teardownLazyMarkdownParse(): void {
+    if (lazyMarkdownRegistered == true) {
+      const el = lazyMarkdownRegisteredEl;
+      const list = lazyMarkdownRegistry;
+      const next: LazyMarkdownEntry[] = [] as LazyMarkdownEntry[];
+      for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        if (item == null || item.el == el) {
+          continue;
+        }
+        next.push(item);
+      }
+      lazyMarkdownRegistry = next;
+      lazyMarkdownRegistered = false;
+      lazyMarkdownRegisteredEl = null;
+    }
+  }
+
+  function finishLazyMarkdownParse(): void {
+    lazyMarkdownDone = true;
+    teardownLazyMarkdownParse();
+    runBodyMarkdownParseNow(true);
+  }
+
+  function setupLazyMarkdownParse(): void {
+    if (lazyMarkdownRegistered == true) {
+      return;
+    }
+    try {
+      const w = window as any;
+      if (w == null || w.document == null || w.document.getElementById == null) {
+        finishLazyMarkdownParse();
+        return;
+      }
+      const key = `${props.deferKey}`;
+      if (key.length == 0) {
+        finishLazyMarkdownParse();
+        return;
+      }
+      const rootEl = w.document.getElementById(`msg-wrapper-${key}`);
+      if (rootEl == null) {
+        // 包裹元素未就绪：立即解析兜底，避免消息一直空白
+        finishLazyMarkdownParse();
+        return;
+      }
+      lazyMarkdownRegisteredEl = rootEl;
+      lazyMarkdownRegistered = true;
+      lazyMarkdownRegistry.push({
+        el: rootEl,
+        done: false,
+        cb: (): void => finishLazyMarkdownParse(),
+      } as LazyMarkdownEntry);
+      ensureLazyMarkdownScrollListener();
+      // 已可见的消息（如首屏底部几条）立即解析，不必等滚动
+      checkLazyMarkdownVisibility();
+    } catch (_eObs) {
+      finishLazyMarkdownParse();
+    }
+  }
+  // #endif
+
+  /** 合并高频 chunk 后解析：intervalMs 合并窗内多次调用只解析一次 */
+  function scheduleMergedParse(intervalMs: number): void {
+    streamMdParsePending = true;
+    if (streamMdParseTimer != 0) {
+      return;
+    }
+    streamMdParseTimer = setTimeout(() => {
+      streamMdParseTimer = 0;
+      if (streamMdParsePending == false) {
+        return;
+      }
+      streamMdParsePending = false;
+      markdownParser.runMarkdownParse(false);
+    }, intervalMs);
+  }
+
+  /** 流式：合并高频 chunk 后再解析；非流式：立即解析；首帧无结果时立即解析 */
+  function scheduleBodyMarkdownParse(): void {
+    const streaming =
+      isConversationActive.value == true && isLastMsg.value == true;
+    if (streaming == false) {
+      runBodyMarkdownParseNow(true);
+      return;
+    }
+    // 首帧立刻出字，避免空白等节流
+    if (markdownParser.resolveRenderList().length == 0) {
+      runBodyMarkdownParseNow(false);
+      return;
+    }
+    const body = resolveRenderableBodyText();
+    if (bodyHasStructuralMarkup(body) == true) {
+      scheduleMergedParse(resolveStructParseIntervalMs(body.length));
+      return;
+    }
+    scheduleMergedParse(STREAM_MD_TEXT_INTERVAL_MS);
+  }
+
   const renderMarkdownElList = computed((): UniAiMarkdownElItem[] => {
     const _rev = streamRevision.value;
     return markdownParser.resolveRenderList();
   });
 
-  /** think 使用独立 MsgItem，避免解析结果覆盖正文 markdownElList。 */
-  const thinkMsg = ref<MsgItem>(new MsgItem());
-  const thinkStreamRevision = ref<number>(0);
-  const thinkMarkdownParser = new AiMsgMarkdownParser(
-    thinkMsg,
-    thinkStreamRevision,
-    resolveRenderableThinkText,
-    (): boolean => isConversationActive.value,
-    (): boolean => isLastMsg.value,
-  );
-  const renderThinkMarkdownElList = computed((): UniAiMarkdownElItem[] => {
-    const _rev = thinkStreamRevision.value;
-    return thinkMarkdownParser.resolveRenderList();
+  // #ifdef H5 || MP-WEIXIN
+  /**
+   * H5/小程序：mp-html 渲染正文（对齐 dev 的 markdown-msg / uni-ai-x-msg 做法）。
+   * 复用 resolveRenderableBodyText 清洗链路（剥 agent-info、未闭合自定义标记尾部，
+   * 保留完整图片语法交由 mp-html 原位渲染），再 replaceMathBracket 把 \\( \\) \\[ \\]
+   * 公式定界符转成 $ / $$，供 mp-html 的 latex 插件解析。
+   */
+  /**
+   * 工具卡 name 属性值内的换行清洗（仅 H5/mp-html 渲染前）：
+   * name 常含 `$(cat <<'EOF'\n...` 等多行命令，换行/空行会让 markdown-it 把
+   * 属性值中间的 \n\n 当段落分隔、注入 <p> 破坏 HTML 标签闭合 → 该卡之后
+   * （总结文本/表格/task-result）全部被 mp-html 解析吞掉。换行统一压成空格。
+   */
+  function sanitizeMpHtmlProcessNameNewlines(html: string): string {
+    if (html.length == 0 || html.indexOf("<markdown-custom-process") < 0) {
+      return html;
+    }
+    const re = /<markdown-custom-process\s([^>]*?)\bname="([^"]*)"([^>]*)>/g;
+    return html.replace(
+      re,
+      (
+        match: string,
+        beforeName: string,
+        name: string,
+        afterName: string,
+      ): string => {
+        const cleaned = name.replace(/\n+/g, " ").replace(/\r/g, "").trim();
+        return `<markdown-custom-process ${beforeName}name="${cleaned}"${afterName}>`;
+      },
+    );
+  }
+
+  /** 会话详情页路径：应用智能体与普通智能体的历史会话入口不同。 */
+  const conversationDetailPagePath = (): string => {
+    return props.isAppDetails == true
+      ? "/subpackages/pages/app-details/app-details"
+      : "/subpackages/pages/agent-detail/agent-detail";
+  };
+
+  const mpHtmlContent = computed((): string => {
+    const _rev = streamRevision.value;
+    // mp-html 的 trustTags 不含 conversation，未转链接会被降级成空 span 而整段丢失
+    const withConversationLink = replaceConversationDetailTags(
+      resolveRenderableBodyText(),
+      conversationDetailPagePath(),
+      t("Mobile.Chat.viewTaskDetails"),
+    );
+    return replaceMathBracket(
+      sanitizeMpHtmlProcessNameNewlines(withConversationLink),
+    );
   });
 
+  /** 长文本换行，避免 mp-html 内 p/li/div/span 换行失效（对齐 dev tag-style）。 */
+  const mpHtmlTagStyle = {
+    p: "word-break: break-all; overflow-wrap: break-word;",
+    li: "word-break: break-all; overflow-wrap: break-word;",
+    div: "word-break: break-all; overflow-wrap: break-word;",
+    span: "word-break: break-all; overflow-wrap: break-word;",
+  };
+
+  /** 从 linktap 事件或 event.detail 读取字符串字段。 */
+  const readLinkTapField = (eventObj: UTSJSONObject, key: string): string => {
+    const detailRaw = eventObj["detail"];
+    if (detailRaw != null) {
+      const detailObj = detailRaw as UTSJSONObject;
+      const inDetail = detailObj[key];
+      if (inDetail != null) {
+        const text = `${inDetail}`.trim();
+        if (text.length > 0) {
+          return text;
+        }
+      }
+    }
+    const direct = eventObj[key];
+    if (direct != null) {
+      const text = `${direct}`.trim();
+      if (text.length > 0) {
+        return text;
+      }
+    }
+    return "";
+  };
+
+  /** mp-html 链接点击：外部链接统一跳转（对齐 dev markdown-msg handleLinkTap）。 */
+  const handleMpHtmlLinkTap = (event: any): void => {
+    if (event == null) {
+      return;
+    }
+    const eventObj = event as UTSJSONObject;
+    const href = readLinkTapField(eventObj, "href");
+    if (href.length == 0) {
+      return;
+    }
+    // 会话详情链接是站内路由，mp-html 内部已 navigateTo，勿再走 webview
+    if (
+      href.indexOf("/subpackages/pages/agent-detail/agent-detail") == 0 ||
+      href.indexOf("/subpackages/pages/app-details/app-details") == 0
+    ) {
+      return;
+    }
+    handleExternalLink(href, readLinkTapField(eventObj, "innerText"));
+  };
+  // #endif
+
+  /** 仅驱动思考区 rich-text，与正文 streamRevision 解耦，避免 THINK 流空刷答案树 */
+  const thinkStreamRevision = ref<number>(0);
+
+  const thinkContent = computed((): string => {
+    // Android：MsgItem 字段变更不一定被深层追踪；think 用独立 revision，勿绑 streamRevision
+    const _rev = thinkStreamRevision.value;
+    return resolveThinkText();
+  });
+
+  /**
+   * 思考区增量缓冲：frozen/live 仅内部维护；模板绑 thinkDisplayText（规避 UTS v-for ref 数组）。
+   * 流式默认折叠：折叠时只缓存 pending，不 paint；用户展开后再渲染。
+   */
+  const THINK_TEXT_THROTTLE_MS: number = 50;
+  const thinkDisplayText = ref<string>("");
+  let thinkFrozenParts: string[] = [] as string[];
+  let thinkLivePart: string = "";
+  let thinkPaintedRaw: string = "";
+  let thinkTextPending: string = "";
+  let thinkTextThrottleTimer: number | null = null;
+
+  const joinThinkPaint = (frozen: string[], live: string): string => {
+    let out = "";
+    for (let i = 0; i < frozen.length; i++) {
+      out += frozen[i];
+    }
+    return out + live;
+  };
+
+  const resetThinkPaintState = () => {
+    thinkFrozenParts = [] as string[];
+    thinkLivePart = "";
+    thinkPaintedRaw = "";
+    thinkDisplayText.value = "";
+  };
+
+  const paintThinkIncremental = (raw: string) => {
+    const painted = applyThinkIncremental(
+      thinkPaintedRaw,
+      thinkFrozenParts,
+      thinkLivePart,
+      raw,
+    );
+    thinkFrozenParts = painted.frozenParts;
+    thinkLivePart = painted.livePart;
+    thinkPaintedRaw = raw;
+    thinkDisplayText.value = joinThinkPaint(
+      thinkFrozenParts,
+      thinkLivePart,
+    );
+  };
+
+  const flushThinkTextDisplay = (immediate: boolean) => {
+    if (thinkTextThrottleTimer != null) {
+      clearTimeout(thinkTextThrottleTimer!);
+      thinkTextThrottleTimer = null;
+    }
+    if (immediate == true) {
+      paintThinkIncremental(thinkTextPending);
+      return;
+    }
+    thinkTextThrottleTimer = setTimeout(() => {
+      thinkTextThrottleTimer = null;
+      // 定时器触发时若已重新折叠，丢弃本次 paint
+      if (hideThinkContent.value == true) {
+        return;
+      }
+      paintThinkIncremental(thinkTextPending);
+    }, THINK_TEXT_THROTTLE_MS) as number;
+  };
+
+  const scheduleThinkTextPaint = (raw: string) => {
+    thinkTextPending = raw;
+    // 折叠：不渲染思考正文（省掉增量拼接与 text layout）
+    if (hideThinkContent.value == true) {
+      if (thinkTextThrottleTimer != null) {
+        clearTimeout(thinkTextThrottleTimer!);
+        thinkTextThrottleTimer = null;
+      }
+      return;
+    }
+    if (
+      isConversationActive.value != true ||
+      isLastMsg.value != true
+    ) {
+      flushThinkTextDisplay(true);
+      return;
+    }
+    if (thinkTextThrottleTimer != null) {
+      return;
+    }
+    flushThinkTextDisplay(false);
+  };
+
+  watch(
+    (): string => thinkContent.value,
+    (v: string) => {
+      scheduleThinkTextPaint(v);
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): boolean => isConversationActive.value,
+    (active: boolean) => {
+      // 会话结束且已展开时定稿；折叠仍不 paint，展开时再刷
+      if (active != true && hideThinkContent.value != true) {
+        thinkTextPending = resolveThinkText();
+        flushThinkTextDisplay(true);
+      }
+    },
+  );
+
   const changeThinkContent = () => {
-    hideThinkContent.value = !hideThinkContent.value;
+    const nextHide = !hideThinkContent.value;
+    hideThinkContent.value = nextHide;
+    if (nextHide != true) {
+      // 用户展开：立刻用当前缓存/消息全文渲染
+      thinkTextPending = resolveThinkText();
+      if (thinkTextPending.length == 0) {
+        thinkTextPending = thinkContent.value;
+      }
+      flushThinkTextDisplay(true);
+    } else {
+      // 收起：卸载展示态，释放 layout；原文仍在 msg / pending
+      if (thinkTextThrottleTimer != null) {
+        clearTimeout(thinkTextThrottleTimer!);
+        thinkTextThrottleTimer = null;
+      }
+      resetThinkPaintState();
+    }
     emit("changeThinkContent", hideThinkContent.value);
   };
 
   const updateMessage = (newData: any) => {
     try {
       if (newData != null) {
+        const bodyBefore = resolveBodyText();
+        const thinkBefore = resolveThinkText();
+        const procBefore = toolCallProcessingListFingerprint(
+          msg.value.processingList != null
+            ? (msg.value.processingList as any[])
+            : ([] as any[]),
+        );
         applyMsgPatch(msg.value, newData);
-        markdownParser.runMarkdownParse(false);
+        const bodyAfter = resolveBodyText();
+        const thinkAfter = resolveThinkText();
+        const procAfter = toolCallProcessingListFingerprint(
+          msg.value.processingList != null
+            ? (msg.value.processingList as any[])
+            : ([] as any[]),
+        );
+        const bodyChanged = bodyBefore != bodyAfter;
+        const thinkChanged = thinkBefore != thinkAfter;
+        const procChanged = procBefore != procAfter;
+        // #ifdef APP
+        try {
+          if (bodyChanged == true || thinkChanged == true || procChanged == true) {
+            perfRecordSseUi(
+              bodyAfter.length,
+              `rev=${streamRevision.value} thinkRev=${thinkStreamRevision.value} think=${thinkAfter.length}`,
+            );
+          }
+        } catch (_eStall) {
+          // ignore
+        }
+        // #endif
+        // THINK：勿 bump streamRevision（否则连带正文 UniAiXMsgRender 整树失效）。
+        // 流式默认折叠：折叠时只写入 msg，不抬 revision（避免驱动 thinkContent watch → paint）；
+        // 仅「空→有」抬一次以便显示思考标题栏；展开后才持续抬 revision 驱动渲染。
+        if (thinkChanged == true) {
+          if (hideThinkContent.value == true) {
+            thinkTextPending = thinkAfter;
+            if (thinkBefore.length == 0 && thinkAfter.length > 0) {
+              thinkStreamRevision.value = thinkStreamRevision.value + 1;
+            }
+          } else {
+            thinkStreamRevision.value = thinkStreamRevision.value + 1;
+          }
+        }
+        if (bodyChanged == true || procChanged == true) {
+          streamRevision.value = streamRevision.value + 1;
+          if (bodyChanged == true) {
+            scheduleBodyMarkdownParse();
+          }
+        }
       }
     } catch (error) {
       console.error("updateMessage 执行失败:", error);
@@ -389,42 +1062,128 @@
   };
 
   watch(
-    (): any => props.msg,
-    (newVal: any) => {
+    (): any | null => (props.msg != null ? props.msg : null),
+    (newVal: any | null) => {
       syncMsgFromProps(newVal);
     },
     { deep: true, immediate: true },
   );
 
   watch(
+    (): string => props.messageId != null ? props.messageId : "",
+    (messageId: string) => {
+      if (messageId.length == 0) return;
+      if (msg.value._id != messageId) {
+        const next = new MsgItem();
+        next._id = messageId;
+        next.from_uid = "assistant";
+        msg.value = next;
+      }
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): any | null =>
+      props.messageStatus != null ? props.messageStatus : null,
+    (status: any | null) => {
+      if (status != null) {
+        msg.value.state = ChatDataAdapter.mapStatusToMsgState(status);
+      }
+    },
+    { immediate: true },
+  );
+
+  let lastProcessingListFp: string = "";
+  watch(
+    (): any[] => props.processingList != null
+      ? props.processingList
+      : [] as any[],
+    (list: any[]) => {
+      const fp = toolCallProcessingListFingerprint(list);
+      msg.value.processingList = list;
+      if (fp == lastProcessingListFp) {
+        return;
+      }
+      lastProcessingListFp = fp;
+      streamRevision.value = streamRevision.value + 1;
+      // 历史消息：工具卡靠 processingList + revision 刷新即可，勿强制全量 markdown
+      if (isLastMsg.value != true) {
+        return;
+      }
+      scheduleBodyMarkdownParse();
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): string => props.conversationId != null ? props.conversationId : "",
+    (conversationId: string) => {
+      if (conversationId.length > 0) {
+        msg.value.chat_id = conversationId.startsWith("chat-")
+          ? conversationId
+          : "chat-" + conversationId;
+      }
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): string => props.messageTime != null ? props.messageTime : "",
+    (messageTime: string) => {
+      if (messageTime.length > 0) {
+        msg.value.create_time = new Date(messageTime).getTime();
+      }
+    },
+    { immediate: true },
+  );
+
+  watch(
+    (): any[] => props.initialMarkdownElList != null
+      ? props.initialMarkdownElList
+      : [] as any[],
+    (list: any[]) => {
+      if (list.length == 0) return;
+      const converted = JSON.parseArray<UniAiMarkdownElItem>(
+        JSON.stringify(list),
+      );
+      if (converted != null && converted.length > 0) {
+        msg.value.markdownElList = converted;
+        msg.value.rendered = true;
+      }
+    },
+    { immediate: true },
+  );
+
+  watch(
     (): string => (props.bodyText != null ? `${props.bodyText}` : ""),
     (v: string) => {
       msg.value.body = v;
-    },
-    { immediate: true },
-  );
-
-  watch(
-    (): string => resolveThinkText(),
-    (v: string) => {
-      msg.value.thinkContent = v;
-      const thinkId = msg.value._id + "-think";
-      if (thinkMsg.value._id != thinkId) {
-        thinkMsg.value = new MsgItem();
-        thinkMsg.value._id = thinkId;
-        thinkMarkdownParser.resetForNewMessage();
+      // 流式最后一条：由 scheduleBodyMarkdownParse（200ms）驱动渲染，
+      // 避免每字 bump streamRevision 导致 App 端整树重绘卡顿。
+      if (isConversationActive.value == true && isLastMsg.value == true) {
+        return;
       }
-      thinkMsg.value.body = v;
-      thinkMsg.value.markdownElList = [] as UniAiMarkdownElItem[];
-      thinkMarkdownParser.runMarkdownParse(true);
+      streamRevision.value = streamRevision.value + 1;
     },
     { immediate: true },
   );
 
   watch(
-    (): number => markdownParseTick.value,
+    (): string =>
+      resolveThinkText() +
+      "|" +
+      `${isConversationActive.value}` +
+      "|" +
+      `${hideThinkContent.value}`,
     () => {
-      markdownParser.runMarkdownParse(true);
+      const v = resolveThinkText();
+      // 已由 updateMessage patch 过则勿再 bump，避免 THINK 每帧 double 刷新
+      if (msg.value.thinkContent == v) {
+        return;
+      }
+      msg.value.thinkContent = v;
+      thinkStreamRevision.value = thinkStreamRevision.value + 1;
     },
     { immediate: true },
   );
@@ -433,42 +1192,64 @@
     (): string => msg.value._id,
     () => {
       markdownParser.resetForNewMessage();
-      markdownParser.runMarkdownParse(true);
-      thinkMsg.value = new MsgItem();
-      thinkMsg.value._id = msg.value._id + "-think";
-      thinkMsg.value.body = resolveThinkText();
-      thinkMarkdownParser.resetForNewMessage();
-      thinkMarkdownParser.runMarkdownParse(true);
+      thinkFrozenParts = [] as string[];
+      thinkLivePart = "";
+      thinkPaintedRaw = "";
+      thinkTextPending = "";
+      thinkDisplayText.value = "";
+      // 新消息默认折叠思考区
+      hideThinkContent.value = true;
     },
   );
 
+  /** 合并正文解析触发条件，避免多个 watch 对同一正文重复解析。 */
   watch(
-    (): string => resolveBodyText(),
+    (): string =>
+      resolveBodyText() + "|" + `${msg.value.state}` + "|" + `${isLastMsg.value}`,
     () => {
-      markdownParser.runMarkdownParse(false);
+      if (isLastMsg.value == true && isConversationActive.value == true) {
+        scheduleBodyMarkdownParse();
+        return;
+      }
+      // #ifdef H5 || WEB
+      // 历史 / 非流式末条：deferParse 历史消息先懒解析（滚近视口再解析），
+      // 大历史会话避免首屏全量 markdown 解析阻塞主线程。
+      if (props.deferParse == true && lazyMarkdownDone == false) {
+        setupLazyMarkdownParse();
+        return;
+      }
+      // #endif
+      // 历史 / 非流式末条：定稿解析（runMarkdownParse 内部会跳过正文未变）
+      runBodyMarkdownParseNow(true);
     },
+    { immediate: true },
   );
 
+  /** 仅末条关心会话 active：开始→节流解析；结束→立刻定稿。历史消息忽略 active 抖动。 */
   watch(
     (): boolean => isConversationActive.value,
-    () => {
-      markdownParser.runMarkdownParse(false);
+    (active: boolean) => {
+      if (isLastMsg.value != true) {
+        return;
+      }
+      if (active == true) {
+        scheduleBodyMarkdownParse();
+      } else {
+        runBodyMarkdownParseNow(true);
+      }
     },
   );
 
-  watch(
-    (): boolean => isLastMsg.value,
-    () => {
-      markdownParser.runMarkdownParse(false);
-    },
-  );
-
-  watch(
-    (): number => msg.value.state,
-    () => {
-      markdownParser.runMarkdownParse(false);
-    },
-  );
+  onUnmounted(() => {
+    clearStreamMdParseTimer();
+    // #ifdef H5 || WEB
+    teardownLazyMarkdownParse();
+    // #endif
+    if (thinkTextThrottleTimer != null) {
+      clearTimeout(thinkTextThrottleTimer!);
+      thinkTextThrottleTimer = null;
+    }
+  });
 
   defineExpose({
     updateMessage,
@@ -550,35 +1331,34 @@
           padding-top: 8rpx;
           padding-bottom: 8rpx;
 
+          /* 思考正文：原生 text 可吃 class 字号颜色；保留换行 */
           .think-plain-text {
+            width: 100%;
             font-size: 28rpx;
-            color: #888;
-            line-height: 1.6;
+            color: #888888;
+            line-height: 1.4;
             white-space: pre-wrap;
-          }
-
-          .text {
-            font-size: 28rpx;
-            color: #888;
-            line-height: 1.6;
-            white-space: pre-wrap;
-            /* #ifndef APP */
-            word-break: break-all;
-            /* #endif */
           }
         }
       }
     }
 
     .answer-container {
+      /* 仅布局。App 禁止在 view 写 color/font-size/line-height。
+       * AI 答复正文样式在 UniAiXMsg 的 text 上（非用户气泡 .user-msg-text）：
+       * - uni-ai-text-md `.text` / `.uni-ai-text-md-paragraph-box-text`
+       * - uni-ai-x-msg `.msg-root-paragraph-text`
+       * 取值：color #404040、font-size 32rpx、line-height 48rpx(=1.5)
+       */
       width: 100%;
     }
 
     .answer-fallback {
+      /* 若使用：须挂在 <text class="answer-fallback">，勿挂 view */
       width: 100%;
-      font-size: 28rpx;
-      color: #15171f;
-      line-height: 1.6;
+      font-size: 32rpx;
+      color: #404040;
+      line-height: 48rpx;
       white-space: pre-wrap;
     }
 
@@ -619,7 +1399,9 @@
     /* #ifndef APP */
     word-break: break-all;
     overflow-wrap: anywhere;
+    /* #ifndef APP-HARMONY */
     max-width: 100%;
+    /* #endif */
     /* #endif */
   }
   .strong {
@@ -667,7 +1449,9 @@
       /* #ifndef APP */
       word-break: break-all;
       overflow-wrap: anywhere;
+      /* #ifndef APP-HARMONY */
       max-width: 100%;
+      /* #endif */
       /* #endif */
       /* #ifdef H5 */
       width: auto;
@@ -768,7 +1552,9 @@
   }
   .list-inline-image-box {
     /* #ifndef APP */
+    /* #ifndef APP-HARMONY */
     max-width: 100%;
+    /* #endif */
     display: block;
     /* #endif */
     .list-content {
@@ -842,14 +1628,41 @@
     /* #endif */
   }
 
+  .icon-loading-wrap {
+    width: 48rpx;
+    height: 48rpx;
+    margin-right: 10rpx;
+    margin-bottom: 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
   .icon-loading-image {
     width: 48rpx;
     height: 48rpx;
     margin-right: 10rpx;
+    margin-bottom: 20rpx;
     /* #ifndef APP */
     -webkit-touch-callout: none !important;
     -webkit-user-select: none !important;
     user-select: none !important;
     /* #endif */
   }
+
+  /* #ifndef APP */
+  .icon-loading-spin {
+    animation: ai-msg-loading-spin 1s linear infinite;
+  }
+
+  @keyframes ai-msg-loading-spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  /* #endif */
 </style>

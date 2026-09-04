@@ -1,0 +1,246 @@
+/**
+ * Nuwax Stream PCM Player（App-Harmony）
+ *
+ * 包装同目录 StreamPcmPlayerBridge.ets（HarmonyOS AudioRenderer 流式 PCM16 播放）：
+ * UTS 接口与 app-android / app-ios 完全一致，ttsWebSocketPlayer 以平台条件编译引用同一模块。
+ *
+ * 另含 StreamPcmRecorder（HarmonyOS AudioCapturer 原生录音，见 StreamPcmRecorderBridge.ets）：
+ * uni.getRecorderManager 在鸿蒙不可靠，录音走 AudioCapturer 采 16kHz mono PCM16 写临时文件，
+ * 接口对齐 RecorderManager（onStart/onStop/onError/start/stop），供 agent-detail web-view
+ * 原生语音桥复用与 Android/iOS 相同的「录音 → 流式 ASR 推文件」链路。
+ */
+// 鸿蒙混编：同目录 StreamPcmPlayerBridge.ets 的 export class 对 UTS 直接可见（import 指向 .ets 文件）
+
+import { StreamPcmPlayerBridge } from './StreamPcmPlayerBridge.ets'
+import { StreamPcmRecorderBridge } from './StreamPcmRecorderBridge.ets'
+import { abilityAccessCtrl, Permissions } from '@kit.AbilityKit'
+import { BusinessError } from '@kit.BasicServicesKit'
+
+export class StreamPcmPlayer {
+  private bridge: StreamPcmPlayerBridge = new StreamPcmPlayerBridge()
+
+  /** 创建 AudioRenderer（16kHz mono PCM16）；音频由系统 writeData 拉取驱动，无独立写循环 */
+  initPlayer(sampleRate: number): void {
+    this.bridge.initPlayer(sampleRate)
+  }
+
+  /**
+   * 推入一帧 PCM16 LE 字节。鸿蒙 UTS 直编 ArkTS，无跨桥，Uint8Array 直接透传安全
+   * （不似 iOS 桥接须走 base64 字符串）。
+   */
+  push(chunk: Uint8Array): void {
+    if (chunk == null || chunk.length == 0) {
+      return
+    }
+    this.bridge.push(chunk)
+  }
+
+  /** 推入一帧 base64 编码的 PCM16 LE 字节（接口一致性；鸿蒙主路径走 push） */
+  pushBase64(b64: string): void {
+    if (b64 == null || b64.length == 0) {
+      return
+    }
+    const ab = uni.base64ToArrayBuffer(b64)
+    if (ab == null || ab.byteLength == 0) {
+      return
+    }
+    this.bridge.push(new Uint8Array(ab))
+  }
+
+  /** 冲刷积压：写循环持续消费，无需额外冲刷 */
+  flushPending(): void {
+    this.bridge.flushPending()
+  }
+
+  /** 攒够起始缓冲后开始播放（幂等） */
+  ensurePlaying(): void {
+    this.bridge.ensurePlaying()
+  }
+
+  /** 立即开始播放（幂等；输入结束时强制用，短音频不足起始缓冲也开播） */
+  playNow(): void {
+    this.bridge.playNow()
+  }
+
+  /** 静音开关 */
+  setMuted(muted: boolean): void {
+    this.bridge.setMuted(muted)
+  }
+
+  getWrittenMs(): number {
+    return this.bridge.getWrittenMs()
+  }
+
+  getEnqueuedMs(): number {
+    return this.bridge.getEnqueuedMs()
+  }
+
+  getPlayedMs(): number {
+    return this.bridge.getPlayedMs()
+  }
+
+  isDrained(): boolean {
+    return this.bridge.isDrained()
+  }
+
+  hasPendingAudio(): boolean {
+    return this.bridge.hasPendingAudio()
+  }
+
+  releasePlayer(): void {
+    this.bridge.releasePlayer()
+  }
+}
+
+// ==================== 原生录音（AudioCapturer → PCM 文件） ====================
+
+/** 录音开始回调（res 无内容，仅通知「已开录」，对齐 RecorderManager.onStart 语义） */
+export type NativeRecorderStartCallback = (res: UTSJSONObject | null) => void
+/** 录音结束回调（res 携带 tempFilePath/duration/fileSize/format，对齐 RecorderManager.onStop） */
+export type NativeRecorderStopCallback = (res: UTSJSONObject | null) => void
+/** 录音失败回调（err 携带 errMsg） */
+export type NativeRecorderErrorCallback = (err: UTSJSONObject | null) => void
+/** 实时 PCM 帧回调（chunk 为 16kHz mono PCM16 LE 裸字节；主线程回调；一次性全新 ArrayBuffer） */
+export type NativeRecorderFrameCallback = (chunk: ArrayBuffer) => void
+
+/**
+ * Nuwax Stream PCM Recorder（App-Harmony）
+ *
+ * 包装 StreamPcmRecorderBridge.ets（AudioCapturer 原生录音）。接口对齐 uni RecorderManager
+ * （onStart/onStop/onError/start/stop），使 agent-detail 的录音流程在鸿蒙端零改动复用：
+ * 录 16kHz mono PCM16 到 USER_DATA_PATH 临时文件，stop 回传 tempFilePath，
+ * 上层继续走「读文件 → 流式 ASR 推流」链路（与 Android/iOS format:'pcm' 行为一致）。
+ */
+export class StreamPcmRecorder {
+  private bridge: StreamPcmRecorderBridge = new StreamPcmRecorderBridge()
+  private onStartCb: NativeRecorderStartCallback | null = null
+  private onStopCb: NativeRecorderStopCallback | null = null
+  private onErrorCb: NativeRecorderErrorCallback | null = null
+  /** 当前是否在录（onStart 后 / onStop 前） */
+  private recording: boolean = false
+
+  constructor() {
+    this.bridge.setOnStart((): void => {
+      this.recording = true
+      const cb = this.onStartCb
+      if (cb != null) {
+        cb(null)
+      }
+    })
+    this.bridge.setOnStop((filePath: string, byteLength: number): void => {
+      this.recording = false
+      const cb = this.onStopCb
+      if (cb != null) {
+        const res = new UTSJSONObject()
+        res["tempFilePath"] = filePath
+        // 16kHz mono PCM16 = 32000 B/s → 时长(ms) = 字节数 / 32
+        res["duration"] = Math.floor(byteLength / 32)
+        res["fileSize"] = byteLength
+        res["format"] = "pcm"
+        cb(res)
+      }
+    })
+    this.bridge.setOnError((message: string): void => {
+      this.recording = false
+      const cb = this.onErrorCb
+      if (cb != null) {
+        const err = new UTSJSONObject()
+        err["errMsg"] = message
+        err["errSubject"] = "StreamPcmRecorder"
+        cb(err)
+      }
+    })
+  }
+
+  onStart(callback: NativeRecorderStartCallback | null): void {
+    this.onStartCb = callback
+  }
+
+  onStop(callback: NativeRecorderStopCallback | null): void {
+    this.onStopCb = callback
+  }
+
+  onError(callback: NativeRecorderErrorCallback | null): void {
+    this.onErrorCb = callback
+  }
+
+  /**
+   * 注册实时 PCM 帧回调（边说边传 ASR 用）：写文件与帧转发并行，文件仍为兜底。
+   * chunk 为 16kHz mono PCM16 LE 裸字节（长度任意偶数），主线程回调，一次性 ArrayBuffer。
+   */
+  onFrame(callback: NativeRecorderFrameCallback | null): void {
+    this.bridge.setOnFrame(callback)
+  }
+
+  isRecording(): boolean {
+    return this.recording
+  }
+
+  /**
+   * 开始录音。options 仅取 duration（毫秒，到时自动停止）；采样率/声道/格式固定
+   * 16kHz mono PCM16（ASR 协议硬编码），与 Android/iOS 的 pcm 参数对齐。
+   * 录音文件固定写 USER_DATA_PATH/nuwax_voice_record.pcm，每次 start 前清空（TRUNC），
+   * 不产生累积临时文件。
+   */
+  start(options: RecorderManagerStartOptions | null): void {
+    if (options == null) {
+      return
+    }
+    let durationMs = 600000
+    try {
+      const durRaw = options!.duration
+      if (durRaw != null) {
+        const durNum = parseFloat(`${durRaw}`)
+        if (!isNaN(durNum) && durNum > 0) {
+          durationMs = Math.min(durNum, 600000)
+        }
+      }
+    } catch (_eDur) {
+      // ignore
+    }
+    // uni.env.USER_DATA_PATH 在鸿蒙解析为 unifile://usr/（uni-app x 虚拟路径），原生 fs.openSync
+    // 不认该 scheme 会抛 13900020 Invalid argument。用真实沙箱 filesDir（与运行时 getEnv 映射
+    // USER_DATA_PATH 的 applicationContext.filesDir 一致）；下游 uni.getFileSystemManager.readFile
+    // 的 getRealPath 对真实路径同样支持。
+    const filesDir = UTSHarmony.getUIAbilityContext().getApplicationContext().filesDir
+    const filePath = `${filesDir}/nuwax_voice_record.pcm`
+    this.bridge.start(filePath, durationMs)
+  }
+
+  /** 停止录音（松手）：桥回传文件路径 → onStop（未真正开录时静默，不发 onStop） */
+  stop(): void {
+    this.bridge.stop()
+  }
+
+  /** 释放（页面销毁 / 弃用）：不回传 onStop */
+  releaseRecorder(): void {
+    this.bridge.release()
+  }
+}
+
+/**
+ * 打开鸿蒙应用权限设置页（录音权限被永久拒绝时引导用）。
+ * requestPermissionOnSetting 会跳转应用权限管理页；权限已授权时返回错误 12100011，
+ * 属预期，仅告警不抛出。
+ */
+export function openHarmonyMicPermissionSettings(): boolean {
+  try {
+    const context = UTSHarmony.getUIAbilityContext()
+    const list: Permissions[] = ["ohos.permission.MICROPHONE"]
+    abilityAccessCtrl
+      .createAtManager()
+      .requestPermissionOnSetting(context, list)
+      .then(
+        (): void => {
+          // ignore
+        },
+        (e: BusinessError) => {
+          console.warn("[StreamPcmRecorder] openPermissionSettings failed", e)
+        },
+      )
+    return true
+  } catch (e) {
+    console.warn("[StreamPcmRecorder] openPermissionSettings error", e)
+    return false
+  }
+}

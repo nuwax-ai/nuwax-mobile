@@ -9,6 +9,36 @@ export default class ScrollManager {
   private data: AgentDetailData;
   // 记录上次滚动位置，用于判断滚动方向
   private lastScrollTop: number = 0;
+  /** 历史首屏布局稳定截止时间（ms），期内允许因异步组件撑高而补滚 */
+  private historySettleUntil: number = 0;
+  /** 历史首屏分批滚底定时器 */
+  private historySettleTimers: number[] = [];
+  /** 稳定期内观测到的最大 scrollHeight，用于检测内容撑高 */
+  private lastSettleScrollHeight: number = 0;
+  /** 内容撑高后的补滚防抖标记 */
+  private settleScrollScheduled: boolean = false;
+  /**
+   * 自动滚底节流定时器。
+   * leading + trailing：首击立刻滚，窗口内再请求则窗口结束补滚，跟上内容增高。
+   */
+  private scrollThrottleTimer: number = 0;
+  /** 节流窗口内是否还有未消费的滚底请求 */
+  private scrollThrottlePending: boolean = false;
+  /**
+   * 流式跟底节流（ms）。流式跟底带动画平滑跟随：窗口需接近动画时长的一半，
+   * 让每次动画有空间完成——过小（32）动画频繁打断呈抖动，过大（如 100）跟底滞后「慢一步」。
+   */
+  private readonly SCROLL_THROTTLE_MS: number = 32;
+  /** 流式内容晚撑高（工具卡片 / Markdown）后的短补滚定时器 */
+  private streamFollowTimers: number[] = [];
+  /** setIsInScrollBottom 节流 */
+  private bottomCheckTimer: number = 0;
+  private pendingBottomEvent: UniScrollEvent | null = null;
+  private readonly BOTTOM_CHECK_MS: number = 80;
+  /** 缓存列表视口高度，减少每帧 getElementById */
+  private cachedOffsetHeight: number = 0;
+  private cachedOffsetHeightAtMs: number = 0;
+  private readonly OFFSET_HEIGHT_CACHE_MS: number = 500;
 
   constructor(data: AgentDetailData) {
     this.data = data;
@@ -17,8 +47,37 @@ export default class ScrollManager {
   /**
    * 滚动到最后一条消息
    * 使用 scroll-into-view 方式，兼容所有平台
+   * @param userClick 是否用户点击触发；true 时启用滚动动画并立刻执行，
+   *   并重新开启短时跟底稳定期（上滑打断后点回底，晚撑高 / 流式输出才能继续跟）
    */
   scrollToLastMsg(userClick: boolean): void {
+    // 用户点击：立刻滚底；重新 arm 跟底窗口，避免只滚一次后内容继续长却不再跟
+    if (userClick == true) {
+      this.doScrollToLastMsg(true);
+      // 上滑会 clearHistorySettle；点回底后历史 table / 流式输出仍可能继续撑高
+      this.armFollowSettle(8000, [
+        100, 300, 700, 1200, 2000, 3500, 5000, 7000,
+      ]);
+      return;
+    }
+    // 自动滚底：leading 立刻执行；窗口内后续请求记 pending，到点 trailing 再滚
+    if (this.scrollThrottleTimer != 0) {
+      this.scrollThrottlePending = true;
+      return;
+    }
+    this.doScrollToLastMsg(false);
+    this.scrollThrottlePending = false;
+    this.scrollThrottleTimer = setTimeout((): void => {
+      this.scrollThrottleTimer = 0;
+      if (this.scrollThrottlePending == true) {
+        this.scrollThrottlePending = false;
+        this.doScrollToLastMsg(false);
+      }
+    }, this.SCROLL_THROTTLE_MS) as number;
+  }
+
+  /** 实际执行 scroll-into-view 滚底（官方推荐） */
+  private doScrollToLastMsg(userClick: boolean): void {
     this.data.autoToLastMsg.value = true;
     this.data.scrollIntoView.value = "";
     this.data.scrollWithAnimation.value = userClick;
@@ -26,49 +85,309 @@ export default class ScrollManager {
       this.data.scrollIntoView.value = "last-msg";
       this.data.scrollInBottom.value = true;
     });
+    // 自动跟底：布局晚到（工具调用卡片等）时短时补滚，避免「先停一会再跳」
+    if (userClick != true) {
+      this.scheduleStreamFollowRetries();
+    }
+  }
+
+  private clearScrollThrottle(): void {
+    if (this.scrollThrottleTimer != 0) {
+      clearTimeout(this.scrollThrottleTimer);
+      this.scrollThrottleTimer = 0;
+    }
+    this.scrollThrottlePending = false;
+  }
+
+  private clearStreamFollowRetries(): void {
+    for (let i = 0; i < this.streamFollowTimers.length; i++) {
+      clearTimeout(this.streamFollowTimers[i]);
+    }
+    this.streamFollowTimers = [];
   }
 
   /**
-   * 设置是否在滚动底部
-   * 使用 scroll 事件参数，兼容微信小程序
+   * 流式自动跟底后短补滚：等工具卡片 / Markdown 撑高再滚一次。
+   * 用户上滑（autoToLastMsg=false / scrollTouch）时立刻停。
+   */
+  private scheduleStreamFollowRetries(): void {
+    this.clearStreamFollowRetries();
+    // 流式期 doScroll 每 ~64ms 触发一次；公式图 / 工具卡异步回填常在渲染后 100~300ms 撑高，
+    // 单次 120ms 兜底可能错过（锚点已按旧高度定位，底部留白 = 慢一步）。
+    // 加密为 3 批（60/180/420）持续吃到异步撑高；每次补滚前都校验 autoToLastMsg/scrollTouch，
+    // 用户上滑立即停，故窗口内多个 pending 定时器不会叠加成滚动风暴。
+    const delays = [120, 140, 160];
+    for (let i = 0; i < delays.length; i++) {
+      const delay = delays[i];
+      const timerId = setTimeout((): void => {
+        if (this.data.autoToLastMsg.value != true) {
+          this.clearStreamFollowRetries();
+          return;
+        }
+        if (this.data.scrollTouch.value == true) {
+          return;
+        }
+        // 绕过节流，直接 into-view，吃到晚到的高度（补滚沿用流式动画设置，平滑补位）
+        this.data.scrollIntoView.value = "";
+        nextTick(() => {
+          if (this.data.autoToLastMsg.value != true) {
+            return;
+          }
+          if (this.data.scrollTouch.value == true) {
+            return;
+          }
+          this.data.scrollIntoView.value = "last-msg";
+          this.data.scrollInBottom.value = true;
+        });
+      }, delay) as number;
+      this.streamFollowTimers.push(timerId);
+    }
+  }
+
+  /**
+   * 开启跟底稳定窗口：分批补滚 + scrollHeight 增长补滚（绕过流式节流）。
+   * 历史首屏 / 用户点「回底」后内容仍可能继续撑高时使用。
+   */
+  private armFollowSettle(durationMs: number, delays: number[]): void {
+    this.clearHistorySettle();
+    this.clearScrollThrottle();
+    this.cachedOffsetHeight = 0;
+    this.cachedOffsetHeightAtMs = 0;
+    this.data.autoToLastMsg.value = true;
+    this.historySettleUntil = Date.now() + durationMs;
+    this.lastSettleScrollHeight = 0;
+
+    for (let i = 0; i < delays.length; i++) {
+      const delay = delays[i];
+      const timerId = setTimeout((): void => {
+        this.tryScrollDuringHistorySettle();
+      }, delay) as number;
+      this.historySettleTimers.push(timerId);
+    }
+  }
+
+  /**
+   * 历史消息加载后延迟滚到底部（无动画）。
+   * 首屏含数学公式 / table / 卡片等异步撑高时，单次滚底往往已过期，
+   * 故在稳定窗口内分批重试，并在 scrollHeight 增长时补滚。
+   */
+  scrollToLastMsgAfterHistoryLoad(): void {
+    // 历史公式批量上屏前少打几次滚底，降低占位→公式切换时的连滚抖动
+    this.armFollowSettle(7000, [0, 200, 800, 1600, 2800, 4500, 6500]);
+  }
+
+  /** 公式批量上屏补滚防抖，避免多条消息各自 emit 导致连续滚底抖动 */
+  private contentReadyNudgeTimer: number = 0;
+
+  /**
+   * 消息富文本/公式一次性上屏后补滚。
+   * 多条历史消息公式齐活时间不同，须防抖合并，否则会连滚多次造成页面抖。
+   */
+  nudgeAfterContentReady(): void {
+    if (this.data.scrollTouch.value == true) {
+      return;
+    }
+    if (this.data.autoToLastMsg.value != true) {
+      return;
+    }
+    if (this.contentReadyNudgeTimer != 0) {
+      clearTimeout(this.contentReadyNudgeTimer);
+    }
+    this.contentReadyNudgeTimer = setTimeout((): void => {
+      this.contentReadyNudgeTimer = 0;
+      if (this.data.scrollTouch.value == true) {
+        return;
+      }
+      if (this.isHistorySettling() == true) {
+        this.tryScrollDuringHistorySettle();
+        return;
+      }
+      // 稳定期已过：短开窗口盖住公式撑高
+      this.armFollowSettle(1800, [0, 120, 400, 900, 1500]);
+    }, 280) as number;
+  }
+
+  /**
+   * 发送消息后滚底（含语音转写发送）。
+   * 须在用户/助手气泡已写入 messageList 之后调用：
+   * 发送前那次 scroll-into-view 打在旧锚点上；流式期 list watch 又会跳过滚底，
+   * iOS 上语音发送后常见停在旧位置。短窗口分批补滚覆盖布局晚到。
+   */
+  scrollToLastMsgAfterSend(): void {
+    this.armFollowSettle(2500, [0, 80, 200, 450, 900, 1600]);
+  }
+
+  /** 页面卸载时清理历史滚底 / 节流滚底定时器 */
+  dispose(): void {
+    this.clearHistorySettle();
+    this.clearScrollThrottle();
+    this.clearStreamFollowRetries();
+    if (this.contentReadyNudgeTimer != 0) {
+      clearTimeout(this.contentReadyNudgeTimer);
+      this.contentReadyNudgeTimer = 0;
+    }
+    if (this.bottomCheckTimer != 0) {
+      clearTimeout(this.bottomCheckTimer);
+      this.bottomCheckTimer = 0;
+    }
+    this.pendingBottomEvent = null;
+  }
+
+  private resolveOffsetHeight(): number {
+    const now = Date.now();
+    if (
+      this.cachedOffsetHeight > 0 &&
+      now - this.cachedOffsetHeightAtMs < this.OFFSET_HEIGHT_CACHE_MS
+    ) {
+      return this.cachedOffsetHeight;
+    }
+    let h = 600;
+    // #ifdef MP-WEIXIN
+    h = 600;
+    // #endif
+    // #ifndef MP-WEIXIN
+    const scrollList = uni.getElementById("msg-list");
+    h = scrollList?.offsetHeight ?? 600;
+    // #endif
+    this.cachedOffsetHeight = h;
+    this.cachedOffsetHeightAtMs = now;
+    return h;
+  }
+
+  private isHistorySettling(): boolean {
+    return Date.now() <= this.historySettleUntil;
+  }
+
+  private clearHistorySettle(): void {
+    for (let i = 0; i < this.historySettleTimers.length; i++) {
+      clearTimeout(this.historySettleTimers[i]);
+    }
+    this.historySettleTimers = [];
+    this.historySettleUntil = 0;
+    this.settleScrollScheduled = false;
+    this.lastSettleScrollHeight = 0;
+  }
+
+  /**
+   * 稳定期内尝试滚底；用户手指上滑打断时立即结束稳定期。
+   * 直接 doScroll，绕过流式节流，保证 table 等晚撑高后仍能补滚到底。
+   */
+  private tryScrollDuringHistorySettle(): void {
+    if (this.isHistorySettling() == false) {
+      return;
+    }
+    if (this.data.autoToLastMsg.value != true) {
+      this.clearHistorySettle();
+      return;
+    }
+    if (this.data.scrollTouch.value == true) {
+      this.clearHistorySettle();
+      return;
+    }
+    // 历史首屏：绕过 throttle，每次补滚都真正执行 scroll-into-view
+    this.clearScrollThrottle();
+    this.doScrollToLastMsg(false);
+  }
+
+  /**
+   * 稳定期内内容高度增长时补一次滚底（katex 图、table、组件晚渲染）。
+   */
+  private maybeRescrollOnContentGrow(scrollHeight: number): void {
+    if (this.isHistorySettling() == false) {
+      return;
+    }
+    if (this.data.autoToLastMsg.value != true) {
+      this.clearHistorySettle();
+      return;
+    }
+    // 阈值略降：table 分批渲染时高度可能小步增长
+    if (scrollHeight <= this.lastSettleScrollHeight + 8) {
+      if (scrollHeight > this.lastSettleScrollHeight) {
+        this.lastSettleScrollHeight = scrollHeight;
+      }
+      return;
+    }
+    this.lastSettleScrollHeight = scrollHeight;
+    if (this.settleScrollScheduled == true) {
+      return;
+    }
+    this.settleScrollScheduled = true;
+    // 公式批量撑高时高度会连续跳变，50ms 太密会连滚抖动；合并到约一帧半
+    setTimeout((): void => {
+      this.settleScrollScheduled = false;
+      this.tryScrollDuringHistorySettle();
+    }, 180);
+  }
+
+  /**
+   * 设置是否在滚动底部。
+   * 历史稳定期内立即处理（便于检测撑高补滚）；流式期仍节流。
    */
   setIsInScrollBottom(e: UniScrollEvent): void {
+    if (this.isHistorySettling() == true) {
+      this.pendingBottomEvent = null;
+      if (this.bottomCheckTimer != 0) {
+        clearTimeout(this.bottomCheckTimer);
+        this.bottomCheckTimer = 0;
+      }
+      this.applyScrollBottomState(e);
+      return;
+    }
+    this.pendingBottomEvent = e;
+    if (this.bottomCheckTimer != 0) {
+      return;
+    }
+    this.bottomCheckTimer = setTimeout((): void => {
+      this.bottomCheckTimer = 0;
+      const pending = this.pendingBottomEvent;
+      this.pendingBottomEvent = null;
+      if (pending != null) {
+        this.applyScrollBottomState(pending);
+      }
+    }, this.BOTTOM_CHECK_MS) as number;
+  }
+
+  private applyScrollBottomState(e: UniScrollEvent): void {
     nextTick(() => {
-      // 使用事件参数获取滚动信息，兼容微信小程序
       const scrollTop = e?.detail?.scrollTop ?? 0;
       const scrollHeight = e?.detail?.scrollHeight ?? 0;
-      // #ifdef MP-WEIXIN
-      // 微信小程序需要通过其他方式获取容器高度，这里使用估算值
-      const offsetHeight = 600; // 默认视窗高度估算
-      // #endif
-      // #ifndef MP-WEIXIN
-      const scrollList = uni.getElementById("msg-list");
-      const offsetHeight = scrollList?.offsetHeight ?? 600;
-      // #endif
+      // 历史稳定期内容高度变化快，不用过期缓存
+      if (this.isHistorySettling() == true) {
+        this.cachedOffsetHeight = 0;
+        this.cachedOffsetHeightAtMs = 0;
+      }
+      const offsetHeight = this.resolveOffsetHeight();
+
+      this.maybeRescrollOnContentGrow(scrollHeight);
 
       const diff: number = scrollHeight - scrollTop - offsetHeight;
       const isInBottom = diff < 50;
       this.data.scrollInBottom.value = isInBottom;
 
-      // 如果滑到底部，自动恢复自动滚动
-      if (isInBottom) {
-        this.data.autoToLastMsg.value = true;
-      }
-
-      // 只有在用户主动滚动（触摸或鼠标）时才可能禁用自动滚动
-      // 且只在向上滚动（远离底部）时禁用
       const isScrollingUp = scrollTop < this.lastScrollTop;
       this.lastScrollTop = scrollTop;
+      const userScrolling =
+        this.data.scrollTouch.value == true ||
+        this.data.mouseScroll.value == true;
 
-      if (
-        (this.data.scrollTouch.value || this.data.mouseScroll.value) &&
-        isScrollingUp && !isInBottom
-      ) {
-        // 用户向上滚动时，立即禁用自动滚动，不需要等待滚动到一定距离
-        // 这样用户可以更容易地中断快速消息流带来的自动滚动
+      // 手指/滚轮上滑：立刻停跟底。
+      // 以前要求先离开底部 50px，导致「上滑一点点」仍被判在底部，
+      // 且下方会把 autoToLastMsg 强制拉回 true，松手后再被 touchend 滚回底。
+      if (userScrolling == true && isScrollingUp == true) {
         this.data.autoToLastMsg.value = false;
-        // 同时显示"滚动到底部"按钮
-        this.data.scrollInBottom.value = false;
+        if (isInBottom != true) {
+          this.data.scrollInBottom.value = false;
+        }
+        this.clearStreamFollowRetries();
+        if (this.isHistorySettling() == true) {
+          this.clearHistorySettle();
+        }
+        return;
+      }
+
+      // 非上滑且已在底部（滑回底 / 程序滚底）：恢复跟底
+      if (isInBottom == true) {
+        this.data.autoToLastMsg.value = true;
       }
     });
   }

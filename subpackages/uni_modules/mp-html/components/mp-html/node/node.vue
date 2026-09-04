@@ -1,11 +1,15 @@
 <template>
+  <!--
+    空壳 md-p / p：markdown-it 包过程标签或 \n\n 会留下无可见子的 <p>，
+    仍吃 margin-block 1em 占高。无可见内容时不挂根 view。
+  -->
   <view
+    v-if="!isEmptyMdBlockShell"
     :id="attrs.id"
-    :class="'_block _' + name + ' ' + attrs.class"
+    :class="['_block', '_' + name, attrs.class, isOpenUiOnlyMdP ? 'md-p--openui' : '']"
     :style="attrs.style"
   >
-    <!-- uni-app-x App：无 block 内置组件，用 template 作虚拟包裹 -->
-    <template v-for="(n, i) in childs" :key="i">
+    <block v-for="(n, i) in childs" v-bind:key="i">
       <!-- 图片 -->
       <!-- 占位图 -->
       <image
@@ -133,14 +137,24 @@
       <text
         v-else-if="n.text"
         :user-select="opts[4] == 'force' && isiOS"
+        style="display:inline;"
         decode
         >{{ n.text }}</text
       >
       <!-- #endif -->
       <!-- #ifndef MP-WEIXIN || MP-BAIDU || MP-ALIPAY || MP-TOUTIAO -->
-      <text v-else-if="n.text" decode>{{ n.text }}</text>
+      <text v-else-if="n.text" style="display:inline;" decode>{{ n.text }}</text>
       <!-- #endif -->
       <text v-else-if="n.name === 'br'">{{ "\n" }}</text>
+      <!-- 会话详情链接使用 text 渲染，避免 view 在原生端独占一行。 -->
+      <text
+        v-else-if="n.name === 'a' && n.attrs['data-conversation-link']"
+        :id="n.attrs.id"
+        :class="'_a ' + n.attrs.class"
+        :style="n.attrs.style"
+        :data-i="i"
+        @tap.stop="linkTap"
+      >{{ (n.children && n.children[0] && n.children[0].text) || "" }}</text>
       <!-- 链接 -->
       <view
         v-else-if="n.name === 'a'"
@@ -239,7 +253,7 @@
             :childs="tbody.children"
             :opts="opts"
           />
-          <template v-else v-for="(tr, y) in tbody.children" :key="y">
+          <block v-else v-for="(tr, y) in tbody.children" v-bind:key="y">
             <view
               v-if="tr.name === 'td' || tr.name === 'th'"
               :class="'_' + tr.name + ' ' + tr.attrs.class"
@@ -254,25 +268,35 @@
             >
               <view
                 v-for="(td, z) in tr.children"
-                :key="z"
+                v-bind:key="z"
                 :class="'_' + td.name + ' ' + td.attrs.class"
                 :style="td.attrs.style"
               >
                 <node :childs="td.children" :opts="opts" />
               </view>
             </view>
-          </template>
+          </block>
         </view>
       </view>
+      <!--
+        OpenUI 原位卡：逻辑在 openui/openui-node-helpers.js，UI 用 openui-card.vue，
+        避免在通用 node 内联整套卡片 markup/CSS。
+      -->
+      <openui-card
+        v-else-if="isOpenUiProcessNode(n)"
+        :artifact-id="openuiArtifactIdOfNode(n)"
+        :title="openuiTitleOfNode(n)"
+        :conversation-id="getConversationId()"
+      />
       <markdown-container
         v-else-if="n.name == 'container'"
-        :tool-call-data="getRenderData(n.attrs.data)"
+        :data="getRenderData(n.attrs.data)"
         data-source="markdown-container"
       />
       <!-- markdown-custom-process 工具调用组件 -->
       <markdown-container
         v-else-if="n.name == 'markdown-custom-process'"
-        :tool-call-data="getRenderData(n.attrs)"
+        :data="getRenderData(n.attrs)"
         data-source="markdown-container"
       />
       <markdown-container-group
@@ -282,11 +306,19 @@
         "
         :childs="n.children"
         :processing-list="processingList"
+        :is-current-streaming="isCurrentStreaming"
+        :auto-collapse="
+          n.attrs &&
+          (n.attrs['auto-collapse'] ||
+            n.attrs.autoCollapse ||
+            n.attrs.autocollapse)
+        "
       >
         <node
           :childs="n.children"
           :opts="opts"
           :processing-list="processingList"
+          :is-current-streaming="isCurrentStreaming"
         />
       </markdown-container-group>
       <!-- task-result 任务结果组件 -->
@@ -339,11 +371,11 @@
         @tap="handleCurrentTap(n)"
       />
       <!-- #endif -->
-      <!-- 继续递归 -->
+      <!-- 继续递归；c=2 的空 p 同样跳过，避免再占高 -->
       <view
-        v-else-if="n.c === 2"
+        v-else-if="n.c === 2 && !isChildEmptyBlockShell(n)"
         :id="n.attrs.id"
-        :class="'_block _' + n.name + ' ' + n.attrs.class"
+        :class="['_block', '_' + n.name, n.attrs.class, isChildOpenUiOnlyMdP(n) ? 'md-p--openui' : '']"
         :style="n.f + ';' + n.attrs.style"
       >
         <node
@@ -354,9 +386,12 @@
           :attrs="n2.attrs"
           :childs="n2.children"
           :opts="opts"
+          :processing-list="processingList"
+          :is-current-streaming="isCurrentStreaming"
           :copy-text="n2._copyText"
         />
       </view>
+      <!-- OpenUI/工具标签 expose 后常挂在 c=1 的 <p> 子树；必须下传 processingList，否则 artifactId 永远为空 →「界面生成中」 -->
       <node
         v-else
         :style="n.f"
@@ -364,9 +399,11 @@
         :attrs="n.attrs"
         :childs="n.children"
         :opts="opts"
+        :processing-list="processingList"
+        :is-current-streaming="isCurrentStreaming"
         :copy-text="n._copyText"
       />
-    </template>
+    </block>
   </view>
 </template>
 <script module="handler" lang="wxs">
@@ -403,9 +440,17 @@
   import markdownContainer from '../container/container.vue'
   import markdownContainerGroup from '../container/container-group.vue'
   import taskResult from '../task-result/task-result.vue'
+  import openuiCard from '../openui-card/openui-card.vue'
   import { getProcessingDataByPriority } from '../container/utils'
   import node from './node'
   import { t } from '@/utils/i18n'
+  import {
+    isOpenUiProcessNode as resolveIsOpenUiProcessNode,
+    openuiArtifactIdOfNode as resolveOpenuiArtifactId,
+    openuiTitleOfNode as resolveOpenuiTitle,
+    isBlockShellEmpty as resolveIsBlockShellEmpty,
+    isOpenUiOnlyParagraph as resolveIsOpenUiOnlyParagraph
+  } from '../openui/openui-node-helpers.js'
   export default {
     name: 'node',
     options: {
@@ -428,6 +473,7 @@
     props: {
       name: String,
       processingList: Array,
+      isCurrentStreaming: Boolean,
       attrs: {
         type: Object,
         default () {
@@ -442,6 +488,7 @@
       markdownContainer,
       markdownContainerGroup,
       taskResult,
+      openuiCard,
       // #ifndef ((H5 || APP-PLUS) && VUE3) || APP-HARMONY
       node
       // #endif
@@ -478,6 +525,26 @@
       }
       // #endif
     },
+    computed: {
+      /**
+       * 当前 node 是否为空壳段落（_p md-p）：无可见子却仍占 margin。
+       * 仅处理 p，避免误伤其它块级结构。
+       */
+      isEmptyMdBlockShell () {
+        return this.isBlockShellEmpty(this.name, this.childs)
+      },
+      /**
+       * 段落内仅有 OpenUI 卡：去掉 md-p 默认 1em 上下边距。
+       */
+      isOpenUiOnlyMdP () {
+        return resolveIsOpenUiOnlyParagraph(
+          this.name,
+          this.childs,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
+      }
+    },
     methods:{
       getI18nText (key) {
         return t(key)
@@ -504,7 +571,44 @@
         }
         return ''
       },
-      getRenderData (data: any) {
+      /**
+       * c=2 子块是否为空壳 p（与根 isEmptyMdBlockShell 同规则）。
+       */
+      isChildEmptyBlockShell (n) {
+        if (n == null) {
+          return false
+        }
+        return resolveIsBlockShellEmpty(
+          n.name,
+          n.children,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
+      },
+      /** c=2 子块是否为「仅 OpenUI」段落，与根 isOpenUiOnlyMdP 同规则。 */
+      isChildOpenUiOnlyMdP (n) {
+        if (n == null) {
+          return false
+        }
+        return resolveIsOpenUiOnlyParagraph(
+          n.name,
+          n.children,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
+      },
+      /**
+       * 空壳 p：无可见子却仍占 md-p margin。OpenUI 可见性规则在 helpers。
+       */
+      isBlockShellEmpty (tagName, children) {
+        return resolveIsBlockShellEmpty(
+          tagName,
+          children,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
+      },
+      getRenderData (data) {
         if(!data) {
           return {}
         }
@@ -534,6 +638,28 @@
         }
 
         return result
+      },
+      /** OpenUI：薄包装，实现见 openui-node-helpers.js */
+      isOpenUiProcessNode (n) {
+        return resolveIsOpenUiProcessNode(
+          n,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
+      },
+      openuiArtifactIdOfNode (n) {
+        return resolveOpenuiArtifactId(
+          n,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
+      },
+      openuiTitleOfNode (n) {
+        return resolveOpenuiTitle(
+          n,
+          (attrs) => this.getRenderData(attrs),
+          this.processingList
+        )
       },
       // #ifdef MP-WEIXIN
       toJSON () { return this },
@@ -604,7 +730,7 @@
         // #endif
         // 自动预览图片
         if (this.root.previewImg) {
-          uni.previewImage({
+          const previewOpts = {
             // #ifdef MP-WEIXIN
             showmenu: this.root.showImgMenu,
             // #endif
@@ -614,7 +740,33 @@
             // #endif
             current: parseInt(node.attrs.i),
             urls: this.root.imgList
-          })
+          }
+          // App 内嵌 H5：uni.previewImage 关闭会 history.back / navigateBack，把原生聊天页弹回首页
+          try {
+            if (typeof window !== 'undefined' && typeof window.__nuwaxPreviewImage === 'function') {
+              window.__nuwaxPreviewImage(previewOpts)
+              return
+            }
+          } catch (ePrev) {}
+          // #ifdef H5
+          // 相对路径（如 /api/computer/static/...）在页面 img 能显示，
+          // uni.previewImage 会当成本地资源导致黑底裂图，预览前补当前 origin。
+          try {
+            const origin = (typeof location !== 'undefined' && location.origin) ? location.origin : ''
+            const list = previewOpts.urls
+            if (origin && origin !== 'null' && list && list.length) {
+              previewOpts.urls = list.map(src => {
+                if (!src || /^(https?:|data:|blob:|file:|wxfile:|content:)/i.test(src)) return src
+                if (src.indexOf('//') === 0) {
+                  const proto = location.protocol || 'https:'
+                  return proto + src
+                }
+                return origin + (src.charAt(0) === '/' ? src : '/' + src)
+              })
+            }
+          } catch (eAbs) {}
+          // #endif
+          uni.previewImage(previewOpts)
         }
       },
 

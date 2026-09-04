@@ -1,10 +1,12 @@
-import { ALLOW_EXTERNAL_LINK_DOMAIN } from "@/constants/config";
+import { ref, type Ref } from "vue";
+import { ALLOW_EXTERNAL_LINK_DOMAIN, getApiBaseUrl } from "@/constants/config";
 import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { apiTenantConfig } from "@/servers/account";
 import { apiGetStaticFileList } from "@/servers/agentDev";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 import { t } from "@/utils/i18n";
+import { isAppWebViewEmbedded, isIosAppWebView } from "@/utils/appWebViewDetect";
 import type { TenantConfigInfo } from "@/types/interfaces/login";
 
 /**
@@ -74,16 +76,226 @@ export const formatDate = (
 
 // 判断是否是允许外部链接跳转的域名
 export const isAllowExternalLinkDomain = (url: string) => {
-  return ALLOW_EXTERNAL_LINK_DOMAIN.some((domain) => url.includes(domain));
+  try {
+    const targetOrigin = new URL(url).origin;
+    if (targetOrigin == getApiBaseUrl()) return true;
+    return ALLOW_EXTERNAL_LINK_DOMAIN.some((domain) => targetOrigin == domain);
+  } catch (_error) {
+    return false;
+  }
 };
 
+const EXTERNAL_LINK_PAGE_PATH = "/subpackages/pages/external-link/external-link";
+const INNER_WEBVIEW_PAGE_PATH = "/subpackages/pages/webview/webview";
+
+function isHttpOrProtocolRelative(url: string): boolean {
+  return (
+    url.indexOf("http://") == 0 ||
+    url.indexOf("https://") == 0 ||
+    url.indexOf("//") == 0
+  );
+}
+
+function normalizeExternalHref(url: string): string {
+  if (url.indexOf("//") == 0) {
+    return `https:${url}`;
+  }
+  return url;
+}
+
 /**
- * 根据链接地址判断不允许调整的页面需要复制链接到剪切板
- * @param url 链接地址
- * @returns void
+ * 拼外链预览页路由（url 必须 encode，避免目标地址里的 ?&= 打散本页 query）。
  */
-export const handleExternalLink = (url: string) => {
-  // 如果链接地址为空，则提示链接地址配置错误
+export function buildExternalLinkPageUrl(href: string, title: string = ""): string {
+  let path = `${EXTERNAL_LINK_PAGE_PATH}?url=${encodeURIComponent(href)}`;
+  if (title.length > 0) {
+    path = `${path}&title=${encodeURIComponent(title)}`;
+  }
+  return path;
+}
+
+/**
+ * 微信小程序 web-view 内嵌 H5：用 wx.miniProgram.navigateTo 打开原生页。
+ * 成功返回 true；非小程序 web-view 或 SDK 未注入返回 false。
+ */
+export function navigateViaWxMiniProgram(url: string): boolean {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    if (w == null || w.wx == null) {
+      return false;
+    }
+    const miniProgram = w.wx.miniProgram;
+    if (miniProgram == null || miniProgram.navigateTo == null) {
+      return false;
+    }
+    miniProgram.navigateTo({ url: url });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/**
+ * App 内嵌 H5：仅改 hash 做 SPA 软导航，不触发原生 uni.navigateTo（避免 locked）。
+ */
+export function navigateEmbeddedH5HashRoute(routeUrl: string): void {
+  // #ifdef H5 || WEB
+  try {
+    let path = routeUrl;
+    if (path.charAt(0) != "/") {
+      path = `/${path}`;
+    }
+    window.location.hash = `#${path}`;
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * iOS 常驻壳内嵌 H5：通知原生 openResidentChat（仅 iOS 生效）。
+ */
+export function requestResidentChatOpenFromEmbeddedH5(
+  agentId: number,
+  conversationId: number | null,
+): boolean {
+  if (agentId <= 0) {
+    return false;
+  }
+  // #ifdef H5 || WEB
+  if (isIosAppWebView() != true) {
+    return false;
+  }
+  const payload = {} as UTSJSONObject;
+  payload["type"] = "app-open-chat";
+  payload["agentId"] = `${agentId}`;
+  if (conversationId != null && conversationId > 0) {
+    payload["conversationId"] = `${conversationId}`;
+  } else {
+    payload["conversationId"] = "";
+  }
+  if (postAppWebViewMessage(payload)) {
+    return true;
+  }
+  const hashUrl = `/subpackages/pages/agent-detail/agent-detail?id=${agentId}`;
+  if (conversationId != null && conversationId > 0) {
+    navigateEmbeddedH5HashRoute(`${hashUrl}&conversationId=${conversationId}`);
+  } else {
+    navigateEmbeddedH5HashRoute(hashUrl);
+  }
+  return true;
+  // #endif
+  return false;
+}
+
+/**
+ * 通过注入的 uni.webview.js（uni.webView.navigateTo）打开原生页。
+ * 成功返回 true；JSSDK 未就绪或非内嵌环境返回 false，由调用方回退 hash 软导航。
+ */
+export function navigateViaWebViewSdk(url: string): boolean {
+  // #ifdef H5 || WEB
+  // iOS 常驻壳：agent-detail 禁止压原生栈
+  if (isIosAppWebView() == true && url.indexOf("agent-detail") >= 0) {
+    const qIdx = url.indexOf("?");
+    if (qIdx >= 0) {
+      navigateEmbeddedH5HashRoute(url);
+      return true;
+    }
+    return false;
+  }
+  try {
+    const w = window as any;
+    if (w == null || w.uni == null) {
+      return false;
+    }
+    const webView = w.uni.webView;
+    if (webView == null || webView.navigateTo == null) {
+      return false;
+    }
+    webView.navigateTo({ url: url });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/**
+ * App 内嵌 H5 → 原生：优先 uni.webView.postMessage，
+ * 本地调试 H5（Vite / 局域网）经常还没加载到 JSSDK，此时直接走原生注入的
+ * __uniapp_x_postMessage（与键盘诊断、商品详情桥同一条通道）。
+ */
+export function postAppWebViewMessage(payload: UTSJSONObject): boolean {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    if (w == null) {
+      return false;
+    }
+    if (
+      w.uni != null &&
+      w.uni.webView != null &&
+      w.uni.webView.postMessage != null
+    ) {
+      w.uni.webView.postMessage({ "data": payload });
+      return true;
+    }
+    if (w.__uniapp_x_postMessage != null) {
+      w.__uniapp_x_postMessage({ "data": payload });
+      return true;
+    }
+    if (w.__uniapp_x_ != null && w.__uniapp_x_.postMessage != null) {
+      w.__uniapp_x_.postMessage(JSON.stringify({ "data": payload }));
+      return true;
+    }
+  } catch (_e) {
+    return false;
+  }
+  // #endif
+  return false;
+}
+
+/**
+ * 在原生 web-view 页打开 HTTP(S) 外链。
+ * App 内嵌 H5：只 postMessage 给承载页（resident-chat-shell），由原生 uni.navigateTo 打开
+ * external-link；失败不回退 H5 navigateTo / window.open，避免把聊天页顶掉或看起来没反应。
+ */
+export function openExternalLinkPage(href: string, title: string = ""): boolean {
+  const target = normalizeExternalHref(href);
+  if (target.indexOf("http://") != 0 && target.indexOf("https://") != 0) {
+    return false;
+  }
+  const pageUrl = buildExternalLinkPageUrl(target, title);
+  if (isAppWebViewEmbedded()) {
+    const payload = {} as UTSJSONObject;
+    payload["type"] = "app-open-external-link";
+    payload["url"] = target;
+    if (title.length > 0) {
+      payload["title"] = title;
+    }
+    return postAppWebViewMessage(payload);
+  }
+  if (navigateViaWxMiniProgram(pageUrl)) {
+    return true;
+  }
+  uni.navigateTo({ url: pageUrl });
+  return true;
+}
+
+/**
+ * 打开聊天 / 业务里的链接。
+ * HTTP(S) 外链：App（含内嵌 H5）与微信小程序走独立 web-view 页；
+ * 浏览器 H5 仍新开标签。站内相对路径仍走原 webview 页（可带 ticket）。
+ */
+export function handleExternalLink(url: string, title: string = ""): void {
   if (url == null || url.length == 0) {
     uni.showToast({
       title: t("Mobile.Link.invalidConfig"),
@@ -92,89 +304,72 @@ export const handleExternalLink = (url: string) => {
     return;
   }
 
-  // #ifdef H5 || WEB
-  // H5 环境直接打开外部链接
-  try {
-    // 判断是否为有效的 URL
-    const isValidUrl =
-      url.startsWith("http://") ||
-      url.startsWith("https://") ||
-      url.startsWith("//");
+  if (isHttpOrProtocolRelative(url)) {
+    const target = normalizeExternalHref(url);
 
-    if (Boolean(isValidUrl)) {
-      // 尝试在新标签页中打开链接
-      const newWindow = window.open(url, "_blank");
-
-      // 检查是否被浏览器拦截（某些浏览器会阻止弹窗）
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded()) {
+      if (openExternalLinkPage(target, title) == false) {
+        uni.showToast({
+          title: t("Mobile.Link.openFailed"),
+          icon: "none",
+        });
+      }
+      return;
+    }
+    if (navigateViaWxMiniProgram(buildExternalLinkPageUrl(target, title))) {
+      return;
+    }
+    try {
+      const newWindow = window.open(target, "_blank");
       if (
-        !newWindow ||
+        newWindow == null ||
         newWindow.closed ||
-        typeof newWindow.closed === "undefined"
+        typeof newWindow.closed == "undefined"
       ) {
-        // 如果被拦截，提示用户并复制链接到剪贴板
-        console.warn("链接被浏览器拦截，使用备用方案");
-
-        // 尝试复制到剪贴板
-        if (navigator.clipboard && navigator.clipboard.writeText) {
+        if (navigator.clipboard != null && navigator.clipboard.writeText != null) {
           navigator.clipboard
-            .writeText(url)
-            .then(() => {
+            .writeText(target)
+            .then((): void => {
               uni.showToast({
                 title: t("Mobile.Link.copyAndOpen"),
                 icon: "none",
                 duration: 3000,
               });
             })
-            .catch(() => {
-              // 如果复制失败，直接在当前页面打开
-              window.location.href = url;
+            .catch((): void => {
+              window.location.href = target;
             });
         } else {
-          // 如果不支持剪贴板 API，直接在当前页面打开
-          window.location.href = url;
+          window.location.href = target;
         }
       }
-    } else {
-      // 如果不是完整的 URL，使用 navigateTo 跳转到 webview 页面
-      uni.navigateTo({
-        url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(url)}`,
+    } catch (_error) {
+      uni.showToast({
+        title: t("Mobile.Link.openFailed"),
+        icon: "none",
       });
     }
-  } catch (error) {
-    console.error("打开链接失败:", error);
-    uni.showToast({
-      title: t("Mobile.Link.openFailed"),
-      icon: "none",
-    });
+    return;
+    // #endif
+
+    // #ifdef APP || MP-WEIXIN
+    openExternalLinkPage(target, title);
+    return;
+    // #endif
+  }
+
+  const innerUrl = `${INNER_WEBVIEW_PAGE_PATH}?url=${encodeURIComponent(url)}`;
+  // #ifdef H5 || WEB
+  if (isAppWebViewEmbedded() && navigateViaWebViewSdk(innerUrl)) {
+    return;
+  }
+  if (navigateViaWxMiniProgram(innerUrl)) {
+    return;
   }
   // #endif
-
-  // #ifdef APP
-  uni.navigateTo({
-    url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(url)}`,
-  });
-  // #endif
-
-  // #ifdef MP-WEIXIN
-  // 如果允许外部链接跳转，则打开外部链接
-  // 微信小程序中打开外部链接，需要在微信开发者工具中配置域名白名单
-  if (isAllowExternalLinkDomain(url)) {
-    uni.navigateTo({
-      url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(url)}`,
-    });
-  } else {
-    uni.setClipboardData({
-      data: url,
-      success: () => {
-        uni.showToast({
-          title: t("Mobile.Link.copied"),
-          icon: "none",
-        });
-      },
-    });
-  }
-  // #endif
-};
+  uni.navigateTo({ url: innerUrl });
+}
 
 // 获取用户配置并设置页面标题和缓存租户信息
 export const fetchTenantConfig = async () => {
@@ -217,6 +412,70 @@ export const setCurrentPageNavigationBarTitle = async () => {
   fetchTenantConfig(); // 获取用户配置并设置页面标题和缓存租户信息
 };
 
+/**
+ * App 常驻壳：通知原生「当前聊天页头图/标题已就绪」，可安全揭开避免闪上一次智能体。
+ * 仅内嵌 H5 生效；浏览器直开 / 无桥时 noop。
+ */
+function postMessageToResidentChatShell(payload: UTSJSONObject): void {
+  // #ifdef H5 || WEB
+  try {
+    if (isAppWebViewEmbedded() != true) {
+      return;
+    }
+    const w = window as any;
+    if (w == null) {
+      return;
+    }
+    const uniGlobal = w.uni;
+    if (
+      uniGlobal != null &&
+      uniGlobal.webView != null &&
+      uniGlobal.webView.postMessage != null
+    ) {
+      uniGlobal.webView.postMessage({ data: payload });
+      return;
+    }
+    if (w.__uniapp_x_postMessage != null) {
+      w.__uniapp_x_postMessage({ data: payload });
+    }
+  } catch (_ePost) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * App 常驻壳：H5 已清空旧会话并进入 loading，可提前揭开原生遮罩（仍由 H5 内 loading 占位）。
+ */
+export function notifyResidentChatCleared(agentId: number | null): void {
+  const payload = {
+    type: "app-chat-cleared",
+    agentId: agentId != null ? `${agentId}` : "",
+  } as UTSJSONObject;
+  postMessageToResidentChatShell(payload);
+}
+
+export function notifyResidentChatReady(agentId: number | null): void {
+  const payload = {
+    type: "app-chat-ready",
+    agentId: agentId != null ? `${agentId}` : "",
+  } as UTSJSONObject;
+  postMessageToResidentChatShell(payload);
+}
+
+/**
+ * H5 内嵌页的状态栏（刘海）高度（px）。
+ * App 端 agent-detail 原生页把 webview 全屏铺满后，顶部刘海区域由内嵌 H5 页面自己处理：
+ * 原生侧在 webview URL fragment 追加 &statusBarHeight=xx，H5 侧 onLoad 读取后写入此处，
+ * 供 custom-nav-bar / safety-zone 在 H5 内做状态栏占位。0 表示非内嵌或未知（浏览器直开）。
+ * 用 ref 保证「onLoad 晚于组件首帧渲染」时（页面生命周期在组件树挂载后才派发）也能响应式补上占位。
+ */
+const embeddedStatusBarHeight = ref<number>(0);
+export const setEmbeddedStatusBarHeight = (height: number): void => {
+  embeddedStatusBarHeight.value = height > 0 ? height : 0;
+};
+export const getEmbeddedStatusBarHeight = (): Ref<number> => embeddedStatusBarHeight;
+
 // 根据会话id和文件路径 跳转至预览页面
 export const jumpToFilePreviewPage = (
   conversationId: string,
@@ -226,8 +485,47 @@ export const jumpToFilePreviewPage = (
     return;
   }
   const path = "/subpackages/pages/file-preview-page/file-preview-page";
-  const url = `${path}?cId=${conversationId}&fileProxyUrl=${encodeURIComponent(fileProxyUrl)}`;
+  // fileProxyUrl 是独立 query 值，uni 路由只分隔 &/=，内部 ?/% 无需编码；
+  // file-preview-page 端也只做单次 decodeURIComponent。此处不再 encode，避免双重编码。
+  // 注意：uni.webView.navigateTo 内部会对整段 url 做 encodeURI，与 file-tree 行为兼容。
+  const url = `${path}?cId=${conversationId}&fileProxyUrl=${fileProxyUrl}`;
+  // App 内嵌 H5：走 JSSDK 开原生预览页（避免只在 web-view 内 H5 SPA 跳转）
+  if (isAppWebViewEmbedded() && navigateViaWebViewSdk(url)) {
+    return;
+  }
   uni.navigateTo({ url });
+};
+
+/**
+ * 打开 OpenUI artifact 预览——与文件树点击 .openui.json 打开的是同一个 file-preview-page（有导航栏/返回）。
+ * 通过 getFileProxyUrlByConversationIdAndFilePath 获取文件代理 URL，再 jumpToFilePreviewPage 跳转。
+ * App 内嵌 H5 时 jumpToFilePreviewPage 会走 uni.webView.navigateTo 开原生页。
+ */
+export const openOpenUiArtifact = async (
+  conversationId: string,
+  artifactId: string,
+  title: string,
+) => {
+  const cid =
+    conversationId.startsWith("chat-") ? conversationId.substring(5) : conversationId;
+  if (cid.length == 0 || artifactId.length == 0) {
+    uni.showToast({ title: "无法打开 OpenUI", icon: "none" });
+    return;
+  }
+  try {
+    const proxyUrlRaw = await getFileProxyUrlByConversationIdAndFilePath(
+      cid,
+      `data/${artifactId}.openui.json`,
+    );
+    const proxyUrl = proxyUrlRaw != null ? `${proxyUrlRaw}` : "";
+    if (proxyUrl.length > 0) {
+      jumpToFilePreviewPage(cid, proxyUrl);
+    } else {
+      uni.showToast({ title: "无法打开 OpenUI", icon: "none" });
+    }
+  } catch (_e) {
+    uni.showToast({ title: "打开文件失败", icon: "none" });
+  }
 };
 
 // 根据会话id查询文件列表并根据文件路径获取到文件代理url

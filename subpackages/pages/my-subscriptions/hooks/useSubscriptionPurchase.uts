@@ -1,4 +1,7 @@
 import { ref, onMounted, onUnmounted, type Ref } from "vue";
+// #ifdef APP
+import { onShow } from "@dcloudio/uni-app";
+// #endif
 import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
 import {
   apiCreateSubscriptionOrder,
@@ -11,6 +14,11 @@ import {
   checkWechatOaPayCallback,
   checkH5PayCallback,
   checkActiveOrderCallback,
+  registerEmbeddedAppPayResultConsumer,
+  unregisterEmbeddedAppPayResultConsumer,
+  // #endif
+  // #ifdef APP
+  checkActiveAppPayOrder,
   // #endif
   executePayFlow,
   getPayMode,
@@ -89,19 +97,43 @@ function readOrderIdFromResponse(res: RequestResponse<any> | null): number {
   return orNumber(idRaw, 0);
 }
 
+/**
+ * Android：跨分包调用时 UTS 不会生成可选参数的重载桥接方法，
+ * 少传参会在运行期抛 NoSuchMethodError，因此两个回调都必须显式声明并传入（可传 null）。
+ */
 export function useSubscriptionPurchase(
-  onSuccess?: () => void,
+  onSuccess: (() => void) | null,
+  onPaymentOptionsOpen: (() => void) | null,
 ): SubscriptionPurchaseApi {
   const emptyParams = emptyI18nParams();
   const t = (key: string): string => i18nT(key, emptyParams, "");
   const processingId = ref<number | null>(null);
   const loading = ref<boolean>(false);
 
+  const notifyPaymentOptionsOpen = (): void => {
+    if (onPaymentOptionsOpen == null) {
+      return;
+    }
+    try {
+      onPaymentOptionsOpen();
+    } catch (error) {
+      console.warn("[subscription-pay] payment options callback failed", error);
+    }
+  };
+
   // ========== H5 / WEB 自动校验生命周期 ==========
   // #ifdef H5 || WEB
   let pageshowHandler: ((event: any) => void) | null = null;
   let visibilitychangeHandler: (() => void) | null = null;
+  let embeddedPayConsumerId = "";
   onMounted(() => {
+    // App 内嵌 H5 即使在支付期间发生 WebView 重载，也能主动取回原生持久化结果。
+    embeddedPayConsumerId = registerEmbeddedAppPayResultConsumer(
+      processingId,
+      loading,
+      t,
+      onSuccess,
+    );
     // 校验第三方渠道回跳的通用支付结果
     checkPayResult(t, onSuccess);
     // 校验微信公众号授权重定向回跳的支付参数及轮询结果
@@ -131,12 +163,26 @@ export function useSubscriptionPurchase(
   });
 
   onUnmounted(() => {
+    unregisterEmbeddedAppPayResultConsumer(embeddedPayConsumerId);
+    embeddedPayConsumerId = "";
     if (pageshowHandler != null) {
       window.removeEventListener("pageshow", pageshowHandler);
     }
     if (visibilitychangeHandler != null) {
       document.removeEventListener("visibilitychange", visibilitychangeHandler);
     }
+  });
+  // #endif
+
+  // ========== APP 回前台核对支付结果 ==========
+  // #ifdef APP
+  // 从微信 / 支付宝收银台切回 App 时触发：先解除支付锁（用户可能只是取消了支付），
+  // 再核对活跃订单的结算状态。对应上面 H5 的 pageshow / visibilitychange 处理——
+  // 缺了它，用户取消支付后要等轮询超时才能再次发起支付。
+  onShow(() => {
+    checkActiveAppPayOrder(processingId, loading, t, onSuccess).catch(
+      (): void => {},
+    );
   });
   // #endif
 
@@ -158,6 +204,7 @@ export function useSubscriptionPurchase(
       if (apiResCode(orderRes) == SUCCESS_CODE) {
         const orderId = readOrderIdFromResponse(orderRes);
         if (orderId > 0) {
+          notifyPaymentOptionsOpen();
           await executePayFlow(orderId, processingId, loading, t, onSuccess);
         } else {
           uni.hideLoading();
@@ -201,6 +248,7 @@ export function useSubscriptionPurchase(
       if (apiResCode(orderRes) == SUCCESS_CODE) {
         const orderId = readOrderIdFromResponse(orderRes);
         if (orderId > 0) {
+          notifyPaymentOptionsOpen();
           await executePayFlow(orderId, processingId, loading, t, onSuccess);
         } else {
           uni.hideLoading();
@@ -237,6 +285,7 @@ export function useSubscriptionPurchase(
       mask: true,
     });
     try {
+      notifyPaymentOptionsOpen();
       await executePayFlow(orderId, processingId, loading, t, onSuccess);
     } catch (e) {
       uni.hideLoading();

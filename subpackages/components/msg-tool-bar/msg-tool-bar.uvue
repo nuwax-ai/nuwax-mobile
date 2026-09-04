@@ -1,32 +1,55 @@
 <template>
 	<view class="tool-bar-container">
-		<svg-icon name="icon-Copy" customClass="btn" @click="copy" />
 		<view
-			class="speech-btn"
-			:class="{ 'speech-btn--active': isSpeaking }"
+			class="tool-btn"
+			hover-class="tool-btn-hover"
+			:hover-start-time="20"
+			:hover-stay-time="70"
+			@click="copy"
+		>
+			<svg-icon name="icon-Copy" size="36" />
+		</view>
+		<!-- 语音播放按钮（仅 App web-view 内嵌页 enableVoice 时显示） -->
+		<view
+			v-if="enableVoice"
+			class="tool-btn"
+			:class="{
+				'tool-btn--active': isSpeaking,
+				'tool-btn--pulse': isSpeaking && speechFrame,
+			}"
+			hover-class="tool-btn-hover"
+			:hover-start-time="20"
+			:hover-stay-time="70"
 			@click.stop.prevent="toggleSpeech"
 		>
-			<uni-icons
-				:type="isSpeaking && speechFrame ? 'sound-filled' : 'sound'"
-				size="36rpx"
-				:color="isSpeaking ? '#5147ff' : '#333333'"
-			/>
+			<svg-icon name="icon-voice-1" size="36" />
 		</view>
 		<text class="time">{{createTime}}</text>
 	</view>
 </template>
 
 <script lang="uts" setup>
-	import { ref, computed, onMounted, onUnmounted } from "vue";
+	import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 	import { MsgItem } from '@/types/interfaces/ai-msg';
 	import { formatTimeAgo } from '@/utils/common';
 	import { useI18n, emptyI18nParams } from '@/utils/i18n';
 	import { cleanTextForSpeech } from "@/subpackages/utils/voice/textFilter";
-	import { loadVoiceSettings } from "@/subpackages/utils/voice/voiceTypes";
+	import {
+		loadVoiceSettings,
+		cloneVoiceSettings,
+	} from "@/subpackages/utils/voice/voiceTypes";
 	import {
 		ttsWebSocketPlayer,
 		type TtsPlaybackState,
 	} from "@/subpackages/utils/voice/ttsWebSocketPlayer";
+	import { audioPlayerManager } from "@/subpackages/utils/voice/audioPlayerManager";
+	import { voiceStreamSpeaker } from "@/subpackages/utils/voice/voiceStreamSpeaker";
+	import {
+		nativeVoiceBridge,
+		type NativeTtsBridgeState,
+	} from "@/subpackages/utils/voice/nativeVoiceBridge";
+	import { getRewrittenMessageId } from "@/subpackages/utils/voice/speechIdRewrite";
+	import type { AudioPlayerState } from "@/subpackages/utils/voice/voiceTypes";
 
 	const { t: tFn } = useI18n();
 	const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -36,13 +59,23 @@
 	const isSpeaking = ref<boolean>(false)
 	const speechFrame = ref<boolean>(false)
 	let ttsListenerId: number = 0
+	let audioListenerId: number = 0
+	let nativeBridgeListenerId: number = 0
 	let speechAnimationTimer: number | null = null
 
 	const props = withDefaults(defineProps<{
 		msg: MsgItem
+		/** 是否最后一条消息。SSE 结束后 handleQueryConversation 会把助手消息 id 改写为服务端真实 id，
+		 *  导致 msg._id 与 voiceStreamSpeaker / ttsWebSocketPlayer 内暂存的临时 id 失配，图标误复位。
+		 *  此时若仍是最后一条消息且播报活跃，应保持播报态。 */
+		isLastMsg?: boolean
 		speakText?: string
+		/** 是否显示语音播报按钮（仅 App web-view 内嵌页为 true） */
+		enableVoice?: boolean
 	}>(), {
 		speakText: "",
+		isLastMsg: false,
+		enableVoice: true,
 	})
 
 	const msg = computed<MsgItem>(() => props.msg as MsgItem)
@@ -96,23 +129,94 @@
 		speechFrame.value = false
 	}
 
+	/** TTS fail/结束时强制退出本条消息的播报 UI */
+	const clearSpeakingUi = (): void => {
+		isSpeaking.value = false
+		speechFrame.value = false
+		stopSpeechAnimation()
+	}
+
+	/** 本条是否处于播报态（流式 id 精确匹配，或续接后最后一条兜底） */
+	const refreshSpeakingUi = (): void => {
+		const messageId = msg.value._id
+		if (nativeVoiceBridge.isActive() == true) {
+			// App web-view 内嵌页：以原生播报回传的镜像状态为准
+			const speakerId = nativeVoiceBridge.getTtsMessageId()
+			const speakerBusy = nativeVoiceBridge.isTtsBusy()
+			// 兜底只在「在播消息已不在列表（id 被改写）」时生效；
+			// 在播消息还在列表里则由精确匹配点亮，禁止最后一条再亮（防双图标）
+			const lastMsgStreamFallback =
+				props.isLastMsg == true &&
+				speakerId.length > 0 &&
+				speakerId != messageId &&
+				speakerBusy == true &&
+				getRewrittenMessageId(speakerId) == messageId
+			const speaking =
+				(speakerId == messageId || lastMsgStreamFallback) && speakerBusy == true
+			isSpeaking.value = speaking
+			if (speaking) {
+				startSpeechAnimation()
+			} else {
+				stopSpeechAnimation()
+			}
+			return
+		}
+		const ttsState = ttsWebSocketPlayer.getState()
+		const ttsMessageId = ttsWebSocketPlayer.getMessageId()
+		const speakerId = voiceStreamSpeaker.getMessageId()
+		const speakerBusy = voiceStreamSpeaker.isBusy()
+		const lastMsgStreamFallback =
+			props.isLastMsg == true &&
+			speakerId.length > 0 &&
+			speakerId != messageId &&
+			speakerBusy == true &&
+			getRewrittenMessageId(speakerId) == messageId
+		const streamSpeaking =
+			(speakerId == messageId || lastMsgStreamFallback) && speakerBusy == true
+		const ttsSpeaking =
+			ttsMessageId.length > 0 &&
+			ttsMessageId == messageId &&
+			(ttsState == "connecting" ||
+				ttsState == "synthesizing" ||
+				ttsState == "playing")
+		const speaking = streamSpeaking || ttsSpeaking
+		isSpeaking.value = speaking
+		if (speaking) {
+			startSpeechAnimation()
+		} else {
+			stopSpeechAnimation()
+		}
+	}
+
 	onMounted(() => {
 		startTimer()
 		ttsListenerId = ttsWebSocketPlayer.subscribe(
-			(state: TtsPlaybackState, messageId: string): void => {
-				isSpeaking.value =
-					messageId == msg.value._id &&
-					(state == "connecting" ||
-						state == "synthesizing" ||
-						state == "playing")
-				if (isSpeaking.value) {
-					startSpeechAnimation()
-				} else {
-					stopSpeechAnimation()
-				}
+			(_state: TtsPlaybackState, _eventMessageId: string): void => {
+				// 分句间隙也会 idle：用 isBusy 判定，避免误清；整轮结束靠 notifyUiIdle
+				refreshSpeakingUi()
 			},
 		)
+		audioListenerId = audioPlayerManager.subscribe(
+			(_state: AudioPlayerState, _messageId: string): void => {
+				refreshSpeakingUi()
+			},
+		)
+		// App web-view 内嵌页：原生播报状态变化也会驱动本条播报 UI
+		nativeBridgeListenerId = nativeVoiceBridge.subscribeTts(
+			(_state: NativeTtsBridgeState, _messageId: string, _message: string): void => {
+				refreshSpeakingUi()
+			},
+		)
+		refreshSpeakingUi()
 	})
+
+	// 续接后 msg._id 改写时重算
+	watch(
+		(): string => `${msg.value._id}|${props.isLastMsg == true ? "1" : "0"}`,
+		(): void => {
+			refreshSpeakingUi()
+		},
+	)
 
 	onUnmounted(() => {
 		stopTimer()
@@ -120,6 +224,14 @@
 		if (ttsListenerId > 0) {
 			ttsWebSocketPlayer.unsubscribe(ttsListenerId)
 			ttsListenerId = 0
+		}
+		if (audioListenerId > 0) {
+			audioPlayerManager.unsubscribe(audioListenerId)
+			audioListenerId = 0
+		}
+		if (nativeBridgeListenerId > 0) {
+			nativeVoiceBridge.unsubscribeTts(nativeBridgeListenerId)
+			nativeBridgeListenerId = 0
 		}
 	})
 
@@ -149,45 +261,125 @@
 		})
 	}
 
-	/** 将播报诊断文本转为单行，避免 UTS 在异步函数内解析正则表达式失败。 */
-	const formatSpeechLogText = (text: string): string => {
-		return text.split("\r").join("\\r").split("\n").join("\\n")
+	/** 当前消息是否正被流式播报占用（含续接后 id 改写兜底） */
+	const isStreamSpeakingThisMsg = (): boolean => {
+		const messageId = msg.value._id
+		if (nativeVoiceBridge.isActive() == true) {
+			// App web-view 内嵌页：以原生播报镜像状态为准
+			const speakerId = nativeVoiceBridge.getTtsMessageId()
+			if (nativeVoiceBridge.isTtsBusy() != true) {
+				return false
+			}
+			if (speakerId == messageId) {
+				return true
+			}
+			return (
+				props.isLastMsg == true &&
+				speakerId.length > 0 &&
+				getRewrittenMessageId(speakerId) == messageId
+			)
+		}
+		const speakerId = voiceStreamSpeaker.getMessageId()
+		if (voiceStreamSpeaker.isBusy() != true) {
+			return false
+		}
+		if (speakerId == messageId) {
+			return true
+		}
+		return (
+			props.isLastMsg == true &&
+			speakerId.length > 0 &&
+			getRewrittenMessageId(speakerId) == messageId
+		)
 	}
 
 	/** 播报或停止当前 AI 消息。 */
 	const toggleSpeech = async (): Promise<void> => {
-		const messageId = msg.value._id
-		if (
-			isSpeaking.value &&
-			ttsWebSocketPlayer.getMessageId() == messageId
-		) {
-			ttsWebSocketPlayer.stop()
+		if (nativeVoiceBridge.isActive() == true) {
+			// App web-view 内嵌页：播报 / 停止走原生桥
+			const messageId = msg.value._id
+			if (isSpeaking.value) {
+				const bridgeMatch = nativeVoiceBridge.getTtsMessageId() == messageId
+				const lastMsgFallback =
+					props.isLastMsg == true &&
+					nativeVoiceBridge.isTtsBusy() == true &&
+					getRewrittenMessageId(nativeVoiceBridge.getTtsMessageId()) == messageId
+				if (bridgeMatch || lastMsgFallback) {
+					nativeVoiceBridge.ttsStop()
+					clearSpeakingUi()
+					return
+				}
+			}
+			let speakableText = ""
+			if (props.speakText.length > 0) {
+				speakableText = props.speakText
+			} else {
+				const filterSettings = cloneVoiceSettings(loadVoiceSettings())
+				filterSettings.includeThinkContent = false
+				filterSettings.includeCodeBlocks = false
+				speakableText = cleanTextForSpeech(
+					msg.value.body,
+					filterSettings,
+					true,
+				)
+			}
+			if (speakableText.length == 0) {
+				uni.showToast({
+					title: t("Mobile.Voice.noSpeakableContent"),
+					icon: "none",
+				})
+				return
+			}
+			const speakSettings = cloneVoiceSettings(loadVoiceSettings())
+			// 工具栏手动播放：不受自动播报/静音开关影响，始终出声
+			speakSettings.autoPlay = true
+			speakSettings.muted = false
+			speakSettings.includeThinkContent = false
+			speakSettings.includeCodeBlocks = false
+			const settingsJson = {} as UTSJSONObject
+			settingsJson["autoPlay"] = true
+			settingsJson["muted"] = false
+			settingsJson["includeThinkContent"] = false
+			settingsJson["includeCodeBlocks"] = false
+			settingsJson["includeLinkUrl"] = speakSettings.includeLinkUrl
+			settingsJson["keepEmoji"] = speakSettings.keepEmoji
+			nativeVoiceBridge.ttsSpeak(messageId, speakableText, settingsJson)
+			refreshSpeakingUi()
 			return
 		}
-		const sourceText =
-			props.speakText.length > 0 ? props.speakText : msg.value.body
-		const sourceLogText = formatSpeechLogText(sourceText)
-		console.log(
-			"[TTS] toolbar.source messageId=" +
-				messageId +
-				" textLen=" +
-				sourceText.length +
-				" text=" +
-				sourceLogText
-		)
-		const speakableText = cleanTextForSpeech(
-			sourceText,
-			loadVoiceSettings(),
-		)
-		const speakableLogText = formatSpeechLogText(speakableText)
-		console.log(
-			"[TTS] toolbar.cleaned messageId=" +
-				messageId +
-				" textLen=" +
-				speakableText.length +
-				" text=" +
-				speakableLogText
-		)
+		// H5：浏览器要求 play() 落在用户手势调用栈内，而 TTS 合成是异步的
+		// （WebSocket 往返后才播放），移动端会拦截迟到的 play()（iOS 最严）。
+		// 因此在点击同步阶段先解锁音频通道（幂等；复用同一 InnerAudioContext），
+		// 后续异步播放即被放行。App / 小程序为 no-op。
+		ttsWebSocketPlayer.unlockInGesture()
+		const messageId = msg.value._id
+		// 停止：本条工具栏 TTS 或本条流式续播（含 lastMsg id 改写）
+		if (isSpeaking.value) {
+			const ttsMatch = ttsWebSocketPlayer.getMessageId() == messageId
+			const streamMatch = isStreamSpeakingThisMsg()
+			if (ttsMatch || streamMatch) {
+				voiceStreamSpeaker.stop()
+				ttsWebSocketPlayer.stop()
+				audioPlayerManager.stop()
+				clearSpeakingUi()
+				return
+			}
+		}
+		// 优先用服务层预计算的 speakableText（经 speak-text 传入）；为空再对 body 过滤一次
+		let speakableText = ""
+		if (props.speakText.length > 0) {
+			speakableText = props.speakText
+		} else {
+			const filterSettings = cloneVoiceSettings(loadVoiceSettings())
+			filterSettings.includeThinkContent = false
+			filterSettings.includeCodeBlocks = false
+			// UTS/Android：须显式传第三参，默认参数不会生成二参重载
+			speakableText = cleanTextForSpeech(
+				msg.value.body,
+				filterSettings,
+				true,
+			)
+		}
 		if (speakableText.length == 0) {
 			uni.showToast({
 				title: t("Mobile.Voice.noSpeakableContent"),
@@ -196,9 +388,28 @@
 			return
 		}
 		try {
-			await ttsWebSocketPlayer.play(messageId, speakableText)
+			// 先停掉当前流式/工具栏播报，再开本轮分段 TTS
+			// （speakPrepared→begin 内也会 stop，此处显式打断，避免两路抢音频）
+			voiceStreamSpeaker.stop()
+			ttsWebSocketPlayer.stop()
+			audioPlayerManager.stop()
+			const speakSettings = cloneVoiceSettings(loadVoiceSettings())
+			// 工具栏手动播放：不受自动播报/静音开关影响，始终出声
+			speakSettings.autoPlay = true
+			speakSettings.muted = false
+			speakSettings.includeThinkContent = false
+			speakSettings.includeCodeBlocks = false
+			audioPlayerManager.setMuted(false)
+			ttsWebSocketPlayer.setMuted(false)
+			// 手势栈内同步解锁 H5 音频通道（WebAudio resume + 静音解锁）。
+			// TTS 合成是异步的，若等到 playSrcAndWait 才首次 play() 已不在手势栈内，
+			// iOS Safari 会拦截（NotAllowedError）或播放被打断抛 AbortError。
+			ttsWebSocketPlayer.unlockInGesture()
+			voiceStreamSpeaker.speakPrepared(messageId, speakSettings, speakableText)
+			refreshSpeakingUi()
 		} catch (error: any) {
 			console.error("[TTS] start failed", error)
+			clearSpeakingUi()
 		}
 	}
 </script>
@@ -206,36 +417,30 @@
 <style lang="scss">
 	.tool-bar-container {
 		width: 100%;
-		padding: 8rpx 0 16rpx 0;
 		margin-top: 16rpx;
 		display: flex;
 		flex-direction: row;
 		align-items: center;
 
-		.btn {
-			font-size: 36rpx;
-			margin-right: 32rpx;
+		.tool-btn {
+			width: 72rpx;
+			height: 72rpx;
+			margin-right: 2rpx;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			border-radius: 16rpx;
 			// #ifndef APP
 			cursor: pointer;
-			&:hover {
-				filter: brightness(0.8);
-			}
 			// #endif
 		}
 
-		.speech-btn {
-			width: 48rpx;
-			height: 48rpx;
-			margin-right: 32rpx;
-			display: flex;
-			flex-direction: row;
-			align-items: center;
-			justify-content: center;
-			border-radius: 50%;
+		.tool-btn--active {
+			background-color: rgba(12, 20, 102, 0.06);
 		}
 
-		.speech-btn--active {
-			background-color: rgba(81, 71, 255, 0.1);
+		.tool-btn--pulse {
+			opacity: 0.55;
 		}
 
 		.time {
@@ -244,5 +449,10 @@
 			color: rgba(0, 0, 0, 0.45);
 			font-weight: 400;
 		}
+	}
+
+	/* App：hover-class 用独立顶层类名，避免 iOS 默认黑底闪一下 */
+	.tool-btn-hover {
+		background-color: #f2f3f7 !important;
 	}
 </style>

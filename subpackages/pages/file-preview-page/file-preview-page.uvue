@@ -1,13 +1,13 @@
 <template>
   <view class="container page-container">
     <!-- 导航栏 -->
-    <!-- #ifdef H5 || WEB || MP-WEIXIN -->
-    <custom-nav-bar :title="fileName" show-back>
+    <!-- #ifdef H5 || WEB || MP-WEIXIN || APP-->
+    <custom-nav-bar :title="navTitle" show-back hasSafetyZone>
       <template v-slot:right>
-        <!-- #ifdef H5 || WEB -->
+        <!-- #ifdef H5 || WEB || APP -->
         <svg-icon
-          name="icon-ShareAltOutlined"
-          size="48"
+          name="icon-AppShare"
+          size="44"
           @click="handleShare"
         />
         <!-- #endif -->
@@ -37,12 +37,26 @@
         ></iframe>
         <!-- #endif -->
 
-        <!-- #ifdef MP-WEIXIN || APP -->
+        <!-- #ifdef MP-WEIXIN -->
         <web-view
           class="w-full h-full"
           :src="previewUrl"
           id="webview"
+          @message="onWebViewMessage"
         ></web-view>
+        <!-- #endif -->
+
+        <!-- #ifdef APP -->
+        <web-view
+          class="w-full h-full"
+          :src="previewUrl"
+          id="file-preview-webview"
+          @load="handleAppWebViewLoad"
+          @message="onWebViewMessage"
+        ></web-view>
+        <!-- 不可见 sibling 占位（勿删）：Android 上内容区仅有 web-view 单节点时会走全屏原生层，
+             createWebviewContext 拿不到 context，evalJS 注入平台/下载桥会失效。 -->
+        <view class="file-preview-webview-placeholder" />
         <!-- #endif -->
       </template>
 
@@ -51,19 +65,29 @@
 </template>
 
 <script setup lang="uts">
-  import { ref } from 'vue';
+  import { ref, computed, onMounted, onUnmounted, getCurrentInstance } from 'vue';
   import { onLoad } from "@dcloudio/uni-app";
   // #ifndef APP-ANDROID
   import { onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
   // #endif
+  import { useShareLink, ShareLinkOptions } from "@/hooks/useShareLink";
   import {
     parseUrlInfo,
     getFileName,
   } from "@/subpackages/utils/parseUrlInfo";
-  import { useI18n } from "@/utils/i18n";
+  import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { firstString } from "@/utils/utsCoalesce";
+  import {
+    extractOpenUiArtifactIdFromText,
+    parseOpenUiActionData,
+  } from "@/utils/openUiSchema.uts";
+  import { buildOpenUiResumeMessage } from "@/utils/openUiResumeMessage.uts";
+  import { savePendingOpenUiAction } from "@/utils/pendingOpenUiAction.uts";
 
-  const { t } = useI18n();
+  // 模板内嵌 t(...) 时须包装成单参函数（类字段 t 的 params/fallback 为可选参，
+  // 模板编译产物不传默认值，Kotlin 报 No value passed for parameter）
+  const { t: tFn } = useI18n();
+  const t = (key: string): string => tFn(key, emptyI18nParams(), "");
 
   // 请求工具
   import {
@@ -74,7 +98,11 @@
   import { SUCCESS_CODE } from "@/constants/codes.constants";
 
   // 环境配置
-  import { API_BASE_URL } from "@/constants/config";
+  import { getApiBaseUrl } from "@/constants/config";
+  // #ifdef APP
+  import { downloadFileInApp } from "@/subpackages/utils/fileTree";
+  import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
+  // #endif
 
   const previewUrl = ref<string>(""); // 预览地址
   const fileName = ref<string>(""); // 文件名
@@ -85,6 +113,8 @@
   const conversationId = ref<string | null>(null); // 会话ID
   const fileProxyUrl = ref<string>(""); // 文件路径
   const sk = ref<string>(""); // sk 微信小程序中需要 sk 查询参数
+  /** web-view 可能重复派发同一个 action；页面生命周期内只接受第一次有效提交。 */
+  let hasHandledOpenUiAction = false;
   // #ifdef H5 || WEB
   const isDev = process.env.NODE_ENV == "development";
   // #endif
@@ -92,17 +122,28 @@
   const isDev = false;
   // #endif
 
-  const getShareTitle = (): string => {
+  const instance = getCurrentInstance();
+  // #ifdef APP
+  let previewDownloadBusy = false;
+  // #endif
+
+  // 页面 navigationStyle=custom，uni.setNavigationBarTitle 不会作用于顶部自绘导航栏，
+  // 顶部标题必须由 custom-nav-bar 的 title 绑定驱动：优先目标 HTML 的 <title>，回退文件名。
+  const navTitle = computed<string>((): string => {
     return firstString([pageTitle.value, fileName.value]);
+  });
+
+  const getShareTitle = (): string => {
+    return navTitle.value;
   };
 
   let baseUrl = "";
   // #ifdef H5 || WEB
-  baseUrl = isDev ? API_BASE_URL : (window != null && window.location != null ? window.location.origin : API_BASE_URL);
+  baseUrl = isDev ? getApiBaseUrl() : (window != null && window.location != null ? window.location.origin : getApiBaseUrl());
   // #endif
 
   // #ifdef MP-WEIXIN || APP
-  baseUrl = API_BASE_URL;
+  baseUrl = getApiBaseUrl();
   // #endif
 
   /**
@@ -127,53 +168,52 @@
     return `${shareKey}`;
   }
 
-  // 分享文件
-  const handleShare = async () => {
-    if (baseUrl.length == 0) {
-      uni.showToast({
-        title: t("Mobile.FilePreview.shareDomainMissing"),
-        icon: "none",
-        duration: 2000,
-      });
-      return;
-    }
-
-    try {
-      const cIdVal = conversationId.value != null ? (conversationId.value as string) : "";
-      const shareKey = await getConversationShareKey(
-        cIdVal,
-        fileProxyUrl.value != null ? fileProxyUrl.value : "",
-      );
-
-      const previewUrlValue = `${baseUrl}/static/file-preview.html?sk=${shareKey}`;
-
-      // 复制到剪切板
-      uni.setClipboardData({
-        data: previewUrlValue,
-        success: () => {
-          uni.showToast({
-            title: t("Mobile.FilePreview.shareSuccess"),
-            icon: "none",
-            duration: 2000,
-          });
-        },
-        fail: () => {
-          uni.showToast({
-            title: t("Mobile.FilePreview.shareFailed"),
-            icon: "none",
-            duration: 2000,
-          });
-        },
-      });
-    } catch (error) {
-      console.error("分享失败:", error);
-      uni.showToast({
-        title: t("Mobile.FilePreview.shareFailed"),
-        icon: "none",
-        duration: 2000,
-      });
-    }
+  /**
+   * 分享/外链地址不得携带会话内预览标记 mode=preview。当前分享链接由 shareKey 独立拼接、
+   * 本不含该标记；此处作兜底过滤，防止日后误把带标记的 previewUrl 用于分享场景。
+   */
+  const stripPreviewMode = (url: string): string => {
+    if (url.indexOf("mode=preview") < 0) return url;
+    let s = url.replace("&mode=preview", "");
+    s = s.replace("?mode=preview&", "?");
+    s = s.replace("?mode=preview", "");
+    return s;
   };
+
+  /** 分享链接缓存：同一页面生命周期内只请求一次 shareKey，避免每次操作重复创建分享 */
+  let shareUrlCache: string | null = null;
+
+  /** 生成分享链接：纯 ?sk=，并经 stripPreviewMode 兜底——绝不让会话内预览标记 mode=preview 外泄到分享场景 */
+  const getShareUrl = async (): Promise<string> => {
+    // shareUrlCache 是异步闭包内会改写的 let，不能直接智能判空（Kotlin smart cast 限制），先取快照
+    const cached = shareUrlCache;
+    if (cached != null && cached.length > 0) {
+      return cached;
+    }
+    if (baseUrl.length == 0) {
+      throw new Error(t("Mobile.FilePreview.shareDomainMissing"));
+    }
+    const cIdVal = conversationId.value != null ? (conversationId.value as string) : "";
+    const shareKey = await getConversationShareKey(
+      cIdVal,
+      fileProxyUrl.value != null ? fileProxyUrl.value : "",
+    );
+    const previewUrlValue = stripPreviewMode(
+      `${baseUrl}/static/file-preview.html?sk=${shareKey}`,
+    );
+    shareUrlCache = previewUrlValue;
+    return previewUrlValue;
+  };
+
+  // 分享交互（H5/WEB 直接复制链接 / App 系统分享调起 / 防重 / 复制兜底）统一由 useShareLink 提供，
+  // 与 webview 页共用同一套逻辑；本页只负责“分享链接怎么来”。
+  // 入参须 new + 逐字段赋值（不能传对象字面量，Android UTS 编译器会把字面量误推导成
+  // UTSJSONObject 而报参数类型不匹配，与 usePageResume 的 PageResumeOptions 同一避坑写法）。
+  const shareOptions = new ShareLinkOptions();
+  shareOptions.getShareTitle = getShareTitle;
+  shareOptions.getShareUrl = getShareUrl;
+  const share = useShareLink(shareOptions);
+  const handleShare = share.handleShare;
 
   // 获取 ticket
   const getTicket = async (): Promise<string> => {
@@ -181,43 +221,43 @@
       const res = await apiUserTicketCreate();
       const code = res.code;
       const data = res.data;
-
-      return code == SUCCESS_CODE && data != null ? `${data}` : "";
+      if (code != SUCCESS_CODE || data == null) {
+        console.warn(`[FilePreview] apiUserTicketCreate failed: code=${code}`);
+        return "";
+      }
+      return `${data}`;
     } catch (e) {
-      console.log(e);
+      console.warn("[FilePreview] apiUserTicketCreate error:", e);
       return "";
     }
   };
 
-  // 设置 html 文件标题
-  const setHtmlTitle = (url: string) => {
-    uni.request({
-      url: url,
-      method: "GET",
-      success: (res) => {
-        // #ifdef H5 || WEB
-        const data = res.data;
-        const html = data as string;
-        const title = extractTitleFromHtml(html);
-        if (title != null && title.length > 0) {
-          pageTitle.value = title;
-          uni.setNavigationBarTitle({
-            title: title,
-          });
-        }
-        // #endif
-      },
-      fail: (err) => {
-        console.error("获取 html 失败", err);
-      },
-    });
+  /** 仅 html/htm 需要抓 <title>，其他类型（pdf/图片等）不必整包下载 */
+  const isHtmlFile = (name: string): boolean => {
+    const lower = name.toLowerCase();
+    return lower.endsWith(".html") || lower.endsWith(".htm");
   };
 
-  // 从 html 中提取 <title> 内容（H5/WEB 专用）
-  // #ifdef H5 || WEB
+  /**
+   * 解码 <title> 中的常见 HTML 实体。
+   * 用 split/join 而非 replace：UTS 在 Android(Kotlin) 与 JS 端 replace 的
+   * 「首个/全部」语义不一致，split/join 两端行为统一。
+   */
+  const decodeHtmlEntities = (text: string): string => {
+    let s = text.split("&lt;").join("<");
+    s = s.split("&gt;").join(">");
+    s = s.split("&quot;").join('"');
+    s = s.split("&#39;").join("'");
+    s = s.split("&nbsp;").join(" ");
+    // &amp; 必须最后处理，否则 &amp;lt; 会被二次解码
+    s = s.split("&amp;").join("&");
+    return s;
+  };
+
+  // 从 html 中提取 <title> 内容（全平台）
   function extractTitleFromHtml(html: string): string {
-    const startTag = "<title";
-    const startIdx = html.toLowerCase().indexOf(startTag);
+    const lower = html.toLowerCase();
+    const startIdx = lower.indexOf("<title");
     if (startIdx < 0) {
       return "";
     }
@@ -225,15 +265,42 @@
     if (closeStart < 0) {
       return "";
     }
-    const endTag = "</title>";
-    const endIdx = html.toLowerCase().indexOf(endTag, closeStart + 1);
+    const endIdx = lower.indexOf("</title>", closeStart + 1);
     if (endIdx < 0) {
       return "";
     }
     const raw = html.substring(closeStart + 1, endIdx);
-    return raw.trim();
+    // 换行/多空格压成单空格，避免多行 <title> 在导航栏显示成断行文本
+    const collapsed = raw.split("\n").join(" ").split("\r").join(" ").split("\t").join(" ");
+    return decodeHtmlEntities(collapsed).trim();
   }
-  // #endif
+
+  // 拉取目标 HTML 并把 <head> 中的 <title> 写入顶部标题栏（全平台生效）
+  const setHtmlTitle = (url: string) => {
+    uni.request({
+      url: url,
+      method: "GET",
+      // 鸿蒙/小程序默认按 JSON 解析，必须显式声明文本，否则 HTML 会被当 JSON 解析失败
+      responseType: "text",
+      dataType: "text",
+      success: (res) => {
+        const data = res.data;
+        if (data == null) return;
+        // App/小程序端 res.data 为 any：非字符串时不做解析，避免强转崩溃
+        if (typeof data != "string") return;
+        const title = extractTitleFromHtml(data as string);
+        if (title.length == 0) return;
+        pageTitle.value = title;
+        // 自绘导航栏由 navTitle 驱动；此处仅同步 H5 浏览器标签页 / 原生标题
+        uni.setNavigationBarTitle({
+          title: title,
+        });
+      },
+      fail: (err) => {
+        console.error("获取 html 失败", err);
+      },
+    });
+  };
 
   async function runOnLoad(options: any): Promise<void> {
     const opts = options as UTSJSONObject;
@@ -276,7 +343,6 @@
     const parts = fileNameValue.split(".");
     const fileTypeValue = parts.length > 0 ? parts[parts.length - 1] : "";
     fileType.value = fileTypeValue;
-
     try {
       const skValue = query["sk"];
       if (skValue != null && skValue.length > 0) {
@@ -284,31 +350,41 @@
         sk.value = skValue;
         previewUrl.value = `${baseUrl}/static/file-preview.html?sk=${skValue}`;
         // 设置 html 文件标题
-        setHtmlTitle(baseUrl + fileProxyUrl.value + "?sk=" + skValue);
+        if (isHtmlFile(fileNameValue)) {
+          setHtmlTitle(baseUrl + fileProxyUrl.value + "?sk=" + skValue);
+        }
       } else {
         // 没有 sk 参数，需要获取 shareKey 和 _ticket
         // 1. 获取 shareKey 用于后续分享功能
         let shareKey = await getConversationShareKey(cId, path);
         sk.value = shareKey;
-        const fileUrl = encodeURIComponent(`${fileProxyUrl.value}`);
+        // 服务端 _ticket 分支要求 fileUrl 为「完整绝对 URL」；网关页 getQueryParams 仅单次 decode。
+        // 故先拼绝对地址，再只对值做一次 encodeURIComponent（不要在 baseUrl 之后二次编码）。
+        const fileUrl = encodeURIComponent(`${baseUrl}${fileProxyUrl.value}`);
 
-        // #ifdef H5 || WEB
-        if (isDev == true) {
-          // _sk 用于下载功能，_ticket 用于当前页面访问（_ticket 只能消费一次，适合当前用户自己访问）
-          const _ticket = await getTicket();
-          previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${baseUrl + fileUrl}&_ticket=${_ticket}&_sk=${shareKey}`;
-        } else {
-          previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${baseUrl + fileUrl}&sk=${shareKey}`;
-        }
-        // #endif
-
-        // #ifdef MP-WEIXIN || APP
-        // _sk 用于下载功能，_ticket 用于当前页面访问（_ticket 只能消费一次，适合当前用户自己访问）
+        // H5 / App / 小程序会话内预览统一走 _ticket（isChat=true，OpenUI 可提交）。
+        // _sk 用于下载；ticket 失败时回退顶层 sk（分享只读，表单不可回写会话）。
         const _ticket = await getTicket();
-        previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${baseUrl + fileUrl}&_ticket=${_ticket}&_sk=${shareKey}`;
-        // 设置 html 文件标题
-        setHtmlTitle(baseUrl + fileProxyUrl.value + "?sk=" + shareKey);
-        // #endif
+        if (_ticket.length > 0) {
+          previewUrl.value = `${baseUrl}/static/file-preview.html?fileUrl=${fileUrl}&_ticket=${_ticket}&_sk=${shareKey}`;
+        } else {
+          // ticket 签发失败（如 /api/user/ticket/create 返回 0001）→ 统一回退顶层 ?sk=。
+          // 网关 startPreview 只在 _ticket 分支才读 params.fileUrl（file-preview.js:351）；
+          // fileUrl+_sk 无对应分支，且 _sk 仅用于 _ticket 分支的下载地址、不参与访问校验 →
+          // 走 fileUrl+_sk 网关会报 "File URL not provided"。顶层 sk 经 /share/detail/{sk}
+          // 校验访问并定位资源，是渲染的前提，故 OpenUI/非 OpenUI 一律用 sk。
+          // 但 sk 也是分享链接用的参数，单凭 sk 网关/后端无法区分「会话内预览」与「外部分享」，
+          // 故额外带 mode=preview 打标预览态。分享按钮（handleShare / 微信 onShareAppMessage）
+          // 独立拼 ?sk=、不读 previewUrl，天然不带此标记（_ticket 主分支自带 _ticket，亦无需此标记）。
+          // 代价：sk 为分享只读态，OpenUI 表单不能提交回会话（isChat=!!_ticket=false）；
+          // 待后端修复 ticket 接口、能拿到 _ticket 后自动恢复可提交的 _ticket 主分支。
+          console.warn(`[FilePreview] ticket empty, fallback to sk share preview. cId=${cId}`);
+          previewUrl.value = `${baseUrl}/static/file-preview.html?sk=${shareKey}&mode=preview`;
+        }
+        // 设置 html 文件标题（H5 之前漏调，导致同一份 HTML 在 H5 只显示文件名）
+        if (isHtmlFile(fileNameValue)) {
+          setHtmlTitle(baseUrl + fileProxyUrl.value + "?sk=" + shareKey);
+        }
       }
     } catch (error) {
       console.error("构建预览URL失败:", error);
@@ -316,6 +392,203 @@
       isLoading.value = false;
     }
   }
+
+  /**
+   * 处理已解析的 OpenUI action：校验契约与 artifact → 构建续作消息 → 暂存并返回会话页。
+   * App/小程序走 web-view @message；H5 走 iframe parent postMessage，共用本函数。
+   */
+  const handleOpenUiAction = (action: UTSJSONObject): void => {
+    if (hasHandledOpenUiAction) return;
+    if (
+      `${action["type"]}` != "nuwax.openui-action" ||
+      `${action["schemaVersion"]}` != "nuwax.openui-action/v1"
+    ) {
+      return;
+    }
+    const expectedArtifactId = extractOpenUiArtifactIdFromText(
+      fileProxyUrl.value,
+    );
+    if (
+      expectedArtifactId.length > 0 &&
+      (`${action["artifactId"]}` != expectedArtifactId ||
+        `${action["artifactPath"]}` !=
+          `data/${expectedArtifactId}.openui.json`)
+    ) {
+      return;
+    }
+    const cIdStr = conversationId.value;
+    if (cIdStr == null) return;
+    const cid = parseInt(cIdStr, 10);
+    if (!(cid > 0)) return;
+    const message = buildOpenUiResumeMessage(
+      action,
+      fileName.value.length > 0 ? fileName.value : "OpenUI",
+    );
+    if (message.trim().length == 0) return;
+    hasHandledOpenUiAction = true;
+    savePendingOpenUiAction(cid, message);
+    // storage 为同步写入；返回会话页后 onShow 消费并复用 ask-question 同款发送入口。
+    uni.navigateBack({ delta: 1 });
+  };
+
+  // #ifdef APP
+  /**
+   * App 预览 web-view：load 完成后写入平台；收到下载约定后走原生 downloadFileInApp。
+   */
+  function getAppPreviewPlatform(): string {
+    // #ifdef APP-IOS
+    return "ios";
+    // #endif
+    // #ifdef APP-HARMONY
+    return "harmony";
+    // #endif
+    return "android";
+  }
+
+  /** web-view @load：注入 window.__nuwaxAppPlatform。 */
+  function handleAppWebViewLoad(_e: any): void {
+    fixAppWebviewTextZoom();
+    try {
+      const ctx = uni.createWebviewContext(
+        "file-preview-webview",
+        instance != null ? instance.proxy : null,
+      );
+      if (ctx == null) {
+        return;
+      }
+      ctx.evalJS(
+        "(function(){try{window.__nuwaxAppPlatform='" +
+          getAppPreviewPlatform() +
+          "';}catch(e){}})()",
+      );
+    } catch (_err) {
+      // web-view 未就绪时 createWebviewContext / evalJS 可能抛错
+    }
+  }
+
+  /**
+   * 原生 @message 的 detail.data 一般为数组，偶发再包一层 { data }。
+   * 命中 { type:'download', action:'downloadCurrentFile' } 则为下载约定。
+   */
+  function isPreviewDownloadMessage(data: any | null): boolean {
+    if (data == null) {
+      return false;
+    }
+    let items: any[] = [];
+    if (Array.isArray(data)) {
+      items = data as any[];
+    } else {
+      items = [data];
+    }
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item == null) {
+        continue;
+      }
+      try {
+        const obj = item as UTSJSONObject;
+        const typeStr = obj["type"] != null ? `${obj["type"]}` : "";
+        const actionStr = obj["action"] != null ? `${obj["action"]}` : "";
+        if (typeStr == "download" && actionStr == "downloadCurrentFile") {
+          return true;
+        }
+        const nested = obj["data"];
+        if (nested != null) {
+          const inner = nested as UTSJSONObject;
+          const nestedType = inner["type"] != null ? `${inner["type"]}` : "";
+          const nestedAction = inner["action"] != null ? `${inner["action"]}` : "";
+          if (nestedType == "download" && nestedAction == "downloadCurrentFile") {
+            return true;
+          }
+        }
+      } catch (_e) {
+        continue;
+      }
+    }
+    return false;
+  }
+
+  /** 下载当前预览文件（与工作台同一套 downloadFileInApp）。 */
+  function runCurrentFileDownload(): void {
+    if (previewDownloadBusy) {
+      return;
+    }
+    const path = fileProxyUrl.value;
+    if (path.length == 0) {
+      uni.showToast({
+        title: t("Mobile.FilePreview.invalidParams"),
+        icon: "none",
+      });
+      return;
+    }
+    let url = `${baseUrl}${path}`;
+    const skVal = sk.value;
+    if (skVal.length > 0) {
+      url = url + (url.indexOf("?") >= 0 ? "&" : "?") + "sk=" + skVal;
+    }
+    const name = fileName.value.length > 0 ? fileName.value : "file";
+    previewDownloadBusy = true;
+    downloadFileInApp(url, name).then(
+      (_saved: string) => {
+        previewDownloadBusy = false;
+      },
+      (_err: any) => {
+        previewDownloadBusy = false;
+      },
+    );
+  }
+  // #endif
+
+  // <web-view> @message：OpenUI 表单提交，或 App 预览页下载当前文件。
+  const onWebViewMessage = (e: UniWebViewMessageEvent): void => {
+    // UniWebViewMessageEvent 是原生强类型对象，Android 上不可整体强转 UTSJSONObject；
+    // 直接读取其公开字段，再交给跨平台解析器处理消息数组。
+    // #ifdef APP
+    if (isPreviewDownloadMessage(e.detail.data)) {
+      runCurrentFileDownload();
+      return;
+    }
+    // #endif
+    const action = parseOpenUiActionData(e.detail.data);
+    if (action == null) return;
+    handleOpenUiAction(action);
+  };
+
+  // #ifdef H5 || WEB
+  /**
+   * H5 iframe：file-preview-openui.js 经 notifyParent → window.parent.postMessage
+   * 投递 { type: 'OPENUI_ACTION', event }，与 App web-view 桥接语义对齐。
+   */
+  const onH5OpenUiMessage = (event: any): void => {
+    try {
+      // H5 MessageEvent：与 uni-ai-x proxy-web 相同，直接读 event.data / event.origin
+      if (event == null || event.data == null) return;
+      const origin = event.origin != null ? `${event.origin}` : "";
+      // 限制来源为本站预览网关（dev 下 baseUrl=API；prod 下为 location.origin）
+      if (
+        origin.length > 0 &&
+        baseUrl.length > 0 &&
+        origin.indexOf(baseUrl) != 0 &&
+        origin != window.location.origin
+      ) {
+        return;
+      }
+      const action = parseOpenUiActionData(event.data);
+      if (action == null) return;
+      handleOpenUiAction(action);
+    } catch (_e) {
+      // ignore malformed postMessage
+    }
+  };
+
+  onMounted(() => {
+    window.addEventListener("message", onH5OpenUiMessage);
+  });
+
+  onUnmounted(() => {
+    window.removeEventListener("message", onH5OpenUiMessage);
+  });
+  // #endif
 
   onLoad((options: any) => {
     runOnLoad(options);
@@ -357,6 +630,13 @@
 
     .file-preview-content {
       flex: 1;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .file-preview-webview-placeholder {
+      width: 0;
+      height: 0;
       overflow: hidden;
     }
 

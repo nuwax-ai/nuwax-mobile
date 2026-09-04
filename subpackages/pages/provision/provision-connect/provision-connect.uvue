@@ -25,8 +25,12 @@
         <text class="status__text status__text--fail">{{ t('Mobile.Provision.Connect.failed') }}</text>
         <text class="status__reason">{{ failReason }}</text>
         <view class="status__btn-group">
-          <view class="status__btn status__btn--primary" hover-class="status__btn--hover" @tap="onRetry">
-            <text class="status__btn-text status__btn-text--primary">{{ t('Mobile.Provision.Connect.retry') }}</text>
+          <!-- 蓝牙/位置信息未开启是可直接解决的环境问题，给一个跳系统设置的入口 -->
+          <view v-if="settingsBtnText != ''" class="status__btn status__btn--primary" hover-class="status__btn--hover" @tap="onOpenSystemSetting">
+            <text class="status__btn-text status__btn-text--primary">{{ settingsBtnText }}</text>
+          </view>
+          <view :class="settingsBtnText != '' ? 'status__btn status__btn--plain' : 'status__btn status__btn--primary'" hover-class="status__btn--hover" @tap="onRetry">
+            <text :class="settingsBtnText != '' ? 'status__btn-text status__btn-text--plain' : 'status__btn-text status__btn-text--primary'">{{ t('Mobile.Provision.Connect.retry') }}</text>
           </view>
           <view class="status__btn status__btn--plain" hover-class="status__btn--hover" @tap="onBackToScan">
             <text class="status__btn-text status__btn-text--plain">{{ t('Mobile.Provision.Connect.backToScan') }}</text>
@@ -40,11 +44,14 @@
 <script setup lang="uts">
   import CustomNavBar from "@/components/custom-nav-bar/custom-nav-bar.uvue";
   import { ref, computed } from "vue";
-  import { onLoad } from "@dcloudio/uni-app";
+  import { onLoad, onReady, onUnload } from "@dcloudio/uni-app";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
-  import { useEspProvisioning } from "@/hooks/useEspProvisioning";
-  import { getQrPayload } from "@/utils/provisionSession";
+  import { useEspProvisioning, releaseEspProvisioning } from "@/hooks/useEspProvisioning";
+  import { getQrPayload, clearProvisionSession } from "@/utils/provisionSession";
   import { EspProvisioningPhaseEnum } from "@/types/enums/espProvisioning";
+  // #ifdef APP-ANDROID
+  import { openAndroidBluetoothSettings, openAndroidLocationSettings } from "@/utils/provisioning/androidBleEnvironment";
+  // #endif
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -54,6 +61,8 @@
 
   const deviceName = ref<string>("");
   const isFailed = ref<boolean>(false);
+  let pageActive = true;
+  let leavingForward = false;
 
   const statusText = computed((): string => {
     const p = phase.value;
@@ -72,6 +81,30 @@
     return t(e.i18nKey);
   });
 
+  /** 环境类失败（蓝牙/位置信息没开）才展示跳系统设置的按钮，其余失败保持原两按钮布局。 */
+  const settingsBtnText = computed((): string => {
+    const e = error.value;
+    if (e == null) return "";
+    if (e.i18nKey == "Mobile.Provision.Error.bluetoothOff") return t("Mobile.Provision.Scan.openBluetooth");
+    if (e.i18nKey == "Mobile.Provision.Error.locationOff") return t("Mobile.Provision.Scan.openLocation");
+    return "";
+  });
+
+  const onOpenSystemSetting = () => {
+    const e = error.value;
+    const needLocation = e != null && e!!.i18nKey == "Mobile.Provision.Error.locationOff";
+    // #ifdef APP-ANDROID
+    if (needLocation) {
+      openAndroidLocationSettings();
+    } else {
+      openAndroidBluetoothSettings();
+    }
+    // #endif
+    // #ifndef APP-ANDROID
+    uni.openAppAuthorizeSetting({});
+    // #endif
+  };
+
   const run = async () => {
     const qr = getQrPayload();
     if (qr == null) {
@@ -81,9 +114,17 @@
     deviceName.value = qr.name;
     isFailed.value = false;
     const ok = await controller.selectAndPrepareFromQr();
+    if (!pageActive) return;
     if (ok && controller.phase.value == EspProvisioningPhaseEnum.READY) {
       // 连接成功，直接进 WiFi 选择页（replace，不让用户返回到这个 loading 页）
-      uni.redirectTo({ url: "/subpackages/pages/provision/provision-wifi/provision-wifi" });
+      leavingForward = true;
+      uni.redirectTo({
+        url: "/subpackages/pages/provision/provision-wifi/provision-wifi",
+        fail: () => {
+          leavingForward = false;
+          isFailed.value = true;
+        },
+      });
     } else {
       isFailed.value = true;
     }
@@ -98,7 +139,25 @@
   };
 
   onLoad((_options: OnLoadOptions) => {
-    run();
+    pageActive = true;
+  });
+
+  onReady(() => {
+    // 页面渲染完成 + 缓冲后再初始化：若 BLE 权限尚未授予（入口页预请求被拒），
+    // 此时再发起系统权限请求会紧跟扫码的相机权限弹窗，须避开页面过渡窗口，
+    // 否则第二次权限弹窗可能被 Android 延后显示/丢弃 → 卡「正在连接设备…」。
+    setTimeout(() => {
+      if (pageActive) run();
+    }, 400) as number;
+  });
+
+  onUnload(() => {
+    pageActive = false;
+    // redirect 到 WiFi 页时保留 Security 2 会话；用户返回/取消时必须释放扫描与 GATT。
+    if (!leavingForward) {
+      releaseEspProvisioning();
+      clearProvisionSession();
+    }
   });
 </script>
 
@@ -121,6 +180,7 @@
   }
 
   .status {
+    width: 100%;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -134,7 +194,7 @@
       align-items: center;
       justify-content: center;
       margin-bottom: 32rpx;
-}
+    }
 
     &__fail-icon {
       font-size: 72rpx;
@@ -163,6 +223,7 @@
       font-size: 26rpx;
       color: #999;
       text-align: center;
+      width: 80%;
       margin-bottom: 48rpx;
       line-height: 1.5;
     }
@@ -214,8 +275,8 @@
 
   /* 呼吸雷达动效（与 progress 页一致） */
   .radar {
-    width: 320rpx;
-    height: 320rpx;
+    width: 280rpx;
+    height: 280rpx;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -230,13 +291,20 @@
       height: 240rpx;
       border-radius: 50%;
       border: 2rpx solid rgba(81, 71, 255, 0.5);
-      transform: translate(-50%, -50%) scale(0.5);
-      opacity: 0;
-&--2 {
-}
+      transform: translate(-50%, -50%);
+      opacity: 0.25;
+
+      &--2 {
+        width: 200rpx;
+        height: 200rpx;
+        opacity: 0.4;
+      }
 
       &--3 {
-}
+        width: 176rpx;
+        height: 176rpx;
+        opacity: 0.6;
+      }
     }
 
     &__core {
@@ -247,16 +315,11 @@
       display: flex;
       align-items: center;
       justify-content: center;
-}
+    }
 
     &__core-icon {
       font-size: 72rpx;
     }
   }
 
-  
-
-  
-
-  
 </style>

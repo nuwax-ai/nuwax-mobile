@@ -1,0 +1,414 @@
+/**
+ * Nuwax Stream PCM Player（App-iOS）
+ *
+ * 包装同目录 StreamPcmPlayerBridge.swift（AVAudioEngine + AVAudioPlayerNode 流式 PCM16 播放）：
+ * UTS 接口与 app-android 完全一致，ttsWebSocketPlayer 以平台条件编译引用同一模块。
+ */
+// iOS 混编：同目录 StreamPcmPlayerBridge.swift 的 public 类对 UTS 直接可见（无需 import）
+
+export class StreamPcmPlayer {
+  private bridge: StreamPcmPlayerBridge = new StreamPcmPlayerBridge()
+
+  /** 创建并启动 AVAudioEngine（16kHz mono PCM16） */
+  initPlayer(sampleRate: number): void {
+    this.bridge.initPlayer(sampleRate)
+  }
+
+  /**
+   * 推入一帧 base64 编码的 PCM16 LE 字节。
+   * 注意：iOS 桥接把 Uint8Array 参数当 model 解析会崩（SIGILL /
+   * dcUTS_modelWithDictionary），音频数据只能走 base64 字符串跨桥
+   * （Android 端桥接支持 Uint8Array，仍走 push(Uint8Array)）。
+   */
+  pushBase64(b64: string): void {
+    if (b64 == null || b64.length == 0) {
+      return
+    }
+    this.bridge.pushBase64(b64)
+  }
+
+  /** 冲刷积压：把攒批的字节一次性交给 Swift（调度排队的 buffer） */
+  flushPending(): void {
+    this.bridge.flushPending()
+  }
+
+  /** 攒够起始缓冲后开始播放（幂等） */
+  ensurePlaying(): void {
+    this.flushPending()
+    this.bridge.ensurePlaying()
+  }
+
+  /** 立即开始播放（幂等；输入结束时强制用） */
+  playNow(): void {
+    this.flushPending()
+    this.bridge.playNow()
+  }
+
+  /** 静音开关 */
+  setMuted(muted: boolean): void {
+    this.bridge.setMuted(muted)
+  }
+
+  getWrittenMs(): number {
+    return this.bridge.getWrittenMs()
+  }
+
+  /** 已入队（≈已调度）的 PCM 总时长（ms）；排空判定用。scheduleBuffer 模型下
+   *  调度即入队，故等价 writtenMs（ttsWebSocketPlayer.checkNativeDrain 兜底 deadline 用） */
+  getEnqueuedMs(): number {
+    return this.bridge.getWrittenMs()
+  }
+
+  getPlayedMs(): number {
+    return this.bridge.getPlayedMs()
+  }
+
+  isDrained(): boolean {
+    return this.bridge.isDrained()
+  }
+
+  hasPendingAudio(): boolean {
+    return this.bridge.hasPendingAudio()
+  }
+
+  releasePlayer(): void {
+    // 诊断：因背压被丢弃的字节数（正常播放应为 0，>0 说明生产远快于播放）
+    // 注意：Swift 桥的 getDroppedBytes() 返回 NSNumber，直接 `'str' + 桥返回值`
+    // 会被编成 `String + NSNumber`，iOS 编译必炸；模板字符串走 Swift 插值才安全。
+    console.log(
+      `[StreamPcmPlayer] release droppedBytes=${this.bridge.getDroppedBytes()}`,
+    )
+    this.bridge.releasePlayer()
+  }
+}
+
+// ==================== 原生录音（AVAudioEngine inputNode tap → PCM 文件 + 实时帧转发） ====================
+
+/** 录音开始回调（res 无内容，仅通知「已开录」，对齐 RecorderManager.onStart 语义） */
+export type NativeRecorderStartCallback = (res: UTSJSONObject | null) => void
+/** 录音结束回调（res 携带 tempFilePath/duration/fileSize/format，对齐 RecorderManager.onStop） */
+export type NativeRecorderStopCallback = (res: UTSJSONObject | null) => void
+/** 录音失败回调（err 携带 errMsg） */
+export type NativeRecorderErrorCallback = (err: UTSJSONObject | null) => void
+/** 实时 PCM 帧回调（chunk 为 16kHz mono PCM16 LE 裸字节；主线程回调；一次性全新 ArrayBuffer） */
+export type NativeRecorderFrameCallback = (chunk: ArrayBuffer) => void
+
+/**
+ * 原生录音器（App-iOS）
+ *
+ * 包装 StreamPcmRecorderBridge.swift（AVAudioEngine inputNode tap，16kHz mono Int16 隐式 SRC）。
+ * 与 Player 桥一致采用「纯拉取式」：PCM 帧走 base64 字符串跨桥（Uint8Array 跨桥当 model 解析会崩，
+ * 见 StreamPcmPlayer.pushBase64 注释），UTS 侧 20ms 轮询拉取 onStart/onFrame/onError/onStop 状态。
+ * 录音与 TTS 播放共用 AVAudioSession（.playAndRecord），与 Android/鸿蒙 StreamPcmRecorder 接口一致。
+ */
+export class StreamPcmRecorder {
+  private bridge: StreamPcmRecorderBridge = new StreamPcmRecorderBridge()
+  private polling: boolean = false
+  private pollTimer: number = 0
+  private onStartCb: NativeRecorderStartCallback | null = null
+  private onStopCb: NativeRecorderStopCallback | null = null
+  private onErrorCb: NativeRecorderErrorCallback | null = null
+  private onFrameCb: NativeRecorderFrameCallback | null = null
+  /** 是否已回传 onStart（幂等） */
+  private startReported: boolean = false
+  /** 是否已回传 onStop（幂等） */
+  private stopReported: boolean = false
+  /** 是否已回传 onError（幂等） */
+  private errorReported: boolean = false
+  /** 本轮是否由业务层显式 stop()（松手 / discard）。
+   *  仅此时才允许「曾开录但 Swift 未置 stopped」的 onStop 兜底；
+   *  轮询中 startReported && !hasStopped 是正常在录，绝不能当松手。 */
+  private userStopRequested: boolean = false
+  /** 诊断拉取节拍（每 25 轮 ≈ 500ms 拉一次 Swift 诊断缓冲，绕开 NSLog 不进 App 日志的问题） */
+  private diagTick: number = 0
+
+  onStart(callback: NativeRecorderStartCallback | null): void {
+    this.onStartCb = callback
+  }
+
+  onStop(callback: NativeRecorderStopCallback | null): void {
+    this.onStopCb = callback
+  }
+
+  onError(callback: NativeRecorderErrorCallback | null): void {
+    this.onErrorCb = callback
+  }
+
+  /**
+   * 注册实时 PCM 帧回调（边说边传 ASR 用）：写文件与帧转发并行，文件仍为兜底。
+   * chunk 为 16kHz mono PCM16 LE 裸字节（长度任意偶数），主线程回调，一次性 ArrayBuffer。
+   */
+  onFrame(callback: NativeRecorderFrameCallback | null): void {
+    this.onFrameCb = callback
+  }
+
+  /**
+   * 进入会话页时预热：配好 playAndRecord，并空跑一次 engine 打掉自惹 interruption。
+   * 用户按下后只重新挂 tap，首帧不再空等 1s、也不会被自愈重启切掉开头。
+   */
+  prepareSession(): void {
+    this.bridge.prepareSession()
+  }
+
+  /**
+   * 开始录音。options 仅取 duration（毫秒，到时自动停止）；采样率/声道/格式固定
+   * 16kHz mono PCM16（ASR 协议硬编码）。录音文件写 NSTemporaryDirectory/nuwax_voice_record.pcm。
+   */
+  start(options: RecorderManagerStartOptions | null): void {
+    // 复用实例：先收尾旧轮（不回传 onStop，避免旧回调污染新会话）
+    this.stopPolling()
+    // iOS 桥对 RecorderManagerStartOptions 对象参数跨桥不可靠（曾 startByJs 恒报
+    // method call failed、Swift start 从未进入）：改调无参 Swift start()（时长固定 600000ms，
+    // 与 UTS 默认值/上限一致）。options 仅作兼容保留，本实现不再读取。
+    console.log(`[PCMRec-UTS] wrapper start() called options=${options != null}`)
+    this.startReported = false
+    this.stopReported = false
+    this.errorReported = false
+    this.userStopRequested = false
+    this.diagTick = 0
+    this.bridge.start()
+    console.log("[PCMRec-UTS] bridge.start() returned")
+    const d0 = this.bridge.takeDiag()
+    if (d0.length > 0) {
+      console.log("[PCMRec-DIAG] " + d0)
+    }
+    this.polling = true
+    this.pollTimer = setInterval((): void => {
+      this.pollOnce()
+    }, 20) as number
+  }
+
+  /** 停止录音（松手）：桥内收尾后先直接投递 onStop（不依赖 pollOnce 帧循环可能阻塞），再补拉尾帧 */
+  stop(): void {
+    this.userStopRequested = true
+    this.bridge.stop()
+    console.log(`[PCMRec-UTS] stop() hs=${this.bridge.hasStopped()} polling=${this.polling} stopCb=${this.onStopCb != null}`)
+    // stop 后轮询即将停止，先拉一次诊断（含 finishInternal 的 running/started 状态），
+    // 否则 onStop 是否真的触发的关键状态会随轮询停止而丢失
+    const d = this.bridge.takeDiag()
+    if (d.length > 0) {
+      console.log("[PCMRec-DIAG] " + d)
+    }
+    // 先投递 onStop（帧循环在 pollOnce 里且可能因 pipeline.feed/WS 发送而慢，会拖住 onStop）
+    this.deliverStopIfStopped()
+    this.pollOnce()
+    this.stopPolling()
+  }
+
+  /**
+   * 主动请求麦克风权限（首次按下预检）：触发系统授权窗。
+   * 结果经 permissionResolved / permissionGranted 轮询拉取。
+   * 仅 app-ios 有实现（Android/鸿蒙权限走 UTSAndroid/UTSHarmony，不调用本方法）。
+   */
+  requestRecordPermission(): void {
+    this.bridge.requestRecordPermission()
+  }
+
+  /** 系统授权是否已出结果（用户已应答 / 状态已确定）。真值判断（iOS 桥 Bool == true 恒不成立） */
+  permissionResolved(): boolean {
+    const v = this.bridge.permissionResolved()
+    if (v) {
+      return true
+    }
+    return false
+  }
+
+  /** 授权结果：true 已授权 / false 拒绝（仅在 permissionResolved 后有效）。真值判断同上 */
+  permissionGranted(): boolean {
+    const v = this.bridge.permissionGranted()
+    if (v) {
+      return true
+    }
+    return false
+  }
+
+  /** 释放（页面销毁 / 弃用）：不回传 onStop */
+  releaseRecorder(): void {
+    this.stopPolling()
+    this.bridge.release()
+  }
+
+  /** 20ms 轮询：拉取 onError / onStart / onFrame / onStop 状态（stop 时同步调一次立即生效） */
+  private pollOnce(): void {
+    if (this.polling != true) {
+      return
+    }
+    // 错误优先：桥内错误 → 回传一次 onError 并停止轮询
+    if (this.errorReported != true) {
+      const err = this.bridge.takeError()
+      if (err.length > 0) {
+        this.errorReported = true
+        this.stopPolling()
+        const cb = this.onErrorCb
+        if (cb != null) {
+          const errObj = new UTSJSONObject()
+          errObj["errMsg"] = err
+          errObj["errSubject"] = "StreamPcmRecorder"
+          cb(errObj)
+        }
+        return
+      }
+    }
+    // 诊断：每 25 轮（≈500ms）拉一次 Swift 诊断缓冲并打印（仅拉取非空，避免刷屏）
+    this.diagTick += 1
+    if (this.diagTick % 25 == 0) {
+      const d = this.bridge.takeDiag()
+      if (d.length > 0) {
+        console.log("[PCMRec-DIAG] " + d)
+      }
+      console.log(`[PCMRec-UTS] poll started=${this.bridge.hasStarted()} running=${this.bridge.isRunningNow()} startRpt=${this.startReported} errRpt=${this.errorReported}`)
+    }
+    // onStart：必须等首帧（hasStarted）。引擎 running 不等于已在采音——
+    // iOS 自惹 interruption 期间 engine.start ok 但 tap 可能暂停，过早 onStart
+    // 会让自愈窗口切到 0.5s，把正常抖动误判成断流并 restartCapture → 只剩 100ms 音频。
+    if (this.startReported == false) {
+      const hs = this.bridge.hasStarted()
+      if (hs) {
+        console.log("[PCMRec-UTS] onStart delivered")
+        this.startReported = true
+        const cb = this.onStartCb
+        if (cb != null) {
+          cb(null)
+        }
+      }
+    }
+    // 帧：拉空 pending（base64 → ArrayBuffer → onFrame）。
+    // 注意：iOS 桥返回的 Swift Bool 用 `== true` 严格比较恒不成立（装箱值），
+    // 必须取局部变量用真值判断——此前 `hasPendingChunk() == true` 让帧从不交给
+    // VAD/管线，是「说话却不触发 VAD」的根因。
+    let hasChunk = this.bridge.hasPendingChunk()
+    while (hasChunk) {
+      const b64 = this.bridge.takePendingChunk()
+      if (b64.length == 0) {
+        break
+      }
+      let ab: ArrayBuffer | null = null
+      try {
+        ab = uni.base64ToArrayBuffer(b64)
+      } catch (_eB64) {
+        ab = null
+      }
+      if (ab != null && ab!.byteLength > 0) {
+        const cb = this.onFrameCb
+        if (cb != null) {
+          try {
+            cb(ab!)
+          } catch (_eCb) {
+            // ignore
+          }
+        }
+      }
+      hasChunk = this.bridge.hasPendingChunk()
+    }
+    // 不再做 tap 断流自愈：UTS 里 `inHoldoff != true` 对比较结果恒成立，
+    // 自愈会在自惹 interruption 期间 restartCapture，切掉开头 1~2s → 丢字 / loading。
+    // 真死流交给业务层 3s 启动看门狗。Android/鸿蒙无此逻辑。
+    this.deliverStopIfStopped()
+  }
+
+  /** onStop 投递：hasStopped 真值判断 + 显式 parseFloat（NSNumber 兜底）。
+   *  幂等（stopReported 守卫）。iOS 桥 Bool 用 `== true` 严格比较恒不成立，必须真值判断。
+   *  特殊兜底（必须同时 userStopRequested）：曾开录（onStart 已投递）但当前 session
+   *  未 started（tap 断流自愈重启后首帧未到就松手）——Swift 因 started=false 不置
+   *  stopped，hasStopped()=false 不投 onStop 会让业务层永远卡「语音识别中」。
+   *  切勿把轮询中的「startReported && !hasStopped」（正常在录）当成松手：
+   *  首帧一到就会立刻 onStop，ASR 只收到 ~100ms 空音频 → 马上 no_speech（iOS 真机已复现）。 */
+  private deliverStopIfStopped(): void {
+    if (this.stopReported == true) {
+      return
+    }
+    const hasStopped = this.bridge.hasStopped()
+    // 注意：iOS 桥 Bool 的 `== true` / `!= true` 都不可用（装箱值），只能真值判断
+    if (!hasStopped) {
+      if (this.userStopRequested == true && this.startReported == true) {
+        // 自愈重启后首帧未到即松手：兜底收尾，避免业务层卡「语音识别中」
+        console.warn("[PCMRec-UTS] 兜底投递 onStop（曾开录但重启后未到首帧即松手）")
+      } else {
+        return
+      }
+    }
+    this.stopReported = true
+    this.stopPolling()
+    const stopCb = this.onStopCb
+    if (stopCb != null) {
+      const filePath = this.bridge.stopFilePath()
+      // NSNumber 返回值在 UTS→Swift 桥可能不自动转 number（iOS 曾卡 onStop 投递）：
+      // 显式 parseFloat 兜底，避免 Math.floor(NSNumber/32) 运行时抛错吞掉整个 onStop
+      let byteLength = 0
+      try {
+        const blRaw = this.bridge.stopByteLength()
+        const blNum = parseFloat(`${blRaw}`)
+        if (!isNaN(blNum) && blNum > 0) {
+          byteLength = blNum
+        }
+      } catch (_eBl) {
+        byteLength = 0
+      }
+      console.log(`[PCMRec-UTS] onStop file=${filePath} bytes=${byteLength}`)
+      const res = new UTSJSONObject()
+      res["tempFilePath"] = filePath
+      // 16kHz mono PCM16 = 32000 B/s → 时长(ms) = 字节数 / 32
+      res["duration"] = Math.floor(byteLength / 32)
+      res["fileSize"] = byteLength
+      res["format"] = "pcm"
+      stopCb(res)
+    }
+  }
+
+  private stopPolling(): void {
+    if (this.pollTimer != 0) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = 0
+    }
+    this.polling = false
+  }
+}
+
+/**
+ * iOS 相机 / 相册授权预检（H5 内嵌页拍照/选图前调用）。
+ * 结果经 permissionResolved / permissionGranted 轮询拉取，与麦克风授权同一模式。
+ * 注意：iOS 桥 Bool 用 `== true` 严格比较恒不成立，必须真值判断。
+ */
+export class IosMediaPermission {
+  private bridge: IosMediaPermissionBridge = new IosMediaPermissionBridge()
+
+  requestCameraPermission(): void {
+    this.bridge.requestCameraPermission()
+  }
+
+  cameraPermissionResolved(): boolean {
+    const v = this.bridge.cameraPermissionResolved()
+    if (v) {
+      return true
+    }
+    return false
+  }
+
+  cameraPermissionGranted(): boolean {
+    const v = this.bridge.cameraPermissionGranted()
+    if (v) {
+      return true
+    }
+    return false
+  }
+
+  requestPhotoLibraryPermission(): void {
+    this.bridge.requestPhotoLibraryPermission()
+  }
+
+  photoPermissionResolved(): boolean {
+    const v = this.bridge.photoPermissionResolved()
+    if (v) {
+      return true
+    }
+    return false
+  }
+
+  photoPermissionGranted(): boolean {
+    const v = this.bridge.photoPermissionGranted()
+    if (v) {
+      return true
+    }
+    return false
+  }
+}

@@ -1,0 +1,875 @@
+/**
+ * 会话 V2 轨迹投影层（H5 / MP-WEIXIN 分支专用）。
+ *
+ * 对齐 PC 端 presentation-v2 契约（nuwax src/features/conversation/presentation-v2/**）：
+ * 正文 text（内嵌 :::container / HTML 过程标签）+ processingList + finalResult
+ *   → 有序 trace items（narration / openui / plan / tool-row / tool-group）
+ *   + 最终回答分离（outputText 优先，兜底末段正文，同源双向包含去重）
+ *   + 轨迹头指标（工具数 / 耗时 / 失败态）。
+ *
+ * 分组规则：连续 ≥2 条普通工具成组（id = tool-group:首节点 executeId，流式追加稳定）；
+ * narration / plan / OpenUI 立即切断分组；单条工具独立成行；Plan 不入组。
+ * 组状态优先级：任一 running > 任一 failed > finished。
+ *
+ * 本模块为纯函数，不持有组件状态、不调用 i18n；文案 key 由组件层消费
+ * （toolTraceActionI18nKey 只生成 key 字符串）。
+ * UTS 约束：无对象 spread，class 带默认值构造；any 一律 as UTSJSONObject 逐字段读。
+ */
+import {
+  collectMarkdownContainerMatches,
+  normalizeContainerTag,
+  type MarkdownContainerMatch,
+} from "@/utils/markdown.uts";
+import { isOpenUiRenderToolName } from "@/utils/openUiSchema.uts";
+import { openUiStatusPriority } from "@/utils/openUiMarkdown.uts";
+import { normalizeFileDiffItems } from "@/utils/fileChangeDiff.uts";
+import type { NormalizedFileDiffItem } from "@/utils/fileChangeDiff.uts";
+import { orEmpty } from "@/utils/utsCoalesce";
+
+/** 单条工具/计划的紧凑事件行数据（组件层按 kind 渲染图标与动作短语）。 */
+export class TraceToolRow {
+  /** 稳定行 id：优先 executeId，兜底 messageKey 序号。 */
+  id: string = "";
+  /** 展示类型：terminal | file-read | file-edit | search | browser | skill | todo | generic */
+  kind: string = "generic";
+  /** running | finished | failed */
+  status: string = "finished";
+  /** 清洗后的工具显示名（解码 %、还原引号、换行压空格）。 */
+  name: string = "";
+  /** ProcessingInfo.type（Plan / ToolCall / Skill / Page ...）。 */
+  componentType: string = "";
+  /** 匹配到的 ProcessingInfo 原始数据；详情弹窗与终态字段以它为准。 */
+  processing: any | null = null;
+  /** 行目标摘要（命令首行 / 文件路径 / 查询词 / 页面标题...）。 */
+  target: string = "";
+  /** 附加指标（file-edit 的 "+N -M"）。 */
+  meta: string = "";
+  /** file-edit 全部为新建文件时为 true（动作短语切换为「创建」语态）。 */
+  isCreate: boolean = false;
+  /** file-edit 涉及文件数；>1 时组件层用 i18n 替换 target 为「N 个文件」。 */
+  fileCount: number = 0;
+}
+
+/** 轨迹展示元素（统一 class + kind 字段，UTS 无 discriminated union）。 */
+export class TraceItem {
+  /** narration | openui | plan | tool-row | tool-group */
+  kind: string = "";
+  id: string = "";
+  /** narration 原始文本段 / openui 规范化标签（未做 mp-html 清洗，清洗由渲染层做）。 */
+  text: string = "";
+  /** plan / tool-row 的单行数据。 */
+  row: TraceToolRow | null = null;
+  /** tool-group 的行列表。 */
+  rows: TraceToolRow[] = [] as TraceToolRow[];
+  /** tool-group 动作类型（按首次出现顺序去重），组头摘要用。 */
+  actionKinds: string[] = [] as string[];
+  /** tool-group 状态：running | failed | finished。 */
+  status: string = "finished";
+  /** 运行轮最末尾未被超越的组为活动组（默认展开）。 */
+  active: boolean = false;
+}
+
+/** 轨迹头指标与整轮状态。 */
+export class TurnTraceMetrics {
+  toolCount: number = 0;
+  /** 终态耗时（ms）；-1 未知。 */
+  elapsedMs: number = -1;
+  /** 运行态计时锚点（ms，已归一）；-1 未知。 */
+  elapsedAnchorMs: number = -1;
+  /** 整轮存在失败工具或 finalResult.success=false。 */
+  failed: boolean = false;
+}
+
+/** 一轮助手消息的投影结果。 */
+export class TurnTracePresentation {
+  items: TraceItem[] = [] as TraceItem[];
+  /** 最终回答原始文本（未清洗）；运行态为 ""（末段正文留轨迹内直出）。 */
+  finalAnswerText: string = "";
+  metrics: TurnTraceMetrics = new TurnTraceMetrics();
+  /** 是否渲染轨迹容器（有过程元素 / 有思考 / 运行中）。 */
+  hasTrace: boolean = false;
+}
+
+/** 投影输入（ai-msg 层从 MessageInfo 通道组装）。 */
+export class TurnTraceInput {
+  bodyText: string = "";
+  thinkText: string = "";
+  /** ProcessingInfo[]（已含历史 componentExecutedList 适配）。 */
+  processingList: any | null = null;
+  /** ConversationFinalResult；终态非空。 */
+  finalResult: any | null = null;
+  /** 当前轮是否流式运行中（isConversationActive && isLastMsg）。 */
+  running: boolean = false;
+  /** 消息稳定 key（节点 id 兜底前缀）。 */
+  messageKey: string = "";
+}
+
+/** 内部中间元素。 */
+class TraceElement {
+  kind: string = ""; // narration | tool | plan | openui
+  text: string = "";
+  row: TraceToolRow | null = null;
+  /** 元素流中的原始序号：最终回答提升移除末段后，narration id 仍保持稳定。 */
+  orderIndex: number = 0;
+}
+
+function createTraceElement(kind: string, text: string, orderIndex: number): TraceElement {
+  const el = new TraceElement();
+  el.kind = kind;
+  el.text = text;
+  el.orderIndex = orderIndex;
+  return el;
+}
+
+// ---------------------------------------------------------------------------
+// 基础读取工具
+// ---------------------------------------------------------------------------
+
+/** any → UTSJSONObject（仅 object 通过，string/number/null 返回 null）。 */
+function asRecord(value: any | null): UTSJSONObject | null {
+  if (value == null) return null;
+  if (typeof value != "object") return null;
+  if (value instanceof UTSJSONObject) return value as UTSJSONObject;
+  if (Array.isArray(value)) return null;
+  return value as UTSJSONObject;
+}
+
+function readStringField(source: UTSJSONObject | null, keys: string[]): string {
+  if (source == null) return "";
+  for (let i = 0; i < keys.length; i++) {
+    const v = source[keys[i]];
+    if (typeof v == "string" && (v as string).length > 0) {
+      return v as string;
+    }
+  }
+  return "";
+}
+
+function readNumberField(source: UTSJSONObject | null, keys: string[]): number {
+  if (source == null) return -1;
+  for (let i = 0; i < keys.length; i++) {
+    const v = source[keys[i]];
+    if (typeof v == "number") {
+      return v as number;
+    }
+  }
+  return -1;
+}
+
+/** result.input（含 rawInput / raw_input 嵌套展开）。 */
+function readResultInput(result: UTSJSONObject | null): UTSJSONObject | null {
+  const input = asRecord(result == null ? null : result["input"]);
+  if (input == null) return null;
+  const nested = asRecord(input["rawInput"]);
+  if (nested == null) {
+    const nested2 = asRecord(input["raw_input"]);
+    if (nested2 != null) return nested2;
+    return input;
+  }
+  return nested;
+}
+
+/** 从 input（含 rawInput/raw_input）读取字符串字段。 */
+function readInputString(result: UTSJSONObject | null, keys: string[]): string {
+  const input = asRecord(result == null ? null : result["input"]);
+  const value = readStringField(input, keys);
+  if (value.length > 0) return value;
+  const nested = readResultInput(result);
+  return readStringField(nested, keys);
+}
+
+/** result.data 数组中的 object 项。 */
+function readDataRecords(result: UTSJSONObject | null): UTSJSONObject[] {
+  const out: UTSJSONObject[] = [] as UTSJSONObject[];
+  if (result == null) return out;
+  const data = result["data"];
+  if (data == null || Array.isArray(data) != true) return out;
+  const arr = data as any[];
+  for (let i = 0; i < arr.length; i++) {
+    const rec = asRecord(arr[i]);
+    if (rec != null) {
+      out.push(rec);
+    }
+  }
+  return out;
+}
+
+/** 时间戳归一为 ms（秒级 *1000；非法 → -1）。 */
+function normalizeTimestampMs(value: number): number {
+  if (value <= 0) return -1;
+  if (value < 1000000000000) {
+    return value * 1000;
+  }
+  return value;
+}
+
+/** 显示名清洗：解码 %、还原引号实体、换行压空格。 */
+function cleanDisplayName(raw: string): string {
+  let name = raw;
+  if (name.indexOf("%") >= 0) {
+    try {
+      name = decodeURIComponent(name);
+    } catch (_e) {
+      // 保留原文
+    }
+  }
+  name = name.replace(/&quot;/g, '"');
+  return name.replace(/\n/g, " ").trim();
+}
+
+// ---------------------------------------------------------------------------
+// 工具展示类型识别（对齐 PC toolPresentation.ts：协议优先 → componentType → 名称启发式）
+// ---------------------------------------------------------------------------
+
+export function getToolTraceActionKind(
+  componentType: string,
+  name: string,
+  result: any | null,
+): string {
+  const resultObj = asRecord(result);
+  const input = asRecord(resultObj == null ? null : resultObj["input"]);
+  const nestedInput = readResultInput(resultObj);
+  let semanticKind = "";
+  if (resultObj != null) {
+    const rk = resultObj["kind"];
+    if (typeof rk == "string" && (rk as string).length > 0) {
+      semanticKind = rk as string;
+    }
+  }
+  if (semanticKind.length == 0 && input != null) {
+    const ik = input["kind"];
+    if (typeof ik == "string" && (ik as string).length > 0) {
+      semanticKind = ik as string;
+    }
+  }
+
+  const dataRecords = readDataRecords(resultObj);
+  for (let i = 0; i < dataRecords.length; i++) {
+    const itemType = dataRecords[i]["type"];
+    if (itemType == "terminal") return "terminal";
+  }
+  for (let i = 0; i < dataRecords.length; i++) {
+    const itemType = dataRecords[i]["type"];
+    if (itemType == "diff") return "file-edit";
+  }
+  if (
+    semanticKind == "execute" ||
+    readStringField(input, ["command"]).length > 0 ||
+    readStringField(nestedInput, ["command"]).length > 0
+  ) {
+    return "terminal";
+  }
+  if (semanticKind == "read") return "file-read";
+  if (semanticKind == "edit" || semanticKind == "write") return "file-edit";
+
+  if (componentType == "Plan") return "todo";
+  if (componentType == "Skill") return "skill";
+  if (componentType == "Knowledge") return "search";
+  if (componentType == "Page") return "browser";
+
+  const normalizedName = name.toLowerCase();
+  if (/(读取|read\b|read_file|打开文件)/.test(normalizedName)) {
+    return "file-read";
+  }
+  if (/(编辑|修改|写入|edit\b|write\b|apply_patch)/.test(normalizedName)) {
+    return "file-edit";
+  }
+  if (/(待办|todo|task list|任务清单)/.test(normalizedName)) return "todo";
+  if (/(搜索|检索|查询|查阅|search\b|query\b|find\b)/.test(normalizedName)) {
+    return "search";
+  }
+  if (/(浏览器|网页|页面|browser\b|navigate\b|open page)/.test(normalizedName)) {
+    return "browser";
+  }
+  return "generic";
+}
+
+/** 动作短语 i18n key（组件层 t() 消费）；返回空串表示无文案（不应发生）。 */
+export function toolTraceActionI18nKey(
+  kind: string,
+  status: string,
+  isCreate: boolean,
+): string {
+  const prefix = "Mobile.Chat.WorkTrace.toolAction";
+  let kindKey = "";
+  if (kind == "terminal") kindKey = "Terminal";
+  else if (kind == "file-read") kindKey = "FileRead";
+  else if (kind == "file-edit") kindKey = "FileEdit";
+  else if (kind == "search") kindKey = "Search";
+  else if (kind == "browser") kindKey = "Browser";
+  else if (kind == "skill") kindKey = "Skill";
+  else if (kind == "todo") kindKey = "Plan";
+  else kindKey = "Generic";
+  if (kind == "file-edit" && isCreate) {
+    kindKey = "FileCreate";
+  }
+  let statusKey = "Finished";
+  if (status == "running") statusKey = "Running";
+  else if (status == "failed") statusKey = "Failed";
+  return prefix + kindKey + statusKey;
+}
+
+/** 首行文本（命令摘要用）。 */
+function firstLine(value: string): string {
+  const idx = value.indexOf("\n");
+  const line = idx >= 0 ? value.substring(0, idx) : value;
+  return line.trim();
+}
+
+// ---------------------------------------------------------------------------
+// 行摘要
+// ---------------------------------------------------------------------------
+
+function buildRowSummary(row: TraceToolRow): void {
+  const resultObj = asRecord(
+    row.processing == null ? null : (row.processing as UTSJSONObject)["result"],
+  );
+  const kind = row.kind;
+  if (kind == "terminal") {
+    const command = readInputString(resultObj, ["command"]);
+    row.target = firstLine(command).length > 0 ? firstLine(command) : row.name;
+    return;
+  }
+  if (kind == "file-read") {
+    const filePath = readInputString(resultObj, [
+      "file_path",
+      "filePath",
+      "filepath",
+      "path",
+    ]);
+    row.target = filePath.length > 0 ? filePath : row.name;
+    return;
+  }
+  if (kind == "file-edit") {
+    let diffs: NormalizedFileDiffItem[] = [] as NormalizedFileDiffItem[];
+    try {
+      diffs = normalizeFileDiffItems(row.processing == null ? resultObj : row.processing);
+    } catch (_e) {
+      diffs = [] as NormalizedFileDiffItem[];
+    }
+    row.fileCount = diffs.length;
+    let additions = 0;
+    let deletions = 0;
+    let allCreate = diffs.length > 0;
+    let firstPath = "";
+    for (let i = 0; i < diffs.length; i++) {
+      const diff = diffs[i];
+      const newLines = diff.newText.length > 0
+        ? diff.newText.split("\n").length
+        : 0;
+      const oldLines = diff.oldText.length > 0
+        ? diff.oldText.split("\n").length
+        : 0;
+      additions += newLines;
+      deletions += oldLines;
+      if (diff.oldText.length > 0 || diff.newText.length == 0) {
+        allCreate = false;
+      }
+      if (firstPath.length == 0 && diff.path.length > 0) {
+        firstPath = diff.path;
+      }
+    }
+    row.isCreate = allCreate;
+    if (additions > 0 || deletions > 0) {
+      row.meta = "+" + additions + " -" + deletions;
+    }
+    if (diffs.length > 1) {
+      // 多文件：组件层以 t("...toolTargetFiles", count) 展示，target 仅存首路径兜底
+      row.target = firstPath;
+    } else {
+      const filePath = readInputString(resultObj, [
+        "file_path",
+        "filePath",
+        "filepath",
+        "path",
+      ]);
+      const target = firstPath.length > 0
+        ? firstPath
+        : filePath.length > 0
+          ? filePath
+          : row.name;
+      row.target = target;
+    }
+    return;
+  }
+  if (kind == "search") {
+    const query = readInputString(resultObj, ["query", "q", "keyword", "keywords"]);
+    row.target = query.length > 0 ? query : row.name;
+    return;
+  }
+  if (kind == "browser") {
+    const dataRecords = readDataRecords(resultObj);
+    let resultTitle = "";
+    let resultUrl = "";
+    for (let i = 0; i < dataRecords.length; i++) {
+      const rec = dataRecords[i];
+      const title = readStringField(rec, ["title", "name"]);
+      if (title.length > 0) {
+        resultTitle = title;
+        break;
+      }
+    }
+    for (let i = 0; i < dataRecords.length; i++) {
+      const url = readStringField(dataRecords[i], ["url", "uri", "href"]);
+      if (url.length > 0) {
+        resultUrl = url;
+        break;
+      }
+    }
+    if (resultUrl.length == 0) {
+      resultUrl = readInputString(resultObj, ["url", "uri", "href"]);
+    }
+    row.target = resultTitle.length > 0
+      ? resultTitle
+      : resultUrl.length > 0
+        ? resultUrl
+        : row.name;
+    return;
+  }
+  row.target = row.name;
+}
+
+// ---------------------------------------------------------------------------
+// 状态解析与 processing 匹配
+// ---------------------------------------------------------------------------
+
+/**
+ * 节点状态：processing.status 优先，标签 status 兜底；
+ * EXECUTING 在轮已终态（finalResult 在场）时判 failed（对齐 PC collectProcessingByKey）。
+ */
+function resolveNodeStatus(
+  tagStatus: string,
+  processingStatus: string,
+  running: boolean,
+  hasFinalResult: boolean,
+): string {
+  const status = processingStatus.length > 0 ? processingStatus : tagStatus;
+  if (status == "FINISHED") return "finished";
+  if (status == "FAILED") return "failed";
+  if (status == "EXECUTING") {
+    if (running) return "running";
+    return hasFinalResult ? "failed" : "finished";
+  }
+  return running ? "running" : "finished";
+}
+
+/** 按 executeId 查 processing（upsert 保证唯一，防御性取最后一次）。 */
+function findProcessingByExecuteId(
+  list: any | null,
+  executeId: string,
+): UTSJSONObject | null {
+  if (list == null || executeId.length == 0) return null;
+  if (Array.isArray(list) != true) return null;
+  const arr = list as any[];
+  let found: UTSJSONObject | null = null;
+  for (let i = 0; i < arr.length; i++) {
+    const rec = asRecord(arr[i]);
+    if (rec == null) continue;
+    const eid = rec["executeId"];
+    if (eid != null && `${eid}` == executeId) {
+      found = rec;
+    }
+  }
+  return found;
+}
+
+/** 从 match / processing 组装工具行。 */
+function buildToolRow(
+  match: MarkdownContainerMatch,
+  processing: UTSJSONObject | null,
+  running: boolean,
+  hasFinalResult: boolean,
+  fallbackIndex: number,
+  messageKey: string,
+): TraceToolRow {
+  const row = new TraceToolRow();
+  const nameRaw = processing != null
+    ? readStringField(processing, ["name"]).length > 0
+      ? readStringField(processing, ["name"])
+      : match.name
+    : match.name;
+  row.name = cleanDisplayName(nameRaw);
+  let componentType = match.type;
+  if (processing != null) {
+    const pt = orEmpty(processing["type"]);
+    if (pt.length > 0) {
+      componentType = pt;
+    }
+  }
+  row.componentType = componentType;
+  const processingStatus = processing == null ? "" : orEmpty(processing["status"]);
+  row.status = resolveNodeStatus(
+    match.status,
+    processingStatus,
+    running,
+    hasFinalResult,
+  );
+  const result = processing == null ? null : processing["result"];
+  row.processing = processing;
+  row.kind = getToolTraceActionKind(componentType, row.name, result);
+  row.id = match.executeId.length > 0
+    ? match.executeId
+    : messageKey + "-tool-" + fallbackIndex;
+  buildRowSummary(row);
+  return row;
+}
+
+// ---------------------------------------------------------------------------
+// 最终回答
+// ---------------------------------------------------------------------------
+
+/** 剥掉正文里的过程标签（outputText / 兜底比较用）。 */
+export function stripContainerTags(text: string): string {
+  const matches = collectMarkdownContainerMatches(text);
+  if (matches.length == 0) return text.trim();
+  let out = "";
+  let last = 0;
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i];
+    out += text.substring(last, m.index);
+    last = m.endIndex;
+  }
+  out += text.substring(last);
+  return out.trim();
+}
+
+function normalizeForCompare(text: string): string {
+  return text.replace(/\s+/g, "");
+}
+
+/** outputText 与正文段同源判定：任一方向包含即视为同一内容。 */
+function isSameAnswerContent(outputText: string, segmentText: string): boolean {
+  const a = normalizeForCompare(outputText);
+  const b = normalizeForCompare(segmentText);
+  if (a.length == 0 || b.length == 0) return false;
+  return a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// 主投影
+// ---------------------------------------------------------------------------
+
+export function projectTurnTrace(input: TurnTraceInput): TurnTracePresentation {
+  const presentation = new TurnTracePresentation();
+  const text = input.bodyText;
+  const finalResultObj = asRecord(input.finalResult);
+  const hasFinalResult = finalResultObj != null;
+  const matches = collectMarkdownContainerMatches(text);
+
+  // executeId 去重：普通工具保留最后一次；OpenUI 按状态优先级（对齐 dedupeMarkdownContainers）
+  const keepIndexMap = new Map<string, number>();
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i];
+    const prevIdx = keepIndexMap.get(m.executeId);
+    if (prevIdx == null) {
+      keepIndexMap.set(m.executeId, i);
+      continue;
+    }
+    if (isOpenUiRenderToolName(m.name) == true) {
+      const prev = matches[prevIdx];
+      const prevPri = openUiStatusPriority(prev.status);
+      const curPri = openUiStatusPriority(m.status);
+      if (curPri < prevPri || (curPri == prevPri && m.index >= prev.index)) {
+        keepIndexMap.set(m.executeId, i);
+      }
+    } else {
+      keepIndexMap.set(m.executeId, i);
+    }
+  }
+  const keptMatches: MarkdownContainerMatch[] = [] as MarkdownContainerMatch[];
+  for (let i = 0; i < matches.length; i++) {
+    if (keepIndexMap.get(matches[i].executeId) == i) {
+      keptMatches.push(matches[i]);
+    }
+  }
+
+  // ---- 元素流（保持时间线顺序）----
+  const elements: TraceElement[] = [] as TraceElement[];
+  let lastIndex = 0;
+  let toolFallbackIndex = 0;
+  let orderSeq = 0;
+  for (let i = 0; i < keptMatches.length; i++) {
+    const match = keptMatches[i];
+    const before = text.substring(lastIndex, match.index);
+    if (before.trim().length > 0) {
+      elements.push(createTraceElement("narration", before, orderSeq));
+      orderSeq++;
+    }
+    lastIndex = match.endIndex;
+
+    const openUi = isOpenUiRenderToolName(match.name) == true;
+    if (match.type == "Event" && openUi != true) {
+      // 内部事件默认丢弃（对齐 PC：type=Event 仅 OpenUI render 例外）
+      continue;
+    }
+    if (openUi == true) {
+      const normalized = normalizeContainerTag(match);
+      elements.push(createTraceElement("openui", normalized, orderSeq));
+      orderSeq++;
+      continue;
+    }
+    if (match.isPlan == true) {
+      const processing = findProcessingByExecuteId(
+        input.processingList,
+        match.executeId,
+      );
+      const planElement = createTraceElement("plan", "", orderSeq);
+      planElement.row = buildToolRow(
+        match,
+        processing,
+        input.running,
+        hasFinalResult,
+        toolFallbackIndex,
+        input.messageKey,
+      );
+      elements.push(planElement);
+      orderSeq++;
+      toolFallbackIndex++;
+      continue;
+    }
+    const processing = findProcessingByExecuteId(
+      input.processingList,
+      match.executeId,
+    );
+    const el = createTraceElement("tool", "", orderSeq);
+    el.row = buildToolRow(
+      match,
+      processing,
+      input.running,
+      hasFinalResult,
+      toolFallbackIndex,
+      input.messageKey,
+    );
+    elements.push(el);
+    orderSeq++;
+    toolFallbackIndex++;
+  }
+  const tail = text.substring(lastIndex);
+  if (tail.trim().length > 0) {
+    elements.push(createTraceElement("narration", tail, orderSeq));
+    orderSeq++;
+  }
+
+  // 相邻连续 Plan 只保留最后一个（对齐 PC / dedupe 规则）
+  const dedupedElements: TraceElement[] = [] as TraceElement[];
+  for (let i = 0; i < elements.length; i++) {
+    const el = elements[i];
+    const next = i + 1 < elements.length ? elements[i + 1] : null;
+    if (el.kind == "plan" && next != null && next.kind == "plan") {
+      continue;
+    }
+    dedupedElements.push(el);
+  }
+
+  // ---- 最终回答分离 ----
+  let outputText = "";
+  if (finalResultObj != null) {
+    const rawOutput = finalResultObj["outputText"];
+    if (typeof rawOutput == "string") {
+      outputText = stripContainerTags(rawOutput as string);
+    }
+  }
+  let finalAnswerText = "";
+  if (input.running != true) {
+    if (outputText.length > 0) {
+      finalAnswerText = outputText;
+      // 末段与 outputText 同源时移出轨迹（即最终回答本身）
+      const lastNarrationIdx = lastNarrationIndex(dedupedElements);
+      if (lastNarrationIdx >= 0) {
+        const seg = dedupedElements[lastNarrationIdx];
+        if (isSameAnswerContent(outputText, seg.text)) {
+          dedupedElements.splice(lastNarrationIdx, 1);
+        }
+      }
+    } else {
+      // 终态回退：最后一段非空正文提升为最终回答
+      const lastNarrationIdx = lastNarrationIndex(dedupedElements);
+      if (lastNarrationIdx >= 0) {
+        finalAnswerText = dedupedElements[lastNarrationIdx].text.trim();
+        dedupedElements.splice(lastNarrationIdx, 1);
+      }
+    }
+  } else {
+    // 运行态：末元素为非空正文段时即实时回答区（对齐 PC：仅看最后一段，
+    // 倒数第二段的正文仍是轨迹 narration，避免回答区越过执行中的工具）
+    const lastIdx = dedupedElements.length - 1;
+    if (
+      lastIdx >= 0 &&
+      dedupedElements[lastIdx].kind == "narration" &&
+      dedupedElements[lastIdx].text.trim().length > 0
+    ) {
+      finalAnswerText = dedupedElements[lastIdx].text.trim();
+      dedupedElements.splice(lastIdx, 1);
+    }
+  }
+  presentation.finalAnswerText = finalAnswerText;
+
+  // ---- 分组：连续普通工具 ≥2 成组 ----
+  const items: TraceItem[] = [] as TraceItem[];
+  let pendingRows: TraceToolRow[] = [] as TraceToolRow[];
+
+  const flushRows = () => {
+    if (pendingRows.length == 0) return;
+    if (pendingRows.length == 1) {
+      const item = new TraceItem();
+      item.kind = "tool-row";
+      item.id = pendingRows[0].id;
+      item.row = pendingRows[0];
+      items.push(item);
+    } else {
+      const group = new TraceItem();
+      group.kind = "tool-group";
+      group.id = "tool-group:" + pendingRows[0].id;
+      group.rows = pendingRows.slice();
+      group.actionKinds = collectActionKinds(group.rows);
+      group.status = getRowsGroupStatus(group.rows);
+      items.push(group);
+    }
+    pendingRows = [] as TraceToolRow[];
+  };
+
+  for (let i = 0; i < dedupedElements.length; i++) {
+    const el = dedupedElements[i];
+    if (el.kind == "tool" && el.row != null) {
+      pendingRows.push(el.row!);
+      continue;
+    }
+    flushRows();
+    const item = new TraceItem();
+    if (el.kind == "narration") {
+      item.kind = "narration";
+      item.id = input.messageKey + "-seg-" + el.orderIndex;
+      item.text = el.text;
+    } else if (el.kind == "openui") {
+      item.kind = "openui";
+      item.id = input.messageKey + "-openui-" + el.orderIndex;
+      item.text = el.text;
+    } else if (el.kind == "plan" && el.row != null) {
+      item.kind = "plan";
+      item.id = el.row.id;
+      item.row = el.row;
+    }
+    if (item.kind.length > 0) {
+      items.push(item);
+    }
+  }
+  flushRows();
+
+  // 活动组标记：running 且是最后一项
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].kind == "tool-group") {
+      items[i].active = input.running && i == items.length - 1;
+    }
+  }
+  presentation.items = items;
+
+  // ---- 指标 ----
+  const metrics = new TurnTraceMetrics();
+  const toolIdSet = new Set<string>();
+  let failed = false;
+  for (let i = 0; i < dedupedElements.length; i++) {
+    const el = dedupedElements[i];
+    if (el.kind != "tool" || el.row == null) continue;
+    const row = el.row!;
+    if (row.kind != "todo") {
+      toolIdSet.add(row.id);
+    }
+    if (row.status == "failed") {
+      failed = true;
+    }
+  }  metrics.toolCount = toolIdSet.size;
+  if (finalResultObj != null) {
+    const successVal = finalResultObj["success"];
+    if (successVal == false) {
+      failed = true;
+    }
+    const startTime = readNumberField(finalResultObj, ["startTime"]);
+    const endTime = readNumberField(finalResultObj, ["endTime"]);
+    const startMs = normalizeTimestampMs(startTime);
+    const endMs = normalizeTimestampMs(endTime);
+    if (startMs > 0 && endMs >= startMs) {
+      metrics.elapsedMs = endMs - startMs;
+    }
+  }
+  if (input.running) {
+    let anchor = -1;
+    for (let i = 0; i < dedupedElements.length; i++) {
+      const el = dedupedElements[i];
+      const row = el.row;
+      if (row == null || row.processing == null) continue;
+      const resultObj = asRecord((row.processing as UTSJSONObject)["result"]);
+      const startTime = readNumberField(resultObj, ["startTime"]);
+      const ms = normalizeTimestampMs(startTime);
+      if (ms > 0 && (anchor < 0 || ms < anchor)) {
+        anchor = ms;
+      }
+    }
+    metrics.elapsedAnchorMs = anchor;
+  }
+  metrics.failed = failed;
+  presentation.metrics = metrics;
+
+  presentation.hasTrace =
+    items.length > 0 ||
+    input.thinkText.trim().length > 0 ||
+    input.running;
+  return presentation;
+}
+
+function lastNarrationIndex(elements: TraceElement[]): number {
+  for (let i = elements.length - 1; i >= 0; i--) {
+    if (elements[i].kind == "narration" && elements[i].text.trim().length > 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** 组状态：任一 running > 任一 failed > finished。 */
+export function getRowsGroupStatus(rows: TraceToolRow[]): string {
+  let hasRunning = false;
+  let hasFailed = false;
+  for (let i = 0; i < rows.length; i++) {
+    const status = rows[i].status;
+    if (status == "running") hasRunning = true;
+    else if (status == "failed") hasFailed = true;
+  }
+  if (hasRunning) return "running";
+  if (hasFailed) return "failed";
+  return "finished";
+}
+
+/** 动作类型按首次出现顺序去重。 */
+export function collectActionKinds(rows: TraceToolRow[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [] as string[];
+  for (let i = 0; i < rows.length; i++) {
+    const kind = rows[i].kind;
+    if (seen.has(kind)) continue;
+    seen.add(kind);
+    out.push(kind);
+  }
+  return out;
+}
+
+/**
+ * 耗时文案（秒级取整）：X 秒 / X 分 Y 秒 / X 时 Y 分。
+ * 单位词由调用方 i18n（时/分/秒）传入，投影层不持文案。
+ */
+export function formatElapsedParts(ms: number): string {
+  if (ms < 0) return "";
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) {
+    return totalSeconds + "{s}";
+  }
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    const seconds = totalSeconds % 60;
+    return seconds > 0
+      ? totalMinutes + "{m}" + seconds + "{s}"
+      : totalMinutes + "{m}";
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? hours + "{h}" + minutes + "{m}" : hours + "{h}";
+}

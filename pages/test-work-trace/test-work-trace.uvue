@@ -1,0 +1,475 @@
+<template>
+  <!--
+    V2 工作轨迹渲染预览页（离线 mock，不依赖会话 API）。
+    直接挂 UniAiXMsg 喂构造数据，覆盖 PC V2_GROUPED_TOOL_TRACE 同款场景：
+    两段被正文切开的工具组、重复调用、失败态、单工具、Plan、最终回答分离；
+    「模拟流式」按钮按阶段推进，验证运行态展开 / 活动组切换 / 终态自动收起。
+  -->
+  <scroll-view class="page" direction="vertical" show-scrollbar>
+    <view class="section">
+      <text class="section-title">1. 历史终态轮（默认收起 · 组摘要 · 失败 · Plan · 最终回答）</text>
+      <UniAiXMsg
+        message-id="case-history"
+        :body-text="historyBody"
+        :think-text="historyThink"
+        :processing-list="historyProcessing"
+        :final-result="historyFinalResult"
+        :is-conversation-active="false"
+        :is-last-msg="false"
+      />
+    </view>
+
+    <view class="section">
+      <text class="section-title">2. 纯文本历史轮（无轨迹 · 正文直出）</text>
+      <UniAiXMsg
+        message-id="case-plain"
+        :body-text="plainBody"
+        :is-conversation-active="false"
+        :is-last-msg="false"
+      />
+    </view>
+
+    <view class="section">
+      <text class="section-title">3. 流式模拟（{{ streamingActive ? "运行中" : "已结束" }}）</text>
+      <view class="controls">
+        <button class="ctrl-btn" size="mini" @tap="startStreaming">自动</button>
+        <button class="ctrl-btn" size="mini" @tap="stepStreaming">下一步</button>
+        <button class="ctrl-btn" size="mini" @tap="resetStreaming">重置</button>
+        <text class="stage-label">阶段 {{ streamStage + 1 }}/{{ streamStages.length }}</text>
+      </view>
+      <UniAiXMsg
+        message-id="case-stream"
+        :key="streamKey"
+        :body-text="streamBody"
+        :think-text="streamThink"
+        :processing-list="streamProcessing"
+        :final-result="streamFinalResult"
+        :is-conversation-active="streamingActive"
+        :is-last-msg="true"
+      />
+    </view>
+  </scroll-view>
+</template>
+
+<script setup lang="uts">
+  import UniAiXMsg from "@/subpackages/components/ai-msg/ai-msg.uvue";
+
+  // ---------------------------------------------------------------------------
+  // 场景 1：历史终态轮
+  // 组1: execute(×2 含失败) + read；正文穿插；组2: edit(×2) + search；单工具 skill；Plan
+  // ---------------------------------------------------------------------------
+  const historyThink = "先分析用户需求，再决定用哪个工具链完成检索与整理。";
+
+  function toolTag(
+    executeId: string,
+    type: string,
+    status: string,
+    name: string,
+  ): string {
+    return (
+      '<markdown-custom-process executeid="' +
+      executeId +
+      '" type="' +
+      type +
+      '" status="' +
+      status +
+      '" name="' +
+      name +
+      '"></markdown-custom-process>'
+    );
+  }
+
+  const historyBody =
+    "我先看一下当前目录里的工程文件。\n\n" +
+    toolTag("h-exe-1", "ToolCall", "FINISHED", "执行命令 ls -la") +
+    "\n" +
+    toolTag("h-exe-2", "ToolCall", "FAILED", "执行命令 npm run build") +
+    "\n" +
+    toolTag("h-read-1", "ToolCall", "FINISHED", "读取文件 README.md") +
+    "\n\n构建失败了，我先梳理一下项目结构，再修复依赖问题。\n\n" +
+    toolTag("h-edit-1", "ToolCall", "FINISHED", "编辑文件 package.json") +
+    "\n" +
+    toolTag("h-edit-2", "ToolCall", "FINISHED", "编辑文件 vite.config.ts") +
+    "\n" +
+    toolTag("h-search-1", "ToolCall", "FINISHED", "搜索 vite 版本兼容问题") +
+    "\n\n" +
+    toolTag("h-skill-1", "Skill", "FINISHED", "前端工程技能") +
+    "\n\n" +
+    toolTag("h-plan-1", "Plan", "FINISHED", "修复计划") +
+    "\n\n构建已恢复，具体修复过程见上方轨迹。";
+
+  function makeProcessing(
+    executeId: string,
+    type: string,
+    name: string,
+    status: string,
+    result: UTSJSONObject | null,
+  ): UTSJSONObject {
+    const item = new UTSJSONObject();
+    item["executeId"] = executeId;
+    item["type"] = type;
+    item["name"] = name;
+    item["status"] = status;
+    item["targetId"] = 0;
+    if (result != null) {
+      item["result"] = result;
+    }
+    return item;
+  }
+
+  function terminalResult(command: string, output: string, failed: boolean): UTSJSONObject {
+    const result = new UTSJSONObject();
+    result["type"] = "ToolCall";
+    result["name"] = "terminal";
+    result["success"] = failed != true;
+    result["kind"] = "execute";
+    result["startTime"] = Date.now() - 3000;
+    result["endTime"] = Date.now();
+    const input = new UTSJSONObject();
+    input["command"] = command;
+    result["input"] = input;
+    const dataEntry = new UTSJSONObject();
+    dataEntry["type"] = "terminal";
+    dataEntry["content"] = output;
+    dataEntry["exitCode"] = failed ? 1 : 0;
+    const data: UTSJSONObject[] = [dataEntry];
+    result["data"] = data;
+    return result;
+  }
+
+  function readResult(path: string, content: string): UTSJSONObject {
+    const result = new UTSJSONObject();
+    result["type"] = "ToolCall";
+    result["name"] = "read_file";
+    result["success"] = true;
+    result["kind"] = "read";
+    result["startTime"] = Date.now() - 2000;
+    result["endTime"] = Date.now() - 1000;
+    const input = new UTSJSONObject();
+    input["file_path"] = path;
+    input["line_start"] = 1;
+    input["line_end"] = 20;
+    result["input"] = input;
+    const dataEntry = new UTSJSONObject();
+    dataEntry["type"] = "text";
+    dataEntry["content"] = content;
+    const data: UTSJSONObject[] = [dataEntry];
+    result["data"] = data;
+    return result;
+  }
+
+  function editResult(path: string, oldText: string, newText: string): UTSJSONObject {
+    const result = new UTSJSONObject();
+    result["type"] = "ToolCall";
+    result["name"] = "edit_file";
+    result["success"] = true;
+    result["kind"] = "edit";
+    result["startTime"] = Date.now() - 2000;
+    result["endTime"] = Date.now() - 500;
+    const input = new UTSJSONObject();
+    input["file_path"] = path;
+    result["input"] = input;
+    const diffEntry = new UTSJSONObject();
+    diffEntry["type"] = "diff";
+    diffEntry["path"] = path;
+    diffEntry["oldText"] = oldText;
+    diffEntry["newText"] = newText;
+    const data: UTSJSONObject[] = [diffEntry];
+    result["data"] = data;
+    return result;
+  }
+
+  function searchResult(query: string): UTSJSONObject {
+    const result = new UTSJSONObject();
+    result["type"] = "Knowledge";
+    result["name"] = "知识库检索";
+    result["success"] = true;
+    result["startTime"] = Date.now() - 2000;
+    result["endTime"] = Date.now() - 1000;
+    const input = new UTSJSONObject();
+    input["query"] = query;
+    result["input"] = input;
+    const structured = new UTSJSONObject();
+    structured["title"] = "Vite 5 升级指南";
+    structured["summary"] = "移除 CJS Node API，ssr.external 默认开启。";
+    structured["url"] = "https://vitejs.dev/guide/migration";
+    const data: UTSJSONObject[] = [structured];
+    result["data"] = data;
+    return result;
+  }
+
+  function skillResult(): UTSJSONObject {
+    const result = new UTSJSONObject();
+    result["type"] = "Skill";
+    result["name"] = "前端工程技能";
+    result["success"] = true;
+    result["startTime"] = Date.now() - 1000;
+    result["endTime"] = Date.now();
+    const input = new UTSJSONObject();
+    input["skill_content"] = "按官方迁移清单逐项核对依赖版本。";
+    result["input"] = input;
+    return result;
+  }
+
+  function planResult(): UTSJSONObject {
+    const result = new UTSJSONObject();
+    result["type"] = "Plan";
+    result["name"] = "修复计划";
+    result["success"] = true;
+    result["startTime"] = Date.now() - 1000;
+    result["endTime"] = Date.now();
+    const step1 = new UTSJSONObject();
+    step1["status"] = "completed";
+    step1["content"] = "定位构建失败原因";
+    const step2 = new UTSJSONObject();
+    step2["status"] = "completed";
+    step2["content"] = "升级 vite 与插件版本";
+    const step3 = new UTSJSONObject();
+    step3["status"] = "in_progress";
+    step3["content"] = "回归验证构建";
+    const data: UTSJSONObject[] = [step1, step2, step3];
+    result["data"] = data;
+    return result;
+  }
+
+  const historyProcessing: UTSJSONObject[] = [
+    makeProcessing("h-exe-1", "ToolCall", "执行命令 ls -la", "FINISHED", terminalResult("ls -la", "total 48\ndrwxr-xr-x  12 user  staff  384 Sep  5 10:00 .", false)),
+    makeProcessing("h-exe-2", "ToolCall", "执行命令 npm run build", "FAILED", terminalResult("npm run build", "error: vite@6 requires node >= 18", true)),
+    makeProcessing("h-read-1", "ToolCall", "读取文件 README.md", "FINISHED", readResult("/workspace/README.md", "# Nuwax 项目\n基于 uni-app x 的跨端应用。")),
+    makeProcessing("h-edit-1", "ToolCall", "编辑文件 package.json", "FINISHED", editResult("package.json", "\"vite\": \"^4.0.0\"", "\"vite\": \"^5.4.0\"")),
+    makeProcessing("h-edit-2", "ToolCall", "编辑文件 vite.config.ts", "FINISHED", editResult("vite.config.ts", "base: '/'", "base: '/m/'")),
+    makeProcessing("h-search-1", "Knowledge", "搜索 vite 版本兼容问题", "FINISHED", searchResult("vite 5 升级 兼容")),
+    makeProcessing("h-skill-1", "Skill", "前端工程技能", "FINISHED", skillResult()),
+    makeProcessing("h-plan-1", "Plan", "修复计划", "FINISHED", planResult()),
+  ];
+
+  const historyFinalResult: UTSJSONObject = (() => {
+    const fr = new UTSJSONObject();
+    fr["success"] = false;
+    fr["outputText"] = "构建失败的原因是 vite@6 与当前 Node 版本不兼容；已将依赖降级到 vite@5 并修正 base 路径，回归验证仍在进行中。";
+    fr["startTime"] = 1757000000000;
+    fr["endTime"] = 1757000016000;
+    return fr;
+  })();
+
+  // ---------------------------------------------------------------------------
+  // 场景 2：纯文本历史轮
+  // ---------------------------------------------------------------------------
+  const plainBody = "你好，我是女娲智能体，可以直接对话，也可以让我调用工具完成复杂任务。";
+
+  // ---------------------------------------------------------------------------
+  // 场景 3：流式模拟（阶段推进）
+  // ---------------------------------------------------------------------------
+  class StreamStage {
+    body: string = "";
+    think: string = "";
+    processing: UTSJSONObject[] = [];
+    active: boolean = true;
+    finalResult: UTSJSONObject | null = null;
+
+    apply(): void {
+      streamBody.value = this.body;
+      streamThink.value = this.think;
+      streamProcessing.value = this.processing.slice();
+      streamingActive.value = this.active;
+      streamFinalResult.value = this.finalResult;
+    }
+  }
+
+  function stage(body: string, think: string, processing: UTSJSONObject[], active: boolean, finalResult: UTSJSONObject | null = null): StreamStage {
+    const s = new StreamStage();
+    s.body = body;
+    s.think = think;
+    s.processing = processing;
+    s.active = active;
+    s.finalResult = finalResult;
+    return s;
+  }
+
+  const streamStages: StreamStage[] = [
+    stage("", "用户要修构建问题，我先看看目录和配置。", [] as UTSJSONObject[], true),
+    stage(
+      toolTag("s-exe-1", "ToolCall", "EXECUTING", "执行命令 ls -la"),
+      "用户要修构建问题，我先看看目录和配置。",
+      [makeProcessing("s-exe-1", "ToolCall", "执行命令 ls -la", "EXECUTING", terminalResult("ls -la", "", false))],
+      true,
+    ),
+    stage(
+      toolTag("s-exe-1", "ToolCall", "FINISHED", "执行命令 ls -la") +
+        "\n" +
+        toolTag("s-read-1", "ToolCall", "EXECUTING", "读取文件 package.json"),
+      "用户要修构建问题，我先看看目录和配置。",
+      [
+        makeProcessing("s-exe-1", "ToolCall", "执行命令 ls -la", "FINISHED", terminalResult("ls -la", "package.json vite.config.ts", false)),
+        makeProcessing("s-read-1", "ToolCall", "读取文件 package.json", "EXECUTING", readResult("package.json", "")),
+      ],
+      true,
+    ),
+    stage(
+      toolTag("s-exe-1", "ToolCall", "FINISHED", "执行命令 ls -la") +
+        "\n" +
+        toolTag("s-read-1", "ToolCall", "FINISHED", "读取文件 package.json") +
+        "\n\n找到问题了，是 vite 版本过高，我来修复依赖。\n\n",
+      "用户要修构建问题，我先看看目录和配置。",
+      [
+        makeProcessing("s-exe-1", "ToolCall", "执行命令 ls -la", "FINISHED", terminalResult("ls -la", "package.json vite.config.ts", false)),
+        makeProcessing("s-read-1", "ToolCall", "读取文件 package.json", "FINISHED", readResult("package.json", "\"vite\": \"^6.0.0\"")),
+      ],
+      true,
+    ),
+    stage(
+      toolTag("s-exe-1", "ToolCall", "FINISHED", "执行命令 ls -la") +
+        "\n" +
+        toolTag("s-read-1", "ToolCall", "FINISHED", "读取文件 package.json") +
+        "\n\n找到问题了，是 vite 版本过高，我来修复依赖。\n\n" +
+        toolTag("s-edit-1", "ToolCall", "EXECUTING", "编辑文件 package.json"),
+      "用户要修构建问题，我先看看目录和配置。",
+      [
+        makeProcessing("s-exe-1", "ToolCall", "执行命令 ls -la", "FINISHED", terminalResult("ls -la", "package.json vite.config.ts", false)),
+        makeProcessing("s-read-1", "ToolCall", "读取文件 package.json", "FINISHED", readResult("package.json", "\"vite\": \"^6.0.0\"")),
+        makeProcessing("s-edit-1", "ToolCall", "编辑文件 package.json", "EXECUTING", editResult("package.json", "", "")),
+      ],
+      true,
+    ),
+    stage(
+      toolTag("s-exe-1", "ToolCall", "FINISHED", "执行命令 ls -la") +
+        "\n" +
+        toolTag("s-read-1", "ToolCall", "FINISHED", "读取文件 package.json") +
+        "\n\n找到问题了，是 vite 版本过高，我来修复依赖。\n\n" +
+        toolTag("s-edit-1", "ToolCall", "FINISHED", "编辑文件 package.json") +
+        "\n\n依赖已修复，正在输出总结。",
+      "用户要修构建问题，我先看看目录和配置。",
+      [
+        makeProcessing("s-exe-1", "ToolCall", "执行命令 ls -la", "FINISHED", terminalResult("ls -la", "package.json vite.config.ts", false)),
+        makeProcessing("s-read-1", "ToolCall", "读取文件 package.json", "FINISHED", readResult("package.json", "\"vite\": \"^6.0.0\"")),
+        makeProcessing("s-edit-1", "ToolCall", "编辑文件 package.json", "FINISHED", editResult("package.json", "\"vite\": \"^6.0.0\"", "\"vite\": \"^5.4.0\"")),
+      ],
+      true,
+    ),
+    stage(
+      toolTag("s-exe-1", "ToolCall", "FINISHED", "执行命令 ls -la") +
+        "\n" +
+        toolTag("s-read-1", "ToolCall", "FINISHED", "读取文件 package.json") +
+        "\n\n找到问题了，是 vite 版本过高，我来修复依赖。\n\n" +
+        toolTag("s-edit-1", "ToolCall", "FINISHED", "编辑文件 package.json") +
+        "\n\n依赖已修复，正在输出总结。",
+      "用户要修构建问题，我先看看目录和配置。",
+      [
+        makeProcessing("s-exe-1", "ToolCall", "执行命令 ls -la", "FINISHED", terminalResult("ls -la", "package.json vite.config.ts", false)),
+        makeProcessing("s-read-1", "ToolCall", "读取文件 package.json", "FINISHED", readResult("package.json", "\"vite\": \"^6.0.0\"")),
+        makeProcessing("s-edit-1", "ToolCall", "编辑文件 package.json", "FINISHED", editResult("package.json", "\"vite\": \"^6.0.0\"", "\"vite\": \"^5.4.0\"")),
+      ],
+      false,
+      (() => {
+        const fr = new UTSJSONObject();
+        fr["success"] = true;
+        fr["outputText"] = "已将 vite 从 6.x 降到 5.4 并修复 base 路径，构建问题解决，可以重新执行 `npm run build` 验证。";
+        fr["startTime"] = Date.now() - 16000;
+        fr["endTime"] = Date.now();
+        return fr;
+      })(),
+    ),
+  ];
+
+  const streamBody = ref<string>("");
+  const streamThink = ref<string>("");
+  const streamProcessing = ref<UTSJSONObject[]>([] as UTSJSONObject[]);
+  const streamingActive = ref<boolean>(false);
+  const streamFinalResult = ref<UTSJSONObject | null>(null);
+  const streamStage = ref<number>(0);
+  const streamKey = ref<number>(0);
+  let streamTimerId: number = 0;
+
+  function startStreaming(): void {
+    resetStreaming();
+    streamKey.value = streamKey.value + 1;
+    streamStage.value = 0;
+    streamStages[0].apply();
+    streamTimerId = setInterval(() => {
+      const next = streamStage.value + 1;
+      if (next >= streamStages.length) {
+        stopStreamTimer();
+        return;
+      }
+      streamStage.value = next;
+      streamStages[next].apply();
+    }, 2200) as number;
+  }
+
+  /** 单步推进一个阶段（无定时器，便于在运行态停留目检）。 */
+  function stepStreaming(): void {
+    stopStreamTimer();
+    if (streamStage.value == 0 && streamBody.value.length == 0 && streamThink.value.length == 0) {
+      streamStages[0].apply();
+      return;
+    }
+    const next = streamStage.value + 1;
+    if (next >= streamStages.length) {
+      return;
+    }
+    streamStage.value = next;
+    streamStages[next].apply();
+  }
+
+  function stopStreamTimer(): void {
+    if (streamTimerId != 0) {
+      clearInterval(streamTimerId);
+      streamTimerId = 0;
+    }
+  }
+
+  function resetStreaming(): void {
+    stopStreamTimer();
+    streamStage.value = 0;
+    streamBody.value = "";
+    streamThink.value = "";
+    streamProcessing.value = [] as UTSJSONObject[];
+    streamingActive.value = false;
+    streamFinalResult.value = null;
+    streamKey.value = streamKey.value + 1;
+  }
+
+  onUnmounted(() => {
+    stopStreamTimer();
+  });
+</script>
+
+<style lang="scss" scoped>
+  .page {
+    width: 100%;
+    height: 100vh;
+    background-color: #f5f6f8;
+  }
+
+  .section {
+    margin: 20rpx;
+    padding: 20rpx;
+    border-radius: 16rpx;
+    background-color: #ffffff;
+  }
+
+  .section-title {
+    font-size: 26rpx;
+    font-weight: 600;
+    color: #33363d;
+    line-height: 40rpx;
+    margin-bottom: 12rpx;
+  }
+
+  .controls {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 16rpx;
+    margin-bottom: 12rpx;
+  }
+
+  .ctrl-btn {
+    margin: 0;
+  }
+
+  .stage-label {
+    font-size: 24rpx;
+    color: #8b8e96;
+  }
+</style>

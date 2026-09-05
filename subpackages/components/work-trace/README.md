@@ -66,10 +66,17 @@ MessageInfo（一轮 = 一条 assistant 消息：think + text 嵌过程标签 + 
 
 ## 验证
 
-- 编译：H5（`cli publish web`）与 app-android（`pnpm uni:build`）双通过
-- 功能：预览页 `#/pages/test-work-trace/test-work-trace` 覆盖
-  运行态展开+计时、成组/单行/正文切断、活动组切换自动收起、终态自动收起一次、
-  手动保持、失败语态、Plan 卡、纯文本轮无轨迹、最终回答独立渲染
+- 单元测试：`pnpm test:conversation`（vitest；配置见 `vitest.config.ts`——.uts 以
+  TS 方言转译 + 按 H5 平台求值条件编译剥离，`tests/setup.ts` 提供
+  UTSJSONObject 垫片）。覆盖分组/去重/状态优先级/类型识别/最终回答分离/
+  指标/行摘要等 45 个用例（`tests/conversation/conversationTrace.test.ts`）。
+- 编译：H5（`cli publish web`）与 app-android（`pnpm uni:build`）双通过。
+  注意 uvue 页面对 UTS(Kotlin) 顶层声明顺序敏感：refs 与被引用函数须先声明。
+- 功能目检：预览页 `#/pages/test-work-trace/test-work-trace` 共 8 个场景
+  （历史终态 / 纯文本 / 重复与去重 / OpenUI 切断 / 失败优先级 / 多文件编辑与
+  Plan 去重 / 同源回答去重 / 流式模拟「自动·下一步·重置」），覆盖运行态展开
+  +计时、成组/单行/正文切断、活动组切换自动收起、终态自动收起一次、手动保持、
+  失败语态、最终回答独立渲染。
 - 性能约束：投影经 computed 缓存（挂 `streamRevision`）；narration 段稳定后
   content 不再变化（mp-html 不重复解析）；SSE 50ms 合并窗与 fingerprint 去重不动
 

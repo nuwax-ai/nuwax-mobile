@@ -343,7 +343,9 @@ function buildRowSummary(row: TraceToolRow): void {
   if (kind == "file-edit") {
     let diffs: NormalizedFileDiffItem[] = [] as NormalizedFileDiffItem[];
     try {
-      diffs = normalizeFileDiffItems(row.processing == null ? resultObj : row.processing);
+      // normalizeFileDiffItems 读 result.data[].type=diff（与 container.vue 同源），
+      // 须传 result 而非整个 processing（data 挂在 result 上）
+      diffs = normalizeFileDiffItems(resultObj);
     } catch (_e) {
       diffs = [] as NormalizedFileDiffItem[];
     }
@@ -576,26 +578,27 @@ export function projectTurnTrace(input: TurnTraceInput): TurnTracePresentation {
       keepIndexMap.set(m.executeId, i);
     }
   }
-  const keptMatches: MarkdownContainerMatch[] = [] as MarkdownContainerMatch[];
-  for (let i = 0; i < matches.length; i++) {
-    if (keepIndexMap.get(matches[i].executeId) == i) {
-      keptMatches.push(matches[i]);
-    }
-  }
 
   // ---- 元素流（保持时间线顺序）----
+  // 遍历完整 matches（而非 keptMatches）：被去重丢弃的标签其文本范围由游标跳过，
+  // 不得落入相邻 narration 段（否则废弃标签会被 mp-html 当正文渲染出卡片）。
   const elements: TraceElement[] = [] as TraceElement[];
   let lastIndex = 0;
   let toolFallbackIndex = 0;
   let orderSeq = 0;
-  for (let i = 0; i < keptMatches.length; i++) {
-    const match = keptMatches[i];
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
     const before = text.substring(lastIndex, match.index);
     if (before.trim().length > 0) {
       elements.push(createTraceElement("narration", before, orderSeq));
       orderSeq++;
     }
     lastIndex = match.endIndex;
+
+    if (keepIndexMap.get(match.executeId) != i) {
+      // 同 executeId 重复标签：只保留最后一次，废弃标签仅推进游标
+      continue;
+    }
 
     const openUi = isOpenUiRenderToolName(match.name) == true;
     if (match.type == "Event" && openUi != true) {
@@ -662,6 +665,9 @@ export function projectTurnTrace(input: TurnTraceInput): TurnTracePresentation {
   }
 
   // ---- 最终回答分离 ----
+  // 注意：被提升为最终回答的正文段只做「标记」（promotedNarrationOrder），
+  // 不从元素流移除——分组仍以完整时间线执行，被提升的正文照样切断前后工具组
+  //（对齐 PC「分组发生在预设过滤之前，保持真实时间线边界」）。
   let outputText = "";
   if (finalResultObj != null) {
     const rawOutput = finalResultObj["outputText"];
@@ -670,24 +676,22 @@ export function projectTurnTrace(input: TurnTraceInput): TurnTracePresentation {
     }
   }
   let finalAnswerText = "";
+  let promotedNarrationOrder = -1;
   if (input.running != true) {
+    const lastNarrationIdx = lastNarrationIndex(dedupedElements);
     if (outputText.length > 0) {
       finalAnswerText = outputText;
       // 末段与 outputText 同源时移出轨迹（即最终回答本身）
-      const lastNarrationIdx = lastNarrationIndex(dedupedElements);
       if (lastNarrationIdx >= 0) {
         const seg = dedupedElements[lastNarrationIdx];
         if (isSameAnswerContent(outputText, seg.text)) {
-          dedupedElements.splice(lastNarrationIdx, 1);
+          promotedNarrationOrder = seg.orderIndex;
         }
       }
-    } else {
+    } else if (lastNarrationIdx >= 0) {
       // 终态回退：最后一段非空正文提升为最终回答
-      const lastNarrationIdx = lastNarrationIndex(dedupedElements);
-      if (lastNarrationIdx >= 0) {
-        finalAnswerText = dedupedElements[lastNarrationIdx].text.trim();
-        dedupedElements.splice(lastNarrationIdx, 1);
-      }
+      finalAnswerText = dedupedElements[lastNarrationIdx].text.trim();
+      promotedNarrationOrder = dedupedElements[lastNarrationIdx].orderIndex;
     }
   } else {
     // 运行态：末元素为非空正文段时即实时回答区（对齐 PC：仅看最后一段，
@@ -699,7 +703,7 @@ export function projectTurnTrace(input: TurnTraceInput): TurnTracePresentation {
       dedupedElements[lastIdx].text.trim().length > 0
     ) {
       finalAnswerText = dedupedElements[lastIdx].text.trim();
-      dedupedElements.splice(lastIdx, 1);
+      promotedNarrationOrder = dedupedElements[lastIdx].orderIndex;
     }
   }
   presentation.finalAnswerText = finalAnswerText;
@@ -737,6 +741,10 @@ export function projectTurnTrace(input: TurnTraceInput): TurnTracePresentation {
     flushRows();
     const item = new TraceItem();
     if (el.kind == "narration") {
+      // 已提升为最终回答的正文段不输出，但其时间线边界已在上方 flush 生效
+      if (el.orderIndex == promotedNarrationOrder) {
+        continue;
+      }
       item.kind = "narration";
       item.id = input.messageKey + "-seg-" + el.orderIndex;
       item.text = el.text;

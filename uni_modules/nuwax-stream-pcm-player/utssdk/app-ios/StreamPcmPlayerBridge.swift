@@ -23,7 +23,27 @@ public class StreamPcmPlayerBridge {
 
     public init() {}
 
+    /// 原生 PCM 不经过 InnerAudioContext，使用 ambient 遵循 iPhone 静音键。
+    /// 录音结束后也要从 playAndRecord 切回；下一次录音由录音器重新配置会话。
+    private func preparePlaybackSession() throws {
+        let session = AVAudioSession.sharedInstance()
+        if session.category != .ambient {
+            try session.setCategory(.ambient, mode: .default)
+        }
+        if engine?.isRunning != true {
+            try session.setActive(true)
+        }
+        let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        NSLog("[PCMPlay] session category=\(session.category.rawValue) outputs=\(outputs) volume=\(session.outputVolume)")
+    }
+
     public func initPlayer(_ sampleRate: NSNumber) {
+        do {
+            try preparePlaybackSession()
+        } catch {
+            NSLog("[PCMPlay] prepare session failed: \(error)")
+            return
+        }
         let sr = sampleRate.doubleValue
         let nextSr = sr > 0 ? sr : 16000
         // 复用已有引擎：不要 release 再重建。engine.stop() 会自惹 AVAudioSession
@@ -36,7 +56,9 @@ public class StreamPcmPlayerBridge {
             self.pending = Data()
             self.droppedBytes = 0
             if engine?.isRunning != true {
-                do { try engine?.start() } catch { /* keep existing graph */ }
+                do { try engine?.start() } catch {
+                    NSLog("[PCMPlay] restart engine failed: \(error)")
+                }
             }
             return
         }
@@ -46,7 +68,9 @@ public class StreamPcmPlayerBridge {
         engine = nil
         format = nil
         self.sampleRate = nextSr
-        let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16,
+        // mixer 的连接使用 Float32；服务端 PCM16 仅作为传输格式，在入队时转换。
+        // 直接把 Int16 连接到 mainMixerNode 会触发 -10868（FormatNotSupported）。
+        let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                 sampleRate: self.sampleRate,
                                 channels: 1,
                                 interleaved: false)
@@ -65,6 +89,7 @@ public class StreamPcmPlayerBridge {
         do {
             try engine.start()
         } catch {
+            NSLog("[PCMPlay] start engine failed: \(error)")
             self.engine = nil
             self.player = nil
         }
@@ -103,24 +128,17 @@ public class StreamPcmPlayerBridge {
             return
         }
         buffer.frameLength = AVAudioFrameCount(frameCount)
-        // PCM16 LE：两个字节拼一个 Int16 样本
-        if let channels = buffer.int16ChannelData {
-            let samples = [Int16](unsafeUninitializedCapacity: frameCount) { rawBuf, count in
-                pending.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                    let bytes = raw.bindMemory(to: UInt8.self)
-                    for i in 0..<frameCount {
-                        let lo = Int16(bytes[i * 2])
-                        let hi = Int16(bytes[i * 2 + 1])
-                        rawBuf[i] = Int16((hi << 8) | (lo & 0xff))
-                    }
-                }
-                count = frameCount
-            }
+        guard let channel = buffer.floatChannelData?[0] else { return }
+        // PCM16 LE 有符号样本归一化到 [-1, 1)，保留服务端采样率和时长。
+        pending.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let bytes = raw.bindMemory(to: UInt8.self)
             for i in 0..<frameCount {
-                channels[0][i] = samples[i]
+                let bits = UInt16(bytes[i * 2]) | (UInt16(bytes[i * 2 + 1]) << 8)
+                channel[i] = Float(Int16(bitPattern: bits)) / 32768.0
             }
         }
-        pending.removeAll()
+        // WebSocket 分帧不保证样本对齐，保留末尾不足一个样本的字节。
+        pending = Data(pending.dropFirst(frameCount * Int(bytesPerFrame)))
         let frames = Int64(frameCount)
         player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: { [weak self] in
             guard let self = self else { return }
@@ -144,8 +162,17 @@ public class StreamPcmPlayerBridge {
     }
 
     public func playNow() {
-        guard let player = player else { return }
+        guard let player = player, let engine = engine else { return }
         if started { return }
+        if !engine.isRunning {
+            do {
+                try preparePlaybackSession()
+                try engine.start()
+            } catch {
+                NSLog("[PCMPlay] resume before play failed: \(error)")
+                return
+            }
+        }
         started = true
         player.play()
     }

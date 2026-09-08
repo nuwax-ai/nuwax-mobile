@@ -1,0 +1,85 @@
+/** 纯状态机：不依赖聊天、Vue 或平台 API。计时器由容器持有。 */
+export class OfflineH5Session {
+  phase: string = "idle";
+  requestId: string = "";
+  requestKey: string = "";
+  scopeKey: string = "";
+  localUrl: string = "";
+  remoteUrl: string = "";
+  documentUrl: string = "";
+  private revision: number = 0;
+
+  private nextRequest(): void {
+    this.revision += 1;
+    this.requestId = `${Date.now()}-${this.revision}`;
+  }
+
+  private pagePathOf(url: string): string {
+    const hashIndex = url.indexOf("#");
+    const hash = hashIndex >= 0 ? url.substring(hashIndex + 1) : url;
+    const queryIndex = hash.indexOf("?");
+    return queryIndex >= 0 ? hash.substring(0, queryIndex) : hash;
+  }
+
+  open(key: string, scope: string, local: string, remote: string, useLocal: boolean): void {
+    // H5 框架对同路径不同 query 的再进入会复用缓存的页面组件（keep-alive），
+    // 业务数据不会刷新；只有目标页面路径变化时才允许软导航复用文档。
+    const samePage = this.pagePathOf(this.localUrl) == this.pagePathOf(local);
+    const reuseDocument = useLocal && this.phase == "ready-local" && this.scopeKey == scope && !samePage;
+    this.nextRequest();
+    this.requestKey = key;
+    this.scopeKey = scope;
+    this.localUrl = local;
+    this.remoteUrl = remote;
+    this.phase = reuseDocument ? "navigating-local" : (useLocal ? "loading-local" : "loading-remote");
+    this.documentUrl = this.withRequestId(useLocal ? local : remote);
+  }
+
+  withRequestId(url: string): string {
+    // 请求身份放在 hash query，页面 onLoad 可直接捕获，不包含账号凭据。
+    const hashIndex = url.indexOf("#");
+    const hash = hashIndex >= 0 ? url.substring(hashIndex) : "";
+    let search = hashIndex >= 0 ? url.substring(0, hashIndex) : url;
+    // search 段的 attempt 随每次尝试变化：WKWebView 对仅 fragment 不同的 src 赋值不触发
+    // 文档重载，软导航超时后的本地重载会退化为纯等待（真机实测 12s 死等后才回退远程）。
+    const attemptJoin = search.includes("?") ? "&" : "?";
+    search = `${search}${attemptJoin}offlineH5Attempt=${encodeURIComponent(this.requestId)}`;
+    if (hash.length == 0) return search;
+    const idJoin = hash.includes("?") ? "&" : "?";
+    return `${search}${hash}${idJoin}offlineH5RequestId=${encodeURIComponent(this.requestId)}`;
+  }
+
+  accepts(id: string): boolean {
+    return id.length > 0 && id == this.requestId && this.phase != "idle" && this.phase != "failed";
+  }
+
+  ready(id: string): boolean {
+    if (!this.accepts(id)) return false;
+    if (this.phase == "ready-local" || this.phase == "ready-remote") return false;
+    this.phase = this.phase == "loading-remote" ? "ready-remote" : "ready-local";
+    return true;
+  }
+
+  /** 每次降级都换 requestId，旧文档/旧定时器无法完成新的尝试。 */
+  timeout(id: string): boolean {
+    if (!this.accepts(id)) return false;
+    if (this.phase == "ready-local" || this.phase == "ready-remote") return false;
+    const previous = this.phase;
+    this.nextRequest();
+    if (previous == "navigating-local") {
+      this.phase = "loading-local";
+      this.documentUrl = this.withRequestId(this.localUrl);
+    } else if (previous == "loading-local" && this.remoteUrl.length > 0) {
+      this.phase = "loading-remote";
+      this.documentUrl = this.withRequestId(this.remoteUrl);
+    } else {
+      this.phase = "failed";
+    }
+    return true;
+  }
+
+  cancel(): void {
+    this.nextRequest();
+    this.phase = "idle";
+  }
+}

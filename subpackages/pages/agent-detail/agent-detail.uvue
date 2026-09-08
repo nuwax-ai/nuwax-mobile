@@ -10,20 +10,23 @@
 	<view class="app-redirect-placeholder"></view>
 	<!-- #endif -->
 	<!-- #ifndef APP-IOS -->
-	<!-- App 端（Android / 鸿蒙）：通过 web-view 内嵌 H5 同页（H5 侧渲染聊天组件），透传当前页 agentId / conversationId。
+	<!-- App 端（Android / 鸿蒙）：离线 H5 容器（本地包优先、远程回退），透传当前页 agentId / conversationId。
 	     webview 全屏铺满（含状态栏/刘海区域），顶部刘海由内嵌 H5 的 custom-nav-bar 内部
 	     safety-zone 依据 URL fragment 注入的 statusBarHeight 自行占位（原生不再加 status-bar-spacer）。 -->
 	<view class="app-webview-root">
-		<web-view
-			id="agent-detail-webview"
-			class="webview-fill"
-			v-if="webViewAlive"
-			:src="agentDetailWebUrl"
-			@load="handleWebViewLoad"
+		<offline-h5-container
+			v-if="webViewAlive && offlineChatReady"
+			:request="offlineChatRequest"
+			:loading-text="t('Mobile.Page.loading')"
+			:error-text="t('Mobile.Link.openFailed')"
+			@context-ready="handleOfflineContextReady"
+			@document-load="handleWebViewLoad"
 			@message="handleWebViewMessage"
-			:bounces="false"
-			:android-nested-scroll="'none'"
-		/>
+		>
+			<template #loading>
+				<chat-skeleton />
+			</template>
+		</offline-h5-container>
 		<!-- 不可见 sibling 占位（勿删）：Android 上页面仅有 web-view 单节点时走全屏原生层，
 		     createWebviewContext 拿不到 context，evalJS 注入失效；该占位使 web-view 保持普通节点模式。 -->
 		<view class="webview-node-placeholder" />
@@ -46,10 +49,11 @@
 	// #ifdef APP
 	// #ifndef APP-IOS
 	import { onLoad, onBackPress } from '@dcloudio/uni-app'
+	import { createChatOfflineH5Request } from '@/utils/chatOfflineH5'
 	import { getApiBaseUrl } from '@/constants/config'
 	import { ACCESS_TOKEN } from '@/constants/home.constants'
 	import { getUploadFileAction } from '@/constants/common.constants'
-	import { getStatusBarHeight, openExternalLinkPage } from '@/utils/system.uts'
+	import { openExternalLinkPage } from '@/utils/system.uts'
 	import { consumeLatestPendingOpenUiAction } from '@/utils/pendingOpenUiAction.uts'
 	import {
 		acknowledgeAppNativePayResult,
@@ -101,8 +105,10 @@
 
 	// #ifdef APP
 	// #ifndef APP-IOS
-	/** App 端 web-view 加载的 H5 同页地址，形如 {API_BASE_URL}/m/#/subpackages/pages/agent-detail/agent-detail?id=xxx&conversationId=yyy&accessToken=xxx */
-	const agentDetailWebUrl = ref<string>("")
+	/** App 端离线容器请求（本地包优先、远程回退），形如 chat:<agentId>:<conversationId>；
+	 *  onLoad 组装完成后 offlineChatReady 置 true 才挂容器，避免空请求开出无效地址。 */
+	const offlineChatRequest = ref<UTSJSONObject>({})
+	const offlineChatReady = ref<boolean>(false)
 	/** iOS 26 WKWebView 释放竞态缓解：退出页面前先卸载 web-view 节点（v-if），
 	 *  延时后再执行真实导航，把 webview 销毁从页面栈 pop 的关键路径上摘出来。 */
 	const webViewAlive = ref<boolean>(true)
@@ -307,8 +313,8 @@
 		let ctx: WebviewContext | null = appWebViewBridgeContext
 		if (ctx == null) {
 			try {
-				// 官方示例传组件实例辅助平台绑定，避免创建 context 失败
-				ctx = uni.createWebviewContext("agent-detail-webview", instance?.proxy)
+				// 容器内 web-view 的 id；@context-ready 正常到达时已缓存，此处仅兜底
+				ctx = uni.createWebviewContext("offline-h5-webview", instance?.proxy)
 				appWebViewBridgeContext = ctx
 			} catch (e) {
 				return false
@@ -349,9 +355,14 @@
 	 * 避免 Android 上加载期 evalJS 落在 about:blank / 中间文档、被后续导航丢弃
 	 * （此前自动注入失败根因）。短窗口 5s 覆盖 H5 异步分包延迟注册 __nuwaxSetAppEmbedded 的情况。
 	 */
+	/** 容器 web-view 上下文就绪：缓存供语音桥 evalJS 回传使用（替代按 id 创建） */
+	function handleOfflineContextReady(context: WebviewContext): void {
+		appWebViewBridgeContext = context
+	}
+
 	function startAppWebViewBridge(): void {
-		// URL 尚未生成（onLoad 未执行 / 无 id 参数）时不启动
-		if (agentDetailWebUrl.value.length == 0) {
+		// 请求尚未生成（onLoad 未执行 / 无 id 参数）时不启动
+		if (offlineChatReady.value != true) {
 			return
 		}
 		// 幂等重启：@load 重复触发只重开窗口
@@ -387,7 +398,7 @@
 		try {
 			let ctx = appWebViewBridgeContext
 			if (ctx == null) {
-				ctx = uni.createWebviewContext("agent-detail-webview", instance?.proxy)
+				ctx = uni.createWebviewContext("offline-h5-webview", instance?.proxy)
 				appWebViewBridgeContext = ctx
 			}
 			if (ctx != null) {
@@ -2500,23 +2511,11 @@
 		if (agentId.length == 0) {
 			return
 		}
-		let webUrl = `${getApiBaseUrl()}/m/#/subpackages/pages/agent-detail/agent-detail?id=${agentId}&appEmbedded=1`
 		const conversationId = convRaw != null ? `${convRaw}` : ""
-		if (conversationId.length > 0) {
-			webUrl = `${webUrl}&conversationId=${conversationId}`
-		}
-		// 状态栏（刘海）高度注入：webview 全屏铺满后顶部刘海区域由 H5 内部导航栏处理，
-		// 此参数供内嵌 H5 的 custom-nav-bar safety-zone 在页面内做状态栏占位（见 getEmbeddedStatusBarHeight）。
-		webUrl = `${webUrl}&statusBarHeight=${getStatusBarHeight()}`
-		// URL 参数兜底透传登录态：追加到 hash fragment（# 后内容仅客户端可见，不会随 HTTP 请求发往服务端）。
-		// H5 侧聊天组件 onLoad 读取并写入 storage / ticket cookie。
-		// 与 @load evalJS 注入互为备份：任一成功即可完成登录态透传（脚本幂等，重复无副作用）。
-		const tokenRaw = uni.getStorageSync(ACCESS_TOKEN)
-		const accessToken = tokenRaw != null ? `${tokenRaw}` : ""
-		if (accessToken.length > 0) {
-			webUrl = `${webUrl}&accessToken=${encodeURIComponent(accessToken)}`
-		}
-		agentDetailWebUrl.value = webUrl
+		// 离线容器请求：本地包优先、远程 /m/ 回退。路由参数（statusBarHeight / appEmbedded /
+		// accessToken、apiBase）由 chatOfflineH5 与 projectOfflineH5 统一组装，与 iOS 常驻壳同一套协议。
+		offlineChatRequest.value = createChatOfflineH5Request(agentId, conversationId)
+		offlineChatReady.value = true
 		// 尽早复位 webview textZoom：webview 挂载后立刻生效，避免 H5 首帧以放大字号渲染
 		fixAppWebviewTextZoom()
 		// 键盘高度桥：系统键盘高度 → 内嵌 H5（幂等注册，onUnmounted 注销）

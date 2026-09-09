@@ -63,11 +63,15 @@ export class StreamPcmRecorderBridge {
     this.onFrameCb = callback
   }
 
+  /** 上一轮 capturer.stop+release 尚未完成时，下一轮 start 须等它结束 */
+  private releaseWait: Promise<void> | null = null
+
   /**
    * 开始录音：清旧状态 → 异步创建 AudioCapturer（16kHz mono PCM16）→ 写 filePath。
    * filePath 为绝对沙箱路径；durationMs 毫秒后自动停止（0 = 不限时长）。
    */
   start(filePath: string, durationMs: number): void {
+    const wait = this.releaseWait
     this.stopInternal(false)
     this.gen += 1
     const g = this.gen
@@ -76,7 +80,17 @@ export class StreamPcmRecorderBridge {
     this.started = false
     this.recordedBytes = 0
     this.clearDurationTimer()
-    this.initCapturer(g, durationMs)
+    const begin = (): void => {
+      if (!this.running || g != this.gen) {
+        return
+      }
+      this.initCapturer(g, durationMs)
+    }
+    if (wait != null) {
+      wait.then(begin).catch(begin)
+      return
+    }
+    begin()
   }
 
   private async initCapturer(g: number, durationMs: number): Promise<void> {
@@ -257,13 +271,22 @@ export class StreamPcmRecorderBridge {
     const capturer = this.capturer
     this.capturer = null
     if (capturer != null) {
-      capturer.stop().catch((e: Error) => {
-        console.warn('[StreamPcmRecorderBridge] stop failed', e)
-      })
-      // release 不可逆，可在任意状态调用；stop 未完成时调用由框架兜底
-      capturer.release().catch((e: Error) => {
-        console.warn('[StreamPcmRecorderBridge] release failed', e)
-      })
+      // 鸿蒙须先 stop 再 release；并行调用会报 system error，且挡住下一轮 createAudioCapturer
+      this.releaseWait = capturer.stop()
+        .then((): Promise<void> => {
+          return capturer.release()
+        })
+        .catch((e: Error): Promise<void> => {
+          console.warn('[StreamPcmRecorderBridge] stop failed', e)
+          return capturer.release()
+        })
+        .then((): void => {
+          this.releaseWait = null
+        })
+        .catch((e2: Error): void => {
+          console.warn('[StreamPcmRecorderBridge] release failed', e2)
+          this.releaseWait = null
+        })
     }
     // 仅在真正开录后回传 onStop（stop 早于 onStart 的看门狗场景不发，避免空文件推 ASR）
     if (emitStop && wasStarted) {

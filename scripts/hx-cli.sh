@@ -47,4 +47,63 @@ if [[ ${#args[@]} -gt 0 ]]; then
   esac
 fi
 
-exec "$CLI" "${args[@]}"
+# App 编译必须带入与当前源码匹配的完整离线资源。
+hx_run() {
+  "${HX_NODE:-/Applications/HBuilderX.app/Contents/HBuilderX/plugins/node/node}" "$@"
+}
+cli_kind=""
+case "${1:-}:${2:-}" in
+  launch:app-*|publish:app|pack:app*)
+    hx_run "$SCRIPT_DIR/prepare-offline-h5.mjs"
+    cli_kind="${1}:${2}"
+    ;;
+esac
+
+cli_status=0
+"$CLI" "${args[@]}" || cli_status=$?
+
+# 编译成功不代表离线资源完整：uni 编译器会按平台过滤 static/ 下的目录段
+# （如 static/web），编译后必须对最终 App 资源跑清单校验，缺文件直接失败。
+if [[ -n "$cli_kind" && $cli_status -eq 0 ]]; then
+  verify_targets=()
+  case "$cli_kind" in
+    launch:app-*)
+      # launch 装进设备的是 dist/dev 编译产物，只校验本次目标平台，避免陈旧的其他平台产物误报
+      platform="${2#app-}" # ios / android / harmony
+      if [[ "$platform" == "harmony" ]]; then
+        # 鸿蒙的静态资源位于原生工程 resfile/www，而非 app-harmony/static。
+        for d in "$ROOT_DIR"/unpackage/dist/dev/app-harmony/entry/src/main/resources/resfile/uni-app-x/apps/*/www/static/app/offline-h5; do
+          [[ -d "$d" ]] && verify_targets+=("$d")
+        done
+      else
+        d="$ROOT_DIR/unpackage/dist/dev/app-$platform/static/app/offline-h5"
+        [[ -d "$d" ]] && verify_targets+=("$d")
+      fi
+      if [[ ${#verify_targets[@]} -eq 0 ]]; then
+        echo "[offline-h5] 错误：app-$platform 编译产物缺少离线 H5 资源，请执行 pnpm offline-h5:prepare 后重新编译" >&2
+        exit 1
+      fi
+      ;;
+    publish:app)
+      # appResource 发行产物在 unpackage/resources/app-*（iOS/Android 各一份）
+      for d in "$ROOT_DIR"/unpackage/resources/app-*/static/app/offline-h5; do
+        [[ -d "$d" ]] && verify_targets+=("$d")
+      done
+      ;;
+    pack:app*)
+      # 云打包/本地打包优先校验 resources，缺失时告警跳过
+      for d in "$ROOT_DIR"/unpackage/resources/app-*/static/app/offline-h5; do
+        [[ -d "$d" ]] && verify_targets+=("$d")
+      done
+      ;;
+  esac
+  if [[ ${#verify_targets[@]} -eq 0 ]]; then
+    echo "[offline-h5] 跳过最终包校验：未找到本地编译产物目录（云打包等场景）" >&2
+  else
+    for d in "${verify_targets[@]}"; do
+      echo "[offline-h5] 校验最终包: ${d#"$ROOT_DIR"/}"
+      hx_run "$SCRIPT_DIR/verify-offline-h5-package.mjs" "$d" || cli_status=1
+    done
+  fi
+fi
+exit $cli_status

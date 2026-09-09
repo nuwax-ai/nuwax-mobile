@@ -77,4 +77,4 @@ sdk-fetch:
 
 # 生成本地打包 App 资源（iOS+Android；HX CLI，需 HBuilderX 已启动 + 项目已导入）
 app-resource:
-	@"$(HX_CLI)" publish app --type appResource --project "$(ROOT:%/=%)"
+	@HX_CLI="$(HX_CLI)" bash "$(ROOT)scripts/hx-cli.sh" publish app --type appResource --project "$(ROOT:%/=%)"

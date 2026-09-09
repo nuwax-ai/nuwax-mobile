@@ -4,22 +4,27 @@
 	     Android / 鸿蒙走 zhuoda 独立页 web-view（agent-detail），不使用本壳。 -->
 	<view
 		class="resident-chat-shell"
-		:class="shellVisible ? 'resident-chat-shell--visible' : 'resident-chat-shell--hidden'"
+		:class="[shellVisible ? 'resident-chat-shell--visible' : 'resident-chat-shell--hidden', chatSlideIn ? 'resident-chat-shell--slide' : '']"
+		:style="shellPanStyle"
 	>
-		<web-view
+		<offline-h5-container
 			v-if="shellCreated"
-			id="resident-chat-webview"
-			class="webview-fill"
-			:src="agentDetailWebUrl"
-			@load="handleWebViewLoad"
+			:request="offlineRequest"
+			:paused="offlinePaused"
+			:loading-text="t('Mobile.Page.loading')"
+			:error-text="t('Mobile.Link.openFailed')"
+			@context-ready="handleOfflineContextReady"
+			@document-load="handleWebViewLoad"
 			@message="handleWebViewMessage"
-			:bounces="false"
-			:android-nested-scroll="'none'"
-		/>
-		<!-- Android：兄弟占位，避免单节点走全屏原生层导致 createWebviewContext 失败 -->
-		<view v-if="shellCreated" class="webview-node-placeholder" />
-		<!-- 换会话遮罩：勿把动态 class 绑在 web-view 上（易触发 setSrc；且 @message 在 JavaBridge） -->
-		<view v-if="shellCreated && !shellContentReady" class="resident-chat-shell__mask" />
+			@source-change="handleOfflineSourceChange"
+			@ready="handleOfflinePageReady"
+			@failed="handleOfflinePageFailed"
+		>
+			<!-- 加载态骨架：灰色块聊天形状，配色与 H5 侧启动骨架一致，揭开前后视觉连续 -->
+			<template #loading>
+				<chat-skeleton />
+			</template>
+		</offline-h5-container>
 		<!-- iOS：左边缘触摸常被系统/WKWebView 吃掉，H5 touch 收不到。
 		     用原生透明条盖在 web-view 之上抢手势（与 mask 同为兄弟层，z-index 可盖住 web-view）。 -->
 		<!-- #ifdef APP-IOS -->
@@ -39,7 +44,8 @@
 </template>
 
 <script setup lang="uts">
-	import { ref, computed, onUnmounted, onMounted, getCurrentInstance } from 'vue'
+	import { ref, computed, onUnmounted, onMounted, nextTick } from 'vue'
+	import OfflineH5Container from '@/components/offline-h5-container/offline-h5-container.uvue'
 	import { onShow, onHide } from '@dcloudio/uni-app'
 	import { useI18n, emptyI18nParams } from '@/utils/i18n'
 	// #ifdef APP-IOS
@@ -80,6 +86,9 @@
 	// Android 内嵌 H5 字体放大修复：强制 webview textZoom = 100%
 	import { fixAppWebviewTextZoom } from '@/subpackages/utils/webviewTextZoom'
 	import { RESIDENT_CHAT_EVENT, setResidentChatVisibleFlag, setResidentChatCoverActive, rememberResidentChatSession, isResidentChatVisible, hideResidentChat, navigateAfterResidentChatHidden, setResidentChatBackHandler, openResidentChat } from '@/utils/residentChatShell'
+	import { syncNativeTabBarState } from '@/utils/commonBusiness'
+	import { createChatOfflineH5Request, createChatWarmupRequest } from '@/utils/chatOfflineH5'
+	import { getOfflineH5ScopeKey, isOfflineH5Enabled } from '@/components/offline-h5-container/offline-h5-project'
 	// App 三端原生录音：StreamPcmRecorder（原生采集 + 写文件 + 实时帧转发，边说边传 ASR）
 	import { StreamPcmRecorder } from '@/uni_modules/nuwax-stream-pcm-player'
 	// #endif
@@ -95,17 +104,34 @@
 	const t = (key: string): string => tFn(key, emptyI18nParams(), "")
 
 	// #ifdef APP-IOS
-	const instance = getCurrentInstance()
 
 	/** 内嵌 H5 地址：仅首次挂载写入 :src；之后换会话不改此 ref，避免 setSrc */
-	const agentDetailWebUrl = ref<string>("")
-	/** 当前会话文档 URL（含 _rs，可与业务会话不一致；会话同一性看 currentAgentId） */
+	const offlineRequest = ref<UTSJSONObject>({})
+	const offlinePaused = ref<boolean>(false)
+	let loadedScopeKey = ""
+	let chatPageLoaded = false
+	let warmupTimer = 0
+	/** 当前会话文档 URL（含请求身份参数，可与业务会话不一致；会话同一性看 currentAgentId） */
 	let currentChatUrl: string = ""
-	/** 壳内已加载的智能体 / 会话（忽略 URL _rs 时间戳） */
+	/** 壳内已加载的智能体 / 会话 */
 	let currentAgentId: string = ""
 	let currentConversationId: string = ""
 	/** 首次打开后置 true，之后永不回 false（杜绝 WKWebView 建销） */
 	const shellCreated = ref<boolean>(false)
+	/** 本地离线包路径才启用壳滑入/滑出过渡；远程回退保持瞬时出现，不引入动画等待 */
+	const chatSlideIn = ref<boolean>(false)
+	/** 平移距离 = 屏幕宽度（px）。纯水平 transform，内容不缩放、不重排；
+	 * 避免百分比/混合属性过渡在 uvue iOS 上的插值歧义（会呈现为内容被压缩）。 */
+	const shellPanPx = ref<number>(430)
+	try {
+		shellPanPx.value = uni.getWindowInfo().windowWidth
+	} catch (_ePan) {
+		// ignore
+	}
+	const shellPanStyle = computed((): string => {
+		const x = shellVisible.value ? 0 : shellPanPx.value
+		return `transform: translateX(${x}px);`
+	})
 	/** 覆盖层是否可见（隐藏时 web-view 仍挂载） */
 	const shellVisible = ref<boolean>(false)
 	/** 当前文档是否已加载到目标会话；false 时盖白遮罩 */
@@ -117,8 +143,9 @@
 	let pendingRevealAfterLoad: boolean = false
 	/** 期望揭开的智能体 id（与 H5 app-chat-ready 对齐；无信号时靠 @load 兜底） */
 	let pendingRevealAgentId: string = ""
-	/** 揭开兜底定时器（@load / ready 均未到时避免卡死） */
-	let revealFallbackTimer: number = 0
+	/** 本次会话的业务身份；异步加载身份由通用容器负责。 */
+	let pendingRevealConversationId = ""
+	let pendingOpenAt = 0
 	/** 系统相册/文件选择等会触发页面 onHide：避免误判 */
 	let suppressHideUnmount: boolean = false
 	/** @load 后注入短轮询定时器 / 次数 / 成功上报标记 */
@@ -154,14 +181,6 @@
 		appWebViewBridgeAttempts = 0
 	}
 
-	function showTabBarSafe(): void {
-		try {
-			uni.showTabBar({ animation: false })
-		} catch (_e) {
-			// ignore
-		}
-	}
-
 	function hideTabBarSafe(): void {
 		try {
 			uni.hideTabBar({ animation: false })
@@ -191,12 +210,6 @@
 		fn()
 	}
 
-	function clearRevealFallbackTimer(): void {
-		if (revealFallbackTimer != 0) {
-			clearTimeout(revealFallbackTimer)
-			revealFallbackTimer = 0
-		}
-	}
 
 	/**
 	 * 尽快撤掉首页 opening-cover（z-index 高于壳）。
@@ -209,9 +222,13 @@
 
 	/** 揭开常驻壳（换会话完成后 / 兜底）。桥注入由调用方在 startAppWebViewBridge 声明后触发。 */
 	function revealChatShellOnMain(): void {
-		clearRevealFallbackTimer()
 		pendingRevealAfterLoad = false
 		pendingRevealAgentId = ""
+		pendingRevealConversationId = ""
+		if (pendingOpenAt > 0) {
+			console.log(`[resident-chat] revealed in ${Date.now() - pendingOpenAt}ms`)
+			pendingOpenAt = 0
+		}
 		shellVisible.value = true
 		shellContentReady.value = true
 		releaseOpeningCover()
@@ -230,136 +247,55 @@
 		}
 	}
 
-	function scheduleRevealFallback(ms: number): void {
-		clearRevealFallbackTimer()
-		revealFallbackTimer = setTimeout((): void => {
-			revealFallbackTimer = 0
-			runOnMainThread((): void => {
-				if (!pendingRevealAfterLoad) {
-					return
-				}
-				revealChatShellOnMain()
-			})
-		}, ms) as number
-	}
-
-	/**
-	 * 换会话：先把当前文档刷成白底，再 location.replace（带 _rs 强制整页导航）。
-	 * 禁止仅改 hash / SPA soft-nav：Android WebView 常不重载文档，会一直显示旧会话。
-	 * 也不做 idle 预热隐藏 web-view：Android 原生层常无视 CSS 显隐，会盖住首页导致「回首页空白」。
-	 */
-	function navigateWebViewToUrl(url: string): void {
-		try {
-			let ctx = appWebViewBridgeContext
-			if (ctx == null) {
-				ctx = uni.createWebviewContext("resident-chat-webview", instance?.proxy)
-				appWebViewBridgeContext = ctx
-			}
-			if (ctx != null) {
-				const literal = JSON.stringify(url)
-				// 刷白 + 简易 loading，随后整页 replace；首页 opening-cover 可在刷白后立刻撤掉
-				ctx.evalJS(
-					"try{document.documentElement.style.background='#fff';var b=document.body;if(b){b.style.background='#fff';b.style.minHeight='100vh';b.innerHTML='';}}catch(_c){}try{location.replace(" +
-						literal +
-						")}catch(_n){}",
-				)
-				return
-			}
-		} catch (_eNav) {
-			// fall through
-		}
-		// 改 :src 易在加载中触发 setSrc / 重绑崩溃：推迟到事件栈外
-		const nextUrl = url
-		setTimeout((): void => {
-			runOnMainThread((): void => {
-				agentDetailWebUrl.value = nextUrl
-			})
-		}, 0)
-	}
-
-	/**
-	 * 打开/切换会话。
-	 * - 同会话：直接揭开（内容已是目标，勿重载）
-	 * - 异会话：白遮罩 → 整页 replace(_rs) → H5 清空后 app-chat-cleared 早揭（loading），ready 校正
-	 */
+	/** 打开/切换只提交业务请求；WebView、导航、超时和回退由容器管理。 */
 	function openChatOnMain(agentId: string, conversationId: string, url: string): void {
-		if (agentId.length == 0) {
-			return
-		}
-		if (url.length == 0) {
-			return
-		}
-		const alreadyCreated = shellCreated.value
-		const sameSession =
-			alreadyCreated &&
-			currentAgentId == agentId &&
-			currentConversationId == conversationId
+		if (agentId.length == 0 || url.length == 0) return
+		const scope = getOfflineH5ScopeKey()
+		const sameSession = currentAgentId == agentId && currentConversationId == conversationId && loadedScopeKey == scope
+		if (sameSession && pendingRevealAfterLoad) return
 		setResidentChatVisibleFlag(true)
 		hideTabBarSafe()
-
-		if (!alreadyCreated) {
-			// 首次：壳立刻盖住首页；opening-cover 只挡极短一瞬，勿等 H5 整页/API
-			setResidentChatCoverActive(true)
-			shellContentReady.value = false
-			pendingRevealAfterLoad = true
-			pendingRevealAgentId = agentId
-			clearRevealFallbackTimer()
-			agentDetailWebUrl.value = url
-			shellCreated.value = true
-			currentChatUrl = url
-			currentAgentId = agentId
-			currentConversationId = conversationId
-			rememberResidentChatSession(agentId, conversationId)
-			shellVisible.value = true
-			fixAppWebviewTextZoom()
-			setTimeout((): void => {
-				releaseOpeningCover()
-			}, 40)
-			scheduleRevealFallback(5000)
+		offlinePaused.value = false
+		if (sameSession && chatPageLoaded) {
+			revealChatShellOnMain()
 			return
 		}
-
-		if (sameSession) {
-			pendingRevealAfterLoad = false
-			pendingRevealAgentId = ""
-			clearRevealFallbackTimer()
-			shellContentReady.value = true
-			shellVisible.value = true
-			releaseOpeningCover()
-			fixAppWebviewTextZoom()
-			// 同会话再开不重载 H5：须主动清掉可能残留的键盘垫高
-			latestInjectedKeyboardHeight = 0
-			try {
-				const ctx = appWebViewBridgeContext
-				if (ctx != null) {
-					ctx.evalJS(
-						"try{window.__nuwaxKeyboardHeight=0;window.dispatchEvent(new CustomEvent('nuwax:keyboardHeightChange',{detail:{height:0,safeAreaBottom:window.__nuwaxSafeAreaBottom||0}}));}catch(e){}",
-					)
-				}
-			} catch (_eKbClearSame) {
-				// ignore
-			}
-			return
-		}
-
-		// 换会话：先盖 opening-cover → 刷白+replace → 立刻撤 cover（防闪旧内容已由刷白完成）
-		setResidentChatCoverActive(true)
+		stopWebViewBridge()
+		chatPageLoaded = false
 		shellContentReady.value = false
-		shellVisible.value = true
 		pendingRevealAfterLoad = true
 		pendingRevealAgentId = agentId
-		currentChatUrl = url
+		pendingRevealConversationId = conversationId
+		pendingOpenAt = Date.now()
 		currentAgentId = agentId
 		currentConversationId = conversationId
-		rememberResidentChatSession(agentId, conversationId)
-		stopWebViewBridge()
-		appWebViewBridgeReported = false
-		navigateWebViewToUrl(url)
-		fixAppWebviewTextZoom()
-		setTimeout((): void => {
-			releaseOpeningCover()
-		}, 80)
-		scheduleRevealFallback(5000)
+		loadedScopeKey = scope
+		const nextRequest = createChatOfflineH5Request(agentId, conversationId)
+		chatSlideIn.value = nextRequest['preferLocal'] == true
+		offlineRequest.value = nextRequest
+		shellCreated.value = true
+		// 容器骨架挂载后再揭开壳：立即置 shellVisible 会让 WebView 里残留的
+		// 上一个会话在骨架出现前闪现（换会话闪旧页的根因），等一轮渲染遮罩就位。
+		nextTick((): void => {
+			shellVisible.value = true
+		})
+		// 容器自行显示加载态；首页遮罩无需等待网络或页面 READY。
+		releaseOpeningCover()
+	}
+
+	function warmUpLocalChatShell(): void {
+		if (shellCreated.value || !isOfflineH5Enabled()) return
+		offlineRequest.value = createChatWarmupRequest()
+		offlinePaused.value = false
+		shellCreated.value = true
+	}
+
+	function handleOfflineContextReady(context: WebviewContext): void {
+		appWebViewBridgeContext = context
+	}
+
+	function handleOfflineSourceChange(url: string): void {
+		currentChatUrl = url
 	}
 
 	function openChat(agentId: string, conversationId: string, url: string): void {
@@ -371,7 +307,9 @@
 	function hideChatShellOnMain(restoreTabBar: boolean): void {
 		pendingRevealAfterLoad = false
 		pendingRevealAgentId = ""
-		clearRevealFallbackTimer()
+		pendingRevealConversationId = ""
+		pendingOpenAt = 0
+		offlinePaused.value = true
 		latestInjectedKeyboardHeight = 0
 		shellVisible.value = false
 		shellContentReady.value = false
@@ -382,9 +320,11 @@
 		} catch (_eStop) {
 			// ignore
 		}
-		// restoreTabBar 为 true 时务必恢复：勿再依赖「壳仍可见」判断（异步 hide 时 flag 可能已清，会导致 TabBar 永久消失）
+		// restoreTabBar 为 true 时重新校准原生 tabBar：
+		// 自绘底栏模式保持隐藏（常隐），兜底模式（CUSTOM_TAB_BAR_ENABLED=false）恢复原生栏。
+		// 勿再依赖「壳仍可见」判断（异步 hide 时 flag 可能已清，会导致底栏状态永久错乱）
 		if (restoreTabBar == true) {
-			showTabBarSafe()
+			syncNativeTabBarState()
 		}
 	}
 
@@ -399,9 +339,6 @@
 		}
 		try {
 			let ctx = appWebViewBridgeContext
-			if (ctx == null) {
-				ctx = uni.createWebviewContext("resident-chat-webview", instance?.proxy)
-			}
 			if (ctx != null) {
 				ctx.evalJS(
 					"try{window.stop&&window.stop();}catch(_s){}try{location.replace('about:blank');}catch(_b){}",
@@ -410,7 +347,9 @@
 		} catch (_eBlank) {
 			// ignore
 		}
-		agentDetailWebUrl.value = "about:blank"
+		offlinePaused.value = true
+		chatPageLoaded = false
+		loadedScopeKey = ""
 		currentChatUrl = ""
 		currentAgentId = ""
 		currentConversationId = ""
@@ -667,7 +606,7 @@
 		if (ctx == null) {
 			try {
 				// 官方示例传组件实例辅助平台绑定，避免创建 context 失败
-				ctx = uni.createWebviewContext("resident-chat-webview", instance?.proxy)
+				ctx = appWebViewBridgeContext
 				appWebViewBridgeContext = ctx
 			} catch (e) {
 				return false
@@ -710,7 +649,7 @@
 	 * （此前自动注入失败根因）。短窗口 5s 覆盖 H5 异步分包延迟注册 __nuwaxSetAppEmbedded 的情况。
 	 */
 	function startAppWebViewBridge(): void {
-		// 只用非响应式 currentChatUrl，避免在 web-view 事件回调里读 agentDetailWebUrl.value
+		// 只用非响应式 currentChatUrl，避免在 web-view 事件回调里读响应式 ref
 		// （Android 上易触发 trackEffects NPE：ReactiveEffect 为 null）
 		if (currentChatUrl.length == 0) {
 			return
@@ -744,41 +683,29 @@
 		}, 0)
 	}
 
-	function tryRevealPendingChat(agentId: string): void {
-		if (pendingRevealAfterLoad != true) {
-			return
-		}
-		if (
-			pendingRevealAgentId.length > 0 &&
-			agentId.length > 0 &&
-			agentId != pendingRevealAgentId
-		) {
-			return
-		}
-		deferAfterWebViewEvent((): void => {
-			if (!pendingRevealAfterLoad) {
-				return
-			}
-			revealChatShellOnMain()
-			startAppWebViewBridge()
-		})
+	function handleOfflinePageReady(info: UTSJSONObject): void {
+		const key = info["requestKey"] != null ? `${info["requestKey"]}` : ""
+		if (key == "warmup") return
+		const target = `chat:${currentAgentId}:${currentConversationId}`
+		if (key != target || info["scopeKey"] != getOfflineH5ScopeKey()) return
+		chatPageLoaded = true
+		rememberResidentChatSession(currentAgentId, currentConversationId)
+		revealChatShellOnMain()
+		startAppWebViewBridge()
 	}
 
-	/** webview 文档加载完成：启桥；@load 即可揭壳（勿再等 600ms / 整段 API） */
+	function handleOfflinePageFailed(_info: UTSJSONObject): void {
+		// 失败由容器显示重试操作，不把错误页记成已加载会话。
+		chatPageLoaded = false
+		pendingRevealAfterLoad = false
+		releaseOpeningCover()
+	}
+
 	function handleWebViewLoad(_event: UniWebViewLoadEvent): void {
+		// 文档完成仅负责安装业务桥，不能当作页面可用信号。
 		deferAfterWebViewEvent((): void => {
-			if (!shellVisible.value && !pendingRevealAfterLoad) {
-				return
-			}
 			fixAppWebviewTextZoom()
 			startAppWebViewBridge()
-			releaseOpeningCover()
-			if (pendingRevealAfterLoad) {
-				// 文档已到：揭开壳内 mask，H5 侧 boot loading / 消息加载继续进行
-				revealChatShellOnMain()
-			} else {
-				shellContentReady.value = true
-			}
 		})
 	}
 
@@ -790,7 +717,7 @@
 		try {
 			let ctx = appWebViewBridgeContext
 			if (ctx == null) {
-				ctx = uni.createWebviewContext("resident-chat-webview", instance?.proxy)
+				ctx = appWebViewBridgeContext
 				appWebViewBridgeContext = ctx
 			}
 			if (ctx != null) {
@@ -2817,6 +2744,7 @@
 				return
 			}
 		}
+		// 阈值触发返回（不做逐帧跟手：JS 逐帧跨桥写样式不丝滑），滑出由 CSS 过渡完成
 		if (dx < edgeBackMinDx()) {
 			return
 		}
@@ -2969,22 +2897,8 @@
 			navigateAfterResidentChatHidden()
 			return
 		}
-		if (type == "app-chat-cleared") {
-			if (pendingRevealAfterLoad != true) {
-				return
-			}
-			const clearedId = msg["agentId"] != null ? `${msg["agentId"]}` : ""
-			tryRevealPendingChat(clearedId)
-			return
-		}
-		if (type == "app-chat-ready") {
-			// 头图/标题就绪；若 cleared 已揭过则只校正桥接
-			if (pendingRevealAfterLoad != true) {
-				startAppWebViewBridge()
-				return
-			}
-			const readyId = msg["agentId"] != null ? `${msg["agentId"]}` : ""
-			tryRevealPendingChat(readyId)
+		if (type == "app-chat-cleared" || type == "app-chat-ready" || type == "LOCAL_APP_BOOT") {
+			// 旧业务消息无请求身份，不能完成通用容器的 PAGE_READY 握手。
 			return
 		}
 		if (type == "app-nav-back") {
@@ -3104,6 +3018,12 @@
 			appKeyboardHeightListenerId = uni.onKeyboardHeightChange(onAppKeyboardHeightChangeForWebView)
 		}
 		// #endif
+		// 空闲预热本地包：避开首屏渲染竞争，延迟到首页稳定后隐藏加载
+		warmupTimer = setTimeout((): void => {
+			runOnMainThread((): void => {
+				warmUpLocalChatShell()
+			})
+		}, 1500)
 	})
 
 	onShow(() => {
@@ -3127,6 +3047,7 @@
 	})
 
 	onUnmounted(() => {
+		if (warmupTimer != 0) clearTimeout(warmupTimer)
 		setResidentChatBackHandler(null)
 		uni.$off(RESIDENT_CHAT_EVENT, onResidentChatEvent)
 		stopWebViewBridge()
@@ -3153,16 +3074,20 @@
 		background-color: #ffffff;
 	}
 
+	/* 位移由内联样式 shellPanStyle 提供（px 纯平移）；这里只管命中区域 */
 	.resident-chat-shell--hidden {
-		transform: translateX(100%);
 		pointer-events: none;
-		opacity: 0;
 	}
 
 	.resident-chat-shell--visible {
-		transform: translateX(0);
 		pointer-events: auto;
-		opacity: 1;
+	}
+
+	/* 本地离线路径的滑入/滑出：仅动画 transform，纯平移不压缩内容 */
+	.resident-chat-shell--slide {
+		transition-property: transform;
+		transition-duration: 240ms;
+		transition-timing-function: ease-out;
 	}
 
 	.webview-fill {
@@ -3204,4 +3129,6 @@
 		opacity: 0;
 		pointer-events: none;
 	}
+
+	/* 离线容器加载骨架见 components/chat-skeleton（共享组件） */
 </style>

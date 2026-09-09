@@ -1,1 +1,0 @@
-import{d as e,p as s,o as t,e as a,F as n,E as l,f as o,bw as r}from"./index-Bubka0W8.js";const p=e({__name:"safety-zone",props:{addHeight:{type:Number,default:0}},setup(e){const p=r();return(r=null,u=null)=>{const d=o;return s(p)>0?(t(),a(d,new UTSJSONObject({key:0,style:n({height:s(p)+e.addHeight+"px"})}),null,8,["style"])):l("",!0)}}});export{p as _};

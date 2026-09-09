@@ -1,0 +1,186 @@
+<template>
+  <view class="offline-h5-container">
+    <web-view v-if="source.length > 0" id="offline-h5-webview" class="offline-h5-webview"
+      :src="source" :bounces="false" @load="handleDocumentLoad" @message="handleMessage" />
+    <view class="webview-placeholder" />
+    <!-- 遮罩常驻挂载、仅切透明度：v-if 首挂载的绘制比 native WebView 图层慢一帧，
+         换会话时旧内容会在骨架出现前闪现；opacity 切换无首帧绘制延迟。 -->
+    <view class="offline-h5-status" :class="(loading || failed) ? 'offline-h5-status--shown' : 'offline-h5-status--idle'">
+      <slot v-if="loading" name="loading">
+        <text class="offline-h5-status__text">{{ loadingText }}</text>
+      </slot>
+      <view v-else class="offline-h5-status__error">
+        <text class="offline-h5-status__text">{{ errorText }}</text>
+        <button @click="retry">{{ retryText }}</button>
+      </view>
+    </view>
+  </view>
+</template>
+<script setup lang="uts">
+import { ref, watch, getCurrentInstance, onUnmounted, type PropType } from 'vue';
+import { OfflineH5Session } from '@/components/offline-h5-container/offline-h5-session';
+
+const props = defineProps({
+  request: { type: Object as PropType<UTSJSONObject>, required: true },
+  paused: { type: Boolean, default: false },
+  loadingText: { type: String, default: '加载中' },
+  errorText: { type: String, default: '页面加载失败' },
+  retryText: { type: String, default: '重试' },
+});
+const emit = defineEmits<{
+  (e: 'context-ready', context: WebviewContext): void;
+  (e: 'document-load', event: UniWebViewLoadEvent): void;
+  (e: 'message', event: UniWebViewMessageEvent): void;
+  (e: 'ready', info: UTSJSONObject): void;
+  (e: 'failed', info: UTSJSONObject): void;
+  (e: 'source-change', url: string): void;
+}>();
+const instance = getCurrentInstance();
+const session = new OfflineH5Session();
+const source = ref<string>('');
+const loading = ref<boolean>(true);
+const failed = ref<boolean>(false);
+let timer = 0;
+let context: WebviewContext | null = null;
+let disposed = false;
+let openedAt = 0;
+const staleLogged = new Set<string>();
+let timeoutHandler: (id: string) => void = (_id: string): void => {};
+
+function stringOption(key: string): string {
+  const value = props.request[key];
+  return value != null ? `${value}` : '';
+}
+function clearTimer(): void {
+  if (timer != 0) { clearTimeout(timer); timer = 0; }
+}
+function readyInfo(): UTSJSONObject {
+  return { requestId: session.requestId, requestKey: session.requestKey, scopeKey: session.scopeKey, phase: session.phase };
+}
+function publishReady(id: string): void {
+  if (!session.ready(id)) return;
+  clearTimer();
+  loading.value = false;
+  console.log(`[offline-h5] ready phase=${session.phase} elapsed=${Date.now() - openedAt}ms`);
+  emit('ready', readyInfo());
+}
+function loadCurrentDocument(): void {
+  source.value = session.documentUrl;
+  emit('source-change', session.documentUrl);
+}
+function armTimeout(): void {
+  clearTimer();
+  const id = session.requestId;
+  // 软导航要先卸载上一个会话页（TTS/轮询清理）再挂载新页，真机 2s 会误判；
+  // 等 6s 仍远快于远程回退（实测 ~14s）。文档加载维持 12s。
+  const delay = session.phase == 'navigating-local' ? 6000 : 12000;
+  timer = setTimeout(() => {
+    timer = 0;
+    timeoutHandler(id);
+  }, delay);
+}
+function advanceFallback(id: string): void {
+  if (disposed || !session.timeout(id)) return;
+  console.log(`[offline-h5] fallback phase=${session.phase} elapsed=${Date.now() - openedAt}ms`);
+  clearTimer();
+  if (session.phase == 'failed') {
+    loading.value = false;
+    failed.value = true;
+    emit('failed', readyInfo());
+    return;
+  }
+  loadCurrentDocument();
+  armTimeout();
+}
+timeoutHandler = advanceFallback;
+function openRequest(): void {
+  if (disposed || props.paused) return;
+  clearTimer();
+  failed.value = false;
+  loading.value = true;
+  openedAt = Date.now();
+  staleLogged.clear();
+  session.open(stringOption('requestKey'), stringOption('scopeKey'), stringOption('localUrl'), stringOption('remoteUrl'), props.request['preferLocal'] == true);
+  console.log(`[offline-h5] open phase=${session.phase} key=${session.requestKey}`);
+  if (session.phase == 'navigating-local' && context != null) {
+    const route = session.documentUrl.substring(session.documentUrl.indexOf('#') + 1);
+    const payload: UTSJSONObject = { route: route, requestId: session.requestId };
+    context!.evalJS(`window.OfflineH5Bridge && window.OfflineH5Bridge.navigate(${JSON.stringify(payload)})`);
+  } else {
+    loadCurrentDocument();
+  }
+  armTimeout();
+}
+function retry(): void { session.cancel(); openRequest(); }
+function handleDocumentLoad(event: UniWebViewLoadEvent): void {
+  // 原生 web-view 事件回调后再操作响应式状态，避开重入。
+  const id = session.requestId;
+  setTimeout(() => {
+    if (disposed || !session.accepts(id)) return;
+    context = uni.createWebviewContext('offline-h5-webview', instance?.proxy);
+    if (context != null) emit('context-ready', context!);
+    emit('document-load', event);
+    // 远程旧页面可以显式选择文档级兼容；本地页必须完成协议确认。
+    if (session.phase == 'loading-remote' && props.request['remoteReadyPolicy'] == 'document') publishReady(id);
+  }, 0);
+}
+function handleMessage(event: UniWebViewMessageEvent): void {
+  const receivedId = session.requestId;
+  let current: any | null = event.detail.data;
+  for (let depth = 0; current != null && depth < 8; depth++) {
+    if (Array.isArray(current)) {
+      const list = current as any[];
+      current = list.length > 0 ? list[list.length - 1] : null;
+      continue;
+    }
+    const msg = current as UTSJSONObject;
+    const type = msg['type'] != null ? `${msg['type']}` : '';
+    if (type.startsWith('OFFLINE_H5_')) {
+      const id = msg['requestId'] != null ? `${msg['requestId']}` : '';
+      const code = msg['code'] != null ? `${msg['code']}` : '';
+      console.log(`[offline-h5] recv ${type} code=${code} id=${id}`);
+      if (msg['protocolVersion'] != 1) return;
+      if (!session.accepts(id)) {
+        // 迟到的旧请求消息：记录便于排查软导航竞态，不进入业务分发；重发的旧消息只记一次。
+        const key = `${type}:${id}`;
+        if (id.length > 0 && !staleLogged.has(key)) {
+          staleLogged.add(key);
+          console.log(`[offline-h5] stale ${type} dropped id=${id}`);
+        }
+        return;
+      }
+      setTimeout(() => {
+        if (disposed || !session.accepts(id)) return;
+        if (context != null) context!.evalJS(`window.OfflineH5Bridge && window.OfflineH5Bridge.acknowledge(${JSON.stringify(type)},${JSON.stringify(id)})`);
+        if (type == 'OFFLINE_H5_PAGE_READY') publishReady(id);
+        if (type == 'OFFLINE_H5_ERROR') advanceFallback(id);
+      }, 0);
+      return;
+    }
+    if (type.length > 0) {
+      // 业务事件由调用方处理；已被取消文档的离线协议不会流入业务分发器。
+      if (session.accepts(receivedId)) emit('message', event);
+      return;
+    }
+    current = msg['data'];
+  }
+}
+// Kotlin(UVS)对表达式体箭头函数的 SAM 推断有坑：watch getter 必须块体 + 显式返回类型
+watch((): UTSJSONObject => { return props.request; }, () => { openRequest(); }, { immediate: true });
+watch((): boolean => { return props.paused; }, (paused: boolean) => {
+  if (paused) {
+    clearTimer();
+    if (session.phase != 'ready-local' && session.phase != 'ready-remote') session.cancel();
+  } else if (session.phase == 'idle') { openRequest(); }
+});
+onUnmounted(() => { disposed = true; clearTimer(); session.cancel(); context = null; });
+</script>
+<style>
+.offline-h5-container { flex: 1; position: relative; width: 100%; height: 100%; }
+.offline-h5-webview { flex: 1; width: 100%; height: 100%; }
+.webview-placeholder { width: 1px; height: 1px; opacity: 0; }
+.offline-h5-status { position: absolute; left: 0; right: 0; top: 0; bottom: 0; background-color: #ffffff; align-items: center; justify-content: center; opacity: 0; pointer-events: none; }
+.offline-h5-status--shown { opacity: 1; pointer-events: auto; }
+.offline-h5-status__text { color: #9aa3ad; font-size: 14px; }
+.offline-h5-status__error { align-items: center; justify-content: center; }
+</style>

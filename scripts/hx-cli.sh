@@ -70,8 +70,19 @@ if [[ -n "$cli_kind" && $cli_status -eq 0 ]]; then
     launch:app-*)
       # launch 装进设备的是 dist/dev 编译产物，只校验本次目标平台，避免陈旧的其他平台产物误报
       platform="${2#app-}" # ios / android / harmony
-      d="$ROOT_DIR/unpackage/dist/dev/app-$platform/static/app/offline-h5"
-      [[ -d "$d" ]] && verify_targets+=("$d")
+      if [[ "$platform" == "harmony" ]]; then
+        # 鸿蒙的静态资源位于原生工程 resfile/www，而非 app-harmony/static。
+        for d in "$ROOT_DIR"/unpackage/dist/dev/app-harmony/entry/src/main/resources/resfile/uni-app-x/apps/*/www/static/app/offline-h5; do
+          [[ -d "$d" ]] && verify_targets+=("$d")
+        done
+      else
+        d="$ROOT_DIR/unpackage/dist/dev/app-$platform/static/app/offline-h5"
+        [[ -d "$d" ]] && verify_targets+=("$d")
+      fi
+      if [[ ${#verify_targets[@]} -eq 0 ]]; then
+        echo "[offline-h5] 错误：app-$platform 编译产物缺少离线 H5 资源，请执行 pnpm offline-h5:prepare 后重新编译" >&2
+        exit 1
+      fi
       ;;
     publish:app)
       # appResource 发行产物在 unpackage/resources/app-*（iOS/Android 各一份）

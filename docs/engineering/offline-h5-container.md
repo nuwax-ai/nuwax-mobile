@@ -113,6 +113,12 @@ offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
 
 ## 排查
 
+鸿蒙在 `WebView.ets:setSrc` 报 `Invalid resource path or file type` 时，先检查离线包是否入包：
+
+- 源目录必须存在 `static/app/offline-h5/index.html`；该目录是忽略提交的派生产物，拉取代码不会自动得到。
+- 鸿蒙编译产物位于 `unpackage/dist/dev/app-harmony/entry/src/main/resources/resfile/uni-app-x/apps/<appid>/www/static/app/offline-h5/`，不是 Android/iOS 的顶层 `static/`。
+- HBuilderX 界面运行前执行 `pnpm offline-h5:prepare`，再重新编译运行；CLI 可用 `bash scripts/hx-cli.sh launch app-harmony`，自动准备资源并校验上述目录，缺包时返回失败。
+
 日志词表（均不含 token / 完整 URL）：
 
 - `[offline-h5] open phase=... key=...`：本次请求走哪条路径、目标是谁

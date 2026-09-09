@@ -15,14 +15,16 @@
 
 ### 运行时分层
 
+容器通用件（壳、状态机、项目适配、页面就绪约定、软导航、协议源码）统一放在 `components/offline-h5-container/`；业务侧只保留 `utils/chatOfflineH5.uts`（业务适配）与各宿主。
+
 | 层 | 文件 | 职责 |
 |---|---|---|
 | 容器 | `components/offline-h5-container/offline-h5-container.uvue` | 持有 web-view，管理加载遮罩 / 超时 / 回退 / 重试，收发协议消息 |
-| 状态机 | `utils/offlineH5/offlineH5Session.uts` | 纯状态机：阶段流转、requestId 轮换、URL 组装、复用判定 |
-| 项目适配 | `utils/offlineH5/projectOfflineH5.uts` | 入口常量、token / 作用域、总开关（storage `NUWAX_LOCAL_CHAT_H5_DISABLE=1` 关闭）、request 组装 |
-| 页面侧约定 | `utils/offlineH5/offlineH5Page.uts` | H5 页面上报就绪：onLoad 快照上报 + onShow 从当前路由上报 |
-| 软导航 | `utils/offlineH5/offlineH5Navigation.uts` | H5 侧用公开 Vue Router 换页（经轻量过渡页强制重挂载） |
-| 协议源码 | `static/offline-h5/bridge.js`、`static/offline-h5/project-bootstrap.js` | 构建时原样拷入包根；桥负责消息重发 / ACK / navigate；bootstrap 负责 file:// 下注入服务器地址与登录态 |
+| 状态机 | `components/offline-h5-container/offline-h5-session.uts` | 纯状态机：阶段流转、requestId 轮换、URL 组装、复用判定 |
+| 项目适配 | `components/offline-h5-container/offline-h5-project.uts` | 入口常量、token / 作用域、总开关（storage `NUWAX_LOCAL_CHAT_H5_DISABLE=1` 关闭）、request 组装 |
+| 页面侧约定 | `components/offline-h5-container/offline-h5-page.uts` | H5 页面上报就绪：onLoad 快照上报 + onShow 从当前路由上报 |
+| 软导航 | `components/offline-h5-container/offline-h5-navigation.uts` | H5 侧用公开 Vue Router 换页（经轻量过渡页强制重挂载） |
+| 协议源码 | `components/offline-h5-container/offline-h5-bridge.js`、`components/offline-h5-container/offline-h5-project-bootstrap.js` | 构建时原样拷入包根；桥负责消息重发 / ACK / navigate；bootstrap 负责 file:// 下注入服务器地址与登录态 |
 | 业务适配 | `utils/chatOfflineH5.uts` | 只组装聊天路由与 requestKey，不碰加载逻辑 |
 | 宿主（业务） | `components/resident-chat-shell/resident-chat-shell.uvue` | iOS 常驻壳：预热、揭开时机、业务桥（语音 / 支付 / 键盘） |
 
@@ -82,7 +84,7 @@ offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
 
 | 路径 | 内容 | 入库 |
 |---|---|---|
-| `static/offline-h5/` | 协议源码（bridge.js / project-bootstrap.js） | ✅ 需提交，勿当产物删除 |
+| `components/offline-h5-container/` | 容器通用件：壳 / 状态机 / 项目适配 / 页面约定 / 软导航 / 协议源码（bridge、project-bootstrap 随源码提交，构建时拷入包根） | ✅ |
 | `scripts/offline-h5/`、`scripts/*-offline-h5.mjs` | 构建脚本与单测 | ✅ |
 | `unpackage/offline-h5-web/` | 中间 Web 产物 | ❌ 已 ignore |
 | `unpackage/offline-h5/` | 派生后的离线包 stage（507 文件 / ~25MB：app-bundle.js、index.html、assets/、static/、modules/、subpackages/、offline-h5-bridge.js、offline-h5-project-bootstrap.js、offline-h5-manifest.json） | ❌ |

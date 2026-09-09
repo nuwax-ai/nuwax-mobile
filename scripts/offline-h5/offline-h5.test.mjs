@@ -9,7 +9,7 @@ import { digest, verifyResourcePackage } from './package-files.mjs';
 const require = createRequire(import.meta.url);
 const hx = process.env.HX_APP_ROOT || '/Applications/HBuilderX.app/Contents/HBuilderX';
 const { transformSync } = require(path.join(hx, 'plugins/uniapp-cli-vite/node_modules/esbuild'));
-const source = fs.readFileSync(new URL('../../utils/offlineH5/offlineH5Session.uts', import.meta.url), 'utf8');
+const source = fs.readFileSync(new URL('../../components/offline-h5-container/offline-h5-session.uts', import.meta.url), 'utf8');
 const { code } = transformSync(source, { loader: 'ts', format: 'cjs' });
 const module = { exports: {} };
 vm.runInNewContext(code, { module, exports: module.exports, Date, encodeURIComponent });
@@ -42,7 +42,7 @@ test('account changes and cancellation prevent document reuse', () => {
 test('ready survives late native bridge installation and stops after ACK', () => {
   let tick; const messages = [];
   const root = { addEventListener() {} };
-  vm.runInNewContext(fs.readFileSync(new URL('../../static/offline-h5/bridge.js', import.meta.url), 'utf8'), {
+  vm.runInNewContext(fs.readFileSync(new URL('../../components/offline-h5-container/offline-h5-bridge.js', import.meta.url), 'utf8'), {
     window: root, location: { hash: '#/a?offlineH5RequestId=one' }, URLSearchParams,
     setInterval(fn) { tick = fn; return 1; }, clearInterval() {},
   });

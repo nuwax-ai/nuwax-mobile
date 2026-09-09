@@ -165,8 +165,8 @@ walkCss(OUT);
 
 // --- 6. 重写 index.html ------------------------------------------------------
 // 通用桥与项目配置适配脚本是源码文件，不再用“DOM 非空”猜测应用就绪。
-fs.copyFileSync(path.join(ROOT, 'static/offline-h5/bridge.js'), path.join(OUT, 'offline-h5-bridge.js'));
-fs.copyFileSync(path.join(ROOT, 'static/offline-h5/project-bootstrap.js'), path.join(OUT, 'offline-h5-project-bootstrap.js'));
+fs.copyFileSync(path.join(ROOT, 'components/offline-h5-container/offline-h5-bridge.js'), path.join(OUT, 'offline-h5-bridge.js'));
+fs.copyFileSync(path.join(ROOT, 'components/offline-h5-container/offline-h5-project-bootstrap.js'), path.join(OUT, 'offline-h5-project-bootstrap.js'));
 
 let outHtml = html;
 // 去 PC/移动端跳转脚本：file:// 下会把页面导向 file:///m/ 死链

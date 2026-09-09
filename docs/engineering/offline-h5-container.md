@@ -94,7 +94,8 @@ offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
 
 1. **CLI 路线**（`pnpm hx:ios:device`、`make app-resource`、发基座等经 `scripts/hx-cli.sh`）全自动：编译前 prepare（产物过期自动重建，无需单独跑 build），编译后对最终产物目录（`unpackage/dist/dev/app-*/...`、`unpackage/resources/app-*/...`）跑清单校验，缺文件即构建失败。云打包本地无产物目录时告警跳过。
 2. **HBuilderX 界面路线**没有可挂接的编译前钩子：点菜单编译前手动跑一次 `pnpm offline-h5:prepare`（同样自动按需重建），发行后手动 `pnpm offline-h5:verify -- unpackage/resources/app-ios/static/app/offline-h5` 核对。**编译成功不代表离线文件完整**（static/web 过滤就是静默发生的），上线前务必校验。
-3. iOS 真机 / 模拟器调试运行时，HBuilderX 把编译产物推到应用沙盒 `Documents/uni-app-x/apps/__UNI__8BF05E4/www/`；日志用 `cli logcat app-ios` 或 `simctl launch --console-pty` 看 `[offline-h5]` 前缀。
+3. **云打包**：离线包是纯 `static/` 资源、无原生依赖，云打包与本地打包同编译器、同规则，天然支持。界面点云打包前先 `pnpm offline-h5:prepare`（CLI `pack` 已自动）；拿到 IPA/APK 后用 `pnpm offline-h5:verify-artifact -- unpackage/release/xxx.ipa` 直接验产物——解包定位 `static/app/offline-h5` 并逐文件核对 sha256，缺资源非零退出。
+4. iOS 真机 / 模拟器调试运行时，HBuilderX 把编译产物推到应用沙盒 `Documents/uni-app-x/apps/__UNI__8BF05E4/www/`；日志用 `cli logcat app-ios` 或 `simctl launch --console-pty` 看 `[offline-h5]` 前缀。
 
 ## 如何新增离线 H5 入口
 

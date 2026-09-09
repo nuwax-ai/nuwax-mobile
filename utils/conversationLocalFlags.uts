@@ -1,0 +1,230 @@
+/**
+ * 会话本地标记（置顶 / 归档 / 收藏）——过渡方案，对齐 PC 端
+ * nuwax src/components/business-component/ConversationContextMenu/conversationLocalFlags.ts。
+ *
+ * 后端会话字段（会话优化 M2 契约：isPinned / isArchived / isCollected）就绪后，
+ * 在本模块单点替换为服务端字段读写，调用方（home-content 列表层）无需改动。
+ *
+ * 存储：uni storage key `conversation_local_flags`；
+ * 结构 {version:1, pinned:number[], archived:number[], collected:number[]}。
+ * 会话 id 一律归一为 number（不同接口 id 存在 number/string 混用）。
+ */
+
+const CONVERSATION_LOCAL_FLAGS_KEY = "conversation_local_flags";
+const CONVERSATION_LOCAL_FLAGS_VERSION = 1;
+
+export const CONVERSATION_FLAG_PINNED = "pinned";
+export const CONVERSATION_FLAG_ARCHIVED = "archived";
+export const CONVERSATION_FLAG_COLLECTED = "collected";
+
+export class ConversationLocalFlags {
+  pinned: number[] = [] as number[];
+  archived: number[] = [] as number[];
+  collected: number[] = [] as number[];
+}
+
+function createEmptyFlags(): ConversationLocalFlags {
+  return new ConversationLocalFlags();
+}
+
+function readIdList(source: UTSJSONObject | null, key: string): number[] {
+  const out: number[] = [] as number[];
+  if (source == null) return out;
+  const raw = source[key];
+  if (raw == null || Array.isArray(raw) != true) return out;
+  const arr = raw as any[];
+  for (let i = 0; i < arr.length; i++) {
+    const value = arr[i];
+    if (value == null) continue;
+    const n = parseFloat(`${value}`);
+    // n != n 判 NaN（UTS 无 isNaN）
+    if (n != n) continue;
+    out.push(n as number);
+  }
+  return out;
+}
+
+/** 读取本地标记（解析失败/无数据返回空标记，不抛错）。 */
+export function loadConversationFlags(): ConversationLocalFlags {
+  const flags = createEmptyFlags();
+  try {
+    const raw = uni.getStorageSync(CONVERSATION_LOCAL_FLAGS_KEY);
+    if (raw == null) return flags;
+    const text = `${raw}`;
+    if (text.length == 0) return flags;
+    const parsed = JSON.parse(text);
+    if (parsed == null || typeof parsed != "object") return flags;
+    const obj = parsed as UTSJSONObject;
+    flags.pinned = readIdList(obj, "pinned");
+    flags.archived = readIdList(obj, "archived");
+    flags.collected = readIdList(obj, "collected");
+  } catch (_e) {
+    // 容错：坏数据当空处理
+  }
+  return flags;
+}
+
+function saveConversationFlags(flags: ConversationLocalFlags): void {
+  try {
+    const obj = new UTSJSONObject();
+    obj["version"] = CONVERSATION_LOCAL_FLAGS_VERSION;
+    obj["pinned"] = flags.pinned;
+    obj["archived"] = flags.archived;
+    obj["collected"] = flags.collected;
+    uni.setStorageSync(CONVERSATION_LOCAL_FLAGS_KEY, JSON.stringify(obj));
+  } catch (_e) {
+    // 写失败静默（本地标记非关键数据）
+  }
+}
+
+function flagListOf(flags: ConversationLocalFlags, kind: string): number[] {
+  if (kind == CONVERSATION_FLAG_ARCHIVED) return flags.archived;
+  if (kind == CONVERSATION_FLAG_COLLECTED) return flags.collected;
+  return flags.pinned;
+}
+
+export function hasConversationFlag(
+  kind: string,
+  id: number,
+  flags: ConversationLocalFlags | null = null,
+): boolean {
+  const target = flags != null ? flags : loadConversationFlags();
+  const list = flagListOf(target, kind);
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] == id) return true;
+  }
+  return false;
+}
+
+/**
+ * 切换标记并持久化。
+ * @return 切换后的状态（true = 已开启该标记）
+ */
+export function toggleConversationFlag(kind: string, id: number): boolean {
+  const flags = loadConversationFlags();
+  const list = flagListOf(flags, kind);
+  let exists = false;
+  const next: number[] = [] as number[];
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] == id) {
+      exists = true;
+      continue;
+    }
+    next.push(list[i]);
+  }
+  if (exists != true) {
+    next.push(id);
+  }
+  if (kind == CONVERSATION_FLAG_ARCHIVED) {
+    flags.archived = next;
+  } else if (kind == CONVERSATION_FLAG_COLLECTED) {
+    flags.collected = next;
+  } else {
+    flags.pinned = next;
+  }
+  saveConversationFlags(flags);
+  return exists != true;
+}
+
+/** 删除会话时清理三组标记中的残留 id。 */
+export function clearConversationFlags(id: number): void {
+  const flags = loadConversationFlags();
+  const hadAny =
+    flags.pinned.indexOf(id) >= 0 ||
+    flags.archived.indexOf(id) >= 0 ||
+    flags.collected.indexOf(id) >= 0;
+  if (hadAny != true) return;
+  const filterIds = (list: number[]): number[] => {
+    const next: number[] = [] as number[];
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] != id) {
+        next.push(list[i]);
+      }
+    }
+    return next;
+  };
+  flags.pinned = filterIds(flags.pinned);
+  flags.archived = filterIds(flags.archived);
+  flags.collected = filterIds(flags.collected);
+  saveConversationFlags(flags);
+}
+
+// ---------------------------------------------------------------------------
+// 列表 selector（供列表 computed 与单测复用；输入列表保持原相对顺序）
+// ---------------------------------------------------------------------------
+
+function readConversationId(item: UTSJSONObject): number {
+  const raw = item["id"];
+  if (raw == null) return 0;
+  const n = parseFloat(`${raw}`);
+  if (n != n) return 0;
+  return n as number;
+}
+
+/** 默认视图：过滤掉已归档会话（保持原顺序）。 */
+export function filterActiveConversations(
+  list: UTSJSONObject[],
+  flags: ConversationLocalFlags,
+): UTSJSONObject[] {
+  const out: UTSJSONObject[] = [] as UTSJSONObject[];
+  for (let i = 0; i < list.length; i++) {
+    const id = readConversationId(list[i]);
+    if (flags.archived.indexOf(id) >= 0) continue;
+    out.push(list[i]);
+  }
+  return out;
+}
+
+/** 已归档视图：只保留已归档会话（保持原顺序）。 */
+export function filterArchivedConversations(
+  list: UTSJSONObject[],
+  flags: ConversationLocalFlags,
+): UTSJSONObject[] {
+  const out: UTSJSONObject[] = [] as UTSJSONObject[];
+  for (let i = 0; i < list.length; i++) {
+    const id = readConversationId(list[i]);
+    if (flags.archived.indexOf(id) >= 0) {
+      out.push(list[i]);
+    }
+  }
+  return out;
+}
+
+/**
+ * 置顶稳定排序：置顶项置前，组内保持原相对顺序
+ * （等价 PC `pinnedSet.has(b) - pinnedSet.has(a)` 稳定比较，规避 UTS sort 稳定性问题）。
+ */
+export function sortConversationsByPinned(
+  list: UTSJSONObject[],
+  flags: ConversationLocalFlags,
+): UTSJSONObject[] {
+  const pinned: UTSJSONObject[] = [] as UTSJSONObject[];
+  const normal: UTSJSONObject[] = [] as UTSJSONObject[];
+  for (let i = 0; i < list.length; i++) {
+    const id = readConversationId(list[i]);
+    if (flags.pinned.indexOf(id) >= 0) {
+      pinned.push(list[i]);
+    } else {
+      normal.push(list[i]);
+    }
+  }
+  const out: UTSJSONObject[] = pinned;
+  for (let i = 0; i < normal.length; i++) {
+    out.push(normal[i]);
+  }
+  return out;
+}
+
+export function countArchivedConversations(
+  list: UTSJSONObject[],
+  flags: ConversationLocalFlags,
+): number {
+  let count = 0;
+  for (let i = 0; i < list.length; i++) {
+    const id = readConversationId(list[i]);
+    if (flags.archived.indexOf(id) >= 0) {
+      count++;
+    }
+  }
+  return count;
+}

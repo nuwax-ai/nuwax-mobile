@@ -1,0 +1,780 @@
+<template>
+  <!--
+    会话历史列表（「任务」分组）：游标分页 + 静默头部合并 + 置顶/归档/收藏本地标记
+    + 长按五项操作。由 project-task-drawer 在其 scroll-view 内组装；
+    滚动/下拉刷新由容器触发（loadMore / refresh），组件只负责列表本体。
+  -->
+  <view class="conversation-history-list">
+    <view class="section-title section-title-gap">
+      <text class="section-title-text">{{ t("Mobile.Common.tasks") }}</text>
+    </view>
+    <view v-if="taskShowArchivedEntry" class="archived-entry" @click="toggleTaskArchivedView">
+      <text class="iconfont icon-order archived-entry-icon" />
+      <text class="archived-entry-text">{{
+        showTaskArchivedView
+          ? t("Mobile.Auth.back")
+          : t("Mobile.Conversation.archivedConversations") + " (" + taskArchivedCount + ")"
+      }}</text>
+    </view>
+    <view v-if="taskRows.length > 0">
+      <view
+        v-for="(row, index) in taskRows"
+        :key="row.id"
+        class="task-row"
+        @click="handleTaskClick(index)"
+        @longpress="handleTaskLongPress(index)"
+      >
+        <view class="task-title-row">
+          <text v-if="row.pinned" class="iconfont icon-order task-flag-icon" />
+          <text v-if="row.collected" class="iconfont icon-star task-flag-icon task-flag-icon-star" />
+          <text class="task-title">{{ row.topic }}</text>
+          <text class="task-time">{{ row.timeLabel }}</text>
+        </view>
+        <view class="task-bottom-row">
+          <text class="task-agent">{{ row.agentName }}</text>
+          <view v-if="row.showExecuting" class="task-status-tag">
+            <text class="task-status-text">{{ t("Mobile.Conversation.executing") }}</text>
+          </view>
+        </view>
+      </view>
+    </view>
+    <view v-else-if="!taskLoading" class="empty-state">
+      <image :src="noData" class="empty-image" :alt="t('Mobile.Common.noDataImageAlt')" />
+      <text class="empty-text">{{ t("Mobile.Common.noData") }}</text>
+    </view>
+    <view v-if="taskShowNoMore" class="no-more-state">
+      <text class="no-more-text">{{ t("Mobile.Common.noMoreData") }}</text>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, computed } from "vue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+  import {
+    apiAgentConversationList,
+    apiAgentConversationUpdate,
+    apiAgentConversationDelete,
+  } from "@/servers/conversation";
+  import { ConversationListParams } from "@/types/interfaces/conversationInfo";
+  import { AgentConversationUpdateParams } from "@/types/interfaces/agent";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { formatTimeAgo } from "@/utils/common";
+  import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+  import {
+    CONVERSATION_FLAG_ARCHIVED,
+    CONVERSATION_FLAG_COLLECTED,
+    CONVERSATION_FLAG_PINNED,
+    clearConversationFlags,
+    countArchivedConversations,
+    filterActiveConversations,
+    filterArchivedConversations,
+    hasConversationFlag,
+    loadConversationFlags,
+    sortConversationsByPinned,
+    toggleConversationFlag,
+  } from "@/utils/conversationLocalFlags.uts";
+  import noData from "@/static/assets/no_data.png";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  interface ConversationHistoryListProps {
+    isLoggedIn: boolean;
+  }
+  const props = defineProps<ConversationHistoryListProps>();
+
+  const emit = defineEmits<{
+    (e: "conversation-click", item: any): void;
+  }>();
+
+  const TASK_PAGE_SIZE = 20;
+  const SILENT_HEAD_SIZE = 10;
+
+  class TaskRowView {
+    id: number = 0;
+    topic: string = "";
+    timeLabel: string = "";
+    agentName: string = "";
+    showExecuting: boolean = false;
+    /** 原始列表项引用：列表经置顶排序/归档过滤后 index 不再等于原始下标，交互一律走 row.item */
+    item: UTSJSONObject | null = null;
+    pinned: boolean = false;
+    collected: boolean = false;
+  }
+
+  const conversationList = ref<UTSJSONObject[]>([]);
+  const taskInitialLoading = ref<boolean>(false);
+  const taskLoadingMore = ref<boolean>(false);
+  const taskHasMore = ref<boolean>(false);
+  const lastId = ref<number | null>(null);
+  const taskFlagsVersion = ref<number>(0);
+  const showTaskArchivedView = ref<boolean>(false);
+  let conversationRequestPromise: Promise<boolean> | null = null;
+
+  const taskLoading = computed((): boolean => {
+    return taskInitialLoading.value || taskLoadingMore.value;
+  });
+
+  function toNum(v: any | null, fallback: number = 0): number {
+    if (v == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${v}`);
+    // parsed != parsed 判 NaN
+    return parsed != parsed ? fallback : parsed;
+  }
+  function toStr(v: any | null, fallback: string = ""): string {
+    if (v == null) {
+      return fallback;
+    }
+    return `${v}`;
+  }
+
+  function normalizeList(raw: any | null): UTSJSONObject[] {
+    const result: UTSJSONObject[] = [];
+    if (raw == null) {
+      return result;
+    }
+    let items: any[] = [];
+    if (Array.isArray(raw)) {
+      items = raw as any[];
+    } else {
+      try {
+        const jsonStr = JSON.stringify(raw);
+        if (jsonStr != null && jsonStr.length > 0) {
+          const parsed = JSON.parse(jsonStr);
+          if (Array.isArray(parsed)) {
+            items = parsed as any[];
+          }
+        }
+      } catch (_e) {
+        return result;
+      }
+    }
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item == null) {
+        continue;
+      }
+      try {
+        const jsonStr = JSON.stringify(item);
+        if (jsonStr != null && jsonStr.length > 0) {
+          const obj = JSON.parse(jsonStr) as UTSJSONObject | null;
+          if (obj != null) {
+            const agentRaw = obj["agent"];
+            let agentName = "";
+            if (agentRaw != null) {
+              try {
+                const agentStr = JSON.stringify(agentRaw);
+                if (agentStr != null && agentStr.length > 0) {
+                  const agentObj = JSON.parse(agentStr) as UTSJSONObject | null;
+                  if (agentObj != null) {
+                    agentName = toStr(agentObj["name"], "");
+                  }
+                }
+              } catch (_3) {
+                agentName = "";
+              }
+            }
+            obj["_agentName"] = agentName;
+            result.push(obj);
+          }
+        }
+      } catch (_e2) {
+        // skip
+      }
+    }
+    return result;
+  }
+
+  function updateConversationItem(target: UTSJSONObject, source: UTSJSONObject): void {
+    const topic = source["topic"];
+    if (topic != null) {
+      target["topic"] = topic;
+    }
+    const modified = source["modified"];
+    if (modified != null) {
+      target["modified"] = modified;
+    }
+    const taskStatus = source["taskStatus"];
+    if (taskStatus != null) {
+      target["taskStatus"] = taskStatus;
+    }
+    const agentName = source["_agentName"];
+    if (agentName != null) {
+      target["_agentName"] = agentName;
+    }
+    const agentId = source["agentId"];
+    if (agentId != null) {
+      target["agentId"] = agentId;
+    }
+  }
+
+  /** 将会话头部增量置顶去重，保留原列表尾部及其分页游标。 */
+  function mergeConversationHead(incoming: UTSJSONObject[]): void {
+    const current = conversationList.value != null ? conversationList.value : ([] as UTSJSONObject[]);
+    const merged: UTSJSONObject[] = [];
+
+    for (let i = 0; i < incoming.length; i++) {
+      const source = incoming[i];
+      const sourceId = toNum(source["id"], 0);
+      let target: UTSJSONObject | null = null;
+      for (let j = 0; j < current.length; j++) {
+        if (toNum(current[j]["id"], 0) == sourceId) {
+          target = current[j];
+          break;
+        }
+      }
+      if (target != null) {
+        updateConversationItem(target, source);
+      } else {
+        target = source;
+      }
+      let duplicated = false;
+      for (let k = 0; k < merged.length; k++) {
+        if (toNum(merged[k]["id"], 0) == sourceId) {
+          duplicated = true;
+          break;
+        }
+      }
+      if (!duplicated) merged.push(target);
+    }
+
+    for (let i = 0; i < current.length; i++) {
+      const candidate = current[i];
+      const candidateId = toNum(candidate["id"], 0);
+      let duplicated = false;
+      for (let j = 0; j < merged.length; j++) {
+        if (toNum(merged[j]["id"], 0) == candidateId) {
+          duplicated = true;
+          break;
+        }
+      }
+      if (!duplicated) merged.push(candidate);
+    }
+    conversationList.value = merged;
+  }
+
+  /** 静默查询任务头部 10 条，保留已加载列表、末尾游标和分页状态。 */
+  async function silentFetchTasks(): Promise<void> {
+    if (!props.isLoggedIn || conversationList.value.length == 0 || conversationRequestPromise != null) return;
+    try {
+      const params = new ConversationListParams();
+      params.agentId = null;
+      params.lastId = null;
+      params.limit = SILENT_HEAD_SIZE;
+      const res = await apiAgentConversationList(params);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const newList = normalizeList(apiResData<any>(res));
+        mergeConversationHead(newList);
+      }
+    } catch (error) {
+      console.error("silentFetchTasks error:", error);
+    }
+  }
+
+  async function fetchTasks(isLoadMore: boolean): Promise<boolean> {
+    if (!props.isLoggedIn) {
+      if (isLoadMore) {
+        taskLoadingMore.value = false;
+      } else {
+        taskInitialLoading.value = false;
+      }
+      return false;
+    }
+    try {
+      const params = new ConversationListParams();
+      params.agentId = null;
+      params.lastId = isLoadMore ? lastId.value : null;
+      params.limit = TASK_PAGE_SIZE;
+      const res = await apiAgentConversationList(params);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const newList = normalizeList(apiResData<any>(res));
+        if (isLoadMore) {
+          const existing = conversationList.value != null ? conversationList.value : ([] as UTSJSONObject[]);
+          const combined: UTSJSONObject[] = [];
+          for (let i = 0; i < existing.length; i++) {
+            combined.push(existing[i]);
+          }
+          for (let j = 0; j < newList.length; j++) {
+            const candidate = newList[j];
+            const candidateId = toNum(candidate["id"], 0);
+            let duplicated = false;
+            for (let k = 0; k < combined.length; k++) {
+              if (toNum(combined[k]["id"], 0) == candidateId) {
+                duplicated = true;
+                break;
+              }
+            }
+            if (!duplicated) combined.push(candidate);
+          }
+          conversationList.value = combined;
+        } else {
+          conversationList.value = newList;
+        }
+        if (newList.length > 0) {
+          const last = newList[newList.length - 1];
+          lastId.value = toNum(last["id"], 0);
+          // 接口可能返回不足一页但仍存在下一页，只有空页才能确认到底。
+          taskHasMore.value = true;
+        } else {
+          taskHasMore.value = false;
+        }
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error("fetchTasks error:", error);
+      return false;
+    } finally {
+      if (isLoadMore) {
+        taskLoadingMore.value = false;
+      } else {
+        taskInitialLoading.value = false;
+      }
+    }
+  }
+
+  async function requestTasks(isLoadMore: boolean): Promise<boolean> {
+    const pending = conversationRequestPromise;
+    if (pending != null) {
+      return await pending;
+    }
+    if (isLoadMore) {
+      if (!taskHasMore.value) {
+        return false;
+      }
+      taskLoadingMore.value = true;
+    } else {
+      taskInitialLoading.value = true;
+    }
+    const requestPromise = fetchTasks(isLoadMore);
+    conversationRequestPromise = requestPromise;
+    try {
+      return await requestPromise;
+    } finally {
+      // 单飞入口保证同一时刻只有这一笔任务列表请求。
+      conversationRequestPromise = null;
+    }
+  }
+
+  const taskRows = computed((): TaskRowView[] => {
+    const _fv = taskFlagsVersion.value;
+    const raw = conversationList.value;
+    const result: TaskRowView[] = [];
+    if (raw == null) {
+      return result;
+    }
+    const flags = loadConversationFlags();
+    const scoped = showTaskArchivedView.value
+      ? filterArchivedConversations(raw, flags)
+      : filterActiveConversations(raw, flags);
+    const ordered = sortConversationsByPinned(scoped, flags);
+    const unnamed = t("Mobile.Conversation.unnamed");
+    const unknownAgent = t("Mobile.Conversation.unknownAgent");
+    for (let i = 0; i < ordered.length; i++) {
+      const item = ordered[i];
+      if (item == null) {
+        continue;
+      }
+      const row = new TaskRowView();
+      row.id = toNum(item["id"], 0);
+      const topic = toStr(item["topic"], "");
+      row.topic = topic.length > 0 ? topic : unnamed;
+      const modified = toStr(item["modified"], "");
+      const ago = formatTimeAgo(modified);
+      row.timeLabel = ago != null ? ago : "";
+      const agentName = toStr(item["_agentName"], "");
+      row.agentName = agentName.length > 0 ? agentName : unknownAgent;
+      const statusStr = toStr(item["taskStatus"], "");
+      row.showExecuting = statusStr == "EXECUTING";
+      row.item = item;
+      row.pinned = hasConversationFlag(CONVERSATION_FLAG_PINNED, row.id, flags);
+      row.collected = hasConversationFlag(CONVERSATION_FLAG_COLLECTED, row.id, flags);
+      result.push(row);
+    }
+    return result;
+  });
+
+  const taskArchivedCount = computed((): number => {
+    const _fv = taskFlagsVersion.value;
+    const raw = conversationList.value;
+    if (raw == null) {
+      return 0;
+    }
+    return countArchivedConversations(raw, loadConversationFlags());
+  });
+
+  const taskShowArchivedEntry = computed((): boolean => {
+    return taskArchivedCount.value > 0 || showTaskArchivedView.value;
+  });
+
+  const taskShowNoMore = computed((): boolean => {
+    const cl = conversationList.value;
+    const clLen = cl != null ? cl.length : 0;
+    return !taskLoading.value && !taskHasMore.value && clLen > 8;
+  });
+
+  function getTaskItemByIndex(index: number): UTSJSONObject | null {
+    const rows = taskRows.value;
+    if (index < 0 || index >= rows.length) {
+      return null;
+    }
+    return rows[index].item;
+  }
+
+  function toggleTaskArchivedView(): void {
+    showTaskArchivedView.value = showTaskArchivedView.value != true;
+  }
+
+  function handleTaskClick(index: number): void {
+    const item = getTaskItemByIndex(index);
+    if (item != null) {
+      emit("conversation-click", item);
+    }
+  }
+
+  // ============================================================
+  // 长按五项操作（对齐 PC ConversationContextMenu）
+  // ============================================================
+  function performTaskFlagToggle(kind: string, id: number, successTitleOn: string, successTitleOff: string): void {
+    const enabled = toggleConversationFlag(kind, id);
+    taskFlagsVersion.value = taskFlagsVersion.value + 1;
+    uni.showToast({
+      title: enabled ? successTitleOn : successTitleOff,
+      icon: "none",
+    });
+    if (kind == CONVERSATION_FLAG_ARCHIVED && enabled != true && showTaskArchivedView.value) {
+      if (taskArchivedCount.value <= 0) {
+        showTaskArchivedView.value = false;
+      }
+    }
+  }
+
+  async function performTaskRenameSubmit(item: UTSJSONObject, newName: string): Promise<void> {
+    if (newName.length == 0) {
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameTitleEmpty"), icon: "none" });
+      return;
+    }
+    if (newName.length > 50) {
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameTitleTooLong"), icon: "none" });
+      return;
+    }
+    try {
+      const updateParams = new AgentConversationUpdateParams();
+      updateParams.id = toNum(item["id"], 0);
+      updateParams.topic = newName;
+      const updateRes = await apiAgentConversationUpdate(updateParams);
+      if (apiResCode(updateRes) == SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
+        item["topic"] = newName;
+        const list = conversationList.value;
+        conversationList.value = list != null ? list.slice(0) : ([] as UTSJSONObject[]);
+      } else {
+        const errorMessage = apiResMessage(updateRes);
+        uni.showToast({ title: errorMessage.length > 0 ? errorMessage : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    } catch (error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+  }
+
+  async function performTaskDeleteSubmit(item: UTSJSONObject): Promise<void> {
+    try {
+      const id = toNum(item["id"], 0);
+      const deleteRes = await apiAgentConversationDelete(id);
+      if (apiResCode(deleteRes) == SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Components.HistoryConversationList.deleteSuccess"), icon: "success" });
+        clearConversationFlags(id);
+        taskFlagsVersion.value = taskFlagsVersion.value + 1;
+        const current = conversationList.value != null ? conversationList.value : ([] as UTSJSONObject[]);
+        const next: UTSJSONObject[] = [];
+        for (let i = 0; i < current.length; i++) {
+          const c = current[i];
+          if (toNum(c["id"], -1) != id) {
+            next.push(c);
+          }
+        }
+        conversationList.value = next;
+        if (showTaskArchivedView.value && taskArchivedCount.value <= 0) {
+          showTaskArchivedView.value = false;
+        }
+      } else {
+        const errorMessage = apiResMessage(deleteRes);
+        uni.showToast({ title: errorMessage.length > 0 ? errorMessage : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    } catch (error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+  }
+
+  function handleTaskRename(item: UTSJSONObject): void {
+    uni.showModal({
+      title: t("Mobile.Components.HistoryConversationList.renameModalTitle"),
+      editable: true,
+      placeholderText: t("Mobile.Components.HistoryConversationList.renamePlaceholder"),
+      content: toStr(item["topic"], ""),
+      cancelText: t("Mobile.Common.cancel"),
+      confirmText: t("Mobile.Common.confirm"),
+      success: (res) => {
+        if (res.confirm) {
+          const rawContent = res.content;
+          const newName = rawContent != null ? rawContent.trim() : "";
+          performTaskRenameSubmit(item, newName);
+        }
+      },
+    });
+  }
+
+  function handleTaskDelete(item: UTSJSONObject): void {
+    uni.showModal({
+      title: t("Mobile.Components.HistoryConversationList.deleteModalTitle"),
+      content: t("Mobile.Components.HistoryConversationList.deleteModalContent"),
+      cancelText: t("Mobile.Common.cancel"),
+      confirmText: t("Mobile.Common.confirm"),
+      confirmColor: "#ff4d4f",
+      success: (res) => {
+        if (res.confirm) {
+          performTaskDeleteSubmit(item);
+        }
+      },
+    });
+  }
+
+  function handleTaskLongPress(index: number): void {
+    const item = getTaskItemByIndex(index);
+    if (item == null) {
+      return;
+    }
+    const id = toNum(item["id"], 0);
+    const flags = loadConversationFlags();
+    const pinned = hasConversationFlag(CONVERSATION_FLAG_PINNED, id, flags);
+    const archived = hasConversationFlag(CONVERSATION_FLAG_ARCHIVED, id, flags);
+    const collected = hasConversationFlag(CONVERSATION_FLAG_COLLECTED, id, flags);
+    const options = [
+      pinned ? t("Mobile.Conversation.unpin") : t("Mobile.Conversation.pin"),
+      archived ? t("Mobile.Conversation.unarchive") : t("Mobile.Conversation.archive"),
+      collected ? t("Mobile.Conversation.unfavorite") : t("Mobile.Conversation.favorite"),
+      t("Mobile.Components.HistoryConversationList.rename"),
+      t("Mobile.Components.HistoryConversationList.delete"),
+    ];
+    uni.showActionSheet({
+      itemList: options,
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        if (res.tapIndex == 0) {
+          performTaskFlagToggle(
+            CONVERSATION_FLAG_PINNED,
+            id,
+            t("Mobile.Conversation.pinSuccess"),
+            t("Mobile.Conversation.unpinSuccess"),
+          );
+        } else if (res.tapIndex == 1) {
+          performTaskFlagToggle(
+            CONVERSATION_FLAG_ARCHIVED,
+            id,
+            t("Mobile.Conversation.archiveSuccess"),
+            t("Mobile.Conversation.unarchiveSuccess"),
+          );
+        } else if (res.tapIndex == 2) {
+          performTaskFlagToggle(
+            CONVERSATION_FLAG_COLLECTED,
+            id,
+            t("Mobile.Conversation.favoriteSuccess"),
+            t("Mobile.Conversation.unfavoriteSuccess"),
+          );
+        } else if (res.tapIndex == 3) {
+          handleTaskRename(item);
+        } else if (res.tapIndex == 4) {
+          handleTaskDelete(item);
+        }
+      },
+    });
+  }
+
+  // ============================================================
+  // 容器触发入口（滚动/下拉刷新/抽屉生命周期）
+  // ============================================================
+  /** 容器触底：加载下一页。 */
+  function loadMore(): void {
+    if (taskHasMore.value && conversationRequestPromise == null) {
+      requestTasks(true);
+    }
+  }
+
+  /** 容器下拉刷新：等待在途请求收口后重置游标拉第一页。 */
+  async function refresh(): Promise<void> {
+    const pending = conversationRequestPromise;
+    if (pending != null) {
+      await pending;
+    }
+    lastId.value = null;
+    taskHasMore.value = true;
+    await requestTasks(false);
+  }
+
+  /** 静默头部补差（抽屉 resume / ChatFinished）。 */
+  function silentRefresh(): void {
+    silentFetchTasks();
+  }
+
+  /** 首次打开且无数据时拉第一页。 */
+  async function loadIfEmpty(): Promise<void> {
+    if (conversationList.value.length > 0) return;
+    await requestTasks(false);
+  }
+
+  defineExpose({
+    refresh: refresh as any,
+    loadMore: loadMore as any,
+    silentRefresh: silentRefresh as any,
+    loadIfEmpty: loadIfEmpty as any,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .conversation-history-list {
+    width: 100%;
+  }
+
+  .section-title {
+    padding: 24rpx 32rpx 8rpx;
+
+    .section-title-text {
+      font-size: 26rpx;
+      font-weight: 600;
+      color: #8b8e96;
+      line-height: 36rpx;
+    }
+  }
+
+  .section-title-gap {
+    padding-top: 48rpx;
+  }
+
+  // ===== 归档入口（对齐项目分组既有形态） =====
+  .archived-entry {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 16rpx 32rpx;
+
+    .archived-entry-icon {
+      font-size: 26rpx;
+      color: #8b8e96;
+      margin-right: 10rpx;
+    }
+
+    .archived-entry-text {
+      font-size: 26rpx;
+      color: #5147ff;
+      line-height: 36rpx;
+    }
+  }
+
+  // ===== 任务行（对齐设计稿：无分割线，行距留白） =====
+  .task-row {
+    background: #fff;
+    padding: 16rpx 32rpx;
+
+    .task-title-row {
+      display: flex;
+      flex-direction: row;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 8rpx;
+
+      .task-flag-icon {
+        flex-shrink: 0;
+        font-size: 22rpx;
+        color: #8b8e96;
+        margin-right: 6rpx;
+        line-height: 42rpx;
+      }
+
+      .task-flag-icon-star {
+        color: #faad14;
+        margin-right: 8rpx;
+      }
+
+      .task-title {
+        flex: 1;
+        font-size: 30rpx;
+        font-weight: 600;
+        color: #333;
+        line-height: 42rpx;
+        margin-right: 16rpx;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .task-time {
+        flex-shrink: 0;
+        font-size: 24rpx;
+        color: #999;
+        line-height: 42rpx;
+      }
+    }
+
+    .task-bottom-row {
+      display: flex;
+      flex-direction: row;
+      justify-content: space-between;
+      align-items: center;
+
+      .task-agent {
+        flex: 1;
+        font-size: 26rpx;
+        color: #999;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .task-status-tag {
+        flex-shrink: 0;
+        padding: 4rpx 0;
+        margin-left: 16rpx;
+
+        .task-status-text {
+          font-size: 22rpx;
+          color: rgba(0, 0, 0, 0.45);
+          line-height: 28rpx;
+        }
+      }
+    }
+  }
+
+  // ===== 空态 / 到底提示 =====
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60rpx 0;
+
+    .empty-image {
+      width: 150rpx;
+      height: 150rpx;
+    }
+
+    .empty-text {
+      font-size: 28rpx;
+      color: #999;
+      margin-top: 24rpx;
+    }
+  }
+
+  .no-more-state {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40rpx;
+
+    .no-more-text {
+      font-size: 24rpx;
+      color: #999;
+    }
+  }
+</style>

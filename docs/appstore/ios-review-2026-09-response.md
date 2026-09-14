@@ -1,7 +1,17 @@
-# iOS 审核 1.0.3(103) 被拒应对材料（2026-09）
+# iOS 审核被拒应对与重新提审材料（2026-09）
 
-> 提交 ID：`1a251433-1b62-4c91-a263-86c6b66ef5f2`（2026-08-27 提交，2026-09-09 Apple 最终回复）
-> App Store Connect 路径：App Store Connect → 女娲Nuwax → 分发 → App 审核 → iOS 提交
+> **当前状态（2026-09-14）：1.0.5(105) 已通过 Transporter 上传 App Store Connect，待重新提交审核。**
+> 负责提审的同学直接从「七、重新提审步骤」开始执行。
+
+App Store Connect 路径：App Store Connect → 女娲Nuwax → 分发 → App 审核 → iOS 提交
+
+### 提审时间线
+
+| 版本 | 时间 | 状态 |
+|---|---|---|
+| 1.0.3(103) | 2026-08-27 提交，2026-09-09 Apple 最终回复 | 被拒：2.1.0 材料补齐 / 4.7.4 智能体索引 / 5.1.1(ii) 权限文案 / 2.1(b) 商业模式问询。提交 ID：`1a251433-1b62-4c91-a263-86c6b66ef5f2` |
+| 1.0.4(104) | — | 已提交过 ASC（**versionCode 104 已占用，勿复用**） |
+| 1.0.5(105) | 2026-09-14 Transporter 上传 | **当前提审版本**，已包含权限文案重写 + iOS 付费收敛两项代码修复（分支 `fix/nuwa-zhuoda-2026.09-ios-appstore-submit`） |
 
 ## 一、被拒条款与本仓对策
 
@@ -11,6 +21,9 @@
 | 4.7.0 / 4.7.4 设计：小程序、聊天机器人、插件 | 要求提供 App 内非内嵌软件（聊天机器人/智能体）的**索引**（名称、开发者、URL），且今后每个版本都要附在 Review Notes | 按「二、智能体索引」生成清单，回复 Resolution Center 并附 Review Notes | ASC 操作 + 每版维护 |
 | 5.1.1(ii) 隐私：权限用途说明 | 相机、相册 purpose string 过于笼统 | 已重写 manifest 权限文案（见「四」） | `manifest.json`（app-ios / app-plus 两处同步） |
 | 2.1(b) 商业模式问询 | 疑似含付费数字内容，要求回答 5 个商业模式问题 | iOS 端已完全移除订阅/付费 UI（见「五」），按「六」口径回复 | 代码已改 + 回复草稿 |
+
+> **代码侧修复已全部落地在 1.0.5(105) 包中**（权限文案、付费收敛，提交 `8e3c15d26`）。
+> 剩余动作全部在 ASC 侧：智能体索引导出、App Review Information 补齐、Resolution Center 回复。
 
 ## 二、智能体索引（4.7.4 要求，每次提审都要更新）
 
@@ -90,9 +103,10 @@ Apple 要求提供 App 内**非内嵌**游戏/软件（对本 App 即平台上�
 4. **What paid content is unlocked in the app without IAP?** None. The iOS app does not display prices or subscription tags, and offers no purchase or external-checkout entry. All payments happen outside the app on the website; the app only consumes the result.
 5. **How do users obtain an account? Is there a fee?** Accounts are registered (free of charge) on the website via phone/email verification code. The app provides sign-in only; there is no in-app registration.
 
-## 七、重新提审步骤
+## 七、重新提审步骤（1.0.5(105)，2026-09-14 起）
 
-1. 确认本分支代码合入提审分支，云打包/本地出包新版本（版本号 ≥ 1.0.3(103) 可复用 1.0.4(104)）。
-2. ASC 更新 App Review Information：演示账号、录屏（附件上传或 Notes 链接）、Notes 附「四」英文权限说明 + 「二」智能体索引。
-3. Resolution Center 逐条回复：4.7.4（附索引）、5.1.1(ii)（附新文案说明 + 新构建已更新）、2.1(b)（「六」草稿）。
-4. 重新提交审核。
+1. ✅【已完成 2026-09-14】1.0.5(105) ipa 已通过 Transporter 上传；在 ASC「iOS 提交」版本页选择该构建。
+2. 智能体索引：从平台管理后台**重新导出当前在线智能体清单**（必须与本版线上一致），按「二」模板填写，附在 App Review Information → Notes（英文口径直接用「二」的引文）。
+3. ASC 更新 App Review Information：演示账号、真机录屏（90~120s，脚本见「三」）、Notes 附「四」英文权限说明 + 智能体索引。
+4. Resolution Center 逐条回复：4.7.4（附新导出索引）、5.1.1(ii)（附新文案说明 + 1.0.5 构建已更新）、2.1(b)（用「六」草稿，发送前与罗东确认口径）。
+5. 提交审核，并在群里同步提交时间与构建号，便于跟进。

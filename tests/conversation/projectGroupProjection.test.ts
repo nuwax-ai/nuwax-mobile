@@ -24,7 +24,7 @@ function makeResponse(records: unknown[]): unknown {
 }
 
 describe("mapProjectTabResponse", () => {
-  it("映射项目行：projectId 主键、projectType、name", () => {
+  it("映射项目行：projectId 主键、projectType、name、服务端标记字段", () => {
     const groups = mapProjectTabResponse(
       makeResponse([
         {
@@ -32,15 +32,29 @@ describe("mapProjectTabResponse", () => {
           projectType: "UserApp",
           name: "全栈项目A",
           modified: "2026-09-01 10:00:00",
+          pinned: true,
+          collected: true,
+        },
+        {
+          projectId: 2,
+          projectType: "NormalProject",
+          name: "常规项目B",
+          archived: true,
         },
       ]),
       identityFormat,
     );
-    expect(groups.length).toBe(1);
+    expect(groups.length).toBe(2);
     expect(groups[0].id).toBe(1);
     expect(groups[0].projectType).toBe("UserApp");
     expect(groups[0].name).toBe("全栈项目A");
     expect(groups[0].expanded).toBe(true);
+    // 标记字段回读打标（2026-09-13 服务端化）：有值读值、缺省 false
+    expect(groups[0].pinned).toBe(true);
+    expect(groups[0].collected).toBe(true);
+    expect(groups[0].archived).toBe(false);
+    expect(groups[1].archived).toBe(true);
+    expect(groups[1].pinned).toBe(false);
   });
 
   it("映射子会话：id/agentId/topic/taskStatus，时间走 formatter", () => {

@@ -6,6 +6,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   mapProjectTabResponse,
+  mapProjectChildren,
   projectTypeLabelKey,
   ProjectChildView,
   ProjectGroupView,
@@ -57,41 +58,21 @@ describe("mapProjectTabResponse", () => {
     expect(groups[1].pinned).toBe(false);
   });
 
-  it("映射子会话：id/agentId/topic/taskStatus，时间走 formatter", () => {
+  it("2026-09-14 统一接口：列表行不再回 conversations，children 空、childrenLoaded=false", () => {
     const groups = mapProjectTabResponse(
       makeResponse([
         {
           projectId: 1,
           projectType: "NormalProject",
           name: "常规项目B",
-          conversations: [
-            {
-              id: 11,
-              agentId: 5,
-              topic: "会话渲染 V2 重构",
-              taskStatus: "EXECUTING",
-              modified: "2026-09-08 15:40:00",
-            },
-            {
-              id: 12,
-              agentId: 5,
-              topic: "首页改造",
-              taskStatus: "COMPLETE",
-              modified: "2026-09-07 09:00:00",
-            },
-          ],
+          conversations: [{ id: 11, topic: "旧字段已下线" }], // 防御：即使回包仍带也忽略
         },
       ]),
       identityFormat,
     );
-    const children = groups[0].children;
-    expect(children.length).toBe(2);
-    expect(children[0].id).toBe(11);
-    expect(children[0].agentId).toBe(5);
-    expect(children[0].name).toBe("会话渲染 V2 重构");
-    expect(children[0].taskStatus).toBe("EXECUTING");
-    expect(children[0].timeLabel).toBe("[2026-09-08 15:40:00]");
-    expect(children[1].taskStatus).toBe("COMPLETE");
+    expect(groups.length).toBe(1);
+    expect(groups[0].children.length).toBe(0);
+    expect(groups[0].childrenLoaded).toBe(false);
   });
 
   it("id/agentId 为字符串时归一为数字", () => {
@@ -106,21 +87,7 @@ describe("mapProjectTabResponse", () => {
       identityFormat,
     );
     expect(groups[0].id).toBe(3);
-    expect(groups[0].children[0].id).toBe(21);
-    expect(groups[0].children[0].agentId).toBe(7);
-  });
-
-  it("conversations 缺失/为空时 children 为空数组", () => {
-    const groups = mapProjectTabResponse(
-      makeResponse([
-        { projectId: 1, name: "无会话项目" },
-        { projectId: 2, name: "空会话项目", conversations: [] },
-      ]),
-      identityFormat,
-    );
-    expect(groups.length).toBe(2);
     expect(groups[0].children.length).toBe(0);
-    expect(groups[1].children.length).toBe(0);
   });
 
   it("records 缺失或 data 为空时返回空数组", () => {
@@ -129,16 +96,42 @@ describe("mapProjectTabResponse", () => {
     expect(mapProjectTabResponse({ records: [] }, identityFormat).length).toBe(0);
   });
 
-  it("records 内 null 项被跳过；modified 缺失时 timeLabel 为空", () => {
+  it("records 内 null 项被跳过", () => {
     const groups = mapProjectTabResponse(
-      makeResponse([
-        null,
-        { projectId: 1, name: "D", conversations: [{ id: 9, topic: "x" }] },
-      ]),
+      makeResponse([null, { projectId: 1, name: "D" }]),
       identityFormat,
     );
     expect(groups.length).toBe(1);
-    expect(groups[0].children[0].timeLabel).toBe("");
+  });
+});
+
+describe("mapProjectChildren（子会话懒加载）", () => {
+  it("数组直入：id/agentId/topic/taskStatus/时间走 formatter", () => {
+    const children = mapProjectChildren(
+      [
+        {
+          id: 11,
+          agentId: 5,
+          topic: "会话渲染 V2 重构",
+          taskStatus: "EXECUTING",
+          modified: "2026-09-08 15:40:00",
+        },
+      ],
+      identityFormat,
+    );
+    expect(children.length).toBe(1);
+    expect(children[0].id).toBe(11);
+    expect(children[0].agentId).toBe(5);
+    expect(children[0].name).toBe("会话渲染 V2 重构");
+    expect(children[0].taskStatus).toBe("EXECUTING");
+    expect(children[0].timeLabel).toBe("[2026-09-08 15:40:00]");
+  });
+
+  it("非数组对象与空入参返回空；modified 缺失 timeLabel 为空", () => {
+    expect(mapProjectChildren({ unexpected: 1 }, identityFormat).length).toBe(0);
+    expect(mapProjectChildren(null, identityFormat).length).toBe(0);
+    const children = mapProjectChildren([{ id: 9, topic: "x" }], identityFormat);
+    expect(children[0].timeLabel).toBe("");
   });
 });
 

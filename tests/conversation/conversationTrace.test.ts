@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 import {
   collectActionKinds,
+  formatElapsedClock,
   formatElapsedParts,
   getRowsGroupStatus,
   getToolTraceActionKind,
@@ -666,6 +667,48 @@ describe("行摘要", () => {
     expect(row?.isCreate).toBe(false);
   });
 
+  it("files 徽标链数据（对齐 PC ProcessNodeRow.files）：file-read 单路径、file-edit=diffs 路径、其余为空", () => {
+    const read = project({
+      body: tag("r1", "ToolCall", "FINISHED", "读取文件 a.ts"),
+      processing: [
+        processing("r1", "ToolCall", "读取文件 a.ts", "FINISHED", {
+          kind: "read",
+          input: { file_path: "/home/user/9/a.ts" },
+        }),
+      ],
+    });
+    expect(rowById(read.items, "r1")?.files).toEqual(["/home/user/9/a.ts"]);
+
+    const edit = project({
+      body: tag("e1", "ToolCall", "FINISHED", "编辑文件"),
+      processing: [
+        processing("e1", "ToolCall", "编辑文件", "FINISHED", {
+          kind: "edit",
+          input: {},
+          data: [
+            { type: "diff", path: "/home/user/9/a.ts", oldText: "", newText: "x" },
+            { type: "diff", path: "b.md", oldText: "y", newText: "z" },
+          ],
+        }),
+      ],
+    });
+    expect(rowById(edit.items, "e1")?.files).toEqual([
+      "/home/user/9/a.ts",
+      "b.md",
+    ]);
+
+    const terminal = project({
+      body: tag("t1", "ToolCall", "FINISHED", "执行命令 ls"),
+      processing: [
+        processing("t1", "ToolCall", "执行命令 ls", "FINISHED", {
+          kind: "execute",
+          input: { command: "ls" },
+        }),
+      ],
+    });
+    expect(rowById(terminal.items, "t1")?.files).toEqual([]);
+  });
+
   it("file-edit 全部 diff 无 oldText → isCreate（「创建文件」语态）", () => {
     const p = project({
       body: tag("e1", "ToolCall", "FINISHED", "编辑文件"),
@@ -724,6 +767,15 @@ describe("工具函数", () => {
     expect(formatElapsedParts(95000)).toBe("1{m}35{s}");
     expect(formatElapsedParts(3600000)).toBe("1{h}");
     expect(formatElapsedParts(3660000)).toBe("1{h}1{m}");
+  });
+
+  it("formatElapsedClock：MM:SS 补零、分不封顶（对齐 PC 运行态时钟）", () => {
+    expect(formatElapsedClock(-1)).toBe("");
+    expect(formatElapsedClock(0)).toBe("00:00");
+    expect(formatElapsedClock(7000)).toBe("00:07");
+    expect(formatElapsedClock(194000)).toBe("03:14");
+    expect(formatElapsedClock(3600000)).toBe("60:00");
+    expect(formatElapsedClock(3661000)).toBe("61:01");
   });
 
   it("toolTraceActionI18nKey：kind×状态×isCreate 组合", () => {

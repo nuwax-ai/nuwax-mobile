@@ -1,1 +1,0 @@
-import{d as e,D as s,b as t,e as a,M as n,i as l,m as r,bz as o}from"./index-CS8IpCLK.js";const u=e({__name:"safety-zone",props:{addHeight:{type:Number,default:0}},setup(e){const u=o();return(o=null,d=null)=>{const p=r;return s(u)>0?(t(),a(p,new UTSJSONObject({key:0,style:n({height:s(u)+e.addHeight+"px"})}),null,8,["style"])):l("",!0)}}});export{u as _};

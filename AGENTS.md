@@ -62,17 +62,17 @@ feat/nuwa-zhuoda-<YYYY.MM>[-<slug>]   →  release/nuwa-zhuoda  →  生产发�
 
 旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
 
-## Git 远程约定（2026-09 起）
+## Git 远程约定（2026-09-16 起更新）
 
 与主仓（nuwax）统一命名，**remote 名固定用途，不再「切换 origin 地址」**：
 
 | remote 名 | 仓库 | 说明 |
 |---|---|---|
-| `origin` | `https://git.yichamao.com/agent-platform/agent-platform-front-weapp.git`（内网 GitLab） | **默认拉/推主仓** |
-| `github` | `https://github.com/nuwax-ai/nuwax-mobile.git` | 公开镜像 |
+| `origin` | `https://github.com/nuwax-ai/nuwax-mobile.git` | **默认拉/推主仓（GitHub）** |
+| `gitlab` | `https://git.yichamao.com/agent-platform/agent-platform-front-weapp.git`（内网 GitLab） | 内网镜像 |
 
-- ⚠️ **push 前先想清楚推哪个 remote**；默认 `git push` 走 `origin`（内网），推 GitHub 需显式 `git push github <分支>`
-- 旧命名克隆（`origin`=GitHub、`gitlab`=内网）迁移：`git remote rename origin github && git remote rename gitlab origin && git fetch --all --prune`
+- ⚠️ **push 前先想清楚推哪个 remote**；默认 `git push` 走 `origin`（GitHub），推内网需显式 `git push gitlab <分支>`
+- 2026-09-16 反转：GitHub 升为默认 origin，内网 GitLab 改名 `gitlab`；旧命名（`origin`=内网、`github`=GitHub）迁移：`git remote rename origin gitlab && git remote rename github origin && git fetch --all --prune`
 - 两端同名分支可能分叉（如 `dev`、`main`），同步前先看领先落后；配置详情见 [docs/archive/switch-git-remote.md](docs/archive/switch-git-remote.md)
 
 ## 构建工具链（重要）

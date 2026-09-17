@@ -9,6 +9,54 @@
       @more="handleMore"
     />
 
+    <view v-if="recentPages.length > 0" class="recent-section">
+      <text class="section-title">{{ t("Mobile.Common.recentUsed") }}</text>
+      <swiper
+        class="recent-swiper"
+        :current="recentSwiperCurrent"
+        :indicator-dots="false"
+        :circular="false"
+        :duration="300"
+        @change="handleRecentSwiperChange"
+      >
+        <swiper-item v-for="page in recentPages" :key="page.key">
+          <view class="recent-grid">
+            <view
+              v-for="item in page.items"
+              :key="getRecentItemKey(item)"
+              class="recent-item"
+              @click="handleRecentClick(item)"
+            >
+              <view class="recent-icon-wrap">
+                <image
+                  class="recent-icon"
+                  :src="getRecentItemIcon(item)"
+                  mode="aspectFill"
+                  :alt="getRecentItemName(item)"
+                />
+              </view>
+              <text class="recent-name text-ellipsis">{{ getRecentItemName(item) }}</text>
+            </view>
+          </view>
+        </swiper-item>
+      </swiper>
+      <view v-if="recentPages.length > 1" class="custom-indicator">
+        <view
+          v-for="(page, pageIndex) in recentPages"
+          :key="page.key"
+          class="custom-indicator-item"
+          @click="handleCustomIndicatorClick(pageIndex)"
+        >
+          <view
+            class="custom-indicator-dot"
+            :class="{ 'custom-indicator-dot--on': recentSwiperCurrent == pageIndex }"
+          ></view>
+        </view>
+      </view>
+    </view>
+
+    <text class="section-title">{{ t("Mobile.AppDev.allApps") }}</text>
+
     <view class="app-dev__body">
       <published-agent-list
         ref="publishedAgentListRef"
@@ -16,6 +64,10 @@
         :title="t('Mobile.Nav.app')"
       ></published-agent-list>
     </view>
+
+    <!-- #ifdef MP-WEIXIN -->
+    <auth-login-popup ref="loginPopupRef" />
+    <!-- #endif -->
   </view>
 </template>
 
@@ -26,11 +78,36 @@
   import SearchMoreBar from "@/components/search-more-bar/search-more-bar.uvue";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { getCurrentPagePath, syncNativeTabBarState } from "@/utils/commonBusiness";
+  import { SquarePublishedListParams } from "@/types/interfaces/square";
+  import { apiRecentlyUsedAppList } from "@/servers/square";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
+  import agentImage from "@/static/assets/agent_image.png";
+  // #ifdef MP-WEIXIN
+  import AuthLoginPopup from "@/components/auth-login-popup/auth-login-popup.uvue";
+  // #endif
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
-  const publishedAgentListRef = ref<ComponentPublicInstance | null>(null);
+  /** 最近使用 swiper 每页 8 个：两行四列 */
+  const RECENT_PAGE_SIZE = 8;
 
+  /** 最近使用一页数据，供 swiper-item 渲染 */
+  class RecentAppPage {
+    key: string = "";
+    items: UTSJSONObject[] = [] as UTSJSONObject[];
+  }
+
+  const publishedAgentListRef = ref<ComponentPublicInstance | null>(null);
+  const recentPages = ref<RecentAppPage[]>([]);
+  /** 最近使用 swiper 当前页，与自定义指示点同步 */
+  const recentSwiperCurrent = ref<number>(0);
+  const { loginPopupRef, handleAgentClick } = useAuthInterceptor();
+
+  /**
+   * Android：组件 ref 是 Gen* 类，禁止 as UTSJSONObject；用 $callMethod 调 defineExpose 方法。
+   */
   function callRefMethod(inst: any | null, methodName: string): void {
     if (inst == null) {
       return;
@@ -39,6 +116,149 @@
     proxy.$callMethod(methodName);
   }
 
+  /**
+   * 最近使用项的列表 key：优先发布 id，缺省用 targetId。
+   */
+  function getRecentItemKey(item: UTSJSONObject): string {
+    const idRaw = item["id"];
+    if (idRaw != null) {
+      return `${idRaw}`;
+    }
+    const targetRaw = item["targetId"];
+    return targetRaw != null ? `${targetRaw}` : "";
+  }
+
+  /**
+   * 读取最近使用项名称（UTSJSONObject 须用方括号取值）。
+   */
+  function getRecentItemName(item: UTSJSONObject): string {
+    const nameRaw = item["name"];
+    return nameRaw != null ? `${nameRaw}` : "";
+  }
+
+  /**
+   * 读取最近使用项图标，空地址回落默认图。
+   */
+  function getRecentItemIcon(item: UTSJSONObject): string {
+    const iconRaw = item["icon"];
+    const icon = iconRaw != null ? `${iconRaw}` : "";
+    return icon.length > 0 ? icon : agentImage;
+  }
+
+  /**
+   * 解析最近使用接口 data。
+   * Android：data 运行时是 UTSJSONObject/数组，禁止 as DTO；经 JSON 往返后再读。
+   * 兼容直接数组与分页 { records } 两种结构。
+   */
+  function parsePublishedList(dataRaw: any | null): UTSJSONObject[] {
+    const result: UTSJSONObject[] = [];
+    if (dataRaw == null) {
+      return result;
+    }
+    const jsonStr = JSON.stringify(dataRaw);
+    if (jsonStr == null || jsonStr.length == 0) {
+      return result;
+    }
+    if (jsonStr.charAt(0) == "[") {
+      const list = JSON.parse(jsonStr) as UTSJSONObject[] | null;
+      if (list != null) {
+        for (let i = 0; i < list.length; i++) {
+          result.push(list[i]);
+        }
+      }
+      return result;
+    }
+    const obj = JSON.parse(jsonStr) as UTSJSONObject | null;
+    if (obj == null) {
+      return result;
+    }
+    const records = obj["records"];
+    if (records != null) {
+      const list = records as UTSJSONObject[];
+      for (let i = 0; i < list.length; i++) {
+        result.push(list[i]);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * 将最近使用列表按 RECENT_PAGE_SIZE 切成 swiper 页。
+   */
+  function buildRecentPages(list: UTSJSONObject[]): RecentAppPage[] {
+    const pages: RecentAppPage[] = [];
+    if (list.length == 0) {
+      return pages;
+    }
+    let current = new RecentAppPage();
+    current.key = "0";
+    for (let i = 0; i < list.length; i++) {
+      if (i > 0 && i % RECENT_PAGE_SIZE == 0) {
+        pages.push(current);
+        current = new RecentAppPage();
+        current.key = `${pages.length}`;
+      }
+      current.items.push(list[i]);
+    }
+    if (current.items.length > 0) {
+      pages.push(current);
+    }
+    return pages;
+  }
+
+  /**
+   * 拉取最近使用应用（pageSize=40），切页后写入 recentPages。
+   */
+  async function fetchRecentlyUsedApps(): Promise<void> {
+    try {
+      const params = new SquarePublishedListParams();
+      params.pageSize = 40;
+      const res = await apiRecentlyUsedAppList(params);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        recentPages.value = [] as RecentAppPage[];
+        recentSwiperCurrent.value = 0;
+        return;
+      }
+      const list = parsePublishedList(apiResData<any>(res));
+      recentPages.value = buildRecentPages(list);
+      recentSwiperCurrent.value = 0;
+    } catch (error) {
+      console.error("加载最近使用应用失败", error);
+      recentPages.value = [] as RecentAppPage[];
+      recentSwiperCurrent.value = 0;
+    }
+  }
+
+  /**
+   * 点击自定义指示点，切换最近使用 swiper 页。
+   */
+  function handleCustomIndicatorClick(index: number): void {
+    recentSwiperCurrent.value = index;
+  }
+
+  /**
+   * 手势滑动 swiper 时同步指示点高亮。
+   */
+  function handleRecentSwiperChange(e: UniSwiperChangeEvent): void {
+    recentSwiperCurrent.value = e.detail.current;
+  }
+
+  /**
+   * 点击最近使用应用：走登录拦截后再跳详情。
+   */
+  function handleRecentClick(item: UTSJSONObject): void {
+    handleAgentClick({
+      targetId: item["targetId"],
+      name: item["name"],
+      agentType: item["agentType"],
+      icon: item["icon"],
+      description: item["description"],
+    });
+  }
+
+  /**
+   * 搜索条：进入应用搜索页，并带回当前 Tab 路径。
+   */
   function handleSearch(): void {
     const currentUrl = getCurrentPagePath();
     uni.navigateTo({
@@ -48,6 +268,9 @@
     });
   }
 
+  /**
+   * 「更多」：进入完整应用列表页。
+   */
   function handleMore(): void {
     uni.navigateTo({
       url: "/pages/page-app/page-app",
@@ -57,6 +280,7 @@
   onShow(() => {
     uni.hideLoading();
     syncNativeTabBarState();
+    fetchRecentlyUsedApps();
     callRefMethod(publishedAgentListRef.value, "refreshData");
   });
 </script>
@@ -67,6 +291,93 @@
     flex-direction: column;
     height: 100%;
     background-color: #ffffff;
+  }
+
+  .section-title {
+    padding: 24rpx 32rpx 8rpx;
+    color: #111111;
+    font-size: 32rpx;
+    font-weight: 600;
+    line-height: 44rpx;
+  }
+
+  .recent-section {
+    flex-shrink: 0;
+  }
+
+  .recent-swiper {
+    width: 100%;
+    height: 360rpx;
+  }
+
+  .custom-indicator {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    padding: 8rpx 0 0;
+  }
+
+  .custom-indicator-item {
+    height: 16rpx;
+    padding: 0 6rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .custom-indicator-dot {
+    width: 10rpx;
+    height: 10rpx;
+    border-radius: 10rpx;
+    background-color: #e6e6e6;
+  }
+
+  .custom-indicator-dot--on {
+    width: 28rpx;
+    background-color: #d0d0d0;
+  }
+
+  .recent-grid {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 8rpx 16rpx 0;
+    box-sizing: border-box;
+  }
+
+  .recent-item {
+    width: 25%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16rpx 8rpx 8rpx;
+    box-sizing: border-box;
+  }
+
+  .recent-icon-wrap {
+    width: 112rpx;
+    height: 112rpx;
+    border-radius: 28rpx;
+    overflow: hidden;
+    background-color: #f5f5f7;
+  }
+
+  .recent-icon {
+    width: 112rpx;
+    height: 112rpx;
+  }
+
+  .recent-name {
+    width: 100%;
+    margin-top: 12rpx;
+    color: #333333;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    text-align: center;
   }
 
   .app-dev__body {

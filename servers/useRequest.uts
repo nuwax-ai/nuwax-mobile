@@ -150,11 +150,29 @@ export default function request(options: any): Promise<any> {
       data: requestData as any,
       timeout: timeoutNum,
       header: header,
+      // #ifdef H5 || WEB
+      // H5 运行时默认会 JSON.parse 响应，>2^53 的 int64（convId/msgId 等雪花号）
+      // 被舍入成错误值（真值 …828 变 …830 → 后端报会话不存在）。dataType 传非
+      // "json" 阻止自动解析，改由 success 里 parseJsonKeepInt64 防精度解析。
+      dataType: "text",
+      // #endif
       success: (res) => {
         // 登录态（ACCESS_TOKEN）不再从响应 Set-Cookie 同步：登录/内嵌注入即权威，cookie 轮换不得覆盖
         // （防止进入聊天页时带入被服务端 cookie 轮换淘汰的旧 token → 4010 弹登录）。
         // res.data 已是 UTSJSONObject，禁止 JSON.parse<T> 或强转为 interface
-        const responseData = res.data;
+        let responseData: any = res.data;
+        // #ifdef H5 || WEB
+        // H5：dataType 已传 "text"，res.data 是原始文本，这里自行解析（大整数保留
+        // 精度，见 parseJsonKeepInt64）。若运行时不支持 dataType（res.data 已是
+        // 对象）则直接走旧逻辑，行为不变。
+        if (typeof responseData == "string") {
+          try {
+            responseData = parseJsonKeepInt64(`${responseData}`);
+          } catch (_e) {
+            responseData = res.data; // 非 JSON 响应（如网关 HTML 错误页）保持字符串，与默认兜底一致
+          }
+        }
+        // #endif
         const respObj = responseData != null ? (responseData as UTSJSONObject) : null;
         const codeVal = respObj != null ? respObj["code"] : null;
         const code = codeVal != null ? `${codeVal}` : null;
@@ -522,4 +540,125 @@ function arrayBufferToString(buffer: ArrayBuffer): string {
   } catch (e) {
     return result;
   }
+}
+
+/** 单字符是否为十进制数字字面量（0-9）。UTS 字符串无大小比较运算符，逐个枚举。 */
+function isDigitChar(ch: string): boolean {
+  return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+    ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9";
+}
+
+/**
+ * 快速预检：响应里是否存在「冒号后 ≥16 位连续数字」（>2^53 的 int64 才会丢精度）。
+ * 绝大多数响应（i18n/配置/小数值）预检不中，直接走原生 JSON.parse，零改写开销。
+ * 字符串字面量内的数字不算（扫描跟踪引号与反斜杠转义）。
+ */
+function hasLossyIntLiteral(raw: string): boolean {
+  const n = raw.length;
+  let i = 0;
+  let inString = false;
+  while (i < n) {
+    const ch = raw[i];
+    if (inString) {
+      if (ch == "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch == "\"") {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+    if (ch == "\"") {
+      inString = true;
+      i++;
+      continue;
+    }
+    if (ch == ":") {
+      let j = i + 1;
+      while (j < n && isDigitChar(raw[j])) {
+        j++;
+      }
+      if (j - i - 1 >= 16) {
+        return true;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return false;
+}
+
+/**
+ * H5 专用防精度 JSON 解析：解析前把「对象值位置 ≥16 位的无符号整数字面量」改写成
+ * 字符串再 JSON.parse。
+ *
+ * 背景：后端 convId/msgId/userId 等雪花号是 int64（19 位，远超 JS 的 2^53），
+ * H5 默认按数字解析会被舍入（225429701454200828 → …830），拼进 URL 后后端
+ * 查无此会话（IM_20103 会话不存在）。雪花号在页面层本就约定「存字符串」
+ * （readString 统一 `${raw}` 转换），改写字面量不改变消费方式。
+ *
+ * 规则与边界：
+ * - 只处理冒号后紧跟的数字（对象值位置）；数组元素、负数、浮点/科学计数法不动
+ * - 15 位及以下整数本就精确，保持数字类型（seq/sendTime/code/unreadCount 等）
+ * - 字符串字面量内部绝不改写（跟踪引号开合与 \\ 转义），消息文本再像 JSON 也安全
+ * - 16 位但 ≤2^53 的值（极少见）会被一并字符串化，对 `${}`/URL 拼接无影响
+ */
+function parseJsonKeepInt64(raw: string): any | null {
+  if (!hasLossyIntLiteral(raw)) {
+    return JSON.parse(raw);
+  }
+  let out = "";
+  let i = 0;
+  const n = raw.length;
+  let inString = false;
+  while (i < n) {
+    const ch = raw[i];
+    if (inString) {
+      out += ch;
+      if (ch == "\\") {
+        if (i + 1 < n) {
+          out += raw[i + 1];
+        }
+        i += 2;
+        continue;
+      }
+      if (ch == "\"") {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+    if (ch == "\"") {
+      inString = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch == ":") {
+      out += ch;
+      i++;
+      let j = i;
+      while (j < n && isDigitChar(raw[j])) {
+        j++;
+      }
+      if (j > i) {
+        const digits = raw.substring(i, j);
+        if (j - i >= 16) {
+          out += "\"";
+          out += digits;
+          out += "\"";
+        } else {
+          out += digits;
+        }
+      }
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return JSON.parse(out);
 }

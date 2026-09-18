@@ -1,1 +1,0 @@
-import{o as e,e as s,f as a,h as r,k as t,l,v as n}from"./index-DgC_ityK.js";import{_ as o}from"./_plugin-vue_export-helper.BCo6x5W8.js";const u=o({},[["render",function(o,u){const f=n,p=r;return e(),s(p,null,{default:a((()=>[t(f,null,{default:a((()=>[l("消息页面")])),_:1})])),_:1})}]]);export{u as default};

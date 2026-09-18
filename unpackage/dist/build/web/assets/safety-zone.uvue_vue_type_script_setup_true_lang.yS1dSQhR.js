@@ -1,1 +1,0 @@
-import{d as e,u as s,o as t,e as a,aO as n,m as u,h as l,bu as o}from"./index-DgC_ityK.js";const r=e({__name:"safety-zone",props:{addHeight:{type:Number,default:0}},setup(e){const r=o();return(o=null,d=null)=>{const p=l;return s(r)>0?(t(),a(p,new UTSJSONObject({key:0,style:n({height:s(r)+e.addHeight+"px"})}),null,8,["style"])):u("",!0)}}});export{r as _};

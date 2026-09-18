@@ -1,0 +1,298 @@
+<template>
+  <view class="knowledge-list-view">
+    <scroll-view
+      id="knowledge-list-scroll"
+      class="knowledge-list"
+      scroll-y="true"
+      :show-scrollbar="false"
+      :lower-threshold="80"
+      @scrolltolower="loadMore"
+    >
+      <view v-if="loading && items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.loading") }}</text>
+      </view>
+      <view v-else-if="items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.noData") }}</text>
+      </view>
+      <view v-else id="knowledge-list-content" class="knowledge-items">
+        <view
+          v-for="item in items"
+          :key="item.key"
+          class="knowledge-row"
+          :class="variant == 'simple' ? 'knowledge-row--simple' : ''"
+          @click="handleSelect(item)"
+        >
+          <view class="file-icon" :class="fileIconClass(item)">
+            <svg-icon name="icon-a-Filetext" :size="variant == 'simple' ? 30 : 38" :color="fileIconColor(item)" />
+          </view>
+          <view class="knowledge-main">
+            <text class="knowledge-name">{{ item.name }}</text>
+            <view v-if="variant == 'default'" class="knowledge-meta">
+              <text v-if="item.fileType.length > 0" class="file-type">{{ item.fileType }}</text>
+              <text v-if="item.usedTime.length > 0" class="used-time">{{ formatTimeAgo(item.usedTime) }}</text>
+            </view>
+          </view>
+          <view v-if="variant == 'default'" class="select-button" @click.stop="handleSelect(item)">
+            <text class="select-text">{{ t("Mobile.KnowledgeList.select") }}</text>
+          </view>
+        </view>
+        <view v-if="loading" class="loading-more">
+          <text class="state-text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+      </view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { getCurrentInstance, nextTick, onMounted, ref, watch } from "vue";
+  import { apiRepoRecentlyAccessedPages, apiRepoSpaceTree } from "@/servers/repo";
+  import { KnowledgeListItem, type KnowledgeListSourceType, type KnowledgeListVariant } from "@/types/interfaces/knowledgeList";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { formatTimeAgo } from "@/utils/common";
+  import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+  const props = withDefaults(defineProps<{
+    type: KnowledgeListSourceType;
+    variant?: KnowledgeListVariant;
+    keyword?: string;
+    spaceId?: number;
+    pageSize?: number;
+  }>(), {
+    type: "recent",
+    variant: "default",
+    keyword: "",
+    spaceId: 0,
+    pageSize: 20,
+  });
+  const emit = defineEmits<{
+    (e: "select", item: UTSJSONObject): void;
+    (e: "loaded", type: string, count: number): void;
+  }>();
+
+  const items = ref<KnowledgeListItem[]>([] as KnowledgeListItem[]);
+  const allItems = ref<KnowledgeListItem[]>([] as KnowledgeListItem[]);
+  const loading = ref<boolean>(false);
+  const hasMore = ref<boolean>(false);
+  const currentPage = ref<number>(0);
+  const componentInstance = getCurrentInstance();
+  let requestId: number = 0;
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string): number {
+    const raw = obj[key];
+    if (raw == null) return 0;
+    const value = parseFloat(`${raw}`);
+    return isNaN(value) ? 0 : value;
+  }
+
+  function normalizeFileType(sourceExt: string, pageType: string): string {
+    const raw = sourceExt.length > 0 ? sourceExt.replace(".", "") : pageType;
+    return raw.toUpperCase();
+  }
+
+  function mapPage(raw: UTSJSONObject, source: string): KnowledgeListItem {
+    const item = new KnowledgeListItem();
+    item.rawId = readNumber(raw, "id");
+    item.key = `knowledge:${source}:${item.rawId}`;
+    item.slugId = readString(raw, "slugId");
+    item.name = readString(raw, "title");
+    item.pageType = readString(raw, "pageType");
+    item.fileType = normalizeFileType(readString(raw, "sourceExt"), item.pageType);
+    item.usedTime = readString(raw, "time");
+    return item;
+  }
+
+  function flattenTree(rows: any[]): KnowledgeListItem[] {
+    const result = [] as KnowledgeListItem[];
+    const stack = [] as any[];
+    for (let i = rows.length - 1; i >= 0; i--) stack.push(rows[i]);
+    while (stack.length > 0) {
+      const raw = stack.pop();
+      if (raw == null) continue;
+      const node = raw as UTSJSONObject;
+      const pageRaw = node["page"];
+      if (pageRaw != null) {
+        const item = mapPage(pageRaw as UTSJSONObject, "space");
+        if (item.rawId > 0 && item.name.length > 0) result.push(item);
+      }
+      const childrenRaw = node["children"];
+      const children = childrenRaw != null ? (childrenRaw as any[]) : ([] as any[]);
+      for (let j = children.length - 1; j >= 0; j--) stack.push(children[j]);
+    }
+    return result;
+  }
+
+  function filteredItems(): KnowledgeListItem[] {
+    const keyword = props.keyword.trim().toLowerCase();
+    if (keyword.length == 0) return allItems.value;
+    const result = [] as KnowledgeListItem[];
+    for (let i = 0; i < allItems.value.length; i++) {
+      const item = allItems.value[i];
+      if (item.name.toLowerCase().includes(keyword)) result.push(item);
+    }
+    return result;
+  }
+
+  function applyPage(page: number): void {
+    const filtered = filteredItems();
+    const end = Math.min(page * props.pageSize, filtered.length);
+    items.value = filtered.slice(0, end);
+    currentPage.value = page;
+    hasMore.value = end < filtered.length;
+  }
+
+  async function load(reset: boolean): Promise<void> {
+    if (loading.value == true && reset != true) return;
+    if (reset != true) {
+      applyPage(currentPage.value + 1);
+      return;
+    }
+    if (props.type == "space" && props.spaceId <= 0) {
+      allItems.value = [] as KnowledgeListItem[];
+      items.value = [] as KnowledgeListItem[];
+      emit("loaded", props.type, 0);
+      return;
+    }
+    const id = requestId + 1;
+    requestId = id;
+    loading.value = true;
+    items.value = [] as KnowledgeListItem[];
+    try {
+      const res = props.type == "recent"
+        ? await apiRepoRecentlyAccessedPages(0, 100)
+        : await apiRepoSpaceTree(props.spaceId);
+      if (id != requestId) return;
+      if (apiResCode(res) != SUCCESS_CODE) throw new Error("knowledge list failed");
+      const dataRaw = apiResData<any>(res);
+      const rows = dataRaw != null ? (dataRaw as any[]) : ([] as any[]);
+      const next = [] as KnowledgeListItem[];
+      if (props.type == "recent") {
+        for (let i = 0; i < rows.length; i++) {
+          const item = mapPage(rows[i] as UTSJSONObject, "recent");
+          if (item.rawId > 0 && item.name.length > 0) next.push(item);
+        }
+      } else {
+        const flattened = flattenTree(rows);
+        for (let i = 0; i < flattened.length; i++) next.push(flattened[i]);
+      }
+      allItems.value = next;
+      applyPage(1);
+      emit("loaded", props.type, next.length);
+    } catch (_error) {
+      if (id == requestId) {
+        allItems.value = [] as KnowledgeListItem[];
+        items.value = [] as KnowledgeListItem[];
+        hasMore.value = false;
+        emit("loaded", props.type, 0);
+      }
+    } finally {
+      if (id == requestId) loading.value = false;
+    }
+  }
+
+  function loadMore(): void {
+    if (hasMore.value == true && loading.value != true) load(false);
+  }
+
+  function fillViewportIfNeeded(): void {
+    if (loading.value == true || hasMore.value != true || items.value.length == 0 || componentInstance == null) return;
+    const proxy = componentInstance.proxy;
+    if (proxy == null) return;
+    nextTick(() => {
+      uni.createSelectorQuery()
+        .in(proxy)
+        .select("#knowledge-list-scroll")
+        .boundingClientRect()
+        .select("#knowledge-list-content")
+        .boundingClientRect()
+        .exec((results: Array<any>) => {
+          if (loading.value == true || hasMore.value != true || results.length < 2) return;
+          const viewportRaw = results[0];
+          const contentRaw = results[1];
+          if (viewportRaw == null || contentRaw == null) return;
+          const viewport = viewportRaw as NodeInfo;
+          const content = contentRaw as NodeInfo;
+          const viewportHeight = viewport.height != null ? parseFloat(`${viewport.height}`) : 0;
+          const contentHeight = content.height != null ? parseFloat(`${content.height}`) : 0;
+          if (viewportHeight > 0 && contentHeight <= viewportHeight + 1) loadMore();
+        });
+    });
+  }
+
+  function fileIconClass(item: KnowledgeListItem): string {
+    const type = item.fileType.toLowerCase();
+    if (type == "pdf") return "file-icon--pdf";
+    if (type == "doc" || type == "docx") return "file-icon--doc";
+    if (type == "xls" || type == "xlsx") return "file-icon--sheet";
+    if (type == "ppt" || type == "pptx") return "file-icon--slide";
+    return "file-icon--default";
+  }
+
+  function fileIconColor(item: KnowledgeListItem): string {
+    const type = item.fileType.toLowerCase();
+    if (type == "pdf") return "#ef596f";
+    if (type == "doc" || type == "docx") return "#4385f5";
+    if (type == "xls" || type == "xlsx") return "#28a874";
+    if (type == "ppt" || type == "pptx") return "#e9863c";
+    return "#6558f5";
+  }
+
+  function handleSelect(item: KnowledgeListItem): void {
+    const payload = new UTSJSONObject();
+    payload["key"] = item.key;
+    payload["rawId"] = item.rawId;
+    payload["slugId"] = item.slugId;
+    payload["name"] = item.name;
+    payload["pageType"] = item.pageType;
+    payload["fileType"] = item.fileType;
+    payload["usedTime"] = item.usedTime;
+    payload["source"] = props.type;
+    emit("select", payload);
+  }
+
+  watch(
+    (): string => `${props.type}|${props.spaceId}|${props.pageSize}`,
+    (): void => { load(true); },
+  );
+  watch(
+    (): string => props.keyword,
+    (): void => { applyPage(1); },
+  );
+  watch(
+    (): string => `${items.value.length}|${loading.value}|${hasMore.value}`,
+    (): void => { fillViewportIfNeeded(); },
+  );
+  onMounted(() => { load(true); });
+</script>
+
+<style scoped lang="scss">
+  .knowledge-list-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .knowledge-list { flex: 1; height: 100%; min-height: 0; }
+  .knowledge-items { display: flex; flex-direction: column; padding: 0 28rpx 24rpx; }
+  .knowledge-row { display: flex; flex-direction: row; align-items: center; min-height: 136rpx; padding: 20rpx 0; border-bottom: 2rpx solid #eeeef3; box-sizing: border-box; }
+  .knowledge-row--simple { min-height: 72rpx; padding: 10rpx 8rpx; border-bottom-width: 0; border-radius: 12rpx; }
+  .file-icon { flex-shrink: 0; display: flex; align-items: center; justify-content: center; width: 72rpx; height: 72rpx; margin-right: 20rpx; border-radius: 20rpx; }
+  .knowledge-row--simple .file-icon { width: 52rpx; height: 52rpx; margin-right: 16rpx; border-radius: 14rpx; }
+  .file-icon--pdf { background-color: #fff0f2; }
+  .file-icon--doc { background-color: #edf4ff; }
+  .file-icon--sheet { background-color: #ecf8f3; }
+  .file-icon--slide { background-color: #fff3e9; }
+  .file-icon--default { background-color: #f1effd; }
+  .knowledge-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .knowledge-name { color: #202028; font-size: 29rpx; font-weight: 600; line-height: 40rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .knowledge-meta { display: flex; flex-direction: row; align-items: center; margin-top: 8rpx; }
+  .file-type, .used-time { padding: 2rpx 12rpx; border-radius: 999rpx; background-color: #f2f1f7; color: #92919b; font-size: 22rpx; line-height: 30rpx; }
+  .used-time { margin-left: 8rpx; color: #6255f5; }
+  .select-button { flex-shrink: 0; display: flex; align-items: center; justify-content: center; min-width: 96rpx; height: 58rpx; margin-left: 18rpx; padding: 0 18rpx; border-radius: 18rpx; background-color: #f3f1fa; box-sizing: border-box; }
+  .select-text { color: #5a46ff; font-size: 26rpx; font-weight: 600; }
+  .state-box { display: flex; align-items: center; justify-content: center; min-height: 360rpx; }
+  .state-text { color: #9999a3; font-size: 25rpx; }
+  .loading-more { display: flex; align-items: center; justify-content: center; padding: 20rpx 0; }
+</style>

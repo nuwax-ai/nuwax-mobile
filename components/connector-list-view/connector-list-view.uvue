@@ -1,0 +1,692 @@
+<template>
+  <view class="connector-list-view">
+    <scroll-view
+      id="connector-list-scroll"
+      class="connector-list"
+      scroll-y="true"
+      :show-scrollbar="false"
+      :lower-threshold="80"
+      @scrolltolower="loadMore"
+    >
+      <view v-if="loading && items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.loading") }}</text>
+      </view>
+      <view v-else-if="items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.noData") }}</text>
+      </view>
+      <view v-else id="connector-list-content" class="connector-items">
+        <view
+          v-for="(item, index) in items"
+          :key="item.key"
+          class="connector-row"
+          :class="variant == 'simple' ? 'connector-row--simple' : ''"
+        >
+          <view
+            class="connector-icon"
+            :class="variant == 'simple' ? 'connector-icon--simple' : ''"
+            :style="{ backgroundColor: iconBackground(index) }"
+          >
+            <image v-if="item.icon.length > 0" class="connector-icon-image" :src="item.icon" mode="aspectFit" />
+            <text v-else class="connector-icon-fallback">{{ iconFallback(item.name) }}</text>
+          </view>
+          <view class="connector-main">
+            <text class="connector-name">{{ item.name }}</text>
+            <view v-if="variant == 'default'" class="connector-meta">
+              <text v-if="item.category.length > 0" class="connector-category">{{ item.category }}</text>
+              <text v-if="item.category.length > 0" class="connector-separator">·</text>
+              <view class="status-dot" :class="item.connected ? 'status-dot--connected' : ''" />
+              <text class="connector-status" :class="item.connected ? 'connector-status--connected' : ''">
+                {{ item.connected ? t("Mobile.ConnectorList.connected") : t("Mobile.ConnectorList.disconnected") }}
+              </text>
+            </view>
+          </view>
+          <switch
+            v-if="variant == 'default'"
+            class="connector-switch"
+            :checked="item.connected && item.connectionEnabled"
+            :disabled="isBusy(item.key)"
+            color="#5147ff"
+            @change="handleSwitchChange($event, item)"
+          />
+        </view>
+        <view v-if="loading" class="loading-more">
+          <text class="state-text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+      </view>
+    </scroll-view>
+
+    <uni-modal-popup ref="credentialPopupRef" position="center" width="88%" :show-header="false" :body-scroll="false" @update-visible="handleCredentialVisible">
+      <view class="credential-modal">
+        <view class="credential-header">
+          <text class="credential-title">{{ credentialItem != null ? credentialItem.name : t("Mobile.CreateHub.connector") }}</text>
+          <view class="credential-close" @click="closeCredentialModal">
+            <view class="close-line close-line--left" />
+            <view class="close-line close-line--right" />
+          </view>
+        </view>
+        <text class="credential-hint">{{ t("Mobile.ConnectorList.credentialHint") }}</text>
+        <view v-for="field in credentialFields" :key="field.name" class="credential-field">
+          <text class="credential-label">{{ field.label }}</text>
+          <input
+            class="credential-input"
+            :password="field.secret"
+            :placeholder="field.placeholder"
+            v-model="field.value"
+          />
+        </view>
+        <view class="credential-submit" :class="credentialSubmitting ? 'credential-submit--disabled' : ''" @click="submitCredentials">
+          <text class="credential-submit-text">{{ credentialSubmitting ? t("Mobile.Common.loading") : t("Mobile.ConnectorList.connect") }}</text>
+        </view>
+      </view>
+    </uni-modal-popup>
+
+    <uni-modal-popup ref="devicePopupRef" position="center" width="88%" :show-header="false" :body-scroll="false" @update-visible="handleDeviceVisible">
+      <view class="device-modal">
+        <view class="credential-header">
+          <text class="credential-title">{{ t("Mobile.ConnectorList.scanConnect") }}</text>
+          <view class="credential-close" @click="closeDeviceModal">
+            <view class="close-line close-line--left" />
+            <view class="close-line close-line--right" />
+          </view>
+        </view>
+        <view class="device-qr-box">
+          <image v-if="deviceQrUrl.length > 0" class="device-qr" :src="deviceQrUrl" mode="aspectFit" />
+          <text v-else class="state-text">{{ t("Mobile.Common.loading") }}</text>
+        </view>
+        <text class="device-hint">{{ t("Mobile.ConnectorList.scanHint") }}</text>
+        <text v-if="deviceUserCode.length > 0" class="device-code">{{ deviceUserCode }}</text>
+        <view class="credential-submit" @click="startDeviceAuthorize">
+          <text class="credential-submit-text">{{ t("Mobile.ConnectorList.refreshQr") }}</text>
+        </view>
+      </view>
+    </uni-modal-popup>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { getCurrentInstance, nextTick, onMounted, onUnmounted, ref, watch, type ComponentPublicInstance } from "vue";
+  import UniModalPopup from "@/components/uni-modal-popup/uni-modal-popup.uvue";
+  import {
+    apiConnectorConnectionCreate,
+    apiConnectorConnectionList,
+    apiConnectorConnectionToggleStatus,
+    apiConnectorDeviceAuthorize,
+    apiConnectorDevicePoll,
+    apiConnectorOauthAuthorize,
+    apiConnectorProviderDetail,
+    apiConnectorProviderList,
+  } from "@/servers/connector";
+  import { ConnectorCredentialField, ConnectorListItem, type ConnectorListSourceType, type ConnectorListVariant } from "@/types/interfaces/connector";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { getApiBaseUrl } from "@/constants/config";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { handleExternalLink } from "@/utils/system";
+  import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+  const props = withDefaults(defineProps<{
+    type: ConnectorListSourceType;
+    variant?: ConnectorListVariant;
+    keyword?: string;
+    category?: string;
+    spaceId?: number;
+    pageSize?: number;
+  }>(), {
+    type: "system",
+    variant: "default",
+    keyword: "",
+    category: "",
+    spaceId: 0,
+    pageSize: 20,
+  });
+  const emit = defineEmits<{
+    (e: "loaded", type: string, count: number): void;
+    (e: "connected-change", item: UTSJSONObject, connected: boolean): void;
+  }>();
+
+  const items = ref<ConnectorListItem[]>([] as ConnectorListItem[]);
+  const loading = ref<boolean>(false);
+  const hasMore = ref<boolean>(true);
+  const currentPage = ref<number>(0);
+  const busyKeys = ref<string[]>([] as string[]);
+  const debouncedKeyword = ref<string>(props.keyword);
+  const componentInstance = getCurrentInstance();
+  let requestId = 0;
+  let keywordTimer: number | null = null;
+  let oauthPollTimer: number | null = null;
+  let oauthPollCount = 0;
+  let devicePollTimer: number | null = null;
+
+  const credentialPopupRef = ref<any | null>(null);
+  const credentialItem = ref<ConnectorListItem | null>(null);
+  const credentialFields = ref<ConnectorCredentialField[]>([] as ConnectorCredentialField[]);
+  const credentialSubmitting = ref<boolean>(false);
+
+  const devicePopupRef = ref<any | null>(null);
+  const deviceItem = ref<ConnectorListItem | null>(null);
+  const deviceQrUrl = ref<string>("");
+  const deviceUserCode = ref<string>("");
+  const deviceState = ref<string>("");
+  const deviceInterval = ref<number>(5);
+
+  const backgrounds = ["#f2f0ff", "#eef8ff", "#f1f8f2", "#fff4ed"] as string[];
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string): number {
+    const raw = obj[key];
+    if (raw == null) return 0;
+    const value = parseFloat(`${raw}`);
+    return isNaN(value) ? 0 : value;
+  }
+
+  function iconBackground(index: number): string {
+    return props.variant == "simple" ? "transparent" : backgrounds[index % backgrounds.length];
+  }
+
+  function iconFallback(name: string): string {
+    return name.length > 0 ? name.substring(0, 1) : "C";
+  }
+
+  function isBusy(key: string): boolean {
+    return busyKeys.value.indexOf(key) >= 0;
+  }
+
+  function setBusy(key: string, busy: boolean): void {
+    const next = [] as string[];
+    for (let i = 0; i < busyKeys.value.length; i++) {
+      if (busyKeys.value[i] != key) next.push(busyKeys.value[i]);
+    }
+    if (busy) next.push(key);
+    busyKeys.value = next;
+  }
+
+  function mapItem(raw: UTSJSONObject, source: string): ConnectorListItem {
+    const item = new ConnectorListItem();
+    const service = readString(raw, "service");
+    const id = readString(raw, "id");
+    item.rawId = service.length > 0 ? service : id;
+    item.key = `connector:${source}:${item.rawId}`;
+    item.connectionId = readNumber(raw, "connectionId");
+    item.spaceId = readNumber(raw, "spaceId");
+    item.name = readString(raw, "displayName");
+    if (item.name.length == 0) item.name = service;
+    item.description = readString(raw, "description");
+    item.category = readString(raw, "category");
+    item.icon = readString(raw, "icon");
+    item.authType = readString(raw, "authType");
+    item.connected = raw["connected"] == true;
+    const enabledRaw = raw["connectionEnabled"];
+    item.connectionEnabled = item.connected && enabledRaw != false;
+    return item;
+  }
+
+  function responseRows(data: any): any[] {
+    if (data == null) return [] as any[];
+    if (Array.isArray(data)) return data as any[];
+    const obj = data as UTSJSONObject;
+    const records = obj["records"];
+    return records != null ? records as any[] : ([] as any[]);
+  }
+
+  function currentScope(): string {
+    if (props.type == "system") return "official";
+    if (props.type == "team") return "space";
+    return "";
+  }
+
+  async function load(reset: boolean): Promise<void> {
+    if (loading.value && !reset) return;
+    const id = requestId + 1;
+    requestId = id;
+    const page = reset ? 1 : currentPage.value + 1;
+    loading.value = true;
+    if (reset) {
+      items.value = [] as ConnectorListItem[];
+      hasMore.value = true;
+    }
+    try {
+      const connected = props.type == "connected" ? "true" : "";
+      const res = await apiConnectorProviderList(
+        props.type == "connected" ? 0 : page,
+        props.type == "connected" ? 0 : props.pageSize,
+        currentScope(),
+        connected,
+        props.type == "connected" ? "" : debouncedKeyword.value,
+        props.type == "system" ? props.category : "",
+        props.type == "team" ? props.spaceId : 0,
+      );
+      if (id != requestId) return;
+      if (apiResCode(res) != SUCCESS_CODE) throw new Error("connector list failed");
+      const rows = responseRows(apiResData<any>(res));
+      const next = [] as ConnectorListItem[];
+      const keyword = debouncedKeyword.value.trim().toLowerCase();
+      for (let i = 0; i < rows.length; i++) {
+        const item = mapItem(rows[i] as UTSJSONObject, props.type);
+        if (props.type != "connected" || keyword.length == 0 || item.name.toLowerCase().indexOf(keyword) >= 0 || item.description.toLowerCase().indexOf(keyword) >= 0) {
+          next.push(item);
+        }
+      }
+      if (reset) items.value = next;
+      else items.value = [...items.value, ...next];
+      currentPage.value = page;
+      hasMore.value = props.type != "connected" && rows.length >= props.pageSize;
+      if (reset) emit("loaded", props.type, next.length);
+    } catch (_error) {
+      if (id == requestId) {
+        if (reset) items.value = [] as ConnectorListItem[];
+        hasMore.value = false;
+        if (reset) emit("loaded", props.type, 0);
+      }
+    } finally {
+      if (id == requestId) loading.value = false;
+    }
+  }
+
+  function loadMore(): void {
+    if (hasMore.value && !loading.value) load(false);
+  }
+
+  function fillViewportIfNeeded(): void {
+    if (loading.value || !hasMore.value || items.value.length == 0 || componentInstance == null || componentInstance.proxy == null) return;
+    const proxy = componentInstance.proxy;
+    nextTick(() => {
+      uni.createSelectorQuery()
+        .in(proxy)
+        .select("#connector-list-scroll")
+        .boundingClientRect()
+        .select("#connector-list-content")
+        .boundingClientRect()
+        .exec((results: Array<any>) => {
+          if (loading.value || !hasMore.value || results.length < 2 || results[0] == null || results[1] == null) return;
+          const viewport = results[0] as NodeInfo;
+          const content = results[1] as NodeInfo;
+          const viewportHeight = viewport.height != null ? parseFloat(`${viewport.height}`) : 0;
+          const contentHeight = content.height != null ? parseFloat(`${content.height}`) : 0;
+          if (viewportHeight > 0 && contentHeight <= viewportHeight + 1) loadMore();
+        });
+    });
+  }
+
+  function itemPayload(item: ConnectorListItem): UTSJSONObject {
+    const payload = new UTSJSONObject();
+    payload["key"] = item.key;
+    payload["service"] = item.rawId;
+    payload["name"] = item.name;
+    payload["connected"] = item.connected;
+    payload["connectionEnabled"] = item.connectionEnabled;
+    return payload;
+  }
+
+  function updateItem(key: string, connected: boolean, enabled: boolean, connectionId: number): void {
+    const next = [] as ConnectorListItem[];
+    let changed: ConnectorListItem | null = null;
+    for (let i = 0; i < items.value.length; i++) {
+      const item = items.value[i];
+      if (item.key == key) {
+        item.connected = connected;
+        item.connectionEnabled = enabled;
+        if (connectionId > 0) item.connectionId = connectionId;
+        changed = item;
+      }
+      next.push(item);
+    }
+    items.value = next;
+    if (changed != null) emit("connected-change", itemPayload(changed), connected);
+  }
+
+  async function resolveConnectionId(item: ConnectorListItem): Promise<number> {
+    if (item.connectionId > 0) return item.connectionId;
+    const res = await apiConnectorConnectionList(props.type == "team" ? props.spaceId : 0);
+    if (apiResCode(res) != SUCCESS_CODE) return 0;
+    const rows = responseRows(apiResData<any>(res));
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i] as UTSJSONObject;
+      const service = readString(row, "providerService").length > 0 ? readString(row, "providerService") : readString(row, "service");
+      if (service == item.rawId) return readNumber(row, "id");
+    }
+    return 0;
+  }
+
+  async function toggleEnabled(item: ConnectorListItem, enabled: boolean): Promise<void> {
+    setBusy(item.key, true);
+    try {
+      const connectionId = await resolveConnectionId(item);
+      if (connectionId <= 0) {
+        uni.showToast({ title: t("Mobile.ConnectorList.connectionMissing"), icon: "none" });
+        return;
+      }
+      const res = await apiConnectorConnectionToggleStatus(connectionId, enabled);
+      if (apiResCode(res) == SUCCESS_CODE) updateItem(item.key, true, enabled, connectionId);
+    } finally {
+      setBusy(item.key, false);
+    }
+  }
+
+  async function connectNoAuth(item: ConnectorListItem): Promise<void> {
+    const data = new UTSJSONObject();
+    data["providerService"] = item.rawId;
+    const spaceId = item.spaceId > 0 ? item.spaceId : (props.type == "team" ? props.spaceId : 0);
+    if (spaceId > 0) data["spaceId"] = spaceId;
+    const res = await apiConnectorConnectionCreate(data);
+    if (apiResCode(res) == SUCCESS_CODE) {
+      uni.showToast({ title: t("Mobile.ConnectorList.connectSuccess"), icon: "success" });
+      await load(true);
+    }
+  }
+
+  async function providerFromDetail(item: ConnectorListItem): Promise<UTSJSONObject | null> {
+    const res = await apiConnectorProviderDetail(item.rawId, props.type == "team" ? props.spaceId : 0);
+    if (apiResCode(res) != SUCCESS_CODE) return null;
+    const dataRaw = apiResData<any>(res);
+    if (dataRaw == null) return null;
+    const data = dataRaw as UTSJSONObject;
+    const providerRaw = data["provider"];
+    return providerRaw != null ? providerRaw as UTSJSONObject : null;
+  }
+
+  function stopOauthPolling(): void {
+    const timer = oauthPollTimer;
+    if (timer != null) {
+      clearInterval(timer);
+      oauthPollTimer = null;
+    }
+    oauthPollCount = 0;
+  }
+
+  function startOauthPolling(item: ConnectorListItem): void {
+    stopOauthPolling();
+    oauthPollTimer = setInterval(() => {
+      oauthPollCount += 1;
+      providerFromDetail(item).then((provider: UTSJSONObject | null): void => {
+        if (provider != null && provider["connected"] == true) {
+          stopOauthPolling();
+          setBusy(item.key, false);
+          uni.showToast({ title: t("Mobile.ConnectorList.connectSuccess"), icon: "success" });
+          load(true);
+        } else if (oauthPollCount >= 80) {
+          stopOauthPolling();
+          setBusy(item.key, false);
+        }
+      });
+    }, 1500);
+  }
+
+  async function connectOauth(item: ConnectorListItem): Promise<void> {
+    setBusy(item.key, true);
+    const res = await apiConnectorOauthAuthorize(item.rawId, props.type == "team" ? props.spaceId : 0);
+    if (apiResCode(res) != SUCCESS_CODE) {
+      setBusy(item.key, false);
+      return;
+    }
+    const dataRaw = apiResData<any>(res);
+    const data = dataRaw != null ? dataRaw as UTSJSONObject : new UTSJSONObject();
+    const authorizeUrl = readString(data, "authorizeUrl");
+    if (authorizeUrl.length == 0) {
+      setBusy(item.key, false);
+      return;
+    }
+    handleExternalLink(authorizeUrl, item.name);
+    startOauthPolling(item);
+  }
+
+  function buildCredentialFields(provider: UTSJSONObject): ConnectorCredentialField[] {
+    const result = [] as ConnectorCredentialField[];
+    const authType = readString(provider, "authType");
+    const authConfigRaw = provider["authConfig"];
+    const authConfig = authConfigRaw != null ? authConfigRaw as UTSJSONObject : new UTSJSONObject();
+    const fieldsRaw = authConfig["fields"];
+    if (fieldsRaw != null) {
+      const rows = fieldsRaw as any[];
+      for (let i = 0; i < rows.length; i++) {
+        const raw = rows[i] as UTSJSONObject;
+        const field = new ConnectorCredentialField();
+        field.name = readString(raw, "name");
+        field.label = readString(raw, "label");
+        if (field.label.length == 0) field.label = field.name;
+        field.placeholder = readString(raw, "placeholder");
+        field.secret = raw["secret"] != false;
+        if (field.name.length > 0) result.push(field);
+      }
+    }
+    if (result.length == 0 && authType == "api_key") {
+      const field = new ConnectorCredentialField();
+      field.name = readString(authConfig, "keyName");
+      if (field.name.length == 0) field.name = "apiKey";
+      field.label = field.name;
+      result.push(field);
+    }
+    if (result.length == 0 && authType == "bearer") {
+      const field = new ConnectorCredentialField();
+      field.name = "token";
+      field.label = "Token";
+      result.push(field);
+    }
+    return result;
+  }
+
+  function callPopup(inst: any | null, method: string): void {
+    if (inst != null) (inst as ComponentPublicInstance).$callMethod(method);
+  }
+
+  async function openCredentialModal(item: ConnectorListItem): Promise<void> {
+    setBusy(item.key, true);
+    try {
+      const provider = await providerFromDetail(item);
+      if (provider == null) return;
+      const fields = buildCredentialFields(provider);
+      if (fields.length == 0) {
+        uni.showToast({ title: t("Mobile.ConnectorList.credentialMissing"), icon: "none" });
+        return;
+      }
+      credentialItem.value = item;
+      credentialFields.value = fields;
+      await nextTick();
+      callPopup(credentialPopupRef.value, "open");
+    } finally {
+      setBusy(item.key, false);
+    }
+  }
+
+  function closeCredentialModal(): void {
+    callPopup(credentialPopupRef.value, "close");
+  }
+
+  function handleCredentialVisible(visible: boolean): void {
+    if (!visible) {
+      credentialItem.value = null;
+      credentialFields.value = [] as ConnectorCredentialField[];
+      credentialSubmitting.value = false;
+    }
+  }
+
+  async function submitCredentials(): Promise<void> {
+    const item = credentialItem.value;
+    if (item == null || credentialSubmitting.value) return;
+    const fields = new UTSJSONObject();
+    for (let i = 0; i < credentialFields.value.length; i++) {
+      const field = credentialFields.value[i];
+      if (field.value.trim().length == 0) {
+        uni.showToast({ title: t("Mobile.ConnectorList.credentialRequired"), icon: "none" });
+        return;
+      }
+      fields[field.name] = field.value.trim();
+    }
+    const data = new UTSJSONObject();
+    data["providerService"] = item.rawId;
+    data["fields"] = fields;
+    const spaceId = item.spaceId > 0 ? item.spaceId : (props.type == "team" ? props.spaceId : 0);
+    if (spaceId > 0) data["spaceId"] = spaceId;
+    credentialSubmitting.value = true;
+    try {
+      const res = await apiConnectorConnectionCreate(data);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        closeCredentialModal();
+        uni.showToast({ title: t("Mobile.ConnectorList.connectSuccess"), icon: "success" });
+        await load(true);
+      }
+    } finally {
+      credentialSubmitting.value = false;
+    }
+  }
+
+  function stopDevicePolling(): void {
+    const timer = devicePollTimer;
+    if (timer != null) {
+      clearTimeout(timer);
+      devicePollTimer = null;
+    }
+  }
+
+  function pollDevice(): void {
+    stopDevicePolling();
+    if (deviceState.value.length == 0) return;
+    devicePollTimer = setTimeout(async () => {
+      const res = await apiConnectorDevicePoll(deviceState.value, deviceInterval.value);
+      const dataRaw = apiResCode(res) == SUCCESS_CODE ? apiResData<any>(res) : null;
+      const data = dataRaw != null ? dataRaw as UTSJSONObject : new UTSJSONObject();
+      const status = readString(data, "status");
+      if (status == "authorized" || status == "already_completed") {
+        const item = deviceItem.value;
+        closeDeviceModal();
+        uni.showToast({ title: t("Mobile.ConnectorList.connectSuccess"), icon: "success" });
+        if (item != null) await load(true);
+        return;
+      }
+      pollDevice();
+    }, deviceInterval.value * 1000);
+  }
+
+  async function startDeviceAuthorize(): Promise<void> {
+    const item = deviceItem.value;
+    if (item == null) return;
+    stopDevicePolling();
+    deviceQrUrl.value = "";
+    const res = await apiConnectorDeviceAuthorize(item.rawId, props.type == "team" ? props.spaceId : 0);
+    if (apiResCode(res) != SUCCESS_CODE) return;
+    const dataRaw = apiResData<any>(res);
+    const data = dataRaw != null ? dataRaw as UTSJSONObject : new UTSJSONObject();
+    deviceState.value = readString(data, "state");
+    deviceUserCode.value = readString(data, "userCode");
+    if (deviceUserCode.value.length == 0) deviceUserCode.value = readString(data, "verificationCode");
+    const interval = readNumber(data, "interval");
+    deviceInterval.value = interval > 0 ? interval : 5;
+    const qrUrl = readString(data, "qrUrl");
+    if (qrUrl.indexOf("http://") == 0 || qrUrl.indexOf("https://") == 0) deviceQrUrl.value = qrUrl;
+    else if (qrUrl.length > 0) deviceQrUrl.value = `${getApiBaseUrl()}${qrUrl}`;
+    pollDevice();
+  }
+
+  async function openDeviceModal(item: ConnectorListItem): Promise<void> {
+    deviceItem.value = item;
+    await nextTick();
+    callPopup(devicePopupRef.value, "open");
+    await startDeviceAuthorize();
+  }
+
+  function closeDeviceModal(): void {
+    stopDevicePolling();
+    callPopup(devicePopupRef.value, "close");
+  }
+
+  function handleDeviceVisible(visible: boolean): void {
+    if (!visible) {
+      stopDevicePolling();
+      deviceItem.value = null;
+      deviceQrUrl.value = "";
+      deviceUserCode.value = "";
+      deviceState.value = "";
+    }
+  }
+
+  async function connectItem(item: ConnectorListItem): Promise<void> {
+    if (item.authType == "no_auth") {
+      setBusy(item.key, true);
+      try { await connectNoAuth(item); } finally { setBusy(item.key, false); }
+      return;
+    }
+    if (item.authType == "oauth2") {
+      await connectOauth(item);
+      return;
+    }
+    if (item.authType == "oauth2_device") {
+      await openDeviceModal(item);
+      return;
+    }
+    await openCredentialModal(item);
+  }
+
+  function handleSwitchChange(event: UniSwitchChangeEvent, item: ConnectorListItem): void {
+    const enabled = event.detail.value;
+    if (item.connected) toggleEnabled(item, enabled);
+    else if (enabled) connectItem(item);
+  }
+
+  watch((): string => props.keyword, (value: string): void => {
+    if (keywordTimer != null) clearTimeout(keywordTimer);
+    keywordTimer = setTimeout(() => { debouncedKeyword.value = value; }, 300);
+  });
+  watch(
+    (): string => `${props.type}|${debouncedKeyword.value}|${props.category}|${props.spaceId}|${props.pageSize}`,
+    (): void => { load(true); },
+  );
+  watch(
+    (): string => `${items.value.length}|${loading.value}|${hasMore.value}`,
+    (): void => { fillViewportIfNeeded(); },
+  );
+
+  onMounted(() => { load(true); });
+  onUnmounted(() => {
+    if (keywordTimer != null) clearTimeout(keywordTimer);
+    stopOauthPolling();
+    stopDevicePolling();
+  });
+
+  defineExpose({ refresh: (): void => { load(true); } });
+</script>
+
+<style scoped lang="scss">
+  .connector-list-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .connector-list { flex: 1; height: 100%; min-height: 0; }
+  .connector-items { display: flex; flex-direction: column; padding: 0 28rpx 24rpx; }
+  .connector-row { display: flex; flex-direction: row; align-items: center; min-height: 122rpx; padding: 18rpx 0; border-bottom: 2rpx solid #eeeef3; box-sizing: border-box; }
+  .connector-row--simple { min-height: 72rpx; padding: 10rpx 8rpx; border-bottom-width: 0; }
+  .connector-icon { flex-shrink: 0; width: 70rpx; height: 70rpx; margin-right: 18rpx; border-radius: 18rpx; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .connector-icon--simple { width: 52rpx; height: 52rpx; margin-right: 16rpx; border-radius: 999rpx; }
+  .connector-icon-image { width: 50rpx; height: 50rpx; }
+  .connector-icon--simple .connector-icon-image { width: 44rpx; height: 44rpx; border-radius: 999rpx; }
+  .connector-icon-fallback { color: #5147ff; font-size: 30rpx; font-weight: 700; }
+  .connector-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .connector-name { color: #202028; font-size: 29rpx; font-weight: 600; line-height: 40rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .connector-meta { display: flex; flex-direction: row; align-items: center; margin-top: 3rpx; }
+  .connector-category, .connector-separator, .connector-status { color: #90909b; font-size: 23rpx; line-height: 32rpx; }
+  .connector-separator { margin: 0 8rpx; }
+  .status-dot { width: 12rpx; height: 12rpx; margin-right: 8rpx; border-radius: 999rpx; background-color: #b1b1ba; }
+  .status-dot--connected { background-color: #23a56a; }
+  .connector-status--connected { color: #23a56a; }
+  .connector-switch { flex-shrink: 0; margin-left: 18rpx; transform: scale(0.86); transform-origin: right center; }
+  .state-box { display: flex; align-items: center; justify-content: center; min-height: 360rpx; }
+  .state-text { color: #9999a3; font-size: 25rpx; }
+  .loading-more { display: flex; align-items: center; justify-content: center; padding: 20rpx 0; }
+  .credential-modal, .device-modal { width: 100%; padding: 30rpx; border-radius: 28rpx; background-color: #ffffff; box-sizing: border-box; }
+  .credential-header { display: flex; flex-direction: row; align-items: center; justify-content: space-between; }
+  .credential-title { flex: 1; min-width: 0; color: #202028; font-size: 32rpx; font-weight: 700; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .credential-close { position: relative; width: 52rpx; height: 52rpx; margin-left: 16rpx; }
+  .close-line { position: absolute; left: 10rpx; top: 25rpx; width: 32rpx; height: 4rpx; border-radius: 999rpx; background-color: #8b8b96; }
+  .close-line--left { transform: rotate(45deg); }
+  .close-line--right { transform: rotate(-45deg); }
+  .credential-hint { margin-top: 12rpx; color: #90909b; font-size: 24rpx; line-height: 34rpx; }
+  .credential-field { margin-top: 24rpx; }
+  .credential-label { color: #393941; font-size: 25rpx; font-weight: 600; }
+  .credential-input { height: 78rpx; margin-top: 10rpx; padding: 0 22rpx; border: 2rpx solid #e4e4ea; border-radius: 16rpx; color: #202028; font-size: 27rpx; box-sizing: border-box; }
+  .credential-submit { height: 78rpx; margin-top: 30rpx; border-radius: 18rpx; background-color: #5147ff; display: flex; align-items: center; justify-content: center; }
+  .credential-submit--disabled { opacity: 0.6; }
+  .credential-submit-text { color: #ffffff; font-size: 27rpx; font-weight: 600; }
+  .device-qr-box { height: 430rpx; margin-top: 24rpx; border-radius: 20rpx; background-color: #f6f6f8; display: flex; align-items: center; justify-content: center; }
+  .device-qr { width: 380rpx; height: 380rpx; }
+  .device-hint { margin-top: 20rpx; color: #70707b; font-size: 24rpx; line-height: 34rpx; text-align: center; }
+  .device-code { margin-top: 12rpx; color: #202028; font-size: 30rpx; font-weight: 700; letter-spacing: 4rpx; text-align: center; }
+</style>

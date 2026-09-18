@@ -1,0 +1,496 @@
+<template>
+  <view class="skill-list-view">
+    <scroll-view
+      id="skill-list-scroll"
+      class="skill-list"
+      scroll-y="true"
+      :show-scrollbar="false"
+      :lower-threshold="80"
+      @scrolltolower="loadMore"
+    >
+      <view v-if="loading && items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.loading") }}</text>
+      </view>
+      <view v-else-if="items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Skill.empty") }}</text>
+      </view>
+      <view v-else id="skill-list-content" class="skill-items">
+        <view
+          v-for="item in items"
+          :key="item.key"
+          class="skill-row"
+          :class="variant == 'simple' ? 'skill-row--simple' : ''"
+          @click="handleSelect(item)"
+        >
+          <view class="skill-top">
+            <view class="skill-icon-box" :class="variant == 'simple' ? 'skill-icon-box--simple' : ''">
+              <image
+                class="skill-icon"
+                :src="item.icon.length > 0 ? item.icon : '/static/logo.png'"
+                mode="aspectFill"
+                :alt="item.name"
+              />
+            </view>
+            <view class="skill-main">
+              <view class="skill-title-line">
+                <text v-if="item.paymentRequired" class="skill-tag" :class="item.subscribed ? 'skill-tag--active' : ''">{{ item.subscribed ? t("Mobile.AgentList.subscribedTag") : t("Mobile.Skill.paid") }}</text>
+                <text class="skill-name">{{ item.name }}</text>
+              </view>
+              <text v-if="variant == 'default' && item.category.length > 0" class="skill-category">{{ item.category }}</text>
+            </view>
+            <view v-if="variant == 'default'" class="skill-actions">
+              <view class="select-button" @click.stop="handleSelect(item)">
+                <text class="select-text">{{ t("Mobile.Skill.select") }}</text>
+              </view>
+              <view
+                class="enable-button"
+                :class="item.enabled ? 'enable-button--active' : ''"
+                @click.stop="handleToggle(item)"
+              >
+                <view class="pin-head" />
+                <view class="pin-stem" />
+              </view>
+            </view>
+          </view>
+          <text v-if="variant == 'default' && item.description.length > 0" class="skill-description">{{ item.description }}</text>
+        </view>
+        <view v-if="loading" class="loading-more">
+          <text class="state-text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+      </view>
+    </scroll-view>
+
+    <agent-subscription-modal
+      v-if="pendingItem != null"
+      ref="subscriptionModalRef"
+      :target-id="pendingTargetId"
+      target-type="Skill"
+      :is-need-subscription="true"
+      @purchase-success="handlePurchaseSuccess"
+      @update-visible="handleSubscriptionVisible"
+    />
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { getCurrentInstance, nextTick, onMounted, ref, watch, type ComponentPublicInstance } from "vue";
+  import AgentSubscriptionModal from "@/subpackages/pages/chat-conversation-component/components/agent-subscription-modal/agent-subscription-modal.uvue";
+  import {
+    apiPublishedSkillEnable,
+    apiPublishedSkillEnableList,
+    apiPublishedSkillList,
+    apiPublishedSkillUnEnable,
+  } from "@/servers/square";
+  import { apiPublishedSkillDetail } from "@/subpackages/servers/skill";
+  import { apiSpaceList } from "@/servers/workspace";
+  import { SquarePublishedListParams } from "@/types/interfaces/square";
+  import { SkillListItem, type SkillListSourceType, type SkillListVariant } from "@/types/interfaces/skillList";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+  const props = withDefaults(defineProps<{
+    type: SkillListSourceType;
+    variant?: SkillListVariant;
+    keyword?: string;
+    category?: string;
+    spaceId?: number;
+    spaceIds?: number[];
+    pageSize?: number;
+  }>(), {
+    type: "system",
+    variant: "default",
+    keyword: "",
+    category: "",
+    spaceId: 0,
+    spaceIds: () => [] as number[],
+    pageSize: 20,
+  });
+  const emit = defineEmits<{
+    (e: "select", item: UTSJSONObject): void;
+    (e: "enabledChange", item: UTSJSONObject, enabled: boolean): void;
+    (e: "loaded", type: string, count: number): void;
+  }>();
+
+  const items = ref<SkillListItem[]>([] as SkillListItem[]);
+  const loading = ref<boolean>(false);
+  const hasMore = ref<boolean>(true);
+  const currentPage = ref<number>(0);
+  const queryKeyword = ref<string>("");
+  const enablingKeys = ref<string[]>([] as string[]);
+  const pendingItem = ref<SkillListItem | null>(null);
+  const pendingAction = ref<string>("");
+  const pendingTargetId = ref<number>(0);
+  const subscriptionModalRef = ref<any | null>(null);
+  const componentInstance = getCurrentInstance();
+  let requestId: number = 0;
+  let subscriptionEnabled: boolean = true;
+  let searchTimer: number | null = null;
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string): number {
+    const raw = obj[key];
+    if (raw == null) return 0;
+    const value = parseFloat(`${raw}`);
+    return isNaN(value) ? 0 : value;
+  }
+
+  function mapItem(raw: UTSJSONObject, source: string): SkillListItem {
+    const item = new SkillListItem();
+    item.rawId = readNumber(raw, "id");
+    item.targetId = readNumber(raw, "targetId");
+    item.key = `skill:${source}:${item.rawId}`;
+    item.name = readString(raw, "name");
+    item.description = readString(raw, "description");
+    item.icon = readString(raw, "icon");
+    item.category = readString(raw, "category");
+    item.paymentRequired = raw["paymentRequired"] == true;
+    item.subscribed = raw["subscribed"] == true;
+    item.enabled = source == "enabled" || raw["enabled"] == true;
+    return item;
+  }
+
+  function mapArray(raw: any | null, source: string): SkillListItem[] {
+    const result = [] as SkillListItem[];
+    if (!Array.isArray(raw)) return result;
+    const rows = raw as any[];
+    for (let i = 0; i < rows.length; i++) result.push(mapItem(rows[i] as UTSJSONObject, source));
+    return result;
+  }
+
+  function filterKeyword(list: SkillListItem[]): SkillListItem[] {
+    const kw = queryKeyword.value.trim().toLowerCase();
+    if (kw.length == 0) return list;
+    const result = [] as SkillListItem[];
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (item.name.toLowerCase().indexOf(kw) >= 0 || item.description.toLowerCase().indexOf(kw) >= 0) result.push(item);
+    }
+    return result;
+  }
+
+  async function resolveTeamSpaceIds(): Promise<number[]> {
+    if (props.spaceId > 0) return [] as number[];
+    if (props.spaceIds.length > 0) return props.spaceIds;
+    const res = await apiSpaceList();
+    if (apiResCode(res) != SUCCESS_CODE) return [] as number[];
+    const raw = apiResData<any>(res);
+    const rows = raw != null && Array.isArray(raw) ? (raw as any[]) : ([] as any[]);
+    const ids = [] as number[];
+    for (let i = 0; i < rows.length; i++) {
+      const id = readNumber(rows[i] as UTSJSONObject, "id");
+      if (id > 0) ids.push(id);
+    }
+    return ids;
+  }
+
+  async function fetchPublished(source: string, page: number, pageSize: number, spaces: number[]): Promise<UTSJSONObject> {
+    const params = new SquarePublishedListParams();
+    params.page = page;
+    params.pageSize = pageSize;
+    params.kw = queryKeyword.value.trim();
+    if (source == "system" || source == "convenient") {
+      params.category = props.category;
+      params.official = true;
+    } else if (source == "team") {
+      params.category = "Skill";
+      params.justReturnSpaceData = true;
+      if (props.spaceId > 0) params.spaceId = props.spaceId;
+      else if (spaces.length > 0) params.spaceIds = spaces;
+    }
+    const res = await apiPublishedSkillList(params);
+    if (apiResCode(res) != SUCCESS_CODE) throw new Error("published skill list failed");
+    const data = apiResData<any>(res);
+    return data != null ? (data as UTSJSONObject) : new UTSJSONObject();
+  }
+
+  function pageItems(data: UTSJSONObject, source: string): SkillListItem[] {
+    return mapArray(data["records"], source);
+  }
+
+  function pageHasMore(data: UTSJSONObject, page: number): boolean {
+    const current = readNumber(data, "current");
+    const pages = readNumber(data, "pages");
+    const currentValue = current > 0 ? current : page;
+    const pagesValue = pages > 0 ? pages : 1;
+    return currentValue < pagesValue;
+  }
+
+  async function load(reset: boolean): Promise<void> {
+    if (loading.value == true && reset != true) return;
+    const id = requestId + 1;
+    requestId = id;
+    const page = reset ? 1 : currentPage.value + 1;
+    loading.value = true;
+    if (reset) {
+      items.value = [] as SkillListItem[];
+      hasMore.value = true;
+    }
+    try {
+      let next = [] as SkillListItem[];
+      let more = false;
+      const source = `${props.type}`;
+      if (source == "enabled") {
+        const res = await apiPublishedSkillEnableList();
+        if (apiResCode(res) != SUCCESS_CODE) throw new Error("enabled skill list failed");
+        next = filterKeyword(mapArray(apiResData<any>(res), "enabled"));
+      } else if (source == "convenient") {
+        const enabledRes = await apiPublishedSkillEnableList();
+        if (apiResCode(enabledRes) != SUCCESS_CODE) throw new Error("enabled skill list failed");
+        let enabled = mapArray(apiResData<any>(enabledRes), "enabled");
+        if (enabled.length > 100) enabled = enabled.slice(0, 100);
+        enabled = filterKeyword(enabled);
+        const published = await fetchPublished("convenient", 1, 100, [] as number[]);
+        const square = pageItems(published, "convenient");
+        const seen = new Map<number, boolean>();
+        for (let i = 0; i < enabled.length; i++) {
+          next.push(enabled[i]);
+          if (enabled[i].targetId > 0) seen.set(enabled[i].targetId, true);
+        }
+        for (let j = 0; j < square.length; j++) {
+          if (square[j].targetId <= 0 || seen.get(square[j].targetId) != true) next.push(square[j]);
+        }
+      } else {
+        const spaces = source == "team" ? await resolveTeamSpaceIds() : ([] as number[]);
+        const data = await fetchPublished(source, page, props.pageSize, spaces);
+        next = pageItems(data, source);
+        more = pageHasMore(data, page);
+      }
+      if (id != requestId) return;
+      items.value = reset ? next : [...items.value, ...next];
+      currentPage.value = page;
+      hasMore.value = more;
+      if (reset) emit("loaded", source, next.length);
+    } catch (_error) {
+      if (id == requestId) {
+        if (reset) items.value = [] as SkillListItem[];
+        hasMore.value = false;
+        if (reset) emit("loaded", `${props.type}`, 0);
+      }
+    } finally {
+      if (id == requestId) loading.value = false;
+    }
+  }
+
+  function loadMore(): void {
+    if (hasMore.value == true && loading.value != true) load(false);
+  }
+
+  function fillViewportIfNeeded(): void {
+    if (loading.value == true || hasMore.value != true || items.value.length == 0) return;
+    if (componentInstance == null) return;
+    const proxy = componentInstance.proxy;
+    if (proxy == null) return;
+    nextTick(() => {
+      uni.createSelectorQuery()
+        .in(proxy)
+        .select("#skill-list-scroll")
+        .boundingClientRect()
+        .select("#skill-list-content")
+        .boundingClientRect()
+        .exec((results: Array<any>) => {
+          if (loading.value == true || hasMore.value != true || results.length < 2) return;
+          const scrollRaw = results[0];
+          const contentRaw = results[1];
+          if (scrollRaw == null || contentRaw == null) return;
+          const scrollRect = scrollRaw as NodeInfo;
+          const contentRect = contentRaw as NodeInfo;
+          const viewportHeight = scrollRect.height != null ? parseFloat(`${scrollRect.height}`) : 0;
+          const contentHeight = contentRect.height != null ? parseFloat(`${contentRect.height}`) : 0;
+          if (viewportHeight > 0 && contentHeight <= viewportHeight + 1) loadMore();
+        });
+    });
+  }
+
+  function toPayload(item: SkillListItem): UTSJSONObject {
+    const payload = new UTSJSONObject();
+    payload["key"] = item.key;
+    payload["rawId"] = item.rawId;
+    payload["targetId"] = item.targetId;
+    payload["name"] = item.name;
+    payload["description"] = item.description;
+    payload["icon"] = item.icon;
+    payload["category"] = item.category;
+    payload["paymentRequired"] = item.paymentRequired;
+    payload["subscribed"] = item.subscribed;
+    payload["enabled"] = item.enabled;
+    payload["source"] = props.type;
+    return payload;
+  }
+
+  function updateItem(key: string, subscribed: boolean, enabled: boolean): void {
+    const next = [] as SkillListItem[];
+    for (let i = 0; i < items.value.length; i++) {
+      const item = items.value[i];
+      if (item.key == key) {
+        item.subscribed = subscribed;
+        item.enabled = enabled;
+      }
+      next.push(item);
+    }
+    items.value = next;
+  }
+
+  function callSubscriptionModal(method: string): void {
+    if (subscriptionModalRef.value != null) (subscriptionModalRef.value as ComponentPublicInstance).$callMethod(method);
+  }
+
+  function isEnabling(key: string): boolean {
+    return enablingKeys.value.indexOf(key) >= 0;
+  }
+
+  async function toggleEnabled(item: SkillListItem): Promise<void> {
+    if (item.targetId <= 0 || isEnabling(item.key)) return;
+    enablingKeys.value = [...enablingKeys.value, item.key];
+    const enabled = item.enabled != true;
+    try {
+      const res = enabled
+        ? await apiPublishedSkillEnable(item.targetId)
+        : await apiPublishedSkillUnEnable(item.targetId);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        item.enabled = enabled;
+        updateItem(item.key, item.subscribed, enabled);
+        emit("enabledChange", toPayload(item), enabled);
+        if (props.type == "enabled" || props.type == "convenient") load(true);
+      }
+    } finally {
+      const next = [] as string[];
+      for (let i = 0; i < enablingKeys.value.length; i++) {
+        if (enablingKeys.value[i] != item.key) next.push(enablingKeys.value[i]);
+      }
+      enablingKeys.value = next;
+    }
+  }
+
+  function completeAction(item: SkillListItem, action: string): void {
+    if (action == "select") {
+      emit("select", toPayload(item));
+      return;
+    }
+    toggleEnabled(item);
+  }
+
+  async function runPaymentGate(item: SkillListItem, action: string): Promise<void> {
+    if (subscriptionEnabled != true || item.paymentRequired != true || item.subscribed == true || item.targetId <= 0) {
+      completeAction(item, action);
+      return;
+    }
+    try {
+      const res = await apiPublishedSkillDetail(item.targetId);
+      const detailRaw = apiResCode(res) == SUCCESS_CODE ? apiResData<any>(res) : null;
+      if (detailRaw != null) {
+        const detail = detailRaw as UTSJSONObject;
+        const stillPending = detail["paymentRequired"] == true && detail["subscribed"] != true;
+        if (stillPending != true) {
+          item.subscribed = detail["subscribed"] == true;
+          updateItem(item.key, item.subscribed, item.enabled);
+          completeAction(item, action);
+          return;
+        }
+      }
+    } catch (_error) {}
+    pendingItem.value = item;
+    pendingAction.value = action;
+    pendingTargetId.value = item.targetId;
+    await nextTick();
+    callSubscriptionModal("open");
+  }
+
+  function handleSelect(item: SkillListItem): void {
+    runPaymentGate(item, "select");
+  }
+
+  function handleToggle(item: SkillListItem): void {
+    if (item.enabled == true) toggleEnabled(item);
+    else runPaymentGate(item, "enable");
+  }
+
+  function handlePurchaseSuccess(): void {
+    const item = pendingItem.value;
+    if (item == null) return;
+    item.subscribed = true;
+    updateItem(item.key, true, item.enabled);
+    const action = pendingAction.value;
+    callSubscriptionModal("close");
+    pendingItem.value = null;
+    pendingAction.value = "";
+    completeAction(item, action);
+  }
+
+  function handleSubscriptionVisible(visible: boolean): void {
+    if (visible != true) {
+      pendingItem.value = null;
+      pendingAction.value = "";
+    }
+  }
+
+  function loadTenantSubscriptionFlag(): void {
+    const raw = uni.getStorageSync(TENANT_CONFIG_INFO);
+    if (raw == null || `${raw}`.length == 0) return;
+    try {
+      const config = JSON.parse<UTSJSONObject>(`${raw}`);
+      if (config != null) subscriptionEnabled = config["enableSubscription"] != 0;
+    } catch (_error) {
+      subscriptionEnabled = true;
+    }
+  }
+
+  watch(
+    (): string => props.keyword,
+    (value: string): void => {
+      if (searchTimer != null) clearTimeout(searchTimer!);
+      searchTimer = setTimeout(() => { queryKeyword.value = value; }, 300);
+    },
+  );
+  watch(
+    (): string => `${props.type}|${props.category}|${props.spaceId}|${JSON.stringify(props.spaceIds)}|${props.pageSize}|${queryKeyword.value}`,
+    (): void => { load(true); },
+  );
+  watch(
+    (): string => `${items.value.length}|${loading.value}|${hasMore.value}`,
+    (): void => { fillViewportIfNeeded(); },
+  );
+  onMounted(() => {
+    loadTenantSubscriptionFlag();
+    queryKeyword.value = props.keyword;
+    load(true);
+  });
+</script>
+
+<style scoped lang="scss">
+  .skill-list-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .skill-list { flex: 1; height: 100%; min-height: 0; }
+  .skill-items { display: flex; flex-direction: column; padding: 0 4rpx 24rpx; }
+  .skill-row { display: flex; flex-direction: column; min-height: 118rpx; padding: 24rpx 0; border-bottom: 2rpx solid #eeeef3; box-sizing: border-box; }
+  .skill-row--simple { min-height: 76rpx; padding: 10rpx 8rpx; border-bottom-width: 0; }
+  .skill-top { display: flex; flex-direction: row; align-items: flex-start; width: 100%; }
+  .skill-row--simple .skill-top { align-items: center; }
+  .skill-icon-box { flex-shrink: 0; width: 70rpx; height: 70rpx; margin-right: 20rpx; border-radius: 18rpx; overflow: hidden; background-color: #f4f2fb; }
+  .skill-icon-box--simple { width: 52rpx; height: 52rpx; margin-right: 16rpx; border-radius: 999rpx; background-color: transparent; }
+  .skill-icon { width: 100%; height: 100%; }
+  .skill-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .skill-title-line { display: flex; flex-direction: row; align-items: center; min-width: 0; }
+  .skill-name { flex: 1; min-width: 0; color: #18181e; font-size: 29rpx; font-weight: 700; line-height: 40rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skill-category { margin-top: 2rpx; color: #94949e; font-size: 24rpx; line-height: 32rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skill-description { width: 100%; margin-top: 14rpx; color: #6f6f7b; font-size: 25rpx; line-height: 35rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skill-tag { flex-shrink: 0; margin-right: 10rpx; padding: 3rpx 10rpx; border-radius: 8rpx; background-color: #fff3df; color: #d57a00; font-size: 20rpx; line-height: 26rpx; }
+  .skill-tag--active { background-color: #e9f8ef; color: #26985a; }
+  .skill-actions { flex-shrink: 0; display: flex; flex-direction: row; align-items: center; margin-left: 18rpx; }
+  .select-button { display: flex; align-items: center; justify-content: center; width: 96rpx; height: 58rpx; border-radius: 18rpx; background-color: #f3f1fa; }
+  .select-text { color: #5a46ff; font-size: 25rpx; font-weight: 600; }
+  .enable-button { position: relative; flex-shrink: 0; width: 52rpx; height: 52rpx; margin-left: 12rpx; border-radius: 16rpx; background-color: #f3f2f8; }
+  .enable-button--active { background-color: #e8e4ff; }
+  .pin-head { position: absolute; left: 16rpx; top: 12rpx; width: 20rpx; height: 18rpx; border: 3rpx solid #92929d; border-radius: 5rpx; box-sizing: border-box; }
+  .pin-stem { position: absolute; left: 24rpx; top: 28rpx; width: 3rpx; height: 15rpx; background-color: #92929d; transform: rotate(12deg); }
+  .enable-button--active .pin-head { border-color: #5a46ff; }
+  .enable-button--active .pin-stem { background-color: #5a46ff; }
+  .state-box { display: flex; align-items: center; justify-content: center; min-height: 360rpx; }
+  .state-text { color: #9999a3; font-size: 25rpx; }
+  .loading-more { display: flex; align-items: center; justify-content: center; padding: 20rpx 0; }
+</style>

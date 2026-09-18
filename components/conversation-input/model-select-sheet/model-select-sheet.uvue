@@ -1,0 +1,343 @@
+<template>
+  <uni-modal-popup
+    ref="popupRef"
+    position="bottom"
+    height="72%"
+    :show-header="false"
+    :body-scroll="false"
+    @update-visible="handleVisibleChange"
+  >
+    <view class="sheet" :class="{ 'sheet--avoid-tab-bar': avoidTabBar }">
+      <view class="sheet-handle" />
+      <text class="sheet-title">{{ t("Mobile.Chat.modelSelect") }}</text>
+      <view class="sheet-tabs">
+        <view
+          v-for="tab in tabs"
+          :key="tab.value"
+          class="sheet-tab"
+          :class="{ 'sheet-tab--active': activeScope == tab.value }"
+          @click="activeScope = tab.value"
+        >
+          <text class="sheet-tab-text" :class="{ 'sheet-tab-text--active': activeScope == tab.value }">{{ tab.label }}</text>
+        </view>
+      </view>
+      <scroll-view class="model-list" direction="vertical" :show-scrollbar="false">
+        <view v-if="loading" class="sheet-state"><text class="sheet-state-text">{{ t("Mobile.Page.loading") }}</text></view>
+        <view v-else-if="visibleModels.length == 0" class="sheet-state"><text class="sheet-state-text">{{ t("Mobile.Common.noData") }}</text></view>
+        <view
+          v-for="item in visibleModels"
+          :key="item.id"
+          class="model-row"
+          :class="{ 'model-row--active': item.id == currentModelId }"
+          @click="selectModel(item)"
+        >
+          <image
+            class="model-provider-icon"
+            :src="item.providerIcon"
+            mode="aspectFit"
+            @error="handleProviderIconError(item)"
+          />
+          <view class="model-main">
+            <view class="model-name-line">
+              <text class="model-name" :class="{ 'model-name--active': item.id == currentModelId }">{{ item.name }}</text>
+              <text
+                v-if="item.scope == 'system' && item.tag.length > 0"
+                class="model-tag"
+                :style="modelTagStyle(item)"
+              >{{ item.tag }}</text>
+              <text v-if="item.scope == 'team' && item.spaceName.length > 0" class="model-space-tag">{{ item.spaceName }}</text>
+            </view>
+          </view>
+          <text v-if="item.scope == 'system' && item.cost.length > 0" class="model-cost">{{ item.cost }}</text>
+          <view class="model-check-slot">
+            <svg-icon v-if="item.id == currentModelId" name="icon-Check" size="34" color="#5147ff" />
+          </view>
+        </view>
+      </scroll-view>
+    </view>
+  </uni-modal-popup>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref, watch, type ComponentPublicInstance } from "vue";
+  import UniModalPopup from "@/components/uni-modal-popup/uni-modal-popup.uvue";
+  import { apiGetAgentModelOptions } from "@/servers/agentDev";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+  import { readAgentEnumString } from "@/subpackages/utils/agentInfoField.uts";
+  import { t as tRaw, emptyI18nParams } from "@/utils/i18n";
+  import {
+    conversationModelMatchesAgentType,
+    resolveConversationModelScope,
+    resolveConversationModelId,
+  } from "../conversationInputOptions.uts";
+
+  const t = (key: string): string => tRaw(key, emptyI18nParams(), "");
+  const DEFAULT_PROVIDER_ICON = "https://s3.nuwax.com:9443/nuwax-public/providers/custom.png";
+  const LOCAL_PROVIDER_ICON = "/static/images/icon-Brain.png";
+
+  class ModelSheetItem {
+    id: number;
+    name: string;
+    scope: string;
+    providerIcon: string;
+    tag: string;
+    tagColor: string;
+    cost: string;
+    spaceName: string;
+    constructor(
+      id: number,
+      name: string,
+      scope: string,
+      providerIcon: string,
+      tag: string,
+      tagColor: string,
+      cost: string,
+      spaceName: string,
+    ) {
+      this.id = id;
+      this.name = name;
+      this.scope = scope;
+      this.providerIcon = providerIcon;
+      this.tag = tag;
+      this.tagColor = tagColor;
+      this.cost = cost;
+      this.spaceName = spaceName;
+    }
+  }
+
+  class ModelScopeTab {
+    label: string;
+    value: string;
+    constructor(label: string, value: string) {
+      this.label = label;
+      this.value = value;
+    }
+  }
+
+  const props = withDefaults(defineProps<{
+    visible: boolean;
+    agentId: number;
+    agentType?: string;
+    currentModelId?: number;
+    avoidTabBar?: boolean;
+  }>(), {
+    visible: false,
+    agentId: 0,
+    agentType: "ChatBot",
+    currentModelId: 0,
+    avoidTabBar: false,
+  });
+
+  const emit = defineEmits<{
+    (e: "close"): void;
+    (e: "select", modelId: number, name: string, providerIcon: string): void;
+    (e: "sync", modelId: number, name: string, providerIcon: string): void;
+  }>();
+
+  const popupRef = ref<any | null>(null);
+  const loading = ref<boolean>(false);
+  const systemModels = ref<ModelSheetItem[]>([]);
+  const personalModels = ref<ModelSheetItem[]>([]);
+  const teamModels = ref<ModelSheetItem[]>([]);
+  const activeScope = ref<string>("system");
+  let loadSequence = 0;
+  let loadedAgentId = 0;
+  const tabs = computed((): ModelScopeTab[] => [
+    new ModelScopeTab(t("Mobile.CreateHub.modelScopeSystem"), "system"),
+    new ModelScopeTab(t("Mobile.CreateHub.modelScopePersonal"), "personal"),
+    new ModelScopeTab(t("Mobile.CreateHub.modelScopeTeam"), "team"),
+  ]);
+
+  const visibleModels = computed((): ModelSheetItem[] => {
+    if (activeScope.value == "personal") return personalModels.value;
+    if (activeScope.value == "team") return teamModels.value;
+    return systemModels.value;
+  });
+
+  const allModels = computed((): ModelSheetItem[] => {
+    return ([] as ModelSheetItem[]).concat(systemModels.value, personalModels.value, teamModels.value);
+  });
+
+  function callPopup(method: string): void {
+    if (popupRef.value == null) return;
+    (popupRef.value as ComponentPublicInstance).$callMethod(method);
+  }
+
+  function readUsageScenarios(raw: any): string[] {
+    const value = readRawField(raw, "usageScenarios");
+    if (value == null) return [];
+    const source = value as any[];
+    const result: string[] = [];
+    for (let i = 0; i < source.length; i++) result.push(readAgentEnumString(source[i]));
+    return result;
+  }
+
+  function parseModel(raw: any, scope: string): ModelSheetItem | null {
+    const idRaw = readRawField(raw, "id");
+    const nameRaw = readRawField(raw, "name");
+    const id = idRaw != null ? parseInt(`${idRaw}`) : 0;
+    const name = nameRaw != null ? `${nameRaw}` : "";
+    if (id <= 0 || name.length == 0) return null;
+    if (conversationModelMatchesAgentType(readUsageScenarios(raw), props.agentType) != true) return null;
+    const providerIconRaw = readRawField(raw, "providerIcon");
+    const tagRaw = readRawField(raw, "tag");
+    const tagColorRaw = readRawField(raw, "tagColor");
+    const costRaw = readRawField(raw, "cost");
+    const spaceNameRaw = readRawField(raw, "spaceName");
+    return new ModelSheetItem(
+      id,
+      name,
+      scope,
+      providerIconRaw != null && `${providerIconRaw}`.length > 0 ? `${providerIconRaw}` : DEFAULT_PROVIDER_ICON,
+      tagRaw != null ? `${tagRaw}` : "",
+      tagColorRaw != null ? `${tagColorRaw}` : "",
+      costRaw != null ? `${costRaw}` : "",
+      spaceNameRaw != null ? `${spaceNameRaw}` : "",
+    );
+  }
+
+  function modelTagStyle(item: ModelSheetItem): UTSJSONObject {
+    const style = new UTSJSONObject();
+    if (item.tagColor.length > 0) {
+      style["backgroundColor"] = item.tagColor;
+      style["borderColor"] = item.tagColor;
+      style["color"] = "#ffffff";
+    }
+    return style;
+  }
+
+  function handleProviderIconError(item: ModelSheetItem): void {
+    if (item.providerIcon != LOCAL_PROVIDER_ICON) item.providerIcon = LOCAL_PROVIDER_ICON;
+  }
+
+  function updateActiveScope(modelId: number): void {
+    if (personalModels.value.some((item: ModelSheetItem): boolean => item.id == modelId)) activeScope.value = "personal";
+    else if (teamModels.value.some((item: ModelSheetItem): boolean => item.id == modelId)) activeScope.value = "team";
+    else activeScope.value = "system";
+  }
+
+  async function loadModels(): Promise<void> {
+    if (props.agentId <= 0) return;
+    loadSequence = loadSequence + 1;
+    const requestSequence = loadSequence;
+    const agentId = props.agentId;
+    loading.value = true;
+    try {
+      let preferredModelId = 0;
+      const optionsRes = await apiGetAgentModelOptions(agentId);
+      if (requestSequence != loadSequence) return;
+      if (apiResCode(optionsRes) != SUCCESS_CODE) {
+        systemModels.value = [];
+        personalModels.value = [];
+        teamModels.value = [];
+        return;
+      }
+
+      const optionsRaw = apiResData<any>(optionsRes);
+      const options = optionsRaw != null ? (optionsRaw as any[]) : ([] as any[]);
+      const systems: ModelSheetItem[] = [];
+      const personals: ModelSheetItem[] = [];
+      const teams: ModelSheetItem[] = [];
+      for (let i = 0; i < options.length; i++) {
+        const row = options[i];
+        const idRaw = readRawField(row, "id");
+        const id = idRaw != null ? parseInt(`${idRaw}`) : 0;
+        if (id > 0 && preferredModelId == 0) preferredModelId = id;
+
+        const scopeRaw = readRawField(row, "scope");
+        const spaceTypeRaw = readRawField(row, "spaceType");
+        const spaceIdRaw = readRawField(row, "spaceId");
+        const scope = scopeRaw != null ? `${scopeRaw}` : "";
+        const spaceType = spaceTypeRaw != null ? `${spaceTypeRaw}` : "";
+        const spaceId = spaceIdRaw != null ? parseInt(`${spaceIdRaw}`) : -1;
+        const modelScope = resolveConversationModelScope(scope, spaceType, spaceId);
+
+        const item = parseModel(row, modelScope);
+        if (item == null) continue;
+        if (modelScope == "personal") personals.push(item);
+        else if (modelScope == "team") teams.push(item);
+        else systems.push(item);
+      }
+      systemModels.value = systems;
+      personalModels.value = personals;
+      teamModels.value = teams;
+      loadedAgentId = agentId;
+
+      const ids: number[] = [];
+      const models = allModels.value;
+      for (let i = 0; i < models.length; i++) ids.push(models[i].id);
+      const selectedId = resolveConversationModelId(props.currentModelId, preferredModelId, ids);
+      const selected = models.find((item: ModelSheetItem): boolean => item.id == selectedId);
+      if (selected != null) {
+        updateActiveScope(selected.id);
+        emit("sync", selected.id, selected.name, selected.providerIcon);
+      }
+    } catch (error) {
+      if (requestSequence == loadSequence) console.error("[conversation-input] load models failed", error);
+    } finally {
+      if (requestSequence == loadSequence) loading.value = false;
+    }
+  }
+
+  function selectModel(item: ModelSheetItem): void {
+    emit("select", item.id, item.name, item.providerIcon);
+    callPopup("close");
+  }
+
+  function handleVisibleChange(value: boolean): void {
+    if (value != true) emit("close");
+  }
+
+  watch((): boolean => props.visible, (value: boolean): void => {
+    if (value) {
+      callPopup("open");
+      updateActiveScope(props.currentModelId);
+      if (loadedAgentId != props.agentId && loading.value != true) loadModels();
+    } else {
+      callPopup("close");
+    }
+  });
+
+  watch((): number => props.agentId, (): void => {
+    loadSequence = loadSequence + 1;
+    loadedAgentId = 0;
+    systemModels.value = [];
+    personalModels.value = [];
+    teamModels.value = [];
+    loadModels();
+  }, { immediate: true });
+</script>
+
+<style lang="scss" scoped>
+  .sheet { display: flex; flex-direction: column; height: 100%; padding: 18rpx 32rpx 0; background: #fff; box-sizing: border-box; }
+  /* 首页 TabBar 是覆盖层，弹窗内容需主动避让。 */
+  /* #ifdef APP */
+  .sheet--avoid-tab-bar { padding-bottom: 100rpx; }
+  /* #endif */
+  /* #ifdef H5 */
+  .sheet--avoid-tab-bar { padding-bottom: calc(100rpx + env(safe-area-inset-bottom)); }
+  /* #endif */
+  .sheet-handle { width: 72rpx; height: 8rpx; margin: 0 auto 36rpx; border-radius: 999rpx; background: #dedee8; }
+  .sheet-title { font-size: 34rpx; line-height: 48rpx; font-weight: 700; color: #17171c; }
+  .sheet-tabs { display: flex; flex-direction: row; margin-top: 24rpx; padding: 6rpx; border-radius: 24rpx; background: #f1f0f5; }
+  .sheet-tab { flex: 1; height: 68rpx; display: flex; align-items: center; justify-content: center; border-radius: 20rpx; }
+  .sheet-tab--active { background: #fff; box-shadow: 0 4rpx 14rpx rgba(0,0,0,.07); }
+  .sheet-tab-text { color: #858590; font-size: 28rpx; }
+  .sheet-tab-text--active { color: #17171c; font-weight: 600; }
+  .model-list { flex: 1; min-height: 0; margin-top: 12rpx; }
+  .model-row { display: flex; flex-direction: row; align-items: center; min-height: 92rpx; padding: 10rpx 16rpx; border-radius: 22rpx; box-sizing: border-box; }
+  .model-row--active { background: #f3f1ff; }
+  .model-provider-icon { width: 34rpx; height: 34rpx; margin-right: 14rpx; border-radius: 6rpx; flex-shrink: 0; }
+  .model-main { flex: 1; min-width: 0; }
+  .model-name-line { display: flex; flex-direction: row; align-items: center; min-width: 0; }
+  .model-name { color: #4f4f58; font-size: 27rpx; line-height: 46rpx; font-weight: 500; lines: 1; overflow: hidden; }
+  .model-name--active { color: #5147ff; }
+  .model-tag { max-width: 180rpx; margin-left: 10rpx; padding: 2rpx 8rpx; border-width: 1rpx; border-style: solid; border-color: #e4e4ea; border-radius: 7rpx; background: #f6f6f8; color: #72727c; font-size: 20rpx; line-height: 28rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+  .model-space-tag { max-width: 180rpx; margin-left: auto; padding: 2rpx 8rpx; border-radius: 7rpx; background: #f2f2f5; color: #858590; font-size: 20rpx; line-height: 28rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+  .model-cost { margin-left: 14rpx; color: #aaaab4; font-size: 24rpx; flex-shrink: 0; }
+  .model-check-slot { width: 42rpx; margin-left: 8rpx; display: flex; align-items: center; justify-content: flex-end; flex-shrink: 0; }
+  .sheet-state { height: 220rpx; display: flex; align-items: center; justify-content: center; }
+  .sheet-state-text { color: #9999a4; font-size: 26rpx; }
+</style>

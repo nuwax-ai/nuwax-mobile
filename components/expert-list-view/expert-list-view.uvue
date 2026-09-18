@@ -1,0 +1,430 @@
+<template>
+  <view class="expert-list-view">
+    <scroll-view
+      id="expert-list-scroll"
+      class="expert-list"
+      scroll-y="true"
+      :show-scrollbar="false"
+      :lower-threshold="80"
+      @scrolltolower="loadMore"
+    >
+      <view v-if="loading && items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.loading") }}</text>
+      </view>
+      <view v-else-if="items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.noData") }}</text>
+      </view>
+      <view v-else id="expert-list-content" class="expert-items">
+        <view
+          v-for="item in items"
+          :key="item.key"
+          class="expert-row"
+          :class="variant == 'simple' ? 'expert-row--simple' : ''"
+          @click="handleItemSelect(item)"
+        >
+          <view class="expert-avatar" :class="variant == 'simple' ? 'expert-avatar--simple' : ''">
+            <agent-icon
+              :icon="item.icon"
+              :alt="item.name"
+              :size="variant == 'simple' ? 52 : 72"
+              :margin-right="0"
+            />
+          </view>
+          <view class="expert-main">
+            <view class="expert-heading">
+              <view class="expert-title-line">
+                <text v-if="item.paymentRequired" class="expert-tag" :class="item.subscribed ? 'expert-tag--active' : ''">{{ item.subscribed ? t("Mobile.AgentList.subscribedTag") : t("Mobile.MySubscriptions.subscribeNow") }}</text>
+                <text class="expert-name">{{ item.name }}</text>
+              </view>
+              <text v-if="variant == 'default' && item.userCount > 0" class="expert-count">{{ item.userCount }} {{ t("Mobile.ExpertList.users") }}</text>
+            </view>
+            <text v-if="variant == 'default' && item.description.length > 0" class="expert-description">{{ item.description }}</text>
+          </view>
+          <view v-if="variant == 'default'" class="summon-button" @click.stop="handleItemSelect(item)">
+            <text class="summon-text">{{ t("Mobile.ExpertList.summon") }}</text>
+          </view>
+        </view>
+        <view v-if="loading" class="loading-more">
+          <text class="state-text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+      </view>
+    </scroll-view>
+
+    <agent-subscription-modal
+      v-if="pendingItem != null"
+      ref="subscriptionModalRef"
+      :agent-id="pendingAgentId"
+      :is-need-subscription="true"
+      @purchase-success="handlePurchaseSuccess"
+      @update-visible="handleSubscriptionVisible"
+    />
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { getCurrentInstance, nextTick, onMounted, ref, watch, type ComponentPublicInstance } from "vue";
+  import AgentIcon from "@/components/agent-icon/agent-icon.uvue";
+  import AgentSubscriptionModal from "@/subpackages/pages/chat-conversation-component/components/agent-subscription-modal/agent-subscription-modal.uvue";
+  import { apiUserUsedAgentList, apiPublishedAgentInfo } from "@/servers/agentDev";
+  import { apiPublishedAgentList } from "@/servers/square";
+  import { apiSpaceList } from "@/servers/workspace";
+  import { ListParams } from "@/types/interfaces/common";
+  import { SquarePublishedListParams } from "@/types/interfaces/square";
+  import { ExpertListItem, type ExpertListSourceType, type ExpertListVariant } from "@/types/interfaces/expertList";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  const props = withDefaults(defineProps<{
+    type: ExpertListSourceType;
+    variant?: ExpertListVariant;
+    category?: string;
+    spaceId?: number;
+    spaceIds?: number[];
+    pageSize?: number;
+  }>(), {
+    type: "system",
+    variant: "default",
+    category: "",
+    spaceId: 0,
+    spaceIds: () => [] as number[],
+    pageSize: 20,
+  });
+
+  const emit = defineEmits<{
+    (e: "select", item: UTSJSONObject): void;
+    (e: "loaded", type: string, count: number): void;
+  }>();
+
+  const items = ref<ExpertListItem[]>([] as ExpertListItem[]);
+  const loading = ref<boolean>(false);
+  const hasMore = ref<boolean>(true);
+  const currentPage = ref<number>(0);
+  const pendingItem = ref<ExpertListItem | null>(null);
+  const pendingAgentId = ref<number>(0);
+  const subscriptionModalRef = ref<any | null>(null);
+  const componentInstance = getCurrentInstance();
+  let requestId: number = 0;
+  let subscriptionEnabled: boolean = true;
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string): number {
+    const raw = obj[key];
+    if (raw == null) return 0;
+    const value = parseFloat(`${raw}`);
+    return isNaN(value) ? 0 : value;
+  }
+
+  function mapUsedItem(raw: UTSJSONObject): ExpertListItem {
+    const item = new ExpertListItem();
+    item.rawId = readNumber(raw, "id");
+    const agentId = readNumber(raw, "agentId");
+    item.targetId = agentId > 0 ? agentId : item.rawId;
+    item.key = `expert:used:${item.rawId}`;
+    item.name = readString(raw, "name");
+    item.description = readString(raw, "description");
+    item.icon = readString(raw, "icon");
+    item.usedTime = readString(raw, "modified");
+    item.paymentRequired = raw["paymentRequired"] == true;
+    item.subscribed = raw["subscribed"] == true;
+    return item;
+  }
+
+  function mapPublishedItem(raw: UTSJSONObject, source: string): ExpertListItem {
+    const item = new ExpertListItem();
+    item.rawId = readNumber(raw, "id");
+    item.targetId = readNumber(raw, "targetId");
+    item.key = `expert:${source}:${item.rawId}`;
+    item.name = readString(raw, "name");
+    item.description = readString(raw, "description");
+    item.icon = readString(raw, "icon");
+    item.paymentRequired = raw["paymentRequired"] == true;
+    item.subscribed = raw["subscribed"] == true;
+    const statisticsRaw = raw["statistics"];
+    if (statisticsRaw != null) {
+      item.userCount = readNumber(statisticsRaw as UTSJSONObject, "userCount");
+    }
+    return item;
+  }
+
+  async function fetchUsed(limit: number): Promise<ExpertListItem[]> {
+    const params = new ListParams();
+    params.size = limit;
+    params.pageIndex = 1;
+    params.type = "Agent";
+    const res = await apiUserUsedAgentList(params);
+    if (apiResCode(res) != SUCCESS_CODE) throw new Error("used expert list failed");
+    const raw = apiResData<any>(res);
+    const rows = raw != null ? (raw as any[]) : ([] as any[]);
+    const result = [] as ExpertListItem[];
+    for (let i = 0; i < rows.length; i++) result.push(mapUsedItem(rows[i] as UTSJSONObject));
+    return result;
+  }
+
+  async function resolveTeamSpaceIds(): Promise<number[]> {
+    if (props.spaceId > 0) return [] as number[];
+    if (props.spaceIds.length > 0) return props.spaceIds;
+    const res = await apiSpaceList();
+    if (apiResCode(res) != SUCCESS_CODE) return [] as number[];
+    const raw = apiResData<any>(res);
+    const rows = raw != null ? (raw as any[]) : ([] as any[]);
+    const ids = [] as number[];
+    for (let i = 0; i < rows.length; i++) {
+      const id = readNumber(rows[i] as UTSJSONObject, "id");
+      if (id > 0) ids.push(id);
+    }
+    return ids;
+  }
+
+  async function fetchPublished(source: string, page: number, pageSize: number, teamSpaceIds: number[]): Promise<UTSJSONObject> {
+    const params = new SquarePublishedListParams();
+    params.targetType = "Agent";
+    params.targetSubType = "ChatBot";
+    params.page = page;
+    params.pageSize = pageSize;
+    if (source == "system" || source == "convenient") {
+      params.category = props.category;
+      params.official = true;
+    } else if (source == "team") {
+      params.category = "Agent";
+      params.justReturnSpaceData = true;
+      if (props.spaceId > 0) params.spaceId = props.spaceId;
+      else if (teamSpaceIds.length > 0) params.spaceIds = teamSpaceIds;
+    }
+    const res = await apiPublishedAgentList(params);
+    if (apiResCode(res) != SUCCESS_CODE) throw new Error("published expert list failed");
+    const data = apiResData<any>(res);
+    return data != null ? (data as UTSJSONObject) : new UTSJSONObject();
+  }
+
+  function pageItems(data: UTSJSONObject, source: string): ExpertListItem[] {
+    const recordsRaw = data["records"];
+    const rows = recordsRaw != null ? (recordsRaw as any[]) : ([] as any[]);
+    const result = [] as ExpertListItem[];
+    for (let i = 0; i < rows.length; i++) result.push(mapPublishedItem(rows[i] as UTSJSONObject, source));
+    return result;
+  }
+
+  function pageHasMore(data: UTSJSONObject, page: number): boolean {
+    const current = readNumber(data, "current");
+    const pages = readNumber(data, "pages");
+    const currentPage = current > 0 ? current : page;
+    const totalPages = pages > 0 ? pages : 1;
+    return currentPage < totalPages;
+  }
+
+  async function load(reset: boolean): Promise<void> {
+    if (loading.value == true && reset != true) return;
+    const id = requestId + 1;
+    requestId = id;
+    const page = reset ? 1 : currentPage.value + 1;
+    loading.value = true;
+    if (reset) {
+      items.value = [] as ExpertListItem[];
+      hasMore.value = true;
+    }
+    try {
+      let next = [] as ExpertListItem[];
+      let more = false;
+      if (props.type == "used") {
+        next = await fetchUsed(props.pageSize);
+      } else if (props.type == "convenient") {
+        const used = await fetchUsed(100);
+        const published = await fetchPublished("convenient", 1, 100, [] as number[]);
+        const square = pageItems(published, "convenient");
+        const seen = new Map<number, boolean>();
+        for (let i = 0; i < used.length; i++) {
+          next.push(used[i]);
+          if (used[i].targetId > 0) seen.set(used[i].targetId, true);
+        }
+        for (let j = 0; j < square.length; j++) {
+          if (square[j].targetId <= 0 || seen.get(square[j].targetId) != true) next.push(square[j]);
+        }
+      } else {
+        const source = `${props.type}`;
+        const spaces = source == "team" ? await resolveTeamSpaceIds() : ([] as number[]);
+        const data = await fetchPublished(source, page, props.pageSize, spaces);
+        next = pageItems(data, source);
+        more = pageHasMore(data, page);
+      }
+      if (id != requestId) return;
+      if (reset) items.value = next;
+      else items.value = [...items.value, ...next];
+      currentPage.value = page;
+      hasMore.value = more;
+      if (reset) emit("loaded", props.type, next.length);
+    } catch (_error) {
+      if (id == requestId) {
+        if (reset) items.value = [] as ExpertListItem[];
+        hasMore.value = false;
+        if (reset) emit("loaded", props.type, 0);
+      }
+    } finally {
+      if (id == requestId) {
+        loading.value = false;
+      }
+    }
+  }
+
+  function loadMore(): void {
+    if (hasMore.value == true && loading.value != true) load(false);
+  }
+
+  function fillViewportIfNeeded(): void {
+    if (loading.value == true || hasMore.value != true || items.value.length == 0) return;
+    if (componentInstance == null) return;
+    const proxy = componentInstance.proxy;
+    if (proxy == null) return;
+    nextTick(() => {
+      if (loading.value == true || hasMore.value != true) return;
+      uni.createSelectorQuery()
+        .in(proxy)
+        .select("#expert-list-scroll")
+        .boundingClientRect()
+        .select("#expert-list-content")
+        .boundingClientRect()
+        .exec((results: Array<any>) => {
+          if (loading.value == true || hasMore.value != true || results.length < 2) return;
+          const scrollRaw = results[0];
+          const contentRaw = results[1];
+          if (scrollRaw == null || contentRaw == null) return;
+          const scrollRect = scrollRaw as NodeInfo;
+          const contentRect = contentRaw as NodeInfo;
+          const viewportHeight = scrollRect.height != null ? parseFloat(`${scrollRect.height}`) : 0;
+          const contentHeight = contentRect.height != null ? parseFloat(`${contentRect.height}`) : 0;
+          if (viewportHeight > 0 && contentHeight <= viewportHeight + 1) loadMore();
+        });
+    });
+  }
+
+  watch(
+    (): string => `${items.value.length}|${loading.value}|${hasMore.value}`,
+    (): void => { fillViewportIfNeeded(); },
+  );
+
+  function toPayload(item: ExpertListItem): UTSJSONObject {
+    const payload = new UTSJSONObject();
+    payload["key"] = item.key;
+    payload["rawId"] = item.rawId;
+    payload["targetId"] = item.targetId;
+    payload["name"] = item.name;
+    payload["description"] = item.description;
+    payload["icon"] = item.icon;
+    payload["paymentRequired"] = item.paymentRequired;
+    payload["subscribed"] = item.subscribed;
+    payload["userCount"] = item.userCount;
+    payload["source"] = props.type;
+    return payload;
+  }
+
+  function emitSelection(item: ExpertListItem): void {
+    emit("select", toPayload(item));
+  }
+
+  function updateSubscribed(key: string): void {
+    const next = [] as ExpertListItem[];
+    for (let i = 0; i < items.value.length; i++) {
+      const item = items.value[i];
+      if (item.key == key) item.subscribed = true;
+      next.push(item);
+    }
+    items.value = next;
+  }
+
+  function callSubscriptionModal(method: string): void {
+    if (subscriptionModalRef.value == null) return;
+    (subscriptionModalRef.value as ComponentPublicInstance).$callMethod(method);
+  }
+
+  async function handleItemSelect(item: ExpertListItem): Promise<void> {
+    if (subscriptionEnabled != true || item.paymentRequired != true || item.subscribed == true || item.targetId <= 0) {
+      emitSelection(item);
+      return;
+    }
+    try {
+      const res = await apiPublishedAgentInfo(item.targetId, false);
+      const detailRaw = apiResCode(res) == SUCCESS_CODE ? apiResData<any>(res) : null;
+      if (detailRaw != null) {
+        const detail = detailRaw as UTSJSONObject;
+        const stillPending = detail["paymentRequired"] == true && detail["subscribed"] != true;
+        if (stillPending != true) {
+          item.subscribed = detail["subscribed"] == true;
+          if (item.subscribed) updateSubscribed(item.key);
+          emitSelection(item);
+          return;
+        }
+      }
+    } catch (_error) {
+      // 详情复核失败仍进入订阅流程，禁止绕过付费门。
+    }
+    pendingItem.value = item;
+    pendingAgentId.value = item.targetId;
+    await nextTick();
+    callSubscriptionModal("open");
+  }
+
+  function handlePurchaseSuccess(): void {
+    const item = pendingItem.value;
+    if (item == null) return;
+    item.subscribed = true;
+    updateSubscribed(item.key);
+    emitSelection(item);
+    callSubscriptionModal("close");
+    pendingItem.value = null;
+  }
+
+  function handleSubscriptionVisible(visible: boolean): void {
+    if (visible != true) pendingItem.value = null;
+  }
+
+  function loadTenantSubscriptionFlag(): void {
+    const raw = uni.getStorageSync(TENANT_CONFIG_INFO);
+    if (raw == null || `${raw}`.length == 0) return;
+    try {
+      const config = JSON.parse<UTSJSONObject>(`${raw}`);
+      if (config != null) subscriptionEnabled = config["enableSubscription"] != 0;
+    } catch (_error) {
+      subscriptionEnabled = true;
+    }
+  }
+
+  watch(
+    (): string => `${props.type}|${props.category}|${props.spaceId}|${JSON.stringify(props.spaceIds)}|${props.pageSize}`,
+    (): void => { load(true); },
+  );
+
+  onMounted(() => {
+    loadTenantSubscriptionFlag();
+    load(true);
+  });
+</script>
+
+<style scoped lang="scss">
+  .expert-list-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .expert-list { flex: 1; height: 100%; min-height: 0; }
+  .expert-items { display: flex; flex-direction: column; padding: 0 28rpx 24rpx; }
+  .expert-row { display: flex; flex-direction: row; align-items: flex-start; min-height: 142rpx; padding: 22rpx 0; border-bottom: 2rpx solid #eeeef3; box-sizing: border-box; }
+  .expert-row--simple { align-items: center; min-height: 72rpx; padding: 10rpx 8rpx; border-bottom-width: 0; border-radius: 12rpx; }
+  .expert-avatar { flex-shrink: 0; width: 72rpx; height: 72rpx; margin-right: 20rpx; border-radius: 999rpx; overflow: hidden; }
+  .expert-avatar--simple { width: 52rpx; height: 52rpx; margin-right: 16rpx; }
+  .expert-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .expert-heading { display: flex; flex-direction: column; min-width: 0; }
+  .expert-title-line { display: flex; flex-direction: row; align-items: center; min-width: 0; }
+  .expert-name { flex: 1; min-width: 0; color: #202028; font-size: 29rpx; font-weight: 600; line-height: 40rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .expert-count { color: #9797a1; font-size: 23rpx; line-height: 32rpx; }
+  .expert-description { margin-top: 12rpx; color: #6f6f7b; font-size: 25rpx; line-height: 34rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .expert-tag { flex-shrink: 0; margin-right: 10rpx; padding: 3rpx 10rpx; border-radius: 8rpx; background-color: #fff3df; color: #d57a00; font-size: 20rpx; line-height: 26rpx; }
+  .expert-tag--active { background-color: #e9f8ef; color: #26985a; }
+  .summon-button { flex-shrink: 0; display: flex; align-items: center; justify-content: center; min-width: 96rpx; height: 58rpx; margin-left: 18rpx; padding: 0 18rpx; border-radius: 18rpx; background-color: #f3f1fa; box-sizing: border-box; }
+  .summon-text { color: #5a46ff; font-size: 26rpx; font-weight: 600; }
+  .state-box { display: flex; align-items: center; justify-content: center; min-height: 360rpx; }
+  .state-text { color: #9999a3; font-size: 25rpx; }
+  .loading-more { display: flex; align-items: center; justify-content: center; padding: 20rpx 0; }
+</style>

@@ -231,6 +231,57 @@
           </view>
         </view>
 
+        <!-- 我的群组：折叠分类（含已从会话列表删除但仍在群内的群），点行进群聊 -->
+        <view v-if="groupsLoaded && groupTotal > 0" class="contact-group">
+          <view class="group-header" hover-class="group-header--active" @click="toggleGroups">
+            <image class="group-header__icon" :src="iconGroupSet" mode="aspectFit" />
+            <text class="group-header__title">{{ t("Mobile.Message.myGroups") }}</text>
+            <text class="group-header__count">{{ groupTotal }}</text>
+            <view class="group-header__spacer" />
+            <svg-icon
+              :name="groupsExpanded ? 'icon-a-Chevrondown' : 'icon-a-Chevronright'"
+              size="28"
+              color="#c0bec8"
+            />
+          </view>
+          <view v-if="groupsExpanded">
+            <view v-for="(group, index) in myGroups" :key="`grp-${group.convId}`">
+              <view class="chat-item" hover-class="chat-item--active" @click="openConversation(group)">
+                <view class="chat-item__avatar-wrap">
+                  <image
+                    v-if="group.avatarUrl.length > 0 && group.avatarFailed != true"
+                    class="chat-item__avatar"
+                    :src="group.avatarUrl"
+                    mode="aspectFill"
+                    @error="handleConvAvatarError(group)"
+                  />
+                  <view
+                    v-else
+                    class="chat-item__avatar"
+                    :style="{ backgroundImage: avatarGradient(group.displayName) }"
+                  >
+                    <text class="chat-item__avatar-letter">{{ avatarLetter(group.displayName) }}</text>
+                  </view>
+                </view>
+                <view class="chat-item__body">
+                  <view class="chat-item__title-row">
+                    <text class="chat-item__title text-ellipsis">{{ displayConvName(group) }}</text>
+                    <view v-if="group.myRole == 3" class="contact-tag contact-tag--owner">
+                      <text class="contact-tag__text contact-tag__text--owner">{{ t("Mobile.Message.groupOwner") }}</text>
+                    </view>
+                    <text class="chat-item__time">{{ formatConvTime(group.lastMsgAt) }}</text>
+                  </view>
+                  <text class="group-row__count">{{ groupMemberLabel(group) }}</text>
+                </view>
+              </view>
+              <view
+                v-if="index < myGroups.length - 1"
+                class="chat-divider"
+              />
+            </view>
+          </view>
+        </view>
+
         <!-- 降级 / 截断提示（语义不同：缺人 vs 截断，都要读） -->
         <view v-if="contactDegraded || contactTruncated" class="im-foot">
           <text class="im-foot__text">{{
@@ -255,11 +306,13 @@
     apiImContacts,
     apiImConversations,
     apiImCreateP2pConversation,
+    apiImMyGroups,
   } from "@/servers/im";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { refreshImUnreadBadge } from "@/utils/imUnreadBadge";
-  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import iconGroupSet from "@/static/icons/group_set.svg";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -285,6 +338,9 @@
     unreadCount: number = 0;
     lastMsgAt: number = 0;
     lastMsgDigest: string = "";
+    memberCount: number = 0;
+    // 我在本群的角色：1=成员 2=管理员 3=群主（ImMemberRole，智联录群组行展示群主徽章）
+    myRole: number = 1;
     avatarFailed: boolean = false;
   }
 
@@ -325,6 +381,13 @@
       pendingInContacts.value.length +
       pendingOutContacts.value.length,
   );
+
+  // ===== 我的群组状态（智联录内折叠分类，与通讯录同生命周期）=====
+  const myGroups = ref<ImConvRow[]>([]);
+  const groupTotal = ref<number>(0);
+  const groupsExpanded = ref<boolean>(false);
+  const groupsLoading = ref<boolean>(false);
+  const groupsLoaded = ref<boolean>(false);
 
   function hasAccessToken(): boolean {
     const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
@@ -369,6 +432,10 @@
     // unreadCount：服务端没算时键整个不存在（非 0），整表刷新下只能按 0 展示。
     row.unreadCount = readNumber(obj, "unreadCount", 0);
     row.lastMsgAt = readNumber(obj, "lastMsgAt", 0);
+    // memberCount：群聊行在智联录「我的群组」里展示
+    row.memberCount = readNumber(obj, "memberCount", 0);
+    // myRole：1=成员 2=管理员 3=群主；仅群聊行有意义（群主徽章）
+    row.myRole = readNumber(obj, "myRole", 1);
     row.lastMsgDigest = readString(obj, "lastMsgDigest");
     return row;
   }
@@ -402,6 +469,30 @@
     }
     const cursorRaw = dataObj["nextCursor"];
     nextCursor.value = cursorRaw != null ? `${cursorRaw}` : "";
+    return rows;
+  }
+
+  /**
+   * 群组分页解析：★cursor 语义与 /conversations 不同（可见集不同，不能混用），
+   * 故不复用 parseConvRecords。服务端 total 实测返回 -1（未统计），分组头计数回落到本页条数。
+   */
+  function parseGroupRecords(res: RequestResponse<any>): ImConvRow[] {
+    const rows: ImConvRow[] = [];
+    const dataRaw = apiResData<any>(res);
+    const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+    if (dataObj == null) {
+      return rows;
+    }
+    const recordsRaw = dataObj["records"];
+    if (recordsRaw != null) {
+      const records = recordsRaw as UTSJSONObject[];
+      for (let i = 0; i < records.length; i++) {
+        rows.push(readConvRow(records[i]));
+      }
+    }
+    const totalRaw = readNumber(dataObj, "total", 0);
+    // 实测 dev 环境返回 total:-1（未统计），此时以本页条数计数（单页 limit=100 足够覆盖）。
+    groupTotal.value = totalRaw > 0 ? totalRaw : rows.length;
     return rows;
   }
 
@@ -505,14 +596,45 @@
     }
   }
 
+  /** 群组页大小：服务端 clamp 到 [1,100]，智联录分类单页拉满，免分页 UI（群组数超 100 再补分页）。 */
+  const GROUP_PAGE_SIZE = 100;
+
+  async function loadGroups(): Promise<void> {
+    if (groupsLoading.value) {
+      return;
+    }
+    if (!hasAccessToken()) {
+      groupsLoaded.value = true;
+      return;
+    }
+    groupsLoading.value = true;
+    try {
+      const res = await apiImMyGroups("", GROUP_PAGE_SIZE);
+      groupsLoading.value = false;
+      if (apiResCode(res) != SUCCESS_CODE) {
+        // 失败静默：分类不展示，下次切入智联录自动重试
+        return;
+      }
+      myGroups.value = parseGroupRecords(res);
+      groupsLoaded.value = true;
+    } catch (_error) {
+      groupsLoading.value = false;
+    }
+  }
+
   function switchTab(tab: string): void {
     if (activeTab.value == tab) {
       return;
     }
     activeTab.value = tab;
-    // 智联录懒加载：首次切入时拉取
-    if (tab == "contact" && contactLoaded.value != true) {
-      loadContacts();
+    // 智联录懒加载：首次切入时拉取（联系人 + 我的群组计数）
+    if (tab == "contact") {
+      if (contactLoaded.value != true) {
+        loadContacts();
+      }
+      if (groupsLoaded.value != true) {
+        loadGroups();
+      }
     }
   }
 
@@ -522,7 +644,29 @@
   }
 
   function displayConvName(conv: ImConvRow): string {
-    return conv.displayName.length > 0 ? conv.displayName : t("Mobile.Common.conversations");
+    if (conv.displayName.length > 0) {
+      return conv.displayName;
+    }
+    // 缺名兜底区分会话类型：群聊给群组语义，单聊沿用通用文案
+    return conv.convType == 2
+      ? t("Mobile.Message.unnamedGroup")
+      : t("Mobile.Common.conversations");
+  }
+
+  /** 展开/折叠我的群组（默认折叠，对齐 PC 端智联录交互）。 */
+  function toggleGroups(): void {
+    groupsExpanded.value = !groupsExpanded.value;
+  }
+
+  /** 群组成员数标签："{count} 人"。 */
+  function groupMemberLabel(conv: ImConvRow): string {
+    const params = new Map<string, string | number>();
+    params.set("count", conv.memberCount);
+    return translateFn(
+      "Mobile.Message.groupMemberCount",
+      toI18nParams(params),
+      `${conv.memberCount}`,
+    );
   }
 
   function avatarLetter(name: string): string {
@@ -720,6 +864,9 @@
     }
     if (contactLoaded.value) {
       loadContacts();
+    }
+    if (groupsLoaded.value) {
+      loadGroups();
     }
   });
 </script>
@@ -946,6 +1093,50 @@
     color: #94929c;
   }
 
+  /* ===== 我的群组折叠分类 ===== */
+  .group-header {
+    padding: 24rpx 32rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .group-header--active {
+    background-color: #f4f3f8;
+  }
+
+  .group-header__icon {
+    width: 36rpx;
+    height: 36rpx;
+    margin-right: 12rpx;
+    flex-shrink: 0;
+  }
+
+  .group-header__title {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    font-weight: 600;
+    color: #1c1b20;
+  }
+
+  .group-header__count {
+    margin-left: 12rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #94929c;
+  }
+
+  .group-header__spacer {
+    flex: 1;
+  }
+
+  .group-row__count {
+    margin-top: 12rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #94929c;
+  }
+
   .contact-tag {
     margin-left: 16rpx;
     padding: 4rpx 16rpx;
@@ -992,6 +1183,15 @@
 
   .contact-tag__text--muted {
     color: #94929c;
+  }
+
+  /* 群主徽章：蓝紫色调，对齐 PC 端智联录群组列表 */
+  .contact-tag--owner {
+    background-color: #eef0ff;
+  }
+
+  .contact-tag__text--owner {
+    color: #5a67d9;
   }
 </style>
 

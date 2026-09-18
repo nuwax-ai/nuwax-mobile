@@ -1,5 +1,46 @@
 import request from "./useRequest";
+import { generateUUID } from "@/utils/common";
 import type { RequestResponse } from "@/types/interfaces/request";
+
+const IM_DEVICE_BASE_ID_STORAGE_KEY = "NUWAX_IM_DEVICE_BASE_ID";
+
+let cachedImDeviceId = "";
+
+/**
+ * IM 协议 deviceId（nuwax-im ImProtocol.isValidDeviceId）：
+ * 格式 {baseId}#{tabId}，字符仅 a-zA-Z0-9 与 - _ .，至多一个 #，总长 ≤128。
+ * ★REST 发送必填：扇出按它【排除来源端】（nuwax-im 02 §6.5），缺失会报 IM_90001。
+ * baseId 首次生成后落 storage 持久化；tabId 每次页面会话随机——H5 多标签各拿各的
+ * tabId，自己其他标签页仍能收到自己发的消息，仅来源标签页被排除。
+ */
+export function getImDeviceId(): string {
+  if (cachedImDeviceId.length > 0) {
+    return cachedImDeviceId;
+  }
+  let baseId = "";
+  try {
+    const raw = uni.getStorageSync(IM_DEVICE_BASE_ID_STORAGE_KEY);
+    if (raw != null) {
+      baseId = `${raw}`;
+    }
+  } catch (_error) {
+    baseId = "";
+  }
+  if (baseId.length == 0) {
+    baseId = generateUUID();
+    try {
+      uni.setStorageSync(IM_DEVICE_BASE_ID_STORAGE_KEY, baseId);
+    } catch (_error) {
+      // 存储异常不阻断发送：本次会话退化为内存态 baseId
+    }
+  }
+  let tabId = "";
+  for (let i = 0; i < 12; i++) {
+    tabId += Math.floor(Math.random() * 16).toString(16);
+  }
+  cachedImDeviceId = `${baseId}#${tabId}`;
+  return cachedImDeviceId;
+}
 
 /**
  * IM 未读总数（App 角标）。
@@ -53,5 +94,77 @@ export async function apiImContacts(): Promise<RequestResponse<any>> {
   return await request({
     url: "/api/instant-message/contacts",
     method: "GET",
+  });
+}
+
+/**
+ * 历史消息（向前翻页，消息详情页用）。
+ *
+ * 契约见 im-openapi.yaml（msgHistory）：
+ * - ★beforeSeq 是【方向键】不是游标：beforeSeq<=0 不传 ⇒ 从最新往回取；
+ *   传了 ⇒ 取 seq < beforeSeq 的那一页（翻更早把上一页最小 seq 传回来）
+ * - 服务端按 seq 降序返回；hasMore 缺键/为空 = 没有更早消息（勿用 records.length 判断）
+ * - 被撤回的消息【仍在列表里】（msgStatus=2、body=null），靠渲染区分，勿过滤
+ * - convId 雪花号存字符串，拼 URL 原样直传防精度丢失
+ */
+export async function apiImMessages(
+  convId: string,
+  beforeSeq: number,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  data["limit"] = limit;
+  if (beforeSeq > 0) {
+    data["beforeSeq"] = beforeSeq;
+  }
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/messages`,
+    method: "GET",
+    data,
+  });
+}
+
+/**
+ * 发送文本消息（msgSend）。
+ *
+ * ★convId 是 int64 雪花号：拼进 JSON 字符串以原始数字直传（request 支持字符串 body
+ *   直通不反转义），避免经 JS number 精度丢失后发错会话。
+ * ★clientMsgId 幂等键【每条必带】：不传服务端会兜底生成，此时幂等保护失效——
+ *   弱网重试会真的发出两条。
+ * ★deviceId【必填】（getImDeviceId 自动携带）：扇出按它排除来源端，REST 入口
+ *   缺失直接被 IM_90001 拒绝。
+ * 响应 data = SendMessageResult{ msgId, seq, sendTime, msgStatus, idempotent, digest }：
+ * idempotent=true 表示重放，调用方应替换本地"发送中"占位而不是再插一条。
+ */
+export async function apiImSendTextMsg(
+  convId: string,
+  text: string,
+  clientMsgId: string,
+): Promise<RequestResponse<any>> {
+  // 文本经 JSON.stringify 转义；clientMsgId/deviceId 是自家生成的安全字符，无需转义
+  const payload =
+    `{"convId":${convId},"msgType":"text","clientMsgId":"${clientMsgId}","deviceId":"${getImDeviceId()}","body":{"text":${JSON.stringify(text)}}}`;
+  return await request({
+    url: "/api/instant-message/messages",
+    method: "POST",
+    data: payload,
+  });
+}
+
+/**
+ * 上报已读水位（readReport）。
+ *
+ * ★readSeq 是"我已连续读到的最大 seq"水位（不是单条 seq），单调不回退：
+ * 回退会被服务端 clamp（advanced=false / clamped=true 属正常，勿据此重试）。
+ * deviceId 可选但建议携带：CONV_UNREAD 下行按它排除来源端（02 §7）。
+ */
+export async function apiImReadReport(
+  convId: string,
+  readSeq: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/read`,
+    method: "POST",
+    data: `{"readSeq":${readSeq},"deviceId":"${getImDeviceId()}"}`,
   });
 }

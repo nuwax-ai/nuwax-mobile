@@ -1,0 +1,170 @@
+import { ref, type Ref } from "vue";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiImUnreadTotal } from "@/servers/im";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+
+/** 「消息」Tab 序号（pages.json tabBar.list：任务 0 / 消息 1 / 专家 2 / 应用 3 / 我的 4）。 */
+const MESSAGE_TAB_INDEX = 1;
+
+/** 常规轮询间隔（毫秒）。IM WebSocket 接入后可由 CONV_UNREAD 事件驱动替代轮询。 */
+const POLL_INTERVAL_MS = 60 * 1000;
+/** 服务端降级（authoritative=false）时的轮询间隔：文档要求此时降低轮询频率。 */
+const POLL_INTERVAL_DEGRADED_MS = 5 * 60 * 1000;
+
+/** IM 未读数响应式变量（该提醒的数字 = total - dndTotal），供 TabBar 徽标与消息页同步渲染。 */
+export const imUnreadCount: Ref<number> = ref<number>(0);
+
+/** 上次响应是否为服务端降级估算（决定下一次轮询间隔档位）。 */
+let lastResponseDegraded = false;
+
+/** 轮询代际号：stop 时自增使在途 tick 失效，避免 stop/start 竞态产生双定时链。 */
+let pollGeneration = 0;
+/** 轮询定时器（setTimeout 链，间隔随 authoritative 档位自适应）。 */
+let pollTimerId: number | null = null;
+
+/** TabBar 页面路由（与 pages.json tabBar.list 保持一致）。 */
+function isTabBarRoute(route: string): boolean {
+  return (
+    route == "pages/index/index" ||
+    route == "pages/message/message" ||
+    route == "pages/agent-list/agent-list" ||
+    route == "pages/app-tab/app-tab" ||
+    route == "pages/mine/mine"
+  );
+}
+
+/**
+ * TabBar API 要求当前栈顶为 Tab 页，且 TabBar 已挂载。
+ * errCode 100 = TabBar 不存在（非 Tab 页 / 启动过早都会触发）。
+ */
+function canUpdateTabBarBadge(): boolean {
+  const pages = getCurrentPages();
+  if (pages.length == 0) {
+    return false;
+  }
+  // UTS：Page 实例勿 as any，否则访问 .route 会报「找不到名称 route」
+  const currentPage = pages[pages.length - 1];
+  if (currentPage == null) {
+    return false;
+  }
+  return isTabBarRoute(`${currentPage.route}`);
+}
+
+function clearBadge(): void {
+  if (!canUpdateTabBarBadge()) {
+    return;
+  }
+  try {
+    uni.removeTabBarBadge({
+      index: MESSAGE_TAB_INDEX,
+      fail: (_err) => {
+        // TabBar 未就绪时忽略
+      },
+    });
+  } catch (_e) {
+    // uni-app x 部分端会以异常抛出 UniError
+  }
+}
+
+function setBadge(count: number): void {
+  if (!canUpdateTabBarBadge()) {
+    return;
+  }
+  try {
+    uni.setTabBarBadge({
+      index: MESSAGE_TAB_INDEX,
+      text: count > 99 ? "99+" : `${count}`,
+      fail: (_err) => {
+        // TabBar 未就绪时忽略，进入 Tab 页后再刷新
+      },
+    });
+  } catch (_e) {
+    // uni-app x 部分端会以异常抛出 UniError
+  }
+}
+
+/**
+ * 刷新「消息」Tab 的 IM 未读徽标。
+ * 角标值 = total - dndTotal（total 已含免打扰贡献的未读，文档规定要减去）。
+ */
+export async function refreshImUnreadBadge(): Promise<void> {
+  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+  const token = tokenRaw != null ? `${tokenRaw}` : "";
+  if (token.length == 0) {
+    imUnreadCount.value = 0;
+    lastResponseDegraded = false;
+    clearBadge();
+    return;
+  }
+
+  try {
+    const response = await apiImUnreadTotal();
+    if (apiResCode(response) != SUCCESS_CODE) {
+      return;
+    }
+    const dataRaw = apiResData<any>(response);
+    const data = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+    if (data == null) {
+      return;
+    }
+    const totalRaw = data["total"];
+    const total = totalRaw != null ? parseInt(`${totalRaw}`) : 0;
+    const dndRaw = data["dndTotal"];
+    const dndTotal = dndRaw != null ? parseInt(`${dndRaw}`) : 0;
+    const authoritativeRaw = data["authoritative"];
+    lastResponseDegraded = authoritativeRaw != null && `${authoritativeRaw}` == "false";
+
+    let count = 0;
+    if (!isNaN(total) && !isNaN(dndTotal)) {
+      count = total - dndTotal > 0 ? total - dndTotal : 0;
+    }
+    imUnreadCount.value = count;
+    if (count <= 0) {
+      clearBadge();
+      return;
+    }
+    setBadge(count);
+  } catch (_error) {
+    // 未读数刷新失败时保留上一次徽标，避免网络抖动导致视觉闪烁。
+  }
+}
+
+/** 启动前台轮询（App onShow 后调用；onHide 时调用 stopImUnreadPolling）。 */
+export function startImUnreadPolling(): void {
+  stopImUnreadPolling();
+  pollGeneration++;
+  scheduleNextPoll(pollGeneration);
+}
+
+/** 停止轮询并清理定时器；在途请求返回后不会再排下一次。 */
+export function stopImUnreadPolling(): void {
+  pollGeneration++;
+  const timerId = pollTimerId;
+  if (timerId != null) {
+    clearTimeout(timerId);
+    pollTimerId = null;
+  }
+}
+
+/** setTimeout 轮询链：间隔随降级档位自适应；代际号失效（已 stop）则不再续排。 */
+function scheduleNextPoll(generation: number): void {
+  const interval = lastResponseDegraded ? POLL_INTERVAL_DEGRADED_MS : POLL_INTERVAL_MS;
+  pollTimerId = setTimeout(() => {
+    pollTick(generation);
+  }, interval);
+}
+
+async function pollTick(generation: number): Promise<void> {
+  await refreshImUnreadBadge();
+  if (generation == pollGeneration) {
+    scheduleNextPoll(generation);
+  }
+}
+
+/** 退出登录等场景立即清零徽标。 */
+export function clearImUnreadBadge(): void {
+  imUnreadCount.value = 0;
+  lastResponseDegraded = false;
+  clearBadge();
+}

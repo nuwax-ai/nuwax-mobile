@@ -44,11 +44,23 @@ MessageInfo（一轮 = 一条 assistant 消息：think + text 嵌过程标签 + 
 | --- | --- | --- | --- |
 | 整轮轨迹 | 运行展开 / 终态与历史收起 | running→终态自动收起一次 | 手动展开后保持，不被流式增量重置 |
 | 工具组 | 活动组（运行轮尾组）展开，其余收起 | 失去活动（新内容/新组出现）自动收起一次 | 手动重开后不再被强制关闭 |
-| 单条工具 | 无展开态 | 详情走全屏弹窗（`page_preview_detail`） | file-edit 且 `kind=edit` 行点击跳文件预览 |
+| 单条工具 | 无展开态 | 行点击内联展开类型化详情（`tool-node-detail`） | 手动展开/收起保持 |
 
 实现要点：`groupExpandedMap` 以稳定组 id 为 key + `groupExpandedVersion` ref 驱动
 模板重算；`previousActiveGroups` / `autoCollapsedGroups` 两个 Set 实现「收起一次」
 语义；轨迹收起仅 `v-if` 卸载内容，宿主实例不卸载。
+
+## 懒挂载（性能语义，对齐 PC 契约 7.4）
+
+与 PC `presentation-v2` 一致（术语口径：V1=旧线 legacy 数据+旧渲染，
+V2=新线 runtime 数据+本渲染，移动端仅实现 V2）：
+
+- 三层折叠内容均为严格条件渲染（`v-if`）：收起即卸载对应子树、再展开重建，
+  不是 `display:none` 常驻 DOM
+- 收起态 DOM 逐层收敛：终态轮收起只剩轨迹头指标行，组收起只剩组头摘要行，
+  行收起只剩紧凑事件行
+- 卸载只影响渲染层：投影数据（`traceItems`）由 computed 常驻；
+  组/行手动展开态由 ai-msg 状态机托管，外层收起不清空
 
 ## 涉及文件
 
@@ -58,7 +70,7 @@ MessageInfo（一轮 = 一条 assistant 消息：think + text 嵌过程标签 + 
 | `subpackages/components/work-trace/work-trace-container.uvue` | 整轮轨迹壳（状态图标 + 指标头 + 折叠体） |
 | `subpackages/components/work-trace/tool-trace-group.uvue` | 工具组（组头摘要 + 行列表） |
 | `subpackages/components/work-trace/tool-trace-row.uvue` | 紧凑事件行（图标+动作+目标+状态；详情弹窗/文件预览） |
-| `subpackages/components/work-trace/plan-trace-card.uvue` | Plan 任务清单 |
+| `subpackages/components/work-trace/plan-trace-row.uvue` | Plan 独立行（todo 步骤详情） |
 | `subpackages/components/work-trace/traceIcons.uts` | 类型 → iconfont 映射 |
 | `subpackages/components/ai-msg/ai-msg.uvue` | 投影 computed + 折叠状态机 + H5 模板分支 |
 | `constants/i18n-locales/*.uts` | `Mobile.Chat.WorkTrace.*` 文案（四语言） |

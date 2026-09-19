@@ -1,0 +1,550 @@
+<template>
+  <view class="qd-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 标题（与聊天页同款双段头） -->
+    <view class="qd-header">
+      <view class="qd-header__btn" hover-class="qd-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="qd-header__title-wrap">
+        <text class="qd-header__title">{{ t("Mobile.Message.quoteTitle") }}</text>
+      </view>
+      <view class="qd-header__btn qd-header__btn--ghost" />
+    </view>
+
+    <!-- 引用的消息全文 -->
+    <scroll-view class="qd-body" direction="vertical" :show-scrollbar="false">
+      <view v-if="loading" class="qd-state">
+        <text class="qd-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+      </view>
+      <view v-else-if="loadFailed" class="qd-state" @click="handleRetry">
+        <text class="qd-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+      </view>
+      <view v-else class="qd-card">
+        <view class="qd-card__head">
+          <text class="qd-name">{{ senderName.length > 0 ? senderName : t("Mobile.Common.conversations") }}</text>
+          <text class="qd-time">{{ timeText }}</text>
+        </view>
+        <!-- 撤回的消息：不出正文 -->
+        <text v-if="revoked" class="qd-revoked">{{ t("Mobile.Message.quoteRevoked") }}</text>
+        <view v-else class="qd-card__body">
+          <text v-if="bodyText.length > 0" class="qd-text">{{ bodyText }}</text>
+          <image
+            v-if="imageUrl.length > 0"
+            class="qd-image"
+            :src="imageUrl"
+            mode="widthFix"
+            @click="handleImageTap(imageUrl)"
+          />
+          <image
+            v-for="att in imageAtts"
+            :key="att.url"
+            class="qd-image"
+            :src="att.url"
+            mode="widthFix"
+            @click="handleImageTap(att.url)"
+          />
+          <view
+            v-for="att in linkAtts"
+            :key="att.url"
+            class="qd-link"
+            hover-class="qd-link--active"
+            @click="handleLinkTap(att)"
+          >
+            <view class="qd-link__icon-wrap">
+              <svg-icon name="icon-Link" size="32" color="#5147ff" />
+            </view>
+            <view class="qd-link__col">
+              <text class="qd-link__title text-ellipsis">{{ att.fileName.length > 0 ? att.fileName : att.url }}</text>
+              <text class="qd-link__host text-ellipsis">{{ hostOf(att.url) }}</text>
+            </view>
+          </view>
+        </view>
+      </view>
+    </scroll-view>
+
+    <!-- 底部：左下角「定位到聊天位置」 -->
+    <view class="qd-foot">
+      <view class="qd-jump" hover-class="qd-jump--active" @click="handleJump">
+        <text class="qd-jump__text">{{ t("Mobile.Message.locateChat") }}</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImMsgDetail, IM_CHAT_JUMP_EVENT } from "@/servers/im";
+  import type { RequestResponse } from "@/types/interfaces/request";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { isAuthProtectedFileUrl, openRemoteFileUrl } from "@/utils/authProtectedFileUrl";
+  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { handleExternalLink } from "@/utils/system";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 附件行（图片附件进 imageAtts，文件/链接附件进 linkAtts，与聊天页一致）。 */
+  class QdAtt {
+    url: string = "";
+    fileName: string = "";
+    mime: string = "";
+  }
+
+  // ===== 页面入参 =====
+  const convId = ref<string>("");
+  const msgId = ref<string>("");
+
+  // ===== 消息内容 =====
+  const loading = ref<boolean>(false);
+  const loadFailed = ref<boolean>(false);
+  const senderName = ref<string>("");
+  const timeText = ref<string>("");
+  const revoked = ref<boolean>(false);
+  const bodyText = ref<string>("");
+  const imageUrl = ref<string>("");
+  const imageAtts = ref<QdAtt[]>([]);
+  const linkAtts = ref<QdAtt[]>([]);
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function pad2(n: number): string {
+    return n < 10 ? `0${n}` : `${n}`;
+  }
+
+  function formatSendTime(ts: number): string {
+    if (ts <= 0) {
+      return "";
+    }
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  }
+
+  /** 附件是图片：kind=image 或 mime 以 image/ 开头。 */
+  function isImageAtt(att: QdAtt): boolean {
+    if (att.mime.indexOf("image/") == 0) {
+      return true;
+    }
+    return att.url.length > 0 && isImageUrl(att.url);
+  }
+
+  function isImageUrl(url: string): boolean {
+    const lower = url.toLowerCase();
+    return (
+      lower.indexOf(".png") > 0 ||
+      lower.indexOf(".jpg") > 0 ||
+      lower.indexOf(".jpeg") > 0 ||
+      lower.indexOf(".gif") > 0 ||
+      lower.indexOf(".webp") > 0 ||
+      lower.indexOf(".bmp") > 0
+    );
+  }
+
+  function hostOf(url: string): string {
+    const marker = "://";
+    const at = url.indexOf(marker);
+    let rest = at >= 0 ? url.substring(at + marker.length) : url;
+    const slash = rest.indexOf("/");
+    if (slash >= 0) {
+      rest = rest.substring(0, slash);
+    }
+    return rest;
+  }
+
+  function parseBody(msgType: string, bodyRaw: any | null): void {
+    if (bodyRaw == null) {
+      return;
+    }
+    const body = bodyRaw as UTSJSONObject;
+    bodyText.value = readString(body, "text");
+    if (msgType == "image") {
+      imageUrl.value = readString(body, "url");
+    }
+    const attsRaw = body["attachments"];
+    if (attsRaw != null) {
+      const atts = attsRaw as UTSJSONObject[];
+      for (let i = 0; i < atts.length; i++) {
+        const att = new QdAtt();
+        att.url = readString(atts[i], "url");
+        att.fileName = readString(atts[i], "fileName");
+        att.mime = readString(atts[i], "mime");
+        if (att.url.length == 0) {
+          continue;
+        }
+        if (isImageAtt(att)) {
+          imageAtts.value.push(att);
+        } else {
+          linkAtts.value.push(att);
+        }
+      }
+    }
+  }
+
+  function loadDetail(): void {
+    if (loading.value || convId.value.length == 0 || msgId.value.length == 0) {
+      return;
+    }
+    loading.value = true;
+    loadFailed.value = false;
+    apiImMsgDetail(convId.value, msgId.value)
+      .then((res: RequestResponse<any>) => {
+        if (apiResCode(res) != SUCCESS_CODE) {
+          loading.value = false;
+          loadFailed.value = true;
+          return;
+        }
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          senderName.value = readString(dataObj, "senderName");
+          timeText.value = formatSendTime(readNumber(dataObj, "sendTime", 0));
+          revoked.value = readNumber(dataObj, "msgStatus", 1) == 2;
+          parseBody(readString(dataObj, "msgType"), dataObj["body"]);
+          resolveProtectedImages();
+        }
+        loading.value = false;
+      })
+      .catch((_e: any | null) => {
+        loading.value = false;
+        loadFailed.value = true;
+      });
+  }
+
+  /**
+   * /api/f/ 受保护图片：<image> 带不了 Bearer（H5 会被 ORB 拦成 net::ERR_BLOCKED_BY_ORB），
+   * 带 Bearer 拉取换成本地可展示地址（H5 blob / App 临时文件）；普通地址原样保留。
+   */
+  function resolveProtectedImages(): void {
+    if (imageUrl.value.length > 0) {
+      const url = imageUrl.value;
+      resolveDisplayImageUrl(url, 420, 420)
+        .then((resolved: string) => {
+          if (resolved != url) {
+            imageUrl.value = resolved;
+          }
+        })
+        .catch((_e: any | null) => {
+          // 失败保留原地址：交给 <image> 兜底
+        });
+    }
+    for (let i = 0; i < imageAtts.value.length; i++) {
+      const att = imageAtts.value[i];
+      const url = att.url;
+      resolveDisplayImageUrl(url, 420, 420)
+        .then((resolved: string) => {
+          if (resolved != url) {
+            att.url = resolved;
+          }
+        })
+        .catch((_e: any | null) => {
+          // 同上
+        });
+    }
+  }
+
+  function handleRetry(): void {
+    if (loadFailed.value) {
+      loadDetail();
+    }
+  }
+
+  function handleImageTap(url: string): void {
+    if (url.length == 0) {
+      return;
+    }
+    uni.previewImage({ urls: [url], current: url });
+  }
+
+  function handleLinkTap(att: QdAtt): void {
+    if (att.url.length == 0) {
+      return;
+    }
+    // /api/f/ 受保护文件带 Bearer 下载打开；普通链接走统一外链
+    if (isAuthProtectedFileUrl(att.url)) {
+      openRemoteFileUrl(att.url, att.fileName).catch((_e: any | null) => {
+        uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+      });
+      return;
+    }
+    handleExternalLink(att.url, att.fileName);
+  }
+
+  /** 定位到聊天位置：通知聊天页滚动到该消息并高亮，随后返回。 */
+  function handleJump(): void {
+    if (msgId.value.length == 0) {
+      return;
+    }
+    uni.$emit(IM_CHAT_JUMP_EVENT, msgId.value);
+    uni.navigateBack({});
+  }
+
+  function handleBack(): void {
+    uni.navigateBack({});
+  }
+
+  onLoad((options: any) => {
+    const readOpt = (key: string): string => {
+      if (options == null) {
+        return "";
+      }
+      const raw = options[key];
+      return raw == null ? "" : `${raw}`;
+    };
+    convId.value = readOpt("convId");
+    msgId.value = readOpt("msgId");
+    loadDetail();
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架：与聊天页同款渐变底 ===== */
+  .qd-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-image: linear-gradient(180deg, #f3f0fc 0%, #edebf8 100%);
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .qd-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(250, 249, 253, 0.92);
+    border-bottom: 2rpx solid rgba(81, 71, 255, 0.1);
+  }
+
+  .qd-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .qd-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .qd-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .qd-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .qd-header__title {
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  .qd-body {
+    flex: 1;
+    min-height: 0;
+    padding: 32rpx;
+  }
+
+  .qd-state {
+    padding: 240rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .qd-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 消息卡片 ===== */
+  .qd-card {
+    padding: 28rpx 30rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    border-radius: 20rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .qd-card__head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20rpx;
+  }
+
+  .qd-name {
+    max-width: 420rpx;
+    font-size: 28rpx;
+    line-height: 40rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  .qd-time {
+    font-size: 22rpx;
+    line-height: 32rpx;
+    color: #b0aebc;
+  }
+
+  .qd-revoked {
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #9a98a5;
+  }
+
+  .qd-card__body {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .qd-text {
+    font-size: 30rpx;
+    line-height: 48rpx;
+    color: #22212a;
+    word-break: break-all;
+  }
+
+  .qd-image {
+    width: 420rpx;
+    margin-top: 16rpx;
+    border-radius: 12rpx;
+    background-color: #f3f1fb;
+  }
+
+  /* ===== 链接附件行 ===== */
+  .qd-link {
+    margin-top: 16rpx;
+    padding: 18rpx 20rpx;
+    background-color: #f7f6fb;
+    border-radius: 12rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .qd-link--active {
+    background-color: #efecf9;
+  }
+
+  .qd-link__icon-wrap {
+    width: 64rpx;
+    height: 64rpx;
+    border-radius: 12rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .qd-link__col {
+    flex: 1;
+    min-width: 0;
+    margin-left: 16rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .qd-link__title {
+    font-size: 26rpx;
+    line-height: 36rpx;
+    color: #22212a;
+  }
+
+  .qd-link__host {
+    margin-top: 4rpx;
+    font-size: 22rpx;
+    line-height: 30rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 底部：按钮固定在左下角 ===== */
+  .qd-foot {
+    flex-shrink: 0;
+    padding: 16rpx 32rpx;
+    display: flex;
+    flex-direction: row;
+    justify-content: flex-start;
+    /* #ifdef H5 || WEB */
+    padding-bottom: calc(16rpx + env(safe-area-inset-bottom, 0px));
+    /* #endif */
+  }
+
+  .qd-jump {
+    padding: 18rpx 36rpx;
+    border-radius: 40rpx;
+    background-color: rgba(81, 71, 255, 0.08);
+    border: 2rpx solid rgba(81, 71, 255, 0.28);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .qd-jump--active {
+    background-color: rgba(81, 71, 255, 0.16);
+  }
+
+  .qd-jump__text {
+    font-size: 26rpx;
+    line-height: 36rpx;
+    font-weight: 500;
+    color: #5147ff;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  /* #endif */
+</style>

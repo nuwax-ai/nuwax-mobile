@@ -1835,6 +1835,488 @@
   });
   // #endif
 
+  function applyDefaultAgentConfig(raw: any | null): number {
+    if (raw == null) {
+      return 0;
+    }
+    const obj = raw as UTSJSONObject;
+    const idRaw = obj["defaultAgentId"];
+    const id = idRaw != null ? (idRaw as number) : 0;
+    defaultAgentId.value = id;
+    return id;
+  }
+
+  async function loadDefaultAgentEntry(): Promise<void> {
+    try {
+      let agentId = 0;
+      const cachedRaw = uni.getStorageSync(TENANT_CONFIG_INFO);
+      if (cachedRaw != null && `${cachedRaw}`.length > 0) {
+        try {
+          const cached = JSON.parse<UTSJSONObject>(`${cachedRaw}`);
+          agentId = applyDefaultAgentConfig(cached);
+        } catch (_e) {
+          agentId = 0;
+        }
+      }
+
+      const configRes = await apiTenantConfig();
+      if (apiResCode(configRes) == SUCCESS_CODE) {
+        const configData = apiResData<any>(configRes);
+        if (configData != null) {
+          uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(configData));
+          agentId = applyDefaultAgentConfig(configData);
+        }
+      }
+
+      if (agentId > 0) {
+        const detailRes = await apiPublishedAgentInfo(agentId, false);
+        if (apiResCode(detailRes) == SUCCESS_CODE) {
+          const detailRaw = apiResData<any>(detailRes);
+          if (detailRaw != null) {
+            const detail = detailRaw as UTSJSONObject;
+            const nameRaw = detail["name"];
+            const typeRaw = detail["type"];
+            const enableVersionControlRaw = detail["enableVersionControl"];
+            defaultAgentName.value = nameRaw != null ? `${nameRaw}` : t("Mobile.Common.appName");
+            defaultAgentType.value = typeRaw != null ? `${typeRaw}` : "ChatBot";
+            defaultEnableVersionControl.value = enableVersionControlRaw == 1 ? 1 : 0;
+          }
+        }
+      }
+    } catch (error) {
+      console.error("加载创建页默认智能体失败", error);
+    }
+  }
+
+  // ===== 项目/任务抽屉（声明须在 onShow 注册之前，规避 UTS 前向引用 error18）=====
+  const drawerRef = ref<any | null>(null);
+  const projectSheetRef = ref<any | null>(null);
+  const isLoggedIn = ref<boolean>(false);
+
+  /** Android：组件 ref 是 Gen* 类，禁止 as UTSJSONObject；用 $callMethod 调 defineExpose 方法 */
+  function callRefMethod(inst: any | null, methodName: string): void {
+    if (inst == null) {
+      return;
+    }
+    const proxy = inst as ComponentPublicInstance;
+    proxy.$callMethod(methodName);
+  }
+
+  async function refreshLoginStateAndDrawer(): Promise<void> {
+    isLoggedIn.value = await hasToken();
+    // 抽屉开着（如从会话页返回）时静默补差
+    callRefMethod(drawerRef.value, "resumeData");
+  }
+
+  function handleDrawerOpen(): void {
+    if (isLoggedIn.value != true) {
+      // 未登录先去登录（抽屉数据依赖登录态）
+      // #ifdef MP-WEIXIN
+      checkAuthAndShowPopup();
+      // #endif
+      // #ifndef MP-WEIXIN
+      goToLogin(true);
+      // #endif
+      return;
+    }
+    callRefMethod(drawerRef.value, "open");
+  }
+
+  /** 项目卡片点击：standard = 常规项目，web = 网页应用，fullstack = 全栈项目 */
+  function handleProjectCardClick(type: string): void {
+    const inst = projectSheetRef.value;
+    if (inst == null) {
+      return;
+    }
+    // Android：组件 ref 是 Gen* 类，须用 $callMethod 调 defineExpose 方法并带参
+    (inst as ComponentPublicInstance).$callMethod("open", type);
+  }
+
+  // ============================================================
+  // 项目创建（对齐 PC 2026-09-10 契约）：
+  // 常规→/api/normal-project/create；全栈→/api/userapp/create（sandboxId=-1 +
+  // devAgentId=租户默认任务智能体）；网页应用→统一 /api/project/create。
+  // 创建成功即建首个会话，有 conversationId+agentId 时直接打开会话。
+  // ============================================================
+  const projectCreating = ref<boolean>(false);
+
+  function readCreatedId(dataRaw: any | null): number {
+    if (dataRaw == null) {
+      return 0;
+    }
+    // error17：any 不能直接作 UTSJSONObject 参数，经 JSON 往返转换
+    const obj = JSON.parse(JSON.stringify(dataRaw)) as UTSJSONObject | null;
+    if (obj == null) {
+      return 0;
+    }
+    const idRaw = obj["id"] != null ? obj["id"] : obj["targetId"];
+    if (idRaw == null) {
+      return 0;
+    }
+    const parsed = parseFloat(`${idRaw}`);
+    // parsed != parsed 判 NaN
+    return parsed != parsed ? 0 : parsed;
+  }
+
+  function readCreatedNumber(dataRaw: any | null, key: string): number {
+    if (dataRaw == null) {
+      return 0;
+    }
+    // error17：any 不能直接作 UTSJSONObject 参数，经 JSON 往返转换
+    const obj = JSON.parse(JSON.stringify(dataRaw)) as UTSJSONObject | null;
+    if (obj == null) {
+      return 0;
+    }
+    const raw = obj[key];
+    if (raw == null) {
+      return 0;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return parsed != parsed ? 0 : parsed;
+  }
+
+  /** 全栈创建的 devAgentId：租户配置 defaultTaskAgentId 优先，回落 defaultAgentId。 */
+  function resolveDevAgentId(): number {
+    let devAgentId = 0;
+    const cachedRaw = uni.getStorageSync(TENANT_CONFIG_INFO);
+    if (cachedRaw != null && `${cachedRaw}`.length > 0) {
+      try {
+        const cached = JSON.parse<UTSJSONObject>(`${cachedRaw}`);
+        if (cached != null) {
+          const taskAgentRaw = cached["defaultTaskAgentId"];
+          devAgentId = taskAgentRaw != null ? parseFloat(`${taskAgentRaw}`) : 0;
+          if (devAgentId != devAgentId || devAgentId <= 0) {
+            const agentRaw = cached["defaultAgentId"];
+            devAgentId = agentRaw != null ? parseFloat(`${agentRaw}`) : 0;
+          }
+        }
+      } catch (_e) {
+        devAgentId = 0;
+      }
+    }
+    return devAgentId != devAgentId ? 0 : devAgentId;
+  }
+
+  function finishProjectCreate(dataRaw: any | null, pType: string): void {
+    uni.hideLoading();
+    projectCreating.value = false;
+    uni.showToast({ title: t("Mobile.CreateHub.createProjectSuccess"), icon: "success" });
+    // 关闭创建弹窗并刷新抽屉项目列表（下次打开即见新项目）
+    const sheetInst = projectSheetRef.value;
+    if (sheetInst != null) {
+      (sheetInst as ComponentPublicInstance).$callMethod("close");
+    }
+    callRefMethod(drawerRef.value, "refreshProjects");
+    // 创建即建首个会话：有会话 id + id 时直接打开（缺省仅提示成功）
+    const conversationId = readCreatedNumber(dataRaw, "conversationId");
+    const projectId = readCreatedId(dataRaw);
+    if (conversationId > 0 && projectId > 0) {
+      setTimeout(() => {
+        jumpToAgentDetailPage(projectId, conversationId, "TaskAgent", "", pType);
+      }, 600);
+    }
+  }
+
+  function failProjectCreate(message: string): void {
+    uni.hideLoading();
+    projectCreating.value = false;
+    uni.showToast({
+      title: message.length > 0 ? message : t("Mobile.CreateHub.createProjectFailed"),
+      icon: "none",
+    });
+  }
+
+  async function settleProjectCreate(
+    requestPromise: Promise<UTSJSONObject>,
+    pType: string,
+  ): Promise<void> {
+    try {
+      const res = await requestPromise;
+      const dataRaw = apiResData<any>(res);
+      if (apiResCode(res) == SUCCESS_CODE && readCreatedId(dataRaw) > 0) {
+        finishProjectCreate(dataRaw, pType);
+      } else {
+        failProjectCreate(apiResMessage(res));
+      }
+    } catch (error) {
+      console.error("performProjectCreate error:", error);
+      failProjectCreate("");
+    }
+  }
+
+  async function performProjectCreate(sheetType: string, name: string): Promise<void> {
+    // Kotlin：any 不接受 null 初值，按分支直接 await 返回
+    if (sheetType == "fullstack") {
+      await settleProjectCreate(apiUserAppCreate(name, resolveDevAgentId()), "UserApp");
+    } else if (sheetType == "web") {
+      await settleProjectCreate(apiPageAppCreate(name), "");
+    } else {
+      await settleProjectCreate(apiNormalProjectCreate(name), "NormalProject");
+    }
+  }
+
+  function handleProjectCreate(payload: any): void {
+    if (projectCreating.value == true) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    const typeRaw = obj["type"];
+    const nameRaw = obj["name"];
+    const sheetType = typeRaw != null ? `${typeRaw}` : "standard";
+    const name = nameRaw != null ? `${nameRaw}`.trim() : "";
+    if (name.length == 0) {
+      uni.showToast({ title: t("Mobile.CreateHub.projectNameRequired"), icon: "none" });
+      return;
+    }
+    projectCreating.value = true;
+    uni.showLoading({ title: t("Mobile.Page.loading"), mask: true });
+    performProjectCreate(sheetType, name);
+  }
+
+  function handleConversationClick(item: any): void {
+    const obj = item as UTSJSONObject;
+    const agentIdRaw = obj["agentId"];
+    const agentId = agentIdRaw != null ? (agentIdRaw as number) : 0;
+    const typeRaw = obj["pType"] != null ? obj["pType"] : obj["projectType"];
+    const pType = typeRaw != null ? `${typeRaw}` : "";
+    if (pType == "NormalProject" || pType == "UserApp") {
+      const projectIdRaw = obj["id"];
+      let projectId = 0;
+      if (projectIdRaw != null) {
+        const parsed = parseFloat(`${projectIdRaw}`);
+        if (parsed == parsed) {
+          projectId = parsed;
+        }
+      }
+      const convRaw = obj["conversationId"];
+      let conversationId = 0;
+      if (convRaw != null) {
+        const parsedConv = parseFloat(`${convRaw}`);
+        if (parsedConv == parsedConv) {
+          conversationId = parsedConv;
+        }
+      }
+      if (projectId <= 0 || conversationId <= 0) {
+        return;
+      }
+      jumpToAgentDetailPage(projectId, conversationId, "ChatBot", "", pType);
+      return;
+    }
+    const idRaw = obj["id"];
+    const conversationId = idRaw != null ? (idRaw as number) : 0;
+    if (agentId <= 0 || conversationId <= 0) {
+      return;
+    }
+    jumpToAgentDetailPage(agentId, conversationId);
+  }
+
+  function handleModeChange(mode: string): void {
+    currentMode.value = mode == "project" ? "project" : "chat";
+  }
+
+  async function ensureLoggedIn(): Promise<boolean> {
+    const loggedIn = await hasToken();
+    if (loggedIn == true) {
+      return true;
+    }
+    // #ifdef MP-WEIXIN
+    await checkAuthAndShowPopup();
+    return false;
+    // #endif
+    // #ifndef MP-WEIXIN
+    goToLogin(true);
+    return false;
+    // #endif
+  }
+
+  function resolveAgentType(): "ChatBot" | "PageApp" | "TaskAgent" {
+    const rawType = activeAgentType.value;
+    if (rawType == "PageApp") {
+      return "PageApp";
+    }
+    if (rawType == "TaskAgent") {
+      return "TaskAgent";
+    }
+    return "ChatBot";
+  }
+
+  function parseConversationId(raw: any | null): number {
+    if (raw == null) {
+      return 0;
+    }
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr == null || jsonStr.length == 0) {
+      return 0;
+    }
+    const parsed = JSON.parse(jsonStr) as UTSJSONObject | null;
+    if (parsed == null) {
+      return 0;
+    }
+    const idRaw = parsed["id"];
+    if (idRaw == null) {
+      return 0;
+    }
+    if (typeof idRaw == "number") {
+      return idRaw as number;
+    }
+    const parsedId = parseInt(`${idRaw}`, 10);
+    return parsedId != parsedId ? 0 : parsedId;
+  }
+
+  function collectDraftAttachments(raw: any | null): UTSJSONObject[] {
+    const result: UTSJSONObject[] = [];
+    if (raw == null) {
+      return result;
+    }
+    const list = raw as UTSJSONObject[];
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      const item: UTSJSONObject = {} as UTSJSONObject;
+      const urlRaw = file["url"];
+      const typeRaw = file["type"];
+      const nameRaw = file["name"];
+      const keyRaw = file["key"];
+      const sizeRaw = file["size"];
+      item["fileUrl"] = urlRaw != null ? `${urlRaw}` : "";
+      item["mimeType"] = typeRaw != null ? `${typeRaw}` : "";
+      item["fileName"] = nameRaw != null ? `${nameRaw}` : "";
+      item["fileKey"] = keyRaw != null ? `${keyRaw}` : "";
+      item["fileSize"] = sizeRaw != null ? (sizeRaw as number) : 0;
+      result.push(item);
+    }
+    return result;
+  }
+
+  function collectSkillIds(raw: any | null): number[] {
+    const result: number[] = [];
+    if (raw == null) {
+      return result;
+    }
+    const list = raw as number[];
+    for (let i = 0; i < list.length; i++) {
+      result.push(list[i]);
+    }
+    return result;
+  }
+
+  async function handleSendMessage(data: any): Promise<void> {
+    if (sending.value == true) {
+      return;
+    }
+    const obj = data as UTSJSONObject;
+    const messageRaw = obj["messageInfo"];
+    const message = messageRaw != null ? `${messageRaw}`.trim() : "";
+    const attachments = collectDraftAttachments(obj["files"]);
+    if (message.length == 0 && attachments.length == 0) {
+      return;
+    }
+    const loggedIn = await ensureLoggedIn();
+    if (loggedIn != true) {
+      return;
+    }
+    const agentId = activeAgentId.value;
+    if (agentId <= 0) {
+      uni.showToast({
+        title: t("Mobile.CreateHub.noDefaultAgent"),
+        icon: "none",
+      });
+      return;
+    }
+
+    sending.value = true;
+    uni.showLoading({ title: t("Mobile.Page.loading"), mask: true });
+    try {
+      const conversationParams: UTSJSONObject = {
+        agentId: agentId,
+        devMode: false,
+      };
+      const res = await apiAgentConversationCreate(conversationParams);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({
+          title: apiResMessage(res).length > 0 ? apiResMessage(res) : t("Mobile.CreateHub.sendFailed"),
+          icon: "none",
+        });
+        return;
+      }
+      const convId = parseConversationId(apiResData<any>(res));
+      if (convId <= 0) {
+        uni.showToast({
+          title: t("Mobile.CreateHub.sendFailed"),
+          icon: "none",
+        });
+        return;
+      }
+      const draft = new PendingChatDraft();
+      draft.createdAt = Date.now();
+      draft.agentId = agentId;
+      draft.conversationId = convId;
+      draft.message = message;
+      draft.attachments = attachments;
+      draft.skillIds = collectSkillIds(obj["skillIds"]);
+      const modelIdRaw = obj["modelId"];
+      draft.modelId = modelIdRaw != null ? (modelIdRaw as number) : currentModelId.value;
+      const sandboxIdRaw = obj["sandboxId"];
+      draft.sandboxId = sandboxIdRaw != null ? `${sandboxIdRaw}` : currentComputerId.value;
+      const selectedRaw = obj["selectedComponents"];
+      if (selectedRaw != null) {
+        const selectedList = selectedRaw as UTSJSONObject[];
+        for (let i = 0; i < selectedList.length; i++) {
+          const item = selectedList[i];
+          const idRaw = item["id"];
+          const id = idRaw != null ? (idRaw as number) : 0;
+          const typeRaw = item["type"];
+          const type = typeRaw != null ? (typeRaw as AgentComponentTypeEnum) : AgentComponentTypeEnum.Plugin;
+          draft.selectedComponents.push(new AgentSelectedComponentInfo(id, type));
+        }
+      }
+      const agentModeRaw = obj["agentMode"];
+      const agentMode = agentModeRaw != null ? `${agentModeRaw}` : "";
+      if (agentMode == "ask" || agentMode == "yolo") {
+        draft.agentMode = agentMode;
+      }
+      savePendingChatDraft(draft);
+      await jumpToAgentDetailPage(agentId, convId, resolveAgentType(), activeAgentName.value);
+    } catch (error) {
+      console.error("创建会话失败", error);
+      uni.showToast({
+        title: t("Mobile.CreateHub.sendFailed"),
+        icon: "none",
+      });
+    } finally {
+      sending.value = false;
+      uni.hideLoading();
+    }
+  }
+
+  const shareTitle = ref<string>("");
+  const fallbackShareTitle = computed<string>((): string => t("Mobile.Nav.home"));
+
+  async function setCurrentShareTitle(): Promise<void> {
+    const tenantConfigRaw = uni.getStorageSync(TENANT_CONFIG_INFO);
+    const tenantConfigInfoString = orEmpty(tenantConfigRaw);
+    if (tenantConfigInfoString.length > 0) {
+      try {
+        const parsed = JSON.parse<UTSJSONObject>(tenantConfigInfoString);
+        if (parsed != null) {
+          const siteName = parsed["siteName"] as string | null;
+          const siteDescription = parsed["siteDescription"] as string | null;
+          let titleStr = "";
+          if (siteName != null) {
+            titleStr = siteName;
+          }
+          if (siteDescription != null) {
+            titleStr = titleStr.length > 0
+              ? titleStr + " " + siteDescription
+              : siteDescription;
+          }
+          shareTitle.value = titleStr;
+        }
+      } catch (error) {
+        console.error("获取本地用户配置失败:", error);
+      }
+    }
+  }
+
   // ════════════════ 8. 生命周期 ════════════════
 
   onLoad((options: any) => {

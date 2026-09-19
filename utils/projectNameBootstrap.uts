@@ -1,0 +1,220 @@
+/**
+ * 项目会话首条提示词：若名称尚未定制（nameDefined=false），用 AI 生成并回写项目信息。
+ * 仅当路由带 pType=NormalProject|UserApp 时生效；此时 query.id 即为项目 id。
+ */
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import {
+  apiAgentGenerateInfo,
+  apiNormalProjectGetById,
+  apiNormalProjectUpdate,
+  apiUserAppGetById,
+  apiUserAppUpdate,
+} from "@/servers/project";
+import {
+  UserAppUpdateParams,
+  UserProjectUpdateParams,
+} from "@/types/interfaces/projectInfo";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+
+let ensureInFlightKey = "";
+const ensuredKeys: string[] = [] as string[];
+
+function readQueryString(options: UTSJSONObject, key: string): string {
+  const raw = options[key];
+  return raw != null ? `${raw}` : "";
+}
+
+function readQueryNumber(options: UTSJSONObject, key: string): number {
+  const raw = options[key];
+  if (raw == null) {
+    return 0;
+  }
+  const parsed = parseFloat(`${raw}`);
+  return parsed != parsed ? 0 : parsed;
+}
+
+function isSupportedProjectType(pType: string): boolean {
+  return pType == "NormalProject" || pType == "UserApp";
+}
+
+function normalizeProjectChatType(pType: string): string {
+  return isSupportedProjectType(pType) ? pType : "";
+}
+
+function pickQueryValue(url: string, key: string): string {
+  const needle = `${key}=`;
+  const from = url.indexOf(needle);
+  if (from < 0) {
+    return "";
+  }
+  const start = from + needle.length;
+  let end = url.indexOf("&", start);
+  if (end < 0) {
+    end = url.indexOf("#", start);
+  }
+  if (end < 0) {
+    end = url.length;
+  }
+  return url.substring(start, end);
+}
+
+function isNameDefined(raw: any | null): boolean {
+  if (raw == true) {
+    return true;
+  }
+  const text = `${raw}`;
+  return text == "true" || text == "1" || text == "Yes";
+}
+
+function isNameUndefined(raw: any | null): boolean {
+  if (raw == false) {
+    return true;
+  }
+  const text = `${raw}`;
+  return text == "false" || text == "0" || text == "No";
+}
+
+function projectEnsureKey(pType: string, projectId: number): string {
+  return `${pType}:${projectId}`;
+}
+
+function hasEnsured(key: string): boolean {
+  for (let i = 0; i < ensuredKeys.length; i++) {
+    if (ensuredKeys[i] == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function markEnsured(key: string): void {
+  if (hasEnsured(key) != true) {
+    ensuredKeys.push(key);
+  }
+}
+
+/**
+ * 从页面 options 读取项目类型（仅 NormalProject / UserApp）。
+ */
+export function readProjectChatType(options: UTSJSONObject): string {
+  return normalizeProjectChatType(readQueryString(options, "pType"));
+}
+
+/**
+ * 从页面 options 读取项目 id。全栈/常规项目路由里 id 就是项目 id。
+ */
+export function readProjectChatId(options: UTSJSONObject): number {
+  if (readProjectChatType(options).length == 0) {
+    return 0;
+  }
+  return readQueryNumber(options, "id");
+}
+
+/**
+ * 从完整 URL 中抽出 pType（NormalProject / UserApp）。
+ */
+export function readProjectChatTypeFromUrl(url: string): string {
+  if (url.length == 0) {
+    return "";
+  }
+  return normalizeProjectChatType(pickQueryValue(url, "pType"));
+}
+
+function readGeneratedString(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  return raw != null ? `${raw}` : "";
+}
+
+/**
+ * 名称未定制时：按当前提示词生成项目信息并按类型回写。
+ * 失败不打断发消息；同一项目只尝试一次成功回写。
+ */
+export async function ensureProjectNameFromPrompt(
+  pType: string,
+  projectId: number,
+  prompt: string,
+): Promise<void> {
+  if (isSupportedProjectType(pType) != true || projectId <= 0) {
+    return;
+  }
+  const trimmed = prompt.trim();
+  if (trimmed.length == 0) {
+    return;
+  }
+  const key = projectEnsureKey(pType, projectId);
+  if (hasEnsured(key) == true || ensureInFlightKey == key) {
+    return;
+  }
+  ensureInFlightKey = key;
+  try {
+    const detailRes =
+      pType == "UserApp"
+        ? await apiUserAppGetById(projectId)
+        : await apiNormalProjectGetById(projectId);
+    if (apiResCode(detailRes) != SUCCESS_CODE) {
+      return;
+    }
+    const detailRaw = apiResData<any>(detailRes);
+    if (detailRaw == null) {
+      return;
+    }
+    const detailObj = detailRaw as UTSJSONObject;
+    if (isNameDefined(detailObj["nameDefined"]) == true) {
+      markEnsured(key);
+      return;
+    }
+    if (isNameUndefined(detailObj["nameDefined"]) != true) {
+      return;
+    }
+    const generateRes = await apiAgentGenerateInfo(trimmed);
+    if (apiResCode(generateRes) != SUCCESS_CODE) {
+      return;
+    }
+    const generateRaw = apiResData<any>(generateRes);
+    if (generateRaw == null) {
+      return;
+    }
+    const generateObj = generateRaw as UTSJSONObject;
+    const name = readGeneratedString(generateObj, "name").trim();
+    if (name.length == 0) {
+      return;
+    }
+    const description = readGeneratedString(generateObj, "description");
+    const icon = readGeneratedString(generateObj, "iconUrl");
+    let updateOk = false;
+    if (pType == "UserApp") {
+      const params = new UserAppUpdateParams();
+      params.id = projectId;
+      params.name = name;
+      if (description.length > 0) {
+        params.description = description;
+      }
+      if (icon.length > 0) {
+        params.icon = icon;
+      }
+      const updateRes = await apiUserAppUpdate(params);
+      updateOk = apiResCode(updateRes) == SUCCESS_CODE;
+    } else {
+      const params = new UserProjectUpdateParams();
+      params.id = projectId;
+      params.name = name;
+      if (description.length > 0) {
+        params.description = description;
+      }
+      if (icon.length > 0) {
+        params.icon = icon;
+      }
+      const updateRes = await apiNormalProjectUpdate(params);
+      updateOk = apiResCode(updateRes) == SUCCESS_CODE;
+    }
+    if (updateOk == true) {
+      markEnsured(key);
+    }
+  } catch (error) {
+    console.error("[ProjectName] ensureProjectNameFromPrompt failed:", error);
+  } finally {
+    if (ensureInFlightKey == key) {
+      ensureInFlightKey = "";
+    }
+  }
+}

@@ -4,6 +4,12 @@ import type { RequestResponse } from "@/types/interfaces/request";
 
 const IM_DEVICE_BASE_ID_STORAGE_KEY = "NUWAX_IM_DEVICE_BASE_ID";
 
+/**
+ * 「定位到聊天位置」跳转事件（quote-detail 页 → 聊天页）：
+ * payload 为目标 msgId（字符串雪花号），聊天页收到后滚动定位并高亮闪烁该行。
+ */
+export const IM_CHAT_JUMP_EVENT = "im-chat-jump-to-msg";
+
 let cachedImDeviceId = "";
 
 /**
@@ -82,6 +88,106 @@ export async function apiImConversations(
 }
 
 /**
+ * 我的群聊列表（convListMyGroups，游标分页，首页 cursor 传空串）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - 与 /conversations 的差异：含 visible=0（已从会话列表删除但仍在群内）的群
+ * - ★cursor 不能与 /conversations 混用（两边可见集不同）
+ * - data = PageResult：records: ConversationSummaryDto[]（convType=2），
+ *   total = 符合条件的总数（智联录分组头计数用它，勿用 records.length）
+ */
+export async function apiImMyGroups(
+  cursor: string,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/conversations/groups",
+    method: "GET",
+    data: {
+      cursor,
+      limit,
+    },
+  });
+}
+
+/**
+ * 解散群聊（convDisband，仅群主）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - 解散即整个群不复存在（全体成员被移出、会话列表同步消失），不可恢复
+ * - 非群主调用会被服务端拒绝；data = true 表示已执行
+ */
+export async function apiImGroupDisband(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}`,
+    method: "DELETE",
+  });
+}
+
+/**
+ * 退出群聊（convLeave，非群主）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - ★群主不能直接退群（需先转让，否则报 IM_30001）——前端按 myRole 只给
+ *   群主展示「解散群聊」，不给「退出群聊」
+ * - data = RemoveMemberResult（四步级联布尔，客户端只按信封 code 判成败）
+ */
+export async function apiImGroupLeave(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/leave`,
+    method: "POST",
+  });
+}
+
+/**
+ * 创建或获取单聊会话（convCreateP2p，幂等）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - ★同一对用户重复调用返回同一个 convId，不会产生第二个会话——智联录点
+ *   联系人进详情页的唯一入口，无需先去会话列表里找
+ * - targetUserId == 自己 → IM_20106（一期不开放给自己发）
+ * - 响应 data = ConversationSummaryDto；created 键仅创建类接口返回（本次是否真的新建）
+ */
+export async function apiImCreateP2pConversation(
+  targetUserId: string,
+): Promise<RequestResponse<any>> {
+  // ★targetUserId 是 int64：以原始数字字面量拼 JSON 直传（同 apiImSendTextMsg 的
+  //   convId），避免经 JS number 丢精度后建错/找不到会话
+  return await request({
+    url: "/api/instant-message/conversations/p2p",
+    method: "POST",
+    data: `{"targetUserId":${targetUserId}}`,
+  });
+}
+
+/**
+ * 创建群聊会话（convCreateGroup）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - name 必填；memberUserIds 不含自己（服务端自动拉创建者入群）
+ * - 响应 data = ConversationSummaryDto（convId 为 int64 雪花号）
+ * - 成员上限超 2000 → IM_20101，超 5000 → IM_20102
+ */
+export async function apiImCreateGroup(
+  name: string,
+  memberUserIds: string[],
+): Promise<RequestResponse<any>> {
+  // ★memberUserIds 元素是 int64 雪花号：userId 全程存字符串，join 后以原始数字
+  //   字面量拼 JSON 直传（同 apiImCreateP2pConversation），避免经 JS number 丢精度
+  const ids = memberUserIds.join(",");
+  // name 走 JSON.stringify 转义（含引号/反斜杠/换行的群名安全）
+  return await request({
+    url: "/api/instant-message/conversations/group",
+    method: "POST",
+    data: `{"name":${JSON.stringify(name)},"memberUserIds":[${ids}]}`,
+  });
+}
+
+/**
  * 通讯录列表（消息页「智联录」tab）。
  *
  * 契约见 im-openapi.yaml（contactList）：
@@ -94,6 +200,203 @@ export async function apiImContacts(): Promise<RequestResponse<any>> {
   return await request({
     url: "/api/instant-message/contacts",
     method: "GET",
+  });
+}
+
+/**
+ * 搜索联系人（searchContacts，跨本地联系人 + 平台用户）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - keyword 必填（1-64 字符，不传 IM_40001）；limit 可选
+ * - data = { items: ContactSearchItem[], degraded }
+ *   degraded=true ⇒ 平台侧查询失败，结果可能不全（应提示用户）
+ * - ContactSearchItem 无 displayName/status：展示名按 nickName > userName 回落
+ */
+export async function apiImSearchContacts(
+  keyword: string,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/search/contacts",
+    method: "GET",
+    data: {
+      keyword,
+      limit,
+    },
+  });
+}
+
+/**
+ * 发起加好友（contactAdd）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - 不传 direct（默认 false）⇒ 落"待接受"态，需对方 accept
+ * - 响应 data = ContactAddResult：accepted 决定文案（"申请已发送"），
+ *   alreadyContact=true 表示早就是好友（不报错、不重复建关系）
+ */
+export async function apiImAddContact(
+  targetUserId: string,
+  message: string,
+): Promise<RequestResponse<any>> {
+  // ★targetUserId 是 int64 雪花号：字符串直传数字字面量拼 JSON（同建群），
+  //   避免经 JS number 丢精度；附言走 JSON.stringify 转义
+  return await request({
+    url: "/api/instant-message/contacts",
+    method: "POST",
+    data: `{"targetUserId":${targetUserId},"message":${JSON.stringify(message)}}`,
+  });
+}
+
+/**
+ * 搜索平台智能体（contactSearchAgents，智能体 tab 数据源）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - kw 可选：不传等于"浏览全部"（分页）；page 从 1 起，pageSize 默认 20 上限 100
+ * - data = AgentSearchResult { items, total, page, pageSize, degraded }
+ *   ★degraded=true ⇒ 平台不可用、items 为空，应提示"搜索服务暂不可用"而非"没有找到"
+ * - AgentSearchItem 的 userId/publishedId 是 int64 雪花号（读时按字符串取）
+ */
+export async function apiImSearchAgents(
+  kw: string,
+  page: number,
+  pageSize: number,
+): Promise<RequestResponse<any>> {
+  if (kw.length > 0) {
+    return await request({
+      url: "/api/instant-message/contacts/agents",
+      method: "GET",
+      data: {
+        kw,
+        page,
+        pageSize,
+      },
+    });
+  }
+  // 不传 kw = 浏览全部（契约规定，空串行为未定义故不传）
+  return await request({
+    url: "/api/instant-message/contacts/agents",
+    method: "GET",
+    data: {
+      page,
+      pageSize,
+    },
+  });
+}
+
+/**
+ * 按群号申请加群（conversations/join，PC 端同款接口）。
+ *
+ * 契约（nuwax-im 后端暂未入 OpenAPI，按 PC 端联调参数对齐）：
+ * - body { groupNo: string(19 位数字，字符串直传), remark: string(≤64，申请附言) }
+ * - 免审批群直接入群；需审批群等群主同意后出现在会话列表
+ */
+export async function apiImJoinGroup(
+  groupNo: string,
+  remark: string,
+): Promise<RequestResponse<any>> {
+  // groupNo 按契约以字符串传输；remark 走 JSON.stringify 转义
+  return await request({
+    url: "/api/instant-message/conversations/join",
+    method: "POST",
+    data: `{"groupNo":${JSON.stringify(groupNo)},"remark":${JSON.stringify(remark)}}`,
+  });
+}
+
+/**
+ * 更新我在会话里的设置（conversations/{convId}/members/me，PUT 局部字段：不传的键不改）。
+ * 会话行左滑三个操作共用：
+ * - 置顶 topFlag / 消息免打扰 dnd（消息仍收，仅不提醒）/ visible=false 从我的消息列表移除
+ * - 返回更新后的 ConversationSummaryDto
+ * ★易混接口：POST /{convId}/mute 是群成员禁言；DELETE /{convId} 是解散群（仅群主），都不是这里的语义
+ */
+async function apiImConvUpdateMySettings(
+  convId: string,
+  body: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/members/me`,
+    method: "PUT",
+    data: body,
+  });
+}
+
+/** 置顶 / 取消置顶会话（可多条置顶，最先置顶的在最上面）。 */
+export async function apiImConvSetTop(
+  convId: string,
+  top: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImConvUpdateMySettings(convId, `{"topFlag":${top}}`);
+}
+
+/** 开启 / 取消消息免打扰（消息仍会接收，仅不提醒）。 */
+export async function apiImConvSetDnd(
+  convId: string,
+  dnd: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImConvUpdateMySettings(convId, `{"dnd":${dnd}}`);
+}
+
+/** 删除会话（仅移出我的消息列表，聊天记录保留；人仍在群，可从智联录重新打开）。 */
+export async function apiImConvRemove(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await apiImConvUpdateMySettings(convId, '{"visible":false}');
+}
+
+/**
+ * 接受好友申请（contactAccept，处理 status=2 的「新的伙伴申请」）。
+ * ★幂等：只对"待接受"态生效，重复接受返回 data=false（仍是成功码，勿当失败重试）。
+ */
+export async function apiImContactAccept(
+  userId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/contacts/${userId}/accept`,
+    method: "POST",
+  });
+}
+
+/**
+ * 拒绝好友申请 / 撤回我发出的申请（contactReject，★同一动作：删掉两行）。
+ * 幂等语义同 accept：重复操作 / 本来就没有返回 false 不报错。
+ */
+export async function apiImContactReject(
+  userId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/contacts/${userId}/reject`,
+    method: "POST",
+  });
+}
+
+/**
+ * 删除联系人（contactRemove，★双向：同时把我也从对方通讯录里删掉，
+ * 恢复需重新申请——确认弹窗文案与此语义对齐）。
+ * 终态幂等：本来就没有也返回 true；data=false 表示对方已不在我的通讯录。
+ */
+export async function apiImContactRemove(
+  userId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/contacts/${userId}`,
+    method: "DELETE",
+  });
+}
+
+/**
+ * 设置联系人备注（contactRemark，只改我这一行）。
+ * ★remark 传空串 = 清除备注（displayName 回落到平台昵称）；上限 32 字（服务端 MAX_REMARK）。
+ * data=false = 对方还不在我的通讯录里。
+ */
+export async function apiImContactSetRemark(
+  userId: string,
+  remark: string,
+): Promise<RequestResponse<any>> {
+  // remark 走 JSON.stringify 转义（含引号/反斜杠的备注安全）
+  return await request({
+    url: `/api/instant-message/contacts/${userId}/remark`,
+    method: "PUT",
+    data: `{"remark":${JSON.stringify(remark)}}`,
   });
 }
 
@@ -119,6 +422,25 @@ export async function apiImMessages(
   }
   return await request({
     url: `/api/instant-message/conversations/${convId}/messages`,
+    method: "GET",
+    data,
+  });
+}
+
+/**
+ * 单条消息详情（msgDetail）。
+ * ★convId 是【必填 query 参数】：msgId 全局唯一但不带会话维度，服务端靠 convId
+ *   做鉴权与分片路由，漏传报 IM_90001（im-openapi /messages/{msgId}）。
+ * 响应 data = MessageDto（含 body / senderName / sendTime / msgStatus 等）。
+ */
+export async function apiImMsgDetail(
+  convId: string,
+  msgId: string,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  data["convId"] = convId;
+  return await request({
+    url: `/api/instant-message/messages/${msgId}`,
     method: "GET",
     data,
   });

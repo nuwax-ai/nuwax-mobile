@@ -47,12 +47,20 @@
         v-for="msg in messages"
         :key="msg.msgId"
         :id="'msg-' + msg.msgId"
+        :class="highlightId == msg.msgId ? 'chat-msg--flash' : ''"
       >
-        <!-- 撤回 / 系统行：body 为空不进气泡（撤回的消息仍在列表里，勿过滤） -->
-        <view v-if="msg.bodyText.length == 0 && (msg.revoked || msg.digest.length > 0)" class="chat-sys">
+        <!-- 撤回 / 系统行：无正文无图无附件不进气泡（撤回的消息仍在列表里，勿过滤） -->
+        <view
+          v-if="msg.bodyText.length == 0 && msg.imageUrl.length == 0 && msg.imageAtts.length == 0 && msg.linkAtts.length == 0 && (msg.revoked || msg.digest.length > 0)"
+          class="chat-sys"
+        >
           <text class="chat-sys__text">{{ sysText(msg) }}</text>
         </view>
-        <view v-else-if="msg.bodyText.length > 0" class="chat-row" :class="isMine(msg) ? 'chat-row--mine' : ''">
+        <view
+          v-else-if="msg.bodyText.length > 0 || msg.imageUrl.length > 0 || msg.imageAtts.length > 0 || msg.linkAtts.length > 0"
+          class="chat-row"
+          :class="isMine(msg) ? 'chat-row--mine' : ''"
+        >
           <view class="chat-ava-wrap">
             <image
               v-if="avatarSrcOf(msg).length > 0 && avatarFailedOf(msg) != true"
@@ -73,13 +81,68 @@
             <text v-if="isMine(msg) != true" class="chat-name text-ellipsis">{{
               msg.senderName.length > 0 ? msg.senderName : titleName
             }}</text>
+            <!-- 图片消息：不进气泡，点击全屏放大（微信交互） -->
+            <image
+              v-if="msg.msgType == 'image' && msg.imageUrl.length > 0"
+              class="chat-image"
+              :src="msg.imageUrl"
+              mode="aspectFill"
+              @click="handleImageMsgTap(msg)"
+            />
             <view
+              v-else
               class="chat-bubble"
               :class="isMine(msg) ? 'chat-bubble--mine' : ''"
               hover-class="chat-bubble--active"
               @click="handleBubbleTap(msg)"
             >
-              <text class="chat-bubble__text" :class="isMine(msg) ? 'chat-bubble__text--mine' : ''">{{ msg.bodyText }}</text>
+              <!-- 引用的原消息：点击进全屏详情，可「定位到聊天位置」 -->
+              <view
+                v-if="msg.replyId.length > 0 && quotePreview(msg).length > 0"
+                class="chat-quote"
+                :class="isMine(msg) ? 'chat-quote--mine' : ''"
+                @click="handleQuoteTap(msg)"
+              >
+                <text
+                  v-if="msg.replySenderName.length > 0"
+                  class="chat-quote__name text-ellipsis"
+                  :class="isMine(msg) ? 'chat-quote__name--mine' : ''"
+                >{{ msg.replySenderName }}</text>
+                <text
+                  class="chat-quote__text text-ellipsis-2"
+                  :class="isMine(msg) ? 'chat-quote__text--mine' : ''"
+                >{{ quotePreview(msg) }}</text>
+              </view>
+              <text
+                v-if="msg.bodyText.length > 0"
+                class="chat-bubble__text"
+                :class="textClassOf(msg)"
+                @click="handleLinkTextTap(msg)"
+              >{{ msg.bodyText }}</text>
+              <!-- rich_text 图片附件：缩略图，点击全屏放大 -->
+              <image
+                v-for="att in msg.imageAtts"
+                :key="att.url"
+                class="chat-image chat-image--att"
+                :src="att.url"
+                mode="aspectFill"
+                @click="handleAttImageTap(msg, att)"
+              />
+              <!-- 文件 / 链接附件：展示文案，点击打开链接（微信交互） -->
+              <view
+                v-for="att in msg.linkAtts"
+                :key="att.url"
+                class="chat-link"
+                @click="handleLinkAttTap(att)"
+              >
+                <view class="chat-link__icon-wrap">
+                  <svg-icon name="icon-Link" size="32" color="#5147ff" />
+                </view>
+                <view class="chat-link__col">
+                  <text class="chat-link__title text-ellipsis">{{ att.fileName.length > 0 ? att.fileName : att.url }}</text>
+                  <text class="chat-link__host text-ellipsis">{{ hostOf(att.url) }}</text>
+                </view>
+              </view>
             </view>
             <text v-if="msg.status == 0" class="chat-status">{{ t("Mobile.Message.sending") }}</text>
             <text v-else-if="msg.status == 2" class="chat-status chat-status--fail">{{ t("Mobile.Message.sendFailed") }}</text>
@@ -141,14 +204,17 @@
 
 <script setup lang="uts">
   import { computed, nextTick, ref } from "vue";
-  import { onLoad } from "@dcloudio/uni-app";
+  import { onLoad, onShow, onHide, onUnload } from "@dcloudio/uni-app";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { apiUserInfo } from "@/servers/account";
-  import { apiImMessages, apiImReadReport, apiImSendTextMsg } from "@/servers/im";
+  import { apiImMessages, apiImReadReport, apiImSendTextMsg, IM_CHAT_JUMP_EVENT } from "@/servers/im";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { isAuthProtectedFileUrl, openAuthProtectedLinkUrl } from "@/utils/authProtectedFileUrl";
   import { generateUUID } from "@/utils/common";
   import { refreshImUnreadBadge } from "@/utils/imUnreadBadge";
+  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { handleExternalLink } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import VoiceRecorderButton from "@/components/conversation-input/voice-recorder-button/voice-recorder-button.uvue";
 
@@ -167,11 +233,20 @@
     "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
   ];
 
+  /** rich_text 附件（kind=image 或图片后缀进图片缩略，其余按链接行展示）。 */
+  class ImMsgAtt {
+    url: string = "";
+    fileName: string = "";
+    mime: string = "";
+  }
+
   /**
    * 消息行（升序存于 messages）。
    * ★msgId/senderId 是 int64 雪花号：Android 经 `${raw}` 精确转字符串；
-   *   H5 JSON.parse 会丢精度（已知限制，后端改字符串序列化前先接受）。
+   *   H5 由请求层 parseJsonKeepInt64 保精度（snowflake 不丢位）。
    * status 是【客户端本地态】：0=发送中 1=已确认 2=发送失败（服务端只有 msgStatus 正常/撤回）。
+   * msgType=text 走 bodyText；image 走 imageUrl；rich_text 走 bodyText + 附件
+   * （图片附件进 imageAtts，文件/链接附件进 linkAtts）；replyId/reply* 为引用的原消息（服务端展开一层）。
    */
   class ImMsgRow {
     msgId: string = "";
@@ -180,7 +255,16 @@
     senderType: number = 1;
     senderName: string = "";
     senderAvatar: string = "";
+    msgType: string = "text";
     bodyText: string = "";
+    imageUrl: string = "";
+    imageAtts: ImMsgAtt[] = [];
+    linkAtts: ImMsgAtt[] = [];
+    replyId: string = "";
+    replySenderName: string = "";
+    replyRevoked: boolean = false;
+    replyIsImage: boolean = false;
+    replyText: string = "";
     digest: string = "";
     revoked: boolean = false;
     sendTime: number = 0;
@@ -203,6 +287,11 @@
   const hasMore = ref<boolean>(false);
   const loadingOlder = ref<boolean>(false);
   const scrollAnchor = ref<string>("");
+
+  // ===== 「定位到聊天位置」高亮（引用详情页跳回后背景快速切换） =====
+  const highlightId = ref<string>("");
+  let pendingJumpId = "";
+  let pageVisible = false;
 
   // ===== 当前用户（区分我方/对方消息） =====
   const myUserId = ref<string>("");
@@ -283,6 +372,73 @@
     return msg.digest;
   }
 
+  /** URL 是否指向图片（按扩展名兜底，mime 缺失时用）。 */
+  function isImageUrl(url: string): boolean {
+    const lower = url.toLowerCase();
+    return (
+      lower.indexOf(".png") > 0 ||
+      lower.indexOf(".jpg") > 0 ||
+      lower.indexOf(".jpeg") > 0 ||
+      lower.indexOf(".gif") > 0 ||
+      lower.indexOf(".webp") > 0 ||
+      lower.indexOf(".bmp") > 0
+    );
+  }
+
+  /** 附件是图片：mime 以 image/ 开头，或 URL 是图片扩展名（与引用详情页同规则）。 */
+  function isImageAtt(att: ImMsgAtt): boolean {
+    if (att.mime.indexOf("image/") == 0) {
+      return true;
+    }
+    return att.url.length > 0 && isImageUrl(att.url);
+  }
+
+  /** 提取链接的域名（无协议时原样截到首个 / 前止）。 */
+  function hostOf(url: string): string {
+    const marker = "://";
+    const at = url.indexOf(marker);
+    let rest = at >= 0 ? url.substring(at + marker.length) : url;
+    const slash = rest.indexOf("/");
+    if (slash >= 0) {
+      rest = rest.substring(0, slash);
+    }
+    return rest;
+  }
+
+  /** 纯链接文本消息（整条就是一个 URL、无空格）：按微信同款蓝色链接字渲染。 */
+  function isUrlMsg(msg: ImMsgRow): boolean {
+    if (msg.msgType != "text") {
+      return false;
+    }
+    const text = msg.bodyText.trim();
+    return (
+      (text.indexOf("http://") == 0 || text.indexOf("https://") == 0) &&
+      text.indexOf(" ") < 0
+    );
+  }
+
+  /** 引用块预览文案：撤回 > 图片 > 正文，兜底按文件（微信同款）。 */
+  function quotePreview(msg: ImMsgRow): string {
+    if (msg.replyRevoked) {
+      return t("Mobile.Message.quoteRevoked");
+    }
+    if (msg.replyIsImage) {
+      return t("Mobile.Message.quoteImage");
+    }
+    if (msg.replyText.length > 0) {
+      return msg.replyText;
+    }
+    return t("Mobile.Message.quoteFile");
+  }
+
+  /** 气泡正文样式：我方白字；纯链接消息用链接蓝（我方气泡内用浅一档保对比度）。 */
+  function textClassOf(msg: ImMsgRow): string {
+    if (isMine(msg)) {
+      return isUrlMsg(msg) ? "chat-bubble__text--link-mine" : "chat-bubble__text--mine";
+    }
+    return isUrlMsg(msg) ? "chat-bubble__text--link" : "";
+  }
+
   /** MessageDto → 行（历史接口按 seq 降序返回，这里只做单行解析）。 */
   function readMsgRow(obj: UTSJSONObject): ImMsgRow {
     const row = new ImMsgRow();
@@ -292,11 +448,50 @@
     row.senderType = readNumber(obj, "senderType", 1);
     row.senderName = readString(obj, "senderName");
     row.senderAvatar = readString(obj, "senderAvatar");
-    // body=null（撤回/审核拦截）不出气泡；正常 text 消息读 body.text
+    row.msgType = readString(obj, "msgType");
+    // body=null（撤回/审核拦截）不出气泡；text 读 body.text，image 读 body.url，
+    // rich_text 读 body.text + body.attachments（图片附件与文件/链接附件分开存）
     const bodyRaw = obj["body"];
     if (bodyRaw != null) {
       const body = bodyRaw as UTSJSONObject;
       row.bodyText = readString(body, "text");
+      if (row.msgType == "image") {
+        row.imageUrl = readString(body, "url");
+      }
+      const attsRaw = body["attachments"];
+      if (attsRaw != null) {
+        const atts = attsRaw as UTSJSONObject[];
+        for (let i = 0; i < atts.length; i++) {
+          const att = new ImMsgAtt();
+          att.url = readString(atts[i], "url");
+          att.fileName = readString(atts[i], "fileName");
+          att.mime = readString(atts[i], "mime");
+          if (att.url.length == 0) {
+            continue;
+          }
+          if (isImageAtt(att)) {
+            row.imageAtts.push(att);
+          } else {
+            row.linkAtts.push(att);
+          }
+        }
+      }
+    }
+    // 引用消息：服务端在 replyTo 里展开原消息（最多一层）
+    row.replyId = readString(obj, "replyToMsgId");
+    const replyRaw = obj["replyTo"];
+    if (replyRaw != null) {
+      const reply = replyRaw as UTSJSONObject;
+      row.replySenderName = readString(reply, "senderName");
+      row.replyRevoked = readNumber(reply, "msgStatus", 1) == 2;
+      if (readString(reply, "msgType") == "image") {
+        row.replyIsImage = true;
+      }
+      const replyBodyRaw = reply["body"];
+      if (replyBodyRaw != null) {
+        const replyBody = replyBodyRaw as UTSJSONObject;
+        row.replyText = readString(replyBody, "text");
+      }
     }
     row.digest = readString(obj, "digest");
     row.revoked = readNumber(obj, "msgStatus", 1) == 2;
@@ -381,6 +576,39 @@
     });
   }
 
+  /**
+   * /api/f/ 受保护媒体：<image> 带不了 Bearer（H5 会被 ORB 拦成 net::ERR_BLOCKED_BY_ORB），
+   * 经 resolveDisplayImageUrl 带 Bearer 拉取换成可展示地址（H5 blob / App 临时文件），
+   * 解析成功后原位替换；普通地址原样保留。
+   */
+  function resolveRowMedia(row: ImMsgRow): void {
+    if (row.imageUrl.length > 0) {
+      const url = row.imageUrl;
+      resolveDisplayImageUrl(url, 300, 300)
+        .then((resolved: string) => {
+          if (resolved != url) {
+            row.imageUrl = resolved;
+          }
+        })
+        .catch((_e: any | null) => {
+          // 失败保留原地址：交给 <image> 兜底（如平台 Cookie 命中的场景）
+        });
+    }
+    for (let i = 0; i < row.imageAtts.length; i++) {
+      const att = row.imageAtts[i];
+      const url = att.url;
+      resolveDisplayImageUrl(url, 260, 260)
+        .then((resolved: string) => {
+          if (resolved != url) {
+            att.url = resolved;
+          }
+        })
+        .catch((_e: any | null) => {
+          // 同上
+        });
+    }
+  }
+
   /** 首屏 + 向上翻页共用：beforeSeq<=0 取最新一页，否则取 seq<beforeSeq 的更早一页。 */
   async function loadHistory(beforeSeq: number): Promise<void> {
     const res = await apiImMessages(convId.value, beforeSeq, MSG_PAGE_SIZE);
@@ -404,6 +632,10 @@
     // 返回为降序（新→旧）；列表升序存，逐条 unshift 后头部即为最旧
     for (let i = rows.length - 1; i >= 0; i--) {
       messages.value.unshift(rows[i]);
+    }
+    // 新插入的行统一补解析受保护图片（经 messages.value 取代理实例，改属性才会触发刷新）
+    for (let i = 0; i < rows.length; i++) {
+      resolveRowMedia(messages.value[i]);
     }
     reportReadIfNeeded(maxSeq());
   }
@@ -501,6 +733,143 @@
     }
   }
 
+  /** 图片消息点击：全屏放大预览。 */
+  function handleImageMsgTap(msg: ImMsgRow): void {
+    if (msg.imageUrl.length == 0) {
+      return;
+    }
+    uni.previewImage({ urls: [msg.imageUrl], current: msg.imageUrl });
+  }
+
+  /** rich_text 图片附件点击：全屏放大预览。 */
+  function handleAttImageTap(msg: ImMsgRow, att: ImMsgAtt): void {
+    if (att.url.length == 0) {
+      return;
+    }
+    uni.previewImage({ urls: [att.url], current: att.url });
+  }
+
+  /** 文件/链接附件点击：/api/f/ 受保护链接优先「打开页面」（对齐微信）；普通链接走统一外链打开。 */
+  function handleLinkAttTap(att: ImMsgAtt): void {
+    if (att.url.length == 0) {
+      return;
+    }
+    if (isAuthProtectedFileUrl(att.url)) {
+      openAuthProtectedLinkUrl(att.url).catch((_e: any | null) => {
+        uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+      });
+      return;
+    }
+    handleExternalLink(att.url, att.fileName);
+  }
+
+  /** 纯链接文本点击：整条即链接，直接打开（微信交互）。 */
+  function handleLinkTextTap(msg: ImMsgRow): void {
+    if (isUrlMsg(msg)) {
+      handleExternalLink(msg.bodyText.trim(), "");
+    }
+  }
+
+  /** 引用块点击：进全屏引用详情页（左下角可「定位到聊天位置」跳回）。 */
+  function handleQuoteTap(msg: ImMsgRow): void {
+    if (msg.replyId.length == 0 || convId.value.length == 0) {
+      return;
+    }
+    uni.navigateTo({
+      url: `/pages/message/quote-detail?convId=${convId.value}&msgId=${msg.replyId}`,
+    });
+  }
+
+  // ===== 「定位到聊天位置」：滚动定位 + 背景快速切换高亮 =====
+  let flashTimers: number[] = [];
+
+  /** 高亮闪烁：亮 350ms → 灭 300ms → 再亮 350ms（参考微信的快速切换展示）。 */
+  function flashHighlight(msgId: string): void {
+    clearFlashTimers();
+    highlightId.value = msgId;
+    flashTimers.push(
+      setTimeout(() => {
+        highlightId.value = "";
+      }, 350)
+    );
+    flashTimers.push(
+      setTimeout(() => {
+        highlightId.value = msgId;
+      }, 650)
+    );
+    flashTimers.push(
+      setTimeout(() => {
+        highlightId.value = "";
+      }, 1000)
+    );
+  }
+
+  function clearFlashTimers(): void {
+    for (let i = 0; i < flashTimers.length; i++) {
+      clearTimeout(flashTimers[i]);
+    }
+    flashTimers.splice(0, flashTimers.length);
+    highlightId.value = "";
+  }
+
+  function findMsgById(msgId: string): ImMsgRow | null {
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].msgId == msgId) {
+        return rows[i];
+      }
+    }
+    return null;
+  }
+
+  /** 引用详情页 emit 的跳转事件（payload 为目标 msgId 字符串）。 */
+  function onJumpEvent(data: any): void {
+    const msgId = data == null ? "" : `${data}`;
+    if (msgId.length == 0) {
+      return;
+    }
+    pendingJumpId = msgId;
+    jumpToMsg(msgId);
+  }
+
+  /** 应用待定位：滚到目标行并闪烁高亮（幂等，消费 pendingJumpId）。 */
+  function applyPendingJump(): void {
+    const msgId = pendingJumpId;
+    if (msgId.length == 0) {
+      return;
+    }
+    if (findMsgById(msgId) == null) {
+      return;
+    }
+    pendingJumpId = "";
+    scrollAnchor.value = "";
+    nextTick(() => {
+      scrollAnchor.value = `msg-${msgId}`;
+      flashHighlight(msgId);
+    });
+  }
+
+  /**
+   * 定位到某条消息：不在已加载区间则持续向前翻页（最多 15 页）。
+   * ★滚动/高亮不在本函数直接做：emit 时本页还被 quote-detail 盖着，隐藏状态下
+   *   scroll-into-view 不生效——统一延到 onShow（页面重新可见）后再应用。
+   */
+  async function jumpToMsg(msgId: string): Promise<void> {
+    let pages = 0;
+    while (findMsgById(msgId) == null && pages < 15) {
+      if (loading.value || loadFailed.value || messages.value.length == 0 || hasMore.value != true) {
+        break;
+      }
+      pages++;
+      const oldestSeq = messages.value[0].seq;
+      await loadHistory(oldestSeq);
+    }
+    if (pageVisible) {
+      // 页面本就可见（数据补齐即可应用）：onShow 不会再触发，这里直接应用
+      applyPendingJump();
+    }
+  }
+
   function toggleVoiceMode(): void {
     voiceMode.value = voiceMode.value != true;
   }
@@ -543,7 +912,14 @@
   }
 
   function handleBack(): void {
-    uni.navigateBack({});
+    // 浏览器刷新后本页成为栈底（getCurrentPages 仅剩本页）：navigateBack 无页可退，
+    // H5 会退化成整页重载当前 URL（表现为"一直退不出去、不停刷新"）——栈底直接切回消息 tab
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
   }
 
   // ===== 头像 =====
@@ -618,6 +994,28 @@
     } else {
       loadFailed.value = true;
     }
+    // 引用详情页「定位到聊天位置」：跳回本页后滚动定位并闪烁高亮目标消息
+    uni.$on(IM_CHAT_JUMP_EVENT, onJumpEvent);
+  });
+
+  onUnload(() => {
+    uni.$off(IM_CHAT_JUMP_EVENT, onJumpEvent);
+    clearFlashTimers();
+  });
+
+  onShow(() => {
+    pageVisible = true;
+    if (pendingJumpId.length == 0) {
+      return;
+    }
+    // 从 quote-detail 返回本页后再滚动定位并闪烁（延迟一拍等页面切换完成）
+    setTimeout(() => {
+      applyPendingJump();
+    }, 100);
+  });
+
+  onHide(() => {
+    pageVisible = false;
   });
 </script>
 
@@ -800,6 +1198,119 @@
 
   .chat-bubble__text--mine {
     color: #ffffff;
+  }
+
+  /* 纯链接文本：微信同款链接蓝（我方紫底气泡内用浅一档保对比度） */
+  .chat-bubble__text--link {
+    color: #576b95;
+  }
+
+  .chat-bubble__text--link-mine {
+    color: #9fb0ff;
+  }
+
+  /* ===== 引用块（气泡内灰底，点击进全屏引用详情） ===== */
+  .chat-quote {
+    align-self: stretch;
+    margin-bottom: 12rpx;
+    padding: 14rpx 18rpx;
+    background-color: rgba(0, 0, 0, 0.05);
+    border-radius: 10rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-quote--mine {
+    background-color: rgba(255, 255, 255, 0.16);
+  }
+
+  .chat-quote__name {
+    max-width: 100%;
+    margin-bottom: 4rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    font-weight: 500;
+    color: #576b95;
+  }
+
+  .chat-quote__name--mine {
+    color: #cfd6ff;
+  }
+
+  .chat-quote__text {
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #6b6976;
+  }
+
+  .chat-quote__text--mine {
+    color: rgba(255, 255, 255, 0.82);
+  }
+
+  /* ===== 图片消息：不进气泡，300rpx 方形缩略，点击全屏放大 ===== */
+  .chat-image {
+    width: 300rpx;
+    height: 300rpx;
+    border-radius: 12rpx;
+    background-color: #ecebf1;
+  }
+
+  .chat-image--att {
+    width: 260rpx;
+    height: 260rpx;
+    margin-top: 12rpx;
+  }
+
+  /* ===== 文件/链接附件卡片：图标 + 文案 + 域名，点击打开链接 ===== */
+  .chat-link {
+    align-self: stretch;
+    margin-top: 12rpx;
+    padding: 16rpx 18rpx;
+    background-color: #f7f6fb;
+    border-radius: 12rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .chat-link__icon-wrap {
+    width: 64rpx;
+    height: 64rpx;
+    border-radius: 12rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .chat-link__col {
+    flex: 1;
+    min-width: 0;
+    margin-left: 16rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-link__title {
+    font-size: 26rpx;
+    line-height: 36rpx;
+    color: #22212a;
+  }
+
+  .chat-link__host {
+    margin-top: 4rpx;
+    font-size: 22rpx;
+    line-height: 30rpx;
+    color: #9a98a5;
+  }
+
+  /* 定位到消息：背景快速切换高亮（外层整行铺底，不改变布局） */
+  .chat-msg--flash {
+    background-color: rgba(255, 213, 79, 0.45);
+    border-radius: 12rpx;
   }
 
   .chat-status {

@@ -102,6 +102,30 @@ console.log(`[offline-h5:uni-app-x] app-bundle.js ${(bundle.length / 1048576).to
 // --- 4. 复制运行期资源 -------------------------------------------------------
 let fileCount = 0;
 let totalBytes = 0;
+// 体积治理排除清单（整目录，包内相对路径）。准入双证据：全产物（JS/CSS/HTML）零路径引用
+// + 闭包探测确认运行时不加载（语法已内联进 parser、App 原生专属资源等）。
+// 运行时拼路径 fetch 无法静态穷举，新增条目前必须先跑真机/浏览器闭包探测；
+// 被运行时 fetch 的路径（如 static/uni-highlight/_onig.wasm、static/uni-cmark/*.wasm）不得进入。
+const EXCLUDED_RESOURCES = [
+  'static/splash',                        // App 原生启动图（manifest 引用），H5 运行时 0 引用
+  'static/app-icon',                      // App 图标，0 引用
+  'static/icons',                         // 0 引用
+  'static/iconfont',                      // 0 引用
+  'static/filetree',                      // 0 引用（file-tree 组件实际用 static/images）
+  'static/harmony-icon',                  // 鸿蒙原生图标，0 引用
+  'modules/uni-ai-x/static/grammar',      // 61 个语法已内联进 aiMsgMarkdownParser，独立文件 0 引用
+  'modules/uni-highlight/static/grammar', // 同上；高亮引擎 wasm 走 static/uni-highlight/_onig.wasm（保留）
+  'modules/uni-ai-x/static/ai-provider',  // 0 引用
+];
+const excludedSet = new Set(EXCLUDED_RESOURCES);
+function isExcludedResource(src) {
+  // SRC 相对路径 → 包内路径（uni_modules/ 拷贝时改名为 modules/）
+  let rel = path.relative(SRC, src).split(path.sep).join('/');
+  if (rel === 'uni_modules' || rel.startsWith('uni_modules/')) rel = 'modules/' + rel.slice('uni_modules/'.length);
+  const parts = rel.split('/');
+  for (let i = 1; i <= parts.length; i++) if (excludedSet.has(parts.slice(0, i).join('/'))) return true;
+  return false;
+}
 function copyTree(from, to, filter) {
   if (!fs.existsSync(from)) return;
   fs.cpSync(from, to, {
@@ -109,6 +133,7 @@ function copyTree(from, to, filter) {
     filter: (src) => {
       const rel = path.relative(SRC, src);
       if (rel.split(path.sep)[0] === 'static' && rel.split(path.sep)[1] === 'app') return false; // 递归防护
+      if (isExcludedResource(src)) return false; // 体积治理排除（见 EXCLUDED_RESOURCES）
       return filter ? filter(src) : true;
     },
   });
@@ -158,10 +183,11 @@ function walkCss(dir) {
 }
 walkCss(OUT);
 
-// 注意：不做任何「按引用猜测裁文件 / 改写字体声明」类体积优化。
+// 注意：不做任何「按引用猜测裁单个文件 / 改写字体声明」类体积优化。
 // 字面路径扫描看不到运行时拼接的资源路径（fetch('a/'+name+'.json')、worker、动态 import），
-// 误删后是静默 404（已实证：页面挂载成功 0 报错但整页白屏）。体积优化必须回到源头：
-// 用官方机制出「内嵌精简版 H5」（pages 子集构建），而不是对发行产物做事后文件手术。
+// 误删后是静默 404（已实证：页面挂载成功 0 报错但整页白屏）。体积治理只走两条路：
+// (1) 源头 pages 子集构建（build-offline-h5.mjs 编译期收窄，未列页面不进 bundle）；
+// (2) 上方 EXCLUDED_RESOURCES 整目录排除（双证据准入，见其注释），不做逐文件手术。
 
 // --- 6. 重写 index.html ------------------------------------------------------
 // 通用桥与项目配置适配脚本是源码文件，不再用“DOM 非空”猜测应用就绪。
@@ -219,6 +245,8 @@ function inventory(dir) {
   }
 }
 inventory(OUT);
+const leaked = entries.filter((entry) => EXCLUDED_RESOURCES.some((p) => entry.path === p || entry.path.startsWith(p + '/')));
+if (leaked.length > 0) fail(`排除清单失效，产物仍包含：${leaked.slice(0, 3).map((e) => e.path).join(', ')}`);
 const stampPath = path.join(ROOT, 'unpackage/offline-h5-source.json');
 if (!fs.existsSync(stampPath)) fail('缺少 HBuilderX 编译来源记录，请运行 pnpm offline-h5:build');
 const sourceStamp = JSON.parse(fs.readFileSync(stampPath, 'utf8'));

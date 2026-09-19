@@ -70,11 +70,18 @@ pnpm offline-h5:prepare（scripts/prepare-offline-h5.mjs）
 
 offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
   1. 记录源码指纹；把 static/app/offline-h5 临时移出（防递归复制）
-  2. HBuilderX 内置编译器出 Web 产物 → unpackage/offline-h5-web（独立目录，不影响线上部署产物）
+  2. pages.json 临时替换为离线子集（bootstrap 默认页 + agent-detail + app-details，无 tabBar），
+     HBuilderX 内置编译器出 Web 产物 → unpackage/offline-h5-web（独立目录，不影响线上部署产物）；
+     编译结束（无论成败）立即恢复原 pages.json，保证指纹校验通过。
+     离线入口页内跳转一律走 uni.webView 桥交原生；新增「纯 H5 路由跳转」的目标页必须加入子集，否则路由 miss 白屏
   3. 派生（scripts/offline-h5/derive-uni-app-x.mjs）：
-     esbuild 把 ESM 入口打成 IIFE app-bundle.js（WebView 禁 file:// 加载 ES module）
+     esbuild 把 ESM 入口打成 IIFE app-bundle.js（WebView 禁 file:// 加载 ES module；页面 chunk 全部内联，
+     运行时的 chunk 预取 404 为良性噪音，与全量包行为一致）
      改写 /m/ 绝对引用、import_meta.url、uni_modules/ → modules/
      **/static/web/ 目录段改名 static/webres/（uni 编译器把它当 web 平台资源静默剔除）
+     体积治理：EXCLUDED_RESOURCES 整目录排除（App 专属启动图/图标、双份 grammar、ai-provider），
+     准入双证据＝全产物零路径引用 + 闭包探测（http 伺服 + 浏览器过一遍真实渲染看请求清单）；
+     被运行时 fetch 的路径（static/uni-highlight/_onig.wasm、static/uni-cmark/*.wasm、proxy-web 全套）不得排除
      重写 index.html：注入桥脚本、去跳转/验证码脚本、启动骨架
      生成 offline-h5-manifest.json（全量文件 sha256 清单 + 源码指纹）
   4. stage 校验后原子替换
@@ -86,8 +93,8 @@ offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
 |---|---|---|
 | `components/offline-h5-container/` | 容器通用件：壳 / 状态机 / 项目适配 / 页面约定 / 软导航 / 协议源码（bridge、project-bootstrap 随源码提交，构建时拷入包根） | ✅ |
 | `scripts/offline-h5/`、`scripts/*-offline-h5.mjs` | 构建脚本与单测 | ✅ |
-| `unpackage/offline-h5-web/` | 中间 Web 产物 | ❌ 已 ignore |
-| `unpackage/offline-h5/` | 派生后的离线包 stage（507 文件 / ~25MB：app-bundle.js、index.html、assets/、static/、modules/、subpackages/、offline-h5-bridge.js、offline-h5-project-bootstrap.js、offline-h5-manifest.json） | ❌ |
+| `unpackage/offline-h5-web/` | 中间 Web 产物 | ❌ 已 ignore；构建成功后自动清理（`OFFLINE_H5_KEEP_WEB=1` 保留排查现场） |
+| `unpackage/offline-h5/` | 派生后的离线包 stage（pages 子集 + 资源排除后 353 文件 / ~15.6MB，全量时 523 文件 / ~25.4MB：app-bundle.js、index.html、assets/、static/、modules/、subpackages/、offline-h5-bridge.js、offline-h5-project-bootstrap.js、offline-h5-manifest.json） | ❌ |
 | `unpackage/offline-h5-source.json` | 源码指纹戳 | ❌ |
 | `static/app/offline-h5/`（及 `.installing/` / `.previous/`） | 安装目录，HBuilderX 据此打进 App | ❌ |
 | `unpackage/dist/dev/app-*/static/app/offline-h5/` | 最终 App 编译产物里的包 | ❌（自动校验对象） |

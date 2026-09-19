@@ -12,6 +12,12 @@ import { t } from "@/utils/i18n.uts";
 import { orEmpty, orNumber, orString } from "@/utils/utsCoalesce";
 import { applyBearerAuthorization } from "@/utils/authSession";
 
+// #ifdef APP-ANDROID
+import Uri from "android.net.Uri";
+import File from "java.io.File";
+import FileOutputStream from "java.io.FileOutputStream";
+// #endif
+
 function readObjectField(obj: UTSJSONObject | null, key: string): any | null {
   if (obj == null) {
     return null;
@@ -123,6 +129,65 @@ function buildUploadHeaders(): UTSJSONObject {
 }
 
 /**
+ * Android 系统文件选择器返回的通常是 content:// URI，而 uni.uploadFile 内部仍会
+ * 尝试按文件路径查询 `_data` 列；部分 Provider 不提供该列，会直接抛出 CursorWindow
+ * col -1。上传前通过 ContentResolver 把内容复制到应用缓存，交给上传器真实路径。
+ */
+function prepareUploadFilePath(filePath: string, uid: string): string {
+  // #ifdef APP-ANDROID
+  if (filePath.indexOf("content://") != 0) {
+    return filePath;
+  }
+  try {
+    const context = UTSAndroid.getAppContext();
+    if (context == null) {
+      throw new Error("Android context unavailable");
+    }
+    const uri = Uri.parse(filePath);
+    const input = context.getContentResolver().openInputStream(uri);
+    if (input == null) {
+      throw new Error("Cannot open selected file");
+    }
+    let extension = ".tmp";
+    const lastSegmentRaw = uri.getLastPathSegment();
+    if (lastSegmentRaw != null) {
+      const lastSegment = `${lastSegmentRaw}`;
+      const dotIndex = lastSegment.lastIndexOf(".");
+      if (dotIndex >= 0 && lastSegment.length - dotIndex <= 12) {
+        extension = lastSegment.substring(dotIndex);
+      }
+    }
+    const target = new File(
+      context.getCacheDir(),
+      "nuwax_upload_" + uid + extension,
+    );
+    const output = new FileOutputStream(target);
+    try {
+      const buffer = new ByteArray(1024 * 16);
+      let readCount = input.read(buffer);
+      while (readCount != -1) {
+        output.write(buffer, 0, readCount);
+        readCount = input.read(buffer);
+      }
+      output.flush();
+    } finally {
+      input.close();
+      output.close();
+    }
+    const resolvedPath = target.getAbsolutePath();
+    console.log("[fileUploader] materialized content uri path=" + resolvedPath);
+    return resolvedPath;
+  } catch (error) {
+    console.error("[fileUploader] materialize content uri failed:", error);
+    throw error;
+  }
+  // #endif
+  // #ifndef APP-ANDROID
+  return filePath;
+  // #endif
+}
+
+/**
  * 上传单个文件到服务器
  *
  * @param filePath 本地临时文件路径
@@ -134,19 +199,27 @@ export function uploadSingleFile(
   filePath: string,
   uid: string,
   onProgress?: (percent: number) => void,
+  displayFileName: string = "",
 ): Promise<UploadResult> {
   const header = buildUploadHeaders();
 
   const progressCallback = onProgress;
 
   return new Promise((resolve, _reject) => {
-    const lastSegment = filePath.split("/").pop();
+    let uploadPath = filePath;
+    try {
+      uploadPath = prepareUploadFilePath(filePath, uid);
+    } catch (_prepareError) {
+      resolve(createFailedUploadResult(t("Mobile.FileUploader.uploadFailed")));
+      return;
+    }
+    const lastSegment = uploadPath.split("/").pop();
     const fileName = orString(lastSegment as any, "file");
     const formDataObj = new UTSJSONObject();
     formDataObj["type"] = "tmp";
     const uploadTask: UploadTask = uni.uploadFile({
       url: getUploadFileAction(),
-      filePath: filePath,
+      filePath: uploadPath,
       name: "file",
       header: header,
       formData: formDataObj,
@@ -183,10 +256,12 @@ export function uploadSingleFile(
           if (codeText == SUCCESS_CODE) {
             const uploadedFile = new UploadFileInfo();
             uploadedFile.key = orEmpty(readObjectField(dataObj, "key"));
-            uploadedFile.name = orString(
+            const serverFileName = orString(
               readObjectField(dataObj, "fileName"),
               fileName,
             );
+            uploadedFile.name =
+              displayFileName.length > 0 ? displayFileName : serverFileName;
             uploadedFile.type = orString(
               readObjectField(dataObj, "mimeType"),
               "application/octet-stream",

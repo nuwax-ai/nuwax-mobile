@@ -62,6 +62,11 @@ class NativeMediaBridge {
 
   /** 选择结果回调（由 chat-input-phone 注入） */
   private resultHandler: NativeMediaResultHandler | null = null
+  /** JSSDK 尚未加载时暂存选择指令，避免详情页首次点击被直接丢弃。 */
+  private pendingPosts: UTSJSONObject[] = []
+  private postFlushTimer: number = 0
+  private postAttempts: number = 0
+  private static readonly POST_MAX_ATTEMPTS: number = 25
 
   isActive(): boolean {
     return this.enabled
@@ -108,27 +113,62 @@ class NativeMediaBridge {
     if (this.enabled != true) {
       return
     }
+    if (this.tryPost(payload) != true) {
+      this.pendingPosts.push(payload)
+      this.schedulePostFlush()
+    } else {
+      this.pendingPosts = []
+      this.postAttempts = 0
+    }
+  }
+
+  /** 单次发送；兼容 JSSDK 与 uni-app x 原生直接注入的两种桥。 */
+  private tryPost(payload: UTSJSONObject): boolean {
     // #ifdef H5 || WEB
     try {
       const w = window as any
       if (w == null) {
-        return
+        return false
       }
+      const wrapped = { "data": payload }
       const uniGlobal = w.uni
-      if (
-        uniGlobal == null ||
-        uniGlobal.webView == null ||
-        uniGlobal.webView.postMessage == null
-      ) {
-        // JSSDK 尚未就绪：再尝试注入一次（原生侧 evalJS 也会注入，双保险）
-        this.injectJssdk()
-        return
+      if (uniGlobal != null && uniGlobal.webView != null && uniGlobal.webView.postMessage != null) {
+        uniGlobal.webView.postMessage(wrapped)
+        return true
       }
-      uniGlobal.webView.postMessage({ "data": payload })
+      if (w.__uniapp_x_postMessage != null) {
+        w.__uniapp_x_postMessage(wrapped)
+        return true
+      }
+      if (w.__uniapp_x_ != null && w.__uniapp_x_.postMessage != null) {
+        w.__uniapp_x_.postMessage(JSON.stringify(wrapped))
+        return true
+      }
+      // JSSDK 尚未就绪：尝试注入并交给重试队列。
+      this.injectJssdk()
+      return false
     } catch (e) {
       console.warn("[native-media] postMessage failed", e)
+      return false
     }
     // #endif
+    return false
+  }
+
+  private schedulePostFlush(): void {
+    if (this.postFlushTimer != 0) return
+    this.postFlushTimer = setTimeout((): void => {
+      this.postFlushTimer = 0
+      if (this.postAttempts >= NativeMediaBridge.POST_MAX_ATTEMPTS) {
+        this.pendingPosts = []
+        this.postAttempts = 0
+        return
+      }
+      this.postAttempts += 1
+      const pending = this.pendingPosts
+      this.pendingPosts = []
+      for (let i = 0; i < pending.length; i++) this.post(pending[i])
+    }, 200) as number
   }
 
   /**

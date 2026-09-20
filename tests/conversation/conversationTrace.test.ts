@@ -16,6 +16,7 @@ import {
   getToolTraceActionKind,
   projectTurnTrace,
   stripContainerTags,
+  toolGroupCountI18nKey,
   toolTraceActionI18nKey,
   TurnTraceInput,
   type TraceItem,
@@ -811,5 +812,35 @@ describe("工具函数", () => {
       { kind: "generic" } as TraceToolRow,
     ];
     expect(collectActionKinds(rows)).toEqual(["file-read", "terminal", "generic"]);
+  });
+
+  it("toolGroupCountI18nKey：终态计数 key 与 isCreate 变体", () => {
+    expect(toolGroupCountI18nKey("terminal", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountTerminal",
+    );
+    expect(toolGroupCountI18nKey("file-read", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountFileRead",
+    );
+    expect(toolGroupCountI18nKey("file-edit", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountFileEdit",
+    );
+    expect(toolGroupCountI18nKey("file-edit", true)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountFileCreate",
+    );
+    expect(toolGroupCountI18nKey("search", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountSearch",
+    );
+    expect(toolGroupCountI18nKey("browser", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountBrowser",
+    );
+    expect(toolGroupCountI18nKey("skill", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountSkill",
+    );
+    expect(toolGroupCountI18nKey("todo", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountPlan",
+    );
+    expect(toolGroupCountI18nKey("unknown-kind", false)).toBe(
+      "Mobile.Chat.WorkTrace.toolGroupCountGeneric",
+    );
   });
 });

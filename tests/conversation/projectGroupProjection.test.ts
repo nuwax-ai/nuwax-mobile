@@ -10,6 +10,10 @@ import {
   projectTypeLabelKey,
   ProjectChildView,
   ProjectGroupView,
+  computeProjectHasMore,
+  needsProjectChase,
+  appendProjectGroupsDedup,
+  mapProjectTotalPages,
 } from "@/utils/projectGroupProjection.uts";
 
 /** 恒等 formatter：仅验证 modified 被传入，时间文案内容不在本测试范围 */
@@ -142,5 +146,53 @@ describe("projectTypeLabelKey", () => {
     expect(projectTypeLabelKey("UserApp")).toBe("Mobile.Project.typeUserApp");
     expect(projectTypeLabelKey("")).toBe("");
     expect(projectTypeLabelKey("Agent")).toBe("");
+  });
+});
+
+describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
+  it("computeProjectHasMore：pages 回读优先，未回读退满页判定", () => {
+    // 回读 3 页拉完 2 页 → 还有
+    expect(computeProjectHasMore(2, 3, 20, 20)).toBe(true);
+    // 回读 3 页拉完 3 页 → 没有
+    expect(computeProjectHasMore(3, 3, 20, 20)).toBe(false);
+    // 未回读（pages=0）：满页视为还有
+    expect(computeProjectHasMore(1, 0, 20, 20)).toBe(true);
+    // 未回读：不满页 → 没有
+    expect(computeProjectHasMore(2, 0, 7, 20)).toBe(false);
+  });
+
+  it("needsProjectChase：可见行够量即停，不足且还有更多才追拉", () => {
+    // 可见 12 ≥ 10 → 不追
+    expect(needsProjectChase(12, 10, 1, 3, 20, 20)).toBe(false);
+    // 可见 4 < 10 且还有 → 追
+    expect(needsProjectChase(4, 10, 1, 3, 20, 20)).toBe(true);
+    // 可见不足但已到最后一页 → 不追
+    expect(needsProjectChase(4, 10, 3, 3, 20, 20)).toBe(false);
+    // 可见不足、未回读 pages 但上页不满 → 不追
+    expect(needsProjectChase(4, 10, 1, 0, 8, 20)).toBe(false);
+  });
+
+  it("appendProjectGroupsDedup：同 id 保留先到，不同 id 全追加", () => {
+    const a = new ProjectGroupView();
+    a.id = 1;
+    a.name = "first";
+    const b = new ProjectGroupView();
+    b.id = 2;
+    const dup = new ProjectGroupView();
+    dup.id = 1;
+    dup.name = "later";
+    const merged = appendProjectGroupsDedup([a, b], [dup]);
+    expect(merged.length).toBe(2);
+    expect(merged[0].name).toBe("first");
+    const c = new ProjectGroupView();
+    c.id = 3;
+    expect(appendProjectGroupsDedup([a], [c]).length).toBe(2);
+  });
+
+  it("mapProjectTotalPages：回读 pages 数值，缺失/非数回 0", () => {
+    expect(mapProjectTotalPages({ records: [], pages: 3 })).toBe(3);
+    expect(mapProjectTotalPages({ records: [], pages: "5" })).toBe(5);
+    expect(mapProjectTotalPages({ records: [] })).toBe(0);
+    expect(mapProjectTotalPages(null)).toBe(0);
   });
 });

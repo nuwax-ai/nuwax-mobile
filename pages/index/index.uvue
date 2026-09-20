@@ -218,12 +218,27 @@
       @select="handleWorkspaceDirSelect"
     />
 
-    <!-- 项目/任务抽屉（App v3）：左上角菜单唤起；「＋新建会话」上框到首页 -->
+    <!-- 项目/任务抽屉（App v3）：左上角菜单唤起 + 左缘右滑手势（见下方边缘条）；「＋新建会话」上框到首页 -->
     <project-task-drawer
       ref="drawerRef"
       :is-logged-in="isLoggedIn"
       @conversation-click="handleConversationClick"
       @pin-project="applyPinnedProject"
+    />
+
+    <!-- 左缘右滑呼出抽屉：透明边缘条抢手势（范式同 resident-chat-shell__edge-back，
+         避免起滑点落在 scroll-view 内被滚动手势拦截吃掉 touch）。
+         z-index 1：盖住滚动内容左缘，但低于分类面板(29/31)、输入区工具行(z2)、
+         键盘/快捷弹层态(40/500)与 H5 页内 TabBar(z20)；top 避开顶部导航行防盖汉堡菜单。
+         跟手期扩全屏持续收 touchmove，见 onEdgeSwipeTouchStart。 -->
+    <view
+      class="create-hub__edge-swipe"
+      :class="{ 'create-hub__edge-swipe--active': edgeSwipeExpanded }"
+      :style="edgeSwipeStripStyle"
+      @touchstart="onEdgeSwipeTouchStart"
+      @touchmove="onEdgeSwipeTouchMove"
+      @touchend="onEdgeSwipeTouchEnd"
+      @touchcancel="onEdgeSwipeTouchCancel"
     />
 
     <!-- iOS 常驻聊天壳 + 打开/换会话白遮罩（仅 iOS；Android / 鸿蒙走 zhuoda 独立页，不使用本壳） -->
@@ -301,7 +316,7 @@
   import { goToLogin } from "@/utils/authNavigation";
   import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
   import { applyTabBarI18n, emptyI18nParams, useI18n } from "@/utils/i18n";
-  import { setCurrentPageNavigationBarTitle } from "@/utils/system";
+  import { getEmbeddedStatusBarHeight, getStatusBarHeight, setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { orEmpty } from "@/utils/utsCoalesce.uts";
   import { PendingChatDraft } from "@/types/interfaces/pendingChatDraft";
   import { SelectedDocInfo } from "@/types/interfaces/knowledgeList";
@@ -1704,6 +1719,124 @@
     callRefMethod(drawerRef.value, "open");
   }
 
+  /** ── 左缘右滑呼出抽屉（快捷手势）──
+      透明边缘条（create-hub__edge-swipe）承接手势：方向锁 + 位移阈值，
+      move 为主、end 兜底（部分机型 move 丢事件）；滑入动画由 page-container 完成，
+      不做逐帧跟手（JS 逐帧跨桥写样式不丝滑，同 resident-chat-shell__edge-back 定调）。 */
+  let edgeSwipeTracking: boolean = false;
+  let edgeSwipeStartX: number = 0;
+  let edgeSwipeStartY: number = 0;
+  let edgeSwipeLocked: boolean = false;
+  let edgeSwipeFired: boolean = false;
+  /** 跟手期间扩成全屏，避免手指滑出边缘带后丢失 touchmove */
+  const edgeSwipeExpanded = ref<boolean>(false);
+
+  /** 避开顶部导航行（状态栏 + 12rpx 上内边距 + 72rpx 菜单钮），防止边缘条盖住汉堡菜单。
+      H5 内嵌页 getStatusBarHeight 恒 0，取注入的 embedded 高度参与比较（与 safety-zone 同源）。 */
+  const edgeSwipeStatusBarPx = getEmbeddedStatusBarHeight();
+  const edgeSwipeStripStyle = computed((): string => {
+    const st = getStatusBarHeight();
+    const emb = edgeSwipeStatusBarPx.value;
+    const top = (emb > st ? emb : st) + rpxToPx(84);
+    return `top:${top}px;`;
+  });
+
+  /** 右滑触发阈值：窗口宽 20%，下限 56px（对齐 resident-chat-shell__edge-back） */
+  function edgeSwipeMinDx(): number {
+    const w = rpxToPx(750);
+    const byRatio = w * 0.2;
+    return byRatio > 56 ? byRatio : 56;
+  }
+
+  function resetEdgeSwipeGesture(): void {
+    edgeSwipeTracking = false;
+    edgeSwipeLocked = false;
+    edgeSwipeExpanded.value = false;
+  }
+
+  function fireEdgeSwipeOpen(): void {
+    edgeSwipeFired = true;
+    resetEdgeSwipeGesture();
+    handleDrawerOpen();
+  }
+
+  function onEdgeSwipeTouchStart(e: UniTouchEvent): void {
+    resetEdgeSwipeGesture();
+    edgeSwipeFired = false;
+    // 分类面板 / 快捷弹层展开时不抢手势（层级已在其下，此处兜底）
+    if (categoryPanelMounted.value || homeQuickPopupVisible.value) {
+      return;
+    }
+    if (e == null || e.touches == null || e.touches.length == 0) {
+      return;
+    }
+    const t = e.touches[0];
+    if (t == null) {
+      return;
+    }
+    edgeSwipeTracking = true;
+    edgeSwipeExpanded.value = true;
+    edgeSwipeStartX = t.clientX;
+    edgeSwipeStartY = t.clientY;
+  }
+
+  function onEdgeSwipeTouchMove(e: UniTouchEvent): void {
+    if (edgeSwipeTracking != true || edgeSwipeFired == true) {
+      return;
+    }
+    if (e == null || e.touches == null || e.touches.length == 0) {
+      return;
+    }
+    const t = e.touches[0];
+    if (t == null) {
+      return;
+    }
+    const dx = t.clientX - edgeSwipeStartX;
+    const dy = t.clientY - edgeSwipeStartY;
+    const absDx = dx > 0 ? dx : -dx;
+    const absDy = dy > 0 ? dy : -dy;
+    if (edgeSwipeLocked != true) {
+      // 先竖后横（竖向滚动意图）直接放弃；横向上右且水平主导才锁定
+      if (absDy > 12 && absDy > absDx * 0.65) {
+        resetEdgeSwipeGesture();
+        return;
+      }
+      if (absDx > 8 && dx > 0 && absDx > absDy * 0.65) {
+        edgeSwipeLocked = true;
+      } else {
+        return;
+      }
+    }
+    if (dx < edgeSwipeMinDx()) {
+      return;
+    }
+    fireEdgeSwipeOpen();
+  }
+
+  function onEdgeSwipeTouchEnd(e: UniTouchEvent): void {
+    if (edgeSwipeTracking == true && edgeSwipeFired != true && e != null) {
+      const touches = e.changedTouches;
+      if (touches != null && touches.length > 0) {
+        const t = touches[0];
+        if (t != null) {
+          const dx = t.clientX - edgeSwipeStartX;
+          const dy = t.clientY - edgeSwipeStartY;
+          const absDx = dx > 0 ? dx : -dx;
+          const absDy = dy > 0 ? dy : -dy;
+          if (dx >= edgeSwipeMinDx() && absDx > absDy * 0.65) {
+            fireEdgeSwipeOpen();
+            return;
+          }
+        }
+      }
+    }
+    resetEdgeSwipeGesture();
+  }
+
+  function onEdgeSwipeTouchCancel(): void {
+    resetEdgeSwipeGesture();
+  }
+
   /** 抽屉会话点击 → 会话页 */
   function handleConversationClick(item: any): void {
     const obj = resObject(item);
@@ -1951,6 +2084,21 @@
     flex-direction: row;
     align-items: center;
     justify-content: center;
+  }
+
+  /* 左缘右滑呼出抽屉的透明边缘条：只占屏幕左缘，跟手期扩成全屏持续接收 touchmove。
+     top 由内联样式给出（状态栏 + 导航行高，避开汉堡菜单）；z-index 1 见模板注释。 */
+  .create-hub__edge-swipe {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 24px;
+    z-index: 1;
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .create-hub__edge-swipe--active {
+    width: 100%;
   }
 
   /* 页面主体：从上到下正常流，内容超出即垂直滚动 */

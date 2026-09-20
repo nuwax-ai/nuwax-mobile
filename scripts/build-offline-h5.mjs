@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** 先 HBuilderX 编译 Web，再派生离线包。默认仅本地构建，不托管、不发布。 */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -36,22 +37,36 @@ const OFFLINE_PAGES = {
   globalStyle: { navigationStyle: 'custom', navigationBarTextStyle: 'black', navigationBarBackgroundColor: '#F8F8F8', navigationBarTitleText: '加载中', backgroundColor: '#F8F8F8', rpxCalcMaxDeviceWidth: 960, rpxCalcBaseDeviceWidth: 375, rpxCalcIncludeWidth: 750, dynamicRpx: true },
 };
 
-// static/app 为派生安装目录；编译 Web 前临时移出，结束后恢复，避免递归复制。
-const installed = path.join(root, 'static/app/offline-h5');
-const saved = path.join(root, `unpackage/offline-h5-installed-${process.pid}`);
-// pages.json 同理：编译前临时替换为离线子集，编译结束（无论成败）立即恢复——
-// 源码指纹校验要求编译前后源码一致，pages.json 属于指纹覆盖范围。
-const pagesJson = path.join(root, 'pages.json');
-const savedPagesJson = path.join(root, `unpackage/pages.json.offline-${process.pid}`);
+// 离线子集必须在独立输入目录里编译。旧流程会临时覆盖仓库 pages.json，并移走
+// static/app/offline-h5；若 H5 开发服务同时运行，文件监听会立刻热更新成「无首页、无
+// tabBar」的离线清单，表现为白屏或底栏消失。临时工程既隔离 watcher，也天然避免
+// 已安装离线包被递归复制进 Web 产物。
+const buildRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nuwax-offline-h5-'));
+const excludedTopLevel = new Set(['.git', 'node_modules', 'unpackage', 'dist', 'out', '.diag']);
+
+function copyProjectInput() {
+  for (const name of fs.readdirSync(root)) {
+    if (excludedTopLevel.has(name)) continue;
+    const source = path.join(root, name);
+    const target = path.join(buildRoot, name);
+    fs.cpSync(source, target, {
+      recursive: true,
+      filter: (entry) => {
+        const relative = path.relative(root, entry).split(path.sep).join('/');
+        return relative !== 'static/app/offline-h5' && !relative.startsWith('static/app/offline-h5/');
+      },
+    });
+  }
+  fs.writeFileSync(path.join(buildRoot, 'pages.json'), JSON.stringify(OFFLINE_PAGES, null, 2));
+  const modules = path.join(root, 'node_modules');
+  if (fs.existsSync(modules)) fs.symlinkSync(modules, path.join(buildRoot, 'node_modules'), 'dir');
+}
+
 fs.mkdirSync(path.dirname(stage), { recursive: true });
-if (fs.existsSync(installed)) fs.renameSync(installed, saved);
-fs.copyFileSync(pagesJson, savedPagesJson);
-fs.writeFileSync(pagesJson, JSON.stringify(OFFLINE_PAGES, null, 2));
-let pagesSwapped = true;
 try {
-  execFileSync(node, [compiler, 'build', '-p', 'h5'], { cwd: root, stdio: 'inherit', env: { ...process.env, NODE_ENV: 'production', HX_APP_ROOT: hxRoot, UNI_INPUT_DIR: root, UNI_OUTPUT_DIR: webOutput, UNI_APP_X: 'true', UNI_PLATFORM: 'h5', UNI_UTS_PLATFORM: 'web', RUN_BY_HBUILDERX: '1' } });
-  fs.renameSync(savedPagesJson, pagesJson);
-  pagesSwapped = false;
+  copyProjectInput();
+  fs.rmSync(webOutput, { recursive: true, force: true });
+  execFileSync(node, [compiler, 'build', '-p', 'h5'], { cwd: buildRoot, stdio: 'inherit', env: { ...process.env, NODE_ENV: 'production', HX_APP_ROOT: hxRoot, UNI_INPUT_DIR: buildRoot, UNI_OUTPUT_DIR: webOutput, UNI_APP_X: 'true', UNI_PLATFORM: 'h5', UNI_UTS_PLATFORM: 'web', RUN_BY_HBUILDERX: '1' } });
   if (sourceFingerprint(root) !== before) throw new Error('源码在编译期间发生变化，请重新构建');
   fs.writeFileSync(path.join(root, 'unpackage/offline-h5-source.json'), JSON.stringify({ sourceFingerprint: before }));
   execFileSync(process.execPath, [path.join(root, 'scripts/offline-h5/derive-uni-app-x.mjs')], { stdio: 'inherit', env: { ...process.env, WEB_DIST: webOutput } });
@@ -59,6 +74,5 @@ try {
   // 打包成功后清理中间 Web 产物（仅派生排查时需要，OFFLINE_H5_KEEP_WEB=1 可保留现场）
   if (process.env.OFFLINE_H5_KEEP_WEB !== '1') fs.rmSync(webOutput, { recursive: true, force: true });
 } finally {
-  if (pagesSwapped && fs.existsSync(savedPagesJson)) fs.renameSync(savedPagesJson, pagesJson);
-  if (fs.existsSync(saved)) fs.renameSync(saved, installed);
+  fs.rmSync(buildRoot, { recursive: true, force: true });
 }

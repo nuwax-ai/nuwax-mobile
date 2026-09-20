@@ -69,10 +69,12 @@ pnpm offline-h5:prepare（scripts/prepare-offline-h5.mjs）
   1. 校验 stage → 复制到 static/app/offline-h5/（临时目录 + 原子替换）
 
 offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
-  1. 记录源码指纹；把 static/app/offline-h5 临时移出（防递归复制）
-  2. pages.json 临时替换为离线子集（bootstrap 默认页 + agent-detail + app-details，无 tabBar），
-     HBuilderX 内置编译器出 Web 产物 → unpackage/offline-h5-web（独立目录，不影响线上部署产物）；
-     编译结束（无论成败）立即恢复原 pages.json，保证指纹校验通过。
+  1. 记录源码指纹；复制当前源码到系统临时目录（排除 unpackage、node_modules 与
+     static/app/offline-h5），从源头防止离线包递归进入 Web 产物
+  2. 仅在临时工程中把 pages.json 写成离线子集（bootstrap 默认页 + agent-detail +
+     app-details，无 tabBar），HBuilderX 内置编译器出 Web 产物 →
+     unpackage/offline-h5-web；不改仓库 pages.json，因此可与 H5 开发服务并行运行，
+     不会触发开发页白屏或底部导航消失。
      离线入口页内跳转一律走 uni.webView 桥交原生；新增「纯 H5 路由跳转」的目标页必须加入子集，否则路由 miss 白屏
   3. 派生（scripts/offline-h5/derive-uni-app-x.mjs）：
      esbuild 把 ESM 入口打成 IIFE app-bundle.js（WebView 禁 file:// 加载 ES module；页面 chunk 全部内联，

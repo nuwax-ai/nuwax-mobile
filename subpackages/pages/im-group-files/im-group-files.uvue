@@ -1,0 +1,819 @@
+<template>
+  <view class="gf-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 群文件 -->
+    <view class="gf-header">
+      <view class="gf-header__btn" hover-class="gf-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="gf-header__title-wrap">
+        <text class="gf-header__title">{{ t("Mobile.Message.groupFiles") }}</text>
+      </view>
+      <view class="gf-header__btn gf-header__btn--ghost" />
+    </view>
+
+    <!-- 分类 tab：全部/图片/文件/视频/音频（对齐 PC 端 ChatFilesPanel） -->
+    <view class="gf-tabs">
+      <view
+        v-for="k in kindTabs"
+        :key="k.id"
+        class="gf-tab"
+        :class="activeKind == k.id ? 'gf-tab--on' : ''"
+        hover-class="gf-tab--hover"
+        @click="switchKind(k.id)"
+      >
+        <text
+          class="gf-tab__text"
+          :class="activeKind == k.id ? 'gf-tab__text--on' : ''"
+        >{{ k.label }}</text>
+      </view>
+    </view>
+
+    <scroll-view class="gf-body" direction="vertical" :show-scrollbar="false">
+      <view v-if="loading" class="gf-state">
+        <text class="gf-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+      </view>
+      <view v-else-if="loadFailed" class="gf-state" @click="handleRetry">
+        <text class="gf-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+      </view>
+      <view v-else>
+        <view
+          v-for="f in filteredFiles"
+          :key="f.key"
+          class="gf-row"
+          hover-class="gf-row--active"
+          @click="handleFileTap(f)"
+        >
+          <view class="gf-icon">
+            <image
+              v-if="f.kind == 'image' && f.thumbUrl.length > 0 && !f.thumbFailed"
+              class="gf-thumb"
+              :src="f.thumbUrl"
+              mode="aspectFill"
+              @error="onThumbError(f)"
+            />
+            <svg-icon v-else name="icon-a-Filetext" size="40" color="#5147ff" />
+          </view>
+          <view class="gf-col">
+            <text class="gf-name text-ellipsis">{{ f.fileName.length > 0 ? f.fileName : f.url }}</text>
+            <text class="gf-sub text-ellipsis">
+              {{ f.metaText }}
+            </text>
+          </view>
+          <view class="gf-dl" hover-class="gf-dl--active" @click.stop="handleDownload(f)">
+            <text class="gf-dl__text">{{ t("Mobile.Terminal.download") }}</text>
+          </view>
+        </view>
+        <view v-if="filteredFiles.length == 0" class="gf-state">
+          <text class="gf-state__text">{{ t("Mobile.Message.filesEmpty") }}</text>
+        </view>
+        <view class="gf-tail" />
+      </view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, computed } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImMessages } from "@/servers/im";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import {
+    isAuthProtectedFileUrl,
+    openAuthProtectedLinkUrl,
+    openRemoteFileUrl,
+  } from "@/utils/authProtectedFileUrl";
+  import { handleExternalLink } from "@/utils/system";
+  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 单页条数（服务端上限 200）与最多翻页数（群文件是客户端聚合，封顶 600 条消息）。 */
+  const PAGE_LIMIT = 200;
+  const MAX_PAGES = 3;
+
+  /**
+   * 文件行（★群文件无专用接口：与 PC 端 convFiles.ts 同做法，翻历史消息把附件收集出来）：
+   * - 单附件形态：msgType 本身就是类型（image/file/video/audio），url 在 body 顶层；
+   * - rich_text：body.attachments[]，kind 字段优先，缺失按 mime/扩展名分类；
+   * - 撤回消息（msgStatus=2，body=null）排除。
+   */
+  class GfFile {
+    key: string = "";
+    kind: string = "file";
+    url: string = "";
+    fileName: string = "";
+    size: number = 0;
+    senderName: string = "";
+    sendTime: number = 0;
+    metaText: string = "";
+    /** 缩略图展示地址：普通地址=url；受保护 /api/f/ 先留空，等 Bearer 解析换 blob/临时文件。 */
+    thumbUrl: string = "";
+    thumbFailed: boolean = false;
+  }
+
+  /** 分类 tab（全部 + 图片/文件/视频/音频，顺序对齐 PC ATTACHMENT_KINDS）。 */
+  class GfKindTab {
+    id: string = "all";
+    label: string = "";
+  }
+
+  // ===== 页面入参 =====
+  const convId = ref<string>("");
+
+  // ===== 状态 =====
+  const files = ref<GfFile[]>([]);
+  const loading = ref<boolean>(false);
+  const loadFailed = ref<boolean>(false);
+  const activeKind = ref<string>("all");
+
+  function makeKindTab(id: string, labelKey: string): GfKindTab {
+    const k = new GfKindTab();
+    k.id = id;
+    k.label = t(labelKey);
+    return k;
+  }
+
+  const kindTabs = ref<GfKindTab[]>([
+    makeKindTab("all", "Mobile.Common.all"),
+    makeKindTab("image", "Mobile.Message.filesTabImage"),
+    makeKindTab("file", "Mobile.Message.filesTabFile"),
+    makeKindTab("video", "Mobile.Message.filesTabVideo"),
+    makeKindTab("audio", "Mobile.Message.filesTabAudio"),
+  ]);
+
+  /** 当前 tab 下的文件（all = 不筛）。 */
+  const filteredFiles = computed<GfFile[]>((): GfFile[] => {
+    if (activeKind.value == "all") {
+      return files.value;
+    }
+    return files.value.filter((f: GfFile): boolean => f.kind == activeKind.value);
+  });
+
+  function switchKind(id: string): void {
+    activeKind.value = id;
+  }
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  // ===== 类型分类（对齐 PC attachment.ts 的扩展名集合） =====
+
+  const VIDEO_EXTS: string[] = ["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv", "flv", "mpeg", "mpg", "3gp"];
+  const AUDIO_EXTS: string[] = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma", "amr", "aiff"];
+  const IMAGE_EXTS: string[] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "avif"];
+
+  /** 文件名后缀（小写、无点）；没有点或点在末尾时返回空串。 */
+  function extOf(name: string): string {
+    const lower = name.toLowerCase();
+    const dot = lower.lastIndexOf(".");
+    if (dot <= 0 || dot == lower.length - 1) {
+      return "";
+    }
+    return lower.substring(dot + 1);
+  }
+
+  /** URL 最后一段的后缀（先剥 query/hash，避免 ?x=.png 这类误判）。 */
+  function urlExtOf(url: string): string {
+    let path = url;
+    const hashIdx = path.indexOf("#");
+    if (hashIdx >= 0) {
+      path = path.substring(0, hashIdx);
+    }
+    const queryIdx = path.indexOf("?");
+    if (queryIdx >= 0) {
+      path = path.substring(0, queryIdx);
+    }
+    const slashIdx = path.lastIndexOf("/");
+    const seg = slashIdx >= 0 ? path.substring(slashIdx + 1) : path;
+    return extOf(seg);
+  }
+
+  /** mime/扩展名兜底分类：image | video | audio | file。 */
+  function classifyKind(mime: string, url: string): string {
+    if (mime.indexOf("image/") == 0) {
+      return "image";
+    }
+    if (mime.indexOf("video/") == 0) {
+      return "video";
+    }
+    if (mime.indexOf("audio/") == 0) {
+      return "audio";
+    }
+    const ext = urlExtOf(url);
+    if (ext.length > 0) {
+      if (VIDEO_EXTS.indexOf(ext) >= 0) {
+        return "video";
+      }
+      if (AUDIO_EXTS.indexOf(ext) >= 0) {
+        return "audio";
+      }
+      if (IMAGE_EXTS.indexOf(ext) >= 0) {
+        return "image";
+      }
+    }
+    return "file";
+  }
+
+  /** 附件 kind 字段是否可认（认不出按 mime/扩展名重分类，比 PC 直接归 file 更准）。 */
+  function isValidKind(kind: string): boolean {
+    return (
+      kind == "image" || kind == "file" || kind == "video" || kind == "audio"
+    );
+  }
+
+  /** URL 是否可用（http(s) 绝对地址或 / 开头的相对地址；其余如 data: 一律不入列）。 */
+  function isUsableUrl(url: string): boolean {
+    if (url.length == 0) {
+      return false;
+    }
+    return (
+      url.indexOf("http://") == 0 ||
+      url.indexOf("https://") == 0 ||
+      url.indexOf("/") == 0
+    );
+  }
+
+  /** 文件大小展示：B / KB / MB / GB（一位小数，<1KB 直接给字节数）。 */
+  function formatSize(size: number): string {
+    if (size <= 0) {
+      return "";
+    }
+    if (size < 1024) {
+      return `${size} B`;
+    }
+    const kb = size / 1024;
+    if (kb < 1024) {
+      return `${kb.toFixed(1)} KB`;
+    }
+    const mb = kb / 1024;
+    if (mb < 1024) {
+      return `${mb.toFixed(1)} MB`;
+    }
+    const gb = mb / 1024;
+    return `${gb.toFixed(1)} GB`;
+  }
+
+  /** 时间展示：MM-DD HH:mm（跨年补年份）。 */
+  function formatTime(ms: number): string {
+    if (ms <= 0) {
+      return "";
+    }
+    const d = new Date(ms);
+    const now = new Date();
+    const pad = (n: number): string => (n < 10 ? `0${n}` : `${n}`);
+    const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    if (d.getFullYear() != now.getFullYear()) {
+      return `${d.getFullYear()}-${md}`;
+    }
+    return md;
+  }
+
+  /** 次行说明：发送人 · 大小 · 时间（缺失项自动跳过）。 */
+  function buildMeta(senderName: string, size: number, sendTime: number): string {
+    const parts: string[] = [];
+    if (senderName.length > 0) {
+      parts.push(senderName);
+    }
+    const sizeText = formatSize(size);
+    if (sizeText.length > 0) {
+      parts.push(sizeText);
+    }
+    const timeText = formatTime(sendTime);
+    if (timeText.length > 0) {
+      parts.push(timeText);
+    }
+    return parts.join(" · ");
+  }
+
+  /**
+   * 翻历史消息聚合文件（新→旧自然有序）：
+   * - 单附件形态：msgType=image/file/video/audio，body 顶层 url/fileName/size
+   * - rich_text：attachments[] 全收（含图片），kind 优先、mime/扩展名兜底
+   * - 撤回（msgStatus=2，body=null）排除；已收集的 url 去重
+   */
+  async function loadFiles(): Promise<void> {
+    if (convId.value.length == 0 || loading.value) {
+      return;
+    }
+    loading.value = true;
+    loadFailed.value = false;
+    try {
+      const out: GfFile[] = [];
+      const seenUrls: string[] = [];
+      let beforeSeq = 0;
+      let more = true;
+      let pages = 0;
+      while (more && pages < MAX_PAGES) {
+        pages++;
+        const res = await apiImMessages(convId.value, beforeSeq, PAGE_LIMIT);
+        if (apiResCode(res) != SUCCESS_CODE) {
+          loading.value = false;
+          loadFailed.value = true;
+          return;
+        }
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        let minSeq = beforeSeq;
+        if (dataObj != null) {
+          more = readBool(dataObj, "hasMore");
+          const recordsRaw = dataObj["records"];
+          if (recordsRaw != null) {
+            const records = recordsRaw as UTSJSONObject[];
+            for (let i = 0; i < records.length; i++) {
+              const rec = records[i];
+              // 撤回的消息文件不可再取（body=null），排除
+              if (readNumber(rec, "msgStatus", 1) == 2) {
+                continue;
+              }
+              const msgType = readString(rec, "msgType").toLowerCase();
+              const senderName = readString(rec, "senderName");
+              const sendTime = readNumber(rec, "sendTime", 0);
+              const seq = readNumber(rec, "seq", 0);
+              if (seq > 0 && (minSeq <= 0 || seq < minSeq)) {
+                minSeq = seq;
+              }
+              const bodyRaw = rec["body"];
+              if (bodyRaw == null) {
+                continue;
+              }
+              const body = bodyRaw as UTSJSONObject;
+              if (isValidKind(msgType)) {
+                // 老的单附件形态：msgType 本身就是类型，url 在 body 顶层
+                const url = readString(body, "url");
+                if (isUsableUrl(url) && seenUrls.indexOf(url) < 0) {
+                  seenUrls.push(url);
+                  const f = new GfFile();
+                  f.key = url;
+                  f.kind = msgType;
+                  f.url = url;
+                  f.fileName = readString(body, "fileName");
+                  f.size = readNumber(body, "size", 0);
+                  f.senderName = senderName;
+                  f.sendTime = sendTime;
+                  f.metaText = buildMeta(senderName, f.size, sendTime);
+                  out.push(f);
+                }
+              } else if (msgType == "rich_text") {
+                const attsRaw = body["attachments"];
+                if (attsRaw != null) {
+                  const atts = attsRaw as UTSJSONObject[];
+                  for (let j = 0; j < atts.length; j++) {
+                    const url = readString(atts[j], "url");
+                    if (!isUsableUrl(url) || seenUrls.indexOf(url) >= 0) {
+                      continue;
+                    }
+                    seenUrls.push(url);
+                    const attKind = readString(atts[j], "kind");
+                    const f = new GfFile();
+                    f.key = url;
+                    f.kind = isValidKind(attKind)
+                      ? attKind
+                      : classifyKind(readString(atts[j], "mime"), url);
+                    f.url = url;
+                    f.fileName = readString(atts[j], "fileName");
+                    f.size = readNumber(atts[j], "size", 0);
+                    f.senderName = senderName;
+                    f.sendTime = sendTime;
+                    f.metaText = buildMeta(senderName, f.size, sendTime);
+                    out.push(f);
+                  }
+                }
+              }
+            }
+          }
+        }
+        beforeSeq = minSeq;
+      }
+      files.value = out;
+      // ★必须经 files.value（响应式代理）取元素再改：直接改 out 里的裸对象不触发视图更新
+      resolveThumbs(files.value);
+      loading.value = false;
+    } catch (_error) {
+      loading.value = false;
+      loadFailed.value = true;
+    }
+  }
+
+  function handleRetry(): void {
+    if (loadFailed.value) {
+      loadFiles();
+    }
+  }
+
+  function onThumbError(f: GfFile): void {
+    f.thumbFailed = true;
+  }
+
+  /**
+   * 图片缩略图展示地址（同聊天页 resolveRowMedia）：
+   * 受保护 /api/f/ 地址 <image> 带不了 Bearer（H5 被 ORB 拦 401），
+   * 先留空占位（渲染文件图标），Bearer 拉取成功后原位换成 blob/临时文件地址；
+   * 普通地址直接展示。解析失败维持空占位，行点击仍可走「打开页面」看原图。
+   */
+  function resolveThumbs(list: GfFile[]): void {
+    for (let i = 0; i < list.length; i++) {
+      const f = list[i];
+      if (f.kind != "image") {
+        continue;
+      }
+      if (!isAuthProtectedFileUrl(f.url)) {
+        f.thumbUrl = f.url;
+        continue;
+      }
+      const url = f.url;
+      resolveDisplayImageUrl(url, 72, 72)
+        .then((resolved: string) => {
+          if (resolved != url && resolved.length > 0) {
+            f.thumbUrl = resolved;
+          }
+        })
+        .catch((_e: any | null) => {
+          // 留空占位：点行仍可经 openAuthProtectedLinkUrl 带凭证打开
+        });
+    }
+  }
+
+  /** 行点击：图片放大预览（同聊天页，用解析后的展示地址），其余 /api/f/ 受保护链接「打开页面」，普通链接统一外链打开。 */
+  function handleFileTap(f: GfFile): void {
+    if (f.url.length == 0) {
+      return;
+    }
+    if (f.kind == "image") {
+      if (f.thumbUrl.length > 0) {
+        uni.previewImage({ urls: [f.thumbUrl], current: f.thumbUrl });
+        return;
+      }
+      // 缩略图没解析出来（受保护地址拉取失败）：退回带凭证「打开页面」看原图
+      if (isAuthProtectedFileUrl(f.url)) {
+        openAuthProtectedLinkUrl(f.url).catch((_e: any | null) => {
+          uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+        });
+        return;
+      }
+      uni.previewImage({ urls: [f.url], current: f.url });
+      return;
+    }
+    if (isAuthProtectedFileUrl(f.url)) {
+      openAuthProtectedLinkUrl(f.url).catch((_e: any | null) => {
+        uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+      });
+      return;
+    }
+    handleExternalLink(f.url, f.fileName);
+  }
+
+  // ===== 下载（★真下载语义，不再是「打开资源」） =====
+
+  /**
+   * 下载文件名（对齐 PC media.ts downloadNameOf 的关键规则）：
+   * 名字里的 / \ 压平（带分隔符时浏览器会静默忽略 download 属性）；
+   * 没后缀时从 URL 借一个，都取不到给通用兜底。
+   */
+  function downloadNameOf(f: GfFile): string {
+    let raw = f.fileName.trim();
+    while (
+      raw.length > 0 &&
+      (raw.charAt(0) == "/" || raw.charAt(0) == "\\" || raw.charAt(0) == ".")
+    ) {
+      raw = raw.substring(1);
+    }
+    raw = raw.split("/").join("_").split("\\").join("_");
+    if (raw.length > 0 && extOf(raw).length > 0) {
+      return raw;
+    }
+    const ext = urlExtOf(f.url);
+    if (raw.length == 0) {
+      return ext.length > 0 ? `file.${ext}` : "file";
+    }
+    return ext.length > 0 ? `${raw}.${ext}` : raw;
+  }
+
+  // #ifdef H5 || WEB
+  /**
+   * H5 普通地址下载：拉字节转 blob（octet-stream 强制走下载而非导航），
+   * CORS 不放行或请求失败时退回新页打开（与旧行为一致，不让用户点了没反应）。
+   */
+  function downloadNormalUrlOnH5(url: string, name: string): void {
+    uni.request({
+      url,
+      method: "GET",
+      responseType: "arraybuffer",
+      // 默认 dataType=json 会尝试 JSON.parse，二进制会失败
+      dataType: "text",
+      success: (res) => {
+        if (res.statusCode == 200 && res.data != null) {
+          const blob = new Blob([res.data as ArrayBuffer], { type: "application/octet-stream" });
+          const objectUrl = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = objectUrl;
+          link.download = name;
+          link.click();
+          setTimeout(() => {
+            URL.revokeObjectURL(objectUrl);
+          }, 60000);
+          return;
+        }
+        window.open(url, "_blank");
+      },
+      fail: (_err) => {
+        window.open(url, "_blank");
+      },
+    });
+  }
+  // #endif
+
+  /** 下载按钮：受保护地址走 openRemoteFileUrl（H5 带 Bearer 拉 blob+保存；App 下载后交系统查看器）。 */
+  function handleDownload(f: GfFile): void {
+    if (f.url.length == 0) {
+      return;
+    }
+    const name = downloadNameOf(f);
+    if (isAuthProtectedFileUrl(f.url)) {
+      openRemoteFileUrl(f.url, name).catch((_e: any | null) => {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+      });
+      return;
+    }
+    // #ifdef H5 || WEB
+    downloadNormalUrlOnH5(f.url, name);
+    // #endif
+    // #ifndef H5 || WEB
+    openRemoteFileUrl(f.url, name).catch((_e: any | null) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+    // #endif
+  }
+
+  function handleBack(): void {
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    convId.value = readOption(options, "convId");
+    loadFiles();
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架 ===== */
+  .gf-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-image: linear-gradient(180deg, #f3f0fc 0%, #edebf8 100%);
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .gf-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(250, 249, 253, 0.92);
+    border-bottom: 2rpx solid rgba(81, 71, 255, 0.1);
+  }
+
+  .gf-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .gf-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .gf-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .gf-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .gf-header__title {
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  /* ===== 分类 tab ===== */
+  .gf-tabs {
+    flex-shrink: 0;
+    padding: 20rpx 32rpx 4rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .gf-tab {
+    padding: 10rpx 26rpx;
+    margin-right: 14rpx;
+    border-radius: 30rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .gf-tab--on {
+    background-color: rgba(81, 71, 255, 0.1);
+    border: 2rpx solid rgba(81, 71, 255, 0.28);
+  }
+
+  .gf-tab--hover {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .gf-tab__text {
+    font-size: 26rpx;
+    line-height: 36rpx;
+    color: #6b6878;
+  }
+
+  .gf-tab__text--on {
+    color: #5147ff;
+    font-weight: 600;
+  }
+
+  .gf-body {
+    flex: 1;
+    min-height: 0;
+    padding: 16rpx 32rpx;
+  }
+
+  .gf-state {
+    padding: 200rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .gf-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 文件行 ===== */
+  .gf-row {
+    margin-bottom: 16rpx;
+    padding: 20rpx 24rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    border-radius: 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .gf-row--active {
+    background-color: #f7f6fb;
+  }
+
+  .gf-icon {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 18rpx;
+    background-color: rgba(81, 71, 255, 0.08);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+
+  .gf-thumb {
+    width: 72rpx;
+    height: 72rpx;
+  }
+
+  .gf-col {
+    flex: 1;
+    min-width: 0;
+    margin-left: 20rpx;
+    margin-right: 8rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .gf-name {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #22212a;
+  }
+
+  .gf-sub {
+    margin-top: 4rpx;
+    font-size: 22rpx;
+    line-height: 32rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 下载按钮 ===== */
+  .gf-dl {
+    flex-shrink: 0;
+    padding: 12rpx 26rpx;
+    border-radius: 30rpx;
+    background-color: rgba(81, 71, 255, 0.1);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .gf-dl--active {
+    background-color: rgba(81, 71, 255, 0.2);
+  }
+
+  .gf-dl__text {
+    font-size: 24rpx;
+    line-height: 34rpx;
+    font-weight: 600;
+    color: #5147ff;
+  }
+
+  .gf-tail {
+    height: 40rpx;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  /* #endif */
+</style>

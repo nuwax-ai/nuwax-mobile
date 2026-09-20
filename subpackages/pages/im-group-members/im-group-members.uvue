@@ -1,0 +1,931 @@
+<template>
+  <view class="gm-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 群成员 + 添加入口 -->
+    <view class="gm-header">
+      <view class="gm-header__btn" hover-class="gm-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="gm-header__title-wrap">
+        <text class="gm-header__title">{{ t("Mobile.Message.groupMembersLabel") }}（{{ members.length }}）</text>
+      </view>
+      <view
+        v-if="canAdd"
+        class="gm-header__btn"
+        hover-class="gm-header__btn--active"
+        @click="openAddMember"
+      >
+        <svg-icon name="icon-Plus" size="40" color="#141416" />
+      </view>
+      <view v-else class="gm-header__btn gm-header__btn--ghost" />
+    </view>
+
+    <!-- 搜索（客户端过滤：群名片/昵称/姓名/userId，过滤出的行同样支持左滑操作） -->
+    <view class="gm-search">
+      <input
+        class="gm-search__input"
+        v-model="query"
+        :placeholder="t('Mobile.Message.mentionSearchPlaceholder')"
+        placeholder-style="color:#b0aebc"
+      />
+    </view>
+
+    <scroll-view class="gm-body" direction="vertical" :show-scrollbar="false">
+      <view v-if="loading" class="gm-state">
+        <text class="gm-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+      </view>
+      <view v-else-if="loadFailed" class="gm-state" @click="handleRetry">
+        <text class="gm-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+      </view>
+      <view v-else>
+        <!-- 左滑行：操作区在内容层下方，按「删除 / 设·撤管理员 / 添加到智联录」渲染 -->
+        <view v-for="m in filteredMembers" :key="m.userId" class="gm-swipe">
+          <view v-if="hasActions(m)" class="gm-actions">
+            <view v-if="canRemoveOf(m)" class="gm-act gm-act--del" @click="handleDeleteTap(m)">
+              <text class="gm-act__text">{{ t("Mobile.Common.delete") }}</text>
+            </view>
+            <view v-if="canRoleOf(m)" class="gm-act gm-act--role" @click="handleRoleTap(m)">
+              <text class="gm-act__text">{{ m.role == 2 ? t("Mobile.Message.revokeManager") : t("Mobile.Message.setAsManager") }}</text>
+            </view>
+            <view v-if="canContactOf(m)" class="gm-act gm-act--contact" @click="handleContactTap(m)">
+              <text class="gm-act__text gm-act__text--contact">{{ t("Mobile.Message.addToDirectory") }}</text>
+            </view>
+          </view>
+          <view
+            class="gm-row"
+            :style="{ transform: 'translateX(' + m.offsetX + 'px)' }"
+            @touchstart="onRowTouchStart($event, m)"
+            @touchmove="onRowTouchMove($event, m)"
+            @touchend="onRowTouchEnd($event, m)"
+            @touchcancel="onRowTouchCancel(m)"
+          >
+            <image
+              v-if="m.avatar.length > 0 && m.avatarFailed != true"
+              class="gm-ava"
+              :src="m.avatar"
+              mode="aspectFill"
+              @error="handleAvatarError(m)"
+            />
+            <view v-else class="gm-ava" :style="{ backgroundImage: avatarGradient(m.token) }">
+              <text class="gm-ava-letter">{{ avatarLetter(m.token) }}</text>
+            </view>
+            <view class="gm-col">
+              <view class="gm-name-row">
+                <text class="gm-name text-ellipsis">{{ m.token }}</text>
+                <view v-if="m.role == 3" class="gm-tag gm-tag--owner">
+                  <text class="gm-tag__text">{{ t("Mobile.Message.groupOwner") }}</text>
+                </view>
+                <view v-else-if="m.role == 2" class="gm-tag">
+                  <text class="gm-tag__text">{{ t("Mobile.Message.roleManager") }}</text>
+                </view>
+              </view>
+              <text v-if="m.nickName.length > 0 && m.nickName != m.token" class="gm-sub text-ellipsis">{{ m.nickName }}</text>
+            </view>
+          </view>
+        </view>
+        <view v-if="filteredMembers.length == 0" class="gm-state">
+          <text class="gm-state__text">{{ t("Mobile.AgentSearch.emptyResult") }}</text>
+        </view>
+        <view class="gm-tail" />
+      </view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref } from "vue";
+  import { onLoad, onShow } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import {
+    apiImAddContact,
+    apiImContacts,
+    apiImConvDetail,
+    apiImConvMembers,
+    apiImGroupRemoveMember,
+    apiImGroupSetMemberRole,
+  } from "@/servers/im";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 头像字母底色渐变板（与群信息页同款）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #f59a9a, #e05f5f)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  /**
+   * 成员行（ConversationMemberDto 投影）。
+   * ★role 对齐服务端 ImConstants：1=普通成员 2=管理员 3=群主（缺省按 1）；
+   *   self=是否我自己（服务端算好）；offsetX=左滑位移 px（0=闭合，负值=展开）；
+   *   contactState=智联录关系（""=无 1=已互加 2=对方申请中 3=我已申请，见 apiImContacts）。
+   */
+  class GmMember {
+    userId: string = "";
+    name: string = "";
+    nickName: string = "";
+    avatar: string = "";
+    token: string = "";
+    role: number = 1;
+    self: boolean = false;
+    avatarFailed: boolean = false;
+    offsetX: number = 0;
+    contactState: string = "";
+  }
+
+  // ===== 左滑操作按钮宽度（rpx；转 px 按 windowWidth/750） =====
+  const ACTION_W_DEL = 128;
+  const ACTION_W_ROLE = 160;
+  const ACTION_W_CONTACT = 176;
+  let rpxScale = 1;
+
+  // ===== 页面入参 =====
+  const convId = ref<string>("");
+  const groupName = ref<string>("");
+
+  // ===== 列表状态 =====
+  const members = ref<GmMember[]>([]);
+  const query = ref<string>("");
+  /** 我的角色：1=普通成员 2=管理员 3=群主（缺省按普通成员=最小权限，服务端兜底）。 */
+  const myRole = ref<number>(1);
+  const loading = ref<boolean>(false);
+  const loadFailed = ref<boolean>(false);
+  const removing = ref<boolean>(false);
+  const roleChanging = ref<boolean>(false);
+  const contactAdding = ref<boolean>(false);
+  let inited = false;
+  /** allowMemberInvite 三态：""=缺省(允许) / "true" / "false"。 */
+  let allowInviteRaw = "";
+
+  const canAdd = computed((): boolean => myRole.value >= 2 || allowInviteRaw != "false");
+
+  /** 客户端搜索：群名片/昵称/姓名/userId 包含匹配（同 @面板口径）。 */
+  const filteredMembers = computed((): GmMember[] => {
+    const q = query.value.trim();
+    if (q.length == 0) {
+      return members.value;
+    }
+    const out: GmMember[] = [];
+    const all = members.value;
+    for (let i = 0; i < all.length; i++) {
+      const m = all[i];
+      if (
+        m.token.indexOf(q) >= 0 ||
+        m.nickName.indexOf(q) >= 0 ||
+        m.name.indexOf(q) >= 0 ||
+        m.userId.indexOf(q) >= 0
+      ) {
+        out.push(m);
+      }
+    }
+    return out;
+  });
+
+  // ===== 左滑手势态（非渲染数据，普通变量即可） =====
+  let touchUserId = "";
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let touchStartOffset = 0;
+  /** 0=未定向 1=横向（本行滑动） 2=纵向（交给 scroll-view）。 */
+  let touchAxis = 0;
+  let touchMoved = false;
+  /** 当前展开的行（同屏只允许一行展开）。 */
+  let openUserId = "";
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function handleAvatarError(m: GmMember): void {
+    m.avatarFailed = true;
+  }
+
+  // ===== 行级权限（对齐 PC lib/memberList：服务端才是权威，这里只控入口） =====
+
+  /** 删除：群主可删管理员+普通成员；管理员只能删普通成员；谁都不能删自己/群主。 */
+  function canRemoveOf(m: GmMember): boolean {
+    if (m.self || m.role == 3) {
+      return false;
+    }
+    if (myRole.value == 3) {
+      return true;
+    }
+    if (myRole.value == 2) {
+      return m.role <= 1;
+    }
+    return false;
+  }
+
+  /** 设/撤管理员：★仅群主（requireOwner），不能对自己、不能对群主。 */
+  function canRoleOf(m: GmMember): boolean {
+    return myRole.value == 3 && m.self != true && m.role != 3;
+  }
+
+  /** 添加到智联录：非本人，且当前无任何联系人关系（已互加/申请中都不再给按钮）。 */
+  function canContactOf(m: GmMember): boolean {
+    return m.self != true && m.contactState.length == 0;
+  }
+
+  function hasActions(m: GmMember): boolean {
+    return canRemoveOf(m) || canRoleOf(m) || canContactOf(m);
+  }
+
+  /** 该行完全展开时的位移（负值 px；按实际渲染出的按钮宽度求和）。 */
+  function openOffsetOf(m: GmMember): number {
+    let w = 0;
+    if (canRemoveOf(m)) {
+      w += ACTION_W_DEL;
+    }
+    if (canRoleOf(m)) {
+      w += ACTION_W_ROLE;
+    }
+    if (canContactOf(m)) {
+      w += ACTION_W_CONTACT;
+    }
+    return -w * rpxScale;
+  }
+
+  // ===== 左滑手势（uvue 无 swipe-cell，touch + translateX 自实现） =====
+
+  function eventX(e: TouchEvent): number {
+    const ts = e.touches;
+    if (ts != null && ts.length > 0) {
+      return ts[0].clientX;
+    }
+    const ct = e.changedTouches;
+    if (ct != null && ct.length > 0) {
+      return ct[0].clientX;
+    }
+    return 0;
+  }
+
+  function eventY(e: TouchEvent): number {
+    const ts = e.touches;
+    if (ts != null && ts.length > 0) {
+      return ts[0].clientY;
+    }
+    const ct = e.changedTouches;
+    if (ct != null && ct.length > 0) {
+      return ct[0].clientY;
+    }
+    return 0;
+  }
+
+  function closeRow(m: GmMember): void {
+    m.offsetX = 0;
+    if (openUserId == m.userId) {
+      openUserId = "";
+    }
+  }
+
+  function closeOtherRows(exceptId: string): void {
+    const all = members.value;
+    for (let i = 0; i < all.length; i++) {
+      if (all[i].userId != exceptId) {
+        all[i].offsetX = 0;
+      }
+    }
+  }
+
+  function onRowTouchStart(e: TouchEvent, m: GmMember): void {
+    if (!hasActions(m)) {
+      return;
+    }
+    touchUserId = m.userId;
+    touchStartX = eventX(e);
+    touchStartY = eventY(e);
+    touchStartOffset = m.offsetX;
+    touchAxis = 0;
+    touchMoved = false;
+  }
+
+  function onRowTouchMove(e: TouchEvent, m: GmMember): void {
+    if (touchUserId != m.userId) {
+      return;
+    }
+    const dx = eventX(e) - touchStartX;
+    const dy = eventY(e) - touchStartY;
+    // 首次越过阈值才定向：|dx|>|dy| 算横滑，否则让给纵向滚动
+    if (touchAxis == 0) {
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) {
+        return;
+      }
+      touchAxis = Math.abs(dx) > Math.abs(dy) ? 1 : 2;
+    }
+    if (touchAxis != 1) {
+      return;
+    }
+    touchMoved = true;
+    const min = openOffsetOf(m);
+    let next = touchStartOffset + dx;
+    if (next > 0) {
+      next = 0;
+    }
+    if (next < min) {
+      next = min;
+    }
+    m.offsetX = next;
+  }
+
+  function onRowTouchEnd(e: TouchEvent, m: GmMember): void {
+    if (touchUserId != m.userId) {
+      return;
+    }
+    const axis = touchAxis;
+    const moved = touchMoved;
+    touchUserId = "";
+    touchAxis = 0;
+    touchMoved = false;
+    if (!moved) {
+      // 纯点按：展开态下点内容收起（行本身没有点击跳转）
+      if (axis == 0 && m.offsetX != 0) {
+        closeRow(m);
+      }
+      return;
+    }
+    if (axis != 1) {
+      return;
+    }
+    const min = openOffsetOf(m);
+    if (m.offsetX <= min / 2) {
+      closeOtherRows(m.userId);
+      m.offsetX = min;
+      openUserId = m.userId;
+    } else {
+      closeRow(m);
+    }
+  }
+
+  function onRowTouchCancel(m: GmMember): void {
+    touchUserId = "";
+    touchAxis = 0;
+    touchMoved = false;
+    closeRow(m);
+  }
+
+  /** 详情（myRole/邀请开关）+ 成员列表 + 智联录关系标记。 */
+  async function loadAll(): Promise<void> {
+    if (convId.value.length == 0 || loading.value) {
+      return;
+    }
+    loading.value = true;
+    loadFailed.value = false;
+    try {
+      const res = await apiImConvDetail(convId.value);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          myRole.value = readNumber(dataObj, "myRole", 1);
+          const inviteRaw = dataObj["allowMemberInvite"];
+          allowInviteRaw = inviteRaw == null ? "" : `${inviteRaw}`;
+          const name = readString(dataObj, "name");
+          if (name.length > 0) {
+            groupName.value = name;
+          }
+        }
+      }
+      const mres = await apiImConvMembers(convId.value);
+      if (apiResCode(mres) != SUCCESS_CODE) {
+        loading.value = false;
+        loadFailed.value = true;
+        return;
+      }
+      const mdataRaw = apiResData<any>(mres);
+      const mdataObj = mdataRaw != null ? (mdataRaw as UTSJSONObject) : null;
+      const out: GmMember[] = [];
+      if (mdataObj != null) {
+        const recordsRaw = mdataObj["records"];
+        if (recordsRaw != null) {
+          const records = recordsRaw as UTSJSONObject[];
+          for (let i = 0; i < records.length; i++) {
+            const m = new GmMember();
+            m.userId = readString(records[i], "userId");
+            m.name = readString(records[i], "name");
+            m.nickName = readString(records[i], "nickName");
+            m.avatar = readString(records[i], "avatar");
+            m.role = readNumber(records[i], "role", 1);
+            m.self = readBool(records[i], "self");
+            m.token = m.nickName.length > 0
+              ? m.nickName
+              : m.name.length > 0
+                ? m.name
+                : `用户${m.userId}`;
+            if (m.userId.length > 0) {
+              out.push(m);
+            }
+          }
+        }
+      }
+      members.value = out;
+      loading.value = false;
+      inited = true;
+      // 智联录关系标记（决定「添加到智联录」按钮显隐）；失败静默=当无关系处理
+      await markContacts(out);
+    } catch (_error) {
+      loading.value = false;
+      loadFailed.value = true;
+    }
+  }
+
+  /** 把 apiImContacts 的关系状态写到成员行（1/2/3 之外一律当无关系）。 */
+  async function markContacts(rows: GmMember[]): Promise<void> {
+    try {
+      const res = await apiImContacts();
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        return;
+      }
+      const itemsRaw = dataObj["items"];
+      if (itemsRaw == null) {
+        return;
+      }
+      const items = itemsRaw as UTSJSONObject[];
+      for (let i = 0; i < items.length; i++) {
+        const id = readString(items[i], "userId");
+        const st = readString(items[i], "status");
+        if (id.length == 0 || (st != "1" && st != "2" && st != "3")) {
+          continue;
+        }
+        for (let j = 0; j < rows.length; j++) {
+          if (rows[j].userId == id) {
+            rows[j].contactState = st;
+          }
+        }
+      }
+    } catch (_error) {
+      // 静默
+    }
+  }
+
+  function handleRetry(): void {
+    if (loadFailed.value) {
+      loadAll();
+    }
+  }
+
+  // ===== 左滑动作：删除（★不做二次确认，用户拍板） =====
+  function handleDeleteTap(m: GmMember): void {
+    closeRow(m);
+    removeMember(m);
+  }
+
+  async function removeMember(m: GmMember): Promise<void> {
+    if (removing.value) {
+      return;
+    }
+    removing.value = true;
+    try {
+      const res = await apiImGroupRemoveMember(convId.value, m.userId);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Message.groupRemoveSuccess"), icon: "none" });
+        const rows = members.value;
+        for (let i = 0; i < rows.length; i++) {
+          if (rows[i].userId == m.userId) {
+            rows.splice(i, 1);
+            break;
+          }
+        }
+      } else {
+        uni.showToast({ title: apiResMessage(res), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+    removing.value = false;
+  }
+
+  // ===== 左滑动作：设/撤管理员（撤管理员二次确认；设管理员直接执行） =====
+  function handleRoleTap(m: GmMember): void {
+    if (roleChanging.value) {
+      return;
+    }
+    closeRow(m);
+    if (m.role == 2) {
+      // 撤销管理员：二次弹窗
+      const params = new Map<string, string | number>();
+      params.set("name", m.token);
+      uni.showModal({
+        title: t("Mobile.Message.revokeManager"),
+        content: translateFn("Mobile.Message.revokeManagerTip", toI18nParams(params), ""),
+        cancelText: t("Mobile.Common.cancel"),
+        confirmText: t("Mobile.Message.revokeManagerConfirm"),
+        confirmColor: "#ff4d4f",
+        success: (res) => {
+          if (res.confirm == true) {
+            setMemberRole(m, 1);
+          }
+        },
+      });
+    } else {
+      setMemberRole(m, 2);
+    }
+  }
+
+  async function setMemberRole(m: GmMember, role: number): Promise<void> {
+    if (roleChanging.value || convId.value.length == 0) {
+      return;
+    }
+    roleChanging.value = true;
+    try {
+      const res = await apiImGroupSetMemberRole(convId.value, m.userId, role);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        // data=false：已是目标角色没写库（DEV-39），提示没变化即可
+        const dataRaw = apiResData<any>(res);
+        const changed = dataRaw != null && `${dataRaw}` == "true";
+        if (changed) {
+          uni.showToast({
+            title: role == 2 ? t("Mobile.Message.setManagerDone") : t("Mobile.Message.revokeManagerDone"),
+            icon: "none",
+          });
+          // ★服务端会向全群广播 SYSTEM 消息：这里只刷新列表，勿在本地补造通知
+          await loadAll();
+        } else {
+          uni.showToast({ title: t("Mobile.Message.memberRoleNoChange"), icon: "none" });
+        }
+      } else {
+        uni.showToast({ title: apiResMessage(res), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+    roleChanging.value = false;
+  }
+
+  // ===== 左滑动作：添加到智联录（不传 direct：走申请/对方同意链路） =====
+  async function handleContactTap(m: GmMember): Promise<void> {
+    if (m.contactState.length > 0 || contactAdding.value) {
+      return;
+    }
+    closeRow(m);
+    contactAdding.value = true;
+    try {
+      const res = await apiImAddContact(m.userId, "");
+      if (apiResCode(res) == SUCCESS_CODE) {
+        // ContactAddResult：accepted 决定文案；alreadyContact=早已是联系人
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        let accepted = false;
+        let already = false;
+        if (dataObj != null) {
+          accepted = readBool(dataObj, "accepted");
+          already = readBool(dataObj, "alreadyContact");
+        }
+        if (already) {
+          m.contactState = "1";
+          uni.showToast({ title: t("Mobile.Message.alreadyContact"), icon: "none" });
+        } else if (accepted) {
+          m.contactState = "1";
+          uni.showToast({ title: t("Mobile.Message.contactAdded"), icon: "none" });
+        } else {
+          m.contactState = "3";
+          uni.showToast({ title: t("Mobile.Message.contactRequestSent"), icon: "none" });
+        }
+      } else {
+        uni.showToast({ title: apiResMessage(res), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
+    }
+    contactAdding.value = false;
+  }
+
+  function openAddMember(): void {
+    uni.navigateTo({
+      url: `/subpackages/pages/im-group-add-member/im-group-add-member?convId=${convId.value}&name=${encodeURIComponent(groupName.value)}`,
+    });
+  }
+
+  function handleBack(): void {
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    convId.value = readOption(options, "convId");
+    groupName.value = readOption(options, "name");
+    // 左滑位移用 px：rpx→px 换算系数（750 设计稿）
+    try {
+      const win = uni.getWindowInfo();
+      rpxScale = win.windowWidth / 750;
+    } catch (_e) {
+      rpxScale = 1;
+    }
+    loadAll();
+  });
+
+  onShow(() => {
+    // 从添加成员页返回：刷新列表
+    if (inited) {
+      loadAll();
+    }
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架 ===== */
+  .gm-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-image: linear-gradient(180deg, #f3f0fc 0%, #edebf8 100%);
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .gm-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(250, 249, 253, 0.92);
+    border-bottom: 2rpx solid rgba(81, 71, 255, 0.1);
+  }
+
+  .gm-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .gm-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .gm-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .gm-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .gm-header__title {
+    max-width: 460rpx;
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  /* ===== 搜索 ===== */
+  .gm-search {
+    flex-shrink: 0;
+    padding: 20rpx 32rpx 8rpx;
+  }
+
+  .gm-search__input {
+    height: 76rpx;
+    padding: 0 28rpx;
+    border-radius: 38rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #17171a;
+  }
+
+  .gm-body {
+    flex: 1;
+    min-height: 0;
+    padding: 16rpx 32rpx;
+  }
+
+  .gm-state {
+    padding: 200rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .gm-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 左滑行 ===== */
+  .gm-swipe {
+    position: relative;
+    margin-bottom: 16rpx;
+    border-radius: 20rpx;
+    overflow: hidden;
+  }
+
+  /* 操作区：贴右侧铺在内容层下方，按钮从左到右 = 删除 / 设·撤管理员 / 添加到智联录 */
+  .gm-actions {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: row;
+  }
+
+  .gm-act {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .gm-act--del {
+    width: 128rpx;
+    background-color: #ff4d4f;
+  }
+
+  .gm-act--role {
+    width: 160rpx;
+    background-color: #5147ff;
+  }
+
+  .gm-act--contact {
+    width: 176rpx;
+    background-color: rgba(81, 71, 255, 0.1);
+  }
+
+  .gm-act__text {
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #ffffff;
+  }
+
+  .gm-act__text--contact {
+    color: #5147ff;
+  }
+
+  /* 内容层：盖在操作区上，左滑时 translateX 露出按钮 */
+  .gm-row {
+    padding: 18rpx 24rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    border-radius: 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .gm-ava {
+    width: 84rpx;
+    height: 84rpx;
+    border-radius: 42rpx;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .gm-ava-letter {
+    font-size: 34rpx;
+    line-height: 44rpx;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .gm-col {
+    flex: 1;
+    min-width: 0;
+    margin-left: 20rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .gm-name-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .gm-name {
+    max-width: 380rpx;
+    font-size: 29rpx;
+    line-height: 40rpx;
+    color: #22212a;
+  }
+
+  .gm-tag {
+    margin-left: 12rpx;
+    padding: 2rpx 12rpx;
+    border-radius: 8rpx;
+    background-color: rgba(81, 71, 255, 0.1);
+  }
+
+  .gm-tag--owner {
+    background-color: rgba(240, 176, 106, 0.22);
+  }
+
+  .gm-tag__text {
+    font-size: 20rpx;
+    line-height: 30rpx;
+    color: #5147ff;
+  }
+
+  .gm-sub {
+    margin-top: 4rpx;
+    font-size: 22rpx;
+    line-height: 32rpx;
+    color: #9a98a5;
+  }
+
+  .gm-tail {
+    height: 40rpx;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  /* #endif */
+</style>

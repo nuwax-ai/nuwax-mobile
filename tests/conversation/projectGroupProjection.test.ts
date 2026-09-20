@@ -13,6 +13,7 @@ import {
   computeProjectHasMore,
   needsProjectChase,
   appendProjectGroupsDedup,
+  reconcileProjectGroups,
   mapProjectTotalPages,
 } from "@/utils/projectGroupProjection.uts";
 
@@ -187,6 +188,38 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     const c = new ProjectGroupView();
     c.id = 3;
     expect(appendProjectGroupsDedup([a], [c]).length).toBe(2);
+  });
+
+  it("reconcileProjectGroups：服务端字段和顺序更新，同时保留展开态与已加载子会话", () => {
+    const current = new ProjectGroupView();
+    current.id = 1;
+    current.name = "旧名称";
+    current.expanded = false;
+    current.childrenLoaded = true;
+    const child = new ProjectChildView();
+    child.id = 11;
+    current.children = [child];
+
+    const removed = new ProjectGroupView();
+    removed.id = 2;
+
+    const fresh = new ProjectGroupView();
+    fresh.id = 1;
+    fresh.name = "新名称";
+    fresh.pinned = true;
+
+    const added = new ProjectGroupView();
+    added.id = 3;
+    added.name = "新增";
+
+    const result = reconcileProjectGroups([current, removed], [added, fresh]);
+    expect(result.map((item) => item.id)).toEqual([3, 1]);
+    expect(result.find((item) => item.id === 2)).toBeUndefined();
+    expect(result[1].name).toBe("新名称");
+    expect(result[1].pinned).toBe(true);
+    expect(result[1].expanded).toBe(false);
+    expect(result[1].childrenLoaded).toBe(true);
+    expect(result[1].children[0].id).toBe(11);
   });
 
   it("mapProjectTotalPages：回读 pages 数值，缺失/非数回 0", () => {

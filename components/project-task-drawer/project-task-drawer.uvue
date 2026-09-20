@@ -313,6 +313,13 @@
     ProjectGroupView,
     mapProjectTabResponse,
     mapProjectChildren,
+    mapProjectTotalPages,
+    appendProjectGroupsDedup,
+    computeProjectHasMore,
+    needsProjectChase,
+    PROJECT_PAGE_SIZE,
+    MIN_VISIBLE_PROJECTS,
+    MAX_PROJECT_CHASE_PAGES,
   } from "@/utils/projectGroupProjection.uts";
   import noData from "@/static/assets/no_data.png";
 
@@ -351,6 +358,11 @@
   let projectLoadedOnce = false;
   let projectRequestPromise: Promise<boolean> | null = null;
   let projectFavoritesMigrationTriggered = false;
+  // 分页游标（对齐 PC ProjectList 2026-09-20：pageSize=20 + 触底加载 + 刷新追拉）
+  let projectNextPage = 1;
+  let projectHasMore = false;
+  let projectTotalPagesCache = 0;
+  let projectLoadingMore = false;
 
   /** 项目行视图模型（类型标签已按需求去除，不再展示常规/全栈/网页应用标记） */
   class ProjectRowView {
@@ -436,29 +448,82 @@
     });
   }
 
+  /** 统计累计数据中非归档项目数（chase 判定的「可见行」口径，对齐 visibleProjectGroups 过滤） */
+  function countVisibleProjects(groups: ProjectGroupView[]): number {
+    let count = 0;
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      if (group != null && group.archived != true) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 拉一页项目并投影；返回 null=请求失败（调用方决定保留/中止），空数组=成功但无行。
+   * 同时回写 projectTotalPagesCache。
+   */
+  async function fetchProjectPage(page: number): Promise<ProjectGroupView[] | null> {
+    const res = await apiUserProjectTabPageQuery(page, PROJECT_PAGE_SIZE);
+    if (apiResCode(res) != SUCCESS_CODE) {
+      return null;
+    }
+    const data = apiResData<any>(res);
+    projectTotalPagesCache = mapProjectTotalPages(data);
+    return mapProjectTabResponse(data, formatTimeLabel);
+  }
+
   async function fetchProjects(): Promise<boolean> {
     try {
-      const res = await apiUserProjectTabPageQuery();
-      if (apiResCode(res) == SUCCESS_CODE) {
-        projectGroupsData = mapProjectTabResponse(apiResData<any>(res), formatTimeLabel);
-        // 默认展开首个项目（对齐设计稿层级感）；子会话统一接口不回包，展开时懒加载
-        for (let g = 0; g < projectGroupsData.length; g++) {
-          projectGroupsData[g].expanded = g == 0;
+      // 刷新：页码 1 起，前端过滤（归档）后可见行不足 MIN_VISIBLE_PROJECTS 时继续追拉
+      // （归档项回包含但被过滤，单页可能稀疏；对齐 PC loadData(isRefresh) + chase）
+      let page = 1;
+      let acc: ProjectGroupView[] = [] as ProjectGroupView[];
+      let lastCount = 0;
+      let visibleCount = 0;
+      let successCount = 0;
+      for (let fetched = 0; fetched < MAX_PROJECT_CHASE_PAGES; fetched++) {
+        if (
+          fetched > 0 &&
+          !needsProjectChase(visibleCount, MIN_VISIBLE_PROJECTS, page - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE)
+        ) {
+          break;
         }
-        projectVersion.value = projectVersion.value + 1;
-        projectLoadedOnce = true;
-        // 首个可见项目立即预取子会话（默认展开态）
-        if (projectGroupsData.length > 0) {
-          loadProjectChildrenIfExpanded(projectGroupsData[0]);
+        const groups = await fetchProjectPage(page);
+        if (groups == null) {
+          // 中途失败：已有数据则保留展示，仅停止追拉
+          break;
         }
-        // 首次加载成功后触发本地项目收藏一次性迁移（幂等，未完成前重试）
-        if (projectFavoritesMigrationTriggered != true) {
-          projectFavoritesMigrationTriggered = true;
-          migrateProjectFavorites();
-        }
-        return true;
+        successCount++;
+        lastCount = groups.length;
+        acc = appendProjectGroupsDedup(acc, groups);
+        visibleCount = countVisibleProjects(acc);
+        page++;
       }
-      return false;
+      // 整轮一页未成功：不动现有数据、维持「未加载过」，下次打开自动重拉（对齐原单发语义）
+      if (successCount == 0) {
+        return false;
+      }
+      projectGroupsData = acc;
+      projectNextPage = page;
+      projectHasMore = computeProjectHasMore(page - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
+      // 默认展开首个项目（对齐设计稿层级感）；子会话统一接口不回包，展开时懒加载
+      for (let g = 0; g < projectGroupsData.length; g++) {
+        projectGroupsData[g].expanded = g == 0;
+      }
+      projectVersion.value = projectVersion.value + 1;
+      projectLoadedOnce = true;
+      // 首个可见项目立即预取子会话（默认展开态）
+      if (projectGroupsData.length > 0) {
+        loadProjectChildrenIfExpanded(projectGroupsData[0]);
+      }
+      // 首次加载成功后触发本地项目收藏一次性迁移（幂等，未完成前重试）
+      if (projectFavoritesMigrationTriggered != true) {
+        projectFavoritesMigrationTriggered = true;
+        migrateProjectFavorites();
+      }
+      return true;
     } catch (error) {
       console.error("fetchProjects error:", error);
       return false;
@@ -1121,8 +1186,38 @@
     performRefresh();
   }
 
-  /** 容器触底：任务列表加载下一页。 */
+  /** 触底加载项目下一页（对齐 PC loadData 翻页语义：拉一页、去重追加、保留展开态不重置）。 */
+  async function loadMoreProjects(): Promise<void> {
+    if (projectHasMore != true || projectLoadingMore || projectRequestPromise != null) {
+      return;
+    }
+    projectLoadingMore = true;
+    try {
+      const groups = await fetchProjectPage(projectNextPage);
+      if (groups == null || groups.length == 0) {
+        // 失败/空页：置停触底重试（下拉刷新恢复），避免触底风暴
+        projectHasMore = false;
+        return;
+      }
+      const lastCount = groups.length;
+      projectGroupsData = appendProjectGroupsDedup(projectGroupsData, groups);
+      projectNextPage = projectNextPage + 1;
+      projectHasMore = computeProjectHasMore(projectNextPage - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
+      projectVersion.value = projectVersion.value + 1;
+    } catch (error) {
+      console.error("loadMoreProjects error:", error);
+      projectHasMore = false;
+    } finally {
+      projectLoadingMore = false;
+    }
+  }
+
+  /** 容器触底：项目未加载完先拉项目下一页，完了交任务列表加载下一页。 */
   function handleScrollTolower(): void {
+    if (projectHasMore == true) {
+      loadMoreProjects();
+      return;
+    }
     callRefMethod(taskListRef.value, "loadMore");
   }
 

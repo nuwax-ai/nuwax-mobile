@@ -6,6 +6,23 @@
 
 ---
 
+## 09-19/20 批次（已实施，2026-09-20 同步完成）
+
+PC `d05c09d2e..9d0d7207a`（09-19~20 会话渲染相关 5 项，全部落地）：
+
+| 项 | PC 提交 | 移动端落点 | 状态 |
+|---|---|---|---|
+| 组头终态计数（运行中保持动词词条不计数；终态按 kind 计数拼接「读取了 2 个文件 · 运行了 1 条命令」，file-edit 全 isCreate 用创建变体） | `e2d2a3626` | `conversationTrace.uts` 新增 `toolGroupCountI18nKey`；`tool-trace-group` groupTitle 终态走计数词条；i18n 四语言 9 条 | ✅ 已验收 |
+| 待办卡 TodoTraceNode（Plan 结构化清单专属：「待办」+ N/M + 浅灰圆角面板三态项：完成=绿圈勾+删除线/进行中=›+主色加粗/待办=空心圆/失败=红✗；运行中默认展开、结束自动收起一次、历史收起；无步骤回落普通行） | `e2d2a3626`+`78dde1ebd` | `plan-trace-row.uvue` 重写为待办卡+回落行；ai-msg 节点展开状态机扩展（todo 运行默认展开 + `previousRunningTodoNodes`/`autoCollapsedTodoNodes` 收起一次） | ✅ 已验收 |
+| 折叠箭头统一 caret（四处：节点/组头/待办卡/轨迹头 → SvgIcon caret_down） | `78dde1ebd` | 移动端五处（轨迹头/组头/工具行/待办卡/思考行）统一 caret SVG mask（iconfont 无该字形，复用终端图标同法，background-color 染色 + -90°/0° 旋转） | ✅ 已验收 |
+| 思考行运行中「正在思考」ticker（首行内容单行贴尾跟随）+ RunOver 去扫光 | `b1df18e12` | ai-msg 思考头：运行态「正在思考 · <首行>」scroll-view 贴尾（scroll-left 递增+动画）；RunOver 无对应物不同步 | ✅ 已验收 |
+| 思考完成时长「思考 · 持续了 N 秒」（投影层锚点：首见思考打点、翻完成收口；历史无锚不显示） | `e2d2a3626` | ai-msg `thinkAnchorStartMs`/`thinkDurationSec`（watch thinkContent 打点、watch isThinkingFinished 收口；消息切换重置）；「已思考 · 持续了 N 秒」 | ✅ 已验收 |
+| OpenUI 产物常显（轨迹收起态保持显示；inline/sidecar 两形态） | `d414f972f` | ai-msg 新增 `.openui-persistent` 收起态常显区（展开态仍原位渲染）；sidecar 预览面板为 PC 桌面交互，移动端保持 mp-html openui-card 现状 | ✅ 已验收（常显部分） |
+
+该批次不同步项：胶囊 OpenUI 分区（随胶囊定调）、runtime 收尾链/SESSION_RESUME/文件树懒加载（PC runtime 架构专属）、消息区横向滚动收敛（PC 布局）、休眠控制（PC 宿主壳）。
+
+---
+
 ## 一、建议同步（按优先级）
 
 ### P1 · 运行行扫光动效（小，纯样式，建议本迭代做）

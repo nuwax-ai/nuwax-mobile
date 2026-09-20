@@ -1773,6 +1773,77 @@
     sendWithRow(row);
   }
 
+  /**
+   * 媒体发送核心（与 PC 端 sendAttachment 单附件链路对齐）：
+   * uploadSingleFile 拿远端 url/size/mime → 按 mime 定 msgType（image/* → image，
+   * 其余 file）→ apiImSendMediaMsg → 确认行按真实类型重建媒体字段后原位替换。
+   */
+  async function sendMediaWithRow(
+    row: ImMsgRow,
+    localPath: string,
+    displayName: string,
+  ): Promise<void> {
+    row.status = 0;
+    try {
+      const up = await uploadSingleFile(localPath, row.clientMsgId, null, displayName);
+      if (up.success != true || up.file == null) {
+        markRowFailed(row.clientMsgId);
+        const reason = up.error != null ? `${up.error}` : "";
+        uni.showToast({
+          title: reason.length > 0 ? reason : t("Mobile.Message.sendFailed"),
+          icon: "none",
+        });
+        return;
+      }
+      const file = up.file;
+      const kind = file.type.indexOf("image/") == 0 ? "image" : "file";
+      const res = await apiImSendMediaMsg(
+        convId.value,
+        kind,
+        file.url,
+        file.name,
+        file.size,
+        file.type,
+        row.clientMsgId,
+      );
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const confirmed = buildConfirmedRow(dataObj, row);
+        confirmed.msgType = kind;
+        if (kind == "image") {
+          confirmed.imageUrl = file.url;
+          confirmed.linkAtts = [];
+        } else {
+          const att = new ImMsgAtt();
+          att.url = file.url;
+          att.fileName = file.name;
+          att.mime = file.type;
+          confirmed.imageUrl = "";
+          confirmed.linkAtts = [att];
+        }
+        replaceByClientMsgId(confirmed);
+        // /api/f/ 受保护地址解析：拿替换进列表后的代理实例改属性才会触发刷新
+        const proxied = findRowByClientMsgId(confirmed.clientMsgId);
+        if (proxied != null) {
+          resolveRowMedia(proxied);
+        }
+        reportReadIfNeeded(maxSeq());
+        scrollToBottom();
+      } else {
+        markRowFailed(row.clientMsgId);
+        const message = apiResMessage(res);
+        uni.showToast({
+          title: message.length > 0 ? message : t("Mobile.Message.sendFailed"),
+          icon: "none",
+        });
+      }
+    } catch (_error) {
+      markRowFailed(row.clientMsgId);
+      uni.showToast({ title: t("Mobile.Message.sendFailed"), icon: "none" });
+    }
+  }
+
   /** 失败行点击重试：复用同一 clientMsgId，服务端幂等保证不会发重（媒体行走上传重发）。 */
   function handleBubbleTap(msg: ImMsgRow): void {
     if (msg.status == 2 && msg.local) {
@@ -2151,9 +2222,9 @@
     }
     // 低位代理结尾：连带其高位代理（一个码点两个单元）
     if (cut > 0) {
-      const tail = text.charCodeAt(cut - 1);
+      const tail = text.charCodeAt(cut - 1) ?? 0;
       if (tail >= 0xdc00 && tail <= 0xdfff && cut > 1) {
-        const prev = text.charCodeAt(cut - 2);
+        const prev = text.charCodeAt(cut - 2) ?? 0;
         if (prev >= 0xd800 && prev <= 0xdbff) {
           cut--;
         }
@@ -2161,15 +2232,15 @@
     }
     cut--;
     // ZWJ 结尾：组合 emoji 的连接符，连带再剥掉前一个码点（同样先吞 FE0F/代理对）
-    if (cut > 0 && text.charCodeAt(cut - 1) == 0x200d) {
+    if (cut > 0 && (text.charCodeAt(cut - 1) ?? -1) == 0x200d) {
       cut--;
-      if (cut > 0 && text.charCodeAt(cut - 1) == 0xfe0f) {
+      if (cut > 0 && (text.charCodeAt(cut - 1) ?? -1) == 0xfe0f) {
         cut--;
       }
       if (cut > 0) {
-        const tail2 = text.charCodeAt(cut - 1);
+        const tail2 = text.charCodeAt(cut - 1) ?? 0;
         if (tail2 >= 0xdc00 && tail2 <= 0xdfff && cut > 1) {
-          const prev2 = text.charCodeAt(cut - 2);
+          const prev2 = text.charCodeAt(cut - 2) ?? 0;
           if (prev2 >= 0xd800 && prev2 <= 0xdbff) {
             cut--;
           }
@@ -2181,6 +2252,38 @@
       cut = 0;
     }
     inputText.value = text.substring(0, cut);
+  }
+
+  /**
+   * 媒体消息入队：先以本地内容乐观渲染（图片直接显本地路径，文件先出卡片占位），
+   * 再走上传+发送。isImage：相册/拍摄恒 true（与 PC kindOf 口径一致）；
+   * H5 文件入口传 false，上传后按返回 mime 判定最终类型。
+   */
+  function queueMediaRow(localPath: string, displayName: string, isImage: boolean): void {
+    if (convId.value.length == 0 || localPath.length == 0) {
+      return;
+    }
+    const clientMsgId = generateUUID();
+    const row = new ImMsgRow();
+    row.msgId = `local-${clientMsgId}`;
+    row.clientMsgId = clientMsgId;
+    row.local = true;
+    row.localPath = localPath;
+    row.sendTime = Date.now();
+    row.status = 0;
+    if (isImage) {
+      row.msgType = "image";
+      row.imageUrl = localPath;
+    } else {
+      row.msgType = "file";
+      const att = new ImMsgAtt();
+      att.url = "";
+      att.fileName = displayName;
+      row.linkAtts = [att];
+    }
+    messages.value.push(row);
+    scrollToBottom();
+    sendMediaWithRow(row, localPath, displayName);
   }
 
   /** 相册 / 拍摄（加号面板）。路径读取与 conversation-input 同款：tempFilePaths 优先、tempFiles.path 兜底。 */
@@ -2259,108 +2362,6 @@
   }
   // #endif
 
-  /**
-   * 媒体消息入队：先以本地内容乐观渲染（图片直接显本地路径，文件先出卡片占位），
-   * 再走上传+发送。isImage：相册/拍摄恒 true（与 PC kindOf 口径一致）；
-   * H5 文件入口传 false，上传后按返回 mime 判定最终类型。
-   */
-  function queueMediaRow(localPath: string, displayName: string, isImage: boolean): void {
-    if (convId.value.length == 0 || localPath.length == 0) {
-      return;
-    }
-    const clientMsgId = generateUUID();
-    const row = new ImMsgRow();
-    row.msgId = `local-${clientMsgId}`;
-    row.clientMsgId = clientMsgId;
-    row.local = true;
-    row.localPath = localPath;
-    row.sendTime = Date.now();
-    row.status = 0;
-    if (isImage) {
-      row.msgType = "image";
-      row.imageUrl = localPath;
-    } else {
-      row.msgType = "file";
-      const att = new ImMsgAtt();
-      att.url = "";
-      att.fileName = displayName;
-      row.linkAtts = [att];
-    }
-    messages.value.push(row);
-    scrollToBottom();
-    sendMediaWithRow(row, localPath, displayName);
-  }
-
-  /**
-   * 媒体发送核心（与 PC 端 sendAttachment 单附件链路对齐）：
-   * uploadSingleFile 拿远端 url/size/mime → 按 mime 定 msgType（image/* → image，
-   * 其余 file）→ apiImSendMediaMsg → 确认行按真实类型重建媒体字段后原位替换。
-   */
-  async function sendMediaWithRow(
-    row: ImMsgRow,
-    localPath: string,
-    displayName: string,
-  ): Promise<void> {
-    row.status = 0;
-    try {
-      const up = await uploadSingleFile(localPath, row.clientMsgId, null, displayName);
-      if (up.success != true || up.file == null) {
-        markRowFailed(row.clientMsgId);
-        const reason = up.error != null ? `${up.error}` : "";
-        uni.showToast({
-          title: reason.length > 0 ? reason : t("Mobile.Message.sendFailed"),
-          icon: "none",
-        });
-        return;
-      }
-      const file = up.file;
-      const kind = file.type.indexOf("image/") == 0 ? "image" : "file";
-      const res = await apiImSendMediaMsg(
-        convId.value,
-        kind,
-        file.url,
-        file.name,
-        file.size,
-        file.type,
-        row.clientMsgId,
-      );
-      if (apiResCode(res) == SUCCESS_CODE) {
-        const dataRaw = apiResData<any>(res);
-        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        const confirmed = buildConfirmedRow(dataObj, row);
-        confirmed.msgType = kind;
-        if (kind == "image") {
-          confirmed.imageUrl = file.url;
-          confirmed.linkAtts = [];
-        } else {
-          const att = new ImMsgAtt();
-          att.url = file.url;
-          att.fileName = file.name;
-          att.mime = file.type;
-          confirmed.imageUrl = "";
-          confirmed.linkAtts = [att];
-        }
-        replaceByClientMsgId(confirmed);
-        // /api/f/ 受保护地址解析：拿替换进列表后的代理实例改属性才会触发刷新
-        const proxied = findRowByClientMsgId(confirmed.clientMsgId);
-        if (proxied != null) {
-          resolveRowMedia(proxied);
-        }
-        reportReadIfNeeded(maxSeq());
-        scrollToBottom();
-      } else {
-        markRowFailed(row.clientMsgId);
-        const message = apiResMessage(res);
-        uni.showToast({
-          title: message.length > 0 ? message : t("Mobile.Message.sendFailed"),
-          icon: "none",
-        });
-      }
-    } catch (_error) {
-      markRowFailed(row.clientMsgId);
-      uni.showToast({ title: t("Mobile.Message.sendFailed"), icon: "none" });
-    }
-  }
 
   function handleBack(): void {
     // 浏览器刷新后本页成为栈底（getCurrentPages 仅剩本页）：navigateBack 无页可退，

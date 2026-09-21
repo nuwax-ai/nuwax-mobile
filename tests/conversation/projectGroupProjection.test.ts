@@ -1,7 +1,7 @@
 /**
- * 项目 tab 接口响应 → 分组视图映射 单元测试。
- * 覆盖：正常映射（projectId 主键/类型/子会话字段）、records 缺失容错、
- * 空数组、conversations 缺失、id/agentId 字符串归一、类型标签 key 映射。
+ * 项目列表接口响应 → 分组视图映射 单元测试。
+ * 覆盖：正常映射（projectId 主键/类型/子会话随行回包 conversations）、records 缺失容错、
+ * 空数组、conversations 缺失、id/agentId 字符串归一、空主题兜底、类型标签 key 映射。
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import {
@@ -20,8 +20,6 @@ import {
   flattenProjectRows,
   PROJECT_FLAT_KIND_GROUP,
   PROJECT_FLAT_KIND_CHILD,
-  PROJECT_FLAT_KIND_LOADING,
-  PROJECT_FLAT_KIND_ERROR,
   PROJECT_FLAT_KIND_EMPTY,
 } from "@/utils/projectGroupProjection.uts";
 
@@ -71,21 +69,41 @@ describe("mapProjectTabResponse", () => {
     expect(groups[1].pinned).toBe(false);
   });
 
-  it("2026-09-14 统一接口：列表行不再回 conversations，children 空、childrenLoaded=false", () => {
+  it("2026-09-21 完整接口：列表行自带 conversations 直接映射子会话 + 空主题兜底", () => {
     const groups = mapProjectTabResponse(
       makeResponse([
         {
           projectId: 1,
           projectType: "NormalProject",
           name: "常规项目B",
-          conversations: [{ id: 11, topic: "旧字段已下线" }], // 防御：即使回包仍带也忽略
+          conversations: [
+            { id: 11, agentId: 5, topic: "会话A", modified: "2026-09-08 15:40:00", taskStatus: "EXECUTING" },
+            { id: 12, agentId: 6, topic: "" },
+          ],
         },
       ]),
       identityFormat,
+      "未命名会话",
+    );
+    expect(groups.length).toBe(1);
+    expect(groups[0].children.length).toBe(2);
+    expect(groups[0].children[0].id).toBe(11);
+    expect(groups[0].children[0].agentId).toBe(5);
+    expect(groups[0].children[0].name).toBe("会话A");
+    expect(groups[0].children[0].taskStatus).toBe("EXECUTING");
+    expect(groups[0].children[0].timeLabel).toBe("[2026-09-08 15:40:00]");
+    // 空主题回退兜底文案（与任务列表「未命名会话」口径一致）
+    expect(groups[0].children[1].name).toBe("未命名会话");
+  });
+
+  it("conversations 字段缺失时 children 为空数组（展示「暂无会话」）", () => {
+    const groups = mapProjectTabResponse(
+      makeResponse([{ projectId: 1, projectType: "NormalProject", name: "无会话项目" }]),
+      identityFormat,
+      "未命名会话",
     );
     expect(groups.length).toBe(1);
     expect(groups[0].children.length).toBe(0);
-    expect(groups[0].childrenLoaded).toBe(false);
   });
 
   it("id/agentId 为字符串时归一为数字", () => {
@@ -100,7 +118,9 @@ describe("mapProjectTabResponse", () => {
       identityFormat,
     );
     expect(groups[0].id).toBe(3);
-    expect(groups[0].children.length).toBe(0);
+    expect(groups[0].children.length).toBe(1);
+    expect(groups[0].children[0].id).toBe(21);
+    expect(groups[0].children[0].agentId).toBe(7);
   });
 
   it("records 缺失或 data 为空时返回空数组", () => {
@@ -118,7 +138,7 @@ describe("mapProjectTabResponse", () => {
   });
 });
 
-describe("mapProjectChildren（子会话懒加载）", () => {
+describe("mapProjectChildren（列表行 conversations 映射）", () => {
   it("数组直入：id/agentId/topic/taskStatus/时间走 formatter", () => {
     const children = mapProjectChildren(
       [
@@ -198,15 +218,14 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     expect(appendProjectGroupsDedup([a], [c]).length).toBe(2);
   });
 
-  it("reconcileProjectGroups：服务端字段和顺序更新，同时保留展开态与已加载子会话", () => {
+  it("reconcileProjectGroups：服务端字段/顺序/子会话以回包为准，仅保留展开态", () => {
     const current = new ProjectGroupView();
     current.id = 1;
     current.name = "旧名称";
     current.expanded = false;
-    current.childrenLoaded = true;
-    const child = new ProjectChildView();
-    child.id = 11;
-    current.children = [child];
+    const staleChild = new ProjectChildView();
+    staleChild.id = 11;
+    current.children = [staleChild];
 
     const removed = new ProjectGroupView();
     removed.id = 2;
@@ -215,6 +234,9 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     fresh.id = 1;
     fresh.name = "新名称";
     fresh.pinned = true;
+    const freshChild = new ProjectChildView();
+    freshChild.id = 99;
+    fresh.children = [freshChild];
 
     const added = new ProjectGroupView();
     added.id = 3;
@@ -225,30 +247,11 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     expect(result.find((item) => item.id === 2)).toBeUndefined();
     expect(result[1].name).toBe("新名称");
     expect(result[1].pinned).toBe(true);
+    // 展开态保留（不整屏回弹）；子会话以服务端回包为准（不沿用本地旧数据）
     expect(result[1].expanded).toBe(false);
-    expect(result[1].childrenLoaded).toBe(true);
-    expect(result[1].children[0].id).toBe(11);
-  });
-
-  it("reconcileProjectGroups：保留子会话懒加载中/失败态（静默刷新不重置三态）", () => {
-    const loadingGroup = new ProjectGroupView();
-    loadingGroup.id = 1;
-    loadingGroup.childrenLoading = true;
-
-    const errorGroup = new ProjectGroupView();
-    errorGroup.id = 2;
-    errorGroup.childrenError = true;
-
-    const fresh1 = new ProjectGroupView();
-    fresh1.id = 1;
-    const fresh2 = new ProjectGroupView();
-    fresh2.id = 2;
-
-    const result = reconcileProjectGroups([loadingGroup, errorGroup], [fresh1, fresh2]);
-    expect(result[0].childrenLoading).toBe(true);
-    expect(result[0].childrenError).toBe(false);
-    expect(result[1].childrenLoading).toBe(false);
-    expect(result[1].childrenError).toBe(true);
+    expect(result[1].children.length).toBe(1);
+    expect(result[1].children[0].id).toBe(99);
+    expect(result[0].expanded).toBe(true);
   });
 
   it("mapProjectTotalPages：回读 pages 数值，缺失/非数回 0", () => {
@@ -299,7 +302,6 @@ describe("flattenProjectRows（Android list-view 扁平化）", () => {
 
   it("展开项目 → 项目行 + 子会话行序，末子行 groupEnd；保持输入顺序", () => {
     const a = makeGroup(1, true);
-    a.childrenLoaded = true;
     a.children = [makeChild(11, "A1"), makeChild(12, "A2")];
     const b = makeGroup(2, false);
     const rows = flattenProjectRows([a, b]);
@@ -317,36 +319,19 @@ describe("flattenProjectRows（Android list-view 扁平化）", () => {
     expect(rows[1].child.name).toBe("A1");
   });
 
-  it("三态互斥：loading / error / 空态各出一行，键带组前缀不撞车", () => {
-    const loading = makeGroup(1, true);
-    loading.childrenLoading = true;
-    const error = makeGroup(2, true);
-    error.childrenError = true;
+  it("展开且无会话 → 项目行 + 空态行，键带组前缀", () => {
     const empty = makeGroup(3, true);
-    empty.childrenLoaded = true;
-    empty.children = [];
-    const rows = flattenProjectRows([loading, error, empty]);
-    expect(rows[1].kind).toBe(PROJECT_FLAT_KIND_LOADING);
-    expect(rows[1].key).toBe("l-1");
-    expect(rows[3].kind).toBe(PROJECT_FLAT_KIND_ERROR);
-    expect(rows[3].key).toBe("e-2");
-    expect(rows[5].kind).toBe(PROJECT_FLAT_KIND_EMPTY);
-    expect(rows[5].key).toBe("n-3");
-    expect(rows[1].groupEnd && rows[3].groupEnd && rows[5].groupEnd).toBe(true);
-  });
-
-  it("展开但未加载完成且无三态标记（首帧）→ 仅项目行，不猜测子行", () => {
-    const fresh = makeGroup(9, true);
-    const rows = flattenProjectRows([fresh]);
-    expect(rows.length).toBe(1);
+    const rows = flattenProjectRows([empty]);
+    expect(rows.length).toBe(2);
     expect(rows[0].kind).toBe(PROJECT_FLAT_KIND_GROUP);
-    expect(rows[0].groupEnd).toBe(true);
+    expect(rows[1].kind).toBe(PROJECT_FLAT_KIND_EMPTY);
+    expect(rows[1].key).toBe("n-3");
+    expect(rows[1].groupEnd).toBe(true);
   });
 
   it("子会话 id 与其他项目 id 撞车时复合键仍唯一", () => {
     const a = makeGroup(7, false);
     const b = makeGroup(8, true);
-    b.childrenLoaded = true;
     b.children = [makeChild(7, "与项目 7 同号")];
     const rows = flattenProjectRows([a, b]);
     expect(rows.map((r) => r.key)).toEqual(["p-7", "p-8", "c-8-7"]);

@@ -15,6 +15,14 @@ import {
   appendProjectGroupsDedup,
   reconcileProjectGroups,
   mapProjectTotalPages,
+  mapProjectTotalCount,
+  remainingProjectCount,
+  flattenProjectRows,
+  PROJECT_FLAT_KIND_GROUP,
+  PROJECT_FLAT_KIND_CHILD,
+  PROJECT_FLAT_KIND_LOADING,
+  PROJECT_FLAT_KIND_ERROR,
+  PROJECT_FLAT_KIND_EMPTY,
 } from "@/utils/projectGroupProjection.uts";
 
 /** 恒等 formatter：仅验证 modified 被传入，时间文案内容不在本测试范围 */
@@ -222,10 +230,126 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     expect(result[1].children[0].id).toBe(11);
   });
 
+  it("reconcileProjectGroups：保留子会话懒加载中/失败态（静默刷新不重置三态）", () => {
+    const loadingGroup = new ProjectGroupView();
+    loadingGroup.id = 1;
+    loadingGroup.childrenLoading = true;
+
+    const errorGroup = new ProjectGroupView();
+    errorGroup.id = 2;
+    errorGroup.childrenError = true;
+
+    const fresh1 = new ProjectGroupView();
+    fresh1.id = 1;
+    const fresh2 = new ProjectGroupView();
+    fresh2.id = 2;
+
+    const result = reconcileProjectGroups([loadingGroup, errorGroup], [fresh1, fresh2]);
+    expect(result[0].childrenLoading).toBe(true);
+    expect(result[0].childrenError).toBe(false);
+    expect(result[1].childrenLoading).toBe(false);
+    expect(result[1].childrenError).toBe(true);
+  });
+
   it("mapProjectTotalPages：回读 pages 数值，缺失/非数回 0", () => {
     expect(mapProjectTotalPages({ records: [], pages: 3 })).toBe(3);
     expect(mapProjectTotalPages({ records: [], pages: "5" })).toBe(5);
     expect(mapProjectTotalPages({ records: [] })).toBe(0);
     expect(mapProjectTotalPages(null)).toBe(0);
+  });
+
+  it("mapProjectTotalCount：回读 total 数值，缺失/非数回 0", () => {
+    expect(mapProjectTotalCount({ records: [], total: 57 })).toBe(57);
+    expect(mapProjectTotalCount({ records: [], total: "42" })).toBe(42);
+    expect(mapProjectTotalCount({ records: [] })).toBe(0);
+    expect(mapProjectTotalCount(null)).toBe(0);
+  });
+
+  it("remainingProjectCount：total - 已加载可见行，未回读/超发钳 0（对齐 PC remainingProjects）", () => {
+    expect(remainingProjectCount(57, 20)).toBe(37);
+    expect(remainingProjectCount(20, 20)).toBe(0);
+    expect(remainingProjectCount(15, 20)).toBe(0);
+    expect(remainingProjectCount(0, 20)).toBe(0);
+  });
+});
+
+describe("flattenProjectRows（Android list-view 扁平化）", () => {
+  function makeGroup(id: number, expanded: boolean): ProjectGroupView {
+    const group = new ProjectGroupView();
+    group.id = id;
+    group.expanded = expanded;
+    return group;
+  }
+
+  function makeChild(id: number, name: string): ProjectChildView {
+    const child = new ProjectChildView();
+    child.id = id;
+    child.name = name;
+    return child;
+  }
+
+  it("收起项目 → 单项目行，groupEnd 补分组间距", () => {
+    const rows = flattenProjectRows([makeGroup(1, false), makeGroup(2, false)]);
+    expect(rows.length).toBe(2);
+    expect(rows[0].kind).toBe(PROJECT_FLAT_KIND_GROUP);
+    expect(rows[0].key).toBe("p-1");
+    expect(rows[0].groupEnd).toBe(true);
+    expect(rows[1].groupEnd).toBe(true);
+  });
+
+  it("展开项目 → 项目行 + 子会话行序，末子行 groupEnd；保持输入顺序", () => {
+    const a = makeGroup(1, true);
+    a.childrenLoaded = true;
+    a.children = [makeChild(11, "A1"), makeChild(12, "A2")];
+    const b = makeGroup(2, false);
+    const rows = flattenProjectRows([a, b]);
+    expect(rows.map((r) => r.kind)).toEqual([
+      PROJECT_FLAT_KIND_GROUP,
+      PROJECT_FLAT_KIND_CHILD,
+      PROJECT_FLAT_KIND_CHILD,
+      PROJECT_FLAT_KIND_GROUP,
+    ]);
+    expect(rows.map((r) => r.key)).toEqual(["p-1", "c-1-11", "c-1-12", "p-2"]);
+    expect(rows[2].groupEnd).toBe(true);
+    expect(rows[3].groupEnd).toBe(true);
+    expect(rows[1].groupId).toBe(1);
+    expect(rows[1].childId).toBe(11);
+    expect(rows[1].child.name).toBe("A1");
+  });
+
+  it("三态互斥：loading / error / 空态各出一行，键带组前缀不撞车", () => {
+    const loading = makeGroup(1, true);
+    loading.childrenLoading = true;
+    const error = makeGroup(2, true);
+    error.childrenError = true;
+    const empty = makeGroup(3, true);
+    empty.childrenLoaded = true;
+    empty.children = [];
+    const rows = flattenProjectRows([loading, error, empty]);
+    expect(rows[1].kind).toBe(PROJECT_FLAT_KIND_LOADING);
+    expect(rows[1].key).toBe("l-1");
+    expect(rows[3].kind).toBe(PROJECT_FLAT_KIND_ERROR);
+    expect(rows[3].key).toBe("e-2");
+    expect(rows[5].kind).toBe(PROJECT_FLAT_KIND_EMPTY);
+    expect(rows[5].key).toBe("n-3");
+    expect(rows[1].groupEnd && rows[3].groupEnd && rows[5].groupEnd).toBe(true);
+  });
+
+  it("展开但未加载完成且无三态标记（首帧）→ 仅项目行，不猜测子行", () => {
+    const fresh = makeGroup(9, true);
+    const rows = flattenProjectRows([fresh]);
+    expect(rows.length).toBe(1);
+    expect(rows[0].kind).toBe(PROJECT_FLAT_KIND_GROUP);
+    expect(rows[0].groupEnd).toBe(true);
+  });
+
+  it("子会话 id 与其他项目 id 撞车时复合键仍唯一", () => {
+    const a = makeGroup(7, false);
+    const b = makeGroup(8, true);
+    b.childrenLoaded = true;
+    b.children = [makeChild(7, "与项目 7 同号")];
+    const rows = flattenProjectRows([a, b]);
+    expect(rows.map((r) => r.key)).toEqual(["p-7", "p-8", "c-8-7"]);
+    expect(new Set(rows.map((r) => r.key)).size).toBe(3);
   });
 });

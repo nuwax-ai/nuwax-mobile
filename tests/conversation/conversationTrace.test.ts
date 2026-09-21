@@ -15,6 +15,7 @@ import {
   getRowsGroupStatus,
   getToolTraceActionKind,
   projectTurnTrace,
+  readTracePlanSteps,
   stripContainerTags,
   toolGroupCountI18nKey,
   toolTraceActionI18nKey,
@@ -166,6 +167,55 @@ describe("分组投影", () => {
     const kinds = p.items.map((item) => item.kind);
     expect(kinds).toEqual(["tool-row", "plan", "tool-row"]);
     expect(p.items[1].row?.componentType).toBe("Plan");
+  });
+
+  it("真实 update_plan ToolCall 在组内保留 todo 行与结构化步骤", () => {
+    const todos = [
+      { content: "初始化 workspace", status: "in_progress" },
+      { content: "实现前端", status: "pending" },
+    ];
+    const p = project({
+      body:
+        tag("p1", "ToolCall", "FINISHED", "2 todos") +
+        "\n" +
+        tag("e1", "ToolCall", "FINISHED", "执行命令 ls"),
+      processing: [
+        processing("p1", "ToolCall", "2 todos", "FINISHED", {
+          input: { todos },
+          data: todos,
+        }),
+        processing("e1", "ToolCall", "执行命令 ls", "FINISHED", {
+          kind: "execute",
+          input: { command: "ls" },
+        }),
+      ],
+    });
+    expect(p.items).toHaveLength(1);
+    expect(p.items[0].kind).toBe("tool-group");
+    expect(p.items[0].rows.map((row) => row.kind)).toEqual([
+      "todo",
+      "terminal",
+    ]);
+    expect(p.items[0].rows[0].planSteps).toEqual([
+      { content: "初始化 workspace", status: "in_progress" },
+      { content: "实现前端", status: "pending" },
+    ]);
+  });
+
+  it("单独出现的 update_plan ToolCall 使用 plan 展示项", () => {
+    const todos = [{ content: "回归验证", status: "pending" }];
+    const p = project({
+      body: tag("p1", "ToolCall", "FINISHED", "1 todos"),
+      processing: [
+        processing("p1", "ToolCall", "1 todos", "FINISHED", {
+          input: { todos },
+          data: todos,
+        }),
+      ],
+    });
+    expect(p.items).toHaveLength(1);
+    expect(p.items[0].kind).toBe("plan");
+    expect(p.items[0].row?.planSteps).toHaveLength(1);
   });
 
   it("OpenUI 切断分组且输出规范化 HTML 标签段", () => {
@@ -369,6 +419,38 @@ describe("状态解析", () => {
 // ---------------------------------------------------------------------------
 // 工具类型识别（协议优先 → componentType → 名称启发式）
 // ---------------------------------------------------------------------------
+
+describe("Plan 步骤协议兼容", () => {
+  it("优先读取标准 result.data", () => {
+    expect(
+      readTracePlanSteps({
+        data: [
+          { content: "步骤一", status: "completed" },
+          { content: "步骤二", status: "unknown" },
+        ],
+      }),
+    ).toEqual([
+      { content: "步骤一", status: "completed" },
+      { content: "步骤二", status: "pending" },
+    ]);
+  });
+
+  it("兼容 PC 实际 payload 的 result.input.todos", () => {
+    expect(
+      readTracePlanSteps({
+        input: {
+          todos: [
+            { content: "初始化 workspace", status: "in_progress" },
+            { content: "构建验证", status: "pending" },
+          ],
+        },
+      }),
+    ).toEqual([
+      { content: "初始化 workspace", status: "in_progress" },
+      { content: "构建验证", status: "pending" },
+    ]);
+  });
+});
 
 describe("工具类型识别", () => {
   it("result.data 含 type=terminal / diff 优先", () => {

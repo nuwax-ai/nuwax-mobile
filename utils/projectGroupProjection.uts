@@ -28,8 +28,12 @@ export class ProjectGroupView {
   projectType: string = "";
   expanded: boolean = true;
   children: ProjectChildView[] = [] as ProjectChildView[];
-  /** 子会话是否已懒加载过（统一列表接口不回 conversations，展开时经懒加载接口补拉） */
+  /** 子会话是否已懒加载成功过（统一列表接口不回 conversations，展开时经懒加载接口补拉） */
   childrenLoaded: boolean = false;
+  /** 子会话懒加载请求进行中（展开区显示加载态而非空态） */
+  childrenLoading: boolean = false;
+  /** 子会话懒加载失败且尚未成功过（失败态可重试；成功过则走 childrenLoaded 口径） */
+  childrenError: boolean = false;
   /** 服务端标记（2026-09-13 列表回读打标；PageApp 契约未覆盖时本地兜底） */
   pinned: boolean = false;
   archived: boolean = false;
@@ -269,6 +273,8 @@ export function reconcileProjectGroups(
       fresh.expanded = existing.expanded;
       fresh.childrenLoaded = existing.childrenLoaded;
       fresh.children = existing.children;
+      fresh.childrenLoading = existing.childrenLoading;
+      fresh.childrenError = existing.childrenError;
     } else {
       // 后台更新发现的新项目默认收起，避免打开抽屉时内容高度突跳。
       fresh.expanded = false;
@@ -296,8 +302,134 @@ export function mapProjectTotalPages(data: any | null): number {
     if (raw != null) {
       const parsed = parseFloat(`${raw}`);
       if (parsed != parsed) return 0;
-      return parsed as number;
+      return parsed;
     }
   }
   return 0;
+}
+
+/** 解析回包 total 总行数（0=未回读；兼容 UTSJSONObject/普通对象）。 */
+export function mapProjectTotalCount(data: any | null): number {
+  if (data == null) return 0;
+  if (data instanceof UTSJSONObject) {
+    const raw = (data as UTSJSONObject)["total"];
+    if (raw != null) {
+      const parsed = parseFloat(`${raw}`);
+      if (parsed != parsed) return 0;
+      return parsed as number;
+    }
+    return 0;
+  }
+  if (typeof data == "object") {
+    const obj = data as Record<string, any>;
+    const raw = obj["total"];
+    if (raw != null) {
+      const parsed = parseFloat(`${raw}`);
+      if (parsed != parsed) return 0;
+      return parsed;
+    }
+  }
+  return 0;
+}
+
+/** 剩余未加载数（对齐 PC remainingProjects：total 未回读或超发时钳为 0） */
+export function remainingProjectCount(totalCount: number, loadedVisible: number): number {
+  if (totalCount <= 0) return 0;
+  return Math.max(0, totalCount - loadedVisible);
+}
+
+// ============================================================
+// 项目树 → 扁平行（Android list-view 修复 2026-09-21）：
+// sticky-section 内 list-item 格高突变（展开 v-if 子树）后 section
+// 不重排，项目块溢出到任务区（真机复现：项目行全部渲染在任务头之下）。
+// 改为展开 = 增删单元格（list-view 标准数据驱动路径，分组头折叠 v-if
+// 同机制 09-20 实测正常），每格内容高度恒定。
+// ============================================================
+
+/** 扁平行 kind 常量：项目行 / 子会话行 / 子会话加载中 / 加载失败(可重试) / 空态 */
+export const PROJECT_FLAT_KIND_GROUP = 0;
+export const PROJECT_FLAT_KIND_CHILD = 1;
+export const PROJECT_FLAT_KIND_LOADING = 2;
+export const PROJECT_FLAT_KIND_ERROR = 3;
+export const PROJECT_FLAT_KIND_EMPTY = 4;
+
+/** 扁平行视图（group/child 给默认实例避免可空访问；非对应 kind 的引用不被渲染） */
+export class ProjectFlatRow {
+  kind: number = 0;
+  /** 复合键：p-{projectId} / c-{projectId}-{conversationId} / l-|e-|n-{projectId} */
+  key: string = "";
+  groupId: number = 0;
+  childId: number = 0;
+  /** 所属项目组的最后一行（补分组间距，替代原 .project-block 的 padding-bottom） */
+  groupEnd: boolean = false;
+  group: ProjectGroupView = new ProjectGroupView();
+  child: ProjectChildView = new ProjectChildView();
+}
+
+/**
+ * 项目分组序 → 扁平行序（保持输入顺序；展开项目按
+ * loading → error → 空 → 子会话行 的互斥三态展开，与 scroll-view 分支口径一致）。
+ */
+export function flattenProjectRows(groups: ProjectGroupView[]): ProjectFlatRow[] {
+  const rows: ProjectFlatRow[] = [] as ProjectFlatRow[];
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i];
+    if (group == null) continue;
+    const groupRow = new ProjectFlatRow();
+    groupRow.kind = PROJECT_FLAT_KIND_GROUP;
+    groupRow.key = `p-${group.id}`;
+    groupRow.groupId = group.id;
+    groupRow.group = group;
+    rows.push(groupRow);
+    if (group.expanded != true) {
+      markGroupEnd(rows);
+      continue;
+    }
+    if (group.childrenLoading) {
+      const stateRow = new ProjectFlatRow();
+      stateRow.kind = PROJECT_FLAT_KIND_LOADING;
+      stateRow.key = `l-${group.id}`;
+      stateRow.groupId = group.id;
+      rows.push(stateRow);
+      markGroupEnd(rows);
+      continue;
+    }
+    if (group.childrenError) {
+      const stateRow = new ProjectFlatRow();
+      stateRow.kind = PROJECT_FLAT_KIND_ERROR;
+      stateRow.key = `e-${group.id}`;
+      stateRow.groupId = group.id;
+      rows.push(stateRow);
+      markGroupEnd(rows);
+      continue;
+    }
+    if (group.childrenLoaded && group.children.length == 0) {
+      const stateRow = new ProjectFlatRow();
+      stateRow.kind = PROJECT_FLAT_KIND_EMPTY;
+      stateRow.key = `n-${group.id}`;
+      stateRow.groupId = group.id;
+      rows.push(stateRow);
+      markGroupEnd(rows);
+      continue;
+    }
+    for (let c = 0; c < group.children.length; c++) {
+      const child = group.children[c];
+      if (child == null) continue;
+      const childRow = new ProjectFlatRow();
+      childRow.kind = PROJECT_FLAT_KIND_CHILD;
+      childRow.key = `c-${group.id}-${child.id}`;
+      childRow.groupId = group.id;
+      childRow.childId = child.id;
+      childRow.child = child;
+      rows.push(childRow);
+    }
+    markGroupEnd(rows);
+  }
+  return rows;
+}
+
+/** 给序里最后一个项目组的末行补分组间距标记 */
+function markGroupEnd(rows: ProjectFlatRow[]): void {
+  if (rows.length == 0) return;
+  rows[rows.length - 1].groupEnd = true;
 }

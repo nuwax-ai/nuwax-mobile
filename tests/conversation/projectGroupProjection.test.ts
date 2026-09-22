@@ -247,11 +247,12 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     expect(result.find((item) => item.id === 2)).toBeUndefined();
     expect(result[1].name).toBe("新名称");
     expect(result[1].pinned).toBe(true);
-    // 展开态保留（不整屏回弹）；子会话以服务端回包为准（不沿用本地旧数据）
+    // 展开态保留（不整屏回弹）；子会话以服务端回包为准（不沿用本地旧数据）；
+    // 静默刷新新发现项目默认收起（防用户浏览中内容整屏推移）
     expect(result[1].expanded).toBe(false);
     expect(result[1].children.length).toBe(1);
     expect(result[1].children[0].id).toBe(99);
-    expect(result[0].expanded).toBe(true);
+    expect(result[0].expanded).toBe(false);
   });
 
   it("mapProjectTotalPages：回读 pages 数值，缺失/非数回 0", () => {

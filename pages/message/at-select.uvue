@@ -1,0 +1,830 @@
+<template>
+  <view class="at-page">
+    <safety-zone />
+
+    <!-- 顶部：✕ 关闭 / 标题 / 多选⇄取消 -->
+    <view class="at-header">
+      <view class="at-header__btn" hover-class="at-header__btn--active" @click="handleClose">
+        <svg-icon name="icon-X" size="36" color="#141416" />
+      </view>
+      <text class="at-header__title">{{ t("Mobile.Message.mentionSelectTitle") }}</text>
+      <view class="at-header__multi" hover-class="at-header__multi--active" @click="toggleMulti">
+        <text class="at-header__multi-text">{{ multiMode ? t("Mobile.Common.cancel") : t("Mobile.Message.mentionMultiSelect") }}</text>
+      </view>
+    </view>
+
+    <!-- 搜索框 -->
+    <view class="at-search">
+      <view class="at-search__box">
+        <svg-icon name="icon-Search" size="32" color="#9999a3" />
+        <input
+          class="at-search__input"
+          v-model="query"
+          :placeholder="t('Mobile.Message.mentionSearchPlaceholder')"
+          placeholder-style="color:#b0aebc"
+        />
+        <view
+          v-if="query.length > 0"
+          class="at-search__clear"
+          hover-class="at-search__clear--active"
+          @click="clearQuery"
+        >
+          <svg-icon name="icon-X" size="24" color="#9999a3" />
+        </view>
+      </view>
+    </view>
+
+    <!-- 成员列表 + 右侧字母索引 -->
+    <view class="at-body-wrap">
+      <scroll-view
+        class="at-body"
+        direction="vertical"
+        :show-scrollbar="false"
+        :scroll-into-view="anchor"
+      >
+        <!-- 所有人（仅群聊·单选态；多选时隐藏） -->
+        <view
+          v-if="showAllRow"
+          class="at-row"
+          hover-class="at-row--active"
+          @click="handleAllTap"
+        >
+          <view class="at-ava at-ava--all" :style="{ backgroundImage: avatarGradient(MENTION_ALL) }">
+            <text class="at-ava__letter">@</text>
+          </view>
+          <text class="at-name text-ellipsis">{{ MENTION_ALL }}</text>
+        </view>
+
+        <!-- 拼音首字母分组 -->
+        <view v-for="g in groups" :key="g.letter" :id="anchorIdOf(g.letter)">
+          <view class="at-group-head">
+            <text class="at-group-head__text">{{ g.letter }}</text>
+          </view>
+          <view
+            v-for="m in g.members"
+            :key="m.userId"
+            class="at-row"
+            hover-class="at-row--active"
+            @click="handleRowTap(m)"
+          >
+            <view
+              v-if="multiMode"
+              class="at-check"
+              :class="{ 'at-check--on': isSelected(m) }"
+            >
+              <svg-icon v-if="isSelected(m)" name="icon-Check" size="22" color="#ffffff" />
+            </view>
+            <image
+              v-if="m.avatar.length > 0 && m.avatarFailed != true"
+              class="at-ava"
+              :src="m.avatar"
+              mode="aspectFill"
+              @error="handleAvaError(m)"
+            />
+            <view v-else class="at-ava" :style="{ backgroundImage: avatarGradient(m.token) }">
+              <text class="at-ava__letter">{{ avatarLetter(m.token) }}</text>
+            </view>
+            <text class="at-name text-ellipsis">{{ m.token }}</text>
+          </view>
+        </view>
+
+        <view v-if="loading" class="at-state">
+          <text class="at-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+        <view v-else-if="loadFailed" class="at-state" @click="loadMembers">
+          <text class="at-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+        </view>
+        <view v-else-if="groups.length == 0 && showAllRow != true" class="at-state">
+          <text class="at-state__text">{{ t("Mobile.Message.mentionEmpty") }}</text>
+        </view>
+        <view class="at-body-pad" />
+      </scroll-view>
+
+      <!-- 右侧 A-Z 快速定位（只渲染有成员的字母） -->
+      <view class="at-index">
+        <view
+          v-for="L in letters"
+          :key="L"
+          class="at-index__item"
+          hover-class="at-index__item--active"
+          @click="scrollToLetter(L)"
+        >
+          <text class="at-index__text">{{ L }}</text>
+        </view>
+      </view>
+    </view>
+
+    <!-- 多选底栏：已选 N 人 + 确定 -->
+    <view v-if="multiMode" class="at-foot" :style="{ paddingBottom: (8 + safeBottomPx) + 'px' }">
+      <text class="at-foot__count">{{ selectedText }}</text>
+      <view class="at-foot__space" />
+      <view
+        class="at-foot__confirm"
+        :class="{ 'at-foot__confirm--ready': selectedCount > 0 }"
+        hover-class="at-foot__confirm--active"
+        @click="handleConfirm"
+      >
+        <text
+          class="at-foot__confirm-text"
+          :class="{ 'at-foot__confirm-text--ready': selectedCount > 0 }"
+        >{{ t("Mobile.Message.mentionConfirm") }}</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, nextTick, ref } from "vue";
+  import { onLoad, onReady } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiUserInfo } from "@/servers/account";
+  import { apiImConvMembers, IM_AT_PICK_EVENT } from "@/servers/im";
+  import type { RequestResponse } from "@/types/interfaces/request";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { cnFirstLetter } from "@/utils/cn-initials";
+  import { getSafeAreaBottom } from "@/utils/system";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 带数字参数的翻译（已选 {count} 人）。 */
+  const tCount = (key: string, count: number): string => {
+    const m = new Map<string, string | number>();
+    m.set("count", count);
+    return translateFn(key, toI18nParams(m), "");
+  };
+
+  /** "@所有人" 提及 token（与聊天页 MENTION_ALL_TOKEN / PC 端字面量逐字一致，勿走 i18n）。 */
+  const MENTION_ALL = "@所有人";
+
+  /**
+   * 可选成员：userId（雪花号字符串，多选勾选的幂等键；单聊对方无服务端 id 时用 "peer" 占位）
+   * token 是回填正文的提及显示名，须与聊天页插入/发送反扫字节一致。
+   */
+  class AtMember {
+    userId: string = "";
+    token: string = "";
+    avatar: string = "";
+    avatarFailed: boolean = false;
+  }
+
+  /** 首字母分组（A-Z 升序、# 末尾；组内按显示名排）。 */
+  class AtGroup {
+    letter: string = "";
+    members: AtMember[] = [];
+  }
+
+  // ===== 页面入参（聊天页携带）=====
+  const convId = ref<string>("");
+  const convType = ref<number>(1);
+  /** 单聊对方显示名/头像（群聊时仅作会话名，不参与成员）。 */
+  const peerName = ref<string>("");
+  const peerAvatar = ref<string>("");
+
+  // ===== 状态 =====
+  const members = ref<AtMember[]>([]);
+  const loading = ref<boolean>(false);
+  const loadFailed = ref<boolean>(false);
+  const query = ref<string>("");
+  const multiMode = ref<boolean>(false);
+  const selectedIds = ref<string[]>([]);
+  const anchor = ref<string>("");
+  // H5 首帧前 safeAreaInsets 可能为 0，onReady 再刷新（同聊天页）
+  const safeBottomPx = ref<number>(getSafeAreaBottom());
+
+  /** 搜索词（小写匹配用）。 */
+  function normQuery(): string {
+    return query.value.trim().toLowerCase();
+  }
+
+  /** 分组模型：query 过滤 + 首字母分桶 + A-Z 升序（# 末尾）+ 组内按显示名排。 */
+  const groups = computed((): AtGroup[] => {
+    const q = normQuery();
+    const buckets = new Map<string, AtMember[]>();
+    const keys: string[] = [];
+    const all = members.value;
+    for (let i = 0; i < all.length; i++) {
+      const m = all[i];
+      if (q.length > 0 && m.token.toLowerCase().indexOf(q) < 0) {
+        continue;
+      }
+      const letter = cnFirstLetter(m.token);
+      let bucket = buckets.get(letter);
+      if (bucket == null) {
+        bucket = [];
+        buckets.set(letter, bucket);
+        keys.push(letter);
+      }
+      bucket.push(m);
+    }
+    const azKeys: string[] = [];
+    let hasHash = false;
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i] == "#") {
+        hasHash = true;
+      } else {
+        azKeys.push(keys[i]);
+      }
+    }
+    azKeys.sort((a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0));
+    if (hasHash) {
+      azKeys.push("#");
+    }
+    const out: AtGroup[] = [];
+    for (let i = 0; i < azKeys.length; i++) {
+      const bucket = buckets.get(azKeys[i]);
+      if (bucket == null) {
+        continue;
+      }
+      bucket.sort((a: AtMember, b: AtMember): number => (a.token < b.token ? -1 : a.token > b.token ? 1 : 0));
+      const g = new AtGroup();
+      g.letter = azKeys[i];
+      g.members = bucket;
+      out.push(g);
+    }
+    return out;
+  });
+
+  /** 索引条字母（与分组同步，只显示有成员的字母）。 */
+  const letters = computed((): string[] => {
+    const out: string[] = [];
+    const gs = groups.value;
+    for (let i = 0; i < gs.length; i++) {
+      out.push(gs[i].letter);
+    }
+    return out;
+  });
+
+  /** 「所有人」行：群聊 · 单选态 ·（有搜索词时须命中「所有人」）。 */
+  const showAllRow = computed((): boolean => {
+    if (convType.value != 2 || multiMode.value) {
+      return false;
+    }
+    const q = query.value.trim();
+    return q.length == 0 || MENTION_ALL.indexOf(q) >= 0;
+  });
+
+  const selectedCount = computed((): number => selectedIds.value.length);
+
+  const selectedText = computed((): string => tCount("Mobile.Message.mentionSelectedCount", selectedIds.value.length));
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  /** URL 入参读取（聊天页 encodeURIComponent 写入，这里容错解码）。 */
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  /** 分组锚点 id（# 不是合法 id 起始字符，换 hash；与 scrollToLetter 对应）。 */
+  function anchorIdOf(letter: string): string {
+    return `id-${letter == "#" ? "hash" : letter}`;
+  }
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  /** 头像字母底色渐变板（与聊天页 @面板同款六色系，按名字稳定取色）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #f59a9a, #e05f5f)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function isSelected(m: AtMember): boolean {
+    return selectedIds.value.indexOf(m.userId) >= 0;
+  }
+
+  function handleAvaError(m: AtMember): void {
+    m.avatarFailed = true;
+  }
+
+  /**
+   * 成员数据源：群聊拉群成员（同聊天页 loadMembers 的 token 口径
+   * nickName || name || 用户${userId}）；单聊只展示当前用户 + 对方。
+   * 失败出可点击重试的空态。
+   */
+  async function loadMembers(): Promise<void> {
+    if (loading.value) {
+      return;
+    }
+    loading.value = true;
+    loadFailed.value = false;
+    try {
+      const out: AtMember[] = [];
+      if (convType.value == 2) {
+        if (convId.value.length == 0) {
+          loadFailed.value = true;
+          loading.value = false;
+          return;
+        }
+        const res = await apiImConvMembers(convId.value);
+        if (apiResCode(res) != SUCCESS_CODE) {
+          loadFailed.value = true;
+          loading.value = false;
+          return;
+        }
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          const recordsRaw = dataObj["records"];
+          if (recordsRaw != null) {
+            const records = recordsRaw as UTSJSONObject[];
+            for (let i = 0; i < records.length; i++) {
+              const m = new AtMember();
+              m.userId = readString(records[i], "userId");
+              m.token = readString(records[i], "nickName");
+              if (m.token.length == 0) {
+                m.token = readString(records[i], "name");
+              }
+              if (m.token.length == 0) {
+                m.token = `用户${m.userId}`;
+              }
+              m.avatar = readString(records[i], "avatar");
+              if (m.userId.length > 0) {
+                out.push(m);
+              }
+            }
+          }
+        }
+      } else {
+        // 单聊：当前用户（apiUserInfo）+ 对方（入参）
+        const res = await apiUserInfo();
+        if (apiResCode(res) == SUCCESS_CODE) {
+          const dataRaw = apiResData<any>(res);
+          const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+          if (dataObj != null) {
+            const me = new AtMember();
+            me.userId = readString(dataObj, "id");
+            me.token = readString(dataObj, "nickName");
+            if (me.token.length == 0) {
+              me.token = readString(dataObj, "userName");
+            }
+            if (me.token.length == 0 && me.userId.length > 0) {
+              me.token = `用户${me.userId}`;
+            }
+            me.avatar = readString(dataObj, "avatar");
+            if (me.token.length > 0) {
+              out.push(me);
+            }
+          }
+        }
+        const peer = new AtMember();
+        peer.userId = "peer";
+        peer.token = peerName.value;
+        peer.avatar = peerAvatar.value;
+        if (peer.token.length > 0) {
+          out.push(peer);
+        }
+      }
+      members.value = out;
+      loading.value = false;
+    } catch (_error) {
+      loading.value = false;
+      loadFailed.value = true;
+    }
+  }
+
+  /** 多选⇄取消：进多选清搜索词（全员可见）；取消时清空已选回单选。 */
+  function toggleMulti(): void {
+    if (multiMode.value) {
+      selectedIds.value.splice(0, selectedIds.value.length);
+      multiMode.value = false;
+      return;
+    }
+    query.value = "";
+    multiMode.value = true;
+  }
+
+  function clearQuery(): void {
+    query.value = "";
+  }
+
+  /** 点击索引字母：scroll-into-view 滚到分组头（清空再赋值，连续点击才生效）。 */
+  function scrollToLetter(letter: string): void {
+    const target = anchorIdOf(letter);
+    anchor.value = "";
+    nextTick(() => {
+      anchor.value = target;
+    });
+  }
+
+  /** 选中结果回填聊天页（payload 用 UTSJSONObject 包装，跨端类型可靠）并返回。 */
+  function emitPick(tokens: string[]): void {
+    const payload = new UTSJSONObject();
+    payload["tokens"] = tokens;
+    uni.$emit(IM_AT_PICK_EVENT, payload);
+    uni.navigateBack({ delta: 1 });
+  }
+
+  /** 成员行：单选即选即回；多选切换勾选。 */
+  function handleRowTap(m: AtMember): void {
+    if (multiMode.value) {
+      const at = selectedIds.value.indexOf(m.userId);
+      if (at >= 0) {
+        selectedIds.value.splice(at, 1);
+      } else {
+        selectedIds.value.push(m.userId);
+      }
+      return;
+    }
+    emitPick([m.token]);
+  }
+
+  /** 「所有人」行：单选即选即回（token 与聊天页 MENTION_ALL_TOKEN 逐字一致）。 */
+  function handleAllTap(): void {
+    emitPick(["所有人"]);
+  }
+
+  /** 多选确定：按勾选顺序收集 token 回填（空选置灰不可点）。 */
+  function handleConfirm(): void {
+    if (selectedIds.value.length == 0) {
+      return;
+    }
+    const tokens: string[] = [];
+    const all = members.value;
+    for (let i = 0; i < all.length; i++) {
+      if (selectedIds.value.indexOf(all[i].userId) >= 0) {
+        tokens.push(all[i].token);
+      }
+    }
+    emitPick(tokens);
+  }
+
+  function handleClose(): void {
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    convId.value = readOption(options, "convId");
+    const convTypeRaw = readOption(options, "convType");
+    const parsedType = parseFloat(convTypeRaw);
+    convType.value = isNaN(parsedType) ? 1 : parsedType;
+    peerName.value = readOption(options, "name");
+    peerAvatar.value = readOption(options, "avatar");
+    loadMembers();
+  });
+
+  onReady(() => {
+    safeBottomPx.value = getSafeAreaBottom();
+  });
+</script>
+
+<style lang="scss" scoped>
+  .at-page {
+    display: flex;
+    flex-direction: column;
+    /* #ifdef H5 */
+    height: 100%;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+    /* #ifndef H5 */
+    flex: 1;
+    /* #endif */
+    background-color: #ffffff;
+  }
+
+  /* ===== 顶部导航 ===== */
+  .at-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    border-bottom: 2rpx solid #e5e6eb;
+  }
+
+  .at-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .at-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .at-header__title {
+    flex: 1;
+    min-width: 0;
+    text-align: center;
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #1f2329;
+  }
+
+  .at-header__multi {
+    min-width: 72rpx;
+    height: 72rpx;
+    padding: 0 8rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .at-header__multi--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .at-header__multi-text {
+    font-size: 29rpx;
+    line-height: 40rpx;
+    font-weight: 500;
+    color: #1f2329;
+  }
+
+  /* ===== 搜索框 ===== */
+  .at-search {
+    flex-shrink: 0;
+    padding: 20rpx 32rpx;
+  }
+
+  .at-search__box {
+    height: 76rpx;
+    padding: 0 24rpx;
+    border-radius: 16rpx;
+    background-color: #f2f3f5;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .at-search__input {
+    flex: 1;
+    min-width: 0;
+    margin-left: 16rpx;
+    font-size: 29rpx;
+    line-height: 40rpx;
+    color: #17171a;
+  }
+
+  .at-search__clear {
+    width: 48rpx;
+    height: 48rpx;
+    border-radius: 24rpx;
+    background-color: #e0e1e8;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .at-search__clear--active {
+    background-color: #d3d4dc;
+  }
+
+  /* ===== 列表 + 索引条 ===== */
+  .at-body-wrap {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+  }
+
+  .at-body {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .at-body-pad {
+    height: 48rpx;
+  }
+
+  .at-group-head {
+    padding: 20rpx 32rpx 8rpx;
+    background-color: #ffffff;
+  }
+
+  .at-group-head__text {
+    font-size: 24rpx;
+    line-height: 34rpx;
+    font-weight: 600;
+    color: #9a98a5;
+  }
+
+  .at-row {
+    padding: 14rpx 32rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .at-row--active {
+    background-color: #f5f6fa;
+  }
+
+  /* 多选勾选框：圆形，未选白底灰边、选中蓝底白勾 */
+  .at-check {
+    width: 40rpx;
+    height: 40rpx;
+    margin-right: 24rpx;
+    border-radius: 20rpx;
+    border: 2rpx solid #d3d4dc;
+    background-color: #ffffff;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .at-check--on {
+    border-color: #337eff;
+    background-color: #337eff;
+  }
+
+  .at-ava {
+    width: 88rpx;
+    height: 88rpx;
+    border-radius: 44rpx;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .at-ava--all {
+    width: 88rpx;
+    height: 88rpx;
+  }
+
+  .at-ava__letter {
+    font-size: 36rpx;
+    line-height: 44rpx;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .at-name {
+    flex: 1;
+    min-width: 0;
+    margin-left: 24rpx;
+    font-size: 30rpx;
+    line-height: 42rpx;
+    color: #22212a;
+  }
+
+  .at-state {
+    padding: 160rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .at-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  /* 右侧字母索引条：贴右缘垂直居中，只渲染有成员的字母 */
+  .at-index {
+    position: absolute;
+    right: 8rpx;
+    top: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+
+  .at-index__item {
+    width: 44rpx;
+    height: 36rpx;
+    border-radius: 12rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .at-index__item--active {
+    background-color: #eef0f4;
+  }
+
+  .at-index__text {
+    font-size: 22rpx;
+    line-height: 30rpx;
+    font-weight: 600;
+    color: #7c7a88;
+  }
+
+  /* ===== 多选底栏：已选 N 人 + 确定 ===== */
+  .at-foot {
+    flex-shrink: 0;
+    padding: 16rpx 32rpx 8rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: #ffffff;
+    border-top: 2rpx solid #e5e6eb;
+  }
+
+  .at-foot__count {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    font-weight: 500;
+    color: #337eff;
+  }
+
+  .at-foot__space {
+    flex: 1;
+  }
+
+  .at-foot__confirm {
+    min-width: 120rpx;
+    height: 64rpx;
+    padding: 0 28rpx;
+    border-radius: 12rpx;
+    background-color: #e6e5ee;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .at-foot__confirm--ready {
+    background-color: #337eff;
+  }
+
+  .at-foot__confirm--active {
+    opacity: 0.85;
+  }
+
+  .at-foot__confirm-text {
+    font-size: 27rpx;
+    line-height: 38rpx;
+    font-weight: 600;
+    color: #9a98a5;
+  }
+
+  .at-foot__confirm-text--ready {
+    color: #ffffff;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #ffffff;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #ffffff;
+  }
+  /* #endif */
+</style>

@@ -127,7 +127,7 @@ export default function request(options: any): Promise<any> {
   // uni.request 在 UTS 里返回 RequestTask（非 Promise），这里手动包装为 Promise
   return new Promise<any>((resolve, reject) => {
   // uni-app x: 后端响应大量字段返 null，严格反序列化会 errCode=100003。
-  // uni.request<string> 拿原始文本宽松解析；禁止 JSON.parse<T>（Gson 无法实例化 interface）。
+  // uni.request<UTSJSONObject> 顶层宽松解析；禁止 JSON.parse<T>（Gson 无法实例化 interface）。
   // 自定义 RequestOptions 已改名为 ApiRequestOptions，避免与 SDK RequestOptions 冲突。
     const fullUrl = baseUrl + url;
     // Vox 网关已跟随主域名（config.uts 中 VOX_BASE_URL == API_BASE_URL），仅比较 baseUrl 取值
@@ -136,60 +136,37 @@ export default function request(options: any): Promise<any> {
     // servers/vox/* 均显式传入 baseUrl: VOX_BASE_URL，主站接口不传，故以「调用方是否显式指定」区分。
     const isVox = baseUrlRaw != null && baseUrl == getVoxBaseUrl();
     const logTag = isVox ? "[VoxReq]" : "[ApiReq]";
-    uni.request<ArrayBuffer>({
+    uni.request<UTSJSONObject>({
       url: fullUrl,
       method: method,
       // data 可能为 null(无 body 的 GET)，无 body 时传空串
       data: requestData as any,
       timeout: timeoutNum,
       header: header,
-      // 全端统一：>2^53 的 int64（convId/msgId 等雪花号）按数字解析会丢精度
-      // （iOS 真机实测：真值 …8256 被舍成 …8260 → 后端报 IM_20103 会话不存在）。
-      // iOS 运行时会无视 <string> 泛型与 dataType "text"，仍把 JSON 预解析成对象，
-      // 精度在 NSNumber→string 转换时即已损失、事后无法恢复——所以改用
-      // responseType "arraybuffer" 按原始字节返回，从根上绕开运行时的一切文本/JSON
-      // 处理：success 里自行 UTF-8 解码 + parseJsonKeepInt64 防精度解析。
-      // Android/鸿蒙原生解析虽保精度，也统一走此路径消除平台差异。
+      // #ifdef H5 || WEB
+      // H5 运行时默认会 JSON.parse 响应，>2^53 的 int64（convId/msgId 等雪花号）
+      // 被舍入成错误值（真值 …828 变 …830 → 后端报会话不存在）。dataType 传非
+      // "json" 阻止自动解析，改由 success 里 parseJsonKeepInt64 防精度解析。
       dataType: "text",
-      responseType: "arraybuffer",
+      // #endif
       success: (res) => {
         // 登录态（ACCESS_TOKEN）不再从响应 Set-Cookie 同步：登录/内嵌注入即权威，cookie 轮换不得覆盖
         // （防止进入聊天页时带入被服务端 cookie 轮换淘汰的旧 token → 4010 弹登录）。
-        // 正常路径：res.data 是 ArrayBuffer → UTF-8 解码 → parseJsonKeepInt64（大整数保
-        // 精度；禁止 JSON.parse<T>，Gson 无法实例化 interface）。
-        // 兜底：若某端运行时无视 responseType 仍返回预解析对象（typeof object）或文本，
-        // 分别回落旧对象路径 / 直接按文本解析，行为不劣化。
-        const dataVal: any | null = res.data as any | null;
-        let rawText: string | null = null;
-        if (typeof dataVal == "string") {
-          rawText = `${dataVal}`;
-        } else if (dataVal != null && dataVal instanceof ArrayBuffer) {
-          rawText = utf8ArrayBufferToString(dataVal);
-        }
-        let responseData: any | null = null;
-        if (rawText != null) {
+        // res.data 已是 UTSJSONObject，禁止 JSON.parse<T> 或强转为 interface
+        let responseData: any | null = res.data as any | null;
+        // #ifdef H5 || WEB
+        // H5：dataType 已传 "text"，res.data 是原始文本，这里自行解析（大整数保留
+        // 精度，见 parseJsonKeepInt64）。若运行时不支持 dataType（res.data 已是
+        // 对象）则直接走旧逻辑，行为不变。
+        if (typeof responseData == "string") {
           try {
-            responseData = parseJsonKeepInt64(rawText);
+            responseData = parseJsonKeepInt64(`${responseData}`);
           } catch (_e) {
-            responseData = null; // 非法 JSON：按无数据处理，调用方按失败信封处理
+            responseData = res.data; // 非 JSON 响应（如网关 HTML 错误页）保持字符串，与默认兜底一致
           }
-          if (responseData == null && rawText.length > 0) {
-            // 非 JSON 响应（网关 HTML 错误页 / 纯文本）：打印接口与首段原文便于定位
-            const previewEnd = rawText.length < 120 ? rawText.length : 120;
-            console.warn(
-              `${logTag} 响应非 JSON statusCode=${res.statusCode} url=${fullUrl}` +
-                ` body=${rawText.substring(0, previewEnd)}`,
-            );
-          }
-        } else {
-          responseData = dataVal; // 运行时无视 responseType 仍预解析：保留旧行为
         }
-        // 非 JSON 文本不能 as UTSJSONObject（Android 原生会 CCE），信封码按无处理
-        const respObj = typeof responseData == "string"
-          ? null
-          : responseData != null
-            ? (responseData as UTSJSONObject)
-            : null;
+        // #endif
+        const respObj = responseData != null ? (responseData as UTSJSONObject) : null;
         const codeVal = respObj != null ? respObj["code"] : null;
         const code = codeVal != null ? `${codeVal}` : null;
         const msgVal = respObj != null ? respObj["message"] : null;
@@ -546,43 +523,6 @@ export function createSSEConnection<T = any>(options: SSEOptions<T>) {
   // #endif
 }
 
-/**
- * ArrayBuffer → string（完整 UTF-8 解码，含中文与 emoji 代理对）。
- * 供 request 响应体解码：响应体整段到达，无 SSE 分块跨界问题；
- * SSE 路径的 arrayBufferToString 语义不同，勿混用。
- */
-function utf8ArrayBufferToString(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const n = bytes.length;
-  let out = "";
-  let i = 0;
-  while (i < n) {
-    const b0 = bytes[i];
-    if (b0 < 0x80) {
-      out += String.fromCharCode(b0);
-      i += 1;
-    } else if (b0 < 0xe0 && i + 1 < n) {
-      out += String.fromCharCode(((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
-      i += 2;
-    } else if (b0 < 0xf0 && i + 2 < n) {
-      out += String.fromCharCode(((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
-      i += 3;
-    } else if (i + 3 < n) {
-      const cp = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
-      // >0xFFFF 的码点（emoji 等）拆成 UTF-16 高低代理对
-      const v = cp - 0x10000;
-      out += String.fromCharCode(0xd800 + (v >> 10));
-      out += String.fromCharCode(0xdc00 + (v & 0x3ff));
-      i += 4;
-    } else {
-      // 截断或非法序列：替换字符收尾，避免死循环
-      out += String.fromCharCode(0xfffd);
-      i += 1;
-    }
-  }
-  return out;
-}
-
 function arrayBufferToString(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let result = "";
@@ -597,8 +537,7 @@ function arrayBufferToString(buffer: ArrayBuffer): string {
   }
 }
 
-/** 单字符是否为十进制数字字面量（0-9）。UTS 字符串无大小比较运算符，逐个枚举。
- * ★取单字符一律用 charAt(i)：下标 raw[i] 在 Android 端是 Char，与 String 比较/传参编译不过。 */
+/** 单字符是否为十进制数字字面量（0-9）。UTS 字符串无大小比较运算符，逐个枚举。 */
 function isDigitChar(ch: string): boolean {
   return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
     ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9";
@@ -614,7 +553,7 @@ function hasLossyIntLiteral(raw: string): boolean {
   let i = 0;
   let inString = false;
   while (i < n) {
-    const ch = raw.charAt(i);
+    const ch = raw[i];
     if (inString) {
       if (ch == "\\") {
         i += 2;
@@ -633,7 +572,7 @@ function hasLossyIntLiteral(raw: string): boolean {
     }
     if (ch == ":") {
       let j = i + 1;
-      while (j < n && isDigitChar(raw.charAt(j))) {
+      while (j < n && isDigitChar(raw[j])) {
         j++;
       }
       if (j - i - 1 >= 16) {
@@ -647,31 +586,9 @@ function hasLossyIntLiteral(raw: string): boolean {
   return false;
 }
 
-/** 剥离 UTF-8 BOM（解码后是 U+FEFF，JSON.parse 会当非法 token）与首尾空白。 */
-function normalizeJsonText(raw: string): string {
-  let text = raw;
-  if (text.length > 0 && text.charAt(0) == String.fromCharCode(0xfeff)) {
-    text = text.substring(1);
-  }
-  return text.trim();
-}
-
 /**
- * 是否像 JSON 文本（以 `{` / `[` / `"` 开头）。
- * 鸿蒙的 JSON.parse 抛错会被框架记成 error 日志并带上完整堆栈，调用方的
- * try/catch 拦不住这条日志，所以非 JSON 响应必须在解析前就挡掉。
- */
-function looksLikeJson(text: string): boolean {
-  if (text.length == 0) {
-    return false;
-  }
-  const head = text.charAt(0);
-  return head == "{" || head == "[" || head == "\"";
-}
-
-/**
- * 全端防精度 JSON 解析（Android/鸿蒙/iOS/H5 统一走）：解析前把「对象值位置 ≥16 位的
- * 无符号整数字面量」改写成字符串再 JSON.parse。
+ * H5 专用防精度 JSON 解析：解析前把「对象值位置 ≥16 位的无符号整数字面量」改写成
+ * 字符串再 JSON.parse。
  *
  * 背景：后端 convId/msgId/userId 等雪花号是 int64（19 位，远超 JS 的 2^53），
  * H5 默认按数字解析会被舍入（225429701454200828 → …830），拼进 URL 后后端
@@ -685,25 +602,20 @@ function looksLikeJson(text: string): boolean {
  * - 16 位但 ≤2^53 的值（极少见）会被一并字符串化，对 `${}`/URL 拼接无影响
  */
 function parseJsonKeepInt64(raw: string): any | null {
-  const text = normalizeJsonText(raw);
-  // 空 body / 网关 HTML 错误页 / 纯文本：不进 JSON.parse，直接按无数据处理
-  if (!looksLikeJson(text)) {
-    return null;
-  }
-  if (!hasLossyIntLiteral(text)) {
-    return JSON.parse(text);
+  if (!hasLossyIntLiteral(raw)) {
+    return JSON.parse(raw);
   }
   let out = "";
   let i = 0;
-  const n = text.length;
+  const n = raw.length;
   let inString = false;
   while (i < n) {
-    const ch = text.charAt(i);
+    const ch = raw[i];
     if (inString) {
       out += ch;
       if (ch == "\\") {
         if (i + 1 < n) {
-          out += text.charAt(i + 1);
+          out += raw[i + 1];
         }
         i += 2;
         continue;
@@ -724,11 +636,11 @@ function parseJsonKeepInt64(raw: string): any | null {
       out += ch;
       i++;
       let j = i;
-      while (j < n && isDigitChar(text.charAt(j))) {
+      while (j < n && isDigitChar(raw[j])) {
         j++;
       }
       if (j > i) {
-        const digits = text.substring(i, j);
+        const digits = raw.substring(i, j);
         if (j - i >= 16) {
           out += "\"";
           out += digits;

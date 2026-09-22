@@ -185,7 +185,7 @@
         'record-tip-container--with-extra': showExtraContainer,
         'record-tip-container--home': usesHomeLayout,
         'record-tip-container--quick-popup': quickPopupVisible,
-        'record-tip-container--home-compact': usesHomeLayout && !isMultiLine && !isVoiceInput && !showExtraContainer && !quickPopupVisible && selectedTag.length == 0 && activeInputExpertId <= 0 && pinnedProjectName.length == 0 && workspaceDirLabel.length == 0 && spaceSelectorLabel.length == 0,
+        'record-tip-container--home-compact': usesHomeLayout && !isMultiLine && !isVoiceInput && !showExtraContainer && selectedTag.length == 0 && activeInputExpertId <= 0 && pinnedProjectName.length == 0 && workspaceDirLabel.length == 0 && spaceSelectorLabel.length == 0,
       }"
     >
       <!-- 无权限蒙层 -->
@@ -203,6 +203,7 @@
         :keyword="quickPopupKeyword"
         :height="quickPopupHeightPx"
         :bottom="quickPopupBottomPx"
+        :anchor-height="quickPopupAnchorHeightPx"
         :files="conversationFiles"
         @close="dismissQuickPopup"
         @select="handleQuickPopupSelect"
@@ -838,8 +839,8 @@
     // #ifdef H5 || WEB
     // H5 兜底：直接聚焦 Quill 的 contenteditable 根节点
     try {
-      const root = document.querySelector("#chat-input-editor .ql-editor");
-      if (root != null) (root as HTMLElement).focus();
+      const container = document.querySelector("#chat-input-editor .ql-container") as any | null;
+      if (container != null && container.__quill != null) container.__quill.focus();
     } catch (_eFocusDom) {
       // ignore
     }
@@ -1344,13 +1345,17 @@
   const quickPopupHeightPx = ref<number>(0);
   // iOS page-container 从视口底部定位，记录输入卡顶边到视口底部的距离（px）。
   const quickPopupBottomPx = ref<number>(0);
+  const quickPopupAnchorHeightPx = ref<number>(0);
   let quickPopupBlurTimer: number | null = null;
   let quickPopupFocusTimer: number | null = null;
   let quickPopupMeasureRequestId = 0;
-  // 选择快捷项时用 undo 回退“/关键词”或“@关键词”。这样能保留原生选区，
-  // 避免 setContents 重建全文后把光标重置到文首。
+  // 弹层抢焦点前保存触发范围，回填时按 Delta 坐标恢复插入点。
   let removingQuickTriggerText: boolean = false;
   let quickTriggerRemovalRequestId = 0;
+  let quickTriggerStart = -1;
+  let quickTriggerEnd = -1;
+  let editorIndexedText = "";
+  let editorInputCursor = 0;
   const skillSheetVisible = ref<boolean>(false);
   const connectorSheetVisible = ref<boolean>(false);
   // 连接器弹窗初始页签（对齐 PC：头像组入口落「已连接」聚合页签，普通入口落系统广场）
@@ -2833,6 +2838,7 @@
           requestedKeyword != quickPopupKeyword.value) return;
         if (results.length == 0 || results[0] == null) return;
         const rect = results[0] as NodeInfo;
+        quickPopupAnchorHeightPx.value = rect.height != null ? parseFloat(`${rect.height}`) : 0;
         const top = rect.top != null ? parseFloat(`${rect.top}`) : 0;
         if (top <= 0) return;
         let reservedTop = getStatusBarHeight() + 8;
@@ -2975,14 +2981,20 @@
   }
 
   function syncQuickPopupFromText(rawText: string): void {
-    const expertDetect = detectQuickTrigger(rawText, "@", "＠");
+    // Delta 中一个 mention 只占一位；不要用显示名称长度计算选区。
+    const beforeCursor = rawText.substring(0, editorInputCursor);
+    const expertDetect = detectQuickTrigger(beforeCursor, "@", "＠");
     if (expertDetect["hasMention"] == true) {
+      quickTriggerEnd = editorInputCursor;
+      quickTriggerStart = quickTriggerEnd - `${expertDetect["searchText"]}`.length - 1;
       openQuickPopup(isHomeScene.value ? "expert" : "file", `${expertDetect["searchText"]}`);
       return;
     }
     if (props.enableSkillAt == true) {
-      const skillDetect = detectQuickTrigger(rawText, "/");
+      const skillDetect = detectQuickTrigger(beforeCursor, "/");
       if (skillDetect["hasMention"] == true) {
+        quickTriggerEnd = editorInputCursor;
+        quickTriggerStart = quickTriggerEnd - `${skillDetect["searchText"]}`.length - 1;
         openQuickPopup("skill", `${skillDetect["searchText"]}`);
         return;
       }
@@ -3034,89 +3046,153 @@
     return nextDelta;
   }
 
-  /** 剔除输入里的快捷触发文本，保留触发符之前的 mention chips。 */
+  /** Delta 的文本坐标：embed 统一占一位，与 Quill 的选区索引一致。 */
+  function indexedEditorText(deltaRaw: any | null): string {
+    if (deltaRaw == null) return "";
+    const ops = (deltaRaw as UTSJSONObject)["ops"] as UTSJSONObject[] | null;
+    if (ops == null) return "";
+    let result = "";
+    for (let i = 0; i < ops.length; i++) {
+      const value = ops[i]["insert"];
+      result += typeof value == "string" ? `${value}` : "\ufffc";
+    }
+    return result.endsWith("\n") ? result.substring(0, result.length - 1) : result;
+  }
+
+  function sliceEditorOps(ops: UTSJSONObject[], start: number, end: number): UTSJSONObject[] {
+    const result: UTSJSONObject[] = [];
+    let offset = 0;
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      const value = op["insert"];
+      const length = typeof value == "string" ? `${value}`.length : 1;
+      const from = Math.max(start, offset);
+      const to = Math.min(end, offset + length);
+      if (from < to) {
+        const copy = new UTSJSONObject();
+        copy["insert"] = typeof value == "string" ? `${value}`.substring(from - offset, to - offset) : value;
+        if (op["attributes"] != null) copy["attributes"] = op["attributes"];
+        result.push(copy);
+      }
+      offset += length;
+    }
+    return result;
+  }
+
+  /** 原生 EditorContext 无 setSelection：先保留后文，再顺序回放前文，光标自然落在替换点。 */
+  function replayEditorPrefix(ops: UTSJSONObject[], index: number, done: () => void): void {
+    if (removingQuickTriggerText != true) return;
+    if (editorContext == null) { removingQuickTriggerText = false; return; }
+    if (index >= ops.length) { done(); return; }
+    const value = ops[index]["insert"];
+    const next = (): void => replayEditorPrefix(ops, index + 1, done);
+    const fail = (): void => {
+      removingQuickTriggerText = false;
+      syncingEditorContent = false;
+      console.warn("[conversation-input] restore selection failed");
+    };
+    if (typeof value == "string") {
+      editorContext!.insertText({ text: `${value}`, success: (_res: UniEditorElementOptionsSuccessRes): void => next(),
+        fail: (_res: UniEditorElementOptionsFailRes): void => fail() });
+    } else {
+      const mention = (value as UTSJSONObject)["mention"] as UTSJSONObject;
+      editorContext!.insertMention({
+        id: `${mention["id"]}`, name: `${mention["name"]}`,
+        color: mention["color"] != null ? `${mention["color"]}` : "#5f5f69",
+        background: mention["background"] != null ? `${mention["background"]}` : "#f2f1f6",
+        radius: "999px",
+        success: (_res: UniEditorElementOptionsSuccessRes): void => next(),
+        fail: (_res: UniEditorElementOptionsFailRes): void => fail(),
+      });
+    }
+  }
+
+  /** 按触发时保存的范围删除，不在清空全文后直接 insertMention。 */
   function removeQuickTriggerText(mode: string, afterRemove: (() => void) | null): void {
     // #ifdef MP
-    const mpTrigger = mode == "skill" ? "/" : "@";
-    const mpAlternate = mode == "skill" ? "" : "＠";
-    const mpDetect = detectQuickTrigger(messageInfo.value, mpTrigger, mpAlternate);
-    if (mpDetect["hasMention"] == true) {
-      const searchText = `${mpDetect["searchText"]}`;
-      const removeLength = searchText.length + 1;
-      messageInfo.value = messageInfo.value.substring(0, messageInfo.value.length - removeLength);
+    const detected = detectQuickTrigger(messageInfo.value, mode == "skill" ? "/" : "@", mode == "skill" ? "" : "＠");
+    if (detected["hasMention"] == true) {
+      messageInfo.value = messageInfo.value.substring(0, messageInfo.value.length - `${detected["searchText"]}`.length - 1);
       textareaCursor.value = messageInfo.value.length;
-      lastEditorRawText = messageInfo.value;
     }
-    if (afterRemove != null) setTimeout(afterRemove, 0);
+    if (afterRemove != null) afterRemove();
     return;
     // #endif
     // #ifndef MP
-    if (editorContext == null || editorReady.value != true) {
-      if (afterRemove != null) afterRemove();
-      return;
-    }
-    const trigger = mode == "skill" ? "/" : "@";
-    const alternate = mode == "skill" ? "" : "＠";
-    const initialDetect = detectQuickTrigger(lastEditorRawText, trigger, alternate);
-    if (initialDetect["hasMention"] != true) {
-      if (afterRemove != null) afterRemove();
-      return;
-    }
-    const searchText = `${initialDetect["searchText"]}`;
-    const removeLength = searchText.length + 1;
-    const requestId = quickTriggerRemovalRequestId + 1;
-    quickTriggerRemovalRequestId = requestId;
+    if (editorContext == null || removingQuickTriggerText) return;
+    const start = quickTriggerStart;
+    const end = quickTriggerEnd;
+    if (start < 0 || end <= start) return;
     removingQuickTriggerText = true;
-    const finishRemove = (): void => {
-      if (requestId != quickTriggerRemovalRequestId || removingQuickTriggerText != true) return;
+    const requestId = ++quickTriggerRemovalRequestId;
+    let restoredDelta: UTSJSONObject | null = null;
+    const finish = (): void => {
+      if (requestId != quickTriggerRemovalRequestId) return;
+      // setContents 是静默写入；关闭弹层而不插入标签时也必须同步正文与已选项。
+      if (restoredDelta != null) {
+        editorDelta.value = restoredDelta;
+        editorIndexedText = indexedEditorText(restoredDelta);
+        lastEditorRawText = editorIndexedText;
+        lastEditorText = editorPlainTextFromDelta(restoredDelta);
+        messageInfo.value = lastEditorText;
+        updateEditorHeight(lastEditorText);
+        syncMentionsFromEditorDelta(restoredDelta);
+      }
       removingQuickTriggerText = false;
-      if (afterRemove != null) setTimeout(afterRemove, 0);
-      else focusChatInput();
+      syncingEditorContent = false;
+      editorInputCursor = start;
+      quickTriggerStart = -1;
+      quickTriggerEnd = -1;
+      if (afterRemove != null) afterRemove();
     };
-    // Android 输入法的 undo/undo.complete 都可能无效。读取原生 editor 的最新 delta，
-    // 直接裁掉末尾触发串，避免残留的 / 或 @ 阻断下一次唤起，同时保留已有 mention chip。
+    const fail = (): void => { removingQuickTriggerText = false; syncingEditorContent = false; };
     editorContext!.getContents({
       success: (res: UniEditorElementGetContentsOptionsRes): void => {
-        if (requestId != quickTriggerRemovalRequestId || removingQuickTriggerText != true) return;
-        let currentText = res.text != null ? `${res.text}` : "";
-        if (currentText.endsWith("\n")) currentText = currentText.substring(0, currentText.length - 1);
-        const currentDetect = detectQuickTrigger(currentText, trigger, alternate);
-        if (currentDetect["hasMention"] != true) {
-          finishRemove();
+        if (requestId != quickTriggerRemovalRequestId) return;
+        const text = indexedEditorText(res.delta);
+        const trigger = text.substring(start, start + 1);
+        if (end > text.length || (mode == "skill" ? trigger != "/" : trigger != "@" && trigger != "＠")) {
+          fail();
           return;
         }
-        const currentSearch = `${currentDetect["searchText"]}`;
-        const nextDelta = trimEditorDeltaTextSuffix(res.delta, currentSearch.length + 1);
-        if (nextDelta == null || editorContext == null) {
-          finishRemove();
+        const ops = (res.delta as UTSJSONObject)["ops"] as UTSJSONObject[];
+        const prefix = sliceEditorOps(ops, 0, start);
+        const tail = sliceEditorOps(ops, end, text.length + 1);
+        restoredDelta = new UTSJSONObject();
+        restoredDelta!["ops"] = [...prefix, ...tail];
+        // #ifdef H5 || WEB
+        const root = document.querySelector("#chat-input-editor .ql-container") as any | null;
+        const quill = root != null ? root.__quill : null;
+        if (quill != null) {
+          syncingEditorContent = true;
+          quill.deleteText(start, end - start, "user");
+          quill.setSelection(start, 0, "silent");
+          finish();
           return;
         }
+        // #endif
+        // 不支持的 embed 不能在回放时静默丢弃。
+        for (let i = 0; i < prefix.length; i++) {
+          const insert = prefix[i]["insert"];
+          if (typeof insert != "string" && (insert as UTSJSONObject)["mention"] == null) { fail(); return; }
+        }
+        const suffix = new UTSJSONObject();
+        suffix["ops"] = tail;
         syncingEditorContent = true;
-        let restored = false;
-        const restoreTrimmedDelta = (): void => {
-          if (restored == true || requestId != quickTriggerRemovalRequestId || editorContext == null) return;
-          restored = true;
-          editorContext!.setContents({
-            delta: nextDelta,
-            complete: (_setRes: UniEditorElementOptionsCompleteRes): void => {
-              syncingEditorContent = false;
-              finishRemove();
-            },
-          });
-        };
-        // Android 聚焦态直接 setContents 会出现“画面已清掉、Editable 缓冲仍残留”的情况，
-        // 下一次输入会把旧触发符带回来。先 clear 原生缓冲，再恢复裁剪后的 delta。
         editorContext!.clear({
-          complete: (_clearRes: UniEditorElementOptionsCompleteRes): void => {
-            setTimeout(restoreTrimmedDelta, 0);
+          success: (_res: UniEditorElementOptionsSuccessRes): void => {
+            if (editorContext == null) { fail(); return; }
+            editorContext!.setContents({
+              delta: suffix,
+              success: (_setRes: UniEditorElementOptionsSuccessRes): void => replayEditorPrefix(prefix, 0, finish),
+              fail: (_setRes: UniEditorElementOptionsFailRes): void => fail(),
+            });
           },
+          fail: (_res: UniEditorElementOptionsFailRes): void => fail(),
         });
-        setTimeout(restoreTrimmedDelta, 80);
       },
-      fail: (_res: UniEditorElementOptionsFailRes): void => finishRemove(),
+      fail: (_res: UniEditorElementOptionsFailRes): void => fail(),
     });
-    // 原生回调异常时也必须释放状态，不能让后续 / 和 @ 永久短路。
-    setTimeout(finishRemove, 600);
     // #endif
   }
 
@@ -3136,11 +3212,19 @@
     lastEditorText = value;
     messageInfo.value = value;
     editorDelta.value = e.detail.delta;
+    const indexed = indexedEditorText(e.detail.delta);
+    if (syncingEditorContent != true && removingQuickTriggerText != true) {
+      let suffix = 0;
+      while (suffix < editorIndexedText.length && suffix < indexed.length &&
+        editorIndexedText.charAt(editorIndexedText.length - suffix - 1) == indexed.charAt(indexed.length - suffix - 1)) suffix++;
+      editorInputCursor = indexed.length - suffix;
+    }
+    editorIndexedText = indexed;
     updateEditorHeight(value);
     syncMentionsFromEditorDelta(e.detail.delta);
     if (syncingEditorContent == true || removingQuickTriggerText == true) return;
     if (usesHomeLayout.value == true) {
-      syncQuickPopupFromText(rawText);
+      syncQuickPopupFromText(indexed);
       return;
     }
     // 会话场景：@ 仍走技能选择弹层（撤销 @、收键盘）
@@ -3193,7 +3277,6 @@
     insertEditorMention("skill", skill.targetId.toString(), skill.name);
     isAtTrigger.value = false;
     atCursorIndex.value = -1;
-    nextTick(() => focusChatInput());
     return;
     // #endif
 
@@ -3720,7 +3803,7 @@
     if (usesHomeLayout.value == true) {
       quickPopupFocusTimer = setTimeout(() => {
         quickPopupFocusTimer = null;
-        syncQuickPopupFromText(lastEditorRawText);
+        syncQuickPopupFromText(editorIndexedText);
       }, 300);
     }
     // 隐藏额外功能栏
@@ -3870,8 +3953,8 @@
         }
       } else {
         handleExpertSelect(item);
+        nextTick(() => focusChatInput());
       }
-      nextTick(() => focusChatInput());
     });
   };
 
@@ -4898,7 +4981,9 @@
       &.record-tip-container--home-compact {
         /* iOS 原生 editor 聚焦后会重新声明约 200px 的默认最小高度；
            单行首页卡片必须锁定为两行布局（输入 + 能力栏），避免尾部大片空白。
-           多行、专家/推荐标签、功能栏展开或存在项目/工作目录底栏时自动移除，恢复内容自适应。 */
+           快捷面板绝对定位在卡片外，不应解除高度锁；否则鸿蒙 ArkWeb 输入 `/` 时会
+           把 editor 撑到可视区剩余高度。仅多行、专家/推荐标签、功能栏展开或存在
+           项目/工作目录底栏时移除，恢复内容自适应。 */
         height: 176rpx;
         max-height: 176rpx;
       }

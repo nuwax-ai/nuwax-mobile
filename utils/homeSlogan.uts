@@ -1,0 +1,235 @@
+/**
+ * 首页 slogan 的安全 HTML -> rich-text nodes 解析器。
+ *
+ * PC 端把 homeSlogan 当 HTML 展示；APP 端不能把租户配置原样传给 rich-text，
+ * 否则 script、onerror、javascript: 等内容会进入 WebView 执行。这里保留
+ * rich-text 支持的 HTML 结构和内联样式，只剔除可执行内容与越界布局能力。
+ */
+
+class HomeSloganFrame {
+  tag: string;
+  node: UTSJSONObject;
+  children: UTSJSONObject[];
+
+  constructor(tag: string, node: UTSJSONObject, children: UTSJSONObject[]) {
+    this.tag = tag;
+    this.node = node;
+    this.children = children;
+  }
+}
+
+function decodeHtmlEntity(value: string): string {
+  return value.replace(/&#(x[0-9a-f]+|[0-9]+);?/gi, (_match: string, codeRawNullable: string | null, _offset: number, _source: string): string => {
+    const codeRaw = codeRawNullable != null ? codeRawNullable : "";
+    const hex = codeRaw.toLowerCase().startsWith("x");
+    const numberText = hex ? codeRaw.substring(1) : codeRaw;
+    const code = parseInt(numberText, hex ? 16 : 10);
+    if (code != code || code <= 0 || code > 1114111) return "";
+    if (code <= 65535) return String.fromCharCode(code);
+    const offset = code - 65536;
+    return String.fromCharCode(55296 + Math.floor(offset / 1024)) + String.fromCharCode(56320 + offset % 1024);
+  }).replace(/&nbsp;/gi, "\u00a0")
+    .replace(/&ensp;/gi, "\u2002")
+    .replace(/&emsp;/gi, "\u2003")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&apos;|&#39;/gi, "'")
+    .replace(/&amp;/gi, "&");
+}
+
+function isBlockedTag(tag: string): boolean {
+  return /^(script|style|iframe|frame|frameset|object|embed|applet|svg|math|canvas|template|noscript|head|meta|link|base|form|input|button|textarea|select|option)$/i.test(tag);
+}
+
+function isVoidTag(tag: string): boolean {
+  return /^(br|hr|img|col|source|track|wbr)$/i.test(tag);
+}
+
+/** rich-text 各端共同支持的安全展示标签；语义相近的标签会在下方归一。 */
+function normalizeTag(tagRaw: string): string {
+  const tag = tagRaw.toLowerCase();
+  if (/^(html|body|main|header|footer|section|article|aside|nav|address|figure|figcaption|center|pre)$/.test(tag)) return "div";
+  if (tag == "small" || tag == "big" || tag == "mark" || tag == "cite" || tag == "time") return "span";
+  if (tag == "s" || tag == "strike") return "del";
+  if (tag == "u") return "ins";
+  if (/^(a|abbr|b|blockquote|br|code|col|colgroup|dd|del|div|dl|dt|em|fieldset|font|h1|h2|h3|h4|h5|h6|hr|i|img|ins|label|legend|li|ol|p|q|ruby|rt|span|strong|sub|sup|table|tbody|td|tfoot|th|thead|tr|ul)$/.test(tag)) return tag;
+  return "span";
+}
+
+function sanitizeUrl(raw: string, allowImageData: boolean): string {
+  const decoded = decodeHtmlEntity(raw).trim();
+  if (decoded.length == 0 || decoded.length > 4096) return "";
+  // 协议判断前清除可用于混淆 javascript: 的控制字符和空白。
+  const compact = decoded.replace(/[\u0000-\u0020\u007f]+/g, "").toLowerCase();
+  if (allowImageData && /^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.test(compact)) return decoded;
+  if (/^(javascript|vbscript|data|file|content|intent):/i.test(compact)) return "";
+  if (/^(https?:|mailto:|tel:)/i.test(compact)) return decoded;
+  // 相对地址、锚点以及协议相对地址仍属于正常富文本能力。
+  if (/^(\/\/|\/|\.\/|\.\.\/|#|\?)/.test(decoded)) return decoded;
+  // 无冒号的相对路径。
+  return decoded.indexOf(":") < 0 ? decoded : "";
+}
+
+function sanitizeStyle(raw: string): string {
+  if (raw.length == 0 || raw.length > 8192) return "";
+  const lowered = decodeHtmlEntity(raw).toLowerCase();
+  if (/(expression\s*\(|javascript\s*:|vbscript\s*:|@import|behavior\s*:|-moz-binding\s*:)/i.test(lowered)) return "";
+
+  const safe = [] as string[];
+  const declarations = raw.split(";");
+  for (let i = 0; i < declarations.length; i++) {
+    const declaration = declarations[i].trim();
+    const colon = declaration.indexOf(":");
+    if (colon <= 0) continue;
+    const name = declaration.substring(0, colon).trim().toLowerCase();
+    const value = declaration.substring(colon + 1).trim();
+    if (!/^[-a-z][a-z0-9-]*$/.test(name) || value.length == 0) continue;
+    // 禁止样式加载外部内容或逃逸首页布局；其余排版/颜色/字体/表格样式保留。
+    if (/^(position|top|right|bottom|left|inset|z-index|behavior|-moz-binding)$/.test(name)) continue;
+    if (/url\s*\(/i.test(value) || /[<>]/.test(value)) continue;
+    safe.push(name + ":" + value);
+  }
+  return safe.join(";");
+}
+
+function isAllowedAttribute(tag: string, name: string): boolean {
+  if (/^(style|class|id|title|dir|lang|align)$/.test(name)) return true;
+  if (tag == "a" && /^(href|target|rel)$/.test(name)) return true;
+  if (tag == "img" && /^(src|alt|width|height)$/.test(name)) return true;
+  if (tag == "font" && /^(color|face|size)$/.test(name)) return true;
+  if (/^(td|th)$/.test(tag) && /^(colspan|rowspan|headers|scope|width|height|valign)$/.test(name)) return true;
+  if (/^(table|col|colgroup)$/.test(tag) && /^(border|cellpadding|cellspacing|span|width)$/.test(name)) return true;
+  if (/^(ol|li)$/.test(tag) && /^(start|type|value)$/.test(name)) return true;
+  return false;
+}
+
+function parseAttributes(source: string, tag: string): UTSJSONObject {
+  const result = new UTSJSONObject();
+  const matcher = /([^\s=\/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match = matcher.exec(source);
+  while (match != null) {
+    const nameRaw = match[1];
+    const name = nameRaw != null ? nameRaw.toLowerCase() : "";
+    if (!name.startsWith("on") && isAllowedAttribute(tag, name)) {
+      let rawValue = "";
+      const doubleQuotedValue = match[2];
+      const singleQuotedValue = match[3];
+      const unquotedValue = match[4];
+      if (doubleQuotedValue != null) {
+        rawValue = doubleQuotedValue;
+      } else if (singleQuotedValue != null) {
+        rawValue = singleQuotedValue;
+      } else if (unquotedValue != null) {
+        rawValue = unquotedValue;
+      }
+      let value = decodeHtmlEntity(rawValue);
+      if (name == "style") value = sanitizeStyle(value);
+      if (name == "href") value = sanitizeUrl(value, false);
+      if (name == "src") value = sanitizeUrl(value, tag == "img");
+      if (name == "target" && value != "_blank" && value != "_self") value = "";
+      if (name == "rel") value = "noopener noreferrer";
+      if (value.length > 0) result[name] = value;
+    }
+    match = matcher.exec(source);
+  }
+  if (tag == "a" && result["target"] == "_blank") result["rel"] = "noopener noreferrer";
+  return result;
+}
+
+function createTextNode(text: string): UTSJSONObject {
+  const node = new UTSJSONObject();
+  node["type"] = "text";
+  node["text"] = decodeHtmlEntity(text);
+  return node;
+}
+
+function appendText(children: UTSJSONObject[], text: string): void {
+  if (text.length == 0) return;
+  children.push(createTextNode(text));
+}
+
+/**
+ * 解析配置中心下发的完整富文本 HTML。
+ * 返回对象节点而不是 HTML 字符串，是阻断脚本执行的关键边界。
+ */
+export function parseHomeSloganNodes(raw: string): UTSJSONObject[] {
+  const root = [] as UTSJSONObject[];
+  if (raw.trim().length == 0) return root;
+
+  const stack = [] as HomeSloganFrame[];
+  const source = raw.substring(0, 65536);
+  const tokens = /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<\/?[a-zA-Z](?:[^"'<>]|"[^"]*"|'[^']*')*>|[^<]+|</g;
+  let blockedTag = "";
+  let match = tokens.exec(source);
+
+  while (match != null && root.length < 512) {
+    const tokenRaw = match[0];
+    const token = tokenRaw != null ? tokenRaw : "";
+    if (token.startsWith("<!--") || token.startsWith("<!")) {
+      match = tokens.exec(source);
+      continue;
+    }
+
+    const tagMatch = /^<\s*(\/?)\s*([a-zA-Z][a-zA-Z0-9:-]*)([\s\S]*?)\/?\s*>$/.exec(token);
+    if (tagMatch == null) {
+      if (blockedTag.length == 0) {
+        const children = stack.length > 0 ? stack[stack.length - 1].children : root;
+        appendText(children, token);
+      }
+      match = tokens.exec(source);
+      continue;
+    }
+
+    const closingRaw = tagMatch[1];
+    const tagNameRaw = tagMatch[2];
+    const attributesRaw = tagMatch[3];
+    const closing = closingRaw != null && closingRaw == "/";
+    const rawTag = tagNameRaw != null ? tagNameRaw.toLowerCase() : "";
+    if (blockedTag.length > 0) {
+      if (closing && rawTag == blockedTag) blockedTag = "";
+      match = tokens.exec(source);
+      continue;
+    }
+    if (isBlockedTag(rawTag)) {
+      if (!closing && !/\/\s*>$/.test(token)) blockedTag = rawTag;
+      match = tokens.exec(source);
+      continue;
+    }
+
+    const tag = normalizeTag(rawTag);
+    if (closing) {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].tag == tag) {
+          stack.splice(i, stack.length - i);
+          break;
+        }
+      }
+      match = tokens.exec(source);
+      continue;
+    }
+
+    const node = new UTSJSONObject();
+    const children = [] as UTSJSONObject[];
+    node["name"] = tag;
+    node["attrs"] = parseAttributes(attributesRaw != null ? attributesRaw : "", tag);
+    if (!isVoidTag(tag)) node["children"] = children;
+    const parent = stack.length > 0 ? stack[stack.length - 1].children : root;
+    parent.push(node);
+    if (!isVoidTag(tag) && !/\/\s*>$/.test(token) && stack.length < 64) {
+      stack.push(new HomeSloganFrame(tag, node, children));
+    }
+    match = tokens.exec(source);
+  }
+  if (root.length == 0) return root;
+
+  // 对齐 PC 首页：homeSlogan 始终作为居中的 h2 标题内容渲染。
+  // 使用 rich-text 节点而不是在 uvue 模板直接写 h2，确保原生 APP 端也可用。
+  const titleAttrs = new UTSJSONObject();
+  titleAttrs["style"] = "width:100%;margin:0;text-align:center;font-size:24px;font-weight:400;color:inherit";
+  const titleNode = new UTSJSONObject();
+  titleNode["name"] = "h2";
+  titleNode["attrs"] = titleAttrs;
+  titleNode["children"] = root;
+  return [titleNode];
+}

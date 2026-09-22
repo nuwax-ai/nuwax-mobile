@@ -8,11 +8,11 @@ const rootDir = process.cwd();
 
 const localeConfig = {
   "zh-cn": {
-    file: path.join(rootDir, "constants/i18n-locales/zh-CN.uts"),
+    file: path.join(rootDir, "constants/i18n-locales/zh-cn.uts"),
     exportName: "I18N_ZH_CN",
   },
   "en-us": {
-    file: path.join(rootDir, "constants/i18n-locales/en-US.uts"),
+    file: path.join(rootDir, "constants/i18n-locales/en-us.uts"),
     exportName: "I18N_EN_US",
   },
 };
@@ -23,7 +23,7 @@ const outputJson = path.join(rootDir, "docs/i18n-platform-default-import.json");
 const parseLocaleBundle = (filePath, exportName) => {
   const source = fs.readFileSync(filePath, "utf8");
   const exportRegex = new RegExp(
-    `export\\s+const\\s+${exportName}\\s*:\\s*Record<[^>]+>\\s*=`,
+    `export\\s+const\\s+${exportName}\\s*(:\\s*Record<[^>]+>\\s*)?=`,
     "m",
   );
 

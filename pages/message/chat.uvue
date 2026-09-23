@@ -2,15 +2,16 @@
   <view class="chat-page">
     <safety-zone />
 
-    <!-- 顶部：返回 + 会话名（对齐参考设计 50+54 双段头，App 由 safety-zone 垫高） -->
-    <view class="chat-header">
+    <!-- 顶部：返回 + 会话名（对齐参考设计 50+54 双段头，App 由 safety-zone 垫高；
+         分割线由下方子页签行承担，header 恒去线） -->
+    <view class="chat-header chat-header--flush">
       <view class="chat-header__btn" hover-class="chat-header__btn--active" @click="handleBack">
         <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
       </view>
       <view class="chat-header__title-wrap">
         <text class="chat-header__title text-ellipsis">{{ titleName }}</text>
       </view>
-      <!-- 右侧：群聊/团队显示「...」进群信息页（飞书式）；单聊占位保证标题绝对居中 -->
+      <!-- 右侧：群聊/团队显示「...」进群设置页（飞书式）；单聊占位保证标题绝对居中 -->
       <view
         v-if="isGroupLike"
         class="chat-header__btn"
@@ -21,6 +22,16 @@
       </view>
       <view v-else class="chat-header__btn chat-header__btn--ghost" />
     </view>
+
+    <!-- 子页签行（单聊与群聊共用）：默认选中「消息」展示当前消息页，Pin/文件从右侧进独立页
+         （接口均按 convId 过滤，群聊直接可用），资料库占位，行尾放大镜进本会话内搜索 -->
+    <chat-subpage-tabs
+      :tabs="subpageTabs"
+      active="messages"
+      :show-search="true"
+      @select="handleSubpageSelect"
+      @search="handleSearchTap"
+    />
 
     <!-- 消息列表（升序渲染；向下滑到顶加载更早） -->
     <scroll-view
@@ -669,7 +680,9 @@
     IM_CHAT_JUMP_EVENT,
   } from "@/servers/im";
   import type { RequestResponse } from "@/types/interfaces/request";
+  import { ChatSubpageTab } from "@/types/interfaces/chatSubpageTab";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { collectChatAttachments, resetChatAttachments } from "@/utils/imChatAttachments";
   import { isAuthProtectedFileUrl, openAuthProtectedLinkUrl } from "@/utils/authProtectedFileUrl";
   import { generateUUID } from "@/utils/common";
   import { uploadSingleFile } from "@/utils/fileUploader";
@@ -821,6 +834,23 @@
   });
   const titleName = ref<string>("");
   const peerAvatar = ref<string>("");
+
+  // ===== 子页签行（单聊标题下方：消息/Pin/资料库/文件；群聊后续复用同组件拼装） =====
+  function makeSubpageTab(id: string, labelKey: string, icon: string): ChatSubpageTab {
+    const tab = new ChatSubpageTab();
+    tab.id = id;
+    tab.label = t(labelKey);
+    tab.icon = icon;
+    return tab;
+  }
+
+  /** 彩色实心图标（与 PC nuwax-im-web DEV-187 同形状同配色，选中态不变色）。 */
+  const subpageTabs = ref<ChatSubpageTab[]>([
+    makeSubpageTab("messages", "Mobile.Message.chatTabMessages", "/static/images/icon-tab-messages.png"),
+    makeSubpageTab("pin", "Mobile.Message.chatTabPin", "/static/images/icon-tab-pin.png"),
+    makeSubpageTab("library", "Mobile.Message.chatTabLibrary", "/static/images/icon-tab-library.png"),
+    makeSubpageTab("files", "Mobile.Message.chatTabFiles", "/static/images/icon-tab-files.png"),
+  ]);
 
   // ===== 列表状态 =====
   const messages = ref<ImMsgRow[]>([]);
@@ -1742,6 +1772,8 @@
         for (let i = 0; i < records.length; i++) {
           rows.push(readMsgRow(records[i]));
         }
+        // 附件缓存累积：文件页（文件/群文件）只读本窗口已加载消息里的附件
+        collectChatAttachments(convId.value, records);
       }
     }
     // 返回为降序（新→旧）；列表升序存，逐条 unshift 后头部即为最旧
@@ -1759,6 +1791,8 @@
     if (loading.value) {
       return;
     }
+    // 附件缓存重置：文件页数据源只看本窗口已加载的消息（从首屏起重新累积）
+    resetChatAttachments(convId.value);
     loading.value = true;
     loadFailed.value = false;
     try {
@@ -2095,6 +2129,13 @@
       pages++;
       const oldestSeq = messages.value[0].seq;
       await loadHistory(oldestSeq);
+    }
+    if (findMsgById(msgId) == null) {
+      // ES 全量命中的消息可能早于窗口可翻页到达的范围（15 页 × 20 条，与 Pin/引用详情同上限）：
+      // 消费掉待定位并提示，避免回到聊天页后静默无操作、pendingJumpId 悬挂
+      pendingJumpId = "";
+      uni.showToast({ title: t("Mobile.Message.jumpOutOfRange"), icon: "none" });
+      return;
     }
     if (pageVisible) {
       // 页面本就可见（数据补齐即可应用）：onShow 不会再触发，这里直接应用
@@ -2702,7 +2743,8 @@
     uni.navigateBack({ delta: 1 });
   }
 
-  /** 「...」进群信息页（群成员/文件/公告/设置/入群申请/资料库，飞书式）。 */
+  /** 「...」进群设置页（群概览/公告/成员/入群申请/群管理/会话设置，飞书式；
+   *  群文件与资料库入口已移至本页子页签行）。 */
   function handleOpenGroupInfo(): void {
     if (convId.value.length == 0) {
       return;
@@ -2710,6 +2752,49 @@
     uni.navigateTo({
       url: `/subpackages/pages/im-group-info/im-group-info?convId=${convId.value}&name=${encodeURIComponent(titleName.value)}`,
     });
+  }
+
+  /** 行尾搜索键：进「本会话内搜索」页（ES 服务端搜全量，与文件页只看已加载窗口的口径不同）。 */
+  function handleSearchTap(): void {
+    if (convId.value.length == 0) {
+      return;
+    }
+    uni.navigateTo({
+      url: `/subpackages/pages/im-chat-search/im-chat-search?convId=${convId.value}`,
+    });
+  }
+
+  /**
+   * 子页签点击（单聊与群聊共用，接口均按 convId 过滤）：
+   * - messages：恒为选中（本页就是消息页），点击无动作；
+   * - pin：从右侧进「Pin 消息」独立页（列表/取消Pin/跳转定位）；
+   * - files：复用群文件页（翻历史消息聚合附件），入参带标题「文件」；
+   * - library：资料库占位（敬请期待）。
+   */
+  function handleSubpageSelect(id: string): void {
+    if (id == "pin") {
+      if (convId.value.length == 0) {
+        return;
+      }
+      uni.navigateTo({
+        url: `/subpackages/pages/im-chat-pins/im-chat-pins?convId=${convId.value}`,
+      });
+      return;
+    }
+    if (id == "files") {
+      if (convId.value.length == 0) {
+        return;
+      }
+      uni.navigateTo({
+        url:
+          `/subpackages/pages/im-group-files/im-group-files?convId=${convId.value}` +
+          `&title=${encodeURIComponent(t("Mobile.Message.chatTabFiles"))}`,
+      });
+      return;
+    }
+    if (id == "library") {
+      uni.showToast({ title: t("Mobile.Common.comingSoon"), icon: "none" });
+    }
   }
 
   // ===== 头像 =====
@@ -2893,6 +2978,11 @@
     align-items: center;
     background-color: rgba(0, 0, 0, 0);
     border-bottom: 2rpx solid #e5e6eb;
+  }
+
+  /* 单聊：分割线由下方子页签行承担，header 自身去线（透明保高度，不跳布局） */
+  .chat-header--flush {
+    border-bottom: 2rpx solid rgba(0, 0, 0, 0);
   }
 
   .chat-header__btn {

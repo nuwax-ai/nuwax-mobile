@@ -1,0 +1,588 @@
+<template>
+  <view class="cp-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + Pin 消息 -->
+    <view class="cp-header">
+      <view class="cp-header__btn" hover-class="cp-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="cp-header__title-wrap">
+        <text class="cp-header__title">{{ t("Mobile.Message.pinTitle") }}</text>
+      </view>
+      <view class="cp-header__btn cp-header__btn--ghost" />
+    </view>
+
+    <!-- 置顶列表（无搜索：im 后端 search/messages 无 pinned 过滤，接口就绪前不做）。
+         ★padding 放内层容器：iOS 上 scroll-view 的水平 padding 不参与子元素宽度计算，
+           卡片会伸进右侧 padding 区被裁掉右边框（Android 正常，iOS 兼容问题） -->
+    <scroll-view class="cp-body" direction="vertical" :show-scrollbar="false">
+      <view class="cp-list">
+        <view v-if="loading" class="cp-state">
+          <text class="cp-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+        <view v-else-if="loadFailed" class="cp-state" @click="handleRetry">
+          <text class="cp-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+        </view>
+        <view v-else>
+          <view
+            v-for="p in pins"
+            :key="p.msgId"
+            class="cp-card"
+            hover-class="cp-card--active"
+            @click="handleJump(p)"
+          >
+            <!-- 卡片头：字母渐变头像 + 发送人 + 发送时间 + 「···」 -->
+            <view class="cp-card__head">
+              <view class="cp-ava" :style="{ backgroundImage: avatarGradient(p.senderName) }">
+                <text class="cp-ava__letter">{{ avatarLetter(p.senderName) }}</text>
+              </view>
+              <view class="cp-card__who">
+                <text class="cp-card__name text-ellipsis">{{
+                  p.senderName.length > 0 ? p.senderName : t("Mobile.Message.pinUnknownSender")
+                }}</text>
+                <text class="cp-card__time text-ellipsis">{{ p.sentAtText }}</text>
+              </view>
+              <view
+                class="cp-card__more"
+                hover-class="cp-card__more--active"
+                @click.stop="handleMore(p)"
+              >
+                <svg-icon name="icon-More" size="36" color="#8a8794" />
+              </view>
+            </view>
+            <!-- 摘要：Pin 那一刻的快照（图片/文件类给类型图标，其余纯文本；快照可空，空则整段不渲染） -->
+            <view
+              v-if="p.digest.length > 0 || p.contentIcon.length > 0"
+              class="cp-card__content"
+            >
+              <view v-if="p.contentIcon.length > 0" class="cp-card__content-icon">
+                <svg-icon :name="p.contentIcon" size="32" color="#5147ff" />
+              </view>
+              <text class="cp-card__digest text-ellipsis-2">{{ p.digest }}</text>
+            </view>
+          </view>
+          <view v-if="pins.length == 0" class="cp-state">
+            <text class="cp-state__text">{{ t("Mobile.Message.pinEmpty") }}</text>
+          </view>
+          <view class="cp-tail" />
+        </view>
+      </view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImConvPins, apiImUnpinMsg, IM_CHAT_JUMP_EVENT } from "@/servers/im";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 头像字母底色渐变板（与聊天页 AVATAR_GRADIENTS 同款六色系）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #f59a9a, #e05f5f)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  /**
+   * 一条置顶项（MessagePinDto，服务端按 pinTime 倒序，最多 10 条）。
+   * ★digest/msgType/senderName/sendTime 是【Pin 那一刻的快照】：
+   *   发送者改名后这里仍显示旧昵称（设计如此）；已撤回的 Pin 服务端读路径已过滤。
+   * ★msgId/senderId/pinBy 是 int64 雪花号：经 `${raw}` 转字符串存用（跳转定位按 msgId）。
+   */
+  class CpPin {
+    msgId: string = "";
+    seq: number = 0;
+    msgType: string = "";
+    digest: string = "";
+    senderName: string = "";
+    sendTime: number = 0;
+    /** 头部「发送于 M月D日」整段文案（onLoad 组装时算好，避免模板里带参拼）。 */
+    sentAtText: string = "";
+    /** 摘要行的类型图标（image/file 有图标，其余空串不渲染）。 */
+    contentIcon: string = "";
+  }
+
+  // ===== 页面入参 =====
+  const convId = ref<string>("");
+
+  // ===== 列表状态 =====
+  const pins = ref<CpPin[]>([]);
+  const loading = ref<boolean>(false);
+  const loadFailed = ref<boolean>(false);
+  /** 正在取消的那条（按 msgId）：期间忽略重复点击，防连点双发请求。 */
+  const unpinningId = ref<string>("");
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  // ===== 头像（与聊天页同款：名字首字母 + 按名字哈希取渐变底色） =====
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function isSameDay(a: Date, b: Date): boolean {
+    return a.getFullYear() == b.getFullYear() && a.getMonth() == b.getMonth() && a.getDate() == b.getDate();
+  }
+
+  /**
+   * 发送时间：今天/昨天给「今天 HH:mm」「昨天 HH:mm」（补时刻，近期消息能对上位置）；
+   * 其余今年「M月D日」，往年补年份「YYYY年M月D日」（列表是彼此无关的消息，只给日期无法定位）。
+   */
+  function formatSendDate(ms: number): string {
+    if (ms <= 0) {
+      return "";
+    }
+    const d = new Date(ms);
+    const now = new Date();
+    const pad = (n: number): string => (n < 10 ? `0${n}` : `${n}`);
+    if (isSameDay(d, now)) {
+      return `${t("Mobile.Message.today")} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    const yesterday = new Date(now.getTime() - 86400000);
+    if (isSameDay(d, yesterday)) {
+      return `${t("Mobile.Message.yesterday")} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    const md = `${d.getMonth() + 1}月${d.getDate()}日`;
+    if (d.getFullYear() != now.getFullYear()) {
+      return `${d.getFullYear()}年${md}`;
+    }
+    return md;
+  }
+
+  /** 头部时间文案：「发送于 M月D日」（时间缺失时整段留空，不输出半截）。 */
+  function buildSentAtText(sendTime: number): string {
+    const dateText = formatSendDate(sendTime);
+    if (dateText.length == 0) {
+      return "";
+    }
+    const params = new Map<string, string | number>();
+    params.set("time", dateText);
+    return translateFn("Mobile.Message.pinSentAt", toI18nParams(params), dateText);
+  }
+
+  /** 摘要行的类型图标：图片/文件给图标，其余（含纯文本）不占位。 */
+  function contentIconOf(msgType: string): string {
+    if (msgType == "image") {
+      return "icon-Image";
+    }
+    if (msgType == "file" || msgType == "video" || msgType == "audio") {
+      return "icon-a-Filetext";
+    }
+    return "";
+  }
+
+  /**
+   * 摘要展示：digest → 类型占位（[图片]/[文件]…，对齐 PC pinText 回落）→ 空串。
+   * digest 是可空快照（老数据/body 被清理过），光显示空行会像面板坏了。
+   */
+  function digestText(p: CpPin): string {
+    const d = p.digest.trim();
+    if (d.length > 0) {
+      return d;
+    }
+    const type = p.msgType;
+    if (type == "image" || type == "file" || type == "video" || type == "audio") {
+      return `[${type}]`;
+    }
+    return "";
+  }
+
+  /**
+   * 拉取置顶列表（每次进页重拉：多人共享状态且无下行帧通知，返回体 ≤10 条，
+   * 重拉是最便宜的自我纠正——别人刚取消的不会在我这残留）。
+   */
+  async function loadPins(): Promise<void> {
+    if (convId.value.length == 0 || loading.value) {
+      return;
+    }
+    loading.value = true;
+    loadFailed.value = false;
+    try {
+      const res = await apiImConvPins(convId.value);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        loading.value = false;
+        loadFailed.value = true;
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const arr = dataRaw != null ? (dataRaw as UTSJSONObject[]) : null;
+      const out: CpPin[] = [];
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const p = new CpPin();
+          p.msgId = readString(arr[i], "msgId");
+          p.seq = readNumber(arr[i], "seq", 0);
+          p.msgType = readString(arr[i], "msgType");
+          p.digest = readString(arr[i], "digest");
+          p.senderName = readString(arr[i], "senderName");
+          p.sendTime = readNumber(arr[i], "sendTime", 0);
+          p.sentAtText = buildSentAtText(p.sendTime);
+          p.contentIcon = contentIconOf(p.msgType);
+          p.digest = digestText(p);
+          if (p.msgId.length > 0) {
+            out.push(p);
+          }
+        }
+      }
+      pins.value = out;
+      loading.value = false;
+    } catch (_error) {
+      loading.value = false;
+      loadFailed.value = true;
+    }
+  }
+
+  function handleRetry(): void {
+    if (loadFailed.value) {
+      loadPins();
+    }
+  }
+
+  // ===== 跳转定位（卡片整块点击 = 跳到该消息位置，同 quote-detail「定位到聊天位置」） =====
+
+  /**
+   * 通知聊天页滚动定位并高亮该消息（聊天页 IM_CHAT_JUMP_EVENT 监听：不在已加载区间
+   * 会持续向前翻页最多 15 页），随后返回。栈底保护：刷新后无页可退时退回消息 tab。
+   */
+  function jumpBack(): void {
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  function handleJump(p: CpPin): void {
+    if (p.msgId.length == 0) {
+      return;
+    }
+    uni.$emit(IM_CHAT_JUMP_EVENT, p.msgId);
+    jumpBack();
+  }
+
+  // ===== 「···」底部弹窗：取消Pin / 跳转至会话 / 取消（系统 ActionSheet，取消键自带） =====
+
+  /**
+   * 取消置顶（任何人都能取消任何一条，服务端不校验 pinBy；幂等——重复取消返回
+   * false 仍是成功码）。成功后行内移除；失败保留该行并提示服务端文案（可能是权限）。
+   * ★须定义在 handleMore 之前（UTS→Kotlin 先用后定义会报「找不到名称」）。
+   */
+  async function handleUnpin(p: CpPin): Promise<void> {
+    if (convId.value.length == 0 || p.msgId.length == 0 || unpinningId.value.length > 0) {
+      return;
+    }
+    unpinningId.value = p.msgId;
+    try {
+      const res = await apiImUnpinMsg(convId.value, p.msgId);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const kept: CpPin[] = [];
+        const rows = pins.value;
+        for (let i = 0; i < rows.length; i++) {
+          if (rows[i].msgId != p.msgId) {
+            kept.push(rows[i]);
+          }
+        }
+        pins.value = kept;
+        uni.showToast({ title: t("Mobile.Message.pinUnpinDone"), icon: "none" });
+      } else {
+        const message = apiResMessage(res);
+        uni.showToast({
+          title: message.length > 0 ? message : t("Mobile.Common.operationFailed"),
+          icon: "none",
+        });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+    unpinningId.value = "";
+  }
+
+  function handleMore(p: CpPin): void {
+    uni.showActionSheet({
+      itemList: [t("Mobile.Message.pinUnpin"), t("Mobile.Message.pinJumpToConv")],
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        if (res.tapIndex == 0) {
+          handleUnpin(p);
+        } else if (res.tapIndex == 1) {
+          handleJump(p);
+        }
+      },
+    });
+  }
+
+  function handleBack(): void {
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    convId.value = readOption(options, "convId");
+    loadPins();
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架：浅灰底（白卡浮起） ===== */
+  .cp-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-color: #f2f3f5;
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .cp-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(0, 0, 0, 0);
+    border-bottom: 2rpx solid #e5e6eb;
+  }
+
+  .cp-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .cp-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .cp-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .cp-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .cp-header__title {
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  .cp-body {
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* 内层容器承担左右留白（勿挪回 .cp-body：iOS 上 scroll-view 的水平 padding
+     不参与子元素宽度计算，卡片右边框会被裁） */
+  .cp-list {
+    padding: 20rpx 32rpx;
+  }
+
+  .cp-state {
+    padding: 200rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .cp-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 置顶卡片（白卡无描边，靠浅灰阴影浮起） ===== */
+  .cp-card {
+    margin-bottom: 16rpx;
+    padding: 24rpx;
+    background-color: #ffffff;
+    border-radius: 20rpx;
+    box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.06);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .cp-card--active {
+    background-color: #f7f6fb;
+  }
+
+  .cp-card__head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .cp-ava {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 36rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .cp-ava__letter {
+    font-size: 30rpx;
+    line-height: 40rpx;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .cp-card__who {
+    flex: 1;
+    min-width: 0;
+    margin-left: 18rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .cp-card__name {
+    font-size: 28rpx;
+    line-height: 38rpx;
+    font-weight: 600;
+    color: #22212a;
+  }
+
+  .cp-card__time {
+    margin-top: 4rpx;
+    font-size: 22rpx;
+    line-height: 30rpx;
+    color: #9a98a5;
+  }
+
+  .cp-card__more {
+    flex-shrink: 0;
+    width: 64rpx;
+    height: 64rpx;
+    border-radius: 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .cp-card__more--active {
+    background-color: rgba(0, 0, 0, 0.05);
+  }
+
+  .cp-card__content {
+    margin-top: 18rpx;
+    padding-top: 18rpx;
+    border-top: 2rpx solid #f0eff5;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .cp-card__content-icon {
+    flex-shrink: 0;
+    margin-top: 3rpx;
+    margin-right: 10rpx;
+    display: flex;
+    flex-direction: row;
+  }
+
+  .cp-card__digest {
+    flex: 1;
+    min-width: 0;
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #3b3a44;
+  }
+
+  .cp-tail {
+    height: 40rpx;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f2f3f5;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f2f3f5;
+  }
+  /* #endif */
+</style>

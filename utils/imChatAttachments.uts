@@ -1,0 +1,207 @@
+/**
+ * 聊天窗口「已加载消息」的附件缓存（文件页数据源：单聊「文件」tab 与群文件共用）。
+ *
+ * 产品语义：文件页只显示本窗口已加载消息里的附件——进会话时的一屏 + 往上翻过
+ * （或定位跳转补翻过）的部分，文件页自己不向服务端翻历史；要找更早的文件，
+ * 先在「消息」里往上翻一些再回来。
+ *
+ * 写入方：聊天页（chat.uvue）——首屏 initHistory 前 reset，之后每次 loadHistory
+ * 成功把该页 records 交进来累积（服务端按 seq 降序=新→旧，追加顺序即列表顺序）。
+ * 读取方：文件页（im-group-files.uvue）打开时按 convId 读快照渲染。
+ */
+
+/** 附件投影（从 MessageDto 收集的与文件展示相关的字段，收集时定格）。 */
+export class ImChatAttachment {
+  key: string = "";
+  kind: string = "file";
+  url: string = "";
+  fileName: string = "";
+  size: number = 0;
+  senderName: string = "";
+  sendTime: number = 0;
+}
+
+// ===== 类型分类（对齐 PC attachment.ts 的扩展名集合；聊天页收集与文件页共用） =====
+
+const VIDEO_EXTS: string[] = ["mp4", "mov", "m4v", "webm", "mkv", "avi", "wmv", "flv", "mpeg", "mpg", "3gp"];
+const AUDIO_EXTS: string[] = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "wma", "amr", "aiff"];
+const IMAGE_EXTS: string[] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "avif"];
+
+function readString(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  return raw != null ? `${raw}` : "";
+}
+
+function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+  const raw = obj[key];
+  if (raw == null) {
+    return fallback;
+  }
+  const parsed = parseFloat(`${raw}`);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+/** 文件名后缀（小写、无点；没有点或点在末尾时返回空串）。 */
+export function extOf(name: string): string {
+  const lower = name.toLowerCase();
+  const dot = lower.lastIndexOf(".");
+  if (dot <= 0 || dot == lower.length - 1) {
+    return "";
+  }
+  return lower.substring(dot + 1);
+}
+
+/** URL 最后一段的后缀（先剥 query/hash，避免 ?x=.png 这类误判）。 */
+export function urlExtOf(url: string): string {
+  let path = url;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    path = path.substring(0, hashIdx);
+  }
+  const queryIdx = path.indexOf("?");
+  if (queryIdx >= 0) {
+    path = path.substring(0, queryIdx);
+  }
+  const slashIdx = path.lastIndexOf("/");
+  const seg = slashIdx >= 0 ? path.substring(slashIdx + 1) : path;
+  return extOf(seg);
+}
+
+/** mime/扩展名兜底分类：image | video | audio | file。 */
+export function classifyKind(mime: string, url: string): string {
+  if (mime.indexOf("image/") == 0) {
+    return "image";
+  }
+  if (mime.indexOf("video/") == 0) {
+    return "video";
+  }
+  if (mime.indexOf("audio/") == 0) {
+    return "audio";
+  }
+  const ext = urlExtOf(url);
+  if (ext.length > 0) {
+    if (VIDEO_EXTS.indexOf(ext) >= 0) {
+      return "video";
+    }
+    if (AUDIO_EXTS.indexOf(ext) >= 0) {
+      return "audio";
+    }
+    if (IMAGE_EXTS.indexOf(ext) >= 0) {
+      return "image";
+    }
+  }
+  return "file";
+}
+
+/** 附件 kind 字段是否可认（认不出按 mime/扩展名重分类，比 PC 直接归 file 更准）。 */
+export function isValidKind(kind: string): boolean {
+  return (
+    kind == "image" || kind == "file" || kind == "video" || kind == "audio"
+  );
+}
+
+/** URL 是否可用（http(s) 绝对地址或 / 开头的相对地址；其余如 data: 一律不入列）。 */
+export function isUsableUrl(url: string): boolean {
+  if (url.length == 0) {
+    return false;
+  }
+  return (
+    url.indexOf("http://") == 0 ||
+    url.indexOf("https://") == 0 ||
+    url.indexOf("/") == 0
+  );
+}
+
+// ===== 模块级缓存（同一应用运行期：聊天页写、文件页读） =====
+
+let cachedConvId = "";
+let cachedAtts: ImChatAttachment[] = [];
+const seenUrls: string[] = [];
+
+/** 开始一个新窗口的累积（聊天页首屏前调用；换会话即作废旧缓存）。 */
+export function resetChatAttachments(convId: string): void {
+  cachedConvId = convId;
+  cachedAtts = [];
+  seenUrls.splice(0, seenUrls.length);
+}
+
+/**
+ * 累积一页历史消息里的附件（loadHistory 成功后调用；records 为该页原始
+ * MessageDto 数组）：
+ * - 单附件形态：msgType 本身就是类型（image/file/video/audio），url 在 body 顶层；
+ * - rich_text：body.attachments[] 全收（含图片），kind 优先、mime/扩展名兜底；
+ * - 撤回消息（msgStatus=2，body=null）排除；已收集的 url 去重。
+ */
+export function collectChatAttachments(convId: string, records: UTSJSONObject[]): void {
+  if (convId.length == 0 || convId != cachedConvId) {
+    // 未经 reset 的时序（正常流程不会走到）：按本会话先清空再收，防串会话
+    resetChatAttachments(convId);
+  }
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    // 撤回的消息文件不可再取（body=null），排除
+    if (readNumber(rec, "msgStatus", 1) == 2) {
+      continue;
+    }
+    const msgType = readString(rec, "msgType").toLowerCase();
+    const senderName = readString(rec, "senderName");
+    const sendTime = readNumber(rec, "sendTime", 0);
+    const bodyRaw = rec["body"];
+    if (bodyRaw == null) {
+      continue;
+    }
+    const body = bodyRaw as UTSJSONObject;
+    if (isValidKind(msgType)) {
+      // 老的单附件形态：msgType 本身就是类型，url 在 body 顶层
+      const url = readString(body, "url");
+      if (isUsableUrl(url) && seenUrls.indexOf(url) < 0) {
+        seenUrls.push(url);
+        const att = new ImChatAttachment();
+        att.key = url;
+        att.kind = msgType;
+        att.url = url;
+        att.fileName = readString(body, "fileName");
+        att.size = readNumber(body, "size", 0);
+        att.senderName = senderName;
+        att.sendTime = sendTime;
+        cachedAtts.push(att);
+      }
+    } else if (msgType == "rich_text") {
+      const attsRaw = body["attachments"];
+      if (attsRaw != null) {
+        const atts = attsRaw as UTSJSONObject[];
+        for (let j = 0; j < atts.length; j++) {
+          const url = readString(atts[j], "url");
+          if (!isUsableUrl(url) || seenUrls.indexOf(url) >= 0) {
+            continue;
+          }
+          seenUrls.push(url);
+          const attKind = readString(atts[j], "kind");
+          const att = new ImChatAttachment();
+          att.key = url;
+          att.kind = isValidKind(attKind)
+            ? attKind
+            : classifyKind(readString(atts[j], "mime"), url);
+          att.url = url;
+          att.fileName = readString(atts[j], "fileName");
+          att.size = readNumber(atts[j], "size", 0);
+          att.senderName = senderName;
+          att.sendTime = sendTime;
+          cachedAtts.push(att);
+        }
+      }
+    }
+  }
+}
+
+/** 读当前窗口已加载的附件快照（convId 不匹配=缓存非本会话，返回空数组由页面渲染空态）。 */
+export function getChatAttachments(convId: string): ImChatAttachment[] {
+  if (convId != cachedConvId) {
+    return [] as ImChatAttachment[];
+  }
+  const out: ImChatAttachment[] = [];
+  for (let i = 0; i < cachedAtts.length; i++) {
+    out.push(cachedAtts[i]);
+  }
+  return out;
+}

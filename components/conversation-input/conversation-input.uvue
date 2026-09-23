@@ -589,13 +589,15 @@
     <view
       class="keyboard-cover"
       :class="{ 'keyboard-cover--animate': keyboardCoverAnimate }"
-      :style="{ height: keyboardCoverHeight + 'px' }"
+      :style="keyboardCoverStyle"
     ></view>
   </view>
 </template>
 
 <script lang="uts" setup>
-  import { buildEditorAtomicReplacementScript } from "@/utils/editorAtomicReplacement";
+  import { buildEditorAtomicReplacementScript, applyEditorAtomicReplacementInWeb, resolveWebComposerQuill } from "@/utils/editorAtomicReplacement";
+  import { detectComposerQuickTrigger } from "@/utils/composerQuickTrigger";
+  import { observeWebComposer, buildComposerEditorObserverScript } from "@/utils/composerEditorObserver";
   import SkillSelectModal from "./skill-select-modal/skill-select-modal.uvue";
   import SkillTagsBar from "./skill-tags-bar/skill-tags-bar.uvue";
   import { SkillInfoForAt } from "@/types/interfaces/skill";
@@ -1197,6 +1199,37 @@
   const isHomeScene = computed((): boolean => props.scene == "home");
   const usesHomeLayout = computed((): boolean => isHomeScene.value || props.homeLayout == true);
 
+  let iosEditorLayoutQueued = false;
+  function syncIOSHomeEditorViewport(): void {
+    // #ifdef APP-IOS
+    if (!isHomeScene.value || iosEditorLayoutQueued) return;
+    iosEditorLayoutQueued = true;
+    nextTick((): void => {
+      if (!isInputFocused.value) { iosEditorLayoutQueued = false; return; }
+      const editor = resolveEditorElement();
+      const web = editor != null ? editor.querySelector("web-view") : null;
+      if (web == null) { iosEditorLayoutQueued = false; return; }
+      // iOS 真机实测：中文已写入 Quill，但 WKWebView viewport 为 0×0。
+      // 临时增大内层 web-view 再恢复，能使视口恢复；外壳裁剪保持输入卡尺寸不变。
+      const originalHeight = web.style.height.length > 0 ? web.style.height : "100%";
+      const visibleHeight = web.getBoundingClientRect().height;
+      console.log(`[conversation-input][ios-viewport-repair] height=${visibleHeight}`);
+      const expanded = new Map<string, any>();
+      expanded.set("height", `${Math.max(200, visibleHeight + 100)}px`);
+      web.updateStyle(expanded);
+      setTimeout((): void => {
+        const restored = new Map<string, any>();
+        restored.set("height", originalHeight);
+        try {
+          if (web.isConnected) web.updateStyle(restored);
+        } finally {
+          iosEditorLayoutQueued = false;
+        }
+      }, 120);
+    });
+    // #endif
+  }
+
   /** 纯计算：输入卡底边相对键盘顶的重叠量（UTS→Kotlin 禁前向引用，
    *  measure/update 共用的计算拆到这里最先声明，打破二者互相调用的环）。 */
   function computeHomeKeyboardOffset(baseBottom: number, height: number): number {
@@ -1204,7 +1237,9 @@
     let windowHeight = 0;
     try {
       const info = uni.getSystemInfoSync();
-      windowHeight = info.windowHeight != null ? info.windowHeight : 0;
+      // iOS 首页窗口高度已扣除 TabBar，键盘高度却以屏幕底部为基准。
+      // 使用同一屏幕坐标，避免把 TabBar 高度重复计入上推距离。
+      windowHeight = info.screenHeight != null ? info.screenHeight : 0;
     } catch (_error) {
       windowHeight = 0;
     }
@@ -1219,7 +1254,7 @@
     const proxy = componentInstance.proxy;
     uni.createSelectorQuery()
       .in(proxy)
-      .select("#record-tip-container")
+      .select(".ai-generate-text-container")
       .boundingClientRect()
       .exec((results: Array<any>) => {
         if (results.length == 0 || results[0] == null) return;
@@ -1227,8 +1262,10 @@
         const top = rect.top != null ? parseFloat(`${rect.top}`) : 0;
         const height = rect.height != null ? parseFloat(`${rect.height}`) : 0;
         if (top > 0 && height > 0) {
-          homeInputBaseBottom = top + height;
-          homeKeyboardOffset.value = computeHomeKeyboardOffset(homeInputBaseBottom, keyboardHeight.value);
+          // bottom 是已应用偏移后的坐标，还原自然位置后只补实际遮挡。
+          homeInputBaseBottom = top + height + homeKeyboardOffset.value;
+          homeKeyboardOffset.value = isInputFocused.value
+            ? computeHomeKeyboardOffset(homeInputBaseBottom, keyboardHeight.value) : 0;
         }
       });
   }
@@ -1238,17 +1275,15 @@
       homeKeyboardOffset.value = 0;
       return;
     }
-    if (homeInputBaseBottom <= 0) {
-      measureHomeInputBaseBottom();
-      return;
-    }
-    homeKeyboardOffset.value = computeHomeKeyboardOffset(homeInputBaseBottom, height);
+    nextTick((): void => measureHomeInputBaseBottom());
+    // 原生 resize 可能晚于高度事件；动画结束后重新读取，已消化的部分及时归零。
+    setTimeout((): void => {
+      if (keyboardHeight.value == height && isInputFocused.value) measureHomeInputBaseBottom();
+    }, 180);
   }
 
   watch(keyboardHeight, (height: number): void => {
-    // Android / 鸿蒙虽使用 adjustResize，但部分原生 flex 子树仍保留键盘前的布局坐标；
-    // iOS 首页使用 softinputMode:nothing。三端都按输入卡和键盘的实际重叠量上移，
-    // 不能在输入组件底部追加完整键盘高度，否则会形成大片空白。
+    // 三端都检查实际遮挡，不依据平台名称推断 resize 是否已完成。
     // #ifdef APP-ANDROID || APP-HARMONY || APP-IOS
     updateHomeKeyboardOffset(height);
     // #endif
@@ -1286,6 +1321,7 @@
   let quickTriggerEnd = -1;
   let editorIndexedText = "";
   let editorInputCursor = 0;
+  let stopComposerObserver: (() => void) | null = null;
   const skillSheetVisible = ref<boolean>(false);
   const connectorSheetVisible = ref<boolean>(false);
   // 连接器弹窗初始页签（对齐 PC：头像组入口落「已连接」聚合页签，普通入口落系统广场）
@@ -1421,7 +1457,7 @@
    * 创建页没有 nothing：鸿蒙会把窗口收到键盘上方，再垫 cover 就会在输入框和键盘之间留出一整段空白。
    */
   const keyboardCoverHeight = computed((): number => {
-    // Android / 鸿蒙首页由系统 resize；iOS 首页由 homeKeyboardOffset 精确上移。
+    // 原生首页单独测量实际遮挡；不再叠加整段键盘 cover。
     // 三端首页都不能再垫完整键盘高度，否则输入卡下方会形成整块空白。
     // 会话详情使用 softinputMode:nothing，必须由共享组件的 cover 抬到键盘上方。
     // #ifdef APP-ANDROID || APP-HARMONY || APP-IOS
@@ -1441,12 +1477,14 @@
    */
   const aiGenerateBottomStyle = computed((): UTSJSONObject => {
     const style: UTSJSONObject = {} as UTSJSONObject;
+    // 是否弹出必须看原始键盘高度。resize 消化全部遮挡时 cover 为 0，但键盘仍在。
+    if (keyboardHeight.value > 0) {
+      style["marginBottom"] = "0px";
+      style["paddingBottom"] = "4px";
+      return style;
+    }
     // #ifdef H5 || WEB
     if (isAppWebViewEmbedded() == true) {
-      if (keyboardCoverHeight.value > 0) {
-        style["marginBottom"] = "0px";
-        return style;
-      }
       let px = injectedSafeAreaBottom.value;
       if (px < 0) {
         px = readCachedInjectedSafeAreaBottom();
@@ -1458,6 +1496,12 @@
       style["marginBottom"] = px >= 0 ? `${Math.round(px)}px` : "0px";
     }
     // #endif
+    return style;
+  });
+
+  const keyboardCoverStyle = computed((): UTSJSONObject => {
+    const style: UTSJSONObject = { height: keyboardCoverHeight.value + "px" };
+    if (keyboardHeight.value > 0) style["marginBottom"] = "0px";
     return style;
   });
 
@@ -1838,6 +1882,8 @@
 
   // 组件卸载时清理资源
   onUnmounted(() => {
+    if (stopComposerObserver != null) stopComposerObserver!();
+    stopComposerObserver = null;
     stopDurationTimer();
     clearMethodSwitchTimer();
     quickPopupMeasureRequestId += 1;
@@ -2854,29 +2900,54 @@
   }
 
   function syncQuickPopupFromText(rawText: string): void {
-    // Delta 中一个 mention 只占一位；不要用显示名称长度计算选区。
-    const beforeCursor = rawText.substring(0, editorInputCursor);
-    const expertDetect = detectQuickTrigger(beforeCursor, "@", "＠");
-    if (expertDetect["hasMention"] == true) {
-      if (isHomeScene.value == true && props.allowExpertSelection != true) {
-        if (quickPopupVisible.value == true) closeQuickPopup();
-        return;
-      }
-      quickTriggerEnd = editorInputCursor;
-      quickTriggerStart = quickTriggerEnd - `${expertDetect["searchText"]}`.length - 1;
-      openQuickPopup(isHomeScene.value ? "expert" : "file", `${expertDetect["searchText"]}`);
+    const trigger = detectComposerQuickTrigger(rawText, editorInputCursor, 0, false,
+      props.enableSkillAt, !isHomeScene.value || props.allowExpertSelection);
+    if (trigger == null) { closeQuickPopup(); return; }
+    quickTriggerStart = trigger["start"] as number;
+    quickTriggerEnd = trigger["end"] as number;
+    openQuickPopup(trigger["mode"] == "skill" ? "skill" : (isHomeScene.value ? "expert" : "file"), `${trigger["keyword"]}`);
+  }
+
+  function handleComposerEditorState(state: UTSJSONObject): void {
+    // #ifdef APP-IOS
+    if (state["viewportCollapsed"] == true && state["composing"] != true) syncIOSHomeEditorViewport();
+    // #endif
+    if (syncingEditorContent || removingQuickTriggerText) return;
+    const cursor = state["cursor"] as number;
+    const length = state["length"] as number;
+    const reason = `${state["reason"]}`;
+    // blur 由现有延迟处理，给候选项点击保留完成插入的机会。
+    if (cursor < 0 && reason == "selection") return;
+    if (state["composing"] == true || reason == "dismiss" || reason == "paste" || reason == "programmatic" || length != 0 || cursor < 0) {
+      closeQuickPopup();
       return;
     }
-    if (props.enableSkillAt == true) {
-      const skillDetect = detectQuickTrigger(beforeCursor, "/");
-      if (skillDetect["hasMention"] == true) {
-        quickTriggerEnd = editorInputCursor;
-        quickTriggerStart = quickTriggerEnd - `${skillDetect["searchText"]}`.length - 1;
-        openQuickPopup("skill", `${skillDetect["searchText"]}`);
-        return;
-      }
+    const text = `${state["text"]}`;
+    editorInputCursor = cursor;
+    if (reason == "selection") {
+      // 移动光标不唤起；离开原触发区间就关闭，不重写触发范围。
+      if (cursor != quickTriggerEnd || text != editorIndexedText) closeQuickPopup();
+      return;
     }
-    if (quickPopupVisible.value == true) closeQuickPopup();
+    if (reason == "edit") syncQuickPopupFromText(text);
+  }
+
+  function installComposerObserver(): void {
+    // #ifdef H5 || WEB
+    if (stopComposerObserver != null) stopComposerObserver!();
+    stopComposerObserver = null;
+    const q = resolveWebComposerQuill();
+    if (q != null) stopComposerObserver = observeWebComposer(q, handleComposerEditorState);
+    // #endif
+    // #ifdef APP
+    const editor = resolveEditorElement();
+    const web = editor != null ? editor.querySelector("web-view") : null;
+    let watchIOSViewport = false;
+    // #ifdef APP-IOS
+    watchIOSViewport = isHomeScene.value;
+    // #endif
+    if (web != null) (web as UniWebViewElement).evalJS(buildComposerEditorObserverScript(watchIOSViewport));
+    // #endif
   }
 
 
@@ -2925,15 +2996,11 @@
         const cursor = start + (mention != null ? 2 : 0);
         const expectedResult = text.substring(0, start) + (mention != null ? "\ufffc " : "") + text.substring(end);
         const change: UTSJSONObject = { ops: ops };
+        const payload: UTSJSONObject = { expected: text, change: change, cursor: cursor };
         syncingEditorContent = true;
         // #ifdef H5 || WEB
-        const root = document.querySelector("#chat-input-editor .ql-container") as any | null;
-        const quill = root != null ? root.__quill : null;
-        if (quill == null || indexedEditorText(quill.getContents()) != text) { fail(); return; }
-        quill.history.cutoff();
-        quill.updateContents(change, "user");
-        quill.setSelection(cursor, 0, "silent");
-        quill.history.cutoff();
+        const quill = resolveWebComposerQuill();
+        if (!applyEditorAtomicReplacementInWeb(quill, payload)) { fail(); return; }
         // #endif
         // #ifdef APP
         // App 三端 editor 都由内部 WebView 承载 Quill。
@@ -2941,7 +3008,6 @@
         const editor = resolveEditorElement();
         const web = editor != null ? editor.querySelector("web-view") : null;
         if (web == null) { fail(); return; }
-        const payload: UTSJSONObject = { expected: text, change: change, cursor: cursor };
         (web as UniWebViewElement).evalJS(buildEditorAtomicReplacementScript(payload));
         // #endif
         // 与 evalJS 排在同一 editor WebView 队列之后，确认写入成功再更新外部选中态。
@@ -2988,17 +3054,19 @@
     // #endif
   }
 
-  /** 用户点快捷层关闭按钮：同时撤掉本轮触发串，保证下一次 / 或 @ 是全新的触发。 */
+  /** 关闭建议不修改草稿；重新聚焦也不自动唤起。 */
   function dismissQuickPopup(): void {
-    const mode = quickPopupMode.value;
     closeQuickPopup();
-    removeQuickTriggerText(mode, (): void => focusChatInput());
   }
 
   function handleEditorInput(e: UniEditorInputEvent): void {
+    // 观测快照不重复解析/回填内容，避免选区变化也触发整个工具栏更新。
+    // #ifdef APP
+    const state = (e.detail.delta as UTSJSONObject)["__nuwaxComposer"] as UTSJSONObject | null;
+    if (state != null) { handleComposerEditorState(state); return; }
+    // #endif
     let rawText = e.detail.text != null ? `${e.detail.text}` : "";
     if (rawText.endsWith("\n")) rawText = rawText.substring(0, rawText.length - 1);
-    const previousRaw = lastEditorRawText;
     lastEditorRawText = rawText;
     const value = editorPlainTextFromDelta(e.detail.delta);
     lastEditorText = value;
@@ -3015,29 +3083,14 @@
     updateEditorHeight(value);
     syncMentionsFromEditorDelta(e.detail.delta);
     if (syncingEditorContent == true || removingQuickTriggerText == true) return;
-    if (usesHomeLayout.value == true) {
-      syncQuickPopupFromText(indexed);
-      return;
-    }
-    // 会话场景：@ 仍走技能选择弹层（撤销 @、收键盘）
-    const inserted = findSingleInsertedCharacter(previousRaw, rawText);
-    if (inserted != "@") return;
-    const openSkillPicker = shouldOpenSkillPickerOnAtInput(
-      props.enableSkillAt,
-      true,
-      true,
-    );
-    if (openSkillPicker != true) return;
-    if (editorContext != null) editorContext!.undo(null);
-    uni.hideKeyboard();
-    showExtraContainer.value = false;
-    skillSelectModalVisible.value = true;
+    // 弹层仅由编辑来源快照控制，普通 input 不猜测光标和输入来源。
   }
 
   watch(
     (): string => messageInfo.value,
     (value: string): void => {
       if (editorReady.value == true && value != lastEditorText) {
+        closeQuickPopup();
         lastEditorText = value;
         updateEditorHeight(value);
         setEditorPlainText(value);
@@ -3572,16 +3625,19 @@
 
   // 输入框获取焦点
   const onInputFocus = () => {
+    installComposerObserver();
     console.log("[conversation-input][focus-event]");
     isInputFocused.value = true;
     emit('onFocusChange', true);
     // 先记录未上推时的输入区底边，再按 IME 顶部计算精确偏移，避免整段白边。
     homeInputBaseBottom = -1;
+    // #ifdef APP
     if (isHomeScene.value) {
       nextTick((): void => {
         measureHomeInputBaseBottom();
       });
     }
+    // #endif
     // #ifdef APP-ANDROID
     if (isHomeScene.value) startAndroidImePolling();
     // #endif
@@ -3592,12 +3648,6 @@
     }
     const focusTimer = quickPopupFocusTimer;
     if (focusTimer != null) clearTimeout(focusTimer);
-    if (usesHomeLayout.value == true) {
-      quickPopupFocusTimer = setTimeout(() => {
-        quickPopupFocusTimer = null;
-        syncQuickPopupFromText(editorIndexedText);
-      }, 300);
-    }
     // 隐藏额外功能栏
     showExtraContainer.value = false;
     // 滚动到最后一个消息

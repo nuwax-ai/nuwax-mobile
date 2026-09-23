@@ -13,7 +13,7 @@ export function sourceFingerprint(root) {
       const stat = fs.lstatSync(file);
       if (stat.isSymbolicLink()) continue;
       if (stat.isDirectory()) walk(file);
-      else if (/\.(uts|uvue|vue|js|css|scss|html)$/.test(name) || ['pages.json', 'manifest.json', 'package.json'].includes(relative)) entries.push([relative, digest(fs.readFileSync(file))]);
+      else if (/\.(uts|uvue|vue|js|mjs|css|scss|html)$/.test(name) || ['pages.json', 'manifest.json', 'package.json'].includes(relative)) entries.push([relative, digest(fs.readFileSync(file))]);
     }
   }
   walk(root);

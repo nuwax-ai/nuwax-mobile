@@ -1,9 +1,13 @@
 <template>
   <!--
-    添加伙伴底部弹窗（双 tab）：
-    - 「用户」：searchContacts 搜平台用户，附言随「加为联系人」发送（对方需同意）
-    - 「智能体」：contactSearchAgents 搜已发布智能体，「加为联系人」直接生效
-    - 「发消息」：convCreateP2p 建会话后跳转消息详情页
+    添加伙伴底部弹窗（双 tab，两种模式）：
+    - 伙伴模式 open()（消息 tab 用）：
+      - 「用户」：searchContacts 搜平台用户，附言随「加为联系人」发送（对方需同意）
+      - 「智能体」：contactSearchAgents 搜已发布智能体，「加为联系人」直接生效
+      - 「发消息」：convCreateP2p 建会话后跳转消息详情页
+    - 群添加模式 openForGroup(convId)（群成员页用）：隐藏附言与发消息，单个「添加」
+      走 convAddMembers（群开审批时转申请 applied>0 → 已发送入群申请）；已在群内的
+      结果行置灰不可选（打开时拉群成员比对）
     - 打开不搜索，输入 400ms 防抖后才调接口（同创建群组）；未输入时面板紧凑定高、
       输入搜索后展开 75% 给结果列表，附言说明收进输入框 placeholder
     - 按钮区避让 home 条（sheetStyle）
@@ -19,7 +23,9 @@
   >
     <view class="buddy-sheet" :style="sheetStyle">
       <view class="buddy-sheet__header">
-        <text class="buddy-sheet__title">{{ t("Mobile.Message.addBuddy") }}</text>
+        <text class="buddy-sheet__title">{{
+          groupConvId.length > 0 ? t("Mobile.Message.groupAddTitle") : t("Mobile.Message.addBuddy")
+        }}</text>
         <view class="buddy-sheet__close" @click="close">
           <svg-icon name="icon-X" size="36" color="#8a8a8a" />
         </view>
@@ -63,8 +69,9 @@
           </view>
         </view>
 
-        <!-- 申请附言：仅「用户」tab（智能体加联系人直接生效，无需附言）；说明收进 placeholder -->
-        <view v-if="activeTab == 'user'" class="buddy-sheet__msg-box">
+        <!-- 申请附言：仅伙伴模式的「用户」tab（智能体加联系人直接生效，群添加无需附言）；
+             说明收进 placeholder -->
+        <view v-if="activeTab == 'user' && groupConvId.length == 0" class="buddy-sheet__msg-box">
           <textarea
             class="buddy-sheet__msg-input"
             v-model="applyMessage"
@@ -126,6 +133,13 @@
               </text>
             </view>
             <view
+              v-if="isExistingMember(m)"
+              class="buddy-sheet__in"
+            >
+              <text class="buddy-sheet__in-text">{{ t("Mobile.Message.groupAlreadyMember") }}</text>
+            </view>
+            <view
+              v-else
               class="buddy-sheet__check"
               :class="{ 'buddy-sheet__check--on': isSelectedTarget(m) }"
             >
@@ -146,26 +160,40 @@
             {{ t("Mobile.Common.cancel") }}
           </text>
         </view>
+        <!-- 群添加模式：单个「添加」主按钮（convAddMembers） -->
         <view
-          class="buddy-sheet__btn buddy-sheet__btn--secondary"
-          :class="{ 'buddy-sheet__btn--disabled': busy }"
-          hover-class="buddy-sheet__btn-cancel--active"
-          @click="handleAddContact"
-        >
-          <text class="buddy-sheet__btn-text buddy-sheet__btn-text--cancel">
-            {{ t("Mobile.Message.addAsContact") }}
-          </text>
-        </view>
-        <view
+          v-if="groupConvId.length > 0"
           class="buddy-sheet__btn buddy-sheet__btn--ok"
           :class="{ 'buddy-sheet__btn--disabled': busy }"
           hover-class="buddy-sheet__btn-ok--active"
-          @click="handleSendMsg"
+          @click="handleGroupAdd"
         >
           <text class="buddy-sheet__btn-text buddy-sheet__btn-text--ok">
-            {{ t("Mobile.Message.sendMessage") }}
+            {{ t("Mobile.Message.groupAddSubmit") }}
           </text>
         </view>
+        <template v-else>
+          <view
+            class="buddy-sheet__btn buddy-sheet__btn--secondary"
+            :class="{ 'buddy-sheet__btn--disabled': busy }"
+            hover-class="buddy-sheet__btn-cancel--active"
+            @click="handleAddContact"
+          >
+            <text class="buddy-sheet__btn-text buddy-sheet__btn-text--cancel">
+              {{ t("Mobile.Message.addAsContact") }}
+            </text>
+          </view>
+          <view
+            class="buddy-sheet__btn buddy-sheet__btn--ok"
+            :class="{ 'buddy-sheet__btn--disabled': busy }"
+            hover-class="buddy-sheet__btn-ok--active"
+            @click="handleSendMsg"
+          >
+            <text class="buddy-sheet__btn-text buddy-sheet__btn-text--ok">
+              {{ t("Mobile.Message.sendMessage") }}
+            </text>
+          </view>
+        </template>
       </view>
     </view>
   </uni-modal-popup>
@@ -178,12 +206,19 @@
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import {
     apiImAddContact,
+    apiImConvMembers,
     apiImCreateP2pConversation,
+    apiImGroupAddMembers,
     apiImSearchAgents,
     apiImSearchContacts,
   } from "@/servers/im";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  const emit = defineEmits<{
+    /** 群添加模式提交成功（convId：群成员页借此刷新成员列表） */
+    added: [convId: string];
+  }>();
 
   /** 搜索结果行（人 tab 与智能体 tab 共用；description 仅智能体有）。 */
   class SheetBuddy {
@@ -219,6 +254,10 @@
   const selectedTarget = ref<SheetBuddy | null>(null);
   /** 加为联系人/发消息 互斥防重 */
   const busy = ref<boolean>(false);
+  // ===== 群添加模式（openForGroup）：非空即群模式，隐藏附言/发消息、按钮换成「添加」 =====
+  const groupConvId = ref<string>("");
+  /** 群内已有成员 userId 集（打开时拉 members 比对，命中行置灰不可选）。 */
+  const existingIds = ref<string[]>([]);
   /** 发消息成功后待跳转的会话（等弹窗完全收起再跳，避免弹层压在推入页上） */
   let pendingChatConvId = "";
   let pendingChatName = "";
@@ -274,8 +313,8 @@
     } catch (_e) {
       safeRpx = 0;
     }
-    // 用户 tab 内容含附言框（约 600rpx），智能体 tab 无附言（约 460rpx）
-    const base = activeTab.value == "user" ? 600 : 460;
+    // 用户 tab 内容含附言框（约 600rpx）；智能体 tab / 群添加模式无附言（约 460rpx）
+    const base = activeTab.value == "user" && groupConvId.value.length == 0 ? 600 : 460;
     return `${base + safeRpx}rpx`;
   });
 
@@ -290,8 +329,72 @@
     results.value = [];
   }
 
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  /** 群添加模式：拉群内成员 userId 集（GET /conversations/{convId}/members），命中行置灰。 */
+  async function loadExistingMembers(): Promise<void> {
+    const conv = groupConvId.value;
+    if (conv.length == 0) {
+      return;
+    }
+    try {
+      const res = await apiImConvMembers(conv);
+      // 晚归守卫：期间弹窗已关/换了群，丢弃本次结果
+      if (conv != groupConvId.value) {
+        return;
+      }
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        return;
+      }
+      const recordsRaw = dataObj["records"];
+      if (recordsRaw == null) {
+        return;
+      }
+      const records = recordsRaw as UTSJSONObject[];
+      const out: string[] = [];
+      for (let i = 0; i < records.length; i++) {
+        const id = readString(records[i], "userId");
+        if (id.length > 0) {
+          out.push(id);
+        }
+      }
+      existingIds.value = out;
+    } catch (_error) {
+      // 静默：已有成员只是辅助置灰，拉不到不阻塞添加
+    }
+  }
+
+  /** 群添加模式：该结果是否已在群内（置灰 + 不可选，替代选择圈）。 */
+  function isExistingMember(m: SheetBuddy): boolean {
+    if (groupConvId.value.length == 0) {
+      return false;
+    }
+    const ids = existingIds.value;
+    for (let i = 0; i < ids.length; i++) {
+      if (ids[i] == m.userId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** 打开添加伙伴弹窗：重置表单（初始不搜索、不展示，输入才搜）。 */
   function open(): void {
+    groupConvId.value = "";
+    existingIds.value = [];
     activeTab.value = "user";
     keyword.value = "";
     applyMessage.value = "";
@@ -306,6 +409,24 @@
         callPopupMethod("open");
       },
     });
+  }
+
+  /**
+   * 群添加模式（群成员页用）：复用搜索/单选，但隐藏附言与「发消息」，
+   * 提交走 convAddMembers（群开审批时转申请）。★宿主是非 tabBar 页，
+   * 跳过 hideTabBar（隐藏后导航返回会残留）。已在群内的行打开时拉取置灰。
+   */
+  function openForGroup(conv: string): void {
+    groupConvId.value = conv;
+    existingIds.value = [];
+    activeTab.value = "user";
+    keyword.value = "";
+    applyMessage.value = "";
+    results.value = [];
+    selectedTarget.value = null;
+    resetSearchIdle();
+    loadExistingMembers();
+    callPopupMethod("open");
   }
 
   /** 关闭弹窗：作废未发出的防抖搜索与在途请求（列表保留到收起动画结束）。 */
@@ -338,16 +459,6 @@
     uni.showTabBar({
       animation: false,
     });
-  }
-
-  function readString(obj: UTSJSONObject, key: string): string {
-    const raw = obj[key];
-    return raw != null ? `${raw}` : "";
-  }
-
-  function readBool(obj: UTSJSONObject, key: string): boolean {
-    const raw = obj[key];
-    return raw != null && `${raw}` == "true";
   }
 
   /** 人 tab 结果行：ContactSearchItem 无 displayName，按 nickName > userName 回落。 */
@@ -452,6 +563,9 @@
 
   /** 单选：再点同一行取消，点别行换目标。 */
   function toggleTarget(m: SheetBuddy): void {
+    if (isExistingMember(m)) {
+      return;
+    }
     if (isSelectedTarget(m)) {
       selectedTarget.value = null;
     } else {
@@ -561,6 +675,57 @@
     }
   }
 
+  /**
+   * 群添加模式提交（convAddMembers，单选单个提交）：
+   * - 与伙伴模式的 contactAdd 是不同链路：群成员走批量 members 端点，无需对方同意
+   * - 群开「入群审批」时服务端转申请：AddMembersResult.applied>0 → 「已发送入群申请」
+   * - 智能体不走审批直接入群；int64 userId 已是字符串，服务端接口层拼原始字面量
+   */
+  async function handleGroupAdd(): Promise<void> {
+    if (busy.value) {
+      return;
+    }
+    const target = selectedTarget.value;
+    if (target == null) {
+      uni.showToast({ title: t("Mobile.Message.groupAddNone"), icon: "none" });
+      return;
+    }
+    const conv = groupConvId.value;
+    if (conv.length == 0) {
+      return;
+    }
+    busy.value = true;
+    try {
+      const res = await apiImGroupAddMembers(conv, [target.userId]);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        let applied = 0;
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          const appliedRaw = dataObj["applied"];
+          if (appliedRaw != null) {
+            const parsed = parseFloat(`${appliedRaw}`);
+            if (!isNaN(parsed)) {
+              applied = parsed;
+            }
+          }
+        }
+        uni.showToast({
+          title: applied > 0 ? t("Mobile.Message.groupAddApplied") : t("Mobile.Message.groupAddDone"),
+          icon: "none",
+        });
+        emit("added", conv);
+        close();
+      } else {
+        uni.showToast({ title: apiResMessage(res), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+    }
+  }
+
   /** 弹窗完全收起：恢复 tabBar，再跳转消息详情页。 */
   function handleAfterLeave(): void {
     restoreTabBar();
@@ -582,6 +747,7 @@
 
   defineExpose({
     open: open as any,
+    openForGroup: openForGroup as any,
     close: close as any,
   });
 
@@ -851,6 +1017,18 @@
   .buddy-sheet__check--on {
     border-color: #5147ff;
     background-color: #5147ff;
+  }
+
+  /* 群添加模式：已在群内的行右侧置灰文案（替代选择圈，不可选） */
+  .buddy-sheet__in {
+    flex-shrink: 0;
+    margin-left: 16rpx;
+  }
+
+  .buddy-sheet__in-text {
+    color: #b0aebc;
+    font-size: 24rpx;
+    line-height: 34rpx;
   }
 
   .buddy-sheet__footer {

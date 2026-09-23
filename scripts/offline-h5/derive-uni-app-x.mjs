@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { removeInlinedJsPreloads } from './preload.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const SRC = path.resolve(ROOT, process.env.WEB_DIST || 'unpackage/dist/build/web');
@@ -81,6 +82,7 @@ try {
 
 // --- 3. 改写产物内绝对路径与 import.meta 残留 ---------------------------------
 let bundle = fs.readFileSync(bundlePath, 'utf8');
+bundle = removeInlinedJsPreloads(bundle);
 const absRefs = (bundle.match(/["']\/m\//g) || []).length;
 bundle = bundle.replaceAll('"/m/', '"./').replaceAll("'/m/", "'./");
 // cmark/Emscripten 胶水的 import.meta.url 在 IIFE 下被 esbuild 置为空对象 → wasm 与
@@ -195,6 +197,8 @@ fs.copyFileSync(path.join(ROOT, 'components/offline-h5-container/offline-h5-brid
 fs.copyFileSync(path.join(ROOT, 'components/offline-h5-container/offline-h5-project-bootstrap.js'), path.join(OUT, 'offline-h5-project-bootstrap.js'));
 
 let outHtml = html;
+// HTML 的静态 JS 预加载同样已由 IIFE 覆盖。
+outHtml = outHtml.replace(/<link\b[^>]*\brel=["']modulepreload["'][^>]*>\s*/g, '');
 // 去 PC/移动端跳转脚本：file:// 下会把页面导向 file:///m/ 死链
 outHtml = outHtml.replace(/<script>([\s\S]*?)<\/script>/g, (m, code) =>
   (code.includes('window.location.replace') && code.includes('isMobile')) ? '' : m);

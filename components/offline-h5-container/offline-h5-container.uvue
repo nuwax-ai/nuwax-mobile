@@ -52,6 +52,27 @@ function stringOption(key: string): string {
   const value = props.request[key];
   return value != null ? `${value}` : '';
 }
+function canLoadLocalDocument(localUrl: string, remoteUrl: string): boolean {
+  // #ifdef APP-HARMONY
+  // 鸿蒙 ArkWeb 对不存在的本地入口会直接报 invalidFileUrl，未必向 web-view
+  // 转发 @error；先检查代码包入口，避免空等文档加载的 12s 超时。
+  if (remoteUrl.length > 0 && localUrl.startsWith('/static/')) {
+    const queryIndex = localUrl.indexOf('?');
+    const hashIndex = localUrl.indexOf('#');
+    let end = localUrl.length;
+    if (queryIndex >= 0 && queryIndex < end) end = queryIndex;
+    if (hashIndex >= 0 && hashIndex < end) end = hashIndex;
+    const entryPath = localUrl.substring(0, end);
+    try {
+      uni.getFileSystemManager().accessSync(entryPath);
+    } catch (_error) {
+      console.log(`[offline-h5] local-entry-missing path=${entryPath}`);
+      return false;
+    }
+  }
+  // #endif
+  return true;
+}
 function clearTimer(): void {
   if (timer != 0) { clearTimeout(timer); timer = 0; }
 }
@@ -101,7 +122,10 @@ function openRequest(): void {
   loading.value = true;
   openedAt = Date.now();
   staleLogged.clear();
-  session.open(stringOption('requestKey'), stringOption('scopeKey'), stringOption('localUrl'), stringOption('remoteUrl'), props.request['preferLocal'] == true);
+  const localUrl = stringOption('localUrl');
+  const remoteUrl = stringOption('remoteUrl');
+  const preferLocal = props.request['preferLocal'] == true && canLoadLocalDocument(localUrl, remoteUrl);
+  session.open(stringOption('requestKey'), stringOption('scopeKey'), localUrl, remoteUrl, preferLocal);
   console.log(`[offline-h5] open phase=${session.phase} key=${session.requestKey}`);
   if (session.phase == 'navigating-local' && context != null) {
     const route = session.documentUrl.substring(session.documentUrl.indexOf('#') + 1);
@@ -128,11 +152,13 @@ function handleDocumentLoad(event: UniWebViewLoadEvent): void {
 function handleDocumentError(event: UniWebViewErrorEvent): void {
   const id = session.requestId;
   const code = event.detail.errCode;
-  // #ifdef APP-HARMONY
-  // Harmony onErrorReceive 也转发图片/字体等子资源错误，url 是失败资源，
-  // fullUrl 却始终是当前文档。不能用 fullUrl 把子资源错误误判为入口丢失。
-  // 实测此时本地 PAGE_READY 随后正常到达，立即回退反而会丢弃它。
-  let failedPath = event.detail.url;
+  // 各端统一核对失败资源：Android 的预加载/图片错误也可能早于 PAGE_READY。
+  // fullUrl 是完整失败地址；url 仅含 scheme://authority，src 是 WebView 入口，
+  // 不能用它们代替 fullUrl 判断是否整页失败。
+  let failedPath = event.detail.fullUrl;
+  // url 仅含 scheme://authority，无法区分入口与子资源；完整失败地址缺失时
+  // 不猜测，交给超时兜底，避免图片/字体错误误触发整页回退。
+  if (failedPath.length == 0) return;
   let documentPath = session.localUrl;
   const failedQuery = failedPath.indexOf('?');
   if (failedQuery >= 0) failedPath = failedPath.substring(0, failedQuery);
@@ -146,7 +172,6 @@ function handleDocumentError(event: UniWebViewErrorEvent): void {
     console.log(`[offline-h5] subresource-error ignored code=${code}`);
     return;
   }
-  // #endif
   // 本地入口不存在或无法加载时，web-view 已经给出了确定失败信号，无需再等 12s。
   // 延后一拍切换 src，避免在原生 web-view 的 error 回调中重入；远程和旧请求错误仍由超时链处理。
   setTimeout(() => {

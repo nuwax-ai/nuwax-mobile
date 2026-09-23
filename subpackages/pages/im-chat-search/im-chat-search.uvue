@@ -1,0 +1,748 @@
+<template>
+  <view class="ics-page">
+    <safety-zone />
+
+    <!-- 顶部：搜索框 + 取消（与全局搜索页 im-search 同款布局） -->
+    <view class="ics-header">
+      <view class="ics-search-box" :class="{ 'ics-search-box--focus': inputFocused }">
+        <svg-icon name="icon-Search" size="34" color="#9a98a5" />
+        <input
+          ref="searchInputRef"
+          class="ics-search-input"
+          v-model="keyword"
+          :placeholder="t('Mobile.Message.chatSearchPlaceholder')"
+          placeholder-class="ics-search-ph"
+          confirm-type="search"
+          :focus="autoFocus"
+          @focus="handleInputFocus"
+          @blur="handleInputBlur"
+          @input="onKeywordInput"
+          @confirm="onKeywordConfirm"
+        />
+        <view v-if="keyword.length > 0" class="ics-clear" @click="handleClear">
+          <svg-icon name="icon-a-Xcircle-fill" size="32" color="#c0bec8" />
+        </view>
+      </view>
+      <view class="ics-cancel" hover-class="ics-cancel--active" @click="handleBack">
+        <text class="ics-cancel__text">{{ t("Mobile.Common.cancel") }}</text>
+      </view>
+    </view>
+
+    <!-- 分类 pill：全部 / 图片 / 文件 / 视频 / 音频（与文件页同分类，映射搜索接口 msgType） -->
+    <view class="ics-pills">
+      <view
+        v-for="k in kindTabs"
+        :key="k.id"
+        class="ics-pill"
+        :class="{ 'ics-pill--on': activeKind == k.id }"
+        @click="switchKind(k.id)"
+      >
+        <text class="ics-pill__text" :class="{ 'ics-pill__text--on': activeKind == k.id }">
+          {{ k.label }}
+        </text>
+      </view>
+    </view>
+
+    <!-- 结果区 -->
+    <scroll-view class="ics-body" direction="vertical" :show-scrollbar="false">
+      <view v-if="submittedKw.length == 0" class="ics-state">
+        <text class="ics-state__text">{{ t("Mobile.Message.chatSearchIdle") }}</text>
+      </view>
+      <view v-else-if="loading" class="ics-state">
+        <text class="ics-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+      </view>
+      <view v-else-if="rows.length == 0" class="ics-state">
+        <text class="ics-state__text">{{ t("Mobile.Message.imSearchEmpty") }}</text>
+      </view>
+      <template v-else>
+        <view v-for="row in rows" :key="row.msgId">
+          <view class="ics-row" hover-class="ics-row--active" @click="handleHitTap(row)">
+            <view class="ics-row__avatar" :style="{ backgroundImage: avatarGradient(rowTitle(row)) }">
+              <text class="ics-row__avatar-letter">{{ avatarLetter(rowTitle(row)) }}</text>
+            </view>
+            <view class="ics-row__body">
+              <view class="ics-row__title-row">
+                <text class="ics-row__title text-ellipsis">{{ rowTitle(row) }}</text>
+                <text class="ics-row__time">{{ formatHitTime(row.sendTime) }}</text>
+              </view>
+              <text class="ics-row__snippet text-ellipsis-2">
+                <text
+                  v-for="(seg, i) in row.segs"
+                  :key="i"
+                  :class="seg.hit ? 'ics-row__seg--hit' : ''"
+                >{{ seg.text }}</text>
+              </text>
+            </view>
+          </view>
+        </view>
+      </template>
+      <view class="ics-bottom-space" />
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { nextTick, onMounted, onUnmounted, ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImSearchConvMessages, IM_CHAT_JUMP_EVENT } from "@/servers/im";
+  import type { RequestResponse } from "@/types/interfaces/request";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 单次拉取条数（PC ChatSearchPanel 同款 size=50，服务端上限 100）。 */
+  const PAGE_SIZE = 50;
+  /** 输入防抖（ms）：与全局搜索页同款，逐字不打 ES。 */
+  const DEBOUNCE_MS = 400;
+
+  /** 头像字母底色渐变板（与聊天页 AVATAR_GRADIENTS 同款六色系）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #f59a9a, #e05f5f)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  /** 高亮片段：服务端 highlight 的 <em>…</em> 拆段（只按标记切分，内容一律纯文本渲染，天然无 XSS）。 */
+  class SearchSeg {
+    text: string = "";
+    hit: boolean = false;
+  }
+
+  /**
+   * 一条命中行。★msgId 是 int64 雪花号（字符串存防精度丢失，跳转定位按它）。
+   * segs 已含 [图片]/[文件] 前缀段（附件消息索引里只有文件名，与 PC previewOf 同口径）。
+   */
+  class SearchHit {
+    msgId: string = "";
+    senderName: string = "";
+    sendTime: number = 0;
+    segs: SearchSeg[] = [];
+  }
+
+  /** 分类 tab（全部 + 图片/文件/视频/音频，顺序对齐文件页 kindTabs）。 */
+  class KindTab {
+    id: string = "all";
+    label: string = "";
+  }
+
+  function makeKindTab(id: string, labelKey: string): KindTab {
+    const k = new KindTab();
+    k.id = id;
+    k.label = t(labelKey);
+    return k;
+  }
+
+  const kindTabs = ref<KindTab[]>([
+    makeKindTab("all", "Mobile.Common.all"),
+    makeKindTab("image", "Mobile.Message.filesTabImage"),
+    makeKindTab("file", "Mobile.Message.filesTabFile"),
+    makeKindTab("video", "Mobile.Message.filesTabVideo"),
+    makeKindTab("audio", "Mobile.Message.filesTabAudio"),
+  ]);
+
+  // ===== 页面入参 =====
+  const convId = ref<string>("");
+
+  // ===== 输入与状态 =====
+  const keyword = ref<string>("");
+  const submittedKw = ref<string>("");
+  const inputFocused = ref<boolean>(false);
+  const autoFocus = ref<boolean>(false);
+  const activeKind = ref<string>("all");
+  const rows = ref<SearchHit[]>([]);
+  const loading = ref<boolean>(false);
+  const searchInputRef = ref<UniInputElement | null>(null);
+  /** 请求时序号：慢响应回来时关键词/分类已变则丢弃。 */
+  let searchSeq = 0;
+  let debounceTimer = 0;
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  // ===== 高亮解析（与 im-search 同款：<em> 拆段 + 附件前缀） =====
+
+  const EM_OPEN = "<em>";
+  const EM_CLOSE = "</em>";
+
+  /**
+   * highlight 拆段：按 <em>/</em> 标记切分为 普通/命中 交替片段。
+   * 片段内容只作纯文本渲染（不进 rich-text），标记本身被剥离，天然免疫注入。
+   */
+  function parseHighlight(frag: string, prefix: string): SearchSeg[] {
+    const segs: SearchSeg[] = [];
+    if (prefix.length > 0) {
+      const head = new SearchSeg();
+      head.text = prefix;
+      segs.push(head);
+    }
+    let rest = frag;
+    let hit = false;
+    let guard = 0;
+    while (rest.length > 0 && guard < 100) {
+      guard++;
+      const marker = hit ? EM_CLOSE : EM_OPEN;
+      const at = rest.indexOf(marker);
+      if (at < 0) {
+        const seg = new SearchSeg();
+        seg.text = rest;
+        seg.hit = hit;
+        segs.push(seg);
+        break;
+      }
+      if (at > 0) {
+        const seg = new SearchSeg();
+        seg.text = rest.substring(0, at);
+        seg.hit = hit;
+        segs.push(seg);
+      }
+      rest = rest.substring(at + marker.length);
+      hit = !hit;
+    }
+    return segs;
+  }
+
+  /**
+   * 命中预览拆段：highlight > text > fileName 逐级回落（后端 pickHighlight 已做过
+   * text→fileName 回落，前端再兜一层兼容旧后端）；附件消息加 [图片]/[文件] 前缀
+   * （索引里只有文件名，不标前缀用户看不出为什么命中——PC previewOf 同口径）。
+   */
+  function buildSegs(obj: UTSJSONObject): SearchSeg[] {
+    const msgType = readString(obj, "msgType");
+    let prefix = "";
+    if (msgType == "image") {
+      prefix = t("Mobile.Message.quoteImage") + " ";
+    } else if (msgType == "file") {
+      prefix = t("Mobile.Message.quoteFile") + " ";
+    }
+    let frag = readString(obj, "highlight");
+    if (frag.length == 0) {
+      frag = readString(obj, "text");
+    }
+    if (frag.length == 0) {
+      frag = readString(obj, "fileName");
+    }
+    return parseHighlight(frag, prefix);
+  }
+
+  function readHit(obj: UTSJSONObject): SearchHit {
+    const row = new SearchHit();
+    row.msgId = readString(obj, "msgId");
+    row.senderName = readString(obj, "senderName");
+    row.sendTime = readNumber(obj, "sendTime", 0);
+    row.segs = buildSegs(obj);
+    return row;
+  }
+
+  function parseItems(res: RequestResponse<any>): SearchHit[] {
+    const out: SearchHit[] = [];
+    const dataRaw = apiResData<any>(res);
+    const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+    if (dataObj != null) {
+      const itemsRaw = dataObj["items"];
+      if (itemsRaw != null) {
+        const items = itemsRaw as UTSJSONObject[];
+        for (let i = 0; i < items.length; i++) {
+          const hit = readHit(items[i]);
+          if (hit.msgId.length > 0) {
+            out.push(hit);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  /** 会话内搜索：分类映射 msgType（全部=不传），慢响应按 seq+条件丢弃。 */
+  function fetchHits(): void {
+    const seq = searchSeq;
+    const kw = submittedKw.value;
+    const kind = activeKind.value;
+    loading.value = true;
+    apiImSearchConvMessages(convId.value, kw, kind == "all" ? "" : kind, PAGE_SIZE)
+      .then((res: RequestResponse<any>) => {
+        if (seq != searchSeq || submittedKw.value != kw || activeKind.value != kind) {
+          return;
+        }
+        loading.value = false;
+        if (apiResCode(res) != SUCCESS_CODE) {
+          rows.value = [];
+          return;
+        }
+        rows.value = parseItems(res);
+      })
+      .catch((_e: any | null) => {
+        if (seq != searchSeq || submittedKw.value != kw || activeKind.value != kind) {
+          return;
+        }
+        loading.value = false;
+        rows.value = [];
+      });
+  }
+
+  /** 提交关键词（空=回待输入态，清结果不发请求）。 */
+  function runSearch(): void {
+    searchSeq++;
+    if (submittedKw.value.length == 0) {
+      rows.value = [];
+      loading.value = false;
+      return;
+    }
+    fetchHits();
+  }
+
+  function submitKeyword(kw: string): void {
+    if (kw == submittedKw.value && kw.length > 0) {
+      return;
+    }
+    submittedKw.value = kw;
+    runSearch();
+  }
+
+  /** 防抖提交：边输边搜（飞书式），但逐字不直接打 ES。 */
+  function handleSearchDebounced(value: string): void {
+    if (debounceTimer != 0) {
+      clearTimeout(debounceTimer);
+      debounceTimer = 0;
+    }
+    debounceTimer = setTimeout(() => {
+      debounceTimer = 0;
+      submitKeyword(value.trim());
+    }, DEBOUNCE_MS);
+  }
+
+  function onKeywordInput(e: UniInputEvent): void {
+    if (e == null) {
+      return;
+    }
+    handleSearchDebounced(e.detail.value);
+  }
+
+  function onKeywordConfirm(e: UniInputConfirmEvent): void {
+    if (e == null) {
+      return;
+    }
+    submitKeyword(e.detail.value.trim());
+  }
+
+  function handleClear(): void {
+    keyword.value = "";
+    if (debounceTimer != 0) {
+      clearTimeout(debounceTimer);
+      debounceTimer = 0;
+    }
+    submittedKw.value = "";
+    runSearch();
+  }
+
+  /** 切分类：关键词已提交则按新分类重查（msgType 是查询条件的一部分，无缓存复用）。 */
+  function switchKind(id: string): void {
+    if (activeKind.value == id) {
+      return;
+    }
+    activeKind.value = id;
+    if (submittedKw.value.length > 0) {
+      runSearch();
+    }
+  }
+
+  // ===== 展示辅助 =====
+
+  /** 行标题：发送者名（PC ChatSearchPanel 同款，本会话内无需会话名回落）。 */
+  function rowTitle(row: SearchHit): string {
+    return row.senderName.length > 0 ? row.senderName : t("Mobile.Message.pinUnknownSender");
+  }
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function pad2(n: number): string {
+    return n < 10 ? `0${n}` : `${n}`;
+  }
+
+  function isSameDay(a: Date, b: Date): boolean {
+    return (
+      a.getFullYear() == b.getFullYear() &&
+      a.getMonth() == b.getMonth() &&
+      a.getDate() == b.getDate()
+    );
+  }
+
+  /** 搜索行时间：今天 HH:mm / 昨天 HH:mm / 今年 M月D日 HH:mm / 跨年 YYYY年M月D日（与 im-search 同款）。 */
+  function formatHitTime(ts: number): string {
+    if (ts <= 0) {
+      return "";
+    }
+    const date = new Date(ts);
+    const now = new Date();
+    if (isSameDay(date, now)) {
+      return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+    }
+    const yesterday = new Date(now.getTime() - 86400000);
+    if (isSameDay(date, yesterday)) {
+      return `${t("Mobile.Message.yesterday")} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+    }
+    if (date.getFullYear() == now.getFullYear()) {
+      return `${date.getMonth() + 1}月${date.getDate()}日 ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+    }
+    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
+  }
+
+  // ===== 跳转定位（复用 Pin 页同款通道：通知聊天页滚到该消息并高亮，随后返回） =====
+
+  function jumpBack(): void {
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  /**
+   * 点命中行：回聊天页并定位到那一条（聊天页 IM_CHAT_JUMP_EVENT 监听：不在已加载区间
+   * 会持续向前翻页最多 15 页补齐——搜索是 ES 全量，结果常比窗口已加载的更早）。
+   */
+  function handleHitTap(row: SearchHit): void {
+    if (row.msgId.length == 0) {
+      return;
+    }
+    uni.$emit(IM_CHAT_JUMP_EVENT, row.msgId);
+    jumpBack();
+  }
+
+  function handleInputFocus(): void {
+    inputFocused.value = true;
+  }
+
+  function handleInputBlur(): void {
+    inputFocused.value = false;
+  }
+
+  function handleBack(): void {
+    // 刷新后栈底保护：同 chat.uvue，无页可退时切回消息 tab，避免整页重载死循环
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    convId.value = readOption(options, "convId");
+    // 进入即聚焦（飞书交互）；#ifndef MP 平台在 onMounted 里聚焦
+    // #ifdef MP-WEIXIN
+    autoFocus.value = true;
+    // #endif
+  });
+
+  onMounted(() => {
+    nextTick(() => {
+      const input = searchInputRef.value;
+      if (input != null) {
+        input.focus();
+      }
+    });
+  });
+
+  onUnmounted(() => {
+    if (debounceTimer != 0) {
+      clearTimeout(debounceTimer);
+      debounceTimer = 0;
+    }
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架（与全局搜索页同底色） ===== */
+  .ics-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-color: #f6f5fb;
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  /* ===== 顶部搜索框 + 取消 ===== */
+  .ics-header {
+    flex-shrink: 0;
+    padding: 16rpx 24rpx 8rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .ics-search-box {
+    flex: 1;
+    min-width: 0;
+    height: 76rpx;
+    padding: 0 24rpx;
+    border-radius: 38rpx;
+    background-color: #ffffff;
+    border: 2rpx solid rgba(81, 71, 255, 0);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .ics-search-box--focus {
+    border: 2rpx solid rgba(81, 71, 255, 0.45);
+  }
+
+  .ics-search-input {
+    flex: 1;
+    min-width: 0;
+    margin: 0 16rpx;
+    font-size: 30rpx;
+    line-height: 42rpx;
+    color: #17171a;
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .ics-search-ph {
+    color: #b0aebc;
+    font-size: 30rpx;
+  }
+
+  .ics-clear {
+    width: 48rpx;
+    height: 48rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .ics-cancel {
+    flex-shrink: 0;
+    height: 76rpx;
+    padding: 0 8rpx 0 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ics-cancel--active {
+    opacity: 0.7;
+  }
+
+  .ics-cancel__text {
+    font-size: 30rpx;
+    line-height: 42rpx;
+    color: #5147ff;
+  }
+
+  /* ===== 分类 pill ===== */
+  .ics-pills {
+    flex-shrink: 0;
+    height: 92rpx;
+    padding: 0 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .ics-pill {
+    height: 60rpx;
+    padding: 0 30rpx;
+    margin-right: 16rpx;
+    border-radius: 30rpx;
+    background-color: #ecebf3;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ics-pill--on {
+    background-color: rgba(81, 71, 255, 0.12);
+  }
+
+  .ics-pill__text {
+    font-size: 26rpx;
+    line-height: 36rpx;
+    color: #55535f;
+  }
+
+  .ics-pill__text--on {
+    color: #5147ff;
+    font-weight: 600;
+  }
+
+  /* ===== 结果区 ===== */
+  .ics-body {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .ics-state {
+    padding: 200rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .ics-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 结果行（头像 + 发送者/摘要 + 右侧时间） ===== */
+  .ics-row {
+    padding: 26rpx 32rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .ics-row--active {
+    background-color: #efedf7;
+  }
+
+  /* 头像整数 px + 半径取半（同 im-search：rpx 亚像素 + 圆角在 iOS 会随机切边） */
+  .ics-row__avatar {
+    width: 48px;
+    height: 48px;
+    border-radius: 24px;
+    margin-right: 22rpx;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    background-color: #ecebf1;
+  }
+
+  .ics-row__avatar-letter {
+    font-size: 40rpx;
+    line-height: 48rpx;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .ics-row__body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .ics-row__title-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .ics-row__title {
+    flex: 1;
+    min-width: 0;
+    font-size: 31rpx;
+    line-height: 44rpx;
+    font-weight: 600;
+    color: #141416;
+  }
+
+  .ics-row__time {
+    margin-left: 16rpx;
+    flex-shrink: 0;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #94929c;
+  }
+
+  /* 命中摘要：<em> 拆段后命中片段着品牌紫 */
+  .ics-row__snippet {
+    margin-top: 4rpx;
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #6b6976;
+  }
+
+  .ics-row__seg--hit {
+    color: #5147ff;
+    font-weight: 600;
+  }
+
+  .ics-bottom-space {
+    height: 40rpx;
+    /* #ifdef H5 || WEB */
+    height: calc(40rpx + env(safe-area-inset-bottom, 0px));
+    /* #endif */
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  /* #endif */
+</style>

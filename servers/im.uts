@@ -118,6 +118,35 @@ export async function apiImMyGroups(
 }
 
 /**
+ * 我的团队列表（智联录「团队」折叠分类，置于我的群组上方）。
+ *
+ * - GET /api/instant-message/spaces → data.items: SpaceSummaryDto[]
+ *   （spaceId/name/description/icon/type("Team")/currentUserRole("Owner"|"Admin"|"User")）
+ * - 全量返回不分页（data.degraded 标志暂未用）；spaceId 拼进 enter 的 URL，存字符串
+ */
+export async function apiImSpaces(): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/spaces",
+    method: "GET",
+  });
+}
+
+/**
+ * 进入团队会话（spaceEnter，幂等 get-or-create，同 p2p 语义）。
+ *
+ * - 响应 data = ConversationSummaryDto：convId 为 int64 雪花号（请求层防精度解析
+ *   保证精确）、convType=4（团队会话），name/avatar 可直接作聊天页入参
+ */
+export async function apiImSpaceEnter(
+  spaceId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/spaces/${spaceId}/enter`,
+    method: "POST",
+  });
+}
+
+/**
  * 解散群聊（convDisband，仅群主）。
  *
  * 契约见 im-openapi.yaml：
@@ -260,6 +289,47 @@ export async function apiImSearchMessages(
       keyword,
       size,
       collapseByConv,
+    },
+  });
+}
+
+/**
+ * 会话内消息搜索（同 /search/messages 端点恒带 convId，PC ChatSearchPanel 同款）：
+ * - convId 限定在本会话内搜（★int64 雪花号字符串直传 query，不经 number 防丢精度）；
+ * - msgType 限定消息类型（image/file/video/audio，ES term 精确匹配）；空串=不过滤——
+ *   ★空串干脆不传该参数（openapi 定义 msgType 空串视为不过滤，但后端 convId 是
+ *   Long 绑定、空串不友好，统一按「有值才传」的纪律走）；
+ * - collapseByConv 恒 false（会话内折叠无意义，后端 convId!=null 时也不会折叠）；
+ * - 其余契约同 apiImSearchMessages（keyword 1-64 必填、ES 恒过滤 msgStatus=1、
+ *   highlight 带 <em> 标记需拆段渲染）。
+ */
+export async function apiImSearchConvMessages(
+  convId: string,
+  keyword: string,
+  msgType: string,
+  size: number,
+): Promise<RequestResponse<any>> {
+  if (msgType.length > 0) {
+    return await request({
+      url: "/api/instant-message/search/messages",
+      method: "GET",
+      data: {
+        keyword,
+        size,
+        collapseByConv: false,
+        convId,
+        msgType,
+      },
+    });
+  }
+  return await request({
+    url: "/api/instant-message/search/messages",
+    method: "GET",
+    data: {
+      keyword,
+      size,
+      collapseByConv: false,
+      convId,
     },
   });
 }
@@ -589,6 +659,52 @@ export async function apiImReadReport(
     url: `/api/instant-message/conversations/${convId}/read`,
     method: "POST",
     data: `{"readSeq":${readSeq},"deviceId":"${getImDeviceId()}"}`,
+  });
+}
+
+// ============================================================ 消息 Pin 域（im-chat-pins，契约见 nuwax-im ImConversationController DEV-195）
+
+/**
+ * 会话的置顶消息列表（convListPins）。
+ *
+ * 契约见 im 仓库 ImConversationController#listPins / MessagePinDto：
+ * - data = MessagePinDto[]，按 pinTime【倒序】（最近 Pin 的在最前），最多 10 条（MESSAGE_PIN_MAX）
+ * - ★digest / msgType / senderName / sendTime 是【Pin 那一刻的快照】不是实时联表：
+ *   发送者改名后旧 Pin 项仍显示旧昵称（设计如此，勿当 bug）；置顶区展示的就是 digest
+ *   （图片消息为「[图片]」，长文会被截断），要原文用 msgId 去拉历史
+ * - ★已撤回的 Pin 项服务端读路径已批量复核过滤，前端无需再判 msgStatus
+ * - pinBy 可能 ≠ senderId（谁 Pin 的与谁发的是两件事，展示"由 xx 置顶"用 pinBy）
+ * - seq 允许为 0（消息行已被物理清理的边角数据）：msgId 仍有效但"定位原文"
+ *   要退化成重新拉历史；★不能拿 seq==0 当坏数据隐藏该条
+ * - msgId / convId / senderId / pinBy 是 int64 雪花号：页面层统一 `${raw}` 转字符串存用
+ *   （H5 请求层已保精度）；sendTime / pinTime 是 13 位毫秒（53 位安全范围内直读）
+ * - 多人共享状态且没有下行帧通知：每次进 Pin 页重拉一次（返回体 ≤10 条，最便宜的自我纠正）
+ */
+export async function apiImConvPins(convId: string): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/pins`,
+    method: "GET",
+  });
+}
+
+/**
+ * 取消一条置顶消息（convUnpinMessage）。
+ *
+ * 契约见 im 仓库 ImConversationController#unpinMessage：
+ * - ★任何人都能取消任何一条（飞书形态，服务端不校验 pinBy）：取消入口不按
+ *   pinBy 做可见性判断——藏起来反而制造"置顶了却取消不掉"的死角
+ * - 幂等：重复取消 / 本来就没有返回 false 仍是成功码，勿当失败重试
+ * - 群会话普通成员能否 Pin/取消由群设置 allowMemberPin 决定（群主/管理员不受约束），
+ *   越权报 IM_30001，前端按信封 code 提示服务端文案即可
+ * - msgId 雪花号存字符串，拼 URL 原样直传防精度丢失
+ */
+export async function apiImUnpinMsg(
+  convId: string,
+  msgId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/pins/${msgId}`,
+    method: "DELETE",
   });
 }
 

@@ -149,15 +149,49 @@ export default function request(options: any): Promise<any> {
       // success 里的 parseJsonKeepInt64 做格式预检和安全解析。
       dataType: "text",
       // #endif
+      // #ifdef APP-IOS || APP-ANDROID
+      // App 端运行时会无视 <string> 泛型与 dataType "text"，仍把 JSON 预解析成对象：
+      // >2^53 的雪花号（convId/msgId 等）在 Number→string 转换时即已按 17 位有效
+      // 数字舍入（…8256→…8260 → 后端报 IM_20103），事后无法恢复——只能按原始字节
+      // 返回，success 里走 parseArrayBufferKeepInt64 单遍解码 + 防精度改写
+      // （iOS 2026-09-21 真机验证 responseType "arraybuffer" 生效；Android
+      // 2026-09-23 真机确认同样丢精度，纳入同一字节路径）。
+      responseType: "arraybuffer",
+      // #endif
       success: (res) => {
         // 登录态（ACCESS_TOKEN）不再从响应 Set-Cookie 同步：登录/内嵌注入即权威，cookie 轮换不得覆盖
         // （防止进入聊天页时带入被服务端 cookie 轮换淘汰的旧 token → 4010 弹登录）。
-        // res.data 已是 UTSJSONObject，禁止 JSON.parse<T> 或强转为 interface
+        // App 端（iOS/Android）：res.data 为 ArrayBuffer（见上方 responseType），按字节防精度解析；
+        // 万一运行时不认 responseType 按对象/文本返回，instanceof 不中则直通（下方字符串兜底）。
+        // Android 直通对象时禁止 JSON.parse<T> 或强转为 interface（UTSJSONObject 宽松取值）
         let responseData: any | null = res.data as any | null;
-        // #ifdef H5 || WEB || APP-HARMONY
+        // #ifdef APP-IOS || APP-ANDROID
+        if (responseData instanceof ArrayBuffer) {
+          const abBuffer = responseData;
+          const startedAt = Date.now();
+          const text = parseArrayBufferKeepInt64(abBuffer);
+          if (text.length == 0) {
+            responseData = null; // 空正文：走下方空对象兜底（204 等）
+          } else {
+            try {
+              responseData = JSON.parse(text);
+            } catch (_e) {
+              responseData = text; // 网关 HTML 错误页等非 JSON 正文，保持字符串（对齐 H5 容错）
+            }
+          }
+          // dev 打点：历史「页面切换卡顿」疑似与此解析链有关（未证实），量出来一锤定音
+          if (process.env.NODE_ENV !== "production") {
+            console.log(
+              `${logTag} [ReqDiag] ab ${res.statusCode} bytes=${abBuffer.byteLength} cost=${Date.now() - startedAt}ms ${method} ${fullUrl}`,
+            );
+          }
+        }
+        // #endif
+        // #ifdef H5 || WEB || APP-HARMONY || APP-IOS || APP-ANDROID
         // H5 / 鸿蒙：dataType 已传 "text"，res.data 是原始文本。合法 JSON 在这里
         // 解析，非 JSON 正文保持字符串，避免运行时解析器在业务回调前直接抛错。
-        // 若运行时已经返回对象则直接走旧逻辑，行为不变。
+        // App 端：正常走上方字节分支；万一运行时按文本返回（非 arraybuffer 的兜底
+        // 路径），同样经 parseJsonKeepInt64 保精度。若已返回对象则直通，行为不变。
         if (typeof responseData == "string") {
           try {
             responseData = parseJsonKeepInt64(`${responseData}`);
@@ -550,17 +584,24 @@ function isDigitChar(ch: string): boolean {
     ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9";
 }
 
+/** 单字符是否为 JSON 允许的空白（空格/Tab/LF/CR）。 */
+function isWsChar(ch: string): boolean {
+  return ch == " " || ch == "\t" || ch == "\n" || ch == "\r";
+}
+
 /**
  * 快速预检：响应里是否存在「冒号后 ≥16 位连续数字」（>2^53 的 int64 才会丢精度）。
  * 绝大多数响应（i18n/配置/小数值）预检不中，直接走原生 JSON.parse，零改写开销。
  * 字符串字面量内的数字不算（扫描跟踪引号与反斜杠转义）。
+ * 冒号后允许先出现空白再数数字；后跟 . e E（浮点/科学计数）的不算（加引号会产出非法 JSON）。
+ * 单字符访问一律 charAt(i)：下标 raw[i] 在 Android 端返回 Char，与 String 比较编译不过。
  */
 function hasLossyIntLiteral(raw: string): boolean {
   const n = raw.length;
   let i = 0;
   let inString = false;
   while (i < n) {
-    const ch = raw[i];
+    const ch = raw.charAt(i);
     if (inString) {
       if (ch == "\\") {
         i += 2;
@@ -579,10 +620,17 @@ function hasLossyIntLiteral(raw: string): boolean {
     }
     if (ch == ":") {
       let j = i + 1;
-      while (j < n && isDigitChar(raw[j])) {
+      while (j < n && isWsChar(raw.charAt(j))) {
         j++;
       }
-      if (j - i - 1 >= 16) {
+      const digitsFrom = j;
+      while (j < n && isDigitChar(raw.charAt(j))) {
+        j++;
+      }
+      if (j - digitsFrom >= 16 &&
+        (j >= n ||
+          (raw.charAt(j) != "." && raw.charAt(j) != "e" && raw.charAt(j) != "E"))
+      ) {
         return true;
       }
       i = j;
@@ -631,17 +679,20 @@ function parseJsonKeepInt64(raw: string): any | null {
   if (!hasLossyIntLiteral(candidate)) {
     return JSON.parse(candidate);
   }
+  // 改写循环统一在 candidate（已 trim/剥 BOM）上扫描与取串：原实现扫 raw 取
+  // candidate.substring，响应带 BOM/前置空白时索引错位，改写出非法 JSON。
+  // 冒号后先跳空白再数数字；≥16 位且后跟非 . e E 才加引号（浮点/科学计数不动）。
   let out = "";
   let i = 0;
   const n = candidate.length;
   let inString = false;
   while (i < n) {
-    const ch = raw[i];
+    const ch = candidate.charAt(i);
     if (inString) {
       out += ch;
       if (ch == "\\") {
         if (i + 1 < n) {
-          out += raw[i + 1];
+          out += candidate.charAt(i + 1);
         }
         i += 2;
         continue;
@@ -661,13 +712,22 @@ function parseJsonKeepInt64(raw: string): any | null {
     if (ch == ":") {
       out += ch;
       i++;
+      while (i < n && isWsChar(candidate.charAt(i))) {
+        out += candidate.charAt(i);
+        i++;
+      }
       let j = i;
-      while (j < n && isDigitChar(raw[j])) {
+      while (j < n && isDigitChar(candidate.charAt(j))) {
         j++;
       }
       if (j > i) {
         const digits = candidate.substring(i, j);
-        if (j - i >= 16) {
+        const lossy = j - i >= 16 &&
+          (j >= n ||
+            (candidate.charAt(j) != "." &&
+              candidate.charAt(j) != "e" &&
+              candidate.charAt(j) != "E"));
+        if (lossy) {
           out += "\"";
           out += digits;
           out += "\"";
@@ -683,3 +743,120 @@ function parseJsonKeepInt64(raw: string): any | null {
   }
   return JSON.parse(out);
 }
+
+// #ifdef APP-IOS || APP-ANDROID
+/** 字节值是否为十进制数字（0x30-0x39）。 */
+function isDigitByte(b: number): boolean {
+  return b >= 0x30 && b <= 0x39;
+}
+
+/** 字节值是否为 JSON 允许的空白（空格/Tab/LF/CR）。 */
+function isWsByte(b: number): boolean {
+  return b == 0x20 || b == 0x09 || b == 0x0a || b == 0x0d;
+}
+
+/**
+ * App 端（iOS/Android）：ArrayBuffer → JSON 文本，单遍同时完成 UTF-8 解码与
+ * 「对象值位置 ≥16 位无符号整数字面量」加引号（>2^53 雪花号防精度，语义对齐 parseJsonKeepInt64）。
+ *
+ * 不复用字符串级预检/改写的原因：UTS 字符串下标在 iOS 上可能非 O(1)，大响应
+ * （i18n 语言包、租户配置）逐字符扫描会退化 O(n²)——旧全端字节方案疑似因此引起
+ * 页面切换卡顿后被撤（未证实）。本函数全程 Uint8Array 索引 O(1)；UTF-8 多字节
+ * 序列按码点原子消费，≥0x80 的续字节不可能与 ASCII token（" \ : 数字 空白）撞车，
+ * 串内/串外状态判断安全。开头跳过 UTF-8 BOM 与首尾空白，保证产出可直接 JSON.parse。
+ */
+function parseArrayBufferKeepInt64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const n = bytes.length;
+  let i = 0;
+  let end = n;
+  // UTF-8 BOM（EF BB BF）与首部空白
+  if (n >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf) {
+    i = 3;
+  }
+  while (i < end && isWsByte(bytes[i])) {
+    i += 1;
+  }
+  while (end > i && isWsByte(bytes[end - 1])) {
+    end -= 1;
+  }
+  let out = "";
+  let inString = false;
+  while (i < end) {
+    const b0 = bytes[i];
+    if (b0 >= 0x80) {
+      // 多字节序列原子解码（中文/emoji 等；>0xFFFF 拆 UTF-16 代理对，截断/非法给替换字符）
+      if (b0 < 0xe0 && i + 1 < end) {
+        out += String.fromCharCode(((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
+        i += 2;
+      } else if (b0 < 0xf0 && i + 2 < end) {
+        out += String.fromCharCode(((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
+        i += 3;
+      } else if (i + 3 < end) {
+        const cp = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+        const v = cp - 0x10000;
+        out += String.fromCharCode(0xd800 + (v >> 10));
+        out += String.fromCharCode(0xdc00 + (v & 0x3ff));
+        i += 4;
+      } else {
+        out += String.fromCharCode(0xfffd);
+        i += 1;
+      }
+      continue;
+    }
+    if (inString) {
+      if (b0 == 0x5c && i + 1 < end) {
+        // 转义成对原样输出（\" 不误判出串；\uXXXX 的十六进制位按普通 ASCII 走）
+        out += String.fromCharCode(b0);
+        out += String.fromCharCode(bytes[i + 1]);
+        i += 2;
+        continue;
+      }
+      if (b0 == 0x22) {
+        inString = false;
+      }
+      out += String.fromCharCode(b0);
+      i += 1;
+      continue;
+    }
+    if (b0 == 0x22) {
+      inString = true;
+      out += String.fromCharCode(b0);
+      i += 1;
+      continue;
+    }
+    if (b0 == 0x3a) {
+      // 对象值位置：跳空白 → 数数字；≥16 位且后跟非 . e E（浮点/科学计数）才加引号
+      out += String.fromCharCode(b0);
+      i += 1;
+      while (i < end && isWsByte(bytes[i])) {
+        out += String.fromCharCode(bytes[i]);
+        i += 1;
+      }
+      let j = i;
+      while (j < end && isDigitByte(bytes[j])) {
+        j += 1;
+      }
+      if (j > i) {
+        const lossy = j - i >= 16 &&
+          (j >= end ||
+            (bytes[j] != 0x2e && bytes[j] != 0x65 && bytes[j] != 0x45));
+        if (lossy) {
+          out += "\"";
+        }
+        for (let k = i; k < j; k++) {
+          out += String.fromCharCode(bytes[k]);
+        }
+        if (lossy) {
+          out += "\"";
+        }
+      }
+      i = j;
+      continue;
+    }
+    out += String.fromCharCode(b0);
+    i += 1;
+  }
+  return out;
+}
+// #endif

@@ -22,9 +22,9 @@
     </view>
 
     <view class="tab-bar">
-      <scroll-view class="tab-scroll" direction="horizontal" :show-scrollbar="false">
+      <scroll-view class="tab-scroll" direction="horizontal" :show-scrollbar="false" :scroll-into-view="tabScrollInto" :scroll-with-animation="true">
         <view class="tab-bar-inner">
-          <view v-for="tab in searchTabs" :key="tab.key" class="tab-item"
+          <view v-for="tab in searchTabs" :key="tab.key" :id="`conversation-search-tab-${tab.key}`" class="tab-item"
             :class="{ 'tab-item-active': tab.key == activeTab }" @click="handleTabClick(tab.key)">
             <text class="tab-item-text" :class="{ 'tab-item-text-active': tab.key == activeTab }">{{ t(tab.labelKey) }}</text>
           </view>
@@ -32,7 +32,7 @@
       </scroll-view>
     </view>
 
-    <view class="scroll-section flex-1">
+    <view class="scroll-section flex-1" @touchstart="handleSwipeStart" @touchend="handleSwipeEnd">
       <!-- tab 内容一律「首次访问才挂载 + v-show 切换」：v-if 会销毁组件实例丢掉已加载数据，
            切回该 tab 时重新走 loading（对齐 drawer 任务区同款约定，见 project-task-drawer 注释）。 -->
       <skill-list-view v-if="tabMounted('skill')" v-show="activeTab == 'skill'" type="search" variant="simple" :keyword="searchKeyword" @select="handleSkillSelect" />
@@ -83,6 +83,7 @@
 </template>
 
 <script lang="uts" setup>
+  import { getCurrentInstance, nextTick } from "vue";
   import SkillListView from "@/components/skill-list-view/skill-list-view.uvue";
   import ExpertListView from "@/components/expert-list-view/expert-list-view.uvue";
   import ConnectorListView from "@/components/connector-list-view/connector-list-view.uvue";
@@ -92,7 +93,7 @@
   import { ConversationListParams } from "@/types/interfaces/conversationInfo";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
-  import { jumpToAgentDetailPage, isTabPage, addTicketAndJumpToWebview } from "@/utils/commonBusiness";
+  import { jumpToAgentDetailPage, isTabPage, tabPathOnly, addTicketAndJumpToWebview } from "@/utils/commonBusiness";
   // #ifdef APP-IOS
   import { navigateBackByBackUrl } from "@/utils/commonBusiness";
   import { onBackPress } from "@dcloudio/uni-app";
@@ -106,6 +107,7 @@
   import teamIcon from "@/static/icons/team.svg";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system.uts";
+  import { HorizontalTabSwipeTracker } from "@/utils/horizontalTabSwipe";
 
   const GLOBAL_SEARCH_SELECTION_EVENT = "NuwaxGlobalSearchSelection";
 
@@ -132,6 +134,9 @@
   ] as SearchTabConfig[];
 
   const activeTab = ref<string>("task");
+  const componentInstance = getCurrentInstance();
+  const tabScrollInto = ref<string>("");
+  const swipeTracker = new HorizontalTabSwipeTracker();
   // 已访问过的 tab：只有访问过才挂载对应内容（避免一进页面把 6 个 tab 的请求全打一遍），
   // 挂载后靠 v-show 常驻，切回时直接显示已加载数据而不是重新 loading。
   const visitedTabs = ref<string[]>(["task"] as string[]);
@@ -251,9 +256,27 @@
   onBackPress((_options: OnBackPressOptions): boolean => { jumpNavigateBack(); return true; });
   // #endif
   // #ifndef APP-IOS
+  function returnToSearchSource(): void {
+    let target = backUrl.value;
+    // 兼容旧入口传入的完整 H5 URL；uni 路由 API 只接受应用内路径。
+    const hashIndex = target.indexOf("#/");
+    if (hashIndex >= 0) target = target.substring(hashIndex + 1);
+    if (target.length == 0 || target == "/" || target.startsWith("/?") ||
+      (!target.startsWith("/pages/") && !target.startsWith("/subpackages/"))) {
+      target = "/pages/index/index";
+    }
+    if (isTabPage(target)) uni.switchTab({ url: tabPathOnly(target) });
+    else uni.redirectTo({ url: target });
+  }
   const jumpNavigateBack = () => {
-    const toUrl = backUrl.value.length > 0 ? backUrl.value : "/pages/index/index";
-    if (isTabPage(toUrl)) uni.switchTab({ url: toUrl }); else uni.redirectTo({ url: toUrl });
+    // H5 正常进入搜索时保留来源页；刷新后无页面栈则使用归一化后的 backUrl。
+    // #ifdef H5 || WEB
+    if (getCurrentPages().length > 1) {
+      uni.navigateBack({ delta: 1, fail: (_error) => { returnToSearchSource(); } });
+      return;
+    }
+    // #endif
+    returnToSearchSource();
   };
   // #endif
 
@@ -296,16 +319,64 @@
     finally { if (requestId == projectRequestId) projectLoading.value = false; }
   }
 
+  function ensureActiveTabVisible(attempt: number): void {
+    if (componentInstance == null || componentInstance.proxy == null) return;
+    const target = `conversation-search-tab-${activeTab.value}`;
+    uni.createSelectorQuery()
+      .in(componentInstance.proxy)
+      .select(".tab-scroll")
+      .boundingClientRect()
+      .select(".tab-item-active")
+      .boundingClientRect()
+      .exec((results: Array<any>) => {
+        if (target != `conversation-search-tab-${activeTab.value}`) return;
+        if (results.length < 2 || results[0] == null || results[1] == null) {
+          if (attempt < 2) setTimeout((): void => ensureActiveTabVisible(attempt + 1), 120);
+          return;
+        }
+        const viewport = results[0] as NodeInfo;
+        const tab = results[1] as NodeInfo;
+        const left = viewport.left != null ? parseFloat(`${viewport.left}`) : 0;
+        const width = viewport.width != null ? parseFloat(`${viewport.width}`) : 0;
+        const tabLeft = tab.left != null ? parseFloat(`${tab.left}`) : 0;
+        const tabWidth = tab.width != null ? parseFloat(`${tab.width}`) : 0;
+        if (width <= 0 || tabWidth <= 0) {
+          if (attempt < 2) setTimeout((): void => ensureActiveTabVisible(attempt + 1), 120);
+          return;
+        }
+        if (tabLeft >= left && tabLeft + tabWidth <= left + width) return;
+        // 只有选中项超出可视区才滚动，避免点击可见 Tab 时整条导航跳动。
+        if (tabScrollInto.value == target) {
+          tabScrollInto.value = "";
+          nextTick((): void => { if (target == `conversation-search-tab-${activeTab.value}`) tabScrollInto.value = target; });
+        } else tabScrollInto.value = target;
+      });
+  }
   function handleTabClick(key: string): void {
-    if (activeTab.value == key) return;
+    if (activeTab.value == key) {
+      nextTick((): void => ensureActiveTabVisible(0));
+      return;
+    }
     activeTab.value = key;
     markTabVisited(key);
+    nextTick((): void => ensureActiveTabVisible(0));
     // 已加载过但关键词已变（在别的 tab 输入/清空）必须重拉，否则展示过期结果
     if (key == "task") {
       if (conversationList.value.length == 0 || taskKeyword != searchKeyword.value) fetchConversationList(false, searchKeyword.value);
     } else if (key == "project") {
       if (projectList.value.length == 0 || projectKeyword != searchKeyword.value) fetchProjectList(false, searchKeyword.value);
     }
+  }
+  function handleSwipeStart(event: UniTouchEvent): void { swipeTracker.begin(event); }
+  function handleSwipeEnd(event: UniTouchEvent): void {
+    const direction = swipeTracker.finish(event);
+    if (direction == 0) return;
+    let currentIndex = -1;
+    for (let i = 0; i < searchTabs.length; i++) {
+      if (searchTabs[i].key == activeTab.value) { currentIndex = i; break; }
+    }
+    const nextIndex = currentIndex + direction;
+    if (currentIndex >= 0 && nextIndex >= 0 && nextIndex < searchTabs.length) handleTabClick(searchTabs[nextIndex].key);
   }
   function handleFocus(): void { isFocused.value = true; }
   function handleBlur(): void { isFocused.value = false; }
@@ -403,9 +474,9 @@
     /* #ifdef MP-WEIXIN */ padding-bottom: env(safe-area-inset-bottom); /* #endif */
   }
   .search-container { display: flex; flex-direction: row; align-items: center; padding: 10rpx 0 10rpx 32rpx; flex-shrink: 0; }
-  .search-box { flex: 1; display: flex; align-items: center; flex-direction: row; height: 76rpx; padding: 0 24rpx; border-radius: 16rpx; border: 2rpx solid transparent; background: rgba(12, 20, 102, 0.04); }
+  .search-box { flex: 1; display: flex; align-items: center; flex-direction: row; height: 76rpx; padding: 0 24rpx; border-radius: 16rpx; border: 2rpx solid transparent; background: rgba(12, 20, 102, 0.04); box-sizing: border-box; }
   .search-box.focused { border-color: #5147ff; }
-  .search-input { flex: 1; border: none; font-size: 28rpx; color: #15171f; font-weight: 400; }
+  .search-input { flex: 1; height: 72rpx; line-height: 72rpx; border: none; font-size: 28rpx; color: #15171f; font-weight: 400; }
   .placeholder-class { color: rgba(21, 23, 31, 0.5); font-size: 28rpx; }
   .clear-icon { font-size: 32rpx; color: #999 !important; }
   .cancel-btn { display: flex; flex-direction: row; align-items: center; justify-content: center; flex-shrink: 0; height: 76rpx; padding: 0 32rpx; }

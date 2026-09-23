@@ -80,7 +80,15 @@ Apple 要求提供 App 内**非内嵌**游戏/软件（对本 App 即平台上�
   - `subpackages/pages/chat-conversation-component/chat-conversation-component.uvue`
   - `subpackages/pages/app-details/app-details.uvue`
   - `subpackages/pages/chat-conversation-component/layers/AgentDetailService.uts`（3 处自动弹窗全部 `#ifndef APP-IOS`；iOS 显式置 false）
-- 原本已隐藏（本次未动）：我的页订阅/订单入口、终端页硬件购买卡、更多菜单「我的订阅」、历史会话抽屉订阅按钮。
+- 原本已隐藏（此前收敛）：我的页订阅/订单入口、终端页硬件购买卡、更多菜单「我的订阅」、历史会话抽屉订阅按钮。
+
+**第二轮（积分/订单收敛）**：
+- 我的页「积分概览」整个区块（总积分/增购积分/订阅积分/活动积分四格 + 明细入口）iOS 不再展示：`pages/mine/mine.uvue`
+- 我的页增购积分套餐弹窗（PurchaseModal）iOS 不再挂载：`pages/mine/mine.uvue`
+- 会话抽屉（app-details 历史抽屉）顶部积分展示（总积分 + 增购跳转）iOS 整块隐藏：`subpackages/pages/app-details/history-conversation-popup/history-conversation-popup.uvue`
+- 终端页桌面搭子订单弹窗（desk-buddy-order-modal）iOS 不再挂载（与已隐藏的产品购买卡一并收敛）：`pages/terminal/terminal.uvue`
+
+排查确认已闭环的入口链：积分明细页（credit-records）唯一入口来自积分概览「明细」按钮（iOS 已无入口）；我的订阅/我的订单页唯一入口在我的页与订阅弹窗（iOS 均已无入口）。
 - 行为变化说明：iOS 上未订阅付费智能体不再弹订阅引导、超额也不再禁用输入框，超额限制由服务端返回错误提示兜底（与既有第三处收敛的注释口径一致）。
 
 ## 六、2.1(b) 商业模式五问回复草稿（中英）

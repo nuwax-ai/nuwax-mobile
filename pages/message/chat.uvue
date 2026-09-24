@@ -67,7 +67,8 @@
         v-for="msg in messages"
         :key="msg.msgId"
         :id="'msg-' + msg.msgId"
-        :class="highlightId == msg.msgId ? 'chat-msg--flash' : ''"
+        :class="msgRowClass(msg)"
+        @longpress="handleMsgLongPress(msg)"
       >
         <!-- 撤回 / 系统行：无正文无图无附件不进气泡（撤回的消息仍在列表里，勿过滤） -->
         <view
@@ -185,8 +186,35 @@
                 </view>
               </view>
             </view>
-            <text v-if="msg.status == 0" class="chat-status">{{ t("Mobile.Message.sending") }}</text>
-            <text v-else-if="msg.status == 2" class="chat-status chat-status--fail">{{ t("Mobile.Message.sendFailed") }}</text>
+            <!-- Pin 署名行：被 pin 的消息在文案下加 pin icon + 操作人署名（对所有成员可见） -->
+            <view v-if="pinInfoOf(msg) != null" class="chat-pininfo">
+              <image class="chat-pininfo__icon" src="/static/images/icon-msg-pin.png" mode="aspectFit" />
+              <text class="chat-pininfo__text">{{ pinInfoTextOf(msg) }}</text>
+            </view>
+            <!-- 气泡下 meta 行：发送态/已读 icon（我发的）/「已编辑」小标 -->
+            <view
+              v-if="msg.status == 0 || msg.status == 2 || msg.edited || readInfoOf(msg) != null"
+              class="chat-meta"
+              :class="isMine(msg) ? 'chat-meta--mine' : ''"
+            >
+              <text v-if="msg.status == 0" class="chat-status">{{ t("Mobile.Message.sending") }}</text>
+              <text v-else-if="msg.status == 2" class="chat-status chat-status--fail">{{ t("Mobile.Message.sendFailed") }}</text>
+              <!-- 群聊：绿圆点（readAll 实心）+ 已读/应读 计数，点击进「消息阅读状态」页 -->
+              <view
+                v-else-if="readInfoOf(msg) != null && isGroupLike"
+                class="chat-read"
+                hover-class="chat-read--active"
+                @click="handleReadTap(msg)"
+              >
+                <view class="chat-read__dot" :class="readAllOf(msg) ? 'chat-read__dot--solid' : ''" />
+                <text class="chat-read__text">{{ readCountTextOf(msg) }}</text>
+              </view>
+              <!-- 单聊：仅圆点（对方已读=实心），点击无动作 -->
+              <view v-else-if="readInfoOf(msg) != null" class="chat-read">
+                <view class="chat-read__dot" :class="readAllOf(msg) ? 'chat-read__dot--solid' : ''" />
+              </view>
+              <text v-if="msg.edited && msg.status == 1" class="chat-status">{{ t("Mobile.Message.msgEditedTag") }}</text>
+            </view>
           </view>
         </view>
       </view>
@@ -195,9 +223,18 @@
       <view id="chat-bottom" class="chat-bottom-anchor" />
     </scroll-view>
 
-    <!-- AI 生成提示：仅会话中出现过智能体消息时展示 -->
-    <view v-if="hasAgentMsg" class="chat-ai-tip">
-      <text class="chat-ai-tip__text">{{ t("Mobile.Chat.aiGeneratedDisclaimer") }}</text>
+    <!-- 引用 / 编辑条（长按消息发起，两者互斥）：位于消息列表与输入坞之间 -->
+    <view v-if="quoteTarget != null || editTarget != null" class="chat-compose-bar">
+      <view class="chat-compose-bar__accent" :class="editTarget != null ? 'chat-compose-bar__accent--edit' : ''" />
+      <view class="chat-compose-bar__main">
+        <text class="chat-compose-bar__label">{{
+          editTarget != null ? t("Mobile.Message.editingBarLabel") : t("Mobile.Message.quoteBarLabel")
+        }}</text>
+        <text class="chat-compose-bar__text text-ellipsis">{{ composePreviewText }}</text>
+      </view>
+      <view class="chat-compose-bar__close" hover-class="chat-compose-bar__close--active" @click="handleComposeBarClose">
+        <svg-icon name="icon-X" size="32" color="#8a8a8a" />
+      </view>
     </view>
 
     <!-- 底部输入坞（飞书消息对话框布局）：语音/键盘切换 + 输入框 + 表情 + 加号/发送 -->
@@ -661,26 +698,43 @@
         </scroll-view>
       </view>
     </view>
+
+    <!-- 长按消息操作弹窗（显隐规则在页面侧 buildActionsFor，组件只渲染与上抛） -->
+    <msg-action-sheet
+      ref="actionSheetRef"
+      :actions="sheetActions"
+      @select="handleSheetSelect"
+      @closed="handleSheetClosed"
+    />
   </view>
 </template>
 
 <script setup lang="uts">
-  import { computed, nextTick, ref } from "vue";
+  import { computed, nextTick, ref, type ComponentPublicInstance } from "vue";
   import { onLoad, onReady, onShow, onHide, onUnload } from "@dcloudio/uni-app";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { apiUserInfo } from "@/servers/account";
   import {
     apiImContacts,
+    apiImConvDetail,
     apiImConvMembers,
+    apiImConvPins,
+    apiImEditMsg,
     apiImMessages,
+    apiImPinMsg,
     apiImReadReport,
+    apiImReadStatus,
+    apiImRevokeMsg,
     apiImSendMediaMsg,
     apiImSendTextMsg,
+    apiImUnpinMsg,
+    apiImWhoami,
     IM_AT_PICK_EVENT,
     IM_CHAT_JUMP_EVENT,
   } from "@/servers/im";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { ChatSubpageTab } from "@/types/interfaces/chatSubpageTab";
+  import { MsgActionItem } from "@/types/interfaces/msgActionItem";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import { collectChatAttachments, resetChatAttachments } from "@/utils/imChatAttachments";
   import { isAuthProtectedFileUrl, openAuthProtectedLinkUrl } from "@/utils/authProtectedFileUrl";
@@ -689,8 +743,9 @@
   import { refreshImUnreadBadge } from "@/utils/imUnreadBadge";
   import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import { getSafeAreaBottom, handleExternalLink } from "@/utils/system";
-  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
   import VoiceRecorderButton from "@/components/conversation-input/voice-recorder-button/voice-recorder-button.uvue";
+  import MsgActionSheet from "./components/msg-action-sheet/msg-action-sheet.uvue";
   // #ifdef APP-IOS
   import { pickIosFiles } from "@/uni_modules/nuwax-ios-file-picker";
   // #endif
@@ -810,6 +865,10 @@
     replyText: string = "";
     digest: string = "";
     revoked: boolean = false;
+    /** 服务端确认被编辑过（MessageDto.editTime 非空）⇒ 气泡下渲染「已编辑」小标。 */
+    edited: boolean = false;
+    /** 撤回操作人 userId（管理员撤他人时 senderId≠revokeById，撤回文案判定用）。 */
+    revokeById: string = "";
     sendTime: number = 0;
     status: number = 1;
     clientMsgId: string = "";
@@ -931,16 +990,66 @@
 
   const canSend = computed((): boolean => inputText.value.trim().length > 0);
 
-  /** 会话里出现过智能体消息（senderType=2）才展示"内容由 AI 生成"提示。 */
-  const hasAgentMsg = computed((): boolean => {
-    const rows = messages.value;
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i].senderType == 2) {
-        return true;
-      }
+  // ===== 会话能力（长按菜单显隐 / 已读 icon 门控；权限权威永远在服务端，这里只做入口 UX） =====
+  /** 我的角色：1=普通成员 2=管理员 3=群主（convDetail.myRole；管理权限 = >=2）。 */
+  const myRole = ref<number>(1);
+  /** 群设置：允许普通成员置顶消息（缺省 true；群主/管理员不受限，p2p 无此约束）。 */
+  let allowMemberPin = true;
+  /** 群设置：已读回执开关（关闭 ⇒ 我发的消息不渲染已读 icon；单聊无此开关恒显示）。 */
+  let readReceiptOn = true;
+  /** 撤回时限秒数（whoami.revokeWindowSec 下发，缺省 24h）。 */
+  let revokeWindowSec = 86400;
+  /** 置顶信息（MessagePinDto：msgId + pinBy 置顶操作人，≤10；「置顶/取消置顶」文案切换、撤回联动刷新与署名行用）。 */
+  class ImPinInfo {
+    msgId: string = "";
+    pinBy: string = "";
+  }
+  const pinnedPins = ref<ImPinInfo[]>([]);
+
+  // ===== 长按消息操作弹窗 =====
+  /** 长按选中的消息（弹窗存续期整行铺选中底色，closed 清空）。 */
+  const selectedId = ref<string>("");
+  /** 弹窗动作列表（buildActionsFor 按消息状态/角色算好传入）。 */
+  const sheetActions = ref<MsgActionItem[]>([]);
+  const actionSheetRef = ref<any | null>(null);
+
+  // ===== 引用 / 编辑（输入坞上方的 compose 条，两者互斥） =====
+  /** 引用目标（占位行乐观渲染引用块用；发送成功后消费清除）。 */
+  class QuoteTargetInfo {
+    msgId: string = "";
+    senderName: string = "";
+    preview: string = "";
+    isImage: boolean = false;
+  }
+  const quoteTarget = ref<QuoteTargetInfo | null>(null);
+  /** 编辑目标（正文回填输入框，发送键变更为「保存」语义）。 */
+  class EditTargetInfo {
+    msgId: string = "";
+    originText: string = "";
+  }
+  const editTarget = ref<EditTargetInfo | null>(null);
+  const composePreviewText = computed((): string => {
+    const editing = editTarget.value;
+    if (editing != null) {
+      return editing.originText;
     }
-    return false;
+    const quoting = quoteTarget.value;
+    if (quoting != null) {
+      return quoting.preview;
+    }
+    return "";
   });
+
+  // ===== 已读状态（我发的消息：群=计数圆点可点，单聊=已读圆点不可点） =====
+  class ImReadInfo {
+    msgId: string = "";
+    readCount: number = 0;
+    eligibleCount: number = 0;
+    readAll: boolean = false;
+  }
+  const readInfos = ref<ImReadInfo[]>([]);
+  /** 已读计数请求序号（旧响应晚归丢弃，防竞态覆盖新数据）。 */
+  let readStatusSeq = 0;
 
   function readString(obj: UTSJSONObject, key: string): string {
     const raw = obj[key];
@@ -990,9 +1099,91 @@
 
   function sysText(msg: ImMsgRow): string {
     if (msg.revoked) {
-      return isMine(msg) ? t("Mobile.Message.msgRevokedByMe") : t("Mobile.Message.msgRevokedByPeer");
+      // 管理员撤他人消息：senderId 不是我但 revokeById 是我 ⇒ 也算「你撤回了一条消息」
+      const revokedByMe = isMine(msg) || (myUserId.value.length > 0 && msg.revokeById == myUserId.value);
+      return revokedByMe ? t("Mobile.Message.msgRevokedByMe") : t("Mobile.Message.msgRevokedByPeer");
     }
     return msg.digest;
+  }
+
+  /** 消息当前置顶信息（命中返回 ImPinInfo，未置顶返回 null）。 */
+  function pinInfoOf(msg: ImMsgRow): ImPinInfo | null {
+    const pins = pinnedPins.value;
+    for (let i = 0; i < pins.length; i++) {
+      if (pins[i].msgId == msg.msgId) {
+        return pins[i];
+      }
+    }
+    return null;
+  }
+
+  function isPinnedMsg(msg: ImMsgRow): boolean {
+    return pinInfoOf(msg) != null;
+  }
+
+  /**
+   * pin 操作人署名：成员表 → 我 → p2p 对方 → 兜底「有人」。
+   * ★仅模板调用（读 members/pinnedPins，成员表晚到时自动重渲染补正署名）。
+   */
+  function pinNameOf(pin: ImPinInfo): string {
+    const by = pin.pinBy;
+    if (by.length > 0) {
+      if (myUserId.value.length > 0 && by == myUserId.value) {
+        const mine = myDisplayName.value;
+        if (mine.length > 0) {
+          return mine;
+        }
+      }
+      const ms = members.value;
+      for (let i = 0; i < ms.length; i++) {
+        if (ms[i].userId == by) {
+          const nick = ms[i].nickName;
+          if (nick.length > 0) {
+            return nick;
+          }
+          if (ms[i].name.length > 0) {
+            return ms[i].name;
+          }
+        }
+      }
+      if (isGroupLike.value != true && myUserId.value.length > 0 && by != myUserId.value) {
+        const peer = titleName.value;
+        if (peer.length > 0 && peer != t("Mobile.Common.conversations")) {
+          return peer;
+        }
+      }
+    }
+    return t("Mobile.Message.pinnedByFallback");
+  }
+
+  /** Pin 署名行文案：群=「…对所有群成员可见」，p2p=短版。 */
+  function pinInfoTextOf(msg: ImMsgRow): string {
+    const pin = pinInfoOf(msg);
+    if (pin == null) {
+      return "";
+    }
+    const params = new Map<string, string | number>();
+    params.set("name", pinNameOf(pin));
+    const key = isGroupLike.value ? "Mobile.Message.msgPinnedByGroup" : "Mobile.Message.msgPinnedByP2p";
+    return translateFn(key, toI18nParams(params), "");
+  }
+
+  /**
+   * 消息整行 class：定位高亮（引用详情跳回）优先，其次长按选中底色（弹窗存续期），
+   * 其后被 pin 的消息铺淡黄底（全员可见标识）。
+   * ★仅模板调用（模板绑定不受 UTS「先定义后使用」约束）。
+   */
+  function msgRowClass(msg: ImMsgRow): string {
+    if (highlightId.value == msg.msgId) {
+      return "chat-msg--flash";
+    }
+    if (selectedId.value == msg.msgId) {
+      return "chat-msg--selected";
+    }
+    if (pinInfoOf(msg) != null) {
+      return "chat-msg--pinned";
+    }
+    return "";
   }
 
   /** URL 是否指向图片（按扩展名兜底，mime 缺失时用）。 */
@@ -1608,6 +1799,8 @@
     }
     row.digest = readString(obj, "digest");
     row.revoked = readNumber(obj, "msgStatus", 1) == 2;
+    row.edited = readString(obj, "editTime").length > 0;
+    row.revokeById = readString(obj, "revokeBy");
     // @提及元数据（int64 数组经 `${raw}` 保精度转字符串）
     const mentionIdsRaw = obj["mentionUserIds"];
     if (mentionIdsRaw != null) {
@@ -1650,11 +1843,230 @@
     row.imageUrl = placeholder.imageUrl;
     row.imageAtts = placeholder.imageAtts;
     row.linkAtts = placeholder.linkAtts;
+    // 引用元数据随占位行带过来（确认响应不含 replyTo 明细，不透传确认瞬间引用块会闪没）
+    row.replyId = placeholder.replyId;
+    row.replySenderName = placeholder.replySenderName;
+    row.replyRevoked = placeholder.replyRevoked;
+    row.replyIsImage = placeholder.replyIsImage;
+    row.replyText = placeholder.replyText;
     row.sendTime = row.sendTime > 0 ? row.sendTime : placeholder.sendTime;
     row.status = 1;
     row.clientMsgId = placeholder.clientMsgId;
     row.local = true;
     return row;
+  }
+
+  // ===== 长按操作 / 已读状态 共用判定 =====
+
+  /** 已被服务端确认的行（本地占位/发送中行 msgId 以 local- 开头，无服务端身份，不可 Pin/编辑/撤回/查已读）。 */
+  function isConfirmedRow(msg: ImMsgRow): boolean {
+    return msg.msgId.indexOf("local-") != 0;
+  }
+
+  // ===== 会话能力加载（convDetail / pins / whoami；失败静默保留默认值） =====
+
+  /** 群会话：拉 myRole 与治理开关（allowMemberPin/readReceiptOn 键缺省/null = 不限制）。 */
+  async function loadConvInfo(): Promise<void> {
+    if (isGroupLike.value != true || convId.value.length == 0) {
+      return;
+    }
+    try {
+      const res = await apiImConvDetail(convId.value);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          myRole.value = readNumber(dataObj, "myRole", 1);
+          const pinRaw = dataObj["allowMemberPin"];
+          allowMemberPin = pinRaw == null ? true : `${pinRaw}` == "true";
+          const receiptRaw = dataObj["readReceiptOn"];
+          readReceiptOn = receiptRaw == null ? true : `${receiptRaw}` == "true";
+        }
+      }
+    } catch (_error) {
+      // 静默：拿不到就按默认能力渲染，服务端仍兜底校验权限
+    }
+  }
+
+  /** 拉当前置顶集（多人共享且无下行通知：进页/撤回后/Pin 后重拉自我纠正；含 pinBy 供署名行）。 */
+  async function loadPinnedIds(): Promise<void> {
+    if (convId.value.length == 0) {
+      return;
+    }
+    try {
+      const res = await apiImConvPins(convId.value);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const arr = dataRaw != null ? (dataRaw as UTSJSONObject[]) : null;
+        const pins: ImPinInfo[] = [];
+        if (arr != null) {
+          for (let i = 0; i < arr.length; i++) {
+            const id = readString(arr[i], "msgId");
+            if (id.length > 0) {
+              const info = new ImPinInfo();
+              info.msgId = id;
+              info.pinBy = readString(arr[i], "pinBy");
+              pins.push(info);
+            }
+          }
+        }
+        pinnedPins.value = pins;
+      }
+    } catch (_error) {
+      // 失败保留旧集（仅影响菜单文案切换，服务端仍兜底校验）
+    }
+  }
+
+  /** 拉撤回时限（whoami.revokeWindowSec；失败保留默认 24h）。 */
+  async function loadRevokeWindow(): Promise<void> {
+    try {
+      const res = await apiImWhoami();
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          const windowSec = readNumber(dataObj, "revokeWindowSec", 0);
+          if (windowSec > 0) {
+            revokeWindowSec = windowSec;
+          }
+        }
+      }
+    } catch (_error) {
+      // 静默：保留默认窗口
+    }
+  }
+
+  // ===== 已读状态（read-status 批量查询，只查自己发的消息） =====
+
+  function findReadInfo(msgId: string): ImReadInfo | null {
+    const infos = readInfos.value;
+    for (let i = 0; i < infos.length; i++) {
+      if (infos[i].msgId == msgId) {
+        return infos[i];
+      }
+    }
+    return null;
+  }
+
+  /** 按 msgId 对齐合并（结果可能少于请求——别人的消息静默消失，顺序不保证，勿按下标）。 */
+  function mergeReadInfo(obj: UTSJSONObject): void {
+    const msgId = readString(obj, "msgId");
+    if (msgId.length == 0) {
+      return;
+    }
+    const readCount = readNumber(obj, "readCount", 0);
+    const eligibleCount = readNumber(obj, "eligibleCount", 0);
+    const readAll = readBool(obj, "readAll");
+    const existing = findReadInfo(msgId);
+    if (existing != null) {
+      existing.readCount = readCount;
+      existing.eligibleCount = eligibleCount;
+      existing.readAll = readAll;
+      return;
+    }
+    const info = new ImReadInfo();
+    info.msgId = msgId;
+    info.readCount = readCount;
+    info.eligibleCount = eligibleCount;
+    info.readAll = readAll;
+    readInfos.value.push(info);
+  }
+
+  /**
+   * 该行是否渲染已读 icon：仅我发的、已确认、未撤回的正式消息；
+   * 群聊关闭「已读回执」后不展示（单聊无此开关）。★「没查到」≠「未读」——
+   * 无数据不渲染 icon（宁缺勿错），别拿 0/0 误导用户。
+   */
+  function readInfoOf(msg: ImMsgRow): ImReadInfo | null {
+    if (isMine(msg) != true || msg.status != 1 || msg.revoked || isConfirmedRow(msg) != true) {
+      return null;
+    }
+    if (isGroupLike.value && readReceiptOn != true) {
+      return null;
+    }
+    return findReadInfo(msg.msgId);
+  }
+
+  /** 仅模板用：圆点实心判定（群=readAll；单聊同一语义，对方已读即 readAll）。 */
+  function readAllOf(msg: ImMsgRow): boolean {
+    const info = readInfoOf(msg);
+    return info != null && info.readAll;
+  }
+
+  /** 仅模板用：已读/应读 计数文本（单聊不渲染文本）。 */
+  function readCountTextOf(msg: ImMsgRow): string {
+    const info = readInfoOf(msg);
+    if (info == null) {
+      return "";
+    }
+    return `${info.readCount}/${info.eligibleCount}`;
+  }
+
+  /** 仅模板用：群聊点击已读计数 → 「消息阅读状态」页（单聊圆点不可点）。 */
+  function handleReadTap(msg: ImMsgRow): void {
+    const info = readInfoOf(msg);
+    if (info == null || isGroupLike.value != true || convId.value.length == 0) {
+      return;
+    }
+    uni.navigateTo({
+      url:
+        `/subpackages/pages/im-msg-read-status/im-msg-read-status?convId=${convId.value}` +
+        `&msgId=${msg.msgId}&seq=${msg.seq}` +
+        `&readCount=${info.readCount}&eligibleCount=${info.eligibleCount}`,
+    });
+  }
+
+  /**
+   * 批量刷新我发消息的已读计数（msgIds ≤200/批，超限服务端直接抛错不截断）：
+   * 只查「无缓存 || 未 readAll」的增量集，按 seq 降序取最新 200——更早的行不渲染
+   * icon（见 readInfoOf 注释），不做多批循环；请求序号防旧响应覆盖新数据。
+   */
+  async function refreshReadStatus(): Promise<void> {
+    if (convId.value.length == 0 || myUserId.value.length == 0 || messages.value.length == 0) {
+      return;
+    }
+    const candidates: ImMsgRow[] = [];
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (isMine(row) != true || row.status != 1 || row.revoked || isConfirmedRow(row) != true) {
+        continue;
+      }
+      if (isGroupLike.value && readReceiptOn != true) {
+        continue;
+      }
+      const cached = findReadInfo(row.msgId);
+      if (cached != null && cached.readAll) {
+        continue;
+      }
+      candidates.push(row);
+    }
+    if (candidates.length == 0) {
+      return;
+    }
+    // rows 本身按时间升序：从尾部往前取即 seq 降序的最新 200 条
+    const picked: string[] = [];
+    for (let i = candidates.length - 1; i >= 0 && picked.length < 200; i--) {
+      picked.push(candidates[i].msgId);
+    }
+    const seq = ++readStatusSeq;
+    try {
+      const res = await apiImReadStatus(convId.value, picked);
+      if (seq != readStatusSeq) {
+        return;
+      }
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const arr = dataRaw != null ? (dataRaw as UTSJSONObject[]) : null;
+        if (arr != null) {
+          for (let i = 0; i < arr.length; i++) {
+            mergeReadInfo(arr[i]);
+          }
+        }
+      }
+    } catch (_error) {
+      // 静默：onShow/下次发送确认会再试
+    }
   }
 
   function replaceByClientMsgId(confirmed: ImMsgRow): void {
@@ -1785,6 +2197,7 @@
       resolveRowMedia(messages.value[i]);
     }
     reportReadIfNeeded(maxSeq());
+    refreshReadStatus();
   }
 
   async function initHistory(): Promise<void> {
@@ -1844,12 +2257,15 @@
         row.clientMsgId,
         row.mentionIds.length > 0 ? row.mentionIds : null,
         row.mentionAll,
+        row.replyId.length > 0 ? row.replyId : "",
       );
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
         replaceByClientMsgId(buildConfirmedRow(dataObj, row));
+        quoteTarget.value = null;
         reportReadIfNeeded(maxSeq());
+        refreshReadStatus();
         scrollToBottom();
       } else {
         markRowFailed(row.clientMsgId);
@@ -1899,9 +2315,117 @@
     return lines.join("\n");
   }
 
+  // ===== 引用 / 编辑（compose 条目标管理；两者互斥，进入一方清另一方） =====
+
+  /** 消息自身内容预览（引用条/占位行引用块用）：图片 > 正文 > 文件，换行折叠为空格。 */
+  function msgSelfPreview(msg: ImMsgRow): string {
+    if (msg.msgType == "image" || msg.imageAtts.length > 0) {
+      return t("Mobile.Message.quoteImage");
+    }
+    if (msg.bodyText.length > 0) {
+      return msg.bodyText.split("\n").join(" ");
+    }
+    return t("Mobile.Message.quoteFile");
+  }
+
+  /** 长按「引用」：记录目标并聚焦输入框（发送时随请求带 replyToMsgId）。 */
+  function enterQuoteMode(msg: ImMsgRow): void {
+    const target = new QuoteTargetInfo();
+    target.msgId = msg.msgId;
+    target.isImage = (msg.msgType == "image" && msg.imageUrl.length > 0) || msg.imageAtts.length > 0;
+    target.senderName = isMine(msg)
+      ? myDisplayName.value
+      : msg.senderName.length > 0
+        ? msg.senderName
+        : titleName.value;
+    target.preview = msgSelfPreview(msg);
+    editTarget.value = null;
+    quoteTarget.value = target;
+    focusChatInput();
+  }
+
+  /** 长按「编辑」：原始正文（含既有 Markdown 标记）回填输入框，聚焦到末尾继续改。 */
+  function enterEditMode(msg: ImMsgRow): void {
+    const target = new EditTargetInfo();
+    target.msgId = msg.msgId;
+    target.originText = msg.bodyText;
+    quoteTarget.value = null;
+    editTarget.value = target;
+    inputText.value = msg.bodyText;
+    focusChatInput();
+  }
+
+  /** compose 条 X：退出当前态（编辑态同时清空输入框，引用态保留已输入内容）。 */
+  function handleComposeBarClose(): void {
+    if (editTarget.value != null) {
+      inputText.value = "";
+    }
+    editTarget.value = null;
+    quoteTarget.value = null;
+  }
+
+  /** 引用元数据写进占位行（乐观渲染引用块；确认行经 buildConfirmedRow 透传）。 */
+  function applyQuoteToRow(row: ImMsgRow): void {
+    const quoting = quoteTarget.value;
+    if (quoting == null) {
+      return;
+    }
+    row.replyId = quoting.msgId;
+    row.replySenderName = quoting.senderName;
+    row.replyIsImage = quoting.isImage;
+    row.replyText = quoting.preview;
+  }
+
+  /**
+   * 编辑保存（PUT /messages/{msgId}）：正文原样提交——★不走 applyActiveMarks
+   * （回显正文已含 Markdown 标记，再包装会二次加粗/斜体）；返回编辑后的
+   * MessageDto 按 msgId 原位替换（editTime 非空 ⇒ 自动带出「已编辑」）。
+   */
+  async function submitEdit(text: string): Promise<void> {
+    const target = editTarget.value;
+    if (target == null || convId.value.length == 0) {
+      return;
+    }
+    if (text == target.originText.trim()) {
+      // 未改动：直接退出编辑态（不发请求）
+      editTarget.value = null;
+      inputText.value = "";
+      return;
+    }
+    try {
+      const res = await apiImEditMsg(target.msgId, convId.value, text);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          const editedRow = readMsgRow(dataObj);
+          const rows = messages.value;
+          for (let i = 0; i < rows.length; i++) {
+            if (rows[i].msgId == editedRow.msgId) {
+              rows.splice(i, 1, editedRow);
+              break;
+            }
+          }
+        }
+        editTarget.value = null;
+        inputText.value = "";
+      } else {
+        const message = apiResMessage(res);
+        uni.showToast({ title: message.length > 0 ? message : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+  }
+
   function handleSend(): void {
     const text = inputText.value.trim();
     if (text.length == 0 || convId.value.length == 0) {
+      return;
+    }
+    // 编辑态：正文原样提交（submitEdit 内不走 applyActiveMarks，见其注释）
+    if (editTarget.value != null) {
+      submitEdit(text);
       return;
     }
     const body = applyActiveMarks(text);
@@ -1916,6 +2440,7 @@
     row.mentionIds = scan.ids;
     row.mentionAll = scan.all;
     applyRichToRow(row);
+    applyQuoteToRow(row);
     row.sendTime = Date.now();
     row.status = 0;
     messages.value.push(row);
@@ -1955,6 +2480,7 @@
         file.size,
         file.type,
         row.clientMsgId,
+        row.replyId.length > 0 ? row.replyId : "",
       );
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
@@ -1973,12 +2499,14 @@
           confirmed.linkAtts = [att];
         }
         replaceByClientMsgId(confirmed);
+        quoteTarget.value = null;
         // /api/f/ 受保护地址解析：拿替换进列表后的代理实例改属性才会触发刷新
         const proxied = findRowByClientMsgId(confirmed.clientMsgId);
         if (proxied != null) {
           resolveRowMedia(proxied);
         }
         reportReadIfNeeded(maxSeq());
+        refreshReadStatus();
         scrollToBottom();
       } else {
         markRowFailed(row.clientMsgId);
@@ -2181,6 +2709,7 @@
     row.mentionIds = scan.ids;
     row.mentionAll = scan.all;
     applyRichToRow(row);
+    applyQuoteToRow(row);
     row.sendTime = Date.now();
     row.status = 0;
     messages.value.push(row);
@@ -2273,6 +2802,189 @@
     expandPanel.value = "";
     expandFocusRequest.value = false;
     uni.hideKeyboard({ complete: () => {} });
+  }
+
+  // ===== 长按消息操作（动态显隐规则全在此；服务端永远是权限权威，这里只做入口 UX） =====
+
+  /** 消息有可引用的内容（文本/图片/附件任一非空）。 */
+  function hasQuotableBody(msg: ImMsgRow): boolean {
+    return msg.bodyText.length > 0 || msg.imageUrl.length > 0 || msg.imageAtts.length > 0 || msg.linkAtts.length > 0;
+  }
+
+  /** 置顶入口：p2p 恒可；群聊默认全员可，allowMemberPin=false 后仅群主/管理员（myRole>=2）。 */
+  function canPinMsg(): boolean {
+    return isGroupLike.value != true || allowMemberPin || myRole.value >= 2;
+  }
+
+  /**
+   * 编辑入口：仅本人、已确认、正常态的纯文本消息（rich_text 带附件不可编辑），
+   * 且在编辑窗口内（服务端 EDIT_WINDOW_SEC_DEFAULT=300s，超窗 IM_40003——
+   * 客户端只做显隐预判，权威在服务端）。
+   */
+  function canEditMsg(msg: ImMsgRow): boolean {
+    if (isMine(msg) != true || msg.revoked || msg.status != 1 || isConfirmedRow(msg) != true) {
+      return false;
+    }
+    const textLike =
+      msg.msgType == "text" || (msg.msgType == "rich_text" && msg.imageAtts.length == 0 && msg.linkAtts.length == 0);
+    if (textLike != true) {
+      return false;
+    }
+    return Date.now() - msg.sendTime <= 300 * 1000;
+  }
+
+  /** 撤回入口：本人消息，或群聊管理员/群主撤他人；时限 whoami.revokeWindowSec（默认 24h）。 */
+  function canRevokeMsg(msg: ImMsgRow): boolean {
+    if (msg.revoked || msg.status != 1 || isConfirmedRow(msg) != true) {
+      return false;
+    }
+    const governor = isMine(msg) || (isGroupLike.value && myRole.value >= 2);
+    if (governor != true) {
+      return false;
+    }
+    return Date.now() - msg.sendTime <= revokeWindowSec * 1000;
+  }
+
+  /** 动作列表（顺序：引用、置顶/取消置顶、编辑、撤回）；撤回=红色破坏性操作。 */
+  function buildActionsFor(msg: ImMsgRow): MsgActionItem[] {
+    const acts: MsgActionItem[] = [];
+    if (msg.revoked) {
+      return acts;
+    }
+    if (hasQuotableBody(msg)) {
+      const quote = new MsgActionItem();
+      quote.key = "quote";
+      quote.label = t("Mobile.Message.actionQuote");
+      quote.icon = "/static/images/icon-msg-quote.png";
+      acts.push(quote);
+    }
+    if (canPinMsg()) {
+      const pin = new MsgActionItem();
+      pin.key = isPinnedMsg(msg) ? "unpin" : "pin";
+      pin.label = isPinnedMsg(msg) ? t("Mobile.Conversation.unpin") : t("Mobile.Conversation.pin");
+      pin.icon = "/static/images/icon-msg-pin.png";
+      acts.push(pin);
+    }
+    if (canEditMsg(msg)) {
+      const edit = new MsgActionItem();
+      edit.key = "edit";
+      edit.label = t("Mobile.Message.actionEdit");
+      edit.icon = "/static/images/icon-msg-edit.png";
+      acts.push(edit);
+    }
+    if (canRevokeMsg(msg)) {
+      const revoke = new MsgActionItem();
+      revoke.key = "revoke";
+      revoke.label = t("Mobile.Message.actionRevoke");
+      revoke.icon = "/static/images/icon-msg-revoke.png";
+      revoke.danger = true;
+      acts.push(revoke);
+    }
+    return acts;
+  }
+
+  /** 长按：系统行（撤回/摘要）不响应；无可用动作不弹；弹前收键盘与内嵌面板。 */
+  function handleMsgLongPress(msg: ImMsgRow): void {
+    if (msg.revoked || msg.digest.length > 0) {
+      return;
+    }
+    if (hasQuotableBody(msg) != true && canPinMsg() != true && canEditMsg(msg) != true && canRevokeMsg(msg) != true) {
+      return;
+    }
+    const acts = buildActionsFor(msg);
+    if (acts.length == 0) {
+      return;
+    }
+    if (expanded.value) {
+      closeExpandSheet();
+    }
+    if (panelMode.value.length > 0) {
+      panelMode.value = "";
+    }
+    uni.hideKeyboard({ complete: () => {} });
+    selectedId.value = msg.msgId;
+    sheetActions.value = acts;
+    const proxy = actionSheetRef.value as ComponentPublicInstance | null;
+    if (proxy != null) {
+      proxy.$callMethod("open");
+    }
+  }
+
+  /** 弹窗完全收起：清选中高亮（点动作路径已同步清过，这里兜底手势关闭路径）。 */
+  function handleSheetClosed(): void {
+    selectedId.value = "";
+  }
+
+  /** 置顶 / 取消置顶：幂等；成功后重拉 Pin 集（多人共享状态自我纠正）。 */
+  async function handleActionPin(msg: ImMsgRow, pin: boolean): Promise<void> {
+    if (convId.value.length == 0) {
+      return;
+    }
+    try {
+      const res = pin ? await apiImPinMsg(convId.value, msg.msgId) : await apiImUnpinMsg(convId.value, msg.msgId);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        uni.showToast({
+          title: pin ? t("Mobile.Conversation.pinSuccess") : t("Mobile.Conversation.unpinSuccess"),
+          icon: "none",
+        });
+        loadPinnedIds();
+      } else {
+        const message = apiResMessage(res);
+        uni.showToast({ title: message.length > 0 ? message : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+  }
+
+  /** 撤回：返回撤回后的 MessageDto 原位替换（body 清空 ⇒ 渲染为系统行）；撤回联动删 Pin 需重拉。 */
+  async function handleActionRevoke(msg: ImMsgRow): Promise<void> {
+    if (convId.value.length == 0) {
+      return;
+    }
+    try {
+      const res = await apiImRevokeMsg(msg.msgId, convId.value);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          const revokedRow = readMsgRow(dataObj);
+          const rows = messages.value;
+          for (let i = 0; i < rows.length; i++) {
+            if (rows[i].msgId == revokedRow.msgId) {
+              rows.splice(i, 1, revokedRow);
+              break;
+            }
+          }
+        }
+        loadPinnedIds();
+      } else {
+        const message = apiResMessage(res);
+        uni.showToast({ title: message.length > 0 ? message : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+  }
+
+  /** 弹窗点行分发（selectedId 先清防 afterleave 延迟期间高亮残留）。 */
+  function handleSheetSelect(key: string): void {
+    const msg = findMsgById(selectedId.value);
+    selectedId.value = "";
+    if (msg == null) {
+      return;
+    }
+    if (key == "quote") {
+      enterQuoteMode(msg);
+    } else if (key == "pin") {
+      handleActionPin(msg, true);
+    } else if (key == "unpin") {
+      handleActionPin(msg, false);
+    } else if (key == "edit") {
+      enterEditMode(msg);
+    } else if (key == "revoke") {
+      handleActionRevoke(msg);
+    }
   }
 
   /**
@@ -2557,6 +3269,9 @@
       att.fileName = displayName;
       row.linkAtts = [att];
     }
+    applyQuoteToRow(row);
+    // 多选媒体逐张入队：引用只挂在第一张上（飞书同款），随即消费掉
+    quoteTarget.value = null;
     messages.value.push(row);
     scrollToBottom();
     sendMediaWithRow(row, localPath, displayName);
@@ -2869,6 +3584,10 @@
       loadMyInfo();
       // 进页即拉 @ 数据源（群聊=群成员 / 单聊=联系人；@面板与提及高亮依据，不阻塞首屏）
       loadMembers();
+      // 长按操作的能力依据（群治理开关/我的角色、置顶集、撤回时限），不阻塞首屏
+      loadConvInfo();
+      loadPinnedIds();
+      loadRevokeWindow();
       initHistory().then((): void => {
         if (jumpMsgId.length > 0) {
           pendingJumpId = jumpMsgId;
@@ -2931,6 +3650,9 @@
 
   onShow(() => {
     pageVisible = true;
+    // 从别的页面回来：置顶集与已读计数是多人共享状态，重拉自我纠正
+    loadPinnedIds();
+    refreshReadStatus();
     if (pendingJumpId.length == 0) {
       return;
     }
@@ -3243,11 +3965,87 @@
     border-radius: 12rpx;
   }
 
-  .chat-status {
+  /* 长按选中：操作弹窗存续期整行铺选中底色 */
+  .chat-msg--selected {
+    background-color: #f3f1fb;
+    border-radius: 12rpx;
+  }
+
+  /* 被 pin 的消息：整行淡黄底（比定位闪烁 flash 更浅的静态黄，全员可见标识） */
+  .chat-msg--pinned {
+    background-color: #fff6df;
+    border-radius: 12rpx;
+  }
+
+  /* Pin 署名行：pin icon + 操作人署名（chat-col--mine 下随列右对齐） */
+  .chat-pininfo {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    margin-top: 6rpx;
+    padding: 0 8rpx;
+  }
+
+  .chat-pininfo__icon {
+    width: 24rpx;
+    height: 24rpx;
+    margin-right: 6rpx;
+  }
+
+  .chat-pininfo__text {
+    font-size: 22rpx;
+    line-height: 30rpx;
+    color: #b08a2e;
+  }
+
+  /* 气泡下 meta 行（发送态 / 已读 icon / 已编辑）：间距收敛到这里，
+     我方行覆盖列对齐改为左对齐（飞书式：状态在气泡左下角） */
+  .chat-meta {
     margin-top: 8rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .chat-meta--mine {
+    align-self: flex-start;
+  }
+
+  .chat-status {
     font-size: 22rpx;
     line-height: 30rpx;
     color: #9a98a5;
+  }
+
+  /* 已读圆点：无动态环形进度（App 不支持 conic-gradient），空心/实心二态 + 计数 */
+  .chat-read {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 4rpx 12rpx 4rpx 0;
+  }
+
+  .chat-read--active {
+    opacity: 0.7;
+  }
+
+  .chat-read__dot {
+    width: 22rpx;
+    height: 22rpx;
+    border-radius: 11rpx;
+    border: 3rpx solid #3fae94;
+    box-sizing: border-box;
+  }
+
+  .chat-read__dot--solid {
+    background-color: #3fae94;
+  }
+
+  .chat-read__text {
+    margin-left: 8rpx;
+    font-size: 20rpx;
+    line-height: 28rpx;
+    color: #a5a3b0;
   }
 
   .chat-status--fail {
@@ -3274,19 +4072,66 @@
     height: 4rpx;
   }
 
-  /* ===== AI 生成提示 + 输入坞 ===== */
-  .chat-ai-tip {
+  /* ===== 引用 / 编辑条 + 输入坞 ===== */
+  .chat-compose-bar {
     flex-shrink: 0;
-    padding: 4rpx 0 12rpx;
+    margin: 0 24rpx 8rpx;
+    padding: 14rpx 20rpx;
+    border-radius: 16rpx;
+    background-color: #ffffff;
     display: flex;
     flex-direction: row;
-    justify-content: center;
+    align-items: center;
   }
 
-  .chat-ai-tip__text {
+  .chat-compose-bar__accent {
+    width: 6rpx;
+    height: 44rpx;
+    border-radius: 3rpx;
+    background-color: #5147ff;
+    flex-shrink: 0;
+  }
+
+  /* 编辑条竖条换暖色，与引用态视觉区分 */
+  .chat-compose-bar__accent--edit {
+    background-color: #e0942e;
+  }
+
+  .chat-compose-bar__main {
+    flex: 1;
+    min-width: 0;
+    margin-left: 16rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-compose-bar__label {
     font-size: 22rpx;
-    line-height: 32rpx;
-    color: #a5a3b0;
+    line-height: 30rpx;
+    color: #6f6d7b;
+    font-weight: 500;
+  }
+
+  .chat-compose-bar__text {
+    margin-top: 2rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #4b4b52;
+  }
+
+  .chat-compose-bar__close {
+    width: 56rpx;
+    height: 56rpx;
+    margin-left: 8rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .chat-compose-bar__close--active {
+    opacity: 0.6;
   }
 
   .chat-dock-wrap {
@@ -3375,6 +4220,14 @@
     font-size: 31rpx;
     line-height: 42rpx;
     color: #17171a;
+    /* #ifdef APP-ANDROID */
+    /* Android 原生输入框自带纵向内边距（disable-default-padding 仅 iOS 生效），
+       与 CSS 纵向内距叠加后输入 pill 明显高于 iOS：去掉 CSS 侧纵向内距，
+       min-height 只留一行行高，pill 高度交由 chat-input-box 的 min-height 统一撑起 */
+    padding-top: 0;
+    padding-bottom: 0;
+    min-height: 42rpx;
+    /* #endif */
   }
 
   .chat-input__expand {

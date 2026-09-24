@@ -71,6 +71,12 @@ handleSendMessage
 
 **关键细节：** ACP 和 MCP Ask 事件在 `handleChangeMessageList` 最前面被拦截并 `return`，**不会**进入 `processingList`。
 
+ACP 请求兼容 `request_permission_request` / `requestPermissionRequest`，既可在事件 data 中，
+也可在 `result.input` 中；识别和提取共用同一候选顺序。传输层必须放行无 data 的扁平审批帧，
+且不得把审批帧与同 executeId 的 PROCESSING 状态帧合并。请求内 `_meta` 的干预 ID 应保留。
+运行 `node --test scripts/approval-flow.test.mjs` 可检查事件过滤、解析、队列及提交后关闭逻辑；
+该检查执行转译后的 UTS，不代替 Android / iOS / 鸿蒙的编译和真机弹窗验收。
+
 ### 2.2 消息恢复（sub stream）
 
 刷新页面 / 重进会话且任务仍 EXECUTING 时触发，由页面层轮询 `taskStatus` 检测后调用 `handleSubConversation`：

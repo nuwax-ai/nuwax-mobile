@@ -153,9 +153,8 @@ export default function request(options: any): Promise<any> {
       // App 端运行时会无视 <string> 泛型与 dataType "text"，仍把 JSON 预解析成对象：
       // >2^53 的雪花号（convId/msgId 等）在 Number→string 转换时即已按 17 位有效
       // 数字舍入（…8256→…8260 → 后端报 IM_20103），事后无法恢复——只能按原始字节
-      // 返回，success 里走 parseArrayBufferKeepInt64 单遍解码 + 防精度改写
-      // （iOS 2026-09-21 真机验证 responseType "arraybuffer" 生效；Android
-      // 2026-09-23 真机确认同样丢精度，纳入同一字节路径）。
+      // 返回（iOS 2026-09-21、Android 2026-09-23 真机均验证 responseType
+      // "arraybuffer" 生效；取回字节后两端的解码/改写路径分叉，见 success 内注释）。
       responseType: "arraybuffer",
       // #endif
       success: (res) => {
@@ -169,7 +168,22 @@ export default function request(options: any): Promise<any> {
         if (responseData instanceof ArrayBuffer) {
           const abBuffer = responseData;
           const startedAt = Date.now();
+          // iOS：单遍「UTF-8 解码 + 防精度改写」（parseArrayBufferKeepInt64，Swift
+          //   String 追加摊还 O(1)，真机验证流畅）。
+          // Android：勿走 parseArrayBufferKeepInt64 —— UTS→Kotlin 的 String 不可变，
+          //   逐字符 out += 每次整串拷贝（O(n²)）且每字节一次小对象分配，大响应在
+          //   主线程 GC 风暴直接卡死/ANR（2026-09-24 真机：切 tab 长加载后冻结；
+          //   iOS 同代码无此问题）。改 native TextDecoder 线性一次解码，防精度改写
+          //   复用 parseJsonKeepInt64（hasLossyIntLiteral 预检，绝大多数响应零改写）。
+          //   同因先例：utils/utf8.uts（App 端解码即为此用的 TextDecoder）。
+          // #ifdef APP-IOS
           const text = parseArrayBufferKeepInt64(abBuffer);
+          const viaTag = "byte";
+          // #endif
+          // #ifdef APP-ANDROID
+          const text = decodeArrayBufferText(abBuffer);
+          const viaTag = "td";
+          // #endif
           if (text.length == 0) {
             responseData = null; // 空正文：走下方空对象兜底（204 等）
           } else {
@@ -179,9 +193,10 @@ export default function request(options: any): Promise<any> {
             responseData = parseJsonKeepInt64(text);
           }
           // dev 打点：历史「页面切换卡顿」疑似与此解析链有关（未证实），量出来一锤定音
+          // via=byte（iOS 单遍字节改写）/ via=td（Android TextDecoder），真机核对两端耗时用
           if (process.env.NODE_ENV !== "production") {
             console.log(
-              `${logTag} [ReqDiag] ab ${res.statusCode} bytes=${abBuffer.byteLength} cost=${Date.now() - startedAt}ms ${method} ${fullUrl}`,
+              `${logTag} [ReqDiag] ab via=${viaTag} ${res.statusCode} bytes=${abBuffer.byteLength} cost=${Date.now() - startedAt}ms ${method} ${fullUrl}`,
             );
           }
         }
@@ -751,7 +766,7 @@ function parseJsonKeepInt64(raw: string): any | null {
   }
 }
 
-// #ifdef APP-IOS || APP-ANDROID
+// #ifdef APP-IOS
 /** 字节值是否为十进制数字（0x30-0x39）。 */
 function isDigitByte(b: number): boolean {
   return b >= 0x30 && b <= 0x39;
@@ -763,8 +778,13 @@ function isWsByte(b: number): boolean {
 }
 
 /**
- * App 端（iOS/Android）：ArrayBuffer → JSON 文本，单遍同时完成 UTF-8 解码与
+ * iOS 专用：ArrayBuffer → JSON 文本，单遍同时完成 UTF-8 解码与
  * 「对象值位置 ≥16 位无符号整数字面量」加引号（>2^53 雪花号防精度，语义对齐 parseJsonKeepInt64）。
+ *
+ * 仅 iOS 的原因：Swift String 追加为摊还 O(1)，逐字符拼接可行；Android（UTS→Kotlin）
+ * String 不可变，同款拼接每次整串拷贝 O(n²) + 逐字节小对象分配 → 主线程 GC 风暴、
+ * 切 tab 卡死/ANR（2026-09-24 真机），Android 已改走 decodeArrayBufferText +
+ * parseJsonKeepInt64，勿再合流两端。
  *
  * 不复用字符串级预检/改写的原因：UTS 字符串下标在 iOS 上可能非 O(1)，大响应
  * （i18n 语言包、租户配置）逐字符扫描会退化 O(n²)——旧全端字节方案疑似因此引起
@@ -865,5 +885,28 @@ function parseArrayBufferKeepInt64(buffer: ArrayBuffer): string {
     i += 1;
   }
   return out;
+}
+// #endif
+
+// #ifdef APP-ANDROID
+/**
+ * Android 专用：ArrayBuffer → 文本，native TextDecoder 一次线性解码（O(n)、
+ * 零逐字符分配）。产出交 parseJsonKeepInt64 做防精度解析（hasLossyIntLiteral
+ * 预检，绝大多数响应零改写直通原生 JSON.parse）。
+ *
+ * 不走 parseArrayBufferKeepInt64 的原因见 success 内注释：Kotlin String 不可变，
+ * 逐字符 out += 拼接 O(n²)。同因先例：utils/utf8.uts（App 端 UTF-8 解码统一
+ * TextDecoder，streamRequest.uts 多处在用）。
+ *
+ * TextDecoder 默认（非 fatal）解码不抛错、非法序列给替换字符、剥除 UTF-8 BOM；
+ * parseJsonKeepInt64 内也有 BOM/首尾空白清理，双保险。try 兜底仅防解码器在
+ * 特定运行时上的意外异常直抛主线程，返回空串走空正文分支。
+ */
+function decodeArrayBufferText(buffer: ArrayBuffer): string {
+  try {
+    return new TextDecoder().decode(new Uint8Array(buffer));
+  } catch (_e) {
+    return "";
+  }
 }
 // #endif

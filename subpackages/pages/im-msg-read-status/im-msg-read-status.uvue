@@ -1,0 +1,513 @@
+<template>
+  <view class="rs-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 标题（群成员页同款骨架） -->
+    <view class="rs-header">
+      <view class="rs-header__btn" hover-class="rs-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="rs-header__title-wrap">
+        <text class="rs-header__title">{{ t("Mobile.Message.readStatusTitle") }}</text>
+      </view>
+      <view class="rs-header__btn rs-header__btn--ghost" />
+    </view>
+
+    <!-- 双 tab（已读/未读，带人数），下划线选中态 -->
+    <view class="rs-tabs">
+      <view class="rs-tab" @click="switchTab('read')">
+        <text class="rs-tab__text" :class="activeTab == 'read' ? 'rs-tab__text--on' : ''">{{ readTabText }}</text>
+        <view v-if="activeTab == 'read'" class="rs-tab__line" />
+      </view>
+      <view class="rs-tab" @click="switchTab('unread')">
+        <text class="rs-tab__text" :class="activeTab == 'unread' ? 'rs-tab__text--on' : ''">{{ unreadTabText }}</text>
+        <view v-if="activeTab == 'unread'" class="rs-tab__line" />
+      </view>
+    </view>
+
+    <scroll-view
+      class="rs-body"
+      direction="vertical"
+      :show-scrollbar="false"
+      @scrolltolower="handleReachBottom"
+    >
+      <view v-if="listState == 'loading'" class="rs-state">
+        <text class="rs-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+      </view>
+      <!-- >500 人群：服务端 IM_30201 拒绝名单查询（计数仍可信，只退计数形态） -->
+      <view v-else-if="listState == 'tooLarge'" class="rs-state">
+        <text class="rs-state__text">{{ t("Mobile.Message.readListTooLarge") }}</text>
+      </view>
+      <!-- 降级：200 + listAvailable=false / degraded 原因码（readCount/eligibleCount 仍可信） -->
+      <view v-else-if="listState == 'degraded'" class="rs-state">
+        <text class="rs-state__text">{{ t("Mobile.Message.readListUnavailable") }}</text>
+      </view>
+      <view v-else-if="listState == 'failed'" class="rs-state" @click="reload">
+        <text class="rs-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+      </view>
+      <view v-else-if="readers.length == 0" class="rs-state">
+        <text class="rs-state__text">{{ t("Mobile.Message.readEmpty") }}</text>
+      </view>
+      <view v-else>
+        <view
+          v-for="(r, i) in readers"
+          :key="r.userId"
+          class="rs-row"
+          :class="i < readers.length - 1 ? 'rs-row--divider' : ''"
+        >
+          <image
+            v-if="r.avatar.length > 0 && r.avatarFailed != true"
+            class="rs-ava"
+            :src="r.avatar"
+            mode="aspectFit"
+            @error="handleAvatarError(r)"
+          />
+          <view v-else class="rs-ava" :style="{ backgroundImage: avatarGradient(r.name) }">
+            <text class="rs-ava-letter">{{ avatarLetter(r.name) }}</text>
+          </view>
+          <text class="rs-name text-ellipsis">{{ r.name }}</text>
+        </view>
+        <view v-if="loadingMore" class="rs-more">
+          <text class="rs-more__text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+        <view class="rs-tail" />
+      </view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  /*
+    消息阅读状态页（群聊已读计数点击进入）：
+    - 双 tab：已读（x人）/ 未读（x人），名单 = GET /messages/{msgId}/readers?type=read|unread
+    - 计数以响应为准校正（入参带来的只是首屏近似值）；未读数 = eligibleCount - readCount
+    - >500 人群服务端报 IM_30201：只显示计数（apiImReadStatus 在大群下仍可用）
+    - 降级形态是 200 + degraded 字符串原因码 / listAvailable=false：★degraded 是字符串
+      不是布尔，判空看长度勿 === true；此时名单为空但计数仍可信
+  */
+  import { computed, ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImMsgReaders } from "@/servers/im";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 头像字母底色渐变板（与群成员页同款）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #f59a9a, #e05f5f)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  /** 名单行（ReaderDto 投影；userId int64 已按字符串存用）。 */
+  class RsReader {
+    userId: string = "";
+    name: string = "";
+    avatar: string = "";
+    avatarFailed: boolean = false;
+  }
+
+  // ===== 页面入参 =====
+  const convId = ref<string>("");
+  const msgId = ref<string>("");
+  let seq = 0;
+
+  // ===== 计数（响应校正） =====
+  const readCount = ref<number>(0);
+  const eligibleCount = ref<number>(0);
+
+  // ===== 列表状态 =====
+  const activeTab = ref<string>("read");
+  const readers = ref<RsReader[]>([]);
+  /** loading | tooLarge | degraded | failed | done */
+  const listState = ref<string>("loading");
+  const loadingMore = ref<boolean>(false);
+  let page = 1;
+  let total = 0;
+
+  const readTabText = computed((): string => {
+    const params = new Map<string, string | number>();
+    params.set("count", readCount.value);
+    return translateFn("Mobile.Message.readTabRead", toI18nParams(params), "");
+  });
+
+  const unreadTabText = computed((): string => {
+    const params = new Map<string, string | number>();
+    params.set("count", eligibleCount.value - readCount.value);
+    return translateFn("Mobile.Message.readTabUnread", toI18nParams(params), "");
+  });
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function handleAvatarError(r: RsReader): void {
+    r.avatarFailed = true;
+  }
+
+  /** 拉名单（首页/翻页共用）：响应同时校正计数（权威）。 */
+  async function fetchPage(nextPage: number): Promise<void> {
+    if (convId.value.length == 0 || msgId.value.length == 0 || loadingMore.value) {
+      return;
+    }
+    if (nextPage > 1) {
+      loadingMore.value = true;
+    } else {
+      listState.value = "loading";
+    }
+    try {
+      const res = await apiImMsgReaders(msgId.value, convId.value, seq, activeTab.value, nextPage);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        // >500 人群：HTTP 层错误码 IM_30201（不降级查库），退回只显示计数形态
+        if (apiResCode(res) == "IM_30201") {
+          listState.value = "tooLarge";
+        } else if (nextPage <= 1) {
+          listState.value = "failed";
+        }
+        loadingMore.value = false;
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        listState.value = nextPage <= 1 ? "done" : listState.value;
+        loadingMore.value = false;
+        return;
+      }
+      // 计数校正（readCount/eligibleCount 与查询侧 read-status 同源可信）
+      const rc = readNumber(dataObj, "readCount", -1);
+      const ec = readNumber(dataObj, "eligibleCount", -1);
+      if (rc >= 0) {
+        readCount.value = rc;
+      }
+      if (ec >= 0) {
+        eligibleCount.value = ec;
+      }
+      // 降级判定：degraded 是字符串原因码（"L3_COLD" 等），判空看长度勿 === true
+      const degraded = readString(dataObj, "degraded").length > 0 || readBool(dataObj, "listAvailable") != true;
+      if (degraded) {
+        listState.value = "degraded";
+        loadingMore.value = false;
+        return;
+      }
+      total = readNumber(dataObj, "total", 0);
+      const out: RsReader[] = nextPage <= 1 ? [] : readers.value;
+      const readersRaw = dataObj["readers"];
+      if (readersRaw != null) {
+        const arr = readersRaw as UTSJSONObject[];
+        for (let i = 0; i < arr.length; i++) {
+          const r = new RsReader();
+          r.userId = readString(arr[i], "userId");
+          r.name = readString(arr[i], "name");
+          r.avatar = readString(arr[i], "avatar");
+          if (r.userId.length > 0) {
+            r.name = r.name.length > 0 ? r.name : `用户${r.userId}`;
+            out.push(r);
+          }
+        }
+      }
+      readers.value = out;
+      page = nextPage;
+      listState.value = "done";
+    } catch (_error) {
+      if (nextPage <= 1) {
+        listState.value = "failed";
+      }
+    }
+    loadingMore.value = false;
+  }
+
+  function reload(): void {
+    fetchPage(1);
+  }
+
+  /** 切 tab：名单数据源不同，重置分页重拉（计数两个 tab 共享）。 */
+  function switchTab(tab: string): void {
+    if (activeTab.value == tab) {
+      return;
+    }
+    activeTab.value = tab;
+    readers.value = [];
+    fetchPage(1);
+  }
+
+  /** 触底翻页：已拉条数 < 名单总人数才继续。 */
+  function handleReachBottom(): void {
+    if (listState.value != "done" || loadingMore.value) {
+      return;
+    }
+    if (readers.value.length < total) {
+      fetchPage(page + 1);
+    }
+  }
+
+  function handleBack(): void {
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      uni.switchTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    convId.value = readOption(options, "convId");
+    msgId.value = readOption(options, "msgId");
+    const seqParsed = parseFloat(readOption(options, "seq"));
+    seq = isNaN(seqParsed) ? 0 : seqParsed;
+    const rcParsed = parseFloat(readOption(options, "readCount"));
+    readCount.value = isNaN(rcParsed) ? 0 : rcParsed;
+    const ecParsed = parseFloat(readOption(options, "eligibleCount"));
+    eligibleCount.value = isNaN(ecParsed) ? 0 : ecParsed;
+    fetchPage(1);
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架（群成员页同款浅底） ===== */
+  .rs-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-color: #f6f5fb;
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .rs-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(250, 249, 253, 0.92);
+    border-bottom: 2rpx solid rgba(81, 71, 255, 0.1);
+  }
+
+  .rs-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .rs-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .rs-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .rs-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .rs-header__title {
+    max-width: 460rpx;
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  /* ===== 双 tab（add-buddy-sheet 下划线式） ===== */
+  .rs-tabs {
+    flex-shrink: 0;
+    padding: 0 32rpx;
+    display: flex;
+    flex-direction: row;
+    background-color: rgba(250, 249, 253, 0.92);
+    border-bottom: 2rpx solid rgba(81, 71, 255, 0.1);
+  }
+
+  .rs-tab {
+    margin-right: 64rpx;
+    padding: 8rpx 4rpx 16rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .rs-tab__text {
+    color: #9a9aa2;
+    font-size: 28rpx;
+    line-height: 40rpx;
+  }
+
+  .rs-tab__text--on {
+    color: #5147ff;
+    font-weight: 600;
+  }
+
+  .rs-tab__line {
+    margin-top: 8rpx;
+    width: 48rpx;
+    height: 6rpx;
+    border-radius: 3rpx;
+    background-color: #5147ff;
+  }
+
+  .rs-body {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .rs-state {
+    padding: 200rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .rs-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 名单行：头像 + 名称，行间短横线分割（末行无） ===== */
+  .rs-row {
+    min-height: 104rpx;
+    padding: 14rpx 32rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    box-sizing: border-box;
+  }
+
+  .rs-row--divider {
+    border-bottom: 2rpx solid #f0eff7;
+  }
+
+  /* 头像整数 px + 半径取半（同 add-buddy-sheet：rpx 亚像素 + 圆角在部分机型会切图标边） */
+  .rs-ava {
+    width: 36px;
+    height: 36px;
+    border-radius: 18px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .rs-ava-letter {
+    font-size: 30rpx;
+    line-height: 42rpx;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .rs-name {
+    flex: 1;
+    min-width: 0;
+    margin-left: 24rpx;
+    font-size: 29rpx;
+    line-height: 40rpx;
+    color: #22212a;
+  }
+
+  .rs-more {
+    padding: 16rpx 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .rs-more__text {
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #b0aebc;
+  }
+
+  .rs-tail {
+    height: 40rpx;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  /* #endif */
+</style>

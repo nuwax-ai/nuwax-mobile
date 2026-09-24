@@ -34,7 +34,6 @@
            至此全端统一走官方复杂列表指南方案。 -->
       <scroll-view
         v-if="listMounted"
-        :key="listKey"
         id="drawer-sticky-scroll"
         class="drawer-scroll"
         direction="vertical"
@@ -57,7 +56,7 @@
             <svg-icon
               :name="projectSectionCollapsed ? 'icon-a-Chevronright' : 'icon-a-Chevrondown'"
               size="24"
-              color="#8b8e96"
+              color="#939397"
               customClass="section-arrow"
             />
             <!-- 全部展开/收起项目下会话（对齐 PC section-tool：上下双 chevron 图标按钮） -->
@@ -73,7 +72,7 @@
             </view>
           </view>
           <view class="header-search-btn" @click.stop="handleSearch">
-            <svg-icon name="icon-Search" size="40" />
+            <svg-icon name="icon-Search" size="40" color="#939397" />
           </view>
         </view>
         <template v-if="!projectSectionCollapsed && visibleProjectGroups.length > 0">
@@ -122,9 +121,7 @@
           <image :src="noData" class="empty-image" :alt="t('Mobile.Common.noDataImageAlt')" />
           <text class="empty-text">{{ t("Mobile.Conversation.projectEmpty") }}</text>
         </view>
-        <!-- #ifndef H5 || WEB -->
-        <!-- 项目区「查看更多」入口（09-21 非 H5 端需求，对齐 PC load-more-entry）：
-             H5 沿触底加载保持现状，不展示入口 -->
+        <!-- 项目分页由本区入口触发，避免任务触底时在视口上方插入项目；全端保留入口。 -->
         <view
           v-if="!projectSectionCollapsed && projectLoadMoreVisible"
           class="project-load-more"
@@ -132,7 +129,6 @@
         >
           <text class="project-load-more-text">{{ projectLoadMoreText }}</text>
         </view>
-        <!-- #endif -->
 
         <view id="task-section-header" class="section-header task-section-header" @click="toggleTaskSection">
           <view class="header-title-row">
@@ -140,7 +136,7 @@
             <svg-icon
               :name="taskSectionCollapsed ? 'icon-a-Chevronright' : 'icon-a-Chevrondown'"
               size="24"
-              color="#8b8e96"
+              color="#939397"
               customClass="section-arrow"
             />
           </view>
@@ -151,6 +147,7 @@
           v-show="!taskSectionCollapsed"
           ref="taskListRef"
           :is-logged-in="isLoggedIn"
+          :allow-silent-refresh="allowSilentRefresh"
           @conversation-click="relayConversationClick"
           @count-change="handleTaskCountChange"
           @hasmore-change="handleTaskHasMoreChange"
@@ -167,7 +164,7 @@
             <svg-icon
               :name="floatingCollapsed ? 'icon-a-Chevronright' : 'icon-a-Chevrondown'"
               size="24"
-              color="#8b8e96"
+              color="#939397"
               customClass="section-arrow"
             />
             <!-- 吸顶浮头与自然位同款「全部展开/收起」入口 -->
@@ -183,7 +180,7 @@
             </view>
           </view>
           <view v-if="floatingHeaderKey != 'task'" class="header-search-btn" @click.stop="handleSearch">
-            <svg-icon name="icon-Search" size="40" />
+            <svg-icon name="icon-Search" size="40" color="#939397" />
           </view>
         </view>
       </view>
@@ -226,6 +223,7 @@
   import { clearConversationFlags } from "@/utils/conversationLocalFlags.uts";
   import { clearProjectFlags } from "@/utils/projectLocalFlags.uts";
   import { migrateProjectFavorites } from "@/utils/favoritesMigration.uts";
+  import { prefetchConversationList, clearCachedConversationList } from "@/utils/conversationListCache";
   import {
     ProjectChildView,
     ProjectGroupView,
@@ -260,6 +258,9 @@
 
   const popupRef = ref<any | null>(null);
   const drawerVisible = ref<boolean>(false);
+  const drawerInstance = getCurrentInstance();
+  // 浏览列表下方时延后头部对账，防止新增/重排的行改变当前阅读位置。
+  const allowSilentRefresh = ref<boolean>(true);
 
   /** Android：组件 ref 是 Gen* 类，禁止 as UTSJSONObject；用 $callMethod 调 defineExpose 方法 */
   function callRefMethod(inst: any | null, methodName: string): void {
@@ -279,6 +280,7 @@
   const projectVersion = ref<number>(0);
   const projectLoading = ref<boolean>(false);
   let projectLoadedOnce = false;
+  let projectDataGeneration = 0;
   let projectRequestPromise: Promise<boolean> | null = null;
   let projectFavoritesMigrationTriggered = false;
   // 分页游标（对齐 PC ProjectList 2026-09-20：pageSize=20 + 触底加载 + 刷新追拉）
@@ -400,8 +402,9 @@
    * 同时回写 projectTotalPagesCache。
    */
   async function fetchProjectPage(page: number): Promise<ProjectGroupView[] | null> {
+    const generation = projectDataGeneration;
     const res = await apiUserProjectTabPageQuery(page, PROJECT_PAGE_SIZE);
-    if (apiResCode(res) != SUCCESS_CODE) {
+    if (generation != projectDataGeneration || apiResCode(res) != SUCCESS_CODE) {
       return null;
     }
     const data = apiResData<any>(res);
@@ -412,6 +415,7 @@
   }
 
   async function fetchProjects(): Promise<boolean> {
+    const generation = projectDataGeneration;
     try {
       // 刷新：页码 1 起，前端过滤（归档）后可见行不足 MIN_VISIBLE_PROJECTS 时继续追拉
       // （归档项回包含但被过滤，单页可能稀疏；对齐 PC loadData(isRefresh) + chase）
@@ -439,14 +443,14 @@
         page++;
       }
       // 整轮一页未成功：不动现有数据、维持「未加载过」，下次打开自动重拉（对齐原单发语义）
-      if (successCount == 0) {
+      if (successCount == 0 || generation != projectDataGeneration) {
         return false;
       }
-      projectGroupsData = acc;
+      projectGroupsData = projectLoadedOnce ? reconcileProjectGroups(projectGroupsData, acc) : acc;
       projectNextPage = page;
       projectHasMore = computeProjectHasMore(page - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
       syncProjectLoadMoreState();
-      // 默认全展开（对齐 PC：collapsedIds 初始为空）；子会话随列表回包一并就位
+      // 首载默认展开；刷新保留已有项目展开态，避免收起的项目突然撑开。
       projectVersion.value = projectVersion.value + 1;
       projectLoadedOnce = true;
       // 首次加载成功后触发本地项目收藏一次性迁移（幂等，未完成前重试）
@@ -482,8 +486,9 @@
    * 并按项目 id 保留展开态与已加载子会话。用户看到的是原内容就地更新。
    */
   async function silentRefreshProjects(): Promise<boolean> {
-    if (!projectLoadedOnce || projectRequestPromise != null) return false;
+    if (!projectLoadedOnce || projectRequestPromise != null || !allowSilentRefresh.value) return false;
     const loadedPages = projectNextPage > 1 ? projectNextPage - 1 : 1;
+    const generation = projectDataGeneration;
     const run = async (): Promise<boolean> => {
       let acc: ProjectGroupView[] = [] as ProjectGroupView[];
       let lastCount = 0;
@@ -493,6 +498,8 @@
         lastCount = groups.length;
         acc = appendProjectGroupsDedup(acc, groups);
       }
+      // 请求期间可能已开始向下浏览；此时也不能把新数据插到视口上方。
+      if (!allowSilentRefresh.value || generation != projectDataGeneration) return false;
       projectGroupsData = reconcileProjectGroups(projectGroupsData, acc);
       projectNextPage = loadedPages + 1;
       projectHasMore = computeProjectHasMore(loadedPages, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
@@ -1078,7 +1085,6 @@
   const taskListRef = ref<any | null>(null);
   const listMounted = ref<boolean>(false);
   const refreshing = ref<boolean>(false);
-  const listKey = ref<number>(0);
   let refreshInFlight = false;
 
   // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
@@ -1121,7 +1127,7 @@
   /** 测任务头锚点相对滚动区的内容偏移；项目区高度变化（版本 bump）与刷新重建后需重测 */
   function measureStickyAnchors(): void {
     if (drawerVisible.value != true) return;
-    const inst = getCurrentInstance();
+    const inst = drawerInstance;
     if (inst == null) return;
     const proxy = inst.proxy;
     if (proxy == null) return;
@@ -1159,6 +1165,11 @@
   function handleStickyScroll(e: UniScrollEvent): void {
     const st = e.detail.scrollTop;
     stickyLastScrollTop = st;
+    const wasAllowed = allowSilentRefresh.value;
+    allowSilentRefresh.value = st <= STICKY_TRIGGER_EPS && !refreshInFlight;
+    if (!wasAllowed && allowSilentRefresh.value) {
+      silentRefreshProjects();
+    }
     updateFloatingHeader(st);
     // 锚点未测得（打开时测量竞态/失败）时滚动中补测（500ms 节流），
     // 否则任务头永远切不上吸顶位
@@ -1226,6 +1237,12 @@
 
   function handlePopupVisible(visible: boolean): void {
     drawerVisible.value = visible == true;
+    if (visible) {
+      stickyLastScrollTop = 0;
+      taskHeaderContentOffset = -1;
+      floatingHeaderKey.value = "";
+      allowSilentRefresh.value = !refreshInFlight;
+    }
     if (!visible) resetDrawerSwipe();
   }
 
@@ -1234,7 +1251,7 @@
     if (proxy == null) return;
     proxy.$callMethod("open");
     if (!props.isLoggedIn) return;
-    // 首次打开拉全量；再次打开仅静默补差
+    // 初始化已预取；提前打开或预取失败时才在此补拉。
     if (!projectLoadedOnce && projectRequestPromise == null) {
       requestProjects();
     }
@@ -1263,8 +1280,6 @@
   /**
    * 任务列表首载兜底：page-container 打开后 slot 子组件的挂载可能晚于 nextTick
    * （ref 短暂为 null），带短重试直到 ref 绑定。
-   * 注意：UTS 顶层声明顺序敏感，本函数必须声明在 releaseRefresher 之前
-   * （下拉刷新重建滚动容器后也要调它重挂首载）。
    */
   function ensureTaskListLoaded(retries: number): void {
     if (drawerVisible.value != true) return;
@@ -1280,20 +1295,6 @@
     }, 120);
   }
 
-  async function releaseRefresher(): Promise<void> {
-    refreshing.value = false;
-    listKey.value = listKey.value + 1;
-    await nextTick();
-    // listKey 重建滚动容器 = 任务列表子组件换成了全新实例：必须重挂首载钩子，
-    // 否则新实例没人管（loadIfEmpty 只在抽屉打开的 watch 里调过一次）——
-    // 缓存有数据 → silentRefresh 轻量对账；缓存空 → loadIfEmpty 拉首屏。
-    // 漏掉这步就是「下拉刷新后任务区暂无数据」且不自恢复（09-21 复现修复）。
-    ensureTaskListLoaded(8);
-    // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
-    // listKey 重建滚动容器后节点全新，重测吸顶锚点
-    scheduleMeasureStickyAnchors(120);
-  }
-
   function resetRefresher(): void {
     refreshing.value = false;
   }
@@ -1301,24 +1302,28 @@
   async function performRefresh(): Promise<void> {
     try {
       await nextTick();
-      // 任务列表刷新即发即忘（子组件内已做在途收口与单飞）；容器等待项目刷新完成后收起刷新层
-      callRefMethod(taskListRef.value, "refresh");
+      // 等待两区请求完成后再收起刷新层，保留原滚动容器和任务组件实例。
+      const taskProxy = taskListRef.value as ComponentPublicInstance | null;
+      const taskRefresh = taskProxy != null ? taskProxy.$callMethod("refresh") as Promise<void> : null;
+      const pendingProjects = projectRequestPromise;
+      if (pendingProjects != null) await pendingProjects;
       await requestProjects();
+      if (taskRefresh != null) await taskRefresh;
     } catch (error) {
       console.error("performRefresh error:", error);
     } finally {
       refreshInFlight = false;
-      await releaseRefresher();
+      refreshing.value = false;
+      allowSilentRefresh.value = stickyLastScrollTop <= STICKY_TRIGGER_EPS;
+      scheduleMeasureStickyAnchors(120);
     }
   }
 
   function handleRefresh(): void {
-    if (refreshInFlight) {
-      releaseRefresher();
-      return;
-    }
+    if (refreshInFlight) return;
     refreshing.value = true;
     refreshInFlight = true;
+    allowSilentRefresh.value = false;
     performRefresh();
   }
 
@@ -1326,17 +1331,18 @@
    *  追加页默认收起：子会话随列表回包后一页 20 个项目展开会新增数百行，
    *  把任务区整体推远（用户视口内容剧变，形似整列表重载）。 */
   async function loadMoreProjects(): Promise<void> {
-    if (projectHasMore != true || projectLoadingMore || projectRequestPromise != null) {
+    if (refreshInFlight || projectHasMore != true || projectLoadingMore || projectRequestPromise != null) {
       return;
     }
     projectLoadingMore = true;
     projectLoadingMoreView.value = true;
-    try {
+    const generation = projectDataGeneration;
+    const run = async (): Promise<boolean> => {
       const groups = await fetchProjectPage(projectNextPage);
-      if (groups == null || groups.length == 0) {
-        // 失败/空页：置停触底重试（下拉刷新恢复），避免触底风暴
+      if (groups == null || generation != projectDataGeneration) return false;
+      if (groups.length == 0) {
         projectHasMore = false;
-        return;
+        return true;
       }
       // 追加页收起（单行紧凑增量，任务区位置稳定；点项目行/区头「全部展开」可展开）
       for (let g = 0; g < groups.length; g++) {
@@ -1347,10 +1353,18 @@
       projectNextPage = projectNextPage + 1;
       projectHasMore = computeProjectHasMore(projectNextPage - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
       projectVersion.value = projectVersion.value + 1;
-    } catch (error) {
+      return true;
+    };
+    // 翻页与刷新共用在途锁，避免旧页回包覆盖刷新后的页码或已追加的数据。
+    const requestPromise = run().catch((error): boolean => {
       console.error("loadMoreProjects error:", error);
-      projectHasMore = false;
+      return false;
+    });
+    projectRequestPromise = requestPromise;
+    try {
+      await requestPromise;
     } finally {
+      projectRequestPromise = null;
       projectLoadingMore = false;
       projectLoadingMoreView.value = false;
       syncProjectLoadMoreState();
@@ -1362,25 +1376,20 @@
     loadMoreProjects();
   }
 
-  /** 容器触底分区分流：用户已滚进任务区（任务头越过吸顶线，floatingHeaderKey=task）
-   *  时优先加载任务下一页（每次 20 条，追加在视口下方不推移内容、不拽掉任务吸顶头）；
-   *  任务到底后再回落项目分页（收起追加）；项目区内维持先项目页后任务页。 */
+  /** 触底只追加当前展开的尾部分组；吸顶头是显示状态，不能用于决定分页目标。
+   *  任务展开时，即使已经到底，也不能回头插入上方项目。 */
   function handleScrollTolower(): void {
-    if (floatingHeaderKey.value == "task") {
+    if (refreshInFlight || !drawerVisible.value) return;
+    if (!taskSectionCollapsed.value) {
       if (taskListHasMore.value) {
         callRefMethod(taskListRef.value, "loadMore");
         return;
       }
-      if (projectHasMore == true) {
-        loadMoreProjects();
-      }
       return;
     }
-    if (projectHasMore == true) {
+    if (!projectSectionCollapsed.value && projectHasMore == true) {
       loadMoreProjects();
-      return;
     }
-    callRefMethod(taskListRef.value, "loadMore");
   }
 
   // 抽屉每次变为可见且子组件挂载完成后再触发任务列表首载（见 open() 注释）
@@ -1409,8 +1418,37 @@
     }
   }
 
+  /** 不依赖弹层 slot 挂载：项目存本组件，任务首屏放跨实例缓存。 */
+  async function preloadDrawerData(): Promise<void> {
+    if (!props.isLoggedIn) return;
+    const pending = projectRequestPromise;
+    if (pending != null) await pending;
+    if (!props.isLoggedIn) return;
+    if (!projectLoadedOnce) requestProjects();
+    const loaded = await prefetchConversationList();
+    if (loaded && props.isLoggedIn) callRefMethod(taskListRef.value, "loadIfEmpty");
+  }
+
+  watch((): boolean => props.isLoggedIn, (loggedIn: boolean) => {
+    if (loggedIn) {
+      preloadDrawerData();
+      return;
+    }
+    projectDataGeneration++;
+    projectLoadedOnce = false;
+    projectGroupsData = [] as ProjectGroupView[];
+    projectHasMore = false;
+    projectNextPage = 1;
+    projectTotalPagesCache = 0;
+    projectTotalCountCache = 0;
+    projectVersion.value++;
+    syncProjectLoadMoreState();
+    clearCachedConversationList();
+  });
+
   onMounted(() => {
     eventBus.on(`${EVENT_TYPE.ChatFinished}`, handleChatFinishedEvent);
+    preloadDrawerData();
     nextTick(() => {
       listMounted.value = true;
     });
@@ -1461,14 +1499,14 @@
     flex-direction: row;
     align-items: center;
     justify-content: space-between;
-    padding: 24rpx 32rpx 8rpx;
+    padding: 28rpx 32rpx 14rpx;
     background-color: #ffffff;
 
     .section-title-text {
-      font-size: 26rpx;
-      font-weight: 600;
+      font-size: 28rpx;
+      font-weight: 400;
       color: #8b8e96;
-      line-height: 36rpx;
+      line-height: 40rpx;
     }
 
     .header-search-btn {
@@ -1493,7 +1531,7 @@
   .section-arrow {
     flex-shrink: 0;
     font-size: 24rpx;
-    color: #8b8e96;
+    color: #939397;
     margin-left: 8rpx;
   }
 
@@ -1519,7 +1557,7 @@
 
   /* 任务分组头：与项目区的间距并入 padding-top（吸顶条整块不透明，不用 margin 防透缝） */
   .task-section-header {
-    padding-top: 32rpx;
+    padding-top: 40rpx;
   }
 
   /* 浮动吸顶头（iOS/微信降级端）：钉在滚动区顶部，top 与 drawer-wrap 的 APP 状态栏让位对齐 */
@@ -1539,14 +1577,14 @@
   /* .project-block 仅剩 scroll-view 分支的分组间距；行样式提升到顶层，
      供 Android 扁平行（list-item 直挂行 view）与 scroll-view 分支共用 */
   .project-block {
-    padding-bottom: 16rpx;
+    padding-bottom: 18rpx;
   }
 
   .project-row {
       display: flex;
       flex-direction: row;
       align-items: center;
-      padding: 20rpx 32rpx;
+      padding: 26rpx 32rpx;
 
       .project-flag-image {
         flex-shrink: 0;
@@ -1563,7 +1601,7 @@
         border-radius: 8rpx;
         background-color: #f2f3f7;
         font-size: 20rpx;
-        color: #6b6e76;
+        color: #85858b;
         line-height: 30rpx;
       }
 
@@ -1582,10 +1620,10 @@
       .project-name {
         flex-shrink: 1;
         min-width: 0;
-        font-size: 34rpx;
+        font-size: 35rpx;
         font-weight: 400;
-        color: #6b6e76;
-        line-height: 42rpx;
+        color: #29292d;
+        line-height: 48rpx;
         margin-right: 12rpx;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1603,7 +1641,7 @@
 
         .project-add-icon {
           font-size: 36rpx;
-          color: #5147ff;
+          color: #929298;
           line-height: 40rpx;
         }
       }
@@ -1613,7 +1651,7 @@
       display: flex;
       flex-direction: row;
       align-items: center;
-      padding: 14rpx 32rpx 14rpx 72rpx;
+      padding: 22rpx 32rpx 22rpx 72rpx;
 
       .child-status {
         flex-shrink: 0;
@@ -1638,8 +1676,8 @@
         min-width: 0;
         font-size: 30rpx;
         font-weight: 400;
-        color: #6b6e76;
-        line-height: 40rpx;
+        color: #38383d;
+        line-height: 44rpx;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1648,7 +1686,7 @@
       .child-time {
         flex-shrink: 0;
         font-size: 22rpx;
-        color: #999;
+        color: #a0a0a5;
         line-height: 32rpx;
         margin-left: 12rpx;
       }
@@ -1689,13 +1727,13 @@
     display: flex;
     flex-direction: row;
     align-items: center;
-    justify-content: center;
-    padding: 16rpx 24rpx;
+    justify-content: flex-start;
+    padding: 24rpx 32rpx;
 
     .project-load-more-text {
-      font-size: 24rpx;
+      font-size: 28rpx;
       color: #8b8e96;
-      line-height: 34rpx;
+      line-height: 40rpx;
     }
   }
 </style>

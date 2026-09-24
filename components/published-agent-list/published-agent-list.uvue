@@ -61,6 +61,12 @@
       </swiper>
     </view>
 
+    <expert-payment-modal
+      v-if="props.expertPayment && props.targetType == 'ChatBot' && props.isApp != true"
+      ref="expertPaymentModalRef"
+      @summon="selectAgentOnHome"
+    />
+
     <!-- 登录弹窗（仅微信小程序） -->
     <!-- #ifdef MP-WEIXIN -->
     <auth-login-popup ref="loginPopupRef" />
@@ -81,6 +87,8 @@
   import { apiPublishedCategoryList, apiPublishedAgentList, apiPublishedAppList } from "@/servers/square";
   import { SUCCESS_CODE, USER_NO_LOGIN, REDIRECT_LOGIN } from "@/constants/codes.constants";
   import PublishedCategoryPane from "@/components/published-agent-list/published-category-pane.uvue";
+  import ExpertPaymentModal from "@/components/expert-list-view/expert-payment-modal/expert-payment-modal.uvue";
+  import { apiPublishedAgentInfo } from "@/servers/agentDev";
   import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { apiTenantConfig } from "@/servers/account";
   import { dispatchPublishedAppClick, isPublishedPageApp, readPublishedAppProjectId, readPublishedAppProjectType } from "@/utils/publishedAppJump";
@@ -109,11 +117,14 @@
       /** 是否为应用（全栈应用、常规项目、三方应用），为 true 时走广场应用列表 apiPublishedAppList（仅应用 Tab）；其余页面保持智能体列表接口 */
       isApp?: boolean;
       isOfficial?: boolean;
+      /** 第三个导航栏的专家付费抽屉；其他复用此列表的页面保持原入口行为。 */
+      expertPayment?: boolean;
     }>(),
     {
       targetType: "ChatBot",
       isApp: false,
       isOfficial: false,
+      expertPayment: false,
     },
   );
 
@@ -128,6 +139,7 @@
   // 使用登录拦截 composable
   const authInterceptor = useAuthInterceptor();
   const loginPopupRef = authInterceptor.loginPopupRef;
+  const expertPaymentModalRef = ref<any | null>(null);
   const baseHandleAgentClick = authInterceptor.handleAgentClick as (info : any) => void;
   const hasToken = authInterceptor.hasToken as () => Promise<boolean>;
 
@@ -208,6 +220,10 @@
       }
     }
     return 0;
+  });
+  const subscriptionGateActive = computed((): boolean => {
+    // 租户配置尚未返回时保持付费门；只有明确关闭订阅才直通。
+    return tenantConfigInfo.value == null || enableSubscription.value == 1;
   });
   // 已渲染的分类索引集合（用于懒加载优化）
   const renderedCategoryIndexes = ref<Set<number>>(new Set([0]));
@@ -682,8 +698,35 @@
     return i != null ? `${i}` : "";
   };
 
-  // 跳转到智能体详情页；应用 Tab 按 targetType 分流
-  const handleAgentClick = (info: UTSJSONObject) => {
+  function selectAgentOnHome(info: UTSJSONObject): void {
+    let targetId = 0;
+    const targetIdRaw = info["targetId"];
+    if (targetIdRaw != null) targetId = parseFloat(`${targetIdRaw}`);
+    if (targetId <= 0) return;
+    appGlobalState.pendingHomeAgentTargetId = targetId;
+    appGlobalState.pendingHomeAgentName = getName(info);
+    appGlobalState.pendingHomeAgentIcon = getIcon(info);
+    uni.switchTab({ url: "/pages/index/index" });
+  }
+
+  function openExpertPayment(info: UTSJSONObject): void {
+    const paymentInfo = new UTSJSONObject();
+    paymentInfo["targetId"] = info["targetId"];
+    paymentInfo["name"] = info["name"];
+    paymentInfo["icon"] = info["icon"];
+    paymentInfo["description"] = info["description"];
+    paymentInfo["paymentRequired"] = true;
+    paymentInfo["subscribed"] = false;
+    const statistics = info["statistics"];
+    if (statistics != null) {
+      paymentInfo["userCount"] = (statistics as UTSJSONObject)["userCount"];
+    }
+    const modal = expertPaymentModalRef.value;
+    if (modal != null) (modal as ComponentPublicInstance).$callMethod("open", paymentInfo);
+  }
+
+  // 第三个导航栏专家列表：付费专家复核后弹出独立抽屉，其余沿用首页选中流程。
+  const handleAgentClick = async (info: UTSJSONObject): Promise<void> => {
     // 检查登录状态，如果未登录则显示登录弹窗
     if (!isLoggedIn.value) {
       handleLogin();
@@ -693,22 +736,29 @@
       dispatchPublishedAppClick(info, jumpPublishedAgent);
       return;
     }
-
-    // 对齐首页侧边栏加号选专家：把 targetId / name / icon 带回首页上框，不进详情
-    let targetId = 0;
-    const targetIdRaw = info["targetId"];
-    if (targetIdRaw != null) {
-      targetId = parseFloat(`${targetIdRaw}`);
-    }
-    if (targetId <= 0) {
+    const idRaw = info["targetId"];
+    const targetId = idRaw != null ? parseFloat(`${idRaw}`) : 0;
+    if (targetId <= 0) return;
+    if (props.expertPayment && props.targetType == "ChatBot" && subscriptionGateActive.value &&
+        info["paymentRequired"] == true && info["subscribed"] != true) {
+      try {
+        const response = await apiPublishedAgentInfo(targetId, false);
+        const detailRaw = apiResCode(response) == SUCCESS_CODE ? apiResData<any>(response) : null;
+        if (detailRaw != null) {
+          const detail = detailRaw as UTSJSONObject;
+          if (detail["paymentRequired"] != true || detail["subscribed"] == true) {
+            info["subscribed"] = detail["subscribed"] == true;
+            selectAgentOnHome(info);
+            return;
+          }
+        }
+      } catch (_error) {
+        // 复核失败仍保持付费门，避免列表状态绕过订阅。
+      }
+      openExpertPayment(info);
       return;
     }
-    appGlobalState.pendingHomeAgentTargetId = targetId;
-    appGlobalState.pendingHomeAgentName = getName(info);
-    appGlobalState.pendingHomeAgentIcon = getIcon(info);
-    uni.switchTab({
-      url: "/pages/index/index",
-    });
+    selectAgentOnHome(info);
   };
 
   const getNestedObj = (info: UTSJSONObject, key: string): UTSJSONObject | null => {

@@ -35,6 +35,10 @@ python3 "$SCRIPT_DIR/strip_sample_unimodules.py"
 python3 "$SCRIPT_DIR/configure_demo.py"
 
 echo "==== 3) xcodebuild 真机（generic，不连机）===="
+# INFOPLIST_OUTPUT_FORMAT=binary：configure_demo.py 用 plistlib 写回的 Info.plist 是 XML，
+# 而 HBuilderX launcher（bplist-parser）只认二进制 plist，XML 会导致
+# initCustomBaseAppInfo/getPackageNameByPlist 解析失败；且必须在签名前转换，
+# 签名后改 plist 会破坏 CodeResources 密封导致设备拒装。
 xcodebuild -project "$PROJ" -scheme UniAppX -configuration Debug \
   -destination "generic/platform=iOS" \
   -derivedDataPath "$DD" \
@@ -42,6 +46,7 @@ xcodebuild -project "$PROJ" -scheme UniAppX -configuration Debug \
   CODE_SIGN_STYLE=Manual \
   PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
   PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE" \
+  INFOPLIST_OUTPUT_FORMAT=binary \
   build
 
 APP="$DD/Build/Products/Debug-iphoneos/UniAppX.app"

@@ -73,12 +73,14 @@ if [[ "$SIM_FORCE_X86_64" == "1" ]]; then
 fi
 
 echo "==== 3) xcodebuild 模拟器（configuration=${CONFIGURATION}, generic，不启动 Simulator）===="
+# INFOPLIST_OUTPUT_FORMAT=binary：同真机脚本，HBuilderX launcher 只认二进制 plist
 xcodebuild -project "$PROJ" -scheme UniAppX -configuration "${CONFIGURATION}" \
   -destination "generic/platform=iOS Simulator" \
   -derivedDataPath "$DD" \
   CODE_SIGN_IDENTITY="-" \
   CODE_SIGNING_REQUIRED=NO \
   PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE" \
+  INFOPLIST_OUTPUT_FORMAT=binary \
   "${XCB_EXTRA[@]}" \
   build
 

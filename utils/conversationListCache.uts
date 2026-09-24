@@ -2,14 +2,23 @@
  * 任务列表（抽屉「任务」区）跨实例内存缓存。
  *
  * 为什么必须放独立 .uts 模块：.uvue 的 <script setup> 顶层 let 编译到 Kotlin
- * 后是组件实例字段，实例销毁重建（下拉刷新 listKey 重建滚动容器、关抽屉重开）
+ * 后是组件实例字段，实例销毁重建（关抽屉重开）
  * 后即归零——写在组件文件里的「模块级缓存」在 Android 端从不真正跨实例，
  * 表现为重建出的空列表 + 容器计数停在旧值（09-21 复现：下拉刷新后任务区
  * 「暂无数据」不自恢复）。独立模块的全局 let 才是真模块作用域（同 appGlobalState）。
  */
 
+import { apiAgentConversationList } from "@/servers/conversation";
+import { ConversationListParams } from "@/types/interfaces/conversationInfo";
+import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+
 let cachedConversationList: UTSJSONObject[] = [];
 let cachedLastId: number | null = null;
+let cachedHasMore = false;
+let cachedLoaded = false;
+let cacheGeneration = 0;
+let preloadPromise: Promise<boolean> | null = null;
 
 export function getCachedConversationList(): UTSJSONObject[] {
   return cachedConversationList;
@@ -19,14 +28,122 @@ export function getCachedLastId(): number | null {
   return cachedLastId;
 }
 
-/** 回包即写（conversation-history-list 的 watch 是唯一出口，覆盖首拉/加载更多/静默合并/标记写侧） */
-export function setCachedConversationList(list: UTSJSONObject[], lastId: number | null): void {
+/** 预取与列表更新共用缓存，保存游标和是否到底，避免重开后错误地继续翻页。 */
+export function setCachedConversationList(list: UTSJSONObject[], lastId: number | null, hasMore: boolean): void {
   cachedConversationList = list;
   cachedLastId = lastId;
+  cachedHasMore = hasMore;
+  cachedLoaded = true;
 }
 
 /** 登出（或未登录）清缓存：避免下一个账号先看到上一个账号的任务 */
 export function clearCachedConversationList(): void {
+  cacheGeneration++;
+  preloadPromise = null;
+  cachedLoaded = false;
+  cachedHasMore = false;
   cachedConversationList = [];
   cachedLastId = null;
+}
+
+export function getCachedHasMore(): boolean {
+  return cachedHasMore;
+}
+
+export function hasCachedConversationList(): boolean {
+  return cachedLoaded;
+}
+
+/** 首页初始化预取首屏；打开抽屉时复用同一请求，缓存成功的空列表也算已加载。 */
+export async function prefetchConversationList(): Promise<boolean> {
+  if (cachedLoaded) return true;
+  const pending = preloadPromise;
+  if (pending != null) return await pending;
+  const generation = cacheGeneration;
+  const run = async (): Promise<boolean> => {
+    const params = new ConversationListParams();
+    params.agentId = null;
+    params.lastId = null;
+    params.limit = 20;
+    params.projectFilter = "exclude";
+    const res = await apiAgentConversationList(params);
+    if (generation != cacheGeneration || apiResCode(res) != SUCCESS_CODE) return false;
+    const rows = normalizeConversationList(apiResData<any>(res));
+    let cursor: number | null = null;
+    if (rows.length > 0) {
+      const rawId = rows[rows.length - 1]["id"];
+      const id = rawId != null ? parseFloat(`${rawId}`) : 0;
+      cursor = id == id && id > 0 ? id : null;
+    }
+    setCachedConversationList(rows, cursor, rows.length > 0);
+    return true;
+  };
+  const requestPromise = run().catch((error): boolean => {
+    console.error("prefetchConversationList error:", error);
+    return false;
+  });
+  preloadPromise = requestPromise;
+  try {
+    return await requestPromise;
+  } finally {
+    if (generation == cacheGeneration) preloadPromise = null;
+  }
+}
+
+export function normalizeConversationList(raw: any | null): UTSJSONObject[] {
+  const result: UTSJSONObject[] = [];
+  if (raw == null) {
+    return result;
+  }
+  let items: any[] = [];
+  if (Array.isArray(raw)) {
+    items = raw as any[];
+  } else {
+    try {
+      const jsonStr = JSON.stringify(raw);
+      if (jsonStr != null && jsonStr.length > 0) {
+        const parsed = JSON.parse(jsonStr);
+        if (Array.isArray(parsed)) {
+          items = parsed as any[];
+        }
+      }
+    } catch (_e) {
+      return result;
+    }
+  }
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item == null) {
+      continue;
+    }
+    try {
+      const jsonStr = JSON.stringify(item);
+      if (jsonStr != null && jsonStr.length > 0) {
+        const obj = JSON.parse(jsonStr) as UTSJSONObject | null;
+        if (obj != null) {
+          const agentRaw = obj["agent"];
+          let agentName = "";
+          if (agentRaw != null) {
+            try {
+              const agentStr = JSON.stringify(agentRaw);
+              if (agentStr != null && agentStr.length > 0) {
+                const agentObj = JSON.parse(agentStr) as UTSJSONObject | null;
+                if (agentObj != null) {
+                  const name = agentObj["name"];
+                  agentName = name != null ? `${name}` : "";
+                }
+              }
+            } catch (_3) {
+              agentName = "";
+            }
+          }
+          obj["_agentName"] = agentName;
+          result.push(obj);
+        }
+      }
+    } catch (_e2) {
+      // skip
+    }
+  }
+  return result;
 }

@@ -6,7 +6,7 @@
 import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { jumpToFilePreviewPage } from "@/utils/system.uts";
-import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
+import { applyXClientTypeHeader, isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
 
 const AUTH_PROTECTED_FILE_PATH_RE = /\/api\/f\//i;
 
@@ -76,16 +76,20 @@ export function resolveAuthProtectedFileFetchUrl(url: string): string {
   return `${getApiBaseUrl()}${normalizedPath}`;
 }
 
-/** 构造受保护文件请求所需的 Bearer 头（供 downloadFile / request 复用）。 */
-export function buildAuthProtectedFileHeaders(): UTSJSONObject {
+function buildProtectedFileHeaders(includeClientType: boolean): UTSJSONObject {
   const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
   const token = tokenRaw != null ? `${tokenRaw}` : "";
   const header = {} as UTSJSONObject;
   if (token.length > 0) {
     header["Authorization"] = `Bearer ${token}`;
   }
-  applyXClientTypeHeader(header);
+  if (includeClientType == true) applyXClientTypeHeader(header);
   return header;
+}
+
+/** 构造受保护文件请求所需的 Bearer 头（供 downloadFile / request 复用）。 */
+export function buildAuthProtectedFileHeaders(): UTSJSONObject {
+  return buildProtectedFileHeaders(true);
 }
 
 /** 从绝对 URL 提取 pathname，供 file-preview 使用。 */
@@ -94,6 +98,62 @@ export function extractPathnameFromRemoteUrl(url: string): string {
 }
 
 // #ifdef H5 || WEB
+let protectedImageRequestSeq = 0;
+const protectedImageCallbacks = new Map<string, (url: string) => void>();
+
+/** Android WebView 的 fetch 会把 Bearer 转发到 302 后的对象存储，必须由原生侧读取 Location。 */
+function fetchAndroidProtectedImageRedirect(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    protectedImageRequestSeq += 1;
+    const requestId = `${Date.now()}-${protectedImageRequestSeq}`;
+    const w = window as any;
+    w.__nuwaxProtectedImageResult = (result: any): void => {
+      const obj = result as UTSJSONObject;
+      const idRaw = obj["requestId"];
+      const id = idRaw != null ? `${idRaw}` : "";
+      const callback = protectedImageCallbacks.get(id);
+      if (callback != null) callback(obj["url"] != null ? `${obj["url"]}` : "");
+    };
+    let attempts = 0;
+    let postTimer = 0;
+    const timeout = setTimeout((): void => {
+      protectedImageCallbacks.delete(requestId);
+      if (postTimer != 0) clearTimeout(postTimer);
+      reject(new Error('Protected image redirect timed out'));
+    }, 12000);
+    protectedImageCallbacks.set(requestId, (directUrl: string): void => {
+      protectedImageCallbacks.delete(requestId);
+      clearTimeout(timeout);
+      if (postTimer != 0) clearTimeout(postTimer);
+      if (directUrl.indexOf('https://') == 0) resolve(directUrl);
+      else reject(new Error('Protected image redirect failed'));
+    });
+    const post = (): void => {
+      const payload = { "data": { "type": "protected-image-url", "requestId": requestId, "url": url } };
+      try {
+        const uniGlobal = w.uni;
+        if (uniGlobal != null && uniGlobal.webView != null && uniGlobal.webView.postMessage != null) {
+          uniGlobal.webView.postMessage(payload);
+          return;
+        }
+        if (w.__uniapp_x_postMessage != null) {
+          w.__uniapp_x_postMessage(payload);
+          return;
+        }
+        if (w.__uniapp_x_ != null && w.__uniapp_x_.postMessage != null) {
+          w.__uniapp_x_.postMessage(JSON.stringify(payload));
+          return;
+        }
+      } catch (_e) {
+        // JSSDK 尚未就绪时重试。
+      }
+      attempts += 1;
+      if (attempts < 30) postTimer = setTimeout(post, 100);
+    };
+    post();
+  });
+}
+
 /**
  * H5 用 arraybuffer + blob URL，避免 uni.downloadFile 读取 Content-Disposition。
  * 该头不在 CORS 白名单，跨域未 Expose 时浏览器会报 Refused to get unsafe header。
@@ -147,7 +207,17 @@ function fetchAuthProtectedFileAsObjectUrl(
  */
 export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
   const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
+  // #ifdef H5 || WEB
+  if (isAppWebViewEmbedded() == true && readAppWebViewHostPlatform() == 'android') {
+    return fetchAndroidProtectedImageRedirect(fetchUrl);
+  }
+  // /api/f/ 图片会重定向到对象存储，其 CORS 白名单不含 X-Client-Type。
+  // 保留 Bearer 鉴权，避免浏览器把额外请求头带到重定向目标导致预检失败。
+  const header = buildProtectedFileHeaders(false);
+  // #endif
+  // #ifndef H5 || WEB
   const header = buildAuthProtectedFileHeaders();
+  // #endif
 
   // #ifdef H5 || WEB
   return fetchAuthProtectedFileAsObjectUrl(fetchUrl, header);

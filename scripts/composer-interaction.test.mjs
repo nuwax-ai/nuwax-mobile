@@ -149,7 +149,7 @@ test('组件状态机：关闭不删草稿、重新聚焦不重开、离开选�
   assert.equal(context.editorIndexedText, '@文');
 });
 
-test('两种原生宿主的键盘脚本：三平台全部组合可解析', () => {
+test('两种原生宿主的键盘脚本：iOS 只传高度，三平台组合均可解析', () => {
   const { buildComposerKeyboardResolverScript } = load('composerKeyboardLayout', ['buildComposerKeyboardResolverScript']);
   for (const file of ['components/resident-chat-shell/resident-chat-shell.uvue', 'subpackages/pages/agent-detail/agent-detail.uvue']) {
     const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8');
@@ -168,8 +168,11 @@ test('两种原生宿主的键盘脚本：三平台全部组合可解析', () =>
       for (const height of [0, 320]) for (const dom of [false, true]) for (const emit of [false, true]) {
         const generated = context.buildKeyboardHeightInjectCode(height, 24, dom, emit);
         new vm.Script(generated);
-        // 聚焦不再写估算键盘高度或预先锁住页面，防首次白屏及外接键盘残留锁。
-        if (platform != 'APP-ANDROID') assert.ok(generated.includes('window.__nuwaxKbPredictOpen=function(){};'));
+        if (platform === 'APP-IOS') {
+          assert.doesNotMatch(generated, /__nuwaxKb(?:ApplyCover|LockDoc|PredictOpen|UnlockPage|ResolveCover|SyncNav)/);
+          assert.doesNotMatch(generated, /querySelectorAll\('\.keyboard-cover'\)|window\.scrollTo\(/);
+        }
+        if (platform === 'APP-HARMONY') assert.ok(generated.includes('window.__nuwaxKbPredictOpen=function(){};'));
       }
     }
   }

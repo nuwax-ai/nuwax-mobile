@@ -7,9 +7,11 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { sourceFingerprint, verifyResourcePackage } from './offline-h5/package-files.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const hxRoot = process.env.HX_APP_ROOT || '/Applications/HBuilderX.app/Contents/HBuilderX';
+// HX 根：env 优先；否则按「经 HBuilderX 内置 node 运行」推导（plugins/node/node[.exe] 上溯三级，
+// Windows/Mac 同深度），最后回落 Mac 默认。Windows 下 node 二进制须带 .exe 后缀。
+const hxRoot = process.env.HX_APP_ROOT || path.resolve(process.execPath, '..', '..', '..');
 const compiler = path.join(hxRoot, 'plugins/uniapp-cli-vite/node_modules/@dcloudio/vite-plugin-uni/bin/uni.js');
-const node = path.join(hxRoot, 'plugins/node/node');
+const node = path.join(hxRoot, 'plugins/node/node') + (process.platform === 'win32' ? '.exe' : '');
 const webOutput = path.join(root, 'unpackage/offline-h5-web');
 const before = sourceFingerprint(root);
 const stage = path.join(root, 'unpackage/offline-h5');
@@ -59,7 +61,10 @@ function copyProjectInput() {
   }
   fs.writeFileSync(path.join(buildRoot, 'pages.json'), JSON.stringify(OFFLINE_PAGES, null, 2));
   const modules = path.join(root, 'node_modules');
-  if (fs.existsSync(modules)) fs.symlinkSync(modules, path.join(buildRoot, 'node_modules'), 'dir');
+  if (fs.existsSync(modules)) {
+    // Windows 普通权限创建目录符号链接需开发者模式/管理员（EPERM），junction 等效且免特权
+    fs.symlinkSync(modules, path.join(buildRoot, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+  }
 }
 
 fs.mkdirSync(path.dirname(stage), { recursive: true });

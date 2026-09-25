@@ -114,9 +114,13 @@ if [[ -n "$PINNED_VERSION" ]]; then
 else
   info "未指定版本，解析最新 channel '${CHANNEL}' ..."
   fetch "$base/channels/$CHANNEL.json" "$TMP/channel.json" || fail "无法读取 channel: $base/channels/$CHANNEL.json（是否已发布过？）"
+  # Windows(Git Bash)：/tmp/... 路径传给 Windows node.exe 会 require 失败返回空，
+  # 因此 node 解析为空时统一回落到 sed（原 else 分支只覆盖"无 node"场景）。
+  VERSION=""
   if command -v node >/dev/null 2>&1; then
     VERSION="$(node -p "require('$TMP/channel.json').version" 2>/dev/null || true)"
-  else
+  fi
+  if [[ -z "$VERSION" ]]; then
     VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/channel.json" | head -1)"
   fi
   [[ -n "${VERSION}" ]] || fail "channel 无 version 字段"

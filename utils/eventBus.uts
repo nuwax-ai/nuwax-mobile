@@ -1,38 +1,28 @@
 /**
  * 事件总线封装
- * 
+ *
  * 对外提供与 PC 端一致的 API：on / off / emit / once
- * 内部使用 uni-app x 原生事件系统：uni.$on / uni.$off / uni.$emit / uni.$once
- * 
+ * ★内部不再走 uni.$on/$emit，改为纯 UTS 自有订阅表：
+ * App-Android 上经本封装注册的订阅者在 uni.$emit 后不被调用（IM 实时链路
+ * 真机两轮实锤：调用点展开与显式单实参两种调用形态均零触发，页面级与
+ * App 级订阅一致失效；同仓库裸 uni.$on/$emit 的单实参用法正常）。自有表
+ * 分发为纯 UTS 逻辑，iOS/Android/H5 三端行为一致：同步分发、注册序调用、
+ * 单载荷传参——与 iOS 已验证行为完全一致。裸 uni.$on 直用的监听名与本总线
+ * 事件名无交集，两套互不受影响。
+ *
  * 参考文档：https://doc.dcloud.net.cn/uni-app-x/api/event-bus.html
  */
 
 type EventCallback = (...args: any[]) => void;
-type UniEventHandler = (event: any) => void;
 
 /**
  * 事件总线类
- * 封装 uni-app 原生事件 API，提供统一接口
  */
 class EventBus {
-  private callbackWrappers = new Map<EventCallback, UniEventHandler>();
-
-  /**
-   * 将业务回调包装为 uni.$on 可接受的函数类型。
-   * 同时缓存映射，确保 off 时能传入同一引用。
-   */
-  private getWrapper(callback: EventCallback): UniEventHandler {
-    const existing = this.callbackWrappers.get(callback);
-    if (existing != null) {
-      return existing;
-    }
-
-    const wrapper: UniEventHandler = (event: any) => {
-      callback(event);
-    };
-    this.callbackWrappers.set(callback, wrapper);
-    return wrapper;
-  }
+  /** 订阅表：eventName → 回调列表（注册序）。 */
+  private listeners = new Map<string, EventCallback[]>();
+  /** once 标记：触发前先注销（Kotlin 不支持闭包自引用，用标记表实现）。 */
+  private onceFlags = new Set<EventCallback>();
 
   /**
    * 订阅事件
@@ -40,38 +30,61 @@ class EventBus {
    * @param callback 回调函数
    */
   on(eventName: string, callback: EventCallback): void {
-    uni.$on(eventName, this.getWrapper(callback));
+    const list = this.listeners.get(eventName);
+    if (list != null) {
+      list.push(callback);
+      return;
+    }
+    const arr: EventCallback[] = [];
+    arr.push(callback);
+    this.listeners.set(eventName, arr);
   }
 
   /**
-   * 取消订阅事件
+   * 取消订阅
    * @param eventName 事件名称
-   * @param callback 回调函数
+   * @param callback 回调函数（须与 on 时同一引用）
    */
   off(eventName: string, callback: EventCallback): void {
-    const wrapper = this.callbackWrappers.get(callback);
-    if (wrapper != null) {
-      uni.$off(eventName, wrapper);
-      this.callbackWrappers.delete(callback);
+    this.onceFlags.delete(callback);
+    const list = this.listeners.get(eventName);
+    if (list == null) {
+      return;
+    }
+    const idx = list.indexOf(callback);
+    if (idx < 0) {
+      return;
+    }
+    list.splice(idx, 1);
+    if (list.length == 0) {
+      this.listeners.delete(eventName);
     }
   }
 
   /**
    * 发布事件
    * @param eventName 事件名称
-   * @param args 参数
+   * @param args 参数（仓库内调用方均为单载荷）
    */
   emit(eventName: string, ...args: any[]): void {
-    // ★App-Android（Kotlin）调用点展开 `uni.$emit(name, ...args)` 分发失效：
-    // emit 后所有 uni.$on 订阅者不被调用（IM 实时链路真机实锤：3002/6001 帧已
-    // 进 handleMessage 且 dispatch 正常，页面/角标处理器零触发；同仓库其余显式
-    // 单实参 uni.$emit 调用在 Android 一直正常）。Swift/H5 端展开与单实参等价，
-    // 统一改为显式单实参——现有调用方均为单载荷 emit，各端语义不变。
-    if (args.length > 0) {
-      uni.$emit(eventName, args[0]);
-    } else {
-      // 零参兜底：null 显式传参（同 ai-msg-parser 先例），规避可选参在 Kotlin 的空缺省
-      uni.$emit(eventName, null);
+    const list = this.listeners.get(eventName);
+    if (list == null || list.length == 0) {
+      return;
+    }
+    // 快照遍历：回调内 off（自身或其他订阅）不影响本轮已入快照的分发
+    const snapshot: EventCallback[] = [];
+    for (let i = 0; i < list.length; i++) {
+      snapshot.push(list[i]);
+    }
+    // 单载荷传参：与原 uni.$emit 路径在 iOS 上实际送达的形态一致
+    const payload = args.length > 0 ? args[0] : null;
+    for (let i = 0; i < snapshot.length; i++) {
+      const cb = snapshot[i];
+      if (this.onceFlags.has(cb)) {
+        this.onceFlags.delete(cb);
+        this.off(eventName, cb);
+      }
+      cb(payload);
     }
   }
 
@@ -81,12 +94,8 @@ class EventBus {
    * @param callback 回调函数
    */
   once(eventName: string, callback: EventCallback): void {
-    const wrapper: UniEventHandler = (event: any) => {
-      this.callbackWrappers.delete(callback);
-      callback(event);
-    };
-    this.callbackWrappers.set(callback, wrapper);
-    uni.$once(eventName, wrapper);
+    this.onceFlags.add(callback);
+    this.on(eventName, callback);
   }
 }
 

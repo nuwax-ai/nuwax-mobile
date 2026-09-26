@@ -8,10 +8,38 @@ import { execFileSync } from 'node:child_process';
 import { sourceFingerprint, verifyResourcePackage } from './offline-h5/package-files.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // HX 根：env 优先；否则按「经 HBuilderX 内置 node 运行」推导（plugins/node/node[.exe] 上溯三级，
-// Windows/Mac 同深度），最后回落 Mac 默认。Windows 下 node 二进制须带 .exe 后缀。
-const hxRoot = process.env.HX_APP_ROOT || path.resolve(process.execPath, '..', '..', '..');
-const compiler = path.join(hxRoot, 'plugins/uniapp-cli-vite/node_modules/@dcloudio/vite-plugin-uni/bin/uni.js');
-const node = path.join(hxRoot, 'plugins/node/node') + (process.platform === 'win32' ? '.exe' : '');
+// Windows/Mac 同深度），最后回落各平台默认安装路径——用系统 node（nvm/fnm/系统包）直接跑
+// 本脚本时推导必然落空，回落缺位会 spawn 出 <node 版本目录>/plugins/node/node 并 ENOENT。
+// Windows 下 node 二进制须带 .exe 后缀。
+const exe = (name) => name + (process.platform === 'win32' ? '.exe' : '');
+const hxNode = (base) => path.join(base, 'plugins/node', exe('node'));
+const hxCompiler = (base) => path.join(base, 'plugins/uniapp-cli-vite/node_modules/@dcloudio/vite-plugin-uni/bin/uni.js');
+const DEFAULT_HX_ROOTS = {
+  darwin: ['/Applications/HBuilderX.app/Contents/HBuilderX'],
+  win32: ['C:/Program Files/HBuilderX', 'D:/HBuilderX'],
+}[process.platform] || [];
+
+function resolveHxRoot() {
+  // 显式 HX_APP_ROOT 不再回落：写错了要报出来，而不是静默换一个 HBuilderX 编译
+  const candidates = process.env.HX_APP_ROOT
+    ? [process.env.HX_APP_ROOT]
+    : [path.resolve(process.execPath, '..', '..', '..'), ...DEFAULT_HX_ROOTS];
+  const found = candidates.find((base) => fs.existsSync(hxNode(base)) && fs.existsSync(hxCompiler(base)));
+  if (found == null) {
+    throw new Error(
+      `未找到 HBuilderX 编译器，已尝试：${candidates.join(', ')}\n` +
+      '请设置 HX_APP_ROOT 指向 HBuilderX 安装目录（Mac 通常是 /Applications/HBuilderX.app/Contents/HBuilderX）',
+    );
+  }
+  return found;
+}
+
+const hxRoot = resolveHxRoot();
+const compiler = hxCompiler(hxRoot);
+const node = hxNode(hxRoot);
+// 派生步骤同样用这套 HBuilderX 里的 esbuild，避免两步落在不同安装上
+const esbuildBin = process.env.ESBUILD_BIN
+  || path.join(hxRoot, 'plugins/uniapp-cli-vite/node_modules/.bin', process.platform === 'win32' ? 'esbuild.cmd' : 'esbuild');
 const webOutput = path.join(root, 'unpackage/offline-h5-web');
 const before = sourceFingerprint(root);
 const stage = path.join(root, 'unpackage/offline-h5');
@@ -74,7 +102,7 @@ try {
   execFileSync(node, [compiler, 'build', '-p', 'h5'], { cwd: buildRoot, stdio: 'inherit', env: { ...process.env, NODE_ENV: 'production', HX_APP_ROOT: hxRoot, UNI_INPUT_DIR: buildRoot, UNI_OUTPUT_DIR: webOutput, UNI_APP_X: 'true', UNI_PLATFORM: 'h5', UNI_UTS_PLATFORM: 'web', RUN_BY_HBUILDERX: '1' } });
   if (sourceFingerprint(root) !== before) throw new Error('源码在编译期间发生变化，请重新构建');
   fs.writeFileSync(path.join(root, 'unpackage/offline-h5-source.json'), JSON.stringify({ sourceFingerprint: before }));
-  execFileSync(process.execPath, [path.join(root, 'scripts/offline-h5/derive-uni-app-x.mjs')], { stdio: 'inherit', env: { ...process.env, WEB_DIST: webOutput } });
+  execFileSync(process.execPath, [path.join(root, 'scripts/offline-h5/derive-uni-app-x.mjs')], { stdio: 'inherit', env: { ...process.env, WEB_DIST: webOutput, ESBUILD_BIN: esbuildBin } });
   verifyResourcePackage(stage);
   // 打包成功后清理中间 Web 产物（仅派生排查时需要，OFFLINE_H5_KEEP_WEB=1 可保留现场）
   if (process.env.OFFLINE_H5_KEEP_WEB !== '1') fs.rmSync(webOutput, { recursive: true, force: true });

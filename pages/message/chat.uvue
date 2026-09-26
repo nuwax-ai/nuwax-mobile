@@ -56,7 +56,7 @@
       <view v-if="loadingOlder" class="chat-foot">
         <text class="chat-foot__text">{{ t("Mobile.Page.loadingMore") }}</text>
       </view>
-      <view v-else-if="messages.length > 0 && hasMore != true" class="chat-foot">
+      <view v-else-if="listSettled && messages.length > 0 && hasMore != true" class="chat-foot">
         <text class="chat-foot__text">{{ t("Mobile.Message.noMore") }}</text>
       </view>
 
@@ -78,6 +78,7 @@
         v-for="msg in messages"
         :key="msg.msgId"
         :id="'msg-' + msg.msgId"
+        class="chat-msg"
         :class="msgRowClass(msg)"
         @touchstart="handleMsgTouchStart(msg, $event)"
         @touchmove="handleMsgTouchMove($event)"
@@ -832,7 +833,13 @@
   import { EVENT_TYPE } from "@/constants/event.constants";
   import { writeClipboardText } from "@/utils/clipboard.uts";
   import { collectChatAttachments, resetChatAttachments } from "@/utils/imChatAttachments";
-  import { getCachedChatRecords, setCachedChatRecords } from "@/utils/im/imChatCache";
+  import {
+    ChatScrollMemo,
+    getCachedChatRecords,
+    getCachedChatScroll,
+    setCachedChatRecords,
+    setCachedChatScroll,
+  } from "@/utils/im/imChatCache";
   import { isAuthProtectedFileUrl, openAuthProtectedLinkUrl } from "@/utils/authProtectedFileUrl";
   import { generateUUID } from "@/utils/common";
   import { uploadSingleFile } from "@/utils/fileUploader";
@@ -1042,24 +1049,12 @@
   const hasMore = ref<boolean>(false);
   const loadingOlder = ref<boolean>(false);
   const scrollAnchor = ref<string>("");
-
-  // ===== 列表滚动中抑制气泡按压态（message.uvue 同款节流方案） =====
-  // 快速滑动（含惯性滚动）期间消息气泡不显示 hover 背景色，滚动停止 ~160ms 后恢复。
-  const chatScrolling = ref<boolean>(false);
-  let chatScrollIdleTimer = 0;
-
-  function handleChatScroll(): void {
-    if (chatScrolling.value != true) {
-      chatScrolling.value = true;
-    }
-    if (chatScrollIdleTimer != 0) {
-      clearTimeout(chatScrollIdleTimer);
-    }
-    chatScrollIdleTimer = setTimeout(() => {
-      chatScrollIdleTimer = 0;
-      chatScrolling.value = false;
-    }, 160);
-  }
+  // 进页定位遮蔽：首屏渲染后 scroll-into-view 跳底（含 150ms 稳定重定位）期间消息行
+  // opacity:0 遮蔽（布局保留，锚点照常计算），定位稳定后揭幕——用户看到的第一帧
+  // 就已在底部，消除「顶部→底部」跳变与二次跳变的可见闪动（飞书式进页观感）。
+  // loading/失败/空态在 v-for 外不受遮蔽；后续 scrollToBottom（发消息/WS/键盘）时
+  // listSettled 已为 true，行为与之前完全一致。
+  const listSettled = ref<boolean>(false);
 
   // ===== 滑动吞击守卫 =====
   // Android 上滑动手势的 touchup 可能被判定为 click：快速滑动消息列表后手指落在
@@ -1373,13 +1368,17 @@
    * ★仅模板调用（模板绑定不受 UTS「先定义后使用」约束）。
    */
   function msgRowClass(msg: ImMsgRow): string {
+    let cls = "";
     if (highlightId.value == msg.msgId) {
-      return "chat-msg--flash";
+      cls = "chat-msg--flash";
+    } else if (pinInfoOf(msg) != null) {
+      cls = "chat-msg--pinned";
     }
-    if (pinInfoOf(msg) != null) {
-      return "chat-msg--pinned";
+    // 进页定位遮蔽期：叠加 veiled（仅视觉隐藏，布局参与 scroll-into-view 定位）
+    if (listSettled.value != true) {
+      cls = cls.length > 0 ? `${cls} chat-msg--veiled` : "chat-msg--veiled";
     }
-    return "";
+    return cls;
   }
 
   /** URL 是否指向图片（按扩展名兜底，mime 缺失时用）。 */
@@ -2532,24 +2531,155 @@
       });
   }
 
-  function scrollToBottom(): void {
+  /** 距底余量阈值（px）：离开时距底小于该值视为「在底部」，进页直接滚最新。 */
+  const NEAR_BOTTOM_PX = 120;
+
+  /**
+   * 锚点定位 + 稳定重定位 + 揭幕（滚底 / 阅读位置恢复共用）。
+   * App 端原生布局异步完成：一拍 nextTick 后 scroll-into-view 可能仍早于内容
+   * 高度稳定（首屏整页消息/卡片渲染时定位失效，系统通知页全是卡片最明显）——
+   * 再补一拍延时清空重设同一锚点，强制 scroll-view 重新定位。期间锚点被其它
+   * 滚动逻辑改走（如翻页定位 msg-*）则不抢。遮蔽期（listSettled=false）内
+   * 全部跳变不可见，定位稳定后揭幕。
+   */
+  function scrollToAnchorWithSettle(anchorId: string): void {
     scrollAnchor.value = "";
     nextTick(() => {
-      scrollAnchor.value = "chat-bottom";
-      // App 端原生布局异步完成：一拍 nextTick 后 scroll-into-view 可能仍早于内容
-      // 高度稳定（首屏整页消息/卡片渲染时定位失效，系统通知页全是卡片最明显）——
-      // 再补一拍延时清空重设同一锚点，强制 scroll-view 重新定位。期间锚点被其它
-      // 滚动逻辑改走（如翻页定位 msg-*）则不抢；本函数所有调用点语义都是"去最新"，
-      // 拉回底部即期望行为。
+      scrollAnchor.value = anchorId;
       setTimeout(() => {
-        if (scrollAnchor.value == "chat-bottom") {
+        const revealList = (): void => {
+          if (listSettled.value != true) {
+            listSettled.value = true;
+          }
+        };
+        if (scrollAnchor.value == anchorId) {
           scrollAnchor.value = "";
           nextTick(() => {
-            scrollAnchor.value = "chat-bottom";
+            scrollAnchor.value = anchorId;
+            // 重定位与揭幕同帧应用：遮蔽期内的全部跳变对用户不可见
+            revealList();
           });
+        } else {
+          // 锚点被其它定位逻辑改走（翻页锚 msg-* 等）：不再抢锚，但仍要揭幕
+          revealList();
         }
       }, 150);
     });
+  }
+
+  function scrollToBottom(): void {
+    scrollToAnchorWithSettle("chat-bottom");
+  }
+
+  /**
+   * 恢复上次阅读位置（飞书式）：进页缓存命中且离开时不在底部时调用。
+   * 直接按保存时记下的首可见行 msgId 走 scrollToAnchorWithSettle 锚定（行级精度，
+   * 对图片加载等高度变化天然免疫）；行已不在缓存窗口（上次翻页后退出）时锚到
+   * 最旧行，scrolltoupper 会自动续拉更早消息。
+   */
+  function restoreScrollPosition(anchorId: string): void {
+    const msgs = messages.value;
+    let anchorIdx = -1;
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].msgId == anchorId) {
+        anchorIdx = i;
+        break;
+      }
+    }
+    if (anchorIdx < 0) {
+      anchorIdx = 0;
+    }
+    scrollToAnchorWithSettle(`msg-${msgs[anchorIdx].msgId}`);
+  }
+
+  /**
+   * 离开页面（返回/进子页/切后台）时记忆阅读位置：首可见行 msgId + 距底余量。
+   * ★不依赖 scrollOffset/fields 取 scrollTop——真机实测该族查询在 App 端
+   *   拿不到字段值；只用 boundingClientRect 的
+   *   top/height（视口坐标实时值）判定首可见行，恢复侧直接锚定该行。
+   * 键盘/面板展开时视口高度失真，跳过本次记忆（保留上次有效值）。
+   */
+  function saveScrollMemo(): void {
+    if (convId.value.length == 0 || messages.value.length == 0 || listSettled.value != true) {
+      return;
+    }
+    if (keyboardHeight.value > 0 || panelMode.value.length > 0 || expandPanel.value.length > 0) {
+      return;
+    }
+    const query = uni.createSelectorQuery();
+    query.select(".chat-body").boundingClientRect();
+    query.select("#chat-bottom").boundingClientRect();
+    query.selectAll(".chat-msg").boundingClientRect();
+    query.exec((results: Array<any>) => {
+      const msgs = messages.value;
+      if (results.length < 3 || results[0] == null || results[1] == null || results[2] == null || msgs.length == 0) {
+        return;
+      }
+      const bodyRect = results[0] as NodeInfo;
+      const endRect = results[1] as NodeInfo;
+      const rows = results[2] as NodeInfo[];
+      if (rows.length == 0) {
+        return;
+      }
+      if (bodyRect.top == null || bodyRect.height == null || endRect.top == null) {
+        return;
+      }
+      const bodyTop = parseFloat(`${bodyRect.top}`);
+      const bodyBottom = bodyTop + parseFloat(`${bodyRect.height}`);
+      // 距底余量 = 内容底（视口坐标）- 视口底：向上滑看历史时为正，在底部 ≈ 0
+      // （★符号勿写反：写反会算出负数被 clamp 成 0，进页误判「上次在底部」直接滚底）
+      let distBottom = parseFloat(`${endRect.top}`) - bodyBottom;
+      if (distBottom < 0) {
+        distBottom = 0;
+      }
+      // 首可见行 = 首个底边（top+height，视口坐标）超过视口顶的行；找不到兜底最旧行
+      let anchorId = "";
+      for (let i = 0; i < rows.length && i < msgs.length; i++) {
+        const r = rows[i];
+        if (r.top == null || r.height == null) {
+          continue;
+        }
+        if (parseFloat(`${r.top}`) + parseFloat(`${r.height}`) > bodyTop + 2) {
+          anchorId = msgs[i].msgId;
+          break;
+        }
+      }
+      if (anchorId.length == 0) {
+        anchorId = msgs[0].msgId;
+      }
+      const memo = new ChatScrollMemo();
+      memo.anchorId = anchorId;
+      memo.distBottom = distBottom;
+      setCachedChatScroll(convId.value, memo);
+    });
+  }
+
+  // ===== 列表滚动中抑制气泡按压态（message.uvue 同款节流方案） =====
+  // 快速滑动（含惯性滚动）期间消息气泡不显示 hover 背景色，滚动停止 ~160ms 后恢复。
+  const chatScrolling = ref<boolean>(false);
+  let chatScrollIdleTimer = 0;
+  // 滚动停稳后防抖记忆阅读位置（主记忆时机；onHide 兜底——返回销毁途中
+  // selectorQuery 的 exec 回调可能不落地，光靠 onHide 会丢）
+  let scrollMemoSaveTimer = 0;
+
+  function handleChatScroll(): void {
+    if (chatScrolling.value != true) {
+      chatScrolling.value = true;
+    }
+    if (chatScrollIdleTimer != 0) {
+      clearTimeout(chatScrollIdleTimer);
+    }
+    chatScrollIdleTimer = setTimeout(() => {
+      chatScrollIdleTimer = 0;
+      chatScrolling.value = false;
+    }, 160);
+    if (scrollMemoSaveTimer != 0) {
+      clearTimeout(scrollMemoSaveTimer);
+    }
+    scrollMemoSaveTimer = setTimeout(() => {
+      scrollMemoSaveTimer = 0;
+      saveScrollMemo();
+    }, 500);
   }
 
   /**
@@ -4234,6 +4364,14 @@
     }
   }
 
+  /** 静默同步完成后：进页时在底部的场景补滚到真最新（同步可能追加了新消息）。 */
+  async function settleAfterSync(needBottom: boolean): Promise<void> {
+    await silentSyncLatest();
+    if (needBottom) {
+      scrollToBottom();
+    }
+  }
+
   async function initHistory(): Promise<void> {
     if (loading.value) {
       return;
@@ -4255,10 +4393,18 @@
       for (let i = 0; i < messages.value.length; i++) {
         resolveRowMedia(messages.value[i]);
       }
-      scrollToBottom();
+      // 阅读位置记忆（飞书式）：离开时不在底部 → 恢复到该位置；在底部/无记忆 → 滚最新，
+      // 且静默同步补齐新消息后再补滚一次（避免停在旧内容的"假底部"）
+      const scrollMemo = getCachedChatScroll(convId.value);
+      if (scrollMemo != null && scrollMemo.anchorId.length > 0 && scrollMemo.distBottom > NEAR_BOTTOM_PX) {
+        restoreScrollPosition(scrollMemo.anchorId);
+        settleAfterSync(false);
+      } else {
+        scrollToBottom();
+        settleAfterSync(true);
+      }
       reportReadIfNeeded(maxSeq());
       refreshReadStatus();
-      silentSyncLatest();
       return;
     }
     loading.value = true;
@@ -4270,6 +4416,8 @@
     } catch (_error) {
       loading.value = false;
       loadFailed.value = true;
+      // 异常路径没有走 scrollToBottom 的揭幕：直接揭，避免失败/空态被遮蔽卡住
+      listSettled.value = true;
     }
   }
 
@@ -4451,6 +4599,10 @@
       clearTimeout(kbScrollTimer);
       kbScrollTimer = 0;
     }
+    if (scrollMemoSaveTimer != 0) {
+      clearTimeout(scrollMemoSaveTimer);
+      scrollMemoSaveTimer = 0;
+    }
     if (rowPressTimer != 0) {
       clearTimeout(rowPressTimer);
       rowPressTimer = 0;
@@ -4493,6 +4645,8 @@
 
   onHide(() => {
     pageVisible = false;
+    // 返回/进子页/切后台时记忆阅读位置（下次进页恢复）
+    saveScrollMemo();
   });
 
   onReady(() => {
@@ -4904,6 +5058,11 @@
   .chat-msg--pinned {
     background-color: #fff6df;
     border-radius: 12rpx;
+  }
+
+  /* 进页定位遮蔽：布局保留（scroll-into-view 需要真实高度），仅视觉隐藏 */
+  .chat-msg--veiled {
+    opacity: 0;
   }
 
   /* Pin 署名行：pin icon + 操作人署名（飞书式左对齐，随气泡列） */

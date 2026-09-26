@@ -60,6 +60,10 @@ const IM_RECONNECT_BACKOFF_MS: Array<number> = [
 /** 重连最大连续失败次数（超过后停止重连，避免无意义死循环）。 */
 const IM_RECONNECT_MAX_FAILURES = 30;
 
+/** token 未就绪时的重试节奏（毫秒）与次数上限（约 1 分钟内每 3s 一次）。 */
+const IM_TOKEN_RETRY_INTERVAL_MS = 3000;
+const IM_TOKEN_RETRY_MAX = 20;
+
 function imLog(msg: string): void {
   if (IM_WS_DEBUG) {
     console.log(`[ImWs] ${msg}`);
@@ -129,6 +133,10 @@ class ImWsClientImpl {
   private pingTimerId: number | null = null;
   /** 重连定时器 id（用于取消）。 */
   private reconnectTimerId: number | null = null;
+  /** token 未就绪重试定时器：冷启动 onLaunch/onShow 早于静默续登写回 token 的竞态兜底。 */
+  private tokenRetryTimerId: number | null = null;
+  /** token 重试计数（连上后归零；超限停止，等下一次 foreground/网络事件再触发）。 */
+  private tokenRetryCount: number = 0;
   /** 后台标记（onHide 暂停心跳但不关 socket）。 */
   private inBackground: boolean = false;
   /** 是否主动 close（区分主动 vs 异常，避免误重连）。 */
@@ -148,6 +156,8 @@ class ImWsClientImpl {
     const token = readAccessToken();
     if (token.length == 0) {
       imLog("start: no token, skip connect");
+      // 冷启动竞态：静默续登/登录弹窗尚未把 token 写回 storage → 定时重试等它落地
+      this.scheduleTokenRetry();
       return;
     }
     this.manualClosed = false;
@@ -159,6 +169,7 @@ class ImWsClientImpl {
     imLog("stop");
     this.manualClosed = true;
     this.cancelReconnect();
+    this.cancelTokenRetry();
     this.stopPingLoop();
     const adapter = this.adapter;
     if (adapter != null) {
@@ -258,8 +269,10 @@ class ImWsClientImpl {
     const token = readAccessToken();
     if (token.length == 0) {
       imLog("connect: no token, skip");
+      this.scheduleTokenRetry();
       return;
     }
+    this.cancelTokenRetry();
     const url = buildImWsUrl(token);
     const headers = buildImWsHeaders(token);
     imLog(`connect: ${url}`);
@@ -460,6 +473,45 @@ class ImWsClientImpl {
       }
       this.reconnectTimerId = null;
     }
+  }
+
+  // ---------------- token 未就绪兜底 ----------------
+
+  /**
+   * 冷启动竞态兜底：onLaunch/首次 onShow 读 storage 拿不到 token（静默续登/登录
+   * 弹窗的 HTTP 往返还没把 token 写回），connect() 直接 skip 后整段前台会话再无
+   * 触发点 → WS 全程不连，实时链路整体失效（Android 真机实锤：冷启动后 6 分钟
+   * 无一条 WS 连接日志，切一次前后台才恢复）。落地前每 3s 重试一次，上限 20 次。
+   * iOS 上 token 在 onLaunch 即就绪时本路径恒不触发，行为与现状完全一致。
+   */
+  private scheduleTokenRetry(): void {
+    if (this.manualClosed || this.tokenRetryTimerId != null) {
+      return;
+    }
+    if (this.tokenRetryCount >= IM_TOKEN_RETRY_MAX) {
+      return;
+    }
+    this.tokenRetryCount += 1;
+    imLog(
+      `token not ready, retry ${this.tokenRetryCount}/${IM_TOKEN_RETRY_MAX} in ${IM_TOKEN_RETRY_INTERVAL_MS}ms`,
+    );
+    this.tokenRetryTimerId = setTimeout((): void => {
+      this.tokenRetryTimerId = null;
+      this.connect();
+    }, IM_TOKEN_RETRY_INTERVAL_MS);
+  }
+
+  private cancelTokenRetry(): void {
+    const timerId = this.tokenRetryTimerId;
+    if (timerId != null) {
+      try {
+        clearTimeout(timerId);
+      } catch (_e) {
+        // ignore
+      }
+      this.tokenRetryTimerId = null;
+    }
+    this.tokenRetryCount = 0;
   }
 
   // ---------------- HTTP 兜底 ----------------

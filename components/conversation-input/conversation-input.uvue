@@ -609,7 +609,7 @@
 <script lang="uts" setup>
   import { buildEditorAtomicReplacementScript, applyEditorAtomicReplacementInWeb, resolveWebComposerQuill } from "@/utils/editorAtomicReplacement";
   import { detectComposerQuickTrigger } from "@/utils/composerQuickTrigger";
-  import { observeWebComposer, buildComposerEditorObserverScript } from "@/utils/composerEditorObserver";
+  import { observeWebComposer, measureWebComposerLayout, buildComposerEditorObserverScript } from "@/utils/composerEditorObserver";
   import SkillSelectModal from "./skill-select-modal/skill-select-modal.uvue";
   import SkillTagsBar from "./skill-tags-bar/skill-tags-bar.uvue";
   import { SkillInfoForAt } from "@/types/interfaces/skill";
@@ -733,16 +733,13 @@
   let editorContext: EditorContext | null = null;
   const editorReady = ref<boolean>(false);
   const editorDelta = ref<any | null>(null);
-  // App 原生 editor 不支持 CSS line-height（Android 编译器会明确告警），实际行距约 34rpx。
-  // 用 34rpx 行增量 + 26rpx 首行内边距可保持单行 60rpx，并在 196rpx 时完整显示 5 行。
-  const EDITOR_LINE_HEIGHT_RPX = 34;
-  const EDITOR_VERTICAL_INSET_RPX = 26;
   const EDITOR_MAX_LINES = 5;
-  // 首页输入区可用宽度约可容纳 22 个全角字符；半角英文/数字约占 0.55 个全角宽度。
-  // 不能直接按 string.length / 20，否则英文约 3 行时就会被误判为 5 行并提前滚动。
-  const EDITOR_WRAP_UNITS_PER_LINE = 22;
-  const EDITOR_MIN_HEIGHT_RPX = EDITOR_LINE_HEIGHT_RPX + EDITOR_VERTICAL_INSET_RPX;
-  const editorHeightRpx = ref<number>(EDITOR_MIN_HEIGHT_RPX);
+  // 首帧采用一行占位；ready 后以各端 Quill 的真实行高和内边距替换。
+  const EDITOR_MIN_HEIGHT_PX = 24;
+  const editorHeightPx = ref<number>(EDITOR_MIN_HEIGHT_PX);
+  const editorSingleHeightPx = ref<number>(EDITOR_MIN_HEIGHT_PX);
+  const editorMaxHeightPx = ref<number>(120);
+  let requestEditorLayout: (() => void) | null = null;
   const componentInstance = getCurrentInstance();
   let lastEditorText: string = "";
   let lastEditorRawText: string = "";
@@ -897,9 +894,6 @@
       }
     } else if (keyboardHeight.value > 0) {
       keyboardHeight.value = 0;
-      // #ifdef APP-ANDROID
-      scheduleAndroidEditorDefocus();
-      // #endif
     }
     if (isInputFocused.value) {
       // 已抬起后降频轮询（等打开动画期间用快频），只需捕捉收起沿
@@ -925,7 +919,6 @@
    * 切语音后 textarea 已卸载，系统收起键盘仍会走这里。
    */
   function onAppKeyboardHeightChange(res: any): void {
-    const hadVisibleKeyboard = keyboardHeight.value > 0;
     let h = 0;
     try {
       const obj = res as UTSJSONObject;
@@ -945,9 +938,6 @@
       keyboardHeight.value = 0;
       // #ifdef APP-ANDROID || APP-HARMONY || APP-IOS
       homeKeyboardOffset.value = 0;
-      // #endif
-      // #ifdef APP-ANDROID
-      if (hadVisibleKeyboard) scheduleAndroidEditorDefocus();
       // #endif
     }
   }
@@ -1065,6 +1055,12 @@
       // #endif
       // #ifndef MP
       if (editorContext != null) editorContext!.blur(null);
+      // #endif
+      // #ifdef H5 || WEB
+      // 离线 H5 的 contenteditable 可能仍持有 DOM 焦点，显式释放编辑器焦点。
+      const active = document.activeElement as any;
+      const container = document.getElementById("chat-input-editor");
+      if (active != null && container != null && container.contains(active)) active.blur();
       // #endif
     } catch (_eBlur) {
       // ignore
@@ -1226,16 +1222,16 @@
       const web = editor != null ? editor.querySelector("web-view") : null;
       if (web == null) { iosEditorLayoutQueued = false; return; }
       // iOS 真机实测：中文已写入 Quill，但 WKWebView viewport 为 0×0。
-      // 临时增大内层 web-view 再恢复，能使视口恢复；外壳裁剪保持输入卡尺寸不变。
-      const originalHeight = web.style.height.length > 0 ? web.style.height : "100%";
+      // 只扰动 1px 触发布局，随后恢复跟随 editor 的高度。
+      // 不能固定为修复开始时的像素值：换行/删行后外层会变高，内层却仍停在旧高度。
       const visibleHeight = web.getBoundingClientRect().height;
       console.log(`[conversation-input][ios-viewport-repair] height=${visibleHeight}`);
       const expanded = new Map<string, any>();
-      expanded.set("height", `${Math.max(200, visibleHeight + 100)}px`);
+      expanded.set("height", `${editorHeightPx.value + 1}px`);
       web.updateStyle(expanded);
       setTimeout((): void => {
         const restored = new Map<string, any>();
-        restored.set("height", originalHeight);
+        restored.set("height", "100%");
         try {
           if (web.isConnected) web.updateStyle(restored);
         } finally {
@@ -1340,6 +1336,7 @@
   let editorIndexedText = "";
   let editorInputCursor = 0;
   let stopComposerObserver: (() => void) | null = null;
+  let stopNativeComposerLayout: (() => void) | null = null;
   const skillSheetVisible = ref<boolean>(false);
   const connectorSheetVisible = ref<boolean>(false);
   // 连接器弹窗初始页签（对齐 PC：头像组入口落「已连接」聚合页签，普通入口落系统广场）
@@ -1366,13 +1363,13 @@
   });
   const editorInlineStyle = computed((): UTSJSONObject => {
     const style = new UTSJSONObject();
-    style["height"] = `${editorHeightRpx.value}rpx`;
+    style["height"] = `${editorHeightPx.value}px`;
     // App 端必须把高度同时写到 editor 本体，不能只裁剪外壳；否则旧版默认
     // min-height: 200px 的内容区不会在第五行后产生内部滚动。
     // UTSJSONObject 内联样式须使用驼峰键；连字符键在 iOS 聚焦后会被忽略，
     // editor 的默认 200px min-height 重新生效并把首页输入卡撑出大片空白。
     style["minHeight"] = "0px";
-    style["maxHeight"] = `${EDITOR_LINE_HEIGHT_RPX * EDITOR_MAX_LINES + EDITOR_VERTICAL_INSET_RPX}rpx`;
+    style["maxHeight"] = `${editorMaxHeightPx.value}px`;
     return style;
   });
 
@@ -1920,6 +1917,9 @@
   onUnmounted(() => {
     if (stopComposerObserver != null) stopComposerObserver!();
     stopComposerObserver = null;
+    requestEditorLayout = null;
+    if (stopNativeComposerLayout != null) stopNativeComposerLayout!();
+    stopNativeComposerLayout = null;
     stopDurationTimer();
     clearMethodSwitchTimer();
     quickPopupMeasureRequestId += 1;
@@ -2517,26 +2517,31 @@
     // #endif
   }
 
-  function updateEditorHeight(text: string): void {
-    const segments = text.split("\n");
-    let lines = 0;
-    for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i];
-      let visualUnits = 0;
-      for (let charIndex = 0; charIndex < segment.length; charIndex++) {
-        const code = segment.charCodeAt(charIndex);
-        if (code != null && code <= 0x007f) visualUnits += 0.55;
-        else visualUnits += 1;
-      }
-      lines += Math.max(1, Math.ceil(visualUnits / EDITOR_WRAP_UNITS_PER_LINE));
-    }
-    const visibleLines = Math.max(1, Math.min(EDITOR_MAX_LINES, lines));
-    // 1～5 行随内容增长；第 6 行开始保持五行高度，由 editor 自身滚动。
-    // 额外 inset 仅用于完整绘制 mention 圆角，不参与行距计算。
-    editorHeightRpx.value = visibleLines * EDITOR_LINE_HEIGHT_RPX + EDITOR_VERTICAL_INSET_RPX;
-    isMultiLine.value = visibleLines > 1;
-    isEditorScrollable.value = lines > EDITOR_MAX_LINES;
+  function applyEditorLayout(layout: UTSJSONObject | null): void {
+    if (layout == null) return;
+    const contentHeight = layout["contentHeight"] as number | null;
+    const singleHeight = layout["singleHeight"] as number | null;
+    const lineHeight = layout["lineHeight"] as number | null;
+    if (contentHeight == null || singleHeight == null || lineHeight == null ||
+      contentHeight <= 0 || singleHeight <= 0 || lineHeight <= 0) return;
+    // 测量与宿主均使用 CSS px，避免 px/rpx 往返和整行向上取整误差。
+    const maxHeight = singleHeight + lineHeight * (EDITOR_MAX_LINES - 1);
+    editorSingleHeightPx.value = singleHeight;
+    editorMaxHeightPx.value = maxHeight;
+    editorHeightPx.value = Math.max(singleHeight, Math.min(contentHeight, maxHeight));
+    isMultiLine.value = contentHeight > singleHeight + 1;
+    isEditorScrollable.value = contentHeight > maxHeight + 1;
     syncEditorScrollState();
+  }
+
+  function updateEditorHeight(text: string): void {
+    if (text.length == 0) {
+      editorHeightPx.value = editorSingleHeightPx.value;
+      isMultiLine.value = false;
+      isEditorScrollable.value = false;
+    }
+    // setContents、粘贴、提及标签、删除与真实输入都在 DOM 更新后重新测量。
+    nextTick((): void => { if (requestEditorLayout != null) requestEditorLayout!(); });
   }
 
   /** 剥掉 mention 名称的图标前缀（🔧 技能 / 📄 资料，历史兼容 "/"、"@"），得到纯名称 */
@@ -2660,7 +2665,7 @@
     if (editorContext != null && editorReady.value == true) editorContext!.clear(null);
     editorDelta.value = null;
     lastEditorText = "";
-    editorHeightRpx.value = EDITOR_MIN_HEIGHT_RPX;
+    editorHeightPx.value = editorSingleHeightPx.value;
     isMultiLine.value = false;
     isEditorScrollable.value = false;
     syncEditorScrollState();
@@ -2973,9 +2978,11 @@
   }
 
   function handleComposerEditorState(state: UTSJSONObject): void {
+    applyEditorLayout(state["layout"] as UTSJSONObject | null);
     // #ifdef APP-IOS
     if (state["viewportCollapsed"] == true && state["composing"] != true) syncIOSHomeEditorViewport();
     // #endif
+    if (state["reason"] == "layout") return;
     if (syncingEditorContent || removingQuickTriggerText) return;
     const cursor = state["cursor"] as number;
     const length = state["length"] as number;
@@ -2996,6 +3003,17 @@
     if (reason == "edit") syncQuickPopupFromText(text);
   }
 
+  function handleNativeComposerLayout(event: UniEvent): void {
+    // #ifdef APP
+    const data = (event as UniWebViewMessageEvent).detail.data;
+    for (let i = 0; i < data.length; i++) {
+      const message = data[i] as UTSJSONObject;
+      if (message["event"] != "nuwax-layout") continue;
+      applyEditorLayout(message["detail"] as UTSJSONObject | null);
+    }
+    // #endif
+  }
+
   function installComposerObserver(): void {
     // #ifdef H5 || WEB
     if (stopComposerObserver != null) stopComposerObserver!();
@@ -3010,9 +3028,32 @@
     // #ifdef APP-IOS
     watchIOSViewport = isHomeScene.value;
     // #endif
-    if (web != null) (web as UniWebViewElement).evalJS(buildComposerEditorObserverScript(watchIOSViewport));
+    if (web != null) {
+      if (stopNativeComposerLayout != null) stopNativeComposerLayout!();
+      const nativeLayoutListener = web.addEventListener("message", handleNativeComposerLayout);
+      stopNativeComposerLayout = (): void => web.removeEventListener("message", nativeLayoutListener);
+      (web as UniWebViewElement).evalJS(buildComposerEditorObserverScript(watchIOSViewport));
+    }
     // #endif
   }
+
+  requestEditorLayout = (): void => {
+    // #ifdef H5 || WEB
+    const q = resolveWebComposerQuill();
+    if (q != null) {
+      if (q.__nuwaxRequestLayout != null) q.__nuwaxRequestLayout();
+      else applyEditorLayout(measureWebComposerLayout(q));
+    }
+    // #endif
+    // #ifdef APP
+    const editor = resolveEditorElement();
+    const web = editor != null ? editor.querySelector("web-view") : null;
+    if (web != null) (web as UniWebViewElement).evalJS("(function(){var root=document.querySelector('.ql-container');var q=root&&(root.__quill||(window.Quill&&window.Quill.find(root)));if(q&&q.__nuwaxRequestLayout)q.__nuwaxRequestLayout();})();");
+    // #endif
+  };
+  watch(editorReady, (ready: boolean): void => {
+    if (ready) nextTick((): void => installComposerObserver());
+  });
 
 
   /** Delta 的文本坐标：embed 统一占一位，与 Quill 的选区索引一致。 */
@@ -3164,7 +3205,21 @@
 
   watch(
     (): number => keyboardHeight.value,
-    (): void => {
+    (height: number, previousHeight: number): void => {
+      // 只响应键盘从显示到收起；初始的 0 不应打断首次聚焦。
+      // App 原生事件、Android IME 轮询及离线 H5 的壳注入均汇入此处。
+      if (previousHeight > 0 && height <= 0 && isInputFocused.value) {
+        clearMethodSwitchTimer();
+        closeQuickPopup();
+        // #ifdef APP-ANDROID
+        scheduleAndroidEditorDefocus();
+        stopAndroidImePolling();
+        // #endif
+        homeKeyboardOffset.value = 0;
+        homeInputBaseBottom = -1;
+        blurChatInput();
+        emit("onFocusChange", false);
+      }
       if (quickPopupVisible.value == true) nextTick(() => measureQuickPopupSpace());
     },
   );
@@ -4967,10 +5022,8 @@
       }
 
       &.chat-input-container--home {
-        // 首页单行态固定输入行盒，阻断 iOS editor 聚焦/失焦时恢复 200px 默认高度向上撑开卡片。
-        height: 90rpx;
+        // 单行保留工具栏所需最小空间，实际编辑区由 editorInlineStyle 约束。
         min-height: 90rpx;
-        overflow: hidden;
 
         &.multi-line {
           height: auto;
@@ -4992,15 +5045,16 @@
         flex: 1;
         // 行高与最大高度须为整数倍，否则 APP/iOS 滚动裁剪会露出下一行
         // 正文与 mention chip 继承同一行高，换行时仍保留适度垂直间距
-        $input-line-height: 52rpx;
+        $input-line-height: 24px;
         $input-max-lines: 5;
         line-height: $input-line-height;
+        min-height: $input-line-height;
         max-height: $input-line-height * $input-max-lines;
         margin: 10rpx 0 10rpx 10rpx;
         // 右侧图标改为绝对定位后，为文本预留两个操作图标的空间。
         padding: 0 124rpx 0 20rpx;
         border: none;
-        font-size: 28rpx;
+        font-size: 16px;
         font-weight: 400;
         color: #000;
         box-sizing: border-box;
@@ -5056,10 +5110,10 @@
         padding: 0 124rpx 0 20rpx;
         border: none;
         box-sizing: border-box;
-        font-size: 28rpx;
+        font-size: 16px;
         font-weight: 400;
         /* 行高与外壳高度须为整数倍，否则 APP/iOS 滚动裁剪会露下一行 */
-        line-height: 52rpx;
+        line-height: 24px;
         color: #000;
         /* #ifdef APP */
         pointer-events: auto;
@@ -5086,7 +5140,14 @@
         max-height: 100% !important;
       }
 
-      :deep(.rich-input .ql-container .ql-editor) {
+      :deep(.rich-input .ql-editor) {
+        font-size: 16px !important;
+        line-height: 24px !important;
+        font-family: sans-serif !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        -webkit-text-size-adjust: 100%;
+        text-size-adjust: 100%;
         height: 100% !important;
         min-height: 0 !important;
         max-height: 100% !important;
@@ -5095,7 +5156,7 @@
 
       .input-placeholder {
         color: rgba(0, 0, 0, 0.25);
-        font-size: 28rpx;
+        font-size: 16px;
         font-weight: 400;
       }
 

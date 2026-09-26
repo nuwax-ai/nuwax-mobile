@@ -55,12 +55,13 @@ function harness() {
 
 for (const native of [false, true]) test(`${native ? '原生' : 'H5/离线'}观察器来源与组合输入`, () => {
   const h = harness(), reports = [], windowEvents = {};
-  const globals = { ...h.globals, document: { querySelector: () => ({ __quill: h.q }) }, window: { innerWidth: 316, innerHeight: 30, addEventListener(k, fn) { windowEvents[k] = fn; } }, triggerEvent: (name, data) => { assert.equal(name, 'input'); reports.push(data.delta.__nuwaxComposer); } };
+  const globals = { ...h.globals, document: { querySelector: () => ({ __quill: h.q }) }, window: { innerWidth: 316, innerHeight: 30, addEventListener(k, fn) { windowEvents[k] = fn; }, removeEventListener(k) { delete windowEvents[k]; } }, triggerEvent: (name, data) => { assert.equal(name, 'input'); reports.push(data.delta.__nuwaxComposer); } };
   const api = load('composerEditorObserver', ['observeWebComposer', 'buildComposerEditorObserverScript'], globals);
   let cleanup;
   if (native) vm.runInNewContext(api.buildComposerEditorObserverScript(true), globals);
   else cleanup = api.observeWebComposer(h.q, state => reports.push(state));
-  h.handlers['text-change']({}, {}, 'user'); h.handlers['selection-change'](); h.flush();
+  h.handlers['text-change']({}, {}, 'user'); h.handlers['selection-change']();
+  h.q.__nuwaxRequestLayout(); h.flush();
   assert.equal(reports.at(-1).reason, 'edit');
   assert.equal(reports.at(-1).text, '/');
   h.dom.paste(); h.handlers['text-change']({}, {}, 'user'); h.flush();
@@ -117,6 +118,7 @@ test('组件状态机：关闭不删草稿、重新聚焦不重开、离开选�
   };
   const opened = [], closed = [], layoutRepairs = [];
   const context = vm.createContext({
+    applyEditorLayout() {},
     detectComposerQuickTrigger: detect, syncingEditorContent: false, removingQuickTriggerText: false,
     isHomeScene: { value: true }, props: { enableSkillAt: true, allowExpertSelection: true },
     editorIndexedText: '@文', editorInputCursor: 2, quickTriggerStart: -1, quickTriggerEnd: -1,
@@ -126,6 +128,8 @@ test('组件状态机：关闭不删草稿、重新聚焦不重开、离开选�
   vm.runInContext(extract('syncQuickPopupFromText') + extract('handleComposerEditorState') + extract('dismissQuickPopup'), context);
   const state = { text: '@文', cursor: 2, length: 0, composing: false, reason: 'edit' };
   context.handleComposerEditorState(state);
+  context.handleComposerEditorState({ ...state, cursor: -1, reason: 'layout' });
+  assert.equal(closed.length, 0);
   assert.deepEqual(opened, [['expert', '文']]);
   context.dismissQuickPopup();
   assert.equal(context.editorIndexedText, '@文');

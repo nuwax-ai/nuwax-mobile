@@ -1,3 +1,4 @@
+import { appendInlineThink, finalizeInlineThink } from "@/utils/inlineThink.uts";
 import { nextTick } from "vue";
 import { setMessageIdRewrite } from "@/utils/voice/speechIdRewrite";
 import {
@@ -981,10 +982,7 @@ export default class AgentDetailService {
       this.flushStreamUiPublish();
       return;
     }
-    // 折叠态已发过 think 头：draft/pending 已持有最新 think，无需再开定时冲刷
-    if (thinkHeavy == true && this.lastPublishedThinkLen > 0) {
-      return;
-    }
+    // 分段思考正文也需持续发布，仍使用较长合并窗限制刷新频率。
     const wantMs =
       thinkHeavy == true
         ? this.THINK_UI_COALESCE_MS
@@ -1782,7 +1780,11 @@ export default class AgentDetailService {
     let arraySpliceAction = 1;
     const currentMessage = list[index];
 
-    const currentTextSnapshot = readMessageText(currentMessage);
+    const isThinkEvent = eventTypeStr == `${ConversationEventTypeEnum.MESSAGE}` &&
+      `${readRawField(responseData, "type")}` == `${MessageModeEnum.THINK}`;
+    const currentTextSnapshot = isThinkEvent
+      ? readMessageText(currentMessage)
+      : finalizeInlineThink(readMessageText(currentMessage));
     const isNewConversation = currentTextSnapshot.length == 0;
 
     // 确保流式过程中消息始终可见
@@ -1911,6 +1913,7 @@ export default class AgentDetailService {
       if (type == `${MessageModeEnum.THINK}`) {
         const m = cloneMessageInfoDraft(currentMessage);
         m["think"] = `${readMessageThink(currentMessage)}${text}`;
+        m["text"] = appendInlineThink(currentTextSnapshot, text, finished);
         m["status"] = MessageStatusEnum.Incomplete;
         newMessage = buildMessageInfoFromDraft(m);
         thinkHeavyUi = true;
@@ -2025,6 +2028,7 @@ export default class AgentDetailService {
       // #endif
       const m = cloneMessageInfoDraft(currentMessage);
       m["status"] = MessageStatusEnum.Complete;
+      m["text"] = currentTextSnapshot;
       m["finalResult"] = responseData;
       m["requestId"] = requestIdStr;
       // speakableText 不在此处写入：由会话结束后的 persistLastAssistantSpeakableText 统一落盘
@@ -2044,6 +2048,7 @@ export default class AgentDetailService {
       // #endif
       const m = cloneMessageInfoDraft(currentMessage);
       m["status"] = "error";
+      m["text"] = currentTextSnapshot;
       // 出错即终态：EXECUTING 工具卡置 FAILED，否则旋转 loading 不消失（对齐 PC onError）
       const failedTools = this.patchDraftExecutingProcessingToFailed(m);
       newMessage = buildMessageInfoFromDraft(m);
@@ -2284,12 +2289,16 @@ export default class AgentDetailService {
     uni.$emit("streamMessageUpdate");
   }
 
-  // 获取文件树列表
-  async fetchFileList(cId: number): Promise<void> {
+  // @ 上下文一次获取最多 100 个文件；文件树继续获取完整列表。
+  async fetchFileList(cId: number, contextOnly: boolean = false): Promise<void> {
     try {
-      this.data.isLoadingFiles.value = true;
-      const result = await apiGetStaticFileList(cId);
-      this.data.isLoadingFiles.value = false;
+      if (contextOnly) this.data.contextFileList.value = [];
+      else this.data.isLoadingFiles.value = true;
+      const result = contextOnly
+        ? await apiGetStaticFileList(cId, "file", 100)
+        : await apiGetStaticFileList(cId);
+      // 切换会话后不写回上一个会话的上下文。
+      if (contextOnly && this.data.conversationId.value != cId) return;
       const responseCode = apiResCode(result);
       if (responseCode == SUCCESS_CODE) {
         let files: any[] = [];
@@ -2321,11 +2330,12 @@ export default class AgentDetailService {
           treeData = files as FileNode[];
         }
 
-        this.data.fileList.value = treeData;
+        if (contextOnly) this.data.contextFileList.value = treeData;
+        else this.data.fileList.value = treeData;
       }
     } catch (error) {
     } finally {
-      this.data.isLoadingFiles.value = false;
+      if (!contextOnly) this.data.isLoadingFiles.value = false;
     }
   }
 

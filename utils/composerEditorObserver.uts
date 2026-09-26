@@ -1,3 +1,42 @@
+/** 在同宽的不可见副本上测量，不改变真实编辑器高度、内容或光标。 */
+export function measureWebComposerLayout(q: any): UTSJSONObject | null {
+  // #ifdef H5 || WEB
+  const root = q.root as any;
+  if (root == null || root.parentElement == null || root.getBoundingClientRect == null) return null;
+  root.style.setProperty("font-size", "16px", "important");
+  root.style.setProperty("line-height", "24px", "important");
+  root.style.setProperty("font-family", "sans-serif", "important");
+  root.style.setProperty("-webkit-text-size-adjust", "100%");
+  root.style.setProperty("padding-top", "0px", "important");
+  root.style.setProperty("padding-bottom", "0px", "important");
+  const width = root.getBoundingClientRect().width;
+  if (width <= 0) return null;
+  const probe = root.cloneNode(true) as any;
+  probe.removeAttribute("id");
+  probe.removeAttribute("contenteditable");
+  probe.setAttribute("aria-hidden", "true");
+  const styles = { position: "absolute", visibility: "hidden", pointerEvents: "none", height: "auto", minHeight: "0", maxHeight: "none", overflow: "visible", width: `${width}px`, top: "0", left: "0" };
+  Object.assign(probe.style, styles);
+  // 页面中 height:100%!important 的 editor 约束也必须在测量节点上解除。
+  probe.style.setProperty("height", "auto", "important");
+  probe.style.setProperty("min-height", "0", "important");
+  probe.style.setProperty("max-height", "none", "important");
+  root.parentElement.appendChild(probe);
+  try {
+    const contentHeight = probe.getBoundingClientRect().height;
+    probe.innerHTML = "<p><br></p>";
+    const singleHeight = probe.getBoundingClientRect().height;
+    probe.innerHTML = "<p><br></p><p><br></p>";
+    const lineHeight = probe.getBoundingClientRect().height - singleHeight;
+    if (singleHeight <= 0 || lineHeight <= 0) return null;
+    return { contentHeight: contentHeight, singleHeight: singleHeight, lineHeight: lineHeight };
+  } finally { probe.remove(); }
+  // #endif
+  // #ifndef H5 || WEB
+  return null;
+  // #endif
+}
+
 /** Web 与原生 editor 的事件适配。业务规则由 composerQuickTrigger 统一处理。 */
 export function observeWebComposer(q: any, report: (state: UTSJSONObject) => void): () => void {
   // #ifdef H5 || WEB
@@ -6,7 +45,7 @@ export function observeWebComposer(q: any, report: (state: UTSJSONObject) => voi
   let pending = "";
   let timer: number | null = null;
   const schedule = (reason: string): void => {
-    if (reason != "selection" || pending == "") pending = reason;
+    if ((reason != "selection" && reason != "layout") || pending == "") pending = reason;
     if (timer != null) clearTimeout(timer!);
     timer = setTimeout((): void => {
       timer = null;
@@ -14,7 +53,8 @@ export function observeWebComposer(q: any, report: (state: UTSJSONObject) => voi
       const delta = q.getContents();
       let text = delta.ops.map((op: any): string => typeof op.insert == "string" ? op.insert : "\ufffc").join("");
       if (text.endsWith("\n")) text = text.substring(0, text.length - 1);
-      report({ text: text, cursor: range != null ? range.index : -1, length: range != null ? range.length : 0, composing: composing, reason: pending });
+      const layout = measureWebComposerLayout(q);
+      report({ layout: layout, text: text, cursor: range != null ? range.index : -1, length: range != null ? range.length : 0, composing: composing, reason: pending });
       pending = "";
       pasted = false;
     }, 0);
@@ -26,6 +66,15 @@ export function observeWebComposer(q: any, report: (state: UTSJSONObject) => voi
   const onStart = (): void => { composing = true; schedule("composition"); };
   const onEnd = (): void => { composing = false; schedule("edit"); };
   const onKey = (event: any): void => { if (event.key == "Escape") schedule("dismiss"); };
+  const onResize = (): void => schedule("layout");
+  q.__nuwaxRequestLayout = onResize;
+  let measuredWidth = -1;
+  const resizeObserver = typeof ResizeObserver != "undefined" ? new ResizeObserver(() => {
+    const width = q.root.getBoundingClientRect().width;
+    if (width != measuredWidth) { measuredWidth = width; schedule("layout"); }
+  }) : null;
+  if (resizeObserver != null) resizeObserver.observe(q.root);
+  window.addEventListener("resize", onResize);
   q.on("text-change", onText);
   q.on("selection-change", onSelection);
   q.root.addEventListener("paste", onPaste, true);
@@ -34,7 +83,11 @@ export function observeWebComposer(q: any, report: (state: UTSJSONObject) => voi
   q.root.addEventListener("compositionstart", onStart);
   q.root.addEventListener("compositionend", onEnd);
   q.root.addEventListener("keydown", onKey);
+  schedule("layout");
   return (): void => {
+    if (resizeObserver != null) resizeObserver.disconnect();
+    window.removeEventListener("resize", onResize);
+    if (q.__nuwaxRequestLayout == onResize) q.__nuwaxRequestLayout = null;
     if (timer != null) clearTimeout(timer!);
     q.off("text-change", onText);
     q.off("selection-change", onSelection);
@@ -53,19 +106,79 @@ export function observeWebComposer(q: any, report: (state: UTSJSONObject) => voi
 
 /** 原生 editor 已支持 input 的 delta 透传；只附加观测信息，不改内容和 SDK。 */
 export function buildComposerEditorObserverScript(watchIOSViewport: boolean = false): string {
-  return `(function(){
+  return `(function installComposerObserver(attempt){
     var root=document.querySelector('.ql-container');
     var q=root&&(root.__quill||(window.Quill&&window.Quill.find(root)));
-    if(!q||q.__nuwaxObserver)return;q.__nuwaxObserver=true;
-    var composing=false,pasted=false,pending='',timer=null,watchViewport=${watchIOSViewport ? "true" : "false"};
+    if(!q){if((attempt||0)<20)setTimeout(function(){installComposerObserver((attempt||0)+1)},50);return;}
+    if(q.__nuwaxLayoutVersion===3){q.__nuwaxRequestLayout();return;}
+    q.__nuwaxObserver=true;q.__nuwaxLayoutVersion=3;
+    var watchViewport=${watchIOSViewport ? "true" : "false"},iosScrollable=false;
+    // iOS 首页仅允许五行以上的编辑内容滚动，文档和外层容器始终停在原点。
+    function resetIOSScroll(){
+      if(!watchViewport)return;
+      if(!iosScrollable&&q.root.scrollTop)q.root.scrollTop=0;
+      if(root.scrollTop)root.scrollTop=0;
+      if(document.body&&document.body.scrollTop)document.body.scrollTop=0;
+      if(document.documentElement&&document.documentElement.scrollTop)document.documentElement.scrollTop=0;
+      if(window.scrollX||window.scrollY)window.scrollTo(0,0);
+    }
+    function syncIOSScroll(layout){
+      if(!watchViewport||!layout)return;
+      var wasScrollable=iosScrollable;
+      iosScrollable=layout.contentHeight>layout.singleHeight+layout.lineHeight*4+1;
+      document.documentElement.style.setProperty('overflow','hidden');
+      document.body.style.setProperty('position','fixed');
+      document.body.style.setProperty('inset','0');
+      document.body.style.setProperty('overflow','hidden');
+      root.style.setProperty('min-height','0px','important');
+      q.root.style.setProperty('min-height','0px','important');
+      q.root.style.setProperty('max-height','100%','important');
+      q.root.style.setProperty('overflow-y',iosScrollable?'auto':'hidden','important');
+      q.root.style.setProperty('overscroll-behavior-y','none');
+      resetIOSScroll();
+      if(iosScrollable&&!wasScrollable&&typeof q.scrollIntoView==='function')q.scrollIntoView();
+    }
+    function measureLayout(){
+      var editor=q.root;
+      if(!editor||!editor.parentElement||!editor.getBoundingClientRect)return null;
+      editor.style.setProperty('font-size','16px','important');
+      editor.style.setProperty('line-height','24px','important');
+      editor.style.setProperty('font-family','sans-serif','important');
+      editor.style.setProperty('-webkit-text-size-adjust','100%');
+      editor.style.setProperty('padding-top','0px','important');editor.style.setProperty('padding-bottom','0px','important');
+      var width=editor.getBoundingClientRect().width;if(width<=0)return null;
+      var probe=editor.cloneNode(true);
+      probe.removeAttribute('id');probe.removeAttribute('contenteditable');probe.setAttribute('aria-hidden','true');
+      Object.assign(probe.style,{position:'absolute',visibility:'hidden',pointerEvents:'none',height:'auto',minHeight:'0',maxHeight:'none',overflow:'visible',width:width+'px',top:'0',left:'0'});
+      probe.style.setProperty('height','auto','important');probe.style.setProperty('min-height','0','important');probe.style.setProperty('max-height','none','important');
+      // iOS 在活动编辑器内临时放入两行测量内容，也可能触发焦点自动滚动。
+      // 用零高度裁剪容器隔离测量节点，保持活动编辑器的滚动范围稳定。
+      var probeHost=null;
+      if(watchViewport){
+        probeHost=document.createElement('div');probeHost.className=root.className;
+        probeHost.style.cssText='position:fixed!important;top:0;left:0;width:'+width+'px;height:0!important;min-height:0!important;overflow:hidden!important;visibility:hidden;pointer-events:none';
+        document.body.appendChild(probeHost);probeHost.appendChild(probe);
+      }else editor.parentElement.appendChild(probe);
+      try{
+        var contentHeight=probe.getBoundingClientRect().height;
+        probe.innerHTML='<p><br></p>';var singleHeight=probe.getBoundingClientRect().height;
+        probe.innerHTML='<p><br></p><p><br></p>';var lineHeight=probe.getBoundingClientRect().height-singleHeight;
+        if(singleHeight<=0||lineHeight<=0)return null;
+        return {contentHeight:contentHeight,singleHeight:singleHeight,lineHeight:lineHeight};
+      }finally{probe.remove();if(probeHost)probeHost.remove();}
+    }
+    var composing=false,pasted=false,pending='',timer=null;
     function schedule(reason){
-      if(reason!=='selection'||!pending)pending=reason;
+      if((reason!=='selection'&&reason!=='layout')||!pending)pending=reason;
       if(timer!==null)clearTimeout(timer);
       timer=setTimeout(function(){
         timer=null;var range=q.getSelection(),delta=q.getContents();
         var text=delta.ops.map(function(op){return typeof op.insert==='string'?op.insert:'\uFFFC';}).join('');
         if(text.slice(-1)==='\\n')text=text.slice(0,-1);
-        delta.__nuwaxComposer={text:text,cursor:range?range.index:-1,length:range?range.length:0,composing:composing,reason:pending,viewportCollapsed:window.innerWidth===0||window.innerHeight===0};
+        var measured=measureLayout();
+        syncIOSScroll(measured);
+        if(measured&&typeof triggerEvent==='function')triggerEvent('nuwax-layout',measured);
+        delta.__nuwaxComposer={layout:measured,text:text,cursor:range?range.index:-1,length:range?range.length:0,composing:composing,reason:pending,viewportCollapsed:window.innerWidth===0||window.innerHeight===0};
         if(typeof triggerEvent==='function')triggerEvent('input',{text:q.getText(),html:q.root.innerHTML,delta:delta});
         pending='';pasted=false;
       },0);
@@ -83,7 +196,22 @@ export function buildComposerEditorObserverScript(watchIOSViewport: boolean = fa
       composing=false;schedule('edit');
       if(watchViewport){setTimeout(checkViewport,80);setTimeout(checkViewport,320);}
     });
-    if(watchViewport)window.addEventListener('resize',function(){setTimeout(checkViewport,0);});
+    window.addEventListener('resize',function(){setTimeout(checkViewport,0);schedule('layout');});
+    if(watchViewport){
+      document.addEventListener('scroll',resetIOSScroll,true);
+      window.addEventListener('scroll',resetIOSScroll);
+      if(window.visualViewport)window.visualViewport.addEventListener('scroll',resetIOSScroll);
+    }
+    if(typeof ResizeObserver!=='undefined'){
+      var measuredWidth=-1;
+      var resizeObserver=new ResizeObserver(function(){
+        var width=q.root.getBoundingClientRect().width;
+        if(width!==measuredWidth){measuredWidth=width;schedule('layout');}
+      });
+      resizeObserver.observe(q.root);
+    }
+    q.__nuwaxRequestLayout=function(){schedule('layout');};
+    schedule('layout');
     q.root.addEventListener('keydown',function(e){if(e.key==='Escape')schedule('dismiss');});
   })();`;
 }

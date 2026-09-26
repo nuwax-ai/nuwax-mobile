@@ -2,18 +2,33 @@
  * 事件总线封装
  *
  * 对外提供与 PC 端一致的 API：on / off / emit / once
- * ★内部不再走 uni.$on/$emit，改为纯 UTS 自有订阅表：
- * App-Android 上经本封装注册的订阅者在 uni.$emit 后不被调用（IM 实时链路
- * 真机两轮实锤：调用点展开与显式单实参两种调用形态均零触发，页面级与
- * App 级订阅一致失效；同仓库裸 uni.$on/$emit 的单实参用法正常）。自有表
- * 分发为纯 UTS 逻辑，iOS/Android/H5 三端行为一致：同步分发、注册序调用、
- * 单载荷传参——与 iOS 已验证行为完全一致。裸 uni.$on 直用的监听名与本总线
- * 事件名无交集，两套互不受影响。
+ * ★纯 UTS 自有订阅表，不走 uni.$on/$emit：App-Android 上经 uni 事件机制注册的
+ * 订阅者不被调用（IM 实时链路真机多轮实锤：帧到达、ACK 回包正常，订阅者零触发）。
+ * ★★EventCallback 必须是「单参无变参」签名：(payload: any) => void。曾用
+ * (...args: any[]) => void——编译能过，但编译器会按 uni.$emit 展开约定把订阅箭头
+ * 改写成「收参数数组、取 [0]」形态（编译产物实证：do_not_transform_spread[0]），
+ * 与本总线 cb(payload) 单参调用在运行时错配，首个监听器抛错被 WS 回调边界吞掉、
+ * 同轮后续监听器全部不执行（表现：emit 静默失效）。单参签名让订阅方与回调类型
+ * 精确一致，编译器不再做任何适配改写。iOS/H5 同语义（同步分发、注册序、单载荷）。
+ *
+ * 分发带诊断日志（EVENT_BUS_DEBUG）：emit 打印监听数、监听器异常单独捕获打印，
+ * 避免一个监听器抛错中断同轮其余分发（uni.$emit 路径无此保护）。
+ * 裸 uni.$on 直用的监听名与本总线事件名无交集，两套互不受影响。
  *
  * 参考文档：https://doc.dcloud.net.cn/uni-app-x/api/event-bus.html
  */
 
-type EventCallback = (...args: any[]) => void;
+/** 分发诊断日志开关（Android 实时链路已验证通过，2026-09-26 置 false 降噪；排查时改回 true）。 */
+const EVENT_BUS_DEBUG = false;
+
+function busLog(msg: string): void {
+  if (EVENT_BUS_DEBUG) {
+    console.log(`[EventBus] ${msg}`);
+  }
+}
+
+/** 订阅回调：★单参非变参（见文件头 ★★ 说明，勿改回 (...args) 形态）。 */
+type EventCallback = (payload: any) => void;
 
 /**
  * 事件总线类
@@ -33,11 +48,13 @@ class EventBus {
     const list = this.listeners.get(eventName);
     if (list != null) {
       list.push(callback);
+      busLog(`on ${eventName} → total ${list.length}`);
       return;
     }
     const arr: EventCallback[] = [];
     arr.push(callback);
     this.listeners.set(eventName, arr);
+    busLog(`on ${eventName} → total 1`);
   }
 
   /**
@@ -59,36 +76,49 @@ class EventBus {
     if (list.length == 0) {
       this.listeners.delete(eventName);
     }
+    busLog(`off ${eventName} → total ${list.length}`);
   }
 
   /**
    * 发布事件
    * @param eventName 事件名称
-   * @param args 参数（仓库内调用方均为单载荷）
+   * @param args 参数（仓库内调用方均为单载荷，只分发首个；与 iOS 已验证的
+   *             uni.$emit 实际送达形态一致）
    */
   emit(eventName: string, ...args: any[]): void {
     const list = this.listeners.get(eventName);
-    if (list == null || list.length == 0) {
+    // 直接判空收窄：局部 val 经 if (list == null) return 后 Kotlin smart cast 到非空；
+    // 经派生变量间接判空不收窄（nullable receiver 不许 .length，真机构建实锤）
+    if (list == null) {
+      busLog(`emit ${eventName} → 0 listener(s), no-op`);
       return;
     }
+    busLog(`emit ${eventName} → ${list.length} listener(s)`);
     // 快照遍历：回调内 off（自身或其他订阅）不影响本轮已入快照的分发
     const snapshot: EventCallback[] = [];
     for (let i = 0; i < list.length; i++) {
       snapshot.push(list[i]);
     }
-    // 单载荷传参：与原 uni.$emit 路径在 iOS 上实际送达的形态一致
-    // 无载荷时补空对象：Kotlin 侧形参为非空 Any，传 null 会编译失败
-    let payload: any = {};
-    if (args.length > 0) {
-      payload = args[0];
+    if (args.length == 0) {
+      // 无实参 emit 本仓库无用法，防御不分发（原路径下订阅者收到的也是 null，
+      // 各处理器首行判空返回，行为等价）
+      return;
     }
+    // args[0] 索引访问即非空 Any：★不能经三元或 ?? 掺 null，Any? 传 any 形参
+    // 过不了 Kotlin 编译（error17，真机构建实锤）
+    const payload = args[0];
     for (let i = 0; i < snapshot.length; i++) {
       const cb = snapshot[i];
       if (this.onceFlags.has(cb)) {
         this.onceFlags.delete(cb);
         this.off(eventName, cb);
       }
-      cb(payload);
+      // 单监听器异常不中断同轮其余分发（曾因无保护被 WS 回调边界整体吞掉）
+      try {
+        cb(payload);
+      } catch (e) {
+        console.error(`[EventBus] listener ${eventName}#${i} threw: ${e != null ? `${e}` : "unknown"}`);
+      }
     }
   }
 

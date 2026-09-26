@@ -65,8 +65,8 @@ public final class IosFilePickerBridge: NSObject {
 
   /// 弹系统文件选择器（多选）。UTS 调 native 的线程无 runloop，统一切主线程后再弹。
   public static func pickFiles(
-    onPicked: @escaping IosFilePicked,
-    onFail: @escaping IosFileFailure
+    _ onPicked: @escaping IosFilePicked,
+    _ onFail: @escaping IosFileFailure
   ) {
     DispatchQueue.main.async {
       guard let top = IosFilePickerBridge.topViewController() else {

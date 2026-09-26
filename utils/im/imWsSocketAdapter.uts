@@ -1,0 +1,326 @@
+/**
+ * IM WS Socket 适配层。
+ *
+ * 双平台实现：
+ * - H5 / Web：H5NativeSocketAdapter，直接用原生 WebSocket（uni.connectSocket 在部分
+ *   H5 环境会出现后续帧丢失，已在 ttsWebSocketPlayer.uts:332 注释中说明）
+ * - App / MP / App 内嵌 H5：UniSocketTaskAdapter，包 uni.connectSocket，握手带 Header
+ *
+ * 子协议双轨：构造时统一传 `protocols: ["im-v1"]`。
+ * - 原生 WebSocket：第二参数 protocols 在所有现代浏览器均支持
+ * - uni.connectSocket：若该参数不支持会被运行时忽略；IM 服务端也接受不传子协议
+ *   （握手层会回 CONNECT_REJECT 但 code 不会是 IM_10001，而是允许握手）
+ *
+ * 调用方（ImWsClient）不感知差异，只用统一接口 connect/onMessage/onError/onClose/send/close。
+ */
+import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+import { IM_WS_SUBPROTOCOL } from "./imProtocol";
+
+/** 适配层统一回调签名。 */
+export type ImWsOnOpen = () => void;
+export type ImWsOnMessage = (data: string) => void;
+export type ImWsOnError = (errMsg: string) => void;
+export type ImWsOnClose = (code: number | null, reason: string | null) => void;
+
+/** 适配层抽象接口。 */
+export interface ImWsSocketAdapter {
+  /**
+   * 建连。必须幂等：重复调起需安全（先 close 旧的）。
+   * @param url 已构造好的 WS URL（含 baseURL/path/query）
+   * @param headers App/MP 用的握手 Header（H5 忽略）
+   */
+  connect(url: string, headers: UTSJSONObject | null): void;
+  onOpen(cb: ImWsOnOpen): void;
+  onMessage(cb: ImWsOnMessage): void;
+  onError(cb: ImWsOnError): void;
+  onClose(cb: ImWsOnClose): void;
+  /** 发文本帧（UTF-8 JSON）。失败返回 false。 */
+  send(text: string): boolean;
+  /**
+   * 关连接。force=true 表示「主动关，不要触发重连」（用户登出/暂停场景）。
+   * 默认 force=false（异常关，触发重连）。
+   */
+  close(force?: boolean): void;
+  /** 当前 readyState 是否 OPEN。H5 用 WebSocket.readyState，Uni 用 SocketTask.readyState。 */
+  isOpen(): boolean;
+}
+
+/** 工厂方法：按当前运行平台返回对应 adapter。 */
+export function createImWsSocketAdapter(): ImWsSocketAdapter {
+  // #ifdef H5 || WEB
+  // App 内嵌 H5：与原生 App 一致，走 uni.connectSocket + Header
+  if (isAppWebViewEmbedded()) {
+    return new UniSocketTaskAdapter();
+  }
+  // 浏览器 H5：原生 WebSocket
+  return new H5NativeSocketAdapter();
+  // #endif
+
+  // #ifndef H5 || WEB
+  return new UniSocketTaskAdapter();
+  // #endif
+}
+
+// =================================================================
+// H5 Native WebSocket Adapter
+// =================================================================
+
+// #ifdef H5 || WEB
+/**
+ * 浏览器 H5 用原生 WebSocket（不走 uni.connectSocket，规避后续帧丢失问题）。
+ * 子协议通过 WebSocket 构造第二参数传。
+ */
+class H5NativeSocketAdapter implements ImWsSocketAdapter {
+  private socket: WebSocket | null = null;
+  private openCb: ImWsOnOpen | null = null;
+  private messageCb: ImWsOnMessage | null = null;
+  private errorCb: ImWsOnError | null = null;
+  private closeCb: ImWsOnClose | null = null;
+
+  connect(url: string, _headers: UTSJSONObject | null): void {
+    // 已存在旧 socket → 先关（避免双连接）
+    if (this.socket != null) {
+      try {
+        this.socket.close();
+      } catch (_e) {
+        // ignore
+      }
+      this.socket = null;
+    }
+    // 原生 WebSocket：第二参数 protocols 数组在所有现代浏览器均支持
+    const ws = new WebSocket(url, [IM_WS_SUBPROTOCOL]);
+    this.socket = ws;
+    ws.onopen = (): void => {
+      if (this.socket === ws && this.openCb != null) {
+        this.openCb();
+      }
+    };
+    ws.onmessage = (ev: MessageEvent): void => {
+      if (this.socket !== ws || this.messageCb == null) {
+        return;
+      }
+      const data = ev.data;
+      // IM 协议只用文本帧；如果收到二进制（Blob/ArrayBuffer）忽略
+      if (typeof data === "string") {
+        this.messageCb(data);
+      }
+    };
+    ws.onerror = (): void => {
+      if (this.socket === ws && this.errorCb != null) {
+        this.errorCb("WebSocket error");
+      }
+    };
+    ws.onclose = (ev: CloseEvent): void => {
+      // 已被 close() 重置过 → 不再回调
+      if (this.socket !== ws) {
+        return;
+      }
+      this.socket = null;
+      if (this.closeCb != null) {
+        this.closeCb(ev.code, ev.reason);
+      }
+    };
+  }
+
+  onOpen(cb: ImWsOnOpen): void {
+    this.openCb = cb;
+  }
+  onMessage(cb: ImWsOnMessage): void {
+    this.messageCb = cb;
+  }
+  onError(cb: ImWsOnError): void {
+    this.errorCb = cb;
+  }
+  onClose(cb: ImWsOnClose): void {
+    this.closeCb = cb;
+  }
+
+  send(text: string): boolean {
+    const ws = this.socket;
+    if (ws == null || ws.readyState != 1) {
+      return false;
+    }
+    try {
+      ws.send(text);
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  close(force?: boolean): void {
+    const ws = this.socket;
+    if (ws == null) {
+      return;
+    }
+    this.socket = null; // 先置空，避免 onclose 误回调
+    try {
+      // code=1000 正常关
+      ws.close(force == true ? 1000 : 1000);
+    } catch (_e) {
+      // ignore
+    }
+  }
+
+  isOpen(): boolean {
+    const ws = this.socket;
+    return ws != null && ws.readyState == 1;
+  }
+}
+// #endif
+
+// =================================================================
+// Uni SocketTask Adapter (App / MP / App 内嵌 H5)
+// =================================================================
+
+/**
+ * App / 小程序 / App 内嵌 H5：用 uni.connectSocket。
+ * - Header 鉴权（Authorization: Bearer <token>）
+ * - 子协议传 protocols；uni.connectSocket 不支持时静默忽略
+ */
+class UniSocketTaskAdapter implements ImWsSocketAdapter {
+  private socketTask: SocketTask | null = null;
+  private openCb: ImWsOnOpen | null = null;
+  private messageCb: ImWsOnMessage | null = null;
+  private errorCb: ImWsOnError | null = null;
+  private closeCb: ImWsOnClose | null = null;
+  private generation: number = 0;
+  /** 当前 socketTask 对应的 generation，用于丢弃迟回调。 */
+  private currentGeneration: number = 0;
+
+  connect(url: string, headers: UTSJSONObject | null): void {
+    // 已有旧 socket → 先关
+    if (this.socketTask != null) {
+      const oldTask = this.socketTask;
+      this.socketTask = null;
+      try {
+        oldTask.close({ code: 1000, reason: "reconnect" });
+      } catch (_e) {
+        // ignore
+      }
+    }
+
+    // Bump generation 让所有旧的回调失效
+    this.generation += 1;
+    const gen = this.generation;
+    this.currentGeneration = gen;
+
+    // 一次性构造 connectSocket 参数（参照 asrWebSocketClient.uts:325 模板）
+    const task = uni.connectSocket({
+      url: url,
+      header: headers,
+      protocols: [IM_WS_SUBPROTOCOL],
+      fail: (err: ConnectSocketFail): void => {
+        if (gen !== this.currentGeneration) {
+          return;
+        }
+        this.socketTask = null;
+        if (this.errorCb != null) {
+          this.errorCb(err.errMsg != null ? `${err.errMsg}` : "connect fail");
+        }
+      },
+    });
+    this.socketTask = task;
+
+    task.onOpen((): void => {
+      if (gen !== this.currentGeneration || this.socketTask !== task) {
+        return;
+      }
+      if (this.openCb != null) {
+        this.openCb();
+      }
+    });
+
+    task.onMessage((res: OnSocketMessageCallbackResult): void => {
+      if (gen !== this.currentGeneration || this.socketTask !== task) {
+        return;
+      }
+      if (this.messageCb == null) {
+        return;
+      }
+      const data = res.data;
+      if (typeof data === "string") {
+        this.messageCb(data);
+      }
+      // 二进制帧 IM 不支持，忽略
+    });
+
+    task.onError((err: GeneralCallbackResult): void => {
+      if (gen !== this.currentGeneration || this.socketTask !== task) {
+        return;
+      }
+      this.socketTask = null;
+      if (this.errorCb != null) {
+        this.errorCb(err.errMsg != null ? `${err.errMsg}` : "ws error");
+      }
+    });
+
+    task.onClose((res: any): void => {
+      // 已被 close() 主动重置过 → 不再回调
+      if (gen !== this.currentGeneration || this.socketTask !== task) {
+        return;
+      }
+      this.socketTask = null;
+      let code: number | null = null;
+      let reason: string | null = null;
+      if (res != null) {
+        const codeRaw = (res as UTSJSONObject)["code"];
+        if (typeof codeRaw === "number") {
+          code = codeRaw;
+        }
+        const reasonRaw = (res as UTSJSONObject)["reason"];
+        if (typeof reasonRaw === "string") {
+          reason = reasonRaw;
+        }
+      }
+      if (this.closeCb != null) {
+        this.closeCb(code, reason);
+      }
+    });
+  }
+
+  onOpen(cb: ImWsOnOpen): void {
+    this.openCb = cb;
+  }
+  onMessage(cb: ImWsOnMessage): void {
+    this.messageCb = cb;
+  }
+  onError(cb: ImWsOnError): void {
+    this.errorCb = cb;
+  }
+  onClose(cb: ImWsOnClose): void {
+    this.closeCb = cb;
+  }
+
+  send(text: string): boolean {
+    const task = this.socketTask;
+    if (task == null) {
+      return false;
+    }
+    try {
+      task.send({ data: text });
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  close(force?: boolean): void {
+    const task = this.socketTask;
+    this.socketTask = null;
+    if (task == null) {
+      return;
+    }
+    try {
+      task.close({ code: 1000, reason: force == true ? "manual" : "auto" });
+    } catch (_e) {
+      // ignore
+    }
+  }
+
+  isOpen(): boolean {
+    // UTS 不暴露 SocketTask.readyState 字段类型，简化判定：socketTask 存在即视为 OPEN。
+    // 真实 OPEN/CLOSED 由 send() 失败 → reconnect 兜底（参见 imWsClient.sendPing）。
+    return this.socketTask != null;
+  }
+}

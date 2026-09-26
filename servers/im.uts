@@ -672,6 +672,69 @@ export async function apiImReadReport(
   });
 }
 
+/**
+ * IM 增量同步（sync，HTTP 兜底）。
+ *
+ * 契约见 nuwax-im docs/openapi/im-openapi.yaml（SyncRequest / SyncResult）：
+ * - 用于 WS 重连 / 弱网恢复后补齐断线期间消息
+ * - 请求体：
+ *   - afterSeqs?: Record<string, number>（每会话水位线，键是字符串形式 convId）
+ *   - fullSync?: boolean（true=本地清空，limitPerConv 给最近若干条）
+ *   - limitPerConv?: number（每会话最多给多少）
+ *   - cursor?: { convId: number, afterSeq: number }（单会话续拉）
+ *   - deviceId?: string
+ * - 响应 data = SyncResult：
+ *   - conversations: ConversationSummaryDto[]（unreadCount 键缺失 ≠ 0）
+ *   - messages: MessageDto[]（已按会话分组展开）
+ *   - hasMore: true 时必须用 nextCursor 续拉
+ *   - nextCursor?: { convId, afterSeq }
+ *   - collapsed: number[]（被折叠的会话，不代表没新消息）
+ *   - mutedConvs: number[]
+ *   - processedConvs: number
+ *   - serverTimeMs: number
+ *   - mode: string（"incremental" / "full" / "folded"）
+ *   - truncated: boolean
+ *
+ * ImWsClient 在 CONNECT_ACK 后自动调一次（runSyncFallback）。
+ */
+export class ApiImSyncCursor {
+  convId: number = 0;
+  afterSeq: number = 0;
+}
+
+export class ApiImSyncParams {
+  afterSeqs: Record<string, number> | null = null;
+  fullSync: boolean = false;
+  limitPerConv: number | null = null;
+  cursor: ApiImSyncCursor | null = null;
+  deviceId: string | null = null;
+}
+
+export async function apiImSync(
+  params: ApiImSyncParams,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  if (params.afterSeqs != null) {
+    data["afterSeqs"] = params.afterSeqs as any;
+  }
+  if (params.fullSync === true) {
+    data["fullSync"] = true;
+  }
+  if (params.limitPerConv != null) {
+    data["limitPerConv"] = params.limitPerConv;
+  }
+  if (params.cursor != null) {
+    data["cursor"] = params.cursor as any;
+  }
+  // deviceId 默认带上（WS 重连场景必须有，否则服务端按设备维度处理错误）
+  data["deviceId"] = params.deviceId ?? getImDeviceId();
+  return await request({
+    url: "/api/instant-message/sync",
+    method: "POST",
+    data: data,
+  });
+}
+
 // ============================================================ 消息 Pin 域（im-chat-pins，契约见 nuwax-im ImConversationController DEV-195）
 
 /**
@@ -895,6 +958,32 @@ export async function apiImReviewJoinRequest(
 }
 
 // ============================================================ 消息操作域（长按消息：Pin/撤回/编辑，契约见 nuwax-im ImMessageController / ImConversationController）
+
+/**
+ * 执行互动卡片上的一个动作（msgRunAction，POST /messages/{msgId}/actions/{actionKey}，
+ * DEV-197-b 通用动作框架唯一入口；入群审核卡片的「同意/拒绝」走这里）。
+ *
+ * - ★convId 走 query 不走 body（与 revoke/edit 把 convId 放 body 的惯例相反）：
+ *   请求体被"动作附言 remark"占住，服务端刻意不让客户端在体里传别的字段
+ * - ★请求体不带 actionType / payload：动作语义由服务端拿 msgId 从库里读消息
+ *   body 按 actionKey 分发，客户端只能选"点哪个按钮"（伪造请求改不了语义）
+ * - 响应 data = CardActionState{ state, text, at }（执行后新状态）：客户端就地
+ *   更新按钮，不必重拉整条消息；幂等（重复点返回既有状态仍 200）
+ * - ★失败语义两档：消息不存在/不是卡片/无此 actionKey 报 IM_10404；
+ *   无权点/已失效【仍 200】但 data.state=forbidden/stale——那是状态不是错误，
+ *   客户端就地置灰即可，不要弹错误提示
+ */
+export async function apiImMsgRunAction(
+  msgId: string,
+  convId: string,
+  actionKey: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/actions/${actionKey}?convId=${convId}`,
+    method: "POST",
+    data: "{}",
+  });
+}
 
 /**
  * 置顶一条消息（convPinMessage，POST /conversations/{convId}/pins）。

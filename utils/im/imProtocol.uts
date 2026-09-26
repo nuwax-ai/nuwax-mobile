@@ -1,0 +1,257 @@
+/**
+ * nuwax-im IM WebSocket 协议常量与编解码工具
+ *
+ * 真源：nuwax-im 仓库 docs/07-移动端APP对接文档.md §6、ImProtocol.java、ImOpCode.java。
+ * 本文件仅放「协议层纯函数 + 常量」，不持任何状态，便于单测。
+ *
+ * 关键事实（决定所有客户端行为）：
+ * - WS 帧：仅 UTF-8 JSON 文本帧（TextWebSocketFrame），无自定义二进制封包
+ * - Envelope：NON_NULL 序列化，键缺失 = undefined，不要 === null 判断
+ * - 心跳间隔：必须读 CONNECT_ACK.body.heartbeatInterval（秒），不要硬编码
+ * - 大整数 ID：雪花号 18-19 位 > 2^53，按字符串保存避免丢精度
+ * - 握手超时 10s 从 TCP accept 起算 → onOpen 第一件事就是发 CONNECT(1000)
+ * - 读空闲 90s 服务端裸关 TCP（code=1006），客户端只能自己判活
+ * - 服务端从不主动 Ping，只回 PONG
+ */
+
+/** WS 路径（拼接在 baseURL 后）。 */
+export const IM_WS_PATH = "/instant-message/ws";
+
+/** WS 子协议（Sec-WebSocket-Protocol）。 */
+export const IM_WS_SUBPROTOCOL = "im-v1";
+
+/** 单帧上限（服务端 Netty 层校验）。 */
+export const IM_MAX_FRAME_BYTES = 262144;
+
+/** 默认心跳间隔（秒），用于服务端未下发时兜底。 */
+export const IM_DEFAULT_HEARTBEAT_INTERVAL_SEC = 30;
+
+/** 心跳间隔 clamp 范围（秒）。 */
+export const IM_HEARTBEAT_MIN_SEC = 5;
+export const IM_HEARTBEAT_MAX_SEC = 300;
+
+/** 读空闲上限（秒），服务端超时会裸关 TCP。 */
+export const IM_READ_IDLE_SEC = 90;
+
+/** 协议版本（envelope.v，固定 1）。 */
+export const IM_PROTOCOL_VERSION = 1;
+
+/** 平台标识（首帧 CONNECT.body.platform）。 */
+export const IM_PLATFORM = "miniapp"; // 微信小程序 / uni-app x 默认走 miniapp；H5 与原生 App 也复用
+
+/** OpCode 枚举（与 nuwax-im ImOpCode.java 对齐）。 */
+export class IM_OP {
+  // 连接生命周期
+  static CONNECT: number = 1000;
+  static CONNECT_ACK: number = 1001;
+  static CONNECT_REJECT: number = 1002;
+  static AUTH_REFRESH: number = 1003;
+  static AUTH_REFRESH_ACK: number = 1004;
+  // 心跳
+  static PING: number = 2000;
+  static PONG: number = 2001;
+  // 消息收发
+  static MSG_SEND: number = 3000;
+  static MSG_SEND_ACK: number = 3001;
+  static MSG_RECV: number = 3002;
+  static MSG_RECV_ACK: number = 3003;
+  static MSG_REVOKE: number = 3004;
+  static MSG_EDIT: number = 3005;
+  static MSG_AGENT_STATUS: number = 3006;
+  static MSG_CUSTOM_EVENT: number = 3007;
+  // 已读
+  static READ_REPORT: number = 4000;
+  static READ_NOTIFY: number = 4001;
+  static READ_NOTIFY_AGG: number = 4002;
+  // 同步
+  static SYNC_REQ: number = 5000;
+  static SYNC_RESP: number = 5001;
+  // 会话
+  static CONV_UPDATE: number = 6000;
+  static CONV_UNREAD: number = 6001;
+  // 会议（本期不实现）
+  static MEETING_SIGNAL: number = 7000;
+  // 联系人
+  static CONTACT_UPDATE: number = 8000;
+  // 控制
+  static KICK: number = 9000;
+  static ERROR: number = 9001;
+}
+
+/**
+ * CONNECT_REJECT 的 errorCode 分类。
+ * - RETRYABLE：客户端可退避重连
+ * - NON_RETRYABLE：客户端不应再重连（鉴权失败 / 账号停用 / tabs 超限 等）
+ *
+ * 证据：nuwax-im ImHandshakeAuthHandler.java:347-380、docs/07:1988-2002。
+ */
+export const IM_RETRYABLE_REJECT_CODES: Array<string> = [
+  "IM_90002", // 内部错误（瞬态）
+  "IM_10503", // 平台不可用（瞬态）
+];
+
+export const IM_NON_RETRYABLE_REJECT_CODES: Array<string> = [
+  "IM_10401", // token 无效 / 缺失
+  "IM_10403", // 账号被停用
+  "IM_10429", // 同设备 tab>5
+  "IM_90001", // deviceId 非法
+  "IM_90003", // Origin 不在白名单（移动端不应触发）
+  "IM_10003", // 首帧超时 >10s（多半是网络问题，但服务端标记不可重试）
+];
+
+/** 判断 CONNECT_REJECT code 是否可重试。 */
+export function isRetryableRejectCode(code: string | null | undefined): boolean {
+  if (code == null) {
+    return false;
+  }
+  return IM_RETRYABLE_REJECT_CODES.indexOf(`${code}`) >= 0;
+}
+
+/**
+ * Envelope（NON_NULL 解析，键缺失即 undefined）。
+ * - 上行 envelope 必须包含 v / op / reqId；body / seq / ts 可选
+ * - 下行 envelope 由服务端原样回带 reqId，code 仅 ERROR/CONNECT_REJECT 等帧顶存在
+ *
+ * 注：UTS 中对象字面量不能直接赋值给 interface，只能赋值给 class。
+ * 因此定义成 class（无构造方法，直接由调用方 `new ImEnvelope()` 后逐字段赋值）。
+ */
+export class ImEnvelope {
+  v: number = 0;
+  op: number = 0;
+  reqId: string = "";
+  seq: number | null = null;
+  ts: number | null = null;
+  code: string | null = null;
+  body: UTSJSONObject | null = null;
+}
+
+/** 简易 reqId 生成器：<prefix>-<random>。调用方保证唯一性。 */
+export function newImReqId(prefix: string): string {
+  let suffix = "";
+  for (let i = 0; i < 12; i++) {
+    suffix += Math.floor(Math.random() * 16).toString(16);
+  }
+  return `${prefix}-${suffix}`;
+}
+
+/**
+ * 把任意 ID 归一为字符串（雪花号 18-19 位 > 2^53，转 string 保精度）。
+ * null/undefined → ""。
+ */
+export function imFormatId(raw: any | null | undefined): string {
+  if (raw == null) {
+    return "";
+  }
+  if (typeof raw === "string") {
+    return raw;
+  }
+  if (typeof raw === "number") {
+    return `${raw}`;
+  }
+  return `${raw}`;
+}
+
+/**
+ * 安全 JSON 解析。失败返回 null。
+ * UTS JSON 解析对 Android UTSJSONObject 类型系统敏感：优先用 JSON.parse 标准路径，
+ * 异常一律吞掉（避免坏帧把 WS 拉崩）。
+ */
+export function imSafeJsonParse(text: string): UTSJSONObject | null {
+  if (text == null || text.length == 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed != null && typeof parsed === "object") {
+      return parsed as UTSJSONObject;
+    }
+    return null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * 把 envelope 序列化为 JSON 字符串（UTF-8）。
+ * NON_NULL 风格：undefined 字段不写入。
+ */
+export function imStringifyEnvelope(env: ImEnvelope): string {
+  // 手写以保留 NON_NULL 语义（uts JSON.stringify 默认会写入 null）
+  const out = new UTSJSONObject();
+  out["v"] = env.v;
+  out["op"] = env.op;
+  out["reqId"] = env.reqId;
+  if (env.seq != null) {
+    out["seq"] = env.seq;
+  }
+  if (env.ts != null) {
+    out["ts"] = env.ts;
+  }
+  if (env.code != null) {
+    out["code"] = env.code;
+  }
+  if (env.body != null) {
+    out["body"] = env.body;
+  }
+  return JSON.stringify(out);
+}
+
+/**
+ * 从 raw JSON 反序列化为 ImEnvelope。
+ * 字段缺失视为 undefined（NON_NULL 语义）。
+ */
+export function imParseEnvelope(raw: UTSJSONObject): ImEnvelope | null {
+  if (raw == null) {
+    return null;
+  }
+  const vRaw = raw["v"];
+  const opRaw = raw["op"];
+  const reqIdRaw = raw["reqId"];
+  if (typeof vRaw !== "number" || typeof opRaw !== "number" || typeof reqIdRaw !== "string") {
+    return null;
+  }
+  const env = new ImEnvelope();
+  env.v = vRaw;
+  env.op = opRaw;
+  env.reqId = reqIdRaw;
+  const seqRaw = raw["seq"];
+  if (typeof seqRaw === "number") {
+    env.seq = seqRaw;
+  }
+  const tsRaw = raw["ts"];
+  if (typeof tsRaw === "number") {
+    env.ts = tsRaw;
+  }
+  const codeRaw = raw["code"];
+  if (typeof codeRaw === "string") {
+    env.code = codeRaw;
+  }
+  const bodyRaw = raw["body"];
+  if (bodyRaw != null && typeof bodyRaw === "object") {
+    env.body = bodyRaw as UTSJSONObject;
+  }
+  return env;
+}
+
+/**
+ * clamp 心跳间隔到 [IM_HEARTBEAT_MIN_SEC, IM_HEARTBEAT_MAX_SEC]（秒）。
+ * 服务端可能配 0 或异常值，必须 clamp。
+ */
+export function imClampHeartbeatInterval(sec: any | null): number {
+  let n = 0;
+  if (typeof sec === "number") {
+    n = Math.floor(sec);
+  } else if (typeof sec === "string") {
+    n = parseInt(sec, 10);
+    if (isNaN(n)) {
+      n = 0;
+    }
+  }
+  if (n < IM_HEARTBEAT_MIN_SEC) {
+    return IM_HEARTBEAT_MIN_SEC;
+  }
+  if (n > IM_HEARTBEAT_MAX_SEC) {
+    return IM_HEARTBEAT_MAX_SEC;
+  }
+  return n;
+}

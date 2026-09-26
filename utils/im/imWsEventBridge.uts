@@ -1,0 +1,313 @@
+/**
+ * IM WS 帧 → eventBus 事件映射（纯函数，不持状态）。
+ *
+ * 接收 envelope（已解析），按 op 分发到对应 eventBus 事件。
+ * ImWsClient 在收到 onMessage 时调用本模块，**先 ACK 后 emit** 的责任
+ * 由 ImWsClient 在调本模块前完成（MSG_RECV_ACK(3003)）。
+ *
+ * 不识别的 op 安全忽略（服务端会随版本新增 op，老客户端必须容错）。
+ */
+import eventBus from "@/utils/eventBus";
+import {
+  IM_OP,
+  type ImEnvelope,
+  imFormatId,
+  isRetryableRejectCode,
+} from "./imProtocol";
+
+/** IM 事件名（与 constants/event.constants.uts 对齐）。 */
+export class IM_EVENT {
+  static MessageReceived: string = "im_message_received";
+  static MessageRevoked: string = "im_message_revoked";
+  static MessageEdited: string = "im_message_edited";
+  static ConversationUpdated: string = "im_conversation_updated";
+  static ConversationUnread: string = "im_conversation_unread";
+  static ReadNotified: string = "im_read_notified";
+  static AgentStatus: string = "im_agent_status";
+  static CustomEvent: string = "im_custom_event";
+  static ContactUpdated: string = "im_contact_updated";
+  static Kicked: string = "im_kicked";
+  // 注：不能叫 Error——与 UTS/Kotlin 内置 Error 类型同名会报「找不到名称 Error」
+  static ImError: string = "im_error";
+  static ConnectionState: string = "im_connection_state";
+  static AuthInvalid: string = "im_auth_invalid";
+}
+
+export type ImConnectionStateValue = "connecting" | "open" | "reconnecting" | "failed" | "closed";
+
+/**
+ * 入口：分发一帧 envelope。
+ *
+ * @param env 已解析的 envelope（来自 ImWsClient.onMessage）
+ * @returns true 表示已处理（用于日志/调试）；false 表示忽略（未识别 op）
+ */
+export function dispatchImEnvelope(env: ImEnvelope): boolean {
+  switch (env.op) {
+    case IM_OP.CONNECT_ACK:
+      handleConnectAck(env);
+      return true;
+    case IM_OP.CONNECT_REJECT:
+      handleConnectReject(env);
+      return true;
+    case IM_OP.MSG_RECV:
+      handleMessageRecv(env);
+      return true;
+    case IM_OP.MSG_REVOKE:
+      handleMessageRevoke(env);
+      return true;
+    case IM_OP.MSG_EDIT:
+      handleMessageEdit(env);
+      return true;
+    case IM_OP.MSG_AGENT_STATUS:
+      handleAgentStatus(env);
+      return true;
+    case IM_OP.MSG_CUSTOM_EVENT:
+      handleCustomEvent(env);
+      return true;
+    case IM_OP.READ_NOTIFY:
+    case IM_OP.READ_NOTIFY_AGG:
+      handleReadNotify(env);
+      return true;
+    case IM_OP.CONV_UPDATE:
+      handleConvUpdate(env);
+      return true;
+    case IM_OP.CONV_UNREAD:
+      handleConvUnread(env);
+      return true;
+    case IM_OP.CONTACT_UPDATE:
+      handleContactUpdate(env);
+      return true;
+    case IM_OP.KICK:
+      handleKick(env);
+      return true;
+    case IM_OP.ERROR:
+      handleError(env);
+      return true;
+    // PING / PONG / MSG_RECV_ACK / READ_REPORT / SYNC_RESP / 其他下行
+    default:
+      return false;
+  }
+}
+
+// ==================== 帧处理函数 ====================
+
+function handleConnectAck(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  const heartbeatRaw = body["heartbeatInterval"];
+  const heartbeatInterval = typeof heartbeatRaw === "number" ? heartbeatRaw : null;
+  const serverTimeRaw = body["serverTime"];
+  const serverTime = typeof serverTimeRaw === "number" ? serverTimeRaw : null;
+  const deviceIdRaw = body["deviceId"];
+  const deviceId = typeof deviceIdRaw === "string" ? deviceIdRaw : "";
+  eventBus.emit(IM_EVENT.ConnectionState, {
+    state: "open" as ImConnectionStateValue,
+    heartbeatInterval,
+    serverTime,
+    deviceId,
+    reqId: env.reqId,
+  });
+}
+
+function handleConnectReject(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  const codeRaw = body["code"];
+  const code = typeof codeRaw === "string" ? codeRaw : `${env.code ?? ""}`;
+  const messageRaw = body["message"];
+  const message = typeof messageRaw === "string" ? messageRaw : "";
+  const retryable = isRetryableRejectCode(code);
+  eventBus.emit(IM_EVENT.ConnectionState, {
+    state: "failed" as ImConnectionStateValue,
+    code,
+    message,
+    retryable,
+    reqId: env.reqId,
+  });
+  // 非重试 code → 触发踢登录链路
+  if (!retryable) {
+    eventBus.emit(IM_EVENT.AuthInvalid, {
+      code,
+      message,
+      source: "connect_reject",
+    });
+  }
+}
+
+function handleMessageRecv(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  // 解析字段到本地变量，避免 UTS 类型推断问题（Any? 不能直接赋给 strict 字段）
+  const seqRaw = body["seq"];
+  const seqVal = typeof seqRaw === "number" ? seqRaw : null;
+  const sendTimeRaw = body["sendTime"];
+  const sendTimeVal = typeof sendTimeRaw === "number" ? sendTimeRaw : 0;
+  const mentionAllVal: boolean = body["mentionAll"] === true;
+  const clientMsgIdVal = body["clientMsgId"];
+  const convDigestVal = body["convDigest"];
+  const mentionUserIdsVal = body["mentionUserIds"];
+  const agentStatusDetailVal = body["agentStatusDetail"];
+  // 原样下发业务层，由订阅者按需解析；ID 已在服务端 string 化（雪花的 JSON number 客户端拿到时已转 string）
+  eventBus.emit(IM_EVENT.MessageReceived, {
+    msgId: imFormatId(body["msgId"]),
+    convId: imFormatId(body["convId"]),
+    seq: seqVal,
+    senderId: imFormatId(body["senderId"]),
+    senderType: body["senderType"] ?? null,
+    senderName: body["senderName"] ?? "",
+    senderAvatar: body["senderAvatar"] ?? "",
+    msgType: body["msgType"] ?? "",
+    body: body["body"] ?? null,
+    digest: body["digest"] ?? "",
+    replyToMsgId: imFormatId(body["replyToMsgId"]),
+    mentionUserIds: mentionUserIdsVal,
+    mentionAll: mentionAllVal,
+    clientMsgId: clientMsgIdVal,
+    msgStatus: body["msgStatus"] ?? 1,
+    revokeTime: body["revokeTime"] ?? null,
+    revokeBy: imFormatId(body["revokeBy"]),
+    editTime: body["editTime"] ?? null,
+    sendTime: sendTimeVal,
+    readCount: body["readCount"] ?? 0,
+    agentStatusDetail: agentStatusDetailVal,
+    // ★仅下行帧带 convDigest，用于会话列表局部更新
+    convDigest: convDigestVal,
+    raw: body,
+    reqId: env.reqId,
+  });
+}
+
+function handleMessageRevoke(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  // 提取局部变量后用 typeof 收窄（内联三元 + as number 在 Kotlin 后端无法推断）
+  const revokeTimeRaw = body["revokeTime"];
+  const revokeTime = typeof revokeTimeRaw === "number" ? revokeTimeRaw : 0;
+  eventBus.emit(IM_EVENT.MessageRevoked, {
+    msgId: imFormatId(body["msgId"]),
+    convId: imFormatId(body["convId"]),
+    revokeBy: imFormatId(body["revokeBy"]),
+    revokeTime: revokeTime,
+    reqId: env.reqId,
+  });
+}
+
+function handleMessageEdit(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  const editTimeRaw = body["editTime"];
+  const editTime = typeof editTimeRaw === "number" ? editTimeRaw : 0;
+  eventBus.emit(IM_EVENT.MessageEdited, {
+    msgId: imFormatId(body["msgId"]),
+    convId: imFormatId(body["convId"]),
+    body: body["body"] ?? null,
+    editTime: editTime,
+    reqId: env.reqId,
+  });
+}
+
+function handleAgentStatus(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  const updateTimeRaw = body["updateTime"];
+  const updateTime = typeof updateTimeRaw === "number" ? updateTimeRaw : 0;
+  eventBus.emit(IM_EVENT.AgentStatus, {
+    convId: imFormatId(body["convId"]),
+    msgId: imFormatId(body["msgId"]),
+    agentSubjectId: imFormatId(body["agentSubjectId"]),
+    status: body["status"] ?? null,
+    failCode: body["failCode"] ?? null,
+    failReason: body["failReason"] ?? null,
+    updateTime: updateTime,
+    reqId: env.reqId,
+  });
+}
+
+function handleCustomEvent(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  const tsRaw = body["ts"];
+  const tsVal = typeof tsRaw === "number" ? tsRaw : 0;
+  eventBus.emit(IM_EVENT.CustomEvent, {
+    eventId: body["eventId"] ?? "",
+    eventType: body["eventType"] ?? "",
+    payload: body["payload"] ?? null,
+    ts: tsVal,
+    reqId: env.reqId,
+  });
+}
+
+function handleReadNotify(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  const isAgg = env.op === IM_OP.READ_NOTIFY_AGG;
+  const countRaw = body["count"];
+  const countVal = typeof countRaw === "number" ? countRaw : 0;
+  // 聚合帧无 readByUserIds（传 null，消费方按 aggregated 区分）；空数组字面量在 Kotlin 后端无法推断
+  const readByUserIdsRaw = body["readByUserIds"];
+  eventBus.emit(IM_EVENT.ReadNotified, {
+    convId: imFormatId(body["convId"]),
+    msgId: imFormatId(body["msgId"]),
+    readByUserIds: isAgg ? null : readByUserIdsRaw,
+    count: isAgg ? countVal : 0,
+    aggregated: isAgg,
+    reqId: env.reqId,
+  });
+}
+
+function handleConvUpdate(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  eventBus.emit(IM_EVENT.ConversationUpdated, {
+    convId: imFormatId(body["convId"]),
+    reason: body["reason"] ?? "PROFILE",
+    snapshot: body,
+    reqId: env.reqId,
+  });
+}
+
+function handleConvUnread(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  // unreadCount 键缺失 ≠ 0（NON_NULL），保持原值
+  const unreadRaw = body["unreadCount"];
+  const unreadVal = typeof unreadRaw === "number" ? unreadRaw : null;
+  eventBus.emit(IM_EVENT.ConversationUnread, {
+    convId: imFormatId(body["convId"]),
+    unreadCount: unreadVal,
+    reqId: env.reqId,
+  });
+}
+
+function handleContactUpdate(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  eventBus.emit(IM_EVENT.ContactUpdated, {
+    action: body["action"] ?? "",
+    peerUserId: imFormatId(body["peerUserId"]),
+    actorUserId: imFormatId(body["actorUserId"]),
+    reqId: env.reqId,
+  });
+}
+
+function handleKick(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  // ★优先读 stopReconnect，不要 switch reason
+  const stopRaw = body["stopReconnect"];
+  const stopReconnect = stopRaw === true || stopRaw === "true";
+  const retryAfterRaw = body["retryAfterSec"];
+  const retryAfterSec = typeof retryAfterRaw === "number" ? (retryAfterRaw as number) : 0;
+  eventBus.emit(IM_EVENT.Kicked, {
+    reason: body["reason"] ?? "",
+    message: body["message"] ?? "",
+    retryAfterSec,
+    stopReconnect,
+    reqId: env.reqId,
+  });
+  // stopReconnect=true → 触发踢登录链路
+  if (stopReconnect) {
+    eventBus.emit(IM_EVENT.AuthInvalid, {
+      code: `KICK_${body["reason"] ?? "unknown"}`,
+      message: body["message"] ?? "",
+      source: "kick",
+    });
+  }
+}
+
+function handleError(env: ImEnvelope): void {
+  const body = env.body ?? ({} as UTSJSONObject);
+  eventBus.emit(IM_EVENT.ImError, {
+    code: typeof env.code === "string" ? env.code : "",
+    message: body["message"] ?? "",
+    reqId: env.reqId,
+  });
+}

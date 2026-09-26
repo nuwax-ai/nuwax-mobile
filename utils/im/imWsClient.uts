@@ -1,0 +1,578 @@
+/**
+ * nuwax-mobile IM WebSocket 客户端（单例）。
+ *
+ * 协议细节参考 docs/07-移动端APP对接文档.md（nuwax-im 仓库）。
+ *
+ * 关键事实：
+ * - onOpen 第一件事就是发 CONNECT(1000)（握手超时 10s 从 TCP accept 起算）
+ * - 心跳间隔必须读 CONNECT_ACK.body.heartbeatInterval，不要硬编码
+ * - MSG_RECV 必须先回 ACK(3003) 再 emit（先 ACK 后落盘，反之中途崩了永久丢）
+ * - 重连退避 1→2→4→8→16→30s，连上后重置 + 调 HTTP /sync 兜底
+ * - onHide 不要 close，只 pauseKeepalive（iOS 后台 30s 自然断）
+ * - onShow reconnect('foreground') 强制重连（OS 后台期间 socket 状态不可信）
+ *
+ * 复用现有：
+ * - getImDeviceId() @ servers/im.uts:29-56
+ * - getApiBaseUrl() @ constants/config.uts
+ * - applyBearerAuthorization() @ utils/authSession.uts:61
+ * - apiImSync() @ servers/im.uts（HTTP 兜底）
+ */
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { getApiBaseUrl } from "@/constants/config";
+import { applyBearerAuthorization } from "@/utils/authSession";
+import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+import { getImDeviceId, apiImSync } from "@/servers/im";
+import { apiResData } from "@/utils/apiResponse";
+import eventBus from "@/utils/eventBus";
+import {
+  IM_WS_PATH,
+  IM_OP,
+  IM_PROTOCOL_VERSION,
+  IM_DEFAULT_HEARTBEAT_INTERVAL_SEC,
+  ImEnvelope,
+  imSafeJsonParse,
+  imParseEnvelope,
+  imStringifyEnvelope,
+  imClampHeartbeatInterval,
+  newImReqId,
+  imFormatId,
+} from "./imProtocol";
+import { ApiImSyncParams } from "@/servers/im";
+import {
+  createImWsSocketAdapter,
+  type ImWsSocketAdapter,
+} from "./imWsSocketAdapter";
+import { dispatchImEnvelope, IM_EVENT } from "./imWsEventBridge";
+
+/** 调试日志开关（上线置 false）。 */
+export const IM_WS_DEBUG = true;
+
+/** 重连退避曲线（毫秒）。连上后从 0 开始累计。 */
+const IM_RECONNECT_BACKOFF_MS: Array<number> = [
+  1000,
+  2000,
+  4000,
+  8000,
+  16000,
+  30000,
+];
+
+/** 重连最大连续失败次数（超过后停止重连，避免无意义死循环）。 */
+const IM_RECONNECT_MAX_FAILURES = 30;
+
+function imLog(msg: string): void {
+  if (IM_WS_DEBUG) {
+    console.log(`[ImWs] ${msg}`);
+  }
+}
+
+function imWarn(msg: string): void {
+  console.warn(`[ImWs] ${msg}`);
+}
+
+/** 从 storage 读 token（参照 imUnreadBadge.uts:91-99）。 */
+function readAccessToken(): string {
+  try {
+    const raw = uni.getStorageSync(ACCESS_TOKEN);
+    if (raw == null) {
+      return "";
+    }
+    const s = `${raw}`;
+    if (s == "undefined" || s == "null" || s.length == 0) {
+      return "";
+    }
+    return s;
+  } catch (_e) {
+    return "";
+  }
+}
+
+/** 派生 WS URL：baseURL → ws/wss + path + H5 query 拼 token。 */
+function buildImWsUrl(token: string): string {
+  let base = getApiBaseUrl();
+  if (base.startsWith("https://")) {
+    base = "wss://" + base.substring(8);
+  } else if (base.startsWith("http://")) {
+    base = "ws://" + base.substring(7);
+  }
+  let url = base + IM_WS_PATH;
+  // 仅浏览器 H5 走 Query；App/MP/App 内嵌 H5 走 Authorization Header
+  // #ifdef H5 || WEB
+  if (!isAppWebViewEmbedded()) {
+    url += "?access_token=" + encodeURIComponent(token);
+  }
+  // #endif
+  return url;
+}
+
+/** 派生握手 Header。App/MP 必写 Authorization；H5 仅在 App 内嵌时写。 */
+function buildImWsHeaders(token: string): UTSJSONObject {
+  const header = new UTSJSONObject();
+  applyBearerAuthorization(header, token);
+  return header;
+}
+
+// =================================================================
+// ImWsClient 单例 class
+// =================================================================
+
+class ImWsClientImpl {
+  private adapter: ImWsSocketAdapter | null = null;
+  /** 代际号，每次重连 bump。onOpen/onMessage 首行校验，丢弃迟回调。 */
+  private generation: number = 0;
+  /** 当前状态。 */
+  private state: "disconnected" | "connecting" | "open" | "reconnecting" | "failed" =
+    "disconnected";
+  /** 重连失败累计计数（连上后归零）。 */
+  private reconnectFailures: number = 0;
+  /** 心跳定时器 id。 */
+  private pingTimerId: number | null = null;
+  /** 重连定时器 id（用于取消）。 */
+  private reconnectTimerId: number | null = null;
+  /** 后台标记（onHide 暂停心跳但不关 socket）。 */
+  private inBackground: boolean = false;
+  /** 是否主动 close（区分主动 vs 异常，避免误重连）。 */
+  private manualClosed: boolean = false;
+  /** 当前服务端下发的心跳间隔（毫秒）。 */
+  private heartbeatIntervalMs: number = IM_DEFAULT_HEARTBEAT_INTERVAL_SEC * 1000;
+  /** App.onLaunch 中调用一次：注册 adapter、注册网络状态监听。 */
+  private inited: boolean = false;
+  /** 最近一次 CONNECT_ACK 的 envelope（用于 status 转换后的副作用入口）。 */
+  private lastConnectAckEnv: ImEnvelope | null = null;
+
+  /** 启动：token 已就绪则 connect；未就绪不报错（等 token 落地后由调用方 reconnect）。 */
+  start(): void {
+    if (!this.inited) {
+      this.init();
+    }
+    const token = readAccessToken();
+    if (token.length == 0) {
+      imLog("start: no token, skip connect");
+      return;
+    }
+    this.manualClosed = false;
+    this.connect();
+  }
+
+  /** 彻底停：清心跳 + close(force=true 不重连)。 */
+  stop(): void {
+    imLog("stop");
+    this.manualClosed = true;
+    this.cancelReconnect();
+    this.stopPingLoop();
+    const adapter = this.adapter;
+    if (adapter != null) {
+      adapter.close(true);
+    }
+    this.state = "disconnected";
+    this.emitState("closed");
+  }
+
+  /**
+   * 强制重连（用于 onShow / 网络恢复）。
+   * - bump generation 丢弃迟回调
+   * - close 旧 socket（异常关，触发 onClose → 但因为 generation 已 bump，onClose 内部会忽略）
+   * - 重置 backoff
+   */
+  reconnect(reason: string): void {
+    imLog(`reconnect by ${reason}`);
+    if (this.adapter != null) {
+      this.adapter.close(false);
+    }
+    this.stopPingLoop();
+    this.cancelReconnect();
+    this.reconnectFailures = 0;
+    this.manualClosed = false;
+    this.connect();
+  }
+
+  /** 暂停心跳（onHide）。不关 socket。 */
+  pauseKeepalive(): void {
+    imLog("pauseKeepalive");
+    this.inBackground = true;
+    this.stopPingLoop();
+  }
+
+  /** 恢复心跳 + 强制重连（onShow）。OS 后台 30s 自然断，不可信。 */
+  resumeKeepaliveAndReconnect(): void {
+    imLog("resumeKeepaliveAndReconnect");
+    this.inBackground = false;
+    // 强制重建（即使 readyState 显示 OPEN，因为 OS 后台可能已静默断开）
+    this.reconnect("foreground");
+  }
+
+  /** 当前是否 OPEN（业务层订阅 ConnectionState 时可参考）。 */
+  isOpen(): boolean {
+    return this.state === "open" && this.adapter != null && this.adapter.isOpen();
+  }
+
+  // ---------------- 私有方法 ----------------
+
+  private init(): void {
+    if (this.inited) {
+      return;
+    }
+    this.inited = true;
+    this.adapter = createImWsSocketAdapter();
+    this.adapter.onOpen((): void => {
+      this.handleOpen();
+    });
+    this.adapter.onMessage((data: string): void => {
+      this.handleMessage(data);
+    });
+    this.adapter.onError((errMsg: string): void => {
+      this.handleError(errMsg);
+    });
+    this.adapter.onClose((code: number | null, reason: string | null): void => {
+      this.handleClose(code, reason);
+    });
+    // 网络状态监听（仓库目前未用过 uni.onNetworkStatusChange）
+    try {
+      uni.onNetworkStatusChange((res: OnNetworkStatusChangeCallbackResult): void => {
+        if (res.isConnected) {
+          // 断网恢复 → 重连
+          this.reconnect("network");
+        }
+      });
+    } catch (_e) {
+      // 旧版 uni-app x 无此 API，不阻断
+    }
+  }
+
+  private connect(): void {
+    if (this.manualClosed) {
+      return;
+    }
+    const token = readAccessToken();
+    if (token.length == 0) {
+      imLog("connect: no token, skip");
+      return;
+    }
+    const url = buildImWsUrl(token);
+    const headers = buildImWsHeaders(token);
+    imLog(`connect: ${url}`);
+    this.state = "connecting";
+    this.emitState("connecting");
+    // adapter.connect 内部会 bump generation
+    this.adapter!.connect(url, headers);
+  }
+
+  private handleOpen(): void {
+    imLog("onOpen: send CONNECT");
+    // ★ 握手超时 10s 从 TCP accept 起算 → 第一件事就是发 CONNECT
+    const body = new UTSJSONObject();
+    body["token"] = readAccessToken();
+    body["deviceId"] = getImDeviceId();
+    body["platform"] = "miniapp";
+    body["lastAckSeq"] = 0;
+    const env = new ImEnvelope();
+    env.v = IM_PROTOCOL_VERSION;
+    env.op = IM_OP.CONNECT;
+    env.reqId = newImReqId("c");
+    env.ts = Date.now();
+    env.body = body;
+    this.sendEnvelope(env);
+  }
+
+  private handleMessage(rawText: string): void {
+    const obj = imSafeJsonParse(rawText);
+    if (obj == null) {
+      imWarn("onMessage: parse fail");
+      return;
+    }
+    const env = imParseEnvelope(obj);
+    if (env == null) {
+      imWarn("onMessage: envelope invalid");
+      return;
+    }
+
+    // MSG_RECV：先 ACK(3003)，再分发（先 ACK 后落盘，反之中途崩了永久丢）
+    if (env.op === IM_OP.MSG_RECV && env.body != null) {
+      const ackBody = new UTSJSONObject();
+      ackBody["convId"] = imFormatId(env.body["convId"]);
+      const seqRaw = env.body["seq"];
+      if (typeof seqRaw === "number") {
+        ackBody["seq"] = seqRaw;
+      }
+      const ackEnv = new ImEnvelope();
+      ackEnv.v = IM_PROTOCOL_VERSION;
+      ackEnv.op = IM_OP.MSG_RECV_ACK;
+      ackEnv.reqId = newImReqId("ack");
+      ackEnv.body = ackBody;
+      this.sendEnvelope(ackEnv);
+    }
+
+    // CONNECT_ACK：状态机直接处理（启动心跳 + /sync 兜底），再交给 eventBus
+    if (env.op === IM_OP.CONNECT_ACK) {
+      this.handleConnectAck(env);
+    }
+
+    // CONNECT_REJECT：标记状态机失败，eventBus 已在 dispatchImEnvelope 中 emit
+    if (env.op === IM_OP.CONNECT_REJECT) {
+      this.handleConnectReject(env);
+    }
+
+    // PONG：心跳响应（不 emit 业务事件）
+    if (env.op === IM_OP.PONG) {
+      return;
+    }
+
+    // 分发到 eventBus（CONNECT_ACK 也分发，ImWsEventBridge 会 emit ConnectionState=open）
+    dispatchImEnvelope(env);
+  }
+
+  private handleError(errMsg: string): void {
+    imWarn(`onError: ${errMsg}`);
+    // adapter 已自己 close，handleClose 会接住
+  }
+
+  private handleClose(code: number | null, reason: string | null): void {
+    imLog(`onClose: code=${code} reason=${reason} manual=${this.manualClosed}`);
+    this.stopPingLoop();
+    if (this.manualClosed) {
+      this.state = "disconnected";
+      return;
+    }
+    // 异常关 → 走退避重连（除非已达上限）
+    if (this.reconnectFailures >= IM_RECONNECT_MAX_FAILURES) {
+      this.state = "failed";
+      this.emitState("failed");
+      imWarn(`reconnect max failures (${IM_RECONNECT_MAX_FAILURES}) reached, stop`);
+      return;
+    }
+    this.scheduleReconnect();
+  }
+
+  private handleConnectAck(env: ImEnvelope): void {
+    const body = env.body ?? ({} as UTSJSONObject);
+    const hbSec = imClampHeartbeatInterval(body["heartbeatInterval"]);
+    this.heartbeatIntervalMs = hbSec * 1000;
+    imLog(`CONNECT_ACK heartbeatInterval=${hbSec}s`);
+    this.state = "open";
+    this.reconnectFailures = 0;
+    if (!this.inBackground) {
+      this.startPingLoop();
+    }
+    // ★ 重连成功后调一次 HTTP /sync 兜底
+    this.runSyncFallback();
+  }
+
+  private handleConnectReject(env: ImEnvelope): void {
+    this.state = "failed";
+    this.stopPingLoop();
+    const body = env.body ?? ({} as UTSJSONObject);
+    const codeRaw = body["code"];
+    const code = typeof codeRaw === "string" ? codeRaw : `${env.code ?? ""}`;
+    imWarn(`CONNECT_REJECT code=${code}`);
+    // 重试性 code → emit 后由 App 层选择是否重试（这里默认不重试，让上层通过 reconnect() 触发）
+    // 非重试性 code → 已经触发 im_auth_invalid，App.uvue 会监听并 stop
+  }
+
+  /** 通过 ConnectionState 事件对外广播状态。 */
+  private emitState(value: string): void {
+    eventBus.emit(IM_EVENT.ConnectionState, {
+      state: value,
+      ts: Date.now(),
+    });
+  }
+
+  // ---------------- 心跳 ----------------
+
+  private startPingLoop(): void {
+    this.stopPingLoop();
+    if (this.inBackground) {
+      return;
+    }
+    const intervalMs = this.heartbeatIntervalMs;
+    // setInterval 直接返回 number（仓库惯用法见 streamRequest.uts:1236-1249，无需强转）
+    this.pingTimerId = setInterval((): void => {
+      this.sendPing();
+    }, intervalMs);
+  }
+
+  private stopPingLoop(): void {
+    // 提取局部变量：可变属性无法 smart cast（Kotlin 并发限制）
+    const timerId = this.pingTimerId;
+    if (timerId != null) {
+      try {
+        clearInterval(timerId);
+      } catch (_e) {
+        // ignore
+      }
+      this.pingTimerId = null;
+    }
+  }
+
+  private sendPing(): void {
+    const env = new ImEnvelope();
+    env.v = IM_PROTOCOL_VERSION;
+    env.op = IM_OP.PING;
+    env.reqId = newImReqId("p");
+    env.ts = Date.now();
+    const ok = this.sendEnvelope(env);
+    if (!ok) {
+      imWarn("ping send fail → trigger reconnect");
+      this.reconnect("ping_fail");
+    }
+  }
+
+  // ---------------- 重连 ----------------
+
+  private scheduleReconnect(): void {
+    this.cancelReconnect();
+    this.state = "reconnecting";
+    this.emitState("reconnecting");
+    const idx = Math.min(this.reconnectFailures, IM_RECONNECT_BACKOFF_MS.length - 1);
+    const backoff = IM_RECONNECT_BACKOFF_MS[idx];
+    this.reconnectFailures += 1;
+    imLog(`scheduleReconnect in ${backoff}ms (attempt ${this.reconnectFailures})`);
+    this.reconnectTimerId = setTimeout((): void => {
+      this.reconnectTimerId = null;
+      this.connect();
+    }, backoff);
+  }
+
+  private cancelReconnect(): void {
+    const timerId = this.reconnectTimerId;
+    if (timerId != null) {
+      try {
+        clearTimeout(timerId);
+      } catch (_e) {
+        // ignore
+      }
+      this.reconnectTimerId = null;
+    }
+  }
+
+  // ---------------- HTTP 兜底 ----------------
+
+  private async runSyncFallback(): Promise<void> {
+    try {
+      const params: ApiImSyncParams = new ApiImSyncParams();
+      params.fullSync = false;
+      params.limitPerConv = 100;
+      const res = await apiImSync(params);
+      if (res == null) {
+        return;
+      }
+      // apiResData 取 data（(res as any)["data"] 在 Kotlin 后端会解析成字符串下标）
+      const resDataRaw = apiResData<any>(res);
+      const dataRaw = resDataRaw != null ? (resDataRaw as UTSJSONObject) : null;
+      if (dataRaw == null) {
+        return;
+      }
+      // 把同步结果通过 im_message_received 事件再 emit 一次（业务层会按 msgId 去重）
+      const messagesRaw = dataRaw["messages"];
+      if (Array.isArray(messagesRaw)) {
+        for (let i = 0; i < messagesRaw.length; i++) {
+          const m = messagesRaw[i] as UTSJSONObject;
+          if (m == null) {
+            continue;
+          }
+          eventBus.emit(IM_EVENT.MessageReceived, {
+            msgId: imFormatId(m["msgId"]),
+            convId: imFormatId(m["convId"]),
+            seq: typeof m["seq"] === "number" ? (m["seq"] as number) : null,
+            senderId: imFormatId(m["senderId"]),
+            senderType: m["senderType"] ?? null,
+            senderName: m["senderName"] ?? "",
+            msgType: m["msgType"] ?? "",
+            body: m["body"] ?? null,
+            digest: m["digest"] ?? "",
+            sendTime: typeof m["sendTime"] === "number" ? (m["sendTime"] as number) : 0,
+            revokeTime: m["revokeTime"] ?? null,
+            editTime: m["editTime"] ?? null,
+            msgStatus: m["msgStatus"] ?? 1,
+            raw: m,
+            reqId: "sync-fallback",
+          });
+        }
+      }
+      // 会话摘要更新
+      const conversationsRaw = dataRaw["conversations"];
+      if (Array.isArray(conversationsRaw)) {
+        for (let i = 0; i < conversationsRaw.length; i++) {
+          const c = conversationsRaw[i] as UTSJSONObject;
+          if (c == null) {
+            continue;
+          }
+          eventBus.emit(IM_EVENT.ConversationUpdated, {
+            convId: imFormatId(c["convId"]),
+            reason: "SYNC_FALLBACK",
+            snapshot: c,
+            reqId: "sync-fallback",
+          });
+        }
+      }
+    } catch (e) {
+      imWarn(`sync fallback failed: ${e != null ? `${e}` : "unknown"}`);
+    }
+  }
+
+  // ---------------- 发帧 ----------------
+
+  private sendEnvelope(env: ImEnvelope): boolean {
+    if (this.adapter == null) {
+      return false;
+    }
+    const text = imStringifyEnvelope(env);
+    return this.adapter.send(text);
+  }
+}
+
+// =================================================================
+// 单例 + 公开 API
+// =================================================================
+
+let _instance: ImWsClientImpl | null = null;
+
+function getInstance(): ImWsClientImpl {
+  // 局部变量承接：模块级可变变量无法 smart cast 非空
+  let ins = _instance;
+  if (ins == null) {
+    ins = new ImWsClientImpl();
+    _instance = ins;
+  }
+  return ins;
+}
+
+/** App.onLaunch 调用一次：启动 WS（自动等待 token 就绪）。 */
+export function initImWsClient(): void {
+  const ins = getInstance();
+  ins.start();
+}
+
+/** App.onShow 调用：恢复 + 强制重连。 */
+export function reconnectImWsOnForeground(): void {
+  const ins = getInstance();
+  ins.resumeKeepaliveAndReconnect();
+}
+
+/** App.onHide 调用：暂停心跳（不关 socket）。 */
+export function pauseImWsKeepalive(): void {
+  const ins = getInstance();
+  ins.pauseKeepalive();
+}
+
+/** 退出登录或 4010 踢登录时调用：彻底停。 */
+export function stopImWsClient(): void {
+  const ins = getInstance();
+  ins.stop();
+}
+
+/** 网络恢复时调用。 */
+export function reconnectImWsOnNetwork(): void {
+  const ins = getInstance();
+  ins.reconnect("network");
+}
+
+/** 当前是否 OPEN。 */
+export function isImWsOpen(): boolean {
+  const ins = getInstance();
+  return ins.isOpen();
+}
+
+/** 调试：导出单例（仅供测试）。 */
+export function _getImWsClientInstanceForTest(): ImWsClientImpl | null {
+  return _instance;
+}

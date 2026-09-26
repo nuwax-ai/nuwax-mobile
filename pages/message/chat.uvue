@@ -1,5 +1,10 @@
 <template>
-  <view class="chat-page">
+  <view
+    class="chat-page"
+    @touchstart="handlePageTouchStart($event)"
+    @touchend="handlePageTouchEnd($event)"
+    @touchcancel="handlePageTouchEnd($event)"
+  >
     <safety-zone />
 
     <!-- 顶部：返回 + 会话名（对齐参考设计 50+54 双段头，App 由 safety-zone 垫高；
@@ -41,8 +46,12 @@
       :scroll-into-view="scrollAnchor"
       :upper-threshold="50"
       :lower-threshold="50"
+      @scroll="handleChatScroll"
       @scrolltoupper="handleLoadOlder"
       @click="handleBodyTap"
+      @touchstart="handlePageTouchStart($event)"
+      @touchend="handlePageTouchEnd($event)"
+      @touchcancel="handlePageTouchEnd($event)"
     >
       <view v-if="loadingOlder" class="chat-foot">
         <text class="chat-foot__text">{{ t("Mobile.Page.loadingMore") }}</text>
@@ -74,15 +83,16 @@
         @touchmove="handleMsgTouchMove($event)"
         @touchend="handleMsgTouchEnd"
       >
-        <!-- 撤回 / 系统行：无正文无图无附件不进气泡（撤回的消息仍在列表里，勿过滤） -->
+        <!-- 撤回 / 系统行：无正文无图无附件不进气泡（撤回的消息仍在列表里，勿过滤）；
+             互动卡片（cardTitle 非空）走下方气泡渲染，不落 digest 系统行 -->
         <view
-          v-if="msg.bodyText.length == 0 && msg.imageUrl.length == 0 && msg.imageAtts.length == 0 && msg.linkAtts.length == 0 && (msg.revoked || msg.digest.length > 0)"
+          v-if="msg.bodyText.length == 0 && msg.imageUrl.length == 0 && msg.imageAtts.length == 0 && msg.linkAtts.length == 0 && msg.cardTitle.length == 0 && (msg.revoked || msg.digest.length > 0)"
           class="chat-sys"
         >
           <text class="chat-sys__text">{{ sysText(msg) }}</text>
         </view>
         <view
-          v-else-if="msg.bodyText.length > 0 || msg.imageUrl.length > 0 || msg.imageAtts.length > 0 || msg.linkAtts.length > 0"
+          v-else-if="msg.bodyText.length > 0 || msg.imageUrl.length > 0 || msg.imageAtts.length > 0 || msg.linkAtts.length > 0 || msg.cardTitle.length > 0"
           class="chat-row"
         >
           <view
@@ -118,11 +128,12 @@
               :src="msg.imageUrl"
               mode="aspectFill"
               @click="handleImageMsgTap(msg)"
+              @error="handleImageRenderError(msg)"
             />
             <view
               v-else
               class="chat-bubble"
-              hover-class="chat-bubble--active"
+              :hover-class="chatScrolling ? 'none' : 'chat-bubble--active'"
               @click="handleBubbleTap(msg)"
             >
               <!-- 引用的原消息：点击进全屏详情，可「定位到聊天位置」 -->
@@ -139,9 +150,36 @@
                   class="chat-quote__text text-ellipsis-2"
                 >{{ quotePreview(msg) }}</text>
               </view>
+              <!-- 互动卡片（msgType=card）：标题/正文/字段行 + 动作按钮（入群审核的同意/拒绝）。
+                   按钮形态由服务端回填的 state 决定（判据在 cardActionStateOf，对齐 PC lib/card.ts）；
+                   无 actions 的展示卡补一句「无需操作」，避免用户去点不可点的卡片本身 -->
+              <view v-if="msg.msgType == 'card' && msg.cardTitle.length > 0" class="chat-card">
+                <text class="chat-card__title">{{ msg.cardTitle }}</text>
+                <text v-if="msg.cardDesc.length > 0" class="chat-card__desc">{{ msg.cardDesc }}</text>
+                <view
+                  v-for="(field, fi) in msg.cardFields"
+                  :key="fi"
+                  class="chat-card__field"
+                >
+                  <text v-if="field.label.length > 0" class="chat-card__field-label">{{ field.label }}</text>
+                  <text class="chat-card__field-value">{{ field.value }}</text>
+                </view>
+                <view v-if="msg.cardActions.length > 0" class="chat-card__actions">
+                  <view
+                    v-for="action in cardVisibleActions(msg)"
+                    :key="action.key"
+                    :class="cardBtnClass(action)"
+                    :hover-class="cardActionClickable(action) ? 'chat-card__btn--active' : 'none'"
+                    @click="handleCardActionTap(msg, action)"
+                  >
+                    <text :class="cardBtnTextClass(action)">{{ cardActionText(action) }}</text>
+                  </view>
+                </view>
+                <text v-else class="chat-card__hint">{{ t("Mobile.Message.cardNoActionHint") }}</text>
+              </view>
               <!-- 富文本正文（Markdown 标记 + @提及高亮，嵌套 text 分段渲染）；
                    纯文本消息 bodyFormatted=false 走原路径（保留纯链接点击等零回归） -->
-              <view v-if="msg.bodyFormatted == true" class="chat-rich">
+              <view v-else-if="msg.bodyFormatted == true" class="chat-rich">
                 <view
                   v-for="(ln, li) in msg.lines"
                   :key="li"
@@ -184,6 +222,7 @@
                 :src="att.url"
                 mode="aspectFill"
                 @click="handleAttImageTap(msg, att)"
+                @error="handleAttImageRenderError(att)"
               />
               <!-- 文件 / 链接附件：展示文案，点击打开链接（微信交互） -->
               <view
@@ -773,6 +812,7 @@
     apiImConvPins,
     apiImEditMsg,
     apiImMessages,
+    apiImMsgRunAction,
     apiImPinMsg,
     apiImReadReport,
     apiImReadStatus,
@@ -788,8 +828,11 @@
   import { ChatSubpageTab } from "@/types/interfaces/chatSubpageTab";
   import { MsgActionItem } from "@/types/interfaces/msgActionItem";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import eventBus from "@/utils/eventBus";
+  import { EVENT_TYPE } from "@/constants/event.constants";
   import { writeClipboardText } from "@/utils/clipboard.uts";
   import { collectChatAttachments, resetChatAttachments } from "@/utils/imChatAttachments";
+  import { getCachedChatRecords, setCachedChatRecords } from "@/utils/im/imChatCache";
   import { isAuthProtectedFileUrl, openAuthProtectedLinkUrl } from "@/utils/authProtectedFileUrl";
   import { generateUUID } from "@/utils/common";
   import { uploadSingleFile } from "@/utils/fileUploader";
@@ -841,6 +884,28 @@
     url: string = "";
     fileName: string = "";
     mime: string = "";
+  }
+
+  /**
+   * 互动卡片动作（msgType=card 的按钮，入群审核卡的「同意/拒绝」）。
+   * ★payload/actionType 是服务端写给自己看的（"通过还是拒绝"藏在 payload 里），
+   *   客户端只回传 key，不读不回传 payload——点击语义由服务端从库里那条消息分发。
+   */
+  class ImCardAction {
+    key: string = "";
+    label: string = "";
+    /** 只影响配色不影响语义：primary=主色 / danger=红 / 其余（含缺省）=default。 */
+    style: string = "";
+    /** 当前状态：pending/done/stale/forbidden；★空=服务端未回填，按 pending（可点）。 */
+    state: string = "";
+    /** 状态文案（done/stale/forbidden 时展示；★由服务端给定，不本地拼口径）。 */
+    stateText: string = "";
+  }
+
+  /** 互动卡片字段行（label: value 键值对，纯展示）。 */
+  class ImCardField {
+    label: string = "";
+    value: string = "";
   }
 
   /** "@所有人" 提及 token（与 PC 端硬编码字面量逐字一致，勿走 i18n）。 */
@@ -934,6 +999,12 @@
     /** 富文本渲染模型：正文含 Markdown 标记/提及 token 时才置 true（否则走纯文本路径零回归）。 */
     bodyFormatted: boolean = false;
     lines: ImRichLine[] = [];
+    /** 互动卡片（msgType=card）：title 必填，空则不是卡片——回落 digest 系统行兜底。 */
+    cardTitle: string = "";
+    /** 卡片正文（desc 自足：digest= title+desc，未渲染卡片的端只看得到它）；subtitle 是 deprecated 等价旧名。 */
+    cardDesc: string = "";
+    cardFields: ImCardField[] = [];
+    cardActions: ImCardAction[] = [];
     avatarFailed: boolean = false;
   }
 
@@ -971,6 +1042,68 @@
   const hasMore = ref<boolean>(false);
   const loadingOlder = ref<boolean>(false);
   const scrollAnchor = ref<string>("");
+
+  // ===== 列表滚动中抑制气泡按压态（message.uvue 同款节流方案） =====
+  // 快速滑动（含惯性滚动）期间消息气泡不显示 hover 背景色，滚动停止 ~160ms 后恢复。
+  const chatScrolling = ref<boolean>(false);
+  let chatScrollIdleTimer = 0;
+
+  function handleChatScroll(): void {
+    if (chatScrolling.value != true) {
+      chatScrolling.value = true;
+    }
+    if (chatScrollIdleTimer != 0) {
+      clearTimeout(chatScrollIdleTimer);
+    }
+    chatScrollIdleTimer = setTimeout(() => {
+      chatScrollIdleTimer = 0;
+      chatScrolling.value = false;
+    }, 160);
+  }
+
+  // ===== 滑动吞击守卫 =====
+  // Android 上滑动手势的 touchup 可能被判定为 click：快速滑动消息列表后手指落在
+  // 底部工具键上会误拉表情/加号面板等。页面级记录触摸位移，超阈值时短暂置吞击标志，
+  // 面板入口的 click 处理器首行用 pageTapSwallowed() 拦截（50ms 后自动失效，不影响后续正常点击）。
+  let pageTouchStartX = 0;
+  let pageTouchStartY = 0;
+  let pageTouchSwallowed = false;
+  let pageTouchResetTimer = 0;
+
+  function handlePageTouchStart(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
+    if (e.touches.length == 0) {
+      return;
+    }
+    pageTouchStartX = e.touches[0].clientX;
+    pageTouchStartY = e.touches[0].clientY;
+  }
+
+  function handlePageTouchEnd(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
+    if (e.changedTouches == null || e.changedTouches.length == 0) {
+      return;
+    }
+    const t = e.changedTouches[0];
+    const dx = t.clientX - pageTouchStartX;
+    const dy = t.clientY - pageTouchStartY;
+    if (Math.abs(dx) <= 10 && Math.abs(dy) <= 10) {
+      return;
+    }
+    pageTouchSwallowed = true;
+    if (pageTouchResetTimer != 0) {
+      clearTimeout(pageTouchResetTimer);
+    }
+    pageTouchResetTimer = setTimeout(() => {
+      pageTouchResetTimer = 0;
+      pageTouchSwallowed = false;
+    }, 50);
+  }
+
+  /** 面板/工具键 click 入口守卫：true=本次 click 由滑动 touchup 派生，应吞掉。 */
+  function pageTapSwallowed(): boolean {
+    return pageTouchSwallowed;
+  }
 
   // ===== 「定位到聊天位置」高亮（引用详情页跳回后背景快速切换） =====
   const highlightId = ref<string>("");
@@ -1824,6 +1957,50 @@
         if (att.url.length > 0) {
           row.linkAtts.push(att);
         }
+      } else if (row.msgType == "card") {
+        // 互动卡片：title 必填（服务端结构化校验），缺失即数据坏——回落 digest 系统行，
+        // 不渲染残卡（渲染一张没标题的卡比降级更糟）。actions 逐项过滤：缺 key 或缺
+        // label 的按钮丢弃（点了必然 IM_10404 / 空白按钮），不让一条坏动作打挂整张卡。
+        row.cardTitle = readString(body, "title");
+        const desc = readString(body, "desc");
+        row.cardDesc = desc.length > 0 ? desc : readString(body, "subtitle");
+        const fieldsRaw = body["fields"];
+        if (fieldsRaw != null) {
+          const fields = fieldsRaw as UTSJSONObject[];
+          for (let i = 0; i < fields.length; i++) {
+            const label = readString(fields[i], "label");
+            const value = readString(fields[i], "value");
+            if (label.length > 0 || value.length > 0) {
+              const f = new ImCardField();
+              f.label = label;
+              f.value = value;
+              row.cardFields.push(f);
+            }
+          }
+        }
+        const actionsRaw = body["actions"];
+        if (actionsRaw != null) {
+          const actions = actionsRaw as UTSJSONObject[];
+          for (let i = 0; i < actions.length; i++) {
+            const key = readString(actions[i], "key");
+            const label = readString(actions[i], "label");
+            if (key.length == 0 || label.length == 0) {
+              continue;
+            }
+            const a = new ImCardAction();
+            a.key = key;
+            a.label = label;
+            a.style = readString(actions[i], "style");
+            // state 整个对象可缺失（历史消息/纯展示卡服务端不回填）⇒ 按 pending（可点）
+            const stateRaw = actions[i]["state"];
+            if (stateRaw != null) {
+              const stateObj = stateRaw as UTSJSONObject;
+              a.state = readString(stateObj, "state");
+              a.stateText = readString(stateObj, "text");
+            }
+            row.cardActions.push(a);
+          }
+        }
       }
       const attsRaw = body["attachments"];
       if (attsRaw != null) {
@@ -1924,6 +2101,149 @@
   /** 已被服务端确认的行（本地占位/发送中行 msgId 以 local- 开头，无服务端身份，不可 Pin/编辑/撤回/查已读）。 */
   function isConfirmedRow(msg: ImMsgRow): boolean {
     return msg.msgId.indexOf("local-") != 0;
+  }
+
+  // ===== 互动卡片（msgType=card）动作按钮：状态判据 + 点击执行（判据对齐 PC lib/card.ts，有单测钉住）=====
+
+  /** 服务端已定义的四个动作状态（openapi CardActionState.state）。 */
+  const KNOWN_CARD_STATES: string[] = ["pending", "done", "stale", "forbidden"];
+
+  /** 正在执行的卡片动作 key（防连点；★只存 key：按钮状态由消息 body 驱动，本地另存一份会出现两个真源）。 */
+  const cardBusyKey = ref<string>("");
+
+  /**
+   * 动作当前状态：state 缺失 ⇒ pending（可点——历史/纯展示卡服务端不回填，最常见，
+   * 读成"不许点"会让线上所有按钮一夜变灰）；有值但不认识 ⇒ unknown（fail-closed
+   * 不可点：给一个点了必报错的按钮是 UI 缺陷）。缺失=服务端没意见，未知=没听懂。
+   */
+  function cardActionStateOf(action: ImCardAction): string {
+    if (action.state.length == 0) {
+      return "pending";
+    }
+    return KNOWN_CARD_STATES.indexOf(action.state) >= 0 ? action.state : "unknown";
+  }
+
+  /** 只有 pending 能点（done/stale/forbidden/unknown 一律置灰；★别拿它猜业务，"过没过"只有服务端知道）。 */
+  function cardActionClickable(action: ImCardAction): boolean {
+    return cardActionStateOf(action) == "pending";
+  }
+
+  /**
+   * 按钮区可见集：★整卡全部不可点（单据终态/失效/无权——服务端按单据给同卡
+   * 按钮回填同一状态与文案）时只显示第一个，避免并排两个相同文案的置灰按钮；
+   * 只要有按钮可点（含点击请求在途：另一按钮仍 pending）就全量展示。
+   */
+  function cardVisibleActions(msg: ImMsgRow): ImCardAction[] {
+    const actions = msg.cardActions;
+    if (actions.length == 0) {
+      return actions;
+    }
+    let anyClickable = false;
+    for (let i = 0; i < actions.length; i++) {
+      if (cardActionClickable(actions[i])) {
+        anyClickable = true;
+        break;
+      }
+    }
+    if (anyClickable) {
+      return actions;
+    }
+    return [actions[0]];
+  }
+
+  /**
+   * 按钮文字：pending=label（不看 stateText，万一有值也不能顶掉按钮名字）；
+   * 其余优先服务端给定的 stateText（服务端改口径前端不发版），缺失按状态回落固定文案。
+   */
+  function cardActionText(action: ImCardAction): string {
+    const state = cardActionStateOf(action);
+    if (state == "pending") {
+      return action.label;
+    }
+    const given = action.stateText.trim();
+    if (given.length > 0) {
+      return given;
+    }
+    if (state == "done") {
+      return t("Mobile.Message.cardStateDone");
+    }
+    if (state == "stale") {
+      return t("Mobile.Message.cardStateStale");
+    }
+    if (state == "forbidden") {
+      return t("Mobile.Message.cardStateForbidden");
+    }
+    return t("Mobile.Message.cardStateUnknown");
+  }
+
+  /** 按钮配色：style 只影响配色不影响语义；未知取值按 default 画（服务端加配色不打挂老客户端）。 */
+  function cardBtnClass(action: ImCardAction): string {
+    // 执行中（防连点）与不可点同用置灰观感，文字仍是 label（读作"处理中"）
+    if (cardBusyKey.value == action.key || cardActionClickable(action) != true) {
+      return "chat-card__btn chat-card__btn--disabled";
+    }
+    if (action.style == "primary") {
+      return "chat-card__btn chat-card__btn--primary";
+    }
+    if (action.style == "danger") {
+      return "chat-card__btn chat-card__btn--danger";
+    }
+    return "chat-card__btn chat-card__btn--default";
+  }
+
+  function cardBtnTextClass(action: ImCardAction): string {
+    if (cardBusyKey.value == action.key || cardActionClickable(action) != true) {
+      return "chat-card__btn-text chat-card__btn-text--disabled";
+    }
+    if (action.style == "primary") {
+      return "chat-card__btn-text chat-card__btn-text--on";
+    }
+    return "chat-card__btn-text";
+  }
+
+  /**
+   * 点击卡片动作按钮：POST msgRunAction（只回传 key；★不弹二次确认——卡片的存在
+   * 意义就是"在通知里一步办完"，照微信/钉钉群邀请卡）。返回 CardActionState 就地
+   * 合并回该按钮（不必重拉整条消息）；★forbidden/stale 是状态不是错误（HTTP 仍
+   * 200），就地置灰不弹错——弹红条反而像"系统坏了"。成功也不 toast：按钮就地
+   * 变成「已通过/已拒绝」本身就是最好的反馈。
+   */
+  async function handleCardActionTap(msg: ImMsgRow, action: ImCardAction): Promise<void> {
+    if (pageTapSwallowed() || cardActionClickable(action) != true) {
+      return;
+    }
+    if (cardBusyKey.value.length > 0 || isConfirmedRow(msg) != true) {
+      return;
+    }
+    cardBusyKey.value = action.key;
+    try {
+      const res = await apiImMsgRunAction(msg.msgId, convId.value, action.key);
+      cardBusyKey.value = "";
+      if (apiResCode(res) != SUCCESS_CODE) {
+        // 真失败（消息没了/不是卡片/网络）：与 PC 失败口径一致，toast 提示
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+        return;
+      }
+      // 200：就地合并新状态到被点按钮，并联动同卡其余 pending 按钮（服务端未给
+      // state 字段时按空串存 ⇒ 判据回落 pending）。★联动的口径与读路径一致：
+      // 服务端回填是按单据状态给整张卡的按钮同一终态文案（单子终态后同意/
+      // 拒绝都显示「已通过该入群申请」），点击瞬间就地模拟同一结果——否则
+      // 「点完同意拒绝还亮着」，用户再点虽被服务端幂等挡住无副作用，但界面该收口。
+      const dataRaw = apiResData<any>(res);
+      const stateObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      const newState = stateObj != null ? readString(stateObj, "state") : "";
+      const newText = stateObj != null ? readString(stateObj, "text") : "";
+      const actions = msg.cardActions;
+      for (let i = 0; i < actions.length; i++) {
+        if (actions[i].key == action.key || cardActionStateOf(actions[i]) == "pending") {
+          actions[i].state = newState;
+          actions[i].stateText = newText;
+        }
+      }
+    } catch (_error) {
+      cardBusyKey.value = "";
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
   }
 
   // ===== 会话能力加载（convDetail / pins / whoami；失败静默保留默认值） =====
@@ -2216,6 +2536,19 @@
     scrollAnchor.value = "";
     nextTick(() => {
       scrollAnchor.value = "chat-bottom";
+      // App 端原生布局异步完成：一拍 nextTick 后 scroll-into-view 可能仍早于内容
+      // 高度稳定（首屏整页消息/卡片渲染时定位失效，系统通知页全是卡片最明显）——
+      // 再补一拍延时清空重设同一锚点，强制 scroll-view 重新定位。期间锚点被其它
+      // 滚动逻辑改走（如翻页定位 msg-*）则不抢；本函数所有调用点语义都是"去最新"，
+      // 拉回底部即期望行为。
+      setTimeout(() => {
+        if (scrollAnchor.value == "chat-bottom") {
+          scrollAnchor.value = "";
+          nextTick(() => {
+            scrollAnchor.value = "chat-bottom";
+          });
+        }
+      }, 150);
     });
   }
 
@@ -2235,6 +2568,7 @@
         })
         .catch((_e: any | null) => {
           // 失败保留原地址：交给 <image> 兜底（如平台 Cookie 命中的场景）
+          console.error(`[ChatImg] 受保护主图解析失败保留原地址 src=${url}`);
         });
     }
     for (let i = 0; i < row.imageAtts.length; i++) {
@@ -2248,6 +2582,7 @@
         })
         .catch((_e: any | null) => {
           // 同上
+          console.error(`[ChatImg] 受保护附件图解析失败保留原地址 src=${url}`);
         });
     }
   }
@@ -2272,6 +2607,10 @@
         }
         // 附件缓存累积：文件页（文件/群文件）只读本窗口已加载消息里的附件
         collectChatAttachments(convId.value, records);
+        // 首屏（beforeSeq<=0）成功后写消息缓存：下次进页先渲染再静默同步
+        if (beforeSeq <= 0 && records.length > 0) {
+          setCachedChatRecords(convId.value, records);
+        }
       }
     }
     // 返回为降序（新→旧）；列表升序存，逐条 unshift 后头部即为最旧
@@ -2284,24 +2623,6 @@
     }
     reportReadIfNeeded(maxSeq());
     refreshReadStatus();
-  }
-
-  async function initHistory(): Promise<void> {
-    if (loading.value) {
-      return;
-    }
-    // 附件缓存重置：文件页数据源只看本窗口已加载的消息（从首屏起重新累积）
-    resetChatAttachments(convId.value);
-    loading.value = true;
-    loadFailed.value = false;
-    try {
-      await loadHistory(0);
-      loading.value = false;
-      scrollToBottom();
-    } catch (_error) {
-      loading.value = false;
-      loadFailed.value = true;
-    }
   }
 
   async function handleLoadOlder(): Promise<void> {
@@ -2324,12 +2645,6 @@
       });
     } catch (_error) {
       loadingOlder.value = false;
-    }
-  }
-
-  function handleRetry(): void {
-    if (loadFailed.value) {
-      initHistory();
     }
   }
 
@@ -2505,6 +2820,9 @@
   }
 
   function handleSend(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     const text = inputText.value.trim();
     if (text.length == 0 || convId.value.length == 0) {
       return;
@@ -2629,6 +2947,15 @@
       return;
     }
     uni.previewImage({ urls: [msg.imageUrl], current: msg.imageUrl });
+  }
+
+  /** 图片渲染失败诊断（Q4：Android 不出图排查——logcat 抓 [ChatImg] 定位失败 src）。 */
+  function handleImageRenderError(msg: ImMsgRow): void {
+    console.error(`[ChatImg] 主图渲染失败 msgId=${msg.msgId} src=${msg.imageUrl}`);
+  }
+
+  function handleAttImageRenderError(att: ImMsgAtt): void {
+    console.error(`[ChatImg] 附件图渲染失败 src=${att.url}`);
   }
 
   /** rich_text 图片附件点击：全屏放大预览。 */
@@ -2770,6 +3097,9 @@
   /** 语音/键盘切换：进语音态时收面板与键盘（语音条与面板互斥；
    *  hold-keyboard 后点话筒键不再自然失焦收键盘，需显式收）。 */
   function toggleVoiceMode(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     if (voiceMode.value != true) {
       if (panelMode.value.length > 0) {
         panelMode.value = "";
@@ -2828,6 +3158,9 @@
 
   /** 表情键：恒开表情面板（不切换收起）；收面板只能靠点输入框换回系统键盘。 */
   function toggleEmojiPanel(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     if (voiceMode.value) {
       voiceMode.value = false;
     }
@@ -2835,6 +3168,9 @@
   }
 
   function togglePlusPanel(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     if (voiceMode.value) {
       voiceMode.value = false;
     }
@@ -2846,6 +3182,9 @@
    * （飞书式新页；选中经 IM_AT_PICK_EVENT 回填输入框，单聊=当前用户+对方，群聊=群成员）。
    */
   function handleMentionKeyTap(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     if (voiceMode.value) {
       voiceMode.value = false;
     }
@@ -2865,6 +3204,9 @@
    * 已开时再点收起（键盘保留）。未聚焦则聚焦拉起系统键盘。
    */
   function handleAaKeyTap(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     if (voiceMode.value) {
       voiceMode.value = false;
     }
@@ -3243,6 +3585,9 @@
    * 开面板先收坞上面板/语音/键盘，焦点移入大输入区。
    */
   function toggleExpandPanel(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     if (expanded.value) {
       closeExpandSheet();
       return;
@@ -3605,6 +3950,9 @@
    * ★须定义在 handlePickImage 之后（UTS→Kotlin 先用后定义会报「找不到名称」）。
    */
   function handleImageToolTap(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
     if (panelMode.value.length > 0) {
       panelMode.value = "";
     }
@@ -3800,6 +4148,212 @@
     return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
   }
 
+  // ==================== IM WebSocket 事件订阅 ====================
+  // IM WS 在 App.uvue onLaunch 中启动。本页订阅下行事件做消息列表实时增量插入。
+  // 设计原则：
+  // - 仅当 payload.convId == 当前会话时处理（避免在 A 会话页收到 B 会话消息造成 UI 错位）
+  // - 按 msgId 去重：已在 messages.value 中的跳过（重连重传 / HTTP /sync 兜底都可能重复）
+  // - 按 seq 插入到正确位置：messages.value 是「老→新」升序，找到第一个 seq > row.seq 的位置
+  // - MSG_RECV_ACK 由 ImWsClient 内部自动回，业务层不感知
+
+  /**
+   * 把 row 按 seq 升序插入到 messages.value 的正确位置（去重后）。
+   * messages.value 是「老→新」升序：插入点 = 第一个 seq > row.seq 的索引；否则末尾追加。
+   */
+  /**
+   * 按 msgId 去重 + seq 升序插入一条消息。
+   * @param autoScroll true=实时消息插到末尾时滚到底（WS 下行）；false=静默同步不打断用户浏览
+   */
+  function insertMessageBySeq(row: ImMsgRow, autoScroll: boolean): void {
+    const rows = messages.value;
+    // 去重
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].msgId == row.msgId) {
+        return;
+      }
+    }
+    let insertAt = rows.length;
+    for (let i = 0; i < rows.length; i++) {
+      const s = rows[i].seq;
+      if (typeof s === "number" && s > row.seq) {
+        insertAt = i;
+        break;
+      }
+    }
+    rows.splice(insertAt, 0, row);
+    messages.value = rows;
+    resolveRowMedia(row);
+    // 滚动到底部：仅当 row 是新增且 seq 大于本地最大 seq（真正的实时消息）
+    if (autoScroll && insertAt >= rows.length - 1) {
+      scrollToBottom();
+    }
+    // 上报已读
+    reportReadIfNeeded(maxSeq());
+  }
+
+  /**
+   * 静默同步最新一页（Q2：页面停留/onShow 兜底刷新；不打 loading、不打断滚动）。
+   * 与 WS 下行互补：断线重连期间漏的消息、WS 未连上时其他端发的消息都靠这里补。
+   * 成功顺带刷新首屏缓存；失败完全静默（下次 onShow/WS 再试）。
+   * ★定义在 insertMessageBySeq 之后、initHistory 之前（UTS→Kotlin 先用后定义报「找不到名称」）。
+   */
+  async function silentSyncLatest(): Promise<void> {
+    if (convId.value.length == 0) {
+      return;
+    }
+    try {
+      const res = await apiImMessages(convId.value, 0, MSG_PAGE_SIZE);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        return;
+      }
+      const recordsRaw = dataObj["records"];
+      if (recordsRaw == null) {
+        return;
+      }
+      const records = recordsRaw as UTSJSONObject[];
+      if (records.length > 0) {
+        setCachedChatRecords(convId.value, records);
+        collectChatAttachments(convId.value, records);
+      }
+      for (let i = 0; i < records.length; i++) {
+        const row = readMsgRow(records[i]);
+        if (row.msgId.length == 0) {
+          continue;
+        }
+        // autoScroll=false：用户可能正在翻历史，静默补齐不打断位置
+        insertMessageBySeq(row, false);
+      }
+      refreshReadStatus();
+    } catch (_error) {
+      // 静默失败
+    }
+  }
+
+  async function initHistory(): Promise<void> {
+    if (loading.value) {
+      return;
+    }
+    // 附件缓存重置：文件页数据源只看本窗口已加载的消息（从首屏起重新累积）
+    resetChatAttachments(convId.value);
+    // 命中缓存：免网络立即渲染上次窗口并滚底，随后静默增量同步（Q3：重进不重新 load）
+    const cached = getCachedChatRecords(convId.value);
+    if (cached != null) {
+      loading.value = false;
+      loadFailed.value = false;
+      messages.value = [];
+      // 缓存即接口原文（降序 新→旧），与 loadHistory 同款逐条 unshift 后头部为最旧
+      for (let i = cached.length - 1; i >= 0; i--) {
+        messages.value.unshift(readMsgRow(cached[i]));
+      }
+      hasMore.value = cached.length >= MSG_PAGE_SIZE;
+      collectChatAttachments(convId.value, cached);
+      for (let i = 0; i < messages.value.length; i++) {
+        resolveRowMedia(messages.value[i]);
+      }
+      scrollToBottom();
+      reportReadIfNeeded(maxSeq());
+      refreshReadStatus();
+      silentSyncLatest();
+      return;
+    }
+    loading.value = true;
+    loadFailed.value = false;
+    try {
+      await loadHistory(0);
+      loading.value = false;
+      scrollToBottom();
+    } catch (_error) {
+      loading.value = false;
+      loadFailed.value = true;
+    }
+  }
+
+  function handleRetry(): void {
+    if (loadFailed.value) {
+      initHistory();
+    }
+  }
+
+  function handleImMessageReceived(payload: any): void {
+    if (payload == null) {
+      return;
+    }
+    // any 参数不能 .property 访问（Kotlin 后端）：转 UTSJSONObject 走 bracket 访问
+    const obj = payload as UTSJSONObject;
+    const msgConvId = readString(obj, "convId");
+    if (msgConvId.length == 0 || msgConvId != convId.value) {
+      return;
+    }
+    const raw = obj["raw"];
+    if (raw == null || typeof raw !== "object") {
+      return;
+    }
+    // 复用现有 readMsgRow（line 1801）从 MessageDto 构造 ImMsgRow
+    const row = readMsgRow(raw as UTSJSONObject);
+    if (row.msgId.length == 0) {
+      return;
+    }
+    insertMessageBySeq(row, true);
+  }
+
+  function handleImMessageRevoked(payload: any): void {
+    if (payload == null) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    const msgConvId = readString(obj, "convId");
+    if (msgConvId.length == 0 || msgConvId != convId.value) {
+      return;
+    }
+    const msgId = readString(obj, "msgId");
+    if (msgId.length == 0) {
+      return;
+    }
+    const revokeBy = readString(obj, "revokeBy");
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].msgId == msgId) {
+        rows[i].revoked = true;
+        rows[i].revokeById = revokeBy;
+        rows[i].bodyText = "";
+        return;
+      }
+    }
+  }
+
+  function handleImMessageEdited(payload: any): void {
+    if (payload == null) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    const msgConvId = readString(obj, "convId");
+    if (msgConvId.length == 0 || msgConvId != convId.value) {
+      return;
+    }
+    const msgId = readString(obj, "msgId");
+    if (msgId.length == 0) {
+      return;
+    }
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].msgId == msgId) {
+        // 重建 row（参照 line 2487 的 editMsg 内部做法：readMsgRow 替换）
+        const raw = obj["raw"];
+        if (raw != null && typeof raw === "object") {
+          const edited = readMsgRow(raw as UTSJSONObject);
+          rows.splice(i, 1, edited);
+          messages.value = rows;
+        }
+        return;
+      }
+    }
+  }
+
   /** 当前用户信息：区分我方/对方消息 + 我方头像昵称（IM senderId 即平台用户 id）。 */
   async function loadMyInfo(): Promise<void> {
     try {
@@ -3851,6 +4405,10 @@
     uni.$on(IM_CHAT_JUMP_EVENT, onJumpEvent);
     // at-select 页 @成员选完：回填 "@token " 到输入框（可连选多个）
     uni.$on(IM_AT_PICK_EVENT, onAtPickEvent);
+    // 订阅 IM WS 实时下行事件（按 convId 过滤；消息去重+按 seq 插入由 handleImMessageReceived 处理）
+    eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, handleImMessageReceived);
+    eventBus.on(`${EVENT_TYPE.ImMessageRevoked}`, handleImMessageRevoked);
+    eventBus.on(`${EVENT_TYPE.ImMessageEdited}`, handleImMessageEdited);
     // #ifndef H5 || WEB
     // 键盘高度监听（App 三端/小程序；H5 不支持该 API）：驱动 dockBottomPx 让位
     uni.onKeyboardHeightChange((res) => {
@@ -3905,14 +4463,25 @@
     }
     uni.$off(IM_CHAT_JUMP_EVENT, onJumpEvent);
     uni.$off(IM_AT_PICK_EVENT, onAtPickEvent);
+    // 注销 IM WS 事件订阅
+    eventBus.off(`${EVENT_TYPE.ImMessageReceived}`, handleImMessageReceived);
+    eventBus.off(`${EVENT_TYPE.ImMessageRevoked}`, handleImMessageRevoked);
+    eventBus.off(`${EVENT_TYPE.ImMessageEdited}`, handleImMessageEdited);
     clearFlashTimers();
   });
 
+  // 首次 onShow 与 onLoad 的首屏拉取重合，跳过避免重复请求（message.uvue 同款惯用法）
+  let chatHasShownOnce = false;
   onShow(() => {
     pageVisible = true;
     // 从别的页面回来：置顶集与已读计数是多人共享状态，重拉自我纠正
     loadPinnedIds();
     refreshReadStatus();
+    // 静默同步最新消息（离开期间其他端新发的消息兜底；不打断滚动）
+    if (chatHasShownOnce && convId.value.length > 0 && messages.value.length > 0) {
+      silentSyncLatest();
+    }
+    chatHasShownOnce = true;
     if (pendingJumpId.length == 0) {
       return;
     }
@@ -4112,6 +4681,120 @@
 
   .chat-bubble__text--link-mine {
     color: #576b95;
+  }
+
+  /* ===== 互动卡片（msgType=card，气泡内）：标题/正文/字段行 + 动作按钮 ===== */
+  .chat-card {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-card__title {
+    font-size: 30rpx;
+    line-height: 42rpx;
+    font-weight: 600;
+    color: #22212a;
+  }
+
+  /* desc 自足（含申请人附言等关键信息），不截断 */
+  .chat-card__desc {
+    margin-top: 8rpx;
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #6b6875;
+  }
+
+  .chat-card__field {
+    margin-top: 8rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .chat-card__field-label {
+    margin-right: 12rpx;
+    flex-shrink: 0;
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #94929c;
+  }
+
+  .chat-card__field-value {
+    flex: 1;
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #22212a;
+  }
+
+  .chat-card__actions {
+    margin-top: 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  /* 按钮配色只随 style 走（primary=主色实底 / danger=红描边 / 其余=default 描边），
+     不可点（done/stale/forbidden/unknown/执行中）一律置灰 */
+  .chat-card__btn {
+    flex: 1;
+    height: 68rpx;
+    margin-left: 16rpx;
+    border-radius: 34rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+  }
+
+  .chat-card__btn:first-child {
+    margin-left: 0;
+  }
+
+  .chat-card__btn--default {
+    background-color: #ffffff;
+    border: 1px solid #d9d7e0;
+  }
+
+  .chat-card__btn--primary {
+    background-color: #5147ff;
+  }
+
+  .chat-card__btn--danger {
+    background-color: #ffffff;
+    border: 1px solid #e05f5f;
+  }
+
+  .chat-card__btn--disabled {
+    background-color: #f0eff4;
+  }
+
+  /* 按压态用透明度统一处理：不覆盖各配色底色（primary 深底也能正确反馈） */
+  .chat-card__btn--active {
+    opacity: 0.72;
+  }
+
+  .chat-card__btn-text {
+    font-size: 26rpx;
+    line-height: 36rpx;
+    font-weight: 500;
+    color: #44424e;
+  }
+
+  .chat-card__btn-text--on {
+    color: #ffffff;
+  }
+
+  .chat-card__btn-text--disabled {
+    color: #94929c;
+  }
+
+  /* 纯展示卡（无动作区）：补一句人话，免得用户去点不可点的卡片本身 */
+  .chat-card__hint {
+    margin-top: 16rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #94929c;
   }
 
   /* ===== 引用块（气泡内灰底，点击进全屏引用详情） ===== */

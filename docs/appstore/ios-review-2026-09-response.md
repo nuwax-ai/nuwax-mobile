@@ -13,7 +13,8 @@ App Store Connect 路径：App Store Connect → 女娲Nuwax → 分发 → App 
 | 1.0.4(104) | — | 已提交过 ASC（**versionCode 104 已占用，勿复用**） |
 | 1.0.5(105) | 2026-09-14 Transporter 上传 | 2026-09-18 二次被拒：3.1.1 IAP（付费智能体仍可访问）/ 5.1.1(i)+5.1.2(i) AI 数据披露 / 4.7.4 索引仍未附 |
 | 1.0.6(106) | 2026-09-19 Transporter 上传 | 2026-09-23 被拒：**2.5.4 后台音频声明**（`UIBackgroundModes=audio` 但无后台播放功能），见「八」 |
-| 1.0.7(107) | 待打包 | **当前提审版本**：已移除 UIBackgroundModes（含此前全部审核修复） |
+| 1.0.7(107) | 2026-09-23 云打包（14:52，真机验证壳内弹窗白屏修复） | versionCode 已占用，勿复用 |
+| 1.0.8(108) | 待打包 | **当前提审版本**：已移除 UIBackgroundModes（含此前全部审核修复） |
 
 ## 一、被拒条款与本仓对策
 
@@ -122,21 +123,21 @@ Apple 要求提供 App 内**非内嵌**游戏/软件（对本 App 即平台上�
 4. Resolution Center 逐条回复：4.7.4（附新导出索引）、5.1.1(ii)（附新文案说明 + 1.0.5 构建已更新）、2.1(b)（用「六」草稿，发送前与罗东确认口径）。
 5. 提交审核，并在群里同步提交时间与构建号，便于跟进。
 
-## 八、2.5.4 后台音频声明被拒（1.0.6(106) → 1.0.7(107)）
+## 八、2.5.4 后台音频声明被拒（1.0.6(106) → 1.0.8(108)）
 
 **被拒原因（2026-09-23）**：Info.plist 声明了 `UIBackgroundModes = audio`（后台音频模式），但审核员实测退到后台后 App 没有任何声音播放，苹果认定声明与实际功能不符（Guideline 2.5.4 要求声明的能力必须真实存在）。
 
 **代码侧事实与修复**：
 - 全仓库无任何后台播放实现（无 `beginBackgroundTask`、无锁屏控制中心/nowPlaying、无后台保活；`speechSocketWarmup.uts` 注释明确「退后台不做保活」），语音/TTS 均为前台播报——该声明是早期模板遗留的**空配置**。
-- 已从 `manifest.json` 删除两处 `UIBackgroundModes: "audio"`（`app-ios.distribute` 与 `app-plus.distribute.ios` 遗留节点），1.0.7(107) 构建的 Info.plist 将不再包含该键。
+- 已从 `manifest.json` 删除两处 `UIBackgroundModes: "audio"`（`app-ios.distribute` 与 `app-plus.distribute.ios` 遗留节点），1.0.8(108) 构建的 Info.plist 将不再包含该键。
 - 对功能零影响：TTS 播报中退后台即停（这本来就是当前实际行为）。
 
 **Resolution Center 英文回复草稿**：
 
 > Thank you for pointing this out. The `UIBackgroundModes: audio` declaration in Info.plist was a leftover misconfiguration from an early project template. The app does not provide any background audio playback feature — all speech/TTS playback happens in the foreground only, which is consistent with your test result.
 >
-> We have removed the UIBackgroundModes declaration entirely in build 1.0.7(107). The app no longer declares any background modes.
+> We have removed the UIBackgroundModes declaration entirely in build 1.0.8(108). The app no longer declares any background modes.
 >
 > Best regards.
 
-**重提注意**：1.0.7(107) 需重新云打包（manifest 改动要重出包才生效）→ Transporter 上传 → Resolution Center 贴上面草稿 → 重新提交；同时把 4.7.4 智能体索引再次附上（每版必附，见「二」）。
+**重提注意**：1.0.8(108) 需重新云打包（manifest 改动要重出包才生效）→ Transporter 上传 → Resolution Center 贴上面草稿 → 重新提交；同时把 4.7.4 智能体索引再次附上（每版必附，见「二」）。

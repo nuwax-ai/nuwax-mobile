@@ -11,7 +11,9 @@ App Store Connect 路径：App Store Connect → 女娲Nuwax → 分发 → App 
 |---|---|---|
 | 1.0.3(103) | 2026-08-27 提交，2026-09-09 Apple 最终回复 | 被拒：2.1.0 材料补齐 / 4.7.4 智能体索引 / 5.1.1(ii) 权限文案 / 2.1(b) 商业模式问询。提交 ID：`1a251433-1b62-4c91-a263-86c6b66ef5f2` |
 | 1.0.4(104) | — | 已提交过 ASC（**versionCode 104 已占用，勿复用**） |
-| 1.0.5(105) | 2026-09-14 Transporter 上传 | **当前提审版本**，已包含权限文案重写 + iOS 付费收敛两项代码修复（分支 `fix/nuwa-zhuoda-2026.09-ios-appstore-submit`） |
+| 1.0.5(105) | 2026-09-14 Transporter 上传 | 2026-09-18 二次被拒：3.1.1 IAP（付费智能体仍可访问）/ 5.1.1(i)+5.1.2(i) AI 数据披露 / 4.7.4 索引仍未附 |
+| 1.0.6(106) | 2026-09-19 Transporter 上传 | 2026-09-23 被拒：**2.5.4 后台音频声明**（`UIBackgroundModes=audio` 但无后台播放功能），见「八」 |
+| 1.0.7(107) | 待打包 | **当前提审版本**：已移除 UIBackgroundModes（含此前全部审核修复） |
 
 ## 一、被拒条款与本仓对策
 
@@ -21,6 +23,7 @@ App Store Connect 路径：App Store Connect → 女娲Nuwax → 分发 → App 
 | 4.7.0 / 4.7.4 设计：小程序、聊天机器人、插件 | 要求提供 App 内非内嵌软件（聊天机器人/智能体）的**索引**（名称、开发者、URL），且今后每个版本都要附在 Review Notes | 按「二、智能体索引」生成清单，回复 Resolution Center 并附 Review Notes | ASC 操作 + 每版维护 |
 | 5.1.1(ii) 隐私：权限用途说明 | 相机、相册 purpose string 过于笼统 | 已重写 manifest 权限文案（见「四」） | `manifest.json`（app-ios / app-plus 两处同步） |
 | 2.1(b) 商业模式问询 | 疑似含付费数字内容，要求回答 5 个商业模式问题 | iOS 端已完全移除订阅/付费 UI（见「五」），按「六」口径回复 | 代码已改 + 回复草稿 |
+| 2.5.4 后台音频声明 | `UIBackgroundModes=audio` 声明了后台音频模式，但 App 无后台播放功能（审核员实测退后台无声音） | 已从 manifest 删除该声明（app-ios 与 app-plus 两处，见「八」） | 代码已改 + 回复草稿 |
 
 > **代码侧修复已全部落地在 1.0.5(105) 包中**（权限文案、付费收敛，提交 `8e3c15d26`）。
 > 剩余动作全部在 ASC 侧：智能体索引导出、App Review Information 补齐、Resolution Center 回复。
@@ -118,3 +121,22 @@ Apple 要求提供 App 内**非内嵌**游戏/软件（对本 App 即平台上�
 3. ASC 更新 App Review Information：演示账号、真机录屏（90~120s，脚本见「三」）、Notes 附「四」英文权限说明 + 智能体索引。
 4. Resolution Center 逐条回复：4.7.4（附新导出索引）、5.1.1(ii)（附新文案说明 + 1.0.5 构建已更新）、2.1(b)（用「六」草稿，发送前与罗东确认口径）。
 5. 提交审核，并在群里同步提交时间与构建号，便于跟进。
+
+## 八、2.5.4 后台音频声明被拒（1.0.6(106) → 1.0.7(107)）
+
+**被拒原因（2026-09-23）**：Info.plist 声明了 `UIBackgroundModes = audio`（后台音频模式），但审核员实测退到后台后 App 没有任何声音播放，苹果认定声明与实际功能不符（Guideline 2.5.4 要求声明的能力必须真实存在）。
+
+**代码侧事实与修复**：
+- 全仓库无任何后台播放实现（无 `beginBackgroundTask`、无锁屏控制中心/nowPlaying、无后台保活；`speechSocketWarmup.uts` 注释明确「退后台不做保活」），语音/TTS 均为前台播报——该声明是早期模板遗留的**空配置**。
+- 已从 `manifest.json` 删除两处 `UIBackgroundModes: "audio"`（`app-ios.distribute` 与 `app-plus.distribute.ios` 遗留节点），1.0.7(107) 构建的 Info.plist 将不再包含该键。
+- 对功能零影响：TTS 播报中退后台即停（这本来就是当前实际行为）。
+
+**Resolution Center 英文回复草稿**：
+
+> Thank you for pointing this out. The `UIBackgroundModes: audio` declaration in Info.plist was a leftover misconfiguration from an early project template. The app does not provide any background audio playback feature — all speech/TTS playback happens in the foreground only, which is consistent with your test result.
+>
+> We have removed the UIBackgroundModes declaration entirely in build 1.0.7(107). The app no longer declares any background modes.
+>
+> Best regards.
+
+**重提注意**：1.0.7(107) 需重新云打包（manifest 改动要重出包才生效）→ Transporter 上传 → Resolution Center 贴上面草稿 → 重新提交；同时把 4.7.4 智能体索引再次附上（每版必附，见「二」）。

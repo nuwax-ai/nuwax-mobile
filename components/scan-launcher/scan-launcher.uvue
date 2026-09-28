@@ -1,0 +1,348 @@
+<template>
+  <!--
+    扫一扫结果弹层（消息页「+」气泡「扫一扫」入口配套）：
+    - startScan()：拉起 uni.scanCode（App / 微信小程序；H5 无此 API，入口本身不渲染）
+    - 结果三路分发（判定见 utils/scanRouter）：
+      · 用户名片码 → 「添加联系人」确认 → apiImAddContact（对方需同意，文案复用
+        Mobile.Message.contactRequestSent / alreadyContact / contactAdded）
+      · 其他 http(s) 链接 → 「打开链接」域名确认 → handleExternalLink（App 走独立 web-view 页）
+      · 纯文本 → 「扫码结果」限高展示 + 复制（utils/clipboard 跨端写剪贴板）
+    - 弹层样式对齐 confirm-modal（600rpx 白底卡片、底部分割线双按钮）；
+      确认钮品牌紫（非危险操作，不用红色态）；单层 fixed 蒙层，无 fixed 嵌套
+  -->
+  <view v-if="visible" class="scan-modal__mask" @tap="handleMaskTap">
+    <view class="scan-modal__panel" @tap.stop="handlePanelTap">
+      <text class="scan-modal__title">{{ titleText }}</text>
+      <view v-if="mode == 'text'" class="scan-modal__body">
+        <scroll-view class="scan-modal__text-scroll" direction="vertical" :show-scrollbar="false">
+          <text class="scan-modal__text">{{ textContent }}</text>
+        </scroll-view>
+      </view>
+      <view v-else class="scan-modal__body">
+        <text class="scan-modal__desc">{{ descText }}</text>
+        <text v-if="mode == 'user'" class="scan-modal__sub">{{ userIdText }}</text>
+      </view>
+      <view class="scan-modal__actions">
+        <view class="scan-modal__btn scan-modal__btn--cancel" @tap="handleCancel">
+          <text class="scan-modal__btn-text">{{ cancelText }}</text>
+        </view>
+        <view
+          class="scan-modal__btn"
+          :class="busy ? 'scan-modal__btn--disabled' : ''"
+          @tap="handleConfirm"
+        >
+          <text class="scan-modal__btn-text scan-modal__btn-text--primary">{{ confirmText }}</text>
+        </view>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref } from "vue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImAddContact } from "@/servers/im";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { writeClipboardText } from "@/utils/clipboard";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { handleExternalLink } from "@/utils/system";
+  import { extractUrlHost, parseScanContent } from "@/utils/scanRouter";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  const visible = ref<boolean>(false);
+  /** text | url | user（纯字符串，避免枚举串化平台分歧） */
+  const mode = ref<string>("text");
+  /** text：扫码原文 */
+  const textContent = ref<string>("");
+  /** url：目标链接与展示用 host */
+  const urlTarget = ref<string>("");
+  const urlHost = ref<string>("");
+  /** user：目标 userId（字符串化雪花号） */
+  const targetUserId = ref<string>("");
+  /** 加联系人请求中（确认钮防重复点击） */
+  const busy = ref<boolean>(false);
+
+  const titleText = computed((): string => {
+    if (mode.value == "url") {
+      return t("Mobile.Scan.openUrlTitle");
+    }
+    if (mode.value == "user") {
+      return t("Mobile.Scan.addTitle");
+    }
+    return t("Mobile.Scan.textTitle");
+  });
+
+  const descText = computed((): string => {
+    if (mode.value == "url") {
+      const params = new Map<string, string | number>();
+      params.set("host", urlHost.value);
+      return translateFn("Mobile.Scan.openUrlDesc", toI18nParams(params), "");
+    }
+    if (mode.value == "user") {
+      return t("Mobile.Scan.addDesc");
+    }
+    return "";
+  });
+
+  const userIdText = computed((): string => {
+    const params = new Map<string, string | number>();
+    params.set("id", targetUserId.value);
+    return translateFn("Mobile.Scan.userId", toI18nParams(params), "");
+  });
+
+  const cancelText = computed((): string => {
+    return mode.value == "text" ? t("Mobile.Scan.close") : t("Mobile.Common.cancel");
+  });
+
+  const confirmText = computed((): string => {
+    if (mode.value == "url") {
+      return t("Mobile.Scan.open");
+    }
+    if (mode.value == "user") {
+      return busy.value ? t("Mobile.Common.loading") : t("Mobile.Scan.add");
+    }
+    return t("Mobile.Scan.copy");
+  });
+
+  /** 扫码原文 → 三路分发开弹层。 */
+  function routeScanResult(raw: string): void {
+    const trimmed = raw.trim();
+    if (trimmed.length == 0) {
+      uni.showToast({ title: t("Mobile.Scan.invalid"), icon: "none" });
+      return;
+    }
+    busy.value = false;
+    const route = parseScanContent(trimmed);
+    if (route.kind == "user") {
+      mode.value = "user";
+      targetUserId.value = route.userId;
+      visible.value = true;
+      return;
+    }
+    if (route.kind == "url") {
+      mode.value = "url";
+      urlTarget.value = route.url;
+      urlHost.value = extractUrlHost(route.url);
+      visible.value = true;
+      return;
+    }
+    mode.value = "text";
+    textContent.value = trimmed;
+    visible.value = true;
+  }
+
+  /** 拉起扫码（消息页「+」气泡入口，气泡关闭后调用）。 */
+  function startScan(): void {
+    // #ifdef APP || MP-WEIXIN
+    uni.scanCode({
+      onlyFromCamera: false,
+      success: (res: ScanCodeSuccess) => {
+        const raw = res.result != null ? res.result : "";
+        routeScanResult(raw);
+      },
+      fail: (_res: ScanCodeFail) => {
+        // 用户取消扫码，静默返回
+      },
+    });
+    // #endif
+    // #ifndef APP || MP-WEIXIN
+    uni.showToast({ title: t("Mobile.Scan.unsupported"), icon: "none" });
+    // #endif
+  }
+
+  function close(): void {
+    visible.value = false;
+  }
+
+  function handleMaskTap(): void {
+    close();
+  }
+
+  /** 阻断面板内点击冒泡到蒙层。 */
+  function handlePanelTap(): void {}
+
+  function handleCancel(): void {
+    close();
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  /** 复制文本结果（跨端剪贴板，成功后关弹层提示已复制）。 */
+  function copyTextResult(): void {
+    const content = textContent.value;
+    writeClipboardText(
+      content,
+      (): void => {
+        close();
+        uni.showToast({ title: t("Mobile.Scan.copied"), icon: "none" });
+      },
+      (): void => {
+        uni.showToast({ title: t("Mobile.Scan.copyFailed"), icon: "none" });
+      },
+    );
+  }
+
+  /**
+   * 确认添加联系人（对方需同意）：文案对齐 add-buddy-sheet 的
+   * contactAdd 处理（alreadyContact / accepted 三档）。
+   */
+  async function addUserContact(): Promise<void> {
+    const userId = targetUserId.value;
+    if (userId.length == 0) {
+      return;
+    }
+    busy.value = true;
+    try {
+      const res = await apiImAddContact(userId, "");
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
+        return;
+      }
+      let accepted = false;
+      let alreadyContact = false;
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        accepted = readBool(dataObj, "accepted");
+        alreadyContact = readBool(dataObj, "alreadyContact");
+      }
+      let title = t("Mobile.Message.contactRequestSent");
+      if (alreadyContact) {
+        title = t("Mobile.Message.alreadyContact");
+      } else if (accepted) {
+        title = t("Mobile.Message.contactAdded");
+      }
+      uni.showToast({ title, icon: "none" });
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+      close();
+    }
+  }
+
+  function handleConfirm(): void {
+    if (busy.value) {
+      return;
+    }
+    if (mode.value == "text") {
+      copyTextResult();
+      return;
+    }
+    if (mode.value == "url") {
+      const url = urlTarget.value;
+      close();
+      handleExternalLink(url);
+      return;
+    }
+    addUserContact();
+  }
+
+  defineExpose({
+    startScan: startScan as any,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .scan-modal__mask {
+    position: fixed;
+    z-index: 1000;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .scan-modal__panel {
+    width: 600rpx;
+    box-sizing: border-box;
+    background-color: #ffffff;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .scan-modal__title {
+    font-size: 32rpx;
+    font-weight: 600;
+    color: #1a1a1a;
+    line-height: 44rpx;
+    text-align: center;
+    margin-top: 44rpx;
+  }
+
+  .scan-modal__body {
+    display: flex;
+    flex-direction: column;
+    padding: 24rpx 40rpx 40rpx;
+  }
+
+  .scan-modal__desc {
+    font-size: 28rpx;
+    color: #666666;
+    line-height: 44rpx;
+    text-align: center;
+  }
+
+  /* 用户 ID 小字：确认目标用，弱化展示 */
+  .scan-modal__sub {
+    margin-top: 12rpx;
+    font-size: 24rpx;
+    color: #9a9aa2;
+    line-height: 34rpx;
+    text-align: center;
+  }
+
+  /* 文本结果：限高滚动，长内容不撑爆弹层 */
+  .scan-modal__text-scroll {
+    max-height: 420rpx;
+  }
+
+  .scan-modal__text {
+    font-size: 28rpx;
+    color: #1c1b20;
+    line-height: 44rpx;
+  }
+
+  .scan-modal__actions {
+    display: flex;
+    flex-direction: row;
+    border-top: 2rpx solid #f0f0f0;
+  }
+
+  .scan-modal__btn {
+    flex: 1;
+    height: 100rpx;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .scan-modal__btn--cancel {
+    border-right: 2rpx solid #f0f0f0;
+  }
+
+  .scan-modal__btn--disabled {
+    opacity: 0.55;
+  }
+
+  .scan-modal__btn-text {
+    font-size: 32rpx;
+    color: #1a1a1a;
+  }
+
+  /* 确认钮品牌紫（打开/添加/复制均为普通操作，非危险态） */
+  .scan-modal__btn-text--primary {
+    color: #5147ff;
+    font-weight: 500;
+  }
+</style>

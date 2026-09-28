@@ -1,6 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+
+/**
+ * 离线包校验清单。文件名不能以 manifest.json 结尾。
+ * HBuilderX 读自定义基座 apk 时，用 entryName.endsWith("manifest.json")
+ * 取最后一个清单的 id 作为 appid。本清单没有 id，又排在
+ * assets/apps/__UNI__xxx/www/manifest.json 之后，会把 appid 读成空，
+ * 资源被同步到 apps/null，基座就弹出「未检测到应用资源」。
+ */
+export const RESOURCE_LIST_FILE = 'offline-h5-resources.json';
 export const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 export function sourceFingerprint(root) {
   const entries = [];
@@ -21,7 +30,7 @@ export function sourceFingerprint(root) {
 }
 export function verifyResourcePackage(directory) {
   directory = path.resolve(directory);
-  const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'offline-h5-manifest.json'), 'utf8'));
+  const manifest = JSON.parse(fs.readFileSync(path.join(directory, RESOURCE_LIST_FILE), 'utf8'));
   if (manifest.schemaVersion !== 1 || manifest.protocolVersion !== 1 || !Array.isArray(manifest.files) || !manifest.files.length) throw new Error('Unsupported or empty offline H5 package');
   const seen = new Set();
   for (const entry of manifest.files) {

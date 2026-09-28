@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { verifyResourcePackage } from './offline-h5/package-files.mjs';
+import { RESOURCE_LIST_FILE, verifyResourcePackage } from './offline-h5/package-files.mjs';
 
 const artifact = process.argv[2];
 if (!artifact || !fs.existsSync(artifact)) {
@@ -35,7 +35,7 @@ try {
     for (const name of fs.readdirSync(dir)) {
       const p = path.join(dir, name);
       if (fs.statSync(p).isDirectory()) {
-        if (name === 'offline-h5' && fs.existsSync(path.join(p, 'offline-h5-manifest.json'))) { pkgDir = p; return; }
+        if (name === 'offline-h5' && fs.existsSync(path.join(p, RESOURCE_LIST_FILE))) { pkgDir = p; return; }
         walk(p);
       }
     }

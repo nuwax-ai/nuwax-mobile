@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { RESOURCE_LIST_FILE } from './package-files.mjs';
 import { removeInlinedJsPreloads } from './preload.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -264,7 +265,7 @@ const manifest = {
   files: entries,
   totalBytes: entries.reduce((total, entry) => total + entry.bytes, 0),
 };
-fs.writeFileSync(path.join(OUT, 'offline-h5-manifest.json'), JSON.stringify(manifest, null, 2));
+fs.writeFileSync(path.join(OUT, RESOURCE_LIST_FILE), JSON.stringify(manifest, null, 2));
 const backup = `${DESTINATION}.previous-${process.pid}`;
 if (fs.existsSync(DESTINATION)) fs.renameSync(DESTINATION, backup);
 try { fs.renameSync(OUT, DESTINATION); }

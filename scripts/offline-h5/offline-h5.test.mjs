@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
-import { digest, verifyResourcePackage } from './package-files.mjs';
+import { digest, RESOURCE_LIST_FILE, verifyResourcePackage } from './package-files.mjs';
 const require = createRequire(import.meta.url);
 const hx = process.env.HX_APP_ROOT || '/Applications/HBuilderX.app/Contents/HBuilderX';
 const { transformSync } = require(path.join(hx, 'plugins/uniapp-cli-vite/node_modules/esbuild'));
@@ -60,7 +60,7 @@ test('resource verification rejects altered files and symlink directories', () =
       fs.writeFileSync(path.join(dir, name), name);
       return { path: name, bytes: Buffer.byteLength(name), sha256: digest(name) };
     });
-    fs.writeFileSync(path.join(dir, 'offline-h5-manifest.json'), JSON.stringify({ schemaVersion: 1, protocolVersion: 1, files, resourceVersion: digest(JSON.stringify(files)) }));
+    fs.writeFileSync(path.join(dir, RESOURCE_LIST_FILE), JSON.stringify({ schemaVersion: 1, protocolVersion: 1, files, resourceVersion: digest(JSON.stringify(files)) }));
     verifyResourcePackage(dir);
     fs.writeFileSync(path.join(dir, 'index.html'), 'broken');
     assert.throws(() => verifyResourcePackage(dir), /modified/);

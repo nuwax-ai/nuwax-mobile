@@ -53,6 +53,11 @@ hx_run() {
 }
 cli_kind=""
 case "${1:-}:${2:-}" in
+  launch:app-android)
+    bash "$SCRIPT_DIR/patch-hx-android-base-appid.sh"
+    ;;
+esac
+case "${1:-}:${2:-}" in
   launch:app-*|publish:app|pack:app*)
     hx_run "$SCRIPT_DIR/prepare-offline-h5.mjs"
     cli_kind="${1}:${2}"

@@ -85,7 +85,7 @@ offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
      准入双证据＝全产物零路径引用 + 闭包探测（http 伺服 + 浏览器过一遍真实渲染看请求清单）；
      被运行时 fetch 的路径（static/uni-highlight/_onig.wasm、static/uni-cmark/*.wasm、proxy-web 全套）不得排除
      重写 index.html：注入桥脚本、去跳转/验证码脚本、启动骨架
-     生成 offline-h5-manifest.json（全量文件 sha256 清单 + 源码指纹）
+     生成 offline-h5-resources.json（全量文件 sha256 清单 + 源码指纹；文件名不能以 manifest.json 结尾，否则 HBuilderX 会把它当成基座 appid）
   4. stage 校验后原子替换
 ```
 
@@ -96,7 +96,7 @@ offline-h5:build（scripts/build-offline-h5.mjs，被 prepare 自动调用）
 | `components/offline-h5-container/` | 容器通用件：壳 / 状态机 / 项目适配 / 页面约定 / 软导航 / 协议源码（bridge、project-bootstrap 随源码提交，构建时拷入包根） | ✅ |
 | `scripts/offline-h5/`、`scripts/*-offline-h5.mjs` | 构建脚本与单测 | ✅ |
 | `unpackage/offline-h5-web/` | 中间 Web 产物 | ❌ 已 ignore；构建成功后自动清理（`OFFLINE_H5_KEEP_WEB=1` 保留排查现场） |
-| `unpackage/offline-h5/` | 派生后的离线包 stage（pages 子集 + 资源排除后 353 文件 / ~15.6MB，全量时 523 文件 / ~25.4MB：app-bundle.js、index.html、assets/、static/、modules/、subpackages/、offline-h5-bridge.js、offline-h5-project-bootstrap.js、offline-h5-manifest.json） | ❌ |
+| `unpackage/offline-h5/` | 派生后的离线包 stage（pages 子集 + 资源排除后 353 文件 / ~15.6MB，全量时 523 文件 / ~25.4MB：app-bundle.js、index.html、assets/、static/、modules/、subpackages/、offline-h5-bridge.js、offline-h5-project-bootstrap.js、offline-h5-resources.json） | ❌ |
 | `unpackage/offline-h5-source.json` | 源码指纹戳 | ❌ |
 | `static/app/offline-h5/`（及 `.installing/` / `.previous/`） | 安装目录，HBuilderX 据此打进 App | ❌ |
 | `unpackage/dist/dev/app-*/static/app/offline-h5/` | 最终 App 编译产物里的包 | ❌（自动校验对象） |

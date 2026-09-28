@@ -1,27 +1,21 @@
 <template>
   <!--
     项目/任务抽屉（App v3 新交互）：左滑抽屉承载「项目」分组 +「任务」（会话历史）列表。
-    容器复用 uni-modal-popup position=left（滑入动画/遮罩/Android 返回拦截，
-    与 app-details 历史会话抽屉同款）。
+    固定遮罩与面板独立合成；拖动时直接更新位移，松手后吸附到开/关端点。
     职责边界：本组件 = 抽屉容器（滚动/下拉刷新/生命周期）+ 项目分组业务；
     任务（会话历史）列表为独立可复用组件 conversation-history-list，
     由本组件在其 scroll-view 内组装，触底/下拉/静默刷新经 expose 入口触发。
-    设计稿（2026-09-21）：项目行 = 名称 + 类型标签 + ＋（无文件夹图标）；子会话行 = 状态点 + 名称 + 相对时间；
+    项目行 = 开合文件夹 + 名称 + 类型标签 + ＋；子会话行 = 状态点 + 名称 + 相对时间；
     任务行 = 状态角标 + 标题 + 相对时间；区头无计数。
     项目列表为完整接口（2026-09-21 契约，对齐 PC toProjectItem）：回包行自带
     conversations 直接映射子会话，展开/收起为纯本地切换，无逐项目会话补拉。
   -->
-  <uni-modal-popup
-    ref="popupRef"
-    position="left"
-    width="85%"
-    :internal-side-overlay="true"
-    :show-header="false"
-    :body-scroll="false"
-    @update-visible="handlePopupVisible"
-  >
+  <view v-show="drawerPresented" class="drawer-overlay">
+    <view class="drawer-mask" :style="drawerMaskStyle" @click="handleMaskClick" />
+    <view class="drawer-panel" :style="drawerPanelStyle">
     <view
       class="drawer-wrap"
+      :style="drawerTopPaddingStyle"
       @touchstart="onDrawerSwipeTouchStart"
       @touchmove="onDrawerSwipeTouchMove"
       @touchend="onDrawerSwipeTouchEnd"
@@ -82,7 +76,12 @@
               @click="toggleProjectExpand(group.id)"
               @longpress="handleProjectLongPress(group.id)"
             >
-              <image v-if="group.pinned" :src="pinIcon" class="project-flag-image" mode="aspectFit" />
+              <view class="project-leading-icon">
+                <image :src="group.expanded ? folderOpenMutedIcon : folderClosedMutedIcon" class="project-folder-image" mode="aspectFit" />
+              </view>
+              <view class="project-pin-btn" @click.stop="handleProjectPinTap(group.id)">
+                <image :src="group.pinned ? pinActiveIcon : pinIcon" class="project-pin-image" mode="aspectFit" />
+              </view>
               <image v-if="!group.owner" :src="teamIcon" class="project-team-image" mode="aspectFit" />
               <text class="project-name">
                 {{ group.name }}
@@ -154,7 +153,7 @@
         />
       </scroll-view>
       <!-- 浮动吸顶头：钉在滚动区顶部，任务区到达后顶替项目头（对齐 PC 互顶行为）；点击同样折叠/展开当前分组 -->
-      <view v-if="showFloatingHeader" class="floating-section-header">
+      <view v-if="showFloatingHeader" class="floating-section-header" :style="floatingHeaderTopStyle">
         <view
           class="section-header"
           @click="floatingHeaderKey == 'task' ? toggleTaskSection() : toggleProjectSection()"
@@ -185,12 +184,15 @@
         </view>
       </view>
     </view>
-  </uni-modal-popup>
+    </view>
+  </view>
 </template>
 
 <script setup lang="uts">
+  import { HorizontalGestureIntent, resolveDrawerOpen } from "@/utils/horizontalGesture";
+  import { gestureTouchSlop } from "@/utils/gestureTouchSlop";
   import { ref, computed, watch, nextTick, onMounted, onUnmounted, getCurrentInstance, type ComponentPublicInstance } from "vue";
-  import UniModalPopup from "@/components/uni-modal-popup/uni-modal-popup.uvue";
+  import { registerPopupClose, unregisterPopupClose } from "@/utils/popupBackRegistry";
   import ConversationHistoryList from "@/components/conversation-history-list/conversation-history-list.uvue";
   import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
   import eventBus from "@/utils/eventBus";
@@ -242,7 +244,10 @@
   } from "@/utils/projectGroupProjection.uts";
   import noData from "@/static/assets/no_data.png";
   import pinIcon from "@/static/icons/pin.svg";
+  import pinActiveIcon from "@/static/icons/pin-active.svg";
   import teamIcon from "@/static/icons/team.svg";
+  import folderOpenMutedIcon from "@/static/icons/folder-open-muted.svg";
+  import folderClosedMutedIcon from "@/static/icons/folder-closed-muted.svg";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -256,7 +261,32 @@
     (e: "pin-project", project: PinnedProjectInfo): void;
   }>();
 
-  const popupRef = ref<any | null>(null);
+  const drawerPresented = ref<boolean>(false);
+  const drawerWidth = ref<number>(uni.getWindowInfo().windowWidth * 0.85);
+  const drawerOffset = ref<number>(-drawerWidth.value);
+  const drawerDuration = ref<number>(0);
+  const drawerTopInset = ref<number>(0);
+  // #ifdef APP
+  drawerTopInset.value = uni.getWindowInfo().statusBarHeight + 8;
+  // #endif
+  const drawerTopPaddingStyle = computed((): string => `padding-top: ${drawerTopInset.value}px;`);
+  const floatingHeaderTopStyle = computed((): string => `top: ${drawerTopInset.value}px;`);
+  let drawerAnimationTimer: number | null = null;
+  let drawerAnimationSequence = 0;
+  let drawerRegistryId = 0;
+  let drawerOpeningDrag = false;
+  let drawerVisibilityHandler: ((visible: boolean) => void) | null = null;
+  let drawerLastOffset = 0;
+  let drawerLastTime = 0;
+  let drawerVelocity = 0;
+  let drawerSuppressClickUntil = 0;
+  const drawerPanelStyle = computed((): string => {
+    return `width: ${drawerWidth.value}px; transform: translateX(${drawerOffset.value}px); transition-duration: ${drawerDuration.value}ms;`;
+  });
+  const drawerMaskStyle = computed((): string => {
+    const progress = Math.max(0, Math.min(1, 1 + drawerOffset.value / drawerWidth.value));
+    return `opacity: ${progress}; transition-duration: ${drawerDuration.value}ms;`;
+  });
   const drawerVisible = ref<boolean>(false);
   const drawerInstance = getCurrentInstance();
   // 浏览列表下方时延后头部对账，防止新增/重排的行改变当前阅读位置。
@@ -526,18 +556,9 @@
     projectVersion.value = projectVersion.value + 1;
   }
 
-// 抽屉容器关闭（声明前置：UTS/Kotlin 前向引用 error18，handleAddConversation 需先可用）
-  function close(): void {
-    const proxy = popupRef.value as ComponentPublicInstance | null;
-    if (proxy == null) return;
-    proxy.$callMethod("close");
-  }
-
-  // 与首页左缘右滑打开共用方向/距离约束。监听列表本身，同时由外壳兜底
-  // 原生 scroll-view 不向父级冒泡的端；同一事件冒泡时 tracking 门卫避免重复开始。
+  const drawerSwipeIntent = new HorizontalGestureIntent();
   let drawerSwipeTracking = false;
   let drawerSwipeLocked = false;
-  let drawerSwipeFired = false;
   let drawerSwipeStartX = 0;
   let drawerSwipeStartY = 0;
 
@@ -546,71 +567,141 @@
     drawerSwipeLocked = false;
   }
 
-  function drawerSwipeMinDx(): number {
-    const width = uni.getSystemInfoSync().windowWidth;
-    const byRatio = width * 0.2;
-    return byRatio > 56 ? byRatio : 56;
+  function clearDrawerAnimation(): void {
+    drawerAnimationSequence += 1;
+    if (drawerAnimationTimer != null) clearTimeout(drawerAnimationTimer!);
+    drawerAnimationTimer = null;
   }
 
-  function onDrawerSwipeTouchStart(e: any): void {
-    if (drawerVisible.value != true || drawerSwipeTracking) return;
-    const event = e as UniTouchEvent;
-    if (event.touches == null || event.touches.length != 1) return;
-    const touch = event.touches[0];
-    if (touch == null) return;
-    drawerSwipeFired = false;
-    drawerSwipeTracking = true;
-    drawerSwipeLocked = false;
-    drawerSwipeStartX = touch.clientX;
-    drawerSwipeStartY = touch.clientY;
-  }
-
-  function onDrawerSwipeTouchMove(e: any): void {
-    if (!drawerSwipeTracking || drawerSwipeFired) return;
-    const event = e as UniTouchEvent;
-    if (event.touches == null || event.touches.length != 1) return;
-    const touch = event.touches[0];
-    if (touch == null) return;
-    const dx = touch.clientX - drawerSwipeStartX;
-    const dy = touch.clientY - drawerSwipeStartY;
-    const absDx = dx >= 0 ? dx : -dx;
-    const absDy = dy >= 0 ? dy : -dy;
-    if (!drawerSwipeLocked) {
-      if (absDy > 12 && absDy > absDx * 0.65) { resetDrawerSwipe(); return; }
-      if (dx < -8 && absDx > absDy * 0.65) drawerSwipeLocked = true;
-      else return;
-    }
-    if (-dx < drawerSwipeMinDx()) return;
-    drawerSwipeFired = true;
+  function settleDrawer(opened: boolean): void {
+    clearDrawerAnimation();
+    drawerOpeningDrag = false;
     resetDrawerSwipe();
+    const target = opened ? 0 : -drawerWidth.value;
+    const distance = Math.abs(target - drawerOffset.value);
+    const duration = Math.round(160 + 120 * distance / drawerWidth.value);
+    drawerDuration.value = duration;
+    drawerOffset.value = target;
+    drawerSuppressClickUntil = Date.now() + duration + 80;
+    // 运动期间暂停列表刷新和锚点测量；在落定后才更新业务可见状态。
+    if (!opened && drawerVisibilityHandler != null) drawerVisibilityHandler!(false);
+    drawerAnimationTimer = setTimeout((): void => {
+      drawerAnimationTimer = null;
+      if (opened) {
+        if (drawerVisibilityHandler != null) drawerVisibilityHandler!(true);
+      }
+      else {
+        drawerPresented.value = false;
+        if (drawerRegistryId != 0) unregisterPopupClose(drawerRegistryId);
+        drawerRegistryId = 0;
+      }
+    }, duration);
+  }
+
+  function close(): void {
+    if (!drawerPresented.value) return;
+    settleDrawer(false);
+  }
+
+  function prepareDrawer(): void {
+    clearDrawerAnimation();
+    drawerWidth.value = uni.getWindowInfo().windowWidth * 0.85;
+    drawerDuration.value = 0;
+    drawerOffset.value = -drawerWidth.value;
+    drawerPresented.value = true;
+    drawerVelocity = 0;
+    drawerLastTime = Date.now();
+    drawerLastOffset = drawerOffset.value;
+    if (drawerRegistryId == 0) drawerRegistryId = registerPopupClose((): void => close());
+  }
+
+  function handleMaskClick(): void {
+    if (Date.now() < drawerSuppressClickUntil || drawerOpeningDrag) return;
     close();
   }
 
-  function onDrawerSwipeTouchEnd(e: any): void {
-    if (drawerSwipeTracking && !drawerSwipeFired) {
-      const event = e as UniTouchEvent;
-      if (event.changedTouches != null && event.changedTouches.length > 0) {
-        const touch = event.changedTouches[0];
-        if (touch != null) {
-          const dx = touch.clientX - drawerSwipeStartX;
-          const dy = touch.clientY - drawerSwipeStartY;
-          const absDx = dx >= 0 ? dx : -dx;
-          const absDy = dy >= 0 ? dy : -dy;
-          if (dx <= -drawerSwipeMinDx() && absDx > absDy * 0.65) {
-            drawerSwipeFired = true;
-            resetDrawerSwipe();
-            close();
-            return;
-          }
-        }
-      }
+  function updateDrawerOffset(offset: number): void {
+    const next = Math.max(-drawerWidth.value, Math.min(0, offset));
+    const now = Date.now();
+    const elapsed = now - drawerLastTime;
+    // scroll-view 与父容器可能同时收到同一事件，重复位置不重置速度样本。
+    if (next != drawerLastOffset) {
+      if (elapsed > 0) drawerVelocity = (next - drawerLastOffset) / elapsed;
+      drawerLastOffset = next;
+      drawerLastTime = now;
     }
-    resetDrawerSwipe();
+    drawerDuration.value = 0;
+    drawerOffset.value = next;
+  }
+
+  function finishDrawerDrag(cancelled: boolean, wasOpen: boolean): void {
+    if (cancelled) { settleDrawer(wasOpen); return; }
+    const velocity = Date.now() - drawerLastTime <= 100 ? drawerVelocity : 0;
+    const opened = resolveDrawerOpen(drawerOffset.value, drawerWidth.value, velocity, wasOpen);
+    settleDrawer(opened);
+  }
+
+  // 首页持有最初的触摸序列，浮层不更换触摸宿主，避免中途丢失 move/end。
+  function beginOpenDrag(): void {
+    if (drawerPresented.value) return;
+    prepareDrawer();
+    drawerOpeningDrag = true;
+  }
+
+  function updateOpenDrag(distance: number): void {
+    if (!drawerOpeningDrag) return;
+    updateDrawerOffset(distance - drawerWidth.value);
+  }
+
+  function endOpenDrag(cancelled: boolean): void {
+    if (!drawerOpeningDrag) return;
+    finishDrawerDrag(cancelled, false);
+  }
+
+  function onDrawerSwipeTouchStart(e: UniTouchEvent): void {
+    if (!drawerVisible.value || drawerSwipeTracking || drawerAnimationTimer != null) return;
+    if (e.touches.length != 1) return;
+    drawerSwipeTracking = true;
+    drawerSwipeLocked = false;
+    drawerSwipeStartX = e.touches[0].screenX;
+    drawerSwipeStartY = e.touches[0].screenY;
+    drawerSwipeIntent.begin(gestureTouchSlop());
+    drawerLastOffset = 0;
+    drawerLastTime = Date.now();
+    drawerVelocity = 0;
   }
 
   function onDrawerSwipeTouchCancel(): void {
-    resetDrawerSwipe();
+    if (drawerSwipeLocked) finishDrawerDrag(true, true);
+    else resetDrawerSwipe();
   }
+
+  function onDrawerSwipeTouchMove(e: UniTouchEvent): void {
+    if (!drawerSwipeTracking) return;
+    if (e.touches.length != 1) { onDrawerSwipeTouchCancel(); return; }
+    const dx = e.touches[0].screenX - drawerSwipeStartX;
+    const dy = e.touches[0].screenY - drawerSwipeStartY;
+    if (!drawerSwipeLocked) {
+      const intent = drawerSwipeIntent.move(dx, dy);
+      if (intent == 0) return;
+      if (intent == -1 || dx > 0) { resetDrawerSwipe(); return; }
+      if (intent != 1 || dx >= 0) return;
+      drawerSwipeLocked = true;
+      allowSilentRefresh.value = false;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    updateDrawerOffset(dx);
+  }
+
+  function onDrawerSwipeTouchEnd(e: UniTouchEvent): void {
+    if (!drawerSwipeTracking) return;
+    if (drawerSwipeLocked) {
+      if (e.changedTouches.length > 0) updateDrawerOffset(e.changedTouches[0].screenX - drawerSwipeStartX);
+      finishDrawerDrag(false, true);
+    } else resetDrawerSwipe();
+  }
+
 
   /** 项目「＋」新建会话：上框到首页（对齐 PC ProjectPanel pin → /home）；PageApp 不上框。 */
   function handleAddConversation(groupId: number): void {
@@ -675,6 +766,12 @@
     }).catch((_e) => {
       uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
     });
+  }
+
+  function handleProjectPinTap(groupId: number): void {
+    const group = findProjectGroup(groupId);
+    if (group == null) return;
+    performProjectPinToggle(group, t("Mobile.Conversation.pinSuccess"), t("Mobile.Conversation.unpinSuccess"));
   }
 
   function performProjectArchiveToggle(group: ProjectGroupView, successTitleOn: string, successTitleOff: string): void {
@@ -1163,6 +1260,8 @@
   let lastLazyAnchorMeasureAt = 0;
 
   function handleStickyScroll(e: UniScrollEvent): void {
+    // 一旦列表产生滚动，未接管的抽屉手势必须退出，保留原生惯性。
+    if (!drawerSwipeLocked) resetDrawerSwipe();
     const st = e.detail.scrollTop;
     stickyLastScrollTop = st;
     const wasAllowed = allowSilentRefresh.value;
@@ -1236,8 +1335,13 @@
   }
 
   function handlePopupVisible(visible: boolean): void {
+    if (visible && drawerVisible.value) {
+      allowSilentRefresh.value = !refreshInFlight;
+      return;
+    }
     drawerVisible.value = visible == true;
     if (visible) {
+      if (props.isLoggedIn && !projectLoadedOnce && projectRequestPromise == null) requestProjects();
       stickyLastScrollTop = 0;
       taskHeaderContentOffset = -1;
       floatingHeaderKey.value = "";
@@ -1246,17 +1350,17 @@
     if (!visible) resetDrawerSwipe();
   }
 
+  drawerVisibilityHandler = (visible: boolean): void => handlePopupVisible(visible);
+
   function open(): void {
-    const proxy = popupRef.value as ComponentPublicInstance | null;
-    if (proxy == null) return;
-    proxy.$callMethod("open");
-    if (!props.isLoggedIn) return;
-    // 初始化已预取；提前打开或预取失败时才在此补拉。
-    if (!projectLoadedOnce && projectRequestPromise == null) {
-      requestProjects();
-    }
-    // 任务列表首载在 watch(drawerVisible) 里做：page-container 关闭态不挂载子组件，
-    // 此刻 taskListRef 尚未绑定，直接调会被 null 守卫吞掉（首开空白、二开才有的根因）
+    if (drawerPresented.value) return;
+    prepareDrawer();
+    // 先提交屏外起点，下一帧再展开；菜单按钮和手势共用同一套缓动。
+    const sequence = drawerAnimationSequence;
+    nextTick((): void => {
+      if (sequence != drawerAnimationSequence) return;
+      drawerAnimationTimer = setTimeout((): void => settleDrawer(true), 16);
+    });
   }
 
   /** 首页 onShow resume：抽屉开着时静默补差（任务头部 + 项目全量）。 */
@@ -1278,7 +1382,7 @@
   }
 
   /**
-   * 任务列表首载兜底：page-container 打开后 slot 子组件的挂载可能晚于 nextTick
+   * 任务列表首载兜底：抽屉打开后 slot 子组件的挂载可能晚于 nextTick
    * （ref 短暂为 null），带短重试直到 ref 绑定。
    */
   function ensureTaskListLoaded(retries: number): void {
@@ -1402,7 +1506,7 @@
       silentRefreshProjects();
     }
     // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
-    // 弹层动画（page-container ~300ms）结束后测锚点；数据到位后 projectVersion watch 会再补测
+    // 抽屉落定后测锚点；数据到位后 projectVersion watch 会再补测
     scheduleMeasureStickyAnchors(400);
   });
 
@@ -1459,6 +1563,9 @@
   });
 
   onUnmounted(() => {
+    clearDrawerAnimation();
+    if (drawerRegistryId != 0) unregisterPopupClose(drawerRegistryId);
+    drawerRegistryId = 0;
     eventBus.off(`${EVENT_TYPE.ChatFinished}`, onChatFinishedEvent);
     refreshing.value = false;
     listMounted.value = false;
@@ -1466,6 +1573,9 @@
 
   defineExpose({
     open: open as any,
+    beginOpenDrag: beginOpenDrag as any,
+    updateOpenDrag: updateOpenDrag as any,
+    endOpenDrag: endOpenDrag as any,
     close: close as any,
     resumeData: resumeData as any,
     refreshProjects: refreshProjects as any,
@@ -1473,6 +1583,10 @@
 </script>
 
 <style lang="scss" scoped>
+  .drawer-overlay { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 999; overflow: hidden; }
+  .drawer-mask { position: absolute; top: 0; right: 0; bottom: 0; left: 0; background-color: rgba(0, 0, 0, 0.4); transition-property: opacity; transition-timing-function: ease-out; }
+  .drawer-panel { position: absolute; top: 0; bottom: 0; left: 0; display: flex; flex-direction: column; background-color: #ffffff; border-top-right-radius: 20rpx; border-bottom-right-radius: 20rpx; overflow: hidden; transition-property: transform; transition-timing-function: ease-out; }
+
   .drawer-wrap {
     position: relative;
     width: 100%;
@@ -1482,9 +1596,6 @@
     flex: 1;
     min-height: 0;
     background-color: #ffffff;
-    /* #ifdef APP */
-    padding-top: 120rpx;
-    /* #endif */
     /* #ifdef APP-IOS */
     /* 抽屉面板 fixed 锚到物理屏底（含 home 指示条区域），底部内容留出安全区 */
     padding-bottom: env(safe-area-inset-bottom);
@@ -1503,7 +1614,7 @@
     flex-direction: row;
     align-items: center;
     justify-content: space-between;
-    padding: 28rpx 32rpx 14rpx;
+    padding: 12rpx 32rpx 10rpx;
     background-color: #ffffff;
 
     .section-title-text {
@@ -1561,7 +1672,7 @@
 
   /* 任务分组头：与项目区的间距并入 padding-top（吸顶条整块不透明，不用 margin 防透缝） */
   .task-section-header {
-    padding-top: 40rpx;
+    padding-top: 20rpx;
   }
 
   /* 浮动吸顶头（iOS/微信降级端）：钉在滚动区顶部，top 与 drawer-wrap 的 APP 状态栏让位对齐 */
@@ -1572,29 +1683,46 @@
     right: 0;
     z-index: 10;
     background-color: #ffffff;
-    /* #ifdef APP */
-    top: 120rpx;
-    /* #endif */
   }
 
   // ===== 项目分组（对齐设计稿：无分割线，留白分组） =====
   /* .project-block 仅剩 scroll-view 分支的分组间距；行样式提升到顶层，
      供 Android 扁平行（list-item 直挂行 view）与 scroll-view 分支共用 */
   .project-block {
-    padding-bottom: 18rpx;
+    padding-bottom: 8rpx;
   }
 
   .project-row {
       display: flex;
       flex-direction: row;
       align-items: center;
-      padding: 26rpx 32rpx;
+      padding: 14rpx 32rpx;
 
-      .project-flag-image {
+      .project-leading-icon {
         flex-shrink: 0;
-        width: 22rpx;
-        height: 22rpx;
-        margin-right: 8rpx;
+        width: 32rpx;
+        height: 32rpx;
+        margin-right: 4rpx;
+      }
+
+      .project-folder-image {
+        width: 32rpx;
+        height: 32rpx;
+      }
+
+      .project-pin-btn {
+        flex-shrink: 0;
+        width: 40rpx;
+        height: 48rpx;
+        margin-right: 4rpx;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .project-pin-image {
+        width: 23rpx;
+        height: 23rpx;
       }
 
       /* 类型标签（2026-09-21 设计稿恢复：常规项目/网页应用/全栈项目，灰底小圆角 pill） */
@@ -1655,7 +1783,7 @@
       display: flex;
       flex-direction: row;
       align-items: center;
-      padding: 22rpx 32rpx 22rpx 72rpx;
+      padding: 11rpx 32rpx 11rpx 72rpx;
 
       .child-status {
         flex-shrink: 0;
@@ -1697,7 +1825,7 @@
     }
 
     .project-child-empty {
-      padding: 12rpx 32rpx 20rpx 72rpx;
+      padding: 6rpx 32rpx 10rpx 72rpx;
 
       .project-child-empty-text {
         font-size: 24rpx;

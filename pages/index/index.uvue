@@ -580,6 +580,13 @@
     if (isUserAppPinned.value) return 0;
     return defaultAgentId.value;
   });
+  const activeRecId = computed((): number | null => {
+    if (summonedExpertId.value > 0) return null;
+    const recommend = selectedRecommend.value;
+    return recommend != null ? recommend.id : null;
+  });
+  // 同一智能体可对应多个推荐标签，标签变化也需要重新获取详情。
+  const activeAgentDetailKey = computed((): string => `${activeAgentId.value}:${activeRecId.value}`);
   const activeAgentName = computed((): string => {
     if (summonedExpertId.value > 0) return summonedExpertName.value;
     const recommend = selectedRecommend.value;
@@ -854,25 +861,6 @@
     summonedExpertAllowAtSkill.value = 1;
   }
 
-  /** 推荐位选中 → 拉详情联动门控/placeholder（对齐 PC currentAgentId → agentDetail） */
-  async function loadRecommendDetail(targetId: number): Promise<void> {
-    recommendAllowAtSkill.value = 1;
-    recommendEnableVersionControl.value = 0;
-    recommendPlaceholder.value = selectedRecommend.value != null ? selectedRecommend.value.placeholder : "";
-    try {
-      const res = await apiPublishedAgentInfo(targetId, false);
-      if (apiResCode(res) != SUCCESS_CODE) return;
-      const detail = resObject(apiResData<any>(res));
-      if (detail == null) return;
-      const recommend = selectedRecommend.value;
-      if (recommend == null || recommend.targetId != targetId) return;
-      recommendAllowAtSkill.value = detail["allowAtSkill"] == 1 ? 1 : 0;
-      recommendEnableVersionControl.value = detail["enableVersionControl"] == 1 ? 1 : 0;
-    } catch (_error) {
-      // 详情失败保留推荐位自带能力（placeholder 已就位）
-    }
-  }
-
   /** 点击标签只更新输入框中的智能体；重复点击保持当前选择和草稿。 */
   function handleRecommendSelect(item: DisplayRecommendInfo): void {
     const current = selectedRecommend.value;
@@ -881,7 +869,7 @@
       return;
     }
     selectedRecommend.value = item;
-    loadRecommendDetail(item.targetId);
+    recommendPlaceholder.value = item.placeholder;
     // 对齐 PC：切换智能体时电脑交给选择器按新智能体记忆解析，避免先按旧 agentId 回弹。
     clearSummonedExpert();
     currentModelId.value = 0;
@@ -947,7 +935,7 @@
     if (hit == null) hit = findTypeFallbackAgent(list, pinned.projectType);
     if (hit != null) {
       selectedRecommend.value = hit;
-      loadRecommendDetail(hit.targetId);
+      recommendPlaceholder.value = hit.placeholder;
       return;
     }
     if (pinnedMissedProjectId != pinned.projectId) {
@@ -1181,7 +1169,9 @@
   }
 
   /** 会话对象详情派生门控（对齐 PC agentDetail：allowOtherModel/allowChooseMode/manualComponents；详情未到保持放开默认） */
-  async function loadActiveAgentDetail(agentId: number): Promise<void> {
+  async function loadActiveAgentDetail(agentId: number, recId: number | null): Promise<void> {
+    recommendAllowAtSkill.value = 1;
+    recommendEnableVersionControl.value = 0;
     activeAllowOtherModel.value = true;
     activeAllowChooseMode.value = 1;
     activeAllowPrivateSandbox.value = false;
@@ -1191,12 +1181,25 @@
     activeGuideQuestions.value = [] as ExpertGuideQuestionInfo[];
     if (agentId <= 0) return;
     try {
-      const res = await apiPublishedAgentInfo(agentId, false);
+      const res = await apiPublishedAgentInfo(agentId, false, recId);
       if (apiResCode(res) != SUCCESS_CODE) return;
       // 快速切换守卫（对齐 PC 禅道bug2394：旧响应晚到不得覆盖新对象详情）
-      if (activeAgentId.value != agentId) return;
+      if (activeAgentId.value != agentId || activeRecId.value != recId) return;
       const detail = resObject(apiResData<any>(res));
       if (detail == null) return;
+      // 默认智能体的展示信息也复用当前详情，初始化配置只负责更新 ID。
+      if (recId == null && agentId == defaultAgentId.value && summonedExpertId.value <= 0) {
+        const nameStr = strOf(detail["name"]);
+        const defaultTypeStr = strOf(detail["type"]);
+        defaultAgentName.value = nameStr.length > 0 ? nameStr : t("Mobile.Common.appName");
+        defaultAgentType.value = defaultTypeStr.length > 0 ? defaultTypeStr : "ChatBot";
+        defaultEnableVersionControl.value = detail["enableVersionControl"] == 1 ? 1 : 0;
+      }
+      // 推荐标签能力与输入框配置共用本次详情，避免点击标签重复请求。
+      if (recId != null) {
+        recommendAllowAtSkill.value = detail["allowAtSkill"] == 1 ? 1 : 0;
+        recommendEnableVersionControl.value = detail["enableVersionControl"] == 1 ? 1 : 0;
+      }
       let guideQuestions = parseHomeGuideQuestions(detail["guidQuestionDtos"]);
       if (guideQuestions.length == 0) guideQuestions = parseHomeGuideQuestions(detail["openingGuidQuestions"]);
       activeGuideQuestions.value = guideQuestions;
@@ -1239,25 +1242,23 @@
   }
 
   /** 租户默认智能体与首页品牌（对齐 PC：本地缓存先行，接口刷新覆盖） */
-  function applyDefaultAgentConfig(config: UTSJSONObject): number {
+  function applyDefaultAgentConfig(config: UTSJSONObject): void {
     applyHomeBranding(config);
     const id = numFromAny(config["defaultAgentId"], 0);
     defaultAgentId.value = id;
-    return id;
   }
 
   async function loadDefaultAgentEntry(): Promise<void> {
     try {
-      let agentId = 0;
       const cachedRaw = uni.getStorageSync(TENANT_CONFIG_INFO);
       if (cachedRaw != null && `${cachedRaw}`.length > 0) {
         try {
           const cached = JSON.parse<UTSJSONObject>(`${cachedRaw}`);
           if (cached != null) {
-            agentId = applyDefaultAgentConfig(cached);
+            applyDefaultAgentConfig(cached);
           }
         } catch (_e) {
-          agentId = 0;
+          // 缓存不可用时继续读取服务端配置。
         }
       }
 
@@ -1268,24 +1269,11 @@
           uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(configData));
           const config = resObject(configData);
           if (config != null) {
-            agentId = applyDefaultAgentConfig(config);
+            applyDefaultAgentConfig(config);
           }
         }
       }
 
-      if (agentId > 0) {
-        const detailRes = await apiPublishedAgentInfo(agentId, false);
-        if (apiResCode(detailRes) == SUCCESS_CODE) {
-          const detail = resObject(apiResData<any>(detailRes));
-          if (detail != null) {
-            const nameStr = strOf(detail["name"]);
-            const typeStr = strOf(detail["type"]);
-            defaultAgentName.value = nameStr.length > 0 ? nameStr : t("Mobile.Common.appName");
-            defaultAgentType.value = typeStr.length > 0 ? typeStr : "ChatBot";
-            defaultEnableVersionControl.value = detail["enableVersionControl"] == 1 ? 1 : 0;
-          }
-        }
-      }
     } catch (error) {
       console.error("加载创建页默认智能体失败", error);
     }
@@ -1888,8 +1876,8 @@
   });
 
   /** 会话对象切换 → 重拉详情派生门控（对齐 PC currentAgentId → agentDetail；快速切换旧响应不覆盖） */
-  watch(activeAgentId, (agentId: number) => {
-    loadActiveAgentDetail(agentId);
+  watch(activeAgentDetailKey, (_key: string) => {
+    loadActiveAgentDetail(activeAgentId.value, activeRecId.value);
   });
 
   // ════════════════ 7. 平台条件块 ════════════════

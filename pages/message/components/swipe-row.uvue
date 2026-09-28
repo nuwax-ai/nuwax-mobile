@@ -7,10 +7,13 @@
     @touchend="onTouchEnd($event)"
     @touchcancel="onTouchEnd($event)"
   >
-    <!-- 默认插槽为行内容；右侧平铺操作按钮层整体滑入/收回。 -->
+    <!-- 默认插槽为行内容；右侧操作按钮层宽度随手势生长/收回。 -->
     <slot />
-    <!-- 操作按钮横向平铺，按钮层整体随手势从右侧拉出。 -->
-    <view class="chat-swipe__acts" :style="actsTranslateStyle">
+    <!-- 按钮层钉在右侧不动，宽度从 0 长到总宽；内部按钮各自固定全宽（文案只排版一次，
+         拖拽永不重测 → 无闪现），以 left: i/N×100% 定位：任意拖出距离 d 下每个按钮
+         露出最左 d/N 等宽切片（相邻按钮重叠遮挡其右段、行右缘裁掉超出部分），
+         拉出=遮挡滑开逐字露出，收起=逐字盖回（重叠式拉出/收起）。 -->
+    <view class="chat-swipe__acts" :style="actsRevealStyle">
       <slot name="acts" />
     </view>
   </view>
@@ -28,7 +31,7 @@
       type: Boolean,
       default: false,
     },
-    // 按钮区总宽（rpx）：420=3×140 / 280=2×140 / 220=单个宽钮
+    // 按钮区总宽（rpx）：420=3钮 / 280=2钮 / 220=单个宽钮（钮宽 141rpx 相邻重叠 1rpx 消缝）
     actsRpx: {
       type: Number,
       default: 420,
@@ -60,24 +63,60 @@
 
   // 按钮层横向偏移（px，闭合=0，展开=-totalW）
   const swipeX = ref<number>(0);
-  // 松手吸附动画开关（200ms 过渡）
-  const swipeAnim = ref<boolean>(false);
 
-  const actsTranslateStyle = computed((): string => {
-    let style = `transform: translateX(${swipeX.value + actsWidthPx}px);`;
-    if (swipeAnim.value) {
-      style += "transition-property: transform; transition-duration: 200ms; transition-timing-function: ease-out;";
-    }
-    return style;
+  /** 按钮层展开宽度（px）：层钉在右侧，宽度 = -swipeX（闭合 swipeX=0 → 宽 0；
+   *  展开 swipeX=-W → 宽 W）。层内按钮各自固定全宽、以 left: i/N×100% 定位，
+   *  拖出距离 d 时每钮露出最左 d/N 等宽切片（重叠式，视觉等宽并显）。 */
+  const actsRevealStyle = computed((): string => {
+    return `width: ${-swipeX.value}px;`;
   });
 
-  // 外部收起：open 变 false 且当前展开 → 动画收回
+  // ===== 松手吸附补间：JS 驱动逐帧改宽（与拖拽同一条渲染路径）=====
+  // 不用 CSS transition：App 端对动态绑定 width 的过渡不稳（真机快速甩动松手时
+  // 按钮层先瞬间跳到全宽再回缩）；拖拽路径逐帧改宽已被真机验证流畅，吸附复用同机制。
+  let settleTimerId: number | null = null;
+
+  function cancelSettleAnim(): void {
+    // 局部常量承接：可变变量无法 smart cast 非空（Kotlin 并发限制）
+    const tid = settleTimerId;
+    if (tid != null) {
+      try {
+        clearInterval(tid);
+      } catch (_e) {
+        // ignore
+      }
+      settleTimerId = null;
+    }
+  }
+
+  /** 200ms ease-out 补间到目标偏移；新 touchstart / 外部收起会取消并改道。 */
+  function settleTo(target: number): void {
+    cancelSettleAnim();
+    const from = swipeX.value;
+    const delta = target - from;
+    if (delta == 0) {
+      return;
+    }
+    const durationMs = 200;
+    const startAt = Date.now();
+    settleTimerId = setInterval((): void => {
+      const progress = Math.min(1, (Date.now() - startAt) / durationMs);
+      // ease-out cubic：1-(1-t)^3，起步快收尾缓，与原 CSS ease-out 观感一致
+      const eased = 1 - (1 - progress) * (1 - progress) * (1 - progress);
+      swipeX.value = Math.round(from + delta * eased);
+      if (progress >= 1) {
+        cancelSettleAnim();
+        swipeX.value = target;
+      }
+    }, 16);
+  }
+
+  // 外部收起：open 变 false 且当前展开 → 补间收回
   watch(
     (): boolean => props.open,
     (open: boolean) => {
       if (open != true && swipeX.value != 0) {
-        swipeAnim.value = true;
-        swipeX.value = 0;
+        settleTo(0);
       }
     },
   );
@@ -91,6 +130,19 @@
   let axis = 0;
   let lastMoveLogAt = 0;
 
+  // ===== 快速滑动（fling）判定：快速左滑一下直接全开、快速右滑一下直接收起 =====
+  /** fling 速度阈值（px/ms，≈300px/s）：松手时窗口速度超过即越过位置阈值直接吸附。 */
+  const FLING_VELOCITY_PX_PER_MS = 0.3;
+  /** 速度窗口（ms）：窗口首尾位移/耗时求速度（真机 move 分发会成簇/断流，瞬时速度不可信）。 */
+  const FLING_WINDOW_MS = 120;
+  // 窗口基点 + 最新采样（touchstart 初始化）。曾用 EMA 平滑瞬时速度：快滑收尾的
+  // 单帧反向抖动能把 EMA 拉回阈值内、>120ms 的分发空档直接清零——快滑松手判不出
+  // 负速度，表现为「拉出一半弹回」；首尾差分对两者都不敏感。
+  let sampleBaseX = 0;
+  let sampleBaseT = 0;
+  let sampleLastX = 0;
+  let sampleLastT = 0;
+
   /**
    * 模板内联表达式中的 `$event` 在 Android UTS 会被推断为 Any；
    * 仅在模板边界接收 Any，进入手势逻辑后恢复为真实的 UniTouchEvent。
@@ -102,11 +154,17 @@
       return;
     }
     touching = true;
+    // 打断进行中的吸附补间，从当前宽度继续跟手
+    cancelSettleAnim();
     startX = e.touches[0].clientX;
     startY = e.touches[0].clientY;
     baseX = swipeX.value;
     axis = 0;
     lastMoveLogAt = 0;
+    sampleBaseX = startX;
+    sampleBaseT = Date.now();
+    sampleLastX = startX;
+    sampleLastT = sampleBaseT;
     console.log(`[IMSwipe] touchstart x=${startX} y=${startY} base=${baseX}`);
     emit("grab");
   }
@@ -135,6 +193,14 @@
     if (axis != 1) {
       return;
     }
+    // 速度采样（fling 判定）：采样跨出窗口时基点前移到上一采样（停顿后不作跨段差分）
+    const sampleT = Date.now();
+    if (sampleT - sampleBaseT > FLING_WINDOW_MS) {
+      sampleBaseX = sampleLastX;
+      sampleBaseT = sampleLastT;
+    }
+    sampleLastX = e.touches[0].clientX;
+    sampleLastT = sampleT;
     let next = baseX + dx;
     if (next < -actsWidthPx) {
       next = -actsWidthPx;
@@ -147,7 +213,6 @@
     if (snapped == swipeX.value) {
       return;
     }
-    swipeAnim.value = false;
     swipeX.value = snapped;
     const now = Date.now();
     if (now - lastMoveLogAt >= 100) {
@@ -167,11 +232,26 @@
       console.log(`[IMSwipe] touchend ignored: axis=${axis}`);
       return;
     }
-    // 过半展开、不足半收回；松手吸附带 200ms 过渡
-    swipeAnim.value = true;
-    swipeX.value = swipeX.value < -actsWidthPx / 2 ? -actsWidthPx : 0;
-    const opened = swipeX.value == -actsWidthPx;
-    console.log(`[IMSwipe] settle swipeX=${swipeX.value}px width=${actsWidthPx}px opened=${opened}`);
+    // 松手吸附（200ms JS 补间）：
+    // - 快速左滑（fling）→ 直接全开；快速右滑 → 直接收起（不受过半位置阈值约束）
+    // - 抬手前已停顿（>100ms 无 move 采样）或窗口速度未达阈值 → 维持过半展开、不足半收回
+    let fling = 0;
+    const endNow = Date.now();
+    if (endNow - sampleLastT <= 100 && sampleLastT - sampleBaseT >= 8) {
+      fling = (sampleLastX - sampleBaseX) / (sampleLastT - sampleBaseT);
+    }
+    let target = swipeX.value < -actsWidthPx / 2 ? -actsWidthPx : 0;
+    if (fling <= -FLING_VELOCITY_PX_PER_MS) {
+      target = -actsWidthPx;
+    } else if (fling >= FLING_VELOCITY_PX_PER_MS) {
+      target = 0;
+    }
+    settleTo(target);
+    const opened = target == -actsWidthPx;
+    const flingDx = sampleLastX - sampleBaseX;
+    const flingDt = sampleLastT - sampleBaseT;
+    const flingStale = endNow - sampleLastT;
+    console.log(`[IMSwipe] settle x=${swipeX.value} w=${actsWidthPx} v=${fling} dx=${flingDx} dt=${flingDt} stale=${flingStale} opened=${opened}`);
     // 先提交本行最终位移，再通知父级变更 scroll-view direction，避免原生视图更新打断收尾。
     emit(opened ? "opened" : "closed");
     emit("swiped");
@@ -180,10 +260,10 @@
 </script>
 
 <style lang="scss">
-  /* 左滑操作行（飞书同款）：内容行不动，按钮层绝对定位盖在行内容上方重叠滑入。
-     不加 scoped：slot 内容由父页 message.uvue 渲染，scoped 会把 .chat-swipe__act
-     改写成 .chat-swipe__act[data-v-xxx] 让父页渲染的按钮拿不到这条样式（行内块
-     自然铺开 = 全部按钮可见），与容器样式只此一处使用、无命名冲突故无需 scoped */
+  /* 左滑操作行（飞书同款）：内容行不动，按钮层绝对定位钉在右侧、宽度随手势生长
+     盖在行内容上方。不加 scoped：slot 内容由父页 message.uvue 渲染，scoped 会把
+     .chat-swipe__act 改写成 .chat-swipe__act[data-v-xxx] 让父页渲染的按钮拿不到
+     这条样式（行内块自然铺开 = 全部按钮可见），与容器样式只此一处使用、无命名冲突故无需 scoped */
   .chat-swipe {
     position: relative;
     overflow: hidden;
@@ -195,7 +275,8 @@
     right: 0;
     bottom: 0;
     z-index: 2;
-    display: flex;
-    flex-direction: row;
+    /* 裁掉越出层宽（=行右缘）的按钮部分：既是收起态的隐藏，也是拖拽中
+       最右按钮的右缘裁切（重叠式的遮挡来源之一） */
+    overflow: hidden;
   }
 </style>

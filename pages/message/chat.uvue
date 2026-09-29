@@ -2638,6 +2638,32 @@
     }
   }
 
+  /** READ_NOTIFY 帧触发的已读重查去抖定时器 + 「窗口期又来帧」尾随标记。 */
+  let readRefreshTimer = 0;
+  let readRefreshOwed = false;
+
+  /**
+   * 已读回执帧 → 去抖重查（PC lib/readRefreshScheduler.ts 同款：前沿 300ms 窗口 +
+   * 尾随一轮）。群里每有一个人读到新位置就发一帧，「大家都读了」会连着来好几帧 ——
+   * 逐帧都查一次 read-status 是把 O(1) 的界面更新放大成 O(人数) 的请求；窗口内
+   * 只留一次，窗口期来过新帧则到点后补一轮（保证最后一帧之后必有一次为它发起的查询）。
+   */
+  function scheduleReadRefresh(): void {
+    if (readRefreshTimer != 0) {
+      readRefreshOwed = true;
+      return;
+    }
+    readRefreshTimer = setTimeout(() => {
+      readRefreshTimer = 0;
+      const owed = readRefreshOwed;
+      readRefreshOwed = false;
+      refreshReadStatus();
+      if (owed) {
+        scheduleReadRefresh();
+      }
+    }, 300);
+  }
+
   function replaceByClientMsgId(confirmed: ImMsgRow): void {
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
@@ -4801,6 +4827,105 @@
       return;
     }
     insertMessageBySeq(row, true);
+    // 多端同步：同一账号在 PC 等其他端发的我方消息 ⇒ 落地即排一次已读查询，
+    // icon 不必等 onShow/本端下次发送（refreshReadStatus 内部自筛候选，非我方消息空转）
+    if (isMine(row)) {
+      scheduleReadRefresh();
+    }
+  }
+
+  /**
+   * READ_NOTIFY 实时已读回执（语义对齐 PC store/chat.ts 的 onReadNotify/onReadNotifyAgg）：
+   * - 4001 逐人帧 {userId, readSeq}：单聊读者只有对方 ⇒ readSeq 水位即答案，本地直推（即时）；
+   *   群聊这帧推不出「几个人读了」⇒ 不猜数字，去抖后问服务端要真值。
+   * - 4002 聚合帧（>500 人群）{counts:[{msgId,readCount}]}：命中缓存的就地补 readCount，
+   *   无缓存（拿不到分母 eligibleCount）只能去抖重查。
+   */
+  function handleImReadNotified(payload: any): void {
+    if (payload == null) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    const frameConvId = readString(obj, "convId");
+    if (frameConvId.length == 0 || frameConvId != convId.value) {
+      return;
+    }
+    if (readBool(obj, "aggregated")) {
+      const countsRaw = obj["counts"];
+      if (countsRaw == null) {
+        return;
+      }
+      const counts = countsRaw as UTSJSONObject[];
+      let miss = false;
+      for (let i = 0; i < counts.length; i++) {
+        const one = counts[i];
+        const msgId = readString(one, "msgId");
+        if (msgId.length == 0) {
+          continue;
+        }
+        const existing = findReadInfo(msgId);
+        if (existing == null) {
+          miss = true;
+          continue;
+        }
+        existing.readCount = readNumber(one, "readCount", existing.readCount);
+        existing.readAll = existing.eligibleCount > 0 && existing.readCount >= existing.eligibleCount;
+      }
+      if (miss) {
+        scheduleReadRefresh();
+      }
+      return;
+    }
+    if (isGroupLike.value) {
+      scheduleReadRefresh();
+      return;
+    }
+    const readSeq = readNumber(obj, "readSeq", 0);
+    if (readSeq <= 0) {
+      return;
+    }
+    // 单聊本地推水位：我发的、已确认、未撤回且 seq ≤ readSeq 的行全部已读
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (isMine(row) != true || row.status != 1 || row.revoked || isConfirmedRow(row) != true) {
+        continue;
+      }
+      if (row.seq > readSeq) {
+        continue;
+      }
+      const info = findReadInfo(row.msgId);
+      if (info == null) {
+        const added = new ImReadInfo();
+        added.msgId = row.msgId;
+        added.readCount = 1;
+        added.eligibleCount = 1;
+        added.readAll = true;
+        readInfos.value.push(added);
+      } else {
+        if (info.readCount < 1) {
+          info.readCount = 1;
+        }
+        if (info.eligibleCount < 1) {
+          info.eligibleCount = 1;
+        }
+        info.readAll = true;
+      }
+    }
+  }
+
+  /**
+   * WS 重连补查（PC DEV-292 D4 同款）：断线期间的 READ_NOTIFY 帧不会补投（WS 无存储转发），
+   * 重连成功后对当前会话排一次已读查询自愈，否则 icon 停在断线前的旧值。
+   */
+  function handleImConnectionState(payload: any): void {
+    if (payload == null) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    if (readString(obj, "state") == "open") {
+      scheduleReadRefresh();
+    }
   }
 
   function handleImMessageRevoked(payload: any): void {
@@ -4861,6 +4986,8 @@
   const onImMessageReceived = (payload: any): void => { handleImMessageReceived(payload); };
   const onImMessageRevoked = (payload: any): void => { handleImMessageRevoked(payload); };
   const onImMessageEdited = (payload: any): void => { handleImMessageEdited(payload); };
+  const onImReadNotified = (payload: any): void => { handleImReadNotified(payload); };
+  const onImConnectionState = (payload: any): void => { handleImConnectionState(payload); };
 
   /** 当前用户信息：区分我方/对方消息 + 我方头像昵称（IM senderId 即平台用户 id）。 */
   async function loadMyInfo(): Promise<void> {
@@ -4923,6 +5050,9 @@
     eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, onImMessageReceived);
     eventBus.on(`${EVENT_TYPE.ImMessageRevoked}`, onImMessageRevoked);
     eventBus.on(`${EVENT_TYPE.ImMessageEdited}`, onImMessageEdited);
+    // 已读回执实时更新（4001 单聊本地推/群聊去抖重查；4002 聚合补丁）+ 重连补查
+    eventBus.on(`${EVENT_TYPE.ImReadNotified}`, onImReadNotified);
+    eventBus.on(`${EVENT_TYPE.ImConnectionState}`, onImConnectionState);
     // #ifndef H5 || WEB
     // 键盘高度监听（App 三端/小程序；H5 不支持该 API）：驱动 dockBottomPx 让位
     uni.onKeyboardHeightChange((res) => {
@@ -4985,6 +5115,12 @@
     eventBus.off(`${EVENT_TYPE.ImMessageReceived}`, onImMessageReceived);
     eventBus.off(`${EVENT_TYPE.ImMessageRevoked}`, onImMessageRevoked);
     eventBus.off(`${EVENT_TYPE.ImMessageEdited}`, onImMessageEdited);
+    eventBus.off(`${EVENT_TYPE.ImReadNotified}`, onImReadNotified);
+    eventBus.off(`${EVENT_TYPE.ImConnectionState}`, onImConnectionState);
+    if (readRefreshTimer != 0) {
+      clearTimeout(readRefreshTimer);
+      readRefreshTimer = 0;
+    }
     clearFlashTimers();
   });
 

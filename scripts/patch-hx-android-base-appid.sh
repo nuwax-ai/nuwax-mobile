@@ -17,6 +17,7 @@ if [[ ! -f "$TARGET" ]]; then
 fi
 
 if grep -qF "$NEW" "$TARGET"; then
+  # 已打过补丁；若仍弹「未检测到应用资源」，多为 HX 主进程未重启或未走自定义基座完整运行
   exit 0
 fi
 

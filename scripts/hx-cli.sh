@@ -55,6 +55,11 @@ cli_kind=""
 case "${1:-}:${2:-}" in
   launch:app-android)
     bash "$SCRIPT_DIR/patch-hx-android-base-appid.sh"
+    if ! grep -qF 'getZipEntriesFile)(t,"/www/manifest.json")' "${HX_APP_ROOT:-/Applications/HBuilderX.app/Contents/HBuilderX}/plugins/launcher/out/main.js" 2>/dev/null; then
+      echo "[hx-cli] 错误：HBuilderX 自定义基座 appid 补丁未生效，Android 可能提示「未检测到应用资源」。" >&2
+      echo "[hx-cli] 请完全退出 HBuilderX 后重试；若仍失败见 scripts/patch-hx-android-base-appid.sh" >&2
+      exit 1
+    fi
     ;;
 esac
 case "${1:-}:${2:-}" in

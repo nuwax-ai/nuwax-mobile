@@ -1122,3 +1122,126 @@ export async function apiImWhoami(): Promise<RequestResponse<any>> {
     method: "GET",
   });
 }
+
+// ============================================================ 表情回复域（reactions，后端已上线测试环境、仓库 ImMessageController 尚未合入）
+
+/**
+ * 添加表情回复（reactionAdd，POST /messages/{msgId}/reactions）。
+ *
+ * 契约（2026-09-29 实测测试环境得出，后端仓库代码合入后以 im-openapi.yaml 为准）：
+ * - body {convId, emoji, deviceId}；emoji 必填非空白（emoji 本身的 Unicode 字符）
+ * - 重复添加同一 emoji 幂等（不报错不重复计数）；同一用户可对同一消息加多种 emoji
+ * - data = {convId, msgId, reactions:[{emoji,userId,userName}]}——★操作后的
+ *   【全量 reactions 快照】，客户端整体替换本地行即可，无需本地合并
+ */
+export async function apiImMsgAddReaction(
+  convId: string,
+  msgId: string,
+  emoji: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/reactions`,
+    method: "POST",
+    data: `{"convId":${convId},"emoji":${JSON.stringify(emoji)},"deviceId":"${getImDeviceId()}"}`,
+  });
+}
+
+/**
+ * 取消表情回复（reactionRemove，DELETE /messages/{msgId}/reactions）。
+ *
+ * - convId / emoji 均为必填 query 参数；只移除【当前用户】在该消息上的该 emoji
+ * - data 同 apiImMsgAddReaction：操作后的全量 reactions 快照
+ */
+export async function apiImMsgRemoveReaction(
+  convId: string,
+  msgId: string,
+  emoji: string,
+): Promise<RequestResponse<any>> {
+  // convId/emoji 为必填 query 参数：App 端 uni.request 不会把 DELETE 的 data 拼 query，
+  // 必须显式进 URL（emoji 走 encodeURIComponent，👍 等 UTF-8 序列安全）
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/reactions?convId=${convId}&emoji=${encodeURIComponent(emoji)}`,
+    method: "DELETE",
+  });
+}
+
+// ============================================================ 转发域（forward，契约见 nuwax-im ImMessageController + ImMergeForwardBodies）
+
+/**
+ * 逐条转发（msgForward，POST /messages/{msgId}/forward）。
+ *
+ * - body {convId(源会话分片键), targetConvIds[], deviceId}；目标数上限
+ *   im.message.forward-max-targets(默认 9)，超限 IM_90001 不截断
+ * - 允许包含源会话自己；重复 convId 服务端去重
+ * - ★逐目标独立成败（部分成功语义）：data = ForwardMessageResult
+ *   {total, succeeded, failures[]}——只看 succeeded 会把"转给 3 人只成功 2"误报成功，
+ *   必须读 failures 逐条提示
+ * - 每目标产生一条全新消息行（新 msgId/seq，origin_msg_id 弱关联源消息）
+ */
+export async function apiImForwardMsg(
+  convId: string,
+  msgId: string,
+  targetConvIds: string[],
+): Promise<RequestResponse<any>> {
+  const ids = targetConvIds.join(",");
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/forward`,
+    method: "POST",
+    data: `{"convId":${convId},"targetConvIds":[${ids}],"deviceId":"${getImDeviceId()}"}`,
+  });
+}
+
+/**
+ * 发送合并转发消息（msgSend，msgType=merge_forward）。
+ *
+ * - body 快照契约（nuwax-im ImMergeForwardBodies 写入侧准入，逐字对齐 PC lib/forward.ts）：
+ *   {title?: 非空文本（可缺省）, items: [{senderName(必填非空), sendTime(必填正整数毫秒),
+ *   msgType(六型白名单 text/rich_text/image/file/audio/video，小写), text?(≤500 码点，
+ *   ★服务端拒绝不截断，构建侧必须自行截好), attachments?([{kind,url(必填非空),fileName,size}])}]}
+ *   1 ≤ items ≤ 50；禁嵌套（merge_forward 不可作为 item）
+ * - ★刻意不带 senderId：雪花 ID 超 2^53，JS number 丢精度、字符串又被拒 ⇒ 缺席
+ * - itemsJson 由调用方（chat.uvue buildMergeItemsJson）按上述契约拼好传入；
+ *   本函数只负责套信封（convId int64 原始数字直传 + clientMsgId 幂等键 + deviceId）
+ * - digest 服务端给 [聊天记录] 占位符；本地乐观行同文案
+ */
+export async function apiImSendMergeForwardMsg(
+  targetConvId: string,
+  title: string,
+  itemsJson: string,
+  clientMsgId: string,
+): Promise<RequestResponse<any>> {
+  let body = `{"items":${itemsJson}`;
+  if (title.length > 0) {
+    body += `,"title":${JSON.stringify(title)}`;
+  }
+  body += "}";
+  return await request({
+    url: "/api/instant-message/messages",
+    method: "POST",
+    data: `{"convId":${targetConvId},"msgType":"merge_forward","clientMsgId":"${clientMsgId}","deviceId":"${getImDeviceId()}","body":${body}}`,
+  });
+}
+
+/**
+ * 会话搜索（searchConversations，GET /search/conversations）。
+ *
+ * - keyword 必填（1-64）；转发页搜群/已有单聊用（与 search/contacts 互补：
+ *   contacts 搜【人】，这里搜【会话】）
+ * - ★data 为裸数组 ConversationSearchItem[]（2026-09-29 真机抓包实证，无 records
+ *   包装；本注释早前按 PageResult.records 写的是错的）
+ *   {convId, convType, name, memberCount, ownerUserId, lastDigest, lastMsgTime}
+ *   （convId 为 int64，请求层 parseJsonKeepInt64 已保精度；peerName/avatar 等可选）
+ */
+export async function apiImSearchConversations(
+  keyword: string,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/search/conversations",
+    method: "GET",
+    data: {
+      keyword,
+      limit,
+    },
+  });
+}

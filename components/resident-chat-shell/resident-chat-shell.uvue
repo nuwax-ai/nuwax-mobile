@@ -39,6 +39,34 @@
 			@touchcancel="onEdgeBackTouchCancel"
 		/>
 		<!-- #endif -->
+		<!-- AI 数据处理隐私声明（App Store 5.1.1(i)/5.1.2(i)）：
+		     首次进会话在壳内原生弹出，不依赖内嵌 H5 发版；同意后记本地标记，拒绝则不开会话（不加载 web-view）。
+		     用普通 view 覆盖层而非 uni-modal-popup：壳容器 z-index 10000，page-container 默认 z-index 999
+		     会被壳的白底整体盖住（表现为白屏），普通 view 作为壳子树末位子节点层级必然在壳内容之上。 -->
+		<view v-if="aiPrivacyModalOpen" class="ai-privacy-overlay">
+			<view class="ai-privacy-dialog">
+				<text class="ai-privacy-dialog-title">{{ aiPrivacyTitle }}</text>
+				<scroll-view scroll-y class="ai-privacy-dialog-body">
+					<text class="ai-privacy-dialog-text">{{ aiPrivacyBody }}</text>
+				</scroll-view>
+				<view class="ai-privacy-dialog-actions">
+					<view
+						class="ai-privacy-dialog-btn ai-privacy-dialog-btn-secondary"
+						hover-class="ai-privacy-dialog-btn-hover"
+						@click="handleAiPrivacyDecline"
+					>
+						<text class="ai-privacy-dialog-btn-secondary-text">{{ aiPrivacyDeclineText }}</text>
+					</view>
+					<view
+						class="ai-privacy-dialog-btn ai-privacy-dialog-btn-primary"
+						hover-class="ai-privacy-dialog-btn-hover"
+						@click="handleAiPrivacyAgree"
+					>
+						<text class="ai-privacy-dialog-btn-primary-text">{{ aiPrivacyAgreeText }}</text>
+					</view>
+				</view>
+			</view>
+		</view>
 	</view>
 	<!-- #endif -->
 </template>
@@ -250,9 +278,50 @@
 		}
 	}
 
+	// ===== AI 数据处理隐私声明（App Store 5.1.1(i)/5.1.2(i)，壳内原生）=====
+	// 首次进会话先在原生侧弹出；同意后记本地标记并继续加载会话，拒绝则不开会话（web-view 不加载任何内容）。
+	// 文案与原 H5 会话页弹窗一致（constants/i18n-locales 各语言包 aiPrivacy*），
+	// 放壳内是为了不依赖内嵌 H5（/m/）发版即可生效。
+	const AI_PRIVACY_ACK_KEY = "nuwax_ai_privacy_ack_v1"
+	/** 弹窗展示中（v-if 渲染覆盖层；true 时系统返回键按拒绝处理） */
+	const aiPrivacyModalOpen = ref<boolean>(false)
+	/** 弹窗确认前暂存的打开参数 */
+	let pendingAiPrivacyAgentId: string = ""
+	let pendingAiPrivacyConversationId: string = ""
+	let pendingAiPrivacyUrl: string = ""
+	let pendingAiPrivacyPType: string = ""
+
+	const aiPrivacyTitle = computed((): string => t("Mobile.Conversation.aiPrivacyTitle"))
+	const aiPrivacyBody = computed((): string => t("Mobile.Conversation.aiPrivacyBody"))
+	const aiPrivacyAgreeText = computed((): string => t("Mobile.Conversation.aiPrivacyAgree"))
+	const aiPrivacyDeclineText = computed((): string => t("Mobile.Conversation.aiPrivacyDecline"))
+
+	function isAiPrivacyAcked(): boolean {
+		try {
+			const acked = uni.getStorageSync(AI_PRIVACY_ACK_KEY)
+			return `${acked}` == "1"
+		} catch (_eStorage) {
+			return false
+		}
+	}
+
 	/** 打开/切换只提交业务请求；WebView、导航、超时和回退由容器管理。 */
 	function openChatOnMain(id: string, conversationId: string, url: string, pType: string): void {
 		if (id.length == 0 || url.length == 0) return
+		// 首次进会话：先弹 AI 数据处理隐私声明，确认后才加载会话 web-view。
+		// 弹窗挂在壳容器内：壳置为白底可见但 web-view 尚未创建（shellCreated 仍为 false）；opening-cover 层级在壳之上，须先撤掉。
+		if (!isAiPrivacyAcked()) {
+			pendingAiPrivacyAgentId = id
+			pendingAiPrivacyConversationId = conversationId
+			pendingAiPrivacyUrl = url
+			pendingAiPrivacyPType = pType
+			setResidentChatVisibleFlag(true)
+			hideTabBarSafe()
+			shellVisible.value = true
+			releaseOpeningCover()
+			aiPrivacyModalOpen.value = true
+			return
+		}
 		const scope = getOfflineH5ScopeKey()
 		const sameSession = currentId == id && currentConversationId == conversationId && loadedScopeKey == scope
 		if (sameSession && pendingRevealAfterLoad) return
@@ -305,6 +374,41 @@
 		currentChatUrl = url
 	}
 
+	/** 同意：记本地标记并继续此前暂存的会话打开（此时已在主线程，直接走 openChatOnMain） */
+	function handleAiPrivacyAgree(): void {
+		try {
+			uni.setStorageSync(AI_PRIVACY_ACK_KEY, "1")
+		} catch (_eStorage) {
+			// ignore
+		}
+		aiPrivacyModalOpen.value = false
+		const agentId = pendingAiPrivacyAgentId
+		const conversationId = pendingAiPrivacyConversationId
+		const url = pendingAiPrivacyUrl
+		const pType = pendingAiPrivacyPType
+		pendingAiPrivacyAgentId = ""
+		pendingAiPrivacyConversationId = ""
+		pendingAiPrivacyUrl = ""
+		pendingAiPrivacyPType = ""
+		if (agentId.length == 0 || url.length == 0) {
+			return
+		}
+		openChatOnMain(agentId, conversationId, url, pType)
+	}
+
+	/** 拒绝：不开会话，壳退场（web-view 从未加载，未发送任何数据）；底栏按当前模式重新校准 */
+	function handleAiPrivacyDecline(): void {
+		aiPrivacyModalOpen.value = false
+		pendingAiPrivacyAgentId = ""
+		pendingAiPrivacyConversationId = ""
+		pendingAiPrivacyUrl = ""
+		pendingAiPrivacyPType = ""
+		shellVisible.value = false
+		setResidentChatVisibleFlag(false)
+		syncNativeTabBarState()
+		releaseOpeningCover()
+	}
+
 	function openChat(id: string, conversationId: string, url: string, pType: string): void {
 		runOnMainThread((): void => {
 			openChatOnMain(id, conversationId, url, pType)
@@ -341,6 +445,12 @@
 	 */
 	function teardownChatShellOnMain(): void {
 		hideChatShellOnMain(true)
+		// AI 隐私弹窗若恰在展示中（如登出时），一并关闭并丢弃暂存参数
+		aiPrivacyModalOpen.value = false
+		pendingAiPrivacyAgentId = ""
+		pendingAiPrivacyConversationId = ""
+		pendingAiPrivacyUrl = ""
+		pendingAiPrivacyPType = ""
 		if (shellCreated.value != true) {
 			return
 		}
@@ -2678,6 +2788,11 @@
 		if (shellVisible.value != true && isResidentChatVisible() != true) {
 			return false
 		}
+		// AI 隐私声明弹窗展示中：返回键按「拒绝」处理（不开会话）
+		if (aiPrivacyModalOpen.value == true) {
+			handleAiPrivacyDecline()
+			return true
+		}
 		if (appWebViewPopupOpen == true) {
 			appWebViewPopupOpen = false
 			evalBridgeJS(
@@ -3123,6 +3238,89 @@
 		transition-property: transform;
 		transition-duration: 240ms;
 		transition-timing-function: ease-out;
+	}
+
+	/* AI 数据处理隐私声明弹窗（App Store 5.1.1(i)/5.1.2(i)）：
+	   普通视图覆盖层（非 page-container），层级压过壳内其余内容（mask z2 / edge-back z10） */
+	.ai-privacy-overlay {
+		position: absolute;
+		left: 0;
+		top: 0;
+		right: 0;
+		bottom: 0;
+		z-index: 20;
+		background-color: rgba(0, 0, 0, 0.4);
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.ai-privacy-dialog {
+		width: 86%;
+		background-color: #ffffff;
+		border-radius: 24rpx;
+		padding: 48rpx 40rpx 40rpx;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.ai-privacy-dialog-title {
+		font-size: 34rpx;
+		font-weight: 600;
+		color: #1a1a1a;
+		text-align: center;
+		margin-bottom: 32rpx;
+	}
+
+	.ai-privacy-dialog-body {
+		max-height: 720rpx;
+		margin-bottom: 40rpx;
+	}
+
+	.ai-privacy-dialog-text {
+		font-size: 28rpx;
+		line-height: 44rpx;
+		color: #4d4d4d;
+	}
+
+	.ai-privacy-dialog-actions {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.ai-privacy-dialog-btn {
+		flex: 1;
+		height: 80rpx;
+		border-radius: 40rpx;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.ai-privacy-dialog-btn-hover {
+		opacity: 0.7;
+	}
+
+	.ai-privacy-dialog-btn-secondary {
+		background-color: #f2f3f5;
+		margin-right: 24rpx;
+	}
+
+	.ai-privacy-dialog-btn-secondary-text {
+		font-size: 30rpx;
+		color: #666666;
+	}
+
+	.ai-privacy-dialog-btn-primary {
+		background-color: #4f6bed;
+	}
+
+	.ai-privacy-dialog-btn-primary-text {
+		font-size: 30rpx;
+		color: #ffffff;
 	}
 
 	.webview-fill {

@@ -1313,6 +1313,8 @@
   const inputFocused = ref<boolean>(false);
   /** textarea focus 属性驱动：false→true 变化触发聚焦（blur 后复位，可重复触发）。 */
   const focusRequest = ref<boolean>(false);
+  /** @ 成员选择页选完待聚焦：事件先于 navigateBack 到达（本页仍隐藏），延迟到 onShow 后拉键盘。 */
+  let pendingFocusAfterAtPick = false;
   /** 格式横条样式态（B/I/S/U 点击切背景，不插标记）：激活的样式在发送时按行包装正文，
    *  气泡按 Markdown 渲染出对应效果（textarea 控件无法在输入过程实时显示富文本样式）。 */
   const markBold = ref<boolean>(false);
@@ -2175,6 +2177,11 @@
       if (token.length > 0) {
         appendMentionText(token);
       }
+    }
+    // 选完即续写：标记待聚焦，返回本页 onShow 后拉起键盘（此刻页面还压在子页下，
+    // 直接 focus 不生效；取消返回不置位，不打扰）
+    if (tokens.length > 0) {
+      pendingFocusAfterAtPick = true;
     }
   }
 
@@ -3471,8 +3478,9 @@
     if (height != keyboardHeight.value) {
       applyKeyboardHeight(height);
     }
-    // 输入坞聚焦 / 展开面板开着才持续轮询；IME 已抬起降频只捕捉收起沿
-    if (inputFocused.value || expanded.value) {
+    // 输入坞聚焦 / 展开面板开着 / 键盘 believed 开着（blur 后收起动画中）才持续轮询；
+    // IME 已抬起降频只捕捉收起沿；让位高度归零且无聚焦后下一拍自停
+    if (inputFocused.value || expanded.value || keyboardHeight.value > 0) {
       const nextDelay = keyboardHeight.value > 0 ? 250 : 100;
       androidImePollTimer = setTimeout((): void => {
         pollAndroidImeHeight();
@@ -3490,6 +3498,35 @@
     androidImePollTimer = setTimeout((): void => {
       pollAndroidImeHeight();
     }, 60);
+    // #endif
+  }
+
+  /** onShow 让位校准定时器（0=无待执行；仅 Android 使用）。 */
+  let androidImeCalibTimer: number = 0;
+
+  /**
+   * Android 从子页返回后的残留让位校准（onShow 调，其余平台空实现）：
+   * 点 @ 键走 hideKeyboard + navigateTo，blur 已停轮询，而收起沿的
+   * onKeyboardHeightChange 在部分机型不派发（见上），keyboardHeight 残留旧值
+   * 会让输入坞下方留出一块「键盘空白」。直读 insets：IME 实际已收则清零让位；
+   * 仍在收起动画（读数 >0）时延迟一拍再校，读数归零即自终止。
+   */
+  function calibrateAndroidImeAfterShow(): void {
+    // #ifdef APP-ANDROID
+    // 已聚焦/展开面板时轮询链路接管让位，校准退位（@ 选完返回自动拉键盘场景防双驱）
+    if (pageVisible != true || keyboardHeight.value <= 0 || inputFocused.value || expanded.value) {
+      return;
+    }
+    if (readAndroidImeHeight() <= 0) {
+      applyKeyboardHeight(0);
+      return;
+    }
+    if (androidImeCalibTimer == 0) {
+      androidImeCalibTimer = setTimeout((): void => {
+        androidImeCalibTimer = 0;
+        calibrateAndroidImeAfterShow();
+      }, 350);
+    }
     // #endif
   }
 
@@ -5042,7 +5079,12 @@
   function handleInputBlur(): void {
     inputFocused.value = false;
     focusRequest.value = false;
-    stopAndroidImePolling();
+    // 键盘还 believed 开着（收起动画中）不立停轮询：部分机型收起沿事件不派发，
+    // 轮询直读 insets 归零是唯一清让位的链路；轮询条件含 keyboardHeight>0，
+    // 归零后下一拍自停；键盘已收（height=0）则照常立停
+    if (keyboardHeight.value <= 0) {
+      stopAndroidImePolling();
+    }
   }
 
   /** Android textarea 焦点常驻时 focus 可能不再触发：输入即视为回到键盘态（兜底，横条除外）；
@@ -5927,6 +5969,10 @@
     }
     // #endif
     stopAndroidImePolling();
+    if (androidImeCalibTimer != 0) {
+      clearTimeout(androidImeCalibTimer);
+      androidImeCalibTimer = 0;
+    }
     if (kbScrollTimer != 0) {
       clearTimeout(kbScrollTimer);
       kbScrollTimer = 0;
@@ -5970,9 +6016,26 @@
   let chatHasShownOnce = false;
   onShow(() => {
     pageVisible = true;
-    // 从子页（@ 成员选择等）回来：若键盘本就开着（部分机型事件已哑），轮询立即接管
+    // Android：进子页返回的 show/hide 周期里原生 gravity 可能被重置回 top，
+    // 未重新聚焦前 placeholder 会贴上沿，返回时兜底重设（textarea 卸载时内部自空返）
+    centerAndroidInputGravity();
+    // 从子页（@ 成员选择等）回来：若键盘本就开着（部分机型事件已哑），轮询立即接管；
+    // 否则校准残留让位（键盘已收但收起事件丢失时，输入坞下方不留「键盘空白」）
     if (inputFocused.value || expanded.value) {
       startAndroidImePolling();
+    } else {
+      calibrateAndroidImeAfterShow();
+    }
+    // @ 成员选择页选完返回：等页面切换动画收尾再聚焦拉键盘（太早窗口未就绪不生效）
+    if (pendingFocusAfterAtPick) {
+      pendingFocusAfterAtPick = false;
+      if (voiceMode.value != true && convDisbanded.value != true) {
+        setTimeout((): void => {
+          if (pageVisible == true) {
+            focusChatInput();
+          }
+        }, 300);
+      }
     }
     // 从别的页面回来：置顶集与已读计数是多人共享状态，重拉自我纠正
     loadPinnedIds();

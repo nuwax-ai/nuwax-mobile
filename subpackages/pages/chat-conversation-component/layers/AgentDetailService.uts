@@ -135,7 +135,7 @@ import AgentDetailUtils from "./AgentDetailUtils.uts";
 import { TEMP_CONVERSATION_UID } from "@/constants/common.constants";
 import { getApiBaseUrl } from "@/constants/config";
 import { CustomActionService } from "@/subpackages/utils/customActionService";
-import { transformFlatListToTree, flattenFileTreeToCurrentLevel, resolveFileTreeChildren, replaceFileTreeNodeChildren } from "@/subpackages/utils/fileTree";
+import { transformFlatListToTree, mergeDirectoryLevelFiles } from "@/subpackages/utils/fileTree";
 import {
   extractTaskResult,
   getFileProxyUrlByConversationIdAndFilePath,
@@ -648,6 +648,8 @@ export function parseEventBindConfig(raw: any | null): EventBindConfig | null {
 export default class AgentDetailService {
   private data: AgentDetailData;
   private contextFileRequestVersion: number = 0;
+  /** 文件树懒加载扁平缓存（name 为工作区根相对路径），对齐 AppDevPro mergeDirectoryLevelFiles */
+  private fileTreeFlatFiles: any[] = [];
   /** 流式会话代数：abort/新开流时递增，用于丢弃旧 SSE 回调 */
   private streamGeneration: number = 0;
   /**
@@ -2314,6 +2316,35 @@ export default class AgentDetailService {
     this.contextFileRequestVersion += 1;
   }
 
+  private readStaticFileList(result: RequestResponse<any>): any[] {
+    const dataRaw = apiResData<any>(result);
+    if (dataRaw == null) {
+      return [];
+    }
+    const rdFiles = dataRaw as UTSJSONObject;
+    const filesVal = rdFiles["files"];
+    if (filesVal == null) {
+      return [];
+    }
+    return filesVal as any[];
+  }
+
+  private applyWorkspaceFileTreeFiles(files: any[], directoryPath: string, reset: boolean): void {
+    if (reset == true) {
+      this.fileTreeFlatFiles = [];
+    }
+    this.fileTreeFlatFiles = mergeDirectoryLevelFiles(
+      this.fileTreeFlatFiles,
+      files,
+      directoryPath,
+    );
+    if (this.fileTreeFlatFiles.length > 0) {
+      this.data.fileList.value = transformFlatListToTree(this.fileTreeFlatFiles);
+    } else {
+      this.data.fileList.value = [];
+    }
+  }
+
   // @ 初始列表用 file-list；有词时用 search-files。文件树按层拉取（depth=2, recursive=false）。
   async fetchFileList(cId: number, contextOnly: boolean = false, keyword: string = ""): Promise<void> {
     const requestVersion = this.contextFileRequestVersion;
@@ -2333,15 +2364,7 @@ export default class AgentDetailService {
       if (contextOnly && (this.data.conversationId.value != cId || requestVersion != this.contextFileRequestVersion)) return;
       const responseCode = apiResCode(result);
       if (responseCode == SUCCESS_CODE) {
-        let files: any[] = [];
-        const dataRaw = apiResData<any>(result);
-        if (dataRaw != null) {
-          const rdFiles = dataRaw as UTSJSONObject;
-          const filesVal = rdFiles["files"];
-          if (filesVal != null) {
-            files = filesVal as any[];
-          }
-        }
+        let files: any[] = this.readStaticFileList(result);
 
         // search-files 也可能命中目录；@ 弹层只展示文件。
         if (contextOnly && files.length > 0) {
@@ -2355,27 +2378,25 @@ export default class AgentDetailService {
           files = onlyFiles;
         }
 
-        let treeData: FileNode[] = [];
-
-        // 检查是否是新的扁平格式
-        if (files.length > 0) {
-          const firstFileRaw = files[0];
-          const firstFile =
-            firstFileRaw != null
-              ? firstFileRaw as UTSJSONObject
-              : new UTSJSONObject();
-          const firstNameVal = firstFile["name"];
-          if (firstNameVal != null && `${firstNameVal}`.length > 0) {
-            treeData = transformFlatListToTree(files);
-          } else {
-            treeData = files as FileNode[];
+        if (contextOnly) {
+          let treeData: FileNode[] = [];
+          if (files.length > 0) {
+            const firstFileRaw = files[0];
+            const firstFile =
+              firstFileRaw != null
+                ? firstFileRaw as UTSJSONObject
+                : new UTSJSONObject();
+            const firstNameVal = firstFile["name"];
+            if (firstNameVal != null && `${firstNameVal}`.length > 0) {
+              treeData = transformFlatListToTree(files);
+            } else {
+              treeData = files as FileNode[];
+            }
           }
+          this.data.contextFileList.value = treeData;
         } else {
-          treeData = files as FileNode[];
+          this.applyWorkspaceFileTreeFiles(files, "", true);
         }
-
-        if (contextOnly) this.data.contextFileList.value = treeData;
-        else this.data.fileList.value = flattenFileTreeToCurrentLevel(treeData);
       } else if (contextOnly) {
         this.data.contextFileError.value = true;
       }
@@ -2392,7 +2413,7 @@ export default class AgentDetailService {
     }
   }
 
-  /** 展开文件夹时按 relativePath 拉取下一层，不改动 @ 文件 / 其它页面的默认参数。 */
+  /** 展开文件夹时按 relativePath 拉取该层及下一层，合并进已有树，不改动其它页面默认参数。 */
   async fetchFileTreeChildren(cId: number, relativePath: string): Promise<void> {
     if (cId <= 0 || relativePath.length == 0) {
       return;
@@ -2402,25 +2423,8 @@ export default class AgentDetailService {
       if (apiResCode(result) != SUCCESS_CODE) {
         return;
       }
-      let files: any[] = [];
-      const dataRaw = apiResData<any>(result);
-      if (dataRaw != null) {
-        const rdFiles = dataRaw as UTSJSONObject;
-        const filesVal = rdFiles["files"];
-        if (filesVal != null) {
-          files = filesVal as any[];
-        }
-      }
-      let treeData: FileNode[] = [];
-      if (files.length > 0) {
-        treeData = transformFlatListToTree(files);
-      }
-      const children = resolveFileTreeChildren(relativePath, treeData);
-      this.data.fileList.value = replaceFileTreeNodeChildren(
-        this.data.fileList.value,
-        relativePath,
-        children,
-      );
+      const files = this.readStaticFileList(result);
+      this.applyWorkspaceFileTreeFiles(files, relativePath, false);
     } catch (_e) {
       // 展开失败时保持当前层，避免整棵树被清空
     }

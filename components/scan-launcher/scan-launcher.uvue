@@ -2,9 +2,12 @@
   <!--
     扫一扫结果弹层（消息页「+」气泡「扫一扫」入口配套）：
     - startScan()：拉起 uni.scanCode（App / 微信小程序；H5 无此 API，入口本身不渲染）
-    - 结果三路分发（判定见 utils/scanRouter）：
-      · 用户名片码 → 「添加联系人」确认 → apiImAddContact（对方需同意，文案复用
-        Mobile.Message.contactRequestSent / alreadyContact / contactAdded）
+    - 结果四路分发（判定见 utils/scanRouter）：
+      · 用户名片码（URL）→ 查联系人列表：已互为好友 → toast；否则 emit add-buddy
+        由页面拉起添加伙伴弹窗并预填账号/用户名（预填搜索确认，不直接发申请）
+      · 群名片码（group#{群号}[#{convId}] 标识内容）→ 第二段携带 convId 时查会话
+        详情：myRole>0 已在群 → toast；否则 emit join-group 由页面拉起加入群组弹窗
+        并预填群号（用户点按钮提交）
       · 其他 http(s) 链接 → 「打开链接」域名确认 → handleExternalLink（App 走独立 web-view 页）
       · 纯文本 → 「扫码结果」限高展示 + 复制（utils/clipboard 跨端写剪贴板）
     - 弹层样式对齐 confirm-modal（600rpx 白底卡片、底部分割线双按钮）；
@@ -20,17 +23,12 @@
       </view>
       <view v-else class="scan-modal__body">
         <text class="scan-modal__desc">{{ descText }}</text>
-        <text v-if="mode == 'user'" class="scan-modal__sub">{{ userIdText }}</text>
       </view>
       <view class="scan-modal__actions">
         <view class="scan-modal__btn scan-modal__btn--cancel" @tap="handleCancel">
           <text class="scan-modal__btn-text">{{ cancelText }}</text>
         </view>
-        <view
-          class="scan-modal__btn"
-          :class="busy ? 'scan-modal__btn--disabled' : ''"
-          @tap="handleConfirm"
-        >
+        <view class="scan-modal__btn" @tap="handleConfirm">
           <text class="scan-modal__btn-text scan-modal__btn-text--primary">{{ confirmText }}</text>
         </view>
       </view>
@@ -41,7 +39,7 @@
 <script setup lang="uts">
   import { computed, ref } from "vue";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { apiImAddContact } from "@/servers/im";
+  import { apiImContacts, apiImConvDetail } from "@/servers/im";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { writeClipboardText } from "@/utils/clipboard";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
@@ -50,25 +48,27 @@
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
+  /**
+   * user / group 名片码不在本弹窗确认，交页面拉起对应 sheet：
+   * - add-buddy：[预填关键字（账号/用户名，缺省回 userId）, 目标 userId]
+   *   ——userId 供添加弹窗在搜索结果里自动选中本人，用户点按钮即提交
+   * - join-group：预填群号
+   * （字符串数组式 + 带参 emit，先例 agent-subscription-modal 的 summon）
+   */
+  const emit = defineEmits(["join-group", "add-buddy"]);
+
   const visible = ref<boolean>(false);
-  /** text | url | user（纯字符串，避免枚举串化平台分歧） */
+  /** text | url（user/group 直接拉起页面侧 sheet，不开本弹窗） */
   const mode = ref<string>("text");
   /** text：扫码原文 */
   const textContent = ref<string>("");
   /** url：目标链接与展示用 host */
   const urlTarget = ref<string>("");
   const urlHost = ref<string>("");
-  /** user：目标 userId（字符串化雪花号） */
-  const targetUserId = ref<string>("");
-  /** 加联系人请求中（确认钮防重复点击） */
-  const busy = ref<boolean>(false);
 
   const titleText = computed((): string => {
     if (mode.value == "url") {
       return t("Mobile.Scan.openUrlTitle");
-    }
-    if (mode.value == "user") {
-      return t("Mobile.Scan.addTitle");
     }
     return t("Mobile.Scan.textTitle");
   });
@@ -79,16 +79,7 @@
       params.set("host", urlHost.value);
       return translateFn("Mobile.Scan.openUrlDesc", toI18nParams(params), "");
     }
-    if (mode.value == "user") {
-      return t("Mobile.Scan.addDesc");
-    }
     return "";
-  });
-
-  const userIdText = computed((): string => {
-    const params = new Map<string, string | number>();
-    params.set("id", targetUserId.value);
-    return translateFn("Mobile.Scan.userId", toI18nParams(params), "");
   });
 
   const cancelText = computed((): string => {
@@ -99,25 +90,117 @@
     if (mode.value == "url") {
       return t("Mobile.Scan.open");
     }
-    if (mode.value == "user") {
-      return busy.value ? t("Mobile.Common.loading") : t("Mobile.Scan.add");
-    }
     return t("Mobile.Scan.copy");
   });
 
-  /** 扫码原文 → 三路分发开弹层。 */
+  /** 模板串化读字段（雪花号保精度口径，同 message.uvue readString）。 */
+  function readStringField(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  /**
+   * 数字字面量且 > 0（status / myRole 判定；不 parseInt——避免非数字串在
+   * Kotlin 侧抛异常，直接按字面量比较，全数字且含非零位才算正）。
+   */
+  function isPositiveNumberLiteral(raw: any | null): boolean {
+    if (raw == null) {
+      return false;
+    }
+    const s = `${raw}`;
+    if (s.length == 0) {
+      return false;
+    }
+    let hasNonZero = false;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charAt(i);
+      if (c < "0" || c > "9") {
+        return false;
+      }
+      if (c != "0") {
+        hasNonZero = true;
+      }
+    }
+    return hasNonZero;
+  }
+
+  /**
+   * 用户名片码：查联系人列表，已互为好友（status==1）→ toast；
+   * 其余（未加 / 列表拉取失败——不挡加好友流程）→ emit add-buddy 预填拉起。
+   */
+  async function handleUserCard(userId: string, account: string): Promise<void> {
+    uni.showLoading({ title: t("Mobile.Common.loading"), mask: true });
+    try {
+      const res = await apiImContacts();
+      uni.hideLoading();
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const itemsRaw = dataObj != null ? dataObj["items"] : null;
+        if (itemsRaw != null) {
+          const items = itemsRaw as UTSJSONObject[];
+          for (let i = 0; i < items.length; i++) {
+            // status：1=已互为联系人（2/3 是待确认申请，仍可走添加弹窗）
+            if (
+              readStringField(items[i], "userId") == userId &&
+              readStringField(items[i], "status") == "1"
+            ) {
+              uni.showToast({ title: t("Mobile.Message.alreadyContact"), icon: "none" });
+              return;
+            }
+          }
+        }
+      }
+    } catch (_e) {
+      uni.hideLoading();
+    }
+    emit("add-buddy", account.length > 0 ? account : userId, userId);
+  }
+
+  /**
+   * 群名片码：c 携带 convId 时查会话详情判「已在群」（群列表接口对 groupNo
+   * 恒回 null，无法按群号反查）；myRole>0 → toast，否则/查询失败 → emit
+   * join-group 预填拉起（失败不挡加群流程，提交时服务端还会兜底校验）。
+   */
+  async function handleGroupCard(groupNo: string, convId: string): Promise<void> {
+    if (convId.length == 0) {
+      emit("join-group", groupNo);
+      return;
+    }
+    uni.showLoading({ title: t("Mobile.Common.loading"), mask: true });
+    try {
+      const res = await apiImConvDetail(convId);
+      uni.hideLoading();
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const myRoleRaw = dataObj != null ? dataObj["myRole"] : null;
+        // myRole：1=成员 2=管理员 3=群主；字段缺失/0 都视为不在群
+        if (isPositiveNumberLiteral(myRoleRaw) == true) {
+          uni.showToast({ title: t("Mobile.Message.groupAlreadyMember"), icon: "none" });
+          return;
+        }
+      }
+    } catch (_e) {
+      uni.hideLoading();
+    }
+    emit("join-group", groupNo);
+  }
+
+  /** 扫码原文 → 四路分发（user/group 拉起页面侧 sheet，url/text 开本弹层）。 */
   function routeScanResult(raw: string): void {
     const trimmed = raw.trim();
     if (trimmed.length == 0) {
       uni.showToast({ title: t("Mobile.Scan.invalid"), icon: "none" });
       return;
     }
-    busy.value = false;
     const route = parseScanContent(trimmed);
     if (route.kind == "user") {
-      mode.value = "user";
-      targetUserId.value = route.userId;
-      visible.value = true;
+      handleUserCard(route.userId, route.userAccount);
+      return;
+    }
+    if (route.kind == "group") {
+      handleGroupCard(route.groupNo, route.groupConvId);
       return;
     }
     if (route.kind == "url") {
@@ -166,11 +249,6 @@
     close();
   }
 
-  function readBool(obj: UTSJSONObject, key: string): boolean {
-    const raw = obj[key];
-    return raw != null && `${raw}` == "true";
-  }
-
   /** 复制文本结果（跨端剪贴板，成功后关弹层提示已复制）。 */
   function copyTextResult(): void {
     const content = textContent.value;
@@ -186,60 +264,14 @@
     );
   }
 
-  /**
-   * 确认添加联系人（对方需同意）：文案对齐 add-buddy-sheet 的
-   * contactAdd 处理（alreadyContact / accepted 三档）。
-   */
-  async function addUserContact(): Promise<void> {
-    const userId = targetUserId.value;
-    if (userId.length == 0) {
-      return;
-    }
-    busy.value = true;
-    try {
-      const res = await apiImAddContact(userId, "");
-      if (apiResCode(res) != SUCCESS_CODE) {
-        uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
-        return;
-      }
-      let accepted = false;
-      let alreadyContact = false;
-      const dataRaw = apiResData<any>(res);
-      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-      if (dataObj != null) {
-        accepted = readBool(dataObj, "accepted");
-        alreadyContact = readBool(dataObj, "alreadyContact");
-      }
-      let title = t("Mobile.Message.contactRequestSent");
-      if (alreadyContact) {
-        title = t("Mobile.Message.alreadyContact");
-      } else if (accepted) {
-        title = t("Mobile.Message.contactAdded");
-      }
-      uni.showToast({ title, icon: "none" });
-    } catch (_e) {
-      uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
-    } finally {
-      busy.value = false;
-      close();
-    }
-  }
-
   function handleConfirm(): void {
-    if (busy.value) {
-      return;
-    }
-    if (mode.value == "text") {
-      copyTextResult();
-      return;
-    }
     if (mode.value == "url") {
       const url = urlTarget.value;
       close();
       handleExternalLink(url);
       return;
     }
-    addUserContact();
+    copyTextResult();
   }
 
   defineExpose({
@@ -293,15 +325,6 @@
     text-align: center;
   }
 
-  /* 用户 ID 小字：确认目标用，弱化展示 */
-  .scan-modal__sub {
-    margin-top: 12rpx;
-    font-size: 24rpx;
-    color: #9a9aa2;
-    line-height: 34rpx;
-    text-align: center;
-  }
-
   /* 文本结果：限高滚动，长内容不撑爆弹层 */
   .scan-modal__text-scroll {
     max-height: 420rpx;
@@ -331,16 +354,12 @@
     border-right: 2rpx solid #f0f0f0;
   }
 
-  .scan-modal__btn--disabled {
-    opacity: 0.55;
-  }
-
   .scan-modal__btn-text {
     font-size: 32rpx;
     color: #1a1a1a;
   }
 
-  /* 确认钮品牌紫（打开/添加/复制均为普通操作，非危险态） */
+  /* 确认钮品牌紫（打开/复制均为普通操作，非危险态） */
   .scan-modal__btn-text--primary {
     color: #5147ff;
     font-weight: 500;

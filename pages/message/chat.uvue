@@ -1316,6 +1316,8 @@
   const keyboardHeight = ref<number>(0);
   /** 键盘弹起后的补滚定时器：等键盘动画+让位过渡完成再滚（滚动去抖，0=无待滚）。 */
   let kbScrollTimer = 0;
+  /** onKeyboardHeightChange 监听 id（onLoad 注册、onUnload 按注销，防误伤全局其他监听）。 */
+  let chatKeyboardListenerId = 0;
   /** 输入坞底部让位：键盘弹起=贴键盘正上方；平时=底部安全区+基础间距。 */
   const dockBottomPx = computed<number>(
     (): number => (keyboardHeight.value > 0 ? keyboardHeight.value : 6 + safeBottomPx.value),
@@ -3302,6 +3304,101 @@
     scrollToAnchorWithSettle("chat-bottom");
   }
 
+  // ===== Android 键盘高度兜底（WindowInsets 轮询） =====
+  // 部分 Android 机型/自定义基座从子页（如 @ 成员选择）返回后 uni.onKeyboardHeightChange
+  // 不再派发（conversation-input / agent-detail 同款已知问题）：表现为键盘弹出但输入坞
+  // 不让位被盖住。聚焦/展开面板期间直接轮询 WindowInsets 的 IME 高度驱动同一套让位逻辑，
+  // 读数归零即视为键盘已收（BACK 只收 IME 不失焦场景），与事件回调互为冗余、幂等无害。
+
+  /** Android IME 轮询定时器（0=无待执行；非 Android 平台不启动）。 */
+  let androidImePollTimer: number = 0;
+
+  /** 直读 IME insets 高度（CSS px）；仅 APP-ANDROID 有实现，其余平台恒 0。 */
+  function readAndroidImeHeight(): number {
+    // #ifdef APP-ANDROID
+    try {
+      const activity = UTSAndroid.getUniActivity();
+      if (activity == null) return 0;
+      const win = activity.getWindow();
+      if (win == null) return 0;
+      const decor = win.getDecorView();
+      if (decor == null) return 0;
+      const insets = decor.getRootWindowInsets();
+      if (insets == null) return 0;
+      const ime = insets.getInsets(8);
+      if (ime == null || ime.bottom <= 0) return 0;
+      const height = UTSAndroid.devicePX2px(ime.bottom);
+      return height > 0 ? height : 0;
+    } catch (_error) {
+      return 0;
+    }
+    // #endif
+    return 0;
+  }
+
+  /** 键盘高度落地（onKeyboardHeightChange 回调与 Android 轮询共用）：让位 + 互斥面板卸载 + 补滚。 */
+  function applyKeyboardHeight(height: number): void {
+    keyboardHeight.value = height;
+    if (height > 0) {
+      // 键盘升起覆盖面板（飞书式）：面板卸载与让位切换同帧，避免面板先消失
+      // 键盘未到时露出空档。格式横条与键盘共存不清；展开面板内嵌面板同样收掉。
+      if (panelMode.value != "font") {
+        panelMode.value = "";
+      }
+      if (expandPanel.value.length > 0) {
+        expandPanel.value = "";
+      }
+      // 展开面板开着时消息列表被盖住，不补滚；只在输入坞态补滚到底
+      // （滚动要等键盘动画（~250ms）与让位过渡完成、高度稳定后再做，
+      // 与布局跳变同帧叠加会掉帧卡顿，这里去抖只滚最终一次）
+      if (expanded.value != true) {
+        if (kbScrollTimer != 0) {
+          clearTimeout(kbScrollTimer);
+        }
+        kbScrollTimer = setTimeout(() => {
+          kbScrollTimer = 0;
+          scrollToBottom();
+        }, 260);
+      }
+    }
+  }
+
+  function stopAndroidImePolling(): void {
+    if (androidImePollTimer != 0) {
+      clearTimeout(androidImePollTimer);
+      androidImePollTimer = 0;
+    }
+  }
+
+  function pollAndroidImeHeight(): void {
+    androidImePollTimer = 0;
+    const height = readAndroidImeHeight();
+    // 与事件回调读数一致时不动（事件正常的机型零开销）；不一致 = 事件丢了，轮询接管
+    if (height != keyboardHeight.value) {
+      applyKeyboardHeight(height);
+    }
+    // 输入坞聚焦 / 展开面板开着才持续轮询；IME 已抬起降频只捕捉收起沿
+    if (inputFocused.value || expanded.value) {
+      const nextDelay = keyboardHeight.value > 0 ? 250 : 100;
+      androidImePollTimer = setTimeout((): void => {
+        pollAndroidImeHeight();
+      }, nextDelay);
+    }
+  }
+
+  function startAndroidImePolling(): void {
+    // #ifdef APP-ANDROID
+    stopAndroidImePolling();
+    // 聚焦瞬间先校准：IME 实际未开而残留旧值时清零，避免输入坞跳到上一轮高度
+    if (keyboardHeight.value > 0 && readAndroidImeHeight() <= 0) {
+      applyKeyboardHeight(0);
+    }
+    androidImePollTimer = setTimeout((): void => {
+      pollAndroidImeHeight();
+    }, 60);
+    // #endif
+  }
+
   /**
    * 恢复上次阅读位置（飞书式）：进页缓存命中且离开时不在底部时调用。
    * 直接按保存时记下的首可见行 msgId 走 scrollToAnchorWithSettle 锚定（行级精度，
@@ -4669,6 +4766,8 @@
     nextTick(() => {
       expandFocusRequest.value = true;
     });
+    // 展开面板 textarea 无独立 focus 回调：面板开着即轮询（Android 键盘事件兜底同链路）
+    startAndroidImePolling();
   }
 
   /** 展开面板发送：走统一 handleSend（格式态包装/提及反扫/滚动同链路），发完收面板。 */
@@ -4814,6 +4913,8 @@
    */
   function handleInputFocus(): void {
     inputFocused.value = true;
+    // Android 兜底：部分机型从子页返回后键盘事件不派发，聚焦期间轮询 IME insets 接管让位
+    startAndroidImePolling();
     // #ifdef H5 || WEB
     if (panelMode.value == "emoji" || panelMode.value == "plus") {
       panelMode.value = "";
@@ -4825,6 +4926,7 @@
   function handleInputBlur(): void {
     inputFocused.value = false;
     focusRequest.value = false;
+    stopAndroidImePolling();
   }
 
   /** Android textarea 焦点常驻时 focus 可能不再触发：输入即视为回到键盘态（兜底，横条除外）；
@@ -5660,43 +5762,27 @@
     // 表情回复实时同步（op 3008 全量快照，本会话内按 msgId 就地替换）
     eventBus.on(`${EVENT_TYPE.ImMessageReaction}`, onImMessageReaction);
     // #ifndef H5 || WEB
-    // 键盘高度监听（App 三端/小程序；H5 不支持该 API）：驱动 dockBottomPx 让位
-    uni.onKeyboardHeightChange((res) => {
+    // 键盘高度监听（App 三端/小程序；H5 不支持该 API）：驱动 dockBottomPx 让位。
+    // 保存监听 id 精确注销（无参 off 会清掉全局所有监听，殃及 conversation-input 等组件）；
+    // Android 上事件可能不派发（子页返回后），由 startAndroidImePolling 轮询兜底
+    chatKeyboardListenerId = uni.onKeyboardHeightChange((res) => {
       // 相同高度的重复回调忽略（收起时可能补发多次 0），避免无谓重排
       if (res.height == keyboardHeight.value) {
         return;
       }
-      keyboardHeight.value = res.height;
-      if (res.height > 0) {
-        // 键盘升起覆盖面板（飞书式）：面板卸载与让位切换同帧，避免面板先消失
-        // 键盘未到时露出空档。格式横条与键盘共存不清；展开面板内嵌面板同样收掉。
-        if (panelMode.value != "font") {
-          panelMode.value = "";
-        }
-        if (expandPanel.value.length > 0) {
-          expandPanel.value = "";
-        }
-        // 展开面板开着时消息列表被盖住，不补滚；只在输入坞态补滚到底
-        // （滚动要等键盘动画（~250ms）与让位过渡完成、高度稳定后再做，
-        // 与布局跳变同帧叠加会掉帧卡顿，这里去抖只滚最终一次）
-        if (expanded.value != true) {
-          if (kbScrollTimer != 0) {
-            clearTimeout(kbScrollTimer);
-          }
-          kbScrollTimer = setTimeout(() => {
-            kbScrollTimer = 0;
-            scrollToBottom();
-          }, 260);
-        }
-      }
+      applyKeyboardHeight(res.height);
     });
     // #endif
   });
 
   onUnload(() => {
     // #ifndef H5 || WEB
-    uni.offKeyboardHeightChange();
+    if (chatKeyboardListenerId != 0) {
+      uni.offKeyboardHeightChange(chatKeyboardListenerId);
+      chatKeyboardListenerId = 0;
+    }
     // #endif
+    stopAndroidImePolling();
     if (kbScrollTimer != 0) {
       clearTimeout(kbScrollTimer);
       kbScrollTimer = 0;
@@ -5736,6 +5822,10 @@
   let chatHasShownOnce = false;
   onShow(() => {
     pageVisible = true;
+    // 从子页（@ 成员选择等）回来：若键盘本就开着（部分机型事件已哑），轮询立即接管
+    if (inputFocused.value || expanded.value) {
+      startAndroidImePolling();
+    }
     // 从别的页面回来：置顶集与已读计数是多人共享状态，重拉自我纠正
     loadPinnedIds();
     refreshReadStatus();
@@ -5755,6 +5845,8 @@
 
   onHide(() => {
     pageVisible = false;
+    // 进子页/切后台停轮询：避免读到子页（如成员选择搜索框）的键盘高度误驱动本页让位
+    stopAndroidImePolling();
     // 返回/进子页/切后台时记忆阅读位置（下次进页恢复）
     saveScrollMemo();
   });

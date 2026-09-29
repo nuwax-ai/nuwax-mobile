@@ -179,21 +179,14 @@
   const sending = ref<boolean>(false);
   /** 搜索去抖定时器（0=无待执行）。 */
   let searchTimer = 0;
+  /** 搜索序号（每次发起自增）：迟到的旧结果按序号作废，防串写新搜索状态（im-search 同款）。 */
+  let searchSeq = 0;
 
   const footerBottomPx = ref<number>(6 + getSafeAreaBottom());
 
   function readString(obj: UTSJSONObject, key: string): string {
     const raw = obj[key];
     return raw != null ? `${raw}` : "";
-  }
-
-  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
-    const raw = obj[key];
-    if (raw == null) {
-      return fallback;
-    }
-    const parsed = parseFloat(`${raw}`);
-    return isNaN(parsed) ? fallback : parsed;
   }
 
   // ===== 头像（名字首字母 + 哈希渐变底，与聊天页/pin 页同款） =====
@@ -222,10 +215,13 @@
 
   // ===== 目标行构建 =====
 
-  /** 会话行（最近对话 + 会话搜索共用）：显示名 name > peerName；已解散群(status=2)跳过。 */
+  /** 会话行（最近对话 + 会话搜索共用）：显示名 name > peerName。
+   *  ★不过滤 status：那是 /conversations 列表接口的字段，搜索接口契约里没有
+   *  （ConversationSearchItem 不含 status），拿列表语义误杀搜索结果会表现为
+   *  「接口有数据页面却空」；解散群选了发送也会被服务端拒绝，无需前端拦。 */
   function convRowOf(obj: UTSJSONObject): FwTarget | null {
     const convId = readString(obj, "convId");
-    if (convId.length == 0 || readNumber(obj, "status", 1) == 2) {
+    if (convId.length == 0) {
       return null;
     }
     const row = new FwTarget();
@@ -284,10 +280,24 @@
     return out;
   }
 
+  /** 从响应 data 取条目数组：search 系接口实测 data 为裸数组（2026-09-29 真机抓包，
+   *  无 records/items 包装；services 契约注释按包装写的是错的）——两种形状都收。 */
+  function itemsOf(dataRaw: any, key: string): UTSJSONObject[] | null {
+    if (Array.isArray(dataRaw)) {
+      return dataRaw as UTSJSONObject[];
+    }
+    if (dataRaw instanceof UTSJSONObject) {
+      const raw = (dataRaw as UTSJSONObject)[key];
+      return raw != null ? (raw as UTSJSONObject[]) : null;
+    }
+    return null;
+  }
+
   // ===== 数据加载 =====
 
   /** 最近对话（首屏；空关键词时列表数据源）。 */
   async function loadRecent(): Promise<void> {
+    searchSeq++;
     searching.value = true;
     loadFailed.value = false;
     try {
@@ -320,20 +330,28 @@
 
   /** 搜索（联系人 + 会话并行，两者独立成败：一侧挂了另一侧结果照常出）。 */
   async function runSearch(kw: string): Promise<void> {
+    searchSeq++;
+    const seq = searchSeq;
     searching.value = true;
     loadFailed.value = false;
     const contacts: FwTarget[] = [];
     const convs: FwTarget[] = [];
     let anyOk = false;
+    // dev 诊断：code + 原始条数 → 解析条数 → 最终行数，空结果时控制台一眼定位是
+    // 接口空 / code 不符 / 解析抛错被吞 / 行过滤（status/空名）丢弃
+    let cCode = "";
+    let cRaw = 0;
+    let vCode = "";
+    let vRaw = 0;
     try {
       const cRes = await apiImSearchContacts(kw, 20);
-      if (apiResCode(cRes) == SUCCESS_CODE) {
+      const code = apiResCode(cRes);
+      cCode = code != null ? code : "";
+      if (code == SUCCESS_CODE) {
         anyOk = true;
-        const dataRaw = apiResData<any>(cRes);
-        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        const itemsRaw = dataObj == null ? null : dataObj["items"];
-        const arr = itemsRaw != null ? (itemsRaw as UTSJSONObject[]) : null;
+        const arr = itemsOf(apiResData<any>(cRes), "items");
         if (arr != null) {
+          cRaw = arr.length;
           for (let i = 0; i < arr.length; i++) {
             const row = contactRowOf(arr[i]);
             if (row != null) {
@@ -347,13 +365,13 @@
     }
     try {
       const vRes = await apiImSearchConversations(kw, 20);
-      if (apiResCode(vRes) == SUCCESS_CODE) {
+      const code = apiResCode(vRes);
+      vCode = code != null ? code : "";
+      if (code == SUCCESS_CODE) {
         anyOk = true;
-        const dataRaw = apiResData<any>(vRes);
-        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        const recordsRaw = dataObj == null ? null : dataObj["records"];
-        const arr = recordsRaw != null ? (recordsRaw as UTSJSONObject[]) : null;
+        const arr = itemsOf(apiResData<any>(vRes), "records");
         if (arr != null) {
+          vRaw = arr.length;
           for (let i = 0; i < arr.length; i++) {
             const row = convRowOf(arr[i]);
             if (row != null) {
@@ -365,13 +383,25 @@
     } catch (_error) {
       // 单侧失败不阻断另一侧
     }
-    // 结果与关键词已变（用户继续输入）时丢弃本次结果
-    if (kw != keyword.value) {
+    // 结果已过时（序号被更新搜索顶掉 / 关键词又变了）时丢弃本次结果；
+    // ★关键词比对两侧都要 trim——kw 是 trim 后的，keyword.value 未 trim，
+    // 不对称会把最后一次搜索误判过期丢掉且 searching 不复原（页面卡加载中）
+    if (seq != searchSeq || kw != keyword.value.trim()) {
+      if (process.env.NODE_ENV !== "production") {
+        console.log(
+          `[FwSearch] drop kw=${kw} seq=${seq}/${searchSeq} cur="${keyword.value}" c=${cCode}/${cRaw} v=${vCode}/${vRaw}`,
+        );
+      }
       return;
     }
     rows.value = mergeRows(contacts, convs);
     searching.value = false;
     loadFailed.value = anyOk != true;
+    if (process.env.NODE_ENV !== "production") {
+      console.log(
+        `[FwSearch] kw=${kw} contacts=${cCode}/${cRaw}→${contacts.length} convs=${vCode}/${vRaw}→${convs.length} rows=${rows.value.length} failed=${loadFailed.value}`,
+      );
+    }
   }
 
   watch(keyword, (val: string, _old: string) => {

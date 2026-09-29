@@ -1,0 +1,390 @@
+import { ref, type Ref } from "vue";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { EVENT_TYPE } from "@/constants/event.constants";
+import { apiUserInfo } from "@/servers/account";
+import { apiImConversations } from "@/servers/im";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+import eventBus from "@/utils/eventBus";
+import { isAppInBackground } from "@/utils/appLifecycle.uts";
+import { isTabBarRoute } from "@/utils/imUnreadBadge";
+import { t } from "@/utils/i18n";
+import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+
+/**
+ * IM 新消息全局顶部横幅（模块单例，同 imUnreadBadge 模式）。
+ *
+ * 非「消息」tab 页收到新消息（WS im_message_received）→ 各 tab 页挂载的
+ * <im-notice-bar/> 顶部横幅显示（头像+名称+摘要），5s 自动消失，点击直达会话。
+ * 静默口径（对齐 IM Web 端 notify.ts）：
+ * - 「消息」tab / 聊天页 / 二级页 / App 后台 → 不弹（横幅组件只挂 4 个非消息 tab 页）
+ * - 自己在其他端发的多端同步消息（senderId == myUserId）→ 不弹
+ * - 重连补拉重放（reqId == "sync-fallback"）→ 不弹（风暴源头）
+ * - 免打扰会话（dnd）且未 @到我 → 不弹
+ * 单条横幅：新消息直接顶掉当前内容并重置计时（纯本地 UI，无请求放大，不去抖）。
+ */
+
+/** 横幅自动消失时长（毫秒）。 */
+const NOTICE_AUTO_HIDE_MS = 5000;
+/** 会话缓存 TTL（毫秒）：免打扰开关 / 会话名变更最迟此时长后生效。 */
+const CONV_CACHE_TTL_MS = 5 * 60 * 1000;
+/** 会话缓存预拉条数（首页 50 条覆盖活跃会话；未命中走 fail-open 兜底）。 */
+const CONV_CACHE_PAGE_SIZE = 50;
+/** 横幅头像展示地址解析尺寸（rpx，与组件样式的头像 76rpx 对齐）。 */
+const NOTICE_AVATAR_RPX = 76;
+
+/** 横幅展示数据（组件只读；ref 内整替实例触发响应，勿 mutate 字段）。 */
+export class ImNoticeData {
+  /** 会话 id（跳转参数）。 */
+  convId: string = "";
+  /** 会话类型（1单聊 2群聊 4团队；跳转必带——chat.uvue 缺省按单聊渲染，群头会错）。 */
+  convType: number = 1;
+  /** 标题：群聊=会话名；单聊=发送者名。 */
+  title: string = "";
+  /** 头像（原始地址，模块内异步解析后整替为可展示地址）。 */
+  avatar: string = "";
+  /** 摘要：服务端 digest 原样（群聊已带「发送者: 」前缀，不重复拼名）。 */
+  digest: string = "";
+  /** 消息 id（异步头像解析回来时校验横幅是否仍是本条）。 */
+  msgId: string = "";
+}
+
+/** 横幅数据（恒为非空实例，隐藏期保留上一条内容；新消息整替实例触发响应）。 */
+export const imNoticeData: Ref<ImNoticeData> = ref(new ImNoticeData());
+/** 横幅显隐（组件 v-if 读它；数据与显隐拆开，模板免判空收窄）。 */
+export const imNoticeVisible: Ref<boolean> = ref(false);
+
+/** 自动消失定时器（UTS setTimeout 返回 number）。 */
+let hideTimerId: number | null = null;
+/** 防重复绑定（App 生命周期内只绑一次）。 */
+let noticeEventsBound = false;
+
+// ==================== myUserId 缓存（多端同步消息过滤依据） ====================
+
+/** 当前用户 id（IM senderId 即平台用户 id，同源）；空 = 未就绪（fail-closed：宁可漏弹不误弹）。 */
+let cachedMyUserId = "";
+/** 拉取 myUserId 时的 token 快照（换账号/重登后失效重拉）。 */
+let myUserIdToken = "";
+
+function currentToken(): string {
+  const raw = uni.getStorageSync(ACCESS_TOKEN);
+  return raw != null ? `${raw}` : "";
+}
+
+/** 拉取/刷新 myUserId（失败静默：保持空值，下一条消息再试）。 */
+async function ensureMyUserId(): Promise<void> {
+  const token = currentToken();
+  if (cachedMyUserId.length > 0 && myUserIdToken == token) {
+    return;
+  }
+  if (token.length == 0) {
+    return;
+  }
+  try {
+    const res = await apiUserInfo();
+    if (apiResCode(res) != SUCCESS_CODE) {
+      return;
+    }
+    const dataRaw = apiResData<any>(res);
+    const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+    if (dataObj != null) {
+      const idRaw = dataObj["id"];
+      cachedMyUserId = idRaw != null ? `${idRaw}` : "";
+      myUserIdToken = token;
+    }
+  } catch (_error) {
+    // 静默：myUserId 保持当前值（可能为空 → fail-closed 不弹）
+  }
+}
+
+// ==================== 会话缓存（补 convType / 会话名 / 头像 / dnd） ====================
+
+/** 会话摘要缓存条目（解析口径复刻 message.uvue readConvRow）。 */
+class ImNoticeConvInfo {
+  convType: number = 1;
+  dnd: boolean = false;
+  displayName: string = "";
+  avatar: string = "";
+}
+
+const convCache = new Map<string, ImNoticeConvInfo>();
+/** 整表构建时间戳（0 = 从未拉取）。 */
+let convCacheAt = 0;
+/** 拉取时的 token 快照（换账号后整表失效）。 */
+let convCacheToken = "";
+/** 防并发刷新。 */
+let convCacheLoading = false;
+
+function readStr(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  return raw != null ? `${raw}` : "";
+}
+
+function readNum(obj: UTSJSONObject, key: string, fallback: number): number {
+  const raw = obj[key];
+  if (raw == null) {
+    return fallback;
+  }
+  const parsed = parseFloat(`${raw}`);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+/** 刷新会话缓存（首页 50 条整表重建）；未过期则跳过。 */
+async function refreshConvCache(): Promise<void> {
+  const token = currentToken();
+  if (token.length == 0) {
+    return;
+  }
+  if (convCacheLoading) {
+    return;
+  }
+  if (
+    convCacheAt > 0 &&
+    convCacheToken == token &&
+    Date.now() - convCacheAt < CONV_CACHE_TTL_MS
+  ) {
+    return;
+  }
+  convCacheLoading = true;
+  try {
+    const res = await apiImConversations("", CONV_CACHE_PAGE_SIZE);
+    if (apiResCode(res) == SUCCESS_CODE) {
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        const recordsRaw = dataObj["records"];
+        if (recordsRaw != null) {
+          const records = recordsRaw as UTSJSONObject[];
+          convCache.clear();
+          for (let i = 0; i < records.length; i++) {
+            const rec = records[i];
+            const convId = readStr(rec, "convId");
+            if (convId.length == 0) {
+              continue;
+            }
+            const info = new ImNoticeConvInfo();
+            info.convType = readNum(rec, "convType", 1);
+            const name = readStr(rec, "name");
+            const peerName = readStr(rec, "peerName");
+            const avatar = readStr(rec, "avatar");
+            const peerAvatar = readStr(rec, "peerAvatar");
+            // 单聊 name 恒为 null（服务端约定）：显示名用 peerName、头像用 peerAvatar；群聊反之
+            if (info.convType == 1) {
+              info.displayName = peerName.length > 0 ? peerName : name;
+              info.avatar = peerAvatar.length > 0 ? peerAvatar : avatar;
+            } else {
+              info.displayName = name.length > 0 ? name : peerName;
+              info.avatar = avatar;
+            }
+            const dndRaw = rec["dnd"];
+            info.dnd = dndRaw != null && `${dndRaw}` == "true";
+            convCache.set(convId, info);
+          }
+          convCacheAt = Date.now();
+          convCacheToken = token;
+        }
+      }
+    }
+  } catch (_error) {
+    // 静默：缓存维持旧值（stale-while-revalidate 语义）
+  } finally {
+    convCacheLoading = false;
+  }
+}
+
+/**
+ * 查会话缓存；过期/换 token 时先返回旧值（先用旧值弹）并后台刷新。
+ */
+function lookupConvInfo(convId: string): ImNoticeConvInfo | null {
+  if (convId.length == 0) {
+    return null;
+  }
+  const stale =
+    convCacheAt == 0 ||
+    convCacheToken != currentToken() ||
+    Date.now() - convCacheAt >= CONV_CACHE_TTL_MS;
+  if (stale) {
+    refreshConvCache();
+  }
+  return convCache.get(convId);
+}
+
+// ==================== 事件处理（gate 链，便宜检查在前） ====================
+
+/** @到我（与 Web 端 isMentionedMe 同口径：mentionAll || mentionUserIds 含我的 id）。 */
+function isMentionedMe(obj: UTSJSONObject): boolean {
+  if (obj["mentionAll"] === true) {
+    return true;
+  }
+  if (cachedMyUserId.length == 0) {
+    return false;
+  }
+  const idsRaw = obj["mentionUserIds"];
+  if (idsRaw != null && Array.isArray(idsRaw)) {
+    const ids = idsRaw as any[];
+    for (let i = 0; i < ids.length; i++) {
+      if (`${ids[i]}` == cachedMyUserId) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function handleNoticeMessage(payload: any): void {
+  if (payload == null) {
+    return;
+  }
+  const obj = payload as UTSJSONObject;
+  // 重连补拉重放（imWsClient runSyncFallback）：批量重放会横幅风暴，只处理实时推送
+  const reqIdRaw = obj["reqId"];
+  if (reqIdRaw != null && `${reqIdRaw}` == "sync-fallback") {
+    return;
+  }
+  // App 后台归系统级提醒（离线推送/角标），回前台不补弹
+  if (isAppInBackground()) {
+    return;
+  }
+  // 横幅组件只挂 4 个非消息 tab 页：非 tab 页（聊天页/二级页）不弹；
+  // 消息 tab 不弹且顺带清掉切页前的残留态
+  const pages = getCurrentPages();
+  if (pages.length == 0) {
+    return;
+  }
+  const currentPage = pages[pages.length - 1];
+  if (currentPage == null) {
+    return;
+  }
+  const route = `${currentPage.route}`;
+  if (!isTabBarRoute(route)) {
+    return;
+  }
+  if (route == "pages/message/message") {
+    hideImNoticeBar();
+    return;
+  }
+  // 自己在其他端发的多端同步消息不弹；myUserId 未就绪时 fail-closed（拉取后下一条生效）
+  const senderIdRaw = obj["senderId"];
+  const senderId = senderIdRaw != null ? `${senderIdRaw}` : "";
+  if (cachedMyUserId.length == 0 || senderId.length == 0) {
+    ensureMyUserId();
+    return;
+  }
+  if (senderId == cachedMyUserId) {
+    return;
+  }
+  const convIdRaw = obj["convId"];
+  const convId = convIdRaw != null ? `${convIdRaw}` : "";
+  if (convId.length == 0) {
+    return;
+  }
+  // 免打扰会话且未 @到我 → 不弹（对齐 Web notify.ts shouldNotify 第 5 判据）
+  const convInfo = lookupConvInfo(convId);
+  if (convInfo != null && convInfo.dnd == true && isMentionedMe(obj) != true) {
+    return;
+  }
+  // ---- 组装横幅（模块层做完文案，组件保持 dumb）----
+  const senderNameRaw = obj["senderName"];
+  const senderName = senderNameRaw != null ? `${senderNameRaw}` : "";
+  const senderAvatarRaw = obj["senderAvatar"];
+  const senderAvatar = senderAvatarRaw != null ? `${senderAvatarRaw}` : "";
+  const digestRaw = obj["digest"];
+  let digest = digestRaw != null ? `${digestRaw}` : "";
+
+  const data = new ImNoticeData();
+  data.convId = convId;
+  data.msgId = readStr(obj, "msgId");
+  if (convInfo != null) {
+    data.convType = convInfo.convType;
+    // 单聊标题=发送者名（回落会话显示名）；群聊/团队=会话名（回落发送者名）
+    if (convInfo.convType == 1) {
+      data.title = senderName.length > 0 ? senderName : convInfo.displayName;
+    } else {
+      data.title = convInfo.displayName.length > 0 ? convInfo.displayName : senderName;
+    }
+    data.avatar = convInfo.avatar;
+  } else {
+    // 缓存未命中（新会话首条 / 列表分页之外）：fail-open 照弹，用发送者信息兜底
+    data.convType = 1;
+    data.title = senderName;
+    data.avatar = senderAvatar;
+  }
+  if (data.title.length == 0) {
+    data.title = t("Mobile.Message.noticeFallbackTitle");
+  }
+  if (digest.length == 0) {
+    digest = t("Mobile.Message.noticeFallbackDigest");
+  }
+  data.digest = digest;
+  imNoticeData.value = data;
+  imNoticeVisible.value = true;
+  resetHideTimer();
+  // 头像异步解析（受保护 /api/f/ 与远程 SVG）：回来时仍是本条则整替为可展示地址
+  if (data.avatar.length > 0) {
+    const msgId = data.msgId;
+    const rawAvatar = data.avatar;
+    resolveDisplayImageUrl(rawAvatar, NOTICE_AVATAR_RPX, NOTICE_AVATAR_RPX)
+      .then((resolved: string): void => {
+        const current = imNoticeData.value;
+        if (
+          resolved.length > 0 &&
+          resolved != rawAvatar &&
+          imNoticeVisible.value == true &&
+          current.msgId == msgId &&
+          current.avatar == rawAvatar
+        ) {
+          const updated = new ImNoticeData();
+          updated.convId = current.convId;
+          updated.convType = current.convType;
+          updated.title = current.title;
+          updated.digest = current.digest;
+          updated.msgId = current.msgId;
+          updated.avatar = resolved;
+          imNoticeData.value = updated;
+        }
+      })
+      .catch((_e: any | null): void => {
+        // 解析失败保留原地址，交给 <image> 原生渲染兜底（Cookie 命中等）
+      });
+  }
+}
+
+function resetHideTimer(): void {
+  // 局部承接再 clearTimeout：可变模块属性无法 smart cast 到 Number（Kotlin 并发限制）
+  const timerId = hideTimerId;
+  if (timerId != null) {
+    clearTimeout(timerId);
+  }
+  hideTimerId = setTimeout(() => {
+    hideTimerId = null;
+    hideImNoticeBar();
+  }, NOTICE_AUTO_HIDE_MS);
+}
+
+/** 隐藏横幅并清定时器（组件点击/关闭、消息 tab gate 共用）。 */
+export function hideImNoticeBar(): void {
+  const timerId = hideTimerId;
+  if (timerId != null) {
+    clearTimeout(timerId);
+    hideTimerId = null;
+  }
+  imNoticeVisible.value = false;
+}
+
+/**
+ * 绑定 WS 新消息事件到横幅（App onLaunch 调用一次）：
+ * 预拉 myUserId 与会话缓存（未登录时静默失败，首条消息到达再补拉）。
+ */
+export function bindImNoticeEvents(): void {
+  if (noticeEventsBound) {
+    return;
+  }
+  noticeEventsBound = true;
+  ensureMyUserId();
+  refreshConvCache();
+  // 零参函数直接当 EventCallback 传在 UTS→Kotlin 报 Unit≠EventCallback（error17），
+  // 包箭头函数（同 App.uvue / imUnreadBadge 绑定写法）
+  eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, (event: any) => {
+    handleNoticeMessage(event);
+  });
+}

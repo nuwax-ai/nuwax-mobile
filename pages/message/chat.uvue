@@ -51,6 +51,7 @@
 
     <!-- 消息列表（升序渲染；向下滑到顶加载更早） -->
     <scroll-view
+      id="im-chat-body"
       class="chat-body"
       direction="vertical"
       :show-scrollbar="false"
@@ -971,17 +972,19 @@
   import { MsgActionItem } from "@/types/interfaces/msgActionItem";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import eventBus from "@/utils/eventBus";
+  import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
+  import { preserveImPrependAnchor } from "@/utils/im/imPrependAnchor";
+  import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
   import { writeClipboardText } from "@/utils/clipboard.uts";
   import { collectChatAttachments, resetChatAttachments } from "@/utils/imChatAttachments";
   import {
     ChatScrollMemo,
     getCachedChatRecords,
-    getCachedChatScroll,
     setCachedChatRecords,
     setCachedChatScroll,
   } from "@/utils/im/imChatCache";
-  import { isAuthProtectedFileUrl, openAuthProtectedLinkUrl } from "@/utils/authProtectedFileUrl";
+  import { isAuthProtectedFileUrl, openAuthProtectedLinkUrl, releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
   import { generateUUID } from "@/utils/common";
   import { ImForwardItem, ImForwardSession, openImForward } from "@/utils/im/imForwardSession";
   import { uploadSingleFile } from "@/utils/fileUploader";
@@ -1167,6 +1170,7 @@
     revoked: boolean = false;
     /** 服务端确认被编辑过（MessageDto.editTime 非空）⇒ 正文末尾显示「已编辑」。 */
     edited: boolean = false;
+    revisionAt: number = 0;
     /** 撤回操作人 userId（管理员撤他人时 senderId≠revokeById，撤回文案判定用）。 */
     revokeById: string = "";
     sendTime: number = 0;
@@ -1253,6 +1257,7 @@
   // loading/失败/空态在 v-for 外不受遮蔽；后续 scrollToBottom（发消息/WS/键盘）时
   // listSettled 已为 true，行为与之前完全一致。
   const listSettled = ref<boolean>(false);
+  let entryFollowLatest = true;
 
   // ===== 滑动吞击守卫 =====
   // Android 上滑动手势的 touchup 可能被判定为 click：快速滑动消息列表后手指落在
@@ -1271,6 +1276,7 @@
   let rowPressFired = false;
 
   function handlePageTouchStart(eventValue: Any): void {
+    entryFollowLatest = false;
     const e = eventValue as UniTouchEvent;
     if (e.touches.length == 0) {
       return;
@@ -1309,6 +1315,25 @@
   const highlightId = ref<string>("");
   let pendingJumpId = "";
   let pageVisible = false;
+  let pageDisposed = false;
+  const pageSessionStamp = getImSessionStamp();
+  function isChatCurrent(): boolean {
+    return !pageDisposed && pageSessionStamp == getImSessionStamp();
+  }
+  const deferredMediaIds = new Set<string>();
+  let settleTimer = 0;
+  let settleVersion = 0;
+  let deferredAnchor = "";
+  let cancelPrependAnchor: (() => void) | null = null;
+  function releasePrependAnchor(): void {
+    const cancel = cancelPrependAnchor;
+    cancelPrependAnchor = null;
+    if (cancel != null) cancel();
+  }
+
+  function isChatActive(): boolean {
+    return isChatCurrent() && pageVisible && !isAppInBackground();
+  }
 
   // ===== 当前用户（区分我方/对方消息） =====
   const myUserId = ref<string>("");
@@ -2180,6 +2205,7 @@
       const out: ImMember[] = [];
       if (isGroupLike.value) {
         const res = await apiImConvMembers(convId.value);
+      if (!isChatCurrent()) return;
         if (apiResCode(res) != SUCCESS_CODE) {
           return;
         }
@@ -2211,6 +2237,7 @@
       } else {
         // 单聊：@ 某人 → 联系人（status=1 已互为联系人，申请中的不进面板）
         const res = await apiImContacts();
+      if (!isChatCurrent()) return;
         if (apiResCode(res) != SUCCESS_CODE) {
           return;
         }
@@ -2394,6 +2421,7 @@
   function readMsgRow(obj: UTSJSONObject): ImMsgRow {
     const row = new ImMsgRow();
     row.msgId = readString(obj, "msgId");
+    row.clientMsgId = readString(obj, "clientMsgId");
     row.seq = readNumber(obj, "seq", 0);
     row.senderId = readString(obj, "senderId");
     row.senderType = readNumber(obj, "senderType", 1);
@@ -2516,7 +2544,8 @@
     }
     row.digest = readString(obj, "digest");
     row.revoked = readNumber(obj, "msgStatus", 1) == 2;
-    row.edited = readString(obj, "editTime").length > 0;
+    row.edited = readNumber(obj, "editTime", 0) > 0;
+    row.revisionAt = Math.max(readNumber(obj, "editTime", 0), readNumber(obj, "revokeTime", 0));
     row.revokeById = readString(obj, "revokeBy");
     // @提及元数据（int64 数组经 `${raw}` 保精度转字符串）
     const mentionIdsRaw = obj["mentionUserIds"];
@@ -2666,6 +2695,7 @@
       const res = mine
         ? await apiImMsgRemoveReaction(convId.value, msg.msgId, emoji)
         : await apiImMsgAddReaction(convId.value, msg.msgId, emoji);
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -3107,6 +3137,7 @@
     cardBusyKey.value = action.key;
     try {
       const res = await apiImMsgRunAction(msg.msgId, convId.value, action.key);
+      if (!isChatCurrent()) return;
       cardBusyKey.value = "";
       if (apiResCode(res) != SUCCESS_CODE) {
         // 真失败（消息没了/不是卡片/网络）：与 PC 失败口径一致，toast 提示
@@ -3144,6 +3175,7 @@
     }
     try {
       const res = await apiImConvDetail(convId.value);
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -3169,6 +3201,7 @@
     }
     try {
       const res = await apiImConvPins(convId.value);
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const arr = dataRaw != null ? (dataRaw as UTSJSONObject[]) : null;
@@ -3195,6 +3228,7 @@
   async function loadRevokeWindow(): Promise<void> {
     try {
       const res = await apiImWhoami();
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -3212,14 +3246,14 @@
 
   // ===== 已读状态（read-status 批量查询，只查自己发的消息） =====
 
+  const readInfoIndex = computed<Map<string, ImReadInfo>>((): Map<string, ImReadInfo> => {
+    const index = new Map<string, ImReadInfo>();
+    for (let i = 0; i < readInfos.value.length; i++) index.set(readInfos.value[i].msgId, readInfos.value[i]);
+    return index;
+  });
+
   function findReadInfo(msgId: string): ImReadInfo | null {
-    const infos = readInfos.value;
-    for (let i = 0; i < infos.length; i++) {
-      if (infos[i].msgId == msgId) {
-        return infos[i];
-      }
-    }
-    return null;
+    return readInfoIndex.value.get(msgId) ?? null;
   }
 
   /** 按 msgId 对齐合并（结果可能少于请求——别人的消息静默消失，顺序不保证，勿按下标）。
@@ -3338,6 +3372,7 @@
    * icon（见 readInfoOf 注释），不做多批循环；请求序号防旧响应覆盖新数据。
    */
   async function refreshReadStatus(): Promise<void> {
+    if (!isChatActive()) return;
     if (convId.value.length == 0 || myUserId.value.length == 0 || messages.value.length == 0) {
       return;
     }
@@ -3368,7 +3403,8 @@
     const seq = ++readStatusSeq;
     try {
       const res = await apiImReadStatus(convId.value, picked);
-      if (seq != readStatusSeq) {
+      if (!isChatCurrent()) return;
+      if (!isChatCurrent() || seq != readStatusSeq) {
         return;
       }
       if (apiResCode(res) == SUCCESS_CODE) {
@@ -3396,6 +3432,7 @@
    * 只留一次，窗口期来过新帧则到点后补一轮（保证最后一帧之后必有一次为它发起的查询）。
    */
   function scheduleReadRefresh(): void {
+    if (!isChatActive()) return;
     if (readRefreshTimer != 0) {
       readRefreshOwed = true;
       return;
@@ -3465,28 +3502,42 @@
   }
 
   function maxSeq(): number {
-    const rows = messages.value;
-    if (rows.length == 0) {
-      return 0;
-    }
-    return rows[rows.length - 1].seq;
+    let seq = 0;
+    for (let i = 0; i < messages.value.length; i++) seq = Math.max(seq, messages.value[i].seq);
+    return seq;
   }
 
-  /** 已读水位上报（单调；advanced=false 属正常不重试），成功后顺带刷新未读角标。 */
-  function reportReadIfNeeded(seq: number): void {
-    if (seq <= 0 || seq <= reportedReadSeq) {
-      return;
+  let readReportTimer = 0;
+  let readReportRunning = false;
+  let wantedReadSeq = 0;
+
+  async function flushReadReport(): Promise<void> {
+    if (!isChatActive() || readReportRunning) return;
+    readReportRunning = true;
+    try {
+      while (isChatActive() && wantedReadSeq > reportedReadSeq) {
+        const seq = wantedReadSeq;
+        const res = await apiImReadReport(convId.value, seq);
+        if (!isChatCurrent() || apiResCode(res) != SUCCESS_CODE) return;
+        reportedReadSeq = Math.max(reportedReadSeq, seq);
+        refreshImUnreadBadge();
+      }
+    } catch (_e) {
+      // 失败不推进水位；下一次来消息/回前台会重试同一水位。
+    } finally {
+      readReportRunning = false;
     }
-    reportedReadSeq = seq;
-    apiImReadReport(convId.value, seq)
-      .then((res: RequestResponse<any>) => {
-        if (apiResCode(res) == SUCCESS_CODE) {
-          refreshImUnreadBadge();
-        }
-      })
-      .catch((_e: any | null) => {
-        // 已读上报失败不打扰用户：下次进入会话会以更高水位重报
-      });
+  }
+
+  /** 合并相邻消息/补拉/页面恢复的水位；只有服务端成功才推进本地确认值。 */
+  function reportReadIfNeeded(seq: number): void {
+    if (!isChatActive() || seq <= reportedReadSeq || seq <= 0) return;
+    wantedReadSeq = Math.max(wantedReadSeq, seq);
+    if (readReportRunning || readReportTimer != 0) return;
+    readReportTimer = setTimeout(() => {
+      readReportTimer = 0;
+      flushReadReport();
+    }, 150);
   }
 
   /** 距底余量阈值（px）：离开时距底小于该值视为「在底部」，进页直接滚最新。 */
@@ -3500,26 +3551,38 @@
    * 滚动逻辑改走（如翻页定位 msg-*）则不抢。遮蔽期（listSettled=false）内
    * 全部跳变不可见，定位稳定后揭幕。
    */
+  function cancelSettle(): void {
+    settleVersion += 1;
+    if (settleTimer != 0) {
+      clearTimeout(settleTimer);
+      settleTimer = 0;
+    }
+  }
+
   function scrollToAnchorWithSettle(anchorId: string): void {
+    cancelSettle();
+    if (!isChatActive()) {
+      deferredAnchor = anchorId;
+      return;
+    }
+    deferredAnchor = "";
+    const version = settleVersion;
     scrollAnchor.value = "";
     nextTick(() => {
+      if (!isChatActive() || version != settleVersion) return;
       scrollAnchor.value = anchorId;
-      setTimeout(() => {
-        const revealList = (): void => {
-          if (listSettled.value != true) {
-            listSettled.value = true;
-          }
-        };
+      settleTimer = setTimeout(() => {
+        settleTimer = 0;
+        if (!isChatActive() || version != settleVersion) return;
         if (scrollAnchor.value == anchorId) {
           scrollAnchor.value = "";
           nextTick(() => {
+            if (!isChatActive() || version != settleVersion) return;
             scrollAnchor.value = anchorId;
-            // 重定位与揭幕同帧应用：遮蔽期内的全部跳变对用户不可见
-            revealList();
+            listSettled.value = true;
           });
         } else {
-          // 锚点被其它定位逻辑改走（翻页锚 msg-* 等）：不再抢锚，但仍要揭幕
-          revealList();
+          listSettled.value = true;
         }
       }, 150);
     });
@@ -3655,27 +3718,6 @@
   }
 
   /**
-   * 恢复上次阅读位置（飞书式）：进页缓存命中且离开时不在底部时调用。
-   * 直接按保存时记下的首可见行 msgId 走 scrollToAnchorWithSettle 锚定（行级精度，
-   * 对图片加载等高度变化天然免疫）；行已不在缓存窗口（上次翻页后退出）时锚到
-   * 最旧行，scrolltoupper 会自动续拉更早消息。
-   */
-  function restoreScrollPosition(anchorId: string): void {
-    const msgs = messages.value;
-    let anchorIdx = -1;
-    for (let i = 0; i < msgs.length; i++) {
-      if (msgs[i].msgId == anchorId) {
-        anchorIdx = i;
-        break;
-      }
-    }
-    if (anchorIdx < 0) {
-      anchorIdx = 0;
-    }
-    scrollToAnchorWithSettle(`msg-${msgs[anchorIdx].msgId}`);
-  }
-
-  /**
    * 离开页面（返回/进子页/切后台）时记忆阅读位置：首可见行 msgId + 距底余量。
    * ★不依赖 scrollOffset/fields 取 scrollTop——真机实测该族查询在 App 端
    *   拿不到字段值；只用 boundingClientRect 的
@@ -3683,7 +3725,7 @@
    * 键盘/面板展开时视口高度失真，跳过本次记忆（保留上次有效值）。
    */
   function saveScrollMemo(): void {
-    if (convId.value.length == 0 || messages.value.length == 0 || listSettled.value != true) {
+    if (!isChatCurrent() || convId.value.length == 0 || messages.value.length == 0 || listSettled.value != true) {
       return;
     }
     if (keyboardHeight.value > 0 || panelMode.value.length > 0 || expandPanel.value.length > 0) {
@@ -3694,24 +3736,27 @@
     query.select("#chat-bottom").boundingClientRect();
     query.selectAll(".chat-msg").boundingClientRect();
     query.exec((results: Array<any>) => {
+      if (!isChatCurrent()) return;
       const msgs = messages.value;
-      if (results.length < 3 || results[0] == null || results[1] == null || results[2] == null || msgs.length == 0) {
+      if (results.length < 3 || results[0] == null || results[2] == null || msgs.length == 0) {
         return;
       }
       const bodyRect = results[0] as NodeInfo;
-      const endRect = results[1] as NodeInfo;
+      const endRect = results[1] != null ? (results[1] as NodeInfo) : null;
       const rows = results[2] as NodeInfo[];
       if (rows.length == 0) {
         return;
       }
-      if (bodyRect.top == null || bodyRect.height == null || endRect.top == null) {
+      if (bodyRect.top == null || bodyRect.height == null) {
         return;
       }
       const bodyTop = parseFloat(`${bodyRect.top}`);
       const bodyBottom = bodyTop + parseFloat(`${bodyRect.height}`);
       // 距底余量 = 内容底（视口坐标）- 视口底：向上滑看历史时为正，在底部 ≈ 0
       // （★符号勿写反：写反会算出负数被 clamp 成 0，进页误判「上次在底部」直接滚底）
-      let distBottom = parseFloat(`${endRect.top}`) - bodyBottom;
+      // 回收列表中底部锚点可能尚未渲染，此时保守视为正在读历史。
+      let distBottom = NEAR_BOTTOM_PX + 1;
+      if (endRect != null && endRect.top != null) distBottom = parseFloat(`${endRect.top}`) - bodyBottom;
       if (distBottom < 0) {
         distBottom = 0;
       }
@@ -3723,13 +3768,14 @@
           continue;
         }
         if (parseFloat(`${r.top}`) + parseFloat(`${r.height}`) > bodyTop + 2) {
-          anchorId = msgs[i].msgId;
-          break;
+          const nodeId = r.id;
+          if (nodeId != null && nodeId.startsWith("msg-")) {
+            anchorId = nodeId.substring(4);
+            break;
+          }
         }
       }
-      if (anchorId.length == 0) {
-        anchorId = msgs[0].msgId;
-      }
+      if (anchorId.length == 0) return;
       const memo = new ChatScrollMemo();
       memo.anchorId = anchorId;
       memo.distBottom = distBottom;
@@ -3811,17 +3857,51 @@
     clearPressTouch();
   }
 
+  const chatImageUrls = new Set<string>();
+  const chatImageRequests = new Map<string, Promise<string>>();
+
+  async function resolveChatImage(url: string, size: number): Promise<string> {
+    const key = `${size}:${url}`;
+    const existing = chatImageRequests.get(key);
+    if (existing != null) return await existing;
+    const task = resolveDisplayImageUrl(url, size, size);
+    chatImageRequests.set(key, task);
+    try {
+      const resolved = await task;
+      if (!isChatCurrent()) {
+        releaseDisplayImageUrl(resolved);
+        return url;
+      }
+      if (resolved.startsWith("blob:")) chatImageUrls.add(resolved);
+      return resolved;
+    } finally {
+      chatImageRequests.delete(key);
+    }
+  }
+
+  function releaseChatImages(): void {
+    chatImageUrls.forEach((url: string) => { releaseDisplayImageUrl(url); });
+    chatImageUrls.clear();
+    chatImageRequests.clear();
+  }
+
   /**
    * /api/f/ 受保护媒体：<image> 带不了 Bearer（H5 会被 ORB 拦成 net::ERR_BLOCKED_BY_ORB），
    * 经 resolveDisplayImageUrl 带 Bearer 拉取换成可展示地址（H5 blob / App 临时文件），
    * 解析成功后原位替换；普通地址原样保留。
    */
   function resolveRowMedia(row: ImMsgRow): void {
+    if (!isChatCurrent()) return;
+    if (!isChatActive()) {
+      deferredMediaIds.add(row.msgId);
+      return;
+    }
+    deferredMediaIds.delete(row.msgId);
     if (row.imageUrl.length > 0) {
       const url = row.imageUrl;
-      resolveDisplayImageUrl(url, 300, 300)
+      resolveChatImage(url, 300)
         .then((resolved: string) => {
-          if (resolved != url) {
+          if (isChatCurrent() && resolved != url) {
             row.imageUrl = resolved;
           }
         })
@@ -3833,9 +3913,9 @@
     for (let i = 0; i < row.imageAtts.length; i++) {
       const att = row.imageAtts[i];
       const url = att.url;
-      resolveDisplayImageUrl(url, 260, 260)
+      resolveChatImage(url, 260)
         .then((resolved: string) => {
-          if (resolved != url) {
+          if (isChatCurrent() && resolved != url) {
             att.url = resolved;
           }
         })
@@ -3846,24 +3926,80 @@
     }
   }
 
+  /** 合并服务端快照：批内去重、按版本更新，保留已解析的未变消息。 */
+  function mergeSyncedMessages(records: UTSJSONObject[]): boolean {
+    if (!isChatCurrent()) return false;
+    const rows = messages.value.slice();
+    const indices = new Map<string, number>();
+    const clientIndices = new Map<string, number>();
+    const changed = new Set<string>();
+    for (let i = 0; i < rows.length; i++) {
+      indices.set(rows[i].msgId, i);
+      if (rows[i].clientMsgId.length > 0) clientIndices.set(rows[i].clientMsgId, i);
+    }
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i];
+      if (record == null || readString(record, "convId") != convId.value) continue;
+      const msgId = readString(record, "msgId");
+      if (msgId.length == 0) continue;
+      let index = indices.get(msgId);
+      if (index == null) index = clientIndices.get(readString(record, "clientMsgId"));
+      const revision = Math.max(readNumber(record, "editTime", 0), readNumber(record, "revokeTime", 0));
+      const revoked = readNumber(record, "msgStatus", 1) == 2;
+      if (index != null) {
+        const previous = rows[index];
+        // 撤回不可复活；较旧 HTTP 快照不可覆盖已收到的编辑事件。
+        if (previous.revoked && !revoked) continue;
+        if (!previous.local && !(revoked && !previous.revoked) && revision <= previous.revisionAt) continue;
+        rows[index] = readMsgRow(record);
+        indices.set(msgId, index);
+      } else {
+        indices.set(msgId, rows.length);
+        const row = readMsgRow(record);
+        if (row.clientMsgId.length > 0) clientIndices.set(row.clientMsgId, rows.length);
+        rows.push(row);
+      }
+      changed.add(msgId);
+    }
+    if (changed.size == 0) return false;
+    // 未确认的本地占位 seq=0，固定留在末尾。
+    rows.sort((a: ImMsgRow, b: ImMsgRow): number => {
+      if (a.local != b.local) return a.local ? 1 : -1;
+      return a.seq - b.seq;
+    });
+    messages.value = rows;
+    for (let i = 0; i < messages.value.length; i++) {
+      const row = messages.value[i];
+      if (changed.has(row.msgId)) resolveRowMedia(row);
+    }
+    reportReadIfNeeded(maxSeq());
+    return true;
+  }
+
+
   /** 首屏 + 向上翻页共用：beforeSeq<=0 取最新一页，否则取 seq<beforeSeq 的更早一页。 */
-  async function loadHistory(beforeSeq: number): Promise<void> {
+  async function loadHistory(beforeSeq: number, preserveAnchor: string = ""): Promise<void> {
     const res = await apiImMessages(convId.value, beforeSeq, MSG_PAGE_SIZE);
+      if (!isChatCurrent()) return;
     if (apiResCode(res) != SUCCESS_CODE) {
       loadFailed.value = true;
       return;
     }
     const dataRaw = apiResData<any>(res);
     const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-    const rows: ImMsgRow[] = [];
+
     if (dataObj != null) {
       hasMore.value = readBool(dataObj, "hasMore");
       const recordsRaw = dataObj["records"];
       if (recordsRaw != null) {
         const records = recordsRaw as UTSJSONObject[];
-        for (let i = 0; i < records.length; i++) {
-          rows.push(readMsgRow(records[i]));
+        // 翻页的消息与锚点同批提交，不能先渲染新增的顶部消息，再 nextTick 拉回。
+        if (preserveAnchor.length > 0 && isChatActive()) {
+          releasePrependAnchor();
+          cancelPrependAnchor = preserveImPrependAnchor("im-chat-body", preserveAnchor);
+          if (cancelPrependAnchor == null) scrollAnchor.value = preserveAnchor;
         }
+        mergeSyncedMessages(records);
         // 附件缓存累积：文件页（文件/群文件）只读本窗口已加载消息里的附件
         collectChatAttachments(convId.value, records);
         // 首屏（beforeSeq<=0）成功后写消息缓存：下次进页先渲染再静默同步
@@ -3872,19 +4008,12 @@
         }
       }
     }
-    // 返回为降序（新→旧）；列表升序存，逐条 unshift 后头部即为最旧
-    for (let i = rows.length - 1; i >= 0; i--) {
-      messages.value.unshift(rows[i]);
-    }
-    // 新插入的行统一补解析受保护图片（经 messages.value 取代理实例，改属性才会触发刷新）
-    for (let i = 0; i < rows.length; i++) {
-      resolveRowMedia(messages.value[i]);
-    }
     reportReadIfNeeded(maxSeq());
     refreshReadStatus();
   }
 
   async function handleLoadOlder(): Promise<void> {
+    if (!isChatActive()) return;
     if (loading.value || loadingOlder.value || loadFailed.value) {
       return;
     }
@@ -3894,14 +4023,14 @@
     // beforeSeq = 当前列表最小 seq；记录首行 id 供翻页后锚回原位
     const firstKey = messages.value[0].msgId;
     const oldestSeq = messages.value[0].seq;
+    entryFollowLatest = false;
+    cancelSettle();
+    scrollAnchor.value = "";
     loadingOlder.value = true;
     try {
-      await loadHistory(oldestSeq);
+      await loadHistory(oldestSeq, `msg-${firstKey}`);
+      if (!isChatCurrent()) return;
       loadingOlder.value = false;
-      scrollAnchor.value = "";
-      nextTick(() => {
-        scrollAnchor.value = `msg-${firstKey}`;
-      });
     } catch (_error) {
       loadingOlder.value = false;
     }
@@ -3919,6 +4048,7 @@
         row.mentionAll,
         row.replyId.length > 0 ? row.replyId : "",
       );
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -4098,6 +4228,7 @@
     }
     try {
       const res = await apiImEditMsg(target.msgId, convId.value, text);
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -4173,6 +4304,7 @@
     row.status = 0;
     try {
       const up = await uploadSingleFile(localPath, row.clientMsgId, null, displayName);
+      if (!isChatCurrent()) return;
       if (up.success != true || up.file == null) {
         markRowFailed(row.clientMsgId);
         const reason = up.error != null ? `${up.error}` : "";
@@ -4194,6 +4326,7 @@
         row.clientMsgId,
         row.replyId.length > 0 ? row.replyId : "",
       );
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -4441,6 +4574,7 @@
     scrollAnchor.value = "";
     nextTick(() => {
       scrollAnchor.value = `msg-${msgId}`;
+      listSettled.value = true;
       flashHighlight(msgId);
     });
   }
@@ -4451,6 +4585,8 @@
    *   scroll-into-view 不生效——统一延到 onShow（页面重新可见）后再应用。
    */
   async function jumpToMsg(msgId: string): Promise<void> {
+    entryFollowLatest = false;
+    cancelSettle();
     let pages = 0;
     while (findMsgById(msgId) == null && pages < 15) {
       if (loading.value || loadFailed.value || messages.value.length == 0 || hasMore.value != true) {
@@ -4937,6 +5073,7 @@
     }
     try {
       const res = pin ? await apiImPinMsg(convId.value, msg.msgId) : await apiImUnpinMsg(convId.value, msg.msgId);
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         // 成功不 toast：气泡上 PIN 徽标 + Pin 面板即时刷新即反馈；失败仍提示
         loadPinnedIds();
@@ -4956,6 +5093,7 @@
     }
     try {
       const res = await apiImRevokeMsg(msg.msgId, convId.value);
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -5664,11 +5802,25 @@
     // 读到的是新地址）。WS 实时消息与静默同步插入都走本函数。
     resolveRowMedia(messages.value[insertAt]);
     // 滚动到底部：仅当 row 是新增且 seq 大于本地最大 seq（真正的实时消息）
-    if (autoScroll && insertAt >= rows.length - 1) {
+    if (isChatActive() && autoScroll && insertAt >= rows.length - 1) {
       scrollToBottom();
     }
     // 上报已读
     reportReadIfNeeded(maxSeq());
+  }
+
+
+  function handleImMessagesSynced(payload: any): void {
+    if (!isChatCurrent() || payload == null) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    const records = obj["records"];
+    if (records != null && Array.isArray(records)) {
+      if (mergeSyncedMessages(records as UTSJSONObject[])) {
+        scheduleReadRefresh();
+      }
+    }
   }
 
   /**
@@ -5677,12 +5829,15 @@
    * 成功顺带刷新首屏缓存；失败完全静默（下次 onShow/WS 再试）。
    * ★定义在 insertMessageBySeq 之后、initHistory 之前（UTS→Kotlin 先用后定义报「找不到名称」）。
    */
+  let latestSyncLoading = false;
   async function silentSyncLatest(): Promise<void> {
-    if (convId.value.length == 0) {
+    if (!isChatCurrent() || latestSyncLoading || convId.value.length == 0) {
       return;
     }
+    latestSyncLoading = true;
     try {
       const res = await apiImMessages(convId.value, 0, MSG_PAGE_SIZE);
+      if (!isChatCurrent()) return;
       if (apiResCode(res) != SUCCESS_CODE) {
         return;
       }
@@ -5700,24 +5855,20 @@
         setCachedChatRecords(convId.value, records);
         collectChatAttachments(convId.value, records);
       }
-      for (let i = 0; i < records.length; i++) {
-        const row = readMsgRow(records[i]);
-        if (row.msgId.length == 0) {
-          continue;
-        }
-        // autoScroll=false：用户可能正在翻历史，静默补齐不打断位置
-        insertMessageBySeq(row, false);
-      }
-      refreshReadStatus();
+      mergeSyncedMessages(records);
+      scheduleReadRefresh();
     } catch (_error) {
       // 静默失败
+    } finally {
+      latestSyncLoading = false;
     }
   }
 
   /** 静默同步完成后：进页时在底部的场景补滚到真最新（同步可能追加了新消息）。 */
   async function settleAfterSync(needBottom: boolean): Promise<void> {
     await silentSyncLatest();
-    if (needBottom) {
+    if (!isChatCurrent()) return;
+    if (needBottom && entryFollowLatest) {
       scrollToBottom();
     }
   }
@@ -5735,24 +5886,12 @@
       loadFailed.value = false;
       messages.value = [];
       // 缓存即接口原文（降序 新→旧），与 loadHistory 同款逐条 unshift 后头部为最旧
-      for (let i = cached.length - 1; i >= 0; i--) {
-        messages.value.unshift(readMsgRow(cached[i]));
-      }
+      mergeSyncedMessages(cached);
       hasMore.value = cached.length >= MSG_PAGE_SIZE;
       collectChatAttachments(convId.value, cached);
-      for (let i = 0; i < messages.value.length; i++) {
-        resolveRowMedia(messages.value[i]);
-      }
-      // 阅读位置记忆（飞书式）：离开时不在底部 → 恢复到该位置；在底部/无记忆 → 滚最新，
-      // 且静默同步补齐新消息后再补滚一次（避免停在旧内容的"假底部"）
-      const scrollMemo = getCachedChatScroll(convId.value);
-      if (scrollMemo != null && scrollMemo.anchorId.length > 0 && scrollMemo.distBottom > NEAR_BOTTOM_PX) {
-        restoreScrollPosition(scrollMemo.anchorId);
-        settleAfterSync(false);
-      } else {
-        scrollToBottom();
-        settleAfterSync(true);
-      }
+      // 重新进入会话始终展示最新消息，不恢复上次阅读的历史位置。
+      scrollToBottom();
+      settleAfterSync(true);
       reportReadIfNeeded(maxSeq());
       refreshReadStatus();
       return;
@@ -5778,11 +5917,15 @@
   }
 
   function handleImMessageReceived(payload: any): void {
-    if (payload == null) {
+    if (!isChatCurrent() || payload == null) {
       return;
     }
     // any 参数不能 .property 访问（Kotlin 后端）：转 UTSJSONObject 走 bracket 访问
     const obj = payload as UTSJSONObject;
+    // HTTP 同步由批次事件消费，不能再次按实时消息触发滚动/已读。
+    if (readString(obj, "reqId") == "sync-fallback") {
+      return;
+    }
     const msgConvId = readString(obj, "convId");
     if (msgConvId.length == 0 || msgConvId != convId.value) {
       return;
@@ -5812,7 +5955,7 @@
    *   无缓存（拿不到分母 eligibleCount）只能去抖重查。
    */
   function handleImReadNotified(payload: any): void {
-    if (payload == null) {
+    if (!isChatCurrent() || payload == null) {
       return;
     }
     const obj = payload as UTSJSONObject;
@@ -5916,7 +6059,7 @@
    * 重连成功后对当前会话排一次已读查询自愈，否则 icon 停在断线前的旧值。
    */
   function handleImConnectionState(payload: any): void {
-    if (payload == null) {
+    if (!isChatCurrent() || payload == null) {
       return;
     }
     const obj = payload as UTSJSONObject;
@@ -5933,7 +6076,7 @@
    * 同一查询拿到的新值）。⑥号帧发自己全部设备−源端，收到即代表别端读过，无需水位判断。
    */
   function handleImConvUnread(payload: any): void {
-    if (payload == null) {
+    if (!isChatCurrent() || payload == null) {
       return;
     }
     const obj = payload as UTSJSONObject;
@@ -5948,7 +6091,7 @@
   /** MSG_REACTION(3008)：reactions 全量快照就地替换目标行（增/删同推；操作端
    *  自己也收——REST 响应已替换过一次，重复替换幂等无害）。 */
   function handleImMessageReaction(payload: any): void {
-    if (payload == null) {
+    if (!isChatCurrent() || payload == null) {
       return;
     }
     const obj = payload as UTSJSONObject;
@@ -5960,7 +6103,7 @@
   }
 
   function handleImMessageRevoked(payload: any): void {
-    if (payload == null) {
+    if (!isChatCurrent() || payload == null) {
       return;
     }
     const obj = payload as UTSJSONObject;
@@ -5976,6 +6119,7 @@
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].msgId == msgId) {
+        rows[i].revisionAt = Math.max(rows[i].revisionAt, readNumber(obj, "revokeTime", 0));
         rows[i].revoked = true;
         rows[i].revokeById = revokeBy;
         rows[i].bodyText = "";
@@ -5985,7 +6129,7 @@
   }
 
   function handleImMessageEdited(payload: any): void {
-    if (payload == null) {
+    if (!isChatCurrent() || payload == null) {
       return;
     }
     const obj = payload as UTSJSONObject;
@@ -6000,12 +6144,15 @@
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].msgId == msgId) {
-        // 重建 row（参照 line 2487 的 editMsg 内部做法：readMsgRow 替换）
-        const raw = obj["raw"];
-        if (raw != null && typeof raw === "object") {
-          const edited = readMsgRow(raw as UTSJSONObject);
-          rows.splice(i, 1, edited);
-          messages.value = rows;
+        const row = rows[i];
+        const revision = readNumber(obj, "editTime", 0);
+        if (row.revoked || revision < row.revisionAt) return;
+        const bodyRaw = obj["body"];
+        if (bodyRaw != null) {
+          row.bodyText = readString(bodyRaw as UTSJSONObject, "text");
+          row.edited = true;
+          row.revisionAt = revision;
+          applyRichToRow(row);
         }
         return;
       }
@@ -6014,6 +6161,7 @@
 
   // ★App-Android(UTS→Kotlin) 裸函数引用传 eventBus.on 绑不上回调（订阅静默失效，
   // 聊天页不实时的直接原因；须箭头包装）；on/off 同一引用故存具名 const
+  const onImMessagesSynced = (payload: any): void => { handleImMessagesSynced(payload); };
   const onImMessageReceived = (payload: any): void => { handleImMessageReceived(payload); };
   const onImMessageRevoked = (payload: any): void => { handleImMessageRevoked(payload); };
   const onImMessageEdited = (payload: any): void => { handleImMessageEdited(payload); };
@@ -6026,6 +6174,7 @@
   async function loadMyInfo(): Promise<void> {
     try {
       const res = await apiUserInfo();
+      if (!isChatCurrent()) return;
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -6040,6 +6189,27 @@
     } catch (_error) {
       // 拉取失败时 myUserId 为空：全部按对方侧渲染，不影响收发
     }
+  }
+
+  const onImSessionCleared = (_payload: any): void => {
+    releaseChatImages();
+    messages.value = [];
+    readInfos.value = [];
+    deferredMediaIds.clear();
+    cancelSettle();
+    readStatusSeq += 1;
+  };
+
+  function clearChatUiTimers(): void {
+    cancelSettle();
+    if (readReportTimer != 0) clearTimeout(readReportTimer);
+    readReportTimer = 0;
+    if (chatScrollIdleTimer != 0) clearTimeout(chatScrollIdleTimer);
+    if (pressTouchTimer != 0) clearTimeout(pressTouchTimer);
+    if (pageTouchResetTimer != 0) clearTimeout(pageTouchResetTimer);
+    chatScrollIdleTimer = 0;
+    pressTouchTimer = 0;
+    pageTouchResetTimer = 0;
   }
 
   onLoad((options: any) => {
@@ -6079,7 +6249,9 @@
     uni.$on(IM_CHAT_JUMP_EVENT, onJumpEvent);
     // at-select 页 @成员选完：回填 "@token " 到输入框（可连选多个）
     uni.$on(IM_AT_PICK_EVENT, onAtPickEvent);
+    eventBus.on(IM_SESSION_CLEARED, onImSessionCleared);
     // 订阅 IM WS 实时下行事件（按 convId 过滤；消息去重+按 seq 插入由 handleImMessageReceived 处理）
+    eventBus.on(`${EVENT_TYPE.ImMessagesSynced}`, onImMessagesSynced);
     eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, onImMessageReceived);
     eventBus.on(`${EVENT_TYPE.ImMessageRevoked}`, onImMessageRevoked);
     eventBus.on(`${EVENT_TYPE.ImMessageEdited}`, onImMessageEdited);
@@ -6105,6 +6277,17 @@
   });
 
   onUnload(() => {
+    releasePrependAnchor();
+    clearChatUiTimers();
+    eventBus.off(IM_SESSION_CLEARED, onImSessionCleared);
+    pageDisposed = true;
+    releaseChatImages();
+    // onUnload 时原生退场动画可能仍在绘制本页；保留最后一帧数据，
+    // 随页面实例销毁回收，避免清空数组触发“暂无聊天消息”闪烁。
+    pageVisible = false;
+    readStatusSeq += 1;
+    cancelSettle();
+    deferredMediaIds.clear();
     // #ifndef H5 || WEB
     if (chatKeyboardListenerId != 0) {
       uni.offKeyboardHeightChange(chatKeyboardListenerId);
@@ -6137,6 +6320,7 @@
     uni.$off(IM_CHAT_JUMP_EVENT, onJumpEvent);
     uni.$off(IM_AT_PICK_EVENT, onAtPickEvent);
     // 注销 IM WS 事件订阅
+    eventBus.off(`${EVENT_TYPE.ImMessagesSynced}`, onImMessagesSynced);
     eventBus.off(`${EVENT_TYPE.ImMessageReceived}`, onImMessageReceived);
     eventBus.off(`${EVENT_TYPE.ImMessageRevoked}`, onImMessageRevoked);
     eventBus.off(`${EVENT_TYPE.ImMessageEdited}`, onImMessageEdited);
@@ -6159,6 +6343,12 @@
   let chatHasShownOnce = false;
   onShow(() => {
     pageVisible = true;
+    for (let i = 0; i < messages.value.length; i++) {
+      const row = messages.value[i];
+      if (deferredMediaIds.has(row.msgId)) resolveRowMedia(row);
+    }
+    if (deferredAnchor.length > 0) scrollToAnchorWithSettle(deferredAnchor);
+    reportReadIfNeeded(maxSeq());
     // Android：进子页返回的 show/hide 周期里原生 gravity 可能被重置回 top，
     // 未重新聚焦前 placeholder 会贴上沿，返回时兜底重设（textarea 卸载时内部自空返）
     centerAndroidInputGravity();
@@ -6193,12 +6383,23 @@
     }
     // 从 quote-detail 返回本页后再滚动定位并闪烁（延迟一拍等页面切换完成）
     setTimeout(() => {
+      if (!isChatActive()) return;
       applyPendingJump();
     }, 100);
   });
 
   onHide(() => {
+    releasePrependAnchor();
     pageVisible = false;
+    if (!listSettled.value && scrollAnchor.value.length > 0) deferredAnchor = scrollAnchor.value;
+    clearChatUiTimers();
+    cancelSettle();
+    readStatusSeq += 1;
+    if (readRefreshTimer != 0) {
+      clearTimeout(readRefreshTimer);
+      readRefreshTimer = 0;
+    }
+    readRefreshOwed = false;
     // 进子页/切后台停轮询：避免读到子页（如成员选择搜索框）的键盘高度误驱动本页让位
     stopAndroidImePolling();
     // 返回/进子页/切后台时记忆阅读位置（下次进页恢复）

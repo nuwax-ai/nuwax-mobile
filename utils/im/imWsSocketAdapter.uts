@@ -184,22 +184,13 @@ class UniSocketTaskAdapter implements ImWsSocketAdapter {
   private messageCb: ImWsOnMessage | null = null;
   private errorCb: ImWsOnError | null = null;
   private closeCb: ImWsOnClose | null = null;
+  private opened: boolean = false;
   private generation: number = 0;
   /** 当前 socketTask 对应的 generation，用于丢弃迟回调。 */
   private currentGeneration: number = 0;
 
   connect(url: string, headers: UTSJSONObject | null): void {
-    // 已有旧 socket → 先关
-    if (this.socketTask != null) {
-      const oldTask = this.socketTask;
-      this.socketTask = null;
-      try {
-        oldTask.close({ code: 1000, reason: "reconnect" });
-      } catch (_e) {
-        // ignore
-      }
-    }
-
+    this.close(true);
     // Bump generation 让所有旧的回调失效
     this.generation += 1;
     const gen = this.generation;
@@ -214,18 +205,24 @@ class UniSocketTaskAdapter implements ImWsSocketAdapter {
         if (gen !== this.currentGeneration) {
           return;
         }
-        this.socketTask = null;
+        this.close(true);
         if (this.errorCb != null) {
           this.errorCb(err.errMsg != null ? `${err.errMsg}` : "connect fail");
         }
       },
     });
+    // connectSocket.fail 也可能同步触发；不能把失败的 task 写回。
+    if (gen !== this.currentGeneration) {
+      task.close({ code: 1000, reason: "stale" });
+      return;
+    }
     this.socketTask = task;
 
     task.onOpen((): void => {
       if (gen !== this.currentGeneration || this.socketTask !== task) {
         return;
       }
+      this.opened = true;
       if (this.openCb != null) {
         this.openCb();
       }
@@ -249,7 +246,7 @@ class UniSocketTaskAdapter implements ImWsSocketAdapter {
       if (gen !== this.currentGeneration || this.socketTask !== task) {
         return;
       }
-      this.socketTask = null;
+      this.close(true);
       if (this.errorCb != null) {
         this.errorCb(err.errMsg != null ? `${err.errMsg}` : "ws error");
       }
@@ -261,6 +258,7 @@ class UniSocketTaskAdapter implements ImWsSocketAdapter {
         return;
       }
       this.socketTask = null;
+      this.opened = false;
       let code: number | null = null;
       let reason: string | null = null;
       if (res != null) {
@@ -294,11 +292,16 @@ class UniSocketTaskAdapter implements ImWsSocketAdapter {
 
   send(text: string): boolean {
     const task = this.socketTask;
-    if (task == null) {
+    if (task == null || !this.opened) {
       return false;
     }
+    const gen = this.currentGeneration;
     try {
-      task.send({ data: text });
+      task.send({ data: text, fail: (err): void => {
+        if (gen !== this.currentGeneration || this.socketTask !== task) return;
+        this.close(true);
+        if (this.errorCb != null) this.errorCb(`${err.errMsg}`);
+      } });
       return true;
     } catch (_e) {
       return false;
@@ -306,6 +309,9 @@ class UniSocketTaskAdapter implements ImWsSocketAdapter {
   }
 
   close(force?: boolean): void {
+    this.generation += 1;
+    this.currentGeneration = this.generation;
+    this.opened = false;
     const task = this.socketTask;
     this.socketTask = null;
     if (task == null) {
@@ -319,8 +325,6 @@ class UniSocketTaskAdapter implements ImWsSocketAdapter {
   }
 
   isOpen(): boolean {
-    // UTS 不暴露 SocketTask.readyState 字段类型，简化判定：socketTask 存在即视为 OPEN。
-    // 真实 OPEN/CLOSED 由 send() 失败 → reconnect 兜底（参见 imWsClient.sendPing）。
-    return this.socketTask != null;
+    return this.opened && this.socketTask != null;
   }
 }

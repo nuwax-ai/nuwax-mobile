@@ -1,3 +1,5 @@
+import { releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
 import { ref, type Ref } from "vue";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -55,6 +57,7 @@ export const imNoticeData: Ref<ImNoticeData> = ref(new ImNoticeData());
 export const imNoticeVisible: Ref<boolean> = ref(false);
 
 /** 自动消失定时器（UTS setTimeout 返回 number）。 */
+let noticeImageUrl = "";
 let hideTimerId: number | null = null;
 /** 防重复绑定（App 生命周期内只绑一次）。 */
 let noticeEventsBound = false;
@@ -65,6 +68,7 @@ let noticeEventsBound = false;
 let cachedMyUserId = "";
 /** 拉取 myUserId 时的 token 快照（换账号/重登后失效重拉）。 */
 let myUserIdToken = "";
+let myUserIdLoading = false;
 
 function currentToken(): string {
   const raw = uni.getStorageSync(ACCESS_TOKEN);
@@ -77,11 +81,12 @@ async function ensureMyUserId(): Promise<void> {
   if (cachedMyUserId.length > 0 && myUserIdToken == token) {
     return;
   }
-  if (token.length == 0) {
-    return;
-  }
+  if (token.length == 0 || myUserIdLoading) return;
+  const stamp = getImSessionStamp();
+  myUserIdLoading = true;
   try {
     const res = await apiUserInfo();
+    if (stamp != getImSessionStamp()) return;
     if (apiResCode(res) != SUCCESS_CODE) {
       return;
     }
@@ -93,7 +98,9 @@ async function ensureMyUserId(): Promise<void> {
       myUserIdToken = token;
     }
   } catch (_error) {
-    // 静默：myUserId 保持当前值（可能为空 → fail-closed 不弹）
+    // 静默：下次消息再试。
+  } finally {
+    myUserIdLoading = false;
   }
 }
 
@@ -146,8 +153,10 @@ async function refreshConvCache(): Promise<void> {
     return;
   }
   convCacheLoading = true;
+  const stamp = getImSessionStamp();
   try {
     const res = await apiImConversations("", CONV_CACHE_PAGE_SIZE);
+    if (stamp != getImSessionStamp()) return;
     if (apiResCode(res) == SUCCESS_CODE) {
       const dataRaw = apiResData<any>(res);
       const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -203,9 +212,8 @@ function lookupConvInfo(convId: string): ImNoticeConvInfo | null {
     convCacheAt == 0 ||
     convCacheToken != currentToken() ||
     Date.now() - convCacheAt >= CONV_CACHE_TTL_MS;
-  if (stale) {
-    refreshConvCache();
-  }
+  if (stale) refreshConvCache();
+  if (convCacheToken != currentToken()) return null;
   return convCache.get(convId);
 }
 
@@ -266,6 +274,7 @@ function handleNoticeMessage(payload: any): void {
   // 自己在其他端发的多端同步消息不弹；myUserId 未就绪时 fail-closed（拉取后下一条生效）
   const senderIdRaw = obj["senderId"];
   const senderId = senderIdRaw != null ? `${senderIdRaw}` : "";
+  if (myUserIdToken != currentToken()) cachedMyUserId = "";
   if (cachedMyUserId.length == 0 || senderId.length == 0) {
     ensureMyUserId();
     return;
@@ -316,17 +325,21 @@ function handleNoticeMessage(payload: any): void {
     digest = t("Mobile.Message.noticeFallbackDigest");
   }
   data.digest = digest;
+  releaseDisplayImageUrl(noticeImageUrl);
+  noticeImageUrl = "";
   imNoticeData.value = data;
   imNoticeVisible.value = true;
   resetHideTimer();
   // 头像异步解析（受保护 /api/f/ 与远程 SVG）：回来时仍是本条则整替为可展示地址
   if (data.avatar.length > 0) {
+    const stamp = getImSessionStamp();
     const msgId = data.msgId;
     const rawAvatar = data.avatar;
     resolveDisplayImageUrl(rawAvatar, NOTICE_AVATAR_RPX, NOTICE_AVATAR_RPX)
       .then((resolved: string): void => {
         const current = imNoticeData.value;
         if (
+          stamp == getImSessionStamp() &&
           resolved.length > 0 &&
           resolved != rawAvatar &&
           imNoticeVisible.value == true &&
@@ -340,7 +353,10 @@ function handleNoticeMessage(payload: any): void {
           updated.digest = current.digest;
           updated.msgId = current.msgId;
           updated.avatar = resolved;
+          noticeImageUrl = resolved;
           imNoticeData.value = updated;
+        } else {
+          releaseDisplayImageUrl(resolved);
         }
       })
       .catch((_e: any | null): void => {
@@ -387,4 +403,16 @@ export function bindImNoticeEvents(): void {
   eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, (event: any) => {
     handleNoticeMessage(event);
   });
+}
+
+export function clearImNoticeState(): void {
+  hideImNoticeBar();
+  releaseDisplayImageUrl(noticeImageUrl);
+  noticeImageUrl = "";
+  imNoticeData.value = new ImNoticeData();
+  cachedMyUserId = "";
+  myUserIdToken = "";
+  convCache.clear();
+  convCacheAt = 0;
+  convCacheToken = "";
 }

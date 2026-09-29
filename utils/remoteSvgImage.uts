@@ -1,3 +1,4 @@
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
 /**
  * 远程 SVG 在 App 端 <image> 的适配工具。
  *
@@ -51,6 +52,18 @@ const svgDataUrlCache = new Map<string, string>();
 const svgFailedCache = new Map<string, boolean>();
 /** 同一 URL 的在途下载：多行共用同一张图时只发一次请求 */
 const svgPendingRequests = new Map<string, Promise<string>>();
+const SVG_CACHE_LIMIT = 128;
+let svgCacheSession = "";
+function prepareSvgCache(): void {
+  const stamp = getImSessionStamp();
+  if (stamp != svgCacheSession || svgTextCache.size >= SVG_CACHE_LIMIT || svgDataUrlCache.size >= SVG_CACHE_LIMIT || svgFailedCache.size >= SVG_CACHE_LIMIT) {
+    svgTextCache.clear();
+    svgDataUrlCache.clear();
+    svgFailedCache.clear();
+    svgCacheSession = stamp;
+  }
+}
+
 
 /**
  * 并发闸门：长列表一次性解析上百个图标时，若全部并发发起请求会把网络队列打满，
@@ -166,8 +179,10 @@ function setSvgSize(svg: string, widthPx: number, heightPx: number): string {
 
 /** 受并发闸门约束的下载 */
 async function downloadSvgTextLimited(url: string, timeoutMs: number): Promise<string> {
+  const stamp = getImSessionStamp();
   await acquireSvgSlot();
   try {
+    if (stamp != getImSessionStamp()) throw new Error("image session changed");
     return await downloadSvgText(url, timeoutMs);
   } finally {
     releaseSvgSlot();
@@ -178,16 +193,20 @@ async function downloadSvgTextLimited(url: string, timeoutMs: number): Promise<s
 async function fetchSvgText(url: string, timeoutMs: number): Promise<string> {
   const cached = svgTextCache.get(url);
   if (cached != null && cached.length > 0) return cached;
-  const pending = svgPendingRequests.get(url);
+  const stamp = getImSessionStamp();
+  const pendingKey = `${stamp}|${url}`;
+  const pending = svgPendingRequests.get(pendingKey);
   if (pending != null) return await pending;
   const task = downloadSvgTextLimited(url, timeoutMs);
-  svgPendingRequests.set(url, task);
+  svgPendingRequests.set(pendingKey, task);
   try {
     const text = await task;
+    if (stamp != getImSessionStamp()) throw new Error("image session changed");
+    prepareSvgCache();
     svgTextCache.set(url, text);
     return text;
   } finally {
-    svgPendingRequests.delete(url);
+    svgPendingRequests.delete(pendingKey);
   }
 }
 // #endif
@@ -201,6 +220,7 @@ async function fetchSvgText(url: string, timeoutMs: number): Promise<string> {
  */
 export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx: number): Promise<string> {
   // #ifdef APP-ANDROID || APP-IOS
+  prepareSvgCache();
   if (url.length == 0) return url;
   // 非 SVG 资源（png/jpg/data URL 等）直接透传
   if (!isRemoteSvgUrl(url)) return url;
@@ -214,8 +234,11 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
   if (cached != null && cached.length > 0) return cached;
   // 之前已确认下载不到：直接回退，不再排队重试
   if (svgFailedCache.get(url) != null) return url;
+  const stamp = getImSessionStamp();
   try {
     const text = await fetchSvgText(url, 8000);
+    if (stamp != getImSessionStamp()) return url;
+    prepareSvgCache();
     let processed = stripPreamble(text);
     processed = moveDefsToFront(processed);
     processed = setSvgSize(processed, widthPx, heightPx);
@@ -224,7 +247,7 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
     return dataUrl;
   } catch (_e) {
     // 下载/处理失败回退原始 URL（仍按 App 默认行为渲染），并记入失败缓存避免重复重试
-    svgFailedCache.set(url, true);
+    if (stamp == getImSessionStamp()) svgFailedCache.set(url, true);
     return url;
   }
   // #endif

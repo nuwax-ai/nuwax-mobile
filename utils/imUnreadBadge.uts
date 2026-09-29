@@ -18,24 +18,11 @@ function imUnreadLog(msg: string): void {
   }
 }
 
-/** 常规轮询间隔（毫秒）。IM WebSocket 接入后可由 CONV_UNREAD 事件驱动替代轮询。 */
-const POLL_INTERVAL_MS = 60 * 1000;
-/** 服务端降级（authoritative=false）时的轮询间隔：文档要求此时降低轮询频率。 */
-const POLL_INTERVAL_DEGRADED_MS = 5 * 60 * 1000;
-
 /** IM 未读数响应式变量（角标数字 = total + dndTotal，对齐飞书口径），供 TabBar 徽标与消息页同步渲染。 */
 export const imUnreadCount: Ref<number> = ref<number>(0);
 
-/** 上次响应是否为服务端降级估算（决定下一次轮询间隔档位）。 */
-let lastResponseDegraded = false;
-
-/** 轮询代际号：stop 时自增使在途 tick 失效，避免 stop/start 竞态产生双定时链。 */
-let pollGeneration = 0;
-/** 轮询定时器（setTimeout 链，间隔随 authoritative 档位自适应）。 */
-let pollTimerId: number | null = null;
-
-/** TabBar 页面路由（与 pages.json tabBar.list 保持一致）。 */
-function isTabBarRoute(route: string): boolean {
+/** TabBar 页面路由（与 pages.json tabBar.list 保持一致；imNoticeBar 横幅 gate 复用）。 */
+export function isTabBarRoute(route: string): boolean {
   return (
     route == "pages/index/index" ||
     route == "pages/message/message" ||
@@ -114,7 +101,6 @@ export async function refreshImUnreadBadge(): Promise<void> {
   const token = tokenRaw != null ? `${tokenRaw}` : "";
   if (token.length == 0) {
     imUnreadCount.value = 0;
-    lastResponseDegraded = false;
     clearBadge();
     return;
   }
@@ -135,7 +121,7 @@ export async function refreshImUnreadBadge(): Promise<void> {
     const dndRaw = data["dndTotal"];
     const dndTotal = dndRaw != null ? parseInt(`${dndRaw}`) : 0;
     const authoritativeRaw = data["authoritative"];
-    lastResponseDegraded = authoritativeRaw != null && `${authoritativeRaw}` == "false";
+    const degraded = authoritativeRaw != null && `${authoritativeRaw}` == "false";
 
     let count = 0;
     if (!isNaN(total)) {
@@ -144,7 +130,7 @@ export async function refreshImUnreadBadge(): Promise<void> {
     if (!isNaN(dndTotal)) {
       count += dndTotal > 0 ? dndTotal : 0;
     }
-    imUnreadLog(`unread-total total=${total} dnd=${dndTotal} count=${count} degraded=${lastResponseDegraded}`);
+    imUnreadLog(`unread-total total=${total} dnd=${dndTotal} count=${count} degraded=${degraded}`);
     imUnreadCount.value = count;
     if (count <= 0) {
       clearBadge();
@@ -156,42 +142,9 @@ export async function refreshImUnreadBadge(): Promise<void> {
   }
 }
 
-/** 启动前台轮询（App onShow 后调用；onHide 时调用 stopImUnreadPolling）。 */
-export function startImUnreadPolling(): void {
-  stopImUnreadPolling();
-  pollGeneration++;
-  scheduleNextPoll(pollGeneration);
-}
-
-/** 停止轮询并清理定时器；在途请求返回后不会再排下一次。 */
-export function stopImUnreadPolling(): void {
-  pollGeneration++;
-  const timerId = pollTimerId;
-  if (timerId != null) {
-    clearTimeout(timerId);
-    pollTimerId = null;
-  }
-}
-
-/** setTimeout 轮询链：间隔随降级档位自适应；代际号失效（已 stop）则不再续排。 */
-function scheduleNextPoll(generation: number): void {
-  const interval = lastResponseDegraded ? POLL_INTERVAL_DEGRADED_MS : POLL_INTERVAL_MS;
-  pollTimerId = setTimeout(() => {
-    pollTick(generation);
-  }, interval);
-}
-
-async function pollTick(generation: number): Promise<void> {
-  await refreshImUnreadBadge();
-  if (generation == pollGeneration) {
-    scheduleNextPoll(generation);
-  }
-}
-
 /** 退出登录等场景立即清零徽标。 */
 export function clearImUnreadBadge(): void {
   imUnreadCount.value = 0;
-  lastResponseDegraded = false;
   clearBadge();
 }
 
@@ -203,9 +156,10 @@ let wsRefreshTimer: number | null = null;
 let wsEventsBound = false;
 
 /**
- * WS 帧 → 角标刷新（1.5s 去抖）：走全量 GET unread-total 而非本地 +1——
+ * WS 帧 → 角标刷新（1s 去抖）：走全量 GET unread-total 而非本地 +1——
  * 自己在其他端发的消息不计未读、免打扰部分走 dndTotal、已读边界随会话状态变，
  * 本地加必然算不准；全量拉一次永远与服务端口径一致，风暴期合并为一次请求。
+ * 无轮询：断线/重连窗口由回前台 onShow 全量拉一次兜底（App.uvue）。
  */
 function scheduleWsRefresh(): void {
   // 局部变量承接：可变模块属性无法 smart cast 到 Number（Kotlin 并发限制）
@@ -217,7 +171,7 @@ function scheduleWsRefresh(): void {
     wsRefreshTimer = null;
     imUnreadLog("ws 去抖到点 → 全量拉 unread-total");
     refreshImUnreadBadge();
-  }, 1500);
+  }, 1000);
 }
 
 /**
@@ -225,7 +179,6 @@ function scheduleWsRefresh(): void {
  * - im_message_received：来新消息（含自己在 PC 端发的多端同步帧）→ 稍后全量拉
  * - im_conversation_unread：CONV_UNREAD(6001) 是「自己其他端已读后」的红点同步帧
  *   （服务端 ImReadStateApplicationService ⑥，只发给自己其他端）→ 全量拉
- * 60s 轮询保留：WS 断线/重连期间仍有兜底。
  */
 export function bindImUnreadWsEvents(): void {
   if (wsEventsBound) {
@@ -235,11 +188,11 @@ export function bindImUnreadWsEvents(): void {
   // 零参函数直接当 EventCallback 传在 UTS→Kotlin 报 Unit≠EventCallback（error17），
   // 包箭头函数（同 App.uvue NewNotifyMessage 绑定写法）
   eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, (_event: any) => {
-    imUnreadLog("ws im_message_received → 1.5s 去抖");
+    imUnreadLog("ws im_message_received → 1s 去抖");
     scheduleWsRefresh();
   });
   eventBus.on(`${EVENT_TYPE.ImConversationUnread}`, (_event: any) => {
-    imUnreadLog("ws im_conversation_unread → 1.5s 去抖");
+    imUnreadLog("ws im_conversation_unread → 1s 去抖");
     scheduleWsRefresh();
   });
 }

@@ -3,20 +3,20 @@
  *
  * 路径中包含 `/repo/doc/` 或 `/repo/share/` 即视为资料库。
  * 移动端不按 PC 那样嵌 iframe、也不校验外链源站：一律改写成
- * 「当前请求域名 + 链接路径」，并带上只看正文的查询参数，再交给站内 webview 打开。
+ * 「当前请求域名 + 链接路径」，并带上 just_show_content、hide_sheet，再交给站内 webview 打开。
  */
 import { getApiBaseUrl } from "@/constants/config";
-import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+import { isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
 import {
   navigateToPageOnce,
-  navigateViaWebViewSdk,
   navigateViaWxMiniProgram,
+  postAppWebViewMessage,
 } from "@/utils/system.uts";
 
 /** 资料库路径：文档与分享都算资料库。 */
 const REPO_LIBRARY_PATHS: string[] = ["/repo/doc/", "/repo/share/"];
 
-/** 嵌入时只展示文档正文，并收起资料库侧栏表格。 */
+/** 只展示文档正文，并收起资料库侧栏。 */
 const REPO_DOC_EMBED_QUERY_KEYS: string[] = ["just_show_content", "hide_sheet"];
 
 const INNER_WEBVIEW_PAGE_PATH = "/subpackages/pages/webview/webview";
@@ -146,6 +146,7 @@ function upsertQueryParam(query: string, key: string, value: string): string {
 
 /**
  * 把资料库链接解析成可打开的绝对地址。
+ * 只追加 just_show_content、hide_sheet，不追加登录票据。
  * @param href 锚点上的原始地址，可以是相对路径或绝对 URL
  * @returns `{请求域名}{路径}?just_show_content=true&hide_sheet=true`；不是资料库链接时返回空串
  */
@@ -227,40 +228,72 @@ function openRepoAsTopLevel(target: string): boolean {
 }
 
 /**
- * 打开资料库链接：站内 webview 加载解析后的绝对地址。
- * App / 小程序由 webview 页补 `_ticket`；不是资料库链接时返回 false，调用方继续走普通外链。
- * 浏览器里若资料库域名和当前页不同源，改为新开顶层页，避免 iframe 跨域读取父窗口。
+ * 资料库预览页路由。noTicket=1 让预览页按原地址加载，不再补 _ticket。
  */
-export function openRepoLibraryPreview(href: string, title: string = ""): boolean {
-  const target = resolveRepoLibraryPreviewUrl(href);
-  if (target.length == 0) {
-    return false;
-  }
-  if (shouldOpenRepoAsTopLevel(target)) {
-    return openRepoAsTopLevel(target);
-  }
-  // iOS 内嵌页 uni.webView.navigateTo 会先 decodeURI 整段路由。
-  // 只编码一次时，%3F / %26 会被还原成 ? / &，资料库地址被拆碎，
-  // web-view 实际打开应用首页，标题参数仍能留下。编码两次，解码一次后仍是完整地址。
-  const encodedOnce = encodeURIComponent(target);
-  const onceText = encodedOnce != null ? encodedOnce : "";
-  const encodedTwice = onceText.length > 0 ? encodeURIComponent(onceText) : "";
-  const encodedUrl = encodedTwice != null ? encodedTwice : "";
+function buildRepoWebviewPageUrl(target: string, title: string): string {
+  const encoded = encodeURIComponent(target);
+  const encodedUrl = encoded != null ? encoded : "";
   if (encodedUrl.length == 0) {
-    return false;
+    return "";
   }
-  let pageUrl = `${INNER_WEBVIEW_PAGE_PATH}?url=${encodedUrl}`;
+  let pageUrl = `${INNER_WEBVIEW_PAGE_PATH}?url=${encodedUrl}&noTicket=1`;
   if (title.length > 0) {
     const encodedTitle = encodeURIComponent(title);
     if (encodedTitle != null && encodedTitle.length > 0) {
       pageUrl = `${pageUrl}&title=${encodedTitle}`;
     }
   }
-  if (isAppWebViewEmbedded() == true && navigateViaWebViewSdk(pageUrl)) {
-    return true;
+  return pageUrl;
+}
+
+/**
+ * 原生侧打开资料库预览页。地址已是完整 https，直接作为 web-view 的 src。
+ */
+export function openNativeRepoLibraryPage(target: string, title: string = ""): boolean {
+  if (target.indexOf("http://") != 0 && target.indexOf("https://") != 0) {
+    return false;
+  }
+  const pageUrl = buildRepoWebviewPageUrl(target, title);
+  if (pageUrl.length == 0) {
+    return false;
+  }
+  return navigateToPageOnce(pageUrl);
+}
+
+/**
+ * 打开资料库链接。
+ * App 内嵌 H5（含本地包）只 postMessage，由原生打开 webview 预览页。
+ * 浏览器里若资料库域名和当前页不同源，改为新开顶层页。
+ */
+export function openRepoLibraryPreview(href: string, title: string = ""): boolean {
+  const target = resolveRepoLibraryPreviewUrl(href);
+  const embedded = isAppWebViewEmbedded();
+  const host = readAppWebViewHostPlatform();
+  console.log(`[repo-link] click href=${href} target=${target} embedded=${embedded} host=${host}`);
+  if (target.length == 0) {
+    console.log("[repo-link] skip: not a repo url");
+    return false;
+  }
+  if (embedded == true) {
+    const payload = {} as UTSJSONObject;
+    payload["type"] = "app-open-repo-link";
+    payload["url"] = target;
+    if (title.length > 0) {
+      payload["title"] = title;
+    }
+    const posted = postAppWebViewMessage(payload);
+    console.log(`[repo-link] postMessage=${posted} url=${target}`);
+    return posted;
+  }
+  if (shouldOpenRepoAsTopLevel(target)) {
+    return openRepoAsTopLevel(target);
+  }
+  const pageUrl = buildRepoWebviewPageUrl(target, title);
+  if (pageUrl.length == 0) {
+    return false;
   }
   if (navigateViaWxMiniProgram(pageUrl)) {
     return true;
   }
-  return navigateToPageOnce(pageUrl);
+  return openNativeRepoLibraryPage(target, title);
 }

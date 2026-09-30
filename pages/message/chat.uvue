@@ -2072,6 +2072,87 @@
     return out;
   }
 
+  /** 裸链接字符口径：ASCII 可见字符，排除空白/引号/尖括号/反引号/花括号/竖线/反斜杠/脱字符，>0x7f（CJK/emoji）截断。 */
+  function isBareUrlChar(code: number | null): boolean {
+    if (code == null || code <= 0x20 || code >= 0x7f) {
+      return false;
+    }
+    if (code == 0x22 || code == 0x3c || code == 0x60 || code == 0x7b ||
+        code == 0x7d || code == 0x7c || code == 0x5c || code == 0x5e) {
+      return false;
+    }
+    return true;
+  }
+
+  /** 常见 HTML 实体还原（后端 body 里的 URL 常被转义成 &amp; 等，直接打开会 403/404）。 */
+  function unescapeHtmlEntities(s: string): string {
+    if (s.indexOf("&") < 0) {
+      return s;
+    }
+    let out = s.split("&amp;").join("&");
+    out = out.split("&lt;").join("<");
+    out = out.split("&gt;").join(">");
+    out = out.split("&quot;").join("\"");
+    out = out.split("&#39;").join("'");
+    return out;
+  }
+
+  /**
+   * 裸超链接拆分：正文中无 [标题](url) 包装的 http(s):// 完整地址整段按链接渲染
+   * （text=url=还原实体后的地址）。从协议头起吃 URL 字符，遇空白/CJK/引尖括号截断；
+   * 末尾孤立标点（.,;:!?)]}'"）回退给正文；协议头后无主机字符不算链接。
+   */
+  function splitBareUrls(text: string): ImSeg[] {
+    const out: ImSeg[] = [];
+    let plainStart = 0;
+    let i = 0;
+    while (i < text.length) {
+      const httpAt = text.indexOf("http://", i);
+      const httpsAt = text.indexOf("https://", i);
+      let start = -1;
+      if (httpAt >= 0 && (httpsAt < 0 || httpAt <= httpsAt)) {
+        start = httpAt;
+      } else if (httpsAt >= 0) {
+        start = httpsAt;
+      }
+      if (start < 0) {
+        break;
+      }
+      const protoLen = text.charAt(start + 4) == "s" ? 8 : 7;
+      let end = start;
+      while (end < text.length) {
+        if (!isBareUrlChar(text.charCodeAt(end))) {
+          break;
+        }
+        end++;
+      }
+      while (end > start + protoLen) {
+        const tail = text.charAt(end - 1);
+        if (tail == "." || tail == "," || tail == ";" || tail == ":" || tail == "!" ||
+            tail == "?" || tail == ")" || tail == "]" || tail == "}" || tail == "'" || tail == "\"") {
+          end--;
+        } else {
+          break;
+        }
+      }
+      if (end <= start + protoLen) {
+        i = start + 1;
+        continue;
+      }
+      pushSeg(out, text.substring(plainStart, start), false, false, false, false, false, false);
+      const clean = unescapeHtmlEntities(text.substring(start, end));
+      const linkSeg = new ImSeg();
+      linkSeg.text = clean;
+      linkSeg.link = true;
+      linkSeg.url = clean;
+      out.push(linkSeg);
+      i = end;
+      plainStart = i;
+    }
+    pushSeg(out, text.substring(plainStart), false, false, false, false, false, false);
+    return out;
+  }
+
   /**
    * 提及拆分 + 行内解析：先扫 "@token"（连续非空白非@字符，≤32，同 PC MENTION_RE 口径），
    * 命中已知成员/@所有人 的整段高亮（段内不再解析标记）；其余段交 parseInline。
@@ -2115,7 +2196,8 @@
     }
   }
 
-  /** 行内段总入口：先拆 [标题](url) 链接段（整段按链接渲染），其余文本走 提及+行内标记 管线。 */
+  /** 行内段总入口：先拆 [标题](url) 链接段，再拆裸 http(s) 链接段（整段按链接渲染），
+      其余文本走 提及+行内标记 管线。 */
   function parseSegs(text: string): ImSeg[] {
     const out: ImSeg[] = [];
     const chunks = splitLinkSegs(text);
@@ -2123,8 +2205,16 @@
       const chunk = chunks[k];
       if (chunk.link) {
         out.push(chunk);
-      } else {
-        parseSegsInto(chunk.text, out);
+        continue;
+      }
+      const bareChunks = splitBareUrls(chunk.text);
+      for (let m = 0; m < bareChunks.length; m++) {
+        const bare = bareChunks[m];
+        if (bare.link) {
+          out.push(bare);
+        } else {
+          parseSegsInto(bare.text, out);
+        }
       }
     }
     return out;
@@ -2250,7 +2340,10 @@
       text.indexOf("<u>") >= 0 ||
       text.indexOf("```") >= 0 ||
       // markdown 链接 [标题](url)："](" 是其必要特征（命中后 splitLinkSegs 再严格校验）
-      text.indexOf("](") >= 0
+      text.indexOf("](") >= 0 ||
+      // 裸超链接：http(s):// 完整地址（splitBareUrls 再严格校验，AI 回复常直接贴地址）
+      text.indexOf("http://") >= 0 ||
+      text.indexOf("https://") >= 0
     ) {
       return true;
     }
@@ -4613,6 +4706,8 @@
   function handleSegTap(msg: ImMsgRow, sg: ImSeg): void {
     if (sg.link && sg.url.length > 0) {
       let url = sg.url;
+      // 后端下发的链接可能带 HTML 实体（&amp; 等）：还原后才是真实地址，否则 403/404
+      url = unescapeHtmlEntities(url);
       // 站内相对路径（系统通知的 /home/... 链接）：web-view/外链页只认完整地址，
       // 点击时补域名（与卡片 actionUrl 同款补全；PC 端也是渲染时才补域名）
       const base = getApiBaseUrl();

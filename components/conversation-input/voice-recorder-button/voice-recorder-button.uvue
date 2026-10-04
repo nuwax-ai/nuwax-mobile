@@ -45,8 +45,11 @@
   import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
   import { pageSystemOverlay } from "@/utils/pageSystemOverlay.uts";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
+  // #ifdef APP
+  import { StreamPcmRecorder } from '@/uni_modules/nuwax-stream-pcm-player'
+  // #endif
   // #ifdef APP-HARMONY
-  import { StreamPcmRecorder, openHarmonyMicPermissionSettings } from '@/uni_modules/nuwax-stream-pcm-player'
+  import { openHarmonyMicPermissionSettings } from '@/uni_modules/nuwax-stream-pcm-player'
   // #endif
   // #ifdef APP
   import { speechSocketWarmup } from "@/utils/voice/speechSocketWarmup";
@@ -55,6 +58,7 @@
     ASR_SAMPLE_RATE,
   } from "@/utils/voice/asrWebSocketClient";
   import { streamLocalAudioFileToAsr } from "@/utils/voice/pcmStreamRecorder";
+  import { NativeStreamAsrPipeline } from "@/utils/voice/nativeStreamAsrPipeline";
   // #endif
   // TTS 打断 / 手势解锁：App 与 H5 共用
   import { ttsWebSocketPlayer } from "@/utils/voice/ttsWebSocketPlayer";
@@ -77,6 +81,10 @@
     isConversationActive?: boolean
     /** 是否启用实时 WebSocket ASR（仅 App 原生录音路径使用；App web-view 内嵌页为 true） */
     enableAsr?: boolean
+    /** 实时推流 ASR（边说边传）：按住期间 VAD 开口即 begin、PCM 实时上传，
+     *  松手只冲刷尾包 + finish，不做松手后整文件重推/文件兜底。
+     *  仅 App 原生页生效（需 StreamPcmRecorder 逐帧回调）；H5/小程序/原生桥内嵌页忽略 */
+    liveAsr?: boolean
     /** 是否 App web-view 内嵌页（isAppWebView）：录音 / 转写走原生桥（postMessage + evalJS） */
     nativeBridge?: boolean
   }
@@ -111,6 +119,22 @@
     }
     // #endif
     return false;
+  }
+
+  /** liveAsr 缺省关闭；仅 App 原生页（非内嵌桥）生效 */
+  function isLiveAsrMode(): boolean {
+    if (props.liveAsr != true) {
+      return false;
+    }
+    if (isNativeBridge() == true) {
+      return false;
+    }
+    // #ifdef APP
+    return true;
+    // #endif
+    // #ifndef APP
+    return false;
+    // #endif
   }
 
   /**
@@ -275,6 +299,30 @@
   let asrWaitingResult: boolean = false
   /** 轻触取消 / abort 后：忽略迟到的 ASR onError（避免 asr_error toast） */
   let suppressAsrError: boolean = false
+  /** liveAsr：VAD 开口回调延迟绑定（规避 UTS 先声明后使用，resident-chat-shell 同款手法） */
+  let streamOnSpeechStart: (() => void) | null = null
+  /** liveAsr：实时推流管道（边说边传：VAD + 预滚 + pre-ready 暂存 + 窗口化发送） */
+  let streamPipeline: NativeStreamAsrPipeline | null = new NativeStreamAsrPipeline(
+    (frame: ArrayBuffer): Promise<boolean> => {
+      return asrWebSocketClient.sendPcmAsync(frame)
+    },
+    (): void => {
+      const h = streamOnSpeechStart
+      if (h != null) {
+        h()
+      }
+    },
+  )
+  /** liveAsr：实时录音器（三端统一 StreamPcmRecorder，取逐帧 onFrame） */
+  let streamPcmRecorder: StreamPcmRecorder | null = null
+  /** liveAsr：本轮按住 VAD 已开口（松手时区分「没说话」与「链路中途失败」） */
+  let streamVadFired: boolean = false
+  /** liveAsr：asr_ready 已达（管道已转实时发送） */
+  let streamReadyReached: boolean = false
+  /** liveAsr：松手时 ready 未达，等 asr_ready 到达后再冲刷 + finish */
+  let streamFlushAfterReady: boolean = false
+  /** liveAsr：按住中 ASR 出错的最后错误（松手收尾时提示用） */
+  let streamLastAsrError: string = ""
   // #endif
   // 音频上传服务
   let audioUploadService: AudioUploader | null = null
@@ -313,6 +361,15 @@
       nativeVoiceBridge.stopRecord()
       return
     }
+    // #ifdef APP
+    // liveAsr：实时录音器收尾（尾帧在 onStop 前经 onFrame 送入管道）
+    if (isLiveAsrMode() == true) {
+      if (streamPcmRecorder != null) {
+        streamPcmRecorder!.stop()
+      }
+      return
+    }
+    // #endif
     // #ifdef APP-HARMONY
     if (harmonyPcmRecorder != null) {
       harmonyPcmRecorder!.stop()
@@ -338,6 +395,25 @@
       nativeVoiceBridge.startRecord()
       return
     }
+    // #ifdef APP
+    // liveAsr：StreamPcmRecorder 逐帧回调（iOS 包装层忽略 options，固定 16k mono PCM16）
+    if (isLiveAsrMode() == true) {
+      if (streamPcmRecorder == null) {
+        console.error("[VoiceRecord] StreamPcmRecorder is null")
+        return
+      }
+      console.log("[VoiceRecord] start via StreamPcmRecorder (live)")
+      // #ifdef APP-IOS
+      // iOS 桥对 RecorderManagerStartOptions 对象参数跨桥不可靠（恒报 method call failed），
+      // 传 null：Swift start() 固定 16k mono PCM16 / 600s，与聊天页参数一致（resident 同款）
+      streamPcmRecorder!.start(null)
+      // #endif
+      // #ifndef APP-IOS
+      streamPcmRecorder!.start(buildNativeRecorderStartOptions())
+      // #endif
+      return
+    }
+    // #endif
     // #ifdef APP-HARMONY
     if (harmonyPcmRecorder != null) {
       console.log("[VoiceRecord] start via StreamPcmRecorder")
@@ -425,6 +501,19 @@
     asrSessionActive = false
     asrWaitingResult = false
     asrWebSocketClient.abort()
+    // liveAsr：连带复位推流管道与会话标记（防迟到帧 / 开口回调污染下一轮）
+    streamVadFired = false
+    streamReadyReached = false
+    streamFlushAfterReady = false
+    streamLastAsrError = ""
+    const discardPipe = streamPipeline
+    if (discardPipe != null) {
+      try {
+        discardPipe.reset()
+      } catch (_ePipeDiscard) {
+        // ignore
+      }
+    }
     // #endif
   }
 
@@ -617,7 +706,7 @@
   }
 
   // 录音错误
-  function handleRecordError(err: any) {
+  function handleRecordError(err: any | null) {
     // APP 原生回调也可能直接传 java.lang.Exception，不能强转 CreateHubRecorderManagerFail。
     let rawError = "";
     try {
@@ -635,6 +724,18 @@
     asrWebSocketClient.abort()
     asrSessionActive = false
     asrWaitingResult = false
+    // liveAsr：录音底层失败，推流管道一并复位（防迟到帧污染后续会话）
+    streamVadFired = false
+    streamReadyReached = false
+    streamFlushAfterReady = false
+    const errPipe = streamPipeline
+    if (errPipe != null) {
+      try {
+        errPipe.reset()
+      } catch (_ePipeErr) {
+        // ignore
+      }
+    }
     // #endif
     // 短按 / 竞态 stop：静默复位，避免「Other errors」打扰
     if (
@@ -657,6 +758,19 @@
   function handleAsrResult(text: string, ok: boolean, errorMessage: string): void {
     asrSessionActive = false
     asrWaitingResult = false
+    // liveAsr：结果到达即关会话，推流管道复位（停掉 sender 定时器；legacy 路径管道空转，无副作用）
+    streamVadFired = false
+    streamReadyReached = false
+    streamFlushAfterReady = false
+    streamLastAsrError = ""
+    const resultPipe = streamPipeline
+    if (resultPipe != null) {
+      try {
+        resultPipe.reset()
+      } catch (_ePipeResult) {
+        // ignore
+      }
+    }
     if (suppressAsrError == true || ignoreNextStopResult == true) {
       suppressAsrError = false
       ensureIdlePaint()
@@ -794,6 +908,198 @@
       },
     )
     // ready 超时在松手后启动（按下预热阶段不挂，避免长按误伤）
+    asrWebSocketClient.watchReadyAfterStop()
+  }
+
+  // ===== liveAsr 实时推流（聊天页边说边传）：不做文件兜底，链路异常按已收部分识别或报错 =====
+
+  /** 复位 liveAsr 会话标记 + 推流管道（新一轮按住 / 松手收尾 / 作废时） */
+  function resetStreamSessionFlags(): void {
+    streamVadFired = false
+    streamReadyReached = false
+    streamFlushAfterReady = false
+    streamLastAsrError = ""
+    const pipe = streamPipeline
+    if (pipe != null) {
+      try {
+        pipe.reset()
+      } catch (_ePipeReset) {
+        // ignore
+      }
+    }
+  }
+
+  /** 实时 PCM 帧（主线程逐帧回调）：喂推流管道（VAD + 预滚 + packetizer） */
+  function handleStreamFrame(chunk: ArrayBuffer): void {
+    const pipe = streamPipeline
+    if (pipe == null) {
+      return
+    }
+    try {
+      pipe.feed(chunk)
+    } catch (_eFeed) {
+      // ignore
+    }
+  }
+
+  /** 冲刷剩余待发字节 → finish（stop）→ 等 asr_result；不做文件兜底重推 */
+  function flushStreamThenFinish(): void {
+    if (asrSessionActive != true) {
+      return
+    }
+    const pipe = streamPipeline
+    if (pipe == null) {
+      // 管道缺失（理论不可达）：直接 finish 让服务端出结果
+      asrWaitingResult = true
+      setTimeout((): void => {
+        if (asrSessionActive == true) {
+          asrWebSocketClient.finish()
+        }
+      }, 40)
+      return
+    }
+    try {
+      pipe.flushPending((): void => {
+        if (asrSessionActive != true) {
+          return
+        }
+        asrWaitingResult = true
+        // 略延后 stop，给底层 WS 刷新 binary 的时间
+        setTimeout((): void => {
+          if (asrSessionActive == true) {
+            asrWebSocketClient.finish()
+          }
+        }, 40)
+      })
+    } catch (_eFlush) {
+      // flush 异常：不重推文件，直接 finish 取服务端已收部分的结果
+      asrWaitingResult = true
+      setTimeout((): void => {
+        if (asrSessionActive == true) {
+          asrWebSocketClient.finish()
+        }
+      }, 40)
+    }
+  }
+
+  /** asr_ready：管道转实时发送（先推预滚 + pre-ready 队列）；若松手时 ready 未达，此刻补冲刷 + finish */
+  function handleStreamAsrReady(): void {
+    if (asrSessionActive != true) {
+      return
+    }
+    streamReadyReached = true
+    const pipe = streamPipeline
+    if (pipe != null) {
+      try {
+        pipe.onReady()
+      } catch (_eReady) {
+        // ignore
+      }
+    }
+    if (streamFlushAfterReady == true) {
+      streamFlushAfterReady = false
+      flushStreamThenFinish()
+    }
+  }
+
+  /**
+   * liveAsr ASR 出错：
+   * - 按住中：不打断录音 UI、不重推文件；记住错误等松手提示（管道不 reset，
+   *   避免 VAD 重新开口 → 反复建连失败的循环）
+   * - 已松手（识别中）：复位并提示
+   */
+  function handleStreamAsrError(message: string): void {
+    asrSessionActive = false
+    asrWaitingResult = false
+    streamReadyReached = false
+    streamFlushAfterReady = false
+    streamLastAsrError = message
+    if (currentState.value == "recording" || isTapped.value == true) {
+      console.warn("[ASR-live] chat 按住中 ASR 出错（松手时提示）: " + message)
+      return
+    }
+    if (
+      suppressAsrError == true ||
+      ignoreNextStopResult == true ||
+      holdDurationMs() < MIN_HOLD_MS
+    ) {
+      ensureIdlePaint()
+      return
+    }
+    hideConnectingLoading()
+    resetState()
+    emit(
+      "onError",
+      new Error(
+        readableSpeechError(message.length > 0 ? message : t("Mobile.Voice.recordFailed")),
+      ),
+    )
+  }
+
+  /**
+   * liveAsr 松手收尾（onStop 后）：音频已边说边传，忽略本地录音文件。
+   * - 无会话：VAD 未开口 → 「未检测到语音」；会话中途失败 → 提示记住的错误
+   * - 已 ready：冲刷尾包 + finish；未 ready：等 asr_ready 到达再冲刷（ready 看门狗兜底超时）
+   */
+  function handleStreamRecordStop(): void {
+    if (asrSessionActive != true) {
+      hideConnectingLoading()
+      const vadFired = streamVadFired
+      const lastErr = streamLastAsrError
+      resetState()
+      resetStreamSessionFlags()
+      emit(
+        "onError",
+        new Error(
+          vadFired == true
+            ? readableSpeechError(lastErr.length > 0 ? lastErr : t("Mobile.AgentDetail.recognizeFailed"))
+            : t("Mobile.Voice.noSpeechDetected"),
+        ),
+      )
+      return
+    }
+    const pipe = streamPipeline
+    if (pipe != null && (pipe.isTruncated() == true || pipe.isPushFailed() == true)) {
+      console.warn("[ASR-live] chat 松手：实时链路丢帧/发送失败，按服务端已收部分识别（无文件兜底）")
+    }
+    if (streamReadyReached == true) {
+      // 略延迟冲刷：iOS 的 StreamPcmRecorder 在 stop() 内先同步投递 onStop、再补拉尾帧，
+      // 立刻 flush 会在尾帧进管道前就收尾（丢尾字）；Android 无此问题，60ms 代价可忽略
+      setTimeout((): void => {
+        if (asrSessionActive != true) {
+          return
+        }
+        flushStreamThenFinish()
+      }, 60)
+      return
+    }
+    // ready 未达（开口晚/建连慢）：等 asr_ready 后由 handleStreamAsrReady 补冲刷；
+    // 迟迟不到则 begin 时挂的 ready 看门狗（15s）走 error 复位
+    streamFlushAfterReady = true
+  }
+
+  /** VAD 开口（按住中）：begin → asr_ready → 边说边传（消除「按住空等被服务端截断」） */
+  function beginStreamAsrSession(): void {
+    if (asrSessionActive == true || ignoreNextStopResult == true) {
+      return
+    }
+    console.log("[ASR-live] chat VAD 开口，按住中 begin")
+    asrSessionActive = true
+    asrWaitingResult = false
+    streamVadFired = true
+    streamReadyReached = false
+    streamFlushAfterReady = false
+    asrWebSocketClient.begin(
+      (): void => {
+        handleStreamAsrReady()
+      },
+      (text: string, ok: boolean, errorMessage: string): void => {
+        handleAsrResult(text, ok, errorMessage)
+      },
+      (message: string): void => {
+        handleStreamAsrError(message)
+      },
+    )
     asrWebSocketClient.watchReadyAfterStop()
   }
   // #endif
@@ -1053,6 +1359,31 @@
     }
     if (authSetting.microphoneAuthorized == "denied") {
       return false;
+    }
+    // liveAsr：AVAudioEngine 不会在 start 时自动弹授权窗，须显式请求并等用户应答
+    const liveRec = streamPcmRecorder;
+    if (isLiveAsrMode() == true && liveRec != null) {
+      pageSystemOverlay.begin("ios.recordPermission", true);
+      liveRec.requestRecordPermission();
+      return await new Promise<boolean>((resolve) => {
+        let pollTimer = 0;
+        pollTimer = setInterval((): void => {
+          if (liveRec.permissionResolved()) {
+            clearInterval(pollTimer);
+            pollTimer = 0;
+            pageSystemOverlay.end();
+            resolve(liveRec.permissionGranted());
+          }
+        }, 50) as number;
+        setTimeout((): void => {
+          if (pollTimer != 0) {
+            clearInterval(pollTimer);
+            pollTimer = 0;
+            pageSystemOverlay.end();
+            resolve(false);
+          }
+        }, 60000) as number;
+      });
     }
     // not determined：start 时系统才弹窗，可能触发 onHide。
     // endOnNextShow 兜底；无 hide 的应用内弹窗则在 onStart/onError 里 end。
@@ -1342,6 +1673,11 @@
     // #ifdef APP
     speechSocketWarmup.preheatTtsForRecording()
     preheatAppAsrConnect()
+    // liveAsr：新一轮实时会话——重置推流管道 + 绑定 VAD 开口回调（开口 → 按住中 begin）
+    if (isLiveAsrMode() == true) {
+      resetStreamSessionFlags()
+      streamOnSpeechStart = beginStreamAsrSession
+    }
     // #endif
     emit('onRecordStart')
   }
@@ -1455,6 +1791,15 @@
       silentDismiss()
       return
     }
+
+    // #ifdef APP
+    // liveAsr：音频已边说边传，忽略本地录音文件（不做文件兜底）——冲刷尾包 + finish
+    if (isLiveAsrMode() == true) {
+      handleStreamRecordStop()
+      return
+    }
+    // #endif
+
     let rawStopResult = ""
     try {
       rawStopResult = JSON.stringify(res) ?? ""
@@ -1578,6 +1923,15 @@
       harmonyPcmRecorder!.onError(null)
     }
     // #endif
+    // #ifdef APP
+    // liveAsr：切断 StreamPcmRecorder 回调（防单例/实例持有已销毁组件闭包）
+    if (streamPcmRecorder != null) {
+      streamPcmRecorder!.onStart(null)
+      streamPcmRecorder!.onStop(null)
+      streamPcmRecorder!.onError(null)
+      streamPcmRecorder!.onFrame(null)
+    }
+    // #endif
     // #ifndef H5
     if (nativeRecorderManager != null) {
       // uni.getRecorderManager() 是进程级单例，onStart 等为单字段 setter 语义
@@ -1605,6 +1959,27 @@
       bindRecorderEvents()
       return
     }
+    // #ifdef APP
+    // liveAsr：三端统一 StreamPcmRecorder（需逐帧 onFrame 边说边传），
+    // 不再创建 uni.getRecorderManager / 鸿蒙 AudioCapturer 分支
+    if (isLiveAsrMode() == true) {
+      streamPcmRecorder = new StreamPcmRecorder()
+      streamPcmRecorder!.onStart((res: UTSJSONObject | null): void => {
+        handleRecordStart(res)
+      })
+      streamPcmRecorder!.onStop((res: UTSJSONObject | null): void => {
+        handleRecordStop(res)
+      })
+      streamPcmRecorder!.onError((err: UTSJSONObject | null): void => {
+        handleRecordError(err)
+      })
+      streamPcmRecorder!.onFrame((chunk: ArrayBuffer): void => {
+        handleStreamFrame(chunk)
+      })
+      audioUploadService = createAudioUploader()
+      return
+    }
+    // #endif
     // #ifdef H5 || WEB
     h5RecorderManager = jzRecorder.getRecorderManager()
     // #endif
@@ -1651,6 +2026,17 @@
         // ignore
       }
       harmonyPcmRecorder = null
+    }
+    // #endif
+    // #ifdef APP
+    // liveAsr：释放实时录音器（后台线程唤醒并 join）
+    if (streamPcmRecorder != null) {
+      try {
+        streamPcmRecorder!.releaseRecorder()
+      } catch (_eStreamRelease) {
+        // ignore
+      }
+      streamPcmRecorder = null
     }
     // #endif
     // #ifndef H5

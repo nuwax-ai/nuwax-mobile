@@ -596,6 +596,8 @@
             :enable-asr="true"
             :live-asr="true"
             @onRecordStop="handleVoiceStop"
+            @onLiveProcessing="handleVoiceProcessing"
+            @onLiveResult="handleVoiceLiveResult"
             @onError="handleVoiceError"
             @onVisualActive="handleVoiceVisualActive"
             @onCancelZoneChange="handleVoiceCancelZone"
@@ -1189,27 +1191,87 @@
       </view>
     </view>
 
-    <!-- 按住说话动态浮层（任务页 conversation-input record-overlay 同款）：贴底蓝渐变 +
-         包络波形跳动，上滑取消区转红换文案。常驻 DOM 用 opacity 切换（按住中 v-if 插入
-         节点会把鸿蒙手势打成 touchcancel）；pointer-events:none 不拦截触摸，按住手势
-         全程仍落在其下的录音按钮上（按钮交互/样式不变） -->
+    <!-- 按住说话全屏蒙层（liveAsr 三阶段）：按住中=顶部状态气泡+波形（不拦截触摸，
+         手势全程落在其下的录音按钮上，鸿蒙 v-if 插节点会打手势的教训保持常驻 DOM）；
+         松手识别中=气泡「语音识别中」；识别完成=中部可编辑卡片 + 底部 取消/仅发语音/确认
+         （后两态拦截触摸）。实时逐字文案需 vox-server 下发 asr_partial（现协议仅 stop 后
+         一次 asr_result，docs/integration/app-asr-tts.md），当前按住中显示状态提示，
+         识别完成文本落入编辑卡，后端支持后气泡直接接逐字文本 -->
     <view
-      class="chat-record-overlay"
+      class="chat-voice-mask"
       :class="{
-        'chat-record-overlay--on': isRecording,
-        'chat-record-overlay--cancel': recordWillCancel,
+        'chat-voice-mask--on': voiceStage != 'idle',
+        'chat-voice-mask--cancel': recordWillCancel && voiceStage == 'recording',
+        'chat-voice-mask--interactive': voiceStage == 'processing' || voiceStage == 'editing',
       }"
     >
-      <text class="chat-record-overlay__hint">{{ recordOverlayHint }}</text>
-      <view class="chat-record-overlay__wave">
-        <view class="chat-record-overlay__baseline" />
-        <view class="chat-record-overlay__bars">
-          <view
-            v-for="(bar, index) in waveformBars"
-            :key="index"
-            class="chat-record-overlay__bar"
-            :style="{ height: `${bar.height}px` }"
-          />
+      <!-- 按住中：状态气泡 + 波形 -->
+      <view v-if="voiceStage == 'recording'" class="chat-voice-stage">
+        <view class="chat-voice-bubble" :class="recordWillCancel ? 'chat-voice-bubble--cancel' : ''">
+          <text class="chat-voice-bubble__text">{{ recordOverlayHint }}</text>
+        </view>
+        <view class="chat-voice-bubble__tail" />
+        <view class="chat-voice-wave">
+          <view class="chat-voice-baseline" />
+          <view class="chat-voice-bars">
+            <view
+              v-for="(bar, index) in waveformBars"
+              :key="index"
+              class="chat-voice-bar"
+              :style="{ height: `${bar.height}px` }"
+            />
+          </view>
+        </view>
+      </view>
+      <!-- 松手识别中 -->
+      <view v-else-if="voiceStage == 'processing'" class="chat-voice-stage">
+        <view class="chat-voice-bubble">
+          <text class="chat-voice-bubble__text">{{ t("Mobile.Voice.recognizing") }}</text>
+        </view>
+        <view class="chat-voice-bubble__tail" />
+      </view>
+      <!-- 识别完成：中部编辑卡（页面居中，卡下提示行 + 取消/仅发语音按钮排），
+           ✓ 大圆钮独立沉底居中（设计稿二版；轻触卡片拉键盘编辑） -->
+      <view v-else-if="voiceStage == 'editing'" class="chat-voice-edit">
+        <view class="chat-voice-edit__main">
+          <view class="chat-voice-card" @click="handleVoiceCardTap">
+            <textarea
+              class="chat-voice-card__input"
+              v-model="voiceDraftText"
+              :focus="voiceDraftFocus"
+              :maxlength="2000"
+              @focus="handleVoiceDraftFocus"
+              @blur="handleVoiceDraftBlur"
+            />
+          </view>
+          <text class="chat-voice-card__hint">{{ t("Mobile.Voice.tapToEdit") }}</text>
+          <view class="chat-voice-actions">
+            <view
+              class="chat-voice-action"
+              hover-class="chat-voice-action--active"
+              @click="handleVoiceEditCancel"
+            >
+              <svg-icon name="icon-a-Return" size="34" color="#ffffff" />
+              <text class="chat-voice-action__text">{{ t("Mobile.Common.cancel") }}</text>
+            </view>
+            <view
+              v-if="voicePcmPath.length > 0"
+              class="chat-voice-action"
+              hover-class="chat-voice-action--active"
+              @click="handleVoiceSendAudio"
+            >
+              <svg-icon name="icon-Mic" size="34" color="#ffffff" />
+              <text class="chat-voice-action__text">{{ t("Mobile.Voice.sendVoiceOnly") }}</text>
+            </view>
+          </view>
+        </view>
+        <view
+          class="chat-voice-confirm"
+          :class="voiceDraftText.trim().length > 0 && voiceAudioSending != true ? '' : 'chat-voice-confirm--disabled'"
+          hover-class="chat-voice-confirm--active"
+          @click="handleVoiceEditConfirm"
+        >
+          <svg-icon name="icon-Check" size="44" color="#2a8cff" />
         </view>
       </view>
     </view>
@@ -1298,10 +1360,12 @@
   import { generateUUID } from "@/utils/common";
   import { ImForwardItem, ImForwardSession, openImForward } from "@/utils/im/imForwardSession";
   import { uploadSingleFile } from "@/utils/fileUploader";
+  // 仅发语音：裸 PCM 录音封装 WAV（播放器可播）后上传
+  import { pcmToWavFile, PcmToWavResult } from "@/utils/voice/pcmToWav";
   import { UploadFileInfo } from "@/types/interfaces/common.uts";
   import { refreshImUnreadBadge } from "@/utils/imUnreadBadge";
   import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
-  import { getSafeAreaBottom, handleExternalLink } from "@/utils/system";
+  import { getSafeAreaBottom, handleExternalLink, openNativeHomeChatLink } from "@/utils/system";
   import { getApiBaseUrl } from "@/constants/config";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
   import VoiceRecorderButton from "@/components/conversation-input/voice-recorder-button/voice-recorder-button.uvue";
@@ -5705,6 +5769,39 @@
     stopVoiceTickTimer();
   }
 
+  // 受保护语音地址（/api/f/ 需 Bearer）解析：缓存 + 在途去重，机制同 resolveChatVideo。
+  // iOS InnerAudioContext 裸播受保护地址不带鉴权头必失败（用户真机反馈「语音播放失败」），
+  // 须先换 App tempPath / H5 blob 再喂 src；本地乐观行路径与非保护直链原样透传。
+  const chatAudioResolved = new Map<string, string>();
+  const chatAudioRequests = new Map<string, Promise<string>>();
+
+  async function resolveChatAudioUrl(url: string): Promise<string> {
+    if (isAuthProtectedFileUrl(url) != true) {
+      return url;
+    }
+    const cached = chatAudioResolved.get(url);
+    if (cached != null) {
+      return cached;
+    }
+    const existing = chatAudioRequests.get(url);
+    if (existing != null) {
+      return await existing;
+    }
+    const task = fetchAuthProtectedFileDisplayUrl(url);
+    chatAudioRequests.set(url, task);
+    try {
+      const resolved = await task;
+      if (!isChatCurrent()) {
+        releaseDisplayImageUrl(resolved);
+        return url;
+      }
+      chatAudioResolved.set(url, resolved);
+      return resolved;
+    } finally {
+      chatAudioRequests.delete(url);
+    }
+  }
+
   // ===== 视频消息模板事件处理器（预载状态与函数见本页前段「视频预载」块） =====
   // 按 msgId 寻址各自 <video>（每行常驻实例）；置于语音块之后：点按互斥需 stopChatAudio。
 
@@ -5762,8 +5859,10 @@
     preloadChatVideoRow(msg.msgId, msg.videoUrl);
   }
 
-  /** 语音气泡点按：播放/停止（微信同款——再点停止复位，换条从头播；播视频先停视频，音视频互斥）。 */
-  function handleAudioMsgTap(msg: ImMsgRow): void {
+  /** 语音气泡点按：播放/停止（微信同款——再点停止复位，换条从头播；播视频先停视频，音视频互斥）。
+   *  受保护地址先解析（见 resolveChatAudioUrl）：解析期间即显播放态，期间再点同条=停止，
+   *  resolve 回来发现已停/换条则丢弃，不抢播。 */
+  async function handleAudioMsgTap(msg: ImMsgRow): Promise<void> {
     pauseChatVideos();
     if (msg.msgId == playingAudioId.value) {
       stopChatAudio();
@@ -5772,9 +5871,21 @@
     const ctx = ensureChatAudioCtx();
     ctx.stop();
     playingAudioId.value = msg.msgId;
-    ctx.src = msg.audioUrl;
-    ctx.play();
     startVoiceTickTimer();
+    let src = msg.audioUrl;
+    try {
+      src = await resolveChatAudioUrl(msg.audioUrl);
+    } catch (_e) {
+      console.error(`[ChatAudio] resolve failed url=${msg.audioUrl}`);
+      stopChatAudio();
+      uni.showToast({ title: t("Mobile.Message.audioPlayFailed"), icon: "none" });
+      return;
+    }
+    if (msg.msgId != playingAudioId.value || !isChatCurrent()) {
+      return;
+    }
+    ctx.src = src;
+    ctx.play();
   }
 
   // ===== 合并转发聊天记录详情（点卡片进全页：载荷走 imMergeRecordSession 暂存，详情页 onLoad 取） =====
@@ -6006,6 +6117,10 @@
     if (url.indexOf("/") == 0 && url.indexOf("//") != 0 && base.length > 0) {
       url = base + url;
     }
+    // 站内会话详情链接直接跳原生 agent-detail（与链接段点击同理由）
+    if (openNativeHomeChatLink(url)) {
+      return;
+    }
     if (isAuthProtectedFileUrl(url)) {
       openAuthProtectedLinkUrl(url).catch((_e: any | null) => {
         uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
@@ -6147,17 +6262,30 @@
     jumpToMsg(msgId);
   }
 
-  // ===== 按住说话动态浮层（任务页 conversation-input 录音层同款）=====
-  // 显隐唯一跟随 voice-recorder-button 的 onVisualActive（权限门控在子组件内：
-  // 未授权按下不出浮层）；上滑取消区由 onCancelZoneChange 上抛（渐变转红 + 文案切换）。
-  const isRecording = ref<boolean>(false);
+  // ===== 按住说话全屏蒙层（liveAsr 三阶段状态机）=====
+  // idle=无 / recording=按住中（波形，蒙层不拦截触摸）/ processing=松手识别中 /
+  // editing=识别完成可编辑（卡片+三按钮，蒙层拦截触摸）。
+  // 显隐起点跟随 voice-recorder-button 的 onVisualActive（权限门控在子组件内）；
+  // liveAsr 松手后流程由 onLiveProcessing/onLiveResult/onError 接管（onVisualActive(false)
+  // 只结束 recording 态，不关 processing/editing——组件在等 asr_result 期间已复位视觉）。
+  const voiceStage = ref<string>("idle");
   const recordWillCancel = ref<boolean>(false);
   const recordOverlayHint = computed((): string => {
     if (recordWillCancel.value == true) {
       return t("Mobile.CreateHub.releaseToCancel");
     }
-    return t("Mobile.CreateHub.releaseToSendSlideCancel");
+    return t("Mobile.Voice.releaseToTranscribe");
   });
+  /** editing：识别文本草稿（可编辑后发文本；空文本确认键置灰） */
+  const voiceDraftText = ref<string>("");
+  /** editing：轻触卡片才拉键盘（voiceDraftFocus 置 true 触发 textarea 聚焦） */
+  const voiceDraftFocus = ref<boolean>(false);
+  /** editing：本轮录音 PCM 文件（仅发语音用；路径空=元数据丢失，按钮隐藏） */
+  const voicePcmPath = ref<string>("");
+  const voicePcmDurationMs = ref<number>(0);
+  const voicePcmFileSize = ref<number>(0);
+  /** 仅发语音上传中（防重复点击；确认键同步置灰） */
+  const voiceAudioSending = ref<boolean>(false);
 
   /** 波形条（高 px）；150ms 全量重算=跳动，App 端无 height 过渡，跳动即动画 */
   class ChatWaveformBar {
@@ -6213,11 +6341,14 @@
     }
   }
 
-  /** 按钮视觉激活态（按下且权限通过）：浮层淡入 + 波形起跳；结束/取消统一收。 */
+  /** 按钮视觉激活态（按下且权限通过）：蒙层淡入进 recording + 波形起跳。
+   *  active=false 只把 recording 收回 idle（轻触/上滑取消/权限失败）；
+   *  processing/editing 不受影响——那是 liveAsr 松手后的流程态，收口事件是
+   *  onLiveResult / onError。 */
   function handleVoiceVisualActive(active: boolean): void {
     if (active == true) {
-      if (isRecording.value != true) {
-        isRecording.value = true;
+      if (voiceStage.value == "idle") {
+        voiceStage.value = "recording";
         if (waveformBars.value.length == 0) {
           initWaveform();
         }
@@ -6225,14 +6356,186 @@
       }
       return;
     }
-    isRecording.value = false;
-    recordWillCancel.value = false;
+    if (voiceStage.value == "recording") {
+      voiceStage.value = "idle";
+      recordWillCancel.value = false;
+      stopVoiceWaveTimer();
+    }
+  }
+
+  /** 上滑进/出取消区：文案切「松开取消」（蒙层不变红，气泡自身转红）。 */
+  function handleVoiceCancelZone(active: boolean): void {
+    recordWillCancel.value = active;
+  }
+
+  /** liveAsr 松手：蒙层保持，切「识别中」（结果经 onLiveResult / onError 收口）。 */
+  function handleVoiceProcessing(): void {
+    if (voiceStage.value == "recording") {
+      voiceStage.value = "processing";
+      recordWillCancel.value = false;
+      stopVoiceWaveTimer();
+    }
+  }
+
+  /** liveAsr 识别完成：文本入编辑卡，录音文件暂存（仅发语音用）。 */
+  function handleVoiceLiveResult(text: string, pcmFilePath: string, durationMs: number, fileSize: number): void {
+    voiceDraftText.value = text;
+    voicePcmPath.value = pcmFilePath;
+    voicePcmDurationMs.value = durationMs;
+    voicePcmFileSize.value = fileSize;
+    voiceStage.value = "editing";
     stopVoiceWaveTimer();
   }
 
-  /** 上滑进/出取消区：渐变转红 + 文案切「松开取消」。 */
-  function handleVoiceCancelZone(active: boolean): void {
-    recordWillCancel.value = active;
+  /** editing 收尾复位（取消/两路发送成功后调用）。 */
+  function closeVoiceEdit(): void {
+    uni.hideKeyboard({ complete: () => {} });
+    voiceDraftFocus.value = false;
+    voiceStage.value = "idle";
+    recordWillCancel.value = false;
+    voiceDraftText.value = "";
+    voicePcmPath.value = "";
+    voicePcmDurationMs.value = 0;
+    voicePcmFileSize.value = 0;
+    voiceAudioSending.value = false;
+    stopVoiceWaveTimer();
+  }
+
+  /** 轻触编辑卡：拉键盘聚焦（首帧不自动聚焦，键盘不抢出场动画）。 */
+  function handleVoiceCardTap(): void {
+    if (voiceDraftFocus.value == true) {
+      return;
+    }
+    // 先回 false 再下一帧置 true：focus 属性需要变化才触发聚焦
+    voiceDraftFocus.value = false;
+    setTimeout((): void => {
+      if (voiceStage.value == "editing") {
+        voiceDraftFocus.value = true;
+      }
+    }, 50);
+  }
+
+  function handleVoiceDraftFocus(): void {
+    // 聚焦态占位（保持 focus 标记真实，供 handleVoiceCardTap 判重）
+  }
+
+  function handleVoiceDraftBlur(): void {
+    voiceDraftFocus.value = false;
+  }
+
+  /** editing 取消：丢弃本轮识别文本与录音。 */
+  function handleVoiceEditCancel(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    if (voiceAudioSending.value == true) {
+      return;
+    }
+    closeVoiceEdit();
+  }
+
+  /**
+   * 仅发语音发送核心（对齐 sendMediaWithRow 模式）：
+   * 上传 WAV → audio 消息（body 带 duration 秒）→ 确认行替换（audioUrl 换服务端 url）。
+   * 本地行 audioUrl 先用本地 WAV 路径（即时可播），确认替换后变远端 url。
+   */
+  async function sendVoiceAudioWithWav(wav: PcmToWavResult): Promise<void> {
+    const clientMsgId = generateUUID();
+    const row = new ImMsgRow();
+    row.msgId = `local-${clientMsgId}`;
+    row.clientMsgId = clientMsgId;
+    row.local = true;
+    row.msgType = "audio";
+    row.audioUrl = wav.wavPath;
+    row.audioDuration = wav.durationSec;
+    row.sendTime = Date.now();
+    row.status = 0;
+    applyQuoteToRow(row);
+    quoteTarget.value = null;
+    resetQuoteMentionSnapshot();
+    messages.value.push(row);
+    scrollToBottom();
+    closeVoiceEdit();
+    try {
+      const up = await uploadSingleFile(wav.wavPath, clientMsgId, null, `voice-${clientMsgId}.wav`);
+      if (!isChatCurrent()) return;
+      if (up.success != true || up.file == null) {
+        markRowFailed(row.clientMsgId);
+        const reason = up.error != null ? `${up.error}` : "";
+        uni.showToast({
+          title: reason.length > 0 ? reason : t("Mobile.Message.sendFailed"),
+          icon: "none",
+        });
+        return;
+      }
+      const file = up.file;
+      const res = await apiImSendMediaMsg(
+        convId.value,
+        "audio",
+        file.url,
+        file.name,
+        file.size,
+        file.type,
+        row.clientMsgId,
+        row.replyId.length > 0 ? row.replyId : "",
+        wav.durationSec,
+      );
+      if (!isChatCurrent()) return;
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const confirmed = buildConfirmedRow(dataObj, row);
+        // readMsgRow 口径：audio 行读 body.url + body.duration（秒）；
+        // 确认行显式回填（服务端 body 原样带回，双保险）
+        confirmed.msgType = "audio";
+        confirmed.audioUrl = file.url;
+        confirmed.audioDuration = wav.durationSec;
+        confirmed.linkAtts = [];
+        replaceByClientMsgId(confirmed);
+        reportReadIfNeeded(maxSeq());
+        refreshReadStatus();
+        scrollToBottom();
+      } else {
+        markRowFailed(row.clientMsgId);
+        const message = apiResMessage(res);
+        uni.showToast({
+          title: message.length > 0 ? message : t("Mobile.Message.sendFailed"),
+          icon: "none",
+        });
+      }
+    } catch (_error) {
+      if (isChatCurrent() == true) {
+        markRowFailed(row.clientMsgId);
+        uni.showToast({ title: t("Mobile.Message.sendFailed"), icon: "none" });
+      }
+    }
+  }
+
+  /** editing 仅发语音（🎤）：PCM→WAV→上传→audio 消息（不转文案，原生语音条可播）。
+   *  位置须在 sendVoiceAudioWithWav 之后（UTS 先声明后使用）。 */
+  function handleVoiceSendAudio(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    if (voiceAudioSending.value == true) {
+      return;
+    }
+    const pcmPath = voicePcmPath.value;
+    if (pcmPath.length == 0 || convId.value.length == 0) {
+      return;
+    }
+    voiceAudioSending.value = true;
+    pcmToWavFile(pcmPath, (wav: PcmToWavResult): void => {
+      if (isChatCurrent() != true) {
+        return;
+      }
+      if (wav.ok != true) {
+        voiceAudioSending.value = false;
+        uni.showToast({ title: t("Mobile.Voice.recordFailed"), icon: "none" });
+        return;
+      }
+      sendVoiceAudioWithWav(wav);
+    });
   }
 
   /** 语音/键盘切换：进语音态时收面板与键盘（语音条与面板互斥；
@@ -6257,7 +6560,9 @@
   }
 
   /**
-   * 语音识别完成：参考设计"松开发送"，识别文本直接作为文本消息发出；
+   * 语音识别文本发送（两个入口共用）：
+   * ① liveAsr 编辑确认（handleVoiceEditConfirm）：蒙层编辑卡里改完的文本；
+   * ② 非 live 端（H5/小程序/原生桥）onRecordStop 自动发送（无编辑环节）。
    * 有暂存图时与图合并发送（单图直发 image / 图文一条 rich_text，判定同 handleSend）。
    */
   function handleVoiceStop(result: string): void {
@@ -6287,7 +6592,28 @@
     sendWithRow(row);
   }
 
+  /** editing 确认（✓）：编辑后的文本按语音发送路径发出（暂存图合并同旧口径）。
+   *  位置须在 handleVoiceStop 之后（UTS 先声明后使用）。 */
+  function handleVoiceEditConfirm(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    if (voiceAudioSending.value == true) {
+      return;
+    }
+    const text = voiceDraftText.value.trim();
+    if (text.length == 0 || convId.value.length == 0) {
+      return;
+    }
+    closeVoiceEdit();
+    handleVoiceStop(text);
+  }
+
   function handleVoiceError(error: any): void {
+    // 识别失败收口：关蒙层（含 processing/editing 态——如按住中链路错误松手提示）
+    if (voiceStage.value == "processing" || voiceStage.value == "editing") {
+      closeVoiceEdit();
+    }
     let message = "";
     try {
       const err = error as Error;
@@ -7968,10 +8294,12 @@
 
   function clearChatUiTimers(): void {
     cancelSettle();
-    // 按住说话波形 timer 一并停（页面隐藏/卸载后不再跳动；浮层态随下次按下重建）
+    // 按住说话波形 timer 一并停（页面隐藏/卸载后不再跳动；蒙层三阶段态一并复位，
+    // editing 草稿丢弃——在途上传不中断，行照发，voiceAudioSending 解除防重）
     stopVoiceWaveTimer();
-    isRecording.value = false;
+    voiceStage.value = "idle";
     recordWillCancel.value = false;
+    voiceAudioSending.value = false;
     if (readReportTimer != 0) clearTimeout(readReportTimer);
     readReportTimer = 0;
     if (chatScrollIdleTimer != 0) clearTimeout(chatScrollIdleTimer);
@@ -9891,74 +10219,92 @@
     background-color: rgba(81, 71, 255, 0.12);
   }
 
-  /* ===== 按住说话动态浮层（任务页 conversation-input record-overlay 同款）=====
-     贴 .chat-page 底 absolute（本页 relative 锚已有让位填充带先例；fixed 在
-     App-Android 定位不稳的仓库教训）；常驻 DOM opacity 切换；pointer-events:none
-     不拦截触摸（按住手势全程落在其下的录音按钮上，按钮交互/样式不变） */
-  .chat-record-overlay {
+  /* ===== 按住说话全屏蒙层（liveAsr 三阶段，布局对齐设计稿）=====
+     贴 .chat-page 全屏 absolute（fixed 在 App-Android 定位不稳的仓库教训）；
+     常驻 DOM opacity 切换；recording 态 pointer-events:none 不拦截触摸（按住手势
+     落在其下的录音按钮上），processing/editing 态切 auto 拦截底层交互 */
+  .chat-voice-mask {
     position: absolute;
     left: 0;
     right: 0;
+    top: 0;
     bottom: 0;
-    height: 520rpx;
     z-index: 998;
     pointer-events: none;
     opacity: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: flex-end;
-    /* 内容组（文案+基线+波形）整体上移 200rpx：原贴底 48rpx 基础上加 200 */
-    padding-bottom: 248rpx;
-    /* #ifdef H5 || WEB || MP-WEIXIN */
-    background: linear-gradient(
-      180deg,
-      rgba(58, 155, 255, 0) 0%,
-      rgba(58, 155, 255, 0.62) 40%,
-      rgba(42, 140, 255, 1) 100%
-    );
-    /* #endif */
-    /* #ifdef APP */
-    background-image: linear-gradient(to top, #2a8cff, rgba(58, 155, 255, 0));
-    /* #endif */
+    background-color: rgba(17, 24, 39, 0.62);
+    transition: opacity 0.16s ease;
   }
 
-  .chat-record-overlay--on {
+  .chat-voice-mask--on {
     opacity: 1;
   }
 
-  .chat-record-overlay--cancel {
-    /* #ifdef H5 || WEB || MP-WEIXIN */
-    background: linear-gradient(
-      180deg,
-      rgba(255, 90, 90, 0) 0%,
-      rgba(255, 90, 90, 0.62) 40%,
-      rgba(232, 72, 72, 1) 100%
-    );
-    /* #endif */
-    /* #ifdef APP */
-    background-image: linear-gradient(to top, #e84848, rgba(255, 90, 90, 0));
-    /* #endif */
+  /* 上滑取消（按住中）：蒙层微偏红提示 */
+  .chat-voice-mask--cancel {
+    background-color: rgba(96, 26, 26, 0.66);
   }
 
-  .chat-record-overlay__hint {
-    font-size: 28rpx;
-    line-height: 40rpx;
-    color: #ffffff;
-    margin-bottom: 40rpx;
+  /* 松手后（识别中/编辑中）加深背景，突出编辑卡 */
+  .chat-voice-mask--interactive {
+    pointer-events: auto;
+    background-color: rgba(17, 24, 39, 0.85);
   }
 
-  .chat-record-overlay__wave {
-    position: relative;
-    width: 100%;
-    height: 56px;
+  /* 按住中/识别中阶段容器：顶部气泡 + 波形（整体下移至页面中间偏上） */
+  .chat-voice-stage {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 36%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .chat-voice-bubble {
+    max-width: 76%;
+    background-color: rgba(255, 255, 255, 0.94);
+    border-radius: 24rpx;
+    padding: 20rpx 30rpx;
     display: flex;
     flex-direction: row;
     align-items: center;
     justify-content: center;
   }
 
-  .chat-record-overlay__baseline {
+  .chat-voice-bubble--cancel {
+    background-color: rgba(255, 214, 214, 0.96);
+  }
+
+  .chat-voice-bubble__text {
+    font-size: 28rpx;
+    line-height: 42rpx;
+    color: #1f2937;
+    text-align: center;
+  }
+
+  /* 气泡下小尾巴（旋转 45° 小方块，App 不支持伪元素） */
+  .chat-voice-bubble__tail {
+    width: 20rpx;
+    height: 20rpx;
+    background-color: rgba(255, 255, 255, 0.94);
+    transform: rotate(45deg);
+    margin-top: -10rpx;
+  }
+
+  .chat-voice-wave {
+    position: relative;
+    width: 100%;
+    height: 56px;
+    margin-top: 56rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-voice-baseline {
     position: absolute;
     left: 12%;
     right: 12%;
@@ -9966,7 +10312,7 @@
     background-color: rgba(255, 255, 255, 0.45);
   }
 
-  .chat-record-overlay__bars {
+  .chat-voice-bars {
     width: 76%;
     height: 56px;
     display: flex;
@@ -9975,7 +10321,7 @@
     justify-content: center;
   }
 
-  .chat-record-overlay__bar {
+  .chat-voice-bar {
     width: 4rpx;
     margin-left: 3rpx;
     margin-right: 3rpx;
@@ -9984,6 +10330,103 @@
     /* #ifndef APP */
     transition: height 0.12s ease;
     /* #endif */
+  }
+
+  /* 识别完成：整页容器——上半区编辑主体（垂直居中），✓ 大圆钮沉底居中 */
+  .chat-voice-edit {
+    position: absolute;
+    left: 48rpx;
+    right: 48rpx;
+    top: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+  }
+
+  /* 编辑主体（卡片+提示行+按钮排）：在 ✓ 上方剩余空间内整体垂直居中；
+     padding-top 60rpx=居中组净下移 30rpx（视觉配平 ✓ 钮上提后的重心） */
+  .chat-voice-edit__main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding-top: 60rpx;
+  }
+
+  .chat-voice-card {
+    background-color: rgba(255, 255, 255, 0.14);
+    border-radius: 24rpx;
+    padding: 24rpx 28rpx;
+  }
+
+  .chat-voice-card__input {
+    width: 100%;
+    height: 220rpx;
+    font-size: 30rpx;
+    line-height: 48rpx;
+    color: #ffffff;
+    background-color: transparent;
+  }
+
+  /* 编辑框下提示行（原 placeholder 文案移到这里） */
+  .chat-voice-card__hint {
+    font-size: 24rpx;
+    line-height: 36rpx;
+    color: rgba(255, 255, 255, 0.55);
+    text-align: center;
+    margin-top: 20rpx;
+  }
+
+  /* 取消 ↩ / 仅发语音 🎤 一排居中，间距加大（相对卡片再下沉） */
+  .chat-voice-actions {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    margin-top: 128rpx;
+  }
+
+  .chat-voice-action {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    margin-left: 72rpx;
+    margin-right: 72rpx;
+  }
+
+  .chat-voice-action--active {
+    opacity: 0.6;
+  }
+
+  .chat-voice-action__text {
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #ffffff;
+    margin-top: 8rpx;
+  }
+
+  /* ✓ 确认大圆钮：蒙层下方，水平居中（略上提避开底边） */
+  .chat-voice-confirm {
+    align-self: center;
+    margin-bottom: 200rpx;
+    width: 108rpx;
+    height: 108rpx;
+    border-radius: 54rpx;
+    background-color: #ffffff;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-voice-confirm--active {
+    opacity: 0.85;
+  }
+
+  .chat-voice-confirm--disabled {
+    opacity: 0.45;
   }
 
   /* ===== 飞书式内嵌面板（表情 / 加号），与键盘互斥 ===== */

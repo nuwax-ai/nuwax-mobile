@@ -1,0 +1,94 @@
+/**
+ * 裸 PCM 录音文件（16kHz mono PCM16，StreamPcmRecorder 落盘格式）→ 可播放 WAV 文件。
+ * 语音消息（msgType=audio）的 body.url 必须能被 InnerAudioContext / PC <audio> 直接播放，
+ * 裸 PCM 无时长头播放器普遍不认，发送前须封装 44 字节 RIFF/WAV 头
+ * （头构造与 writeFile 先例：utils/voice/ttsWebSocketPlayer.uts buildPcm16Wav / saveWavFile）。
+ */
+import { readAudioFileBuffer } from "./pcmStreamRecorder";
+import { ASR_SAMPLE_RATE } from "./asrWebSocketClient";
+
+/** WAV 封装结果：ok=false 时 error 有值；durationSec 由数据字节数换算（16k mono PCM16 = 32000 B/s） */
+export class PcmToWavResult {
+  ok: boolean = false;
+  wavPath: string = "";
+  sizeBytes: number = 0;
+  durationSec: number = 0;
+  error: string = "";
+
+  static fail(message: string): PcmToWavResult {
+    const r = new PcmToWavResult();
+    r.ok = false;
+    r.error = message;
+    return r;
+  }
+}
+
+function writeAscii(view: DataView, offset: number, text: string): void {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    view.setUint8(offset + i, code != null ? code : 0);
+  }
+}
+
+/** 44 字节 RIFF/WAV 头（PCM16 mono）+ 整段 PCM 数据 → 新 ArrayBuffer */
+function buildWavBuffer(pcm: ArrayBuffer): ArrayBuffer {
+  const pcmLength = pcm.byteLength;
+  const buffer = new ArrayBuffer(44 + pcmLength);
+  const view = new DataView(buffer);
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + pcmLength, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, ASR_SAMPLE_RATE, true);
+  view.setUint32(28, ASR_SAMPLE_RATE * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, pcmLength, true);
+  // App UTS 不支持 TypedArray.set(array, offset)，逐下标拷贝（ttsWebSocketPlayer 同款教训注释）
+  const src = new Uint8Array(pcm);
+  const dst = new Uint8Array(buffer);
+  for (let i = 0; i < pcmLength; i++) {
+    dst[44 + i] = src[i];
+  }
+  return buffer;
+}
+
+/**
+ * 读 PCM 文件 → 加 WAV 头 → 写应用沙盒新文件。
+ * 异步回调风格（对齐 readAudioFileBuffer / pcmStreamRecorder，避免 UTS Promise 链截断）。
+ */
+export function pcmToWavFile(pcmPath: string, done: (result: PcmToWavResult) => void): void {
+  if (pcmPath.length == 0) {
+    done(PcmToWavResult.fail("pcm path empty"));
+    return;
+  }
+  readAudioFileBuffer(pcmPath, (buffer: ArrayBuffer | null): void => {
+    if (buffer == null || buffer!.byteLength == 0) {
+      done(PcmToWavResult.fail("pcm file empty"));
+      return;
+    }
+    const wav = buildWavBuffer(buffer!);
+    const wavPath = `${uni.env.USER_DATA_PATH}/voice-${Date.now()}.wav`;
+    uni.getFileSystemManager().writeFile({
+      filePath: wavPath,
+      data: wav,
+      success: (_res): void => {
+        const r = new PcmToWavResult();
+        r.ok = true;
+        r.wavPath = wavPath;
+        r.sizeBytes = wav.byteLength;
+        // 16kHz mono PCM16 = 32000 B/s；向上取整至少 1 秒（零头不足 1s 也算 1s）
+        r.durationSec = Math.max(1, Math.round(wav.byteLength / 32000));
+        done(r);
+      },
+      fail: (err): void => {
+        const errMsg = err != null ? `${err.errMsg ?? "write wav failed"}` : "write wav failed";
+        done(PcmToWavResult.fail(errMsg));
+      },
+    });
+  });
+}

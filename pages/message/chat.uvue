@@ -1345,6 +1345,7 @@
   import {
     buildAuthProtectedFileHeaders,
     extractFileNameFromUrl,
+    fetchAuthProtectedFileAkUrl,
     fetchAuthProtectedFileDisplayUrl,
     isAuthProtectedFileUrl,
     openAuthProtectedLinkUrl,
@@ -4782,7 +4783,9 @@
   }
 
   // ===== 视频预载（msgType=video：进页/增量合并后自动解析地址回填行，首帧常驻 <video>） =====
-  // /api/f/ 受保护地址 <video> src 带不了 Bearer：解析成 temp（H5 blob）地址回填
+  // /api/f/ 受保护地址 <video> src 带不了 Bearer：先经 /api/file/ak/refresh 换 ?ak= 流式
+  // 直链（302→对象存储 Range 流输出，播放器渐进拉流，10-04 起首选）；换链失败才回落
+  // 整段下载 temp（H5 blob）地址回填。
   // msg.videoPlayUrl ⇒ 模板按行挂 <video>（controls 自带播放键点播——不做任何自动起播：
   // iOS autoplay/延迟补调 play() 均不稳定，手点是唯一稳定路径，10-04 定稿）。
   // ★本块必须定义在 mergeSyncedMessages / insertMessageBySeq 之前（它们尾部要调
@@ -4802,6 +4805,8 @@
   const chatVideoRequests = new Map<string, Promise<string>>();
   /** 批量预载防重入（在途轮次未结束时新触发直接放弃，漏行等下一轮合并/插入补扫）。 */
   let chatVideoPreloadBusy = false;
+  /** 播放报错已自动重解析过的 msgId（每页会话至多一次：ak 过期自愈够用，坏文件不无限循环）。 */
+  const videoRetryIds = new Set<string>();
 
   /** 指定行的 <video> 元素（每行独立 id：预载后多行常驻，非单实例）。 */
   function getChatVideoElement(msgId: string): UniVideoElement | null {
@@ -4865,10 +4870,32 @@
   }
   // #endif
 
-  /** 解析视频可播地址：CDN 直链原样返回；受保护地址换 temp/blob（带缓存与在途去重）。 */
+  /** 受保护视频取址：allowAk 时首选 /api/file/ak/refresh 换流式直链（播放器自行跟
+   *  302 渐进拉流，预载只花一次轻量 JSON 请求，不再先下整段）；接口不可用/失败，
+   *  或播放报错自愈重解析（ak 已被证伪：可能过期或该端播放器不跟 302）时，
+   *  走整段下载路径（temp/blob，进度回调只在下载分支有意义）。 */
+  async function resolveChatVideoProtected(
+    url: string,
+    onProgress: ((percent: number) => void) | null,
+    allowAk: boolean,
+  ): Promise<string> {
+    if (allowAk) {
+      try {
+        return await fetchAuthProtectedFileAkUrl(url);
+      } catch (_e) {
+        console.error(`[ChatVideo] ak 直链解析失败，回落整段下载 url=${url}`);
+      }
+    }
+    return await fetchChatVideoProtectedUrl(url, onProgress);
+  }
+
+  /** 解析视频可播地址：CDN 直链原样返回；受保护地址先换 ak 流式直链（302→对象存储
+   *  Range 流输出，边下边播、免整段下载），换链失败回落整段下载 temp/blob
+   *  （带缓存与在途去重；ak 播放报错的自愈路径见 handleVideoError——直接走下载兜底）。 */
   async function resolveChatVideo(
     url: string,
     onProgress: ((percent: number) => void) | null,
+    allowAk: boolean = true,
   ): Promise<string> {
     if (isAuthProtectedFileUrl(url) != true) {
       return url;
@@ -4881,7 +4908,7 @@
     if (existing != null) {
       return await existing;
     }
-    const task = fetchChatVideoProtectedUrl(url, onProgress);
+    const task = resolveChatVideoProtected(url, onProgress, allowAk);
     chatVideoRequests.set(url, task);
     try {
       const resolved = await task;
@@ -4903,7 +4930,11 @@
    *  ★await 期间行可能被快照整行替换：按 msgId 经 messages.value 重取代理实例再写
    *  （insertMessageBySeq 注释同款约束：改原始对象不触发视图刷新）。失败静默（占位卡
    *  ▶ 可再点重试）；同 url 并发由 chatVideoRequests 去重。 */
-  async function preloadChatVideoRow(msgId: string, url: string): Promise<void> {
+  async function preloadChatVideoRow(
+    msgId: string,
+    url: string,
+    allowAk: boolean = true,
+  ): Promise<void> {
     videoLoadingId.value = msgId;
     videoLoadPercent.value = -1;
     try {
@@ -4912,7 +4943,7 @@
         if (videoLoadingId.value == msgId) {
           videoLoadPercent.value = percent;
         }
-      });
+      }, allowAk);
       if (!isChatCurrent()) {
         return;
       }
@@ -4963,6 +4994,7 @@
     chatVideoUrls.clear();
     chatVideoResolved.clear();
     chatVideoRequests.clear();
+    videoRetryIds.clear();
   }
 
   function releaseChatImages(): void {
@@ -5818,9 +5850,26 @@
     el.seek(0);
   }
 
-  /** 播放器报错：日志 + toast（保持挂载，系统播放键自带重试）。 */
+  /** 播放器报错：ak 流式直链可能过期（页面停留久了再点播）或该端播放器不跟 302——
+   *  作废该行解析缓存并自动重解析一次，且直接走整段下载兜底（重换 ak 无意义）；
+   *  已重试过或非受保护行维持日志 + toast（保持挂载，系统播放键自带重试）。 */
   function handleVideoError(msgId: string): void {
     console.error(`[ChatVideo] 播放器报错 msgId=${msgId}`);
+    if (!videoRetryIds.has(msgId)) {
+      for (let i = 0; i < messages.value.length; i++) {
+        const row = messages.value[i];
+        if (row.msgId == msgId) {
+          if (isAuthProtectedFileUrl(row.videoUrl) && row.videoPlayUrl.length > 0) {
+            videoRetryIds.add(msgId);
+            chatVideoResolved.delete(row.videoUrl);
+            row.videoPlayUrl = "";
+            preloadChatVideoRow(msgId, row.videoUrl, false);
+            return;
+          }
+          break;
+        }
+      }
+    }
     uni.showToast({ title: t("Mobile.Message.videoPlayFailed"), icon: "none" });
   }
 

@@ -128,6 +128,11 @@
       <view class="ab-tail" />
     </scroll-view>
 
+    <!-- 非联系人 gating 提示：选中的还不是我的联系人，发消息被禁，引导先加联系人 -->
+    <view v-if="sendMsgBlocked" class="ab-hint">
+      <text class="ab-hint-text">{{ t("Mobile.Message.notContactSendHint") }}</text>
+    </view>
+
     <!-- 底部按钮：取消=返回 / 加为联系人 / 发消息 -->
     <view class="ab-footer" :style="footerStyle">
       <view class="ab-btn" hover-class="ab-btn-cancel--active" @click="handleBack">
@@ -143,7 +148,7 @@
       </view>
       <view
         class="ab-btn ab-btn--ok"
-        :class="{ 'ab-btn--disabled': busy }"
+        :class="{ 'ab-btn--disabled': busy || sendMsgBlocked }"
         hover-class="ab-btn-ok--active"
         @click="handleSendMsg"
       >
@@ -161,6 +166,7 @@
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import {
     apiImAddContact,
+    apiImContacts,
     apiImCreateP2pConversation,
     apiImSearchAgents,
     apiImSearchContacts,
@@ -235,6 +241,65 @@
     const raw = obj[key];
     return raw != null && `${raw}` == "true";
   }
+
+  /** 已互为联系人 userId 集（status=1）：搜索接口 ContactSearchItem 无联系人标记，
+   *  「发消息」gating 只能靠通讯录本地比对。拉取失败/被截断（truncated）时放弃
+   *  gating（fail-open：宁可不禁也不错禁真联系人，服务端仍是权威兜底）。 */
+  const contactUserIds = new Set<string>();
+  const contactIdsLoaded = ref<boolean>(false);
+  const contactIdsTruncated = ref<boolean>(false);
+  let contactIdsLoading = false;
+
+  async function loadContactIds(): Promise<void> {
+    if (contactIdsLoading || contactIdsLoaded.value) {
+      return;
+    }
+    contactIdsLoading = true;
+    try {
+      const res = await apiImContacts();
+      contactIdsLoading = false;
+      if (apiResCode(res) != SUCCESS_CODE) {
+        // 失败保持未加载态：下次搜索自动重试，期间发消息按原行为放行
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      contactUserIds.clear();
+      if (dataObj != null) {
+        contactIdsTruncated.value = readBool(dataObj, "truncated");
+        const itemsRaw = dataObj["items"];
+        if (itemsRaw != null) {
+          const items = itemsRaw as UTSJSONObject[];
+          for (let i = 0; i < items.length; i++) {
+            // status=1 才是已互为联系人；2=对方申请待我确认 3=我已申请待对方同意，都还不能直接发消息
+            const item = items[i];
+            if (readString(item, "status") == "1") {
+              const uid = readString(item, "userId");
+              if (uid.length > 0) {
+                contactUserIds.add(uid);
+              }
+            }
+          }
+        }
+      }
+      contactIdsLoaded.value = true;
+    } catch (_e) {
+      contactIdsLoading = false;
+    }
+  }
+
+  /** 发消息禁用：仅用户 tab——已选中目标、通讯录比对可靠（已拉取且未截断）、对方
+   *  还不是我的联系人。智能体 tab 不 gating（加为联系人即时生效）。 */
+  const sendMsgBlocked = computed((): boolean => {
+    if (activeTab.value != "user" || !contactIdsLoaded.value || contactIdsTruncated.value) {
+      return false;
+    }
+    const target = selectedTarget.value;
+    if (target == null) {
+      return false;
+    }
+    return !contactUserIds.has(target.userId);
+  });
 
   /** 页面入参读取（容错解码：扫码预填的关键字可能带中文/特殊字符）。 */
   function readOption(options: any | null, key: string): string {
@@ -314,6 +379,10 @@
     const tab = activeTab.value;
     const seq = ++searchSeq;
     searchState.value = "loading";
+    // 用户 tab 顺带补拉通讯录（onLoad 首拉失败时的重试路径；成功后 gating 生效）
+    if (tab != "agent" && !contactIdsLoaded.value) {
+      loadContactIds();
+    }
     try {
       const res = tab == "agent"
         ? await apiImSearchAgents(kw, 1, 20)
@@ -472,6 +541,11 @@
     if (busy.value) {
       return;
     }
+    // 非联系人 gating：按钮已是禁用态，这里兜底点按反馈（提示条常驻 footer 上方）
+    if (sendMsgBlocked.value) {
+      uni.showToast({ title: t("Mobile.Message.notContactSendHint"), icon: "none" });
+      return;
+    }
     const target = selectedTarget.value;
     if (target == null) {
       uni.showToast({ title: t("Mobile.Message.selectTargetFirst"), icon: "none" });
@@ -522,6 +596,8 @@
       keyword.value = kw;
     }
     autoSelectUserId = uid;
+    // 首拉通讯录建「已互为联系人」集合（发消息 gating 比对用；失败由每次搜索重试）
+    loadContactIds();
   });
 
   onUnmounted(() => {
@@ -812,6 +888,22 @@
 
   .ab-tail {
     height: 40rpx;
+  }
+
+  /* 非联系人 gating 提示条（footer 上方居中，暖色引导先加联系人再发消息） */
+  .ab-hint {
+    flex-shrink: 0;
+    padding: 12rpx 32rpx 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .ab-hint-text {
+    color: #e0942e;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    text-align: center;
   }
 
   /* ===== 底部按钮（按钮规范同原弹窗：次要=浅灰填充、主操作=品牌紫，无描边） ===== */

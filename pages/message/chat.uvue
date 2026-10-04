@@ -482,6 +482,29 @@
     <view v-if="multiSelectMode != true" class="chat-dock-wrap" :style="{ paddingBottom: dockPadBottomPx + 'px' }">
       <!-- 输入坞第一行：输入框（语音条互斥）+ 发送（有内容时）+ 展开长文编辑 -->
       <view class="chat-dock">
+        <!-- 待发图片暂存条（微信同款）：选图/拍照后先暂存，可与文案合并发送；
+             点缩略图预览、右上角删除；语音/文字两态都展示（dock 首子节点） -->
+        <view v-if="stagedImages.length > 0 && !convDisbanded" class="chat-staged">
+          <scroll-view class="chat-staged__scroll" direction="horizontal" :show-scrollbar="false">
+            <view class="chat-staged__row">
+              <view class="chat-staged__item" v-for="img in stagedImages" :key="img.id">
+                <image
+                  class="chat-staged__thumb"
+                  :src="img.localPath"
+                  mode="aspectFill"
+                  @click="handleStagedImageTap(img.localPath)"
+                />
+                <view class="chat-staged__remove" hover-class="chat-staged__remove--active" @click.stop="removeStagedImage(img.id)">
+                  <image
+                    class="chat-staged__remove-icon"
+                    src="/static/images/icon-a-Xcircle-fill.png"
+                    mode="aspectFit"
+                  />
+                </view>
+              </view>
+            </view>
+          </scroll-view>
+        </view>
         <!-- 语音模式回复提示条（飞书式）：按住说话行上方展示当前引用，
              与输入框内引用条互斥呈现——切语音/文字模式各自展示对应样式 -->
         <view
@@ -1178,6 +1201,7 @@
     apiImReadStatus,
     apiImRevokeMsg,
     apiImSendMediaMsg,
+    apiImSendRichTextMsg,
     apiImSendTextMsg,
     apiImUnpinMsg,
     apiImWhoami,
@@ -1282,6 +1306,15 @@
     url: string = "";
     fileName: string = "";
     mime: string = "";
+  }
+
+  /**
+   * 待发图片（选图/拍照后先入暂存条，可与输入框文案合并成一条 rich_text 发出；
+   * 单图无文字仍走 image 直发，形态判定见 handleSend）。id 供删除定位。
+   */
+  class StagedImage {
+    id: string = "";
+    localPath: string = "";
   }
 
   /**
@@ -1484,6 +1517,8 @@
 
   // ===== 列表状态 =====
   const messages = ref<ImMsgRow[]>([]);
+  // 待发图片暂存条（选图后不立即发，点发送时与文案合并 rich_text / 单图直发 image）
+  const stagedImages = ref<StagedImage[]>([]);
   const loading = ref<boolean>(false);
   const loadFailed = ref<boolean>(false);
   const hasMore = ref<boolean>(false);
@@ -1882,7 +1917,8 @@
   /** 已上报的已读水位（单调递增，避免重复上报）。 */
   let reportedReadSeq: number = 0;
 
-  const canSend = computed((): boolean => inputText.value.trim().length > 0);
+  // 有文案或有暂存图即可发（图文合并发送后，纯图也能点亮发送键）
+  const canSend = computed((): boolean => inputText.value.trim().length > 0 || stagedImages.value.length > 0);
 
   // ===== 会话能力（长按菜单显隐 / 已读 icon 门控；权限权威永远在服务端，这里只做入口 UX） =====
   /** 我的角色：1=普通成员 2=管理员 3=群主（convDetail.myRole；管理权限 = >=2）。 */
@@ -4971,44 +5007,6 @@
     }
   }
 
-  function handleSend(): void {
-    if (pageTapSwallowed()) {
-      return;
-    }
-    // 群已解散：入口禁发（服务端 IM_20105 兜底，这里挡住误触）
-    if (convDisbanded.value) {
-      uni.showToast({ title: t("Mobile.Message.groupDisbandedSendTip"), icon: "none" });
-      return;
-    }
-    const text = inputText.value.trim();
-    if (text.length == 0 || convId.value.length == 0) {
-      return;
-    }
-    // 编辑态：正文原样提交（submitEdit 内不走 applyActiveMarks，见其注释）
-    if (editTarget.value != null) {
-      submitEdit(text);
-      return;
-    }
-    const body = applyActiveMarks(text);
-    inputText.value = "";
-    const clientMsgId = generateUUID();
-    const row = new ImMsgRow();
-    row.msgId = `local-${clientMsgId}`;
-    row.clientMsgId = clientMsgId;
-    row.local = true;
-    row.bodyText = body;
-    const scan = scanMentions(body);
-    row.mentionIds = scan.ids;
-    row.mentionAll = scan.all;
-    applyRichToRow(row);
-    applyQuoteToRow(row);
-    row.sendTime = Date.now();
-    row.status = 0;
-    messages.value.push(row);
-    scrollToBottom();
-    sendWithRow(row);
-  }
-
   /**
    * 媒体发送核心（与 PC 端 sendAttachment 单附件链路对齐）：
    * uploadSingleFile 拿远端 url/size/mime → 按 mime 定 msgType（image/* → image，
@@ -5083,6 +5081,237 @@
       markRowFailed(row.clientMsgId);
       uni.showToast({ title: t("Mobile.Message.sendFailed"), icon: "none" });
     }
+  }
+
+  /**
+   * 图文混排发送核心（与 PC 端 sendComposed 的 rich_text 分支对齐，DEV-159 契约）：
+   * 逐张串行上传（PC 同款背压：并发多文件会撞服务端限流）→ 拼 attachments JSON →
+   * apiImSendRichTextMsg → 确认行按真实 url/mime 重建 imageAtts 后原位替换。
+   * 失败整行标失败，点击气泡全量重传（clientMsgId 幂等防重，部分已上传的 URL 不缓存）。
+   */
+  async function sendRichTextWithRow(row: ImMsgRow, localPaths: string[]): Promise<void> {
+    row.status = 0;
+    try {
+      const files: UploadFileInfo[] = [];
+      for (let i = 0; i < localPaths.length; i++) {
+        // uid 加序号区分多张（与单文件上传的 clientMsgId 用法独立，仅作上传去重标识）
+        const up = await uploadSingleFile(localPaths[i], `${row.clientMsgId}-${i}`, null, "");
+        if (!isChatCurrent()) return;
+        if (up.success != true || up.file == null) {
+          markRowFailed(row.clientMsgId);
+          const reason = up.error != null ? `${up.error}` : "";
+          uni.showToast({
+            title: reason.length > 0 ? reason : t("Mobile.Message.sendFailed"),
+            icon: "none",
+          });
+          return;
+        }
+        const file = up.file;
+        files.push(file);
+      }
+      // attachments JSON：url/fileName/mime 含用户可控字符，一律 JSON.stringify 转义
+      // （buildMergeItemsJson 同款手法）；kind 恒 image（本链路只装图片）。
+      let attsJson = "[";
+      for (let i = 0; i < files.length; i++) {
+        if (i > 0) {
+          attsJson += ",";
+        }
+        const urlJson = JSON.stringify(files[i].url);
+        const nameJson = JSON.stringify(files[i].name);
+        const mimeJson = JSON.stringify(files[i].type);
+        attsJson += `{"kind":"image","url":${urlJson},"fileName":${nameJson},"size":${files[i].size},"mime":${mimeJson}}`;
+      }
+      attsJson += "]";
+      const res = await apiImSendRichTextMsg(
+        convId.value,
+        row.bodyText,
+        attsJson,
+        row.clientMsgId,
+        row.mentionIds.length > 0 ? row.mentionIds : null,
+        row.mentionAll,
+        row.replyId.length > 0 ? row.replyId : "",
+      );
+      if (!isChatCurrent()) return;
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const confirmed = buildConfirmedRow(dataObj, row);
+        confirmed.msgType = "rich_text";
+        confirmed.imageUrl = "";
+        confirmed.linkAtts = [];
+        // 远端真实 url/mime 覆盖乐观行的本地路径占位（readMsgRow 同款三字段）
+        confirmed.imageAtts = [];
+        for (let i = 0; i < files.length; i++) {
+          const att = new ImMsgAtt();
+          att.url = files[i].url;
+          att.fileName = files[i].name;
+          att.mime = files[i].type;
+          confirmed.imageAtts.push(att);
+        }
+        replaceByClientMsgId(confirmed);
+        quoteTarget.value = null;
+        resetQuoteMentionSnapshot();
+        // /api/f/ 受保护地址解析：拿替换进列表后的代理实例改属性才会触发刷新
+        const proxied = findRowByClientMsgId(confirmed.clientMsgId);
+        if (proxied != null) {
+          resolveRowMedia(proxied);
+        }
+        reportReadIfNeeded(maxSeq());
+        refreshReadStatus();
+        scrollToBottom();
+      } else {
+        markRowFailed(row.clientMsgId);
+        // 群已解散被服务端拒（IM_20105）：切换输入坞为已解散灰条（sendWithRow 同款）
+        if (apiResCode(res) == "IM_20105") {
+          convDisbanded.value = true;
+          uni.showToast({ title: t("Mobile.Message.groupDisbandedSendTip"), icon: "none" });
+          return;
+        }
+        const message = apiResMessage(res);
+        uni.showToast({
+          title: message.length > 0 ? message : t("Mobile.Message.sendFailed"),
+          icon: "none",
+        });
+      }
+    } catch (_error) {
+      markRowFailed(row.clientMsgId);
+      uni.showToast({ title: t("Mobile.Message.sendFailed"), icon: "none" });
+    }
+  }
+
+  /**
+   * 媒体消息入队：先以本地内容乐观渲染（图片直接显本地路径，文件先出卡片占位），
+   * 再走上传+发送。isImage：相册/拍摄恒 true（与 PC kindOf 口径一致）；
+   * H5 文件入口传 false，上传后按返回 mime 判定最终类型。
+   */
+  function queueMediaRow(localPath: string, displayName: string, isImage: boolean): void {
+    if (convId.value.length == 0 || localPath.length == 0) {
+      return;
+    }
+    const clientMsgId = generateUUID();
+    const row = new ImMsgRow();
+    row.msgId = `local-${clientMsgId}`;
+    row.clientMsgId = clientMsgId;
+    row.local = true;
+    row.localPath = localPath;
+    row.sendTime = Date.now();
+    row.status = 0;
+    if (isImage) {
+      row.msgType = "image";
+      row.imageUrl = localPath;
+    } else {
+      row.msgType = "file";
+      const att = new ImMsgAtt();
+      att.url = "";
+      att.fileName = displayName;
+      row.linkAtts = [att];
+    }
+    applyQuoteToRow(row);
+    // 多选媒体逐张入队：引用只挂在第一张上（飞书同款），随即消费掉
+    quoteTarget.value = null;
+    resetQuoteMentionSnapshot();
+    messages.value.push(row);
+    scrollToBottom();
+    sendMediaWithRow(row, localPath, displayName);
+  }
+
+  /**
+   * 暂存图消费（发送统一出口）：形态判定对齐 PC chooseMessageShape——
+   * 单图无文字 → image 直发（摘要 [图片]，与存量行为逐字一致）；
+   * 有文字或多图 → 一条 rich_text（body.text + attachments，PC sendComposed 同契约）。
+   * 文字发送键（handleSend）与语音识别（handleVoiceStop）共用：
+   * 语音模式下说完自动发送时，同样带上已选暂存图一起发。
+   * @return true = 本次消费了暂存图并已发起发送（调用方直接 return）；
+   *         false = 无暂存图，调用方走自己的纯文本路径
+   */
+  function dispatchStagedSend(text: string): boolean {
+    if (stagedImages.value.length == 0) {
+      return false;
+    }
+    const paths = [] as string[];
+    for (let i = 0; i < stagedImages.value.length; i++) {
+      paths.push(stagedImages.value[i].localPath);
+    }
+    stagedImages.value = [];
+    if (text.length == 0 && paths.length == 1) {
+      // 单图直发走既有队列（引用消费/乐观行/重试全在 queueMediaRow 链路内，零改动）；
+      // 清掉残留的纯空白输入，与 rich_text 分支发送后清空输入框的口径一致
+      inputText.value = "";
+      queueMediaRow(paths[0], "", true);
+      return true;
+    }
+    const richBody = applyActiveMarks(text);
+    inputText.value = "";
+    const clientMsgId = generateUUID();
+    const row = new ImMsgRow();
+    row.msgId = `local-${clientMsgId}`;
+    row.clientMsgId = clientMsgId;
+    row.local = true;
+    row.msgType = "rich_text";
+    row.bodyText = richBody;
+    const scan = scanMentions(richBody);
+    row.mentionIds = scan.ids;
+    row.mentionAll = scan.all;
+    applyRichToRow(row);
+    applyQuoteToRow(row);
+    for (let i = 0; i < paths.length; i++) {
+      const att = new ImMsgAtt();
+      att.url = paths[i];
+      // mime 占位：isImageAtt 按 image/ 前缀判定，本地临时路径可能无扩展名，
+      // 不占位会误进 linkAtts 渲染成链接卡片；确认行会被真实 mime 覆盖
+      att.mime = "image/jpeg";
+      row.imageAtts.push(att);
+    }
+    row.sendTime = Date.now();
+    row.status = 0;
+    messages.value.push(row);
+    scrollToBottom();
+    sendRichTextWithRow(row, paths);
+    return true;
+  }
+
+  function handleSend(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    // 群已解散：入口禁发（服务端 IM_20105 兜底，这里挡住误触）
+    if (convDisbanded.value) {
+      uni.showToast({ title: t("Mobile.Message.groupDisbandedSendTip"), icon: "none" });
+      return;
+    }
+    const text = inputText.value.trim();
+    // 图文合并发送后：文案与暂存图均空才无内容可发
+    if ((text.length == 0 && stagedImages.value.length == 0) || convId.value.length == 0) {
+      return;
+    }
+    // 编辑态：正文原样提交（submitEdit 内不走 applyActiveMarks，见其注释）；
+    // 编辑不带图——暂存条保留不动，退出编辑态后仍可图文一起发
+    if (editTarget.value != null) {
+      submitEdit(text);
+      return;
+    }
+    // ===== 暂存图分支（语音/文字键共用的发送统一出口，见 dispatchStagedSend） =====
+    if (dispatchStagedSend(text)) {
+      return;
+    }
+    const body = applyActiveMarks(text);
+    inputText.value = "";
+    const clientMsgId = generateUUID();
+    const row = new ImMsgRow();
+    row.msgId = `local-${clientMsgId}`;
+    row.clientMsgId = clientMsgId;
+    row.local = true;
+    row.bodyText = body;
+    const scan = scanMentions(body);
+    row.mentionIds = scan.ids;
+    row.mentionAll = scan.all;
+    applyRichToRow(row);
+    applyQuoteToRow(row);
+    row.sendTime = Date.now();
+    row.status = 0;
+    messages.value.push(row);
+    scrollToBottom();
+    sendWithRow(row);
   }
 
   // ===== 语音消息播放（msgType=audio：页面级单一 InnerAudioContext，点气泡播放/再点停止复位） =====
@@ -5244,6 +5473,16 @@
       return;
     }
     if (msg.status == 2 && msg.local) {
+      // 图文混排行重试：imageAtts 里仍是本地路径（确认替换只发生在成功后），
+      // 全量重传（部分已上传的 URL 不缓存；clientMsgId 幂等保证不会发重）
+      if (msg.msgType == "rich_text" && msg.imageAtts.length > 0) {
+        const retryPaths = [] as string[];
+        for (let i = 0; i < msg.imageAtts.length; i++) {
+          retryPaths.push(msg.imageAtts[i].url);
+        }
+        sendRichTextWithRow(msg, retryPaths);
+        return;
+      }
       if (msg.localPath.length > 0) {
         sendMediaWithRow(
           msg,
@@ -5647,10 +5886,17 @@
     // #endif
   }
 
-  /** 语音识别完成：参考设计"松开发送"，识别文本直接作为文本消息发出。 */
+  /**
+   * 语音识别完成：参考设计"松开发送"，识别文本直接作为文本消息发出；
+   * 有暂存图时与图合并发送（单图直发 image / 图文一条 rich_text，判定同 handleSend）。
+   */
   function handleVoiceStop(result: string): void {
     const text = result.trim();
     if (text.length == 0 || convId.value.length == 0) {
+      return;
+    }
+    // 语音说完自动发送：带上已选暂存图一起发（识别文本即文案；无暂存图走原纯文本路径）
+    if (dispatchStagedSend(text)) {
       return;
     }
     const clientMsgId = generateUUID();
@@ -6567,52 +6813,48 @@
     inputText.value = text.substring(0, cut);
   }
 
-  /**
-   * 媒体消息入队：先以本地内容乐观渲染（图片直接显本地路径，文件先出卡片占位），
-   * 再走上传+发送。isImage：相册/拍摄恒 true（与 PC kindOf 口径一致）；
-   * H5 文件入口传 false，上传后按返回 mime 判定最终类型。
-   */
-  function queueMediaRow(localPath: string, displayName: string, isImage: boolean): void {
-    if (convId.value.length == 0 || localPath.length == 0) {
-      return;
+  /** 暂存图片张数上限（含已暂存量，与既有相册多选 count 同值）。 */
+  const STAGED_IMAGE_MAX = 9;
+
+  /** 暂存条删除单张（按 id 过滤重建数组，响应式安全）。 */
+  function removeStagedImage(id: string): void {
+    const kept = [] as StagedImage[];
+    for (let i = 0; i < stagedImages.value.length; i++) {
+      if (stagedImages.value[i].id != id) {
+        kept.push(stagedImages.value[i]);
+      }
     }
-    const clientMsgId = generateUUID();
-    const row = new ImMsgRow();
-    row.msgId = `local-${clientMsgId}`;
-    row.clientMsgId = clientMsgId;
-    row.local = true;
-    row.localPath = localPath;
-    row.sendTime = Date.now();
-    row.status = 0;
-    if (isImage) {
-      row.msgType = "image";
-      row.imageUrl = localPath;
-    } else {
-      row.msgType = "file";
-      const att = new ImMsgAtt();
-      att.url = "";
-      att.fileName = displayName;
-      row.linkAtts = [att];
-    }
-    applyQuoteToRow(row);
-    // 多选媒体逐张入队：引用只挂在第一张上（飞书同款），随即消费掉
-    quoteTarget.value = null;
-    resetQuoteMentionSnapshot();
-    messages.value.push(row);
-    scrollToBottom();
-    sendMediaWithRow(row, localPath, displayName);
+    stagedImages.value = kept;
   }
 
-  /** 相册 / 拍摄（图片键 action sheet）。路径读取与 conversation-input 同款：tempFilePaths 优先、tempFiles.path 兜底。 */
+  /** 暂存缩略图点击：系统查看器预览（可滑到其余暂存张，微信同款）。 */
+  function handleStagedImageTap(current: string): void {
+    const urls = [] as string[];
+    for (let i = 0; i < stagedImages.value.length; i++) {
+      urls.push(stagedImages.value[i].localPath);
+    }
+    uni.previewImage({ urls, current });
+  }
+
+  /**
+   * 相册 / 拍摄（图片键 action sheet）：选完先入暂存条（不再立即发送），
+   * 可与输入框文案合并成一条 rich_text 发出（形态判定见 handleSend）。
+   * 路径读取与 conversation-input 同款：tempFilePaths 优先、tempFiles.path 兜底。
+   */
   function handlePickImage(source: string): void {
     const sourceTypes =
       source == "camera"
         ? (["camera"] as ("album" | "camera")[])
         : (["album"] as ("album" | "camera")[]);
+    const room = STAGED_IMAGE_MAX - stagedImages.value.length;
+    if (room <= 0) {
+      uni.showToast({ title: tCount("Mobile.Chat.imageMaxSelect", STAGED_IMAGE_MAX), icon: "none" });
+      return;
+    }
     uni.chooseImage({
       sourceType: sourceTypes,
       sizeType: ["compressed"],
-      count: source == "camera" ? 1 : 9,
+      count: source == "camera" ? 1 : room,
       success: (res) => {
         const pathList = [] as string[];
         const pathsFromApi = res.tempFilePaths;
@@ -6633,9 +6875,18 @@
             }
           }
         }
-        // 逐张独立成一条 image 消息（PC 端单附件直发同形态）
-        for (let i = 0; i < pathList.length; i++) {
-          queueMediaRow(pathList[i], "", true);
+        // 逐张入暂存条（点发送时与文案合并 rich_text / 单图直发 image）
+        for (let i = 0; i < pathList.length && i < room; i++) {
+          const staged = new StagedImage();
+          staged.id = generateUUID();
+          staged.localPath = pathList[i];
+          stagedImages.value.push(staged);
+        }
+        if (pathList.length > room) {
+          uni.showToast({
+            title: tCount("Mobile.Chat.imageMaxSelect", STAGED_IMAGE_MAX),
+            icon: "none",
+          });
         }
       },
       fail: (_err) => {
@@ -8690,6 +8941,58 @@
     font-size: 24rpx;
     line-height: 34rpx;
     color: #6f6d7b;
+  }
+
+  /* 待发图片暂存条：横向滚动缩略图行（微信同款），钉在输入坞首行 */
+  .chat-staged {
+    margin-bottom: 12rpx;
+    flex-shrink: 0;
+  }
+
+  .chat-staged__scroll {
+    width: 100%;
+  }
+
+  .chat-staged__row {
+    flex-direction: row;
+    align-items: center;
+    padding: 10rpx 4rpx 4rpx 4rpx;
+  }
+
+  .chat-staged__item {
+    position: relative;
+    width: 140rpx;
+    height: 140rpx;
+    margin-right: 16rpx;
+    flex-shrink: 0;
+  }
+
+  .chat-staged__thumb {
+    width: 140rpx;
+    height: 140rpx;
+    border-radius: 8rpx;
+    background-color: #f2f3f5;
+  }
+
+  .chat-staged__remove {
+    position: absolute;
+    top: -12rpx;
+    right: -12rpx;
+    width: 40rpx;
+    height: 40rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-staged__remove--active {
+    opacity: 0.6;
+  }
+
+  .chat-staged__remove-icon {
+    width: 36rpx;
+    height: 36rpx;
   }
 
   .chat-input-content {

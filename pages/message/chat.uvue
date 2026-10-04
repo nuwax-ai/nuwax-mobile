@@ -220,12 +220,15 @@
                 @touchend="handleMsgTouchEnd"
                 @touchcancel="handleMsgTouchEnd"
               />
-              <!-- 视频消息：不进气泡（对齐图片），深色占位卡 ↔ 原生 <video> 原位切换；
-                   页面级单一活跃实例（activeVideoId），src 持有在页面 ref——行被快照整行替换不中断播放。
-                   ★activeVideoId/videoLoadingId/videoLoadPercent 须在模板表达式直读
+              <!-- 视频消息：不进气泡（对齐图片）。预载策略——进页/增量合并后自动解析视频地址
+                   回填 msg.videoPlayUrl ⇒ 每行常驻原生 <video>（首帧即封面，交给系统播放键
+                   点播，不再做任何自动起播：iOS autoplay/延迟补调均不稳，手点是唯一稳定路径）；
+                   预载未完成/失败时短暂回落深色占位卡（进度文案 / ▶ 手动重试）。
+                   ★videoPlayUrl/videoLoadingId/videoLoadPercent 须在模板表达式直读
                    （App-Android 方法调用绑定不收集方法体内依赖，包进方法 UI 会冻结，readInfoTick 先例）；
-                   <video> 自身不绑 touch——播放后手势全归原生控件，长按面板只在占位卡态可拉起；
-                   全屏：控制条全屏键 + 子组件层兜底按钮，退全屏不清播放状态（原位续播） -->
+                   预载挂载后手势全归原生控件，长按面板只在占位卡态可拉起；
+                   全屏走控制条全屏键；退全屏不清播放状态（原位续播）。
+                   ★iOS 坑：勿往 <video> 里挂子组件（全屏切换子节点销毁闪退 #22070 未修复） -->
               <view
                 v-else-if="msg.msgType == 'video' && msg.videoUrl.length > 0"
                 class="chat-video"
@@ -236,36 +239,39 @@
                 @touchcancel="handleMsgTouchEnd"
               >
                 <video
-                  v-if="msg.msgId == activeVideoId && activeVideoSrc.length > 0"
-                  id="chatVideoPlayer"
+                  v-if="msg.videoPlayUrl.length > 0"
+                  :id="'chatVideoPlayer-' + msg.msgId"
                   class="chat-video__player"
-                  :src="activeVideoSrc"
-                  :autoplay="true"
+                  :src="msg.videoPlayUrl"
                   :controls="true"
                   :show-fullscreen-btn="true"
                   :title="msg.videoFileName"
                   object-fit="contain"
-                  @ended="handleVideoEnded"
-                  @error="handleVideoError"
+                  @ended="handleVideoEnded(msg.msgId)"
+                  @error="handleVideoError(msg.msgId)"
                   @fullscreenchange="handleVideoFullscreenChange"
                 >
-                  <!-- 全屏兜底入口：控制条全屏键之外再给一枚显式按钮（video 官方子组件层，
-                       hello-uniapp-x 同款 @tap.stop）；全屏态隐藏——退出用控制条自带键 -->
-                  <view v-if="videoFullscreen != true" class="chat-video__fs" @tap.stop="requestChatVideoFullscreen">
+                  <!-- #ifdef APP-ANDROID -->
+                  <!-- Android 控制条实测无全屏键，官方 video 子组件层补一枚显式入口
+                       （全屏态隐藏，退出走全屏控制条/系统返回）；iOS 勿开——video 子节点
+                       创建/销毁在 iOS 闪退（#22070 未修复），iOS 用控制条自带全屏键 -->
+                  <view v-if="videoFullscreen != true" class="chat-video__fs" @tap.stop="requestChatVideoFullscreen(msg.msgId)">
                     <view class="chat-video__fs-corner chat-video__fs-corner--tl" />
                     <view class="chat-video__fs-corner chat-video__fs-corner--tr" />
                     <view class="chat-video__fs-corner chat-video__fs-corner--bl" />
                     <view class="chat-video__fs-corner chat-video__fs-corner--br" />
                   </view>
+                  <!-- #endif -->
                 </video>
                 <view v-else class="chat-video__poster">
-                  <view class="chat-video__play">
-                    <text class="chat-video__play-glyph">▶</text>
-                  </view>
-                  <text v-if="msg.videoFileName.length > 0" class="chat-video__name text-ellipsis">{{ msg.videoFileName }}</text>
+                  <!-- 预载中只显进度；未预载/失败显 ▶ 可点重试（成功即被 <video> 首帧顶替） -->
                   <text v-if="msg.msgId == videoLoadingId && videoLoadPercent >= 0" class="chat-video__hint">{{ t("Mobile.FileTree.downloading") }} {{ videoLoadPercent }}%</text>
                   <text v-else-if="msg.msgId == videoLoadingId" class="chat-video__hint">{{ t("Mobile.FileTree.downloading") }}</text>
-                  <text v-else-if="msg.videoSize > 0" class="chat-video__hint">{{ videoSizeLabel(msg.videoSize) }}</text>
+                  <view v-else class="chat-video__play">
+                    <!-- ▶ 文字字形各平台字体度量不一，固定 margin 补不齐；PNG 按像素
+                         精确光学居中（bbox 中心右移 14/512），三端渲染一致 -->
+                    <image class="chat-video__play-icon" src="/static/images/icon-video-play.png" mode="aspectFit" />
+                  </view>
                 </view>
               </view>
               <view
@@ -1284,7 +1290,6 @@
     resolveAuthProtectedFileFetchUrl,
   } from "@/utils/authProtectedFileUrl";
   import { previewImageCompat } from "@/utils/appWebViewImagePreview";
-  import { formatBytes } from "@/utils/byteConverter";
   // #ifdef APP
   import { downloadFileInApp } from "@/subpackages/utils/fileTree";
   import { saveVideoToAlbumInApp } from "@/utils/appWebViewImagePreview";
@@ -1485,7 +1490,9 @@
     videoFileName: string = "";
     /** 视频大小字节（body.size，占位卡角标展示，0 不显示）。 */
     videoSize: number = 0;
-    /** 受保护地址解析产物（temp/blob 路径）的脚本层缓存：重放免二次下载；播放 src 用页面级 activeVideoSrc（行被快照替换不中断）。 */
+    /** 可播地址（CDN 直链或受保护地址解析产物 temp/blob）：非空 ⇒ 模板挂原生 <video> 显首帧。
+     *  ★须经 messages.value 代理实例回填（改原始对象不触发视图刷新）；
+     *  行被快照整行替换会丢失，预载扫到后从缓存命中即时补回（换新实例重启到首帧）。 */
     videoPlayUrl: string = "";
     imageAtts: ImMsgAtt[] = [];
     linkAtts: ImMsgAtt[] = [];
@@ -4709,6 +4716,190 @@
     }
   }
 
+  // ===== 视频预载（msgType=video：进页/增量合并后自动解析地址回填行，首帧常驻 <video>） =====
+  // /api/f/ 受保护地址 <video> src 带不了 Bearer：解析成 temp（H5 blob）地址回填
+  // msg.videoPlayUrl ⇒ 模板按行挂 <video>（controls 自带播放键点播——不做任何自动起播：
+  // iOS autoplay/延迟补调 play() 均不稳定，手点是唯一稳定路径，10-04 定稿）。
+  // ★本块必须定义在 mergeSyncedMessages / insertMessageBySeq 之前（它们尾部要调
+  //   preloadChatVideos，UTS 严格要求先定义后调用）；模板事件处理器在语音块之后。
+
+  /** 受保护地址解析中的 msgId（占位卡显示「下载中」，模板直读）。 */
+  const videoLoadingId = ref<string>("");
+  /** 解析进度百分比（-1=不确定，无进度回调的平台只显「下载中」；模板直读）。 */
+  const videoLoadPercent = ref<number>(-1);
+  /** 任一视频是否全屏（fullscreenchange 回写；模板直读控制 Android 全屏兜底按钮显隐）。 */
+  const videoFullscreen = ref<boolean>(false);
+  /** 原始 url → 已解析 src 缓存（重放免二次下载；temp 文件由 OS 回收，这里只缓存路径）。 */
+  const chatVideoResolved = new Map<string, string>();
+  /** H5 blob 地址登记（onUnload 统一 revoke，对齐 chatImageUrls）。 */
+  const chatVideoUrls = new Set<string>();
+  /** 在途解析去重（同 url 并发触发共享同一次下载，对齐 chatImageRequests）。 */
+  const chatVideoRequests = new Map<string, Promise<string>>();
+  /** 批量预载防重入（在途轮次未结束时新触发直接放弃，漏行等下一轮合并/插入补扫）。 */
+  let chatVideoPreloadBusy = false;
+
+  /** 指定行的 <video> 元素（每行独立 id：预载后多行常驻，非单实例）。 */
+  function getChatVideoElement(msgId: string): UniVideoElement | null {
+    return uni.getElementById(`chatVideoPlayer-${msgId}`) as UniVideoElement | null;
+  }
+
+  /** 暂停所有已挂载视频（页面隐藏 / 播语音互斥；不清 src——回来仍停在该帧）。 */
+  function pauseChatVideos(): void {
+    for (let i = 0; i < messages.value.length; i++) {
+      const row = messages.value[i];
+      if (row.videoPlayUrl.length > 0) {
+        const el = getChatVideoElement(row.msgId);
+        if (el != null) {
+          el.pause();
+        }
+      }
+    }
+  }
+
+  // App 端：页面内 downloadFile 薄封装（与 fetchAuthProtectedFileDisplayUrl 同鉴权头），
+  // 额外拿 DownloadTask.onProgressUpdate 驱动占位卡百分比
+  // #ifdef APP
+  function fetchChatVideoProtectedUrl(
+    url: string,
+    onProgress: ((percent: number) => void) | null,
+  ): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
+      const task = uni.downloadFile({
+        url: fetchUrl,
+        header: buildAuthProtectedFileHeaders(),
+        success: (res) => {
+          const tempPath = res.tempFilePath;
+          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+            resolve(tempPath);
+            return;
+          }
+          console.error(`[ChatVideo] downloadFile statusCode=${res.statusCode} url=${fetchUrl}`);
+          reject(new Error(`download statusCode ${res.statusCode}`));
+        },
+        fail: (err) => {
+          console.error(`[ChatVideo] downloadFile fail url=${fetchUrl}`, err);
+          reject(new Error(err.errMsg != null ? err.errMsg : "download fail"));
+        },
+      });
+      task.onProgressUpdate((res) => {
+        if (onProgress != null) {
+          onProgress(res.progress);
+        }
+      });
+    });
+  }
+  // #endif
+  // 非 App 端：复用通用受保护文件拉取（H5 换 blob；小程序换 temp），无进度回调
+  // #ifndef APP
+  function fetchChatVideoProtectedUrl(
+    url: string,
+    _onProgress: ((percent: number) => void) | null,
+  ): Promise<string> {
+    return fetchAuthProtectedFileDisplayUrl(url);
+  }
+  // #endif
+
+  /** 解析视频可播地址：CDN 直链原样返回；受保护地址换 temp/blob（带缓存与在途去重）。 */
+  async function resolveChatVideo(
+    url: string,
+    onProgress: ((percent: number) => void) | null,
+  ): Promise<string> {
+    if (isAuthProtectedFileUrl(url) != true) {
+      return url;
+    }
+    const cached = chatVideoResolved.get(url);
+    if (cached != null) {
+      return cached;
+    }
+    const existing = chatVideoRequests.get(url);
+    if (existing != null) {
+      return await existing;
+    }
+    const task = fetchChatVideoProtectedUrl(url, onProgress);
+    chatVideoRequests.set(url, task);
+    try {
+      const resolved = await task;
+      if (!isChatCurrent()) {
+        releaseDisplayImageUrl(resolved);
+        return url;
+      }
+      if (resolved.startsWith("blob:")) {
+        chatVideoUrls.add(resolved);
+      }
+      chatVideoResolved.set(url, resolved);
+      return resolved;
+    } finally {
+      chatVideoRequests.delete(url);
+    }
+  }
+
+  /** 单条视频预载：解析可播地址并回填行字段（videoPlayUrl 非空 ⇒ 模板挂 <video> 显首帧）。
+   *  ★await 期间行可能被快照整行替换：按 msgId 经 messages.value 重取代理实例再写
+   *  （insertMessageBySeq 注释同款约束：改原始对象不触发视图刷新）。失败静默（占位卡
+   *  ▶ 可再点重试）；同 url 并发由 chatVideoRequests 去重。 */
+  async function preloadChatVideoRow(msgId: string, url: string): Promise<void> {
+    videoLoadingId.value = msgId;
+    videoLoadPercent.value = -1;
+    try {
+      const src = await resolveChatVideo(url, (percent: number): void => {
+        // 进度只归属于当前等待的那条（快速换点另一条时旧回调静默）
+        if (videoLoadingId.value == msgId) {
+          videoLoadPercent.value = percent;
+        }
+      });
+      if (!isChatCurrent()) {
+        return;
+      }
+      for (let i = 0; i < messages.value.length; i++) {
+        const row = messages.value[i];
+        if (row.msgId == msgId) {
+          row.videoPlayUrl = src;
+          break;
+        }
+      }
+    } catch (_e) {
+      console.error(`[ChatVideo] 预载失败 msgId=${msgId} url=${url}`);
+    } finally {
+      if (videoLoadingId.value == msgId) {
+        videoLoadingId.value = "";
+        videoLoadPercent.value = -1;
+      }
+    }
+  }
+
+  /** 批量预载（进页合并 / 翻页 / 新消息插入后调用）：从最新往回扫，视频行且未挂载的
+   *  逐条顺序预载（顺序下载避免多视频并发抢带宽；缓存命中零成本回填）。 */
+  async function preloadChatVideos(): Promise<void> {
+    if (chatVideoPreloadBusy) {
+      return;
+    }
+    chatVideoPreloadBusy = true;
+    try {
+      for (let i = messages.value.length - 1; i >= 0; i--) {
+        const row = messages.value[i];
+        if (row.msgType == "video" && row.videoUrl.length > 0 && row.videoPlayUrl.length == 0) {
+          if (!isChatCurrent()) {
+            return;
+          }
+          await preloadChatVideoRow(row.msgId, row.videoUrl);
+        }
+      }
+    } finally {
+      chatVideoPreloadBusy = false;
+    }
+  }
+
+  /** 卸载释放：H5 blob 统一 revoke、缓存表清空（对齐 releaseChatImages）。 */
+  function releaseChatVideos(): void {
+    chatVideoUrls.forEach((url) => {
+      releaseDisplayImageUrl(url);
+    });
+    chatVideoUrls.clear();
+    chatVideoResolved.clear();
+    chatVideoRequests.clear();
+  }
+
   function releaseChatImages(): void {
     chatImageUrls.forEach((url: string) => { releaseDisplayImageUrl(url); });
     chatImageUrls.clear();
@@ -4802,6 +4993,8 @@
       const row = messages.value[i];
       if (changed.has(row.msgId)) resolveRowMedia(row);
     }
+    // 视频预载：批量合并落库后扫一遍未挂载的视频行（缓存命中零成本，非视频行零开销）
+    preloadChatVideos();
     reportReadIfNeeded(maxSeq());
     return true;
   }
@@ -5511,162 +5704,45 @@
     stopVoiceTickTimer();
   }
 
-  // ===== 视频消息播放（msgType=video：页面级单一 <video>，占位卡原位切换） =====
-  // /api/f/ 受保护地址 <video> src 带不了 Bearer：点击时懒解析成 temp（H5 blob）地址再播——
-  // 不做整页预解析（图片小必显示才预解析，视频动辄几 MB，随行渲染全量下载不可接受）；
-  // 播完/换条/离开页面复位占位卡（原生实例随 v-if 卸载由引擎回收）。
-  // ★若真机出现 video 嵌 scroll-view 渲染异常，降级路径：同一状态机改为页面级全屏遮罩渲染（只改挂载点）。
+  // ===== 视频消息模板事件处理器（预载状态与函数见本页前段「视频预载」块） =====
+  // 按 msgId 寻址各自 <video>（每行常驻实例）；置于语音块之后：点按互斥需 stopChatAudio。
 
-  /** 正在播放的视频 msgId（空=无；模板直读它切 <video> 分支）。 */
-  const activeVideoId = ref<string>("");
-  /** 活跃实例的可播 src（CDN 直链或解析产物 temp/blob）。持有在页面而非行内字段——快照整行替换不中断播放。 */
-  const activeVideoSrc = ref<string>("");
-  /** 受保护地址解析中的 msgId（占位卡显示「下载中」，模板直读）。 */
-  const videoLoadingId = ref<string>("");
-  /** 解析进度百分比（-1=不确定，无进度回调的平台只显「下载中」；模板直读）。 */
-  const videoLoadPercent = ref<number>(-1);
-  /** 当前视频是否全屏（fullscreenchange 回写；模板直读控制全屏兜底按钮显隐）。 */
-  const videoFullscreen = ref<boolean>(false);
-  /** 原始 url → 已解析 src 缓存（重放免二次下载；temp 文件由 OS 回收，这里只缓存路径）。 */
-  const chatVideoResolved = new Map<string, string>();
-  /** H5 blob 地址登记（onUnload 统一 revoke，对齐 chatImageUrls）。 */
-  const chatVideoUrls = new Set<string>();
-  /** 在途解析去重（同 url 并发点击共享同一次下载，对齐 chatImageRequests）。 */
-  const chatVideoRequests = new Map<string, Promise<string>>();
-
-  /** 当前活跃 <video> 元素（固定 id：单实例保证同屏仅一个；chat-input-textarea 同款取法）。 */
-  function getActiveVideoElement(): UniVideoElement | null {
-    return uni.getElementById("chatVideoPlayer") as UniVideoElement | null;
-  }
-
-  /** 停止当前视频：卸载 <video> 回占位卡、收下载态。 */
-  function stopChatVideo(): void {
+  /** 播放结束：seek(0) 定格首帧当封面（原生控制条可直接重播）；全屏态播完先退全屏。 */
+  function handleVideoEnded(msgId: string): void {
+    const el = getChatVideoElement(msgId);
+    if (el == null) {
+      return;
+    }
     if (videoFullscreen.value) {
-      // 全屏态下结束/换条/离开页面：先退全屏再卸载实例，避免残留系统全屏层
-      const el = getActiveVideoElement();
-      if (el != null) {
-        el.exitFullScreen();
-      }
+      el.exitFullScreen();
       videoFullscreen.value = false;
     }
-    activeVideoId.value = "";
-    activeVideoSrc.value = "";
-    videoLoadingId.value = "";
-    videoLoadPercent.value = -1;
+    el.seek(0);
   }
 
-  /** 播放结束：复位占位卡（微信同款播完回封面态）。 */
-  function handleVideoEnded(): void {
-    stopChatVideo();
-  }
-
-  /** 播放器报错：日志 + toast + 复位（占位卡保留可重点重试）。 */
-  function handleVideoError(): void {
-    console.error(`[ChatVideo] 播放器报错 msgId=${activeVideoId.value} src=${activeVideoSrc.value}`);
+  /** 播放器报错：日志 + toast（保持挂载，系统播放键自带重试）。 */
+  function handleVideoError(msgId: string): void {
+    console.error(`[ChatVideo] 播放器报错 msgId=${msgId}`);
     uni.showToast({ title: t("Mobile.Message.videoPlayFailed"), icon: "none" });
-    stopChatVideo();
   }
 
-  /** 全屏状态变化：只回写标记，退出全屏不清 activeVideoId——<video> 原地继续内联播放
-   *  （复位只存在于 ended/error；用户要求：关全屏回会话页原位续播）。 */
+  /** 全屏状态变化：只回写标记（任一视频全屏时隐藏 Android 兜底按钮）；退全屏不清
+   *  播放状态——<video> 原地继续内联播放（用户要求：关全屏回会话页原位续播）。 */
   function handleVideoFullscreenChange(event: UniVideoFullScreenChangeEvent): void {
     videoFullscreen.value = event.detail.fullScreen;
   }
 
-  /** 全屏兜底按钮：requestFullScreen 传 null = 按视频宽高比自动定方向（横屏录屏转横屏全屏）。 */
-  function requestChatVideoFullscreen(): void {
-    const el = getActiveVideoElement();
+  /** Android 全屏入口（video 子组件层按钮，按 msgId 寻址）：requestFullScreen 传
+   *  null = 按视频宽高比自动定方向（横屏录屏转横屏；auto 判定 5.21 起修复，基座 5.26 可用）。 */
+  function requestChatVideoFullscreen(msgId: string): void {
+    const el = getChatVideoElement(msgId);
     if (el == null) {
       return;
     }
     el.requestFullScreen(null);
   }
 
-  /** 视频大小文案。包一层本地函数：模板插值直调外部 import 函数编译不通过（uvue 已知问题 error18，t 同款包装）。 */
-  function videoSizeLabel(bytes: number): string {
-    return formatBytes(bytes, 1);
-  }
-
-  // App 端：页面内 downloadFile 薄封装（与 fetchAuthProtectedFileDisplayUrl 同鉴权头），
-  // 额外拿 DownloadTask.onProgressUpdate 驱动占位卡百分比
-  // #ifdef APP
-  function fetchChatVideoProtectedUrl(
-    url: string,
-    onProgress: ((percent: number) => void) | null,
-  ): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
-      const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
-      const task = uni.downloadFile({
-        url: fetchUrl,
-        header: buildAuthProtectedFileHeaders(),
-        success: (res) => {
-          const tempPath = res.tempFilePath;
-          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
-            resolve(tempPath);
-            return;
-          }
-          console.error(`[ChatVideo] downloadFile statusCode=${res.statusCode} url=${fetchUrl}`);
-          reject(new Error(`download statusCode ${res.statusCode}`));
-        },
-        fail: (err) => {
-          console.error(`[ChatVideo] downloadFile fail url=${fetchUrl}`, err);
-          reject(new Error(err.errMsg != null ? err.errMsg : "download fail"));
-        },
-      });
-      task.onProgressUpdate((res) => {
-        if (onProgress != null) {
-          onProgress(res.progress);
-        }
-      });
-    });
-  }
-  // #endif
-  // 非 App 端：复用通用受保护文件拉取（H5 换 blob；小程序换 temp），无进度回调
-  // #ifndef APP
-  function fetchChatVideoProtectedUrl(
-    url: string,
-    _onProgress: ((percent: number) => void) | null,
-  ): Promise<string> {
-    return fetchAuthProtectedFileDisplayUrl(url);
-  }
-  // #endif
-
-  /** 解析视频可播地址：CDN 直链原样返回；受保护地址换 temp/blob（带缓存与在途去重）。 */
-  async function resolveChatVideo(
-    url: string,
-    onProgress: ((percent: number) => void) | null,
-  ): Promise<string> {
-    if (isAuthProtectedFileUrl(url) != true) {
-      return url;
-    }
-    const cached = chatVideoResolved.get(url);
-    if (cached != null) {
-      return cached;
-    }
-    const existing = chatVideoRequests.get(url);
-    if (existing != null) {
-      return await existing;
-    }
-    const task = fetchChatVideoProtectedUrl(url, onProgress);
-    chatVideoRequests.set(url, task);
-    try {
-      const resolved = await task;
-      if (!isChatCurrent()) {
-        releaseDisplayImageUrl(resolved);
-        return url;
-      }
-      if (resolved.startsWith("blob:")) {
-        chatVideoUrls.add(resolved);
-      }
-      chatVideoResolved.set(url, resolved);
-      return resolved;
-    } finally {
-      chatVideoRequests.delete(url);
-    }
-  }
-
-  /** 视频占位卡点按：原位切 <video> 播放（单实例——换条自动卸载旧的；再点由原生控件接管）。
-   *  受保护地址先懒解析（占位卡转「下载中 N%」），解析完自动起播；失败 toast 后复位可重试。 */
+  /** 占位卡点按（仅预载未完成/失败行可见）：手动触发该条预载；已挂载行手势归原生控件。 */
   function handleVideoMsgTap(msg: ImMsgRow): void {
     if (rowPressFired || pageTapSwallowed()) {
       return;
@@ -5674,71 +5750,20 @@
     if (multiGuard(msg)) {
       return;
     }
-    if (msg.videoUrl.length == 0) {
+    if (msg.videoUrl.length == 0 || msg.videoPlayUrl.length > 0) {
       return;
     }
-    if (msg.msgId == activeVideoId.value) {
+    if (msg.msgId == videoLoadingId.value) {
       return;
     }
     // 音视频互斥（语音侧见 handleAudioMsgTap 开头）
     stopChatAudio();
-    if (isAuthProtectedFileUrl(msg.videoUrl) != true) {
-      activeVideoSrc.value = msg.videoUrl;
-      activeVideoId.value = msg.msgId;
-      return;
-    }
-    const cached = chatVideoResolved.get(msg.videoUrl);
-    if (cached != null) {
-      activeVideoSrc.value = cached;
-      activeVideoId.value = msg.msgId;
-      return;
-    }
-    videoLoadingId.value = msg.msgId;
-    videoLoadPercent.value = -1;
-    resolveChatVideo(msg.videoUrl, (percent: number): void => {
-      // 进度只归属于当前等待的那条（快速换点另一条时旧回调静默）
-      if (videoLoadingId.value == msg.msgId) {
-        videoLoadPercent.value = percent;
-      }
-    })
-      .then((src: string) => {
-        if (!isChatCurrent()) {
-          return;
-        }
-        if (videoLoadingId.value == msg.msgId) {
-          activeVideoSrc.value = src;
-          activeVideoId.value = msg.msgId;
-          videoLoadingId.value = "";
-          videoLoadPercent.value = -1;
-        }
-        // best-effort 回填行内缓存（mergeSyncedMessages 整行替换后丢失仅多一次下载，无碍）
-        msg.videoPlayUrl = src;
-      })
-      .catch((_e: any | null) => {
-        console.error(`[ChatVideo] 受保护视频解析失败 msgId=${msg.msgId} url=${msg.videoUrl}`);
-        if (isChatCurrent() && videoLoadingId.value == msg.msgId) {
-          uni.showToast({ title: t("Mobile.Message.videoPlayFailed"), icon: "none" });
-          videoLoadingId.value = "";
-          videoLoadPercent.value = -1;
-        }
-      });
-  }
-
-  /** 卸载释放：H5 blob 统一 revoke、缓存表清空（对齐 releaseChatImages）。 */
-  function releaseChatVideos(): void {
-    chatVideoUrls.forEach((url) => {
-      releaseDisplayImageUrl(url);
-    });
-    chatVideoUrls.clear();
-    chatVideoResolved.clear();
-    chatVideoRequests.clear();
+    preloadChatVideoRow(msg.msgId, msg.videoUrl);
   }
 
   /** 语音气泡点按：播放/停止（微信同款——再点停止复位，换条从头播；播视频先停视频，音视频互斥）。 */
   function handleAudioMsgTap(msg: ImMsgRow): void {
-    if (activeVideoId.value.length > 0) {
-      stopChatVideo();
-    }
+    pauseChatVideos();
     if (msg.msgId == playingAudioId.value) {
       stopChatAudio();
       return;
@@ -7539,6 +7564,8 @@
     // <image> 仍持旧地址，表现为「列表里图不显示、点击却能放大」（点击经代理
     // 读到的是新地址）。WS 实时消息与静默同步插入都走本函数。
     resolveRowMedia(messages.value[insertAt]);
+    // 视频预载：新插入的视频行也自动挂首帧（非视频行扫描零成本）
+    preloadChatVideos();
     // 滚动到底部：仅当 row 是新增且 seq 大于本地最大 seq（真正的实时消息）
     if (isChatActive() && autoScroll && insertAt >= rows.length - 1) {
       scrollToBottom();
@@ -8050,7 +8077,6 @@
     eventBus.off(IM_SESSION_CLEARED, onImSessionCleared);
     pageDisposed = true;
     releaseChatImages();
-    stopChatVideo();
     releaseChatVideos();
     // onUnload 时原生退场动画可能仍在绘制本页；保留最后一帧数据，
     // 随页面实例销毁回收，避免清空数组触发“暂无聊天消息”闪烁。
@@ -8163,9 +8189,9 @@
   onHide(() => {
     releasePrependAnchor();
     pageVisible = false;
-    // 进子页/切后台停语音/视频播放（微信同款：离开聊天即停）
+    // 进子页/切后台停语音/视频播放（微信同款：离开聊天即停；视频只暂停不清首帧）
     stopChatAudio();
-    stopChatVideo();
+    pauseChatVideos();
     if (!listSettled.value && scrollAnchor.value.length > 0) deferredAnchor = scrollAnchor.value;
     clearChatUiTimers();
     cancelSettle();
@@ -8671,8 +8697,9 @@
     background-color: #000000;
   }
 
-  /* 全屏兜底按钮（video 子组件层，非全屏态显示）：56rpx 半透明黑圆 + 四角括号
-     纯 view 绘制（不依赖字体字形，双端渲染一致；半透明底保证浅/深画面上都可见） */
+  /* 全屏兜底按钮（仅 APP-ANDROID：控制条实测无全屏键）：56rpx 半透明黑圆 + 四角括号
+     纯 view 绘制（不依赖字体字形）；全屏态由 v-if 卸载（Android 子节点创建/销毁安全，
+     iOS 勿用——#22070 闪退） */
   .chat-video__fs {
     position: absolute;
     top: 12rpx;
@@ -8738,18 +8765,12 @@
     justify-content: center;
   }
 
-  .chat-video__play-glyph {
-    font-size: 36rpx;
-    color: #ffffff;
-    /* ▶ 字形基线偏右，左移一点视觉居中 */
-    margin-left: -6rpx;
-  }
-
-  .chat-video__name {
-    margin-top: 14rpx;
-    max-width: 360rpx;
-    font-size: 24rpx;
-    color: rgba(255, 255, 255, 0.9);
+  /* PNG 内已做光学居中（bbox 中心右移 14/512）；再整体右移 4rpx（≈2px，
+     10-04 真机校准追加）——flex 居中布局下 margin 即视觉位移，三端一致 */
+  .chat-video__play-icon {
+    width: 60rpx;
+    height: 60rpx;
+    margin-left: 4rpx;
   }
 
   .chat-video__hint {

@@ -57,6 +57,10 @@
          展开输入面板（fixed 蒙层/浮层）与让位填充带必须留在此包裹外 -->
     <view class="chat-main" :style="chatMainStyle">
 
+    <!-- 消息列滚动区包裹层：仅为「回到底部」浮钮充当 absolute 定位锚（底缘即输入坞顶，
+         暂存条/回复条/多选条都在坞内，浮钮天然悬于其上；不包一层则锚到 chat-main 底，
+         浮钮会被高度动态变化的输入坞盖住） -->
+    <view class="chat-body-wrap">
     <!-- 消息列表（升序渲染；向下滑到顶加载更早） -->
     <scroll-view
       id="im-chat-body"
@@ -492,6 +496,25 @@
       <!-- 底部锚点：scroll-into-view 定位用 -->
       <view id="chat-bottom" class="chat-bottom-anchor" />
     </scroll-view>
+
+    <!-- 「回到底部」浮钮：滚上去看历史时出现（白圆底双下箭头），点击滚到最新并消失；
+         不设 z-index——底部面板槽/展开蒙层按 DOM 序与层级自然盖住；多选态隐藏 -->
+    <view
+      v-if="showJumpLatest && multiSelectMode != true"
+      class="chat-jump-latest"
+      hover-class="chat-jump-latest--active"
+      @click="handleJumpLatest"
+    >
+      <view class="chat-jump-latest__arrows">
+        <view class="chat-jump-latest__arrow">
+          <svg-icon name="icon-a-Chevrondown" size="30" color="#6b6878" />
+        </view>
+        <view class="chat-jump-latest__arrow chat-jump-latest__arrow--lower">
+          <svg-icon name="icon-a-Chevrondown" size="30" color="#6b6878" />
+        </view>
+      </view>
+    </view>
+    </view>
 
     <!-- 多选态底部工具条：取消 + 逐条转发 + 合并转发（>50 条禁用合并，服务端上限 50 items） -->
     <view v-if="multiSelectMode" class="chat-multibar" :style="{ paddingBottom: 6 + safeBottomPx + 'px' }">
@@ -4376,6 +4399,49 @@
   /** 距底余量阈值（px）：离开时距底小于该值视为「在底部」，进页直接滚最新。 */
   const NEAR_BOTTOM_PX = 120;
 
+  // ===== 「回到底部」浮钮（读历史时出现，点击滚到最新） =====
+  // ★须定义在 scrollToAnchorWithSettle 之前（UTS 不提升声明，定位落定回调里要调
+  //   scheduleJumpLatestCheck 校准浮钮；handleJumpLatest 因引用 scrollToBottom
+  //   挪到其后定义）。
+  const showJumpLatest = ref<boolean>(false);
+  /** 触发展示阈值（px）：距底余量超过该值才算「在读历史」——略大于 NEAR_BOTTOM_PX，
+   *  避免贴底微滚/回弹就闪钮。 */
+  const JUMP_LATEST_TRIGGER_PX = 200;
+  let jumpLatestCheckTimer = 0;
+
+  /** 距底探测：与 saveScrollMemo 同款 boundingClientRect 方案——scrollOffset
+   *  族查询真机实测 App 端拿不到值；键盘/面板展开时视口整体平移，两组矩形同处
+   *  平移后坐标系，差值仍有效，照常探测。★须定义在 scheduleJumpLatestCheck 之前
+   *  （UTS 不提升声明，error18：定时器回调体里的调用同样要求先定义）。 */
+  function checkJumpLatest(): void {
+    if (!isChatCurrent() || multiSelectMode.value || messages.value.length == 0 || listSettled.value != true) {
+      return;
+    }
+    const query = uni.createSelectorQuery();
+    query.select(".chat-body").boundingClientRect();
+    query.select("#chat-bottom").boundingClientRect();
+    query.exec((results: Array<any>) => {
+      if (!isChatCurrent() || multiSelectMode.value) return;
+      if (results.length < 2 || results[0] == null || results[1] == null) return;
+      const bodyRect = results[0] as NodeInfo;
+      const endRect = results[1] as NodeInfo;
+      if (bodyRect.top == null || bodyRect.height == null || endRect.top == null) return;
+      // 距底余量 = 底部锚点 top（视口坐标）- 滚动区可视底缘：在读历史为正，贴底 ≈ 0
+      const distBottom = parseFloat(`${endRect.top}`) - (parseFloat(`${bodyRect.top}`) + parseFloat(`${bodyRect.height}`));
+      showJumpLatest.value = distBottom > JUMP_LATEST_TRIGGER_PX;
+    });
+  }
+
+  /** 节流式排队一次距底探测（已有在途则不叠加）：长按滚动过程中也能周期性亮/灭浮钮，
+   *  不是只等滚动停稳。 */
+  function scheduleJumpLatestCheck(delay: number): void {
+    if (jumpLatestCheckTimer != 0) return;
+    jumpLatestCheckTimer = setTimeout(() => {
+      jumpLatestCheckTimer = 0;
+      checkJumpLatest();
+    }, delay);
+  }
+
   /**
    * 锚点定位 + 稳定重定位 + 揭幕（滚底 / 阅读位置恢复共用）。
    * App 端原生布局异步完成：一拍 nextTick 后 scroll-into-view 可能仍早于内容
@@ -4413,9 +4479,12 @@
             if (!isChatActive() || version != settleVersion) return;
             scrollAnchor.value = anchorId;
             listSettled.value = true;
+            // 程序化定位不必然派发 @scroll：落定后主动校准浮钮（滚底→藏，恢复历史位→亮）
+            scheduleJumpLatestCheck(60);
           });
         } else {
           listSettled.value = true;
+          scheduleJumpLatestCheck(60);
         }
       }, 150);
     });
@@ -4423,6 +4492,13 @@
 
   function scrollToBottom(): void {
     scrollToAnchorWithSettle("chat-bottom");
+  }
+
+  /** 浮钮点击：滚到最新消息并藏钮（定位被抢/失败时滚动事件会再探测复位）。 */
+  function handleJumpLatest(): void {
+    if (pageTapSwallowed()) return;
+    showJumpLatest.value = false;
+    scrollToBottom();
   }
 
   // ===== Android 键盘高度兜底（WindowInsets 轮询） =====
@@ -4711,6 +4787,8 @@
       scrollMemoSaveTimer = 0;
       saveScrollMemo();
     }, 500);
+    // 「回到底部」浮钮节流探测（在读历史→亮，滚回贴底→灭）
+    scheduleJumpLatestCheck(250);
   }
 
   // ===== 消息区按压触摸处理（状态与 class 函数在 cardBusyKey 后；此处引用 chatScrolling）=====
@@ -6266,6 +6344,8 @@
       scrollAnchor.value = `msg-${msgId}`;
       listSettled.value = true;
       flashHighlight(msgId);
+      // 引用/搜索跳转常落在中部历史区：落定后校准浮钮（亮）
+      scheduleJumpLatestCheck(60);
     });
   }
 
@@ -8352,9 +8432,11 @@
     if (chatScrollIdleTimer != 0) clearTimeout(chatScrollIdleTimer);
     if (pressTouchTimer != 0) clearTimeout(pressTouchTimer);
     if (pageTouchResetTimer != 0) clearTimeout(pageTouchResetTimer);
+    if (jumpLatestCheckTimer != 0) clearTimeout(jumpLatestCheckTimer);
     chatScrollIdleTimer = 0;
     pressTouchTimer = 0;
     pageTouchResetTimer = 0;
+    jumpLatestCheckTimer = 0;
   }
 
   onLoad((options: any) => {
@@ -8695,10 +8777,57 @@
     color: #1f2329;
   }
 
+  /* 消息列滚动区包裹层：仅为「回到底部」浮钮充当 absolute 定位锚（底缘即输入坞顶） */
+  .chat-body-wrap {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+
   .chat-body {
     flex: 1;
     min-height: 0;
     padding: 36rpx 32rpx 16rpx;
+  }
+
+  /* ===== 「回到底部」浮钮：读历史时悬于列表右下（白圆底 + 双下箭头）。
+     不设 z-index——底部面板槽(z1)/展开蒙层(z998+)按 DOM 序与层级自然盖住 ===== */
+  .chat-jump-latest {
+    position: absolute;
+    right: 28rpx;
+    bottom: 32rpx;
+    width: 88rpx;
+    height: 88rpx;
+    border-radius: 44rpx;
+    background-color: #ffffff;
+    box-shadow: 0 4rpx 16rpx rgba(31, 35, 41, 0.12);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-jump-latest--active {
+    background-color: #f2f3f5;
+  }
+
+  .chat-jump-latest__arrows {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .chat-jump-latest__arrow {
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  /* 双箭头叠影：下枚上提与上枚错叠出「快进到底」双箭头观感 */
+  .chat-jump-latest__arrow--lower {
+    margin-top: -18rpx;
   }
 
   .chat-foot {

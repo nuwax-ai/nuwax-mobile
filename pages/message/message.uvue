@@ -612,11 +612,11 @@
   import { refreshImUnreadBadge, setImContactPendingCount } from "@/utils/imUnreadBadge";
   import eventBus from "@/utils/eventBus";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
-  import { releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
+  import { isAuthProtectedFileUrl, releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
-  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { isRemoteSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   // 本地图标用 png：App 端 <image> 官方支持格式不含 svg，部分机型直接不渲染（对齐 agent-union-record 做法）
   import iconGroupSet from "@/static/icons/group_set.png";
@@ -1060,14 +1060,24 @@
 
   // ===== 头像 / 图标展示地址解析（受保护 /api/f/ 与远程 SVG 统一经 resolveDisplayImageUrl）=====
   // 页面级正缓存 rawUrl→展示地址：onShow/WS 整表 reload 时同步命中回填，已出过的图不再闪回字母底；
-  // 负缓存按原始 URL 记忆失败（<image> @error 记入）：reload 重建行对象后继承 avatarFailed，
-  // 失败头像稳定停在渐变字母底，不再「图→字母→图」循环闪动。
+  // 负缓存按原始 URL 记忆连续失败（有限重试耗尽后由 <image> @error 记入）：
+  // reload 重建行对象后继承 avatarFailed，真正失败的头像稳定停在渐变字母底。
   // 已渲染缓存按原始 URL 记忆成功（<image> @load 记入）：reload 重建行对象后继承 avatarLoaded——
   // 行 key 不变时 Vue 复用 <image> 元素、正缓存同步回填的 src 无变化，@load 不会补发，
   // 不继承则字母底重新叠出（透明底头像重影回归）。
   const resolvedIconCache = new Map<string, string>();
   const failedIconUrls = new Set<string>();
   const renderedIconUrls = new Set<string>();
+  // 覆盖安装后的首次冷启动可能遇到 token/网络/原生网络栈尚未稳定；
+  // 受保护头像解析失败时延迟重试，避免一次瞬时失败被永久留在本页。
+  let iconResolveRetryTimer = 0;
+  let iconResolveRetryCount = 0;
+  const MAX_ICON_RESOLVE_RETRIES = 3;
+  let iconResolveRetryRunner: (() => void) | null = null;
+  // <image> 原生加载瞬时失败时，按原始 URL 做少量重试；真正失败后才进入负缓存。
+  const iconLoadRetryTimers = new Map<string, number>();
+  const iconLoadRetryCounts = new Map<string, number>();
+  const MAX_ICON_LOAD_RETRIES = 2;
 
   /** 头像展示尺寸 46px CSS → rpx（setup 期算一次，喂给 resolveDisplayImageUrl 出图）。 */
   const avatarSysInfo = uni.getSystemInfoSync();
@@ -1103,6 +1113,23 @@
     }, 50);
   }
 
+  function scheduleIconResolveRetry(delayMs: number = 1000): void {
+    if (iconResolveRetryTimer != 0 || iconResolveRetryCount >= MAX_ICON_RESOLVE_RETRIES) {
+      return;
+    }
+    iconResolveRetryCount += 1;
+    iconResolveRetryTimer = setTimeout(() => {
+      iconResolveRetryTimer = 0;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) {
+        return;
+      }
+      const runner = iconResolveRetryRunner;
+      if (runner != null) {
+        runner();
+      }
+    }, delayMs);
+  }
+
   /**
    * 解析并回填单个头像/图标地址（apply 收可直接绑定给 <image> 的地址）。
    * ★rows 须取自 ref 数组（响应式代理实例），异步写入才会触发渲染刷新（chat.uvue resolveRowMedia 同款）。
@@ -1122,6 +1149,29 @@
           releaseDisplayImageUrl(resolved);
           return;
         }
+        // resolveDisplayImageUrl 在受保护资源失败时会回退原 URL。
+        // 原 URL 没有鉴权，直接绑定只会再次触发 401/error；不要把它当正缓存，
+        // 给冷启动的 token/网络初始化留出有限重试机会。
+        if (
+          resolved == rawUrl &&
+          (isAuthProtectedFileUrl(rawUrl)
+            // App 原生 SVG 需要先下载改尺寸；失败时不能把原地址当成成功结果缓存。
+            // #ifdef APP-ANDROID || APP-IOS
+            || isRemoteSvgUrl(rawUrl)
+            // #endif
+          )
+        ) {
+          // App SVG 失败后工具层有 5 秒负缓存，页面重试需稍晚于该窗口；
+          // 普通受保护位图仍按 1/2/3 秒快速重试。
+          let retryDelayMs = 1000;
+          // #ifdef APP-ANDROID || APP-IOS
+          if (isRemoteSvgUrl(rawUrl)) {
+            retryDelayMs = 5500;
+          }
+          // #endif
+          scheduleIconResolveRetry(retryDelayMs);
+          return;
+        }
         if (resolved.length > 0) {
           resolvedIconCache.set(rawUrl, resolved);
           apply(resolved);
@@ -1130,8 +1180,8 @@
         }
       })
       .catch((_e: any | null): void => {
-        // 解析异常回退原地址的语义已由 resolveDisplayImageUrl 内部兜底；这里真异常时静默，
-        // 交给 <image> 原生渲染兜底（Cookie 命中等），真失败由 @error 记入负缓存
+        // 解析器通常会把失败回退成原地址；这里保留静默兜底，
+        // 真实加载失败仍由 @error 负责落到字母/默认群图。
       });
   }
 
@@ -1172,6 +1222,114 @@
         row.iconDisplay = resolved;
       });
     }
+  }
+
+  iconResolveRetryRunner = (): void => {
+    resolveConvRowsIcons(conversations.value);
+    resolveContactRowsIcons(acceptedContacts.value);
+    resolveContactRowsIcons(pendingInContacts.value);
+    resolveContactRowsIcons(pendingOutContacts.value);
+    resolveConvRowsIcons(myGroups.value);
+    resolveSpaceRowsIcons(mySpaces.value);
+  };
+
+  function resetRowsForIconRetry(rawUrl: string): void {
+    for (let i = 0; i < conversations.value.length; i++) {
+      const row = conversations.value[i];
+      if (row.avatarUrl == rawUrl) {
+        row.avatarDisplay = "";
+        row.avatarLoaded = false;
+        row.avatarFailed = false;
+      }
+    }
+    for (let i = 0; i < acceptedContacts.value.length; i++) {
+      const row = acceptedContacts.value[i];
+      if (row.avatarUrl == rawUrl) {
+        row.avatarDisplay = "";
+        row.avatarLoaded = false;
+        row.avatarFailed = false;
+      }
+    }
+    for (let i = 0; i < pendingInContacts.value.length; i++) {
+      const row = pendingInContacts.value[i];
+      if (row.avatarUrl == rawUrl) {
+        row.avatarDisplay = "";
+        row.avatarLoaded = false;
+        row.avatarFailed = false;
+      }
+    }
+    for (let i = 0; i < pendingOutContacts.value.length; i++) {
+      const row = pendingOutContacts.value[i];
+      if (row.avatarUrl == rawUrl) {
+        row.avatarDisplay = "";
+        row.avatarLoaded = false;
+        row.avatarFailed = false;
+      }
+    }
+    for (let i = 0; i < myGroups.value.length; i++) {
+      const row = myGroups.value[i];
+      if (row.avatarUrl == rawUrl) {
+        row.avatarDisplay = "";
+        row.avatarLoaded = false;
+        row.avatarFailed = false;
+      }
+    }
+    for (let i = 0; i < mySpaces.value.length; i++) {
+      const row = mySpaces.value[i];
+      if (row.icon == rawUrl) {
+        row.iconDisplay = "";
+        row.iconLoaded = false;
+        row.iconFailed = false;
+      }
+    }
+    scheduleIconTableRefresh();
+  }
+
+  function retryIconAfterLoadError(rawUrl: string): void {
+    if (rawUrl.length == 0 || messagePageDisposed || messagePageSession != getImSessionStamp()) {
+      return;
+    }
+    const existingTimer = iconLoadRetryTimers.get(rawUrl);
+    if (existingTimer != null) {
+      return;
+    }
+    const currentCount = iconLoadRetryCounts.get(rawUrl) ?? 0;
+    if (currentCount >= MAX_ICON_LOAD_RETRIES) {
+      failedIconUrls.add(rawUrl);
+      return;
+    }
+    iconLoadRetryCounts.set(rawUrl, currentCount + 1);
+    failedIconUrls.delete(rawUrl);
+    renderedIconUrls.delete(rawUrl);
+    const cached = resolvedIconCache.get(rawUrl);
+    if (cached != null) {
+      releaseDisplayImageUrl(cached);
+      resolvedIconCache.delete(rawUrl);
+    }
+    resetRowsForIconRetry(rawUrl);
+    const delayMs = 1000 * (currentCount + 1);
+    const timer = setTimeout(() => {
+      iconLoadRetryTimers.delete(rawUrl);
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) {
+        return;
+      }
+      const runner = iconResolveRetryRunner;
+      if (runner != null) {
+        runner();
+      }
+    }, delayMs);
+    iconLoadRetryTimers.set(rawUrl, timer);
+  }
+
+  function markIconLoaded(rawUrl: string): void {
+    if (rawUrl.length == 0) return;
+    const timer = iconLoadRetryTimers.get(rawUrl);
+    if (timer != null) {
+      clearTimeout(timer);
+      iconLoadRetryTimers.delete(rawUrl);
+    }
+    iconLoadRetryCounts.delete(rawUrl);
+    failedIconUrls.delete(rawUrl);
   }
 
   function readConvRow(obj: UTSJSONObject): ImConvRow {
@@ -2903,6 +3061,7 @@
       后继承（复用的 <image> src 未变不补发 @load）；失败路径见下方 @error 系列。 */
   function handleConvAvatarLoaded(conv: ImConvRow): void {
     conv.avatarLoaded = true;
+    markIconLoaded(conv.avatarUrl);
     if (conv.avatarUrl.length > 0) {
       renderedIconUrls.add(conv.avatarUrl);
     }
@@ -2912,6 +3071,7 @@
 
   function handleContactAvatarLoaded(contact: ImContactRow): void {
     contact.avatarLoaded = true;
+    markIconLoaded(contact.avatarUrl);
     if (contact.avatarUrl.length > 0) {
       renderedIconUrls.add(contact.avatarUrl);
     }
@@ -2921,32 +3081,33 @@
   /** 团队 icon 渲染成功（@load）：字母退场 + 记已渲染缓存（语义同头像）。 */
   function handleSpaceIconLoaded(space: ImSpaceRow): void {
     space.iconLoaded = true;
+    markIconLoaded(space.icon);
     if (space.icon.length > 0) {
       renderedIconUrls.add(space.icon);
     }
     scheduleIconTableRefresh();
   }
 
-  /** 头像真图渲染失败：行内置灰 + 按原始 URL 记入负缓存（reload 继承，不再反复闪）。 */
+  /** 头像真图渲染失败：先做有限重试，连续失败后才按原始 URL 记入负缓存。 */
   function handleConvAvatarError(conv: ImConvRow): void {
     conv.avatarFailed = true;
     if (conv.avatarUrl.length > 0) {
-      failedIconUrls.add(conv.avatarUrl);
+      retryIconAfterLoadError(conv.avatarUrl);
     }
   }
 
   function handleContactAvatarError(contact: ImContactRow): void {
     contact.avatarFailed = true;
     if (contact.avatarUrl.length > 0) {
-      failedIconUrls.add(contact.avatarUrl);
+      retryIconAfterLoadError(contact.avatarUrl);
     }
   }
 
-  /** 团队 icon 加载失败：回落字母渐变底（同联系人/群组行）。 */
+  /** 团队 icon 加载失败：先做有限重试，连续失败后回落字母渐变底。 */
   function handleSpaceIconError(space: ImSpaceRow): void {
     space.iconFailed = true;
     if (space.icon.length > 0) {
-      failedIconUrls.add(space.icon);
+      retryIconAfterLoadError(space.icon);
     }
   }
 
@@ -3133,6 +3294,12 @@
     if (pageTouchResetTimer != 0) clearTimeout(pageTouchResetTimer);
     if (convRefreshTimer != 0) clearTimeout(convRefreshTimer);
     convRefreshTimer = 0;
+    if (iconResolveRetryTimer != 0) clearTimeout(iconResolveRetryTimer);
+    iconResolveRetryTimer = 0;
+    iconResolveRetryCount = 0;
+    iconLoadRetryTimers.forEach((timer: number) => { clearTimeout(timer); });
+    iconLoadRetryTimers.clear();
+    iconLoadRetryCounts.clear();
   }
 
   const onImSessionCleared = (_event: any): void => {

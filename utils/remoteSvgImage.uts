@@ -16,7 +16,8 @@ import { getImSessionStamp } from "@/utils/im/imSessionScope";
  * 5. 生成 data:image/svg+xml URL，按「宽x高|URL」缓存；失败回退原 URL。
  *
  * 长列表保护：同一 URL 的在途请求会共用一次下载（去重），整体下载并发受闸门限制（默认 5），
- * 失败 URL 记入负缓存不再重试；调用方应按需（可见行）解析，不要一次性 await 全量列表。
+ * 失败 URL 只短暂记入负缓存并允许后续重试；调用方应按需（可见行）解析，
+ * 不要一次性 await 全量列表。
  *
  * 注意：Android / iOS 为 1:1 绘制，每个显示尺寸必须各自调用（各自生成对应物理像素的 data URL）。
  *
@@ -48,11 +49,12 @@ export function isRemoteSvgUrl(url: string): boolean {
 // #ifdef APP-ANDROID || APP-IOS
 const svgTextCache = new Map<string, string>();
 const svgDataUrlCache = new Map<string, string>();
-/** 下载失败（含超时）的 URL：不再重复发起，直接回退原图，避免长列表反复卡在 8s 超时上 */
-const svgFailedCache = new Map<string, boolean>();
+/** 下载失败（含超时）的 URL：短时间内回退原图，稍后允许一次重试，避免冷启动瞬时失败被永久记住 */
+const svgFailedCache = new Map<string, number>();
 /** 同一 URL 的在途下载：多行共用同一张图时只发一次请求 */
 const svgPendingRequests = new Map<string, Promise<string>>();
 const SVG_CACHE_LIMIT = 128;
+const SVG_FAILURE_RETRY_MS = 5000;
 let svgCacheSession = "";
 function prepareSvgCache(): void {
   const stamp = getImSessionStamp();
@@ -113,6 +115,10 @@ function downloadSvgText(url: string, timeoutMs: number): Promise<string> {
       // 不显式 dataType 会把 SVG/XML 文本当 JSON parse 并上报错误
       dataType: "text",
       success: (res) => {
+        if (res.statusCode != 200) {
+          reject(new Error(`svg http status ${res.statusCode}`));
+          return;
+        }
         const data = res.data;
         if (data == null) {
           reject(new Error("svg response empty"));
@@ -120,15 +126,20 @@ function downloadSvgText(url: string, timeoutMs: number): Promise<string> {
         }
         if (typeof data == "string") {
           const text = data as string;
-          if (text.trim().length == 0) {
-            reject(new Error("svg response empty"));
+          const trimmed = text.trim();
+          if (trimmed.length == 0 || trimmed.toLowerCase().indexOf("<svg") < 0) {
+            reject(new Error("svg response is not svg"));
             return;
           }
           resolve(text);
           return;
         }
         const s = JSON.stringify(data);
-        resolve(s != null ? s : "");
+        if (s == null || s.trim().toLowerCase().indexOf("<svg") < 0) {
+          reject(new Error("svg response is not svg"));
+          return;
+        }
+        resolve(s);
       },
       fail: (_err) => {
         reject(new Error("svg download failed"));
@@ -232,8 +243,11 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
   const cacheKey = widthPx.toString() + "x" + heightPx.toString() + "|" + url;
   const cached = svgDataUrlCache.get(cacheKey);
   if (cached != null && cached.length > 0) return cached;
-  // 之前已确认下载不到：直接回退，不再排队重试
-  if (svgFailedCache.get(url) != null) return url;
+  const failedAt = svgFailedCache.get(url);
+  if (failedAt != null) {
+    if (Date.now() - failedAt < SVG_FAILURE_RETRY_MS) return url;
+    svgFailedCache.delete(url);
+  }
   const stamp = getImSessionStamp();
   try {
     const text = await fetchSvgText(url, 8000);
@@ -246,8 +260,8 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
     svgDataUrlCache.set(cacheKey, dataUrl);
     return dataUrl;
   } catch (_e) {
-    // 下载/处理失败回退原始 URL（仍按 App 默认行为渲染），并记入失败缓存避免重复重试
-    if (stamp == getImSessionStamp()) svgFailedCache.set(url, true);
+    // 下载/处理失败短暂回退原始 URL；避免一次冷启动网络/鉴权瞬时失败永久污染本页。
+    if (stamp == getImSessionStamp()) svgFailedCache.set(url, Date.now());
     return url;
   }
   // #endif
@@ -277,9 +291,10 @@ export async function resolveDisplayImageUrl(
   if (url.length == 0) return url;
   // #ifdef APP-ANDROID || APP-IOS
   if (isRemoteSvgUrl(url)) {
-    const resolved = await resolveAppSvgUrl(url, widthRpx, heightRpx);
-    // 解析成功（已是 data URL）直接用；失败时受保护地址再退回 downloadFile 兜底
-    if (resolved != url) return resolved;
+    // App 端 SVG 必须始终走「下载文本 → 改尺寸 → data URL」；
+    // 解析失败时返回原地址交给调用方重试，不能再落成本地临时文件，
+    // 否则会绕过尺寸改写，恢复 Android 原生 SVG 的裁切/变形问题。
+    return await resolveAppSvgUrl(url, widthRpx, heightRpx);
   }
   // #endif
   if (isAuthProtectedFileUrl(url)) {

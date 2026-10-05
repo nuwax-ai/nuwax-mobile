@@ -452,27 +452,10 @@
     isOpenUiOnlyParagraph as resolveIsOpenUiOnlyParagraph
   } from '../openui/openui-node-helpers.js'
 
-  /** 资料库路径交给业务 linktap 打开，避免相对地址被当成 uni 页面 navigateTo。 */
+  /** 资料库路径以 /repo/ 开头，交给业务 linktap 打开，避免被当成 uni 页面 navigateTo。 */
   function isRepoLibraryHref (href) {
     if (href == null) return false
-    let value = `${href}`.trim()
-    if (value.length === 0) return false
-    if (value.indexOf('//') === 0) value = 'https:' + value
-    const lower = value.toLowerCase()
-    let path = value
-    if (lower.indexOf('http://') === 0 || lower.indexOf('https://') === 0) {
-      const after = value.substring(value.indexOf('://') + 3)
-      const slash = after.indexOf('/')
-      if (slash < 0) return false
-      path = after.substring(slash)
-    } else if (value.indexOf('://') >= 0) {
-      return false
-    }
-    const hashIdx = path.indexOf('#')
-    if (hashIdx >= 0) path = path.substring(0, hashIdx)
-    const queryIdx = path.indexOf('?')
-    if (queryIdx >= 0) path = path.substring(0, queryIdx)
-    return path.indexOf('/repo/doc/') >= 0 || path.indexOf('/repo/share/') >= 0
+    return `${href}`.trim().indexOf('/repo/') === 0
   }
 
   export default {

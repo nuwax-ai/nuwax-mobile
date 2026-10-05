@@ -35,17 +35,26 @@
         @load="handleWebviewLoad"
         @message="handleWebviewMessage"
       ></web-view>
+      <!-- #ifdef APP -->
+      <!-- 不可见占位：Android 内容区只有 web-view 时会走全屏原生层，createWebviewContext 拿不到，cookie 注入会失效。 -->
+      <view class="webview-placeholder" />
+      <!-- #endif -->
     </view>
   </view>
 </template>
 
 <script lang="uts" setup>
   import { computed, ref } from "vue";
+  // #ifdef APP
+  import { getCurrentInstance } from "vue";
+  // #endif
   import { removeQueryCompat, isHttpUrl } from "@/utils/common";
   import { NO_LOGIN_CHECK_URL } from "@/constants/config";
   import { apiUserTicketCreate } from "@/servers/agentDev";
+  import { ACCESS_TOKEN } from "@/constants/home.constants";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { onLoad, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
+  import { onLoad, onUnload, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
+  import { isRepoLibraryPath } from "@/utils/repoLibraryLink";
   import { isTabPage } from "@/utils/commonBusiness";
   // #ifdef APP-IOS
   // iOS：返回时须显式恢复 TabBar（常驻壳关壳可能 hide 过）
@@ -67,6 +76,15 @@
   const pageTitle = ref<string>("");
   // 分享按钮显隐：调用方在本页路由上传 hideShare=1 即可隐藏（如「关于我们」这类纯展示页）
   const showShare = ref<boolean>(true);
+  // 资料库页要写入 document.cookie 的 ticket。非资料库、未取到票据时为空。
+  // 小程序 web-view 不能 evalJS，票据只走地址上的 _ticket。
+  let repoPageTicket = "";
+  // #ifdef APP
+  const instance = getCurrentInstance();
+  let webViewContext: WebviewContext | null = null;
+  let repoCookieTimer: number = 0;
+  let repoCookieAttempts = 0;
+  // #endif
 
   const displayPageTitle = computed(
     (): string =>
@@ -147,10 +165,136 @@
     });
   };
 
+  /** 本地登录 token。鸿蒙清空时会写成空串。 */
+  const readCachedAccessToken = (): string => {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    if (tokenRaw == null) {
+      return "";
+    }
+    return `${tokenRaw}`.trim();
+  };
+
+  /**
+   * 从地址里取出完整 `_ticket`。
+   * 通用查询解析按第一个 `=` 截断，票据里的填充符会被切掉。
+   */
+  const readQueryTicket = (raw: string): string => {
+    const hashIdx = raw.indexOf("#");
+    const withoutHash = hashIdx >= 0 ? raw.substring(0, hashIdx) : raw;
+    const marker = "_ticket=";
+    const idx = withoutHash.indexOf(marker);
+    if (idx < 0) {
+      return "";
+    }
+    const start = idx + marker.length;
+    const amp = withoutHash.indexOf("&", start);
+    const encoded = amp >= 0 ? withoutHash.substring(start, amp) : withoutHash.substring(start);
+    if (encoded.length == 0) {
+      return "";
+    }
+    try {
+      const decoded = decodeURIComponent(encoded);
+      return decoded != null ? `${decoded}` : encoded;
+    } catch (_e) {
+      return encoded;
+    }
+  };
+
+  /**
+   * 记下资料库页的 ticket，供打开后写入 cookie。
+   * 其它页面只把 _ticket 放在地址上，不写 cookie。
+   */
+  const rememberRepoPageTicket = (pageUrl: string, ticket: string): void => {
+    let value = ticket.trim();
+    const hashIdx = value.indexOf("#");
+    if (hashIdx >= 0) {
+      value = value.substring(0, hashIdx).trim();
+    }
+    if (value.length == 0 || isRepoLibraryPath(pageUrl) == false) {
+      repoPageTicket = "";
+      return;
+    }
+    repoPageTicket = value;
+  };
+
+  // #ifdef APP
+  const stopRepoTicketCookieInject = (): void => {
+    if (repoCookieTimer != 0) {
+      clearInterval(repoCookieTimer);
+      repoCookieTimer = 0;
+    }
+  };
+
+  /**
+   * 在已打开的资料库文档上写 `ticket` cookie。
+   * 地址还停在 about:blank 时跳过，避免写到错误的源上。
+   * 返回 true 只表示拿到 context 且 evalJS 没有抛错。
+   */
+  const injectRepoTicketCookieOnce = (): boolean => {
+    if (repoPageTicket.length == 0) {
+      return false;
+    }
+    let ctx: WebviewContext | null = webViewContext;
+    if (ctx == null) {
+      try {
+        ctx = uni.createWebviewContext(
+          "webview",
+          instance != null ? instance.proxy : null,
+        );
+        webViewContext = ctx;
+      } catch (_e) {
+        return false;
+      }
+      if (ctx == null) {
+        return false;
+      }
+    }
+    const ticketLiteral = JSON.stringify(repoPageTicket);
+    try {
+      ctx.evalJS(
+        `try{var h=location.href||'';if(h.indexOf('/repo/doc/')<0&&h.indexOf('/repo/share/')<0){return;}document.cookie='ticket='+${ticketLiteral}+'; path=/';}catch(e){}`,
+      );
+    } catch (_e) {
+      return false;
+    }
+    return true;
+  };
+
+  /**
+   * 文档加载后短轮询写入 cookie。
+   * 加载过程中的 evalJS 可能落在中间文档上，页面内跳转后需要再写一次。
+   */
+  const startRepoTicketCookieInject = (): void => {
+    stopRepoTicketCookieInject();
+    webViewContext = null;
+    if (repoPageTicket.length == 0) {
+      return;
+    }
+    repoCookieAttempts = 0;
+    injectRepoTicketCookieOnce();
+    repoCookieTimer = setInterval((): void => {
+      repoCookieAttempts++;
+      injectRepoTicketCookieOnce();
+      if (repoCookieAttempts >= 12) {
+        stopRepoTicketCookieInject();
+      }
+    }, 250) as number;
+  };
+  // #endif
+
+  const injectRepoTicketCookie = (): void => {
+    // #ifdef APP
+    startRepoTicketCookieInject();
+    // #endif
+  };
+
   // WebView 加载完成
   const handleWebviewLoad = (e: any) => {
     // Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
     fixAppWebviewTextZoom();
+    if (repoPageTicket.length > 0) {
+      injectRepoTicketCookie();
+    }
     // #ifdef MP-WEIXIN || APP
     if (isNeedCallApi.value) {
       uni.showLoading({
@@ -346,6 +490,14 @@
     const ticketVal = queryParams["_ticket"];
     if (ticketVal != null) {
       url.value = currentUrl;
+      if (isRepoLibraryPath(currentUrl)) {
+        const existingTicket = readQueryTicket(currentUrl);
+        rememberRepoPageTicket(
+          currentUrl,
+          existingTicket.length > 0 ? existingTicket : `${ticketVal}`,
+        );
+        injectRepoTicketCookie();
+      }
     } else {
       // 暂存当前url（仅微信小程序读取 globalThis.appConfig，APP 端无读取方）
       // #ifdef MP-WEIXIN
@@ -358,11 +510,24 @@
         const baseUrl = hashIdx >= 0 ? currentUrl.substring(0, hashIdx) : currentUrl;
         const hashStr = hashIdx >= 0 ? currentUrl.substring(hashIdx) : "";
         const andStr = baseUrl.includes("?") ? "&" : "?";
-        url.value = baseUrl + andStr + `_ticket=${ticketResult.data}` + hashStr;
+        const createdTicket = `${ticketResult.data}`;
+        url.value = baseUrl + andStr + `_ticket=${createdTicket}` + hashStr;
+        if (isRepoLibraryPath(currentUrl)) {
+          rememberRepoPageTicket(currentUrl, createdTicket);
+          injectRepoTicketCookie();
+        }
       } else {
         // ticket 获取失败也加载原地址：web-view 仅在 url 非空时挂载，
-        // 不兜底会整页白屏（目标站自身的登录/错误页至少可见、可操作）
+        // 不兜底会整页白屏（目标站自身的登录/错误页至少可见、可操作）。
+        // 仅资料库页改用本地登录 token 作为 cookie ticket 注入。
         url.value = currentUrl;
+        if (isRepoLibraryPath(currentUrl)) {
+          const cachedToken = readCachedAccessToken();
+          if (cachedToken.length > 0) {
+            rememberRepoPageTicket(currentUrl, cachedToken);
+            injectRepoTicketCookie();
+          }
+        }
       }
     }
     // #endif
@@ -371,6 +536,12 @@
   onLoad((params: OnLoadOptions) => {
     onLoadInit(params);
     fixAppWebviewTextZoom();
+  });
+
+  onUnload(() => {
+    // #ifdef APP
+    stopRepoTicketCookieInject();
+    // #endif
   });
 
   // #ifdef MP-WEIXIN
@@ -431,5 +602,11 @@
   .web-view {
     width: 100%;
     height: 100%;
+  }
+
+  .webview-placeholder {
+    width: 0;
+    height: 0;
+    overflow: hidden;
   }
 </style>

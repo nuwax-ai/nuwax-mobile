@@ -140,9 +140,9 @@
             @touchcancel.stop="handleAvatarPressEnd"
           >
             <image
-              v-if="avatarSrcOf(msg).length > 0 && avatarFailedOf(msg) != true"
+              v-if="avatarSrcOf(msg, avatarResolveTick).length > 0 && avatarFailedOf(msg) != true"
               class="chat-ava"
-              :src="avatarSrcOf(msg)"
+              :src="avatarSrcOf(msg, avatarResolveTick)"
               mode="aspectFill"
               @error="handleAvatarError(msg)"
             />
@@ -5101,10 +5101,65 @@
     videoRetryIds.clear();
   }
 
+  // ===== 头像展示地址解析（与下方 resolveRowMedia 同理由）=====
+  // /api/f/ 受保护头像与远程 SVG：<image> 带不了 Bearer（H5 被 ORB 拦成
+  // net::ERR_BLOCKED_BY_ORB），经 resolveDisplayImageUrl 带 Bearer 拉取换可展示地址
+  // （H5 blob / App 临时文件 / SVG 按尺寸 data URL），avatarSrcOf 渲染时查缓存替换；
+  // 普通地址原样保留（真机直连可出图，不产生额外请求）。
+  /** .chat-ava 展示尺寸（rpx），App 端 SVG 按此出物理像素图 */
+  const AVATAR_DISPLAY_RPX = 76;
+  /** 原始地址 → 已解析展示地址（avatarSrcOf 渲染时查表） */
+  const avatarDisplayCache = new Map<string, string>();
+  /** 已发起过解析的原始地址（含失败回退原地址的：不重试，对齐 SVG 负缓存语义） */
+  const avatarAttemptedUrls = new Set<string>();
+  /** H5 blob 地址登记：releaseChatImages 统一 revoke */
+  const avatarBlobUrls = new Set<string>();
+  /** 在途去重：同地址并发触发共享同一次解析 */
+  const avatarRequests = new Set<string>();
+  /** 头像解析版本号：App-Android 方法调用绑定不收集方法体内依赖（readInfoTick 先例），
+   * 解析完成 bump 一次强制模板重算 avatarSrcOf。 */
+  const avatarResolveTick = ref<number>(0);
+
+  function resolveChatAvatarUrl(url: string): void {
+    // ★仅浏览器 H5 生效：App 三端 <image> 原生加载器直连可用（无 ORB），保持原地址
+    //   直连，不额外下载换 temp/SVG 地址（避开 temp/SVG 渲染路径裁圆不生效的坑）
+    // #ifdef H5 || WEB
+    if (url.length == 0) return;
+    if (avatarDisplayCache.has(url) || avatarAttemptedUrls.has(url)) return;
+    if (avatarRequests.has(url)) return;
+    avatarAttemptedUrls.add(url);
+    avatarRequests.add(url);
+    resolveDisplayImageUrl(url, AVATAR_DISPLAY_RPX, AVATAR_DISPLAY_RPX)
+      .then((resolved: string) => {
+        avatarRequests.delete(url);
+        // 普通地址 / 解析失败回退：保持原地址直连（真机可用，H5 交 @error 兜底字母头像）
+        if (resolved == url) return;
+        if (!isChatCurrent()) {
+          // 会话已切换：blob 立即回收防泄漏（缓存随 releaseChatImages 清空）
+          if (resolved.startsWith("blob:")) releaseDisplayImageUrl(resolved);
+          return;
+        }
+        if (resolved.startsWith("blob:")) avatarBlobUrls.add(resolved);
+        avatarDisplayCache.set(url, resolved);
+        avatarResolveTick.value = avatarResolveTick.value + 1;
+      })
+      .catch((_e: any | null) => {
+        avatarRequests.delete(url);
+        // resolveDisplayImageUrl 内部已兜底回退原地址；防御异常路径即可
+      });
+    // #endif
+  }
+
   function releaseChatImages(): void {
     chatImageUrls.forEach((url: string) => { releaseDisplayImageUrl(url); });
     chatImageUrls.clear();
     chatImageRequests.clear();
+    // 头像解析产物一并回收：会话切换/页面卸载后 blob 已失效，缓存须清空防悬挂引用
+    avatarBlobUrls.forEach((url: string) => { releaseDisplayImageUrl(url); });
+    avatarBlobUrls.clear();
+    avatarDisplayCache.clear();
+    avatarAttemptedUrls.clear();
+    avatarRequests.clear();
   }
 
   /**
@@ -5119,6 +5174,8 @@
       return;
     }
     deferredMediaIds.delete(row.msgId);
+    // 头像同走受保护/SVG 解析（H5 ORB / App SVG 光栅化；attempted 去重，普通地址零成本）
+    resolveChatAvatarUrl(row.senderAvatar);
     if (row.imageUrl.length > 0) {
       const url = row.imageUrl;
       resolveChatImage(url, 300)
@@ -7976,11 +8033,30 @@
   }
 
   // ===== 头像 =====
-  function avatarSrcOf(msg: ImMsgRow): string {
+  /** H5：未解析的受保护地址先藏图（返回空，同消息列表——裸 <img> 请求必被 ORB 拦，
+   * 还会触发 @error 标死字母兜底）；已解析/普通地址原样返回。App 端恒原样（不解析直连）。 */
+  function h5HideUnresolvedProtected(url: string): string {
+    // #ifdef H5 || WEB
+    if (isAuthProtectedFileUrl(url)) return "";
+    // #endif
+    return url;
+  }
+
+  /** ★尾参 tick（App-Android 方法调用绑定不收集方法体内依赖，readInfoTick 先例）：
+   * 头像异步解析完成后 bump avatarResolveTick 强制本绑定重算，换上可展示地址。 */
+  function avatarSrcOf(msg: ImMsgRow, _tick: number = 0): string {
     if (msg.senderAvatar.length > 0) {
-      return msg.senderAvatar;
+      const hit = avatarDisplayCache.get(msg.senderAvatar);
+      if (hit != null) return hit;
+      return h5HideUnresolvedProtected(msg.senderAvatar);
     }
-    return isMine(msg) ? myAvatar.value : peerAvatar.value;
+    const raw = isMine(msg) ? myAvatar.value : peerAvatar.value;
+    if (raw.length > 0) {
+      const hit = avatarDisplayCache.get(raw);
+      if (hit != null) return hit;
+      return h5HideUnresolvedProtected(raw);
+    }
+    return raw;
   }
 
   function avatarFailedOf(msg: ImMsgRow): boolean {
@@ -7993,6 +8069,8 @@
     } else {
       msg.avatarFailed = true;
     }
+    // App-Android 方法绑定不收集依赖：bump 通知上方 v-if 重算，切到字母渐变兜底
+    avatarResolveTick.value = avatarResolveTick.value + 1;
   }
 
   function avatarLetter(name: string): string {
@@ -8439,6 +8517,7 @@
           const userName = readString(dataObj, "userName");
           myDisplayName.value = nickName.length > 0 ? nickName : userName;
           myAvatar.value = readString(dataObj, "avatar");
+          resolveChatAvatarUrl(myAvatar.value);
         }
       }
     } catch (_error) {
@@ -8489,6 +8568,7 @@
     const name = readOption(options, "name");
     titleName.value = name.length > 0 ? name : t("Mobile.Common.conversations");
     peerAvatar.value = readOption(options, "avatar");
+    resolveChatAvatarUrl(peerAvatar.value);
     // 搜索页带来的定位消息：历史首屏就绪后翻页查找并滚动高亮（onShow 兜底应用）
     const jumpMsgId = readOption(options, "jumpMsgId");
     if (convId.value.length > 0) {

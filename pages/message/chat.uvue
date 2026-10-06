@@ -1322,6 +1322,9 @@
       @closed="handleSheetClosed"
     />
 
+    <!-- 删除消息二次确认（按人删除：仅自己的可见范围，红钮确认） -->
+    <confirm-modal ref="confirmModalRef" @confirm="handleDeleteConfirmOk" @cancel="handleDeleteConfirmCancel" />
+
     <!-- 合并转发聊天记录详情页：点卡片经 imMergeRecordSession 暂存跳转（openMergeDetail） -->
   </view>
 </template>
@@ -1342,6 +1345,7 @@
     apiImConvDetail,
     apiImConvMembers,
     apiImConvPins,
+    apiImDeleteMsg,
     apiImEditMsg,
     apiImForwardMsg,
     apiImMessages,
@@ -1406,6 +1410,7 @@
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
   import VoiceRecorderButton from "@/components/conversation-input/voice-recorder-button/voice-recorder-button.uvue";
   import iconMd from "@/static/filetree/icon_md.svg";
+  import ConfirmModal from "@/components/confirm-modal/confirm-modal.uvue";
   import MsgActionSheet from "./components/msg-action-sheet/msg-action-sheet.uvue";
   import { ImMergeItem } from "@/types/interfaces/imMergeItem";
   import { ImMergeRecordSession, openImMergeRecord } from "@/utils/im/imMergeRecordSession";
@@ -2117,6 +2122,12 @@
   const actionSheetRef = ref<any | null>(null);
   // 表情快选条数据（sheetQuickEmojis computed 定义在「表情回复 + 多选转发」
   // 块：依赖 canReactMsg，UTS→Kotlin 须先定义后引用）
+
+  // ===== 删除消息二次确认（confirm-modal 全页一个实例；打开时记 pendingDeleteMsg，
+  //       确认回调取它执行——同 message.uvue 确认弹窗模式） =====
+  const confirmModalRef = ref<any | null>(null);
+  /** 待删除消息（null=确认弹窗未挂着任何操作）。 */
+  let pendingDeleteMsg: ImMsgRow | null = null;
 
   // ===== 引用 / 编辑（输入坞上方的 compose 条，两者互斥） =====
   /** 引用目标（占位行乐观渲染引用块用；发送成功后消费清除）。 */
@@ -7084,6 +7095,12 @@
     return Date.now() - msg.sendTime <= revokeWindowSec * 1000;
   }
 
+  /** 删除入口：本人已确认消息（本地占位行无服务端身份，删无可删）。
+   *  按人删除仅收敛自己的可见范围，无时限无权限差异，服务端幂等。 */
+  function canDeleteMsg(msg: ImMsgRow): boolean {
+    return isMine(msg) && isConfirmedRow(msg);
+  }
+
   /** 动作列表；撤回=红色破坏性操作。 */
   function buildActionsFor(msg: ImMsgRow): MsgActionItem[] {
     const acts: MsgActionItem[] = [];
@@ -7148,6 +7165,14 @@
       revoke.danger = true;
       acts.push(revoke);
     }
+    // 删除（红色破坏性，置底同撤回）：仅自己的可见范围，二次确认在 handleSheetSelect
+    if (canDeleteMsg(msg)) {
+      const del = new MsgActionItem();
+      del.key = "delete";
+      del.label = t("Mobile.Message.actionDelete");
+      del.danger = true;
+      acts.push(del);
+    }
     return acts;
   }
 
@@ -7164,7 +7189,7 @@
     if (systemRow) {
       return;
     }
-    if (hasQuotableBody(msg) != true && canPinMsg() != true && canEditMsg(msg) != true && canRevokeMsg(msg) != true && canReactMsg(msg) != true && canForwardMsg(msg) != true) {
+    if (hasQuotableBody(msg) != true && canPinMsg() != true && canEditMsg(msg) != true && canRevokeMsg(msg) != true && canDeleteMsg(msg) != true && canReactMsg(msg) != true && canForwardMsg(msg) != true) {
       return;
     }
     const acts = buildActionsFor(msg);
@@ -7389,6 +7414,56 @@
     }
   }
 
+  /** 长按「删除」：弹紧凑确认（按人删除语义文案），确认后 handleActionDelete。 */
+  function openDeleteConfirm(msg: ImMsgRow): void {
+    pendingDeleteMsg = msg;
+    const proxy = confirmModalRef.value as ComponentPublicInstance | null;
+    if (proxy != null) {
+      proxy.$callMethod("open", t("Mobile.Message.deleteMsgTitle"), t("Mobile.Message.deleteMsgTip"), t("Mobile.Common.delete"));
+    }
+  }
+
+  /** 删除（按人删除，仅自己的可见范围）：成功后本地行直接移除（服务端历史对我已
+   *  过滤，重拉也不再出现）；幂等——data=false 仍是成功码，同码处理不区分。 */
+  async function handleActionDelete(msg: ImMsgRow): Promise<void> {
+    if (convId.value.length == 0) {
+      return;
+    }
+    try {
+      const res = await apiImDeleteMsg(msg.msgId, convId.value);
+      if (!isChatCurrent()) return;
+      if (apiResCode(res) == SUCCESS_CODE) {
+        // 成功不 toast：行消失即反馈；失败仍提示
+        const rows = messages.value;
+        for (let i = 0; i < rows.length; i++) {
+          if (rows[i].msgId == msg.msgId) {
+            rows.splice(i, 1);
+            break;
+          }
+        }
+      } else {
+        const message = apiResMessage(res);
+        uni.showToast({ title: message.length > 0 ? message : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+  }
+
+  /** 删除确认-确认：按打开时记下的消息执行（弹窗组件负责关闭自身）。 */
+  function handleDeleteConfirmOk(): void {
+    const msg = pendingDeleteMsg;
+    pendingDeleteMsg = null;
+    if (msg != null) {
+      handleActionDelete(msg);
+    }
+  }
+
+  /** 删除确认-取消/点遮罩：清待删消息（不产生副作用）。 */
+  function handleDeleteConfirmCancel(): void {
+    pendingDeleteMsg = null;
+  }
+
   /** 长按「下载视频」：下载并保存到系统相册（仅 App——动作项在 buildActionsFor 内 #ifdef APP 收敛）。
    *  传原始 videoUrl（可能 /api/f/ 相对路径）而非解析产物：temp file:// 不能再 downloadFile，
    *  原始地址才能正确决定鉴权头（同源带 Bearer，CDN 直链不带）。 */
@@ -7430,6 +7505,8 @@
       enterEditMode(msg);
     } else if (key == "revoke") {
       handleActionRevoke(msg);
+    } else if (key == "delete") {
+      openDeleteConfirm(msg);
     } else if (key == "forward") {
       handleActionForward(msg);
     } else if (key == "multi") {

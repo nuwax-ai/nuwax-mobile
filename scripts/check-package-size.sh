@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# 云打包计费体积守门：拦截 x86/x86_64 .so 回流 + 本地编译产物体积告警。
+# 云打包计费体积守门：拦截 x86/x86_64/armeabi-v7a .so 回流 + 本地编译产物体积告警。
 #
 # 用法：bash scripts/check-package-size.sh  （即 pnpm size:check）
 # 背景：DCloud 云打包按「编译后、压缩前」的项目体积计费，免费额度 60MB。
 #   uni_modules UTS 插件（uni-highlight / uni-cmark）的 x86、x86_64 ABI
 #   仅 Intel 模拟器使用，两个 ABI 合计约 15M，已于 2026-09 物理删除
-#   （真机全 arm，Apple Silicon 模拟器为 arm64 镜像）。上游插件更新会把
-#   它们带回来，由本脚本拦截。
+#   （真机全 arm，Apple Silicon 模拟器为 arm64 镜像）。
+#   armeabi-v7a（32 位 arm，合计约 6.8M）于 2026-10 删除：manifest 的
+#   abiFilters 本就只有 arm64-v8a，v7a .so 从未进过 APK，纯属项目目录
+#   计费死重。上游插件更新会把它们带回来，由本脚本拦截。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,10 +16,10 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 fail=0
 
-# 1) uni_modules 下不允许出现 x86 / x86_64 ABI 目录
-found="$(find "$ROOT_DIR/uni_modules" -type d \( -name x86 -o -name x86_64 \) -path '*/utssdk/app-android/libs/*' -print 2>/dev/null || true)"
+# 1) uni_modules 下不允许出现 x86 / x86_64 / armeabi-v7a ABI 目录
+found="$(find "$ROOT_DIR/uni_modules" -type d \( -name x86 -o -name x86_64 -o -name armeabi-v7a \) -path '*/utssdk/app-android/libs/*' -print 2>/dev/null || true)"
 if [ -n "$found" ]; then
-  echo "✖ uni_modules 下存在 x86/x86_64 ABI 目录（约 15M，会顶破 60MB 免费额度），请删除：" >&2
+  echo "✖ uni_modules 下存在 x86/x86_64/armeabi-v7a ABI 目录（合计约 15M+6.8M，会顶破 60MB 免费额度），请删除：" >&2
   echo "$found" >&2
   fail=1
 fi

@@ -247,7 +247,7 @@
                    全屏走控制条全屏键；退全屏不清播放状态（原位续播）。
                    ★iOS 坑：勿往 <video> 里挂子组件（全屏切换子节点销毁闪退 #22070 未修复） -->
               <view
-                v-else-if="msg.msgType == 'video' && msg.videoUrl.length > 0"
+                v-else-if="(msg.msgType == 'video' || msg.msgType == 'file') && msg.videoUrl.length > 0"
                 class="chat-video"
                 @click="handleVideoMsgTap(msg)"
                 @touchstart="handleMsgTouchStart(msg, $event)"
@@ -430,6 +430,48 @@
                   @click="handleAttImageTap(msg, att)"
                   @error="handleAttImageRenderError(att)"
                 />
+                <!-- rich_text 内嵌视频附件：气泡内联播放（播放器/预载/全屏与单视频消息
+                     同管线，videoPlayUrl 由 preloadChatVideos 回填；iOS 坑同外层：勿往
+                     <video> 挂子组件（全屏切换闪退 #22070），Android 全屏兜底键除外） -->
+                <view
+                  v-if="msg.videoUrl.length > 0"
+                  class="chat-video chat-video--in-bubble"
+                  @click="handleVideoMsgTap(msg)"
+                  @touchstart="handleMsgTouchStart(msg, $event)"
+                  @touchmove="handleMsgTouchMove($event)"
+                  @touchend="handleMsgTouchEnd"
+                  @touchcancel="handleMsgTouchEnd"
+                >
+                  <video
+                    v-if="msg.videoPlayUrl.length > 0"
+                    :id="'chatVideoPlayer-' + msg.msgId"
+                    class="chat-video__player"
+                    :src="msg.videoPlayUrl"
+                    :controls="true"
+                    :show-fullscreen-btn="true"
+                    :title="msg.videoFileName"
+                    object-fit="contain"
+                    @ended="handleVideoEnded(msg.msgId)"
+                    @error="handleVideoError(msg.msgId)"
+                    @fullscreenchange="handleVideoFullscreenChange"
+                  >
+                    <!-- #ifdef APP-ANDROID -->
+                    <view v-if="videoFullscreen != true" class="chat-video__fs" @tap.stop="requestChatVideoFullscreen(msg.msgId)">
+                      <view class="chat-video__fs-corner chat-video__fs-corner--tl" />
+                      <view class="chat-video__fs-corner chat-video__fs-corner--tr" />
+                      <view class="chat-video__fs-corner chat-video__fs-corner--bl" />
+                      <view class="chat-video__fs-corner chat-video__fs-corner--br" />
+                    </view>
+                    <!-- #endif -->
+                  </video>
+                  <view v-else class="chat-video__poster">
+                    <text v-if="msg.msgId == videoLoadingId && videoLoadPercent >= 0" class="chat-video__hint">{{ t("Mobile.FileTree.downloading") }} {{ videoLoadPercent }}%</text>
+                    <text v-else-if="msg.msgId == videoLoadingId" class="chat-video__hint">{{ t("Mobile.FileTree.downloading") }}</text>
+                    <view v-else class="chat-video__play">
+                      <image class="chat-video__play-icon" src="/static/images/icon-video-play.png" mode="aspectFit" />
+                    </view>
+                  </view>
+                </view>
                 <!-- 文件 / 链接附件：md 文档画文档卡片（点开走文件预览页渲染），
                      其余展示文案点击打开链接（微信交互） -->
                 <view
@@ -1374,7 +1416,7 @@
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
   import { writeClipboardText } from "@/utils/clipboard.uts";
-  import { collectChatAttachments, resetChatAttachments } from "@/utils/imChatAttachments";
+  import { classifyKind, collectChatAttachments, resetChatAttachments } from "@/utils/imChatAttachments";
   import {
     ChatScrollMemo,
     getCachedChatRecords,
@@ -3203,13 +3245,26 @@
       if (row.msgType == "image") {
         row.imageUrl = readString(body, "url");
       } else if (row.msgType == "file") {
-        // 文件消息按链接卡片渲染（与 rich_text 附件同款，可点击打开；不再落 digest 系统行）
-        const att = new ImMsgAtt();
-        att.url = readString(body, "url");
-        att.fileName = readString(body, "fileName");
-        att.mime = readString(body, "mime");
-        if (att.url.length > 0) {
-          row.linkAtts.push(att);
+        // 文件消息按链接卡片渲染（与 rich_text 附件同款，可点击打开；不再落 digest 系统行）。
+        // 视频文件（mime video/* 或视频扩展名）例外：转入视频消息渲染管线（内联 <video> +
+        // ak 直链预载，与 msgType=video 同款）——链接卡片点开走文件预览页，预览页 shareKey
+        // 智能体域不认 IM convId（conversation not found）。发送契约仍是 kind=file（PC 同款），
+        // 只改端上渲染形态
+        const fileUrl = readString(body, "url");
+        const fileName = readString(body, "fileName");
+        const fileMime = readString(body, "mime");
+        if (fileUrl.length > 0 && classifyKind(fileMime, fileUrl) == "video") {
+          row.videoUrl = fileUrl;
+          row.videoFileName = fileName;
+          row.videoSize = readNumber(body, "size", 0);
+        } else {
+          const att = new ImMsgAtt();
+          att.url = fileUrl;
+          att.fileName = fileName;
+          att.mime = fileMime;
+          if (att.url.length > 0) {
+            row.linkAtts.push(att);
+          }
         }
       } else if (row.msgType == "audio") {
         // 语音消息：body.url 即播放地址；duration 秒可缺省（>3600 按 ms 误传换算回秒，
@@ -3311,6 +3366,13 @@
           }
           if (isImageAtt(att)) {
             row.imageAtts.push(att);
+          } else if (row.videoUrl.length == 0 && classifyKind(att.mime, att.url) == "video") {
+            // 内嵌视频附件（kind=video，PC 发送形态）：气泡内联播放（同 file 视频的
+            // conversation-not-found 坑，不走链接卡片）；单行只承载一个播放器，
+            // 第 2+ 条视频附件仍落链接卡片（点击走下载兜底，见 handleLinkAttTap）
+            row.videoUrl = att.url;
+            row.videoFileName = att.fileName;
+            row.videoSize = readNumber(atts[i], "size", 0);
           } else {
             row.linkAtts.push(att);
           }
@@ -3754,8 +3816,10 @@
     if (m.msgType == "image" && m.imageUrl.length > 0) {
       push("image", m.imageUrl, "");
     }
-    if (m.msgType == "video" && m.videoUrl.length > 0) {
-      push("video", m.videoUrl, m.videoFileName);
+    if (m.videoUrl.length > 0) {
+      // file 单附件视频端上按视频渲染，转发快照仍按原 file 契约；
+      // rich_text 内嵌视频附件原本 kind=video，快照保真原 kind
+      push(m.msgType == "file" ? "file" : "video", m.videoUrl, m.videoFileName);
     }
     for (let i = 0; i < m.imageAtts.length; i++) {
       push("image", m.imageAtts[i].url, m.imageAtts[i].fileName);
@@ -5165,7 +5229,9 @@
     try {
       for (let i = messages.value.length - 1; i >= 0; i--) {
         const row = messages.value[i];
-        if (row.msgType == "video" && row.videoUrl.length > 0 && row.videoPlayUrl.length == 0) {
+        // videoUrl 即预载对象：msgType=video + file 视频文件 + rich_text 内嵌视频附件
+        // （readMsgRow 三形态统一落入同一字段，渲染/预载/播放器全共用）
+        if (row.videoUrl.length > 0 && row.videoPlayUrl.length == 0) {
           if (!isChatCurrent()) {
             return;
           }
@@ -5677,6 +5743,14 @@
         if (kind == "image") {
           confirmed.imageUrl = file.url;
           confirmed.linkAtts = [];
+        } else if (file.type.indexOf("video/") == 0) {
+          // 视频文件：确认行转视频渲染（readMsgRow 同口径；发送契约仍 kind=file），
+          // 随后 preloadChatVideos 换 ak 直链挂播放器
+          confirmed.imageUrl = "";
+          confirmed.linkAtts = [];
+          confirmed.videoUrl = file.url;
+          confirmed.videoFileName = file.name;
+          confirmed.videoSize = file.size;
         } else {
           const att = new ImMsgAtt();
           att.url = file.url;
@@ -5692,6 +5766,8 @@
         if (proxied != null) {
           resolveRowMedia(proxied);
         }
+        // 视频确认行预载（原占位是本地播放，确认后换远端地址重挂播放器）
+        preloadChatVideos();
         reportReadIfNeeded(maxSeq());
         refreshReadStatus();
         scrollToBottom();
@@ -5829,6 +5905,13 @@
     if (isImage) {
       row.msgType = "image";
       row.imageUrl = localPath;
+    } else if (classifyKind("", displayName) == "video") {
+      // 视频入队（相册视频入口 displayName 已保 .mp4 等扩展名）：本地路径直接挂
+      // 播放器即时预览（videoPlayUrl=localPath），确认后换远端地址重新预载
+      row.msgType = "file";
+      row.videoUrl = localPath;
+      row.videoPlayUrl = localPath;
+      row.videoFileName = displayName;
     } else {
       row.msgType = "file";
       const att = new ImMsgAtt();
@@ -6239,7 +6322,8 @@
         sendMediaWithRow(
           msg,
           msg.localPath,
-          msg.linkAtts.length > 0 ? msg.linkAtts[0].fileName : "",
+          // 视频占位行无 linkAtts，展示名从 videoFileName 取（重传保原文件名）
+          msg.linkAtts.length > 0 ? msg.linkAtts[0].fileName : msg.videoFileName,
         );
         return;
       }
@@ -6367,6 +6451,13 @@
     if (isAuthProtectedFileUrl(att.url)) {
       // zip/apk 等无可预览二进制：直接下载（PC 同款），不跳文件预览页
       if (isDownloadOnlyAttachment(att.fileName.length > 0 ? att.fileName : att.url)) {
+        handleBinaryAttDownload(att);
+        return;
+      }
+      // 视频/音频链接卡片（rich_text 多视频的第 2+ 条等遗留形态）：文件预览页
+      // shareKey 不认 IM convId（conversation not found），走下载兜底（H5 新标签
+      // 浏览器直接播 / App 下载后系统播放器打开），不再进坏死页面
+      if (classifyKind(att.mime, att.url) == "video" || classifyKind(att.mime, att.url) == "audio") {
         handleBinaryAttDownload(att);
         return;
       }
@@ -7132,9 +7223,10 @@
       acts.push(multi);
     }
     // #ifdef APP
-    // 视频消息专属：保存到系统相册（saveVideoToPhotosAlbum 仅 App 有意义；
-    // H5 走浏览器另存、小程序保存需另行声明相册权限，均不出现该项）
-    if (msg.msgType == "video" && msg.videoUrl.length > 0) {
+    // 视频专属：保存到系统相册（saveVideoToPhotosAlbum 仅 App 有意义；
+    // H5 走浏览器另存、小程序保存需另行声明相册权限，均不出现该项）。
+    // videoUrl 三形态统一：msgType=video / file 视频文件 / rich_text 内嵌视频附件
+    if (msg.videoUrl.length > 0) {
       const download = new MsgActionItem();
       download.key = "download";
       download.label = t("Mobile.Message.actionDownloadVideo");
@@ -9531,6 +9623,11 @@
     border-radius: 12rpx;
     background-color: #1c1b20;
     overflow: hidden;
+  }
+
+  /* rich_text 气泡内嵌视频附件：播放器同尺寸，与气泡内文案/图片留间距 */
+  .chat-video--in-bubble {
+    margin-top: 8rpx;
   }
 
   .chat-video__player {

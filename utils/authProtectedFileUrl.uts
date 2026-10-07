@@ -256,28 +256,111 @@ function fetchAuthProtectedFileAsObjectUrl(
 }
 // #endif
 
+// #ifndef H5 || WEB
 /**
- * 拉取受保护文件并返回可用于 image 组件展示的本地/temp 地址。
+ * App 端受保护图片下载防护三件套（2026-10-07 半截图标事故）：
+ * 1) 同 URL 并发去重：冷启动列表会对同一头像并发发起多次 downloadFile，
+ *    实测运行时并发落盘出过恰好 8KB 整块倍数的截断/垃圾尾文件；
+ * 2) 落盘完整性校验：PNG 必须以 IEND 结尾、JPG 尾部须有 EOI、GIF 尾 0x3B——
+ *    截断 PNG 会被 image 组件增量解码只画上半截且不触发 @error，必须绑定前拦下；
+ * 3) 校验失败删临时文件重下（至多 3 次、间隔 300ms），当次会话内自愈，不必等重启。
+ * 网络失败保持单次语义不在此重试，由调用方原有重试机制兜底。
  */
-export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
-  const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
-  // #ifdef H5 || WEB
-  if (isAppWebViewEmbedded() == true && readAppWebViewHostPlatform() == 'android') {
-    return fetchAndroidProtectedImageRedirect(fetchUrl);
+const PROTECTED_IMAGE_MAX_DOWNLOAD_ATTEMPTS = 3;
+const PROTECTED_IMAGE_RETRY_DELAY_MS = 300;
+const protectedImageInflight = new Map<string, Promise<string>>();
+
+function delayProtectedImageRetry(ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    setTimeout((): void => {
+      resolve(true);
+    }, ms);
+  });
+}
+
+function unlinkTempQuiet(filePath: string): void {
+  try {
+    uni.getFileSystemManager().unlink({
+      filePath: filePath,
+      fail: (_e) => {},
+    });
+  } catch (_eUnlink) {
+    // 尽力删除，失败不影响重下
   }
-  // /api/f/ 图片会重定向到对象存储，其 CORS 白名单不含 X-Client-Type。
-  // 保留 Bearer 鉴权，避免浏览器把额外请求头带到重定向目标导致预检失败。
-  const header = buildProtectedFileHeaders(false);
-  // #endif
-  // #ifndef H5 || WEB
-  const header = buildAuthProtectedFileHeaders();
-  // #endif
+}
 
-  // #ifdef H5 || WEB
-  return fetchAuthProtectedFileAsObjectUrl(fetchUrl, header);
-  // #endif
+/** PNG 尾 8 字节必须是 IEND 块类型 + CRC：49 45 4E 44 AE 42 60 82。 */
+function isPngTailIntact(bytes: Uint8Array): boolean {
+  const len = bytes.length;
+  if (len < 12) {
+    return false;
+  }
+  return (
+    bytes[len - 8] == 0x49 &&
+    bytes[len - 7] == 0x45 &&
+    bytes[len - 6] == 0x4e &&
+    bytes[len - 5] == 0x44 &&
+    bytes[len - 4] == 0xae &&
+    bytes[len - 3] == 0x42 &&
+    bytes[len - 2] == 0x60 &&
+    bytes[len - 1] == 0x82
+  );
+}
 
-  // #ifndef H5 || WEB
+/** JPG 尾部 64 字节内须有 FF D9（EOI）；垃圾填充尾同样拦下交给重下。 */
+function isJpgTailIntact(bytes: Uint8Array): boolean {
+  const len = bytes.length;
+  if (len < 4) {
+    return false;
+  }
+  const scanFrom = len - 64 > 0 ? len - 64 : 0;
+  let i = len - 2;
+  while (i >= scanFrom) {
+    if (bytes[i] == 0xff && bytes[i + 1] == 0xd9) {
+      return true;
+    }
+    i--;
+  }
+  return false;
+}
+
+/** GIF 尾 0x3B。 */
+function isGifTailIntact(bytes: Uint8Array): boolean {
+  const len = bytes.length;
+  if (len < 6) {
+    return false;
+  }
+  return bytes[len - 1] == 0x3b;
+}
+
+/** 读落盘文件做头/尾完整性校验；识别不了的一律放行保持旧行为。 */
+function isLocalImageFileIntact(filePath: string): boolean {
+  try {
+    const data = uni.getFileSystemManager().readFileSync(filePath, null);
+    if (data instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(data as ArrayBuffer);
+      const len = bytes.length;
+      if (len == 0) {
+        return false;
+      }
+      if (len >= 4 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e && bytes[3] == 0x47) {
+        return isPngTailIntact(bytes);
+      }
+      if (len >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8) {
+        return isJpgTailIntact(bytes);
+      }
+      if (len >= 4 && bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x38) {
+        return isGifTailIntact(bytes);
+      }
+    }
+    return true;
+  } catch (_e) {
+    // 读不出来不拦截，维持旧的失败链路
+    return true;
+  }
+}
+
+function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Promise<string> {
   return new Promise((resolve, reject) => {
     uni.downloadFile({
       url: fetchUrl,
@@ -302,6 +385,68 @@ export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
       },
     });
   });
+}
+
+async function downloadProtectedImageWithIntegrityCheck(
+  fetchUrl: string,
+  header: UTSJSONObject,
+): Promise<string> {
+  for (let attempt = 1; attempt <= PROTECTED_IMAGE_MAX_DOWNLOAD_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      await delayProtectedImageRetry(PROTECTED_IMAGE_RETRY_DELAY_MS);
+    }
+    const tempPath = await downloadProtectedFileOnce(fetchUrl, header);
+    if (isLocalImageFileIntact(tempPath)) {
+      return tempPath;
+    }
+    console.warn(
+      "[ChatImg] integrity check fail, will retry attempt=" + attempt + " path=" + tempPath + " url=" + fetchUrl,
+    );
+    unlinkTempQuiet(tempPath);
+  }
+  throw new Error("protected image download corrupt after retries url=" + fetchUrl);
+}
+
+function fetchProtectedImageDisplayUrlOnApp(fetchUrl: string, header: UTSJSONObject): Promise<string> {
+  const inflight = protectedImageInflight.get(fetchUrl);
+  if (inflight != null) {
+    return inflight;
+  }
+  const task = downloadProtectedImageWithIntegrityCheck(fetchUrl, header);
+  protectedImageInflight.set(fetchUrl, task);
+  // 结束后移除登记；期间同 URL 的并发请求共享同一任务，不再重复落盘
+  task.then((_path: string) => {
+    protectedImageInflight.delete(fetchUrl);
+  }).catch((_err) => {
+    protectedImageInflight.delete(fetchUrl);
+  });
+  return task;
+}
+// #endif
+
+/**
+ * 拉取受保护文件并返回可用于 image 组件展示的本地/temp 地址。
+ */
+export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
+  const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
+  // #ifdef H5 || WEB
+  if (isAppWebViewEmbedded() == true && readAppWebViewHostPlatform() == 'android') {
+    return fetchAndroidProtectedImageRedirect(fetchUrl);
+  }
+  // /api/f/ 图片会重定向到对象存储，其 CORS 白名单不含 X-Client-Type。
+  // 保留 Bearer 鉴权，避免浏览器把额外请求头带到重定向目标导致预检失败。
+  const header = buildProtectedFileHeaders(false);
+  // #endif
+  // #ifndef H5 || WEB
+  const header = buildAuthProtectedFileHeaders();
+  // #endif
+
+  // #ifdef H5 || WEB
+  return fetchAuthProtectedFileAsObjectUrl(fetchUrl, header);
+  // #endif
+
+  // #ifndef H5 || WEB
+  return fetchProtectedImageDisplayUrlOnApp(fetchUrl, header);
   // #endif
 }
 

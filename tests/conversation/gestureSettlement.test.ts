@@ -206,7 +206,7 @@ describe("原生滚动所有权", () => {
   });
 
   it("首页列表开始滚动后退出尚未接管的横滑识别", async () => {
-    const source = readFileSync("pages/index/index.uvue", "utf8");
+    const source = readFileSync("pages/index/index-content.uvue", "utf8");
     const start = source.indexOf("  function onGuideScroll()");
     const method = source.slice(start, source.indexOf("\n  }", start) + 4);
     const { code } = await transformWithOxc(method, "scroll.ts", { lang: "ts" });

@@ -10,7 +10,7 @@ import {
 
 // 执行首页真实发送入口，仅隔离登录、网络、草稿存储与导航等运行时依赖。
 const homeSource = readFileSync(
-  new URL("../../pages/index/index.uvue", import.meta.url),
+  new URL("../../pages/index/index-content.uvue", import.meta.url),
   "utf8",
 );
 const start = homeSource.indexOf("  async function handleSendMessage(");

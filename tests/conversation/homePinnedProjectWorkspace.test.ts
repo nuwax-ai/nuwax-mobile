@@ -12,7 +12,7 @@ import {
 } from "@/types/interfaces/displayRecommend.uts";
 
 // 执行首页真实上框、选择和发送函数，隔离网络与导航，验证完整首条任务链路。
-const source = readFileSync("pages/index/index.uvue", "utf8");
+const source = readFileSync("pages/index/index-content.uvue", "utf8");
 function fragment(startMarker: string, endMarker: string): string {
   const start = source.indexOf(startMarker);
   const end = source.indexOf(endMarker, start);

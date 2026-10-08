@@ -3,7 +3,7 @@ import { transformSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
 
 const composerSource = readFileSync("components/conversation-input/conversation-input.uvue", "utf8");
-const homeSource = readFileSync("pages/index/index.uvue", "utf8");
+const homeSource = readFileSync("pages/index/index-content.uvue", "utf8");
 const listSource = readFileSync("components/expert-list-view/expert-list-view.uvue", "utf8");
 const popupSource = readFileSync("components/conversation-input/expert-quick-popup/expert-quick-popup.uvue", "utf8");
 const atomicSource = readFileSync("utils/editorAtomicReplacement.uts", "utf8");

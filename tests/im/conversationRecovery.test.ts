@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { transformSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
 
-const source = readFileSync("pages/message/message.uvue", "utf8");
+const source = readFileSync("pages/message/message-content.uvue", "utf8");
 function extract(name: string, async = false) {
   const start = source.indexOf(`  ${async ? "async " : ""}function ${name}(`);
   return source.slice(start, source.indexOf("\n  }", start) + 4);
@@ -18,7 +18,7 @@ function fixture() {
     isAppInBackground: () => false,
     readString: (o: any, k: string) => `${o[k] ?? ""}`,
     readNumber: (o: any, k: string, fallback: number) => o[k] ?? fallback,
-    getImSessionStamp: () => "a", hasAccessToken: () => true,
+    getImSessionStamp: () => "a", hasAccessToken: () => true, hasLoginSession: () => true,
     apiImConversations: api, apiResCode: () => "ok", parseConvRecords: (r: any) => r.rows,
     resolveConvRowsIcons: vi.fn(),
   };

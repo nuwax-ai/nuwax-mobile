@@ -1,0 +1,136 @@
+import { computed, inject, onMounted, onUnmounted, provide, ref, watch, type Ref } from "vue";
+import { onShow as onPageShow, onHide as onPageHide, onUnload as onPageUnload } from "@dcloudio/uni-app";
+import { CUSTOM_TAB_BAR_ENABLED } from "@/constants/customTabBar.constants";
+import { mainTabActivePath, mainTabPageVisible, switchMainTab } from "@/utils/mainTabNavigation";
+import { closeTopPopup } from "@/utils/popupBackRegistry";
+
+type TabLoadHandler = (options: OnLoadOptions) => void;
+type TabBackHandler = (options: OnBackPressOptions) => boolean;
+type TabResizeHandler = (options: OnResizeOptions) => void;
+
+class MainTabScope {
+  path: string;
+  visible: Ref<boolean>;
+  loadOptions: OnLoadOptions = {} as OnLoadOptions;
+  backHandlers: TabBackHandler[] = [];
+  resizeHandlers: TabResizeHandler[] = [];
+
+  constructor(path: string, visible: Ref<boolean>) {
+    this.path = path;
+    this.visible = visible;
+  }
+}
+
+const SCOPE_KEY = "nuwaxMainTabScope";
+const tabScopes = new Map<string, MainTabScope>();
+
+function registerShow(scope: MainTabScope, handler: () => void): void {
+  let mounted = false;
+  onMounted(() => {
+    mounted = true;
+    if (scope.visible.value) handler();
+  });
+  watch((): boolean => scope.visible.value, (visible: boolean) => {
+    if (mounted && visible) handler();
+  });
+}
+
+function registerHide(scope: MainTabScope, handler: () => void): void {
+  watch((): boolean => scope.visible.value, (visible: boolean, previous: boolean) => {
+    if (!visible && previous) handler();
+  });
+}
+
+type MainTabLifecycle = {
+  onLoad: (handler: TabLoadHandler) => void;
+  onShow: (handler: () => void) => void;
+  onHide: (handler: () => void) => void;
+  onUnload: (handler: () => void) => void;
+  onBackPress: (handler: TabBackHandler) => void;
+  onResize: (handler: TabResizeHandler) => void;
+};
+
+/** 首次挂载初始化一次；激活状态 + 容器显隐共同决定业务显隐。 */
+export function useMainTabLifecycle(path: string): MainTabLifecycle {
+  const inherited = inject<MainTabScope | null>(SCOPE_KEY, null);
+  const visible = computed((): boolean => mainTabPageVisible.value && mainTabActivePath.value == path);
+  const scope = inherited != null ? inherited : new MainTabScope(path, visible);
+  provide(SCOPE_KEY, scope);
+  tabScopes.set(path, scope);
+  onUnmounted(() => {
+    if (tabScopes.get(path) == scope) tabScopes.delete(path);
+  });
+  return {
+    onLoad: (handler: TabLoadHandler): void => { onMounted(() => handler(scope.loadOptions)); },
+    onShow: (handler: () => void): void => registerShow(scope, handler),
+    onHide: (handler: () => void): void => registerHide(scope, handler),
+    onUnload: (handler: () => void): void => { onUnmounted(handler); },
+    onBackPress: (handler: TabBackHandler): void => { scope.backHandlers.push(handler); },
+    onResize: (handler: TabResizeHandler): void => { scope.resizeHandlers.push(handler); },
+  };
+}
+
+/** 内嵌组件复用所属 Tab 的显隐；其他普通页面仍走原有页面钩子。 */
+export function onTabPageShow(handler: () => void): void {
+  const scope = inject<MainTabScope | null>(SCOPE_KEY, null);
+  if (scope == null) onPageShow(handler);
+  else registerShow(scope, handler);
+}
+
+export function onTabPageHide(handler: () => void): void {
+  const scope = inject<MainTabScope | null>(SCOPE_KEY, null);
+  if (scope == null) onPageHide(handler);
+  else registerHide(scope, handler);
+}
+
+export function onTabPageUnload(handler: () => void): void {
+  const scope = inject<MainTabScope | null>(SCOPE_KEY, null);
+  if (scope == null) onPageUnload(handler);
+  else onUnmounted(handler);
+}
+
+export function dispatchMainTabBack(path: string, options: OnBackPressOptions): boolean {
+  if (closeTopPopup()) return true;
+  const scope = tabScopes.get(path);
+  if (scope == null || !scope.visible.value) return false;
+  for (let i = scope.backHandlers.length - 1; i >= 0; i--) {
+    if (scope.backHandlers[i](options)) return true;
+  }
+  return false;
+}
+
+export function dispatchMainTabResize(path: string, options: OnResizeOptions): void {
+  const scope = tabScopes.get(path);
+  if (scope == null || !scope.visible.value) return;
+  scope.resizeHandlers.forEach((handler: TabResizeHandler) => handler(options));
+}
+
+type MainTabEntry = {
+  load: (options: OnLoadOptions) => void;
+  show: () => void;
+  hide: () => void;
+  ready: () => void;
+  back: (options: OnBackPressOptions) => boolean;
+  resize: (options: OnResizeOptions) => void;
+};
+
+/** 页面直接注册 SDK 钩子，再转发到此作用域（保留 UTS 页面的生命周期编译标记）。 */
+export function useMainTabEntry(path: string): MainTabEntry {
+  const scope = new MainTabScope(path, ref<boolean>(false));
+  provide(SCOPE_KEY, scope);
+  let ready = false;
+  return {
+    load: (options: OnLoadOptions): void => { scope.loadOptions = options; },
+    show: (): void => {
+      scope.visible.value = true;
+      if (CUSTOM_TAB_BAR_ENABLED && ready) switchMainTab({ url: path });
+    },
+    ready: (): void => {
+      ready = true;
+      if (CUSTOM_TAB_BAR_ENABLED) switchMainTab({ url: path });
+    },
+    hide: (): void => { scope.visible.value = false; },
+    back: (options: OnBackPressOptions): boolean => dispatchMainTabBack(path, options),
+    resize: (options: OnResizeOptions): void => dispatchMainTabResize(path, options),
+  };
+}

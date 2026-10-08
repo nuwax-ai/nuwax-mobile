@@ -3,7 +3,7 @@ import { runInNewContext } from "node:vm";
 import { transformSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
 
-const source = readFileSync("pages/index/index.uvue", "utf8");
+const source = readFileSync("pages/index/index-content.uvue", "utf8");
 function fragment(startMarker: string, endMarker: string): string {
   const start = source.indexOf(startMarker);
   const end = source.indexOf(endMarker, start);

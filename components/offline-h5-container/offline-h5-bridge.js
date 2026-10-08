@@ -32,6 +32,7 @@
     requestId: currentRequestId,
     registerNavigator: function (handler) { navigator = handler; },
     pageReady: function (requestId) { send('OFFLINE_H5_PAGE_READY', requestId); },
+    authRequired: function (requestId) { send('OFFLINE_H5_AUTH_REQUIRED', requestId); },
     fail: function (requestId, code) { send('OFFLINE_H5_ERROR', requestId, code); },
     debug: function (requestId, code) { send('OFFLINE_H5_DEBUG', requestId, code); },
     acknowledge: function (type, requestId) { delete pending[type + ':' + requestId]; },

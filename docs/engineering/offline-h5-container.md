@@ -45,8 +45,11 @@ open(request)
 关键设计：
 
 - **请求身份**：每次 open / 超时 / 取消都轮换 requestId。身份放 hash query（`offlineH5RequestId`，页面 onLoad 直接读）；attempt 参数放 search 段（`offlineH5Attempt`，保证仅 hash 变化的 src 赋值也触发真实文档重载——WKWebView 对 fragment-only 变化不重载）。旧请求的迟到消息一律丢弃。
+- **文档回调与暂停**：原生 load/error 中的 attempt / requestId 也要核对，不能仅凭相同入口路径把旧回调归到新页面。暂停期间记住最新 request，恢复时打开一次；原生桥调用失败仍须保留回退计时器。
+- **业务初始化**：PAGE_READY 只表示首帧已绘制。会话页独立显示数据加载态，初始化拒绝、历史请求失败或超过 30s 时显示重试；缺失、空串或损坏的租户缓存不能抛错中断常规会话。临时会话仍等待有效的验证码配置。
+- **登录分流**：浏览器 H5 保留 H5 登录路由，小程序保留小程序登录路由。支持登录交接的 App 宿主在请求中显式追加 `appNativeLogin=1`；内嵌 H5 通过 `OFFLINE_H5_AUTH_REQUIRED`（协议 v1、当前 requestId）请求原生登录。容器验证身份，宿主再验证 scopeKey 后清理原生登录态并跳转；旧宿主的远程 H5 没有能力标记，继续使用自身登录路由。`@auth-required` 必须由宿主接入，包括隐藏预热容器。
 - **就绪判定**：只认页面主动上报，不得用 DOM 非空、文档 load 或旧业务事件伪造。页面两条上报路径都要接：onLoad 快照（首帧）与 onShow 现取（H5 框架缓存页面组件时切 query 只走 activated，不重新 onLoad，业务数据也不会刷新——这是「同页面不同 query 必须整文档重载」的原因）。
-- **消息协议 v1**：`OFFLINE_H5_PAGE_READY` / `OFFLINE_H5_ERROR` / `OFFLINE_H5_DEBUG`，均带 `protocolVersion` + `requestId`；桥未收到 ACK 前 each 250ms 重发（上限 120 次），确保原生侧晚安装也能收到。
+- **消息协议 v1**：`OFFLINE_H5_PAGE_READY` / `OFFLINE_H5_ERROR` / `OFFLINE_H5_DEBUG` / `OFFLINE_H5_AUTH_REQUIRED`，均带 `protocolVersion` + `requestId`；桥未收到 ACK 前 each 250ms 重发（上限 120 次），确保原生侧晚安装也能收到。批量投递需逐条处理协议消息，不能只取最后一条。
 - **运行时不校验清单**：包完整性校验只在构建期（见下），运行时靠超时兜底。
 
 ### 入口 URL 形态
@@ -54,7 +57,7 @@ open(request)
 ```
 /static/app/offline-h5/index.html?apiBase=<server>&offlineH5Attempt=<id>
   #/subpackages/pages/agent-detail/agent-detail?id=..&conversationId=..
-    &statusBarHeight=..&appEmbedded=1&accessToken=..&offlineH5RequestId=<id>
+    &statusBarHeight=..&appEmbedded=1&appNativeLogin=1&accessToken=..&offlineH5RequestId=<id>
 ```
 
 登录态经 hash accessToken 注入（file:// 无 Cookie，靠 URL / localStorage 传身份），由 `offline-h5-project-bootstrap.js` 在文档启动时写入 `NUWAX_API_BASE_URL` / `NUWAX_ACCESS_TOKEN`。

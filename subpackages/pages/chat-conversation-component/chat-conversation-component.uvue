@@ -109,7 +109,11 @@
     </custom-nav-bar>
 
     <!-- 默认展开扩展页面区域，且隐藏聊天区域 -->
-    <template v-if="isShowWebView">
+    <view v-if="chatPageBootFailed" class="chat-container chat-page-load-error">
+      <text class="chat-page-load-error__text">{{ t('Mobile.Webview.loadFailed') }}</text>
+      <button class="chat-page-load-error__retry" @click="retryChatPageLoad">{{ t('Mobile.Common.retry') }}</button>
+    </view>
+    <template v-else-if="isShowWebView">
       <web-view
         class="w-full"
         v-if="pageHomeUrl?.length"
@@ -120,11 +124,9 @@
     <template v-else>
       <view class="chat-container" :class="{ 'chat-container--ios-embedded': isIosEmbeddedChat }">
         <!-- App 内嵌：换会话/首屏加载占位（原生遮罩揭开后仍避免空白） -->
-        <!-- #ifdef H5 || WEB -->
-        <view v-if="isAppWebView && residentChatBootLoading" class="resident-chat-boot-loading">
+        <view v-if="chatPageBootLoading || (isAppWebView && residentChatBootLoading)" class="resident-chat-boot-loading">
           <spin-loading size="48rpx" color="#3bb346" :duration-ms="800" />
         </view>
-        <!-- #endif -->
         <!-- 性能测试浮层：avgFps / maxGap（仅 perfTest 模式） -->
         <view v-if="isPerfMock" class="perf-overlay">
           <text class="perf-overlay-text">fps {{ perfFpsText }} · maxGap {{ perfGapText }}ms</text>
@@ -642,6 +644,7 @@
   import docImage from "@/static/assets/doc_image.png";
   import { ACCESS_TOKEN, TENANT_CONFIG_INFO } from "@/constants/home.constants";
   import { getApiBaseUrl } from "@/constants/config";
+  import { parseTenantConfigCache } from "@/utils/tenantConfigCache";
 
   // ==================== API ====================
   import { apiAgentConversation } from "@/servers/conversation";
@@ -667,7 +670,7 @@
 
   // ==================== 工具方法 ====================
   import { formatBytes } from "@/utils/byteConverter.uts";
-  import { objectToQueryString } from "@/utils/common";
+  import { objectToQueryString, getCurrentPageFullPath } from "@/utils/common";
   import { chatService } from "@/utils/chatService";
   import { handleExternalLink } from "@/utils/system.uts";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system.uts";
@@ -818,6 +821,36 @@
   });
   /** App 内嵌：换会话/首屏数据加载中（配合 app-chat-cleared 早揭原生遮罩） */
   const residentChatBootLoading = ref<boolean>(false);
+  // PAGE_READY 仅表示 H5 首帧，接口初始化另有有限等待与可重试失败态。
+  const chatPageBootLoading = ref<boolean>(true);
+  const chatPageBootFailed = ref<boolean>(false);
+  let chatPageBootTimer = 0;
+  let chatPageDisposed = false;
+
+  function clearChatPageBootTimer(): void {
+    if (chatPageBootTimer != 0) {
+      clearTimeout(chatPageBootTimer);
+      chatPageBootTimer = 0;
+    }
+  }
+
+  function failChatPageLoad(): void {
+    if (chatPageDisposed) return;
+    clearChatPageBootTimer();
+    chatPageBootLoading.value = false;
+    chatPageBootFailed.value = true;
+    residentChatBootLoading.value = false;
+  }
+
+  function retryChatPageLoad(): void {
+    // 重建页面可同时清理上一轮初始化、订阅与事件监听，避免重试叠加。
+    // #ifdef H5 || WEB
+    window.location.reload();
+    // #endif
+    // #ifndef H5 || WEB
+    uni.redirectTo({ url: getCurrentPageFullPath() });
+    // #endif
+  }
 
   let offlineH5RequestId = "";
   /** 路由 pType：NormalProject / UserApp，空串表示非项目会话 */
@@ -2332,13 +2365,14 @@
   };
   const createNewConversation = (isAppDetails: boolean) =>
     service.createNewConversation(isAppDetails);
-  function getPublishedAgentInfo(appParams: OpenAppParams | null) {
+  async function getPublishedAgentInfo(appParams: OpenAppParams | null): Promise<void> {
     // Android：禁止 null as OpenAppParams；服务层参数改为可空
-    service.getPublishedAgentInfo(appParams).then((): void => {
+    try {
+      await service.getPublishedAgentInfo(appParams);
+      if (data.agentInfo.value == null) failChatPageLoad();
+    } finally {
       finishResidentChatBoot(data.agentId.value);
-    }).catch((): void => {
-      finishResidentChatBoot(data.agentId.value);
-    });
+    }
   }
   const handleCollect = () => service.handleCollect();
 
@@ -2798,51 +2832,34 @@
       }
     }
 
+    let config: UTSJSONObject | null = null;
     try {
       const res = await apiTenantConfig();
-      const codeOk = apiResCode(res) == SUCCESS_CODE;
-      const resDataRaw = apiResData<any>(res);
-      const hasData = resDataRaw != null;
-      if (codeOk == true) {
-        if (hasData == true) {
-          const resData = resDataRaw as UTSJSONObject;
-          let enableSub = 0;
-          const enableSubRaw = resData["enableSubscription"];
-          if (enableSubRaw != null) {
-            enableSub = enableSubRaw as number;
-          }
-          data.enableSubscription.value = enableSub;
-          tenantConfigInfo.value = resData;
-          uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(resDataRaw));
+      if (apiResCode(res) == SUCCESS_CODE) {
+        config = parseTenantConfigCache(apiResData<any>(res));
+        if (config != null) {
           lastTenantConfigFetchTime = Date.now();
-        }
-      } else {
-        const info = uni.getStorageSync(TENANT_CONFIG_INFO);
-        if (info != null) {
-          const cachedConfig = JSON.parse(info as string) as UTSJSONObject;
-          let enableSub = 0;
-          const enableSubRaw = cachedConfig["enableSubscription"];
-          if (enableSubRaw != null) {
-            enableSub = enableSubRaw as number;
-          }
-          data.enableSubscription.value = enableSub;
-          tenantConfigInfo.value = cachedConfig;
+          uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(config));
         }
       }
     } catch (e) {
       console.error("初始化租户配置失败:", e);
-      const info = uni.getStorageSync(TENANT_CONFIG_INFO);
-      if (info != null) {
-        const cachedConfig = JSON.parse(info as string) as UTSJSONObject;
-        let enableSub = 0;
-        const enableSubRaw = cachedConfig["enableSubscription"];
-        if (enableSubRaw != null) {
-          enableSub = enableSubRaw as number;
-        }
-        data.enableSubscription.value = enableSub;
-        tenantConfigInfo.value = cachedConfig;
+    }
+    if (config == null) {
+      try {
+        config = parseTenantConfigCache(uni.getStorageSync(TENANT_CONFIG_INFO));
+      } catch (_cacheError) {
+        // 部分原生端缺少缓存键时也会抛错，继续使用当前配置 / 默认订阅状态。
       }
     }
+    if (config == null) config = parseTenantConfigCache(tenantConfigInfo.value);
+    let enableSub = 0;
+    if (config != null) {
+      const enableSubRaw = config["enableSubscription"];
+      if (enableSubRaw != null) enableSub = readPositiveNumber(enableSubRaw);
+      tenantConfigInfo.value = config;
+    }
+    data.enableSubscription.value = enableSub;
   };
 
   /**
@@ -3783,8 +3800,9 @@
       // 查询历史会话信息(接口返回数据中包含智能体详情信息, 所以不在需要单独查询智能体详情信息了)
       try {
         const res = await apiAgentConversation(id);
+        if (chatPageDisposed || chatPageBootFailed.value) return;
         // Android：res 是 UTSJSONObject，res.code / res.data 点号访问失败 → 不会进 handleQueryConversation → messageList 空
-        if (apiResCode(res) == SUCCESS_CODE) {
+        if (apiResCode(res) == SUCCESS_CODE && apiResData<any>(res) != null) {
           const resData = apiResData<any>(res);
           if (resData != null) {
             const resDataObj = resData as UTSJSONObject;
@@ -3794,6 +3812,7 @@
             }
           }
           await handleQueryConversation(res);
+          if (chatPageDisposed || chatPageBootFailed.value) return;
           // H5 storage 和原生桥注入统一从此刻起消费草稿，避免被上方默认组件初始化覆盖。
           if (data.conversationId.value == id) {
             pendingDraftReadyConversationId = id;
@@ -3839,9 +3858,11 @@
             }
           }
         } else {
+          failChatPageLoad();
           finishResidentChatBoot(data.agentId.value);
         }
       } catch (_eConv) {
+        failChatPageLoad();
         finishResidentChatBoot(data.agentId.value);
       }
     } else {
@@ -3852,7 +3873,7 @@
       }
 
       // 查询智能体详情信息，并初始化会话id
-      getPublishedAgentInfo(paramsData);
+      await getPublishedAgentInfo(paramsData);
     }
   };
 
@@ -4174,6 +4195,7 @@
     // 须 await：handleTempChatPageLoad / handlePageLoad 会同步读取 tenantConfigInfo，
     // 不 await 则读到 null → 临时会话不创建 / 订阅状态缺失（回归 4747f2e2 改 void 导致临时聊天页空白）
     await initTenantConfig();
+    if (chatPageDisposed || chatPageBootFailed.value) return;
 
     // 设置当前页面导航栏标题
     setCurrentPageNavigationBarTitle();
@@ -4225,6 +4247,11 @@
     }
     // 判断是否是临时会话
     if (props.isTempChat) {
+      // 临时会话依赖验证码配置，配置不可用时必须给出重试入口。
+      if (tenantConfigInfo.value == null) {
+        failChatPageLoad();
+        return;
+      }
       await handleTempChatPageLoad(options);
     } else {
       await handlePageLoad(options);
@@ -4265,7 +4292,18 @@
       // ignore
     }
     // #endif
-    runOnLoadAsync(options);
+    chatPageBootLoading.value = true;
+    chatPageBootFailed.value = false;
+    clearChatPageBootTimer();
+    chatPageBootTimer = setTimeout((): void => { failChatPageLoad(); }, 30000);
+    runOnLoadAsync(options).then((): void => {
+      if (chatPageDisposed) return;
+      clearChatPageBootTimer();
+      chatPageBootLoading.value = false;
+    }).catch((): void => {
+      console.error("[ChatPage] initialization failed");
+      failChatPageLoad();
+    });
   });
 
   // 刷新文件列表
@@ -4486,6 +4524,8 @@
   // JS 线程繁忙 / Activity 泄漏时 onUnmounted 可能不触发）。onUnmounted 保留作兜底。
   onUnload((): void => {
     speechSocketWarmup.teardown();
+    chatPageDisposed = true;
+    clearChatPageBootTimer();
     stopAllStreamSpeech(true);
     chatService.abort();
     service.abortSubConversation();
@@ -4540,6 +4580,8 @@
 
   // 清理事件监听器
   onUnmounted(() => {
+    chatPageDisposed = true;
+    clearChatPageBootTimer();
     if (contextFileSearchTimer != 0) clearTimeout(contextFileSearchTimer);
     service.invalidateContextFileRequest();
     speechSocketWarmup.teardown();
@@ -4722,5 +4764,18 @@
     justify-content: center;
     background-color: #ffffff;
     z-index: 20;
+  }
+
+  .chat-page-load-error {
+    align-items: center;
+    justify-content: center;
+  }
+  .chat-page-load-error__text {
+    color: #9aa3ad;
+    font-size: 28rpx;
+    margin-bottom: 24rpx;
+  }
+  .chat-page-load-error__retry {
+    font-size: 28rpx;
   }
 </style>

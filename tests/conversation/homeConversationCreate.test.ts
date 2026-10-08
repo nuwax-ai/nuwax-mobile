@@ -21,7 +21,7 @@ const handlerCode = transformSync(
   { loader: "ts" },
 ).code;
 
-function setup(computerId = "403", path = "/tmp/mobile-project", project: PinnedProjectInfo | null = null) {
+function setup(computerId = "403", path = "/tmp/mobile-project", project: PinnedProjectInfo | null = null, boundComputerId = "") {
   const context = {
     sending: { value: false },
     projectCreating: { value: false },
@@ -31,6 +31,9 @@ function setup(computerId = "403", path = "/tmp/mobile-project", project: Pinned
     ensureLoggedIn: vi.fn().mockResolvedValue(true),
     activeAgentId: { value: 1596 },
     activeAgentName: { value: "任务智能体" },
+    activeAgentDetailLoading: { value: false },
+    isAgentComputerBound: { value: boundComputerId.length > 0 },
+    activeAgentSandboxId: { value: boundComputerId },
     pinnedProject: { value: project },
     currentComputerId: { value: computerId },
     workspacePath: { value: path },
@@ -105,5 +108,35 @@ describe("首页选择个人电脑与工作目录后创建会话", () => {
     expect(page.saveDraft).not.toHaveBeenCalled();
     expect(page.jumpToAgentDetailPage).not.toHaveBeenCalled();
     expect(page.sending.value).toBe(false);
+  });
+
+  it.each(["366", "private-computer"])("私人智能体绑定 %s：固定电脑并发送用户新选的目录", async (boundComputerId) => {
+    const page = setup("403", "/tmp/private-workspace", null, boundComputerId);
+    const payload = { messageInfo: "私人任务", sandboxId: "-1", files: [] };
+    await page.send(payload);
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledTimes(1);
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({
+      agentId: 1596, devMode: false,
+      sandboxId: boundComputerId === "366" ? 366 : boundComputerId,
+      workspacePath: "/tmp/private-workspace",
+    });
+    expect(page.workspacePath.value).toBe("/tmp/private-workspace");
+    expect(page.saveDraft).toHaveBeenCalledWith(
+      1596, 9527, "私人任务", [], { ...payload, sandboxId: boundComputerId }, boundComputerId, "/tmp/private-workspace",
+    );
+  });
+
+  it("私人智能体选择默认目录时仍固定电脑，创建请求不带自定义目录", async () => {
+    const page = setup("-1", "", null, "366");
+    await page.send({ messageInfo: "私人任务", sandboxId: "403" });
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({ agentId: 1596, devMode: false, sandboxId: 366 });
+  });
+
+  it("私人智能体的绑定确认前不能用上一个电脑创建会话", async () => {
+    const page = setup();
+    page.activeAgentDetailLoading.value = true;
+    await page.send({ messageInfo: "开始任务", sandboxId: "403" });
+    expect(page.apiAgentConversationCreate).not.toHaveBeenCalled();
+    expect(page.tryCreateProjectFlow).not.toHaveBeenCalled();
   });
 });

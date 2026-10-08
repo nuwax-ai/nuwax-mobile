@@ -36,6 +36,20 @@ function makeResponse(records: unknown[]): unknown {
 }
 
 describe("mapProjectTabResponse", () => {
+  it.each([
+    { workspacePath: "/work/project", agentWorkspacePath: "/agent/project", fileWorkspacePath: "/files/project", expected: "/work/project" },
+    { workspacePath: null, agentWorkspacePath: "/agent/project", fileWorkspacePath: "/files/project", expected: "/agent/project" },
+    { fileWorkspacePath: "/files/project", expected: "/files/project" },
+    { agentWorkspacePath: null, fileWorkspacePath: null, expected: "" },
+  ])("保留项目电脑类型与工作目录：$expected", ({ expected, ...paths }) => {
+    const groups = mapProjectTabResponse(makeResponse([
+      { projectId: 509, projectType: "NormalProject", sandboxId: 417, sandboxType: "Personal", ...paths },
+    ]), identityFormat);
+    expect(groups[0].sandboxId).toBe(417);
+    expect(groups[0].sandboxType).toBe("Personal");
+    expect(groups[0].workspacePath).toBe(expected);
+  });
+
   it("映射项目行：projectId 主键、projectType、name、服务端标记字段", () => {
     const groups = mapProjectTabResponse(
       makeResponse([

@@ -38,8 +38,8 @@ function inputFixture(scene: string, locked: boolean, unavailable = false) {
   return { ...handlers, props, computerSheetVisible, selectedComputerId, selectedComputerName, emit };
 }
 
-function sheetFixture(readonly: boolean, savedId = "-1", currentValue = "366") {
-  const props = { readonly, autoSelect: true, currentValue, agentId: 7, visible: false };
+function sheetFixture(readonly: boolean, savedId = "-1", currentValue = "366", autoSelect = true) {
+  const props = { readonly, autoSelect, currentValue, agentId: 7, visible: false };
   const emit = vi.fn(), save = vi.fn().mockResolvedValue({ code: "0000" });
   const script = sheetSource.split('<script setup lang="uts">')[1].split("</script>")[0]
     .replace(/^\s*import .*;\s*$/gm, "");
@@ -100,6 +100,18 @@ describe("conversation computer inspection", () => {
     expect(f.emit.mock.calls).toEqual([["syncName", "366", "我的电脑"]]);
     expect(f.save).not.toHaveBeenCalled();
     expect(f.popup).not.toHaveBeenCalled();
+  });
+
+  it("keeps the project's initial computer despite agent memory and still allows user changes", async () => {
+    const f = sheetFixture(false, "-1", "366", false);
+    await f.loadComputers();
+    expect(f.emit.mock.calls).toEqual([["syncName", "366", "我的电脑"]]);
+    expect(f.save).not.toHaveBeenCalled();
+    f.emit.mockClear();
+    await f.selectItem(f.computers.value[0]);
+    expect(f.emit.mock.calls).toEqual([["select", "-1", "云端电脑"]]);
+    expect(f.save).toHaveBeenCalledTimes(1);
+    expect(f.save).toHaveBeenCalledWith("7", "-1");
   });
 
   it("updates only the bound computer name and ignores stale computer metadata", () => {

@@ -25,6 +25,7 @@ function setup(sandboxId: unknown = "366") {
   const ref = <T>(value: T) => ({ value });
   const context = {
     pinnedNormalProject: ref(false), pinnedProject: ref(null), disablePersonalComputer: ref(false),
+    pinnedProjectConfigLoading: ref(false),
     effectiveTaskAgent: ref(true), activeAgentType: ref("TaskAgent"),
     activeAgentId: ref(7), activeRecId: ref(null),
     activeAgentDetailSequence: 0, activeAgentDetailLoading: ref(false),

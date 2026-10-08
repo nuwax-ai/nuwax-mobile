@@ -59,6 +59,7 @@ describe("mapProjectTabResponse", () => {
     expect(groups.length).toBe(2);
     expect(groups[0].id).toBe(1);
     expect(groups[0].projectType).toBe("UserApp");
+    expect(groups[0].key).toBe("UserApp:1");
     expect(groups[0].name).toBe("全栈项目A");
     expect(groups[0].expanded).toBe(true);
     // 标记字段回读打标（2026-09-13 服务端化）：有值读值、缺省 false
@@ -66,6 +67,7 @@ describe("mapProjectTabResponse", () => {
     expect(groups[0].collected).toBe(true);
     expect(groups[0].archived).toBe(false);
     expect(groups[1].archived).toBe(true);
+    expect(groups[1].key).toBe("NormalProject:2");
     expect(groups[1].pinned).toBe(false);
   });
 
@@ -218,6 +220,28 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     expect(appendProjectGroupsDedup([a], [c]).length).toBe(2);
   });
 
+  it("同一页的网站应用 3 和测试常规 3 都保留，仅同类型同 ID 去重", () => {
+    const groups = mapProjectTabResponse(makeResponse([
+      { projectId: 3, projectType: "UserApp", name: "测试网站应用1" },
+      { projectId: 3, projectType: "NormalProject", name: "测试常规1" },
+      { projectId: 3, projectType: "NormalProject", name: "重复回包" },
+    ]), identityFormat);
+    const merged = appendProjectGroupsDedup([], groups);
+    expect(merged.map((group) => group.name)).toEqual(["测试网站应用1", "测试常规1"]);
+  });
+
+  it("分页追加时同号的另一类项目保留，重复项目不覆盖已加载数据", () => {
+    const first = mapProjectTabResponse(makeResponse([
+      { projectId: 3, projectType: "UserApp", name: "测试网站应用1" },
+    ]), identityFormat);
+    const next = mapProjectTabResponse(makeResponse([
+      { projectId: 3, projectType: "NormalProject", name: "测试常规1" },
+      { projectId: 3, projectType: "UserApp", name: "重复回包" },
+    ]), identityFormat);
+    expect(appendProjectGroupsDedup(first, next).map((group) => group.name))
+      .toEqual(["测试网站应用1", "测试常规1"]);
+  });
+
   it("reconcileProjectGroups：服务端字段/顺序/子会话以回包为准，仅保留展开态", () => {
     const current = new ProjectGroupView();
     current.id = 1;
@@ -255,6 +279,22 @@ describe("项目列表分页（对齐 PC projectHistoryRows 口径）", () => {
     expect(result[0].expanded).toBe(false);
   });
 
+  it("刷新同号项目时分别保留各自的展开状态", () => {
+    const current = mapProjectTabResponse(makeResponse([
+      { projectId: 3, projectType: "UserApp", name: "网站应用" },
+      { projectId: 3, projectType: "NormalProject", name: "常规项目" },
+    ]), identityFormat);
+    current[0].expanded = false;
+    current[1].expanded = true;
+    const fresh = mapProjectTabResponse(makeResponse([
+      { projectId: 3, projectType: "NormalProject", name: "常规项目新名称" },
+      { projectId: 3, projectType: "UserApp", name: "网站应用新名称" },
+    ]), identityFormat);
+    const result = reconcileProjectGroups(current, fresh);
+    expect(result.map((group) => group.expanded)).toEqual([true, false]);
+    expect(result.map((group) => group.name)).toEqual(["常规项目新名称", "网站应用新名称"]);
+  });
+
   it("mapProjectTotalPages：回读 pages 数值，缺失/非数回 0", () => {
     expect(mapProjectTotalPages({ records: [], pages: 3 })).toBe(3);
     expect(mapProjectTotalPages({ records: [], pages: "5" })).toBe(5);
@@ -281,6 +321,7 @@ describe("flattenProjectRows（Android list-view 扁平化）", () => {
   function makeGroup(id: number, expanded: boolean): ProjectGroupView {
     const group = new ProjectGroupView();
     group.id = id;
+    group.projectType = "NormalProject";
     group.expanded = expanded;
     return group;
   }
@@ -296,7 +337,7 @@ describe("flattenProjectRows（Android list-view 扁平化）", () => {
     const rows = flattenProjectRows([makeGroup(1, false), makeGroup(2, false)]);
     expect(rows.length).toBe(2);
     expect(rows[0].kind).toBe(PROJECT_FLAT_KIND_GROUP);
-    expect(rows[0].key).toBe("p-1");
+    expect(rows[0].key).toBe("p-NormalProject:1");
     expect(rows[0].groupEnd).toBe(true);
     expect(rows[1].groupEnd).toBe(true);
   });
@@ -312,7 +353,7 @@ describe("flattenProjectRows（Android list-view 扁平化）", () => {
       PROJECT_FLAT_KIND_CHILD,
       PROJECT_FLAT_KIND_GROUP,
     ]);
-    expect(rows.map((r) => r.key)).toEqual(["p-1", "c-1-11", "c-1-12", "p-2"]);
+    expect(rows.map((r) => r.key)).toEqual(["p-NormalProject:1", "c-NormalProject:1-11", "c-NormalProject:1-12", "p-NormalProject:2"]);
     expect(rows[2].groupEnd).toBe(true);
     expect(rows[3].groupEnd).toBe(true);
     expect(rows[1].groupId).toBe(1);
@@ -326,7 +367,7 @@ describe("flattenProjectRows（Android list-view 扁平化）", () => {
     expect(rows.length).toBe(2);
     expect(rows[0].kind).toBe(PROJECT_FLAT_KIND_GROUP);
     expect(rows[1].kind).toBe(PROJECT_FLAT_KIND_EMPTY);
-    expect(rows[1].key).toBe("n-3");
+    expect(rows[1].key).toBe("n-NormalProject:3");
     expect(rows[1].groupEnd).toBe(true);
   });
 
@@ -335,7 +376,20 @@ describe("flattenProjectRows（Android list-view 扁平化）", () => {
     const b = makeGroup(8, true);
     b.children = [makeChild(7, "与项目 7 同号")];
     const rows = flattenProjectRows([a, b]);
-    expect(rows.map((r) => r.key)).toEqual(["p-7", "p-8", "c-8-7"]);
+    expect(rows.map((r) => r.key)).toEqual(["p-NormalProject:7", "p-NormalProject:8", "c-NormalProject:8-7"]);
     expect(new Set(rows.map((r) => r.key)).size).toBe(3);
+  });
+
+  it("跨类型同号项目及其同号子项均生成不同的列表 key", () => {
+    const app = makeGroup(3, true);
+    app.projectType = "UserApp";
+    app.children = [makeChild(11, "网站会话")];
+    const normal = makeGroup(3, true);
+    normal.children = [makeChild(11, "常规会话")];
+    const rows = flattenProjectRows([app, normal]);
+    expect(rows.map((row) => row.key)).toEqual([
+      "p-UserApp:3", "c-UserApp:3-11", "p-NormalProject:3", "c-NormalProject:3-11",
+    ]);
+    expect(new Set(rows.map((row) => row.key)).size).toBe(4);
   });
 });

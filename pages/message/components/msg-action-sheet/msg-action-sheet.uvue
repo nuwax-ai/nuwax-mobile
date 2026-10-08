@@ -32,6 +32,9 @@
                 class="ma-emoji"
                 hover-class="ma-emoji--hover"
                 @click="handleEmojiSelect(emo)"
+                @touchstart="handleSheetTouchStart($event)"
+                @touchend="handleSheetTouchEnd('react:' + emo, $event)"
+                @touchcancel="handleSheetTouchCancel('react:' + emo, $event)"
               >
                 <text class="ma-emoji__face">{{ emo }}</text>
               </view>
@@ -42,6 +45,9 @@
             class="ma-more"
             hover-class="ma-more--active"
             @click="toggleExpand"
+            @touchstart="handleSheetTouchStart($event)"
+            @touchend="handleMoreTouchEnd($event)"
+            @touchcancel="handleMoreTouchCancel($event)"
           >
             <view class="ma-more__circle">
               <view class="ma-more__dot" />
@@ -59,6 +65,9 @@
                 class="ma-emoji"
                 hover-class="ma-emoji--hover"
                 @click="handleEmojiSelect(emo)"
+                @touchstart="handleSheetTouchStart($event)"
+                @touchend="handleSheetTouchEnd('react:' + emo, $event)"
+                @touchcancel="handleSheetTouchCancel('react:' + emo, $event)"
               >
                 <text class="ma-emoji__face">{{ emo }}</text>
               </view>
@@ -79,6 +88,9 @@
           class="ma-row"
           hover-class="ma-row--active"
           @click="handleSelect(a.key)"
+          @touchstart="handleSheetTouchStart($event)"
+          @touchend="handleSheetTouchEnd(a.key, $event)"
+          @touchcancel="handleSheetTouchCancel(a.key, $event)"
         >
           <view class="ma-row__icon-wrap">
             <svg-icon v-if="a.key == 'copy'" name="icon-CopyOutlined" size="44" color="#292832" />
@@ -130,6 +142,53 @@
   /** 表情网格展开态（组件内部：展开/收起不经过页面，高度随之联动）。 */
   const expanded = ref<boolean>(false);
 
+  // ===== 点选触摸判定态（三星 One UI 修复，2026-10-08）=====
+  // 三星机型在 page-container 原生弹层内对子视图的 click 合成偶发不产生：长按消息
+  // 弹出本面板后，回复/转发等按钮点了没反应（其余验证的 Android/iOS 均正常）。
+  // 行/表情/「更多」键改为 touchend 自行判点按（位移 ≤12px 即派发）为主通道，
+  // @click 保留为 H5 桌面无触摸兜底；两通道经 handleSelect/toggleExpand 内 500ms
+  // 防重（同 key）保证只生效一次。
+  let sheetTouchStartX = 0;
+  let sheetTouchStartY = 0;
+  let lastSelectKey = "";
+  let lastSelectAtMs = 0;
+  let lastToggleAtMs = 0;
+  const SELECT_DEDUPE_MS = 500;
+
+  /** 记点按起点（行/表情/更多键 touchstart 共用；横向 emoji 条滚动起点的位移超阈值不派发）。
+   *  部分安卓运行时（鸿蒙系手机装 Android 版）touchstart 的 touches 为空、坐标只在
+   *  changedTouches：起点取不到会残留上一轮旧坐标，isSheetTap 位移必超阈值，touchend
+   *  主通道整轮哑火——起点两侧互补读取。 */
+  function handleSheetTouchStart(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
+    if (e.touches.length > 0) {
+      sheetTouchStartX = e.touches[0].clientX;
+      sheetTouchStartY = e.touches[0].clientY;
+      return;
+    }
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      sheetTouchStartX = e.changedTouches[0].clientX;
+      sheetTouchStartY = e.changedTouches[0].clientY;
+    }
+  }
+
+  /** 抬手落点位移 ≤12px 判点按（emoji 条横滚、面板下滑关闭手势都超阈值，不会误派发）。
+   *  落点同样 changedTouches 优先、touches 兜底（与起点互补，防单侧为空的运行时）。 */
+  function isSheetTap(eventValue: Any): boolean {
+    const e = eventValue as UniTouchEvent;
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      const dx = e.changedTouches[0].clientX - sheetTouchStartX;
+      const dy = e.changedTouches[0].clientY - sheetTouchStartY;
+      return Math.abs(dx) <= 12 && Math.abs(dy) <= 12;
+    }
+    if (e.touches.length > 0) {
+      const dx = e.touches[0].clientX - sheetTouchStartX;
+      const dy = e.touches[0].clientY - sheetTouchStartY;
+      return Math.abs(dx) <= 12 && Math.abs(dy) <= 12;
+    }
+    return false;
+  }
+
   /** easycom 子组件须走 $callMethod（uni-modal-popup expose open/close，同 add-buddy-sheet）。 */
   function callPopupMethod(methodName: string): void {
     const proxy = popupRef.value as ComponentPublicInstance | null;
@@ -141,6 +200,10 @@
 
   function open(): void {
     expanded.value = false;
+    // 新开面板清点选防重窗：上一轮收面板手势的 dedupe 态不再吞本轮首点
+    lastSelectKey = "";
+    lastSelectAtMs = 0;
+    lastToggleAtMs = 0;
     callPopupMethod("open");
   }
 
@@ -154,20 +217,70 @@
     emit("closed");
   }
 
-  /** 点行：上抛动作并收起（close 的 afterleave 再发 closed）。 */
+  /** 点选分发（行/表情共用）：emit 后收面板。双通道防重——touchend 先派发，系统随后
+   *  合成的 click 再进这里时 500ms 内同 key 直接吞（三星合成 click 有时不产生，touchend
+   *  是主通道；其余端两通道都发，靠此处去重保证只生效一次）。 */
   function handleSelect(key: string): void {
+    if (key == lastSelectKey && Date.now() - lastSelectAtMs < SELECT_DEDUPE_MS) {
+      return;
+    }
+    lastSelectKey = key;
+    lastSelectAtMs = Date.now();
     emit("select", key);
     close();
   }
 
-  /** 点 emoji：上抛 react: 前缀动作并收起（toggle 语义在页面侧判定）。 */
+  /** 点 emoji：react: 前缀动作走 handleSelect 同一分发/防重路径（toggle 语义在页面侧判定）。 */
   function handleEmojiSelect(emoji: string): void {
-    emit("select", `react:${emoji}`);
-    close();
+    handleSelect("react:" + emoji);
+  }
+
+  /** touchend 派发（行/表情）：落点位移 ≤12px 判点按后走 handleSelect——绕开三星
+   *  One UI 在 page-container 原生弹层内 click 合成偶发失败导致的「按钮点不动」。 */
+  function handleSheetTouchEnd(key: string, eventValue: Any): void {
+    if (isSheetTap(eventValue)) {
+      handleSelect(key);
+    }
   }
 
   function toggleExpand(): void {
+    // 「更多」键同样双通道（touchend + click），500ms 防重
+    if (Date.now() - lastToggleAtMs < SELECT_DEDUPE_MS) {
+      return;
+    }
+    lastToggleAtMs = Date.now();
     expanded.value = !expanded.value;
+  }
+
+  /** 「更多」键 touchend 派发（判定语义同 handleSheetTouchEnd）。 */
+  function handleMoreTouchEnd(eventValue: Any): void {
+    if (isSheetTap(eventValue)) {
+      toggleExpand();
+    }
+  }
+
+  /** touchcancel 派发（行/表情）：原生弹层的下滑关闭手势、scroll-view 滚动抢占触摸时，
+   *  抬手侧收到的是 cancel 而非 touchend（鸿蒙系 Android 尤其明显），且被手势认领后
+   *  click 也不会再合成——不处理 cancel 点按就被整个吞掉（点表情面板无反应、不收起）。
+   *  静点按（位移 ≤12px）同样派发；位移超阈值按滚动/下滑手势吞掉。先清起点防脏坐标
+   *  毒化下一轮判定（防重仍由 handleSelect 的 500ms 窗口保证）。 */
+  function handleSheetTouchCancel(key: string, eventValue: Any): void {
+    const tap = isSheetTap(eventValue);
+    sheetTouchStartX = 0;
+    sheetTouchStartY = 0;
+    if (tap) {
+      handleSelect(key);
+    }
+  }
+
+  /** 「更多」键 touchcancel（判定语义同 handleSheetTouchCancel）。 */
+  function handleMoreTouchCancel(eventValue: Any): void {
+    const tap = isSheetTap(eventValue);
+    sheetTouchStartX = 0;
+    sheetTouchStartY = 0;
+    if (tap) {
+      toggleExpand();
+    }
   }
 
   /**

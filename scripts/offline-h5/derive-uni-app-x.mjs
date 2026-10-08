@@ -2,7 +2,6 @@
 /** uni-app x 产物适配器：/m/ Web ESM → 本地 IIFE。由 build-offline-h5.mjs 调用。
  * 框架产物格式相关处理只放这里；应用运行与协议不依赖这些文本改写。
  */
-import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -51,13 +50,15 @@ const bundlePath = path.join(OUT, 'app-bundle.js');
 // 绝对路径编码成了「..-..-...」畸形文件名（裸包名形态），esbuild 无法按相对路径解析，需插件接管。
 let esbuildPkg;
 try {
-  // ESBUILD 指向 .bin 启动器（用于 --version），JS API 需加载其同级包目录
+  // ESBUILD 指向 .bin 启动器（仅用于定位包），JS API 需加载其同级包目录
   const esbuildPkgDir = path.resolve(path.dirname(ESBUILD), '..', 'esbuild');
   esbuildPkg = createRequire(import.meta.url)(esbuildPkgDir);
 } catch {
   fail(`无法加载 esbuild JS API：${ESBUILD}（${ESBUILD_BIN_HINT()}）`);
 }
-const esbuildVersion = execFileSync(ESBUILD, ['--version'], { encoding: 'utf8' }).trim();
+// 版本号取自 JS API；不再 execFileSync .bin/esbuild(.cmd)——Windows 下 Node ≥18.20/20.12/22
+// 的 CVE-2024-27980 补丁会对无 shell 的 .cmd spawn 抛 EINVAL
+const esbuildVersion = esbuildPkg.version || 'unknown';
 console.log(`[offline-h5:uni-app-x] esbuild ${esbuildVersion} <- ${entryRel}`);
 try {
   await esbuildPkg.build({

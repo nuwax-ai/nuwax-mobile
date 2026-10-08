@@ -143,13 +143,14 @@
         :current-model-id="currentModelId"
         :current-model-name="currentModelName"
         :current-sandbox-id="effectiveHomeComputerId"
+        :auto-select-computer="pinnedProject == null"
         :current-computer-name="currentComputerName"
         :agent-enable-version-control="activeEnableVersionControl"
         :summoned-expert-id="summonedExpertId"
         :summoned-expert-name="summonedExpertName"
         :summoned-expert-icon="summonedExpertIcon"
         :allow-choose-mode="activeAllowChooseMode"
-        :is-sandbox-switch-disabled="disablePersonalComputer || isAgentComputerBound || activeAgentDetailLoading"
+        :is-sandbox-switch-disabled="disablePersonalComputer || isAgentComputerBound || activeAgentDetailLoading || pinnedProjectConfigLoading"
         :allow-private-sandbox="activeAllowPrivateSandbox || pinnedNormalProject || isAgentComputerBound"
         :hide-computer-selector="pinnedProject != null && !pinnedNormalProject"
         :pinned-project-name="pinnedProject != null ? pinnedProject.name : ''"
@@ -158,7 +159,7 @@
         :space-selector-label="showSpaceSelector && selectedSpaceName.length > 0 ? selectedSpaceName : ''"
         :enable-voice="true"
         :is-conversation-active="false"
-        :whole-disabled="sending || projectCreating || activeAgentDetailLoading"
+        :whole-disabled="sending || projectCreating || activeAgentDetailLoading || pinnedProjectConfigLoading"
         :is-sending="sending || projectCreating"
         :has-permission="true"
         :manual-components="activeManualComponents"
@@ -297,7 +298,7 @@
   import { apiPublishedAgentInfo, apiDisplayRecommendList } from "@/servers/agentDev";
   import { apiAgentConversationCreate } from "@/servers/conversation";
   import { apiSpaceList } from "@/servers/space";
-  import { apiProjectCreateUnified } from "@/servers/project";
+  import { apiProjectCreateUnified, apiNormalProjectGetById } from "@/servers/project";
   import { fetchChatboxCategories } from "@/servers/square";
   import { isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
   import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
@@ -319,6 +320,8 @@
   import {
     DisplayRecommendInfo,
     PinnedProjectInfo,
+    resolvePinnedProjectComputerId,
+    resolveProjectWorkspacePath,
     findDefaultAgent,
     findTypeFallbackAgent,
     getProjectTypeByFunctionType,
@@ -477,6 +480,8 @@
 
   // 项目上框（对齐 PC pinnedProject）：抽屉「＋新建会话」pin 进来，约束推荐可选范围并随会话绑定项目
   const pinnedProject = ref<PinnedProjectInfo | null>(null);
+  const pinnedProjectConfigLoading = ref<boolean>(false);
+  let pinnedProjectConfigSequence = 0;
   // 上框未命中提示去重（同一项目只提示一次，对齐 PC agentMissedPromptedRef）
   let pinnedMissedProjectId = 0;
 
@@ -660,7 +665,7 @@
   });
   // 私人智能体固定电脑，但仍可在绑定电脑上选择工作目录。
   const showWorkspaceDirBar = computed((): boolean => {
-    if (activeAgentDetailLoading.value) return false;
+    if (activeAgentDetailLoading.value || pinnedProjectConfigLoading.value) return false;
     if (pinnedProject.value != null && !pinnedNormalProject.value) return false;
     if (disablePersonalComputer.value) return false;
     if (effectiveTaskAgent.value != true && activeAgentType.value != "TaskAgent") return false;
@@ -968,32 +973,70 @@
     }
   }
 
-  /** 上框项目落地（对齐 PC consumePinnedProject）：切换项目时清旧会话对象及互斥选择 */
-  function applyPinnedProject(project: PinnedProjectInfo): void {
-    const current = pinnedProject.value;
-    if (current != null && current.projectId == project.projectId) {
-      // 同项目重复 pin：只刷新数据不重置选择态（避免命中项弹回默认）
-      pinnedProject.value = project;
-      return;
+  /** 项目电脑和目录仅作为初始值，之后以用户选择为准。 */
+  function applyPinnedProjectComputer(project: PinnedProjectInfo): void {
+    const computerId = resolvePinnedProjectComputerId(project);
+    if (currentComputerId.value != computerId) {
+      currentComputerName.value = t(computerId == "-1" ? "Mobile.CreateHub.cloudComputer" : "Mobile.CreateHub.selectComputer");
     }
+    currentComputerId.value = computerId;
+    workspacePath.value = resolvePersonalWorkspacePath(computerId, project.workspacePath);
+    workspaceDirMenuVisible.value = false;
+    workspaceDirSheetVisible.value = false;
+  }
+
+  /** 每次点击项目创建任务都重新继承配置；列表目录可能缺失，读取一次详情补齐。 */
+  async function applyPinnedProject(project: PinnedProjectInfo): Promise<void> {
+    const current = pinnedProject.value;
+    const sameProject = current != null && current.projectId == project.projectId && current.projectType == project.projectType;
+    pinnedProjectConfigSequence = pinnedProjectConfigSequence + 1;
+    const requestSequence = pinnedProjectConfigSequence;
+    pinnedProjectConfigLoading.value = project.projectType == "NormalProject";
     pinnedProject.value = project;
-    pinnedMissedProjectId = 0;
-    clearSummonedExpert();
-    clearRecommendState();
-    userPickedCategory.value = chatboxCategories.value.length > 0 ? chatboxCategories.value[0].key : "";
-    categoryScrollInto.value = "";
-    currentModelId.value = 0;
-    currentModelName.value = "";
-    selectedSpaceId.value = 0;
-    // 新项目不能继承上一位专家或模型；同项目重复 pin 在上方提前返回，不影响当前输入。
-    resetComputerSelection();
-    // 推荐列表已就绪则立即尝试默认命中
-    resolvePinnedAgentHit();
+    if (!sameProject) {
+      pinnedMissedProjectId = 0;
+      clearSummonedExpert();
+      clearRecommendState();
+      userPickedCategory.value = chatboxCategories.value.length > 0 ? chatboxCategories.value[0].key : "";
+      categoryScrollInto.value = "";
+      currentModelId.value = 0;
+      currentModelName.value = "";
+      selectedSpaceId.value = 0;
+      // 只有切换项目才重置会话对象，避免同项目重开时重复加载智能体及其工具。
+      resolvePinnedAgentHit();
+    }
+    if (project.projectType == "NormalProject") {
+      applyPinnedProjectComputer(project);
+    } else {
+      resetComputerSelection();
+    }
     callInputRef("focus");
+    if (project.projectType != "NormalProject") return;
+    try {
+      const res = await apiNormalProjectGetById(project.projectId);
+      if (requestSequence != pinnedProjectConfigSequence || apiResCode(res) != SUCCESS_CODE) return;
+      const pinned = pinnedProject.value;
+      if (pinned == null || pinned.projectId != project.projectId || pinned.projectType != project.projectType) return;
+      const detail = resObject(apiResData<any>(res));
+      if (detail == null) return;
+      pinned.sandboxId = numFromAny(detail["sandboxId"], pinned.sandboxId);
+      const sandboxType = strOf(detail["sandboxType"]);
+      if (sandboxType.length > 0) pinned.sandboxType = sandboxType;
+      pinned.workspacePath = resolveProjectWorkspacePath(
+        strOf(detail["workspacePath"]), strOf(detail["agentWorkspacePath"]), strOf(detail["fileWorkspacePath"]),
+      );
+      applyPinnedProjectComputer(pinned);
+    } catch (error) {
+      console.error("读取上框项目配置失败", error);
+    } finally {
+      if (requestSequence == pinnedProjectConfigSequence) pinnedProjectConfigLoading.value = false;
+    }
   }
 
   /** 移除上框：恢复首页默认形态（对齐 PC handleClearPinnedProject） */
   function handleClearPinnedProject(): void {
+    pinnedProjectConfigSequence = pinnedProjectConfigSequence + 1;
+    pinnedProjectConfigLoading.value = false;
     pinnedProject.value = null;
     pinnedMissedProjectId = 0;
     clearRecommendState();
@@ -1029,7 +1072,7 @@
   }
 
   function handleComputerChange(computerId: string, name: string): void {
-    if (isAgentComputerBound.value || activeAgentDetailLoading.value) return;
+    if (isAgentComputerBound.value || activeAgentDetailLoading.value || pinnedProjectConfigLoading.value) return;
     if (computerId != currentComputerId.value) workspacePath.value = "";
     currentComputerId.value = computerId;
     currentComputerName.value = name;
@@ -1602,7 +1645,7 @@
    * 双击防护覆盖两分支（sending / projectCreating 任一进行中直接忽略）。
    */
   async function handleSendMessage(data: any): Promise<void> {
-    if (sending.value == true || projectCreating.value == true || activeAgentDetailLoading.value) {
+    if (sending.value == true || projectCreating.value == true || activeAgentDetailLoading.value || pinnedProjectConfigLoading.value) {
       return;
     }
     const payload = normalizeSendPayload(data);

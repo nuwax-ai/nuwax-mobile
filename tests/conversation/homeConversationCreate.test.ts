@@ -32,6 +32,7 @@ function setup(computerId = "403", path = "/tmp/mobile-project", project: Pinned
     activeAgentId: { value: 1596 },
     activeAgentName: { value: "任务智能体" },
     activeAgentDetailLoading: { value: false },
+    pinnedProjectConfigLoading: { value: false },
     isAgentComputerBound: { value: boundComputerId.length > 0 },
     activeAgentSandboxId: { value: boundComputerId },
     pinnedProject: { value: project },

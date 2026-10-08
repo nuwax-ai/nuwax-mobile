@@ -24,7 +24,7 @@ function setup() {
   const groups = mapProjectTabResponse({ records: [
     { projectId: 3, projectType: "UserApp", name: "测试网站应用1", sandboxId: 301,
       conversations: [{ id: 101, agentId: 10, devTargetType: "UserApp", devTargetId: 3, topic: "网站会话" }] },
-    { projectId: 3, projectType: "NormalProject", name: "测试常规1", sandboxId: 417,
+    { projectId: 3, projectType: "NormalProject", name: "测试常规1", sandboxId: 417, sandboxType: "Personal", agentWorkspacePath: "/work/project",
       conversations: [{ id: 102, agentId: 1596, devTargetType: "NormalProject", devTargetId: 3, topic: "常规会话" }] },
   ] }, value => value);
   const context = {
@@ -72,6 +72,7 @@ describe("同号项目的抽屉操作定位", () => {
     expect(context.close).toHaveBeenCalledTimes(1);
     expect(context.emit).toHaveBeenCalledWith("pin-project", expect.objectContaining({
       projectId: 3, projectType: type, name: group.name, sandboxId: group.sandboxId,
+      sandboxType: group.sandboxType, workspacePath: group.workspacePath,
     }));
   });
 

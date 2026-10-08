@@ -1396,6 +1396,10 @@
       @closed="handleSheetClosed"
     />
 
+    <!-- 选择复制弹层（长按面板「选择复制」进）：textarea 原生选择手柄 + 系统菜单复制
+         选中部分；文案传剥掉 Markdown 标记的纯文本，编辑不回写消息 -->
+    <msg-select-copy-sheet ref="selectCopyRef" :text="selectCopyText" @closed="handleSelectCopyClosed" />
+
     <!-- 删除消息二次确认（按人删除：仅自己的可见范围，红钮确认） -->
     <confirm-modal ref="confirmModalRef" @confirm="handleDeleteConfirmOk" @cancel="handleDeleteConfirmCancel" />
 
@@ -1489,6 +1493,7 @@
   import iconMd from "@/static/filetree/icon_md.svg";
   import ConfirmModal from "@/components/confirm-modal/confirm-modal.uvue";
   import MsgActionSheet from "./components/msg-action-sheet/msg-action-sheet.uvue";
+  import MsgSelectCopySheet from "./components/msg-select-copy-sheet/msg-select-copy-sheet.uvue";
   import { ImMergeItem, ImMergeMedia } from "@/types/interfaces/imMergeItem";
   import { ImMergeRecordSession, openImMergeRecord } from "@/utils/im/imMergeRecordSession";
   // #ifdef APP-IOS
@@ -2196,6 +2201,9 @@
   /** 弹窗动作列表（buildActionsFor 按消息状态/角色算好传入）。 */
   const sheetActions = ref<MsgActionItem[]>([]);
   const actionSheetRef = ref<any | null>(null);
+  /** 选择复制弹层（长按面板「选择复制」动作）：正文剥标记后的纯文本 + 弹层实例。 */
+  const selectCopyRef = ref<any | null>(null);
+  const selectCopyText = ref<string>("");
   // 表情快选条数据（sheetQuickEmojis computed 定义在「表情回复 + 多选转发」
   // 块：依赖 canReactMsg，UTS→Kotlin 须先定义后引用）
 
@@ -2972,6 +2980,83 @@
     }
     row.lines = parseRichLines(row.bodyText);
     row.bodyFormatted = row.lines.length > 0;
+  }
+
+  // ===== 复制用纯文本提取（整段「复制」与「选择复制」弹层共用）=====
+  // bodyText 存的是带 Markdown 标记的原文（applyActiveMarks 发送时包装），
+  // 复制给用户看/选的应是气泡显示口径的纯文本（微信同款），此处复用渲染管线剥标记。
+
+  /** 行内剥标记：走 parseSegs 同一管线——链接段取标题（裸链接 text 即还原实体后的地址）、
+   *  其余段取原文（粗体、斜体、删除线、下划线、行内码的标记字符不出现在段 text 里）。 */
+  function plainInlineForCopy(text: string): string {
+    if (text.length == 0) {
+      return "";
+    }
+    const segs = parseSegs(text);
+    const parts: string[] = [];
+    for (let i = 0; i < segs.length; i++) {
+      parts.push(segs[i].text);
+    }
+    return parts.join("");
+  }
+
+  /** 单行剥标记：块级前缀判定与 parseLine 一一对应（# 标题/> 引用去前缀；无序列表
+   *  "- * +" 按显示口径转 "· "，有序 "N. " 原样；空行原样保留不折叠）。 */
+  function plainLineForCopy(raw: string): string {
+    const t = raw.trim();
+    if (t.length == 0) {
+      return raw;
+    }
+    let body = raw;
+    let prefix = "";
+    if (t.charAt(0) == "#") {
+      let level = 0;
+      while (level < t.length && t.charAt(level) == "#" && level < 3) {
+        level++;
+      }
+      if (level > 0 && t.length > level && t.charAt(level) == " ") {
+        body = t.substring(level + 1);
+      }
+    } else if (t.charAt(0) == ">") {
+      body = t.substring(1);
+      if (body.length > 0 && body.charAt(0) == " ") {
+        body = body.substring(1);
+      }
+      body = body.trim();
+    } else if (t.length > 2 && (t.charAt(0) == "-" || t.charAt(0) == "*" || t.charAt(0) == "+") && t.charAt(1) == " ") {
+      prefix = "· ";
+      body = t.substring(2);
+    } else if (olPrefixLen(t) > 0 && t.length > olPrefixLen(t)) {
+      const cut = olPrefixLen(t);
+      prefix = t.substring(0, cut);
+      body = t.substring(cut);
+    }
+    return prefix + plainInlineForCopy(body);
+  }
+
+  /** 整文剥标记：``` 围栏行本身不出文案（内容原样保留、不再剥行内标记，未闭合围栏吃到尾）；
+   *  无富文本特征（richNeeded 同口径）原文直返零变形。渲染与复制共用同一套解析器，剥法不漂移。 */
+  function plainBodyForCopy(text: string): string {
+    if (text.length == 0 || richNeeded(text) != true) {
+      return text;
+    }
+    const rawLines = text.split("\n");
+    const out: string[] = [];
+    let inCode = false;
+    for (let i = 0; i < rawLines.length; i++) {
+      const raw = rawLines[i];
+      const trimmed = raw.trim();
+      if (trimmed.indexOf("```") == 0) {
+        inCode = !inCode;
+        continue;
+      }
+      if (inCode) {
+        out.push(raw);
+        continue;
+      }
+      out.push(plainLineForCopy(raw));
+    }
+    return out.join("\n");
   }
 
   /** 成员列表到位后：已渲染消息的提及高亮需要重建（richNeeded 依赖成员 token）。 */
@@ -7364,6 +7449,11 @@
       copy.key = "copy";
       copy.label = t("Mobile.Message.actionCopy");
       acts.push(copy);
+      // 选择复制：二级弹层 textarea 系统选择手柄局部复制（框架不支持气泡内选择，见组件头注释）
+      const selectCopy = new MsgActionItem();
+      selectCopy.key = "selectCopy";
+      selectCopy.label = t("Mobile.Message.actionSelectCopy");
+      acts.push(selectCopy);
     }
     if (hasQuotableBody(msg)) {
       const quote = new MsgActionItem();
@@ -7616,6 +7706,11 @@
     selectedId.value = "";
   }
 
+  /** 选择复制弹层收起：清承接文本（弹层内 textarea 是本地副本，不受影响）。 */
+  function handleSelectCopyClosed(): void {
+    selectCopyText.value = "";
+  }
+
   /** 置顶 / 取消置顶：幂等；成功后重拉 Pin 集（多人共享状态自我纠正）。 */
   async function handleActionPin(msg: ImMsgRow, pin: boolean): Promise<void> {
     if (convId.value.length == 0) {
@@ -7748,8 +7843,10 @@
     if (key == "quote") {
       enterQuoteMode(msg);
     } else if (key == "copy") {
+      // 整段复制也走剥标记纯文本（与气泡显示口径一致；极端剥空回落原文兜底）
+      const copyPlain = plainBodyForCopy(msg.bodyText);
       writeClipboardText(
-        msg.bodyText,
+        copyPlain.length > 0 ? copyPlain : msg.bodyText,
         () => {
           uni.showToast({ title: t("Mobile.Common.copySuccess"), icon: "none" });
         },
@@ -7757,6 +7854,15 @@
           uni.showToast({ title: t("Mobile.Common.copyFailed"), icon: "none" });
         },
       );
+    } else if (key == "selectCopy") {
+      // 选择复制弹层：纯文本进 textarea，系统选择手柄局部复制（复制动作由系统菜单完成）；
+      // 文案随 open 入参直传（$callMethod 同步执行，props.text 此刻可能尚未随赋值落地）
+      const selectPlain = plainBodyForCopy(msg.bodyText);
+      selectCopyText.value = selectPlain.length > 0 ? selectPlain : msg.bodyText;
+      const selectProxy = selectCopyRef.value as ComponentPublicInstance | null;
+      if (selectProxy != null) {
+        selectProxy.$callMethod("open", selectCopyText.value);
+      }
     } else if (key == "pin") {
       handleActionPin(msg, true);
     } else if (key == "unpin") {

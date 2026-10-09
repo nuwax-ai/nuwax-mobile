@@ -176,20 +176,42 @@
                  icon 沉到气泡左下角；包层只包气泡本体，下方表情行/pin 署名行/时间行
                  仍在气泡列竖排（状态列不再随它们下沉） -->
             <view class="chat-bubwrap">
-              <!-- 状态列（微信式：紧挨我方气泡左下角）：发送态 / 已读 icon
+              <!-- 状态列（微信式：紧挨我方气泡左下角）：发送态 / 已读 icon / 智能体处理标记
                    （仅我发的消息会渲染本列；DOM 前位=渲染在气泡左侧） -->
               <view
-                v-if="msg.status == 0 || msg.status == 2 || readInfoOf(msg, readInfoTick) != null"
+                v-if="msg.status == 0 || msg.status == 2 || msg.agentStatus > 0 || readInfoOf(msg, readInfoTick) != null"
                 class="chat-tail"
               >
                 <text v-if="msg.status == 0" class="chat-status">{{ t("Mobile.Message.sending") }}</text>
                 <text v-else-if="msg.status == 2" class="chat-status chat-status--fail">{{ t("Mobile.Message.sendFailed") }}</text>
+                <!-- 智能体处理标记（消息衔接了智能体才有明细；WS 3006 帧驱动）：
+                     未读=灰空心圈 / 处理中=青色转钟 / 完成=蓝圈蓝勾（DEV-308：蓝=完成，
+                     绿=已读回执，勿混）/ 失败=红圈叹号。
+                     ★p2p 替代已读环、群聊与已读环并列（PC 拍板⑥=C）——与下方两环各自独立 v-if；
+                     agentClockDeg 作参传入建立响应依赖（readInfoTick 同款） -->
+                <view v-if="msg.agentStatus > 0" class="chat-agent">
+                  <view v-if="msg.agentStatus == 1" class="chat-agent__ring" />
+                  <view
+                    v-else-if="msg.agentStatus == 2"
+                    class="chat-agent__clock"
+                    :style="agentClockStyle(agentClockDeg)"
+                  >
+                    <view class="chat-agent__hand chat-agent__hand--v" />
+                    <view class="chat-agent__hand chat-agent__hand--h" />
+                  </view>
+                  <view v-else-if="msg.agentStatus == 4" class="chat-agent__ring chat-agent__ring--done">
+                    <view class="chat-agent__tick" />
+                  </view>
+                  <view v-else-if="msg.agentStatus == 3" class="chat-agent__ring chat-agent__ring--fail">
+                    <text class="chat-agent__bang">!</text>
+                  </view>
+                </view>
                 <!-- 群聊：绿圈（部分已读=圈内扇形饼图按占比动态 / 全员已读=绿勾），无计数文案，
                      点击进「消息阅读状态」页看已读/未读名单。
                      ★已读相关绑定统一把 readInfoTick 作尾参传入：App-Android 方法调用
                      绑定不收集方法体内依赖，须让表达式直接读该 ref 才会随已读数据重算 -->
                 <view
-                  v-else-if="readInfoOf(msg, readInfoTick) != null && isGroupLike"
+                  v-if="readInfoOf(msg, readInfoTick) != null && isGroupLike"
                   class="chat-read"
                   :class="pressedReadCls(msg.msgId)"
                   @click="handleReadTap(msg)"
@@ -216,8 +238,12 @@
                     </view>
                   </view>
                 </view>
-                <!-- 单聊：未读=灰空心圈，已读=绿圈绿勾，点击无动作 -->
-                <view v-else-if="readInfoOf(msg, readInfoTick) != null" class="chat-read">
+                <!-- 单聊：未读=灰空心圈，已读=绿圈绿勾，点击无动作；
+                     有智能体标记时不渲染（agent mark 替代已读环） -->
+                <view
+                  v-if="readInfoOf(msg, readInfoTick) != null && isGroupLike != true && msg.agentStatus <= 0"
+                  class="chat-read"
+                >
                   <view v-if="readAllOf(msg, readInfoTick) || readCountOf(msg, readInfoTick) > 0" class="chat-read__ring">
                     <view class="chat-read__tick" />
                   </view>
@@ -1452,6 +1478,15 @@
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import eventBus from "@/utils/eventBus";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
+  import {
+    ImAgentStatusItem,
+    IM_AGENT_STATUS_DONE,
+    IM_AGENT_STATUS_PROCESSING,
+    aggregateAgentStatus,
+    mergeAgentStatusItems,
+    parseAgentStatusDetail,
+    parseAgentStatusObject,
+  } from "@/utils/im/imAgentStatus";
   import { preserveImPrependAnchor } from "@/utils/im/imPrependAnchor";
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
@@ -1722,6 +1757,10 @@
     cardActionUrl: string = "";
     /** 表情回复（MessageDto.reactions / WS 3008 全量快照；空数组=无人回复）。 */
     reactions: ImReaction[] = [];
+    /** 智能体处理状态明细（拉路径 agentStatusDetail 与 3006 帧单调并入；空=没衔接智能体）。 */
+    agentDetail: ImAgentStatusItem[] = [];
+    /** 聚合后的智能体标记态：0=无明细（回落已读环）1未读 2处理中(转钟) 3失败 4完成；applyAgentStatusToRow 维护。 */
+    agentStatus: number = 0;
     /** 合并转发卡片标题（body.title；空=接收端回落「聊天记录」）。 */
     mergeTitle: string = "";
     /** 合并转发预览条目（body.items 前 2 条渲染，其余收进「共 N 条」；空=非合并转发）。 */
@@ -3349,6 +3388,30 @@
     return t("Mobile.Message.quoteFile");
   }
 
+  /** 按行内明细重算聚合标记态（明细/sendTime 变化后调用；HUNG 投影随当前时刻走）。 */
+  function applyAgentStatusToRow(row: ImMsgRow): void {
+    const view = aggregateAgentStatus(row.agentDetail, Date.now(), row.sendTime);
+    row.agentStatus = view.has ? view.status : 0;
+  }
+
+  /**
+   * 智能体状态明细单调并入目标行（3006 帧与 HTTP 快照共口）。
+   * 返回是否引起聚合态变化（调用方据此决定是否触发重渲）。
+   */
+  function mergeRowAgentDetail(row: ImMsgRow, incoming: ImAgentStatusItem[]): boolean {
+    if (incoming.length == 0) {
+      return false;
+    }
+    const before = row.agentStatus;
+    const merged = mergeAgentStatusItems(row.agentDetail, incoming);
+    if (merged == null) {
+      return false;
+    }
+    row.agentDetail = merged;
+    applyAgentStatusToRow(row);
+    return row.agentStatus != before;
+  }
+
   function readMsgRow(obj: UTSJSONObject): ImMsgRow {
     const row = new ImMsgRow();
     row.msgId = readString(obj, "msgId");
@@ -3574,6 +3637,10 @@
     applyRichToRow(row);
     row.sendTime = readNumber(obj, "sendTime", 0);
     row.status = 1;
+    // 智能体处理状态明细（读路径投影：仅发送者本人且衔接了智能体才有键；缺键=回落已读环）。
+    // ★须在 sendTime 赋值后：HUNG 挂起投影以它作 updateTime 缺失时的时间锚
+    row.agentDetail = parseAgentStatusDetail(obj["agentStatusDetail"]);
+    applyAgentStatusToRow(row);
     return row;
   }
 
@@ -3729,6 +3796,62 @@
       messages.value = messages.value.slice();
     }, 50);
   }
+
+  // ===== 智能体「处理中」转钟驱动（对齐 PC 1.6s/圈；App 端 CSS animation 不可靠，
+  // 用 transition 自转——spin-loading 同款：角度单调递增 + linear transition，
+  // 每 tick 转 4 圈把 JS→原生桥频率降为 1/4）。deg 经模板参数传入建立响应依赖（readInfoTick 同款）。 =====
+  const AGENT_CLOCK_PERIOD_MS: number = 1600;
+  const AGENT_CLOCK_CYCLES_PER_TICK: number = 4;
+  const agentClockDeg = ref<number>(0);
+  let agentClockTimer = 0;
+  let agentClockStartTimer = 0;
+
+  /** 处理中钟面 inline style：transform + 本次过渡时长（property/timing-function 落在类上）。 */
+  function agentClockStyle(deg: number): string {
+    return `transform: rotate(${deg}deg);transition-duration: ${AGENT_CLOCK_PERIOD_MS * AGENT_CLOCK_CYCLES_PER_TICK}ms;`;
+  }
+
+  function clearAgentClockTimers(): void {
+    if (agentClockTimer != 0) {
+      clearInterval(agentClockTimer);
+      agentClockTimer = 0;
+    }
+    if (agentClockStartTimer != 0) {
+      clearTimeout(agentClockStartTimer);
+      agentClockStartTimer = 0;
+    }
+  }
+
+  /** 是否有「处理中」行：依赖 messages 整表重赋值（明细变更均伴随 mergeSyncedMessages/scheduleChatMediaRefresh）。 */
+  const anyAgentProcessing = computed((): boolean => {
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].agentStatus == IM_AGENT_STATUS_PROCESSING) {
+        return true;
+      }
+    }
+    return false;
+  });
+
+  watch(
+    (): boolean => anyAgentProcessing.value,
+    (on: boolean) => {
+      clearAgentClockTimers();
+      if (on != true) {
+        return;
+      }
+      agentClockDeg.value = 0;
+      // 等节点就绪后先抬到整 tick 角度再起 interval（首帧 transition 才会转起来——spin-loading 同款）
+      agentClockStartTimer = setTimeout(() => {
+        agentClockStartTimer = 0;
+        agentClockDeg.value = 360 * AGENT_CLOCK_CYCLES_PER_TICK;
+        agentClockTimer = setInterval(() => {
+          agentClockDeg.value = agentClockDeg.value + 360 * AGENT_CLOCK_CYCLES_PER_TICK;
+        }, AGENT_CLOCK_PERIOD_MS * AGENT_CLOCK_CYCLES_PER_TICK);
+      }, 50);
+    },
+    { immediate: true },
+  );
 
   /** reactions 全量快照就地替换目标行（REST 响应与 WS 3008 同构：整体替换，无本地合并）。 */
   function applyReactionSnapshot(msgId: string, raw: any | null): void {
@@ -5634,8 +5757,23 @@
         const previous = rows[index];
         // 撤回不可复活；较旧 HTTP 快照不可覆盖已收到的编辑事件。
         if (previous.revoked && !revoked) continue;
-        if (!previous.local && !(revoked && !previous.revoked) && revision <= previous.revisionAt) continue;
-        rows[index] = readMsgRow(record);
+        if (!previous.local && !(revoked && !previous.revoked) && revision <= previous.revisionAt) {
+          // 版本守卫挡掉整行替换，但智能体明细是另一条时间线（读路径投影）：单调并入，
+          // 旧 HTTP 快照才不会把 3006 帧推来的新状态盖回去
+          const agentIncoming = parseAgentStatusDetail(record["agentStatusDetail"]);
+          if (agentIncoming.length > 0 && mergeRowAgentDetail(previous, agentIncoming)) {
+            changed.add(msgId);
+          }
+          continue;
+        }
+        const fresh = readMsgRow(record);
+        // 本地已并入的 3006 帧状态可能领先 HTTP 快照：单调并入防回退（同 PC mergeAgentDetailList）
+        const agentKeep = mergeAgentStatusItems(fresh.agentDetail, previous.agentDetail);
+        if (agentKeep != null) {
+          fresh.agentDetail = agentKeep;
+          applyAgentStatusToRow(fresh);
+        }
+        rows[index] = fresh;
         indices.set(msgId, index);
       } else {
         indices.set(msgId, rows.length);
@@ -8983,6 +9121,53 @@
     }
   }
 
+  /**
+   * 智能体回复落地 ⇒ 该智能体的「处理中」行就地推到「完成」（乐观收口）。
+   *
+   * 依据后端时序（ImAgentChatService.settleAndForward）：⑥整批 settle（终态落库
+   * + 推 3006 帧）严格先于 ⑦代发回复——回复消息能到达 ⟹ 库里已是 DONE。但 3006 走
+   * 按发送者路由的广播管道、回复走消息扇出管道，两条管道延迟不同：回复都渲染了
+   * 转钟还在转的窗口就是 3006 晚到/乱序。这里不等帧，回复落地立即收口。
+   * - 代发消息 senderId == agentSubjectId（sendAgentReply 的 runAs 上下文），按它精确匹配；
+   * - 只动该发送者 status==2 的明细：1=未读属于下一轮排队（回复对应的是已开跑的批），
+   *   动了会把紧跟着发的新消息误标完成；
+   * - 单调合并保证随后真 3006(4) 帧幂等；失败轮不代发（回复存在 ⟹ outcome.isOk），
+   *   不会有 3 跟在回复后面被 4 挡掉。
+   */
+  function settleAgentProcessingOnReply(senderId: string): void {
+    if (senderId.length == 0) {
+      return;
+    }
+    const rows = messages.value;
+    let touched = false;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (row.agentStatus != IM_AGENT_STATUS_PROCESSING) {
+        continue;
+      }
+      const detail = row.agentDetail;
+      for (let j = 0; j < detail.length; j++) {
+        if (
+          detail[j].agentSubjectId == senderId &&
+          detail[j].status == IM_AGENT_STATUS_PROCESSING
+        ) {
+          const done = new ImAgentStatusItem();
+          done.agentSubjectId = senderId;
+          done.status = IM_AGENT_STATUS_DONE;
+          done.updateTime = Date.now();
+          const incoming: ImAgentStatusItem[] = [done];
+          if (mergeRowAgentDetail(row, incoming)) {
+            touched = true;
+          }
+          break;
+        }
+      }
+    }
+    if (touched) {
+      scheduleChatMediaRefresh();
+    }
+  }
+
   function handleImMessageReceived(payload: any): void {
     if (!isChatCurrent() || payload == null) {
       return;
@@ -9011,6 +9196,9 @@
     // icon 不必等 onShow/本端下次发送（refreshReadStatus 内部自筛候选，非我方消息空转）
     if (isMine(row)) {
       scheduleReadRefresh();
+    } else {
+      // 对方消息落地即乐观收口智能体转钟（人类 senderId 匹配不到任何明细，天然空转）
+      settleAgentProcessingOnReply(row.senderId);
     }
   }
 
@@ -9226,6 +9414,42 @@
     }
   }
 
+  /**
+   * MSG_AGENT_STATUS(3006)：智能体对某条消息的处理状态推进（仅发送者本人收到；
+   * 后端仅「处理中/终态」推帧——未读建行不推，PC 同款链路）。
+   * P1 帧可丢可重可乱序 ⇒ 单调并入；行不在当前窗口（历史翻走了）= 安全忽略。
+   */
+  function handleImAgentStatus(payload: any): void {
+    if (!isChatCurrent() || payload == null) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    const frameConvId = readString(obj, "convId");
+    if (frameConvId.length == 0 || frameConvId != convId.value) {
+      return;
+    }
+    const msgId = readString(obj, "msgId");
+    if (msgId.length == 0) {
+      return;
+    }
+    const item = parseAgentStatusObject(obj);
+    if (item == null) {
+      return;
+    }
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].msgId == msgId) {
+        const row = rows[i];
+        const incoming: ImAgentStatusItem[] = [item];
+        if (mergeRowAgentDetail(row, incoming)) {
+          // Android 不追踪行内原地变更：整表去抖重建触发 v-for 重渲（表情回应同款）
+          scheduleChatMediaRefresh();
+        }
+        return;
+      }
+    }
+  }
+
   // ★App-Android(UTS→Kotlin) 裸函数引用传 eventBus.on 绑不上回调（订阅静默失效，
   // 聊天页不实时的直接原因；须箭头包装）；on/off 同一引用故存具名 const
   const onImMessagesSynced = (payload: any): void => { handleImMessagesSynced(payload); };
@@ -9236,6 +9460,7 @@
   const onImConnectionState = (payload: any): void => { handleImConnectionState(payload); };
   const onImConvUnread = (payload: any): void => { handleImConvUnread(payload); };
   const onImMessageReaction = (payload: any): void => { handleImMessageReaction(payload); };
+  const onImAgentStatus = (payload: any): void => { handleImAgentStatus(payload); };
 
   /** 当前用户信息：区分我方/对方消息 + 我方头像昵称（IM senderId 即平台用户 id）。 */
   async function loadMyInfo(): Promise<void> {
@@ -9352,6 +9577,8 @@
     eventBus.on(`${EVENT_TYPE.ImConversationUnread}`, onImConvUnread);
     // 表情回复实时同步（op 3008 全量快照，本会话内按 msgId 就地替换）
     eventBus.on(`${EVENT_TYPE.ImMessageReaction}`, onImMessageReaction);
+    // 智能体处理状态实时推进（op 3006：处理中转钟 → 终态蓝勾/红叹，仅发送者收到）
+    eventBus.on(`${EVENT_TYPE.ImAgentStatus}`, onImAgentStatus);
     // #ifndef H5 || WEB
     // 键盘高度监听（App 三端/小程序；H5 不支持该 API）：驱动 liftPx 刚体平移让位。
     // 保存监听 id 精确注销（无参 off 会清掉全局所有监听，殃及 conversation-input 等组件）；
@@ -9452,6 +9679,8 @@
     eventBus.off(`${EVENT_TYPE.ImConnectionState}`, onImConnectionState);
     eventBus.off(`${EVENT_TYPE.ImConversationUnread}`, onImConvUnread);
     eventBus.off(`${EVENT_TYPE.ImMessageReaction}`, onImMessageReaction);
+    eventBus.off(`${EVENT_TYPE.ImAgentStatus}`, onImAgentStatus);
+    clearAgentClockTimers();
     if (readRefreshTimer != 0) {
       clearTimeout(readRefreshTimer);
       readRefreshTimer = 0;
@@ -10584,6 +10813,97 @@
     border-top-right-radius: 5px;
     border-bottom-right-radius: 5px;
     transform-origin: 0% 50%;
+  }
+
+  /* ===== 智能体处理标记（我发的 + 衔接智能体；对齐 PC DEV-275 四态，色板同 PC）：
+     未读灰 #c3c1cd / 处理中青 #0fa893 / 完成蓝 #3370ff（DEV-308：蓝=完成，绿=已读回执）/
+     失败红 #f54a45→用本页 fail 红 #ff4d4f。几何与 chat-read 系同口径（14px 整数 px 圆）。 ===== */
+  .chat-agent {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 4rpx 0;
+  }
+
+  /* 圈底：默认灰空心=未读（刚发出，仅历史拉取可见——后端建行不推帧）；圈内可居中放内容 */
+  .chat-agent__ring {
+    position: relative;
+    width: 14px;
+    height: 14px;
+    border-radius: 7px;
+    border: 2px solid #c3c1cd;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  /* 完成：蓝圈（圈内蓝勾见 __tick） */
+  .chat-agent__ring--done {
+    border-color: #3370ff;
+  }
+
+  /* 失败：红圈（圈内红叹号见 __bang） */
+  .chat-agent__ring--fail {
+    border-color: #ff4d4f;
+  }
+
+  /* 完成蓝勾：几何与 chat-read__tick 完全同款（双边框旋转法），仅配色蓝 */
+  .chat-agent__tick {
+    position: absolute;
+    top: 1px;
+    left: 3px;
+    width: 4px;
+    height: 6px;
+    border-right: 2px solid #3370ff;
+    border-bottom: 2px solid #3370ff;
+    transform: rotate(45deg);
+  }
+
+  /* 失败叹号（PC 端 failReason 走 title，移动端图标语义即可） */
+  .chat-agent__bang {
+    font-size: 20rpx;
+    line-height: 20rpx;
+    font-weight: bold;
+    color: #ff4d4f;
+  }
+
+  /* 处理中钟面：青圈 + 两根指针（子元素随父级 transform 一起旋转）。
+     App 端 CSS animation 不可靠——旋转由 inline style 注入的 transform+transition-duration
+     与此处 transition-property/timing-function 共同完成（spin-loading 同款自转） */
+  .chat-agent__clock {
+    position: relative;
+    width: 14px;
+    height: 14px;
+    border-radius: 7px;
+    border: 2px solid #0fa893;
+    box-sizing: border-box;
+    flex-shrink: 0;
+    transition-property: transform;
+    transition-timing-function: linear;
+    transform: rotate(0deg);
+  }
+
+  /* 指针：从圆心 (5,5) 指向 12 点 / 3 点的两根短针（padding box 10×10 内） */
+  .chat-agent__hand {
+    position: absolute;
+    background-color: #0fa893;
+  }
+
+  .chat-agent__hand--v {
+    left: 4px;
+    top: 1px;
+    width: 2px;
+    height: 4px;
+  }
+
+  .chat-agent__hand--h {
+    left: 5px;
+    top: 4px;
+    width: 4px;
+    height: 2px;
   }
 
   /* ===== 撤回 / 系统提示行 ===== */

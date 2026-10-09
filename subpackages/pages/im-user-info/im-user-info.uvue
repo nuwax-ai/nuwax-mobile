@@ -1,0 +1,838 @@
+<template>
+  <!--
+    用户个人资料页（微信式）：聊天页点左右两列头像进入；智能体共用本页（subject=agent）。
+    - 内容：大头像 + 姓名 + 用户名（人）/ 简介（智能体；查不到则该行不渲染）
+    - 按钮：发消息（convCreateP2p 幂等建会话后进消息详情页）/ 加为联系人
+      （人需对方同意；智能体即时生效，im-add-buddy 智能体 tab 同口径）
+    - 已是联系人（status=1）不出加为联系人；对方申请待我确认（status=2）出「同意」；
+      我已申请待对方同意（status=3）只出灰字提示；本人资料仅展示无按钮
+    - 无按 userId 直取资料的接口：入参带聊天页已知姓名/头像先出首帧，通讯录命中补全
+      status/姓名；用户名/简介缺则按姓名搜索回落（人：searchContacts；智能体：
+      searchAgents——均 QR 扫码流同款客户端按 id 对齐）
+    - 非 tabBar 页：底部安全区由 footerStyle 内联兜底
+  -->
+  <view class="ui-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 标题（群设置页同款页头） -->
+    <view class="ui-header">
+      <view class="ui-header__btn" hover-class="ui-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="ui-header__title-wrap">
+        <text class="ui-header__title">{{
+          isAgent ? t("Mobile.Message.buddyTabAgent") : t("Mobile.Mine.personalInfo")
+        }}</text>
+      </view>
+      <view class="ui-header__btn ui-header__btn--ghost" />
+    </view>
+
+    <scroll-view class="ui-body" direction="vertical" :show-scrollbar="false">
+      <view v-if="loading" class="ui-state">
+        <text class="ui-state__text">{{ t("Mobile.Common.loading") }}</text>
+      </view>
+      <view v-else-if="loadFailed" class="ui-state" @click="resolveData">
+        <text class="ui-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+      </view>
+      <view v-else class="ui-card">
+        <!-- 整数 px + 半径取半 + overflow 放容器：App <image> 自身 border-radius 对
+             解析后的 temp/SVG 渲染路径不生效会方形透出（im-add-buddy 头像同款兜底） -->
+        <view class="ui-ava-box">
+          <image
+            v-if="avatarDisplay.length > 0 && avatarFailed != true"
+            class="ui-ava"
+            :src="avatarDisplay"
+            mode="aspectFill"
+            @error="handleAvatarError"
+          />
+          <view v-else class="ui-ava" :style="{ backgroundImage: avatarGradient(displayName) }">
+            <text class="ui-ava-letter">{{ avatarLetter(displayName) }}</text>
+          </view>
+        </view>
+        <text class="ui-name text-ellipsis">{{ displayName.length > 0 ? displayName : userName }}</text>
+        <text v-if="isAgent != true && userName.length > 0" class="ui-username text-ellipsis">
+          {{ t("Mobile.Profile.userName") }}：{{ userName }}
+        </text>
+        <text v-if="isAgent && description.length > 0" class="ui-username ui-username--desc text-ellipsis-2">
+          {{ description }}
+        </text>
+      </view>
+      <view class="ui-tail" />
+    </scroll-view>
+
+    <!-- 底部操作区：本人无按钮；按钮互斥按联系人状态出（见 computed 注释） -->
+    <view v-if="footerVisible" class="ui-footer" :style="footerStyle">
+      <view
+        v-if="showAccept"
+        class="ui-btn ui-btn--ok"
+        hover-class="ui-btn-ok--active"
+        @click="handleAccept"
+      >
+        <text class="ui-btn__text ui-btn__text--ok">{{ t("Mobile.Message.contactAccept") }}</text>
+      </view>
+      <view
+        v-if="showAdd"
+        class="ui-btn"
+        :class="{ 'ui-btn--disabled': busy }"
+        hover-class="ui-btn-sec--active"
+        @click="handleAddContact"
+      >
+        <text class="ui-btn__text ui-btn__text--sec">{{ t("Mobile.Message.addAsContact") }}</text>
+      </view>
+      <view
+        v-if="showSend"
+        class="ui-btn ui-btn--ok"
+        :class="{ 'ui-btn--disabled': busy }"
+        hover-class="ui-btn-ok--active"
+        @click="handleSendMsg"
+      >
+        <text class="ui-btn__text ui-btn__text--ok">{{ t("Mobile.Message.sendMessage") }}</text>
+      </view>
+      <view v-if="showWait" class="ui-wait">
+        <text class="ui-wait__text">{{ t("Mobile.Message.statusWaitAccept") }}</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { switchMainTab } from "@/utils/mainTabNavigation";
+
+  import { computed, ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { imAvatarDisplayUrl, resolveImAvatarDisplay } from "@/utils/imAvatarDisplay";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { apiUserInfo } from "@/servers/account";
+  import { getCachedMyInfo } from "@/utils/im/myInfoCache";
+  import {
+    apiImAddContact,
+    apiImContactAccept,
+    apiImContacts,
+    apiImCreateP2pConversation,
+    apiImSearchAgents,
+    apiImSearchContacts,
+  } from "@/servers/im";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 头像字母底色渐变板（对齐消息页五色系）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw != null) {
+      const n = parseFloat(`${raw}`);
+      return isNaN(n) ? fallback : n;
+    }
+    return fallback;
+  }
+
+  /** 页面入参读取（容错解码：聊天页带来的姓名/头像可能带中文/特殊字符）。 */
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  // ===== 入参（首帧数据源） =====
+  let userId = "";
+  let fromConvId = "";
+  let nameParam = "";
+  let avatarParam = "";
+
+  // ===== 展示态 =====
+  const loading = ref<boolean>(true);
+  const loadFailed = ref<boolean>(false);
+  const busy = ref<boolean>(false);
+  const displayName = ref<string>("");
+  const userName = ref<string>("");
+  /** 原始头像地址（页间传递/建会话带参取它，勿用解析出的 blob 地址） */
+  const avatarRaw = ref<string>("");
+  const avatarDisplay = ref<string>("");
+  const avatarFailed = ref<boolean>(false);
+  /** 本人资料：仅展示，无操作按钮 */
+  const isSelf = ref<boolean>(false);
+  /** 智能体资料形态：简介行替代用户名、搜索回落走 contactSearchAgents、发消息不
+   *  gating（加联系人即时生效，im-add-buddy 智能体 tab 同口径）。入参 subject=agent
+   *  先定形态，通讯录命中 subjectType!=1 也会置位（双信号取或）。 */
+  const isAgent = ref<boolean>(false);
+  /** 智能体简介（AgentSearchItem.description；人无此概念，仅智能体形态渲染） */
+  const description = ref<string>("");
+  /** 联系人关系：""=非联系人（通讯录没查到） 1=互为联系人 2=对方申请待我确认 3=我已申请待对方同意 */
+  const status = ref<string>("");
+  const subjectType = ref<number>(1);
+  /** 通讯录比对可靠性（成功拉取且未截断才可靠；不可靠时发消息 fail-open） */
+  const contactsFetched = ref<boolean>(false);
+  const contactsTruncated = ref<boolean>(false);
+
+  /**
+   * 底部安全距离：App 端样式表 env(safe-area-inset-bottom) 不可靠，内联把底部
+   * 内边距改为 16rpx 基础 + 系统安全区（px），按钮避开 iPhone home 条；
+   * H5/小程序走样式表 env()，不叠加（im-add-buddy 同款）。
+   */
+  const footerStyle = computed((): string => {
+    let style = "";
+    // #ifdef APP
+    try {
+      const win = uni.getWindowInfo();
+      const scale = win.windowWidth / 750;
+      const basePx = scale > 0 ? Math.round(16 * scale) : 16;
+      style = `padding-bottom: ${basePx + win.safeAreaInsets.bottom}px;`;
+    } catch (_e) {
+      style = "";
+    }
+    // #endif
+    return style;
+  });
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function handleAvatarError(): void {
+    avatarFailed.value = true;
+  }
+
+  /** 头像展示地址解析（受保护/SVG）：同步缓存直取首帧 + 异步解析写回复位失败态。 */
+  function resolveAvatar(): void {
+    const raw = avatarRaw.value;
+    avatarDisplay.value = imAvatarDisplayUrl(raw, 160);
+    if (raw.length == 0) {
+      return;
+    }
+    resolveImAvatarDisplay(raw, 160).then((resolved: string): void => {
+      if (resolved != raw && resolved != avatarDisplay.value) {
+        avatarDisplay.value = resolved;
+        avatarFailed.value = false;
+      }
+    });
+  }
+
+  /** 本人资料：getLoginInfo 补全姓名/用户名/头像（入参首帧兜底，接口失败保留）。 */
+  async function resolveSelfInfo(): Promise<void> {
+    try {
+      const res = await apiUserInfo();
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        return;
+      }
+      if (readString(dataObj, "id") != userId) {
+        return;
+      }
+      const nickName = readString(dataObj, "nickName");
+      const name = readString(dataObj, "userName");
+      userName.value = name;
+      displayName.value = nickName.length > 0 ? nickName : name;
+      const ava = readString(dataObj, "avatar");
+      if (ava.length > 0) {
+        avatarRaw.value = ava;
+      }
+    } catch (_e) {
+      // 拉取失败保留入参首帧
+    }
+  }
+
+  /** 智能体资料回落：contactSearchAgents 按名称搜 + 客户端 userId 对齐，命中补
+   *  简介（AgentSearchItem.description）/名称/头像；未命中简介行不渲染。
+   *  ★须声明在 resolvePeer 之前（UTS 无提升，调用点在前）。 */
+  async function resolveAgentFallback(): Promise<void> {
+    if (description.value.length > 0 || nameParam.trim().length == 0) {
+      return;
+    }
+    let kw = nameParam.trim();
+    if (kw.length > 64) {
+      kw = kw.substring(0, 64);
+    }
+    try {
+      const res = await apiImSearchAgents(kw, 1, 20);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        return;
+      }
+      const itemsRaw = dataObj["items"];
+      if (itemsRaw == null) {
+        return;
+      }
+      const items = itemsRaw as UTSJSONObject[];
+      for (let i = 0; i < items.length; i++) {
+        if (readString(items[i], "userId") == userId) {
+          description.value = readString(items[i], "description");
+          if (displayName.value.length == 0) {
+            displayName.value = readString(items[i], "name");
+          }
+          if (avatarRaw.value.length == 0) {
+            avatarRaw.value = readString(items[i], "avatar");
+          }
+          break;
+        }
+      }
+    } catch (_e) {
+      // 搜索回落尽力而为：未命中只是简介行不渲染
+    }
+  }
+
+  /**
+   * 对方资料解析：通讯录按 userId 查（status/姓名/头像，displayName 服务端已按
+   * 备注>昵称>账号算好直接用）；用户名缺则按姓名搜平台用户回落——ContactSearchItem
+   * 才有 userName，按 id 对齐命中行（QR 扫码流同款：关键字搜索 + 客户端 userId 比对，
+   * 勿拿 userId 串当 keyword，按 id 搜未证实）。智能体走 resolveAgentFallback。都未
+   * 命中：用户名/简介行不渲染。
+   */
+  async function resolvePeer(): Promise<void> {
+    let hit: UTSJSONObject | null = null;
+    try {
+      const res = await apiImContacts();
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj != null) {
+          contactsTruncated.value = readBool(dataObj, "truncated");
+          const itemsRaw = dataObj["items"];
+          if (itemsRaw != null) {
+            const items = itemsRaw as UTSJSONObject[];
+            for (let i = 0; i < items.length; i++) {
+              if (readString(items[i], "userId") == userId) {
+                hit = items[i];
+                break;
+              }
+            }
+          }
+        }
+        contactsFetched.value = true;
+      }
+    } catch (_e) {
+      // 失败保持未拉取态：发消息 gating 走 fail-open（im-add-buddy 通讯录比对同款）
+    }
+    // 可空判空先落局部常量（Kotlin smart-cast 纪律，同聊天页 avatarPressTarget）
+    const item = hit;
+    if (item != null) {
+      status.value = readString(item, "status");
+      subjectType.value = readNumber(item, "subjectType", 1);
+      if (subjectType.value != 1) {
+        isAgent.value = true;
+      }
+      const display = readString(item, "displayName");
+      const nickName = readString(item, "nickName");
+      const name = display.length > 0 ? display : nickName;
+      if (name.length > 0) {
+        displayName.value = name;
+      }
+      userName.value = readString(item, "userName");
+      const ava = readString(item, "avatar");
+      if (ava.length > 0) {
+        avatarRaw.value = ava;
+      }
+    }
+    if (isAgent.value) {
+      await resolveAgentFallback();
+      return;
+    }
+    if (userName.value.length == 0 && nameParam.trim().length > 0) {
+      let kw = nameParam.trim();
+      if (kw.length > 64) {
+        kw = kw.substring(0, 64);
+      }
+      try {
+        const res = await apiImSearchContacts(kw, 20);
+        if (apiResCode(res) == SUCCESS_CODE) {
+          const dataRaw = apiResData<any>(res);
+          const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+          if (dataObj != null) {
+            const itemsRaw = dataObj["items"];
+            if (itemsRaw != null) {
+              const items = itemsRaw as UTSJSONObject[];
+              for (let i = 0; i < items.length; i++) {
+                if (readString(items[i], "userId") == userId) {
+                  userName.value = readString(items[i], "userName");
+                  if (displayName.value.length == 0) {
+                    const nick = readString(items[i], "nickName");
+                    displayName.value = nick.length > 0 ? nick : userName.value;
+                  }
+                  if (avatarRaw.value.length == 0) {
+                    avatarRaw.value = readString(items[i], "avatar");
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        }
+      } catch (_e) {
+        // 搜索回落尽力而为：未命中只是用户名行不渲染
+      }
+    }
+  }
+
+  /** 总解析（首开/失败重试同一入口）：本人走 getLoginInfo，对方走通讯录+搜索回落。 */
+  async function resolveData(): Promise<void> {
+    if (userId.length == 0) {
+      loading.value = false;
+      loadFailed.value = true;
+      return;
+    }
+    loading.value = true;
+    loadFailed.value = false;
+    status.value = "";
+    subjectType.value = 1;
+    contactsFetched.value = false;
+    contactsTruncated.value = false;
+    if (isSelf.value) {
+      await resolveSelfInfo();
+    } else {
+      await resolvePeer();
+    }
+    loading.value = false;
+    resolveAvatar();
+  }
+
+  // ===== 按钮可见性（互斥：status 2 出同意、3 出灰字、其余按关系出加联系人/发消息） =====
+
+  const showAccept = computed((): boolean => {
+    return isSelf.value != true && status.value == "2";
+  });
+
+  const showWait = computed((): boolean => {
+    return isSelf.value != true && status.value == "3";
+  });
+
+  /** 加为联系人：仅非联系人（通讯录没查到）时出；已是联系人(1)/申请流转中(2/3)不出。 */
+  const showAdd = computed((): boolean => {
+    return isSelf.value != true && status.value.length == 0;
+  });
+
+  /** 发消息：已互为联系人可发；智能体不 gating（im-add-buddy 智能体 tab 同口径：
+   *  加联系人即时生效即互为联系人，通讯录未收录的智能体也放行）；非联系人但
+   *  通讯录比对不可靠时 fail-open（宁可放行，也不错禁——服务端仍是权威兜底）；
+   *  比对可靠且明确非联系人则引导先加联系人。 */
+  const showSend = computed((): boolean => {
+    if (isSelf.value || status.value == "2" || status.value == "3") {
+      return false;
+    }
+    if (status.value == "1" || isAgent.value) {
+      return true;
+    }
+    if (contactsFetched.value && contactsTruncated.value != true && subjectType.value == 1) {
+      return false;
+    }
+    return true;
+  });
+
+  const footerVisible = computed((): boolean => {
+    return loading.value != true && loadFailed.value != true && isSelf.value != true;
+  });
+
+  /** 发消息：convCreateP2p（幂等）建/取会话——从本会话点进来的退回即回该会话
+   *  （redirectTo 会堆出重复 chat 页）；否则 redirectTo 消息详情页替换本页
+   *  （返回直达上一页，im-add-buddy 同栈序）。 */
+  async function handleSendMsg(): Promise<void> {
+    if (busy.value) {
+      return;
+    }
+    busy.value = true;
+    try {
+      const res = await apiImCreateP2pConversation(userId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Message.openChatFailed"), icon: "none" });
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      const convId = dataObj != null ? readString(dataObj, "convId") : "";
+      if (convId.length == 0) {
+        uni.showToast({ title: t("Mobile.Message.openChatFailed"), icon: "none" });
+        return;
+      }
+      if (fromConvId.length > 0 && convId == fromConvId) {
+        uni.navigateBack({ delta: 1 });
+        return;
+      }
+      const nameForChat = displayName.value.length > 0 ? displayName.value : userName.value;
+      uni.redirectTo({
+        url:
+          `/pages/message/chat?convId=${convId}&convType=1` +
+          `&name=${encodeURIComponent(nameForChat)}&avatar=${encodeURIComponent(avatarRaw.value)}`,
+      });
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Message.openChatFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  /** 加为联系人（contactAdd）：按 ContactAddResult 的 alreadyContact/accepted 决定
+   *  文案与本地状态迁移（服务端为权威，下次进页以通讯录为准）。 */
+  async function handleAddContact(): Promise<void> {
+    if (busy.value) {
+      return;
+    }
+    busy.value = true;
+    try {
+      const res = await apiImAddContact(userId, "");
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
+        return;
+      }
+      let accepted = false;
+      let alreadyContact = false;
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        accepted = readBool(dataObj, "accepted");
+        alreadyContact = readBool(dataObj, "alreadyContact");
+      }
+      if (alreadyContact) {
+        status.value = "1";
+        uni.showToast({ title: t("Mobile.Message.alreadyContact"), icon: "none" });
+      } else if (accepted) {
+        status.value = "1";
+        uni.showToast({ title: t("Mobile.Message.contactAdded"), icon: "none" });
+      } else {
+        status.value = "3";
+        uni.showToast({ title: t("Mobile.Message.contactRequestSent"), icon: "none" });
+      }
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  /** 同意对方的好友申请（contactAccept）：成功即互为联系人（消息页 onShow 静默刷新智联录）。 */
+  async function handleAccept(): Promise<void> {
+    if (busy.value) {
+      return;
+    }
+    busy.value = true;
+    try {
+      const res = await apiImContactAccept(userId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+        return;
+      }
+      status.value = "1";
+      uni.showToast({ title: t("Mobile.Message.contactAccepted"), icon: "none" });
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  function handleBack(): void {
+    // 刷新后栈底保护：无页可退时切回消息 tab，避免整页重载死循环
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      switchMainTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    userId = readOption(options, "userId");
+    fromConvId = readOption(options, "fromConvId");
+    nameParam = readOption(options, "name");
+    avatarParam = readOption(options, "avatar");
+    // 聊天页对 senderType!=1 的消息带 subject=agent：先定智能体形态（通讯录
+    // subjectType!=1 为第二信号，取或——单凭入参即可在通讯录未收录时走智能体回落）
+    if (readOption(options, "subject") == "agent") {
+      isAgent.value = true;
+    }
+    if (userId.length == 0) {
+      loading.value = false;
+      loadFailed.value = true;
+      return;
+    }
+    displayName.value = nameParam;
+    avatarRaw.value = avatarParam;
+    const cached = getCachedMyInfo();
+    isSelf.value = cached != null && cached.userId == userId;
+    resolveData();
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架（浅灰底 + 白卡片，群设置页同款） ===== */
+  .ui-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-color: #f6f5fb;
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .ui-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(250, 249, 253, 0.92);
+    border-bottom: 2rpx solid rgba(81, 71, 255, 0.1);
+  }
+
+  .ui-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .ui-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .ui-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .ui-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .ui-header__title {
+    max-width: 460rpx;
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  .ui-body {
+    flex: 1;
+    min-height: 0;
+    padding: 28rpx 32rpx;
+  }
+
+  .ui-state {
+    padding: 240rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .ui-state__text {
+    color: #9a9aa2;
+    font-size: 26rpx;
+    line-height: 36rpx;
+  }
+
+  /* ===== 资料主卡片：大头像 + 姓名 + 用户名（微信式居中排版） ===== */
+  .ui-card {
+    padding: 56rpx 28rpx 48rpx;
+    background-color: #ffffff;
+    border: 2rpx solid #ecebf1;
+    border-radius: 20rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  /* 头像整数 px + 半径取半（同 im-add-buddy 头像纪律）：rpx 亚像素 + 圆角在部分
+     机型/iOS 会切图标边；圆角+overflow 放容器上兜底 App SVG 渲染路径 */
+  .ui-ava-box {
+    width: 80px;
+    height: 80px;
+    border-radius: 40px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .ui-ava {
+    width: 80px;
+    height: 80px;
+    border-radius: 40px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ui-ava-letter {
+    color: #ffffff;
+    font-size: 64rpx;
+    line-height: 80rpx;
+    font-weight: 600;
+  }
+
+  .ui-name {
+    margin-top: 32rpx;
+    max-width: 560rpx;
+    font-size: 38rpx;
+    line-height: 54rpx;
+    font-weight: 600;
+    color: #17171a;
+    text-align: center;
+  }
+
+  .ui-username {
+    margin-top: 10rpx;
+    max-width: 560rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #9a98a5;
+    text-align: center;
+  }
+
+  /* 智能体简介行：两行阅读态，左对齐 + 行距放宽（text-ellipsis-2 截两行） */
+  .ui-username--desc {
+    margin-top: 14rpx;
+    line-height: 38rpx;
+    text-align: left;
+  }
+
+  .ui-tail {
+    height: 40rpx;
+  }
+
+  /* ===== 底部操作区（按钮规范同 im-add-buddy：次要=浅灰填充、主操作=品牌紫） ===== */
+  .ui-footer {
+    flex-shrink: 0;
+    padding: 16rpx 32rpx 24rpx;
+    /* #ifdef H5 || MP-WEIXIN */
+    padding-bottom: calc(24rpx + env(safe-area-inset-bottom));
+    /* #endif */
+    display: flex;
+    flex-direction: column;
+  }
+
+  .ui-btn {
+    width: 100%;
+    height: 88rpx;
+    margin-bottom: 24rpx;
+    border-radius: 24rpx;
+    background-color: #f2f1f7;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ui-btn-sec--active {
+    background-color: #e8e7f0;
+  }
+
+  .ui-btn--ok {
+    background-color: #5147ff;
+  }
+
+  .ui-btn-ok--active {
+    background-color: #4239e8;
+  }
+
+  .ui-btn--disabled {
+    opacity: 0.55;
+  }
+
+  .ui-btn__text {
+    font-size: 30rpx;
+    line-height: 42rpx;
+    font-weight: 500;
+  }
+
+  .ui-btn__text--sec {
+    color: #4b4b52;
+  }
+
+  .ui-btn__text--ok {
+    color: #ffffff;
+  }
+
+  .ui-wait {
+    padding: 12rpx 0 8rpx;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .ui-wait__text {
+    color: #9a98a5;
+    font-size: 26rpx;
+    line-height: 36rpx;
+    text-align: center;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  /* #endif */
+</style>

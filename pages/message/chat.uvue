@@ -1430,6 +1430,8 @@
     apiImForwardMsg,
     apiImMessages,
     apiImMsgAddReaction,
+    apiImRecentEmojis,
+    apiImRecordEmojiUsage,
     apiImMsgRemoveReaction,
     apiImMsgRunAction,
     apiImPinMsg,
@@ -1739,8 +1741,11 @@
   }
 
   /**
-   * 长按弹窗顶部表情快选条（飞书同款一排；与 EMOJIS 全量表共存，
-   * 展开键弹出完整网格）。条内出现过的 emoji 会高亮为已选。
+   * 长按弹窗顶部表情快选条默认组（飞书同款一排；与 EMOJIS 全量表共存，展开键弹出
+   * 完整网格）。★DEV-318 起快选条第一行 = 我的常用表情（GET /emojis/recent，服务端
+   * 序不重排），本组降级为「兜底/补齐」：常用不足一排时依次补齐（跳过已出现），
+   * 新用户（常用为空）完整显示本组——避免"刚进来一排空"以为功能坏了（对齐 PC
+   * lib/emojiUsage quickEmojis 拍板）。条内出现过的 emoji 会高亮为已选。
    */
   const QUICK_EMOJIS: string[] = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🎉"];
 
@@ -3788,12 +3793,92 @@
     }
   }
 
+  // ===== 常用表情（DEV-318 对齐 PC：长按面板第一行数据源 + 点表情记账） =====
+
+  /** 常用表情上限（= 服务端 USER_EMOJI_RECENT_MAX=24：接口无分页，24 就是返回量上界）。 */
+  const RECENT_EMOJI_MAX = 24;
+
+  /** 我的常用表情（GET /emojis/recent 归一后的 emoji 串，服务端序：useCount 降 →
+   *  lastUseTime 降 → id 降，★不重排；空 = 新用户或未拉到，快选条回落默认组）。
+   *  用户级资源与会话无关：切会话不重拉不清空（无实时帧，跨端刚用的靠面板拉起时刷新）。 */
+  const recentEmojis = ref<string[]>([]);
+
+  /** /emojis/recent 的 data 归一（对齐 PC normalizeRecentEmojis）：丢 emoji 空行、
+   *  按 emoji 去重保留首次、截 RECENT_EMOJI_MAX 防上限变更撑爆面板。 */
+  function parseRecentEmojis(dataRaw: any | null): string[] {
+    const out: string[] = [];
+    if (dataRaw == null || Array.isArray(dataRaw) != true) {
+      return out;
+    }
+    const rows = dataRaw as UTSJSONObject[];
+    for (let i = 0; i < rows.length; i++) {
+      if (out.length >= RECENT_EMOJI_MAX) {
+        break;
+      }
+      const emoji = readString(rows[i], "emoji").trim();
+      if (emoji.length > 0 && out.indexOf(emoji) < 0) {
+        out.push(emoji);
+      }
+    }
+    return out;
+  }
+
+  /** 拉常用表情（进页预热 + 每次长按面板拉起时刷新，PC 开面板重拉同款）。★失败静默
+   *  保留旧值：写空会把"没拉到"伪装成"没有常用"，快选条闪回默认组。 */
+  async function loadRecentEmojis(): Promise<void> {
+    try {
+      const res = await apiImRecentEmojis();
+      if (!isChatCurrent()) return;
+      if (apiResCode(res) == SUCCESS_CODE) {
+        recentEmojis.value = parseRecentEmojis(apiResData<any>(res));
+      }
+    } catch (_error) {
+      // 静默：回落默认组，下次长按再试
+    }
+  }
+
+  /** 快选条列表：我的常用在前（服务端序）+ QUICK_EMOJIS 依次补齐至满排（跳过已出现；
+   *  常用已满排则不补不截——条可横滚，24 条以内整排展示）。 */
+  function buildQuickEmojis(): string[] {
+    const out: string[] = [];
+    const recent = recentEmojis.value;
+    for (let i = 0; i < recent.length; i++) {
+      if (out.indexOf(recent[i]) < 0) {
+        out.push(recent[i]);
+      }
+    }
+    for (let i = 0; i < QUICK_EMOJIS.length && out.length < QUICK_EMOJIS.length; i++) {
+      if (out.indexOf(QUICK_EMOJIS[i]) < 0) {
+        out.push(QUICK_EMOJIS[i]);
+      }
+    }
+    return out;
+  }
+
+  /** 记一次「我用了这个表情」（POST /emojis/usage，PC 两入口同款：回应点选 +
+   *  输入面板插入）。★计数器不幂等不重试；失败静默（服务端写失败也只回 data=false
+   *  ——记账是附属动作，永不拖挂主流程）。 */
+  async function recordEmojiUsage(emoji: string): Promise<void> {
+    const clean = emoji.trim();
+    if (clean.length == 0) {
+      return;
+    }
+    try {
+      await apiImRecordEmojiUsage(clean);
+    } catch (_error) {
+      // fire-and-forget：不弹错、不重试（重试一次=用户多用一次）
+    }
+  }
+
   /** 加/取消表情：我加过该 emoji ⇒ 取消，否则添加。点下瞬间先乐观本地增删（chips 即时变化，
       不等 REST 往返），REST 响应 / WS 3008 的全量快照随后权威覆盖；失败回滚并 toast。 */
   async function handleActionReact(msg: ImMsgRow, emoji: string): Promise<void> {
     if (convId.value.length == 0) {
       return;
     }
+    // 记一次常用表情（PC doReact 同款落点：快选条/展开网格/chip 三入口都收敛到这里，
+    // 点选即记账——与 toggle 方向、回应成败无关；不 await 不影响回应时序）
+    recordEmojiUsage(emoji);
     const mine = myEmojisOf(msg).indexOf(emoji) >= 0;
     const before = applyOptimisticReaction(msg.msgId, mine != true, emoji);
     try {
@@ -3826,7 +3911,8 @@
     handleActionReact(msg, chip.emoji);
   }
 
-  /** 表情快选条：可回复的正常消息才显示（撤回/发送中行不可加表情）。 */
+  /** 表情快选条：可回复的正常消息才显示（撤回/发送中行不可加表情）；第一行 = 我的
+   *  常用表情（buildQuickEmojis：常用在前 + 默认组补齐）。 */
   const sheetQuickEmojis = computed((): string[] => {
     const id = selectedId.value;
     if (id.length == 0) {
@@ -3835,7 +3921,7 @@
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].msgId == id) {
-        return canReactMsg(rows[i]) ? QUICK_EMOJIS : ([] as string[]);
+        return canReactMsg(rows[i]) ? buildQuickEmojis() : ([] as string[]);
       }
     }
     return [] as string[];
@@ -7614,6 +7700,9 @@
     uni.hideKeyboard({ complete: () => {} });
     selectedId.value = msg.msgId;
     sheetActions.value = acts;
+    // 面板拉起即重拉常用表情（PC 开面板重拉同款：常用无实时帧，跨端/别处刚用的
+    // 表情要靠这次 GET 才可见；面板先按旧值渲染，返回后第一行就地刷新，无闪烁态）
+    loadRecentEmojis();
     const proxy = actionSheetRef.value as ComponentPublicInstance | null;
     if (proxy != null) {
       proxy.$callMethod("open");
@@ -8279,8 +8368,10 @@
     uni.hideKeyboard({ complete: () => {} });
   }
 
-  /** 表情点选：追加到输入末尾（与 textarea maxlength=2000 同口径截断）。 */
+  /** 表情点选：追加到输入末尾（与 textarea maxlength=2000 同口径截断）。
+   *  顺带记一次常用表情（PC onUseEmoji 同款第二入口：面板点选插入即记账）。 */
   function handleEmojiTap(emo: string): void {
+    recordEmojiUsage(emo);
     const next = inputText.value + emo;
     inputText.value = next.substring(0, 2000);
   }
@@ -9233,6 +9324,8 @@
       loadConvInfo();
       loadPinnedIds();
       loadRevokeWindow();
+      // 常用表情预热（长按面板第一行数据源；用户级资源，失败回落默认组，不阻塞首屏）
+      loadRecentEmojis();
       initHistory().then((): void => {
         if (jumpMsgId.length > 0) {
           pendingJumpId = jumpMsgId;

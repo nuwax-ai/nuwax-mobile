@@ -32,4 +32,10 @@ node node_modules/vitest/vitest.mjs run tests/imageCaptcha.test.ts tests/account
 /Applications/HBuilderX.app/Contents/MacOS/cli launch app-android --project "$PWD" --compile true
 ```
 
-生成的 H5 产物单独保存在本机 `/tmp/nuwax-mobile-image-captcha-build-artifacts/web`，源码工作区恢复了原有构建产物。代码未推送。
+初始验证生成的 H5 产物单独保存在本机 `/tmp/nuwax-mobile-image-captcha-build-artifacts/web`，源码工作区恢复了原有构建产物。实现随后以 `c6edae958` 合入 `gitlab/feat/nuwa-zhuoda-2026.09.30`。
+
+2026-10-09 Android 显示修复：
+
+- 模拟器请求 `/api/user/captcha/image` 返回 HTTP 200 和有效 PNG，但界面一直停在“加载”。原实现把 class 实例放进 `ref` 后修改内部字段，Android VDOM 无法监听这些字段；[DCloud 组合式 API 文档](https://doc.dcloud.net.cn/uni-app-x/vue/composition-api.html)说明该平台不支持 class 响应式。
+- 保留一次性挑战与请求序号逻辑，将图片、加载状态、ID 和输入文本绑定到独立基础类型 `ref`，在挑战开始、完成、输入及卸载时同步。
+- HBuilderX Android 编译和模拟器启动通过；实测首次显示、点击“换一张”、点击图片连续换图、旧输入清空、账号与手机号登录切换后加载正常。20 项针对性测试通过。

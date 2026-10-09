@@ -8925,34 +8925,179 @@
     });
   }
 
+  /** 相册视频权限申请结果：deniedForever=true 表示系统不会再弹授权窗，只能引导去系统设置开启。 */
+  class VideoAlbumPermissionResult {
+    granted: boolean = false;
+    deniedForever: boolean = false;
+    constructor(granted: boolean, deniedForever: boolean) {
+      this.granted = granted;
+      this.deniedForever = deniedForever;
+    }
+  }
+
+  // #ifdef APP-ANDROID
+  /**
+   * 解析视频相册权限：targetSdk>=33 用 READ_MEDIA_VIDEO，否则旧 READ_EXTERNAL_STORAGE。
+   * uni-app x 运行时对两侧都做硬校验——targetSdk<33 请求新媒体权限抛 IllegalStateException，
+   * targetSdk>=33 请求旧权限抛 IllegalArgumentException，必须按运行时 targetSdkVersion 分流
+   * （同款实现见 resident-chat-shell 的 resolveAlbumMediaPermission）。
+   */
+  function resolveVideoMediaPermission(): string {
+    try {
+      const activity = UTSAndroid.getUniActivity();
+      const appInfo = activity?.getApplicationInfo();
+      if (appInfo != null && appInfo.targetSdkVersion >= 33) {
+        return "android.permission.READ_MEDIA_VIDEO";
+      }
+    } catch (_eResolve) {
+      // 读取失败按旧权限兜底（当前生产基座 targetSdk=32）
+    }
+    return "android.permission.READ_EXTERNAL_STORAGE";
+  }
+  // #endif
+
+  /**
+   * 申请相册视频读取权限（「视频」入口先于 uni.chooseVideo 调用）。
+   * Android：chooseVideo 首次被拒后运行时不再代弹授权框，此后每次点击都静默失败，
+   * 必须业务侧显式重申请（临时拒绝系统会再弹窗）；永久拒绝（doNotAskAgain）引导去设置。
+   * iOS：拒绝后系统同样不再弹窗，读 albumAuthorized 判定；not determined 交给 chooseVideo 弹。
+   * H5/鸿蒙：无预检，交回 chooseVideo 自行处理（保持原行为）。
+   */
+  async function ensureVideoAlbumPermission(): Promise<VideoAlbumPermissionResult> {
+    // #ifdef APP-ANDROID
+    return await new Promise<VideoAlbumPermissionResult>((resolve) => {
+      const activity = UTSAndroid.getUniActivity();
+      if (activity == null) {
+        resolve(new VideoAlbumPermissionResult(false, false));
+        return;
+      }
+      const permission = [resolveVideoMediaPermission()] as string[];
+      if (UTSAndroid.checkSystemPermissionGranted(activity, permission)) {
+        resolve(new VideoAlbumPermissionResult(true, false));
+        return;
+      }
+      UTSAndroid.requestSystemPermission(
+        activity,
+        permission,
+        (allGranted: boolean, _granted: string[]) => {
+          resolve(new VideoAlbumPermissionResult(allGranted, false));
+        },
+        (doNotAskAgain: boolean, _denied: string[]) => {
+          resolve(new VideoAlbumPermissionResult(false, doNotAskAgain));
+        },
+      );
+    });
+    // #endif
+    // #ifdef APP-IOS
+    const authSetting = uni.getAppAuthorizeSetting();
+    const albumStatus = `${authSetting.albumAuthorized}`;
+    // authorized / limited（相册有限访问）放行
+    if (albumStatus == "authorized" || albumStatus == "limited") {
+      return new VideoAlbumPermissionResult(true, false);
+    }
+    // denied / config error / restricted：系统不会再弹授权窗，须去系统设置开启
+    if (albumStatus == "denied" || albumStatus == "config error" || albumStatus == "restricted") {
+      return new VideoAlbumPermissionResult(false, true);
+    }
+    // not determined：交给 uni.chooseVideo 弹系统授权窗
+    return new VideoAlbumPermissionResult(true, false);
+    // #endif
+    // H5 / 鸿蒙：直接放行
+    return new VideoAlbumPermissionResult(true, false);
+  }
+
+  /** 永久拒绝相册权限：弹窗引导去系统设置开启（Android 跳应用权限页；iOS 跳系统设置） */
+  function guideVideoAlbumPermissionSettings(): void {
+    uni.showModal({
+      title: t("Mobile.Chat.videoPermissionTitle"),
+      content: t("Mobile.Chat.videoPermissionContent"),
+      confirmText: t("Mobile.Voice.goToSettings"),
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        if (res.confirm == true) {
+          // #ifdef APP-ANDROID
+          const activity = UTSAndroid.getUniActivity();
+          if (activity != null) {
+            UTSAndroid.gotoSystemPermissionActivity(
+              activity,
+              [resolveVideoMediaPermission()] as string[],
+            );
+          }
+          // #endif
+          // #ifdef APP-IOS
+          uni.openAppAuthorizeSetting({});
+          // #endif
+        }
+      },
+    });
+  }
+
+  /**
+   * uni.chooseVideo 因无权限失败（区别于用户取消——cancel/abort 不在此列）：
+   * 预检放行但选择器内部仍被拒时兜底命中，引导去系统设置（同款判定见 resident-chat-shell）。
+   */
+  function isVideoPermissionDeniedError(errMsg: string): boolean {
+    if (errMsg.length == 0) {
+      return false;
+    }
+    const lower = errMsg.toLowerCase();
+    return (
+      lower.indexOf("no permission") >= 0 ||
+      lower.indexOf("permission denied") >= 0 ||
+      lower.indexOf("unauthorized") >= 0 ||
+      lower.indexOf("not authorized") >= 0 ||
+      lower.indexOf("auth deny") >= 0 ||
+      lower.indexOf("auth denied") >= 0 ||
+      lower.indexOf("access denied") >= 0 ||
+      lower.indexOf("user denied") >= 0 ||
+      lower.indexOf("authorize:fail") >= 0 ||
+      errMsg.indexOf("没有权限") >= 0 ||
+      errMsg.indexOf("权限被拒") >= 0 ||
+      errMsg.indexOf("权限拒绝") >= 0
+    );
+  }
+
   /**
    * 视频入口（加号面板）：相册选一条视频，按文件链路上传发送
    * （mime video/* → kind "file"，与 PC 端单附件契约一致，气泡渲染文件卡片）。
    * ★须定义在 queueMediaRow 之后（UTS→Kotlin 先用后定义会报「找不到名称」）。
    */
   function handlePickVideo(): void {
-    uni.chooseVideo({
-      sourceType: ["album"],
-      compressed: true,
-      success: (res) => {
-        const path = res.tempFilePath;
-        if (path == null || path.length == 0) {
-          return;
+    ensureVideoAlbumPermission().then((result: VideoAlbumPermissionResult) => {
+      if (result.granted != true) {
+        // 永久拒绝：弹窗引导去系统设置；临时拒绝：静默返回（下次点击重申请，系统会再弹窗）
+        if (result.deniedForever == true) {
+          guideVideoAlbumPermissionSettings();
         }
-        // 相册视频临时路径可能无扩展名（Android content 路径），补 .mp4 保上传 mime 可判
-        let name = "";
-        const segs = path.split("/");
-        if (segs.length > 0 && segs[segs.length - 1].length > 0) {
-          name = segs[segs.length - 1];
-        }
-        if (name.indexOf(".") < 0) {
-          name = `${name}.mp4`;
-        }
-        queueMediaRow(path, name, false);
-      },
-      fail: (_err) => {
-        // 用户取消选择：无需提示
-      },
+        return;
+      }
+      uni.chooseVideo({
+        sourceType: ["album"],
+        compressed: true,
+        success: (res) => {
+          const path = res.tempFilePath;
+          if (path == null || path.length == 0) {
+            return;
+          }
+          // 相册视频临时路径可能无扩展名（Android content 路径），补 .mp4 保上传 mime 可判
+          let name = "";
+          const segs = path.split("/");
+          if (segs.length > 0 && segs[segs.length - 1].length > 0) {
+            name = segs[segs.length - 1];
+          }
+          if (name.indexOf(".") < 0) {
+            name = `${name}.mp4`;
+          }
+          queueMediaRow(path, name, false);
+        },
+        fail: (err) => {
+          // 权限被拒：引导去系统设置；用户取消与其他失败保持静默（原行为）
+          const message = err.errMsg != null ? err.errMsg : "";
+          if (isVideoPermissionDeniedError(message)) {
+            guideVideoAlbumPermissionSettings();
+          }
+        },
+      });
     });
   }
 

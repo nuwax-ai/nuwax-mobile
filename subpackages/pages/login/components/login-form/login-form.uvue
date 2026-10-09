@@ -120,6 +120,14 @@
       </view>
     </view>
 
+    <image-captcha
+      v-if="needImageCaptcha && (!isCaptchaVerify || codeCountdown <= 0)"
+      :refreshToken="imageCaptchaRefreshToken"
+      :inputResizeKey="inputResizeKey"
+      :disabled="isSubmitting"
+      @change="handleImageCaptchaChange"
+    />
+
     <agreement-checkbox v-model="agreeTerms" :monochrome="true" />
 
     <button
@@ -184,6 +192,9 @@
   import { SUCCESS_CODE, AGENT_NOT_EXIST } from "@/constants/codes.constants";
   import SegmentedControl from "@/components/segmented-control/segmented-control.uvue";
   import AgreementCheckbox from "@/components/agreement-checkbox/agreement-checkbox.uvue";
+  import ImageCaptcha from "@/components/image-captcha/image-captcha.uvue";
+  import { isImageCaptchaEnabled, imageCaptchaValidationKey } from "@/utils/imageCaptcha";
+  import { apiErrorMessage } from "@/utils/apiResponse";
   import { redirectTo } from "@/utils/common";
   import { getApiBaseUrl } from "@/constants/config";
   import { extractCaptchaVerifyParam } from "@/utils/aliyunCaptcha";
@@ -322,6 +333,34 @@
   });
 
   const loading = ref<boolean>(false);
+  const imageCaptchaId = ref<string>("");
+  const imageCaptchaCode = ref<string>("");
+  const imageCaptchaRefreshToken = ref<number>(0);
+  const needImageCaptcha = computed((): boolean => isImageCaptchaEnabled(tenantConfigInfoVal.value));
+  let authRequestRunning = false;
+
+  function handleImageCaptchaChange(captchaId: string, captchaCode: string): void {
+    imageCaptchaId.value = captchaId;
+    imageCaptchaCode.value = captchaCode;
+  }
+
+  function refreshImageCaptcha(): void {
+    // 父级先同步清空，不能等子组件 watcher 再作废旧 ID。
+    handleImageCaptchaChange("", "");
+    imageCaptchaRefreshToken.value = imageCaptchaRefreshToken.value + 1;
+  }
+
+  function validateImageCaptcha(): boolean {
+    const key = imageCaptchaValidationKey(needImageCaptcha.value, imageCaptchaId.value, imageCaptchaCode.value);
+    if (key.length == 0) return true;
+    uni.showToast({ title: t(key), icon: "none" });
+    return false;
+  }
+
+  function showAuthError(error: any): void {
+    const message = apiErrorMessage(error);
+    uni.showToast({ title: message.length > 0 ? message : t("Mobile.Common.operationFailed"), icon: "none" });
+  }
   const loginCompleted = ref<boolean>(false);
   const isSubmitting = computed((): boolean => {
     return loading.value || loginCompleted.value || props.submitting == true;
@@ -410,12 +449,17 @@
 
   // 处理登录方式切换
   const handleLoginTypeChange = (value: string | number, index: number) => {
+    if (isSubmitting.value) {
+      currentLoginType.value = isCaptchaVerify.value ? "phone" : "password";
+      return;
+    }
     currentLoginType.value = `${value}`;
     if (`${value}` == "password") {
       isCaptchaVerify.value = false;
     } else if (`${value}` == "phone") {
       isCaptchaVerify.value = true;
     }
+    refreshImageCaptcha();
   };
 
   // ====== 校验辅助：手机号/邮箱格式 ======
@@ -564,9 +608,9 @@
           redirectTo(redirectUrlVal.value);
         }
       }, 1000);
-    } else if (code == AGENT_NOT_EXIST) {
+    } else {
       uni.showToast({
-        title: message,
+        title: message.length > 0 ? message : t("Mobile.Common.operationFailed"),
         icon: "none",
       });
     }
@@ -591,11 +635,18 @@
     params.phoneOrEmail = account.value;
     params.password = password.value;
     params.captchaVerifyParam = captchaVerifyParam;
+    if (needImageCaptcha.value) {
+      params.captchaId = imageCaptchaId.value;
+      params.captchaCode = imageCaptchaCode.value;
+    }
     try {
       loading.value = true;
       const result = await apiLogin(params);
       handleLoginSuccess(result as UTSJSONObject);
+    } catch (error) {
+      showAuthError(error);
     } finally {
+      if (!loginCompleted.value) refreshImageCaptcha();
       loading.value = false;
     }
   }
@@ -609,6 +660,10 @@
     // Android：勿赋 SendCodeEnum，会序列化为 { value: "LOGIN_OR_REGISTER" }
     params.type = "LOGIN_OR_REGISTER";
     params.captchaVerifyParam = captchaVerifyParam;
+    if (needImageCaptcha.value) {
+      params.captchaId = imageCaptchaId.value;
+      params.captchaCode = imageCaptchaCode.value;
+    }
     if (isTenantEmailAuth.value) {
       params.email = emailNumber.value.trim();
     } else {
@@ -637,6 +692,8 @@
             duration: 5000,
           });
           startCodeCountdown();
+        } else {
+          uni.showToast({ title: message.length > 0 ? message : t("Mobile.Common.operationFailed"), icon: "none" });
         }
       } else {
         // 手机验证码
@@ -654,17 +711,31 @@
           });
         }
       }
+    } catch (error) {
+      showAuthError(error);
     } finally {
+      refreshImageCaptcha();
       loading.value = false;
     }
   }
 
   // ====== 阿里云验证码成功回调 ======
-  function handlerSuccess(captchaVerifyParam: string): void {
-    if (isCaptchaVerify.value) {
-      handleNext(captchaVerifyParam);
-    } else {
-      handlePasswordLogin(captchaVerifyParam);
+  async function handlerSuccess(captchaVerifyParam: string): Promise<void> {
+    if (authRequestRunning || loginCompleted.value) return;
+    if (!validateImageCaptcha()) {
+      loading.value = false;
+      return;
+    }
+    authRequestRunning = true;
+    try {
+      if (isCaptchaVerify.value) {
+        await handleNext(captchaVerifyParam);
+      } else {
+        await handlePasswordLogin(captchaVerifyParam);
+      }
+    } finally {
+      authRequestRunning = false;
+      loading.value = false;
     }
   }
 
@@ -756,6 +827,11 @@
 
   // ====== 执行登录 / 触发验证码 ======
   const doLogin = () => {
+    if (!validateImageCaptcha()) {
+      loading.value = false;
+      return;
+    }
+    loading.value = true;
     // 阿里云验证码配置读取
     const tenantConfigInfo = tenantConfigInfoVal.value;
     let captchaSceneId = "";

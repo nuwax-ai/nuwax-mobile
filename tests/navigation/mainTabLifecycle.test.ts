@@ -4,8 +4,9 @@ import { transformSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
 
 function compile(path: string, exports: string[], ios = false) {
-  let source = readFileSync(path, "utf8").replace(/^import .*;\n/gm, "").replace(/^export /gm, "");
-  if (ios) source = source.replace(/\s*\/\/ #ifndef APP-IOS\n[\s\S]*?\/\/ #endif/g, "");
+  // Windows 检出多为 CRLF：剥 import / 条件编译块的正则须容忍 \r，否则 import 残留进 runInNewContext 报 ESM 语法错
+  let source = readFileSync(path, "utf8").replace(/^import .*;\r?\n/gm, "").replace(/^export /gm, "");
+  if (ios) source = source.replace(/\s*\/\/ #ifndef APP-IOS\r?\n[\s\S]*?\/\/ #endif/g, "");
   return transformSync(`${source}\n({ ${exports.join(",")} });`, { loader: "ts" }).code;
 }
 
@@ -105,7 +106,7 @@ function lifecycle() {
     onPageShow: fallbackShow, onPageHide: fallbackHide, onPageUnload: fallbackUnload,
   };
   const api = runInNewContext(compile("hooks/useMainTabLifecycle.uts", [
-    "useMainTabLifecycle", "onTabPageShow", "onTabPageHide", "dispatchMainTabBack", "dispatchMainTabResize",
+    "useMainTabLifecycle", "onTabPageShow", "onTabPageHide", "dispatchMainTabBack", "dispatchMainTabResize", "dispatchMainTabRetap",
   ]), context);
   return {
     ...api, active, visible, fallbackShow, fallbackHide,
@@ -172,5 +173,17 @@ describe("Tab 内容显隐生命周期", () => {
     expect(page.dispatchMainTabBack("/pages/message/message", { from: "backbutton" })).toBe(false);
     page.dispatchMainTabResize("/pages/message/message", { size: { windowWidth: 812 } });
     expect(back).toHaveBeenCalledTimes(1); expect(resize).toHaveBeenCalledTimes(1);
+  });
+
+  it("双击底栏 retap 只派发给当前可见内容（双击定位首条未读的通道）", () => {
+    const page = lifecycle(); page.setup(); const hooks = page.useMainTabLifecycle("/pages/message/message");
+    const retap = vi.fn(); hooks.onRetap(retap);
+    page.visible.value = true;
+    page.dispatchMainTabRetap("/pages/message/message");
+    expect(retap).toHaveBeenCalledTimes(1);
+    page.active.value = "/pages/index/index";
+    page.dispatchMainTabRetap("/pages/message/message");
+    page.dispatchMainTabRetap("/pages/unknown/not-registered");
+    expect(retap).toHaveBeenCalledTimes(1);
   });
 });

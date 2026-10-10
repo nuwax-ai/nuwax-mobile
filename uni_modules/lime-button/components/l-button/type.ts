@@ -1,4 +1,7 @@
 // @ts-nocheck
+// #ifndef UNI-APP-X
+type UTSJSONObject = Record<string, any>
+// #endif
 export type SizeEnum = 'small' | 'medium' | 'large';
 export interface ButtonProps {
 	ariaLabel?: string;
@@ -54,7 +57,7 @@ export interface ButtonProps {
 	fontSize ?: string;
 	textColor ?: string;
 	color ?: string;
-	lStyle?: string;
+	lStyle?: string | UTSJSONObject;
 	gap?: string;
 	formType ?: string
 	openType ?: string

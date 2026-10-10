@@ -1,0 +1,152 @@
+/**
+ * App web-view 内嵌页原生下载桥（H5 侧）。
+ *
+ * 文件树「下载全部」在内嵌 WebView 中走 blob 下载不可靠（WebView 对 a[download]
+ * 支持不一），改由 App 原生侧 uni.downloadFile 下载并保存到系统公共下载目录：
+ *
+ *   H5 → 原生：{type:'download', action:'downloadAllFiles', cId}
+ *   原生 → H5：window.__onNativeDownloadResult({success, error})
+ *
+ * 非内嵌（浏览器直接打开 / App 原生页 / 小程序）不使用本桥，仍走各自原有下载逻辑。
+ */
+
+/** 原生下载结果回调 */
+export type NativeDownloadResultHandler = (
+  success: boolean,
+  error: string,
+) => void
+
+class NativeDownloadBridge {
+  /** 是否已启用（file-tree 在 isAppWebView=true 时 setup） */
+  private enabled: boolean = false
+  /** 全局回调是否已注册（幂等） */
+  private globalsRegistered: boolean = false
+  /** 是否已尝试注入 uni.webview JSSDK（幂等） */
+  private jssdkInjected: boolean = false
+
+  /** 下载结果回调（由 file-tree 注入） */
+  private resultHandler: NativeDownloadResultHandler | null = null
+
+  isActive(): boolean {
+    return this.enabled
+  }
+
+  /** 启用桥并注册全局回调；仅 App web-view 内嵌页调用（幂等） */
+  setup(): void {
+    if (this.enabled == true) {
+      return
+    }
+    this.enabled = true
+    this.injectJssdk()
+    this.registerGlobals()
+  }
+
+  /** 注入结果回调（重复注入覆盖；传 null 解绑） */
+  setResultHandler(handler: NativeDownloadResultHandler | null): void {
+    this.resultHandler = handler
+  }
+
+  /** 下载全部文件（zip），由原生下载并保存到公共目录 */
+  downloadAllFiles(cId: string): void {
+    this.post({
+      "type": "download",
+      "action": "downloadAllFiles",
+      "cId": cId,
+    } as UTSJSONObject)
+  }
+
+  // ==================== 内部 ====================
+
+  /** H5 → 原生：uni.webView.postMessage（内容须放在 data 字段，见 JSSDK 约定） */
+  private post(payload: UTSJSONObject): void {
+    if (this.enabled != true) {
+      return
+    }
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null) {
+        return
+      }
+      const uniGlobal = w.uni
+      if (
+        uniGlobal == null ||
+        uniGlobal.webView == null ||
+        uniGlobal.webView.postMessage == null
+      ) {
+        // JSSDK 尚未就绪：再尝试注入一次（原生侧 evalJS 也会注入，双保险）
+        this.injectJssdk()
+        return
+      }
+      uniGlobal.webView.postMessage({ "data": payload })
+    } catch (e) {
+      console.warn("[native-download] postMessage failed", e)
+    }
+    // #endif
+  }
+
+  /**
+   * 确保 uni.webview.1.5.5.js 已注入到当前文档（幂等）。
+   * 脚本随 H5 构建发布在 static/ 下（相对路径 ./static/... 按文档 base 解析）。
+   */
+  private injectJssdk(): void {
+    if (this.jssdkInjected == true) {
+      return
+    }
+    this.jssdkInjected = true
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null || w.document == null || w.document.head == null) {
+        return
+      }
+      if (w.uni != null && w.uni.webView != null) {
+        return
+      }
+      const script = w.document.createElement("script")
+      script.src = "./static/uni.webview.1.5.5.js"
+      w.document.head.appendChild(script)
+    } catch (e) {
+      console.warn("[native-download] inject jssdk failed", e)
+    }
+    // #endif
+  }
+
+  /** 注册原生 evalJS 回传的全局回调（幂等） */
+  private registerGlobals(): void {
+    if (this.globalsRegistered == true) {
+      return
+    }
+    this.globalsRegistered = true
+    // #ifdef H5 || WEB
+    try {
+      const w = window as any
+      if (w == null) {
+        return
+      }
+      w.__onNativeDownloadResult = (res: any): void => {
+        const h = this.resultHandler
+        if (h == null) {
+          return
+        }
+        let success = false
+        let error = ""
+        try {
+          if (res != null) {
+            success = res.success == true
+            error = res.error != null ? `${res.error}` : ""
+          }
+        } catch (_e) {
+          // ignore
+        }
+        h(success, error)
+      }
+    } catch (_e) {
+      // ignore
+    }
+    // #endif
+  }
+}
+
+/** 全局单例 */
+export const nativeDownloadBridge = new NativeDownloadBridge()

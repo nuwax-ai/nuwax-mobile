@@ -1,9 +1,7 @@
 // @ts-nocheck
 // #ifndef UNI-APP-X
-// export * from './vue.ts'
-export { selectComponent } from './vue.ts'
+export { selectComponent } from './vue'
 // #endif
 // #ifdef UNI-APP-X
-// export * from './uvue.uts'
-export { selectComponent } from './uvue.uts'
+export { selectComponent } from './uvue'
 // #endif

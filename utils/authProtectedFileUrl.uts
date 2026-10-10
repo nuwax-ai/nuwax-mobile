@@ -1,69 +1,249 @@
 /**
  * 受保护文件 URL 鉴权拉取与打开
  * 对齐 nuwax Web 版 authProtectedFileUrl.ts
+ * pathname 用字符串切分，避免 App/Kotlin 不支持 Web URL 与可选链。
  */
-import { API_BASE_URL } from "@/constants/config";
+import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { jumpToFilePreviewPage } from "@/utils/system.uts";
+import { applyXClientTypeHeader, isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
 
 const AUTH_PROTECTED_FILE_PATH_RE = /\/api\/f\//i;
 
+function isHttpUrl(url: string): boolean {
+  return url.indexOf("http://") == 0 || url.indexOf("https://") == 0;
+}
+
+/**
+ * 从 URL 中提取 pathname（去掉协议、host、query、hash）。
+ * 不依赖 Web URL API，兼容 App/Kotlin。
+ */
+function extractPathname(url: string): string {
+  let path = url;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    path = path.substring(0, hashIdx);
+  }
+  const queryIdx = path.indexOf("?");
+  if (queryIdx >= 0) {
+    path = path.substring(0, queryIdx);
+  }
+  if (isHttpUrl(path)) {
+    const protoIdx = path.indexOf("://");
+    const afterProto = path.substring(protoIdx + 3);
+    const slashIdx = afterProto.indexOf("/");
+    if (slashIdx >= 0) {
+      return afterProto.substring(slashIdx);
+    }
+    return "/";
+  }
+  if (path.length == 0) {
+    return "/";
+  }
+  if (path.indexOf("/") != 0) {
+    return `/${path}`;
+  }
+  return path;
+}
+
+export function extractFileNameFromUrl(url: string): string {
+  const path = extractPathname(url);
+  const lastSlash = path.lastIndexOf("/");
+  if (lastSlash >= 0 && lastSlash < path.length - 1) {
+    return path.substring(lastSlash + 1);
+  }
+  return "download";
+}
+
 /** 判断 URL 是否为需 Bearer 鉴权才能加载的文件地址。 */
-export function isAuthProtectedFileUrl(url: string | undefined): boolean {
-  if (!url?.trim()) {
+export function isAuthProtectedFileUrl(url: string): boolean {
+  if (url.length == 0) {
     return false;
   }
-  try {
-    const parsed = /^https?:\/\//i.test(url)
-      ? new URL(url)
-      : new URL(url.startsWith("/") ? url : `/${url}`, API_BASE_URL);
-    return AUTH_PROTECTED_FILE_PATH_RE.test(parsed.pathname);
-  } catch {
-    return AUTH_PROTECTED_FILE_PATH_RE.test(url);
+  const trimmed = url.trim();
+  if (trimmed.length == 0) {
+    return false;
   }
+  return AUTH_PROTECTED_FILE_PATH_RE.test(extractPathname(trimmed));
 }
 
 /** 将相对或绝对文件 URL 规范化为可请求的完整地址。 */
 export function resolveAuthProtectedFileFetchUrl(url: string): string {
-  if (/^https?:\/\//i.test(url)) {
+  if (isHttpUrl(url)) {
     return url;
   }
-  const normalizedPath = url.startsWith("/") ? url : `/${url}`;
-  return `${API_BASE_URL}${normalizedPath}`;
+  const normalizedPath = url.indexOf("/") == 0 ? url : `/${url}`;
+  return `${getApiBaseUrl()}${normalizedPath}`;
 }
 
-function buildAuthHeaders(): UTSJSONObject {
-  const token = uni.getStorageSync(ACCESS_TOKEN) ?? "";
+function buildProtectedFileHeaders(includeClientType: boolean): UTSJSONObject {
+  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+  const token = tokenRaw != null ? `${tokenRaw}` : "";
   const header = {} as UTSJSONObject;
-  if (token) {
+  if (token.length > 0) {
     header["Authorization"] = `Bearer ${token}`;
   }
+  if (includeClientType == true) applyXClientTypeHeader(header);
   return header;
+}
+
+/** 构造受保护文件请求所需的 Bearer 头（供 downloadFile / request 复用）。 */
+export function buildAuthProtectedFileHeaders(): UTSJSONObject {
+  return buildProtectedFileHeaders(true);
 }
 
 /** 从绝对 URL 提取 pathname，供 file-preview 使用。 */
 export function extractPathnameFromRemoteUrl(url: string): string {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    return url;
-  }
+  return extractPathname(url);
 }
 
 /**
- * 拉取受保护文件并返回可用于 image 组件展示的本地/temp 地址。
+ * 受保护文件换 ak 流式直链（对齐 PC 端 /api/file/ak/refresh 契约）：
+ * GET {base}/api/file/ak/refresh?url=<encodeURIComponent(pathname)> →
+ * data = 原地址 + ?ak=<临时签名>。访问该地址 302 到对象存储（s3p）流输出，
+ * Range 206 已验证——可直接喂 <video>/<audio> 渐进播放，免去整段下载。
+ * 接口匿名可调（ak 即短期凭证），仍带 Bearer 兼容后续收紧鉴权。
+ * 非 200 / 非 0000 / data 非法一律 reject，由调用方自行回落旧下载路径。
  */
-export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
-  const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
-  const header = buildAuthHeaders();
-
-  return new Promise((resolve, reject) => {
-    uni.downloadFile({
+export function fetchAuthProtectedFileAkUrl(url: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const encodedPath = encodeURIComponent(extractPathname(url));
+    const fetchUrl = `${getApiBaseUrl()}/api/file/ak/refresh?url=${encodedPath}`;
+    uni.request({
       url: fetchUrl,
-      header,
+      method: "GET",
+      header: buildProtectedFileHeaders(false),
       success: (res) => {
-        if (res.statusCode === 200 && res.tempFilePath) {
-          resolve(res.tempFilePath);
+        if (res.statusCode != 200) {
+          console.error(`[AkUrl] refresh statusCode=${res.statusCode} url=${fetchUrl}`);
+          reject(new Error(`ak refresh statusCode ${res.statusCode}`));
+          return;
+        }
+        // App 端 uni.request 会把 JSON 预解析成 UTSJSONObject；万一按文本返回
+        // （对齐 useRequest 口径：Android Gson 对非 JSON 抛异常 UTS catch 拦不住，
+        // 先按首字符预检再 parse），本响应无 int64，无精度问题。
+        let body: any | null = res.data as any | null;
+        if (typeof body == "string") {
+          const text = `${body}`.trim();
+          if (text.length == 0 || !(text.indexOf("{") == 0 || text.indexOf("[") == 0)) {
+            console.error(`[AkUrl] refresh 非JSON正文 url=${fetchUrl}`);
+            reject(new Error("ak refresh non-json body"));
+            return;
+          }
+          body = JSON.parse(text);
+        }
+        const obj = body as UTSJSONObject | null;
+        const code = obj != null ? obj["code"] : null;
+        const dataVal = obj != null ? obj["data"] : null;
+        const akUrl = dataVal != null ? `${dataVal}` : "";
+        if (code != null && `${code}` == "0000" && (akUrl.indexOf("https://") == 0 || akUrl.indexOf("http://") == 0)) {
+          resolve(akUrl);
+          return;
+        }
+        console.error(`[AkUrl] refresh 响应非法 code=${code != null ? `${code}` : ""} url=${fetchUrl}`);
+        reject(new Error("ak refresh bad response"));
+      },
+      fail: (err) => {
+        console.error(`[AkUrl] refresh fail url=${fetchUrl}`, err);
+        reject(new Error(err.errMsg != null ? err.errMsg : "ak refresh fail"));
+      },
+    });
+  });
+}
+
+// #ifdef H5 || WEB
+let protectedImageRequestSeq = 0;
+const protectedImageCallbacks = new Map<string, (url: string) => void>();
+
+/** Android WebView 的 fetch 会把 Bearer 转发到 302 后的对象存储，必须由原生侧读取 Location。 */
+function fetchAndroidProtectedImageRedirect(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    protectedImageRequestSeq += 1;
+    const requestId = `${Date.now()}-${protectedImageRequestSeq}`;
+    const w = window as any;
+    w.__nuwaxProtectedImageResult = (result: any): void => {
+      const obj = result as UTSJSONObject;
+      const idRaw = obj["requestId"];
+      const id = idRaw != null ? `${idRaw}` : "";
+      const callback = protectedImageCallbacks.get(id);
+      if (callback != null) callback(obj["url"] != null ? `${obj["url"]}` : "");
+    };
+    let attempts = 0;
+    let postTimer = 0;
+    const timeout = setTimeout((): void => {
+      protectedImageCallbacks.delete(requestId);
+      if (postTimer != 0) clearTimeout(postTimer);
+      reject(new Error('Protected image redirect timed out'));
+    }, 12000);
+    protectedImageCallbacks.set(requestId, (directUrl: string): void => {
+      protectedImageCallbacks.delete(requestId);
+      clearTimeout(timeout);
+      if (postTimer != 0) clearTimeout(postTimer);
+      if (directUrl.indexOf('https://') == 0) resolve(directUrl);
+      else reject(new Error('Protected image redirect failed'));
+    });
+    const post = (): void => {
+      const payload = { "data": { "type": "protected-image-url", "requestId": requestId, "url": url } };
+      try {
+        const uniGlobal = w.uni;
+        if (uniGlobal != null && uniGlobal.webView != null && uniGlobal.webView.postMessage != null) {
+          uniGlobal.webView.postMessage(payload);
+          return;
+        }
+        if (w.__uniapp_x_postMessage != null) {
+          w.__uniapp_x_postMessage(payload);
+          return;
+        }
+        if (w.__uniapp_x_ != null && w.__uniapp_x_.postMessage != null) {
+          w.__uniapp_x_.postMessage(JSON.stringify(payload));
+          return;
+        }
+      } catch (_e) {
+        // JSSDK 尚未就绪时重试。
+      }
+      attempts += 1;
+      if (attempts < 30) postTimer = setTimeout(post, 100);
+    };
+    post();
+  });
+}
+
+/**
+ * H5 用 arraybuffer + blob URL，避免 uni.downloadFile 读取 Content-Disposition。
+ * 该头不在 CORS 白名单，跨域未 Expose 时浏览器会报 Refused to get unsafe header。
+ */
+function resolveHeaderMimeType(headers: any | null): string {
+  if (headers == null) {
+    return "application/octet-stream";
+  }
+  const obj = headers as UTSJSONObject;
+  let ct = obj["content-type"];
+  if (ct == null) {
+    ct = obj["Content-Type"];
+  }
+  if (ct != null && `${ct}`.length > 0) {
+    return `${ct}`;
+  }
+  return "application/octet-stream";
+}
+
+function fetchAuthProtectedFileAsObjectUrl(
+  fetchUrl: string,
+  header: UTSJSONObject,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    uni.request({
+      url: fetchUrl,
+      method: "GET",
+      header,
+      responseType: "arraybuffer",
+      // 默认 dataType=json 会尝试 JSON.parse，二进制封面会失败
+      dataType: "text",
+      success: (res) => {
+        if (res.statusCode == 200 && res.data != null) {
+          const mimeType = resolveHeaderMimeType(res.header);
+          const blob = new Blob([res.data as ArrayBuffer], { type: mimeType });
+          resolve(URL.createObjectURL(blob));
           return;
         }
         reject(new Error());
@@ -74,42 +254,261 @@ export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
     });
   });
 }
+// #endif
+
+// #ifndef H5 || WEB
+/**
+ * App 端受保护图片下载防护三件套（2026-10-07 半截图标事故）：
+ * 1) 同 URL 并发去重：冷启动列表会对同一头像并发发起多次 downloadFile，
+ *    实测运行时并发落盘出过恰好 8KB 整块倍数的截断/垃圾尾文件；
+ * 2) 落盘完整性校验：PNG 必须以 IEND 结尾、JPG 尾部须有 EOI、GIF 尾 0x3B——
+ *    截断 PNG 会被 image 组件增量解码只画上半截且不触发 @error，必须绑定前拦下；
+ * 3) 校验失败删临时文件重下（至多 3 次、间隔 300ms），当次会话内自愈，不必等重启。
+ * 网络失败保持单次语义不在此重试，由调用方原有重试机制兜底。
+ */
+const PROTECTED_IMAGE_MAX_DOWNLOAD_ATTEMPTS = 3;
+const PROTECTED_IMAGE_RETRY_DELAY_MS = 300;
+const protectedImageInflight = new Map<string, Promise<string>>();
+
+function delayProtectedImageRetry(ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    setTimeout((): void => {
+      resolve(true);
+    }, ms);
+  });
+}
+
+function unlinkTempQuiet(filePath: string): void {
+  try {
+    uni.getFileSystemManager().unlink({
+      filePath: filePath,
+      fail: (_e) => {},
+    });
+  } catch (_eUnlink) {
+    // 尽力删除，失败不影响重下
+  }
+}
+
+/** PNG 尾 8 字节必须是 IEND 块类型 + CRC：49 45 4E 44 AE 42 60 82。 */
+function isPngTailIntact(bytes: Uint8Array): boolean {
+  const len = bytes.length;
+  if (len < 12) {
+    return false;
+  }
+  return (
+    bytes[len - 8] == 0x49 &&
+    bytes[len - 7] == 0x45 &&
+    bytes[len - 6] == 0x4e &&
+    bytes[len - 5] == 0x44 &&
+    bytes[len - 4] == 0xae &&
+    bytes[len - 3] == 0x42 &&
+    bytes[len - 2] == 0x60 &&
+    bytes[len - 1] == 0x82
+  );
+}
+
+/** JPG 尾部 64 字节内须有 FF D9（EOI）；垃圾填充尾同样拦下交给重下。 */
+function isJpgTailIntact(bytes: Uint8Array): boolean {
+  const len = bytes.length;
+  if (len < 4) {
+    return false;
+  }
+  const scanFrom = len - 64 > 0 ? len - 64 : 0;
+  let i = len - 2;
+  while (i >= scanFrom) {
+    if (bytes[i] == 0xff && bytes[i + 1] == 0xd9) {
+      return true;
+    }
+    i--;
+  }
+  return false;
+}
+
+/** GIF 尾 0x3B。 */
+function isGifTailIntact(bytes: Uint8Array): boolean {
+  const len = bytes.length;
+  if (len < 6) {
+    return false;
+  }
+  return bytes[len - 1] == 0x3b;
+}
+
+/** 读落盘文件做头/尾完整性校验；识别不了的一律放行保持旧行为。 */
+function isLocalImageFileIntact(filePath: string): boolean {
+  try {
+    const data = uni.getFileSystemManager().readFileSync(filePath, null);
+    if (data instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(data as ArrayBuffer);
+      const len = bytes.length;
+      if (len == 0) {
+        return false;
+      }
+      if (len >= 4 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e && bytes[3] == 0x47) {
+        return isPngTailIntact(bytes);
+      }
+      if (len >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8) {
+        return isJpgTailIntact(bytes);
+      }
+      if (len >= 4 && bytes[0] == 0x47 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x38) {
+        return isGifTailIntact(bytes);
+      }
+    }
+    return true;
+  } catch (_e) {
+    // 读不出来不拦截，维持旧的失败链路
+    return true;
+  }
+}
+
+function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Promise<string> {
+  return new Promise((resolve, reject) => {
+    uni.downloadFile({
+      url: fetchUrl,
+      header,
+      success: (res) => {
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+          resolve(tempPath);
+          return;
+        }
+        // 非 200（如 302→对象存储带 Bearer 被拒的 4xx）：logcat 抓 [ChatImg] 定位
+        console.error(
+          `[ChatImg] downloadFile statusCode=${res.statusCode} temp=${tempPath != null ? tempPath : ""} url=${fetchUrl}`,
+        );
+        reject(new Error());
+      },
+      fail: (err) => {
+        console.error(
+          `[ChatImg] downloadFile fail: ${err.errMsg != null ? err.errMsg : ""} url=${fetchUrl}`,
+        );
+        reject(err);
+      },
+    });
+  });
+}
+
+async function downloadProtectedImageWithIntegrityCheck(
+  fetchUrl: string,
+  header: UTSJSONObject,
+): Promise<string> {
+  for (let attempt = 1; attempt <= PROTECTED_IMAGE_MAX_DOWNLOAD_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      await delayProtectedImageRetry(PROTECTED_IMAGE_RETRY_DELAY_MS);
+    }
+    const tempPath = await downloadProtectedFileOnce(fetchUrl, header);
+    if (isLocalImageFileIntact(tempPath)) {
+      return tempPath;
+    }
+    console.warn(
+      "[ChatImg] integrity check fail, will retry attempt=" + attempt + " path=" + tempPath + " url=" + fetchUrl,
+    );
+    unlinkTempQuiet(tempPath);
+  }
+  throw new Error("protected image download corrupt after retries url=" + fetchUrl);
+}
+
+function fetchProtectedImageDisplayUrlOnApp(fetchUrl: string, header: UTSJSONObject): Promise<string> {
+  const inflight = protectedImageInflight.get(fetchUrl);
+  if (inflight != null) {
+    return inflight;
+  }
+  const task = downloadProtectedImageWithIntegrityCheck(fetchUrl, header);
+  protectedImageInflight.set(fetchUrl, task);
+  // 结束后移除登记；期间同 URL 的并发请求共享同一任务，不再重复落盘
+  task.then((_path: string) => {
+    protectedImageInflight.delete(fetchUrl);
+  }).catch((_err) => {
+    protectedImageInflight.delete(fetchUrl);
+  });
+  return task;
+}
+// #endif
+
+/**
+ * 拉取受保护文件并返回可用于 image 组件展示的本地/temp 地址。
+ */
+export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
+  const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
+  // #ifdef H5 || WEB
+  if (isAppWebViewEmbedded() == true && readAppWebViewHostPlatform() == 'android') {
+    return fetchAndroidProtectedImageRedirect(fetchUrl);
+  }
+  // /api/f/ 图片会重定向到对象存储，其 CORS 白名单不含 X-Client-Type。
+  // 保留 Bearer 鉴权，避免浏览器把额外请求头带到重定向目标导致预检失败。
+  const header = buildProtectedFileHeaders(false);
+  // #endif
+  // #ifndef H5 || WEB
+  const header = buildAuthProtectedFileHeaders();
+  // #endif
+
+  // #ifdef H5 || WEB
+  return fetchAuthProtectedFileAsObjectUrl(fetchUrl, header);
+  // #endif
+
+  // #ifndef H5 || WEB
+  return fetchProtectedImageDisplayUrlOnApp(fetchUrl, header);
+  // #endif
+}
+
+// 注：不要再新增「先 downloadFile 再交给 SVG 处理」的组合助手——受保护 SVG 落成本地
+// file:// 后无法再取文本，Android / iOS 会退回原生 1:1 光栅化导致显示异常。
+// 需要同时处理受保护文件与远程 SVG 时，请用 utils/remoteSvgImage 的 resolveDisplayImageUrl。
 
 /**
  * 打开或下载远程文件。
- * 受保护地址带 Bearer 下载；若提供 conversationId 则优先跳转预览页。
+ * 受保护地址带 Bearer 下载；若提供 conversationId 则跳转预览页（附 source=im）。
+ * 预览页按 source=im 走「只预览文件」路径、不调智能体域 /api/agent/conversation/share
+ * （IM convId 在该接口必报 conversation not found）——改造落地前的过渡期会白屏+报错。
  */
 export function openRemoteFileUrl(
   url: string,
-  fileName?: string,
-  conversationId?: string | number,
+  fileName: string = "",
+  conversationId: string = "",
 ): Promise<void> {
   const resolvedName =
-    fileName ||
-    url.split("/").filter(Boolean).pop()?.split("?")[0] ||
-    "download";
+    fileName.length > 0 ? fileName : extractFileNameFromUrl(url);
 
-  if (conversationId && isAuthProtectedFileUrl(url)) {
+  if (conversationId.length > 0 && isAuthProtectedFileUrl(url)) {
     const path = extractPathnameFromRemoteUrl(url);
-    jumpToFilePreviewPage(String(conversationId), path);
+    jumpToFilePreviewPage(`${conversationId}`, path, "im");
     return Promise.resolve();
   }
 
   if (isAuthProtectedFileUrl(url)) {
     const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
-    const header = buildAuthHeaders();
+    const header = buildAuthProtectedFileHeaders();
     uni.showLoading({ title: "" });
+
+    // #ifdef H5 || WEB
+    return new Promise((resolve, reject) => {
+      fetchAuthProtectedFileAsObjectUrl(fetchUrl, header)
+        .then((objectUrl: string) => {
+          uni.hideLoading();
+          const link = document.createElement("a");
+          link.href = objectUrl;
+          link.download = resolvedName;
+          link.target = "_blank";
+          link.click();
+          resolve();
+        })
+        .catch((err) => {
+          uni.hideLoading();
+          reject(err);
+        });
+    });
+    // #endif
+
+    // #ifndef H5 || WEB
     return new Promise((resolve, reject) => {
       uni.downloadFile({
         url: fetchUrl,
         header,
         success: (res) => {
           uni.hideLoading();
-          if (res.statusCode === 200 && res.tempFilePath) {
-            // #ifdef MP || APP-PLUS || APP-ANDROID || APP-IOS
+          const tempPath = res.tempFilePath;
+          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
             uni.openDocument({
-              filePath: res.tempFilePath,
-              showMenu: true,
+              filePath: tempPath,
               success: () => {
                 resolve();
               },
@@ -117,15 +516,6 @@ export function openRemoteFileUrl(
                 reject(err);
               },
             });
-            // #endif
-            // #ifdef H5 || WEB
-            const link = document.createElement("a");
-            link.href = res.tempFilePath;
-            link.download = resolvedName;
-            link.target = "_blank";
-            link.click();
-            resolve();
-            // #endif
             return;
           }
           reject(new Error());
@@ -136,6 +526,7 @@ export function openRemoteFileUrl(
         },
       });
     });
+    // #endif
   }
 
   return new Promise((resolve, reject) => {
@@ -147,21 +538,92 @@ export function openRemoteFileUrl(
     uni.downloadFile({
       url,
       success: (res) => {
-        if (res.statusCode === 200 && res.tempFilePath) {
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
           uni.openDocument({
-            filePath: res.tempFilePath,
-            showMenu: true,
+            filePath: tempPath,
             success: () => {
               resolve();
             },
-            fail: reject,
+            fail: (err) => {
+              reject(err);
+            },
           });
         } else {
           reject(new Error());
         }
       },
-      fail: reject,
+      fail: (err) => {
+        reject(err);
+      },
     });
     // #endif
   });
+}
+
+/**
+ * 打开受保护链接（聊天里的链接/文件附件点击）：期望「打开页面」而非「下载」。
+ * 带 conversationId（会话内点击）且为 /api/f/ 受保护文件时，优先跳文件预览页
+ *   （与聊天文件树一致）——系统文档查看器打不开 .md 等纯文本类文件，预览页
+ *   才是会话内文件的统一渲染面，H5 / App 同此路由。跳转附 source=im 标记，
+ *   预览页据此走「只预览文件」路径、不调智能体域 /api/agent/conversation/share
+ *   换 shareKey（IM convId 在该接口必报 conversation not found）——预览页侧
+ *   改造落地前的过渡期此处会白屏+报错，属已知状态。
+ * H5：点击手势内同步先开空白新页（异步 fetch 后再 window.open 会被当弹窗拦截），
+ *   带 Bearer 拉取成功后把新页指向 blob 地址——浏览器可渲染的类型（html/pdf/txt…）
+ *   直接展示，不可渲染的（zip 等）由浏览器自然回落为下载；新页被拦截时退回下载。
+ * App：维持 openRemoteFileUrl 语义（下载后交系统文档查看器打开）。
+ */
+export function openAuthProtectedLinkUrl(
+  url: string,
+  fileName: string = "",
+  conversationId: string = "",
+): Promise<void> {
+  if (conversationId.length > 0 && isAuthProtectedFileUrl(url)) {
+    const path = extractPathnameFromRemoteUrl(url);
+    jumpToFilePreviewPage(`${conversationId}`, path, "im");
+    return Promise.resolve();
+  }
+
+  // #ifndef H5 || WEB
+  return openRemoteFileUrl(url, fileName, conversationId);
+  // #endif
+
+  // #ifdef H5 || WEB
+  const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
+  const header = buildAuthProtectedFileHeaders();
+  uni.showLoading({ title: "" });
+  return new Promise((resolve, reject) => {
+    // 同步先占住新页：保住用户手势，避免异步 fetch 后开页被浏览器拦截
+    const opened = window.open("", "_blank");
+    fetchAuthProtectedFileAsObjectUrl(fetchUrl, header)
+      .then((objectUrl: string) => {
+        uni.hideLoading();
+        if (opened != null) {
+          opened.location.href = objectUrl;
+        } else {
+          // 新页被拦截：退回下载语义
+          const link = document.createElement("a");
+          link.href = objectUrl;
+          link.download = extractFileNameFromUrl(url);
+          link.click();
+        }
+        resolve();
+      })
+      .catch((err) => {
+        uni.hideLoading();
+        if (opened != null) {
+          opened.close();
+        }
+        reject(err);
+      });
+  });
+  // #endif
+}
+
+/** 释放调用方独占的 H5 图片对象地址；普通 URL/App 临时路径不处理。 */
+export function releaseDisplayImageUrl(url: string): void {
+  // #ifdef H5 || WEB
+  if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+  // #endif
 }

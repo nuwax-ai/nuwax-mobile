@@ -333,6 +333,10 @@ class H5RecorderManager {
     this._removeCallback('onStop', callback);
   }
 
+  offError(callback) {
+    this._removeCallback('onError', callback);
+  }
+
   offFrameRecorded(callback) {
     this._removeCallback('onFrameRecorded', callback);
   }
@@ -429,6 +433,33 @@ function getRecorderManager() {
     // H5平台使用自定义实现
     if (!recorderManagerInstance) {
       recorderManagerInstance = new H5RecorderManager();
+      // 预绑定方法 this，防止 UTS 通过 bracket 提取方法后丢失上下文
+      const methods = [
+        'start',
+        'stop',
+        'pause',
+        'resume',
+        'onStart',
+        'onStop',
+        'onError',
+        'onPause',
+        'onResume',
+        'onFrameRecorded',
+        'onInterruptionBegin',
+        'onInterruptionEnd',
+        'offStart',
+        'offStop',
+        'offError',
+        'offPause',
+        'offResume',
+        'offFrameRecorded',
+      ];
+      methods.forEach(name => {
+        if (typeof recorderManagerInstance[name] === 'function') {
+          recorderManagerInstance[name] =
+            recorderManagerInstance[name].bind(recorderManagerInstance);
+        }
+      });
     }
     return recorderManagerInstance;
   } else {

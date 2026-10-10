@@ -1,0 +1,139 @@
+/**
+ * App 端内嵌 H5（web-view）字体放大修复。
+ *
+ * Android 系统字体缩放会传导到 WebView，导致内嵌页面（如 agent-detail 的 H5 聊天）
+ * 字号比原生 UI 大。等价于 uni-app(vue) 的：
+ *   plus.webview.currentWebview().setStyle({ webview: { textZoom: '100%' } })
+ * uni-app x 无 plus 体系，改为遍历当前 Activity 视图树定位 android.webkit.WebView，
+ * 强制 settings.textZoom = 100。
+ *
+ * 用法：在包含 <web-view> 的页面 onLoad / onReady / @load 中调用 fixAppWebviewTextZoom()；
+ * 内部带 100ms × 30 次短轮询，兼容 webview 尚未挂载的时序。
+ *
+ * 线程：web-view @load 可能在 JavaBridge 线程回调；WebView.settings 必须在主线程改，
+ * 否则抛 “A WebView method was called on thread 'JavaBridge'”。
+ */
+
+// #ifdef APP-ANDROID
+import WebView from 'android.webkit.WebView';
+import View from 'android.view.View';
+import ViewGroup from 'android.view.ViewGroup';
+// #endif
+
+// #ifdef APP-ANDROID
+/** 递归查找视图树中的第一个 WebView（SysWebView 等 DCloud 实现均继承自 android.webkit.WebView）。 */
+function findFirstWebView(view: View | null): WebView | null {
+  if (view == null) {
+    return null
+  }
+  if (view instanceof WebView) {
+    return view as WebView
+  }
+  if (view instanceof ViewGroup) {
+    const group = view as ViewGroup
+    const count: Int = group.getChildCount()
+    for (let i: Int = 0; i < count; i++) {
+      const child = group.getChildAt(i)
+      if (child == null) {
+        continue
+      }
+      const found = findFirstWebView(child)
+      if (found != null) {
+        return found
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * 单次尝试（须在主线程调用）：找到 WebView 并设置 textZoom；未找到返回 false。
+ */
+function applyWebviewTextZoomOnce(): boolean {
+  const activity = UTSAndroid.getUniActivity()
+  if (activity == null) {
+    return false
+  }
+  const window = activity.getWindow()
+  if (window == null) {
+    return false
+  }
+  const decorView = window.getDecorView()
+  if (decorView == null) {
+    return false
+  }
+  const webView = findFirstWebView(decorView)
+  if (webView == null) {
+    return false
+  }
+  try {
+    webView.settings.textZoom = 100
+  } catch (_eZoom) {
+    return false
+  }
+  return true
+}
+
+/** 把一次 apply 投递到主线程；ok 表示本轮已找到并改写成功。 */
+function applyWebviewTextZoomOnMain(onDone: (ok: boolean) => void): void {
+  const activity = UTSAndroid.getUniActivity()
+  if (activity == null) {
+    onDone(false)
+    return
+  }
+  activity.runOnUiThread((): void => {
+    let ok = false
+    try {
+      ok = applyWebviewTextZoomOnce()
+    } catch (_eApply) {
+      ok = false
+    }
+    onDone(ok)
+  })
+}
+// #endif
+
+/**
+ * 修复 App 内嵌 H5 的 WebView 字体缩放（Android；iOS 无此问题，自动跳过）。
+ * 页面 onLoad / onReady / @load 调用一次即可；内部 100ms 轮询最多 3s 覆盖 webview 挂载时序。
+ */
+export function fixAppWebviewTextZoom(): void {
+  // #ifdef APP-ANDROID
+  let attempts = 0
+  let timer: number = 0
+  let stopped = false
+
+  const stopPoll = (): void => {
+    if (stopped == true) {
+      return
+    }
+    stopped = true
+    if (timer != 0) {
+      clearInterval(timer)
+      timer = 0
+    }
+  }
+
+  const tick = (): void => {
+    if (stopped == true) {
+      return
+    }
+    applyWebviewTextZoomOnMain((ok: boolean): void => {
+      if (ok == true) {
+        stopPoll()
+        return
+      }
+      attempts++
+      if (attempts >= 30) {
+        stopPoll()
+      }
+    })
+  }
+
+  // 立即投递一次（@load 时 WebView 多半已挂载），再短轮询兜底
+  tick()
+  timer = setInterval((): void => {
+    tick()
+  }, 100) as number
+  // #endif
+}

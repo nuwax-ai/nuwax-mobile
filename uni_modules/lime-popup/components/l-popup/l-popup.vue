@@ -1,22 +1,15 @@
 <template>
 	<view>
-		<l-overlay
-			:visible="innerValue" 
-			:zIndex="overlayZIndex"
-			:preventScrollThrough="preventScrollThrough"
-			:l-style="overlayStyle"
-			@click="handleOverlayClick"
-			v-if="destroyOnClose ? display && overlay : overlay">
+		<l-overlay :visible="innerValue" :zIndex="overlayZIndex" :preventScrollThrough="preventScrollThrough"
+			:l-style="overlayStyle" @click="handleOverlayClick" v-if="destroyOnClose ? display && overlay : overlay">
 		</l-overlay>
-		<view class="l-popup" 
-			v-if="destroyOnClose ? display : inited"
-			:class="rootClass" 
-			:style="[styles, lStyle]"
-			@transitionend="finished">
+		<view class="l-popup" v-if="destroyOnClose ? display : inited" :class="rootClass" :data-class="classes"
+			:style="[styles, lStyle]" @transitionend="finished">
 			<slot></slot>
 			<view class="l-popup__close" v-if="closeable" @click="handleClose">
 				<slot name="close-btn">
-					<l-icon class="l-popup__close-icon" :name="closeIcon" v-if="closeable" size="54rpx" :color="iconColor" />
+					<l-icon class="l-popup__close-icon" :name="closeIcon" v-if="closeable" size="54rpx"
+						:color="iconColor" />
 				</slot>
 			</view>
 		</view>
@@ -67,92 +60,109 @@
 	 * @event {Function} leave
 	 * @event {Function} after-leave
 	 */
-	import { computed, defineComponent } from '@/uni_modules/lime-shared/vue';
+	import { computed, defineComponent, ref, watch } from '@/uni_modules/lime-shared/vue';
+	import { useVModel } from '@/uni_modules/lime-shared/useVModel'
 	import { useTransition, type UseTransitionOptions, type TransitionEmitStatus } from '@/uni_modules/lime-transition';
 	import popupProps from './props'
 	import { convertRadius } from './utils'
 	export default defineComponent({
-		name: 'l-popup',
+		// name: 'l-popup',
 		props: popupProps,
 		options: {
 			addGlobalClass: true,
 			virtualHost: true,
 		},
 		externalClasses: ['l-class'],
-		emits: ['change', 'click-overlay', 'click-close', 'open', 'opened','close','closed','update:modelValue', 'input', 'before-enter', 'enter', 'after-enter', 'before-leave', 'leave', 'after-leave'],
+		emits: ['change', 'click-overlay', 'click-close', 'open', 'opened', 'close', 'closed', 'update:modelValue', 'input', 'before-enter', 'enter', 'after-enter', 'before-leave', 'leave', 'after-leave'],
 		setup(props, { emit }) {
-			const innerValue = computed({
-				set(value: boolean) {
-					emit('change', value)
-					emit('update:modelValue', value)
+
+			// const innerValue = computed({
+			// 	set(value: boolean) {
+			// 		emit('change', value)
+			// 		emit('update:modelValue', value)
+			// 		// #ifdef VUE2
+			// 		emit('input', value)
+			// 		// #endif
+			// 	},
+			// 	get():boolean {
+			// 		return props.visible || props.modelValue || props.value || false
+			// 	}
+			// } as WritableComputedOptions<boolean>)
+			// vue2 app 不支持 computed
+			const innerValue = useVModel({
+				value: (() => props.visible || props.modelValue || props.value),
+				defaultValue: props.visible,
+				onChange(newVal) {
+					emit('change', newVal)
+					emit('update:modelValue', newVal)
 					// #ifdef VUE2
-					emit('input', value)
+					emit('input', newVal)
 					// #endif
 				},
-				get():boolean {
-					return props.visible || props.modelValue || props.value || false
+				onFormat(newVal) {
+					return newVal || false
 				}
-			} as WritableComputedOptions<boolean>)
-		
-			const {inited, display, classes, finished} = useTransition({
+			})
+
+			const { inited, display, classes, finished } = useTransition({
 				defaultName: props.transitionName || 'popup-fade',
 				appear: innerValue.value,
-				emits: (name:TransitionEmitStatus) => { 
-					if(name == 'before-enter') {
+				emits: (name : TransitionEmitStatus) => {
+					if (name == 'before-enter') {
 						emit('open')
-					} else if(name == 'after-enter') {
+					} else if (name == 'after-enter') {
 						emit('opened')
-					} else if(name == 'before-leave') {
+					} else if (name == 'before-leave') {
 						emit('close')
-					} else if(name == 'after-leave') {
+					} else if (name == 'after-leave') {
 						emit('closed')
 					}
-					emit(name) 
+					emit(name)
 				},
-				visible: (): boolean => innerValue.value,
+				visible: () : boolean => innerValue.value,
 				duration: props.duration,
 			} as UseTransitionOptions)
-			
-			const overlayZIndex = computed(():number =>  props.zIndex > 0?  props.zIndex - 1 : 998);
-			
-			const rootClass = computed(():string=>{
+
+			const overlayZIndex = computed(() : number => props.zIndex > 0 ? props.zIndex - 1 : 998);
+
+			const rootClass = computed(() : string => {
 				const safe = props.safeAreaInsetTop && props.position == 'top'
-					?  'l-safe-area-top' 
-					:  props.safeAreaInsetBottom && props.position == 'bottom' 
+					? 'l-safe-area-top'
+					: props.safeAreaInsetBottom && props.position == 'bottom'
 						? 'l-safe-area-bottom'
 						: ''
-					
+
 				return `l-popup--${props.position} ${safe} ${classes.value}`
 				// return `l-popup--${props.position} ${classes.value}`
 			})
-			
+
 			const styles = computed(() => {
-				const style:Record<string, any> = {}
+				const style : Record<string, any> = {}
 				style['transition-duration'] = props.duration + 'ms'
 				if (props.bgColor != null) {
 					style["background"] = props.bgColor!
 				}
-				if (props.zIndex > 0) {
-					style["z-index"] = props.zIndex
+				if (props.zIndex > 0 || !props.zIndex) {
+					style["z-index"] = props.zIndex ?? 999
 				}
 				if (!display.value) {
 					style["display"] = "none"
 				}
-				
-				if(props.radius) {
+
+				if (props.radius) {
 					const values = convertRadius(props.radius!)
-					
+
 					style['border-top-left-radius'] = values[0]
 					style['border-top-right-radius'] = values[1]
 					style['border-bottom-right-radius'] = values[2]
 					style['border-bottom-left-radius'] = values[3]
 				}
-				
+
 				return style
 			})
-			
+
 			const handleOverlayClick = () => {
-				if(props.closeOnClickOverlay) {
+				if (props.closeOnClickOverlay) {
 					innerValue.value = false
 					emit('click-overlay')
 				}
@@ -161,8 +171,9 @@
 				innerValue.value = false
 				emit('click-close')
 			}
-			
+
 			return {
+				classes,
 				innerValue,
 				inited,
 				display,

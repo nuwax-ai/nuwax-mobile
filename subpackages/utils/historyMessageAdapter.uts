@@ -1,16 +1,16 @@
 /**
  * 历史消息适配器
- * 将PC端历史会话消息中的自定义HTML标签转换为移动端支持的Markdown容器语法
+ * 将PC端历史会话消息中的自定义HTML标签规范化为移动端可渲染格式
  *
  * PC端格式: <div><markdown-custom-process executeId="xxx" type="xxx" status="xxx" name="xxx"></markdown-custom-process></div>
- * 移动端格式: :::container executeId="xxx" type="xxx" status="xxx" name="xxx"\n:::\n
+ * 当前渲染链路：规范化后的 <markdown-custom-process>（name 可含 > / 换行；勿再转单行 :::container）
  */
 
-import type {
+import {
   MessageInfo,
   ProcessingInfo,
   ExecuteResultInfo,
-} from "@/types/interfaces/conversationInfo";
+} from "@/types/interfaces/conversationInfo.uts";
 import { ProcessingEnum } from "@/types/enums/common";
 import {
   AssistantRoleEnum,
@@ -19,58 +19,135 @@ import {
 } from "@/types/enums/agent";
 import type { McpAskInteraction } from "@/types/intervention"; // contract verification marker: revision
 import { createMcpAskInteractionFromToolInput, extractMcpAskStructuredInputFromResult } from "@/utils/mcpAskSchema.uts";
-import { resolveMcpAskResumeStatus } from "@/subpackages/utils/mcpAskResumeMessage.uts";
+import { resolveMcpAskResumeStatus } from "@/subpackages/utils/mcpAskResumeLite.uts";
+import {
+  firstString,
+  firstNullableString,
+  orArray,
+  orEmpty,
+  orNumber,
+  orObject,
+} from "@/utils/utsCoalesce.uts";
+import {
+  cloneMessageInfo,
+  createMessageInfoFromRaw,
+  messageToJsonObject,
+} from "@/subpackages/utils/messageInfoClass.uts";
+import {
+  listMarkdownCustomProcessTags,
+  toMarkdownCustomProcessHtml,
+} from "@/utils/markdownCustomProcess.uts";
+import {
+  coerceOpenUiHistoryComponentType,
+  liftOpenUiRefIntoResultData,
+  coerceOpenUiProcessTagType,
+  ensureOpenUiProcessTagsInBody,
+} from "@/subpackages/utils/historyOpenUi.uts";
+function patchMessageInfo(
+  message: MessageInfo,
+  field: string,
+  value: any,
+): MessageInfo {
+  const copy = messageToJsonObject(message);
+  copy[field] = value;
+  return createMessageInfoFromRaw(copy);
+}
+
+/**
+ * 组件执行结果（来自 API componentExecutedList[].result）
+ */
+export interface ComponentExecutedResult {
+  executeId: string;
+  id: number;
+  name: string;
+  type: string;
+  startTime: number;
+  endTime?: number;
+  success?: boolean;
+  data?: any;
+  input?: any;
+  kind?: string;
+}
 
 /**
  * 组件执行列表项接口（来自API返回）
  */
 export interface ComponentExecutedItem {
   name: string;
-  result: {
-    executeId: string;
-    id: number;
-    name: string;
-    type: string; // "Plan", "ToolCall", "Skill", "Workflow", "Page", etc.
-    startTime: number;
-    endTime?: number;
-    success?: boolean;
-    data?: any;
-    input?: any;
-  };
+  result: ComponentExecutedResult;
   status: string; // "FINISHED" | "FAILED" | "EXECUTING"
   targetId: number;
   type: string; // "Plan", "ToolCall", "Skill", "Workflow", "Page", etc.
 }
 
+function readComponentField(component: any, key: string): any | null {
+  if (component == null) {
+    return null;
+  }
+  // Android：UTSJSONObject[key] 可能为 null，禁止 as any（Kotlin Any 非空）
+  const val = (component as UTSJSONObject)[key];
+  if (val == null) {
+    return null;
+  }
+  return val;
+}
+
+function readNestedComponentField(
+  component: any,
+  nestedKey: string,
+  key: string,
+): any | null {
+  const nested = readComponentField(component, nestedKey);
+  if (nested == null) {
+    return null;
+  }
+  const val = (nested as UTSJSONObject)[key];
+  if (val == null) {
+    return null;
+  }
+  return val;
+}
+
 function getComponentInput(component: any): any {
-  const result = component?.result;
-  return (
-    extractMcpAskStructuredInputFromResult(result) ||
-    component?.input ||
-    result?.input
-  );
+  const result = readComponentField(component, "result");
+  const structuredInput = extractMcpAskStructuredInputFromResult(
+    result as any,
+  ) as any | null;
+  if (structuredInput != null) {
+    return structuredInput as any;
+  }
+  const componentInput = readComponentField(component, "input");
+  if (componentInput != null) {
+    return componentInput as any;
+  }
+  const resultInput = readComponentField(result, "input");
+  if (resultInput != null) {
+    return resultInput as any;
+  }
+  return {} as any;
 }
 
 function getComponentToolCallId(component: any): string {
-  const id =
-    component?.executeId ||
-    component?.result?.executeId ||
-    component?.toolCallId ||
-    component?.result?.toolCallId ||
-    component?.tool_call_id ||
-    component?.result?.tool_call_id;
-  return typeof id === "string" ? id : "";
+  return firstNullableString([
+    readComponentField(component, "executeId"),
+    readNestedComponentField(component, "result", "executeId"),
+    readComponentField(component, "toolCallId"),
+    readNestedComponentField(component, "result", "toolCallId"),
+    readComponentField(component, "tool_call_id"),
+    readNestedComponentField(component, "result", "tool_call_id"),
+  ]);
 }
 
 function isFailedComponent(component: any): boolean {
-  const status = String(
-    component?.status || component?.result?.status || "",
-  ).toLowerCase();
+  const status = firstNullableString([
+    readComponentField(component, "status"),
+    readNestedComponentField(component, "result", "status"),
+  ]).toLowerCase();
   return (
     status === "failed" ||
     status === "error" ||
-    component?.success === false ||
-    component?.result?.success === false
+    readComponentField(component, "success") === false ||
+    readNestedComponentField(component, "result", "success") === false
   );
 }
 
@@ -78,144 +155,154 @@ function getMcpAskKey(interaction: McpAskInteraction): string {
   return interaction.requestId;
 }
 
+function readMessageField(message: MessageInfo, key: string): any | null {
+  // 直读字段：入参恒为 MessageInfo（adaptHistoryMessage 即直读 role/messageType），
+  // 旧实现每读一个字段做一次 messageToJsonObject 整表往返，applyMcpAskResumeStatuses
+  // 的双重循环里是 O(n²) 次往返，大会话下为主要开销之一。
+  if (message == null) {
+    return null;
+  }
+  if (key == "id") return message.id;
+  if (key == "role") return message.role;
+  if (key == "type") return message.type;
+  if (key == "text") return message.text;
+  if (key == "think") return message.think;
+  if (key == "time") return message.time;
+  if (key == "attachments") return message.attachments;
+  if (key == "ext") return message.ext;
+  if (key == "finished") return message.finished;
+  if (key == "metadata") return message.metadata;
+  if (key == "messageType") return message.messageType;
+  if (key == "requestId") return message.requestId;
+  if (key == "index") return message.index;
+  if (key == "status") return message.status;
+  if (key == "finalResult") return message.finalResult;
+  if (key == "processingList") return message.processingList;
+  if (key == "markdownElList") return message.markdownElList;
+  if (key == "componentExecutedList") return message.componentExecutedList;
+  if (key == "mcpAskInteractions") return message.mcpAskInteractions;
+  if (key == "acpPermissionInteractions") return message.acpPermissionInteractions;
+  if (key == "speakableText") return message.speakableText;
+  // 未知键：保持旧行为（整表 JSON 往返）
+  const obj = messageToJsonObject(message);
+  // Android：缺失字段为 null，禁止 as any（null cannot be cast to non-null Any）
+  const val = obj[key];
+  if (val == null) {
+    return null;
+  }
+  return val;
+}
+
 export function hydrateMcpAskInteractionsFromExecutedComponents(
   message: MessageInfo,
 ): MessageInfo {
-  const componentExecutedList = (message as any).componentExecutedList as
-    | ComponentExecutedItem[]
-    | null;
-  if (
-    !componentExecutedList ||
-    !Array.isArray(componentExecutedList) ||
-    componentExecutedList.length === 0
-  ) {
+  const componentExecutedList = readMessageField(
+    message,
+    "componentExecutedList",
+  );
+  if (componentExecutedList == null || !Array.isArray(componentExecutedList)) {
     return message;
   }
 
-  const existing = message.mcpAskInteractions || [];
-  const existingKeys = new Set(
-    existing.map((item: McpAskInteraction): string => getMcpAskKey(item)),
+  const executedList = componentExecutedList as any[];
+  if (executedList.length === 0) {
+    return message;
+  }
+
+  const existing = orArray<McpAskInteraction>(
+    readMessageField(message, "mcpAskInteractions"),
   );
+  const existingKeys = new Set<string>();
+  for (let i = 0; i < existing.length; i++) {
+    existingKeys.add(getMcpAskKey(existing[i]));
+  }
   const hydrated: McpAskInteraction[] = [];
 
-  componentExecutedList.forEach((component: any) => {
-    if (isFailedComponent(component)) return;
+  for (let i = 0; i < executedList.length; i++) {
+    const component = executedList[i] as any;
+    if (isFailedComponent(component)) {
+      continue;
+    }
 
     const interaction = createMcpAskInteractionFromToolInput(
       getComponentInput(component),
       getComponentToolCallId(component),
     );
-    if (!interaction) return;
-
-    // 对齐 PC:component status(FINISHED/SUCCESS)只代表「问」完成,不代表用户已回答。
-    // hydrate 默认 pending(由 applyMcpAskResumeStatusesInMessageList 按 resume 消息判 submitted),
-    // 让历史最后一条 ASK_QUESTION 能恢复渲染 DockPanel 表单。
-    // (isCompletedComponent 不再置 submitted)
+    if (interaction == null) {
+      continue;
+    }
 
     const key = getMcpAskKey(interaction);
-    if (existingKeys.has(key)) return;
+    if (existingKeys.has(key)) {
+      continue;
+    }
 
     existingKeys.add(key);
     hydrated.push(interaction);
-  });
+  }
 
-  if (!hydrated.length) return message;
+  if (hydrated.length === 0) return message;
 
-  return {
-    ...message,
-    mcpAskInteractions: [...existing, ...hydrated],
-  };
+  const merged: McpAskInteraction[] = [];
+  for (let i = 0; i < existing.length; i++) {
+    merged.push(existing[i]);
+  }
+  for (let i = 0; i < hydrated.length; i++) {
+    merged.push(hydrated[i]);
+  }
+
+  return patchMessageInfo(message, "mcpAskInteractions", merged);
 }
 
 /**
  * 解析的自定义标签信息
  */
-interface ParsedCustomTag {
-  executeId: string;
-  type: string;
-  status: string;
-  name: string;
-  fullMatch: string; // 完整的匹配字符串，用于替换
+class ParsedCustomTag {
+  executeId: string = "";
+  type: string = "";
+  status: string = "";
+  name: string = "";
+  fullMatch: string = "";
 }
 
 /**
- * 解析PC端的markdown-custom-process HTML标签
+ * 解析PC端的markdown-custom-process HTML标签（引号感知，允许 name 含 > / 换行）
  * @param text 包含HTML标签的文本
  * @returns 解析出的标签信息数组
  */
 export function parseMarkdownCustomProcess(text: string): ParsedCustomTag[] {
-  if (!text) return [];
+  if (text.length === 0) return [];
 
   const results: ParsedCustomTag[] = [];
-
-  // 匹配 <div><markdown-custom-process ...></markdown-custom-process></div> 格式
-  // 以及 <markdown-custom-process ...></markdown-custom-process> 格式（无div包裹）
-  const regex =
-    /<div>[\s\n]*<markdown-custom-process([^>]*)><\/markdown-custom-process>[\s\n]*<\/div>|<markdown-custom-process([^>]*)><\/markdown-custom-process>/g;
-
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    const attrString = match[1] || match[2] || "";
-    const fullMatch = match[0];
-
-    // 解析属性
-    const executeId = extractAttribute(attrString, "executeId");
-    const type = extractAttribute(attrString, "type");
-    const status = extractAttribute(attrString, "status");
-    const name = extractAttribute(attrString, "name");
-
-    if (executeId) {
-      results.push({
-        executeId,
-        type: type || "",
-        status: status || "",
-        name: name || "",
-        fullMatch,
-      });
+  const tags = listMarkdownCustomProcessTags(text);
+  for (let i = 0; i < tags.length; i++) {
+    const hit = tags[i];
+    if (hit.executeId.length == 0) {
+      continue;
     }
+    const tag = new ParsedCustomTag();
+    tag.executeId = hit.executeId;
+    tag.type = orEmpty(hit.type);
+    tag.status = orEmpty(hit.status);
+    tag.name = orEmpty(hit.name);
+    tag.fullMatch = hit.fullMatch;
+    results.push(tag);
   }
 
   return results;
 }
 
 /**
- * 从属性字符串中提取指定属性的值
- * @param attrString 属性字符串，如 ' executeId="xxx" type="yyy"'
- * @param attrName 属性名
- * @returns 属性值
- */
-function extractAttribute(attrString: string, attrName: string): string {
-  let regex = new RegExp(`${attrName}="([^"]*)"`);
-  let match = attrString.match(regex);
-  if (match != null) {
-    return match[1].replace(/&quot;/g, '"');
-  }
-
-  regex = new RegExp(`${attrName}='([^']*)'`);
-  match = attrString.match(regex);
-  if (match != null) {
-    return match[1].replace(/&quot;/g, '"');
-  }
-
-  return "";
-}
-
-/**
- * 将PC端HTML标签转换为移动端Markdown容器语法
+ * 将PC端HTML标签规范化为当前渲染链路可识别的 HTML（非单行 :::container）
  * @param tag 解析的标签信息
- * @returns Markdown容器语法字符串
+ * @returns 规范化 HTML 标签
  */
 export function convertToMobileContainerSyntax(tag: ParsedCustomTag): string {
-  const attrs = [
-    `executeId="${tag.executeId}"`,
-    tag.type ? `type="${tag.type}"` : "",
-    tag.status ? `status="${tag.status}"` : "",
-    tag.name ? `name="${tag.name}"` : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-
-  return `\n\n:::container ${attrs}\n:::\n\n`;
+  return (
+    "\n\n" +
+    toMarkdownCustomProcessHtml(tag.executeId, tag.type, tag.status, tag.name) +
+    "\n\n"
+  );
 }
 
 /**
@@ -269,6 +356,18 @@ function parseComponentType(type: string): AgentComponentTypeEnum {
   }
 }
 
+function readResultField(result: any, key: string): any | null {
+  if (result == null) {
+    return null;
+  }
+  // Android：缺失字段为 null，禁止 as any（null cannot be cast to non-null Any）
+  const val = (result as UTSJSONObject)[key];
+  if (val == null) {
+    return null;
+  }
+  return val;
+}
+
 /**
  * 将componentExecutedList转换为processingList
  * @param componentExecutedList 组件执行列表
@@ -277,40 +376,79 @@ function parseComponentType(type: string): AgentComponentTypeEnum {
 export function convertComponentExecutedListToProcessingList(
   componentExecutedList: ComponentExecutedItem[] | null | undefined,
 ): ProcessingInfo[] {
-  if (!componentExecutedList || !Array.isArray(componentExecutedList)) {
+  if (componentExecutedList == null || !Array.isArray(componentExecutedList)) {
     return [];
   }
 
-  return componentExecutedList.map((item): ProcessingInfo => {
-    const result = item.result || {};
-    const status = parseStatus(item.status);
-    const componentType = parseComponentType(item.type);
-
-    // 构建ExecuteResultInfo
-    const executeResult: ExecuteResultInfo = {
-      kind: result?.kind || "",
-      id: result.id || -1,
+  const executedList = componentExecutedList as any[];
+  const processingList: ProcessingInfo[] = [];
+  for (let i = 0; i < executedList.length; i++) {
+    const item = executedList[i] as any;
+    const itemStatus = orEmpty(readComponentField(item, "status"));
+    const itemName = orEmpty(readComponentField(item, "name"));
+    const itemType = orEmpty(readComponentField(item, "type"));
+    const itemTargetId = readComponentField(item, "targetId");
+    const result = orObject(
+      readComponentField(item, "result"),
+      new UTSJSONObject() as any,
+    );
+    const status = parseStatus(itemStatus);
+    // RENDER_UI 历史项：Event → ToolCall（详见 historyOpenUi）
+    let componentType = coerceOpenUiHistoryComponentType(
+      itemName,
+      parseComponentType(itemType),
+    );
+    const resultSuccess = readResultField(result, "success");
+    // Android：禁止 typeof=== / as boolean；禁止 orObject(x, null)（UTSArray as Void 崩溃）
+    let successVal = itemStatus == "FINISHED";
+    if (resultSuccess == true) {
+      successVal = true;
+    } else if (resultSuccess == false) {
+      successVal = false;
+    }
+    const dataRaw = liftOpenUiRefIntoResultData(
+      itemName,
+      item,
+      result,
+      readResultField(result, "data"),
+    );
+    const inputRaw = readResultField(result, "input");
+    const executeResult = {
+      kind: orEmpty(readResultField(result, "kind")),
+      id: orNumber(readResultField(result, "id"), -1),
       icon: "",
-      name: result.name || item.name || "",
+      name: firstNullableString([
+        readResultField(result, "name"),
+        itemName,
+      ]),
       type: componentType,
-      success: result.success ?? item.status === "FINISHED",
+      success: successVal,
       error: "",
-      data: result.data || null,
-      startTime: result.startTime || 0,
-      endTime: result.endTime || 0,
-      input: result.input || null,
-    };
+      data: dataRaw,
+      startTime: orNumber(readResultField(result, "startTime"), 0),
+      endTime: orNumber(readResultField(result, "endTime"), 0),
+      input: inputRaw,
+    } as ExecuteResultInfo;
 
-    return {
-      executeId: result.executeId || "",
-      name: item.name || result.name || "",
+    const processingInfo = {
+      executeId: firstNullableString([
+        readResultField(result, "executeId"),
+        readComponentField(item, "executeId"),
+      ]),
+      name: firstNullableString([itemName, readResultField(result, "name")]),
       type: componentType,
       status: status,
-      targetId: item.targetId || result.id || -1,
+      targetId: orNumber(
+        itemTargetId,
+        orNumber(readResultField(result, "id"), -1),
+      ),
       result: executeResult,
-      cardBindConfig: null as any,
+      cardBindConfig: null,
     } as ProcessingInfo;
-  });
+    processingList.push(processingInfo);
+  }
+
+  return processingList;
 }
 
 /**
@@ -320,76 +458,104 @@ export function convertComponentExecutedListToProcessingList(
  * @returns 适配后的消息
  */
 export function adaptHistoryMessage(message: MessageInfo): MessageInfo {
-  if (!message) return message;
+  if (message == null) return message;
 
   // 只处理ASSISTANT消息，非ASSISTANT消息确保text有值后直接返回
   if (
     message.role !== AssistantRoleEnum.ASSISTANT &&
     message.messageType !== MessageTypeEnum.ASSISTANT
   ) {
-    // 确保 text 字段有值
-    if (message.text === undefined || message.text === null) {
-      return { ...message, text: "" };
+    // 确保 text 字段有值；始终返回 class 克隆，避免 Android 强转失败
+    if (readMessageField(message, "text") == null) {
+      return patchMessageInfo(message, "text", "");
     }
-    return message;
+    return cloneMessageInfo(message);
   }
 
-  let adaptedText = message.text || "";
-  let processingList = message.processingList || [];
+  let adaptedText = orEmpty(readMessageField(message, "text"));
+  let processingList = orArray<ProcessingInfo>(
+    readMessageField(message, "processingList"),
+  );
 
   // 1. 从componentExecutedList转换processingList
-  const componentExecutedList = (message as any).componentExecutedList as
-    | ComponentExecutedItem[]
-    | null;
-  if (componentExecutedList && componentExecutedList.length > 0) {
-    const convertedProcessingList =
-      convertComponentExecutedListToProcessingList(componentExecutedList);
-    // 合并已有的processingList（如果有的话）
-    processingList = [...processingList, ...convertedProcessingList];
+  const componentExecutedListRaw = readMessageField(
+    message,
+    "componentExecutedList",
+  );
+  if (
+    componentExecutedListRaw != null &&
+    Array.isArray(componentExecutedListRaw) &&
+    (componentExecutedListRaw as any[]).length > 0
+  ) {
+    const convertedProcessingList = convertComponentExecutedListToProcessingList(
+      componentExecutedListRaw as any[],
+    );
+    const mergedProcessingList: ProcessingInfo[] = [];
+    for (let i = 0; i < processingList.length; i++) {
+      mergedProcessingList.push(processingList[i]);
+    }
+    for (let i = 0; i < convertedProcessingList.length; i++) {
+      mergedProcessingList.push(convertedProcessingList[i]);
+    }
+    processingList = mergedProcessingList;
   }
 
   // 2. 解析并转换PC端HTML标签为移动端Markdown容器语法
   const parsedTags = parseMarkdownCustomProcess(adaptedText);
 
-  for (const tag of parsedTags) {
+  for (let tagIndex = 0; tagIndex < parsedTags.length; tagIndex++) {
+    const tag = parsedTags[tagIndex];
+    coerceOpenUiProcessTagType(tag);
     const containerSyntax = convertToMobileContainerSyntax(tag);
-    // 替换HTML标签为Markdown容器语法
-    adaptedText = adaptedText.replace(tag.fullMatch, containerSyntax);
+    // name 常含 shell 文本（$' / $& / $`），String.replace 会把替换串里的 $ 模式
+    // 展开（$' = 匹配后全文），大文本 + 多标签时指数膨胀直至 Invalid string length。
+    // 用 indexOf+substring 按字面量拼接，行为与 replace(str,str) 一致（仅首个、未命中跳过）。
+    const matchIdx = adaptedText.indexOf(tag.fullMatch);
+    if (matchIdx >= 0) {
+      adaptedText =
+        adaptedText.substring(0, matchIdx) +
+        containerSyntax +
+        adaptedText.substring(matchIdx + tag.fullMatch.length);
+    }
   }
+
+  // 2.1 历史缺过程标签时补插 OpenUI（详见 historyOpenUi）
+  adaptedText = ensureOpenUiProcessTagsInBody(adaptedText, processingList);
 
   // 3. 清理多余的空行（超过2个连续换行符的情况）
   adaptedText = adaptedText.replace(/\n{3,}/g, "\n\n");
 
-  // 转换自定义 agent-info 和 agent 标签为加粗 Markdown 格式，以兼容移动端 mp-html 渲染
+  // 转换自定义 agent-info 和 agent 标签（ai-msg 原生渲染，此处保留原文）
   adaptedText = adaptAgentInfoTags(adaptedText);
 
-  const adaptedMessage = {
-    ...message,
-    text: adaptedText || "", // 确保 text 始终有值
-    processingList,
-  };
+  const adaptedObj = messageToJsonObject(message);
+  adaptedObj["text"] = orEmpty(adaptedText);
+  adaptedObj["processingList"] = processingList;
 
-  return hydrateMcpAskInteractionsFromExecutedComponents(adaptedMessage);
+  return hydrateMcpAskInteractionsFromExecutedComponents(
+    createMessageInfoFromRaw(adaptedObj),
+  );
 }
 
 export function applyMcpAskResumeStatusesInMessageList(
   messageList: MessageInfo[],
 ): MessageInfo[] {
-  if (!messageList || !Array.isArray(messageList)) return [];
+  if (messageList == null || !Array.isArray(messageList)) return [];
 
   return messageList.map(
     (message: MessageInfo, messageIndex: number): MessageInfo => {
-      if (
-        !message.mcpAskInteractions ||
-        message.mcpAskInteractions.length === 0
-      ) {
+      const mcpAskInteractions = orArray<McpAskInteraction>(
+        readMessageField(message, "mcpAskInteractions"),
+      );
+      if (mcpAskInteractions.length === 0) {
         return message;
       }
 
-      const updatedInteractions = message.mcpAskInteractions.map(
+      const updatedInteractions = mcpAskInteractions.map(
         (interaction: McpAskInteraction): McpAskInteraction => {
           if (
-            interaction.responseStatus &&
+            interaction.responseStatus != null &&
+            interaction.responseStatus.length > 0 &&
             interaction.responseStatus !== "pending"
           ) {
             return interaction;
@@ -398,14 +564,15 @@ export function applyMcpAskResumeStatusesInMessageList(
           for (let i = messageIndex + 1; i < messageList.length; i += 1) {
             const candidate = messageList[i];
             const status = resolveMcpAskResumeStatus(
-              candidate.text,
+              orEmpty(readMessageField(candidate, "text")),
               interaction,
             );
-            if (status) {
-              return {
-                ...interaction,
-                responseStatus: status,
-              };
+            if (status != null && status.length > 0) {
+              const nextInteraction = JSON.parse(
+                JSON.stringify(interaction),
+              ) as UTSJSONObject;
+              nextInteraction["responseStatus"] = status;
+              return nextInteraction as McpAskInteraction;
             }
           }
 
@@ -413,10 +580,11 @@ export function applyMcpAskResumeStatusesInMessageList(
         },
       );
 
-      return {
-        ...message,
-        mcpAskInteractions: updatedInteractions,
-      };
+      return patchMessageInfo(
+        message,
+        "mcpAskInteractions",
+        updatedInteractions,
+      );
     },
   );
 }
@@ -429,7 +597,7 @@ export function applyMcpAskResumeStatusesInMessageList(
 export function adaptHistoryMessageList(
   messageList: MessageInfo[],
 ): MessageInfo[] {
-  if (!messageList || !Array.isArray(messageList)) {
+  if (messageList == null || !Array.isArray(messageList)) {
     return [];
   }
 
@@ -439,27 +607,9 @@ export function adaptHistoryMessageList(
 }
 
 /**
- * 转换自定义 agent-info 和 agent 标签为移动端 mp-html 可渲染结构
+ * 转换自定义 agent-info / agent 标签。
+ * 移动端已改为 ai-msg 原生解析渲染，此处保留标签原文，避免再转成 mp-html HTML。
  */
 export function adaptAgentInfoTags(text: string): string {
-  if (!text) return "";
-
-  const regex =
-    /<agent-info([^>]*?)\/?>|<agent-info([^>]*?)><\/agent-info>|<agent([^>]*?)\/?>|<agent([^>]*?)><\/agent>/g;
-
-  return text.replace(regex, (match, p1, p2, p3, p4) => {
-    const attrString = p1 || p2 || p3 || p4 || "";
-    const name = extractAttribute(attrString, "name") || "";
-    const icon = extractAttribute(attrString, "icon") || "";
-    const hasIcon =
-      icon &&
-      icon !== "null" &&
-      icon !== "undefined" &&
-      icon.trim() !== "";
-    const imgHtml = hasIcon
-      ? `<img class="agent-info-icon" style="width: 36rpx; height: 36rpx; border-radius: 50%; margin-right: 12rpx; display: inline-block; vertical-align: middle; object-fit: cover;" src="${icon}" />`
-      : "";
-
-    return `<div class="agent-info-container" style="display: block; text-align: left; margin: 12rpx 0; line-height: 1;">${imgHtml}<span class="agent-info-name" style="font-size: 26rpx; color: rgba(0, 0, 0, 0.45); font-weight: 500; display: inline-block; vertical-align: middle; line-height: 36rpx; height: 36rpx;">${name}</span></div>`;
-  });
+  return text;
 }

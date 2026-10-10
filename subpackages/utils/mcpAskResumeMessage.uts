@@ -17,6 +17,47 @@ import type {
 } from "@/types/intervention";
 import { t } from "@/utils/i18n.uts";
 import { parseInteractionFields } from "@/utils/mcpAskSchema.uts";
+import {
+  firstString,
+  orArray,
+  orEmpty,
+  orString,
+} from "@/utils/utsCoalesce.uts";
+
+/** 文件字段展示用的附件对象结构 */
+interface McpAskFileDisplayItem {
+  name?: string;
+  fileName?: string;
+  fileUrl?: string;
+  url?: string;
+}
+
+/** 同 title 多次询问时的 ask 序信息 */
+interface McpAskAskOrdinalEntry {
+  ordinal: number;
+  sequence: number;
+  requestId: string;
+  resolved: boolean;
+}
+
+/** 同 title 多次询问时的 resume 序信息 */
+interface McpAskResumeOrdinalEntry {
+  ordinal: number;
+  sequence: number;
+}
+
+function compareByOrdinalThenSequence(
+  leftOrdinal: number,
+  leftSequence: number,
+  rightOrdinal: number,
+  rightSequence: number,
+): number {
+  const ordinalDiff = leftOrdinal - rightOrdinal;
+  if (ordinalDiff !== 0) {
+    return ordinalDiff;
+  }
+  return leftSequence - rightSequence;
+}
 
 /** resume 消息 JSON 块中的 requestId 键（历史 fenced JSON 格式，仍识别） */
 export const MCP_ASK_REQUEST_ID_MARKER_KEY = "nuwaxMcpAskRequestId";
@@ -30,12 +71,13 @@ const MCP_ASK_REQUEST_ID_HTML_COMMENT_RE =
 
 export interface McpAskResumeMatchOptions {
   containingMessageIndex?: number;
+  legacyTitleMatch?: boolean;
 }
 
 export function sortMessagesByConversationIndex(
   messages: MessageInfo[],
 ): MessageInfo[] {
-  return [...(messages || [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  return [...orArray<MessageInfo>(messages)].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 }
 
 function readMessageOrdinal(message: MessageInfo, fallback = 0): number {
@@ -52,7 +94,7 @@ export function buildMcpAskRequestIdMarker(requestId: string): string {
 export function stripMcpAskResumeDisplayArtifacts(
   text: string | undefined,
 ): string {
-  if (!text) {
+  if (text == null || text.length === 0) {
     return "";
   }
   return text
@@ -64,9 +106,9 @@ export function stripMcpAskResumeDisplayArtifacts(
 function extractFileNameFromUrl(url: string, fallback: string): string {
   try {
     const pathname = new URL(url).pathname;
-    return pathname.split("/").filter(Boolean).pop() || fallback;
+    return orString(pathname.split("/").filter(Boolean).pop(), fallback);
   } catch {
-    return url.split("/").filter(Boolean).pop() || fallback;
+    return orString(url.split("/").filter(Boolean).pop(), fallback);
   }
 }
 
@@ -81,7 +123,7 @@ export function textContainsMcpAskRequestIdMarker(
   text: string | undefined,
   requestId: string,
 ): boolean {
-  if (!text || !requestId) {
+  if (text == null || text.length === 0 || requestId.length === 0) {
     return false;
   }
   if (text.includes(`<!--${MCP_ASK_REQUEST_ID_HTML_PREFIX}${requestId}-->`)) {
@@ -113,19 +155,15 @@ function formatFileFieldDisplayValue(value: unknown): string {
         : item;
     }
     if (typeof item === "object" && item !== null) {
-      const file = item as {
-        name?: string;
-        fileName?: string;
-        fileUrl?: string;
-        url?: string;
-      };
-      return (
-        file.name ||
-        file.fileName ||
-        (file.url || file.fileUrl
-          ? extractFileNameFromUrl(file.url || file.fileUrl || "", unknownFile)
-          : unknownFile)
-      );
+      const file = item as McpAskFileDisplayItem;
+      const fileUrl = firstString([file.url, file.fileUrl]);
+      return firstString([
+        file.name,
+        file.fileName,
+        fileUrl.length > 0
+          ? extractFileNameFromUrl(fileUrl, unknownFile)
+          : "",
+      ], unknownFile);
     }
     return String(item);
   };
@@ -178,7 +216,12 @@ function stringifyDisplayValue(value: unknown): string {
   }
   if (typeof value === "object") {
     const obj = value as any;
-    if (obj.name || obj.fileName || obj.fileUrl || obj.url) {
+    const hasFileField =
+      (obj.name != null && String(obj.name).length > 0) ||
+      (obj.fileName != null && String(obj.fileName).length > 0) ||
+      (obj.fileUrl != null && String(obj.fileUrl).length > 0) ||
+      (obj.url != null && String(obj.url).length > 0);
+    if (hasFileField) {
       return formatFileFieldDisplayValue(value);
     }
     const entries = Object.entries(value as Record<string, unknown>);
@@ -205,30 +248,29 @@ function formatFieldValue(
 ): string {
   const labelByValue = new Map<string, string>();
   enumValues.forEach((item: string, index: number) => {
-    labelByValue.set(item, enumLabels[index] || item);
+    labelByValue.set(item, orString(enumLabels[index], item));
   });
 
   if (Array.isArray(value)) {
     return stringifyDisplayValue(
       value.map((item: unknown): unknown => {
-        if (typeof item === "string") return labelByValue.get(item) || item;
+        if (typeof item === "string") return orString(labelByValue.get(item), item);
         return item;
       }),
     );
   }
 
   if (typeof value === "string") {
-    return labelByValue.get(value) || value;
+    return orString(labelByValue.get(value), value);
   }
 
   return stringifyDisplayValue(value);
 }
 
 function getMcpAskResumeTitle(interaction: McpAskInteraction): string {
-  return (
-    interaction.title ||
-    interaction.ui?.title ||
-    t("Mobile.Intervention.McpAsk.defaultTitle")
+  return firstString(
+    [interaction.title, interaction.ui?.title],
+    t("Mobile.Intervention.McpAsk.defaultTitle"),
   );
 }
 
@@ -266,7 +308,7 @@ function messageMatchesAnyResumeSignature(
   text: string | undefined,
   title: string,
 ): boolean {
-  if (!text?.trim()) {
+  if (text == null || text.trim().length === 0) {
     return false;
   }
   const actions = ["submit", "cancel", "skip", "timeout"];
@@ -280,18 +322,8 @@ function messageMatchesAnyResumeSignature(
 function collectSameTitleAskOrdinals(
   sortedMessages: MessageInfo[],
   title: string,
-): Array<{
-  ordinal: number;
-  sequence: number;
-  requestId: string;
-  resolved: boolean;
-}> {
-  const entries: Array<{
-    ordinal: number;
-    sequence: number;
-    requestId: string;
-    resolved: boolean;
-  }> = [];
+): McpAskAskOrdinalEntry[] {
+  const entries: McpAskAskOrdinalEntry[] = [];
   let sequence = 0;
 
   sortedMessages.forEach((message: MessageInfo, messageIndex: number) => {
@@ -311,17 +343,21 @@ function collectSameTitleAskOrdinals(
     });
   });
 
-  return entries.sort(
-    (left, right): number =>
-      left.ordinal - right.ordinal || left.sequence - right.sequence,
+  return entries.sort((left, right): number =>
+    compareByOrdinalThenSequence(
+      left.ordinal,
+      left.sequence,
+      right.ordinal,
+      right.sequence,
+    ),
   );
 }
 
 function collectSameTitleResumeOrdinals(
   sortedMessages: MessageInfo[],
   title: string,
-): Array<{ ordinal: number; sequence: number }> {
-  const entries: Array<{ ordinal: number; sequence: number }> = [];
+): McpAskResumeOrdinalEntry[] {
+  const entries: McpAskResumeOrdinalEntry[] = [];
 
   sortedMessages.forEach((message: MessageInfo, messageIndex: number) => {
     if (message.role !== undefined && message.role !== AssistantRoleEnum.USER) {
@@ -329,7 +365,8 @@ function collectSameTitleResumeOrdinals(
     }
     const text = message.text;
     if (
-      !text ||
+      text == null ||
+      text.length === 0 ||
       messageHasForeignRequestIdMarker(text) ||
       !messageMatchesAnyResumeSignature(text, title)
     ) {
@@ -341,9 +378,13 @@ function collectSameTitleResumeOrdinals(
     });
   });
 
-  return entries.sort(
-    (left, right): number =>
-      left.ordinal - right.ordinal || left.sequence - right.sequence,
+  return entries.sort((left, right): number =>
+    compareByOrdinalThenSequence(
+      left.ordinal,
+      left.sequence,
+      right.ordinal,
+      right.sequence,
+    ),
   );
 }
 
@@ -361,7 +402,7 @@ function hasOrdinalPairedResumeMessage(
   const targetAsk = asks.find(
     (entry): boolean => entry.requestId === interaction.requestId,
   );
-  if (!targetAsk) {
+  if (targetAsk == null) {
     return false;
   }
 
@@ -468,7 +509,7 @@ export function buildMcpAskResumeMessage(
     const header = t("Mobile.Intervention.McpAsk.resumeSubmitted", {
       "0": title,
     });
-    if (!formData || Object.keys(formData).length === 0) {
+    if (formData == null || Object.keys(formData).length === 0) {
       message = `${header}\n\n${t("Mobile.Intervention.McpAsk.emptyFormContent")}`;
     } else {
       const lines: string[] = [];
@@ -479,9 +520,12 @@ export function buildMcpAskResumeMessage(
       fields.forEach((field) => {
         if (Object.prototype.hasOwnProperty.call(formData, field.name)) {
           consumedKeys.add(field.name);
-          const label = field.property.title || field.name;
-          const otherValue = field.options.otherValue || "__custom__";
-          const otherField = field.options.otherField || `${field.name}Custom`;
+          const label = firstString([field.property.title, field.name]);
+          const otherValue = orString(field.options.otherValue, "__custom__");
+          const otherField = orString(
+            field.options.otherField,
+            `${field.name}Custom`,
+          );
           if (
             field.widget === "radio-with-custom" &&
             formData[field.name] === otherValue &&
@@ -524,9 +568,9 @@ export function buildMcpAskResumeMessage(
 export function isMcpAskResumeMessageForInteraction(
   text: string | undefined,
   interaction: McpAskInteraction,
-  options?: { legacyTitleMatch?: boolean },
+  options?: McpAskResumeMatchOptions,
 ): boolean {
-  if (!text) return false;
+  if (text == null || text.length === 0) return false;
 
   if (textContainsMcpAskRequestIdMarker(text, interaction.requestId)) {
     return true;
@@ -543,7 +587,7 @@ export function resolveMcpAskResumeStatus(
   text: string | undefined,
   interaction: McpAskInteraction,
 ): "submitted" | "cancelled" | "skipped" | "timeout" | null {
-  if (!text) return null;
+  if (text == null || text.length === 0) return null;
   const title = getMcpAskResumeTitle(interaction);
 
   if (

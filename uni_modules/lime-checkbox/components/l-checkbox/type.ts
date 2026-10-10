@@ -28,7 +28,7 @@ export type CheckboxProps = {
 	 * 只读
 	 */
 	readonly : boolean;
-	size : 'small' | 'medium' | 'large'
+	size ?: 'small' | 'medium' | 'large'
 	/**
 	 * 标识符，通常为一个唯一的字符串或数字
 	 */
@@ -41,7 +41,7 @@ export type CheckboxProps = {
 	 * 多选框的值
 	 */
 	value?: any; // string | number 
-	icon: 'circle' | 'line' | 'rectangle' | 'dot';
+	icon ?: 'circle' | 'line' | 'rectangle' | 'dot';
 	
 	fontSize?: string;
 	iconSize?: string;

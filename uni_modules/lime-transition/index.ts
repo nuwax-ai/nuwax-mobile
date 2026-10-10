@@ -21,6 +21,7 @@ export type UseTransitionOptions = {
 	emits ?: (name : TransitionEmitStatus) => void,
 	onNextTick ?: (name : TransitionEmitStatus) => Promise<void>,
 	duration ?: number
+	removeClasses?: boolean;
 }
 
 type ClassNameMap = Map<string, string>;
@@ -56,6 +57,7 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 	let isTransitionEnd = false;
 	let isTransitioning = false;
 	let timeoutId = -1
+	let finishTimeoutId = -1
 
 	const emitEvent = (event : TransitionEmitStatus) => {
 		options.emits?.(event);
@@ -65,7 +67,14 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 	const finished = () => {
 		if (isTransitionEnd) return;
 		isTransitionEnd = true;
+		
+		clearTimeout(finishTimeoutId)
+		
+		if (options.removeClasses ?? false) {
+		    classes.value = '';
+		}
 		emitEvent(`after-${status}`)
+		
 		if (display.value && !state.value) {
 			display.value = false
 		}
@@ -75,7 +84,7 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 		return new Promise((resolve) => {
 			nextTick(() => {
 				raf(() => {
-					// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+					// #ifdef UNI-APP-X && APP
 					if (options.element?.value != null) {
 						options.element?.value?.getBoundingClientRectAsync()?.then(res => {
 							resolve()
@@ -84,7 +93,7 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 						resolve()
 					}
 					// #endif
-					// #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
+					// #ifndef UNI-APP-X && APP
 					resolve()
 					// #endif
 				})
@@ -114,17 +123,25 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 			const currentStatus = transitionQueue.value.shift()!;
 			status = currentStatus;
 			emitEvent(`before-${eventName}`);
-
+			
+			// IOS hbx4.76如果时间过短会卡住
 			await sleep();
 			await sleep();
+			await sleep();
+			await sleep();
+			await sleep();
+			
 			if (status != currentStatus) continue;
 
 			const classNames = getClassNames(name.value);
 			inited.value = true;
 			display.value = true;
+			// const executeBeforeTick = options.onNextTick?.(`before-${eventName}`);
+			// if (executeBeforeTick != null) {
+			// 	await executeBeforeTick;
+			// }
 			classes.value = classNames.get(eventName)!;
 			emitEvent(eventName);
-
 			const executeAfterTick = options.onNextTick?.(eventName);
 			if (executeAfterTick != null) {
 				await executeAfterTick;
@@ -167,9 +184,12 @@ export function useTransition(options : UseTransitionOptions) : UseTransitionRet
 	}
 
 	let init = false;
+	let lastState:boolean|null = null
 	watchEffect(() => {
 		if (options.visible == null) return
 		state.value = options.visible!();
+		if(lastState == state.value) return
+		lastState = state.value
 		if (!appear && !init) {
 			init = true
 			return

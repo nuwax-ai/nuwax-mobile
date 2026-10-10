@@ -1,0 +1,98 @@
+<template>
+	<view class="demo-block">
+		<text class="demo-block__title-text ultra">遮罩层</text>
+		<text class="demo-block__desc-text">通过遮罩层，可以强调部分内容</text>	
+		<view class="demo-block__body">
+			<view class="demo-block">
+				<text class="demo-block__title-text">基础使用</text>
+				<view class="demo-block__body">
+					<button @click="onClick">显示</button>
+					<l-overlay :visible="show" @click="onClick"></l-overlay>
+				</view>	
+			</view>	
+			<view class="demo-block">
+				<text class="demo-block__title-text">嵌入内容</text>
+				<view class="demo-block__body">
+					<button @click="show2 = true">显示</button>
+					<l-overlay :visible="show2" @click="show2 = !show2">
+						<view class="wrapper">
+						    <view class="block" />
+						</view>
+					</l-overlay>
+				</view>	
+			</view>	
+		</view>	
+	</view>
+</template>
+<script>
+	export default {
+		data() {
+			return {
+				show: false,
+				show2: false,
+			}
+		},
+		methods:{
+			onClick(){
+				this.show = !this.show
+				console.log(`show`, this.show)
+			}
+		}
+	}
+</script>
+<style lang="scss">
+	.wrapper {
+	    display: flex;
+	    align-items: center;
+	    justify-content: center;
+	    height: 100%;
+	  }
+	
+	  .block {
+	    width: 120px;
+	    height: 120px;
+	    background-color: #fff;
+	  }
+	  
+	.demo-block {
+		margin: 32px 20px 0;
+		overflow: visible;
+		&__title {
+			margin: 0;
+			margin-top: 8px;
+			&-text {
+				color: rgba(0, 0, 0, 0.6);
+				font-weight: 400;
+				font-size: 14px;
+				line-height: 16px;
+				
+				&.large {
+					color: rgba(0, 0, 0, 0.9);
+					font-size: 18px;
+					font-weight: 700;
+					line-height: 26px;
+				}
+				&.ultra {
+					color: rgba(0, 0, 0, 0.9);
+					font-size: 24px;
+					font-weight: 700;
+					line-height: 32px;
+				}
+			}
+		}
+		&__desc-text {
+			color: rgba(0, 0, 0, 0.6);
+			margin: 8px 16px 0 0;
+			font-size: 14px;
+			line-height: 22px;
+		}
+		&__body {
+			margin: 16px 0;
+			overflow: visible;
+			.demo-block {
+				// margin-top: 0px;
+				margin: 0;
+			}
+		}
+	}
+</style>

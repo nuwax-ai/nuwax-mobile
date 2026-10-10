@@ -1,0 +1,386 @@
+<template>
+  <view :class="['emoji-bind', disabled ? 'config-disabled' : '']">
+    <view class="field-label">{{ t("Mobile.Terminal.eventEmojiBind") }}</view>
+    <view class="card-group">
+      <view v-if="loading" class="row-item">
+        <text class="row-title">{{ t("Mobile.Terminal.loading") }}</text>
+      </view>
+      <view v-else-if="eventList.length == 0" class="row-item">
+        <text class="row-title row-title-muted">—</text>
+      </view>
+      <view
+        v-else
+        v-for="item in eventList"
+        :key="`${item.event}:${item.emotion}:${item.customized ? '1' : '0'}`"
+        class="row-item"
+        hover-class="row-item-active"
+        @tap="handlePick(item)"
+      >
+        <image v-if="item.emotionUrl != ''" class="row-emoji-image" :src="item.emotionUrl" mode="aspectFit" />
+        <text v-else class="row-emoji">{{ emotionEmoji(item.emotion) }}</text>
+        <view class="row-info">
+          <text class="row-title">{{ item.eventLabel }}</text>
+          <text v-if="!item.customized" class="row-default">{{ t("Mobile.Terminal.eventEmojiDefault") }}</text>
+        </view>
+        <text class="bind-current">{{ item.emotionLabel }}</text>
+        <text class="row-arrow">›</text>
+      </view>
+    </view>
+
+    <radio-list-drawer
+      :visible="emotionPickerVisible"
+      :title="t('Mobile.Terminal.eventEmojiBind')"
+      :list="emotionRadioOptions"
+      :image-url-list="emotionRadioImageUrls"
+      :current-value="emotionPickerCurrentValue"
+      max-height="70%"
+      @onClose="closeEmotionPicker"
+      @onChange="handleEmotionChange"
+    />
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, computed, onMounted } from "vue";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiVoxGetEventEmotions, apiVoxGetEmotionOptions, apiVoxUpdateEventEmotion } from "@/servers/vox/voxDevice";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/common";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import RadioListDrawer from "@/components/radio-list-drawer/radio-list-drawer.uvue";
+  import { RadioListItem } from "@/types/interfaces/radio";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 表情 wire → emoji，仅在接口未返回 emotionUrl 时兜底。 */
+  const emotionEmoji = (wire: string): string => {
+    // wire 值对齐后端 GET /api/app/devices/emotions (listEmotions) 返回的 emotion 字段
+    if (wire == "neutral") return "😐";
+    if (wire == "happy") return "😊";
+    if (wire == "surprised") return "😲";
+    if (wire == "wink") return "😉";
+    if (wire == "tongue") return "😛";
+    if (wire == "thinking") return "🤔";
+    if (wire == "focused") return "🎯";
+    if (wire == "pensive") return "🧐";
+    if (wire == "analyzing") return "🔍";
+    // processing：用沙漏表示「处理中」，避免齿轮 emoji 在部分机型上渲染异常
+    if (wire == "processing") return "⏳";
+    if (wire == "received") return "📥";
+    if (wire == "what") return "❓";
+    if (wire == "understood") return "👌";
+    if (wire == "awesome") return "🤩";
+    if (wire == "like") return "👍";
+    if (wire == "sad") return "😢";
+    if (wire == "lost") return "😵";
+    if (wire == "angry") return "😠";
+    if (wire == "shy") return "😳";
+    if (wire == "tired") return "😴";
+    return "✨";
+  };
+
+  const props = withDefaults(defineProps<{
+    deviceId: string;
+    disabled: boolean;
+  }>(), {
+    deviceId: "",
+    disabled: false,
+  });
+
+  // 按需隐藏的事件（按后端下发的 eventLabel 匹配）。默认不隐藏：后端 GET /event-emotions
+  // 返回的就是全部可绑定事件，逐一隐藏会让列表为空、回退到 FALLBACK_EVENTS（占位事件），
+  // 再用不存在的 event 调 update 会被 INVALID_UI_EVENT 拒。需要隐藏某条再按需加回。
+  const HIDDEN_EVENTS: string[] = [];
+  const isHidden = (label: string): boolean => {
+    for (let i = 0; i < HIDDEN_EVENTS.length; i++) {
+      if (HIDDEN_EVENTS[i] == label) return true;
+    }
+    return false;
+  };
+
+  class EventEmotionRow {
+    event: string = "";
+    eventLabel: string = "";
+    emotion: string = "";
+    emotionLabel: string = "";
+    emotionUrl: string = "";
+    defaultEmotion: string = "";
+    customized: boolean = false;
+    constructor(event: string, eventLabel: string, emotion: string, emotionLabel: string, emotionUrl: string, defaultEmotion: string, customized: boolean) {
+      this.event = event;
+      this.eventLabel = eventLabel;
+      this.emotion = emotion;
+      this.emotionLabel = emotionLabel;
+      this.emotionUrl = emotionUrl;
+      this.defaultEmotion = defaultEmotion;
+      this.customized = customized;
+    }
+  }
+
+  class EmotionOption {
+    emotion: string = "";
+    label: string = "";
+    url: string = "";
+    constructor(emotion: string, label: string, url: string) {
+      this.emotion = emotion;
+      this.label = label;
+      this.url = url;
+    }
+  }
+
+  const eventList = ref<EventEmotionRow[]>([]);
+  const emotionOptions = ref<EmotionOption[]>([]);
+  const loading = ref<boolean>(true);
+  const emotionPickerVisible = ref<boolean>(false);
+  const selectedEvent = ref<EventEmotionRow | null>(null);
+  const EMOTION_DEFAULT_VALUE = "__default_event_emotion__";
+
+  // 兜底静态数据：后端 /event-emotions 返回空或请求失败时，回退到「保留的 7 个事件」，
+  // 保证列表不为空（事件 wire 取自设备端约定，与后端一致即生效；不一致时仅展示，更新会被后端拒）。
+  // 兜底事件列表：与后端 GET /event-emotions 返回的 6 个可绑定事件一致（含默认 emotion）。
+  // 仅在接口失败/空时用；这些 event 值后端认，调 update 不会被 INVALID_UI_EVENT 拒。
+  const FALLBACK_EVENTS: EventEmotionRow[] = [
+    new EventEmotionRow("tool_call_start", "工具调用开始", "processing", "处理中", "", "processing", false),
+    new EventEmotionRow("tool_call_end", "工具调用结束", "understood", "明白、好的", "", "understood", false),
+    new EventEmotionRow("tool_call_error", "工具调用错误", "sad", "抱歉、难过、出错", "", "sad", false),
+    new EventEmotionRow("deep_thinking", "深度思考", "thinking", "思考", "", "thinking", false),
+    new EventEmotionRow("conversation_start", "对话开始", "happy", "开心、微笑", "", "happy", false),
+    new EventEmotionRow("task_complete", "任务完成", "awesome", "太棒了", "", "awesome", false),
+  ];
+  // 兜底静态表情池：与 GET /api/app/devices/emotions (listEmotions) 返回一致
+  const FALLBACK_EMOTIONS: EmotionOption[] = [
+    new EmotionOption("neutral", "正常、默认", ""),
+    new EmotionOption("happy", "开心、微笑", ""),
+    new EmotionOption("surprised", "惊讶", ""),
+    new EmotionOption("wink", "眨眼", ""),
+    new EmotionOption("tongue", "吐舌", ""),
+    new EmotionOption("thinking", "思考", ""),
+    new EmotionOption("focused", "专注", ""),
+    new EmotionOption("pensive", "沉思", ""),
+    new EmotionOption("analyzing", "分析中", ""),
+    new EmotionOption("processing", "处理中", ""),
+    new EmotionOption("received", "已收到", ""),
+    new EmotionOption("what", "疑惑、不理解", ""),
+    new EmotionOption("understood", "明白、好的", ""),
+    new EmotionOption("awesome", "太棒了", ""),
+    new EmotionOption("like", "喜欢", ""),
+    new EmotionOption("sad", "抱歉、难过、出错", ""),
+    new EmotionOption("lost", "迷茫", ""),
+    new EmotionOption("angry", "生气", ""),
+    new EmotionOption("shy", "害羞", ""),
+    new EmotionOption("tired", "疲惫", ""),
+  ];
+
+  const strVal = (obj: UTSJSONObject, key: string): string => {
+    const v = obj[key];
+    return v != null ? `${v}` : "";
+  };
+
+  const fetchEventEmotions = async () => {
+    if (props.deviceId == "") {
+      console.warn("[EventEmoji] deviceId 为空，跳过拉取（请检查父页是否传入 :deviceId），启用兜底");
+      eventList.value = FALLBACK_EVENTS;
+      loading.value = false;
+      return;
+    }
+    try {
+      const res = await apiVoxGetEventEmotions(props.deviceId);
+      const code = apiResCode(res);
+      console.log(`[EventEmoji] GET /event-emotions deviceId=${props.deviceId} code=${code}`);
+      if (code == SUCCESS_CODE) {
+        const raw = apiResData<any>(res);
+        const arr = raw != null ? (raw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        const labels: string[] = [];
+        const rows: EventEmotionRow[] = [];
+        for (let i = 0; i < arr.length; i++) {
+          const eventLabel = strVal(arr[i], "eventLabel");
+          labels.push(eventLabel);
+          if (isHidden(eventLabel)) continue;
+          const cVal = arr[i]["customized"];
+          rows.push(new EventEmotionRow(
+            strVal(arr[i], "event"),
+            eventLabel,
+            strVal(arr[i], "emotion"),
+            strVal(arr[i], "emotionLabel"),
+            strVal(arr[i], "emotionUrl"),
+            strVal(arr[i], "defaultEmotion"),
+            cVal != null ? (cVal as boolean) : false,
+          ));
+        }
+        console.log(`[EventEmoji] 后端返回 ${arr.length} 条，eventLabel=[${labels.join(",")}]，过滤后保留 ${rows.length} 条`);
+        eventList.value = rows;
+      } else {
+        console.warn(`[EventEmoji] 拉取失败 code=${code} msg=${apiResMessage(res)}`);
+        uni.showToast({ title: t("Mobile.Terminal.eventEmojiLoadFailed"), icon: "none" });
+      }
+    } catch (e) {
+      console.error("[EventEmoji] fetchEventEmotions error", e);
+      uni.showToast({ title: t("Mobile.Terminal.eventEmojiLoadFailed"), icon: "none" });
+    }
+    // 后端返回空/失败/全被过滤 → 回退兜底静态列表（保留的 7 个事件）
+    if (eventList.value.length == 0) {
+      console.warn("[EventEmoji] 列表为空，启用兜底静态列表（保留的 7 个事件）");
+      eventList.value = FALLBACK_EVENTS;
+    }
+    loading.value = false;
+  };
+
+  const fetchEmotionOptions = async () => {
+    if (props.deviceId == "") {
+      emotionOptions.value = FALLBACK_EMOTIONS;
+      return;
+    }
+    try {
+      const res = await apiVoxGetEmotionOptions();
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const raw = apiResData<any>(res);
+        const arr = raw != null ? (raw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        const opts: EmotionOption[] = [];
+        for (let i = 0; i < arr.length; i++) {
+          opts.push(new EmotionOption(strVal(arr[i], "emotion"), strVal(arr[i], "label"), strVal(arr[i], "url")));
+        }
+        emotionOptions.value = opts;
+      }
+    } catch (e) {
+      console.error("fetchEmotionOptions error", e);
+    }
+    if (emotionOptions.value.length == 0) {
+      emotionOptions.value = FALLBACK_EMOTIONS;
+    }
+  };
+
+  const labelOf = (emotion: string): string => {
+    for (let i = 0; i < emotionOptions.value.length; i++) {
+      if (emotionOptions.value[i].emotion == emotion) return emotionOptions.value[i].label;
+    }
+    return "";
+  };
+
+  const urlOf = (emotion: string): string => {
+    for (let i = 0; i < emotionOptions.value.length; i++) {
+      if (emotionOptions.value[i].emotion == emotion) return emotionOptions.value[i].url;
+    }
+    return "";
+  };
+
+  const emotionPickerCurrentValue = computed((): string => {
+    const row = selectedEvent.value;
+    if (row == null || !row.customized) return EMOTION_DEFAULT_VALUE;
+    return row.emotion;
+  });
+
+  const emotionRadioOptions = computed((): RadioListItem[] => {
+    const result: RadioListItem[] = [];
+    for (let i = 0; i < emotionOptions.value.length; i++) {
+      const item = emotionOptions.value[i];
+      const prefix = item.url == "" ? `${emotionEmoji(item.emotion)} ` : "";
+      result.push(new RadioListItem(`${prefix}${item.label}`, item.emotion));
+    }
+    result.push(new RadioListItem(t("Mobile.Terminal.eventEmojiReset"), EMOTION_DEFAULT_VALUE));
+    return result;
+  });
+
+  const emotionRadioImageUrls = computed((): string[] => {
+    const result: string[] = [];
+    for (let i = 0; i < emotionOptions.value.length; i++) {
+      result.push(emotionOptions.value[i].url);
+    }
+    // 与“默认表情”选项对齐，该行不展示图片。
+    result.push("");
+    return result;
+  });
+
+  const replaceEventRow = (rowIndex: number, row: EventEmotionRow) => {
+    const rows: EventEmotionRow[] = [];
+    for (let i = 0; i < eventList.value.length; i++) {
+      rows.push(i == rowIndex ? row : eventList.value[i]);
+    }
+    // uni-app x 对 ref<class[]> 的原地 splice 更新不稳定；替换数组引用才能稳定触发列表重绘。
+    eventList.value = rows;
+  };
+
+  const applyEmotion = async (row: EventEmotionRow, emotion: string, label: string, emotionUrl: string) => {
+    let rowIndex = -1;
+    for (let i = 0; i < eventList.value.length; i++) {
+      if (eventList.value[i].event == row.event) {
+        rowIndex = i;
+        break;
+      }
+    }
+    if (rowIndex < 0) return;
+    let nextRow: EventEmotionRow;
+    if (emotion == "") {
+      nextRow = new EventEmotionRow(
+        row.event,
+        row.eventLabel,
+        row.defaultEmotion,
+        labelOf(row.defaultEmotion),
+        emotionUrl,
+        row.defaultEmotion,
+        false,
+      );
+    } else {
+      nextRow = new EventEmotionRow(
+        row.event,
+        row.eventLabel,
+        emotion,
+        label,
+        emotionUrl,
+        row.defaultEmotion,
+        true,
+      );
+    }
+    // 先更新本地展示；只有接口失败才恢复原值。
+    replaceEventRow(rowIndex, nextRow);
+    try {
+      const res = await apiVoxUpdateEventEmotion(props.deviceId, row.event, emotion);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        replaceEventRow(rowIndex, row);
+        uni.showToast({ title: t("Mobile.Terminal.eventEmojiUpdateFailed"), icon: "none" });
+      } else {
+        // 更新接口不返回图片地址，重新拉取以使用后端最新 emotionUrl。
+        await fetchEventEmotions();
+      }
+    } catch (e) {
+      replaceEventRow(rowIndex, row);
+      console.error("applyEmotion error", e);
+      uni.showToast({ title: t("Mobile.Terminal.eventEmojiUpdateFailed"), icon: "none" });
+    }
+  };
+
+  const handlePick = (row: EventEmotionRow) => {
+    if (props.disabled) return;
+    if (props.deviceId == "" || loading.value || emotionOptions.value.length == 0) return;
+    selectedEvent.value = row;
+    emotionPickerVisible.value = true;
+  };
+
+  const closeEmotionPicker = () => {
+    emotionPickerVisible.value = false;
+  };
+
+  const handleEmotionChange = async (value: string) => {
+    emotionPickerVisible.value = false;
+    const row = selectedEvent.value;
+    if (row == null) return;
+    if (value == EMOTION_DEFAULT_VALUE) {
+      await applyEmotion(row, "", labelOf(row.defaultEmotion), urlOf(row.defaultEmotion));
+      return;
+    }
+    for (let i = 0; i < emotionOptions.value.length; i++) {
+      const item = emotionOptions.value[i];
+      if (item.emotion == value) {
+        await applyEmotion(row, item.emotion, item.label, item.url);
+        return;
+      }
+    }
+  };
+
+  onMounted(() => {
+    fetchEmotionOptions();
+    fetchEventEmotions();
+  });
+</script>
+
+<style lang="scss" scoped>
+  @import "./event-emoji-bind.scss";
+</style>

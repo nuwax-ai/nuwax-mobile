@@ -1,109 +1,94 @@
-import { nextTick } from 'vue'
-import { MessageInfo } from '@/types/interfaces/conversationInfo'
-import { MessageTypeEnum } from '@/types/enums/agent'
-import { MessageStatusEnum } from '@/types/enums/common'
+import { nextTick, type ComponentPublicInstance } from 'vue'
+import { StringAnyRecord } from '@/types/interfaces/common'
 import AgentDetailData from './AgentDetailData.uts'
-import AgentDetailUtils from './AgentDetailUtils.uts'
 
 /**
  * 组件管理层：负责组件的引用管理和更新
+ * Android：StringAnyRecord 运行时是 Map，禁止 as UTSJSONObject / UTSJSONObject.keys
  */
 export default class ComponentManager {
-	private data: AgentDetailData
-	constructor(private data: AgentDetailData) {
-		this.data = data
+	private data: AgentDetailData;
+	constructor(data: AgentDetailData) {
+		this.data = data;
+	}
+
+	/** 将 messageRefs 规范为 Map（Android Record = Map） */
+	private refsAsMap(): Map<string, any | null> {
+		const refs = this.data.messageRefs.value
+		try {
+			const m = refs as Map<string, any | null>
+			if (m != null) {
+				return m
+			}
+		} catch (_e) {
+			// fallthrough
+		}
+		// 非 Map 时迁移到新 Map，避免后续 keys/as UTSJSONObject
+		const next = new Map<string, any | null>()
+		this.data.messageRefs.value = next as any as StringAnyRecord
+		return next
 	}
 
 	/**
 	 * 设置消息组件引用
+	 * Vue ref 回调在卸载时会传 null；Android 上 el 必须声明为可空，否则进方法前 NPE
 	 */
-	setMessageRef(el: any, messageId: string): void {
-		if (el) {
-			this.data.messageRefs.value[messageId] = el
+	setMessageRef(el: any | null, messageId: string): void {
+		if (messageId == null || messageId.length == 0) {
+			return
 		}
+		if (el == null) {
+			this.removeMessageRef(messageId)
+			return
+		}
+		this.refsAsMap().set(messageId, el)
 	}
 
 	/**
 	 * 移除消息组件引用
 	 */
 	removeMessageRef(messageId: string): void {
-		if (this.data.messageRefs.value[messageId]) {
-			delete this.data.messageRefs.value[messageId]
+		const m = this.refsAsMap()
+		if (m.get(messageId) == null) {
+			return
 		}
+		m.delete(messageId)
+	}
+
+	private triggerMessageListRefresh(): void {
+		this.data.messageList.value = [...this.data.messageList.value]
 	}
 
 	/**
 	 * 更新消息组件
+	 * Android：组件实例不能 as UTSJSONObject，须 $callMethod 调 defineExpose.updateMessage
 	 */
 	async updateMessageComponent(messageId: string, newData: any): Promise<void> {
-		const messageRef = this.data.messageRefs.value[messageId]
-		if (messageRef) {
-			try {
-				if (typeof messageRef.updateMessage === 'function') {
-					await messageRef.updateMessage(newData)
-				} else {
-					// 备用方案：强制触发组件更新
-					await nextTick()
-					const message = this.data.messageList.value.find(msg => msg.id === messageId)
-					if (message) {
-						message.lastUpdateTime = Date.now()
-						this.data.messageList.value = [...this.data.messageList.value]
-					}
-				}
-			} catch (error) {
-				console.error(`更新消息组件 ${messageId} 失败:`, error)
-				// 错误恢复：使用备用方案
+		try {
+			const el = this.refsAsMap().get(messageId)
+			if (el != null && newData != null) {
 				try {
-					await nextTick()
-					const message = this.data.messageList.value.find(msg => msg.id === messageId)
-					if (message) {
-						message.lastUpdateTime = Date.now()
-						this.data.messageList.value = [...this.data.messageList.value]
-					}
-				} catch (backupError) {
-					console.error('备用方案也失败了:', backupError)
+					const proxy = el as ComponentPublicInstance
+					proxy.$callMethod('updateMessage', newData)
+					// 流式场景 messageList 已在 Service 层更新，直接 patch 子组件即可，避免重复刷新整表
+					return
+				} catch (_eCall) {
+					// 组件未挂载完成时回退到列表刷新
 				}
 			}
+			// scroll-view 不做 cell 回收，ref 常驻；流式期间（~40ms 一发
+			// updateMessageComponent）若走整表替换，长列表每帧重建 → 滚动抖动。
+			// 流式正文走 streamingAssistantText 打字机通道 + 流结束
+			// publishStreamDraftLastOnly 落盘，这里直接跳过；
+			// 非流式（历史落库 / 状态终态更新）保留整表刷新兜底。
+			if (this.data.isConversationActive.value == true) {
+				return
+			}
+			await nextTick()
+			this.triggerMessageListRefresh()
+		} catch (error) {
+			console.error(`更新消息组件 ${messageId} 失败:`, error)
 		}
 	}
 
-	/**
-	 * 根据状态枚举确定状态
-	 */
-	determineState(status: MessageStatusEnum): number {
-		switch (status) {
-			case MessageStatusEnum.Loading:
-				return 1
-			case MessageStatusEnum.Incomplete:
-				return 2
-			case MessageStatusEnum.Complete:
-				return 3
-			case MessageStatusEnum.Error:	
-				return 4
-			default:
-				return 3
-		}
-	}
-
-	/**
-	 * 将MessageInfo转换为MsgItem格式
-	 */
-	convertMessageInfoToMsgItem(messageInfo: MessageInfo): any {
-		return {
-			_id: messageInfo.id?.toString() || '',
-			from_uid: messageInfo.messageType === MessageTypeEnum.ASSISTANT ? 'uni-ai' : 'user',
-			// thinkContent: messageInfo.text || messageInfo.think || '',
-			// body: messageInfo.text || messageInfo.think || '',
-			thinkContent: messageInfo.think || '',
-			body: messageInfo.text || '',
-			create_time: new Date(messageInfo.time || Date.now()).getTime(),
-			state: this.determineState(messageInfo.status),
-			chat_id: 'chat-' + this.data.conversationId.value,
-			// markdownElList: [],
-			// markdownElList: messageInfo.markdownElList || [],
-			rendered: false,
-			// 传递processingList用于自定义组件渲染（历史消息的工具调用等）
-			processingList: messageInfo.processingList || []
-		} as any
-	}
 }

@@ -17,18 +17,7 @@ export const getLocalFilePath = (path : string) => {
 
 
 // #ifdef UNI-APP-X && APP
-// lime-file-utils 已被删除，使用备用实现
-export const getLocalFilePath = (path: string): string => {
-	console.warn('getLocalFilePath: lime-file-utils 已被删除，使用备用实现')
-	// 备用实现：直接返回路径
-	if (path.startsWith("http") || path.startsWith("<svg") || path.startsWith("data:image/svg+xml")) {
-		return path
-	}
-	if (path.startsWith("file://")) {
-		return path.substring("file://".length)
-	}
-	return path
-}
+export { getResourcePath as getLocalFilePath } from '@/uni_modules/lime-file-utils'
 // export const getLocalFilePath = (path : string) : string => {
 // 	let uri = path
 // 	if (uri.startsWith("http") || uri.startsWith("<svg") || uri.startsWith("data:image/svg+xml")) {

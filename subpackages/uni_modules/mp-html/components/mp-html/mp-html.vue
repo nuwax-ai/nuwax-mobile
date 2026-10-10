@@ -3,6 +3,7 @@
     <slot v-if="!nodes[0]" />
     <!-- #ifndef APP-PLUS-NVUE -->
     <node v-else :childs="nodes" :processing-list="processingList"
+      :is-current-streaming="isCurrentStreaming"
       :opts="[lazyLoad, loadingImg, errorImg, showImgMenu, selectable]" name="span" />
     <!-- #endif -->
     <!-- #ifdef APP-PLUS-NVUE -->
@@ -76,6 +77,10 @@ export default {
     processingList: {
       type: Array,
       default: () => []
+    },
+    isCurrentStreaming: {
+      type: Boolean,
+      default: false
     },
     conversationId: {
       type: [String, Number],

@@ -1,0 +1,1846 @@
+<template>
+  <!--
+    项目/任务抽屉（App v3 新交互）：左滑抽屉承载「项目」分组 +「任务」（会话历史）列表。
+    固定遮罩与面板独立合成；拖动时直接更新位移，松手后吸附到开/关端点。
+    职责边界：本组件 = 抽屉容器（滚动/下拉刷新/生命周期）+ 项目分组业务；
+    任务（会话历史）列表为独立可复用组件 conversation-history-list，
+    由本组件在其 scroll-view 内组装，触底/下拉/静默刷新经 expose 入口触发。
+    项目行 = 开合文件夹 + 名称 + 类型标签 + ＋；子会话行 = 状态点 + 名称 + 相对时间；
+    任务行 = 状态角标 + 标题 + 相对时间；区头无计数。
+    项目列表为完整接口（2026-09-21 契约，对齐 PC toProjectItem）：回包行自带
+    conversations 直接映射子会话，展开/收起为纯本地切换，无逐项目会话补拉。
+  -->
+  <view v-show="drawerPresented" class="drawer-overlay">
+    <view class="drawer-mask" :style="drawerMaskStyle" @click="handleMaskClick" />
+    <view class="drawer-panel" :style="drawerPanelStyle">
+    <view
+      class="drawer-wrap"
+      :style="drawerTopPaddingStyle"
+      @touchstart="onDrawerSwipeTouchStart"
+      @touchmove="onDrawerSwipeTouchMove"
+      @touchend="onDrawerSwipeTouchEnd"
+      @touchcancel="onDrawerSwipeTouchCancel"
+    >
+      <!-- 项目标题与搜索常驻；滚动区只包含项目/任务条目，任务标题到顶后吸附。
+           原 Android list-view + sticky-section 路径废弃——引擎在首帧布局后向前序 section
+           增删/改动单元格时内容流错乱（项目区整区渲染到任务区后，真机两轮复现）；
+           iOS 避 list-view 复用丢行高、微信无 sticky 组件、H5 list-view 图标渲染不完整（09-16）。
+           至此全端统一走官方复杂列表指南方案。 -->
+      <view class="section-header" @click="toggleProjectSection">
+        <view class="header-title-row">
+          <text class="section-title-text">{{ sectionProjectTitle }}</text>
+          <svg-icon
+            :name="projectSectionCollapsed ? 'icon-a-Chevronright' : 'icon-a-Chevrondown'"
+            size="24"
+            color="#939397"
+            customClass="section-arrow"
+          />
+          <view v-if="projectToggleAllVisible" class="header-toggle-all-btn" @click.stop="toggleAllProjectChildren">
+            <view class="toggle-all-chevrons">
+              <svg-icon name="icon-a-Chevronup" size="16" color="#8b8e96" />
+              <svg-icon name="icon-a-Chevrondown" size="16" color="#8b8e96" />
+            </view>
+          </view>
+        </view>
+        <view class="header-search-btn" @click.stop="handleSearch">
+          <svg-icon name="icon-Search" size="40" color="#939397" />
+        </view>
+      </view>
+      <view class="drawer-list-area">
+      <scroll-view
+        v-if="listMounted"
+        id="drawer-sticky-scroll"
+        class="drawer-scroll"
+        direction="vertical"
+        :show-scrollbar="false"
+        :refresher-enabled="true"
+        :refresher-triggered="refreshing"
+        @touchstart="onDrawerSwipeTouchStart"
+        @touchmove="onDrawerSwipeTouchMove"
+        @touchend="onDrawerSwipeTouchEnd"
+        @touchcancel="onDrawerSwipeTouchCancel"
+        @scroll="handleStickyScroll"
+        @scrolltolower="handleScrollTolower"
+        @refresherrefresh="handleRefresh"
+        @refresherrestore="resetRefresher"
+        @refresherabort="resetRefresher"
+      >
+        <template v-if="!projectSectionCollapsed && visibleProjectGroups.length > 0">
+          <view v-for="group in visibleProjectGroups" :key="group.key" class="project-block">
+            <view
+              class="project-row"
+              @click="toggleProjectExpand(group.key)"
+              @longpress="handleProjectLongPress(group.key)"
+            >
+              <view class="project-leading-icon">
+                <image :src="group.expanded ? folderOpenMutedIcon : folderClosedMutedIcon" class="project-folder-image" mode="aspectFit" />
+              </view>
+              <view class="project-pin-btn" @click.stop="handleProjectPinTap(group.key)">
+                <image :src="group.pinned ? pinActiveIcon : pinIcon" class="project-pin-image" mode="aspectFit" />
+              </view>
+              <image v-if="!group.owner" :src="teamIcon" class="project-team-image" mode="aspectFit" />
+              <text class="project-name">
+                {{ group.name }}
+              </text>
+              <!-- 类型标签（常规项目/网页应用/网站应用；未知类型文案为空串不渲染） -->
+              <text v-if="projectTypeTag(group.projectType).length > 0" class="project-type-tag">{{ projectTypeTag(group.projectType) }}</text>
+              <view class="project-row-flex" />
+              <view class="project-add-btn" @click.stop="handleAddConversation(group.key)">
+                <text class="project-add-icon">＋</text>
+              </view>
+            </view>
+            <view v-if="group.expanded">
+              <view
+                v-for="child in group.children"
+                :key="child.id"
+                class="project-child-row"
+                @click="handleProjectChildClick(group.key, child.id)"
+                @longpress="handleProjectChildLongPress(group.key, child.id)"
+              >
+                <!-- 状态点仅在有状态时占位（对齐设计稿：无状态子项与项目名左对齐） -->
+                <view v-if="child.taskStatus == 'EXECUTING' || child.taskStatus == 'FAILED'" class="child-status">
+                  <svg-icon v-if="child.taskStatus == 'EXECUTING'" name="icon-Loader" size="24" color="#8b8e96" customClass="status-running" />
+                  <svg-icon v-else name="icon-waring" size="24" color="#e54d4d" />
+                </view>
+                <text class="child-name">{{ child.name }}</text>
+                <text class="child-time">{{ child.timeLabel }}</text>
+              </view>
+              <!-- 子会话随列表回包（完整接口契约）：无会话仅显示空态文案，无在途/失败态 -->
+              <view v-if="group.children.length == 0" class="project-child-empty">
+                <text class="project-child-empty-text">{{ t("Mobile.Project.noConversation") }}</text>
+              </view>
+            </view>
+          </view>
+        </template>
+        <view v-else-if="!projectSectionCollapsed && !projectLoading" class="empty-state">
+          <image :src="noData" class="empty-image" :alt="t('Mobile.Common.noDataImageAlt')" />
+          <text class="empty-text">{{ t("Mobile.Conversation.projectEmpty") }}</text>
+        </view>
+        <!-- 项目分页由本区入口触发，避免任务触底时在视口上方插入项目；全端保留入口。 -->
+        <view
+          v-if="!projectSectionCollapsed && projectLoadMoreVisible"
+          class="project-load-more"
+          @click="handleProjectLoadMore"
+        >
+          <text class="project-load-more-text">{{ projectLoadMoreText }}</text>
+        </view>
+
+        <view id="task-section-header" class="section-header task-section-header" @click="toggleTaskSection">
+          <view class="header-title-row">
+            <text class="section-title-text">{{ sectionTaskTitle }}</text>
+            <svg-icon
+              :name="taskSectionCollapsed ? 'icon-a-Chevronright' : 'icon-a-Chevrondown'"
+              size="24"
+              color="#939397"
+              customClass="section-arrow"
+            />
+          </view>
+        </view>
+        <!-- 折叠用 v-show 不用 v-if：组件实例持有已加载数据，v-if 销毁重建会清空
+             conversationList 且 loadIfEmpty 不会再触发（首载仅抽屉打开时调）→ 永久空态 -->
+        <conversation-history-list
+          v-show="!taskSectionCollapsed"
+          ref="taskListRef"
+          :is-logged-in="isLoggedIn"
+          :allow-silent-refresh="allowSilentRefresh"
+          @conversation-click="relayConversationClick"
+          @count-change="handleTaskCountChange"
+          @hasmore-change="handleTaskHasMoreChange"
+        />
+      </scroll-view>
+      <!-- 任务标题到达滚动区顶部后，浮动副本接替自然位；项目标题与搜索始终在上方。 -->
+      <view v-if="showFloatingTaskHeader" class="floating-section-header">
+        <view class="section-header task-section-header" @click="toggleTaskSection">
+          <view class="header-title-row">
+            <text class="section-title-text">{{ sectionTaskTitle }}</text>
+            <svg-icon
+              :name="taskSectionCollapsed ? 'icon-a-Chevronright' : 'icon-a-Chevrondown'"
+              size="24"
+              color="#939397"
+              customClass="section-arrow"
+            />
+          </view>
+        </view>
+      </view>
+      </view>
+    </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { HorizontalGestureIntent, resolveDrawerOpen } from "@/utils/horizontalGesture";
+  import { gestureTouchSlop } from "@/utils/gestureTouchSlop";
+  import { ref, computed, watch, nextTick, onMounted, onUnmounted, getCurrentInstance, type ComponentPublicInstance } from "vue";
+  import { registerPopupClose, unregisterPopupClose } from "@/utils/popupBackRegistry";
+  import ConversationHistoryList from "@/components/conversation-history-list/conversation-history-list.uvue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+  import eventBus from "@/utils/eventBus";
+  import { EVENT_TYPE } from "@/constants/event.constants";
+  import {
+    apiAgentConversationUpdate,
+    apiAgentConversationDelete,
+  } from "@/servers/conversation";
+  import { AgentConversationUpdateParams } from "@/types/interfaces/agent";
+  import { PinnedProjectInfo } from "@/types/interfaces/displayRecommend";
+  import {
+    apiUserProjectTabPageQuery,
+    apiNormalProjectUpdate,
+    apiUserProjectDelete,
+    apiUserAppUpdate,
+    apiUserAppDelete,
+    apiUserProjectPin,
+    apiUserProjectArchive,
+    apiUserProjectCollect,
+    apiUserProjectUnCollect,
+  } from "@/servers/project";
+  import {
+    UserProjectUpdateParams,
+    UserAppUpdateParams,
+  } from "@/types/interfaces/projectInfo";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { formatListTimeAgo } from "@/utils/common";
+  import { getCurrentPagePath } from "@/utils/commonBusiness";
+  import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+  import { clearConversationFlags } from "@/utils/conversationLocalFlags.uts";
+  import { clearProjectFlags } from "@/utils/projectLocalFlags.uts";
+  import { migrateProjectFavorites } from "@/utils/favoritesMigration.uts";
+  import { prefetchConversationList, clearCachedConversationList } from "@/utils/conversationListCache";
+  import {
+    ProjectChildView,
+    ProjectGroupView,
+    mapProjectTabResponse,
+    mapProjectTotalPages,
+    mapProjectTotalCount,
+    remainingProjectCount,
+    appendProjectGroupsDedup,
+    reconcileProjectGroups,
+    computeProjectHasMore,
+    needsProjectChase,
+    projectTypeLabelKey,
+    projectKeyOf,
+    PROJECT_PAGE_SIZE,
+    MIN_VISIBLE_PROJECTS,
+    MAX_PROJECT_CHASE_PAGES,
+  } from "@/utils/projectGroupProjection.uts";
+  import noData from "@/static/assets/no_data.png";
+  import pinIcon from "@/static/icons/pin.svg";
+  import pinActiveIcon from "@/static/icons/pin-active.svg";
+  import teamIcon from "@/static/icons/team.svg";
+  import folderOpenMutedIcon from "@/static/icons/folder-open-muted.svg";
+  import folderClosedMutedIcon from "@/static/icons/folder-closed-muted.svg";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  interface ProjectTaskDrawerProps {
+    isLoggedIn: boolean;
+  }
+  const props = defineProps<ProjectTaskDrawerProps>();
+
+  const emit = defineEmits<{
+    (e: "conversation-click", item: any): void;
+    (e: "pin-project", project: PinnedProjectInfo): void;
+  }>();
+
+  const drawerPresented = ref<boolean>(false);
+  const drawerWidth = ref<number>(uni.getWindowInfo().windowWidth * 0.85);
+  const drawerOffset = ref<number>(-drawerWidth.value);
+  const drawerDuration = ref<number>(0);
+  const drawerTopInset = ref<number>(0);
+  // #ifdef APP
+  drawerTopInset.value = uni.getWindowInfo().statusBarHeight + 8;
+  // #endif
+  const drawerTopPaddingStyle = computed((): string => `padding-top: ${drawerTopInset.value}px;`);
+  let drawerAnimationTimer: number | null = null;
+  let drawerAnimationSequence = 0;
+  let drawerRegistryId = 0;
+  let drawerOpeningDrag = false;
+  let drawerVisibilityHandler: ((visible: boolean) => void) | null = null;
+  let drawerLastOffset = 0;
+  let drawerLastTime = 0;
+  let drawerVelocity = 0;
+  let drawerSuppressClickUntil = 0;
+  const drawerPanelStyle = computed((): string => {
+    return `width: ${drawerWidth.value}px; transform: translateX(${drawerOffset.value}px); transition-duration: ${drawerDuration.value}ms;`;
+  });
+  const drawerMaskStyle = computed((): string => {
+    const progress = Math.max(0, Math.min(1, 1 + drawerOffset.value / drawerWidth.value));
+    return `opacity: ${progress}; transition-duration: ${drawerDuration.value}ms;`;
+  });
+  const drawerVisible = ref<boolean>(false);
+  const drawerInstance = getCurrentInstance();
+  // 浏览列表下方时延后头部对账，防止新增/重排的行改变当前阅读位置。
+  const allowSilentRefresh = ref<boolean>(true);
+
+  /** Android：组件 ref 是 Gen* 类，禁止 as UTSJSONObject；用 $callMethod 调 defineExpose 方法 */
+  function callRefMethod(inst: any | null, methodName: string): void {
+    if (inst == null) {
+      return;
+    }
+    const proxy = inst as ComponentPublicInstance;
+    proxy.$callMethod(methodName);
+  }
+
+  // ============================================================
+  // 项目分组（真实接口 /api/user-project/tab/page-query）
+  // UTS class 深层追踪不可靠（Android）：可变数据放普通数组，版本号驱动 computed。
+  // 标记读侧：服务端字段回读打标（2026-09-13 后端化）；写侧走接口成功后改字段。
+  // ============================================================
+  let projectGroupsData: ProjectGroupView[] = [] as ProjectGroupView[];
+  const projectVersion = ref<number>(0);
+  const projectLoading = ref<boolean>(false);
+  let projectLoadedOnce = false;
+  let projectDataGeneration = 0;
+  let projectRequestPromise: Promise<boolean> | null = null;
+  let projectFavoritesMigrationTriggered = false;
+  // 分页游标：pageSize=20 + 触底加载 + 刷新追拉
+  let projectNextPage = 1;
+  let projectHasMore = false;
+  let projectTotalPagesCache = 0;
+  let projectLoadingMore = false;
+  // 「查看更多」入口（09-21 非 H5 端需求）：hasMore/loadingMore/total 为普通 let，
+  // 模板需响应式镜像；projectTotalCountCache 供剩余数计算
+  let projectTotalCountCache = 0;
+  const projectHasMoreView = ref<boolean>(false);
+  const projectLoadingMoreView = ref<boolean>(false);
+  const projectRemainingView = ref<number>(0);
+
+  /** 项目行视图模型（2026-09-21 设计稿恢复类型标签：常规/网页应用/全栈） */
+  class ProjectRowView {
+    id: number = 0;
+    key: string = "";
+    name: string = "";
+    projectType: string = "";
+    expanded: boolean = true;
+    pinned: boolean = false;
+    /** 非创建者项目标「团队」tag（2026-09-20 契约：owner 严格 === false 才标） */
+    owner: boolean = true;
+    children: ProjectChildView[] = [] as ProjectChildView[];
+  }
+
+  /** 列表投影（对齐 PC ProjectPanel）：隐藏归档项、置顶排前、稳定顺序。 */
+  const visibleProjectGroups = computed((): ProjectRowView[] => {
+    const _v = projectVersion.value;
+    const pinnedRows: ProjectRowView[] = [] as ProjectRowView[];
+    const normalRows: ProjectRowView[] = [] as ProjectRowView[];
+    for (let i = 0; i < projectGroupsData.length; i++) {
+      const group = projectGroupsData[i];
+      if (group == null || group.archived) {
+        continue;
+      }
+      const row = new ProjectRowView();
+      row.id = group.id;
+      row.key = projectKeyOf(group.id, group.projectType);
+      row.name = group.name;
+      row.projectType = group.projectType;
+      row.expanded = group.expanded;
+      row.pinned = group.pinned;
+      row.owner = group.owner;
+      row.children = group.children;
+      if (group.pinned) {
+        pinnedRows.push(row);
+      } else {
+        normalRows.push(row);
+      }
+    }
+    const rows: ProjectRowView[] = pinnedRows;
+    for (let i = 0; i < normalRows.length; i++) {
+      rows.push(normalRows[i]);
+    }
+    return rows;
+  });
+
+  function findProjectGroup(groupKey: string): ProjectGroupView | null {
+    for (let i = 0; i < projectGroupsData.length; i++) {
+      if (projectKeyOf(projectGroupsData[i].id, projectGroupsData[i].projectType) == groupKey) {
+        return projectGroupsData[i];
+      }
+    }
+    return null;
+  }
+
+  function formatTimeLabel(targetTime: string): string {
+    const ago = formatListTimeAgo(targetTime);
+    return ago != null ? ago : "";
+  }
+
+  /** 类型标签文案（projectTypeLabelKey 未知类型返回空串 = 不展示标签） */
+  function projectTypeTag(projectType: string): string {
+    const key = projectTypeLabelKey(projectType);
+    return key.length > 0 ? t(key) : "";
+  }
+
+  /**
+   * 子会话随项目列表回包（2026-09-21 完整接口契约，对齐 PC toProjectItem
+   * 直接消费 record.conversations）：展开/收起纯本地切换已就位数据，
+   * 不再调用 /api/user-project/conversations 逐项目补拉。
+   */
+
+  /** 统计累计数据中非归档项目数（chase 判定的「可见行」口径，对齐 visibleProjectGroups 过滤） */
+  function countVisibleProjects(groups: ProjectGroupView[]): number {
+    let count = 0;
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      if (group != null && group.archived != true) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /** 同步「查看更多」入口响应式镜像（剩余数 = total - 已加载可见行，钳 0） */
+  function syncProjectLoadMoreState(): void {
+    projectHasMoreView.value = projectHasMore;
+    projectRemainingView.value = remainingProjectCount(projectTotalCountCache, countVisibleProjects(projectGroupsData));
+  }
+
+  /** 「查看更多」入口可见性：还有下一页且当前有可见项目行（H5 走触底加载不展示，模板条件编译控制） */
+  const projectLoadMoreVisible = computed((): boolean => {
+    return projectHasMoreView.value == true && visibleProjectGroups.value.length > 0;
+  });
+
+  /** 「查看更多」文案：加载中 / 查看更多 (剩余数)（对齐 PC load-more-entry；total 未回读时不带计数） */
+  const projectLoadMoreText = computed((): string => {
+    if (projectLoadingMoreView.value == true) {
+      return t("Mobile.Page.loadingMore");
+    }
+    const base = t("Mobile.Project.viewMore");
+    const remaining = projectRemainingView.value;
+    return remaining > 0 ? `${base} (${remaining})` : base;
+  });
+
+  /**
+   * 拉一页项目并投影；返回 null=请求失败（调用方决定保留/中止），空数组=成功但无行。
+   * 同时回写 projectTotalPagesCache。
+   */
+  async function fetchProjectPage(page: number): Promise<ProjectGroupView[] | null> {
+    const generation = projectDataGeneration;
+    const res = await apiUserProjectTabPageQuery(page, PROJECT_PAGE_SIZE);
+    if (generation != projectDataGeneration || apiResCode(res) != SUCCESS_CODE) {
+      return null;
+    }
+    const data = apiResData<any>(res);
+    projectTotalPagesCache = mapProjectTotalPages(data);
+    projectTotalCountCache = mapProjectTotalCount(data);
+    // 子会话随列表行回包直接映射；空主题兜底与任务列表「未命名会话」口径一致
+    return mapProjectTabResponse(data, formatTimeLabel, t("Mobile.Conversation.unnamed"));
+  }
+
+  async function fetchProjects(): Promise<boolean> {
+    const generation = projectDataGeneration;
+    try {
+      // 刷新：页码 1 起，前端过滤（归档）后可见行不足 MIN_VISIBLE_PROJECTS 时继续追拉
+      // （归档项回包含但被过滤，单页可能稀疏；对齐 PC loadData(isRefresh) + chase）
+      let page = 1;
+      let acc: ProjectGroupView[] = [] as ProjectGroupView[];
+      let lastCount = 0;
+      let visibleCount = 0;
+      let successCount = 0;
+      for (let fetched = 0; fetched < MAX_PROJECT_CHASE_PAGES; fetched++) {
+        if (
+          fetched > 0 &&
+          !needsProjectChase(visibleCount, MIN_VISIBLE_PROJECTS, page - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE)
+        ) {
+          break;
+        }
+        const groups = await fetchProjectPage(page);
+        if (groups == null) {
+          // 中途失败：已有数据则保留展示，仅停止追拉
+          break;
+        }
+        successCount++;
+        lastCount = groups.length;
+        acc = appendProjectGroupsDedup(acc, groups);
+        visibleCount = countVisibleProjects(acc);
+        page++;
+      }
+      // 整轮一页未成功：不动现有数据、维持「未加载过」，下次打开自动重拉（对齐原单发语义）
+      if (successCount == 0 || generation != projectDataGeneration) {
+        return false;
+      }
+      projectGroupsData = projectLoadedOnce ? reconcileProjectGroups(projectGroupsData, acc) : acc;
+      projectNextPage = page;
+      projectHasMore = computeProjectHasMore(page - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
+      syncProjectLoadMoreState();
+      // 首载默认展开；刷新保留已有项目展开态，避免收起的项目突然撑开。
+      projectVersion.value = projectVersion.value + 1;
+      projectLoadedOnce = true;
+      // 首次加载成功后触发本地项目收藏一次性迁移（幂等，未完成前重试）
+      if (projectFavoritesMigrationTriggered != true) {
+        projectFavoritesMigrationTriggered = true;
+        migrateProjectFavorites();
+      }
+      return true;
+    } catch (error) {
+      console.error("fetchProjects error:", error);
+      return false;
+    }
+  }
+
+  async function requestProjects(): Promise<boolean> {
+    const pending = projectRequestPromise;
+    if (pending != null) {
+      return await pending;
+    }
+    projectLoading.value = true;
+    const requestPromise = fetchProjects();
+    projectRequestPromise = requestPromise;
+    try {
+      return await requestPromise;
+    } finally {
+      projectRequestPromise = null;
+      projectLoading.value = false;
+    }
+  }
+
+  /**
+   * 抽屉再次打开时后台对账：重取当前已加载页数，但不进入 loading、不清空列表，
+   * 并按项目 id 保留展开态与已加载子会话。用户看到的是原内容就地更新。
+   */
+  async function silentRefreshProjects(): Promise<boolean> {
+    if (!projectLoadedOnce || projectRequestPromise != null || !allowSilentRefresh.value) return false;
+    const loadedPages = projectNextPage > 1 ? projectNextPage - 1 : 1;
+    const generation = projectDataGeneration;
+    const run = async (): Promise<boolean> => {
+      let acc: ProjectGroupView[] = [] as ProjectGroupView[];
+      let lastCount = 0;
+      for (let page = 1; page <= loadedPages; page++) {
+        const groups = await fetchProjectPage(page);
+        if (groups == null) return false;
+        lastCount = groups.length;
+        acc = appendProjectGroupsDedup(acc, groups);
+      }
+      // 请求期间可能已开始向下浏览；此时也不能把新数据插到视口上方。
+      if (!allowSilentRefresh.value || generation != projectDataGeneration) return false;
+      projectGroupsData = reconcileProjectGroups(projectGroupsData, acc);
+      projectNextPage = loadedPages + 1;
+      projectHasMore = computeProjectHasMore(loadedPages, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
+      syncProjectLoadMoreState();
+      projectVersion.value = projectVersion.value + 1;
+      return true;
+    };
+    const requestPromise = run();
+    projectRequestPromise = requestPromise;
+    try {
+      return await requestPromise;
+    } catch (error) {
+      console.error("silentRefreshProjects error:", error);
+      return false;
+    } finally {
+      projectRequestPromise = null;
+    }
+  }
+
+  function toggleProjectExpand(groupKey: string): void {
+    const group = findProjectGroup(groupKey);
+    if (group == null) return;
+    group.expanded = group.expanded != true;
+    projectVersion.value = projectVersion.value + 1;
+  }
+
+  const drawerSwipeIntent = new HorizontalGestureIntent();
+  let drawerSwipeTracking = false;
+  let drawerSwipeLocked = false;
+  let drawerSwipeStartX = 0;
+  let drawerSwipeStartY = 0;
+
+  function resetDrawerSwipe(): void {
+    drawerSwipeTracking = false;
+    drawerSwipeLocked = false;
+  }
+
+  function clearDrawerAnimation(): void {
+    drawerAnimationSequence += 1;
+    if (drawerAnimationTimer != null) clearTimeout(drawerAnimationTimer!);
+    drawerAnimationTimer = null;
+  }
+
+  function settleDrawer(opened: boolean): void {
+    clearDrawerAnimation();
+    drawerOpeningDrag = false;
+    resetDrawerSwipe();
+    const target = opened ? 0 : -drawerWidth.value;
+    const distance = Math.abs(target - drawerOffset.value);
+    const duration = Math.round(160 + 120 * distance / drawerWidth.value);
+    drawerDuration.value = duration;
+    drawerOffset.value = target;
+    drawerSuppressClickUntil = Date.now() + duration + 80;
+    // 运动期间暂停列表刷新和锚点测量；在落定后才更新业务可见状态。
+    if (!opened && drawerVisibilityHandler != null) drawerVisibilityHandler!(false);
+    drawerAnimationTimer = setTimeout((): void => {
+      drawerAnimationTimer = null;
+      if (opened) {
+        if (drawerVisibilityHandler != null) drawerVisibilityHandler!(true);
+      }
+      else {
+        drawerPresented.value = false;
+        if (drawerRegistryId != 0) unregisterPopupClose(drawerRegistryId);
+        drawerRegistryId = 0;
+      }
+    }, duration);
+  }
+
+  function close(): void {
+    if (!drawerPresented.value) return;
+    settleDrawer(false);
+  }
+
+  function prepareDrawer(): void {
+    clearDrawerAnimation();
+    drawerWidth.value = uni.getWindowInfo().windowWidth * 0.85;
+    drawerDuration.value = 0;
+    drawerOffset.value = -drawerWidth.value;
+    drawerPresented.value = true;
+    drawerVelocity = 0;
+    drawerLastTime = Date.now();
+    drawerLastOffset = drawerOffset.value;
+    if (drawerRegistryId == 0) drawerRegistryId = registerPopupClose((): void => close());
+  }
+
+  function handleMaskClick(): void {
+    if (Date.now() < drawerSuppressClickUntil || drawerOpeningDrag) return;
+    close();
+  }
+
+  function updateDrawerOffset(offset: number): void {
+    const next = Math.max(-drawerWidth.value, Math.min(0, offset));
+    const now = Date.now();
+    const elapsed = now - drawerLastTime;
+    // scroll-view 与父容器可能同时收到同一事件，重复位置不重置速度样本。
+    if (next != drawerLastOffset) {
+      if (elapsed > 0) drawerVelocity = (next - drawerLastOffset) / elapsed;
+      drawerLastOffset = next;
+      drawerLastTime = now;
+    }
+    drawerDuration.value = 0;
+    drawerOffset.value = next;
+  }
+
+  function finishDrawerDrag(cancelled: boolean, wasOpen: boolean): void {
+    if (cancelled) { settleDrawer(wasOpen); return; }
+    const velocity = Date.now() - drawerLastTime <= 100 ? drawerVelocity : 0;
+    const opened = resolveDrawerOpen(drawerOffset.value, drawerWidth.value, velocity, wasOpen);
+    settleDrawer(opened);
+  }
+
+  // 首页持有最初的触摸序列，浮层不更换触摸宿主，避免中途丢失 move/end。
+  function beginOpenDrag(): void {
+    if (drawerPresented.value) return;
+    prepareDrawer();
+    drawerOpeningDrag = true;
+  }
+
+  function updateOpenDrag(distance: number): void {
+    if (!drawerOpeningDrag) return;
+    updateDrawerOffset(distance - drawerWidth.value);
+  }
+
+  function endOpenDrag(cancelled: boolean): void {
+    if (!drawerOpeningDrag) return;
+    finishDrawerDrag(cancelled, false);
+  }
+
+  function onDrawerSwipeTouchStart(e: UniTouchEvent): void {
+    if (!drawerVisible.value || drawerSwipeTracking || drawerAnimationTimer != null) return;
+    if (e.touches.length != 1) return;
+    drawerSwipeTracking = true;
+    drawerSwipeLocked = false;
+    drawerSwipeStartX = e.touches[0].screenX;
+    drawerSwipeStartY = e.touches[0].screenY;
+    drawerSwipeIntent.begin(gestureTouchSlop());
+    drawerLastOffset = 0;
+    drawerLastTime = Date.now();
+    drawerVelocity = 0;
+  }
+
+  function onDrawerSwipeTouchCancel(): void {
+    if (drawerSwipeLocked) finishDrawerDrag(true, true);
+    else resetDrawerSwipe();
+  }
+
+  function onDrawerSwipeTouchMove(e: UniTouchEvent): void {
+    if (!drawerSwipeTracking) return;
+    if (e.touches.length != 1) { onDrawerSwipeTouchCancel(); return; }
+    const dx = e.touches[0].screenX - drawerSwipeStartX;
+    const dy = e.touches[0].screenY - drawerSwipeStartY;
+    if (!drawerSwipeLocked) {
+      const intent = drawerSwipeIntent.move(dx, dy);
+      if (intent == 0) return;
+      if (intent == -1 || dx > 0) { resetDrawerSwipe(); return; }
+      if (intent != 1 || dx >= 0) return;
+      drawerSwipeLocked = true;
+      allowSilentRefresh.value = false;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    updateDrawerOffset(dx);
+  }
+
+  function onDrawerSwipeTouchEnd(e: UniTouchEvent): void {
+    if (!drawerSwipeTracking) return;
+    if (drawerSwipeLocked) {
+      if (e.changedTouches.length > 0) updateDrawerOffset(e.changedTouches[0].screenX - drawerSwipeStartX);
+      finishDrawerDrag(false, true);
+    } else resetDrawerSwipe();
+  }
+
+
+  /** 项目「＋」新建会话：上框到首页（对齐 PC ProjectPanel pin → /home）；PageApp 不上框。 */
+  function handleAddConversation(groupKey: string): void {
+    const group = findProjectGroup(groupKey);
+    if (group == null) return;
+    if (group.projectType == "PageApp") {
+      uni.showToast({ title: t("Mobile.Project.addConversationPending"), icon: "none" });
+      return;
+    }
+    const pinned = new PinnedProjectInfo();
+    pinned.projectId = group.id;
+    pinned.projectType = group.projectType;
+    pinned.name = group.name;
+    pinned.icon = group.icon;
+    pinned.sandboxId = group.sandboxId;
+    pinned.sandboxType = group.sandboxType;
+    pinned.workspacePath = group.workspacePath;
+    pinned.devAgentId = group.devAgentId;
+    close();
+    emit("pin-project", pinned);
+  }
+
+  /** 抽屉搜索（设计稿右上角放大镜）：跳会话搜索页（任务=会话历史）。 */
+  function handleSearch(): void {
+    close();
+    uni.navigateTo({
+      url:
+        "/subpackages/pages/conversation-search/conversation-search?backUrl=" +
+        encodeURIComponent(getCurrentPagePath()),
+    });
+  }
+
+  // ============================================================
+  // 项目长按操作：六项（对齐 PC ProjectPanel 2026-09-13 服务端化）
+  // 置顶/归档/收藏：NormalProject/UserApp 走真实接口（pin/archive 传目标态 +
+  // projectType 必传 query、collect/unCollect 双路径带 projectType），成功才更新字段；PageApp 契约未覆盖暂本地。
+  // 重命名/删除按 projectType 路由真实接口；新建会话 = 占位提示（PC 亦未接入）。
+  // ============================================================
+  /** PageApp 无标记接口：本地直接改字段（对齐 PC） */
+  function projectFlagsUseRealApi(projectType: string): boolean {
+    return projectType == "NormalProject" || projectType == "UserApp";
+  }
+
+  function applyProjectFlag(group: ProjectGroupView, field: string, value: boolean): void {
+    group.pinned = field == "pinned" ? value : group.pinned;
+    group.archived = field == "archived" ? value : group.archived;
+    group.collected = field == "collected" ? value : group.collected;
+    projectVersion.value = projectVersion.value + 1;
+  }
+
+  function performProjectPinToggle(group: ProjectGroupView, successTitleOn: string, successTitleOff: string): void {
+    const next = group.pinned != true;
+    if (projectFlagsUseRealApi(group.projectType) != true) {
+      applyProjectFlag(group, "pinned", next);
+      uni.showToast({ title: next ? successTitleOn : successTitleOff, icon: "none" });
+      return;
+    }
+    apiUserProjectPin(group.id, next, group.projectType).then((res) => {
+      if (apiResCode(res) == SUCCESS_CODE) {
+        applyProjectFlag(group, "pinned", next);
+        uni.showToast({ title: next ? successTitleOn : successTitleOff, icon: "none" });
+      } else {
+        uni.showToast({ title: apiResMessage(res).length > 0 ? apiResMessage(res) : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    }).catch((_e) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+  }
+
+  function handleProjectPinTap(groupKey: string): void {
+    const group = findProjectGroup(groupKey);
+    if (group == null) return;
+    performProjectPinToggle(group, t("Mobile.Conversation.pinSuccess"), t("Mobile.Conversation.unpinSuccess"));
+  }
+
+  function performProjectArchiveToggle(group: ProjectGroupView, successTitleOn: string, successTitleOff: string): void {
+    const next = group.archived != true;
+    if (projectFlagsUseRealApi(group.projectType) != true) {
+      applyProjectFlag(group, "archived", next);
+      uni.showToast({ title: next ? successTitleOn : successTitleOff, icon: "none" });
+      return;
+    }
+    apiUserProjectArchive(group.id, next, group.projectType).then((res) => {
+      if (apiResCode(res) == SUCCESS_CODE) {
+        applyProjectFlag(group, "archived", next);
+        uni.showToast({ title: next ? successTitleOn : successTitleOff, icon: "none" });
+      } else {
+        uni.showToast({ title: apiResMessage(res).length > 0 ? apiResMessage(res) : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    }).catch((_e) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+  }
+
+  /** 归档行内二次确认（对齐 PC 09-19/20 定调）：归档方向需确认，取消归档直接切换 */
+  function confirmProjectArchiveToggle(group: ProjectGroupView, successTitleOn: string, successTitleOff: string): void {
+    if (group.archived != true) {
+      uni.showModal({
+        title: t("Mobile.Conversation.archive"),
+        content: t("Mobile.Conversation.archiveConfirm"),
+        cancelText: t("Mobile.Common.cancel"),
+        confirmText: t("Mobile.Common.confirm"),
+        success: (res) => {
+          if (res.confirm) {
+            performProjectArchiveToggle(group, successTitleOn, successTitleOff);
+          }
+        },
+      });
+      return;
+    }
+    performProjectArchiveToggle(group, successTitleOn, successTitleOff);
+  }
+
+  function performProjectCollectToggle(group: ProjectGroupView, successTitleOn: string, successTitleOff: string): void {
+    const next = group.collected != true;
+    if (projectFlagsUseRealApi(group.projectType) != true) {
+      applyProjectFlag(group, "collected", next);
+      uni.showToast({ title: next ? successTitleOn : successTitleOff, icon: "none" });
+      return;
+    }
+    // projectType 为后端必传 query（归属校验，同 conversation/create 口径）
+    const request = next
+      ? apiUserProjectCollect(group.id, group.projectType)
+      : apiUserProjectUnCollect(group.id, group.projectType);
+    request.then((res) => {
+      if (apiResCode(res) == SUCCESS_CODE) {
+        applyProjectFlag(group, "collected", next);
+        uni.showToast({ title: next ? successTitleOn : successTitleOff, icon: "none" });
+      } else {
+        uni.showToast({ title: apiResMessage(res).length > 0 ? apiResMessage(res) : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    }).catch((_e) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+  }
+
+  function performProjectRenameSubmit(group: ProjectGroupView, newName: string): Promise<void> {
+    if (newName.length == 0) {
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameTitleEmpty"), icon: "none" });
+      return Promise.resolve();
+    }
+    if (newName.length > 50) {
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameTitleTooLong"), icon: "none" });
+      return Promise.resolve();
+    }
+    // PageApp 契约未覆盖改名（对齐 PC）：仅本地改名
+    if (group.projectType != "NormalProject" && group.projectType != "UserApp") {
+      group.name = newName;
+      projectVersion.value = projectVersion.value + 1;
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
+      return Promise.resolve();
+    }
+    const applyLocal = (): void => {
+      group.name = newName;
+      projectVersion.value = projectVersion.value + 1;
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
+    };
+    if (group.projectType == "UserApp") {
+      const params = new UserAppUpdateParams();
+      params.id = group.id;
+      params.name = newName;
+      return apiUserAppUpdate(params).then((updateRes) => {
+        if (apiResCode(updateRes) == SUCCESS_CODE) {
+          applyLocal();
+        } else {
+          const errorMessage = apiResMessage(updateRes);
+          uni.showToast({ title: errorMessage.length > 0 ? errorMessage : t("Mobile.Common.operationFailed"), icon: "none" });
+        }
+      }).catch((_e) => {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+      });
+    }
+    const projectParams = new UserProjectUpdateParams();
+    projectParams.id = group.id;
+    projectParams.name = newName;
+    return apiNormalProjectUpdate(projectParams).then((updateRes) => {
+      if (apiResCode(updateRes) == SUCCESS_CODE) {
+        applyLocal();
+      } else {
+        const errorMessage = apiResMessage(updateRes);
+        uni.showToast({ title: errorMessage.length > 0 ? errorMessage : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    }).catch((_e) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+  }
+
+  function handleProjectRename(group: ProjectGroupView): void {
+    uni.showModal({
+      title: t("Mobile.Components.HistoryConversationList.renameModalTitle"),
+      editable: true,
+      placeholderText: t("Mobile.Components.HistoryConversationList.renamePlaceholder"),
+      content: group.name,
+      cancelText: t("Mobile.Common.cancel"),
+      confirmText: t("Mobile.Common.confirm"),
+      success: (res) => {
+        if (res.confirm) {
+          const rawContent = res.content;
+          const newName = rawContent != null ? rawContent.trim() : "";
+          performProjectRenameSubmit(group, newName);
+        }
+      },
+    });
+  }
+
+  function performProjectDeleteSubmit(group: ProjectGroupView): Promise<void> {
+    const request = group.projectType == "UserApp"
+      ? apiUserAppDelete(group.id)
+      : apiUserProjectDelete(group.id);
+    return request.then((deleteRes) => {
+      if (apiResCode(deleteRes) == SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Components.HistoryConversationList.deleteSuccess"), icon: "success" });
+        const next: ProjectGroupView[] = [] as ProjectGroupView[];
+        const deletedKey = projectKeyOf(group.id, group.projectType);
+        let hasSameIdProject = false;
+        for (let i = 0; i < projectGroupsData.length; i++) {
+          if (projectKeyOf(projectGroupsData[i].id, projectGroupsData[i].projectType) != deletedKey) {
+            next.push(projectGroupsData[i]);
+            if (projectGroupsData[i].id == group.id) hasSameIdProject = true;
+          }
+        }
+        // 旧本地标记只有数字 ID；同号的另一类项目仍存在时保留，避免误清它的残留收藏。
+        if (!hasSameIdProject) clearProjectFlags(group.id);
+        projectGroupsData = next;
+        projectVersion.value = projectVersion.value + 1;
+      } else {
+        const errorMessage = apiResMessage(deleteRes);
+        uni.showToast({ title: errorMessage.length > 0 ? errorMessage : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    }).catch((_e) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+  }
+
+  function handleProjectDelete(group: ProjectGroupView): void {
+    uni.showModal({
+      title: t("Mobile.Project.deleteModalTitle"),
+      content: t("Mobile.Project.deleteModalContent"),
+      cancelText: t("Mobile.Common.cancel"),
+      confirmText: t("Mobile.Common.confirm"),
+      confirmColor: "#ff4d4f",
+      success: (res) => {
+        if (res.confirm) {
+          performProjectDeleteSubmit(group);
+        }
+      },
+    });
+  }
+
+  function handleProjectLongPress(groupKey: string): void {
+    const group = findProjectGroup(groupKey);
+    if (group == null) {
+      return;
+    }
+    // PageApp 契约未覆盖删除（对齐 PC）：不挂删除项
+    const canDelete = group.projectType == "NormalProject" || group.projectType == "UserApp";
+    const options: string[] = [];
+    options.push(group.pinned ? t("Mobile.Conversation.unpin") : t("Mobile.Conversation.pin"));
+    options.push(group.archived ? t("Mobile.Conversation.unarchive") : t("Mobile.Conversation.archive"));
+    options.push(group.collected ? t("Mobile.Conversation.unfavorite") : t("Mobile.Conversation.favorite"));
+    options.push(t("Mobile.Components.HistoryConversationList.rename"));
+    if (canDelete) {
+      options.push(t("Mobile.Components.HistoryConversationList.delete"));
+    }
+    options.push(t("Mobile.Conversation.newConversation"));
+    uni.showActionSheet({
+      itemList: options,
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        if (res.tapIndex == 0) {
+          performProjectPinToggle(
+            group,
+            t("Mobile.Conversation.pinSuccess"),
+            t("Mobile.Conversation.unpinSuccess"),
+          );
+        } else if (res.tapIndex == 1) {
+          confirmProjectArchiveToggle(
+            group,
+            t("Mobile.Conversation.archiveSuccess"),
+            t("Mobile.Conversation.unarchiveSuccess"),
+          );
+        } else if (res.tapIndex == 2) {
+          performProjectCollectToggle(
+            group,
+            t("Mobile.Conversation.favoriteSuccess"),
+            t("Mobile.Conversation.unfavoriteSuccess"),
+          );
+        } else if (res.tapIndex == 3) {
+          handleProjectRename(group);
+        } else if (res.tapIndex == 4 && canDelete) {
+          handleProjectDelete(group);
+        } else {
+          handleAddConversation(projectKeyOf(group.id, group.projectType));
+        }
+      },
+    });
+  }
+
+  // ============================================================
+  // 项目子会话长按操作：两项（重命名/删除；PC 定调子项不做置顶）
+  // ============================================================
+  function performChildRenameSubmit(group: ProjectGroupView, child: ProjectChildView, newName: string): Promise<void> {
+    if (newName.length == 0) {
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameTitleEmpty"), icon: "none" });
+      return Promise.resolve();
+    }
+    if (newName.length > 50) {
+      uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameTitleTooLong"), icon: "none" });
+      return Promise.resolve();
+    }
+    const updateParams = new AgentConversationUpdateParams();
+    updateParams.id = child.id;
+    updateParams.topic = newName;
+    return apiAgentConversationUpdate(updateParams).then((updateRes) => {
+      if (apiResCode(updateRes) == SUCCESS_CODE) {
+        child.name = newName;
+        projectVersion.value = projectVersion.value + 1;
+        uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
+      } else {
+        const errorMessage = apiResMessage(updateRes);
+        uni.showToast({ title: errorMessage.length > 0 ? errorMessage : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    }).catch((_e) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+  }
+
+  function performChildDeleteSubmit(group: ProjectGroupView, child: ProjectChildView): Promise<void> {
+    return apiAgentConversationDelete(child.id).then((deleteRes) => {
+      if (apiResCode(deleteRes) == SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Components.HistoryConversationList.deleteSuccess"), icon: "success" });
+        clearConversationFlags(child.id);
+        const next: ProjectChildView[] = [] as ProjectChildView[];
+        for (let i = 0; i < group.children.length; i++) {
+          if (group.children[i].id != child.id) {
+            next.push(group.children[i]);
+          }
+        }
+        group.children = next;
+        projectVersion.value = projectVersion.value + 1;
+      } else {
+        const errorMessage = apiResMessage(deleteRes);
+        uni.showToast({ title: errorMessage.length > 0 ? errorMessage : t("Mobile.Common.operationFailed"), icon: "none" });
+      }
+    }).catch((_e) => {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    });
+  }
+
+  function handleProjectChildLongPress(groupKey: string, childId: number): void {
+    const group = findProjectGroup(groupKey);
+    if (group == null) return;
+    let child: ProjectChildView | null = null;
+    for (let i = 0; i < group.children.length; i++) {
+      if (group.children[i].id == childId) {
+        child = group.children[i];
+        break;
+      }
+    }
+    if (child == null) return;
+    const options = [
+      t("Mobile.Components.HistoryConversationList.rename"),
+      t("Mobile.Components.HistoryConversationList.delete"),
+    ];
+    uni.showActionSheet({
+      itemList: options,
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        if (res.tapIndex == 0) {
+          uni.showModal({
+            title: t("Mobile.Components.HistoryConversationList.renameModalTitle"),
+            editable: true,
+            placeholderText: t("Mobile.Components.HistoryConversationList.renamePlaceholder"),
+            content: child!.name,
+            cancelText: t("Mobile.Common.cancel"),
+            confirmText: t("Mobile.Common.confirm"),
+            success: (modalRes) => {
+              if (modalRes.confirm) {
+                const rawContent = modalRes.content;
+                const newName = rawContent != null ? rawContent.trim() : "";
+                performChildRenameSubmit(group, child!, newName);
+              }
+            },
+          });
+        } else if (res.tapIndex == 1) {
+          uni.showModal({
+            title: t("Mobile.Components.HistoryConversationList.deleteModalTitle"),
+            content: t("Mobile.Components.HistoryConversationList.deleteModalContent"),
+            cancelText: t("Mobile.Common.cancel"),
+            confirmText: t("Mobile.Common.confirm"),
+            confirmColor: "#ff4d4f",
+            success: (modalRes) => {
+              if (modalRes.confirm) {
+                performChildDeleteSubmit(group, child!);
+              }
+            },
+          });
+        }
+      },
+    });
+  }
+
+  // ============================================================
+  // 点击跳转
+  // ============================================================
+  function handleProjectChildClick(groupKey: string, childId: number): void {
+    const group = findProjectGroup(groupKey);
+    if (group == null) return;
+    let child: ProjectChildView | null = null;
+    for (let i = 0; i < group.children.length; i++) {
+      if (group.children[i].id == childId) {
+        child = group.children[i];
+        break;
+      }
+    }
+    if (child == null) return;
+    const targetType = child.devTargetType.length > 0 ? child.devTargetType : group.projectType;
+    // 常规项目跳转用会话 agentId；全栈项目用会话 devTargetId
+    if (targetType == "NormalProject" && child.agentId <= 0) {
+      uni.showToast({ title: t("Mobile.Conversation.agentIdMissing"), icon: "none" });
+      return;
+    }
+    if (targetType == "UserApp" && child.devTargetId <= 0) {
+      uni.showToast({ title: t("Mobile.Conversation.agentIdMissing"), icon: "none" });
+      return;
+    }
+    if (targetType != "NormalProject" && targetType != "UserApp" && child.agentId <= 0) {
+      uni.showToast({ title: t("Mobile.Conversation.agentIdMissing"), icon: "none" });
+      return;
+    }
+    const payload = new UTSJSONObject();
+    payload["id"] = group.id;
+    // 会话ID
+    payload["conversationId"] = child.id;
+    // 常规项目跳转用
+    payload["agentId"] = child.agentId;
+    // 全栈项目跳转用
+    payload["devTargetId"] = child.devTargetId;
+    payload["devTargetType"] = child.devTargetType;
+    // 会话主题
+    payload["topic"] = child.name;
+    // 以会话 devTargetType 为准，缺失时回落项目类型
+    payload["pType"] = targetType;
+    emit("conversation-click", payload);
+  }
+
+  /** 任务列表（子组件）点击透传给页面层跳转 */
+  function relayConversationClick(item: any): void {
+    emit("conversation-click", item);
+  }
+
+  // ============================================================
+  // 区头标题（2026-09-21 设计稿定调：无计数）；taskCount 与子组件 count-change
+  // 上报链路保留，仅标题不再拼接，便于后续恢复计数
+  // ============================================================
+  const taskCount = ref<number>(0);
+
+  /** 子组件可见行数上报（分页/长按归档删除等都覆盖） */
+  function handleTaskCountChange(count: number): void {
+    taskCount.value = count;
+  }
+
+  /** 子组件是否还有任务下一页上报（触底分区分流用；初值 true 与子组件默认一致） */
+  const taskListHasMore = ref<boolean>(true);
+
+  function handleTaskHasMoreChange(hasMore: boolean): void {
+    taskListHasMore.value = hasMore == true;
+  }
+
+  const sectionProjectTitle = computed((): string => {
+    return t("Mobile.Common.projects");
+  });
+
+  const sectionTaskTitle = computed((): string => {
+    return t("Mobile.Common.tasks");
+  });
+
+  /** 分组折叠态（对齐 PC：点击分组头折叠/展开整个分组，计数保留） */
+  const projectSectionCollapsed = ref<boolean>(false);
+  const taskSectionCollapsed = ref<boolean>(false);
+
+  // ============================================================
+  // 抽屉生命周期 / 刷新（滚动与下拉刷新在此，经 expose 入口驱动子组件）
+  // ============================================================
+  const taskListRef = ref<any | null>(null);
+  const listMounted = ref<boolean>(false);
+  const refreshing = ref<boolean>(false);
+  let refreshInFlight = false;
+
+  // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
+  // ============================================================
+  // 任务区浮动标题：项目标题与搜索在滚动区外常驻，任务标题越过滚动区顶后接替自然位。
+  // ============================================================
+  const showFloatingTaskHeader = ref<boolean>(false);
+  let stickyLastScrollTop = 0;
+  /** 任务头在滚动内容坐标的偏移（px），-1 表示尚未测到 */
+  let taskHeaderContentOffset = -1;
+  const STICKY_TRIGGER_EPS = 1;
+
+  function updateFloatingHeader(scrollTop: number): void {
+    showFloatingTaskHeader.value = taskHeaderContentOffset >= 0 && scrollTop > STICKY_TRIGGER_EPS && scrollTop + STICKY_TRIGGER_EPS >= taskHeaderContentOffset;
+  }
+
+  /** 测任务头锚点相对滚动区的内容偏移；项目区高度变化（版本 bump）与刷新重建后需重测 */
+  function measureStickyAnchors(): void {
+    if (drawerVisible.value != true) return;
+    const inst = drawerInstance;
+    if (inst == null) return;
+    const proxy = inst.proxy;
+    if (proxy == null) return;
+    uni.createSelectorQuery()
+      .in(proxy)
+      .select("#drawer-sticky-scroll")
+      .boundingClientRect()
+      .select("#task-section-header")
+      .boundingClientRect()
+      .exec((results: Array<any>) => {
+        if (results.length < 2) return;
+        const scrollRaw = results[0];
+        const taskRaw = results[1];
+        if (scrollRaw == null || taskRaw == null) return;
+        const scrollRect = scrollRaw as NodeInfo;
+        const taskRect = taskRaw as NodeInfo;
+        // NodeInfo.top 可空（Android Kotlin 禁可空接收者运算），按仓内惯例 parseFloat 归一
+        const taskTop = taskRect.top != null ? parseFloat(`${taskRect.top}`) : 0;
+        const scrollViewportTop = scrollRect.top != null ? parseFloat(`${scrollRect.top}`) : 0;
+        // 两 rect 同帧测得（viewport 坐标），差值 + 当前 scrollTop = 内容坐标偏移
+        taskHeaderContentOffset = taskTop - scrollViewportTop + stickyLastScrollTop;
+        updateFloatingHeader(stickyLastScrollTop);
+      });
+  }
+
+  function scheduleMeasureStickyAnchors(delayMs: number): void {
+    setTimeout(() => {
+      measureStickyAnchors();
+    }, delayMs);
+  }
+
+  /** 锚点未测得时滚动中懒补测的节流时间戳 */
+  let lastLazyAnchorMeasureAt = 0;
+
+  function handleStickyScroll(e: UniScrollEvent): void {
+    // 一旦列表产生滚动，未接管的抽屉手势必须退出，保留原生惯性。
+    if (!drawerSwipeLocked) resetDrawerSwipe();
+    const st = e.detail.scrollTop;
+    stickyLastScrollTop = st;
+    const wasAllowed = allowSilentRefresh.value;
+    allowSilentRefresh.value = st <= STICKY_TRIGGER_EPS && !refreshInFlight;
+    if (!wasAllowed && allowSilentRefresh.value) {
+      silentRefreshProjects();
+    }
+    updateFloatingHeader(st);
+    // 锚点未测得（打开时测量竞态/失败）时滚动中补测（500ms 节流），
+    // 否则任务头永远切不上吸顶位
+    if (taskHeaderContentOffset < 0 && st > STICKY_TRIGGER_EPS) {
+      const now = Date.now();
+      if (now - lastLazyAnchorMeasureAt > 500) {
+        lastLazyAnchorMeasureAt = now;
+        scheduleMeasureStickyAnchors(0);
+      }
+    }
+  }
+
+  // 项目区高度变化（展开/收起/子会话懒加载/标记增删）后重测锚点
+  watch(projectVersion, (_v: number) => {
+    scheduleMeasureStickyAnchors(120);
+  });
+
+  /** 点击分组头折叠/展开整个分组（PC 同款）；折叠改变内容高度，降级端需重测任务头锚点 */
+  function toggleProjectSection(): void {
+    projectSectionCollapsed.value = projectSectionCollapsed.value != true;
+    // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
+    scheduleMeasureStickyAnchors(160);
+  }
+
+  function toggleTaskSection(): void {
+    taskSectionCollapsed.value = taskSectionCollapsed.value != true;
+    // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
+    scheduleMeasureStickyAnchors(160);
+  }
+
+  // ============================================================
+  // 项目区头「全部展开/收起」按钮（对齐 PC section-tool → ProjectPanel.toggleAll）
+  // ============================================================
+  /** 可见（非归档）项目是否全部处于展开态 */
+  const projectChildrenAllExpanded = computed((): boolean => {
+    const rows = visibleProjectGroups.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].expanded != true) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  /** 无可见项目时隐藏入口（对齐 PC 空列表 disabled 语义） */
+  const projectToggleAllVisible = computed((): boolean => {
+    return visibleProjectGroups.value.length > 0;
+  });
+
+  /** 全部展开/收起项目下会话：全展开 → 全收起，否则 → 全展开；项目区被分组折叠时先展开分组 */
+  function toggleAllProjectChildren(): void {
+    if (projectToggleAllVisible.value != true) return;
+    const collapse = projectChildrenAllExpanded.value;
+    for (let i = 0; i < projectGroupsData.length; i++) {
+      const group = projectGroupsData[i];
+      if (group == null || group.archived == true) continue;
+      group.expanded = collapse != true;
+    }
+    if (projectSectionCollapsed.value) {
+      projectSectionCollapsed.value = false;
+      scheduleMeasureStickyAnchors(160);
+    }
+    projectVersion.value = projectVersion.value + 1;
+  }
+
+  function handlePopupVisible(visible: boolean): void {
+    if (visible && drawerVisible.value) {
+      allowSilentRefresh.value = !refreshInFlight;
+      return;
+    }
+    drawerVisible.value = visible == true;
+    if (visible) {
+      if (props.isLoggedIn && !projectLoadedOnce && projectRequestPromise == null) requestProjects();
+      stickyLastScrollTop = 0;
+      taskHeaderContentOffset = -1;
+      showFloatingTaskHeader.value = false;
+      allowSilentRefresh.value = !refreshInFlight;
+    }
+    if (!visible) resetDrawerSwipe();
+  }
+
+  drawerVisibilityHandler = (visible: boolean): void => handlePopupVisible(visible);
+
+  function open(): void {
+    if (drawerPresented.value) return;
+    prepareDrawer();
+    // 先提交屏外起点，下一帧再展开；菜单按钮和手势共用同一套缓动。
+    const sequence = drawerAnimationSequence;
+    nextTick((): void => {
+      if (sequence != drawerAnimationSequence) return;
+      drawerAnimationTimer = setTimeout((): void => settleDrawer(true), 16);
+    });
+  }
+
+  /** 首页 onShow resume：抽屉开着时静默补差（任务头部 + 项目全量）。 */
+  function resumeData(): void {
+    if (drawerVisible.value != true || !props.isLoggedIn) return;
+    callRefMethod(taskListRef.value, "silentRefresh");
+    if (projectRequestPromise == null) {
+      silentRefreshProjects();
+    }
+  }
+
+  /** 对外：创建项目后强制刷新项目列表（无论抽屉是否打开，下次打开即见新项目）。 */
+  function refreshProjects(): void {
+    if (!props.isLoggedIn) return;
+    if (projectRequestPromise == null) {
+      if (projectLoadedOnce) silentRefreshProjects();
+      else requestProjects();
+    }
+  }
+
+  /**
+   * 任务列表首载兜底：抽屉打开后 slot 子组件的挂载可能晚于 nextTick
+   * （ref 短暂为 null），带短重试直到 ref 绑定。
+   */
+  function ensureTaskListLoaded(retries: number): void {
+    if (drawerVisible.value != true) return;
+    const inst = taskListRef.value;
+    if (inst != null) {
+      callRefMethod(inst, "loadIfEmpty");
+      callRefMethod(inst, "silentRefresh");
+      return;
+    }
+    if (retries <= 0) return;
+    setTimeout(() => {
+      ensureTaskListLoaded(retries - 1);
+    }, 120);
+  }
+
+  function resetRefresher(): void {
+    refreshing.value = false;
+  }
+
+  async function performRefresh(): Promise<void> {
+    try {
+      await nextTick();
+      // 等待两区请求完成后再收起刷新层，保留原滚动容器和任务组件实例。
+      const taskProxy = taskListRef.value as ComponentPublicInstance | null;
+      const taskRefresh = taskProxy != null ? taskProxy.$callMethod("refresh") as Promise<void> : null;
+      const pendingProjects = projectRequestPromise;
+      if (pendingProjects != null) await pendingProjects;
+      await requestProjects();
+      if (taskRefresh != null) await taskRefresh;
+    } catch (error) {
+      console.error("performRefresh error:", error);
+    } finally {
+      refreshInFlight = false;
+      refreshing.value = false;
+      allowSilentRefresh.value = stickyLastScrollTop <= STICKY_TRIGGER_EPS;
+      scheduleMeasureStickyAnchors(120);
+    }
+  }
+
+  function handleRefresh(): void {
+    if (refreshInFlight) return;
+    refreshing.value = true;
+    refreshInFlight = true;
+    allowSilentRefresh.value = false;
+    performRefresh();
+  }
+
+  /** 触底加载项目下一页（对齐 PC loadData 翻页语义：拉一页、去重追加、保留展开态不重置）。
+   *  追加页默认收起：子会话随列表回包后一页 10 个项目展开会新增大量行，
+   *  把任务区整体推远（用户视口内容剧变，形似整列表重载）。 */
+  async function loadMoreProjects(): Promise<void> {
+    if (refreshInFlight || projectHasMore != true || projectLoadingMore || projectRequestPromise != null) {
+      return;
+    }
+    projectLoadingMore = true;
+    projectLoadingMoreView.value = true;
+    const generation = projectDataGeneration;
+    const run = async (): Promise<boolean> => {
+      const groups = await fetchProjectPage(projectNextPage);
+      if (groups == null || generation != projectDataGeneration) return false;
+      if (groups.length == 0) {
+        projectHasMore = false;
+        return true;
+      }
+      // 追加页收起（单行紧凑增量，任务区位置稳定；点项目行/区头「全部展开」可展开）
+      for (let g = 0; g < groups.length; g++) {
+        groups[g].expanded = false;
+      }
+      const lastCount = groups.length;
+      projectGroupsData = appendProjectGroupsDedup(projectGroupsData, groups);
+      projectNextPage = projectNextPage + 1;
+      projectHasMore = computeProjectHasMore(projectNextPage - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
+      projectVersion.value = projectVersion.value + 1;
+      return true;
+    };
+    // 翻页与刷新共用在途锁，避免旧页回包覆盖刷新后的页码或已追加的数据。
+    const requestPromise = run().catch((error): boolean => {
+      console.error("loadMoreProjects error:", error);
+      return false;
+    });
+    projectRequestPromise = requestPromise;
+    try {
+      await requestPromise;
+    } finally {
+      projectRequestPromise = null;
+      projectLoadingMore = false;
+      projectLoadingMoreView.value = false;
+      syncProjectLoadMoreState();
+    }
+  }
+
+  /** 「查看更多」入口点击：复用触底加载下一页逻辑（自带防重入/无更多守卫） */
+  function handleProjectLoadMore(): void {
+    loadMoreProjects();
+  }
+
+  /** 触底只追加当前展开的尾部分组；吸顶头是显示状态，不能用于决定分页目标。
+   *  任务展开时，即使已经到底，也不能回头插入上方项目。 */
+  function handleScrollTolower(): void {
+    if (refreshInFlight || !drawerVisible.value) return;
+    if (!taskSectionCollapsed.value) {
+      if (taskListHasMore.value) {
+        callRefMethod(taskListRef.value, "loadMore");
+        return;
+      }
+      return;
+    }
+    if (!projectSectionCollapsed.value && projectHasMore == true) {
+      loadMoreProjects();
+    }
+  }
+
+  // 抽屉每次变为可见且子组件挂载完成后再触发任务列表首载（见 open() 注释）
+  watch(drawerVisible, (visible: boolean) => {
+    if (visible != true || props.isLoggedIn != true) return;
+    nextTick(() => {
+      ensureTaskListLoaded(8);
+    });
+    if (projectLoadedOnce && projectRequestPromise == null) {
+      silentRefreshProjects();
+    }
+    // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
+    // 抽屉落定后测锚点；数据到位后 projectVersion watch 会再补测
+    scheduleMeasureStickyAnchors(400);
+  });
+
+  /**
+   * 消费全局 batch 轮询分发的 ChatFinished：抽屉开着时静默刷新任务头部与项目列表，
+   * 保证执行中/已完成状态及时更新。
+   */
+  function handleChatFinishedEvent(_data: any | null): void {
+    if (drawerVisible.value != true) return;
+    callRefMethod(taskListRef.value, "silentRefresh");
+    if (projectRequestPromise == null) {
+      silentRefreshProjects();
+    }
+  }
+
+  // ★App-Android(UTS→Kotlin) 裸函数引用传 eventBus.on 绑不上回调（订阅静默失效）；
+  // 须箭头包装，on/off 同一引用故存具名 const
+  const onChatFinishedEvent = (_data: any): void => { handleChatFinishedEvent(_data); };
+
+  /** 不依赖弹层 slot 挂载：项目存本组件，任务首屏放跨实例缓存。 */
+  async function preloadDrawerData(): Promise<void> {
+    if (!props.isLoggedIn) return;
+    const pending = projectRequestPromise;
+    if (pending != null) await pending;
+    if (!props.isLoggedIn) return;
+    if (!projectLoadedOnce) requestProjects();
+    const loaded = await prefetchConversationList();
+    if (loaded && props.isLoggedIn) callRefMethod(taskListRef.value, "loadIfEmpty");
+  }
+
+  watch((): boolean => props.isLoggedIn, (loggedIn: boolean) => {
+    if (loggedIn) {
+      preloadDrawerData();
+      return;
+    }
+    projectDataGeneration++;
+    projectLoadedOnce = false;
+    projectGroupsData = [] as ProjectGroupView[];
+    projectHasMore = false;
+    projectNextPage = 1;
+    projectTotalPagesCache = 0;
+    projectTotalCountCache = 0;
+    projectVersion.value++;
+    syncProjectLoadMoreState();
+    clearCachedConversationList();
+  });
+
+  onMounted(() => {
+    eventBus.on(`${EVENT_TYPE.ChatFinished}`, onChatFinishedEvent);
+    preloadDrawerData();
+    nextTick(() => {
+      listMounted.value = true;
+    });
+  });
+
+  onUnmounted(() => {
+    clearDrawerAnimation();
+    if (drawerRegistryId != 0) unregisterPopupClose(drawerRegistryId);
+    drawerRegistryId = 0;
+    eventBus.off(`${EVENT_TYPE.ChatFinished}`, onChatFinishedEvent);
+    refreshing.value = false;
+    listMounted.value = false;
+  });
+
+  defineExpose({
+    open: open as any,
+    beginOpenDrag: beginOpenDrag as any,
+    updateOpenDrag: updateOpenDrag as any,
+    endOpenDrag: endOpenDrag as any,
+    close: close as any,
+    resumeData: resumeData as any,
+    refreshProjects: refreshProjects as any,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .drawer-overlay { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 999; overflow: hidden; }
+  .drawer-mask { position: absolute; top: 0; right: 0; bottom: 0; left: 0; background-color: rgba(0, 0, 0, 0.4); transition-property: opacity; transition-timing-function: ease-out; }
+  .drawer-panel { position: absolute; top: 0; bottom: 0; left: 0; display: flex; flex-direction: column; background-color: #ffffff; border-top-right-radius: 20rpx; border-bottom-right-radius: 20rpx; overflow: hidden; transition-property: transform; transition-timing-function: ease-out; }
+
+  .drawer-wrap {
+    position: relative;
+    width: 100%;
+    /* 高度链用 flex 而非 height:100%（iOS 上百分比高度对 flex 计算父级会断裂） */
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    background-color: #ffffff;
+    /* #ifdef APP-IOS */
+    /* 抽屉面板 fixed 锚到物理屏底（含 home 指示条区域），底部内容留出安全区 */
+    padding-bottom: env(safe-area-inset-bottom);
+    /* #endif */
+  }
+
+  .drawer-scroll {
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .drawer-list-area {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+  }
+
+  /* 吸顶/浮头场景下分组头必须不透明（PC 同款防穿帮：滚动内容不得从头后透出） */
+  .section-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12rpx 32rpx 10rpx;
+    background-color: #ffffff;
+
+    .section-title-text {
+      font-size: 28rpx;
+      font-weight: 400;
+      color: #8b8e96;
+      line-height: 40rpx;
+    }
+
+    .header-search-btn {
+      flex-shrink: 0;
+      width: 56rpx;
+      height: 56rpx;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-right: -8rpx;
+    }
+  }
+
+  /* 分组头文案行：标题 + 紧随的折叠箭头（对齐 PC：chevron 跟在 label 文案旁） */
+  .header-title-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  /* 分组折叠箭头（与项目行箭头同视觉） */
+  .section-arrow {
+    flex-shrink: 0;
+    font-size: 24rpx;
+    color: #939397;
+    margin-left: 8rpx;
+  }
+
+  /* 项目区头「全部展开/收起」图标按钮（对齐 PC section-tool：上下双 chevron，
+     与 header-search-btn 同命中区域） */
+  .header-toggle-all-btn {
+    flex-shrink: 0;
+    width: 56rpx;
+    height: 56rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    margin-left: 8rpx;
+  }
+
+  .toggle-all-chevrons {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* 任务分组头：与项目区的间距并入 padding-top（吸顶条整块不透明，不用 margin 防透缝） */
+  .task-section-header {
+    padding-top: 20rpx;
+  }
+
+  /* 任务吸顶头钉在滚动区顶部；项目头与搜索是滚动区外的常驻兄弟节点。 */
+  .floating-section-header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    background-color: #ffffff;
+  }
+
+  // ===== 项目分组（对齐设计稿：无分割线，留白分组） =====
+  /* .project-block 仅剩 scroll-view 分支的分组间距；行样式提升到顶层，
+     供 Android 扁平行（list-item 直挂行 view）与 scroll-view 分支共用 */
+  .project-block {
+    padding-bottom: 8rpx;
+  }
+
+  .project-row {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      padding: 14rpx 32rpx;
+
+      .project-leading-icon {
+        flex-shrink: 0;
+        width: 32rpx;
+        height: 32rpx;
+        margin-right: 4rpx;
+      }
+
+      .project-folder-image {
+        width: 32rpx;
+        height: 32rpx;
+      }
+
+      .project-pin-btn {
+        flex-shrink: 0;
+        width: 40rpx;
+        height: 48rpx;
+        margin-right: 4rpx;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .project-pin-image {
+        width: 23rpx;
+        height: 23rpx;
+      }
+
+      /* 类型标签（2026-09-21 设计稿恢复：常规项目/网页应用/全栈项目，灰底小圆角 pill） */
+      .project-type-tag {
+        flex-shrink: 0;
+        margin-left: 12rpx;
+        padding: 2rpx 12rpx;
+        border-radius: 8rpx;
+        background-color: #f2f3f7;
+        font-size: 20rpx;
+        color: #85858b;
+        line-height: 30rpx;
+      }
+
+      /* 弹性占位：项目名/标签贴左，＋钉在行右缘 */
+      .project-row-flex {
+        flex: 1;
+      }
+
+      .project-team-image {
+        flex-shrink: 0;
+        width: 22rpx;
+        height: 22rpx;
+        margin-right: 8rpx;
+      }
+
+      .project-name {
+        flex-shrink: 1;
+        min-width: 0;
+        font-size: 35rpx;
+        font-weight: 400;
+        color: #29292d;
+        line-height: 48rpx;
+        margin-right: 12rpx;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* ＋按钮（2026-09-21 设计稿：纯＋号无底色，保留 48rpx 命中区域） */
+      .project-add-btn {
+        flex-shrink: 0;
+        width: 48rpx;
+        height: 48rpx;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        .project-add-icon {
+          font-size: 36rpx;
+          color: #929298;
+          line-height: 40rpx;
+        }
+      }
+    }
+
+    .project-child-row {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      padding: 11rpx 32rpx 11rpx 72rpx;
+
+      .child-status {
+        flex-shrink: 0;
+        height: 32rpx;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-right: 12rpx;
+
+        .status-running {
+          color: #5147ff;
+        }
+
+        .status-failed {
+          font-size: 24rpx;
+          color: #e54d4d;
+        }
+      }
+
+      .child-name {
+        flex: 1;
+        min-width: 0;
+        font-size: 30rpx;
+        font-weight: 400;
+        color: #38383d;
+        line-height: 44rpx;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .child-time {
+        flex-shrink: 0;
+        font-size: 22rpx;
+        color: #a0a0a5;
+        line-height: 32rpx;
+        margin-left: 12rpx;
+      }
+    }
+
+    .project-child-empty {
+      padding: 6rpx 32rpx 10rpx 72rpx;
+
+      .project-child-empty-text {
+        font-size: 24rpx;
+        color: #b3b6bd;
+        line-height: 34rpx;
+      }
+    }
+
+  // ===== 空态 =====
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60rpx 0;
+
+    .empty-image {
+      width: 150rpx;
+      height: 150rpx;
+    }
+
+    .empty-text {
+      font-size: 28rpx;
+      color: #999;
+      margin-top: 24rpx;
+    }
+  }
+
+  /* 项目区「查看更多」入口（对齐 PC load-more-entry：小号居中次级文字） */
+  .project-load-more {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    padding: 24rpx 32rpx;
+
+    .project-load-more-text {
+      font-size: 28rpx;
+      color: #8b8e96;
+      line-height: 40rpx;
+    }
+  }
+</style>

@@ -564,6 +564,18 @@ Parser.prototype.onOpenTag = function (selfClose) {
     this.expose();
   }
 
+  // 工具过程 / OpenUI 自定义标签必须 expose：
+  // markdown-it 常把 <markdown-custom-process> 包进 <p>；若不给祖先打 c=1，
+  // node.vue 会把整段 <p> 交给 <rich-text>，OpenUI 原位卡分支永远进不去。
+  if (
+    node.name === "markdown-custom-process" ||
+    node.name === "markdown-custom-process-group" ||
+    node.name === "container" ||
+    node.name === "container-group"
+  ) {
+    this.expose();
+  }
+
   // 处理自闭合标签
   if (close) {
     if (!this.hook(node) || config.ignoreTags[node.name]) {

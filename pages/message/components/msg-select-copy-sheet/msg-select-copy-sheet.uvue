@@ -1,0 +1,558 @@
+<template>
+  <!--
+    消息「选择复制」弹窗（chat.uvue 专用）：
+    - 框架 text 组件不支持气泡内局部选择（微信/飞书式选择手柄），以二级弹层承接：
+      textarea 预填剥掉 Markdown 标记的纯正文（页面侧 plainBodyForCopy 传入），
+      用户长按出系统选择手柄拖动定范围，点系统菜单「复制」只有选中部分进剪贴板
+      （复制动作由系统原生菜单完成，页面不经手选区，框架也不暴露 getSelectionText）。
+    - 纯选择画布（不弹键盘）：Android 经原生 AppCompatEditText 强化——
+      setShowSoftInputOnFocus(false) 点按/长按都不唤起键盘；选择态菜单过滤到只剩
+      复制（滤 全选/Cut/Paste/Share/Translate 等，整段复制走「全选复制」按钮）；
+      点按定位光标不弹菜单。
+      iOS uvue 拿不到 UITextView（getIOSView 限 uts 插件），用 disabled 抑制键盘
+      （菜单项按系统默认，可能多出 Look Up 等系统项）。
+      编辑不回写消息，「全选复制」始终复制原始纯文本，兜底整段复制少退一步。
+    - 高度随内容自适应：estimateBodyHeightRpx 按全角/半角加权字宽估行数，画布夹
+      [84, 840]rpx（超长文内部滚动），面板高度公式同拍随动，不写死。
+    - 下滑关闭手势不启用（enable-swipe-close 不传）：textarea 是原生视图，拖动
+      选择手柄的竖向位移易被 page-container 误判为下滑关闭把手柄拖丢。
+    - 按钮点按沿用 msg-action-sheet 的 touchend/touchcancel 双通道 + 500ms 防重
+      （三星 One UI 在 page-container 原生弹层内 click 合成偶发失败）。
+  -->
+  <uni-modal-popup
+    ref="popupRef"
+    position="bottom"
+    :height="sheetHeight"
+    :show-header="false"
+    :body-scroll="false"
+    @afterleave="handleAfterLeave"
+  >
+    <view class="ms-sheet" :style="sheetStyle">
+      <view class="ms-head">
+        <text class="ms-title">{{ titleText }}</text>
+        <text class="ms-hint">{{ hintText }}</text>
+      </view>
+      <view class="ms-body-wrap">
+        <textarea
+          id="msg-select-copy-textarea"
+          class="ms-body"
+          :style="bodyStyle"
+          v-model="boxText"
+          :maxlength="-1"
+          :show-confirm-bar="false"
+          :disable-default-padding="true"
+          :disabled="iosDisabled"
+        />
+      </view>
+      <view class="ms-btns">
+        <view
+          class="ms-btn"
+          hover-class="ms-btn--hover"
+          @click="handleSelect('cancel')"
+          @touchstart="handleSheetTouchStart($event)"
+          @touchend="handleSheetTouchEnd('cancel', $event)"
+          @touchcancel="handleSheetTouchCancel('cancel', $event)"
+        >
+          <text class="ms-btn__label">{{ cancelText }}</text>
+        </view>
+        <view
+          class="ms-btn ms-btn--primary"
+          hover-class="ms-btn--primary-hover"
+          @click="handleSelect('copyAll')"
+          @touchstart="handleSheetTouchStart($event)"
+          @touchend="handleSheetTouchEnd('copyAll', $event)"
+          @touchcancel="handleSheetTouchCancel('copyAll', $event)"
+        >
+          <text class="ms-btn__label ms-btn__label--primary">{{ copyAllText }}</text>
+        </view>
+      </view>
+    </view>
+  </uni-modal-popup>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref, watch, type ComponentPublicInstance } from "vue";
+  import { translateText } from "@/utils/i18n";
+  import { writeClipboardText } from "@/utils/clipboard.uts";
+  // #ifdef APP-ANDROID
+  import AppCompatEditText from "androidx.appcompat.widget.AppCompatEditText";
+  import ActionMode from "android.view.ActionMode";
+  import Menu from "android.view.Menu";
+  import MenuItem from "android.view.MenuItem";
+  import R from "android.R";
+  // #endif
+
+  const props = withDefaults(
+    defineProps<{
+      /** 待选择复制的纯文本（页面按消息正文剥标记后传入；空文本页面侧已拦，不弹）。 */
+      text?: string;
+    }>(),
+    {
+      text: "",
+    },
+  );
+
+  const emit = defineEmits<{
+    (e: "closed"): void;
+  }>();
+
+  const popupRef = ref<any | null>(null);
+
+  /** textarea 本地副本：承载纯文本供系统选择手柄圈选（键盘已抑制不可编辑，个别机型
+   *  漏抑制被改也不回写消息），「全选复制」始终取传入原文。 */
+  const boxText = ref<string>("");
+
+  /** iOS 键盘抑制开关：uvue 侧拿不到 UITextView（getIOSView 须在 uts 插件内用），
+   *  disabled 走 editable=false——selectable 默认开，长按选择与系统 复制/全选 菜单
+   *  仍在（可能多出 Look Up 等系统项，iOS 无滤菜单钩子）；Android/H5 恒 false。
+   *  ★真机待验：若 disabled 连长按选择一并关死，iOS 改走 uts 插件覆写
+   *  canPerformAction 剔菜单。 */
+  const iosDisabled = ref<boolean>(false);
+  // #ifdef APP-IOS
+  iosDisabled.value = true;
+  // #endif
+
+  // ===== 画布/面板高度自适应常量（rpx 域，随 rpx 缩放与设备无关）=====
+  const BODY_MIN_RPX = 84; // 1 行（44 行高 + 40 内距）：极短文本下限
+  const BODY_MAX_RPX = 840; // 画布上限（2026-10-08 由旧固定值 560 上调 50%），超长文触顶后画布内部滚动
+  const BODY_LINE_RPX = 44; // .ms-body 行高
+  const BODY_PAD_RPX = 40; // .ms-body 上下内距合计
+  const BODY_CJK_RPX = 30; // 全角字宽 ≈ 字号 30rpx
+  const BODY_LATIN_RPX = 17; // 半角字宽经验值 ≈ 0.55 字宽
+  const BODY_CONTENT_RPX = 646; // 画布内容宽 = 750 - 32×2 缩进（外层内距）- 20×2 画布内距
+
+  /** 选择画布高度（rpx）：open 时按文本估出，sheetHeight/bodyStyle 同拍随动。 */
+  const bodyHeightRpx = ref<number>(BODY_MIN_RPX);
+
+  const titleText = computed((): string => translateText("Mobile.Message.actionSelectCopy"));
+  const hintText = computed((): string => translateText("Mobile.Message.selectCopyHint"));
+  const cancelText = computed((): string => translateText("Mobile.Common.cancel"));
+  const copyAllText = computed((): string => translateText("Mobile.Message.selectCopyAll"));
+
+  // ===== 点选触摸判定态（同 msg-action-sheet：三星 One UI 弹层内 click 合成偶发失败，
+  //       touchend 主通道 + click 兜底 + 500ms 同 key 防重）=====
+  let sheetTouchStartX = 0;
+  let sheetTouchStartY = 0;
+  let lastSelectKey = "";
+  let lastSelectAtMs = 0;
+  const SELECT_DEDUPE_MS = 500;
+
+  /** 记点按起点（鸿蒙系 touchstart touches 可能为空，changedTouches 互补读取）。 */
+  function handleSheetTouchStart(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
+    if (e.touches.length > 0) {
+      sheetTouchStartX = e.touches[0].clientX;
+      sheetTouchStartY = e.touches[0].clientY;
+      return;
+    }
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      sheetTouchStartX = e.changedTouches[0].clientX;
+      sheetTouchStartY = e.changedTouches[0].clientY;
+    }
+  }
+
+  /** 抬手落点位移 ≤12px 判点按（落点 changedTouches 优先、touches 兜底）。 */
+  function isSheetTap(eventValue: Any): boolean {
+    const e = eventValue as UniTouchEvent;
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      const dx = e.changedTouches[0].clientX - sheetTouchStartX;
+      const dy = e.changedTouches[0].clientY - sheetTouchStartY;
+      return Math.abs(dx) <= 12 && Math.abs(dy) <= 12;
+    }
+    if (e.touches.length > 0) {
+      const dx = e.touches[0].clientX - sheetTouchStartX;
+      const dy = e.touches[0].clientY - sheetTouchStartY;
+      return Math.abs(dx) <= 12 && Math.abs(dy) <= 12;
+    }
+    return false;
+  }
+
+  /** easycom 子组件须走 $callMethod（uni-modal-popup expose open/close，同 msg-action-sheet）。 */
+  function callPopupMethod(methodName: string): void {
+    const proxy = popupRef.value as ComponentPublicInstance | null;
+    if (proxy == null) {
+      return;
+    }
+    proxy.$callMethod(methodName);
+  }
+
+  function close(): void {
+    callPopupMethod("close");
+  }
+
+  /** 点选分发：cancel 收面板；copyAll 复制原始纯文本（传入原文，非 boxText 编辑态）
+   *  + toast + 收面板（失败不收，留着手动选择重试）。
+   *  ★须定义在 close 之后（UTS 无提升，前向引用报 error18）。 */
+  function handleSelect(key: string): void {
+    if (key == lastSelectKey && Date.now() - lastSelectAtMs < SELECT_DEDUPE_MS) {
+      return;
+    }
+    lastSelectKey = key;
+    lastSelectAtMs = Date.now();
+    if (key == "copyAll") {
+      const whole = props.text.length > 0 ? props.text : boxText.value;
+      writeClipboardText(
+        whole,
+        () => {
+          uni.showToast({ title: translateText("Mobile.Common.copySuccess"), icon: "none" });
+          close();
+        },
+        () => {
+          uni.showToast({ title: translateText("Mobile.Common.copyFailed"), icon: "none" });
+        },
+      );
+      return;
+    }
+    close();
+  }
+
+  /** touchend 派发（主通道）。 */
+  function handleSheetTouchEnd(key: string, eventValue: Any): void {
+    if (isSheetTap(eventValue)) {
+      handleSelect(key);
+    }
+  }
+
+  /** touchcancel 派发（下滑/滚动抢占时抬手收到 cancel；静点按同样派发）。 */
+  function handleSheetTouchCancel(key: string, eventValue: Any): void {
+    const tap = isSheetTap(eventValue);
+    sheetTouchStartX = 0;
+    sheetTouchStartY = 0;
+    if (tap) {
+      handleSelect(key);
+    }
+  }
+
+  /** 单字显示宽（rpx）估算：CJK/全角字符按整字宽（≈字号），其余半角按约 0.55 字宽；
+   *  够用于行数估算（上下限钳制后残差无感，宁高勿裁）。 */
+  function charWidthRpx(ch: string): number {
+    const code = ch.charCodeAt(0);
+    if (code == null) {
+      return BODY_LATIN_RPX;
+    }
+    if (code > 11903) {
+      return BODY_CJK_RPX;
+    }
+    return BODY_LATIN_RPX;
+  }
+
+  /** 按内容估画布高（rpx）：显式换行分段，段内按加权字宽折行计数，行数×行高+内距，
+   *  夹 [BODY_MIN_RPX, BODY_MAX_RPX]；未触顶再补半行余量防字体实宽略超估算。 */
+  function estimateBodyHeightRpx(text: string): number {
+    if (text.length == 0) {
+      return BODY_MIN_RPX;
+    }
+    let lines = 0;
+    const paras = text.split("\n");
+    for (let i = 0; i < paras.length; i++) {
+      let width = 0;
+      const para = paras[i];
+      for (let j = 0; j < para.length; j++) {
+        width += charWidthRpx(para.charAt(j));
+      }
+      lines += Math.max(1, Math.ceil(width / BODY_CONTENT_RPX));
+    }
+    const est = BODY_PAD_RPX + lines * BODY_LINE_RPX;
+    if (est >= BODY_MAX_RPX) {
+      return BODY_MAX_RPX;
+    }
+    if (est <= BODY_MIN_RPX) {
+      return BODY_MIN_RPX;
+    }
+    return Math.min(BODY_MAX_RPX, est + BODY_LINE_RPX / 2);
+  }
+
+  // ===== Android 原生强化：键盘抑制 + 选择菜单过滤（chat.uvue 同款
+  //       uni.getElementById → getAndroidView → instanceof 拿 AppCompatEditText；
+  //       接口覆写类参照 utils/im/imPrependAnchor.uts 的 implements 写法）=====
+  // #ifdef APP-ANDROID
+  /** 选择态菜单只留 复制（保留系统原装菜单项，点击仍走系统默认处理），滤掉
+   *  全选/Cut/Paste/Replace/Share/Translate/WebSearch 等——整段复制的诉求由面板
+   *  「全选复制」按钮承接，菜单里不再给全选。 */
+  class SelectCopyModeCallback implements ActionMode.Callback {
+    constructor() {
+      super();
+    }
+
+    /** 倒序遍历删白名单外菜单项（onCreate/onPrepare 双钩都滤，防系统后补项）。 */
+    filterMenuItems(menu: Menu | null): void {
+      if (menu == null) {
+        return;
+      }
+      for (let i = menu.size() - 1; i >= 0; i--) {
+        const item: MenuItem | null = menu.getItem(i);
+        if (item == null) {
+          continue;
+        }
+        const id = item.getItemId();
+        if (id != R.id.copy) {
+          menu.removeItem(id);
+        }
+      }
+    }
+
+    override onCreateActionMode(mode: ActionMode | null, menu: Menu | null): boolean {
+      this.filterMenuItems(menu);
+      return true;
+    }
+
+    override onPrepareActionMode(mode: ActionMode | null, menu: Menu | null): boolean {
+      this.filterMenuItems(menu);
+      return false;
+    }
+
+    override onActionItemClicked(mode: ActionMode | null, item: MenuItem | null): boolean {
+      return false;
+    }
+
+    override onDestroyActionMode(mode: ActionMode | null): void {}
+  }
+
+  /** 点按定位光标的插入菜单：纯选择场景一律不弹（onCreateActionMode 回 false 即拦）。 */
+  class NoInsertionModeCallback implements ActionMode.Callback {
+    constructor() {
+      super();
+    }
+
+    override onCreateActionMode(mode: ActionMode | null, menu: Menu | null): boolean {
+      return false;
+    }
+
+    override onPrepareActionMode(mode: ActionMode | null, menu: Menu | null): boolean {
+      return false;
+    }
+
+    override onActionItemClicked(mode: ActionMode | null, item: MenuItem | null): boolean {
+      return false;
+    }
+
+    override onDestroyActionMode(mode: ActionMode | null): void {}
+  }
+
+  /** 原生视图幂等强化：不弹键盘（setShowSoftInputOnFocus(false)）+ 两个菜单钩子。
+   *  视图未挂载返回 false 供上层重试。 */
+  function applyAndroidSelectOnly(): boolean {
+    const el = uni.getElementById("msg-select-copy-textarea");
+    if (el == null) {
+      return false;
+    }
+    const host = el.getAndroidView();
+    if (host instanceof AppCompatEditText) {
+      const edit = host as AppCompatEditText;
+      edit.setShowSoftInputOnFocus(false);
+      edit.setCustomSelectionActionModeCallback(new SelectCopyModeCallback());
+      edit.setCustomInsertionActionModeCallback(new NoInsertionModeCallback());
+      return true;
+    }
+    return false;
+  }
+
+  /** 超长文画布内部滚动的复位：设文本后框架把光标带去末尾并触发 bring-into-view
+   *  自动滚到底，这里把光标挪回首、scrollY 归零，打开时始终从顶部呈现；
+   *  若用户已极速圈选出选区（起止不等）则不打扰。 */
+  function resetAndroidScrollTop(): void {
+    const el = uni.getElementById("msg-select-copy-textarea");
+    if (el == null) {
+      return;
+    }
+    const host = el.getAndroidView();
+    if (host instanceof AppCompatEditText) {
+      const edit = host as AppCompatEditText;
+      if (edit.getSelectionStart() != edit.getSelectionEnd()) {
+        return;
+      }
+      edit.setSelection(0);
+      edit.scrollTo(0, 0);
+    }
+  }
+  // #endif
+
+  /** 打开弹层并重置编辑副本/防重窗。文案优先取入参（$callMethod 同步执行时 props.text
+   *  可能尚未随父级赋值落地，直传值最稳）；入参为空再回落 props.text。
+   *  ★不能带默认参：defineExpose 的 open as any 引用带默认参的函数时，UTS→Kotlin
+   *  不生成 ::可调用引用，报「Function invocation 'open(...)' expected」（零参同款
+   *  写法在 msg-action-sheet 已验证可编）。 */
+  function open(text: string): void {
+    const src = text.length > 0 ? text : props.text;
+    boxText.value = src;
+    bodyHeightRpx.value = estimateBodyHeightRpx(src);
+    lastSelectKey = "";
+    lastSelectAtMs = 0;
+    callPopupMethod("open");
+    // Android：page-container 内容首次 open 才挂载，原生视图延迟就位；setter 幂等，
+    // 双档延迟重试 + 每次打开重抹一遍，兜框架/机型把属性复位的情况；顺带复位内部
+    // 滚动到顶部（设文本后框架可能带光标滚到底）。
+    // #ifdef APP-ANDROID
+    setTimeout(() => {
+      applyAndroidSelectOnly();
+      resetAndroidScrollTop();
+    }, 200);
+    setTimeout(() => {
+      applyAndroidSelectOnly();
+      resetAndroidScrollTop();
+    }, 600);
+    // #endif
+  }
+
+  /** props.text 迟到补写：$callMethod 先于 props 更新执行时 boxText 先拿到入参，
+   *  这里兜「入参没传上」的端。props.text 只在打开前赋值/关闭后清空两处变化：
+   *  清空传空串被非空守卫跳过、下次打开 open() 本就重置 boxText，均不打扰编辑态。 */
+  watch(
+    (): string => props.text,
+    (val: string) => {
+      if (val.length > 0 && boxText.value != val) {
+        boxText.value = val;
+        bodyHeightRpx.value = estimateBodyHeightRpx(val);
+      }
+    },
+  );
+
+  /** 完全收起后通知页面清承接文本（同 msg-action-sheet 的 closed 语义）。 */
+  function handleAfterLeave(): void {
+    emit("closed");
+  }
+
+  /**
+   * 底部安全距离（同 msg-action-sheet）：App 端样式表 env(safe-area-inset-bottom)
+   * 不可靠，内联 24rpx 基础 + 系统安全区（px）；H5/小程序走样式表 env()。
+   */
+  const sheetStyle = computed((): string => {
+    let style = "";
+    // #ifdef APP
+    try {
+      const win = uni.getWindowInfo();
+      const scale = win.windowWidth / 750;
+      const basePx = scale > 0 ? Math.round(24 * scale) : 24;
+      style = `padding-bottom: ${basePx + win.safeAreaInsets.bottom}px;`;
+    } catch (_e) {
+      style = "";
+    }
+    // #endif
+    return style;
+  });
+
+  /** 面板高度 = 顶部圆角区 + 标题/提示 + 画布（随内容自适应）+ 按钮行 + 底部留白 + 安全区（rpx）。 */
+  const sheetHeight = computed((): string => {
+    let safeRpx = 0;
+    try {
+      const win = uni.getWindowInfo();
+      const scale = win.windowWidth / 750;
+      if (scale > 0) {
+        safeRpx = Math.ceil(win.safeAreaInsets.bottom / scale);
+      }
+    } catch (_e) {
+      safeRpx = 0;
+    }
+    const h = 16 + 94 + 20 + bodyHeightRpx.value + 24 + 88 + 24 + safeRpx;
+    return `${h}rpx`;
+  });
+
+  /** 画布高度内联下发（class 不再写死，触顶 BODY_MAX_RPX 后 textarea 内部滚动）。 */
+  const bodyStyle = computed((): string => `height: ${bodyHeightRpx.value}rpx;`);
+
+  defineExpose({
+    open: open as any,
+    close: close as any,
+  });
+</script>
+
+<style lang="scss" scoped>
+  .ms-sheet {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: #ffffff;
+    border-top-left-radius: 32rpx;
+    border-top-right-radius: 32rpx;
+    padding-top: 16rpx;
+    /* #ifndef APP */
+    padding-bottom: calc(24rpx + env(safe-area-inset-bottom));
+    /* #endif */
+  }
+
+  /* 标题 + 操作提示（选择手柄交互不常见，一句话引导） */
+  .ms-head {
+    display: flex;
+    flex-direction: column;
+    padding-left: 32rpx;
+    padding-right: 32rpx;
+    padding-top: 12rpx;
+  }
+
+  .ms-title {
+    font-size: 32rpx;
+    font-weight: 600;
+    line-height: 44rpx;
+    color: #1c1b20;
+  }
+
+  .ms-hint {
+    margin-top: 4rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #8f8e99;
+  }
+
+  /* 画布水平缩进与标题/提示左对齐（双侧 32rpx）：缩进放外层 view 的内距——
+     textarea 原生视图的水平外距在部分机型上不生效，view 内距可靠 */
+  .ms-body-wrap {
+    margin-top: 20rpx;
+    padding-left: 32rpx;
+    padding-right: 32rpx;
+  }
+
+  /* 选择画布：浅灰底圆角，高度由 bodyStyle 内联下发（随内容自适应、上限 840rpx 内部滚动） */
+  .ms-body {
+    width: 100%;
+    padding: 20rpx;
+    font-size: 30rpx;
+    line-height: 44rpx;
+    color: #1c1b20;
+    background-color: #f6f5fb;
+    border-radius: 16rpx;
+  }
+
+  .ms-btns {
+    display: flex;
+    flex-direction: row;
+    margin-top: 24rpx;
+    padding-left: 32rpx;
+    padding-right: 32rpx;
+  }
+
+  .ms-btn {
+    flex: 1;
+    height: 88rpx;
+    border-radius: 44rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    background-color: #f0eff7;
+    margin-right: 24rpx;
+  }
+
+  .ms-btn--hover {
+    background-color: #e6e4f0;
+  }
+
+  .ms-btn--primary {
+    background-color: #5147ff;
+    margin-right: 0;
+  }
+
+  .ms-btn--primary-hover {
+    background-color: #4238e0;
+  }
+
+  .ms-btn__label {
+    font-size: 30rpx;
+    line-height: 42rpx;
+    color: #1c1b20;
+  }
+
+  .ms-btn__label--primary {
+    color: #ffffff;
+  }
+</style>

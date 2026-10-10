@@ -1,0 +1,173 @@
+import { UniAiChunk, UniAiRequestAiCoMessage } from '@/uni_modules/uni-ai-x/types.uts';
+import { openClawWebSocketUrl } from '@/uni_modules/uni-ai-x/config.uts';
+
+type BailianOptionsOnChunkFn = (chunkObj : UniAiChunk) => void
+type BailianOptionsOnErrorFn = (err : UTSJSONObject) => void
+type BailianOptionsOnDoneFn = (data : UTSJSONObject) => void
+
+export type WebSocketCallbacks = {
+	onChunk ?: BailianOptionsOnChunkFn,
+	onError ?: BailianOptionsOnErrorFn,
+	onDone ?: BailianOptionsOnDoneFn
+}
+
+/**
+ * OpenClaw WebSocket 客户端（已移除 uniCloud.connectWebSocket，改为直连配置的 WS 地址）。
+ */
+class WebSocketManager {
+	private socketTask: SocketTask | null = null
+	private connected: boolean = false
+	private currentCallbacks: WebSocketCallbacks | null = null
+
+	async connectWebSocket(): Promise<void> {
+		if (this.connected) {
+			console.log('已经处于连接状态，无需重新连接')
+			return
+		}
+		const wsUrl = openClawWebSocketUrl
+		if (wsUrl.length == 0) {
+			throw new Error('请在 uni_modules/uni-ai-x/config.uts 中配置 openClawWebSocketUrl')
+		}
+
+		await new Promise<void>((resolve, reject) => {
+			const socketTask = uni.connectSocket({
+				url: wsUrl,
+				fail: (err) => {
+					reject(err)
+				}
+			})
+
+			socketTask.onOpen((_event) => {
+				console.log('WebSocket 连接成功')
+				this.connected = true
+				socketTask.onMessage((res) => {
+					this.handleMessage(res)
+				})
+				socketTask.onError((err) => {
+					console.error('WebSocket 错误', err)
+					this.connected = false
+				})
+				socketTask.onClose((_res) => {
+					console.log('WebSocket 已关闭')
+					this.connected = false
+				})
+				this.socketTask = socketTask
+				resolve()
+			})
+
+			socketTask.onError((err) => {
+				reject(err)
+			})
+		})
+	}
+
+	async init() {
+		if (openClawWebSocketUrl.length == 0) {
+			return
+		}
+		await this.connectWebSocket()
+	}
+
+	private handleMessage(res: OnSocketMessageCallbackResult) {
+		if (this.currentCallbacks == null) {
+			return
+		}
+		try {
+			const data = typeof res.data == 'string' ? res.data : JSON.stringify(res.data)
+			const message = JSON.parse<UTSJSONObject>(data) as UTSJSONObject
+			const type = message.getString('type', '')
+
+			if (type == 'openclaw_message') {
+				const openClawData = message.getJSON('data')
+				if (openClawData != null) {
+					const content = openClawData.getString('text', '')
+					const isDone = openClawData.getBoolean('isDone', false)
+
+					if (content.length > 0) {
+						const chunkObj: UniAiChunk = {
+							choices: [{
+								delta: { content: content }
+							}]
+						}
+						this.currentCallbacks.onChunk?.(chunkObj)
+					}
+
+					if (isDone) {
+						this.currentCallbacks.onDone?.({} as UTSJSONObject)
+						this.currentCallbacks = null
+					}
+				}
+			} else if (type == 'error') {
+				const errMsg = message.getString('message', '未知错误')
+				const errInfo: UTSJSONObject = {
+					errCode: -202,
+					errMsg: errMsg
+				}
+				this.currentCallbacks.onError?.(errInfo)
+				this.currentCallbacks = null
+			}
+		} catch (e) {
+			console.error('解析 WebSocket 消息失败', e)
+		}
+	}
+
+	async send(messages: UniAiRequestAiCoMessage[], model: string, chat_id: string, callbacks: WebSocketCallbacks): Promise<boolean> {
+		if (!this.connected) {
+			console.log('WebSocket 未连接，尝试重新连接')
+			await this.connectWebSocket()
+
+			if (!this.connected) {
+				console.error('WebSocket 重连失败')
+				const errInfo: UTSJSONObject = {
+					errCode: -203,
+					errMsg: 'WebSocket 未连接，且重连失败'
+				}
+				callbacks.onError?.(errInfo)
+				return false
+			}
+		}
+
+		const lastUserMessage = messages.reverse().find((item) => item.role == 'user')
+		if (lastUserMessage == null) {
+			console.error('最后一条用户发送的消息为空')
+			return false
+		}
+		this.currentCallbacks = callbacks
+
+		let lastUserMessageText = ''
+		if (lastUserMessage.content instanceof Array) {
+			lastUserMessageText = lastUserMessage.content.map((item) => item.type == 'text' ? item.text : ("图片地址：" + item.image_url?.url)).join('\n')
+		} else {
+			lastUserMessageText = lastUserMessage.content
+		}
+
+		const messageData = {
+			text: lastUserMessageText,
+			timestamp: Date.now(),
+			chat_id: chat_id
+		}
+		this.socketTask!.send({
+			data: JSON.stringify(messageData),
+			success: () => {
+				console.log('消息发送成功', JSON.stringify(messageData))
+			},
+			fail: (err) => {
+				console.error('消息发送失败', err)
+				const errInfo: UTSJSONObject = {
+					errCode: -201,
+					errMsg: '发送消息失败'
+				}
+				callbacks.onError?.(errInfo)
+				this.currentCallbacks = null
+			}
+		})
+
+		return true
+	}
+
+	isConnected(): boolean {
+		return this.connected
+	}
+}
+
+export default WebSocketManager

@@ -8,7 +8,7 @@ import { isString } from '../isString'
 // function toBoolean(value : boolean) : boolean;
 
 // #ifdef UNI-APP-X && APP
-function toBoolean(value : any | null) : boolean {
+export function toBoolean(value : any | null) : boolean {
 	// 根据输入值的类型，返回相应的布尔值
 	// if (isNumber(value)) {
 	// 	return (value as number) != 0;
@@ -30,11 +30,7 @@ function toBoolean(value : any | null) : boolean {
 
 
 // #ifndef UNI-APP-X && APP
-function toBoolean(value : any | null) : value is NonNullable<typeof value> {
+export function toBoolean(value : any | null) : value is NonNullable<typeof value> {
 	return !!value//value !== null && value !== undefined;
 }
 // #endif
-
-export {
-	toBoolean
-}

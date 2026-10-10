@@ -1,0 +1,147 @@
+import { getCurrentPageFullPath } from "@/utils/common";
+import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+
+/** 普通登录页路径（App / H5） */
+export const LOGIN_PAGE_PATH = "/subpackages/pages/login/login";
+/** 微信小程序登录页路径 */
+export const LOGIN_WEIXIN_PAGE_PATH = "/subpackages/pages/login-weixin/login-weixin";
+
+/**
+ * 冷启动分流（App.onLaunch 无 Token）与接口 4010 踢登录会在同一时刻多次要求跳登录页，
+ * 每一次 uni.reLaunch 都会销毁并重建登录页（整页重排 + 重渲染），表现为登录页连续闪烁。
+ * 这里统一收口跳转：已经在登录页、或上一次跳转尚未落地时直接跳过。
+ */
+const LOGIN_REDIRECT_DEDUPE_MS = 3000;
+let loginRedirecting = false;
+let lastLoginRedirectAt = 0;
+
+// #ifdef H5 || WEB
+function readNativeLoginRequestId(): string {
+  const w = window as any;
+  try {
+    const parts = `${w.location.hash}`.split('?').join('&').split('&');
+    let requestId = '';
+    let nativeLoginSupported = false;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] == 'appNativeLogin=1') nativeLoginSupported = true;
+      if (parts[i].startsWith('offlineH5RequestId=')) {
+        requestId = decodeURIComponent(parts[i].substring('offlineH5RequestId='.length));
+      }
+    }
+    if (nativeLoginSupported) return requestId;
+  } catch (_error) {
+    // 普通 H5 / 无容器身份的旧页面继续用自身登录路由。
+  }
+  return '';
+}
+
+/** 离线包不包含登录页；请求原生宿主清理登录态并打开原生登录页。 */
+function requestNativeLogin(): void {
+  const w = window as any;
+  const requestId = readNativeLoginRequestId();
+  const bridge = w.OfflineH5Bridge;
+  if (bridge != null && bridge.authRequired != null) {
+    bridge.authRequired(requestId);
+    return;
+  }
+  // 远程回退页也可能运行在桥 SDK 安装之前，短重试窗口保证不丢登录请求。
+  let attempts = 0;
+  const send = (): void => {
+    if (requestId.length == 0) return;
+    attempts += 1;
+    try {
+      if (w.uni != null && w.uni.webView != null) {
+        w.uni.webView.postMessage({ data: { type: 'OFFLINE_H5_AUTH_REQUIRED', protocolVersion: 1, requestId: requestId } });
+        return;
+      }
+    } catch (_error) {
+      // 桥仍在安装时继续等下一拍。
+    }
+    if (attempts < 120) setTimeout(send, 250);
+  };
+  send();
+}
+// #endif
+
+/** 仅显式支持登录交接的 App 容器可接管；浏览器 H5 和旧宿主继续走 H5 登录。 */
+export function canRequestNativeLogin(): boolean {
+  // #ifdef H5 || WEB
+  return isAppWebViewEmbedded() && readNativeLoginRequestId().length > 0;
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/** 当前是否已经停留在登录页（普通登录页或微信登录页） */
+export function isOnLoginPage(): boolean {
+  const currentUrl = getCurrentPageFullPath();
+  return (
+    currentUrl.includes(LOGIN_PAGE_PATH) ||
+    currentUrl.includes(LOGIN_WEIXIN_PAGE_PATH)
+  );
+}
+
+/**
+ * 去重跳转登录页。
+ * @param url 目标登录页地址（可带 redirect 参数）
+ * @returns 是否真正发起了跳转
+ */
+export function redirectToLoginOnce(url: string = LOGIN_PAGE_PATH): boolean {
+  // #ifdef H5 || WEB
+  if (canRequestNativeLogin()) {
+    const now = Date.now();
+    if (loginRedirecting && now - lastLoginRedirectAt < LOGIN_REDIRECT_DEDUPE_MS) return false;
+    loginRedirecting = true;
+    lastLoginRedirectAt = now;
+    requestNativeLogin();
+    return true;
+  }
+  // #endif
+  if (isOnLoginPage()) {
+    loginRedirecting = false;
+    return false;
+  }
+  const now = Date.now();
+  if (loginRedirecting && now - lastLoginRedirectAt < LOGIN_REDIRECT_DEDUPE_MS) {
+    return false;
+  }
+  loginRedirecting = true;
+  lastLoginRedirectAt = now;
+  uni.reLaunch({
+    url: url,
+    complete: (_res: any) => {
+      loginRedirecting = false;
+    },
+  });
+  return true;
+}
+
+/**
+ * 跳转到登录页面的公共函数
+ * 自动检测当前页面 URL，若当前已处于登录页，则不追加 redirect 参数。
+ * @param reLaunch 是否使用 uni.reLaunch 代替 uni.navigateTo（默认为 false）
+ */
+export function goToLogin(reLaunch: boolean = false): void {
+  // #ifdef H5 || WEB
+  if (canRequestNativeLogin()) {
+    redirectToLoginOnce();
+    return;
+  }
+  // #endif
+  const currentUrl = getCurrentPageFullPath();
+  // 判断当前页面是否已经是登录页（包括普通登录页和微信登录页）
+  const isLoginPage =
+    currentUrl.includes(LOGIN_PAGE_PATH) ||
+    currentUrl.includes(LOGIN_WEIXIN_PAGE_PATH);
+
+  const targetUrl = isLoginPage
+    ? LOGIN_PAGE_PATH
+    : LOGIN_PAGE_PATH + "?redirect=" + encodeURIComponent(currentUrl);
+
+  if (reLaunch) {
+    uni.reLaunch({ url: targetUrl });
+  } else {
+    uni.navigateTo({ url: targetUrl });
+  }
+}

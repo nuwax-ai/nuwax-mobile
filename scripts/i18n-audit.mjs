@@ -11,6 +11,7 @@ const excludeFiles = new Set([
   "components/pane-tabs/example.uvue",
   "utils/mockInterventionData.uts",
   "utils/mockApiService.uts",
+  "utils/mockProvisionData.uts",
   "utils/pinyin.uts",
 ]);
 const excludePathPrefixes = ["subpackages/uni_modules/"];

@@ -1,0 +1,233 @@
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { isAppInBackground } from "@/utils/appLifecycle";
+import { computed, ref, type Ref } from "vue";
+import { hasLoginSession } from "@/utils/authSession";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { CUSTOM_TAB_BAR_ENABLED } from "@/constants/customTabBar.constants";
+import { resolveMainTabPagePath } from "@/utils/mainTabNavigation";
+import { EVENT_TYPE } from "@/constants/event.constants";
+import { apiImUnreadTotal } from "@/servers/im";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+import eventBus from "@/utils/eventBus";
+
+/** 「消息」Tab 序号（各平台均为 0；iOS 不显示应用 Tab）。 */
+const MESSAGE_TAB_INDEX = 0;
+
+/** 角标链路诊断日志（排查 tabBar 未读不实时；2026-09-28 定位为免打扰减除口径，已对齐飞书，置 false 降噪）。 */
+const IM_UNREAD_DEBUG = false;
+
+function imUnreadLog(msg: string): void {
+  if (IM_UNREAD_DEBUG) {
+    console.log(`[IMUnread] ${msg}`);
+  }
+}
+
+/** IM 未读数响应式变量（角标数字 = total，后端统一计算口径），供 TabBar 徽标与消息页/聊天页返回角标同步渲染。 */
+export const imUnreadCount: Ref<number> = ref<number>(0);
+
+/** 底部 tabBar 0 号槽（伙伴）角标值 = total（后端统一计算口径，客户端直接读）。
+ *  历史：曾在客户端叠「会话未读 + 智联录待我处理申请数 + dndTotal」，后端统一计算
+ *  口径（叠加项均折叠进 total）后全部移除，避免双计。 */
+export const imTabBadgeCount = computed((): number => imUnreadCount.value);
+
+/** TabBar 页面路由（与 pages.json tabBar.list 保持一致；imNoticeBar 横幅 gate 复用）。 */
+export function isTabBarRoute(route: string): boolean {
+  route = resolveMainTabPagePath(route).substring(1);
+  return (
+    route == "pages/index/index" ||
+    route == "pages/message/message" ||
+    route == "pages/expert-list/expert-list" ||
+    // #ifndef APP-IOS
+    route == "pages/app-dev/app-dev" ||
+    // #endif
+    route == "pages/mine/mine"
+  );
+}
+
+/**
+ * TabBar API 要求当前栈顶为 Tab 页，且 TabBar 已挂载。
+ * errCode 100 = TabBar 不存在（非 Tab 页 / 启动过早都会触发）。
+ */
+function canUpdateTabBarBadge(): boolean {
+  const pages = getCurrentPages();
+  if (pages.length == 0) {
+    imUnreadLog("skip: 页面栈为空");
+    return false;
+  }
+  // UTS：Page 实例勿 as any，否则访问 .route 会报「找不到名称 route」
+  const currentPage = pages[pages.length - 1];
+  if (currentPage == null) {
+    return false;
+  }
+  const route = `${currentPage.route}`;
+  if (!isTabBarRoute(route)) {
+    imUnreadLog(`skip: 栈顶 ${route} 非 tab 页（聊天页/二级页期间不刷角标，回 tab 页即恢复）`);
+    return false;
+  }
+  return true;
+}
+
+function clearBadge(): void {
+  if (CUSTOM_TAB_BAR_ENABLED == true) return;
+  if (!canUpdateTabBarBadge()) {
+    return;
+  }
+  try {
+    uni.removeTabBarBadge({
+      index: MESSAGE_TAB_INDEX,
+      fail: (_err) => {
+        // TabBar 未就绪时忽略
+      },
+    });
+  } catch (_e) {
+    // uni-app x 部分端会以异常抛出 UniError
+  }
+}
+
+function setBadge(count: number): void {
+  if (CUSTOM_TAB_BAR_ENABLED == true) return;
+  if (!canUpdateTabBarBadge()) {
+    return;
+  }
+  imUnreadLog(`setTabBarBadge index=${MESSAGE_TAB_INDEX} count=${count}`);
+  try {
+    uni.setTabBarBadge({
+      index: MESSAGE_TAB_INDEX,
+      text: count > 99 ? "99+" : `${count}`,
+      fail: (_err) => {
+        // TabBar 未就绪时忽略，进入 Tab 页后再刷新
+      },
+    });
+  } catch (_e) {
+    // uni-app x 部分端会以异常抛出 UniError
+  }
+}
+
+/** 角标落盘（0 号槽）：值 = total，变化即重设/清除。 */
+function applyTabBarBadge(): void {
+  const count = imTabBadgeCount.value;
+  if (count <= 0) {
+    clearBadge();
+    return;
+  }
+  setBadge(count);
+}
+
+/**
+ * 刷新「消息」Tab 的 IM 未读徽标。
+ * 角标值 = total（由后端统一计算：免打扰等口径已折叠进 total，客户端直接读）。
+ * 历史：曾按 total + dndTotal 在客户端合成对齐飞书，后端统一计算口径后移除叠加。
+ */
+let badgeLoading = false;
+let badgeRefreshOwed = false;
+let badgeRevision = 0;
+
+export async function refreshImUnreadBadge(): Promise<void> {
+  if (isAppInBackground()) return;
+  if (badgeLoading) {
+    badgeRefreshOwed = true;
+    return;
+  }
+  const stamp = getImSessionStamp();
+  const revision = badgeRevision;
+  // storage token 或 H5 生产 Cookie 会话任一成立即视为已登录；H5 读不到 cookie 时
+  // 不能证伪（HttpOnly/path/改名），放行请求由 4010 链路兜底踢登录（同消息页闸门口径）
+  if (!hasLoginSession()) {
+    // #ifndef H5 || WEB
+    imUnreadCount.value = 0;
+    applyTabBarBadge();
+    return;
+    // #endif
+  }
+
+  badgeLoading = true;
+  try {
+    const response = await apiImUnreadTotal();
+    if (stamp != getImSessionStamp() || revision != badgeRevision) return;
+    if (apiResCode(response) != SUCCESS_CODE) {
+      imUnreadLog(`unread-total 接口非成功码: ${apiResCode(response)}`);
+      return;
+    }
+    const dataRaw = apiResData<any>(response);
+    const data = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+    if (data == null) {
+      return;
+    }
+    const totalRaw = data["total"];
+    const total = totalRaw != null ? parseInt(`${totalRaw}`) : 0;
+    const authoritativeRaw = data["authoritative"];
+    const degraded = authoritativeRaw != null && `${authoritativeRaw}` == "false";
+
+    const count = !isNaN(total) && total > 0 ? total : 0;
+    imUnreadLog(`unread-total total=${total} count=${count} degraded=${degraded}`);
+    imUnreadCount.value = count;
+    applyTabBarBadge();
+  } catch (_error) {
+    // 未读数刷新失败时保留上一次徽标。
+  } finally {
+    badgeLoading = false;
+    if (badgeRefreshOwed) {
+      badgeRefreshOwed = false;
+      scheduleWsRefresh();
+    }
+  }
+}
+
+/** 退出登录等场景立即清零徽标。 */
+export function clearImUnreadBadge(): void {
+  badgeRevision += 1;
+  badgeRefreshOwed = false;
+  const timer = wsRefreshTimer;
+  if (timer != null) clearTimeout(timer);
+  wsRefreshTimer = null;
+  imUnreadCount.value = 0;
+  clearBadge();
+}
+
+// ==================== WS 帧驱动 tabBar 角标（最后一环） ====================
+
+/** WS 未读相关帧 → 角标刷新的去抖定时器（群消息风暴合并为一次 HTTP 全量拉取）。 */
+let wsRefreshTimer: number | null = null;
+/** 防重复绑定（App 生命周期内只绑一次）。 */
+let wsEventsBound = false;
+
+/**
+ * WS 帧 → 角标刷新（1s 去抖）：走全量 GET unread-total 而非本地 +1——
+ * 自己在其他端发的消息不计未读、免打扰部分走 dndTotal、已读边界随会话状态变，
+ * 本地加必然算不准；全量拉一次永远与服务端口径一致，风暴期合并为一次请求。
+ * 无轮询：断线/重连窗口由回前台 onShow 全量拉一次兜底（App.uvue）。
+ */
+function scheduleWsRefresh(): void {
+  // 局部变量承接：可变模块属性无法 smart cast 到 Number（Kotlin 并发限制）
+  const timerId = wsRefreshTimer;
+  if (timerId != null || isAppInBackground()) return;
+  wsRefreshTimer = setTimeout(() => {
+    wsRefreshTimer = null;
+    imUnreadLog("ws 去抖到点 → 全量拉 unread-total");
+    refreshImUnreadBadge();
+  }, 1000);
+}
+
+/**
+ * 绑定 WS 事件到 tabBar 角标（App onLaunch 调用一次）：
+ * - im_message_received：来新消息（含自己在 PC 端发的多端同步帧）→ 稍后全量拉
+ * - im_conversation_unread：CONV_UNREAD(6001) 是「自己其他端已读后」的红点同步帧
+ *   （服务端 ImReadStateApplicationService ⑥，只发给自己其他端）→ 全量拉
+ */
+export function bindImUnreadWsEvents(): void {
+  if (wsEventsBound) {
+    return;
+  }
+  wsEventsBound = true;
+  eventBus.on(`${EVENT_TYPE.ImMessagesSynced}`, (_event: any) => { scheduleWsRefresh(); });
+  // 零参函数直接当 EventCallback 传在 UTS→Kotlin 报 Unit≠EventCallback（error17），
+  // 包箭头函数（同 App.uvue NewNotifyMessage 绑定写法）
+  eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, (_event: any) => {
+    imUnreadLog("ws im_message_received → 1s 去抖");
+    scheduleWsRefresh();
+  });
+  eventBus.on(`${EVENT_TYPE.ImConversationUnread}`, (_event: any) => {
+    imUnreadLog("ws im_conversation_unread → 1s 去抖");
+    scheduleWsRefresh();
+  });
+}

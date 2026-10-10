@@ -1,3 +1,4 @@
+// @ts-nocheck
 // 完整类型定义
 export interface LoadingProps {
   color?: string;
@@ -10,7 +11,7 @@ export interface LoadingProps {
   // #endif
   text?: string;
   textColor?: string;
-  textSize?: string;
+  textSize?: string|number;
   mode: 'raf' | 'animate';
   vertical: boolean;
   animated: boolean;

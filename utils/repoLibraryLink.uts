@@ -1,0 +1,307 @@
+/**
+ * 会话里的资料库链接。
+ *
+ * 路径以 `/repo/` 开头即视为资料库。
+ * 移动端不按 PC 那样嵌 iframe、也不校验外链源站：一律改写成
+ * 「当前请求域名 + 链接路径」，并带上 just_show_content、hide_sheet，再交给站内 webview 打开。
+ */
+import { getApiBaseUrl } from "@/constants/config";
+import { isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
+import {
+  navigateToPageOnce,
+  navigateViaWxMiniProgram,
+  postAppWebViewMessage,
+} from "@/utils/system.uts";
+
+/** 资料库路径前缀。 */
+const REPO_LIBRARY_PATH_PREFIX = "/repo/";
+
+/** 只展示文档正文，并收起资料库侧栏。 */
+const REPO_DOC_EMBED_QUERY_KEYS: string[] = ["just_show_content", "hide_sheet"];
+
+const INNER_WEBVIEW_PAGE_PATH = "/subpackages/pages/webview/webview";
+
+/**
+ * 是否为资料库地址。
+ * 会话链接以 `/repo/` 开头；webview 里是拼上域名后的绝对地址，路径仍须以 `/repo/` 开头。
+ * @param pathname 资料库路径或绝对地址
+ */
+export function isRepoLibraryPath(pathname: string): boolean {
+  const value = pathname.trim();
+  const idx = value.indexOf(REPO_LIBRARY_PATH_PREFIX);
+  if (idx < 0) {
+    return false;
+  }
+  if (idx == 0) {
+    return true;
+  }
+  const protoIdx = value.indexOf("://");
+  if (protoIdx < 0) {
+    return false;
+  }
+  return value.indexOf("/", protoIdx + 3) == idx;
+}
+
+function trimTrailingSlash(value: string): string {
+  let result = value;
+  while (result.length > 0 && result.charAt(result.length - 1) == "/") {
+    result = result.substring(0, result.length - 1);
+  }
+  return result;
+}
+
+/**
+ * 资料库页要拼到的请求域名。
+ * App 内嵌离线包以 storage 里的 API 域名为准；浏览器 H5 生产环境接口走同源，域名回退当前页 origin。
+ */
+function resolveRepoRequestOrigin(): string {
+  const base = trimTrailingSlash(getApiBaseUrl().trim());
+  if (base.length > 0) {
+    return base;
+  }
+  // #ifdef H5 || WEB
+  try {
+    const origin = window.location.origin;
+    if (origin != null && `${origin}`.length > 0) {
+      return trimTrailingSlash(`${origin}`);
+    }
+  } catch (_e) {
+    return "";
+  }
+  // #endif
+  return "";
+}
+
+/**
+ * 从相对路径或绝对地址里取出 path / query / hash。
+ * 非 http(s)、锚点、无路径的地址返回空路径。
+ */
+function extractRepoLinkParts(raw: string): string[] {
+  const empty: string[] = ["", "", ""];
+  let value = raw.trim();
+  if (value.length == 0 || value.charAt(0) == "#") {
+    return empty;
+  }
+  if (value.indexOf("//") == 0) {
+    value = `https:${value}`;
+  }
+  const lower = value.toLowerCase();
+  if (
+    lower.indexOf("javascript:") == 0 ||
+    lower.indexOf("mailto:") == 0 ||
+    lower.indexOf("data:") == 0
+  ) {
+    return empty;
+  }
+
+  let path = value;
+  if (lower.indexOf("http://") == 0 || lower.indexOf("https://") == 0) {
+    const protoIdx = value.indexOf("://");
+    const afterProto = value.substring(protoIdx + 3);
+    const slashIdx = afterProto.indexOf("/");
+    if (slashIdx < 0) {
+      return empty;
+    }
+    path = afterProto.substring(slashIdx);
+  } else if (value.indexOf("://") >= 0) {
+    return empty;
+  } else if (value.charAt(0) != "/") {
+    return empty;
+  }
+
+  let hash = "";
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    hash = path.substring(hashIdx);
+    path = path.substring(0, hashIdx);
+  }
+  let query = "";
+  const queryIdx = path.indexOf("?");
+  if (queryIdx >= 0) {
+    query = path.substring(queryIdx + 1);
+    path = path.substring(0, queryIdx);
+  }
+  const parts: string[] = [path, query, hash];
+  return parts;
+}
+
+/** 写入或覆盖一个查询参数，保留链接上已有的其它参数。 */
+function upsertQueryParam(query: string, key: string, value: string): string {
+  const pieces = query.length == 0 ? ([] as string[]) : query.split("&");
+  const kept: string[] = [];
+  let replaced = false;
+  for (let i = 0; i < pieces.length; i++) {
+    const piece = pieces[i];
+    if (piece.length == 0) {
+      continue;
+    }
+    const eq = piece.indexOf("=");
+    const pieceKey = eq >= 0 ? piece.substring(0, eq) : piece;
+    if (pieceKey == key) {
+      if (replaced == false) {
+        kept.push(`${key}=${value}`);
+        replaced = true;
+      }
+    } else {
+      kept.push(piece);
+    }
+  }
+  if (replaced == false) {
+    kept.push(`${key}=${value}`);
+  }
+  return kept.join("&");
+}
+
+/**
+ * 把资料库链接解析成可打开的绝对地址。
+ * 只追加 just_show_content、hide_sheet，不追加登录票据。
+ * @param href 锚点上的原始地址，可以是相对路径或绝对 URL
+ * @returns `{请求域名}{路径}?just_show_content=true&hide_sheet=true`；不是资料库链接时返回空串
+ */
+export function resolveRepoLibraryPreviewUrl(href: string): string {
+  const parts = extractRepoLinkParts(href);
+  const path = parts[0];
+  if (path.length == 0 || isRepoLibraryPath(path) == false) {
+    return "";
+  }
+  const origin = resolveRepoRequestOrigin();
+  if (origin.length == 0) {
+    return "";
+  }
+  let query = parts[1];
+  for (let i = 0; i < REPO_DOC_EMBED_QUERY_KEYS.length; i++) {
+    query = upsertQueryParam(query, REPO_DOC_EMBED_QUERY_KEYS[i], "true");
+  }
+  return `${origin}${path}?${query}${parts[2]}`;
+}
+
+/**
+ * 浏览器 H5 且目标与当前页不同源时，不能放进 web-view 的 iframe。
+ * 资料库页会读 `window.parent.__repoEmbedSeed`，父页面跨域会抛 SecurityError 把文档打挂。
+ * 新开顶层页后 `window.parent === window`，这段读取会直接跳过。
+ */
+function shouldOpenRepoAsTopLevel(target: string): boolean {
+  // #ifdef H5 || WEB
+  if (isAppWebViewEmbedded() == true) {
+    return false;
+  }
+  try {
+    const pageOrigin = `${window.location.origin}`;
+    const protoIdx = target.indexOf("://");
+    if (protoIdx < 0 || pageOrigin.length == 0) {
+      return true;
+    }
+    const afterProto = target.substring(protoIdx + 3);
+    let hostEnd = afterProto.length;
+    const slashIdx = afterProto.indexOf("/");
+    if (slashIdx >= 0 && slashIdx < hostEnd) {
+      hostEnd = slashIdx;
+    }
+    const queryIdx = afterProto.indexOf("?");
+    if (queryIdx >= 0 && queryIdx < hostEnd) {
+      hostEnd = queryIdx;
+    }
+    const targetOrigin = target.substring(0, protoIdx + 3) + afterProto.substring(0, hostEnd);
+    return targetOrigin != pageOrigin;
+  } catch (_e) {
+    return true;
+  }
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/** 以顶层文档打开资料库，避免跨域 iframe 读取父窗口。 */
+function openRepoAsTopLevel(target: string): boolean {
+  // #ifdef H5 || WEB
+  try {
+    const opened = window.open(target, "_blank");
+    if (opened != null) {
+      return true;
+    }
+  } catch (_e) {
+    // 弹窗被拦截时改走当前页跳转
+  }
+  try {
+    window.location.href = target;
+    return true;
+  } catch (_e2) {
+    return false;
+  }
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/**
+ * 资料库预览页路由。不带 noTicket，进入 webview 页后再用登录态换 _ticket。
+ */
+function buildRepoWebviewPageUrl(target: string, title: string): string {
+  const encoded = encodeURIComponent(target);
+  const encodedUrl = encoded != null ? encoded : "";
+  if (encodedUrl.length == 0) {
+    return "";
+  }
+  let pageUrl = `${INNER_WEBVIEW_PAGE_PATH}?url=${encodedUrl}`;
+  if (title.length > 0) {
+    const encodedTitle = encodeURIComponent(title);
+    if (encodedTitle != null && encodedTitle.length > 0) {
+      pageUrl = `${pageUrl}&title=${encodedTitle}`;
+    }
+  }
+  return pageUrl;
+}
+
+/**
+ * 原生侧打开资料库预览页。地址已是完整 https，直接作为 web-view 的 src。
+ */
+export function openNativeRepoLibraryPage(target: string, title: string = ""): boolean {
+  if (target.indexOf("http://") != 0 && target.indexOf("https://") != 0) {
+    return false;
+  }
+  const pageUrl = buildRepoWebviewPageUrl(target, title);
+  if (pageUrl.length == 0) {
+    return false;
+  }
+  return navigateToPageOnce(pageUrl);
+}
+
+/**
+ * 打开资料库链接。
+ * App 内嵌 H5（含本地包）只 postMessage，由原生打开 webview 预览页。
+ * 浏览器里若资料库域名和当前页不同源，改为新开顶层页。
+ */
+export function openRepoLibraryPreview(href: string, title: string = ""): boolean {
+  const target = resolveRepoLibraryPreviewUrl(href);
+  const embedded = isAppWebViewEmbedded();
+  const host = readAppWebViewHostPlatform();
+  console.log(`[repo-link] click href=${href} target=${target} embedded=${embedded} host=${host}`);
+  if (target.length == 0) {
+    console.log("[repo-link] skip: not a repo url");
+    return false;
+  }
+  if (embedded == true) {
+    const payload = {} as UTSJSONObject;
+    payload["type"] = "app-open-repo-link";
+    payload["url"] = target;
+    if (title.length > 0) {
+      payload["title"] = title;
+    }
+    const posted = postAppWebViewMessage(payload);
+    console.log(`[repo-link] postMessage=${posted} url=${target}`);
+    return posted;
+  }
+  if (shouldOpenRepoAsTopLevel(target)) {
+    return openRepoAsTopLevel(target);
+  }
+  const pageUrl = buildRepoWebviewPageUrl(target, title);
+  if (pageUrl.length == 0) {
+    return false;
+  }
+  if (navigateViaWxMiniProgram(pageUrl)) {
+    return true;
+  }
+  return openNativeRepoLibraryPage(target, title);
+}

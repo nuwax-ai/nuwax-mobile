@@ -1,0 +1,240 @@
+import Manifest from 'android.Manifest';
+import Build from 'android.os.Build';
+import EspProvisioningBridge from 'com.nuwax.provisioning.EspProvisioningBridge';
+import BridgeResultCallback from 'com.nuwax.provisioning.BridgeResultCallback';
+import BridgeScanCallback from 'com.nuwax.provisioning.BridgeScanCallback';
+import BridgeProgressCallback from 'com.nuwax.provisioning.BridgeProgressCallback';
+import type {
+  NativeEspDeviceCallback,
+  NativeEspFailureCallback,
+  NativeEspLogCallback,
+  NativeEspProgressCallback,
+  NativeEspSuccessCallback,
+} from '../interface.uts';
+
+let nativeBridge: EspProvisioningBridge | null = null;
+
+class ResultCallbackAdapter implements BridgeResultCallback {
+  private success: NativeEspSuccessCallback;
+  private fail: NativeEspFailureCallback;
+
+  constructor(success: NativeEspSuccessCallback, fail: NativeEspFailureCallback) {
+    super();
+    this.success = success;
+    this.fail = fail;
+  }
+
+  override onSuccess(value: string): void {
+    this.success(value);
+  }
+
+  override onFailure(code: string, message: string): void {
+    this.fail(code, message);
+  }
+}
+
+class ScanCallbackAdapter implements BridgeScanCallback {
+  private device: NativeEspDeviceCallback;
+  private fail: NativeEspFailureCallback;
+
+  constructor(device: NativeEspDeviceCallback, fail: NativeEspFailureCallback) {
+    super();
+    this.device = device;
+    this.fail = fail;
+  }
+
+  override onDevice(deviceId: string, name: string, rssi: Int, serviceUuid: string): void {
+    this.device(deviceId, name, rssi, serviceUuid);
+  }
+
+  override onFailure(code: string, message: string): void {
+    this.fail(code, message);
+  }
+}
+
+class ProgressCallbackAdapter implements BridgeProgressCallback {
+  private callback: NativeEspProgressCallback;
+
+  constructor(callback: NativeEspProgressCallback) {
+    super();
+    this.callback = callback;
+  }
+
+  override onProgress(stage: string): void {
+    this.callback(stage);
+  }
+}
+
+function bridge(): EspProvisioningBridge {
+  if (nativeBridge == null) {
+    nativeBridge = new EspProvisioningBridge(UTSAndroid.getAppContext()!);
+  }
+  return nativeBridge!!;
+}
+
+/**
+ * 仅申请蓝牙运行时权限（不创建桥）。
+ * 供配网入口页预请求：BLE 弹窗先于相机弹窗完成，避免扫码成功跳转 connect 页后
+ * 紧跟相机弹窗再次发起系统权限请求被 Android 延后显示/丢弃 → initialize 永不返回。
+ * @UTSJS.keepAlive：权限弹窗停留期间回调对象必须防 GC。
+ */
+@UTSJS.keepAlive
+export function ensureNativeEspPermissions(
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    fail('UNSUPPORTED', 'Android Activity is unavailable');
+    return;
+  }
+  let permissions = [] as string[];
+  if (Build.VERSION.SDK_INT >= 31) {
+    permissions = [
+      Manifest.permission.BLUETOOTH_SCAN,
+      Manifest.permission.BLUETOOTH_CONNECT,
+    ] as string[];
+  } else {
+    permissions = [Manifest.permission.ACCESS_FINE_LOCATION] as string[];
+  }
+  if (UTSAndroid.checkSystemPermissionGranted(activity, permissions)) {
+    success('');
+    return;
+  }
+  UTSAndroid.requestSystemPermission(
+    activity,
+    permissions,
+    (allGranted: boolean, _permissions: string[]) => {
+      if (!allGranted) {
+        fail('NO_PERMISSION', 'Bluetooth permission was not granted');
+        return;
+      }
+      success('');
+    },
+    (_doNotAskAgain: boolean, _permissions: string[]) => {
+      fail('NO_PERMISSION', 'Bluetooth permission was denied');
+    },
+  );
+}
+
+/**
+ * 蓝牙权限申请 + 创建原生桥。
+ * @UTSJS.keepAlive：权限弹窗停留期间（用户阅读可能数十秒），成功/失败回调对象
+ * 必须防 GC——否则首次授权后回调被回收、initialize 永不 resolve，界面卡死在
+ * 「正在连接设备…」。其他异步回调函数同理统一标注。
+ * 已授权时走快速通道直接 resolve，不再重复弹窗链路。
+ */
+@UTSJS.keepAlive
+export function initializeNativeEspProvisioning(
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  ensureNativeEspPermissions(
+    (_value: string) => {
+      bridge();
+      success('');
+    },
+    fail,
+  );
+}
+
+/** iOS 专用日志通道：Android 原生日志直接走 Logcat，此处空实现以对齐插件接口。两端都标 keepAlive 保持一致。 */
+@UTSJS.keepAlive
+export function setNativeEspLog(_cb: NativeEspLogCallback): void {}
+
+@UTSJS.keepAlive
+export function startNativeEspScan(
+  prefix: string,
+  serviceUuid: string,
+  onDevice: NativeEspDeviceCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  bridge().startScan(prefix, serviceUuid, new ScanCallbackAdapter(onDevice, fail));
+}
+
+export function stopNativeEspScan(): void {
+  if (nativeBridge != null) nativeBridge!!.stopScan();
+}
+
+/** 异步回调经原生持有，统一 @UTSJS.keepAlive 防回调对象被 GC（与 initialize/scan 一致）。 */
+@UTSJS.keepAlive
+export function connectNativeEspDevice(
+  deviceId: string,
+  serviceUuid: string,
+  username: string,
+  proofOfPossession: string,
+  timeoutMs: number,
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  bridge().connect(
+    deviceId,
+    serviceUuid,
+    username,
+    proofOfPossession,
+    timeoutMs.toLong(),
+    new ResultCallbackAdapter(success, fail),
+  );
+}
+
+@UTSJS.keepAlive
+export function getNativeEspCapabilities(
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  bridge().getCapabilities(new ResultCallbackAdapter(success, fail));
+}
+
+@UTSJS.keepAlive
+export function getNativeEspDeviceInfo(
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  bridge().getDeviceInfo(new ResultCallbackAdapter(success, fail));
+}
+
+/** 向固件自定义 endpoint 写数据（payload 为 JSON 字符串），成功回调返回设备响应 JSON 字符串 */
+@UTSJS.keepAlive
+export function sendNativeEspCustomData(
+  endpoint: string,
+  payload: string,
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  bridge().sendCustomData(endpoint, payload, new ResultCallbackAdapter(success, fail));
+}
+
+@UTSJS.keepAlive
+export function scanNativeEspNetworks(
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  bridge().scanNetworks(new ResultCallbackAdapter(success, fail));
+}
+
+@UTSJS.keepAlive
+export function provisionNativeEspDevice(
+  ssid: string,
+  password: string,
+  timeoutMs: number,
+  progress: NativeEspProgressCallback,
+  success: NativeEspSuccessCallback,
+  fail: NativeEspFailureCallback,
+): void {
+  bridge().provision(
+    ssid,
+    password,
+    timeoutMs.toLong(),
+    new ProgressCallbackAdapter(progress),
+    new ResultCallbackAdapter(success, fail),
+  );
+}
+
+export function disconnectNativeEspDevice(): void {
+  if (nativeBridge != null) nativeBridge!!.disconnect();
+}
+
+export function disposeNativeEspProvisioning(): void {
+  if (nativeBridge != null) nativeBridge!!.dispose();
+  nativeBridge = null;
+}

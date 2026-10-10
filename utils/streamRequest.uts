@@ -2,13 +2,515 @@ import { StreamRequestConfig, StreamChunk } from "@/types/interfaces/chat";
 import { createSSEConnection } from "@/servers/useRequest.uts";
 import { utf8ArrayToString } from "@/utils/utf8.uts";
 import { t } from "@/utils/i18n";
+import { readRawField } from "@/utils/readRawField.uts";
+import { isAppInBackground } from "@/utils/appLifecycle.uts";
+import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
+
+/**
+ * 合并两个 Uint8Array。
+ * UTS 的 Uint8Array.set 只支持 set(index, element)，不支持整段拷贝。
+ * @param first 前一段字节
+ * @param second 后一段字节
+ * @returns 合并后的新数组
+ */
+function mergeUint8Arrays(first: Uint8Array, second: Uint8Array): Uint8Array {
+  const merged = new Uint8Array(first.length + second.length);
+  for (let i = 0; i < first.length; i++) {
+    merged[i] = first[i];
+  }
+  for (let j = 0; j < second.length; j++) {
+    merged[first.length + j] = second[j];
+  }
+  return merged;
+}
+
+/** App residual 全量解码上限：超出只保留尾部，防止 success.data 整包打满主线程 */
+const SSE_RESIDUAL_MAX_BYTES: number = 512 * 1024;
+/** 已收过 chunk 且 residual 无新增字节时，仅扫描末尾是否含终态标记 */
+const SSE_RESIDUAL_TERMINAL_SCAN_BYTES: number = 8192;
+
+/**
+ * 从 ArrayBuffer 尾部取出一段并解码为文本（用于终态探测，避免整包 UTF-8）。
+ */
+function decodeArrayBufferTail(data: ArrayBuffer, maxBytes: number): string {
+  const total = data.byteLength;
+  if (total <= 0) {
+    return "";
+  }
+  const take = total > maxBytes ? maxBytes : total;
+  const offset = total - take;
+  const view = new Uint8Array(data);
+  // 尽量对齐到 UTF-8 字符边界，减少尾部截断乱码
+  let start = offset;
+  if (start > 0) {
+    let guard = 0;
+    while (start < total && guard < 4 && (view[start] & 0xc0) == 0x80) {
+      start += 1;
+      guard += 1;
+    }
+  }
+  if (start >= total) {
+    return "";
+  }
+  return utf8ArrayToString(view.slice(start));
+}
+
+/**
+ * 文本中是否含 SSE 终态（[DONE] 或 completed 事件）。
+ */
+function sseTextLooksTerminal(text: string): boolean {
+  if (text.length == 0) {
+    return false;
+  }
+  if (text.indexOf("[DONE]") >= 0) {
+    return true;
+  }
+  const lower = text.toLowerCase();
+  // 与 isCompletedPayload 对齐：看 completed 字段，避免正文里碰巧出现 completed 误判
+  if (lower.indexOf("\"completed\":true") >= 0) {
+    return true;
+  }
+  if (lower.indexOf("\"completed\":\"true\"") >= 0) {
+    return true;
+  }
+  if (lower.indexOf("\"completed\":1") >= 0) {
+    return true;
+  }
+  if (lower.indexOf("\"completed\":\"1\"") >= 0) {
+    return true;
+  }
+  // FINAL_RESULT 事件同样表示整轮结束（业务终态，可能不带 completed 字段）
+  if (lower.indexOf("\"eventtype\":\"final_result\"") >= 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 构建 HTTP 错误提示文案。
+ * UTS 中 i18n 插值参数需使用 Map，不能传对象字面量。
+ * @param statusCode HTTP 状态码
+ * @returns 本地化后的错误信息
+ */
+function buildHttpErrorMessage(statusCode: number): string {
+  const params = new Map<string, string | number>();
+  params.set("code", statusCode);
+  return t("Mobile.Stream.httpErrorWithCode", params as Record<string, string | number>);
+}
+
+/**
+ * 创建流式内容块。
+ * UTS 中 StreamChunk 为 class，不能用对象字面量初始化。
+ * @param data SSE 数据内容
+ * @returns 类型为 content 的 StreamChunk 实例
+ */
+function createContentChunk(data: string): StreamChunk {
+  const chunk = new StreamChunk();
+  chunk.type = "content";
+  chunk.data = data;
+  return chunk;
+}
+
+/**
+ * 判断 SSE 载荷是否表示流已结束。
+ * Android：completed 可能是 boolean / 字符串 / 数字，禁止仅判断 == true。
+ */
+function isCompletedPayload(data: any): boolean {
+  if (data == null) {
+    return false;
+  }
+  const completedRaw = readRawField(data, "completed");
+  if (completedRaw == true) {
+    return true;
+  }
+  const completedStr = completedRaw != null ? `${completedRaw}` : "";
+  return completedStr == "true" || completedStr == "1";
+}
+
+/**
+ * 判断 SSE 载荷是否为业务终态事件 FINAL_RESULT（顶层 eventType）。
+ * 正常会话只要进入 FINAL_RESULT 即整轮结束（即使未带 completed 字段），
+ * 此前流式层不识别该事件，导致连接正常关闭时走 onTimeout 误判异常
+ * （loading 反复翻转 / sub 续接自激循环）。该帧携带 finalResult 载荷，
+ * 与 completed 帧不同，须先派发业务层落库，再标终态收尾。
+ */
+function isFinalResultPayload(data: any): boolean {
+  if (data == null) {
+    return false;
+  }
+  const eventTypeRaw = readRawField(data, "eventType");
+  return eventTypeRaw != null && `${eventTypeRaw}` == "FINAL_RESULT";
+}
+
+/** 心跳包，不含 data */
+function isSseHeartBeatPayload(data: any): boolean {
+  const eventTypeRaw = readRawField(data, "eventType");
+  return eventTypeRaw != null && `${eventTypeRaw}` == "HEART_BEAT";
+}
+
+/**
+ * 判断是否为必须原样交给业务层的 Agent 干预事件。
+ *
+ * ACP / MCP Ask 的后端事件存在扁平与嵌套两种形状，部分帧顶层没有 data。
+ * 这里仅识别稳定的事件标记，不在传输层解析具体交互内容。
+ */
+function isAgentInterventionPayload(payload: any): boolean {
+  if (payload == null) return false;
+  const nested = readRawField(payload, "data");
+  const eventTypeRaw = readRawField(payload, "eventType");
+  const eventType = eventTypeRaw != null ? `${eventTypeRaw}` : "";
+  if (eventType == "ACP_REQUEST_PERMISSION") return true;
+
+  const messageTypeRaw = readRawField(payload, "messageType") != null
+    ? readRawField(payload, "messageType")
+    : readRawField(payload, "message_type");
+  const messageType = messageTypeRaw != null ? `${messageTypeRaw}` : "";
+  const subTypeRaw = readRawField(payload, "subType") != null
+    ? readRawField(payload, "subType")
+    : readRawField(payload, "sub_type");
+  const subType = subTypeRaw != null ? `${subTypeRaw}` : "";
+  if (
+    messageType == "acpRequestPermission" ||
+    subType == "request_permission" ||
+    subType == "AcpRequestPermission"
+  ) {
+    return true;
+  }
+
+  const result = readRawField(payload, "result");
+  const input = readRawField(result, "input");
+  const subEventTypeRaw = readRawField(payload, "subEventType") != null
+    ? readRawField(payload, "subEventType")
+    : readRawField(payload, "sub_event_type");
+  const subEventType = subEventTypeRaw != null ? `${subEventTypeRaw}` : "";
+  const nameRaw = readRawField(payload, "name") != null
+    ? readRawField(payload, "name")
+    : readRawField(result, "name");
+  const name = nameRaw != null ? `${nameRaw}` : "";
+  if (
+    subEventType == "REQUEST_PERMISSION" ||
+    readRawField(payload, "request_permission_request") != null ||
+    readRawField(payload, "requestPermissionRequest") != null ||
+    readRawField(input, "request_permission_request") != null ||
+    readRawField(input, "requestPermissionRequest") != null ||
+    name == "Backend.Sandbox.Event.RequestPermission" ||
+    subEventType == "ASK_QUESTION" ||
+    name == "Backend.Sandbox.Event.AskQuestion" ||
+    name == "AskQuestion"
+  ) {
+    return true;
+  }
+
+  // 外层 data 可能本身就是事件 envelope。
+  return nested != null && nested !== payload
+    ? isAgentInterventionPayload(nested)
+    : false;
+}
+
+/** 不应下发给业务 onChunk 的 SSE 载荷（无 data 的完成包 / 心跳等） */
+function shouldSkipSsePayloadEmit(data: any): boolean {
+  if (data == null) {
+    return true;
+  }
+  if (isCompletedPayload(data)) {
+    return true;
+  }
+  if (isSseHeartBeatPayload(data)) {
+    return true;
+  }
+  if (isAgentInterventionPayload(data)) {
+    return false;
+  }
+  return readRawField(data, "data") == null;
+}
+
+/**
+ * 从 SSE data 帧里粗提取 eventType（避免 enqueue 时全量 JSON.parse）。
+ */
+function peekSseEventType(content: string): string {
+  if (content.length == 0) {
+    return "";
+  }
+  const key = "\"eventType\"";
+  const keyIdx = content.indexOf(key);
+  if (keyIdx < 0) {
+    return "";
+  }
+  const afterKey = content.substring(keyIdx + key.length);
+  const colonIdx = afterKey.indexOf(":");
+  if (colonIdx < 0) {
+    return "";
+  }
+  let i = colonIdx + 1;
+  while (i < afterKey.length) {
+    const ch = afterKey.charAt(i);
+    if (ch == " " || ch == "\t" || ch == "\n" || ch == "\r") {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  if (i >= afterKey.length || afterKey.charAt(i) != "\"") {
+    return "";
+  }
+  i += 1;
+  const end = afterKey.indexOf("\"", i);
+  if (end < 0) {
+    return "";
+  }
+  return afterKey.substring(i, end);
+}
+
+/**
+ * 从 PROCESSING 帧粗提取 executeId。
+ * 队列合并只能覆盖同一次工具调用；不同 executeId 的连续帧必须全部保留，
+ * 否则 renderUI 的 FINISHED/result 可能被后续工具帧吞掉，直到重进历史才恢复。
+ */
+function peekSseProcessingExecuteId(content: string): string {
+  if (content.length == 0) {
+    return "";
+  }
+  const key = "\"executeId\"";
+  const keyIdx = content.indexOf(key);
+  if (keyIdx < 0) {
+    return "";
+  }
+  const afterKey = content.substring(keyIdx + key.length);
+  const colonIdx = afterKey.indexOf(":");
+  if (colonIdx < 0) {
+    return "";
+  }
+  let i = colonIdx + 1;
+  while (i < afterKey.length) {
+    const ch = afterKey.charAt(i);
+    if (ch == " " || ch == "\t" || ch == "\n" || ch == "\r") {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  if (i >= afterKey.length || afterKey.charAt(i) != "\"") {
+    return "";
+  }
+  i += 1;
+  const end = afterKey.indexOf("\"", i);
+  if (end < 0) {
+    return "";
+  }
+  return afterKey.substring(i, end);
+}
+
+/** 仅同一工具调用的连续 PROCESSING 帧可合并。 */
+function canCoalesceProcessingFrames(previous: string, next: string): boolean {
+  if (
+    peekSseEventType(previous) != "PROCESSING" ||
+    peekSseEventType(next) != "PROCESSING"
+  ) {
+    return false;
+  }
+  // 审批/提问帧属于一次性干预事件，不能被相同 executeId 的后续状态帧覆盖。
+  if (
+    looksLikeAgentInterventionFrame(previous) ||
+    looksLikeAgentInterventionFrame(next)
+  ) {
+    return false;
+  }
+  const previousId = peekSseProcessingExecuteId(previous);
+  const nextId = peekSseProcessingExecuteId(next);
+  return previousId.length > 0 && previousId == nextId;
+}
+
+/** 入队前的轻量识别，避免为每个 PROCESSING 帧额外 JSON.parse。 */
+function looksLikeAgentInterventionFrame(content: string): boolean {
+  return (
+    content.indexOf("ACP_REQUEST_PERMISSION") >= 0 ||
+    content.indexOf("acpRequestPermission") >= 0 ||
+    content.indexOf("request_permission") >= 0 ||
+    content.indexOf("requestPermissionRequest") >= 0 ||
+    content.indexOf("AcpRequestPermission") >= 0 ||
+    content.indexOf("REQUEST_PERMISSION") >= 0 ||
+    content.indexOf("Backend.Sandbox.Event.RequestPermission") >= 0 ||
+    content.indexOf("ASK_QUESTION") >= 0 ||
+    content.indexOf("Backend.Sandbox.Event.AskQuestion") >= 0 ||
+    content.indexOf("\"name\":\"AskQuestion\"") >= 0
+  );
+}
+
+/**
+ * 从原始 SSE 文本块中提取 data: 载荷（可能多行）。
+ */
+function extractSseDataContent(message: string): string {
+  if (message.length == 0) {
+    return "";
+  }
+  const lines = message.split("\n");
+  let dataContent = "";
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("data:")) {
+      const content = line.slice(5).trim();
+      if (dataContent.length > 0) {
+        dataContent += "\n" + content;
+      } else {
+        dataContent = content;
+      }
+    }
+  }
+  return dataContent;
+}
+
+/**
+ * 判断错误是否为用户主动中止请求（AbortError）。
+ * @param error 捕获到的错误对象
+ * @returns 是 AbortError 时返回 true
+ */
+function isAbortError(error: any): boolean {
+  if (error == null) {
+    return false;
+  }
+  const errorObj = error as UTSJSONObject;
+  const name = errorObj["name"];
+  return name != null && `${name}` === "AbortError";
+}
+
+/**
+ * 汇总 errMsg / message / cause.message，便于识别 iOS 嵌套错误文案。
+ */
+function collectRequestErrorText(error: any): string {
+  if (error == null) {
+    return "";
+  }
+  let out = "";
+  try {
+    const obj = error as UTSJSONObject;
+    const errMsg = obj["errMsg"];
+    if (errMsg != null && `${errMsg}`.length > 0) {
+      out = out + `${errMsg} `;
+    }
+    const message = obj["message"];
+    if (message != null && `${message}`.length > 0) {
+      out = out + `${message} `;
+    }
+    const cause = obj["cause"];
+    if (cause != null) {
+      try {
+        const causeObj = cause as UTSJSONObject;
+        const causeMsg = causeObj["message"];
+        if (causeMsg != null && `${causeMsg}`.length > 0) {
+          out = out + `${causeMsg} `;
+        }
+      } catch (_eCause) {
+        // ignore
+      }
+    }
+    const errCode = obj["errCode"];
+    if (errCode != null) {
+      out = out + `errCode=${errCode} `;
+    }
+    const code = obj["code"];
+    if (code != null) {
+      out = out + `code=${code} `;
+    }
+  } catch (_eObj) {
+    // ignore
+  }
+  if (out.length == 0) {
+    out = `${error}`;
+  }
+  return out.toLowerCase();
+}
+
+/**
+ * iOS enableChunked 常见：服务端关连接 / 录音或 TTS 后短暂断网时，
+ * fail 报「网络连接已中断」(600003)，并不等于业务失败。
+ * 已有 chunk 或即将走 complete 冲刷时，应软收尾（onTimeout → 回补/sub），禁止 onError。
+ */
+function isNetworkConnectionLostError(error: any): boolean {
+  const text = collectRequestErrorText(error);
+  if (text.length == 0) {
+    return false;
+  }
+  if (text.indexOf("网络连接已中断") >= 0) {
+    return true;
+  }
+  if (text.indexOf("network connection was lost") >= 0) {
+    return true;
+  }
+  if (text.indexOf("nsurlerrornetworkconnectionlost") >= 0) {
+    return true;
+  }
+  if (text.indexOf("errcode=600003") >= 0 || text.indexOf("code=600003") >= 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 安全读取错误对象的 message 字段。
+ * @param error 捕获到的错误对象
+ * @returns 错误信息字符串，无 message 时返回空字符串
+ */
+function getErrorMessage(error: any): string {
+  if (error == null) {
+    return "";
+  }
+  const errorObj = error as UTSJSONObject;
+  const message = errorObj["message"];
+  return message != null ? `${message}` : "";
+}
+
+/**
+ * 从 onChunkReceived 回调参数中提取 ArrayBuffer。
+ * Android 上必须用官方 RequestTaskOnChunkReceivedListenerResult 访问 .data；
+ * 自定义 interface / UTSJSONObject 强转绑不到 Kotlin getData()，会得到 null（日志里仍能 toString 出 data=…）。
+ * @param chunkResult onChunkReceived 回调参数
+ * @returns 分块字节数据，无法识别时返回 null
+ */
+function extractChunkArrayBuffer(chunkResult: any): ArrayBuffer | null {
+  if (chunkResult == null) {
+    return null;
+  }
+
+  // 官方类型（与 uni_modules/uni-ai-x/sdk/requestAiWorker.uts 一致）
+  try {
+    const listener = chunkResult as RequestTaskOnChunkReceivedListenerResult;
+    const listenerData = listener.data;
+    if (listenerData != null) {
+      return listenerData as ArrayBuffer;
+    }
+  } catch (_eListener) {
+    // 非官方 listener result，继续尝试其他格式
+  }
+
+  // 小程序 / UTSJSONObject / Map（禁止对 Android 原生 listener 走这条，会 ClassCastException）
+  try {
+    const dataField = readRawField(chunkResult, "data");
+    if (dataField != null) {
+      return dataField as ArrayBuffer;
+    }
+  } catch (_eField) {
+    // ignore
+  }
+
+  // success 回调中 res.data 可能直接是 ArrayBuffer
+  try {
+    const maybeBuffer = chunkResult as ArrayBuffer;
+    const byteLength = maybeBuffer.byteLength;
+    if (byteLength != null && byteLength >= 0) {
+      return maybeBuffer;
+    }
+  } catch (_eBuffer) {
+    // ignore
+  }
+
+  return null;
+}
 
 // 全局错误处理 - 捕获未处理的 AbortError
 // #ifdef H5
 if (typeof window !== "undefined") {
   window.addEventListener("unhandledrejection", (event) => {
-    if (event.reason && event.reason.name === "AbortError") {
-      console.log("捕获到未处理的 AbortError，已静默处理");
+    if (event.reason != null && event.reason.name === "AbortError") {
       event.preventDefault(); // 阻止默认的错误处理
     }
   });
@@ -19,21 +521,58 @@ if (typeof window !== "undefined") {
 export class StreamRequest {
   private requestTask: RequestTask | null = null;
   private isAborted: boolean = false;
-  private abortController: AbortController | null = null;
+  private abortController: any | null = null;
   private buffer: string = ""; // 用于缓存不完整的 SSE 消息（以 \n\n 为完整标记）
   private pendingBytes: Uint8Array = new Uint8Array(0); // 用于缓存不完整的 UTF-8 字节序列
+  /** 是否已收到 completed / [DONE] 终态标记（用于判断 HTTP complete 是否过早） */
+  private receivedTerminalMarker: boolean = false;
 
-  // 微信小程序数据流超时监控
-  private lastChunkReceivedTime: number = 0; // 最后一次接收数据的时间戳
-  private timeoutCheckTimer: any = null; // 超时检查定时器（使用 any 类型以兼容不同平台）
-  private readonly TIMEOUT_DURATION: number = 60000; // 超时时长 60 秒
-  private timeoutCallback: (() => void) | null = null; // 超时回调
+  // 流式空闲超时监控（无数据到达则断开）
+  private lastChunkReceivedTime: number = 0;
+  private timeoutCheckTimer: number | null = null;
+  /** H5 / 小程序：事件较密，60s 无数据即可判超时 */
+  private readonly TIMEOUT_DURATION_DEFAULT: number = 60000;
+  /**
+   * APP：onChunkReceived 可能长时间不回调（工具/生图计算、系统缓冲），
+   * 空闲阈值需更宽，避免误杀仍在进行的长连接。
+   */
+  private readonly TIMEOUT_DURATION_APP: number = 180000;
+  private timeoutCallback: (() => void) | null = null;
+  /** 当前请求使用的空闲超时（ms） */
+  private activeTimeoutDuration: number = 60000;
+
+  /** App：SSE 消息分帧队列，避免同一事件循环内批量 onChunk 导致 iOS UI 只在结束时刷新 */
+  private sseDispatchQueue: string[] = [];
+  private sseDispatchRunning: boolean = false;
+  private sseDispatchConfig: StreamRequestConfig | null = null;
+  private sseDispatchOnComplete: (() => void) | null = null;
+  /**
+   * 轻负载时帧间隔；积压时会降为 0 并加大 batch。
+   * 调参历史：16ms → 8ms（轻负载出队上限 62 → 125 帧/s）。缩短"入栈"延迟，token 更快进 UI 合并窗；
+   * 仅摊薄 onChunk 派发节奏，不触发生成渲染（渲染仍由 AgentDetailService 的合并窗节流）。
+   */
+  private readonly SSE_DISPATCH_INTERVAL_MS: number = 4;
+  /** 大包异步入队尚未完成（防止 complete 误判队列空闲） */
+  private sseBurstEnqueuePending: boolean = false;
+  private sseBurstTimer: number | null = null;
+  /** burst 入队剩余帧与游标（UTS 不支持嵌套函数自引用，须挂实例） */
+  private sseBurstRest: string[] | null = null;
+  private sseBurstOffset: number = 0;
+  private readonly SSE_BURST_SLICE: number = 80;
+  /** App：已通过 onChunkReceived 解码的原始字节数，用于 residual 只吃增量尾包 */
+  private decodedChunkBytes: number = 0;
+  /** 防止 [DONE] / completed / residual 终态多路径重复触发 onComplete */
+  private streamOnCompleteFired: boolean = false;
 
   // 发起流式请求
   async request(config: StreamRequestConfig): Promise<void> {
     this.isAborted = false;
     this.buffer = ""; // 重置缓冲区
     this.pendingBytes = new Uint8Array(0); // 重置字节缓冲区
+    this.receivedTerminalMarker = false;
+    this.streamOnCompleteFired = false;
+    this.decodedChunkBytes = 0;
+    this.resetSseDispatchQueue();
 
     // #ifdef H5
     // 只在 H5 环境中创建 AbortController
@@ -41,10 +580,16 @@ export class StreamRequest {
     // #endif
 
     // 清除可能存在的旧定时器（重要：避免定时器泄漏）
-    console.log("[超时监控] 新请求开始，清除旧定时器");
     this.clearTimeoutMonitor();
     // 保存超时回调
-    this.timeoutCallback = config.onTimeout || null;
+    this.timeoutCallback = config.onTimeout != null ? config.onTimeout : null;
+
+    let streamHeaders = config.headers;
+    if (streamHeaders == null) {
+      streamHeaders = new UTSJSONObject();
+      config.headers = streamHeaders;
+    }
+    applyXClientTypeHeader(streamHeaders);
 
     try {
       // #ifdef H5 || WEB
@@ -55,21 +600,24 @@ export class StreamRequest {
       await this.requestWeapp(config);
       // #endif
 
+      // #ifdef APP
+      // uni-app x APP：uni.request 返回 RequestTask（非 Promise），需独立实现 chunked 流式接收
+      await this.requestAppX(config);
+      // #endif
+
       // #ifdef APP-PLUS
       await this.requestApp(config);
       // #endif
     } catch (error) {
       // 如果是用户主动中止，不触发错误回调
       // #ifdef H5
-      if (error.name === "AbortError" || this.isAborted) {
-        console.log("请求已被中止");
+      if (isAbortError(error) || this.isAborted) {
         return;
       }
       // #endif
 
-      // #ifdef MP-WEIXIN || APP-PLUS
+      // #ifdef MP-WEIXIN || APP-PLUS || APP
       if (this.isAborted) {
-        console.log("请求已被中止");
         return;
       }
       // #endif
@@ -83,14 +631,12 @@ export class StreamRequest {
     try {
       // 关键修复：在创建 requestTask 后立即启动超时监控
       // 因为 onChunkReceived 可能比 success 回调更早触发
-      console.log("[请求] requestTask 已创建，立即启动超时监控");
       this.startTimeoutMonitor();
-      console.log("[请求] 超时监控启动完成");
 
-      await createSSEConnection({
+      await createSSEConnection<any>({
         url: config.url,
         method: config.method,
-        headers: config.headers as any,
+        headers: config.headers,
         body: config.body,
         abortController: this.abortController,
         onMessage: (data: any) => {
@@ -100,8 +646,9 @@ export class StreamRequest {
 
           try {
             // 检查是否完成
-            if (data && data.completed) {
-              console.log("[SSE] 收到完成标记 completed");
+            if (isCompletedPayload(data)) {
+              // 与 App 对齐：标记终态，避免随后 onClose 误触发 onTimeout
+              this.receivedTerminalMarker = true;
 
               // 清除超时监控
               console.log(
@@ -109,27 +656,42 @@ export class StreamRequest {
                 this.timeoutCheckTimer,
               );
               this.clearTimeoutMonitor();
-              console.log("[SSE] completed 标记处理完成，定时器已清除");
 
               config.onComplete?.();
               return;
             }
 
+            // FINAL_RESULT：业务终态事件（正常会话进入即整轮结束，可能不带 completed）。
+            // 与 completed 帧不同，其携带 finalResult 载荷，须先派发业务层再标终态收尾。
+            if (isFinalResultPayload(data)) {
+              const finalChunk = createContentChunk(
+                data != null ? JSON.stringify(data) : "",
+              );
+              config.onChunk?.(finalChunk);
+              this.receivedTerminalMarker = true;
+              this.clearTimeoutMonitor();
+              config.onComplete?.();
+              return;
+            }
+
+            if (shouldSkipSsePayloadEmit(data)) {
+              return;
+            }
+
             // 处理数据块
-            const chunk: StreamChunk = {
-              type: "content",
-              data: data ? JSON.stringify(data) : "",
-            };
+            const chunk = createContentChunk(
+              data != null ? JSON.stringify(data) : "",
+            );
             config.onChunk?.(chunk);
           } catch (e) {
             console.error("Parse chunk error:", e);
           }
         },
-        onError: (error: Error) => {
+        onError: (error: any) => {
           // 清除超时监控
           this.clearTimeoutMonitor();
           // 如果是中止错误，不触发错误回调
-          if (error.name === "AbortError" || this.isAborted) {
+          if (isAbortError(error) || this.isAborted) {
             console.log("SSE连接已被中止");
             return;
           }
@@ -140,15 +702,19 @@ export class StreamRequest {
         },
         onClose: () => {
           console.log("SSE连接已关闭");
-          // 调用超时回调-关闭loading状态以及恢复停止按钮
+          // 正常 completed 后 EventSource 也会 onClose；勿再当超时/异常断流
+          if (this.isAborted == true || this.receivedTerminalMarker == true) {
+            return;
+          }
+          // 无终态的异常关闭：恢复停止按钮 / 触发回补
           config.onTimeout?.();
         },
       });
     } catch (error) {
       // 捕获所有可能的错误，包括 AbortError
       if (
-        error.message === "Connection aborted by user" ||
-        error.name === "AbortError" ||
+        getErrorMessage(error) === "Connection aborted by user" ||
+        isAbortError(error) ||
         this.isAborted
       ) {
         console.log("SSE连接已被中止");
@@ -160,26 +726,435 @@ export class StreamRequest {
     }
   }
 
+  /**
+   * 将解码后的 SSE 文本追加到缓冲区，并处理完整消息块。
+   * @param text 新接收的 UTF-8 文本
+   * @param config 流式请求配置
+   * @param onStreamComplete 流结束时的回调（[DONE] / completed）
+   */
+  private resetSseDispatchQueue(): void {
+    this.sseDispatchQueue = [];
+    this.sseDispatchRunning = false;
+    this.sseDispatchConfig = null;
+    this.sseDispatchOnComplete = null;
+    this.sseBurstEnqueuePending = false;
+    this.sseBurstRest = null;
+    this.sseBurstOffset = 0;
+    if (this.sseBurstTimer != null) {
+      clearTimeout(this.sseBurstTimer!);
+      this.sseBurstTimer = null;
+    }
+  }
+
+  /**
+   * App 端入队。
+   * - PROCESSING：连续帧可合并为最新一帧（工具状态洪峰），避免堵住后续 MESSAGE。
+   * - MESSAGE：禁止合并。正文是增量 delta，合并会丢掉中间字，表现为气泡只剩末尾几个字。
+   */
+  private enqueueSseMessage(
+    content: string,
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    this.sseDispatchConfig = config;
+    this.sseDispatchOnComplete = onStreamComplete;
+    const eventType = peekSseEventType(content);
+    if (eventType == "PROCESSING" && this.sseDispatchQueue.length > 0) {
+      const last = this.sseDispatchQueue[this.sseDispatchQueue.length - 1];
+      if (canCoalesceProcessingFrames(last, content)) {
+        this.sseDispatchQueue[this.sseDispatchQueue.length - 1] = content;
+        if (this.sseDispatchRunning == false) {
+          this.pumpSseDispatchQueue();
+        }
+        return;
+      }
+    }
+    this.sseDispatchQueue.push(content);
+    if (this.sseDispatchRunning == false) {
+      this.pumpSseDispatchQueue();
+    }
+  }
+
+  /**
+   * 按积压深度自适应批量派发：队列越深，单次处理越多、间隔越短，尽快追上网络进度。
+   */
+  private pumpSseDispatchQueue(): void {
+    if (this.isAborted) {
+      this.resetSseDispatchQueue();
+      return;
+    }
+    if (this.sseDispatchQueue.length == 0) {
+      this.sseDispatchRunning = false;
+      return;
+    }
+
+    this.sseDispatchRunning = true;
+    const config = this.sseDispatchConfig as StreamRequestConfig;
+    const onComplete = this.sseDispatchOnComplete as () => void;
+    const qLen = this.sseDispatchQueue.length;
+    let batchSize = 1;
+    if (qLen > 200) {
+      batchSize = 40;
+    } else if (qLen > 50) {
+      batchSize = 16;
+    } else if (qLen > 10) {
+      batchSize = 5;
+    } else if (qLen > 1) {
+      batchSize = 2;
+    }
+
+    for (let i = 0; i < batchSize; i++) {
+      if (this.sseDispatchQueue.length == 0) {
+        break;
+      }
+      if (this.isAborted) {
+        break;
+      }
+      const content = this.sseDispatchQueue.shift() as string;
+      // 终态后仍须派发积压 MESSAGE（success 扫尾抢跑 onComplete 时常见），
+      // 禁止清空队列，否则会丢后半段正文（日志里 STREAM_COMPLETE 后仍有 MESSAGE）。
+      this.processSSEMessage(content, config, onComplete);
+    }
+
+    if (this.isAborted) {
+      this.sseDispatchRunning = false;
+      return;
+    }
+    if (
+      this.sseDispatchQueue.length == 0 &&
+      this.sseBurstEnqueuePending != true
+    ) {
+      this.sseDispatchRunning = false;
+      return;
+    }
+    if (this.sseDispatchQueue.length == 0) {
+      // burst 还在往队列塞，稍后由 burst 回调再泵
+      this.sseDispatchRunning = false;
+      return;
+    }
+
+    const remain = this.sseDispatchQueue.length;
+    const delay =
+      remain > 20 ? 0 : this.SSE_DISPATCH_INTERVAL_MS;
+    setTimeout(() => {
+      this.pumpSseDispatchQueue();
+    }, delay);
+  }
+
+  private waitForSseDispatchIdle(onIdle: () => void): void {
+    if (
+      this.sseDispatchRunning == false &&
+      this.sseDispatchQueue.length == 0 &&
+      this.sseBurstRest == null &&
+      this.sseBurstEnqueuePending != true
+    ) {
+      onIdle();
+      return;
+    }
+    setTimeout(() => {
+      this.waitForSseDispatchIdle(onIdle);
+    }, this.SSE_DISPATCH_INTERVAL_MS);
+  }
+
+  /**
+   * 终态后等分发队列空闲再调业务 onComplete。
+   * 否则 [DONE] 后仍积压的 THINK/MESSAGE 会撞上已 endStreamListDraft 的空 draft，
+   * 日志表现为 STREAM_COMPLETE 后继续刷大量 MESSAGE。
+   */
+  private fireStreamOnCompleteAfterIdle(
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    this.waitForSseDispatchIdle(() => {
+      if (this.isAborted) {
+        onStreamComplete();
+        return;
+      }
+      if (this.streamOnCompleteFired != true) {
+        this.streamOnCompleteFired = true;
+        config.onComplete?.();
+      }
+      onStreamComplete();
+    });
+  }
+
+  /**
+   * 大包分帧入队（保持 MESSAGE delta 全局顺序）。
+   *
+   * 历史坑（Android 语音后长文常见）：
+   * 1) 队列非空时同步 process 首帧 → 插队，正文错位（如两行新闻互相嵌套）
+   * 2) burst 未入队完时把新包直接 push 进 dispatch 队列 → 与 rest 交错，同样乱序
+   * 因此：有积压时只追加到 burstRest / 派发队列；仅完全空闲时才首帧同步上屏。
+   */
+  private enqueueSseFramesWithFirstPaint(
+    frames: string[],
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    if (frames.length == 0) {
+      return;
+    }
+    this.sseDispatchConfig = config;
+    this.sseDispatchOnComplete = onStreamComplete;
+
+    // burst 进行中：追加到 rest 末尾，禁止与 dispatch 队列交错
+    const burstRest = this.sseBurstRest;
+    if (burstRest != null) {
+      for (let i = 0; i < frames.length; i++) {
+        burstRest.push(frames[i]);
+      }
+      return;
+    }
+    if (this.sseBurstEnqueuePending == true) {
+      for (let i = 0; i < frames.length; i++) {
+        this.enqueueSseMessage(frames[i], config, onStreamComplete);
+      }
+      return;
+    }
+
+    // 派发未空闲：禁止首帧插队
+    if (
+      this.sseDispatchRunning == true ||
+      this.sseDispatchQueue.length > 0
+    ) {
+      for (let i = 0; i < frames.length; i++) {
+        this.enqueueSseMessage(frames[i], config, onStreamComplete);
+      }
+      return;
+    }
+
+    // 完全空闲：首帧同步上屏，其余 burst 入队
+    this.processSSEMessage(frames[0], config, onStreamComplete);
+    if (frames.length == 1 || this.receivedTerminalMarker == true) {
+      return;
+    }
+
+    const rest: string[] = [];
+    for (let i = 1; i < frames.length; i++) {
+      rest.push(frames[i]);
+    }
+
+    this.sseBurstEnqueuePending = true;
+    this.sseBurstRest = rest;
+    this.sseBurstOffset = 0;
+    this.sseBurstTimer = setTimeout(() => {
+      this.pumpSseBurstEnqueue();
+    }, 0);
+  }
+
+  /**
+   * 把尚未入队的 burst 剩余帧一次性进入派发队列（终态前调用，防止丢尾部 MESSAGE）。
+   */
+  private materializeBurstRestToQueue(
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    if (this.sseBurstTimer != null) {
+      clearTimeout(this.sseBurstTimer!);
+      this.sseBurstTimer = null;
+    }
+    const rest = this.sseBurstRest;
+    if (rest == null) {
+      this.sseBurstEnqueuePending = false;
+      this.sseBurstOffset = 0;
+      return;
+    }
+    const offset = this.sseBurstOffset;
+    for (let i = offset; i < rest.length; i++) {
+      this.enqueueSseMessage(rest[i], config, onStreamComplete);
+    }
+    this.sseBurstRest = null;
+    this.sseBurstOffset = 0;
+    this.sseBurstEnqueuePending = false;
+  }
+
+  /**
+   * 终态前同步排空派发队列中的非终态帧（MESSAGE/PROCESSING 等）。
+   */
+  private flushQueuedNonTerminalBeforeComplete(
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+  ): void {
+    while (this.sseDispatchQueue.length > 0) {
+      const content = this.sseDispatchQueue.shift() as string;
+      if (content === "[DONE]") {
+        // 终态交给调用方统一处理
+        this.sseDispatchQueue.unshift(content);
+        break;
+      }
+      const looksLikeJSON =
+        content.startsWith("{") || content.startsWith("[");
+      if (looksLikeJSON) {
+        try {
+          const data = JSON.parse(content) as UTSJSONObject;
+          // FINAL_RESULT 同样为终态帧：留给终态流程统一处理（含业务层落库），不在此当普通帧排空
+          if (isCompletedPayload(data) || isFinalResultPayload(data)) {
+            this.sseDispatchQueue.unshift(content);
+            break;
+          }
+        } catch (_e) {
+          // fallthrough 当普通 chunk
+        }
+      }
+      // 临时清除终态标记干扰，按普通消息处理
+      this.processSSEMessage(content, config, onStreamComplete);
+      if (this.receivedTerminalMarker == true) {
+        // processSSEMessage 不应在此路径再次 complete；若误触则停
+        break;
+      }
+    }
+  }
+
+  /**
+   * 分片把大包剩余帧入队（实例方法，避免 UTS 嵌套函数自引用编译失败）。
+   * PROCESSING 可合并；MESSAGE 禁止合并（delta 丢失会表现为 Android 少字）。
+   */
+  private pumpSseBurstEnqueue(): void {
+    this.sseBurstTimer = null;
+    if (this.isAborted) {
+      this.sseBurstEnqueuePending = false;
+      this.sseBurstRest = null;
+      this.sseBurstOffset = 0;
+      return;
+    }
+    const rest = this.sseBurstRest;
+    if (rest == null) {
+      this.sseBurstEnqueuePending = false;
+      return;
+    }
+    const offset = this.sseBurstOffset;
+    const sliceSize = this.SSE_BURST_SLICE;
+    const end =
+      offset + sliceSize < rest.length ? offset + sliceSize : rest.length;
+    for (let i = offset; i < end; i++) {
+      const content = rest[i];
+      const eventType = peekSseEventType(content);
+      // 仅 PROCESSING 合并；MESSAGE 必须逐帧入队
+      if (eventType == "PROCESSING" && this.sseDispatchQueue.length > 0) {
+        const last = this.sseDispatchQueue[this.sseDispatchQueue.length - 1];
+        if (canCoalesceProcessingFrames(last, content)) {
+          this.sseDispatchQueue[this.sseDispatchQueue.length - 1] = content;
+          continue;
+        }
+      }
+      this.sseDispatchQueue.push(content);
+    }
+    this.sseBurstOffset = end;
+    if (end < rest.length) {
+      this.sseBurstTimer = setTimeout(() => {
+        this.pumpSseBurstEnqueue();
+      }, 0);
+      if (this.sseDispatchRunning == false) {
+        this.pumpSseDispatchQueue();
+      }
+      return;
+    }
+    this.sseBurstRest = null;
+    this.sseBurstOffset = 0;
+    this.sseBurstEnqueuePending = false;
+    if (this.sseDispatchRunning == false) {
+      this.pumpSseDispatchQueue();
+    }
+  }
+
+  /**
+   * 将 decodeUTF8 残留的不完整 UTF-8 字节强制刷入文本 buffer（流结束时调用）。
+   */
+  private flushPendingUtf8Bytes(): void {
+    if (this.pendingBytes.length == 0) {
+      return;
+    }
+    const leftover = this.pendingBytes;
+    this.pendingBytes = new Uint8Array(0);
+    const text = utf8ArrayToString(leftover);
+    if (text.length > 0) {
+      this.buffer += text;
+    }
+  }
+
+  private appendAndProcessSSEText(
+    text: string,
+    config: StreamRequestConfig,
+    onStreamComplete: () => void,
+    yieldBetweenMessages: boolean = false,
+  ): void {
+    if (text.length === 0) {
+      return;
+    }
+
+    // 增量边界扫描：buffer 只保留「未完成尾部」，避免每个 chunk 都对整个累积 buffer
+    // 做 split（O(n²) 字符串拷贝/分配 → 主线程 GC 风暴，见 .diag/20260807-anr/）。
+    // 切分边界语义与原 split("\n\n") + pop() 完全一致。
+    this.buffer += text;
+    const messages: string[] = [];
+    let rest = this.buffer;
+    let sepIdx = rest.indexOf("\n\n");
+    while (sepIdx >= 0) {
+      messages.push(rest.substring(0, sepIdx));
+      rest = rest.substring(sepIdx + 2);
+      sepIdx = rest.indexOf("\n\n");
+    }
+    this.buffer = rest;
+
+    if (yieldBetweenMessages != true) {
+      for (let mi = 0; mi < messages.length; mi++) {
+        const message = messages[mi];
+        if (!message.trim()) {
+          continue;
+        }
+        const dataContent = extractSseDataContent(message);
+        if (dataContent.length > 0) {
+          this.processSSEMessage(dataContent, config, onStreamComplete);
+        }
+      }
+      return;
+    }
+
+    // App：先收集 data 帧；多帧时首帧同步上屏，其余异步入队（MESSAGE 不合并）
+    const frames: string[] = [];
+    for (let mi = 0; mi < messages.length; mi++) {
+      const message = messages[mi];
+      if (!message.trim()) {
+        continue;
+      }
+      const dataContent = extractSseDataContent(message);
+      if (dataContent.length > 0) {
+        frames.push(dataContent);
+      }
+    }
+    if (frames.length == 0) {
+      return;
+    }
+    if (frames.length <= 3) {
+      for (let fi = 0; fi < frames.length; fi++) {
+        this.enqueueSseMessage(frames[fi], config, onStreamComplete);
+      }
+      return;
+    }
+    this.enqueueSseFramesWithFirstPaint(frames, config, onStreamComplete);
+  }
+
   // 处理完整的 SSE 消息
   private processSSEMessage(
     content: string,
     config: StreamRequestConfig,
-    resolve: (value: void | PromiseLike<void>) => void,
+    onStreamComplete: () => void,
   ): void {
     // 检查是否完成
     if (content === "[DONE]") {
-      console.log("[SSE] 收到完成标记 [DONE]");
+      if (this.receivedTerminalMarker == true) {
+        return;
+      }
+      // 终态前先排空 burst + 队列里尚未派发的 MESSAGE，避免 Android 少字
+      this.materializeBurstRestToQueue(config, onStreamComplete);
+      this.flushQueuedNonTerminalBeforeComplete(config, onStreamComplete);
+      this.receivedTerminalMarker = true;
 
       // 清除超时监控
-      console.log(
-        "[SSE] [DONE] 标记触发，准备清除定时器，当前 timer ID:",
-        this.timeoutCheckTimer,
-      );
-      this.clearTimeoutMonitor();
-      console.log("[SSE] [DONE] 标记处理完成，定时器已清除");
+      this.finalizeCompletedStream();
 
-      config.onComplete?.();
-      resolve();
+      // 等本轮 pump / burst 余量全部应用后再 onComplete，避免 draft 被提前关掉
+      this.fireStreamOnCompleteAfterIdle(config, onStreamComplete);
       return;
     }
 
@@ -189,100 +1164,100 @@ export class StreamRequest {
     if (looksLikeJSON) {
       // 尝试解析 JSON 数据
       try {
-        const data = JSON.parse(content);
-        if (data && data.completed) {
-          console.log("[SSE] 收到完成标记 completed");
+        const data = JSON.parse(content) as UTSJSONObject;
+        const isFinalResultEvent = isFinalResultPayload(data);
+        if (isCompletedPayload(data) || isFinalResultEvent) {
+          // 终态已标记（[DONE] / completed / FINAL_RESULT 多路径）：FINAL_RESULT 帧
+          // 仍携带 finalResult 载荷，须派发业务层落库，但不重复收尾。
+          if (this.receivedTerminalMarker == true) {
+            if (isFinalResultEvent == true) {
+              config.onChunk?.(createContentChunk(content));
+            }
+            return;
+          }
+          // 先排空积压的非终态帧（前置 MESSAGE delta 先落库），再派发 FINAL_RESULT
+          // 载荷（标 Complete + 写 finalResult），最后标终态收尾——避免连接正常关闭时
+          // 被误判为 onTimeout → finalizeStreamAbnormally（loading 翻转 / sub 续接循环）。
+          this.materializeBurstRestToQueue(config, onStreamComplete);
+          this.flushQueuedNonTerminalBeforeComplete(config, onStreamComplete);
+          if (isFinalResultEvent == true) {
+            config.onChunk?.(createContentChunk(content));
+          }
+          this.receivedTerminalMarker = true;
 
           // 清除超时监控
-          console.log(
-            "[SSE] completed 标记触发，准备清除定时器，当前 timer ID:",
-            this.timeoutCheckTimer,
-          );
-          this.clearTimeoutMonitor();
-          console.log("[SSE] completed 标记处理完成，定时器已清除");
+          this.finalizeCompletedStream();
 
-          config.onComplete?.();
-          resolve();
+          this.fireStreamOnCompleteAfterIdle(config, onStreamComplete);
+          return;
+        }
+
+        if (shouldSkipSsePayloadEmit(data)) {
           return;
         }
 
         // 处理数据块
-        const chunk: StreamChunk = {
-          type: "content",
-          data: content,
-        };
+        const chunk = createContentChunk(content);
         config.onChunk?.(chunk);
       } catch (e) {
-        console.log("[SSE] JSON 解析失败，内容:", content);
       }
     } else {
       // 不是 JSON 格式，直接作为内容处理
-      const chunk: StreamChunk = {
-        type: "content",
-        data: content,
-      };
+      const chunk = createContentChunk(content);
       config.onChunk?.(chunk);
     }
   }
 
+  /** 按平台返回空闲超时时长。 */
+  private resolveTimeoutDuration(): number {
+    // #ifdef APP
+    return this.TIMEOUT_DURATION_APP;
+    // #endif
+    // #ifndef APP
+    return this.TIMEOUT_DURATION_DEFAULT;
+    // #endif
+  }
+
   // 启动超时监控
   private startTimeoutMonitor(): void {
-    console.log(
-      "[超时监控] 准备启动超时监控，当前 timer ID:",
-      this.timeoutCheckTimer,
-    );
+    this.activeTimeoutDuration = this.resolveTimeoutDuration();
 
     // 记录初始时间
     this.lastChunkReceivedTime = Date.now();
 
     // 先清除可能存在的旧定时器
-    if (
-      this.timeoutCheckTimer !== null &&
-      this.timeoutCheckTimer !== undefined
-    ) {
-      console.log(
-        "[超时监控] 发现旧定时器，先清除，ID:",
-        this.timeoutCheckTimer,
-      );
-      clearInterval(this.timeoutCheckTimer);
+    const existingTimerId = this.timeoutCheckTimer;
+    if (existingTimerId !== null) {
+      clearInterval(existingTimerId);
       this.timeoutCheckTimer = null;
     }
 
-    // 每 10 秒检查一次是否超时
+    // 每 15 秒检查一次；后台跳过（系统可能挂起网络，避免误杀）
     const timerId = setInterval(() => {
+      if (isAppInBackground() == true) {
+        return;
+      }
       const now = Date.now();
       const timeSinceLastChunk = now - this.lastChunkReceivedTime;
+      const limit = this.activeTimeoutDuration;
 
-      console.log(
-        `[超时监控] 检查中... 距离上次接收数据: ${timeSinceLastChunk}ms，定时器 ID: ${this.timeoutCheckTimer}`,
-      );
-
-      if (timeSinceLastChunk >= this.TIMEOUT_DURATION) {
-        console.log(
-          `[超时监控] 数据流超时: ${timeSinceLastChunk}ms 未收到数据`,
-        );
+      if (timeSinceLastChunk >= limit) {
         this.handleTimeout();
       }
-    }, 10000);
+    }, 15000);
 
     this.timeoutCheckTimer = timerId;
-    console.log("[超时监控] 定时器已创建，新 ID:", this.timeoutCheckTimer);
+    registerTimeoutMonitor(this);
   }
 
   // 清除超时监控
   private clearTimeoutMonitor(): void {
-    console.log("[超时监控] 尝试清除，当前 timer ID:", this.timeoutCheckTimer);
-
-    if (
-      this.timeoutCheckTimer !== null &&
-      this.timeoutCheckTimer !== undefined
-    ) {
-      console.log("[超时监控] 清除超时监控，timer ID:", this.timeoutCheckTimer);
-      clearInterval(this.timeoutCheckTimer);
+    const timerId = this.timeoutCheckTimer;
+    if (timerId !== null) {
+      clearInterval(timerId);
       this.timeoutCheckTimer = null;
-    } else {
-      console.log("[超时监控] 定时器 ID 为空，无需清除");
     }
+    unregisterTimeoutMonitor(this);
   }
 
   // 更新最后接收数据的时间
@@ -290,21 +1265,48 @@ export class StreamRequest {
     this.lastChunkReceivedTime = Date.now();
   }
 
+  /**
+   * App 回前台：刷新空闲计时，避免后台停留计入超时。
+   */
+  onAppForeground(): void {
+    if (this.timeoutCheckTimer == null || this.isAborted == true) {
+      return;
+    }
+    this.updateLastChunkTime();
+  }
+
+  /**
+   * 释放 requestTask 引用。
+   * uni-app x 在请求实例已销毁后调用 abort 会抛错，需 try-catch 并先置空引用。
+   */
+  private releaseRequestTask(attemptAbort: boolean = true): void {
+    const task = this.requestTask;
+    this.requestTask = null;
+    if (task == null || attemptAbort == false) {
+      return;
+    }
+    try {
+      task.abort();
+    } catch (error) {
+    }
+  }
+
+  /** SSE 正常结束时仅清理引用，避免对已销毁实例再次 abort。 */
+  private finalizeCompletedStream(): void {
+    this.clearTimeoutMonitor();
+    this.releaseRequestTask(false);
+  }
+
   // 处理超时
   private handleTimeout(): void {
-    console.log("[超时监控] 触发超时处理");
-
-    // 清除定时器
-    this.clearTimeoutMonitor();
-
-    // 标记为中止状态
-    this.isAborted = true;
-
-    // 中止请求
-    if (this.requestTask) {
-      this.requestTask.abort();
-      this.requestTask = null;
+    // 后台不因空闲超时 abort（系统可能挂起网络）；回前台由 notifyStreamAppForeground 刷新计时
+    if (isAppInBackground() == true) {
+      return;
     }
+
+    this.clearTimeoutMonitor();
+    this.isAborted = true;
+    this.releaseRequestTask(true);
 
     // 显示轻提示
     uni.showToast({
@@ -314,8 +1316,9 @@ export class StreamRequest {
     });
 
     // 调用超时回调
-    if (this.timeoutCallback) {
-      this.timeoutCallback();
+    const timeoutCallback = this.timeoutCallback;
+    if (timeoutCallback != null) {
+      timeoutCallback();
     }
   }
 
@@ -325,9 +1328,7 @@ export class StreamRequest {
     let combined = newBytes;
 
     if (this.pendingBytes.length > 0) {
-      combined = new Uint8Array(this.pendingBytes.length + newBytes.length);
-      combined.set(this.pendingBytes);
-      combined.set(newBytes, this.pendingBytes.length);
+      combined = mergeUint8Arrays(this.pendingBytes, newBytes);
       this.pendingBytes = new Uint8Array(0);
     }
 
@@ -391,13 +1392,12 @@ export class StreamRequest {
       this.requestTask = uni.request({
         url: config.url,
         method: config.method,
-        header: config.headers as any,
+        header: config.headers,
         data: config.body,
         enableChunked: true, // 启用分块传输
         responseType: "arraybuffer", // 响应类型
         timeout: 1000 * 60 * 60 * 12, // 设置超时时间为 12小时
         success: (res) => {
-          console.log("[请求] success 回调触发，statusCode:", res.statusCode);
           if (res.statusCode === 200) {
             // 流式数据通过 onChunkReceived 接收，success 仅表示请求建立成功
             // 实际的流式数据处理在 onChunkReceived 回调中
@@ -405,31 +1405,22 @@ export class StreamRequest {
 
             resolve(); // 请求成功建立连接后即可 resolve
           } else {
-            console.log("[请求] 请求失败，statusCode:", res.statusCode);
-            // 清除超时监控
-            this.clearTimeoutMonitor();
-            reject(
-              new Error(
-                t("Mobile.Stream.httpErrorWithCode", {
-                  code: res.statusCode,
-                }),
-              ),
-            );
+            this.finalizeCompletedStream();
+            reject(new Error(buildHttpErrorMessage(res.statusCode)));
           }
         },
         fail: (err) => {
-          // 清除超时监控
-          this.clearTimeoutMonitor();
+          this.finalizeCompletedStream();
 
           if (!this.isAborted) {
             // 忽略超时错误，因为对于长连接流式请求，超时是预期内的行为
             // 只要 connection 还在接收数据，就不应该视为真正的错误
+            const errMsgText = err.errMsg;
             if (
-              err.errMsg &&
-              (err.errMsg.includes("time out") ||
-                err.errMsg.includes("timeout"))
+              errMsgText != null &&
+              (errMsgText.includes("time out") ||
+                errMsgText.includes("timeout"))
             ) {
-              console.log("请求超时警告（流式请求正常现象）:", err);
               // 不 reject，也不触发 onError，保持连接继续接收数据
               return;
             }
@@ -442,69 +1433,368 @@ export class StreamRequest {
 
       // 关键修复：在创建 requestTask 后立即启动超时监控
       // 因为 onChunkReceived 可能比 success 回调更早触发
-      console.log("[请求] requestTask 已创建，立即启动超时监控");
       this.startTimeoutMonitor();
-      console.log("[请求] 超时监控启动完成");
 
       // 监听分块数据接收
-      this.requestTask?.onChunkReceived?.((res) => {
-        // console.log('[数据接收] onChunkReceived 触发')
-        if (this.isAborted) return;
+      const requestTask = this.requestTask;
+      if (requestTask != null) {
+        const onWeappStreamComplete = (): void => {
+          resolve();
+        };
+        requestTask.onChunkReceived((res: RequestTaskOnChunkReceivedListenerResult) => {
+          if (this.isAborted) return;
 
-        // 更新最后接收数据的时间
-        this.updateLastChunkTime();
+          this.updateLastChunkTime();
 
-        try {
-          // 使用 decodeUTF8 处理分块数据，解决字符截断问题
-          const str = this.decodeUTF8(res.data as ArrayBuffer);
-
-          // console.log('[SSE] 接收到分块数据, 长度:', str.length)
-
-          // 将新数据添加到缓冲区
-          this.buffer += str;
-
-          // SSE 协议：完整的消息以 \n\n 结尾
-          // 按 \n\n 分割出完整的消息块
-          const messages = this.buffer.split("\n\n");
-
-          // 保存最后一个可能不完整的消息块
-          this.buffer = messages.pop() || "";
-
-          // 处理所有完整的消息块
-          for (const message of messages) {
-            if (!message.trim()) continue;
-
-            // 按行分割消息块，处理多行的情况
-            const lines = message.split("\n");
-            let dataContent = "";
-
-            // 提取所有 data: 开头的行
-            for (const line of lines) {
-              if (line.startsWith("data:")) {
-                // 移除 "data:" 前缀，保留后面的内容
-                const content = line.slice(5).trim();
-
-                // 拼接多个 data: 行的内容（用换行符连接）
-                if (dataContent.length > 0) {
-                  dataContent += "\n" + content;
-                } else {
-                  dataContent = content;
-                }
-              }
+          try {
+            // 优先走官方类型 .data；extractChunkArrayBuffer 作兜底
+            let chunkBuffer: ArrayBuffer | null = null;
+            const typedData = res.data;
+            if (typedData != null) {
+              chunkBuffer = typedData as ArrayBuffer;
+            } else {
+              chunkBuffer = extractChunkArrayBuffer(res);
             }
-
-            // 如果提取到了数据内容，进行处理
-            if (dataContent.length > 0) {
-              // 统一由 processSSEMessage 处理所有消息，包括 [DONE] 标记
-              this.processSSEMessage(dataContent, config, resolve);
+            if (chunkBuffer == null) {
+              return;
+            }
+            const str = this.decodeUTF8(chunkBuffer);
+            this.appendAndProcessSSEText(str, config, onWeappStreamComplete);
+          } catch (error) {
+            console.error("处理分块数据失败:", error);
+            if (!this.isAborted) {
+              config.onError?.(error);
             }
           }
+        });
+      }
+    });
+  }
+
+  /**
+   * uni-app x APP 端流式 SSE 请求。
+   * 官方文档：uni.request 返回 RequestTask（非 Promise），需 enableChunked + onChunkReceived + responseType arraybuffer。
+   * @see https://doc.dcloud.net.cn/uni-app-x/api/request.html
+   */
+  private requestAppX(config: StreamRequestConfig): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let isStreamFinished = false;
+      let hasReceivedChunk = false;
+
+      const finishStream = (): void => {
+        if (isStreamFinished) {
+          return;
+        }
+        this.waitForSseDispatchIdle(() => {
+          if (isStreamFinished) {
+            return;
+          }
+          isStreamFinished = true;
+          this.finalizeCompletedStream();
+          resolve();
+        });
+      };
+
+      const failStream = (error: any): void => {
+        if (isStreamFinished || this.isAborted) {
+          return;
+        }
+        isStreamFinished = true;
+        this.finalizeCompletedStream();
+        reject(error);
+      };
+
+      const handleChunkBuffer = (chunkBuffer: ArrayBuffer | null): void => {
+        if (chunkBuffer == null || this.isAborted) {
+          return;
+        }
+        hasReceivedChunk = true;
+        this.decodedChunkBytes = this.decodedChunkBytes + chunkBuffer.byteLength;
+        this.updateLastChunkTime();
+        try {
+          const text = this.decodeUTF8(chunkBuffer);
+          this.appendAndProcessSSEText(text, config, finishStream, true);
         } catch (error) {
-          console.error("处理分块数据失败:", error);
+          console.error("[SSE-APP] 处理分块数据失败:", error);
           if (!this.isAborted) {
             config.onError?.(error);
           }
         }
+      };
+
+      this.startTimeoutMonitor();
+
+      // APP 端 uni.request 同步返回 RequestTask，不可当作 Promise 使用
+      const requestTask = uni.request<ArrayBuffer>({
+        url: config.url,
+        method: config.method,
+        header: config.headers,
+        data: config.body,
+        enableChunked: true,
+        responseType: "arraybuffer",
+        dataType: "text",
+        timeout: 1000 * 60 * 60 * 12,
+        success: (res) => {
+          if (this.isAborted) {
+            return;
+          }
+          if (res.statusCode !== 200) {
+            failStream(new Error(buildHttpErrorMessage(res.statusCode)));
+            return;
+          }
+
+          // 连接已建立也算活跃（部分机型首包很晚才到 onChunkReceived）
+          this.updateLastChunkTime();
+          config.onOpen?.(res);
+
+          // iOS：工具调用后 MESSAGE/completed 可能只出现在 success.data。
+          // success.data 有两种形态：
+          // 1) 整包回放（byteLength >= decodedChunkBytes）→ 只解析增量，防 ANR
+          // 2) 仅尾包（byteLength < decodedChunkBytes）→ 必须整段解析，否则丢终态正文
+          const responseData = res.data;
+          if (responseData != null && this.receivedTerminalMarker != true) {
+            const byteLength = responseData.byteLength;
+            if (byteLength != null && byteLength > 0) {
+              if (hasReceivedChunk == true) {
+                if (byteLength > this.decodedChunkBytes) {
+                  // 整包回放：只解码尚未经 chunk 路径的尾部字节
+                  let takeStart = this.decodedChunkBytes;
+                  const view = new Uint8Array(responseData);
+                  let guard = 0;
+                  while (
+                    takeStart < byteLength &&
+                    guard < 4 &&
+                    (view[takeStart] & 0xc0) == 0x80
+                  ) {
+                    takeStart += 1;
+                    guard += 1;
+                  }
+                  if (byteLength - takeStart > SSE_RESIDUAL_MAX_BYTES) {
+                    takeStart = byteLength - SSE_RESIDUAL_MAX_BYTES;
+                    guard = 0;
+                    while (
+                      takeStart < byteLength &&
+                      guard < 4 &&
+                      (view[takeStart] & 0xc0) == 0x80
+                    ) {
+                      takeStart += 1;
+                      guard += 1;
+                    }
+                  }
+                  if (takeStart < byteLength) {
+                    const residualText = utf8ArrayToString(
+                      view.slice(takeStart),
+                    );
+                    if (residualText.length > 0) {
+                      this.appendAndProcessSSEText(
+                        residualText,
+                        config,
+                        finishStream,
+                        true,
+                      );
+                    }
+                  }
+                } else if (byteLength < this.decodedChunkBytes) {
+                  // 仅尾包：与改前一致，整段入队（仍做 512KB 上限保护）
+                  let takeStart = 0;
+                  if (byteLength > SSE_RESIDUAL_MAX_BYTES) {
+                    takeStart = byteLength - SSE_RESIDUAL_MAX_BYTES;
+                  }
+                  const view = new Uint8Array(responseData);
+                  if (takeStart > 0) {
+                    let guard = 0;
+                    while (
+                      takeStart < byteLength &&
+                      guard < 4 &&
+                      (view[takeStart] & 0xc0) == 0x80
+                    ) {
+                      takeStart += 1;
+                      guard += 1;
+                    }
+                  }
+                  const residualText = utf8ArrayToString(view.slice(takeStart));
+                  if (residualText.length > 0) {
+                    this.appendAndProcessSSEText(
+                      residualText,
+                      config,
+                      finishStream,
+                      true,
+                    );
+                  }
+                } else if (this.receivedTerminalMarker != true) {
+                  // 等长整包回放且无新增：只扫尾部终态，禁止重解析
+                  const tailText = decodeArrayBufferTail(
+                    responseData,
+                    SSE_RESIDUAL_TERMINAL_SCAN_BYTES,
+                  );
+                  if (sseTextLooksTerminal(tailText)) {
+                    // 必须先排空派发队列再 onComplete，否则 success 抢跑会丢后半段 MESSAGE
+                    this.materializeBurstRestToQueue(config, finishStream);
+                    this.flushQueuedNonTerminalBeforeComplete(
+                      config,
+                      finishStream,
+                    );
+                    this.receivedTerminalMarker = true;
+                    this.finalizeCompletedStream();
+                    this.fireStreamOnCompleteAfterIdle(config, finishStream);
+                  }
+                }
+              } else {
+                // 未收过 chunk：整包兜底，但仍限长只吃尾部
+                let takeStart = 0;
+                if (byteLength > SSE_RESIDUAL_MAX_BYTES) {
+                  takeStart = byteLength - SSE_RESIDUAL_MAX_BYTES;
+                }
+                const view = new Uint8Array(responseData);
+                if (takeStart > 0) {
+                  let guard = 0;
+                  while (
+                    takeStart < byteLength &&
+                    guard < 4 &&
+                    (view[takeStart] & 0xc0) == 0x80
+                  ) {
+                    takeStart += 1;
+                    guard += 1;
+                  }
+                }
+                const residualText = utf8ArrayToString(view.slice(takeStart));
+                if (residualText.length > 0) {
+                  hasReceivedChunk = true;
+                  this.appendAndProcessSSEText(
+                    residualText,
+                    config,
+                    finishStream,
+                    true,
+                  );
+                } else {
+                  handleChunkBuffer(responseData);
+                }
+              }
+            }
+          }
+        },
+        fail: (err) => {
+          this.finalizeCompletedStream();
+
+          if (this.isAborted || isStreamFinished) {
+            return;
+          }
+
+          // 忽略超时错误（长连接预期行为）
+          const errMsgText = err.errMsg;
+          if (
+            errMsgText != null &&
+            (errMsgText.includes("time out") || errMsgText.includes("timeout"))
+          ) {
+            return;
+          }
+
+          // 已收到 SSE 终态：关连接时常再报 fail，忽略即可
+          if (this.receivedTerminalMarker == true) {
+            console.warn(
+              "[SSE-APP] ignore fail after terminal marker:",
+              collectRequestErrorText(err),
+            );
+            finishStream();
+            return;
+          }
+
+          // iOS：录音/TTS/服务端关连后常报「网络连接已中断」。
+          // 软收尾：先冲刷 residual，再走 onTimeout（hydrate/sub），禁止 onError 双回调清会话。
+          if (isNetworkConnectionLostError(err) == true) {
+            console.warn(
+              "[SSE-APP] connection lost soft-close hasChunk=" +
+                `${hasReceivedChunk}` +
+                " background=" +
+                `${isAppInBackground()}` +
+                " " +
+                collectRequestErrorText(err),
+            );
+            this.flushPendingUtf8Bytes();
+            if (this.buffer.trim().length > 0) {
+              this.appendAndProcessSSEText("\n\n", config, finishStream, true);
+            }
+            this.waitForSseDispatchIdle(() => {
+              if (isStreamFinished || this.isAborted) {
+                return;
+              }
+              if (this.receivedTerminalMarker == true) {
+                finishStream();
+                return;
+              }
+              this.clearTimeoutMonitor();
+              config.onTimeout?.();
+              finishStream();
+            });
+            return;
+          }
+
+          // 真正失败：只 reject，由 request() catch 统一调一次 onError（避免双次 finalize）
+          failStream(err);
+        },
+        complete: () => {
+          if (isStreamFinished || this.isAborted) {
+            this.releaseRequestTask(false);
+            return;
+          }
+          // iOS enableChunked：complete 可能早于分发队列排空，也可能是真结束但 completed 卡在 buffer（缺尾部 \n\n）。
+          // 流程：冲刷 UTF-8 残留 → 等队列空 → 冲刷 buffer → 再等队列空。
+          // 与 H5 对齐：仅当已有 SSE 终态（completed/[DONE]）才算成功；否则走 onTimeout，不当 onComplete。
+          this.flushPendingUtf8Bytes();
+          this.waitForSseDispatchIdle(() => {
+            if (isStreamFinished || this.isAborted) {
+              this.releaseRequestTask(false);
+              return;
+            }
+            if (this.buffer.trim().length > 0) {
+              // 补一个分隔符，强制解析残留帧（常见含 completed）
+              this.appendAndProcessSSEText("\n\n", config, finishStream, true);
+            }
+            this.waitForSseDispatchIdle(() => {
+              if (isStreamFinished || this.isAborted) {
+                this.releaseRequestTask(false);
+                return;
+              }
+          if (this.receivedTerminalMarker == true) {
+            // 终态已见：onComplete 可能仍在 waitForSseDispatchIdle 排队；
+            // finishStream 再等一次 idle 后 resolve，与 deferred onComplete 对齐。
+            finishStream();
+            return;
+          }
+
+              console.warn(
+                "[SSE-APP] complete without terminal background=" +
+                  `${isAppInBackground()}`,
+              );
+              this.clearTimeoutMonitor();
+              config.onTimeout?.();
+              finishStream();
+            });
+          });
+        },
+      });
+
+      this.requestTask = requestTask;
+
+      // 必须标注官方类型：Android 上自定义 interface 读不到 getData()
+      requestTask.onChunkReceived((result: RequestTaskOnChunkReceivedListenerResult) => {
+        if (this.isAborted) {
+          return;
+        }
+        // 回调一到就刷新空闲计时（即使 buffer 解析失败也不误杀）
+        this.updateLastChunkTime();
+        let chunkBuffer: ArrayBuffer | null = null;
+        const typedData = result.data;
+        if (typedData != null) {
+          chunkBuffer = typedData as ArrayBuffer;
+        } else {
+          chunkBuffer = extractChunkArrayBuffer(result);
+        }
+        if (chunkBuffer == null) {
+          console.warn("[SSE-APP] onChunkReceived 无法解析 ArrayBuffer，已刷新空闲计时", result);
+          return;
+        }
+        handleChunkBuffer(chunkBuffer);
       });
     });
   }
@@ -516,7 +1806,7 @@ export class StreamRequest {
       this.requestTask = uni.request({
         url: config.url,
         method: config.method,
-        header: config.headers as any,
+        header: config.headers,
         data: config.body,
         success: (res) => {
           if (res.statusCode === 200) {
@@ -524,13 +1814,7 @@ export class StreamRequest {
             this.handleStreamResponse(res.data as string, config);
             resolve();
           } else {
-            reject(
-              new Error(
-                t("Mobile.Stream.httpErrorWithCode", {
-                  code: res.statusCode,
-                }),
-              ),
-            );
+            reject(new Error(buildHttpErrorMessage(res.statusCode)));
           }
         },
         fail: (err) => {
@@ -548,7 +1832,6 @@ export class StreamRequest {
     data: string,
     config: StreamRequestConfig,
   ): void {
-    console.log("[SSE-APP] 处理流式响应数据, 长度:", data.length);
     const lines = data.split("\n");
 
     for (const line of lines) {
@@ -558,16 +1841,12 @@ export class StreamRequest {
         const content = line.slice(5).trim();
 
         // 跳过空内容
-        if (!content) {
-          console.log("[SSE-APP] 跳过空内容行");
+        if (content.length == 0) {
           continue;
         }
 
-        console.log("[SSE-APP] 处理数据行:", content);
-
         // 检查是否完成
         if (content === "[DONE]") {
-          console.log("[SSE-APP] 收到完成标记 [DONE]");
           config.onComplete?.();
           return;
         }
@@ -579,26 +1858,29 @@ export class StreamRequest {
         if (looksLikeJSON) {
           // 尝试解析 JSON 数据
           try {
-            const parseData = JSON.parse(content);
-            if (parseData && parseData.completed) {
-              console.log("[SSE-APP] 收到完成标记 completed");
+            const parseData = JSON.parse(content) as UTSJSONObject;
+            if (isCompletedPayload(parseData)) {
               config.onComplete?.();
+              return;
+            }
+            // FINAL_RESULT：业务终态事件，先派发载荷再 complete（与 completed 帧不同）
+            if (isFinalResultPayload(parseData)) {
+              const chunk = createContentChunk(content);
+              config.onChunk?.(chunk);
+              config.onComplete?.();
+              return;
+            }
+            if (shouldSkipSsePayloadEmit(parseData)) {
               return;
             }
           } catch (e) {
             // JSON 解析失败，继续处理为普通数据
-            console.log("[SSE-APP] JSON 解析失败，作为普通内容处理");
           }
-        } else {
-          console.log("[SSE-APP] 非 JSON 格式，直接处理");
         }
 
         // 处理数据块
         try {
-          const chunk: StreamChunk = {
-            type: "content",
-            data: content,
-          };
+          const chunk = createContentChunk(content);
           config.onChunk?.(chunk);
         } catch (e) {
           console.error("[SSE-APP] 处理数据块失败:", e);
@@ -611,33 +1893,64 @@ export class StreamRequest {
   abort(): void {
     this.isAborted = true;
     this.buffer = ""; // 清空缓冲区
+    this.resetSseDispatchQueue();
 
     // 清除超时监控（所有平台都需要）
     this.clearTimeoutMonitor();
 
     // #ifdef H5
     // 中止 H5 的 SSE 连接
-    if (this.abortController) {
-      this.abortController.abort();
+    const abortController = this.abortController;
+    if (abortController != null) {
+      abortController.abort();
       this.abortController = null;
     }
     // #endif
 
-    // #ifdef MP-WEIXIN
-    // 中止小程序的请求
-    if (this.requestTask) {
-      this.requestTask.abort();
-      this.requestTask = null;
-    }
+    // #ifdef MP-WEIXIN || APP || APP-PLUS
+    this.releaseRequestTask(true);
     // #endif
+  }
+}
 
-    // #ifdef APP-PLUS
-    // 中止 App 的请求
-    if (this.requestTask) {
-      this.requestTask.abort();
-      this.requestTask = null;
+/**
+ * 当前挂了空闲超时监控的 StreamRequest（含 live chat 与 sub）。
+ * App 回前台时统一刷新 lastChunkTime，避免后台停留时间计入空闲超时。
+ */
+const activeTimeoutMonitors: StreamRequest[] = [];
+
+function registerTimeoutMonitor(req: StreamRequest): void {
+  for (let i = 0; i < activeTimeoutMonitors.length; i++) {
+    if (activeTimeoutMonitors[i] === req) {
+      return;
     }
-    // #endif
+  }
+  activeTimeoutMonitors.push(req);
+}
+
+function unregisterTimeoutMonitor(req: StreamRequest): void {
+  const next: StreamRequest[] = [];
+  for (let i = 0; i < activeTimeoutMonitors.length; i++) {
+    if (activeTimeoutMonitors[i] !== req) {
+      next.push(activeTimeoutMonitors[i]);
+    }
+  }
+  // 原地替换，避免外部仍持有旧引用语义混乱
+  while (activeTimeoutMonitors.length > 0) {
+    activeTimeoutMonitors.pop();
+  }
+  for (let j = 0; j < next.length; j++) {
+    activeTimeoutMonitors.push(next[j]);
+  }
+}
+
+/**
+ * App 回前台：活跃 SSE 刷新 lastChunk 时间，避免后台停留误触发空闲超时。
+ * 由 App.uvue onShow 调用。
+ */
+export function notifyStreamAppForeground(): void {
+  for (let i = 0; i < activeTimeoutMonitors.length; i++) {
+    activeTimeoutMonitors[i].onAppForeground();
   }
 }
 

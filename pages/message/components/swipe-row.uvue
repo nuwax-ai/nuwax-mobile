@@ -1,0 +1,281 @@
+<template>
+  <view
+    class="chat-swipe"
+    @touchstart="onTouchStart($event)"
+    @touchmove="onTouchMove($event)"
+    @touchend="onTouchEnd($event)"
+    @touchcancel="onTouchEnd($event)"
+  >
+    <!-- 默认插槽为行内容；右侧操作按钮层宽度随手势生长/收回。 -->
+    <slot />
+    <!-- 按钮层钉在右侧不动，宽度从 0 长到总宽；内部按钮各自固定全宽（文案只排版一次，
+         拖拽永不重测 → 无闪现），以 left: i/N×100% 定位：任意拖出距离 d 下每个按钮
+         露出最左 d/N 等宽切片（相邻按钮重叠遮挡其右段、行右缘裁掉超出部分），
+         拉出=遮挡滑开逐字露出，收起=逐字盖回（重叠式拉出/收起）。 -->
+    <view class="chat-swipe__acts" :style="actsRevealStyle">
+      <slot name="acts" />
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref, watch } from "vue";
+
+  const props = defineProps({
+    /**
+     * 受控收起：true 时该行处于展开态。展开不由此 prop 驱动（跟手拖拽/松手吸附在子组件自治），
+     * prop 变 false 时内部带动画收回——父页单开策略（关其它行）/点行收起/点按钮收起走这里。
+     */
+    open: {
+      type: Boolean,
+      default: false,
+    },
+    // 按钮区总宽（rpx）：420=3钮 / 280=2钮 / 220=单个宽钮（钮宽 141rpx 相邻重叠 1rpx 消缝）
+    actsRpx: {
+      type: Number,
+      default: 420,
+    },
+  });
+
+  const emit = defineEmits<{
+    /** touchstart：父页收起其它已展开行（单开策略） */
+    grab: [];
+    /** 轴判定为横向：锁列表滚动（direction=none，防斜滑时页面上下晃动） */
+    lock: [];
+    /** 松手/取消：解锁列表滚动 */
+    unlock: [];
+    /** 松手吸附为展开（过半）：父页记入 openRowId */
+    opened: [];
+    /** 松手吸附为收回（不足半）：父页清出 openRowId */
+    closed: [];
+    /** 横向滑动松手：H5 会补发一次 click，父页置位吞掉避免误触行点击 */
+    swiped: [];
+  }>();
+
+  /**
+   * rpx→px 换算基准（组件创建时取一次缓存）：
+   * 跟手滑动期间不再跨端调 uni.getWindowInfo（原生桥调用 × 每帧，是左滑跟手延迟的主因）。
+   */
+  const rpxScalePx = uni.getWindowInfo().windowWidth / 750;
+  /** 本行按钮区总宽（px）：actsRpx 按行类型固定，算一次即可。 */
+  const actsWidthPx = rpxScalePx * props.actsRpx;
+
+  // 按钮层横向偏移（px，闭合=0，展开=-totalW）
+  const swipeX = ref<number>(0);
+
+  /** 按钮层展开宽度（px）：层钉在右侧，宽度 = -swipeX（闭合 swipeX=0 → 宽 0；
+   *  展开 swipeX=-W → 宽 W）。层内按钮各自固定全宽、以 left: i/N×100% 定位，
+   *  拖出距离 d 时每钮露出最左 d/N 等宽切片（重叠式，视觉等宽并显）。 */
+  const actsRevealStyle = computed((): string => {
+    return `width: ${-swipeX.value}px;`;
+  });
+
+  // ===== 松手吸附补间：JS 驱动逐帧改宽（与拖拽同一条渲染路径）=====
+  // 不用 CSS transition：App 端对动态绑定 width 的过渡不稳（真机快速甩动松手时
+  // 按钮层先瞬间跳到全宽再回缩）；拖拽路径逐帧改宽已被真机验证流畅，吸附复用同机制。
+  let settleTimerId: number | null = null;
+
+  function cancelSettleAnim(): void {
+    // 局部常量承接：可变变量无法 smart cast 非空（Kotlin 并发限制）
+    const tid = settleTimerId;
+    if (tid != null) {
+      try {
+        clearInterval(tid);
+      } catch (_e) {
+        // ignore
+      }
+      settleTimerId = null;
+    }
+  }
+
+  /** 200ms ease-out 补间到目标偏移；新 touchstart / 外部收起会取消并改道。 */
+  function settleTo(target: number): void {
+    cancelSettleAnim();
+    const from = swipeX.value;
+    const delta = target - from;
+    if (delta == 0) {
+      return;
+    }
+    const durationMs = 200;
+    const startAt = Date.now();
+    settleTimerId = setInterval((): void => {
+      const progress = Math.min(1, (Date.now() - startAt) / durationMs);
+      // ease-out cubic：1-(1-t)^3，起步快收尾缓，与原 CSS ease-out 观感一致
+      const eased = 1 - (1 - progress) * (1 - progress) * (1 - progress);
+      swipeX.value = Math.round(from + delta * eased);
+      if (progress >= 1) {
+        cancelSettleAnim();
+        swipeX.value = target;
+      }
+    }, 16);
+  }
+
+  // 外部收起：open 变 false 且当前展开 → 补间收回
+  watch(
+    (): boolean => props.open,
+    (open: boolean) => {
+      if (open != true && swipeX.value != 0) {
+        settleTo(0);
+      }
+    },
+  );
+
+  // ===== 左滑手势（单行自治；跟手的每帧状态更新只落在本组件内，不重渲整个列表页）=====
+  let touching = false;
+  let startX = 0;
+  let startY = 0;
+  let baseX = 0;
+  // 轴锁定：0=未判定 1=横向（左滑）2=纵向（让位列表滚动）
+  let axis = 0;
+  let lastMoveLogAt = 0;
+
+  // ===== 快速滑动（fling）判定：快速左滑一下直接全开、快速右滑一下直接收起 =====
+  /** fling 速度阈值（px/ms，≈300px/s）：松手时窗口速度超过即越过位置阈值直接吸附。 */
+  const FLING_VELOCITY_PX_PER_MS = 0.3;
+  /** 速度窗口（ms）：窗口首尾位移/耗时求速度（真机 move 分发会成簇/断流，瞬时速度不可信）。 */
+  const FLING_WINDOW_MS = 120;
+  // 窗口基点 + 最新采样（touchstart 初始化）。曾用 EMA 平滑瞬时速度：快滑收尾的
+  // 单帧反向抖动能把 EMA 拉回阈值内、>120ms 的分发空档直接清零——快滑松手判不出
+  // 负速度，表现为「拉出一半弹回」；首尾差分对两者都不敏感。
+  let sampleBaseX = 0;
+  let sampleBaseT = 0;
+  let sampleLastX = 0;
+  let sampleLastT = 0;
+
+  /**
+   * 模板内联表达式中的 `$event` 在 Android UTS 会被推断为 Any；
+   * 仅在模板边界接收 Any，进入手势逻辑后恢复为真实的 UniTouchEvent。
+   */
+  function onTouchStart(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
+    if (e.touches.length == 0) {
+      console.log("[IMSwipe] touchstart without touches");
+      return;
+    }
+    touching = true;
+    // 打断进行中的吸附补间，从当前宽度继续跟手
+    cancelSettleAnim();
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+    baseX = swipeX.value;
+    axis = 0;
+    lastMoveLogAt = 0;
+    sampleBaseX = startX;
+    sampleBaseT = Date.now();
+    sampleLastX = startX;
+    sampleLastT = sampleBaseT;
+    console.log(`[IMSwipe] touchstart x=${startX} y=${startY} base=${baseX}`);
+    emit("grab");
+  }
+
+  function onTouchMove(eventValue: Any): void {
+    if (touching != true) {
+      return;
+    }
+    const e = eventValue as UniTouchEvent;
+    const dx = e.touches[0].clientX - startX;
+    const dy = e.touches[0].clientY - startY;
+    const adx = dx < 0 ? -dx : dx;
+    const ady = dy < 0 ? -dy : dy;
+    // 轴锁定：位移超 8px 才判定方向，|dx|>|dy| 为横向，否则让位纵向滚动
+    if (axis == 0) {
+      if (adx < 8 && ady < 8) {
+        return;
+      }
+      axis = adx > ady ? 1 : 2;
+      console.log(`[IMSwipe] axis=${axis == 1 ? "horizontal" : "vertical"} dx=${dx} dy=${dy}`);
+      if (axis == 1) {
+        // 横向判定成立即锁列表滚动，吃掉剩余纵向分量（解锁在 onTouchEnd/cancel）
+        emit("lock");
+      }
+    }
+    if (axis != 1) {
+      return;
+    }
+    // 速度采样（fling 判定）：采样跨出窗口时基点前移到上一采样（停顿后不作跨段差分）
+    const sampleT = Date.now();
+    if (sampleT - sampleBaseT > FLING_WINDOW_MS) {
+      sampleBaseX = sampleLastX;
+      sampleBaseT = sampleLastT;
+    }
+    sampleLastX = e.touches[0].clientX;
+    sampleLastT = sampleT;
+    let next = baseX + dx;
+    if (next < -actsWidthPx) {
+      next = -actsWidthPx;
+    }
+    if (next > 0) {
+      next = 0;
+    }
+    // 取整到像素：触摸坐标是浮点，亚像素更新只会刷无效帧徒增延迟；值未变则不触发响应式更新
+    const snapped = Math.round(next);
+    if (snapped == swipeX.value) {
+      return;
+    }
+    swipeX.value = snapped;
+    const now = Date.now();
+    if (now - lastMoveLogAt >= 100) {
+      lastMoveLogAt = now;
+      console.log(`[IMSwipe] move dx=${dx} swipeX=${snapped}px`);
+    }
+  }
+
+  function onTouchEnd(_eventValue: Any): void {
+    if (touching != true) {
+      console.log("[IMSwipe] touchend ignored: no active touch");
+      return;
+    }
+    touching = false;
+    console.log(`[IMSwipe] touchend axis=${axis} swipeX=${swipeX.value}px`);
+    if (axis != 1) {
+      console.log(`[IMSwipe] touchend ignored: axis=${axis}`);
+      return;
+    }
+    // 松手吸附（200ms JS 补间）：
+    // - 快速左滑（fling）→ 直接全开；快速右滑 → 直接收起（不受过半位置阈值约束）
+    // - 抬手前已停顿（>100ms 无 move 采样）或窗口速度未达阈值 → 维持过半展开、不足半收回
+    let fling = 0;
+    const endNow = Date.now();
+    if (endNow - sampleLastT <= 100 && sampleLastT - sampleBaseT >= 8) {
+      fling = (sampleLastX - sampleBaseX) / (sampleLastT - sampleBaseT);
+    }
+    let target = swipeX.value < -actsWidthPx / 2 ? -actsWidthPx : 0;
+    if (fling <= -FLING_VELOCITY_PX_PER_MS) {
+      target = -actsWidthPx;
+    } else if (fling >= FLING_VELOCITY_PX_PER_MS) {
+      target = 0;
+    }
+    settleTo(target);
+    const opened = target == -actsWidthPx;
+    const flingDx = sampleLastX - sampleBaseX;
+    const flingDt = sampleLastT - sampleBaseT;
+    const flingStale = endNow - sampleLastT;
+    console.log(`[IMSwipe] settle x=${swipeX.value} w=${actsWidthPx} v=${fling} dx=${flingDx} dt=${flingDt} stale=${flingStale} opened=${opened}`);
+    // 先提交本行最终位移，再通知父级变更 scroll-view direction，避免原生视图更新打断收尾。
+    emit(opened ? "opened" : "closed");
+    emit("swiped");
+    emit("unlock");
+  }
+</script>
+
+<style lang="scss">
+  /* 左滑操作行（飞书同款）：内容行不动，按钮层绝对定位钉在右侧、宽度随手势生长
+     盖在行内容上方。不加 scoped：slot 内容由父页 message.uvue 渲染，scoped 会把
+     .chat-swipe__act 改写成 .chat-swipe__act[data-v-xxx] 让父页渲染的按钮拿不到
+     这条样式（行内块自然铺开 = 全部按钮可见），与容器样式只此一处使用、无命名冲突故无需 scoped */
+  .chat-swipe {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .chat-swipe__acts {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 2;
+    /* 裁掉越出层宽（=行右缘）的按钮部分：既是收起态的隐藏，也是拖拽中
+       最右按钮的右缘裁切（重叠式的遮挡来源之一） */
+    overflow: hidden;
+  }
+</style>

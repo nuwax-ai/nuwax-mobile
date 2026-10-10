@@ -1,0 +1,1398 @@
+import request from "./useRequest";
+import { generateUUID } from "@/utils/common";
+import type { RequestResponse } from "@/types/interfaces/request";
+
+const IM_DEVICE_BASE_ID_STORAGE_KEY = "NUWAX_IM_DEVICE_BASE_ID";
+
+/**
+ * 「定位到聊天位置」跳转事件（quote-detail 页 → 聊天页）：
+ * payload 为目标 msgId（字符串雪花号），聊天页收到后滚动定位并高亮闪烁该行。
+ */
+export const IM_CHAT_JUMP_EVENT = "im-chat-jump-to-msg";
+
+/**
+ * @成员选择回填事件（at-select 页 → 聊天页）：
+ * payload 为选中的提及 token 数组（不带 @ 前缀的显示名字符串），
+ * 聊天页收到后逐个追加 "@token " 到输入框（IM_CHAT_JUMP_EVENT 同款 uni.$emit 模式）。
+ */
+export const IM_AT_PICK_EVENT = "im-chat-at-pick";
+
+let cachedImDeviceId = "";
+
+/**
+ * IM 协议 deviceId（nuwax-im ImProtocol.isValidDeviceId）：
+ * 格式 {baseId}#{tabId}，字符仅 a-zA-Z0-9 与 - _ .，至多一个 #，总长 ≤128。
+ * ★REST 发送必填：扇出按它【排除来源端】（nuwax-im 02 §6.5），缺失会报 IM_90001。
+ * baseId 首次生成后落 storage 持久化；tabId 每次页面会话随机——H5 多标签各拿各的
+ * tabId，自己其他标签页仍能收到自己发的消息，仅来源标签页被排除。
+ */
+export function getImDeviceId(): string {
+  if (cachedImDeviceId.length > 0) {
+    return cachedImDeviceId;
+  }
+  let baseId = "";
+  try {
+    const raw = uni.getStorageSync(IM_DEVICE_BASE_ID_STORAGE_KEY);
+    if (raw != null) {
+      baseId = `${raw}`;
+    }
+  } catch (_error) {
+    baseId = "";
+  }
+  if (baseId.length == 0) {
+    baseId = generateUUID();
+    try {
+      uni.setStorageSync(IM_DEVICE_BASE_ID_STORAGE_KEY, baseId);
+    } catch (_error) {
+      // 存储异常不阻断发送：本次会话退化为内存态 baseId
+    }
+  }
+  let tabId = "";
+  for (let i = 0; i < 12; i++) {
+    tabId += Math.floor(Math.random() * 16).toString(16);
+  }
+  cachedImDeviceId = `${baseId}#${tabId}`;
+  return cachedImDeviceId;
+}
+
+/**
+ * IM 未读总数（App 角标）。
+ *
+ * 契约见 nuwax-im 仓库 docs/openapi/im-openapi.yaml（syncUnreadTotal）：
+ * - 响应 data：total / dndTotal / unreadConvs / authoritative / serverTimeMs
+ * - ★total 已包含 dndTotal，角标应展示 total - dndTotal（该提醒用户的数字）
+ * - ★authoritative=false 表示服务端走了缓存/降级路径，客户端应降低轮询频率
+ * - 接口承诺"永不 500"，可安全用于周期轮询
+ */
+export async function apiImUnreadTotal(): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/unread-total",
+    method: "GET",
+  });
+}
+
+/**
+ * 我的会话列表（游标分页，首页 cursor 传空串）。
+ *
+ * 契约见 im-openapi.yaml（convList）：
+ * - data = PageResult + records: ConversationSummaryDto[]
+ * - nextCursor 缺键/为空 = 没有下一页（★勿用 records.length < limit 判断）
+ * - convId 是雪花号（int64），H5 按 number 解析会丢精度，页面层统一转字符串保存
+ * - unreadCount 服务端没算时【键整个不存在】（不是 0）
+ */
+export async function apiImConversations(
+  cursor: string,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/conversations",
+    method: "GET",
+    data: {
+      cursor,
+      limit,
+    },
+  });
+}
+
+/**
+ * 我的群聊列表（convListMyGroups，游标分页，首页 cursor 传空串）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - 与 /conversations 的差异：含 visible=0（已从会话列表删除但仍在群内）的群
+ * - ★cursor 不能与 /conversations 混用（两边可见集不同）
+ * - data = PageResult：records: ConversationSummaryDto[]（convType=2），
+ *   total = 符合条件的总数（智联录分组头计数用它，勿用 records.length）
+ */
+export async function apiImMyGroups(
+  cursor: string,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/conversations/groups",
+    method: "GET",
+    data: {
+      cursor,
+      limit,
+    },
+  });
+}
+
+/**
+ * 我的团队列表（智联录「团队」折叠分类，置于我的群组上方）。
+ *
+ * - GET /api/instant-message/spaces → data.items: SpaceSummaryDto[]
+ *   （spaceId/name/description/icon/type("Team")/currentUserRole("Owner"|"Admin"|"User")）
+ * - 全量返回不分页（data.degraded 标志暂未用）；spaceId 拼进 enter 的 URL，存字符串
+ */
+export async function apiImSpaces(): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/spaces",
+    method: "GET",
+  });
+}
+
+/**
+ * 进入团队会话（spaceEnter，幂等 get-or-create，同 p2p 语义）。
+ *
+ * - 响应 data = ConversationSummaryDto：convId 为 int64 雪花号（请求层防精度解析
+ *   保证精确）、convType=4（团队会话），name/avatar 可直接作聊天页入参
+ */
+export async function apiImSpaceEnter(
+  spaceId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/spaces/${spaceId}/enter`,
+    method: "POST",
+  });
+}
+
+/**
+ * 解散群聊（convDisband，仅群主）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - 解散即整个群不复存在（全体成员被移出、会话列表同步消失），不可恢复
+ * - 非群主调用会被服务端拒绝；data = true 表示已执行
+ */
+export async function apiImGroupDisband(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}`,
+    method: "DELETE",
+  });
+}
+
+/**
+ * 退出群聊（convLeave，非群主）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - ★群主不能直接退群（需先转让，否则报 IM_30001）——前端按 myRole 只给
+ *   群主展示「解散群聊」，不给「退出群聊」
+ * - data = RemoveMemberResult（四步级联布尔，客户端只按信封 code 判成败）
+ */
+export async function apiImGroupLeave(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/leave`,
+    method: "POST",
+  });
+}
+
+/**
+ * 创建或获取单聊会话（convCreateP2p，幂等）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - ★同一对用户重复调用返回同一个 convId，不会产生第二个会话——智联录点
+ *   联系人进详情页的唯一入口，无需先去会话列表里找
+ * - targetUserId == 自己 → IM_20106（一期不开放给自己发）
+ * - 响应 data = ConversationSummaryDto；created 键仅创建类接口返回（本次是否真的新建）
+ */
+export async function apiImCreateP2pConversation(
+  targetUserId: string,
+): Promise<RequestResponse<any>> {
+  // ★targetUserId 是 int64：以原始数字字面量拼 JSON 直传（同 apiImSendTextMsg 的
+  //   convId），避免经 JS number 丢精度后建错/找不到会话
+  return await request({
+    url: "/api/instant-message/conversations/p2p",
+    method: "POST",
+    data: `{"targetUserId":${targetUserId}}`,
+  });
+}
+
+/**
+ * 创建群聊会话（convCreateGroup）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - name 必填；memberUserIds 不含自己（服务端自动拉创建者入群）
+ * - 响应 data = ConversationSummaryDto（convId 为 int64 雪花号）
+ * - 成员上限超 2000 → IM_20101，超 5000 → IM_20102
+ */
+export async function apiImCreateGroup(
+  name: string,
+  memberUserIds: string[],
+): Promise<RequestResponse<any>> {
+  // ★memberUserIds 元素是 int64 雪花号：userId 全程存字符串，join 后以原始数字
+  //   字面量拼 JSON 直传（同 apiImCreateP2pConversation），避免经 JS number 丢精度
+  const ids = memberUserIds.join(",");
+  // name 走 JSON.stringify 转义（含引号/反斜杠/换行的群名安全）
+  return await request({
+    url: "/api/instant-message/conversations/group",
+    method: "POST",
+    data: `{"name":${JSON.stringify(name)},"memberUserIds":[${ids}]}`,
+  });
+}
+
+/**
+ * 通讯录列表（消息页「智联录」tab）。
+ *
+ * 契约见 im-openapi.yaml（contactList）：
+ * - data = { items: ContactItem[], degraded, truncated }
+ * - displayName 服务端已按 remark > nickName > userName 算好，直接用，不要重算
+ * - status：1=已互为联系人 2=对方申请待我确认 3=我已申请待对方同意（2/3 勿渲染成正常联系人）
+ * - subjectType：1=人（用户标签），其余值为智能体（专家标签）
+ */
+export async function apiImContacts(): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/contacts",
+    method: "GET",
+  });
+}
+
+/**
+ * 搜索联系人（searchContacts，跨本地联系人 + 平台用户）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - keyword 必填（1-64 字符，不传 IM_40001）；limit 可选
+ * - data = { items: ContactSearchItem[], degraded }
+ *   degraded=true ⇒ 平台侧查询失败，结果可能不全（应提示用户）
+ * - ContactSearchItem 无 displayName/status：展示名按 nickName > userName 回落
+ */
+export async function apiImSearchContacts(
+  keyword: string,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/search/contacts",
+    method: "GET",
+    data: {
+      keyword,
+      limit,
+    },
+  });
+}
+
+/**
+ * 全局消息搜索（searchMessages，ES，PC 搜索弹窗同款端点）。
+ *
+ * 契约见 im-openapi.yaml（mobile-search 域）：
+ * - ★入参全是 query 参数（服务端 @ModelAttribute 绑定）
+ * - keyword 必填（1-64 字符）；size 默认 20 上限 100
+ * - collapseByConv=true ⇒ 每个会话只返回最匹配的一条（聚合视角用）；
+ *   false ⇒ 返回所有命中（消息级视角）
+ * - from/size 是 ES 深分页语义（from+size>10000 报错），勿用它做无限滚动
+ * - ★ES 侧恒定过滤 msgStatus=1：撤回/删除的消息搜不到，前端无需再判
+ * - highlight 是服务端加好 <em> 标记的高亮片段（text→fileName 已回落），
+ *   text 为纯文本摘要；渲染前不得当 HTML 用（分段渲染天然免 XSS）
+ * - ★本接口不受 clear_before_seq 过滤：清空过聊天记录的消息仍可能被搜到
+ *   （已知设计取舍，勿当 bug 上报）
+ */
+export async function apiImSearchMessages(
+  keyword: string,
+  size: number,
+  collapseByConv: boolean,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/search/messages",
+    method: "GET",
+    data: {
+      keyword,
+      size,
+      collapseByConv,
+    },
+  });
+}
+
+/**
+ * 会话内消息搜索（同 /search/messages 端点恒带 convId，PC ChatSearchPanel 同款）：
+ * - convId 限定在本会话内搜（★int64 雪花号字符串直传 query，不经 number 防丢精度）；
+ * - msgType 限定消息类型（image/file/video/audio，ES term 精确匹配）；空串=不过滤——
+ *   ★空串干脆不传该参数（openapi 定义 msgType 空串视为不过滤，但后端 convId 是
+ *   Long 绑定、空串不友好，统一按「有值才传」的纪律走）；
+ * - collapseByConv 恒 false（会话内折叠无意义，后端 convId!=null 时也不会折叠）；
+ * - 其余契约同 apiImSearchMessages（keyword 1-64 必填、ES 恒过滤 msgStatus=1、
+ *   highlight 带 <em> 标记需拆段渲染）。
+ */
+export async function apiImSearchConvMessages(
+  convId: string,
+  keyword: string,
+  msgType: string,
+  size: number,
+): Promise<RequestResponse<any>> {
+  if (msgType.length > 0) {
+    return await request({
+      url: "/api/instant-message/search/messages",
+      method: "GET",
+      data: {
+        keyword,
+        size,
+        collapseByConv: false,
+        convId,
+        msgType,
+      },
+    });
+  }
+  return await request({
+    url: "/api/instant-message/search/messages",
+    method: "GET",
+    data: {
+      keyword,
+      size,
+      collapseByConv: false,
+      convId,
+    },
+  });
+}
+
+/**
+ * 发起加好友（contactAdd）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - 不传 direct（默认 false）⇒ 落"待接受"态，需对方 accept
+ * - 响应 data = ContactAddResult：accepted 决定文案（"申请已发送"），
+ *   alreadyContact=true 表示早就是好友（不报错、不重复建关系）
+ */
+export async function apiImAddContact(
+  targetUserId: string,
+  message: string,
+): Promise<RequestResponse<any>> {
+  // ★targetUserId 是 int64 雪花号：字符串直传数字字面量拼 JSON（同建群），
+  //   避免经 JS number 丢精度；附言走 JSON.stringify 转义
+  return await request({
+    url: "/api/instant-message/contacts",
+    method: "POST",
+    data: `{"targetUserId":${targetUserId},"message":${JSON.stringify(message)}}`,
+  });
+}
+
+/**
+ * 搜索平台智能体（contactSearchAgents，智能体 tab 数据源）。
+ *
+ * 契约见 im-openapi.yaml：
+ * - kw 可选：不传等于"浏览全部"（分页）；page 从 1 起，pageSize 默认 20 上限 100
+ * - data = AgentSearchResult { items, total, page, pageSize, degraded }
+ *   ★degraded=true ⇒ 平台不可用、items 为空，应提示"搜索服务暂不可用"而非"没有找到"
+ * - AgentSearchItem 的 userId/publishedId 是 int64 雪花号（读时按字符串取）
+ */
+export async function apiImSearchAgents(
+  kw: string,
+  page: number,
+  pageSize: number,
+): Promise<RequestResponse<any>> {
+  if (kw.length > 0) {
+    return await request({
+      url: "/api/instant-message/contacts/agents",
+      method: "GET",
+      data: {
+        kw,
+        page,
+        pageSize,
+      },
+    });
+  }
+  // 不传 kw = 浏览全部（契约规定，空串行为未定义故不传）
+  return await request({
+    url: "/api/instant-message/contacts/agents",
+    method: "GET",
+    data: {
+      page,
+      pageSize,
+    },
+  });
+}
+
+/**
+ * 按群号申请加群（conversations/join，PC 端同款接口）。
+ *
+ * 契约（nuwax-im 后端暂未入 OpenAPI，按 PC 端联调参数对齐）：
+ * - body { groupNo: string(19 位数字，字符串直传), remark: string(≤64，申请附言) }
+ * - 免审批群直接入群；需审批群等群主同意后出现在会话列表
+ */
+export async function apiImJoinGroup(
+  groupNo: string,
+  remark: string,
+): Promise<RequestResponse<any>> {
+  // groupNo 按契约以字符串传输；remark 走 JSON.stringify 转义
+  return await request({
+    url: "/api/instant-message/conversations/join",
+    method: "POST",
+    data: `{"groupNo":${JSON.stringify(groupNo)},"remark":${JSON.stringify(remark)}}`,
+  });
+}
+
+/**
+ * 更新我在会话里的设置（conversations/{convId}/members/me，PUT 局部字段：不传的键不改）。
+ * 会话行左滑三操作 + 群昵称共用：
+ * - 置顶 topFlag / 消息免打扰 dnd（消息仍收，仅不提醒）/ visible=false 从我的消息列表移除
+ * - 我在本群的昵称 nickName（群设置页子页，见 apiImConvSetMyNickName）
+ * - 返回更新后的 ConversationSummaryDto
+ * ★易混接口：POST /{convId}/mute 是群成员禁言；DELETE /{convId} 是解散群（仅群主），都不是这里的语义
+ */
+async function apiImConvUpdateMySettings(
+  convId: string,
+  body: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/members/me`,
+    method: "PUT",
+    data: body,
+  });
+}
+
+/** 置顶 / 取消置顶会话（可多条置顶，最先置顶的在最上面）。 */
+export async function apiImConvSetTop(
+  convId: string,
+  top: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImConvUpdateMySettings(convId, `{"topFlag":${top}}`);
+}
+
+/** 开启 / 取消消息免打扰（消息仍会接收，仅不提醒）。 */
+export async function apiImConvSetDnd(
+  convId: string,
+  dnd: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImConvUpdateMySettings(convId, `{"dnd":${dnd}}`);
+}
+
+/** 删除会话（仅移出我的消息列表，聊天记录保留；人仍在群，可从智联录重新打开）。 */
+export async function apiImConvRemove(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await apiImConvUpdateMySettings(convId, '{"visible":false}');
+}
+
+/**
+ * 设置我在本群的昵称（同 members/me 端点，群设置页子页用；全员可改自己，与角色无关）。
+ * ★nickName 传空串 = 清除群昵称（写 NULL，展示回落平台昵称，与群名「空串报错」语义相反）；
+ * 服务端会 trim，上限 64 码点。data=false = 值没变没写库，仍是成功码勿当失败。
+ */
+export async function apiImConvSetMyNickName(
+  convId: string,
+  nickName: string,
+): Promise<RequestResponse<any>> {
+  // nickName 走 JSON.stringify 转义（含引号/反斜杠的昵称安全，同 apiImJoinGroup）
+  return await apiImConvUpdateMySettings(convId, `{"nickName":${JSON.stringify(nickName)}}`);
+}
+
+/**
+ * 接受好友申请（contactAccept，处理 status=2 的「新的伙伴申请」）。
+ * ★幂等：只对"待接受"态生效，重复接受返回 data=false（仍是成功码，勿当失败重试）。
+ */
+export async function apiImContactAccept(
+  userId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/contacts/${userId}/accept`,
+    method: "POST",
+  });
+}
+
+/**
+ * 拒绝好友申请 / 撤回我发出的申请（contactReject，★同一动作：删掉两行）。
+ * 幂等语义同 accept：重复操作 / 本来就没有返回 false 不报错。
+ */
+export async function apiImContactReject(
+  userId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/contacts/${userId}/reject`,
+    method: "POST",
+  });
+}
+
+/**
+ * 删除联系人（contactRemove，★双向：同时把我也从对方通讯录里删掉，
+ * 恢复需重新申请——确认弹窗文案与此语义对齐）。
+ * 终态幂等：本来就没有也返回 true；data=false 表示对方已不在我的通讯录。
+ */
+export async function apiImContactRemove(
+  userId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/contacts/${userId}`,
+    method: "DELETE",
+  });
+}
+
+/**
+ * 设置联系人备注（contactRemark，只改我这一行）。
+ * ★remark 传空串 = 清除备注（displayName 回落到平台昵称）；上限 32 字（服务端 MAX_REMARK）。
+ * data=false = 对方还不在我的通讯录里。
+ */
+export async function apiImContactSetRemark(
+  userId: string,
+  remark: string,
+): Promise<RequestResponse<any>> {
+  // remark 走 JSON.stringify 转义（含引号/反斜杠的备注安全）
+  return await request({
+    url: `/api/instant-message/contacts/${userId}/remark`,
+    method: "PUT",
+    data: `{"remark":${JSON.stringify(remark)}}`,
+  });
+}
+
+/**
+ * 历史消息（向前翻页，消息详情页用）。
+ *
+ * 契约见 im-openapi.yaml（msgHistory）：
+ * - ★beforeSeq 是【方向键】不是游标：beforeSeq<=0 不传 ⇒ 从最新往回取；
+ *   传了 ⇒ 取 seq < beforeSeq 的那一页（翻更早把上一页最小 seq 传回来）
+ * - 服务端按 seq 降序返回；hasMore 缺键/为空 = 没有更早消息（勿用 records.length 判断）
+ * - 被撤回的消息【仍在列表里】（msgStatus=2、body=null），靠渲染区分，勿过滤
+ * - convId 雪花号存字符串，拼 URL 原样直传防精度丢失
+ */
+export async function apiImMessages(
+  convId: string,
+  beforeSeq: number,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  data["limit"] = limit;
+  if (beforeSeq > 0) {
+    data["beforeSeq"] = beforeSeq;
+  }
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/messages`,
+    method: "GET",
+    data,
+  });
+}
+
+/**
+ * 单条消息详情（msgDetail）。
+ * ★convId 是【必填 query 参数】：msgId 全局唯一但不带会话维度，服务端靠 convId
+ *   做鉴权与分片路由，漏传报 IM_90001（im-openapi /messages/{msgId}）。
+ * 响应 data = MessageDto（含 body / senderName / sendTime / msgStatus 等）。
+ */
+export async function apiImMsgDetail(
+  convId: string,
+  msgId: string,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  data["convId"] = convId;
+  return await request({
+    url: `/api/instant-message/messages/${msgId}`,
+    method: "GET",
+    data,
+  });
+}
+
+/**
+ * 发送文本消息（msgSend）。
+ *
+ * ★convId 是 int64 雪花号：拼进 JSON 字符串以原始数字直传（request 支持字符串 body
+ *   直通不反转义），避免经 JS number 精度丢失后发错会话。
+ * ★clientMsgId 幂等键【每条必带】：不传服务端会兜底生成，此时幂等保护失效——
+ *   弱网重试会真的发出两条。
+ * ★deviceId【必填】（getImDeviceId 自动携带）：扇出按它排除来源端，REST 入口
+ *   缺失直接被 IM_90001 拒绝。
+ * 响应 data = SendMessageResult{ msgId, seq, sendTime, msgStatus, idempotent, digest }：
+ * idempotent=true 表示重放，调用方应替换本地"发送中"占位而不是再插一条。
+ */
+export async function apiImSendTextMsg(
+  convId: string,
+  text: string,
+  clientMsgId: string,
+  mentionUserIds: string[] | null = null,
+  mentionAll: boolean = false,
+  replyToMsgId: string = "",
+): Promise<RequestResponse<any>> {
+  // 文本经 JSON.stringify 转义；clientMsgId/deviceId 是自家生成的安全字符，无需转义
+  // mentionUserIds/mentionAll（@提及元数据）与 PC 端 onSend 同契约（nuwax-im-web
+  // ChatWindow.tsx）：正文里插的是 "@昵称 " 纯文本，发送时按成员昵称反查出 userId
+  // 随请求顶层字段一并上报；mentionUserIds 元素是 int64，join 后以原始数字直传
+  // （同 apiImCreateGroup 的 memberUserIds 拼法）。
+  // replyToMsgId 非空 = 引用回复（SendMessageRequest.replyToMsgId），int64 直传。
+  let payload =
+    `{"convId":${convId},"msgType":"text","clientMsgId":"${clientMsgId}","deviceId":"${getImDeviceId()}"`;
+  if (replyToMsgId.length > 0) {
+    payload += `,"replyToMsgId":${replyToMsgId}`;
+  }
+  if (mentionUserIds != null && mentionUserIds.length > 0) {
+    payload += `,"mentionUserIds":[${mentionUserIds.join(",")}]`;
+  }
+  if (mentionAll) {
+    payload += `,"mentionAll":true`;
+  }
+  payload += `,"body":{"text":${JSON.stringify(text)}}}`;
+  return await request({
+    url: "/api/instant-message/messages",
+    method: "POST",
+    data: payload,
+  });
+}
+
+/**
+ * 会话成员列表（convMembers，群聊 @提及面板的数据源）。
+ *
+ * 契约同 PC 端 convApi.listMembers：GET /conversations/{convId}/members，首屏
+ * limit=100 单页（与 PC loadMembers 同口径）；响应 data = PageResult<ConversationMemberDto>，
+ * 取 records 数组。★userId 是 int64 雪花号：H5 请求层已保精度，Android 端经
+ * `${raw}` 转字符串存用。
+ */
+export async function apiImConvMembers(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  data["limit"] = 100;
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/members`,
+    method: "GET",
+    data,
+  });
+}
+
+/**
+ * 发送媒体消息（图片 / 文件 / 语音，msgSend）。
+ *
+ * ★body 形态与 PC 端 sendAttachment 单附件分支逐字一致（nuwax-im-web store/chat.ts）：
+ *   {url, fileName, size, mime}，msgType 用 im_message.msg_type 的字面量（image / file / audio），
+ *   服务端按类型给列表摘要占位符（[图片] / [文件] / [语音]）。
+ * ★msgType 由调用方判定（mime 以 image/ 开头即 image，与 PC lib/attachment.kindOf 同口径）：
+ *   相册/拍摄入口恒为 image；文件入口按上传返回的 mime 归类；语音消息（App 按住说话
+ *   「仅发语音」）传 "audio"。
+ * ★durationSec 语音专用可选字段（body.duration，单位秒，PC/移动端渲染口径一致，
+ *   缺省合法——接收端首播后从播放器回填）；<0 不携带，image/file 调用方不传。
+ * ★convId int64 原样拼入 / clientMsgId 幂等键必带 / deviceId 必填，语义同 apiImSendTextMsg。
+ */
+export async function apiImSendMediaMsg(
+  convId: string,
+  msgType: string,
+  url: string,
+  fileName: string,
+  size: number,
+  mime: string,
+  clientMsgId: string,
+  replyToMsgId: string = "",
+  durationSec: number = -1,
+): Promise<RequestResponse<any>> {
+  // url/fileName/mime 可能含用户可控字符，一律 JSON.stringify 转义；replyToMsgId 同 apiImSendTextMsg
+  let payload =
+    `{"convId":${convId},"msgType":"${msgType}","clientMsgId":"${clientMsgId}","deviceId":"${getImDeviceId()}"`;
+  if (replyToMsgId.length > 0) {
+    payload += `,"replyToMsgId":${replyToMsgId}`;
+  }
+  // ★结尾 }：先闭 body 对象再闭根对象；duration 仅语音携带（手拼 JSON 花括号教训见 uts-handbuilt-json-braces）
+  payload += `,"body":{"url":${JSON.stringify(url)},"fileName":${JSON.stringify(fileName)},"size":${size},"mime":${JSON.stringify(mime)}`;
+  if (durationSec > 0) {
+    payload += `,"duration":${Math.round(durationSec)}`;
+  }
+  payload += `}}`;
+  return await request({
+    url: "/api/instant-message/messages",
+    method: "POST",
+    data: payload,
+  });
+}
+
+/**
+ * 发送图文混排消息（msgSend，msgType=rich_text）。
+ *
+ * ★契约 = PC 端 sendComposed 的 rich_text 分支（nuwax-im-web store/chat.ts，DEV-159）：
+ *   body = {"text": 干净 Markdown 正文（可空串，纯多图合法）,
+ *          "attachments": [{kind:"image", url, fileName, size, mime}, ...]}
+ *   attachments 是附件元数据的唯一来源；segments 刻意不带——缺席完全合法，
+ *   接收端按 text + attachments 渲染（nuwax-im docs/07 §5.12）。
+ * ★「有文字且有附件 / 多附件」走本形态；纯文字走 apiImSendTextMsg、
+ *   单附件无文字走 apiImSendMediaMsg（摘要占位符口径见 PC chooseMessageShape）。
+ * ★attsJson 由调用方（chat.uvue sendRichTextWithRow）拼好传入，本函数只套信封
+ *   （itemsJson 先例同 apiImSendMergeForwardMsg）；convId int64 原样拼入 /
+ *   clientMsgId 幂等键必带 / deviceId 必填 / mention 与 replyToMsgId 语义同 apiImSendTextMsg。
+ */
+export async function apiImSendRichTextMsg(
+  convId: string,
+  text: string,
+  attsJson: string,
+  clientMsgId: string,
+  mentionUserIds: string[] | null = null,
+  mentionAll: boolean = false,
+  replyToMsgId: string = "",
+): Promise<RequestResponse<any>> {
+  // text 经 JSON.stringify 转义；attsJson 已由调用方转义；信封逐字段同 apiImSendTextMsg
+  let payload =
+    `{"convId":${convId},"msgType":"rich_text","clientMsgId":"${clientMsgId}","deviceId":"${getImDeviceId()}"`;
+  if (replyToMsgId.length > 0) {
+    payload += `,"replyToMsgId":${replyToMsgId}`;
+  }
+  if (mentionUserIds != null && mentionUserIds.length > 0) {
+    payload += `,"mentionUserIds":[${mentionUserIds.join(",")}]`;
+  }
+  if (mentionAll) {
+    payload += `,"mentionAll":true`;
+  }
+  // ★结尾三重 }:第一个闭合 ${} 插值、第二个闭合 body 对象、第三个闭合根对象
+  // （少一个就是「请求体格式错误」——服务端 Jackson 直接解析失败）
+  payload += `,"body":{"text":${JSON.stringify(text)},"attachments":${attsJson}}}`;
+  return await request({
+    url: "/api/instant-message/messages",
+    method: "POST",
+    data: payload,
+  });
+}
+
+/**
+ * 上报已读水位（readReport）。
+ *
+ * ★readSeq 是"我已连续读到的最大 seq"水位（不是单条 seq），单调不回退：
+ * 回退会被服务端 clamp（advanced=false / clamped=true 属正常，勿据此重试）。
+ * deviceId 可选但建议携带：CONV_UNREAD 下行按它排除来源端（02 §7）。
+ */
+export async function apiImReadReport(
+  convId: string,
+  readSeq: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/read`,
+    method: "POST",
+    data: `{"readSeq":${readSeq},"deviceId":"${getImDeviceId()}"}`,
+  });
+}
+
+/**
+ * IM 增量同步（sync，HTTP 兜底）。
+ *
+ * 契约见 nuwax-im docs/openapi/im-openapi.yaml（SyncRequest / SyncResult）：
+ * - 用于 WS 重连 / 弱网恢复后补齐断线期间消息
+ * - 请求体：
+ *   - afterSeqs?: Record<string, number>（每会话水位线，键是字符串形式 convId）
+ *   - fullSync?: boolean（true=本地清空，limitPerConv 给最近若干条）
+ *   - limitPerConv?: number（每会话最多给多少）
+ *   - cursor?: { convId: number, afterSeq: number }（单会话续拉）
+ *   - deviceId?: string
+ * - 响应 data = SyncResult：
+ *   - conversations: ConversationSummaryDto[]（unreadCount 键缺失 ≠ 0）
+ *   - messages: MessageDto[]（已按会话分组展开）
+ *   - hasMore: true 时必须用 nextCursor 续拉
+ *   - nextCursor?: { convId, afterSeq }
+ *   - collapsed: number[]（被折叠的会话，不代表没新消息）
+ *   - mutedConvs: number[]
+ *   - processedConvs: number
+ *   - serverTimeMs: number
+ *   - mode: string（"incremental" / "full" / "folded"）
+ *   - truncated: boolean
+ *
+ * ImWsClient 在 CONNECT_ACK 后自动调一次（runSyncFallback）。
+ */
+export class ApiImSyncCursor {
+  convId: string = "";
+  afterSeq: number = 0;
+}
+
+export class ApiImSyncParams {
+  afterSeqs: Record<string, number> | null = null;
+  fullSync: boolean = false;
+  limitPerConv: number | null = null;
+  cursor: ApiImSyncCursor | null = null;
+  deviceId: string | null = null;
+}
+
+export async function apiImSync(
+  params: ApiImSyncParams,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  if (params.afterSeqs != null) {
+    data["afterSeqs"] = params.afterSeqs as any;
+  }
+  if (params.fullSync === true) {
+    data["fullSync"] = true;
+  }
+  if (params.limitPerConv != null) {
+    data["limitPerConv"] = params.limitPerConv;
+  }
+  if (params.cursor != null) {
+    const cursor = params.cursor;
+    if (cursor != null) {
+      const value = new UTSJSONObject();
+      value["convId"] = cursor.convId;
+      value["afterSeq"] = cursor.afterSeq;
+      data["cursor"] = value;
+    }
+  }
+  // deviceId 默认带上（WS 重连场景必须有，否则服务端按设备维度处理错误）
+  data["deviceId"] = params.deviceId ?? getImDeviceId();
+  return await request({
+    url: "/api/instant-message/sync",
+    method: "POST",
+    data: data,
+  });
+}
+
+// ============================================================ 消息 Pin 域（im-chat-pins，契约见 nuwax-im ImConversationController DEV-195）
+
+/**
+ * 会话的置顶消息列表（convListPins）。
+ *
+ * 契约见 im 仓库 ImConversationController#listPins / MessagePinDto：
+ * - data = MessagePinDto[]，按 pinTime【倒序】（最近 Pin 的在最前），最多 10 条（MESSAGE_PIN_MAX）
+ * - ★digest / msgType / senderName / sendTime 是【Pin 那一刻的快照】不是实时联表：
+ *   发送者改名后旧 Pin 项仍显示旧昵称（设计如此，勿当 bug）；置顶区展示的就是 digest
+ *   （图片消息为「[图片]」，长文会被截断），要原文用 msgId 去拉历史
+ * - ★已撤回的 Pin 项服务端读路径已批量复核过滤，前端无需再判 msgStatus
+ * - pinBy 可能 ≠ senderId（谁 Pin 的与谁发的是两件事，展示"由 xx 置顶"用 pinBy）
+ * - seq 允许为 0（消息行已被物理清理的边角数据）：msgId 仍有效但"定位原文"
+ *   要退化成重新拉历史；★不能拿 seq==0 当坏数据隐藏该条
+ * - msgId / convId / senderId / pinBy 是 int64 雪花号：页面层统一 `${raw}` 转字符串存用
+ *   （H5 请求层已保精度）；sendTime / pinTime 是 13 位毫秒（53 位安全范围内直读）
+ * - 多人共享状态且没有下行帧通知：每次进 Pin 页重拉一次（返回体 ≤10 条，最便宜的自我纠正）
+ */
+export async function apiImConvPins(convId: string): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/pins`,
+    method: "GET",
+  });
+}
+
+/**
+ * 取消一条置顶消息（convUnpinMessage）。
+ *
+ * 契约见 im 仓库 ImConversationController#unpinMessage：
+ * - ★任何人都能取消任何一条（飞书形态，服务端不校验 pinBy）：取消入口不按
+ *   pinBy 做可见性判断——藏起来反而制造"置顶了却取消不掉"的死角
+ * - 幂等：重复取消 / 本来就没有返回 false 仍是成功码，勿当失败重试
+ * - 群会话普通成员能否 Pin/取消由群设置 allowMemberPin 决定（群主/管理员不受约束），
+ *   越权报 IM_30001，前端按信封 code 提示服务端文案即可
+ * - msgId 雪花号存字符串，拼 URL 原样直传防精度丢失
+ */
+export async function apiImUnpinMsg(
+  convId: string,
+  msgId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/pins/${msgId}`,
+    method: "DELETE",
+  });
+}
+
+// ============================================================ 群信息页域（im-group-info*，契约对齐 PC nuwax-im-web convApi）
+
+/**
+ * 会话详情（convDetail）。
+ *
+ * ★会话列表对单条会话的 groupNo/notice/治理开关恒回 null——群信息页要展示
+ *   群公告/群号/myRole/入群审批等，只能走这个端点拿全量 ConversationSummaryDto：
+ *   - myRole：1=普通成员 2=管理员 3=群主（★对齐服务端 ImConstants；管理权限 = myRole>=2）
+ *   - myNickName：我在本群的昵称（null=未设置，展示回落平台昵称；群设置页入口取值）
+ *   - memberCount/maxMember/ownerUserId/joinApprove/allowMemberInvite 同包返回
+ *   - topFlag/dnd 是我的会话设置（与列表接口同口径）
+ */
+export async function apiImConvDetail(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}`,
+    method: "GET",
+  });
+}
+
+/**
+ * 群资料/治理开关局部更新（convUpdateProfile，PUT /conversations/{convId}）。
+ *
+ * ★局部更新语义：不传的键不改；notice 传空串=清空公告；布尔键传 false 是
+ *   「改成关」不是「不改」（与 undefined 不传的语义相反）。
+ * ★群主+管理员可改；data=false 表示值本来相同没写库，仍是成功码，勿当失败。
+ */
+async function apiImGroupUpdateProfile(
+  convId: string,
+  body: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}`,
+    method: "PUT",
+    data: body,
+  });
+}
+
+/** 改群名（name 走 JSON.stringify 转义，含引号/换行的群名安全）。 */
+export async function apiImGroupSetName(
+  convId: string,
+  name: string,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupUpdateProfile(convId, `{"name":${JSON.stringify(name)}}`);
+}
+
+/** 设置/清空群公告（★空串=清空，null 才是「不改」；服务端上限 1024 字）。 */
+export async function apiImGroupSetNotice(
+  convId: string,
+  notice: string,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupUpdateProfile(convId, `{"notice":${JSON.stringify(notice)}}`);
+}
+
+/** 设置入群是否需审批。 */
+export async function apiImGroupSetJoinApprove(
+  convId: string,
+  on: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupUpdateProfile(convId, `{"joinApprove":${on}}`);
+}
+
+/** 设置普通成员能否邀请他人入群。 */
+export async function apiImGroupSetAllowInvite(
+  convId: string,
+  on: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupUpdateProfile(convId, `{"allowMemberInvite":${on}}`);
+}
+
+/** 设置普通成员能否置顶消息。 */
+export async function apiImGroupSetAllowPin(
+  convId: string,
+  on: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupUpdateProfile(convId, `{"allowMemberPin":${on}}`);
+}
+
+/** 设置已读回执开关。 */
+export async function apiImGroupSetReadReceipt(
+  convId: string,
+  on: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupUpdateProfile(convId, `{"readReceiptOn":${on}}`);
+}
+
+/**
+ * 添加群成员（convAddMembers，群主+管理员；allowMemberInvite 开启时普通成员也可）。
+ *
+ * ★userIds ≤50/次，元素是 int64：join 后以原始数字字面量拼 JSON 直传（同建群）。
+ * ★群开了入群审批时「人」会被转成入群申请：AddMembersResult applied>0 ⇒ 有
+ *   转申请的，按成功处理但文案要说「已发送入群申请」；智能体不走审批（直接入群）。
+ */
+export async function apiImGroupAddMembers(
+  convId: string,
+  userIds: string[],
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/members`,
+    method: "POST",
+    data: `{"userIds":[${userIds.join(",")}]}`,
+  });
+}
+
+/**
+ * 移除群成员（convRemoveMember）。权限：群主可移除管理员+成员；管理员只能移除
+ * 普通成员；不能移除自己（退群走 /leave）。前端只按 myRole 控制入口显隐，
+ * 服务端才是权威。data = RemoveMemberResult，按信封 code 判成败。
+ */
+export async function apiImGroupRemoveMember(
+  convId: string,
+  userId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/members/${userId}`,
+    method: "DELETE",
+  });
+}
+
+/**
+ * 设置/撤销管理员（convSetMemberRole，PUT .../members/{userId}/role）。
+ *
+ * ★仅群主（requireOwner，越权 IM_30001 文案含「仅群主」）；body {"role":1|2}：
+ *   2=设为管理员，1=撤销回普通成员；role=3 报 IM_90001（转让群主走 /transfer）。
+ * ★data=false 表示该成员已是目标角色、没写库（DEV-39）——仍是成功码，提示
+ *   「内容没有变化」即可，勿当失败。
+ * ★变更成功时服务端会向全群广播一条 SYSTEM 消息：前端不要在本地补造系统消息，
+ *   刷新成员列表即可。
+ */
+export async function apiImGroupSetMemberRole(
+  convId: string,
+  userId: string,
+  role: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/members/${userId}/role`,
+    method: "PUT",
+    data: `{"role":${role}}`,
+  });
+}
+
+/**
+ * 给他人设置群名片（convSetMemberNickName，PUT .../members/{userId}，DEV-197）。
+ *
+ * ★与 apiImConvSetMyNickName（PUT .../members/me 本人改自己）不是一个端点。
+ * ★权限与移除成员共用 canManage：群主可管管理员+普通成员；管理员只能管普通
+ *   成员（同级/群主不可管）；不能给自己设（服务端 PARAM_ERROR）。前端只按角色
+ *   控制入口显隐，服务端才是权威。
+ * ★空白（纯空格）= 清除（nick_name 写 NULL，回落平台昵称）；服务端会 trim。
+ * ★长度上限 64 字符（按字符数算，emoji 算 1），超长返 IM_90001 而非静默截断。
+ * ★data=false 表示与当前值相同、没写库（DEV-39）——仍是成功码，勿当失败。
+ * ★不发系统通知：改的是显示名，群内署名自然变化，无需往群里插消息。
+ */
+export async function apiImGroupSetMemberNickName(
+  convId: string,
+  userId: string,
+  nickName: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/members/${userId}`,
+    method: "PUT",
+    data: `{"nickName":${JSON.stringify(nickName)}}`,
+  });
+}
+
+/**
+ * 待审入群申请列表（convJoinRequests，★群主/管理员专属：普通成员报 IM_30001，
+ * 前端按 myRole>=2 决定入口显隐，无权限时不调用）。
+ * - 只回 status=pending，按 createTime 升序（先来先审，界面照此顺序渲染）
+ * - 上限 100 条、超出不报错；userName 服务端已批量补好，勿逐条再查（N+1）
+ * - source='invite' 档必须用「由 xx 邀请加入」文案（缺省按 apply 处理）
+ */
+export async function apiImJoinRequests(
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/join-requests`,
+    method: "GET",
+  });
+}
+
+/**
+ * 通过/拒绝一条入群申请（convReviewJoinRequest）。
+ * - approve=true 真的把人加进群；群满/已解散时单子保持 pending——失败时把申请留在列表
+ * - 幂等：单子已是终态返回既有状态仍 200（reviewerId 分辨是否被别人抢先处理）
+ * - reviewRemark ≤255 字，★拒绝时会发给申请人；通过时不发，传空串即可
+ */
+export async function apiImReviewJoinRequest(
+  convId: string,
+  requestId: string,
+  approve: boolean,
+  reviewRemark: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/join-requests/${requestId}/review`,
+    method: "POST",
+    data: `{"approve":${approve},"reviewRemark":${JSON.stringify(reviewRemark)}}`,
+  });
+}
+
+// ============================================================ 消息操作域（长按消息：Pin/撤回/编辑，契约见 nuwax-im ImMessageController / ImConversationController）
+
+/**
+ * 执行互动卡片上的一个动作（msgRunAction，POST /messages/{msgId}/actions/{actionKey}，
+ * DEV-197-b 通用动作框架唯一入口；入群审核卡片的「同意/拒绝」走这里）。
+ *
+ * - ★convId 走 query 不走 body（与 revoke/edit 把 convId 放 body 的惯例相反）：
+ *   请求体被"动作附言 remark"占住，服务端刻意不让客户端在体里传别的字段
+ * - ★请求体不带 actionType / payload：动作语义由服务端拿 msgId 从库里读消息
+ *   body 按 actionKey 分发，客户端只能选"点哪个按钮"（伪造请求改不了语义）
+ * - 响应 data = CardActionState{ state, text, at }（执行后新状态）：客户端就地
+ *   更新按钮，不必重拉整条消息；幂等（重复点返回既有状态仍 200）
+ * - ★失败语义两档：消息不存在/不是卡片/无此 actionKey 报 IM_10404；
+ *   无权点/已失效【仍 200】但 data.state=forbidden/stale——那是状态不是错误，
+ *   客户端就地置灰即可，不要弹错误提示
+ */
+export async function apiImMsgRunAction(
+  msgId: string,
+  convId: string,
+  actionKey: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/actions/${actionKey}?convId=${convId}`,
+    method: "POST",
+    data: "{}",
+  });
+}
+
+/**
+ * 置顶一条消息（convPinMessage，POST /conversations/{convId}/pins）。
+ *
+ * - 权限（DEV-195）：默认全员可置顶；群设置 allowMemberPin=false 后仅群主/管理员
+ *   （myRole>=2，群主/管理员自身不受开关限制）；p2p 会话无此约束恒可
+ * - 幂等：同一条重复置顶不报错，返回既有记录（pinTime 不变）
+ * - 上限 10 条（MESSAGE_PIN_MAX）：超限报 IM_20107，不自动挤掉最旧的
+ * - 消息必须属于本会话且未被撤回，否则 IM_20001 / IM_90001
+ * - 撤回联动：消息被撤回时服务端会把置顶一并删掉
+ * - msgId int64 雪花号：拼 JSON 以原始数字直传防精度丢失
+ */
+export async function apiImPinMsg(
+  convId: string,
+  msgId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/pins`,
+    method: "POST",
+    data: `{"msgId":${msgId}}`,
+  });
+}
+
+/**
+ * 撤回消息（msgRevoke，POST /messages/{msgId}/revoke）。
+ *
+ * - 撤回对【所有人】生效（msgStatus=2 并广播），与"仅自己可见"的删除不是同一件事
+ * - 权限：发送者本人 + 群管理员可撤他人消息；时限由服务端配置（默认 24h，
+ *   whoami.revokeWindowSec 下发同值），超窗报 IM_40003
+ * - 返回撤回后的 MessageDto（body 已清空、msgStatus=2、revokeBy=操作人）：
+ *   客户端按 msgId 原位替换本地行即可；被撤回消息若在置顶区会一并被删
+ */
+export async function apiImRevokeMsg(
+  msgId: string,
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/revoke`,
+    method: "POST",
+    data: `{"convId":${convId},"deviceId":"${getImDeviceId()}"}`,
+  });
+}
+
+/**
+ * 删除消息（msgDelete，DELETE /messages/{msgId}?convId=）。
+ *
+ * - ★按人删除（DEV-48）：只把这条消息从【我自己的】可见范围去掉（im_message_delete
+ *   表，历史/详情按查看者过滤），其他成员完全不受影响——要让所有人看不到是
+ *   撤回 apiImRevokeMsg 的事，两者不是同一语义
+ * - 幂等：重复删除返回 data=false 但仍是成功码，勿当失败重试
+ * - msgId/convId 雪花号存字符串，拼 URL 原样直传防精度丢失
+ */
+export async function apiImDeleteMsg(
+  msgId: string,
+  convId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/messages/${msgId}?convId=${convId}`,
+    method: "DELETE",
+  });
+}
+
+/**
+ * 编辑消息（msgEdit，PUT /messages/{msgId}）。
+ *
+ * - 仅发送者本人、且在编辑时限内（ImConstants.EDIT_WINDOW_SEC_DEFAULT=300s，
+ *   超窗报 IM_40003；客户端只做入口显隐的 UX 预判，权威在服务端）
+ * - body 整体替换（文本消息传 {"text":...}）；msgType 可选传改类型，这里恒 text
+ * - 返回【编辑后】的完整 MessageDto（editTime 非空 ⇒ 渲染"已编辑"标记），
+ *   客户端直接替换本地那条即可
+ */
+export async function apiImEditMsg(
+  msgId: string,
+  convId: string,
+  text: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/messages/${msgId}`,
+    method: "PUT",
+    data: `{"convId":${convId},"deviceId":"${getImDeviceId()}","body":{"text":${JSON.stringify(text)}}}`,
+  });
+}
+
+// ============================================================ 已读回执域（read-status / readers，契约见 nuwax-im ImReadStateController）
+
+/**
+ * 批量查已读计数（readStatus，POST /conversations/{convId}/read-status）。
+ *
+ * - msgIds 去重后 ≤200：超上限【抛】IM_30201 而不是截断（调用方自行控制批量）
+ * - ★只返回【自己发出的】消息，别人的静默消失（不是 bug）；结果可能少于请求，
+ *   按 msgId 对齐合并，不要按下标（顺序不保证）
+ * - data = ReadStatusItem[] 裸数组：{msgId, seq, readCount, eligibleCount(应读人数),
+ *   readAll, level, readerListAvailable}；p2p 会话 eligibleCount=1
+ * - msgIds 元素是 int64：join 后以原始数字直传（同 mentionUserIds 拼法）
+ */
+export async function apiImReadStatus(
+  convId: string,
+  msgIds: string[],
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/read-status`,
+    method: "POST",
+    data: `{"msgIds":[${msgIds.join(",")}]}`,
+  });
+}
+
+/**
+ * 已读/未读成员名单（msgReaders，GET /messages/{msgId}/readers）。
+ *
+ * - convId 必填 query（msgId 是分片键的一部分，缺了要全分片扫）；seq 可选，
+ *   传了可省一次分表查询；type="read"（默认已读名单）/"unread"（未读名单）
+ * - page 从 1 开始、size 上限 100；total = 该名单总人数（分页判据）
+ * - ★>500 人的群直接报 IM_30201（HTTP 层错误码，不降级查库）：客户端收到后
+ *   应退回"只显示计数"形态（apiImReadStatus 在大群下仍可用）
+ * - 降级形态是【200 + degraded 字段】而非错误码：degraded 是字符串原因码
+ *   （"L3_COLD" / "REDIS_UNAVAILABLE"），判空看字符串长度，不要 === true；
+ *   listAvailable=false / degraded 非空 ⇒ readers 为空数组但 readCount/eligibleCount 仍可信
+ * - readers 元素 {userId, name, avatar, readSeq, joinSeq, readTimeMs}：
+ *   userId int64 经 `${raw}` 转字符串存用
+ */
+export async function apiImMsgReaders(
+  msgId: string,
+  convId: string,
+  seq: number,
+  type: string,
+  page: number,
+): Promise<RequestResponse<any>> {
+  const data = new UTSJSONObject();
+  data["convId"] = convId;
+  if (seq > 0) {
+    data["seq"] = seq;
+  }
+  data["type"] = type;
+  data["page"] = page;
+  data["size"] = 100;
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/readers`,
+    method: "GET",
+    data,
+  });
+}
+
+/**
+ * 当前登录用户（userMe，GET /users/me）。
+ *
+ * - 身份完全来自凭据（Authorization / platform Cookie），不接受任何入参
+ * - 聊天页只消费 revokeWindowSec（DEV-207：服务端当前生效的撤回时限秒数，
+ *   默认 86400）：超过时限就不显示「撤回」菜单项，而不是让用户点了再被告知超时
+ *   —— 它只是 UX 优化不是权限，判"能不能撤"的权威永远在服务端
+ * - userId/tenantId 是 int64；拉取失败时调用方保留默认窗口即可
+ */
+export async function apiImWhoami(): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/users/me",
+    method: "GET",
+  });
+}
+
+// ============================================================ 表情回复域（reactions，后端已上线测试环境、仓库 ImMessageController 尚未合入）
+
+/**
+ * 添加表情回复（reactionAdd，POST /messages/{msgId}/reactions）。
+ *
+ * 契约（2026-09-29 实测测试环境得出，后端仓库代码合入后以 im-openapi.yaml 为准）：
+ * - body {convId, emoji, deviceId}；emoji 必填非空白（emoji 本身的 Unicode 字符）
+ * - 重复添加同一 emoji 幂等（不报错不重复计数）；同一用户可对同一消息加多种 emoji
+ * - data = {convId, msgId, reactions:[{emoji,userId,userName}]}——★操作后的
+ *   【全量 reactions 快照】，客户端整体替换本地行即可，无需本地合并
+ */
+export async function apiImMsgAddReaction(
+  convId: string,
+  msgId: string,
+  emoji: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/reactions`,
+    method: "POST",
+    data: `{"convId":${convId},"emoji":${JSON.stringify(emoji)},"deviceId":"${getImDeviceId()}"}`,
+  });
+}
+
+/**
+ * 取消表情回复（reactionRemove，DELETE /messages/{msgId}/reactions）。
+ *
+ * - convId / emoji 均为必填 query 参数；只移除【当前用户】在该消息上的该 emoji
+ * - data 同 apiImMsgAddReaction：操作后的全量 reactions 快照
+ */
+export async function apiImMsgRemoveReaction(
+  convId: string,
+  msgId: string,
+  emoji: string,
+): Promise<RequestResponse<any>> {
+  // convId/emoji 为必填 query 参数：App 端 uni.request 不会把 DELETE 的 data 拼 query，
+  // 必须显式进 URL（emoji 走 encodeURIComponent，👍 等 UTF-8 序列安全）
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/reactions?convId=${convId}&emoji=${encodeURIComponent(emoji)}`,
+    method: "DELETE",
+  });
+}
+
+// ============================================================ 常用表情域（emoji，契约见 nuwax-im im-openapi.yaml mobile-emojis 组 + docs/07 §5.16，DEV-318）
+
+/**
+ * 我的常用表情（emojiRecent，GET /emojis/recent）。
+ *
+ * - 用户级资源：无 convId/userId 参数，"记到谁头上"由登录态唯一确定
+ * - data = UserEmojiUsageDto[]（{emoji, useCount, lastUseTime}），★服务端已按
+ *   useCount 降 → lastUseTime 降 → id 降排好，客户端不要重排（重排=第二真源）
+ * - 最多 24 条（USER_EMOJI_RECENT_MAX），无分页；★新用户返回 []，服务端不兜底
+ *   默认集合——空态回落默认快捷条是客户端的事（对齐 PC quickEmojis 补齐逻辑）
+ */
+export async function apiImRecentEmojis(): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/emojis/recent",
+    method: "GET",
+  });
+}
+
+/**
+ * 记一次「我用了这个表情」（emojiUsage，POST /emojis/usage，body 只有 emoji）。
+ *
+ * - ★计数器【不幂等】：调两次=用了两次，绝不重试、不去重
+ * - ★fire-and-forget：服务端写失败返回 data=false 而非报错（记账是点表情的
+ *   附属动作，永不拖挂主流程）——调用侧不 await 决策、不弹错
+ * - 仅 emoji 非法（trim 后空/超 32 码点）才 IM_90001
+ */
+export async function apiImRecordEmojiUsage(emoji: string): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/emojis/usage",
+    method: "POST",
+    data: `{"emoji":${JSON.stringify(emoji)}}`,
+  });
+}
+
+// ============================================================ 转发域（forward，契约见 nuwax-im ImMessageController + ImMergeForwardBodies）
+
+/**
+ * 逐条转发（msgForward，POST /messages/{msgId}/forward）。
+ *
+ * - body {convId(源会话分片键), targetConvIds[], deviceId}；目标数上限
+ *   im.message.forward-max-targets(默认 9)，超限 IM_90001 不截断
+ * - 允许包含源会话自己；重复 convId 服务端去重
+ * - ★逐目标独立成败（部分成功语义）：data = ForwardMessageResult
+ *   {total, succeeded, failures[]}——只看 succeeded 会把"转给 3 人只成功 2"误报成功，
+ *   必须读 failures 逐条提示
+ * - 每目标产生一条全新消息行（新 msgId/seq，origin_msg_id 弱关联源消息）
+ */
+export async function apiImForwardMsg(
+  convId: string,
+  msgId: string,
+  targetConvIds: string[],
+): Promise<RequestResponse<any>> {
+  const ids = targetConvIds.join(",");
+  return await request({
+    url: `/api/instant-message/messages/${msgId}/forward`,
+    method: "POST",
+    data: `{"convId":${convId},"targetConvIds":[${ids}],"deviceId":"${getImDeviceId()}"}`,
+  });
+}
+
+/**
+ * 发送合并转发消息（msgSend，msgType=merge_forward）。
+ *
+ * - body 快照契约（nuwax-im ImMergeForwardBodies 写入侧准入，逐字对齐 PC lib/forward.ts）：
+ *   {title?: 非空文本（可缺省）, items: [{senderName(必填非空), sendTime(必填正整数毫秒),
+ *   msgType(六型白名单 text/rich_text/image/file/audio/video，小写), text?(≤500 码点，
+ *   ★服务端拒绝不截断，构建侧必须自行截好), attachments?([{kind,url(必填非空),fileName,size}])}]}
+ *   1 ≤ items ≤ 50；禁嵌套（merge_forward 不可作为 item）
+ * - ★刻意不带 senderId：雪花 ID 超 2^53，JS number 丢精度、字符串又被拒 ⇒ 缺席
+ * - itemsJson 由调用方（chat.uvue buildMergeItemsJson）按上述契约拼好传入；
+ *   本函数只负责套信封（convId int64 原始数字直传 + clientMsgId 幂等键 + deviceId）
+ * - digest 服务端给 [聊天记录] 占位符；本地乐观行同文案
+ */
+export async function apiImSendMergeForwardMsg(
+  targetConvId: string,
+  title: string,
+  itemsJson: string,
+  clientMsgId: string,
+): Promise<RequestResponse<any>> {
+  let body = `{"items":${itemsJson}`;
+  if (title.length > 0) {
+    body += `,"title":${JSON.stringify(title)}`;
+  }
+  body += "}";
+  return await request({
+    url: "/api/instant-message/messages",
+    method: "POST",
+    data: `{"convId":${targetConvId},"msgType":"merge_forward","clientMsgId":"${clientMsgId}","deviceId":"${getImDeviceId()}","body":${body}}`,
+  });
+}
+
+/**
+ * 会话搜索（searchConversations，GET /search/conversations）。
+ *
+ * - keyword 必填（1-64）；转发页搜群/已有单聊用（与 search/contacts 互补：
+ *   contacts 搜【人】，这里搜【会话】）
+ * - ★data 为裸数组 ConversationSearchItem[]（2026-09-29 真机抓包实证，无 records
+ *   包装；本注释早前按 PageResult.records 写的是错的）
+ *   {convId, convType, name, memberCount, ownerUserId, lastDigest, lastMsgTime}
+ *   （convId 为 int64，请求层 parseJsonKeepInt64 已保精度；peerName/avatar 等可选）
+ */
+export async function apiImSearchConversations(
+  keyword: string,
+  limit: number,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/search/conversations",
+    method: "GET",
+    data: {
+      keyword,
+      limit,
+    },
+  });
+}

@@ -1,0 +1,222 @@
+<template>
+  <view class="app-dev">
+    <safety-zone />
+
+    <!-- 新消息顶部横幅（fixed 覆盖层） -->
+    <im-notice-bar />
+
+    <search-more-bar
+      :placeholder="t('Mobile.AgentSearch.pageAppPlaceholder')"
+      :more-text="t('Mobile.Conversation.more')"
+      @search="handleSearch"
+      @more="handleMore"
+    />
+
+    <view class="app-dev__body">
+      <published-app-square
+        ref="publishedAppSquareRef"
+        :is-official="true"
+        :recent-pages="recentPages"
+        :reserve-bottom-safe-area="!CUSTOM_TAB_BAR_ENABLED"
+      ></published-app-square>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, type ComponentPublicInstance } from "vue";
+  import { CUSTOM_TAB_BAR_ENABLED } from "@/constants/customTabBar.constants";
+  import { useMainTabLifecycle } from "@/hooks/useMainTabLifecycle";
+  import PublishedAppSquare from "@/components/published-app-square/published-app-square.uvue";
+  import SearchMoreBar from "@/components/search-more-bar/search-more-bar.uvue";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { getCurrentPagePath, syncNativeTabBarState } from "@/utils/commonBusiness";
+  import { setCurrentPageNavigationBarTitle } from "@/utils/system";
+  import { SquarePublishedListParams } from "@/types/interfaces/square";
+  import { RecentAppPage } from "@/types/interfaces/recentAppPage";
+  import { apiRecentlyUsedAppList } from "@/servers/square";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+
+  const { onShow } = useMainTabLifecycle("/pages/app-dev/app-dev");
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 最近使用 swiper 每页 8 个：两行四列 */
+  const RECENT_PAGE_SIZE = 8;
+  /** 最近使用最多拉 3 页，避免 onShow 把过多图标一次性挂上 */
+  const RECENT_FETCH_SIZE = 24;
+
+  const publishedAppSquareRef = ref<ComponentPublicInstance | null>(null);
+  const recentPages = ref<RecentAppPage[]>([]);
+  let recentFingerprint = "";
+
+  /**
+   * Android：组件 ref 是 Gen* 类，禁止 as UTSJSONObject；用 $callMethod 调 defineExpose 方法。
+   */
+  function callRefMethod(inst: any | null, methodName: string): void {
+    if (inst == null) {
+      return;
+    }
+    const proxy = inst as ComponentPublicInstance;
+    proxy.$callMethod(methodName);
+  }
+
+  /**
+   * 解析最近使用接口 data。
+   * Android：data 运行时是 UTSJSONObject/数组，禁止 as DTO；经 JSON 往返后再读。
+   * 兼容直接数组与分页 { records } 两种结构。
+   */
+  function parsePublishedList(dataRaw: any | null): UTSJSONObject[] {
+    const result: UTSJSONObject[] = [];
+    if (dataRaw == null) {
+      return result;
+    }
+    const jsonStr = JSON.stringify(dataRaw);
+    if (jsonStr == null || jsonStr.length == 0) {
+      return result;
+    }
+    if (jsonStr.charAt(0) == "[") {
+      const list = JSON.parse(jsonStr) as UTSJSONObject[] | null;
+      if (list != null) {
+        for (let i = 0; i < list.length; i++) {
+          result.push(list[i]);
+        }
+      }
+      return result;
+    }
+    const obj = JSON.parse(jsonStr) as UTSJSONObject | null;
+    if (obj == null) {
+      return result;
+    }
+    const records = obj["records"];
+    if (records != null) {
+      const list = records as UTSJSONObject[];
+      for (let i = 0; i < list.length; i++) {
+        result.push(list[i]);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * 将最近使用列表按 RECENT_PAGE_SIZE 切成 swiper 页。
+   */
+  function buildRecentPages(list: UTSJSONObject[]): RecentAppPage[] {
+    const pages: RecentAppPage[] = [];
+    if (list.length == 0) {
+      return pages;
+    }
+    let current = new RecentAppPage();
+    current.key = "0";
+    for (let i = 0; i < list.length; i++) {
+      if (i > 0 && i % RECENT_PAGE_SIZE == 0) {
+        pages.push(current);
+        current = new RecentAppPage();
+        current.key = `${pages.length}`;
+      }
+      current.items.push(list[i]);
+    }
+    if (current.items.length > 0) {
+      pages.push(current);
+    }
+    return pages;
+  }
+
+  function recentListFingerprint(list: UTSJSONObject[]): string {
+    let mark = `${list.length}`;
+    const n = list.length < RECENT_FETCH_SIZE ? list.length : RECENT_FETCH_SIZE;
+    for (let i = 0; i < n; i++) {
+      const idRaw = list[i]["targetId"];
+      const id = idRaw != null ? `${idRaw}` : "";
+      mark = `${mark}:${id}`;
+    }
+    return mark;
+  }
+
+  /**
+   * 拉取最近使用应用，列表未变则不写 recentPages，避免 swiper 整树重建。
+   */
+  async function fetchRecentlyUsedApps(): Promise<void> {
+    try {
+      const params = new SquarePublishedListParams();
+      params.pageSize = RECENT_FETCH_SIZE;
+      const res = await apiRecentlyUsedAppList(params);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        recentFingerprint = "";
+        recentPages.value = [] as RecentAppPage[];
+        return;
+      }
+      const list = parsePublishedList(apiResData<any>(res));
+      const nextMark = recentListFingerprint(list);
+      if (nextMark == recentFingerprint) {
+        return;
+      }
+      recentFingerprint = nextMark;
+      recentPages.value = buildRecentPages(list);
+    } catch (error) {
+      console.error("加载最近使用应用失败", error);
+      recentFingerprint = "";
+      recentPages.value = [] as RecentAppPage[];
+    }
+  }
+
+  /**
+   * 搜索条：进入应用搜索页，并带回当前 Tab 路径。
+   */
+  function handleSearch(): void {
+    const currentUrl = getCurrentPagePath();
+    uni.navigateTo({
+      url:
+        `/subpackages/pages/agent-search/agent-search?type=PageApp&backUrl=` +
+        encodeURIComponent(currentUrl),
+    });
+  }
+
+  /**
+   * 「更多」：进入完整应用列表页。
+   */
+  function handleMore(): void {
+    uni.navigateTo({
+      url: "/subpackages/pages/app-list/app-list",
+    });
+  }
+
+  onShow(() => {
+    syncNativeTabBarState();
+    setCurrentPageNavigationBarTitle();
+    uni.hideLoading();
+    fetchRecentlyUsedApps();
+    callRefMethod(publishedAppSquareRef.value, "refreshData");
+  });
+</script>
+
+<style lang="scss" scoped>
+  .app-dev {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-color: #ffffff;
+  }
+
+  .app-dev__body {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+</style>
+
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  /* #endif */
+</style>

@@ -1,0 +1,157 @@
+/**
+ * 弹窗返回拦截注册表（App web-view 内嵌 H5 专用）。
+ *
+ * 背景：uni-modal-popup 基于 page-container 实现，page-container 的滑动手势仅 iOS 生效；
+ * Android 上系统返回手势（边缘滑动 / 返回键）会直接弹掉承载 web-view 的页面（agent-detail），
+ * 而不是先关闭已打开的弹窗，导致「开着弹窗一滑就返回上一页」。
+ *
+ * 机制：
+ *  - 每个 uni-modal-popup 实例 open 时登记关闭回调、close 时注销，组成「已打开弹窗」栈；
+ *  - 页面回退时原生侧（agent-detail.uvue onBackPress）先经 evalJS 调 __nuwaxCloseTopPopup
+ *    关闭顶层弹窗，而不是直接弹页面；
+ *  - 开合状态变化经 postMessage 同步给原生侧（type=popup-back），
+ *    原生侧无需 evalJS 返回值即可知道当前是否有弹窗打开，并按真实栈状态自校正。
+ *
+ * 非 web-view 内嵌（浏览器直开 / 小程序 / App 原生页）下本模块不产生副作用：
+ * syncNativePopupState 在无原生桥时静默跳过。
+ */
+type PopupCloseHandler = () => void;
+
+class PopupEntry {
+  id: number;
+  close: PopupCloseHandler;
+
+  constructor(id: number, close: PopupCloseHandler) {
+    this.id = id;
+    this.close = close;
+  }
+}
+
+let popupStack: PopupEntry[] = [];
+let nextPopupId: number = 1;
+
+/** open 时登记关闭回调，返回登记 id（close 时用它注销） */
+export function registerPopupClose(close: PopupCloseHandler): number {
+  const id = nextPopupId;
+  nextPopupId = nextPopupId + 1;
+  popupStack.push(new PopupEntry(id, close));
+  syncNativePopupState();
+  return id;
+}
+
+/** close 时注销登记 */
+export function unregisterPopupClose(id: number): void {
+  popupStack = popupStack.filter((entry: PopupEntry): boolean => entry.id != id);
+  syncNativePopupState();
+}
+
+export function hasOpenPopup(): boolean {
+  return popupStack.length > 0;
+}
+
+/** 关闭最顶层弹窗；返回是否确实关掉了一个弹窗 */
+export function closeTopPopup(): boolean {
+  const len = popupStack.length;
+  if (len == 0) {
+    syncNativePopupState();
+    return false;
+  }
+  const top = popupStack[len - 1];
+  try {
+    top.close();
+  } catch (eClose) {
+    // ignore
+  }
+  syncNativePopupState();
+  return true;
+}
+
+/**
+ * 清空所有已打开弹窗（页面跳转前收尾用）。
+ * 先整体取出并清空栈，再自顶向下逐个 close：即使某个 close 回调异常也不会死循环；
+ * close 内部经 watch → unregisterPopupClose 操作的是（已清空的）新栈，天然无副作用。
+ * 结束统一同步一次原生状态（close 触发的 watch 已各同步一次，此行为冗余保险）。
+ */
+export function closeAllPopups(): void {
+  const remaining = popupStack;
+  popupStack = [] as PopupEntry[];
+  for (let i = remaining.length - 1; i >= 0; i--) {
+    const entry = remaining[i];
+    if (entry == null) {
+      continue;
+    }
+    try {
+      entry.close();
+    } catch (eClose) {
+      // ignore
+    }
+  }
+  syncNativePopupState();
+}
+
+/**
+ * 把当前弹窗开合状态同步给 App 原生侧。
+ * JSSDK 与 uni-app x 注入桥都发一遍：部分机型只通其中一条，漏发则左滑会把聊天页弹回首页。
+ */
+export function syncNativePopupState(): void {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    if (w == null) {
+      return;
+    }
+    const payload = {
+      "type": "popup-back",
+      "action": popupStack.length > 0 ? "open" : "close",
+    } as UTSJSONObject;
+    const wrapped = { "data": payload } as UTSJSONObject;
+    if (
+      w.uni != null &&
+      w.uni.webView != null &&
+      w.uni.webView.postMessage != null
+    ) {
+      try {
+        w.uni.webView.postMessage(wrapped);
+      } catch (_eSdk) {
+        // ignore
+      }
+    }
+    if (w.__uniapp_x_postMessage != null) {
+      try {
+        w.__uniapp_x_postMessage(wrapped);
+      } catch (_eX) {
+        // ignore
+      }
+    }
+    if (w.__uniapp_x_ != null && w.__uniapp_x_.postMessage != null) {
+      try {
+        w.__uniapp_x_.postMessage(JSON.stringify(wrapped));
+      } catch (_eX2) {
+        // ignore
+      }
+    }
+  } catch (eSync) {
+    // ignore
+  }
+  // #endif
+}
+
+/** 注册返回拦截全局（App 原生侧 evalJS 调用），幂等 */
+export function registerBackInterceptionGlobals(): void {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    if (w == null) {
+      return;
+    }
+    if (w.__nuwaxHasOpenPopup == null) {
+      w.__nuwaxHasOpenPopup = (): boolean => hasOpenPopup();
+    }
+    if (w.__nuwaxCloseTopPopup == null) {
+      w.__nuwaxCloseTopPopup = (): boolean => closeTopPopup();
+    }
+  } catch (eReg) {
+    // ignore
+  }
+  // #endif
+}

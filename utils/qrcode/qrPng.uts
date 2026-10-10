@@ -1,0 +1,210 @@
+/**
+ * QR 模块矩阵 → PNG data URL（纯函数、平台无关、零依赖）。
+ *
+ * 生成 1-bit 灰度 PNG（color type 0 / bit depth 1，白=1 黑=0），zlib 用 stored
+ * block（无压缩，仅格式包裹）——QR 点阵不可压缩，stored 最简单且各端解码器均支持。
+ * 全程 Array<number> 字节流，不碰 ArrayBuffer/Uint8Array（typed-array 跨端有坑）。
+ *
+ * 位运算跨端口径：CRC32/Adler32 值按 32 位补码参与运算（Android 端 Int 可能为负、
+ * JS 端经 ToInt32 后位型一致），读取字节时一律 (v >> k) & 0xff 掩码，不依赖符号；
+ * 禁用 >2^31 的位域字面量（-1 即 0xFFFFFFFF、CRC 多项式用补码十进制）。
+ *
+ * 留 PNG_BIT_DEPTH 常量：万一某端 image 组件不渲染 1-bit 灰度图，一键切 8-bit。
+ */
+
+import type { QrEncodeResult } from "./qrcodeEncoder";
+
+/** 1 或 8（灰度位深）。 */
+const PNG_BIT_DEPTH = 1;
+
+/** 32 位全 1（补码口径，等价 0xFFFFFFFF）。 */
+const PNG_U32_MASK_ALL = -1;
+
+/** CRC32 反射多项式 0xEDB88320 的 32 位补码表示（4294967296 - 3988292384）。 */
+const PNG_CRC_POLY = -306674912;
+
+const PNG_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/** CRC32 表（顶层惰性缓存，元素可能为负——按 32 位补码参与异或）。 */
+let pngCrcTableCache: Array<number> | null = null;
+
+function pngEnsureCrcTable(): Array<number> {
+  if (pngCrcTableCache != null) {
+    return pngCrcTableCache as Array<number>;
+  }
+  const table: Array<number> = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      // 逻辑右移的无 >>> 写法；结果按 32 位补码参与后续异或（符号不参与语义）
+      const shifted = (c >> 1) & 0x7fffffff;
+      c = (c & 1) != 0 ? PNG_CRC_POLY ^ shifted : shifted;
+    }
+    table.push(c);
+  }
+  pngCrcTableCache = table;
+  return table;
+}
+
+/** CRC32（对 bytes 的 [from, to) 区间）。 */
+function pngCrc32(bytes: Array<number>, from: number, to: number): number {
+  const table = pngEnsureCrcTable();
+  let c = PNG_U32_MASK_ALL;
+  for (let i = from; i < to; i++) {
+    // (c >>> 8) 的补码安全写法：算术右移后掩掉符号扩展位
+    c = table[(c ^ bytes[i]) & 0xff] ^ ((c >> 8) & 0xffffff);
+  }
+  return c ^ PNG_U32_MASK_ALL;
+}
+
+/** Adler-32（zlib 流尾校验；b<<16|a < 2^31，恒非负）。 */
+function pngAdler32(bytes: Array<number>, from: number, to: number): number {
+  let a = 1;
+  let b = 0;
+  for (let i = from; i < to; i++) {
+    a = (a + bytes[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return (b << 16) | a;
+}
+
+/** 大端 4 字节（v 可能带符号——按补码取字节，& 0xff 后必非负）。 */
+function pngPushU32BE(out: Array<number>, v: number): void {
+  out.push((v >> 24) & 0xff);
+  out.push((v >> 16) & 0xff);
+  out.push((v >> 8) & 0xff);
+  out.push(v & 0xff);
+}
+
+function pngPushU16LE(out: Array<number>, v: number): void {
+  out.push(v & 0xff);
+  out.push((v >> 8) & 0xff);
+}
+
+/** 追加 PNG 块：长度(BE) + 类型(ascii) + 数据 + CRC32(BE, 类型+数据)。 */
+function pngAppendChunk(out: Array<number>, type: string, data: Array<number>): void {
+  pngPushU32BE(out, data.length);
+  const crcStart = out.length;
+  for (let i = 0; i < 4; i++) {
+    // UTS：charCodeAt 返回 Number?（i < 4 ≤ type.length 恒非空，as number 纯编译层安抚）
+    out.push(type.charCodeAt(i) as number);
+  }
+  for (let i = 0; i < data.length; i++) {
+    out.push(data[i]);
+  }
+  pngPushU32BE(out, pngCrc32(out, crcStart, out.length));
+}
+
+/** zlib 流（stored block：0x78 0x01 + ≤65535 字节分块 + adler32 大端）。 */
+function pngAppendZlibStored(out: Array<number>, raw: Array<number>, from: number, to: number): void {
+  out.push(0x78);
+  out.push(0x01);
+  let pos = from;
+  while (pos < to) {
+    const blockLen = Math.min(65535, to - pos);
+    const isFinal = pos + blockLen >= to;
+    out.push(isFinal ? 1 : 0); // BFINAL(bit0) + BTYPE=00(stored)
+    pngPushU16LE(out, blockLen);
+    pngPushU16LE(out, blockLen ^ 0xffff);
+    for (let i = 0; i < blockLen; i++) {
+      out.push(raw[pos + i]);
+    }
+    pos += blockLen;
+  }
+  pngPushU32BE(out, pngAdler32(raw, from, to));
+}
+
+/** 手写 base64（查表 3→4 + padding；段数组 join，避免逐段 += 的 O(n²) 拼接）。 */
+function pngBase64(bytes: Array<number>): string {
+  const parts: Array<string> = [];
+  const len = bytes.length;
+  const full = Math.floor(len / 3) * 3;
+  for (let i = 0; i < full; i += 3) {
+    const n = bytes[i] << 16 | bytes[i + 1] << 8 | bytes[i + 2];
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 18) & 0x3f));
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 12) & 0x3f));
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 6) & 0x3f));
+    parts.push(PNG_BASE64_ALPHABET.charAt(n & 0x3f));
+  }
+  const rest = len - full;
+  if (rest == 1) {
+    const n = bytes[full] << 16;
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 18) & 0x3f));
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 12) & 0x3f));
+    parts.push("==");
+  } else if (rest == 2) {
+    const n = bytes[full] << 16 | bytes[full + 1] << 8;
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 18) & 0x3f));
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 12) & 0x3f));
+    parts.push(PNG_BASE64_ALPHABET.charAt((n >> 6) & 0x3f));
+    parts.push("=");
+  }
+  return parts.join("");
+}
+
+/**
+ * QR 编码结果 → PNG data URL（含 border 模块静区，白底黑码）。
+ * 返回 "data:image/png;base64,{...}"，可直接喂 <image> 与 uni.previewImage。
+ */
+export function qrPngDataUrl(result: QrEncodeResult, scale: number, border: number): string {
+  const size = result.size;
+  const safeScale = scale < 1 ? 1 : scale;
+  const safeBorder = border < 0 ? 0 : border;
+  const dim = (size + safeBorder * 2) * safeScale; // 输出图像宽高（方形）
+
+  // 扫描线原始字节：每行 filter(0x00) + 位打包像素（1-bit：白=1；8-bit：白=255）
+  const bytesPerLine = PNG_BIT_DEPTH == 1 ? Math.ceil(dim / 8) + 1 : dim + 1;
+  const raw: Array<number> = [];
+  for (let y = 0; y < dim; y++) {
+    const my = Math.floor(y / safeScale) - safeBorder; // 模块坐标（含静区偏移）
+    raw.push(0x00); // filter: None
+    if (PNG_BIT_DEPTH == 1) {
+      for (let bx = 0; bx < bytesPerLine - 1; bx++) {
+        let b = 0;
+        const x0 = bx * 8;
+        for (let bit = 0; bit < 8; bit++) {
+          const x = x0 + bit;
+          const mx = Math.floor(x / safeScale) - safeBorder;
+          const dark = mx >= 0 && mx < size && my >= 0 && my < size && result.modules[my * size + mx];
+          b = b << 1 | (dark ? 0 : 1); // 1-bit 灰度：白=1 黑=0
+        }
+        raw.push(b);
+      }
+    } else {
+      for (let x = 0; x < dim; x++) {
+        const mx = Math.floor(x / safeScale) - safeBorder;
+        const dark = mx >= 0 && mx < size && my >= 0 && my < size && result.modules[my * size + mx];
+        raw.push(dark ? 0 : 255);
+      }
+    }
+  }
+
+  const png: Array<number> = [];
+  // PNG 签名
+  png.push(0x89);
+  png.push(0x50);
+  png.push(0x4e);
+  png.push(0x47);
+  png.push(0x0d);
+  png.push(0x0a);
+  png.push(0x1a);
+  png.push(0x0a);
+  // IHDR
+  const ihdr: Array<number> = [];
+  pngPushU32BE(ihdr, dim);
+  pngPushU32BE(ihdr, dim);
+  ihdr.push(PNG_BIT_DEPTH);
+  ihdr.push(0); // color type: grayscale
+  ihdr.push(0); // compression: deflate
+  ihdr.push(0); // filter: adaptive
+  ihdr.push(0); // interlace: none
+  pngAppendChunk(png, "IHDR", ihdr);
+  // IDAT（zlib stored 包裹的扫描线）
+  const idat: Array<number> = [];
+  pngAppendZlibStored(idat, raw, 0, raw.length);
+  pngAppendChunk(png, "IDAT", idat);
+  // IEND
+  pngAppendChunk(png, "IEND", []);
+
+  return "data:image/png;base64," + pngBase64(png);
+}

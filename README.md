@@ -63,6 +63,8 @@ pnpm install
 yarn install
 ```
 
+> **Git remotes**: internal developers use `origin` for the primary GitLab repo (`git.yichamao.com/agent-platform/agent-platform-front-weapp`) and `github` for the public mirror. See [docs/archive/switch-git-remote.md](docs/archive/switch-git-remote.md).
+
 ### Development
 
 #### H5 Development

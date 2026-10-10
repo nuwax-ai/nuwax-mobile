@@ -1,0 +1,337 @@
+/**
+ * Mock BLE 适配器（任意端可用）
+ *
+ * 模拟一台 ESP32 待配网设备，行为由 MockScenarioEnum 场景驱动（存 storage 可运行时切换）。
+ * 用于 ESP32 固件 ready 前验收 UI 与配网流程，以及复现各类异常路径（失败/超时/抖动/断开）。
+ *
+ * 实现 BleAdapter 平台无关契约；定时器统一在 closeAdapter/dispose 时清理。
+ */
+import type { BleAdapter, BleAdapterConfig } from '@/utils/ble/bleAdapter';
+import {
+  BleDeviceInfo,
+  BleServiceInfo,
+  BleCharacteristicInfo,
+} from '@/utils/ble/bleTypes';
+import type {
+  BleNotifyCallback,
+  BleConnectionStateCallback,
+  BleDeviceFoundCallback,
+} from '@/utils/ble/bleTypes';
+import { createBleError } from '@/utils/ble/bleTypes';
+import { MockScenarioEnum, ProvStatusEnum } from '@/types/enums/provision';
+import {
+  PROV_SERVICE_UUID,
+  PROV_CHAR_WIFI_SSID_UUID,
+  PROV_CHAR_WIFI_PASSWORD_UUID,
+  PROV_CHAR_STATUS_UUID,
+  PROV_CHAR_DEVICE_INFO_UUID,
+  PROV_CHAR_COMMAND_UUID,
+} from '@/constants/provision.constants';
+import { encodeUtf8 } from '@/utils/provisionProtocol';
+import { getMockScenario, mockScanDevices, mockDeviceInfoRaw } from '@/utils/mockProvisionData';
+
+/** 调试日志（同步打到 console，调试页可读） */
+function mockLog(msg: string): void {
+  console.log(`[MockBle] ${msg}`);
+}
+
+export class MockBleAdapter implements BleAdapter {
+  private opened = false;
+  private scanning = false;
+  private connectedDeviceId = '';
+  private notified = false;
+  // 已收到的凭据（模拟设备端暂存）
+  private ssid = '';
+  private password = '';
+  // 抖动场景计数器
+  private connectAttempts = 0;
+  private writeAttempts = 0;
+  // 定时器集合，便于统一清理
+  private timers = [] as number[];
+
+  private deviceFoundCb: BleDeviceFoundCallback | null = null;
+  private notifyCb: BleNotifyCallback | null = null;
+  private connStateCb: BleConnectionStateCallback | null = null;
+
+  /** 注册一个延迟定时器并记录 id */
+  private later(fn: () => void, delayMs: number): void {
+    const id = setTimeout(() => {
+      fn();
+    }, delayMs);
+    this.timers.push(id as number);
+  }
+
+  /** 清理全部定时器 */
+  private clearTimers(): void {
+    for (let i = 0; i < this.timers.length; i++) {
+      clearTimeout(this.timers[i]);
+    }
+    this.timers = [] as number[];
+  }
+
+  openAdapter(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.later(() => {
+        this.opened = true;
+        mockLog('openAdapter 成功');
+        resolve();
+      }, 100);
+    });
+  }
+
+  closeAdapter(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.clearTimers();
+      this.opened = false;
+      this.scanning = false;
+      this.connectedDeviceId = '';
+      this.notified = false;
+      mockLog('closeAdapter');
+      resolve();
+    });
+  }
+
+  startScan(config: BleAdapterConfig): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (!this.opened) {
+        reject(createBleError('BT_OFF', 'Mock: adapter 未打开'));
+        return;
+      }
+      this.scanning = true;
+      mockLog('startScan 开始扫描');
+      resolve();
+      // 模拟陆续发现设备
+      const devices = mockScanDevices();
+      for (let i = 0; i < devices.length; i++) {
+        const d = devices[i];
+        this.later(() => {
+          if (this.scanning && this.deviceFoundCb != null) {
+            mockLog(`发现设备 ${d.name} (${d.deviceId})`);
+            this.deviceFoundCb!!(d);
+          }
+        }, 600 + i * 500);
+      }
+      // 扫描超时自动停（Mock 下缩短为 4s，避免干等）
+      this.later(() => {
+        if (this.scanning) {
+          this.scanning = false;
+          mockLog('扫描超时自动停止');
+        }
+      }, 4000);
+    });
+  }
+
+  stopScan(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.scanning = false;
+      mockLog('stopScan');
+      resolve();
+    });
+  }
+
+  onDeviceFound(cb: BleDeviceFoundCallback): void {
+    this.deviceFoundCb = cb;
+  }
+
+  connect(deviceId: string, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const scenario = getMockScenario();
+      this.connectAttempts++;
+      mockLog(`connect ${deviceId} (第 ${this.connectAttempts} 次, 场景=${scenario})`);
+      this.later(() => {
+        // 连接抖动：前 2 次失败，第 3 次成功
+        if (scenario == MockScenarioEnum.CONNECT_FLAKY && this.connectAttempts < 3) {
+          mockLog('连接失败(抖动)');
+          reject(createBleError('CONNECT_FAIL', 'Mock: 模拟连接抖动失败'));
+          return;
+        }
+        this.connectedDeviceId = deviceId;
+        mockLog('连接成功');
+        if (this.connStateCb != null) {
+          this.connStateCb!!(deviceId, 'connected', false);
+        }
+        resolve();
+      }, 400);
+    });
+  }
+
+  disconnect(deviceId: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.connectedDeviceId = '';
+      this.notified = false;
+      this.clearTimers();
+      mockLog(`disconnect ${deviceId}`);
+      if (this.connStateCb != null) {
+        this.connStateCb!!(deviceId, 'disconnected', false);
+      }
+      resolve();
+    });
+  }
+
+  onConnectionStateChange(cb: BleConnectionStateCallback): void {
+    this.connStateCb = cb;
+  }
+
+  discoverServices(deviceId: string): Promise<BleServiceInfo[]> {
+    return new Promise<BleServiceInfo[]>((resolve, reject) => {
+      this.later(() => {
+        resolve([
+          new BleServiceInfo(PROV_SERVICE_UUID, true),
+        ]);
+      }, 200);
+    });
+  }
+
+  discoverCharacteristics(deviceId: string, serviceUuid: string): Promise<BleCharacteristicInfo[]> {
+    return new Promise<BleCharacteristicInfo[]>((resolve, reject) => {
+      this.later(() => {
+        resolve([
+          new BleCharacteristicInfo(PROV_CHAR_WIFI_SSID_UUID, serviceUuid, false, true, false),
+          new BleCharacteristicInfo(PROV_CHAR_WIFI_PASSWORD_UUID, serviceUuid, false, true, false),
+          new BleCharacteristicInfo(PROV_CHAR_STATUS_UUID, serviceUuid, true, false, true),
+          new BleCharacteristicInfo(PROV_CHAR_DEVICE_INFO_UUID, serviceUuid, true, false, false),
+          new BleCharacteristicInfo(PROV_CHAR_COMMAND_UUID, serviceUuid, false, true, false),
+        ]);
+      }, 200);
+    });
+  }
+
+  notify(deviceId: string, serviceUuid: string, charUuid: string, enable: boolean): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.later(() => {
+        this.notified = enable;
+        mockLog(`notify ${charUuid} enable=${enable}`);
+        resolve();
+        // 已配置场景：订阅后立即上报 ALREADY_CONFIGURED
+        if (enable && getMockScenario() == MockScenarioEnum.ALREADY_CONFIGURED) {
+          this.pushStatus(ProvStatusEnum.ALREADY_CONFIGURED, 0, 300);
+        }
+      }, 200);
+    });
+  }
+
+  onNotify(cb: BleNotifyCallback): void {
+    this.notifyCb = cb;
+  }
+
+  /** 构造 PROV_STATUS 3 字节并回调（byte0=状态码, byte1-2=错误详情 little-endian） */
+  private pushStatus(status: ProvStatusEnum, errorDetail: number, delayMs: number): void {
+    this.later(() => {
+      if (this.notifyCb == null || this.connectedDeviceId == '') return;
+      const u8 = new Uint8Array(3);
+      u8[0] = status as number;
+      u8[1] = errorDetail & 0xff;
+      u8[2] = (errorDetail >> 8) & 0xff;
+      mockLog(`上报状态 status=${status} detail=${errorDetail}`);
+      this.notifyCb!!(this.connectedDeviceId, PROV_SERVICE_UUID, PROV_CHAR_STATUS_UUID, u8.buffer as ArrayBuffer);
+    }, delayMs);
+  }
+
+  write(
+    deviceId: string,
+    serviceUuid: string,
+    charUuid: string,
+    value: ArrayBuffer,
+    writeNoResponse: boolean,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const scenario = getMockScenario();
+      const isSsid = charUuid == PROV_CHAR_WIFI_SSID_UUID;
+      const isPwd = charUuid == PROV_CHAR_WIFI_PASSWORD_UUID;
+      const isCmd = charUuid == PROV_CHAR_COMMAND_UUID;
+      this.later(() => {
+        // 写抖动：首次写失败
+        if (scenario == MockScenarioEnum.WRITE_FLAKY && this.writeAttempts == 0 && (isSsid || isPwd)) {
+          this.writeAttempts++;
+          mockLog('写失败(抖动)');
+          reject(createBleError('WRITE_FAIL', 'Mock: 模拟写抖动失败'));
+          return;
+        }
+        this.writeAttempts++;
+        if (isSsid) {
+          this.ssid = this.bufToStr(value);
+          mockLog(`写入 SSID: ${this.ssid}`);
+        } else if (isPwd) {
+          this.password = this.bufToStr(value);
+          mockLog(`写入 密码: (len=${this.password.length})`);
+        } else if (isCmd) {
+          const u8 = new Uint8Array(value);
+          mockLog(`写入 COMMAND: 0x${u8.length > 0 ? u8[0].toString() : '?'}`);
+          // RESET：清空凭据
+          this.ssid = '';
+          this.password = '';
+        }
+        resolve();
+
+        // 收齐 SSID+密码后推进配网状态机
+        if (isPwd && this.ssid.length > 0) {
+          this.advanceProvision(scenario);
+        }
+      }, 250);
+    });
+  }
+
+  /** 收齐凭据后的状态推进（按场景） */
+  private advanceProvision(scenario: MockScenarioEnum): void {
+    mockLog(`凭据收齐，推进配网 (场景=${scenario})`);
+    if (scenario == MockScenarioEnum.UNEXPECTED_DISCONNECT) {
+      // 先报 PROVISIONING，再意外断开
+      this.pushStatus(ProvStatusEnum.PROVISIONING, 0, 500);
+      this.later(() => {
+        const id = this.connectedDeviceId;
+        this.connectedDeviceId = '';
+        this.notified = false;
+        mockLog('意外断开连接');
+        if (this.connStateCb != null && id != '') {
+          this.connStateCb!!(id, 'disconnected', true);
+        }
+      }, 1200);
+      return;
+    }
+    // 正常推进：PROVISIONING → 终态
+    this.pushStatus(ProvStatusEnum.PROVISIONING, 0, 500);
+    if (scenario == MockScenarioEnum.SUCCESS) {
+      this.pushStatus(ProvStatusEnum.CONNECTED, 0, 2000);
+    } else if (scenario == MockScenarioEnum.FAIL_WRONG_PASSWORD) {
+      this.pushStatus(ProvStatusEnum.FAILED, 1, 2000); // detail=1 密码错误
+    } else if (scenario == MockScenarioEnum.FAIL_AP_NOT_FOUND) {
+      this.pushStatus(ProvStatusEnum.FAILED, 2, 2000); // detail=2 找不到AP
+    } else if (scenario == MockScenarioEnum.FAIL_TIMEOUT) {
+      // 只到 PROVISIONING，不再推进，让 APP 端 30s 超时
+      mockLog('(超时场景) 卡在 PROVISIONING，等待 APP 超时');
+    } else {
+      // 其它场景默认成功
+      this.pushStatus(ProvStatusEnum.CONNECTED, 0, 2000);
+    }
+  }
+
+  read(deviceId: string, serviceUuid: string, charUuid: string): Promise<ArrayBuffer> {
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      this.later(() => {
+        if (charUuid == PROV_CHAR_DEVICE_INFO_UUID) {
+          resolve(encodeUtf8(mockDeviceInfoRaw(deviceId)));
+          return;
+        }
+        if (charUuid == PROV_CHAR_STATUS_UUID) {
+          // 主动读状态：默认 IDLE
+          const u8 = new Uint8Array(3);
+          u8[0] = ProvStatusEnum.IDLE as number;
+          resolve(u8.buffer as ArrayBuffer);
+          return;
+        }
+        resolve(new ArrayBuffer(0));
+      }, 200);
+    });
+  }
+
+  /** ArrayBuffer → string（仅用于日志/凭据暂存） */
+  private bufToStr(buf: ArrayBuffer): string {
+    const u8 = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < u8.length; i++) {
+      s += String.fromCharCode(u8[i]);
+    }
+    // 说明：Mock 内部仅做 ASCII 展示；真实 UTF-8 解码在协议层负责
+    return s;
+  }
+}

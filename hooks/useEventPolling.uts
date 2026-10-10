@@ -7,21 +7,24 @@
  * 
  * 自动处理的场景：
  * - H5：页面切换到后台（visibilitychange）或切换标签页时暂停，回来后恢复
- * - 小程序：需要在 App.uvue 的 onHide/onShow 中手动调用 stop/start
+ * - 小程序：需要在 App.vue 的 onHide/onShow 中手动调用 stop/start
+ * - 聊天页：pauseEventPollingForChat / resumeEventPollingAfterChat（可见时暂停 batch）
  * 
  * 使用方式：
- * - 在 App.uvue 的 onLaunch 中调用 initEventPolling() 初始化
- * - 在 App.uvue 的 onHide 中调用 stopEventPolling()（小程序需要）
- * - 在 App.uvue 的 onShow 中调用 startEventPolling()（小程序需要）
+ * - 在 App.vue 的 onLaunch 中调用 initEventPolling() 初始化
+ * - 在 App.vue 的 onHide 中调用 stopEventPolling()（小程序需要）
+ * - 在 App.vue 的 onShow 中调用 startEventPolling()（小程序需要）
+ * - 聊天页 onShow 调 pauseEventPollingForChat，onHide/onUnload 调 resumeEventPollingAfterChat
  * 
  * 订阅事件：
  * - eventBus.on(EVENT_TYPE.RefreshFileList, handler)
  * - eventBus.off(EVENT_TYPE.RefreshFileList, handler)
  */
-import { apiCollectEvent, apiClearEvent, ApiCollectEventResponse } from '@/servers/event';
+import { apiResCode, apiResData } from '@/utils/apiResponse';
+import { apiCollectEvent, apiClearEvent } from '@/servers/event';
 import eventBus from '@/utils/eventBus';
 import { SUCCESS_CODE } from '@/constants/codes.constants';
-import { ACCESS_TOKEN } from '@/constants/home.constants';
+import { isAppInBackground } from '@/utils/appLifecycle.uts';
 
 // 轮询间隔（毫秒）
 const POLLING_INTERVAL = 5000;
@@ -35,66 +38,207 @@ let isProcessing = false;
 // 是否已初始化 H5 可见性监听
 let isVisibilityListenerInitialized = false;
 
-// 是否已登录（未登录不轮询）
-// function isLoggedIn(): boolean {
-//   const token = uni.getStorageSync(ACCESS_TOKEN);
-//   return !!token;
-// }
+/**
+ * 聊天页可见时为 true：暂停 batch 轮询；离开聊天页后恢复。
+ * App onShow / H5 visibility / pollOnce finally 里的 start 都会尊重此标记。
+ */
+let pausedByChatPage = false;
+
+/**
+ * 诊断日志开关：tester 包置 true 抓 logcat 确认轮询行为，上线前置 false。
+ */
+export const EVENT_POLLING_DEBUG = true;
+
+function epLog(msg: string): void {
+  if (EVENT_POLLING_DEBUG == true) {
+    console.log(msg);
+  }
+}
+
+/**
+ * 清事件失败去重：记录上一批签名，连续命中即跳过重复 emit，切断 death-spiral。
+ */
+let lastBatchSig = "";
+let consecutiveUncleared = 0;
+
+/**
+ * 把 eventList 原始数据解析成可遍历的 any[]。
+ * Android：res.data 常为 UTSJSONObject/Array，禁止 as interface 或带泛型的 JSON.parse，
+ * 故先 JSON.stringify 再 JSON.parse 成普通数组（与原 normalizeEventList 的前半段一致）。
+ * 拆出来是为了在 normalize 之前先算签名，命中“上一批没清掉”时跳过昂贵的逐条归一化与 emit。
+ */
+function parseEventItems(raw: any | null): any[] {
+  if (raw == null) {
+    return [] as any[];
+  }
+  if (Array.isArray(raw)) {
+    return raw as any[];
+  }
+  try {
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr != null && jsonStr.length > 0) {
+      const parsed = JSON.parse(jsonStr);
+      if (Array.isArray(parsed)) {
+        return parsed as any[];
+      }
+    }
+  } catch (_e) {
+    // ignore
+  }
+  return [] as any[];
+}
+
+/**
+ * 逐条归一化为 UTSJSONObject（沿用原双 JSON 转换以兼容 Android 类型系统）。
+ */
+function normalizeEventItems(items: any[]): UTSJSONObject[] {
+  const result: UTSJSONObject[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item == null) {
+      continue;
+    }
+    try {
+      const jsonStr = JSON.stringify(item);
+      if (jsonStr != null && jsonStr.length > 0) {
+        const obj = JSON.parse(jsonStr) as UTSJSONObject | null;
+        if (obj != null) {
+          result.push(obj);
+        }
+      }
+    } catch (_e2) {
+      // ignore bad item
+    }
+  }
+  return result;
+}
+
+/**
+ * 为一批事件计算廉价内容签名（条数 + 序列化字符串长度）。
+ * 用于判定 apiClearEvent 失败后“同一批事件是否再次返回”——命中则跳过重复 emit，
+ * 切断“每 5s 重发同批 + 重跑逐条 JSON + 触发徽标网络请求”的 death-spiral。
+ * 两次内容不同的批几乎不可能同时条数相同且序列化长度相同。
+ */
+function computeBatchSig(items: any[]): string {
+  const len = items.length;
+  if (len == 0) {
+    return "";
+  }
+  try {
+    const jsonStr = JSON.stringify(items);
+    return `${len}:${jsonStr.length}`;
+  } catch (_e) {
+    return `${len}`;
+  }
+}
 
 /**
  * 执行一次轮询
  */
 async function pollOnce(): Promise<void> {
-  // 未登录不轮询
-  // if (!isLoggedIn()) {
-  //   return;
-  // }
-
-  // 如果正在处理，跳过本次
-  if (isProcessing) {
-    console.log('[EventPolling] 跳过重复的事件处理');
+  if (isProcessing == true) {
+    epLog('[EventPolling] 跳过重复的事件处理');
     return;
   }
 
+  const tickStart = Date.now();
+
   try {
     const response = await apiCollectEvent();
-    const data = response as any;
 
-    // 检查响应是否有效
-    if (!data || data.code !== SUCCESS_CODE) {
+    if (response == null || apiResCode(response) != SUCCESS_CODE) {
+      epLog(`[EventPolling] collect 失败 code=${response == null ? "null" : apiResCode(response)} uncleared=${consecutiveUncleared}`);
       return;
     }
 
-    const result: ApiCollectEventResponse = data.data;
-
-    // 如果有事件需要处理
-    if (result?.hasEvent && result?.eventList?.length > 0) {
-      try {
-        // 标记开始处理
-        isProcessing = true;
-
-        // 暂停轮询
-        stopEventPolling();
-
-        // 遍历所有事件，使用 eventBus 发布事件
-        for (const event of result.eventList) {
-          // console.log('[EventPolling] 发布事件:', event.type, event.event);
-          eventBus.emit(event.type, event.event);
-        }
-
-        // 清除已处理的事件
-        await apiClearEvent();
-      } catch (error) {
-        console.error('[EventPolling] 处理事件时出错:', error);
-      } finally {
-        // 重新开始轮询
-        startEventPolling();
-        // 处理完成
-        isProcessing = false;
-      }
+    // Android：data 是 UTSJSONObject，禁止 JSON.parse 成 ApiCollectEventResponse（会 ClassCastException）
+    const dataRaw = apiResData<any>(response);
+    if (dataRaw == null) {
+      return;
     }
+    const dataObj = dataRaw as UTSJSONObject;
+    const hasEventRaw = dataObj["hasEvent"];
+    const hasEvent =
+      hasEventRaw == true ||
+      hasEventRaw == 1 ||
+      `${hasEventRaw}` == "true";
+    if (hasEvent != true) {
+      // 无事件：若之前处于 uncleared 状态，记一条恢复日志
+      if (consecutiveUncleared > 0) {
+        epLog(`[EventPolling] 事件已清空，恢复正常轮询（之前 uncleared=${consecutiveUncleared}）`);
+      }
+      lastBatchSig = "";
+      consecutiveUncleared = 0;
+      return;
+    }
+
+    // 先解析 + 算签名；命中“上一批没清掉”则跳过 normalize/emit，切断 death-spiral
+    const items = parseEventItems(dataObj["eventList"]);
+    const sig = computeBatchSig(items);
+    if (sig.length > 0 && sig == lastBatchSig) {
+      consecutiveUncleared = consecutiveUncleared + 1;
+      epLog(`[EventPolling] 重复批未清除 sig=${sig} 连续=${consecutiveUncleared}，跳过 emit（保 5s 廉价轮询）`);
+      return;
+    }
+
+    const eventList = normalizeEventItems(items);
+    if (eventList.length == 0) {
+      lastBatchSig = "";
+      consecutiveUncleared = 0;
+      return;
+    }
+
+    try {
+      isProcessing = true;
+      stopEventPolling();
+
+      for (let i = 0; i < eventList.length; i++) {
+        const item = eventList[i];
+        const typeRaw = item["type"];
+        if (typeRaw == null) {
+          continue;
+        }
+        const typeStr = `${typeRaw}`;
+        if (typeStr.length == 0) {
+          continue;
+        }
+        const eventPayload = item["event"];
+        if (eventPayload == null) {
+          continue;
+        }
+        eventBus.emit(typeStr, eventPayload);
+      }
+
+      // 检查清事件结果：失败则记下本批签名，下一轮若同批再次返回即去重，避免每 5s 重发
+      const clearRes = (await apiClearEvent()) as UTSJSONObject | null;
+      const clearOk = clearRes != null && apiResCode(clearRes) == SUCCESS_CODE;
+      if (clearOk) {
+        lastBatchSig = "";
+        consecutiveUncleared = 0;
+      } else {
+        lastBatchSig = sig;
+        consecutiveUncleared = consecutiveUncleared + 1;
+        epLog(`[EventPolling] clear 失败 code=${clearRes == null ? "null" : apiResCode(clearRes)} 连续=${consecutiveUncleared}，下轮将去重`);
+      }
+    } catch (error) {
+      console.error('[EventPolling] 处理事件时出错:', error);
+      // 处理过程中抛错同样按“本批未清”处理，下轮去重
+      lastBatchSig = sig;
+      consecutiveUncleared = consecutiveUncleared + 1;
+    } finally {
+      // 退后台期间不复活轮询：处理事件批中途被 App onHide 停表后（stopEventPolling
+      // → await apiClearEvent 挂起），这里无条件重启会在后台留下 5s 轮询且永不自停；
+      // 回前台由 App onShow 的 startEventPolling 补启。
+      if (isAppInBackground() != true) {
+        startEventPolling();
+      }
+      isProcessing = false;
+    }
+
+    epLog(`[EventPolling] tick size=${eventList.length} tickMs=${Date.now() - tickStart} uncleared=${consecutiveUncleared}`);
   } catch (error) {
-    console.error('[EventPolling] 轮询请求失败:', error);
+    const errMsg = error != null ? `${error}` : "unknown";
+    console.error('[EventPolling] 轮询请求失败:', errMsg);
   }
 }
 
@@ -104,7 +248,7 @@ async function pollOnce(): Promise<void> {
  */
 function handleVisibilityChange(): void {
   // #ifdef H5 || WEB
-  if (document.hidden) {
+  if (Boolean(document.hidden)) {
     console.log('[EventPolling] H5 页面不可见，暂停轮询');
     stopEventPolling();
   } else {
@@ -119,7 +263,7 @@ function handleVisibilityChange(): void {
  */
 function initVisibilityListener(): void {
   // #ifdef H5 || WEB
-  if (isVisibilityListenerInitialized) {
+  if (Boolean(isVisibilityListenerInitialized)) {
     return;
   }
   
@@ -130,7 +274,7 @@ function initVisibilityListener(): void {
 }
 
 /**
- * 初始化事件轮询（在 App.uvue onLaunch 中调用）
+ * 初始化事件轮询（在 App.vue onLaunch 中调用）
  * - H5：自动监听 visibilitychange，自动处理暂停/恢复
  * - 小程序：需要在 onHide/onShow 中手动调用 stop/start
  */
@@ -146,6 +290,11 @@ export function initEventPolling(): void {
  * 启动事件轮询
  */
 export function startEventPolling(): void {
+  // 聊天页可见时不启动（避免与会话 SSE / 状态轮询抢带宽）
+  if (pausedByChatPage == true) {
+    return;
+  }
+
   // 如果已经在轮询，不重复启动
   if (pollingTimerId !== null) {
     return;
@@ -165,17 +314,45 @@ export function startEventPolling(): void {
   // 设置定时轮询
   pollingTimerId = setInterval(() => {
     pollOnce();
-  }, POLLING_INTERVAL) as unknown as number;
+  }, POLLING_INTERVAL);
 }
 
 /**
  * 停止事件轮询
  */
 export function stopEventPolling(): void {
-  if (pollingTimerId !== null) {
+  const timerId = pollingTimerId;
+  if (timerId !== null) {
     console.log('[EventPolling] 停止事件轮询');
-    clearInterval(pollingTimerId);
+    clearInterval(timerId);
     pollingTimerId = null;
+  }
+}
+
+/**
+ * 进入聊天页：暂停 batch 轮询
+ */
+export function pauseEventPollingForChat(): void {
+  if (pausedByChatPage == true) {
+    stopEventPolling();
+    return;
+  }
+  pausedByChatPage = true;
+  stopEventPolling();
+}
+
+/**
+ * 离开聊天页：允许并恢复 batch 轮询
+ */
+export function resumeEventPollingAfterChat(): void {
+  if (pausedByChatPage != true) {
+    return;
+  }
+  pausedByChatPage = false;
+  // 聊天页 onHide 可能由 App 退后台连带触发（与 App onHide 先后不定），此时不在
+  // 后台重启轮询；回前台由 App onShow 的 startEventPolling 补启。
+  if (isAppInBackground() != true) {
+    startEventPolling();
   }
 }
 
@@ -193,7 +370,7 @@ export function destroyEventPolling(): void {
   stopEventPolling();
   
   // #ifdef H5 || WEB
-  if (isVisibilityListenerInitialized) {
+  if (Boolean(isVisibilityListenerInitialized)) {
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     isVisibilityListenerInitialized = false;
     console.log('[EventPolling] H5 可见性监听已移除');

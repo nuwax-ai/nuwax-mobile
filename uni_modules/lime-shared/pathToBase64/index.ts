@@ -1,11 +1,9 @@
 // @ts-nocheck
 // #ifndef UNI-APP-X && APP
-// export * from './vue.ts'
-export { pathToBase64 } from './vue.ts'
+export { pathToBase64 } from './vue'
 // #endif
 
 
 // #ifdef UNI-APP-X && APP
-// export * from './uvue.uts'
-export { pathToBase64 } from './uvue.uts'
+export { pathToBase64 } from './uvue'
 // #endif

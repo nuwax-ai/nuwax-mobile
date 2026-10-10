@@ -182,7 +182,7 @@ export function isDate(input : string | Date, options : string | IsDateOptions |
 			(date.getMonth() + 1) == parseInt(month, 10) &&
 			date.getFullYear() == parseInt(fullYear, 10);
 		// #endif
-	} catch {
+	} catch(e) {
 		return false;
 	}
 

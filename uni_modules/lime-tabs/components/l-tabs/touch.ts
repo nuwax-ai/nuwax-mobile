@@ -16,11 +16,11 @@ function getDirection(x : number, y : number) : Direction {
 	return '';
 }
 
-type TouchEventHandler = (event : UniTouchEvent) => void
-type BooleanFunction = () => boolean;
+type TouchEventHandler = any
+type BooleanFunction = any;
 type UseTouchResult = {
-	start : TouchEventHandler,
-	move : TouchEventHandler,
+	start : (event: UniTouchEvent) => void,
+	move : (event: UniTouchEvent) => void,
 	startX : Ref<number>,
 	startY : Ref<number>,
 	deltaX : Ref<number>,
@@ -28,8 +28,8 @@ type UseTouchResult = {
 	offsetX : Ref<number>,
 	offsetY : Ref<number>,
 	direction : Ref<Direction>,
-	isVertical : BooleanFunction,
-	isHorizontal : BooleanFunction,
+	isVertical : any,
+	isHorizontal : any,
 	isTap : Ref<Boolean>,
 }
 export function useTouch() : UseTouchResult {

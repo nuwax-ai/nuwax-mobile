@@ -10,11 +10,12 @@
 </template>
 
 <script>
-	import { fontData } from './uniicons_file_vue.js';
+	import { fontData } from './uniicons_file_vue.uts';
 
-	const getVal = (val) => {
-		const reg = /^[0-9]*$/g
-		return (typeof val === 'number' || reg.test(val)) ? val + 'px' : val;
+	const getVal = (val: any): any => {
+		const valStr = `${val}`;
+		const reg = /^[0-9]*$/;
+		return reg.test(valStr) ? valStr + 'px' : val;
 	}
 
 	// #ifdef APP-NVUE

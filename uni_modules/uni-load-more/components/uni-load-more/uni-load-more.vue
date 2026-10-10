@@ -15,7 +15,7 @@
 		<!-- #endif -->
 		<!-- #ifndef APP-NVUE || H5 -->
 		<view
-			v-if="!webviewHide && (iconType==='circle' || iconType==='auto' && platform === 'android') && status === 'loading' && showIcon"
+			v-if="showAndroidCircleLoading"
 			:style="{width:iconSize+'px',height:iconSize+'px'}"
 			class="uni-load-more__img uni-load-more__img--android-MP">
 			<view class="uni-load-more__img-icon" :style="{borderTopColor:color,borderTopWidth:iconSize/12}"></view>
@@ -24,18 +24,18 @@
 		</view>
 		<!-- #endif -->
 		<!-- #ifndef APP-NVUE -->
-		<view v-else-if="!webviewHide && status === 'loading' && showIcon"
+		<view v-else-if="showIosSnowLoading"
 			:style="{width:iconSize+'px',height:iconSize+'px'}" class="uni-load-more__img uni-load-more__img--ios-H5">
 			<image class="image" :src="imgBase64" mode="widthFix"></image>
 		</view>
 		<!-- #endif -->
 		<text v-if="showText" class="uni-load-more__text"
-			:style="{color: color}">{{ status === 'more' ? contentdownText : status === 'loading' ? contentrefreshText : contentnomoreText }}</text>
+			:style="{color: color}">{{ statusDisplayText }}</text>
 	</view>
 </template>
 
 <script>
-	let platform
+	let platform = ""
 	setTimeout(() => {
 		// #ifdef MP-WEIXIN
 		platform = uni.getDeviceInfo().platform
@@ -45,6 +45,7 @@
 		// #endif
 	}, 16)
 
+	// #ifndef APP-ANDROID
 	import {
 		initVueI18n
 	} from '@dcloudio/uni-i18n'
@@ -52,6 +53,102 @@
 	const {
 		t
 	} = initVueI18n(messages)
+	// #endif
+
+	/** 本组件默认 contentText 类型（UTS：禁止对 any 点属性 / 下标） */
+	class LoadMoreContentText {
+		contentdown: string = "";
+		contentrefresh: string = "";
+		contentnomore: string = "";
+	}
+
+	/**
+	 * contentText 为空时的默认文案。
+	 * Android：Options API computed 里不能引用外层 const t（会编成 IndexKt.t 静态调用 → NoSuchMethodError），
+	 * 因此 App-Android 直接返回本地默认，勿再调 t()。
+	 */
+	function resolveLoadMoreFallbackText(kind: string): string {
+		// #ifdef APP-ANDROID
+		if (kind == "contentdown") {
+			return "上拉显示更多";
+		}
+		if (kind == "contentrefresh") {
+			return "正在加载...";
+		}
+		if (kind == "contentnomore") {
+			return "没有更多数据了";
+		}
+		return "";
+		// #endif
+		// #ifndef APP-ANDROID
+		if (kind == "contentdown") {
+			return t("uni-load-more.contentdown");
+		}
+		if (kind == "contentrefresh") {
+			return t("uni-load-more.contentrefresh");
+		}
+		if (kind == "contentnomore") {
+			return t("uni-load-more.contentnomore");
+		}
+		return "";
+		// #endif
+	}
+
+	/**
+	 * 读取 contentText 文案。
+	 * Android：可能是 LoadMoreContentText / UniLoadMoreContentText / Map / UTSJSONObject。
+	 * 禁止对 any 做 .field 或 [key]；禁止把生成类型直接 as UTSJSONObject。
+	 */
+	function readContentTextField(raw: any | null, key: string): string {
+		if (raw == null || key.length == 0) {
+			return "";
+		}
+		// 1) 本组件 class
+		try {
+			const typed = raw as LoadMoreContentText;
+			if (typed != null) {
+				if (key == "contentdown" && typed.contentdown != "") {
+					return typed.contentdown;
+				}
+				if (key == "contentrefresh" && typed.contentrefresh != "") {
+					return typed.contentrefresh;
+				}
+				if (key == "contentnomore" && typed.contentnomore != "") {
+					return typed.contentnomore;
+				}
+			}
+		} catch (_eTyped) {
+			// ignore
+		}
+		// 2) Map（Android Record）
+		try {
+			const m = raw as Map<string, any | null>;
+			if (m != null) {
+				const fromMap = m.get(key);
+				if (fromMap != null && `${fromMap}` != "") {
+					return `${fromMap}`;
+				}
+			}
+		} catch (_eMap) {
+			// ignore
+		}
+		// 3) JSON 中转成 UTSJSONObject 再 bracket（勿 as 原对象）
+		try {
+			const jsonStr = JSON.stringify(raw);
+			if (jsonStr != null && jsonStr.length > 2 && jsonStr != "null" && jsonStr != "{}") {
+				const parsed = JSON.parse(jsonStr) as UTSJSONObject | null;
+				if (parsed != null) {
+					const fromJson = parsed[key];
+					if (fromJson != null && `${fromJson}` != "") {
+						return `${fromJson}`;
+					}
+				}
+			}
+		} catch (_eJson) {
+			// ignore
+		}
+		return "";
+	}
 
 	/**
 	 * LoadMore 加载更多
@@ -98,12 +195,8 @@
 			},
 			contentText: {
 				type: Object,
-				default () {
-					return {
-						contentdown: '',
-						contentrefresh: '',
-						contentnomore: ''
-					}
+				default(): LoadMoreContentText {
+					return new LoadMoreContentText();
 				}
 			},
 			showText: {
@@ -120,17 +213,77 @@
 		},
 		computed: {
 			iconSnowWidth() {
-				return (Math.floor(this.iconSize / 24) || 1) * 2
+				const base = Math.floor(this.iconSize / 24);
+				if (base == 0) {
+					return 2;
+				}
+				return base * 2;
 			},
 			contentdownText() {
-				return this.contentText.contentdown || t("uni-load-more.contentdown")
+				const text = readContentTextField(this.contentText as any, "contentdown");
+				if (text != "") {
+					return text;
+				}
+				return resolveLoadMoreFallbackText("contentdown");
 			},
 			contentrefreshText() {
-				return this.contentText.contentrefresh || t("uni-load-more.contentrefresh")
+				const text = readContentTextField(this.contentText as any, "contentrefresh");
+				if (text != "") {
+					return text;
+				}
+				return resolveLoadMoreFallbackText("contentrefresh");
 			},
 			contentnomoreText() {
-				return this.contentText.contentnomore || t("uni-load-more.contentnomore")
-			}
+				const text = readContentTextField(this.contentText as any, "contentnomore");
+				if (text != "") {
+					return text;
+				}
+				return resolveLoadMoreFallbackText("contentnomore");
+			},
+			/** 是否展示 Android 圆环 loading */
+			showAndroidCircleLoading() {
+				if (this.webviewHide == true) {
+					return false;
+				}
+				if (this.status !== 'loading') {
+					return false;
+				}
+				if (this.showIcon != true) {
+					return false;
+				}
+				if (this.iconType === 'circle') {
+					return true;
+				}
+				if (this.iconType === 'auto') {
+					if (platform === 'android') {
+						return true;
+					}
+				}
+				return false;
+			},
+			/** 是否展示 iOS 雪花 loading */
+			showIosSnowLoading() {
+				if (this.webviewHide == true) {
+					return false;
+				}
+				if (this.status !== 'loading') {
+					return false;
+				}
+				if (this.showIcon != true) {
+					return false;
+				}
+				return true;
+			},
+			/** 状态文案 */
+			statusDisplayText() {
+				if (this.status === 'more') {
+					return this.contentdownText;
+				}
+				if (this.status === 'loading') {
+					return this.contentrefreshText;
+				}
+				return this.contentnomoreText;
+			},
 		},
 		mounted() {
 			// #ifdef APP-PLUS
@@ -158,6 +311,7 @@
 </script>
 
 <style lang="scss" >
+/* #ifdef H5 */
 	.uni-load-more {
 		/* #ifndef APP-NVUE */
 		display: flex;
@@ -401,4 +555,5 @@
 	}
 
 	/* #endif */
+/* #endif */
 </style>

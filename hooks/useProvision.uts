@@ -1,0 +1,468 @@
+/**
+ * 桌宠配网状态机 composable（useProvision）
+ *
+ * 驱动 BleAdapter 完成完整配网时序：
+ *   扫描(15s超时) → 连接(重试3次指数退避) → 读DEVICE_INFO → 订阅PROV_STATUS
+ *   → 写SSID(重试3) → 写密码(重试3) → 等Notify(30s超时) → SUCCESS/FAILED
+ *
+ * 页面只渲染状态；凭据只存内存 ref、dispose 时清空不落盘（MVP 安全）。
+ * 所有上屏文案走 i18n key；技术细节只进 ProvisionError.detail / console。
+ */
+import { ref, type Ref } from 'vue';
+import type { BleAdapter } from '@/utils/ble/bleAdapter';
+import { BleAdapterConfig } from '@/utils/ble/bleAdapter';
+import { getBleAdapter } from '@/utils/ble/bleAdapterFactory';
+import type { BleDeviceInfo, BleError, BleCharacteristicInfo } from '@/utils/ble/bleTypes';
+import {
+  ProvStatusEnum,
+  ProvisionPhaseEnum,
+  ProvisionRetryActionEnum,
+  ProvCommandEnum,
+} from '@/types/enums/provision';
+import type {
+  ProvisionDeviceInfo,
+  ProvisionTargetDevice,
+  ProvisionError,
+} from '@/types/interfaces/provision';
+import {
+  PROV_SERVICE_UUID,
+  PROV_CHAR_WIFI_SSID_UUID,
+  PROV_CHAR_WIFI_PASSWORD_UUID,
+  PROV_CHAR_STATUS_UUID,
+  PROV_CHAR_DEVICE_INFO_UUID,
+  PROV_CHAR_COMMAND_UUID,
+  PROV_SCAN_TIMEOUT_MS,
+  PROV_RESULT_TIMEOUT_MS,
+  PROV_CONNECT_TIMEOUT_MS,
+  PROV_CONNECT_RETRY,
+  PROV_CONNECT_RETRY_BASE_DELAY_MS,
+  PROV_WRITE_RETRY,
+  PROV_WRITE_RETRY_DELAY_MS,
+} from '@/constants/provision.constants';
+import {
+  encodeUtf8,
+  encodeCommand,
+  decodeProvStatus,
+  decodeDeviceInfo,
+  validateSsid,
+  validatePassword,
+  provErrorToI18nKey,
+} from '@/utils/provisionProtocol';
+
+/** useProvision 对外暴露的响应式状态与操作（UTS 下用 class 返回） */
+export class ProvisionController {
+  phase: Ref<ProvisionPhaseEnum>;
+  /** 扫描到的设备列表 */
+  scannedDevices: Ref<ProvisionTargetDevice[]>;
+  /** 已选设备信息（DEVICE_INFO 解析结果） */
+  device: Ref<ProvisionDeviceInfo | null>;
+  /** 失败时填充（含 i18n 文案 key + 是否可重试） */
+  error: Ref<ProvisionError | null>;
+  /** 成功后设备连上的 SSID */
+  connectedSsid: Ref<string>;
+  /** 是否正在执行配网动作（连接/写/等结果） */
+  busy: Ref<boolean>;
+
+  private adapter: BleAdapter;
+  private currentDeviceId = '';
+  private scanTimer = 0;
+  private resultTimer = 0;
+  private disposed = false;
+  // 待处理的凭据（retry 用）
+  private pendingSsid = '';
+  private pendingPassword = '';
+
+  constructor() {
+    this.adapter = getBleAdapter();
+    this.phase = ref<ProvisionPhaseEnum>(ProvisionPhaseEnum.IDLE);
+    this.scannedDevices = ref<ProvisionTargetDevice[]>([] as ProvisionTargetDevice[]);
+    this.device = ref<ProvisionDeviceInfo | null>(null);
+    this.error = ref<ProvisionError | null>(null);
+    this.connectedSsid = ref<string>('');
+    this.busy = ref<boolean>(false);
+
+    // 注册全局回调
+    this.adapter.onDeviceFound((d: BleDeviceInfo) => this.handleDeviceFound(d));
+    this.adapter.onNotify((deviceId: string, serviceUuid: string, charUuid: string, value: ArrayBuffer) =>
+      this.handleNotify(deviceId, serviceUuid, charUuid, value),
+    );
+    this.adapter.onConnectionStateChange((deviceId: string, state: string, unexpected: boolean) =>
+      this.handleConnState(deviceId, state, unexpected),
+    );
+  }
+
+  // ───────────────────────── 扫描 ─────────────────────────
+
+  /** 打开适配器并开始扫描（15s 超时自动停） */
+  async startScan(): Promise<void> {
+    this.error.value = null;
+    this.scannedDevices.value = [] as ProvisionTargetDevice[];
+    try {
+      await this.adapter.openAdapter();
+    } catch (e) {
+      const be = e as BleError;
+      this.fail(this.mapBleError(be, ProvisionRetryActionEnum.RESCAN));
+      return;
+    }
+    this.phase.value = ProvisionPhaseEnum.SCANNING;
+    try {
+      await this.adapter.startScan(new BleAdapterConfig(PROV_SCAN_TIMEOUT_MS, PROV_SERVICE_UUID));
+    } catch (e) {
+      const be = e as BleError;
+      this.fail(this.mapBleError(be, ProvisionRetryActionEnum.RESCAN));
+      return;
+    }
+    this.clearScanTimer();
+    this.scanTimer = setTimeout(() => {
+      this.stopScan();
+    }, PROV_SCAN_TIMEOUT_MS) as number;
+  }
+
+  /** 停止扫描 */
+  stopScan(): void {
+    this.clearScanTimer();
+    this.adapter.stopScan();
+    if (this.phase.value == ProvisionPhaseEnum.SCANNING) {
+      this.phase.value = ProvisionPhaseEnum.IDLE;
+    }
+  }
+
+  private clearScanTimer(): void {
+    if (this.scanTimer != 0) {
+      clearTimeout(this.scanTimer);
+      this.scanTimer = 0;
+    }
+  }
+
+  private handleDeviceFound(d: BleDeviceInfo): void {
+    // 按 deviceId 去重并更新 RSSI
+    const list = this.scannedDevices.value;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].deviceId == d.deviceId) {
+        list[i].rssi = d.rssi;
+        return;
+      }
+    }
+    list.push(new ProvisionTargetDevice(d.deviceId, d.name, d.rssi));
+  }
+
+  // ─────────────────── 连接 + 读信息 + 订阅 ───────────────────
+
+  /**
+   * 选中设备并完成「连接→校验特征→读DEVICE_INFO→订阅PROV_STATUS」。
+   * 成功返回 true，失败填充 error 并返回 false。
+   */
+  async selectAndPrepare(deviceId: string): Promise<boolean> {
+    this.stopScan();
+    this.error.value = null;
+    this.busy.value = true;
+    this.currentDeviceId = deviceId;
+
+    // 1. 连接（重试 N 次，指数退避）
+    this.phase.value = ProvisionPhaseEnum.CONNECTING;
+    const connected = await this.connectWithRetry(deviceId);
+    if (!connected) {
+      this.busy.value = false;
+      return false;
+    }
+
+    try {
+      // 2. 校验特征齐全
+      const chars = await this.adapter.discoverCharacteristics(deviceId, PROV_SERVICE_UUID);
+      const hasSsid = this.hasChar(chars, PROV_CHAR_WIFI_SSID_UUID);
+      const hasPwd = chars.length > 0 && this.hasChar(chars, PROV_CHAR_WIFI_PASSWORD_UUID);
+      const hasStatus = this.hasChar(chars, PROV_CHAR_STATUS_UUID);
+      if (!hasSsid || !hasPwd || !hasStatus) {
+        this.fail(new ProvisionError(
+          'Mobile.Provision.Error.firmwareMismatch',
+          `缺少必要特征 ssid=${hasSsid} pwd=${hasPwd} status=${hasStatus}`,
+          true,
+          ProvisionRetryActionEnum.RESCAN,
+        ));
+        this.busy.value = false;
+        return false;
+      }
+
+      // 3. 读 DEVICE_INFO（失败不阻断，仅记录）
+      this.phase.value = ProvisionPhaseEnum.READING_INFO;
+      try {
+        const buf = await this.adapter.read(deviceId, PROV_SERVICE_UUID, PROV_CHAR_DEVICE_INFO_UUID);
+        this.device.value = decodeDeviceInfo(buf);
+      } catch (e) {
+        this.device.value = null;
+      }
+
+      // 4. 订阅 PROV_STATUS
+      this.phase.value = ProvisionPhaseEnum.SUBSCRIBING;
+      await this.adapter.notify(deviceId, PROV_SERVICE_UUID, PROV_CHAR_STATUS_UUID, true);
+
+      this.busy.value = false;
+      return true;
+    } catch (e) {
+      const be = e as BleError;
+      this.fail(this.mapBleError(be, ProvisionRetryActionEnum.RECONNECT));
+      this.busy.value = false;
+      return false;
+    }
+  }
+
+  private hasChar(chars: BleCharacteristicInfo[], uuid: string): boolean {
+    const target = uuid.toLowerCase();
+    for (let i = 0; i < chars.length; i++) {
+      if (chars[i].uuid.toLowerCase() == target) return true;
+    }
+    return false;
+  }
+
+  /** 连接并重试（指数退避 base*2^i） */
+  private async connectWithRetry(deviceId: string): Promise<boolean> {
+    let lastErr = null as BleError | null;
+    for (let attempt = 0; attempt < PROV_CONNECT_RETRY; attempt++) {
+      try {
+        await this.adapter.connect(deviceId, PROV_CONNECT_TIMEOUT_MS);
+        return true;
+      } catch (e) {
+        lastErr = e as BleError;
+        if (this.disposed) return false;
+        if (attempt < PROV_CONNECT_RETRY - 1) {
+          await this.sleep(PROV_CONNECT_RETRY_BASE_DELAY_MS * (1 << attempt));
+        }
+      }
+    }
+    this.fail(this.mapBleError(lastErr, ProvisionRetryActionEnum.RECONNECT));
+    return false;
+  }
+
+  // ───────────────────────── 配网 ─────────────────────────
+
+  /** 写入凭据并等待联网结果（须先 selectAndPrepare 成功） */
+  async provision(ssid: string, password: string): Promise<void> {
+    this.error.value = null;
+    // 本地校验
+    if (!validateSsid(ssid)) {
+      this.fail(new ProvisionError(
+        'Mobile.Provision.Wifi.ssidInvalid',
+        `ssid 长度非法: ${ssid}`,
+        false,
+        ProvisionRetryActionEnum.NONE,
+      ));
+      return;
+    }
+    if (!validatePassword(password)) {
+      this.fail(new ProvisionError(
+        'Mobile.Provision.Wifi.passwordInvalid',
+        'password 长度非法',
+        false,
+        ProvisionRetryActionEnum.NONE,
+      ));
+      return;
+    }
+    this.pendingSsid = ssid;
+    this.pendingPassword = password;
+    this.busy.value = true;
+
+    // 写 SSID（重试）
+    this.phase.value = ProvisionPhaseEnum.WRITING_SSID;
+    const ssidOk = await this.writeWithRetry(PROV_CHAR_WIFI_SSID_UUID, encodeUtf8(ssid));
+    if (!ssidOk) {
+      this.busy.value = false;
+      return;
+    }
+    // 写密码（重试）
+    this.phase.value = ProvisionPhaseEnum.WRITING_PASSWORD;
+    const pwdOk = await this.writeWithRetry(PROV_CHAR_WIFI_PASSWORD_UUID, encodeUtf8(password));
+    if (!pwdOk) {
+      this.busy.value = false;
+      return;
+    }
+
+    // 进入等待结果，启动 30s 总超时
+    this.phase.value = ProvisionPhaseEnum.WAITING_RESULT;
+    this.clearResultTimer();
+    this.resultTimer = setTimeout(() => {
+      this.fail(new ProvisionError(
+        'Mobile.Provision.Error.timeout',
+        `等待联网结果超时(${PROV_RESULT_TIMEOUT_MS}ms)`,
+        true,
+        ProvisionRetryActionEnum.REWRITE,
+      ));
+    }, PROV_RESULT_TIMEOUT_MS) as number;
+  }
+
+  /** 写特征并重试 */
+  private async writeWithRetry(charUuid: string, value: ArrayBuffer): Promise<boolean> {
+    let lastErr = null as BleError | null;
+    for (let attempt = 0; attempt < PROV_WRITE_RETRY; attempt++) {
+      try {
+        await this.adapter.write(this.currentDeviceId, PROV_SERVICE_UUID, charUuid, value, false);
+        return true;
+      } catch (e) {
+        lastErr = e as BleError;
+        if (this.disposed) return false;
+        if (attempt < PROV_WRITE_RETRY - 1) {
+          await this.sleep(PROV_WRITE_RETRY_DELAY_MS);
+        }
+      }
+    }
+    this.fail(new ProvisionError(
+      'Mobile.Provision.Error.writeFailed',
+      lastErr != null ? lastErr.message : 'write failed',
+      true,
+      ProvisionRetryActionEnum.REWRITE,
+    ));
+    return false;
+  }
+
+  /** 处理 PROV_STATUS Notify */
+  private handleNotify(deviceId: string, serviceUuid: string, charUuid: string, value: ArrayBuffer): void {
+    if (charUuid.toLowerCase() != PROV_CHAR_STATUS_UUID.toLowerCase()) return;
+    // 仅在等待结果阶段处理终态推进；ALREADY_CONFIGURED 在订阅后即可能上报
+    const waiting = this.phase.value == ProvisionPhaseEnum.WAITING_RESULT;
+    const r = decodeProvStatus(value);
+    if (r.status == ProvStatusEnum.ALREADY_CONFIGURED && (waiting || this.phase.value == ProvisionPhaseEnum.SUBSCRIBING)) {
+      this.clearResultTimer();
+      this.connectedSsid.value = this.pendingSsid;
+      this.phase.value = ProvisionPhaseEnum.SUCCESS;
+      this.busy.value = false;
+      return;
+    }
+    if (!waiting) return;
+    if (r.status == ProvStatusEnum.PROVISIONING) {
+      // 保持 WAITING_RESULT，进度文案由页面按 phase 展示
+      return;
+    }
+    if (r.status == ProvStatusEnum.CONNECTED) {
+      this.clearResultTimer();
+      this.connectedSsid.value = this.pendingSsid;
+      this.phase.value = ProvisionPhaseEnum.SUCCESS;
+      this.busy.value = false;
+      return;
+    }
+    if (r.status == ProvStatusEnum.FAILED) {
+      this.clearResultTimer();
+      this.fail(new ProvisionError(
+        provErrorToI18nKey(r.status, r.errorDetail),
+        `固件上报失败 detail=${r.errorDetail}`,
+        true,
+        ProvisionRetryActionEnum.REWRITE,
+      ));
+      return;
+    }
+  }
+
+  /** 处理连接状态变化（意外断开） */
+  private handleConnState(deviceId: string, state: string, unexpected: boolean): void {
+    if (state == 'disconnected' && unexpected && this.busy.value) {
+      // 配网中途意外断开
+      this.clearResultTimer();
+      this.fail(new ProvisionError(
+        'Mobile.Provision.Error.disconnected',
+        `设备 ${deviceId} 意外断开`,
+        true,
+        ProvisionRetryActionEnum.RECONNECT,
+      ));
+    }
+  }
+
+  // ─────────────────── 重试 / 重置 / 清理 ───────────────────
+
+  /** 按 error.retryAction 重试 */
+  async retry(): Promise<void> {
+    const err = this.error.value;
+    if (err == null || !err.retryable) return;
+    if (err.retryAction == ProvisionRetryActionEnum.REWRITE) {
+      // 重写凭据（连接仍在）
+      await this.provision(this.pendingSsid, this.pendingPassword);
+    } else if (err.retryAction == ProvisionRetryActionEnum.RECONNECT) {
+      // 重连并准备后重写
+      const ok = await this.selectAndPrepare(this.currentDeviceId);
+      if (ok) {
+        await this.provision(this.pendingSsid, this.pendingPassword);
+      }
+    } else if (err.retryAction == ProvisionRetryActionEnum.RESCAN) {
+      await this.startScan();
+    }
+  }
+
+  /** 发送 COMMAND RESET（0x01）重置设备配网 */
+  async resetDevice(): Promise<boolean> {
+    if (this.currentDeviceId == '') return false;
+    try {
+      await this.adapter.write(
+        this.currentDeviceId,
+        PROV_SERVICE_UUID,
+        PROV_CHAR_COMMAND_UUID,
+        encodeCommand(ProvCommandEnum.RESET),
+        false,
+      );
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 资源清理：取阅/断开/关适配器/清定时器/清凭据。页面 onUnload 调用。 */
+  dispose(): void {
+    this.disposed = true;
+    this.clearScanTimer();
+    this.clearResultTimer();
+    const id = this.currentDeviceId;
+    if (id != '') {
+      // 尽力取阅与断开（不 await）
+      this.adapter.notify(id, PROV_SERVICE_UUID, PROV_CHAR_STATUS_UUID, false).catch(() => {});
+      this.adapter.disconnect(id).catch(() => {});
+    }
+    this.adapter.closeAdapter().catch(() => {});
+    // 清空凭据（不落盘）
+    this.pendingSsid = '';
+    this.pendingPassword = '';
+    this.currentDeviceId = '';
+  }
+
+  private clearResultTimer(): void {
+    if (this.resultTimer != 0) {
+      clearTimeout(this.resultTimer);
+      this.resultTimer = 0;
+    }
+  }
+
+  private fail(err: ProvisionError): void {
+    this.error.value = err;
+    this.phase.value = ProvisionPhaseEnum.FAILED;
+    this.busy.value = false;
+  }
+
+  /** 把 BleError 映射为 ProvisionError（技术信息进 detail） */
+  private mapBleError(be: BleError | null, retryAction: ProvisionRetryActionEnum): ProvisionError {
+    let key = 'Mobile.Provision.Error.unknown';
+    if (be != null) {
+      if (be.code == 'BT_OFF') key = 'Mobile.Provision.Error.bluetoothOff';
+      else if (be.code == 'CONNECT_FAIL') key = 'Mobile.Provision.Error.connectFailed';
+      else if (be.code == 'WRITE_FAIL') key = 'Mobile.Provision.Error.writeFailed';
+      else if (be.code == 'DISCONNECTED') key = 'Mobile.Provision.Error.disconnected';
+      else if (be.code == 'TIMEOUT' || be.code == 'SCAN_TIMEOUT') key = 'Mobile.Provision.Error.timeout';
+      else key = 'Mobile.Provision.Error.unknown';
+    }
+    return new ProvisionError(
+      key,
+      be != null ? `${be.code}: ${be.message}` : 'unknown',
+      true,
+      retryAction,
+    );
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        resolve();
+      }, ms);
+    });
+  }
+}
+
+/** 创建配网控制器（页面 setup 中调用，onUnload 调 dispose） */
+export function useProvision(): ProvisionController {
+  return new ProvisionController();
+}
+
+export default useProvision;

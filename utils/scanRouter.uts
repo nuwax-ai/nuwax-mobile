@@ -1,0 +1,288 @@
+/**
+ * 扫一扫结果四路分发判定（纯函数、无 UI）：
+ * - user：自家域名的用户名片码 —— https://{API域名}[/m]/u/{纯数字 userId}[?a={encodeURIComponent(用户名)}]
+ *   host 必须与 getApiBaseUrl() 一致才认（防外部任意 /u/ 链接伪造加好友弹窗）；
+ *   /m 为 H5 部署路径前缀。
+ * - group：群名片码 —— group#{群号}[#{convId}]
+ *   ★group# 前缀即判型标识，不看域名也不看群号位数（测试环境群号位数与契约
+ *   不一致，长度判型曾把真实群码打成普通链接）；群号须纯数字，提交时服务端兜底校验。
+ * - url：其余 http(s) 链接（打开前由 UI 层做域名确认）
+ * - text：所有其他内容原样展示
+ *
+ * build 与 match 对称：buildUserCardUrl / buildGroupCardContent 生成的内容
+ * 一定能被 matchUserCardUrl / matchGroupCardContent 识别。
+ */
+
+import { getApiBaseUrl } from "@/constants/config";
+
+/** 扫码内容的分发判定结果（kind: "user" | "group" | "url" | "text"，纯字符串避免枚举串化分歧）。 */
+export class ScanRoute {
+  kind: string = "text";
+  /** url 路由：完整链接（保持原文，不做编码/解码） */
+  url: string = "";
+  /** user 路由：目标 userId（字符串化雪花号；纯数字，apiImAddContact 按数字字面量拼 JSON） */
+  userId: string = "";
+  /** user 路由：?a= 携带的用户名/账号（已解码；老格式裸 /u/{id} 无此参数，为空串） */
+  userAccount: string = "";
+  /** group 路由：群号（纯数字字符串；位数不参与判型，服务端兜底校验） */
+  groupNo: string = "";
+  /** group 路由：第二段 # 携带的会话 id（纯数字雪花号；缺省为空串，扫码端跳过已在群判定） */
+  groupConvId: string = "";
+  /** text 路由：trim 后原文 */
+  text: string = "";
+}
+
+/** 是否 http(s) 链接（前缀大小写不敏感）。 */
+export function isHttpUrl(raw: string): boolean {
+  const lower = raw.toLowerCase();
+  return lower.indexOf("http://") == 0 || lower.indexOf("https://") == 0;
+}
+
+/** 提取小写 host（scheme:// 之后到首个 / ? # 之前）；无法解析返回空串。 */
+export function extractUrlHost(url: string): string {
+  const lower = url.toLowerCase();
+  // UTS：String.length 推导 Int，indexOf 返回 Number——统一显式 number 防混型赋值报错
+  const len: number = url.length;
+  let start: number = -1;
+  if (lower.indexOf("https://") == 0) {
+    start = 8;
+  } else if (lower.indexOf("http://") == 0) {
+    start = 7;
+  }
+  if (start < 0 || len <= start) {
+    return "";
+  }
+  let end: number = len;
+  const slashAt = url.indexOf("/", start);
+  if (slashAt >= 0 && slashAt < end) {
+    end = slashAt;
+  }
+  const queryAt = url.indexOf("?", start);
+  if (queryAt >= 0 && queryAt < end) {
+    end = queryAt;
+  }
+  const hashAt = url.indexOf("#", start);
+  if (hashAt >= 0 && hashAt < end) {
+    end = hashAt;
+  }
+  if (end <= start) {
+    return "";
+  }
+  return url.substring(start, end).toLowerCase();
+}
+
+/** 纯数字判定（雪花 userId / 群号 / convId 字符串；按数字字面量拼 JSON，必须全数字）。 */
+function isAllDigits(raw: string): boolean {
+  if (raw.length == 0) {
+    return false;
+  }
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charAt(i);
+    if (c < "0" || c > "9") {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 名片码路径归一化：取 path（首个 / ? # 起，到 ? / # 之前），补根斜杠、
+ * 去尾斜杠、剥 H5 部署前缀 /m（严格匹配 /m 或 /m/ 开头，不影响 /mu/ 这类路径）。
+ */
+function normalizeCardPath(url: string): string {
+  const lower = url.toLowerCase();
+  const schemeAt: number = lower.indexOf("://");
+  let pathStart: number = schemeAt < 0 ? 0 : schemeAt + 3;
+  const len: number = url.length;
+  while (pathStart < len) {
+    const c = url.charAt(pathStart);
+    if (c == "/" || c == "?" || c == "#") {
+      break;
+    }
+    pathStart++;
+  }
+  let pathEnd: number = len;
+  const queryAt = url.indexOf("?", pathStart);
+  if (queryAt >= 0 && queryAt < pathEnd) {
+    pathEnd = queryAt;
+  }
+  const hashAt = url.indexOf("#", pathStart);
+  if (hashAt >= 0 && hashAt < pathEnd) {
+    pathEnd = hashAt;
+  }
+  let path = url.substring(pathStart, pathEnd);
+  if (path.length == 0) {
+    path = "/";
+  }
+  while (path.length > 1 && path.charAt(path.length - 1) == "/") {
+    path = path.substring(0, path.length - 1);
+  }
+  if (path == "/m" || path.indexOf("/m/") == 0) {
+    path = path.substring(2);
+    if (path.length == 0) {
+      path = "/";
+    }
+  }
+  return path;
+}
+
+/** 名片码公共前置校验：API 域名已配置且 url host 与其一致时返回归一化 path，否则返回空串。 */
+function cardPathIfOwnHost(url: string): string {
+  const apiHost = extractUrlHost(getApiBaseUrl());
+  if (apiHost.length == 0) {
+    return "";
+  }
+  if (extractUrlHost(url) != apiHost) {
+    return "";
+  }
+  return normalizeCardPath(url);
+}
+
+/** 安全 decode：无 % 原样返回；解码失败 / 平台返回 null 时回原文。 */
+function safeDecodeQueryValue(input: string): string {
+  if (input.indexOf("%") < 0) {
+    return input;
+  }
+  try {
+    const decoded = decodeURIComponent(input);
+    return decoded != null ? decoded : input;
+  } catch (_e) {
+    return input;
+  }
+}
+
+/**
+ * 提取 url 指定 query 参数（? 与 # 之间按 & 分段；值安全解码；无则空串）。
+ * 仅取第一个命中 key；key 为空串或无 = 的分段跳过。
+ */
+export function extractUrlQueryValue(url: string, key: string): string {
+  const queryAt: number = url.indexOf("?");
+  if (queryAt < 0) {
+    return "";
+  }
+  const hashAt: number = url.indexOf("#");
+  if (hashAt >= 0 && hashAt < queryAt) {
+    return ""; // ? 在 # 之后属于 fragment，不算 query
+  }
+  let end: number = url.length;
+  if (hashAt >= 0 && hashAt < end) {
+    end = hashAt;
+  }
+  const query = url.substring(queryAt + 1, end);
+  if (query.length == 0) {
+    return "";
+  }
+  const parts = query.split("&");
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const eqAt: number = part.indexOf("=");
+    if (eqAt <= 0) {
+      continue;
+    }
+    if (part.substring(0, eqAt) == key) {
+      return safeDecodeQueryValue(part.substring(eqAt + 1));
+    }
+  }
+  return "";
+}
+
+/**
+ * 用户名片码匹配：路径（经 /m 前缀与尾斜杠归一）形如 /u/{纯数字}。
+ * 命中返回 userId，否则返回空串。API 域名未配置（如 H5 同源生产）时不命中——
+ * 宁可按普通链接打开，不做无域名校验的加好友。
+ */
+export function matchUserCardUrl(url: string): string {
+  const path = cardPathIfOwnHost(url);
+  if (path.indexOf("/u/") != 0) {
+    return "";
+  }
+  const userId = path.substring(3);
+  return isAllDigits(userId) ? userId : "";
+}
+
+/**
+ * 群名片码匹配：内容形如 group#{纯数字群号}[#{纯数字convId}]。
+ * group# 前缀即判型标识（不依赖域名/群号位数——测试环境群号位数与契约不一致，
+ * 长度判型曾把真实群码打成普通链接）；群号必须纯数字。命中返回群号，否则空串。
+ */
+export function matchGroupCardContent(raw: string): string {
+  if (raw.indexOf("group#") != 0) {
+    return "";
+  }
+  const rest = raw.substring(6);
+  const hashAt = rest.indexOf("#");
+  const groupNo = hashAt < 0 ? rest : rest.substring(0, hashAt);
+  return isAllDigits(groupNo) ? groupNo : "";
+}
+
+/** 名片码 origin（scheme + 小写 host）；API 域名未配置时返回空串，build 侧据此转失败态。 */
+export function cardUrlOrigin(): string {
+  const base = getApiBaseUrl();
+  const host = extractUrlHost(base);
+  if (host.length == 0) {
+    return "";
+  }
+  return (base.toLowerCase().indexOf("http://") == 0 ? "http://" : "https://") + host;
+}
+
+/**
+ * 生成个人名片码 URL：{origin}/u/{userId}[?a={encodeURIComponent(account)}]。
+ * account 缺省时省略 query（match 侧 a 缺省合法）；origin / userId 为空返回空串。
+ */
+export function buildUserCardUrl(userId: string, account: string): string {
+  const origin = cardUrlOrigin();
+  if (origin.length == 0 || userId.length == 0) {
+    return "";
+  }
+  if (account.length == 0) {
+    return origin + "/u/" + userId;
+  }
+  return origin + "/u/" + userId + "?a=" + encodeURIComponent(account);
+}
+
+/**
+ * 生成群名片码内容：group#{groupNo}[#{convId}]。
+ * convId 缺省时省略第二段（扫码端跳过已在群判定）；groupNo 为空返回空串。
+ * ★不依赖 API 域名（group# 标识判型）：域名未配置（如 H5 同源）也能出群码。
+ */
+export function buildGroupCardContent(groupNo: string, convId: string): string {
+  if (groupNo.length == 0) {
+    return "";
+  }
+  if (convId.length == 0) {
+    return "group#" + groupNo;
+  }
+  return "group#" + groupNo + "#" + convId;
+}
+
+/** 扫码原文 → 四路分发（trim 后判定；group 标识非 URL 先判，user/url 走 http 分支）。 */
+export function parseScanContent(raw: string): ScanRoute {
+  const route = new ScanRoute();
+  const trimmed = raw.trim();
+  const groupNo = matchGroupCardContent(trimmed);
+  if (groupNo.length > 0) {
+    route.kind = "group";
+    route.groupNo = groupNo;
+    // 第二段 # 携带 convId：必须纯数字才可用（服务端按数字字面量处理），否则丢弃
+    const rest = trimmed.substring(6);
+    const hashAt = rest.indexOf("#");
+    const convId = hashAt >= 0 ? rest.substring(hashAt + 1) : "";
+    route.groupConvId = isAllDigits(convId) ? convId : "";
+    return route;
+  }
+  if (isHttpUrl(trimmed)) {
+    const userId = matchUserCardUrl(trimmed);
+    if (userId.length > 0) {
+      route.kind = "user";
+      route.userId = userId;
+      route.userAccount = extractUrlQueryValue(trimmed, "a");
+      return route;
+    }
+    route.kind = "url";
+    route.url = trimmed;
+    return route;
+  }
+  route.kind = "text";
+  route.text = trimmed;
+  return route;
+}

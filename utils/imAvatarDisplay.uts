@@ -1,0 +1,107 @@
+import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
+
+/**
+ * IM 用户头像展示地址统一解析（选人/搜索等次级页面共用）。
+ *
+ * H5 根因：/api/f/ 受保护头像 <image> 带不了 Bearer——H5 端 <img> 拿到 401 JSON 会被
+ * ORB 拦成 net::ERR_BLOCKED_BY_ORB（真机原生加载器不受浏览器 ORB 约束，直连可用，
+ * 故真机正常、浏览器必现）。与消息列表同机制：经 resolveDisplayImageUrl 带 Bearer
+ * 拉图换 blob 地址展示。
+ *
+ * App 根因（2026-10 阅读状态页女娲助手图标 Android 空白 / iOS 落字母底）：远程 SVG
+ * 头像直连 <image> 时 Android 原生渲染器按 SVG 声明尺寸 1:1 光栅化，小容器只显示
+ * 局部（透明角落=看不见）且不触发 @error；iOS 直连渲染失败触发 @error 落字母底。
+ * 故 Android/iOS 也走 resolveDisplayImageUrl（消息列表 resolveIconInto 同款）：
+ * SVG 按容器物理像素改写后出 data URL、/api/f/ 带 Bearer 换 temp 文件；
+ * 普通位图地址内部零请求透传，无额外成本。
+ *
+ * ★鸿蒙不处理：ArkUI <image> 不支持 SVG data URL（直连远程 .svg 可正确缩放），
+ *   保持原地址透传（resolveDisplayImageUrl 内部对鸿蒙同样透传）。
+ *
+ * 缓存策略对齐 utils/remoteSvgImage：按 IM 会话 stamp 隔离清空 + 容量上限、在途
+ * 去重、普通地址/失败负缓存不重试。次级页面头像量小，blob 不做逐页 revoke（会话
+ * 切换即弃）；消息列表仍走页面级生命周期管理，勿混用。
+ *
+ * 接入姿势（★批量解析必须放在 xxx.value = rows 赋值之后、行取自 ref 数组——响应式
+ * 代理实例上异步写回才触发渲染刷新；建行期 new 出的裸实例上写回不刷新，头像会卡死
+ * 字母兜底。message.uvue resolveConvRowsIcons 同款）：
+ *   // 建行（本地数组）：
+ *   row.avatarRaw = readString(item, "avatar");
+ *   row.avatar = imAvatarDisplayUrl(row.avatarRaw);
+ *   // 赋值后批量解析：
+ *   rows.value = out;
+ *   resolveRowAvatars();   // 内部 const live = rows.value 遍历，闭包捕获代理实例
+ * ★写回须复位 avatarFailed：首帧失败可能已把行标死在字母兜底，解析完成后要救回。
+ * ★App-Android 异步写回后 v-for 行可能不重渲（ba6a72f18 消息列表同款平台缺陷），
+ *   页面须在回填后整表重建赋值强制重渲（im-msg-read-status scheduleRowsRefresh 先例）。
+ * ★行原始地址留 avatarRaw 字段：跳转带参等数据用途取它，勿把 blob:/data:地址带给别的页面。
+ */
+
+/** 原始地址 → 已解析展示地址（键含展示尺寸：App 端 SVG data URL 按尺寸出图，跨页尺寸不同不可混用） */
+const resolvedCache = new Map<string, string>();
+/** 已发起过解析的原始地址（含普通地址/失败回退：不重试，负缓存语义；失败与尺寸无关，按原始地址记） */
+const attemptedUrls = new Set<string>();
+/** 在途去重：同「尺寸|地址」并发触发共享同一次解析 */
+const pendingUrls = new Map<string, Promise<string>>();
+const AVATAR_CACHE_LIMIT = 256;
+let cacheSession = "";
+
+function prepareCache(): void {
+  const stamp = getImSessionStamp();
+  if (stamp != cacheSession || resolvedCache.size >= AVATAR_CACHE_LIMIT ||
+      attemptedUrls.size >= AVATAR_CACHE_LIMIT) {
+    resolvedCache.clear();
+    attemptedUrls.clear();
+    cacheSession = stamp;
+  }
+}
+
+/** 同步取展示地址（sizeRpx 须与 resolveImAvatarDisplay 一致，缓存键含尺寸）：
+ * 缓存命中返回已解析地址；H5 上未解析的受保护地址返回空（先藏图，与消息列表一致
+ * ——裸 <img> 请求必被 ORB 拦，还会触发 @error 标死字母兜底）；其余原样返回。 */
+export function imAvatarDisplayUrl(url: string, sizeRpx: number): string {
+  if (url.length == 0) return url;
+  const hit = resolvedCache.get(`${sizeRpx}|${url}`);
+  if (hit != null) return hit;
+  // #ifdef H5 || WEB
+  if (isAuthProtectedFileUrl(url)) return "";
+  // #endif
+  return url;
+}
+
+/**
+ * 异步解析并写缓存：普通地址零请求透传原样返回；受保护/SVG 地址返回换好的展示地址。
+ * 调用方把返回值写回行字段（并在失败首帧已标 avatarFailed 时复位）。
+ * 生效范围：H5（ORB 拦截）与 App-Android/iOS（SVG 1:1 光栅化裁切/渲染失败）；
+ * 鸿蒙与小程序原样透传（ArkUI 直连远程 .svg 可正确缩放）。
+ */
+export function resolveImAvatarDisplay(url: string, sizeRpx: number): Promise<string> {
+  // #ifdef H5 || WEB || APP-ANDROID || APP-IOS
+  if (url.length == 0) return Promise.resolve(url);
+  prepareCache();
+  const key = `${sizeRpx}|${url}`;
+  const hit = resolvedCache.get(key);
+  if (hit != null) return Promise.resolve(hit);
+  if (attemptedUrls.has(url)) return Promise.resolve(url);
+  const pending = pendingUrls.get(key);
+  if (pending != null) return pending;
+  attemptedUrls.add(url);
+  const task = resolveDisplayImageUrl(url, sizeRpx, sizeRpx)
+    .then((resolved: string): string => {
+      if (resolved != url) resolvedCache.set(key, resolved);
+      return resolved;
+    })
+    .catch((_e: any | null): string => url);
+  pendingUrls.set(key, task);
+  // task 已被 catch 兜底不会 reject；结算后清在途登记，防 map 无谓增长
+  task.then((): void => {
+    pendingUrls.delete(key);
+  });
+  return task;
+  // #endif
+  // #ifndef H5 || WEB || APP-ANDROID || APP-IOS
+  return Promise.resolve(url);
+  // #endif
+}

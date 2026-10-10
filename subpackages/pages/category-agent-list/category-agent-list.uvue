@@ -1,11 +1,12 @@
 <template>
   <view class="container flex flex-col h-full">
-    <custom-nav-bar :title="category?.name">
+    <custom-nav-bar :title="categoryName" hasSafetyZone>
       <template v-slot:left>
-        <text
-          class="iconfont icon-a-Chevronleft"
+        <svg-icon
+          name="icon-a-Chevronleft"
+          size="44"
           @tap="jumpNavigateBack"
-        ></text>
+        />
       </template>
     </custom-nav-bar>
     <scroll-view class="flex-1" direction="vertical" :show-scrollbar="false">
@@ -26,9 +27,9 @@
         >
           <image
             class="item-card__icon"
-            :src="getImageSrc(item.targetId, item.icon)"
+            :src="getImageSrc(item.targetId, item.resolvedIcon.length > 0 ? item.resolvedIcon : item.icon)"
             mode="aspectFill"
-            :alt="item.name || t('Mobile.Common.agentIconAlt')"
+            :alt="item.name.length > 0 ? item.name : t('Mobile.Common.agentIconAlt')"
             @error="handleImageError(item.targetId)"
           />
           <view class="item-card__content">
@@ -44,40 +45,82 @@
 </template>
 
 <script setup lang="uts">
+  import { switchMainTab } from "@/utils/mainTabNavigation";
+
   import agentImage from "@/static/assets/agent_image.png";
-  import { jumpToAgentDetailPage } from "@/utils/commonBusiness";
-  // import { jumpNavigateBack } from '@/utils/common'
+  // #ifdef APP-IOS
+  // iOS：从常驻聊天关壳回来时 TabBar 可能仍被 hide，回 Tab 前必须显式恢复
+  import { syncNativeTabBarState } from "@/utils/commonBusiness";
+  // #endif
+  import { appGlobalState } from "@/utils/appGlobalState";
   import {
     SUCCESS_CODE,
     USER_NO_LOGIN,
     REDIRECT_LOGIN,
-  } from "@/constants/codes.constants.uts";
+  } from "@/constants/codes.constants";
   import { apiHomeCategoryList } from "@/servers/agentDev";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import {
     CategoryInfo,
     CategoryItemInfo,
   } from "@/types/interfaces/agentConfig";
+  import { ref, computed } from 'vue';
+  import { onLoad, onShow } from "@dcloudio/uni-app";
+  // #ifndef APP-ANDROID
   import { onAddToFavorites } from "@dcloudio/uni-app";
-  import { setCurrentPageNavigationBarTitle } from "@/utils/system.uts";
-  import { useI18n } from "@/utils/i18n";
+  // #endif
+  import { setCurrentPageNavigationBarTitle } from "@/utils/system";
+  import { useI18n, emptyI18nParams } from "@/utils/i18n";
+  import { resolveAppSvgUrl } from "@/utils/remoteSvgImage";
 
-  const { t } = useI18n();
+  const { t: tFn } = useI18n();
+  const t = (key: string): string => tFn(key, emptyI18nParams(), "");
 
   const loading = ref<boolean>(false);
   const categoryKey = ref<string>(""); // 分类key
   // 分类信息
-  const category = ref<CategoryInfo>(null);
+  const category = ref<CategoryInfo | null>(null);
   // 分类下的智能体列表
   const categoryItems = ref<CategoryItemInfo[]>([]);
 
-  // 记录加载失败的图片ID
-  const failedImageIds = reactive<Set<string>>(new Set());
+  // 记录加载失败的图片ID（UTS 下用数组替代 Set）
+  const failedImageIds = ref<number[]>([]);
 
   // 新增标志变量，用于区分首次加载
   const isFirstLoad = ref<boolean>(true);
 
+  const categoryName = computed((): string => {
+    const c = category.value;
+    return c != null ? c.name : "";
+  });
+
+  const hasFailed = (id: number): boolean => {
+    const arr = failedImageIds.value;
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] == id) return true;
+    }
+    return false;
+  };
+
+  const addFailed = (id: number) => {
+    if (!hasFailed(id)) {
+      failedImageIds.value = [...failedImageIds.value, id];
+    }
+  };
+
   const jumpNavigateBack = () => {
-    uni.switchTab({ url: "/pages/agent-union-record/agent-union-record" });
+    // #ifdef APP-IOS
+    // 返回前重新校准原生 tabBar（自绘模式常隐 / 兜底模式恢复），避免常驻聊天壳 hide 遗留状态
+    syncNativeTabBarState();
+    // #endif
+    // 智联录分类入口已下放到「我的」，此页主要从「我的」分类 navigateTo 进入，直接返回上一页
+    const pages = getCurrentPages();
+    if (pages.length > 1) {
+      uni.navigateBack({ delta: 1 });
+    } else {
+      // 页面栈无上级时兜底回到「我的」tab
+      switchMainTab({ url: "/pages/mine/mine" });
+    }
   };
 
   /**
@@ -86,39 +129,72 @@
    * @param originalIcon 原始图片地址
    * @returns 图片地址（加载失败则返回默认图片）
    */
-  const getImageSrc = (id: string, originalIcon: string): string => {
-    return failedImageIds.has(id) ? agentImage : originalIcon;
+  const getImageSrc = (id: number, originalIcon: string): string => {
+    return hasFailed(id) ? agentImage : originalIcon;
   };
 
   /**
    * 图片加载错误时触发，切换为默认图片
    * @param id 智能体ID
    */
-  const handleImageError = (id: string) => {
-    failedImageIds.add(id);
+  const handleImageError = (id: number) => {
+    addFailed(id);
   };
 
   // 主页智能体列表接口
   const fetchHomeCategoryList = async () => {
     const response = await apiHomeCategoryList();
     loading.value = false;
-    const { code, data, message } = response || {};
-    if (code === SUCCESS_CODE) {
-      if (data) {
-        category.value = data.categories?.find(
-          (item: CategoryInfo) => item.type === categoryKey.value,
-        );
-        categoryItems.value = data.categoryItems?.[categoryKey.value] || [];
+    if (response == null) return;
+    const code = apiResCode(response);
+    if (code == SUCCESS_CODE) {
+      const dataRaw = apiResData<any>(response);
+      if (dataRaw != null) {
+        const dataObj = dataRaw as UTSJSONObject;
+        const catsRaw = dataObj["categories"];
+        const cats = catsRaw != null
+          ? JSON.parse<CategoryInfo[]>(JSON.stringify(catsRaw))
+          : null;
+        let matched: CategoryInfo | null = null;
+        if (cats != null) {
+          for (let i = 0; i < cats.length; i++) {
+            if (cats[i].type == categoryKey.value) {
+              matched = cats[i];
+              break;
+            }
+          }
+        }
+        category.value = matched;
+
+        const itemsObj = dataObj["categoryItems"] as UTSJSONObject | null;
+        const itemsRaw = itemsObj != null ? itemsObj[categoryKey.value] : null;
+        if (itemsRaw != null) {
+          const parsed = JSON.parse<CategoryItemInfo[]>(JSON.stringify(itemsRaw));
+          const items = parsed != null ? parsed : ([] as CategoryItemInfo[]);
+          // App 端远程 SVG 头像按列表尺寸（80rpx）解析；H5/小程序透传原 URL。并行解析避免首屏串行下载过慢
+          const resolveTasks: Promise<string>[] = [] as Promise<string>[];
+          for (let ri = 0; ri < items.length; ri++) {
+            resolveTasks.push(resolveAppSvgUrl(items[ri].icon, 80, 80));
+          }
+          const resolved = await Promise.all(resolveTasks);
+          for (let ri = 0; ri < items.length; ri++) {
+            items[ri].resolvedIcon = resolved[ri];
+          }
+          categoryItems.value = items;
+        } else {
+          categoryItems.value = [] as CategoryItemInfo[];
+        }
       }
-    } else if (code !== USER_NO_LOGIN && code !== REDIRECT_LOGIN) {
+    } else if (code != USER_NO_LOGIN && code != REDIRECT_LOGIN) {
+      const message = apiResMessage(response);
       uni.showToast({
-        title: message || t("Mobile.AgentUnion.fetchHomeAgentListFailed"),
+        title: message.length > 0 ? message : t("Mobile.AgentUnion.fetchHomeAgentListFailed"),
         icon: "none",
       });
     }
   };
 
-  onPageShow((options) => {
+  onShow((options: any) => {
     if (isFirstLoad.value) {
       isFirstLoad.value = false;
       return;
@@ -126,33 +202,48 @@
     fetchHomeCategoryList();
   });
 
-  onLoad((options: { categoryKey: string }) => {
+  onLoad((options: any) => {
     // 设置当前页面导航栏标题
     setCurrentPageNavigationBarTitle();
-    const { categoryKey: _categoryKey } = options;
-    categoryKey.value = _categoryKey;
+    const optObj = options as UTSJSONObject;
+    const ck = optObj["categoryKey"];
+    if (ck != null) {
+      categoryKey.value = ck as string;
+    }
     isFirstLoad.value = true;
     loading.value = true;
     fetchHomeCategoryList();
   });
 
-  // 点击智能体
-  const handleAgentClick = (info: AgentInfo) => {
-    const { lastConversationId, targetId, name, agentType } = info || {};
-
-    if (lastConversationId) {
-      jumpToAgentDetailPage(targetId, lastConversationId);
-    } else {
-      jumpToAgentDetailPage(targetId, null, agentType, name);
+  // 点击智能体：对齐专家列表，把 targetId / name / icon 带回首页上框，不进详情
+  const handleAgentClick = (info: CategoryItemInfo) => {
+    let targetId = 0;
+    if (info.targetId != null) {
+      targetId = info.targetId;
     }
+    if (targetId <= 0) {
+      return;
+    }
+    appGlobalState.pendingHomeAgentTargetId = targetId;
+    appGlobalState.pendingHomeAgentName = info.name;
+    appGlobalState.pendingHomeAgentIcon = info.icon;
+    switchMainTab({
+      url: "/pages/index/index",
+    });
   };
 
-  // 收藏
+  // #ifndef APP-ANDROID
+  // 收藏（仅小程序/H5 支持，Android 端整段剥离）
   onAddToFavorites(() => {
+    const c = category.value;
+    const name = c != null && c.name.length > 0
+      ? c.name
+      : t("Mobile.Common.appName");
     return {
-      title: category.value?.name || t("Mobile.Common.appName"),
+      title: name,
     };
   });
+  // #endif
 </script>
 
 <style lang="scss" scoped>
@@ -179,6 +270,7 @@
         align-items: center;
         flex-direction: row;
 
+        /* #ifndef APP */
         @keyframes spin {
           0% {
             transform: rotate(0deg);
@@ -187,7 +279,8 @@
             transform: rotate(360deg);
           }
         }
-
+        /* #endif */
+        /* #ifndef APP */
         &::before {
           content: "";
           width: 32rpx;
@@ -198,6 +291,7 @@
           animation: spin 1s linear infinite;
           margin-right: 16rpx;
         }
+        /* #endif */
       }
     }
 
@@ -212,8 +306,8 @@
       }
 
       &__icon {
-        width: 80rpx;
-        height: 80rpx;
+        width: 112rpx;
+        height: 112rpx;
         border-radius: 50%;
         margin-right: 24rpx;
       }

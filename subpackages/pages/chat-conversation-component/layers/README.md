@@ -178,3 +178,18 @@ scrollManager.scrollToLastMsg(true)
 6. **控制器维护**: 控制器逻辑在主组件中，需要保持代码整洁
 7. **视图层维护**: 视图层方法直接在主组件中，便于调试和维护
 8. **样式维护**: 样式文件独立管理，便于主题定制和样式复用
+
+## 🎨 会话消息渲染链路（2026-09 V2 重构后）
+
+AI 助手消息渲染分两条平行链路（`ai-msg.uvue` 内条件编译）：
+
+- **H5 / MP-WEIXIN（App 生产 web-view 嵌 H5 走此路径）**：V2 三层工作轨迹
+  （整轮轨迹 → 工具组 → 紧凑行）+ 最终回答独立区。投影层为
+  `subpackages/components/ai-msg/conversationTrace.uts` 纯函数，折叠状态机
+  托管在 `ai-msg.uvue`，组件树见 `subpackages/components/work-trace/README.md`。
+  本层通过 `:final-result` 通道向消息组件透传 `MessageInfo.finalResult`
+  （最终回答 / 耗时 / 失败态）。
+- **原生 uvue（UniAiXMsgRender）**：保持旧渲染（正文内嵌标签 → tool-call 卡片组）。
+
+离线目检入口：`#/pages/test-work-trace/test-work-trace`（历史终态 / 纯文本 /
+单步流式模拟三场景）。

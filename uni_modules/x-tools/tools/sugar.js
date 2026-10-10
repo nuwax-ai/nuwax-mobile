@@ -1,7 +1,8 @@
-export const log = console.log
-import { t } from '@/utils/i18n'
+import { rpx2px as _rpx2px } from './com.js'
 
-export const upx2px = val => uni.upx2px(parseInt(val))
+export const log = console.log
+
+export const upx2px = val => _rpx2px(parseInt(val))
 
 export const toast = (title, options = { duration: 2000, icon: 'none' }) => uni.showToast({ title, fail: console.log, ...options })
 
@@ -92,13 +93,10 @@ export const toCustomerService = (corpId, url) => {
                 console.log("error", JSON.stringify(err))
             })
         } else {
-            plus.nativeUI.alert(t('Mobile.ThirdParty.XTools.wechatUnsupported'))
+            plus.nativeUI.alert('当前环境不支持微信操作!')
         }
     }, function() {
-        uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.getServiceFailed'),
-            icon: 'error'
-        })
+        uni.showToast({ title: "获取服务失败，不支持该操作。" + JSON.stringify(e), icon: 'error' })
     })
     // #endif
 
@@ -146,14 +144,14 @@ export const saveImage = async (url, tips = true) => {
         // #endif
 
         tips && uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.saveSuccess'),
+            title: '保存成功',
             icon: 'success'
         })
     } catch (e) {
         console.log(e);
 
         tips && uni.showToast({
-            title: t('Mobile.ThirdParty.XTools.saveFailed'),
+            title: '保存失败',
             icon: 'error'
         })
     }

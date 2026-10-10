@@ -1,0 +1,482 @@
+/**
+ * Android 兼容：API / JSON 数据需通过 class 构造 MessageInfo，禁止 UTSJSONObject as MessageInfo。
+ *
+ * Android 响应数组项常为 Map：
+ * - JSON.stringify(Map) == "{}"
+ * - Map as UTSJSONObject 后 bracket 读不到字段
+ * - UTSJSONObject as Map 会 ClassCastException
+ * 必须用 Map.get(已知键) / UTSJSONObject.keys 读取。
+ */
+import {
+  MessageInfo,
+  ProcessingInfo,
+  ConversationFinalResult,
+  markdownElItem,
+  AttachmentFile,
+  MessageQuestionExtInfo,
+} from "@/types/interfaces/conversationInfo";
+import {
+  AssistantRoleEnum,
+  MessageTypeEnum,
+  MessageModeEnum,
+} from "@/types/enums/agent";
+import { MessageStatusEnum } from "@/types/enums/common";
+
+/** 消息对象已知字段（避免依赖 Map.forEach / stringify） */
+const MESSAGE_FIELD_KEYS: string[] = [
+  "id",
+  "role",
+  "type",
+  "text",
+  "think",
+  "time",
+  "attachments",
+  "ext",
+  "finished",
+  "metadata",
+  "messageType",
+  "requestId",
+  "index",
+  "status",
+  "finalResult",
+  "processingList",
+  "markdownElList",
+  "componentExecutedList",
+  "mcpAskInteractions",
+  "acpPermissionInteractions",
+  "speakableText",
+];
+
+function isMessageFieldKey(key: string): boolean {
+  for (let i = 0; i < MESSAGE_FIELD_KEYS.length; i++) {
+    if (MESSAGE_FIELD_KEYS[i] == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 从 MessageInfo / MessageInfoClass 实例读已知字段（Android messageList 项走此路径） */
+function readMessageInfoField(raw: any | null, key: string): any | null {
+  if (raw == null || !isMessageFieldKey(key)) {
+    return null;
+  }
+  try {
+    const msg = raw as MessageInfo;
+    if (key == "id") return msg.id;
+    if (key == "role") return msg.role;
+    if (key == "type") return msg.type;
+    if (key == "text") return msg.text;
+    if (key == "think") return msg.think;
+    if (key == "time") return msg.time;
+    if (key == "attachments") return msg.attachments;
+    if (key == "ext") return msg.ext;
+    if (key == "finished") return msg.finished;
+    if (key == "metadata") return msg.metadata;
+    if (key == "messageType") return msg.messageType;
+    if (key == "requestId") return msg.requestId;
+    if (key == "index") return msg.index;
+    if (key == "status") return msg.status;
+    if (key == "finalResult") return msg.finalResult;
+    if (key == "processingList") return msg.processingList;
+    if (key == "markdownElList") return msg.markdownElList;
+    if (key == "componentExecutedList") return msg.componentExecutedList;
+    if (key == "mcpAskInteractions") return msg.mcpAskInteractions;
+    if (key == "acpPermissionInteractions") return msg.acpPermissionInteractions;
+    if (key == "speakableText") return msg.speakableText;
+  } catch (_eMsg) {
+    // 非 MessageInfo
+  }
+  return null;
+}
+
+/**
+ * 从 Map / UTSJSONObject / MessageInfo 实例安全读字段。
+ * Android：优先 Map.get；messageList 内 MessageInfoClass 须走 readMessageInfoField。
+ */
+export function readRawField(raw: any | null, key: string): any | null {
+  if (raw == null || key.length == 0) {
+    return null;
+  }
+
+  // 快速分派：instanceof 一次判型直读。下方 try/catch 多路探测以异常做类型判断，
+  // H5 上每字段最多抛 2 次异常，大会话（消息数 × 字段数十次调用）下是 CPU 最大热点。
+  if (raw instanceof UTSJSONObject) {
+    return (raw as UTSJSONObject)[key];
+  }
+  // 基本类型（枚举值 / 字符串 / 数字）无字段可读，直接短路。
+  if (typeof raw != "object") {
+    return null;
+  }
+  if (raw instanceof Map<string, any | null>) {
+    // has 不可靠的实现由 get 兜底；键缺失时 get 返回 null，与原多路探测结果一致。
+    return (raw as Map<string, any | null>).get(key);
+  }
+  // MessageInfoClass（Android 模板 v-for 项）：直读字段，免去下方两次强转异常。
+  if (raw instanceof MessageInfoClass) {
+    return readMessageInfoField(raw, key);
+  }
+
+  // 1) Map.get（Android Gson / 网络层常见）
+  try {
+    const m = raw as Map<string, any | null>;
+    if (m != null) {
+      if (m.has(key) == true) {
+        return m.get(key);
+      }
+      // 部分实现 has 不可靠，再试 get
+      const fromGet = m.get(key);
+      if (fromGet != null) {
+        return fromGet;
+      }
+    }
+  } catch (_eMap) {
+    // 非 Map（如 UTSJSONObject as Map 会 CCE）
+  }
+
+  // 2) UTSJSONObject bracket
+  try {
+    const o = raw as UTSJSONObject;
+    if (o != null) {
+      const fromBracket = o[key];
+      if (fromBracket != null) {
+        return fromBracket;
+      }
+    }
+  } catch (_eObj) {
+    // ignore
+  }
+
+  // 3) MessageInfoClass（Android 模板 v-for 项；Map/JSONObject 均读不到 text）
+  return readMessageInfoField(raw, key);
+}
+
+/**
+ * 将 API 消息项规范为可 bracket 读取的 UTSJSONObject。
+ */
+export function normalizeMessageRawToJson(raw: any | null): UTSJSONObject | null {
+  if (raw == null) {
+    return null;
+  }
+
+  // 1) Map：先按已知键 get；再 forEach（兼容 JS (value,key) / Kotlin (key,value)）
+  try {
+    const m = raw as Map<string, any | null>;
+    if (m != null) {
+      const out = new UTSJSONObject();
+      let count = 0;
+      for (let i = 0; i < MESSAGE_FIELD_KEYS.length; i++) {
+        const key = MESSAGE_FIELD_KEYS[i];
+        if (m.has(key) == true) {
+          out[key] = m.get(key);
+          count++;
+        } else {
+          const v = m.get(key);
+          if (v != null) {
+            out[key] = v;
+            count++;
+          }
+        }
+      }
+      if (count > 0) {
+        return out;
+      }
+      // get/has 未命中时用 forEach；用「参数是否为已知字段名」判断顺序
+      m.forEach((a: any | null, b: any | null) => {
+        const aStr = a != null ? `${a}` : "";
+        const bStr = b != null ? `${b}` : "";
+        let fieldKey: string | null = null;
+        let fieldVal: any | null = null;
+        if (isMessageFieldKey(bStr)) {
+          // JS 约定：(value, key)
+          fieldKey = bStr;
+          fieldVal = a;
+        } else if (isMessageFieldKey(aStr)) {
+          // Kotlin 常见：(key, value)
+          fieldKey = aStr;
+          fieldVal = b;
+        }
+        if (fieldKey != null) {
+          out[fieldKey] = fieldVal;
+          count++;
+        }
+      });
+      if (count > 0) {
+        return out;
+      }
+    }
+  } catch (_eMap) {
+    // 非 Map
+  }
+
+  // 2) 已是 UTSJSONObject：必须能读到业务字段，否则当作无效（避免空壳 MessageInfo）
+  try {
+    const o = raw as UTSJSONObject;
+    const hasId = o["id"] != null;
+    const hasText = o["text"] != null;
+    const hasRole = o["role"] != null;
+    if (hasId == true || hasText == true || hasRole == true) {
+      return o;
+    }
+  } catch (_eObj) {
+    // 非 UTSJSONObject
+  }
+
+  // 3) JSON 往返（仅非空对象；Map 通常走不到或 stringify 为 "{}"）
+  try {
+    const jsonStr = JSON.stringify(raw);
+    if (jsonStr != null && jsonStr.length > 2 && jsonStr != "null" && jsonStr != "{}") {
+      const parsed = JSON.parse(jsonStr) as UTSJSONObject | null;
+      if (parsed != null) {
+        return parsed;
+      }
+    }
+  } catch (_eJson) {
+    // ignore
+  }
+
+  return null;
+}
+
+function parseAssistantRole(val: any | null): AssistantRoleEnum {
+  if (val == null) return AssistantRoleEnum.USER;
+  // Android 枚举 / 嵌套可能是 { value: "USER" }
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseAssistantRole(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
+  const s = `${val}`;
+  if (s == "ASSISTANT") return AssistantRoleEnum.ASSISTANT;
+  if (s == "SYSTEM") return AssistantRoleEnum.SYSTEM;
+  if (s == "FUNCTION") return AssistantRoleEnum.FUNCTION;
+  return AssistantRoleEnum.USER;
+}
+
+function parseMessageMode(val: any | null): MessageModeEnum | null {
+  if (val == null) return null;
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseMessageMode(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
+  const s = `${val}`;
+  if (s == "CHAT") return MessageModeEnum.CHAT;
+  if (s == "THINK") return MessageModeEnum.THINK;
+  if (s == "GUID") return MessageModeEnum.GUID;
+  if (s == "QUESTION") return MessageModeEnum.QUESTION;
+  if (s == "ANSWER") return MessageModeEnum.ANSWER;
+  return null;
+}
+
+function parseMessageType(val: any | null): MessageTypeEnum {
+  if (val == null) return MessageTypeEnum.USER;
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseMessageType(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
+  const s = `${val}`;
+  if (s == "ASSISTANT") return MessageTypeEnum.ASSISTANT;
+  if (s == "SYSTEM") return MessageTypeEnum.SYSTEM;
+  if (s == "TOOL") return MessageTypeEnum.TOOL;
+  return MessageTypeEnum.USER;
+}
+
+function parseMessageStatus(val: any | null): MessageStatusEnum | null {
+  if (val == null) return null;
+  try {
+    const nested = readRawField(val, "value");
+    if (nested != null) {
+      return parseMessageStatus(nested);
+    }
+  } catch (_e) {
+    // not object
+  }
+  const s = `${val}`;
+  if (s == "loading") return MessageStatusEnum.Loading;
+  if (s == "incomplete") return MessageStatusEnum.Incomplete;
+  if (s == "complete") return MessageStatusEnum.Complete;
+  if (s == "error") return MessageStatusEnum.Failed;
+  return null;
+}
+
+export class MessageInfoClass implements MessageInfo {
+  id: number | string = 0;
+  role: AssistantRoleEnum = AssistantRoleEnum.USER;
+  type: MessageModeEnum | null = null;
+  text: string | null = null;
+  think: string | null = null;
+  time: string = "";
+  attachments: AttachmentFile[] | null = null;
+  ext: MessageQuestionExtInfo[] | null = null;
+  finished: boolean | null = null;
+  metadata: any | null = null;
+  messageType: MessageTypeEnum = MessageTypeEnum.USER;
+  requestId: string | null = null;
+  index: number | null = null;
+  status: MessageStatusEnum | null = null;
+  finalResult: ConversationFinalResult | null = null;
+  processingList: ProcessingInfo[] | null = null;
+  markdownElList: markdownElItem[] | null = null;
+  componentExecutedList: any | null = null;
+  mcpAskInteractions: any | null = null;
+  acpPermissionInteractions: any | null = null;
+  /** 可播报纯文本缓存（见 MessageInfo.speakableText） */
+  speakableText: string | null = null;
+
+  /**
+   * @param raw Map / UTSJSONObject / 已规范化对象；禁止依赖 as UTSJSONObject 后才可读
+   */
+  constructor(raw: any | null) {
+    if (raw == null) return;
+
+    const idRaw = readRawField(raw, "id");
+    this.id = idRaw != null ? `${idRaw}` : 0;
+    this.role = parseAssistantRole(readRawField(raw, "role"));
+    this.type = parseMessageMode(readRawField(raw, "type"));
+    const textRaw = readRawField(raw, "text");
+    this.text = textRaw != null ? `${textRaw}` : null;
+    const thinkRaw = readRawField(raw, "think");
+    this.think = thinkRaw != null ? `${thinkRaw}` : null;
+    const timeRaw = readRawField(raw, "time");
+    this.time = timeRaw != null ? `${timeRaw}` : "";
+    const attachmentsRaw = readRawField(raw, "attachments");
+    this.attachments =
+      attachmentsRaw != null ? (attachmentsRaw as AttachmentFile[]) : null;
+    const extRaw = readRawField(raw, "ext");
+    this.ext = extRaw != null ? (extRaw as MessageQuestionExtInfo[]) : null;
+    const finishedRaw = readRawField(raw, "finished");
+    this.finished = finishedRaw == true ? true : finishedRaw == false ? false : null;
+    this.metadata = readRawField(raw, "metadata");
+    // 历史接口常只回 role / senderType，不回 messageType；缺省时按 role 推导，
+    // 避免 ASSISTANT 被 parseMessageType(null) 落成 USER。
+    const messageTypeRaw = readRawField(raw, "messageType");
+    if (messageTypeRaw != null) {
+      this.messageType = parseMessageType(messageTypeRaw);
+    } else {
+      const senderTypeRaw = readRawField(raw, "senderType");
+      if (senderTypeRaw != null) {
+        this.messageType = parseMessageType(senderTypeRaw);
+      } else if (this.role == AssistantRoleEnum.ASSISTANT) {
+        this.messageType = MessageTypeEnum.ASSISTANT;
+      } else if (this.role == AssistantRoleEnum.SYSTEM) {
+        this.messageType = MessageTypeEnum.SYSTEM;
+      } else if (this.role == AssistantRoleEnum.FUNCTION) {
+        this.messageType = MessageTypeEnum.TOOL;
+      } else {
+        this.messageType = MessageTypeEnum.USER;
+      }
+    }
+    const requestIdRaw = readRawField(raw, "requestId");
+    this.requestId = requestIdRaw != null ? `${requestIdRaw}` : null;
+    const indexRaw = readRawField(raw, "index");
+    if (indexRaw != null) {
+      const idx = parseFloat(`${indexRaw}`);
+      this.index = idx != idx ? null : idx;
+    } else {
+      this.index = null;
+    }
+    this.status = parseMessageStatus(readRawField(raw, "status"));
+    const finalResultRaw = readRawField(raw, "finalResult");
+    this.finalResult =
+      finalResultRaw != null ? (finalResultRaw as ConversationFinalResult) : null;
+    const processingListRaw = readRawField(raw, "processingList");
+    this.processingList =
+      processingListRaw != null ? (processingListRaw as ProcessingInfo[]) : null;
+    const markdownElListRaw = readRawField(raw, "markdownElList");
+    this.markdownElList =
+      markdownElListRaw != null ? (markdownElListRaw as markdownElItem[]) : null;
+    this.componentExecutedList = readRawField(raw, "componentExecutedList");
+    this.mcpAskInteractions = readRawField(raw, "mcpAskInteractions");
+    this.acpPermissionInteractions = readRawField(raw, "acpPermissionInteractions");
+    const speakableTextRaw = readRawField(raw, "speakableText");
+    this.speakableText =
+      speakableTextRaw != null ? `${speakableTextRaw}` : null;
+  }
+}
+
+/** 枚举 → 业务字符串（兼容 Android { value: "USER" }） */
+function enumToBizString(val: any | null): string | null {
+  if (val == null) {
+    return null;
+  }
+  const nested = readRawField(val, "value");
+  if (nested != null) {
+    return `${nested}`;
+  }
+  return `${val}`;
+}
+
+export function messageToJsonObject(message: MessageInfo): UTSJSONObject {
+  // 手写字段，避免 Android 上 JSON.stringify(class/enum) 丢字段或变成 {value}
+  const out = new UTSJSONObject();
+  if (message == null) {
+    return out;
+  }
+  out["id"] = message.id;
+  out["role"] = enumToBizString(message.role);
+  out["type"] = enumToBizString(message.type);
+  out["text"] = message.text;
+  out["think"] = message.think;
+  out["time"] = message.time;
+  out["attachments"] = message.attachments;
+  out["ext"] = message.ext;
+  out["finished"] = message.finished;
+  out["metadata"] = message.metadata;
+  out["messageType"] = enumToBizString(message.messageType);
+  out["requestId"] = message.requestId;
+  out["index"] = message.index;
+  out["status"] = enumToBizString(message.status);
+  out["finalResult"] = message.finalResult;
+  out["processingList"] = message.processingList;
+  out["markdownElList"] = message.markdownElList;
+  out["componentExecutedList"] = message.componentExecutedList;
+  out["mcpAskInteractions"] = message.mcpAskInteractions;
+  out["acpPermissionInteractions"] = message.acpPermissionInteractions;
+  out["speakableText"] = message.speakableText;
+  return out;
+}
+
+export function createMessageInfoFromRaw(raw: UTSJSONObject): MessageInfo {
+  return new MessageInfoClass(raw);
+}
+
+/** 从任意 API 项构造 MessageInfo（兼容 Map / UTSJSONObject） */
+export function createMessageInfoFromAny(raw: any | null): MessageInfo | null {
+  if (raw == null) {
+    return null;
+  }
+  // 直接用 readRawField 构造（Map.get / UTSJSONObject）
+  const probeId = readRawField(raw, "id");
+  const probeText = readRawField(raw, "text");
+  const probeRole = readRawField(raw, "role");
+  if (probeId != null || probeText != null || probeRole != null) {
+    return new MessageInfoClass(raw);
+  }
+  // 读不到业务字段：再 normalize；仍无则返回 null（禁止推空壳进列表）
+  const obj = normalizeMessageRawToJson(raw);
+  if (obj == null) {
+    return null;
+  }
+  const id2 = obj["id"];
+  const text2 = obj["text"];
+  const role2 = obj["role"];
+  if (id2 == null && text2 == null && role2 == null) {
+    return null;
+  }
+  return new MessageInfoClass(obj);
+}
+
+export function cloneMessageInfo(message: MessageInfo): MessageInfo {
+  return createMessageInfoFromRaw(messageToJsonObject(message));
+}

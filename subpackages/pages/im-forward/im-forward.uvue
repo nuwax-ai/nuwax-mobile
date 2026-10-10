@@ -1,0 +1,893 @@
+<template>
+  <view class="fw-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 转发标题 -->
+    <view class="fw-header">
+      <view class="fw-header__btn" hover-class="fw-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="fw-header__title-wrap">
+        <text class="fw-header__title">{{ t("Mobile.Message.forwardPageTitle") }}</text>
+      </view>
+      <view class="fw-header__btn fw-header__btn--ghost" />
+    </view>
+
+    <!-- 转发上下文条：逐条/合并 + 已选消息数（进入页即固定，发送前可核对自己在转什么） -->
+    <view v-if="contextModeText.length > 0" class="fw-context">
+      <text class="fw-context__mode">{{ contextModeText }}</text>
+      <text class="fw-context__count">{{ contextCountText }}</text>
+    </view>
+
+    <!-- 搜索框：300ms 去抖，同时搜联系人（人）与会话（群/单聊） -->
+    <view class="fw-search">
+      <view class="fw-search__box">
+        <svg-icon name="icon-Search" size="32" color="#9a98a5" />
+        <input
+          class="fw-search__input"
+          v-model="keyword"
+          :placeholder="t('Mobile.Message.forwardSearchPlaceholder')"
+          :placeholder-style="'color: #9a98a5'"
+          confirm-type="search"
+        />
+        <view v-if="keyword.length > 0" class="fw-search__clear" hover-class="fw-search__clear--active" @click="clearKeyword">
+          <svg-icon name="icon-X" size="24" color="#9a98a5" />
+        </view>
+      </view>
+    </view>
+
+    <!-- 目标列表：空关键词=最近对话；搜索=联系人+会话合并（联系人优先）；行点击即选中 -->
+    <scroll-view class="fw-body" direction="vertical" :show-scrollbar="false">
+      <view class="fw-list">
+        <view v-if="searching" class="fw-state">
+          <text class="fw-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+        <template v-else>
+          <view v-if="keyword.length == 0" class="fw-section">
+            <text class="fw-section__text">{{ t("Mobile.Message.forwardRecent") }}</text>
+          </view>
+          <view
+            v-for="row in rows"
+            :key="row.key"
+            class="fw-row"
+            hover-class="fw-row--active"
+            @click="toggleRow(row)"
+          >
+            <view
+              v-if="row.avatar.length > 0 && row.avatarFailed != true"
+              class="fw-ava fw-ava--clip"
+            >
+              <image
+                class="fw-ava__img"
+                :src="row.avatar"
+                mode="aspectFill"
+                @error="handleAvatarError(row)"
+              />
+            </view>
+            <view v-else class="fw-ava" :style="{ backgroundImage: avatarGradient(row.name) }">
+              <text class="fw-ava__letter">{{ avatarLetter(row.name) }}</text>
+            </view>
+            <view class="fw-row__main">
+              <text class="fw-row__name text-ellipsis">{{ row.name }}</text>
+              <text v-if="row.sub.length > 0" class="fw-row__sub text-ellipsis">{{ row.sub }}</text>
+            </view>
+            <view class="fw-check" :class="isSelected(row) ? 'fw-check--on' : ''">
+              <svg-icon v-if="isSelected(row)" name="icon-Check" size="28" color="#ffffff" />
+            </view>
+          </view>
+          <view v-if="rows.length == 0" class="fw-state">
+            <text class="fw-state__text">{{
+              loadFailed ? t("Mobile.Message.loadFailed") : t("Mobile.Message.forwardSearchEmpty")
+            }}</text>
+          </view>
+        </template>
+        <view class="fw-tail" />
+      </view>
+    </scroll-view>
+
+    <!-- 底部：发送（选中数随点选即时更新；发送中防连点） -->
+    <view class="fw-footer" :style="{ paddingBottom: footerBottomPx + 'px' }">
+      <view
+        class="fw-send"
+        :class="selectedKeys.length > 0 && sending != true ? '' : 'fw-send--disabled'"
+        hover-class="fw-send--active"
+        @click="handleSubmit"
+      >
+        <text class="fw-send__text">{{
+          sending ? t("Mobile.Page.loadingMore") : t("Mobile.Message.forwardSend") + "(" + selectedKeys.length + ")"
+        }}</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { switchMainTab } from "@/utils/mainTabNavigation";
+
+  import { computed, ref, watch } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { imAvatarDisplayUrl, resolveImAvatarDisplay } from "@/utils/imAvatarDisplay";
+  import {
+    apiImConversations,
+    apiImCreateP2pConversation,
+    apiImForwardMsg,
+    apiImSearchContacts,
+    apiImSearchConversations,
+    apiImSendMergeForwardMsg,
+  } from "@/servers/im";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { generateUUID } from "@/utils/common";
+  import { ImForwardItem, ImForwardSession, takeImForwardSession } from "@/utils/im/imForwardSession";
+  import { getSafeAreaBottom } from "@/utils/system";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  const tCount = (key: string, count: number): string => {
+    const m = new Map<string, string | number>();
+    m.set("count", count);
+    return translateFn(key, toI18nParams(m), "");
+  };
+
+  /** 头像字母底色渐变板（与聊天页 AVATAR_GRADIENTS 同款五色系）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  /**
+   * 一个可转发目标（两种形态，对齐 PC ForwardModal）：
+   * - conv：已有会话（最近对话/会话搜索命中），提交时直接用 convId
+   * - user：搜索命中的联系人（可能带 p2pConvId），提交时才 createP2p（幂等 get-or-create）
+   * key 去重：c:{convId} / u:{userId}——user 带 p2pConvId 时升格为 conv 形态按会话去重。
+   */
+  class FwTarget {
+    kind: string = "conv";
+    key: string = "";
+    convId: string = "";
+    userId: string = "";
+    name: string = "";
+    sub: string = "";
+    avatarRaw: string = "";
+    avatar: string = "";
+    avatarFailed: boolean = false;
+  }
+
+  // ===== 转发载荷（chat.uvue 经 imForwardSession 暂存带入；空=异常进入，只读不可发） =====
+  const session = ref<ImForwardSession | null>(null);
+
+  /** 上下文条文案（computed：模板里 v-if 判空后直接取 session 字段在 Android 不保窄化）。 */
+  const contextModeText = computed((): string => {
+    const s = session.value;
+    if (s == null) {
+      return "";
+    }
+    return s.mode == "merge" ? t("Mobile.Message.multiMergeForward") : t("Mobile.Message.multiOneByOneForward");
+  });
+
+  const contextCountText = computed((): string => {
+    const s = session.value;
+    if (s == null) {
+      return "";
+    }
+    return tCount("Mobile.Message.multiSelectedCount", s.items.length);
+  });
+
+  // ===== 列表状态 =====
+  const keyword = ref<string>("");
+  const rows = ref<FwTarget[]>([]);
+  const searching = ref<boolean>(false);
+  const loadFailed = ref<boolean>(false);
+  const selectedKeys = ref<string[]>([]);
+  const sending = ref<boolean>(false);
+  /** 搜索去抖定时器（0=无待执行）。 */
+  let searchTimer = 0;
+  /** 搜索序号（每次发起自增）：迟到的旧结果按序号作废，防串写新搜索状态（im-search 同款）。 */
+  let searchSeq = 0;
+
+  const footerBottomPx = ref<number>(6 + getSafeAreaBottom());
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  // ===== 头像（名字首字母 + 哈希渐变底，与聊天页/pin 页同款） =====
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function handleAvatarError(row: FwTarget): void {
+    row.avatarFailed = true;
+  }
+
+  // ===== 目标行构建 =====
+
+  /** 批量解析头像展示地址（/api/f/ 受保护与远程 SVG；H5 裸连 <img> 会被 ORB 拦）。
+   * ★须在 rows.value 赋值后调、行取自 ref 数组（响应式代理实例），异步写回才会触发
+   * 渲染刷新——建行期 new 出的裸实例上写回不刷新（message.uvue resolveConvRowsIcons 同款）。 */
+  function resolveRowAvatars(): void {
+    const live = rows.value;
+    for (let i = 0; i < live.length; i++) {
+      const row = live[i];
+      const raw = row.avatarRaw;
+      if (raw.length == 0 || row.avatar.length > 0) {
+        continue;
+      }
+      resolveImAvatarDisplay(raw, 72).then((resolved: string) => {
+        if (resolved != raw && resolved != row.avatar) {
+          row.avatar = resolved;
+          row.avatarFailed = false; // 首帧失败可能已标死字母兜底，解析成功救回
+        }
+      });
+    }
+  }
+
+  /** 会话行（最近对话 + 会话搜索共用）：显示名 name > peerName。
+   *  ★不过滤 status：那是 /conversations 列表接口的字段，搜索接口契约里没有
+   *  （ConversationSearchItem 不含 status），拿列表语义误杀搜索结果会表现为
+   *  「接口有数据页面却空」；解散群选了发送也会被服务端拒绝，无需前端拦。 */
+  function convRowOf(obj: UTSJSONObject): FwTarget | null {
+    const convId = readString(obj, "convId");
+    if (convId.length == 0) {
+      return null;
+    }
+    const row = new FwTarget();
+    row.kind = "conv";
+    row.key = `c:${convId}`;
+    row.convId = convId;
+    const name = readString(obj, "name");
+    const peerName = readString(obj, "peerName");
+    row.name = name.length > 0 ? name : peerName;
+    row.avatarRaw = readString(obj, "avatar").length > 0 ? readString(obj, "avatar") : readString(obj, "peerAvatar");
+    row.avatar = imAvatarDisplayUrl(row.avatarRaw, 72);
+    return row;
+  }
+
+  /** 联系人行：显示名 nickName > userName（ContactSearchItem 无 displayName）；带
+   *  p2pConvId 时升格 conv 形态（去重按既有会话走，提交也不必再 createP2p）。 */
+  function contactRowOf(obj: UTSJSONObject): FwTarget | null {
+    const userId = readString(obj, "userId");
+    if (userId.length == 0) {
+      return null;
+    }
+    const p2pConvId = readString(obj, "p2pConvId");
+    const row = new FwTarget();
+    const nickName = readString(obj, "nickName");
+    const userName = readString(obj, "userName");
+    row.name = nickName.length > 0 ? nickName : userName;
+    row.avatarRaw = readString(obj, "avatar");
+    row.avatar = imAvatarDisplayUrl(row.avatarRaw, 72);
+    if (p2pConvId.length > 0) {
+      row.kind = "conv";
+      row.key = `c:${p2pConvId}`;
+      row.convId = p2pConvId;
+    } else {
+      row.kind = "user";
+      row.key = `u:${userId}`;
+      row.userId = userId;
+    }
+    return row;
+  }
+
+  /** 按 key 去重合并（contacts 在前 conversations 在后；重复 key 保留先到者）。 */
+  function mergeRows(primary: FwTarget[], secondary: FwTarget[]): FwTarget[] {
+    const out: FwTarget[] = [];
+    const seen: string[] = [];
+    const push = (row: FwTarget): void => {
+      if (row.name.length == 0 || seen.indexOf(row.key) >= 0) {
+        return;
+      }
+      seen.push(row.key);
+      out.push(row);
+    };
+    for (let i = 0; i < primary.length; i++) {
+      push(primary[i]);
+    }
+    for (let i = 0; i < secondary.length; i++) {
+      push(secondary[i]);
+    }
+    return out;
+  }
+
+  /** 从响应 data 取条目数组：search 系接口实测 data 为裸数组（2026-09-29 真机抓包，
+   *  无 records/items 包装；services 契约注释按包装写的是错的）——两种形状都收。 */
+  function itemsOf(dataRaw: any | null, key: string): UTSJSONObject[] | null {
+    if (Array.isArray(dataRaw)) {
+      return dataRaw as UTSJSONObject[];
+    }
+    if (dataRaw instanceof UTSJSONObject) {
+      const raw = (dataRaw as UTSJSONObject)[key];
+      return raw != null ? (raw as UTSJSONObject[]) : null;
+    }
+    return null;
+  }
+
+  // ===== 数据加载 =====
+
+  /** 最近对话（首屏；空关键词时列表数据源）。 */
+  async function loadRecent(): Promise<void> {
+    searchSeq++;
+    searching.value = true;
+    loadFailed.value = false;
+    try {
+      const res = await apiImConversations("", 50);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        searching.value = false;
+        loadFailed.value = true;
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      const recordsRaw = dataObj == null ? null : dataObj["records"];
+      const arr = recordsRaw != null ? (recordsRaw as UTSJSONObject[]) : null;
+      const out: FwTarget[] = [];
+      if (arr != null) {
+        for (let i = 0; i < arr.length; i++) {
+          const row = convRowOf(arr[i]);
+          if (row != null) {
+            out.push(row);
+          }
+        }
+      }
+      rows.value = out;
+      resolveRowAvatars();
+      searching.value = false;
+    } catch (_error) {
+      searching.value = false;
+      loadFailed.value = true;
+    }
+  }
+
+  /** 搜索（联系人 + 会话并行，两者独立成败：一侧挂了另一侧结果照常出）。 */
+  async function runSearch(kw: string): Promise<void> {
+    searchSeq++;
+    const seq = searchSeq;
+    searching.value = true;
+    loadFailed.value = false;
+    const contacts: FwTarget[] = [];
+    const convs: FwTarget[] = [];
+    let anyOk = false;
+    try {
+      const cRes = await apiImSearchContacts(kw, 20);
+      const code = apiResCode(cRes);
+      if (code == SUCCESS_CODE) {
+        anyOk = true;
+        const arr = itemsOf(apiResData<any>(cRes), "items");
+        if (arr != null) {
+          for (let i = 0; i < arr.length; i++) {
+            const row = contactRowOf(arr[i]);
+            if (row != null) {
+              contacts.push(row);
+            }
+          }
+        }
+      }
+    } catch (_error) {
+      // 单侧失败不阻断另一侧
+    }
+    try {
+      const vRes = await apiImSearchConversations(kw, 20);
+      const code = apiResCode(vRes);
+      if (code == SUCCESS_CODE) {
+        anyOk = true;
+        const arr = itemsOf(apiResData<any>(vRes), "records");
+        if (arr != null) {
+          for (let i = 0; i < arr.length; i++) {
+            const row = convRowOf(arr[i]);
+            if (row != null) {
+              convs.push(row);
+            }
+          }
+        }
+      }
+    } catch (_error) {
+      // 单侧失败不阻断另一侧
+    }
+    // 仅当前关键词和请求序号匹配时写入，避免过期结果覆盖新搜索。
+    if (seq == searchSeq && kw == keyword.value.trim()) {
+      rows.value = mergeRows(contacts, convs);
+      resolveRowAvatars();
+      searching.value = false;
+      loadFailed.value = anyOk != true;
+    }
+  }
+
+  watch(keyword, (val: string, _old: string) => {
+    if (searchTimer != 0) {
+      clearTimeout(searchTimer);
+      searchTimer = 0;
+    }
+    const kw = val.trim();
+    if (kw.length == 0) {
+      loadRecent();
+      return;
+    }
+    searchTimer = setTimeout(() => {
+      searchTimer = 0;
+      runSearch(kw);
+    }, 300);
+  });
+
+  function clearKeyword(): void {
+    keyword.value = "";
+  }
+
+  // ===== 选中 =====
+
+  function isSelected(row: FwTarget): boolean {
+    return selectedKeys.value.indexOf(row.key) >= 0;
+  }
+
+  function toggleRow(row: FwTarget): void {
+    const keys = selectedKeys.value;
+    const idx = keys.indexOf(row.key);
+    if (idx >= 0) {
+      keys.splice(idx, 1);
+      selectedKeys.value = keys;
+    } else {
+      keys.push(row.key);
+      selectedKeys.value = keys;
+    }
+  }
+
+  // ===== 发送 =====
+
+  /** merge 快照 items → JSON 数组字符串（契约见 servers/im.uts apiImSendMergeForwardMsg：
+   *  senderName/sendTime/msgType 必填，text ≤500 码点已截好，attachments 已滤空 url）。 */
+  function buildItemsJson(items: ImForwardItem[]): string {
+    let json = "[";
+    for (let i = 0; i < items.length; i++) {
+      if (i > 0) {
+        json += ",";
+      }
+      const it = items[i];
+      json += `{"senderName":${JSON.stringify(it.senderName)},"sendTime":${it.sendTime},"msgType":"${it.msgType}"`;
+      if (it.text.length > 0) {
+        json += `,"text":${JSON.stringify(it.text)}`;
+      }
+      if (it.attachmentsJson != "[]") {
+        json += `,"attachments":${it.attachmentsJson}`;
+      }
+      json += "}";
+    }
+    json += "]";
+    return json;
+  }
+
+  /** 当前列表里按 key 找行（user 形态提交时要 createP2p）。 */
+  function findRowByKey(key: string): FwTarget | null {
+    const all = rows.value;
+    for (let i = 0; i < all.length; i++) {
+      if (all[i].key == key) {
+        return all[i];
+      }
+    }
+    return null;
+  }
+
+  function handleBack(): void {
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      switchMainTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  /**
+   * 发送（PC 同款串行逐目标派发，避免并发触发 IM_20005 限流）：
+   * - user 形态目标先 createP2p（幂等）解析出 convId，任一失败即记 partialFail
+   * - single：逐条消息 × 逐目标 /forward（targetConvIds 单目标；接口本身支持 ≤9 批量，
+   *   单目标循环可完整读 failures，语义最简单）
+   * - merge：itemsJson 构建一次，逐目标发 merge_forward 消息（clientMsgId 幂等键）
+   * - 完成后 toast（全部成功/部分失败）并返回聊天页
+   */
+  async function handleSubmit(): Promise<void> {
+    const s = session.value;
+    if (s == null || sending.value || selectedKeys.value.length == 0) {
+      if (s != null && selectedKeys.value.length == 0) {
+        uni.showToast({ title: t("Mobile.Message.forwardNoTargets"), icon: "none" });
+      }
+      return;
+    }
+    sending.value = true;
+    // 1) 目标解析：user 形态 lazy createP2p
+    const targetConvIds: string[] = [];
+    let resolveFailed = false;
+    const keys = selectedKeys.value;
+    for (let i = 0; i < keys.length; i++) {
+      const row = findRowByKey(keys[i]);
+      if (row == null) {
+        continue;
+      }
+      if (row.kind == "conv" && row.convId.length > 0) {
+        targetConvIds.push(row.convId);
+        continue;
+      }
+      try {
+        const res = await apiImCreateP2pConversation(row.userId);
+        if (apiResCode(res) == SUCCESS_CODE) {
+          const dataRaw = apiResData<any>(res);
+          const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+          const convId = dataObj == null ? "" : readString(dataObj, "convId");
+          if (convId.length > 0) {
+            targetConvIds.push(convId);
+            continue;
+          }
+        }
+      } catch (_error) {
+        // 落到下方统一记失败
+      }
+      resolveFailed = true;
+    }
+    if (targetConvIds.length == 0) {
+      sending.value = false;
+      uni.showToast({ title: t("Mobile.Message.forwardPartialFail"), icon: "none" });
+      return;
+    }
+    // 2) 派发
+    let anyFail = resolveFailed;
+    if (s.mode == "merge") {
+      const itemsJson = buildItemsJson(s.items);
+      for (let i = 0; i < targetConvIds.length; i++) {
+        try {
+          const res = await apiImSendMergeForwardMsg(targetConvIds[i], "", itemsJson, generateUUID());
+          if (apiResCode(res) != SUCCESS_CODE) {
+            anyFail = true;
+          }
+        } catch (_error) {
+          anyFail = true;
+        }
+      }
+    } else {
+      for (let m = 0; m < s.items.length; m++) {
+        const msgId = s.items[m].msgId;
+        for (let i = 0; i < targetConvIds.length; i++) {
+          try {
+            const res = await apiImForwardMsg(s.sourceConvId, msgId, [targetConvIds[i]]);
+            if (apiResCode(res) != SUCCESS_CODE) {
+              anyFail = true;
+              continue;
+            }
+            // 部分成功语义：读 failures（单目标时 failures 非空即该目标失败）
+            const dataRaw = apiResData<any>(res);
+            const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+            const failuresRaw = dataObj == null ? null : dataObj["failures"];
+            if (failuresRaw != null && (failuresRaw as any[]).length > 0) {
+              anyFail = true;
+            }
+          } catch (_error) {
+            anyFail = true;
+          }
+        }
+      }
+    }
+    sending.value = false;
+    uni.showToast({ title: anyFail ? t("Mobile.Message.forwardPartialFail") : t("Mobile.Message.forwardDone"), icon: "none" });
+    setTimeout(() => {
+      handleBack();
+    }, 400);
+  }
+
+  onLoad((_options: any) => {
+    // 转发载荷一次性取走（取出即清：返回重进不会拿到上一次的旧载荷）
+    session.value = takeImForwardSession();
+    loadRecent();
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架 ===== */
+  .fw-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-color: #f6f5fb;
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .fw-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(0, 0, 0, 0);
+    border-bottom: 2rpx solid #e5e6eb;
+  }
+
+  .fw-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .fw-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .fw-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .fw-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .fw-header__title {
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  /* 转发上下文条：模式 + 消息数 */
+  .fw-context {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16rpx 32rpx;
+  }
+
+  .fw-context__mode {
+    font-size: 26rpx;
+    line-height: 36rpx;
+    color: #5147ff;
+    font-weight: 600;
+  }
+
+  .fw-context__count {
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #9a98a5;
+  }
+
+  /* 搜索框 */
+  .fw-search {
+    flex-shrink: 0;
+    padding: 8rpx 32rpx 20rpx;
+  }
+
+  .fw-search__box {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 76rpx;
+    padding: 0 24rpx;
+    border-radius: 38rpx;
+    background-color: #ffffff;
+  }
+
+  .fw-search__input {
+    flex: 1;
+    min-width: 0;
+    height: 76rpx;
+    margin-left: 14rpx;
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #1c1b20;
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .fw-search__clear {
+    width: 48rpx;
+    height: 48rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .fw-search__clear--active {
+    background-color: #f0eff7;
+  }
+
+  .fw-body {
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* 内层容器承担左右留白（iOS scroll-view 水平 padding 不参与子元素宽度计算） */
+  .fw-list {
+    padding: 0 32rpx;
+  }
+
+  .fw-section {
+    padding: 20rpx 8rpx 8rpx;
+  }
+
+  .fw-section__text {
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #9a98a5;
+  }
+
+  .fw-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 18rpx 20rpx;
+    margin-bottom: 4rpx;
+    border-radius: 20rpx;
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .fw-row--active {
+    background-color: #eeedff;
+  }
+
+  .fw-ava {
+    width: 80rpx;
+    height: 80rpx;
+    border-radius: 40rpx;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* 真图裁切：App <image> 自身 border-radius 对解析后的 temp/SVG 渲染路径不生效
+     （消息页 chat-item__avatar-clip 同款 overflow 兜底），与消息列表裁圆一致 */
+  .fw-ava--clip {
+    overflow: hidden;
+  }
+
+  .fw-ava__img {
+    width: 100%;
+    height: 100%;
+  }
+
+  .fw-ava__letter {
+    font-size: 32rpx;
+    line-height: 42rpx;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .fw-row__main {
+    flex: 1;
+    min-width: 0;
+    margin-left: 20rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .fw-row__name {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #22212a;
+  }
+
+  .fw-row__sub {
+    margin-top: 2rpx;
+    font-size: 22rpx;
+    line-height: 30rpx;
+    color: #9a98a5;
+  }
+
+  .fw-check {
+    width: 44rpx;
+    height: 44rpx;
+    border-radius: 22rpx;
+    border-width: 3rpx;
+    border-style: solid;
+    border-color: #c9c7d6;
+    background-color: rgba(0, 0, 0, 0);
+    flex-shrink: 0;
+    margin-left: 16rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .fw-check--on {
+    border-color: #5147ff;
+    background-color: #5147ff;
+  }
+
+  .fw-state {
+    padding: 160rpx 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .fw-state__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #9a98a5;
+  }
+
+  .fw-tail {
+    height: 40rpx;
+  }
+
+  /* 底部发送条 */
+  .fw-footer {
+    flex-shrink: 0;
+    padding: 16rpx 32rpx;
+    background-color: #f6f5fb;
+  }
+
+  .fw-send {
+    height: 88rpx;
+    border-radius: 44rpx;
+    background-color: #5147ff;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .fw-send--active {
+    opacity: 0.85;
+  }
+
+  .fw-send--disabled {
+    opacity: 0.4;
+  }
+
+  .fw-send__text {
+    font-size: 30rpx;
+    line-height: 42rpx;
+    font-weight: 600;
+    color: #ffffff;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f6f5fb;
+  }
+  /* #endif */
+</style>

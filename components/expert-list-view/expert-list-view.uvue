@@ -1,0 +1,461 @@
+<template>
+  <view class="expert-list-view">
+    <scroll-view
+      id="expert-list-scroll"
+      class="expert-list"
+      scroll-y="true"
+      :show-scrollbar="false"
+      :lower-threshold="80"
+      @scrolltolower="loadMore"
+    >
+      <view v-if="loading && items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.loading") }}</text>
+      </view>
+      <view v-else-if="items.length == 0" class="state-box">
+        <text class="state-text">{{ t("Mobile.Common.noData") }}</text>
+      </view>
+      <view v-else id="expert-list-content" class="expert-items" :class="{ 'expert-items--search': type == 'search' }">
+        <view
+          v-for="(item, index) in items"
+          :key="item.key"
+          class="expert-row"
+          :class="{
+            'expert-row--highlight': index == highlightIndex,
+            'expert-row--simple': variant == 'simple',
+            'expert-row--search': type == 'search',
+          }"
+          @click="handleItemSelect(item)"
+        >
+          <view class="expert-top">
+            <view class="expert-avatar" :class="{ 'expert-avatar--simple': variant == 'simple', 'expert-avatar--search': type == 'search' }">
+              <agent-icon
+                :icon="item.icon"
+                :alt="item.name"
+                :size="type == 'search' ? 72 : (variant == 'simple' ? 52 : 72)"
+                :margin-right="0"
+              />
+            </view>
+            <view class="expert-main">
+              <view class="expert-heading">
+                <view class="expert-title-line">
+                  <text v-if="item.paymentRequired" class="expert-tag" :class="item.subscribed ? 'expert-tag--active' : ''">{{ item.subscribed ? t("Mobile.AgentList.subscribedTag") : t("Mobile.MySubscriptions.subscribeNow") }}</text>
+                  <text class="expert-name">{{ item.name }}</text>
+                </view>
+                <text v-if="variant == 'default' && item.userCount > 0" class="expert-count">{{ item.userCount }} {{ t("Mobile.ExpertList.users") }}</text>
+              </view>
+              <text v-if="variant == 'simple' && item.description.length > 0" class="expert-description expert-description--simple">{{ item.description }}</text>
+            </view>
+            <view v-if="variant == 'default'" class="summon-button" @click.stop="handleItemSelect(item)">
+              <text class="summon-text">{{ t("Mobile.ExpertList.summon") }}</text>
+            </view>
+          </view>
+          <text v-if="variant == 'default' && item.description.length > 0" class="expert-description">{{ item.description }}</text>
+        </view>
+        <view v-if="loading" class="loading-more">
+          <text class="state-text">{{ t("Mobile.Page.loadingMore") }}</text>
+        </view>
+      </view>
+    </scroll-view>
+
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { getCurrentInstance, nextTick, onMounted, ref, watch } from "vue";
+  import AgentIcon from "@/components/agent-icon/agent-icon.uvue";
+  import { apiUserUsedAgentList, apiPublishedAgentInfo } from "@/servers/agentDev";
+  import { apiPublishedAgentList } from "@/servers/square";
+  import { apiSpaceList } from "@/servers/workspace";
+  import { ListParams } from "@/types/interfaces/common";
+  import { SquarePublishedListParams } from "@/types/interfaces/square";
+  import { ExpertListItem, type ExpertListSourceType, type ExpertListVariant } from "@/types/interfaces/expertList";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  const props = withDefaults(defineProps<{
+    type: ExpertListSourceType;
+    variant?: ExpertListVariant;
+    category?: string;
+    spaceId?: number;
+    spaceIds?: number[];
+    /** 搜索关键字（受控，300ms 防抖）：used/convenient 客户端过滤 name/description，广场走 kw 服务端过滤；空 = 不过滤 */
+    keyword?: string;
+    pageSize?: number;
+  }>(), {
+    type: "system",
+    variant: "default",
+    category: "",
+    spaceId: 0,
+    spaceIds: () => [] as number[],
+    keyword: "",
+    pageSize: 20,
+  });
+
+  const emit = defineEmits<{
+    (e: "select", item: UTSJSONObject): void;
+    (e: "payment-required", item: UTSJSONObject): void;
+    (e: "loaded", type: string, count: number): void;
+  }>();
+
+  const items = ref<ExpertListItem[]>([] as ExpertListItem[]);
+  const loading = ref<boolean>(false);
+  const hasMore = ref<boolean>(true);
+  const currentPage = ref<number>(0);
+  const componentInstance = getCurrentInstance();
+  let requestId: number = 0;
+  let subscriptionEnabled: boolean = true;
+  // keyword 防抖（对齐 PC 300ms）
+  const debouncedKeyword = ref<string>("");
+  let keywordTimer: number | null = null;
+
+  watch(
+    (): string => props.keyword,
+    (value: string): void => {
+      const pending = keywordTimer;
+      if (pending != null) clearTimeout(pending);
+      keywordTimer = setTimeout(() => { debouncedKeyword.value = value; }, 300);
+    },
+  );
+
+  /** used/convenient 的客户端过滤（对齐 PC：name/description 包含匹配） */
+  function matchesKeyword(item: ExpertListItem): boolean {
+    const kw = debouncedKeyword.value.trim().toLowerCase();
+    if (kw.length == 0) return true;
+    return item.name.toLowerCase().indexOf(kw) >= 0 || item.description.toLowerCase().indexOf(kw) >= 0;
+  }
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string): number {
+    const raw = obj[key];
+    if (raw == null) return 0;
+    const value = parseFloat(`${raw}`);
+    return isNaN(value) ? 0 : value;
+  }
+
+  function mapUsedItem(raw: UTSJSONObject): ExpertListItem {
+    const item = new ExpertListItem();
+    item.rawId = readNumber(raw, "id");
+    const agentId = readNumber(raw, "agentId");
+    item.targetId = agentId > 0 ? agentId : item.rawId;
+    item.key = `expert:used:${item.rawId}`;
+    item.name = readString(raw, "name");
+    item.description = readString(raw, "description");
+    item.icon = readString(raw, "icon");
+    item.usedTime = readString(raw, "modified");
+    item.paymentRequired = raw["paymentRequired"] == true;
+    item.subscribed = raw["subscribed"] == true;
+    return item;
+  }
+
+  function mapPublishedItem(raw: UTSJSONObject, source: string): ExpertListItem {
+    const item = new ExpertListItem();
+    item.rawId = readNumber(raw, "id");
+    item.targetId = readNumber(raw, "targetId");
+    item.key = `expert:${source}:${item.rawId}`;
+    item.name = readString(raw, "name");
+    item.description = readString(raw, "description");
+    item.icon = readString(raw, "icon");
+    item.paymentRequired = raw["paymentRequired"] == true;
+    item.subscribed = raw["subscribed"] == true;
+    const statisticsRaw = raw["statistics"];
+    if (statisticsRaw != null) {
+      item.userCount = readNumber(statisticsRaw as UTSJSONObject, "userCount");
+    }
+    return item;
+  }
+
+  async function fetchUsed(limit: number): Promise<ExpertListItem[]> {
+    const params = new ListParams();
+    params.size = limit;
+    params.pageIndex = 1;
+    params.type = "Agent";
+    const res = await apiUserUsedAgentList(params);
+    if (apiResCode(res) != SUCCESS_CODE) throw new Error("used expert list failed");
+    const raw = apiResData<any>(res);
+    const rows = raw != null ? (raw as any[]) : ([] as any[]);
+    const result = [] as ExpertListItem[];
+    for (let i = 0; i < rows.length; i++) result.push(mapUsedItem(rows[i] as UTSJSONObject));
+    return result;
+  }
+
+  async function resolveTeamSpaceIds(): Promise<number[]> {
+    if (props.spaceId > 0) return [] as number[];
+    if (props.spaceIds.length > 0) return props.spaceIds;
+    const res = await apiSpaceList();
+    if (apiResCode(res) != SUCCESS_CODE) return [] as number[];
+    const raw = apiResData<any>(res);
+    const rows = raw != null ? (raw as any[]) : ([] as any[]);
+    const ids = [] as number[];
+    for (let i = 0; i < rows.length; i++) {
+      const id = readNumber(rows[i] as UTSJSONObject, "id");
+      if (id > 0) ids.push(id);
+    }
+    return ids;
+  }
+
+  async function fetchPublished(source: string, page: number, pageSize: number, teamSpaceIds: number[]): Promise<UTSJSONObject> {
+    const params = new SquarePublishedListParams();
+    params.targetType = "Agent";
+    params.targetSubType = "ChatBot";
+    params.page = page;
+    params.pageSize = pageSize;
+    if (source == "system" || source == "convenient") {
+      params.category = props.category;
+      params.official = true;
+      // 广场侧服务端过滤（对齐 PC buildParams 的 kw）
+      const kw = debouncedKeyword.value.trim();
+      if (kw.length > 0) params.kw = kw;
+    } else if (source == "search") {
+      // 对齐 PC search：固定搜索空间哨兵，不继承广场或团队筛选。
+      params.spaceId = -1;
+      const kw = debouncedKeyword.value.trim();
+      if (kw.length > 0) params.kw = kw;
+    } else if (source == "team") {
+      params.category = "Agent";
+      params.justReturnSpaceData = true;
+      if (props.spaceId > 0) params.spaceId = props.spaceId;
+      else if (teamSpaceIds.length > 0) params.spaceIds = teamSpaceIds;
+    }
+    const res = await apiPublishedAgentList(params);
+    if (apiResCode(res) != SUCCESS_CODE) throw new Error("published expert list failed");
+    const data = apiResData<any>(res);
+    return data != null ? (data as UTSJSONObject) : new UTSJSONObject();
+  }
+
+  function pageItems(data: UTSJSONObject, source: string): ExpertListItem[] {
+    const recordsRaw = data["records"];
+    const rows = recordsRaw != null ? (recordsRaw as any[]) : ([] as any[]);
+    const result = [] as ExpertListItem[];
+    for (let i = 0; i < rows.length; i++) result.push(mapPublishedItem(rows[i] as UTSJSONObject, source));
+    return result;
+  }
+
+  function pageHasMore(data: UTSJSONObject, page: number): boolean {
+    const current = readNumber(data, "current");
+    const pages = readNumber(data, "pages");
+    const currentPage = current > 0 ? current : page;
+    const totalPages = pages > 0 ? pages : 1;
+    return currentPage < totalPages;
+  }
+
+  async function load(reset: boolean): Promise<void> {
+    if (loading.value == true && reset != true) return;
+    const id = requestId + 1;
+    requestId = id;
+    const page = reset ? 1 : currentPage.value + 1;
+    loading.value = true;
+    if (reset) {
+      items.value = [] as ExpertListItem[];
+      hasMore.value = true;
+    }
+    try {
+      let next = [] as ExpertListItem[];
+      let more = false;
+      if (props.type == "used") {
+        const used = await fetchUsed(props.pageSize);
+        for (let i = 0; i < used.length; i++) {
+          if (matchesKeyword(used[i])) next.push(used[i]);
+        }
+      } else if (props.type == "convenient") {
+        const used = await fetchUsed(100);
+        const published = await fetchPublished("convenient", 1, 100, [] as number[]);
+        const square = pageItems(published, "convenient");
+        const seen = new Map<number, boolean>();
+        for (let i = 0; i < used.length; i++) {
+          if (matchesKeyword(used[i]) != true) continue;
+          next.push(used[i]);
+          if (used[i].targetId > 0) seen.set(used[i].targetId, true);
+        }
+        for (let j = 0; j < square.length; j++) {
+          if (square[j].targetId <= 0 || seen.get(square[j].targetId) != true) next.push(square[j]);
+        }
+      } else {
+        const source = `${props.type}`;
+        const spaces = source == "team" ? await resolveTeamSpaceIds() : ([] as number[]);
+        const data = await fetchPublished(source, page, props.pageSize, spaces);
+        next = pageItems(data, source);
+        more = pageHasMore(data, page);
+      }
+      if (id != requestId) return;
+      if (reset) items.value = next;
+      else items.value = [...items.value, ...next];
+      currentPage.value = page;
+      hasMore.value = more;
+      if (reset) emit("loaded", props.type, next.length);
+    } catch (_error) {
+      if (id == requestId) {
+        if (reset) items.value = [] as ExpertListItem[];
+        hasMore.value = false;
+        if (reset) emit("loaded", props.type, 0);
+      }
+    } finally {
+      if (id == requestId) {
+        loading.value = false;
+      }
+    }
+  }
+
+  function loadMore(): void {
+    if (hasMore.value == true && loading.value != true) load(false);
+  }
+
+  function fillViewportIfNeeded(): void {
+    if (loading.value == true || hasMore.value != true || items.value.length == 0) return;
+    if (componentInstance == null) return;
+    const proxy = componentInstance.proxy;
+    if (proxy == null) return;
+    nextTick(() => {
+      if (loading.value == true || hasMore.value != true) return;
+      uni.createSelectorQuery()
+        .in(proxy)
+        .select("#expert-list-scroll")
+        .boundingClientRect()
+        .select("#expert-list-content")
+        .boundingClientRect()
+        .exec((results: Array<any>) => {
+          if (loading.value == true || hasMore.value != true || results.length < 2) return;
+          const scrollRaw = results[0];
+          const contentRaw = results[1];
+          if (scrollRaw == null || contentRaw == null) return;
+          const scrollRect = scrollRaw as NodeInfo;
+          const contentRect = contentRaw as NodeInfo;
+          const viewportHeight = scrollRect.height != null ? parseFloat(`${scrollRect.height}`) : 0;
+          const contentHeight = contentRect.height != null ? parseFloat(`${contentRect.height}`) : 0;
+          if (viewportHeight > 0 && contentHeight <= viewportHeight + 1) loadMore();
+        });
+    });
+  }
+
+  watch(
+    (): string => `${items.value.length}|${loading.value}|${hasMore.value}`,
+    (): void => { fillViewportIfNeeded(); },
+  );
+
+  function toPayload(item: ExpertListItem): UTSJSONObject {
+    const payload = new UTSJSONObject();
+    payload["key"] = item.key;
+    payload["rawId"] = item.rawId;
+    payload["targetId"] = item.targetId;
+    payload["name"] = item.name;
+    payload["description"] = item.description;
+    payload["icon"] = item.icon;
+    payload["paymentRequired"] = item.paymentRequired;
+    payload["subscribed"] = item.subscribed;
+    payload["userCount"] = item.userCount;
+    payload["source"] = props.type;
+    return payload;
+  }
+
+  function emitSelection(item: ExpertListItem): void {
+    emit("select", toPayload(item));
+  }
+
+  async function handleItemSelect(item: ExpertListItem): Promise<void> {
+    if (subscriptionEnabled != true || item.paymentRequired != true || item.subscribed == true || item.targetId <= 0) {
+      emitSelection(item);
+      return;
+    }
+    try {
+      const res = await apiPublishedAgentInfo(item.targetId, false);
+      const detailRaw = apiResCode(res) == SUCCESS_CODE ? apiResData<any>(res) : null;
+      if (detailRaw != null) {
+        const detail = detailRaw as UTSJSONObject;
+        const stillPending = detail["paymentRequired"] == true && detail["subscribed"] != true;
+        if (stillPending != true) {
+          item.subscribed = detail["subscribed"] == true;
+          emitSelection(item);
+          return;
+        }
+      }
+    } catch (_error) {
+      // 详情复核失败仍进入订阅流程，禁止绕过付费门。
+    }
+    emit("payment-required", toPayload(item));
+  }
+
+  function loadTenantSubscriptionFlag(): void {
+    const raw = uni.getStorageSync(TENANT_CONFIG_INFO);
+    if (raw == null || `${raw}`.length == 0) return;
+    try {
+      const config = JSON.parse<UTSJSONObject>(`${raw}`);
+      if (config != null) subscriptionEnabled = config["enableSubscription"] != 0;
+    } catch (_error) {
+      subscriptionEnabled = true;
+    }
+  }
+
+  watch(
+    (): string => `${props.type}|${props.category}|${props.spaceId}|${JSON.stringify(props.spaceIds)}|${props.pageSize}|${debouncedKeyword.value}`,
+    (): void => { load(true); },
+  );
+
+  onMounted(() => {
+    loadTenantSubscriptionFlag();
+    load(true);
+  });
+
+  // ── 键盘导航（对齐 PC AtResourcePopup focusIndex）：高亮索引 + 选择桥 ──
+  const highlightIndex = ref<number>(-1);
+
+  function setHighlightIndex(payload: UTSJSONObject): void {
+    const raw = payload["index"];
+    highlightIndex.value = raw != null ? parseFloat(`${raw}`) : -1;
+  }
+
+  function getItemCount(): number {
+    return items.value.length;
+  }
+
+  function pickHighlight(): void {
+    const idx2 = highlightIndex.value;
+    if (idx2 < 0 || idx2 >= items.value.length) return;
+    const item = items.value[idx2];
+    if (item != null) handleItemSelect(item);
+  }
+
+  defineExpose({
+    setHighlightIndex: setHighlightIndex as any,
+    getItemCount: getItemCount as any,
+    pickHighlight: pickHighlight as any,
+  });
+</script>
+
+<style scoped lang="scss">
+  .expert-list-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .expert-list { flex: 1; height: 100%; min-height: 0; }
+  .expert-items { display: flex; flex-direction: column; padding: 0 28rpx 24rpx; }
+  .expert-items--search { padding: 12rpx 24rpx 24rpx; }
+  .expert-row--highlight { background-color: #f3f1ff; }
+  .expert-row { display: flex; flex-direction: column; min-height: 118rpx; padding: 22rpx 0; border-bottom: 2rpx solid #eeeef3; box-sizing: border-box; }
+  .expert-row--simple { min-height: 112rpx; padding: 12rpx 8rpx; border-bottom-width: 0; border-radius: 12rpx; }
+  .expert-row--search { min-height: 112rpx; padding: 14rpx 12rpx; border-bottom: 2rpx solid #f1f2f5; border-radius: 0; }
+  .expert-top { display: flex; flex-direction: row; align-items: flex-start; width: 100%; }
+  .expert-row--simple .expert-top { align-items: center; }
+  .expert-avatar { flex-shrink: 0; width: 72rpx; height: 72rpx; margin-right: 20rpx; border-radius: 999rpx; overflow: hidden; }
+  .expert-avatar--simple { width: 52rpx; height: 52rpx; margin-right: 16rpx; }
+  .expert-avatar--search { width: 72rpx; height: 72rpx; margin-right: 20rpx; }
+  .expert-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .expert-heading { display: flex; flex-direction: column; min-width: 0; }
+  .expert-title-line { display: flex; flex-direction: row; align-items: center; min-width: 0; }
+  .expert-name { flex: 1; min-width: 0; color: #202028; font-size: 29rpx; font-weight: 600; line-height: 40rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .expert-count { color: #9797a1; font-size: 23rpx; line-height: 32rpx; }
+  .expert-description { width: 100%; margin-top: 12rpx; color: #6f6f7b; font-size: 25rpx; line-height: 34rpx; lines: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .expert-description--simple { margin-top: 2rpx; color: #90909b; font-size: 23rpx; line-height: 32rpx; }
+  .expert-row--search .expert-name { color: #15171f; font-weight: 400; line-height: 42rpx; }
+  .expert-row--search .expert-description { margin-top: 4rpx; color: rgba(21, 23, 31, 0.45); }
+  .expert-tag { flex-shrink: 0; margin-right: 10rpx; padding: 3rpx 10rpx; border-radius: 8rpx; background-color: #fff3df; color: #d57a00; font-size: 20rpx; line-height: 26rpx; }
+  .expert-tag--active { background-color: #e9f8ef; color: #26985a; }
+  .summon-button { flex-shrink: 0; display: flex; align-items: center; justify-content: center; min-width: 96rpx; height: 58rpx; margin-left: 18rpx; padding: 0 18rpx; border-radius: 18rpx; background-color: #f3f1fa; box-sizing: border-box; }
+  .summon-text { color: #5a46ff; font-size: 26rpx; font-weight: 600; }
+  .state-box { display: flex; align-items: center; justify-content: center; min-height: 360rpx; }
+  .state-text { color: #9999a3; font-size: 25rpx; }
+  .loading-more { display: flex; align-items: center; justify-content: center; padding: 20rpx 0; }
+</style>

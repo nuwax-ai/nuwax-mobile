@@ -1,0 +1,150 @@
+/**
+ * 本地收藏一次性迁移（过渡方案收尾，对齐 PC conversationFavorites.ts 2026-09-13）：
+ * 置顶/归档/收藏后端化（pin/archive/collect 上线）后，读侧切列表回包字段打标、
+ * 写侧切接口。本模块仅负责把本地已收藏的会话/项目 id 逐个上报后端
+ * （collect 幂等，已收藏再报无副作用），成功后清 collected 数据并写迁移
+ * 标记防重入；单个失败容错跳过，未写标记前下次进入会重试。
+ *
+ * 本地 pinned/archived 旧数据不迁移（对齐 PC：09-05~13 过渡期标记视为已废弃）。
+ */
+import { apiAgentConversationCollect } from "@/servers/conversation";
+import { apiUserProjectCollect } from "@/servers/project";
+import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
+import { apiResCode } from "@/utils/apiResponse";
+import {
+  takeAndClearConversationCollected,
+} from "@/utils/conversationLocalFlags.uts";
+import {
+  takeAndClearProjectCollected,
+} from "@/utils/projectLocalFlags.uts";
+
+const CONVERSATION_MIGRATED_KEY = "conversation_favorite_migrated";
+const PROJECT_MIGRATED_KEY = "project_favorite_migrated";
+
+/**
+ * 取走本地已收藏会话 id 并清存储（迁移用）。
+ * 放在 conversationLocalFlags 里实现会导致该模块继续承载已废弃职责，
+ * 这里经 storage 直接读原始 collected 数组。
+ */
+function readCollectedIds(flagsKey: string): number[] {
+  const ids: number[] = [] as number[];
+  try {
+    const raw = uni.getStorageSync(flagsKey);
+    if (raw == null) return ids;
+    const text = `${raw}`;
+    if (text.length == 0) return ids;
+    const parsed = JSON.parse(text);
+    if (parsed == null || typeof parsed != "object") return ids;
+    const obj = parsed as UTSJSONObject;
+    const collectedRaw = obj["collected"];
+    if (collectedRaw == null || Array.isArray(collectedRaw) != true) return ids;
+    const arr = collectedRaw as any[];
+    for (let i = 0; i < arr.length; i++) {
+      const n = parseFloat(`${arr[i]}`);
+      if (n != n) continue;
+      ids.push(n as number);
+    }
+  } catch (_e) {
+    // 坏数据当空处理
+  }
+  return ids;
+}
+
+function readMigrated(key: string): boolean {
+  try {
+    const raw = uni.getStorageSync(key);
+    return raw != null && `${raw}` == "1";
+  } catch (_e) {
+    return false;
+  }
+}
+
+function markMigrated(key: string): void {
+  try {
+    uni.setStorageSync(key, "1");
+  } catch (_e) {
+    // 写失败静默：下次重试幂等
+  }
+}
+
+/**
+ * 会话收藏迁移：本地 collected → 后端 collect。
+ * 无本地数据 / 已迁移 / 迁移中直接跳过；上报成功即写标记（失败项不阻塞整体，
+ * 未写标记前下次重试，collect 幂等）。
+ */
+let conversationMigrationInFlight = false;
+export async function migrateConversationFavorites(): Promise<void> {
+  if (conversationMigrationInFlight) return;
+  if (readMigrated(CONVERSATION_MIGRATED_KEY)) return;
+  const ids = readCollectedIds("conversation_local_flags");
+  if (ids.length == 0) {
+    markMigrated(CONVERSATION_MIGRATED_KEY);
+    return;
+  }
+  conversationMigrationInFlight = true;
+  try {
+    let allOk = true;
+    for (let i = 0; i < ids.length; i++) {
+      try {
+        const res = await apiAgentConversationCollect(ids[i]);
+        if (apiResCode(res) != SUCCESS_CODE) {
+          allOk = false;
+        }
+      } catch (_e) {
+        allOk = false;
+      }
+    }
+    if (allOk) {
+      // 全部上报成功：清本地 collected 残留并写标记
+      takeAndClearConversationCollected();
+      markMigrated(CONVERSATION_MIGRATED_KEY);
+    }
+  } finally {
+    conversationMigrationInFlight = false;
+  }
+}
+
+/**
+ * 项目收藏迁移：本地 collected → 后端 collect。
+ * projectType 必传：迁移时本地无类型信息，按后端归属校验兼容口径
+ * 依次以 NormalProject / UserApp / PageApp 三类型尝试（collect 对不属于
+ * 该类型的项目会报错，跳过即可）；任一类型成功即算该项目迁移完成。
+ */
+let projectMigrationInFlight = false;
+export async function migrateProjectFavorites(): Promise<void> {
+  if (projectMigrationInFlight) return;
+  if (readMigrated(PROJECT_MIGRATED_KEY)) return;
+  const ids = readCollectedIds("project_local_flags");
+  if (ids.length == 0) {
+    markMigrated(PROJECT_MIGRATED_KEY);
+    return;
+  }
+  projectMigrationInFlight = true;
+  try {
+    const types: string[] = ["NormalProject", "UserApp", "PageApp"];
+    let allOk = true;
+    for (let i = 0; i < ids.length; i++) {
+      let migrated = false;
+      for (let t = 0; t < types.length; t++) {
+        try {
+          const res = await apiUserProjectCollect(ids[i], types[t]);
+          if (apiResCode(res) == SUCCESS_CODE) {
+            migrated = true;
+            break;
+          }
+        } catch (_e) {
+          // 该类型不匹配，试下一个
+        }
+      }
+      if (migrated != true) {
+        allOk = false;
+      }
+    }
+    if (allOk) {
+      takeAndClearProjectCollected();
+      markMigrated(PROJECT_MIGRATED_KEY);
+    }
+  } finally {
+    projectMigrationInFlight = false;
+  }
+}

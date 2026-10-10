@@ -1,60 +1,484 @@
-import { ALLOW_EXTERNAL_LINK_DOMAIN } from "@/constants/config";
+import { ref, type Ref } from "vue";
+import { ALLOW_EXTERNAL_LINK_DOMAIN, getApiBaseUrl } from "@/constants/config";
 import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { apiTenantConfig } from "@/servers/account";
-import { apiGetStaticFileList } from "@/servers/agentDev.uts";
+import { apiSearchFiles } from "@/servers/agentDev";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
 import { t } from "@/utils/i18n";
+import { isAppWebViewEmbedded, isIosAppWebView } from "@/utils/appWebViewDetect";
 import type { TenantConfigInfo } from "@/types/interfaces/login";
 
-const SYSTEM_INFO = uni.getSystemInfoSync();
+/**
+ * 获取状态栏高度（兼容 iOS 刘海屏 / 动态岛）
+ * iOS 在模块初始化时 getSystemInfoSync 可能返回 0，所以改为延迟调用获取实时值
+ */
+export const getStatusBarHeight = (): number => {
+  const info = uni.getSystemInfoSync();
+  // iOS 优先使用 safeAreaInsets.top（更准确，包含刘海/动态岛高度）
+  const safeTop = info.safeAreaInsets?.top;
+  if (safeTop != null && safeTop > 20) {
+    return safeTop;
+  }
+  return info.statusBarHeight != null ? info.statusBarHeight : 15;
+};
 
-export const getStatusBarHeight = () => SYSTEM_INFO.statusBarHeight || 15;
+/** 底部安全区高度（iOS home indicator / Android 手势条）；普通屏为 0 */
+export const getSafeAreaBottom = (): number => {
+  const info = uni.getSystemInfoSync();
+  const safeBottom = info.safeAreaInsets?.bottom;
+  if (safeBottom != null && safeBottom > 0) {
+    return safeBottom;
+  }
+  return 0;
+};
 
 export const formatDate = (
-  input: string | number | Date,
-  format:
-    | "YYYY-MM-DD"
-    | "MM-DD"
-    | "HH:mm"
-    | "YYYY-MM-DD HH:mm:ss"
-    | "YYYY-MM-DD HH:mm" = "MM-DD",
+  input: string | number | Date | null,
+  format: string,
 ): string => {
-  const date = new Date(input);
+  if (input == null) {
+    return "-";
+  }
+  if (typeof input == "string" && input.length == 0) {
+    return "-";
+  }
+  let date: Date | null = null;
+  if (input instanceof Date) {
+    date = input as Date;
+  } else if (typeof input == "number") {
+    date = new Date(input as number);
+  } else {
+    date = new Date(input as string);
+  }
+
+  if (date == null) {
+    return "-";
+  }
 
   const YYYY = date.getFullYear();
-  const MM = String(date.getMonth() + 1).padStart(2, "0");
-  const DD = String(date.getDate()).padStart(2, "0");
-  const HH = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
+  const MM = `${date.getMonth() + 1}`;
+  const DD = `${date.getDate()}`;
+  const HH = `${date.getHours()}`;
+  const mm = `${date.getMinutes()}`;
 
-  switch (format) {
-    case "YYYY-MM-DD":
-      return `${YYYY}-${MM}-${DD}`;
-    case "YYYY-MM-DD HH:mm:ss":
-      const ss = String(date.getSeconds()).padStart(2, "0");
-      return `${YYYY}-${MM}-${DD} ${HH}:${mm}:${ss}`;
-    case "YYYY-MM-DD HH:mm":
-      return `${YYYY}-${MM}-${DD} ${HH}:${mm}`;
-    case "HH:mm":
-      return `${HH}:${mm}`;
-    default:
-      return `${MM}-${DD}`;
+  const pad2 = (s: string): string => s.length < 2 ? `0${s}` : s;
+  const MM2 = pad2(MM);
+  const DD2 = pad2(DD);
+  const HH2 = pad2(HH);
+  const mm2 = pad2(mm);
+
+  if (format == "YYYY-MM-DD") {
+    return `${YYYY}-${MM2}-${DD2}`;
   }
+  if (format == "YYYY-MM-DD HH:mm:ss") {
+    const ss = pad2(`${date.getSeconds()}`);
+    return `${YYYY}-${MM2}-${DD2} ${HH2}:${mm2}:${ss}`;
+  }
+  if (format == "YYYY-MM-DD HH:mm") {
+    return `${YYYY}-${MM2}-${DD2} ${HH2}:${mm2}`;
+  }
+  if (format == "HH:mm") {
+    return `${HH2}:${mm2}`;
+  }
+  return `${MM2}-${DD2}`;
 };
 
 // 判断是否是允许外部链接跳转的域名
 export const isAllowExternalLinkDomain = (url: string) => {
-  return ALLOW_EXTERNAL_LINK_DOMAIN.some((domain) => url.includes(domain));
+  try {
+    const targetOrigin = new URL(url).origin;
+    if (targetOrigin == getApiBaseUrl()) return true;
+    return ALLOW_EXTERNAL_LINK_DOMAIN.some((domain) => targetOrigin == domain);
+  } catch (_error) {
+    return false;
+  }
 };
 
+const EXTERNAL_LINK_PAGE_PATH = "/subpackages/pages/external-link/external-link";
+const INNER_WEBVIEW_PAGE_PATH = "/subpackages/pages/webview/webview";
+
+/** 防并发 navigateTo：框架未完成上次跳转时再调会报 errCode 4 locked */
+let pageNavInFlight: boolean = false;
+let lastPageNavUrl: string = "";
+let lastPageNavAt: number = 0;
+
 /**
- * 根据链接地址判断不允许调整的页面需要复制链接到剪切板
- * @param url 链接地址
- * @returns void
+ * 同一路由短时间只跳一次，并吞掉 locked / Promise rejection。
  */
-export const handleExternalLink = (url: string) => {
-  // 如果链接地址为空，则提示链接地址配置错误
-  if (!url) {
+export function navigateToPageOnce(pageUrl: string, debounceMs: number = 600): boolean {
+  if (pageUrl.length == 0) {
+    return false;
+  }
+  if (pageNavInFlight) {
+    return false;
+  }
+  const now = Date.now();
+  if (pageUrl == lastPageNavUrl && now - lastPageNavAt < debounceMs) {
+    return false;
+  }
+  lastPageNavUrl = pageUrl;
+  lastPageNavAt = now;
+  pageNavInFlight = true;
+  uni.navigateTo({
+    url: pageUrl,
+    fail: (_err: any | null) => {},
+    complete: (_res: any | null) => {
+      pageNavInFlight = false;
+    },
+  });
+  return true;
+}
+
+function isHttpOrProtocolRelative(url: string): boolean {
+  return (
+    url.indexOf("http://") == 0 ||
+    url.indexOf("https://") == 0 ||
+    url.indexOf("//") == 0
+  );
+}
+
+function normalizeExternalHref(url: string): string {
+  if (url.indexOf("//") == 0) {
+    return `https:${url}`;
+  }
+  return url;
+}
+
+/** 提取绝对 http(s) 地址的权威段（host[:port]，小写）；非 http(s) / 空返回 ""。 */
+function extractUrlAuthority(url: string): string {
+  let rest = "";
+  if (url.indexOf("https://") == 0) {
+    rest = url.substring(8);
+  } else if (url.indexOf("http://") == 0) {
+    rest = url.substring(7);
+  } else {
+    return "";
+  }
+  // indexOf 返回 number，end 显式标 number（length 是 Int，裸推断后赋值报 Number→Int；scanRouter 同款）
+  let end: number = rest.length;
+  const slashIdx = rest.indexOf("/");
+  if (slashIdx >= 0 && slashIdx < end) {
+    end = slashIdx;
+  }
+  const queryIdx = rest.indexOf("?");
+  if (queryIdx >= 0 && queryIdx < end) {
+    end = queryIdx;
+  }
+  const hashIdx = rest.indexOf("#");
+  if (hashIdx >= 0 && hashIdx < end) {
+    end = hashIdx;
+  }
+  return rest.substring(0, end).toLowerCase();
+}
+
+/**
+ * 是否站内 http(s) 链接（host 与运行时 API 域名一致）。
+ * 仅鸿蒙外链打开分流用：鸿蒙 web-view 的 cookie 不跨实例留存，站内链接走
+ * external-link 裸 web-view 必然匿名被 302 到登录页（资料库），改走内嵌 webview
+ * 页（apiUserTicketCreate 拼 _ticket 免登）；iOS/Android cookie 留存，不走此分支。
+ */
+function isInternalSiteHttpUrl(url: string): boolean {
+  const base = getApiBaseUrl();
+  if (base.length == 0) {
+    return false;
+  }
+  const linkAuthority = extractUrlAuthority(url);
+  const baseAuthority = extractUrlAuthority(base);
+  return linkAuthority.length > 0 && linkAuthority == baseAuthority;
+}
+
+/**
+ * 拼外链预览页路由（url 必须 encode，避免目标地址里的 ?&= 打散本页 query）。
+ */
+export function buildExternalLinkPageUrl(href: string, title: string = ""): string {
+  let path = `${EXTERNAL_LINK_PAGE_PATH}?url=${encodeURIComponent(href)}`;
+  if (title.length > 0) {
+    path = `${path}&title=${encodeURIComponent(title)}`;
+  }
+  return path;
+}
+
+/** PC 会话详情链接前缀：/home/chat/<conversationId>/<agentId>。 */
+const HOME_CHAT_LINK_PREFIX = "/home/chat/";
+
+/** 单字符是否为十进制数字。UTS 字符串无大小比较运算符，逐个枚举（同 useRequest 先例）。 */
+function isDigitChar(ch: string): boolean {
+  return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+    ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9";
+}
+
+function isAllDigits(value: string): boolean {
+  if (value.length == 0) {
+    return false;
+  }
+  for (let i = 0; i < value.length; i++) {
+    if (isDigitChar(value.charAt(i)) == false) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 站内会话详情链接（PC 的 /home/chat/<convId>/<agentId>）→ Android/鸿蒙跳原生 agent-detail。
+ *
+ * 外链 web-view 打开后 PC 站会把移动端 UA 重定向回 /m/ 站的 agent-detail，而 /m/ 生产
+ * 模式靠 webview 里留存的 cookie ticket 鉴权（App 登录态不透传）：Android 聊天是本地
+ * 离线 H5 容器、不产生站内 cookie，webview 无该 cookie 时 IM 接口 401 IM_10401，请求层
+ * 把后端 message「token 无效或已过期」原样 toast。原生页直接用 App 自身 Bearer 登录态，
+ * 无此依赖；参数（id=agentId、conversationId）与 PC 站移动端重定向完全一致。
+ *
+ * iOS 不拦截、维持 webview 流：WKWebView 全局共享 cookie，常驻壳聊天（远程 https 页）
+ * 已写下站内 ticket cookie，webview 直开该链接本就正常；而开壳需 switchTab，会拆掉
+ * 消息 Tab 上的聊天页栈——关壳只能 navigateTo 重建，initHistory 固定滚底（chat.uvue
+ * 「重新进入会话始终展示最新」的既定设计），返回回不到原位置。
+ *
+ * 相对路径与站内绝对地址都识别；非该格式返回 false，调用方继续原外链流程。
+ */
+export function openNativeHomeChatLink(rawUrl: string): boolean {
+  // #ifdef APP-ANDROID || APP-HARMONY
+  if (rawUrl == null || rawUrl.length == 0) {
+    return false;
+  }
+  let value = rawUrl.trim();
+  if (value.indexOf("//") == 0) {
+    value = `https:${value}`;
+  }
+  const lower = value.toLowerCase();
+  if (lower.indexOf("http://") == 0 || lower.indexOf("https://") == 0) {
+    // 绝对地址仅拦截站内域名，第三方域名的同路径不劫持
+    if (isInternalSiteHttpUrl(value) == false) {
+      return false;
+    }
+  } else if (value.charAt(0) != "/") {
+    return false;
+  }
+  // 去掉 query / hash，剥掉协议与域名只剩路径
+  let path = value;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx >= 0) {
+    path = path.substring(0, hashIdx);
+  }
+  const queryIdx = path.indexOf("?");
+  if (queryIdx >= 0) {
+    path = path.substring(0, queryIdx);
+  }
+  const protoIdx = path.indexOf("://");
+  if (protoIdx >= 0) {
+    const afterProto = path.substring(protoIdx + 3);
+    const slashIdx = afterProto.indexOf("/");
+    path = slashIdx >= 0 ? afterProto.substring(slashIdx) : "";
+  }
+  while (path.length > 1 && path.charAt(path.length - 1) == "/") {
+    path = path.substring(0, path.length - 1);
+  }
+  if (path.indexOf(HOME_CHAT_LINK_PREFIX) != 0) {
+    return false;
+  }
+  const segs = path.substring(HOME_CHAT_LINK_PREFIX.length).split("/");
+  if (segs.length != 2 ||
+      isAllDigits(segs[0]) == false || isAllDigits(segs[1]) == false) {
+    return false;
+  }
+  const pageUrl =
+    `/subpackages/pages/agent-detail/agent-detail?id=${segs[1]}&conversationId=${segs[0]}`;
+  return navigateToPageOnce(pageUrl);
+  // #endif
+  // #ifndef APP-ANDROID || APP-HARMONY
+  return false;
+  // #endif
+}
+
+/**
+ * 微信小程序 web-view 内嵌 H5：用 wx.miniProgram.navigateTo 打开原生页。
+ * 成功返回 true；非小程序 web-view 或 SDK 未注入返回 false。
+ */
+export function navigateViaWxMiniProgram(url: string): boolean {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    if (w == null || w.wx == null) {
+      return false;
+    }
+    const miniProgram = w.wx.miniProgram;
+    if (miniProgram == null || miniProgram.navigateTo == null) {
+      return false;
+    }
+    miniProgram.navigateTo({ url: url });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/**
+ * App 内嵌 H5：仅改 hash 做 SPA 软导航，不触发原生 uni.navigateTo（避免 locked）。
+ */
+export function navigateEmbeddedH5HashRoute(routeUrl: string): void {
+  // #ifdef H5 || WEB
+  try {
+    let path = routeUrl;
+    if (path.charAt(0) != "/") {
+      path = `/${path}`;
+    }
+    window.location.hash = `#${path}`;
+  } catch (_e) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * iOS 常驻壳内嵌 H5：通知原生 openResidentChat（仅 iOS 生效）。
+ */
+export function requestResidentChatOpenFromEmbeddedH5(
+  id: number,
+  conversationId: number | null,
+  pType: string = "",
+): boolean {
+  if (id <= 0) {
+    return false;
+  }
+  // #ifdef H5 || WEB
+  if (isIosAppWebView() != true) {
+    return false;
+  }
+  const payload = {} as UTSJSONObject;
+  payload["type"] = "app-open-chat";
+  payload["id"] = `${id}`;
+  if (conversationId != null && conversationId > 0) {
+    payload["conversationId"] = `${conversationId}`;
+  } else {
+    payload["conversationId"] = "";
+  }
+  if (pType == "NormalProject" || pType == "UserApp") {
+    payload["pType"] = pType;
+  }
+  if (postAppWebViewMessage(payload)) {
+    return true;
+  }
+  let hashUrl = `/subpackages/pages/agent-detail/agent-detail?id=${id}`;
+  if (conversationId != null && conversationId > 0) {
+    hashUrl = `${hashUrl}&conversationId=${conversationId}`;
+  }
+  if (pType == "NormalProject" || pType == "UserApp") {
+    hashUrl = `${hashUrl}&pType=${pType}`;
+  }
+  navigateEmbeddedH5HashRoute(hashUrl);
+  return true;
+  // #endif
+  return false;
+}
+
+/**
+ * 通过注入的 uni.webview.js（uni.webView.navigateTo）打开原生页。
+ * 成功返回 true；JSSDK 未就绪或非内嵌环境返回 false，由调用方回退 hash 软导航。
+ */
+export function navigateViaWebViewSdk(url: string): boolean {
+  // #ifdef H5 || WEB
+  // iOS 常驻壳：agent-detail 禁止压原生栈
+  if (isIosAppWebView() == true && url.indexOf("agent-detail") >= 0) {
+    const qIdx = url.indexOf("?");
+    if (qIdx >= 0) {
+      navigateEmbeddedH5HashRoute(url);
+      return true;
+    }
+    return false;
+  }
+  try {
+    const w = window as any;
+    if (w == null || w.uni == null) {
+      return false;
+    }
+    const webView = w.uni.webView;
+    if (webView == null || webView.navigateTo == null) {
+      return false;
+    }
+    webView.navigateTo({ url: url });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+  // #endif
+  // #ifndef H5 || WEB
+  return false;
+  // #endif
+}
+
+/**
+ * App 内嵌 H5 → 原生：优先 uni.webView.postMessage，
+ * 本地调试 H5（Vite / 局域网）经常还没加载到 JSSDK，此时直接走原生注入的
+ * __uniapp_x_postMessage（与键盘诊断、商品详情桥同一条通道）。
+ */
+export function postAppWebViewMessage(payload: UTSJSONObject): boolean {
+  // #ifdef H5 || WEB
+  try {
+    const w = window as any;
+    if (w == null) {
+      return false;
+    }
+    if (
+      w.uni != null &&
+      w.uni.webView != null &&
+      w.uni.webView.postMessage != null
+    ) {
+      w.uni.webView.postMessage({ "data": payload });
+      return true;
+    }
+    if (w.__uniapp_x_postMessage != null) {
+      w.__uniapp_x_postMessage({ "data": payload });
+      return true;
+    }
+    if (w.__uniapp_x_ != null && w.__uniapp_x_.postMessage != null) {
+      w.__uniapp_x_.postMessage(JSON.stringify({ "data": payload }));
+      return true;
+    }
+  } catch (_e) {
+    return false;
+  }
+  // #endif
+  return false;
+}
+
+/**
+ * 在原生 web-view 页打开 HTTP(S) 外链。
+ * App 内嵌 H5：只 postMessage 给承载页（resident-chat-shell），由原生 uni.navigateTo 打开
+ * external-link；失败不回退 H5 navigateTo / window.open，避免把聊天页顶掉或看起来没反应。
+ */
+export function openExternalLinkPage(href: string, title: string = ""): boolean {
+  const target = normalizeExternalHref(href);
+  if (target.indexOf("http://") != 0 && target.indexOf("https://") != 0) {
+    return false;
+  }
+  const pageUrl = buildExternalLinkPageUrl(target, title);
+  if (isAppWebViewEmbedded()) {
+    const payload = {} as UTSJSONObject;
+    payload["type"] = "app-open-external-link";
+    payload["url"] = target;
+    if (title.length > 0) {
+      payload["title"] = title;
+    }
+    return postAppWebViewMessage(payload);
+  }
+  if (navigateViaWxMiniProgram(pageUrl)) {
+    return true;
+  }
+  navigateToPageOnce(pageUrl);
+  return true;
+}
+
+/**
+ * 打开聊天 / 业务里的链接。
+ * HTTP(S) 外链：App（含内嵌 H5）与微信小程序走独立 web-view 页；
+ * 浏览器 H5 仍新开标签。站内相对路径仍走原 webview 页（可带 ticket）。
+ */
+export function handleExternalLink(url: string, title: string = ""): void {
+  if (url == null || url.length == 0) {
     uni.showToast({
       title: t("Mobile.Link.invalidConfig"),
       icon: "none",
@@ -62,110 +486,127 @@ export const handleExternalLink = (url: string) => {
     return;
   }
 
-  // #ifdef H5 || WEB
-  // H5 环境直接打开外部链接
-  try {
-    // 判断是否为有效的 URL
-    const isValidUrl =
-      url.startsWith("http://") ||
-      url.startsWith("https://") ||
-      url.startsWith("//");
+  // 站内会话详情链接（Android/鸿蒙）：直接跳原生 agent-detail，避免 webview 里的 /m/ 站
+  // 因无 cookie 登录态被 IM 接口弹「token 无效或已过期」（iOS 维持 webview 流，见
+  // openNativeHomeChatLink 注释）
+  if (openNativeHomeChatLink(url)) {
+    return;
+  }
 
-    if (isValidUrl) {
-      // 尝试在新标签页中打开链接
-      const newWindow = window.open(url, "_blank");
+  if (isHttpOrProtocolRelative(url)) {
+    const target = normalizeExternalHref(url);
 
-      // 检查是否被浏览器拦截（某些浏览器会阻止弹窗）
+    // #ifdef APP-HARMONY
+    // 鸿蒙：站内绝对链接（资料库等）改走内嵌 webview 页带 _ticket 免登——
+    // 鸿蒙 web-view cookie 不跨实例留存，external-link 裸 web-view 打开即被
+    // 302 到登录页；iOS/Android cookie 留存可直达，不走此分支（行为不变）。
+    if (isInternalSiteHttpUrl(target)) {
+      let innerUrl = `${INNER_WEBVIEW_PAGE_PATH}?url=${encodeURIComponent(target)}`;
+      if (title.length > 0) {
+        innerUrl = `${innerUrl}&title=${encodeURIComponent(title)}`;
+      }
+      navigateToPageOnce(innerUrl);
+      return;
+    }
+    // #endif
+
+    // #ifdef H5 || WEB
+    if (isAppWebViewEmbedded()) {
+      if (openExternalLinkPage(target, title) == false) {
+        uni.showToast({
+          title: t("Mobile.Link.openFailed"),
+          icon: "none",
+        });
+      }
+      return;
+    }
+    if (navigateViaWxMiniProgram(buildExternalLinkPageUrl(target, title))) {
+      return;
+    }
+    try {
+      const newWindow = window.open(target, "_blank");
       if (
-        !newWindow ||
+        newWindow == null ||
         newWindow.closed ||
-        typeof newWindow.closed === "undefined"
+        typeof newWindow.closed == "undefined"
       ) {
-        // 如果被拦截，提示用户并复制链接到剪贴板
-        console.warn("链接被浏览器拦截，使用备用方案");
-
-        // 尝试复制到剪贴板
-        if (navigator.clipboard && navigator.clipboard.writeText) {
+        if (navigator.clipboard != null && navigator.clipboard.writeText != null) {
           navigator.clipboard
-            .writeText(url)
-            .then(() => {
+            .writeText(target)
+            .then((): void => {
               uni.showToast({
                 title: t("Mobile.Link.copyAndOpen"),
                 icon: "none",
                 duration: 3000,
               });
             })
-            .catch(() => {
-              // 如果复制失败，直接在当前页面打开
-              window.location.href = url;
+            .catch((): void => {
+              window.location.href = target;
             });
         } else {
-          // 如果不支持剪贴板 API，直接在当前页面打开
-          window.location.href = url;
+          window.location.href = target;
         }
       }
-    } else {
-      // 如果不是完整的 URL，使用 navigateTo 跳转到 webview 页面
-      uni.navigateTo({
-        url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(url)}`,
+    } catch (_error) {
+      uni.showToast({
+        title: t("Mobile.Link.openFailed"),
+        icon: "none",
       });
     }
-  } catch (error) {
-    console.error("打开链接失败:", error);
-    uni.showToast({
-      title: t("Mobile.Link.openFailed"),
-      icon: "none",
-    });
-  }
-  // #endif
+    return;
+    // #endif
 
-  // #ifdef MP-WEIXIN
-  // 如果允许外部链接跳转，则打开外部链接
-  if (isAllowExternalLinkDomain(url)) {
-    uni.navigateTo({
-      url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(url)}`,
-    });
-  } else {
-    uni.setClipboardData({
-      data: url,
-      success: () => {
-        uni.showToast({
-          title: t("Mobile.Link.copied"),
-          icon: "none",
-        });
-      },
-    });
+    // #ifdef APP || MP-WEIXIN
+    openExternalLinkPage(target, title);
+    return;
+    // #endif
+  }
+
+  const innerUrl = `${INNER_WEBVIEW_PAGE_PATH}?url=${encodeURIComponent(url)}`;
+  // #ifdef H5 || WEB
+  if (isAppWebViewEmbedded() && navigateViaWebViewSdk(innerUrl)) {
+    return;
+  }
+  if (navigateViaWxMiniProgram(innerUrl)) {
+    return;
   }
   // #endif
-};
+  uni.navigateTo({ url: innerUrl });
+}
 
 // 获取用户配置并设置页面标题和缓存租户信息
 export const fetchTenantConfig = async () => {
-  const { code, data } = await apiTenantConfig();
-  const siteName = data?.siteName;
-  if (code === SUCCESS_CODE && siteName) {
-    // 设置当前页面导航栏标题
-    uni.setNavigationBarTitle({ title: siteName });
-    // 缓存租户信息
-    uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(data));
+  const res = await apiTenantConfig();
+  const code = apiResCode(res);
+  const dataRaw = apiResData<any>(res);
+  if (code == SUCCESS_CODE && dataRaw != null) {
+    const dataObj = dataRaw as UTSJSONObject;
+    const siteNameRaw = dataObj["siteName"];
+    const siteName = siteNameRaw != null ? `${siteNameRaw}` : "";
+    if (siteName != "") {
+      // 设置当前页面导航栏标题
+      uni.setNavigationBarTitle({ title: siteName });
+      // 缓存租户信息
+      uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(dataRaw));
+    }
   }
 };
 
 // 设置当前页面导航栏标题
 export const setCurrentPageNavigationBarTitle = async () => {
   // 获取本地用户配置
-  const tenantConfigInfoString = await uni.getStorageSync(TENANT_CONFIG_INFO);
-  if (tenantConfigInfoString) {
+  const tenantConfigInfoString = uni.getStorageSync(TENANT_CONFIG_INFO);
+  if (tenantConfigInfoString != null && tenantConfigInfoString != "") {
     try {
-      // JSON.parse 返回 unknown，这里显式约束为仅关心 siteName 的结构
-      const tenantConfig = JSON.parse(tenantConfigInfoString) as {
-        siteName?: string;
-      };
-      const { siteName } = tenantConfig;
-      if (siteName) {
-        // 设置当前页面导航栏标题
-        uni.setNavigationBarTitle({ title: siteName });
-        return;
+      const tenantConfigStr = tenantConfigInfoString as string;
+      const tenantConfig = JSON.parse<UTSJSONObject>(tenantConfigStr);
+      if (tenantConfig != null) {
+        const siteNameVal = tenantConfig["siteName"];
+        if (siteNameVal != null && siteNameVal != "") {
+          // 设置当前页面导航栏标题
+          uni.setNavigationBarTitle({ title: siteNameVal as string });
+          return;
+        }
       }
     } catch (error) {
       console.error("获取本地用户配置失败:", error);
@@ -174,48 +615,255 @@ export const setCurrentPageNavigationBarTitle = async () => {
   fetchTenantConfig(); // 获取用户配置并设置页面标题和缓存租户信息
 };
 
-// 根据会话id和文件路径 跳转至预览页面
-export const jumpToFilePreviewPage = (
+/**
+ * App 常驻壳：通知原生「当前聊天页头图/标题已就绪」，可安全揭开避免闪上一次智能体。
+ * 仅内嵌 H5 生效；浏览器直开 / 无桥时 noop。
+ */
+function postMessageToResidentChatShell(payload: UTSJSONObject): void {
+  // #ifdef H5 || WEB
+  try {
+    if (isAppWebViewEmbedded() != true) {
+      return;
+    }
+    const w = window as any;
+    if (w == null) {
+      return;
+    }
+    const uniGlobal = w.uni;
+    if (
+      uniGlobal != null &&
+      uniGlobal.webView != null &&
+      uniGlobal.webView.postMessage != null
+    ) {
+      uniGlobal.webView.postMessage({ data: payload });
+      return;
+    }
+    if (w.__uniapp_x_postMessage != null) {
+      w.__uniapp_x_postMessage({ data: payload });
+    }
+  } catch (_ePost) {
+    // ignore
+  }
+  // #endif
+}
+
+/**
+ * App 常驻壳：H5 已清空旧会话并进入 loading，可提前揭开原生遮罩（仍由 H5 内 loading 占位）。
+ */
+export function notifyResidentChatCleared(agentId: number | null): void {
+  const payload = {
+    type: "app-chat-cleared",
+    agentId: agentId != null ? `${agentId}` : "",
+  } as UTSJSONObject;
+  postMessageToResidentChatShell(payload);
+}
+
+export function notifyResidentChatReady(agentId: number | null): void {
+  const payload = {
+    type: "app-chat-ready",
+    agentId: agentId != null ? `${agentId}` : "",
+  } as UTSJSONObject;
+  postMessageToResidentChatShell(payload);
+}
+
+/**
+ * H5 内嵌页的状态栏（刘海）高度（px）。
+ * App 端 agent-detail 原生页把 webview 全屏铺满后，顶部刘海区域由内嵌 H5 页面自己处理：
+ * 原生侧在 webview URL fragment 追加 &statusBarHeight=xx，H5 侧 onLoad 读取后写入此处，
+ * 供 custom-nav-bar / safety-zone 在 H5 内做状态栏占位。0 表示非内嵌或未知（浏览器直开）。
+ * 用 ref 保证「onLoad 晚于组件首帧渲染」时（页面生命周期在组件树挂载后才派发）也能响应式补上占位。
+ */
+const embeddedStatusBarHeight = ref<number>(0);
+export const setEmbeddedStatusBarHeight = (height: number): void => {
+  embeddedStatusBarHeight.value = height > 0 ? height : 0;
+};
+export const getEmbeddedStatusBarHeight = (): Ref<number> => embeddedStatusBarHeight;
+
+/** 预览页 query `source`：产物入口（文件树 / 任务产物 / OpenUI 产物）。仅此值会调 shareKey。 */
+export const FILE_PREVIEW_SOURCE_ARTIFACT = "artifact";
+
+// 根据会话id和文件路径 跳转至预览页面。source 非空时附加 &source=…。
+// source=artifact 表示产物入口，预览页才调 /api/agent/conversation/share 换 shareKey；
+// source=im 及其它入口不调该接口，分享按钮只复制地址。
+// 函数声明而非 const 箭头：默认参在 UTS→Kotlin 的匿名函数中不允许（fileTree.uts 教训）。
+/** 打开文件预览页面
+ * @param conversationId 会话id
+ * @param fileProxyUrl 文件代理url
+ * @param source 来源 source=artifact 表示产物入口，预览页才调 /api/agent/conversation/share 换 shareKey；source=im 及其它入口不调该接口，分享按钮只复制地址。
+ */
+export function jumpToFilePreviewPage(
   conversationId: string,
   fileProxyUrl: string,
-) => {
-  if (!conversationId || !fileProxyUrl) {
+  source: string = "",
+) {
+  if (conversationId == null || conversationId.length == 0 || fileProxyUrl == null || fileProxyUrl.length == 0) {
     return;
   }
   const path = "/subpackages/pages/file-preview-page/file-preview-page";
-  const url = `${path}?cId=${conversationId}&fileProxyUrl=${encodeURIComponent(fileProxyUrl)}`;
+  // fileProxyUrl 是独立 query 值，uni 路由只分隔 &/=，内部 ?/% 无需编码；
+  // file-preview-page 端也只做单次 decodeURIComponent。此处不再 encode，避免双重编码。
+  // 注意：uni.webView.navigateTo 内部会对整段 url 做 encodeURI，与 file-tree 行为兼容。
+  let url = `${path}?cId=${conversationId}&fileProxyUrl=${fileProxyUrl}`;
+  if (source.length > 0) {
+    url = `${url}&source=${source}`;
+  }
+  // App 内嵌 H5：走 JSSDK 开原生预览页（避免只在 web-view 内 H5 SPA 跳转）
+  if (isAppWebViewEmbedded() && navigateViaWebViewSdk(url)) {
+    return;
+  }
   uni.navigateTo({ url });
 };
 
-// 根据会话id查询文件列表并根据文件路径获取到文件代理url
+/**
+ * 打开 OpenUI artifact 预览——与文件树点击 .openui.json 打开的是同一个 file-preview-page（有导航栏/返回）。
+ * 通过 getFileProxyUrlByConversationIdAndFilePath 获取文件代理 URL，再 jumpToFilePreviewPage 跳转。
+ * App 内嵌 H5 时 jumpToFilePreviewPage 会走 uni.webView.navigateTo 开原生页。
+ */
+export const openOpenUiArtifact = async (
+  conversationId: string,
+  artifactId: string,
+  title: string,
+) => {
+  const cid =
+    conversationId.startsWith("chat-") ? conversationId.substring(5) : conversationId;
+  if (cid.length == 0 || artifactId.length == 0) {
+    uni.showToast({ title: "无法打开 OpenUI", icon: "none" });
+    return;
+  }
+  try {
+    const proxyUrlRaw = await getFileProxyUrlByConversationIdAndFilePath(
+      cid,
+      `data/${artifactId}.openui.json`,
+    );
+    const proxyUrl = proxyUrlRaw != null ? `${proxyUrlRaw}` : "";
+    if (proxyUrl.length > 0) {
+      jumpToFilePreviewPage(cid, proxyUrl, FILE_PREVIEW_SOURCE_ARTIFACT);
+    } else {
+      uni.showToast({ title: "无法打开 OpenUI", icon: "none" });
+    }
+  } catch (_e) {
+    uni.showToast({ title: "打开文件失败", icon: "none" });
+  }
+};
+
+/** 去掉首尾斜杠，得到工作区相对路径。 */
+function normalizeWorkspacePath(path: string): string {
+  let result = path;
+  while (result.startsWith("/")) {
+    result = result.substring(1);
+  }
+  while (result.length > 0 && result.endsWith("/")) {
+    result = result.substring(0, result.length - 1);
+  }
+  return result;
+}
+
+/**
+ * 搜索接口关键字只用路径最后一段（文件名）。
+ * 同名文件再靠完整相对路径在结果的 name 里筛一次。
+ */
+function workspaceSearchKeyword(relativePath: string): string {
+  const normalized = normalizeWorkspacePath(relativePath);
+  const parts = normalized.split("/");
+  if (parts.length == 0) {
+    return normalized;
+  }
+  const last = parts[parts.length - 1];
+  return last != null && last.length > 0 ? last : normalized;
+}
+
+function readSearchFileProxyUrl(file: UTSJSONObject): string | null {
+  const proxyUrlRaw = file["fileProxyUrl"];
+  return proxyUrlRaw != null ? `${proxyUrlRaw}` : null;
+}
+
+/**
+ * 在搜索结果里按任务结果的相对路径命中文件，优先完整路径一致。
+ * 对齐 nuwax findSearchFileByRelativePath。
+ */
+function findSearchFileProxyUrlByRelativePath(
+  files: any[],
+  relativePath: string,
+): string | null {
+  const target = normalizeWorkspacePath(relativePath);
+  if (target.length == 0) {
+    return null;
+  }
+  for (let i = 0; i < files.length; i++) {
+    const fileRaw = files[i];
+    if (fileRaw == null) {
+      continue;
+    }
+    const file = fileRaw as UTSJSONObject;
+    const nameRaw = file["name"];
+    if (nameRaw == null) {
+      continue;
+    }
+    if (normalizeWorkspacePath(`${nameRaw}`) == target) {
+      return readSearchFileProxyUrl(file);
+    }
+  }
+  for (let i = 0; i < files.length; i++) {
+    const fileRaw = files[i];
+    if (fileRaw == null) {
+      continue;
+    }
+    const file = fileRaw as UTSJSONObject;
+    const nameRaw = file["name"];
+    if (nameRaw == null) {
+      continue;
+    }
+    const name = normalizeWorkspacePath(`${nameRaw}`);
+    if (name.endsWith(`/${target}`) || target.endsWith(`/${name}`)) {
+      return readSearchFileProxyUrl(file);
+    }
+  }
+  return null;
+}
+
+/**
+ * 根据会话 id 和文件路径获取文件代理 url。
+ * 文件树已改为分层加载，不再拉全量列表；改为按文件名 search-files，再按完整相对路径命中。
+ * 对齐 nuwax Chat 工作区任务结果打开（useWorkspaceFileTreeSession / locateWorkspaceChangeFile）。
+ */
 export const getFileProxyUrlByConversationIdAndFilePath = async (
   conversationId: string,
   filePath: string,
 ) => {
-  if (!conversationId || !filePath) {
+  if (conversationId == null || conversationId.length == 0 || filePath == null || filePath.length == 0) {
     return null;
   }
-  // 接口要求 number 类型，先做显式转换并校验，避免把非法字符串传入服务层
-  const normalizedConversationId = Number(conversationId);
+  const normalizedConversationId = parseInt(conversationId);
   if (Number.isNaN(normalizedConversationId)) {
     return null;
   }
-  const result = await apiGetStaticFileList(normalizedConversationId);
-  if (result.code === SUCCESS_CODE) {
-    const { files } = result.data || {};
-    const file = files.find((item) => item.name === filePath);
-    return file?.fileProxyUrl;
+  const keyword = workspaceSearchKeyword(filePath);
+  if (keyword.length == 0) {
+    return null;
   }
-  return null;
+  const result = await apiSearchFiles(normalizedConversationId, keyword);
+  if (apiResCode(result) != SUCCESS_CODE) {
+    return null;
+  }
+  const dataRaw = apiResData<any>(result);
+  if (dataRaw == null) {
+    return null;
+  }
+  const data = dataRaw as UTSJSONObject;
+  const filesRaw = data["files"];
+  if (filesRaw == null) {
+    return null;
+  }
+  return findSearchFileProxyUrlByRelativePath(filesRaw as any[], filePath);
 };
 
 /**
  * 任务结果数据
  */
-interface TaskResultData {
-  hasTaskResult: boolean;
-  description?: string;
-  file?: string;
+type TaskResultData = {
+  hasTaskResult : boolean;
+  description : string;
+  file : string;
 }
 
 /**
@@ -226,14 +874,16 @@ interface TaskResultData {
 export const extractTaskResult = (text: string): TaskResultData => {
   const result: TaskResultData = {
     hasTaskResult: false,
+    description: "",
+    file: "",
   };
 
-  if (!text) return result;
+  if (text == null || text.length == 0) return result;
 
   // 1️⃣ 匹配 <task-result>...</task-result>
   const taskResultMatch = text.match(/<task-result>([\s\S]*?)<\/task-result>/);
 
-  if (!taskResultMatch) {
+  if (taskResultMatch == null) {
     return result;
   }
 
@@ -241,17 +891,17 @@ export const extractTaskResult = (text: string): TaskResultData => {
   const taskResultContent = taskResultMatch[1];
 
   // 2️⃣ 提取 description
-  const descriptionMatch = taskResultContent.match(
+  const descriptionMatch = taskResultContent!!.match(
     /<description>([\s\S]*?)<\/description>/,
   );
-  if (descriptionMatch) {
-    result.description = descriptionMatch[1].trim();
+  if (descriptionMatch != null && descriptionMatch[1] != null) {
+    result.description = descriptionMatch[1]!!.trim();
   }
 
   // 3️⃣ 提取 file
-  const fileMatch = taskResultContent.match(/<file>([\s\S]*?)<\/file>/);
-  if (fileMatch) {
-    result.file = fileMatch[1].trim();
+  const fileMatch = taskResultContent!!.match(/<file>([\s\S]*?)<\/file>/);
+  if (fileMatch != null && fileMatch[1] != null) {
+    result.file = fileMatch[1]!!.trim();
   }
 
   return result;
@@ -263,12 +913,12 @@ export const extractTaskResult = (text: string): TaskResultData => {
  * @returns file 内容或 null
  */
 export const extractLastTaskResultFile = (text: string): string | null => {
-  if (!text) return null;
+  if (text == null || text.length == 0) return null;
 
   // 匹配所有 <task-result>...</task-result>
   const taskResultMatches = text.match(/<task-result>[\s\S]*?<\/task-result>/g);
 
-  if (!taskResultMatches || taskResultMatches.length === 0) {
+  if (taskResultMatches == null || taskResultMatches.length === 0) {
     return null;
   }
 
@@ -286,16 +936,16 @@ export const extractLastTaskResultFile = (text: string): string | null => {
  * @param value 输入数值或字符
  * @returns 格式化后的千分位字符串
  */
-export const formatNumber = (value: any, precision: number = -1): string => {
+export function formatNumber(value: any, precision: number = -1): string {
   if (value == null) {
     return "0";
   }
-  let str = String(value).trim();
+  let str = `${value}`.trim();
   if (str === "" || str === "null" || str === "undefined") {
     return "0";
   }
 
-  const num = Number(str);
+  const num = Number.parseFloat(str);
   if (Number.isNaN(num) || !Number.isFinite(num)) {
     return "0";
   }
@@ -320,7 +970,7 @@ export const formatNumber = (value: any, precision: number = -1): string => {
   for (let i = integerPart.length - 1; i >= 0; i--) {
     result = integerPart.charAt(i) + result;
     counter++;
-    if (counter === 3 && i !== 0) {
+    if (counter == 3 && i != 0) {
       result = "," + result;
       counter = 0;
     }
@@ -337,10 +987,13 @@ export const checkSubscriptionEnable = async (): Promise<boolean> => {
   let isEnabled = false;
   // 1. 优先校验本地缓存
   const tenantConfigInfoString = uni.getStorageSync(TENANT_CONFIG_INFO);
-  if (tenantConfigInfoString) {
+  if (tenantConfigInfoString != null && tenantConfigInfoString != "") {
     try {
-      const tenantConfig = JSON.parse(tenantConfigInfoString) as TenantConfigInfo;
-      isEnabled = tenantConfig.enableSubscription === 1;
+      const tenantConfig = JSON.parse<UTSJSONObject>(tenantConfigInfoString as string);
+      if (tenantConfig != null) {
+        const enableSubRaw = tenantConfig["enableSubscription"];
+        isEnabled = enableSubRaw != null && (enableSubRaw as number) == 1;
+      }
     } catch (error) {
       console.error("Failed to parse tenant config:", error);
     }
@@ -349,10 +1002,13 @@ export const checkSubscriptionEnable = async (): Promise<boolean> => {
   // 2. 实时拉取最新配置进行二次校验和本地同步
   try {
     const res = await apiTenantConfig();
-    if (res.code === SUCCESS_CODE && res.data != null) {
-      const latestConfig = res.data!;
-      isEnabled = latestConfig.enableSubscription === 1;
-      uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(latestConfig));
+    const code = apiResCode(res);
+    const dataRaw = apiResData<any>(res);
+    if (code == SUCCESS_CODE && dataRaw != null) {
+      const dataObj = dataRaw as UTSJSONObject;
+      const enableSub = dataObj["enableSubscription"];
+      isEnabled = enableSub != null && (enableSub as number) == 1;
+      uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(dataRaw));
     }
   } catch (e) {
     console.error("Failed to sync latest tenant config:", e);

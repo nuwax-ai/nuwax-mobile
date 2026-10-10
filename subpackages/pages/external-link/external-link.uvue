@@ -1,0 +1,256 @@
+<template>
+  <view class="external-link-page page-container">
+    <!-- 微信小程序 web-view 会铺满全屏，仍画自定义导航，与全局 navigationStyle=custom 对齐；
+         App / H5 导航栏在 web-view 上方，返回可回到聊天页。 -->
+    <custom-nav-bar
+      class="external-link-nav"
+      :title="displayPageTitle"
+      :show-back="true"
+      :has-safety-zone="true"
+    />
+
+    <view class="external-link-content">
+      <web-view
+        v-if="pageUrl.length > 0"
+        class="external-link-web-view"
+        id="external-link-webview"
+        :src="pageUrl"
+        <!-- #ifndef APP -->
+        @error="handleWebviewError"
+        <!-- #endif -->
+        @load="handleWebviewLoad"
+        @message="handleWebviewMessage"
+      ></web-view>
+      <!-- Android：页面仅有 web-view 单节点时会走全屏原生层；导航栏已是兄弟节点，此处再占位保险。 -->
+      <view class="external-link-placeholder" />
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref, getCurrentInstance, onUnmounted } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { useI18n, emptyI18nParams } from "@/utils/i18n";
+  import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
+
+  const { t: tFn } = useI18n();
+  const t = (key: string): string => tFn(key, emptyI18nParams(), "");
+  const instance = getCurrentInstance();
+
+  const pageUrl = ref<string>("");
+  const pageTitle = ref<string>("");
+  let titlePollTimer = 0;
+  let titlePollCount = 0;
+
+  const displayPageTitle = computed((): string => pageTitle.value);
+
+  const isHttpUrl = (url: string): boolean => {
+    return url.indexOf("http://") == 0 || url.indexOf("https://") == 0;
+  };
+
+  const handleWebviewError = (_e: any): void => {
+    uni.showToast({
+      title: t("Mobile.Webview.loadFailed"),
+      icon: "none",
+      duration: 2000,
+    });
+  };
+
+  const applyPageTitle = (title: string): void => {
+    const trimmed = title.trim();
+    if (trimmed.length == 0) {
+      return;
+    }
+    pageTitle.value = trimmed;
+    uni.setNavigationBarTitle({ title: trimmed });
+  };
+
+  /**
+   * App：在已加载的网页上下文里读 document.title，经原生桥回传本页 @message。
+   * 外链页没有 uni H5 运行时，优先 __uniapp_x_postMessage（容器注入）。
+   */
+  const readDocumentTitleFromWebView = (): void => {
+    // #ifdef APP
+    try {
+      const ctx = uni.createWebviewContext(
+        "external-link-webview",
+        instance != null ? instance.proxy : null,
+      );
+      if (ctx == null) {
+        return;
+      }
+      ctx.evalJS(
+        "(function(){try{var t=document.title||'';if(!t){return;}var payload={type:'external-link-title',title:t};if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:payload});return;}if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:payload});}}catch(e){}})()",
+      );
+    } catch (_e) {
+      // ignore
+    }
+    // #endif
+  };
+
+  const stopTitlePoll = (): void => {
+    if (titlePollTimer != 0) {
+      clearInterval(titlePollTimer);
+      titlePollTimer = 0;
+    }
+  };
+
+  const handleWebviewLoad = (_e: any): void => {
+    fixAppWebviewTextZoom();
+    readDocumentTitleFromWebView();
+    stopTitlePoll();
+    titlePollCount = 0;
+    titlePollTimer = setInterval((): void => {
+      titlePollCount++;
+      readDocumentTitleFromWebView();
+      if (titlePollCount >= 8) {
+        stopTitlePoll();
+      }
+    }, 400) as number;
+  };
+
+  const unwrapBridgeMessage = (data: any | null): UTSJSONObject | null => {
+    let current: any | null = data;
+    let depth = 0;
+    while (current != null && depth < 8) {
+      depth += 1;
+      if (Array.isArray(current)) {
+        const arr = current as any[];
+        if (arr.length == 0) {
+          return null;
+        }
+        current = arr[arr.length - 1];
+        continue;
+      }
+      const obj = current as UTSJSONObject;
+      if (obj["type"] != null) {
+        return obj;
+      }
+      const nested = obj["data"];
+      if (nested == null) {
+        return null;
+      }
+      current = nested;
+    }
+    return null;
+  };
+
+  const handleWebviewMessage = (e: UniWebViewMessageEvent): void => {
+    const msg = unwrapBridgeMessage(e.detail.data);
+    if (msg == null) {
+      return;
+    }
+    if (`${msg["type"]}` != "external-link-title") {
+      return;
+    }
+    const titleRaw = msg["title"];
+    if (titleRaw == null) {
+      return;
+    }
+    applyPageTitle(`${titleRaw}`);
+  };
+
+  const decodeParam = (raw: any | null): string => {
+    if (raw == null) {
+      return "";
+    }
+    const text = `${raw}`;
+    if (text.length == 0) {
+      return "";
+    }
+    const decoded = decodeURIComponent(text);
+    return decoded != null ? decoded : "";
+  };
+
+  /**
+   * 从链接 query 取指定键（不依赖 Web URL，兼容 App/Kotlin）。
+   * 对齐 webview 页：站内外链常把标题放在 ?title= 上。
+   */
+  const extractQueryValue = (url: string, key: string): string => {
+    let path = url;
+    const hashIdx = path.indexOf("#");
+    if (hashIdx >= 0) {
+      path = path.substring(0, hashIdx);
+    }
+    const qIdx = path.indexOf("?");
+    if (qIdx < 0) {
+      return "";
+    }
+    const query = path.substring(qIdx + 1);
+    const prefix = `${key}=`;
+    const pairs = query.split("&");
+    for (let i = 0; i < pairs.length; i++) {
+      const pair = pairs[i];
+      if (pair.indexOf(prefix) != 0) {
+        continue;
+      }
+      const raw = pair.substring(prefix.length);
+      if (raw.length == 0) {
+        return "";
+      }
+      const decoded = decodeURIComponent(raw.replaceAll("+", " "));
+      return decoded != null ? decoded : "";
+    }
+    return "";
+  };
+
+  onLoad((params: OnLoadOptions) => {
+    const href = decodeParam(params["url"]);
+    const routeTitle = decodeParam(params["title"]);
+    const urlTitle = extractQueryValue(href, "title");
+    const resolvedTitle =
+      routeTitle.length > 0 ? routeTitle : urlTitle;
+    if (resolvedTitle.length > 0) {
+      applyPageTitle(resolvedTitle);
+    }
+
+    if (href.length == 0 || isHttpUrl(href) == false) {
+      uni.showToast({
+        title: t("Mobile.Link.invalidConfig"),
+        icon: "none",
+      });
+      return;
+    }
+    pageUrl.value = href;
+    fixAppWebviewTextZoom();
+  });
+
+  onUnmounted(() => {
+    stopTitlePoll();
+  });
+</script>
+
+<style lang="scss" scoped>
+  .external-link-page {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .external-link-nav {
+    flex-shrink: 0;
+    position: relative;
+    z-index: 20;
+    background: #fff;
+  }
+
+  .external-link-content {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .external-link-web-view {
+    width: 100%;
+    height: 100%;
+  }
+
+  .external-link-placeholder {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+</style>

@@ -1,64 +1,162 @@
 <template>
-  <!-- #ifdef H5 || WEB -->
-  <!-- 自定义导航栏 -->
-  <custom-nav-bar :title="displayPageTitle">
-    <template v-slot:left>
-      <text class="iconfont icon-a-Chevronleft" @tap="onBackClick"></text>
-    </template>
-  </custom-nav-bar>
-  <!-- #endif -->
+  <view class="webview-page page-container">
+    <!-- #ifdef H5 || WEB || APP -->
+    <!-- Web 与 App 统一使用自定义导航栏；安全区覆盖 Android 状态栏和 iOS 刘海区域。 -->
+    <custom-nav-bar
+      class="webview-nav"
+      :title="displayPageTitle"
+      :has-safety-zone="true"
+    >
+      <template v-slot:left>
+        <view class="webview-back" @click="onBackClick">
+          <svg-icon name="icon-a-Chevronleft" size="44" />
+        </view>
+      </template>
+      <template v-slot:right>
+        <svg-icon
+          v-if="showShare"
+          name="icon-AppShare"
+          size="44"
+          @click="handleShare"
+        />
+      </template>
+    </custom-nav-bar>
+    <!-- #endif -->
 
-  <web-view
-    class="web-view page-container"
-    v-if="url.length != 0"
-    :src="url"
-    id="webview"
-    @error="handleWebviewError"
-    @load="handleWebviewLoad"
-    @message="handleWebviewMessage"
-  ></web-view>
+    <view class="webview-content">
+      <web-view
+        class="web-view"
+        v-if="url.length != 0"
+        :src="url"
+        id="webview"
+        <!-- #ifndef APP -->
+        @error="handleWebviewError"
+        <!-- #endif -->
+        @load="handleWebviewLoad"
+        @message="handleWebviewMessage"
+      ></web-view>
+      <!-- #ifdef APP -->
+      <!-- 不可见占位：Android 内容区只有 web-view 时会走全屏原生层，createWebviewContext 拿不到，token 注入会失效。 -->
+      <view class="webview-placeholder" />
+      <!-- #endif -->
+    </view>
+  </view>
 </template>
 
 <script lang="uts" setup>
+  import { switchMainTab } from "@/utils/mainTabNavigation";
+
   import { computed, ref } from "vue";
-  import { removeQueryCompat } from "@/utils/common.uts";
+  // #ifdef APP
+  import { getCurrentInstance } from "vue";
+  // #endif
+  import { removeQueryCompat, isHttpUrl } from "@/utils/common";
   import { NO_LOGIN_CHECK_URL } from "@/constants/config";
+  // #ifdef APP
+  import { getApiBaseUrl } from "@/constants/config";
+  // #endif
   import { apiUserTicketCreate } from "@/servers/agentDev";
+  import { ACCESS_TOKEN } from "@/constants/home.constants";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { onAddToFavorites } from "@dcloudio/uni-app";
-  import { isHttpUrl } from "@/utils/common.uts";
-  import { isTabPage } from "@/utils/commonBusiness.uts";
-  import { useI18n } from "@/utils/i18n";
+  import { onLoad, onUnload, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
+  import { isRepoLibraryPath } from "@/utils/repoLibraryLink";
+  import { isTabPage } from "@/utils/commonBusiness";
+  // #ifdef APP-IOS
+  // iOS：返回时须显式恢复 TabBar（常驻壳关壳可能 hide 过）
+  import { navigateBackByBackUrl } from "@/utils/commonBusiness";
+  // #endif
+  import { useI18n, emptyI18nParams } from "@/utils/i18n";
+  // App 端内嵌 H5 字体放大修复：Android 强制 webview textZoom = 100%（iOS 无此问题，自动跳过）
+  import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
+  import { useShareLink, ShareLinkOptions } from "@/hooks/useShareLink";
 
-  const { t } = useI18n();
+  const { t: tFn } = useI18n();
+  const t = (key: string): string => tFn(key, emptyI18nParams(), "");
+  // uvue 中直接调用 t() 会因缺少 params 形参报错，这里包一层单参版本
 
-  const url = ref("");
-  const method = ref("");
-  const data_type = ref("");
-  const request_id = ref("");
-  const pageTitle = ref("");
+  const url = ref<string>("");
+  const method = ref<string>("");
+  const data_type = ref<string>("");
+  const request_id = ref<string>("");
+  const pageTitle = ref<string>("");
+  // 分享按钮显隐：调用方在本页路由上传 hideShare=1 即可隐藏（如「关于我们」这类纯展示页）
+  const showShare = ref<boolean>(true);
+  // 资料库页要写入 localStorage 的登录 token。非资料库、未取到票据时为空。
+  // 小程序 web-view 不能 evalJS，票据只走地址上的 _ticket。
+  let repoPageTicket = "";
+  // #ifdef APP
+  const instance = getCurrentInstance();
+  let webViewContext: WebviewContext | null = null;
+  let repoCookieTimer: number = 0;
+  let repoCookieAttempts = 0;
+  // #endif
+
   const displayPageTitle = computed(
-    () => pageTitle.value || t("Mobile.Webview.defaultTitle"),
+    (): string =>
+      pageTitle.value.length > 0 ? pageTitle.value : t("Mobile.Webview.defaultTitle"),
   );
 
-  const getQueryParams = (url) => {
-    const queryString = url.split("?")[1] || "";
+  /**
+   * 还原 webview 的 url 参数。
+   * 资料库链接会编码两次，避开 iOS 对整段路由的一次 decodeURI；
+   * 其它调用方仍是编码一次或已是绝对地址，循环解开到 http(s) 或站内路径即可。
+   */
+  const unwrapWebviewUrl = (raw: string): string => {
+    let value = raw.trim();
+    for (let i = 0; i < 2; i++) {
+      if (
+        value.indexOf("http://") == 0 ||
+        value.indexOf("https://") == 0 ||
+        (value.indexOf("/") == 0 && value.indexOf("//") != 0)
+      ) {
+        return value;
+      }
+      if (value.indexOf("%") < 0) {
+        break;
+      }
+      try {
+        const next = decodeURIComponent(value);
+        const nextText = next != null ? `${next}` : "";
+        if (nextText.length == 0 || nextText == value) {
+          break;
+        }
+        value = nextText;
+      } catch (_e) {
+        break;
+      }
+    }
+    return value;
+  };
+
+  // 获取查询参数
+  const getQueryParams = (url: string): UTSJSONObject => {
+    const parts = url.split("?");
+    const queryString = parts.length > 1 ? parts[1] : "";
     const pairs = queryString.split("&");
-    const params = {};
-    for (let pair of pairs) {
-      if (!pair) continue;
-      const [k, v] = pair.split("=");
-      params[decodeURIComponent(k)] = decodeURIComponent(v || "");
+    const params = new UTSJSONObject();
+    for (let i = 0; i < pairs.length; i++) {
+      const pair = pairs[i];
+      if (pair.length == 0) {
+        continue;
+      }
+      const kv = pair.split("=");
+      const k = kv.length > 0 ? kv[0] : "";
+      const v = kv.length > 1 ? kv[1] : "";
+      const decK = decodeURIComponent(k);
+      const decV = decodeURIComponent(v);
+      const keyStr = decK != null ? decK : "";
+      const valStr = decV != null ? decV : "";
+      params[keyStr] = valStr;
     }
     return params;
   };
 
   // 判断是否需要调用接口
-  const isNeedCallApi = computed(() => {
-    return !!(
-      method.value === "browser_navigate_page" &&
-      data_type.value &&
-      request_id.value
+  const isNeedCallApi = computed((): boolean => {
+    return (
+      method.value == "browser_navigate_page" &&
+      data_type.value.length > 0 &&
+      request_id.value.length > 0
     );
   });
 
@@ -72,9 +170,142 @@
     });
   };
 
+  /** 本地登录 token。鸿蒙清空时会写成空串。 */
+  const readCachedAccessToken = (): string => {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    if (tokenRaw == null) {
+      return "";
+    }
+    return `${tokenRaw}`.trim();
+  };
+
+  /**
+   * 从地址里取出完整 `_ticket`。
+   * 通用查询解析按第一个 `=` 截断，票据里的填充符会被切掉。
+   */
+  const readQueryTicket = (raw: string): string => {
+    const hashIdx = raw.indexOf("#");
+    const withoutHash = hashIdx >= 0 ? raw.substring(0, hashIdx) : raw;
+    const marker = "_ticket=";
+    const idx = withoutHash.indexOf(marker);
+    if (idx < 0) {
+      return "";
+    }
+    const start = idx + marker.length;
+    const amp = withoutHash.indexOf("&", start);
+    const encoded = amp >= 0 ? withoutHash.substring(start, amp) : withoutHash.substring(start);
+    if (encoded.length == 0) {
+      return "";
+    }
+    try {
+      const decoded = decodeURIComponent(encoded);
+      return decoded != null ? `${decoded}` : encoded;
+    } catch (_e) {
+      return encoded;
+    }
+  };
+
+  /**
+   * 记下资料库页的 ticket，供打开后写入登录 token。
+   * 其它页面只把 _ticket 放在地址上。
+   */
+  const rememberRepoPageTicket = (pageUrl: string, ticket: string): void => {
+    let value = ticket.trim();
+    const hashIdx = value.indexOf("#");
+    if (hashIdx >= 0) {
+      value = value.substring(0, hashIdx).trim();
+    }
+    if (value.length == 0 || isRepoLibraryPath(pageUrl) == false) {
+      repoPageTicket = "";
+      return;
+    }
+    repoPageTicket = value;
+  };
+
+  // #ifdef APP
+  const stopRepoTicketCookieInject = (): void => {
+    if (repoCookieTimer != 0) {
+      clearInterval(repoCookieTimer);
+      repoCookieTimer = 0;
+    }
+  };
+
+  /**
+   * 在已打开的资料库文档上写入登录态：
+   * localStorage 的 ACCESS_TOKEN、内嵌标记。
+   * 地址还不是资料库页时跳过。
+   * 返回 true 只表示拿到 context 且 evalJS 没有抛错。
+   */
+  const injectRepoTicketCookieOnce = (): boolean => {
+    if (repoPageTicket.length == 0) {
+      return false;
+    }
+    let ctx: WebviewContext | null = webViewContext;
+    if (ctx == null) {
+      try {
+        ctx = uni.createWebviewContext(
+          "webview",
+          instance != null ? instance.proxy : null,
+        );
+        webViewContext = ctx;
+      } catch (_e) {
+        return false;
+      }
+      if (ctx == null) {
+        return false;
+      }
+    }
+    const cachedToken = readCachedAccessToken();
+    const tokenToInject = cachedToken.length > 0 ? cachedToken : repoPageTicket;
+    const ticketLiteral = JSON.stringify(tokenToInject);
+    // 资料库文档不在 /m/ 下，相对路径 ./static 会落到 /repo/doc/，改为站点 /m/ 下的 JSSDK。
+    const sdkLiteral = JSON.stringify(`${getApiBaseUrl()}/m/static/uni.webview.1.5.5.js`);
+    try {
+      ctx.evalJS(
+        `try{var h=location.pathname||'';if(h.indexOf('/repo/')!=0){return;}try{if(!window.uni||!uni.webView){var s=document.createElement('script');s.src=${sdkLiteral};document.head.appendChild(s);}}catch(e){}try{localStorage.setItem('ACCESS_TOKEN',${ticketLiteral});}catch(e){}window.__nuwaxSetAppEmbedded&&window.__nuwaxSetAppEmbedded();}catch(e){}`,
+      );
+    } catch (_e) {
+      return false;
+    }
+    return true;
+  };
+
+  /**
+   * 文档加载后短轮询写入登录态。
+   * 加载过程中的 evalJS 可能落在中间文档上，页面内跳转后需要再写一次。
+   */
+  const startRepoTicketCookieInject = (): void => {
+    stopRepoTicketCookieInject();
+    webViewContext = null;
+    if (repoPageTicket.length == 0) {
+      return;
+    }
+    repoCookieAttempts = 0;
+    injectRepoTicketCookieOnce();
+    repoCookieTimer = setInterval((): void => {
+      repoCookieAttempts++;
+      injectRepoTicketCookieOnce();
+      if (repoCookieAttempts >= 12) {
+        stopRepoTicketCookieInject();
+      }
+    }, 250) as number;
+  };
+  // #endif
+
+  const injectRepoTicketCookie = (): void => {
+    // #ifdef APP
+    startRepoTicketCookieInject();
+    // #endif
+  };
+
   // WebView 加载完成
   const handleWebviewLoad = (e: any) => {
-    // #ifdef MP-WEIXIN
+    // Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
+    fixAppWebviewTextZoom();
+    if (repoPageTicket.length > 0) {
+      injectRepoTicketCookie();
+    }
+    // #ifdef MP-WEIXIN || APP
     if (isNeedCallApi.value) {
       uni.showLoading({
         title: t("Mobile.Webview.aiReading"),
@@ -103,19 +334,30 @@
    * 3. 如果没有，检查网页端代码是否正确调用 wx.miniProgram.postMessage
    */
   const handleWebviewMessage = (e: any) => {
-    // #ifdef MP-WEIXIN
+    // #ifdef MP-WEIXIN || APP
 
     // e.detail.data 是一个数组，包含所有 postMessage 发送的消息
-    const messages = e.detail.data;
+    const detail = (e as UTSJSONObject)["detail"];
+    const messages =
+      detail != null ? (detail as UTSJSONObject)["data"] : null;
 
-    if (isNeedCallApi.value && messages && messages.length > 0) {
-      // 处理最后一条消息 - 读取首页内容
-      uni.$emit("browser_navigate_page", {
-        method: method.value,
-        data_type: data_type.value,
-        html: messages[messages.length - 1].html,
-        request_id: request_id.value,
-      });
+    if (isNeedCallApi.value && messages != null) {
+      const arr = messages as UTSJSONObject[];
+      if (arr.length > 0) {
+        // 处理最后一条消息 - 读取首页内容
+        const lastMsg = arr[arr.length - 1];
+        uni.$emit(
+          "browser_navigate_page",
+          {
+            method: method.value,
+            data_type: data_type.value,
+            html: lastMsg["html"],
+            request_id: request_id.value,
+          } as UTSJSONObject,
+        );
+      } else {
+        console.warn("消息数组为空");
+      }
     } else {
       console.warn("消息数组为空");
     }
@@ -123,110 +365,260 @@
   };
 
   /**
-   * 获取分享链接
+   * 清理当前 webview 地址：去除 _ticket / jump_type 后重新标记为外部跳转来源。
+   * 小程序转发（拼进内部路径）与「复制链接/系统分享」（需要真实可直接打开的外链）共用同一份清理逻辑。
    */
-  const getSharingLink = () => {
+  const buildCleanShareTargetUrl = (): string => {
     const newUrl = removeQueryCompat(url.value, ["_ticket", "jump_type"]);
     const andStr = newUrl.includes("?") ? "&" : "?";
-    const currentUrl = newUrl + andStr + "jump_type=outer";
-    return encodeURIComponent(currentUrl);
+    return newUrl + andStr + "jump_type=outer";
   };
 
-  const onBackClick = () => {
-    const backUrl = uni.getStorageSync("backUrl");
-    // 首页是 tabbar 页面，必须使用 switchTab 跳转
-    const toUrl = backUrl && backUrl !== "/" ? backUrl : "/pages/index/index";
+  /**
+   * 获取分享链接（用于小程序转发/收藏路径拼接，需 encode 后作为查询参数值）
+   */
+  const getSharingLink = () => {
+    return encodeURIComponent(buildCleanShareTargetUrl());
+  };
 
+  /** 分享链接：H5/WEB 复制链接面板、App 系统分享面板共用，直接是可打开的外链，无需再 encode */
+  const getShareUrl = async (): Promise<string> => {
+    return buildCleanShareTargetUrl();
+  };
+
+  // 分享交互统一由 useShareLink 提供，与 file-preview-page 共用同一套逻辑：
+  // H5/WEB 点击分享直接复制链接；App 端唤起系统分享面板。模板无需渲染任何分享面板组件。
+  // 入参须 new + 逐字段赋值（不能传对象字面量，Android UTS 编译器会把字面量误推导成
+  // UTSJSONObject 而报参数类型不匹配，与 usePageResume 的 PageResumeOptions 同一避坑写法）。
+  const shareOptions = new ShareLinkOptions();
+  shareOptions.getShareTitle = () => displayPageTitle.value;
+  shareOptions.getShareUrl = getShareUrl;
+  const share = useShareLink(shareOptions);
+  const handleShare = share.handleShare;
+
+  const onBackClick = () => {
+    const pages = getCurrentPages();
+    if (pages.length > 1) {
+      uni.navigateBack({ delta: 1 });
+      return;
+    }
+
+    // 栈只剩本页（H5 刷新 / 直接打开）：按 storage 里的来源落地
+    const backUrlRaw = uni.getStorageSync("backUrl");
+    const backUrl = backUrlRaw != null ? `${backUrlRaw}` : "";
+    const toUrl =
+      backUrl.length > 0 && backUrl != "/" ? backUrl : "/pages/message/message";
+
+    // #ifdef APP-IOS
+    // iOS：常驻壳关壳时 TabBar 可能仍被 hide，回 Tab 前须显式恢复
+    navigateBackByBackUrl(toUrl);
+    // #endif
+    // #ifndef APP-IOS
     if (isTabPage(toUrl)) {
-      uni.switchTab({ url: toUrl });
+      switchMainTab({ url: toUrl });
     } else {
       uni.redirectTo({ url: toUrl });
     }
+    // #endif
     uni.removeStorageSync("backUrl");
   };
 
   // 初始化加载
-  const onLoadInit = async (params: UTSJSONObject) => {
-    if (params.url) {
-      let currentUrl = decodeURIComponent(params.url);
-      const queryParams = getQueryParams(currentUrl);
+  const onLoadInit = async (params: OnLoadOptions) => {
+    // 分享按钮显隐先于 url 校验读取，url 缺失时也保持调用方指定的形态
+    const hideShareVal = params["hideShare"];
+    showShare.value = !(hideShareVal != null && `${hideShareVal}` == "1");
+    // 外部站点自带鉴权参数时传 noTicket=1，避免把主站 _ticket 拼给第三方域名
+    const noTicketVal = params["noTicket"];
+    const noTicket = noTicketVal != null && `${noTicketVal}` == "1";
 
-      // 设置页面标题
-      const title = queryParams.title || t("Mobile.Webview.defaultTitle");
-      pageTitle.value = title;
-      uni.setNavigationBarTitle({
-        title: title,
-      });
+    const urlVal = params["url"];
+    if (urlVal == null) {
+      return;
+    }
+    const urlStr = `${urlVal}`;
+    const currentUrl = unwrapWebviewUrl(urlStr);
+    if (currentUrl.length == 0) {
+      return;
+    }
+    const queryParams = getQueryParams(currentUrl);
 
-      // #ifdef H5 || WEB
-      if (isHttpUrl(currentUrl)) {
-        url.value = currentUrl;
-      } else {
-        url.value = window.location.origin + currentUrl;
+    // 设置页面标题：优先取本页路由参数 title（外部链接不便在目标 URL 上拼 query），
+    // 其次取目标 URL 自带的 title（站内页沿用原有约定），都没有才用默认标题
+    const routeTitleRaw = params["title"];
+    let routeTitle = "";
+    if (routeTitleRaw != null) {
+      // 调用方按路由约定做过 encodeURIComponent，这里与 url 参数一致地解码
+      const decodedTitle = decodeURIComponent(`${routeTitleRaw}`);
+      routeTitle = decodedTitle != null ? decodedTitle : "";
+    }
+    const titleRaw = queryParams["title"];
+    const title =
+      routeTitle.length > 0
+        ? routeTitle
+        : (titleRaw != null ? `${titleRaw}` : t("Mobile.Webview.defaultTitle"));
+    pageTitle.value = title;
+    uni.setNavigationBarTitle({
+      title: title,
+    });
+
+    // #ifdef H5 || WEB
+    if (isHttpUrl(currentUrl)) {
+      url.value = currentUrl;
+    } else if (`${window.location.protocol}` == "file:") {
+      // 本地包的 origin 是 file://。相对路径拼上去会打开包内 index，也就是 App 首页。
+      return;
+    } else {
+      url.value = window.location.origin + currentUrl;
+    }
+    // #endif
+
+    // #ifdef MP-WEIXIN || APP
+    // 判断当前url是否不需要登录检查
+    if (noTicket || NO_LOGIN_CHECK_URL.includes(currentUrl)) {
+      url.value = currentUrl;
+      if (isRepoLibraryPath(currentUrl)) {
+        console.log(`[repo-link] preview src=${currentUrl}`);
       }
-      // #endif
+      return;
+    }
 
+    const methodVal = queryParams["method"];
+    if (methodVal != null) {
+      method.value = `${methodVal}`;
+    }
+    const dtVal = queryParams["data_type"];
+    if (dtVal != null) {
+      data_type.value = `${dtVal}`;
+    }
+    const riVal = queryParams["request_id"];
+    if (riVal != null) {
+      request_id.value = `${riVal}`;
+    }
+
+    // 判断是否存在 _ticket
+    const ticketVal = queryParams["_ticket"];
+    if (ticketVal != null) {
+      url.value = currentUrl;
+      if (isRepoLibraryPath(currentUrl)) {
+        const existingTicket = readQueryTicket(currentUrl);
+        rememberRepoPageTicket(
+          currentUrl,
+          existingTicket.length > 0 ? existingTicket : `${ticketVal}`,
+        );
+        injectRepoTicketCookie();
+      }
+    } else {
+      // 暂存当前url（仅微信小程序读取 globalThis.appConfig，APP 端无读取方）
       // #ifdef MP-WEIXIN
-      // 判断当前url是否不需要登录检查
-      if (NO_LOGIN_CHECK_URL.includes(currentUrl)) {
-        url.value = currentUrl;
-        return;
-      }
-
-      if (queryParams.method) {
-        method.value = queryParams.method;
-      }
-      if (queryParams.data_type) {
-        data_type.value = queryParams.data_type;
-      }
-      if (queryParams.request_id) {
-        request_id.value = queryParams.request_id;
-      }
-
-      // 判断是否存在 _ticket
-      if (queryParams._ticket) {
-        url.value = currentUrl;
+      globalThis.appConfig.redirectUrl = urlStr; // 未解码
+      // #endif
+      const ticketResult = await apiUserTicketCreate();
+      if (ticketResult.code == SUCCESS_CODE && ticketResult.data != null) {
+        // 带锚点(#fragment)的 URL 须把 _ticket 插在 # 之前，拼在末尾目标页读不到
+        const hashIdx = currentUrl.indexOf("#");
+        const baseUrl = hashIdx >= 0 ? currentUrl.substring(0, hashIdx) : currentUrl;
+        const hashStr = hashIdx >= 0 ? currentUrl.substring(hashIdx) : "";
+        const andStr = baseUrl.includes("?") ? "&" : "?";
+        const createdTicket = `${ticketResult.data}`;
+        url.value = baseUrl + andStr + `_ticket=${createdTicket}` + hashStr;
+        if (isRepoLibraryPath(currentUrl)) {
+          rememberRepoPageTicket(currentUrl, createdTicket);
+          injectRepoTicketCookie();
+        }
       } else {
-        // 暂存当前url
-        globalThis.appConfig.redirectUrl = params.url; // 未解码
-        const ticketResult = await apiUserTicketCreate();
-        if (ticketResult.code === SUCCESS_CODE && ticketResult.data) {
-          const andStr = currentUrl.includes("?") ? "&" : "?";
-          url.value = currentUrl + andStr + `_ticket=${ticketResult.data}`;
+        // ticket 获取失败也加载原地址：web-view 仅在 url 非空时挂载，
+        // 不兜底会整页白屏（目标站自身的登录/错误页至少可见、可操作）。
+        // 仅资料库页改用本地登录 token 写入 localStorage。
+        url.value = currentUrl;
+
+        // 资料库链接地址需要注入token信息到localStorage中，用于验证用户身份和权限。注入
+        if (isRepoLibraryPath(currentUrl)) {
+          const cachedToken = readCachedAccessToken();
+          if (cachedToken.length > 0) {
+            rememberRepoPageTicket(currentUrl, cachedToken);
+            injectRepoTicketCookie();
+          }
         }
       }
-      // #endif
     }
+    // #endif
   };
 
-  onLoad((params) => {
-    // 加载初始化数据
+  onLoad((params: OnLoadOptions) => {
     onLoadInit(params);
+    fixAppWebviewTextZoom();
+  });
+
+  onUnload(() => {
+    // #ifdef APP
+    stopRepoTicketCookieInject();
+    // #endif
   });
 
   // #ifdef MP-WEIXIN
   // 转发给朋友
   onShareAppMessage(() => {
+    const params = getQueryParams(url.value);
+    const titleVal = params["title"];
     return {
       title:
-        getQueryParams(url.value)?.["title"] || t("Mobile.Common.appName"),
+        titleVal != null ? `${titleVal}` : t("Mobile.Common.appName"),
       path: "/subpackages/pages/webview/webview?url=" + getSharingLink(),
-    };
+    } as UTSJSONObject;
   });
 
   // 收藏
   onAddToFavorites(() => {
+    const params = getQueryParams(url.value);
+    const titleVal = params["title"];
     return {
       title:
-        getQueryParams(url.value)?.["title"] || t("Mobile.Common.appName"),
+        titleVal != null ? `${titleVal}` : t("Mobile.Common.appName"),
       query: "url=" + getSharingLink(),
-    };
+    } as UTSJSONObject;
   });
   // #endif
 </script>
 
 <style lang="scss" scoped>
+  .webview-page {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .webview-nav {
+    flex-shrink: 0;
+    position: relative;
+    z-index: 20;
+    background: #fff;
+  }
+
+  .webview-back {
+    width: 64rpx;
+    height: 64rpx;
+    margin-left: -10rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .webview-content {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
   .web-view {
     width: 100%;
+    height: 100%;
+  }
+
+  .webview-placeholder {
+    width: 0;
+    height: 0;
+    overflow: hidden;
   }
 </style>

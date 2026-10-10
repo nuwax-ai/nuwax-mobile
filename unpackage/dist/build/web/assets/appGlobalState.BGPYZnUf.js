@@ -1,0 +1,1 @@
+import"./index-pO_ej_q7.js";const e=new class{constructor(){this.localAgentList=[],this.searchPlaceholder="",this.pendingHomeAgentTargetId=0,this.pendingHomeAgentName="",this.pendingHomeAgentIcon=""}};export{e as a};

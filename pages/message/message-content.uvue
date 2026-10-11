@@ -89,8 +89,7 @@
               class="chat-item"
               :class="[pressedRowCls(conv.convId), rowMenuOnCls(conv.convId), pinnedRowCls(conv)]"
               @click="handleConvRowClick(conv)"
-              @longpress="handleConvRowLongPress(conv)"
-              @touchstart="handleRowTouchStart(conv.convId, $event)"
+              @touchstart="handleConvRowTouchStart(conv, $event)"
               @touchmove="handleRowTouchMove($event)"
               @touchend="handleConvRowTouchEnd(conv, $event)"
               @touchcancel="handleRowTouchCancel"
@@ -242,8 +241,7 @@
                 class="chat-item"
                 :class="[pressedRowCls(`ct-${contact.userId}`), rowMenuOnCls(`ct-${contact.userId}`)]"
                 @click="handlePendingOutRowClick(contact)"
-                @longpress="handleContactRowLongPress(contact)"
-                @touchstart="handleRowTouchStart(`ct-${contact.userId}`, $event)"
+                @touchstart="handleContactRowTouchStart(contact, $event)"
                 @touchmove="handleRowTouchMove($event)"
                 @touchend="handlePendingOutRowTouchEnd(contact, $event)"
                 @touchcancel="handleRowTouchCancel"
@@ -393,8 +391,7 @@
                   class="chat-item"
                   :class="[pressedRowCls(group.convId), rowMenuOnCls(group.convId)]"
                   @click="handleConvRowClick(group)"
-                  @longpress="handleGroupRowLongPress(group)"
-                  @touchstart="handleRowTouchStart(group.convId, $event)"
+                  @touchstart="handleGroupRowTouchStart(group, $event)"
                   @touchmove="handleRowTouchMove($event)"
                   @touchend="handleConvRowTouchEnd(group, $event)"
                   @touchcancel="handleRowTouchCancel"
@@ -455,8 +452,7 @@
                 class="chat-item"
                 :class="[pressedRowCls(`ct-${contact.userId}`), rowMenuOnCls(`ct-${contact.userId}`)]"
                 @click="handleContactRowClick(contact)"
-                @longpress="handleContactRowLongPress(contact)"
-                @touchstart="handleRowTouchStart(`ct-${contact.userId}`, $event)"
+                @touchstart="handleContactRowTouchStart(contact, $event)"
                 @touchmove="handleRowTouchMove($event)"
                 @touchend="handleContactRowTouchEnd(contact, $event)"
                 @touchcancel="handleRowTouchCancel"
@@ -743,7 +739,9 @@
   // 此刻才挂激活底色 ~300ms；click 紧随 touchend 到达，各点击入口的 flashRowPressed
   // 重置计时覆盖页面转场。位移超 6px 判定为滑动、触摸被取消（touchcancel，Android
   // 滚动接管）一律不闪，全程无灰底。
-  // 滚动抑制（listScrolling）：惯性滚动中点停列表的抬手不闪（touchend 里检查）。
+  // 滚动抑制（rowTouchDuringScroll 起手快照）：起手于滚动中（点停惯性滚动）的抬手
+  // 不闪不派发；快照在 touchstart 落定，滚动停稳 ≥80ms 后的真实点击不再被
+  // listScrolling 的 160ms idle 尾窗连坐（见 rowTouchDuringScroll 声明处注释）。
   // ★不用 hover-class：Android 上触摸被滚动接管后按压底色会粘住不灭
   //   （长按后上下滑、快速滑动扫过的行被点亮，松手后残留；把 hover-class
   //   值改成 'none' 也清不掉已激活样式）。
@@ -755,10 +753,27 @@
   let touchingRowPending = "";
   let rowTouchStartX = 0;
   let rowTouchStartY = 0;
+  /** 起手快照：touchstart 时距最近滚动事件 <80ms（fling 进行中触摸，scroll 事件每帧
+   *  在发）= 点停惯性滚动的手势。抬手时才查 listScrolling 会被其 160ms idle 尾窗连坐：
+   *  滚动停稳后的真实点击先被拦派发、settleRowTouchEnd 里刚置上的 500ms 防重窗又吞掉
+   *  随后补发的合成 click——双通道全死、这次点击净丢失（三星 fling 快而长，点停后紧点
+   *  行「没反应」即此）。80ms 介于 fling 帧间隔(~16ms)与人手反应时(≥150ms)之间。 */
+  let rowTouchDuringScroll = false;
   /** 本轮手势是否弹出了长按浮层（openRowMenu 置位、touchstart 清零）：弹浮层手势的
-   *  抬手绝不派发——持按超过 600ms 吞击窗再松手时，rowClickIntercept 会把它当
+   *  抬手绝不派发——持按超过 800ms 吞击窗再松手时，rowClickIntercept 会把它当
    *  「超时到达的真实点击」走到收浮层分支（长按松手浮层自关的回归即此）。 */
   let rowTouchMenuArmed = false;
+  /** 长按自计时器（撤 @longpress 后自计时，见 armRowLongPress；在此先声明是因为
+   *  clearRowTouch 要清它——滑动/取消/滚动接管/抬手任一终结即弃，到点不得再弹）。 */
+  let rowLongPressTimer = 0;
+
+  /** 清长按自计时（与 touchingRowPending 同生命周期，clearRowTouch 统一调）。 */
+  function cancelRowLongPress(): void {
+    if (rowLongPressTimer != 0) {
+      clearTimeout(rowLongPressTimer);
+      rowLongPressTimer = 0;
+    }
+  }
 
   // ===== 三星可靠点按（utils/reliableTap.uts）：touchend 主通道派发 + click 兜底 =====
   // 三星 One UI 触控灵敏，按压触下瞬间带微移即被原生层判为手势、不合成 click
@@ -791,8 +806,10 @@
     }, 300);
   }
 
-  const listScrolling = ref<boolean>(false);
-  let listScrollIdleTimer = 0;
+  /** 最近一次滚动事件时刻（handleListScroll 记；rowTouchDuringScroll 起手快照用）。
+   *  原 listScrolling + 160ms idle 尾窗已撤：读点全改起手快照（尾窗连坐死点击，见
+   *  rowTouchDuringScroll 声明处注释）。 */
+  let lastScrollEventAt = 0;
 
   // ===== 长按行操作浮层 / 横滑切 tab 页级状态（须先于 handleListScroll 等使用方：UTS 不提升声明）=====
   /** 气泡操作项：文案 + iconfont 图标名（svg-icon 渲染，同尺寸异形）。 */
@@ -858,48 +875,50 @@
     rowMenuRowId = "";
   }
 
-  /** 清行触摸判定态（任何触摸结束路径都调它，杜绝粘滞）。 */
+  /** 清行触摸判定态（任何触摸结束路径都调它，杜绝粘滞）。长按自计时一并清：
+   *  计时存续期间手势已被滑动/取消/滚动接管/抬手终结，到点不得再弹。 */
   function clearRowTouch(): void {
     touchingRowPending = "";
+    cancelRowLongPress();
   }
 
   function handleListScroll(): void {
+    lastScrollEventAt = Date.now();
     // 滚动事件 = 手势已被原生滚动接管：立即清触摸判定态（否则抬手会被误判为
     // 点击闪灰）。Android 上子视图 touchmove 在 touchslop(≈8px) 拦截后断流，
     // 位移清除路径走不到（iOS move 持续分发故无此问题），滚动事件是兜底。
     clearRowTouch();
-    if (listScrolling.value != true) {
-      listScrolling.value = true;
-    }
     // 滚动即收起长按操作浮层；横滑切 tab 期间 direction 已锁 none 不产生滚动事件，
     // 不会与切 tab 手势竞争
     if (rowMenuVisible.value) {
       rowMenuVisible.value = false;
     }
-    if (listScrollIdleTimer != 0) {
-      clearTimeout(listScrollIdleTimer);
-    }
-    listScrollIdleTimer = setTimeout(() => {
-      listScrollIdleTimer = 0;
-      listScrolling.value = false;
-    }, 160);
   }
 
   /** 行触摸开始：记起点与待判定行（按住不点亮，点亮推迟到抬手判定为点击时）。
    *  三星可靠点按：先清防重窗再记本轮起点（防上一轮 500ms 窗吞掉快速连点的下一击）；
    *  须在 touches 早退之前喂——touchStart 内含 changedTouches 兜底（鸿蒙系 touches
-   *  可能为空），早退路径的起点也要有值。 */
+   *  可能为空），早退路径的起点也要有值。
+   *  起手快照 rowTouchDuringScroll 在此落定（见其声明处注释）。 */
   function handleRowTouchStart(rowId: string, eventValue: Any): void {
     rowTapGuard.reset();
     rowTapGuard.touchStart(eventValue);
     rowTouchMenuArmed = false;
+    rowTouchDuringScroll = Date.now() - lastScrollEventAt < 80;
     const e = eventValue as UniTouchEvent;
-    if (e.touches.length == 0) {
+    if (e.touches.length > 0) {
+      rowTouchStartX = e.touches[0].clientX;
+      rowTouchStartY = e.touches[0].clientY;
+      touchingRowPending = rowId;
       return;
     }
-    rowTouchStartX = e.touches[0].clientX;
-    rowTouchStartY = e.touches[0].clientY;
-    touchingRowPending = rowId;
+    // 鸿蒙系 touches 可能为空（坐标在 changedTouches，guard 同款兜底）：不记行的话
+    // touchingRowPending 恒空，长按自计时到点必弃、闪灰也不亮。
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      rowTouchStartX = e.changedTouches[0].clientX;
+      rowTouchStartY = e.changedTouches[0].clientY;
+      touchingRowPending = rowId;
+    }
   }
 
   /** 行触摸移动：位移超 6px = 判定为滑动（滚动/左滑/长按拖动），清判定态（全程无灰底）。 */
@@ -922,22 +941,23 @@
 
   /** 行触摸结束（手指真实抬起）公共判定：闪灰 + 三星可靠点按判定。
    *  闪灰：判定态仍非空 + 抬手落点位移 ≤6px = 点击，挂激活底色 ~300ms（各点击入口
-   *  的 flashRowPressed 会重置计时覆盖页面转场）。不闪：滚动中抬手（点停惯性滚动）；
-   *  长按操作浮层开着（含长按弹层后的抬手，rowClickIntercept 会吞派发）；落点位移
-   *  复检不过（兜底 move 断流——Android 滚动接管可在一个帧批内完成、行上一个
-   *  >6px 的 move 都没送达）。
-   *  返回 true = 点按派发主通道放行（guard 位移 ≤10px 且非惯性滚动中）：调用方
+   *  的 flashRowPressed 会重置计时覆盖页面转场）。不闪：起手于滚动中（点停惯性滚动，
+   *  rowTouchDuringScroll 快照）；长按操作浮层开着（含长按弹层后的抬手，
+   *  rowClickIntercept 会吞派发）；落点位移复检不过（兜底 move 断流——Android 滚动
+   *  接管可在一个帧批内完成、行上一个 >6px 的 move 都没送达）。
+   *  返回 true = 点按派发主通道放行（guard 位移 ≤10px 且非起手于滚动中）：调用方
    *  再过 rowClickIntercept 后执行行点击动作（三星微移不合成 click 的兜底主通道）。
-   *  惯性滚动中点停列表的抬手不派发（同闪灰口径；此类平台若仍合成 click，由
-   *  @click 兜底通道接住，与既有行为一致）。
-   *  弹浮层手势（rowTouchMenuArmed）的抬手一律不派发：持按超 600ms 吞击窗再松手
+   *  起手于滚动中的抬手不派发（Android「点停不激活」惯例，同闪灰口径）；起手时列表
+   *  已停 ≥80ms 的真实点击照常派发——不再被 160ms idle 尾窗连坐（此前该尾窗拦下
+   *  派发后，刚置上的 500ms 防重窗又吞掉补发 click，双通道全死、点击净丢失）。
+   *  弹浮层手势（rowTouchMenuArmed）的抬手一律不派发：持按超 800ms 吞击窗再松手
    *  时 rowClickIntercept 会把本轮抬手当「超时到达的真实点击」走到收浮层分支；
    *  吞击位也不在此消费，留给随后平台补发的 click 走原吞法（只吞不关）。 */
   function settleRowTouchEnd(eventValue: Any): boolean {
     const tapFired = rowTapGuard.touchEnd(eventValue);
     if (
       touchingRowPending.length > 0 &&
-      listScrolling.value != true &&
+      rowTouchDuringScroll != true &&
       rowMenuVisible.value != true
     ) {
       const e = eventValue as UniTouchEvent;
@@ -953,12 +973,12 @@
     if (rowTouchMenuArmed) {
       return false;
     }
-    return tapFired && listScrolling.value != true;
+    return tapFired && rowTouchDuringScroll != true;
   }
 
   /** 行触摸被取消（Android 滚动接管/系统打断）：绝不是点击，只清判定态、不闪。
-   *  ★必须与 touchend 分开绑：接管 cancel 可能先于首个滚动事件到达（此刻
-   *  listScrolling 仍 false），并入 touchend 会把刚起步的滚动误判为点击闪灰——
+   *  ★必须与 touchend 分开绑：接管 cancel 可能先于首个滚动事件到达（起手快照
+   *  仍判非滚动中），并入 touchend 会把刚起步的滚动误判为点击闪灰——
    *  表现为按住行上下滑动时灰底闪现（iOS 无接管 cancel，不受影响）。 */
   function handleRowTouchCancel(): void {
     clearRowTouch();
@@ -2615,10 +2635,12 @@
   }
 
   /** 长按弹操作浮层入口：记中转数据并测量行矩形（回调里定位气泡并展开）。
-   *  置吞击位：部分端长按抬手仍补发一次 click，rowClickIntercept 只吞不关（浮层保持）。 */
+   *  置吞击位：撤 @longpress 后无原生长按消费触摸，各端长按抬手都会补发一次 click，
+   *  rowClickIntercept 只吞不关（浮层保持）；窗 800ms 覆盖浮层弹出后再抬手的常见
+   *  反应时延（500ms 到点弹层 + ~300ms 松手）。 */
   function openRowMenu(kind: string, domId: string, conv: ImConvRow | null, contact: ImContactRow | null): void {
     suppressNextSwipeClick = true;
-    suppressSwipeClickUntil = Date.now() + 600;
+    suppressSwipeClickUntil = Date.now() + 800;
     // 本轮手势弹了浮层：其抬手不派发（见 rowTouchMenuArmed 声明处注释）
     rowTouchMenuArmed = true;
     rowMenuPendingKind = kind;
@@ -2662,23 +2684,52 @@
   /** 气泡根节点吞点击：点在气泡空白区不落穿到下方行/入口。 */
   function handleRowMenuPopTap(): void {}
 
-  /** 会话行长按：系统通知会话（合成主体）无操作，不弹浮层。 */
-  function handleConvRowLongPress(conv: ImConvRow): void {
+  /** 长按装填（撤 @longpress 后自计时；声明在 openRowMenu 之后——计时回调要调它，
+   *  UTS 不提升声明）。500ms 对齐 iOS 原生长按体感、跨端统一：Android 原生 ~400ms
+   *  偏短（三星上「按压时间不长却弹窗」即其症），且原生长按不要求零位移——现微移
+   *  >6px 即清计时（handleRowTouchMove → clearRowTouch），移动了就不是长按。
+   *  到点守卫 touchingRowPending 非空：滑动/取消/滚动接管/抬手都经 clearRowTouch
+   *  清了计时，此为双保险（防未来新增清除路径漏调）。 */
+  let rowLongPressKind = "";
+  let rowLongPressDomId = "";
+  let rowLongPressConv: ImConvRow | null = null;
+  let rowLongPressContact: ImContactRow | null = null;
+
+  function armRowLongPress(kind: string, domId: string, conv: ImConvRow | null, contact: ImContactRow | null): void {
+    rowLongPressKind = kind;
+    rowLongPressDomId = domId;
+    rowLongPressConv = conv;
+    rowLongPressContact = contact;
+    rowLongPressTimer = setTimeout(() => {
+      rowLongPressTimer = 0;
+      if (touchingRowPending.length == 0) {
+        return;
+      }
+      openRowMenu(rowLongPressKind, rowLongPressDomId, rowLongPressConv, rowLongPressContact);
+    }, 500);
+  }
+
+  /** 会话行 touchstart：公共判定 + 装填长按（系统通知会话无操作，不装填）。 */
+  function handleConvRowTouchStart(conv: ImConvRow, eventValue: Any): void {
+    handleRowTouchStart(conv.convId, eventValue);
     if (isSystemConv(conv)) {
       return;
     }
-    openRowMenu("conv", `row-${conv.convId}`, conv, null);
+    armRowLongPress("conv", `row-${conv.convId}`, conv, null);
   }
 
-  /** 群组行长按（打开会话 / 解散·退出群聊）。 */
-  function handleGroupRowLongPress(group: ImConvRow): void {
+  /** 群组行 touchstart：公共判定 + 装填长按（打开会话 / 解散·退出群聊）。 */
+  function handleGroupRowTouchStart(group: ImConvRow, eventValue: Any): void {
     // 双页 swiper 常驻后行 id 不得跨 pane 撞名（群 conv 同时在会话列表）：群组行加 grp- 前缀
-    openRowMenu("group", `row-grp-${group.convId}`, group, null);
+    handleRowTouchStart(group.convId, eventValue);
+    armRowLongPress("group", `row-grp-${group.convId}`, group, null);
   }
 
-  /** 联系人行长按：已申请（status=3）= 撤回申请；正式联系（status=1）= 发消息/备注/删除。 */
-  function handleContactRowLongPress(contact: ImContactRow): void {
-    openRowMenu("contact", `row-ct-${contact.userId}`, null, contact);
+  /** 联系人行 touchstart（含已申请行）：公共判定 + 装填长按——已申请（status=3）=
+   *  撤回申请；正式联系（status=1）= 发消息/备注/删除。 */
+  function handleContactRowTouchStart(contact: ImContactRow, eventValue: Any): void {
+    handleRowTouchStart(`ct-${contact.userId}`, eventValue);
+    armRowLongPress("contact", `row-ct-${contact.userId}`, null, contact);
   }
 
   /** 行点击守卫：长按浮层开着时点任意行=收浮层并吞掉本次点击；长按/滑动补发的 click
@@ -3562,7 +3613,6 @@
     failedIconUrls.clear();
     renderedIconUrls.clear();
     if (pressedRowTimer != 0) clearTimeout(pressedRowTimer);
-    if (listScrollIdleTimer != 0) clearTimeout(listScrollIdleTimer);
     if (pageTouchResetTimer != 0) clearTimeout(pageTouchResetTimer);
     if (convRefreshTimer != 0) clearTimeout(convRefreshTimer);
     convRefreshTimer = 0;
@@ -3604,6 +3654,7 @@
     eventBus.off(IM_SESSION_CLEARED, onImSessionCleared);
     // 浮层开着时卸载：收起浮层（注销返回拦截经 watch）
     closeRowMenu();
+    cancelRowLongPress();
     clearMessageUiResources();
     messagePageDisposed = true;
     messagePageVisible = false;
@@ -3621,8 +3672,9 @@
 
   onHide(() => {
     // 浮层开着时切走（进后台等）：收起浮层；「+」气泡同理静默收起
-    // 点底部导航切 Tab 时也在这里收起浮层。
+    // 点底部导航切 Tab 时也在这里收起浮层。按压中途切走：长按计时一并弃。
     closeRowMenu();
+    cancelRowLongPress();
     addDrawerVisible.value = false;
     messagePageVisible = false;
     if (convRefreshTimer != 0) clearTimeout(convRefreshTimer);

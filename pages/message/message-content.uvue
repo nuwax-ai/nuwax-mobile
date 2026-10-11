@@ -7,6 +7,17 @@
   >
     <safety-zone />
 
+    <!-- 工作商业版未授权（workCommercialEdition !== true）：整页居中提示，
+         不渲染列表与入口、不发任何 IM 请求（对齐 PC WorkCommercialRouteBoundary；
+         WS 连接 / 未读角标在工具层同步闸门，见 utils/workCommercial.uts） -->
+    <view v-if="workGateBlocked" class="work-gate">
+      <text class="work-gate__text">{{ t("Mobile.Message.workCommercialRequired") }}</text>
+    </view>
+    <!-- 闸门未定（缓存缺失、租户配置拉取中）：加载占位（PC Boundary 的 Spin 同款语义） -->
+    <view v-else-if="workGatePending" class="work-gate">
+      <text class="work-gate__text">{{ t("Mobile.Page.loadingMore") }}</text>
+    </view>
+    <template v-else>
     <!-- 顶部：消息 / 智联录 tab + 搜索、添加占位入口 -->
     <view class="im-header">
       <view class="im-tab-row">
@@ -515,6 +526,7 @@
         </scroll-view>
       </swiper-item>
     </swiper>
+    </template>
 
     <!-- 长按行操作浮层（无蒙层版）：长按行原位浅灰高亮（rowMenuOnCls，取按压态同色
          #f4f3f8），行旁锚定浅灰纵向气泡（操作项=图标+文案）；
@@ -631,7 +643,9 @@
   } from "@/servers/im";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
-  import { refreshImUnreadBadge } from "@/utils/imUnreadBadge";
+  import { refreshImUnreadBadge, clearImUnreadBadge } from "@/utils/imUnreadBadge";
+  import { initImWsClient, stopImWsClient } from "@/utils/im/imWsClient";
+  import { isWorkCommercialBlockedSync, resolveWorkCommercialBlocked } from "@/utils/workCommercial";
   import eventBus from "@/utils/eventBus";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
   import { isAuthProtectedFileUrl, releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
@@ -664,6 +678,14 @@
 
   /** 会话列表页大小（服务端 clamp 到 [1,100]）。 */
   const CONV_PAGE_SIZE = 50;
+
+  // ===== 工作商业版闸门（对齐 PC WorkCommercialRouteBoundary）=====
+  // workCommercialEdition !== true → 整页替换为居中提示语，所有 IM 请求（会话/
+  // 联系人/群组/团队/未读）与 WS 连接全部不出；pending = 缓存未定、租户配置拉取中
+  // （PC 同款 Spin 语义）。授权态翻转（缓存被登录页/其他 Tab 刷新）经 onShow 复查
+  // 就地生效：撤销即停 WS 清角标，恢复即补首拉。
+  const workGateBlocked = ref<boolean>(false);
+  const workGatePending = ref<boolean>(true);
 
   /** 会话行（仅保留列表展示所需字段；convId 雪花号存字符串防 JS 精度丢失）。 */
   class ImConvRow {
@@ -1771,6 +1793,8 @@
   }
 
   async function loadConversations(): Promise<void> {
+    // 工作商业版未授权：会话列表请求不出（闸门见 workGateBlocked 声明处）
+    if (workGateBlocked.value) return;
     if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
     if (convLoading.value || convLoadingMore.value) {
       convRefreshOwed = true;
@@ -1864,6 +1888,8 @@
   }
 
   async function loadContacts(): Promise<void> {
+    // 工作商业版未授权：联系人请求不出（含 WS CONTACT_UPDATE 驱动的重拉）
+    if (workGateBlocked.value) return;
     if (contactLoading.value) {
       return;
     }
@@ -1930,6 +1956,8 @@
   const GROUP_PAGE_SIZE = 100;
 
   async function loadGroups(): Promise<void> {
+    // 工作商业版未授权：群组请求不出（闸门见 workGateBlocked 声明处）
+    if (workGateBlocked.value) return;
     if (groupsLoading.value) {
       return;
     }
@@ -1960,6 +1988,8 @@
 
   /** 团队列表（spaces 全量无分页；失败静默：分类不展示，下次切入智联录自动重试）。 */
   async function loadSpaces(): Promise<void> {
+    // 工作商业版未授权：团队请求不出（闸门见 workGateBlocked 声明处）
+    if (workGateBlocked.value) return;
     if (spacesLoading.value) {
       return;
     }
@@ -2001,6 +2031,41 @@
     } catch (_error) {
       spacesLoading.value = false;
     }
+  }
+
+  // ===== 工作商业版闸门函数（声明在四个 load 之后：UTS 不提升声明）=====
+
+  /** 闸门判定为未授权：停 WS + 清 tab 未读角标（对齐 PC 授权撤销即卸载微应用）。幂等。 */
+  function applyWorkGateBlocked(): void {
+    workGatePending.value = false;
+    if (workGateBlocked.value) {
+      return;
+    }
+    workGateBlocked.value = true;
+    stopImWsClient();
+    clearImUnreadBadge();
+  }
+
+  /** 页面 onLoad 闸门：缓存优先、缺失拉一次租户配置；放行后补跑首拉（原 onLoad 直调的两个 load）。 */
+  async function initWorkGate(): Promise<void> {
+    const blocked = await resolveWorkCommercialBlocked();
+    if (messagePageDisposed) {
+      return;
+    }
+    if (blocked) {
+      applyWorkGateBlocked();
+      return;
+    }
+    workGatePending.value = false;
+    if (workGateBlocked.value) {
+      // 拉取期间 onShow 复查曾抢先拦下：恢复授权，重启 WS/角标（同 onShow 解锁分支）
+      workGateBlocked.value = false;
+      initImWsClient();
+      refreshImUnreadBadge();
+    }
+    // onShow 复查可能已抢先解锁并补拉过（loadXxx 自带 loading 去重，重复调用无害）
+    loadConversations();
+    loadContacts();
   }
 
   /** 切 tab 落定（tab 点击与 swiper 横滑共用）。横滑抬手必置吞击位，走 switchTab 会被
@@ -3636,10 +3701,9 @@
   };
 
   onLoad((_options: any) => {
-    loadConversations();
-    // 联系人随页面首拉（不等切入智联录）：智联录 tab 角标需要「待我处理」申请数，
-    // 顺带提前建好展示名索引（会话行名称优先取我方备注）
-    loadContacts();
+    // 工作商业版闸门先行：未授权不发任何 IM 请求（首拉由闸门放行后在 initWorkGate
+    // 里补跑——联系人原本就随页面首拉，供智联录角标与展示名索引）
+    initWorkGate();
     eventBus.on(IM_SESSION_CLEARED, onImSessionCleared);
     // 订阅 IM WS 事件
     eventBus.on(`${EVENT_TYPE.ImMessagesSynced}`, onImMessagesSynced);
@@ -3688,6 +3752,18 @@
     messagePageVisible = true;
     setCurrentPageNavigationBarTitle();
     refreshImUnreadBadge();
+    // 闸门缓存复查（同步读，开销可忽略）：登录页/其他 Tab 拉租户配置会写缓存，
+    // 授权态翻转就地生效——撤销即停 WS 清角标，恢复即解锁补首拉
+    if (isWorkCommercialBlockedSync()) {
+      applyWorkGateBlocked();
+    } else if (workGateBlocked.value && !workGatePending.value) {
+      // 授权恢复：解除拦截 + 重启 WS（stop 曾置 manualClosed，需 init 复位）+ 补角标与首拉
+      workGateBlocked.value = false;
+      initImWsClient();
+      refreshImUnreadBadge();
+      loadConversations();
+      loadContacts();
+    }
     if (!hasShownOnce) {
       hasShownOnce = true;
       return;
@@ -3852,6 +3928,24 @@
     font-size: 28rpx;
     line-height: 40rpx;
     color: #94929c;
+  }
+
+  /* 工作商业版闸门整页态：未授权=居中提示语；未定=加载占位。
+     flex:1 占满 header 以下（im-page 是 flex column，闸门态下 header/swiper 不渲染） */
+  .work-gate {
+    flex: 1;
+    padding: 0 48rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .work-gate__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #94929c;
+    text-align: center;
   }
 
   .im-foot {

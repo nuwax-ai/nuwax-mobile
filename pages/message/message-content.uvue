@@ -653,7 +653,7 @@
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { refreshImUnreadBadge, clearImUnreadBadge } from "@/utils/imUnreadBadge";
   // 会话草稿（微信式）：聊天页未发文案，列表摘要行显示「[草稿]xxx」
-  import { getChatDraft } from "@/utils/im/chatDrafts";
+  import { getChatDraft, chatDraftRecency } from "@/utils/im/chatDrafts";
   import { initImWsClient, stopImWsClient } from "@/utils/im/imWsClient";
   import { isWorkCommercialBlockedSync, resolveWorkCommercialBlocked } from "@/utils/workCommercial";
   import eventBus from "@/utils/eventBus";
@@ -1553,6 +1553,43 @@
     return readNumber(obj, "status", 1) == 2;
   }
 
+  /** 会话列表排序（消息 tab）：置顶区（组内 lastMsgAt 降序）→ 草稿区（非置顶且
+   *  有草稿的行整体浮在置顶区后，最近编辑的在前）→ 其余（保持传入序=服务端
+   *  update_time 降序）。置顶区对齐 PC convOrder.ts DEV-227「置顶优先 → lastMsgAt
+   *  降序」；草稿浮顶是 App 端独立增强（PC 无此规则）。parseConvRecords 全量解析、
+   *  loadMore 追加后、从聊天页返回时的本地即时重排共用本规则，保证三种路径同序。 */
+  function reorderConvRows(rows: ImConvRow[]): ImConvRow[] {
+    const pinned: ImConvRow[] = [];
+    const drafts: ImConvRow[] = [];
+    const normal: ImConvRow[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].topFlag) {
+        pinned.push(rows[i]);
+      } else if (getChatDraft(rows[i].convId).length > 0) {
+        drafts.push(rows[i]);
+      } else {
+        normal.push(rows[i]);
+      }
+    }
+    pinned.sort((a: ImConvRow, b: ImConvRow): number => {
+      return b.lastMsgAt - a.lastMsgAt;
+    });
+    drafts.sort((a: ImConvRow, b: ImConvRow): number => {
+      return chatDraftRecency(b.convId) - chatDraftRecency(a.convId);
+    });
+    const merged: ImConvRow[] = [];
+    for (let i = 0; i < pinned.length; i++) {
+      merged.push(pinned[i]);
+    }
+    for (let i = 0; i < drafts.length; i++) {
+      merged.push(drafts[i]);
+    }
+    for (let i = 0; i < normal.length; i++) {
+      merged.push(normal[i]);
+    }
+    return merged;
+  }
+
   function parseConvRecords(res: RequestResponse<any>): ImConvRow[] {
     const rows: ImConvRow[] = [];
     const dataRaw = apiResData<any>(res);
@@ -1569,29 +1606,7 @@
     }
     const cursorRaw = dataObj["nextCursor"];
     nextCursor.value = cursorRaw != null ? `${cursorRaw}` : "";
-    // 置顶分区：置顶行整体提前，组内按最近消息时间降序（微信式，对齐 PC convOrder.ts
-    // DEV-227「置顶优先 → lastMsgAt 降序」）——服务端序是 top_time（置顶先后），端上重排；
-    // 非置顶区保持服务端序（update_time 降序）。可多条置顶。
-    const pinned: ImConvRow[] = [];
-    const normal: ImConvRow[] = [];
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i].topFlag) {
-        pinned.push(rows[i]);
-      } else {
-        normal.push(rows[i]);
-      }
-    }
-    pinned.sort((a: ImConvRow, b: ImConvRow): number => {
-      return b.lastMsgAt - a.lastMsgAt;
-    });
-    const merged: ImConvRow[] = [];
-    for (let i = 0; i < pinned.length; i++) {
-      merged.push(pinned[i]);
-    }
-    for (let i = 0; i < normal.length; i++) {
-      merged.push(normal[i]);
-    }
-    return merged;
+    return reorderConvRows(rows);
   }
 
   /**
@@ -1902,9 +1917,12 @@
         return;
       }
       const rows = parseConvRecords(res);
+      // 追加后整表重排：新页里带草稿/置顶的行不能滞留表尾（分区不变式跨页成立）
+      const merged: ImConvRow[] = copyRows(conversations.value);
       for (let i = 0; i < rows.length; i++) {
-        conversations.value.push(rows[i]);
+        merged.push(rows[i]);
       }
+      conversations.value = reorderConvRows(merged);
       // 追加行统一解析（helper 跳过已回填行，直接传整表安全）
       resolveConvRowsIcons(conversations.value);
       // 取字整表重算（去重 map 重建，顺序稳定：loadMore 追加行参与同列表去重）
@@ -3570,10 +3588,11 @@
   // - im_auth_invalid / im_kicked：让 useRequest 4010 链路接管，App.uvue 已 stopImWsClient
 
   /**
-   * 把一条 row 移到「其分区」最前（与 parseConvRecords 的置顶分区一致）：
+   * 把一条 row 移到「其分区」最前（与 reorderConvRows 分区一致）：
    * 置顶行 → 置顶区最前（组内按最近消息时间降序，本函数仅在 lastMsgAt 更新为更大
    * 值后调用，移到最前即最新——★此前版本把它挪到置顶区末尾，破坏组内时间序）；
-   * 非置顶行 → 非置顶区最前。
+   * 非置顶行 → 本会话留有草稿则草稿区最前，否则草稿区之后（新消息不越过草稿行，
+   * 草稿浮顶不变式在 WS 实时路径同样成立）。
    */
   function bumpRowToTop(row: ImConvRow): void {
     const list = conversations.value;
@@ -3588,13 +3607,15 @@
       conversations.value = list;
       return;
     }
-    // 找到第一个非置顶位置插入
+    // 跳过置顶区；本行无草稿再跳过草稿区
+    const hasDraft = getChatDraft(row.convId).length > 0;
     let insertAt = 0;
-    for (let i = 0; i < list.length; i++) {
-      if (list[i].topFlag) {
-        insertAt = i + 1;
-      } else {
-        break;
+    while (insertAt < list.length && list[insertAt].topFlag) {
+      insertAt++;
+    }
+    if (!hasDraft) {
+      while (insertAt < list.length && getChatDraft(list[insertAt].convId).length > 0) {
+        insertAt++;
       }
     }
     list.splice(insertAt, 0, row);
@@ -3831,7 +3852,9 @@
       return;
     }
     // 从聊天页返回：草稿是本地态（模板方法调用不收集其依赖），先整表重建让
-    // 「[草稿]xxx」即时上屏，网络静默刷新随后对齐其余字段
+    // 「[草稿]xxx」即时上屏；同时按草稿态本地重排（草稿会话浮到置顶区后，免等
+    // 网络往返才跳动位置，reorderConvRows 与网络刷新同规则），网络静默刷新随后对齐其余字段
+    conversations.value = reorderConvRows(copyRows(conversations.value));
     scheduleIconTableRefresh();
     if (convLoaded.value) {
       loadConversations();

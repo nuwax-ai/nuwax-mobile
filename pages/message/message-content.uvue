@@ -773,6 +773,10 @@
   // ===== 行触摸判定态（只判点击/滑动，不驱动点亮）=====
   /** 待判定行（touchstart 记入；位移超 6px 判滑动即清，抬手仍非空 = 点击）。 */
   let touchingRowPending = "";
+  /** 起手快照：起手时长按浮层开着且正落在浮层所属行（行 touchstart 先于页面根冒泡执行、
+   *  浮层尚未被收起，快照有效）。抬手按它区分：所属行=只收层（不进会话、不闪灰），
+   *  其余行=正常点按动作（进会话/联系人操作）。 */
+  let rowTouchOnMenuOwner = false;
   let rowTouchStartX = 0;
   let rowTouchStartY = 0;
   /** 起手快照：touchstart 时距最近滚动事件 <80ms（fling 进行中触摸，scroll 事件每帧
@@ -796,6 +800,12 @@
       rowLongPressTimer = 0;
     }
   }
+
+  /** 长按浮层「点外收起」手势的吞击位：收层当次手势稍后派发的 click 全吞（点外只关
+   *  浮层不穿透），下一次页面 touchstart（新手势）自动解除；置位在 handlePageTouchStart，
+   *  经 pageTapSwallowed() 并入各 click 入口守卫。★在此先声明是因为 settleRowTouchEnd
+   *  要读它（收层手势不闪灰）——UTS 不提升，前向引用报错。 */
+  let rowMenuTouchSwallowed = false;
 
   // ===== 三星可靠点按（utils/reliableTap.uts）：touchend 主通道派发 + click 兜底 =====
   // 三星 One UI 触控灵敏，按压触下瞬间带微移即被原生层判为手势、不合成 click
@@ -926,6 +936,7 @@
     rowTapGuard.reset();
     rowTapGuard.touchStart(eventValue);
     rowTouchMenuArmed = false;
+    rowTouchOnMenuOwner = rowMenuVisible.value && rowMenuRowId == rowId;
     rowTouchDuringScroll = Date.now() - lastScrollEventAt < 80;
     const e = eventValue as UniTouchEvent;
     if (e.touches.length > 0) {
@@ -980,7 +991,10 @@
     if (
       touchingRowPending.length > 0 &&
       rowTouchDuringScroll != true &&
-      rowMenuVisible.value != true
+      rowMenuVisible.value != true &&
+      // 浮层所属行的收层手势不闪灰：点它=只收层，闪一下灰底像「点了没反应」；其余行
+      // 放行闪灰——那是正常点按反馈（闪完随即进会话）
+      rowTouchOnMenuOwner != true
     ) {
       const e = eventValue as UniTouchEvent;
       if (e.changedTouches != null && e.changedTouches.length > 0) {
@@ -993,6 +1007,13 @@
     }
     clearRowTouch();
     if (rowTouchMenuArmed) {
+      return false;
+    }
+    // 浮层所属行的收层抬手不派发（点它=只收层不进会话）；置 800ms 吞击窗吞掉 Android
+    // 抬手补发的 click（同 openRowMenu 长按弹层的吞法，只吞不派发不闪灰）
+    if (rowTouchOnMenuOwner) {
+      suppressNextSwipeClick = true;
+      suppressSwipeClickUntil = Date.now() + 800;
       return false;
     }
     return tapFired && rowTouchDuringScroll != true;
@@ -1034,9 +1055,8 @@
   // 点外收起手势的吞击标志：收起当次手势稍后派生的 click 全吞（点外只关气泡，
   // 不穿透触发底下的行/tab/入口），下一次 touchstart（新手势）自动解除；
   // 经 pageTapSwallowed() 并入各 click 入口的既有守卫。
+  // （长按浮层同款 rowMenuTouchSwallowed 已前移至行触摸判定态区——settleRowTouchEnd 要读）
   let addDrawerTouchSwallowed = false;
-  // 长按浮层点外收起共用同款吞击语义（见上），一并并入 pageTapSwallowed()
-  let rowMenuTouchSwallowed = false;
 
   /** 点外收起（兜底路径：主路径=蒙层 @tap，Android 黑洞下触摸到不了根不触发）：
       气泡已开时，漏到页面根的触摸（气泡自身已阻断冒泡，必在气泡外）在此收起并
@@ -2100,6 +2120,8 @@
   // iOS 滑动不派生 click，守卫恒不触发，已验证交互零影响。
   let pageTouchStartX = 0;
   let pageTouchStartY = 0;
+  /** 上次页面级 touchstart 时刻：冒泡去重用（见 handlePageTouchStart）。 */
+  let pageTouchStartAt = 0;
   let pageTouchSwallowed = false;
   let pageTouchResetTimer = 0;
 
@@ -2108,6 +2130,19 @@
     if (e.touches.length == 0) {
       return;
     }
+    // 冒泡去重：同一手势会先后打到 pane scroll-view 与页面根两处同名绑定（毫秒级内、
+    // 坐标逐位相同）。不去重的话二次调用会把首次刚做的「收层+吞击决策」当新手势清掉
+    // ——吞击位恒失效，点外收层后 click 穿透、浮层所属行闪灰即其症。40ms 内同坐标视为
+    // 同次派发直接跳过（人手两次独立触屏间隔远大于此）。
+    const touchStartAt = Date.now();
+    if (
+      touchStartAt - pageTouchStartAt <= 40 &&
+      e.touches[0].clientX == pageTouchStartX &&
+      e.touches[0].clientY == pageTouchStartY
+    ) {
+      return;
+    }
+    pageTouchStartAt = touchStartAt;
     pageTouchStartX = e.touches[0].clientX;
     pageTouchStartY = e.touches[0].clientY;
     // 新手势开始：解除上一手势（气泡/浮层点外收起）的吞击标志
@@ -2117,11 +2152,17 @@
     // 加号区除外——排除后交给 click toggle，见函数注释）
     closeAddDrawerOnOutsideTouch(pageTouchStartX, pageTouchStartY);
     // 长按操作浮层（无蒙层）：任意页面触摸即收起（气泡内触摸已被气泡根 @touchstart.stop
-    // 阻断冒泡，必在气泡外）；同手势稍后补发的 click 全吞——点外只关浮层，不穿透进会话/入口
+    // 阻断冒泡，必在气泡外）。★不清判定态（clearRowTouch）：本手势若起在另一行上，行
+    // touchstart 先冒泡到此、已装填 500ms 长按计时，此处清掉会把「浮层开着长按另一行换弹」
+    // 连坐杀掉（群成员页原生 @longpress 天然可换弹，对齐之）；判定态清理由手势终结路径
+    // 负责（touchend/cancel、move>6px、滚动接管 handleListScroll）。
+    // 吞击位只给非行落点（列表空白/分组头/tab/+入口——点外只关浮层不穿透）；行落点不置：
+    // 抬手由行路径按 rowTouchOnMenuOwner 快照决策——所属行=只收层（不进会话不闪灰），
+    // 其余行=正常点按（进会话/联系人动作）。★行落点判定依据 touchingRowPending：行
+    // touchstart 已先于本函数（冒泡序）执行并记好行 id。
     if (rowMenuVisible.value) {
       closeRowMenu();
-      rowMenuTouchSwallowed = true;
-      clearRowTouch();
+      rowMenuTouchSwallowed = touchingRowPending.length == 0;
     }
   }
 

@@ -1,0 +1,154 @@
+import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN } from "@/constants/home.constants";
+/**
+ * 会话输入草稿（微信式）：聊天页未发出的文案按 convId 本地记忆——
+ * 退出聊天页后消息列表摘要行显示「[草稿]xxx」，再进页输入框回显上次输入；
+ * 发送（输入框清空）后草稿随之清除。
+ *
+ * 存储：单 storage 键存全部会话草稿（items 数组：id/文案/顺序），跨进程重启保留；
+ * 账号 tag（token|origin，imSessionScope 同源字段但去掉进程内 epoch——epoch 重启
+ * 归零会让重启后必失配）不匹配整包丢弃，防换账号串号。超量按最久未更新淘汰
+ * （草稿是碎片数据，不值得无限累积）。进程内模块级缓存一份：读走内存，
+ * 写同步刷盘（调用方聊天页 watch 去抖后调，不逐键入写盘）。
+ */
+
+const DRAFTS_STORAGE_KEY = "IM_CHAT_DRAFTS";
+/** 最多记忆的会话草稿数（超出淘汰最久未更新的）。 */
+const DRAFTS_MAX_CONVS = 50;
+
+class ChatDraftEntry {
+  convId: string = "";
+  text: string = "";
+  constructor(convId: string, text: string) {
+    this.convId = convId;
+    this.text = text;
+  }
+}
+
+/** 账号 tag（重启稳定；token 轮换会失配丢草稿，可接受的边界）。 */
+function accountTag(): string {
+  const token = uni.getStorageSync(ACCESS_TOKEN);
+  const origin = uni.getStorageSync(ACCESS_TOKEN_ORIGIN);
+  return `${token ?? ""}|${origin ?? ""}`;
+}
+
+function readString(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  return raw != null ? `${raw}` : "";
+}
+
+// ===== 模块级缓存（convId → 草稿；order 为更新序，队尾最新）=====
+const draftsByConv = new Map<string, ChatDraftEntry>();
+const draftOrder: string[] = [];
+let cacheTag = "__chat_drafts_unset__";
+
+/** 读缓存（账号 tag 变化即整包重载：换账号不串号）。 */
+function ensureCache(): void {
+  const tag = accountTag();
+  if (tag == cacheTag) {
+    return;
+  }
+  cacheTag = tag;
+  draftsByConv.clear();
+  draftOrder.splice(0, draftOrder.length);
+  try {
+    const raw = uni.getStorageSync(DRAFTS_STORAGE_KEY);
+    if (raw == null) {
+      return;
+    }
+    const text = `${raw}`.trim();
+    if (text.length == 0) {
+      return;
+    }
+    const root = JSON.parse<UTSJSONObject>(text);
+    if (root == null) {
+      return;
+    }
+    if (readString(root, "s") != tag) {
+      return;
+    }
+    const itemsRaw = root["items"];
+    if (itemsRaw == null) {
+      return;
+    }
+    const items = itemsRaw as UTSJSONObject[];
+    for (let i = 0; i < items.length; i++) {
+      const convId = readString(items[i], "id");
+      if (convId.length == 0 || draftsByConv.has(convId)) {
+        continue;
+      }
+      draftsByConv.set(convId, new ChatDraftEntry(convId, readString(items[i], "t")));
+      draftOrder.push(convId);
+    }
+  } catch (_e) {
+    // 存储损坏按无草稿处理（下次写入整包重写自愈）
+  }
+}
+
+/** 整包落盘（顺序即更新序，淘汰按队头）。 */
+function persist(): void {
+  const items: UTSJSONObject[] = [];
+  for (let i = 0; i < draftOrder.length; i++) {
+    const entry = draftsByConv.get(draftOrder[i]);
+    if (entry == null) {
+      continue;
+    }
+    const obj = new UTSJSONObject();
+    obj["id"] = entry.convId;
+    obj["t"] = entry.text;
+    items.push(obj);
+  }
+  const root = new UTSJSONObject();
+  root["s"] = cacheTag;
+  root["items"] = items;
+  const json = JSON.stringify(root);
+  if (json == null) {
+    return;
+  }
+  try {
+    uni.setStorageSync(DRAFTS_STORAGE_KEY, json);
+  } catch (_e) {
+    // 写失败静默：草稿尽力而为
+  }
+}
+
+/** 取会话草稿（原样含空白换行，回显用）；未记忆返回 ""。 */
+export function getChatDraft(convId: string): string {
+  ensureCache();
+  if (convId.length == 0) {
+    return "";
+  }
+  const entry = draftsByConv.get(convId);
+  return entry != null ? entry.text : "";
+}
+
+/**
+ * 写/清会话草稿：纯空白视为清除（微信同款——没输入有效文案就不算草稿）；
+ * 相同内容重复写仍刷更新序（防被淘汰后读丢）。清一个不存在的会话不触发落盘。
+ */
+export function setChatDraft(convId: string, text: string): void {
+  ensureCache();
+  if (convId.length == 0) {
+    return;
+  }
+  const keep = text.trim().length > 0;
+  const idx = draftOrder.indexOf(convId);
+  const existed = idx >= 0;
+  if (existed) {
+    draftOrder.splice(idx, 1);
+    draftsByConv.delete(convId);
+  }
+  if (!keep) {
+    if (existed) {
+      persist();
+    }
+    return;
+  }
+  draftsByConv.set(convId, new ChatDraftEntry(convId, text));
+  draftOrder.push(convId);
+  while (draftOrder.length > DRAFTS_MAX_CONVS) {
+    const oldest = draftOrder[0];
+    draftOrder.splice(0, 1);
+    draftsByConv.delete(oldest);
+  }
+  persist();
+}

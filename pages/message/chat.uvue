@@ -225,7 +225,13 @@
                 class="chat-tail"
               >
                 <text v-if="msg.status == 0" class="chat-status">{{ t("Mobile.Message.sending") }}</text>
-                <text v-else-if="msg.status == 2" class="chat-status chat-status--fail">{{ t("Mobile.Message.sendFailed") }}</text>
+                <!-- 失败文案本身可点重发（微信点红叹号语义；点击面比气泡小但意图更明确） -->
+                <text
+                  v-else-if="msg.status == 2"
+                  class="chat-status chat-status--fail"
+                  @click="handleSendFailTap(msg)"
+                  >{{ t("Mobile.Message.sendFailed") }}</text
+                >
                 <!-- 智能体处理标记（消息衔接了智能体才有明细；WS 3006 帧驱动）：
                      未读=灰空心圈 / 处理中=青色转钟 / 完成=蓝圈蓝勾（DEV-308：蓝=完成，
                      绿=已读回执，勿混）/ 失败=红圈叹号。
@@ -244,7 +250,11 @@
                   <view v-else-if="msg.agentStatus == 4" class="chat-agent__ring chat-agent__ring--done">
                     <view class="chat-agent__tick" />
                   </view>
-                  <view v-else-if="msg.agentStatus == 3" class="chat-agent__ring chat-agent__ring--fail">
+                  <view
+                    v-else-if="msg.agentStatus == 3"
+                    class="chat-agent__ring chat-agent__ring--fail"
+                    @click="handleAgentFailTap(msg)"
+                  >
                     <text class="chat-agent__bang">!</text>
                   </view>
                 </view>
@@ -1581,6 +1591,12 @@
     <!-- 删除消息二次确认（按人删除：仅自己的可见范围，红钮确认） -->
     <confirm-modal ref="confirmModalRef" @confirm="handleDeleteConfirmOk" @cancel="handleDeleteConfirmCancel" />
 
+    <!-- App 端 SVG 全屏预览：原生 previewImage 把 SVG 按视图拉伸（正方形→竖椭圆），
+         页面内自绘 <image> aspectFit + 全屏尺寸 data URL 保比例；点按任意处关闭 -->
+    <view v-if="svgPreviewSrc.length > 0" class="chat-svg-preview" @click="closeSvgPreview">
+      <image class="chat-svg-preview__img" :src="svgPreviewSrc" mode="aspectFit" @click="closeSvgPreview" />
+    </view>
+
     <!-- 合并转发聊天记录详情页：点卡片经 imMergeRecordSession 暂存跳转（openMergeDetail） -->
   </view>
 </template>
@@ -1632,6 +1648,8 @@
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
   // 会话草稿（微信式）：未发文案本地按 convId 记忆，列表「[草稿]xxx」+ 进页回显
   import { getChatDraft, setChatDraft } from "@/utils/im/chatDrafts";
+  // 失败行发件箱（微信式）：发送失败的乐观行跨重启本地保留，重进会话回显末尾可重发
+  import { getFailedSends, removeFailedSend, upsertFailedSend } from "@/utils/im/chatFailedSends";
   import {
     ImAgentStatusItem,
     IM_AGENT_STATUS_DONE,
@@ -1675,7 +1693,7 @@
   import { pcmToWavFile, PcmToWavResult } from "@/utils/voice/pcmToWav";
   import { UploadFileInfo } from "@/types/interfaces/common.uts";
   import { imUnreadCount, refreshImUnreadBadge } from "@/utils/imUnreadBadge";
-  import { isRemoteSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { isRemoteSvgUrl, resolveAppSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import { getSafeAreaBottom, handleExternalLink, isWorkCommercialRepoLinkBlocked, openNativeHomeChatLink } from "@/utils/system";
   import { getApiBaseUrl } from "@/constants/config";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
@@ -5133,6 +5151,30 @@
     });
   }
 
+  /** 仅模板用：点智能体失败红圈 → 弹窗展示失败原因（PC 端走 title 的移动端对齐；
+   *  toast 有行数上限会截断长原因，用 modal 保完整）。
+   *  守卫与 handleReadTap 同款（状态列小 icon 先例）：只查滑动吞击，不查
+   *  rowPressFired——本元素不绑长按三件套，不会产生长按抬手补发 click。
+   *  原因不落行字段，点击时重跑聚合（HUNG 投影 failReason 恒空 → 超时文案兜底）。 */
+  function handleAgentFailTap(msg: ImMsgRow): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    const view = aggregateAgentStatus(msg.agentDetail, Date.now(), msg.sendTime);
+    const reason = view.failReason;
+    uni.showModal({
+      title: t("Mobile.Message.agentProcessFailed"),
+      content:
+        reason.length > 0
+          ? reason
+          : view.failCode == "HUNG"
+            ? t("Mobile.Message.agentProcessHung")
+            : "",
+      showCancel: false,
+      confirmText: t("Mobile.Common.ok"),
+    });
+  }
+
   /**
    * 批量刷新我发消息的已读计数（msgIds ≤200/批，超限服务端直接抛错不截断）：
    * 只查「无缓存 || 未 readAll」的增量集，按 seq 降序取最新 200——更早的行不渲染
@@ -5236,16 +5278,71 @@
     }, 1500);
   }
 
+  /** 失败行 → 发件箱字段包（chatFailedSends 持久化用）：只存重发与回显需要的
+   *  字段白名单——渲染模型（lines/富文本标记）不存，恢复时 applyRichToRow 重算；
+   *  媒体只存本地路径（确认替换只发生在成功后，失败行里恒为本地值）。 */
+  function failedRowToPayload(row: ImMsgRow): UTSJSONObject {
+    const p = new UTSJSONObject();
+    p["msgId"] = row.msgId;
+    p["clientMsgId"] = row.clientMsgId;
+    p["sendTime"] = row.sendTime;
+    p["msgType"] = row.msgType;
+    p["bodyText"] = row.bodyText;
+    p["mentionAll"] = row.mentionAll;
+    const mentionIds: string[] = [];
+    for (let i = 0; i < row.mentionIds.length; i++) {
+      mentionIds.push(row.mentionIds[i]);
+    }
+    p["mentionIds"] = mentionIds;
+    p["replyId"] = row.replyId;
+    p["replySenderName"] = row.replySenderName;
+    p["replyRevoked"] = row.replyRevoked;
+    p["replyIsImage"] = row.replyIsImage;
+    p["replyIsAudio"] = row.replyIsAudio;
+    p["replyIsVideo"] = row.replyIsVideo;
+    p["replyText"] = row.replyText;
+    p["localPath"] = row.localPath;
+    p["imageUrl"] = row.imageUrl;
+    p["audioUrl"] = row.audioUrl;
+    p["audioDuration"] = row.audioDuration;
+    p["videoUrl"] = row.videoUrl;
+    p["videoPlayUrl"] = row.videoPlayUrl;
+    p["videoFileName"] = row.videoFileName;
+    p["videoSize"] = row.videoSize;
+    const imageAtts: UTSJSONObject[] = [];
+    for (let i = 0; i < row.imageAtts.length; i++) {
+      const att = new UTSJSONObject();
+      att["url"] = row.imageAtts[i].url;
+      att["fileName"] = row.imageAtts[i].fileName;
+      att["mime"] = row.imageAtts[i].mime;
+      imageAtts.push(att);
+    }
+    p["imageAtts"] = imageAtts;
+    const linkAtts: UTSJSONObject[] = [];
+    for (let i = 0; i < row.linkAtts.length; i++) {
+      const att = new UTSJSONObject();
+      att["url"] = row.linkAtts[i].url;
+      att["fileName"] = row.linkAtts[i].fileName;
+      att["mime"] = row.linkAtts[i].mime;
+      linkAtts.push(att);
+    }
+    p["linkAtts"] = linkAtts;
+    return p;
+  }
+
   function replaceByClientMsgId(confirmed: ImMsgRow): void {
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].clientMsgId.length > 0 && rows[i].clientMsgId == confirmed.clientMsgId) {
         rows.splice(i, 1, confirmed);
+        // 重发成功即出箱（平时是无记录的空调用，零成本）
+        removeFailedSend(convId.value, confirmed.clientMsgId);
         return;
       }
     }
     // 占位已被清掉（如刷新重载）：幂等重放时补插，避免消息丢失
     rows.push(confirmed);
+    removeFailedSend(convId.value, confirmed.clientMsgId);
   }
 
   function markRowFailed(clientMsgId: string): void {
@@ -5253,6 +5350,10 @@
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].clientMsgId == clientMsgId) {
         rows[i].status = 2;
+        // 失败行入发件箱跨重启保留（页面所有失败路径唯一收口；convId 空不落）
+        if (convId.value.length > 0) {
+          upsertFailedSend(convId.value, clientMsgId, failedRowToPayload(rows[i]));
+        }
         return;
       }
     }
@@ -5276,6 +5377,8 @@
         break;
       }
     }
+    // 行移除同步出箱（可能是重试撞禁言：箱里留着会跨重启复活成孤儿失败行）
+    removeFailedSend(convId.value, clientMsgId);
     const message = apiResMessage(res);
     uni.showToast({ title: message.length > 0 ? message : t("Mobile.Message.sendFailed"), icon: "none" });
     return true;
@@ -5289,6 +5392,98 @@
       }
     }
     return null;
+  }
+
+  /** 发件箱字段包 → 失败行（回显用）：强制 status=2/local=true；富文本渲染模型
+   *  由 applyRichToRow 按存文重算；坏包（无 clientMsgId）返回 null 丢弃。 */
+  function failedPayloadToRow(p: UTSJSONObject): ImMsgRow | null {
+    const clientMsgId = readString(p, "clientMsgId");
+    if (clientMsgId.length == 0) {
+      return null;
+    }
+    const row = new ImMsgRow();
+    row.msgId = readString(p, "msgId");
+    row.clientMsgId = clientMsgId;
+    row.sendTime = readNumber(p, "sendTime", 0);
+    row.msgType = readString(p, "msgType");
+    row.bodyText = readString(p, "bodyText");
+    row.mentionAll = readBool(p, "mentionAll");
+    const idsRaw = p["mentionIds"];
+    if (idsRaw != null && Array.isArray(idsRaw)) {
+      const ids = idsRaw as any[];
+      for (let i = 0; i < ids.length; i++) {
+        row.mentionIds.push(`${ids[i]}`);
+      }
+    }
+    row.replyId = readString(p, "replyId");
+    row.replySenderName = readString(p, "replySenderName");
+    row.replyRevoked = readBool(p, "replyRevoked");
+    row.replyIsImage = readBool(p, "replyIsImage");
+    row.replyIsAudio = readBool(p, "replyIsAudio");
+    row.replyIsVideo = readBool(p, "replyIsVideo");
+    row.replyText = readString(p, "replyText");
+    row.localPath = readString(p, "localPath");
+    row.imageUrl = readString(p, "imageUrl");
+    row.audioUrl = readString(p, "audioUrl");
+    row.audioDuration = readNumber(p, "audioDuration", 0);
+    row.videoUrl = readString(p, "videoUrl");
+    row.videoPlayUrl = readString(p, "videoPlayUrl");
+    row.videoFileName = readString(p, "videoFileName");
+    row.videoSize = readNumber(p, "videoSize", 0);
+    const imageAttsRaw = p["imageAtts"];
+    if (imageAttsRaw != null && Array.isArray(imageAttsRaw)) {
+      const atts = imageAttsRaw as any[];
+      for (let i = 0; i < atts.length; i++) {
+        const item = atts[i] as UTSJSONObject;
+        const att = new ImMsgAtt();
+        att.url = readString(item, "url");
+        att.fileName = readString(item, "fileName");
+        att.mime = readString(item, "mime");
+        row.imageAtts.push(att);
+      }
+    }
+    const linkAttsRaw = p["linkAtts"];
+    if (linkAttsRaw != null && Array.isArray(linkAttsRaw)) {
+      const atts = linkAttsRaw as any[];
+      for (let i = 0; i < atts.length; i++) {
+        const item = atts[i] as UTSJSONObject;
+        const att = new ImMsgAtt();
+        att.url = readString(item, "url");
+        att.fileName = readString(item, "fileName");
+        att.mime = readString(item, "mime");
+        row.linkAtts.push(att);
+      }
+    }
+    row.status = 2;
+    row.local = true;
+    applyRichToRow(row);
+    return row;
+  }
+
+  /** 发件箱恢复（幂等，可在任意列表重建后调）：按 clientMsgId 查重后追加到列表
+   *  末尾——与同步合并的排序语义一致（本地未确认行恒在末尾）。媒体的本地文件
+   *  重启后可能已被清理：行照常回显（图裂灰底），重发时 localFileReadable 提示。 */
+  function restoreFailedRows(): void {
+    if (convId.value.length == 0) {
+      return;
+    }
+    const payloads = getFailedSends(convId.value);
+    let appended = false;
+    for (let i = 0; i < payloads.length; i++) {
+      const row = failedPayloadToRow(payloads[i]);
+      if (row == null) {
+        continue;
+      }
+      // 幂等：已在列表（本窗口发过/已恢复过）的 clientMsgId 不重复回显
+      if (findRowByClientMsgId(row.clientMsgId) != null) {
+        continue;
+      }
+      messages.value.push(row);
+      appended = true;
+    }
+    if (appended) {
+      messages.value = messages.value.slice();
+    }
   }
 
   function maxSeq(): number {
@@ -5820,6 +6015,11 @@
   const chatImageAkOrigins = new Map<string, string>();
   /** 已按「ak 渲染失败」自愈过的展示地址（每地址至多一次：过期自愈够用，坏文件不无限循环）。 */
   const chatImageAkRetried = new Set<string>();
+  /** SVG data URL 展示地址 → 原始地址：App 端 SVG 行 imageUrl 被换写为按气泡尺寸改写的
+   *  data URL，全屏预览要按原址重出一份全屏尺寸的（原生 previewImage 拉伸 SVG 不可用）。 */
+  const chatSvgDataOrigins = new Map<string, string>();
+  /** App 端 SVG 全屏预览展示地址（空=关闭；页面内自绘 <image> aspectFit 保比例）。 */
+  const svgPreviewSrc = ref<string>("");
 
   /** 受保护图片取址：allowAk 时首选 /api/file/ak/refresh 换 ?ak= 直链——<image> 自跟
    *  302 到对象存储流式加载，只花一次轻量 JSON 请求，免去整段下载落盘与完整性校验
@@ -6166,6 +6366,10 @@
           if (!isChatCurrent()) return;
           if (resolved != url) {
             row.imageUrl = resolved;
+            // SVG 换写为 data URL：登记原址，全屏预览按原址重出全屏尺寸那份
+            if (resolved.indexOf("data:image/svg+xml") == 0) {
+              chatSvgDataOrigins.set(resolved, url);
+            }
             // 换地址重载：复位 loading 态（新地址未加载过）
             row.imageLoaded = false;
             // Android 原地属性变更不触发 v-for 行重渲：回填后整表重建调度出图
@@ -6197,6 +6401,10 @@
           if (!isChatCurrent()) return;
           if (resolved != url) {
             att.url = resolved;
+            // SVG 换写为 data URL：登记原址（同主图）
+            if (resolved.indexOf("data:image/svg+xml") == 0) {
+              chatSvgDataOrigins.set(resolved, url);
+            }
             // 换地址重载：复位 loading 态（新地址未加载过）
             att.loaded = false;
             // 同上：附件图回填后同样要整表重建才在 Android 出图
@@ -6759,6 +6967,74 @@
   }
 
   /**
+   * 仅发语音发送核心（对齐 sendMediaWithRow 模式；首发与失败重发共用——重发走
+   * retrySendRow 进来，row.audioUrl 仍是本地 WAV 路径。不并入 sendMediaWithRow：
+   * 其 kind 只有 image/file，audio 需带 duration 秒）：
+   * 上传 WAV → audio 消息（body 带 duration 秒）→ 确认行替换（audioUrl 换服务端 url）。
+   * 本地行 audioUrl 先用本地 WAV 路径（即时可播），确认替换后变远端 url。
+   */
+  async function sendAudioWithRow(row: ImMsgRow): Promise<void> {
+    row.status = 0;
+    const wavPath = row.audioUrl;
+    const durationSec = row.audioDuration;
+    try {
+      const up = await uploadSingleFile(wavPath, row.clientMsgId, null, `voice-${row.clientMsgId}.wav`);
+      if (!isChatCurrent()) return;
+      if (up.success != true || up.file == null) {
+        markRowFailed(row.clientMsgId);
+        const reason = up.error != null ? `${up.error}` : "";
+        uni.showToast({
+          title: reason.length > 0 ? reason : t("Mobile.Message.sendFailed"),
+          icon: "none",
+        });
+        return;
+      }
+      const file = up.file;
+      const res = await apiImSendMediaMsg(
+        convId.value,
+        "audio",
+        file.url,
+        file.name,
+        file.size,
+        file.type,
+        row.clientMsgId,
+        row.replyId.length > 0 ? row.replyId : "",
+        durationSec,
+      );
+      if (!isChatCurrent()) return;
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        const confirmed = buildConfirmedRow(dataObj, row);
+        // readMsgRow 口径：audio 行读 body.url + body.duration（秒）；
+        // 确认行显式回填（服务端 body 原样带回，双保险）
+        confirmed.msgType = "audio";
+        confirmed.audioUrl = file.url;
+        confirmed.audioDuration = durationSec;
+        confirmed.linkAtts = [];
+        replaceByClientMsgId(confirmed);
+        reportReadIfNeeded(maxSeq());
+        refreshReadStatus();
+        scrollToBottom();
+      } else {
+        // 禁言拒发：乐观行移除（不留失败态），handleMuteRejection 内已 toast
+        if (handleMuteRejection(res, row.clientMsgId)) return;
+        markRowFailed(row.clientMsgId);
+        const message = apiResMessage(res);
+        uni.showToast({
+          title: message.length > 0 ? message : t("Mobile.Message.sendFailed"),
+          icon: "none",
+        });
+      }
+    } catch (_error) {
+      if (isChatCurrent() == true) {
+        markRowFailed(row.clientMsgId);
+        uni.showToast({ title: t("Mobile.Message.sendFailed"), icon: "none" });
+      }
+    }
+  }
+
+  /**
    * 媒体消息入队：先以本地内容乐观渲染（图片直接显本地路径，文件先出卡片占位），
    * 再走上传+发送。isImage：相册/拍摄恒 true（与 PC kindOf 口径一致）；
    * H5 文件入口传 false，上传后按返回 mime 判定最终类型。
@@ -7149,6 +7425,85 @@
     el.requestFullScreen(null);
   }
 
+  /** 本地文件可读探测（失败行重发前置检查）：
+   *  H5 的 blob: 展示地址跨页/重载必失效；App/小程序用 fs access 探测真实文件
+   *  （临时目录重启后可能被系统清理）。探测失败≠删行——行保留失败态，重发时提示。 */
+  function localFileReadable(path: string): boolean {
+    if (path.length == 0) {
+      return false;
+    }
+    // #ifdef H5
+    return path.indexOf("blob:") != 0;
+    // #endif
+    // #ifndef H5
+    try {
+      const fsm = uni.getFileSystemManager();
+      fsm.accessSync(path);
+      return true;
+    } catch (_e) {
+      return false;
+    }
+    // #endif
+  }
+
+  /** 失败行重发（气泡/图片区/视频区/失败文案共用出口）：复用同一 clientMsgId，
+   *  服务端幂等保证不会发重（媒体行走上传重发）。本地文件已失效（重启后临时
+   *  文件被系统清理 / H5 blob 跨页失效）时保持失败态并提示重选，不空跑上传。 */
+  function retrySendRow(msg: ImMsgRow): void {
+    if (msg.status != 2 || msg.local != true) {
+      return;
+    }
+    // 图文混排行重试：imageAtts 里仍是本地路径（确认替换只发生在成功后），
+    // 全量重传（部分已上传的 URL 不缓存；clientMsgId 幂等保证不会发重）
+    if (msg.msgType == "rich_text" && msg.imageAtts.length > 0) {
+      for (let i = 0; i < msg.imageAtts.length; i++) {
+        if (localFileReadable(msg.imageAtts[i].url) != true) {
+          uni.showToast({ title: t("Mobile.Message.sendFileExpired"), icon: "none" });
+          return;
+        }
+      }
+      const retryPaths = [] as string[];
+      for (let i = 0; i < msg.imageAtts.length; i++) {
+        retryPaths.push(msg.imageAtts[i].url);
+      }
+      sendRichTextWithRow(msg, retryPaths);
+      return;
+    }
+    // 语音行：audioUrl 在失败期间恒为本地 WAV 路径（确认替换只发生在成功后），
+    // 走音频专用发送核保时长；localPath 不占位（媒体占位语义是待上传附件）
+    if (msg.msgType == "audio") {
+      if (localFileReadable(msg.audioUrl) != true) {
+        uni.showToast({ title: t("Mobile.Message.sendFileExpired"), icon: "none" });
+        return;
+      }
+      sendAudioWithRow(msg);
+      return;
+    }
+    if (msg.localPath.length > 0) {
+      if (localFileReadable(msg.localPath) != true) {
+        uni.showToast({ title: t("Mobile.Message.sendFileExpired"), icon: "none" });
+        return;
+      }
+      sendMediaWithRow(
+        msg,
+        msg.localPath,
+        // 视频占位行无 linkAtts，展示名从 videoFileName 取（重传保原文件名）
+        msg.linkAtts.length > 0 ? msg.linkAtts[0].fileName : msg.videoFileName,
+      );
+      return;
+    }
+    sendWithRow(msg);
+  }
+
+  /** 仅模板用：点「发送失败，点击重试」文案 → 重发（微信点红叹号语义）。
+   *  守卫与 handleAgentFailTap 同款：只查滑动吞击（文案无长按语义，无补发 click 之忧）。 */
+  function handleSendFailTap(msg: ImMsgRow): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    retrySendRow(msg);
+  }
+
   /** 视频区点按：已挂载=轻触整面切换播放/暂停（原生中央播放键只覆盖中心小区域，
    *  表面其余区域 5.13+ 基座不拦截触摸、会冒泡到本层——补齐微信同款整面轻触切换；
    *  中央键/控制条仍归原生，各自消费各自的触摸不会双触发）；未挂载=占位卡 ▶ 手动预载。 */
@@ -7157,6 +7512,11 @@
       return;
     }
     if (multiGuard(msg)) {
+      return;
+    }
+    // 失败行优先重发（否则点按会播本地占位视频而非重试）
+    if (msg.status == 2 && msg.local) {
+      retrySendRow(msg);
       return;
     }
     if (msg.videoUrl.length == 0) {
@@ -7230,12 +7590,17 @@
     openImMergeRecord(session);
   }
 
-  /** 失败行点击重试：复用同一 clientMsgId，服务端幂等保证不会发重（媒体行走上传重发）。 */
+  /** 气泡点按：失败行重发优先（先于语音播放/卡片详情——微信同款，失败行点哪都是重发）；
+   *  其余按类型分派。 */
   function handleBubbleTap(msg: ImMsgRow): void {
     if (rowPressFired || pageTapSwallowed()) {
       return;
     }
     if (multiGuard(msg)) {
+      return;
+    }
+    if (msg.status == 2 && msg.local) {
+      retrySendRow(msg);
       return;
     }
     // 语音消息：点按=播放/停止（微信同款；不出时间行）
@@ -7248,36 +7613,45 @@
       openMergeDetail(msg);
       return;
     }
-    if (msg.status == 2 && msg.local) {
-      // 图文混排行重试：imageAtts 里仍是本地路径（确认替换只发生在成功后），
-      // 全量重传（部分已上传的 URL 不缓存；clientMsgId 幂等保证不会发重）
-      if (msg.msgType == "rich_text" && msg.imageAtts.length > 0) {
-        const retryPaths = [] as string[];
-        for (let i = 0; i < msg.imageAtts.length; i++) {
-          retryPaths.push(msg.imageAtts[i].url);
-        }
-        sendRichTextWithRow(msg, retryPaths);
-        return;
-      }
-      if (msg.localPath.length > 0) {
-        sendMediaWithRow(
-          msg,
-          msg.localPath,
-          // 视频占位行无 linkAtts，展示名从 videoFileName 取（重传保原文件名）
-          msg.linkAtts.length > 0 ? msg.linkAtts[0].fileName : msg.videoFileName,
-        );
-        return;
-      }
-      sendWithRow(msg);
-    }
     // 微信同款：点消息内容切换显示/隐藏这条消息的时间（失败重发路径除外——那一下的重心是重发）
     timeRevealedId.value = timeRevealedId.value == msg.msgId ? "" : msg.msgId;
   }
 
+  /** App 端 SVG 展示地址（改写后的 data URL / 解析失败回退的远链）：原生 previewImage
+   *  把 SVG 按视图拉伸（正方形被拉成竖椭圆），剔除出连播列表，点击走页面内自绘预览。
+   *  H5 浏览器 / 鸿蒙 ArkUI 都能正确缩放 SVG，维持原预览路径。 */
+  function isChatSvgDisplayUrl(url: string): boolean {
+    // #ifdef APP-ANDROID || APP-IOS
+    return url.indexOf("data:image/svg+xml") == 0 || isRemoteSvgUrl(url);
+    // #endif
+    // #ifndef APP-ANDROID || APP-IOS
+    return false;
+    // #endif
+  }
+
+  /** App 端 SVG 全屏预览：按屏幕尺寸从原址重出 data URL（行内那份是 300rpx 气泡尺寸，
+   *  模块缓存按「宽x高|URL」分键互不干扰），页面内 <image> aspectFit 渲染比例恒正。 */
+  async function openChatSvgPreview(displayUrl: string): Promise<void> {
+    const originRaw = chatSvgDataOrigins.get(displayUrl);
+    const origin = originRaw != null ? originRaw : displayUrl;
+    const sys = uni.getSystemInfoSync();
+    const windowWidth = sys.windowWidth > 0 ? sys.windowWidth : 375;
+    const windowHeight = sys.windowHeight > 0 ? sys.windowHeight : 667;
+    const screenHRpx = Math.round((windowHeight * 750) / windowWidth);
+    svgPreviewSrc.value = await resolveAppSvgUrl(origin, 750, screenHRpx);
+  }
+
+  function closeSvgPreview(): void {
+    svgPreviewSrc.value = "";
+  }
+
   /** 图片可入滑动预览列表：ak 直链（带临时签名免鉴权）与 temp/blob 展示地址可入；
-   *  空地址与未解析的 /api/f/ 受保护直链剔除（带不了 Bearer，进系统查看器必然空白）。 */
+   *  空地址、未解析的 /api/f/ 受保护直链（带不了 Bearer，进系统查看器必然空白）与
+   *  SVG 展示地址（App 端原生预览器拉伸变形）剔除。 */
   function isPreviewableChatImage(url: string): boolean {
     if (url.length == 0) return false;
+    // SVG 展示地址剔除：App 端原生预览器 FIT_XY 拉伸，点击改走 openChatSvgPreview 自绘层
+    if (isChatSvgDisplayUrl(url)) return false;
     // ak 直链（已带临时签名，免鉴权可载）可预览；temp/blob 展示地址可预览；
     // 仍剔除未解析的原始受保护地址（预览器带不了 Bearer）
     if (chatImageAkOrigins.has(url)) return true;
@@ -7312,7 +7686,17 @@
     if (multiGuard(msg)) {
       return;
     }
+    // 失败行优先重发（否则点按会开本地大图预览而非重试）
+    if (msg.status == 2 && msg.local) {
+      retrySendRow(msg);
+      return;
+    }
     if (msg.imageUrl.length == 0) {
+      return;
+    }
+    // SVG 走页面内自绘全屏预览（原生 previewImage 按视图拉伸，正方形会变竖椭圆）
+    if (isChatSvgDisplayUrl(msg.imageUrl)) {
+      openChatSvgPreview(msg.imageUrl);
       return;
     }
     const urls = collectChatPreviewImages();
@@ -7428,6 +7812,11 @@
       return;
     }
     if (att.url.length == 0) {
+      return;
+    }
+    // SVG 走页面内自绘全屏预览（同主图：原生预览器拉伸变形）
+    if (isChatSvgDisplayUrl(att.url)) {
+      openChatSvgPreview(att.url);
       return;
     }
     const urls = collectChatPreviewImages();
@@ -7961,11 +8350,7 @@
     closeVoiceEdit();
   }
 
-  /**
-   * 仅发语音发送核心（对齐 sendMediaWithRow 模式）：
-   * 上传 WAV → audio 消息（body 带 duration 秒）→ 确认行替换（audioUrl 换服务端 url）。
-   * 本地行 audioUrl 先用本地 WAV 路径（即时可播），确认替换后变远端 url。
-   */
+  /** 仅发语音入口：建本地乐观行（audioUrl=本地 WAV 即时可播）后走发送核心。 */
   async function sendVoiceAudioWithWav(wav: PcmToWavResult): Promise<void> {
     const clientMsgId = generateUUID();
     const row = new ImMsgRow();
@@ -7983,59 +8368,7 @@
     messages.value.push(row);
     scrollToBottom();
     closeVoiceEdit();
-    try {
-      const up = await uploadSingleFile(wav.wavPath, clientMsgId, null, `voice-${clientMsgId}.wav`);
-      if (!isChatCurrent()) return;
-      if (up.success != true || up.file == null) {
-        markRowFailed(row.clientMsgId);
-        const reason = up.error != null ? `${up.error}` : "";
-        uni.showToast({
-          title: reason.length > 0 ? reason : t("Mobile.Message.sendFailed"),
-          icon: "none",
-        });
-        return;
-      }
-      const file = up.file;
-      const res = await apiImSendMediaMsg(
-        convId.value,
-        "audio",
-        file.url,
-        file.name,
-        file.size,
-        file.type,
-        row.clientMsgId,
-        row.replyId.length > 0 ? row.replyId : "",
-        wav.durationSec,
-      );
-      if (!isChatCurrent()) return;
-      if (apiResCode(res) == SUCCESS_CODE) {
-        const dataRaw = apiResData<any>(res);
-        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        const confirmed = buildConfirmedRow(dataObj, row);
-        // readMsgRow 口径：audio 行读 body.url + body.duration（秒）；
-        // 确认行显式回填（服务端 body 原样带回，双保险）
-        confirmed.msgType = "audio";
-        confirmed.audioUrl = file.url;
-        confirmed.audioDuration = wav.durationSec;
-        confirmed.linkAtts = [];
-        replaceByClientMsgId(confirmed);
-        reportReadIfNeeded(maxSeq());
-        refreshReadStatus();
-        scrollToBottom();
-      } else {
-        markRowFailed(row.clientMsgId);
-        const message = apiResMessage(res);
-        uni.showToast({
-          title: message.length > 0 ? message : t("Mobile.Message.sendFailed"),
-          icon: "none",
-        });
-      }
-    } catch (_error) {
-      if (isChatCurrent() == true) {
-        markRowFailed(row.clientMsgId);
-        uni.showToast({ title: t("Mobile.Message.sendFailed"), icon: "none" });
-      }
-    }
+    await sendAudioWithRow(row);
   }
 
   /** editing 仅发语音（🎤）：PCM→WAV→上传→audio 消息（不转文案，原生语音条可播）。
@@ -10096,6 +10429,8 @@
       messages.value = [];
       // 缓存即接口原文（降序 新→旧），与 loadHistory 同款逐条 unshift 后头部为最旧
       mergeSyncedMessages(cached);
+      // 失败行发件箱回显（幂等）：缓存/历史重建都会清掉本地行，两条路径都要补
+      restoreFailedRows();
       hasMore.value = cached.length >= MSG_PAGE_SIZE;
       collectChatAttachments(convId.value, cached);
       // 重新进入会话始终展示最新消息，不恢复上次阅读的历史位置。
@@ -10110,6 +10445,7 @@
     try {
       await loadHistory(0);
       loading.value = false;
+      restoreFailedRows();
       scrollToBottom();
     } catch (_error) {
       loading.value = false;
@@ -12486,6 +12822,26 @@
   .chat-collapse-glyph {
     width: 44rpx;
     height: 44rpx;
+  }
+
+  /* ===== App 端 SVG 全屏预览（原生 previewImage 拉伸 SVG 的替代）：黑底全屏 + aspectFit ===== */
+  .chat-svg-preview {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 1200;
+    background-color: #000000;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-svg-preview__img {
+    width: 750rpx;
+    height: 100%;
   }
 
   /* ===== 展开输入面板（⤢ 从底部拉起）：贴底白面板（无边框）+ 大输入区 + 底部工具行 ===== */

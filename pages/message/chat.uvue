@@ -292,19 +292,29 @@
                   <view v-else class="chat-read__ring chat-read__ring--pending" />
                 </view>
               </view>
-              <!-- 图片消息：不进气泡，点击全屏放大（微信交互） -->
-              <image
+              <!-- 图片消息：不进气泡，点击全屏放大（微信交互）。box 定尺寸并承载 loading 态：
+                   未加载完成前灰底转圈（imageLoaded 字段模板直读——App-Android 方法调用绑定
+                   不收集方法体内依赖，videoPlayUrl 同款；url 被受保护解析回填时复位重转） -->
+              <view
                 v-if="msg.msgType == 'image' && msg.imageUrl.length > 0"
-                class="chat-image"
-                :src="msg.imageUrl"
-                mode="aspectFill"
-                @click="handleImageMsgTap(msg)"
-                @error="handleImageRenderError(msg)"
-                @touchstart="handleMsgTouchStart(msg, $event)"
-                @touchmove="handleMsgTouchMove($event)"
-                @touchend="handleMsgTouchEnd"
-                @touchcancel="handleMsgTouchEnd"
-              />
+                class="chat-image-box"
+              >
+                <image
+                  class="chat-image"
+                  :src="msg.imageUrl"
+                  mode="aspectFill"
+                  @click="handleImageMsgTap(msg)"
+                  @load="handleImageRenderLoaded(msg)"
+                  @error="handleImageRenderError(msg)"
+                  @touchstart="handleMsgTouchStart(msg, $event)"
+                  @touchmove="handleMsgTouchMove($event)"
+                  @touchend="handleMsgTouchEnd"
+                  @touchcancel="handleMsgTouchEnd"
+                />
+                <view v-if="msg.imageLoaded != true" class="chat-img-spinbox">
+                  <view class="chat-img-spin" :style="imgSpinStyle(imgSpinDeg)" />
+                </view>
+              </view>
               <!-- 视频消息：不进气泡（对齐图片）。预载策略——进页/增量合并后自动解析视频地址
                    回填 msg.videoPlayUrl ⇒ 每行常驻原生 <video>（首帧即封面，交给系统播放键
                    点播，不再做任何自动起播：iOS autoplay/延迟补调均不稳，手点是唯一稳定路径）；
@@ -514,16 +524,24 @@
                   v-if="msg.edited && msg.status == 1"
                   class="chat-edited-inline"
                 >{{ t("Mobile.Message.msgEditedTag") }}</text></text>
-                <!-- rich_text 图片附件：缩略图，点击全屏放大 -->
-                <image
+                <!-- rich_text 图片附件：缩略图，点击全屏放大（loading 态同主图：att.loaded 模板直读） -->
+                <view
                   v-for="att in msg.imageAtts"
                   :key="att.url"
-                  class="chat-image chat-image--att"
-                  :src="att.url"
-                  mode="aspectFill"
-                  @click="handleAttImageTap(msg, att)"
-                  @error="handleAttImageRenderError(att)"
-                />
+                  class="chat-image-box chat-image-box--att"
+                >
+                  <image
+                    class="chat-image"
+                    :src="att.url"
+                    mode="aspectFill"
+                    @click="handleAttImageTap(msg, att)"
+                    @load="handleAttImageRenderLoaded(att)"
+                    @error="handleAttImageRenderError(att)"
+                  />
+                  <view v-if="att.loaded != true" class="chat-img-spinbox">
+                    <view class="chat-img-spin" :style="imgSpinStyle(imgSpinDeg)" />
+                  </view>
+                </view>
                 <!-- rich_text 内嵌视频附件：气泡内联播放（播放器/预载/全屏与单视频消息
                      同管线，videoPlayUrl 由 preloadChatVideos 回填；iOS 坑同外层：勿往
                      <video> 挂子组件（全屏切换闪退 #22070），Android 全屏兜底键除外） -->
@@ -1747,6 +1765,8 @@
     url: string = "";
     fileName: string = "";
     mime: string = "";
+    /** 缩略图已渲染完成（@load/@error 置位；url 被受保护解析回填时复位，重转 loading）。 */
+    loaded: boolean = false;
   }
 
   /**
@@ -1862,6 +1882,8 @@
     msgType: string = "text";
     bodyText: string = "";
     imageUrl: string = "";
+    /** 主图已渲染完成（@load/@error 置位；imageUrl 被受保护解析回填时复位，重转 loading）。 */
+    imageLoaded: boolean = false;
     /** 语音消息（msgType=audio）：body.url（空=坏行不出语音条，回落 digest 系统行）。 */
     audioUrl: string = "";
     /** 语音时长秒：body.duration 可缺省（单位防御见 readMsgRow），缺失时首播后从播放器回填。 */
@@ -4090,6 +4112,96 @@
     { immediate: true },
   );
 
+  // ===== 消息图片 loading 转圈驱动（agentClock 同款 transition 自转——App 端 CSS animation
+  // 不可靠；任一图片未加载完成时运行，全部就绪即停。deg 经模板参数传入建立响应依赖）。
+  // ★两段式：起转段=单圈短弧（800ms，进页即见旋转——4 圈长弧在进场繁忙时首段过渡
+  // 可能被丢、环静止不显眼）；稳态段=4 圈长 tick（3200ms）——JS→native 桥接降频 4 倍、
+  // 弧间接缝的定时抖动同摊薄（单圈 tick 每 800ms 一接缝，Android 定时器抖动+进页
+  // 主线程繁忙时就是「转圈卡顿」——spin-loading 防卡顿同款设计）。两段周期不同，
+  // setInterval 定周期接不上，用链式 setTimeout 自续 =====
+  const IMG_SPIN_PERIOD_MS: number = 800;
+  const IMG_SPIN_CYCLES_PER_TICK: number = 4;
+  const imgSpinDeg = ref<number>(0);
+  let imgSpinTimer = 0;
+  let imgSpinStartTimer = 0;
+  /** 当前过渡弧时长（起转 800ms / 稳态 3200ms）。非 ref：只在 tick 回调里改，
+   *  值由随后 deg 变更驱动的重渲染带上（模板对 deg 的响应依赖不变）。 */
+  let imgSpinArcMs = IMG_SPIN_PERIOD_MS;
+
+  /** 图片 loading 环 inline style：旋转角+过渡时长+高亮弧颜色。★返回 UTSJSONObject
+   *  （spin-loading 组件 boxStyle 同款）而非样式串——App-Android 串内 border 颜色解析
+   *  不可靠（解析不掉回落平台默认黑边，真机「黑色圆圈」即此），对象形态 camelCase 键
+   *  由各端归一化处理；class 内同步给 top/right 色兜底，任一通道失效都不出黑边。
+   *  色取次级文案灰 #94929c：可见但读「灰」不读「黑」。 */
+  function imgSpinStyle(deg: number): UTSJSONObject {
+    const style = new UTSJSONObject();
+    style["transform"] = `rotate(${deg}deg)`;
+    style["transitionDuration"] = `${imgSpinArcMs}ms`;
+    style["borderTopColor"] = "#94929c";
+    style["borderRightColor"] = "#94929c";
+    return style;
+  }
+
+  function clearImgSpinTimers(): void {
+    if (imgSpinTimer != 0) {
+      clearTimeout(imgSpinTimer);
+      imgSpinTimer = 0;
+    }
+    if (imgSpinStartTimer != 0) {
+      clearTimeout(imgSpinStartTimer);
+      imgSpinStartTimer = 0;
+    }
+  }
+
+  /** 稳态段自续：到点抬 4 圈角、切长弧时长并按同周期续下一段（链式 setTimeout——
+   *  延迟取当前弧长，起转段 800ms 结束的瞬间正好接上第一段长弧，无空窗）。 */
+  function scheduleImgSpinSteadyTick(): void {
+    imgSpinTimer = setTimeout(() => {
+      imgSpinArcMs = IMG_SPIN_PERIOD_MS * IMG_SPIN_CYCLES_PER_TICK;
+      imgSpinDeg.value = imgSpinDeg.value + 360 * IMG_SPIN_CYCLES_PER_TICK;
+      scheduleImgSpinSteadyTick();
+    }, imgSpinArcMs);
+  }
+
+  /** 是否有未加载完成的图片（主图+rich_text 附件图）：字段变更均伴随 scheduleChatMediaRefresh
+   *  整表重赋值（@load/@error/url 回填都调它），computed 随之重算（anyAgentProcessing 同款）。 */
+  const anyImageLoading = computed((): boolean => {
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (row.msgType == "image" && row.imageUrl.length > 0 && row.imageLoaded != true) {
+        return true;
+      }
+      for (let j = 0; j < row.imageAtts.length; j++) {
+        const att = row.imageAtts[j];
+        if (att.url.length > 0 && att.loaded != true) {
+          return true;
+        }
+      }
+    }
+    return false;
+  });
+
+  watch(
+    (): boolean => anyImageLoading.value,
+    (on: boolean) => {
+      clearImgSpinTimers();
+      if (on != true) {
+        return;
+      }
+      imgSpinDeg.value = 0;
+      imgSpinArcMs = IMG_SPIN_PERIOD_MS;
+      // 等节点就绪后先走单圈起转弧（首帧 transition 才会转起来——spin-loading 同款），
+      // 起转弧落定的瞬间由稳态链接手 4 圈长弧
+      imgSpinStartTimer = setTimeout(() => {
+        imgSpinStartTimer = 0;
+        imgSpinDeg.value = 360;
+        scheduleImgSpinSteadyTick();
+      }, 50);
+    },
+    { immediate: true },
+  );
+
   /** reactions 全量快照就地替换目标行（REST 响应与 WS 3008 同构：整体替换，无本地合并）。 */
   function applyReactionSnapshot(msgId: string, raw: any | null): void {
     const rows = messages.value;
@@ -5989,15 +6101,30 @@
       const url = row.imageUrl;
       resolveChatImage(url, 300)
         .then((resolved: string) => {
-          if (isChatCurrent() && resolved != url) {
+          if (!isChatCurrent()) return;
+          if (resolved != url) {
             row.imageUrl = resolved;
+            // 换地址重载：复位 loading 态（新地址未加载过）
+            row.imageLoaded = false;
             // Android 原地属性变更不触发 v-for 行重渲：回填后整表重建调度出图
+            scheduleChatMediaRefresh();
+            return;
+          }
+          // 受保护解析失败回退原地址：不再有换址重载（原始地址 @error 已不收圈），
+          // 在此终态收圈停灰底，防转圈永不停止；Cookie 命中晚到 @load 不受影响
+          if (isAuthProtectedFileUrl(url) && row.imageLoaded != true) {
+            row.imageLoaded = true;
             scheduleChatMediaRefresh();
           }
         })
         .catch((_e: any | null) => {
-          // 失败保留原地址：交给 <image> 兜底（如平台 Cookie 命中的场景）
+          // 失败保留原地址：交给 <image> 兜底（如平台 Cookie 命中的场景）；
+          // 同上须终态收圈（reject 后无换址重载）
           console.error(`[ChatImg] 受保护主图解析失败保留原地址 src=${url}`);
+          if (isChatCurrent() && isAuthProtectedFileUrl(url) && row.imageLoaded != true) {
+            row.imageLoaded = true;
+            scheduleChatMediaRefresh();
+          }
         });
     }
     for (let i = 0; i < row.imageAtts.length; i++) {
@@ -6005,15 +6132,28 @@
       const url = att.url;
       resolveChatImage(url, 260)
         .then((resolved: string) => {
-          if (isChatCurrent() && resolved != url) {
+          if (!isChatCurrent()) return;
+          if (resolved != url) {
             att.url = resolved;
+            // 换地址重载：复位 loading 态（新地址未加载过）
+            att.loaded = false;
             // 同上：附件图回填后同样要整表重建才在 Android 出图
+            scheduleChatMediaRefresh();
+            return;
+          }
+          // 终态收圈（语义同主图回退分支）
+          if (isAuthProtectedFileUrl(url) && att.loaded != true) {
+            att.loaded = true;
             scheduleChatMediaRefresh();
           }
         })
         .catch((_e: any | null) => {
           // 同上
           console.error(`[ChatImg] 受保护附件图解析失败保留原地址 src=${url}`);
+          if (isChatCurrent() && isAuthProtectedFileUrl(url) && att.loaded != true) {
+            att.loaded = true;
+            scheduleChatMediaRefresh();
+          }
         });
     }
   }
@@ -7118,11 +7258,45 @@
   }
 
   /** 图片渲染失败诊断（Q4：Android 不出图排查——logcat 抓 [ChatImg] 定位失败 src）。 */
+  /** 主图渲染完成：收 loading 态。字段+整表刷新（App-Android 原地属性变更不触发
+   * v-for 行重渲，videoPlayUrl 回填同款）。 */
+  function handleImageRenderLoaded(msg: ImMsgRow): void {
+    if (msg.imageLoaded) return;
+    msg.imageLoaded = true;
+    scheduleChatMediaRefresh();
+  }
+
   function handleImageRenderError(msg: ImMsgRow): void {
+    if (msg.imageLoaded) return;
+    // 原始受保护地址（/api/f/）渲染失败是常态（<image> 带不了 Bearer）：resolveRowMedia
+    // 正在带 Bearer 解析、成功后换地址重载——此刻不收圈，让转圈贯穿整个解析等待期
+    // （进页先灰底静默、解析完才闪一下圈即此症）；非受保护地址/已换的展示地址失败
+    // 才是终态，收圈停灰底防永转（解析回退/异常的终态收圈在 resolveRowMedia 兜底）
+    if (isAuthProtectedFileUrl(msg.imageUrl)) {
+      console.error(`[ChatImg] 主图原始地址渲染失败（解析换址在途，保持转圈） msgId=${msg.msgId} src=${msg.imageUrl}`);
+      return;
+    }
+    msg.imageLoaded = true;
+    scheduleChatMediaRefresh();
     console.error(`[ChatImg] 主图渲染失败 msgId=${msg.msgId} src=${msg.imageUrl}`);
   }
 
+  /** 附件图渲染完成：收 loading 态（机制同主图）。 */
+  function handleAttImageRenderLoaded(att: ImMsgAtt): void {
+    if (att.loaded) return;
+    att.loaded = true;
+    scheduleChatMediaRefresh();
+  }
+
   function handleAttImageRenderError(att: ImMsgAtt): void {
+    if (att.loaded) return;
+    // 语义同主图：原始受保护地址失败=解析换址在途，保持转圈；终态失败才收圈
+    if (isAuthProtectedFileUrl(att.url)) {
+      console.error(`[ChatImg] 附件图原始地址渲染失败（解析换址在途，保持转圈） src=${att.url}`);
+      return;
+    }
+    att.loaded = true;
+    scheduleChatMediaRefresh();
     console.error(`[ChatImg] 附件图渲染失败 src=${att.url}`);
   }
 
@@ -10389,6 +10563,7 @@
     eventBus.off(`${EVENT_TYPE.ImMessageReaction}`, onImMessageReaction);
     eventBus.off(`${EVENT_TYPE.ImAgentStatus}`, onImAgentStatus);
     clearAgentClockTimers();
+    clearImgSpinTimers();
     if (readRefreshTimer != 0) {
       clearTimeout(readRefreshTimer);
       readRefreshTimer = 0;
@@ -11084,18 +11259,67 @@
     color: #6b6976;
   }
 
-  /* ===== 图片消息：不进气泡，300rpx 方形缩略，点击全屏放大 ===== */
-  .chat-image {
+  /* ===== 图片消息：不进气泡，300rpx 方形缩略，点击全屏放大。外层 box 定尺寸+灰底占位
+     并承载 loading 态（未加载完成前转圈环；@load/@error 置位字段，url 回填时复位重转） ===== */
+  .chat-image-box {
+    position: relative;
     width: 300rpx;
     height: 300rpx;
     border-radius: 12rpx;
     background-color: #ecebf1;
+    flex-shrink: 0;
   }
 
-  .chat-image--att {
+  .chat-image-box--att {
     width: 260rpx;
     height: 260rpx;
     margin-top: 12rpx;
+  }
+
+  .chat-image {
+    width: 100%;
+    height: 100%;
+    border-radius: 12rpx;
+  }
+
+  /* loading 蒙层：图片未就绪期间盖缩略位（灰底由 box 承担），转圈环居中 */
+  .chat-img-spinbox {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* 转圈环：App 端 CSS animation 不可靠——旋转由 inline style 注入的 transform+
+     transition-duration 共同完成（agentClock 同款）。★四边 border 用 longhand 且
+     非高亮边 transparent，高亮弧颜色（top/right）由 imgSpinStyle 对象 inline 注入
+     （class 单边 border-color 覆盖在 App-Android 不可靠——spin-loading 组件同款）；
+     class 内仍给同色兜底：inline 通道失效时不回落平台默认黑边 */
+  .chat-img-spin {
+    width: 44rpx;
+    height: 44rpx;
+    border-radius: 100px;
+    box-sizing: border-box;
+    flex-shrink: 0;
+    border-top-width: 4rpx;
+    border-top-style: solid;
+    border-top-color: #94929c;
+    border-right-width: 4rpx;
+    border-right-style: solid;
+    border-right-color: #94929c;
+    border-bottom-width: 4rpx;
+    border-bottom-style: solid;
+    border-bottom-color: transparent;
+    border-left-width: 4rpx;
+    border-left-style: solid;
+    border-left-color: transparent;
+    transition-property: transform;
+    transition-timing-function: linear;
+    transform: rotate(0deg);
   }
 
   /* ===== 视频消息：不进气泡，深色圆角占位卡（服务端无封面字段），点击原位换 <video>。

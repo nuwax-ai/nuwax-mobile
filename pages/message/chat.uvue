@@ -1675,7 +1675,7 @@
   import { pcmToWavFile, PcmToWavResult } from "@/utils/voice/pcmToWav";
   import { UploadFileInfo } from "@/types/interfaces/common.uts";
   import { imUnreadCount, refreshImUnreadBadge } from "@/utils/imUnreadBadge";
-  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { isRemoteSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import { getSafeAreaBottom, handleExternalLink, isWorkCommercialRepoLinkBlocked, openNativeHomeChatLink } from "@/utils/system";
   import { getApiBaseUrl } from "@/constants/config";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
@@ -5814,12 +5814,34 @@
 
   const chatImageUrls = new Set<string>();
   const chatImageRequests = new Map<string, Promise<string>>();
+  /** ak 直链展示地址 → 原始受保护地址：@error 自愈要按原址回落整段下载（视频有
+   *  row.videoUrl 原址字段可重解析，图片行 imageUrl 会被换写，以此表补原址）。
+   *  只登记 ak 地址（仍命中 /api/f/ 判定）；temp/blob 展示地址不走该判定，无需登记。 */
+  const chatImageAkOrigins = new Map<string, string>();
+  /** 已按「ak 渲染失败」自愈过的展示地址（每地址至多一次：过期自愈够用，坏文件不无限循环）。 */
+  const chatImageAkRetried = new Set<string>();
 
-  async function resolveChatImage(url: string, size: number): Promise<string> {
-    const key = `${size}:${url}`;
+  /** 受保护图片取址：allowAk 时首选 /api/file/ak/refresh 换 ?ak= 直链——<image> 自跟
+   *  302 到对象存储流式加载，只花一次轻量 JSON 请求，免去整段下载落盘与完整性校验
+   *  （视频 resolveChatVideo 同款策略）；接口不可用/失败回落原整段下载路径（temp/blob）。
+   *  SVG 例外：受保护 SVG 必须走「取文本→改尺寸→data URL」管线，ak 直链会让原生
+   *  1:1 光栅化裁切问题回归（resolveDisplayImageUrl 内已按平台分流）。 */
+  async function resolveChatImageProtected(url: string, size: number, allowAk: boolean): Promise<string> {
+    if (allowAk && isAuthProtectedFileUrl(url) && isRemoteSvgUrl(url) != true) {
+      try {
+        return await fetchAuthProtectedFileAkUrl(url);
+      } catch (_e) {
+        console.error(`[ChatImg] ak 直链解析失败，回落整段下载 url=${url}`);
+      }
+    }
+    return await resolveDisplayImageUrl(url, size, size);
+  }
+
+  async function resolveChatImage(url: string, size: number, allowAk: boolean = true): Promise<string> {
+    const key = `${allowAk ? "ak" : "dl"}:${size}:${url}`;
     const existing = chatImageRequests.get(key);
     if (existing != null) return await existing;
-    const task = resolveDisplayImageUrl(url, size, size);
+    const task = resolveChatImageProtected(url, size, allowAk);
     chatImageRequests.set(key, task);
     try {
       const resolved = await task;
@@ -5828,6 +5850,10 @@
         return url;
       }
       if (resolved.startsWith("blob:")) chatImageUrls.add(resolved);
+      // ak 直链仍属 /api/f/ 判定：登记原址供 @error 自愈回落整段下载（temp 地址不登记）
+      if (resolved != url && isAuthProtectedFileUrl(resolved)) {
+        chatImageAkOrigins.set(resolved, url);
+      }
       return resolved;
     } finally {
       chatImageRequests.delete(key);
@@ -6108,6 +6134,9 @@
     chatImageUrls.forEach((url: string) => { releaseDisplayImageUrl(url); });
     chatImageUrls.clear();
     chatImageRequests.clear();
+    // ak 原址登记/自愈记账一并清空：会话切换后地址全部失效，防悬挂引用
+    chatImageAkOrigins.clear();
+    chatImageAkRetried.clear();
     // 头像解析产物一并回收：会话切换/页面卸载后 blob 已失效，缓存须清空防悬挂引用
     avatarBlobUrls.forEach((url: string) => { releaseDisplayImageUrl(url); });
     avatarBlobUrls.clear();
@@ -6121,7 +6150,7 @@
    * 经 resolveDisplayImageUrl 带 Bearer 拉取换成可展示地址（H5 blob / App 临时文件），
    * 解析成功后原位替换；普通地址原样保留。
    */
-  function resolveRowMedia(row: ImMsgRow): void {
+  function resolveRowMedia(row: ImMsgRow, allowAk: boolean = true): void {
     if (!isChatCurrent()) return;
     if (!isChatActive()) {
       deferredMediaIds.add(row.msgId);
@@ -6132,7 +6161,7 @@
     resolveChatAvatarUrl(row.senderAvatar);
     if (row.imageUrl.length > 0) {
       const url = row.imageUrl;
-      resolveChatImage(url, 300)
+      resolveChatImage(url, 300, allowAk)
         .then((resolved: string) => {
           if (!isChatCurrent()) return;
           if (resolved != url) {
@@ -6163,7 +6192,7 @@
     for (let i = 0; i < row.imageAtts.length; i++) {
       const att = row.imageAtts[i];
       const url = att.url;
-      resolveChatImage(url, 260)
+      resolveChatImage(url, 260, allowAk)
         .then((resolved: string) => {
           if (!isChatCurrent()) return;
           if (resolved != url) {
@@ -7245,9 +7274,14 @@
     timeRevealedId.value = timeRevealedId.value == msg.msgId ? "" : msg.msgId;
   }
 
-  /** 图片可入滑动预览列表：空地址与未解析的 /api/f/ 受保护直链剔除（带不了 Bearer，进系统查看器必然空白）。 */
+  /** 图片可入滑动预览列表：ak 直链（带临时签名免鉴权）与 temp/blob 展示地址可入；
+   *  空地址与未解析的 /api/f/ 受保护直链剔除（带不了 Bearer，进系统查看器必然空白）。 */
   function isPreviewableChatImage(url: string): boolean {
-    return url.length > 0 && isAuthProtectedFileUrl(url) != true;
+    if (url.length == 0) return false;
+    // ak 直链（已带临时签名，免鉴权可载）可预览；temp/blob 展示地址可预览；
+    // 仍剔除未解析的原始受保护地址（预览器带不了 Bearer）
+    if (chatImageAkOrigins.has(url)) return true;
+    return isAuthProtectedFileUrl(url) != true;
   }
 
   /** 会话内全部可预览图片（升序遍历 messages = 视觉顺序，含向上翻页加载的更早消息）：
@@ -7301,11 +7335,39 @@
 
   function handleImageRenderError(msg: ImMsgRow): void {
     if (msg.imageLoaded) return;
-    // 原始受保护地址（/api/f/）渲染失败是常态（<image> 带不了 Bearer）：resolveRowMedia
-    // 正在带 Bearer 解析、成功后换地址重载——此刻不收圈，让转圈贯穿整个解析等待期
-    // （进页先灰底静默、解析完才闪一下圈即此症）；非受保护地址/已换的展示地址失败
-    // 才是终态，收圈停灰底防永转（解析回退/异常的终态收圈在 resolveRowMedia 兜底）
+    // 受保护地址（/api/f/）分两态：原始地址渲染失败是常态（<image> 带不了 Bearer），
+    // resolveRowMedia 正在解析、成功后换地址重载——不收圈，转圈贯穿解析等待期；
+    // 已换的 ak 直链展示地址失败（ak 过期/该端 <image> 不跟 302）则按原址回落
+    // 整段下载自愈一次（视频 handleVideoError 同款），下载也失败才终态收圈停灰底。
     if (isAuthProtectedFileUrl(msg.imageUrl)) {
+      const origin = chatImageAkOrigins.get(msg.imageUrl);
+      if (origin != null && chatImageAkRetried.has(msg.imageUrl) != true) {
+        chatImageAkRetried.add(msg.imageUrl);
+        console.error(`[ChatImg] 主图 ak 直链渲染失败，回落整段下载 msgId=${msg.msgId} src=${msg.imageUrl}`);
+        resolveChatImage(origin, 300, false)
+          .then((resolved: string) => {
+            if (!isChatCurrent()) return;
+            if (resolved != origin) {
+              msg.imageUrl = resolved;
+              // 换地址重载：复位 loading 态（新地址未加载过）
+              msg.imageLoaded = false;
+              scheduleChatMediaRefresh();
+              return;
+            }
+            // 下载兜底也失败（回退原地址）：终态收圈（resolveRowMedia 回退分支同口径）
+            if (msg.imageLoaded != true) {
+              msg.imageLoaded = true;
+              scheduleChatMediaRefresh();
+            }
+          })
+          .catch((_e: any | null) => {
+            if (isChatCurrent() && msg.imageLoaded != true) {
+              msg.imageLoaded = true;
+              scheduleChatMediaRefresh();
+            }
+          });
+        return;
+      }
       console.error(`[ChatImg] 主图原始地址渲染失败（解析换址在途，保持转圈） msgId=${msg.msgId} src=${msg.imageUrl}`);
       return;
     }
@@ -7323,8 +7385,35 @@
 
   function handleAttImageRenderError(att: ImMsgAtt): void {
     if (att.loaded) return;
-    // 语义同主图：原始受保护地址失败=解析换址在途，保持转圈；终态失败才收圈
+    // 语义同主图：原始受保护地址失败=解析换址在途，保持转圈；ak 直链展示地址失败
+    // 按原址回落整段下载自愈一次；终态失败才收圈
     if (isAuthProtectedFileUrl(att.url)) {
+      const origin = chatImageAkOrigins.get(att.url);
+      if (origin != null && chatImageAkRetried.has(att.url) != true) {
+        chatImageAkRetried.add(att.url);
+        console.error(`[ChatImg] 附件图 ak 直链渲染失败，回落整段下载 src=${att.url}`);
+        resolveChatImage(origin, 260, false)
+          .then((resolved: string) => {
+            if (!isChatCurrent()) return;
+            if (resolved != origin) {
+              att.url = resolved;
+              att.loaded = false;
+              scheduleChatMediaRefresh();
+              return;
+            }
+            if (att.loaded != true) {
+              att.loaded = true;
+              scheduleChatMediaRefresh();
+            }
+          })
+          .catch((_e: any | null) => {
+            if (isChatCurrent() && att.loaded != true) {
+              att.loaded = true;
+              scheduleChatMediaRefresh();
+            }
+          });
+        return;
+      }
       console.error(`[ChatImg] 附件图原始地址渲染失败（解析换址在途，保持转圈） src=${att.url}`);
       return;
     }

@@ -210,9 +210,10 @@
             </view>
           </view>
           <view class="chat-col" :class="isMine(msg) ? 'chat-col--mine' : ''">
-            <!-- 微信式：我方行不显示昵称（头像已在右侧标识发送者），仅对方行展示 -->
+            <!-- 微信式：我方行不显示昵称（头像已在右侧标识发送者），仅对方行展示；
+                 联系人索引（备注）优先于 senderName 快照，tick 尾参驱动 Android 重渲 -->
             <text v-if="isGroupLike && isMine(msg) != true" class="chat-name text-ellipsis">{{
-              msg.senderName.length > 0 ? msg.senderName : titleName
+              groupSenderName(msg, contactRemarkTick)
             }}</text>
             <!-- 气泡横排包层：[状态列][图片|气泡]——align-items:flex-end 让发送态/已读
                  icon 沉到气泡左下角；包层只包气泡本体，下方表情行/pin 署名行/时间行
@@ -1688,6 +1689,7 @@
     setCachedChatScroll,
   } from "@/utils/im/imChatCache";
   import { getCachedMyInfo, setCachedMyInfo } from "@/utils/im/myInfoCache";
+  import { getCachedContactRemarks, setCachedContactRemarks } from "@/utils/im/contactRemarkCache";
   import {
     buildAuthProtectedFileHeaders,
     extractFileNameFromUrl,
@@ -2020,6 +2022,15 @@
   });
   const titleName = ref<string>("");
   const peerAvatar = ref<string>("");
+
+  // ===== 群聊发送者备注名（联系人备注覆写 senderName 快照） =====
+  /** senderId → remark（只收设了备注的联系人）：群聊消息行昵称优先取它——senderName
+   *  是发送时刻昵称快照、不含我方备注；无备注回落快照（保住「历史消息显示当时名字」
+   *  的快照语义）。非响应式 Map + tick 版本号驱动。 */
+  let contactRemarks = new Map<string, string>();
+  /** 索引就绪/变更版本号：Android 模板方法绑定不收集方法体内依赖（本页 readInfoTick
+   *  同款配方），groupSenderName(msg, contactRemarkTick) 靠尾参变化触发已渲染行重渲。 */
+  const contactRemarkTick = ref<number>(0);
 
   /** 返回键旁未读角标文案（飞书式：浅灰圆底黑字，>99 收敛 99+）：读全局 imUnreadCount
    *  响应式总量（WS 新消息/已读回执/回前台均全量拉刷新），模板直接读本 computed 建立
@@ -2634,6 +2645,75 @@
       return true;
     }
     return myUserId.value.length > 0 && msg.senderId == myUserId.value;
+  }
+
+  /**
+   * 群聊消息行发送者昵称：我给发送者设的备注优先——消息接口 senderName 是发送
+   * 那一刻的昵称快照（飞书语义）不含备注；无备注回落快照（保住快照语义），快照
+   * 也空回落会话标题。★尾参 contactRemarkTick：Android 模板方法绑定不收集方法体内
+   * 依赖（readInfoOf(msg, readInfoTick) 同款配方），索引就绪/变更靠 tick 重渲。
+   */
+  function groupSenderName(msg: ImMsgRow, _tick: number): string {
+    if (contactRemarks.size > 0) {
+      const remark = contactRemarks.get(msg.senderId);
+      if (remark != null && remark.length > 0) {
+        return remark;
+      }
+    }
+    return msg.senderName.length > 0 ? msg.senderName : titleName.value;
+  }
+
+  /**
+   * 拉通讯录建备注索引（仅群聊/团队：单聊不显示发送者昵称，标题已走
+   * IM_PEER_REMARK_EVENT 即时更新）。先同步回填模块缓存（消息页刷新联系人时会写，
+   * 命中则首帧即备注名，免二次换名），再静默拉取整表替换——值未变时 diff 无可见
+   * 变化，仅一轮轻量重渲。失败完全静默（保留缓存/快照名渲染，下次 onShow 再试）。
+   */
+  async function loadContactRemarks(): Promise<void> {
+    if (isGroupLike.value != true || convId.value.length == 0) {
+      return;
+    }
+    const cached = getCachedContactRemarks();
+    if (cached != null && cached.size > 0 && contactRemarks.size == 0) {
+      contactRemarks = cached;
+      contactRemarkTick.value += 1;
+    }
+    try {
+      const res = await apiImContacts();
+      if (!isChatCurrent()) return;
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      const itemsRaw = dataObj == null ? null : dataObj["items"];
+      if (itemsRaw == null) {
+        return;
+      }
+      const items = itemsRaw as UTSJSONObject[];
+      const fresh = new Map<string, string>();
+      for (let i = 0; i < items.length; i++) {
+        // 只收正式联系人（status=1）且设了备注的：申请流转中无备注语义；★存纯备注
+        // 而非 displayName（备注>昵称>账号 合并值）——无备注联系人的昵称会盖过
+        // 群页的群卡片，破坏「备注 > 群卡片 > 昵称」优先级（缓存模块注释同因）
+        if (readNumber(items[i], "status", 1) != 1) {
+          continue;
+        }
+        const uid = readString(items[i], "userId");
+        const remark = readString(items[i], "remark");
+        if (uid.length > 0 && remark.length > 0) {
+          fresh.set(uid, remark);
+        }
+      }
+      if (fresh.size == 0) {
+        return;
+      }
+      setCachedContactRemarks(fresh);
+      contactRemarks = fresh;
+      contactRemarkTick.value += 1;
+    } catch (_error) {
+      // 静默：保留缓存/快照名
+    }
   }
 
   function sysText(msg: ImMsgRow): string {
@@ -11072,15 +11152,13 @@
   };
 
   /**
-   * 子页改备注通知（im-user-info 发，payload { convId, userId, name }）：
-   * 单聊顶部标题是 onLoad 入参快照、返回 onShow 不重拉，这里即时换新（name 为
-   * 服务端按 备注>昵称>账号 重算的 displayName）。群聊/团队标题=群名与备注无关
-   * 忽略；单聊里改自己备注（理论上不可达，服务端联系人域不含自己）也忽略。
+   * 子页改备注通知（im-user-info 发，payload { convId, userId, name }，name 为
+   * 服务端按 备注>昵称>账号 重算的 displayName）。单聊：顶部标题是 onLoad 入参
+   * 快照、返回 onShow 不重拉，这里即时换新。群聊/团队：标题=群名与备注无关，
+   * 但消息行发送者昵称走联系人索引覆写——把索引里该行即时换新并 tick 重渲。
+   * 改自己备注（理论上不可达，服务端联系人域不含自己）忽略。
    */
   function onPeerRemarkUpdated(data: any): void {
-    if (isGroupLike.value) {
-      return;
-    }
     const obj = data == null ? null : (data as UTSJSONObject);
     if (obj == null) {
       return;
@@ -11088,13 +11166,26 @@
     if (readString(obj, "convId") != convId.value) {
       return;
     }
-    if (myUserId.value.length > 0 && readString(obj, "userId") == myUserId.value) {
+    const uid = readString(obj, "userId");
+    if (myUserId.value.length > 0 && uid == myUserId.value) {
       return;
     }
     const name = readString(obj, "name");
-    if (name.length > 0) {
-      titleName.value = name;
+    if (name.length == 0) {
+      return;
     }
+    if (isGroupLike.value) {
+      // 群聊：改备注 → 索引换新并 tick 重渲消息行；清备注 → 摘除回落快照名
+      const remark = readString(obj, "remark");
+      if (remark.length > 0) {
+        contactRemarks.set(uid, remark);
+      } else {
+        contactRemarks.delete(uid);
+      }
+      contactRemarkTick.value += 1;
+      return;
+    }
+    titleName.value = name;
   }
 
   function clearChatUiTimers(): void {
@@ -11145,6 +11236,8 @@
       myInfoPending = loadMyInfo();
       // 进页即拉 @ 数据源（群聊=群成员 / 单聊=联系人；@面板与提及高亮依据，不阻塞首屏）
       loadMembers();
+      // 群聊发送者备注名索引（先回填模块缓存再静默刷新；单聊内部空转，不阻塞首屏）
+      loadContactRemarks();
       // 长按操作的能力依据（群治理开关/我的角色、置顶集、撤回时限），不阻塞首屏
       loadConvInfo();
       loadPinnedIds();
@@ -11333,6 +11426,11 @@
     // 从别的页面回来：置顶集与已读计数是多人共享状态，重拉自我纠正
     loadPinnedIds();
     refreshReadStatus();
+    // 群聊返回（群设置→成员→资料页改备注等无事件路径）：联系人索引静默自我纠正
+    // （首次 onShow 与 onLoad 拉取重合，跳过避免重复请求——下方 silentSyncLatest 同款守卫）
+    if (chatHasShownOnce && isGroupLike.value) {
+      loadContactRemarks();
+    }
     // 静默同步最新消息（离开期间其他端新发的消息兜底；不打断滚动）
     if (chatHasShownOnce && convId.value.length > 0 && messages.value.length > 0) {
       silentSyncLatest();

@@ -5,6 +5,7 @@
 //
 import AVFoundation
 import Foundation
+import UIKit
 
 public class StreamPcmPlayerBridge {
     private var engine: AVAudioEngine?
@@ -20,21 +21,69 @@ public class StreamPcmPlayerBridge {
     private let maxBacklogBytes: Int64 = 600 * 32000
     /** 诊断：因积压超上限被丢弃的字节数（正常播放应为 0） */
     private var droppedBytes: Int64 = 0
+    /** 退后台时再确认一次 playback 会话；播报对象存活期间只注册一次 */
+    private var lifecycleObserversInstalled = false
 
-    public init() {}
+    public init() {
+        installLifecycleObservers()
+    }
 
-    /// 原生 PCM 不经过 InnerAudioContext，使用 ambient 遵循 iPhone 静音键。
-    /// 录音结束后也要从 playAndRecord 切回；下一次录音由录音器重新配置会话。
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    /// 播报期间用 playback，退后台才能继续播完（ambient 进后台会被系统静音）。
+    /// mixWithOthers：不抢占其他 App 正在播放的音频。
+    /// 播完 releasePlayer 切回 ambient，录音仍由录音器自行切到 playAndRecord。
+    /// 播报进行中不跟随静音键，与 Android STREAM_MUSIC 一致；结束后恢复 ambient。
     private func preparePlaybackSession() throws {
         let session = AVAudioSession.sharedInstance()
-        if session.category != .ambient {
-            try session.setCategory(.ambient, mode: .default)
-        }
-        if engine?.isRunning != true {
+        if session.category != .playback {
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+        } else if engine?.isRunning != true {
             try session.setActive(true)
         }
         let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
         NSLog("[PCMPlay] session category=\(session.category.rawValue) outputs=\(outputs) volume=\(session.outputVolume)")
+    }
+
+    private func installLifecycleObservers() {
+        if lifecycleObserversInstalled { return }
+        lifecycleObserversInstalled = true
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(appWillResignActive),
+                                               name: UIApplication.willResignActiveNotification,
+                                               object: nil)
+    }
+
+    /// 进后台前再激活 playback 会话。控制中心/来电也会触发；未在播则不动会话。
+    @objc private func appWillResignActive() {
+        guard started else { return }
+        do {
+            try preparePlaybackSession()
+            if engine?.isRunning != true {
+                try engine?.start()
+            }
+            if player?.isPlaying != true {
+                player?.play()
+            }
+        } catch {
+            NSLog("[PCMPlay] keep playback on resign active failed: \(error)")
+        }
+    }
+
+    /// 播报结束后交还会话。正在录音（playAndRecord）时不改，避免拆掉录音路由。
+    private func restoreAmbientSession() {
+        let session = AVAudioSession.sharedInstance()
+        if session.category != .playback {
+            return
+        }
+        do {
+            try session.setCategory(.ambient, mode: .default)
+        } catch {
+            NSLog("[PCMPlay] restore ambient failed: \(error)")
+        }
     }
 
     public func initPlayer(_ sampleRate: NSNumber) {
@@ -205,5 +254,7 @@ public class StreamPcmPlayerBridge {
         started = false
         // 不停 AVAudioEngine：engine.stop() 会自惹 session interruption，
         // 随后立刻开录音会丢开头 1~2s。下次 initPlayer 复用同一引擎。
+        // 切回 ambient，避免播完后仍占后台音频资格。不 setActive(false)，同上。
+        restoreAmbientSession()
     }
 }

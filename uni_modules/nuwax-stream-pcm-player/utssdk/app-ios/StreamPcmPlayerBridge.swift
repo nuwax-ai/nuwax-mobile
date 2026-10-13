@@ -21,8 +21,10 @@ public class StreamPcmPlayerBridge {
     private let maxBacklogBytes: Int64 = 600 * 32000
     /** 诊断：因积压超上限被丢弃的字节数（正常播放应为 0） */
     private var droppedBytes: Int64 = 0
-    /** 退后台时再确认一次 playback 会话；播报对象存活期间只注册一次 */
+    /** 退后台 / 回前台时再确认 playback 会话；播报对象存活期间只注册一次 */
     private var lifecycleObserversInstalled = false
+    /** 避免 configurationChange 里同步重入 recover */
+    private var recovering = false
 
     public init() {
         installLifecycleObservers()
@@ -55,21 +57,77 @@ public class StreamPcmPlayerBridge {
                                                selector: #selector(appWillResignActive),
                                                name: UIApplication.willResignActiveNotification,
                                                object: nil)
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(appDidBecomeActive),
+                                               name: UIApplication.didBecomeActiveNotification,
+                                               object: nil)
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleEngineConfigurationChange(_:)),
+                                               name: .AVAudioEngineConfigurationChange,
+                                               object: nil)
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleSessionInterruption(_:)),
+                                               name: AVAudioSession.interruptionNotification,
+                                               object: nil)
     }
 
     /// 进后台前再激活 playback 会话。控制中心/来电也会触发；未在播则不动会话。
     @objc private func appWillResignActive() {
+        recoverPlaybackIfNeeded(reason: "resign-active")
+    }
+
+    /// 回前台：会话仍是 playback 且引擎在跑就不要动。
+    /// 无条件 pause/start 会把正在播的声音掐断一下，页面也会跟着顿。
+    @objc private func appDidBecomeActive() {
+        recoverPlaybackIfNeeded(reason: "become-active")
+    }
+
+    @objc private func handleEngineConfigurationChange(_ notification: Notification) {
+        guard let changed = notification.object as? AVAudioEngine, changed === engine else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.recoverPlaybackIfNeeded(reason: "configuration-change")
+        }
+    }
+
+    /// 中断结束（回前台、录音预热 setActive 等）后把还在播的引擎拉起来。began 不改 started。
+    @objc private func handleSessionInterruption(_ notification: Notification) {
         guard started else { return }
+        guard let info = notification.userInfo,
+              let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw),
+              type == .ended else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.recoverPlaybackIfNeeded(reason: "interruption-ended")
+        }
+    }
+
+    /// 进后台：会话被改掉或引擎停了才修。未在播则不动。
+    private func recoverPlaybackIfNeeded(reason: String) {
+        guard started else { return }
+        let session = AVAudioSession.sharedInstance()
+        let engineDown = engine?.isRunning != true
+        let wrongCategory = session.category != .playback
+        if !engineDown && !wrongCategory && player?.isPlaying == true {
+            return
+        }
+        reassertPlaybackOutput(reason: reason)
+    }
+
+    /// 只在会话被改掉或引擎已停时接回输出。正在跑的引擎不要 pause，否则回前台会顿一下。
+    private func reassertPlaybackOutput(reason: String) {
+        guard started, !recovering, let engine = engine, let player = player else { return }
+        recovering = true
+        defer { recovering = false }
         do {
             try preparePlaybackSession()
-            if engine?.isRunning != true {
-                try engine?.start()
+            if !engine.isRunning {
+                try engine.start()
             }
-            if player?.isPlaying != true {
-                player?.play()
+            if !player.isPlaying {
+                player.play()
             }
         } catch {
-            NSLog("[PCMPlay] keep playback on resign active failed: \(error)")
+            NSLog("[PCMPlay] reassert \(reason) failed: \(error)")
         }
     }
 
@@ -204,7 +262,14 @@ public class StreamPcmPlayerBridge {
     }
 
     public func ensurePlaying() {
-        if started { return }
+        if started {
+            // 排空轮询约 200ms 一次。回前台会话被改成 playAndRecord、或引擎被停时，在这里接回去。
+            let session = AVAudioSession.sharedInstance()
+            if session.category != .playback || engine?.isRunning != true {
+                reassertPlaybackOutput(reason: "ensure-playing")
+            }
+            return
+        }
         if writtenMs() >= 150 {
             playNow()
         }

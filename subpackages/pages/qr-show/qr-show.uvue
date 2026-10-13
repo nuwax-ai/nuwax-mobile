@@ -1,0 +1,572 @@
+<template>
+  <!--
+    名片二维码独立页（我的页 / 群设置页共用，替代原 qr-card-popup 弹窗）：
+    - 正面：名字 + 账号/群号副题 + 二维码（view 叠加 /static/logo.png）+ tip 文案
+    - 点导航栏右上角链接 icon → 白色内容卡片翻转 180°（页面/导航不动，按钮在卡外随面切换）：
+      背面在原二维码位置展示「{name}申请添加你为联系人，点击链接处理」+ 链接（群=群号引导 + 群号）
+    - 保存图片：惰性合成含 logo 的像素级方图（qrLogoPngDataUrl）存相册
+    - 二维码本地生成（encodeQr + qrPngDataUrl，纯 UTS 无网络依赖），内容按参数页内重建
+      （buildUserCardUrl / buildGroupCardContent，与扫一扫 match 对称）
+    - 翻转用两段式（0→90° 换面 → -90°→0°），规避 backface-visibility 跨端支持风险；
+      rotateY 万一某端不生效则退化为硬切换面，功能不受损
+  -->
+  <view class="qs-page">
+    <custom-nav-bar :title="navTitle" :show-back="true" :has-safety-zone="true">
+      <template #right>
+        <view v-if="state == 'done'" class="qs-nav-action" @click="toggleSide">
+          <svg-icon
+            :name="side == 'front' ? 'icon-Link' : 'icon-Qrcode'"
+            size="40"
+            color="#1c1b20"
+          />
+        </view>
+      </template>
+    </custom-nav-bar>
+
+    <view class="qs-body">
+      <!-- 翻转容器 = 整张白色内容卡片（用户口径：内容卡片翻转，非页面翻转）；
+           transition 属性/曲线落 class，时长走内联（chat.uvue agentClockStyle 同款）。
+           卡高固定 720rpx（正面内容高为最大面），两面均 absolute 铺满：换面时高度不跳 -->
+      <view class="qs-card" :style="flipStyleText">
+        <!-- 正面 -->
+        <view v-show="side == 'front'" class="qs-card__face qs-card__face--front">
+          <text class="qs-card__name">{{ cardName }}</text>
+          <text class="qs-card__subtitle">{{ cardSubtitle }}</text>
+
+          <view class="qs-qr-slot">
+            <view v-if="state == 'loading'" class="qs-qr-state">
+              <text class="qs-qr-state__text">{{ t("Mobile.Common.loading") }}</text>
+            </view>
+            <view v-else-if="state == 'failed'" class="qs-qr-state">
+              <text class="qs-qr-state__text">{{ t("Mobile.Qr.generateFailed") }}</text>
+            </view>
+            <template v-else>
+              <image
+                class="qs-qr-image"
+                :src="dataUrl"
+                mode="aspectFit"
+                :fade-show="false"
+                @click="previewQr"
+              />
+              <!-- 中央 logo 白垫（显示层叠加，保存时才做像素合成）：
+                   尺寸对齐保存图口径 k 模块（v4 码 ≈72rpx / v5 ≈75rpx），取 84rpx 视觉居中 -->
+              <view class="qs-qr-logo-pad">
+                <image class="qs-qr-logo" src="/static/logo.png" mode="aspectFit" />
+              </view>
+            </template>
+          </view>
+
+          <text class="qs-card__tip">{{ cardTip }}</text>
+        </view>
+
+        <!-- 背面：名字/副题与正面同位；原二维码槽内换引导文案+链接（个人/群） -->
+        <view v-show="side == 'back'" class="qs-card__face qs-card__face--back">
+          <text class="qs-card__name">{{ cardName }}</text>
+          <text class="qs-card__subtitle">{{ cardSubtitle }}</text>
+          <view class="qs-qr-slot qs-back-area">
+            <text class="qs-back-desc">{{ backDescText }}</text>
+            <text class="qs-back-link">{{ backLinkText }}</text>
+          </view>
+        </view>
+      </view>
+
+      <!-- 操作按钮（卡外，随面切换；单键占满行宽） -->
+      <view v-if="side == 'front'" class="qs-actions">
+        <view
+          class="qs-btn qs-btn--plain"
+          :class="saving ? 'qs-btn--saving' : ''"
+          @click="handleSaveImage"
+        >
+          <text class="qs-btn__text qs-btn__text--plain">{{
+            saving ? t("Mobile.Qr.saving") : t("Mobile.Qr.saveImage")
+          }}</text>
+        </view>
+      </view>
+      <view v-else class="qs-actions">
+        <view class="qs-btn qs-btn--plain" @click="handleCopyLink">
+          <text class="qs-btn__text qs-btn__text--plain">{{ t("Mobile.Scan.copy") }}</text>
+        </view>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import CustomNavBar from "@/components/custom-nav-bar/custom-nav-bar.uvue";
+  import { encodeQr } from "@/utils/qrcode/qrcodeEncoder";
+  import type { QrEncodeResult } from "@/utils/qrcode/qrcodeEncoder";
+  import { qrPngDataUrl, qrLogoPngDataUrl } from "@/utils/qrcode/qrPng";
+  import { previewImageCompat } from "@/utils/appWebViewImagePreview";
+  import { saveQrImageToAlbum, qrImageFileName } from "@/utils/qrImageSave";
+  import { buildUserCardUrl, buildGroupCardContent } from "@/utils/scanRouter";
+  import { writeClipboardText } from "@/utils/clipboard";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  // ===== 页面参数态（user | group；雪花号/群号/convId 全程字符串）=====
+  const qrType = ref<string>("user");
+  const cardName = ref<string>("");
+  /** 账号（user）/ 群号（group），副题与背面链接共用 */
+  const cardAccount = ref<string>("");
+  const cardUserId = ref<string>("");
+  const cardConvId = ref<string>("");
+
+  // ===== 二维码生成态（loading | failed | done，纯字符串避免枚举串化平台分歧）=====
+  const state = ref<string>("loading");
+  const dataUrl = ref<string>("");
+  /** 编码结果暂存（保存时合成 logo 版用；模板不读，普通 let 即可） */
+  let qrResult: QrEncodeResult | null = null;
+  /** 码内容（个人=名片 URL，群=group#群号[#convId]；页面内重建不透传） */
+  let qrContent = "";
+  /** 含 logo 保存图（惰性合成 + 模块级缓存：raw 百万级 Number，勿放渲染路径） */
+  let logoDataUrlCache = "";
+
+  /** 保存图 scale：显示用 12（≈492px），相册保存提到 16（v4~v6 ≈592~720px）。
+   *  再高内存/耗时翻倍收益小——清晰度主要靠 logo 源 64→192（保存图 logo 区
+   *  ~112~128px，192 源近原生不再拉伸发糊）；qrPng 侧行模板+IDAT 直写已把
+   *  纯计算降维，剩余耗时为字节物化（第二次保存走缓存瞬时） */
+  const SAVE_SCALE = 16;
+
+  // ===== 翻转态 =====
+  const side = ref<string>("front");
+  const flipDeg = ref<number>(0);
+  const flipDurationMs = ref<number>(0);
+  const flipping = ref<boolean>(false);
+
+  const saving = ref<boolean>(false);
+
+  // ===== 派生（一律 computed：Android 模板 fn() 绑定不收集方法体内依赖）=====
+
+  /** 导航标题：正面 我/群二维码；背面 我/群链接 */
+  const navTitle = computed<string>(() => {
+    if (side.value == "back") {
+      return t(qrType.value == "group" ? "Mobile.Qr.groupLinkTitle" : "Mobile.Qr.myLinkTitle");
+    }
+    return t(qrType.value == "group" ? "Mobile.Qr.titleGroup" : "Mobile.Qr.titleUser");
+  });
+
+  /** 卡片翻转内联样式：基态显式 rotateY(0deg)（iOS 复位先例），时长内联驱动两段动画 */
+  const flipStyleText = computed<string>(() => {
+    return `transform: rotateY(${flipDeg.value}deg); transition-duration: ${flipDurationMs.value}ms;`;
+  });
+
+  /** 副题：账号：xxx / 群号：xxx（i18n 复用弹窗两个 label 键） */
+  const cardSubtitle = computed<string>(() => {
+    const params = new Map<string, string | number>();
+    params.set(qrType.value == "group" ? "no" : "account", cardAccount.value);
+    return translateFn(
+      qrType.value == "group" ? "Mobile.Qr.groupNoLabel" : "Mobile.Qr.accountLabel",
+      toI18nParams(params),
+      cardAccount.value,
+    );
+  });
+
+  /** 码下 tip（沿用弹窗两键） */
+  const cardTip = computed<string>(() => {
+    return t(qrType.value == "group" ? "Mobile.Qr.groupScanTip" : "Mobile.Qr.userScanTip");
+  });
+
+  /** 背面引导语：个人={name}申请添加你为联系人；群=搜索群号申请加入 */
+  const backDescText = computed<string>(() => {
+    if (qrType.value == "group") {
+      return t("Mobile.Qr.joinGroupPrompt");
+    }
+    const params = new Map<string, string | number>();
+    params.set("name", cardName.value);
+    return translateFn("Mobile.Qr.linkRequestDesc", toI18nParams(params), "");
+  });
+
+  /** 背面链接文本：个人=名片 URL；群=群号 */
+  const backLinkText = computed<string>(() => {
+    return qrType.value == "group" ? cardAccount.value : qrContent;
+  });
+
+  // ===== 工具 =====
+
+  /** 读页面参数（容错解码，im-join-group 同款） */
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  /** 展示名截断（仅展示用，超长截 64 字符） */
+  function truncateName(name: string): string {
+    return name.length > 64 ? name.substring(0, 64) : name;
+  }
+
+  // ===== 生命周期与生成（generateQr 须先于 onLoad 声明：UTS 不提升）=====
+
+  /** 生成展示用二维码（不含 logo：显示层 view 叠加；参数沿用弹窗 scale=12/border=2） */
+  function generateQr(): void {
+    if (qrContent.length == 0) {
+      state.value = "failed";
+      return;
+    }
+    state.value = "loading";
+    // 同步计算放下一帧：先渲 loading（v4~v5 毫秒级，仅为交互确定性，弹窗同款）
+    setTimeout(() => {
+      const res = encodeQr(qrContent);
+      if (res == null) {
+        state.value = "failed";
+        return;
+      }
+      qrResult = res;
+      dataUrl.value = qrPngDataUrl(res, 12, 2);
+      state.value = "done";
+    }, 0);
+  }
+
+  onLoad((options: any) => {
+    qrType.value = readOption(options, "type") == "group" ? "group" : "user";
+    cardName.value = truncateName(readOption(options, "name"));
+    cardAccount.value = readOption(options, qrType.value == "group" ? "no" : "account");
+    cardUserId.value = readOption(options, "userId");
+    cardConvId.value = readOption(options, "convId");
+    // 码内容页内重建（不透传）：与扫一扫 match 侧对称；空 host → build 返回空串 → failed 态
+    qrContent = qrType.value == "group"
+      ? buildGroupCardContent(cardAccount.value, cardConvId.value)
+      : buildUserCardUrl(cardUserId.value, cardAccount.value);
+    generateQr();
+  });
+
+  // ===== 翻转（两段式：0→90° 换面瞬移 -90° → 0°；规避 backface-visibility）=====
+
+  function toggleSide(): void {
+    if (flipping.value || state.value != "done") {
+      return;
+    }
+    flipping.value = true;
+    flipDurationMs.value = 180;
+    flipDeg.value = 90;
+    setTimeout(() => {
+      side.value = side.value == "front" ? "back" : "front";
+      flipDurationMs.value = 0;
+      flipDeg.value = -90;
+      setTimeout(() => {
+        flipDurationMs.value = 180;
+        flipDeg.value = 0;
+        setTimeout(() => {
+          flipping.value = false;
+        }, 190);
+      }, 30);
+    }, 190);
+  }
+
+  // ===== 操作 =====
+
+  /** 保存图片：惰性合成含 logo 方图（同一码只合成一次）→ 跨端落相册 */
+  async function handleSaveImage(): Promise<void> {
+    if (saving.value || state.value != "done") {
+      return;
+    }
+    const res = qrResult;
+    if (res == null) {
+      return;
+    }
+    saving.value = true;
+    // ★让一帧给渲染：合成是同步重计算会冻结 JS 线程，不让帧则「保存中...」
+    // 按钮态画不出来（真机实测像卡死）。反馈只用按钮态（文案+半透明），
+    // 不用 showLoading——遮罩的出现/消失在快操作下本身就是一次全屏闪动
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, 50);
+    });
+    try {
+      if (logoDataUrlCache.length == 0) {
+        logoDataUrlCache = qrLogoPngDataUrl(res, SAVE_SCALE, 2);
+      }
+      const dataUrlToSave = logoDataUrlCache;
+      await saveQrImageToAlbum(dataUrlToSave, qrImageFileName(cardName.value));
+    } catch (_e) {
+      // 失败提示已由保存链路分类弹出（权限引导/失败 toast），此处仅复位态
+    }
+    saving.value = false;
+  }
+
+  /** 复制：个人=名片 URL，群=群号 */
+  function handleCopyLink(): void {
+    const text = qrType.value == "group" ? cardAccount.value : qrContent;
+    writeClipboardText(
+      text,
+      () => {
+        uni.showToast({ title: t("Mobile.Scan.copied"), icon: "none" });
+      },
+      () => {
+        uni.showToast({ title: t("Mobile.Scan.copyFailed"), icon: "none" });
+      },
+    );
+  }
+
+  /** 点图全屏放大（复用 H5 遮罩 / App 官方预览的兼容层；不含 logo，与弹窗行为一致） */
+  function previewQr(): void {
+    if (state.value != "done" || dataUrl.value.length == 0) {
+      return;
+    }
+    previewImageCompat([dataUrl.value], dataUrl.value);
+  }
+</script>
+
+<style lang="scss" scoped>
+  .qs-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-color: #f6f5fb;
+  }
+
+  .qs-body {
+    flex: 1;
+    min-height: 0;
+    padding-top: 40rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  /* ===== 白色内容卡片（翻转容器；高固定取正面内容高，两面 absolute 铺满防换面跳动）===== */
+  .qs-card {
+    position: relative;
+    width: 640rpx;
+    height: 720rpx;
+    border-radius: 24rpx;
+    background-color: #ffffff;
+    box-shadow: 0 8rpx 40rpx rgba(0, 0, 0, 0.06);
+    transition-property: transform;
+    transition-timing-function: ease-in-out;
+  }
+
+  .qs-card__face {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .qs-card__face--front {
+    padding: 44rpx 40rpx;
+  }
+
+  .qs-card__name {
+    max-width: 560rpx;
+    font-size: 32rpx;
+    line-height: 45rpx;
+    font-weight: 600;
+    color: #1c1b20;
+    text-align: center;
+    /* #ifndef H5 */
+    lines: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    /* #endif */
+    /* #ifdef H5 */
+    white-space: nowrap;
+    overflow: hidden;
+    /* #endif */
+  }
+
+  .qs-card__subtitle {
+    margin-top: 8rpx;
+    max-width: 560rpx;
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #666666;
+    text-align: center;
+    word-break: break-all;
+  }
+
+  /* 二维码槽（440 方形；logo 白垫绝对定位居中，偏移写死不依赖 transform 居中） */
+  .qs-qr-slot {
+    position: relative;
+    width: 440rpx;
+    height: 440rpx;
+    margin-top: 24rpx;
+  }
+
+  /* loading / 失败占位：与二维码同尺寸，状态切换不跳（弹窗同款） */
+  .qs-qr-state {
+    width: 440rpx;
+    height: 440rpx;
+    border-radius: 16rpx;
+    background-color: #f6f5f8;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .qs-qr-state__text {
+    font-size: 26rpx;
+    line-height: 38rpx;
+    color: #9a9aa2;
+    text-align: center;
+    padding: 0 24rpx;
+  }
+
+  .qs-qr-image {
+    width: 440rpx;
+    height: 440rpx;
+    border-radius: 16rpx;
+    background-color: #ffffff;
+  }
+
+  /* 中央 logo 白垫（显示层）：尺寸对齐保存图 k 模块口径，圆角轻阴影浮于码上 */
+  .qs-qr-logo-pad {
+    position: absolute;
+    left: 164rpx;
+    top: 164rpx;
+    width: 112rpx;
+    height: 112rpx;
+    border-radius: 20rpx;
+    background-color: #ffffff;
+    box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.1);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .qs-qr-logo {
+    width: 84rpx;
+    height: 84rpx;
+  }
+
+  .qs-card__tip {
+    margin-top: 24rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #9a9aa2;
+    text-align: center;
+  }
+
+  /* 背面：名字/副题与正面同位（同 padding 同顺序），引导语+链接占原二维码槽 */
+  .qs-card__face--back {
+    padding: 44rpx 40rpx;
+  }
+
+  /* 背面内容区：与二维码槽同位（margin-top/高对齐），灰底加宽到卡片内容满宽
+     （640 - 左右 padding 40×2 = 560），文案槽内垂直居中、左右留白 32；
+     子项拉伸占满槽宽，长 URL break-all 有边界可换行（宽度覆写晚于 .qs-qr-slot 生效） */
+  .qs-back-area {
+    width: 560rpx;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    background-color: #f6f5f8;
+    border-radius: 16rpx;
+    padding: 0 32rpx;
+  }
+
+  .qs-back-desc {
+    font-size: 28rpx;
+    line-height: 44rpx;
+    color: #1c1b20;
+    text-align: center;
+    word-break: break-all;
+  }
+
+  .qs-back-link {
+    margin-top: 32rpx;
+    font-size: 28rpx;
+    line-height: 42rpx;
+    font-weight: 600;
+    color: #5147ff;
+    text-align: center;
+    word-break: break-all;
+    /* #ifndef H5 */
+    lines: 6;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    /* #endif */
+  }
+
+  /* ===== 操作按钮行（卡外；单键占满行宽，正面保存图片 / 背面复制）===== */
+  .qs-actions {
+    margin-top: 40rpx;
+    width: 640rpx;
+    display: flex;
+    flex-direction: row;
+  }
+
+  .qs-actions .qs-btn {
+    width: 640rpx;
+  }
+
+  .qs-btn {
+    height: 88rpx;
+    border-radius: 16rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .qs-btn--plain {
+    background-color: #ffffff;
+    border: 2rpx solid #e5e3ee;
+  }
+
+  /* 保存中：按钮半透明 + 文案换「保存中...」（防重复点由 saving 守卫兜底） */
+  .qs-btn--saving {
+    opacity: 0.6;
+  }
+
+  .qs-btn__text {
+    font-size: 30rpx;
+    line-height: 42rpx;
+  }
+
+  .qs-btn__text--plain {
+    color: #5a5966;
+  }
+
+  /* 导航右上角翻转按钮命中区 */
+  .qs-nav-action {
+    width: 72rpx;
+    height: 72rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    background-color: #f6f5fb;
+  }
+  uni-page-body {
+    height: 100%;
+    background-color: #f6f5fb;
+  }
+  /* #endif */
+  /* #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ || MP-LARK || MP-KUAISHOU || MP-JD */
+  page {
+    height: 100%;
+    background-color: #f6f5fb;
+  }
+  /* #endif */
+</style>

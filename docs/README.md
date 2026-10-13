@@ -31,6 +31,8 @@
 | [agent_integration_guide.md](integration/agent_integration_guide.md) | Agent 组件（文件树等）接入 |
 | [app-asr-tts.md](integration/app-asr-tts.md) | Vox ASR / TTS 对接 |
 | [app-native-pay-integration.md](integration/app-native-pay-integration.md) | App 原生支付（现行；webview 支付已废弃归档） |
+| [mobile-idp-backend-confirmation-checklist.md](integration/mobile-idp-backend-confirmation-checklist.md) | 移动联合登录后端确认清单：接口、账号规则、微信/飞书应用配置、联调条件与回复模板；当前仅文档确认 |
+| [cas-mobile-assessment-and-plan.md](integration/cas-mobile-assessment-and-plan.md) | 移动 CAS 评估方案：PC/后端接口、功能差距、H5/App 方案及历史验证；已暂停代码实施（2026-10-13） |
 | [SSE-Implementation-Guide.md](integration/SSE-Implementation-Guide.md) | SSE 流式请求实现 |
 | [Markdown-Custom-Renderer-Guide.md](integration/Markdown-Custom-Renderer-Guide.md) | Markdown 自定义渲染元素 |
 | [openui-mobile-integration.md](integration/openui-mobile-integration.md) | OpenUI 移动端接入 |

@@ -1,0 +1,154 @@
+<template>
+  <view class="identity-page">
+    <custom-nav-bar :title="t('Mobile.Auth.accountIdentity')" :showBack="true" />
+    <scroll-view class="identity-scroll" direction="vertical">
+      <view class="identity-content">
+        <text v-if="loading">{{ t('Mobile.Auth.idpLoading') }}</text>
+        <view v-else-if="error.length > 0">
+          <text class="identity-error">{{ error }}</text>
+          <button @click="load">{{ t('Mobile.Auth.idpRetry') }}</button>
+        </view>
+        <template v-else>
+          <text v-if="identities.length == 0" class="identity-note">{{ t('Mobile.Auth.noIdentity') }}</text>
+          <view v-for="item in identities" :key="item.id" class="identity-card">
+            <text class="identity-title">{{ item.providerName }}</text>
+            <text class="identity-detail">{{ item.externalUserName }}</text>
+            <text class="identity-detail">{{ item.externalIdMasked }}</text>
+            <button :disabled="busy" @click="confirmUnbind(item.id)">{{ t('Mobile.Auth.unbindIdentity') }}</button>
+          </view>
+          <view v-if="unboundProviders.length > 0" class="identity-card">
+            <text class="identity-title">{{ t('Mobile.Auth.bindIdentity') }}</text>
+            <button v-for="provider in unboundProviders" :key="provider.id" :disabled="busy" @click="bind(provider.id)">{{ provider.name }}</button>
+          </view>
+          <text v-if="!browserSupported" class="identity-note">{{ t('Mobile.Auth.identityWebHint') }}</text>
+        </template>
+      </view>
+    </scroll-view>
+  </view>
+</template>
+<script setup lang="uts">
+import { ref, onMounted, onUnmounted } from 'vue';
+import { AuthIdpProvider, AuthIdentity } from '@/types/interfaces/authIdp';
+import { apiAuthIdpList, apiAuthIdentityList, apiAuthIdentityUnbind } from '@/servers/authIdp';
+import { apiResCode, apiResData, apiResMessage } from '@/utils/apiResponse';
+import { SUCCESS_CODE } from '@/constants/codes.constants';
+import { getApiBaseUrl } from '@/constants/config';
+import { AuthLoadScope, parseAuthIdentities, parseAuthIdpList, availableAuthProviders } from '@/utils/authIdp';
+import { canUseBrowserIdp, authBrowserUserAgent, beginBrowserIdentityBind } from '@/utils/idpNavigation';
+import { useI18n, emptyI18nParams } from '@/utils/i18n';
+
+const { t: translate } = useI18n();
+const t = (key: string): string => translate(key, emptyI18nParams(), '');
+const loading = ref(true);
+const busy = ref(false);
+const error = ref('');
+const identities = ref<AuthIdentity[]>([]);
+const unboundProviders = ref<AuthIdpProvider[]>([]);
+const browserSupported = canUseBrowserIdp();
+const scope = new AuthLoadScope();
+let loadedOrigin = '';
+
+async function load(): Promise<void> {
+  if (busy.value) return;
+  const sequence = scope.begin();
+  const origin = getApiBaseUrl();
+  loading.value = true;
+  error.value = '';
+  try {
+    const identityResponse = await apiAuthIdentityList();
+    if (!scope.accepts(sequence, origin, getApiBaseUrl())) return;
+    if (apiResCode(identityResponse) != SUCCESS_CODE) {
+      const message = apiResMessage(identityResponse);
+      error.value = message.length > 0 ? message : t('Mobile.Auth.identityLoadFailed');
+      return;
+    }
+    const nextIdentities = parseAuthIdentities(apiResData<any>(identityResponse));
+    if (nextIdentities == null) { error.value = t('Mobile.Auth.identityLoadFailed'); return; }
+    let nextProviders: AuthIdpProvider[] = [];
+    if (browserSupported) {
+      const providerResponse = await apiAuthIdpList();
+      if (!scope.accepts(sequence, origin, getApiBaseUrl())) return;
+      const parsed = parseAuthIdpList(apiResData<any>(providerResponse));
+      if (apiResCode(providerResponse) != SUCCESS_CODE || !parsed.valid) {
+        error.value = t('Mobile.Auth.identityLoadFailed');
+        return;
+      }
+      nextProviders = availableAuthProviders(parsed.items, true, authBrowserUserAgent()).filter((p: AuthIdpProvider): boolean =>
+        !nextIdentities.some((item: AuthIdentity): boolean => item.idpId == p.id));
+    }
+    // 两份数据都成功才替换界面，不能把失败快照当作“未绑定”。
+    identities.value = nextIdentities;
+    unboundProviders.value = nextProviders;
+    loadedOrigin = origin;
+  } catch (_error) {
+    if (scope.accepts(sequence, origin, getApiBaseUrl())) error.value = t('Mobile.Auth.identityLoadFailed');
+  } finally {
+    if (scope.accepts(sequence, origin, getApiBaseUrl())) loading.value = false;
+  }
+}
+
+async function unbind(id: string, sequence: number, origin: string): Promise<void> {
+  if (!scope.accepts(sequence, origin, getApiBaseUrl())) { busy.value = false; return; }
+  let succeeded = false;
+  try {
+    const response = await apiAuthIdentityUnbind(id);
+    if (!scope.accepts(sequence, origin, getApiBaseUrl())) return;
+    succeeded = apiResCode(response) == SUCCESS_CODE;
+    const message = apiResMessage(response);
+    uni.showToast({ title: succeeded ? t('Mobile.Auth.identityUnbound') : (message.length > 0 ? message : t('Mobile.Common.operationFailed')), icon: 'none' });
+  } catch (_error) {
+    if (scope.accepts(sequence, origin, getApiBaseUrl())) uni.showToast({ title: t('Mobile.Common.networkRetry'), icon: 'none' });
+  } finally {
+    if (scope.accepts(sequence, origin, getApiBaseUrl())) {
+      busy.value = false;
+      if (succeeded) load();
+    }
+  }
+}
+function confirmUnbind(id: string): void {
+  if (busy.value || loading.value || loadedOrigin != getApiBaseUrl()) return;
+  if (!identities.value.some((item: AuthIdentity): boolean => item.id == id)) return;
+  busy.value = true;
+  const sequence = scope.begin();
+  const origin = loadedOrigin;
+  uni.showModal({ title: t('Mobile.Auth.unbindIdentity'), content: t('Mobile.Auth.unbindIdentityConfirm'),
+    confirmText: t('Mobile.Common.confirm'), cancelText: t('Mobile.Common.cancel'),
+    success: (result) => {
+      if (result.confirm) unbind(id, sequence, origin);
+      else busy.value = false;
+    }, fail: (_error) => { busy.value = false; } });
+}
+function bind(id: string): void {
+  if (busy.value || loadedOrigin != getApiBaseUrl()) return;
+  if (!unboundProviders.value.some((p: AuthIdpProvider): boolean => p.id == id)) return;
+  busy.value = true;
+  if (!beginBrowserIdentityBind(id)) busy.value = false;
+}
+onShow(() => { busy.value = false; load(); });
+// #ifdef H5 || WEB
+function restoreFromBrowser(event: PageTransitionEvent): void {
+  if (event.persisted == true) { busy.value = false; load(); }
+}
+// #endif
+onMounted(() => {
+  // #ifdef H5 || WEB
+  window.addEventListener('pageshow', restoreFromBrowser);
+  // #endif
+});
+onUnmounted(() => {
+  scope.invalidate();
+  // #ifdef H5 || WEB
+  window.removeEventListener('pageshow', restoreFromBrowser);
+  // #endif
+});
+</script>
+<style scoped>
+.identity-page { flex: 1; background-color: #f8f8f8; }
+.identity-scroll { flex: 1; }
+.identity-content { padding: 32rpx; }
+.identity-card { background-color: #ffffff; border-radius: 16rpx; padding: 28rpx; margin-bottom: 24rpx; }
+.identity-title { font-size: 30rpx; font-weight: 600; margin-bottom: 20rpx; }
+.identity-detail { font-size: 26rpx; color: #666666; margin-bottom: 12rpx; }
+.identity-note { color: #777777; font-size: 26rpx; margin-bottom: 24rpx; }
+.identity-error { color: #b42318; font-size: 28rpx; margin-bottom: 24rpx; }
+</style>

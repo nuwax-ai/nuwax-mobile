@@ -7303,6 +7303,19 @@
   /** 声波跳动 tick（播放中 150ms +1；模板绑定以尾参直读它——App-Android 方法调用绑定不收集方法体内依赖）。 */
   const voiceTick = ref<number>(0);
   let chatAudioCtx: InnerAudioContext | null = null;
+  // #ifdef APP-IOS
+  // iOS 语音播放走 BackgroundAudioManager：真机 A/B 实证 InnerAudioContext 全局
+  // setInnerAudioOption({obeyMuteSwitch:false})（切 .playback 类别）后播放只剩听筒级
+  // 微弱声音（录音残留 playAndRecord/听筒路由，其 configureAudioSession 里
+  // overrideOutputAudioPort 对非 playAndRecord 类别不合法，会话激活/路由不可靠）；
+  // 基线 soloAmbient 有声但锁屏/后台即停。BackgroundAudioManager 实现干净（每次 play 前
+  // .playback+setActive，无 override 破坏链），配合基座已带的 UIBackgroundModes=audio
+  // 锁屏/切后台续播。应用级单例，仅接线一次。
+  // 注意：SDK≤5.24 的离线基座未注册该 API（调用同步抛异常）→ ensureChatBgaCtx 判空回落
+  // InnerAudioContext（有声、无续播），换 ≥5.26 基座后自动启用，无需改代码。
+  let chatBgaCtx: BackgroundAudioManager | null = null;
+  let chatBgaUnavailable = false;
+  // #endif
   let voiceTickTimer = 0;
 
   /** 声波条静态高度 px（两侧低中间高）；播放态叠随机抖动模拟音量（按住说话浮层同款手法）。 */
@@ -7387,24 +7400,96 @@
     return ctx;
   }
 
+  // #ifdef APP-IOS
+  /** iOS 播放器接线（BackgroundAudioManager 单例，见 chatBgaCtx 声明处注释）。
+   * 基座未注册该 API 时返回 null，调用方回落 InnerAudioContext。 */
+  function ensureChatBgaCtx(): BackgroundAudioManager | null {
+    if (chatBgaUnavailable) {
+      return null;
+    }
+    const existed = chatBgaCtx;
+    if (existed != null) {
+      return existed;
+    }
+    let bga: BackgroundAudioManager;
+    try {
+      bga = uni.getBackgroundAudioManager();
+    } catch (e) {
+      chatBgaUnavailable = true;
+      console.warn("[ChatAudio] BackgroundAudioManager unavailable (base too old?), fallback to InnerAudioContext:", e);
+      return null;
+    }
+    bga.title = t("Mobile.Message.voiceMsgLockTitle");
+    bga.onEnded(() => {
+      playingAudioId.value = "";
+      stopVoiceTickTimer();
+    });
+    bga.onError((err) => {
+      console.error("[ChatAudio] bga play failed", err);
+      playingAudioId.value = "";
+      stopVoiceTickTimer();
+      uni.showToast({ title: t("Mobile.Message.audioPlayFailed"), icon: "none" });
+    });
+    bga.onTimeUpdate(() => {
+      if (playingAudioId.value.length == 0) {
+        return;
+      }
+      const dur = bga.duration;
+      if (dur > 0) {
+        backfillAudioDuration(dur);
+      }
+    });
+    chatBgaCtx = bga;
+    return bga;
+  }
+  // #endif
+
   /** 停止当前播放（复位到头；播放态与跳动 timer 一并收）。 */
   function stopChatAudio(): void {
+    // #ifdef APP-IOS
+    const bga = chatBgaCtx;
+    if (bga != null) {
+      bga.stop();
+    } else {
+      const ctx = chatAudioCtx;
+      if (ctx != null) {
+        ctx.stop();
+      }
+    }
+    // #endif
+    // #ifndef APP-IOS
     const ctx = chatAudioCtx;
     if (ctx != null) {
       ctx.stop();
     }
+    // #endif
     playingAudioId.value = "";
     stopVoiceTickTimer();
   }
 
-  /** 页面卸载销毁（InnerAudioContext 用完必须 destroy 释放资源）。 */
+  /** 页面卸载销毁（InnerAudioContext 用完必须 destroy 释放资源；iOS BGA 为应用级单例，仅停不销毁）。 */
   function destroyChatAudio(): void {
+    // #ifdef APP-IOS
+    const bga = chatBgaCtx;
+    if (bga != null) {
+      bga.stop();
+    } else {
+      const ctx = chatAudioCtx;
+      if (ctx != null) {
+        ctx.stop();
+        ctx.destroy();
+        chatAudioCtx = null;
+      }
+    }
+    // #endif
+    // #ifndef APP-IOS
     const ctx = chatAudioCtx;
     if (ctx != null) {
       ctx.stop();
       ctx.destroy();
       chatAudioCtx = null;
     }
+    // #endif
     playingAudioId.value = "";
     stopVoiceTickTimer();
   }
@@ -7842,8 +7927,18 @@
       stopChatAudio();
       return;
     }
+    // #ifndef APP-IOS
     const ctx = ensureChatAudioCtx();
     ctx.stop();
+    // #endif
+    // #ifdef APP-IOS
+    const bga = ensureChatBgaCtx();
+    if (bga != null) {
+      bga.stop();
+    } else {
+      ensureChatAudioCtx().stop();
+    }
+    // #endif
     playingAudioId.value = msg.msgId;
     startVoiceTickTimer();
     let src = msg.audioUrl;
@@ -7858,8 +7953,20 @@
     if (msg.msgId != playingAudioId.value || !isChatCurrent()) {
       return;
     }
+    // #ifdef APP-IOS
+    if (bga != null) {
+      bga.src = src; // 新 src 设上即自动起播
+      bga.play(); // 同 src 复播兜底（stop 已归零；已在播时 play 幂等）
+    } else {
+      const ctx = ensureChatAudioCtx();
+      ctx.src = src;
+      ctx.play();
+    }
+    // #endif
+    // #ifndef APP-IOS
     ctx.src = src;
     ctx.play();
+    // #endif
   }
 
   // ===== 合并转发聊天记录详情（点卡片进全页：载荷走 imMergeRecordSession 暂存，详情页 onLoad 取） =====

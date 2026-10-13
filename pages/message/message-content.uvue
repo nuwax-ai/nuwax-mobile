@@ -689,6 +689,7 @@
   const seenMessageOrder: string[] = [];
 
   let convRefreshRunner: (() => void) | null = null;
+  let convLoadRetryRunner: (() => void) | null = null;
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -1851,6 +1852,35 @@
     }
   }
 
+  // ===== 会话列表首拉失败有限自动重试（头像解析同款配方）：冷启动网络栈未稳 /
+  //       IM 网关瞬态 5xx 不该把用户晾在「加载失败」——列表仍空时延迟重试，连续
+  //       失败封顶后停（保留手点重试与 onShow 自愈）。有数据的静默刷新失败不
+  //       重试（列表仍在屏，onShow/WS 路径自会再刷）。=====
+  let convLoadRetryTimer = 0;
+  let convLoadRetryCount = 0;
+  const MAX_CONV_LOAD_RETRIES = 2;
+
+  function scheduleConvLoadRetry(): void {
+    if (convLoadRetryTimer != 0 || convLoadRetryCount >= MAX_CONV_LOAD_RETRIES) {
+      return;
+    }
+    if (conversations.value.length > 0) {
+      return;
+    }
+    convLoadRetryCount += 1;
+    convLoadRetryTimer = setTimeout(() => {
+      convLoadRetryTimer = 0;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) {
+        return;
+      }
+      if (conversations.value.length > 0 || convLoading.value) {
+        return;
+      }
+      const runner = convLoadRetryRunner;
+      if (runner != null) runner();
+    }, 1500);
+  }
+
   async function loadConversations(): Promise<void> {
     // 工作商业版未授权：会话列表请求不出（闸门见 workGateBlocked 声明处）
     if (workGateBlocked.value) return;
@@ -1885,14 +1915,17 @@
     convFailed.value = false;
     try {
       const res = await apiImConversations("", CONV_PAGE_SIZE);
-      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+      // 先复位 loading 再做废弃守卫：会话戳中途变化（登录/换 token）早退时，
+      // 卡死的 convLoading=true 会让后续所有刷新进 loading 守卫早退、列表永停「加载中」
       convLoading.value = false;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
       if (messagePageDisposed || messagePageSession != getImSessionStamp() || revision != convRevision) {
         scheduleConvRefresh();
         return;
       }
       if (apiResCode(res) != SUCCESS_CODE) {
         convFailed.value = true;
+        scheduleConvLoadRetry();
         return;
       }
       conversations.value = parseConvRecords(res);
@@ -1900,15 +1933,18 @@
       assignConvFallbacks(conversations.value);
       convHasMore.value = nextCursor.value.length > 0;
       convLoaded.value = true;
+      convLoadRetryCount = 0;
     } catch (_error) {
       convLoading.value = false;
       convFailed.value = true;
+      scheduleConvLoadRetry();
     } finally {
       if (convRefreshOwed) scheduleConvRefresh();
     }
   }
 
   convRefreshRunner = (): void => { loadConversations(); };
+  convLoadRetryRunner = (): void => { loadConversations(); };
 
   async function loadMoreConversations(): Promise<void> {
     if (messagePageDisposed || convLoading.value || convHasMore.value != true || convLoadingMore.value) {
@@ -1921,8 +1957,9 @@
     convLoadingMore.value = true;
     try {
       const res = await apiImConversations(nextCursor.value, CONV_PAGE_SIZE);
-      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+      // 先复位 loading 再守卫（同 loadConversations：防会话戳变化早退卡死翻页态）
       convLoadingMore.value = false;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
       if (messagePageDisposed || messagePageSession != getImSessionStamp() || revision != convRevision) {
         scheduleConvRefresh();
         return;
@@ -1967,8 +2004,9 @@
     contactFailed.value = false;
     try {
       const res = await apiImContacts();
-      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+      // 先复位 loading 再守卫（同 loadConversations：防会话戳变化早退卡死加载态）
       contactLoading.value = false;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
       if (apiResCode(res) != SUCCESS_CODE) {
         contactFailed.value = true;
         return;
@@ -2033,8 +2071,9 @@
     groupsLoading.value = true;
     try {
       const res = await apiImMyGroups("", GROUP_PAGE_SIZE);
-      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+      // 先复位 loading 再守卫（同 loadConversations：防会话戳变化早退卡死加载态）
       groupsLoading.value = false;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
       if (apiResCode(res) != SUCCESS_CODE) {
         // 失败静默：分类不展示，下次切入智联录自动重试
         return;
@@ -2065,8 +2104,9 @@
     spacesLoading.value = true;
     try {
       const res = await apiImSpaces();
-      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+      // 先复位 loading 再守卫（同 loadConversations：防会话戳变化早退卡死加载态）
       spacesLoading.value = false;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
       if (apiResCode(res) != SUCCESS_CODE) {
         return;
       }
@@ -3778,6 +3818,9 @@
     if (pageTouchResetTimer != 0) clearTimeout(pageTouchResetTimer);
     if (convRefreshTimer != 0) clearTimeout(convRefreshTimer);
     convRefreshTimer = 0;
+    if (convLoadRetryTimer != 0) clearTimeout(convLoadRetryTimer);
+    convLoadRetryTimer = 0;
+    convLoadRetryCount = 0;
     if (iconResolveRetryTimer != 0) clearTimeout(iconResolveRetryTimer);
     iconResolveRetryTimer = 0;
     iconResolveRetryCount = 0;
@@ -3870,10 +3913,11 @@
     // 网络往返才跳动位置，reorderConvRows 与网络刷新同规则），网络静默刷新随后对齐其余字段
     conversations.value = reorderConvRows(copyRows(conversations.value));
     scheduleIconTableRefresh();
-    if (convLoaded.value) {
+    // 失败态也重载：首拉失败（含自动重试耗尽）后切回页面自愈，不必等用户手点「点击重试」
+    if (convLoaded.value || convFailed.value) {
       loadConversations();
     }
-    if (contactLoaded.value) {
+    if (contactLoaded.value || contactFailed.value) {
       loadContacts();
     }
     if (groupsLoaded.value) {

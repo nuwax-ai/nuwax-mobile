@@ -424,6 +424,22 @@
                   <view class="chat-voice__bar" :style="{ height: voiceBarH(msg, 3, voiceTick) + 'px' }" />
                   <text v-if="msg.audioDuration > 0" class="chat-voice__dur">{{ audioDurationLabelOf(msg) }}</text>
                 </view>
+                <!-- 语音转文字（长按「转文字」→ /api/audio/stt 客户端即时转写；结果仅
+                     本会话内存缓存，不落库不漫游）。转写中=微信式小白块三点 loading。
+                     ★状态/文本读经 voiceAsrStateOf(msg, asrTick) 尾参 tick 建立响应依赖
+                     （App-Android 方法调用绑定不收集方法体内依赖，仅 splice 不重渲染——
+                     2026-10-13 真机实锤要再点页面才出文本，readInfoTick 先例）。 -->
+                <view
+                  v-if="msg.msgType == 'audio' && msg.audioUrl.length > 0 && (voiceAsrStateOf(msg, asrTick) == 1 || (voiceAsrStateOf(msg, asrTick) == 2 && msg.audioAsrText.length > 0))"
+                  class="chat-voice-asr"
+                >
+                  <view v-if="voiceAsrStateOf(msg, asrTick) == 1" class="chat-voice-asr-loading">
+                    <view class="chat-voice-asr-loading__dot" :class="(asrAnimTick % 3) == 0 ? 'chat-voice-asr-loading__dot--on' : ''" />
+                    <view class="chat-voice-asr-loading__dot" :class="(asrAnimTick % 3) == 1 ? 'chat-voice-asr-loading__dot--on' : ''" />
+                    <view class="chat-voice-asr-loading__dot" :class="(asrAnimTick % 3) == 2 ? 'chat-voice-asr-loading__dot--on' : ''" />
+                  </view>
+                  <text v-else class="chat-voice-asr__text">{{ voiceAsrTextOf(msg, asrTick) }}</text>
+                </view>
                 <!-- 合并转发卡片（msgType=merge_forward）：标题 + 前 2 条预览 + 「共 N 条」；
                      点卡片进聊天记录详情页看全量（openMergeDetail，载荷经 session 暂存跳转） -->
                 <view v-if="msg.msgType == 'merge_forward' && msg.mergeItems.length > 0" class="chat-merge">
@@ -1614,6 +1630,7 @@
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { IM_CHAT_INPUT_METHOD } from "@/constants/common.constants";
   import { apiUserInfo } from "@/servers/account";
+  import { AudioFile, AudioUploader } from "@/servers/audioUploader";
   import {
     apiImContacts,
     apiImConvDetail,
@@ -1908,6 +1925,10 @@
     audioUrl: string = "";
     /** 语音时长秒：body.duration 可缺省（单位防御见 readMsgRow），缺失时首播后从播放器回填。 */
     audioDuration: number = 0;
+    /** 语音转文字状态（客户端本地态，IM 消息体无字段不落库不漫游）：0=未转写 1=转写中 2=已出文本 3=失败。 */
+    audioAsrState: number = 0;
+    /** 转写结果文本（长按「转文字」→ /api/audio/stt 即时转写；行重建时从页面级 chatAsrTextCache 恢复）。 */
+    audioAsrText: string = "";
     /** 视频消息（msgType=video，PC 端发出）：body.url 原样地址（多为 /api/f/ 相对路径，空=坏行回落 digest 系统行）。 */
     videoUrl: string = "";
     /** 视频文件名（body.fileName，日志与下载命名兜底用）。 */
@@ -3686,6 +3707,14 @@
     return row.agentStatus != before;
   }
 
+  /** 已转写文本缓存（msgId → text）：行被刷新/WS 整行替换时在 readMsgRow 恢复。
+   *  ★须声明在 readMsgRow 之前（UTS 先声明后使用， Kotlin 编译报「找不到名称」）。 */
+  const chatAsrTextCache = new Map<string, string>();
+  /** 「已转写但收起」标记（msgId → true，「取消转文字」后置入）：行重建恢复时读它
+   *  决定恢复为已展示(2)还是收起(4)。与文本缓存同为会话级内存态（false=展开，不用
+   *  delete 以避开 UTS Map.delete 差异风险）。 */
+  const chatAsrHidden = new Map<string, boolean>();
+
   function readMsgRow(obj: UTSJSONObject): ImMsgRow {
     const row = new ImMsgRow();
     row.msgId = readString(obj, "msgId");
@@ -3915,6 +3944,14 @@
     // ★须在 sendTime 赋值后：HUNG 挂起投影以它作 updateTime 缺失时的时间锚
     row.agentDetail = parseAgentStatusDetail(obj["agentStatusDetail"]);
     applyAgentStatusToRow(row);
+    // 语音转文字缓存恢复（会话级内存缓存；行被刷新/WS 整行替换时补回，离开页面即失）。
+    // 收起过的行（chatAsrHidden）恢复为 4=已转写已收起，不回弹文本
+    const cachedAsr = chatAsrTextCache.get(row.msgId);
+    if (cachedAsr != null && cachedAsr.length > 0) {
+      const hiddenRaw = chatAsrHidden.get(row.msgId);
+      row.audioAsrState = hiddenRaw == true ? 4 : 2;
+      row.audioAsrText = cachedAsr;
+    }
     return row;
   }
 
@@ -7549,6 +7586,172 @@
     preloadChatVideoRow(msg.msgId, msg.videoUrl);
   }
 
+  // ===== 语音转文字（长按「转文字」：客户端闭环 /api/audio/stt，不落库不漫游） =====
+
+  /** 转写状态「版本号」：App-Android 模板绑定不收集方法体内依赖（readInfoTick 先例），
+   * 行状态 splice 后必须 bump，模板经 voiceAsrStateOf(msg, asrTick) 才会即时重渲染
+   * （2026-10-13 真机实锤：只 splice 不 bump 时，转写完成要再点一下页面才出文本）。 */
+  const asrTick = ref<number>(0);
+
+  function bumpAsrTick(): void {
+    asrTick.value = asrTick.value + 1;
+  }
+
+  /** 模板用：读行转写态（★尾参 _tick 只为建立响应依赖，见 asrTick 注释）。 */
+  function voiceAsrStateOf(msg: ImMsgRow, _tick: number): number {
+    return msg.audioAsrState;
+  }
+
+  /** 模板用：读转写文本（同上，尾参 tick 建立依赖）。 */
+  function voiceAsrTextOf(msg: ImMsgRow, _tick: number): string {
+    return msg.audioAsrText;
+  }
+
+  /** 三点 loading 动画帧 tick（350ms +1，模板直读 asrAnimTick 取 % 3 点亮对应圆点；
+   *  uvue 无 @keyframes 可用，同 voiceTick 的 timer 驱动手法）。 */
+  const asrAnimTick = ref<number>(0);
+  let asrAnimTimer = 0;
+
+  function startAsrAnimTimer(): void {
+    if (asrAnimTimer != 0) {
+      return;
+    }
+    asrAnimTimer = setInterval((): void => {
+      asrAnimTick.value = asrAnimTick.value + 1;
+    }, 350);
+  }
+
+  function stopAsrAnimTimer(): void {
+    if (asrAnimTimer != 0) {
+      clearInterval(asrAnimTimer);
+      asrAnimTimer = 0;
+    }
+  }
+
+  /** 是否还有行在转写中（状态收口后判停动画 timer；多条并行转写共用一个 timer）。 */
+  function anyRowTranscribing(): boolean {
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].audioAsrState == 1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 转写状态回写（UTS class 就地赋值不触发视图，splice 整行替换——同 backfillAudioDuration；
+   *  随后 bump asrTick 让模板立即重渲染，并按是否还有转写中的行启停三点动画 timer）。 */
+  function setRowAsrState(msgId: string, state: number, text: string): void {
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].msgId == msgId) {
+        const row = rows[i];
+        row.audioAsrState = state;
+        row.audioAsrText = text;
+        rows.splice(i, 1, row);
+        break;
+      }
+    }
+    bumpAsrTick();
+    if (state == 1) {
+      startAsrAnimTimer();
+    } else if (anyRowTranscribing() != true) {
+      stopAsrAnimTimer();
+    }
+  }
+
+  /** STT 按文件扩展名识别格式：下载临时名无扩展名时补拷一份 .wav（失败回落原路径试传）。 */
+  function ensureWavSuffixForStt(path: string, msgId: string): string {
+    // #ifdef APP
+    const lower = path.toLowerCase();
+    if (path.length == 0 || (lower.length >= 4 && lower.substring(lower.length - 4) == ".wav")) {
+      return path;
+    }
+    const target = `${uni.env.USER_DATA_PATH}/asr-${msgId}.wav`;
+    try {
+      const fsm = uni.getFileSystemManager();
+      fsm.copyFileSync(path, target);
+      return target;
+    } catch (_e) {
+      console.error("[ChatAudio] copy wav for stt failed, fallback origin path");
+      return path;
+    }
+    // #endif
+    // #ifndef APP
+    return path;
+    // #endif
+  }
+
+  /**
+   * 长按「转文字」（仅 App，动作项在 buildActionsFor 收敛）：本地占位行直传 wav /
+   * 远端行整段下载（受保护 /api/f/ 自动带鉴权头，复用视频兜底下载封装）→ 上传
+   * /api/audio/stt → 文本落在语音条下方。转写中行内小白块三点 loading（audioAsrState=1
+   * 同时抑制菜单项，防重入）；结果仅存 chatAsrTextCache，IM 消息体无文本字段不落库。
+   * 已收起（state=4）再点=直接展开缓存文本，不重新转写。
+   */
+  async function handleActionVoiceToText(msg: ImMsgRow): Promise<void> {
+    // #ifdef APP
+    const msgId = msg.msgId;
+    if (msgId.length == 0 || msg.audioUrl.length == 0 || msg.audioAsrState == 1) {
+      return;
+    }
+    // 已转写后被「取消转文字」收起（state=4）：文本缓存还在，直接展开，免重复下载/上传
+    if (msg.audioAsrState == 4) {
+      const cached = chatAsrTextCache.get(msgId);
+      if (cached != null && cached.length > 0) {
+        chatAsrHidden.set(msgId, false);
+        setRowAsrState(msgId, 2, cached);
+        return;
+      }
+    }
+    setRowAsrState(msgId, 1, "");
+    let uploadPath = "";
+    try {
+      if (localFileReadable(msg.audioUrl)) {
+        // 本地占位行（刚录的 wav 直传）或已落盘缓存：文件就在，免下载
+        uploadPath = msg.audioUrl;
+      } else {
+        // 远端地址：整段下载到临时文件（同视频整段兜底路径，含受保护鉴权头）
+        uploadPath = await fetchChatVideoProtectedUrl(msg.audioUrl, null);
+      }
+      uploadPath = ensureWavSuffixForStt(uploadPath, msgId);
+      const audio = new AudioFile(uploadPath, msg.audioDuration, 0, "wav");
+      const result = await new AudioUploader().uploadAudio(audio, null);
+      const text = result.text.trim();
+      if (result.success != true || text.length == 0) {
+        throw new Error(result.error.length > 0 ? result.error : t("Mobile.AudioUploader.noTextRecognized"));
+      }
+      chatAsrTextCache.set(msgId, text);
+      chatAsrHidden.set(msgId, false);
+      setRowAsrState(msgId, 2, text);
+    } catch (error: any) {
+      console.error("[ChatAudio] voice to text failed msgId=" + msgId, error);
+      setRowAsrState(msgId, 3, "");
+      let tip = "";
+      try {
+        const err = error as Error;
+        if (err != null && err.message != null) {
+          tip = err.message;
+        }
+      } catch (_e) {
+        // ignore
+      }
+      uni.showToast({ title: tip.length > 0 ? tip : t("Mobile.Message.voiceTranscribeFailed"), icon: "none" });
+    }
+    // #endif
+  }
+
+  /** 长按「取消转文字」：收起语音下方文案（state=4；文本与缓存保留——再点「转文字」
+   *  直接展开，无需重新转写。行重建后由 readMsgRow 按 chatAsrHidden 恢复收起态）。 */
+  function handleActionVoiceToTextHide(msg: ImMsgRow): void {
+    const msgId = msg.msgId;
+    if (msgId.length == 0 || msg.audioAsrText.length == 0) {
+      return;
+    }
+    chatAsrHidden.set(msgId, true);
+    setRowAsrState(msgId, 4, msg.audioAsrText);
+  }
+
   /** 语音气泡点按：播放/停止（微信同款——再点停止复位，换条从头播；播视频先停视频，音视频互斥）。
    *  受保护地址先解析（见 resolveChatAudioUrl）：解析期间即显播放态，期间再点同条=停止，
    *  resolve 回来发现已停/换条则丢弃，不抢播。 */
@@ -8693,6 +8896,25 @@
       acts.push(multi);
     }
     // #ifdef APP
+    // 语音专属：转文字（远端语音须整段下载再上传 /api/audio/stt，受保护地址带鉴权头，
+    // 同「下载视频」仅 App；H5/小程序解析产物是 blob/temp，上传链路未验先收敛）。
+    // 转写中不出现（行内 loading 态防重复触发）；已出文本=「取消转文字」收起文案；
+    // 未转/失败/已收起=「转文字」（收起态再点直接展开缓存，不重转）。
+    if (msg.msgType == "audio" && msg.audioUrl.length > 0 && msg.audioAsrState != 1) {
+      const asr = new MsgActionItem();
+      if (msg.audioAsrState == 2 && msg.audioAsrText.length > 0) {
+        asr.key = "voiceToTextOff";
+        asr.label = t("Mobile.Message.actionVoiceToTextOff");
+        asr.icon = "/static/images/icon-msg-voice-text-off-action.png";
+      } else {
+        asr.key = "voiceToText";
+        asr.label = t("Mobile.Message.actionVoiceToText");
+        asr.icon = "/static/images/icon-msg-voice-text-action.png";
+      }
+      acts.push(asr);
+    }
+    // #endif
+    // #ifdef APP
     // 视频专属：保存到系统相册（saveVideoToPhotosAlbum 仅 App 有意义；
     // H5 走浏览器另存、小程序保存需另行声明相册权限，均不出现该项）。
     // videoUrl 三形态统一：msgType=video / file 视频文件 / rich_text 内嵌视频附件
@@ -9140,6 +9362,10 @@
       handleActionForward(msg);
     } else if (key == "multi") {
       enterMultiSelect(msg);
+    } else if (key == "voiceToText") {
+      handleActionVoiceToText(msg);
+    } else if (key == "voiceToTextOff") {
+      handleActionVoiceToTextHide(msg);
     } else if (key == "download") {
       handleActionVideoDownload(msg);
     } else if (key.indexOf("react:") == 0) {
@@ -10976,6 +11202,7 @@
     }
     clearStopAudioOnHideTimer();
     destroyChatAudio();
+    stopAsrAnimTimer();
     eventBus.off(IM_SESSION_CLEARED, onImSessionCleared);
     pageDisposed = true;
     releaseChatImages();
@@ -11565,6 +11792,46 @@
     margin: 0 8rpx;
     font-size: 26rpx;
     line-height: 36rpx;
+    color: #22212a;
+  }
+
+  /* ===== 语音转文字（气泡内、语音条下方）：转写中=微信式小白块三点 loading（无
+     @keyframes 可用，圆点由 asrAnimTick 驱动换 class 点亮）；结果文本底色同 chat-quote ===== */
+  .chat-voice-asr {
+    align-self: stretch;
+    margin-top: 12rpx;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-voice-asr-loading {
+    align-self: flex-start;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 14rpx 20rpx;
+    background-color: #ffffff;
+    border-radius: 10rpx;
+  }
+
+  .chat-voice-asr-loading__dot {
+    width: 10rpx;
+    height: 10rpx;
+    border-radius: 5rpx;
+    background-color: #d1d0d8;
+    margin: 0 6rpx;
+  }
+
+  .chat-voice-asr-loading__dot--on {
+    background-color: #22212a;
+  }
+
+  .chat-voice-asr__text {
+    padding: 14rpx 18rpx;
+    background-color: rgba(0, 0, 0, 0.05);
+    border-radius: 10rpx;
+    font-size: 26rpx;
+    line-height: 38rpx;
     color: #22212a;
   }
 

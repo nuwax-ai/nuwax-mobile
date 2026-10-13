@@ -1635,6 +1635,7 @@
   import {
     apiImContacts,
     apiImConvDetail,
+    apiImConvEnsureSpace,
     apiImConvMembers,
     apiImConvPins,
     apiImDeleteMsg,
@@ -1715,6 +1716,9 @@
   import { imUnreadCount, refreshImUnreadBadge } from "@/utils/imUnreadBadge";
   import { isRemoteSvgUrl, resolveAppSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import { getSafeAreaBottom, handleExternalLink, isWorkCommercialRepoLinkBlocked, openNativeHomeChatLink } from "@/utils/system";
+  import { resolveWorkCommercialBlocked } from "@/utils/workCommercial";
+  // 会话资料库：空间 docs 页经站内 webview 打开（含商业版闸门与防重复导航）
+  import { openNativeRepoLibraryPage } from "@/utils/repoLibraryLink";
   import { getApiBaseUrl } from "@/constants/config";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
   import { unescapeMarkdownEscapes } from "@/utils/markdown.uts";
@@ -1855,6 +1859,8 @@
     nickName: string = "";
     avatar: string = "";
     token: string = "";
+    /** 主体类型（仅单聊=联系人来源时有值）：1=人，其余值=智能体（对齐 apiImContacts 契约）。 */
+    subjectType: number = 1;
   }
 
   /** 富文本行内段（Markdown 行内标记的组合态 + @提及高亮 + [标题](url) 链接）。 */
@@ -2022,6 +2028,11 @@
   });
   const titleName = ref<string>("");
   const peerAvatar = ref<string>("");
+  /** 单聊对端 userId（convDetail.peerUserId 回填，int64 存字符串）：识别智能体单聊用。 */
+  const peerUserIdFromDetail = ref<string>("");
+  /** 会话资料库空间 id（convDetail.spaceId 回填，int64 存字符串；空/0=还没有空间，
+   *  点开资料库时再走 ensureSpace 懒建）。 */
+  const convSpaceId = ref<string>("");
 
   // ===== 群聊发送者备注名（联系人备注覆写 senderName 快照） =====
   /** senderId → remark（只收设了备注的联系人）：群聊消息行昵称优先取它——senderName
@@ -2041,7 +2052,7 @@
     return count > 99 ? "99+" : `${count}`;
   });
 
-  // ===== 子页签行（单聊标题下方：消息/Pin/资料库/文件；群聊后续复用同组件拼装） =====
+  // ===== 子页签行（单聊标题下方：消息/Pin/资料库/文件；群聊复用同组件拼装） =====
   function makeSubpageTab(id: string, labelKey: string, icon: string): ChatSubpageTab {
     const tab = new ChatSubpageTab();
     tab.id = id;
@@ -2051,12 +2062,8 @@
   }
 
   /** 彩色实心图标（与 PC nuwax-im-web DEV-187 同形状同配色，选中态不变色）。
-      资料库页签暂隐藏（功能未上）：恢复时补回 makeSubpageTab("library", "Mobile.Message.chatTabLibrary", ...)。 */
-  const subpageTabs = ref<ChatSubpageTab[]>([
-    makeSubpageTab("messages", "Mobile.Message.chatTabMessages", "/static/images/icon-tab-messages.png"),
-    makeSubpageTab("pin", "Mobile.Message.chatTabPin", "/static/images/icon-tab-pin.png"),
-    makeSubpageTab("files", "Mobile.Message.chatTabFiles", "/static/images/icon-tab-files.png"),
-  ]);
+      资料库页签（icon-tab-library.png 已备）对齐 PC 标签顺序「消息、Pin、资料库、文件」，
+      智能体单聊隐藏（isAgentP2p，见下方 members 声明后的 computed）。 */
 
   // ===== 列表状态 =====
   const messages = ref<ImMsgRow[]>([]);
@@ -2491,6 +2498,73 @@
   // ===== @提及（提及高亮 / 发送反扫的数据源；选择交互已独立成 at-select 页）=====
   const members = ref<ImMember[]>([]);
   let membersLoaded = false;
+
+  /** 对端是否智能体（仅单聊有意义，对齐 PC DEV-311 需求⑪ hiddenInAgentP2p）：单聊且
+      对端 userId 在联系人（members 单聊来源=apiImContacts）里命中 subjectType!=1。
+      ★fail-open 宁多显不误藏——对端不在联系人（未互加/数据未就绪）时按普通单聊显示
+      页签，误藏会让真单聊丢资料库；点开由服务端 ensureSpace 权威拦截（IM_90001
+      不可重试），两层判据同源不冲突。 */
+  const isAgentP2p = computed((): boolean => {
+    if (convType.value != 1 || peerUserIdFromDetail.value.length == 0) {
+      return false;
+    }
+    const list = members.value;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].userId == peerUserIdFromDetail.value) {
+        return list[i].subjectType != 1;
+      }
+    }
+    return false;
+  });
+
+  /** 系统通知会话：后端 SYSTEM(type=3)，或单聊且对端为服务端合成主体 1999999999999
+   *  （message-content SYSTEM_NOTIFY_SUBJECT_ID 同值，DEV-197-b 实际形态）——通知会话
+   *  没有资料库（后端 ensureSpace 对系统会话/合成主体拒建，IM_90001），页签不显示。 */
+  const isSystemConvLike = computed((): boolean => {
+    if (convType.value == 3) {
+      return true;
+    }
+    return convType.value == 1 && peerUserIdFromDetail.value == "1999999999999";
+  });
+
+  /** 单聊智能体判定是否齐料（详情 peerUserId 与联系人都已回程，成败皆算）：资料库页签
+      在此之前不渲染——否则智能体单聊进页页签先按「非智能体」显示、数据到位再隐藏，
+      先显后隐闪动。群式会话无此判定，页签立即可见。 */
+  const p2pAgentCheckSettled = ref<boolean>(false);
+  let p2pAgentCheckPending = 2;
+
+  function settleP2pAgentCheck(): void {
+    p2pAgentCheckPending = p2pAgentCheckPending - 1;
+    if (p2pAgentCheckPending <= 0) {
+      p2pAgentCheckSettled.value = true;
+    }
+  }
+
+  /** 资料库页签可见性：群式=立即可见；智能体单聊/系统通知=不显示；普通单聊=等判定
+      齐料（判定依赖异步请求，期间隐藏——齐料后普通单聊出现、另两类永不出现，不闪；
+      系统判定同理：合成主体 id 要等详情回程，正好落在齐料之后）。 */
+  const showLibraryTab = computed((): boolean => {
+    if (isGroupLike.value) {
+      return true;
+    }
+    if (isAgentP2p.value || isSystemConvLike.value) {
+      return false;
+    }
+    return p2pAgentCheckSettled.value;
+  });
+
+  /** 子页签集（★放 members 之后：isAgentP2p 引用它，UTS→Kotlin 不允许前向引用）。 */
+  const subpageTabs = computed<ChatSubpageTab[]>((): ChatSubpageTab[] => {
+    const tabs: ChatSubpageTab[] = [
+      makeSubpageTab("messages", "Mobile.Message.chatTabMessages", "/static/images/icon-tab-messages.png"),
+      makeSubpageTab("pin", "Mobile.Message.chatTabPin", "/static/images/icon-tab-pin.png"),
+    ];
+    if (showLibraryTab.value) {
+      tabs.push(makeSubpageTab("library", "Mobile.Message.chatTabLibrary", "/static/images/icon-tab-library.png"));
+    }
+    tabs.push(makeSubpageTab("files", "Mobile.Message.chatTabFiles", "/static/images/icon-tab-files.png"));
+    return tabs;
+  });
 
   /** 已上报的已读水位（单调递增，避免重复上报）。 */
   let reportedReadSeq: number = 0;
@@ -3600,6 +3674,8 @@
             m.userId = readString(items[i], "userId");
             m.token = readString(items[i], "displayName");
             m.avatar = readString(items[i], "avatar");
+            // 主体类型随联系人带回（1=人，其余=智能体）：资料库页签按对端是否智能体显隐
+            m.subjectType = readNumber(items[i], "subjectType", 1);
             if (readNumber(items[i], "status", 1) == 1 && m.userId.length > 0 && m.token.length > 0) {
               out.push(m);
             }
@@ -5071,9 +5147,10 @@
 
   // ===== 会话能力加载（convDetail / pins / whoami；失败静默保留默认值） =====
 
-  /** 群会话：拉 myRole 与治理开关（allowMemberPin/readReceiptOn 键缺省/null = 不限制）。 */
+  /** 拉会话详情：群聊取 myRole 与治理开关（键缺省/null = 不限制）；单聊取对端 userId
+   *  （识别智能体单聊）——两类会话都取 spaceId（已绑资料库空间的会话点开零网络）。 */
   async function loadConvInfo(): Promise<void> {
-    if (isGroupLike.value != true || convId.value.length == 0) {
+    if (convId.value.length == 0) {
       return;
     }
     try {
@@ -5083,13 +5160,19 @@
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
         if (dataObj != null) {
-          myRole.value = readNumber(dataObj, "myRole", 1);
-          // status：1=正常 2=已解散（服务端软状态，成员查询仍返回但带 status=2）
-          convDisbanded.value = readNumber(dataObj, "status", 1) == 2;
-          const pinRaw = dataObj["allowMemberPin"];
-          allowMemberPin = pinRaw == null ? true : `${pinRaw}` == "true";
-          const receiptRaw = dataObj["readReceiptOn"];
-          readReceiptOn = receiptRaw == null ? true : `${receiptRaw}` == "true";
+          // 单聊对端/空间 id：int64 存字符串（peerUserId 供智能体判定，spaceId 供资料库直开）
+          peerUserIdFromDetail.value = readString(dataObj, "peerUserId");
+          const spaceRaw = readString(dataObj, "spaceId");
+          convSpaceId.value = spaceRaw == "0" ? "" : spaceRaw;
+          if (isGroupLike.value) {
+            myRole.value = readNumber(dataObj, "myRole", 1);
+            // status：1=正常 2=已解散（服务端软状态，成员查询仍返回但带 status=2）
+            convDisbanded.value = readNumber(dataObj, "status", 1) == 2;
+            const pinRaw = dataObj["allowMemberPin"];
+            allowMemberPin = pinRaw == null ? true : `${pinRaw}` == "true";
+            const receiptRaw = dataObj["readReceiptOn"];
+            readReceiptOn = receiptRaw == null ? true : `${receiptRaw}` == "true";
+          }
         }
       }
     } catch (_error) {
@@ -10612,10 +10695,103 @@
     });
   }
 
+  // ===== 会话资料库（子页签「资料库」：站内 webview 打开空间 docs 页，对齐 PC DEV-247 ChatDocsPanel） =====
+
+  /** spaceId 是否可拼进 URL（对齐 PC docs.ts docsSpaceId）：非空十进制串且非全 0
+   *  （后端契约 0 = 没有空间；"0" 是真值，判空写错会拼出 /space/0/docs 白屏无报错）。 */
+  function validDocsSpaceId(raw: string): boolean {
+    const v = raw.trim();
+    if (v.length == 0) {
+      return false;
+    }
+    let nonzero = false;
+    for (let i = 0; i < v.length; i++) {
+      const c = v.charAt(i);
+      if (c < "0" || c > "9") {
+        return false;
+      }
+      if (c != "0") {
+        nonzero = true;
+      }
+    }
+    return nonzero;
+  }
+
+  /** 打开失败文案按错误码说（对齐 PC docs.ts docsErrorText）：IM_90001=该会话不该有
+   *  资料库（智能体单聊/系统会话，重试一万次同答案）、IM_90002=平台忙或正在创建
+   *  （可自愈）；★不回显服务端 message——后端文案带 ★ 开发注解与雪花号。 */
+  function docsErrorText(code: string | null): string {
+    if (code == "IM_90001") {
+      return t("Mobile.Message.chatDocsNotSupported");
+    }
+    if (code == "IM_90002") {
+      return t("Mobile.Message.chatDocsBusy");
+    }
+    return t("Mobile.Message.chatDocsFailed");
+  }
+
+  /** ensureSpace 在途标志：防双击并发两次 POST（服务端虽有单飞，前端也先自守）。 */
+  let docsEnsuring = false;
+
+  /** 「资料库」页签点击：商业版闸门 → 取 spaceId（详情已带直用，否则 ensureSpace 懒建）
+   *  → 站内 webview 打开 {域名}/repo/space/{spaceId}/docs。 */
+  async function handleLibraryTap(): Promise<void> {
+    if (convId.value.length == 0 || docsEnsuring) {
+      return;
+    }
+    // 工作商业版未授权：资料库不打开（异步闸门缓存优先，未定会带登录态重拉核实；
+    // 对齐资料库卡片/链接的拦截文案与 fail-open 口径）
+    if (await resolveWorkCommercialBlocked()) {
+      uni.showToast({ title: t("Mobile.Message.workCommercialRequired"), icon: "none" });
+      return;
+    }
+    let spaceId = convSpaceId.value.trim();
+    if (!validDocsSpaceId(spaceId)) {
+      // 详情没带回空间（单聊常态：懒建）——只在用户真的点开时 POST（平台侧建空间
+      // 不可回收，勿挂进进页预取），服务端幂等：已有原样返回
+      docsEnsuring = true;
+      uni.showLoading({ title: t("Mobile.Common.loading"), mask: true });
+      try {
+        const res = await apiImConvEnsureSpace(convId.value);
+        docsEnsuring = false;
+        uni.hideLoading();
+        const code = apiResCode(res);
+        if (code != SUCCESS_CODE) {
+          uni.showToast({ title: docsErrorText(code), icon: "none" });
+          return;
+        }
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        spaceId = dataObj == null ? "" : readString(dataObj, "spaceId");
+        if (!validDocsSpaceId(spaceId)) {
+          // 契约外的空 spaceId：按打开失败处理，不拼 /space//docs 去打平台
+          uni.showToast({ title: docsErrorText(null), icon: "none" });
+          return;
+        }
+        convSpaceId.value = spaceId;
+      } catch (_e) {
+        docsEnsuring = false;
+        uni.hideLoading();
+        uni.showToast({ title: docsErrorText(null), icon: "none" });
+        return;
+      }
+    }
+    // 空间 docs 页用完整库 UI：不带 just_show_content/hide_sheet（那是单篇文档预览参数，
+    // PC iframe 同样裸拼 /repo/space/{id}/docs）；登录态由 webview 页 /repo/ 注入换票
+    const base = getApiBaseUrl();
+    if (base.length == 0) {
+      uni.showToast({ title: docsErrorText(null), icon: "none" });
+      return;
+    }
+    const target = `${base}/repo/space/${spaceId}/docs`;
+    openNativeRepoLibraryPage(target, t("Mobile.Message.chatTabLibrary"));
+  }
+
   /**
    * 子页签点击（单聊与群聊共用，接口均按 convId 过滤）：
    * - messages：恒为选中（本页就是消息页），点击无动作；
    * - pin：从右侧进「Pin 消息」独立页（列表/取消Pin/跳转定位）；
+   * - library：进会话资料库（handleLibraryTap，空间 docs 页 webview 打开）；
    * - files：复用群文件页（翻历史消息聚合附件），入参带标题「文件」。
    */
   function handleSubpageSelect(id: string): void {
@@ -10626,6 +10802,10 @@
       uni.navigateTo({
         url: `/subpackages/pages/im-chat-pins/im-chat-pins?convId=${convId.value}`,
       });
+      return;
+    }
+    if (id == "library") {
+      handleLibraryTap();
       return;
     }
     if (id == "files") {
@@ -11342,11 +11522,13 @@
     if (convId.value.length > 0) {
       myInfoPending = loadMyInfo();
       // 进页即拉 @ 数据源（群聊=群成员 / 单聊=联系人；@面板与提及高亮依据，不阻塞首屏）
-      loadMembers();
+      //（回程回调 settleP2pAgentCheck：单聊智能体判定齐料后资料库页签才定显隐，防先显后隐闪动）
+      loadMembers().then((): void => settleP2pAgentCheck());
       // 群聊发送者备注名索引（先回填模块缓存再静默刷新；单聊内部空转，不阻塞首屏）
       loadContactRemarks();
       // 长按操作的能力依据（群治理开关/我的角色、置顶集、撤回时限），不阻塞首屏
-      loadConvInfo();
+      //（同上：详情回程也计一次判定齐料——peerUserId 来自这里）
+      loadConvInfo().then((): void => settleP2pAgentCheck());
       loadPinnedIds();
       loadRevokeWindow();
       // 常用表情预热（长按面板第一行数据源；用户级资源，失败回落默认组，不阻塞首屏）

@@ -149,7 +149,8 @@
     - 双 tab：已读（x人）/ 未读（x人），名单 = GET /messages/{msgId}/readers?type=read|unread
     - 进页并行拉 read/unread 两份名单，切 tab（点击/横滑）纯本地切换不再请求；
       失败态点击按 tab 重试、触底翻页按 tab 续拉（状态/游标双 tab 独立）
-    - 展示名与群成员列表同口径：群卡片 nickName 优先（进页并行拉成员首屏建映射，见 memberCards）
+    - 展示名与群成员列表同口径：我设的备注 > 群卡片 nickName > 平台名（备注取
+      contactRemarkCache 模块缓存；卡片进页并行拉成员首屏建映射，见 memberCards）
     - 计数以响应为准校正（入参带来的只是首屏近似值）；未读数 = eligibleCount - readCount
     - >500 人群服务端报 IM_30201：只显示计数（apiImReadStatus 在大群下仍可用）
     - 降级形态是 200 + degraded 字符串原因码 / listAvailable=false：★degraded 是字符串
@@ -160,6 +161,7 @@
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { imAvatarDisplayUrl, resolveImAvatarDisplay } from "@/utils/imAvatarDisplay";
   import { apiImConvMembers, apiImMsgReaders } from "@/servers/im";
+  import { getCachedContactRemarks } from "@/utils/im/contactRemarkCache";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
 
@@ -175,26 +177,37 @@
   ];
 
   /** 名单行（ReaderDto 投影；userId int64 已按字符串存用）。name 为最终展示名
-   *  （群卡片优先口径，见 resolveDisplayName）。 */
+   *  （备注 > 群卡片优先口径，见 resolveDisplayName）；apiName 保留 readers 接口名，
+   *  供卡片映射晚到时重算展示名（见 applyMemberCardsToList）。 */
   class RsReader {
     userId: string = "";
     name: string = "";
+    apiName: string = "";
     avatarRaw: string = "";
     avatar: string = "";
     avatarFailed: boolean = false;
   }
 
-  // ===== 群卡片名映射：与群成员列表展示名保持一致 =====
-  // readers 接口的 name 是平台账号名（后端 ReaderItem 不带群卡片 nickName），设过
-  // 群卡片的人在群成员列表显示卡片名、在这里却显示账号名。进页并行拉一次成员首屏
-  // （apiImConvMembers，与群成员页同款单页 limit=100）建 userId → 展示名映射，
-  // 名单行按同口径取名；>100 人群超出部分查不到卡片，回落 readers 接口名。
-  /** userId → 群成员展示名（群卡片 nickName > 平台名 name > 用户+id，token 同款）。 */
+  // ===== 展示名映射：与群成员列表口径保持一致（备注 > 群卡片 > 平台名） =====
+  // readers 接口的 name 是平台账号名（后端 ReaderItem 既不带群卡片 nickName，也不含
+  // 我设的联系人备注），群成员列表显示「备注 > 群卡片」、这里此前却只显示账号名/卡片
+  // ——改完备注本页不同步的根因。① 备注取模块缓存 contactRemarkCache（消息页/资料页
+  // 刷新联系人时会写，进页读到即最新，改完备注再进来立即生效）；② 群卡片进页并行拉
+  // 一次成员首屏（apiImConvMembers，与群成员页同款单页 limit=100）建 userId → 卡片名
+  // 映射；>100 人群超出部分查不到卡片，回落 readers 接口名。
+  /** userId → 群成员卡片名（群卡片 nickName > 平台名 name > 用户+id，token 同款）。 */
   const memberCards = new Map<string, string>();
   let memberCardsLoaded = false;
 
-  /** 行展示名解析：群卡片优先（与群成员列表一致），readers 接口名兜底。 */
+  /** 行展示名解析：我设的备注 > 群卡片 > readers 接口名（群成员列表同口径，微信语义）。 */
   function resolveDisplayName(userId: string, apiName: string): string {
+    const cachedRemarks = getCachedContactRemarks();
+    if (cachedRemarks != null) {
+      const remark = cachedRemarks.get(userId);
+      if (remark != null && remark.length > 0) {
+        return remark;
+      }
+    }
     const card = memberCards.get(userId);
     if (card != null && card.length > 0) {
       return card;
@@ -344,14 +357,15 @@
     }
   }
 
-  /** 单个 tab 名单重套卡片名（行取自 ref 数组=响应式代理实例，写回可触发刷新）。 */
+  /** 单个 tab 名单重套展示名（卡片映射晚到按「备注 > 群卡片」重算；行取自 ref 数组
+   *  =响应式代理实例，写回可触发刷新）。 */
   function applyMemberCardsToList(live: RsReader[]): boolean {
     let changed = false;
     for (let i = 0; i < live.length; i++) {
       const row = live[i];
-      const card = memberCards.get(row.userId);
-      if (card != null && card.length > 0 && card != row.name) {
-        row.name = card;
+      const resolved = resolveDisplayName(row.userId, row.apiName);
+      if (resolved.length > 0 && resolved != row.name) {
+        row.name = resolved;
         changed = true;
       }
     }
@@ -471,10 +485,11 @@
         for (let i = 0; i < arr.length; i++) {
           const r = new RsReader();
           r.userId = readString(arr[i], "userId");
+          r.apiName = readString(arr[i], "name");
           r.avatarRaw = readString(arr[i], "avatar");
           r.avatar = imAvatarDisplayUrl(r.avatarRaw, 72);
           if (r.userId.length > 0) {
-            r.name = resolveDisplayName(r.userId, readString(arr[i], "name"));
+            r.name = resolveDisplayName(r.userId, r.apiName);
             out.push(r);
           }
         }

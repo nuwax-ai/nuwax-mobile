@@ -5,10 +5,15 @@ import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
 import { orEmpty, orNumber, orString } from "@/utils/utsCoalesce.uts";
 
 // #ifdef APP-ANDROID
+import Intent from 'android.content.Intent';
+import ContentValues from 'android.content.ContentValues';
 import Environment from 'android.os.Environment';
+import Build from 'android.os.Build';
+import MediaStore from 'android.provider.MediaStore';
 import File from 'java.io.File';
 import FileInputStream from 'java.io.FileInputStream';
 import FileOutputStream from 'java.io.FileOutputStream';
+import FileProvider from 'androidx.core.content.FileProvider';
 // #endif
 
 /**
@@ -714,41 +719,125 @@ export function mergeDirectoryLevelFiles(
   // #endif
 
   // #ifdef APP-ANDROID
+  /**
+   * 把下载临时文件落到系统公共 Download 目录，返回对外展示/打开用的路径。
+   * Android 10+ 分区存储：targetSdk>=29 时 legacy 标志在 Android 11+ 已被系统忽略、
+   * WRITE_EXTERNAL_STORAGE 不再授予公共目录写权，File API 直写公共 Download 会被
+   * **静默拒绝**（文件实际留在私有 cache，文件管理不可见）——API 29+ 改走
+   * MediaStore.Downloads 插入（自有文件免存储运行时权限；重名由系统自动加 (n)）；
+   * API 29 以下维持旧 File 直写。任一步失败回落临时路径。
+   */
   function copyToPublicDownload(tempFilePath: string, filename: string): string {
     try {
-      const downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-      if (downloadDir != null) {
-        if (!downloadDir.exists()) {
-          downloadDir.mkdirs();
-        }
-        let targetFile = new File(downloadDir, filename);
-        if (targetFile.exists()) {
-          const dotIdx = filename.lastIndexOf('.');
-          const nameWithoutExt = dotIdx > 0 ? filename.substring(0, dotIdx) : filename;
-          const ext = dotIdx > 0 ? filename.substring(dotIdx) : '';
-          let counter = 1;
-          while (targetFile.exists() && counter < 100) {
-            targetFile = new File(downloadDir, `${nameWithoutExt}(${counter})${ext}`);
-            counter++;
+      const context = UTSAndroid.getAppContext();
+      if (context == null) return tempFilePath;
+      if (Build.VERSION.SDK_INT >= 29) {
+        const resolver = context.getContentResolver();
+        const values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+        const uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (uri != null) {
+          const inStream = new FileInputStream(new File(tempFilePath));
+          const outStream = resolver.openOutputStream(uri);
+          if (outStream != null) {
+            const buffer = new ByteArray(1024 * 8);
+            let bytesRead = inStream.read(buffer);
+            while (bytesRead != -1) {
+              outStream.write(buffer, 0, bytesRead);
+              bytesRead = inStream.read(buffer);
+            }
+            outStream.close();
           }
+          inStream.close();
+          // 展示路径：DATA 列多数 ROM 仍回填物理路径（含系统重名加缀后的真名），取不到按标准位置拼
+          let displayPath = `${Environment.getExternalStorageDirectory()}/${Environment.DIRECTORY_DOWNLOADS}/${filename}`;
+          const cursor = resolver.query(uri, null, null, null, null);
+          if (cursor != null) {
+            if (cursor.moveToFirst()) {
+              const idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA);
+              if (idx >= 0) {
+                const p = cursor.getString(idx);
+                if (p != null && p.length > 0) {
+                  displayPath = p;
+                }
+              }
+            }
+            cursor.close();
+          }
+          console.log('已存入公共 Download(MediaStore):', displayPath);
+          return displayPath;
         }
-        const srcFile = new File(tempFilePath);
-        const inStream = new FileInputStream(srcFile);
-        const outStream = new FileOutputStream(targetFile);
-        const buffer = new ByteArray(1024 * 8);
-        let bytesRead = inStream.read(buffer);
-        while (bytesRead != -1) {
-          outStream.write(buffer, 0, bytesRead);
-          bytesRead = inStream.read(buffer);
+      } else {
+        const downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        if (downloadDir != null) {
+          if (!downloadDir.exists()) {
+            downloadDir.mkdirs();
+          }
+          let targetFile = new File(downloadDir, filename);
+          if (targetFile.exists()) {
+            const dotIdx = filename.lastIndexOf('.');
+            const nameWithoutExt = dotIdx > 0 ? filename.substring(0, dotIdx) : filename;
+            const ext = dotIdx > 0 ? filename.substring(dotIdx) : '';
+            let counter = 1;
+            while (targetFile.exists() && counter < 100) {
+              targetFile = new File(downloadDir, `${nameWithoutExt}(${counter})${ext}`);
+              counter++;
+            }
+          }
+          const srcFile = new File(tempFilePath);
+          const inStream = new FileInputStream(srcFile);
+          const outStream = new FileOutputStream(targetFile);
+          const buffer = new ByteArray(1024 * 8);
+          let bytesRead = inStream.read(buffer);
+          while (bytesRead != -1) {
+            outStream.write(buffer, 0, bytesRead);
+            bytesRead = inStream.read(buffer);
+          }
+          inStream.close();
+          outStream.close();
+          return targetFile.getAbsolutePath();
         }
-        inStream.close();
-        outStream.close();
-        return targetFile.getAbsolutePath();
       }
     } catch (e) {
       console.error('拷贝文件至 Download 目录失败:', e);
     }
     return tempFilePath;
+  }
+
+  /**
+   * 拉起系统 APK 安装（下载附件为 .apk 时「打开」即装）。
+   * uni.openDocument 对 apk 找不到可打开的 Activity，静默无反应，须显式发安装 Intent：
+   * 基座内置 DCFileProvider（root-path 全盘映射）负责把公共 Download 路径转 content://。
+   * Android 8+ 需声明 REQUEST_INSTALL_PACKAGES，否则系统直接拦——注意权限写项目根目录
+   * AndroidManifest.xml（uni-app x 云打包不读 manifest.json 的 permissions 数组）。
+   */
+  function tryInstallApk(filePath: string): boolean {
+    try {
+      const context = UTSAndroid.getAppContext();
+      if (context == null) return false;
+      const file = new File(filePath);
+      if (!file.exists()) return false;
+      // authority 随包名（标准基座 io.dcloud.uniappx.dc.fileprovider 同源），勿写死
+      const authority = `${context!!.getPackageName()}.dc.fileprovider`;
+      const uri = FileProvider.getUriForFile(context!!, authority, file);
+      const intent = new Intent(Intent.ACTION_VIEW);
+      intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+      intent.setDataAndType(uri, 'application/vnd.android.package-archive');
+      console.log('拉起 APK 安装:', filePath, 'uri:', `${uri}`);
+      // 优先前台 Activity 拉起（HarmonyOS 上 application context 拉安装器偶发无反馈）
+      const activity = UTSAndroid.getUniActivity();
+      if (activity != null) {
+        activity.startActivity(intent);
+      } else {
+        context!!.startActivity(intent);
+      }
+      return true;
+    } catch (e) {
+      console.error('拉起 APK 安装失败:', e);
+      return false;
+    }
   }
   // #endif
 
@@ -794,6 +883,13 @@ export function mergeDirectoryLevelFiles(
               cancelText: t("Mobile.Common.cancel"),
               success: (modalRes) => {
                 if (modalRes.confirm) {
+                  // #ifdef APP-ANDROID
+                  // apk：openDocument 无接收方会静默无反应，改发系统安装 Intent；
+                  // 拉起失败再回落 openDocument（由其 toast 打开失败兜底）
+                  if (finalFilePath.toLowerCase().endsWith('.apk') && tryInstallApk(finalFilePath)) {
+                    return;
+                  }
+                  // #endif
                   uni.openDocument({
                     filePath: finalFilePath,
                     success: () => {

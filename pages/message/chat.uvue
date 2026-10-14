@@ -1666,6 +1666,7 @@
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import eventBus from "@/utils/eventBus";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
+  import { IM_WS_DEBUG } from "@/utils/im/imWsClient";
   // 会话草稿（微信式）：未发文案本地按 convId 记忆，列表「[草稿]xxx」+ 进页回显
   import { getChatDraft, setChatDraft } from "@/utils/im/chatDrafts";
   // 失败行发件箱（微信式）：发送失败的乐观行跨重启本地保留，重进会话回显末尾可重发
@@ -2671,6 +2672,7 @@
   /** readInfos 变更统一收口：bump 版本号（见 readInfoTick 注释）。 */
   function bumpReadInfoTick(): void {
     readInfoTick.value = readInfoTick.value + 1;
+    if (IM_WS_DEBUG) console.log(`[ImWsRead] tick -> ${readInfoTick.value}`);
   }
   /** 已读计数请求序号（旧响应晚归丢弃，防竞态覆盖新数据）。 */
   let readStatusSeq = 0;
@@ -5258,6 +5260,10 @@
     const readCount = readNumber(obj, "readCount", 0);
     const eligibleCount = readNumber(obj, "eligibleCount", 0);
     const readAll = readBool(obj, "readAll");
+    if (IM_WS_DEBUG) {
+      const tail = msgId.length > 6 ? msgId.substring(msgId.length - 6) : msgId;
+      console.log(`[ImWsRead] merge #${tail} read=${readCount}/${eligibleCount} all=${readAll}`);
+    }
     const infos = readInfos.value;
     for (let i = 0; i < infos.length; i++) {
       if (infos[i].msgId == msgId) {
@@ -5325,6 +5331,10 @@
   /** 仅模板用：右半扇形旋转角（0~180° 顺时针，>180 固定满半）；渲染由 v-if 门控。 */
   function pieRightStyleOf(msg: ImMsgRow, _tick: number): string {
     const deg = readPieDegOf(msg, 0);
+    if (IM_WS_DEBUG) {
+      const tail = msg.msgId.length > 6 ? msg.msgId.substring(msg.msgId.length - 6) : msg.msgId;
+      console.log(`[ImWsRead] pie-render #${tail} deg=${deg} tick=${_tick}`);
+    }
     const rot = deg > 180 ? 180 : deg;
     return `transform: rotate(${rot}deg);`;
   }
@@ -5403,6 +5413,7 @@
       candidates.push(row);
     }
     if (candidates.length == 0) {
+      if (IM_WS_DEBUG) console.log("[ImWsRead] refresh: no candidates (all cached readAll / receiptOff)");
       return;
     }
     // rows 本身按时间升序：从尾部往前取即 seq 降序的最新 200 条
@@ -5415,6 +5426,7 @@
       const res = await apiImReadStatus(convId.value, picked);
       if (!isChatCurrent()) return;
       if (!isChatCurrent() || seq != readStatusSeq) {
+        if (IM_WS_DEBUG) console.log(`[ImWsRead] refresh: stale response dropped seq=${seq}`);
         return;
       }
       if (apiResCode(res) == SUCCESS_CODE) {
@@ -5424,10 +5436,18 @@
           for (let i = 0; i < arr.length; i++) {
             mergeReadInfo(arr[i]);
           }
+          // ★App-Android 已读 icon/扇形对 readInfoTick 的 bump 不重渲（2026-10-14
+          // 真机日志实锤：merge 值 0→2→4→5 在变、UI 冻结），splice+bump 链对已读列
+          // 无效——去抖整表重建强制重渲（表情回复/媒体回填同款，key 稳定不跳滚动）。
+          scheduleChatMediaRefresh();
+          if (IM_WS_DEBUG) console.log(`[ImWsRead] read-status api ok: picked=${picked.length} merged=${arr.length}`);
         }
+      } else {
+        if (IM_WS_DEBUG) console.log(`[ImWsRead] read-status api fail: code=${apiResCode(res)}`);
       }
     } catch (_error) {
       // 静默：onShow/下次发送确认会再试
+      if (IM_WS_DEBUG) console.log("[ImWsRead] read-status api threw");
     }
   }
 
@@ -5442,11 +5462,17 @@
    * 只留一次，窗口期来过新帧则到点后补一轮（保证最后一帧之后必有一次为它发起的查询）。
    */
   function scheduleReadRefresh(): void {
-    if (!isChatActive()) return;
+    if (!isChatActive()) {
+      if (IM_WS_DEBUG) {
+        console.log(`[ImWsRead] refresh skipped: chat inactive visible=${pageVisible} bg=${isAppInBackground()}`);
+      }
+      return;
+    }
     if (readRefreshTimer != 0) {
       readRefreshOwed = true;
       return;
     }
+    if (IM_WS_DEBUG) console.log("[ImWsRead] refresh armed (300ms)");
     readRefreshTimer = setTimeout(() => {
       readRefreshTimer = 0;
       const owed = readRefreshOwed;
@@ -11145,12 +11171,17 @@
    */
   function handleImReadNotified(payload: any): void {
     if (!isChatCurrent() || payload == null) {
+      if (IM_WS_DEBUG) console.log("[ImWsRead] 4001 dropped: chat not current / null payload");
       return;
     }
     const obj = payload as UTSJSONObject;
     const frameConvId = readString(obj, "convId");
     if (frameConvId.length == 0 || frameConvId != convId.value) {
+      if (IM_WS_DEBUG) console.log(`[ImWsRead] 4001 dropped: convId mismatch frame=${frameConvId} cur=${convId.value}`);
       return;
+    }
+    if (IM_WS_DEBUG) {
+      console.log(`[ImWsRead] 4001 accepted: agg=${readBool(obj, "aggregated")} group=${isGroupLike.value}`);
     }
     if (readBool(obj, "aggregated")) {
       const countsRaw = obj["counts"];
@@ -11188,6 +11219,8 @@
         infos.splice(foundIdx, 1, updated);
         bumpReadInfoTick();
       }
+      // ★同 refreshReadStatus：已读数据变更后整表去抖重建强制重渲（Android tick 链无效）
+      scheduleChatMediaRefresh();
       if (miss) {
         scheduleReadRefresh();
         scheduleReadSettle();
@@ -11195,6 +11228,7 @@
       return;
     }
     if (isGroupLike.value) {
+      if (IM_WS_DEBUG) console.log("[ImWsRead] group path: scheduleReadRefresh(300ms) + settle(1.5s)");
       scheduleReadRefresh();
       scheduleReadSettle();
       return;
@@ -11241,6 +11275,8 @@
         bumpReadInfoTick();
       }
     }
+    // ★同 refreshReadStatus：已读数据变更后整表去抖重建强制重渲（Android tick 链无效）
+    scheduleChatMediaRefresh();
   }
 
   /**

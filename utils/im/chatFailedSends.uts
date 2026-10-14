@@ -1,0 +1,255 @@
+import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN } from "@/constants/home.constants";
+/**
+ * 发送失败行发件箱（微信式）：发送失败的乐观行按 convId 本地持久化——
+ * 杀 App / 退出会话后重进，失败行仍回显在消息列表末尾，点击可重发
+ * （clientMsgId 不变，服务端幂等保证不重）。重发成功（确认行替换）或行被
+ * 移除（禁言拒发）即出箱。
+ *
+ * 存储：单 storage 键存全部会话失败行（items 数组：会话 id + {cid, p} 列表，
+ * p 为聊天页序列化的字段包），跨进程重启保留；账号 tag（token|origin，
+ * chatDrafts 同源字段）不匹配整包丢弃，防换账号串号。上限：每会话 20 条、
+ * 全局 50 会话，超量按更新序淘汰最旧（失败行是补救数据，不值得无限累积）。
+ * 模块不感知页面行结构：字段包由聊天页序列化/反序列化，此处只存取。
+ */
+
+const FAILED_SENDS_STORAGE_KEY = "IM_CHAT_FAILED_SENDS";
+/** 最多记忆的会话数（超出淘汰最久未更新的整箱）。 */
+const FAILED_SENDS_MAX_CONVS = 50;
+/** 单会话最多保留的失败行数（超出淘汰最久未更新的）。 */
+const FAILED_SENDS_MAX_PER_CONV = 20;
+
+class FailedSendEntry {
+  clientMsgId: string = "";
+  payload: UTSJSONObject;
+  constructor(clientMsgId: string, payload: UTSJSONObject) {
+    this.clientMsgId = clientMsgId;
+    this.payload = payload;
+  }
+}
+
+class FailedConvEntry {
+  convId: string = "";
+  /** 更新序（队尾最新；淘汰从队头摘）。 */
+  items: FailedSendEntry[] = [];
+  constructor(convId: string) {
+    this.convId = convId;
+  }
+}
+
+/** 账号 tag（重启稳定；token 轮换会失配丢失败行，可接受的边界，chatDrafts 同款）。 */
+function accountTag(): string {
+  const token = uni.getStorageSync(ACCESS_TOKEN);
+  const origin = uni.getStorageSync(ACCESS_TOKEN_ORIGIN);
+  return `${token ?? ""}|${origin ?? ""}`;
+}
+
+function readString(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  return raw != null ? `${raw}` : "";
+}
+
+// ===== 模块级缓存（convId → 失败行箱；convOrder 为会话更新序，队尾最新）=====
+const failedByConv = new Map<string, FailedConvEntry>();
+const convOrder: string[] = [];
+let cacheTag = "__failed_sends_unset__";
+
+/** 读缓存（账号 tag 变化即整包重载：换账号不串号）。 */
+function ensureCache(): void {
+  const tag = accountTag();
+  if (tag == cacheTag) {
+    return;
+  }
+  cacheTag = tag;
+  failedByConv.clear();
+  convOrder.splice(0, convOrder.length);
+  try {
+    const raw = uni.getStorageSync(FAILED_SENDS_STORAGE_KEY);
+    if (raw == null) {
+      return;
+    }
+    const text = `${raw}`.trim();
+    if (text.length == 0) {
+      return;
+    }
+    const root = JSON.parse<UTSJSONObject>(text);
+    if (root == null) {
+      return;
+    }
+    if (readString(root, "s") != tag) {
+      return;
+    }
+    const itemsRaw = root["items"];
+    if (itemsRaw == null) {
+      return;
+    }
+    const items = itemsRaw as UTSJSONObject[];
+    for (let i = 0; i < items.length; i++) {
+      const convId = readString(items[i], "id");
+      if (convId.length == 0 || failedByConv.has(convId)) {
+        continue;
+      }
+      const entry = new FailedConvEntry(convId);
+      const listRaw = items[i]["list"];
+      if (listRaw != null && Array.isArray(listRaw)) {
+        const list = listRaw as any[];
+        for (let j = 0; j < list.length; j++) {
+          const item = list[j] as UTSJSONObject;
+          const cid = readString(item, "cid");
+          const payloadRaw = item["p"];
+          if (cid.length == 0 || payloadRaw == null) {
+            continue;
+          }
+          const payload = payloadRaw as UTSJSONObject;
+          // 同 cid 去重（存储里理论上不会重，防御性跳过）
+          let dup = false;
+          for (let k = 0; k < entry.items.length; k++) {
+            if (entry.items[k].clientMsgId == cid) {
+              dup = true;
+              break;
+            }
+          }
+          if (dup != true) {
+            entry.items.push(new FailedSendEntry(cid, payload));
+          }
+        }
+      }
+      if (entry.items.length > 0) {
+        failedByConv.set(convId, entry);
+        convOrder.push(convId);
+      }
+    }
+  } catch (_e) {
+    // 存储损坏按无失败行处理（下次写入整包重写自愈）
+  }
+}
+
+/** 会话箱触底（更新序刷新 + 淘汰），返回箱内列表。 */
+function touchConvEntry(convId: string): FailedConvEntry {
+  const idx = convOrder.indexOf(convId);
+  if (idx >= 0) {
+    convOrder.splice(idx, 1);
+  }
+  convOrder.push(convId);
+  while (convOrder.length > FAILED_SENDS_MAX_CONVS) {
+    const oldest = convOrder[0];
+    convOrder.splice(0, 1);
+    failedByConv.delete(oldest);
+  }
+  let entry = failedByConv.get(convId);
+  if (entry == null) {
+    entry = new FailedConvEntry(convId);
+    failedByConv.set(convId, entry);
+  }
+  return entry;
+}
+
+/** 整包落盘（会话顺序 + 箱内条目顺序均为更新序，淘汰按队头）。 */
+function persist(): void {
+  const items: UTSJSONObject[] = [];
+  for (let i = 0; i < convOrder.length; i++) {
+    const entry = failedByConv.get(convOrder[i]);
+    if (entry == null || entry.items.length == 0) {
+      continue;
+    }
+    const list: UTSJSONObject[] = [];
+    for (let j = 0; j < entry.items.length; j++) {
+      const obj = new UTSJSONObject();
+      obj["cid"] = entry.items[j].clientMsgId;
+      obj["p"] = entry.items[j].payload;
+      list.push(obj);
+    }
+    const convObj = new UTSJSONObject();
+    convObj["id"] = entry.convId;
+    convObj["list"] = list;
+    items.push(convObj);
+  }
+  const root = new UTSJSONObject();
+  root["s"] = cacheTag;
+  root["items"] = items;
+  const json = JSON.stringify(root);
+  if (json == null) {
+    return;
+  }
+  try {
+    uni.setStorageSync(FAILED_SENDS_STORAGE_KEY, json);
+  } catch (_e) {
+    // 写失败静默：失败行持久化尽力而为
+  }
+}
+
+/** 箱已空则连同会话序一起摘掉（不留空箱）。 */
+function dropConvIfEmpty(convId: string): void {
+  const entry = failedByConv.get(convId);
+  if (entry != null && entry.items.length == 0) {
+    failedByConv.delete(convId);
+    const idx = convOrder.indexOf(convId);
+    if (idx >= 0) {
+      convOrder.splice(idx, 1);
+    }
+  }
+}
+
+/** 取会话的失败行字段包列表（读序即更新序，旧的在前）；未记忆返回空数组。 */
+export function getFailedSends(convId: string): UTSJSONObject[] {
+  ensureCache();
+  const out: UTSJSONObject[] = [];
+  if (convId.length == 0) {
+    return out;
+  }
+  const entry = failedByConv.get(convId);
+  if (entry == null) {
+    return out;
+  }
+  for (let i = 0; i < entry.items.length; i++) {
+    out.push(entry.items[i].payload);
+  }
+  return out;
+}
+
+/**
+ * 写/覆盖一条失败行：同 clientMsgId 覆盖旧字段包并刷更新序（重试再失败
+ * 场景）；写满按会话内更新序淘汰最旧。空 convId / clientMsgId 不落。
+ */
+export function upsertFailedSend(convId: string, clientMsgId: string, payload: UTSJSONObject): void {
+  ensureCache();
+  if (convId.length == 0 || clientMsgId.length == 0) {
+    return;
+  }
+  const entry = touchConvEntry(convId);
+  for (let i = 0; i < entry.items.length; i++) {
+    if (entry.items[i].clientMsgId == clientMsgId) {
+      entry.items.splice(i, 1);
+      break;
+    }
+  }
+  entry.items.push(new FailedSendEntry(clientMsgId, payload));
+  while (entry.items.length > FAILED_SENDS_MAX_PER_CONV) {
+    entry.items.splice(0, 1);
+  }
+  persist();
+}
+
+/** 清一条失败行（重发成功 / 行被移除）；清不存在的条目不触发落盘。 */
+export function removeFailedSend(convId: string, clientMsgId: string): void {
+  ensureCache();
+  if (convId.length == 0 || clientMsgId.length == 0) {
+    return;
+  }
+  const entry = failedByConv.get(convId);
+  if (entry == null) {
+    return;
+  }
+  let removed = false;
+  for (let i = 0; i < entry.items.length; i++) {
+    if (entry.items[i].clientMsgId == clientMsgId) {
+      entry.items.splice(i, 1);
+      removed = true;
+      break;
+    }
+  }
+  if (removed != true) {
+    return;
+  }
+  dropConvIfEmpty(convId);
+  persist();
+}

@@ -26,6 +26,8 @@
  */
 
 import { audio } from '@kit.AudioKit'
+import { common } from '@kit.AbilityKit'
+import { TtsBackgroundKeepAlive } from './TtsBackgroundKeepAlive.ets'
 
 /** 开始播放前的最小缓冲（音频 ms）：略攒一点再播，减少开局 underrun（对齐 Android START_PLAY_MS）。
  *  鸿蒙模拟器音频 HAL 启动慢，150ms 一次写满后常在下批 write 前耗尽造成开局欠载
@@ -85,6 +87,14 @@ export class StreamPcmPlayerBridge {
   private recoverCount: number = 0
   /** 待写队列（ArrayBuffer，紧凑表示；push 追加、写循环顺序消费） */
   private queue: Array<ArrayBuffer> = []
+
+  /** 退后台续播用的 Ability 上下文；release 不清，下一轮播报复用 */
+  setAbilityContext(context: common.UIAbilityContext): void {
+    TtsBackgroundKeepAlive.bind(context)
+    if (this.started) {
+      TtsBackgroundKeepAlive.begin()
+    }
+  }
 
   initPlayer(sampleRate: number): void {
     // 重置旧状态（含异步创建中/写循环中的旧实例，gen 令牌隔离）
@@ -283,6 +293,8 @@ export class StreamPcmPlayerBridge {
         console.warn('[StreamPcmPlayerBridge] release failed', e)
       })
     }
+    // 播完 / 手动停止都走这里：停掉长时任务和 AVSession，通知随任务结束消失
+    TtsBackgroundKeepAlive.end()
   }
 
   /** 幂等拉起写循环（单异步任务；循环结束后 draining 复位） */
@@ -500,6 +512,7 @@ export class StreamPcmPlayerBridge {
       }
       this.started = true
       console.log('[StreamPcmPlayerBridge] renderer started')
+      TtsBackgroundKeepAlive.begin()
     } catch (eStart) {
       console.error('[StreamPcmPlayerBridge] start failed', eStart)
       this.started = false

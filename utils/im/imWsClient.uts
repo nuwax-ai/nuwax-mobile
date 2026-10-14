@@ -21,6 +21,7 @@ import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { getApiBaseUrl } from "@/constants/config";
 import { applyBearerAuthorization } from "@/utils/authSession";
 import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
+import { readCookie } from "@/utils/webCookie";
 import { getImDeviceId, apiImSync } from "@/servers/im";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 import eventBus from "@/utils/eventBus";
@@ -39,6 +40,7 @@ import {
   isRetryableRejectCode,
 } from "./imProtocol";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { isWorkCommercialBlockedSync } from "@/utils/workCommercial";
 import { ApiImSyncCursor, ApiImSyncParams } from "@/servers/im";
 import {
   createImWsSocketAdapter,
@@ -46,7 +48,7 @@ import {
 } from "./imWsSocketAdapter";
 import { dispatchImEnvelope, IM_EVENT } from "./imWsEventBridge";
 
-/** 调试日志开关（IM 实时链路已验证通过，2026-09-26 置 false 降噪；排查时改回 true。imWarn/imParseEnvelope 告警不受此开关影响）。 */
+/** 调试日志开关；业务告警（imWarn/imParseEnvelope）不受此开关影响。 */
 export const IM_WS_DEBUG = false;
 
 /** 重连退避曲线（毫秒）。连上后从 0 开始累计。 */
@@ -89,13 +91,38 @@ function readAccessToken(): string {
     }
     return s;
   } catch (_e) {
-    return "";
+    // iOS getStorageSync key 不存在时可能抛异常，继续尝试 H5 Cookie。
   }
+  // 浏览器 H5 生产环境通过同域 ticket Cookie 鉴权，登录流程不会把 token
+  // 写入 ACCESS_TOKEN storage；WS 握手不能在 start() 阶段因 storage 为空而跳过。
+  // #ifdef H5 || WEB
+  if (!isAppWebViewEmbedded()) {
+    const cookieToken = readCookie("ticket");
+    if (cookieToken.length > 0) {
+      return cookieToken;
+    }
+  }
+  // #endif
+  return "";
 }
 
 /** 派生 WS URL：baseURL → ws/wss + path + H5 query 拼 token。 */
 function buildImWsUrl(token: string): string {
   let base = getApiBaseUrl();
+  // #ifdef H5 || WEB
+  // 生产 H5 部署在 {domain}/m/ 下：API_BASE_URL 为空、HTTP 走同源相对路径（见
+  // config.uts 注释），但浏览器原生 WebSocket 构造器只接受绝对 ws/wss URL，
+  // 相对路径 "/instant-message/ws" 会同步抛 SyntaxError（connect 里被 catch 成
+  // "connect threw" 静默重连，表现=聊天页全程不实时）。用页面 origin 补全，
+  // 同源 nginx 已代理该路径（PC 端同域名 WS 正常）。AgentDetailService pageHomeUrl 同款。
+  // App 内嵌离线 H5 的 origin 是 file://（button-wrapper 注释），不 http(s) 开头则不补。
+  if (base.length == 0) {
+    const origin = `${window.location.origin}`;
+    if (origin.startsWith("http://") || origin.startsWith("https://")) {
+      base = origin;
+    }
+  }
+  // #endif
   if (base.startsWith("https://")) {
     base = "wss://" + base.substring(8);
   } else if (base.startsWith("http://")) {
@@ -280,6 +307,13 @@ class ImWsClientImpl {
   }
 
   private connect(): void {
+    // 工作商业版未授权（workCommercialEdition !== true）：不建连。放 connect 单点
+    // 拦截——start/前台恢复/网络恢复/token 重试/退避重连全部经此，授权撤销后自然
+    // 停在断开态；已建立的连接由页面闸门翻转时显式 stopImWsClient 收掉。
+    if (isWorkCommercialBlockedSync()) {
+      imLog("connect: work commercial edition not licensed, abort");
+      return;
+    }
     if (this.manualClosed || this.inBackground || !this.networkAvailable || this.state == "connecting" || this.state == "open") {
       return;
     }

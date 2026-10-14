@@ -71,6 +71,7 @@
             <view
               v-if="m.avatar.length > 0 && m.avatarFailed != true"
               class="gm-ava gm-ava--clip"
+              :style="gmAvaStyle"
             >
               <image
                 class="gm-ava__img"
@@ -79,7 +80,7 @@
                 @error="handleAvatarError(m)"
               />
             </view>
-            <view v-else class="gm-ava" :style="{ backgroundImage: avatarGradient(m.token) }">
+            <view v-else class="gm-ava" :style="gmAvaFallbackStyle(m.token)">
               <text class="gm-ava-letter">{{ avatarLetter(m.token) }}</text>
             </view>
             <view class="gm-col">
@@ -103,10 +104,34 @@
       </view>
     </scroll-view>
 
-    <!-- 长按行操作浮层（无蒙层，消息列表 message.uvue 同款）：长按行原位浅灰高亮 + 行旁
-         锚定浅灰纵向气泡（操作项=图标+文案，按成员权限生成）；页面任意触摸即收起（气泡根
-         touchstart/touchend/touchcancel 三阶段断冒泡，气泡内不算点外），同手势补发的 click
-         全吞防误触；Android 返回先关浮层（popupBackRegistry）；浮层期间列表锁滚动 -->
+    <!-- 长按行操作浮层（双模式，消息列表 message-content 同款）：gmMenuDark（自定义
+         tabbar 平台）=飞书式——压暗蒙层条挖洞（紧邻其下）+ 行原位浅灰高亮 + 行旁锚定
+         白色气泡；MP（原生 tabBar 盖不住）=无蒙层同款气泡，路径不变。
+         气泡根 touchstart/touchend/touchcancel 三阶段断冒泡（气泡内不算点外），
+         同手势补发的 click 全吞防误触；Android 返回先关浮层（popupBackRegistry）；
+         浮层期间列表锁滚动 -->
+    <!-- 飞书式压暗蒙层条（仅 gmMenuDark 平台）：两条 fixed 蒙层条在长按行位置「挖洞」
+         ——上条盖视口顶→行顶、下条盖行底→视口底（含 header/搜索区域，即整个视口），
+         洞内行原位高亮不被压暗（原生 scroll-view 子树浮不上页面级 fixed，只能挖洞；
+         行全宽→洞=行矩形全宽）。★本页页面根 .gm-page 无任何触摸绑定，条上是点外收层
+         的唯一路径（不是兜底）：按下+完整抬起即收层（uni-modal-popup 三星真机同配方，
+         不做位移判定；洞外行被条挡住，长按另一行不换弹，抬手即收，再长按是新的一轮）。 -->
+    <template v-if="rowMenuVisible && gmMenuDark">
+      <view
+        class="gm-menu-mask gm-menu-mask--top"
+        :style="rowMenuMaskTopStyle"
+        @touchstart.stop="swallowRowMenuTouch"
+        @touchend.stop="closeRowMenu"
+        @touchcancel.stop="closeRowMenu"
+      />
+      <view
+        class="gm-menu-mask gm-menu-mask--bottom"
+        :style="rowMenuMaskBottomStyle"
+        @touchstart.stop="swallowRowMenuTouch"
+        @touchend.stop="closeRowMenu"
+        @touchcancel.stop="closeRowMenu"
+      />
+    </template>
     <template v-if="rowMenuVisible">
       <view
         class="gm-menu-pop"
@@ -159,6 +184,8 @@
   import ConfirmModal from "@/components/confirm-modal/confirm-modal.uvue";
   import AddBuddySheet from "@/components/add-buddy-sheet/add-buddy-sheet.uvue";
   import { registerPopupClose, unregisterPopupClose } from "@/utils/popupBackRegistry";
+  import { getCachedContactRemarks } from "@/utils/im/contactRemarkCache";
+  import { CUSTOM_TAB_BAR_ENABLED } from "@/constants/customTabBar.constants";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -251,8 +278,15 @@
   const rowMenuMember = ref<GmMember | null>(null);
   /** 气泡操作项（按行权限生成：文案+图标，点击按 key 分发 handleRowMenuAct）。 */
   const rowMenuActs = ref<GmRowMenuAct[]>([]);
-  /** 气泡定位（页面坐标系 px 样式串，长按时 createSelectorQuery 测行矩形后拼装）。 */
+  /** 气泡定位（视口坐标系 px 样式串，fixed 定位与蒙层条同层；长按测行矩形后拼装）。 */
   const rowMenuPopStyle = ref<string>("");
+  /** 飞书式压暗蒙层总开关：自定义 tabbar 平台（APP/H5/WEB）开，MP 保留旧版
+   *  无蒙层（原生 tabBar 盖不住）；气泡面板两端统一维持浅色。★单点回退：改 false
+   *  即整页回到旧行为。 */
+  const gmMenuDark = CUSTOM_TAB_BAR_ENABLED;
+  /** 压暗蒙层条高度（fixed 视口系 px 样式串，长按测行矩形后拼装；仅 gmMenuDark 平台写值）。 */
+  const rowMenuMaskTopStyle = ref<string>("");
+  const rowMenuMaskBottomStyle = ref<string>("");
   /** 长按浮层指向的行 id（rowMenuOnCls 同键：成员=userId）。 */
   let rowMenuRowId = "";
   /** 测量中转：长按落定的成员行（exec 回调取用拼装浮层）。 */
@@ -551,8 +585,44 @@
     return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
   }
 
+  // ★头像盒整数 pt 化（消息页 chat-item__avatar-wrap 同款，iPhone 13/390pt 真机实证）：
+  // 72rpx 在 390pt 屏折 37.44pt 小数——wrap 帧被 iOS 取整到整物理像素、子图按小数帧
+  // 布局，右缘越出亚像素被 overflow:hidden 裁剪削出直边（Android 不裁正常）。内联整
+  // pt 根治；圆角须随半宽同步（样式表 36rpx 是绝对值，宽高变了不跟会变椭圆）。
+  const GM_AVA_PT = Math.round((uni.getWindowInfo().windowWidth * 72) / 750);
+  const gmAvaStyle = `width: ${GM_AVA_PT}px; height: ${GM_AVA_PT}px; border-radius: ${GM_AVA_PT / 2}px;`;
+
+  /** 字母兜底头像内联样式：整 pt 盒 + 渐变底（与 clip 分支同尺寸口径）。 */
+  function gmAvaFallbackStyle(token: string): string {
+    return gmAvaStyle + "; background-image: " + avatarGradient(token) + ";";
+  }
+
+  // ===== 整表重建强制重渲（im-msg-read-status scheduleRowsRefresh 同款）=====
+  /** App-Android 不追踪 ref 数组内实例属性的原地变更（ba6a72f18 消息列表同款平台
+   * 缺陷）：@error 置 avatarFailed / 异步解析回填 avatar 后 v-for 行不重渲，头像
+   * 停在失败图的空渲染上，直到下一次偶然的组件重渲（点行等）才落字母兜底。写回后
+   * 去抖合并一次整表重建赋值强制重渲（key 稳定元素复用，iOS/H5 无副作用）。 */
+  let rowsRefreshTimer = 0;
+
+  function copyMembers(live: GmMember[]): GmMember[] {
+    const copy: GmMember[] = [];
+    for (let i = 0; i < live.length; i++) {
+      copy.push(live[i]);
+    }
+    return copy;
+  }
+
+  function scheduleRowsRefresh(): void {
+    if (rowsRefreshTimer != 0) return;
+    rowsRefreshTimer = setTimeout((): void => {
+      rowsRefreshTimer = 0;
+      members.value = copyMembers(members.value);
+    }, 50);
+  }
+
   function handleAvatarError(m: GmMember): void {
     m.avatarFailed = true;
+    scheduleRowsRefresh();
   }
 
   /** 批量解析头像展示地址（/api/f/ 受保护与远程 SVG；H5 裸连 <img> 会被 ORB 拦）。
@@ -562,14 +632,17 @@
     const live = members.value;
     for (let i = 0; i < live.length; i++) {
       const row = live[i];
+      // ★跳过条件看「avatar 仍等于原始地址」：App 端未解析时 avatar=raw 透传非空，
+      //   旧 length>0 判断会把 App 端解析整个跳过（read-status 同款更正）
       const raw = row.avatarRaw;
-      if (raw.length == 0 || row.avatar.length > 0) {
+      if (raw.length == 0 || row.avatar != raw) {
         continue;
       }
       resolveImAvatarDisplay(raw, 72).then((resolved: string) => {
         if (resolved != raw && resolved != row.avatar) {
           row.avatar = resolved;
           row.avatarFailed = false; // 首帧失败可能已标死字母兜底，解析成功救回
+          scheduleRowsRefresh();
         }
       });
     }
@@ -609,8 +682,9 @@
 
   // ===== 长按行操作浮层：定位与入口（行矩形测量 → 气泡几何拼装，message.uvue 同款）=====
 
-  /** 行矩形测量回调（具名函数：深层箭头块会触发 UTS 截断编译）。测行 + .gm-page 两矩形，
-   *  视口坐标换算页面坐标（浮层 absolute 挂 .gm-page 布局流）；测不到行矩形则放弃弹层。 */
+  /** 行矩形测量回调（具名函数：深层箭头块会触发 UTS 截断编译）。测行 + .gm-page 两矩形
+   *  （页面矩形供上下空间判定与 fixed 视口坐标换算：页面坐标 + 页面原点 = 视口坐标）；
+   *  气泡与蒙层条同为 fixed 层（z-index 991 压条上）；测不到行矩形则放弃弹层。 */
   function onRowMenuRectsMeasured(results: Array<any>): void {
     let rowTopPx = -1;
     let rowBottomPx = -1;
@@ -696,6 +770,15 @@
     if (pageHpx <= 0) {
       pageHpx = win.windowHeight - pageTopPx;
     }
+    // 蒙层条几何（fixed=视口系，直接用行矩形视口坐标，不做页面坐标换算）：行顶以上全盖、
+    // 行底以下全盖；行半滚出屏钳 0（洞随可见区收窄）。仅 gmMenuDark 平台写值，MP 零增量
+    if (gmMenuDark) {
+      const winH = win.windowHeight;
+      const maskTopH = rowTopPx < 0 ? 0 : rowTopPx;
+      const maskBottomH = rowBottomPx >= winH ? 0 : winH - rowBottomPx;
+      rowMenuMaskTopStyle.value = "height: " + maskTopH.toString() + "px;";
+      rowMenuMaskBottomStyle.value = "height: " + maskBottomH.toString() + "px;";
+    }
     const popWpx = 300 * scale;
     const popHpx = (acts.length * 88 + 16) * scale;
     const gapPx = 10 * scale;
@@ -721,7 +804,9 @@
     if (popLeft > maxLeft) {
       popLeft = maxLeft < 12 ? 12 : maxLeft;
     }
-    rowMenuPopStyle.value = "top: " + popTop.toString() + "px; left: " + popLeft.toString() + "px;";
+    // 气泡 fixed（视口坐标 = 页面坐标 + 页面原点）：App 原生 fixed 层浮于普通流之上，
+    // absolute 气泡会被蒙层条压住，z-index 991>990 须同定位模式才作数
+    rowMenuPopStyle.value = "top: " + (popTop + pageTopPx).toString() + "px; left: " + (popLeft + pageLeftPx).toString() + "px;";
     rowMenuVisible.value = true;
   }
 
@@ -850,11 +935,19 @@
             m.avatar = imAvatarDisplayUrl(m.avatarRaw, 72);
             m.role = readNumber(records[i], "role", 1);
             m.self = readBool(records[i], "self");
-            m.token = m.nickName.length > 0
-              ? m.nickName
-              : m.name.length > 0
-                ? m.name
-                : `用户${m.userId}`;
+            // 展示名：我设的备注 > 群卡片 > 平台昵称（微信语义；成员接口无备注，
+            // 备注取模块缓存——消息页/资料页刷新联系人时会写，本页 onShow 重拉即同步）
+            const cachedRemarks = getCachedContactRemarks();
+            const myRemark = cachedRemarks == null
+              ? ""
+              : cachedRemarks.get(m.userId) ?? "";
+            m.token = myRemark.length > 0
+              ? myRemark
+              : m.nickName.length > 0
+                ? m.nickName
+                : m.name.length > 0
+                  ? m.name
+                  : `用户${m.userId}`;
             if (m.userId.length > 0) {
               out.push(m);
             }
@@ -1271,6 +1364,9 @@
     box-sizing: border-box;
   }
 
+  /* 头像盒：72rpx 设计基准 + 模板内联整 pt 覆盖（gmAvaStyle，含半宽圆角）——
+     rpx 折小数 pt 时 iOS wrap 帧取整物理像素、子图按小数帧布局，右缘越出亚像素
+     被 overflow:hidden 裁剪削直边（消息页 chat-item__avatar-wrap 注释同款） */
   .gm-ava {
     width: 72rpx;
     height: 72rpx;
@@ -1349,10 +1445,11 @@
     height: 40rpx;
   }
 
-  /* ===== 长按行操作浮层（无蒙层：行原位浅灰高亮 + 行旁锚定浅灰纵向气泡；消息列表同款）=====
+  /* ===== 长按行操作浮层（双模式：gmMenuDark 平台=压暗蒙层挖洞+行高亮+白色气泡；
+     MP=无蒙层同款气泡；消息列表同款）=====
      几何与 onRowMenuRectsMeasured 的测量常量严格对齐：宽 300rpx 固定、项高 88rpx×N、
      垂直内边距 8rpx×2——改这里必须同步改测量。
-     行高亮与气泡底取按压态同色（#f4f3f8 / #eceaf3，与消息列表一致）；操作项按压再深一档。 */
+     行高亮取按压态同色（#eceaf3）；气泡底纯白不透明；操作项按压深一档。 */
   .gm-row--menu-on {
     background-color: #eceaf3;
   }
@@ -1362,15 +1459,18 @@
     background-color: #eceaf3;
   }
 
+  /* 气泡与蒙层条同为 fixed 层：App 原生 fixed 浮于普通流之上，absolute 气泡会被
+     蒙层条压住（z-index 跨定位模式不作数）；同层后 991 > 990 恒在蒙层之上。
+     定位用视口坐标（onRowMenuRectsMeasured 换算），消息列表同款 */
   .gm-menu-pop {
-    position: absolute;
+    position: fixed;
     z-index: 991;
     /* 比消息列表 240rpx 放宽：本页最长文案「添加到智联录」6 字 + 图标 + 内边距 ≈280rpx */
     width: 300rpx;
     display: flex;
     flex-direction: column;
     padding: 8rpx 0;
-    background-color: #f4f3f8;
+    background-color: #ffffff;
     border-radius: 20rpx;
     box-shadow: 0 8rpx 32rpx rgba(0, 0, 0, 0.16);
   }
@@ -1383,9 +1483,28 @@
     align-items: center;
   }
 
-  /* 操作项按压：气泡底为按压态灰，再深一档保持可见 */
+  /* 操作项按压：白底上深一档灰保持可见 */
   .gm-menu-act--active {
     background-color: #e7e5ef;
+  }
+
+  /* ===== 飞书式压暗蒙层条（挖洞：洞=长按行矩形全宽）===== 条 z-index 990 低于气泡 991；
+     高度由 rowMenuMaskTopStyle/BottomStyle 内联（上条锚 top:0、下条锚 bottom:0），
+     仅 gmMenuDark 平台渲染。 */
+  .gm-menu-mask {
+    position: fixed;
+    left: 0;
+    right: 0;
+    z-index: 990;
+    background-color: rgba(0, 0, 0, 0.45);
+  }
+
+  .gm-menu-mask--top {
+    top: 0;
+  }
+
+  .gm-menu-mask--bottom {
+    bottom: 0;
   }
 
   /* 图标统一盒（同尺寸不同形）：svg-icon 字形 32rpx 居中其中 */

@@ -169,6 +169,13 @@ public class StreamPcmRecorderBridge {
     /// 用户按下时只重新挂 tap，对齐 Android/鸿蒙按下即采。
     public func prepareSession() {
         appendDiag("prepareSession")
+        // TTS 播报占用 .playback。回前台 onShow 会再调本方法；此时若 setActive(false)
+        // 并切到 playAndRecord，播放引擎仍标记在播但输出被拆掉：图标保持播报态、前台无声，
+        // 下次进后台才会被播放器切回 playback。预热让路，真正开录仍走 start() → configureSession()。
+        if AVAudioSession.sharedInstance().category == .playback {
+            appendDiag("prepareSession skip (playback session active)")
+            return
+        }
         configureSession()
         addObservers()
         if ioPrimed || priming || running {

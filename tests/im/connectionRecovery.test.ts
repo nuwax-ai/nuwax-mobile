@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadUtsClass } from "./runtimeHarness";
 
-function clientFixture() {
+function clientFixture(options: { storageToken?: unknown; cookieToken?: string } = {}) {
   const callbacks: Record<string, Function> = {};
   const adapter = {
     connect: vi.fn(), close: vi.fn(), send: vi.fn(() => true), isOpen: () => true,
@@ -12,9 +12,13 @@ function clientFixture() {
   };
   const emit = vi.fn();
   const sync = vi.fn(async () => ({ data: { messages: [], conversations: [] } }));
+  const storageToken = options.storageToken === undefined ? "user-a" : options.storageToken;
   const scope = {
-    ACCESS_TOKEN: "token", uni: { getStorageSync: () => "user-a", onNetworkStatusChange: (f: Function) => callbacks.network = f },
+    ACCESS_TOKEN: "token",
+    uni: { getStorageSync: () => storageToken, onNetworkStatusChange: (f: Function) => callbacks.network = f },
     getApiBaseUrl: () => "https://example.test", isAppWebViewEmbedded: () => false,
+    readCookie: () => options.cookieToken || "",
+    isWorkCommercialBlockedSync: () => false,
     applyBearerAuthorization: () => {}, createImWsSocketAdapter: () => adapter,
     getImDeviceId: () => "device", apiImSync: sync, apiResData: (r: any) => r.data,
     apiResCode: () => "0000", SUCCESS_CODE: "0000",
@@ -34,6 +38,13 @@ function clientFixture() {
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 describe("IM connection recovery", () => {
+  it("uses the browser ticket cookie when storage has no access token", () => {
+    const f = clientFixture({ storageToken: "", cookieToken: "browser-ticket" });
+    f.client.start();
+    expect(f.adapter.connect).toHaveBeenCalledTimes(1);
+    expect((f.adapter.connect.mock.calls[0] as any)[0]).toContain("access_token=browser-ticket");
+  });
+
   it("retries an error without relying on a subsequent close event", () => {
     const f = clientFixture(); f.client.start();
     f.callbacks.error("failed"); f.callbacks.close(1006, "failed");

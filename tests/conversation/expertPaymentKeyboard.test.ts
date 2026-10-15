@@ -71,7 +71,7 @@ function fixture(platform = "APP-ANDROID") {
   const script = [
     atomicSource.slice(atomicSource.indexOf("export function resolveWebComposerQuill")).replace("export function", "function"),
     fragment(composerSource, "  const focusChatInput = ", "  // 文档"),
-    fragment(composerSource, "  const wholeDisabledVal = ", "  const pageHomeIndexVal = "),
+    fragment(composerSource, "  const wholeDisabledVal = ", "  const agentTypeVal = "),
     fragment(composerSource, "  const blurChatInput = ", "  /** 切换输入方式"),
     fragment(composerSource, "  const onInputFocus = ", "  // 切换额外功能栏"),
     fragment(composerSource, "  const handleExpertSelect = ", "  const handleExpertPaymentRequired = "),

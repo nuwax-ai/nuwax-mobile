@@ -37,8 +37,9 @@ function makeResponse(records: unknown[]): unknown {
 
 describe("mapProjectTabResponse", () => {
   it.each([
-    { workspacePath: "/work/project", agentWorkspacePath: "/agent/project", fileWorkspacePath: "/files/project", expected: "/work/project" },
-    { workspacePath: null, agentWorkspacePath: "/agent/project", fileWorkspacePath: "/files/project", expected: "/agent/project" },
+    { workspacePath: "/work/project", agentWorkspacePath: "/agent/project", fileWorkspacePath: "/files/project", expected: "/files/project" },
+    { workspacePath: null, agentWorkspacePath: "/agent/project", fileWorkspacePath: "/files/project", expected: "/files/project" },
+    { workspacePath: "/old", agentWorkspacePath: "/agent/default", fileWorkspacePath: "", expected: "" },
     { fileWorkspacePath: "/files/project", expected: "/files/project" },
     { agentWorkspacePath: null, fileWorkspacePath: null, expected: "" },
   ])("保留项目电脑类型与工作目录：$expected", ({ expected, ...paths }) => {

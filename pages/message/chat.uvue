@@ -339,6 +339,7 @@
               <view
                 v-else-if="(msg.msgType == 'video' || msg.msgType == 'file') && msg.videoUrl.length > 0"
                 class="chat-video"
+                :class="msg.msgId.indexOf('local-') == 0 ? 'chat-video--local' : ''"
                 @click="handleVideoMsgTap(msg)"
                 @touchstart="handleMsgTouchStart(msg, $event)"
                 @touchmove="handleMsgTouchMove($event)"
@@ -349,6 +350,7 @@
                   v-if="msg.videoPlayUrl.length > 0"
                   :id="'chatVideoPlayer-' + msg.msgId"
                   class="chat-video__player"
+                  :class="msg.msgId.indexOf('local-') == 0 ? 'chat-video__player--local' : ''"
                   :src="msg.videoPlayUrl"
                   :controls="true"
                   :show-fullscreen-btn="true"
@@ -373,7 +375,11 @@
                   </view>
                   <!-- #endif -->
                 </video>
-                <view v-else class="chat-video__poster">
+                <view
+                  v-else
+                  class="chat-video__poster"
+                  :class="msg.msgId.indexOf('local-') == 0 ? 'chat-video__poster--local' : ''"
+                >
                   <!-- 预载中只显进度；未预载/失败显 ▶ 可点重试（成功即被 <video> 首帧顶替） -->
                   <text v-if="msg.msgId == videoLoadingId && videoLoadPercent >= 0" class="chat-video__hint">{{ t("Mobile.FileTree.downloading") }} {{ videoLoadPercent }}%</text>
                   <text v-else-if="msg.msgId == videoLoadingId" class="chat-video__hint">{{ t("Mobile.FileTree.downloading") }}</text>
@@ -9163,7 +9169,9 @@
   /** 删除入口：本人已确认消息（本地占位行无服务端身份，删无可删）。
    *  按人删除仅收敛自己的可见范围，无时限无权限差异，服务端幂等。 */
   function canDeleteMsg(msg: ImMsgRow): boolean {
-    return isMine(msg) && isConfirmedRow(msg);
+    // 发送失败的本地行也可删（服务端从未落库 → 纯本机移除，handleActionDelete 本地分支）；
+    // 发送中（status=0）不可删——等出结果再操作
+    return isMine(msg) && (isConfirmedRow(msg) || msg.status == 2);
   }
 
   /** 动作列表；撤回=红色破坏性操作。 */
@@ -9562,18 +9570,42 @@
     }
   }
 
-  /** 长按「删除」：弹紧凑确认（按人删除语义文案），确认后 handleActionDelete。 */
+  /** 失败行本机移除（长按「删除」本地分支）：列表 splice + 失败发件箱同步出箱
+   *  （箱里留着会跨重启复活成孤儿失败行，handleMuteRejection 同款收口）。 */
+  function removeLocalFailedRow(msg: ImMsgRow): void {
+    if (msg.clientMsgId.length == 0) {
+      return;
+    }
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].clientMsgId == msg.clientMsgId) {
+        rows.splice(i, 1);
+        break;
+      }
+    }
+    removeFailedSend(convId.value, msg.clientMsgId);
+  }
+
+  /** 长按「删除」：弹紧凑确认（已确认行=按人删除语义；失败本地行=本机移除语义），确认后 handleActionDelete。 */
   function openDeleteConfirm(msg: ImMsgRow): void {
     pendingDeleteMsg = msg;
     const proxy = confirmModalRef.value as ComponentPublicInstance | null;
     if (proxy != null) {
-      proxy.$callMethod("open", t("Mobile.Message.deleteMsgTitle"), t("Mobile.Message.deleteMsgTip"), t("Mobile.Common.delete"));
+      const tip = isConfirmedRow(msg)
+        ? t("Mobile.Message.deleteMsgTip")
+        : t("Mobile.Message.deleteLocalMsgTip");
+      proxy.$callMethod("open", t("Mobile.Message.deleteMsgTitle"), tip, t("Mobile.Common.delete"));
     }
   }
 
   /** 删除（按人删除，仅自己的可见范围）：成功后本地行直接移除（服务端历史对我已
-   *  过滤，重拉也不再出现）；幂等——data=false 仍是成功码，同码处理不区分。 */
+   *  过滤，重拉也不再出现）；幂等——data=false 仍是成功码，同码处理不区分。
+   *  发送失败的本地行走本机移除分支（服务端从未落库，无服务端对象可删）。 */
   async function handleActionDelete(msg: ImMsgRow): Promise<void> {
+    if (!isConfirmedRow(msg)) {
+      removeLocalFailedRow(msg);
+      return;
+    }
     if (convId.value.length == 0) {
       return;
     }
@@ -10473,6 +10505,14 @@
           success: (res) => {
             const files = res.tempFiles;
             if (files == null) {
+              return;
+            }
+            if (files.length == 0) {
+              // iOS chooseMedia 对个别老视频（相册可正常播放）导出失败时仍报 success
+              // 且 tempFiles 为空——PhotoKit loadFileRepresentation 对部分旧资产的已知
+              // 行为（2026-10-15 真机实测：完整播放一次后仍为空，非 iCloud 未下载）；
+              // 非用户取消——取消走 fail 1101001：显式提示 + 指引复制资产后重选
+              uni.showToast({ title: t("Mobile.Chat.albumImportEmpty"), icon: "none" });
               return;
             }
             let stagedCount = 0;
@@ -12545,6 +12585,29 @@
     border-radius: 12rpx;
     background-color: #1c1b20;
     overflow: hidden;
+  }
+
+  /* 本地未确认行视频卡降档（msgId local-* 前缀，isConfirmedRow 同口径）：尾部
+     「发送失败，点击重试」文案约 214rpx + 400rpx 卡 + 头像 76 + 边距已超 686rpx
+     内容宽（750−chat-body 32×2），行右锚定左溢出会把重试文案顶出屏幕左缘；降至
+     与图片消息同 300rpx 宽（4:3→300×225）恰好收进（英文文案更宽也够）。
+     ★条件绑 msgId 前缀而非 status：status 在重试时 2→0→2 抖动会让视频放大再缩回；
+     msgId 全生命周期恒定，本地行（首发发送中/失败/重试中）恒小卡，确认替换时
+     内容连同尺寸一起换 400×300，只跳变一次。远端行恒 400×300 不受影响；
+     uvue 无后代选择器，容器/播放器/占位卡三处同改 */
+  .chat-video--local {
+    width: 300rpx;
+    height: 225rpx;
+  }
+
+  .chat-video__player--local {
+    width: 300rpx;
+    height: 225rpx;
+  }
+
+  .chat-video__poster--local {
+    width: 300rpx;
+    height: 225rpx;
   }
 
   /* rich_text 气泡内嵌视频附件：播放器同尺寸，与气泡内文案/图片留间距 */

@@ -38,27 +38,28 @@ function inputFixture(scene: string, locked: boolean, unavailable = false) {
   return { ...handlers, props, computerSheetVisible, selectedComputerId, selectedComputerName, emit };
 }
 
-function sheetFixture(readonly: boolean, savedId = "-1", currentValue = "366", autoSelect = true) {
-  const props = { readonly, autoSelect, currentValue, agentId: 7, visible: false };
+function sheetFixture(readonly: boolean, savedId = "-1", currentValue = "366", autoSelect = true, fallbackToAvailable = false) {
+  const props = { readonly, autoSelect, currentValue, fallbackToAvailable, agentId: 7, visible: false };
   const emit = vi.fn(), save = vi.fn().mockResolvedValue({ code: "0000" });
   const script = sheetSource.split('<script setup lang="uts">')[1].split("</script>")[0]
     .replace(/^\s*import .*;\s*$/gm, "");
+  const load = vi.fn().mockResolvedValue({ code: "0000", data: {
+    sandboxes: [
+      { sandboxId: "-1", name: "云端电脑", description: "" },
+      { sandboxId: "366", name: "我的电脑", description: "个人工作目录" },
+    ], agentSelected: { 7: savedId },
+  } });
   const state = execute(script, {
     defineProps: () => props, withDefaults: (value: unknown) => value, defineEmits: () => emit,
     ref: (value: unknown) => ({ value }), watch() {},
     UTSJSONObject: class {}, resolveHomeComputerId,
-    apiGetSandboxList: async () => ({ code: "0000", data: {
-      sandboxes: [
-        { sandboxId: "-1", name: "云端电脑", description: "" },
-        { sandboxId: "366", name: "我的电脑", description: "个人工作目录" },
-      ], agentSelected: { 7: savedId },
-    } }),
+    apiGetSandboxList: load,
     apiUpdateSelectedSandbox: save, apiResCode: (res: any) => res.code, apiResData: (res: any) => res.data,
     SUCCESS_CODE: "0000", tRaw: (key: string) => key, emptyI18nParams: () => ({}),
     uni: { showToast: vi.fn() }, console,
   }, "{loadComputers, selectItem, syncSelection, computers, popupRef}");
   const popup = vi.fn(); state.popupRef.value = { $callMethod: popup };
-  return { ...state, props, emit, save, popup };
+  return { ...state, props, emit, save, popup, load };
 }
 
 describe("conversation computer inspection", () => {
@@ -146,5 +147,51 @@ describe("conversation computer inspection", () => {
     await f.selectItem(f.computers.value[0]); f.syncSelection();
     expect(f.emit).not.toHaveBeenCalled();
     expect(f.save).not.toHaveBeenCalled();
+  });
+
+  it("项目原电脑首次缺失时同步回落云端，不把回落写成 Agent 记忆", async () => {
+    const f = sheetFixture(false, "366", "offline-project-computer", false, true);
+    await f.loadComputers();
+    expect(f.emit.mock.calls).toEqual([["sync", "-1", "云端电脑"]]);
+    expect(f.save).not.toHaveBeenCalled();
+  });
+
+  it("曾经出现的项目电脑在后续刷新暂缺时保留选择和名称", async () => {
+    const f = sheetFixture(false, "-1", "366", false, true);
+    await f.loadComputers(); f.emit.mockClear();
+    f.load.mockResolvedValue({ code: "0000", data: {
+      sandboxes: [{ sandboxId: "-1", name: "云端电脑", description: "" }], agentSelected: {},
+    } });
+    await f.loadComputers();
+    expect(f.emit.mock.calls).toEqual([["syncName", "366", "我的电脑"]]);
+    expect(f.save).not.toHaveBeenCalled();
+  });
+
+  it("锁定且电脑 ID 尚未回填时保持等待，不回落云端也不显示不可用", async () => {
+    const f = sheetFixture(true, "366", "", false, true);
+    await f.loadComputers();
+    expect(f.emit).not.toHaveBeenCalled();
+    expect(f.save).not.toHaveBeenCalled();
+  });
+
+  it("智能体记忆中的电脑暂缺时不向后端写入云端覆盖记忆", async () => {
+    const f = sheetFixture(false, "offline-memory", "-1");
+    await f.loadComputers();
+    expect(f.emit.mock.calls).toEqual([["syncName", "-1", "云端电脑"]]);
+    expect(f.save).not.toHaveBeenCalled();
+  });
+
+  it("刷新过程中手选电脑后，晚到的旧记忆不能覆盖新选择", async () => {
+    const f = sheetFixture(false, "-1", "-1");
+    await f.loadComputers();
+    let finish!: (value: unknown) => void;
+    f.load.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const refreshing = f.loadComputers();
+    await f.selectItem(f.computers.value[1]);
+    f.props.currentValue = "366";
+    f.emit.mockClear();
+    finish({ code: "0000", data: { sandboxes: f.computers.value, agentSelected: { 7: "-1" } } });
+    await refreshing;
+    expect(f.emit.mock.calls).toEqual([["syncName", "366", "我的电脑"]]);
   });
 });

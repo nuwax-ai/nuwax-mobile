@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { transformSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
+import { resolvePersonalWorkspacePath } from "@/types/interfaces/displayRecommend.uts";
 
 const source = readFileSync("pages/index/index-content.uvue", "utf8");
 function fragment(startMarker: string, endMarker: string): string {
@@ -43,6 +44,7 @@ function setup(sandboxId: unknown = "366") {
     numFromAny: (value: unknown, fallback: number) => value == null ? fallback : Number(value),
     objectRows: (value: unknown) => Array.isArray(value) ? value : [],
     parseHomeGuideQuestions: () => [], HomeManualComponent: class {},
+    resolvePersonalWorkspacePath,
     SUCCESS_CODE: "0000", t: (key: string) => key,
     computed: (getter: () => unknown) => ({ get value() { return getter(); } }),
   };
@@ -75,15 +77,15 @@ describe("首页私人智能体的固定电脑与目录", () => {
     expect(page.workspacePath.value).toBe("");
   });
 
-  it("之前选云端电脑时，也能在私人智能体绑定的个人电脑上选目录", async () => {
+  it("不允许选择电脑时，即使智能体绑定个人电脑也隐藏目录入口", async () => {
     const page = setup("366");
     page.currentComputerId.value = "-1";
     page.apiPublishedAgentInfo.mockResolvedValue({ code: "0000", data: { sandboxId: "366", type: "TaskAgent", allowPrivateSandbox: 0 } });
     await page.loadActiveAgentDetail(7, null);
     expect(page.effectiveHomeComputerId.value).toBe("366");
-    expect(page.showWorkspaceDirBar.value).toBe(true);
+    expect(page.showWorkspaceDirBar.value).toBe(false);
     page.handleWorkspaceDirSelect("/tmp/private-workspace");
-    expect(page.workspacePath.value).toBe("/tmp/private-workspace");
+    expect(page.workspacePath.value).toBe("");
   });
 
   it.each(["", "-1", "0", null])("未绑定或云端哨兵 %s 仍允许自选电脑和目录", async (sandboxId) => {

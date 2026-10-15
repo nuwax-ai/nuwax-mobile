@@ -27,7 +27,7 @@ const code = transformSync([
   ...functions.map(name => fragment(`  function ${name}(`, "\n  }")),
   fragment("  async function applyPinnedProject(", "\n  }"),
   fragment("  async function handleSendMessage(", "\n  }"),
-  ...["isAgentComputerBound", "effectiveHomeComputerId", "showWorkspaceDirBar"].map(
+  ...["isAgentComputerBound", "effectiveHomeComputerId", "showHomeComputerSelector", "showWorkspaceDirBar"].map(
     name => fragment(`  const ${name} = computed(`, "\n  });"),
   ),
   `({${functions.join(",")}, applyPinnedProject, handleSendMessage, isAgentComputerBound, showWorkspaceDirBar});`,
@@ -79,19 +79,19 @@ function setup() {
 }
 
 describe("项目上框新建任务的电脑与工作目录", () => {
-  it("列表未带目录时读取一次详情，默认继承项目电脑与 agent 执行目录并发送", async () => {
+  it("列表未带目录时读取详情，继承项目电脑与 file 自定义目录并发送", async () => {
     const page = setup();
     await page.applyPinnedProject(project());
     expect(page.apiNormalProjectGetById).toHaveBeenCalledTimes(1);
     expect(page.apiNormalProjectGetById).toHaveBeenCalledWith(509);
     expect(page.currentComputerId.value).toBe("417");
-    expect(page.workspacePath.value).toBe("/work/project");
+    expect(page.workspacePath.value).toBe("/files/project");
     expect(page.showWorkspaceDirBar.value).toBe(true);
     await page.handleSendMessage({ messageInfo: "项目任务" });
     expect(page.apiAgentConversationCreate).toHaveBeenCalledTimes(1);
     expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({
       agentId: 1596, devMode: false, projectId: 509, projectType: "NormalProject",
-      sandboxId: 417, workspacePath: "/work/project",
+      sandboxId: 417, workspacePath: "/files/project",
     });
   });
 
@@ -105,7 +105,7 @@ describe("项目上框新建任务的电脑与工作目录", () => {
     await page.applyPinnedProject(project());
     expect(page.apiNormalProjectGetById).toHaveBeenCalledTimes(2);
     expect(page.currentComputerId.value).toBe("417");
-    expect(page.workspacePath.value).toBe("/work/project");
+    expect(page.workspacePath.value).toBe("/files/project");
     expect(page.clearSummonedExpert).toHaveBeenCalledTimes(1);
     expect(page.clearRecommendState).toHaveBeenCalledTimes(1);
     page.handleComputerChange("other-personal", "另一台电脑");
@@ -168,7 +168,7 @@ describe("项目上框新建任务的电脑与工作目录", () => {
     finishes[0]({ code: "0000", data: { sandboxId: 403, agentWorkspacePath: "/old/A" } });
     await first;
     expect(page.pinnedProjectConfigLoading.value).toBe(true);
-    finishes[2]({ code: "0000", data: { sandboxId: 417, agentWorkspacePath: "/new/A" } });
+    finishes[2]({ code: "0000", data: { sandboxId: 417, fileWorkspacePath: "/new/A" } });
     await last;
     finishes[1]({ code: "0000", data: { sandboxId: 403, agentWorkspacePath: "/old/B" } });
     await second;
@@ -210,5 +210,30 @@ describe("项目上框新建任务的电脑与工作目录", () => {
     expect(page.currentComputerId.value).toBe("417");
     expect(page.workspacePath.value).toBe("/list/project");
     expect(page.pinnedProjectConfigLoading.value).toBe(false);
+  });
+
+  it("切换云端或其他电脑清除项目目录，切回原电脑恢复 file 目录，仍允许手选默认目录", async () => {
+    const page = setup();
+    await page.applyPinnedProject(project());
+    page.handleComputerChange("-1", "云端电脑");
+    expect(page.workspacePath.value).toBe("");
+    page.handleComputerChange("418", "其他电脑");
+    expect(page.workspacePath.value).toBe("");
+    page.handleComputerChange("417", "项目电脑");
+    expect(page.workspacePath.value).toBe("/files/project");
+    page.handleWorkspaceDirSelect("");
+    page.handleComputerChange("417", "项目电脑");
+    expect(page.workspacePath.value).toBe("");
+  });
+
+  it("fileWorkspacePath 缺失代表默认目录，不能用 agent 或兼容目录补位", async () => {
+    const page = setup();
+    page.apiNormalProjectGetById.mockResolvedValue({ code: "0000", data: {
+      sandboxId: 417, sandboxType: "Personal", workspacePath: "/old", agentWorkspacePath: "/agent/default",
+    } });
+    await page.applyPinnedProject(project());
+    expect(page.workspacePath.value).toBe("");
+    await page.handleSendMessage({ messageInfo: "项目任务" });
+    expect(page.apiAgentConversationCreate.mock.calls[0][0]).not.toHaveProperty("workspacePath");
   });
 });

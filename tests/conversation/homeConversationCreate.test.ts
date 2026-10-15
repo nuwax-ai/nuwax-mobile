@@ -17,7 +17,7 @@ const start = homeSource.indexOf("  async function handleSendMessage(");
 const end = homeSource.indexOf("  // ── 5.9 抽屉 / 登录 ──", start);
 if (start < 0 || end <= start) throw new Error("首页发送入口未找到");
 const handlerCode = transformSync(
-  `${homeSource.slice(start, end)}\nhandleSendMessage;`,
+  `${homeSource.slice(homeSource.indexOf("  const showHomeComputerSelector = computed("), homeSource.indexOf("\n  });", homeSource.indexOf("  const showHomeComputerSelector = computed(")) + 7)}\n${homeSource.slice(start, end)}\nhandleSendMessage;`,
   { loader: "ts" },
 ).code;
 
@@ -31,6 +31,11 @@ function setup(computerId = "403", path = "/tmp/mobile-project", project: Pinned
     ensureLoggedIn: vi.fn().mockResolvedValue(true),
     activeAgentId: { value: 1596 },
     activeAgentName: { value: "任务智能体" },
+    activeAgentType: { value: "TaskAgent" },
+    effectiveTaskAgent: { value: false },
+    activeAllowPrivateSandbox: { value: true },
+    pinnedNormalProject: { value: project?.projectType === "NormalProject" },
+    computed: (getter: () => unknown) => ({ get value() { return getter(); } }),
     activeAgentDetailLoading: { value: false },
     pinnedProjectConfigLoading: { value: false },
     isAgentComputerBound: { value: boundComputerId.length > 0 },
@@ -65,7 +70,7 @@ describe("首页选择个人电脑与工作目录后创建会话", () => {
     { name: "发送载荷未带电脑时沿用当前选择", selected: "", current: "403", path: "/tmp/mobile-project", sandboxId: 403, workspacePath: "/tmp/mobile-project" },
     { name: "个人电脑默认目录", selected: "403", current: "403", path: "", sandboxId: 403, workspacePath: undefined },
     { name: "云电脑不带旧目录", selected: "-1", current: "403", path: "/tmp/mobile-project", sandboxId: -1, workspacePath: undefined },
-    { name: "未选电脑回退云电脑", selected: "", current: "", path: "/tmp/mobile-project", sandboxId: -1, workspacePath: undefined },
+    { name: "没有选择时不补云电脑", selected: "", current: "", path: "/tmp/mobile-project", sandboxId: undefined, workspacePath: undefined },
   ])("$name：只创建一次并保留首条消息交接", async ({ selected, current, path, sandboxId, workspacePath }) => {
     const page = setup(current, path);
     const payload = { messageInfo: "开始任务", sandboxId: selected, files: [{ url: "/file.txt" }], skillIds: [7], modelId: 8 };
@@ -76,11 +81,11 @@ describe("首页选择个人电脑与工作目录后创建会话", () => {
     expect(params).toEqual({
       agentId: 1596,
       devMode: false,
-      sandboxId,
+      ...(sandboxId !== undefined ? { sandboxId } : {}),
       ...(workspacePath ? { workspacePath } : {}),
     });
     expect(page.saveDraft).toHaveBeenCalledWith(
-      1596, 9527, "开始任务", payload.files, payload, selected || current || "-1", workspacePath ?? "",
+      1596, 9527, "开始任务", payload.files, payload, selected || current, workspacePath ?? "",
     );
     expect(page.jumpToAgentDetailPage).toHaveBeenCalledWith(1596, 9527, "TaskAgent", "任务智能体");
     expect(page.sending.value).toBe(false);
@@ -139,5 +144,37 @@ describe("首页选择个人电脑与工作目录后创建会话", () => {
     await page.send({ messageInfo: "开始任务", sandboxId: "403" });
     expect(page.apiAgentConversationCreate).not.toHaveBeenCalled();
     expect(page.tryCreateProjectFlow).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: "ChatBot", allow: true }, { type: "PageApp", allow: true }, { type: "TaskAgent", allow: false },
+  ])("$type 隐藏选择器时，创建请求和草稿不携带旧电脑/目录", async ({ type, allow }) => {
+    const page = setup("403", "/work/previous");
+    page.activeAgentType.value = type;
+    page.activeAllowPrivateSandbox.value = allow;
+    await page.send({ messageInfo: "开始任务", sandboxId: "403", workspacePath: "/work/previous" });
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({ agentId: 1596, devMode: false });
+    const draftArgs = page.saveDraft.mock.calls[0];
+    expect(draftArgs[4].sandboxId).toBe("");
+    expect(draftArgs[4].workspacePath).toBe("");
+    expect(draftArgs.slice(5)).toEqual(["", ""]);
+  });
+
+  it("不允许选择电脑的绑定智能体也不从首页主动指定容器", async () => {
+    const page = setup("403", "/old", null, "366");
+    page.activeAllowPrivateSandbox.value = false;
+    await page.send({ messageInfo: "开始任务", sandboxId: "403" });
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({ agentId: 1596, devMode: false });
+  });
+
+  it("全栈项目上框只发送项目和调试智能体，不透传项目环境到创建请求或草稿", async () => {
+    const project = new PinnedProjectInfo();
+    project.projectId = 111; project.projectType = "UserApp"; project.sandboxId = 302;
+    const page = setup("403", "/old", project);
+    await page.send({ messageInfo: "开始任务", sandboxId: "403" });
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({
+      agentId: 1596, devMode: false, projectId: 111, projectType: "UserApp", devAgentId: 1596,
+    });
+    expect(page.saveDraft.mock.calls[0].slice(5)).toEqual(["", ""]);
   });
 });

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { transformWithOxc } from "vite";
 import { describe, expect, it, vi } from "vitest";
+import { clearDrawerTitles, beginDrawerTitleRead, protectConversationTitles, recordDrawerTitle, resolveDrawerTitle } from "@/utils/drawerTitleState.uts";
 
 const drawer = readFileSync("components/project-task-drawer/project-task-drawer.uvue", "utf8");
 const tasks = readFileSync("components/conversation-history-list/conversation-history-list.uvue", "utf8");
@@ -29,6 +30,7 @@ describe("抽屉分页与刷新", () => {
   it("未打开且没有任务组件实例时也预取项目与任务", async () => {
     const state = {
       props: { isLoggedIn: true }, projectRequestPromise: null, projectLoadedOnce: false,
+      drawerHostVisible: { value: true }, mainTabBarCovered: { value: false },
       requestProjects: vi.fn(async () => true), prefetchConversationList: vi.fn(async () => true),
       taskListRef: { value: null }, callRefMethod: vi.fn(),
     };
@@ -97,8 +99,10 @@ describe("抽屉分页与刷新", () => {
   it.each([false, true])("头部请求完成/失败后仍消费触底事件，失败=%s", async fail => {
     const head = deferred<any>();
     const state = {
-      props: { isLoggedIn: true, allowSilentRefresh: true },
+      props: { isLoggedIn: true, isVisible: true, allowSilentRefresh: true },
       taskDataGeneration: 0,
+      beginDrawerTitleRead, protectConversationTitles, taskSilentRefreshPending: false,
+      flushPendingTaskRefresh: vi.fn(), mergeConversationTitles: vi.fn(),
       conversationList: { value: [{ id: 20 }] }, conversationRequestPromise: null,
       ConversationListParams: class {}, SILENT_HEAD_SIZE: 10, SUCCESS_CODE: 0,
       apiAgentConversationList: vi.fn(() => head.promise), apiResCode: () => 0,
@@ -128,6 +132,7 @@ describe("抽屉分页与刷新", () => {
       projectRequestPromise: null, projectLoadingMoreView: { value: false },
       projectNextPage: 2, fetchProjectPage: vi.fn(() => page.promise),
       syncProjectLoadMoreState: vi.fn(), console,
+      beginDrawerTitleRead, flushPendingProjectRefresh: vi.fn(),
     };
     const api = await bind(drawer, ["loadMoreProjects"], state);
     const first = api.loadMoreProjects();
@@ -150,11 +155,27 @@ async function cacheApi(request: any) {
   );
   return runInNewContext(`${code}\n({prefetchConversationList, getCachedConversationList, getCachedLastId, getCachedHasMore, clearCachedConversationList})`, {
     apiAgentConversationList: request, ConversationListParams: class {}, SUCCESS_CODE: 0,
+    clearDrawerTitles, beginDrawerTitleRead, protectConversationTitles,
     apiResCode: (res: any) => res.code, apiResData: (res: any) => res.data, console,
   });
 }
 
 describe("侧栏初始化预取缓存", () => {
+  it("预取旧包晚于标题写回返回时缓存仍是新标题；无组件时的标题变更也能恢复", async () => {
+    clearDrawerTitles();
+    const response = deferred<any>();
+    const api = await cacheApi(vi.fn(() => response.promise));
+    const pending = api.prefetchConversationList();
+    recordDrawerTitle("conversation", 20, "新标题", "");
+    response.resolve({ code: 0, data: [{ id: 20, topic: "旧标题" }] });
+    await pending;
+    expect(api.getCachedConversationList()[0].topic).toBe("新标题");
+    recordDrawerTitle("conversation", 20, "再次改名", "");
+    expect(api.getCachedConversationList()[0].topic).toBe("再次改名");
+    // 读缓存不能确认服务端已经追上写回。
+    expect(resolveDrawerTitle("conversation", 20, "", "旧副本", beginDrawerTitleRead())).toBe("再次改名");
+  });
+
   it.each([{ rows: [] }, { rows: [{ id: 20, agent: { name: "助手" } }] }])("预取和立即打开复用请求，保存首屏与游标 %j", async ({ rows }) => {
     const response = deferred<any>();
     const request = vi.fn(() => response.promise);

@@ -21,7 +21,7 @@ describe("pinned project conversation computer", () => {
     expect(resolvePersonalWorkspacePath("-1", "/work/new")).toBe("");
   });
 
-  it("keeps a non-regular project's bound computer", () => {
-    expect(resolvePinnedConversationSandboxId(pinned("UserApp", 307), "-1")).toBe("307");
+  it("does not specify an environment for a project without computer selection", () => {
+    expect(resolvePinnedConversationSandboxId(pinned("UserApp", 307), "-1")).toBe("");
   });
 });

@@ -1,0 +1,110 @@
+import { apiAgentConversation, apiAgentConversationUpdate } from "@/servers/conversation";
+import { AgentConversationUpdateParams } from "@/types/interfaces/agent";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+import { readRawField } from "@/subpackages/utils/messageInfoClass";
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { captureDrawerTitleContext, publishDrawerTitleChange } from "@/utils/drawerTitleSync";
+import { delegateTitleBootstrap } from "@/utils/titleBootstrapBridge";
+
+const pendingTitles = new Map<string, Promise<UTSJSONObject | null>>();
+const completedTitles = new Map<string, UTSJSONObject>();
+let titleSession = "";
+
+function topicIsDefined(info: any | null): boolean {
+  const topic = readRawField(info, "topic");
+  const updated = readRawField(info, "topicUpdated");
+  return (`${updated}` == "1" || `${updated}` == "true") && topic != null && `${topic}`.trim().length > 0;
+}
+
+/** 原始历史按时间正序；只用实际用户的正文，排除预置问题、助手和附件占位。 */
+export function firstUserTitlePrompt(raw: any | null): string {
+  if (raw == null) return "";
+  const rows = raw as any[];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const role = readRawField(row, "role");
+    const type = readRawField(row, "type");
+    if (`${role}` != "USER" || `${type}` == "GUID") continue;
+    const text = readRawField(row, "text");
+    if (text != null && `${text}`.trim().length > 0) return `${text}`.trim();
+  }
+  return "";
+}
+
+export async function ensureConversationTitleFromDetail(info: any | null): Promise<UTSJSONObject | null> {
+  if (info == null || topicIsDefined(info)) return null;
+  const idRaw = readRawField(info, "id");
+  const id = idRaw != null ? parseFloat(`${idRaw}`) : 0;
+  return await ensureConversationTitleFromPrompt(id, firstUserTitlePrompt(readRawField(info, "messageList")), info);
+}
+
+/** chat 请求发起即调用，与 SSE 首包、流完成和详情页面生命周期无关。 */
+export async function ensureConversationTitleFromPrompt(id: number, prompt: string, info: any | null = null): Promise<UTSJSONObject | null> {
+  const firstMessage = prompt.trim();
+  if (id != id || id <= 0 || firstMessage.length == 0) return null;
+  if (info != null && `${readRawField(info, "id")}` == `${id}` && topicIsDefined(info)) return null;
+  if (delegateTitleBootstrap("conversation", id, firstMessage, "")) return null;
+  const context = captureDrawerTitleContext();
+  if (titleSession != context.session) {
+    pendingTitles.clear();
+    completedTitles.clear();
+    titleSession = context.session;
+  }
+  const key = `${id}`;
+  const completed = completedTitles.get(key);
+  if (completed != null) return completed;
+  const pending = pendingTitles.get(key);
+  if (pending != null) return await pending;
+  const task = runConversationTitle(id, firstMessage, context.session);
+  pendingTitles.set(key, task);
+  try {
+    const result = await task;
+    if (result != null && context.session == getImSessionStamp()) completedTitles.set(key, result);
+    return result;
+  } finally {
+    if (pendingTitles.get(key) == task) pendingTitles.delete(key);
+  }
+}
+
+async function runConversationTitle(id: number, firstMessage: string, session: string): Promise<UTSJSONObject | null> {
+  const context = captureDrawerTitleContext();
+  // 总共三次尝试；失败不锁死，后续续接或再次发送仍可补偿。
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise<void>((resolve) => { setTimeout(() => { resolve(); }, attempt == 1 ? 1000 : 3000); });
+    }
+    if (session != getImSessionStamp()) return null;
+    try {
+      if (attempt > 0) {
+        // 写请求可能已成功但回包丢失；先查详情，也避免重试覆盖用户刚改好的名称。
+        const detail = await apiAgentConversation(id);
+        if (session != getImSessionStamp()) return null;
+        if (apiResCode(detail) != SUCCESS_CODE) continue;
+        const current = apiResData<any>(detail);
+        if (topicIsDefined(current)) {
+          const topic = `${readRawField(current, "topic")}`;
+          publishDrawerTitleChange("conversation", id, topic, "", context);
+          return current as UTSJSONObject;
+        }
+      }
+      const params = new AgentConversationUpdateParams();
+      params.id = id;
+      params.firstMessage = firstMessage;
+      const response = await apiAgentConversationUpdate(params);
+      if (session != getImSessionStamp()) return null;
+      if (apiResCode(response) != SUCCESS_CODE) continue;
+      const data = apiResData<any>(response);
+      const topic = readRawField(data, "topic");
+      if (topic == null || `${topic}`.trim().length == 0) continue;
+      const updated = readRawField(data, "topicUpdated");
+      // 明确仍未命名的回包不能被默认的“新会话”文本误判为成功。
+      if (updated != null && !topicIsDefined(data)) continue;
+      publishDrawerTitleChange("conversation", id, `${topic}`, "", context);
+      return data as UTSJSONObject;
+    } catch (_error) {
+      // 后台命名不打断聊天，不弹 toast；网络恢复后按退避重试。
+    }
+  }
+  return null;
+}

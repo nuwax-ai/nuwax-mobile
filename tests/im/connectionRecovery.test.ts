@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadUtsClass } from "./runtimeHarness";
 
-function clientFixture(options: { storageToken?: unknown; cookieToken?: string } = {}) {
+function clientFixture(options: { storageToken?: unknown; embedded?: boolean } = {}) {
   const callbacks: Record<string, Function> = {};
   const adapter = {
     connect: vi.fn(), close: vi.fn(), send: vi.fn(() => true), isOpen: () => true,
@@ -16,8 +16,7 @@ function clientFixture(options: { storageToken?: unknown; cookieToken?: string }
   const scope = {
     ACCESS_TOKEN: "token",
     uni: { getStorageSync: () => storageToken, onNetworkStatusChange: (f: Function) => callbacks.network = f },
-    getApiBaseUrl: () => "https://example.test", isAppWebViewEmbedded: () => false,
-    readCookie: () => options.cookieToken || "",
+    getApiBaseUrl: () => "https://example.test", isAppWebViewEmbedded: () => options.embedded !== false,
     isWorkCommercialBlockedSync: () => false,
     applyBearerAuthorization: () => {}, createImWsSocketAdapter: () => adapter,
     getImDeviceId: () => "device", apiImSync: sync, apiResData: (r: any) => r.data,
@@ -38,11 +37,25 @@ function clientFixture(options: { storageToken?: unknown; cookieToken?: string }
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 describe("IM connection recovery", () => {
-  it("uses the browser ticket cookie when storage has no access token", () => {
-    const f = clientFixture({ storageToken: "", cookieToken: "browser-ticket" });
+  it("uses only same-origin cookie auth in browser H5, even if storage has a token", () => {
+    const f = clientFixture({ storageToken: "must-not-be-used", embedded: false });
     f.client.start();
     expect(f.adapter.connect).toHaveBeenCalledTimes(1);
-    expect((f.adapter.connect.mock.calls[0] as any)[0]).toContain("access_token=browser-ticket");
+    expect((f.adapter.connect.mock.calls[0] as any)[0]).toBe("wss://example.test/ws");
+    expect(f.client.connectedToken).toBe("");
+  });
+
+  it("connects with the same-origin URL when the ticket cookie is HttpOnly", () => {
+    const f = clientFixture({ storageToken: "", embedded: false });
+    f.client.start();
+    expect(f.adapter.connect).toHaveBeenCalledTimes(1);
+    expect((f.adapter.connect.mock.calls[0] as any)[0]).toBe("wss://example.test/ws");
+  });
+
+  it("still waits for an explicit token inside an embedded app webview", () => {
+    const f = clientFixture({ storageToken: "", embedded: true });
+    f.client.start();
+    expect(f.adapter.connect).not.toHaveBeenCalled();
   });
 
   it("retries an error without relying on a subsequent close event", () => {

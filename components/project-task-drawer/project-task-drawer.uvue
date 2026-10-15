@@ -79,7 +79,7 @@
                 <image :src="group.pinned ? pinActiveIcon : pinIcon" class="project-pin-image" mode="aspectFit" />
               </view>
               <image v-if="!group.owner" :src="teamIcon" class="project-team-image" mode="aspectFit" />
-              <text class="project-name">
+              <text class="project-name" :lines="1">
                 {{ group.name }}
               </text>
               <!-- 类型标签（常规项目/网页应用/网站应用；未知类型文案为空串不渲染） -->
@@ -102,7 +102,7 @@
                   <svg-icon v-if="child.taskStatus == 'EXECUTING'" name="icon-Loader" size="24" color="#8b8e96" customClass="status-running" />
                   <svg-icon v-else name="icon-waring" size="24" color="#e54d4d" />
                 </view>
-                <text class="child-name">{{ child.name }}</text>
+                <text class="child-name" :lines="1">{{ child.name }}</text>
                 <text class="child-time">{{ child.timeLabel }}</text>
               </view>
               <!-- 子会话随列表回包（完整接口契约）：无会话仅显示空态文案，无在途/失败态 -->
@@ -142,6 +142,7 @@
           v-show="!taskSectionCollapsed"
           ref="taskListRef"
           :is-logged-in="isLoggedIn"
+          :is-visible="drawerDataVisible"
           :allow-silent-refresh="allowSilentRefresh"
           @conversation-click="relayConversationClick"
           @count-change="handleTaskCountChange"
@@ -177,6 +178,10 @@
   import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
   import eventBus from "@/utils/eventBus";
   import { EVENT_TYPE } from "@/constants/event.constants";
+  import { onTabPageShow, onTabPageHide } from "@/hooks/useMainTabLifecycle";
+  import { mainTabBarCovered } from "@/utils/mainTabNavigation";
+  import { DRAWER_TITLE_CHANGED, captureDrawerTitleContext, publishDrawerTitleChange } from "@/utils/drawerTitleSync";
+  import { beginDrawerTitleRead, resolveDrawerTitle } from "@/utils/drawerTitleState";
   import {
     apiAgentConversationUpdate,
     apiAgentConversationDelete,
@@ -268,6 +273,9 @@
     return `opacity: ${progress}; transition-duration: ${drawerDuration.value}ms;`;
   });
   const drawerVisible = ref<boolean>(false);
+  const drawerHostVisible = ref<boolean>(false);
+  // 抽屉在返回任务页时保留开合态；详情页或 iOS 聊天壳覆盖期间不能据此发起列表查询。
+  const drawerDataVisible = computed((): boolean => drawerVisible.value && drawerHostVisible.value && !mainTabBarCovered.value);
   const drawerInstance = getCurrentInstance();
   // 浏览列表下方时延后头部对账，防止新增/重排的行改变当前阅读位置。
   const allowSilentRefresh = ref<boolean>(true);
@@ -292,6 +300,8 @@
   let projectLoadedOnce = false;
   let projectDataGeneration = 0;
   let projectRequestPromise: Promise<boolean> | null = null;
+  let projectSilentRefreshPending = false;
+  let runProjectSilentRefresh: () => void = (): void => {};
   let projectFavoritesMigrationTriggered = false;
   // 分页游标：pageSize=20 + 触底加载 + 刷新追拉
   let projectNextPage = 1;
@@ -409,12 +419,25 @@
     return remaining > 0 ? `${base} (${remaining})` : base;
   });
 
+  function protectProjectTitles(groups: ProjectGroupView[], titleRevision: number): void {
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      group.name = resolveDrawerTitle("project", group.id, group.projectType, group.name, titleRevision);
+      for (let j = 0; j < group.children.length; j++) {
+        const child = group.children[j];
+        child.name = resolveDrawerTitle("conversation", child.id, "", child.name, titleRevision);
+      }
+    }
+  }
+
   /**
    * 拉一页项目并投影；返回 null=请求失败（调用方决定保留/中止），空数组=成功但无行。
    * 同时回写 projectTotalPagesCache。
    */
   async function fetchProjectPage(page: number): Promise<ProjectGroupView[] | null> {
+    if (!props.isLoggedIn || !drawerHostVisible.value || mainTabBarCovered.value) return null;
     const generation = projectDataGeneration;
+    const titleRevision = beginDrawerTitleRead();
     const res = await apiUserProjectTabPageQuery(page, PROJECT_PAGE_SIZE);
     if (generation != projectDataGeneration || apiResCode(res) != SUCCESS_CODE) {
       return null;
@@ -423,11 +446,48 @@
     projectTotalPagesCache = mapProjectTotalPages(data);
     projectTotalCountCache = mapProjectTotalCount(data);
     // 子会话随列表行回包直接映射；空主题兜底与任务列表「未命名会话」口径一致
-    return mapProjectTabResponse(data, formatTimeLabel, t("Mobile.Conversation.unnamed"));
+    const groups = mapProjectTabResponse(data, formatTimeLabel, t("Mobile.Conversation.unnamed"));
+    protectProjectTitles(groups, titleRevision);
+    return groups;
+  }
+
+  /** 滚动中只更新同身份的已有行，项目/子会话的顺序和数量均保持不变。 */
+  function mergeProjectTitles(incoming: ProjectGroupView[]): void {
+    let changed = false;
+    for (let i = 0; i < projectGroupsData.length; i++) {
+      const current = projectGroupsData[i];
+      for (let j = 0; j < incoming.length; j++) {
+        const fresh = incoming[j];
+        if (current.key != fresh.key) continue;
+        if (current.name != fresh.name) { current.name = fresh.name; changed = true; }
+        for (let c = 0; c < current.children.length; c++) {
+          for (let n = 0; n < fresh.children.length; n++) {
+            if (current.children[c].id != fresh.children[n].id) continue;
+            if (current.children[c].name != fresh.children[n].name) {
+              current.children[c].name = fresh.children[n].name;
+              changed = true;
+            }
+            break;
+          }
+        }
+        break;
+      }
+    }
+    if (changed) projectVersion.value++;
+  }
+
+  function flushPendingProjectRefresh(): void {
+    if (!projectSilentRefreshPending || !props.isLoggedIn || !drawerDataVisible.value || projectRequestPromise != null) return;
+    projectSilentRefreshPending = false;
+    const generation = projectDataGeneration;
+    setTimeout(() => {
+      if (generation == projectDataGeneration && props.isLoggedIn) runProjectSilentRefresh();
+    }, 0);
   }
 
   async function fetchProjects(): Promise<boolean> {
     const generation = projectDataGeneration;
+    const titleRevision = beginDrawerTitleRead();
     try {
       // 刷新：页码 1 起，前端过滤（归档）后可见行不足 MIN_VISIBLE_PROJECTS 时继续追拉
       // （归档项回包含但被过滤，单页可能稀疏；对齐 PC loadData(isRefresh) + chase）
@@ -458,6 +518,7 @@
       if (successCount == 0 || generation != projectDataGeneration) {
         return false;
       }
+      protectProjectTitles(acc, titleRevision);
       projectGroupsData = projectLoadedOnce ? reconcileProjectGroups(projectGroupsData, acc) : acc;
       projectNextPage = page;
       projectHasMore = computeProjectHasMore(page - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
@@ -490,6 +551,7 @@
     } finally {
       projectRequestPromise = null;
       projectLoading.value = false;
+      flushPendingProjectRefresh();
     }
   }
 
@@ -498,9 +560,20 @@
    * 并按项目 id 保留展开态与已加载子会话。用户看到的是原内容就地更新。
    */
   async function silentRefreshProjects(): Promise<boolean> {
-    if (!projectLoadedOnce || projectRequestPromise != null || !allowSilentRefresh.value) return false;
+    if (!props.isLoggedIn) return false;
+    if (!drawerDataVisible.value) {
+      projectSilentRefreshPending = true;
+      return false;
+    }
+    if (projectRequestPromise != null) {
+      projectSilentRefreshPending = true;
+      return false;
+    }
+    projectSilentRefreshPending = false;
+    if (!projectLoadedOnce) return await requestProjects();
     const loadedPages = projectNextPage > 1 ? projectNextPage - 1 : 1;
     const generation = projectDataGeneration;
+    const titleRevision = beginDrawerTitleRead();
     const run = async (): Promise<boolean> => {
       let acc: ProjectGroupView[] = [] as ProjectGroupView[];
       let lastCount = 0;
@@ -510,8 +583,13 @@
         lastCount = groups.length;
         acc = appendProjectGroupsDedup(acc, groups);
       }
-      // 请求期间可能已开始向下浏览；此时也不能把新数据插到视口上方。
-      if (!allowSilentRefresh.value || generation != projectDataGeneration) return false;
+      if (generation != projectDataGeneration) return false;
+      protectProjectTitles(acc, titleRevision);
+      // 请求期间可能已开始向下浏览；仅改文字，不把新行插到视口上方。
+      if (!allowSilentRefresh.value) {
+        mergeProjectTitles(acc);
+        return true;
+      }
       projectGroupsData = reconcileProjectGroups(projectGroupsData, acc);
       projectNextPage = loadedPages + 1;
       projectHasMore = computeProjectHasMore(loadedPages, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
@@ -528,8 +606,11 @@
       return false;
     } finally {
       projectRequestPromise = null;
+      flushPendingProjectRefresh();
     }
   }
+
+  runProjectSilentRefresh = (): void => { silentRefreshProjects(); };
 
   function toggleProjectExpand(groupKey: string): void {
     const group = findProjectGroup(groupKey);
@@ -836,8 +917,10 @@
       uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
       return Promise.resolve();
     }
+    const titleContext = captureDrawerTitleContext();
     const applyLocal = (): void => {
       group.name = newName;
+      publishDrawerTitleChange("project", group.id, newName, group.projectType, titleContext);
       projectVersion.value = projectVersion.value + 1;
       uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
     };
@@ -997,9 +1080,11 @@
     const updateParams = new AgentConversationUpdateParams();
     updateParams.id = child.id;
     updateParams.topic = newName;
+    const titleContext = captureDrawerTitleContext();
     return apiAgentConversationUpdate(updateParams).then((updateRes) => {
       if (apiResCode(updateRes) == SUCCESS_CODE) {
         child.name = newName;
+        publishDrawerTitleChange("conversation", child.id, newName, "", titleContext);
         projectVersion.value = projectVersion.value + 1;
         uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
       } else {
@@ -1302,16 +1387,15 @@
 
   function handlePopupVisible(visible: boolean): void {
     if (visible && drawerVisible.value) {
-      allowSilentRefresh.value = !refreshInFlight;
+      allowSilentRefresh.value = stickyLastScrollTop <= STICKY_TRIGGER_EPS && !refreshInFlight;
       return;
     }
     drawerVisible.value = visible == true;
     if (visible) {
       if (props.isLoggedIn && !projectLoadedOnce && projectRequestPromise == null) requestProjects();
-      stickyLastScrollTop = 0;
       taskHeaderContentOffset = -1;
       showFloatingTaskHeader.value = false;
-      allowSilentRefresh.value = !refreshInFlight;
+      allowSilentRefresh.value = stickyLastScrollTop <= STICKY_TRIGGER_EPS && !refreshInFlight;
     }
     if (!visible) resetDrawerSwipe();
   }
@@ -1331,20 +1415,15 @@
 
   /** 首页 onShow resume：抽屉开着时静默补差（任务头部 + 项目全量）。 */
   function resumeData(): void {
-    if (drawerVisible.value != true || !props.isLoggedIn) return;
+    if (!drawerDataVisible.value || !props.isLoggedIn) return;
     callRefMethod(taskListRef.value, "silentRefresh");
-    if (projectRequestPromise == null) {
-      silentRefreshProjects();
-    }
+    silentRefreshProjects();
   }
 
-  /** 对外：创建项目后强制刷新项目列表（无论抽屉是否打开，下次打开即见新项目）。 */
+  /** 创建项目后标记待刷新；抽屉实际可见时才查询，下次打开即可回读新项目。 */
   function refreshProjects(): void {
     if (!props.isLoggedIn) return;
-    if (projectRequestPromise == null) {
-      if (projectLoadedOnce) silentRefreshProjects();
-      else requestProjects();
-    }
+    silentRefreshProjects();
   }
 
   /**
@@ -1352,7 +1431,7 @@
    * （ref 短暂为 null），带短重试直到 ref 绑定。
    */
   function ensureTaskListLoaded(retries: number): void {
-    if (drawerVisible.value != true) return;
+    if (!drawerDataVisible.value) return;
     const inst = taskListRef.value;
     if (inst != null) {
       callRefMethod(inst, "loadIfEmpty");
@@ -1407,6 +1486,7 @@
     projectLoadingMore = true;
     projectLoadingMoreView.value = true;
     const generation = projectDataGeneration;
+    const titleRevision = beginDrawerTitleRead();
     const run = async (): Promise<boolean> => {
       const groups = await fetchProjectPage(projectNextPage);
       if (groups == null || generation != projectDataGeneration) return false;
@@ -1419,6 +1499,7 @@
         groups[g].expanded = false;
       }
       const lastCount = groups.length;
+      protectProjectTitles(groups, titleRevision);
       projectGroupsData = appendProjectGroupsDedup(projectGroupsData, groups);
       projectNextPage = projectNextPage + 1;
       projectHasMore = computeProjectHasMore(projectNextPage - 1, projectTotalPagesCache, lastCount, PROJECT_PAGE_SIZE);
@@ -1438,6 +1519,7 @@
       projectLoadingMore = false;
       projectLoadingMoreView.value = false;
       syncProjectLoadMoreState();
+      flushPendingProjectRefresh();
     }
   }
 
@@ -1463,12 +1545,12 @@
   }
 
   // 抽屉每次变为可见且子组件挂载完成后再触发任务列表首载（见 open() 注释）
-  watch(drawerVisible, (visible: boolean) => {
+  watch(drawerDataVisible, (visible: boolean) => {
     if (visible != true || props.isLoggedIn != true) return;
     nextTick(() => {
       ensureTaskListLoaded(8);
     });
-    if (projectLoadedOnce && projectRequestPromise == null) {
+    if (projectLoadedOnce) {
       silentRefreshProjects();
     }
     // 全端（09-21 Android/鸿蒙并入 scroll-view 路径）
@@ -1481,11 +1563,9 @@
    * 保证执行中/已完成状态及时更新。
    */
   function handleChatFinishedEvent(_data: any | null): void {
-    if (drawerVisible.value != true) return;
+    if (!drawerDataVisible.value) return;
     callRefMethod(taskListRef.value, "silentRefresh");
-    if (projectRequestPromise == null) {
-      silentRefreshProjects();
-    }
+    silentRefreshProjects();
   }
 
   // ★App-Android(UTS→Kotlin) 裸函数引用传 eventBus.on 绑不上回调（订阅静默失效）；
@@ -1494,10 +1574,10 @@
 
   /** 不依赖弹层 slot 挂载：项目存本组件，任务首屏放跨实例缓存。 */
   async function preloadDrawerData(): Promise<void> {
-    if (!props.isLoggedIn) return;
+    if (!props.isLoggedIn || !drawerHostVisible.value || mainTabBarCovered.value) return;
     const pending = projectRequestPromise;
     if (pending != null) await pending;
-    if (!props.isLoggedIn) return;
+    if (!props.isLoggedIn || !drawerHostVisible.value || mainTabBarCovered.value) return;
     if (!projectLoadedOnce) requestProjects();
     const loaded = await prefetchConversationList();
     if (loaded && props.isLoggedIn) callRefMethod(taskListRef.value, "loadIfEmpty");
@@ -1509,6 +1589,7 @@
       return;
     }
     projectDataGeneration++;
+    projectSilentRefreshPending = false;
     projectLoadedOnce = false;
     projectGroupsData = [] as ProjectGroupView[];
     projectHasMore = false;
@@ -1520,7 +1601,36 @@
     clearCachedConversationList();
   });
 
+  const onDrawerTitleChanged = (data: any): void => {
+    if (!props.isLoggedIn || data == null) return;
+    const payload = data as UTSJSONObject;
+    const id = payload["id"] != null ? parseFloat(`${payload["id"]}`) : 0;
+    const title = payload["title"] != null ? `${payload["title"]}` : "";
+    let changed = false;
+    for (let i = 0; i < projectGroupsData.length; i++) {
+      const group = projectGroupsData[i];
+      if (payload["kind"] == "project" && group.id == id && group.projectType == payload["projectType"]) {
+        group.name = title;
+        changed = true;
+      }
+      if (payload["kind"] == "conversation") {
+        for (let j = 0; j < group.children.length; j++) {
+          if (group.children[j].id == id) { group.children[j].name = title; changed = true; }
+        }
+      }
+    }
+    if (changed) projectVersion.value++;
+    silentRefreshProjects();
+  };
+
+  onTabPageShow(() => {
+    drawerHostVisible.value = true;
+    preloadDrawerData();
+  });
+  onTabPageHide(() => { drawerHostVisible.value = false; });
+
   onMounted(() => {
+    eventBus.on(DRAWER_TITLE_CHANGED, onDrawerTitleChanged);
     eventBus.on(`${EVENT_TYPE.ChatFinished}`, onChatFinishedEvent);
     preloadDrawerData();
     nextTick(() => {
@@ -1529,6 +1639,9 @@
   });
 
   onUnmounted(() => {
+    eventBus.off(DRAWER_TITLE_CHANGED, onDrawerTitleChanged);
+    projectDataGeneration++;
+    projectSilentRefreshPending = false;
     clearDrawerAnimation();
     if (drawerRegistryId != 0) unregisterPopupClose(drawerRegistryId);
     drawerRegistryId = 0;

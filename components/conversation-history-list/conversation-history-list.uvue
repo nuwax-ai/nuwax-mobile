@@ -24,7 +24,7 @@
             <image v-else-if="row.pinned" :src="pinIcon" class="task-pin-image" mode="aspectFit" />
             <svg-icon v-else name="icon-Star-fill" size="22" color="#faad14" customClass="task-status-collected" />
           </view>
-          <text class="task-title">{{ row.topic }}</text>
+          <text class="task-title" :lines="1">{{ row.topic }}</text>
           <!-- 行尾相对时间（2026-09-21 设计稿新增，取 modified） -->
           <text class="task-time">{{ row.timeLabel }}</text>
         </view>
@@ -44,7 +44,10 @@
 </template>
 
 <script setup lang="uts">
-  import { ref, computed, watch } from "vue";
+  import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+  import eventBus from "@/utils/eventBus";
+  import { DRAWER_TITLE_CHANGED, captureDrawerTitleContext, publishDrawerTitleChange } from "@/utils/drawerTitleSync";
+  import { beginDrawerTitleRead, protectConversationTitles } from "@/utils/drawerTitleState";
   import { SUCCESS_CODE } from "@/constants/codes.constants.uts";
   import {
     apiAgentConversationList,
@@ -79,6 +82,7 @@
 
   interface ConversationHistoryListProps {
     isLoggedIn: boolean;
+    isVisible: boolean;
     allowSilentRefresh: boolean;
   }
   const props = defineProps<ConversationHistoryListProps>();
@@ -123,6 +127,8 @@
   /** 服务端字段写侧更新后 bump，驱动列表重算 */
   const taskFlagsVersion = ref<number>(0);
   let conversationRequestPromise: Promise<boolean> | null = null;
+  let taskSilentRefreshPending = false;
+  let runTaskSilentRefresh: () => void = (): void => {};
   let taskDataGeneration = 0;
   let taskLoadedOnce = hasCachedConversationList();
   let favoritesMigrationTriggered = false;
@@ -231,35 +237,31 @@
     conversationList.value = merged;
   }
 
-  /** 静默查询任务头部 10 条，保留已加载列表、末尾游标和分页状态。 */
-  async function silentFetchTasks(): Promise<void> {
-    if (!props.isLoggedIn || !props.allowSilentRefresh || conversationList.value.length == 0 || conversationRequestPromise != null) return;
-    const generation = taskDataGeneration;
-    const run = async (): Promise<boolean> => {
-      const params = new ConversationListParams();
-      params.agentId = null;
-      params.lastId = null;
-      params.limit = SILENT_HEAD_SIZE;
-      // 与 PC「任务」分组一致：项目内会话只展示在项目子项，不在任务区重复。
-      params.projectFilter = "exclude";
-      const res = await apiAgentConversationList(params);
-      if (generation == taskDataGeneration && props.isLoggedIn && apiResCode(res) == SUCCESS_CODE && props.allowSilentRefresh) {
-        const newList = normalizeConversationList(apiResData<any>(res));
-        mergeConversationHead(newList);
-        return true;
+  /** 滚动中仅替换已有行的文字，不新增、删除、置顶或重排。 */
+  function mergeConversationTitles(incoming: UTSJSONObject[]): void {
+    let changed = false;
+    const current = conversationList.value;
+    for (let i = 0; i < current.length; i++) {
+      for (let j = 0; j < incoming.length; j++) {
+        if (toNum(current[i]["id"]) != toNum(incoming[j]["id"])) continue;
+        const topic = incoming[j]["topic"];
+        if (topic != null && current[i]["topic"] != topic) {
+          current[i]["topic"] = topic;
+          changed = true;
+        }
+        break;
       }
-      return false;
-    };
-    const requestPromise = run().catch((error): boolean => {
-      console.error("silentFetchTasks error:", error);
-      return false;
-    });
-    conversationRequestPromise = requestPromise;
-    try {
-      await requestPromise;
-    } finally {
-      conversationRequestPromise = null;
     }
+    if (changed) conversationList.value = current.slice(0);
+  }
+
+  function flushPendingTaskRefresh(): void {
+    if (!taskSilentRefreshPending || !props.isLoggedIn || !props.isVisible || conversationRequestPromise != null) return;
+    taskSilentRefreshPending = false;
+    const generation = taskDataGeneration;
+    setTimeout(() => {
+      if (generation == taskDataGeneration && props.isLoggedIn) runTaskSilentRefresh();
+    }, 0);
   }
 
   async function fetchTasks(isLoadMore: boolean): Promise<boolean> {
@@ -278,10 +280,12 @@
       params.lastId = isLoadMore ? lastId.value : null;
       params.limit = TASK_PAGE_SIZE;
       params.projectFilter = "exclude";
+      const titleRevision = beginDrawerTitleRead();
       const res = await apiAgentConversationList(params);
       if (generation == taskDataGeneration && props.isLoggedIn && apiResCode(res) == SUCCESS_CODE) {
         taskLoadedOnce = true;
         const newList = normalizeConversationList(apiResData<any>(res));
+        protectConversationTitles(newList, titleRevision);
         if (isLoadMore) {
           const existing = conversationList.value != null ? conversationList.value : ([] as UTSJSONObject[]);
           const combined: UTSJSONObject[] = [];
@@ -333,6 +337,10 @@
   }
 
   async function requestTasks(isLoadMore: boolean): Promise<boolean> {
+    if (!props.isVisible) {
+      taskSilentRefreshPending = true;
+      return false;
+    }
     const pending = conversationRequestPromise;
     if (pending != null) {
       return await pending;
@@ -352,8 +360,59 @@
     } finally {
       // 单飞入口保证同一时刻只有这一笔任务列表请求。
       conversationRequestPromise = null;
+      flushPendingTaskRefresh();
     }
   }
+
+  /** 对账已加载范围；浏览中只更新标题，结构变化等回到顶部再应用。 */
+  async function silentFetchTasks(): Promise<void> {
+    if (!props.isLoggedIn) return;
+    if (!props.isVisible) {
+      taskSilentRefreshPending = true;
+      return;
+    }
+    if (conversationRequestPromise != null) {
+      taskSilentRefreshPending = true;
+      return;
+    }
+    taskSilentRefreshPending = false;
+    if (conversationList.value.length == 0) {
+      await requestTasks(false);
+      return;
+    }
+    const generation = taskDataGeneration;
+    const titleRevision = beginDrawerTitleRead();
+    const run = async (): Promise<boolean> => {
+      const params = new ConversationListParams();
+      params.agentId = null;
+      params.lastId = null;
+      params.limit = Math.max(SILENT_HEAD_SIZE, conversationList.value.length);
+      // 与 PC「任务」分组一致：项目内会话只展示在项目子项，不在任务区重复。
+      params.projectFilter = "exclude";
+      const res = await apiAgentConversationList(params);
+      if (generation == taskDataGeneration && props.isLoggedIn && apiResCode(res) == SUCCESS_CODE) {
+        const newList = normalizeConversationList(apiResData<any>(res));
+        protectConversationTitles(newList, titleRevision);
+        if (props.allowSilentRefresh) mergeConversationHead(newList);
+        else mergeConversationTitles(newList);
+        return true;
+      }
+      return false;
+    };
+    const requestPromise = run().catch((error): boolean => {
+      console.error("silentFetchTasks error:", error);
+      return false;
+    });
+    conversationRequestPromise = requestPromise;
+    try {
+      await requestPromise;
+    } finally {
+      conversationRequestPromise = null;
+      flushPendingTaskRefresh();
+    }
+  }
+
+  runTaskSilentRefresh = (): void => { silentFetchTasks(); };
 
   /**
    * 列表投影（对齐 PC useHomeSectionData）：消费服务端 pinned 排前、
@@ -514,10 +573,12 @@
       const updateParams = new AgentConversationUpdateParams();
       updateParams.id = toNum(item["id"], 0);
       updateParams.topic = newName;
+      const titleContext = captureDrawerTitleContext();
       const updateRes = await apiAgentConversationUpdate(updateParams);
       if (apiResCode(updateRes) == SUCCESS_CODE) {
         uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
         item["topic"] = newName;
+        publishDrawerTitleChange("conversation", updateParams.id, newName, "", titleContext);
         const list = conversationList.value;
         conversationList.value = list != null ? list.slice(0) : ([] as UTSJSONObject[]);
       } else {
@@ -650,6 +711,10 @@
     if (pending != null) {
       await pending;
     }
+    if (!props.isVisible) {
+      taskSilentRefreshPending = true;
+      return;
+    }
     lastId.value = null;
     taskHasMore.value = true;
     await requestTasks(false);
@@ -657,19 +722,15 @@
 
   /** 静默头部补差（抽屉 resume / ChatFinished）。 */
   function silentRefresh(): void {
-    if (props.isLoggedIn && props.allowSilentRefresh && conversationList.value.length == 0) {
-      requestTasks(false);
-      return;
-    }
     silentFetchTasks();
   }
 
   /** 首次打开且无数据时拉第一页。 */
   async function loadIfEmpty(): Promise<void> {
-    if (!props.isLoggedIn) return;
+    if (!props.isLoggedIn || !props.isVisible) return;
     const pending = conversationRequestPromise;
     if (pending != null) await pending;
-    if (!props.isLoggedIn || conversationRequestPromise != null) return;
+    if (!props.isLoggedIn || !props.isVisible || conversationRequestPromise != null) return;
     if (taskLoadedOnce || conversationList.value.length > 0) {
       if (!favoritesMigrationTriggered) {
         favoritesMigrationTriggered = true;
@@ -699,6 +760,7 @@
     } finally {
       conversationRequestPromise = null;
       taskInitialLoading.value = false;
+      flushPendingTaskRefresh();
     }
   }
 
@@ -726,6 +788,7 @@
     (loggedIn: boolean): void => {
       if (loggedIn == true) return;
       taskDataGeneration++;
+      taskSilentRefreshPending = false;
       taskLoadedOnce = false;
       conversationList.value = [] as UTSJSONObject[];
       lastId.value = null;
@@ -734,6 +797,21 @@
       clearCachedConversationList();
     },
   );
+
+  const onDrawerTitleChanged = (data: any): void => {
+    if (!props.isLoggedIn || data == null) return;
+    const payload = data as UTSJSONObject;
+    if (payload["kind"] != "conversation") return;
+    const row: UTSJSONObject = { id: payload["id"], topic: payload["title"] };
+    mergeConversationTitles([row]);
+    silentRefresh();
+  };
+  onMounted(() => { eventBus.on(DRAWER_TITLE_CHANGED, onDrawerTitleChanged); });
+  onUnmounted(() => {
+    eventBus.off(DRAWER_TITLE_CHANGED, onDrawerTitleChanged);
+    taskDataGeneration++;
+    taskSilentRefreshPending = false;
+  });
 
   defineExpose({
     refresh: refresh as any,

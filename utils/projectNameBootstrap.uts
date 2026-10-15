@@ -16,8 +16,14 @@ import {
   UserProjectUpdateParams,
 } from "@/types/interfaces/projectInfo";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
+import { delegateTitleBootstrap } from "@/utils/titleBootstrapBridge";
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { captureDrawerTitleContext, publishDrawerTitleChange } from "@/utils/drawerTitleSync";
 
-let ensureInFlightKey = "";
+const ensureInFlightKeys = new Set<string>();
+// 已生成的名称/图标与写回分开：写回失败只重试保存，不重新生成图标。
+const generatedProjectInfo = new Map<string, UTSJSONObject>();
+let ensuredSession = "";
 const ensuredKeys: string[] = [] as string[];
 
 function readQueryString(options: UTSJSONObject, key: string): string {
@@ -142,16 +148,42 @@ export async function ensureProjectNameFromPrompt(
   if (trimmed.length == 0) {
     return;
   }
+  const session = getImSessionStamp();
+  if (ensuredSession != session) {
+    ensureInFlightKeys.clear();
+    generatedProjectInfo.clear();
+    ensuredKeys.splice(0, ensuredKeys.length);
+    ensuredSession = session;
+  }
   const key = projectEnsureKey(pType, projectId);
-  if (hasEnsured(key) == true || ensureInFlightKey == key) {
+  if (hasEnsured(key) == true || ensureInFlightKeys.has(key)) {
     return;
   }
-  ensureInFlightKey = key;
+  if (delegateTitleBootstrap("project", projectId, trimmed, pType)) return;
+  ensureInFlightKeys.add(key);
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        await new Promise<void>((resolve) => { setTimeout(() => { resolve(); }, attempt == 1 ? 1000 : 3000); });
+      }
+      if (session != getImSessionStamp()) return;
+      await tryEnsureProjectName(pType, projectId, trimmed, key);
+      if (hasEnsured(key)) return;
+    }
+  } finally {
+    if (session == getImSessionStamp()) ensureInFlightKeys.delete(key);
+  }
+}
+
+async function tryEnsureProjectName(pType: string, projectId: number, trimmed: string, key: string): Promise<void> {
+  const titleContext = captureDrawerTitleContext();
+  const session = titleContext.session;
   try {
     const detailRes =
       pType == "UserApp"
         ? await apiUserAppGetById(projectId)
         : await apiNormalProjectGetById(projectId);
+    if (session != getImSessionStamp()) return;
     if (apiResCode(detailRes) != SUCCESS_CODE) {
       return;
     }
@@ -162,26 +194,26 @@ export async function ensureProjectNameFromPrompt(
     const detailObj = detailRaw as UTSJSONObject;
     if (isNameDefined(detailObj["nameDefined"]) == true) {
       markEnsured(key);
+      const existingName = readGeneratedString(detailObj, "name").trim();
+      if (existingName.length > 0) publishDrawerTitleChange("project", projectId, existingName, pType, titleContext);
       return;
     }
     if (isNameUndefined(detailObj["nameDefined"]) != true) {
       return;
     }
 
-    // 生成项目信息
-    const generateRes = await apiAgentGenerateInfo(trimmed);
-    if (apiResCode(generateRes) != SUCCESS_CODE) {
-      return;
+    let generateObj = generatedProjectInfo.get(key);
+    if (generateObj == null) {
+      const generateRes = await apiAgentGenerateInfo(trimmed);
+      if (session != getImSessionStamp()) return;
+      if (apiResCode(generateRes) != SUCCESS_CODE) return;
+      const generateRaw = apiResData<any>(generateRes);
+      if (generateRaw == null) return;
+      generateObj = generateRaw as UTSJSONObject;
+      if (readGeneratedString(generateObj, "name").trim().length == 0) return;
+      generatedProjectInfo.set(key, generateObj);
     }
-    const generateRaw = apiResData<any>(generateRes);
-    if (generateRaw == null) {
-      return;
-    }
-    const generateObj = generateRaw as UTSJSONObject;
     const name = readGeneratedString(generateObj, "name").trim();
-    if (name.length == 0) {
-      return;
-    }
     const description = readGeneratedString(generateObj, "description");
     const icon = readGeneratedString(generateObj, "iconUrl");
     let updateOk = false;
@@ -215,14 +247,13 @@ export async function ensureProjectNameFromPrompt(
       const updateRes = await apiNormalProjectUpdate(params);
       updateOk = apiResCode(updateRes) == SUCCESS_CODE;
     }
+    if (session != getImSessionStamp()) return;
     if (updateOk == true) {
       markEnsured(key);
+      generatedProjectInfo.delete(key);
+      publishDrawerTitleChange("project", projectId, name, pType, titleContext);
     }
-  } catch (error) {
-    console.error("[ProjectName] ensureProjectNameFromPrompt failed:", error);
-  } finally {
-    if (ensureInFlightKey == key) {
-      ensureInFlightKey = "";
-    }
+  } catch (_error) {
+    // 后台生成失败交给外层退避重试，不阻断聊天。
   }
 }

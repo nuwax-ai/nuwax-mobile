@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { transformSync } from "esbuild";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const api = vi.hoisted(() => ({
   getNormalProject: vi.fn(),
@@ -9,6 +9,15 @@ const api = vi.hoisted(() => ({
   getUserApp: vi.fn(),
   updateUserApp: vi.fn(),
   generateInfo: vi.fn(),
+  publishTitle: vi.fn(),
+}));
+
+vi.mock("@/utils/titleBootstrapBridge", () => ({ delegateTitleBootstrap: () => false }));
+vi.mock("@/utils/im/imSessionScope", () => ({ getImSessionStamp: () => "test" }));
+
+vi.mock("@/utils/drawerTitleSync", () => ({
+  captureDrawerTitleContext: () => ({ session: "test", scope: "test-scope" }),
+  publishDrawerTitleChange: api.publishTitle,
 }));
 
 vi.mock("@/servers/project", () => ({
@@ -22,6 +31,7 @@ vi.mock("@/servers/project", () => ({
 let ensureProjectNameFromPrompt: typeof import("@/utils/projectNameBootstrap.uts").ensureProjectNameFromPrompt;
 
 beforeEach(async () => {
+  vi.useFakeTimers();
   vi.resetModules();
   vi.clearAllMocks();
   api.getNormalProject.mockResolvedValue({ code: "0000", data: { id: 111, nameDefined: false } });
@@ -33,6 +43,8 @@ beforeEach(async () => {
   api.updateUserApp.mockResolvedValue({ code: "0000" });
   ensureProjectNameFromPrompt = (await import("@/utils/projectNameBootstrap.uts")).ensureProjectNameFromPrompt;
 });
+
+afterEach(() => { vi.useRealTimers(); });
 
 // 执行会话组件真实发送入口及项目识别逻辑，保留真实命名工具，只隔离网络、声音和滚动。
 const source = readFileSync(new URL(
@@ -76,7 +88,7 @@ function setup(
     props: { isTempChat: false },
     AgentDetailUtils: { toSendMessageParamsObject: (payload: Record<string, unknown>) => ({ ...payload }) },
     getConvSetVariableParams: () => ({}),
-    service: { abortSubConversation: vi.fn(), handleSendMessage: vi.fn() },
+    service: { abortSubConversation: vi.fn(), handleSendMessage: vi.fn((_params, _temp, _timeout, started) => started?.()) },
     ttsWebSocketPlayer: { unlockInGesture: vi.fn() },
     asrWebSocketClient: { disableWarmupAndDisconnect: vi.fn() },
     interruptStreamSpeakPlayback: vi.fn(), streamSpeakAllowed: false,
@@ -84,10 +96,39 @@ function setup(
     streamingAssistantMessageId: { value: "" }, ensureHeadlessStreamSpeak: vi.fn(),
   };
   const send = runInNewContext(handlerCode, context) as (payload: Record<string, unknown>) => void;
-  return { ...context, send, waitForNameSync: () => Promise.all(pending) };
+  return { ...context, send, waitForNameSync: async () => { await vi.runAllTimersAsync(); await Promise.all(pending); } };
 }
 
 describe("个人电脑指定目录隐式创建常规项目后同步名称", () => {
+  it("chat 没有发起时不生成项目信息", async () => {
+    const page = setup();
+    page.service.handleSendMessage.mockImplementation(() => {});
+    page.send({ messageInfo: "开始任务" });
+    await page.waitForNameSync();
+    expect(api.generateInfo).not.toHaveBeenCalled();
+  });
+
+  it.each(["NormalProject", "UserApp"])("%s 图标为 null 时仍更新名称，后续消息不为图标重复生成", async type => {
+    api.generateInfo.mockResolvedValue({ code: "0000", data: { name: "简单任务", description: null, iconUrl: null } });
+    const page = type == "UserApp" ? setup({ id: 9527, devTargetType: "UserApp", devTargetId: 222 }, type, 222) : setup();
+    page.send({ messageInfo: "你好" });
+    await page.waitForNameSync();
+    page.send({ messageInfo: "再来一次" });
+    await page.waitForNameSync();
+    const update = type == "UserApp" ? api.updateUserApp : api.updateNormalProject;
+    expect(api.generateInfo).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update.mock.calls[0][0]).toMatchObject({ name: "简单任务", icon: null });
+  });
+
+  it("不同项目并行时，同一项目的生成也只发起一次", async () => {
+    const a = ensureProjectNameFromPrompt("NormalProject", 111, "项目 A");
+    const b = ensureProjectNameFromPrompt("NormalProject", 112, "项目 B");
+    const aAgain = ensureProjectNameFromPrompt("NormalProject", 111, "项目 A 重复");
+    await Promise.all([a, b, aAgain]);
+    expect(api.generateInfo).toHaveBeenCalledTimes(2);
+  });
+
   it("无 pType 时从当前会话识别项目，用首条消息生成并更新名称、描述和图标", async () => {
     const page = setup();
     const payload = {
@@ -103,6 +144,7 @@ describe("个人电脑指定目录隐式创建常规项目后同步名称", () =
     expect(api.updateNormalProject.mock.calls[0][0]).toMatchObject({
       id: 111, name: "目录任务项目", description: "根据首条消息生成的描述", icon: "/project-icon.png",
     });
+    expect(api.publishTitle).toHaveBeenCalledWith("project", 111, "目录任务项目", "NormalProject", expect.anything());
     expect(page.service.handleSendMessage).toHaveBeenCalledTimes(1);
     expect(page.service.handleSendMessage.mock.calls[0][0]).toMatchObject(payload);
     expect(api.getUserApp).not.toHaveBeenCalled();
@@ -170,6 +212,7 @@ describe("个人电脑指定目录隐式创建常规项目后同步名称", () =
     await page.waitForNameSync();
     expect(page.service.handleSendMessage).toHaveBeenCalledTimes(2);
     expect(api.updateNormalProject).toHaveBeenCalledTimes(2);
+    expect(api.generateInfo).toHaveBeenCalledTimes(1);
   });
 
   it("仅发送附件时不生成项目名称", async () => {
@@ -188,5 +231,6 @@ describe("个人电脑指定目录隐式创建常规项目后同步名称", () =
     expect(api.getNormalProject).not.toHaveBeenCalled();
     expect(api.getUserApp).toHaveBeenCalledExactlyOnceWith(222);
     expect(api.updateUserApp.mock.calls[0][0]).toMatchObject({ id: 222, name: "目录任务项目" });
+    expect(api.publishTitle).toHaveBeenCalledWith("project", 222, "目录任务项目", "UserApp", expect.anything());
   });
 });

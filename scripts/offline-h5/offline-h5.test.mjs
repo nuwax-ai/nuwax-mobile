@@ -216,6 +216,7 @@ test('history failures expose retry, and a timed-out or disposed page cannot con
     let failures = 0, rendered = 0, drafts = 0;
     const scope = {
       data, parseInt, pendingDraftReadyConversationId: 0, pendingDraftAgentMode: { value: '' },
+      service: { resetSandboxSelection() {} },
       captureProjectChatQuery() {}, projectChatPType: '', beginResidentChatBoot() {}, finishResidentChatBoot() {},
       eventBindConfig: { value: null }, parseEventBindConfig: () => ({}), props: { isTempChat: false },
       chatPageDisposed: result === 'disposed', chatPageBootFailed: { value: result === 'late-timeout' },

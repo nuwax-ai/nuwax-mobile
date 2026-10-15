@@ -1,5 +1,6 @@
 import { appendInlineThink, finalizeInlineThink } from "@/utils/inlineThink.uts";
 import { nextTick } from "vue";
+import { ensureConversationTitleFromPrompt, ensureConversationTitleFromDetail, firstUserTitlePrompt } from "@/utils/conversationTitleBootstrap";
 import { setMessageIdRewrite } from "@/utils/voice/speechIdRewrite";
 import {
   MessageInfo,
@@ -26,7 +27,6 @@ import type {
   EventConfig,
   EventArg,
   FileNode,
-  AgentConversationUpdateParams,
 } from "@/types/interfaces/agent";
 import type { SandboxInfo, SandboxListResponse } from "@/types/interfaces/sandbox";
 import {
@@ -85,7 +85,6 @@ import {
   apiAgentConversationCreate,
   apiAgentConversation,
   apiAgentConversationChatSuggest,
-  apiAgentConversationUpdate,
   apiAgentConversationChatStop,
   apiTempChatConversationStop,
   apiTempChatConversationQuery,
@@ -1381,6 +1380,7 @@ export default class AgentDetailService {
     }
     // Android: 通过 any 赋值跳过泛型运行时检查，避免 UTSJSONObject as ConversationInfo 异常
     this.data.conversationInfo.value = responseDataRaw as any;
+    if (!this.data.isTempChat.value) ensureConversationTitleFromDetail(responseDataRaw);
     const agentVal = this.toAgentJson(responseObj["agent"]);
     this.data.agentInfo.value = agentVal;
     if (agentVal != null) {
@@ -2445,6 +2445,7 @@ export default class AgentDetailService {
     // 是否是临时会话
     isTempChat: boolean = false,
     onTimeout : NullableTimeoutCallback,
+    onRequestStarted: NullableTimeoutCallback = null,
   ): Promise<void> {
     try {
       // 清空问题建议列表
@@ -2453,8 +2454,6 @@ export default class AgentDetailService {
       this.data.streamingAssistantText.value = "";
       this.data.streamingAssistantMessageId.value = currentMessageId;
 
-      // 标记是否已经更新过主题，确保只更新一次
-      let hasUpdatedTopic = false;
       // 本轮流代数；abort / 新开流后旧回调直接丢弃
       this.streamGeneration = this.streamGeneration + 1;
       this.pendingBackgroundReconnect = false;
@@ -2570,33 +2569,6 @@ export default class AgentDetailService {
               return;
             }
 
-            // 流式数据开始时，第一次收到数据时更新主题（只执行一次）
-            const convInfo = this.data.conversationInfo.value;
-            let topicUpdated = 0;
-            if (convInfo != null) {
-              const tuVal = readRawField(convInfo, "topicUpdated");
-              if (tuVal != null) {
-                topicUpdated = tuVal as number;
-              }
-            }
-
-            const topic = readRawField(convInfo, "topic");
-            if (
-              !hasUpdatedTopic &&
-              !isTempChat &&
-              this.data.needUpdateTopicRef.value &&
-              (topicUpdated != 1 || topic == null || topic == "") // 只有未更新过才会执行，避免重复修改标题
-            ) {
-              hasUpdatedTopic = true;
-              const convIdRaw = readRawField(params, "conversationId");
-              const messageRaw = readRawField(params, "message");
-              const convIdStr = convIdRaw != null ? `${convIdRaw}` : "";
-              const messageStr = messageRaw != null ? `${messageRaw}` : "";
-              if (convIdStr.length > 0 && messageStr.length > 0) {
-                this.handleUpdateTopic(convIdStr, messageStr);
-              }
-            }
-
             this.handleChangeMessageList(resultObj, currentMessageId);
           } catch (error) {
             console.error(
@@ -2649,6 +2621,14 @@ export default class AgentDetailService {
           }
           console.warn("[SSE-Stream] stream abnormal close / timeout");
           this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, false);
+        },
+        () => {
+          if (!isTempChat) {
+            const id = readRawField(params, "conversationId");
+            const prompt = firstUserTitlePrompt(this.data.messageList.value);
+            if (id != null) this.handleUpdateTopic(`${id}`, prompt);
+            if (onRequestStarted != null) (onRequestStarted as () => void)();
+          }
         },
       );
     } catch (error) {
@@ -3335,6 +3315,7 @@ export default class AgentDetailService {
         return;
       }
       const dataObj = dataRaw as UTSJSONObject;
+      ensureConversationTitleFromDetail(dataObj);
       const taskStatusRaw = dataObj["taskStatus"];
       const taskStatusStr =
         taskStatusRaw != null ? `${taskStatusRaw}` : "";
@@ -4032,6 +4013,7 @@ export default class AgentDetailService {
       }
       const convData = apiResData<ConversationInfo>(res);
       const convObj = convData != null ? (convData as UTSJSONObject) : null;
+      ensureConversationTitleFromDetail(convObj);
       let taskStatusStr = "";
       if (convObj != null) {
         const taskStatusRaw = convObj["taskStatus"];
@@ -4078,6 +4060,7 @@ export default class AgentDetailService {
     data: HandleSendMessageData | any,
     isTempChat: boolean = false,
     onTimeout: NullableTimeoutCallback = null,
+    onRequestStarted: NullableTimeoutCallback = null,
   ): Promise<void> {
     const dataObj = AgentDetailUtils.toSendMessageParamsObject(data);
     const messageInfo = dataObj["messageInfo"] as string | null;
@@ -4303,37 +4286,23 @@ export default class AgentDetailService {
         selectedDocs: dataObj["selectedDocs"],
       };
     }
-    this.handleConversation(params, currentMessageId, isTempChat, onTimeout);
+    this.handleConversation(params, currentMessageId, isTempChat, onTimeout, onRequestStarted);
   }
 
-  // 根据用户消息更新会话主题
-  async handleUpdateTopic(
-    conversationId: string,
-    messageInfo: string,
-  ): Promise<void> {
-    const params = new AgentConversationUpdateParams();
-    params.id = parseInt(conversationId);
-    params.firstMessage = messageInfo;
-
-    const res = await apiAgentConversationUpdate(params);
-    const code = apiResCode(res);
-    const responseData = apiResData<any>(res);
-    const message = apiResMessage(res);
-    if (code == SUCCESS_CODE) {
-      const topicUpdatedRaw = responseData != null ? (responseData as UTSJSONObject)["topicUpdated"] : null;
-      this.data.needUpdateTopicRef.value = topicUpdatedRaw != 1;
-      // 更新会话主题
-      const conv = this.data.conversationInfo.value;
-      if (conv != null && responseData != null) {
-        const convObj = JSON.parse(JSON.stringify(conv)) as UTSJSONObject;
-        convObj["topic"] = (responseData as UTSJSONObject)["topic"];
-        this.data.conversationInfo.value = convObj as any;
-      }
-    } else {
-      uni.showToast({
-        title: message != null ? message : "",
-        icon: "none",
-      });
+  // 成功一次后不再生成；失败由独立任务重试，不能用 SSE 首包充当成功标记。
+  async handleUpdateTopic(conversationId: string, messageInfo: string): Promise<void> {
+    const id = parseInt(conversationId);
+    const response = await ensureConversationTitleFromPrompt(id, messageInfo, this.data.conversationInfo.value);
+    if (response == null || this.data.conversationId.value != id) return;
+    const topic = readRawField(response, "topic");
+    if (topic == null || `${topic}`.trim().length == 0) return;
+    this.data.needUpdateTopicRef.value = false;
+    const conv = this.data.conversationInfo.value;
+    if (conv != null) {
+      const next = JSON.parse(JSON.stringify(conv)) as UTSJSONObject;
+      next["topic"] = topic;
+      next["topicUpdated"] = 1;
+      this.data.conversationInfo.value = next as any;
     }
   }
 

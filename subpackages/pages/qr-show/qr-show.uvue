@@ -1,10 +1,11 @@
 <template>
   <!--
     名片二维码独立页（我的页 / 群设置页共用，替代原 qr-card-popup 弹窗）：
-    - 正面：名字 + 账号/群号副题 + 二维码（view 叠加 /static/logo.png）+ tip 文案
+    - 正面：名字 + 账号/群号副题 + 二维码（view 叠加中央「名字方块」，替代原 logo 白垫）+ tip 文案
     - 点导航栏右上角链接 icon → 白色内容卡片翻转 180°（页面/导航不动，按钮在卡外随面切换）：
       背面在原二维码位置展示「{name}申请添加你为联系人，点击链接处理」+ 链接（群=群号引导 + 群号）
-    - 保存图片：惰性合成含 logo 的像素级方图（qrLogoPngDataUrl）存相册
+    - 保存图片：屏外 canvas 按模块矩阵重绘码 + 同款名字方块（贪心折两行 + measureText 截断）
+      → toDataURL 存相册；canvas 链路异常回退纯码图（qrPngDataUrl，无中央遮盖扫码率最优）
     - 二维码本地生成（encodeQr + qrPngDataUrl，纯 UTS 无网络依赖），内容按参数页内重建
       （buildUserCardUrl / buildGroupCardContent，与扫一扫 match 对称）
     - 翻转用两段式（0→90° 换面 → -90°→0°），规避 backface-visibility 跨端支持风险；
@@ -41,20 +42,21 @@
               <text class="qs-qr-state__text">{{ t("Mobile.Qr.generateFailed") }}</text>
             </view>
             <template v-else>
-              <!-- 不挂 @click 放大：放大图不含 logo 且长按保存会失败，统一走下方保存按钮 -->
+              <!-- 不挂 @click 放大：放大图不含名字胶囊且长按保存会失败，统一走下方保存按钮 -->
               <image
                 class="qs-qr-image"
                 :src="dataUrl"
                 mode="aspectFit"
                 :fade-show="false"
               />
-              <!-- 中央 logo 白垫（显示层叠加，保存时才做像素合成）：
-                   尺寸对齐保存图口径 k 模块（v4 码 ≈72rpx / v5 ≈75rpx），取 84rpx 视觉居中 -->
-              <view class="qs-qr-logo-pad">
-                <image class="qs-qr-logo" src="/static/logo.png" mode="aspectFit" />
+              <!-- 中央名字方块（显示层叠加，替代原 logo 白垫）：白色圆角方块 + 名字最多两行省略；
+                   边长 140rpx（遮盖 ~10% < ECL M 15% 纠错余量，且不碰 timing/定位/校正图形）；
+                   名字为空不显示（保存图同步跳过）。保存图由屏外 canvas 等比重绘（drawSaveQr） -->
+              <view v-if="cardName.length > 0" class="qs-qr-name-tile">
+                <text class="qs-qr-name-text">{{ cardName }}</text>
               </view>
-              <!-- 吞触摸蒙层：鸿蒙等端 image 原生长按会弹无 logo 的预览/保存菜单，
-                   叠透明 view 让长按落不到 image 上（码图与 logo 都罩住），存图只走保存按钮 -->
+              <!-- 吞触摸蒙层：鸿蒙等端 image 原生长按会弹无名字的预览/保存菜单，
+                   叠透明 view 让长按落不到 image 上（码图与方块都罩住），存图只走保存按钮 -->
               <view class="qs-qr-guard" />
             </template>
           </view>
@@ -91,6 +93,17 @@
         </view>
       </view>
     </view>
+
+    <!-- 保存合成画布（屏外常驻）：点保存时按模块矩阵重绘码 + 中央名字方块 → toDataURL；
+         width/height 组件属性 = 绘制缓冲区尺寸（App/Web 端再用 Element 强制对齐一遍，
+         小程序端无同步 Element API 只能依赖该属性）；任何环节异常由调用方回退纯码图 -->
+    <canvas
+      id="qsSaveCanvas"
+      type="2d"
+      :width="saveCanvasPx"
+      :height="saveCanvasPx"
+      class="qs-save-canvas"
+    />
   </view>
 </template>
 
@@ -100,7 +113,7 @@
   import CustomNavBar from "@/components/custom-nav-bar/custom-nav-bar.uvue";
   import { encodeQr } from "@/utils/qrcode/qrcodeEncoder";
   import type { QrEncodeResult } from "@/utils/qrcode/qrcodeEncoder";
-  import { qrPngDataUrl, qrLogoPngDataUrl } from "@/utils/qrcode/qrPng";
+  import { qrPngDataUrl } from "@/utils/qrcode/qrPng";
   import { saveQrImageToAlbum, qrImageFileName } from "@/utils/qrImageSave";
   import { buildUserCardUrl, buildGroupCardContent } from "@/utils/scanRouter";
   import { writeClipboardText } from "@/utils/clipboard";
@@ -119,17 +132,16 @@
   // ===== 二维码生成态（loading | failed | done，纯字符串避免枚举串化平台分歧）=====
   const state = ref<string>("loading");
   const dataUrl = ref<string>("");
-  /** 编码结果暂存（保存时合成 logo 版用；模板不读，普通 let 即可） */
+  /** 编码结果暂存（保存时 canvas 重绘用；模板不读，普通 let 即可） */
   let qrResult: QrEncodeResult | null = null;
   /** 码内容（个人=名片 URL，群=group#群号[#convId]；页面内重建不透传） */
   let qrContent = "";
-  /** 含 logo 保存图（惰性合成 + 模块级缓存：raw 百万级 Number，勿放渲染路径） */
-  let logoDataUrlCache = "";
 
-  /** 保存图 scale：显示用 12（≈492px），相册保存提到 16（v4~v6 ≈592~720px）。
-   *  再高内存/耗时翻倍收益小——清晰度主要靠 logo 源 64→192（保存图 logo 区
-   *  ~112~128px，192 源近原生不再拉伸发糊）；qrPng 侧行模板+IDAT 直写已把
-   *  纯计算降维，剩余耗时为字节物化（第二次保存走缓存瞬时） */
+  /** 保存合成画布边长（px）：与显示槽 440rpx 等比换算胶囊/字号（×800/440），
+   *  清晰度高于屏幕显示且与原纯码保存图（592~720px）同量级；再大内存/耗时翻倍收益小 */
+  const saveCanvasPx = 800;
+
+  /** 纯码兜底图 scale（canvas 链路异常时用 qrPngDataUrl：v4~v6 ≈592~720px） */
   const SAVE_SCALE = 16;
 
   // ===== 翻转态 =====
@@ -214,7 +226,7 @@
 
   // ===== 生命周期与生成（generateQr 须先于 onLoad 声明：UTS 不提升）=====
 
-  /** 生成展示用二维码（不含 logo：显示层 view 叠加；参数沿用弹窗 scale=12/border=2） */
+  /** 生成展示用二维码（不含中央胶囊：显示层 view 叠加；参数沿用弹窗 scale=12/border=2） */
   function generateQr(): void {
     if (qrContent.length == 0) {
       state.value = "failed";
@@ -270,9 +282,279 @@
     }, 190);
   }
 
+  // ===== 保存图合成（屏外 canvas：码矩阵重绘 + 中央名字方块）=====
+
+  /** measureText 可用性探测（缺席的端走定长启发） */
+  function ctxMeasurable(ctx: CanvasRenderingContext2D): boolean {
+    try {
+      ctx.measureText("测");
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  /** 名字按宽度截断（measureText 逐字回退 + 补省略号；measure 缺席按 heuristicChars 定长截） */
+  function fitNameToWidth(
+    ctx: CanvasRenderingContext2D,
+    name: string,
+    maxWidth: number,
+    heuristicChars: number,
+  ): string {
+    if (!ctxMeasurable(ctx)) {
+      return name.length > heuristicChars ? name.substring(0, heuristicChars - 1) + "…" : name;
+    }
+    if (ctx.measureText(name).width <= maxWidth) {
+      return name;
+    }
+    let txt = name;
+    while (txt.length > 1) {
+      txt = txt.substring(0, txt.length - 1);
+      if (ctx.measureText(txt + "…").width <= maxWidth) {
+        return txt + "…";
+      }
+    }
+    return "…";
+  }
+
+  /** 贪心取第一行（宽度内最长前缀，至少 1 字符；measure 缺席按 heuristicChars 定长） */
+  function greedyFirstLine(
+    ctx: CanvasRenderingContext2D,
+    name: string,
+    maxWidth: number,
+    heuristicChars: number,
+  ): string {
+    if (!ctxMeasurable(ctx)) {
+      return name.length > heuristicChars ? name.substring(0, heuristicChars) : name;
+    }
+    let cur = "";
+    for (let i = 0; i < name.length; i++) {
+      const test = cur + name.charAt(i);
+      if (ctx.measureText(test).width <= maxWidth) {
+        cur = test;
+      } else {
+        break;
+      }
+    }
+    if (cur.length == 0) {
+      cur = name.charAt(0);
+    }
+    return cur;
+  }
+
+  /** 名字方块折行：单行装得下→1 行；否则贪心两行，尾行超宽复用 fitNameToWidth 截断（…） */
+  function wrapNameForSquare(
+    ctx: CanvasRenderingContext2D,
+    name: string,
+    maxWidth: number,
+    heuristicChars: number,
+  ): Array<string> {
+    const lines: Array<string> = [];
+    if (ctxMeasurable(ctx) && ctx.measureText(name).width <= maxWidth) {
+      lines.push(name);
+      return lines;
+    }
+    const line1 = greedyFirstLine(ctx, name, maxWidth, heuristicChars);
+    const rest = name.substring(line1.length);
+    if (rest.length == 0) {
+      lines.push(line1);
+      return lines;
+    }
+    lines.push(line1);
+    lines.push(fitNameToWidth(ctx, rest, maxWidth, heuristicChars));
+    return lines;
+  }
+
+  /** 圆角矩形路径（roundRect App 端不支持 → 四角 arc 手拼；显式 false 顺时针方向） */
+  function roundRectPath(
+    ctx: CanvasRenderingContext2D,
+    x0: number,
+    y0: number,
+    w: number,
+    h: number,
+    r: number,
+  ): void {
+    ctx.beginPath();
+    ctx.moveTo(x0 + r, y0);
+    ctx.lineTo(x0 + w - r, y0);
+    ctx.arc(x0 + w - r, y0 + r, r, (-Math.PI) / 2, 0, false);
+    ctx.lineTo(x0 + w, y0 + h - r);
+    ctx.arc(x0 + w - r, y0 + h - r, r, 0, Math.PI / 2, false);
+    ctx.lineTo(x0 + r, y0 + h);
+    ctx.arc(x0 + r, y0 + h - r, r, Math.PI / 2, Math.PI, false);
+    ctx.lineTo(x0, y0 + r);
+    ctx.arc(x0 + r, y0 + r, r, Math.PI, (Math.PI * 3) / 2, false);
+    ctx.closePath();
+  }
+
+  /** 重绘保存图到 ctx：白底 + 模块矩阵（整数像素无毛边）+ 中央名字方块（与显示层 440rpx 槽等比）。
+   *  W=绘制坐标空间边长：首遍=标称画布边长；若导出实测缓冲区更大/更小按实测值整幅重画 */
+  function drawSaveQr(ctx: CanvasRenderingContext2D, res: QrEncodeResult, W: number): void {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, W, W);
+
+    // 码矩阵：整数模块像素居中（border=2 与显示/纯码兜底同口径）
+    const size = res.size;
+    const border = 2;
+    const mpx = Math.floor(W / (size + border * 2));
+    const codePx = mpx * (size + border * 2);
+    const off = Math.floor((W - codePx) / 2);
+    ctx.fillStyle = "#000000";
+    for (let my = 0; my < size; my++) {
+      for (let mx = 0; mx < size; mx++) {
+        if (res.modules[my * size + mx]) {
+          ctx.fillRect(off + (border + mx) * mpx, off + (border + my) * mpx, mpx, mpx);
+        }
+      }
+    }
+
+    // 中央名字方块：几何与显示层（440rpx 槽）等比——140rpx 方形 / 圆角 20rpx /
+    // 内距 16rpx / 字号 24rpx / 文字区宽 108rpx（最多两行，对齐 lines:2）；
+    // font 只写「字号 + 字族」最小形态（weight 前缀在 App 端解析有失败先例，宁缺毋滥）
+    if (cardName.value.length == 0) {
+      return;
+    }
+    const s = W / 440;
+    const tile = Math.round(140 * s);
+    const radius = Math.round(20 * s);
+    const pad = Math.round(16 * s);
+    const fontPx = Math.round(24 * s);
+    const textW = tile - pad * 2;
+    const heuristicChars = Math.max(1, Math.floor(textW / fontPx));
+    ctx.font = `${fontPx}px sans-serif`;
+    const lines = wrapNameForSquare(ctx, cardName.value, textW, heuristicChars);
+
+    const cx = W / 2;
+    roundRectPath(ctx, cx - tile / 2, cx - tile / 2, tile, tile, radius);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+
+    // 文字：默认 alphabetic 基线 + 左对齐（不设 textAlign/textBaseline，规避端差异），
+    // 水平按实测宽度居中，垂直基线 = cy ± 行高/2 + 0.35×字号（近似视觉居中）
+    ctx.fillStyle = "#1c1b20";
+    const lineH = fontPx * 1.42; // 对齐显示层 line-height 34/24
+    if (lines.length == 1) {
+      const tw = ctx.measureText(lines[0]).width;
+      ctx.fillText(lines[0], cx - tw / 2, cx + fontPx * 0.35);
+    } else {
+      const baseTop = cx - lineH / 2 + fontPx * 0.35;
+      for (let li = 0; li < lines.length; li++) {
+        const tw = ctx.measureText(lines[li]).width;
+        ctx.fillText(lines[li], cx - tw / 2, baseTop + li * lineH);
+      }
+    }
+  }
+
+  /** 读 PNG dataUrl 的 IHDR 宽高（护栏校验导出尺寸；返回 [w, h]，非 PNG/解析失败 [-1, -1]） */
+  function pngSizeFromDataUrl(dataUrl: string): Array<number> {
+    const prefix = "data:image/png;base64,";
+    if (dataUrl.indexOf(prefix) != 0) {
+      return [-1, -1];
+    }
+    const b64 = dataUrl.substring(prefix.length, prefix.length + 32); // 32 字符 → 24 字节
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let buf = 0;
+    let bits = 0;
+    const bytes: Array<number> = [];
+    for (let i = 0; i < b64.length; i++) {
+      const v = alphabet.indexOf(b64.charAt(i));
+      if (v < 0) {
+        break;
+      }
+      buf = (buf << 6) | v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        bytes.push((buf >> bits) & 0xff);
+        if (bytes.length >= 24) {
+          break;
+        }
+      }
+    }
+    if (bytes.length < 24 || bytes[0] != 0x89 || bytes[12] != 0x49 || bytes[13] != 0x48) {
+      return [-1, -1]; // 非 PNG 或结构异常（0x49/0x48 = "IH"）
+    }
+    // PNG 签名 8B + IHDR 长度 4B + "IHDR" 4B → 宽 BE32 位于 16..19、高 20..23
+    const w = (bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19];
+    const h = (bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23];
+    return [w, h];
+  }
+
+  /** 屏外 canvas 合成保存图 → dataUrl（reject = 任一环节异常，调用方回退纯码图）。
+   *  各失败点打 [QrSave] 探针日志（复验后移除）：真机 logcat grep QrSave 定位断点 */
+  function composeSaveImage(res: QrEncodeResult): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      // App/Web：先对齐缓冲区再取 context（小程序端无同步 Element API，依赖 :width/:height 属性）
+      // #ifdef APP || H5 || WEB
+      const el = uni.getElementById("qsSaveCanvas");
+      if (el != null) {
+        const cv = el as UniCanvasElement;
+        cv.width = saveCanvasPx;
+        cv.height = saveCanvasPx;
+      } else {
+        console.log("[QrSave] element miss (getElementById null)");
+      }
+      // #endif
+      uni.createCanvasContextAsync({
+        id: "qsSaveCanvas",
+        success: (cctx) => {
+          const ctx = cctx.getContext("2d");
+          if (ctx == null) {
+            console.log("[QrSave] ctx null");
+            reject(new Error("canvas 2d context null"));
+            return;
+          }
+          let exported = "";
+          try {
+            drawSaveQr(ctx, res, saveCanvasPx);
+            exported = cctx.toDataURL();
+          } catch (e) {
+            console.log("[QrSave] draw/export err", e);
+            reject(new Error("draw or export error"));
+            return;
+          }
+          // ★自适应缓冲区：canvas 坐标=缓冲区像素（官方口径 offsetWidth×dpr + ctx.scale），
+          // 各端缓冲区未必等于标称 800（dpr 缩放 / :width 属性未生效）。实测导出尺寸
+          // 为方形且≠标称 → 按实测边长整幅重画一遍（坐标空间随之放大/缩小，几何等比不变）
+          let dims = pngSizeFromDataUrl(exported);
+          let w = dims[0];
+          const h = dims[1];
+          if (w > 0 && h > 0 && w == h && w != saveCanvasPx) {
+            console.log(`[QrSave] buffer ${w} != ${saveCanvasPx}, redraw`);
+            try {
+              drawSaveQr(ctx, res, w);
+              exported = cctx.toDataURL();
+              dims = pngSizeFromDataUrl(exported);
+              w = dims[0];
+            } catch (e) {
+              console.log("[QrSave] redraw err", e);
+              reject(new Error("redraw error"));
+              return;
+            }
+          }
+          // 护栏：非方形缓冲区（如小程序默认 300×150）画不满整幅→残图，一律回退纯码；
+          // 方形但 <400px 分辨率过低保名不保清晰，同样回退；PNG 解析不出（非 PNG 导出）
+          // 则只靠长度护栏。全白空图经真压缩 base64 仅几 KB，正常码图在数百 KB 量级
+          const sizeOk = (w < 0 || dims[1] < 0) || (w == dims[1] && w >= 400);
+          if (exported.indexOf("data:image/") != 0 || !sizeOk || exported.length < 60000) {
+            console.log(`[QrSave] export bad w=${w} h=${dims[1]} len=${exported.length}`);
+            reject(new Error("canvas export suspicious"));
+            return;
+          }
+          console.log(`[QrSave] ok w=${w} len=${exported.length}`);
+          resolve(exported);
+        },
+        fail: (err) => {
+          console.log("[QrSave] cca fail", err);
+          reject(new Error("createCanvasContextAsync fail"));
+        },
+      });
+    });
+  }
+
   // ===== 操作 =====
 
-  /** 保存图片：惰性合成含 logo 方图（同一码只合成一次）→ 跨端落相册 */
+  /** 保存图片：canvas 重绘含名字方块方图（异常回退纯码图）→ 跨端落相册 */
   async function handleSaveImage(): Promise<void> {
     if (saving.value || state.value != "done") {
       return;
@@ -282,19 +564,21 @@
       return;
     }
     saving.value = true;
-    // ★让一帧给渲染：合成是同步重计算会冻结 JS 线程，不让帧则「保存中...」
-    // 按钮态画不出来（真机实测像卡死）。反馈只用按钮态（文案+半透明），
-    // 不用 showLoading——遮罩的出现/消失在快操作下本身就是一次全屏闪动
+    // ★让一帧给渲染：反馈只用按钮态（文案+半透明），不用 showLoading——
+    // 遮罩的出现/消失在快操作下本身就是一次全屏闪动
     await new Promise<void>((resolve) => {
       setTimeout(() => {
         resolve();
       }, 50);
     });
     try {
-      if (logoDataUrlCache.length == 0) {
-        logoDataUrlCache = qrLogoPngDataUrl(res, SAVE_SCALE, 2);
+      let dataUrlToSave = "";
+      try {
+        dataUrlToSave = await composeSaveImage(res);
+      } catch (_e) {
+        // canvas 链路异常（上下文拿不到/缓冲区口径不对/导出可疑）→ 纯码兜底
+        dataUrlToSave = qrPngDataUrl(res, SAVE_SCALE, 2);
       }
-      const dataUrlToSave = logoDataUrlCache;
       await saveQrImageToAlbum(dataUrlToSave, qrImageFileName(cardName.value));
     } catch (_e) {
       // 失败提示已由保存链路分类弹出（权限引导/失败 toast），此处仅复位态
@@ -434,13 +718,14 @@
     height: 440rpx;
   }
 
-  /* 中央 logo 白垫（显示层）：尺寸对齐保存图 k 模块口径，圆角轻阴影浮于码上 */
-  .qs-qr-logo-pad {
+  /* 中央名字方块：绝对定位居中（140rpx 方形，圆角/轻阴影沿用原 logo 白垫观感），
+     文字区定宽 108rpx（=140 - 左右 padding 16×2）保证折行口径与保存图一致 */
+  .qs-qr-name-tile {
     position: absolute;
-    left: 164rpx;
-    top: 164rpx;
-    width: 112rpx;
-    height: 112rpx;
+    left: 150rpx;
+    top: 150rpx;
+    width: 140rpx;
+    height: 140rpx;
     border-radius: 20rpx;
     background-color: #ffffff;
     box-shadow: 0 4rpx 16rpx rgba(0, 0, 0, 0.1);
@@ -448,11 +733,35 @@
     flex-direction: row;
     align-items: center;
     justify-content: center;
+    padding: 16rpx;
   }
 
-  .qs-qr-logo {
-    width: 84rpx;
-    height: 84rpx;
+  .qs-qr-name-text {
+    width: 108rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #1c1b20;
+    text-align: center;
+    /* #ifndef H5 */
+    lines: 2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    /* #endif */
+    /* #ifdef H5 */
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    /* #endif */
+  }
+
+  /* 保存合成画布：屏外常驻（fixed 负偏移不产生滚动条；原生端屏外仅裁剪不回收渲染） */
+  .qs-save-canvas {
+    position: fixed;
+    left: -3000px;
+    top: 0;
+    width: 800px;
+    height: 800px;
   }
 
   .qs-card__tip {

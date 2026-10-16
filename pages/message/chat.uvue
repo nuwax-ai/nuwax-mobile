@@ -860,11 +860,13 @@
               <text class="chat-reply-preview__text text-ellipsis">{{ replyPreviewText }}</text>
             </view>
             <view class="chat-input-content">
+              <!-- maxlength=-1 解除字数硬顶（超 2000 字改由发送时弹窗问是否转
+                   .txt 文件发送，见 promptLongTextAsFile；勿改回数字——uni 默认 140） -->
               <textarea
                 id="chat-input-textarea"
                 class="chat-input"
                 v-model="inputText"
-                :maxlength="2000"
+                :maxlength="-1"
                 :auto-height="chatInputAutoHeight"
                 :placeholder="t('Mobile.Message.inputPlaceholder')"
                 placeholder-style="color:#b0aebc;line-height:48rpx;"
@@ -1241,7 +1243,7 @@
         <textarea
           class="chat-expand-sheet__input"
           v-model="inputText"
-          :maxlength="2000"
+          :maxlength="-1"
           :placeholder="t('Mobile.Message.inputPlaceholder')"
           placeholder-style="color:#b0aebc;line-height:48rpx;"
           :show-confirm-bar="false"
@@ -1748,6 +1750,14 @@
   const tCount = (key: string, count: number): string => {
     const m = new Map<string, string | number>();
     m.set("count", count);
+    return translateFn(key, toI18nParams(m), "");
+  };
+
+  /** 超长文案弹窗正文（count/limit 双参数：当前 N 字、阈值 2000 字）。 */
+  const tLongText = (key: string, count: number, limit: number): string => {
+    const m = new Map<string, string | number>();
+    m.set("count", count);
+    m.set("limit", limit);
     return translateFn(key, toI18nParams(m), "");
   };
 
@@ -3708,8 +3718,7 @@
     const text = inputText.value;
     const needsSpace = text.length > 0 && text.charAt(text.length - 1) != " " && text.charAt(text.length - 1) != "\n";
     const insert = `${needsSpace ? " " : ""}@${token} `;
-    const next = text + insert;
-    inputText.value = next.substring(0, 2000);
+    inputText.value = text + insert;
   }
 
   /** 键盘敲 @ 检测用的输入快照：watch 跟随一切改写（发送清空/表情/提及回填/编辑等），
@@ -7404,6 +7413,137 @@
     return true;
   }
 
+  /** 超长文案转文件的字数阈值（企微同款口径：会话消息超长即询问转文档发出）。 */
+  const LONG_TEXT_AS_FILE_THRESHOLD = 2000;
+
+  /** 纯文本直发：handleSend 尾段抽函数——超长弹窗的「直接发送 / 回落」分支复用同一路径。 */
+  function sendPlainTextNow(text: string): void {
+    const body = applyActiveMarks(text);
+    inputText.value = "";
+    const clientMsgId = generateUUID();
+    const row = new ImMsgRow();
+    row.msgId = `local-${clientMsgId}`;
+    row.clientMsgId = clientMsgId;
+    row.local = true;
+    row.bodyText = body;
+    const scan = scanMentions(body);
+    row.mentionIds = scan.ids;
+    row.mentionAll = scan.all;
+    applyRichToRow(row);
+    applyQuoteToRow(row);
+    row.sendTime = Date.now();
+    row.status = 0;
+    messages.value.push(row);
+    scrollToBottom();
+    sendWithRow(row);
+  }
+
+  function fallbackLongTextToPlain(text: string): void {
+    uni.showToast({ title: t("Mobile.Message.longTextFileFail"), icon: "none" });
+    sendPlainTextNow(text);
+  }
+
+  /** 转文件展示名：正文首个非空行取前 16 字（过滤路径非法字符、防截半个代理对），截不出则用兜底名。 */
+  function longTextFileName(text: string): string {
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      let head = lines[i].trim();
+      if (head.length == 0) {
+        continue;
+      }
+      // 先判长再截：Kotlin substring 越界会抛异常，不能像 JS 直接 substring(0, 16)
+      if (head.length > 16) {
+        head = head.substring(0, 16);
+      }
+      // 尾字符是高位代理（emoji 被截半）则丢弃，避免落出无效码元
+      const lastCode = head.charCodeAt(head.length - 1) ?? 0;
+      if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+        head = head.substring(0, head.length - 1);
+      }
+      // App 端 RegExp 替换不稳定（i18n fillTemplate 同款教训），手扫替换路径非法字符
+      let safe = "";
+      for (let j = 0; j < head.length; j++) {
+        const ch = head.charAt(j);
+        if ("/\\:*?\"<>|".indexOf(ch) >= 0) {
+          safe += " ";
+        } else {
+          safe += ch;
+        }
+      }
+      safe = safe.trim();
+      if (safe.length > 0) {
+        return `${safe}.txt`;
+      }
+    }
+    return `${t("Mobile.Message.longTextFileFallbackName")}.txt`;
+  }
+
+  /**
+   * 超长文案转 .txt 文件发送：正文原样落盘（不走 applyActiveMarks——加粗等
+   * 编辑态标记是气泡富文本语法，进纯文本文件反而露码），写盘成功走文件管线；
+   * 失败 toast 后回落纯文本直发。USER_DATA_PATH 沙盒内文件，写入先例 pcmToWav/qrImageSave。
+   * ★须定义在 queueMediaRow / longTextFileName / fallbackLongTextToPlain 之后（UTS→Kotlin 先用后定义报错）。
+   */
+  function sendLongTextAsTxtFile(text: string): void {
+    const filePath = `${uni.env.USER_DATA_PATH}/long-text-${Date.now()}.txt`;
+    try {
+      uni.getFileSystemManager().writeFile({
+        filePath: filePath,
+        data: text,
+        // 合法值是带连字符的 "utf-8"（WriteFileOptions 枚举：ascii/base64/utf-8），
+        // 写成 "utf8" Android 运行时写盘失败 → 回落纯文本发送
+        encoding: "utf-8",
+        success: (_res): void => {
+          inputText.value = "";
+          queueMediaRow(filePath, longTextFileName(text), false);
+        },
+        fail: (err): void => {
+          const errMsg = err != null ? `${err.errMsg ?? ""}` : "";
+          console.error(`[chat] long text -> txt write failed: ${errMsg}`);
+          fallbackLongTextToPlain(text);
+        },
+      });
+    } catch (error) {
+      console.error("[chat] long text -> txt write threw:", error);
+      fallbackLongTextToPlain(text);
+    }
+  }
+
+  /**
+   * 超长文案发送（企微同款弹窗）：App 端询问「转文本文件发送 / 直接发送文本」。
+   * 确认 → 正文原样落盘 .txt，走文件消息管线 queueMediaRow（乐观行/上传/引用全复用）；
+   * 取消或模态异常 → 回落纯文本直发，不吞消息。H5/小程序端无落盘能力，
+   * 不弹窗直接按文本发送（维持纯文本）。
+   * ★须定义在 sendPlainTextNow / sendLongTextAsTxtFile 之后（UTS→Kotlin 先用后定义报错）。
+   */
+  function promptLongTextAsFile(text: string): void {
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    // 输入框 hold-keyboard：iOS 弹窗前键盘不收，会盖住 showModal 下半部（Android 无此问题）。
+    // 先收键盘再弹（收起沿的让位插值由键盘 hide 事件自行驱动，无需 predict 抢跑）
+    uni.hideKeyboard({ complete: () => {} });
+    uni.showModal({
+      title: t("Mobile.Message.longTextFileTitle"),
+      content: tLongText("Mobile.Message.longTextFileContent", text.length, LONG_TEXT_AS_FILE_THRESHOLD),
+      confirmText: t("Mobile.Message.longTextFileConfirm"),
+      cancelText: t("Mobile.Message.longTextFileCancel"),
+      success: (res): void => {
+        if (res.confirm) {
+          sendLongTextAsTxtFile(text);
+        } else {
+          sendPlainTextNow(text);
+        }
+      },
+      fail: (_err): void => {
+        sendPlainTextNow(text);
+      },
+    });
+    return;
+    // #endif
+    // #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
+    sendPlainTextNow(text);
+    // #endif
+  }
+
   function handleSend(): void {
     if (pageTapSwallowed()) {
       return;
@@ -7428,24 +7568,13 @@
     if (dispatchStagedSend(text)) {
       return;
     }
-    const body = applyActiveMarks(text);
-    inputText.value = "";
-    const clientMsgId = generateUUID();
-    const row = new ImMsgRow();
-    row.msgId = `local-${clientMsgId}`;
-    row.clientMsgId = clientMsgId;
-    row.local = true;
-    row.bodyText = body;
-    const scan = scanMentions(body);
-    row.mentionIds = scan.ids;
-    row.mentionAll = scan.all;
-    applyRichToRow(row);
-    applyQuoteToRow(row);
-    row.sendTime = Date.now();
-    row.status = 0;
-    messages.value.push(row);
-    scrollToBottom();
-    sendWithRow(row);
+    // 超长文案（企微同款）：纯文本超阈值改走弹窗问「转 .txt 文件还是直接发文本」；
+    // 编辑态与暂存图分支不进此闸（改消息 / rich_text 各维持原样）
+    if (text.length > LONG_TEXT_AS_FILE_THRESHOLD) {
+      promptLongTextAsFile(text);
+      return;
+    }
+    sendPlainTextNow(text);
   }
 
   // ===== 语音消息播放（msgType=audio：页面级单一 InnerAudioContext，点气泡播放/再点停止复位） =====
@@ -9943,7 +10072,7 @@
         lines[last] = `- ${rest}`;
       }
     }
-    inputText.value = lines.join("\n").substring(0, 2000);
+    inputText.value = lines.join("\n");
     syncListKind();
   }
 
@@ -10155,12 +10284,11 @@
    *  在此不适用（空格也退得掉）。禁用仅视觉置灰，点击由退格函数空串早退兜底。 */
   const emojiBackEnabled = computed<boolean>((): boolean => inputText.value.length > 0);
 
-  /** 表情点选：追加到输入末尾（与 textarea maxlength=2000 同口径截断）。
+  /** 表情点选：追加到输入末尾（输入框已无字数硬顶，不截断）。
    *  顺带记一次常用表情（PC onUseEmoji 同款第二入口：面板点选插入即记账）。 */
   function handleEmojiTap(emo: string): void {
     recordEmojiUsage(emo);
-    const next = inputText.value + emo;
-    inputText.value = next.substring(0, 2000);
+    inputText.value = inputText.value + emo;
   }
 
   /**

@@ -1,0 +1,312 @@
+<template>
+  <!--
+    会话行内容组件（行级局部渲染）：头像盒（渐变取字兜底/群剪影/真图+未读角标）+
+    主体（名称/时间/草稿·摘要/免打扰图标）。
+    ★只抽内容不抽外壳：.chat-item 外壳（id/class 三态/五路触摸事件）留在 conv-list-pane
+    ——长按浮层测量协议靠 pane 作用域查 #row-*（createSelectorQuery 不穿透自定义组件，
+    行节点进了子组件 pane 就查不到，Stage 4 的 R1 结论）。
+    收益：闪灰/菜单高亮只写 pressedRowId/menuRowId（pane props）时，未变行的本组件
+    按 conv 对象身份整体跳过重渲染（displayConvName/Digest、convDraft、formatConvTime
+    等逐行求值不再全表重跑）。代价与约束：行显示依赖「新对象身份」——原位改字段后
+    必须换克隆再整表替换（见 im-row-helpers cloneConvRow 注释），数组替换点在页面侧。
+    事件：头像 @load/@error 上抛 pane（pane 再带 conv 上抛页面），其余行级手势都在外壳。
+  -->
+  <view class="chat-item__avatar-wrap" :style="avatarBoxStyle">
+    <!-- 名称取字兜底（飞书规则）：个人=名末 2 字（赵立坤→立坤）、群=前 4 字
+         两行 2+2（智能体平台研发组→智能/体平，同列表缩写去重）；拼名群
+         （用户a，用户b 式）走蓝底默认群剪影。真图 @load 后整层退场；@error 回场 -->
+    <view
+      v-if="conv.avatarLoaded != true || conv.avatarFailed == true"
+      :class="conv.fallbackMerged ? 'chat-item__avatar chat-item__avatar--solid' : 'chat-item__avatar'"
+      :style="{ backgroundImage: conv.fallbackMerged ? 'none' : avatarGradient(conv.displayName) }"
+    >
+      <image
+        v-if="conv.fallbackMerged"
+        class="chat-item__avatar-glyph"
+        :src="avatarDefaultGroup"
+        mode="aspectFit"
+      />
+      <view v-else class="chat-item__avatar-fallback">
+        <text :class="conv.fallbackLine2.length > 0 ? 'chat-item__avatar-fallback-text chat-item__avatar-fallback-text--sm' : 'chat-item__avatar-fallback-text'">{{ conv.fallbackLine1 }}</text>
+        <text v-if="conv.fallbackLine2.length > 0" class="chat-item__avatar-fallback-text chat-item__avatar-fallback-text--sm">{{ conv.fallbackLine2 }}</text>
+      </view>
+    </view>
+    <view
+      v-if="conv.avatarDisplay.length > 0 && conv.avatarFailed != true"
+      class="chat-item__avatar-clip"
+    >
+      <image
+        class="chat-item__avatar chat-item__avatar--img"
+        :src="conv.avatarDisplay"
+        mode="aspectFill"
+        :fade-show="false"
+        @load="onAvatarLoaded"
+        @error="onAvatarError"
+      />
+    </view>
+    <view v-if="conv.unreadCount > 0" :class="convBadgeCls(conv)">
+      <text class="chat-item__badge-text">{{ formatUnread(conv.unreadCount) }}</text>
+    </view>
+  </view>
+  <view class="chat-item__body">
+    <view class="chat-item__title-row">
+      <text class="chat-item__title text-ellipsis">{{ displayConvName(conv) }}</text>
+      <text class="chat-item__time">{{ formatConvTime(conv.lastMsgAt) }}</text>
+    </view>
+    <view class="chat-item__sub-row">
+      <!-- 草稿优先于末条消息摘要（微信式）；[草稿]前缀独立红字节点（text 无法局部染色） -->
+      <text v-if="convDraft(conv).length > 0" class="chat-item__draft">{{
+        t("Mobile.Message.draftPrefix")
+      }}</text>
+      <text
+        v-if="convDraft(conv).length > 0"
+        class="chat-item__sub text-ellipsis"
+        >{{ convDraft(conv) }}</text>
+      <text v-else class="chat-item__sub text-ellipsis">{{ displayConvDigest(conv) }}</text>
+      <image
+        v-if="conv.dnd"
+        class="chat-item__mark"
+        :src="iconMute"
+        mode="aspectFit"
+      />
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import iconMute from "@/static/icons/mute.png";
+  import avatarDefaultGroup from "@/static/images/avatar-default-group.png";
+  import { ImConvRow } from "./im-row-models.uts";
+  import {
+    avatarBoxStyle as avatarBoxStyleOf,
+    avatarGradient as avatarGradientOf,
+    convBadgeCls as convBadgeClsOf,
+    convDraft as convDraftOf,
+    displayConvDigest as displayConvDigestOf,
+    displayConvName as displayConvNameOf,
+    formatConvTime as formatConvTimeOf,
+    formatUnread as formatUnreadOf,
+  } from "./im-row-helpers.uts";
+
+  // 事件名须 kebab-case：App-Android 模板监听会把 camelCase 转小写导致收不到（同 panes 规约）
+  const emit = defineEmits<{
+    /** 头像真图 @load（pane 带 conv 上抛页面 handleConvAvatarLoaded：记缓存+整表重建退兜底层）。 */
+    "avatar-loaded": [];
+    /** 头像真图 @error（pane 带 conv 上抛页面 handleConvAvatarError：负缓存+兜底层回场）。 */
+    "avatar-error": [];
+  }>();
+
+  defineProps<{
+    /** 会话行数据（★对象身份驱动重渲染：字段变化的路径必须换克隆对象，见文件头注释）。 */
+    conv: ImConvRow;
+  }>();
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  // ★uvue 模板不能直接调用导入函数（invoke 解析失败）——本地 const 包装（Stage 1 同款）
+  const avatarBoxStyle = avatarBoxStyleOf;
+  const avatarGradient = (name: string): string => avatarGradientOf(name);
+  const convBadgeCls = (conv: ImConvRow): string => convBadgeClsOf(conv);
+  const convDraft = (conv: ImConvRow): string => convDraftOf(conv);
+  const displayConvDigest = (conv: ImConvRow): string => displayConvDigestOf(conv);
+  const displayConvName = (conv: ImConvRow): string => displayConvNameOf(conv);
+  const formatConvTime = (ts: number): string => formatConvTimeOf(ts);
+  const formatUnread = (count: number): string => formatUnreadOf(count);
+
+  function onAvatarLoaded(): void {
+    emit("avatar-loaded");
+  }
+
+  function onAvatarError(): void {
+    emit("avatar-error");
+  }
+</script>
+
+<style lang="scss" scoped>
+  /* ★本块自 conv-list-pane 迁入（行内容随组件走，App 端 scoped 样式按组件解析）；
+     contact-list-pane 仍持整份 .chat-item 全族（其行未组件化）——改此处行内家族
+     （avatar/body/title/sub/draft/mark/badge）须同步 contact-list-pane 与
+     conv-list-pane 各自副本（R5 同步注释）。外壳三态（--active/--menu-on/--pinned）
+     在 conv-list-pane。 */
+
+  /* 头像盒：46px 定值（px 化后与内联 avatarBoxStyle 同值；历史 iOS 小数 pt 削边问题
+     随整数 px 消失——子层 100% 跟随 wrap，勿再重写尺寸） */
+  .chat-item__avatar-wrap {
+    position: relative;
+    width: 46px;
+    height: 46px;
+    margin-right: 14px;
+    flex-shrink: 0;
+  }
+
+  /* 宽高 100% 随 wrap 实际布局帧（尺寸真源只在 wrap，子层勿再重写 rpx/px） */
+  .chat-item__avatar {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* 头像真图覆盖层：绝对定位于裁切容器内（真图 @load 后剪影兜底整层退场，仅加载期/失败期垫底）。
+     100% 随 clip 实际帧（尺寸真源唯一，见 wrap 注释） */
+  .chat-item__avatar--img {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+  }
+
+  /* 真图裁切容器：app-android 上 <image> 自身 border-radius 对个别渲染路径（SVG
+     data URL / 本地临时文件）不生效，真机方形透出（H5 是背景图恒被裁，故正常）——
+     独立容器 border-radius+overflow 兜底裁切。不裁整个 avatar-wrap 是为避开未读
+     角标（位于圆外的方形角区，会被圆形裁切削掉）。z-index 1 同原覆盖层，低于角标 2。
+     宽高 100% 随 wrap 实际帧（wrap 已内联整 pt，见其注释——勿在此重写尺寸）。 */
+  .chat-item__avatar-clip {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    overflow: hidden;
+    z-index: 1;
+  }
+
+  /* 头像兜底取字（飞书规则）：个人=名末 2 字（单行）、群=前 4 字两行 2+2（同列表去重），
+     底色沿用五色渐变板（avatarGradient，红色与未读角标同色易混淆已移除）；「用户a，用户b」式拼名群无语义词可取 →
+     蓝底默认群剪影（--solid，backgroundImage 置 none 露出底色） */
+  .chat-item__avatar--solid {
+    background-color: #337eff;
+  }
+
+  /* 取字容器：两行 column 居中（个人单行时只有 line1） */
+  .chat-item__avatar-fallback {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-item__avatar-fallback-text {
+    font-size: 16px;
+    line-height: 20px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  /* 两行（群 2+2）字号收小：17px×2 落在 46px 圈内不贴边 */
+  .chat-item__avatar-fallback-text--sm {
+    font-size: 13px;
+    line-height: 17px;
+  }
+
+  /* 默认群剪影 PNG：白色实心（透明底），28px 约占 46px 头像 6 成 */
+  .chat-item__avatar-glyph {
+    width: 28px;
+    height: 28px;
+  }
+
+  .chat-item__badge {
+    position: absolute;
+    /* 全平台统一落在头像容器内：App（Android/iOS）原生渲染按父容器边界裁剪越界子元素，
+       负偏移角标被 avatar-wrap 削平顶/右边；H5 浏览器实测同样裁右侧负偏移（悬浮式不成立）。
+       贴头像右上内缘保证完整圆形，跨端一致。 */
+    top: 0;
+    right: 0;
+    min-width: 19px;
+    height: 19px;
+    padding: 0 5px;
+    border-radius: 50%;
+    background-color: #ff4d4f;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    z-index: 2;
+  }
+
+  /* 免打扰会话的行内未读：红数字→灰数字（对齐飞书；tabBar 角标仍计入总数） */
+  .chat-item__badge--dnd {
+    background-color: #94929c;
+  }
+
+  .chat-item__badge-text {
+    font-size: 11px;
+    line-height: 13px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .chat-item__body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-item__title-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .chat-item__title {
+    flex: 1;
+    font-size: 17px;
+    line-height: 20.5px;
+    font-weight: 400;
+    color: #141416;
+  }
+
+  .chat-item__time {
+    margin-left: 8px;
+    flex-shrink: 0;
+    font-size: 13.5px;
+    line-height: 18px;
+    color: #8f959e;
+  }
+
+  /* 摘要行：摘要(flex 收缩截断) + 行尾状态图标（免打扰，对齐时间下方） */
+  .chat-item__sub-row {
+    margin-top: 4px;
+    display: flex;
+    flex-direction: row;
+    /* 图标在容器中垂直居中 */
+    align-items: center;
+  }
+
+  .chat-item__sub {
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    line-height: 17.5px;
+    color: #8f959e;
+  }
+
+  /* 草稿前缀（微信式红字，未读角标同色）：与摘要同行，固定宽不参与截断 */
+  .chat-item__draft {
+    margin-right: 4px;
+    flex-shrink: 0;
+    font-size: 14px;
+    line-height: 17.5px;
+    color: #ff4d4f;
+  }
+
+  /* 免打扰状态图标（摘要行右端，容器中垂直居中；置顶不再展示角标）。
+     盒子取摘要字号（14px）同大：素材为透明底铃铛（占画布 92%），
+     实际可见约 13px；H5 端可见层是 uni-image 内层 div 的 background（contain），
+     可见尺寸只由本盒子决定 */
+  .chat-item__mark {
+    width: 14px;
+    height: 14px;
+    margin-left: 4px;
+    flex-shrink: 0;
+  }
+</style>

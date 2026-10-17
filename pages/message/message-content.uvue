@@ -232,6 +232,8 @@
     assignContactFallbacks,
     assignConvFallbacks,
     assignSpaceFallbacks,
+    cloneConvRow,
+    cloneConvRows,
     displayConvName,
     isSystemConv,
     rebuildContactNameIndex,
@@ -783,7 +785,9 @@
     // 相对时间，由回页 onShow 的 scheduleIconTableRefresh 兜底刷出（onShow 先置
     // visible 再调度，此处守卫不会误伤回页首刷）
     if (!messagePageVisible || isAppInBackground()) return;
-    conversations.value = copyRows(conversations.value);
+    // ★会话行内容已抽 conv-row-item（按对象身份跳过重渲染）：头像回填/相对时间这类
+    // 原位改字段的显示刷新必须换行身份——深克隆整表；智联录行未组件化，浅拷即可
+    conversations.value = cloneConvRows(conversations.value);
     acceptedContacts.value = copyRows(acceptedContacts.value);
     pendingInContacts.value = copyRows(pendingInContacts.value);
     pendingOutContacts.value = copyRows(pendingOutContacts.value);
@@ -2283,13 +2287,9 @@
       conv.dnd = mute;
       // Android 不追踪 ref 数组内实例属性变更：conv.dnd 原地改不触发 v-for 行重渲，
       // icon 停在旧态直到下次整表重建（iOS 原生追踪属性所以即时）——整表重建赋值
-      // 强制三端一致重渲（removeConversation 同款，无 watch 副作用）
-      const refreshed: ImConvRow[] = [];
-      const list = conversations.value;
-      for (let i = 0; i < list.length; i++) {
-        refreshed.push(list[i]);
-      }
-      conversations.value = refreshed;
+      // 强制三端一致重渲（removeConversation 同款，无 watch 副作用）。★行内容已抽
+      // conv-row-item（按对象身份跳过）：须深克隆换行身份，浅拷重建行组件会跳过
+      conversations.value = cloneConvRows(conversations.value);
       uni.showToast({
         title: mute ? t("Mobile.Message.muteSuccess") : t("Mobile.Message.unmuteSuccess"),
         icon: "none",
@@ -2919,6 +2919,29 @@
   // - CONTACT_UPDATE：触发 GET /contacts 重拉通讯录（contract: 收到后只重拉）
   // - im_auth_invalid / im_kicked：让 useRequest 4010 链路接管，App.uvue 已 stopImWsClient
 
+  /** bumpRowToTop 的插入半段（行已不在列表中；供顶置与 WS 克隆更新路径共用）：
+   *  分区规则见 bumpRowToTop 注释。splice 即触发响应，无须再同引用回写 ref。
+   *  ★声明在 bumpRowToTop/handleImMessageReceived 之前（UTS 不提升，error18）。 */
+  function insertConvRowPromoted(row: ImConvRow): void {
+    const list = conversations.value;
+    if (row.topFlag) {
+      list.splice(0, 0, row);
+      return;
+    }
+    // 跳过置顶区；本行无草稿再跳过草稿区
+    const hasDraft = getChatDraft(row.convId).length > 0;
+    let insertAt = 0;
+    while (insertAt < list.length && list[insertAt].topFlag) {
+      insertAt++;
+    }
+    if (!hasDraft) {
+      while (insertAt < list.length && getChatDraft(list[insertAt].convId).length > 0) {
+        insertAt++;
+      }
+    }
+    list.splice(insertAt, 0, row);
+  }
+
   /**
    * 把一条 row 移到「其分区」最前（与 reorderConvRows 分区一致）：
    * 置顶行 → 置顶区最前（组内按最近消息时间降序，本函数仅在 lastMsgAt 更新为更大
@@ -2934,24 +2957,7 @@
     }
     // 从原位置移除
     list.splice(idx, 1);
-    if (row.topFlag) {
-      list.splice(0, 0, row);
-      conversations.value = list;
-      return;
-    }
-    // 跳过置顶区；本行无草稿再跳过草稿区
-    const hasDraft = getChatDraft(row.convId).length > 0;
-    let insertAt = 0;
-    while (insertAt < list.length && list[insertAt].topFlag) {
-      insertAt++;
-    }
-    if (!hasDraft) {
-      while (insertAt < list.length && getChatDraft(list[insertAt].convId).length > 0) {
-        insertAt++;
-      }
-    }
-    list.splice(insertAt, 0, row);
-    conversations.value = list;
+    insertConvRowPromoted(row);
   }
 
   function findConvRowById(convId: string): ImConvRow | null {
@@ -2984,9 +2990,17 @@
     const existing = findConvRowById(convId);
     const sendTime = readNumber(obj, "sendTime", 0);
     if (existing != null && sendTime > existing.lastMsgAt) {
-      existing.lastMsgDigest = readString(obj, "digest");
-      existing.lastMsgAt = sendTime;
-      bumpRowToTop(existing);
+      // ★换克隆再顶置：conv-row-item 按对象身份跳过重渲染，原位改摘要/时间行组件
+      // 会跳过、显示旧值；克隆新身份 → 插入后该行重渲染出新摘要/时间
+      const updated = cloneConvRow(existing);
+      updated.lastMsgDigest = readString(obj, "digest");
+      updated.lastMsgAt = sendTime;
+      const list = conversations.value;
+      const idx = list.indexOf(existing);
+      if (idx >= 0) {
+        list.splice(idx, 1);
+        insertConvRowPromoted(updated);
+      }
     }
     // 未读必须以服务端为准，自己发送/已读/重放都不能本地 +1。
   }
@@ -3034,7 +3048,14 @@
     }
     const existing = findConvRowById(convId);
     if (existing != null) {
-      existing.unreadCount = unread;
+      // ★换克隆原位替换：conv-row-item 按对象身份跳过重渲染，纯原位写三端都要等
+      // scheduleConvRefresh 全量回包才显示；克隆换身份 → 仅该行重渲染、角标即时
+      const idx = conversations.value.indexOf(existing);
+      if (idx >= 0) {
+        const updated = cloneConvRow(existing);
+        updated.unreadCount = unread;
+        conversations.value.splice(idx, 1, updated);
+      }
     }
 
   }
@@ -3243,7 +3264,9 @@
     // 每次激活都同步整表重渲染（问题1主因；隐藏期 reorder 输入只可能来自草稿：置顶
     // 仅本页可改、WS 本地更新本就有隐藏守卫）。版本号无快照（-1）时回退为必重建。
     if (chatDraftsVersion() != draftsVersionAtHide) {
-      conversations.value = reorderConvRows(copyRows(conversations.value));
+      // 深克隆（非浅 copyRows）：草稿是模块态，conv-row-item 读它靠行对象身份变化
+      // 触发重渲染——浅拷只换数组身份，行组件会跳过、草稿不上屏
+      conversations.value = reorderConvRows(cloneConvRows(conversations.value));
     }
     // 保留：兜底隐藏期异步解析的头像原地回填与相对时间刷新（50ms 后、激活首帧之外；
     // timer 回调内有手势/隐藏守卫，见 runIconTableRefresh）

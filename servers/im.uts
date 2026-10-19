@@ -1,5 +1,7 @@
 import request from "./useRequest";
 import { generateUUID } from "@/utils/common";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
 import type { RequestResponse } from "@/types/interfaces/request";
 
 const IM_DEVICE_BASE_ID_STORAGE_KEY = "NUWAX_IM_DEVICE_BASE_ID";
@@ -624,23 +626,98 @@ export async function apiImSendTextMsg(
 }
 
 /**
- * 会话成员列表（convMembers，群聊 @提及面板的数据源）。
+ * 会话成员列表·单页（convMembers；全量请用 apiImConvMembersAll）。
  *
- * 契约同 PC 端 convApi.listMembers：GET /conversations/{convId}/members，首屏
- * limit=100 单页（与 PC loadMembers 同口径）；响应 data = PageResult<ConversationMemberDto>，
- * 取 records 数组。★userId 是 int64 雪花号：H5 请求层已保精度，Android 端经
- * `${raw}` 转字符串存用。
+ * 契约同 PC 端 convApi.listMembers：GET /conversations/{convId}/members，limit=100；
+ * 响应 data = PageResult<ConversationMemberDto>，取 records 数组。cursor=afterUserId
+ * （上一页最后一条 userId 的十进制字符串，首页传空串）。
+ * ★userId 是 int64 雪花号：H5 请求层已保精度，Android 端经 `${raw}` 转字符串存用。
  */
 export async function apiImConvMembers(
   convId: string,
+  cursor: string,
 ): Promise<RequestResponse<any>> {
   const data = new UTSJSONObject();
   data["limit"] = 100;
+  if (cursor.length > 0) {
+    data["cursor"] = cursor;
+  }
   return await request({
     url: `/api/instant-message/conversations/${convId}/members`,
     method: "GET",
     data,
   });
+}
+
+/** apiImConvMembers 单页结果：records=本页原始行（ConversationMemberDto），
+ *  nextCursor=下一页游标（空串=末页；超阈值大群服务端降级恒为空）。 */
+export class ImConvMembersPage {
+  records: UTSJSONObject[] = [];
+  nextCursor: string = "";
+}
+
+/**
+ * 会话成员列表·单页解析版（首页/翻页逐页取数用；要一次拿全走 apiImConvMembersAll）。
+ *
+ * 契约（nuwax-im ImConversationApplicationService.listMembers + PageResult）：
+ * 服务端多取一条判 hasMore，nextCursor 非空串=还有下一页（值=本页末条 userId），
+ * 空串/缺省=末页。★超阈值大群（默认 >500 人）服务端降级：忽略 cursor 恒返首页
+ * 前 100 条且 nextCursor 为空（找具体人须走搜索，端上翻不动）。
+ * 返回 null=请求失败/响应缺 data（调用方自行决定重试语义）。
+ */
+export async function apiImConvMembersPage(
+  convId: string,
+  cursor: string,
+): Promise<ImConvMembersPage | null> {
+  const res = await apiImConvMembers(convId, cursor);
+  if (apiResCode(res) != SUCCESS_CODE) {
+    return null;
+  }
+  const dataRaw = apiResData<any>(res);
+  const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+  if (dataObj == null) {
+    return null;
+  }
+  const page = new ImConvMembersPage();
+  const recordsRaw = dataObj["records"];
+  if (recordsRaw != null) {
+    const records = recordsRaw as UTSJSONObject[];
+    for (let i = 0; i < records.length; i++) {
+      page.records.push(records[i]);
+    }
+  }
+  const nextRaw = dataObj["nextCursor"];
+  page.nextCursor = nextRaw == null ? "" : `${nextRaw}`;
+  return page;
+}
+
+/**
+ * 会话成员列表·全量（apiImConvMembersPage 翻页循环收敛，@提及面板 / 已读名单等
+ * 需要完整数据的数据源用）。
+ *
+ * 返回：成功=累计 records（空群为空数组）；任一页失败/响应缺 data=null——调用方
+ * 按整体失败处理（重试从头拉），不把半截名单当全量展示。护栏：至多 30 页
+ * （3000 人）+ nextCursor 与上轮相同即止，防服务端异常导致死循环。
+ */
+export async function apiImConvMembersAll(
+  convId: string,
+): Promise<UTSJSONObject[] | null> {
+  let cursor = "";
+  const all: UTSJSONObject[] = [];
+  for (let page = 0; page < 30; page++) {
+    const p = await apiImConvMembersPage(convId, cursor);
+    if (p == null) {
+      return null;
+    }
+    for (let i = 0; i < p.records.length; i++) {
+      all.push(p.records[i]);
+    }
+    if (p.nextCursor.length == 0 || p.nextCursor == cursor) {
+      return all;
+    }
+    cursor = p.nextCursor;
+  }
+  return all;
 }
 
 /**

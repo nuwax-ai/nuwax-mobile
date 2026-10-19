@@ -34,12 +34,14 @@
       />
     </view>
 
-    <!-- 成员列表（长按浮层期间锁滚动 direction=none；页面级触摸收浮层 + 吞击守卫，消息列表同款） -->
+    <!-- 成员列表（长按浮层期间锁滚动 direction=none；页面级触摸收浮层 + 吞击守卫，消息列表同款；
+         滚到底展开下一渲染窗——数据链后台自续，scroll-view 不回收行故按窗建行） -->
     <scroll-view
       class="gm-body"
       :direction="rowMenuVisible ? 'none' : 'vertical'"
       :show-scrollbar="false"
       @scroll="handleListScroll"
+      @scrolltolower="handleListReachLower"
       @touchstart="handlePageTouchStart($event)"
       @touchend="handlePageTouchEnd($event)"
       @touchcancel="handlePageTouchCancel($event)"
@@ -56,7 +58,7 @@
           操作项按行权限生成（设·撤管理员/添加到智联录/删除），点击经 handleRowMenuAct 分发。
           ★key 只用 userId：旧复合键（含 role/contactState）是给左滑按钮区宽度重建用的，已废。
         -->
-        <view v-for="m in filteredMembers" :key="m.userId">
+        <view v-for="m in visibleMembers" :key="m.userId">
           <view
             :id="`row-${m.userId}`"
             class="gm-row"
@@ -98,6 +100,13 @@
         </view>
         <view v-if="filteredMembers.length == 0" class="gm-state">
           <text class="gm-state__text">{{ t("Mobile.AgentSearch.emptyResult") }}</text>
+        </view>
+        <!-- 后台翻页链断：点此从断点续拉；链进行中 / 还有未展开渲染的行 → 加载中 -->
+        <view v-else-if="chainFailed" class="gm-state" @click="handleChainRetry">
+          <text class="gm-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+        </view>
+        <view v-else-if="tailLoading" class="gm-state">
+          <text class="gm-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
         </view>
         <view class="gm-tail" />
       </view>
@@ -174,7 +183,7 @@
     apiImAddContact,
     apiImContacts,
     apiImConvDetail,
-    apiImConvMembers,
+    apiImConvMembersPage,
     apiImGroupRemoveMember,
     apiImGroupSetMemberRole,
   } from "@/servers/im";
@@ -255,6 +264,39 @@
       }
     }
     return out;
+  });
+
+  // ===== 渐进加载与渐进渲染（terminal-group-members 同款思路，两层各管一事）：
+  //       ①数据：首页 100 条先渲染，后续页后台串行补齐（chainMembers）——链完成后
+  //         搜索过滤即全量口径；②渲染：scroll-view 不回收已建行，按 renderCount
+  //         步进建行，滚到底（scrolltolower）再展开下一窗，500 人群不一次建全量节点。 =====
+  /** 渲染窗口步长（行）：滚到底 +50。 */
+  const RENDER_STEP = 50;
+  /** 当前渲染窗口行数（loadAll 整表刷新时复位）。 */
+  const renderCount = ref<number>(RENDER_STEP);
+  /** 后台翻页链进行中（尾部「加载中」）。 */
+  const chainRunning = ref<boolean>(false);
+  /** 后台翻页链失败（尾部可点击重试：从断点 cursor 续拉）。 */
+  const chainFailed = ref<boolean>(false);
+  /** 翻页会话号：loadAll 每次自增，在途链晚归按号丢弃（重载/换群期间的旧响应）。 */
+  let membersSession = 0;
+  /** 后台链断点 cursor（空=已到末页；失败重试续拉用）。 */
+  let chainCursor = "";
+  /** 链已拉页数护栏（30 页=3000 人，防服务端异常 nextCursor 死循环）。 */
+  let chainPages = 0;
+
+  /** 渲染窗口：搜索过滤结果按 renderCount 切片（不满一窗=全量直出）。 */
+  const visibleMembers = computed((): GmMember[] => {
+    const all = filteredMembers.value;
+    if (all.length <= renderCount.value) {
+      return all;
+    }
+    return all.slice(0, renderCount.value);
+  });
+
+  /** 尾部「加载中」显隐：后台翻页进行中，或已过滤出但未展开渲染的行还有余量。 */
+  const tailLoading = computed((): boolean => {
+    return chainRunning.value || visibleMembers.value.length < filteredMembers.value.length;
   });
 
   // ===== 长按行操作浮层 / 页面触摸守卫（消息列表 message.uvue 同款，声明顺序满足
@@ -548,6 +590,36 @@
     return raw != null && `${raw}` == "true";
   }
 
+  /** ConversationMemberDto → 行模型（首页与翻页链逐页共用）。展示名：群卡片 >
+   *  我设的备注 > 平台昵称（有群名片优先展示群卡片，此时不再展示备注；成员接口
+   *  无备注，备注取模块缓存——消息页/资料页刷新联系人时会写，本页 onShow 重拉即同步）。
+   *  userId 为空返回 null（跳行）。 */
+  function parseMemberRow(record: UTSJSONObject): GmMember | null {
+    const m = new GmMember();
+    m.userId = readString(record, "userId");
+    if (m.userId.length == 0) {
+      return null;
+    }
+    m.name = readString(record, "name");
+    m.nickName = readString(record, "nickName");
+    m.avatarRaw = readString(record, "avatar");
+    m.avatar = imAvatarDisplayUrl(m.avatarRaw, 72);
+    m.role = readNumber(record, "role", 1);
+    m.self = readBool(record, "self");
+    const cachedRemarks = getCachedContactRemarks();
+    const myRemark = cachedRemarks == null
+      ? ""
+      : cachedRemarks.get(m.userId) ?? "";
+    m.token = m.nickName.length > 0
+      ? m.nickName
+      : myRemark.length > 0
+        ? myRemark
+        : m.name.length > 0
+          ? m.name
+          : `用户${m.userId}`;
+    return m;
+  }
+
   function readOption(options: any | null, key: string): string {
     if (options == null) {
       return "";
@@ -626,10 +698,13 @@
   }
 
   /** 批量解析头像展示地址（/api/f/ 受保护与远程 SVG；H5 裸连 <img> 会被 ORB 拦）。
-   * ★须在 members.value 赋值后调、行取自 ref 数组（响应式代理实例），异步写回才会
-   * 触发渲染刷新——建行期 new 出的裸实例上写回不刷新（message.uvue resolveConvRowsIcons 同款）。 */
+   * ★只解析渲染窗口内的行（visibleMembers：渐进渲染下窗口外的行滚到再解析，
+   * 500 人群不一次发起全量解析）；已解析的行跳过（avatar != raw），滚到底展开
+   * 新窗/换搜索词后再调即可。★须在 members.value 赋值后调、行取自 ref 数组派生
+   * 的窗口切片（行实例仍是响应式代理实例），异步写回才会触发渲染刷新——建行期
+   * new 出的裸实例上写回不刷新（message.uvue resolveConvRowsIcons 同款）。 */
   function resolveRowAvatars(): void {
-    const live = members.value;
+    const live = visibleMembers.value;
     for (let i = 0; i < live.length; i++) {
       const row = live[i];
       // ★跳过条件看「avatar 仍等于原始地址」：App 端未解析时 avatar=raw 透传非空，
@@ -645,6 +720,14 @@
           scheduleRowsRefresh();
         }
       });
+    }
+  }
+
+  /** 滚到底：展开下一渲染窗（数据链后台自续，这里只管建行）+ 补解析新窗头像。 */
+  function handleListReachLower(): void {
+    if (renderCount.value < filteredMembers.value.length) {
+      renderCount.value += RENDER_STEP;
+      resolveRowAvatars();
     }
   }
 
@@ -860,8 +943,19 @@
   /** 气泡根节点吞点击：点在气泡空白区不落穿到下方行/入口。 */
   function handleRowMenuPopTap(): void {}
 
-  /** 把 apiImContacts 的关系状态写到成员行（1/2/3 之外一律当无关系）。 */
-  async function markContacts(rows: GmMember[]): Promise<void> {
+  // ===== 智联录关系（原 markContacts 改「会话内一次拉取建表 + 逐页套用」：渐进
+  //       翻页下后续页的新行也要标，不必每页重拉整表关系）=====
+  /** 关系表（会话内缓存；null=拉取失败当无关系）。 */
+  let contactStates: Map<string, string> | null = null;
+  let contactStatesSession = -1;
+
+  /** 拉取智联录关系整表建 userId → status(1/2/3) 表（一次会话只拉一次，失败静默）。 */
+  async function ensureContactStates(session: number): Promise<void> {
+    if (contactStatesSession == session) {
+      return;
+    }
+    contactStatesSession = session;
+    contactStates = null;
     try {
       const res = await apiImContacts();
       if (apiResCode(res) != SUCCESS_CODE) {
@@ -877,30 +971,99 @@
         return;
       }
       const items = itemsRaw as UTSJSONObject[];
+      const map = new Map<string, string>();
       for (let i = 0; i < items.length; i++) {
         const id = readString(items[i], "userId");
         const st = readString(items[i], "status");
         if (id.length == 0 || (st != "1" && st != "2" && st != "3")) {
           continue;
         }
-        for (let j = 0; j < rows.length; j++) {
-          if (rows[j].userId == id) {
-            rows[j].contactState = st;
-          }
-        }
+        map.set(id, st);
       }
+      contactStates = map;
     } catch (_error) {
       // 静默
     }
   }
 
-  /** 详情（myRole/邀请开关）+ 成员列表 + 智联录关系标记。 */
+  /** 把关系表套到行上（1/2/3 之外一律当无关系；决定「添加到智联录」入口显隐）。 */
+  function applyContactStates(rows: GmMember[]): void {
+    const map = contactStates;
+    if (map == null) {
+      return;
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const st = map.get(rows[i].userId);
+      if (st != null && st.length > 0) {
+        rows[i].contactState = st;
+      }
+    }
+  }
+
+  /** 后台翻页补齐：从 cursor 起串行拉到末页，每页解析合并入表并重排（保持
+   *  群主→管理员→成员分区）；晚归按会话号丢弃（重载/换群期间的旧响应），失败
+   *  挂 chainFailed 由尾部点击续拉。loadAll 首屏渲染后点火即走、不 await。 */
+  async function chainMembers(session: number, startCursor: string): Promise<void> {
+    let cursor = startCursor;
+    while (cursor.length > 0 && chainPages < 30) {
+      chainCursor = cursor;
+      chainRunning.value = true;
+      chainFailed.value = false;
+      const page = await apiImConvMembersPage(convId.value, cursor);
+      if (session != membersSession) {
+        return; // 在途整表重载（onShow/角色变更/加人）：旧链作废，链状态由新会话复位
+      }
+      if (page == null) {
+        chainRunning.value = false;
+        chainFailed.value = true;
+        return;
+      }
+      chainPages++;
+      const rows = members.value;
+      const added: GmMember[] = [];
+      for (let i = 0; i < page.records.length; i++) {
+        const m = parseMemberRow(page.records[i]);
+        if (m != null) {
+          rows.push(m);
+          added.push(m);
+        }
+      }
+      applyContactStates(added);
+      rows.sort((a: GmMember, b: GmMember): number => b.role - a.role);
+      members.value = copyMembers(rows);
+      resolveRowAvatars();
+      if (page.nextCursor.length == 0 || page.nextCursor == cursor) {
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+    chainRunning.value = false;
+    chainFailed.value = false;
+    chainCursor = "";
+  }
+
+  /** 翻页链失败重试：从断点 cursor 续拉（同会话）。 */
+  function handleChainRetry(): void {
+    if (chainFailed.value && chainCursor.length > 0) {
+      chainMembers(membersSession, chainCursor);
+    }
+  }
+
+  /** 详情（myRole/邀请开关）+ 成员首页 + 智联录关系标记；后续页后台串行补齐。 */
   async function loadAll(): Promise<void> {
     if (convId.value.length == 0 || loading.value) {
       return;
     }
     loading.value = true;
     loadFailed.value = false;
+    // 新会话：在途翻页链作废，链状态与渲染窗口复位
+    membersSession++;
+    const session = membersSession;
+    chainRunning.value = false;
+    chainFailed.value = false;
+    chainCursor = "";
+    chainPages = 0;
+    renderCount.value = RENDER_STEP;
     try {
       const res = await apiImConvDetail(convId.value);
       if (apiResCode(res) == SUCCESS_CODE) {
@@ -912,46 +1075,17 @@
           allowInviteRaw = inviteRaw == null ? "" : `${inviteRaw}`;
         }
       }
-      const mres = await apiImConvMembers(convId.value);
-      if (apiResCode(mres) != SUCCESS_CODE) {
+      const page = await apiImConvMembersPage(convId.value, "");
+      if (page == null) {
         loading.value = false;
         loadFailed.value = true;
         return;
       }
-      const mdataRaw = apiResData<any>(mres);
-      const mdataObj = mdataRaw != null ? (mdataRaw as UTSJSONObject) : null;
       const out: GmMember[] = [];
-      if (mdataObj != null) {
-        const recordsRaw = mdataObj["records"];
-        if (recordsRaw != null) {
-          const records = recordsRaw as UTSJSONObject[];
-          for (let i = 0; i < records.length; i++) {
-            const m = new GmMember();
-            m.userId = readString(records[i], "userId");
-            m.name = readString(records[i], "name");
-            m.nickName = readString(records[i], "nickName");
-            m.avatarRaw = readString(records[i], "avatar");
-            m.avatar = imAvatarDisplayUrl(m.avatarRaw, 72);
-            m.role = readNumber(records[i], "role", 1);
-            m.self = readBool(records[i], "self");
-            // 展示名：群卡片 > 我设的备注 > 平台昵称（有群名片优先展示群名片，
-            // 此时不再展示备注；成员接口无备注，备注取模块缓存——消息页/资料页
-            // 刷新联系人时会写，本页 onShow 重拉即同步）
-            const cachedRemarks = getCachedContactRemarks();
-            const myRemark = cachedRemarks == null
-              ? ""
-              : cachedRemarks.get(m.userId) ?? "";
-            m.token = m.nickName.length > 0
-              ? m.nickName
-              : myRemark.length > 0
-                ? myRemark
-                : m.name.length > 0
-                  ? m.name
-                  : `用户${m.userId}`;
-            if (m.userId.length > 0) {
-              out.push(m);
-            }
-          }
+      for (let i = 0; i < page.records.length; i++) {
+        const m = parseMemberRow(page.records[i]);
+        if (m != null) {
+          out.push(m);
         }
       }
       // 群主(3)→管理员(2)→普通成员(1) 端上稳定分区排序：服务端 listMembers 走
@@ -963,7 +1097,15 @@
       loading.value = false;
       inited = true;
       // 智联录关系标记（决定「添加到智联录」按钮显隐）；失败静默=当无关系处理
-      await markContacts(out);
+      await ensureContactStates(session);
+      if (session != membersSession) {
+        return;
+      }
+      applyContactStates(out);
+      // 后台串行补齐后续页（>100 人群）；链完成前搜索只覆盖已到账行
+      if (page.nextCursor.length > 0) {
+        chainMembers(session, page.nextCursor);
+      }
     } catch (_error) {
       loading.value = false;
       loadFailed.value = true;
@@ -1189,9 +1331,11 @@
     loadAll();
   });
 
-  // 搜索过滤会整表重排（气泡锚定的行矩形失效）：输入即收浮层
+  // 搜索过滤会整表重排（气泡锚定的行矩形失效）：输入即收浮层；过滤结果换了一批
+  // 可见行（可能带未解析头像），补一轮窗口内头像解析
   watch(query, (_val: string) => {
     closeRowMenu();
+    resolveRowAvatars();
   });
 
   onShow(() => {

@@ -2249,6 +2249,14 @@
   let kbWatchdogTimer = 0;
   /** 看门狗标记：预抬后是否已有真值落地（任何 applyKeyboardHeight 均置 true）。 */
   let kbPredictConfirmed = false;
+  /** 键盘高度最近一次落地前的值 + 落地时间戳（含 predict 预抬）：判定升降沿方向与
+   *  动画窗（回声门 isKbEdgeEcho / scheduleIosKbApply 降沿门 / 余量快照写入门共用）。 */
+  let kbPrevLanded = 0;
+  let kbLandedTs = 0;
+  /** 最近一次输入框聚焦请求时间戳（主坞/展开面板/语音编辑卡三处 @focus 同步）：降沿
+   *  回声门的「真重开键盘」判据——真升起必先经聚焦（时间戳晚于 0 落地），聚焦先于
+   *  0 落地则是收起沿回声。★须声明在 isKbEdgeEcho/scheduleIosKbApply 之前（error18）。 */
+  let kbFocusReqTs = 0;
   /** onKeyboardHeightChange 监听 id（onLoad 注册、onUnload 按注销，防误伤全局其他监听）。 */
   let chatKeyboardListenerId = 0;
 
@@ -5810,8 +5818,13 @@
       const distBottom = parseFloat(`${endRect.top}`) - (parseFloat(`${bodyRect.top}`) + parseFloat(`${bodyRect.height}`));
       // 让位平移量记账：余量快照驱动 bodyShiftPx 插值（clamp），发送/翻页后探测刷新即
       // 连续重定目标——末行始终齐输入坞上缘，不满屏不触发滚动（无溢出可滚），满屏后交回
-      // scroll-into-view 贴底（此时主体已全量平移，与旧刚体行为一致）
-      bodySlackPx.value = distBottom;
+      // scroll-into-view 贴底（此时主体已全量平移，与旧刚体行为一致）。
+      // 让位过渡窗内（升降 250ms + dock 安全区 padding 收放）distBottom 处于布局中间态：
+      // 此刻写入会让 bodyShiftPx 中途重定目标＝二段抖动，跳过；窗后首次探测自然校准
+      //（浮钮/贴底态与让位无关，照常刷新）
+      if (Date.now() - kbLandedTs >= 400) {
+        bodySlackPx.value = distBottom;
+      }
       showJumpLatest.value = distBottom > JUMP_LATEST_TRIGGER_PX;
       nearChatBottom.value = distBottom <= NEAR_BOTTOM_PX;
     });
@@ -5957,7 +5970,9 @@
         return;
       }
     }
+    kbPrevLanded = keyboardHeight.value;
     keyboardHeight.value = height;
+    kbLandedTs = Date.now();
     clearKbWatchdog();
     if (height > 0) {
       // 键盘升起覆盖面板（飞书式）：清互斥面板让 liftPx 立即切到键盘高度，表情/加号槽
@@ -5987,6 +6002,32 @@
   /* ★armKbWatchdog / scheduleIosKbApply 声明在 applyKeyboardHeight 之后（UTS 不提升
      声明，error18）：两者回调体引用它；其调用点（focus 预测预抬 / iOS 键盘事件分发）
      均在本处之后，定义下移不影响绑定。 */
+
+  /**
+   * 键盘升降动画沿的「回声高度」判定（事件/轮询真值通道用；predict 先行预抬不受限，
+   * focus 预测本意就是抢跑）。键盘动画期间事件/轮询会派发中间高度，与已落地的终值
+   * 方向相反，逐次落地 = 让位反复改向（2026-10-19 真机症状：拉起/收起键盘消息区抖动）：
+   * - 升沿回声：本次落地来自升高（当前值 > 上次落地值）且窗内来值比当前矮 → 动画中间
+   *   矮值（终值已落地），丢弃防「升到顶→跌回→再爬」；
+   * - 降沿回声：已落地 0（blur 预测/收起真值）且窗内来正高度、且 0 落地之后无新的聚焦
+   *   请求（kbFocusReqTs < kbLandedTs）→ 收起动画迟到的中间值，丢弃防「下落→回弹→
+   *   再下落」。真重开键盘必先经输入框聚焦（时间戳晚于 0 落地），快速重聚焦不误伤。
+   * 窗 800ms > 键盘动画（~300ms）+ 轮询节拍（100ms）+ 事件派发延迟余量；轮询驱动的
+   * 下降沿（BACK 收 IME 不失焦）逐值落地会滚动刷新时间戳，方向判定保证单调下降不受拦。
+   * 窗内快速切更矮键盘类型（如字母→表情）会被误拦一次，窗过后首事件自然校正，可接受。
+   */
+  function isKbEdgeEcho(height: number): boolean {
+    if (Date.now() - kbLandedTs >= 800) {
+      return false;
+    }
+    if (height > 0 && keyboardHeight.value == 0) {
+      return kbFocusReqTs < kbLandedTs;
+    }
+    if (height > 0 && height < keyboardHeight.value && keyboardHeight.value > kbPrevLanded) {
+      return true;
+    }
+    return false;
+  }
   function armKbWatchdog(): void {
     kbPredictConfirmed = false;
     if (kbWatchdogTimer != 0) {
@@ -6025,6 +6066,17 @@
     }
     iosKbDebounceTimer = setTimeout((): void => {
       iosKbDebounceTimer = 0;
+      // 收起沿回声：blur 预测已落 0（下落与收起动画同步起步），收起动画迟到的中间正高度
+      // 不再重抬让位——否则「下落→回弹→终值 0 再落」＝收起抖动（short-hold 只护升沿）。
+      // 真重开键盘必先经输入框聚焦（kbFocusReqTs 晚于 0 落地 + predict 先抬），不误伤。
+      if (
+        height > 0 &&
+        keyboardHeight.value == 0 &&
+        kbFocusReqTs < kbLandedTs &&
+        Date.now() - kbLandedTs < 800
+      ) {
+        return;
+      }
       if (height > 0 && keyboardHeight.value > 0 && height < keyboardHeight.value) {
         cancelIosKbShortHold();
         clearKbWatchdog();
@@ -6056,8 +6108,9 @@
   function pollAndroidImeHeight(): void {
     androidImePollTimer = 0;
     const height = readAndroidImeHeight();
-    // 与事件回调读数一致时不动（事件正常的机型零开销）；不一致 = 事件丢了，轮询接管
-    if (height != keyboardHeight.value) {
+    // 与事件回调读数一致时不动（事件正常的机型零开销）；不一致 = 事件丢了，轮询接管；
+    // 升降动画沿的中间回声值拦下（isKbEdgeEcho：升沿矮回声/降沿正回声），终值/归零放行
+    if (height != keyboardHeight.value && !isKbEdgeEcho(height)) {
       applyKeyboardHeight(height, "event");
     }
     // 输入坞聚焦 / 展开面板开着 / 键盘 believed 开着（blur 后收起动画中）才持续轮询；
@@ -9000,11 +9053,15 @@
   }
 
   function handleVoiceDraftFocus(): void {
-    // 聚焦态占位（保持 focus 标记真实，供 handleVoiceCardTap 判重）
+    // 聚焦态占位（保持 focus 标记真实，供 handleVoiceCardTap 判重）；
+    // 聚焦请求记账：语音编辑卡拉键盘不走 inputFocused，靠时间戳过降沿回声门
+    kbFocusReqTs = Date.now();
   }
 
   function handleVoiceDraftBlur(): void {
     voiceDraftFocus.value = false;
+    // blur 即宣告降沿：解除升沿方向标记，放行收起动画的下降中间值（同 handleInputBlur）
+    kbPrevLanded = keyboardHeight.value;
   }
 
   /** editing 取消：丢弃本轮识别文本与录音。 */
@@ -9909,11 +9966,15 @@
    *  升起）；失焦只复位聚焦边沿，面板不随之收（同主坞 handleInputBlur 的最小集）。 */
   function handleExpandInputFocus(): void {
     expandInputFocused.value = true;
+    // 聚焦请求记账：降沿回声门的「真重开键盘」判据（晚于 0 落地 = 真升起）
+    kbFocusReqTs = Date.now();
   }
 
   function handleExpandInputBlur(): void {
     expandInputFocused.value = false;
     expandFocusRequest.value = false;
+    // blur 即宣告降沿：解除升沿方向标记，放行收起动画的下降中间值（同 handleInputBlur）
+    kbPrevLanded = keyboardHeight.value;
   }
 
   /**
@@ -10170,6 +10231,8 @@
     // placeholder 上跳 = 单次重设落在框架重置之前）——按拍 sweep 盖住开键盘全程
     sweepAndroidInputGravity(6);
     inputFocused.value = true;
+    // 聚焦请求记账：降沿回声门的「真重开键盘」判据（晚于 0 落地 = 真升起）
+    kbFocusReqTs = Date.now();
     // Android 兜底：部分机型从子页返回后键盘事件不派发，聚焦期间轮询 IME insets 接管让位
     startAndroidImePolling();
     // #ifdef APP-IOS || APP-HARMONY
@@ -10191,6 +10254,10 @@
   function handleInputBlur(): void {
     inputFocused.value = false;
     focusRequest.value = false;
+    // blur 即宣告降沿：解除升沿方向标记（kbPrevLanded 对齐当前值），放行收起动画的
+    // 下降中间值追逐——否则快速点输入框又立刻失焦时，回声门会把下降值拦到 800ms 窗
+    // 过期，坞悬空（键盘已收、让位还挂着）
+    kbPrevLanded = keyboardHeight.value;
     // #ifdef APP-IOS
     // iOS blur 必收键盘：预测性先落 0 让让位下落与收起动画同步起步，事件到达幂等确认
     if (keyboardHeight.value > 0) {
@@ -11836,6 +11903,12 @@
       scheduleIosKbApply(res.height);
       // #endif
       // #ifndef APP-IOS
+      // 升降沿回声拦截（iOS 走 scheduleIosKbApply 自有去抖/缓落地，不在此拦）：
+      // 事件到达即证明键盘存在，丢弃同时撤预测看门狗防误回落（鸿蒙 predict 同款）
+      if (isKbEdgeEcho(res.height)) {
+        clearKbWatchdog();
+        return;
+      }
       applyKeyboardHeight(res.height, "event");
       // #endif
     });

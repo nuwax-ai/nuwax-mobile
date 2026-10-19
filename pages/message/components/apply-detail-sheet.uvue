@@ -1,0 +1,478 @@
+<template>
+  <!--
+    新的伙伴申请 · 申请详情底部卡片：
+    - 展示申请人头像/昵称 + 申请理由全文（≤100 字，服务端已截断），底部同意/拒绝
+    - 替代原系统 actionSheet：用户先看清理由再决定
+    - 接口在本组件内调用（同 remark-sheet），成功后 emit resolved 由页面整表刷新；
+      失败保留卡片便于重试（busy 同步置位防连点）
+    - 参数全部走 primitive 字符串（不声明 ImContactRow prop，规避 uvue 类实例
+      模板侧推断 any 的历史问题）
+  -->
+  <uni-modal-popup
+    ref="popupRef"
+    position="bottom"
+    :height="sheetHeight"
+    :show-header="false"
+    :body-scroll="false"
+    :enable-swipe-close="!busy"
+    :mask-click="!busy"
+    @afterleave="handleAfterLeave"
+  >
+    <view class="apply-sheet" :style="sheetStyle">
+      <view class="apply-sheet__header">
+        <text class="apply-sheet__title">{{ t("Mobile.Message.applyDetailTitle") }}</text>
+        <view class="apply-sheet__close" @click="close">
+          <svg-icon name="icon-X" size="18" unit="px" color="#8a8a8a" />
+        </view>
+      </view>
+
+      <view class="apply-sheet__profile">
+        <view class="apply-sheet__avatar-wrap">
+          <view
+            v-if="avatarLoaded != true || avatarFailed == true"
+            class="apply-sheet__avatar"
+            :style="{ backgroundImage: avatarGradient(displayName) }"
+          >
+            <text class="apply-sheet__avatar-text">{{ fallbackText }}</text>
+          </view>
+          <view
+            v-if="avatarSrc.length > 0 && avatarFailed != true"
+            class="apply-sheet__avatar-clip"
+          >
+            <image
+              class="apply-sheet__avatar apply-sheet__avatar--img"
+              :src="avatarSrc"
+              mode="aspectFill"
+              :fade-show="false"
+              @load="handleAvatarLoaded"
+              @error="handleAvatarError"
+            />
+          </view>
+        </view>
+        <text class="apply-sheet__name text-ellipsis">{{ displayName }}</text>
+      </view>
+
+      <view class="apply-sheet__reason-block">
+        <text class="apply-sheet__reason-label">{{ t("Mobile.Message.applyReasonLabel") }}</text>
+        <view class="apply-sheet__reason-box">
+          <text
+            :class="applyMsg.length > 0 ? 'apply-sheet__reason-text' : 'apply-sheet__reason-text apply-sheet__reason-text--empty'"
+          >{{ applyMsg.length > 0 ? applyMsg : t("Mobile.Message.applyMsgEmpty") }}</text>
+        </view>
+      </view>
+
+      <view class="apply-sheet__footer">
+        <view
+          class="apply-sheet__btn"
+          :class="{ 'apply-sheet__btn--disabled': busy }"
+          hover-class="apply-sheet__btn-cancel--active"
+          @click="handleReject"
+        >
+          <text class="apply-sheet__btn-text apply-sheet__btn-text--cancel">
+            {{ t("Mobile.Message.contactReject") }}
+          </text>
+        </view>
+        <view
+          class="apply-sheet__btn apply-sheet__btn--ok"
+          :class="{ 'apply-sheet__btn--disabled': busy }"
+          hover-class="apply-sheet__btn-ok--active"
+          @click="handleAccept"
+        >
+          <text class="apply-sheet__btn-text apply-sheet__btn-text--ok">
+            {{ t("Mobile.Message.contactAccept") }}
+          </text>
+        </view>
+      </view>
+    </view>
+  </uni-modal-popup>
+</template>
+
+<script setup lang="uts">
+  import { computed, onUnmounted, ref, type ComponentPublicInstance } from "vue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiResCode } from "@/utils/apiResponse";
+  import { syncNativeTabBarState } from "@/utils/commonBusiness";
+  import { apiImContactAccept, apiImContactReject } from "@/servers/im";
+  import { avatarGradient as avatarGradientOf } from "./im-row-helpers.uts";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  // uvue 模板不能直接调用导入函数——本地 const 包装（contact-list-pane 同款）
+  const avatarGradient = (name: string): string => avatarGradientOf(name);
+
+  const emit = defineEmits<{
+    /** 申请已处理（同意或拒绝成功）：页面据此整表刷新联系人。 */
+    resolved: [];
+  }>();
+
+  const popupRef = ref<any | null>(null);
+  const tabBarHiddenBySheet = ref<boolean>(false);
+  /** 目标申请人（userId 是 int64 雪花号，全程字符串） */
+  let targetUserId = "";
+
+  const displayName = ref<string>("");
+  const avatarSrc = ref<string>("");
+  const fallbackText = ref<string>("");
+  const applyMsg = ref<string>("");
+  const avatarLoaded = ref<boolean>(false);
+  const avatarFailed = ref<boolean>(false);
+  /** 提交防重（同时禁掉下滑关闭与遮罩点击，避免请求中被误关） */
+  const busy = ref<boolean>(false);
+
+  /** 理由区：每行 21px，最少 5 行（短理由也留足留白），最多 7 行。 */
+  const REASON_LINE_PX = 21;
+  const REASON_MIN_LINES = 5;
+  const REASON_MAX_LINES = 7;
+  /** 固定骨架（含理由框上下 14px 内边距）：14+26+14+46+16+18+8+28+14+44+12。 */
+  const SHEET_BASE_PX = 240;
+
+  /**
+   * 卡片高度：固定骨架 240px + 理由行数 × 21px + 底部安全区。
+   * popup body 槽在 App 端是 height:0 + flex:1，必须给确定高度（auto 会塌陷）；
+   * 理由最多 100 字（约 5 行），按 22 字/行估算，最少按 4 行给高度。
+   */
+  const sheetHeight = computed((): string => {
+    let safePx = 0;
+    // #ifndef H5
+    try {
+      safePx = uni.getWindowInfo().safeAreaInsets.bottom;
+    } catch (_e) {
+      safePx = 0;
+    }
+    // #endif
+    let lines = Math.ceil(applyMsg.value.length / 22);
+    if (lines < REASON_MIN_LINES) {
+      lines = REASON_MIN_LINES;
+    }
+    if (lines > REASON_MAX_LINES) {
+      lines = REASON_MAX_LINES;
+    }
+    return `${SHEET_BASE_PX + lines * REASON_LINE_PX + safePx}px`;
+  });
+
+  /** 底部安全距离：App 端样式表 env() 不可靠；H5/小程序走样式表 env()，勿重复叠加。 */
+  const sheetStyle = computed((): string => {
+    let style = "";
+    // #ifdef APP
+    try {
+      const win = uni.getWindowInfo();
+      style = `padding-bottom: ${12 + win.safeAreaInsets.bottom}px;`;
+    } catch (_e) {
+      style = "";
+    }
+    // #endif
+    return style;
+  });
+
+  function callPopupMethod(methodName: string): void {
+    const proxy = popupRef.value as ComponentPublicInstance | null;
+    if (proxy == null) {
+      return;
+    }
+    proxy.$callMethod(methodName);
+  }
+
+  /** 打开卡片：记录申请人快照并重置加载态。 */
+  function open(
+    userId: string,
+    name: string,
+    avatarDisplay: string,
+    fallbackLine: string,
+    message: string,
+  ): void {
+    targetUserId = userId;
+    displayName.value = name;
+    avatarSrc.value = avatarDisplay;
+    let fb = fallbackLine.trim();
+    if (fb.length == 0) {
+      // 兜底取字：页面正常会传 fallbackLine1；缺失时取名字前 2 字
+      fb = name.trim();
+      if (fb.length > 2) {
+        fb = fb.substring(0, 2);
+      }
+    }
+    fallbackText.value = fb;
+    // 申请附言折成单段（发送端为单行输入；PC 端可能带换行，避免卡片被撑高）
+    applyMsg.value = message.trim().split("\r").join("").split("\n").join(" ");
+    avatarLoaded.value = false;
+    avatarFailed.value = false;
+    busy.value = false;
+    // 系统 TabBar 是独立原生层，页面内弹窗无法用 z-index 覆盖，先隐藏、关闭时恢复
+    tabBarHiddenBySheet.value = true;
+    uni.hideTabBar({
+      animation: false,
+      complete: () => {
+        callPopupMethod("open");
+      },
+    });
+  }
+
+  function close(): void {
+    callPopupMethod("close");
+  }
+
+  function restoreTabBar(): void {
+    if (tabBarHiddenBySheet.value != true) {
+      return;
+    }
+    tabBarHiddenBySheet.value = false;
+    syncNativeTabBarState();
+  }
+
+  function handleAvatarLoaded(): void {
+    avatarLoaded.value = true;
+    avatarFailed.value = false;
+  }
+
+  function handleAvatarError(): void {
+    avatarFailed.value = true;
+    avatarLoaded.value = false;
+  }
+
+  /** 同意/拒绝：接口成功 → toast + 通知页面刷新 + 收起；失败保留卡片供重试。 */
+  async function submit(accept: boolean): Promise<void> {
+    if (busy.value || targetUserId.length == 0) {
+      return;
+    }
+    busy.value = true;
+    try {
+      const res = accept
+        ? await apiImContactAccept(targetUserId)
+        : await apiImContactReject(targetUserId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+        return;
+      }
+      uni.showToast({
+        title: accept
+          ? t("Mobile.Message.contactAccepted")
+          : t("Mobile.Message.contactRejected"),
+        icon: "none",
+      });
+      emit("resolved");
+      close();
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  function handleAccept(): void {
+    submit(true);
+  }
+
+  function handleReject(): void {
+    submit(false);
+  }
+
+  /** 卡片完全收起：恢复 tabBar。 */
+  function handleAfterLeave(): void {
+    restoreTabBar();
+  }
+
+  defineExpose({
+    open: open as any,
+    close: close as any,
+  });
+
+  onUnmounted(() => {
+    restoreTabBar();
+  });
+</script>
+
+<style lang="scss" scoped>
+  .apply-sheet {
+    width: 100%;
+    height: 100%;
+    padding: 14px 16px 12px;
+    /* #ifdef H5 || MP-WEIXIN */
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    /* #endif */
+    background-color: #ffffff;
+    border-radius: 16px 16px 0 0;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .apply-sheet__header {
+    min-height: 26px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__title {
+    color: #111111;
+    font-size: 16px;
+    line-height: 22px;
+    font-weight: 600;
+  }
+
+  .apply-sheet__close {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ===== 申请人：头像 + 昵称 ===== */
+  .apply-sheet__profile {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__avatar-wrap {
+    position: relative;
+    width: 46px;
+    height: 46px;
+    margin-right: 12px;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__avatar {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .apply-sheet__avatar--img {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+  }
+
+  .apply-sheet__avatar-clip {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    overflow: hidden;
+    z-index: 1;
+  }
+
+  .apply-sheet__avatar-text {
+    font-size: 16px;
+    line-height: 20px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .apply-sheet__name {
+    flex: 1;
+    min-width: 0;
+    font-size: 17px;
+    line-height: 22px;
+    font-weight: 500;
+    color: #141416;
+  }
+
+  /* ===== 申请理由 ===== */
+  .apply-sheet__reason-block {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .apply-sheet__reason-label {
+    font-size: 13px;
+    line-height: 18px;
+    color: #94929c;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__reason-box {
+    margin-top: 8px;
+    padding: 14px;
+    /* 最少 5 行留白（与 sheetHeight 的 REASON_MIN_LINES 同步） */
+    min-height: 105px;
+    border-radius: 10px;
+    background-color: #f6f5f8;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__reason-text {
+    font-size: 14px;
+    line-height: 21px;
+    color: #1c1b20;
+    word-break: break-all;
+  }
+
+  .apply-sheet__reason-text--empty {
+    color: #b7b7be;
+  }
+
+  /* ===== 底部按钮：拒绝=浅灰、同意=品牌紫（与 remark-sheet 一致） ===== */
+  .apply-sheet__footer {
+    flex-shrink: 0;
+    padding-top: 14px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .apply-sheet__btn {
+    flex: 1;
+    min-width: 96px;
+    height: 44px;
+    padding: 0 16px;
+    border-radius: 12px;
+    background-color: #f2f1f7;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .apply-sheet__btn-cancel--active {
+    background-color: #e8e7f0;
+  }
+
+  .apply-sheet__btn--ok {
+    margin-left: 12px;
+    background-color: #5147ff;
+  }
+
+  .apply-sheet__btn-ok--active {
+    background-color: #4239e8;
+  }
+
+  .apply-sheet__btn--disabled {
+    opacity: 0.55;
+  }
+
+  .apply-sheet__btn-text {
+    font-size: 15px;
+    line-height: 21px;
+    font-weight: 500;
+  }
+
+  .apply-sheet__btn-text--cancel {
+    color: #4b4b52;
+  }
+
+  .apply-sheet__btn-text--ok {
+    color: #ffffff;
+  }
+</style>

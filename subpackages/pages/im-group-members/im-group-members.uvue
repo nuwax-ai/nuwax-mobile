@@ -193,6 +193,7 @@
   import AddBuddySheet from "@/components/add-buddy-sheet/add-buddy-sheet.uvue";
   import { registerPopupClose, unregisterPopupClose } from "@/utils/popupBackRegistry";
   import { getCachedContactRemarks } from "@/utils/im/contactRemarkCache";
+  import { invalidateCachedConvMembers, setCachedConvMembers } from "@/utils/im/convMembersCache";
   import { CUSTOM_TAB_BAR_ENABLED } from "@/constants/customTabBar.constants";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
@@ -282,6 +283,8 @@
   let membersSession = 0;
   /** 后台链断点 cursor（空=已到末页；失败重试续拉用）。 */
   let chainCursor = "";
+  /** 链累计的原始 records（含首页；全量到账后回写 @ 两入口复用的成员缓存）。 */
+  let chainRawRecords: UTSJSONObject[] = [];
   /** 链已拉页数护栏（30 页=3000 人，防服务端异常 nextCursor 死循环）。 */
   let chainPages = 0;
 
@@ -1000,6 +1003,29 @@
     }
   }
 
+  /** 全量到账后回写成员缓存（@ 两入口复用的快照）：按当前行表过滤——删人是
+   *  splice 本地表、在途链的原始 records 仍含被删者，不过滤会把已退群的人写回
+   *  快照；会话已过期（期间整表重载）不写。★须定义在 chainMembers 之前（UTS
+   *  先声明后调用）。 */
+  function writeMembersCache(session: number): void {
+    if (session != membersSession) {
+      return;
+    }
+    const live = members.value;
+    const liveMap = new Map<string, boolean>();
+    for (let i = 0; i < live.length; i++) {
+      liveMap.set(live[i].userId, true);
+    }
+    const filtered: UTSJSONObject[] = [];
+    for (let i = 0; i < chainRawRecords.length; i++) {
+      const id = readString(chainRawRecords[i], "userId");
+      if (id.length > 0 && liveMap.get(id) == true) {
+        filtered.push(chainRawRecords[i]);
+      }
+    }
+    setCachedConvMembers(convId.value, filtered);
+  }
+
   /** 后台翻页补齐：从 cursor 起串行拉到末页，每页解析合并入表并重排（保持
    *  群主→管理员→成员分区）；晚归按会话号丢弃（重载/换群期间的旧响应），失败
    *  挂 chainFailed 由尾部点击续拉。loadAll 首屏渲染后点火即走、不 await。 */
@@ -1022,6 +1048,7 @@
       const rows = members.value;
       const added: GmMember[] = [];
       for (let i = 0; i < page.records.length; i++) {
+        chainRawRecords.push(page.records[i]);
         const m = parseMemberRow(page.records[i]);
         if (m != null) {
           rows.push(m);
@@ -1040,6 +1067,8 @@
     chainRunning.value = false;
     chainFailed.value = false;
     chainCursor = "";
+    // 全量到账：回写 @ 两入口复用的成员缓存（群名片改名后经本页 onShow 重拉即保鲜）
+    writeMembersCache(session);
   }
 
   /** 翻页链失败重试：从断点 cursor 续拉（同会话）。 */
@@ -1082,7 +1111,9 @@
         return;
       }
       const out: GmMember[] = [];
+      chainRawRecords = [];
       for (let i = 0; i < page.records.length; i++) {
+        chainRawRecords.push(page.records[i]);
         const m = parseMemberRow(page.records[i]);
         if (m != null) {
           out.push(m);
@@ -1102,9 +1133,12 @@
         return;
       }
       applyContactStates(out);
-      // 后台串行补齐后续页（>100 人群）；链完成前搜索只覆盖已到账行
+      // 后台串行补齐后续页（>100 人群）；链完成前搜索只覆盖已到账行。
+      // 单页即全量（≤100 人群）时直接回写成员缓存（@ 两入口复用）
       if (page.nextCursor.length > 0) {
         chainMembers(session, page.nextCursor);
+      } else {
+        writeMembersCache(session);
       }
     } catch (_error) {
       loading.value = false;
@@ -1135,6 +1169,8 @@
             break;
           }
         }
+        // 全量成员缓存失效（@ 两入口复用的快照残留已退群者；下次取用自会重拉）
+        invalidateCachedConvMembers(convId.value);
       } else {
         uni.showToast({ title: apiResMessage(res), icon: "none" });
       }

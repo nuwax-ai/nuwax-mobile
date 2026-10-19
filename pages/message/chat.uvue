@@ -1693,6 +1693,7 @@
     setCachedChatScroll,
   } from "@/utils/im/imChatCache";
   import { getCachedMyInfo, setCachedMyInfo } from "@/utils/im/myInfoCache";
+  import { getCachedConvMembers, setCachedConvMembers } from "@/utils/im/convMembersCache";
   import { getCachedContactRemarks, setCachedContactRemarks } from "@/utils/im/contactRemarkCache";
   import {
     buildAuthProtectedFileHeaders,
@@ -3641,10 +3642,30 @@
 
   // ===== @提及（面板 / 插入 / 发送反扫） =====
 
+  /** ConversationMemberDto → @ 成员行（token=群卡片>平台昵称>占位，不含备注——
+   *  与 at-select 同口径；userId 空返回 null）。loadMembers/缓存重同步共用。 */
+  function parseImMember(record: UTSJSONObject): ImMember | null {
+    const m = new ImMember();
+    m.userId = readString(record, "userId");
+    if (m.userId.length == 0) {
+      return null;
+    }
+    m.name = readString(record, "name");
+    m.nickName = readString(record, "nickName");
+    m.avatar = readString(record, "avatar");
+    m.token = m.nickName.length > 0
+      ? m.nickName
+      : m.name.length > 0
+        ? m.name
+        : `用户${m.userId}`;
+    return m;
+  }
+
   /**
    * @面板数据源加载（提及反扫/高亮同依据）：群聊/团队拉会话成员，单聊拉联系人
    * （@ 某人，飞书式；displayName 服务端已按备注>昵称>账号算好直接做 token）。
-   * 失败静默：面板显示空态可重试。
+   * 群聊缓存优先（@ 两入口一份数据；群成员页全量到账也会回写保鲜）。失败静默：
+   * 面板显示空态可重试。
    */
   async function loadMembers(): Promise<void> {
     if (convId.value.length == 0 || membersLoaded) {
@@ -3653,23 +3674,21 @@
     try {
       const out: ImMember[] = [];
       if (isGroupLike.value) {
-        const records = await apiImConvMembersAll(convId.value);
+        const cachedRecords = getCachedConvMembers(convId.value);
+        let records: UTSJSONObject[] | null = cachedRecords;
+        if (records == null) {
+          records = await apiImConvMembersAll(convId.value);
       if (!isChatCurrent()) return;
+          if (records != null) {
+            setCachedConvMembers(convId.value, records);
+          }
+        }
         if (records == null) {
           return;
         }
         for (let i = 0; i < records.length; i++) {
-          const m = new ImMember();
-          m.userId = readString(records[i], "userId");
-          m.name = readString(records[i], "name");
-          m.nickName = readString(records[i], "nickName");
-          m.avatar = readString(records[i], "avatar");
-          m.token = m.nickName.length > 0
-            ? m.nickName
-            : m.name.length > 0
-              ? m.name
-              : `用户${m.userId}`;
-          if (m.userId.length > 0) {
+          const m = parseImMember(records[i]);
+          if (m != null) {
             out.push(m);
           }
         }
@@ -3707,6 +3726,32 @@
       rebuildRichAll();
     } catch (_error) {
       // 静默：面板空态可再点开重试
+    }
+  }
+
+  /** 群聊返回时从全量成员缓存零请求重同步 @ 数据源：群设置/群成员页的加删人、
+   *  改名片等操作已把缓存刷新（回写新快照）或失效，回到本页时对齐到最新快照——
+   *  本表是引用@/长按头像@/发送提及反扫的依据，进页拉一次不再刷新是旧行为，这里
+   *  借缓存补上。缓存未命中（被失效）保持原表，@ 选择页自会重拉并回写。 */
+  function resyncMembersFromCache(): void {
+    if (membersLoaded != true || convId.value.length == 0) {
+      return;
+    }
+    const records = getCachedConvMembers(convId.value);
+    if (records == null) {
+      return;
+    }
+    const out: ImMember[] = [];
+    for (let i = 0; i < records.length; i++) {
+      const m = parseImMember(records[i]);
+      if (m != null) {
+        out.push(m);
+      }
+    }
+    if (out.length > 0) {
+      members.value = out;
+      // 提及高亮 token 可能随新快照变化（改名片），补扫一次
+      rebuildRichAll();
     }
   }
 
@@ -12047,6 +12092,8 @@
     // （首次 onShow 与 onLoad 拉取重合，跳过避免重复请求——下方 silentSyncLatest 同款守卫）
     if (chatHasShownOnce && isGroupLike.value) {
       loadContactRemarks();
+      // 成员表零请求对齐最新缓存快照（群设置/成员页的加删人、改名片在此生效）
+      resyncMembersFromCache();
     }
     // 静默同步最新消息（离开期间其他端新发的消息兜底；不打断滚动）
     if (chatHasShownOnce && convId.value.length > 0 && messages.value.length > 0) {

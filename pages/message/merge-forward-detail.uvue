@@ -98,8 +98,8 @@
             <view class="mfd-voice__bar" :style="{ height: voiceBarH(a, 3, voiceTick) + 'px' }" />
             <text v-if="a.duration > 0" class="mfd-voice__dur">{{ audioDurationLabelOf(a) }}</text>
           </view>
-          <!-- 文件附件（kind=file 真文件）：文件卡片，点击路由同聊天页链接卡片
-               （受保护文档→文件预览页；zip/apk→下载；外链→webview） -->
+          <!-- 文件附件（kind=file 真文件）：微信式文件卡片（左：名称两行 + 大小/下载状态；
+               右：类型图标），点击进文件详情页（下载/打开在该页完成） -->
           <view
             v-for="(f, k) in it.files"
             :key="'f' + k"
@@ -107,10 +107,13 @@
             hover-class="mfd-file--active"
             @click="handleFileTap(f)"
           >
-            <view class="mfd-file__icon">
-              <svg-icon name="icon-a-Filetext" size="40" color="#5147ff" />
+            <view class="mfd-file__col">
+              <text class="mfd-file__name text-ellipsis-2">{{ fileDisplayNameOf(f) }}</text>
+              <text class="mfd-file__meta">{{ fileMetaText(f, downloadTick) }}</text>
             </view>
-            <text class="mfd-file__name text-ellipsis">{{ fileDisplayNameOf(f) }}</text>
+            <view class="mfd-file__icon-wrap">
+              <file-type-icon :file-name="f.fileName" :url="f.url" :size="96" />
+            </view>
           </view>
           <!-- 无文本且无媒体：类型占位兜底 -->
           <text
@@ -132,7 +135,7 @@
   import { isAppInBackground } from "@/utils/appLifecycle";
 
   import { computed, ref } from "vue";
-  import { onHide, onLoad, onUnload } from "@dcloudio/uni-app";
+  import { onHide, onLoad, onShow, onUnload } from "@dcloudio/uni-app";
   import { ImMergeItem, ImMergeMedia } from "@/types/interfaces/imMergeItem";
   import { takeImMergeRecord } from "@/utils/im/imMergeRecordSession";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
@@ -143,16 +146,13 @@
     fetchAuthProtectedFileAkUrl,
     fetchAuthProtectedFileDisplayUrl,
     isAuthProtectedFileUrl,
-    openAuthProtectedLinkUrl,
-    openRemoteFileUrl,
     releaseDisplayImageUrl,
     resolveAuthProtectedFileFetchUrl,
   } from "@/utils/authProtectedFileUrl";
   import { previewImageCompat } from "@/utils/appWebViewImagePreview";
-  import { extOf, urlExtOf } from "@/utils/imChatAttachments";
-  import { handleExternalLink } from "@/utils/system";
+  import { formatFileSize } from "@/utils/imFileCard";
   // #ifdef APP
-  import { downloadFileInApp } from "@/subpackages/utils/fileTree";
+  import { isImFileDownloadedNow } from "@/subpackages/utils/fileTree";
   // #endif
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
@@ -162,6 +162,9 @@
   /** 源会话 id（承载 merge_forward 消息的会话；文件点击跳预览页带它，同聊天气泡路由）。 */
   const convId = ref<string>("");
   const items = ref<ImMergeItem[]>([] as ImMergeItem[]);
+  /** 下载状态重渲 tick：App-Android 模板方法调用不收集依赖（chat.uvue readInfoTick 先例），
+   *  从文件详情页返回时（onShow）自增驱动文件卡片「已下载/未下载」文案重估。 */
+  const downloadTick = ref<number>(0);
 
   // ===== 媒体解析态（受保护 /api/f/ 缩略图回填）=====
   let pageDisposed = false;
@@ -769,68 +772,41 @@
     el.play();
   }
 
-  /** 无预览意义、PC 端点击即下载的二进制扩展名（chat.uvue 同清单）。 */
-  const DOWNLOAD_ONLY_EXTS: string[] = [
-    "zip", "rar", "7z", "tar", "gz", "bz2", "xz",
-    "apk", "ipa", "exe", "msi", "dmg", "pkg", "iso", "jar",
-    "tmp",
-  ];
-
-  function isDownloadOnlyAttachment(fileName: string, url: string): boolean {
-    const fileExt = extOf(fileName);
-    if (fileExt.length > 0 && DOWNLOAD_ONLY_EXTS.indexOf(fileExt) >= 0) {
-      return true;
-    }
-    const remoteExt = urlExtOf(url);
-    return remoteExt.length > 0 && DOWNLOAD_ONLY_EXTS.indexOf(remoteExt) >= 0;
-  }
-
-  /**
-   * 无可预览二进制：App 走 downloadFileInApp（受保护地址带 Bearer 拉取后拷入公共
-   * Download 目录），H5/小程序走 openRemoteFileUrl（chat.uvue handleBinaryUrlDownload 同款）。
-   */
-  function handleBinaryUrlDownload(url: string, fileName: string): void {
-    const name = fileName.length > 0 ? fileName : extractFileNameFromUrl(url);
-    // #ifdef APP
-    const protectedFile = isAuthProtectedFileUrl(url);
-    const downloadUrl = protectedFile ? resolveAuthProtectedFileFetchUrl(url) : url;
-    downloadFileInApp(downloadUrl, name, protectedFile).catch((_e: any | null): void => {
-      // downloadFileInApp 内部已 toast 失败原因，这里只吞未处理拒绝
-    });
-    // #endif
-    // #ifndef APP
-    openRemoteFileUrl(url, name).catch((_e: any | null): void => {
-      uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
-    });
-    // #endif
-  }
-
   /** 文件卡片展示名（快照 fileName 优先，缺省从 URL 提取）。 */
   function fileDisplayNameOf(f: ImMergeMedia): string {
     return f.fileName.length > 0 ? f.fileName : extractFileNameFromUrl(f.url);
   }
 
-  /** 文件/视频卡片点击（路由同聊天页 handleLinkAttTap：视频直下、受保护文档跳预览页、外链走 webview）。 */
+  /** 文件卡片次行：大小 ·（仅 APP）已下载/未下载；H5 只显示大小（浏览器接管下载）。
+   *  ★tick 必须作参进模板表达式（App-Android 方法调用绑定不收集方法体内依赖）。 */
+  function fileMetaText(f: ImMergeMedia, tick: number): string {
+    const sizeText = formatFileSize(f.size);
+    // #ifdef APP
+    const downloaded = isImFileDownloadedNow(f.fileName, f.url);
+    const status = downloaded ? t("Mobile.Message.fileDownloaded") : t("Mobile.Message.fileNotDownloaded");
+    return sizeText.length > 0 ? `${sizeText} · ${status}` : status;
+    // #endif
+    // #ifndef APP
+    return sizeText;
+    // #endif
+  }
+
+  /** 文件卡片点击：进文件详情页（下载/打开等在该页完成；同 quote-detail 文件卡片路由）。 */
   function handleFileTap(f: ImMergeMedia): void {
     if (f.url.length == 0) {
       return;
     }
-    // 视频快照：文件预览页 shareKey 不认 IM convId，与聊天页视频链接卡片同款走下载兜底
-    if (f.kind == "video") {
-      handleBinaryUrlDownload(f.url, fileDisplayNameOf(f));
-      return;
-    }
-    if (isAuthProtectedFileUrl(f.url)) {
-      if (isDownloadOnlyAttachment(f.fileName, f.url)) {
-        handleBinaryUrlDownload(f.url, f.fileName);
-        return;
-      }
-      openAuthProtectedLinkUrl(f.url, f.fileName, convId.value).catch((_e: any | null): void => {
-        uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
-      });
-      return;
-    }
-    handleExternalLink(f.url, fileDisplayNameOf(f));
+    uni.navigateTo({
+      url:
+        "/subpackages/pages/im-file-detail/im-file-detail" +
+        "?url=" +
+        encodeURIComponent(f.url) +
+        "&fileName=" +
+        encodeURIComponent(fileDisplayNameOf(f)) +
+        "&size=" +
+        f.size +
+        "&mime=",
+    });
   }
 
   /** 头像字母底色渐变板（与聊天页 AVATAR_GRADIENTS / 搜索页同款五色系）。 */
@@ -929,6 +905,11 @@
       resolveMergeMedia();
       preloadMfdVideos();
     }
+  });
+
+  onShow((): void => {
+    // 从文件详情页返回时重估文件卡片下载状态（tick 自增驱动模板重渲，见 downloadTick）
+    downloadTick.value = downloadTick.value + 1;
   });
 
   onHide((): void => {
@@ -1237,10 +1218,10 @@
     color: #22212a;
   }
 
-  /* 文件/视频卡片（白底行卡：icon-a-Filetext + 文件名，im-group-files 同款观感） */
+  /* 文件卡片（微信式：白底行卡，左名称两行+大小/下载状态，右类型图标；quote-detail qd-file 同款） */
   .mfd-file {
     margin-top: 12rpx;
-    padding: 18rpx 20rpx;
+    padding: 20rpx;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -1252,23 +1233,35 @@
     background-color: #f2f1f7;
   }
 
-  .mfd-file__icon {
-    width: 56rpx;
-    height: 56rpx;
-    margin-right: 14rpx;
+  .mfd-file__col {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .mfd-file__name {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    color: #1c1b20;
+    word-break: break-all;
+  }
+
+  .mfd-file__meta {
+    margin-top: 6rpx;
+    font-size: 22rpx;
+    line-height: 30rpx;
+    color: #9a98a5;
+  }
+
+  .mfd-file__icon-wrap {
+    margin-left: 20rpx;
+    flex-shrink: 0;
     display: flex;
     flex-direction: row;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
-  }
-
-  .mfd-file__name {
-    flex: 1;
-    min-width: 0;
-    font-size: 28rpx;
-    line-height: 40rpx;
-    color: #1c1b20;
   }
 
   .mfd-state {

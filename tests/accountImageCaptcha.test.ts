@@ -36,7 +36,6 @@ describe("图形验证码接口与 UTS 请求序列化", () => {
     await apiLogin(params);
     expect(JSON.parse(JSON.stringify(request.mock.calls[0][0].data))).toEqual({
       phoneOrEmail: "user@example.com",
-      emailOrPhone: "user@example.com",
       password: "password",
       captchaVerifyParam: "aliyun-token",
       captchaId: "image-id",

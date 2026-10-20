@@ -1,18 +1,19 @@
 <template>
-  <view class="task-result" @tap="handleClick">
-    <!-- 左侧图标 -->
-    <view class="task-result-icon">
-      <text class="iconfont">&#xe64e;</text>
-    </view>
-
-    <!-- 文件描述/名称 -->
-    <view class="task-result-action">
-      <text class="action-text">{{ displayText }}</text>
-    </view>
-
-    <!-- 右侧图标 -->
-    <view class="task-result-arrow">
-      <text class="iconfont">&#xe63f;</text>
+  <view class="task-result">
+    <text v-if="displayText" class="task-result-title">{{ displayText }}</text>
+    <view
+      v-for="(name, index) in fileNames"
+      :key="index"
+      class="task-result-file"
+      @tap="handleClickFile(name)"
+    >
+      <view class="task-result-icon">
+        <text class="iconfont">&#xe64e;</text>
+      </view>
+      <text class="file-text">{{ fileLabel(name) }}</text>
+      <view class="task-result-arrow">
+        <text class="iconfont">&#xe63f;</text>
+      </view>
     </view>
   </view>
 </template>
@@ -42,13 +43,20 @@
       description() {
         return this.extractChildText("description");
       },
-      // 提取文件名
-      fileName() {
-        return this.extractChildText("file");
+      fileNames() {
+        const children = this.data?.children || [];
+        const names = [];
+        for (const child of children) {
+          if (child.name === "file") {
+            const text = `${this.getTextContent(child)}`.trim();
+            if (text.length > 0) names.push(text);
+          }
+        }
+        return names;
       },
-      // 显示文本：优先显示描述，其次显示文件名
+      // 显示文本：优先显示描述，其次显示第一个文件名
       displayText() {
-        return this.description || this.fileName || "查看结果";
+        return this.description || "";
       },
     },
     methods: {
@@ -93,33 +101,45 @@
         return "";
       },
 
+      fileLabel(filePath) {
+        const normalized = `${filePath}`.trim();
+        const slash = normalized.lastIndexOf("/");
+        if (slash >= 0 && slash < normalized.length - 1) {
+          return normalized.substring(slash + 1);
+        }
+        return normalized;
+      },
+
       /**
-       * 点击处理：打开预览视图
+       * 点击指定文件：打开预览视图
        */
-      async handleClick() {
+      async handleClickFile(fileName) {
         let conversationId = String(this.conversationId);
-        // 移除 chat- 前缀，因为页面参数使用的是纯数字ID
         if (conversationId && conversationId.startsWith("chat-")) {
           conversationId = conversationId.replace("chat-", "");
         }
 
         if (conversationId) {
           try {
-            const fileId = this.fileName.split(`${conversationId}/`).pop();
+            const fileId = `${fileName}`.split(`${conversationId}/`).pop();
             const fileProxyUrl =
               await getFileProxyUrlByConversationIdAndFilePath(
                 conversationId,
                 fileId,
               );
+            if (!fileProxyUrl) {
+              uni.showToast({ title: "打开文件失败", icon: "none" });
+              return;
+            }
             jumpToFilePreviewPage(conversationId, fileProxyUrl);
           } catch (error) {
             console.error("[TaskResult] 获取文件列表失败:", error);
+            uni.showToast({ title: "打开文件失败", icon: "none" });
           }
         } else {
-          // 如果没有会话ID，发送事件让父组件处理
           uni.$emit("task_result_click", {
             data: this.data,
-            fileName: this.fileName,
+            fileName,
             description: this.description,
           });
         }
@@ -131,18 +151,42 @@
 <style lang="scss">
   .task-result {
     display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 8rpx;
-    padding: 20rpx 20rpx;
-    margin: 16rpx 0;
-    border-radius: 16rpx;
-    background-color: rgba(12, 20, 102, 0.04);
+    flex-direction: column;
+    align-items: stretch;
     width: 100%;
+    margin: 16rpx 0;
     box-sizing: border-box;
 
-    &:active {
-      background-color: rgba(12, 20, 102, 0.08);
+    .task-result-title {
+      color: #17191f;
+      font-size: 28rpx;
+      font-weight: 600;
+      line-height: 40rpx;
+      margin-bottom: 16rpx;
+    }
+
+    .task-result-file {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      width: 100%;
+      margin-bottom: 16rpx;
+      padding: 22rpx 24rpx;
+      border-radius: 16rpx;
+      background-color: #ffffff;
+      border: 1rpx solid #eceef2;
+      box-sizing: border-box;
+    }
+
+    .file-text {
+      flex: 1;
+      min-width: 0;
+      font-size: 28rpx;
+      line-height: 40rpx;
+      color: #17191f;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .task-result-icon {

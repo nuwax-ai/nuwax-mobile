@@ -79,10 +79,13 @@ function imWarn(msg: string): void {
 
 /** 从 storage 读 token（参照 imUnreadBadge.uts:91-99）。 */
 function readAccessToken(): string {
-  // 浏览器直开 H5 的 WS 完全走同源 Cookie，不读 storage、不走 query 或 CONNECT.body。
-  // App 内嵌 H5 / 原生端仍使用显式 token。
+  // 生产浏览器直开 H5：WS 完全走同源 Cookie，不读 storage、不走 CONNECT.body。
+  // App 内嵌 H5 / 原生端 / H5 开发环境仍用显式 token——开发环境页面在
+  // localhost、API 在测试站，跨域下 Cookie 永远不可用，若也返回空 token，
+  // CONNECT 帧恒无凭证 → IM_10401 → 无 CONNECT_ACK → devices 永不注册、
+  // 消息不实时。判定与 applyBearerAuthorization 的 dev/embedded 口径一致。
   // #ifdef H5 || WEB
-  if (!isAppWebViewEmbedded()) {
+  if (!isAppWebViewEmbedded() && process.env.NODE_ENV !== "development") {
     return "";
   }
   // #endif
@@ -100,10 +103,12 @@ function readAccessToken(): string {
   return "";
 }
 
-/** 浏览器直开 H5 由同源 HttpOnly ticket Cookie 鉴权，JS 无法读取该 Cookie。 */
+/** 浏览器直开 H5 由同源 HttpOnly ticket Cookie 鉴权，JS 无法读取该 Cookie。
+ *  仅指生产同域部署；开发环境页面在 localhost、API 在测试站，跨域下 Cookie
+ *  不可用，等同无 Cookie 模式（与 readAccessToken 的 dev 分支同口径）。 */
 function canUseBrowserCookieAuth(): boolean {
   // #ifdef H5 || WEB
-  return !isAppWebViewEmbedded();
+  return !isAppWebViewEmbedded() && process.env.NODE_ENV !== "development";
   // #endif
   return false;
 }
@@ -475,6 +480,8 @@ class ImWsClientImpl {
 
   /** 注册/刷新设备：CONNECT_ACK 后 fire-and-forget（async + try/catch，调用处不 await）。 */
   private async registerDevice(): Promise<void> {
+    // 新会话注册开始：恢复注销能力（此后切账号/登出的事件注销才可再发）
+    imDeviceUnregisterDone = false;
     try {
       const res = await apiImDeviceRegister();
       if (apiResCode(res) != SUCCESS_CODE) {
@@ -748,13 +755,27 @@ export function stopImWsClient(): void {
   ins.stop();
 }
 
+/** 设备注销去重位：一次注销尝试后置位，直到下次 CONNECT_ACK 注册（registerDevice）
+ *  才复位。防止同一会话尾部的重复注销（见 unregisterImDeviceSafe 注释第 2 条）。 */
+let imDeviceUnregisterDone = false;
+
 /**
  * 注销当前设备（App.uvue 在 IM_SESSION_CLEARED 里调，对齐 nuwax-im-web logout）。
  * 此刻 storage 仍是旧 token（invalidateImSession 在写新 token 之前触发事件），
  * 按【旧账号】身份注销本 deviceId。fire-and-forget：失败吞——服务端
  * purgeInactive 定时清理僵尸行，且下次同账号登录会 UPSERT 刷新。
+ *
+ * 两道拦截（均为「发了也注定失败/多余」的场景）：
+ * 1) 无任何凭证不发：旧 token 为空且非浏览器 Cookie 模式（首登、登出后重登、
+ *    4010 清 token 后的事件链都命中）。这类裸调 401/IM_10401 会进 useRequest
+ *    踢登录分支，把「登出→重登」刚成功的用户拽回登录页卡死（2026-10-21 测试站实测）。
+ * 2) 一次注销去重：登出流程已显式注销（凭证齐全）后，IM_SESSION_CLEARED 事件的
+ *    二次注销此刻 token/cookie 已清，必为裸调——置位跳过，registerDevice 复位。
  */
 export async function unregisterImDeviceSafe(): Promise<void> {
+  if (imDeviceUnregisterDone) return;
+  if (readAccessToken().length == 0 && !canUseBrowserCookieAuth()) return;
+  imDeviceUnregisterDone = true;
   try {
     await apiImDeviceUnregister(getImDeviceId());
   } catch (_e) {

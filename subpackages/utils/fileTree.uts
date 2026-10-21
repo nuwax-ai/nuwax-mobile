@@ -3,6 +3,8 @@ import { ACCESS_TOKEN } from '@/constants/home.constants'
 import { t, toI18nParams } from "@/utils/i18n";
 import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
 import { orEmpty, orNumber, orString } from "@/utils/utsCoalesce.uts";
+import { imFileDownloadKey, isImFileDownloaded, markImFileDownloaded } from "@/utils/imFileDownloadRegistry";
+import { extractFileNameFromUrl } from "@/utils/authProtectedFileUrl";
 
 // #ifdef APP-ANDROID
 import Intent from 'android.content.Intent';
@@ -839,6 +841,148 @@ export function mergeDirectoryLevelFiles(
       return false;
     }
   }
+
+  /** 匹配下载落盘名：原名，或系统重名自动加缀的 "name (n).ext"。 */
+  function matchesDownloadName(display: string, filename: string): boolean {
+    if (display == filename) {
+      return true;
+    }
+    const dotIdx = filename.lastIndexOf('.');
+    if (dotIdx > 0) {
+      const base = filename.substring(0, dotIdx);
+      const ext = filename.substring(dotIdx);
+      return display.startsWith(`${base} (`) && display.endsWith(ext);
+    }
+    return display.startsWith(`${filename} (`);
+  }
+
+  /**
+   * 在公共 Download 里找 filename（含系统重名加缀 "name (n).ext"）的落盘物理路径，
+   * 找不到返回 ""。API 29+ 查 MediaStore.Downloads 本应用贡献的行取 DATA 列（多数 ROM
+   * 仍回填物理路径）；API 29 以下 File 探测标准位置（原名 + (n) 逐个试）。
+   */
+  function findDownloadedFilePath(filename: string): string {
+    try {
+      const context = UTSAndroid.getAppContext();
+      if (context == null) return "";
+      const resolver = context.getContentResolver();
+      if (Build.VERSION.SDK_INT >= 29) {
+        const cursor = resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, null, null, null, null);
+        if (cursor == null) return "";
+        let found = "";
+        if (cursor.moveToFirst()) {
+          do {
+            const nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME);
+            if (nameIdx >= 0) {
+              const name = cursor.getString(nameIdx);
+              if (name != null && matchesDownloadName(name, filename)) {
+                const dataIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA);
+                if (dataIdx >= 0) {
+                  const p = cursor.getString(dataIdx);
+                  if (p != null && p.length > 0) {
+                    found = p;
+                    break;
+                  }
+                }
+              }
+            }
+          } while (cursor.moveToNext());
+        }
+        cursor.close();
+        return found;
+      } else {
+        const downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        if (downloadDir == null) return "";
+        const direct = new File(downloadDir, filename);
+        if (direct.exists()) return direct.getAbsolutePath();
+        const dotIdx = filename.lastIndexOf('.');
+        const base = dotIdx > 0 ? filename.substring(0, dotIdx) : filename;
+        const ext = dotIdx > 0 ? filename.substring(dotIdx) : '';
+        for (let i = 1; i < 100; i++) {
+          const candidate = new File(downloadDir, `${base} (${i})${ext}`);
+          if (candidate.exists()) return candidate.getAbsolutePath();
+        }
+        return "";
+      }
+    } catch (e) {
+      console.error('查询 Download 目录文件路径失败:', e);
+      return "";
+    }
+  }
+
+  /**
+   * 查文件是否仍在系统公共 Download 目录（与 copyToPublicDownload 落盘位置同口径）：
+   * 用户在文件管理器删掉文件后注册表 flag 仍在，用它实查纠偏「已下载」虚标。
+   */
+  function isFilePresentInDownload(filename: string): boolean {
+    return findDownloadedFilePath(filename).length > 0;
+  }
+  // #endif
+
+  /**
+   * 打开已下载文件（下载成功弹窗「打开」同款链路，供 im-file-detail「打开」按钮复用）：
+   * Android apk 发系统安装 Intent（openDocument 无接收方会静默无反应），
+   * 其余走 uni.openDocument，失败 toast 兜底。
+   */
+  // #ifdef APP
+  export function openDownloadedFile(filePath: string): void {
+    // #ifdef APP-ANDROID
+    if (filePath.toLowerCase().endsWith('.apk') && tryInstallApk(filePath)) {
+      return;
+    }
+    // #endif
+    uni.openDocument({
+      filePath: filePath,
+      success: () => {
+        console.log('打开文件成功');
+      },
+      fail: (err) => {
+        console.error('打开文件失败:', err);
+        uni.showToast({
+          title: t("Mobile.FileTree.openFailed"),
+          icon: 'none',
+          duration: 3000,
+        });
+      },
+    });
+  }
+  // #endif
+
+  /**
+   * IM 文件卡片「已下载」判定 = 注册表 flag + Android 真实存在性校验：
+   * 用户删了 Download 目录里的文件后 flag 仍在，Android 按 MediaStore 实查纠偏；
+   * 其余平台（iOS 落私有 tmp 无公共目录可查）维持 flag 语义。
+   */
+  // #ifdef APP
+  export function isImFileDownloadedNow(fileName: string, url: string): boolean {
+    const key = imFileDownloadKey(fileName, url);
+    if (!isImFileDownloaded(key)) {
+      return false;
+    }
+    // #ifdef APP-ANDROID
+    const display = fileName.length > 0 ? fileName : extractFileNameFromUrl(url);
+    if (display.length > 0) {
+      return isFilePresentInDownload(display);
+    }
+    // #endif
+    return true;
+  }
+  // #endif
+
+  /**
+   * 取公共 Download 里该文件的落盘路径（按文件名回捞，含重名加缀），找不到返回 ""。
+   * 用途：im-file-detail 已下载但文件是别处下的（本页无 localPath）时直接打开；
+   * iOS 下载落私有 tmp 无公共目录可查，返回 ""（调用方回落重走下载）。
+   */
+  // #ifdef APP
+  export function resolveDownloadedFilePath(filename: string): string {
+    // #ifdef APP-ANDROID
+    return findDownloadedFilePath(filename);
+    // #endif
+    // #ifndef APP-ANDROID
+    return "";
+    // #endif
+  }
   // #endif
 
   /**
@@ -848,10 +992,13 @@ export function mergeDirectoryLevelFiles(
    * @param needAuth 是否带 Bearer/X-Client-Type 头（默认 true）。非受保护的对象
    *   存储裸直链（s3p）必须传 false：S3 兼容存储会把 Authorization 头当非法
    *   签名解析，带 Bearer 反而被拒。
+   * @param silent 静默模式（默认 false；im-file-detail 内联下载用）：不弹全屏
+   *   loading、不弹「下载完成」确认框（页面自管内联状态，本函数弹窗即被页面替换），
+   *   失败 toast 仍由内部弹出。
    * @returns 返回保存的文件路径
    */
   // #ifdef APP
-  export async function downloadFileInApp(downloadUrl: string, filename: string, needAuth: boolean = true): Promise<string> {
+  export async function downloadFileInApp(downloadUrl: string, filename: string, needAuth: boolean = true, silent: boolean = false): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       const header = new UTSJSONObject();
       if (needAuth) {
@@ -862,7 +1009,9 @@ export function mergeDirectoryLevelFiles(
         applyXClientTypeHeader(header);
       }
 
-      uni.showLoading({ title: t("Mobile.FileTree.downloading") });
+      if (!silent) {
+        uni.showLoading({ title: t("Mobile.FileTree.downloading") });
+      }
       uni.downloadFile({
         url: downloadUrl,
         header: header,
@@ -872,41 +1021,26 @@ export function mergeDirectoryLevelFiles(
             // #ifdef APP-ANDROID
             finalFilePath = copyToPublicDownload(res.tempFilePath, filename);
             // #endif
-            uni.hideLoading();
-            const modalParams = new Map<string, any>();
-            modalParams.set("fileName", filename);
-            modalParams.set("filePath", finalFilePath);
-            uni.showModal({
-              title: t("Mobile.FileTree.downloadComplete"),
-              content: t("Mobile.FileTree.zipSavedContentApp", toI18nParams(modalParams), ""),
-              confirmText: t("Mobile.Common.open"),
-              cancelText: t("Mobile.Common.cancel"),
-              success: (modalRes) => {
-                if (modalRes.confirm) {
-                  // #ifdef APP-ANDROID
-                  // apk：openDocument 无接收方会静默无反应，改发系统安装 Intent；
-                  // 拉起失败再回落 openDocument（由其 toast 打开失败兜底）
-                  if (finalFilePath.toLowerCase().endsWith('.apk') && tryInstallApk(finalFilePath)) {
-                    return;
+            // 全 App 下载汇合点打标：IM 文件卡片「已下载」状态按文件名登记
+            // （本函数拿不到原始 url，注册表故以 fileName 为主键）
+            markImFileDownloaded(filename);
+            if (!silent) {
+              uni.hideLoading();
+              const modalParams = new Map<string, any>();
+              modalParams.set("fileName", filename);
+              modalParams.set("filePath", finalFilePath);
+              uni.showModal({
+                title: t("Mobile.FileTree.downloadComplete"),
+                content: t("Mobile.FileTree.zipSavedContentApp", toI18nParams(modalParams), ""),
+                confirmText: t("Mobile.Common.open"),
+                cancelText: t("Mobile.Common.cancel"),
+                success: (modalRes) => {
+                  if (modalRes.confirm) {
+                    openDownloadedFile(finalFilePath);
                   }
-                  // #endif
-                  uni.openDocument({
-                    filePath: finalFilePath,
-                    success: () => {
-                      console.log('打开文件成功');
-                    },
-                    fail: (err) => {
-                      console.error('打开文件失败:', err);
-                      uni.showToast({
-                        title: t("Mobile.FileTree.openFailed"),
-                        icon: 'none',
-                        duration: 3000,
-                      });
-                    },
-                  });
-                }
-              },
-            });
+                },
+              });
+            }
             resolve(finalFilePath);
           } else {
             uni.hideLoading();

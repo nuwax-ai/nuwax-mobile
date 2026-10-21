@@ -5,7 +5,7 @@
     <!-- 顶部：返回 + 群成员 + 添加 -->
     <view class="gm-header">
       <view class="gm-header__btn" hover-class="gm-header__btn--active" @click="handleBack">
-        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+        <svg-icon name="icon-a-Chevronleft" size="20" unit="px" color="#141416" />
       </view>
       <view class="gm-header__title-wrap">
         <text class="gm-header__title">{{ t("Mobile.Message.groupMembersLabel") }}</text>
@@ -24,7 +24,7 @@
     <!-- 搜索（客户端过滤：群名片/昵称/姓名/userId，过滤出的行同样支持长按操作气泡） -->
     <view class="gm-search">
       <view class="gm-search__icon">
-        <svg-icon name="icon-Search" size="28" color="#9a9aa2" />
+        <svg-icon name="icon-Search" size="14" unit="px" color="#9a9aa2" />
       </view>
       <input
         class="gm-search__input"
@@ -34,12 +34,14 @@
       />
     </view>
 
-    <!-- 成员列表（长按浮层期间锁滚动 direction=none；页面级触摸收浮层 + 吞击守卫，消息列表同款） -->
+    <!-- 成员列表（长按浮层期间锁滚动 direction=none；页面级触摸收浮层 + 吞击守卫，消息列表同款；
+         滚到底展开下一渲染窗——数据链后台自续，scroll-view 不回收行故按窗建行） -->
     <scroll-view
       class="gm-body"
       :direction="rowMenuVisible ? 'none' : 'vertical'"
       :show-scrollbar="false"
       @scroll="handleListScroll"
+      @scrolltolower="handleListReachLower"
       @touchstart="handlePageTouchStart($event)"
       @touchend="handlePageTouchEnd($event)"
       @touchcancel="handlePageTouchCancel($event)"
@@ -56,7 +58,7 @@
           操作项按行权限生成（设·撤管理员/添加到智联录/删除），点击经 handleRowMenuAct 分发。
           ★key 只用 userId：旧复合键（含 role/contactState）是给左滑按钮区宽度重建用的，已废。
         -->
-        <view v-for="m in filteredMembers" :key="m.userId">
+        <view v-for="m in visibleMembers" :key="m.userId">
           <view
             :id="`row-${m.userId}`"
             class="gm-row"
@@ -93,12 +95,18 @@
                   <text class="gm-tag__text">{{ t("Mobile.Message.roleManager") }}</text>
                 </view>
               </view>
-              <text v-if="m.nickName.length > 0 && m.nickName != m.token" class="gm-sub text-ellipsis">{{ m.nickName }}</text>
             </view>
           </view>
         </view>
         <view v-if="filteredMembers.length == 0" class="gm-state">
           <text class="gm-state__text">{{ t("Mobile.AgentSearch.emptyResult") }}</text>
+        </view>
+        <!-- 后台翻页链断：点此从断点续拉；链进行中 / 还有未展开渲染的行 → 加载中 -->
+        <view v-else-if="chainFailed" class="gm-state" @click="handleChainRetry">
+          <text class="gm-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+        </view>
+        <view v-else-if="tailLoading" class="gm-state">
+          <text class="gm-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
         </view>
         <view class="gm-tail" />
       </view>
@@ -149,7 +157,7 @@
           @click="handleRowMenuAct(index)"
         >
           <view class="gm-menu-act__icon">
-            <svg-icon :name="act.icon" size="32" color="#5a5966" />
+            <svg-icon :name="act.icon" size="16" unit="px" color="#5a5966" />
           </view>
           <text class="gm-menu-act__text">{{ act.label }}</text>
         </view>
@@ -175,7 +183,7 @@
     apiImAddContact,
     apiImContacts,
     apiImConvDetail,
-    apiImConvMembers,
+    apiImConvMembersPage,
     apiImGroupRemoveMember,
     apiImGroupSetMemberRole,
   } from "@/servers/im";
@@ -185,6 +193,7 @@
   import AddBuddySheet from "@/components/add-buddy-sheet/add-buddy-sheet.uvue";
   import { registerPopupClose, unregisterPopupClose } from "@/utils/popupBackRegistry";
   import { getCachedContactRemarks } from "@/utils/im/contactRemarkCache";
+  import { invalidateCachedConvMembers, setCachedConvMembers } from "@/utils/im/convMembersCache";
   import { CUSTOM_TAB_BAR_ENABLED } from "@/constants/customTabBar.constants";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
@@ -256,6 +265,41 @@
       }
     }
     return out;
+  });
+
+  // ===== 渐进加载与渐进渲染（terminal-group-members 同款思路，两层各管一事）：
+  //       ①数据：首页 100 条先渲染，后续页后台串行补齐（chainMembers）——链完成后
+  //         搜索过滤即全量口径；②渲染：scroll-view 不回收已建行，按 renderCount
+  //         步进建行，滚到底（scrolltolower）再展开下一窗，500 人群不一次建全量节点。 =====
+  /** 渲染窗口步长（行）：滚到底 +50。 */
+  const RENDER_STEP = 50;
+  /** 当前渲染窗口行数（loadAll 整表刷新时复位）。 */
+  const renderCount = ref<number>(RENDER_STEP);
+  /** 后台翻页链进行中（尾部「加载中」）。 */
+  const chainRunning = ref<boolean>(false);
+  /** 后台翻页链失败（尾部可点击重试：从断点 cursor 续拉）。 */
+  const chainFailed = ref<boolean>(false);
+  /** 翻页会话号：loadAll 每次自增，在途链晚归按号丢弃（重载/换群期间的旧响应）。 */
+  let membersSession = 0;
+  /** 后台链断点 cursor（空=已到末页；失败重试续拉用）。 */
+  let chainCursor = "";
+  /** 链累计的原始 records（含首页；全量到账后回写 @ 两入口复用的成员缓存）。 */
+  let chainRawRecords: UTSJSONObject[] = [];
+  /** 链已拉页数护栏（30 页=3000 人，防服务端异常 nextCursor 死循环）。 */
+  let chainPages = 0;
+
+  /** 渲染窗口：搜索过滤结果按 renderCount 切片（不满一窗=全量直出）。 */
+  const visibleMembers = computed((): GmMember[] => {
+    const all = filteredMembers.value;
+    if (all.length <= renderCount.value) {
+      return all;
+    }
+    return all.slice(0, renderCount.value);
+  });
+
+  /** 尾部「加载中」显隐：后台翻页进行中，或已过滤出但未展开渲染的行还有余量。 */
+  const tailLoading = computed((): boolean => {
+    return chainRunning.value || visibleMembers.value.length < filteredMembers.value.length;
   });
 
   // ===== 长按行操作浮层 / 页面触摸守卫（消息列表 message.uvue 同款，声明顺序满足
@@ -549,6 +593,36 @@
     return raw != null && `${raw}` == "true";
   }
 
+  /** ConversationMemberDto → 行模型（首页与翻页链逐页共用）。展示名：群卡片 >
+   *  我设的备注 > 平台昵称（有群名片优先展示群卡片，此时不再展示备注；成员接口
+   *  无备注，备注取模块缓存——消息页/资料页刷新联系人时会写，本页 onShow 重拉即同步）。
+   *  userId 为空返回 null（跳行）。 */
+  function parseMemberRow(record: UTSJSONObject): GmMember | null {
+    const m = new GmMember();
+    m.userId = readString(record, "userId");
+    if (m.userId.length == 0) {
+      return null;
+    }
+    m.name = readString(record, "name");
+    m.nickName = readString(record, "nickName");
+    m.avatarRaw = readString(record, "avatar");
+    m.avatar = imAvatarDisplayUrl(m.avatarRaw, 72);
+    m.role = readNumber(record, "role", 1);
+    m.self = readBool(record, "self");
+    const cachedRemarks = getCachedContactRemarks();
+    const myRemark = cachedRemarks == null
+      ? ""
+      : cachedRemarks.get(m.userId) ?? "";
+    m.token = m.nickName.length > 0
+      ? m.nickName
+      : myRemark.length > 0
+        ? myRemark
+        : m.name.length > 0
+          ? m.name
+          : `用户${m.userId}`;
+    return m;
+  }
+
   function readOption(options: any | null, key: string): string {
     if (options == null) {
       return "";
@@ -585,18 +659,13 @@
     return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
   }
 
-  // ★头像盒尺寸（消息页 chat-item__avatar-wrap 同款）：H5 走字面 rpx（运行时转 rem 与
-  // class CSS 同口径，无原生小数帧裁剪问题），App 走整数 pt 内联——iPhone 13/390pt 真机
-  // 实证：72rpx 折 37.44pt 小数，wrap 帧被 iOS 取整到整物理像素、子图按小数帧布局，右
-  // 缘越出亚像素被 overflow:hidden 裁剪削出直边（Android 不裁正常）。内联整 pt 根治；
-  // 圆角须随半宽同步（两分支同守：36rpx=72rpx 半宽，样式表 36rpx 是绝对值不跟宽高会变椭圆）。
-  // #ifdef H5 || WEB
-  const gmAvaStyle = "width: 72rpx; height: 72rpx; border-radius: 36rpx;";
-  // #endif
-  // #ifndef H5 || WEB
-  const GM_AVA_PT = Math.round((uni.getWindowInfo().windowWidth * 72) / 750);
-  const gmAvaStyle = `width: ${GM_AVA_PT}px; height: ${GM_AVA_PT}px; border-radius: ${GM_AVA_PT / 2}px;`;
-  // #endif
+  // ★头像盒尺寸（消息页 chat-item__avatar-wrap 同款）：px 化定值 36px（密度类不随屏宽
+  // 缩放，折叠屏展开不再放大），半宽圆角 18px 同步（圆角是绝对值不跟宽高，不同步会变
+  // 椭圆）。历史 iOS 小数 pt 削边（72rpx 折 37.44pt，wrap 帧被 iOS 取整到整物理像素、
+  // 子图按小数帧布局，右缘越出亚像素被 overflow:hidden 裁剪削出直边，Android 不裁正常）
+  // 曾靠「App 内联整 pt + H5 字面 rpx」双分支根治；定值整数 px 后两分支同值，保留内联
+  // 仅为少动模板。
+  const gmAvaStyle = "width: 36px; height: 36px; border-radius: 18px;";
 
   /** 字母兜底头像内联样式：整 pt 盒 + 渐变底（与 clip 分支同尺寸口径）。 */
   function gmAvaFallbackStyle(token: string): string {
@@ -632,10 +701,13 @@
   }
 
   /** 批量解析头像展示地址（/api/f/ 受保护与远程 SVG；H5 裸连 <img> 会被 ORB 拦）。
-   * ★须在 members.value 赋值后调、行取自 ref 数组（响应式代理实例），异步写回才会
-   * 触发渲染刷新——建行期 new 出的裸实例上写回不刷新（message.uvue resolveConvRowsIcons 同款）。 */
+   * ★只解析渲染窗口内的行（visibleMembers：渐进渲染下窗口外的行滚到再解析，
+   * 500 人群不一次发起全量解析）；已解析的行跳过（avatar != raw），滚到底展开
+   * 新窗/换搜索词后再调即可。★须在 members.value 赋值后调、行取自 ref 数组派生
+   * 的窗口切片（行实例仍是响应式代理实例），异步写回才会触发渲染刷新——建行期
+   * new 出的裸实例上写回不刷新（message.uvue resolveConvRowsIcons 同款）。 */
   function resolveRowAvatars(): void {
-    const live = members.value;
+    const live = visibleMembers.value;
     for (let i = 0; i < live.length; i++) {
       const row = live[i];
       // ★跳过条件看「avatar 仍等于原始地址」：App 端未解析时 avatar=raw 透传非空，
@@ -651,6 +723,14 @@
           scheduleRowsRefresh();
         }
       });
+    }
+  }
+
+  /** 滚到底：展开下一渲染窗（数据链后台自续，这里只管建行）+ 补解析新窗头像。 */
+  function handleListReachLower(): void {
+    if (renderCount.value < filteredMembers.value.length) {
+      renderCount.value += RENDER_STEP;
+      resolveRowAvatars();
     }
   }
 
@@ -738,7 +818,7 @@
     const holeBottom = rowBottomPx - pageTopPx;
     const holeLeft = rowLeftPx - pageLeftPx;
     // 操作项按行权限生成（危险操作删除排末位，同消息列表气泡排序）；
-    // 图标取 iconfont 既有字形（svg-icon 32rpx，同尺寸不同形）
+    // 图标取 iconfont 既有字形（svg-icon 16px，同尺寸不同形）
     const m = rowMenuPendingMember;
     const acts: GmRowMenuAct[] = [];
     if (m != null) {
@@ -767,12 +847,11 @@
     rowMenuMember.value = m;
     rowMenuActs.value = acts;
     rowMenuRowId = m != null ? m.userId : "";
-    // 气泡几何与样式表对齐：宽 300rpx 固定（CSS；比消息列表宽，「添加到智联录」不截断），
-    // 高 = 项高 88rpx×N + 垂直内边距 8rpx×2；
-    // 上下空间实测判定：上方余量够（含 10rpx 间距）弹行上方，否则下方，两侧都不够挑空间
-    // 大的一侧并钳回页面内；左对齐行内容（32rpx 行内边距），右缘越屏则钳到距右缘 12px
+    // 气泡几何与样式表对齐：宽 150px 固定（CSS；比消息列表宽，「添加到智联录」不截断），
+    // 高 = 项高 44px×N + 垂直内边距 4px×2；
+    // 上下空间实测判定：上方余量够（含 5px 间距）弹行上方，否则下方，两侧都不够挑空间
+    // 大的一侧并钳回页面内；左对齐行内容（16px 行内边距），右缘越屏则钳到距右缘 12px
     const win = uni.getWindowInfo();
-    const scale = win.windowWidth / 750;
     if (pageHpx <= 0) {
       pageHpx = win.windowHeight - pageTopPx;
     }
@@ -785,9 +864,9 @@
       rowMenuMaskTopStyle.value = "height: " + maskTopH.toString() + "px;";
       rowMenuMaskBottomStyle.value = "height: " + maskBottomH.toString() + "px;";
     }
-    const popWpx = 300 * scale;
-    const popHpx = (acts.length * 88 + 16) * scale;
-    const gapPx = 10 * scale;
+    const popWpx = 150;
+    const popHpx = acts.length * 44 + 8;
+    const gapPx = 5;
     const spaceAbovePx = holeTop;
     const spaceBelowPx = pageHpx - holeBottom;
     let popTop = -1;
@@ -805,7 +884,7 @@
         popTop = 6;
       }
     }
-    let popLeft = holeLeft + 32 * scale;
+    let popLeft = holeLeft + 16;
     const maxLeft = win.windowWidth - 12 - popWpx;
     if (popLeft > maxLeft) {
       popLeft = maxLeft < 12 ? 12 : maxLeft;
@@ -867,8 +946,19 @@
   /** 气泡根节点吞点击：点在气泡空白区不落穿到下方行/入口。 */
   function handleRowMenuPopTap(): void {}
 
-  /** 把 apiImContacts 的关系状态写到成员行（1/2/3 之外一律当无关系）。 */
-  async function markContacts(rows: GmMember[]): Promise<void> {
+  // ===== 智联录关系（原 markContacts 改「会话内一次拉取建表 + 逐页套用」：渐进
+  //       翻页下后续页的新行也要标，不必每页重拉整表关系）=====
+  /** 关系表（会话内缓存；null=拉取失败当无关系）。 */
+  let contactStates: Map<string, string> | null = null;
+  let contactStatesSession = -1;
+
+  /** 拉取智联录关系整表建 userId → status(1/2/3) 表（一次会话只拉一次，失败静默）。 */
+  async function ensureContactStates(session: number): Promise<void> {
+    if (contactStatesSession == session) {
+      return;
+    }
+    contactStatesSession = session;
+    contactStates = null;
     try {
       const res = await apiImContacts();
       if (apiResCode(res) != SUCCESS_CODE) {
@@ -884,30 +974,125 @@
         return;
       }
       const items = itemsRaw as UTSJSONObject[];
+      const map = new Map<string, string>();
       for (let i = 0; i < items.length; i++) {
         const id = readString(items[i], "userId");
         const st = readString(items[i], "status");
         if (id.length == 0 || (st != "1" && st != "2" && st != "3")) {
           continue;
         }
-        for (let j = 0; j < rows.length; j++) {
-          if (rows[j].userId == id) {
-            rows[j].contactState = st;
-          }
-        }
+        map.set(id, st);
       }
+      contactStates = map;
     } catch (_error) {
       // 静默
     }
   }
 
-  /** 详情（myRole/邀请开关）+ 成员列表 + 智联录关系标记。 */
+  /** 把关系表套到行上（1/2/3 之外一律当无关系；决定「添加到智联录」入口显隐）。 */
+  function applyContactStates(rows: GmMember[]): void {
+    const map = contactStates;
+    if (map == null) {
+      return;
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const st = map.get(rows[i].userId);
+      if (st != null && st.length > 0) {
+        rows[i].contactState = st;
+      }
+    }
+  }
+
+  /** 全量到账后回写成员缓存（@ 两入口复用的快照）：按当前行表过滤——删人是
+   *  splice 本地表、在途链的原始 records 仍含被删者，不过滤会把已退群的人写回
+   *  快照；会话已过期（期间整表重载）不写。★须定义在 chainMembers 之前（UTS
+   *  先声明后调用）。 */
+  function writeMembersCache(session: number): void {
+    if (session != membersSession) {
+      return;
+    }
+    const live = members.value;
+    const liveMap = new Map<string, boolean>();
+    for (let i = 0; i < live.length; i++) {
+      liveMap.set(live[i].userId, true);
+    }
+    const filtered: UTSJSONObject[] = [];
+    for (let i = 0; i < chainRawRecords.length; i++) {
+      const id = readString(chainRawRecords[i], "userId");
+      if (id.length > 0 && liveMap.get(id) == true) {
+        filtered.push(chainRawRecords[i]);
+      }
+    }
+    setCachedConvMembers(convId.value, filtered);
+  }
+
+  /** 后台翻页补齐：从 cursor 起串行拉到末页，每页解析合并入表并重排（保持
+   *  群主→管理员→成员分区）；晚归按会话号丢弃（重载/换群期间的旧响应），失败
+   *  挂 chainFailed 由尾部点击续拉。loadAll 首屏渲染后点火即走、不 await。 */
+  async function chainMembers(session: number, startCursor: string): Promise<void> {
+    let cursor = startCursor;
+    while (cursor.length > 0 && chainPages < 30) {
+      chainCursor = cursor;
+      chainRunning.value = true;
+      chainFailed.value = false;
+      const page = await apiImConvMembersPage(convId.value, cursor);
+      if (session != membersSession) {
+        return; // 在途整表重载（onShow/角色变更/加人）：旧链作废，链状态由新会话复位
+      }
+      if (page == null) {
+        chainRunning.value = false;
+        chainFailed.value = true;
+        return;
+      }
+      chainPages++;
+      const rows = members.value;
+      const added: GmMember[] = [];
+      for (let i = 0; i < page.records.length; i++) {
+        chainRawRecords.push(page.records[i]);
+        const m = parseMemberRow(page.records[i]);
+        if (m != null) {
+          rows.push(m);
+          added.push(m);
+        }
+      }
+      applyContactStates(added);
+      rows.sort((a: GmMember, b: GmMember): number => b.role - a.role);
+      members.value = copyMembers(rows);
+      resolveRowAvatars();
+      if (page.nextCursor.length == 0 || page.nextCursor == cursor) {
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+    chainRunning.value = false;
+    chainFailed.value = false;
+    chainCursor = "";
+    // 全量到账：回写 @ 两入口复用的成员缓存（群名片改名后经本页 onShow 重拉即保鲜）
+    writeMembersCache(session);
+  }
+
+  /** 翻页链失败重试：从断点 cursor 续拉（同会话）。 */
+  function handleChainRetry(): void {
+    if (chainFailed.value && chainCursor.length > 0) {
+      chainMembers(membersSession, chainCursor);
+    }
+  }
+
+  /** 详情（myRole/邀请开关）+ 成员首页 + 智联录关系标记；后续页后台串行补齐。 */
   async function loadAll(): Promise<void> {
     if (convId.value.length == 0 || loading.value) {
       return;
     }
     loading.value = true;
     loadFailed.value = false;
+    // 新会话：在途翻页链作废，链状态与渲染窗口复位
+    membersSession++;
+    const session = membersSession;
+    chainRunning.value = false;
+    chainFailed.value = false;
+    chainCursor = "";
+    chainPages = 0;
+    renderCount.value = RENDER_STEP;
     try {
       const res = await apiImConvDetail(convId.value);
       if (apiResCode(res) == SUCCESS_CODE) {
@@ -919,45 +1104,19 @@
           allowInviteRaw = inviteRaw == null ? "" : `${inviteRaw}`;
         }
       }
-      const mres = await apiImConvMembers(convId.value);
-      if (apiResCode(mres) != SUCCESS_CODE) {
+      const page = await apiImConvMembersPage(convId.value, "");
+      if (page == null) {
         loading.value = false;
         loadFailed.value = true;
         return;
       }
-      const mdataRaw = apiResData<any>(mres);
-      const mdataObj = mdataRaw != null ? (mdataRaw as UTSJSONObject) : null;
       const out: GmMember[] = [];
-      if (mdataObj != null) {
-        const recordsRaw = mdataObj["records"];
-        if (recordsRaw != null) {
-          const records = recordsRaw as UTSJSONObject[];
-          for (let i = 0; i < records.length; i++) {
-            const m = new GmMember();
-            m.userId = readString(records[i], "userId");
-            m.name = readString(records[i], "name");
-            m.nickName = readString(records[i], "nickName");
-            m.avatarRaw = readString(records[i], "avatar");
-            m.avatar = imAvatarDisplayUrl(m.avatarRaw, 72);
-            m.role = readNumber(records[i], "role", 1);
-            m.self = readBool(records[i], "self");
-            // 展示名：我设的备注 > 群卡片 > 平台昵称（微信语义；成员接口无备注，
-            // 备注取模块缓存——消息页/资料页刷新联系人时会写，本页 onShow 重拉即同步）
-            const cachedRemarks = getCachedContactRemarks();
-            const myRemark = cachedRemarks == null
-              ? ""
-              : cachedRemarks.get(m.userId) ?? "";
-            m.token = myRemark.length > 0
-              ? myRemark
-              : m.nickName.length > 0
-                ? m.nickName
-                : m.name.length > 0
-                  ? m.name
-                  : `用户${m.userId}`;
-            if (m.userId.length > 0) {
-              out.push(m);
-            }
-          }
+      chainRawRecords = [];
+      for (let i = 0; i < page.records.length; i++) {
+        chainRawRecords.push(page.records[i]);
+        const m = parseMemberRow(page.records[i]);
+        if (m != null) {
+          out.push(m);
         }
       }
       // 群主(3)→管理员(2)→普通成员(1) 端上稳定分区排序：服务端 listMembers 走
@@ -969,7 +1128,18 @@
       loading.value = false;
       inited = true;
       // 智联录关系标记（决定「添加到智联录」按钮显隐）；失败静默=当无关系处理
-      await markContacts(out);
+      await ensureContactStates(session);
+      if (session != membersSession) {
+        return;
+      }
+      applyContactStates(out);
+      // 后台串行补齐后续页（>100 人群）；链完成前搜索只覆盖已到账行。
+      // 单页即全量（≤100 人群）时直接回写成员缓存（@ 两入口复用）
+      if (page.nextCursor.length > 0) {
+        chainMembers(session, page.nextCursor);
+      } else {
+        writeMembersCache(session);
+      }
     } catch (_error) {
       loading.value = false;
       loadFailed.value = true;
@@ -999,6 +1169,8 @@
             break;
           }
         }
+        // 全量成员缓存失效（@ 两入口复用的快照残留已退群者；下次取用自会重拉）
+        invalidateCachedConvMembers(convId.value);
       } else {
         uni.showToast({ title: apiResMessage(res), icon: "none" });
       }
@@ -1195,9 +1367,11 @@
     loadAll();
   });
 
-  // 搜索过滤会整表重排（气泡锚定的行矩形失效）：输入即收浮层
+  // 搜索过滤会整表重排（气泡锚定的行矩形失效）：输入即收浮层；过滤结果换了一批
+  // 可见行（可能带未解析头像），补一轮窗口内头像解析
   watch(query, (_val: string) => {
     closeRowMenu();
+    resolveRowAvatars();
   });
 
   onShow(() => {
@@ -1231,19 +1405,19 @@
 
   .gm-header {
     flex-shrink: 0;
-    height: 108rpx;
-    padding: 0 20rpx;
+    height: 54px;
+    padding: 0 10px;
     display: flex;
     flex-direction: row;
     align-items: center;
     background-color: rgba(250, 249, 253, 0.92);
-    border-bottom: 2rpx solid rgba(81, 71, 255, 0.1);
+    border-bottom: 1px solid rgba(81, 71, 255, 0.1);
   }
 
   .gm-header__btn {
-    width: 72rpx;
-    height: 72rpx;
-    border-radius: 24rpx;
+    width: 36px;
+    height: 36px;
+    border-radius: 12px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -1268,19 +1442,19 @@
   }
 
   .gm-header__title {
-    max-width: 460rpx;
-    font-size: 33rpx;
-    line-height: 46rpx;
+    max-width: 230px;
+    font-size: 16.5px;
+    line-height: 23px;
     font-weight: 600;
     color: #17171a;
   }
 
   /* 添加入口：文案按钮（与返回键同占位宽，保持标题居中） */
   .gm-header__add {
-    min-width: 72rpx;
-    height: 72rpx;
-    padding: 0 8rpx;
-    border-radius: 24rpx;
+    min-width: 36px;
+    height: 36px;
+    padding: 0 4px;
+    border-radius: 12px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -1294,8 +1468,8 @@
   }
 
   .gm-header__add-text {
-    font-size: 30rpx;
-    line-height: 42rpx;
+    font-size: 15px;
+    line-height: 21px;
     font-weight: 600;
     color: #5147ff;
   }
@@ -1303,12 +1477,12 @@
   /* ===== 搜索（小圆角 + 左侧搜索 icon） ===== */
   .gm-search {
     flex-shrink: 0;
-    margin: 20rpx 32rpx 8rpx;
-    height: 76rpx;
-    padding: 0 24rpx;
-    border-radius: 12rpx;
+    margin: 10px 16px 4px;
+    height: 38px;
+    padding: 0 12px;
+    border-radius: 6px;
     background-color: #ffffff;
-    border: 2rpx solid #ecebf1;
+    border: 1px solid #ecebf1;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -1316,9 +1490,9 @@
   }
 
   .gm-search__icon {
-    width: 40rpx;
-    height: 40rpx;
-    margin-right: 12rpx;
+    width: 20px;
+    height: 20px;
+    margin-right: 6px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -1329,54 +1503,54 @@
   .gm-search__input {
     flex: 1;
     min-width: 0;
-    height: 72rpx;
-    font-size: 28rpx;
-    line-height: 40rpx;
+    height: 36px;
+    font-size: 14px;
+    line-height: 20px;
     color: #17171a;
   }
 
   .gm-search__ph {
     color: #b0aebc;
-    font-size: 28rpx;
+    font-size: 14px;
   }
 
   .gm-body {
     flex: 1;
     min-height: 0;
-    padding: 8rpx 0;
+    padding: 4px 0;
   }
 
   .gm-state {
-    padding: 200rpx 48rpx;
+    padding: 100px 24px;
     display: flex;
     flex-direction: column;
     align-items: center;
   }
 
   .gm-state__text {
-    font-size: 28rpx;
-    line-height: 40rpx;
+    font-size: 14px;
+    line-height: 20px;
     color: #9a98a5;
   }
 
   /* ===== 成员行内容（透明行直接排在页底色上，行高收紧；
-     ★行高由 min-height 兜底主导——头 72 + padding 2×10 = 92 < 96，改间距须连 min-height 一起动） ===== */
+     ★行高由 min-height 兜底主导——头 36 + padding 2×5 = 46 < 48，改间距须连 min-height 一起动） ===== */
   .gm-row {
-    min-height: 96rpx;
-    padding: 10rpx 32rpx;
+    min-height: 48px;
+    padding: 5px 16px;
     display: flex;
     flex-direction: row;
     align-items: center;
     box-sizing: border-box;
   }
 
-  /* 头像盒：72rpx 设计基准 + 模板内联整 pt 覆盖（gmAvaStyle，含半宽圆角）——
-     rpx 折小数 pt 时 iOS wrap 帧取整物理像素、子图按小数帧布局，右缘越出亚像素
-     被 overflow:hidden 裁剪削直边（消息页 chat-item__avatar-wrap 注释同款） */
+  /* 头像盒：36px 定值基准 + 模板内联同值（gmAvaStyle，含半宽圆角 18px）——px 整数
+     无小数帧且宽屏不随屏宽翻倍；历史 rpx 折小数 pt 时 iOS wrap 帧取整物理像素、子图
+     按小数帧布局，右缘越出亚像素被 overflow:hidden 裁剪削直边（消息页同款结论） */
   .gm-ava {
-    width: 72rpx;
-    height: 72rpx;
-    border-radius: 36rpx;
+    width: 36px;
+    height: 36px;
+    border-radius: 18px;
     flex-shrink: 0;
     display: flex;
     flex-direction: row;
@@ -1396,8 +1570,8 @@
   }
 
   .gm-ava-letter {
-    font-size: 28rpx;
-    line-height: 38rpx;
+    font-size: 14px;
+    line-height: 19px;
     font-weight: 600;
     color: #ffffff;
   }
@@ -1405,7 +1579,7 @@
   .gm-col {
     flex: 1;
     min-width: 0;
-    margin-left: 20rpx;
+    margin-left: 10px;
     display: flex;
     flex-direction: column;
   }
@@ -1417,16 +1591,16 @@
   }
 
   .gm-name {
-    max-width: 380rpx;
-    font-size: 29rpx;
-    line-height: 40rpx;
+    max-width: 190px;
+    font-size: 14.5px;
+    line-height: 20px;
     color: #22212a;
   }
 
   .gm-tag {
-    margin-left: 12rpx;
-    padding: 2rpx 12rpx;
-    border-radius: 8rpx;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 4px;
     background-color: rgba(81, 71, 255, 0.1);
   }
 
@@ -1435,26 +1609,19 @@
   }
 
   .gm-tag__text {
-    font-size: 20rpx;
-    line-height: 30rpx;
+    font-size: 10px;
+    line-height: 15px;
     color: #5147ff;
   }
 
-  .gm-sub {
-    margin-top: 4rpx;
-    font-size: 22rpx;
-    line-height: 32rpx;
-    color: #9a98a5;
-  }
-
   .gm-tail {
-    height: 40rpx;
+    height: 20px;
   }
 
   /* ===== 长按行操作浮层（双模式：gmMenuDark 平台=压暗蒙层挖洞+行高亮+白色气泡；
      MP=无蒙层同款气泡；消息列表同款）=====
-     几何与 onRowMenuRectsMeasured 的测量常量严格对齐：宽 300rpx 固定、项高 88rpx×N、
-     垂直内边距 8rpx×2——改这里必须同步改测量。
+     几何与 onRowMenuRectsMeasured 的测量常量严格对齐：宽 150px 固定、项高 44px×N、
+     垂直内边距 4px×2——改这里必须同步改测量。
      行高亮取按压态同色（#eceaf3）；气泡底纯白不透明；操作项按压深一档。 */
   .gm-row--menu-on {
     background-color: #eceaf3;
@@ -1471,19 +1638,19 @@
   .gm-menu-pop {
     position: fixed;
     z-index: 991;
-    /* 比消息列表 240rpx 放宽：本页最长文案「添加到智联录」6 字 + 图标 + 内边距 ≈280rpx */
-    width: 300rpx;
+    /* 比消息列表 120px 放宽：本页最长文案「添加到智联录」6 字 + 图标 + 内边距 ≈140px */
+    width: 150px;
     display: flex;
     flex-direction: column;
-    padding: 8rpx 0;
+    padding: 4px 0;
     background-color: #ffffff;
-    border-radius: 20rpx;
-    box-shadow: 0 8rpx 32rpx rgba(0, 0, 0, 0.16);
+    border-radius: 10px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16);
   }
 
   .gm-menu-act {
-    height: 88rpx;
-    padding: 0 28rpx;
+    height: 44px;
+    padding: 0 14px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -1513,11 +1680,11 @@
     bottom: 0;
   }
 
-  /* 图标统一盒（同尺寸不同形）：svg-icon 字形 32rpx 居中其中 */
+  /* 图标统一盒（同尺寸不同形）：svg-icon 字形 16px 居中其中 */
   .gm-menu-act__icon {
-    width: 40rpx;
-    height: 40rpx;
-    margin-right: 16rpx;
+    width: 20px;
+    height: 20px;
+    margin-right: 8px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -1526,8 +1693,8 @@
   }
 
   .gm-menu-act__text {
-    font-size: 28rpx;
-    line-height: 40rpx;
+    font-size: 14px;
+    line-height: 20px;
     color: #1c1b20;
     /* 项宽恒定，文案正常不截断；此配方仅作长文案（i18n）兜底：
        App 端 lines 须与 overflow/text-overflow 同元素配合才截断（global.scss 同配方），

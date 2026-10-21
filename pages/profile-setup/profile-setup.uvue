@@ -1,0 +1,453 @@
+<template>
+  <!--
+    新用户「取昵称+设头像」引导页（触发判定见 utils/profileSetupPrompt.uts，tab-shell
+    onShow 里 navigateTo 跳入）。由底部弹窗改为独立页面（2026-10-21）：弹窗在 tab-shell
+    （adjustResize，服务首页任务编辑器）上无法兼顾「背景不动 + 输入区在键盘上方」——
+    Android 键盘高度事件不可靠（chat.uvue 已知坑），独立页面直接吃页面级默认键盘行为，
+    全平台零自定义顶起代码。骨架对齐 reset-password：custom-nav-bar + scroll-view，
+    保存按钮在输入框下方拉通。
+    - 昵称、头像均可选：两样都空点保存 = 直接返回（等同跳过，无请求）；
+      只提交填了的字段（头像先传文件接口拿 URL，保存时与昵称一次 /api/user/update）
+    - 无冷却：跳过（导航栏返回）后每次登录进来仍会按同样条件判断；设置过昵称后条件不满足自然不再弹
+    - 昵称规则与编辑资料页一致：trim + 上限 50（Mobile.Profile.nickName 同款文案）
+  -->
+  <view class="setup-page">
+    <custom-nav-bar :title="t('Mobile.ProfileSetup.navTitle')" hasSafetyZone showBack fixed />
+
+    <scroll-view class="setup-page__body" direction="vertical" :show-scrollbar="false">
+      <text class="setup-page__subtitle">{{ t("Mobile.ProfileSetup.subtitle") }}</text>
+
+      <!-- 头像：白圆恒亮垫底（真图失败绝不空白），点按选图 -->
+      <view class="setup-page__avatar-wrap">
+        <view class="setup-page__avatar" :style="{ opacity: isUploading ? 0.7 : 1 }" @tap="handleChooseAvatar">
+          <view class="setup-page__avatar-fallback"></view>
+          <image
+            v-if="avatarSrc.length > 0"
+            :src="avatarSrc"
+            mode="aspectFill"
+            class="setup-page__avatar-img"
+            @error="handleAvatarError"
+          />
+          <view v-if="isUploading" class="setup-page__avatar-mask"></view>
+          <view class="setup-page__avatar-badge">
+            <svg-icon name="icon-Edit" size="14" unit="px" color="#4b4b52" />
+          </view>
+        </view>
+      </view>
+
+      <view class="setup-page__field">
+        <text class="setup-page__label">{{ t("Mobile.Profile.nickName") }}</text>
+        <view class="setup-page__input-box">
+          <input
+            class="setup-page__input"
+            v-model="nickName"
+            :maxlength="50"
+            :placeholder="t('Mobile.Profile.inputNickName')"
+            placeholder-class="setup-page__ph"
+          />
+          <text class="setup-page__count">{{ nickName.length }} / 50</text>
+        </view>
+      </view>
+
+      <view
+        class="setup-page__btn--ok"
+        :class="{ 'setup-page__btn--disabled': busy || isUploading }"
+        hover-class="setup-page__btn-ok--active"
+        @click="handleSubmit"
+      >
+        <text class="setup-page__btn-text--ok">
+          {{ t("Mobile.Common.save") }}
+        </text>
+      </view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { onUnload } from "@dcloudio/uni-app";
+  import { ref } from "vue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { apiUserInfo, apiUserUpdate } from "@/servers/account";
+  import { getUploadFileAction } from "@/constants/common.constants";
+  import { ACCESS_TOKEN } from "@/constants/home.constants";
+  import { applyBearerAuthorization } from "@/utils/authSession";
+  import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
+  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { PROFILE_SETUP_COMPLETED_EVENT } from "@/utils/profileSetupPrompt";
+  import eventBus from "@/utils/eventBus";
+  import defaultAvatar from "@/static/assets/avatar.png";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  const nickName = ref<string>("");
+  /** 提交防重 */
+  const busy = ref<boolean>(false);
+  /** 头像上传中（点按选图被挡） */
+  const isUploading = ref<boolean>(false);
+  /** 已上传头像的服务端 URL：选图只上传暂存，保存时才与昵称一起一次提交 */
+  let uploadedAvatarUrl = "";
+
+  // ===== 头像展示（页面常驻可见，无弹层时序问题：解析守卫 + 失败回落即可） =====
+
+  /** 展示地址（远程经 resolveDisplayImageUrl 解析；选中新图直接塞本地临时路径）。 */
+  const avatarSrc = ref<string>("");
+  /** 解析序号：异步解析回来时页面已离开/已换图就丢弃结果。 */
+  let resolveSeq = 0;
+
+  /**
+   * 解析并绑定展示头像：/api/f/ 受保护头像与远程 SVG 走 resolveDisplayImageUrl
+   * （同 avatar-uploader；本地临时路径与静态资源非 SVG 一律透传，无网络请求）。
+   */
+  function applyAvatar(raw: string): void {
+    const seq = ++resolveSeq;
+    const target = raw.length > 0 ? raw : defaultAvatar;
+    resolveDisplayImageUrl(target, 120, 120)
+      .then((resolved: string): void => {
+        if (seq != resolveSeq) {
+          return;
+        }
+        avatarSrc.value = resolved.length > 0 ? resolved : defaultAvatar;
+      })
+      .catch((_e: any | null): void => {
+        if (seq != resolveSeq) {
+          return;
+        }
+        avatarSrc.value = defaultAvatar;
+      });
+  }
+
+  function handleAvatarError(): void {
+    // 尚未给出 src（解析中）时收到的 error 一定不属于当前头像，忽略；
+    // 默认图也失败则保持兜底白圆，不再重试
+    if (avatarSrc.value.length == 0 || avatarSrc.value == defaultAvatar) return;
+    avatarSrc.value = defaultAvatar;
+  }
+
+  /** 进页拉一次当前头像（失败保持默认头像，不阻塞引导）。 */
+  function fetchCurrentAvatar(): void {
+    apiUserInfo()
+      .then((res) => {
+        if (apiResCode(res) != SUCCESS_CODE) {
+          applyAvatar("");
+          return;
+        }
+        const data = apiResData<any>(res);
+        const raw = data != null ? (data as UTSJSONObject) : null;
+        applyAvatar(raw != null && raw["avatar"] != null ? `${raw["avatar"]}` : "");
+      })
+      .catch((_e: any | null): void => {
+        applyAvatar("");
+      });
+  }
+
+  // ===== 选图 + 上传（校验照抄 avatar-uploader；上传只拿 URL 暂存，不落资料） =====
+
+  function isAvatarImage(type: string, fileName: string): boolean {
+    if (type == "image/jpeg" || type == "image/jpg" || type == "image/png" || type == "image/svg+xml") return true;
+    const lowerName = fileName.toLowerCase().split("?")[0];
+    return lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") || lowerName.endsWith(".png") || lowerName.endsWith(".svg");
+  }
+
+  function uploadAvatarFile(filePath: string): Promise<string> {
+    const header = new UTSJSONObject();
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    applyBearerAuthorization(header, token != null ? `${token}` : null);
+    applyXClientTypeHeader(header);
+
+    return new Promise<string>((resolve, reject) => {
+      uni.uploadFile({
+        url: getUploadFileAction(),
+        filePath,
+        name: "file",
+        header,
+        formData: { type: "tmp" },
+        success: (res) => {
+          try {
+            const response = JSON.parse(res.data) as UTSJSONObject;
+            if (apiResCode(response) != SUCCESS_CODE) {
+              reject(new Error("avatar upload response failed"));
+              return;
+            }
+            const data = apiResData<any>(response);
+            if (data == null) {
+              reject(new Error("avatar upload url missing"));
+              return;
+            }
+            const urlValue = (data as UTSJSONObject)["url"];
+            const url = urlValue != null ? `${urlValue}` : "";
+            if (url.length == 0) {
+              reject(new Error("avatar upload url missing"));
+              return;
+            }
+            resolve(url);
+          } catch (error) {
+            reject(error);
+          }
+        },
+        fail: (error) => reject(error),
+      });
+    });
+  }
+
+  function handleChooseAvatar(): void {
+    if (isUploading.value || busy.value) return;
+    uni.chooseImage({
+      count: 1,
+      sizeType: ["compressed"],
+      sourceType: ["album", "camera"],
+      success: (res) => {
+        const file = res.tempFiles.length > 0 ? res.tempFiles[0] : null;
+        if (file == null) return;
+        const fileType = file.type != null ? `${file.type}`.toLowerCase() : "";
+        const fileName = file.name != null && file.name.length > 0 ? file.name : file.path;
+        if (!isAvatarImage(fileType, fileName)) {
+          uni.showToast({ title: t("Mobile.Profile.avatarInvalidType"), icon: "none" });
+          return;
+        }
+        if (file.size >= 2 * 1024 * 1024) {
+          uni.showToast({ title: t("Mobile.Profile.avatarTooLarge"), icon: "none" });
+          return;
+        }
+        // 先本地预览（临时路径直出，不等上传）
+        applyAvatar(file.path);
+        isUploading.value = true;
+        uni.showLoading({ title: t("Mobile.Common.loading") });
+        uploadAvatarFile(file.path)
+          .then((url: string): void => {
+            uploadedAvatarUrl = url;
+          })
+          .catch((_e: any | null): void => {
+            // 上传失败：退回原头像预览，保存时不带 avatar 字段
+            console.error("[ProfileSetup] avatar upload failed");
+            uploadedAvatarUrl = "";
+            applyAvatar("");
+            uni.showToast({ title: t("Mobile.Profile.avatarUploadFailed"), icon: "none" });
+          })
+          .finally((): void => {
+            uni.hideLoading();
+            isUploading.value = false;
+          });
+      },
+    });
+  }
+
+  // ===== 返回 / 提交 =====
+
+  function closeBack(): void {
+    uni.navigateBack({});
+  }
+
+  /**
+   * 保存：昵称、头像均可选——两样都空 = 直接返回（无请求，等同跳过）；
+   * 否则只提交非空字段，昵称+头像一次 /api/user/update。
+   * 跳过语义 = 导航栏返回键（不写任何标记，下次登录仍会判断）。
+   */
+  async function handleSubmit(): Promise<void> {
+    if (busy.value || isUploading.value) {
+      return;
+    }
+    const nick = nickName.value.trim();
+    if (nick.length == 0 && uploadedAvatarUrl.length == 0) {
+      closeBack();
+      return;
+    }
+    busy.value = true;
+    try {
+      const body = new UTSJSONObject();
+      if (nick.length > 0) {
+        body["nickName"] = nick;
+      }
+      if (uploadedAvatarUrl.length > 0) {
+        body["avatar"] = uploadedAvatarUrl;
+      }
+      const res = await apiUserUpdate(body);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Profile.saveFailed"), icon: "none" });
+        return;
+      }
+      uni.showToast({ title: t("Mobile.Profile.saveSuccess"), icon: "success" });
+      // 通知「我的」等常驻 tab 刷新用户信息（emit 必须带载荷，无参 emit 是 no-op）
+      eventBus.emit(PROFILE_SETUP_COMPLETED_EVENT, nick);
+      closeBack();
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Profile.saveFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  // 进页拉当前头像（在声明之后调用：UTS 无提升）
+  fetchCurrentAvatar();
+
+  onUnload(() => {
+    // 离页兜底：上传 loading 不残留、在途解析结果作废
+    uni.hideLoading();
+    resolveSeq++;
+  });
+</script>
+
+<style lang="scss" scoped>
+  .setup-page {
+    flex: 1;
+    width: 100%;
+    height: 100%;
+    background-color: #ffffff;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+  }
+
+  .setup-page__body {
+    flex: 1;
+    min-height: 0;
+    padding: 14px 16px 30px;
+    box-sizing: border-box;
+    /* #ifdef H5 || MP-WEIXIN */
+    padding-bottom: calc(30px + env(safe-area-inset-bottom));
+    /* #endif */
+  }
+
+  .setup-page__subtitle {
+    color: #9a9aa2;
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .setup-page__avatar-wrap {
+    margin-top: 18px;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  /* 80px 圆头像 + 编辑角标（对齐 avatar-uploader）；白圆恒亮垫底，真图盖上 */
+  .setup-page__avatar {
+    position: relative;
+    width: 80px;
+    height: 80px;
+    overflow: hidden;
+    border-radius: 50%;
+    background-color: #ffffff;
+  }
+
+  .setup-page__avatar-fallback {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background-color: #f2f1f7;
+    border-radius: 50%;
+  }
+
+  .setup-page__avatar-img {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+  }
+
+  .setup-page__avatar-mask {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background-color: rgba(0, 0, 0, 0.28);
+  }
+
+  /* 编辑角标：与账号管理页 avatar-uploader 同款（右下 4px 白圆角标） */
+  .setup-page__avatar-badge {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    z-index: 1;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(255, 255, 255, 0.72);
+    border-radius: 50%;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+  }
+
+  .setup-page__field {
+    margin-top: 18px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .setup-page__label {
+    color: #1a1a1a;
+    font-size: 14px;
+    line-height: 20px;
+    font-weight: 500;
+  }
+
+  .setup-page__input-box {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    height: 44px;
+    padding: 0 12px;
+    border-radius: 10px;
+    background-color: #f6f5f8;
+    box-sizing: border-box;
+  }
+
+  .setup-page__input {
+    flex: 1;
+    min-width: 0;
+    height: 44px;
+    font-size: 14px;
+    color: #1c1b20;
+  }
+
+  .setup-page__ph {
+    color: #b7b7be;
+    font-size: 13px;
+  }
+
+  .setup-page__count {
+    margin-left: 8px;
+    flex-shrink: 0;
+    font-size: 12px;
+    color: #999999;
+  }
+
+  /* 保存按钮：输入框下方拉通（对齐 reset-password 全宽提交钮） */
+  .setup-page__btn--ok {
+    margin-top: 28px;
+    height: 44px;
+    border-radius: 12px;
+    background-color: #111111;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .setup-page__btn-ok--active {
+    background-color: #333333;
+  }
+
+  .setup-page__btn--disabled {
+    opacity: 0.55;
+  }
+
+  .setup-page__btn-text--ok {
+    font-size: 15px;
+    line-height: 21px;
+    font-weight: 500;
+    color: #ffffff;
+  }
+</style>

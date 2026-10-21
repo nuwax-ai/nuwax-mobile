@@ -1,0 +1,702 @@
+<template>
+  <!--
+    新的伙伴申请 · 申请详情底部卡片：
+    - 展示申请人头像/昵称 + 申请理由全文（≤100 字，服务端已截断），底部同意/拒绝
+    - 替代原系统 actionSheet：用户先看清理由再决定
+    - 接口在本组件内调用（同 remark-sheet），成功后 emit resolved 由页面整表刷新；
+      失败保留卡片便于重试（busy 同步置位防连点）
+    - 参数全部走 primitive 字符串（不声明 ImContactRow prop，规避 uvue 类实例
+      模板侧推断 any 的历史问题）
+  -->
+  <uni-modal-popup
+    ref="popupRef"
+    position="bottom"
+    :lazy-mount="true"
+    :height="sheetHeight"
+    :show-header="false"
+    :body-scroll="false"
+    :enable-swipe-close="!busy"
+    :mask-click="!busy"
+    @afterenter="handleAfterEnter"
+    @afterleave="handleAfterLeave"
+  >
+    <view class="apply-sheet" :style="sheetStyle">
+      <view class="apply-sheet__header">
+        <text class="apply-sheet__title">{{ t("Mobile.Message.applyDetailTitle") }}</text>
+        <view class="apply-sheet__close" @click="close">
+          <svg-icon name="icon-X" size="18" unit="px" color="#8a8a8a" />
+        </view>
+      </view>
+
+      <view class="apply-sheet__profile">
+        <view class="apply-sheet__avatar-wrap">
+          <!-- 兜底层常驻、显隐走 opacity（不用 v-if）：真图加载期间头像位留空、出图直接
+               落位，不做「默认 icon → 真图」的闪换。鸿蒙弹层打开瞬间呈现的是组件在隐藏
+               page-container 内的上一帧快照——若兜底层走 v-if，open 改状态也压不住那
+               一帧，仍会先闪默认文字圆再被移除；常驻 + opacity 只是同一节点的样式变更，
+               不涉及节点创建销毁。初始 avatarHasPhoto=true（假定有真图）让首次打开即
+               opacity 0，绝不会先露出默认圆 -->
+          <view
+            class="apply-sheet__avatar"
+            :style="fallbackAvatarStyle"
+          >
+            <text class="apply-sheet__avatar-text">{{ fallbackText }}</text>
+          </view>
+          <!-- 真图层常驻（地址非空即挂）、失败不回退卸载：只让兜底层 opacity 接管。
+               卸载节点会丢掉晚到的 @load 事件，图其实能出也永远看不到；常驻则最坏
+               情况是兜底圆盖住透明节点，最好情况是晚到一步的真图直接顶上来 -->
+          <view
+            v-if="avatarSrc.length > 0"
+            class="apply-sheet__avatar-clip"
+          >
+            <image
+              class="apply-sheet__avatar apply-sheet__avatar--img"
+              :src="avatarSrc"
+              mode="aspectFill"
+              :fade-show="false"
+              @load="handleAvatarLoaded"
+              @error="handleAvatarError"
+            />
+          </view>
+        </view>
+        <text class="apply-sheet__name text-ellipsis">{{ displayName }}</text>
+      </view>
+
+      <view class="apply-sheet__reason-block">
+        <text class="apply-sheet__reason-label">{{ t("Mobile.Message.applyReasonLabel") }}</text>
+        <view class="apply-sheet__reason-box">
+          <text
+            :class="applyMsg.length > 0 ? 'apply-sheet__reason-text' : 'apply-sheet__reason-text apply-sheet__reason-text--empty'"
+          >{{ applyMsg.length > 0 ? applyMsg : t("Mobile.Message.applyMsgEmpty") }}</text>
+        </view>
+      </view>
+
+      <view class="apply-sheet__footer">
+        <view
+          class="apply-sheet__btn"
+          :class="{ 'apply-sheet__btn--disabled': busy }"
+          hover-class="apply-sheet__btn-cancel--active"
+          @click="handleReject"
+        >
+          <text class="apply-sheet__btn-text apply-sheet__btn-text--cancel">
+            {{ t("Mobile.Message.contactReject") }}
+          </text>
+        </view>
+        <view
+          class="apply-sheet__btn apply-sheet__btn--ok"
+          :class="{ 'apply-sheet__btn--disabled': busy }"
+          hover-class="apply-sheet__btn-ok--active"
+          @click="handleAccept"
+        >
+          <text class="apply-sheet__btn-text apply-sheet__btn-text--ok">
+            {{ t("Mobile.Message.contactAccept") }}
+          </text>
+        </view>
+      </view>
+    </view>
+  </uni-modal-popup>
+</template>
+
+<script setup lang="uts">
+  import { computed, onUnmounted, ref, type ComponentPublicInstance } from "vue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { apiResCode } from "@/utils/apiResponse";
+  import { syncNativeTabBarState } from "@/utils/commonBusiness";
+  import { apiImContactAccept, apiImContactReject } from "@/servers/im";
+  import { avatarGradient as avatarGradientOf } from "./im-row-helpers.uts";
+  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  // uvue 模板不能直接调用导入函数——本地 const 包装（contact-list-pane 同款）
+  const avatarGradient = (name: string): string => avatarGradientOf(name);
+
+  const emit = defineEmits<{
+    /** 申请已处理（同意或拒绝成功）：页面据此整表刷新联系人。 */
+    resolved: [];
+  }>();
+
+  const popupRef = ref<any | null>(null);
+  const tabBarHiddenBySheet = ref<boolean>(false);
+  /** 目标申请人（userId 是 int64 雪花号，全程字符串） */
+  let targetUserId = "";
+
+  const displayName = ref<string>("");
+  const avatarSrc = ref<string>("");
+  const fallbackText = ref<string>("");
+  const applyMsg = ref<string>("");
+  /** 真图已上屏（@load）：看门狗据此区分「已绘制」与「挂了节点却没画出来」。 */
+  const avatarLoaded = ref<boolean>(false);
+  /** 真图加载失败：真图层退场、兜底层接手。 */
+  const avatarFailed = ref<boolean>(false);
+  /** open 时按快照重算「有真图可期」。初始 true = 假定有真图（兜底层 opacity 0）：
+   *  组件在页面加载时就已挂在隐藏的 page-container 里，鸿蒙弹层打开瞬间呈现的是
+   *  上一帧快照——初始假设「无真图」会让那帧先露出默认文字圆（真机实证的闪换）。 */
+  const avatarHasPhoto = ref<boolean>(true);
+  /** 兜底层显隐：仅「确无真图」或「真图加载失败」时才露出（加载期间头像位留空）。 */
+  const showFallbackAvatar = computed((): boolean => {
+    // #ifdef APP-HARMONY
+    // 鸿蒙没有「已绘制」事件可判（@load 会回调但节点可以不上屏，真机实证）→
+    // 兜底圆永远垫在真图层下面：真图能画就把它盖住，画不出来也不会留白。
+    return true;
+    // #endif
+    // #ifndef APP-HARMONY
+    return avatarHasPhoto.value != true || avatarFailed.value == true;
+    // #endif
+  });
+  /** 兜底层样式：渐变底 + opacity 显隐（字符串 style，同 chat 页读状态先例）。 */
+  const fallbackAvatarStyle = computed((): string => {
+    const opacity = showFallbackAvatar.value ? "1" : "0";
+    return "background-image: " + avatarGradient(displayName.value) + "; opacity: " + opacity + ";";
+  });
+  /** 提交防重（同时禁掉下滑关闭与遮罩点击，避免请求中被误关） */
+  const busy = ref<boolean>(false);
+
+  // ===== 头像绑定管线（鸿蒙弹层专项，2026-10-20 三轮真机）=====
+  // 鸿蒙的 <image> 只要祖先是在「隐藏态」建起来的，后续换 src、甚至晚建节点都可能
+  // 不上屏，而且 @load 照常回调（当「已绘制」用就会永远等不到真相）。对策分两层：
+  // 【结构】弹层加 lazy-mount：鸿蒙改为打开时才挂载 page-container 与整棵子树——节点
+  //   诞生在「点按触发、容器已可见」的那次渲染里（列表行能出图正是这条路）。
+  // 【兜底】① 鸿蒙仍把 src 绑定推迟到 afterenter 之后再延 350ms（避开进入动画帧），
+  //   afterenter 不派发时用 900ms 定时器兜；② 卡片拿不到列表行展示地址时自己解析
+  //   原始地址；③ 兜底圆在鸿蒙**恒亮**、永远垫在真图层下方——真图能画就盖住它，
+  //   画不出来也只是文字圆，绝不出现空白格；④ 绑完 @load 死线，没回调就重挂一次。
+  /** 待绑定的展示地址（地址已拿到、等可见再建节点）。 */
+  let pendingAvatarUrl = "";
+  /** 打开序号：异步解析回来时卡片已换人/已关闭就丢弃结果。 */
+  let avatarBindSeq = 0;
+  /** 弹层是否已完全展开（可见）。 */
+  let sheetVisible = false;
+  /** 鸿蒙：<image> 必须等弹层可见后再创建。 */
+  let deferAvatarBind = false;
+  // #ifdef APP-HARMONY
+  deferAvatarBind = true;
+  // #endif
+  /** 绑定后等 @load 的死线：到点仍未上屏 → 重挂一次，再不到点回退兜底圆（不赌平台事件）。 */
+  const AVATAR_WATCHDOG_MS = 1200;
+  /** afterenter 不派发时的兜底：超时按「已可见」处理，照常绑定。 */
+  const AVATAR_ENTER_FALLBACK_MS = 900;
+  /** 鸿蒙：afterenter 之后再等这么久才建节点（避开进入动画帧）。 */
+  const AVATAR_BIND_DELAY_MS = 350;
+  /** 头像解析尺寸（rpx，46px 展示 ×2 密度）。 */
+  const AVATAR_RESOLVE_RPX = 92;
+  let avatarWatchdogTimer = 0;
+  let avatarEnterFallbackTimer = 0;
+  let avatarRebindTimer = 0;
+  let avatarBindDelayTimer = 0;
+  /** 死线第一次触发时重挂一次节点（鸿蒙「新节点才绘制」），只重挂一次。 */
+  let avatarRetryDone = false;
+
+  function clearAvatarTimers(): void {
+    if (avatarWatchdogTimer != 0) {
+      clearTimeout(avatarWatchdogTimer);
+      avatarWatchdogTimer = 0;
+    }
+    if (avatarEnterFallbackTimer != 0) {
+      clearTimeout(avatarEnterFallbackTimer);
+      avatarEnterFallbackTimer = 0;
+    }
+    if (avatarRebindTimer != 0) {
+      clearTimeout(avatarRebindTimer);
+      avatarRebindTimer = 0;
+    }
+    if (avatarBindDelayTimer != 0) {
+      clearTimeout(avatarBindDelayTimer);
+      avatarBindDelayTimer = 0;
+    }
+  }
+
+  /** 重挂入口（UTS 同文件函数需先声明后引用，与 bindPendingAvatar 互相调用 → 用变量桥接） */
+  let avatarRebindRunner: (() => void) | null = null;
+
+  /** 绑定后的 @load 死线：能发事件的真失败走 @error，不能发事件的（鸿蒙）走这里。
+   *  第一次到点先卸节点、稍后重挂一次（新节点才绘制），再等不到才退兜底圆。 */
+  function armAvatarWatchdog(): void {
+    if (avatarWatchdogTimer != 0) {
+      clearTimeout(avatarWatchdogTimer);
+    }
+    avatarWatchdogTimer = setTimeout(() => {
+      avatarWatchdogTimer = 0;
+      if (avatarLoaded.value == true || avatarFailed.value == true) {
+        return;
+      }
+      const url = avatarSrc.value;
+      if (avatarRetryDone != true && url.length > 0) {
+        avatarRetryDone = true;
+        // 先卸载 → 稍后重挂：鸿蒙已存在节点换 src 不重绘，必须换新节点
+        avatarSrc.value = "";
+        console.error("[ApplyAva] watchdog rebind src=" + url);
+        avatarRebindTimer = setTimeout(() => {
+          avatarRebindTimer = 0;
+          pendingAvatarUrl = url;
+          const runner = avatarRebindRunner;
+          if (runner != null) {
+            runner();
+          }
+        }, 200);
+        return;
+      }
+      // 重挂后仍没上屏：退兜底圆，绝不长期留白
+      avatarFailed.value = true;
+      console.error("[ApplyAva] watchdog fallback src=" + url);
+    }, AVATAR_WATCHDOG_MS);
+  }
+
+  /** 把待绑地址交给 <image>（鸿蒙需等弹层可见；未就绪时保持待绑）。 */
+  function bindPendingAvatar(): void {
+    if (deferAvatarBind == true && sheetVisible != true) {
+      return;
+    }
+    if (pendingAvatarUrl.length == 0) {
+      return;
+    }
+    const url = pendingAvatarUrl;
+    pendingAvatarUrl = "";
+    avatarLoaded.value = false;
+    avatarFailed.value = false;
+    avatarSrc.value = url;
+    armAvatarWatchdog();
+    console.error("[ApplyAva] bind src=" + url);
+  }
+
+  avatarRebindRunner = (): void => {
+    bindPendingAvatar();
+  };
+
+  function handleAvatarLoaded(): void {
+    avatarLoaded.value = true;
+    avatarFailed.value = false;
+    if (avatarWatchdogTimer != 0) {
+      clearTimeout(avatarWatchdogTimer);
+      avatarWatchdogTimer = 0;
+    }
+  }
+
+  function handleAvatarError(): void {
+    avatarLoaded.value = false;
+    avatarFailed.value = true;
+    if (avatarWatchdogTimer != 0) {
+      clearTimeout(avatarWatchdogTimer);
+      avatarWatchdogTimer = 0;
+    }
+    console.error("[ApplyAva] error src=" + avatarSrc.value);
+  }
+
+  /** 理由区：每行 21px，最少 5 行（短理由也留足留白），最多 7 行。 */
+  const REASON_LINE_PX = 21;
+  const REASON_MIN_LINES = 5;
+  const REASON_MAX_LINES = 7;
+  /** 固定骨架（含理由框上下 14px 内边距）：14+26+14+46+16+18+8+28+14+44+12。 */
+  const SHEET_BASE_PX = 240;
+
+  /**
+   * 卡片高度：固定骨架 240px + 理由行数 × 21px + 底部安全区。
+   * popup body 槽在 App 端是 height:0 + flex:1，必须给确定高度（auto 会塌陷）；
+   * 理由最多 100 字（约 5 行），按 22 字/行估算，最少按 4 行给高度。
+   */
+  const sheetHeight = computed((): string => {
+    let safePx = 0;
+    // #ifndef H5
+    try {
+      safePx = uni.getWindowInfo().safeAreaInsets.bottom;
+    } catch (_e) {
+      safePx = 0;
+    }
+    // #endif
+    let lines = Math.ceil(applyMsg.value.length / 22);
+    if (lines < REASON_MIN_LINES) {
+      lines = REASON_MIN_LINES;
+    }
+    if (lines > REASON_MAX_LINES) {
+      lines = REASON_MAX_LINES;
+    }
+    return "" + (SHEET_BASE_PX + lines * REASON_LINE_PX + safePx) + "px";
+  });
+
+  /** 底部安全距离：App 端样式表 env() 不可靠；H5/小程序走样式表 env()，勿重复叠加。 */
+  const sheetStyle = computed((): string => {
+    let style = "";
+    // #ifdef APP
+    try {
+      const win = uni.getWindowInfo();
+      style = "padding-bottom: " + (12 + win.safeAreaInsets.bottom) + "px;";
+    } catch (_e) {
+      style = "";
+    }
+    // #endif
+    return style;
+  });
+
+  function callPopupMethod(methodName: string): void {
+    const proxy = popupRef.value as ComponentPublicInstance | null;
+    if (proxy == null) {
+      return;
+    }
+    proxy.$callMethod(methodName);
+  }
+
+  /** 打开卡片：记录申请人快照并重置加载态。 */
+  function open(
+    userId: string,
+    name: string,
+    avatarDisplay: string,
+    fallbackLine: string,
+    message: string,
+    /** 原始头像地址（可为空）：列表行还没解析出展示地址时由卡片自己解析 */
+    avatarRaw: string,
+  ): void {
+    targetUserId = userId;
+    displayName.value = name;
+    // 每轮打开都重置绑定态：上一轮的死线/可见标记不能漏到这一轮
+    clearAvatarTimers();
+    avatarBindSeq += 1;
+    const seq = avatarBindSeq;
+    sheetVisible = false;
+    avatarRetryDone = false;
+    pendingAvatarUrl = "";
+    avatarSrc.value = "";
+    avatarLoaded.value = false;
+    avatarFailed.value = false;
+    const sourceRaw = avatarRaw.length > 0 ? avatarRaw : avatarDisplay;
+    // 有真图可期即先行置位：兜底层在整个加载期（含鸿蒙等可见窗口）不出现
+    avatarHasPhoto.value = sourceRaw.length > 0;
+    if (avatarDisplay.length > 0) {
+      // 列表行已解析好的地址：直接用（免一次下载）
+      pendingAvatarUrl = avatarDisplay;
+      bindPendingAvatar();
+    } else if (avatarRaw.length > 0) {
+      // 列表行还没解析出来：卡片自己解析，不再依赖行状态
+      resolveDisplayImageUrl(avatarRaw, AVATAR_RESOLVE_RPX, AVATAR_RESOLVE_RPX)
+        .then((resolved: string): void => {
+          if (seq != avatarBindSeq) {
+            return;
+          }
+          if (resolved.length == 0) {
+            avatarFailed.value = true;
+            return;
+          }
+          pendingAvatarUrl = resolved;
+          bindPendingAvatar();
+        })
+        .catch((_e: any | null): void => {
+          if (seq != avatarBindSeq) {
+            return;
+          }
+          avatarFailed.value = true;
+        });
+    }
+    // 鸿蒙：afterenter 万一不派发（平台/动画差异）就超时按「已可见」处理照常绑定，
+    // 否则地址永远停在待绑、头像位始终空白
+    if (deferAvatarBind == true) {
+      avatarEnterFallbackTimer = setTimeout(() => {
+        avatarEnterFallbackTimer = 0;
+        sheetVisible = true;
+        bindPendingAvatar();
+      }, AVATAR_ENTER_FALLBACK_MS);
+    }
+    let fb = fallbackLine.trim();
+    if (fb.length == 0) {
+      // 兜底取字：页面正常会传 fallbackLine1；缺失时取名字前 2 字
+      fb = name.trim();
+      if (fb.length > 2) {
+        fb = fb.substring(0, 2);
+      }
+    }
+    fallbackText.value = fb;
+    // 申请附言折成单段（发送端为单行输入；PC 端可能带换行，避免卡片被撑高）
+    applyMsg.value = message.trim().split("\r").join("").split("\n").join(" ");
+    busy.value = false;
+    // 系统 TabBar 是独立原生层，页面内弹窗无法用 z-index 覆盖，先隐藏、关闭时恢复
+    tabBarHiddenBySheet.value = true;
+    uni.hideTabBar({
+      animation: false,
+      complete: () => {
+        callPopupMethod("open");
+      },
+    });
+  }
+
+  function close(): void {
+    callPopupMethod("close");
+  }
+
+  function restoreTabBar(): void {
+    if (tabBarHiddenBySheet.value != true) {
+      return;
+    }
+    tabBarHiddenBySheet.value = false;
+    syncNativeTabBarState();
+  }
+
+  /** 同意/拒绝：接口成功 → toast + 通知页面刷新 + 收起；失败保留卡片供重试。 */
+  async function submit(accept: boolean): Promise<void> {
+    if (busy.value || targetUserId.length == 0) {
+      return;
+    }
+    busy.value = true;
+    try {
+      const res = accept
+        ? await apiImContactAccept(targetUserId)
+        : await apiImContactReject(targetUserId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+        return;
+      }
+      uni.showToast({
+        title: accept
+          ? t("Mobile.Message.contactAccepted")
+          : t("Mobile.Message.contactRejected"),
+        icon: "none",
+      });
+      emit("resolved");
+      close();
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  function handleAccept(): void {
+    submit(true);
+  }
+
+  function handleReject(): void {
+    submit(false);
+  }
+
+  /** 卡片完全展开（进屏动画结束）：鸿蒙此时才把地址交给 <image>——弹层已可见，
+   *  真图元素在可见容器内创建（列表行同款正常路径）。 */
+  function handleAfterEnter(): void {
+    sheetVisible = true;
+    if (avatarEnterFallbackTimer != 0) {
+      clearTimeout(avatarEnterFallbackTimer);
+      avatarEnterFallbackTimer = 0;
+    }
+    // #ifdef APP-HARMONY
+    // afterenter 未必等于「原生容器已可见」：在它的那一帧里建节点仍会落在隐藏态。
+    // 稍延一帧之后新建，走「可见容器内新建节点」这条真机验证过的正常路径。
+    avatarBindDelayTimer = setTimeout(() => {
+      avatarBindDelayTimer = 0;
+      bindPendingAvatar();
+    }, AVATAR_BIND_DELAY_MS);
+    // #endif
+    // #ifndef APP-HARMONY
+    bindPendingAvatar();
+    // #endif
+  }
+
+  /** 卡片完全收起：清掉绑定死线并恢复 tabBar。 */
+  function handleAfterLeave(): void {
+    sheetVisible = false;
+    avatarBindSeq += 1;
+    clearAvatarTimers();
+    restoreTabBar();
+  }
+
+  defineExpose({
+    open: open as any,
+    close: close as any,
+  });
+
+  onUnmounted(() => {
+    clearAvatarTimers();
+    restoreTabBar();
+  });
+</script>
+
+<style lang="scss" scoped>
+  .apply-sheet {
+    width: 100%;
+    height: 100%;
+    padding: 14px 16px 12px;
+    /* #ifdef H5 || MP-WEIXIN */
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    /* #endif */
+    background-color: #ffffff;
+    border-radius: 16px 16px 0 0;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .apply-sheet__header {
+    min-height: 26px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__title {
+    color: #111111;
+    font-size: 16px;
+    line-height: 22px;
+    font-weight: 600;
+  }
+
+  .apply-sheet__close {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ===== 申请人：头像 + 昵称 ===== */
+  .apply-sheet__profile {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__avatar-wrap {
+    position: relative;
+    width: 46px;
+    height: 46px;
+    margin-right: 12px;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__avatar {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .apply-sheet__avatar--img {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+  }
+
+  .apply-sheet__avatar-clip {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    overflow: hidden;
+    z-index: 1;
+  }
+
+  .apply-sheet__avatar-text {
+    font-size: 16px;
+    line-height: 20px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .apply-sheet__name {
+    flex: 1;
+    min-width: 0;
+    font-size: 17px;
+    line-height: 22px;
+    font-weight: 500;
+    color: #141416;
+  }
+
+  /* ===== 申请理由 ===== */
+  .apply-sheet__reason-block {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .apply-sheet__reason-label {
+    font-size: 13px;
+    line-height: 18px;
+    color: #94929c;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__reason-box {
+    margin-top: 8px;
+    padding: 14px;
+    /* 最少 5 行留白（与 sheetHeight 的 REASON_MIN_LINES 同步） */
+    min-height: 105px;
+    border-radius: 10px;
+    background-color: #f6f5f8;
+    flex-shrink: 0;
+  }
+
+  .apply-sheet__reason-text {
+    font-size: 14px;
+    line-height: 21px;
+    color: #1c1b20;
+    word-break: break-all;
+  }
+
+  .apply-sheet__reason-text--empty {
+    color: #b7b7be;
+  }
+
+  /* ===== 底部按钮：拒绝=浅灰、同意=品牌紫（与 remark-sheet 一致） ===== */
+  .apply-sheet__footer {
+    flex-shrink: 0;
+    padding-top: 14px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .apply-sheet__btn {
+    flex: 1;
+    min-width: 96px;
+    height: 44px;
+    padding: 0 16px;
+    border-radius: 12px;
+    background-color: #f2f1f7;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .apply-sheet__btn-cancel--active {
+    background-color: #e8e7f0;
+  }
+
+  .apply-sheet__btn--ok {
+    margin-left: 12px;
+    background-color: #111111;
+  }
+
+  .apply-sheet__btn-ok--active {
+    background-color: #333333;
+  }
+
+  .apply-sheet__btn--disabled {
+    opacity: 0.55;
+  }
+
+  .apply-sheet__btn-text {
+    font-size: 15px;
+    line-height: 21px;
+    font-weight: 500;
+  }
+
+  .apply-sheet__btn-text--cancel {
+    color: #4b4b52;
+  }
+
+  .apply-sheet__btn-text--ok {
+    color: #ffffff;
+  }
+</style>

@@ -1,0 +1,438 @@
+<template>
+  <view class="ifd-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 标题（与聊天页/引用详情同款双段头） -->
+    <view class="ifd-header">
+      <view class="ifd-header__btn" hover-class="ifd-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="40" color="#141416" />
+      </view>
+      <view class="ifd-header__title-wrap">
+        <text class="ifd-header__title">{{ t("Mobile.Message.fileDetail") }}</text>
+      </view>
+      <view class="ifd-header__btn ifd-header__btn--ghost" />
+    </view>
+
+    <!-- 文件信息 + 下载/打开按钮（随内容流，不贴底） -->
+    <scroll-view class="ifd-body" direction="vertical" :show-scrollbar="false">
+      <view class="ifd-card">
+        <view class="ifd-icon-wrap">
+          <file-type-icon :file-name="fileName" :url="url" :size="160" />
+        </view>
+        <text class="ifd-name text-ellipsis-2">{{ displayName }}</text>
+        <text class="ifd-meta">{{ metaText }}</text>
+      </view>
+      <view v-if="downloading" class="ifd-loading">
+        <view class="ifd-loading__dots">
+          <view v-for="(ds, idx) in loadingDotStyles" :key="idx" class="ifd-loading__dot" :style="ds" />
+        </view>
+        <text class="ifd-loading__text">{{ t("Mobile.Message.fileDownloading") }}</text>
+      </view>
+      <view v-else class="ifd-action" hover-class="ifd-action--active" @click="handleActionTap">
+        <text class="ifd-action__text">{{ actionText }}</text>
+      </view>
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { switchMainTab } from "@/utils/mainTabNavigation";
+
+  import { computed, ref } from "vue";
+  import { onLoad, onShow, onUnload } from "@dcloudio/uni-app";
+  import {
+    extractFileNameFromUrl,
+    isAuthProtectedFileUrl,
+    openRemoteFileUrl,
+    resolveAuthProtectedFileFetchUrl,
+  } from "@/utils/authProtectedFileUrl";
+  import { formatFileSize } from "@/utils/imFileCard";
+  import { imFileDownloadKey, isImFileDownloaded, markImFileDownloaded, unmarkImFileDownloaded } from "@/utils/imFileDownloadRegistry";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  // #ifdef APP
+  import { downloadFileInApp, isImFileDownloadedNow, openDownloadedFile, resolveDownloadedFilePath } from "@/subpackages/utils/fileTree";
+  // #endif
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  // ===== 页面入参 =====
+  const url = ref<string>("");
+  const fileName = ref<string>("");
+  const size = ref<number>(0);
+  const mime = ref<string>("");
+
+  // ===== 本地状态 =====
+  const downloading = ref<boolean>(false);
+  const downloaded = ref<boolean>(false);
+  /** 「打开」用的路径：本页下载 resolve 或按文件名从公共 Download 回捞；空则点打开回落重走下载 */
+  const localPath = ref<string>("");
+
+  /** 下载中内联 loading：三点轮换（timer 驱动，已发送语音转文字三点 loading 同款先例） */
+  const loadingPhase = ref<number>(0);
+  let loadingTimerId: number = -1;
+
+  function readOption(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const value = `${raw}`;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded != null ? decoded : value;
+    } catch (_e) {
+      return value;
+    }
+  }
+
+  const displayName = computed((): string => {
+    return fileName.value.length > 0 ? fileName.value : extractFileNameFromUrl(url.value);
+  });
+
+  /** 次行说明：大小；已下载附「已下载」（未下载不标——按钮即下载入口）；H5 仅大小。 */
+  const metaText = computed((): string => {
+    const sizeText = formatFileSize(size.value);
+    // #ifdef APP
+    if (downloaded.value) {
+      const status = t("Mobile.Message.fileDownloaded");
+      return sizeText.length > 0 ? `${sizeText} · ${status}` : status;
+    }
+    // #endif
+    return sizeText;
+  });
+
+  /** 按钮文案：已下载 → 打开，未下载 → 下载（下载中按钮隐藏，由内联 loading 接管）；H5 恒「下载」。 */
+  const actionText = computed((): string => {
+    // #ifdef APP
+    if (downloaded.value) {
+      return t("Mobile.Common.open");
+    }
+    // #endif
+    return t("Mobile.Terminal.download");
+  });
+
+  /** 三点 loading 各点透明度（computed 驱动重渲——模板直调函数不收集依赖的 Android 坑）。 */
+  const loadingDotStyles = computed((): string[] => {
+    const out: string[] = [] as string[];
+    for (let i = 0; i < 3; i++) {
+      out.push(`opacity: ${i == loadingPhase.value ? 1 : 0.25};`);
+    }
+    return out;
+  });
+
+  /** 刷新下载状态：注册表 flag + Android 实查（文件已被用户删除 → 撤标纠偏，聊天页等列表同步回「未下载」）。 */
+  function refreshDownloadState(): void {
+    // #ifdef APP
+    downloaded.value = false;
+    if (url.value.length == 0) {
+      return;
+    }
+    const key = imFileDownloadKey(fileName.value, url.value);
+    if (!isImFileDownloaded(key)) {
+      return;
+    }
+    if (isImFileDownloadedNow(fileName.value, url.value)) {
+      downloaded.value = true;
+      return;
+    }
+    unmarkImFileDownloaded(key);
+    // #endif
+  }
+
+  function stopLoadingDots(): void {
+    if (loadingTimerId != -1) {
+      clearInterval(loadingTimerId);
+      loadingTimerId = -1;
+    }
+  }
+
+  function startLoadingDots(): void {
+    stopLoadingDots();
+    loadingPhase.value = 0;
+    loadingTimerId = setInterval((): void => {
+      loadingPhase.value = (loadingPhase.value + 1) % 3;
+    }, 400);
+  }
+
+  onLoad((options: any) => {
+    url.value = readOption(options, "url");
+    fileName.value = readOption(options, "fileName");
+    mime.value = readOption(options, "mime");
+    const sizeRaw = parseFloat(readOption(options, "size"));
+    size.value = sizeRaw != sizeRaw ? 0 : sizeRaw;
+    refreshDownloadState();
+  });
+
+  // 回页重估（返回本页时同步别处下载/删除造成的变化；下载进行中不打扰）
+  onShow(() => {
+    if (!downloading.value) {
+      refreshDownloadState();
+    }
+  });
+
+  onUnload(() => {
+    stopLoadingDots();
+  });
+
+  /**
+   * 下载（chat.uvue handleBinaryUrlDownload 同款路由）：App 走 downloadFileInApp
+   * silent 模式（受保护 /api/f/ 带 Bearer 拉取后拷入公共 Download 目录；不弹全屏
+   * loading 与「下载完成」确认框——本页内联三点 loading + 「打开」按钮即替代原弹窗），
+   * H5 走 openRemoteFileUrl（blob 下载/新标签）。
+   */
+  function handleDownload(): void {
+    const name = displayName.value;
+    // #ifdef APP
+    downloading.value = true;
+    startLoadingDots();
+    const protectedFile = isAuthProtectedFileUrl(url.value);
+    const downloadUrl = protectedFile ? resolveAuthProtectedFileFetchUrl(url.value) : url.value;
+    downloadFileInApp(downloadUrl, name, protectedFile, true)
+      .then((path: string) => {
+        localPath.value = path;
+        downloaded.value = true;
+        // 汇合点已按文件名打标；此处再按本页键（fileName 优先）补标，覆盖 fileName 为空的边角
+        markImFileDownloaded(imFileDownloadKey(fileName.value, url.value));
+        downloading.value = false;
+        stopLoadingDots();
+      })
+      .catch((_e: any | null) => {
+        // downloadFileInApp 内部已 toast 失败原因
+        downloading.value = false;
+        stopLoadingDots();
+      });
+    // #endif
+    // #ifndef APP
+    openRemoteFileUrl(url.value, name).catch((_e: any | null) => {
+      uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+    });
+    // #endif
+  }
+
+  /** 打开文件（原下载弹窗「打开」同款链路：apk 走安装 Intent，其余 openDocument）。
+   *  本页有 localPath 直接用；别处下载的按文件名到公共 Download 回捞路径（Android）；
+   *  回捞不到（iOS tmp / 文件已删）回落重走下载。 */
+  function handleOpen(): void {
+    // #ifdef APP
+    let path = localPath.value;
+    if (path.length == 0) {
+      path = resolveDownloadedFilePath(displayName.value);
+      localPath.value = path;
+    }
+    if (path.length == 0) {
+      handleDownload();
+      return;
+    }
+    openDownloadedFile(path);
+    // #endif
+  }
+
+  /** 底部按钮：下载中防重复点击；已下载（APP）→ 打开，否则下载。
+   *  ★UTS→Kotlin 声明须先于引用（error18）：本函数只能排在 handleDownload/handleOpen 之后。 */
+  function handleActionTap(): void {
+    if (downloading.value || url.value.length == 0) {
+      return;
+    }
+    // #ifdef APP
+    if (downloaded.value) {
+      handleOpen();
+      return;
+    }
+    // #endif
+    handleDownload();
+  }
+
+  function handleBack(): void {
+    // 刷新后栈底保护：同 quote-detail，无页可退时切回消息 tab
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      switchMainTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架：与聊天页同款渐变底 ===== */
+  .ifd-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background-image: linear-gradient(180deg, #f3f0fc 0%, #edebf8 100%);
+    /* #ifdef H5 */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* #endif */
+  }
+
+  .ifd-header {
+    flex-shrink: 0;
+    height: 108rpx;
+    padding: 0 20rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: #ffffff;
+    /* 底部分割线（聊天页/文件页同款灰线） */
+    border-bottom: 2rpx solid #e5e6eb;
+  }
+
+  .ifd-header__btn {
+    width: 72rpx;
+    height: 72rpx;
+    border-radius: 24rpx;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .ifd-header__btn--active {
+    background-color: rgba(81, 71, 255, 0.06);
+  }
+
+  .ifd-header__btn--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
+  .ifd-header__title-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .ifd-header__title {
+    font-size: 33rpx;
+    line-height: 46rpx;
+    font-weight: 600;
+    color: #17171a;
+  }
+
+  .ifd-body {
+    flex: 1;
+    min-height: 0;
+    padding: 32rpx;
+  }
+
+  /* ===== 文件信息卡 ===== */
+  .ifd-card {
+    padding: 64rpx 40rpx;
+    background-color: #ffffff;
+    border-radius: 20rpx;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .ifd-icon-wrap {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ifd-name {
+    margin-top: 40rpx;
+    align-self: stretch;
+    text-align: center;
+    font-size: 30rpx;
+    line-height: 44rpx;
+    color: #22212a;
+    word-break: break-all;
+  }
+
+  .ifd-meta {
+    margin-top: 12rpx;
+    font-size: 24rpx;
+    line-height: 34rpx;
+    color: #9a98a5;
+  }
+
+  /* ===== 下载/打开按钮（随内容流，卡片下方居中） ===== */
+  .ifd-action {
+    width: 50%;
+    margin-top: 48rpx;
+    align-self: center;
+    padding: 22rpx 0;
+    border-radius: 44rpx;
+    background-color: #111111;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ifd-action--active {
+    background-color: #333333;
+  }
+
+  .ifd-action__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    font-weight: 500;
+    color: #ffffff;
+  }
+
+  /* 下载中：占按钮位的内联三点 loading（替代原「下载完成」确认框） */
+  .ifd-loading {
+    width: 50%;
+    margin-top: 48rpx;
+    align-self: center;
+    padding: 22rpx 0;
+    border-radius: 44rpx;
+    background-color: #ecebfa;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ifd-loading__dots {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    margin-right: 12rpx;
+  }
+
+  .ifd-loading__dot {
+    width: 10rpx;
+    height: 10rpx;
+    border-radius: 5rpx;
+    background-color: #5147ff;
+    margin: 0 4rpx;
+  }
+
+  .ifd-loading__text {
+    font-size: 28rpx;
+    line-height: 40rpx;
+    font-weight: 500;
+    color: #5147ff;
+  }
+</style>
+
+<!-- uvue (uni-app x Android/iOS) 不支持 page 选择器，仅 H5 / 小程序需要 -->
+<style lang="scss">
+  /* #ifdef H5 */
+  page {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  uni-page-body {
+    height: 100%;
+    overflow: hidden;
+    background-color: #f3f0fc;
+  }
+  /* #endif */
+</style>

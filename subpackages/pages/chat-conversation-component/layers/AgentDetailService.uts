@@ -375,7 +375,7 @@ class _ConversationChatSuggestParams implements ConversationChatSuggestParams {
   }
 }
 
-function buildConversationChatSuggestParams(raw: any): ConversationChatSuggestParams {
+function buildConversationChatSuggestParams(raw: any | null): ConversationChatSuggestParams {
   return new _ConversationChatSuggestParams(raw);
 }
 
@@ -653,6 +653,8 @@ export default class AgentDetailService {
   private fileTreeFlatFiles: any[] = [];
   /** 流式会话代数：abort/新开流时递增，用于丢弃旧 SSE 回调 */
   private streamGeneration: number = 0;
+  /** 建议请求版本：新请求或中断续接后丢弃旧回包。 */
+  private chatSuggestRequestVersion: number = 0;
   /**
    * live/sub fail 后置 true：保持 isConversationActive 视觉态（loading 不消失），
    * 同时标记「需恢复」，busy 判断据此放行轮询 / 立即续接；
@@ -1233,16 +1235,6 @@ export default class AgentDetailService {
     }
     const taskStatusRaw = readRawField(stopConvInfo, "taskStatus");
     if (taskStatusRaw == null || `${taskStatusRaw}` != `${TaskStatus.EXECUTING}`) {
-      // 预期 EXECUTING 才写：skip 日志用于确认「没写入是因为本来就不在执行中」，
-      // 而不是路径没走到（排查固化 EXECUTING 时 cur= 值是关键证据）
-      console.log(
-        "[AgentDetailService] taskStatus terminal skip: cur=" +
-          `${taskStatusRaw}` +
-          " next=" +
-          `${nextStatus}` +
-          " convId=" +
-          `${this.data.conversationId.value}`,
-      );
       return;
     }
     try {
@@ -1256,12 +1248,6 @@ export default class AgentDetailService {
       }
       convObj["taskStatus"] = nextStatus;
       this.data.conversationInfo.value = convObj as any;
-      console.log(
-        "[AgentDetailService] taskStatus terminal: EXECUTING -> " +
-          `${nextStatus}` +
-          " convId=" +
-          `${this.data.conversationId.value}`,
-      );
     } catch (_e) {
       // ignore
     }
@@ -2082,12 +2068,6 @@ export default class AgentDetailService {
       newMessage = buildMessageInfoFromDraft(m);
       this.data.isConversationActive.value = false;
       this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
-      console.log(
-        "[AgentDetailService] ERROR event terminal: taskStatus->FAILED toolsFailed=" +
-          `${failedTools}` +
-          " msgId=" +
-          `${currentMessageId}`,
-      );
     }
 
     // 更新消息列表草稿
@@ -2619,7 +2599,6 @@ export default class AgentDetailService {
           if (streamGen != this.streamGeneration) {
             return;
           }
-          console.warn("[SSE-Stream] stream abnormal close / timeout");
           this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, false);
         },
         () => {
@@ -2819,7 +2798,7 @@ export default class AgentDetailService {
         finished: finished,
       });
     } catch (eSpeak) {
-      console.warn("[AgentDetailService] streamSpeakFeed ignored (TTS must not break SSE)", eSpeak);
+      // ignore
     }
   }
 
@@ -2843,7 +2822,7 @@ export default class AgentDetailService {
         }
       }
     } catch (eSeal) {
-      console.warn("[AgentDetailService] sealStreamingAssistant ignored", eSeal);
+      // ignore
     }
   }
 
@@ -2866,10 +2845,6 @@ export default class AgentDetailService {
     if (fromBackground == true) {
       this.pendingBackgroundReconnect = true;
       // 保持「生成中」，便于回前台续接；不调 onTimeout（避免按钮态立刻变空闲）
-      console.warn(
-        "[SSE-Stream] soft finalize while background, pending reconnect gen=" +
-          `${streamGen}`,
-      );
       this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
       return;
     }
@@ -2897,13 +2872,6 @@ export default class AgentDetailService {
     // （cleanupSub 的 resumeFailStreak 阈值路径；taskStatus 终态在那里写，不在 fail 时刻写：
     // 若立即落 FAILED，网络抖动后续接成功时会与「任务实际仍在执行」矛盾，且重引翻转）。
     // isRealError 仅用于日志区分来源（真实网络 error vs timeout/异常关闭兜底）。
-    console.log(
-      "[SSE-Stream] abnormal finalize: isRealError=" +
-        `${isRealError}` +
-        " gen=" +
-        `${streamGen}` +
-        " -> resumePending",
-    );
     this.streamResumePending = true;
     this.resumeFailStreak = this.resumeFailStreak + 1;
     this.scheduleRecoverIfAssistantLoading(false, streamGen);
@@ -2940,10 +2908,7 @@ export default class AgentDetailService {
       }
       this.data.messageList.value = [...list.slice(0, list.length - 1), updated];
     } catch (ePersist) {
-      console.warn(
-        "[AgentDetailService] persistSpeakableText ignored (must not break SSE/UI)",
-        ePersist,
-      );
+      // ignore
     }
   }
 
@@ -2997,15 +2962,9 @@ export default class AgentDetailService {
     // 仅当最后一条消息仍有未决 OpenUI 时回补，避免所有普通会话额外请求。
     await this.hydrateCompletedOpenUiIfNeeded(isTempChat);
 
-    // 如果不是临时会话,则处理问题建议，临时会话，不需要处理问题建议
+    // live 与 sub 共用建议加载，临时会话保持不生成建议。
     if (!isTempChat) {
-      if (this.data.isSuggest.value) {
-        const suggestParams = buildConversationChatSuggestParams(params);
-        const responseData = await apiAgentConversationChatSuggest(suggestParams);
-        // 更新问题建议列表
-        const rd = responseData != null ? responseData.data : null;
-        this.data.chatSuggestList.value = rd != null ? (rd as any[]) : [];
-      }
+      await this.refreshChatSuggest(buildConversationChatSuggestParams(params), genAtComplete);
     }
     // 会话完成后根据消息列表中的最后一条消息 判断是否存在 <task-result> 标签
     const lastMessage =
@@ -3035,6 +2994,33 @@ export default class AgentDetailService {
       }
     }
     // 正常 onComplete 不做 recover；异常断流由 finalize → 详情回补，EXECUTING 由页面轮询开 sub
+  }
+
+  /** 回复完成后加载建议；失败不影响收尾，旧会话/旧轮次的结果不得覆盖当前建议。 */
+  private async refreshChatSuggest(
+    params: ConversationChatSuggestParams,
+    streamGen: number,
+  ): Promise<void> {
+    const conversationId = params.conversationId;
+    if (this.data.isTempChat.value || !this.data.isSuggest.value || conversationId <= 0 ||
+      this.data.conversationId.value != conversationId || this.streamGeneration != streamGen) {
+      return;
+    }
+    this.chatSuggestRequestVersion = this.chatSuggestRequestVersion + 1;
+    const requestVersion = this.chatSuggestRequestVersion;
+    try {
+      const response = await apiAgentConversationChatSuggest(params);
+      if (requestVersion != this.chatSuggestRequestVersion || this.streamGeneration != streamGen ||
+        this.data.conversationId.value != conversationId || this.data.isTempChat.value || !this.data.isSuggest.value) {
+        return;
+      }
+      if (apiResCode(response) != SUCCESS_CODE) return;
+      // Android 响应是 UTSJSONObject，统一用 apiResData，避免接口属性访问。
+      const suggestions = apiResData<any>(response);
+      this.data.chatSuggestList.value = suggestions != null ? (suggestions as any[]) : [];
+    } catch (error) {
+      // ignore
+    }
   }
 
   /** 用历史详情链路回补已完成但 live SSE 未携带 ref 的 OpenUI。 */
@@ -3183,6 +3169,9 @@ export default class AgentDetailService {
     // 先中断旧 sub，再标记订阅（abort 会置 isSubscribed=false，必须在标记前）
     this.abortSubConversation();
     this.isSubscribed = true;
+    const streamGen = this.streamGeneration;
+    const suggestParams = buildConversationChatSuggestParams(null);
+    suggestParams.conversationId = conversationId;
     // 已接管续流：清 pending；若随后在后台再被掐断，softCleanup 会再置位
     this.pendingBackgroundReconnect = false;
 
@@ -3278,9 +3267,6 @@ export default class AgentDetailService {
       }
       this.isSubscribed = false;
       this.pendingBackgroundReconnect = true;
-      console.warn(
-        "[SSE-Sub] soft cleanup while background, pending reconnect",
-      );
       if (onSubClose != null) {
         (onSubClose as () => void)();
       }
@@ -3316,6 +3302,10 @@ export default class AgentDetailService {
       }
       const dataObj = dataRaw as UTSJSONObject;
       ensureConversationTitleFromDetail(dataObj);
+      const agent = dataObj["agent"];
+      if (agent != null) {
+        this.data.isSuggest.value = readRawField(agent, "openSuggest") == OpenCloseEnum.Open;
+      }
       const taskStatusRaw = dataObj["taskStatus"];
       const taskStatusStr =
         taskStatusRaw != null ? `${taskStatusRaw}` : "";
@@ -3332,6 +3322,9 @@ export default class AgentDetailService {
         }
         // 后端已非执行中：正常收尾关态
         cleanupSub(true, false);
+        if (taskStatusStr == `${TaskStatus.COMPLETE}`) {
+          await this.refreshChatSuggest(suggestParams, streamGen);
+        }
         return;
       }
       // skipListRebuild=true：列表已由调用方（resume/进页的 handleQueryConversation）
@@ -3500,11 +3493,14 @@ export default class AgentDetailService {
       }
     };
     requestConfig.onComplete = () => {
+      if (isCleanedUp || !this.isSubscribed || streamGen != this.streamGeneration ||
+        this.data.conversationId.value != conversationId) return;
       // sub SSE 正常结束：立刻关掉 Loading（不等 ChatFinished / 详情回拉）
       this.pendingBackgroundReconnect = false;
       this.markConversationTaskCompleteIfExecuting();
       // 正常完成：收尾关态
       cleanupSub(true, false);
+      this.refreshChatSuggest(suggestParams, streamGen);
     };
     requestConfig.onError = (error: any) => {
       if (isAppInBackground() == true) {
@@ -3541,6 +3537,7 @@ export default class AgentDetailService {
    * 中断 sub 流恢复连接
    */
   abortSubConversation(): void {
+    this.chatSuggestRequestVersion = this.chatSuggestRequestVersion + 1;
     if (this.subStreamRequest != null) {
       this.subStreamRequest!.abort();
       this.subStreamRequest = null;
@@ -3697,12 +3694,6 @@ export default class AgentDetailService {
       if (startedAt > 0) {
         const streamAge = Date.now() - startedAt;
         if (streamAge < this.REMOTE_TERMINAL_GRACE_MS) {
-          console.warn(
-            "[RemoteTerminal] skip stale terminal force-close, streamAge=" +
-              `${streamAge}` +
-              "ms < grace=" +
-              `${this.REMOTE_TERMINAL_GRACE_MS}`,
-          );
           return false;
         }
       }

@@ -1,0 +1,316 @@
+<template>
+  <!--
+    消息 tab 会话列表（组件化 Stage 4 从 message-content 抽出，模板/样式原样迁移）：
+    scroll-view + 加载/空态/会话行 v-for。纯展示组件——全部状态经 props 下发
+    （单一事实源在页面），交互经 emit 上抛（守卫/判定/导航全在页面处理器）。
+    - 行 class 三态（按压闪亮/长按菜单高亮/置顶常驻底）改内联表达式读 props：
+      App-Android 方法调用式 class 绑定不保证重估（群已读 v-if 同款坑），内联
+      属性访问表达式随 props 变更稳定重渲染；互斥逻辑与原 pinnedRowCls 一致
+    - 手势链冒泡序保持：行 touchstart → scroll-view（pane-touch*）→ 页面根
+      touchstart，与抽离前同序（页面 handlePageTouchStart 依赖行 touchstart
+      先记 touchingRowPending，40ms 去重双派发语义不变）
+    - ★行测量协议：行节点在本组件内，页面查不到——measureRow(domId) 组件作用域
+      自测（$callMethod 调起），矩形原始数字经 row-rect 上抛（im-header-tabs
+      measurePlus 同机制）
+  -->
+  <scroll-view
+    class="im-pane"
+    :direction="menuVisible ? 'none' : 'vertical'"
+    :show-scrollbar="false"
+    :scroll-into-view="scrollAnchor"
+    @scroll="emitScroll"
+    @scrolltolower="emitScrollLower"
+    @touchstart="emitPaneTouchStart($event)"
+    @touchend="emitPaneTouchEnd($event)"
+    @touchcancel="emitPaneTouchCancel($event)"
+  >
+    <view v-if="loading && conversations.length == 0" class="im-state">
+      <text class="im-state__text">{{ t("Mobile.Page.loadingMore") }}</text>
+    </view>
+    <view
+      v-else-if="conversations.length == 0"
+      class="im-state"
+      @click="emitRetry"
+    >
+      <text class="im-state__text">{{
+        failed ? t("Mobile.Message.loadFailed") : t("Mobile.Message.emptyMessages")
+      }}</text>
+    </view>
+    <template v-else>
+      <view v-for="(conv, index) in conversations" :key="conv.convId">
+        <!-- 行内容（长按弹操作气泡：行原位浅灰高亮 + 行旁锚定气泡，无蒙层）；
+             置顶行常驻浅底（比按压态再浅一档，微信式置顶标识） -->
+        <view
+          :id="`row-${conv.convId}`"
+          class="chat-item"
+          :class="[
+            pressedRowId == conv.convId ? 'chat-item--active' : '',
+            menuVisible && menuRowId == conv.convId ? 'chat-item--menu-on' : '',
+            pressedRowId == conv.convId || (menuVisible && menuRowId == conv.convId)
+              ? ''
+              : conv.topFlag
+                ? 'chat-item--pinned'
+                : '',
+          ]"
+          @click="emitRowClick(conv)"
+          @touchstart="emitRowTouchStart(conv, $event)"
+          @touchmove="emitRowTouchMove($event)"
+          @touchend="emitRowTouchEnd(conv, $event)"
+          @touchcancel="emitRowTouchCancel"
+        >
+          <!-- 行内容抽 conv-row-item（行级局部渲染）：闪灰/菜单高亮写 pane props 时
+               未变行整体跳过逐行求值；★id/class 三态/五路触摸留此外壳——测量协议靠
+               pane 作用域查 #row-*（不穿透子组件），手势裁决链也不能多一跳 -->
+          <conv-row-item
+            :conv="conv"
+            @avatar-loaded="emitAvatarLoaded(conv)"
+            @avatar-error="emitAvatarError(conv)"
+          />
+        </view>
+      </view>
+      <view v-if="loadingMore" class="im-foot">
+        <text class="im-foot__text">{{ t("Mobile.Page.loadingMore") }}</text>
+      </view>
+      <view v-else-if="hasMore != true" class="im-foot">
+        <text class="im-foot__text">{{ t("Mobile.Message.noMore") }}</text>
+      </view>
+    </template>
+  </scroll-view>
+</template>
+
+<script setup lang="uts">
+  import { getCurrentInstance } from "vue";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import ConvRowItem from "./conv-row-item.uvue";
+  import { ImConvRow } from "./im-row-models.uts";
+
+  // 事件名须 kebab-case：App-Android 模板监听会把 camelCase 转小写导致收不到（add-menu-drawer 同规约）。
+  // 触摸载荷 UniTouchEvent 与页面处理器形参 Any 兼容（Any 为根类型）；页面侧再 as UniTouchEvent。
+  const emit = defineEmits<{
+    /** 空态点击重试（页面 handleConvRetry）。 */
+    retry: [];
+    /** 列表滚动（页面 handleListScroll：滚动收浮层+清触摸判定+手势门控计时）。 */
+    scroll: [];
+    /** 滚到底部分页加载（页面 handleConvScrollLower）。 */
+    "scroll-lower": [];
+    /** scroll-view 层页面触摸三件套（冒泡到页面根之前先到这，40ms 去重语义在页面）。 */
+    "pane-touchstart": [e: UniTouchEvent];
+    "pane-touchend": [e: UniTouchEvent];
+    "pane-touchcancel": [e: UniTouchEvent];
+    /** 会话行 click 兜底通道（页面 handleConvRowClick：防重窗）。 */
+    "row-click": [conv: ImConvRow];
+    /** 会话行 touchstart（页面 handleConvRowTouchStart：公共判定+装填长按）。 */
+    "row-touchstart": [conv: ImConvRow, e: UniTouchEvent];
+    /** 行 touchmove（页面 handleRowTouchMove：位移>6px 清判定态）。 */
+    "row-touchmove": [e: UniTouchEvent];
+    /** 会话行 touchend 主通道（页面 handleConvRowTouchEnd：三星微移点按派发）。 */
+    "row-touchend": [conv: ImConvRow, e: UniTouchEvent];
+    /** 行 touchcancel（页面 handleRowTouchCancel：只清判定态）。 */
+    "row-touchcancel": [];
+    /** 头像真图 @load/@error（页面记已渲染缓存/负缓存+整表重建）。 */
+    "avatar-loaded": [conv: ImConvRow];
+    "avatar-error": [conv: ImConvRow];
+    /** 行矩形测量结果（视口 px 原始数字；页面拼长按浮层气泡/蒙层）。 */
+    "row-rect": [top: number, bottom: number, left: number];
+  }>();
+
+  withDefaults(
+    defineProps<{
+      /** 会话行数组（页面 conversations 直发；整表替换驱动重渲染）。 */
+      conversations: ImConvRow[];
+      /** 首拉加载中（空表时显示加载态；页面喂 convInitialLoading——首拉未完成的
+          间隙帧也算，已加载后的静默刷新不回闪）。 */
+      loading: boolean;
+      /** 加载失败（空表时显示失败文案，点击重试）。 */
+      failed: boolean;
+      /** 分页加载中（列表尾 loading 条）。 */
+      loadingMore: boolean;
+      /** 还有更多分页数据（false 时列表尾「没有更多」）。 */
+      hasMore: boolean;
+      /** scroll-into-view 锚点（双击 tab 定位首未读行；页面写 `row-${convId}`）。 */
+      scrollAnchor: string;
+      /** 长按浮层展开（锁滚动 direction=none + 行高亮判定）。 */
+      menuVisible: boolean;
+      /** 长按浮层指向行 id（convId；高亮判定）。 */
+      menuRowId: string;
+      /** 按压闪亮行 id（convId；300ms 闪灰）。 */
+      pressedRowId: string;
+    }>(),
+    {
+      conversations: [] as ImConvRow[],
+      loading: false,
+      failed: false,
+      loadingMore: false,
+      hasMore: true,
+      scrollAnchor: "",
+      menuVisible: false,
+      menuRowId: "",
+      pressedRowId: "",
+    },
+  );
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  // 行内容求值函数（displayConvName/Digest、convDraft、formatConvTime、头像族）已随
+  // conv-row-item 组件迁移（行级局部渲染）；本组件仅剩外壳与列表态。
+
+  const componentInstance = getCurrentInstance();
+
+  /** createSelectorQuery.exec 回调（具名函数：深层箭头块会触发 UTS 截断编译，
+      message-content 同款约束）。矩形解析后原始数字直发页面（视口坐标系）。 */
+  function onRowRectMeasured(results: Array<any>): void {
+    let topPx = -1;
+    let bottomPx = -1;
+    let leftPx = -1;
+    if (results.length > 0) {
+      const raw = results[0];
+      if (raw != null) {
+        const rect = raw as NodeInfo;
+        if (rect.top != null) {
+          topPx = parseFloat(`${rect.top}`);
+        }
+        if (rect.bottom != null) {
+          bottomPx = parseFloat(`${rect.bottom}`);
+        }
+        if (rect.left != null) {
+          leftPx = parseFloat(`${rect.left}`);
+        }
+      }
+    }
+    emit("row-rect", topPx, bottomPx, leftPx);
+  }
+
+  /** 组件作用域测行矩形（页面 openRowMenu 经 $callMethod 调起；boundingClientRect
+      为视口坐标系，与页面侧 .im-page 矩形同系，挖洞/锚定数学不变）。 */
+  function measureRow(domId: string): void {
+    const proxy = componentInstance != null ? componentInstance.proxy : null;
+    if (proxy == null) {
+      return;
+    }
+    uni.createSelectorQuery()
+      .in(proxy)
+      .select("#" + domId)
+      .boundingClientRect()
+      .exec(onRowRectMeasured);
+  }
+
+  defineExpose({
+    measureRow: measureRow as any,
+  });
+
+  // ===== 事件上抛薄包装（模板边界 $event 为 Any，进入前 as UniTouchEvent）=====
+
+  function emitRetry(): void {
+    emit("retry");
+  }
+
+  function emitScroll(): void {
+    emit("scroll");
+  }
+
+  function emitScrollLower(): void {
+    emit("scroll-lower");
+  }
+
+  function emitPaneTouchStart(eventValue: Any): void {
+    emit("pane-touchstart", eventValue as UniTouchEvent);
+  }
+
+  function emitPaneTouchEnd(eventValue: Any): void {
+    emit("pane-touchend", eventValue as UniTouchEvent);
+  }
+
+  function emitPaneTouchCancel(eventValue: Any): void {
+    emit("pane-touchcancel", eventValue as UniTouchEvent);
+  }
+
+  function emitRowClick(conv: ImConvRow): void {
+    emit("row-click", conv);
+  }
+
+  function emitRowTouchStart(conv: ImConvRow, eventValue: Any): void {
+    emit("row-touchstart", conv, eventValue as UniTouchEvent);
+  }
+
+  function emitRowTouchMove(eventValue: Any): void {
+    emit("row-touchmove", eventValue as UniTouchEvent);
+  }
+
+  function emitRowTouchEnd(conv: ImConvRow, eventValue: Any): void {
+    emit("row-touchend", conv, eventValue as UniTouchEvent);
+  }
+
+  function emitRowTouchCancel(): void {
+    emit("row-touchcancel");
+  }
+
+  function emitAvatarLoaded(conv: ImConvRow): void {
+    emit("avatar-loaded", conv);
+  }
+
+  function emitAvatarError(conv: ImConvRow): void {
+    emit("avatar-error", conv);
+  }
+</script>
+
+<style lang="scss" scoped>
+  /* ★.chat-item 行内家族（avatar/body/title/sub/draft/mark/badge）已随 conv-row-item
+     组件迁移（App 端 scoped 样式按组件解析）；此处仅剩外壳盒与三态。contact-list-pane
+     仍持整份 .chat-item 全族（其行未组件化），改外壳三态须同步 contact-list-pane 与
+     conv-row-item 各自副本（R5 同步注释）。 */
+
+  /* swiper-item 内列表：撑满页高（swiper-item 自身随 swiper 拉伸，子级须显式 100%） */
+  .im-pane {
+    height: 100%;
+  }
+
+  .im-state {
+    padding: 100px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .im-state__text {
+    font-size: 14px;
+    line-height: 20px;
+    color: #94929c;
+  }
+
+  .im-foot {
+    padding: 14px 0 22px;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .im-foot__text {
+    font-size: 12px;
+    line-height: 17px;
+    color: #c0bec8;
+  }
+
+  /* ===== 会话 / 联系人通用行 ===== */
+  .chat-item {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 10.5px 16px;
+  }
+
+  /* 置顶会话行常驻底色：与按压态拉开可感差距（浅 11/12/8）；激活期间由
+     行 class 内联表达式在 JS 层退场（App 原生端同特异性 class 覆盖不保证按样式表序） */
+  .chat-item--pinned {
+    background-color: #f7f6fb;
+  }
+
+  .chat-item--active {
+    background-color: #eceaf3;
+  }
+
+  /* 长按浮层行高亮：取按压态同色（#eceaf3，状态一致优先）；气泡/蒙层样式在
+     row-menu-pop 组件（Stage 2），几何约束见其注释 */
+  .chat-item--menu-on {
+    background-color: #eceaf3;
+  }
+</style>

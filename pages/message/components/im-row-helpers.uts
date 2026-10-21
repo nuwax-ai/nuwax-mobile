@@ -1,0 +1,443 @@
+/**
+ * 伙伴页行渲染纯函数集：头像渐变/兜底取字、展示名（含联系人备注索引）、草稿摘要、
+ * 时间/角标格式化、团队角色徽章等。从 message-content.uvue 原样抽出（2026-10-16
+ * 组件化重构 Stage 1），页面与 pane 子组件共同 import。
+ *
+ * ★uvue 模板不能直接调用导入函数（invoke 解析失败，plan-cards 同款约束）——
+ * 各 uvue 侧须包一层本地 const 再供模板使用。
+ *
+ * 模块级私有状态 contactDisplayNameByUserId：联系人展示名索引（peerUserId →
+ * displayName）。displayConvName 是唯一读方、rebuildContactNameIndex 唯一写方；
+ * Android 模板方法调用不收集依赖，名称刷新依赖调用方在索引重建后整表替换行数组
+ * （loadContacts 成功路径已强制 copyRows，见 message-content 注释）。
+ */
+
+import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+import { getChatDraft } from "@/utils/im/chatDrafts";
+import { setCachedContactRemarks } from "@/utils/im/contactRemarkCache";
+import { ImConvRow, ImContactRow, ImSpaceRow } from "./im-row-models.uts";
+
+const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+/** 头像展示尺寸（46px，与样式表同源；喂给 resolveDisplayImageUrl 按宽出图）。 */
+export const AVATAR_DISPLAY_PX = 46;
+
+// ★头像盒尺寸：px 化定值 46px（密度类不随屏宽缩放，折叠屏展开不再放大）。历史
+// iOS 小数 pt 削边（92rpx 折 47.84pt，wrap 帧取整物理像素而子层按小数帧越出被裁）
+// 曾靠「App 端内联整 pt」根治；定值整数 px 后两分支同值，保留内联仅为少动模板。
+export const avatarBoxStyle = "width: 46px; height: 46px;";
+
+/** ===== 头像兜底取字（飞书规则）=====
+ *  个人：中文名取名末 2 字（「赵立坤」→「立坤」，2 字名恰为全名），英文名取首词首字母；
+ *  群组/团队：取前 4 字分两行 2+2（「智能体平台研发组」→「智能」/「体平」）；同列表缩写
+ *  撞车时截掉与源名的公共前缀改取区分词（「智能体平台前端组」→「前端」）；
+ *  拼名群（「用户a，用户b，用户c」成员名拼接）无语义词可取 → 蓝底默认群剪影图。 */
+
+/** 头像兜底底色渐变板（紫/绿/黄/蓝/橙五色；红色与未读角标 #ff4d4f 同色易混淆，已移除）。 */
+const AVATAR_GRADIENTS: string[] = [
+  "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+  "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+  "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+  "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+  "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+];
+
+export function avatarGradient(name: string): string {
+  let sum = 0;
+  for (let i = 0; i < name.length; i++) {
+    const code = name.charCodeAt(i);
+    if (code == null) continue;
+    sum += code;
+  }
+  return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+}
+
+/** 名称去空白（取字不把名字内的半/全角空格算进来）。 */
+function squeezeName(name: string): string {
+  let out = "";
+  for (let i = 0; i < name.length; i++) {
+    const ch = name.charAt(i);
+    if (ch != " " && ch != "\t" && ch != "　") {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/** 拼名群判定：群名由成员名以逗号/顿号拼接（「用户a，用户b，用户c」）——无语义词可取。 */
+function isMergedNameGroup(name: string): boolean {
+  return name.indexOf("，") >= 0 || name.indexOf("、") >= 0 || name.indexOf(",") >= 0;
+}
+
+/** 是否含 CJK 字符（区分中文名/英文名取字规则）。charCodeAt 返回 Number?，须判空后比较。 */
+function hasChineseChar(name: string): boolean {
+  for (let i = 0; i < name.length; i++) {
+    const code = name.charCodeAt(i);
+    if (code != null && code > 0x2e80) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 个人名取字：中文≥2 字取名末 2 字（去姓），英文取首字母大写；空名占位「#」。 */
+function personalFallbackLines(name: string): string[] {
+  const cleaned = squeezeName(name);
+  if (cleaned.length == 0) {
+    return ["#"];
+  }
+  if (!hasChineseChar(cleaned)) {
+    return [cleaned.charAt(0).toUpperCase()];
+  }
+  if (cleaned.length >= 2) {
+    return [cleaned.substring(cleaned.length - 2)];
+  }
+  return [cleaned];
+}
+
+/** 群名取字尾缀表：截公共前缀后无区分度的组织尾缀去掉（「前端组」→「前端」）。 */
+const GROUP_TAIL_SUFFIXES: string[] = ["团队", "组", "群", "部"];
+
+function trimGroupTail(rest: string): string {
+  for (let i = 0; i < GROUP_TAIL_SUFFIXES.length; i++) {
+    const suf = GROUP_TAIL_SUFFIXES[i];
+    if (rest.length > suf.length && rest.endsWith(suf)) {
+      return rest.substring(0, rest.length - suf.length);
+    }
+  }
+  return rest;
+}
+
+function lcpLen(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charAt(i) == b.charAt(i)) {
+    i++;
+  }
+  return i;
+}
+
+/** 取出的缩写整体是纯字母或纯数字（完整单词/数字，如 test、2048）时不拆两行——
+ *  英文/数字没有 2+2 分行习惯，拆开（te/st、20/48）反而不可读。 */
+function isAsciiWordOrNumber(text: string): boolean {
+  if (text.length == 0) {
+    return false;
+  }
+  let allLetter = true;
+  let allDigit = true;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code == null) {
+      return false;
+    }
+    const isDigit = code >= 48 && code <= 57;
+    const isLetter = (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+    if (!isDigit) {
+      allDigit = false;
+    }
+    if (!isLetter) {
+      allLetter = false;
+    }
+  }
+  return allLetter || allDigit;
+}
+
+/** 群名取字（列表内去重）：默认前 4 字；与已取缩写撞车时截掉与源群名的最长公共前缀、
+ *  去组织尾缀后改取（≤4 字）。「智能体平台研发组」先占「智能/体平」，「智能体平台
+ *  前端组」即改取「前端」。usedMap：已用缩写 → 源群名（调用方列表级共享）。 */
+function groupFallbackLines(name: string, usedMap: Map<string, string>): string[] {
+  const cleaned = squeezeName(name);
+  if (cleaned.length == 0) {
+    return ["#"];
+  }
+  let take = cleaned.length > 4 ? cleaned.substring(0, 4) : cleaned;
+  const clashSrc = usedMap.get(take);
+  if (clashSrc != null) {
+    let rest = cleaned.substring(lcpLen(cleaned, clashSrc));
+    rest = trimGroupTail(rest);
+    if (rest.length > 4) {
+      rest = rest.substring(0, 4);
+    }
+    if (rest.length > 0) {
+      take = rest;
+    }
+  }
+  usedMap.set(take, cleaned);
+  // ≤2 字单行；纯字母/数字缩写（test、2048）是完整词不拆两行；其余（中文 4 字）2+2
+  if (take.length <= 2 || isAsciiWordOrNumber(take)) {
+    return [take];
+  }
+  return [take.substring(0, 2), take.substring(2)];
+}
+
+/** 会话/群组行兜底取字回填（个人=名末 2 字；群=前 4 字两行，列表内去重；拼名群走默认剪影）。 */
+export function assignConvFallbacks(rows: ImConvRow[]): void {
+  const usedMap = new Map<string, string>();
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.convType == 1) {
+      row.fallbackMerged = false;
+      row.fallbackLine1 = personalFallbackLines(row.displayName)[0];
+      row.fallbackLine2 = "";
+      continue;
+    }
+    row.fallbackMerged = isMergedNameGroup(row.displayName);
+    if (row.fallbackMerged) {
+      row.fallbackLine1 = "";
+      row.fallbackLine2 = "";
+    } else {
+      const lines = groupFallbackLines(row.displayName, usedMap);
+      row.fallbackLine1 = lines[0];
+      row.fallbackLine2 = lines.length > 1 ? lines[1] : "";
+    }
+  }
+}
+
+/** 联系人行兜底取字回填（个人语义恒单行）。 */
+export function assignContactFallbacks(rows: ImContactRow[]): void {
+  for (let i = 0; i < rows.length; i++) {
+    rows[i].fallbackLine1 = personalFallbackLines(rows[i].displayName)[0];
+  }
+}
+
+/** 团队行兜底取字回填（群语义：前 4 字两行 + 列表内去重；拼名走默认剪影）。 */
+export function assignSpaceFallbacks(rows: ImSpaceRow[]): void {
+  const usedMap = new Map<string, string>();
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    row.fallbackMerged = isMergedNameGroup(row.name);
+    if (row.fallbackMerged) {
+      row.fallbackLine1 = "";
+      row.fallbackLine2 = "";
+    } else {
+      const lines = groupFallbackLines(row.name, usedMap);
+      row.fallbackLine1 = lines[0];
+      row.fallbackLine2 = lines.length > 1 ? lines[1] : "";
+    }
+  }
+}
+
+/** 「系统通知」合成主体 id（服务端 ImConstants.SYSTEM_NOTIFY_SUBJECT_ID，DEV-197-b）：
+ *  审核卡片落地的"管理员↔系统通知"单聊对手方，列表里显示为「系统通知」。 */
+const SYSTEM_NOTIFY_SUBJECT_ID = "1999999999999";
+
+/** 系统通知会话（单聊，对手方为服务端合成主体）：通知只能点进会话处理，不出置顶/免打扰/删除左滑操作。 */
+export function isSystemConv(conv: ImConvRow): boolean {
+  return conv.convType == 1 && conv.peerUserId == SYSTEM_NOTIFY_SUBJECT_ID;
+}
+
+// ===== 联系人展示名索引（peerUserId → displayName）=====
+// 服务端联系人接口的 displayName 按我方视角算好（remark > nick > name），而会话
+// 接口的 peerName 只回对方资料昵称、不含我方备注——在智联录改完备注只刷会话列表
+// 名称不变。单聊会话行展示名优先取此索引（非联系人如系统通知回落 peerName），
+// 索引随联系人整表刷新重建；切回消息 tab 时 scroll-view 重挂载会重取名，无需额外刷。
+const contactDisplayNameByUserId = new Map<string, string>();
+
+/** 按已互为联系人列表重建展示名索引（loadContacts 成功后调用）。 */
+/** 重建联系人展示名索引；返回索引是否有变化（无变化时调用方可跳过会话行整表
+ *  重建——onShow 每次静默刷联系人，名字没变就不该重渲染会话 pane）。备注缓存
+ *  无论有无变化都照刷（其他页 onShow 重算取新值，与会话行渲染无关）。 */
+export function rebuildContactNameIndex(list: ImContactRow[]): boolean {
+  const next = new Map<string, string>();
+  const remarks = new Map<string, string>();
+  let indexedCount = 0;
+  for (let i = 0; i < list.length; i++) {
+    const row = list[i];
+    if (row.userId.length > 0 && row.displayName.length > 0) {
+      next.set(row.userId, row.displayName);
+      indexedCount++;
+    }
+    // 顺手同步备注索引模块缓存（群页成员名/聊天页发送者名覆写用）：消息 tab
+    // 是进会话的必经页，这里刷过后各页 onShow 重算即取到新值。★只收设了备注
+    // 的——存纯备注而非 displayName，口径见 contactRemarkCache 模块注释
+    if (row.userId.length > 0 && row.remark.length > 0) {
+      remarks.set(row.userId, row.remark);
+    }
+  }
+  // 与旧索引比对（先 size 后逐条）：一致则跳过交换——displayConvName 是索引唯一
+  // 读方，名字全没变时整表重建会话行是纯多余渲染
+  let changed = contactDisplayNameByUserId.size != indexedCount;
+  if (!changed) {
+    for (let i = 0; i < list.length; i++) {
+      const row = list[i];
+      if (row.userId.length > 0 && row.displayName.length > 0) {
+        if (contactDisplayNameByUserId.get(row.userId) != row.displayName) {
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  if (changed) {
+    contactDisplayNameByUserId.clear();
+    next.forEach((value: string, key: string) => {
+      contactDisplayNameByUserId.set(key, value);
+    });
+  }
+  setCachedContactRemarks(remarks);
+  return changed;
+}
+
+/** 深克隆会话行（新对象=新身份）。行内容抽 conv-row-item 组件后，行组件按 conv
+ *  对象身份决定是否跳过重渲染——凡「原位改字段后靠整表替换刷显示」的路径（WS 顶置
+ *  改摘要、头像解析回填、草稿同步重排）都必须换克隆，浅 copyRows 只换数组身份不够，
+ *  行组件会因 props 同引用而跳过、显示旧值。 */
+export function cloneConvRow(row: ImConvRow): ImConvRow {
+  const out = new ImConvRow();
+  out.convId = row.convId;
+  out.convType = row.convType;
+  out.peerUserId = row.peerUserId;
+  out.displayName = row.displayName;
+  out.avatarUrl = row.avatarUrl;
+  out.unreadCount = row.unreadCount;
+  out.lastMsgAt = row.lastMsgAt;
+  out.lastMsgDigest = row.lastMsgDigest;
+  out.memberCount = row.memberCount;
+  out.myRole = row.myRole;
+  out.topFlag = row.topFlag;
+  out.dnd = row.dnd;
+  out.avatarDisplay = row.avatarDisplay;
+  out.avatarFailed = row.avatarFailed;
+  out.avatarLoaded = row.avatarLoaded;
+  out.fallbackLine1 = row.fallbackLine1;
+  out.fallbackLine2 = row.fallbackLine2;
+  out.fallbackMerged = row.fallbackMerged;
+  return out;
+}
+
+/** cloneConvRow 的整表版（替换 copyRows 用于上述需要行身份变化的整表替换点）。 */
+export function cloneConvRows(rows: ImConvRow[]): ImConvRow[] {
+  const out: ImConvRow[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    out.push(cloneConvRow(rows[i]));
+  }
+  return out;
+}
+
+/** subjectType：1=人（用户标签），其余值为智能体（专家标签）。 */
+export function isExpertContact(contact: ImContactRow): boolean {
+  return contact.subjectType != 1;
+}
+
+export function displayConvName(conv: ImConvRow): string {
+  // 单聊展示名优先取联系人索引（含我方最新备注）：会话接口 peerName 不含备注，
+  // 只读 conv.displayName 的话智联录改备注后这里仍是旧昵称；非联系人（系统通知
+  // 合成主体 / 未加载联系人）回落会话自带名。
+  if (conv.convType == 1 && conv.peerUserId.length > 0) {
+    const contactName = contactDisplayNameByUserId.get(conv.peerUserId);
+    if (contactName != null) {
+      return contactName;
+    }
+  }
+  if (conv.displayName.length > 0) {
+    return conv.displayName;
+  }
+  // 缺名兜底区分会话类型：群聊给群组语义，单聊沿用通用文案
+  return conv.convType == 2
+    ? t("Mobile.Message.unnamedGroup")
+    : t("Mobile.Common.conversations");
+}
+
+/**
+ * 会话摘要：无消息的会话（lastMsgSeq=0，服务端整个省略 lastMsgDigest/lastMsgAt 键）
+ * 显示「暂无消息」占位，避免摘要行空白。
+ */
+export function displayConvDigest(conv: ImConvRow): string {
+  if (conv.lastMsgDigest.length > 0) {
+    return conv.lastMsgDigest;
+  }
+  return t("Mobile.Message.emptyMessages");
+}
+
+/** 会话行草稿（微信式「[草稿]xxx」）：本地按 convId 记忆的未发文案，换行折成
+ *  空格单行展示；空=无草稿走正常末条摘要。★每次读实时取（storage 模块级缓存），
+ *  模板方法调用不收集方法体内依赖，靠整表重建刷新（onShow 有 scheduleIconTableRefresh）。 */
+export function convDraft(conv: ImConvRow): string {
+  const draft = getChatDraft(conv.convId);
+  if (draft.length == 0) {
+    return "";
+  }
+  return draft.split("\n").join(" ").trim();
+}
+
+/** 团队角色徽章文案：Owner=拥有者 Admin=管理员 其余=成员。 */
+export function spaceRoleText(space: ImSpaceRow): string {
+  if (space.currentUserRole == "Owner") {
+    return t("Mobile.Message.spaceRoleOwner");
+  }
+  if (space.currentUserRole == "Admin") {
+    return t("Mobile.Message.spaceRoleAdmin");
+  }
+  return t("Mobile.Message.spaceRoleMember");
+}
+
+/** 团队角色徽章底色：Owner=蓝紫（同群主）Admin=橙 Member=灰，复用现有 tag 色板。 */
+export function spaceRoleTagClass(space: ImSpaceRow): string {
+  if (space.currentUserRole == "Owner") {
+    return "contact-tag contact-tag--owner";
+  }
+  if (space.currentUserRole == "Admin") {
+    return "contact-tag contact-tag--warn";
+  }
+  return "contact-tag contact-tag--muted";
+}
+
+export function spaceRoleTextClass(space: ImSpaceRow): string {
+  if (space.currentUserRole == "Owner") {
+    return "contact-tag__text contact-tag__text--owner";
+  }
+  if (space.currentUserRole == "Admin") {
+    return "contact-tag__text contact-tag__text--warn";
+  }
+  return "contact-tag__text contact-tag__text--muted";
+}
+
+/** 群组成员数标签："{count} 人"。 */
+export function groupMemberLabel(conv: ImConvRow): string {
+  const params = new Map<string, string | number>();
+  params.set("count", conv.memberCount);
+  return translateFn(
+    "Mobile.Message.groupMemberCount",
+    toI18nParams(params),
+    `${conv.memberCount}`,
+  );
+}
+
+export function formatUnread(count: number): string {
+  return count > 99 ? "99+" : `${count}`;
+}
+
+/** 行内未读角标 class：免打扰灰底（对齐飞书），普通红底（字符串形式，跨端无歧义）。 */
+export function convBadgeCls(conv: ImConvRow): string {
+  return conv.dnd ? "chat-item__badge chat-item__badge--dnd" : "chat-item__badge";
+}
+
+function pad2(value: number): string {
+  return value < 10 ? `0${value}` : `${value}`;
+}
+
+function isSameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() == b.getFullYear() &&
+    a.getMonth() == b.getMonth() &&
+    a.getDate() == b.getDate();
+}
+
+/** 列表时间：今天 HH:mm / 昨天 / 同年 M月D日 / 跨年 YYYY年M月D日（首版对齐参考设计中文格式）。 */
+export function formatConvTime(ts: number): string {
+  if (ts <= 0) {
+    return "";
+  }
+  const date = new Date(ts);
+  const now = new Date();
+  if (isSameDay(date, now)) {
+    return pad2(date.getHours()) + ":" + pad2(date.getMinutes());
+  }
+  const yesterday = new Date(now.getTime() - 86400000);
+  if (isSameDay(date, yesterday)) {
+    return t("Mobile.Message.yesterday");
+  }
+  if (date.getFullYear() == now.getFullYear()) {
+    return `${date.getMonth() + 1}月${date.getDate()}日`;
+  }
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
+}

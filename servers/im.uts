@@ -1,6 +1,11 @@
 import request from "./useRequest";
 import { generateUUID } from "@/utils/common";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
 import type { RequestResponse } from "@/types/interfaces/request";
+// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+import { getStableDeviceBaseId } from "@/uni_modules/nuwax-device-identity";
+// #endif
 
 const IM_DEVICE_BASE_ID_STORAGE_KEY = "NUWAX_IM_DEVICE_BASE_ID";
 
@@ -30,11 +35,43 @@ export const IM_PEER_REMARK_EVENT = "im-peer-remark-updated";
 let cachedImDeviceId = "";
 
 /**
+ * 平台稳定 ID 的防御闸：字符白名单（服务端 ImProtocol.isValidDeviceId 同款，
+ * 不含 #）+ 长度上限。ROM/系统返回意外内容时返回空串，调用方回落随机 UUID——
+ * 宁可换 ID 也不能打穿服务端校验（IM_90001 拦的是整条发送）。
+ */
+function sanitizeBaseId(value: string | null): string {
+  if (value == null) return "";
+  const s = `${value}`.trim();
+  if (s.length == 0 || s.length > 100) return "";
+  for (let i = 0; i < s.length; i++) {
+    // charCodeAt 返回 Number | null（UTS 类型签名），i < s.length 恒非空，!! 断言收窄
+    const c = s.charCodeAt(i)!!;
+    const ok = (c >= 97 && c <= 122)     // a-z
+      || (c >= 65 && c <= 90)            // A-Z
+      || (c >= 48 && c <= 57)            // 0-9
+      || c == 45 || c == 46 || c == 95;  // - . _
+    if (!ok) return "";
+  }
+  return s;
+}
+
+/**
  * IM 协议 deviceId（nuwax-im ImProtocol.isValidDeviceId）：
  * 格式 {baseId}#{tabId}，字符仅 a-zA-Z0-9 与 - _ .，至多一个 #，总长 ≤128。
  * ★REST 发送必填：扇出按它【排除来源端】（nuwax-im 02 §6.5），缺失会报 IM_90001。
- * baseId 首次生成后落 storage 持久化；tabId 每次页面会话随机——H5 多标签各拿各的
- * tabId，自己其他标签页仍能收到自己发的消息，仅来源标签页被排除。
+ *
+ * baseId 解析链（storage 优先，存量安装零扰动；storage 只在卸载重装时清空）：
+ *  1. storage 有 → 直接用（老用户 deviceId 不突变，服务端不产生僵尸设备行）；
+ *  2. storage 空（新装/重装，App 三端）→ 平台稳定标识——Android SSAID /
+ *     iOS Keychain UUID / 鸿蒙 ODID（卸载重装后仍能取回同一值）；
+ *  3. 仍拿不到 / 格式非法 → generateUUID()（H5 恒走此路）。
+ * 解析成功后统一落 storage 持久化。
+ *
+ * ★tabId（#后缀）仅 H5/WEB：多标签页共享 storage 里的 baseId，须以会话级
+ * tabId 区分端点（CONV_UNREAD 扇出按完整 deviceId 排除来源端）。
+ * App 三端 / 小程序单实例，deviceId 直接 = baseId——若加随机 tabId，
+ * 每次冷启动 deviceId 都变，服务端设备表（按完整 deviceId UPSERT）每次
+ * 启动都多一行，卸载重装稳定性就被 tabId 抵消了。
  */
 export function getImDeviceId(): string {
   if (cachedImDeviceId.length > 0) {
@@ -50,19 +87,96 @@ export function getImDeviceId(): string {
     baseId = "";
   }
   if (baseId.length == 0) {
-    baseId = generateUUID();
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    baseId = sanitizeBaseId(getStableDeviceBaseId());
+    // #endif
+    if (baseId.length == 0) {
+      baseId = generateUUID();
+    }
     try {
       uni.setStorageSync(IM_DEVICE_BASE_ID_STORAGE_KEY, baseId);
     } catch (_error) {
       // 存储异常不阻断发送：本次会话退化为内存态 baseId
     }
   }
+  // #ifdef H5 || WEB
   let tabId = "";
   for (let i = 0; i < 12; i++) {
     tabId += Math.floor(Math.random() * 16).toString(16);
   }
   cachedImDeviceId = `${baseId}#${tabId}`;
+  // #endif
+  // #ifndef H5 || WEB
+  cachedImDeviceId = baseId;
+  // #endif
   return cachedImDeviceId;
+}
+
+// ============================================================================
+// 设备注册（nuwax-im 02 §12.1：POST /api/instant-message/devices 等，身份只从
+// token 的 RequestContext 取，请求体传 userId 无效）
+// ============================================================================
+
+/**
+ * 设备注册 platform 取值：按实际运行端上报（对齐 nuwax-im ImPlatform.fromWire）。
+ * ★鸿蒙报 "harmonyos"：后端枚举暂无该值（现仅 ios/android/web/desktop/miniapp），
+ * fromWire → UNKNOWN 会被注册接口拒（IM_90001）；WS 握手不受影响（platform 仅
+ * 统计维度，不拒连）。注册失败已静默吞掉，后端加值后鸿蒙自动生效，勿改报
+ * miniapp 糊弄统计。
+ */
+export function imDevicePlatform(): string {
+  // #ifdef APP-ANDROID
+  return "android";
+  // #endif
+  // #ifdef APP-IOS
+  return "ios";
+  // #endif
+  // #ifdef APP-HARMONY
+  return "harmonyos";
+  // #endif
+  // #ifdef MP-WEIXIN
+  return "miniapp";
+  // #endif
+  // #ifdef H5 || WEB
+  return "web";
+  // #endif
+}
+
+/**
+ * 注册/刷新设备（UPSERT：后端语义是「每次建连都调」，订阅会过期会变）。
+ * ImWsClient 在 CONNECT_ACK 后自动调。pushEnabled=false——移动端暂无离线推送
+ * 通道（对齐 nuwax-im-web 注册口径）；Web Push 三要素与 voipToken 均不传。
+ */
+export async function apiImDeviceRegister(): Promise<RequestResponse<any>> {
+  const body = new UTSJSONObject();
+  body["deviceId"] = getImDeviceId();
+  body["platform"] = imDevicePlatform();
+  body["appName"] = "nuwax-mobile";
+  body["pushEnabled"] = false;
+  try {
+    const sys = uni.getSystemInfoSync();
+    body["appVersion"] = sys.appVersion;
+    body["osVersion"] = sys.osVersion;
+  } catch (_error) {
+    // 版本字段缺省不阻断注册
+  }
+  return await request({
+    url: "/api/instant-message/devices",
+    method: "POST",
+    data: body,
+  });
+}
+
+/**
+ * 注销设备（响应终态幂等：重复注销返回同样的 true；(userId, deviceId) 从未注册
+ * 过才 false）。登出/切账号（IM_SESSION_CLEARED）时调——此刻 storage 仍是旧
+ * token（saveAccessToken 先 invalidate 再写新 token），能带上旧账号凭证。
+ */
+export async function apiImDeviceUnregister(deviceId: string): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/devices/${encodeURIComponent(deviceId)}`,
+    method: "DELETE",
+  });
 }
 
 /**
@@ -624,23 +738,98 @@ export async function apiImSendTextMsg(
 }
 
 /**
- * 会话成员列表（convMembers，群聊 @提及面板的数据源）。
+ * 会话成员列表·单页（convMembers；全量请用 apiImConvMembersAll）。
  *
- * 契约同 PC 端 convApi.listMembers：GET /conversations/{convId}/members，首屏
- * limit=100 单页（与 PC loadMembers 同口径）；响应 data = PageResult<ConversationMemberDto>，
- * 取 records 数组。★userId 是 int64 雪花号：H5 请求层已保精度，Android 端经
- * `${raw}` 转字符串存用。
+ * 契约同 PC 端 convApi.listMembers：GET /conversations/{convId}/members，limit=100；
+ * 响应 data = PageResult<ConversationMemberDto>，取 records 数组。cursor=afterUserId
+ * （上一页最后一条 userId 的十进制字符串，首页传空串）。
+ * ★userId 是 int64 雪花号：H5 请求层已保精度，Android 端经 `${raw}` 转字符串存用。
  */
 export async function apiImConvMembers(
   convId: string,
+  cursor: string,
 ): Promise<RequestResponse<any>> {
   const data = new UTSJSONObject();
   data["limit"] = 100;
+  if (cursor.length > 0) {
+    data["cursor"] = cursor;
+  }
   return await request({
     url: `/api/instant-message/conversations/${convId}/members`,
     method: "GET",
     data,
   });
+}
+
+/** apiImConvMembers 单页结果：records=本页原始行（ConversationMemberDto），
+ *  nextCursor=下一页游标（空串=末页；超阈值大群服务端降级恒为空）。 */
+export class ImConvMembersPage {
+  records: UTSJSONObject[] = [];
+  nextCursor: string = "";
+}
+
+/**
+ * 会话成员列表·单页解析版（首页/翻页逐页取数用；要一次拿全走 apiImConvMembersAll）。
+ *
+ * 契约（nuwax-im ImConversationApplicationService.listMembers + PageResult）：
+ * 服务端多取一条判 hasMore，nextCursor 非空串=还有下一页（值=本页末条 userId），
+ * 空串/缺省=末页。★超阈值大群（默认 >500 人）服务端降级：忽略 cursor 恒返首页
+ * 前 100 条且 nextCursor 为空（找具体人须走搜索，端上翻不动）。
+ * 返回 null=请求失败/响应缺 data（调用方自行决定重试语义）。
+ */
+export async function apiImConvMembersPage(
+  convId: string,
+  cursor: string,
+): Promise<ImConvMembersPage | null> {
+  const res = await apiImConvMembers(convId, cursor);
+  if (apiResCode(res) != SUCCESS_CODE) {
+    return null;
+  }
+  const dataRaw = apiResData<any>(res);
+  const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+  if (dataObj == null) {
+    return null;
+  }
+  const page = new ImConvMembersPage();
+  const recordsRaw = dataObj["records"];
+  if (recordsRaw != null) {
+    const records = recordsRaw as UTSJSONObject[];
+    for (let i = 0; i < records.length; i++) {
+      page.records.push(records[i]);
+    }
+  }
+  const nextRaw = dataObj["nextCursor"];
+  page.nextCursor = nextRaw == null ? "" : `${nextRaw}`;
+  return page;
+}
+
+/**
+ * 会话成员列表·全量（apiImConvMembersPage 翻页循环收敛，@提及面板 / 已读名单等
+ * 需要完整数据的数据源用）。
+ *
+ * 返回：成功=累计 records（空群为空数组）；任一页失败/响应缺 data=null——调用方
+ * 按整体失败处理（重试从头拉），不把半截名单当全量展示。护栏：至多 30 页
+ * （3000 人）+ nextCursor 与上轮相同即止，防服务端异常导致死循环。
+ */
+export async function apiImConvMembersAll(
+  convId: string,
+): Promise<UTSJSONObject[] | null> {
+  let cursor = "";
+  const all: UTSJSONObject[] = [];
+  for (let page = 0; page < 30; page++) {
+    const p = await apiImConvMembersPage(convId, cursor);
+    if (p == null) {
+      return null;
+    }
+    for (let i = 0; i < p.records.length; i++) {
+      all.push(p.records[i]);
+    }
+    if (p.nextCursor.length == 0 || p.nextCursor == cursor) {
+      return all;
+    }
+    cursor = p.nextCursor;
+  }
+  return all;
 }
 
 /**

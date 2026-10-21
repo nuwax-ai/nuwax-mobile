@@ -64,9 +64,14 @@ function sanitizeBaseId(value: string | null): string {
  *  1. storage 有 → 直接用（老用户 deviceId 不突变，服务端不产生僵尸设备行）；
  *  2. storage 空（新装/重装，App 三端）→ 平台稳定标识——Android SSAID /
  *     iOS Keychain UUID / 鸿蒙 ODID（卸载重装后仍能取回同一值）；
- *  3. 仍拿不到 / 格式非法 → generateUUID()（H5/小程序恒走此路）。
- * 解析成功后统一落 storage 持久化；tabId 每次页面会话随机——H5 多标签各拿各的
- * tabId，自己其他标签页仍能收到自己发的消息，仅来源标签页被排除。
+ *  3. 仍拿不到 / 格式非法 → generateUUID()（H5 恒走此路）。
+ * 解析成功后统一落 storage 持久化。
+ *
+ * ★tabId（#后缀）仅 H5/WEB：多标签页共享 storage 里的 baseId，须以会话级
+ * tabId 区分端点（CONV_UNREAD 扇出按完整 deviceId 排除来源端）。
+ * App 三端 / 小程序单实例，deviceId 直接 = baseId——若加随机 tabId，
+ * 每次冷启动 deviceId 都变，服务端设备表（按完整 deviceId UPSERT）每次
+ * 启动都多一行，卸载重装稳定性就被 tabId 抵消了。
  */
 export function getImDeviceId(): string {
   if (cachedImDeviceId.length > 0) {
@@ -94,12 +99,84 @@ export function getImDeviceId(): string {
       // 存储异常不阻断发送：本次会话退化为内存态 baseId
     }
   }
+  // #ifdef H5 || WEB
   let tabId = "";
   for (let i = 0; i < 12; i++) {
     tabId += Math.floor(Math.random() * 16).toString(16);
   }
   cachedImDeviceId = `${baseId}#${tabId}`;
+  // #endif
+  // #ifndef H5 || WEB
+  cachedImDeviceId = baseId;
+  // #endif
   return cachedImDeviceId;
+}
+
+// ============================================================================
+// 设备注册（nuwax-im 02 §12.1：POST /api/instant-message/devices 等，身份只从
+// token 的 RequestContext 取，请求体传 userId 无效）
+// ============================================================================
+
+/**
+ * 设备注册 platform 取值：按实际运行端上报（对齐 nuwax-im ImPlatform.fromWire）。
+ * ★鸿蒙报 "harmonyos"：后端枚举暂无该值（现仅 ios/android/web/desktop/miniapp），
+ * fromWire → UNKNOWN 会被注册接口拒（IM_90001）；WS 握手不受影响（platform 仅
+ * 统计维度，不拒连）。注册失败已静默吞掉，后端加值后鸿蒙自动生效，勿改报
+ * miniapp 糊弄统计。
+ */
+export function imDevicePlatform(): string {
+  // #ifdef APP-ANDROID
+  return "android";
+  // #endif
+  // #ifdef APP-IOS
+  return "ios";
+  // #endif
+  // #ifdef APP-HARMONY
+  return "harmonyos";
+  // #endif
+  // #ifdef MP-WEIXIN
+  return "miniapp";
+  // #endif
+  // #ifdef H5 || WEB
+  return "web";
+  // #endif
+}
+
+/**
+ * 注册/刷新设备（UPSERT：后端语义是「每次建连都调」，订阅会过期会变）。
+ * ImWsClient 在 CONNECT_ACK 后自动调。pushEnabled=false——移动端暂无离线推送
+ * 通道（对齐 nuwax-im-web 注册口径）；Web Push 三要素与 voipToken 均不传。
+ */
+export async function apiImDeviceRegister(): Promise<RequestResponse<any>> {
+  const body = new UTSJSONObject();
+  body["deviceId"] = getImDeviceId();
+  body["platform"] = imDevicePlatform();
+  body["appName"] = "nuwax-mobile";
+  body["pushEnabled"] = false;
+  try {
+    const sys = uni.getSystemInfoSync();
+    body["appVersion"] = sys.appVersion;
+    body["osVersion"] = sys.osVersion;
+  } catch (_error) {
+    // 版本字段缺省不阻断注册
+  }
+  return await request({
+    url: "/api/instant-message/devices",
+    method: "POST",
+    data: body,
+  });
+}
+
+/**
+ * 注销设备（响应终态幂等：重复注销返回同样的 true；(userId, deviceId) 从未注册
+ * 过才 false）。登出/切账号（IM_SESSION_CLEARED）时调——此刻 storage 仍是旧
+ * token（saveAccessToken 先 invalidate 再写新 token），能带上旧账号凭证。
+ */
+export async function apiImDeviceUnregister(deviceId: string): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/devices/${encodeURIComponent(deviceId)}`,
+    method: "DELETE",
+  });
 }
 
 /**

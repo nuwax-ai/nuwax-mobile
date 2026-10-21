@@ -785,6 +785,26 @@
       </view>
     </view>
 
+    <!-- 剪贴板图片粘贴提示条：聚焦探测到剪贴板有图（App）/首次聚焦盲贴入口（H5）时展示，
+         点条读图入暂存条（与选图同链路，可与输入框文案合并 rich_text 发送），右侧 X 关闭；
+         同编辑/引用条一样须随输入坞让位补足上移（transform 与 dock 同曲线同拍） -->
+    <view
+      v-if="clipboardImageHint && multiSelectMode != true && !convDisbanded"
+      class="chat-clipboard-bar"
+      :style="{ transform: dockLiftTransform, transitionDuration: kbTransDuration }"
+    >
+      <view class="chat-clipboard-bar__main" hover-class="chat-clipboard-bar__main--active" @click="handleClipboardPasteTap">
+        <image class="chat-clipboard-bar__icon" src="/static/images/icon-Image.png" mode="aspectFit" />
+        <text class="chat-clipboard-bar__text text-ellipsis">{{
+          clipboardBlindMode ? t("Mobile.Chat.clipboardImagePaste") : t("Mobile.Chat.clipboardImageHint")
+        }}</text>
+        <text class="chat-clipboard-bar__action">{{ t("Mobile.Chat.clipboardImagePasteAction") }}</text>
+      </view>
+      <view class="chat-clipboard-bar__close" hover-class="chat-compose-bar__close--active" @click="handleClipboardBarClose">
+        <svg-icon name="icon-X" size="16" unit="px" color="#8a8a8a" />
+      </view>
+    </view>
+
     <!-- 底部输入坞（飞书消息对话框布局）：语音/键盘切换 + 输入框 + 表情 + 加号/发送
          （多选态卸载，由多选工具条接管底部） -->
     <view
@@ -1787,6 +1807,14 @@
   // #ifdef APP-IOS
   import { pickIosFiles } from "@/uni_modules/nuwax-ios-file-picker";
   // #endif
+  // 剪贴板图片粘贴：App 三端走原生插件（元数据探测 + 读图写缓存文件）；H5 走
+  // navigator.clipboard.read（盲贴，浏览器安全确认）+ textarea paste 事件（桌面 Ctrl+V）
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+  import { probeClipboardImage, readClipboardImageFile } from "@/uni_modules/nuwax-clipboard-image";
+  // #endif
+  // #ifdef H5 || WEB
+  import { canReadWebClipboard, observeChatInputPaste, readWebClipboardImage } from "@/utils/webClipboardImage.uts";
+  // #endif
 
   /** md 文档卡片图标（file-tree fileIconHelper 同款取法：H5 用打包资源、App 用静态路径）。 */
   // #ifdef H5 || WEB
@@ -2134,6 +2162,16 @@
   const messages = ref<ImMsgRow[]>([]);
   // 待发图片暂存条（选图后不立即发，点发送时与文案合并 rich_text / 单图直发 image）
   const stagedImages = ref<StagedImage[]>([]);
+  // 剪贴板图片粘贴提示条（聚焦时探测：App 原生元数据探测 / H5 盲贴入口一次）：
+  // 点击读图入暂存条走既有 rich_text 混发链路；指纹去重=同一份剪贴板内容只提示一次
+  const clipboardImageHint = ref<boolean>(false);
+  const clipboardBlindMode = ref<boolean>(false);
+  let clipboardProbeInFlight = false;
+  let clipboardImageFp = "";
+  // #ifdef H5 || WEB
+  let webClipboardPillArmed = true;
+  let disposeWebPasteObserver: (() => void) | null = null;
+  // #endif
   const loading = ref<boolean>(false);
   const loadFailed = ref<boolean>(false);
   const hasMore = ref<boolean>(false);
@@ -4947,9 +4985,10 @@
       push("audio", m.audioUrl, "");
     }
     if (m.videoUrl.length > 0) {
-      // file 单附件视频端上按视频渲染，转发快照仍按原 file 契约；
-      // rich_text 内嵌视频附件原本 kind=video，快照保真原 kind
-      push(m.msgType == "file" ? "file" : "video", m.videoUrl, m.videoFileName);
+      // 视频行统一 kind=video（msgType=video 新契约 + 端上按视频渲染的 file 存量行 +
+      // rich_text 内嵌视频附件）：合并快照 kind 白名单含 video，PC 合并详情按 kind
+      // 渲染播放器；按原 file 契约快照会让桌面端转发详情把视频画成文件卡片
+      push("video", m.videoUrl, m.videoFileName);
     }
     for (let i = 0; i < m.imageAtts.length; i++) {
       push("image", m.imageAtts[i].url, m.imageAtts[i].fileName);
@@ -7318,8 +7357,15 @@
       const file = up.file;
       // 入口契约（PC kindOf 同口径，servers/im.uts 注释「相册/拍摄入口恒为 image」）：
       // 入队时已判定的图片行不被服务端 mime 嗅探失败（octet-stream——上传物理文件
-      // 无扩展名的形态）降级成文件消息；文件入口（H5）仍按返回 mime 归类（可升格 image）
-      const kind = row.msgType == "image" || file.type.indexOf("image/") == 0 ? "image" : "file";
+      // 无扩展名的形态）降级成文件消息；视频按 mime/扩展名升格 kind=video——PC 单附件
+      // 渲染只认 msgType、无 mime 兜底（MessageBubble singleKind），恒发 file 会让
+      // 桌面端把视频画成文件卡片；其余文件入口（H5）按返回 mime 归类（可升格 image）
+      let kind = "file";
+      if (row.msgType == "image" || file.type.indexOf("image/") == 0) {
+        kind = "image";
+      } else if (file.type.indexOf("video/") == 0 || classifyKind("", file.name) == "video") {
+        kind = "video";
+      }
       const res = await apiImSendMediaMsg(
         convId.value,
         kind,
@@ -7339,8 +7385,8 @@
         if (kind == "image") {
           confirmed.imageUrl = file.url;
           confirmed.linkAtts = [];
-        } else if (file.type.indexOf("video/") == 0 || classifyKind("", file.name) == "video") {
-          // 视频文件：确认行转视频渲染（readMsgRow 同口径；发送契约仍 kind=file），
+        } else if (kind == "video") {
+          // 视频文件：确认行转视频渲染（readMsgRow 同口径，发送契约 kind=video），
           // 随后 preloadChatVideos 换 ak 直链挂播放器。服务端 mime 嗅探失败
           // （octet-stream，如相册视频物理文件无扩展名上传的形态）时按文件名扩展名兜底
           confirmed.imageUrl = "";
@@ -10448,6 +10494,114 @@
     }
   });
 
+  // ===== 剪贴板图片粘贴（提示条见模板 chat-clipboard-bar，插件/工具见 import 区）=====
+
+  /** 暂存图片张数上限（含已暂存量，与既有相册多选 count 同值；剪贴板粘贴同用此上限）。 */
+  const STAGED_IMAGE_MAX = 9;
+
+  /**
+   * 聚焦探测剪贴板是否含图片：iOS=UIPasteboard.hasImages / Android=ClipDescription mime，
+   * 均为元数据级探测，不触发系统粘贴提示/Toast。指纹去重：同一份剪贴板内容只提示一次
+   * （粘贴或关闭后不再重复弹）；鸿蒙拿不到指纹（空串）时每次聚焦都提示。
+   * 回调延迟 400ms 写 hint：避开键盘升起让位动画窗，防整页重渲染落进动画帧。
+   */
+  function probeClipboardForImage(): void {
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    if (clipboardProbeInFlight) {
+      return;
+    }
+    clipboardProbeInFlight = true;
+    probeClipboardImage((hasImage: boolean, fingerprint: string) => {
+      clipboardProbeInFlight = false;
+      if (hasImage != true || convDisbanded.value || stagedImages.value.length >= STAGED_IMAGE_MAX) {
+        return;
+      }
+      if (fingerprint.length > 0) {
+        if (fingerprint == clipboardImageFp) {
+          return;
+        }
+        clipboardImageFp = fingerprint;
+      }
+      setTimeout(() => {
+        clipboardImageHint.value = true;
+      }, 400);
+    });
+    // #endif
+  }
+
+  /** H5 无静默探测（clipboard.read 必弹浏览器确认）：首次聚焦给一次「盲贴」入口（会话级）。 */
+  function armWebClipboardPill(): void {
+    // #ifdef H5 || WEB
+    if (!webClipboardPillArmed || !canReadWebClipboard()) {
+      return;
+    }
+    webClipboardPillArmed = false;
+    if (convDisbanded.value || stagedImages.value.length >= STAGED_IMAGE_MAX) {
+      return;
+    }
+    clipboardBlindMode.value = true;
+    setTimeout(() => {
+      clipboardImageHint.value = true;
+    }, 400);
+    // #endif
+  }
+
+  /** 剪贴板图片入暂存条（与选图/拍照同构，可与文案合并 rich_text 发送；返回是否入列）。 */
+  function pushClipboardStagedImage(path: string): boolean {
+    if (path.length == 0 || stagedImages.value.length >= STAGED_IMAGE_MAX) {
+      return false;
+    }
+    const staged = new StagedImage();
+    staged.id = generateUUID();
+    staged.localPath = path;
+    stagedImages.value.push(staged);
+    return true;
+  }
+
+  /**
+   * 提示条整条点击=粘贴：读图入暂存条（iOS 16+ 读取时系统弹「允许粘贴」、Android 13+
+   * 弹读取 Toast，均平台常态）。成功收起提示条；失败（含 iOS 拒绝弹窗→EMPTY、
+   * 鸿蒙无权限→PERM）同样收起并 toast。
+   */
+  function handleClipboardPasteTap(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    if (stagedImages.value.length >= STAGED_IMAGE_MAX) {
+      uni.showToast({ title: tCount("Mobile.Chat.imageMaxSelect", STAGED_IMAGE_MAX), icon: "none" });
+      return;
+    }
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    readClipboardImageFile(
+      (path: string) => {
+        pushClipboardStagedImage(path);
+        clipboardImageHint.value = false;
+      },
+      (_code: string, _message: string) => {
+        clipboardImageHint.value = false;
+        uni.showToast({ title: t("Mobile.Chat.clipboardImageReadFail"), icon: "none" });
+      },
+    );
+    // #endif
+    // #ifdef H5 || WEB
+    readWebClipboardImage(
+      (url: string) => {
+        pushClipboardStagedImage(url);
+        clipboardImageHint.value = false;
+      },
+      (_code: string, _message: string) => {
+        clipboardImageHint.value = false;
+        uni.showToast({ title: t("Mobile.Chat.clipboardImageReadFail"), icon: "none" });
+      },
+    );
+    // #endif
+  }
+
+  /** 提示条关闭（X）：App 端凭指纹本轮剪贴板内容不再提示（下次复制新图才会再弹）。 */
+  function handleClipboardBarClose(): void {
+    clipboardImageHint.value = false;
+  }
+
   /**
    * 点输入框：聚焦拉起系统键盘。App 端面板不清——飞书式键盘升起覆盖住表情面板，
    * 面板卸载在键盘高度回调里与让位同帧做；H5 无键盘高度回调，focus 即收互斥面板。
@@ -10463,6 +10617,9 @@
     kbFocusReqTs = Date.now();
     // Android 兜底：部分机型从子页返回后键盘事件不派发，聚焦期间轮询 IME insets 接管让位
     startAndroidImePolling();
+    // 剪贴板图片提示：App 原生元数据探测（不弹系统提示）；H5 无静默探测，首次聚焦给盲贴入口
+    probeClipboardForImage();
+    armWebClipboardPill();
     // #ifdef APP-IOS || APP-HARMONY
     // 微信式预抬：聚焦瞬间用上次真实键盘高度先行让位（与键盘动画同帧起步），真值回调
     // 到达即校正；500ms 无任何真值则看门狗回落（外接键盘/焦点被抢防幽灵让位）
@@ -10625,9 +10782,6 @@
     }
     inputText.value = text.substring(0, cut);
   }
-
-  /** 暂存图片张数上限（含已暂存量，与既有相册多选 count 同值）。 */
-  const STAGED_IMAGE_MAX = 9;
 
   /** 暂存条删除单张（按 id 过滤重建数组，响应式安全）。 */
   function removeStagedImage(id: string): void {
@@ -12195,6 +12349,12 @@
     destroyChatAudio();
     stopAsrAnimTimer();
     eventBus.off(IM_SESSION_CLEARED, onImSessionCleared);
+    // #ifdef H5 || WEB
+    if (disposeWebPasteObserver != null) {
+      disposeWebPasteObserver!();
+      disposeWebPasteObserver = null;
+    }
+    // #endif
     pageDisposed = true;
     releaseChatImages();
     releaseChatVideos();
@@ -12353,6 +12513,12 @@
     // Android：输入框已挂载时把原生 gravity 设为垂直居中；进页首帧原生视图可能
     // 晚于 onReady 挂载（单次调用会静默空转，未聚焦时 placeholder 偏上），带重试兜到挂载
     centerAndroidInputGravityWithRetry(8);
+    // #ifdef H5 || WEB
+    // 桌面 Web：textarea paste 事件直取 clipboardData.files（Ctrl+V 图文混贴，免浏览器确认弹窗）
+    disposeWebPasteObserver = observeChatInputPaste("chat-input-textarea", (url: string) => {
+      pushClipboardStagedImage(url);
+    });
+    // #endif
   });
 </script>
 
@@ -13818,6 +13984,72 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+  }
+
+  /* ===== 剪贴板图片粘贴提示条（同编辑/引用条：随坞让位、白底圆角、右端 X）===== */
+  .chat-clipboard-bar {
+    flex-shrink: 0;
+    margin: 0 12px 4px;
+    padding: 7px 10px 7px 8px;
+    border-radius: 8px;
+    background-color: #ffffff;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    /* 与编辑/引用条、输入坞同曲线同拍让位（transform 绑定见模板） */
+    transition-property: transform;
+    transition-duration: 250ms;
+    transition-timing-function: cubic-bezier(0.2, 0.9, 0.2, 1);
+  }
+
+  .chat-clipboard-bar__main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .chat-clipboard-bar__main--active {
+    opacity: 0.7;
+  }
+
+  .chat-clipboard-bar__icon {
+    width: 16px;
+    height: 16px;
+    margin-right: 6px;
+    flex-shrink: 0;
+  }
+
+  .chat-clipboard-bar__text {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    line-height: 17px;
+    color: #4b4b52;
+  }
+
+  /* 动作胶囊：黑底白字（全 App 方形/胶囊动作按钮统一黑白风格） */
+  .chat-clipboard-bar__action {
+    flex-shrink: 0;
+    margin-left: 8px;
+    padding: 3px 10px;
+    border-radius: 10px;
+    background-color: #111118;
+    color: #ffffff;
+    font-size: 11px;
+    line-height: 15px;
+  }
+
+  .chat-clipboard-bar__close {
+    flex-shrink: 0;
+    margin-left: 4px;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
   }
 
   .chat-compose-bar__close--active {

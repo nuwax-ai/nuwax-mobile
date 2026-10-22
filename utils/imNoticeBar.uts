@@ -1,5 +1,5 @@
 import { releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
-import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { getImSessionStamp, IM_SESSION_READY } from "@/utils/im/imSessionScope";
 import { ref, type Ref } from "vue";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -88,6 +88,35 @@ function currentToken(): string {
   return raw != null ? `${raw}` : "";
 }
 
+/** 持久化 myUserId 缓存（成对存 id + 拉取时的 token 快照，token 不匹配即失效）。 */
+const MY_USER_ID_STORAGE_KEY = "NUWAX_IM_MY_USER_ID";
+const MY_USER_ID_TOKEN_STORAGE_KEY = "NUWAX_IM_MY_USER_ID_TOKEN";
+
+/**
+ * 从 storage 水合内存缓存（仅 token 匹配时生效）：
+ * 内存缓存被清/进程重启后，登录态下的首条消息不再被 myUserId fail-closed 吃掉
+ * （2026-10-22 真机：消息先到、apiUserInfo 后 110ms 回来，横幅必丢）。
+ */
+function hydrateMyUserIdFromStorage(): void {
+  if (cachedMyUserId.length > 0) {
+    return;
+  }
+  const token = currentToken();
+  if (token.length == 0) {
+    return;
+  }
+  try {
+    const idRaw = uni.getStorageSync(MY_USER_ID_STORAGE_KEY);
+    const tokenRaw = uni.getStorageSync(MY_USER_ID_TOKEN_STORAGE_KEY);
+    if (idRaw != null && tokenRaw != null && `${tokenRaw}` == token) {
+      cachedMyUserId = `${idRaw}`;
+      myUserIdToken = token;
+    }
+  } catch (_e) {
+    // storage 读失败：保持空，走网络拉取
+  }
+}
+
 /** 拉取/刷新 myUserId（失败静默：保持空值，下一条消息再试）。 */
 async function ensureMyUserId(): Promise<void> {
   // 工作商业版未授权：不预拉（WS 已闸死收不到消息，横幅链路整体不启用）
@@ -111,6 +140,10 @@ async function ensureMyUserId(): Promise<void> {
       const idRaw = dataObj["id"];
       cachedMyUserId = idRaw != null ? `${idRaw}` : "";
       myUserIdToken = token;
+      if (cachedMyUserId.length > 0) {
+        uni.setStorageSync(MY_USER_ID_STORAGE_KEY, cachedMyUserId);
+        uni.setStorageSync(MY_USER_ID_TOKEN_STORAGE_KEY, token);
+      }
     }
   } catch (_error) {
     // 静默：下次消息再试。
@@ -296,6 +329,7 @@ function handleNoticeMessage(payload: any): void {
   const senderIdRaw = obj["senderId"];
   const senderId = senderIdRaw != null ? `${senderIdRaw}` : "";
   if (myUserIdToken != currentToken()) cachedMyUserId = "";
+  if (cachedMyUserId.length == 0) hydrateMyUserIdFromStorage();
   if (cachedMyUserId.length == 0 || senderId.length == 0) {
     ensureMyUserId();
     return;
@@ -403,6 +437,7 @@ function handleBackgroundNotification(obj: UTSJSONObject): void {
   const senderIdRaw = obj["senderId"];
   const senderId = senderIdRaw != null ? `${senderIdRaw}` : "";
   if (myUserIdToken != currentToken()) cachedMyUserId = "";
+  if (cachedMyUserId.length == 0) hydrateMyUserIdFromStorage();
   if (cachedMyUserId.length == 0 || senderId.length == 0) {
     ensureMyUserId();
     return;
@@ -478,8 +513,16 @@ export function bindImNoticeEvents(): void {
     return;
   }
   noticeEventsBound = true;
+  hydrateMyUserIdFromStorage();
   ensureMyUserId();
   refreshConvCache();
+  // 登录 token 写入后补拉：onLaunch 时未登录的预拉是空转（token 为空静默失败），
+  // 不补拉则登录后首条消息必被 myUserId fail-closed 吃掉（且 apiUserInfo 偶发失败时
+  // 会连续吃掉多条）。WS 同靠 IM_SESSION_READY 启动，补拉可与连接建立并行。
+  eventBus.on(`${IM_SESSION_READY}`, (_event: any) => {
+    ensureMyUserId();
+    refreshConvCache();
+  });
   // 零参函数直接当 EventCallback 传在 UTS→Kotlin 报 Unit≠EventCallback（error17），
   // 包箭头函数（同 App.uvue / imUnreadBadge 绑定写法）
   eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, (event: any) => {

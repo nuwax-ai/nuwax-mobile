@@ -1799,6 +1799,11 @@
   // #ifdef APP-IOS
   import { pickIosFiles } from "@/uni_modules/nuwax-ios-file-picker";
   // #endif
+  // 鸿蒙相册直选：uni.chooseMedia 对混选 mediaType 会强弹自家「拍摄/从相册选择」
+  // sheet（无视 sourceType:["album"]），改走自研插件直开系统相册选择器（图+视频混选）
+  // #ifdef APP-HARMONY
+  import { pickHarmonyAlbumMedia } from "@/uni_modules/nuwax-harmony-album-picker";
+  // #endif
   // 剪贴板图片粘贴：App 三端走原生插件（元数据探测 + 读图写缓存文件）；H5 走
   // navigator.clipboard.read（盲贴，浏览器安全确认）+ textarea paste 事件（桌面 Ctrl+V）
   // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
@@ -11062,14 +11067,60 @@
   }
 
   /**
+   * 相册选择结果入链（uni.chooseMedia 与鸿蒙 nuwax-harmony-album-picker 的共用出口）：
+   * 视频立即入队发送（路径末段为 displayName，无扩展名时补 .mp4 保上传 mime 可判——
+   * Android content 路径与鸿蒙媒体库 URI 的末段都可能无扩展名），图片入暂存条；
+   * 暂存条满额后的图片计入溢出并统一提示。paths 与 isVideos 等长一一对应。
+   */
+  function stagePickedAlbumFiles(paths: string[], isVideos: boolean[], room: number): void {
+    let stagedCount = 0;
+    let overflow = 0;
+    for (let i = 0; i < paths.length; i++) {
+      const path = paths[i];
+      if (path.length == 0) {
+        continue;
+      }
+      if (isVideos[i] == true) {
+        // 视频立即入队：相册临时路径可能无扩展名，补 .mp4 保上传 mime 可判
+        let name = "";
+        const segs = path.split("/");
+        if (segs.length > 0 && segs[segs.length - 1].length > 0) {
+          name = segs[segs.length - 1];
+        }
+        if (name.indexOf(".") < 0) {
+          name = `${name}.mp4`;
+        }
+        queueMediaRow(path, name, false);
+      } else if (stagedCount < room) {
+        const staged = new StagedImage();
+        staged.id = generateUUID();
+        staged.localPath = path;
+        stagedImages.value.push(staged);
+        stagedCount++;
+      } else {
+        overflow++;
+      }
+    }
+    if (overflow > 0) {
+      uni.showToast({
+        title: tCount("Mobile.Chat.imageMaxSelect", STAGED_IMAGE_MAX),
+        icon: "none",
+      });
+    }
+  }
+
+  /**
    * 相册 / 拍摄（图片键 action sheet）：拍摄走 chooseImage 仅出图；
-   * 相册（App/小程序）走 chooseMedia 图+视频混选——图片先入暂存条（可与输入框
+   * 相册（安卓/iOS/小程序）走 chooseMedia 图+视频混选；鸿蒙走 nuwax-harmony-album-picker
+   * 直开系统相册选择器——运行时 chooseMedia 对混选 mediaType 无视 sourceType，会先弹
+   * 自家「拍摄/从相册选择」sheet 与本处二选一弹窗叠成双层——图片先入暂存条（可与输入框
    * 文案合并 rich_text，形态判定见 handleSend），视频走文件链路直接入队发送
    * （queueMediaRow，与 PC 单附件契约一致；原加号面板视频入口已并入此处）。
    * 相册/相机权限先于 choose* 显式申请（首次被拒后运行时不再代弹授权框，
-   * 首次被拒后运行时不再代弹授权框，此后每次点击都静默失败）；
+   * 此后每次点击都静默失败）；
    * Android13+ 混选须同时申请 READ_MEDIA_IMAGES + READ_MEDIA_VIDEO（见 mix 分支）。
-   * ★本函数须定义在上方权限 helpers 与 queueMediaRow 之后（UTS 先声明后使用）。
+   * ★本函数须定义在上方权限 helpers、queueMediaRow 与 stagePickedAlbumFiles
+   * 之后（UTS 先声明后使用）。
    */
   function handlePickImage(source: string): void {
     const sourceTypes =
@@ -11097,8 +11148,23 @@
         }
         return;
       }
-      // ===== 相册：App/小程序走 chooseMedia 图+视频混选 =====
-      // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY || MP-WEIXIN
+      // ===== 相册：鸿蒙走自研插件直开系统相册选择器；安卓/iOS/小程序走 chooseMedia 图+视频混选 =====
+      // #ifdef APP-HARMONY
+      if (isCamera != true) {
+        pickHarmonyAlbumMedia(
+          room,
+          (paths: string[], isVideos: boolean[]): void => {
+            stagePickedAlbumFiles(paths, isVideos, room);
+          },
+          (_code: string, _message: string): void => {
+            // 取消/失败均静默（对齐 chooseMedia fail 的非权限路径；
+            // 系统相册选择器为安全控件，无权限被拒场景）
+          },
+        );
+        return;
+      }
+      // #endif
+      // #ifdef APP-ANDROID || APP-IOS || MP-WEIXIN
       if (isCamera != true) {
         uni.chooseMedia({
           sourceType: ["album"],
@@ -11117,42 +11183,17 @@
               uni.showToast({ title: t("Mobile.Chat.albumImportEmpty"), icon: "none" });
               return;
             }
-            let stagedCount = 0;
-            let overflow = 0;
+            const paths = [] as string[];
+            const isVideos = [] as boolean[];
             for (let i = 0; i < files.length; i++) {
               const f = files[i];
               if (f == null || f.tempFilePath == null || `${f.tempFilePath}`.length == 0) {
                 continue;
               }
-              const path = `${f.tempFilePath}`;
-              if (f.fileType == "video") {
-                // 视频立即入队：相册临时路径可能无扩展名
-                // （Android content 路径），补 .mp4 保上传 mime 可判
-                let name = "";
-                const segs = path.split("/");
-                if (segs.length > 0 && segs[segs.length - 1].length > 0) {
-                  name = segs[segs.length - 1];
-                }
-                if (name.indexOf(".") < 0) {
-                  name = `${name}.mp4`;
-                }
-                queueMediaRow(path, name, false);
-              } else if (stagedCount < room) {
-                const staged = new StagedImage();
-                staged.id = generateUUID();
-                staged.localPath = path;
-                stagedImages.value.push(staged);
-                stagedCount++;
-              } else {
-                overflow++;
-              }
+              paths.push(`${f.tempFilePath}`);
+              isVideos.push(f.fileType == "video");
             }
-            if (overflow > 0) {
-              uni.showToast({
-                title: tCount("Mobile.Chat.imageMaxSelect", STAGED_IMAGE_MAX),
-                icon: "none",
-              });
-            }
+            stagePickedAlbumFiles(paths, isVideos, room);
           },
           fail: (err) => {
             // 权限被拒（errCode 1101005）：引导去系统设置；用户取消（1101001）与其他失败保持静默

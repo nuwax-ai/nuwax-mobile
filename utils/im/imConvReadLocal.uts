@@ -1,0 +1,74 @@
+import { apiResData } from "@/utils/apiResponse";
+import type { RequestResponse } from "@/types/interfaces/request";
+
+/**
+ * 本端 read 上报回包 → 消息列表行角标本地纠正（模块单例，单槽标记）。
+ *
+ * 后端 ReadReportResult.unreadCleared 的设计用途就是「来源端本地立即清红点」：
+ * 来源端被 deviceId 排除、收不到自己的 CONV_UNREAD 帧（02 §7.5），全靠回包回显。
+ *
+ * 口径（nuwax-im ImUnreadCounter / ReadReportResult 注释）：
+ * - 会话行红点（im:unread:{userId} HASH）含免打扰会话，read 推进水位即清零该会话
+ *   未读 ⇒ advanced=true 时行角标本地置 0 恒对；unread-total 全量回包随时权威覆盖。
+ * - tab 总数（im:unread:total）不含免打扰会话，read 免打扰会话时 total 不变 ⇒
+ *   unreadCleared 不能拿来减 tab 角标（会多减），tab 维持 unread-total 权威拉取。
+ */
+export class ConvReadMark {
+  convId: string;
+  cleared: number;
+  /** readSeqAfter >= lastMsgSeq：已读到最新（本 App 上报恒为 maxSeq，常态 true）。 */
+  caughtUp: boolean;
+
+  constructor(convId: string, cleared: number, caughtUp: boolean) {
+    this.convId = convId;
+    this.cleared = cleared;
+    this.caughtUp = caughtUp;
+  }
+}
+
+let pendingMark: ConvReadMark | null = null;
+
+function readMarkNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+  const raw = obj[key];
+  if (raw == null) {
+    return fallback;
+  }
+  const parsed = parseFloat(`${raw}`);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+function readMarkBool(obj: UTSJSONObject, key: string): boolean {
+  const raw = obj[key];
+  return raw != null && `${raw}` == "true";
+}
+
+/**
+ * read 上报成功回包（调用方须先校验 SUCCESS_CODE）→ 解析并落单槽标记。
+ * advanced != true（水位未推进/被 clamp 的重复上报）与 redisDegraded=true
+ * （未读书目可能不实）都不做本地纠正，回落全量 pull 兜底。
+ * convId 用调用方本地值，不读回包（int64 雪花号 H5/小程序 JSON.parse 丢精度）。
+ */
+export function noteConvReadFromReadReport(
+  convId: string,
+  response: RequestResponse<any>,
+): void {
+  if (convId.length == 0) return;
+  const dataRaw = apiResData<any>(response);
+  const obj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+  if (obj == null) return;
+  if (!readMarkBool(obj, "advanced")) return;
+  if (readMarkBool(obj, "redisDegraded")) return;
+  const cleared = readMarkNumber(obj, "unreadCleared", 0);
+  const after = readMarkNumber(obj, "readSeqAfter", 0);
+  const last = readMarkNumber(obj, "lastMsgSeq", 0);
+  const caughtUp = last > 0 && after >= last;
+  if (cleared <= 0 && !caughtUp) return;
+  pendingMark = new ConvReadMark(convId, cleared, caughtUp);
+}
+
+/** 消息列表 onShow 消费（取出即清）。单槽够用：两次进聊天页之间必经列表 onShow。 */
+export function consumeConvReadMark(): ConvReadMark | null {
+  const mark = pendingMark;
+  pendingMark = null;
+  return mark;
+}

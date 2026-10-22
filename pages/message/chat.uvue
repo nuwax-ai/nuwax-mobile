@@ -1781,6 +1781,7 @@
   import { pcmToWavFile, PcmToWavResult } from "@/utils/voice/pcmToWav";
   import { UploadFileInfo } from "@/types/interfaces/common.uts";
   import { imUnreadCount, refreshImUnreadBadge } from "@/utils/imUnreadBadge";
+  import { noteConvReadFromReadReport } from "@/utils/im/imConvReadLocal";
   import { isRemoteSvgUrl, resolveAppSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import { getSafeAreaBottom, handleExternalLink, isWorkCommercialRepoLinkBlocked, openNativeHomeChatLink } from "@/utils/system";
   import { resolveWorkCommercialBlocked } from "@/utils/workCommercial";
@@ -5910,19 +5911,43 @@
   let readReportRunning = false;
   let wantedReadSeq = 0;
 
+  async function runReadReportLoop(): Promise<void> {
+    // 不设页面可见守卫：退页补发（flushReadReportOnLeave）的在途回包与页面离开后的
+    // 续轮只写模块级状态（read 标记 / unread-total pull），无页面依赖，离开后照常推进。
+    while (wantedReadSeq > reportedReadSeq) {
+      const seq = wantedReadSeq;
+      const res = await apiImReadReport(convId.value, seq);
+      if (apiResCode(res) != SUCCESS_CODE) return;
+      reportedReadSeq = Math.max(reportedReadSeq, seq);
+      // unreadCleared 回显（来源端收不到自己的 CONV_UNREAD 帧）→ 列表行角标本地清
+      noteConvReadFromReadReport(convId.value, res);
+      refreshImUnreadBadge();
+    }
+  }
+
   async function flushReadReport(): Promise<void> {
     if (!isChatActive() || readReportRunning) return;
     readReportRunning = true;
     try {
-      while (isChatActive() && wantedReadSeq > reportedReadSeq) {
-        const seq = wantedReadSeq;
-        const res = await apiImReadReport(convId.value, seq);
-        if (!isChatCurrent() || apiResCode(res) != SUCCESS_CODE) return;
-        reportedReadSeq = Math.max(reportedReadSeq, seq);
-        refreshImUnreadBadge();
-      }
+      await runReadReportLoop();
     } catch (_e) {
       // 失败不推进水位；下一次来消息/回前台会重试同一水位。
+    } finally {
+      readReportRunning = false;
+    }
+  }
+
+  /** 退页补发：onHide/onUnload 原把 150ms 去抖窗口内的挂起上报随 timer 直接丢弃，
+   *  read 落不了地 → 返回列表后的行角标标记与 unread-total 全拉旧值。改为立即发
+   *  （fire-and-forget），成功后照常落标记 + 拉角标（均模块级，页面销毁不中断）。
+   *  进子页（@ 选人/群设置等）也走 onHide：水位已持平即空转，幂等无害。 */
+  async function flushReadReportOnLeave(): Promise<void> {
+    if (readReportRunning || wantedReadSeq <= reportedReadSeq) return;
+    readReportRunning = true;
+    try {
+      await runReadReportLoop();
+    } catch (_e) {
+      // 静默：下次进页 onShow 的 reportReadIfNeeded 重试同水位
     } finally {
       readReportRunning = false;
     }
@@ -12378,6 +12403,8 @@
   onUnload(() => {
     releasePrependAnchor();
     clearChatUiTimers();
+    // navigateBack 兜底：onHide 已补发则水位持平空转；个别链路丢 onHide 时不漏报
+    flushReadReportOnLeave();
     // 草稿即时落盘（退页兜底；发送清空经 watch 已清，此处幂等）
     flushChatDraft();
     if (chatMediaRefreshTimer != 0) {
@@ -12528,6 +12555,8 @@
     if (!listSettled.value && scrollAnchor.value.length > 0) deferredAnchor = scrollAnchor.value;
     clearChatUiTimers();
     cancelSettle();
+    // 去抖窗口内的挂起 read 上报立即补发，不再随 timer 丢弃
+    flushReadReportOnLeave();
     readStatusSeq += 1;
     if (readRefreshTimer != 0) {
       clearTimeout(readRefreshTimer);

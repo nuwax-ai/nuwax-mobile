@@ -10,16 +10,16 @@ import { isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
  * 故真机正常、浏览器必现）。与消息列表同机制：经 resolveDisplayImageUrl 带 Bearer
  * 拉图换 blob 地址展示。
  *
- * App 根因（Android；2026-10 阅读状态页女娲助手图标空白同因）：远程 SVG 头像直连
- * <image> 时 Android 原生渲染器按 SVG 声明尺寸 1:1 光栅化，小容器只显示局部（透明
- * 角落=看不见）且不触发 @error。故 Android 走 resolveDisplayImageUrl（消息列表
- * resolveIconInto 同款）：SVG 按容器物理像素改写后出 data URL、/api/f/ 带 Bearer
- * 换 temp 文件；普通位图地址内部零请求透传，无额外成本。
- * （iOS 早前记载「直连渲染失败」已被 2026-10-23 消息列表实测推翻——直连/302/
- * Cookie/渲染均正常，resolveDisplayImageUrl 对 iOS 的 SVG 现为直连透传。）
+ * App（2026-10-23 消息列表定稿）：Android/iOS 的 svg 与普通位图直连均正常，
+ * resolveDisplayImageUrl 内部按平台分流（App 两端 svg 直连透传、受保护地址换 Bearer
+ * temp 文件），调用方无需关心平台差异。Android 走本解析的历史根因（SVG 1:1 光栅化
+ * 裁切须改写 data URL）已在直连定稿中推翻。
  *
- * ★鸿蒙不处理：ArkUI <image> 不支持 SVG data URL（直连远程 .svg 可正确缩放），
- *   保持原地址透传（resolveDisplayImageUrl 内部对鸿蒙同样透传）。
+ * ★鸿蒙例外（2026-10-23 消息列表/聊天页同因实锤）：ArkUI <image> 直连 /api/f/ 不带
+ *   Cookie → 服务端回 200+JSON 错误包 → "After download successful, imageObject
+ *   Create fail"，受保护地址同样走 resolveDisplayImageUrl 换 Bearer temp 文件。
+ *   普通位图/远程 svg 直连可用（ArkUI 不支持 SVG data URL，但直连远程 .svg 可正确
+ *   缩放），不解析不额外下载。
  *
  * 缓存策略对齐 utils/remoteSvgImage：按 IM 会话 stamp 隔离清空 + 容量上限、在途
  * 去重、普通地址/失败负缓存不重试。次级页面头像量小，blob 不做逐页 revoke（会话
@@ -42,7 +42,9 @@ import { isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
 
 /** 原始地址 → 已解析展示地址（键含展示尺寸：App 端 SVG data URL 按尺寸出图，跨页尺寸不同不可混用） */
 const resolvedCache = new Map<string, string>();
-/** 已发起过解析的原始地址（含普通地址/失败回退：不重试，负缓存语义；失败与尺寸无关，按原始地址记） */
+/** 已发起过解析的键（size|url；含失败回退：不重试，负缓存语义）。★键必须含尺寸：
+ *  同 URL 跨页 sizeRpx 不同（群成员页 72 / 用户信息页 160 / 搜索 96）须各自解析——
+ *  旧按 URL 记会短路掉第二个尺寸（首帧藏图后永不写回＝字母兜底钉死）。 */
 const attemptedUrls = new Set<string>();
 /** 在途去重：同「尺寸|地址」并发触发共享同一次解析 */
 const pendingUrls = new Map<string, Promise<string>>();
@@ -60,13 +62,14 @@ function prepareCache(): void {
 }
 
 /** 同步取展示地址（sizeRpx 须与 resolveImAvatarDisplay 一致，缓存键含尺寸）：
- * 缓存命中返回已解析地址；H5 上未解析的受保护地址返回空（先藏图，与消息列表一致
- * ——裸 <img> 请求必被 ORB 拦，还会触发 @error 标死字母兜底）；其余原样返回。 */
+ * 缓存命中返回已解析地址；H5 / 鸿蒙上未解析的受保护地址返回空（先藏图，与消息列表
+ * 一致——H5 裸 <img> 请求必被 ORB 拦；鸿蒙 ArkUI 直连无 Cookie 必 imageObject
+ * Create fail；都会触发 @error 标死字母兜底）；其余原样返回。 */
 export function imAvatarDisplayUrl(url: string, sizeRpx: number): string {
   if (url.length == 0) return url;
   const hit = resolvedCache.get(`${sizeRpx}|${url}`);
   if (hit != null) return hit;
-  // #ifdef H5 || WEB
+  // #ifdef H5 || WEB || APP-HARMONY
   if (isAuthProtectedFileUrl(url)) return "";
   // #endif
   return url;
@@ -75,20 +78,26 @@ export function imAvatarDisplayUrl(url: string, sizeRpx: number): string {
 /**
  * 异步解析并写缓存：普通地址零请求透传原样返回；受保护/SVG 地址返回换好的展示地址。
  * 调用方把返回值写回行字段（并在失败首帧已标 avatarFailed 时复位）。
- * 生效范围：H5（ORB 拦截）与 App-Android（SVG 1:1 光栅化裁切）；iOS 与鸿蒙、
- * 小程序对 SVG 原样透传（iOS 2026-10-23 实测直连可行；ArkUI 直连远程 .svg 可正确缩放）。
+ * 生效范围：H5（ORB 拦截）；鸿蒙（受保护 /api/f/ 无 Cookie 直连失败，2026-10-23
+ * 实锤，仅解析受保护地址）；Android/iOS 仅有受保护地址会实际换链（svg 与普通位图
+ * resolveDisplayImageUrl 内部直连透传，零额外请求）；小程序原样透传。
  */
 export function resolveImAvatarDisplay(url: string, sizeRpx: number): Promise<string> {
-  // #ifdef H5 || WEB || APP-ANDROID || APP-IOS
+  // #ifdef H5 || WEB || APP-ANDROID || APP-IOS || APP-HARMONY
   if (url.length == 0) return Promise.resolve(url);
+  // #ifdef APP-HARMONY
+  // 鸿蒙只解析受保护地址：普通直链位图/远程 svg 直连可用（ArkUI 正确缩放远程
+  // .svg），零请求透传不额外下载。
+  if (isAuthProtectedFileUrl(url) != true) return Promise.resolve(url);
+  // #endif
   prepareCache();
   const key = `${sizeRpx}|${url}`;
   const hit = resolvedCache.get(key);
   if (hit != null) return Promise.resolve(hit);
-  if (attemptedUrls.has(url)) return Promise.resolve(url);
+  if (attemptedUrls.has(key)) return Promise.resolve(url);
   const pending = pendingUrls.get(key);
   if (pending != null) return pending;
-  attemptedUrls.add(url);
+  attemptedUrls.add(key);
   const task = resolveDisplayImageUrl(url, sizeRpx, sizeRpx)
     .then((resolved: string): string => {
       if (resolved != url) resolvedCache.set(key, resolved);
@@ -102,7 +111,7 @@ export function resolveImAvatarDisplay(url: string, sizeRpx: number): Promise<st
   });
   return task;
   // #endif
-  // #ifndef H5 || WEB || APP-ANDROID || APP-IOS
+  // #ifndef H5 || WEB || APP-ANDROID || APP-IOS || APP-HARMONY
   return Promise.resolve(url);
   // #endif
 }

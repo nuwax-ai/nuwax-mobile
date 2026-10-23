@@ -85,7 +85,7 @@
           :pending-out="pendingOutContacts"
           :spaces="mySpaces"
           :groups="myGroups"
-          :contacts="acceptedContacts"
+          :contacts="contactRowsWithSelf"
           :contact-total="contactTotal"
           :space-total="spaceTotal"
           :group-total="groupTotal"
@@ -262,6 +262,7 @@
     apiImSpaceEnter,
     apiImSpaces,
   } from "@/servers/im";
+  import { apiUserInfo } from "@/servers/account";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { refreshImUnreadBadge, clearImUnreadBadge } from "@/utils/imUnreadBadge";
@@ -284,6 +285,7 @@
   import { isWorkCommercialBlockedSync, resolveWorkCommercialBlocked } from "@/utils/workCommercial";
   import eventBus from "@/utils/eventBus";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
+  import { getCachedMyInfo, setCachedMyInfo } from "@/utils/im/myInfoCache";
   import { isAuthProtectedFileUrl, releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
@@ -669,14 +671,37 @@
   const contactDegraded = ref<boolean>(false);
   const contactTruncated = ref<boolean>(false);
 
+  // 「我自己」置顶行（PC 对齐：智联录联系人首位固定入口，点击进自环会话）。
+  // 纯前端合成行——不进 acceptedContacts/缓存/名字索引（saveImContactsCache 存
+  // 服务端原文，天然不含）；整表替换后靠 contactRowsWithSelf computed 自动重前置。
+  const selfContactRow = ref<ImContactRow | null>(null);
+  let selfRowEnsuring = false;
+
   // 联系人展示名索引已抽至 im-row-helpers.uts（模块级私有 Map + rebuildContactNameIndex
   // /displayConvName 导出，Stage 1）；loadContacts 成功路径负责重建+联动整表刷新。
 
+  /** 智联录「联系人」展示表：self 行恒在首位（myUserId 未就绪时无此行）。 */
+  const contactRowsWithSelf = computed<ImContactRow[]>((): ImContactRow[] => {
+    const self = selfContactRow.value;
+    if (self == null) {
+      return acceptedContacts.value;
+    }
+    const out: ImContactRow[] = [self];
+    const src = acceptedContacts.value;
+    for (let i = 0; i < src.length; i++) {
+      out.push(src[i]);
+    }
+    return out;
+  });
+
+  // 空表也计入 self 行：零联系人新账号仍渲染「联系人」区块与置顶入口（contactTotal
+  // 仅空态消费；tab 角标走 contactPendingInCount 不受影响）
   const contactTotal = computed<number>(
     (): number =>
       acceptedContacts.value.length +
       pendingInContacts.value.length +
-      pendingOutContacts.value.length,
+      pendingOutContacts.value.length +
+      (selfContactRow.value != null ? 1 : 0),
   );
 
   /** 智联录 tab 角标：待我处理的好友申请数（status=2）；status=3 是我发出的申请
@@ -945,6 +970,11 @@
     resolveContactRowsIcons(acceptedContacts.value);
     resolveContactRowsIcons(pendingInContacts.value);
     resolveContactRowsIcons(pendingOutContacts.value);
+    // 「我自己」置顶行不在上述数组里，单独补一遍（与普通行同重试口径）
+    const selfRowForRetry = selfContactRow.value;
+    if (selfRowForRetry != null) {
+      resolveContactRowsIcons([selfRowForRetry]);
+    }
     resolveConvRowsIcons(myGroups.value);
     resolveSpaceRowsIcons(mySpaces.value);
   };
@@ -965,6 +995,13 @@
         row.avatarLoaded = false;
         row.avatarFailed = false;
       }
+    }
+    // 「我自己」置顶行同口径复位（在位时）
+    const selfRowForReset = selfContactRow.value;
+    if (selfRowForReset != null && selfRowForReset.avatarUrl == rawUrl) {
+      selfRowForReset.avatarDisplay = "";
+      selfRowForReset.avatarLoaded = false;
+      selfRowForReset.avatarFailed = false;
     }
     for (let i = 0; i < pendingInContacts.value.length; i++) {
       const row = pendingInContacts.value[i];
@@ -1504,6 +1541,62 @@
     }
   }
 
+  /**
+   * 「我自己」置顶行信息（id/头像）：myInfoCache 命中零请求（进过聊天页即暖）；
+   * 冷启动为空补拉一次 getLoginInfo（chat.uvue loadMyInfo 同款）并回填缓存。
+   * 拉取失败静默不显示该行，下次 onShow/切 tab 再试。行对象整页生命周期恒定
+   * （头像 @load/@error 直接改本实例，与普通联系人行同机制）。
+   */
+  async function ensureSelfContactRow(): Promise<void> {
+    if (selfContactRow.value != null || selfRowEnsuring) return;
+    if (workGateBlocked.value) return;
+    let userId = "";
+    let avatar = "";
+    const cached = getCachedMyInfo();
+    if (cached != null && cached.userId.length > 0) {
+      userId = cached.userId;
+      avatar = cached.avatar;
+    } else {
+      // App / 小程序 token 缺失即纯匿名，不发包（口径同 loadContacts 闸门）
+      if (!hasLoginSession()) return;
+      selfRowEnsuring = true;
+      try {
+        const res = await apiUserInfo();
+        if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+        if (apiResCode(res) != SUCCESS_CODE) return;
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj == null) return;
+        userId = readString(dataObj, "id");
+        const nickName = readString(dataObj, "nickName");
+        const userName = readString(dataObj, "userName");
+        avatar = readString(dataObj, "avatar");
+        if (userId.length > 0) {
+          setCachedMyInfo(userId, nickName.length > 0 ? nickName : userName, avatar);
+        }
+      } catch (_error) {
+        return;
+      } finally {
+        selfRowEnsuring = false;
+      }
+    }
+    if (userId.length == 0) return;
+    const row = new ImContactRow();
+    row.userId = userId;
+    row.subjectType = 1;
+    row.status = 1;
+    row.displayName = t("Mobile.Message.selfChatTitle");
+    row.avatarUrl = avatar;
+    // 与普通联系人行同管线：头像解析（ak/授权 URL）+ 兜底取字（无头像/失败回落）
+    resolveContactRowsIcons([row]);
+    assignContactFallbacks([row]);
+    selfContactRow.value = row;
+    // 会话标题自环分支的 myUserId 此刻才就绪：换行身份重渲染，把既有「我自己」
+    // 会话行（可能他端建的，此前按 peerName 显示自己昵称）纠正为固定标题
+    //（Android 方法调用式绑定不收集依赖，displayConvName 读不到响应式源）
+    conversations.value = copyRows(conversations.value);
+  }
+
   /** 群组页大小：服务端 clamp 到 [1,100]，智联录分类单页拉满，免分页 UI（群组数超 100 再补分页）。 */
   const GROUP_PAGE_SIZE = 100;
 
@@ -1731,6 +1824,8 @@
     hydrateContactsFromCache();
     loadConversations();
     loadContacts();
+    // 「我自己」置顶行：与联系人首拉同机（已有行早退，幂等）
+    ensureSelfContactRow();
   }
 
   /** 切 tab 落定（tab 点击与 swiper 横滑共用）。横滑抬手必置吞击位，走 switchTab 会被
@@ -1752,6 +1847,8 @@
         hydrateContactsFromCache();
         loadContacts();
       }
+      // 「我自己」置顶行：首拉失败/冷启动为空时切入智联录再试（已有行早退）
+      ensureSelfContactRow();
       if (groupsLoaded.value != true) {
         hydrateGroupsFromCache();
         loadGroups();
@@ -2416,9 +2513,14 @@
   }
 
   /** 联系人行 touchstart（含已申请行）：公共判定 + 装填长按——已申请（status=3）=
-   *  撤回申请；正式联系（status=1）= 发消息/备注/删除。 */
+   *  撤回申请；正式联系（status=1）= 发消息/备注/删除。「我自己」置顶行不装填
+   *  （发消息走点按；备注/删除联系人对自环会话无意义）。 */
   function handleContactRowTouchStart(contact: ImContactRow, eventValue: Any): void {
     handleRowTouchStart(`ct-${contact.userId}`, eventValue);
+    const selfRowForPress = selfContactRow.value;
+    if (selfRowForPress != null && contact.userId == selfRowForPress.userId) {
+      return;
+    }
     armRowLongPress("contact", `row-ct-${contact.userId}`, null, contact);
   }
 
@@ -3348,6 +3450,9 @@
     acceptedContacts.value = [];
     pendingInContacts.value = [];
     pendingOutContacts.value = [];
+    // 「我自己」行同清：换账号后 myInfoCache/imNoticeBar 随会话戳失效，行内
+    // userId/头像属旧账号，不得残留（ensureSelfContactRow 会按新账号重建）
+    selfContactRow.value = null;
     myGroups.value = [];
     mySpaces.value = [];
     clearMessageUiResources();
@@ -3393,6 +3498,8 @@
       if (contactLoaded.value || contactFailed.value) {
         loadContacts();
       }
+      // 「我自己」置顶行：静默刷新顺带补试（首拉失败场景的自愈路径；已有行早退）
+      ensureSelfContactRow();
       if (groupsLoaded.value) {
         loadGroups();
       }

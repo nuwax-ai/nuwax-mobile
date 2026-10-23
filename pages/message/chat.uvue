@@ -147,6 +147,14 @@
         class="chat-msg"
         :class="msgRowClass(msg)"
       >
+        <!-- 「以下为新消息」分隔线：钉在定位出的首条未读行首子位（进会话一次性定位
+             落定，会话内冻结不随新消息漂移——PC 同款）；与日期条不互斥，恰好同时命中
+             则两元素堆叠渲染；同样不动 rect 映射与 msg-{id} 滚动锚定 -->
+        <view v-if="msg.msgId == unreadDividerMsgId" class="chat-unread-divider">
+          <view class="chat-unread-divider__line"></view>
+          <text class="chat-unread-divider__text">{{ t("Mobile.Chat.unreadDivider") }}</text>
+          <view class="chat-unread-divider__line"></view>
+        </view>
         <!-- 飞书式时间分割线：首条 / 跨天 / 与上一条间隔超 5 分钟出线（渲染时实时
              比较，翻页整表重赋值与确认行原位替换都会重估）；放在本行内部首子位，
              不动 selectAll(".chat-msg") 的按序 rect 映射与 msg-{id} 滚动锚定 -->
@@ -159,7 +167,7 @@
           v-if="msg.bodyText.length == 0 && msg.imageUrl.length == 0 && msg.audioUrl.length == 0 && msg.videoUrl.length == 0 && msg.imageAtts.length == 0 && msg.linkAtts.length == 0 && msg.cardTitle.length == 0 && msg.mergeItems.length == 0 && (msg.revoked || msg.digest.length > 0)"
           class="chat-sys"
         >
-          <text class="chat-sys__text">{{ sysText(msg) }}</text>
+          <text class="chat-sys__text">{{ sysText(msg, membersTick + contactRemarkTick) }}</text>
         </view>
         <view
           v-else-if="msg.bodyText.length > 0 || msg.imageUrl.length > 0 || msg.audioUrl.length > 0 || msg.videoUrl.length > 0 || msg.imageAtts.length > 0 || msg.linkAtts.length > 0 || msg.cardTitle.length > 0 || msg.mergeItems.length > 0"
@@ -1747,7 +1755,7 @@
   import { preserveImPrependAnchor } from "@/utils/im/imPrependAnchor";
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
-  import { classifyKind, collectChatAttachments, resetChatAttachments, extOf, urlExtOf } from "@/utils/imChatAttachments";
+  import { classifyKind, extOf, urlExtOf } from "@/utils/imChatAttachments";
   import {
     ChatScrollMemo,
     getCachedChatRecords,
@@ -2617,6 +2625,8 @@
   // ===== @提及（提及高亮 / 发送反扫的数据源；选择交互已独立成 at-select 页）=====
   const members = ref<ImMember[]>([]);
   let membersLoaded = false;
+  /** 成员表版本号：成员晚到/缓存重同步时驱动撤回行署名等模板方法绑定重估（contactRemarkTick 同款）。 */
+  const membersTick = ref<number>(0);
 
   /** 对端是否智能体（仅单聊有意义，对齐 PC DEV-311 需求⑪ hiddenInAgentP2p）：单聊且
       对端 userId 在联系人（members 单聊来源=apiImContacts）里命中 subjectType!=1。
@@ -2921,11 +2931,64 @@
     }
   }
 
-  function sysText(msg: ImMsgRow): string {
+  /**
+   * 群聊撤回行署名：操作人（revokeById，管理员撤他人时≠发送者）→ 成员表昵称
+   * （pinNameOf 同款查找）；查不到回落原发送者的备注/昵称快照（与 PC 端
+   * 「senderName撤回了一条消息」口径一致，但不回落会话标题——群名当署名会
+   * 误读成群撤的）。我的消息被未知操作人撤回时不署我的名（不是我撤的），
+   * 给空调用方走「对方撤回」兜底。
+   * ★尾参 _tick：读 members/contactRemarks 的模板方法绑定不收集方法体内依赖
+   *  （groupSenderName 同款配方），成员表/备注晚到靠 tick 重估署名。
+   * ★物理上须定义在 sysText 之前（error18：调用者前文找不到后定义的被调函数）。
+   */
+  function revokeOperatorNameOf(msg: ImMsgRow, _tick: number): string {
+    const by = msg.revokeById;
+    if (by.length > 0) {
+      const ms = members.value;
+      for (let i = 0; i < ms.length; i++) {
+        if (ms[i].userId == by) {
+          if (ms[i].nickName.length > 0) {
+            return ms[i].nickName;
+          }
+          if (ms[i].name.length > 0) {
+            return ms[i].name;
+          }
+          if (ms[i].token.length > 0) {
+            return ms[i].token;
+          }
+        }
+      }
+    }
+    if (isMine(msg) != true) {
+      if (contactRemarks.size > 0) {
+        const remark = contactRemarks.get(msg.senderId);
+        if (remark != null && remark.length > 0) {
+          return remark;
+        }
+      }
+      return msg.senderName;
+    }
+    return "";
+  }
+
+  function sysText(msg: ImMsgRow, _tick: number): string {
     if (msg.revoked) {
       // 管理员撤他人消息：senderId 不是我但 revokeById 是我 ⇒ 也算「你撤回了一条消息」
       const revokedByMe = isMine(msg) || (myUserId.value.length > 0 && msg.revokeById == myUserId.value);
-      return revokedByMe ? t("Mobile.Message.msgRevokedByMe") : t("Mobile.Message.msgRevokedByPeer");
+      if (revokedByMe) {
+        return t("Mobile.Message.msgRevokedByMe");
+      }
+      // 群聊带撤回人署名「XXX 撤回了一条消息」：解析得出名字才署名；解析不出
+      // （操作人已退群且发送者名缺失）维持「对方撤回了一条消息」，单聊也维持原文案
+      if (isGroupLike.value) {
+        const name = revokeOperatorNameOf(msg, _tick);
+        if (name.length > 0) {
+          const params = new Map<string, string | number>();
+          params.set("name", name);
+          return translateFn("Mobile.Message.msgRevokedByName", toI18nParams(params), "");
+        }
+      }
+      return t("Mobile.Message.msgRevokedByPeer");
     }
     return msg.digest;
   }
@@ -3823,6 +3886,7 @@
       }
       members.value = out;
       membersLoaded = true;
+      membersTick.value += 1;
       // 已渲染消息的 @提及高亮依赖成员 token，补扫一次
       rebuildRichAll();
     } catch (_error) {
@@ -3851,6 +3915,7 @@
     }
     if (out.length > 0) {
       members.value = out;
+      membersTick.value += 1;
       // 提及高亮 token 可能随新快照变化（改名片），补扫一次
       rebuildRichAll();
     }
@@ -5964,6 +6029,24 @@
     }, 150);
   }
 
+  // ===== 未读定位（进会话定位首条未读 +「以下为新消息」分隔线）=====
+  // entryUnreadSnapshot：列表行点击时的未读数一次性快照（天然在清零前），>0 才进
+  //   定位模式；unreadViewportRead：仅门控定位期的滚动行为（首屏不滚底、遮蔽交给
+  //   locateFirstUnread、降级复位），不门控报读。报读对齐 PC（nuwax-im-web 的
+  //   selectConv → reportRead 推到最新）：进会话即全清——首屏缓存/网络两路都会
+  //   走到 reportReadAuto() 报 maxSeq；正在看时新消息到达（merge/insert）与
+  //   回前台（onShow）同样报 maxSeq。不再做「看多少清多少」视口水位。
+  let entryUnreadSnapshot = 0;
+  let unreadViewportRead = false;
+  let unreadLocating = false;
+  const unreadDividerMsgId = ref<string>("");
+
+  /** 自动报读统一入口：一律报 maxSeq——进会话即全清（对齐 PC），正在看时新消息
+   *  到达即清，回前台补报同水位。幂等（reportReadIfNeeded 取 max + 单调推进）。 */
+  function reportReadAuto(): void {
+    reportReadIfNeeded(maxSeq());
+  }
+
   /** 距底余量阈值（px）：离开时距底小于该值视为「在底部」，进页直接滚最新。 */
   const NEAR_BOTTOM_PX = 120;
 
@@ -7054,7 +7137,7 @@
     }
     // 视频预载：批量合并落库后扫一遍未挂载的视频行（缓存命中零成本，非视频行零开销）
     preloadChatVideos();
-    reportReadIfNeeded(maxSeq());
+    reportReadAuto();
     return true;
   }
 
@@ -7082,19 +7165,19 @@
           if (cancelPrependAnchor == null) scrollAnchor.value = preserveAnchor;
         }
         mergeSyncedMessages(records);
-        // 附件缓存累积：文件页（文件/群文件）只读本窗口已加载消息里的附件
-        collectChatAttachments(convId.value, records);
         // 首屏（beforeSeq<=0）成功后写消息缓存：下次进页先渲染再静默同步
         if (beforeSeq <= 0 && records.length > 0) {
           setCachedChatRecords(convId.value, records);
         }
       }
     }
-    reportReadIfNeeded(maxSeq());
+    reportReadAuto();
     refreshReadStatus();
   }
 
   async function handleLoadOlder(): Promise<void> {
+    // 未读定位翻页中：用户未触摸（遮蔽定位窗内 scrolltoupper 是定位滚动误触发）
+    if (unreadLocating) return;
     if (!isChatActive()) return;
     if (loading.value || loadingOlder.value || loadFailed.value) {
       return;
@@ -11711,12 +11794,14 @@
     preloadChatVideos();
     // 滚动到底部：仅当 row 是新增且 seq 大于本地最大 seq（真正的实时消息）；
     // ★仅贴底时才滚（nearChatBottom 由浮钮探测维护）——在读历史时新消息到达
-    //   不拽走阅读位置（微信式不打扰），靠右下角「回到底部」浮钮回最新
-    if (isChatActive() && autoScroll && insertAt >= rows.length - 1 && nearChatBottom.value) {
+    //   不拽走阅读位置（微信式不打扰），靠右下角「回到底部」浮钮回最新；
+    //   未读定位翻页中同样不拽（nearChatBottom 初值 true 未校准，拽了会中途
+    //   掀遮蔽揭到底部）——定位落定后贴底态由 checkJumpLatest 校准照常接管
+    if (isChatActive() && autoScroll && !unreadLocating && insertAt >= rows.length - 1 && nearChatBottom.value) {
       scrollToBottom();
     }
     // 上报已读
-    reportReadIfNeeded(maxSeq());
+    reportReadAuto();
   }
 
 
@@ -11763,7 +11848,6 @@
       const records = recordsRaw as UTSJSONObject[];
       if (records.length > 0) {
         setCachedChatRecords(convId.value, records);
-        collectChatAttachments(convId.value, records);
       }
       mergeSyncedMessages(records);
       scheduleReadRefresh();
@@ -11789,6 +11873,63 @@
    */
   let myInfoPending: Promise<void> | null = null;
 
+  /**
+   * 定位到第一条未读：倒数法 idx = length - entryUnreadSnapshot（与服务端未读公式
+   * 天然一致——unreadCount 已含 joinSeq/clearBeforeSeq 修正）；窗口不够则向前连续
+   * 翻页（复用 jumpToMsg 式循环，封顶 10 页/200 条）。全程 veiled 遮蔽，定位稳定
+   * 才揭幕；失败/翻完/封顶一律降级贴底并复位定位模式（不留矛盾态）。报读不走本
+   * 函数——进会话即全清已由首屏 reportReadAuto 完成（对齐 PC，无水位模式）。
+   */
+  async function locateFirstUnread(): Promise<void> {
+    if (!unreadViewportRead || unreadLocating) return;
+    unreadLocating = true;
+    // 定位目标在历史区：关掉「贴底跟随」（防 settleAfterSync 补滚底 / WS 新消息拽底）
+    entryFollowLatest = false;
+    cancelSettle();
+    try {
+      // 失败/空列表守卫：退回现状贴底全清（scrollToBottom 兼负揭幕，防空列表卡遮蔽）
+      if (loadFailed.value || messages.value.length == 0) {
+        unreadViewportRead = false;
+        scrollToBottom();
+        if (messages.value.length > 0) reportReadIfNeeded(maxSeq());
+        return;
+      }
+      let idx = messages.value.length - entryUnreadSnapshot;
+      let pages = 0;
+      while (idx < 0 && pages < 10) {
+        if (!isChatCurrent()) return;
+        if (loading.value || loadFailed.value || hasMore.value != true || messages.value.length == 0) {
+          break;
+        }
+        pages++;
+        const oldestSeq = messages.value[0].seq;
+        // 不传 preserveAnchor：遮蔽窗内无防跳需求（翻页闪变用户不可见）
+        await loadHistory(oldestSeq);
+        idx = messages.value.length - entryUnreadSnapshot;
+      }
+      if (!isChatCurrent()) return;
+      if (idx < 0) {
+        // 翻完/封顶仍不够：降级贴底 + divider 钉最早已加载行 + 全清
+        unreadDividerMsgId.value = messages.value[0].msgId;
+        unreadViewportRead = false;
+        scrollToBottom();
+        reportReadIfNeeded(maxSeq());
+        return;
+      }
+      if (idx >= messages.value.length - 3) {
+        // 少量未读（目标行已在末 3 行内）：贴底即全部可见，不展示分隔线
+        // （unreadDividerMsgId 保持空串=不渲染），直接贴底免顶对齐观感差
+        scrollToBottom();
+      } else {
+        // 分隔线钉首条未读行（会话内冻结，不随新消息漂移——PC 同款）
+        unreadDividerMsgId.value = messages.value[idx].msgId;
+        scrollToAnchorWithSettle(`msg-${messages.value[idx].msgId}`);
+      }
+    } finally {
+      unreadLocating = false;
+    }
+  }
+
   async function initHistory(): Promise<void> {
     if (loading.value) {
       return;
@@ -11801,8 +11942,6 @@
       await myInfoTask;
       if (!isChatCurrent()) return;
     }
-    // 附件缓存重置：文件页数据源只看本窗口已加载的消息（从首屏起重新累积）
-    resetChatAttachments(convId.value);
     // 命中缓存：免网络立即渲染上次窗口并滚底，随后静默增量同步（Q3：重进不重新 load）
     const cached = getCachedChatRecords(convId.value);
     if (cached != null) {
@@ -11814,11 +11953,19 @@
       // 失败行发件箱回显（幂等）：缓存/历史重建都会清掉本地行，两条路径都要补
       restoreFailedRows();
       hasMore.value = cached.length >= MSG_PAGE_SIZE;
-      collectChatAttachments(convId.value, cached);
       // 重新进入会话始终展示最新消息，不恢复上次阅读的历史位置。
-      scrollToBottom();
-      settleAfterSync(true);
-      reportReadIfNeeded(maxSeq());
+      // 未读定位模式：不滚底（保持遮蔽，定位交给 onLoad 的 locateFirstUnread）。
+      // ★await 增量同步：缓存尾巴可能缺「上次离开后新到的消息」，不等同步落地就
+      //   定位会把倒数法 idx 算在过期尾巴上——同步补齐后分隔线下面多出已读内容
+      //   （线下条数=未读数+缓存缺条数）。等待全程 veiled 遮蔽，观感无差；同步
+      //   失败静默放行，按旧尾巴定位（与现状一致，不更糟）。
+      if (unreadViewportRead) {
+        await settleAfterSync(false);
+      } else {
+        scrollToBottom();
+        settleAfterSync(true);
+      }
+      reportReadAuto();
       refreshReadStatus();
       return;
     }
@@ -11828,7 +11975,11 @@
       await loadHistory(0);
       loading.value = false;
       restoreFailedRows();
-      scrollToBottom();
+      // 未读定位模式：首屏不滚底（保持遮蔽，定位交给 onLoad 的 locateFirstUnread；
+      // 失败/空列表由 locateFirstUnread 降级分支兜底揭幕）
+      if (!unreadViewportRead) {
+        scrollToBottom();
+      }
     } catch (_error) {
       loading.value = false;
       loadFailed.value = true;
@@ -12311,6 +12462,13 @@
     resolveChatAvatarUrl(peerAvatar.value);
     // 搜索页带来的定位消息：历史首屏就绪后翻页查找并滚动高亮（onShow 兜底应用）
     const jumpMsgId = readOption(options, "jumpMsgId");
+    // 列表行带来的未读数快照（点击时天然在清零前）：>0 进「定位首条未读」定位模式；
+    // jumpMsgId 抢占（跳转=已读，走现状贴底）。只驱动定位与分隔线，不再门控报读——
+    // 报读对齐 PC：首屏（缓存路径/loadHistory 尾）即报 maxSeq 进会话全清。
+    const unreadRaw = readOption(options, "unread");
+    const parsedUnread = parseFloat(unreadRaw);
+    entryUnreadSnapshot = isNaN(parsedUnread) || parsedUnread <= 0 ? 0 : Math.floor(parsedUnread);
+    unreadViewportRead = entryUnreadSnapshot > 0 && jumpMsgId.length == 0;
     if (convId.value.length > 0) {
       myInfoPending = loadMyInfo();
       // 进页即拉 @ 数据源（群聊=群成员 / 单聊=联系人；@面板与提及高亮依据，不阻塞首屏）
@@ -12329,6 +12487,8 @@
         if (jumpMsgId.length > 0) {
           pendingJumpId = jumpMsgId;
           jumpToMsg(jumpMsgId);
+        } else if (unreadViewportRead) {
+          locateFirstUnread();
         }
       });
     } else {
@@ -12498,7 +12658,7 @@
       if (deferredMediaIds.has(row.msgId)) resolveRowMedia(row);
     }
     if (deferredAnchor.length > 0) scrollToAnchorWithSettle(deferredAnchor);
-    reportReadIfNeeded(maxSeq());
+    reportReadAuto();
     // Android：进子页返回的 show/hide 周期里原生 gravity 可能被重置回 top，
     // 未重新聚焦前 placeholder 会贴上沿，返回时按拍兜底重设（textarea 卸载时逐拍空转）
     sweepAndroidInputGravity(6);
@@ -13562,6 +13722,29 @@
     font-size: 11px;
     line-height: 16px;
     color: #a5a3b0;
+    text-align: center;
+  }
+
+  /* ===== 「以下为新消息」分隔线：居中蓝字两侧细线（PC 同款观感） ===== */
+  .chat-unread-divider {
+    margin: 8px 0 10px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-unread-divider__line {
+    flex: 1;
+    height: 1px;
+    background-color: #d8e3ff;
+  }
+
+  .chat-unread-divider__text {
+    margin: 0 10px;
+    font-size: 12px;
+    line-height: 17px;
+    color: #1664ff;
     text-align: center;
   }
 

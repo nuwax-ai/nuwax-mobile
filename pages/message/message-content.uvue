@@ -85,7 +85,7 @@
           :pending-out="pendingOutContacts"
           :spaces="mySpaces"
           :groups="myGroups"
-          :contacts="acceptedContacts"
+          :contacts="contactRowsWithSelf"
           :contact-total="contactTotal"
           :space-total="spaceTotal"
           :group-total="groupTotal"
@@ -261,17 +261,32 @@
     apiImMyGroups,
     apiImSpaceEnter,
     apiImSpaces,
+    apiImWhoami,
   } from "@/servers/im";
+  import { apiUserInfo } from "@/servers/account";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { refreshImUnreadBadge, clearImUnreadBadge } from "@/utils/imUnreadBadge";
   import { consumeConvReadMark } from "@/utils/im/imConvReadLocal";
+  // 伙伴页列表缓存（SWR）：进页先水合缓存秒出，网络回包整表替换后回写
+  import {
+    clearImListCache,
+    readImContactsCache,
+    readImConvCache,
+    readImGroupsCache,
+    readImSpacesCache,
+    saveImContactsCache,
+    saveImConvCache,
+    saveImGroupsCache,
+    saveImSpacesCache,
+  } from "@/utils/im/imListCache";
   // 会话草稿（微信式）：聊天页未发文案，列表摘要行显示「[草稿]xxx」
   import { getChatDraft, chatDraftRecency, chatDraftsVersion } from "@/utils/im/chatDrafts";
   import { initImWsClient, stopImWsClient } from "@/utils/im/imWsClient";
   import { isWorkCommercialBlockedSync, resolveWorkCommercialBlocked } from "@/utils/workCommercial";
   import eventBus from "@/utils/eventBus";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
+  import { getCachedMyInfo, setCachedMyInfo } from "@/utils/im/myInfoCache";
   import { isAuthProtectedFileUrl, releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
@@ -657,14 +672,37 @@
   const contactDegraded = ref<boolean>(false);
   const contactTruncated = ref<boolean>(false);
 
+  // 「我自己」置顶行（PC 对齐：智联录联系人首位固定入口，点击进自环会话）。
+  // 纯前端合成行——不进 acceptedContacts/缓存/名字索引（saveImContactsCache 存
+  // 服务端原文，天然不含）；整表替换后靠 contactRowsWithSelf computed 自动重前置。
+  const selfContactRow = ref<ImContactRow | null>(null);
+  let selfRowEnsuring = false;
+
   // 联系人展示名索引已抽至 im-row-helpers.uts（模块级私有 Map + rebuildContactNameIndex
   // /displayConvName 导出，Stage 1）；loadContacts 成功路径负责重建+联动整表刷新。
 
+  /** 智联录「联系人」展示表：self 行恒在首位（myUserId 未就绪时无此行）。 */
+  const contactRowsWithSelf = computed<ImContactRow[]>((): ImContactRow[] => {
+    const self = selfContactRow.value;
+    if (self == null) {
+      return acceptedContacts.value;
+    }
+    const out: ImContactRow[] = [self];
+    const src = acceptedContacts.value;
+    for (let i = 0; i < src.length; i++) {
+      out.push(src[i]);
+    }
+    return out;
+  });
+
+  // 空表也计入 self 行：零联系人新账号仍渲染「联系人」区块与置顶入口（contactTotal
+  // 仅空态消费；tab 角标走 contactPendingInCount 不受影响）
   const contactTotal = computed<number>(
     (): number =>
       acceptedContacts.value.length +
       pendingInContacts.value.length +
-      pendingOutContacts.value.length,
+      pendingOutContacts.value.length +
+      (selfContactRow.value != null ? 1 : 0),
   );
 
   /** 智联录 tab 角标：待我处理的好友申请数（status=2）；status=3 是我发出的申请
@@ -933,6 +971,11 @@
     resolveContactRowsIcons(acceptedContacts.value);
     resolveContactRowsIcons(pendingInContacts.value);
     resolveContactRowsIcons(pendingOutContacts.value);
+    // 「我自己」置顶行不在上述数组里，单独补一遍（与普通行同重试口径）
+    const selfRowForRetry = selfContactRow.value;
+    if (selfRowForRetry != null) {
+      resolveContactRowsIcons([selfRowForRetry]);
+    }
     resolveConvRowsIcons(myGroups.value);
     resolveSpaceRowsIcons(mySpaces.value);
   };
@@ -953,6 +996,13 @@
         row.avatarLoaded = false;
         row.avatarFailed = false;
       }
+    }
+    // 「我自己」置顶行同口径复位（在位时）
+    const selfRowForReset = selfContactRow.value;
+    if (selfRowForReset != null && selfRowForReset.avatarUrl == rawUrl) {
+      selfRowForReset.avatarDisplay = "";
+      selfRowForReset.avatarLoaded = false;
+      selfRowForReset.avatarFailed = false;
     }
     for (let i = 0; i < pendingInContacts.value.length; i++) {
       const row = pendingInContacts.value[i];
@@ -1062,6 +1112,17 @@
     // 「我的群组」共用本函数但传 false，保持原解析路径（本实验只改消息列表）。
     if (directAvatar && row.avatarUrl.length > 0 && !isRemoteSvgUrl(row.avatarUrl)) {
       row.avatarDisplay = row.avatarUrl;
+    }
+    // 整表 reload 重建行对象时，SVG 行（上方被排除）与 directAvatar=false 行的
+    // avatarDisplay 首帧为空 → image 节点按 v-if 卸载，缓存回填要等 50ms 去抖
+    // 整表重建才重挂（鸿蒙新节点上屏又慢一拍）＝进页/回页可见闪烁。构造期同步
+    // 命中页面级正缓存（resolvedIconCache 注释声称的语义在此落地），首帧即带
+    // 展示地址、节点复用不卸载。失败态由 avatarFailed 继承拦截，不受此影响。
+    if (row.avatarDisplay.length == 0 && row.avatarUrl.length > 0) {
+      const cachedDisplay = resolvedIconCache.get(row.avatarUrl);
+      if (cachedDisplay != null) {
+        row.avatarDisplay = cachedDisplay;
+      }
     }
     // unreadCount：服务端没算时键整个不存在（非 0），整表刷新下只能按 0 展示。
     row.unreadCount = readNumber(obj, "unreadCount", 0);
@@ -1227,8 +1288,10 @@
 
   // ===== 会话列表首拉失败有限自动重试（头像解析同款配方）：冷启动网络栈未稳 /
   //       IM 网关瞬态 5xx 不该把用户晾在「加载失败」——列表仍空时延迟重试，连续
-  //       失败封顶后停（保留手点重试与 onShow 自愈）。有数据的静默刷新失败不
-  //       重试（列表仍在屏，onShow/WS 路径自会再刷）。=====
+  //       失败封顶后停（保留手点重试与 onShow 自愈）。有数据的静默刷新失败原版
+  //       失败即止——行未读/排序的权威值只能等下一条 WS 帧或 onShow 补，WS 丢帧
+  //       叠加网关瞬断时列表长期停旧值；现补一次 1.5s 延迟重试（见
+  //       scheduleConvSilentRetry），重试再失败不续（防与网关故障共振成小风暴）。=====
   let convLoadRetryTimer = 0;
   let convLoadRetryCount = 0;
   const MAX_CONV_LOAD_RETRIES = 2;
@@ -1250,6 +1313,36 @@
         return;
       }
       const runner = convLoadRetryRunner;
+      if (runner != null) runner();
+    }, 1500);
+  }
+
+  /** 静默刷新失败补拉 timer（与首拉重试互斥：空表失败归首拉管，不双发）。 */
+  let convSilentRetryTimer = 0;
+  /** 本失败周期补拉预算已用（任一次成功刷新即复位）：重试再失败不续补。 */
+  let convSilentRetryUsed = false;
+
+  /** 有数据时的静默刷新失败（WS 帧 500ms 去抖 / onShow 刷新等）1.5s 后补拉一次：
+   *  行未读数的权威值只在 conversations 回包里，失败即止会停旧值到下一事件；
+   *  补拉走 convRefreshRunner（loadConversations），loading 在途/废弃守卫齐全。 */
+  function scheduleConvSilentRetry(): void {
+    if (convSilentRetryTimer != 0 || convSilentRetryUsed) {
+      return;
+    }
+    if (conversations.value.length == 0) {
+      return;
+    }
+    convSilentRetryUsed = true;
+    convSilentRetryTimer = setTimeout(() => {
+      convSilentRetryTimer = 0;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) {
+        return;
+      }
+      // 恰有刷新在途：放弃本发（在途回包成败自有后续路径；再失败不再补）
+      if (convLoading.value) {
+        return;
+      }
+      const runner = convRefreshRunner;
       if (runner != null) runner();
     }, 1500);
   }
@@ -1299,6 +1392,7 @@
       if (apiResCode(res) != SUCCESS_CODE) {
         convFailed.value = true;
         scheduleConvLoadRetry();
+        scheduleConvSilentRetry();
         return;
       }
       conversations.value = parseConvRecords(res);
@@ -1307,10 +1401,15 @@
       convHasMore.value = nextCursor.value.length > 0;
       convLoaded.value = true;
       convLoadRetryCount = 0;
+      // 静默补拉预算随任一次成功刷新复位（新失败周期重新可用）
+      convSilentRetryUsed = false;
+      // 列表缓存回写（首页 records 原文 + nextCursor；同串跳写，翻页不写）
+      saveImConvCache(res);
     } catch (_error) {
       convLoading.value = false;
       convFailed.value = true;
       scheduleConvLoadRetry();
+      scheduleConvSilentRetry();
     } finally {
       if (convRefreshOwed) scheduleConvRefresh();
     }
@@ -1343,7 +1442,17 @@
       const rows = parseConvRecords(res);
       // 追加后整表重排：新页里带草稿/置顶的行不能滞留表尾（分区不变式跨页成立）
       const merged: ImConvRow[] = copyRows(conversations.value);
+      // convId 去重：缓存水合的 nextCursor 可能落后服务端头，翻页会带回已展示行
+      //（服务端游标边界重复同防），重复行直接跳过
+      const seen = new Set<string>();
+      for (let i = 0; i < conversations.value.length; i++) {
+        seen.add(conversations.value[i].convId);
+      }
       for (let i = 0; i < rows.length; i++) {
+        if (seen.has(rows[i].convId)) {
+          continue;
+        }
+        seen.add(rows[i].convId);
         merged.push(rows[i]);
       }
       conversations.value = reorderConvRows(merged);
@@ -1425,10 +1534,68 @@
       assignContactFallbacks(pendingInContacts.value);
       assignContactFallbacks(pendingOutContacts.value);
       contactLoaded.value = true;
+      // 列表缓存回写（全量 items 原文 + degraded/truncated）
+      saveImContactsCache(res);
     } catch (_error) {
       contactLoading.value = false;
       contactFailed.value = true;
     }
+  }
+
+  /**
+   * 「我自己」置顶行信息（id/头像）：myInfoCache 命中零请求（进过聊天页即暖）；
+   * 冷启动为空补拉一次 getLoginInfo（chat.uvue loadMyInfo 同款）并回填缓存。
+   * 拉取失败静默不显示该行，下次 onShow/切 tab 再试。行对象整页生命周期恒定
+   * （头像 @load/@error 直接改本实例，与普通联系人行同机制）。
+   */
+  async function ensureSelfContactRow(): Promise<void> {
+    if (selfContactRow.value != null || selfRowEnsuring) return;
+    if (workGateBlocked.value) return;
+    let userId = "";
+    let avatar = "";
+    const cached = getCachedMyInfo();
+    if (cached != null && cached.userId.length > 0) {
+      userId = cached.userId;
+      avatar = cached.avatar;
+    } else {
+      // App / 小程序 token 缺失即纯匿名，不发包（口径同 loadContacts 闸门）
+      if (!hasLoginSession()) return;
+      selfRowEnsuring = true;
+      try {
+        const res = await apiUserInfo();
+        if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+        if (apiResCode(res) != SUCCESS_CODE) return;
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        if (dataObj == null) return;
+        userId = readString(dataObj, "id");
+        const nickName = readString(dataObj, "nickName");
+        const userName = readString(dataObj, "userName");
+        avatar = readString(dataObj, "avatar");
+        if (userId.length > 0) {
+          setCachedMyInfo(userId, nickName.length > 0 ? nickName : userName, avatar);
+        }
+      } catch (_error) {
+        return;
+      } finally {
+        selfRowEnsuring = false;
+      }
+    }
+    if (userId.length == 0) return;
+    const row = new ImContactRow();
+    row.userId = userId;
+    row.subjectType = 1;
+    row.status = 1;
+    row.displayName = t("Mobile.Message.selfChatTitle");
+    row.avatarUrl = avatar;
+    // 与普通联系人行同管线：头像解析（ak/授权 URL）+ 兜底取字（无头像/失败回落）
+    resolveContactRowsIcons([row]);
+    assignContactFallbacks([row]);
+    selfContactRow.value = row;
+    // 会话标题自环分支的 myUserId 此刻才就绪：换行身份重渲染，把既有「我自己」
+    // 会话行（可能他端建的，此前按 peerName 显示自己昵称）纠正为固定标题
+    //（Android 方法调用式绑定不收集依赖，displayConvName 读不到响应式源）
+    conversations.value = copyRows(conversations.value);
   }
 
   /** 群组页大小：服务端 clamp 到 [1,100]，智联录分类单页拉满，免分页 UI（群组数超 100 再补分页）。 */
@@ -1461,6 +1628,8 @@
       resolveConvRowsIcons(myGroups.value);
       assignConvFallbacks(myGroups.value);
       groupsLoaded.value = true;
+      // 列表缓存回写（records 原文 + total）
+      saveImGroupsCache(res);
     } catch (_error) {
       groupsLoading.value = false;
     }
@@ -1509,6 +1678,8 @@
       assignSpaceFallbacks(mySpaces.value);
       spaceTotal.value = rows.length;
       spacesLoaded.value = true;
+      // 列表缓存回写（全量 items 原文）
+      saveImSpacesCache(res);
     } catch (_error) {
       spacesLoading.value = false;
     }
@@ -1525,6 +1696,122 @@
     workGateBlocked.value = true;
     stopImWsClient();
     clearImUnreadBadge();
+  }
+
+  // ===== 列表缓存水合（stale-while-revalidate，imListCache.uts）=====
+  // 命中即整表落对应 ref 并置 loaded：加载态随之切到「静默刷新」语义
+  //（convInitialLoading 等 computed 恒 false，不闪「加载中」），随后 loadXxx 回包
+  // 整表替换为服务端真值（无合并逻辑）。守卫照抄 loadXxx + 已有数据早退（幂等）。
+
+  function hydrateConversationsFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (convLoaded.value || conversations.value.length > 0) return;
+    const cached = readImConvCache();
+    if (cached == null) return;
+    const rows: ImConvRow[] = [];
+    for (let i = 0; i < cached.records.length; i++) {
+      rows.push(readConvRow(cached.records[i], true));
+    }
+    conversations.value = reorderConvRows(rows);
+    resolveConvRowsIcons(conversations.value);
+    assignConvFallbacks(conversations.value);
+    // 翻页游标一并水合：水合态下上滑直接续翻（陈旧 cursor 带回的重复行由
+    // loadMoreConversations 的 convId 去重挡掉），刷新成功即被服务端真值重置
+    nextCursor.value = cached.nextCursor;
+    convHasMore.value = cached.nextCursor.length > 0;
+    convLoaded.value = true;
+  }
+
+  function hydrateContactsFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (contactLoaded.value || acceptedContacts.value.length > 0 || pendingInContacts.value.length > 0 || pendingOutContacts.value.length > 0) return;
+    const cached = readImContactsCache();
+    if (cached == null) return;
+    const accepted: ImContactRow[] = [];
+    const pendingIn: ImContactRow[] = [];
+    const pendingOut: ImContactRow[] = [];
+    for (let i = 0; i < cached.items.length; i++) {
+      const row = readContactRow(cached.items[i]);
+      if (row.status == 2) {
+        pendingIn.push(row);
+      } else if (row.status == 3) {
+        pendingOut.push(row);
+      } else {
+        accepted.push(row);
+      }
+    }
+    acceptedContacts.value = accepted;
+    pendingInContacts.value = pendingIn;
+    pendingOutContacts.value = pendingOut;
+    contactDegraded.value = cached.degraded;
+    contactTruncated.value = cached.truncated;
+    // 展示名索引重建 + 会话行联动（对齐 loadContacts 成功路径：索引供会话行
+    // displayConvName 读，Android 方法绑定不收集依赖须换行身份刷新）
+    if (rebuildContactNameIndex(acceptedContacts.value)) {
+      conversations.value = copyRows(conversations.value);
+    }
+    resolveContactRowsIcons(acceptedContacts.value);
+    resolveContactRowsIcons(pendingInContacts.value);
+    resolveContactRowsIcons(pendingOutContacts.value);
+    assignContactFallbacks(acceptedContacts.value);
+    assignContactFallbacks(pendingInContacts.value);
+    assignContactFallbacks(pendingOutContacts.value);
+    contactLoaded.value = true;
+  }
+
+  function hydrateGroupsFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (groupsLoaded.value || myGroups.value.length > 0) return;
+    const cached = readImGroupsCache();
+    if (cached == null) return;
+    const rows: ImConvRow[] = [];
+    for (let i = 0; i < cached.records.length; i++) {
+      if (isDisbandedConvRecord(cached.records[i])) {
+        continue;
+      }
+      rows.push(readConvRow(cached.records[i], false));
+    }
+    myGroups.value = rows;
+    // total 实测 -1=未统计，回落本页条数（parseGroupRecords 同款口径）
+    groupTotal.value = cached.total > 0 ? cached.total : rows.length;
+    resolveConvRowsIcons(myGroups.value);
+    assignConvFallbacks(myGroups.value);
+    groupsLoaded.value = true;
+  }
+
+  function hydrateSpacesFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (spacesLoaded.value || mySpaces.value.length > 0) return;
+    const cached = readImSpacesCache();
+    if (cached == null) return;
+    const rows: ImSpaceRow[] = [];
+    for (let i = 0; i < cached.items.length; i++) {
+      const row = readSpaceRow(cached.items[i]);
+      if (row.spaceId.length > 0) {
+        rows.push(row);
+      }
+    }
+    mySpaces.value = rows;
+    spaceTotal.value = rows.length;
+    resolveSpaceRowsIcons(mySpaces.value);
+    assignSpaceFallbacks(mySpaces.value);
+    spacesLoaded.value = true;
+  }
+
+  /** 触发服务端默认智能体补建（DEV-325 挂在 whoami 尾部的异步旁路：加联系人+建会话
+   *  置顶+发默认消息，ensure 语义幂等）。App 端 whoami 只挂在 chat 页 onLoad，新账号
+   *  伙伴页空、无会话可进 ⇒ 那条触发链断裂——在此补一脚对齐 PC web「每次进 IM 必调」。
+   *  静默 best-effort：响应不消费（本页不需要 revokeWindowSec），失败下次进页再来。 */
+  async function pingWhoamiForAgentProvision(): Promise<void> {
+    try {
+      await apiImWhoami();
+    } catch (_error) {
+      // 静默：纯触发（补建成败由 WS 推送/下次刷新体现）
+    }
   }
 
   /** 页面 onLoad 闸门：缓存优先、缺失拉一次租户配置；放行后补跑首拉（原 onLoad 直调的两个 load）。 */
@@ -1544,9 +1831,17 @@
       initImWsClient();
       refreshImUnreadBadge();
     }
-    // onShow 复查可能已抢先解锁并补拉过（loadXxx 自带 loading 去重，重复调用无害）
+    // 先水合再首拉：缓存命中秒出列表（加载态直接进静默刷新语义），网络照常整表替换
+    //（onShow 复查可能已抢先解锁并补拉过：loadXxx 自带 loading 去重，水合已有数据早退，重复调用无害）
+    hydrateConversationsFromCache();
+    hydrateContactsFromCache();
     loadConversations();
     loadContacts();
+    // 默认智能体补建触发（fire-and-forget，不消费响应）：异步补建赶不上首拉属预期，
+    // 靠 WS 推送（ImConversationUpdated/ImContactUpdated 已订阅）或下次回页刷新出现
+    pingWhoamiForAgentProvision();
+    // 「我自己」置顶行：与联系人首拉同机（已有行早退，幂等）
+    ensureSelfContactRow();
   }
 
   /** 切 tab 落定（tab 点击与 swiper 横滑共用）。横滑抬手必置吞击位，走 switchTab 会被
@@ -1560,15 +1855,22 @@
     if (rowMenuVisible.value) {
       rowMenuVisible.value = false;
     }
-    // 智联录懒加载：联系人已随页面首拉（tab 角标需要「待我处理」数据），群组/团队首次切入时拉取
+    // 智联录懒加载：联系人已随页面首拉（tab 角标需要「待我处理」数据），群组/团队首次切入时拉取。
+    // 各分支先水合再照常 load（条件进 body 时已定，水合命中也不跳过请求）＝SWR：
+    // 缓存秒出 + 静默刷新；水合失败/未命中则与原行为完全一致。
     if (tab == "contact") {
       if (contactLoaded.value != true) {
+        hydrateContactsFromCache();
         loadContacts();
       }
+      // 「我自己」置顶行：首拉失败/冷启动为空时切入智联录再试（已有行早退）
+      ensureSelfContactRow();
       if (groupsLoaded.value != true) {
+        hydrateGroupsFromCache();
         loadGroups();
       }
       if (spacesLoaded.value != true) {
+        hydrateSpacesFromCache();
         loadSpaces();
       }
     }
@@ -1944,12 +2246,15 @@
     }
   }
 
-  /** 进入消息详情页：携带会话基础信息（名称/头像 encodeURIComponent，详情页容错解码）。 */
+  /** 进入消息详情页：携带会话基础信息（名称/头像 encodeURIComponent，详情页容错解码）。
+   *  unread=点击时行未读数快照（天然在清零前），>0 时详情页定位首条未读+水位清零；
+   *  其余入口（通知栏/加好友等）不带该参 → 详情页走现状贴底。 */
   function openConversation(conv: ImConvRow): void {
     const chatUrl =
       `/pages/message/chat?convId=${conv.convId}&convType=${conv.convType}` +
       `&name=${encodeURIComponent(displayConvName(conv))}` +
-      `&avatar=${encodeURIComponent(conv.avatarUrl)}`;
+      `&avatar=${encodeURIComponent(conv.avatarUrl)}` +
+      `&unread=${conv.unreadCount}`;
     uni.navigateTo({ url: chatUrl });
   }
 
@@ -2224,9 +2529,14 @@
   }
 
   /** 联系人行 touchstart（含已申请行）：公共判定 + 装填长按——已申请（status=3）=
-   *  撤回申请；正式联系（status=1）= 发消息/备注/删除。 */
+   *  撤回申请；正式联系（status=1）= 发消息/备注/删除。「我自己」置顶行不装填
+   *  （发消息走点按；备注/删除联系人对自环会话无意义）。 */
   function handleContactRowTouchStart(contact: ImContactRow, eventValue: Any): void {
     handleRowTouchStart(`ct-${contact.userId}`, eventValue);
+    const selfRowForPress = selfContactRow.value;
+    if (selfRowForPress != null && contact.userId == selfRowForPress.userId) {
+      return;
+    }
     armRowLongPress("contact", `row-ct-${contact.userId}`, null, contact);
   }
 
@@ -3139,6 +3449,9 @@
     if (convLoadRetryTimer != 0) clearTimeout(convLoadRetryTimer);
     convLoadRetryTimer = 0;
     convLoadRetryCount = 0;
+    if (convSilentRetryTimer != 0) clearTimeout(convSilentRetryTimer);
+    convSilentRetryTimer = 0;
+    convSilentRetryUsed = false;
     if (iconResolveRetryTimer != 0) clearTimeout(iconResolveRetryTimer);
     iconResolveRetryTimer = 0;
     iconResolveRetryCount = 0;
@@ -3153,9 +3466,14 @@
     acceptedContacts.value = [];
     pendingInContacts.value = [];
     pendingOutContacts.value = [];
+    // 「我自己」行同清：换账号后 myInfoCache/imNoticeBar 随会话戳失效，行内
+    // userId/头像属旧账号，不得残留（ensureSelfContactRow 会按新账号重建）
+    selfContactRow.value = null;
     myGroups.value = [];
     mySpaces.value = [];
     clearMessageUiResources();
+    // 列表缓存同清：登出/换账号/切域名不串号（信封账号 tag 校验兜底）
+    clearImListCache();
   };
 
   onLoad((_options: any) => {
@@ -3196,6 +3514,8 @@
       if (contactLoaded.value || contactFailed.value) {
         loadContacts();
       }
+      // 「我自己」置顶行：静默刷新顺带补试（首拉失败场景的自愈路径；已有行早退）
+      ensureSelfContactRow();
       if (groupsLoaded.value) {
         loadGroups();
       }
@@ -3265,11 +3585,16 @@
       applyWorkGateBlocked();
     } else if (workGateBlocked.value && !workGatePending.value) {
       // 授权恢复：解除拦截 + 重启 WS（stop 曾置 manualClosed，需 init 复位）+ 补角标与首拉
+      //（blocked 期间从未拉过、表为空，先水合缓存秒出再补拉——与 initWorkGate 同款 SWR）
       workGateBlocked.value = false;
       initImWsClient();
       refreshImUnreadBadge();
+      hydrateConversationsFromCache();
+      hydrateContactsFromCache();
       loadConversations();
       loadContacts();
+      // 解锁也是「进 IM」：blocked 期间从未触发过补建，随首拉一并补上
+      pingWhoamiForAgentProvision();
     }
     if (!hasShownOnce) {
       hasShownOnce = true;

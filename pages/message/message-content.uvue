@@ -872,6 +872,21 @@
     }, delayMs);
   }
 
+  /** resolveDisplayImageUrl 回退原地址（resolved==rawUrl）时是否按失败处理（负缓存重试）。
+   * App 两端：svg 已直连透传（remoteSvgImage），回退原址是直连结果而非失败——注意
+   * /api/f/ 的 svg 会同时命中受保护条件，不排除就会掉进重试环导致 avatarDisplay
+   * 永远绑不上（2026-10-23 实测踩过：svg 行零 @load/@error、直落文案兜底）；仅非
+   * svg 受保护地址仍按失败走有限重试。其余平台：仅受保护地址按失败。 */
+  function iconResolveFallbackIsFailure(rawUrl: string): boolean {
+    // #ifdef APP-ANDROID || APP-IOS
+    return isAuthProtectedFileUrl(rawUrl) && !isRemoteSvgUrl(rawUrl);
+    // #endif
+    // #ifndef APP-ANDROID || APP-IOS
+    if (isAuthProtectedFileUrl(rawUrl)) return true;
+    return false;
+    // #endif
+  }
+
   /**
    * 解析并回填单个头像/图标地址（apply 收可直接绑定给 <image> 的地址）。
    * ★rows 须取自 ref 数组（响应式代理实例），异步写入才会触发渲染刷新（chat.uvue resolveRowMedia 同款）。
@@ -894,24 +909,9 @@
         // resolveDisplayImageUrl 在受保护资源失败时会回退原 URL。
         // 原 URL 没有鉴权，直接绑定只会再次触发 401/error；不要把它当正缓存，
         // 给冷启动的 token/网络初始化留出有限重试机会。
-        if (
-          resolved == rawUrl &&
-          (isAuthProtectedFileUrl(rawUrl)
-            // App 原生 SVG 需要先下载改尺寸；失败时不能把原地址当成成功结果缓存。
-            // #ifdef APP-ANDROID || APP-IOS
-            || isRemoteSvgUrl(rawUrl)
-            // #endif
-          )
-        ) {
-          // App SVG 失败后工具层有 5 秒负缓存，页面重试需稍晚于该窗口；
-          // 普通受保护位图仍按 1/2/3 秒快速重试。
-          let retryDelayMs = 1000;
-          // #ifdef APP-ANDROID || APP-IOS
-          if (isRemoteSvgUrl(rawUrl)) {
-            retryDelayMs = 5500;
-          }
-          // #endif
-          scheduleIconResolveRetry(retryDelayMs);
+        if (resolved == rawUrl && iconResolveFallbackIsFailure(rawUrl)) {
+          // 普通受保护位图按 1/2/3 秒快速重试（svg 直连透传不进此分支）。
+          scheduleIconResolveRetry(1000);
           return;
         }
         if (resolved.length > 0) {
@@ -1103,14 +1103,24 @@
       row.displayName = name.length > 0 ? name : peerName;
       row.avatarUrl = avatar;
     }
-    // ★实验（2026-10-08，仅消息列表）：受保护 /api/f/ 头像直连原始地址——后端确认
-    // 登录态（Cookie 会话）下 /api/f/ 可直接访问，<image> 请求自动带 Cookie（带不了
-    // Bearer 才有原先的换链机制）。directAvatar 时首帧即绑原地址，绕开
-    // resolveDisplayImageUrl 的 Bearer 拉取换 blob/temp；失败（401 JSON→ORB / Cookie
-    // 未命中）由 @error 走原有字母兜底 + 有限重试。远程 SVG 例外：App 端 1:1 光栅化
-    // 裁切与鉴权无关，仍走 resolveConvRowsIcons 的尺寸改写解析。
-    // 「我的群组」共用本函数但传 false，保持原解析路径（本实验只改消息列表）。
-    if (directAvatar && row.avatarUrl.length > 0 && !isRemoteSvgUrl(row.avatarUrl)) {
+    // 受保护 /api/f/ 头像直连原始地址（2026-10-08 起，10-23 三端真机定稿）：后端确认
+    // 登录态（Cookie 会话）下 /api/f/ 可直接访问，Android/iOS 的 <image> 请求自动带
+    // Cookie（带不了 Bearer 才有原先的换链机制）。directAvatar 时首帧即绑原地址，
+    // 绕开 resolveDisplayImageUrl 的 Bearer 拉取换 blob/temp；失败（401 JSON→ORB /
+    // Cookie 未命中）由 @error 走原有字母兜底 + 有限重试。远程 SVG 走解析链但 App
+    // 两端已直连透传（remoteSvgImage resolveDisplayImageUrl），等效直连。
+    // 「我的群组」共用本函数但传 false，保持原解析路径。
+    let directAvatarBind = row.avatarUrl.length > 0 && !isRemoteSvgUrl(row.avatarUrl);
+    // #ifdef APP-HARMONY
+    // 鸿蒙例外（2026-10-23 两轮真机实锤：直连复现闪烁，Bearer temp 文件方案已验通过）：
+    // ArkUI <image> 直连 /api/f/ 不带 Cookie，服务端回 200+JSON 错误包 →
+    // "After download successful, imageObject Create fail" → @error 文案兜底 + 重试链
+    // 换 Bearer temp 文件才恢复；每次整表重建首帧又绑裸地址再失败＝切 tab 反复闪烁。
+    // 受保护位图鸿蒙不直连，走解析换 temp 文件（构造期 resolvedIconCache 回填保首帧，
+    // 见下方）。
+    directAvatarBind = directAvatarBind && !isAuthProtectedFileUrl(row.avatarUrl);
+    // #endif
+    if (directAvatar && directAvatarBind) {
       row.avatarDisplay = row.avatarUrl;
     }
     // 整表 reload 重建行对象时，SVG 行（上方被排除）与 directAvatar=false 行的

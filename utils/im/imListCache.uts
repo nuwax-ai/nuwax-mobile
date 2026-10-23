@@ -1,0 +1,362 @@
+import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN } from "@/constants/home.constants";
+import type { RequestResponse } from "@/types/interfaces/request";
+import { apiResData } from "@/utils/apiResponse";
+/**
+ * 伙伴页列表缓存（消息会话 / 联系人 / 群组 / 团队）：stale-while-revalidate——
+ * 冷启动（或小程序实例重建）进页先同步水合缓存秒出列表，网络首拉/静默刷新照常
+ * 发包、回包整表替换（页面 loadXxx 既有语义，无合并逻辑），成功后回写本缓存。
+ *
+ * 存储：四表四个 storage 键（版本号进键名，旧版本数据永不被读；一次成功只重写
+ * 一个键，互不连坐）。信封 {v, s, at, …表字段}：s = 账号 tag（token|origin，
+ * chatDrafts 同源口径——不含进程内 epoch，epoch 重启归零会误失配）不匹配整包
+ * 丢弃防换账号串号；at 超 TTL（24h）或超前 5min（时钟回拨）当无缓存。
+ *
+ * ★存服务端 records/items 原文（UTSJSONObject[]），不存解析后的行对象：行对象
+ * 的头像解析态（blob:/临时路径）跨进程必失效，unreadCount「服务端缺键=未算」
+ * 语义只有原文保真；草稿区排序/兜底取字由页面水合管线现算天然正确。空数组
+ * 不算命中（PC convCache 同款纪律：拿空缓存当命中=用旧记忆替服务端下结论）。
+ *
+ * 写侧同串跳写：模块级记各键上次落盘 JSON，新串全等则跳过 setStorageSync——
+ * onShow 静默刷新大概率回包不变，一条字符串比较挡掉绝大多数冗余盘写（替代
+ * debounce，零复杂度）。
+ */
+
+const IM_LIST_CACHE_VERSION = 1;
+const IM_LIST_CACHE_CONVS_KEY = "IM_LIST_CACHE_V1_CONVS";
+const IM_LIST_CACHE_CONTACTS_KEY = "IM_LIST_CACHE_V1_CONTACTS";
+const IM_LIST_CACHE_GROUPS_KEY = "IM_LIST_CACHE_V1_GROUPS";
+const IM_LIST_CACHE_SPACES_KEY = "IM_LIST_CACHE_V1_SPACES";
+/** 读侧 TTL：过期当无缓存（不主动删，下次成功写入自愈）。 */
+const IM_LIST_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+/** at 超前容差：超过 now+5min 视为时钟回拨产物，整包作废。 */
+const IM_LIST_CACHE_FUTURE_SKEW_MS = 5 * 60 * 1000;
+/** 单键 JSON 长度上限：微信小程序单键 1MB 硬限留余量，超限弃写该键（读侧无感）。 */
+const IM_LIST_CACHE_MAX_JSON_CHARS = 700000;
+
+/** 会话列表缓存载荷（服务端首页 records 原文 + 翻页游标）。 */
+export class ImConvListCachePayload {
+  records: UTSJSONObject[] = [];
+  nextCursor: string = "";
+}
+
+/** 联系人缓存载荷（全量 items 原文 + 降级/截断标记）。 */
+export class ImContactsCachePayload {
+  items: UTSJSONObject[] = [];
+  degraded: boolean = false;
+  truncated: boolean = false;
+}
+
+/** 群组缓存载荷（records 原文 + 服务端 total，-1=未统计由水合侧回落）。 */
+export class ImGroupsCachePayload {
+  records: UTSJSONObject[] = [];
+  total: number = 0;
+}
+
+/** 团队缓存载荷（全量 items 原文）。 */
+export class ImSpacesCachePayload {
+  items: UTSJSONObject[] = [];
+}
+
+/** 账号 tag（重启稳定；token 轮换会失配丢缓存，可接受的边界——chatDrafts 同款）。 */
+function accountTag(): string {
+  const token = uni.getStorageSync(ACCESS_TOKEN);
+  const origin = uni.getStorageSync(ACCESS_TOKEN_ORIGIN);
+  return `${token ?? ""}|${origin ?? ""}`;
+}
+
+function readString(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  return raw != null ? `${raw}` : "";
+}
+
+function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+  const raw = obj[key];
+  if (raw == null) {
+    return fallback;
+  }
+  const parsed = parseFloat(`${raw}`);
+  // n != n 判 NaN（UTS 无 isNaN，conversationLocalFlags 同款）
+  return parsed != parsed ? fallback : parsed;
+}
+
+function readBool(obj: UTSJSONObject, key: string): boolean {
+  const raw = obj[key];
+  return raw != null && `${raw}` == "true";
+}
+
+/** 读信封：键缺失/JSON 损坏/版本或账号不符/TTL 过期/时钟回拨 → null（当无缓存）。 */
+function readEnvelope(key: string): UTSJSONObject | null {
+  try {
+    const raw = uni.getStorageSync(key);
+    if (raw == null) {
+      return null;
+    }
+    const text = `${raw}`.trim();
+    if (text.length == 0) {
+      return null;
+    }
+    const root = JSON.parse<UTSJSONObject>(text);
+    if (root == null) {
+      return null;
+    }
+    if (readNumber(root, "v", 0) != IM_LIST_CACHE_VERSION) {
+      return null;
+    }
+    if (readString(root, "s") != accountTag()) {
+      return null;
+    }
+    const at = readNumber(root, "at", 0);
+    if (at <= 0) {
+      return null;
+    }
+    const now = Date.now();
+    if (at > now + IM_LIST_CACHE_FUTURE_SKEW_MS) {
+      return null;
+    }
+    if (now - at > IM_LIST_CACHE_TTL_MS) {
+      return null;
+    }
+    return root;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** 信封内取对象数组：缺键/类型不符/空数组 → null（空数组不是命中）。 */
+function readRecordArray(root: UTSJSONObject, key: string): UTSJSONObject[] | null {
+  try {
+    const raw = root[key];
+    if (raw == null) {
+      return null;
+    }
+    const records = raw as UTSJSONObject[];
+    if (records.length == 0) {
+      return null;
+    }
+    return records;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** 读会话列表缓存：命中返回首页 records 原文 + nextCursor，未命中 null。 */
+export function readImConvCache(): ImConvListCachePayload | null {
+  const root = readEnvelope(IM_LIST_CACHE_CONVS_KEY);
+  if (root == null) {
+    return null;
+  }
+  const records = readRecordArray(root, "records");
+  if (records == null) {
+    return null;
+  }
+  const payload = new ImConvListCachePayload();
+  payload.records = records;
+  payload.nextCursor = readString(root, "nextCursor");
+  return payload;
+}
+
+/** 读联系人缓存：命中返回全量 items 原文 + degraded/truncated，未命中 null。 */
+export function readImContactsCache(): ImContactsCachePayload | null {
+  const root = readEnvelope(IM_LIST_CACHE_CONTACTS_KEY);
+  if (root == null) {
+    return null;
+  }
+  const items = readRecordArray(root, "items");
+  if (items == null) {
+    return null;
+  }
+  const payload = new ImContactsCachePayload();
+  payload.items = items;
+  payload.degraded = readBool(root, "degraded");
+  payload.truncated = readBool(root, "truncated");
+  return payload;
+}
+
+/** 读群组缓存：命中返回 records 原文 + total（-1=未统计），未命中 null。 */
+export function readImGroupsCache(): ImGroupsCachePayload | null {
+  const root = readEnvelope(IM_LIST_CACHE_GROUPS_KEY);
+  if (root == null) {
+    return null;
+  }
+  const records = readRecordArray(root, "records");
+  if (records == null) {
+    return null;
+  }
+  const payload = new ImGroupsCachePayload();
+  payload.records = records;
+  payload.total = readNumber(root, "total", 0);
+  return payload;
+}
+
+/** 读团队缓存：命中返回全量 items 原文，未命中 null。 */
+export function readImSpacesCache(): ImSpacesCachePayload | null {
+  const root = readEnvelope(IM_LIST_CACHE_SPACES_KEY);
+  if (root == null) {
+    return null;
+  }
+  const items = readRecordArray(root, "items");
+  if (items == null) {
+    return null;
+  }
+  const payload = new ImSpacesCachePayload();
+  payload.items = items;
+  return payload;
+}
+
+// ===== 写侧（同串跳写：记各键上次落盘 JSON，全等跳过）=====
+const lastWrittenJson = new Map<string, string>();
+
+/** 落盘：超长弃写；同串跳写；写失败静默（仅失去缓存，无功能影响）。
+ *  ★记账在写盘成功之后：若先记账后写失败，同串跳写会让盘上永久停留旧值；
+ *  先写后记则下次同串仍会重试写盘，瞬时失败可自愈。 */
+function persistEnvelope(key: string, json: string): void {
+  if (json.length > IM_LIST_CACHE_MAX_JSON_CHARS) {
+    return;
+  }
+  const last = lastWrittenJson.get(key);
+  if (last != null && last == json) {
+    return;
+  }
+  try {
+    uni.setStorageSync(key, json);
+    lastWrittenJson.set(key, json);
+  } catch (_e) {
+    // 写失败静默（不记账，下次同串重试）
+  }
+}
+
+/** 响应 data 转 UTSJSONObject（页面 parseConvRecords 等同款口径）。 */
+function resDataObj(res: RequestResponse<any>): UTSJSONObject | null {
+  const dataRaw = apiResData<any>(res);
+  return dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+}
+
+/**
+ * 写会话列表缓存（loadConversations 首页成功路径调用；翻页不写——缓存只承首屏）。
+ * 空结果也写：读侧「空数组不是命中」使其等价于清键，防冷启动闪上一批已删会话。
+ */
+export function saveImConvCache(res: RequestResponse<any>): void {
+  try {
+    const dataObj = resDataObj(res);
+    if (dataObj == null) {
+      return;
+    }
+    const recordsRaw = dataObj["records"];
+    if (recordsRaw == null) {
+      return;
+    }
+    const records = recordsRaw as UTSJSONObject[];
+    const root = new UTSJSONObject();
+    root["v"] = IM_LIST_CACHE_VERSION;
+    root["s"] = accountTag();
+    root["at"] = Date.now();
+    root["records"] = records;
+    const cursorRaw = dataObj["nextCursor"];
+    root["nextCursor"] = cursorRaw != null ? `${cursorRaw}` : "";
+    const json = JSON.stringify(root);
+    if (json != null) {
+      persistEnvelope(IM_LIST_CACHE_CONVS_KEY, json);
+    }
+  } catch (_e) {
+    // 写失败静默
+  }
+}
+
+/** 写联系人缓存（loadContacts 成功路径调用）。空结果同写（口径同 saveImConvCache）。 */
+export function saveImContactsCache(res: RequestResponse<any>): void {
+  try {
+    const dataObj = resDataObj(res);
+    if (dataObj == null) {
+      return;
+    }
+    const itemsRaw = dataObj["items"];
+    if (itemsRaw == null) {
+      return;
+    }
+    const items = itemsRaw as UTSJSONObject[];
+    const root = new UTSJSONObject();
+    root["v"] = IM_LIST_CACHE_VERSION;
+    root["s"] = accountTag();
+    root["at"] = Date.now();
+    root["items"] = items;
+    root["degraded"] = readBool(dataObj, "degraded");
+    root["truncated"] = readBool(dataObj, "truncated");
+    const json = JSON.stringify(root);
+    if (json != null) {
+      persistEnvelope(IM_LIST_CACHE_CONTACTS_KEY, json);
+    }
+  } catch (_e) {
+    // 写失败静默
+  }
+}
+
+/** 写群组缓存（loadGroups 成功路径调用）。 */
+export function saveImGroupsCache(res: RequestResponse<any>): void {
+  try {
+    const dataObj = resDataObj(res);
+    if (dataObj == null) {
+      return;
+    }
+    const recordsRaw = dataObj["records"];
+    if (recordsRaw == null) {
+      return;
+    }
+    const records = recordsRaw as UTSJSONObject[];
+    const root = new UTSJSONObject();
+    root["v"] = IM_LIST_CACHE_VERSION;
+    root["s"] = accountTag();
+    root["at"] = Date.now();
+    root["records"] = records;
+    root["total"] = readNumber(dataObj, "total", 0);
+    const json = JSON.stringify(root);
+    if (json != null) {
+      persistEnvelope(IM_LIST_CACHE_GROUPS_KEY, json);
+    }
+  } catch (_e) {
+    // 写失败静默
+  }
+}
+
+/** 写团队缓存（loadSpaces 成功路径调用）。 */
+export function saveImSpacesCache(res: RequestResponse<any>): void {
+  try {
+    const dataObj = resDataObj(res);
+    if (dataObj == null) {
+      return;
+    }
+    const itemsRaw = dataObj["items"];
+    if (itemsRaw == null) {
+      return;
+    }
+    const items = itemsRaw as UTSJSONObject[];
+    const root = new UTSJSONObject();
+    root["v"] = IM_LIST_CACHE_VERSION;
+    root["s"] = accountTag();
+    root["at"] = Date.now();
+    root["items"] = items;
+    const json = JSON.stringify(root);
+    if (json != null) {
+      persistEnvelope(IM_LIST_CACHE_SPACES_KEY, json);
+    }
+  } catch (_e) {
+    // 写失败静默
+  }
+}
+
+/** 清全部列表缓存（IM_SESSION_CLEARED：登出/换账号/切域名时页面事件里调用）。 */
+export function clearImListCache(): void {
+  const keys: string[] = [
+    IM_LIST_CACHE_CONVS_KEY,
+    IM_LIST_CACHE_CONTACTS_KEY,
+    IM_LIST_CACHE_GROUPS_KEY,
+    IM_LIST_CACHE_SPACES_KEY,
+  ];
+  for (let i = 0; i < keys.length; i++) {
+    lastWrittenJson.delete(keys[i]);
+    try {
+      uni.removeStorageSync(keys[i]);
+    } catch (_e) {
+      // 删失败静默（读侧账号 tag 校验兜底）
+    }
+  }
+}

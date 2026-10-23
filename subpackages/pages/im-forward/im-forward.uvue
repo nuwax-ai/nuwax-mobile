@@ -19,6 +19,20 @@
       <text class="fw-context__count">{{ contextCountText }}</text>
     </view>
 
+    <!-- 转发留言（可选）：提交时先于转发内容发到每个目标（微信同款「留言在上」） -->
+    <view class="fw-remark">
+      <view class="fw-remark__box">
+        <textarea
+          class="fw-remark__input"
+          v-model="commentText"
+          :maxlength="500"
+          :placeholder="t('Mobile.Message.forwardRemarkPlaceholder')"
+          placeholder-class="fw-remark__ph"
+        />
+        <text v-if="commentText.length > 0" class="fw-remark__count">{{ commentText.length }} / 500</text>
+      </view>
+    </view>
+
     <!-- 搜索框：300ms 去抖，同时搜联系人（人）与会话（群/单聊） -->
     <view class="fw-search">
       <view class="fw-search__box">
@@ -115,6 +129,7 @@
     apiImSearchContacts,
     apiImSearchConversations,
     apiImSendMergeForwardMsg,
+    apiImSendTextMsg,
   } from "@/servers/im";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
@@ -176,6 +191,10 @@
     }
     return tCount("Mobile.Message.multiSelectedCount", s.items.length);
   });
+
+  // ===== 转发留言（可选附言） =====
+  /** 留言文本（trim 后空串 = 不发留言，行为与现状一致；maxlength=500 限 UTF-16 长）。 */
+  const commentText = ref<string>("");
 
   // ===== 列表状态 =====
   const keyword = ref<string>("");
@@ -452,6 +471,51 @@
 
   // ===== 发送 =====
 
+  // ---- 码点三件套（chat.uvue 局部同款拷贝：代理对不劈、与 merge 快照截断语义逐字一致） ----
+
+  /** 取 src 第 i 个码点的 UTF-16 长度（代理对算 1 个码点占 2 个 char）。 */
+  function cpLenAt(src: string, i: number): number {
+    const code = src.charCodeAt(i) ?? -1;
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < src.length) {
+      const next = src.charCodeAt(i + 1) ?? -1;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        return 2;
+      }
+    }
+    return 1;
+  }
+
+  function codePointCount(src: string): number {
+    let n = 0;
+    let i = 0;
+    while (i < src.length) {
+      i += cpLenAt(src, i);
+      n++;
+    }
+    return n;
+  }
+
+  /** 按码点截断（代理对不劈开；超限时保留 max-1 个码点 + 「…」，输出 ≤ max，PC truncateCodePoints 同语义）。 */
+  function truncateCodePoints(src: string, max: number): string {
+    if (max <= 0) {
+      return "";
+    }
+    if (codePointCount(src) <= max) {
+      return src;
+    }
+    const keep = max - 1;
+    let out = "";
+    let i = 0;
+    let n = 0;
+    while (i < src.length && n < keep) {
+      const l = cpLenAt(src, i);
+      out += src.substring(i, i + l);
+      i += l;
+      n++;
+    }
+    return out + "…";
+  }
+
   /** merge 快照 items → JSON 数组字符串（契约见 servers/im.uts apiImSendMergeForwardMsg：
    *  senderName/sendTime/msgType 必填，text ≤500 码点已截好，attachments 已滤空 url）。 */
   function buildItemsJson(items: ImForwardItem[]): string {
@@ -497,6 +561,8 @@
   /**
    * 发送（PC 同款串行逐目标派发，避免并发触发 IM_20005 限流）：
    * - user 形态目标先 createP2p（幂等）解析出 convId，任一失败即记 partialFail
+   * - 留言（可选）：先于转发内容逐目标发一条普通 text 消息（微信「留言」同款，服务端无感知）；
+   *   留言失败的目标记入 deadTargets 并跳过其转发内容，避免「内容到了留言丢了」的错序
    * - single：逐条消息 × 逐目标 /forward（targetConvIds 单目标；接口本身支持 ≤9 批量，
    *   单目标循环可完整读 failures，语义最简单）
    * - merge：itemsJson 构建一次，逐目标发 merge_forward 消息（clientMsgId 幂等键）
@@ -547,9 +613,33 @@
     }
     // 2) 派发
     let anyFail = resolveFailed;
+    // 2.5) 留言先行：每目标一条普通 text 消息（串行防 IM_20005），失败目标跳过转发内容
+    const deadTargets: string[] = [];
+    let remark = commentText.value.trim();
+    if (remark.length > 0 && codePointCount(remark) > 500) {
+      // maxlength=500 已限 UTF-16 长（≥码点数），此处仅超长粘贴兜底（与 merge 快照同语义截断）
+      remark = truncateCodePoints(remark, 500);
+    }
+    if (remark.length > 0) {
+      for (let i = 0; i < targetConvIds.length; i++) {
+        try {
+          const res = await apiImSendTextMsg(targetConvIds[i], remark, generateUUID());
+          if (apiResCode(res) != SUCCESS_CODE) {
+            anyFail = true;
+            deadTargets.push(targetConvIds[i]);
+          }
+        } catch (_error) {
+          anyFail = true;
+          deadTargets.push(targetConvIds[i]);
+        }
+      }
+    }
     if (s.mode == "merge") {
       const itemsJson = buildItemsJson(s.items);
       for (let i = 0; i < targetConvIds.length; i++) {
+        if (deadTargets.indexOf(targetConvIds[i]) >= 0) {
+          continue;
+        }
         try {
           const res = await apiImSendMergeForwardMsg(targetConvIds[i], "", itemsJson, generateUUID());
           if (apiResCode(res) != SUCCESS_CODE) {
@@ -563,6 +653,9 @@
       for (let m = 0; m < s.items.length; m++) {
         const msgId = s.items[m].msgId;
         for (let i = 0; i < targetConvIds.length; i++) {
+          if (deadTargets.indexOf(targetConvIds[i]) >= 0) {
+            continue;
+          }
           try {
             const res = await apiImForwardMsg(s.sourceConvId, msgId, [targetConvIds[i]]);
             if (apiResCode(res) != SUCCESS_CODE) {
@@ -677,6 +770,44 @@
   .fw-context__count {
     font-size: 12px;
     line-height: 17px;
+    color: #9a98a5;
+  }
+
+  /* 转发留言框（骨架同 im-join-group 留言框） */
+  .fw-remark {
+    flex-shrink: 0;
+    padding: 0 16px 10px;
+  }
+
+  .fw-remark__box {
+    position: relative;
+  }
+
+  /* 固定 80px：App 端原生 textarea 行盒偏高，过矮会裁掉 placeholder 底部
+     （im-join-group / im-add-buddy 真机实锤同款坑）；底 padding 20px 给计数留位 */
+  .fw-remark__input {
+    width: 100%;
+    height: 80px;
+    padding: 8px 12px 20px;
+    border-radius: 12px;
+    background-color: #ffffff;
+    font-size: 14px;
+    line-height: 20px;
+    color: #1c1b20;
+    box-sizing: border-box;
+  }
+
+  .fw-remark__count {
+    position: absolute;
+    right: 12px;
+    bottom: 6px;
+    font-size: 11px;
+    line-height: 16px;
+    color: #9a98a5;
+  }
+
+  .fw-remark__ph {
+    font-size: 13px;
     color: #9a98a5;
   }
 
@@ -853,7 +984,7 @@
   .fw-send {
     height: 44px;
     border-radius: 22px;
-    background-color: #5147ff;
+    background-color: #111111;
     display: flex;
     flex-direction: row;
     align-items: center;

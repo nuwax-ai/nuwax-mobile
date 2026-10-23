@@ -1,5 +1,5 @@
 import { releaseDisplayImageUrl } from "@/utils/authProtectedFileUrl";
-import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { getImSessionStamp, IM_SESSION_READY } from "@/utils/im/imSessionScope";
 import { ref, type Ref } from "vue";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -14,18 +14,29 @@ import { resolveMainTabPagePath } from "@/utils/mainTabNavigation";
 import { t } from "@/utils/i18n";
 import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
 import { isWorkCommercialBlockedSync } from "@/utils/workCommercial";
+// #ifdef APP-HARMONY
+import { publishImHarmonyNotify } from "@/utils/imHarmonyNotify";
+// #endif
 
 /**
  * IM 新消息全局顶部横幅（模块单例，同 imUnreadBadge 模式）。
  *
  * 非「消息」tab 页收到新消息（WS im_message_received）→ 各 tab 页挂载的
  * <im-notice-bar/> 顶部横幅显示（头像+名称+摘要），5s 自动消失，点击直达会话。
- * 静默口径（对齐 IM Web 端 notify.ts）：
- * - 「消息」tab / 聊天页 / 二级页 / App 后台 → 不弹（横幅组件只挂 4 个非消息 tab 页）
- * - 自己在其他端发的多端同步消息（senderId == myUserId）→ 不弹
+ * 静默口径（对齐 IM Web 端 notify.ts，前后台两条链路共用同一套 gate）：
+ * - 「消息」tab / 聊天页 / 二级页 → 不弹（横幅组件只挂 4 个非消息 tab 页）
+ * - App 后台 → Android 转系统本地通知（见下），其余端归离线推送/角标
+ * - 自己在其他端发的多端同步消息（senderId == myUserId）→ 不弹/不通知
  * - 重连补拉重放（reqId == "sync-fallback"）→ 不弹（风暴源头）
- * - 免打扰会话（dnd）且未 @到我 → 不弹
+ * - 免打扰会话（dnd）且未 @到我 → 不弹/不通知
  * 单条横幅：新消息直接顶掉当前内容并重置计时（纯本地 UI，无请求放大，不去抖）。
+ *
+ * App 后台系统本地通知（仅鸿蒙，utils/imHarmonyNotify.uts）：App 退后台且进程
+ * 活着（WS 仍连）时收到新消息 → notificationManager.publish 弹系统通知（自研
+ * 直连系统 API，不经 uni-push/个推，无任何外部账号依赖）。Android 曾按
+ * uni.createPushMessage 实现过（需开通 unipush 2.0），2026-10-21 按需求收敛
+ * 撤下；iOS 退后台 ~30s 即挂起收不到 WS（见 imWsClient 头注），后台提醒须
+ * APNs 离线推送（后端接入阶段统一做）。
  */
 
 /** 横幅自动消失时长（毫秒）。 */
@@ -77,6 +88,35 @@ function currentToken(): string {
   return raw != null ? `${raw}` : "";
 }
 
+/** 持久化 myUserId 缓存（成对存 id + 拉取时的 token 快照，token 不匹配即失效）。 */
+const MY_USER_ID_STORAGE_KEY = "NUWAX_IM_MY_USER_ID";
+const MY_USER_ID_TOKEN_STORAGE_KEY = "NUWAX_IM_MY_USER_ID_TOKEN";
+
+/**
+ * 从 storage 水合内存缓存（仅 token 匹配时生效）：
+ * 内存缓存被清/进程重启后，登录态下的首条消息不再被 myUserId fail-closed 吃掉
+ * （2026-10-22 真机：消息先到、apiUserInfo 后 110ms 回来，横幅必丢）。
+ */
+function hydrateMyUserIdFromStorage(): void {
+  if (cachedMyUserId.length > 0) {
+    return;
+  }
+  const token = currentToken();
+  if (token.length == 0) {
+    return;
+  }
+  try {
+    const idRaw = uni.getStorageSync(MY_USER_ID_STORAGE_KEY);
+    const tokenRaw = uni.getStorageSync(MY_USER_ID_TOKEN_STORAGE_KEY);
+    if (idRaw != null && tokenRaw != null && `${tokenRaw}` == token) {
+      cachedMyUserId = `${idRaw}`;
+      myUserIdToken = token;
+    }
+  } catch (_e) {
+    // storage 读失败：保持空，走网络拉取
+  }
+}
+
 /** 拉取/刷新 myUserId（失败静默：保持空值，下一条消息再试）。 */
 async function ensureMyUserId(): Promise<void> {
   // 工作商业版未授权：不预拉（WS 已闸死收不到消息，横幅链路整体不启用）
@@ -100,6 +140,10 @@ async function ensureMyUserId(): Promise<void> {
       const idRaw = dataObj["id"];
       cachedMyUserId = idRaw != null ? `${idRaw}` : "";
       myUserIdToken = token;
+      if (cachedMyUserId.length > 0) {
+        uni.setStorageSync(MY_USER_ID_STORAGE_KEY, cachedMyUserId);
+        uni.setStorageSync(MY_USER_ID_TOKEN_STORAGE_KEY, token);
+      }
     }
   } catch (_error) {
     // 静默：下次消息再试。
@@ -255,8 +299,12 @@ function handleNoticeMessage(payload: any): void {
   if (reqIdRaw != null && `${reqIdRaw}` == "sync-fallback") {
     return;
   }
-  // App 后台归系统级提醒（离线推送/角标），回前台不补弹
+  // App 后台：鸿蒙转系统本地通知（静默口径与横幅一致）；其余端归离线推送/
+  // 角标，回前台不补弹横幅
   if (isAppInBackground()) {
+    // #ifdef APP-HARMONY
+    handleBackgroundNotification(obj);
+    // #endif
     return;
   }
   // 横幅组件只挂 4 个非消息 tab 页：非 tab 页（聊天页/二级页）不弹；
@@ -281,6 +329,7 @@ function handleNoticeMessage(payload: any): void {
   const senderIdRaw = obj["senderId"];
   const senderId = senderIdRaw != null ? `${senderIdRaw}` : "";
   if (myUserIdToken != currentToken()) cachedMyUserId = "";
+  if (cachedMyUserId.length == 0) hydrateMyUserIdFromStorage();
   if (cachedMyUserId.length == 0 || senderId.length == 0) {
     ensureMyUserId();
     return;
@@ -371,6 +420,68 @@ function handleNoticeMessage(payload: any): void {
   }
 }
 
+// ==================== App 后台系统本地通知（仅鸿蒙） ====================
+
+// #ifdef APP-HARMONY
+
+/**
+ * 后台新消息 → 系统本地通知。静默口径与前台横幅共用（myUserId 过滤 /
+ * sync-fallback 已在 handleNoticeMessage 前置 gate 完成）：
+ * - 自己多端同步消息不通知；myUserId 未就绪 fail-closed（下一条生效）
+ * - 免打扰且未 @我 → 不通知
+ * - 标题/摘要组装同横幅：单聊=发送者名（回落会话名）、群聊=会话名（回落发送者名）；
+ *   digest 服务端已带「发送者: 」前缀，不重复拼名
+ */
+function handleBackgroundNotification(obj: UTSJSONObject): void {
+  // 换 token（切账号）后旧 myUserId 失效，清空待重拉（同横幅分支）
+  const senderIdRaw = obj["senderId"];
+  const senderId = senderIdRaw != null ? `${senderIdRaw}` : "";
+  if (myUserIdToken != currentToken()) cachedMyUserId = "";
+  if (cachedMyUserId.length == 0) hydrateMyUserIdFromStorage();
+  if (cachedMyUserId.length == 0 || senderId.length == 0) {
+    ensureMyUserId();
+    return;
+  }
+  if (senderId == cachedMyUserId) {
+    return;
+  }
+  const convIdRaw = obj["convId"];
+  const convId = convIdRaw != null ? `${convIdRaw}` : "";
+  if (convId.length == 0) {
+    return;
+  }
+  // 免打扰会话且未 @到我 → 不通知（对齐横幅判据）
+  const convInfo = lookupConvInfo(convId);
+  if (convInfo != null && convInfo.dnd == true && isMentionedMe(obj) != true) {
+    return;
+  }
+  // ---- 组装通知 ----
+  const senderNameRaw = obj["senderName"];
+  const senderName = senderNameRaw != null ? `${senderNameRaw}` : "";
+  const digestRaw = obj["digest"];
+  let digest = digestRaw != null ? `${digestRaw}` : "";
+  let convType = 1;
+  let title = senderName;
+  if (convInfo != null) {
+    convType = convInfo.convType;
+    if (convInfo.convType == 1) {
+      title = senderName.length > 0 ? senderName : convInfo.displayName;
+    } else {
+      title = convInfo.displayName.length > 0 ? convInfo.displayName : senderName;
+    }
+  }
+  if (title.length == 0) {
+    title = t("Mobile.Message.noticeFallbackTitle");
+  }
+  if (digest.length == 0) {
+    digest = t("Mobile.Message.noticeFallbackDigest");
+  }
+  // 发鸿蒙系统通知（title/digest 组装完直接下发；点击路由见 imHarmonyNotify 头注）
+  publishImHarmonyNotify(title, digest, convId, convType);
+}
+
+// #endif
+
 function resetHideTimer(): void {
   // 局部承接再 clearTimeout：可变模块属性无法 smart cast 到 Number（Kotlin 并发限制）
   const timerId = hideTimerId;
@@ -402,8 +513,16 @@ export function bindImNoticeEvents(): void {
     return;
   }
   noticeEventsBound = true;
+  hydrateMyUserIdFromStorage();
   ensureMyUserId();
   refreshConvCache();
+  // 登录 token 写入后补拉：onLaunch 时未登录的预拉是空转（token 为空静默失败），
+  // 不补拉则登录后首条消息必被 myUserId fail-closed 吃掉（且 apiUserInfo 偶发失败时
+  // 会连续吃掉多条）。WS 同靠 IM_SESSION_READY 启动，补拉可与连接建立并行。
+  eventBus.on(`${IM_SESSION_READY}`, (_event: any) => {
+    ensureMyUserId();
+    refreshConvCache();
+  });
   // 零参函数直接当 EventCallback 传在 UTS→Kotlin 报 Unit≠EventCallback（error17），
   // 包箭头函数（同 App.uvue / imUnreadBadge 绑定写法）
   eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, (event: any) => {

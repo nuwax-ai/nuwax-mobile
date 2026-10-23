@@ -1,0 +1,106 @@
+import { hasLoginSession } from "@/utils/authSession";
+import { apiUserInfo } from "@/servers/account";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+import { peekLoginCheckPending, clearLoginCheckPending } from "@/utils/profileSetupGate";
+
+/**
+ * 新用户「取昵称+设头像」引导的触发判定（会话级，无本地存储）。
+ *
+ * 背景：注册默认 userName = user{userId}（user+数字），昵称为空时所有展示位
+ * （消息/通知/会话列表）都回落到这个默认账号名。本模块在登录进来后判断
+ * 「userName 仍是默认形态 且 昵称为空」→ 通知调用方弹引导窗。
+ *
+ * 产品口径（2026-10-21 确认）：
+ * - 弹窗内昵称、头像均可选，用户可随时关闭，不强制；
+ * - 无冷却——每次登录进来都做同样判断；设置过昵称后条件天然不满足，不再弹
+ *   （只设头像不设昵称的用户下次登录仍会弹，属预期）。
+ */
+
+/** 引导完成事件名（emit 必须带单载荷，eventBus 无参 emit 是 no-op）。 */
+export const PROFILE_SETUP_COMPLETED_EVENT = "profile_setup_completed";
+
+/** 后缀是否全为数字（UTS 端稳妥写法，不依赖正则）。 */
+function isAllDigits(s: string): boolean {
+  if (s.length == 0) {
+    return false;
+  }
+  for (let i = 0; i < s.length; i++) {
+    if ("0123456789".indexOf(s.charAt(i)) < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 默认 userName 判定：前缀 "user" + 纯数字后缀。
+ * 2026-10-21 真机实测样本 userName="user1792564071"（10 位数字）——★后缀不是
+ * getLoginInfo 返回的 id（那是 19 位雪花号），不能按 user{id} 全等匹配；
+ * 位数按数字特征宽松判定，不受后缀长度变化影响。
+ * 生成逻辑在 agent-platform 主后端（本机三仓均无此代码）。误判面仅剩
+ * 「用户真名恰好是 user+纯数字且从未设昵称」，最坏多弹一次可跳过的引导。
+ */
+export function needsProfileSetup(rawUser: UTSJSONObject): boolean {
+  const nick = rawUser["nickName"] != null ? `${rawUser["nickName"]}`.trim() : "";
+  if (nick.length > 0) {
+    return false;
+  }
+  const name = rawUser["userName"] != null ? `${rawUser["userName"]}`.trim() : "";
+  if (name.length <= 4) {
+    return false;
+  }
+  if (name.substring(0, 4) != "user") {
+    return false;
+  }
+  return isAllDigits(name.substring(4));
+}
+
+// ===== 状态机（模块级，仅剩在途去重；触发与否由 profileSetupGate 决定） =====
+
+/** apiUserInfo 在途去重（前后台切换 onShow 连发）。 */
+let checkInFlight = false;
+
+/**
+ * 检查一次是否需要弹引导：仅当「刚完成登录」（gate 标记置位，saveAccessToken
+ * 写新 token 时写入；冷启动由 App onLaunch 清除）才判定——满足「从登录页进来、
+ * 调了登录接口才弹」的口径，杀 App 重开（持久登录态）不再弹。
+ *
+ * 拉取失败 / 弹窗 ref 未就绪不清标记，下次 onShow 重试；判定完成（条件不满足
+ * 或弹窗已接手）清标记——同一次登录至多弹一次。
+ */
+export async function maybePromptProfileSetup(
+  onNeedsSetup: (rawUser: UTSJSONObject) => boolean,
+): Promise<void> {
+  if (checkInFlight) {
+    return;
+  }
+  if (peekLoginCheckPending() != true) {
+    return;
+  }
+  if (hasLoginSession() != true) {
+    return;
+  }
+  checkInFlight = true;
+  let raw: UTSJSONObject | null = null;
+  try {
+    const res = await apiUserInfo();
+    if (apiResCode(res) == SUCCESS_CODE) {
+      const data = apiResData<any>(res);
+      raw = data != null ? (data as UTSJSONObject) : null;
+    }
+  } catch (_e) {
+    // 静默：引导是增强体验，接口异常不该打扰
+  }
+  checkInFlight = false;
+  if (raw == null) {
+    return;
+  }
+  if (needsProfileSetup(raw) != true) {
+    clearLoginCheckPending();
+    return;
+  }
+  if (onNeedsSetup(raw)) {
+    clearLoginCheckPending();
+  }
+}

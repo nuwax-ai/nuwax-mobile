@@ -27,8 +27,9 @@ function imUnreadLog(msg: string): void {
 export const imUnreadCount: Ref<number> = ref<number>(0);
 
 /** 底部 tabBar 0 号槽（伙伴）角标值 = total（后端统一计算口径，客户端直接读）。
- *  历史：曾在客户端叠「会话未读 + 智联录待我处理申请数 + dndTotal」，后端统一计算
- *  口径（叠加项均折叠进 total）后全部移除，避免双计。 */
+ *  口径（后端 ImUnreadCounter）：total **不含免打扰会话**（静音群不顶角标），
+ *  dndTotal 单独返回；历史曾客户端叠「会话未读+申请数+dndTotal」，统一由后端
+ *  口径接管后全部移除，避免双计。 */
 export const imTabBadgeCount = computed((): number => imUnreadCount.value);
 
 /** TabBar 页面路由（与 pages.json tabBar.list 保持一致；imNoticeBar 横幅 gate 复用）。 */
@@ -116,12 +117,18 @@ function applyTabBarBadge(): void {
 
 /**
  * 刷新「消息」Tab 的 IM 未读徽标。
- * 角标值 = total（由后端统一计算：免打扰等口径已折叠进 total，客户端直接读）。
- * 历史：曾按 total + dndTotal 在客户端合成对齐飞书，后端统一计算口径后移除叠加。
+ * 角标值 = total（后端口径不含免打扰会话，客户端直接读；勿本地叠加/减算——
+ * read 回包 unreadCleared 含免打扰清零量，拿它减 total 会多减，见 imConvReadLocal）。
  */
 let badgeLoading = false;
 let badgeRefreshOwed = false;
 let badgeRevision = 0;
+/** 静默失败补拉 timer（一次失败 1.5s 后补一发；成功即复位预算）。 */
+let badgeRetryTimer: number | null = null;
+/** 本失败周期补拉预算已用：重试再失败不续补（下一条 WS 帧 / onShow 拉成功后复位）。
+ *  原版失败即止会让 tabbar 停旧值直到下一事件，网关瞬断 / 网络切换窗口内丢的
+ *  unread-total 无自愈；有限补一发兜住瞬态失败，不与持续故障共振。 */
+let badgeRetryUsed = false;
 
 export async function refreshImUnreadBadge(): Promise<void> {
   if (isAppInBackground()) return;
@@ -153,6 +160,14 @@ export async function refreshImUnreadBadge(): Promise<void> {
     if (stamp != getImSessionStamp() || revision != badgeRevision) return;
     if (apiResCode(response) != SUCCESS_CODE) {
       imUnreadLog(`unread-total 接口非成功码: ${apiResCode(response)}`);
+      // 静默失败补拉一次（自引用回调同 scheduleShowRefresh 先例）
+      if (badgeRetryTimer == null && !badgeRetryUsed && !isAppInBackground()) {
+        badgeRetryUsed = true;
+        badgeRetryTimer = setTimeout((): void => {
+          badgeRetryTimer = null;
+          refreshImUnreadBadge();
+        }, 1500);
+      }
       return;
     }
     const dataRaw = apiResData<any>(response);
@@ -169,13 +184,23 @@ export async function refreshImUnreadBadge(): Promise<void> {
     imUnreadLog(`unread-total total=${total} count=${count} degraded=${degraded}`);
     imUnreadCount.value = count;
     applyTabBarBadge();
+    // 任一次成功刷新复位补拉预算（新失败周期重新可用；degraded 也是权威结果）
+    badgeRetryUsed = false;
   } catch (_error) {
-    // 未读数刷新失败时保留上一次徽标。
+    // 未读数刷新失败时保留上一次徽标；补拉一次兜瞬态失败（同非成功码分支）
+    if (badgeRetryTimer == null && !badgeRetryUsed && !isAppInBackground()) {
+      badgeRetryUsed = true;
+      badgeRetryTimer = setTimeout((): void => {
+        badgeRetryTimer = null;
+        refreshImUnreadBadge();
+      }, 1500);
+    }
   } finally {
     badgeLoading = false;
     if (badgeRefreshOwed) {
       badgeRefreshOwed = false;
-      scheduleWsRefresh();
+      // 欠账=并发合并（onShow 撞在途等），非 WS 风暴：立即补拉，不再吃 1s 去抖
+      refreshImUnreadBadge();
     }
   }
 }
@@ -184,6 +209,10 @@ export async function refreshImUnreadBadge(): Promise<void> {
 export function clearImUnreadBadge(): void {
   badgeRevision += 1;
   badgeRefreshOwed = false;
+  badgeRetryUsed = false;
+  const retryTimer = badgeRetryTimer;
+  if (retryTimer != null) clearTimeout(retryTimer);
+  badgeRetryTimer = null;
   const timer = wsRefreshTimer;
   if (timer != null) clearTimeout(timer);
   wsRefreshTimer = null;

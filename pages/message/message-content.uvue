@@ -46,10 +46,12 @@
       <!-- 消息 tab：会话列表（组件化 Stage 4 抽出 conv-list-pane；长按浮层期间
            direction=none 锁滚动、行测量经组件 measureRow/$callMethod + row-rect 上抛） -->
       <swiper-item>
+        <!-- loading 喂首拉加载态（convInitialLoading）而非在途标志 convLoading：
+             空表后的静默刷新不回闪「加载中」，首拉前的间隙帧也不闪「暂无消息」 -->
         <conv-list-pane
           ref="convPaneRef"
           :conversations="conversations"
-          :loading="convLoading"
+          :loading="convInitialLoading"
           :failed="convFailed"
           :loading-more="convLoadingMore"
           :has-more="convHasMore"
@@ -263,6 +265,19 @@
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { refreshImUnreadBadge, clearImUnreadBadge } from "@/utils/imUnreadBadge";
+  import { consumeConvReadMark } from "@/utils/im/imConvReadLocal";
+  // 伙伴页列表缓存（SWR）：进页先水合缓存秒出，网络回包整表替换后回写
+  import {
+    clearImListCache,
+    readImContactsCache,
+    readImConvCache,
+    readImGroupsCache,
+    readImSpacesCache,
+    saveImContactsCache,
+    saveImConvCache,
+    saveImGroupsCache,
+    saveImSpacesCache,
+  } from "@/utils/im/imListCache";
   // 会话草稿（微信式）：聊天页未发文案，列表摘要行显示「[草稿]xxx」
   import { getChatDraft, chatDraftRecency, chatDraftsVersion } from "@/utils/im/chatDrafts";
   import { initImWsClient, stopImWsClient } from "@/utils/im/imWsClient";
@@ -632,6 +647,17 @@
   const convScrollAnchor = ref<string>("");
   const RETAP_LOCATE_MAX_PAGES = 5;
   let retapLocating = false;
+
+  /** 会话列表首拉加载态：首拉尚未成功（convLoaded）期间的在途请求，或「请求还没
+   *  发出也还没失败」的间隙帧（loadConversations 守卫早退 / 刷新去抖窗）——进页
+   *  先见「加载中」而非闪「暂无消息」。★整个表达式以 convLoaded != true 为前提：
+   *  成功加载过一次后本值恒 false，静默刷新（WS 推送 / 回页 onShow 去抖）在途也
+   *  不回闪加载态，空表保持「暂无消息」等回包落表（首版写成 convLoading || (…)
+   *  漏了这层约束，登录后 WS 同步刷新照样二闪）。失败态显示不变；手点/自动重试
+   *  起手即复位 convFailed（loadConversations），重试在途仍显示加载中。 */
+  const convInitialLoading = computed<boolean>(
+    (): boolean => convLoaded.value != true && (convLoading.value || convFailed.value != true),
+  );
 
   // ===== 通讯录状态 =====
   const acceptedContacts = ref<ImContactRow[]>([]);
@@ -1049,6 +1075,17 @@
     if (directAvatar && row.avatarUrl.length > 0 && !isRemoteSvgUrl(row.avatarUrl)) {
       row.avatarDisplay = row.avatarUrl;
     }
+    // 整表 reload 重建行对象时，SVG 行（上方被排除）与 directAvatar=false 行的
+    // avatarDisplay 首帧为空 → image 节点按 v-if 卸载，缓存回填要等 50ms 去抖
+    // 整表重建才重挂（鸿蒙新节点上屏又慢一拍）＝进页/回页可见闪烁。构造期同步
+    // 命中页面级正缓存（resolvedIconCache 注释声称的语义在此落地），首帧即带
+    // 展示地址、节点复用不卸载。失败态由 avatarFailed 继承拦截，不受此影响。
+    if (row.avatarDisplay.length == 0 && row.avatarUrl.length > 0) {
+      const cachedDisplay = resolvedIconCache.get(row.avatarUrl);
+      if (cachedDisplay != null) {
+        row.avatarDisplay = cachedDisplay;
+      }
+    }
     // unreadCount：服务端没算时键整个不存在（非 0），整表刷新下只能按 0 展示。
     row.unreadCount = readNumber(obj, "unreadCount", 0);
     row.lastMsgAt = readNumber(obj, "lastMsgAt", 0);
@@ -1213,8 +1250,10 @@
 
   // ===== 会话列表首拉失败有限自动重试（头像解析同款配方）：冷启动网络栈未稳 /
   //       IM 网关瞬态 5xx 不该把用户晾在「加载失败」——列表仍空时延迟重试，连续
-  //       失败封顶后停（保留手点重试与 onShow 自愈）。有数据的静默刷新失败不
-  //       重试（列表仍在屏，onShow/WS 路径自会再刷）。=====
+  //       失败封顶后停（保留手点重试与 onShow 自愈）。有数据的静默刷新失败原版
+  //       失败即止——行未读/排序的权威值只能等下一条 WS 帧或 onShow 补，WS 丢帧
+  //       叠加网关瞬断时列表长期停旧值；现补一次 1.5s 延迟重试（见
+  //       scheduleConvSilentRetry），重试再失败不续（防与网关故障共振成小风暴）。=====
   let convLoadRetryTimer = 0;
   let convLoadRetryCount = 0;
   const MAX_CONV_LOAD_RETRIES = 2;
@@ -1236,6 +1275,36 @@
         return;
       }
       const runner = convLoadRetryRunner;
+      if (runner != null) runner();
+    }, 1500);
+  }
+
+  /** 静默刷新失败补拉 timer（与首拉重试互斥：空表失败归首拉管，不双发）。 */
+  let convSilentRetryTimer = 0;
+  /** 本失败周期补拉预算已用（任一次成功刷新即复位）：重试再失败不续补。 */
+  let convSilentRetryUsed = false;
+
+  /** 有数据时的静默刷新失败（WS 帧 500ms 去抖 / onShow 刷新等）1.5s 后补拉一次：
+   *  行未读数的权威值只在 conversations 回包里，失败即止会停旧值到下一事件；
+   *  补拉走 convRefreshRunner（loadConversations），loading 在途/废弃守卫齐全。 */
+  function scheduleConvSilentRetry(): void {
+    if (convSilentRetryTimer != 0 || convSilentRetryUsed) {
+      return;
+    }
+    if (conversations.value.length == 0) {
+      return;
+    }
+    convSilentRetryUsed = true;
+    convSilentRetryTimer = setTimeout(() => {
+      convSilentRetryTimer = 0;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) {
+        return;
+      }
+      // 恰有刷新在途：放弃本发（在途回包成败自有后续路径；再失败不再补）
+      if (convLoading.value) {
+        return;
+      }
+      const runner = convRefreshRunner;
       if (runner != null) runner();
     }, 1500);
   }
@@ -1285,6 +1354,7 @@
       if (apiResCode(res) != SUCCESS_CODE) {
         convFailed.value = true;
         scheduleConvLoadRetry();
+        scheduleConvSilentRetry();
         return;
       }
       conversations.value = parseConvRecords(res);
@@ -1293,10 +1363,15 @@
       convHasMore.value = nextCursor.value.length > 0;
       convLoaded.value = true;
       convLoadRetryCount = 0;
+      // 静默补拉预算随任一次成功刷新复位（新失败周期重新可用）
+      convSilentRetryUsed = false;
+      // 列表缓存回写（首页 records 原文 + nextCursor；同串跳写，翻页不写）
+      saveImConvCache(res);
     } catch (_error) {
       convLoading.value = false;
       convFailed.value = true;
       scheduleConvLoadRetry();
+      scheduleConvSilentRetry();
     } finally {
       if (convRefreshOwed) scheduleConvRefresh();
     }
@@ -1329,7 +1404,17 @@
       const rows = parseConvRecords(res);
       // 追加后整表重排：新页里带草稿/置顶的行不能滞留表尾（分区不变式跨页成立）
       const merged: ImConvRow[] = copyRows(conversations.value);
+      // convId 去重：缓存水合的 nextCursor 可能落后服务端头，翻页会带回已展示行
+      //（服务端游标边界重复同防），重复行直接跳过
+      const seen = new Set<string>();
+      for (let i = 0; i < conversations.value.length; i++) {
+        seen.add(conversations.value[i].convId);
+      }
       for (let i = 0; i < rows.length; i++) {
+        if (seen.has(rows[i].convId)) {
+          continue;
+        }
+        seen.add(rows[i].convId);
         merged.push(rows[i]);
       }
       conversations.value = reorderConvRows(merged);
@@ -1411,6 +1496,8 @@
       assignContactFallbacks(pendingInContacts.value);
       assignContactFallbacks(pendingOutContacts.value);
       contactLoaded.value = true;
+      // 列表缓存回写（全量 items 原文 + degraded/truncated）
+      saveImContactsCache(res);
     } catch (_error) {
       contactLoading.value = false;
       contactFailed.value = true;
@@ -1447,6 +1534,8 @@
       resolveConvRowsIcons(myGroups.value);
       assignConvFallbacks(myGroups.value);
       groupsLoaded.value = true;
+      // 列表缓存回写（records 原文 + total）
+      saveImGroupsCache(res);
     } catch (_error) {
       groupsLoading.value = false;
     }
@@ -1495,6 +1584,8 @@
       assignSpaceFallbacks(mySpaces.value);
       spaceTotal.value = rows.length;
       spacesLoaded.value = true;
+      // 列表缓存回写（全量 items 原文）
+      saveImSpacesCache(res);
     } catch (_error) {
       spacesLoading.value = false;
     }
@@ -1511,6 +1602,110 @@
     workGateBlocked.value = true;
     stopImWsClient();
     clearImUnreadBadge();
+  }
+
+  // ===== 列表缓存水合（stale-while-revalidate，imListCache.uts）=====
+  // 命中即整表落对应 ref 并置 loaded：加载态随之切到「静默刷新」语义
+  //（convInitialLoading 等 computed 恒 false，不闪「加载中」），随后 loadXxx 回包
+  // 整表替换为服务端真值（无合并逻辑）。守卫照抄 loadXxx + 已有数据早退（幂等）。
+
+  function hydrateConversationsFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (convLoaded.value || conversations.value.length > 0) return;
+    const cached = readImConvCache();
+    if (cached == null) return;
+    const rows: ImConvRow[] = [];
+    for (let i = 0; i < cached.records.length; i++) {
+      rows.push(readConvRow(cached.records[i], true));
+    }
+    conversations.value = reorderConvRows(rows);
+    resolveConvRowsIcons(conversations.value);
+    assignConvFallbacks(conversations.value);
+    // 翻页游标一并水合：水合态下上滑直接续翻（陈旧 cursor 带回的重复行由
+    // loadMoreConversations 的 convId 去重挡掉），刷新成功即被服务端真值重置
+    nextCursor.value = cached.nextCursor;
+    convHasMore.value = cached.nextCursor.length > 0;
+    convLoaded.value = true;
+  }
+
+  function hydrateContactsFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (contactLoaded.value || acceptedContacts.value.length > 0 || pendingInContacts.value.length > 0 || pendingOutContacts.value.length > 0) return;
+    const cached = readImContactsCache();
+    if (cached == null) return;
+    const accepted: ImContactRow[] = [];
+    const pendingIn: ImContactRow[] = [];
+    const pendingOut: ImContactRow[] = [];
+    for (let i = 0; i < cached.items.length; i++) {
+      const row = readContactRow(cached.items[i]);
+      if (row.status == 2) {
+        pendingIn.push(row);
+      } else if (row.status == 3) {
+        pendingOut.push(row);
+      } else {
+        accepted.push(row);
+      }
+    }
+    acceptedContacts.value = accepted;
+    pendingInContacts.value = pendingIn;
+    pendingOutContacts.value = pendingOut;
+    contactDegraded.value = cached.degraded;
+    contactTruncated.value = cached.truncated;
+    // 展示名索引重建 + 会话行联动（对齐 loadContacts 成功路径：索引供会话行
+    // displayConvName 读，Android 方法绑定不收集依赖须换行身份刷新）
+    if (rebuildContactNameIndex(acceptedContacts.value)) {
+      conversations.value = copyRows(conversations.value);
+    }
+    resolveContactRowsIcons(acceptedContacts.value);
+    resolveContactRowsIcons(pendingInContacts.value);
+    resolveContactRowsIcons(pendingOutContacts.value);
+    assignContactFallbacks(acceptedContacts.value);
+    assignContactFallbacks(pendingInContacts.value);
+    assignContactFallbacks(pendingOutContacts.value);
+    contactLoaded.value = true;
+  }
+
+  function hydrateGroupsFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (groupsLoaded.value || myGroups.value.length > 0) return;
+    const cached = readImGroupsCache();
+    if (cached == null) return;
+    const rows: ImConvRow[] = [];
+    for (let i = 0; i < cached.records.length; i++) {
+      if (isDisbandedConvRecord(cached.records[i])) {
+        continue;
+      }
+      rows.push(readConvRow(cached.records[i], false));
+    }
+    myGroups.value = rows;
+    // total 实测 -1=未统计，回落本页条数（parseGroupRecords 同款口径）
+    groupTotal.value = cached.total > 0 ? cached.total : rows.length;
+    resolveConvRowsIcons(myGroups.value);
+    assignConvFallbacks(myGroups.value);
+    groupsLoaded.value = true;
+  }
+
+  function hydrateSpacesFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (spacesLoaded.value || mySpaces.value.length > 0) return;
+    const cached = readImSpacesCache();
+    if (cached == null) return;
+    const rows: ImSpaceRow[] = [];
+    for (let i = 0; i < cached.items.length; i++) {
+      const row = readSpaceRow(cached.items[i]);
+      if (row.spaceId.length > 0) {
+        rows.push(row);
+      }
+    }
+    mySpaces.value = rows;
+    spaceTotal.value = rows.length;
+    resolveSpaceRowsIcons(mySpaces.value);
+    assignSpaceFallbacks(mySpaces.value);
+    spacesLoaded.value = true;
   }
 
   /** 页面 onLoad 闸门：缓存优先、缺失拉一次租户配置；放行后补跑首拉（原 onLoad 直调的两个 load）。 */
@@ -1530,7 +1725,10 @@
       initImWsClient();
       refreshImUnreadBadge();
     }
-    // onShow 复查可能已抢先解锁并补拉过（loadXxx 自带 loading 去重，重复调用无害）
+    // 先水合再首拉：缓存命中秒出列表（加载态直接进静默刷新语义），网络照常整表替换
+    //（onShow 复查可能已抢先解锁并补拉过：loadXxx 自带 loading 去重，水合已有数据早退，重复调用无害）
+    hydrateConversationsFromCache();
+    hydrateContactsFromCache();
     loadConversations();
     loadContacts();
   }
@@ -1546,15 +1744,20 @@
     if (rowMenuVisible.value) {
       rowMenuVisible.value = false;
     }
-    // 智联录懒加载：联系人已随页面首拉（tab 角标需要「待我处理」数据），群组/团队首次切入时拉取
+    // 智联录懒加载：联系人已随页面首拉（tab 角标需要「待我处理」数据），群组/团队首次切入时拉取。
+    // 各分支先水合再照常 load（条件进 body 时已定，水合命中也不跳过请求）＝SWR：
+    // 缓存秒出 + 静默刷新；水合失败/未命中则与原行为完全一致。
     if (tab == "contact") {
       if (contactLoaded.value != true) {
+        hydrateContactsFromCache();
         loadContacts();
       }
       if (groupsLoaded.value != true) {
+        hydrateGroupsFromCache();
         loadGroups();
       }
       if (spacesLoaded.value != true) {
+        hydrateSpacesFromCache();
         loadSpaces();
       }
     }
@@ -1930,12 +2133,15 @@
     }
   }
 
-  /** 进入消息详情页：携带会话基础信息（名称/头像 encodeURIComponent，详情页容错解码）。 */
+  /** 进入消息详情页：携带会话基础信息（名称/头像 encodeURIComponent，详情页容错解码）。
+   *  unread=点击时行未读数快照（天然在清零前），>0 时详情页定位首条未读+水位清零；
+   *  其余入口（通知栏/加好友等）不带该参 → 详情页走现状贴底。 */
   function openConversation(conv: ImConvRow): void {
     const chatUrl =
       `/pages/message/chat?convId=${conv.convId}&convType=${conv.convType}` +
       `&name=${encodeURIComponent(displayConvName(conv))}` +
-      `&avatar=${encodeURIComponent(conv.avatarUrl)}`;
+      `&avatar=${encodeURIComponent(conv.avatarUrl)}` +
+      `&unread=${conv.unreadCount}`;
     uni.navigateTo({ url: chatUrl });
   }
 
@@ -3043,6 +3249,24 @@
 
   }
 
+  /** 消费本端 read 标记（imConvReadLocal）：read 回包 unreadCleared 本地清行角标。
+   *  来源端收不到自己的 CONV_UNREAD 帧（deviceId 排除），后端回显 unreadCleared 就是
+   *  为来源端本地清红点设计的；行口径含免打扰，advanced=true 时置 0/按量减恒对，
+   *  权威值由 onShow 300ms 去抖的 loadConversations 回包覆盖纠正。
+   *  克隆换身份仅重渲该行（同 handleImConvUnread 机制，不吃整表重排）。 */
+  function applyPendingConvReadMark(): void {
+    const mark = consumeConvReadMark();
+    if (mark == null) return;
+    if (!mark.caughtUp && mark.cleared <= 0) return;
+    const existing = findConvRowById(mark.convId);
+    if (existing == null || existing.unreadCount <= 0) return;
+    const idx = conversations.value.indexOf(existing);
+    if (idx < 0) return;
+    const updated = cloneConvRow(existing);
+    updated.unreadCount = mark.caughtUp ? 0 : Math.max(0, existing.unreadCount - mark.cleared);
+    conversations.value.splice(idx, 1, updated);
+  }
+
   function handleImConvUpdated(payload: any): void {
     if (payload == null) {
       return;
@@ -3107,6 +3331,9 @@
     if (convLoadRetryTimer != 0) clearTimeout(convLoadRetryTimer);
     convLoadRetryTimer = 0;
     convLoadRetryCount = 0;
+    if (convSilentRetryTimer != 0) clearTimeout(convSilentRetryTimer);
+    convSilentRetryTimer = 0;
+    convSilentRetryUsed = false;
     if (iconResolveRetryTimer != 0) clearTimeout(iconResolveRetryTimer);
     iconResolveRetryTimer = 0;
     iconResolveRetryCount = 0;
@@ -3124,6 +3351,8 @@
     myGroups.value = [];
     mySpaces.value = [];
     clearMessageUiResources();
+    // 列表缓存同清：登出/换账号/切域名不串号（信封账号 tag 校验兜底）
+    clearImListCache();
   };
 
   onLoad((_options: any) => {
@@ -3225,15 +3454,20 @@
     messagePageVisible = true;
     setCurrentPageNavigationBarTitle();
     refreshImUnreadBadge();
+    // 本端刚读过的会话：read 回包 unreadCleared 本地清行角标（不等 300ms 去抖全量刷新）
+    applyPendingConvReadMark();
     // 闸门缓存复查（同步读，开销可忽略）：登录页/其他 Tab 拉租户配置会写缓存，
     // 授权态翻转就地生效——撤销即停 WS 清角标，恢复即解锁补首拉
     if (isWorkCommercialBlockedSync()) {
       applyWorkGateBlocked();
     } else if (workGateBlocked.value && !workGatePending.value) {
       // 授权恢复：解除拦截 + 重启 WS（stop 曾置 manualClosed，需 init 复位）+ 补角标与首拉
+      //（blocked 期间从未拉过、表为空，先水合缓存秒出再补拉——与 initWorkGate 同款 SWR）
       workGateBlocked.value = false;
       initImWsClient();
       refreshImUnreadBadge();
+      hydrateConversationsFromCache();
+      hydrateContactsFromCache();
       loadConversations();
       loadContacts();
     }

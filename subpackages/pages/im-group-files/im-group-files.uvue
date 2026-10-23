@@ -30,11 +30,6 @@
       </view>
     </view>
 
-    <!-- 数据范围说明：文件只来自本窗口已加载的消息（产品语义，见 utils/imChatAttachments） -->
-    <view class="gf-hint">
-      <text class="gf-hint__text">{{ t("Mobile.Message.filesLoadedHint") }}</text>
-    </view>
-
     <!-- 横滑切页（directional-pager，已读状态页/全局搜索同款）：禁 swiper 原生跟手
          拖动、由 tracker 判向整页跳一档，避免与列表纵向滚动抢手势（斜滑不劫持）。
          懒挂载：首次点击或横拖预览（@preview）时才挂对应 pane，各 tab 滚动位置
@@ -52,9 +47,14 @@
         <im-file-pane
           v-if="kindMounted('all')"
           :files="paneFiles[0]"
+          :loading="filesLoading"
+          :error="filesError"
+          :has-more="filesHasMore"
+          :auto-stopped="filesAutoStopped"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
+          @loadolder="loadOlderFromUi"
           @resolved="onThumbResolved"
         />
       </swiper-item>
@@ -62,9 +62,14 @@
         <im-file-pane
           v-if="kindMounted('image')"
           :files="paneFiles[1]"
+          :loading="filesLoading"
+          :error="filesError"
+          :has-more="filesHasMore"
+          :auto-stopped="filesAutoStopped"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
+          @loadolder="loadOlderFromUi"
           @resolved="onThumbResolved"
         />
       </swiper-item>
@@ -72,9 +77,14 @@
         <im-file-pane
           v-if="kindMounted('file')"
           :files="paneFiles[2]"
+          :loading="filesLoading"
+          :error="filesError"
+          :has-more="filesHasMore"
+          :auto-stopped="filesAutoStopped"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
+          @loadolder="loadOlderFromUi"
           @resolved="onThumbResolved"
         />
       </swiper-item>
@@ -82,9 +92,14 @@
         <im-file-pane
           v-if="kindMounted('video')"
           :files="paneFiles[3]"
+          :loading="filesLoading"
+          :error="filesError"
+          :has-more="filesHasMore"
+          :auto-stopped="filesAutoStopped"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
+          @loadolder="loadOlderFromUi"
           @resolved="onThumbResolved"
         />
       </swiper-item>
@@ -92,9 +107,14 @@
         <im-file-pane
           v-if="kindMounted('audio')"
           :files="paneFiles[4]"
+          :loading="filesLoading"
+          :error="filesError"
+          :has-more="filesHasMore"
+          :auto-stopped="filesAutoStopped"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
+          @loadolder="loadOlderFromUi"
           @resolved="onThumbResolved"
         />
       </swiper-item>
@@ -107,9 +127,20 @@
 
   import { ref, computed } from "vue";
   import { onLoad } from "@dcloudio/uni-app";
-  import { extOf, getChatAttachments, urlExtOf } from "@/utils/imChatAttachments";
+  import {
+    classifyKind,
+    extOf,
+    isUsableUrl,
+    isValidKind,
+    readNumber,
+    readString,
+    urlExtOf,
+  } from "@/utils/imChatAttachments";
+  import { apiImConvFiles } from "@/servers/im";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
   import DirectionalPager from "@/components/directional-pager/directional-pager.uvue";
-  import { GfFile } from "@/components/im-file-pane/gf-models";
+  import { GfFile, gfCanPreviewUrl } from "@/components/im-file-pane/gf-models";
   import {
     fetchAuthProtectedFileAkUrl,
     isAuthProtectedFileUrl,
@@ -118,7 +149,6 @@
     resolveAuthProtectedFileFetchUrl,
   } from "@/utils/authProtectedFileUrl";
   import { getApiBaseUrl } from "@/constants/config";
-  import { handleExternalLink } from "@/utils/system";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
@@ -300,8 +330,8 @@
     return md;
   }
 
-  /** 次行说明：发送人 · 大小 · 时间（缺失项自动跳过）。 */
-  function buildMeta(senderName: string, size: number, sendTime: number): string {
+  /** 次行左段：发送人 · 大小（缺失项自动跳过；过长由 UI 省略，不挤右侧时间）。 */
+  function buildSub(senderName: string, size: number): string {
     const parts: string[] = [];
     if (senderName.length > 0) {
       parts.push(senderName);
@@ -310,36 +340,132 @@
     if (sizeText.length > 0) {
       parts.push(sizeText);
     }
-    const timeText = formatTime(sendTime);
-    if (timeText.length > 0) {
-      parts.push(timeText);
-    }
     return parts.join(" · ");
   }
 
+  // ===== 数据源：服务端全量分页（对齐 PC ChatFilesPanel / DEV-300） =====
+  // 此前聚合聊天页「已加载消息」的窗口附件缓存（要找更早的文件得先回消息往上翻），
+  // 现改走 GET /conversations/{convId}/files：服务端按会话检索附件行（新→旧），
+  // 首屏拉一页、滚到底自动翻更早，覆盖会话全部消息。
+
+  /** 每页拉多少条原始消息（服务端 clamp 到 [20,100]；附件行可能多于消息数）。 */
+  const PAGE_SIZE = 20;
   /**
-   * 读聊天窗口已加载消息的附件快照（同步、无网络请求）：聊天页首屏 + 往上翻过的
-   * 每一页都会写入共享缓存（utils/imChatAttachments），这里按 convId 取投影渲染；
-   * 缓存非本会话（如 H5 刷新后直达本页）返回空数组 → 空态。
-   * 图片缩略图的解析/loading/失败态由行内 im-file-thumb 组件自理。
+   * 空页自动续拉保险丝：「空页 + hasMore=true」合法（整页消息全被撤回/清空过滤），
+   * 须续拉但要有上限，否则游标不推进的服务端 bug 会把端上变成请求泵；
+   * 50 页 = 至少 1000 条消息无一附件才触顶，触顶后如实给「继续查找」入口。
    */
-  function loadFiles(): void {
-    const atts = getChatAttachments(convId.value);
-    const out: GfFile[] = [];
-    for (let i = 0; i < atts.length; i++) {
-      const a = atts[i];
-      const f = new GfFile();
-      f.key = a.key;
-      f.kind = a.kind;
-      f.url = a.url;
-      f.fileName = a.fileName;
-      f.size = a.size;
-      f.senderName = a.senderName;
-      f.sendTime = a.sendTime;
-      f.metaText = buildMeta(a.senderName, a.size, a.sendTime);
-      out.push(f);
+  const MAX_AUTO_PAGES = 50;
+
+  const filesLoading = ref<boolean>(false);
+  const filesError = ref<boolean>(false);
+  /** 初始 true：首屏失败后的「点击重试」靠它放行（同 PC 无缓存先给 true 的理由）。 */
+  const filesHasMore = ref<boolean>(true);
+  const filesAutoStopped = ref<boolean>(false);
+
+  /** 翻页游标 = 上一页 nextCursor（本页最小 seq 的字符串形态）；空串 = 首页。只被请求链读写，不绑模板。 */
+  let filesCursor = "";
+  /** 请求在途闸门（scrolltolower/重试点按会连发）。非 reactive，模板不绑。 */
+  let filesInflight = false;
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  /**
+   * 服务端附件行（ConvFileDto）→ 面板行 GfFile。口径与 PC convFileItemsOf 对齐：
+   * url 过 isUsableUrl 闸门（服务端透传 ≠ 可信，不合法不入列）；kind 认不出按
+   * mime/扩展名重分类（比 PC 归 file 更准，与聊天页收集路径同款）；key = msgId#index。
+   */
+  function toGfFile(rec: UTSJSONObject): GfFile | null {
+    const url = readString(rec, "url");
+    if (!isUsableUrl(url)) {
+      return null;
     }
-    files.value = out;
+    const kindRaw = readString(rec, "kind");
+    const f = new GfFile();
+    f.key = `${readString(rec, "msgId")}#${readNumber(rec, "index", 0)}`;
+    // kind=file 再按扩展名重判（视频发送契约修正前的老消息 kind=file 的 .mp4/.mp3
+    // 归位 video/audio，行图标与 tab 分组一致）；image/video/audio 尊重服务端 kind
+    f.kind = isValidKind(kindRaw) && kindRaw != "file" ? kindRaw : classifyKind("", url);
+    f.url = url;
+    f.fileName = readString(rec, "fileName");
+    f.size = readNumber(rec, "size", 0);
+    f.senderName = readString(rec, "senderName");
+    f.sendTime = readNumber(rec, "sendTime", 0);
+    f.subText = buildSub(f.senderName, f.size);
+    f.timeText = formatTime(f.sendTime);
+    return f;
+  }
+
+  /**
+   * 从当前游标往更早翻，直到拿到非空一页 / 翻完 / 触 MAX_AUTO_PAGES 保险丝。
+   * 兼任三条路径：首屏（onLoad，游标空串）、滚到底续翻、失败重试（含首屏失败——
+   * hasMore 初始 true 放行）。列表新→旧为服务端 seq DESC 原序，只追加不排序。
+   */
+  async function loadOlder(): Promise<void> {
+    if (convId.value.length == 0 || filesInflight || !filesHasMore.value) {
+      return;
+    }
+    filesInflight = true;
+    filesLoading.value = true;
+    filesError.value = false;
+    filesAutoStopped.value = false;
+    let pages = 0;
+    try {
+      while (pages < MAX_AUTO_PAGES) {
+        pages += 1;
+        const res = await apiImConvFiles(convId.value, filesCursor, PAGE_SIZE);
+        if (apiResCode(res) != SUCCESS_CODE) {
+          throw new Error("convFiles api error");
+        }
+        const dataRaw = apiResData<any>(res);
+        if (dataRaw == null) {
+          throw new Error("convFiles empty data");
+        }
+        const dataObj = dataRaw as UTSJSONObject;
+        filesHasMore.value = readBool(dataObj, "hasMore");
+        filesCursor = readString(dataObj, "nextCursor");
+        const recordsRaw = dataObj["records"];
+        const records = recordsRaw != null ? (recordsRaw as UTSJSONObject[]) : ([] as UTSJSONObject[]);
+        // 追加去重（key=msgId#index，防服务端边界重叠），整表替换数组写入
+        const seen = new Set<string>();
+        const next = [] as GfFile[];
+        for (let i = 0; i < files.value.length; i++) {
+          seen.add(files.value[i].key);
+          next.push(files.value[i]);
+        }
+        let appended = 0;
+        for (let i = 0; i < records.length; i++) {
+          const f = toGfFile(records[i]);
+          if (f == null || seen.has(f.key)) {
+            continue;
+          }
+          seen.add(f.key);
+          next.push(f);
+          appended += 1;
+        }
+        files.value = next;
+        // 空页 + hasMore：合法形态，自动续拉；拿到非空页或翻完即停
+        if (appended > 0 || !filesHasMore.value) {
+          break;
+        }
+      }
+      if (pages >= MAX_AUTO_PAGES && filesHasMore.value) {
+        filesAutoStopped.value = true;
+      }
+    } catch (_e) {
+      filesError.value = true;
+    } finally {
+      filesInflight = false;
+      filesLoading.value = false;
+    }
+  }
+
+  /** 模板事件入口（pane scrolltolower / 失败重试 / 继续查找点按）：转异步不等待。 */
+  function loadOlderFromUi(): void {
+    loadOlder();
   }
 
   // ===== 预览（站内 webview 打开平台预览网关页，对齐 Web 端「开新窗预览」语义） =====
@@ -382,36 +508,6 @@
         uni.hideLoading();
         uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
       });
-  }
-
-  /** 行点击：图片放大预览（优先用缩略图组件已解析的展示地址），其余 /api/f/ 受保护链接「打开页面」，普通链接统一外链打开。 */
-  function handleFileTap(f: GfFile): void {
-    if (f.url.length == 0) {
-      return;
-    }
-    if (f.kind == "image") {
-      const resolved = resolvedThumbs.get(f.url);
-      if (resolved != null && resolved.length > 0) {
-        uni.previewImage({ urls: [resolved], current: resolved });
-        return;
-      }
-      // 缩略图还没解析出来（解析中/失败）：退回带凭证「打开页面」看原图
-      if (isAuthProtectedFileUrl(f.url)) {
-        openAuthProtectedLinkUrl(f.url).catch((_e: any | null) => {
-          uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
-        });
-        return;
-      }
-      uni.previewImage({ urls: [f.url], current: f.url });
-      return;
-    }
-    if (isAuthProtectedFileUrl(f.url)) {
-      openAuthProtectedLinkUrl(f.url).catch((_e: any | null) => {
-        uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
-      });
-      return;
-    }
-    handleExternalLink(f.url, f.fileName);
   }
 
   // ===== 下载（★真下载语义，不再是「打开资源」） =====
@@ -496,6 +592,42 @@
     // #endif
   }
 
+  /**
+   * 行点击（整卡可点，与右缘两个按钮并行的快捷入口）：
+   * - 图片 → 放大预览（优先用缩略图组件已解析的展示地址）；
+   * - 预览网关支持的类型 → 走「预览」按钮同一链路；
+   * - 其余（zip/doc 等网关不认的）→ 走「下载」按钮同一链路。
+   * ★不再走「受保护直开页面 / 外链打开」旧路径——那条链路在真机上常无可见反馈，
+   *   用户感知就是「条目点不动」；统一到按钮同款动作后每次点击都有明确响应。
+   * ★定义在 handleDownload 之后：UTS→Kotlin 先用后定义会报「找不到名称」（error18）。
+   */
+  function handleFileTap(f: GfFile): void {
+    if (f.url.length == 0) {
+      return;
+    }
+    if (f.kind == "image") {
+      const resolved = resolvedThumbs.get(f.url);
+      if (resolved != null && resolved.length > 0) {
+        uni.previewImage({ urls: [resolved], current: resolved });
+        return;
+      }
+      // 缩略图还没解析出来（解析中/失败）：退回带凭证「打开页面」看原图
+      if (isAuthProtectedFileUrl(f.url)) {
+        openAuthProtectedLinkUrl(f.url).catch((_e: any | null) => {
+          uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+        });
+        return;
+      }
+      uni.previewImage({ urls: [f.url], current: f.url });
+      return;
+    }
+    if (gfCanPreviewUrl(f.url)) {
+      handlePreview(f);
+      return;
+    }
+    handleDownload(f);
+  }
+
   function handleBack(): void {
     const pages = getCurrentPages();
     if (pages.length <= 1) {
@@ -509,7 +641,7 @@
     convId.value = readOption(options, "convId");
     const title = readOption(options, "title");
     titleText.value = title.length > 0 ? title : t("Mobile.Message.groupFiles");
-    loadFiles();
+    loadOlderFromUi();
   });
 </script>
 
@@ -615,23 +747,7 @@
     font-weight: 600;
   }
 
-  /* ===== 数据范围说明（灰小字左对齐，tab 行与列表之间） ===== */
-  .gf-hint {
-    flex-shrink: 0;
-    padding: 4px 16px 0;
-    display: flex;
-    flex-direction: row;
-    justify-content: flex-start;
-  }
-
-  .gf-hint__text {
-    font-size: 11px;
-    line-height: 16px;
-    color: #9a98a5;
-    text-align: left;
-  }
-
-  /* pager 占据页头/hint 之外的剩余空间（directional-pager 自带 flex:1/height:0，
+  /* pager 占据页头/tab 之外的剩余空间（directional-pager 自带 flex:1/height:0，
      同已读状态页 .rs-body 叠加写法）；行级样式已随列表移入 im-file-pane。 */
   .gf-body {
     flex: 1;

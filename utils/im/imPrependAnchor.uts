@@ -1,20 +1,45 @@
 // #ifdef APP-ANDROID
 import ViewTreeObserver from "android.view.ViewTreeObserver";
+import View from "android.view.View";
+// #endif
 
+/**
+ * 翻页头部插入的阅读位置守卫（微信式锚定）：数据 merge 前安装，锚点行视口相对位置恒定。
+ * 校正时机与滚动读写按平台分流：
+ * - Android：onPreDraw 绘制前原生补偿（零闪烁）。原生视图 UniScrollerView 系 DCloud
+ *   NestedScrollView（标准 mScrollY 滚动），getScrollY/scrollTo 同帧同步生效；勿改回
+ *   uni 元素 scrollTop 属性读写（桥接异步，曾致补偿打折、视口落在加载页中间）。
+ * - iOS：rAF 轮询（下次重绘前契约）+ UIScrollView.contentOffset 原生写。
+ * - H5/WEB：rAF 轮询 + 元素 scrollTop。
+ * - 鸿蒙：元素级 scrollTo/scrollTop 无实现且页面模板捕获已顶 255 硬限（不可绑
+ *   scroll-top 属性），返回 null 由调用方走 scroll-into-view settle 兜底（顶部对齐，
+ *   误差≤upper-threshold；后续若放开捕获预算可升级 getHarmonyController 原生通道）。
+ * 校正窗口 1000ms，覆盖图片/文件等异步高度变化的后续布局；稳定两拍即停。
+ */
+
+// #ifdef APP-ANDROID
 /** 在原生布局完成、第一帧绘制之前补偿头部插入，避免先显示新页再跳回。 */
 class PrependDrawAnchor implements ViewTreeObserver.OnPreDrawListener {
   body: UniElement;
   anchor: UniElement;
+  view: View;
   observer: ViewTreeObserver;
-  contentTop: number;
+  offset0: number;
   timer: number = 0;
   stopped: boolean = false;
 
-  constructor(body: UniElement, anchor: UniElement, observer: ViewTreeObserver) {
+  constructor(body: UniElement, anchor: UniElement, view: View, observer: ViewTreeObserver) {
     this.body = body;
     this.anchor = anchor;
+    this.view = view;
     this.observer = observer;
-    this.contentTop = anchor.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop;
+    // 锚点内容偏移基线（原生 scrollY 为当前真值，读取同步）。
+    this.offset0 = this.anchorTop() + this.view.getScrollY();
+  }
+
+  /** 锚点距视口顶偏移（不含滚动量）。 */
+  anchorTop(): number {
+    return this.anchor.getBoundingClientRect().top - this.body.getBoundingClientRect().top;
   }
 
   stop(): void {
@@ -29,18 +54,90 @@ class PrependDrawAnchor implements ViewTreeObserver.OnPreDrawListener {
 
   override onPreDraw(): boolean {
     if (this.stopped) return true;
-    const contentTop = this.anchor.getBoundingClientRect().top - this.body.getBoundingClientRect().top + this.body.scrollTop;
-    const delta = contentTop - this.contentTop;
+    const cur = this.anchorTop() + this.view.getScrollY();
+    const delta = cur - this.offset0;
     if (Math.abs(delta) < 0.5) return true;
-    // 提示行移除与消息插入可能分两次布局；持续到本次短窗口结束。
-    this.contentTop = contentTop;
-    this.body.scrollTop = Math.max(0, this.body.scrollTop + delta);
-    // 本次只修正偏移，下次绘制直接呈现保留的位置。
-    this.body.getAndroidView()?.invalidate();
+    // 基线重定到实测值：补偿后内容偏移即为其，后续绘制 delta 归零（用户滚动不改变
+    // 内容偏移，不会被对抗；只有布局变化才会）。原生 scrollTo 同帧生效，下次绘制
+    // 直接呈现保留的位置。提示浮层与消息插入可能分两次布局，持续到窗口结束。
+    this.offset0 = cur;
+    this.view.scrollTo(0, Math.max(0, this.view.getScrollY() + delta).toInt());
+    this.view.invalidate();
     return false;
   }
 }
 // #endif
+
+/**
+ * rAF 守卫（iOS/H5 共用）：
+ * 不变量=锚点「内容偏移」（anchorTop + 滚动值）——用户滚动不改变内容偏移故不与用户对抗，
+ * 头部插入等布局变化使其抬升即触发校正（滚动值 += 抬升量，锚点回到原视口位置）。
+ * 写入落位等待（settling）：写后须等 readY 追上写入值才能继续判漂移/判稳，防异步
+ * 生效窗口内重复补偿（iOS/H5 原生/属性写同步落位，等待至多白耗一拍，无副作用）。
+ * 稳定两拍即停；1000ms 硬窗兜底（页面隐藏 rAF 不触发时防守卫滞留）。
+ */
+function startRafAnchorLoop(
+  body: UniElement,
+  anchor: UniElement,
+  readY: () => number,
+  writeY: (y: number) => void,
+): () => void {
+  const anchorTop = (): number => anchor.getBoundingClientRect().top - body.getBoundingClientRect().top;
+  let target = anchorTop() + readY();
+  const startAt = Date.now();
+  let rafId = 0;
+  let stable = 0;
+  let settling = false;
+  let lastWriteY = 0;
+  let stopped = false;
+  const stop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    if (rafId != 0) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+  };
+  const tick = (): void => {
+    if (stopped) return;
+    if (Date.now() - startAt >= 1000) {
+      stop();
+      return;
+    }
+    if (settling) {
+      // 上次写入尚未被滚动回调反映：等落位（期间不判漂移，防重复补偿）。
+      if (Math.abs(readY() - lastWriteY) >= 0.5) {
+        stable = 0;
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+      settling = false;
+    }
+    const cur = anchorTop() + readY();
+    const drift = cur - target;
+    if (Math.abs(drift) < 0.5) {
+      // 连续两拍稳定才收工（图片等异步高度变化的二次布局留一拍缓冲）。
+      stable++;
+      if (stable >= 2) {
+        stop();
+        return;
+      }
+    } else {
+      stable = 0;
+      settling = true;
+      // 基线重定到写入后的内容偏移；写入目标 = 当前滚动 + 抬升量。
+      target = cur;
+      lastWriteY = Math.max(0, readY() + drift);
+      writeY(lastWriteY);
+    }
+    rafId = requestAnimationFrame(tick);
+  };
+  rafId = requestAnimationFrame(tick);
+  setTimeout((): void => {
+    stop();
+  }, 1000);
+  return stop;
+}
 
 export function preserveImPrependAnchor(bodyId: string, anchorId: string): (() => void) | null {
   // #ifdef APP-ANDROID
@@ -50,13 +147,48 @@ export function preserveImPrependAnchor(bodyId: string, anchorId: string): (() =
   const view = body.getAndroidView();
   if (view == null) return null;
   const observer = view.getViewTreeObserver();
-  const guard = new PrependDrawAnchor(body, anchor, observer);
+  const guard = new PrependDrawAnchor(body, anchor, view, observer);
   observer.addOnPreDrawListener(guard);
   // 无新增记录、请求结果重复等路径同样释放监听。
-  guard.timer = setTimeout(() => { guard.stop(); }, 1000);
-  return (): void => { guard.stop(); };
+  guard.timer = setTimeout((): void => {
+    guard.stop();
+  }, 1000);
+  return (): void => {
+    guard.stop();
+  };
   // #endif
-  // #ifndef APP-ANDROID
+  // #ifdef APP-IOS
+  const iosBody = uni.getElementById(bodyId);
+  const iosAnchor = uni.getElementById(anchorId);
+  if (iosBody != null && iosAnchor != null) {
+    const sv = iosBody.getIOSView() as UIScrollView | null;
+    return startRafAnchorLoop(
+      iosBody,
+      iosAnchor,
+      (): number => {
+        if (sv != null) return sv.contentOffset.y;
+        return iosBody.scrollTop;
+      },
+      (y: number): void => {
+        if (sv != null) sv.contentOffset = CGPointMake(0, y);
+        else iosBody.scrollTop = y;
+      },
+    );
+  }
+  // #endif
+  // #ifdef H5 || WEB
+  const webBody = uni.getElementById(bodyId);
+  const webAnchor = uni.getElementById(anchorId);
+  if (webBody != null && webAnchor != null) {
+    return startRafAnchorLoop(
+      webBody,
+      webAnchor,
+      (): number => webBody.scrollTop,
+      (y: number): void => {
+        webBody.scrollTop = y;
+      },
+    );
+  }
+  // #endif
   return null;
-  // #endif
 }

@@ -88,10 +88,7 @@
       @touchend="handlePageTouchEnd($event)"
       @touchcancel="handlePageTouchEnd($event)"
     >
-      <view v-if="loadingOlder" class="chat-foot">
-        <text class="chat-foot__text">{{ t("Mobile.Page.loadingMore") }}</text>
-      </view>
-      <view v-else-if="listSettled && messages.length > 0 && hasMore != true && showGroupWelcome != true" class="chat-foot">
+      <view v-if="listSettled && messages.length > 0 && hasMore != true && showGroupWelcome != true && loadingOlder != true" class="chat-foot">
         <text class="chat-foot__text">{{ t("Mobile.Message.noMore") }}</text>
       </view>
 
@@ -731,6 +728,12 @@
       <!-- 底部锚点：scroll-into-view 定位用 -->
       <view id="chat-bottom" class="chat-bottom-anchor" />
     </scroll-view>
+
+    <!-- 翻页加载浮层：悬浮于列表顶部、不占布局——出现/消失零位移，翻页锚定只须补偿
+         「插入消息」这一次高度变化（原内嵌 chat-foot 会造成两次位移；微信同款观感） -->
+    <view v-if="loadingOlder" class="chat-loading-top">
+      <text class="chat-loading-top__text">{{ t("Mobile.Page.loadingMore") }}</text>
+    </view>
 
     <!-- 「回到底部」浮钮：滚上去看历史时出现（白圆底双下箭头），点击滚到最新并消失；
          不设 z-index——底部面板槽/展开蒙层按 DOM 序与层级自然盖住；多选态隐藏 -->
@@ -7152,8 +7155,73 @@
   }
 
 
+  /** 翻页锚点行：视口内第一条可见行（rect 判定，微信式锚定取用户正在看的行）；
+      upper-threshold=50 故至多扫前几行；测量失败退回列表首行。 */
+  function firstVisibleRowKey(): ImMsgRow {
+    const body = uni.getElementById("im-chat-body");
+    if (body != null) {
+      const bodyTop = body.getBoundingClientRect().top;
+      const scan = Math.min(messages.value.length, 5);
+      for (let i = 0; i < scan; i++) {
+        const row = messages.value[i];
+        const el = uni.getElementById(`msg-${row.msgId}`);
+        if (el == null) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.top + rect.height > bodyTop + 2) {
+          return row;
+        }
+      }
+    }
+    return messages.value[0];
+  }
+
+  /**
+   * 向上翻页专用头部插入（Anchor Position Restoration 第 3 步）：
+   * 不整表替换——既有行对象引用与 key 一律不动，新行按升序原位插入表头。
+   * ★接口返回即正序（旧→新；后端 listHistory 已 DESC→ASC 反转，2026-10-24 真机日志
+   *   实证 records[0].seq < records[last].seq），必须按原序遍历——首版误按降序倒遍历，
+   *   整页插反致表头变成该页最新一条，翻页游标（列表首行 seq）错位，下一页 19/20
+   *   重复被去重丢弃，表现为「一次只加载很少的数据」。末尾按 seq 排序兜底防契约再变。
+   * 边界行重复按 msgId 去重防御。
+   */
+  function prependHistoryRecords(records: UTSJSONObject[]): boolean {
+    if (!isChatCurrent()) return false;
+    if (records.length == 0) return false;
+    const existing = new Set<string>();
+    for (let i = 0; i < messages.value.length; i++) {
+      existing.add(messages.value[i].msgId);
+    }
+    const fresh: ImMsgRow[] = [];
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i];
+      if (record == null || readString(record, "convId") != convId.value) continue;
+      const msgId = readString(record, "msgId");
+      if (msgId.length == 0 || existing.has(msgId)) continue;
+      existing.add(msgId);
+      fresh.push(readMsgRow(record));
+    }
+    fresh.sort((a: ImMsgRow, b: ImMsgRow): number => a.seq - b.seq);
+    if (fresh.length == 0) return false;
+    // 诊断探针（短页排查，验证后删）：客户端丢弃计数（msgId 重复/convId 不符）
+    if (fresh.length < records.length) {
+      console.error(`[ImHistory] prepend appended=${fresh.length} dropped=${records.length - fresh.length}`);
+    }
+    // 尾起逐条 unshift：表头按升序就位；local 占位行恒在尾部不受扰。
+    for (let i = fresh.length - 1; i >= 0; i--) {
+      messages.value.unshift(fresh[i]);
+    }
+    for (let i = 0; i < fresh.length; i++) {
+      resolveRowMedia(fresh[i]);
+    }
+    preloadChatVideos();
+    reportReadAuto();
+    return true;
+  }
+
   /** 首屏 + 向上翻页共用：beforeSeq<=0 取最新一页，否则取 seq<beforeSeq 的更早一页。 */
   async function loadHistory(beforeSeq: number, preserveAnchor: string = ""): Promise<void> {
+    // 诊断探针（短页排查，验证后删）：请求参数
+    console.error(`[ImHistory] req convId=${convId.value} beforeSeq=${beforeSeq} limit=${MSG_PAGE_SIZE}`);
     const res = await apiImMessages(convId.value, beforeSeq, MSG_PAGE_SIZE);
       if (!isChatCurrent()) return;
     if (apiResCode(res) != SUCCESS_CODE) {
@@ -7168,13 +7236,30 @@
       const recordsRaw = dataObj["records"];
       if (recordsRaw != null) {
         const records = recordsRaw as UTSJSONObject[];
+        // 诊断探针（短页排查，验证后删）：响应摘要——fetched<limit 看服务端（按人删除后置过滤/
+        // 边界），fetched 正常但上屏少看 prepend dropped 那行
+        if (records.length > 0) {
+          const firstRec = records[0];
+          const lastRec = records[records.length - 1];
+          console.error(`[ImHistory] resp fetched=${records.length} hasMore=${hasMore.value} firstSeq=${readNumber(firstRec, "seq", 0)} lastSeq=${readNumber(lastRec, "seq", 0)}`);
+        } else {
+          console.error(`[ImHistory] resp fetched=0 hasMore=${hasMore.value}`);
+        }
         // 翻页的消息与锚点同批提交，不能先渲染新增的顶部消息，再 nextTick 拉回。
+        // 守卫：Android 原生 preDraw 补偿 / iOS·H5 rAF 轮询（精确回位）；鸿蒙元素滚动 API
+        // 缺口 + 模板捕获顶限（255 硬限）不可绑 scroll-top，走 scroll-into-view 兜底——
+        // 必须用 settle 惯用法等布局完成再落锚（同 flush 设值会在新内容布局前应用、落在旧偏移）。
         if (preserveAnchor.length > 0 && isChatActive()) {
           releasePrependAnchor();
           cancelPrependAnchor = preserveImPrependAnchor("im-chat-body", preserveAnchor);
-          if (cancelPrependAnchor == null) scrollAnchor.value = preserveAnchor;
+          if (cancelPrependAnchor == null) scrollToAnchorWithSettle(preserveAnchor);
         }
-        mergeSyncedMessages(records);
+        if (beforeSeq > 0) {
+          // 翻页：头部原位插入，既有行引用/key 不动（锚定与 keyed DOM 复用的前提）。
+          prependHistoryRecords(records);
+        } else {
+          mergeSyncedMessages(records);
+        }
         // 首屏（beforeSeq<=0）成功后写消息缓存：下次进页先渲染再静默同步
         if (beforeSeq <= 0 && records.length > 0) {
           setCachedChatRecords(convId.value, records);
@@ -7195,8 +7280,10 @@
     if (hasMore.value != true || messages.value.length == 0) {
       return;
     }
-    // beforeSeq = 当前列表最小 seq；记录首行 id 供翻页后锚回原位
-    const firstKey = messages.value[0].msgId;
+    // beforeSeq = 当前列表最小 seq（翻页游标，仍取列表首行）；
+    // 锚点行=视口内第一条可见行（微信式：守卫保持用户正在看的行，而非列表首行）
+    const anchorRow = firstVisibleRowKey();
+    const firstKey = anchorRow.msgId;
     const oldestSeq = messages.value[0].seq;
     entryFollowLatest = false;
     cancelSettle();
@@ -12941,6 +13028,27 @@
   /* 双箭头叠影：下枚上提与上枚错叠出「快进到底」双箭头观感 */
   .chat-jump-latest__arrow--lower {
     margin-top: -9px;
+  }
+
+  /* 翻页加载浮层：顶部居中小胶囊（absolute 悬浮、零布局位移） */
+  .chat-loading-top {
+    position: absolute;
+    top: 8px;
+    left: 0;
+    right: 0;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    pointer-events: none;
+  }
+
+  .chat-loading-top__text {
+    font-size: 11px;
+    line-height: 16px;
+    color: #b0aebc;
+    background-color: rgba(255, 255, 255, 0.9);
+    border-radius: 10px;
+    padding: 3px 10px;
   }
 
   .chat-foot {

@@ -1,0 +1,348 @@
+/**
+ * IM 会话消息同步编排（Phase3，《消息存储与同步改造方案》§10）。
+ *
+ * 职责边界：本模块只做「网络 ↔ imMsgDb」的编排与一致性守卫；UI 窗口更新在
+ * 聊天页（P4）订阅处完成。唯一网络依赖通过 ImHistoryFetcher 注入（单测可换）。
+ *
+ * 进会话 syncImConvOnEnter（常规路径 1 次请求）：
+ *   1. 拉服务端权威尾页（最新 PAGE 条）；响应缺 records 键=形态不符按失败处理
+ *      （不动本地），不与「真空页」混淆
+ *   2. tail 比对：本地在服务端窗口内的行若 msgId 缺失 ⇒ 按人删除/清空残留 → 剔除
+ *   3. upsert 尾页（撤回/编辑由 revision 守卫就地纠正——3004/3005 不产生新 seq，
+ *      增量不会重投，尾页权威值是窗口内唯一自愈源）
+ *   4. 空洞检测：尾页最小 seq > 本地水位+1 且本地有数据 ⇒ 断线久了，用历史接口
+ *      从尾页最小 seq 向回翻页回填到本地水位（上限 GAP_MAX_PAGES 防请求泵）
+ *   5. 真空页（records 键在但为空）且本地有缓存 ⇒ 会话被清空/全部按人删除，
+ *      服务端权威失效 → 整会话剔库并置 wiped（UI 同步清窗）
+ *
+ * 翻页 fetchImConvHistoryPage：本地优先；本地不足且库称还有更多才走 HTTP 权威页
+ * →落库→返回。hasMore 落库口径（撤销 Phase1 补丁既定语义）：建窗/翻到顶采用响应
+ * 值；尾部刷新与 WS 到达传 null 不动（true 不许被尾部刷新翻回 false，反向只随
+ * 翻到顶响应发生）。
+ *
+ * /sync 汇聚 applyImConvSyncResult：conversations[].clearBeforeSeq 是清空记录
+ * 水位的唯一权威载体（清空无 WS 推送）；messages 批按各自 convId 分发落库。
+ * 挂在现有 runSyncFallback（WS 重连补拉）结果处调用即可，零新增连接。
+ */
+
+import {
+  getImMsgDbMeta,
+  loadImMsgDbBefore,
+  hasImMsgDbBelow,
+  upsertImMsgDbMessages,
+  removeImMsgDbMessages,
+  applyImMsgDbClearBefore,
+  setImMsgDbHasMore,
+  dropImMsgDbConversation,
+} from "./imMsgDb";
+
+const ENTER_PAGE = 20
+const GAP_MAX_PAGES = 50
+
+/**
+ * 历史接口取页器（chat.uvue 注入 apiImMessages 封装；单测注入假实现）。
+ * 返回响应 data 对象（{records, hasMore}），失败/异常返回 null。
+ */
+export type ImHistoryFetcher = (convId: string, beforeSeq: number, limit: number) => Promise<UTSJSONObject | null>
+
+export type ImConvSyncOutcome = {
+  /** 权威尾页记录（含与本地重复行；UI 走既有 merge 去重）。网络失败返回 null。 */
+  records: UTSJSONObject[]
+  /** tail 比对剔除的本地行（UI 需同步从窗口移除）。 */
+  removedMsgIds: string[]
+  /** 本次是否实际触网（本地空库建窗也算）。 */
+  usedNetwork: boolean
+  /** 服务端权威尾页为空但本地有缓存 ⇒ 缓存整体失效（清空/全删），已剔库。 */
+  wiped: boolean
+}
+
+export type ImConvHistoryPage = {
+  records: UTSJSONObject[]
+  usedNetwork: boolean
+  /** 翻页继续判据（DB 水位口径）。 */
+  hasMoreLocal: boolean
+  /** HTTP 请求失败/形态不符（本地残页兜底时仍为 true——首屏空列表据此走失败态）。 */
+  httpFailed: boolean
+}
+
+function readNum(obj: UTSJSONObject, key: string, def: number): number {
+  const v = obj[key]
+  if (v == null) return def
+  if (typeof v == "number") return v as number
+  return def
+}
+
+function readStr(obj: UTSJSONObject, key: string): string {
+  const v = obj[key]
+  if (v == null) return ""
+  if (typeof v == "string") return v as string
+  return ""
+}
+
+function readBool(obj: UTSJSONObject, key: string, def: boolean): boolean {
+  const v = obj[key]
+  if (v == null) return def
+  if (typeof v == "boolean") return v as boolean
+  return def
+}
+
+/** 解包响应 data：{records: UTSJSONObject[], hasMore: boolean}。调用方已保证 records 键存在。 */
+function parsePage(dataObj: UTSJSONObject | null): UTSJSONObject[] {
+  if (dataObj == null) return []
+  const raw = dataObj["records"]
+  if (raw == null) return []
+  return raw as UTSJSONObject[]
+}
+
+function pageHasMore(dataObj: UTSJSONObject | null): boolean {
+  if (dataObj == null) return false
+  return readBool(dataObj, "hasMore", false)
+}
+
+function rowSeq(rec: UTSJSONObject): number {
+  return readNum(rec, "seq", 0)
+}
+
+function minSeqOf(records: UTSJSONObject[]): number {
+  let m = Number.MAX_SAFE_INTEGER
+  for (let i = 0; i < records.length; i++) {
+    const s = rowSeq(records[i])
+    if (s > 0 && s < m) m = s
+  }
+  return m
+}
+
+/**
+ * tail 权威比对：本地位于服务端窗口 [minSeq, maxSeq] 内的行，msgId 不在服务端
+ * 集合中 ⇒ 该行已被按人删除（或清空残留）→ 从本地剔除并返回 id 列表。
+ * 窗口外的本地行不动（深历史残留是服务端无 fanout 的已知边界，方案风险 A1）。
+ */
+export function tailCompareImConv(uid: string, convId: string, serverRecords: UTSJSONObject[]): string[] {
+  if (serverRecords.length == 0) return []
+  let minSeq = Number.MAX_SAFE_INTEGER
+  let maxSeq = 0
+  const serverIds = new Set<string>()
+  for (let i = 0; i < serverRecords.length; i++) {
+    const s = rowSeq(serverRecords[i])
+    if (s > 0 && s < minSeq) minSeq = s
+    if (s > maxSeq) maxSeq = s
+    const mid = readStr(serverRecords[i], "msgId")
+    if (mid.length > 0) serverIds.add(mid)
+  }
+  if (maxSeq == 0) return []
+  // 本地窗口内行：loadBefore(maxSeq+1, 窗口+余量) 再按下界过滤；窗口内本地行
+  // 超出余量属极端 seq 稀疏场景，容忍漏剔（下次进会话或 /sync 收敛）
+  const localRows = loadImMsgDbBefore(uid, convId, maxSeq + 1, ENTER_PAGE * 4)
+  if (localRows == null) return []
+  const doomed = new Set<string>()
+  const out: string[] = []
+  for (let i = 0; i < localRows.length; i++) {
+    const s = rowSeq(localRows[i])
+    if (s < minSeq) continue
+    const mid = readStr(localRows[i], "msgId")
+    // 同扫同收（Set 去重、数组保序）：免 Set.forEach（Android 无先例）
+    if (mid.length > 0 && !serverIds.has(mid) && !doomed.has(mid)) {
+      doomed.add(mid)
+      out.push(mid)
+    }
+  }
+  if (out.length == 0) return []
+  const removed = removeImMsgDbMessages(uid, convId, doomed)
+  if (removed == 0) return []
+  return out
+}
+
+/**
+ * 通用落库口（WS 3002 / 发送确认 / 历史页 / 尾页共用）：
+ * upsert + hasMore 合并（null=不动；false 只在翻到顶响应时传入）。
+ * 返回生效条数。
+ */
+export function persistImConvRecords(uid: string, convId: string, records: UTSJSONObject[], hasMore: boolean | null): number {
+  const applied = upsertImMsgDbMessages(uid, convId, records)
+  if (hasMore != null) {
+    // 探针（定位「提前没有更多」毒化页用，验证后删）：显式 hasMore 写点仅建窗/网络页两处
+    console.error(`[ImHasMore] persist convId=${convId} rows=${records.length} hasMore=${(hasMore as boolean) ? "true" : "false"}`)
+    setImMsgDbHasMore(uid, convId, hasMore as boolean)
+  }
+  return applied
+}
+
+/**
+ * /sync 结果汇聚（挂在 WS 重连补拉 runSyncFallback 的结果处）：
+ * conversations[].clearBeforeSeq 应用 + messages 批落库（按 convId 分发）。
+ * 消息批是跨会话扁平列表，逐条按自身 convId 聚合后整批 upsert（避免逐条重建段）。
+ */
+export function applyImConvSyncResult(uid: string, syncData: UTSJSONObject | null): void {
+  if (syncData == null || uid.length == 0) return
+  const convsRaw = syncData["conversations"]
+  if (convsRaw != null) {
+    const convs = convsRaw as UTSJSONObject[]
+    for (let i = 0; i < convs.length; i++) {
+      const c = convs[i]
+      if (c == null) continue
+      const cid = readStr(c, "convId")
+      if (cid.length == 0) continue
+      const cb = readNum(c, "clearBeforeSeq", 0)
+      if (cb > 0) applyImMsgDbClearBefore(uid, cid, cb)
+    }
+  }
+  // /sync 原生键 messages；WS 事件桥批次转发用 records（imWsClient runSyncFallback）
+  const msgsRaw = syncData["messages"] != null ? syncData["messages"] : syncData["records"]
+  if (msgsRaw != null) {
+    const msgs = msgsRaw as UTSJSONObject[]
+    const byConv = new Map<string, UTSJSONObject[]>()
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i]
+      if (m == null) continue
+      const cid = readStr(m, "convId")
+      if (cid.length == 0) continue
+      let arr = byConv.get(cid)
+      if (arr == null) {
+        const created: UTSJSONObject[] = []
+        byConv.set(cid, created)
+        arr = created
+      }
+      (arr as UTSJSONObject[]).push(m)
+    }
+    byConv.forEach((records: UTSJSONObject[], cid: string): void => {
+      upsertImMsgDbMessages(uid, cid, records)
+    })
+  }
+}
+
+/**
+ * 进会话同步（方案 §10.1/§10.5）。网络失败返回 null（UI 维持本地数据，
+ * 断网可继续浏览已缓存历史——验收项）。
+ */
+export async function syncImConvOnEnter(uid: string, convId: string, fetcher: ImHistoryFetcher): Promise<ImConvSyncOutcome | null> {
+  // uid 未就绪（冷启动用户信息失败）：降级纯网络同步，不碰库（键会以空 uid 污染命名空间）
+  const useDb = uid.length > 0
+  const meta = useDb ? getImMsgDbMeta(uid, convId) : null
+  let dataObj: UTSJSONObject | null = null
+  try {
+    dataObj = await fetcher(convId, 0, ENTER_PAGE)
+  } catch (_e) {
+    dataObj = null
+  }
+  if (dataObj == null) return null
+  if (dataObj["records"] == null) return null // 形态不符按失败处理，不动本地
+  const records = parsePage(dataObj)
+  if (records.length == 0) {
+    // 真空页：会话对我无可见消息。本地若有缓存 ⇒ 清空/全删的权威失效 → 剔库
+    if (meta != null) {
+      dropImMsgDbConversation(uid, convId)
+      const outcome: ImConvSyncOutcome = { records: [], removedMsgIds: [], usedNetwork: true, wiped: true }
+      return outcome
+    }
+    const outcome: ImConvSyncOutcome = { records: [], removedMsgIds: [], usedNetwork: true, wiped: false }
+    return outcome
+  }
+  const removed = meta != null ? tailCompareImConv(uid, convId, records) : []
+  const localLatest = meta != null ? meta.latestSeq : 0
+  if (!useDb) {
+    // 纯网络：只把权威尾页交 UI merge，库操作与回填全跳过
+    const outcome: ImConvSyncOutcome = { records: records, removedMsgIds: [], usedNetwork: true, wiped: false }
+    return outcome
+  }
+  if (meta == null) {
+    // 建窗：采用响应 hasMore
+    persistImConvRecords(uid, convId, records, pageHasMore(dataObj))
+  } else {
+    persistImConvRecords(uid, convId, records, null)
+    // 空洞回填：断线期间缺口（尾页最旧 seq 仍新于本地水位+1）
+    const pageMin = minSeqOf(records)
+    if (localLatest > 0 && pageMin > localLatest + 1) {
+      let cursor = pageMin
+      for (let page = 0; page < GAP_MAX_PAGES; page++) {
+        let gapObj: UTSJSONObject | null = null
+        try {
+          gapObj = await fetcher(convId, cursor, ENTER_PAGE)
+        } catch (_e) {
+          gapObj = null
+        }
+        if (gapObj == null) break
+        if (gapObj["records"] == null) break
+        const gapRecords = parsePage(gapObj)
+        if (gapRecords.length == 0) break
+        persistImConvRecords(uid, convId, gapRecords, null)
+        const nextMin = minSeqOf(gapRecords)
+        if (nextMin <= localLatest + 1 || nextMin >= cursor) break
+        cursor = nextMin
+        if (!pageHasMore(gapObj)) break
+      }
+    }
+  }
+  // 到顶闩自愈：库称已无更多但存量非零 —— hasMore 可能被某次网络页响应提前毒化成
+  // false（翻页足页/残页两分支都会透传关闸，UI 从此不再触网，深历史被永久锁死）。
+  // 以本地最旧 seq 为游标做一次 limit=1 探测：服务端确有更早 ⇒ 探测行落库并解锁；
+  // 确实到顶/探测失败 ⇒ 维持 false（下次进会话再证）。真到顶代价 = 每次重进一条空探测。
+  if (meta != null && meta.hasMore != true && meta.total > 0) {
+    let verifyObj: UTSJSONObject | null = null
+    try {
+      verifyObj = await fetcher(convId, meta.oldestSeq, 1)
+    } catch (_e) {
+      verifyObj = null
+    }
+    if (verifyObj != null && verifyObj["records"] != null) {
+      const probe = parsePage(verifyObj)
+      if (probe.length > 0) {
+        persistImConvRecords(uid, convId, probe, null)
+        setImMsgDbHasMore(uid, convId, true)
+      }
+    }
+  }
+  const outcome: ImConvSyncOutcome = { records: records, removedMsgIds: removed, usedNetwork: true, wiped: false }
+  return outcome
+}
+
+/**
+ * 翻页取数（P4 用）：本地优先。本地该窗足页 → 直接返回（usedNetwork=false）；
+ * 本地不足且库称还有更多（或无库）→ HTTP 权威页 → 落库 → 返回。本地与服务端
+ * 都到头 → 残页/空页 + hasMoreLocal=false；网络失败但有残页 → 残页兜底。
+ */
+export async function fetchImConvHistoryPage(
+  uid: string,
+  convId: string,
+  beforeSeq: number,
+  limit: number,
+  fetcher: ImHistoryFetcher,
+): Promise<ImConvHistoryPage> {
+  // uid 未就绪：纯网络翻页（本地读与落库全跳过）
+  const useDb = uid.length > 0
+  const local = useDb ? loadImMsgDbBefore(uid, convId, beforeSeq, limit) : null
+  const meta = useDb ? getImMsgDbMeta(uid, convId) : null
+  if (local != null && local.length >= limit) {
+    // 闸门=「本页之下仍有可展示内容」：服务端还有更多（meta）∨ DB 本页之下仍有
+    // 缓存行。hasMore=false 只断言服务端在库底之下无更早——不能闸死已缓存的深历史
+    // （重进只装尾窗，若被闸死则一次 loadHistory 都不会发，库底之上全部不可见）。
+    const gate = (meta != null ? meta.hasMore : true) || hasImMsgDbBelow(uid, convId, rowSeq(local[0]))
+    const page: ImConvHistoryPage = { records: local, usedNetwork: false, hasMoreLocal: gate, httpFailed: false }
+    return page
+  }
+  if (meta != null && meta.hasMore != true) {
+    // 本地已翻到头（且服务端也到头）：返回残页或空
+    const page: ImConvHistoryPage = { records: local != null ? local : [], usedNetwork: false, hasMoreLocal: false, httpFailed: false }
+    return page
+  }
+  let dataObj: UTSJSONObject | null = null
+  try {
+    dataObj = await fetcher(convId, beforeSeq, limit)
+  } catch (_e) {
+    dataObj = null
+  }
+  if (dataObj == null || dataObj["records"] == null) {
+    // 网络失败/形态不符但有本地残页：仍可展示（断网翻页体验）
+    const page: ImConvHistoryPage = { records: local != null ? local : [], usedNetwork: false, hasMoreLocal: meta != null ? meta.hasMore : true, httpFailed: true }
+    return page
+  }
+  const records = parsePage(dataObj)
+  if (useDb) {
+    persistImConvRecords(uid, convId, records, pageHasMore(dataObj))
+  }
+  if (records.length == 0) {
+    const page: ImConvHistoryPage = { records: local != null ? local : [], usedNetwork: true, hasMoreLocal: false, httpFailed: false }
+    return page
+  }
+  const page: ImConvHistoryPage = { records: records, usedNetwork: true, hasMoreLocal: pageHasMore(dataObj), httpFailed: false }
+  return page
+}

@@ -1,0 +1,847 @@
+/**
+ * IM 消息本地库（Phase2：分段键 storage 实现，《消息存储与同步改造方案》P2）
+ *
+ * 分层：UI 不触本模块；SyncManager（P3）是唯一写编排方；本模块只做存储与查询。
+ *
+ * 核心设计：
+ * - 只存服务端 records 原文（UTSJSONObject），渲染交给页面 readMsgRow 管线；
+ *   不存 ImMsgRow 运行态（媒体解析地址/blob 态跨进程必失效）。
+ * - 分段键 =「会话 × seq 区间」页：翻页按键寻址读一段（毫秒级），排序过滤由
+ *   键序 + 段内自然序完成，绝不整表读内存再 filter/sort（方案 §6/§9 硬要求）。
+ * - meta 键持水位与段索引：latestSeq/oldestSeq/hasMore/clearBeforeSeq/segs[{a,b,n}]。
+ * - 写入一律幂等：同 msgId 按 revision=max(editTime,revokeTime) 高者胜
+ *   （旧编辑不覆盖新编辑、撤回不可被旧快照复活）；同 clientMsgId 允许确认替换。
+ * - 单会话落盘上限 CAP_ROWS(2000)：超限整段淘汰最旧（DB 是缓存不是真相源，
+ *   方案决策点②；「10万条」验收归 SQLite 升级轨道）。
+ * - 单键体积上限 SEG_MAX_CHARS(700000)：富文本巨段自动对半分裂（imListCache 同口径）。
+ * - H5/小程序降级内存 IO（方案决策点③：H5 不落盘，PC Web 已有完整本地缓存）。
+ * - 排除行：local 占位 / tmp- 前缀 / msgStatus<0 不入库（PC isCacheableMessage 同款闸门）。
+ *
+ * 精度：msgId/convId/userId 恒 string；seq/sendTime/size 等数值均 < 2^53，
+ * JSON 往返安全（上游 records 已过 parseJsonKeepInt64 管线，雪花号在此已是字符串）。
+ *
+ * 撤回/编辑 3004/3005 不产生新 seq、增量同步不会重投（后端注释明示）⇒ 调用方
+ * （P3）必须在 WS handler 里把整条修正记录 upsert 进来，本模块 revision 守卫兜底。
+ */
+
+/**
+ * 存储介质最小接口（PC convCache CacheIo 同款：注入式，单测/H5 内存实现共用）。
+ * ★必须用 class 而非 type 对象字面量：函数成员两种形态（方法简写/属性箭头）在
+ *   Kotlin 后端都退化成 Any——io.get 调用点报 Any?→String?、io.set 返回值变
+ *   Unit（2026-10-24 两轮编译实锤）。class 方法调用稳（TtsSocketHandle 基类+
+ *   子类 override 同款先例）。单测经 configureImMsgDbIo 注入鸭子对象，不实例化。
+ */
+export class ImMsgDbIo {
+  get(_key: string): string | null {
+    return null
+  }
+  set(_key: string, _value: string): boolean {
+    return false
+  }
+  remove(_key: string): void {}
+  keys(): string[] {
+    return []
+  }
+}
+
+/** App 端：uni storage 同步 IO。 */
+class UniStorageIo extends ImMsgDbIo {
+  constructor() {
+    super()
+  }
+
+  override get(key: string): string | null {
+    const v = uni.getStorageSync(key)
+    if (v == null) return null
+    // getStorageSync 返回 Any：模板串收窄成 string（imListCache readEnvelope 同款）
+    const text = `${v}`
+    if (text.length == 0) return null
+    return text
+  }
+
+  override set(key: string, value: string): boolean {
+    try {
+      uni.setStorageSync(key, value)
+      return true
+    } catch (_e) {
+      // 配额/隐私模式：返回 false 由调用方降级（imListCache 同款纪律：写失败记账在成功后）
+      return false
+    }
+  }
+
+  override remove(key: string): void {
+    uni.removeStorageSync(key)
+  }
+
+  override keys(): string[] {
+    try {
+      const info = uni.getStorageInfoSync()
+      return info.keys
+    } catch (_e) {
+      return []
+    }
+  }
+}
+
+/** H5/小程序降级内存 IO（H5 不落盘，方案决策点③）。 */
+class MemoryIo extends ImMsgDbIo {
+  private map: Map<string, string>
+
+  constructor() {
+    super()
+    this.map = new Map<string, string>()
+  }
+
+  override get(key: string): string | null {
+    const hit = this.map.get(key)
+    return hit != null ? (hit as string) : null
+  }
+
+  override set(key: string, value: string): boolean {
+    this.map.set(key, value)
+    return true
+  }
+
+  override remove(key: string): void {
+    this.map.delete(key)
+  }
+
+  override keys(): string[] {
+    const out: string[] = []
+    this.map.forEach((v: string, k: string): void => {
+      out.push(k)
+    })
+    return out
+  }
+}
+
+export type ImMsgDbMeta = {
+  latestSeq: number
+  oldestSeq: number
+  hasMore: boolean
+  clearBeforeSeq: number
+  total: number
+}
+
+/** 段引用（meta 内持久化形态）：a=最小 seq，b=最大 seq，n=行数。 */
+type ImSegRef = { a: number, b: number, n: number }
+/** 工作态段（含已加载行）。 */
+type ImSeg = { a: number, b: number, rows: UTSJSONObject[] }
+/** 会话工作态。 */
+type ImConvState = {
+  uid: string
+  convId: string
+  latestSeq: number
+  oldestSeq: number
+  hasMore: boolean
+  clearBeforeSeq: number
+  segs: ImSegRef[]
+  total: number
+}
+
+const DB_VERSION = 1
+const DB_PREFIX = "IM_MSGDB_V1"
+const SEG_MAX_ROWS = 200
+const SEG_MAX_CHARS = 700000
+const CAP_ROWS = 2000
+
+let activeIo: ImMsgDbIo | null = null
+
+/** 单测/降级注入；传 null 恢复默认。生产代码不调用。 */
+export function configureImMsgDbIo(io: ImMsgDbIo | null): void {
+  activeIo = io
+}
+
+function currentIo(): ImMsgDbIo {
+  if (activeIo != null) return activeIo as ImMsgDbIo
+  // #ifndef H5 || MP-WEIXIN
+  activeIo = new UniStorageIo()
+  return activeIo as ImMsgDbIo
+  // #endif
+  // #ifdef H5 || MP-WEIXIN
+  activeIo = new MemoryIo()
+  return activeIo as ImMsgDbIo
+  // #endif
+}
+
+// ============================================================ 基础读取
+
+function dbReadNum(obj: UTSJSONObject, key: string, def: number): number {
+  const v = obj[key]
+  if (v == null) return def
+  if (typeof v == "number") return v as number
+  return def
+}
+
+function dbReadStr(obj: UTSJSONObject, key: string): string {
+  const v = obj[key]
+  if (v == null) return ""
+  if (typeof v == "string") return v as string
+  return ""
+}
+
+function dbReadBool(obj: UTSJSONObject, key: string, def: boolean): boolean {
+  const v = obj[key]
+  if (v == null) return def
+  if (typeof v == "boolean") return v as boolean
+  return def
+}
+
+/** revision = max(editTime, revokeTime)：消息行版本号，只增守卫用。 */
+function revisionOf(rec: UTSJSONObject): number {
+  const e = dbReadNum(rec, "editTime", 0)
+  const r = dbReadNum(rec, "revokeTime", 0)
+  return Math.max(e, r)
+}
+
+function rowSeq(rec: UTSJSONObject): number {
+  return dbReadNum(rec, "seq", 0)
+}
+
+/** 入库闸门：须有服务端 msgId；tmp- 乐观占位与发送失败行（PC isCacheableMessage 同款）不入库。 */
+export function isImMsgDbCacheable(rec: UTSJSONObject | null): boolean {
+  if (rec == null) return false
+  const msgId = dbReadStr(rec, "msgId")
+  if (msgId.length == 0) return false
+  if (msgId.startsWith("tmp-")) return false
+  const st = dbReadNum(rec, "msgStatus", 0)
+  if (st < 0) return false
+  if (rowSeq(rec) <= 0) return false
+  return true
+}
+
+// ============================================================ 键与信封
+
+function idxKey(uid: string): string {
+  return `${DB_PREFIX}.u.${uid}.idx`
+}
+
+function metaKey(uid: string, convId: string): string {
+  return `${DB_PREFIX}.u.${uid}.c.${convId}.m`
+}
+
+function segKeyOf(uid: string, convId: string, a: number, b: number): string {
+  return `${DB_PREFIX}.u.${uid}.c.${convId}.s.${a}.${b}`
+}
+
+function segTag(a: number, b: number): string {
+  return `${a}.${b}`
+}
+
+function parseObj(text: string | null): UTSJSONObject | null {
+  if (text == null || text.length == 0) return null
+  try {
+    // ★必须带泛型：.uts 模块里裸 JSON.parse 推断成 String，后续按键访问全报错
+    const parsed = JSON.parse<UTSJSONObject>(text)
+    if (parsed == null) return null
+    return parsed as UTSJSONObject
+  } catch (_e) {
+    // 坏 JSON 当 miss：宁重拉勿渲染坏数据
+    return null
+  }
+}
+
+/** JSON.stringify 返回 string|null（坑表同条）：可空收口，null 占位 "{}"。 */
+function stringifySafe(obj: UTSJSONObject): string {
+  const text = JSON.stringify(obj)
+  return text != null ? (text as string) : "{}"
+}
+
+/** 读一段（信封校验：版本/账号/会话不符或坏 JSON 一律当 miss，宁重拉勿渲染坏数据）。 */
+function loadSeg(io: ImMsgDbIo, uid: string, convId: string, a: number, b: number): ImSeg | null {
+  const obj = parseObj(io.get(segKeyOf(uid, convId, a, b)))
+  if (obj == null) return null
+  if (dbReadNum(obj, "v", 0) != DB_VERSION) return null
+  if (dbReadStr(obj, "uid") != uid || dbReadStr(obj, "convId") != convId) return null
+  const rowsRaw = obj["rows"]
+  if (rowsRaw == null) return null
+  const rows = rowsRaw as UTSJSONObject[]
+  const seg: ImSeg = { a: dbReadNum(obj, "a", a), b: dbReadNum(obj, "b", b), rows: rows }
+  return seg
+}
+
+function segToJson(uid: string, convId: string, seg: ImSeg): string {
+  const obj = new UTSJSONObject()
+  obj["v"] = DB_VERSION
+  obj["uid"] = uid
+  obj["convId"] = convId
+  obj["a"] = seg.a
+  obj["b"] = seg.b
+  obj["rows"] = seg.rows
+  return stringifySafe(obj)
+}
+
+// ============================================================ 会话状态（meta）读写
+
+function newState(uid: string, convId: string): ImConvState {
+  const st: ImConvState = {
+    uid: uid,
+    convId: convId,
+    latestSeq: 0,
+    oldestSeq: 0,
+    hasMore: true,
+    clearBeforeSeq: 0,
+    segs: [],
+    total: 0,
+  }
+  return st
+}
+
+function loadConvState(io: ImMsgDbIo, uid: string, convId: string): ImConvState | null {
+  const obj = parseObj(io.get(metaKey(uid, convId)))
+  if (obj == null) return null
+  if (dbReadNum(obj, "v", 0) != DB_VERSION) return null
+  if (dbReadStr(obj, "uid") != uid || dbReadStr(obj, "convId") != convId) return null
+  const st = newState(uid, convId)
+  st.latestSeq = dbReadNum(obj, "latestSeq", 0)
+  st.oldestSeq = dbReadNum(obj, "oldestSeq", 0)
+  st.hasMore = dbReadBool(obj, "hasMore", true)
+  st.clearBeforeSeq = dbReadNum(obj, "clearBeforeSeq", 0)
+  const segsRaw = obj["segs"]
+  if (segsRaw != null) {
+    const arr = segsRaw as UTSJSONObject[]
+    for (let i = 0; i < arr.length; i++) {
+      const s = arr[i]
+      if (s == null) continue
+      const ref: ImSegRef = { a: dbReadNum(s, "a", 0), b: dbReadNum(s, "b", 0), n: dbReadNum(s, "n", 0) }
+      if (ref.a > 0 && ref.b >= ref.a) {
+        st.segs.push(ref)
+        st.total += ref.n
+      }
+    }
+  }
+  return st
+}
+
+function saveConvState(io: ImMsgDbIo, st: ImConvState): boolean {
+  const obj = new UTSJSONObject()
+  obj["v"] = DB_VERSION
+  obj["uid"] = st.uid
+  obj["convId"] = st.convId
+  obj["latestSeq"] = st.latestSeq
+  obj["oldestSeq"] = st.oldestSeq
+  obj["hasMore"] = st.hasMore
+  obj["clearBeforeSeq"] = st.clearBeforeSeq
+  const segArr: UTSJSONObject[] = []
+  for (let i = 0; i < st.segs.length; i++) {
+    const s = new UTSJSONObject()
+    s["a"] = st.segs[i].a
+    s["b"] = st.segs[i].b
+    s["n"] = st.segs[i].n
+    segArr.push(s)
+  }
+  obj["segs"] = segArr
+  const ok = io.set(metaKey(st.uid, st.convId), stringifySafe(obj))
+  if (ok) touchConvIndex(io, st.uid, st.convId)
+  return ok
+}
+
+/** 用户级会话索引（clearUser 免 keys() 枚举）。 */
+function touchConvIndex(io: ImMsgDbIo, uid: string, convId: string): void {
+  const obj = parseObj(io.get(idxKey(uid)))
+  const convs: string[] = []
+  if (obj != null && dbReadNum(obj, "v", 0) == DB_VERSION && dbReadStr(obj, "uid") == uid) {
+    const raw = obj["convs"]
+    if (raw != null) {
+      const arr = raw as string[]
+      for (let i = 0; i < arr.length; i++) convs.push(arr[i])
+    }
+  }
+  if (convs.indexOf(convId) >= 0) return
+  convs.push(convId)
+  const out = new UTSJSONObject()
+  out["v"] = DB_VERSION
+  out["uid"] = uid
+  out["convs"] = convs
+  io.set(idxKey(uid), stringifySafe(out))
+}
+
+function eraseFromConvIndex(io: ImMsgDbIo, uid: string, convId: string): void {
+  const obj = parseObj(io.get(idxKey(uid)))
+  if (obj == null) return
+  const raw = obj["convs"]
+  if (raw == null) return
+  const arr = raw as string[]
+  const convs: string[] = []
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] != convId) convs.push(arr[i])
+  }
+  const out = new UTSJSONObject()
+  out["v"] = DB_VERSION
+  out["uid"] = uid
+  out["convs"] = convs
+  io.set(idxKey(uid), stringifySafe(out))
+}
+
+// ============================================================ 段工作区
+
+/**
+ * 段工作区：本次操作触碰的段（按原始键 tag 缓存行数据，避免重复读盘）。
+ * srcKey 记录原始键（分裂后旧键要删）。
+ */
+type ImSegWork = { srcA: number, srcB: number, seg: ImSeg }
+
+function workTag(w: ImSegWork): string {
+  return segTag(w.srcA, w.srcB)
+}
+
+function loadWork(io: ImMsgDbIo, uid: string, convId: string, ref: ImSegRef, work: Map<string, ImSegWork>): ImSegWork {
+  const tag = segTag(ref.a, ref.b)
+  const hit = work.get(tag)
+  if (hit != null) return hit as ImSegWork
+  const loaded = loadSeg(io, uid, convId, ref.a, ref.b)
+  const seg: ImSeg = loaded != null ? (loaded as ImSeg) : { a: ref.a, b: ref.b, rows: [] }
+  const w: ImSegWork = { srcA: ref.a, srcB: ref.b, seg: seg }
+  work.set(tag, w)
+  return w
+}
+
+/** 段内按 seq 升序找插入位（线性即可：段 ≤ SEG_MAX_ROWS*2）。 */
+function insertPos(rows: UTSJSONObject[], seq: number): number {
+  let i = 0
+  while (i < rows.length && rowSeq(rows[i]) <= seq) i++
+  return i
+}
+
+function findByMsgId(rows: UTSJSONObject[], msgId: string): number {
+  for (let i = 0; i < rows.length; i++) {
+    if (dbReadStr(rows[i], "msgId") == msgId) return i
+  }
+  return -1
+}
+
+function findByClientMsgId(rows: UTSJSONObject[], clientMsgId: string): number {
+  if (clientMsgId.length == 0) return -1
+  for (let i = 0; i < rows.length; i++) {
+    if (dbReadStr(rows[i], "clientMsgId") == clientMsgId) return i
+  }
+  return -1
+}
+
+/**
+ * 段规整：超行数/超字符上限即对半分裂（递归到合法），返回最终段列表。
+ * 返回的段 a/b 为重算后的边界（取自行内 seq）。
+ */
+function normalizeSeg(uid: string, convId: string, seg: ImSeg): ImSeg[] {
+  const out: ImSeg[] = []
+  const stack: ImSeg[] = [seg]
+  while (stack.length > 0) {
+    const s = stack.pop() as ImSeg
+    const tooManyRows = s.rows.length > SEG_MAX_ROWS
+    let tooFat = false
+    if (!tooManyRows && s.rows.length >= 4) {
+      tooFat = segToJson(uid, convId, s).length > SEG_MAX_CHARS
+    }
+    if ((tooManyRows || tooFat) && s.rows.length >= 4) {
+      const mid = Math.floor(s.rows.length / 2)
+      const leftRows: UTSJSONObject[] = []
+      const rightRows: UTSJSONObject[] = []
+      for (let i = 0; i < mid; i++) leftRows.push(s.rows[i])
+      for (let i = mid; i < s.rows.length; i++) rightRows.push(s.rows[i])
+      const left: ImSeg = { a: rowSeq(leftRows[0]), b: rowSeq(leftRows[leftRows.length - 1]), rows: leftRows }
+      const right: ImSeg = { a: rowSeq(rightRows[0]), b: rowSeq(rightRows[rightRows.length - 1]), rows: rightRows }
+      stack.push(right)
+      stack.push(left)
+    } else {
+      if (s.rows.length > 0) {
+        s.a = rowSeq(s.rows[0])
+        s.b = rowSeq(s.rows[s.rows.length - 1])
+        out.push(s)
+      }
+    }
+  }
+  // stack 逆序压入 → 弹出顺序左在前后在后？pop 先取 right：压 right 再 left ⇒ 先弹 left ✓ 升序。
+  return out
+}
+
+/** 落盘工作区：规整 → 写新键 → 删旧键 → 重建 state.segs。返回是否全部成功。 */
+function flushWork(io: ImMsgDbIo, st: ImConvState, work: Map<string, ImSegWork>): boolean {
+  const finalSegs: ImSeg[] = []
+  const staleKeys: string[] = []
+  work.forEach((w: ImSegWork, _tag: string): void => {
+    const normalized = normalizeSeg(st.uid, st.convId, w.seg)
+    for (let i = 0; i < normalized.length; i++) finalSegs.push(normalized[i])
+    // 分裂（或边界变化）才需要删旧键；单段且边界未变时新键覆盖旧键，无需删
+    const changedKey = normalized.length != 1 || normalized[0].a != w.srcA || normalized[0].b != w.srcB
+    if (changedKey) staleKeys.push(segKeyOf(st.uid, st.convId, w.srcA, w.srcB))
+  })
+  // 未触碰的段引用保留
+  const untouched: ImSegRef[] = []
+  const touchedTags = new Set<string>()
+  work.forEach((w: ImSegWork, tag: string): void => {
+    touchedTags.add(tag)
+  })
+  for (let i = 0; i < st.segs.length; i++) {
+    const ref = st.segs[i]
+    if (!touchedTags.has(segTag(ref.a, ref.b))) untouched.push(ref)
+  }
+  for (let i = 0; i < finalSegs.length; i++) {
+    const fs = finalSegs[i]
+    const ref: ImSegRef = { a: fs.a, b: fs.b, n: fs.rows.length }
+    untouched.push(ref)
+  }
+  untouched.sort((x: ImSegRef, y: ImSegRef): number => x.a - y.a)
+  st.segs = untouched
+  st.total = 0
+  for (let i = 0; i < st.segs.length; i++) st.total += st.segs[i].n
+  let ok = true
+  for (let i = 0; i < staleKeys.length; i++) io.remove(staleKeys[i])
+  for (let i = 0; i < finalSegs.length; i++) {
+    if (finalSegs[i].rows.length == 0) continue
+    if (!io.set(segKeyOf(st.uid, st.convId, finalSegs[i].a, finalSegs[i].b), segToJson(st.uid, st.convId, finalSegs[i]))) {
+      ok = false
+    }
+  }
+  if (!saveConvState(io, st)) ok = false
+  return ok
+}
+
+/** 上限淘汰：整段丢最旧，直到 total ≤ CAP_ROWS 或只剩一段。oldestSeq 随之首段推进。 */
+function pruneToCap(io: ImMsgDbIo, st: ImConvState): void {
+  let dropped = false
+  while (st.total > CAP_ROWS && st.segs.length > 1) {
+    const first = st.segs[0]
+    io.remove(segKeyOf(st.uid, st.convId, first.a, first.b))
+    st.total -= first.n
+    st.segs.splice(0, 1)
+    dropped = true
+  }
+  st.oldestSeq = st.segs.length > 0 ? st.segs[0].a : 0
+  // 淘汰推进了库底 ⇒ hasMore=false 断言过期：它断言的是「淘汰前 oldestSeq 之下
+  // 服务端无更早」，floor 上移后被丢的行在服务端仍然存在。复位 true，翻到新底
+  // 时走一页网络重新求证（空页/到顶响应会再写回 false，代价一页）。
+  if (dropped && st.hasMore != true) st.hasMore = true
+}
+
+// ============================================================ 对外 API
+
+/** 元信息（无本地库返回 null）。 */
+export function getImMsgDbMeta(uid: string, convId: string): ImMsgDbMeta | null {
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null) return null
+  const meta: ImMsgDbMeta = {
+    latestSeq: st.latestSeq,
+    oldestSeq: st.oldestSeq,
+    hasMore: st.hasMore,
+    clearBeforeSeq: st.clearBeforeSeq,
+    total: st.total,
+  }
+  return meta
+}
+
+export function setImMsgDbHasMore(uid: string, convId: string, hasMore: boolean): void {
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null) return
+  st.hasMore = hasMore
+  saveConvState(io, st)
+}
+
+/**
+ * 幂等写入（唯一写入口之一）：
+ * - 同 msgId：revision 高者胜（同 revision 新覆盖）
+ * - 同 clientMsgId 不同 msgId：确认替换（删旧行插新行）
+ * 返回实际生效条数（含替换）。
+ */
+export function upsertImMsgDbMessages(uid: string, convId: string, records: UTSJSONObject[]): number {
+  if (records.length == 0) return 0
+  const io = currentIo()
+  let st = loadConvState(io, uid, convId)
+  if (st == null) st = newState(uid, convId)
+  const work = new Map<string, ImSegWork>()
+  let applied = 0
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i]
+    if (!isImMsgDbCacheable(rec)) continue
+    if (dbReadStr(rec, "convId") != convId) continue
+    const seq = rowSeq(rec)
+    if (st.clearBeforeSeq > 0 && seq <= st.clearBeforeSeq) continue
+    // 定位目标段：命中区间 / 尾段追加 / 头前或空洞新建
+    let refIdx = -1
+    for (let k = 0; k < st.segs.length; k++) {
+      if (seq >= st.segs[k].a && seq <= st.segs[k].b) {
+        refIdx = k
+        break
+      }
+    }
+    if (refIdx < 0) {
+      if (st.segs.length > 0 && seq > st.segs[st.segs.length - 1].b) {
+        refIdx = st.segs.length - 1
+      } else {
+        const ref: ImSegRef = { a: seq, b: seq, n: 0 }
+        let at = st.segs.length
+        for (let k = 0; k < st.segs.length; k++) {
+          if (st.segs[k].a > seq) {
+            at = k
+            break
+          }
+        }
+        st.segs.splice(at, 0, ref)
+        refIdx = at
+      }
+    }
+    const ref = st.segs[refIdx]
+    const w = loadWork(io, uid, convId, ref, work)
+    const rows = w.seg.rows
+    const msgId = dbReadStr(rec, "msgId")
+    let idx = findByMsgId(rows, msgId)
+    if (idx >= 0) {
+      if (revisionOf(rec) < revisionOf(rows[idx])) continue
+      // 同 revision 同内容=幂等重放，跳过不计数；同 revision 不同内容（如 readCount 刷新）仍替换
+      if (JSON.stringify(rec) == JSON.stringify(rows[idx])) continue
+      rows[idx] = rec
+      applied++
+      continue
+    }
+    const cmid = dbReadStr(rec, "clientMsgId")
+    const cmIdx = findByClientMsgId(rows, cmid)
+    if (cmIdx >= 0) {
+      rows[cmIdx] = rec
+      applied++
+      continue
+    }
+    const pos = insertPos(rows, seq)
+    rows.splice(pos, 0, rec)
+    applied++
+    if (seq > st.latestSeq) st.latestSeq = seq
+  }
+  if (applied == 0) return 0
+  if (st.segs.length > 0) {
+    st.oldestSeq = st.oldestSeq > 0 ? Math.min(st.oldestSeq, st.segs[0].a) : st.segs[0].a
+    st.latestSeq = Math.max(st.latestSeq, st.segs[st.segs.length - 1].b)
+  }
+  flushWork(io, st, work)
+  pruneToCap(io, st)
+  saveConvState(io, st)
+  return applied
+}
+
+/**
+ * 尾页读取（升序）。无本地库/清空过返回 null（空不当命中，imListCache 同款）。
+ * limit 建议取页面页大小（20）。
+ */
+export function loadImMsgDbLatest(uid: string, convId: string, limit: number): UTSJSONObject[] | null {
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null || st.segs.length == 0) return null
+  const need: number = Math.max(1, limit)
+  const collected: UTSJSONObject[] = []
+  for (let i = st.segs.length - 1; i >= 0 && collected.length < need; i--) {
+    const loaded = loadSeg(io, uid, convId, st.segs[i].a, st.segs[i].b)
+    if (loaded == null) continue
+    const rows = (loaded as ImSeg).rows
+    for (let k = rows.length - 1; k >= 0 && collected.length < need; k--) {
+      collected.push(rows[k])
+    }
+  }
+  if (collected.length == 0) return null
+  const asc: UTSJSONObject[] = []
+  for (let i = collected.length - 1; i >= 0; i--) asc.push(collected[i])
+  return asc
+}
+
+/**
+ * 历史页读取：seq < beforeSeq 的最近 limit 条（升序）。无本地数据返回 null。
+ * clearBeforeSeq 以下的行读侧也过滤（双保险，正常应已在写入/清空时移除）。
+ */
+export function loadImMsgDbBefore(uid: string, convId: string, beforeSeq: number, limit: number): UTSJSONObject[] | null {
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null || st.segs.length == 0) return null
+  const need: number = Math.max(1, limit)
+  const collected: UTSJSONObject[] = []
+  for (let i = st.segs.length - 1; i >= 0 && collected.length < need; i--) {
+    const ref = st.segs[i]
+    if (ref.a >= beforeSeq) continue
+    const loaded = loadSeg(io, uid, convId, ref.a, ref.b)
+    if (loaded == null) continue
+    const rows = (loaded as ImSeg).rows
+    for (let k = rows.length - 1; k >= 0 && collected.length < need; k--) {
+      const s = rowSeq(rows[k])
+      if (s >= beforeSeq) continue
+      if (st.clearBeforeSeq > 0 && s <= st.clearBeforeSeq) continue
+      collected.push(rows[k])
+    }
+  }
+  if (collected.length == 0) return null
+  const asc: UTSJSONObject[] = []
+  for (let i = collected.length - 1; i >= 0; i--) asc.push(collected[i])
+  return asc
+}
+
+/**
+ * 索引级探测：seq 之下是否还有可读行（clearBeforeSeq 之上）。翻页闸门用——
+ * meta.hasMore 只描述「服务端在库底之下还有没有」，DB 已缓存的更早行不能被
+ * false 闸死（重进只装尾窗，必须还能继续翻到库底）。只扫段索引，不触行数据。
+ */
+export function hasImMsgDbBelow(uid: string, convId: string, seq: number): boolean {
+  if (seq <= 0) return false
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null || st.segs.length == 0) return false
+  const cbFloor = st.clearBeforeSeq > 0 ? st.clearBeforeSeq + 1 : 0
+  for (let i = 0; i < st.segs.length; i++) {
+    const ref = st.segs[i]
+    if (ref.a >= seq) break // 段索引升序，后面只会更靠上
+    const floor = Math.max(ref.a, cbFloor)
+    const ceil = Math.min(ref.b, seq - 1)
+    if (ceil >= floor) return true
+  }
+  return false
+}
+
+/**
+ * 按 msgId 删除（tail 权威比对用：服务端缺失=按人删除/清空，从本地剔除）。
+ * 返回删除条数。空段连同键与引用一并移除。
+ */
+export function removeImMsgDbMessages(uid: string, convId: string, msgIds: Set<string>): number {
+  if (msgIds.size == 0) return 0
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null) return 0
+  const work = new Map<string, ImSegWork>()
+  let removed = 0
+  for (let i = 0; i < st.segs.length; i++) {
+    const w = loadWork(io, uid, convId, st.segs[i], work)
+    const rows = w.seg.rows
+    let j = 0
+    while (j < rows.length) {
+      if (msgIds.has(dbReadStr(rows[j], "msgId"))) {
+        rows.splice(j, 1)
+        removed++
+      } else {
+        j++
+      }
+    }
+  }
+  if (removed == 0) return 0
+  flushWork(io, st, work)
+  saveConvState(io, st)
+  return removed
+}
+
+/**
+ * 应用清空记录水位（/sync conversations[].clearBeforeSeq 权威快照）：
+ * 删除 seq ≤ cb 的所有段/行，重置 oldestSeq。幂等。
+ */
+export function applyImMsgDbClearBefore(uid: string, convId: string, clearBeforeSeq: number): void {
+  const io = currentIo()
+  let st = loadConvState(io, uid, convId)
+  if (st == null) return
+  if (clearBeforeSeq <= st.clearBeforeSeq) return
+  st.clearBeforeSeq = clearBeforeSeq
+  const work = new Map<string, ImSegWork>()
+  const keep: ImSegRef[] = []
+  for (let i = 0; i < st.segs.length; i++) {
+    const ref = st.segs[i]
+    if (ref.b <= clearBeforeSeq) {
+      io.remove(segKeyOf(uid, convId, ref.a, ref.b))
+      continue
+    }
+    if (ref.a <= clearBeforeSeq) {
+      const w = loadWork(io, uid, convId, ref, work)
+      const rows = w.seg.rows
+      let j = 0
+      while (j < rows.length) {
+        if (rowSeq(rows[j]) <= clearBeforeSeq) rows.splice(j, 1)
+        else j++
+      }
+    }
+    keep.push(ref)
+  }
+  st.segs = keep
+  flushWork(io, st, work)
+  st.oldestSeq = st.segs.length > 0 ? st.segs[0].a : 0
+  saveConvState(io, st)
+}
+
+/** 丢弃整个会话（会话被删/成员被踢场景）。 */
+export function dropImMsgDbConversation(uid: string, convId: string): void {
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null) return
+  for (let i = 0; i < st.segs.length; i++) {
+    io.remove(segKeyOf(uid, convId, st.segs[i].a, st.segs[i].b))
+  }
+  io.remove(metaKey(uid, convId))
+  eraseFromConvIndex(io, uid, convId)
+}
+
+/** 清空某账号全部消息库（登出/换号）。 */
+export function clearImMsgDbUser(uid: string): void {
+  const io = currentIo()
+  const obj = parseObj(io.get(idxKey(uid)))
+  if (obj != null) {
+    const raw = obj["convs"]
+    if (raw != null) {
+      const arr = raw as string[]
+      for (let i = 0; i < arr.length; i++) dropImMsgDbConversation(uid, arr[i])
+    }
+  }
+  io.remove(idxKey(uid))
+}
+
+/** 清空所有账号（全量清理兜底，App 端走 storage keys 扫描前缀）。 */
+export function clearImMsgDbAll(): void {
+  const io = currentIo()
+  const keys = io.keys()
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i].startsWith(`${DB_PREFIX}.`)) io.remove(keys[i])
+  }
+}
+
+// ============================================================ 撤回/编辑补丁（3004/3005）
+
+/** 单行补丁载体（UTSJSONObject 无键枚举 API，补丁字段由两个语义化包装函数显式写死）。 */
+type ImRecordPatch = (rec: UTSJSONObject) => void
+
+/**
+ * 补丁落库公共载体：全段扫 msgId 命中后原位补丁并单条 upsert（revision 守卫 +
+ * 内容 diff 由 upsert 兜底）。行不在库（未缓存/已被上限淘汰）返回 false——后续
+ * 翻页/尾页自愈，不视为错误。低频人工事件，整扫成本可受（P6 需要时再加段索引）。
+ * ★须定义在 applyImMsgDbRevoke/applyImMsgDbEdit 之前（UTS→Kotlin 先用后定义报错）。
+ */
+function patchStoredRecord(uid: string, convId: string, msgId: string, revision: number, patch: ImRecordPatch): boolean {
+  if (msgId.length == 0 || revision <= 0) return false
+  const io = currentIo()
+  const st = loadConvState(io, uid, convId)
+  if (st == null) return false
+  for (let i = st.segs.length - 1; i >= 0; i--) {
+    const loaded = loadSeg(io, uid, convId, st.segs[i].a, st.segs[i].b)
+    if (loaded == null) continue
+    const rows = (loaded as ImSeg).rows
+    const idx = findByMsgId(rows, msgId)
+    if (idx < 0) continue
+    const rec = rows[idx]
+    // 旧补丁/同版本重放直接拒（upsert 同款守卫，此处早退省一次写链）
+    if (revision <= revisionOf(rec)) return false
+    patch(rec)
+    upsertImMsgDbMessages(uid, convId, [rec])
+    return true
+  }
+  return false
+}
+
+/**
+ * 撤回补丁（3004 不产生新 seq、增量同步不重投 ⇒ WS handler 须主动修正库存行）：
+ * msgStatus=2 + revokeTime + revokeBy + body 清空，对齐服务端权威形态。
+ */
+export function applyImMsgDbRevoke(uid: string, convId: string, msgId: string, revokeTime: number, revokeBy: string): boolean {
+  return patchStoredRecord(uid, convId, msgId, revokeTime, (rec: UTSJSONObject): void => {
+    rec["msgStatus"] = 2
+    rec["revokeTime"] = revokeTime
+    if (revokeBy.length > 0) rec["revokeBy"] = revokeBy
+    rec["body"] = null
+  })
+}
+
+/** 编辑补丁（3005 同理）：body.text 整体替换 + editTime（编辑仅文本消息）。 */
+export function applyImMsgDbEdit(uid: string, convId: string, msgId: string, editTime: number, newText: string): boolean {
+  return patchStoredRecord(uid, convId, msgId, editTime, (rec: UTSJSONObject): void => {
+    const body = new UTSJSONObject()
+    body["text"] = newText
+    rec["body"] = body
+    rec["editTime"] = editTime
+  })
+}

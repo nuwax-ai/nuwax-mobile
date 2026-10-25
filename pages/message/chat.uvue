@@ -2286,6 +2286,8 @@
   // ===== 「定位到聊天位置」高亮（引用详情页跳回后背景快速切换） =====
   const highlightId = ref<string>("");
   let pendingJumpId = "";
+  // 搜索/引用定位进行中（jumpToMsg 全程）：屏蔽 scrolltoupper 误触发 + 定位窗内不裁尾
+  let jumpLocating = false;
   let pageVisible = false;
   let pageDisposed = false;
   const pageSessionStamp = getImSessionStamp();
@@ -7197,11 +7199,12 @@
   let windowTailTrimmed = false;
 
   /** 合并服务端快照：批内去重、按版本更新，保留已解析的未变消息。 */
-  function mergeSyncedMessages(records: UTSJSONObject[]): boolean {
+  function mergeSyncedMessages(records: UTSJSONObject[], allowGapped: boolean = false): boolean {
     if (!isChatCurrent()) return false;
     // 窗口尾已裁（用户深翻历史）：新行只落库不上屏——中段缺行直接追加会出现
     // 视觉断层；「回到底部」浮钮点击时整窗重建（resetWindowToDbTail）自愈。
-    if (windowTailTrimmed) return false;
+    // allowGapped 仅供定位直达（fetchJumpWindow）：中段插入正是定位目的，断层可受。
+    if (windowTailTrimmed && !allowGapped) return false;
     const rows = messages.value.slice();
     const indices = new Map<string, number>();
     const clientIndices = new Map<string, number>();
@@ -7411,10 +7414,10 @@
     for (let i = fresh.length - 1; i >= 0; i--) {
       messages.value.unshift(fresh[i]);
     }
-    // 内存窗口尾裁：超限从尾端裁除（视口下方零位移）。未读定位中不裁——
-    // 倒数法 idx 以「窗口尾=最新」为前提，裁尾会算错定位行（定位最多 10 页，
-    // 短暂超限可受）。尾部未确认/失败行（local/status==0）保护不裁。
-    if (!unreadLocating) {
+    // 内存窗口尾裁：超限从尾端裁除（视口下方零位移）。定位中不裁——未读倒数法
+    // idx 以「窗口尾=最新」为前提，裁尾会算错定位行；搜索/引用回翻同理（定位
+    // 最多 15 页，短暂超限可受）。尾部未确认/失败行（local/status==0）保护不裁。
+    if (!unreadLocating && !jumpLocating) {
       let drop = messages.value.length - CHAT_WINDOW_MAX;
       if (drop > 0) {
         const rows = messages.value;
@@ -7440,6 +7443,27 @@
     return true;
   }
 
+  /** 翻页/定位插入前的锚定守卫安装。iOS 交互锁由守卫 onDone 解（stable/idle/abs/cancel
+   *  任一即渲染稳定/收工）。锚定安装异常不得吞掉整页数据（iOS 疑点：安装抛错会中断
+   *  loadHistory，prepend 永不执行——beforeSeq 原地踏步、页面无新增行）；降级 scroll-into-view。 */
+  function engagePrependAnchor(anchorId: string): void {
+    releasePrependAnchor();
+    let anchorDone: ((reason: string) => void) | null = null;
+    // #ifdef APP-IOS
+    anchorDone = (reason: string): void => {
+      releaseHistoryLock(reason);
+    };
+    // #endif
+    try {
+      cancelPrependAnchor = preserveImPrependAnchor("im-chat-body", anchorId, anchorDone);
+    } catch (_e) {
+      console.error("[ImHistory] anchor install error");
+      console.error(_e);
+      cancelPrependAnchor = null;
+    }
+    if (cancelPrependAnchor == null) scrollToAnchorWithSettle(anchorId);
+  }
+
   /**
    * 首屏 + 向上翻页共用：beforeSeq<=0 取最新一页，否则取 seq<beforeSeq 的更早一页。
    * DB 优先（fetchImConvHistoryPage）：本地足页直出零请求；本地不足且库称还有更多才
@@ -7462,24 +7486,7 @@
       // 缺口 + 模板捕获顶限（255 硬限）不可绑 scroll-top，走 scroll-into-view 兜底——
       // 必须用 settle 惯用法等布局完成再落锚（同 flush 设值会在新内容布局前应用、落在旧偏移）。
       if (preserveAnchor.length > 0 && isChatActive()) {
-        releasePrependAnchor();
-        // 锚定安装异常不得吞掉整页数据（iOS 疑点：安装抛错会中断 loadHistory，
-        // prepend 永不执行——beforeSeq 原地踏步、页面无新增行）；降级 scroll-into-view。
-        // iOS 交互锁由守卫 onDone 解（stable/idle/abs/cancel 任一即渲染稳定/收工）。
-        let anchorDone: ((reason: string) => void) | null = null;
-        // #ifdef APP-IOS
-        anchorDone = (reason: string): void => {
-          releaseHistoryLock(reason);
-        };
-        // #endif
-        try {
-          cancelPrependAnchor = preserveImPrependAnchor("im-chat-body", preserveAnchor, anchorDone);
-        } catch (_e) {
-          console.error("[ImHistory] anchor install error");
-          console.error(_e);
-          cancelPrependAnchor = null;
-        }
-        if (cancelPrependAnchor == null) scrollToAnchorWithSettle(preserveAnchor);
+        engagePrependAnchor(preserveAnchor);
       }
       if (beforeSeq > 0) {
         // 翻页：头部原位插入，既有行引用/key 不动（锚定与 keyed DOM 复用的前提）。
@@ -7495,6 +7502,8 @@
   async function handleLoadOlder(): Promise<void> {
     // 未读定位翻页中：用户未触摸（遮蔽定位窗内 scrolltoupper 是定位滚动误触发）
     if (unreadLocating) return;
+    // 搜索/引用定位中同理：直达/回翻的滚动与遮蔽期事件同样不是用户意图
+    if (jumpLocating) return;
     if (!isChatActive()) return;
     // iOS 交互锁期内不连环拉页（锁未释放=上一页锚定/渲染未稳）
     if (historyLock.value) return;
@@ -9560,7 +9569,10 @@
     return null;
   }
 
-  /** 应用待定位：滚到目标行并闪烁高亮（幂等，消费 pendingJumpId）。 */
+  /** 应用待定位：滚到目标行并闪烁高亮（幂等，消费 pendingJumpId）。
+   *  scrollToAnchorWithSettle 收口：揭幕 + 150ms 稳定重定位——进页首屏图片/卡片
+   *  异步撑高会推走单次锚定（locateFirstUnread 同款）；页面不可见时锚点暂存
+   *  deferredAnchor，onShow 统一重放。 */
   function applyPendingJump(): void {
     const msgId = pendingJumpId;
     if (msgId.length == 0) {
@@ -9570,54 +9582,151 @@
       return;
     }
     pendingJumpId = "";
-    scrollAnchor.value = "";
-    nextTick(() => {
-      scrollAnchor.value = `msg-${msgId}`;
-      listSettled.value = true;
-      flashHighlight(msgId);
-      // 引用/搜索跳转常落在中部历史区：落定后校准浮钮（亮）
-      scheduleJumpLatestCheck(60);
-    });
+    scrollToAnchorWithSettle(`msg-${msgId}`);
+    flashHighlight(msgId);
   }
 
   /**
-   * 定位到某条消息：不在已加载区间则持续向前翻页（最多 15 页）。
-   * ★滚动/高亮不在本函数直接做：emit 时本页还被 quote-detail 盖着，隐藏状态下
-   *   scroll-into-view 不生效——统一延到 onShow（页面重新可见）后再应用。
+   * 定位回翻取页（无 seq 兜底路径）：已揭幕（引用定位）时锚定首可见行 + iOS 交互锁
+   * + 顶部加载胶囊——头部插入无锚定会逐页顶开视口＝肉眼连续跳动（对齐 handleLoadOlder）；
+   * 进页遮蔽期翻页闪变不可见，无需锚定（locateFirstUnread 同款）。
    */
-  async function jumpToMsg(msgId: string): Promise<void> {
-    entryFollowLatest = false;
-    cancelSettle();
-    let pages = 0;
-    while (findMsgById(msgId) == null && pages < 15) {
-      if (loading.value || loadFailed.value || messages.value.length == 0 || hasMore.value != true) {
-        break;
-      }
-      pages++;
-      const oldestSeq = messages.value[0].seq;
-      await loadHistory(oldestSeq);
+  async function runLocatedPage(beforeSeq: number): Promise<void> {
+    const anchorId = listSettled.value && isChatActive() ? `msg-${firstVisibleRowKey().msgId}` : "";
+    scrollAnchor.value = "";
+    if (anchorId.length > 0) {
+      // #ifdef APP-IOS
+      engageHistoryLock();
+      // #endif
+      loadingOlder.value = true;
     }
-    if (findMsgById(msgId) == null) {
-      // ES 全量命中的消息可能早于窗口可翻页到达的范围（15 页 × 20 条，与 Pin/引用详情同上限）：
-      // 消费掉待定位并提示，避免回到聊天页后静默无操作、pendingJumpId 悬挂
-      pendingJumpId = "";
-      uni.showToast({ title: t("Mobile.Message.jumpOutOfRange"), icon: "none" });
-      return;
-    }
-    if (pageVisible) {
-      // 页面本就可见（数据补齐即可应用）：onShow 不会再触发，这里直接应用
-      applyPendingJump();
+    try {
+      await loadHistory(beforeSeq, anchorId);
+    } catch (_error) {
+      // #ifdef APP-IOS
+      releaseHistoryLock("error");
+      // #endif
+    } finally {
+      loadingOlder.value = false;
     }
   }
 
-  /** 引用详情页 emit 的跳转事件（payload 为目标 msgId 字符串）。 */
+  /**
+   * 定位直达取页（PC focusPinnedMessage 同款）：beforeSeq = 目标 seq+1 一发请求，
+   * 返回页以目标收尾，无需逐页回翻——很早的消息（超出 15 页范围）也一发可达。
+   * 落位走 mergeSyncedMessages（allowGapped）：目标通常比现窗表头更老 ⇒ 排序后
+   * 落新表头；深翻裁尾时目标可能比表头新 ⇒ 中段插入（时间缺口由滚动分页自然
+   * 补齐，PC「往中间补了一段」同款语义）。直达页成为新表头时 hasMore 随之重算。
+   */
+  async function fetchJumpWindow(jumpSeq: number): Promise<void> {
+    const anchorId = listSettled.value && isChatActive() ? `msg-${firstVisibleRowKey().msgId}` : "";
+    scrollAnchor.value = "";
+    if (anchorId.length > 0) {
+      // #ifdef APP-IOS
+      engageHistoryLock();
+      // #endif
+      loadingOlder.value = true;
+    }
+    try {
+      const page = await fetchImConvHistoryPage(myUserId.value, convId.value, jumpSeq + 1, MSG_PAGE_SIZE, chatHistoryFetcher);
+      if (!isChatCurrent()) return;
+      if (page.records.length > 0) {
+        const headSeqBefore = messages.value.length > 0 ? messages.value[0].seq : 0;
+        if (anchorId.length > 0) {
+          engagePrependAnchor(anchorId);
+        }
+        mergeSyncedMessages(page.records, true);
+        if (messages.value.length > 0 && messages.value[0].seq < headSeqBefore) {
+          hasMore.value = page.hasMoreLocal;
+        }
+        refreshReadStatus();
+      }
+    } catch (_error) {
+      // #ifdef APP-IOS
+      releaseHistoryLock("error");
+      // #endif
+    } finally {
+      loadingOlder.value = false;
+    }
+  }
+
+  /**
+   * 定位到某条消息，两段式：
+   * ① 带 seq（搜索跳转/引用定位）：fetchJumpWindow 一发直达；未命中不再回翻——
+   *   比 seq 更早的页不可能包含它（已被清删/过滤）。
+   * ② 无 seq（旧载荷）：尾窗向上连续翻页（最多 15 页）。
+   * ★滚动/高亮不在本函数直接做：emit 时本页还被 quote-detail 盖着，隐藏状态下
+   *   scroll-into-view 不生效——统一延到 onShow（页面重新可见）后再应用。
+   */
+  async function jumpToMsg(msgId: string, jumpSeq: number): Promise<void> {
+    entryFollowLatest = false;
+    cancelSettle();
+    jumpLocating = true;
+    try {
+      if (findMsgById(msgId) == null && jumpSeq > 0) {
+        await fetchJumpWindow(jumpSeq);
+        if (!isChatCurrent()) return;
+      } else {
+        let pages = 0;
+        while (findMsgById(msgId) == null && pages < 15) {
+          if (loading.value || loadFailed.value || messages.value.length == 0 || hasMore.value != true) {
+            break;
+          }
+          pages++;
+          const oldestSeq = messages.value[0].seq;
+          await runLocatedPage(oldestSeq);
+          if (!isChatCurrent()) return;
+          // 空页/网络失败：游标不动再翻也是同一页，直接走未命中收口
+          if (messages.value.length == 0 || messages.value[0].seq >= oldestSeq) {
+            break;
+          }
+        }
+      }
+      if (findMsgById(msgId) == null) {
+        // 消费掉待定位并提示，避免回到聊天页后静默无操作、pendingJumpId 悬挂
+        //（loadFailed 已有整页失败态与重试入口，不叠加误导性 toast）
+        pendingJumpId = "";
+        if (!loadFailed.value) {
+          uni.showToast({ title: t("Mobile.Message.jumpOutOfRange"), icon: "none" });
+        }
+        if (!listSettled.value) {
+          // 进页遮蔽未揭幕：兜底贴底揭幕（引用定位路径本已可见，不拽底）
+          if (messages.value.length > 0) {
+            scrollToBottom();
+          } else {
+            listSettled.value = true;
+          }
+        }
+        return;
+      }
+      if (pageVisible) {
+        // 页面本就可见（数据补齐即可应用）：onShow 不会再触发，这里直接应用
+        applyPendingJump();
+      }
+    } finally {
+      jumpLocating = false;
+    }
+  }
+
+  /** 引用详情页 emit 的跳转事件（payload = "msgId|seq"，seq 供直达取页；旧载荷裸 msgId 兼容）。 */
   function onJumpEvent(data: any): void {
-    const msgId = data == null ? "" : `${data}`;
+    const raw = data == null ? "" : `${data}`;
+    if (raw.length == 0) {
+      return;
+    }
+    let msgId = raw;
+    let seq = 0;
+    const sep = raw.indexOf("|");
+    if (sep >= 0) {
+      msgId = raw.substring(0, sep);
+      const seqRaw = parseFloat(raw.substring(sep + 1));
+      seq = isNaN(seqRaw) || seqRaw <= 0 ? 0 : Math.floor(seqRaw);
+    }
     if (msgId.length == 0) {
       return;
     }
     pendingJumpId = msgId;
-    jumpToMsg(msgId);
+    jumpToMsg(msgId, seq);
   }
 
   // ===== 按住说话全屏蒙层（liveAsr 三阶段状态机）=====
@@ -12327,6 +12436,10 @@
       //   失败静默放行，按旧尾巴定位（与现状一致，不更糟）。
       if (unreadViewportRead) {
         await settleAfterSync(false);
+      } else if (pendingJumpId.length > 0) {
+        // 搜索/引用带定位目标进页：不贴底揭幕——veiled 直达定位（jumpToMsg 终态
+        // 揭幕；够不着/被清删分支兜底贴底）。尾部静默同步照常发，不阻塞定位取数。
+        settleAfterSync(false);
       } else {
         scrollToBottom();
         settleAfterSync(true);
@@ -12341,9 +12454,9 @@
       await loadHistory(0);
       loading.value = false;
       restoreFailedRows();
-      // 未读定位模式：首屏不滚底（保持遮蔽，定位交给 onLoad 的 locateFirstUnread；
-      // 失败/空列表由 locateFirstUnread 降级分支兜底揭幕）
-      if (!unreadViewportRead) {
+      // 未读定位/跳转定位模式：首屏不滚底（保持遮蔽，定位交给 onLoad 的
+      // locateFirstUnread / jumpToMsg；失败分支各自兜底揭幕）
+      if (!unreadViewportRead && pendingJumpId.length == 0) {
         scrollToBottom();
       }
     } catch (_error) {
@@ -12875,10 +12988,16 @@
       loadRevokeWindow();
       // 常用表情预热（长按面板第一行数据源；用户级资源，失败回落默认组，不阻塞首屏）
       loadRecentEmojis();
+      // 定位目标先落 pendingJumpId 再 initHistory：initHistory 据此不贴底揭幕
+      //（veiled 直达，对齐未读定位的遮蔽语义）；seq 供 fetchJumpWindow 一发直达。
+      const parsedJumpSeq = parseFloat(readOption(options, "jumpSeq"));
+      const jumpSeqNum = isNaN(parsedJumpSeq) || parsedJumpSeq <= 0 ? 0 : Math.floor(parsedJumpSeq);
+      if (jumpMsgId.length > 0) {
+        pendingJumpId = jumpMsgId;
+      }
       initHistory().then((): void => {
         if (jumpMsgId.length > 0) {
-          pendingJumpId = jumpMsgId;
-          jumpToMsg(jumpMsgId);
+          jumpToMsg(jumpMsgId, jumpSeqNum);
         } else if (unreadViewportRead) {
           locateFirstUnread();
         }

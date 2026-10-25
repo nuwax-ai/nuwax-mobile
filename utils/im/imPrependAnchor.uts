@@ -9,12 +9,17 @@ import View from "android.view.View";
  * - Android：onPreDraw 绘制前原生补偿（零闪烁）。原生视图 UniScrollerView 系 DCloud
  *   NestedScrollView（标准 mScrollY 滚动），getScrollY/scrollTo 同帧同步生效；勿改回
  *   uni 元素 scrollTop 属性读写（桥接异步，曾致补偿打折、视口落在加载页中间）。
- * - iOS：rAF 轮询（下次重绘前契约）+ UIScrollView.contentOffset 原生写。
+ * - iOS：16ms timer 帧循环 + 元素 scrollTop。原生通道（UIScrollView.contentOffset
+ *   直读写）在 HX 5.15 uts→Swift 编译下不可达：CGFloat↔number(NSNumber) 无桥接、
+ *   带标签调用/构造（CGPoint(x:y:)、setContentOffset(_:animated:)）报 missing
+ *   argument label，插件三轮编译实锤（2026-10-24），已弃。元素写桥接异步落位由
+ *   settling 循环等待 readY 追平，天然容忍。
  * - H5/WEB：rAF 轮询 + 元素 scrollTop。
  * - 鸿蒙：元素级 scrollTo/scrollTop 无实现且页面模板捕获已顶 255 硬限（不可绑
  *   scroll-top 属性），返回 null 由调用方走 scroll-into-view settle 兜底（顶部对齐，
  *   误差≤upper-threshold；后续若放开捕获预算可升级 getHarmonyController 原生通道）。
- * 校正窗口 1000ms，覆盖图片/文件等异步高度变化的后续布局；稳定两拍即停。
+ * 收工=measurement-driven 三条件（见过布局变化+drift 两拍稳+高度三拍稳，见
+ * startFrameAnchorLoop），覆盖图片/文件等异步高度变化；静默看门狗+5s 绝对兜底。
  */
 
 // #ifdef APP-ANDROID
@@ -27,6 +32,7 @@ class PrependDrawAnchor implements ViewTreeObserver.OnPreDrawListener {
   offset0: number;
   timer: number = 0;
   stopped: boolean = false;
+  done: ((reason: string) => void) | null = null;
 
   constructor(body: UniElement, anchor: UniElement, view: View, observer: ViewTreeObserver) {
     this.body = body;
@@ -50,6 +56,8 @@ class PrependDrawAnchor implements ViewTreeObserver.OnPreDrawListener {
       clearTimeout(this.timer);
       this.timer = 0;
     }
+    const cb = this.done;
+    if (cb != null) cb("android");
   }
 
   override onPreDraw(): boolean {
@@ -69,57 +77,130 @@ class PrependDrawAnchor implements ViewTreeObserver.OnPreDrawListener {
 // #endif
 
 /**
- * rAF 守卫（iOS/H5 共用）：
+ * 帧循环守卫（iOS/H5 共用，业务算法与 Android onPreDraw 分支同构）：
  * 不变量=锚点「内容偏移」（anchorTop + 滚动值）——用户滚动不改变内容偏移故不与用户对抗，
  * 头部插入等布局变化使其抬升即触发校正（滚动值 += 抬升量，锚点回到原视口位置）。
- * 写入落位等待（settling）：写后须等 readY 追上写入值才能继续判漂移/判稳，防异步
- * 生效窗口内重复补偿（iOS/H5 原生/属性写同步落位，等待至多白耗一拍，无副作用）。
- * 稳定两拍即停；1000ms 硬窗兜底（页面隐藏 rAF 不触发时防守卫滞留）。
+ * 统一测量快照：每 tick 每个量只读一次、顺序固定（bodyRect→anchorRect→contentHeight→
+ * scrollTop），杜绝同拍内新旧快照混算（bTop 理论恒定，参与 anchorTop 计算）。
+ * 收工三条件（measurement-driven，非时间驱动）：已观测到布局变化（内容高变或
+ * drift 越阈——纯滚动两值皆不变故不误置）+ drift 连续两拍 <0.5 + 锚点高/内容高
+ * 连续三拍 <0.5 且非 settling。
+ * ★停摆感知（2026-10-25 iOS 日志实锤：20 行 prepend 布局阻塞主线程 ~1s，1000ms
+ * 硬窗在校正开始前被吃光=「有时准有时不准」主因）：改静默看门狗——sawLayout 后
+ * 1s 无任何活动（测量无变化且非 settling）才收工；停摆恢复首拍见变化即重置。
+ * ★补拍风暴过滤：主线程停摆积压的 timer 恢复后连发（实测 3 tick/1ms），同拍冻结
+ * 快照会凑出假稳定（GIF 回落等迟到布局被漏补 ~40px）——相邻 tick 间隔 <8ms 不
+ * 累计 stable/heightStable，写入/settling 照常。绝对兜底 5s（防泄漏保险，非方案）。
+ * 写入落位等待（settling）：写后须等 readY 追上写入值才能继续判漂移/判稳，防桥接
+ * 异步生效窗口内重复补偿。
+ * 调度层适配（本函数唯一平台差异）：iOS uts 模块上下文无 requestAnimationFrame
+ * （官方支持表 uniUtsPlugin:"x"，2026-10-24 真机安装期抛错实锤）⇒ 16ms setTimeout
+ * 自链（iOS 4.11 起可用）；H5/WEB 维持 rAF（对齐重绘时机）。
  */
-function startRafAnchorLoop(
+function startFrameAnchorLoop(
   body: UniElement,
   anchor: UniElement,
   readY: () => number,
   writeY: (y: number) => void,
+  onDone: ((reason: string) => void) | null,
 ): () => void {
-  const anchorTop = (): number => anchor.getBoundingClientRect().top - body.getBoundingClientRect().top;
-  let target = anchorTop() + readY();
+  // 安装期快照（prepend 前真值，基线）。
+  const bodyRect0 = body.getBoundingClientRect();
+  const anchorRect0 = anchor.getBoundingClientRect();
+  const aTop0 = anchorRect0.top - bodyRect0.top;
+  const aH0 = anchorRect0.height;
+  const cH0 = body.scrollHeight;
+  const y0 = readY();
+  let target = aTop0 + y0;
   const startAt = Date.now();
-  let rafId = 0;
+  let lastTickAt = startAt;
+  let lastActivityAt = startAt;
+  let taskId = 0;
   let stable = 0;
+  let heightStable = 0;
+  let sawLayout = false;
   let settling = false;
   let lastWriteY = 0;
   let stopped = false;
-  const stop = (): void => {
+  let prevAH = aH0;
+  let prevCH = cH0;
+  let prevY = y0;
+  // 调度器默认 timer 自链（iOS 通道）；H5/WEB 覆写为 rAF。均为「下一拍」语义，业务无感。
+  let scheduleTick: (fn: () => void) => number = (fn: () => void): number => {
+    return setTimeout(fn, 16);
+  };
+  let cancelTick: (id: number) => void = (id: number): void => {
+    if (id != 0) clearTimeout(id);
+  };
+  // #ifdef H5 || WEB
+  scheduleTick = (fn: () => void): number => {
+    return requestAnimationFrame(fn);
+  };
+  cancelTick = (id: number): void => {
+    if (id != 0) cancelAnimationFrame(id);
+  };
+  // #endif
+  const stop = (reason: string): void => {
     if (stopped) return;
     stopped = true;
-    if (rafId != 0) {
-      cancelAnimationFrame(rafId);
-      rafId = 0;
-    }
+    cancelTick(taskId);
+    taskId = 0;
+    if (onDone != null) onDone(reason);
   };
   const tick = (): void => {
     if (stopped) return;
-    if (Date.now() - startAt >= 1000) {
-      stop();
+    // 统一快照：每量单读、序固定，本拍全部运算只用这份。
+    const now = Date.now();
+    const burst = now - lastTickAt < 8;
+    lastTickAt = now;
+    const bTop = body.getBoundingClientRect().top;
+    const aRect = anchor.getBoundingClientRect();
+    const aTop = aRect.top - bTop;
+    const aH = aRect.height;
+    const cH = body.scrollHeight;
+    const y = readY();
+    const cur = aTop + y;
+    const drift = cur - target;
+    if (!sawLayout && (Math.abs(cH - cH0) >= 0.5 || Math.abs(drift) >= 0.5)) {
+      sawLayout = true;
+    }
+    // 补拍风暴（<8ms 积压连发）测的是同拍冻结快照，不计稳定拍；变化照常归零。
+    const heightSame = Math.abs(aH - prevAH) < 0.5 && Math.abs(cH - prevCH) < 0.5;
+    if (heightSame) {
+      if (!burst) heightStable++;
+    } else {
+      heightStable = 0;
+    }
+    const changed = !heightSame || Math.abs(y - prevY) >= 0.5;
+    prevAH = aH;
+    prevCH = cH;
+    prevY = y;
+    if (changed || settling) {
+      lastActivityAt = now;
+    }
+    // 静默看门狗/绝对兜底（先测后判：停摆恢复首拍若见变化已在上面重置看门狗）。
+    if (now - startAt >= 5000) {
+      stop("abs");
+      return;
+    }
+    if (sawLayout && settling != true && now - lastActivityAt >= 1000) {
+      stop("idle");
       return;
     }
     if (settling) {
       // 上次写入尚未被滚动回调反映：等落位（期间不判漂移，防重复补偿）。
-      if (Math.abs(readY() - lastWriteY) >= 0.5) {
+      if (Math.abs(y - lastWriteY) >= 0.5) {
         stable = 0;
-        rafId = requestAnimationFrame(tick);
+        taskId = scheduleTick(tick);
         return;
       }
       settling = false;
     }
-    const cur = anchorTop() + readY();
-    const drift = cur - target;
     if (Math.abs(drift) < 0.5) {
-      // 连续两拍稳定才收工（图片等异步高度变化的二次布局留一拍缓冲）。
-      stable++;
-      if (stable >= 2) {
-        stop();
+      // 收工须三条件齐备：见过布局变化（防布局前误判稳）+ drift 两拍稳（真拍）+ 高度三拍稳。
+      if (!burst) stable++;
+      if (sawLayout && stable >= 2 && heightStable >= 3) {
+        stop("stable");
         return;
       }
     } else {
@@ -127,19 +208,27 @@ function startRafAnchorLoop(
       settling = true;
       // 基线重定到写入后的内容偏移；写入目标 = 当前滚动 + 抬升量。
       target = cur;
-      lastWriteY = Math.max(0, readY() + drift);
+      lastWriteY = Math.max(0, y + drift);
       writeY(lastWriteY);
+      lastActivityAt = Date.now();
     }
-    rafId = requestAnimationFrame(tick);
+    taskId = scheduleTick(tick);
   };
-  rafId = requestAnimationFrame(tick);
+  taskId = scheduleTick(tick);
   setTimeout((): void => {
-    stop();
-  }, 1000);
-  return stop;
+    stop("abs");
+  }, 5000);
+  // 外部取消也归一走 stop（onDone 恰好一次，stopped 幂等守卫）。
+  return (): void => {
+    stop("cancel");
+  };
 }
 
-export function preserveImPrependAnchor(bodyId: string, anchorId: string): (() => void) | null {
+export function preserveImPrependAnchor(
+  bodyId: string,
+  anchorId: string,
+  onDone: ((reason: string) => void) | null = null,
+): (() => void) | null {
   // #ifdef APP-ANDROID
   const body = uni.getElementById(bodyId);
   const anchor = uni.getElementById(anchorId);
@@ -148,6 +237,7 @@ export function preserveImPrependAnchor(bodyId: string, anchorId: string): (() =
   if (view == null) return null;
   const observer = view.getViewTreeObserver();
   const guard = new PrependDrawAnchor(body, anchor, view, observer);
+  guard.done = onDone;
   observer.addOnPreDrawListener(guard);
   // 无新增记录、请求结果重复等路径同样释放监听。
   guard.timer = setTimeout((): void => {
@@ -157,36 +247,21 @@ export function preserveImPrependAnchor(bodyId: string, anchorId: string): (() =
     guard.stop();
   };
   // #endif
-  // #ifdef APP-IOS
-  const iosBody = uni.getElementById(bodyId);
-  const iosAnchor = uni.getElementById(anchorId);
-  if (iosBody != null && iosAnchor != null) {
-    const sv = iosBody.getIOSView() as UIScrollView | null;
-    return startRafAnchorLoop(
-      iosBody,
-      iosAnchor,
-      (): number => {
-        if (sv != null) return sv.contentOffset.y;
-        return iosBody.scrollTop;
-      },
+  // #ifdef APP-IOS || H5 || WEB
+  const scBody = uni.getElementById(bodyId);
+  const scAnchor = uni.getElementById(anchorId);
+  if (scBody != null && scAnchor != null) {
+    // iOS/H5 同一元素 scrollTop 通道（差异仅在调度器：iOS timer / H5 rAF，见
+    // startFrameAnchorLoop）。iOS 元素 scrollTop 与原生 contentOffset 双向同步，
+    // 写入经桥接异步落位——settling 循环等 readY 追平写入值再判漂移，天然容忍。
+    return startFrameAnchorLoop(
+      scBody,
+      scAnchor,
+      (): number => scBody.scrollTop,
       (y: number): void => {
-        if (sv != null) sv.contentOffset = CGPointMake(0, y);
-        else iosBody.scrollTop = y;
+        scBody.scrollTop = y;
       },
-    );
-  }
-  // #endif
-  // #ifdef H5 || WEB
-  const webBody = uni.getElementById(bodyId);
-  const webAnchor = uni.getElementById(anchorId);
-  if (webBody != null && webAnchor != null) {
-    return startRafAnchorLoop(
-      webBody,
-      webAnchor,
-      (): number => webBody.scrollTop,
-      (y: number): void => {
-        webBody.scrollTop = y;
-      },
+      onDone,
     );
   }
   // #endif

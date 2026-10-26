@@ -240,11 +240,14 @@
                   >{{ t("Mobile.Message.sendFailed") }}</text
                 >
                 <!-- 智能体处理标记（消息衔接了智能体才有明细；WS 3006 帧驱动）：
-                     未读=灰空心圈 / 处理中=青色转钟 / 完成=蓝圈蓝勾（DEV-308：蓝=完成，
+                     未读=灰空心圈（仅群聊）/ 处理中=青色转钟 / 完成=蓝圈蓝勾（DEV-308：蓝=完成，
                      绿=已读回执，勿混）/ 失败=红圈叹号。
                      ★p2p 替代已读环、群聊与已读环并列（PC 拍板⑥=C）——与下方两环各自独立 v-if；
+                     ★单聊 status=1（建行未读，仅拉路径可见）不画标记：未读与否交由已读水位说话
+                     （下方单聊环：未读灰环/已读绿点，PC ReadInfo 同款）——否则重进会话时
+                     灰圈顶掉已读绿点（⑥=C 渲染顶替，2026-10-26 排查定案）；
                      agentClockDeg 作参传入建立响应依赖（readInfoTick 同款） -->
-                <view v-if="msg.agentStatus > 0" class="chat-agent">
+                <view v-if="msg.agentStatus > 0 && (isGroupLike || msg.agentStatus != 1)" class="chat-agent">
                   <view v-if="msg.agentStatus == 1" class="chat-agent__ring" />
                   <view
                     v-else-if="msg.agentStatus == 2"
@@ -298,14 +301,31 @@
                     </view>
                   </view>
                 </view>
-                <!-- 单聊：未读=灰空心圈，已读=绿圈绿勾，点击无动作；
-                     有智能体标记时不渲染（agent mark 替代已读环） -->
+                <!-- 单聊：未读=灰空心圈；已读=绿圈+圈内绿芯点（PC ReadRingIcon 同款，DEV-308 绿=已读）。
+                     ★智能体单聊（拍板 10-26：绿点出现=已读=开始思考，后端 2 帧要等首条回复才推，
+                     思考期等不来帧 ⇒ 客户端合成）：已读且对端尚无落在本行之后的回复=合成思考转钟
+                     （msg.agentP2pMark==1，行字段驱动——模板零新增顶层引用，render lambda 255 参数
+                     硬限）；已有=合成完成蓝勾（==2）；人-人单聊恒 0=绿点照旧。
+                     真实 3006 帧 2/3/4 经 agentStatus 压过合成态（agentStatus<=1 才走本环）。点击无动作 -->
                 <view
-                  v-if="readInfoOf(msg, readInfoTick) != null && isGroupLike != true && msg.agentStatus <= 0"
+                  v-if="readInfoOf(msg, readInfoTick) != null && isGroupLike != true && msg.agentStatus <= 1"
                   class="chat-read"
                 >
-                  <view v-if="readAllOf(msg, readInfoTick) || readCountOf(msg, readInfoTick) > 0" class="chat-read__ring">
-                    <view class="chat-read__tick" />
+                  <view v-if="readAllOf(msg, readInfoTick) || readCountOf(msg, readInfoTick) > 0">
+                    <view
+                      v-if="msg.agentP2pMark == 1"
+                      class="chat-agent__clock"
+                      :style="agentClockStyle(agentClockDeg)"
+                    >
+                      <view class="chat-agent__hand chat-agent__hand--v" />
+                      <view class="chat-agent__hand chat-agent__hand--h" />
+                    </view>
+                    <view v-else-if="msg.agentP2pMark == 2" class="chat-agent__ring chat-agent__ring--done">
+                      <view class="chat-agent__tick" />
+                    </view>
+                    <view v-else class="chat-read__ring">
+                      <view class="chat-read__dot" />
+                    </view>
                   </view>
                   <view v-else class="chat-read__ring chat-read__ring--pending" />
                 </view>
@@ -2132,6 +2152,8 @@
     agentDetail: ImAgentStatusItem[] = [];
     /** 聚合后的智能体标记态：0=无明细（回落已读环）1未读 2处理中(转钟) 3失败 4完成；applyAgentStatusToRow 维护。 */
     agentStatus: number = 0;
+    /** 单聊智能体合成标记（chat.uvue recomputeAgentP2pMarks 维护）：0=无 1=思考转钟 2=完成蓝勾。 */
+    agentP2pMark: number = 0;
     /** 合并转发卡片标题（body.title；空=接收端回落「聊天记录」）。 */
     mergeTitle: string = "";
     /** 合并转发预览条目（body.items 前 2 条渲染，其余收进「共 N 条」；空=非合并转发）。 */
@@ -4642,11 +4664,16 @@
     }
   }
 
-  /** 是否有「处理中」行：依赖 messages 整表重赋值（明细变更均伴随 mergeSyncedMessages/scheduleChatMediaRefresh）。 */
+  /** 是否有「处理中」行（真实 3006 状态 ∨ 单聊合成思考标记 agentP2pMark==1）：依赖 messages
+      整表重赋值（明细变更均伴随 mergeSyncedMessages/scheduleChatMediaRefresh；合成标记由
+      recomputeAgentP2pMarks 写行字段，同样借整表重建上屏——合成转钟挂同一套旋转定时器）。 */
   const anyAgentProcessing = computed((): boolean => {
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].agentStatus == IM_AGENT_STATUS_PROCESSING) {
+        return true;
+      }
+      if (rows[i].agentP2pMark == 1) {
         return true;
       }
     }
@@ -5580,11 +5607,18 @@
     const infos = readInfos.value;
     for (let i = 0; i < infos.length; i++) {
       if (infos[i].msgId == msgId) {
+        // ★单调护栏（2026-10-26 智能体单聊已读态丢失实锤）：发送确认直调的 read-status
+        // 查询在途时，WS 4001 水位帧可先把 readAll 置真（绿点/思考转钟出现），该响应带着
+        // 「服务端尚未聚合」的 readAll=false 晚归且请求序号仍最新——readStatusSeq 只防
+        // 请求间乱序，防不住 WS 先真/HTTP 后假。已读在服务端只前进不回退（4001 分支本就
+        // 单调 max），此处同口径：readAll 只真化、readCount/eligibleCount 只取更大，
+        // 晚到的旧值作废。
+        const old = infos[i];
         const updated = new ImReadInfo();
         updated.msgId = msgId;
-        updated.readCount = readCount;
-        updated.eligibleCount = eligibleCount;
-        updated.readAll = readAll;
+        updated.readCount = old.readCount < readCount ? readCount : old.readCount;
+        updated.eligibleCount = old.eligibleCount < eligibleCount ? eligibleCount : old.eligibleCount;
+        updated.readAll = old.readAll || readAll;
         infos.splice(i, 1, updated);
         bumpReadInfoTick();
         return;
@@ -5724,6 +5758,58 @@
   }
 
   /**
+   * 单聊智能体合成标记重算（用户拍板 2026-10-26：绿点出现=已读=智能体开始思考）。
+   * 后端 3006 要等智能体首条回复才推「处理中」（非流式智能体≈思考结束），思考期转钟
+   * 等不来帧，只能客户端合成：智能体单聊（isAgentP2p）里我发的行、agentStatus<=1
+   * （无真实处理中/终态）时——已读且对端尚无 seq≥本行的回复 ⇒ 1=思考转钟；已读且已有
+   * ⇒ 2=完成蓝勾；其余 0（未读灰环；人-人单聊恒 0=已读绿点照旧）。真实 2/3/4 帧经
+   * agentStatus 压过合成态，本函数遇 agentStatus>1 即清零。
+   * ★纯行字段写入（模板零新增顶层引用——render lambda 255 参数硬限），行内字段变更须
+   * 伴随 messages 整表重赋值/scheduleChatMediaRefresh 才上屏；anyAgentProcessing 扫
+   * agentP2pMark==1 驱动转钟定时器。调用点：已读合并（查询/READ_NOTIFY）、回复落地、
+   * 3006 帧合并、窗口重建（merge/reset/settle）、智能体判定齐料后。
+   */
+  function recomputeAgentP2pMarks(): void {
+    const rows = messages.value;
+    if (isAgentP2p.value != true || isGroupLike.value == true) {
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i].agentP2pMark != 0) {
+          rows[i].agentP2pMark = 0;
+        }
+      }
+      return;
+    }
+    // 对端最新已确认回复 seq（合成分界：思考中=尚无对端回复落在本行之后）
+    let peerMaxSeq = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      if (isMine(r) != true && r.seq > peerMaxSeq) {
+        peerMaxSeq = r.seq;
+      }
+    }
+    const infos = readInfos.value;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (isMine(row) != true || row.status != 1 || row.revoked || isConfirmedRow(row) != true || row.agentStatus > 1) {
+        row.agentP2pMark = 0;
+        continue;
+      }
+      let read = false;
+      for (let j = 0; j < infos.length; j++) {
+        if (infos[j].msgId == row.msgId) {
+          read = infos[j].readAll || infos[j].readCount > 0;
+          break;
+        }
+      }
+      if (read != true) {
+        row.agentP2pMark = 0;
+        continue;
+      }
+      row.agentP2pMark = row.seq > peerMaxSeq ? 1 : 2;
+    }
+  }
+
+  /**
    * 批量刷新我发消息的已读计数（msgIds ≤200/批，超限服务端直接抛错不截断）：
    * 只查「无缓存 || 未 readAll」的增量集，按 seq 降序取最新 200——更早的行不渲染
    * icon（见 readInfoOf 注释），不做多批循环；请求序号防旧响应覆盖新数据。
@@ -5774,6 +5860,7 @@
           // ★App-Android 已读 icon/扇形对 readInfoTick 的 bump 不重渲（2026-10-14
           // 真机日志实锤：merge 值 0→2→4→5 在变、UI 冻结），splice+bump 链对已读列
           // 无效——去抖整表重建强制重渲（表情回复/媒体回填同款，key 稳定不跳滚动）。
+          recomputeAgentP2pMarks();
           scheduleChatMediaRefresh();
         }
       }
@@ -7299,6 +7386,9 @@
       return a.seq - b.seq;
     });
     messages.value = rows;
+    // 拉取快照可能带入对端回复/已读变化：赋值后重算合成标记，借去抖重建上屏
+    recomputeAgentP2pMarks();
+    scheduleChatMediaRefresh();
     for (let i = 0; i < messages.value.length; i++) {
       const row = messages.value[i];
       if (changed.has(row.msgId)) resolveRowMedia(row);
@@ -7325,6 +7415,8 @@
       fresh.push(readMsgRow(rows[i]));
     }
     messages.value = fresh;
+    recomputeAgentP2pMarks();
+    scheduleChatMediaRefresh();
     windowTailTrimmed = false;
     // 同 initHistory 口径：DB 缓存比尾窗深 ⇒ 闸门开（hasMore=false 不闸死已缓存行）
     hasMore.value = (dbMeta != null ? dbMeta.hasMore : true) || (dbMeta != null && dbMeta.total > rows.length);
@@ -12696,6 +12788,16 @@
     } else {
       // 对方消息落地即乐观收口智能体转钟（人类 senderId 匹配不到任何明细，天然空转）
       settleAgentProcessingOnReply(row.senderId);
+      // 合成标记随回复落地翻转（思考中→完成）；行内字段变更须整表重建上屏
+      //（insertMessageBySeq 只追新行，不改存量行渲染）
+      recomputeAgentP2pMarks();
+      scheduleChatMediaRefresh();
+      // 智能体回复落地 ⟹ 读取必然已发生：4001 推帧丢失（服务端 Pub/Sub 至多一次）或
+      // 已读态曾被旧响应打回时，补拉一次已读态自愈——mergeReadInfo 已单调，此查只升不
+      // 降；全部已读时候选为空，refreshReadStatus 直接返回不发包。仅智能体单聊。
+      if (isAgentP2p.value == true) {
+        scheduleReadRefresh();
+      }
     }
   }
 
@@ -12807,6 +12909,7 @@
       }
     }
     // ★同 refreshReadStatus：已读数据变更后整表去抖重建强制重渲（Android tick 链无效）
+    recomputeAgentP2pMarks();
     scheduleChatMediaRefresh();
   }
 
@@ -12954,9 +13057,19 @@
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].msgId == msgId) {
         const row = rows[i];
+        // 迟到「处理中」帧——按行状态判（时钟比对版已撤：updateTime/sendTime 服务端语义
+        // 不可比，真机实证丢弃从未生效）：该行已有对端更新回复落地（合成完成态）且尚无
+        // 真实状态 ⟹ 批次早已 settle（⑥先于⑦），收下只会在回复渲染后再闪一轮转钟。丢弃，
+        // 真相由随后终态帧补；3/4 帧不丢（失败轮真相要进来）。排队下一轮的行已在合成完成
+        // 态，其 2 帧同被丢弃——代价=该轮少转一会儿钟，终点仍由 4 帧收敛。
+        if (item.status == IM_AGENT_STATUS_PROCESSING && row.agentStatus <= 1 && row.agentP2pMark == 2) {
+          return;
+        }
         const incoming: ImAgentStatusItem[] = [item];
         if (mergeRowAgentDetail(row, incoming)) {
-          // Android 不追踪行内原地变更：整表去抖重建触发 v-for 重渲（表情回应同款）
+          // Android 不追踪行内原地变更：整表去抖重建触发 v-for 重渲（表情回应同款）；
+          // 真实状态落地后合成标记按新 agentStatus 清零重算
+          recomputeAgentP2pMarks();
           scheduleChatMediaRefresh();
         }
         return;
@@ -13133,7 +13246,12 @@
       loadContactRemarks();
       // 长按操作的能力依据（群治理开关/我的角色、置顶集、撤回时限），不阻塞首屏
       //（同上：详情回程也计一次判定齐料——peerUserId 来自这里）
-      loadConvInfo().then((): void => settleP2pAgentCheck());
+      loadConvInfo().then((): void => {
+        settleP2pAgentCheck();
+        // isAgentP2p 齐料可能翻转：合成标记随之启用/清零（此前事件已按非智能体口径算过）
+        recomputeAgentP2pMarks();
+        scheduleChatMediaRefresh();
+      });
       loadPinnedIds();
       loadRevokeWindow();
       // 常用表情预热（长按面板第一行数据源；用户级资源，失败回落默认组，不阻塞首屏）
@@ -14715,6 +14833,16 @@
     border-right: 2px solid #3fae94;
     border-bottom: 2px solid #3fae94;
     transform: rotate(45deg);
+  }
+
+  /* 单聊已读芯点（群聊绿勾仍用 __tick，勿混）：PC ReadRingIcon 同款几何——外环 r≈6、
+     内芯 r≈3，环与芯之间留一圈背景间隙（芯点直径取环内径的 6/10）。环容器自带 flex
+     居中，子节点免绝对定位直接落心 */
+  .chat-read__dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background-color: #3fae94;
   }
 
   /* 扇形饼图（群部分已读，扇形面积=已读占比）：双半圆法——半遮罩 overflow hidden

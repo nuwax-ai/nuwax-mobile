@@ -675,6 +675,13 @@
   import { formatBytes } from "@/utils/byteConverter.uts";
   import { objectToQueryString, getCurrentPageFullPath } from "@/utils/common";
   import { chatService } from "@/utils/chatService";
+  import {
+    chatSendJournalScope,
+    saveChatSendJournal,
+    readChatSendJournal,
+    readChatSendJournalJson,
+    clearChatSendJournal,
+  } from "@/utils/chatSendJournal";
   import { handleExternalLink } from "@/utils/system.uts";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system.uts";
   import { setEmbeddedStatusBarHeight } from "@/utils/system.uts";
@@ -2355,9 +2362,85 @@
     data.wholeDisabled.value = disabled;
   };
 
-  // 服务层 - 使用箭头函数保持this上下文
-  const handleQueryConversation = (result: RequestResponse<ConversationInfo>) =>
-    service.handleQueryConversation(result);
+  // ── 发送台账恢复 ──
+  // 点发送后 POST 在途被强退（webview 随页销毁）时，重进会话把未确认送达的发送意图
+  // 恢复为输入框草稿；已送达（历史出现同内容用户消息）则静默清台账。详见 utils/chatSendJournal.uts。
+  let sendJournalRestoredThisSession = false;
+
+  function sendJournalMessageTimeMs(m: MessageInfo): number {
+    try {
+      if (m.time == null || m.time.length == 0) return 0;
+      return new Date(m.time).getTime();
+    } catch (_e) {
+      return 0;
+    }
+  }
+
+  /** 台账判定已送达：历史里出现台账时间窗内、附件数一致且正文包含的用户消息。 */
+  function sendJournalDelivered(journal: UTSJSONObject): boolean {
+    const text = journal["messageInfo"] != null ? `${journal["messageInfo"]}`.trim() : "";
+    const filesRaw = journal["files"];
+    const filesCount = filesRaw != null && Array.isArray(filesRaw) ? (filesRaw as any[]).length : 0;
+    if (text.length == 0 && filesCount == 0) return true;
+    const ts = journal["ts"] != null ? parseFloat(`${journal["ts"]}`) : 0;
+    // 客户端/服务端时钟差 + 受理落库延迟：允许台账时间前 5 分钟内的历史消息参与匹配
+    const minMs = ts > 0 ? ts - 5 * 60 * 1000 : 0;
+    const list = data.messageList.value;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const m = list[i];
+      if (m.role != AssistantRoleEnum.USER) continue;
+      if (minMs > 0) {
+        const mMs = sendJournalMessageTimeMs(m);
+        if (mMs > 0 && mMs < minMs) break;
+      }
+      if (m.attachments == null || m.attachments.length != filesCount) continue;
+      // 历史用户消息 text 可能内嵌附件标签：正文用包含匹配
+      const mText = m.text != null ? `${m.text}` : "";
+      if (text.length == 0 || mText.indexOf(text) >= 0) return true;
+    }
+    return false;
+  }
+
+  function tryRestoreSendJournal(): void {
+    if (props.isTempChat == true) return;
+    if (sendJournalRestoredThisSession == true) return;
+    const convIdRaw = data.conversationId.value;
+    const agentIdRaw = data.agentId.value;
+    // 两键都可能为 null（未定会话/未带 agent），null 按 0 处理=不参与 scope
+    const convId = convIdRaw != null ? (convIdRaw as number) : 0;
+    const agentId = agentIdRaw != null ? (agentIdRaw as number) : 0;
+    if (convId <= 0 && agentId <= 0) return;
+    const scopes: string[] = [];
+    if (convId > 0) scopes.push(chatSendJournalScope(convId, agentId));
+    if (agentId > 0) scopes.push(`a${agentId}`);
+    for (let s = 0; s < scopes.length; s++) {
+      const scope = scopes[s];
+      const journal = readChatSendJournal(scope);
+      if (journal == null) continue;
+      if (sendJournalDelivered(journal) == true) {
+        // 服务端实际已受理（首包清除回调晚于强退）：静默丢弃台账
+        clearChatSendJournal(scope);
+        continue;
+      }
+      const inputRef = agentDetailInputRef.value as any | null;
+      if (inputRef == null) return;
+      const raw = readChatSendJournalJson(scope);
+      const restored = (inputRef as ComponentPublicInstance).$callMethod("restoreSendDraft", raw);
+      if (restored == true) {
+        clearChatSendJournal(scope);
+        sendJournalRestoredThisSession = true;
+        uni.showToast({ title: t("Mobile.Chat.sendDraftRestored"), icon: "none" });
+      }
+      // 恢复失败（输入框非空等）：保留台账，下次进会话再试
+      return;
+    }
+  }
+
+  // 服务层 - 使用箭头函数保持this上下文（await 历史重建后再跑台账恢复，保证去重基于完整历史）
+  const handleQueryConversation = async (result: RequestResponse<ConversationInfo>) => {
+    await service.handleQueryConversation(result);
+    tryRestoreSendJournal();
+  };
   const handleChangeMessageList = (
     res: ConversationChatResponse,
     currentMessageId: string,
@@ -2727,6 +2810,26 @@
     // 本地发送前中断 sub 流恢复（避免 live + sub 双流）
     service.abortSubConversation();
 
+    // 发送台账：POST 派发前持久化发送意图；服务端受理（SSE 首包回调）后清除。
+    // 强退导致 POST 在途被拆时，重进会话恢复草稿（utils/chatSendJournal.uts）。
+    let sendJournalScope = "";
+    if (props.isTempChat != true) {
+      sendJournalScope = chatSendJournalScope(
+        data.conversationId.value != null ? (data.conversationId.value as number) : 0,
+        data.agentId.value != null ? (data.agentId.value as number) : 0,
+      );
+      const journalFilesRaw = params["files"];
+      const journalFiles: UTSJSONObject[] =
+        journalFilesRaw != null && Array.isArray(journalFilesRaw)
+          ? (journalFilesRaw as UTSJSONObject[])
+          : ([] as UTSJSONObject[]);
+      saveChatSendJournal(
+        sendJournalScope,
+        params["messageInfo"] != null ? `${params["messageInfo"]}` : "",
+        journalFiles,
+      );
+    }
+
     service.handleSendMessage(params, props.isTempChat, () => {
       // 软断流 / 超时收尾：只复位按钮态。会话态由 service 管理——
       // 普通会话 fail 保持态（不关 loading，避免「消失→续接→又出现」翻转），
@@ -2737,7 +2840,11 @@
     }, () => {
       const sendPromptRaw = params["messageInfo"];
       if (sendPromptRaw != null) triggerProjectNameBootstrap(`${sendPromptRaw}`);
-    });
+    }, sendJournalScope.length > 0
+      ? (): void => {
+          clearChatSendJournal(sendJournalScope);
+        }
+      : null);
     // 用户/助手气泡已入列表后再滚底（含短时补滚，覆盖 iOS 布局晚到）
     data.autoToLastMsg.value = true;
     scrollToLastMsgAfterSend();
@@ -4542,6 +4649,12 @@
     // #ifdef APP || WEB
     bindMarkdownProxyWeb();
     // #endif
+    // 新会话（无 conversationId，不拉历史）：延迟兜底跑一次发送台账恢复
+    setTimeout((): void => {
+      const bootCid = data.conversationId.value;
+      // 新会话（无 convId）：历史接口不会回，延时兜底跑一次恢复（agent 维度 scope）
+      if (bootCid == null || bootCid <= 0) tryRestoreSendJournal();
+    }, 800);
     runOnMountedAsync();
   });
 

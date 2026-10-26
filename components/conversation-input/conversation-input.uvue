@@ -4524,12 +4524,115 @@
   const handleDelFile = (uid: string) => {
     files.value = filterFilesExcludingUid(files.value, uid);
   };
+
+  // ── 发送台账恢复（会话页重进，$callMethod("restoreSendDraft", rawJson)）──
+  // 正文回填编辑器；附件带服务端 key 的直接可发，无 key 的按本地路径重传，
+  // 源文件已失效（blob 随页销毁等）会失败落现有 error 芯片（可删/重选）。
+  function applyRestoreEditorText(text: string, attempt: number): void {
+    // #ifndef MP
+    if (editorContext == null || editorReady.value != true) {
+      // 编辑器初始化是异步的：未就绪则延迟重试（封顶 5 次防死循环）
+      if (attempt < 5) {
+        setTimeout((): void => {
+          applyRestoreEditorText(text, attempt + 1);
+        }, 400);
+      }
+      return;
+    }
+    const insert = new UTSJSONObject();
+    insert["insert"] = text;
+    const ops: UTSJSONObject[] = [] as UTSJSONObject[];
+    ops.push(insert);
+    const delta = new UTSJSONObject();
+    delta["ops"] = ops;
+    syncingEditorContent = true;
+    editorContext!.setContents({
+      delta,
+      complete: (_res: any): void => {
+        syncingEditorContent = false;
+      },
+    });
+    // #endif
+  }
+
+  function restoreSendDraft(rawJson: string): boolean {
+    try {
+      if (rawJson.length == 0) return false;
+      // 输入框已有内容/附件（用户先手输入或其它草稿机制已注入）时不覆盖
+      if (messageInfo.value.trim().length > 0 || files.value.length > 0) return false;
+      const parsed = JSON.parse<UTSJSONObject>(rawJson);
+      if (parsed == null) return false;
+
+      const text = parsed["messageInfo"] != null ? `${parsed["messageInfo"]}` : "";
+      if (text.length > 0) {
+        messageInfo.value = text;
+        lastEditorText = text;
+        lastEditorRawText = text;
+        editorIndexedText = text;
+        editorInputCursor = text.length;
+        applyRestoreEditorText(text, 0);
+      }
+
+      const filesRaw = parsed["files"];
+      if (filesRaw != null && Array.isArray(filesRaw)) {
+        const rows = filesRaw as any[];
+        const appendList: UTSJSONObject[] = [];
+        const reuploadList: UTSJSONObject[] = [];
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i] as UTSJSONObject;
+          const uid = getFileUid();
+          const entry = new UTSJSONObject();
+          entry["uid"] = uid;
+          entry["url"] = row["url"] != null ? `${row["url"]}` : "";
+          entry["name"] = row["name"] != null ? `${row["name"]}` : "";
+          const typeVal = row["type"] != null ? `${row["type"]}` : "";
+          if (typeVal.length > 0) entry["type"] = typeVal;
+          entry["size"] = row["size"] != null ? parseFloat(`${row["size"]}`) : 0;
+          const key = row["key"] != null ? `${row["key"]}` : "";
+          if (key.length > 0) {
+            // 上传已完成（字节已在服务端）：直接可发
+            entry["key"] = key;
+            entry["status"] = UploadFileStatus.done;
+            entry["percent"] = 100;
+          } else {
+            // 死在半路的附件：按本地路径重传（Android 原生选择器拷贝的文件可读）
+            entry["status"] = UploadFileStatus.uploading;
+            reuploadList.push(entry);
+          }
+          appendList.push(entry);
+        }
+        if (appendList.length > 0) {
+          files.value = [...files.value, ...appendList];
+        }
+        for (let p = 0; p < reuploadList.length; p++) {
+          const item = reuploadList[p];
+          const path = `${item["url"]}`;
+          const uid = `${item["uid"]}`;
+          if (path.length == 0) {
+            markFileUploadError(uid);
+            continue;
+          }
+          uploadFile(path, uid)
+            .then((_res: UTSJSONObject): void => {})
+            .catch((_e: any | null): void => {
+              markFileUploadError(uid);
+            });
+        }
+      }
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
   // 暴露messageInfo和files
   defineExpose({
     files,
     selectedComponents,
     getFiles,
     getSelectedComponents,
+    /** 发送台账恢复：重进会话恢复未送达草稿；输入框非空时拒绝（返回 false）。 */
+    restoreSendDraft,
     /** 首页提示问题：一次替换草稿，清技能/资料，不触发发送且保留当前智能体。语音态先切回输入再聚焦。 */
     setText: (text: string): void => {
       const fromVoice = inputMethod.value == ChatInputMethod.Voice;

@@ -2,7 +2,7 @@
   <!-- 音频转写播放器：会议 / 监控列表共用（播放条 + 转写分段同步高亮 / 点击跳转） -->
   <view class="atp flex flex-col">
     <!-- 播放器 -->
-    <view v-if="showPlayer && hasAudio" class="atp__player">
+    <view v-if="showPlayer && hasAudio && resolvedHasAudio" class="atp__player">
       <!-- 主行：播放按钮（带声波动效）+ 进度 + 倍速 -->
       <view class="atp__player-main">
         <view class="atp__play-btn" hover-class="atp__play-btn--active" @click="handlePlayToggle">
@@ -73,7 +73,7 @@
             <view class="atp__seg-body">
               <view class="atp__seg-head">
                 <text class="atp__seg-speaker">{{ speakerLabel(seg) }}</text>
-                <text :class="['atp__seg-time', isActiveSegment(seg) ? 'atp__seg-time--active' : '']">{{ formatMs(seg.startMs) }}</text>
+                <text v-if="hasValidTime(seg)" :class="['atp__seg-time', isActiveSegment(seg) ? 'atp__seg-time--active' : '']">{{ formatMs(seg.startMs) }}</text>
               </view>
               <text class="atp__seg-text">{{ seg.text }}</text>
             </view>
@@ -169,9 +169,13 @@
    * 录音按 segmentIndex 升序拆成多段，全局进度 = Σ前缀段 durationMs + 当前段内偏移。
    * total=1（无卡现状）时数组只有一段，行为与旧单文件口径完全一致。
    */
-  interface SegRuntime {
-    audioUrl: string;
-    durationMs: number;
+  class SegRuntime {
+    audioUrl: string = "";
+    durationMs: number = 0;
+    constructor(audioUrl: string = "", durationMs: number = 0) {
+      this.audioUrl = audioUrl;
+      this.durationMs = durationMs;
+    }
   }
   let audioSegments: SegRuntime[] = [] as SegRuntime[];
   let currentSegIndex: number = -1;
@@ -232,7 +236,19 @@
   let seekGuardTargetMs: number = -1;
   let seekGuardUntilMs: number = 0;
 
+  const audioLoaded = ref<boolean>(false);
+  const resolvedHasAudio = computed((): boolean => {
+    if (!props.hasAudio) return false;
+    if (audioLoaded.value && audioSegments.length == 0) return false;
+    return true;
+  });
+
+  const hasValidTime = (seg: AudioTranscriptSegment): boolean => {
+    return seg.startMs >= 0;
+  };
+
   const formatMs = (ms: number): string => {
+    if (ms < 0) return "";
     const totalSec = Math.floor(ms / 1000);
     const min = Math.floor(totalSec / 60);
     const sec = totalSec % 60;
@@ -278,6 +294,7 @@
    * NW-269 分段口径：会议详情 segments 相对整场，ms 即全局时间直接对齐；
    * 监控多段时 segments 相对所在音频分段的起点，需换算成「当前段的段内偏移」
    * 并只在属于当前音频段的子集里匹配（segIndexOfTranscript 预计算归属）。
+   * 未知时间（startMs 为 null / 负数）不参与高亮匹配。
    */
   const resolveActiveSeq = (ms: number): number => {
     const list = props.segments;
@@ -291,6 +308,7 @@
     const matchSeg = monitoringMultiSeg ? currentSegIndex : -1;
     let result = -1;
     for (let i = 0; i < list.length; i++) {
+      if (!hasValidTime(list[i])) continue;
       if (monitoringMultiSeg && segIndexOfTranscript[i] != matchSeg) continue;
       if (list[i].startMs <= matchMs) {
         result = list[i].seq;
@@ -318,7 +336,12 @@
     }
     let seg = 0;
     for (let i = 0; i < n; i++) {
-      const s = props.segments[i].startMs;
+      const item = props.segments[i];
+      if (!hasValidTime(item)) {
+        result.push(seg);
+        continue;
+      }
+      const s = item.startMs;
       // 超出当前段有效时长（留 1ms 边界）则前进到能容纳它的段
       while (
         seg < audioSegments.length - 1 &&
@@ -510,6 +533,7 @@
     segBaseMs = 0;
     switchingSeg = false;
     segPendingSeekMs = -1;
+    audioLoaded.value = false;
   };
 
   /**
@@ -542,6 +566,7 @@
         if (items.length < PAGE_SIZE) break;
         page++;
       }
+      audioLoaded.value = true;
       if (collected.length == 0) return;
       // 组装运行时段队列（接口按 segmentIndex 升序返回，此处再防御性插入排序）
       const segs = [] as SegRuntime[];
@@ -558,13 +583,13 @@
           pos--;
         }
         // 插入排序保持升序
-        segs.push({ audioUrl: "", durationMs: 0 } as SegRuntime);
+        segs.push(new SegRuntime("", 0));
         segIdx.push(0);
         for (let j = segs.length - 1; j > pos; j--) {
           segs[j] = segs[j - 1];
           segIdx[j] = segIdx[j - 1];
         }
-        segs[pos] = { audioUrl: url, durationMs: durMs } as SegRuntime;
+        segs[pos] = new SegRuntime(url, durMs);
         segIdx[pos] = order;
       }
       if (segs.length == 0) return;
@@ -714,9 +739,24 @@
   };
 
   const handleSegmentClick = (seg: AudioTranscriptSegment) => {
-    if (!props.hasAudio) return;
+    if (!props.hasAudio || !hasValidTime(seg)) return;
     enableFollowTranscript();
-    seekToMs(seg.startMs);
+    let targetMs = seg.startMs;
+    if (props.recordType == "monitoring" && audioSegments.length > 1) {
+      let segIdx = -1;
+      for (let i = 0; i < props.segments.length; i++) {
+        if (props.segments[i].seq == seg.seq) {
+          if (i < segIndexOfTranscript.length) {
+            segIdx = segIndexOfTranscript[i];
+          }
+          break;
+        }
+      }
+      if (segIdx >= 0 && segIdx < audioSegments.length) {
+        targetMs = segmentBaseMs(segIdx) + seg.startMs;
+      }
+    }
+    seekToMs(targetMs);
     // #ifdef APP
     if (!playing.value) {
       play();
@@ -725,7 +765,7 @@
   };
 
   const isActiveSegment = (seg: AudioTranscriptSegment): boolean => {
-    return props.hasAudio && activeSeq.value == seg.seq;
+    return props.hasAudio && hasValidTime(seg) && activeSeq.value == seg.seq;
   };
 
   // meetingId 变化时重新拉播放地址

@@ -7406,9 +7406,78 @@
     persistImConvRecords(myUserId.value, convId.value, records, hasMore);
   }
 
-  /** 发送确认落库：服务端 SendMessageResult（含 msgId/seq）写入本地库，幂等由 revision 守卫兜底。 */
-  function persistConfirmedRecord(dataObj: UTSJSONObject | null): void {
+  /** 发送确认落库：服务端 SendMessageResult 只含 msgId/seq/sendTime/msgStatus——没有
+   *  sender/body，直接落库会让重进首屏（DB 优先）读到「无主」消息：senderId 空 → 判非
+   *  本人按左侧他人渲染（无头像），body 空只剩 digest 兜底成「名字:文案」文本行，
+   *  同步落库后才恢复。以服务端字段为准，缺的用确认行（已含最终 msgType/body/附件
+   *  远端 url）补齐后再写；后续历史同步仍会以服务端全量记录覆盖。 */
+  function persistConfirmedRecord(dataObj: UTSJSONObject | null, confirmed: ImMsgRow | null): void {
     if (dataObj == null) return;
+    if (confirmed != null) {
+      if (readString(dataObj, "convId").length == 0) dataObj["convId"] = convId.value;
+      if (readString(dataObj, "senderId").length == 0) dataObj["senderId"] = myUserId.value;
+      if (readNumber(dataObj, "senderType", 0) == 0) dataObj["senderType"] = 1;
+      if (readString(dataObj, "clientMsgId").length == 0) {
+        dataObj["clientMsgId"] = confirmed.clientMsgId;
+      }
+      if (readString(dataObj, "msgType").length == 0) {
+        // DB 记录用 readMsgRow 可解析的形态：视频按 file 存（file 分支 classifyKind
+        // 重判回视频）；纯文本确认行 msgType 是空串，归一为服务端历史同款 "text"
+        const rawType = confirmed.msgType == "video" ? "file" : confirmed.msgType;
+        dataObj["msgType"] = rawType.length > 0 ? rawType : "text";
+      }
+      if (dataObj["body"] == null) {
+        const body = new UTSJSONObject();
+        let bodyHasContent = false;
+        if (confirmed.bodyText.length > 0) {
+          body["text"] = confirmed.bodyText;
+          bodyHasContent = true;
+        }
+        if (confirmed.msgType == "image" && confirmed.imageUrl.length > 0) {
+          body["url"] = confirmed.imageUrl;
+          bodyHasContent = true;
+        } else if (confirmed.msgType == "video") {
+          body["url"] = confirmed.videoUrl;
+          body["fileName"] = confirmed.videoFileName;
+          body["size"] = confirmed.videoSize;
+          bodyHasContent = true;
+        } else if (confirmed.msgType == "audio") {
+          body["url"] = confirmed.audioUrl;
+          body["duration"] = confirmed.audioDuration;
+          bodyHasContent = true;
+        } else if (confirmed.msgType == "file" && confirmed.linkAtts.length > 0) {
+          body["url"] = confirmed.linkAtts[0].url;
+          body["fileName"] = confirmed.linkAtts[0].fileName;
+          body["mime"] = confirmed.linkAtts[0].mime;
+          body["size"] = confirmed.linkAtts[0].size;
+          bodyHasContent = true;
+        } else if (confirmed.msgType == "rich_text") {
+          // imageAtts 与 linkAtts 全量入 attachments（readMsgRow 按 mime/classifyKind 分流回两侧）
+          const attachments: UTSJSONObject[] = [];
+          for (let i = 0; i < confirmed.imageAtts.length; i++) {
+            const att = new UTSJSONObject();
+            att["url"] = confirmed.imageAtts[i].url;
+            att["fileName"] = confirmed.imageAtts[i].fileName;
+            att["mime"] = confirmed.imageAtts[i].mime;
+            att["size"] = confirmed.imageAtts[i].size;
+            attachments.push(att);
+          }
+          for (let i = 0; i < confirmed.linkAtts.length; i++) {
+            const att = new UTSJSONObject();
+            att["url"] = confirmed.linkAtts[i].url;
+            att["fileName"] = confirmed.linkAtts[i].fileName;
+            att["mime"] = confirmed.linkAtts[i].mime;
+            att["size"] = confirmed.linkAtts[i].size;
+            attachments.push(att);
+          }
+          if (attachments.length > 0) {
+            body["attachments"] = attachments;
+            bodyHasContent = true;
+          }
+        }
+        if (bodyHasContent) dataObj["body"] = body;
+      }
+    }
     persistRowsToDb([dataObj], null);
   }
 
@@ -7598,8 +7667,9 @@
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        persistConfirmedRecord(dataObj);
-        replaceByClientMsgId(buildConfirmedRow(dataObj, row));
+        const confirmedText = buildConfirmedRow(dataObj, row);
+        persistConfirmedRecord(dataObj, confirmedText);
+        replaceByClientMsgId(confirmedText);
         quoteTarget.value = null;
         resetQuoteMentionSnapshot();
         reportReadIfNeeded(maxSeq());
@@ -7873,7 +7943,6 @@
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        persistConfirmedRecord(dataObj);
         const confirmed = buildConfirmedRow(dataObj, row);
         confirmed.msgType = kind;
         if (kind == "image") {
@@ -7896,6 +7965,7 @@
           confirmed.imageUrl = "";
           confirmed.linkAtts = [att];
         }
+        persistConfirmedRecord(dataObj, confirmed);
         replaceByClientMsgId(confirmed);
         quoteTarget.value = null;
         // /api/f/ 受保护地址解析：拿替换进列表后的代理实例改属性才会触发刷新
@@ -7978,7 +8048,6 @@
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        persistConfirmedRecord(dataObj);
         const confirmed = buildConfirmedRow(dataObj, row);
         confirmed.msgType = "rich_text";
         confirmed.imageUrl = "";
@@ -7992,6 +8061,7 @@
           att.mime = files[i].type;
           confirmed.imageAtts.push(att);
         }
+        persistConfirmedRecord(dataObj, confirmed);
         replaceByClientMsgId(confirmed);
         quoteTarget.value = null;
         resetQuoteMentionSnapshot();
@@ -8064,7 +8134,6 @@
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        persistConfirmedRecord(dataObj);
         const confirmed = buildConfirmedRow(dataObj, row);
         // readMsgRow 口径：audio 行读 body.url + body.duration（秒）；
         // 确认行显式回填（服务端 body 原样带回，双保险）
@@ -8072,6 +8141,7 @@
         confirmed.audioUrl = file.url;
         confirmed.audioDuration = durationSec;
         confirmed.linkAtts = [];
+        persistConfirmedRecord(dataObj, confirmed);
         replaceByClientMsgId(confirmed);
         reportReadIfNeeded(maxSeq());
         refreshReadStatus();

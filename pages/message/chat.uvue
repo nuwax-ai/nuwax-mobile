@@ -1714,6 +1714,7 @@
   import AppCompatEditText from "androidx.appcompat.widget.AppCompatEditText";
   import Gravity from "android.view.Gravity";
   import Layout from "android.text.Layout";
+  import Uri from "android.net.Uri";
   // #endif
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { IM_CHAT_INPUT_METHOD } from "@/constants/common.constants";
@@ -1753,8 +1754,8 @@
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import eventBus from "@/utils/eventBus";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
-  // 会话草稿（微信式）：未发文案本地按 convId 记忆，列表「[草稿]xxx」+ 进页回显
-  import { getChatDraft, setChatDraft } from "@/utils/im/chatDrafts";
+  // 会话草稿（微信式）：未发文案+暂存图本地按 convId 记忆，列表「[草稿]xxx」+ 进页回显
+  import { getChatDraft, getChatDraftImages, setChatDraft } from "@/utils/im/chatDrafts";
   // 失败行发件箱（微信式）：发送失败的乐观行跨重启本地保留，重进会话回显末尾可重发
   import { getFailedSends, removeFailedSend, upsertFailedSend } from "@/utils/im/chatFailedSends";
   import {
@@ -2327,10 +2328,37 @@
   }
 
   // ===== 会话草稿（微信式）：键入去抖落盘，退页/切后台即时补存（flushChatDraft）=====
-  // 发送清空 inputText 也会经此清除草稿；纯空白不算草稿（setChatDraft 内判）。
+  // 发送清空 inputText/stagedImages 也会经此清除草稿；纯空白文案且无暂存图不算草稿
+  // （setChatDraft 内判）。指纹含暂存图路径：选图/删图与键入同样触发去抖落盘。
   let chatDraftSaveTimer = 0;
 
-  watch(inputText, (_val: string) => {
+  /** 草稿要记忆的暂存图路径；H5 相册是 blob: URL，页面卸载即失效，不入草稿。 */
+  function stagedDraftImagePaths(): string[] {
+    // #ifdef H5
+    return [] as string[];
+    // #endif
+    // #ifndef H5
+    const paths = [] as string[];
+    const staged = stagedImages.value;
+    for (let i = 0; i < staged.length; i++) {
+      if (staged[i].localPath.length > 0) {
+        paths.push(staged[i].localPath);
+      }
+    }
+    return paths;
+    // #endif
+  }
+
+  function stagedDraftFingerprint(): string {
+    let fp = inputText.value;
+    const staged = stagedImages.value;
+    for (let i = 0; i < staged.length; i++) {
+      fp = `${fp}\u0001${staged[i].localPath}`;
+    }
+    return fp;
+  }
+
+  watch((): string => stagedDraftFingerprint(), (_val: string) => {
     if (convId.value.length == 0) {
       return;
     }
@@ -2340,7 +2368,7 @@
     chatDraftSaveTimer = setTimeout((): void => {
       chatDraftSaveTimer = 0;
       if (isChatActive()) {
-        setChatDraft(convId.value, inputText.value);
+        setChatDraft(convId.value, inputText.value, stagedDraftImagePaths());
       }
     }, 600) as number;
   });
@@ -2354,7 +2382,7 @@
     if (convId.value.length == 0) {
       return;
     }
-    setChatDraft(convId.value, inputText.value);
+    setChatDraft(convId.value, inputText.value, stagedDraftImagePaths());
   }
   /** 面板态（飞书式）：“”=无 / "emoji"=表情 / "plus"=加号（两者与键盘互斥）；
    *  "font"=格式横条（B/I/S/U + 列表）——与系统键盘【共存】，Aa 键即聚焦拉键盘。 */
@@ -5871,6 +5899,18 @@
     removeFailedSend(convId.value, confirmed.clientMsgId);
   }
 
+  /** 派发即入发件箱（微信式防丢，乐观行 push 后调用）：发送链各 await 后的
+   *  isChatCurrent 守卫会在离开页面后直接掐断后续（上传完成也不发 POST），
+   *  发送到后端期间强退=消息确定性丢失。入箱后：确认（replaceByClientMsgId
+   *  出箱）/失败（markRowFailed 覆盖）自动收口；强退则重进会话由
+   *  restoreFailedRows 回显为可重发失败行（clientMsgId 不变重发，服务端幂等不重）。 */
+  function journalOutgoingRow(row: ImMsgRow): void {
+    if (convId.value.length == 0 || row.clientMsgId.length == 0) {
+      return;
+    }
+    upsertFailedSend(convId.value, row.clientMsgId, failedRowToPayload(row));
+  }
+
   function markRowFailed(clientMsgId: string): void {
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
@@ -8093,6 +8133,7 @@
     quoteTarget.value = null;
     resetQuoteMentionSnapshot();
     messages.value.push(row);
+    journalOutgoingRow(row);
     scrollToBottom();
     sendMediaWithRow(row, localPath, displayName);
   }
@@ -8148,6 +8189,7 @@
     row.sendTime = Date.now();
     row.status = 0;
     messages.value.push(row);
+    journalOutgoingRow(row);
     scrollToBottom();
     sendRichTextWithRow(row, paths);
     return true;
@@ -8174,6 +8216,7 @@
     row.sendTime = Date.now();
     row.status = 0;
     messages.value.push(row);
+    journalOutgoingRow(row);
     scrollToBottom();
     sendWithRow(row);
   }
@@ -8647,10 +8690,34 @@
     // #ifdef H5
     return path.indexOf("blob:") != 0;
     // #endif
+    // #ifdef APP-ANDROID
+    // 相册选图/选文件常态是 content:// URI（fs.accessSync 不认，上传侧走
+    // ContentResolver——prepareUploadFilePath 同款），可读性也须问 ContentResolver
+    if (path.indexOf("content://") == 0) {
+      try {
+        const context = UTSAndroid.getAppContext();
+        if (context == null) {
+          return false;
+        }
+        const stream = context.getContentResolver().openInputStream(Uri.parse(path));
+        if (stream == null) {
+          return false;
+        }
+        stream.close();
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    }
+    // #endif
     // #ifndef H5
     try {
+      let fsPath = path;
+      if (fsPath.indexOf("file://") == 0) {
+        fsPath = fsPath.substring("file://".length);
+      }
       const fsm = uni.getFileSystemManager();
-      fsm.accessSync(path);
+      fsm.accessSync(fsPath);
       return true;
     } catch (_e) {
       return false;
@@ -9921,6 +9988,7 @@
     quoteTarget.value = null;
     resetQuoteMentionSnapshot();
     messages.value.push(row);
+    journalOutgoingRow(row);
     scrollToBottom();
     closeVoiceEdit();
     await sendAudioWithRow(row);
@@ -12949,11 +13017,23 @@
       voiceMode.value = uni.getStorageSync(inputMethodKey()) == "voice";
     }
     // #endif
-    // 草稿回显（微信式）：恢复上次未发文案；输入框高度适配由 inputText watch 统一驱动
+    // 草稿回显（微信式）：恢复上次未发文案与暂存图（App 端相册临时文件跨页面实例可读；
+    // 被系统清理的极端情形恢复出裂图，可手删重选）；输入框高度适配由 inputText watch 统一驱动
     if (convId.value.length > 0) {
       const draft = getChatDraft(convId.value);
       if (draft.length > 0) {
         inputText.value = draft;
+      }
+      const draftImages = getChatDraftImages(convId.value);
+      if (draftImages.length > 0) {
+        const restored: StagedImage[] = [];
+        for (let i = 0; i < draftImages.length && restored.length < STAGED_IMAGE_MAX; i++) {
+          const staged = new StagedImage();
+          staged.id = generateUUID();
+          staged.localPath = draftImages[i];
+          restored.push(staged);
+        }
+        stagedImages.value = restored;
       }
     }
     const convTypeRaw = readOption(options, "convType");

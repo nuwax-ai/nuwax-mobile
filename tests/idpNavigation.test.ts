@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const context = vi.hoisted(() => ({ base: '', embedded: false }));
 vi.mock('@/constants/config', () => ({ getApiBaseUrl: () => context.base }));
 vi.mock('@/utils/appWebViewDetect', () => ({ isAppWebViewEmbedded: () => context.embedded }));
-import { authBrowserQuery, beginBrowserIdp, canUseBrowserIdp, finishBrowserLogin, ordinaryLoginUrl } from '../utils/idpNavigation.uts';
+import { authBrowserQuery, beginBrowserIdp, canUseBrowserIdp, finishBrowserLogin, idpLoginEntryUrl } from '../utils/idpNavigation.uts';
 
 const origin = 'https://tenant.example';
 const assign = vi.fn();
@@ -54,9 +54,9 @@ describe('浏览器 Cookie 登录', () => {
     finishBrowserLogin('https://evil.example');
     expect(replace).toHaveBeenLastCalledWith('/m/#/pages/message/message');
   });
-  it('失败后提供带 local=1 的账号登录逃生入口', () => {
-    const url = new URL(ordinaryLoginUrl('/pages/message/chat?convId=123'), origin);
-    expect(url.searchParams.get('local')).toBe('1');
+  it('回到登录入口时不注入覆盖服务端自动配置的 local 参数', () => {
+    const url = new URL(idpLoginEntryUrl('/pages/message/chat?convId=123'), origin);
+    expect(url.searchParams.has('local')).toBe(false);
     expect(url.searchParams.get('redirect')).toBe('/m/#/pages/message/chat?convId=123');
   });
 });

@@ -10,13 +10,13 @@
 |---|---|---|
 | 提供方类型、ID、名称等数据模型 | 已有：[authIdp.uts](../../types/interfaces/authIdp.uts) | 可复用；原生授权能力字段需扩展 |
 | 公开列表与游客请求 | 已有：[servers/authIdp.uts](../../servers/authIdp.uts) | 可复用列表；Cookie 验证接口封装只适用于 H5 |
-| 类型与 ID 白名单 | 已有：[constants/authIdp.uts](../../constants/authIdp.uts)，默认 CAS/OAUTH2，微信关闭 | 当前是 H5 构建配置；后续分平台判断能力 |
+| H5 提供方与自动策略 | 由服务端 `items/autoRedirectIdpId` 决定，前端不维护类型/ID 白名单，也不以本地参数停用自动认证 | 原生会话交接合同和实际平台能力另行确认 |
 | 列表解析、返回路径约束、旧请求隔离 | 已有：[utils/authIdp.uts](../../utils/authIdp.uts) | 可复用部分纯逻辑；不能用 `AuthLoadScope` 代替完整原生事务 |
 | H5 授权导航及回调页 | 已有：[idpNavigation.uts](../../utils/idpNavigation.uts)、[idp-return.uvue](../../subpackages/pages/auth/idp-return.uvue) | 浏览器导航与 Cookie 回调不用于原生 |
 | 原生入口闸门 | `canUseBrowserIdp()` 在非 H5 返回 `false`；登录组件也按 H5 条件编译 | 保持关闭，完成原生链路后另接原生入口 |
 | App 业务 Token 保存及 Bearer 请求 | 原有：[authSession.uts](../../utils/authSession.uts)、[useRequest.uts](../../servers/useRequest.uts) | 在取得并验证平台业务 Token 后复用 |
 | 系统认证窗口、原生回调、PKCE、一次性码兑换、冷启动恢复 | **未实现** | 本方案后续阶段新增 |
-| 微信/飞书原生 SDK 登录 | **未实现** | 独立阶段；支付插件、H5 微信开关不代表已经支持 |
+| 微信/飞书原生 SDK 登录 | **未实现** | 独立阶段；支付插件、H5 后端微信配置不代表已经支持 |
 
 历史分支 `feat/nuwa-zhuoda-2026.10-idp-login` 的 10 月 13 日草稿和后端确认清单仅作历史参考；其中的暂停状态、旧远端配置、旧测试数及拟议接口不能代替本文的当前结论。本文与 [H5 接入说明](mobile-h5-idp-login.md) 是当前入口。
 
@@ -125,7 +125,7 @@ sequenceDiagram
 
 ## 6. 公开能力与开关设计
 
-当前仅有 H5 静态类型/ID 白名单和后端租户级 `autoRedirectIdpId`。原生平台开关、SDK AppID、能力版本等字段**尚无后端合同**，以下为扩展语义建议，不固定字段名：
+当前 H5 直接采用服务端 `items/autoRedirectIdpId`，已移除静态类型/ID 白名单及前端自动开关。原生平台开关、SDK AppID、能力版本等字段**尚无后端合同**，以下为扩展语义建议，不固定字段名：
 
 | 信息 | 应表达的内容 | 缺失时的行为 |
 |---|---|---|
@@ -138,7 +138,7 @@ sequenceDiagram
 
 入口开放条件为：**本地策略允许 ∩ 后端允许当前平台 ∩ 当前包桥/SDK支持 ∩ 回调及交换配置完整**。远端开关可以收紧本地允许范围，不能把缺少桥或未审核资质的功能强制打开。
 
-微信阶段 N3 前保持原生微信关闭；现有 H5 `WECHAT` 开关只影响公众号/网站授权，不连带开放 SDK。灰度按租户、平台、客户端版本和 provider 配置，不通过修改全租户自动跳转仅给 App 灰度。
+微信阶段 N3 前保持原生微信关闭；H5 服务端的 `WECHAT` 配置只影响公众号/网站授权，不连带开放 SDK。灰度按租户、平台、客户端版本和 provider 配置，不通过修改全租户自动跳转仅给 App 灰度。
 
 ## 7. 原生事务、PKCE与会话生命周期
 

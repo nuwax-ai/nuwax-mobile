@@ -1,4 +1,4 @@
-# 移动 H5 统一登录（CAS / OAuth2）
+# 移动 H5 统一登录（服务端配置驱动）
 
 本期接入浏览器 H5，优先满足西财统一认证。协议与 `workspace/nuwax` 的 PC Web 一致，使用后端写入的 Cookie 会话；不将 Cookie 导出为 App Token，也不从回调 URL 接收 Token。Android、iOS、鸿蒙原生壳和小程序沿用现有登录。
 
@@ -6,24 +6,22 @@
 
 ## 登录链路
 
-1. 登录页读取公开接口 `GET /api/auth/idp/list`，按移动端配置展示入口。
+1. 登录页读取公开接口 `GET /api/auth/idp/list`；服务端 `items` 决定手动入口，`autoRedirectIdpId` 决定是否自动认证及使用哪个提供方。
 2. 自动统一认证时先勾选同意协议并直接跳转；手动入口仍先确认协议，再由顶层页面跳转到 `/api/auth/idp/authorize?provider=<id>&redirect=<callback>`。CAS/OAuth2 的授权码、state、PKCE、首次注册/绑定规则由后端处理。
 3. 成功回调为 `/m/#/subpackages/pages/auth/idp-return?redirect=<移动业务路径>`。页面调用 `/api/user/getLoginInfo` 验证 Cookie（支持 HttpOnly），拿到有效用户后返回原移动页面；未指定目标时回消息首页。
-4. 会话验证失败保留错误及重试入口；普通登录回退带 `local=1`，避免再次自动授权。列表失败、旧后端不支持或提供方被过滤时，账号/验证码登录仍可使用。
+4. 会话验证失败显示错误及重试/返回登录页入口。返回登录页后重新读取服务端配置，不注入 `local` 参数。未配置自动认证或列表请求失败时保留普通表单。
 
-`autoRedirectIdpId` 只对当前配置允许的提供方生效。自动登录会同步勾选协议，不弹出确认框阻断登录。每次进入登录页、页面返回或浏览器后退恢复时，都会重新读取提供方配置并自动跳转；不读写 `sessionStorage` 自动尝试标识，不设置五分钟冷却。只有显式 `local` 普通登录回退、`idpError` 错误返回或当前不允许自动认证时保留普通表单。手动登录未勾选协议时仍需确认。
+自动认证只采用服务端返回的有效 `autoRedirectIdpId`，不要求该 ID 出现在手动按钮列表中；`items` 为空或缺失也不会吞掉自动配置。`local`、`idpError`、弹窗标记、本地表单 `disabled`、手动按钮的微信 UA 过滤均不覆盖自动项。自动发起前同步勾选协议，不弹出确认框。
 
-表单暂时提交中时延后自动跳转，恢复可用后补发。仅对同次页面展示内的并发发起去重；页面隐藏后不让旧列表请求触发导航，再次展示时重新发起。浏览器未能发起跳转时解除加载并提示失败，不在同次展示内连续重试；下次进入或返回仍按配置自动跳转。`idpError` 即使为空也显示通用失败提示。
+每次进入登录页、页面返回或浏览器后退恢复时重新读取配置并自动跳转。不读写 `sessionStorage` 尝试标识，不设置冷却或重试次数限制；只去重同次展示内的并发导航，并丢弃页面隐藏/卸载或服务域变化前的旧请求。浏览器导航抛异常时解除加载并提示失败，下次返回时仍重新按配置处理。
 
-## 入口配置
+## 配置归属
 
-配置文件：`constants/authIdp.uts`。
-
-- `MOBILE_IDP_ENABLED_TYPES` 默认 `CAS`、`OAUTH2`，微信本期关闭。
-- `MOBILE_IDP_ALLOWED_IDS` 默认为空，不额外限制后端已启用的提供方。西财专版可填对应的 CAS 配置 ID，只显示该项。
-- 后续启用微信时加入 `WECHAT`；微信浏览器选择 `OA`，其他浏览器选择 `QRCODE`。不在前端配置任何 Secret。
-
-提供方 ID、类型及启停状态仍以同一租户的公开列表为准；不根据按钮名称推断协议。配置修改需重新编译 H5。
+- 提供方启停、类型、可见 ID 和自动项全部由服务端管理，已移除前端类型/ID 白名单。
+- 手动入口仅对微信 `OA/QRCODE` 按浏览器 UA 选择展示形态；这一展示过滤不影响服务端自动项。
+- H5 微信使用后端网页授权，不引入微信原生 SDK；Android/iOS SDK 仍不在本阶段接入。
+- `local` 或错误参数只作历史参数/提示信息，不能停用服务端配置的自动认证。需要账号、验证码或首次绑定续接时，由后端给出相应配置和流程，前端不自行绕过。
+- 不在前端保存任何 IdP Secret；不通过回调 URL 接收业务 Token。
 
 ## 部署及验证条件
 
@@ -43,4 +41,4 @@ pnpm exec vitest run tests/authIdp.test.ts tests/idpNavigation.test.ts tests/aut
 node tests/fixtures/mobile-idp-server.mjs <HBuilderX生成的web目录>
 ```
 
-模拟站点为 `http://127.0.0.1:18765/m/#/subpackages/pages/login/login?local=1`，需使用移动浏览器 UA。模拟授权写入 HttpOnly Cookie，回调验证通过后不保存 `ACCESS_TOKEN`。真实 IdP、内网可达性及服务器 Cookie 配置仍需环境验收。
+模拟站点为 `http://127.0.0.1:18765/m/#/subpackages/pages/login/login`，需使用移动浏览器 UA。模拟服务默认不配置自动项；需要模拟自动认证时通过 `/_fixture` 设置 `auto`，不使用 URL 参数覆盖。模拟授权写入 HttpOnly Cookie，回调验证通过后不保存 `ACCESS_TOKEN`。真实 IdP、内网可达性及服务器 Cookie 配置仍需环境验收。

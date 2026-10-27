@@ -57,7 +57,7 @@ http.createServer(async (req, res) => {
   if (url.pathname === '/auth/bind-or-register') {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     if (signedIn) return res.end('<p>首次关联续接成功（本地模拟）</p>');
-    const login = '/m/#/subpackages/pages/login/login?local=1&redirect=' + encodeURIComponent('/auth/bind-or-register?token=local-pending&bind=1');
+    const login = '/m/#/subpackages/pages/login/login?redirect=' + encodeURIComponent('/auth/bind-or-register?token=local-pending&bind=1');
     return res.end('<p>首次关联（本地模拟）</p><a href="' + login + '">登录已有账号</a>');
   }
   try {

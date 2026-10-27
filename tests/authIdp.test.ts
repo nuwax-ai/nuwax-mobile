@@ -4,7 +4,6 @@ import {
   autoAuthProviderId, buildIdpAuthorizePath, mobileAuthWebReturn,
   resolveMobileAuthReturn, resolvePendingAuthReturn,
 } from '../utils/authIdp.uts';
-import { MOBILE_IDP_ENABLED_TYPES, MOBILE_IDP_ALLOWED_IDS } from '../constants/authIdp.uts';
 
 const origin = 'https://tenant.example';
 const list = parseAuthIdpList({ items: [
@@ -15,20 +14,23 @@ const list = parseAuthIdpList({ items: [
 ] });
 
 describe('移动 H5 登录方式配置', () => {
-  it('默认开放 CAS/OAuth2，关闭微信', () => {
-    expect(availableAuthProviders(list.items, MOBILE_IDP_ENABLED_TYPES, MOBILE_IDP_ALLOWED_IDS, 'Chrome').map(p => p.id)).toEqual(['5', '1']);
+  it('展示服务端开放的提供方，不再维护前端类型及 ID 白名单', () => {
+    expect(availableAuthProviders(list.items, 'Chrome').map(p => p.id)).toEqual(['5', '1', '10']);
   });
-  it('按配置 ID 限制西财专属入口，自动项同样不可越过白名单', () => {
-    const items = availableAuthProviders(list.items, ['CAS', 'OAUTH2'], ['5'], 'Chrome');
-    expect(items.map(p => p.id)).toEqual(['5']);
-    expect(autoAuthProviderId(items, '1', false, false)).toBe('');
-    expect(autoAuthProviderId(items, '5', false, false)).toBe('5');
+  it('自动提供方只看服务端 ID，不依赖手动按钮列表或浏览器类型过滤', () => {
+    expect(autoAuthProviderId('4')).toBe('4');
+    expect(autoAuthProviderId('999')).toBe('999');
   });
   it.each([['Chrome', '10'], ['MicroMessenger', '4']])('启用微信后按 UA 选择授权形态 %s', (ua, id) => {
-    expect(availableAuthProviders(list.items, ['WECHAT'], [], ua).map(p => p.id)).toEqual([id]);
+    expect(availableAuthProviders(list.items, ua).filter(p => p.type === 'WECHAT').map(p => p.id)).toEqual([id]);
   });
-  it.each([[true, false], [false, true]])('local 或错误参数阻止自动跳转', (local, error) => {
-    expect(autoAuthProviderId(list.items, '5', local, error)).toBe('');
+  it.each(['', '0', '../5', '5&redirect=//evil'])('仅拒绝空或格式无效的自动提供方 ID %s', id => {
+    expect(autoAuthProviderId(id)).toBe('');
+  });
+  it('手动列表为空或缺失时仍保留服务端的自动配置', () => {
+    expect(parseAuthIdpList({ autoRedirectIdpId: '5' }).autoRedirectIdpId).toBe('5');
+    expect(parseAuthIdpList({ items: null, autoRedirectIdpId: '5' }).autoRedirectIdpId).toBe('5');
+    expect(availableAuthProviders(parseAuthIdpList({ items: [{ id: '6', type: 'SAML' }] }).items, 'Chrome').map(p => p.id)).toEqual(['6']);
   });
   it('容忍旧后端/畸形列表，跳过无效和重复 ID，保留 int64 字符串', () => {
     expect(parseAuthIdpList(null).items).toEqual([]);

@@ -3,7 +3,6 @@ import { runInNewContext } from 'node:vm';
 import { transformSync } from 'esbuild';
 import { describe, expect, it, vi } from 'vitest';
 import { AuthLoadScope, parseAuthIdpList, availableAuthProviders, autoAuthProviderId } from '../utils/authIdp.uts';
-import { MOBILE_IDP_ENABLED_TYPES, MOBILE_IDP_ALLOWED_IDS } from '../constants/authIdp.uts';
 
 // 执行组件的实际 script setup，覆盖 mounted 自动发起和手动确认两条入口。
 const source = readFileSync('components/idp-login/idp-login.uvue', 'utf8');
@@ -14,17 +13,17 @@ const origin = 'https://tenant.example';
 
 interface Options {
   agreed?: boolean;
-  allowAutomatic?: boolean;
   automaticId?: string;
   query?: Record<string, string>;
   recentAttempt?: boolean;
   disabled?: boolean;
   navigationFailure?: boolean;
   storageUnavailable?: boolean;
+  items?: unknown;
 }
 
 async function setup(options: Options = {}) {
-  const props = { agreed: options.agreed ?? false, disabled: options.disabled ?? false, redirectUrl: '/pages/message/chat?convId=123', allowAutomatic: options.allowAutomatic ?? true };
+  const props = { agreed: options.agreed ?? false, disabled: options.disabled ?? false, redirectUrl: '/pages/message/chat?convId=123' };
   const order: string[] = [];
   const emit = vi.fn((name: string) => {
     if (name === 'agreed') { props.agreed = true; order.push('agreed'); }
@@ -49,11 +48,10 @@ async function setup(options: Options = {}) {
     watch: (read: () => boolean, callback: (value: boolean) => void) => { disabledChanged = () => callback(read()); },
     defineProps: () => props, defineEmits: () => emit,
     AuthLoadScope, parseAuthIdpList, availableAuthProviders, autoAuthProviderId,
-    MOBILE_IDP_ENABLED_TYPES, MOBILE_IDP_ALLOWED_IDS,
     getApiBaseUrl: () => origin, authBrowserOrigin: () => origin,
     authBrowserQuery: (key: string) => options.query?.[key] ?? null,
     authBrowserUserAgent: () => 'Chrome', canUseBrowserIdp: () => true, beginBrowserIdp,
-    apiAuthIdpLoginList: async () => ({ code: '0000', data: { items: [{ id: '5', type: 'CAS', name: '统一认证' }], autoRedirectIdpId: options.automaticId ?? '5' } }),
+    apiAuthIdpLoginList: async () => ({ code: '0000', data: { items: options.items === undefined ? [{ id: '5', type: 'CAS', name: '统一认证' }] : options.items, autoRedirectIdpId: options.automaticId ?? '5' } }),
     apiResCode: (response: any) => response.code, apiResData: (response: any) => response.data, SUCCESS_CODE: '0000',
     useI18n: () => ({ t: (key: string) => key }), emptyI18nParams: () => ({}),
     uni: { showModal }, window: {
@@ -85,7 +83,7 @@ describe('H5 统一认证的协议确认', () => {
   });
 
   it('手动认证未勾选时等待确认，拒绝后恢复普通登录', async () => {
-    const page = await setup({ allowAutomatic: false });
+    const page = await setup({ automaticId: '' });
     page.login('5', false);
     expect(page.showModal).toHaveBeenCalledOnce();
     expect(page.beginBrowserIdp).not.toHaveBeenCalled();
@@ -96,7 +94,7 @@ describe('H5 统一认证的协议确认', () => {
   });
 
   it('手动认证确认后才勾选并跳转', async () => {
-    const page = await setup({ allowAutomatic: false });
+    const page = await setup({ automaticId: '' });
     page.login('5', false);
     page.showModal.mock.calls[0][0].success({ confirm: true });
     expect(page.order).toEqual(['agreed', 'authorize']);
@@ -104,16 +102,16 @@ describe('H5 统一认证的协议确认', () => {
   });
 
   it('手动认证已勾选时直接跳转', async () => {
-    const page = await setup({ allowAutomatic: false, agreed: true });
+    const page = await setup({ automaticId: '', agreed: true });
     page.login('5', false);
     expect(page.showModal).not.toHaveBeenCalled();
     expect(page.beginBrowserIdp).toHaveBeenCalledOnce();
   });
 
-  it('表单暂时禁用时延后自动跳转，恢复可用后补跳且只跳一次', async () => {
+  it('本地表单 disabled 不覆盖服务端自动配置，且同次展示只发起一次', async () => {
     const page = await setup({ disabled: true });
     expect(page.storage.size).toBe(0);
-    expect(page.beginBrowserIdp).not.toHaveBeenCalled();
+    expect(page.beginBrowserIdp).toHaveBeenCalledOnce();
     page.setDisabled(false);
     expect(page.props.agreed).toBe(true);
     expect(page.beginBrowserIdp).toHaveBeenCalledOnce();
@@ -155,13 +153,22 @@ describe('H5 统一认证的协议确认', () => {
     expect(page.beginBrowserIdp).toHaveBeenCalledTimes(2);
   });
 
-  it('空 idpError 也说明登录失败，避免只停止自动跳转而不给提示', async () => {
-    const page = await setup({ query: { idpError: '' } });
+  it('未配置自动认证时，空 idpError 仍提供错误提示', async () => {
+    const page = await setup({ automaticId: '', query: { idpError: '' } });
     expect(page.errorText.value).toBe('Mobile.Auth.idpSessionFailed');
     expect(page.beginBrowserIdp).not.toHaveBeenCalled();
   });
 
-  it.each([{ query: { local: '' } }, { query: { idpError: '' } }, { automaticId: '999' }])('显式回退、错误及无效自动配置保留普通表单 %j', async options => {
+  it.each([{ query: { local: '' } }, { query: { local: '1' } }, { query: { idpError: '' } }, { query: { idpError: 'failed' } }, { automaticId: '999', items: [] }, { items: null }, { items: [{ id: '5', type: 'WECHAT', wechatMode: 'OA' }] }])('自动配置不被本地参数或手动展示过滤覆盖 %j', async options => {
+    const page = await setup(options);
+    expect(page.props.agreed).toBe(true);
+    expect(page.showModal).not.toHaveBeenCalled();
+    expect(page.beginBrowserIdp).toHaveBeenCalledWith(options.automaticId ?? '5', page.props.redirectUrl, true);
+    await page.browserRestore();
+    expect(page.beginBrowserIdp).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([{ automaticId: '' }, { automaticId: '../5' }])('服务端未配置或 ID 格式无效才保留普通表单 %j', async options => {
     const page = await setup(options);
     expect(page.props.agreed).toBe(false);
     expect(page.showModal).not.toHaveBeenCalled();

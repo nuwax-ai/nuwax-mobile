@@ -7,11 +7,11 @@
 ## 登录链路
 
 1. 登录页读取公开接口 `GET /api/auth/idp/list`，按移动端配置展示入口。
-2. 点击入口并确认协议后，顶层页面跳转到 `/api/auth/idp/authorize?provider=<id>&redirect=<callback>`。CAS/OAuth2 的授权码、state、PKCE、首次注册/绑定规则由后端处理。
+2. 自动统一认证时先勾选同意协议并直接跳转；手动入口仍先确认协议，再由顶层页面跳转到 `/api/auth/idp/authorize?provider=<id>&redirect=<callback>`。CAS/OAuth2 的授权码、state、PKCE、首次注册/绑定规则由后端处理。
 3. 成功回调为 `/m/#/subpackages/pages/auth/idp-return?redirect=<移动业务路径>`。页面调用 `/api/user/getLoginInfo` 验证 Cookie（支持 HttpOnly），拿到有效用户后返回原移动页面；未指定目标时回消息首页。
 4. 会话验证失败保留错误及重试入口；普通登录回退带 `local=1`，避免再次自动授权。列表失败、旧后端不支持或提供方被过滤时，账号/验证码登录仍可使用。
 
-`autoRedirectIdpId` 只对当前配置允许的提供方生效。`local`、`idpError`、浏览器后退恢复会阻止自动跳转；同一提供方五分钟内只自动尝试一次。自动登录同样先确认服务协议，用户取消后保留普通表单。
+`autoRedirectIdpId` 只对当前配置允许的提供方生效。自动登录会同步勾选协议，不弹出确认框阻断登录。`local`、`idpError`、浏览器后退恢复会阻止自动跳转；同一提供方五分钟内只自动尝试一次。手动登录未勾选协议时仍需确认，用户取消后保留普通表单。
 
 ## 入口配置
 
@@ -35,7 +35,7 @@
 ## 本地回归
 
 ```bash
-pnpm exec vitest run tests/authIdp.test.ts tests/idpNavigation.test.ts tests/authIdpRequest.test.ts
+pnpm exec vitest run tests/authIdp.test.ts tests/idpNavigation.test.ts tests/authIdpRequest.test.ts tests/idpLoginConsent.test.ts
 
 # HBuilderX 编译 H5 后，可用本地模拟接口走浏览器链路；不会转发真实 API。
 node tests/fixtures/mobile-idp-server.mjs <HBuilderX生成的web目录>

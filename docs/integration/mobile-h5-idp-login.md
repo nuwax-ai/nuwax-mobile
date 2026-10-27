@@ -2,6 +2,8 @@
 
 本期接入浏览器 H5，优先满足西财统一认证。协议与 `workspace/nuwax` 的 PC Web 一致，使用后端写入的 Cookie 会话；不将 Cookie 导出为 App Token，也不从回调 URL 接收 Token。Android、iOS、鸿蒙原生壳和小程序沿用现有登录。
 
+原生 App 的复用范围、授权/Token 交接方案、平台打包要求和后端确认清单统一见[联合登录总方案与原生接入计划](mobile-idp-native-plan.md)。原生当前尚无完整授权桥及会话交接，不能通过启用 H5 开关直接开放。
+
 ## 登录链路
 
 1. 登录页读取公开接口 `GET /api/auth/idp/list`，按移动端配置展示入口。

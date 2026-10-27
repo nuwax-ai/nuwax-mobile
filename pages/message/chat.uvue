@@ -212,26 +212,27 @@
                  （位图正常、SVG 方形透出；iOS 原生裁剪恒生效、H5 背景图恒被裁，故仅 Android
                  透方）——消息页 chat-item__avatar-clip 同款 overflow 兜底，与消息列表裁圆一致 -->
             <!-- #ifdef APP-HARMONY -->
-            <!-- 字母层常驻垫底 + 真图叠上去淡入：首屏数据已由 initHistory 等到首帧呈现
-                 才落地，真图节点都在「首帧已呈现」之后创建（避开 UniImageElement 的
-                 Hidden 初值，见 script 头注）；字母层留着只为真图未解析/失败时兜底，
-                 绝不出现空白格。淡入仅去硬切，不加额外延迟 -->
+            <!-- 默认头像（字母+渐变）只作兜底：没有地址 / 加载失败 / 解析用尽 / 6s 未 load
+                 时才出场；正常情况先留白等真图，真图 @load 后淡入（用户 2026-10-27 要求：
+                 别再先闪一下默认头像）。层叠顺序=兜底在下、真图在上，晚到的真图直接盖住 -->
             <view
-              class="chat-ava"
+              v-if="harmonyAvaFallbackOf(msg, avatarResolveTick)"
+              class="chat-ava chat-ava-clip--overlay chat-ava-clip--shown"
               :style="{ backgroundImage: avatarGradient(isMine(msg) ? myDisplayName : titleName) }"
             >
               <text class="chat-ava-letter">{{ avatarLetter(isMine(msg) ? myDisplayName : titleName) }}</text>
             </view>
             <view
-              v-if="harmonyImgOn && avatarSrcOf(msg, avatarResolveTick).length > 0 && avatarFailedOf(msg) != true"
+              v-if="harmonyImgOn && harmonyAvaHoldOf(msg, harmonyAvaSettleTick) != true && avatarSrcOf(msg, avatarResolveTick).length > 0 && avatarFailedOf(msg) != true"
               class="chat-ava-clip chat-ava-clip--overlay"
-              :class="avaFadeOn ? 'chat-ava-clip--shown' : ''"
+              :class="(avaFadeOn && (harmonyAvaLoadedOf(msg, avatarResolveTick) || harmonyAvaRevealAll)) ? 'chat-ava-clip--shown' : ''"
             >
               <image
                 class="chat-ava"
                 :src="avatarSrcOf(msg, avatarResolveTick)"
                 mode="aspectFill"
                 @error="handleAvatarError(msg)"
+                @load="handleHarmonyAvatarLoad(msg)"
               />
             </view>
             <!-- #endif -->
@@ -6842,6 +6843,13 @@
   // 由 handlePressTouchStart 的定时器在点亮前检查），滚动停止 ~160ms 后恢复。
   const chatScrolling = ref<boolean>(false);
   let chatScrollIdleTimer = 0;
+  // #ifdef APP-HARMONY
+  /** 滚动中落地的行（msgId）：这些行的头像节点若在滚动帧里创建，ArkUI 补绘不到，
+   *  会静默显示字母兜底（无 @error、无日志）。先按住不挂，停手后统一放行挂新节点。 */
+  const harmonyAvaHeldIds = new Set<string>();
+  /** 放行版本号：停手清空按住集合后 bump，驱动模板重算（鸿蒙专属，不占 Android 参数位） */
+  const harmonyAvaSettleTick = ref<number>(0);
+  // #endif
   // 滚动停稳后防抖记忆阅读位置（主记忆时机；onHide 兜底——返回销毁途中
   // selectorQuery 的 exec 回调可能不落地，光靠 onHide 会丢）
   let scrollMemoSaveTimer = 0;
@@ -6885,6 +6893,14 @@
     chatScrollIdleTimer = setTimeout(() => {
       chatScrollIdleTimer = 0;
       chatScrolling.value = false;
+      // #ifdef APP-HARMONY
+      // 停手放行：滚动中落地的行到这一刻才挂头像节点（滚动帧里新建的节点补绘不到，
+      // 会静默停在字母兜底）；一批放行一次，版本号驱动模板重算。
+      if (harmonyAvaHeldIds.size > 0) {
+        harmonyAvaHeldIds.clear();
+        harmonyAvaSettleTick.value = harmonyAvaSettleTick.value + 1;
+      }
+      // #endif
     }, 160);
     if (scrollMemoSaveTimer != 0) {
       clearTimeout(scrollMemoSaveTimer);
@@ -7255,6 +7271,138 @@
   /** 头像解析版本号：App-Android 方法调用绑定不收集方法体内依赖（readInfoTick 先例），
    * 解析完成 bump 一次强制模板重算 avatarSrcOf。 */
   const avatarResolveTick = ref<number>(0);
+  /** 解析失败退避重试计数（原始地址 → 已重试次数；成功即清）。鸿蒙进页会并发出十几
+   *  个头像下载，个别失败很常见，一次抖动不该让该发送者整场会话停在字母兜底。 */
+  const avatarResolveRetries = new Map<string, number>();
+  const AVATAR_RESOLVE_MAX_RETRIES = 3;
+  /** 鸿蒙「换新地址重挂」计数（渲染阶段 @error 用，见 handleAvatarError）。 */
+  const avatarRemountCounts = new Map<string, number>();
+  const AVATAR_REMOUNT_MAX = 2;
+  /** 鸿蒙重挂窗口内临时抑制（先卸载旧节点，再换新地址挂新节点）。 */
+  const avatarSuppressedUrls = new Set<string>();
+  /** 鸿蒙重挂次数用尽：该地址不再挂 <image>（挂了也画不出来，只会反复 @error）。 */
+  const avatarDeadUrls = new Set<string>();
+
+  // #ifdef APP-HARMONY
+  /**
+   * 鸿蒙头像是否走「下载成 temp 文件」而不是 <image> 直连。
+   *
+   * ①受保护 /api/f/（带不上 Bearer）。
+   * ②同源 /api/ 路径（实测用户头像 /api/user/avatar/1/<hash>，匿名 curl 就是 200
+   *   image/jpeg，不涉鉴权）：2026-10-27 真机 `direct=20` 全是它，部分行的 <image>
+   *   节点迟迟不绘制（无 @error、无日志），而同一人 /api/f/ 那份下载成 temp 就正常。
+   *   落到本地文件后与已验证可渲染的链路一致，也顺带把挂载挪进「停稳后再挂」的拍子。
+   */
+  function isHarmonyAvatarNeedsFetch(url: string): boolean {
+    if (isAuthProtectedFileUrl(url)) return true;
+    if (url.indexOf("/api/") < 0) return false;
+    // 取 pathname（去掉 scheme+host 与 query），只认根路径开头的 /api/，避免误伤
+    // 第三方 CDN 里恰好含 /api/ 的地址
+    let path = url;
+    const schemeIdx = path.indexOf("://");
+    if (schemeIdx >= 0) {
+      const afterProto = path.substring(schemeIdx + 3);
+      const slashIdx = afterProto.indexOf("/");
+      path = slashIdx >= 0 ? afterProto.substring(slashIdx) : "/";
+    }
+    const q = path.indexOf("?");
+    if (q >= 0) path = path.substring(0, q);
+    return path.indexOf("/api/") == 0;
+  }
+
+  /** 该行头像本轮是否仍被按住（tick 尾参驱动重算）；集合与版本号声明见 chatScrolling 处 */
+  function harmonyAvaHoldOf(msg: ImMsgRow, _tick: number = 0): boolean {
+    return harmonyAvaHeldIds.has(msg.msgId);
+  }
+
+  /** 该行头像原始地址（行内有则用行的，否则回落到「我的 / 对端」头像） */
+  function harmonyAvaRawOf(msg: ImMsgRow): string {
+    if (msg.senderAvatar.length > 0) return msg.senderAvatar;
+    return isMine(msg) ? myAvatar.value : peerAvatar.value;
+  }
+
+  /** 已 @load 的行（msgId）：真图淡入的判定依据（创建时 opacity 0，load 后翻 class 走 transition） */
+  const harmonyAvaLoadedIds = new Set<string>();
+  /** 超时仍未 load 的行（msgId）：收口成默认头像，先留白不能变成永久空框 */
+  const harmonyAvaTimeoutIds = new Set<string>();
+  /** 已挂过 6s 兜底计时器的行，防重复计时 */
+  const harmonyAvaLoadWatchIds = new Set<string>();
+  /** 进页 2s 后一律放行真图可见：@load 万一不回调也不能把真图永远摁在 opacity 0
+   *  （放行后真图仍按自身加载时机出现，只是不再有淡入） */
+  const harmonyAvaRevealAll = ref<boolean>(false);
+  let harmonyAvaFlushTimer = 0;
+
+  /** 60ms 合并刷渲染：逐行 bump tick 会把整表重渲 N 次（页面局部渲染原则） */
+  function scheduleHarmonyAvaFlush(): void {
+    if (harmonyAvaFlushTimer != 0) return;
+    harmonyAvaFlushTimer = setTimeout((): void => {
+      harmonyAvaFlushTimer = 0;
+      avatarResolveTick.value = avatarResolveTick.value + 1;
+    }, 60);
+  }
+
+  /** 真图是否已 load（成功才淡入；未 load 前刻意留白，不显示默认头像） */
+  function harmonyAvaLoadedOf(msg: ImMsgRow, _tick: number = 0): boolean {
+    return harmonyAvaLoadedIds.has(msg.msgId);
+  }
+
+  /** 默认头像（字母+渐变）何时出场：没有地址 / 加载失败 / 解析用尽 / 超时未 load */
+  function harmonyAvaFallbackOf(msg: ImMsgRow, _tick: number = 0): boolean {
+    const raw = harmonyAvaRawOf(msg);
+    if (raw.length == 0) return true;
+    const failed: boolean = isMine(msg) ? myAvatarFailed.value : msg.avatarFailed;
+    if (failed) return true;
+    if (avatarDeadUrls.has(raw)) return true;
+    return harmonyAvaTimeoutIds.has(msg.msgId);
+  }
+
+  /** 行落地起 6s 内没有任何 @load → 收口默认头像（滑历史/进页都覆盖） */
+  function scheduleHarmonyAvaLoadWatch(msg: ImMsgRow): void {
+    const id = msg.msgId;
+    if (harmonyAvaLoadWatchIds.has(id)) return;
+    harmonyAvaLoadWatchIds.add(id);
+    setTimeout((): void => {
+      if (!isChatCurrent()) return;
+      if (harmonyAvaLoadedIds.has(id)) return;
+      if (harmonyAvaRawOf(msg).length == 0) return;
+      if (harmonyAvaTimeoutIds.has(id)) return;
+      harmonyAvaTimeoutIds.add(id);
+      scheduleHarmonyAvaFlush();
+      console.error(`[ChatAva] 6s 未 load，收口默认头像 msgId=${id}`);
+    }, 6000);
+  }
+
+  /** 诊断（验证通过后删）：节点 @load 是否到达。load 但图不出＝加载到了不绘制；
+   *  连 load 都没有＝节点根本没建/请求没完成。鸿蒙真机只有 console.error 可见。 */
+  function handleHarmonyAvatarLoad(msg: ImMsgRow): void {
+    const id = msg.msgId;
+    if (harmonyAvaLoadedIds.has(id)) return;
+    harmonyAvaLoadedIds.add(id);
+    harmonyAvaTimeoutIds.delete(id);
+    scheduleHarmonyAvaFlush();
+    console.error(`[ChatAva] 节点 load msgId=${id}`);
+  }
+
+  /**
+   * 鸿蒙头像回填落库（须定义在 resolveChatAvatarUrl 之前：UTS 同级函数前向引用报 error18）。
+   *
+   * 两道延时：①网络回调帧里渲染出的 <image> 可能进不了补绘队列（静默无事件）；
+   * ②手势/滚动帧里新建的 v-if 节点同样缺补绘帧（翻页加载浮层先例），滑历史正是这个
+   * 场景——所以滚动中不落库，等 chatScrolling 变假（停手 160ms）再挂节点。
+   */
+  function commitHarmonyAvatarBackfill(url: string, resolved: string, waitTick: number): void {
+    if (!isChatCurrent() || avatarDisplayCache.has(url)) return;
+    if (chatScrolling.value == true && waitTick < 40) {
+      setTimeout((): void => {
+        commitHarmonyAvatarBackfill(url, resolved, waitTick + 1);
+      }, 120);
+      return;
+    }
+    avatarDisplayCache.set(url, resolved);
+    avatarResolveTick.value = avatarResolveTick.value + 1;
+    console.error(`[ChatAva] 头像回填 url=${url} => ${resolved}`);
+  }
+  // #endif
 
   function resolveChatAvatarUrl(url: string): void {
     // ★仅浏览器 H5 与鸿蒙生效：Android/iOS <image> 原生加载器直连可用（无 ORB、
@@ -7267,31 +7415,124 @@
     // #ifdef H5 || WEB || APP-HARMONY
     if (url.length == 0) return;
     // #ifdef APP-HARMONY
-    // 鸿蒙只解析受保护地址：普通直链位图直连可用，非受保护 svg 直连也能正确缩放
-    // （ArkUI 远程 .svg OK），不产生额外下载。
-    if (isAuthProtectedFileUrl(url) != true) return;
+    // 鸿蒙只解析「带不上鉴权」的地址：受保护 /api/f/ + 同源 /api/ 路径（用户头像
+    // /api/user/avatar/… 实测直连必空白且无 @error，见 isHarmonyAvatarNeedsFetch）。
+    // 其余普通直链位图/远程 svg 直连可正常渲染，不产生额外下载。
+    if (isHarmonyAvatarNeedsFetch(url) != true) return;
     // #endif
     if (avatarDisplayCache.has(url) || avatarAttemptedUrls.has(url)) return;
     if (avatarRequests.has(url)) return;
     avatarAttemptedUrls.add(url);
     avatarRequests.add(url);
-    resolveDisplayImageUrl(url, AVATAR_DISPLAY_PX, AVATAR_DISPLAY_PX)
+    // #ifdef APP-HARMONY
+    // 看门狗：鸿蒙 downloadFile 偶发 success/fail 都不回调，promise 悬挂会让该地址永久
+    // 空白（无缓存、无事件、无日志——「一条 [ChatAva] 都没有」正是这个形态）：
+    // 3s 未回调按失败处理，走同一套退避重试。
+    const avatarWatchdogTimer = setTimeout((): void => {
+      if (!isChatCurrent() || !avatarRequests.has(url)) return;
+      avatarRequests.delete(url);
+      console.error(`[ChatAva] 解析 3s 未回调，按失败处理 url=${url}`);
+      const wPrev = avatarResolveRetries.get(url);
+      const wTries: number = wPrev == null ? 0 : wPrev;
+      if (wTries < AVATAR_RESOLVE_MAX_RETRIES) {
+        avatarResolveRetries.set(url, wTries + 1);
+        avatarAttemptedUrls.delete(url);
+        setTimeout((): void => {
+          if (!isChatCurrent() || avatarDisplayCache.has(url)) return;
+          resolveChatAvatarUrl(url);
+        }, 400 * (wTries + 1));
+      } else {
+        avatarDeadUrls.add(url);
+        avatarResolveTick.value = avatarResolveTick.value + 1;
+        console.error(`[ChatAva] 解析悬挂重试用尽，保持原地址 url=${url}`);
+      }
+    }, 3000);
+    // #endif
+    // #ifdef APP-HARMONY
+    // 受保护 /api/f/ 走通用解析（含 H5 blob / SVG 分支）；其余同源 /api/ 路径
+    // （用户头像 /api/user/avatar/…）通用解析会直连透传，改走下载换 temp（公开地址
+    // 多带个 Authorization 也无害），见 isHarmonyAvatarNeedsFetch。
+    let avatarResolveTask: Promise<string> = Promise.resolve(url);
+    if (isAuthProtectedFileUrl(url)) {
+      avatarResolveTask = resolveDisplayImageUrl(url, AVATAR_DISPLAY_PX, AVATAR_DISPLAY_PX);
+    } else {
+      avatarResolveTask = fetchAuthProtectedFileDisplayUrl(url);
+    }
+    // #endif
+    // #ifndef APP-HARMONY
+    const avatarResolveTask = resolveDisplayImageUrl(url, AVATAR_DISPLAY_PX, AVATAR_DISPLAY_PX);
+    // #endif
+    avatarResolveTask
       .then((resolved: string) => {
         avatarRequests.delete(url);
-        // 普通地址 / 解析失败回退：保持原地址直连（真机可用，H5 交 @error 兜底字母头像）
-        if (resolved == url) return;
+        // #ifdef APP-HARMONY
+        clearTimeout(avatarWatchdogTimer);
+        // #endif
+        // 普通地址 / 解析失败回退：保持原地址直连（真机可用，H5 交 @error 兜底字母头像）。
+        // 受保护地址回退原址＝本轮解析失败（鸿蒙原址绑不上），退避重试——鸿蒙进页/滑动
+        // 会并发出十几个头像下载，个别失败很常见，一次抖动不该整场停在字母兜底。
+        if (resolved == url) {
+          const prevTries = avatarResolveRetries.get(url);
+          const tries: number = prevTries == null ? 0 : prevTries;
+          if (tries < AVATAR_RESOLVE_MAX_RETRIES) {
+            avatarResolveRetries.set(url, tries + 1);
+            avatarAttemptedUrls.delete(url);
+            console.error(`[ChatAva] 解析失败，第 ${tries + 1} 次退避重试 url=${url}`);
+            setTimeout((): void => {
+              if (!isChatCurrent() || avatarDisplayCache.has(url)) return;
+              resolveChatAvatarUrl(url);
+            }, 400 * (tries + 1));
+          } else {
+            // #ifdef APP-HARMONY
+            // 一直解析不出来＝这张头像永远不会出：收口默认头像（留白不能永久空着）
+            avatarDeadUrls.add(url);
+            avatarResolveTick.value = avatarResolveTick.value + 1;
+            // #endif
+            console.error(`[ChatAva] 解析重试用尽，保持原地址 url=${url}`);
+          }
+          return;
+        }
         if (!isChatCurrent()) {
           // 会话已切换：blob 立即回收防泄漏（缓存随 releaseChatImages 清空）
           if (resolved.startsWith("blob:")) releaseDisplayImageUrl(resolved);
           return;
         }
         if (resolved.startsWith("blob:")) avatarBlobUrls.add(resolved);
+        avatarResolveRetries.delete(url);
+        // #ifdef APP-HARMONY
+        // 鸿蒙挂节点时机见 commitHarmonyAvatarBackfill：独立定时器帧起手 + 滚动停稳。
+        setTimeout((): void => {
+          commitHarmonyAvatarBackfill(url, resolved, 0);
+        }, 60);
+        // #endif
+        // #ifndef APP-HARMONY
         avatarDisplayCache.set(url, resolved);
         avatarResolveTick.value = avatarResolveTick.value + 1;
+        // #endif
       })
       .catch((_e: any | null) => {
         avatarRequests.delete(url);
-        // resolveDisplayImageUrl 内部已兜底回退原地址；防御异常路径即可
+        // #ifdef APP-HARMONY
+        clearTimeout(avatarWatchdogTimer);
+        // #endif
+        // resolveDisplayImageUrl 内部已兜底回退原地址；异常路径同样按失败退避重试
+        const prevTries = avatarResolveRetries.get(url);
+        const tries: number = prevTries == null ? 0 : prevTries;
+        if (tries < AVATAR_RESOLVE_MAX_RETRIES) {
+          avatarResolveRetries.set(url, tries + 1);
+          avatarAttemptedUrls.delete(url);
+          console.error(`[ChatAva] 解析异常，第 ${tries + 1} 次退避重试 url=${url}`);
+          setTimeout((): void => {
+            if (!isChatCurrent() || avatarDisplayCache.has(url)) return;
+            resolveChatAvatarUrl(url);
+          }, 400 * (tries + 1));
+        } else {
+          // #ifdef APP-HARMONY
+          avatarDeadUrls.add(url);
+          avatarResolveTick.value = avatarResolveTick.value + 1;
+          // #endif
+          console.error(`[ChatAva] 解析异常重试用尽 url=${url}`);
+        }
       });
     // #endif
   }
@@ -7309,6 +7550,17 @@
     avatarDisplayCache.clear();
     avatarAttemptedUrls.clear();
     avatarRequests.clear();
+    avatarResolveRetries.clear();
+    avatarRemountCounts.clear();
+    avatarSuppressedUrls.clear();
+    avatarDeadUrls.clear();
+    // #ifdef APP-HARMONY
+    harmonyAvaHeldIds.clear();
+    harmonyAvaLoadedIds.clear();
+    harmonyAvaTimeoutIds.clear();
+    harmonyAvaLoadWatchIds.clear();
+    harmonyAvaSettleTick.value = harmonyAvaSettleTick.value + 1;
+    // #endif
   }
 
   /**
@@ -7323,6 +7575,12 @@
       return;
     }
     deferredMediaIds.delete(row.msgId);
+    // #ifdef APP-HARMONY
+    // 滚动中落地的行先按住头像挂载，停手后再挂节点（滚动帧里新建的 <image> 补绘不到）
+    if (chatScrolling.value == true) harmonyAvaHeldIds.add(row.msgId);
+    // 行落地起 6s 内没有 @load 就收口默认头像（先留白等真图不能变成永久空框）
+    scheduleHarmonyAvaLoadWatch(row);
+    // #endif
     // 头像同走受保护/SVG 解析（H5 ORB / App SVG 光栅化；attempted 去重，普通地址零成本）
     resolveChatAvatarUrl(row.senderAvatar);
     if (row.imageUrl.length > 0) {
@@ -12408,6 +12666,19 @@
     // #ifdef H5 || WEB || APP-HARMONY
     if (isAuthProtectedFileUrl(url)) return "";
     // #endif
+    // #ifdef APP-HARMONY
+    // 重挂窗口内（旧节点先卸载）与重挂次数用尽（再挂也画不出，只会反复 @error）都不挂。
+    if (avatarSuppressedUrls.has(url) || avatarDeadUrls.has(url)) return "";
+    // 同源 /api/ 路径（用户头像 /api/user/avatar/…）鸿蒙直连不上鉴权：未解析前不挂节点，
+    // 等 Bearer 下载换 temp 回填（挂着必失败，还会把字母兜底标死）。
+    if (isHarmonyAvatarNeedsFetch(url)) return "";
+    // 站点根相对地址在 App <image> 里按「本地文件」解析必失败（H5 按页面源解析故正常，
+    // 正是「H5 对、鸿蒙错」的分端差异）：其余 /static/ 等补全再绑。
+    // 只补这两种前缀——沙箱绝对路径（/data/storage/…）本身就是可展示地址，不能动。
+    if (url.indexOf("/api/") == 0 || url.indexOf("/static/") == 0) {
+      return resolveAuthProtectedFileFetchUrl(url);
+    }
+    // #endif
     return url;
   }
 
@@ -12433,6 +12704,46 @@
   }
 
   function handleAvatarError(msg: ImMsgRow): void {
+    // #ifdef APP-HARMONY
+    // 鸿蒙「已挂节点换新 src 不重绘，只有新挂载的节点才绘制」：加载失败若只置失败标记，
+    // 原节点会一直停在空白（字母层露出来＝用户看到「默认头像」，且永不恢复）。这里做
+    // 有限次真实「卸载旧节点 → 换新地址 → 挂新节点」：受保护图清缓存重解析（整段下载
+    // 天然得到新 temp 路径），远程直链追加一次性 ?_r= 强制换地址。次数用尽落
+    // avatarDeadUrls，不再挂必失败的节点（与改动前一样显示字母兜底）。
+    const raw = msg.senderAvatar.length > 0 ? msg.senderAvatar : (isMine(msg) ? myAvatar.value : peerAvatar.value);
+    if (raw.length > 0) {
+      // 同一发送者的多个头像行共用同一地址：本轮已在重挂（抑制期）就直接返回，
+      // 否则每行的重复 @error 会各计一次，两次就把重挂次数耗尽。
+      if (avatarSuppressedUrls.has(raw)) return;
+      const prev = avatarRemountCounts.get(raw);
+      const tries: number = prev == null ? 0 : prev;
+      if (tries < AVATAR_REMOUNT_MAX) {
+        avatarRemountCounts.set(raw, tries + 1);
+        console.error(`[ChatAva] 头像渲染失败，第 ${tries + 1} 次换址重挂 url=${raw}`);
+        avatarDisplayCache.delete(raw);
+        avatarAttemptedUrls.delete(raw);
+        avatarSuppressedUrls.add(raw);
+        // 先重渲一次让旧 <image> 卸载（鸿蒙不重绘已存在节点）；此拍 v-if 因抑制而为假
+        avatarResolveTick.value = avatarResolveTick.value + 1;
+        setTimeout((): void => {
+          if (!isChatCurrent()) return;
+          avatarSuppressedUrls.delete(raw);
+          if (isHarmonyAvatarNeedsFetch(raw)) {
+            resolveChatAvatarUrl(raw);
+            return;
+          }
+          const sep = raw.indexOf("?") >= 0 ? "&" : "?";
+          // 站点根相对路径先补成绝对地址（App <image> 把它当本地文件，必失败）
+          const absRaw = (raw.indexOf("/") == 0 && raw.indexOf("//") != 0) ? resolveAuthProtectedFileFetchUrl(raw) : raw;
+          avatarDisplayCache.set(raw, `${absRaw}${sep}_r=${Date.now()}`);
+          avatarResolveTick.value = avatarResolveTick.value + 1;
+        }, 260);
+        return;
+      }
+      avatarDeadUrls.add(raw);
+      console.error(`[ChatAva] 头像重挂次数用尽，字母兜底 url=${raw}`);
+    }
+    // #endif
     if (isMine(msg)) {
       myAvatarFailed.value = true;
     } else {
@@ -13531,6 +13842,49 @@
     setTimeout(() => {
       avaFadeOn.value = true;
     }, 80);
+    // 诊断（验证通过后删）：进页 2s 汇总头像状态——鸿蒙真机只有 console.error 可见。
+    // rows=有地址的消息行数，pending=仍等下载换 temp（/api/f/ 与同源 /api/），direct=其余直连行，
+    // held=滚动中按住未挂的行，cache=已回填地址数，inflight=解析在途，dead=重挂用尽。
+    setTimeout((): void => {
+      // 兜底放行：@load 不回调时真图也得能显出来（见 harmonyAvaRevealAll）
+      if (harmonyAvaRevealAll.value != true) harmonyAvaRevealAll.value = true;
+      if (!isChatCurrent()) return;
+      let total = 0;
+      let pending = 0;
+      let direct = 0;
+      let sample = "";
+      let samples = 0;
+      let detail = "";
+      let details = 0;
+      const rows = messages.value;
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const raw = row.senderAvatar.length > 0 ? row.senderAvatar : (isMine(row) ? myAvatar.value : peerAvatar.value);
+        // 逐行样本：最后 6 行（首屏可见的那几条）实际绑给 <image> 的 src
+        if (details < 6 && i + 6 >= rows.length) {
+          details += 1;
+          const src = avatarSrcOf(row, avatarResolveTick.value);
+          const shownSrc: string = src.length > 70 ? src.substring(0, 70) : src;
+          const mineFlag: number = isMine(row) ? 1 : 0;
+          detail += ` [${i}:m=${mineFlag}:src=${shownSrc}]`;
+        }
+        if (raw.length == 0) continue;
+        total += 1;
+        if (avatarDisplayCache.has(raw)) continue;
+        if (isHarmonyAvatarNeedsFetch(raw)) {
+          pending += 1;
+        } else {
+          direct += 1;
+          // 直连地址不经解析，画不出来时无任何日志可循：附前 6 条样本
+          if (samples < 6 && sample.indexOf(raw) < 0) {
+            samples += 1;
+            sample += ` [${raw}]`;
+          }
+        }
+      }
+      console.error(`[ChatAva] 汇总 rows=${total} pending=${pending} direct=${direct} held=${harmonyAvaHeldIds.size} cache=${avatarDisplayCache.size} attempts=${avatarAttemptedUrls.size} inflight=${avatarRequests.size} dead=${avatarDeadUrls.size}${sample}`);
+      console.error(`[ChatAva] 逐行${detail}`);
+    }, 2000);
     // #endif
     // Android：输入框已挂载时把原生 gravity 设为垂直居中；进页首帧原生视图可能
     // 晚于 onReady 挂载（单次调用会静默空转，未聚焦时 placeholder 偏上），带重试兜到挂载

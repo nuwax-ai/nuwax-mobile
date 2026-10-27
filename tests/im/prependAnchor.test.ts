@@ -1,15 +1,29 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { loadUtsClass } from "./runtimeHarness";
 
+// UTS `Number.toInt()` 的 Node 垫片（Kotlin 侧 View.scrollTo(Int, Int) 要求显式转换）
+(Number.prototype as any).toInt = function (this: number): number { return Math.trunc(this); };
+
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 function fixture() {
   let contentTop = 80;
   let listener: any;
+  let scrollY = 35; // 原生滚动真值（view 持有；body.scrollTop 为其代理——断言面不变）
   const observer = { isAlive: () => true, addOnPreDrawListener: (v: any) => listener = v, removeOnPreDrawListener: vi.fn() };
-  const view = { getViewTreeObserver: () => observer, invalidate: vi.fn() };
-  const body = { scrollTop: 35, getBoundingClientRect: () => ({ top: 100 }), getAndroidView: () => view };
-  const anchor = { getBoundingClientRect: () => ({ top: 100 + contentTop - body.scrollTop }) };
+  const view = {
+    getViewTreeObserver: () => observer,
+    invalidate: vi.fn(),
+    getScrollY: () => scrollY,
+    scrollTo: (_x: number, y: number) => { scrollY = y; },
+  };
+  const body = {
+    get scrollTop() { return scrollY; },
+    set scrollTop(v: number) { scrollY = v; },
+    getBoundingClientRect: () => ({ top: 100 }),
+    getAndroidView: () => view,
+  };
+  const anchor = { getBoundingClientRect: () => ({ top: 100 + contentTop - scrollY }) };
   const preserve = loadUtsClass("utils/im/imPrependAnchor.uts", "preserveImPrependAnchor", {
     uni: { getElementById: (id: string) => id === 'body' ? body : anchor },
   });

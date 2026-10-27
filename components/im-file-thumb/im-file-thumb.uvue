@@ -1,0 +1,175 @@
+<template>
+  <view class="ift-box">
+    <!-- 解析完成：<image> 直显；解析中：三点轮换 loading；失败：文件图标兜底 -->
+    <image
+      v-if="src.length > 0 && failed != true"
+      class="ift-thumb"
+      :src="src"
+      mode="aspectFill"
+      @error="onError"
+    />
+    <view v-else-if="loading" class="ift-dots">
+      <view v-for="(ds, idx) in dotStyles" :key="idx" class="ift-dot" :style="ds" />
+    </view>
+    <svg-icon v-else name="icon-a-Filetext" size="20" unit="px" color="#5147ff" />
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, computed, onMounted, onUnmounted } from "vue";
+  import { isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
+  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { acquireThumbSlot, releaseThumbSlot, getCachedThumbSrc, cacheThumbSrc } from "./thumb-slot.uts";
+
+  /**
+   * 文件页图片缩略图槽位（自包含：解析 + loading 态 + 失败兜底）。
+   * 受保护 /api/f/ 地址 <image> 带不了 Bearer，须先经 resolveDisplayImageUrl
+   * 换 blob/临时文件，解析期内以三点 loading 占位。
+   * ★并发闸门（thumb-slot.uts，模块级共享）：长列表 N 行同时挂载时最多 3 个
+   * 解析同时进行、其余排队（排队期静态三点占位、不起 timer），避免 N 路整文件
+   * 下载同时发起把网络/内存打满导致页面卡死。同模块还有成功缓存：切 tab
+   * 重建行、组件重挂时命中即秒显零下载（失败不缓存，重挂可重试）。
+   * ★解析状态全部收在组件内部（ref 自驱动本组件重渲）：父页面行内绑定不穿透
+   * 数组元素属性（Android 已知坑），跨组件就地改属性行不通——曾因此引入页级
+   * tick 强制重评并真机卡死，抽组件后 tick 整个不再需要。解析结果经 resolved
+   * 事件上抛，父页面存 Map 供点行放大预览复用。
+   */
+  const props = withDefaults(
+    defineProps<{
+      /** 附件原始地址（受保护 /api/f/ 或普通地址）。 */
+      url: string;
+    }>(),
+    { url: "" },
+  );
+
+  const emit = defineEmits<{
+    (e: "resolved", url: string, src: string): void;
+  }>();
+
+  /** 解析出的可展示地址（空 = 未解析）。 */
+  const src = ref<string>("");
+  /** 展示失败（解析失败或 @error）。 */
+  const failed = ref<boolean>(false);
+  /** 解析中（三点 loading 显隐）。 */
+  const loading = ref<boolean>(false);
+
+  // ===== 三点 loading（im-file-detail 内联三点同款：timer 驱动 + computed 出样式） =====
+  const loadingPhase = ref<number>(0);
+  let loadingTimerId: number = -1;
+  /** 组件已卸载：排队中醒来时立即让出槽位、不再发起解析。 */
+  let gone = false;
+
+  /** 各点透明度（computed 驱动重渲——模板直调函数不收集依赖的 Android 坑）。 */
+  const dotStyles = computed((): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      out.push(`opacity: ${i == loadingPhase.value ? 1 : 0.25};`);
+    }
+    return out;
+  });
+
+  function stopDots(): void {
+    if (loadingTimerId != -1) {
+      clearInterval(loadingTimerId);
+      loadingTimerId = -1;
+    }
+    loading.value = false;
+  }
+
+  function startDots(): void {
+    stopDots();
+    loadingPhase.value = 0;
+    loading.value = true;
+    loadingTimerId = setInterval((): void => {
+      loadingPhase.value = (loadingPhase.value + 1) % 3;
+    }, 400);
+  }
+
+  onMounted((): void => {
+    const url = props.url;
+    if (url.length == 0) {
+      return;
+    }
+    // 普通地址可直显，无需 loading；受保护地址解析期间三点占位
+    if (!isAuthProtectedFileUrl(url)) {
+      src.value = url;
+      return;
+    }
+    // 命中模块级成功缓存：直接显示不走 loading/下载（切 tab 重建行时秒回显）；
+    // 仍上抛 resolved 供父页面 Map 补齐（页面重进后父 Map 是空的）
+    const cached = getCachedThumbSrc(url);
+    if (cached != null && cached.length > 0) {
+      src.value = cached;
+      emit("resolved", url, cached);
+      return;
+    }
+    // 排队期先显示静态三点占位（不起 timer）；拿到槽位才开动画并发起解析
+    loading.value = true;
+    acquireThumbSlot()
+      .then((_ok: boolean): void => {
+        if (gone) {
+          // 排队期间组件已卸载：立即让出槽位，不发起解析
+          releaseThumbSlot();
+          return;
+        }
+        startDots();
+        resolveDisplayImageUrl(url, 72, 72)
+          .then((resolved: string): void => {
+            releaseThumbSlot();
+            stopDots();
+            if (resolved.length > 0) {
+              cacheThumbSrc(url, resolved);
+              src.value = resolved;
+              emit("resolved", url, resolved);
+              return;
+            }
+            failed.value = true;
+          })
+          .catch((_e: any | null): void => {
+            releaseThumbSlot();
+            stopDots();
+            failed.value = true;
+          });
+      });
+  });
+
+  onUnmounted((): void => {
+    gone = true;
+    stopDots();
+  });
+
+  function onError(): void {
+    failed.value = true;
+  }
+</script>
+
+<style lang="scss" scoped>
+  .ift-box {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ift-thumb {
+    width: 36px;
+    height: 36px;
+  }
+
+  .ift-dots {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .ift-dot {
+    width: 4px;
+    height: 4px;
+    border-radius: 2px;
+    background-color: #5147ff;
+    margin-left: 3px;
+    margin-right: 3px;
+  }
+</style>

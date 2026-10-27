@@ -1,10 +1,13 @@
 import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN } from "@/constants/home.constants";
 /**
- * 会话输入草稿（微信式）：聊天页未发出的文案按 convId 本地记忆——
- * 退出聊天页后消息列表摘要行显示「[草稿]xxx」，再进页输入框回显上次输入；
- * 发送（输入框清空）后草稿随之清除。
+ * 会话输入草稿（微信式）：聊天页未发出的文案+暂存图按 convId 本地记忆——
+ * 退出聊天页后消息列表摘要行显示「[草稿]xxx」（图片占位 [图片]），再进页输入框与
+ * 暂存图条回显上次内容；发送（输入框与暂存图清空）后草稿随之清除。
  *
- * 存储：单 storage 键存全部会话草稿（items 数组：id/文案/顺序），跨进程重启保留；
+ * 图片存本地路径（App 端相册/拍摄临时文件跨页面实例可读；H5 相册是 blob: URL，
+ * 页面卸载即失效，页面侧不写入）。路径被系统清理的极端情形恢复出裂图，可手删。
+ *
+ * 存储：单 storage 键存全部会话草稿（items 数组：id/文案/图片/顺序），跨进程重启保留；
  * 账号 tag（token|origin，imSessionScope 同源字段但去掉进程内 epoch——epoch 重启
  * 归零会让重启后必失配）不匹配整包丢弃，防换账号串号。超量按最久未更新淘汰
  * （草稿是碎片数据，不值得无限累积）。进程内模块级缓存一份：读走内存，
@@ -14,13 +17,17 @@ import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN } from "@/constants/home.constants";
 const DRAFTS_STORAGE_KEY = "IM_CHAT_DRAFTS";
 /** 最多记忆的会话草稿数（超出淘汰最久未更新的）。 */
 const DRAFTS_MAX_CONVS = 50;
+/** 单会话草稿最多记忆的暂存图数（与聊天页 STAGED_IMAGE_MAX 同值，超出截断）。 */
+const DRAFTS_MAX_IMAGES = 9;
 
 class ChatDraftEntry {
   convId: string = "";
   text: string = "";
-  constructor(convId: string, text: string) {
+  images: string[] = [];
+  constructor(convId: string, text: string, images: string[]) {
     this.convId = convId;
     this.text = text;
+    this.images = images;
   }
 }
 
@@ -34,6 +41,23 @@ function accountTag(): string {
 function readString(obj: UTSJSONObject, key: string): string {
   const raw = obj[key];
   return raw != null ? `${raw}` : "";
+}
+
+/** 读草稿图片路径数组（旧版条目无 imgs 键 → 空数组，兼容只存文案的历史草稿）。 */
+function readImages(obj: UTSJSONObject): string[] {
+  const images: string[] = [];
+  const raw = obj["imgs"];
+  if (raw == null || !Array.isArray(raw)) {
+    return images;
+  }
+  const rows = raw as any[];
+  for (let i = 0; i < rows.length && images.length < DRAFTS_MAX_IMAGES; i++) {
+    const path = rows[i] != null ? `${rows[i]}` : "";
+    if (path.length > 0) {
+      images.push(path);
+    }
+  }
+  return images;
 }
 
 // ===== 模块级缓存（convId → 草稿；order 为更新序，队尾最新）=====
@@ -86,7 +110,7 @@ function ensureCache(): void {
       if (convId.length == 0 || draftsByConv.has(convId)) {
         continue;
       }
-      draftsByConv.set(convId, new ChatDraftEntry(convId, readString(items[i], "t")));
+      draftsByConv.set(convId, new ChatDraftEntry(convId, readString(items[i], "t"), readImages(items[i])));
       draftOrder.push(convId);
     }
   } catch (_e) {
@@ -105,6 +129,7 @@ function persist(): void {
     const obj = new UTSJSONObject();
     obj["id"] = entry.convId;
     obj["t"] = entry.text;
+    obj["imgs"] = entry.images;
     items.push(obj);
   }
   const root = new UTSJSONObject();
@@ -131,16 +156,45 @@ export function getChatDraft(convId: string): string {
   return entry != null ? entry.text : "";
 }
 
+/** 取会话草稿暂存图路径（回显暂存图条用）；未记忆返回空数组。 */
+export function getChatDraftImages(convId: string): string[] {
+  ensureCache();
+  if (convId.length == 0) {
+    return [] as string[];
+  }
+  const entry = draftsByConv.get(convId);
+  return entry != null ? [...entry.images] : ([] as string[]);
+}
+
+/** 会话是否有草稿（文案非空白或暂存图非空）——列表浮顶/插行分区判定用。 */
+export function chatDraftHasContent(convId: string): boolean {
+  ensureCache();
+  if (convId.length == 0) {
+    return false;
+  }
+  const entry = draftsByConv.get(convId);
+  if (entry == null) {
+    return false;
+  }
+  return entry.text.trim().length > 0 || entry.images.length > 0;
+}
+
 /**
- * 写/清会话草稿：纯空白视为清除（微信同款——没输入有效文案就不算草稿）；
+ * 写/清会话草稿：纯空白文案且无暂存图视为清除（微信同款）；文案与暂存图一起记忆。
  * 相同内容重复写仍刷更新序（防被淘汰后读丢）。清一个不存在的会话不触发落盘。
  */
-export function setChatDraft(convId: string, text: string): void {
+export function setChatDraft(convId: string, text: string, images: string[] = [] as string[]): void {
   ensureCache();
   if (convId.length == 0) {
     return;
   }
-  const keep = text.trim().length > 0;
+  const keptImages: string[] = [];
+  for (let i = 0; i < images.length && keptImages.length < DRAFTS_MAX_IMAGES; i++) {
+    if (images[i].length > 0) {
+      keptImages.push(images[i]);
+    }
+  }
+  const keep = text.trim().length > 0 || keptImages.length > 0;
   const idx = draftOrder.indexOf(convId);
   const existed = idx >= 0;
   // 有效变更（新增/更新/清除任一）自增版本号；同内容重写也刷更新序故同样自增
@@ -157,7 +211,7 @@ export function setChatDraft(convId: string, text: string): void {
     }
     return;
   }
-  draftsByConv.set(convId, new ChatDraftEntry(convId, text));
+  draftsByConv.set(convId, new ChatDraftEntry(convId, text, keptImages));
   draftOrder.push(convId);
   while (draftOrder.length > DRAFTS_MAX_CONVS) {
     const oldest = draftOrder[0];

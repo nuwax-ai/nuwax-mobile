@@ -1,0 +1,97 @@
+/**
+ * 聊天页发送台账（send journal）
+ *
+ * 场景：点发送后 POST 在途 / SSE 首包未回时用户强退页面（Android/鸿蒙 webview 随页销毁，
+ * 在途请求被网络层拆断），消息体未达服务端即丢失、重进不落库。
+ *
+ * 机制：发送意图在 POST 派发前落 storage；服务端受理（本轮流首个 SSE 数据块）后清除。
+ * 重进会话时台账仍在 = 该次发送未确认送达，恢复为输入框草稿（可重发）。
+ * 与 pendingChatDraft（首页→聊天页首条消息注入）互补：台账只保存恢复草稿所需的最小集
+ * （正文 + 附件条目），消费方是会话页自身。
+ */
+
+const PREFIX = "chatSendJournal:";
+// 台账保留期：超期视为用户已放弃，不再恢复
+const TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** 台账作用域：已有会话按会话维度；新会话首条消息（conversationId 未定）按智能体维度。 */
+export function chatSendJournalScope(conversationId: number, agentId: number): string {
+  return conversationId > 0 ? `c${conversationId}` : `a${agentId}`;
+}
+
+function storageKey(scope: string): string {
+  return PREFIX + scope;
+}
+
+function numberFromAny(value: any | null, fallback: number): number {
+  if (value == null) return fallback;
+  const parsed = parseFloat(`${value}`);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+/** 台账条目序列化（ts + 正文 + 附件五字段纯 JSON）。 */
+function buildEntryJson(messageInfo: string, files: UTSJSONObject[]): string {
+  const fileRows: UTSJSONObject[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const source = files[i];
+    if (source == null) continue;
+    const row = new UTSJSONObject();
+    row["url"] = source["url"] != null ? `${source["url"]}` : "";
+    row["key"] = source["key"] != null ? `${source["key"]}` : "";
+    row["name"] = source["name"] != null ? `${source["name"]}` : "";
+    row["type"] = source["type"] != null ? `${source["type"]}` : "";
+    row["size"] = numberFromAny(source["size"], 0);
+    fileRows.push(row);
+  }
+  const root = new UTSJSONObject();
+  root["ts"] = Date.now();
+  root["messageInfo"] = messageInfo;
+  root["files"] = fileRows;
+  const json = JSON.stringify(root);
+  return json != null ? json : "";
+}
+
+/**
+ * 点发送（POST 派发前）写入台账。
+ * messageInfo 为正文文本；files 为输入框附件条目（UTSJSONObject，取 url/key/name/type/size 五个纯 JSON 字段）。
+ * 参照 serializePendingChatDraft：UTS 运行时对含类实例对象直接 stringify 可能得到空对象，逐字段组装纯 JSON。
+ */
+export function saveChatSendJournal(scope: string, messageInfo: string, files: UTSJSONObject[]): void {
+  if (scope.length == 0) return;
+  const json = buildEntryJson(messageInfo, files);
+  if (json.length > 0) uni.setStorageSync(storageKey(scope), json);
+}
+
+/** 读取台账原始 JSON（空串 = 无台账），不做 TTL 校验。 */
+export function readChatSendJournalJson(scope: string): string {
+  try {
+    const raw = uni.getStorageSync(storageKey(scope));
+    if (raw == null) return "";
+    return `${raw}`;
+  } catch (_e) {
+    return "";
+  }
+}
+
+/** 读取并解析台账；超期（TTL）视为放弃，清除后返回 null。 */
+export function readChatSendJournal(scope: string): UTSJSONObject | null {
+  const raw = readChatSendJournalJson(scope);
+  if (raw.length == 0) return null;
+  try {
+    const parsed = JSON.parse<UTSJSONObject>(raw);
+    if (parsed == null) return null;
+    const ts = numberFromAny(parsed["ts"], 0);
+    if (ts <= 0 || Date.now() - ts > TTL_MS) {
+      clearChatSendJournal(scope);
+      return null;
+    }
+    return parsed;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** 服务端已受理（SSE 首包）/ 恢复完成 / 判定已送达时清除。 */
+export function clearChatSendJournal(scope: string): void {
+  uni.removeStorageSync(storageKey(scope));
+}

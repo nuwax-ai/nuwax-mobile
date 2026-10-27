@@ -1,0 +1,121 @@
+import { AuthIdpProvider, AuthIdpLoginList } from "@/types/interfaces/authIdp";
+
+export const IDP_RETURN_PATH = "/subpackages/pages/auth/idp-return";
+export const MOBILE_AUTH_HOME = "/pages/message/message";
+export const MOBILE_LOGIN_PATH = "/subpackages/pages/login/login";
+
+function textField(obj: UTSJSONObject, key: string): string {
+  const value = obj[key];
+  return value != null ? `${value}` : "";
+}
+
+export function isAuthId(value: string): boolean {
+  return /^[1-9][0-9]*$/.test(value);
+}
+
+export function parseAuthIdpList(raw: any | null): AuthIdpLoginList {
+  const result = new AuthIdpLoginList();
+  if (raw == null || typeof raw != "object" || Array.isArray(raw)) return result;
+  const obj = raw as UTSJSONObject;
+  if (!Array.isArray(obj["items"])) return result;
+  const items = obj["items"] as any[];
+  for (let i = 0; i < items.length; i++) {
+    if (items[i] == null || typeof items[i] != "object" || Array.isArray(items[i])) continue;
+    const source = items[i] as UTSJSONObject;
+    const provider = new AuthIdpProvider();
+    provider.id = textField(source, "id");
+    provider.type = textField(source, "type");
+    provider.name = textField(source, "name");
+    provider.icon = textField(source, "icon");
+    provider.wechatMode = textField(source, "wechatMode");
+    if (!isAuthId(provider.id) || result.items.some((p: AuthIdpProvider): boolean => p.id == provider.id)) continue;
+    result.items.push(provider);
+  }
+  result.autoRedirectIdpId = textField(obj, "autoRedirectIdpId");
+  return result;
+}
+
+/** 不按按钮名称推断提供方；配置过滤同样适用于自动跳转。 */
+export function availableAuthProviders(items: AuthIdpProvider[], enabledTypes: string[], allowedIds: string[], userAgent: string): AuthIdpProvider[] {
+  const wechatMode = userAgent.toLowerCase().includes("micromessenger") ? "OA" : "QRCODE";
+  return items.filter((p: AuthIdpProvider): boolean => {
+    if (!enabledTypes.includes(p.type) || (allowedIds.length > 0 && !allowedIds.includes(p.id))) return false;
+    if (p.type == "WECHAT") return p.wechatMode == wechatMode;
+    return p.type == "CAS" || p.type == "OAUTH2";
+  });
+}
+
+function relativePath(value: string, origin: string): string {
+  let target = value;
+  // uni.reLaunch 的 H5 query 会再编码一层；仅解开整个地址的包装，
+  // 已是 /pages/... 的业务 query 不再解码，避免破坏其中的 %26 / %20。
+  if (/^(%2f|https?%3a)/i.test(target)) {
+    try {
+      const decoded = decodeURIComponent(target);
+      if (decoded == null) return "";
+      target = decoded;
+    } catch (_error) { return ""; }
+  }
+  if (origin.length > 0 && target.startsWith(origin + "/")) target = target.substring(origin.length);
+  if (!target.startsWith("/") || target.startsWith("//") || /[\\\u0000-\u001f\u007f]/.test(target)) return "";
+  return target;
+}
+
+/** 只返回移动站内页面；拒绝登录/启动/回调循环及 URL 归一化绕过。 */
+export function resolveMobileAuthReturn(value: string, origin: string = ""): string {
+  let target = relativePath(value, origin);
+  if (target.startsWith("/m/#/")) target = target.substring(4);
+  const path = target.split("?")[0];
+  if (!/^\/(pages|subpackages\/pages)\/[a-zA-Z0-9_/-]+$/.test(path) || path.includes("//")) return MOBILE_AUTH_HOME;
+  if (path.includes("/login") || path.includes("/auth/") || path.includes("/launch/") || path.includes("/offline-h5-bootstrap/") ||
+      path == "/subpackages/pages/temporary-session/temporary-session") return MOBILE_AUTH_HOME;
+  return target;
+}
+
+/** 首次关联的普通登录只能续接后端的指定 pending 页面，不开放任意 /api 地址。 */
+export function resolvePendingAuthReturn(value: string, origin: string = ""): string {
+  const target = relativePath(value, origin);
+  if (target.includes("#") || target.split("?")[0] != "/auth/bind-or-register") return "";
+  const query = target.split("?");
+  if (query.length != 2) return "";
+  const fields = query[1].split("&");
+  let hasToken = false;
+  let hasBind = false;
+  for (let i = 0; i < fields.length; i++) {
+    if (fields[i].startsWith("token=") && fields[i].length > 6 && !hasToken) {
+      try {
+        const token = decodeURIComponent(fields[i].substring(6));
+        if (token == null || token.trim().length == 0 || /[\u0000-\u001f\u007f]/.test(token)) return "";
+      } catch (_error) { return ""; }
+      hasToken = true;
+    }
+    else if (fields[i] == "bind=1" && !hasBind) hasBind = true;
+    else return "";
+  }
+  return hasToken ? target : "";
+}
+
+export function mobileAuthWebReturn(value: string, origin: string = ""): string {
+  return "/m/#" + resolveMobileAuthReturn(value, origin);
+}
+
+export function buildIdpAuthorizePath(providerId: string, requestedReturn: string, origin: string = ""): string {
+  if (!isAuthId(providerId)) return "";
+  const callback = "/m/#" + IDP_RETURN_PATH + "?redirect=" + encodeURIComponent(resolveMobileAuthReturn(requestedReturn, origin));
+  return "/api/auth/idp/authorize?provider=" + providerId + "&redirect=" + encodeURIComponent(callback);
+}
+
+export function autoAuthProviderId(items: AuthIdpProvider[], configured: string, local: boolean, hasError: boolean): string {
+  if (local || hasError) return "";
+  return items.some((p: AuthIdpProvider): boolean => p.id == configured) ? configured : "";
+}
+
+/** 防止列表请求在页面卸载/服务域切换后回写 UI 或发起跳转。 */
+export class AuthLoadScope {
+  private revision: number = 0;
+  begin(): number { this.revision += 1; return this.revision; }
+  invalidate(): void { this.revision += 1; }
+  accepts(revision: number, requestedOrigin: string, currentOrigin: string): boolean {
+    return revision == this.revision && requestedOrigin == currentOrigin;
+  }
+}

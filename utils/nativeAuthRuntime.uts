@@ -1,0 +1,233 @@
+import { NATIVE_AUTH_ENABLED, NATIVE_AUTH_PROVIDER_IDS } from "@/constants/nativeAuth";
+import {
+  NativeAuthCrypto, NativeAuthStorage, NativeAuthBrowser, NativeAuthBackend,
+  NativeAuthSessionHost, NativeAuthSession, NativeAuthResult, NativeAuthCompletion,
+} from "@/types/interfaces/nativeAuth";
+import { NativeAuthFlow } from "@/utils/nativeAuthFlow";
+import { getApiBaseUrl } from "@/constants/config";
+import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN, EXPIRE_DATE } from "@/constants/home.constants";
+import { saveAccessToken } from "@/utils/authSession";
+import { IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
+import eventBus from "@/utils/eventBus";
+
+// #ifdef APP-ANDROID || APP-IOS
+import {
+  nativeAuthAvailable, nativeAuthRandomToken, nativeAuthSha256, nativeAuthRead,
+  nativeAuthWrite, nativeAuthClear, nativeAuthOpen, nativeAuthCancel, nativeAuthTakeResult,
+} from "@/uni_modules/nuwax-native-auth";
+// #endif
+
+export const NATIVE_AUTH_COMPLETED_EVENT = "native_auth_completed";
+export const NATIVE_AUTH_STATUS_EVENT = "native_auth_status";
+let backend: NativeAuthBackend | null = null;
+let flow: NativeAuthFlow | null = null;
+let bootstrapped = false;
+let resumeRunning = false;
+let pollTimer: number = -1;
+let pollingPaused = false;
+let lastPublished = "";
+let completion: NativeAuthCompletion | null = null;
+
+export function pauseNativeAuthPolling(): void {
+  pollingPaused = true;
+  if (pollTimer >= 0) clearTimeout(pollTimer);
+  pollTimer = -1;
+}
+
+function publishStatus(result: NativeAuthResult): void {
+  const signature = result.status + "|" + result.error + "|" + result.requestId;
+  if (signature == lastPublished) return;
+  lastPublished = signature;
+  const data = new UTSJSONObject();
+  data["status"] = result.status;
+  data["error"] = result.error;
+  data["requestId"] = result.requestId;
+  uni.$emit(NATIVE_AUTH_STATUS_EVENT, data);
+}
+
+function schedulePoll(): void {
+  if (flow == null || pollTimer >= 0 || pollingPaused) return;
+  const phase = flow!.status().status;
+  if (!["preparing", "authorizing", "exchanging", "verifying"].includes(phase)) return;
+  // iOS 认证会话关闭未必触发 App.onShow；只在活跃事务期间轮询原生结果。
+  pollTimer = setTimeout(() => {
+    pollTimer = -1;
+    // 网络等待期间也独立检查取消上下文/期限，不等 prepare/exchange 完成才解除 UI。
+    if (flow != null) publishStatus(flow!.checkContext());
+    schedulePoll();
+    resumeNativeAuth().catch((_error: any | null): void => {});
+  }, 300);
+}
+
+// #ifdef APP-ANDROID || APP-IOS
+class PlatformCrypto implements NativeAuthCrypto {
+  randomToken(): string { return nativeAuthRandomToken(); }
+  sha256Base64Url(value: string): string { return nativeAuthSha256(value); }
+}
+class PlatformStorage implements NativeAuthStorage {
+  read(): string { return nativeAuthRead(); }
+  write(value: string): boolean { return nativeAuthWrite(value); }
+  clear(): boolean { return nativeAuthClear(); }
+}
+class PlatformBrowser implements NativeAuthBrowser {
+  available(): boolean { return nativeAuthAvailable(); }
+  open(requestId: string, authorizeUrl: string, callbackUrl: string): boolean {
+    const value = new UTSJSONObject();
+    value["requestId"] = requestId;
+    value["authorizeUrl"] = authorizeUrl;
+    value["callbackUrl"] = callbackUrl;
+    return nativeAuthOpen(JSON.stringify(value) ?? "");
+  }
+  cancel(requestId: string): void { nativeAuthCancel(requestId); }
+}
+class PlatformSessionHost implements NativeAuthSessionHost {
+  currentOrigin(): string { return getApiBaseUrl(); }
+  currentSessionStamp(): string {
+    // 只持久化摘要；不使用进程内 epoch，保证同一会话可跨冷启动校验。
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    const origin = uni.getStorageSync(ACCESS_TOKEN_ORIGIN);
+    return nativeAuthSha256(`${origin ?? ""}|${token ?? ""}`);
+  }
+  commit(session: NativeAuthSession, userId: string, returnPath: string): void {
+    uni.setStorageSync(EXPIRE_DATE, new Date(session.expiresAt).toISOString());
+    saveAccessToken(session.token);
+    // 留存一次完成信息，覆盖冷启动时事件早于登录页挂载的情形。
+    const pending = new NativeAuthCompletion();
+    pending.origin = this.currentOrigin();
+    pending.sessionStamp = this.currentSessionStamp();
+    pending.userId = userId;
+    pending.resetPass = session.resetPass;
+    pending.returnPath = returnPath;
+    completion = pending;
+    const data = new UTSJSONObject();
+    data["userId"] = userId;
+    data["resetPass"] = session.resetPass;
+    data["returnPath"] = returnPath;
+    uni.$emit(NATIVE_AUTH_COMPLETED_EVENT, data);
+  }
+}
+// #endif
+
+export function takeNativeAuthCompletion(): NativeAuthCompletion | null {
+  const pending = completion;
+  completion = null;
+  // #ifdef APP-ANDROID || APP-IOS
+  if (pending != null) {
+    const host = new PlatformSessionHost();
+    if (pending.origin == host.currentOrigin() && pending.sessionStamp == host.currentSessionStamp()) return pending;
+  }
+  // #endif
+  return null;
+}
+
+export function nativeAuthReadiness(): string {
+  if (!NATIVE_AUTH_ENABLED) return "feature_disabled";
+  if (backend == null) return "backend_unconfigured";
+  // #ifdef APP-ANDROID || APP-IOS
+  try { return nativeAuthAvailable() ? "ready" : "native_bridge_unavailable"; }
+  catch (_error) { return "native_bridge_unavailable"; }
+  // #endif
+  // #ifndef APP-ANDROID || APP-IOS
+  return "platform_unsupported";
+  // #endif
+}
+
+/** 只接收代码内、按正式合同实现的适配器；不允许由页面参数注入 URL/Secret。 */
+export function registerNativeAuthBackend(adapter: NativeAuthBackend | null): void {
+  pauseNativeAuthPolling();
+  if (flow != null) flow!.cancel();
+  flow = null;
+  backend = adapter;
+}
+
+function ensureFlow(): NativeAuthFlow | null {
+  if (nativeAuthReadiness() != "ready") return null;
+  // #ifdef APP-ANDROID || APP-IOS
+  if (flow == null) {
+    flow = new NativeAuthFlow(new PlatformCrypto(), new PlatformStorage(), new PlatformBrowser(),
+      backend, new PlatformSessionHost(), true, (): number => Date.now());
+    flow!.restore();
+  }
+  // #endif
+  return flow;
+}
+
+export async function startNativeAuth(providerId: string, providerType: string, returnPath: string): Promise<NativeAuthResult> {
+  if (!NATIVE_AUTH_PROVIDER_IDS.includes(providerId)) {
+    const blocked = new NativeAuthResult();
+    blocked.status = "blocked";
+    blocked.error = "provider_unconfigured";
+    return blocked;
+  }
+  pollingPaused = false;
+  const current = ensureFlow();
+  if (current != null) {
+    const pending = current.start(providerId, providerType, returnPath);
+    publishStatus(current.status());
+    schedulePoll();
+    const result = await pending;
+    publishStatus(result);
+    schedulePoll();
+    return result;
+  }
+  const result = new NativeAuthResult();
+  result.status = "blocked";
+  result.error = nativeAuthReadiness();
+  return result;
+}
+
+export function cancelNativeAuth(): void {
+  pauseNativeAuthPolling();
+  if (flow != null) publishStatus(flow!.cancel());
+}
+
+export function nativeAuthStatus(): NativeAuthResult {
+  if (flow != null) return flow!.status();
+  const result = new NativeAuthResult();
+  const readiness = nativeAuthReadiness();
+  if (readiness != "ready") {
+    result.status = "blocked";
+    result.error = readiness;
+  }
+  return result;
+}
+
+/** App onLaunch/onShow 可调用；回前台本身不产生授权成功或兑换请求。 */
+export async function resumeNativeAuth(): Promise<void> {
+  pollingPaused = false;
+  if (resumeRunning) { schedulePoll(); return; }
+  const current = ensureFlow();
+  if (current == null) return;
+  resumeRunning = true;
+  try {
+    current.checkContext();
+  // #ifdef APP-ANDROID || APP-IOS
+  const raw = nativeAuthTakeResult();
+  if (raw.length == 0 || raw.length > 16384 || !raw.trim().startsWith("{")) return;
+  let obj: UTSJSONObject | null = null;
+  try { obj = JSON.parse<UTSJSONObject>(raw); } catch (_error) { return; }
+  if (obj == null) return;
+    await current.handleResult(`${obj["requestId"] ?? ""}`, `${obj["kind"] ?? ""}`, `${obj["uri"] ?? ""}`);
+  // #endif
+  } finally {
+    resumeRunning = false;
+    publishStatus(current.status());
+    schedulePoll();
+  }
+}
+
+export function bootstrapNativeAuth(): void {
+  if (bootstrapped) return;
+  bootstrapped = true;
+  eventBus.on(IM_SESSION_CLEARED, (_event: any) => {
+    completion = null;
+    if (flow == null) return;
+    const phase = flow!.status().status;
+    if (["preparing", "authorizing", "exchanging", "verifying"].includes(phase)) cancelNativeAuth();
+  });
+  // #ifdef APP-ANDROID || APP-IOS
+  if (!NATIVE_AUTH_ENABLED) {
+    try { nativeAuthClear(); } catch (_error) { /* 未完成的旧事务不能用于关闭功能后的登录。 */ }
+  }
+  // #endif
+}

@@ -1,0 +1,126 @@
+import { NativeAuthCallback, NativeAuthTransaction } from "@/types/interfaces/nativeAuth";
+import { isAuthId, resolveMobileAuthReturn } from "@/utils/authIdp";
+import { NATIVE_AUTH_MAX_AGE_MS } from "@/constants/nativeAuth";
+
+export function validNativeAuthOrigin(value: string): boolean {
+  return /^https:\/\/[a-zA-Z0-9.-]+(:[0-9]{1,5})?$/.test(value) &&
+    !value.includes("..") && !value.includes("@") && value.length <= 255;
+}
+
+export function validNativeAuthToken(value: string): boolean {
+  return /^[a-zA-Z0-9_-]{43}$/.test(value);
+}
+
+/** 第一版固定私有 scheme；HTTPS/Universal Link 必须另有包与域名登记，不能靠参数开放。 */
+export function validNativeCallbackUrl(value: string): boolean {
+  return value == "com.nuwax.app.auth://oauth/callback";
+}
+
+export function trustedNativeAuthorizeUrl(value: string, origin: string, verifier: string): boolean {
+  if (!validNativeAuthOrigin(origin) || !value.startsWith(origin + "/") || value.length > 8192 ||
+      /[\\\u0000-\u0020\u007f#]/.test(value) || value.includes(verifier)) return false;
+  const path = value.substring(origin.length).split("?")[0];
+  if (path.includes("%") || path.includes("//") || path.split("/").includes("..")) return false;
+  const query = value.includes("?") ? value.substring(value.indexOf("?") + 1) : "";
+  const pairs = query.split("&");
+  for (let i = 0; i < pairs.length; i++) {
+    try {
+      if (decodeURIComponent(pairs[i].split("=")[0]) == "code_verifier") return false;
+    } catch (_error) { return false; }
+  }
+  return true;
+}
+
+/** 严格匹配完整回调与唯一参数；错误描述不返回给 UI 或日志。 */
+export function parseNativeAuthCallback(uri: string, expectedUrl: string, expectedState: string): NativeAuthCallback {
+  const result = new NativeAuthCallback();
+  if (!validNativeCallbackUrl(expectedUrl) || !validNativeAuthToken(expectedState) || uri.length > 8192 ||
+      /[\\\u0000-\u0020\u007f#]/.test(uri) || !uri.startsWith(expectedUrl + "?")) return result;
+  let state = "";
+  let code = "";
+  let error = "";
+  const keys: string[] = [];
+  const pairs = uri.substring(expectedUrl.length + 1).split("&");
+  for (let i = 0; i < pairs.length; i++) {
+    const equal = pairs[i].indexOf("=");
+    if (equal <= 0) return result;
+    let key = "";
+    let value = "";
+    try {
+      key = decodeURIComponent(pairs[i].substring(0, equal)) ?? "";
+      value = decodeURIComponent(pairs[i].substring(equal + 1).replace(/\+/g, " ")) ?? "";
+    } catch (_error) { return result; }
+    if (keys.includes(key) || !["state", "code", "error", "error_description"].includes(key) ||
+        /[\u0000-\u001f\u007f]/.test(value)) return result;
+    keys.push(key);
+    if (key == "state") state = value;
+    if (key == "code") code = value;
+    if (key == "error") error = value;
+  }
+  if (state != expectedState || (code.length > 0) == (error.length > 0)) return result;
+  if (keys.includes("code") && keys.includes("error")) return result;
+  if (code.length > 4096 || /[\u0000-\u0020\u007f]/.test(code) || error.length > 128) return result;
+  result.valid = true;
+  result.code = code;
+  result.error = error;
+  return result;
+}
+
+/** 显式 JSON 字段，避免 UTS class 在 Android 上序列化丢字段。只能写入 NativeAuthStorage。 */
+export function encodeNativeAuthTransaction(tx: NativeAuthTransaction): string {
+  const obj = new UTSJSONObject();
+  obj["version"] = tx.version;
+  obj["id"] = tx.id;
+  obj["origin"] = tx.origin;
+  obj["providerId"] = tx.providerId;
+  obj["callbackUrl"] = tx.callbackUrl;
+  obj["returnPath"] = tx.returnPath;
+  obj["state"] = tx.state;
+  obj["verifier"] = tx.verifier;
+  obj["challenge"] = tx.challenge;
+  obj["sessionStamp"] = tx.sessionStamp;
+  obj["serverTransactionId"] = tx.serverTransactionId;
+  obj["createdAt"] = tx.createdAt;
+  obj["expiresAt"] = tx.expiresAt;
+  obj["phase"] = tx.phase;
+  return JSON.stringify(obj) ?? "";
+}
+
+function textField(obj: UTSJSONObject, key: string): string {
+  const value = obj[key];
+  return value != null ? `${value}` : "";
+}
+
+function timestampField(obj: UTSJSONObject, key: string): number {
+  const raw = obj[key];
+  return typeof raw == "number" ? raw as number : Number.NaN;
+}
+
+export function decodeNativeAuthTransaction(raw: string, now: number): NativeAuthTransaction | null {
+  if (raw.length == 0 || raw.length > 16384 || !raw.trim().startsWith("{")) return null;
+  let obj: UTSJSONObject | null = null;
+  try { obj = JSON.parse<UTSJSONObject>(raw); } catch (_error) { return null; }
+  if (obj == null || `${obj["version"] ?? ""}` != "1") return null;
+  const tx = new NativeAuthTransaction();
+  tx.id = textField(obj, "id");
+  tx.origin = textField(obj, "origin");
+  tx.providerId = textField(obj, "providerId");
+  tx.callbackUrl = textField(obj, "callbackUrl");
+  tx.returnPath = textField(obj, "returnPath");
+  tx.state = textField(obj, "state");
+  tx.verifier = textField(obj, "verifier");
+  tx.challenge = textField(obj, "challenge");
+  tx.sessionStamp = textField(obj, "sessionStamp");
+  tx.serverTransactionId = textField(obj, "serverTransactionId");
+  tx.phase = textField(obj, "phase");
+  tx.createdAt = timestampField(obj, "createdAt");
+  tx.expiresAt = timestampField(obj, "expiresAt");
+  if (!validNativeAuthOrigin(tx.origin) || !isAuthId(tx.providerId) || !validNativeCallbackUrl(tx.callbackUrl) ||
+      !validNativeAuthToken(tx.id) || !validNativeAuthToken(tx.state) || !validNativeAuthToken(tx.verifier) ||
+      !validNativeAuthToken(tx.challenge) || tx.sessionStamp.length == 0 ||
+      !["preparing", "authorizing", "exchanging", "verifying"].includes(tx.phase) ||
+      !Number.isFinite(tx.createdAt) || !Number.isFinite(tx.expiresAt) || tx.createdAt > now ||
+      tx.expiresAt <= now || tx.expiresAt <= tx.createdAt || tx.expiresAt - tx.createdAt > NATIVE_AUTH_MAX_AGE_MS ||
+      resolveMobileAuthReturn(tx.returnPath) != tx.returnPath) return null;
+  return tx;
+}

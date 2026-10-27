@@ -1,0 +1,213 @@
+import {
+  NativeAuthTransaction, NativeAuthPrepareRequest, NativeAuthExchangeRequest, NativeAuthResult,
+  NativeAuthCrypto, NativeAuthStorage, NativeAuthBrowser, NativeAuthBackend, NativeAuthSessionHost,
+} from "@/types/interfaces/nativeAuth";
+import { isAuthId, resolveMobileAuthReturn } from "@/utils/authIdp";
+import { NATIVE_AUTH_CALLBACK_URL, NATIVE_AUTH_MAX_AGE_MS } from "@/constants/nativeAuth";
+import {
+  validNativeAuthOrigin, validNativeAuthToken, trustedNativeAuthorizeUrl, parseNativeAuthCallback,
+  encodeNativeAuthTransaction, decodeNativeAuthTransaction,
+} from "@/utils/nativeAuthProtocol";
+
+/** 无后端路径假设的原生编排器。所有网络能力通过已确认合同的适配器注入。 */
+export class NativeAuthFlow {
+  private crypto: NativeAuthCrypto;
+  private storage: NativeAuthStorage;
+  private browser: NativeAuthBrowser;
+  private backend: NativeAuthBackend | null;
+  private host: NativeAuthSessionHost;
+  private enabled: boolean;
+  private transaction: NativeAuthTransaction | null = null;
+  private revision: number = 0;
+  private clock: () => number;
+  private latest: NativeAuthResult = new NativeAuthResult();
+
+  constructor(crypto: NativeAuthCrypto, storage: NativeAuthStorage, browser: NativeAuthBrowser,
+    backend: NativeAuthBackend | null, host: NativeAuthSessionHost, enabled: boolean, clock: () => number) {
+    this.crypto = crypto;
+    this.storage = storage;
+    this.browser = browser;
+    this.backend = backend;
+    this.host = host;
+    this.enabled = enabled;
+    this.clock = clock;
+  }
+
+  /** 返回值不包含 state/code/verifier/token，供 UI 安全消费。 */
+  status(): NativeAuthResult { return this.latest; }
+
+  private result(status: string, error: string = "", id: string = ""): NativeAuthResult {
+    const result = new NativeAuthResult();
+    result.status = status;
+    result.error = error;
+    result.requestId = id;
+    this.latest = result;
+    return result;
+  }
+
+  private finish(status: string, error: string = ""): NativeAuthResult {
+    const tx = this.transaction;
+    this.transaction = null;
+    this.revision += 1;
+    let cleared = false;
+    try { cleared = this.storage.clear(); } catch (_error) { /* 安全存储不可用，不能假装已清理。 */ }
+    if (!cleared) {
+      // 删除失败时尽力写入无效记录，防止旧 authorizing 记录在重启后恢复。
+      try { this.storage.write('{"version":1,"phase":"cancelled"}'); } catch (_error) {}
+    }
+    if (tx != null) {
+      try { this.browser.cancel(tx.id); } catch (_error) { /* 取消系统窗口不能影响事务失效。 */ }
+    }
+    return this.result(cleared ? status : "failed", cleared ? error : "secure_storage_failed", tx != null ? tx.id : "");
+  }
+
+  cancel(): NativeAuthResult { return this.finish("cancelled"); }
+
+  /** 每次 await 后复核；旧响应不得清理较新的事务。 */
+  private accepts(id: string, revision: number): boolean {
+    const tx = this.transaction;
+    if (tx == null || tx.id != id || this.revision != revision) return false;
+    if (tx.origin != this.host.currentOrigin() || tx.sessionStamp != this.host.currentSessionStamp()) {
+      this.finish("cancelled", "context_changed");
+      return false;
+    }
+    if (tx.expiresAt <= this.clock() || this.clock() < tx.createdAt) {
+      this.finish("expired", "transaction_expired");
+      return false;
+    }
+    return true;
+  }
+
+  private persist(tx: NativeAuthTransaction): boolean {
+    try { return this.storage.write(encodeNativeAuthTransaction(tx)); } catch (_error) { return false; }
+  }
+
+  async start(providerId: string, providerType: string, returnPath: string): Promise<NativeAuthResult> {
+    if (!this.enabled || this.backend == null) return this.result("blocked", "backend_unconfigured");
+    if (providerType != "CAS" && providerType != "OAUTH2") return this.result("blocked", "provider_unsupported");
+    if (this.transaction != null) return this.result(this.transaction.phase, "busy", this.transaction.id);
+    const origin = this.host.currentOrigin();
+    if (!validNativeAuthOrigin(origin) || !isAuthId(providerId)) return this.result("blocked", "invalid_configuration");
+    if (!this.browser.available()) return this.result("blocked", "native_bridge_unavailable");
+    const tx = new NativeAuthTransaction();
+    try {
+      tx.id = this.crypto.randomToken();
+      tx.state = this.crypto.randomToken();
+      tx.verifier = this.crypto.randomToken();
+      tx.challenge = this.crypto.sha256Base64Url(tx.verifier);
+      tx.sessionStamp = this.host.currentSessionStamp();
+    } catch (_error) { return this.result("blocked", "crypto_unavailable"); }
+    if (!validNativeAuthToken(tx.id) || !validNativeAuthToken(tx.state) || !validNativeAuthToken(tx.verifier) ||
+        !validNativeAuthToken(tx.challenge) || tx.id == tx.state || tx.state == tx.verifier || tx.id == tx.verifier ||
+        tx.sessionStamp.length == 0) return this.result("blocked", "crypto_unavailable");
+    tx.origin = origin;
+    tx.providerId = providerId;
+    tx.callbackUrl = NATIVE_AUTH_CALLBACK_URL;
+    tx.returnPath = resolveMobileAuthReturn(returnPath);
+    tx.createdAt = this.clock();
+    tx.expiresAt = tx.createdAt + NATIVE_AUTH_MAX_AGE_MS;
+    this.revision += 1;
+    const revision = this.revision;
+    this.transaction = tx;
+    if (!this.persist(tx)) return this.finish("failed", "secure_storage_failed");
+    this.result("preparing", "", tx.id);
+    const request = new NativeAuthPrepareRequest();
+    request.requestId = tx.id;
+    request.origin = tx.origin;
+    request.providerId = tx.providerId;
+    request.callbackUrl = tx.callbackUrl;
+    request.state = tx.state;
+    request.codeChallenge = tx.challenge;
+    try {
+      const launch = await this.backend!.prepare(request);
+      if (!this.accepts(tx.id, revision)) return this.latest;
+      if (!trustedNativeAuthorizeUrl(launch.authorizeUrl, tx.origin, tx.verifier) ||
+          !Number.isFinite(launch.expiresAt) || launch.expiresAt <= this.clock() ||
+          launch.serverTransactionId.length > 256) return this.finish("failed", "invalid_launch_response");
+      tx.serverTransactionId = launch.serverTransactionId;
+      tx.expiresAt = Math.min(tx.expiresAt, launch.expiresAt);
+      tx.phase = "authorizing";
+      if (!this.persist(tx)) return this.finish("failed", "secure_storage_failed");
+      if (!this.browser.open(tx.id, launch.authorizeUrl, tx.callbackUrl)) return this.finish("failed", "browser_unavailable");
+      return this.result("authorizing", "", tx.id);
+    } catch (_error) {
+      return this.accepts(tx.id, revision) ? this.finish("failed", "prepare_failed") : this.latest;
+    }
+  }
+
+  /** 仅恢复尚未兑换的事务；兑换中断属于结果不确定，禁止冷启动自动重放。 */
+  restore(): NativeAuthResult {
+    if (this.transaction != null) return this.latest;
+    let raw = "";
+    try { raw = this.storage.read(); } catch (_error) { return this.result("blocked", "secure_storage_failed"); }
+    if (raw.length == 0) return this.result("idle");
+    if (!this.enabled || this.backend == null) return this.finish("blocked", "backend_unconfigured");
+    const tx = decodeNativeAuthTransaction(raw, this.clock());
+    if (tx == null) return this.finish("expired", "invalid_or_expired_transaction");
+    if (tx.origin != this.host.currentOrigin() || tx.sessionStamp != this.host.currentSessionStamp()) {
+      return this.finish("cancelled", "context_changed");
+    }
+    if (tx.phase != "authorizing") return this.finish("failed", "authorization_interrupted");
+    try {
+      if (this.crypto.sha256Base64Url(tx.verifier) != tx.challenge) return this.finish("failed", "invalid_transaction");
+    } catch (_error) { return this.finish("blocked", "crypto_unavailable"); }
+    this.transaction = tx;
+    this.revision += 1;
+    return this.result("authorizing", "", tx.id);
+  }
+
+  /** 系统浏览器回前台不等于成功，只有匹配事务的原生结果才进入这里。 */
+  async handleResult(requestId: string, kind: string, uri: string): Promise<NativeAuthResult> {
+    const tx = this.transaction;
+    if (tx == null || tx.id != requestId || tx.phase != "authorizing") return this.latest;
+    const revision = this.revision;
+    if (!this.accepts(tx.id, revision)) return this.latest;
+    if (kind == "cancelled") return this.finish("cancelled");
+    if (kind == "failed") return this.finish("failed", "browser_failed");
+    if (kind != "callback") return this.latest;
+    const callback = parseNativeAuthCallback(uri, tx.callbackUrl, tx.state);
+    // 不让无关或伪造的 scheme 调用终止真实授权。
+    if (!callback.valid) return this.latest;
+    if (callback.error.length > 0) return this.finish(callback.error == "access_denied" ? "cancelled" : "failed", "authorization_denied");
+    const backend = this.backend;
+    if (backend == null) return this.finish("failed", "backend_unconfigured");
+    tx.phase = "exchanging";
+    if (!this.persist(tx)) return this.finish("failed", "secure_storage_failed");
+    this.result("exchanging", "", tx.id);
+    const request = new NativeAuthExchangeRequest();
+    request.requestId = tx.id;
+    request.origin = tx.origin;
+    request.providerId = tx.providerId;
+    request.callbackUrl = tx.callbackUrl;
+    request.serverTransactionId = tx.serverTransactionId;
+    request.code = callback.code;
+    request.codeVerifier = tx.verifier;
+    try {
+      const session = await backend.exchange(request);
+      if (!this.accepts(tx.id, revision)) return this.latest;
+      if (session.token.length == 0 || session.token.length > 8192 || /[^\u0021-\u007e]/.test(session.token) ||
+          !Number.isFinite(session.expiresAt) || session.expiresAt <= this.clock() ||
+          (session.resetPass != 0 && session.resetPass != 1)) return this.finish("failed", "invalid_business_session");
+      tx.phase = "verifying";
+      if (!this.persist(tx)) return this.finish("failed", "secure_storage_failed");
+      this.result("verifying", "", tx.id);
+      const userId = await backend.verify(tx.origin, session.token);
+      if (!this.accepts(tx.id, revision)) return this.latest;
+      if (!isAuthId(userId) || session.expiresAt <= this.clock()) return this.finish("failed", "session_verification_failed");
+      // 先结束事务，再保存会话；saveAccessToken 会发 IM_SESSION_CLEARED/READY。
+      const completed = this.finish("completed");
+      if (completed.status != "completed") return completed;
+      try { this.host.commit(session, userId, tx.returnPath); }
+      catch (_error) { return this.result("failed", "session_commit_failed", tx.id); }
+      return completed;
+    } catch (_error) {
+      return this.accepts(tx.id, revision) ? this.finish("failed", "exchange_or_verify_failed") : this.latest;
+    }
+  }
+
+  checkContext(): NativeAuthResult {
+    const tx = this.transaction;
+    if (tx != null) this.accepts(tx.id, this.revision);
+    return this.latest;
+  }
+}

@@ -1,10 +1,10 @@
 # 移动端联合登录总方案与原生 App 接入计划
 
-更新：2026-10-27。H5 实现基线：`cccd851ff`。当前按用户要求完成方案梳理；原生业务代码、后端扩展、应用登记及发布均未实施。测试环境行为由用户验证。
+更新：2026-10-27。H5 实现基线：`cccd851ff`。现已按用户后续要求实现不依赖后端的原生事务、协议校验、系统认证桥、App 生命周期及独立登录页入口/完成导航；后端适配器、基座出包、真实联调及发布尚未完成。实际代码状态和可交后端协调的合同清单见[原生后端交接单](native-idp-backend-handoff.md)。H5 测试环境行为由用户验证。
 
 ## 1. 当前完成范围与“原生预留”的含义
 
-**H5 已实现，原生只有可复用基础，尚无完整的原生授权流程或桥接接口。** 原生后续接入可以复用提供方配置、解析、普通登录与会话管理；不能通过打开 H5 开关就完成原生登录。
+**H5 已实现；原生已有独立客户端基础，实际后端闭环仍未接通。** 原生可复用提供方配置、解析、普通登录与会话管理；不能通过打开 H5 开关就完成原生登录。
 
 | 能力 | 当前状态 / 源码 | 原生处理 |
 |---|---|---|
@@ -13,9 +13,9 @@
 | 类型与 ID 白名单 | 已有：[constants/authIdp.uts](../../constants/authIdp.uts)，默认 CAS/OAUTH2，微信关闭 | 当前是 H5 构建配置；后续分平台判断能力 |
 | 列表解析、返回路径约束、旧请求隔离 | 已有：[utils/authIdp.uts](../../utils/authIdp.uts) | 可复用部分纯逻辑；不能用 `AuthLoadScope` 代替完整原生事务 |
 | H5 授权导航及回调页 | 已有：[idpNavigation.uts](../../utils/idpNavigation.uts)、[idp-return.uvue](../../subpackages/pages/auth/idp-return.uvue) | 浏览器导航与 Cookie 回调不用于原生 |
-| 原生入口闸门 | `canUseBrowserIdp()` 在非 H5 返回 `false`；登录组件也按 H5 条件编译 | 保持关闭，完成原生链路后另接原生入口 |
+| 原生入口闸门 | H5 入口不在原生开放；已有独立 `native-idp-login`，由原生开关、适配器、基座能力、原生 ID 白名单共同控制 | 默认关闭；只有后端确认原生交接的 provider 才配置；本阶段仅手动发起 |
 | App 业务 Token 保存及 Bearer 请求 | 原有：[authSession.uts](../../utils/authSession.uts)、[useRequest.uts](../../servers/useRequest.uts) | 在取得并验证平台业务 Token 后复用 |
-| 系统认证窗口、原生回调、PKCE、一次性码兑换、冷启动恢复 | **未实现** | 本方案后续阶段新增 |
+| 系统认证窗口、原生回调、PKCE、事务恢复与兑换编排 | 独立客户端代码已实现，当前关闭 | 真实兑换适配器、包内回调与真机验收仍待完成；中断于兑换阶段不自动重放 |
 | 微信/飞书原生 SDK 登录 | **未实现** | 独立阶段；支付插件、H5 微信开关不代表已经支持 |
 
 历史分支 `feat/nuwa-zhuoda-2026.10-idp-login` 的 10 月 13 日草稿和后端确认清单仅作历史参考；其中的暂停状态、旧远端配置、旧测试数及拟议接口不能代替本文的当前结论。本文与 [H5 接入说明](mobile-h5-idp-login.md) 是当前入口。
@@ -31,7 +31,7 @@
 | N3 微信/飞书等原生 SDK | 按实际移动应用资质接入 | 明确 SDK 能力与公开 AppID 后逐项开启 | 已安装/未安装、拒绝、取消、跨端同一账号、真实签名包验收 |
 | N4 鸿蒙与小程序 | 分别适配系统浏览器/SDK及小程序登录限制 | 平台验证前关闭 | 各自完整会话链路验收，不能套用 Android/iOS 的通过结论 |
 
-本文不要求现在新增这些功能代码，也不要求先开通第三方资质。H5 登录能力与原生开关独立，原生未就绪不能影响西财 H5 使用。
+本轮先实现不依赖后端的客户端基础，不开通第三方资质。H5 登录能力与原生开关独立，原生未就绪不能影响西财 H5 使用。
 
 ## 3. 已知后端能力与接口边界
 
@@ -105,18 +105,19 @@ sequenceDiagram
 
 ## 5. 原生模块拆分及拟定接口
 
-下表均为待新增/扩展项；这些文件和接口尚未创建。
+下表给出模块边界。客户端基础已有实际代码；HTTP 适配器仍待完成，UI 已接线但待真实联调，参见交接单中的当前状态。
 
 | 模块 | 责任 | 与现有代码的边界 |
 |---|---|---|
-| `utils/nativeIdpFlow.uts` | 编排开始、回调、兑换、会话验证、取消与业务返回 | 复用提供方解析及安全业务路由；不修改 H5 浏览器导航语义 |
-| `utils/nativeIdpTransaction.uts` | 状态机、事务代数、过期、并发和安全恢复 | `AuthLoadScope` 仅保护局部异步加载，不能覆盖进程重建 |
+| `utils/nativeAuthFlow.uts` | 已实现开始、回调、兑换/验证适配器编排、取消及安全返回目标 | 复用提供方解析及安全业务路由；不修改 H5 浏览器导航语义 |
+| `utils/nativeAuthProtocol.uts` | 已实现状态记录校验、回调解析、过期与安全恢复校验 | `AuthLoadScope` 仅保护局部异步加载，不能覆盖进程重建 |
 | `servers/authIdp.uts` 扩展或独立服务 | 选定合同的请求封装、候选 Token 验证 | 网络请求继续集中到 servers；不在页面里直接 `uni.request` |
-| `uni_modules/nuwax-native-auth` | 系统认证窗口、回调收取、加密随机/摘要及安全事务存储 | 三端分别实现；与支付插件的 URL 分发互不吞事件 |
-| 登录页原生入口 | 按平台能力显示、协议确认、加载与取消、普通登录逃生 | 不把 H5-only 的 `canUseBrowserIdp()` 直接改成原生 true |
+| `uni_modules/nuwax-native-auth` | Android/iOS 系统认证浏览器、回调收取、加密随机/摘要及安全事务存储已实现 | 鸿蒙仍关闭；与支付插件的 URL 分发互不吞事件，实际包需单独验证 |
+| `utils/nativeAuthRuntime.uts` | 已实现 App 注册、活跃事务结果轮询、后台暂停与已验证业务会话提交事件 | 本地开关关闭、后端适配器未注册；不发真实原生认证请求 |
+| 登录页原生入口 | 已接能力闸门、协议确认、加载与取消、普通登录逃生、设密码和安全业务返回 | 不把 H5-only 的 `canUseBrowserIdp()` 直接改成原生 true |
 | `App.uvue` 启动/回前台适配 | 最早注册原生桥，收取初始回调并去重 | `onShow` 只表示回前台，不表示授权成功；单靠 `onShow` 不兑换 Token |
 
-拟定桥面向统一流程暴露：`getCapabilities()`、`startAuthorization(request)`、`cancel(requestId)`、`getInitialCallback()`、`subscribeCallback(listener)`。这是设计边界，不是可调用的现有 SDK。
+实际桥使用 `nativeAuthAvailable/nativeAuthOpen/nativeAuthCancel/nativeAuthTakeResult` 及安全存储/加密函数，UTS 统一运行层暴露 readiness/start/cancel/resume/status。结果进入安全存储并由活跃事务补轮询消费；未开放通用 URL 监听器。后端按 `NativeAuthBackend` 内部模型接入，不把这些名字当作现有 HTTP API。
 
 - request 至少含 `requestId/authorizeUrl/expectedCallback`；桥只允许打开编排层确认的授权地址。
 - callback 为 `success(uri)`、`cancelled`、`failed(errorKind)`；success 仅表示收到回调 URI，最终登录仍以兑换和用户验证为准。
@@ -268,7 +269,7 @@ H5 失败默认回 PC `/login?idpError=…` 的现有后端行为不能由原生
 | 配置及回退 | 老后端、旧基座、平台不支持、微信未开、自动项不支持、远端停用 | 版本组合测试；普通登录始终可达 |
 | SDK/其他端 | 微信/飞书安装状态、真实应用签名、跨端账号对应；鸿蒙/小程序各自矩阵 | 各阶段独立验收，前期保持关闭 |
 
-本次 H5 专项 47 项通过，HBuilderX H5 编译通过；全量测试有 36 项失败，已在 H5 实施前基线 `39cf4ce57` 隔离复现。它们不是原生编译/真机或真实 IdP 登录证据。本次后续只整理文档，不部署，不修改测试/生产平台配置。
+H5 专项 47 项及原有 H5 编译已通过；全量测试有 36 项失败，已在 H5 实施前基线 `39cf4ce57` 隔离复现。后续原生独立实现的验证与边界单列在交接单，不与 H5 或真机结论混记。不部署、不修改测试/生产平台配置。
 
 ## 12. 后端及平台配置待确认清单
 

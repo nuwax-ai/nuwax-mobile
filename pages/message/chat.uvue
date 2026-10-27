@@ -51,6 +51,20 @@
 
     <!-- 子页签行（单聊与群聊共用）：默认选中「消息」展示当前消息页，Pin/文件从右侧进独立页
          （接口均按 convId 过滤，群聊直接可用），资料库占位，行尾放大镜进本会话内搜索 -->
+    <!-- #ifdef APP-HARMONY -->
+    <!-- 鸿蒙：contentOn 由 onReady（=首帧已呈现，见 script 头注）放行，页签内容与首屏
+         消息同拍出现；条件编译双份是为了不给 Android 渲染函数新增引用（255 参数硬限） -->
+    <chat-subpage-tabs
+      class="chat-subpage-tabs"
+      :tabs="subpageTabs"
+      active="messages"
+      :show-search="true"
+      :content-on="harmonyImgOn"
+      @select="handleSubpageSelect"
+      @search="handleSearchTap"
+    />
+    <!-- #endif -->
+    <!-- #ifndef APP-HARMONY -->
     <chat-subpage-tabs
       class="chat-subpage-tabs"
       :tabs="subpageTabs"
@@ -59,6 +73,7 @@
       @select="handleSubpageSelect"
       @search="handleSearchTap"
     />
+    <!-- #endif -->
     </view>
 
     <!-- 主体区（消息列表 + 输入坞）：让位平移量按列表余量插值分配（bodyShiftPx）——满屏
@@ -196,6 +211,31 @@
             <!-- 真图裁切容器：app-android <image> 自身 border-radius 对 SVG 渲染路径不生效
                  （位图正常、SVG 方形透出；iOS 原生裁剪恒生效、H5 背景图恒被裁，故仅 Android
                  透方）——消息页 chat-item__avatar-clip 同款 overflow 兜底，与消息列表裁圆一致 -->
+            <!-- #ifdef APP-HARMONY -->
+            <!-- 字母层常驻垫底 + 真图叠上去淡入：首屏数据已由 initHistory 等到首帧呈现
+                 才落地，真图节点都在「首帧已呈现」之后创建（避开 UniImageElement 的
+                 Hidden 初值，见 script 头注）；字母层留着只为真图未解析/失败时兜底，
+                 绝不出现空白格。淡入仅去硬切，不加额外延迟 -->
+            <view
+              class="chat-ava"
+              :style="{ backgroundImage: avatarGradient(isMine(msg) ? myDisplayName : titleName) }"
+            >
+              <text class="chat-ava-letter">{{ avatarLetter(isMine(msg) ? myDisplayName : titleName) }}</text>
+            </view>
+            <view
+              v-if="harmonyImgOn && avatarSrcOf(msg, avatarResolveTick).length > 0 && avatarFailedOf(msg) != true"
+              class="chat-ava-clip chat-ava-clip--overlay"
+              :class="avaFadeOn ? 'chat-ava-clip--shown' : ''"
+            >
+              <image
+                class="chat-ava"
+                :src="avatarSrcOf(msg, avatarResolveTick)"
+                mode="aspectFill"
+                @error="handleAvatarError(msg)"
+              />
+            </view>
+            <!-- #endif -->
+            <!-- #ifndef APP-HARMONY -->
             <view
               v-if="avatarSrcOf(msg, avatarResolveTick).length > 0 && avatarFailedOf(msg) != true"
               class="chat-ava-clip"
@@ -214,6 +254,7 @@
             >
               <text class="chat-ava-letter">{{ avatarLetter(isMine(msg) ? myDisplayName : titleName) }}</text>
             </view>
+            <!-- #endif -->
           </view>
           <view class="chat-col" :class="isMine(msg) ? 'chat-col--mine' : ''">
             <!-- 微信式：我方行不显示昵称（头像已在右侧标识发送者），仅对方行展示；
@@ -9076,6 +9117,61 @@
     return isAuthProtectedFileUrl(url) != true;
   }
 
+  // ===== 鸿蒙：<image> 首帧不显示的对策（读 runtime 源码实证，非旧记忆推测） =====
+  // 现象只落在 <image>（PNG/位图）上，同一行的 svg-icon（字体字形）、view/text 全都正常
+  // ——用户反馈「复制/转发/多选有 icon，回复/pin/撤回没有」正是这条分界。
+  // 依据（unpackage/dist/dev/app-harmony/libs/runtime.har 解出的 .ets）：
+  //   · dom/UniImageElement.ets：节点建出来就是 Visibility.Hidden，只有 Image 的
+  //     onComplete 派发 loadingStatus===0 且 ratio 变化时，才置 Visibility.Visible；
+  //     而 @load 走 loadingStatus===1 的另一条分支 → 「事件照常回调、图就是不显示」；
+  //   · dom/UniDocument.ets requestRenderQueue：这个可见化回调（经 layoutNodeDirty）
+  //     要等 isAfterFrame===true 才 apply，首帧呈现前只能 20ms 轮询；
+  //   · dom/UniDocument.ets applyRenderQueue → postFrameCallback → onReadyCallback：
+  //     **document.onReady 就是「首帧已呈现」**（UniNativePage.ets 再 setTimeout(0) 后
+  //     才 emit 页面 onReady）。所以不需要任何固定长延时（旧版 1.2s/900ms/300ms 都是
+  //     拿时间猜窗口），用 onReady 这个真实首帧完成信号即可，图标不会「晚 1~2 秒」。
+  // 实现：首帧只画骨架（页签不渲染内容、消息不落地），onReady 同一批放行页签内容 +
+  // 首屏数据 + 头像真图 → 页签与内容、图标与文案同拍出现。
+  // #ifdef APP-HARMONY
+  const harmonyImgOn = ref(false);
+  /** 真图淡入拍（仅头像用；仅鸿蒙模板分支引用，不占 Android 渲染 lambda 255 位）：
+   *  挂载后隔约 3 帧再翻，让真图节点先以 opacity 0 挂稳、由 class 变更驱动
+   *  transition 淡入（ArkUI 无 @keyframes，transition 须有属性变更才动）。晚于本拍
+   *  才解析回填的头像挂载即 --shown 直出（个别行硬切，可接受）。 */
+  const avaFadeOn = ref(false);
+  /** 首帧渲染完成（onReady 兑现）时调用：放页签内容/真图、并释放 initHistory 落首屏。 */
+  let harmonyFirstPaintResolve: (() => void) | null = null;
+
+  /** 首帧渲染完成信号。Promise 提前建好（只建一次），wait 方 await 即可；已兑现后
+   *  再 wait 也立即返回，故 handleRetry 等后置调用无需特殊处理。 */
+  const harmonyFirstPaintTask: Promise<void> = new Promise<void>((resolve) => {
+    harmonyFirstPaintResolve = () => {
+      resolve();
+    };
+  });
+
+  function notifyHarmonyFirstPaint(): void {
+    const resolveFn = harmonyFirstPaintResolve;
+    harmonyFirstPaintResolve = null;
+    if (resolveFn != null) {
+      resolveFn();
+    }
+  }
+
+  function waitHarmonyFirstPaint(): Promise<void> {
+    return harmonyFirstPaintTask;
+  }
+
+  // 看门狗：onReady 是页面必发事件，这里只防极端情况（页面异常/onReady 丢失）下
+  // 页签内容缺失、initHistory 永久挂起导致空白页——到点强制放行，退化成「图标可能
+  // 不显示」而非白屏。
+  setTimeout(() => {
+    harmonyImgOn.value = true;
+    avaFadeOn.value = true;
+    notifyHarmonyFirstPaint();
+  }, 2000);
+  // #endif
+
   /** 会话内全部可预览图片（升序遍历 messages = 视觉顺序，含向上翻页加载的更早消息）：
    *  image 主图 + rich_text 的 imageAtts。被剔除的受保护未解析图由点击处回落单张预览（与旧行为一致）。 */
   function collectChatPreviewImages(): string[] {
@@ -10274,6 +10370,21 @@
   }
 
   /** 动作列表；撤回=红色破坏性操作。 */
+  /**
+   * 长按面板图标地址（**兜底路径**）：面板实际按 key 走 iconfont 字形渲染（引用/PIN/
+   * 撤回/下载/转文字已于 2026-10-27 并入 iconfont.ttf，源图形即下列 SVG），因为鸿蒙
+   * 弹层里的 <image> 在二次打开等时机不上屏；这里保留 image 地址只为「新增动作且暂无
+   * 字形」时仍能出图。微信小程序 image 对 SVG 支持不稳，退回同名 PNG 位图。
+   */
+  function msgActionIcon(name: string): string {
+    // #ifdef MP-WEIXIN
+    return "/static/images/" + name + ".png";
+    // #endif
+    // #ifndef MP-WEIXIN
+    return "/static/images/" + name + ".svg";
+    // #endif
+  }
+
   function buildActionsFor(msg: ImMsgRow): MsgActionItem[] {
     const acts: MsgActionItem[] = [];
     if (msg.revoked) {
@@ -10291,7 +10402,7 @@
       const quote = new MsgActionItem();
       quote.key = "quote";
       quote.label = t("Mobile.Message.actionQuote");
-      quote.icon = "/static/images/icon-msg-quote-action.png";
+      quote.icon = msgActionIcon("icon-msg-quote-action");
       acts.push(quote);
     }
     // 转发 / 多选：六型白名单内正常消息（merge_forward 禁嵌套不出现这两项）
@@ -10315,11 +10426,11 @@
       if (msg.audioAsrState == 2 && msg.audioAsrText.length > 0) {
         asr.key = "voiceToTextOff";
         asr.label = t("Mobile.Message.actionVoiceToTextOff");
-        asr.icon = "/static/images/icon-msg-voice-text-off-action.png";
+        asr.icon = msgActionIcon("icon-msg-voice-text-off-action");
       } else {
         asr.key = "voiceToText";
         asr.label = t("Mobile.Message.actionVoiceToText");
-        asr.icon = "/static/images/icon-msg-voice-text-action.png";
+        asr.icon = msgActionIcon("icon-msg-voice-text-action");
       }
       acts.push(asr);
     }
@@ -10332,7 +10443,7 @@
       const download = new MsgActionItem();
       download.key = "download";
       download.label = t("Mobile.Message.actionDownloadVideo");
-      download.icon = "/static/images/icon-msg-download-action.png";
+      download.icon = msgActionIcon("icon-msg-download-action");
       acts.push(download);
     }
     // #endif
@@ -10341,7 +10452,7 @@
       pin.key = isPinnedMsg(msg) ? "unpin" : "pin";
       // IM 消息面板用专属 key（PIN/取消PIN）；Mobile.Conversation.pin 是 AI 会话列表的「置顶」，勿共用
       pin.label = isPinnedMsg(msg) ? t("Mobile.Message.actionUnpin") : t("Mobile.Message.actionPin");
-      pin.icon = "/static/images/icon-msg-pin-action.png";
+      pin.icon = msgActionIcon("icon-msg-pin-action");
       acts.push(pin);
     }
     if (canEditMsg(msg)) {
@@ -10355,7 +10466,7 @@
       const revoke = new MsgActionItem();
       revoke.key = "revoke";
       revoke.label = t("Mobile.Message.actionRevoke");
-      revoke.icon = "/static/images/icon-msg-revoke-action.png";
+      revoke.icon = msgActionIcon("icon-msg-revoke-action");
       acts.push(revoke);
     }
     // 删除（红色破坏性，置底同撤回）：仅自己的可见范围，二次确认在 handleSheetSelect
@@ -12194,10 +12305,12 @@
   }
 
   // ===== 头像 =====
-  /** H5：未解析的受保护地址先藏图（返回空，同消息列表——裸 <img> 请求必被 ORB 拦，
-   * 还会触发 @error 标死字母兜底）；已解析/普通地址原样返回。App 端恒原样（不解析直连）。 */
+  /** H5/鸿蒙：未解析的受保护地址先藏图（返回空）——H5 裸 <img> 请求必被 ORB 拦；
+   * 鸿蒙 ArkUI 无 Cookie 直连必败（200+JSON → Create fail），@error 还会把字母兜底
+   * 标死（avatarFailed 无复位链），解析完成前先出字母、temp 回填后 tick 换真图。
+   * Android/iOS 原生加载器直连可用，恒原样返回。 */
   function h5HideUnresolvedProtected(url: string): string {
-    // #ifdef H5 || WEB
+    // #ifdef H5 || WEB || APP-HARMONY
     if (isAuthProtectedFileUrl(url)) return "";
     // #endif
     return url;
@@ -12443,6 +12556,13 @@
       await myInfoTask;
       if (!isChatCurrent()) return;
     }
+    // #ifdef APP-HARMONY
+    // 首屏数据等首帧渲染完成再落地（见 harmonyImgOn 头注）：首帧只画页签骨架与输入坞，
+    // 页面轻、onReady 来得快；数据渲染与页签图标、头像真图同拍出现，且这些 <image>
+    // 全部生在「首帧已呈现」之后，不会卡在 UniImageElement 的 Hidden 初值上。
+    await waitHarmonyFirstPaint();
+    if (!isChatCurrent()) return;
+    // #endif
     // 命中缓存：免网络立即渲染上次窗口并滚底，随后静默增量同步（Q3：重进不重新 load）
     const cached = getCachedChatRecords(convId.value);
     if (cached != null) {
@@ -13293,6 +13413,16 @@
   onReady(() => {
     // 二次刷新底部安全区（iOS 首帧前 safeAreaInsets 可能为 0）
     safeBottomPx.value = getSafeAreaBottom();
+    // #ifdef APP-HARMONY
+    // 首帧已呈现（框架语义，见 script 头注）：同一批放行页签内容、头像真图，并释放
+    // initHistory 落地首屏数据——页签与内容、图标与文案同拍出现，无「先文案后图标」。
+    notifyHarmonyFirstPaint();
+    harmonyImgOn.value = true;
+    // 挂载后一拍再开淡入：真图节点先挂稳，class 变更走 transition（见 avaFadeOn）
+    setTimeout(() => {
+      avaFadeOn.value = true;
+    }, 80);
+    // #endif
     // Android：输入框已挂载时把原生 gravity 设为垂直居中；进页首帧原生视图可能
     // 晚于 onReady 挂载（单次调用会静默空转，未聚焦时 placeholder 偏上），带重试兜到挂载
     centerAndroidInputGravityWithRetry(8);
@@ -13644,6 +13774,28 @@
     border-radius: 19px;
     overflow: hidden;
   }
+
+  /* #ifdef APP-HARMONY */
+  /* 头像真图淡入层（仅鸿蒙）：绝对定位盖在常驻字母层上，opacity 0 挂载、
+     avaFadeOn 翻拍后 class 变更走 transition 淡入——总闸放行时不再整页硬切 */
+  .chat-ava-clip--overlay {
+    position: absolute;
+    left: 0;
+    top: 0;
+    opacity: 0;
+    transition-property: opacity;
+    transition-duration: 200ms;
+  }
+
+  .chat-ava-clip--shown {
+    opacity: 1;
+  }
+
+  /* 字母层在流内撑住 38×38，真图覆盖层以 wrap 为定位锚 */
+  .chat-ava-wrap {
+    position: relative;
+  }
+  /* #endif */
 
   .chat-ava {
     width: 38px;

@@ -1793,21 +1793,10 @@
   import { classifyKind, extOf, urlExtOf } from "@/utils/imChatAttachments";
   import {
     ChatScrollMemo,
+    getCachedChatRecords,
+    setCachedChatRecords,
     setCachedChatScroll,
   } from "@/utils/im/imChatCache";
-  import {
-    syncImConvOnEnter,
-    fetchImConvHistoryPage,
-    persistImConvRecords,
-    applyImConvSyncResult,
-  } from "@/utils/im/imMsgSync";
-  import {
-    loadImMsgDbLatest,
-    getImMsgDbMeta,
-    hasImMsgDbBelow,
-    applyImMsgDbRevoke,
-    applyImMsgDbEdit,
-  } from "@/utils/im/imMsgDb";
   import { getCachedMyInfo, setCachedMyInfo } from "@/utils/im/myInfoCache";
   import { getCachedConvMembers, setCachedConvMembers } from "@/utils/im/convMembersCache";
   import { getCachedContactRemarks, setCachedContactRemarks } from "@/utils/im/contactRemarkCache";
@@ -1904,21 +1893,6 @@
 
   /** 历史消息单页条数（服务端上限 200，见 im-openapi LimitQueryDefault20）。 */
   const MSG_PAGE_SIZE = 20;
-
-  /**
-   * 进会话 DB 首屏窗口行数（imMsgDb 本地优先读）：3 页冗余，未读定位倒数法与
-   * 首屏滚底都更从容；DB 尾页读取按键寻址取段，多取 40 行成本可忽略。
-   */
-  const CHAT_DB_ENTRY_ROWS = 60;
-
-  /**
-   * 内存窗口行数上限：翻页 prepend 无界增长是主风险（翻 50 页=1000 行常驻 DOM），
-   * 超限裁【尾】（视口下方，裁除零位移——锚定行在顶部不受扰，无需冻结锚定窗）。
-   * 裁后最新行不在窗内：新到帧只落库不上屏（防中段断层），「回到底部」整窗重建。
-   * 追加侧增长（WS/进会话）受消息到达率约束，由重进/回底自然收口，不做头部裁
-   * （头部裁需滚动补偿，收益小风险大）。
-   */
-  const CHAT_WINDOW_MAX = 200;
 
   /**
    * 表情面板字表（与 PC 端 nuwax-im-web lib/emoji.ts 的 EMOJIS 完全一致，
@@ -4214,10 +4188,6 @@
     row.senderType = readNumber(obj, "senderType", 1);
     row.senderName = readString(obj, "senderName");
     row.senderAvatar = readString(obj, "senderAvatar");
-    // [ChatAvatar] 临时探针（定位头像只剩字母兜底，验证后删）：行级 senderAvatar 缺失
-    if (row.senderAvatar.length == 0) {
-      console.error(`[ChatAvatar] row senderAvatar 空 msgId=${row.msgId} senderId=${row.senderId} name=${row.senderName}`);
-    }
     row.msgType = readString(obj, "msgType");
     // body=null（撤回/审核拦截）不出气泡；text 读 body.text，image 读 body.url，
     // rich_text 读 body.text + body.attachments（图片附件与文件/链接附件分开存）
@@ -6154,14 +6124,6 @@
   function maxSeq(): number {
     let seq = 0;
     for (let i = 0; i < messages.value.length; i++) seq = Math.max(seq, messages.value[i].seq);
-    // 窗口尾裁后最新行可能已不在窗内：DB 水位兜底（WS/尾页/发送确认实时落库推进）。
-    // 报读口径=「进会话即全清」（对齐 PC），水位取已知最新与窗内最大之高者无害。
-    if (myUserId.value.length > 0) {
-      const meta = getImMsgDbMeta(myUserId.value, convId.value);
-      if (meta != null && meta.latestSeq > seq) {
-        seq = meta.latestSeq;
-      }
-    }
     return seq;
   }
 
@@ -6352,8 +6314,12 @@
     scrollToAnchorWithSettle("chat-bottom");
   }
 
-  /** 浮钮点击：滚到最新消息并藏钮（定位被抢/失败时滚动事件会再探测复位）。
-   *  实现在 mergeSyncedMessages 之后（窗口尾裁重建，error18 前向引用约束）。 */
+  /** 浮钮点击：滚到最新消息并藏钮（定位被抢/失败时滚动事件会再探测复位）。 */
+  function handleJumpLatest(): void {
+    if (pageTapSwallowed()) return;
+    showJumpLatest.value = false;
+    scrollToBottom();
+  }
 
   // ===== Android 键盘高度通道（WindowInsets 轮询：逐帧同步 + 事件丢失兜底） =====
   // 双角色：① 键盘动画期间 IME insets 逐帧更新（API 30+），快节拍走 requestAnimationFrame
@@ -7191,27 +7157,15 @@
     // #ifdef APP-HARMONY
     // 鸿蒙只解析受保护地址：普通直链位图直连可用，非受保护 svg 直连也能正确缩放
     // （ArkUI 远程 .svg OK），不产生额外下载。
-    if (isAuthProtectedFileUrl(url) != true) {
-      // [ChatAvatar] 临时探针（验证后删）：鸿蒙非受保护地址按设计直连不解析
-      console.error(`[ChatAvatar] skip 非受保护直连 ${url}`);
-      return;
-    }
+    if (isAuthProtectedFileUrl(url) != true) return;
     // #endif
-    if (avatarDisplayCache.has(url) || avatarAttemptedUrls.has(url)) {
-      // [ChatAvatar] 临时探针（验证后删）：缓存命中/已试过（含失败负缓存）不再发
-      console.error(`[ChatAvatar] skip dup/attempted ${url}`);
-      return;
-    }
+    if (avatarDisplayCache.has(url) || avatarAttemptedUrls.has(url)) return;
     if (avatarRequests.has(url)) return;
     avatarAttemptedUrls.add(url);
     avatarRequests.add(url);
-    // [ChatAvatar] 临时探针（验证后删）：真正发起换链解析（仅 H5/鸿蒙编译进包）
-    console.error(`[ChatAvatar] resolve begin ${url}`);
     resolveDisplayImageUrl(url, AVATAR_DISPLAY_PX, AVATAR_DISPLAY_PX)
       .then((resolved: string) => {
         avatarRequests.delete(url);
-        // [ChatAvatar] 临时探针（验证后删）：==原址=普通/失败回退，!=原址=换链成功
-        console.error(`[ChatAvatar] resolve done ${url} -> ${resolved}`);
         // 普通地址 / 解析失败回退：保持原地址直连（真机可用，H5 交 @error 兜底字母头像）
         if (resolved == url) return;
         if (!isChatCurrent()) {
@@ -7225,8 +7179,6 @@
       })
       .catch((_e: any | null) => {
         avatarRequests.delete(url);
-        // [ChatAvatar] 临时探针（验证后删）
-        console.error(`[ChatAvatar] resolve fail ${url} e=${_e}`);
         // resolveDisplayImageUrl 内部已兜底回退原地址；防御异常路径即可
       });
     // #endif
@@ -7330,20 +7282,9 @@
     }
   }
 
-  /**
-   * 窗口尾已裁标记（prependHistoryRecords 尾裁置位）：为 true 时新到消息只落库
-   * 不上屏（mergeSyncedMessages 守卫），「回到底部」点击整窗重建（resetWindowToDbTail）
-   * 后复位。★须声明在 mergeSyncedMessages 之前（前向引用约束）。
-   */
-  let windowTailTrimmed = false;
-
   /** 合并服务端快照：批内去重、按版本更新，保留已解析的未变消息。 */
-  function mergeSyncedMessages(records: UTSJSONObject[], allowGapped: boolean = false): boolean {
+  function mergeSyncedMessages(records: UTSJSONObject[]): boolean {
     if (!isChatCurrent()) return false;
-    // 窗口尾已裁（用户深翻历史）：新行只落库不上屏——中段缺行直接追加会出现
-    // 视觉断层；「回到底部」浮钮点击时整窗重建（resetWindowToDbTail）自愈。
-    // allowGapped 仅供定位直达（fetchJumpWindow）：中段插入正是定位目的，断层可受。
-    if (windowTailTrimmed && !allowGapped) return false;
     const rows = messages.value.slice();
     const indices = new Map<string, number>();
     const clientIndices = new Map<string, number>();
@@ -7411,48 +7352,6 @@
     return true;
   }
 
-  /**
-   * 整窗重建为 DB 尾窗（CHAT_DB_ENTRY_ROWS 行）：深翻历史后点「回到底部」用。
-   * 重建后贴底 + 报读；失败行发件箱回显。★依赖 readMsgRow/restoreFailedRows/
-   * resolveRowMedia/preloadChatVideos，须定义在其后（error18 前向引用约束）。
-   */
-  function resetWindowToDbTail(): void {
-    scrollToBottom();
-    if (myUserId.value.length == 0) return;
-    const dbMeta = getImMsgDbMeta(myUserId.value, convId.value);
-    const rows = loadImMsgDbLatest(myUserId.value, convId.value, CHAT_DB_ENTRY_ROWS);
-    if (rows == null || rows.length == 0) return;
-    const fresh: ImMsgRow[] = [];
-    for (let i = 0; i < rows.length; i++) {
-      fresh.push(readMsgRow(rows[i]));
-    }
-    messages.value = fresh;
-    recomputeAgentP2pMarks();
-    scheduleChatMediaRefresh();
-    windowTailTrimmed = false;
-    // 同 initHistory 口径：DB 缓存比尾窗深 ⇒ 闸门开（hasMore=false 不闸死已缓存行）
-    hasMore.value = (dbMeta != null ? dbMeta.hasMore : true) || (dbMeta != null && dbMeta.total > rows.length);
-    restoreFailedRows();
-    // 媒体解析走代理实例（insertMessageBySeq 同款约束：App 端改原始对象不触发视图）
-    for (let i = 0; i < messages.value.length; i++) {
-      resolveRowMedia(messages.value[i]);
-    }
-    preloadChatVideos();
-    scrollToBottom();
-    reportReadAuto();
-  }
-
-  /** 浮钮点击：滚到最新消息并藏钮（定位被抢/失败时滚动事件会再探测复位）。
-   *  窗口尾已裁 ⇒ DB 尾窗整窗重建（裁掉的最新行回屏）后贴底。 */
-  function handleJumpLatest(): void {
-    if (pageTapSwallowed()) return;
-    showJumpLatest.value = false;
-    if (windowTailTrimmed) {
-      resetWindowToDbTail();
-      return;
-    }
-    scrollToBottom();
-  }
 
   /** 翻页锚点行：视口内第一条可见行（rect 判定，微信式锚定取用户正在看的行）；
       upper-threshold=50 故至多扫前几行；测量失败退回列表首行。 */
@@ -7474,16 +7373,7 @@
     return messages.value[0];
   }
 
-  /**
-   * 向上翻页专用头部插入（Anchor Position Restoration 第 3 步）：
-   * 不整表替换——既有行对象引用与 key 一律不动，新行按升序原位插入表头。
-   * ★接口返回即正序（旧→新；后端 listHistory 已 DESC→ASC 反转，2026-10-24 真机日志
-   *   实证 records[0].seq < records[last].seq），必须按原序遍历——首版误按降序倒遍历，
-   *   整页插反致表头变成该页最新一条，翻页游标（列表首行 seq）错位，下一页 19/20
-   *   重复被去重丢弃，表现为「一次只加载很少的数据」。末尾按 seq 排序兜底防契约再变。
-   * 边界行重复按 msgId 去重防御。
-   */
-  /** DB 同步编排取页器（ImHistoryFetcher 适配 apiImMessages：非成功码/异常 → null）。 */
+  /** 定位直达取页器（fetchJumpWindow 用）：apiImMessages 封装，非成功码/异常 → null。 */
   function chatHistoryFetcher(convIdArg: string, beforeSeq: number, limit: number): Promise<UTSJSONObject | null> {
     return new Promise<UTSJSONObject | null>((resolve) => {
       apiImMessages(convIdArg, beforeSeq, limit).then((res): void => {
@@ -7500,111 +7390,14 @@
   }
 
   /**
-   * 当前用户维度落库（uid 未就绪=冷启动用户信息失败：跳过，纯内存会话不写库）。
-   * hasMore 口径：WS/发送确认/尾部刷新传 null 不动；翻到顶响应才传显式值。
+   * 向上翻页专用头部插入（Anchor Position Restoration 第 3 步）：
+   * 不整表替换——既有行对象引用与 key 一律不动，新行按升序原位插入表头。
+   * ★接口返回即正序（旧→新；后端 listHistory 已 DESC→ASC 反转，2026-10-24 真机日志
+   *   实证 records[0].seq < records[last].seq），必须按原序遍历——首版误按降序倒遍历，
+   *   整页插反致表头变成该页最新一条，翻页游标（列表首行 seq）错位，下一页 19/20
+   *   重复被去重丢弃，表现为「一次只加载很少的数据」。末尾按 seq 排序兜底防契约再变。
+   * 边界行重复按 msgId 去重防御。
    */
-  function persistRowsToDb(records: UTSJSONObject[], hasMore: boolean | null): void {
-    if (myUserId.value.length == 0 || convId.value.length == 0 || records.length == 0) {
-      return;
-    }
-    persistImConvRecords(myUserId.value, convId.value, records, hasMore);
-  }
-
-  /** 发送确认落库：服务端 SendMessageResult 只含 msgId/seq/sendTime/msgStatus——没有
-   *  sender/body，直接落库会让重进首屏（DB 优先）读到「无主」消息：senderId 空 → 判非
-   *  本人按左侧他人渲染（无头像），body 空只剩 digest 兜底成「名字:文案」文本行，
-   *  同步落库后才恢复。以服务端字段为准，缺的用确认行（已含最终 msgType/body/附件
-   *  远端 url）补齐后再写；后续历史同步仍会以服务端全量记录覆盖。 */
-  function persistConfirmedRecord(dataObj: UTSJSONObject | null, confirmed: ImMsgRow | null): void {
-    if (dataObj == null) return;
-    if (confirmed != null) {
-      if (readString(dataObj, "convId").length == 0) dataObj["convId"] = convId.value;
-      if (readString(dataObj, "senderId").length == 0) dataObj["senderId"] = myUserId.value;
-      if (readNumber(dataObj, "senderType", 0) == 0) dataObj["senderType"] = 1;
-      if (readString(dataObj, "clientMsgId").length == 0) {
-        dataObj["clientMsgId"] = confirmed.clientMsgId;
-      }
-      if (readString(dataObj, "msgType").length == 0) {
-        // DB 记录用 readMsgRow 可解析的形态：视频按 file 存（file 分支 classifyKind
-        // 重判回视频）；纯文本确认行 msgType 是空串，归一为服务端历史同款 "text"
-        const rawType = confirmed.msgType == "video" ? "file" : confirmed.msgType;
-        dataObj["msgType"] = rawType.length > 0 ? rawType : "text";
-      }
-      if (dataObj["body"] == null) {
-        const body = new UTSJSONObject();
-        let bodyHasContent = false;
-        if (confirmed.bodyText.length > 0) {
-          body["text"] = confirmed.bodyText;
-          bodyHasContent = true;
-        }
-        if (confirmed.msgType == "image" && confirmed.imageUrl.length > 0) {
-          body["url"] = confirmed.imageUrl;
-          bodyHasContent = true;
-        } else if (confirmed.msgType == "video") {
-          body["url"] = confirmed.videoUrl;
-          body["fileName"] = confirmed.videoFileName;
-          body["size"] = confirmed.videoSize;
-          bodyHasContent = true;
-        } else if (confirmed.msgType == "audio") {
-          body["url"] = confirmed.audioUrl;
-          body["duration"] = confirmed.audioDuration;
-          bodyHasContent = true;
-        } else if (confirmed.msgType == "file" && confirmed.linkAtts.length > 0) {
-          body["url"] = confirmed.linkAtts[0].url;
-          body["fileName"] = confirmed.linkAtts[0].fileName;
-          body["mime"] = confirmed.linkAtts[0].mime;
-          body["size"] = confirmed.linkAtts[0].size;
-          bodyHasContent = true;
-        } else if (confirmed.msgType == "rich_text") {
-          // imageAtts 与 linkAtts 全量入 attachments（readMsgRow 按 mime/classifyKind 分流回两侧）
-          const attachments: UTSJSONObject[] = [];
-          for (let i = 0; i < confirmed.imageAtts.length; i++) {
-            const att = new UTSJSONObject();
-            att["url"] = confirmed.imageAtts[i].url;
-            att["fileName"] = confirmed.imageAtts[i].fileName;
-            att["mime"] = confirmed.imageAtts[i].mime;
-            att["size"] = confirmed.imageAtts[i].size;
-            attachments.push(att);
-          }
-          for (let i = 0; i < confirmed.linkAtts.length; i++) {
-            const att = new UTSJSONObject();
-            att["url"] = confirmed.linkAtts[i].url;
-            att["fileName"] = confirmed.linkAtts[i].fileName;
-            att["mime"] = confirmed.linkAtts[i].mime;
-            att["size"] = confirmed.linkAtts[i].size;
-            attachments.push(att);
-          }
-          if (attachments.length > 0) {
-            body["attachments"] = attachments;
-            bodyHasContent = true;
-          }
-        }
-        if (bodyHasContent) dataObj["body"] = body;
-      }
-    }
-    persistRowsToDb([dataObj], null);
-  }
-
-  /** tail 权威比对剔除的行同步撤窗（服务端已删：按人删除/清空残留；低频全表扫可受）。 */
-  function dropWindowRows(msgIds: string[]): void {
-    if (msgIds.length == 0) return;
-    const gone = new Set<string>();
-    for (let i = 0; i < msgIds.length; i++) {
-      gone.add(msgIds[i]);
-    }
-    const rows = messages.value;
-    let removed = false;
-    for (let i = rows.length - 1; i >= 0; i--) {
-      if (gone.has(rows[i].msgId)) {
-        rows.splice(i, 1);
-        removed = true;
-      }
-    }
-    if (removed) {
-      messages.value = rows;
-    }
-  }
-
   function prependHistoryRecords(records: UTSJSONObject[]): boolean {
     if (!isChatCurrent()) return false;
     if (records.length == 0) return false;
@@ -7627,27 +7420,6 @@
     for (let i = fresh.length - 1; i >= 0; i--) {
       messages.value.unshift(fresh[i]);
     }
-    // 内存窗口尾裁：超限从尾端裁除（视口下方零位移）。定位中不裁——未读倒数法
-    // idx 以「窗口尾=最新」为前提，裁尾会算错定位行；搜索/引用回翻同理（定位
-    // 最多 15 页，短暂超限可受）。尾部未确认/失败行（local/status==0）保护不裁。
-    if (!unreadLocating && !jumpLocating) {
-      let drop = messages.value.length - CHAT_WINDOW_MAX;
-      if (drop > 0) {
-        const rows = messages.value;
-        let end = rows.length;
-        while (drop > 0 && end > 0) {
-          const r = rows[end - 1];
-          if (r.local || r.status == 0) break;
-          end--;
-          drop--;
-        }
-        if (end < rows.length) {
-          rows.splice(end, rows.length - end);
-          messages.value = rows;
-          windowTailTrimmed = true;
-        }
-      }
-    }
     for (let i = 0; i < fresh.length; i++) {
       resolveRowMedia(fresh[i]);
     }
@@ -7658,7 +7430,7 @@
 
   /** 翻页/定位插入前的锚定守卫安装。iOS 交互锁由守卫 onDone 解（stable/idle/abs/cancel
    *  任一即渲染稳定/收工）。锚定安装异常不得吞掉整页数据（iOS 疑点：安装抛错会中断
-   *  loadHistory，prepend 永不执行——beforeSeq 原地踏步、页面无新增行）；降级 scroll-into-view。 */
+   * loadHistory，prepend 永不执行——beforeSeq 原地踏步、页面无新增行）；降级 scroll-into-view。 */
   function engagePrependAnchor(anchorId: string): void {
     releasePrependAnchor();
     let anchorDone: ((reason: string) => void) | null = null;
@@ -7677,35 +7449,39 @@
     if (cancelPrependAnchor == null) scrollToAnchorWithSettle(anchorId);
   }
 
-  /**
-   * 首屏 + 向上翻页共用：beforeSeq<=0 取最新一页，否则取 seq<beforeSeq 的更早一页。
-   * DB 优先（fetchImConvHistoryPage）：本地足页直出零请求；本地不足且库称还有更多才
-   * 走 HTTP 权威页并顺带落库。翻页网络失败回退本地残页（断网可继续翻缓存历史，
-   * 静默不打失败态）；首屏无本地数据且 HTTP 失败才置 loadFailed（可重试）。
-   */
+  /** 首屏 + 向上翻页共用：beforeSeq<=0 取最新一页，否则取 seq<beforeSeq 的更早一页。 */
   async function loadHistory(beforeSeq: number, preserveAnchor: string = ""): Promise<void> {
-    const page = await fetchImConvHistoryPage(myUserId.value, convId.value, beforeSeq, MSG_PAGE_SIZE, chatHistoryFetcher);
+    const res = await apiImMessages(convId.value, beforeSeq, MSG_PAGE_SIZE);
       if (!isChatCurrent()) return;
-    const records = page.records;
-    hasMore.value = page.hasMoreLocal;
-    // 首屏（无本地数据兜底）网络失败：走失败态可重试；翻页失败静默（残页/空页兜底）
-    if (records.length == 0 && beforeSeq <= 0 && page.httpFailed && messages.value.length == 0) {
+    if (apiResCode(res) != SUCCESS_CODE) {
       loadFailed.value = true;
       return;
     }
-    if (records.length > 0) {
-      // 翻页的消息与锚点同批提交，不能先渲染新增的顶部消息，再 nextTick 拉回。
-      // 守卫：Android 原生 preDraw 补偿 / iOS·H5 rAF 轮询（精确回位）；鸿蒙元素滚动 API
-      // 缺口 + 模板捕获顶限（255 硬限）不可绑 scroll-top，走 scroll-into-view 兜底——
-      // 必须用 settle 惯用法等布局完成再落锚（同 flush 设值会在新内容布局前应用、落在旧偏移）。
-      if (preserveAnchor.length > 0 && isChatActive()) {
-        engagePrependAnchor(preserveAnchor);
-      }
-      if (beforeSeq > 0) {
-        // 翻页：头部原位插入，既有行引用/key 不动（锚定与 keyed DOM 复用的前提）。
-        prependHistoryRecords(records);
-      } else {
-        mergeSyncedMessages(records);
+    const dataRaw = apiResData<any>(res);
+    const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+
+    if (dataObj != null) {
+      hasMore.value = readBool(dataObj, "hasMore");
+      const recordsRaw = dataObj["records"];
+      if (recordsRaw != null) {
+        const records = recordsRaw as UTSJSONObject[];
+        // 翻页的消息与锚点同批提交，不能先渲染新增的顶部消息，再 nextTick 拉回。
+        // 守卫：Android 原生 preDraw 补偿 / iOS·H5 rAF 轮询（精确回位）；鸿蒙元素滚动 API
+        // 缺口 + 模板捕获顶限（255 硬限）不可绑 scroll-top，走 scroll-into-view 兜底——
+        // 必须用 settle 惯用法等布局完成再落锚（同 flush 设值会在新内容布局前应用、落在旧偏移）。
+        if (preserveAnchor.length > 0 && isChatActive()) {
+          engagePrependAnchor(preserveAnchor);
+        }
+        if (beforeSeq > 0) {
+          // 翻页：头部原位插入，既有行引用/key 不动（锚定与 keyed DOM 复用的前提）。
+          prependHistoryRecords(records);
+        } else {
+          mergeSyncedMessages(records);
+        }
+        // 首屏（beforeSeq<=0）成功后写消息缓存：下次进页先渲染再静默同步
+        if (beforeSeq <= 0 && records.length > 0) {
+          setCachedChatRecords(convId.value, records);
+        }
       }
     }
     reportReadAuto();
@@ -7771,9 +7547,7 @@
       if (apiResCode(res) == SUCCESS_CODE) {
         const dataRaw = apiResData<any>(res);
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
-        const confirmedText = buildConfirmedRow(dataObj, row);
-        persistConfirmedRecord(dataObj, confirmedText);
-        replaceByClientMsgId(confirmedText);
+        replaceByClientMsgId(buildConfirmedRow(dataObj, row));
         quoteTarget.value = null;
         resetQuoteMentionSnapshot();
         reportReadIfNeeded(maxSeq());
@@ -8069,7 +7843,6 @@
           confirmed.imageUrl = "";
           confirmed.linkAtts = [att];
         }
-        persistConfirmedRecord(dataObj, confirmed);
         replaceByClientMsgId(confirmed);
         quoteTarget.value = null;
         // /api/f/ 受保护地址解析：拿替换进列表后的代理实例改属性才会触发刷新
@@ -8165,7 +7938,6 @@
           att.mime = files[i].type;
           confirmed.imageAtts.push(att);
         }
-        persistConfirmedRecord(dataObj, confirmed);
         replaceByClientMsgId(confirmed);
         quoteTarget.value = null;
         resetQuoteMentionSnapshot();
@@ -8245,7 +8017,6 @@
         confirmed.audioUrl = file.url;
         confirmed.audioDuration = durationSec;
         confirmed.linkAtts = [];
-        persistConfirmedRecord(dataObj, confirmed);
         replaceByClientMsgId(confirmed);
         reportReadIfNeeded(maxSeq());
         refreshReadStatus();
@@ -9894,9 +9665,9 @@
   /**
    * 定位直达取页（PC focusPinnedMessage 同款）：beforeSeq = 目标 seq+1 一发请求，
    * 返回页以目标收尾，无需逐页回翻——很早的消息（超出 15 页范围）也一发可达。
-   * 落位走 mergeSyncedMessages（allowGapped）：目标通常比现窗表头更老 ⇒ 排序后
-   * 落新表头；深翻裁尾时目标可能比表头新 ⇒ 中段插入（时间缺口由滚动分页自然
-   * 补齐，PC「往中间补了一段」同款语义）。直达页成为新表头时 hasMore 随之重算。
+   * 落位走 mergeSyncedMessages：目标通常比现窗表头更老 ⇒ 排序后落新表头；目标
+   * 比表头新 ⇒ 中段插入（时间缺口由滚动分页自然补齐，PC「往中间补了一段」同款
+   * 语义）。直达页成为新表头时 hasMore 随之重算。
    */
   async function fetchJumpWindow(jumpSeq: number): Promise<void> {
     const anchorId = listSettled.value && isChatActive() ? `msg-${firstVisibleRowKey().msgId}` : "";
@@ -9908,16 +9679,18 @@
       loadingOlder.value = true;
     }
     try {
-      const page = await fetchImConvHistoryPage(myUserId.value, convId.value, jumpSeq + 1, MSG_PAGE_SIZE, chatHistoryFetcher);
+      const dataObj = await chatHistoryFetcher(convId.value, jumpSeq + 1, MSG_PAGE_SIZE);
       if (!isChatCurrent()) return;
-      if (page.records.length > 0) {
+      if (dataObj == null || dataObj["records"] == null) return;
+      const records = dataObj["records"] as UTSJSONObject[];
+      if (records.length > 0) {
         const headSeqBefore = messages.value.length > 0 ? messages.value[0].seq : 0;
         if (anchorId.length > 0) {
           engagePrependAnchor(anchorId);
         }
-        mergeSyncedMessages(page.records, true);
+        mergeSyncedMessages(records);
         if (messages.value.length > 0 && messages.value[0].seq < headSeqBefore) {
-          hasMore.value = page.hasMoreLocal;
+          hasMore.value = readBool(dataObj, "hasMore");
         }
         refreshReadStatus();
       }
@@ -12446,14 +12219,10 @@
   }
 
   function avatarFailedOf(msg: ImMsgRow): boolean {
-    // ★对方行读 msg.avatarFailed（2026-10-24 修：此前恒 false——@error 写的字段没人读，
-    //   坏地址行图片层 v-if 永不翻转，落不到字母兜底只剩空白块；xiaowa 域头像 502 实锤触发）
-    return isMine(msg) ? myAvatarFailed.value : msg.avatarFailed;
+    return isMine(msg) ? myAvatarFailed.value : false;
   }
 
   function handleAvatarError(msg: ImMsgRow): void {
-    // [ChatAvatar] 临时探针（验证后删）：<image> 加载失败翻字母兜底的现场
-    console.error(`[ChatAvatar] @error msgId=${msg.msgId} mine=${isMine(msg)} src=${avatarSrcOf(msg, 0)}`);
     if (isMine(msg)) {
       myAvatarFailed.value = true;
     } else {
@@ -12540,11 +12309,6 @@
       return;
     }
     const obj = payload as UTSJSONObject;
-    // WS 重连补拉批次先落库（跨会话按各自 convId 分发 + conversations[].clearBeforeSeq
-    // 是清空水位唯一权威载体），再走本会话 UI merge
-    if (myUserId.value.length > 0) {
-      applyImConvSyncResult(myUserId.value, obj);
-    }
     const records = obj["records"];
     if (records != null && Array.isArray(records)) {
       if (mergeSyncedMessages(records as UTSJSONObject[])) {
@@ -12554,11 +12318,10 @@
   }
 
   /**
-   * 静默同步（Q2：页面停留/onShow 兜底刷新；不打 loading、不打断滚动）。
-   * 走 syncImConvOnEnter 编排：服务端权威尾页 → tail 比对剔「按人删除/清空残留」行
-   * → 落库（撤回/编辑靠 revision 守卫就地自愈）→ 断线缺口自动回填。与 WS 下行互补。
-   * wiped=会话对我已无可见消息（清空/全删）→ 清窗；失败完全静默（下次 onShow/WS 再试）。
-   * ★定义在 dropWindowRows 之后、initHistory 之前（UTS→Kotlin 先用后定义报「找不到名称」）。
+   * 静默同步最新一页（Q2：页面停留/onShow 兜底刷新；不打 loading、不打断滚动）。
+   * 与 WS 下行互补：断线重连期间漏的消息、WS 未连上时其他端发的消息都靠这里补。
+   * 成功顺带刷新首屏缓存；失败完全静默（下次 onShow/WS 再试）。
+   * ★定义在 insertMessageBySeq 之后、initHistory 之前（UTS→Kotlin 先用后定义报「找不到名称」）。
    */
   let latestSyncLoading = false;
   async function silentSyncLatest(): Promise<void> {
@@ -12567,36 +12330,26 @@
     }
     latestSyncLoading = true;
     try {
-      const outcome = await syncImConvOnEnter(myUserId.value, convId.value, chatHistoryFetcher);
-      if (!isChatCurrent() || outcome == null) return;
-      if (outcome.wiped) {
-        // 服务端权威失效：清窗（含未读分隔线），贴底揭幕；尾裁标记一并复位
-        messages.value = [];
-        hasMore.value = false;
-        unreadDividerMsgId.value = "";
-        windowTailTrimmed = false;
-        scrollToBottom();
+      const res = await apiImMessages(convId.value, 0, MSG_PAGE_SIZE);
+      if (!isChatCurrent()) return;
+      if (apiResCode(res) != SUCCESS_CODE) {
         return;
       }
-      if (outcome.removedMsgIds.length > 0) {
-        dropWindowRows(outcome.removedMsgIds);
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        return;
       }
-      if (outcome.records.length > 0) {
-        mergeSyncedMessages(outcome.records);
+      const recordsRaw = dataObj["records"];
+      if (recordsRaw == null) {
+        return;
       }
-      if (outcome.removedMsgIds.length > 0 || outcome.records.length > 0) {
-        scheduleReadRefresh();
+      const records = recordsRaw as UTSJSONObject[];
+      if (records.length > 0) {
+        setCachedChatRecords(convId.value, records);
       }
-      // 到顶闩自愈可能解锁了 meta.hasMore（syncImConvOnEnter 尾部探测）——回读刷闸。
-      // ★口径必须与 initHistory 一致：「窗口之外仍有可展示内容」= meta.hasMore ∨ DB 在
-      // 窗口最旧行之下仍有缓存行。裸读 meta.hasMore 会把 initHistory 刚开的闸又关上
-      // （翻到过顶的会话 meta=false 但库内深历史仍须可翻，真机 20:43 实锤）。
-      if (myUserId.value.length > 0 && messages.value.length > 0) {
-        const healedMeta = getImMsgDbMeta(myUserId.value, convId.value);
-        if (healedMeta != null) {
-          hasMore.value = healedMeta.hasMore || hasImMsgDbBelow(myUserId.value, convId.value, messages.value[0].seq);
-        }
-      }
+      mergeSyncedMessages(records);
+      scheduleReadRefresh();
     } catch (_error) {
       // 静默失败
     } finally {
@@ -12680,8 +12433,6 @@
     if (loading.value) {
       return;
     }
-    // 新进会话：窗口从 DB 尾窗重建，尾裁标记复位（mergeSyncedMessages 守卫解除）
-    windowTailTrimmed = false;
     // 冷启动 myUserId 未知：等用户信息返回（失败也放行，保持全左侧旧兜底）；
     // 暖会话 loadMyInfo 已同步回填缓存，此处零等待直落首屏
     const myInfoTask = myInfoPending;
@@ -12690,25 +12441,17 @@
       await myInfoTask;
       if (!isChatCurrent()) return;
     }
-    // 命中本地消息库（imMsgDb）：免网络立即渲染上次窗口并滚底，随后静默增量同步
-    // （Q3：重进不重新 load；syncImConvOnEnter 会做权威比对/剔删除行/缺口回填）
-    const dbMeta = myUserId.value.length > 0 ? getImMsgDbMeta(myUserId.value, convId.value) : null;
-    if (dbMeta != null) {
+    // 命中缓存：免网络立即渲染上次窗口并滚底，随后静默增量同步（Q3：重进不重新 load）
+    const cached = getCachedChatRecords(convId.value);
+    if (cached != null) {
       loading.value = false;
       loadFailed.value = false;
       messages.value = [];
-      // DB 尾窗升序直达（按键寻址取段，毫秒级；CHAT_DB_ENTRY_ROWS=3 页冗余）
-      const dbRows = loadImMsgDbLatest(myUserId.value, convId.value, CHAT_DB_ENTRY_ROWS);
-      if (dbRows != null && dbRows.length > 0) {
-        mergeSyncedMessages(dbRows);
-      }
+      // 缓存即接口原文（降序 新→旧），与 loadHistory 同款逐条 unshift 后头部为最旧
+      mergeSyncedMessages(cached);
       // 失败行发件箱回显（幂等）：缓存/历史重建都会清掉本地行，两条路径都要补
       restoreFailedRows();
-      // 闸门=「尾窗之外仍有可展示内容」：服务端还有更多 ∨ DB 缓存比已装窗口深。
-      // 只看 dbMeta.hasMore 会在翻到过顶的会话上把已缓存深历史闸死（一次翻页都不发）。
-      hasMore.value = dbMeta.hasMore || dbMeta.total > (dbRows != null ? dbRows.length : 0);
-      // 诊断探针（验证后删）：进入时库全貌——判别「深历史没落库」vs「闸门误关」vs「清空水位删库」
-      console.error(`[ImEnter] convId=${convId.value} total=${dbMeta.total} hasMore=${dbMeta.hasMore} clear=${dbMeta.clearBeforeSeq} oldest=${dbMeta.oldestSeq} latest=${dbMeta.latestSeq} rows=${dbRows != null ? dbRows.length : 0} gate=${hasMore.value}`);
+      hasMore.value = cached.length >= MSG_PAGE_SIZE;
       // 重新进入会话始终展示最新消息，不恢复上次阅读的历史位置。
       // 未读定位模式：不滚底（保持遮蔽，定位交给 onLoad 的 locateFirstUnread）。
       // ★await 增量同步：缓存尾巴可能缺「上次离开后新到的消息」，不等同步落地就
@@ -12822,13 +12565,6 @@
     // 复用现有 readMsgRow（line 1801）从 MessageDto 构造 ImMsgRow
     const row = readMsgRow(raw as UTSJSONObject);
     if (row.msgId.length == 0) {
-      return;
-    }
-    // 实时帧先落库（幂等；tmp-/失败行由入库闸门拦下）再上屏
-    persistRowsToDb([raw as UTSJSONObject], null);
-    // 窗口尾已裁（深翻历史中）：只落库不上屏——缺行窗口直接尾部追加会中段断层，
-    // 「回到底部」浮钮点击时 resetWindowToDbTail 整窗重建自愈
-    if (windowTailTrimmed) {
       return;
     }
     insertMessageBySeq(row, true);
@@ -13026,11 +12762,6 @@
       return;
     }
     const revokeBy = readString(obj, "revokeBy");
-    // 3004 不产生新 seq、增量同步不重投 ⇒ 库内行必须在此主动修正（窗口外深行同修；
-    // 不在库返回 false，后续翻页/尾页权威自愈）。窗口行更新见下方循环。
-    if (myUserId.value.length > 0) {
-      applyImMsgDbRevoke(myUserId.value, convId.value, msgId, readNumber(obj, "revokeTime", 0), revokeBy);
-    }
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].msgId == msgId) {
@@ -13055,14 +12786,6 @@
     const msgId = readString(obj, "msgId");
     if (msgId.length == 0) {
       return;
-    }
-    // 3005 同撤回：库内行主动修正（窗口外深行同修；revision 守卫拒旧补丁）
-    if (myUserId.value.length > 0) {
-      const bodyRaw2 = obj["body"];
-      const newText = bodyRaw2 != null ? readString(bodyRaw2 as UTSJSONObject, "text") : "";
-      if (newText.length > 0) {
-        applyImMsgDbEdit(myUserId.value, convId.value, msgId, readNumber(obj, "editTime", 0), newText);
-      }
     }
     const rows = messages.value;
     for (let i = 0; i < rows.length; i++) {
@@ -13150,8 +12873,6 @@
       myUserId.value = cachedInfo.userId;
       myDisplayName.value = cachedInfo.displayName;
       myAvatar.value = cachedInfo.avatar;
-      // [ChatAvatar] 临时探针（验证后删）
-      console.error(`[ChatAvatar] myAvatar(cache)=${myAvatar.value.length > 0 ? myAvatar.value : "<空>"}`);
       resolveChatAvatarUrl(myAvatar.value);
     }
     try {
@@ -13166,8 +12887,6 @@
           const userName = readString(dataObj, "userName");
           myDisplayName.value = nickName.length > 0 ? nickName : userName;
           myAvatar.value = readString(dataObj, "avatar");
-          // [ChatAvatar] 临时探针（验证后删）
-          console.error(`[ChatAvatar] myAvatar(api)=${myAvatar.value.length > 0 ? myAvatar.value : "<空>"}`);
           resolveChatAvatarUrl(myAvatar.value);
           setCachedMyInfo(myUserId.value, myDisplayName.value, myAvatar.value);
         }
@@ -13277,8 +12996,6 @@
     titleName.value = name.length > 0 ? name : t("Mobile.Common.conversations");
     peerAvatar.value = readOption(options, "avatar");
     resolveChatAvatarUrl(peerAvatar.value);
-    // [ChatAvatar] 临时探针（验证后删）：进页 URL 参头像——对方行兜底数据源
-    console.error(`[ChatAvatar] enter conv=${convId.value} type=${convType.value} peerAvatar=${peerAvatar.value.length > 0 ? peerAvatar.value : "<空>"}`);
     // 搜索页带来的定位消息：历史首屏就绪后翻页查找并滚动高亮（onShow 兜底应用）
     const jumpMsgId = readOption(options, "jumpMsgId");
     // 列表行带来的未读数快照（点击时天然在清零前）：>0 进「定位首条未读」定位模式；

@@ -45,6 +45,9 @@
                ★playUrl/videoLoadingId/videoLoadPercent 须在模板表达式直读（App-Android
                方法调用绑定不收集方法体内依赖）；预载挂载后轻触视频任意位置切换播放/暂停
                （原生中央播放键只覆盖中心小区域）。
+               ★App 三端行内关系统控制条、改用自绘条 <chat-video-bar>（系统条时间文案不可调
+               字号，时长一长就把全屏键挤出去），全屏态反过来开 controls（退出键挂在同一闸门后，
+               见 utils/chatVideoControl.uts）。
                ★iOS 勿往 <video> 挂子组件（全屏切换子节点销毁闪退 #22070） -->
           <view v-for="(v, k) in it.videos" :key="'v' + k" class="mfd-video" @click="handleVideoTap(v)">
             <video
@@ -52,28 +55,22 @@
               :id="'mfdVideoPlayer-' + v.uid"
               class="mfd-video__player"
               :src="v.playUrl"
+              <!-- #ifdef APP -->
+              :controls="videoFullscreen"
+              <!-- #endif -->
+              <!-- #ifndef APP -->
               :controls="true"
               :show-fullscreen-btn="true"
+              <!-- #endif -->
               :title="fileDisplayNameOf(v)"
               object-fit="contain"
               @play="handleVideoPlaying(v.uid)"
               @pause="handleVideoPaused(v.uid)"
+              @timeupdate="handleVideoTimeUpdate(v.uid, $event)"
               @ended="handleVideoEnded(v.uid)"
               @error="handleVideoError(v)"
               @fullscreenchange="handleVideoFullscreenChange(v.uid, $event)"
-            >
-              <!-- #ifdef APP-ANDROID -->
-              <!-- Android 控制条实测无全屏键，video 子组件层补显式入口（全屏态隐藏）；
-                   全屏后交互全归原生播放器——点中央播放/暂停、点表面弹原生顶栏
-                   （左上角标题+返回）。iOS 勿用——#22070 闪退 -->
-              <view v-if="videoFullscreen != true" class="mfd-video__fs" @tap.stop="requestMfdVideoFullscreen(v.uid)">
-                <view class="mfd-video__fs-corner mfd-video__fs-corner--tl" />
-                <view class="mfd-video__fs-corner mfd-video__fs-corner--tr" />
-                <view class="mfd-video__fs-corner mfd-video__fs-corner--bl" />
-                <view class="mfd-video__fs-corner mfd-video__fs-corner--br" />
-              </view>
-              <!-- #endif -->
-            </video>
+            ></video>
             <view v-else class="mfd-video__poster">
               <!-- 预载中只显进度；未预载/失败显 ▶ 可点重试（成功即被 <video> 首帧顶替） -->
               <text v-if="v.uid == videoLoadingId && videoLoadPercent >= 0" class="mfd-video__hint">{{ t("Mobile.FileTree.downloading") }} {{ videoLoadPercent }}%</text>
@@ -82,6 +79,10 @@
                 <image class="mfd-video__play-icon" src="/static/images/icon-video-play.png" mode="aspectFit" />
               </view>
             </view>
+            <!-- #ifdef APP -->
+            <!-- 自绘控制条（chat.uvue 同款，放在 v-if/v-else 之后别顶开 poster 的 v-else） -->
+            <chat-video-bar v-if="v.playUrl.length > 0" :player-id="'mfdVideoPlayer-' + v.uid" />
+            <!-- #endif -->
           </view>
           <!-- 语音附件（kind=audio）：声波气泡，点按播放/再点停止（chat.uvue 同款——页面级
                单一播放实例，播放中声波跳动换主题色；快照无时长字段，首播后回填真值） -->
@@ -151,6 +152,15 @@
   } from "@/utils/authProtectedFileUrl";
   import { previewImageCompat } from "@/utils/appWebViewImagePreview";
   import { formatFileSize } from "@/utils/imFileCard";
+  // 视频播放态/进度/全屏态（模块级 ref）：自绘控制条 components/chat-video-bar 与页面事件共用
+  import {
+    chatVideoFullscreen,
+    confirmChatVideoFullscreen,
+    isChatVideoPlaying,
+    setChatVideoFullscreen,
+    setChatVideoPlaying,
+    updateChatVideoProgress,
+  } from "@/utils/chatVideoControl.uts";
   // #ifdef APP
   import { isImFileDownloadedNow } from "@/subpackages/utils/fileTree";
   // #endif
@@ -454,22 +464,27 @@
   const videoLoadingId = ref<string>("");
   /** 解析进度百分比（-1=不确定，无进度回调的平台只显「下载中」；模板直读）。 */
   const videoLoadPercent = ref<number>(-1);
-  /** 任一视频是否全屏（fullscreenchange 回写；模板直读控制 Android 全屏兜底按钮显隐）。 */
-  const videoFullscreen = ref<boolean>(false);
+  /** 任一视频是否全屏（模块级 ref，与自绘控制条共用：模板 :controls 直读——行内 false
+   *  走自绘条、全屏 true 让系统条回来，系统条左上返回是全屏里唯一的退出键）。 */
+  const videoFullscreen = chatVideoFullscreen;
   /** 原始 url → 已解析 src 缓存（重放免二次下载）。 */
   const videoResolved = new Map<string, string>();
   /** 在途解析去重（同 url 并发触发共享同一次解析）。 */
   const videoRequests = new Map<string, Promise<string>>();
   /** 播放报错已自动重解析过的 uid（每页会话至多一次：ak 过期自愈够用，坏文件不无限循环）。 */
   const videoRetryIds = new Set<string>();
-  /** 正在播放的 uid（@play/@pause 回写：轻触切播放/暂停要按它判方向）。 */
-  const playingVideoIds = new Set<string>();
   /** 批量预载防重入。 */
   let videoPreloadBusy = false;
 
   /** 指定条目的 <video> 元素（每条独立 id：预载后多条常驻，非单实例）。 */
   function getMfdVideoElement(uid: string): UniVideoElement | null {
     return uni.getElementById(`mfdVideoPlayer-${uid}`) as UniVideoElement | null;
+  }
+
+  /** 播放态/进度的状态 key = 播放器元素 id（自绘控制条按同一 key 读，
+   *  见 utils/chatVideoControl.uts：进度不放页面 reactive）。 */
+  function mfdVideoKeyOf(uid: string): string {
+    return `mfdVideoPlayer-${uid}`;
   }
 
   /** 暂停所有已挂载视频（页面隐藏 / 播语音互斥；不清 src——回来仍停在该帧）。 */
@@ -684,7 +699,7 @@
       }
       // 音视频互斥（语音侧见 handleAudioTap 开头）
       stopMfdAudio();
-      if (playingVideoIds.has(v.uid)) {
+      if (isChatVideoPlaying(mfdVideoKeyOf(v.uid))) {
         el.pause();
       } else {
         el.play();
@@ -699,20 +714,30 @@
     preloadMfdVideoRow(v, true);
   }
 
-  /** 播放状态回写（video @play/@pause）：轻触切播放/暂停的方向依据。 */
+  /** 播放状态回写（video @play/@pause）：轻触切播放/暂停的方向依据，同时驱动
+   *  自绘控制条的 ▶/❚❚（状态在 utils/chatVideoControl.uts，与聊天页共用一份）。 */
   function handleVideoPlaying(uid: string): void {
-    playingVideoIds.add(uid);
+    setChatVideoPlaying(mfdVideoKeyOf(uid), true);
   }
 
   function handleVideoPaused(uid: string): void {
-    playingVideoIds.delete(uid);
+    setChatVideoPlaying(mfdVideoKeyOf(uid), false);
   }
 
-  /** 播放结束：seek(0) 定格首帧当封面（原生控制条可直接重播）。
+  /** 播放进度回写（video @timeupdate，单位秒）：只写模块级 ref，不进页面 reactive
+   *  （timeupdate 一秒数拍，写页面会把整页合记录重渲）。 */
+  function handleVideoTimeUpdate(uid: string, eventValue: Any): void {
+    // 模板侧带额外参数时 $event 推断为 Any（UTS error17），入参显式收窄
+    const event = eventValue as UniVideoTimeUpdateEvent;
+    const detail = event.detail;
+    updateChatVideoProgress(mfdVideoKeyOf(uid), detail.currentTime, detail.duration);
+  }
+
+  /** 播放结束：seek(0) 定格首帧当封面（自绘控制条的 ▶ 可直接重播）。
    *  全屏态播完「停留在全屏页」——不主动 exitFullScreen（用户要求：播完不回上一页），
    *  由用户自己点返回退全屏。 */
   function handleVideoEnded(uid: string): void {
-    playingVideoIds.delete(uid);
+    setChatVideoPlaying(mfdVideoKeyOf(uid), false);
     const el = getMfdVideoElement(uid);
     if (el == null) {
       return;
@@ -726,7 +751,7 @@
     console.error("[MfdVideo] 播放器报错 uid=" + v.uid);
     if (!videoRetryIds.has(v.uid) && isAuthProtectedFileUrl(v.url) && v.playUrl.length > 0) {
       videoRetryIds.add(v.uid);
-      playingVideoIds.delete(v.uid);
+      setChatVideoPlaying(mfdVideoKeyOf(v.uid), false);
       videoResolved.delete(v.url);
       v.playUrl = "";
       scheduleMediaTableRefresh();
@@ -736,14 +761,16 @@
     uni.showToast({ title: t("Mobile.Message.videoPlayFailed"), icon: "none" });
   }
 
-  /** 全屏状态变化：回写标记（任一视频全屏时隐藏 Android 兜底按钮）。
+  /** 全屏状态变化：回写标记（全屏态页面不再接管轻触）。
    *  进入全屏即起播（chat.uvue 同款）：全屏页停在第一帧且点按无响应，根因是
    *  播放器从未起播；全屏容器接管与事件回调存在时序差，立即起播后再补一记
-   *  300ms 兜底（已起播时 play() 幂等）。退全屏不清播放状态。 */
+   *  300ms 兜底（已起播时 play() 幂等）。退全屏不清播放状态。
+   *  ★全屏入口在 components/chat-video-bar（按 playerId 取元素 requestFullScreen）。 */
   function handleVideoFullscreenChange(uid: string, eventValue: Any): void {
     // 模板侧带额外参数时 $event 推断为 Any（UTS error17），入参显式收窄
     const event = eventValue as UniVideoFullScreenChangeEvent;
-    videoFullscreen.value = event.detail.fullScreen;
+    // 以事件为准校准全屏态（进/出都覆盖），同时作废控制条那次乐观置位的看门狗
+    confirmChatVideoFullscreen(event.detail.fullScreen);
     if (!event.detail.fullScreen) {
       return;
     }
@@ -757,19 +784,6 @@
         lateEl.play();
       }
     }, 300);
-  }
-
-  /** Android 全屏入口（video 子组件层按钮，按 uid 寻址）：requestFullScreen 传
-   *  null = 按视频宽高比自动定方向（chat.uvue 同款）。 */
-  function requestMfdVideoFullscreen(uid: string): void {
-    const el = getMfdVideoElement(uid);
-    if (el == null) {
-      return;
-    }
-    el.requestFullScreen(null);
-    // 兜底起播：正常由 fullscreenchange 统一起播；若某端不派发该事件，
-    // 也避免全屏页停在第一帧且点按无响应
-    el.play();
   }
 
   /** 文件卡片展示名（快照 fileName 优先，缺省从 URL 提取）。 */
@@ -917,6 +931,8 @@
     // 不停语音——判后台放行续播，见 stopMfdAudioOnHideIfNeeded
     stopMfdAudioOnHideIfNeeded();
     pauseMfdVideos();
+    // 全屏态复位（模块级 ref 跨页存活：残留 true 会让下一个视频行内就挂系统控制条）
+    setChatVideoFullscreen(false);
   });
 
   onUnload((): void => {
@@ -924,6 +940,7 @@
     clearStopAudioOnHideTimer();
     destroyMfdAudio();
     pauseMfdVideos();
+    setChatVideoFullscreen(false);
     if (mediaRefreshTimer != 0) {
       clearTimeout(mediaRefreshTimer);
       mediaRefreshTimer = 0;
@@ -1096,60 +1113,14 @@
     border-radius: 12rpx;
     background-color: #1c1b20;
     overflow: hidden;
+    /* 自绘控制条（chat-video-bar）是 <video> 的兄弟节点，靠本层定位压在播放器底部 */
+    position: relative;
   }
 
   .mfd-video__player {
     width: 400rpx;
     height: 300rpx;
     background-color: #000000;
-  }
-
-  /* 全屏兜底按钮（仅 APP-ANDROID：控制条实测无全屏键）：56rpx 半透明黑圆 + 四角括号
-     纯 view 绘制；全屏态由 v-if 卸载（iOS 勿用——#22070 闪退） */
-  .mfd-video__fs {
-    position: absolute;
-    top: 12rpx;
-    right: 12rpx;
-    width: 56rpx;
-    height: 56rpx;
-    border-radius: 28rpx;
-    background-color: rgba(0, 0, 0, 0.45);
-  }
-
-  .mfd-video__fs-corner {
-    position: absolute;
-    width: 12rpx;
-    height: 12rpx;
-    border-color: #ffffff;
-    border-style: solid;
-  }
-
-  .mfd-video__fs-corner--tl {
-    top: 16rpx;
-    left: 16rpx;
-    border-top-width: 3rpx;
-    border-left-width: 3rpx;
-  }
-
-  .mfd-video__fs-corner--tr {
-    top: 16rpx;
-    right: 16rpx;
-    border-top-width: 3rpx;
-    border-right-width: 3rpx;
-  }
-
-  .mfd-video__fs-corner--bl {
-    bottom: 16rpx;
-    left: 16rpx;
-    border-bottom-width: 3rpx;
-    border-left-width: 3rpx;
-  }
-
-  .mfd-video__fs-corner--br {
-    bottom: 16rpx;
-    right: 16rpx;
-    border-bottom-width: 3rpx;
-    border-right-width: 3rpx;
   }
 
   .mfd-video__poster {

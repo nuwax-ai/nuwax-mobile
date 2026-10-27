@@ -15,6 +15,7 @@
 
 <script setup lang="uts">
 import { ref, watch, onMounted, onUnmounted } from 'vue';
+import { onShow, onHide } from '@dcloudio/uni-app';
 import { AuthIdpProvider } from '@/types/interfaces/authIdp';
 import { MOBILE_IDP_ENABLED_TYPES, MOBILE_IDP_ALLOWED_IDS } from '@/constants/authIdp';
 import { apiAuthIdpLoginList } from '@/servers/authIdp';
@@ -22,7 +23,7 @@ import { apiResCode, apiResData } from '@/utils/apiResponse';
 import { SUCCESS_CODE } from '@/constants/codes.constants';
 import { getApiBaseUrl } from '@/constants/config';
 import { AuthLoadScope, parseAuthIdpList, availableAuthProviders, autoAuthProviderId } from '@/utils/authIdp';
-import { canUseBrowserIdp, authBrowserOrigin, authBrowserQuery, authBrowserUserAgent, beginBrowserIdp } from '@/utils/idpNavigation';
+import { canUseBrowserIdp, authBrowserQuery, authBrowserUserAgent, beginBrowserIdp } from '@/utils/idpNavigation';
 import { useI18n, emptyI18nParams } from '@/utils/i18n';
 
 const props = defineProps<{ agreed: boolean, disabled: boolean, redirectUrl: string, allowAutomatic: boolean }>();
@@ -38,55 +39,31 @@ let loadedOrigin = '';
 let loadedRevision = 0;
 let local = false;
 let automaticId = '';
+let mounted = false;
+let suspended = false;
 
 function setBusy(value: boolean): void {
   busy.value = value;
   emit('busy', value);
 }
 
-/** 同一提供方五分钟内只自动发起一次，覆盖 IdP 失败回 PC 登录页再回移动站的情形。 */
-function reserveAutomaticAttempt(id: string): boolean {
-  // #ifdef H5 || WEB
-  try {
-    const key = 'NUWAX_IDP_AUTO:' + authBrowserOrigin() + ':' + id;
-    const previous = sessionStorage.getItem(key);
-    const timestamp = previous != null ? parseFloat(previous) : 0;
-    if (timestamp > 0 && Date.now() - timestamp < 300000) return false;
-    sessionStorage.setItem(key, `${Date.now()}`);
-    return true;
-  } catch (_error) { return false; }
-  // #endif
-  // #ifndef H5 || WEB
-  return false;
-  // #endif
-}
-
-function releaseAutomaticAttempt(id: string): void {
-  // #ifdef H5 || WEB
-  try { sessionStorage.removeItem('NUWAX_IDP_AUTO:' + authBrowserOrigin() + ':' + id); } catch (_error) {}
-  // #endif
-}
-
 function tryAutomaticLogin(): void {
-  if (props.allowAutomatic && !local && automaticId.length > 0) login(automaticId, true);
+  if (!suspended && props.allowAutomatic && !local && automaticId.length > 0) login(automaticId, true);
 }
 
 function login(id: string, automatic: boolean): void {
-  if (busy.value || props.disabled || !scope.accepts(loadedRevision, loadedOrigin, getApiBaseUrl())) return;
+  if (suspended || busy.value || props.disabled || !scope.accepts(loadedRevision, loadedOrigin, getApiBaseUrl())) return;
   if (!canUseBrowserIdp() || !providers.value.some((p: AuthIdpProvider): boolean => p.id == id)) return;
-  // 前置条件满足后才占用尝试记录；真正尝试后不因 disabled 恢复而反复自动发起。
+  // 只去重本次展示内的并发发起；下次进入或返回登录页时重新读取自动配置。
   automaticId = '';
-  if (automatic && !reserveAutomaticAttempt(id)) return;
   activeId.value = id;
   setBusy(true);
   const start = (): void => {
     if (!scope.accepts(loadedRevision, loadedOrigin, getApiBaseUrl())) {
-      if (automatic) releaseAutomaticAttempt(id);
       setBusy(false);
       return;
     }
     if (!beginBrowserIdp(id, props.redirectUrl, automatic)) {
-      if (automatic) releaseAutomaticAttempt(id);
       setBusy(false);
       errorText.value = t('Mobile.Auth.idpUnavailable');
     }
@@ -121,18 +98,29 @@ watch((): boolean => props.disabled, (disabled: boolean): void => {
 
 // #ifdef H5 || WEB
 function restoreFromBrowser(event: PageTransitionEvent): void {
-  if (event.persisted) { setBusy(false); local = true; }
+  if (event.persisted) resumeAutomaticLogin();
 }
 // #endif
 
-onMounted(async () => {
-  if (!canUseBrowserIdp()) return;
+function suspendAutomaticLogin(): void {
+  if (!mounted) return;
+  suspended = true;
+  automaticId = '';
+  scope.invalidate();
+}
+
+function resumeAutomaticLogin(): void {
+  if (!mounted || !suspended) return;
+  suspended = false;
+  setBusy(false);
+  loadProviders().catch((_error: any | null): void => {});
+}
+
+async function loadProviders(): Promise<void> {
+  if (suspended || !canUseBrowserIdp()) return;
   const error = authBrowserQuery('idpError');
   errorText.value = error != null ? (error.length > 0 ? error.substring(0, 500) : t('Mobile.Auth.idpSessionFailed')) : '';
   local = authBrowserQuery('local') != null || error != null;
-  // #ifdef H5 || WEB
-  window.addEventListener('pageshow', restoreFromBrowser);
-  // #endif
   const revision = scope.begin();
   const origin = getApiBaseUrl();
   try {
@@ -147,13 +135,27 @@ onMounted(async () => {
   } catch (_error) {
     // 列表失败、超时或旧后端不支持时，普通登录仍然可用。
   }
+}
+
+onShow(resumeAutomaticLogin);
+onHide(suspendAutomaticLogin);
+
+onMounted(async () => {
+  mounted = true;
+  // #ifdef H5 || WEB
+  window.addEventListener('pagehide', suspendAutomaticLogin);
+  window.addEventListener('pageshow', restoreFromBrowser);
+  // #endif
+  await loadProviders();
 });
 
 onUnmounted(() => {
+  mounted = false;
   automaticId = '';
   scope.invalidate();
   emit('busy', false);
   // #ifdef H5 || WEB
+  window.removeEventListener('pagehide', suspendAutomaticLogin);
   window.removeEventListener('pageshow', restoreFromBrowser);
   // #endif
 });

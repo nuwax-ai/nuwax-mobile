@@ -9,7 +9,7 @@ import { MOBILE_IDP_ENABLED_TYPES, MOBILE_IDP_ALLOWED_IDS } from '../constants/a
 const source = readFileSync('components/idp-login/idp-login.uvue', 'utf8');
 const script = source.split('<script setup lang="uts">')[1].split('</script>')[0]
   .replace(/^import .+;\s*$/gm, '');
-const code = transformSync(script + '\n({ login, busy });', { loader: 'ts' }).code;
+const code = transformSync(script + '\n({ login, busy, errorText });', { loader: 'ts' }).code;
 const origin = 'https://tenant.example';
 
 interface Options {
@@ -18,22 +18,26 @@ interface Options {
   automaticId?: string;
   query?: Record<string, string>;
   recentAttempt?: boolean;
+  disabled?: boolean;
+  navigationFailure?: boolean;
 }
 
 async function setup(options: Options = {}) {
-  const props = { agreed: options.agreed ?? false, disabled: false, redirectUrl: '/pages/message/chat?convId=123', allowAutomatic: options.allowAutomatic ?? true };
+  const props = { agreed: options.agreed ?? false, disabled: options.disabled ?? false, redirectUrl: '/pages/message/chat?convId=123', allowAutomatic: options.allowAutomatic ?? true };
   const order: string[] = [];
   const emit = vi.fn((name: string) => {
     if (name === 'agreed') { props.agreed = true; order.push('agreed'); }
   });
-  const beginBrowserIdp = vi.fn(() => { order.push('authorize'); return true; });
+  const beginBrowserIdp = vi.fn(() => { order.push('authorize'); return !options.navigationFailure; });
   const showModal = vi.fn();
   const storage = new Map<string, string>();
   if (options.recentAttempt) storage.set('NUWAX_IDP_AUTO:' + origin + ':5', String(Date.now()));
   let mount: () => Promise<void> = async () => {};
+  let disabledChanged: () => void = () => {};
   const context = {
     ref: <T>(value: T) => ({ value }),
     onMounted: (callback: () => Promise<void>) => { mount = callback; }, onUnmounted: vi.fn(),
+    watch: (read: () => boolean, callback: (value: boolean) => void) => { disabledChanged = () => callback(read()); },
     defineProps: () => props, defineEmits: () => emit,
     AuthLoadScope, parseAuthIdpList, availableAuthProviders, autoAuthProviderId,
     MOBILE_IDP_ENABLED_TYPES, MOBILE_IDP_ALLOWED_IDS,
@@ -44,11 +48,12 @@ async function setup(options: Options = {}) {
     apiResCode: (response: any) => response.code, apiResData: (response: any) => response.data, SUCCESS_CODE: '0000',
     useI18n: () => ({ t: (key: string) => key }), emptyI18nParams: () => ({}),
     uni: { showModal }, window: { addEventListener: vi.fn(), removeEventListener: vi.fn() },
-    sessionStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    sessionStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) },
   };
   const handlers = runInNewContext(code, context);
   await mount();
-  return { props, emit, beginBrowserIdp, showModal, order, ...handlers };
+  return { props, emit, beginBrowserIdp, showModal, order, storage,
+    setDisabled: (value: boolean) => { props.disabled = value; disabledChanged(); }, ...handlers };
 }
 
 describe('H5 统一认证的协议确认', () => {
@@ -84,6 +89,34 @@ describe('H5 统一认证的协议确认', () => {
     page.login('5', false);
     expect(page.showModal).not.toHaveBeenCalled();
     expect(page.beginBrowserIdp).toHaveBeenCalledOnce();
+  });
+
+  it('表单暂时禁用不消耗自动尝试，恢复可用后补跳且只跳一次', async () => {
+    const page = await setup({ disabled: true });
+    expect(page.storage.size).toBe(0);
+    expect(page.beginBrowserIdp).not.toHaveBeenCalled();
+    page.setDisabled(false);
+    expect(page.props.agreed).toBe(true);
+    expect(page.beginBrowserIdp).toHaveBeenCalledOnce();
+    page.setDisabled(true);
+    page.setDisabled(false);
+    expect(page.beginBrowserIdp).toHaveBeenCalledOnce();
+  });
+
+  it('跳转未发起时解除加载并回收尝试记录，不自动反复重试', async () => {
+    const page = await setup({ navigationFailure: true });
+    expect(page.busy.value).toBe(false);
+    expect(page.errorText.value).toBe('Mobile.Auth.idpUnavailable');
+    expect(page.storage.size).toBe(0);
+    page.setDisabled(true);
+    page.setDisabled(false);
+    expect(page.beginBrowserIdp).toHaveBeenCalledOnce();
+  });
+
+  it('空 idpError 也说明登录失败，避免只停止自动跳转而不给提示', async () => {
+    const page = await setup({ query: { idpError: '' } });
+    expect(page.errorText.value).toBe('Mobile.Auth.idpSessionFailed');
+    expect(page.beginBrowserIdp).not.toHaveBeenCalled();
   });
 
   it.each([{ query: { local: '' } }, { query: { idpError: '' } }, { recentAttempt: true }, { automaticId: '999' }])('保留普通登录回退与防循环限制 %j', async options => {

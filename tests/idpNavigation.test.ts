@@ -41,6 +41,11 @@ describe('浏览器 Cookie 登录', () => {
     expect(beginBrowserIdp('5', '', true)).toBe(true);
     expect(replace).toHaveBeenCalledOnce();
   });
+  it.each([true, false])('浏览器拒绝跳转时返回失败，让表单解除加载 replace=%s', shouldReplace => {
+    const navigate = shouldReplace ? replace : assign;
+    navigate.mockImplementationOnce(() => { throw new Error('navigation blocked'); });
+    expect(beginBrowserIdp('5', '', shouldReplace)).toBe(false);
+  });
   it('普通登录后回移动路由或安全 pending 页面', () => {
     finishBrowserLogin('/pages/message/chat?convId=123');
     expect(replace).toHaveBeenLastCalledWith('/m/#/pages/message/chat?convId=123');

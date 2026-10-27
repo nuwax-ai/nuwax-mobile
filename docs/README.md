@@ -6,6 +6,7 @@
 
 | 文档 | 说明 |
 |---|---|
+| [ios-hbuilderx-linker-compat.md](engineering/ios-hbuilderx-linker-compat.md) | Xcode 27 的 HBuilderX iOS 链接兼容与仓库编译入口 |
 | [local-custom-base-maintenance.md](engineering/local-custom-base-maintenance.md) | 本地离线自定义基座维护规范 |
 | [custom-base-distribution-s3.md](engineering/custom-base-distribution-s3.md) | 自定义基座 S3 分发（拉取/发布） |
 | [offline-sdk-distribution-s3.md](engineering/offline-sdk-distribution-s3.md) | 离线 SDK S3 分发 |

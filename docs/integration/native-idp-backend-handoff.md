@@ -81,7 +81,7 @@ exchange 对应方式：方法/路径、鉴权、输入、成功/失败/重复/�
 
 ## 本地验证与未验证边界
 
-- 原生编排/协议、安全导航与既有 H5 登录专项共 89 项通过；当前原生工作区的 HBuilderX H5 回归编译通过。
-- iOS 原生 Swift 桥及 HBuilderX 生成的 UTS 插件 Swift 包装/URL Hook 一起通过了 iOS Simulator SDK 的 `swiftc -typecheck`，并独立编译/链接为 arm64 模拟器动态库（使用当前 DCloud 框架）。全工程停在现有 `nuwax-device-identity` 插件链接阶段；隔离的新认证插件编译同样出现 linker 错误，因此尚未确认 iOS UTS 插件链接/全工程编译通过。签名安装包和真实认证回调未验证。
+- 原生编排/协议、安全导航与既有 H5 登录专项及 iOS 构建兼容测试共 97 项通过；当前原生工作区的 HBuilderX H5 回归编译通过。
+- iOS 原生 Swift 桥及 HBuilderX 生成的 UTS 插件 Swift 包装/URL Hook 一起通过了 iOS Simulator SDK 的 `swiftc -typecheck`，并独立编译/链接为 arm64 模拟器动态库（使用当前 DCloud 框架）。原链接错误已定位为 HBuilderX 生成的过时 `-ld64`，仓库内编译进程兼容层已使认证插件通过 HBuilderX 链接；使用 `pnpm hx:ios:compile`，完整 77 页业务工程已编译通过；同时处理了生成 Pods 的过低目标，并将编译堆上限设为可配置的 8GB。使用方式和边界见 [iOS 编译说明](../engineering/ios-hbuilderx-linker-compat.md)。签名安装包和真实认证回调未验证。
 - Android HBuilderX 编译验证使用本原生工作区的显式 `UNI_INPUT_DIR`，避免 CLI 同名项目匹配到 H5 提测主检出；编译通过不等于包内 Manifest 已生效或真实浏览器往返通过。
 - 没有请求真实原生登录接口、修改平台配置、安装新包或操作用户账号。H5 提测分支保持原样，原生工作单独保存。

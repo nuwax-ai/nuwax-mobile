@@ -62,7 +62,7 @@
         </view>
       </view>
 
-      <!-- 仅确认设备上线后进入成功完成态；随后自动返回来源页 -->
+      <!-- 仅确认设备上线后进入成功完成态；随后自动返回终端页 -->
       <view v-else-if="isSuccess && deviceOnline" class="result">
         <view class="result__badge result__badge--success">
           <text class="result__badge-icon">✓</text>
@@ -70,9 +70,12 @@
         <text class="result__title">{{ t('Mobile.Provision.Result.successTitle') }}</text>
         <text class="result__desc">{{ successDesc }}</text>
         <text class="result__online result__online--ok">✓ {{ t('Mobile.Provision.Result.deviceOnline') }}</text>
+        <view v-if="returnFailed" class="result__btn result__btn--manual" hover-class="result__btn--hover" @tap="onDone">
+          <text class="result__btn-text result__btn-text--manual">{{ t('Mobile.Provision.Result.manualReturn') }}</text>
+        </view>
       </view>
 
-      <!-- 30 秒内未确认上线：进入待确认态，仅此时显示手动返回 -->
+      <!-- 30 秒内未确认上线：进入待确认态，提供手动返回 -->
       <view v-else-if="isSuccess && onlineCheckFailed" class="result result--pending">
         <view class="result__badge result__badge--pending">
           <text class="result__badge-icon result__badge-icon--pending">!</text>
@@ -109,14 +112,12 @@
 </template>
 
 <script setup lang="uts">
-  import { switchMainTab } from "@/utils/mainTabNavigation";
-
   import CustomNavBar from "@/components/custom-nav-bar/custom-nav-bar.uvue";
   import { ref, computed, watch, onUnmounted } from "vue";
   import { onLoad, onBackPress } from "@dcloudio/uni-app";
   import { useI18n, toI18nParams, emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { useEspProvisioning, releaseEspProvisioning } from "@/hooks/useEspProvisioning";
-  import { getProvisionDevice, getProvisionCredentials, clearProvisionSession, getReprovisionTarget, getQrPayload, getProvisionReturnUrl } from "@/utils/provisionSession";
+  import { getProvisionDevice, getProvisionCredentials, clearProvisionSession, getReprovisionTarget, getQrPayload, getProvisionReturnUrl, PROVISION_TERMINAL_PAGE } from "@/utils/provisionSession";
   import { EspProvisioningPhaseEnum } from "@/types/enums/espProvisioning";
   import { ProvisionRetryActionEnum } from "@/types/enums/provision";
   import { apiVoxDeviceDetail, apiVoxDeviceBindingDetail } from "@/servers/vox/voxDevice";
@@ -270,6 +271,7 @@
   let pollSessionId = 0;
   /** 在线确认后的自动返回定时器（先展示成功提示，再跳终端页） */
   let autoReturnTimer = 0;
+  const returnFailed = ref<boolean>(false);
   const isCheckingOnline = computed((): boolean => isSuccess.value && !deviceOnline.value && !onlineCheckFailed.value);
   const onlineIndicatorStep = computed((): number => pollTick.value % 4);
 
@@ -284,35 +286,49 @@
   };
 
   let hasDone = false;
-  const returnToSource = () => {
-    const returnUrl = getProvisionReturnUrl();
-    releaseEspProvisioning();
-    clearProvisionSession();
-    if (returnUrl == "/pages/terminal/terminal") {
-      switchMainTab({ url: returnUrl });
-    } else if (returnUrl != "") {
-      uni.reLaunch({ url: returnUrl });
-    } else {
-      uni.navigateBack();
-    }
+  const onReturnFailed = (error: IUniError) => {
+    hasDone = false;
+    returnFailed.value = true;
+    console.error("[ProvisionReturn] navigation failed", error);
+    uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
   };
 
-  /** 在线确认完成后的固定去向：统一回终端页（终端 onShow 会静默刷新设备列表）。 */
+  /** 终端已迁到普通分包页；退回已有实例以清理配网页并触发 onShow 刷新。 */
   const returnToTerminal = () => {
     releaseEspProvisioning();
     clearProvisionSession();
-    switchMainTab({
-      url: "/pages/terminal/terminal",
-      fail: () => {
-        // 兜底：H5 等无 terminal tab 的环境退化为重开页面
-        uni.reLaunch({ url: "/pages/terminal/terminal" });
-      },
-    });
+    const openTerminal = () => {
+      uni.redirectTo({ url: PROVISION_TERMINAL_PAGE, fail: onReturnFailed });
+    };
+    const pages = getCurrentPages();
+    for (let i = pages.length - 2; i >= 0; i--) {
+      const page = pages[i];
+      if (page == null) continue;
+      const route = `${page.route}`;
+      const path = route.startsWith("/") ? route : `/${route}`;
+      if (path != PROVISION_TERMINAL_PAGE) continue;
+      uni.navigateBack({ delta: pages.length - 1 - i, fail: () => openTerminal() });
+      return;
+    }
+    // 扫码直达等场景没有终端实例，替换当前结果页进入正确的分包地址。
+    openTerminal();
+  };
+
+  const returnToSource = () => {
+    const returnUrl = getProvisionReturnUrl();
+    if (returnUrl == PROVISION_TERMINAL_PAGE || returnUrl == "") {
+      returnToTerminal();
+      return;
+    }
+    releaseEspProvisioning();
+    clearProvisionSession();
+    uni.reLaunch({ url: returnUrl, fail: onReturnFailed });
   };
 
   const onDone = () => {
     if (hasDone) return;
     hasDone = true;
+    returnFailed.value = false;
     stopOnlinePolling();
     returnToTerminal();
   };
@@ -320,6 +336,7 @@
   const leaveProvision = () => {
     if (hasDone) return;
     hasDone = true;
+    returnFailed.value = false;
     stopOnlinePolling();
     returnToSource();
   };
@@ -338,7 +355,8 @@
   };
 
   onBackPress((_options: OnBackPressOptions): boolean => {
-    if (!isRunning.value) return false;
+    // 已确认离开后放行程序触发的 navigateBack，避免再次弹出离开确认。
+    if (hasDone || !isRunning.value) return false;
     onRequestLeave();
     return true;
   });

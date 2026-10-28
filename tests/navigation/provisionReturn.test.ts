@@ -3,7 +3,7 @@ import { runInNewContext } from "node:vm";
 import { transformSync } from "esbuild";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EspProvisioningPhaseEnum } from "@/types/enums/espProvisioning.uts";
-import { PROVISION_TERMINAL_PAGE } from "@/utils/provisionSession.uts";
+import { PROVISION_TERMINAL_PAGE, ReprovisionTarget } from "@/utils/provisionSession.uts";
 
 const terminalPath = "/subpackages/pages/terminal/terminal";
 const progressPath = "subpackages/pages/provision/provision-progress/provision-progress";
@@ -13,6 +13,19 @@ function setup(source: string, context: Record<string, unknown>, expose: string)
   const script = source.match(/<script setup lang="uts">([\s\S]*?)<\/script>/)![1]
     .replace(/^\s*import .+;\s*$/gm, "");
   return runInNewContext(transformSync(`${script}\n;({${expose}});`, { loader: "ts" }).code, context);
+}
+
+function entry(options: Record<string, string>) {
+  let returnUrl = "";
+  let target: ReprovisionTarget | null = null;
+  setup(readFileSync("subpackages/pages/provision/provision-entry/provision-entry.uvue", "utf8"), {
+    ref: (value: unknown) => ({ value }), useEspProvisioning: () => ({}),
+    onLoad: (fn: (options: unknown) => void) => fn(options), onReady: vi.fn(),
+    PROVISION_TERMINAL_PAGE, ReprovisionTarget, orEmpty: (value: string | null) => value ?? "",
+    setProvisionReturnUrl: (url: string) => { returnUrl = url; },
+    setReprovisionTarget: (value: ReprovisionTarget) => { target = value; },
+  }, "");
+  return { returnUrl, target };
 }
 
 function progress(routes = ["pages/tab-shell/tab-shell", terminalPath.slice(1), "entry", "wifi", progressPath], returnUrl = terminalPath) {
@@ -41,14 +54,14 @@ function progress(routes = ["pages/tab-shell/tab-shell", terminalPath.slice(1), 
     EspProvisioningPhaseEnum, PROVISION_TERMINAL_PAGE,
     useEspProvisioning: () => controller,
     releaseEspProvisioning: vi.fn(), clearProvisionSession: vi.fn(),
-    getProvisionReturnUrl: () => returnUrl, getReprovisionTarget: () => null,
+    getProvisionReturnUrl: () => returnUrl, getReprovisionTarget: vi.fn((): ReprovisionTarget | null => null),
     getCurrentPages: () => routes.map(route => ({ route })),
     apiVoxDeviceBindingDetail: vi.fn().mockResolvedValue({ code: "0000", data: { bindingStatus: "BOUND" } }),
     apiResCode: (res: any) => res.code, apiResData: (res: any) => res.data, SUCCESS_CODE: "0000",
     switchMainTab: (options: any) => uni.switchTab(options), uni,
     setTimeout, clearTimeout, setInterval, clearInterval, console: { error: vi.fn() },
   };
-  const page = setup(progressSource, context, "onDone, leaveProvision, startOnlinePolling, onlineCheckFailed, deviceOnline, returnFailed");
+  const page = setup(progressSource, context, "onDone, onReprovision, leaveProvision, startOnlinePolling, onlineCheckFailed, deviceOnline, returnFailed");
   return { ...context, page, controller, unmount: () => unmounted.forEach(fn => fn()) };
 }
 
@@ -154,5 +167,72 @@ describe("配网完成返回终端", () => {
     vi.advanceTimersByTime(1500);
     expect(p.uni.navigateBack).not.toHaveBeenCalled();
     expect(p.uni.redirectTo).not.toHaveBeenCalled();
+  });
+
+  it("第 30 秒的末次查询确认上线后仍自动返回", async () => {
+    const p = progress();
+    p.apiVoxDeviceBindingDetail.mockResolvedValue({ code: "0000", data: { bindingStatus: "PENDING" } });
+    p.page.startOnlinePolling();
+    await vi.advanceTimersByTimeAsync(29999);
+    p.apiVoxDeviceBindingDetail.mockImplementationOnce(() => new Promise(resolve => {
+      setTimeout(() => resolve({ code: "0000", data: { bindingStatus: "BOUND" } }), 200);
+    }));
+    await vi.advanceTimersByTimeAsync(201);
+    expect(p.page.deviceOnline.value).toBe(true);
+    expect(p.page.onlineCheckFailed.value).toBe(false);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(p.uni.navigateBack).toHaveBeenCalledWith(expect.objectContaining({ delta: 3 }));
+  });
+
+  it("末次查询最多额外等待 5 秒，超时后的在线回包不得再跳转", async () => {
+    const p = progress();
+    p.apiVoxDeviceBindingDetail.mockResolvedValue({ code: "0000", data: { bindingStatus: "PENDING" } });
+    p.page.startOnlinePolling();
+    await vi.advanceTimersByTimeAsync(29999);
+    let resolveLast: (value: any) => void = () => {};
+    p.apiVoxDeviceBindingDetail.mockImplementationOnce(() => new Promise(resolve => { resolveLast = resolve; }));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(p.page.onlineCheckFailed.value).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(p.page.onlineCheckFailed.value).toBe(true);
+    resolveLast({ code: "0000", data: { bindingStatus: "BOUND" } });
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(p.page.deviceOnline.value).toBe(false);
+    expect(p.uni.navigateBack).not.toHaveBeenCalled();
+  });
+
+  it("末次查询等待期间离开页面后不再处理在线回包", async () => {
+    const p = progress();
+    p.apiVoxDeviceBindingDetail.mockResolvedValue({ code: "0000", data: { bindingStatus: "PENDING" } });
+    p.page.startOnlinePolling();
+    await vi.advanceTimersByTimeAsync(29999);
+    let resolveLast: (value: any) => void = () => {};
+    p.apiVoxDeviceBindingDetail.mockImplementationOnce(() => new Promise(resolve => { resolveLast = resolve; }));
+    await vi.advanceTimersByTimeAsync(1);
+    p.unmount();
+    resolveLast({ code: "0000", data: { bindingStatus: "BOUND" } });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(p.page.deviceOnline.value).toBe(false);
+    expect(p.page.onlineCheckFailed.value).toBe(false);
+    expect(p.uni.showToast).not.toHaveBeenCalled();
+  });
+
+  it("换 Wi-Fi 失败后重新配网仍保留绑定记录，取消返回正确详情页", () => {
+    const original = entry({ deviceId: "NX-test", name: "设备 A", bindingId: "42" });
+    const p = progress();
+    p.getReprovisionTarget.mockReturnValue(original.target);
+    p.page.onReprovision();
+    const options = p.uni.reLaunch.mock.calls[0][0];
+    const query = new URL(options.url, "https://example.invalid").searchParams;
+    expect(query.get("bindingId")).toBe("42");
+    const restarted = entry(Object.fromEntries(query));
+    expect(restarted.returnUrl).toBe("/subpackages/pages/terminal/terminal-device-detail?bindingId=42");
+    const next = progress(undefined, restarted.returnUrl);
+    next.page.leaveProvision();
+    expect(next.uni.reLaunch).toHaveBeenCalledWith(expect.objectContaining({ url: restarted.returnUrl }));
+  });
+
+  it("重配入口缺少绑定记录时返回终端列表，避免打开空详情页", () => {
+    expect(entry({ deviceId: "NX-test", name: "设备 A" }).returnUrl).toBe(terminalPath);
   });
 });

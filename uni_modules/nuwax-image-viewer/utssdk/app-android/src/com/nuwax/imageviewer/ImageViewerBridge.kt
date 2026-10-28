@@ -30,6 +30,11 @@ import kotlin.math.min
 
 private const val SETTLE_DURATION = 220L
 private const val CLOSE_DURATION = 240L
+/** 手势/返回键关闭：系统边缘滑动自身已有返回动效，回缩只需一小段就收场，别拖满 240ms。 */
+private const val FAST_CLOSE_DURATION = 130L
+/** 手势关闭的动画终值：只走到回缩路程的 45%，在贴到缩略图前就 dismiss。 */
+private const val FAST_CLOSE_STOP = 0.45f
+private const val FAST_FADE_DURATION = 110L
 
 /** UTS 侧保存回调：鉴权下载与入相册逻辑留在上层（savePreviewImageToAlbumInApp）。 */
 interface SaveRequestCallback {
@@ -67,8 +72,12 @@ class ImageViewerBridge(
     private val fileProvider: ViewerFileProvider,
     private val saveCb: SaveRequestCallback
 ) {
-    fun show() {
-        if (urls.isEmpty()) return
+    fun show(): Boolean {
+        if (urls.isEmpty()) return false
+        // 分块解码库（libs 里的 aar）只有自定义基座/正式包才有；标准基座下插件代码照样会被
+        // 动态编译加载，但 aar 里的类找不到 → 构造 PageView 时 NoClassDefFoundError 直接崩。
+        // 这里先探测，缺失就返回 false 交由上层回退系统 previewImage。
+        if (!libAvailable()) return false
         ViewerDialog(
             activity,
             urls,
@@ -79,6 +88,17 @@ class ImageViewerBridge(
             fileProvider,
             saveCb
         ).show()
+        return true
+    }
+
+    private fun libAvailable(): Boolean {
+        return try {
+            Class.forName("com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView", false,
+                javaClass.classLoader)
+            true
+        } catch (t: Throwable) {
+            false
+        }
     }
 }
 
@@ -113,7 +133,7 @@ private class ViewerDialog(
         // key 路径（含手势导航的返回）先到这里；onBackPressed 兜住其余派发路径
         setOnKeyListener { _, keyCode, event ->
             if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-                pager.closeWithTransition()
+                pager.closeWithTransition(true)
                 true
             } else {
                 false
@@ -123,7 +143,7 @@ private class ViewerDialog(
     }
 
     override fun onBackPressed() {
-        pager.closeWithTransition()
+        pager.closeWithTransition(true)
     }
 
     override fun show() {
@@ -207,8 +227,11 @@ private class PagerHost(
      * 放大态（不在最小缩放档）、图未就绪、未测到落点时退化为整体淡出；
      * 已翻页看过别的图则直接关闭（缩略图不在当前视野，回缩无处可去）。
      * 任何一种都是渐变，不再是改动前的硬切消失。
+     *
+     * @param fast 手势边缘滑动返回/返回键：只播一小段回缩就 dismiss（不必真落到缩略图上，
+     *             系统返回手势自己已给了位移动效，拖满全程会明显发慢）；单击关闭仍走完整转场。
      */
-    fun closeWithTransition() {
+    fun closeWithTransition(fast: Boolean = false) {
         if (closing) return
         closing = true
         animator?.cancel()
@@ -223,7 +246,7 @@ private class PagerHost(
         if (page == null || visible == null ||
             exitRect.width() < 1f || exitRect.height() < 1f || !canPage()
         ) {
-            fadeOutAndClose()
+            fadeOutAndClose(fast)
             return
         }
         // 落点来自 JS boundingClientRect＝逻辑 px(dp)，本层坐标是物理 px：
@@ -259,8 +282,10 @@ private class PagerHost(
         clipPath.reset()
         clipPath.addRoundRect(clipRect, 0f, 0f, Path.Direction.CW)
         clipping = true
-        val anim = android.animation.ValueAnimator.ofFloat(0f, 1f)
-        anim.duration = CLOSE_DURATION
+        // fast 只走到 FAST_CLOSE_STOP：图片缩到半路就消失，不等贴齐缩略图
+        val endF = if (fast) FAST_CLOSE_STOP else 1f
+        val anim = android.animation.ValueAnimator.ofFloat(0f, endF)
+        anim.duration = if (fast) FAST_CLOSE_DURATION else CLOSE_DURATION
         anim.interpolator = DecelerateInterpolator(1.6f)
         anim.addUpdateListener { a ->
             val f = a.animatedValue as Float
@@ -280,13 +305,14 @@ private class PagerHost(
             val r = cornerPx * f
             clipPath.reset()
             clipPath.addRoundRect(clipRect, r, r, Path.Direction.CW)
-            scrim.alpha = 1f - f
+            // 按归一化进度淡出黑底：fast 半途收场时黑底已归零，dismiss 时不会整块跳掉
+            scrim.alpha = 1f - f / endF
         }
         anim.addListener(object : android.animation.AnimatorListenerAdapter() {
             override fun onAnimationEnd(a: android.animation.Animator) {
                 animator = null
                 // 终态那一帧要先真正绘出来再 dismiss，否则最后一帧被吃掉 → 落点瞬间跳一下
-                postDelayed({ close() }, 32)
+                postDelayed({ close() }, if (fast) 16 else 32)
             }
         })
         animator = anim
@@ -294,9 +320,9 @@ private class PagerHost(
     }
 
     /** 兜底关闭：整层淡出（放大态、图未就绪、测量不到落点）。 */
-    private fun fadeOutAndClose() {
+    private fun fadeOutAndClose(fast: Boolean = false) {
         val anim = android.animation.ValueAnimator.ofFloat(1f, 0f)
-        anim.duration = 160
+        anim.duration = if (fast) FAST_FADE_DURATION else 160
         anim.addUpdateListener { a ->
             alpha = a.animatedValue as Float
         }

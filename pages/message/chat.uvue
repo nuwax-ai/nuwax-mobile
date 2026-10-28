@@ -377,6 +377,7 @@
                    不收集方法体内依赖，videoPlayUrl 同款；url 被受保护解析回填时复位重转） -->
               <view
                 v-if="msg.msgType == 'image' && msg.imageUrl.length > 0"
+                :id="'chat-img-box-' + msg.msgId"
                 class="chat-image-box"
               >
                 <!-- #ifdef APP-HARMONY -->
@@ -666,8 +667,9 @@
                 >{{ t("Mobile.Message.msgEditedTag") }}</text></text>
                 <!-- rich_text 图片附件：缩略图，点击全屏放大（loading 态同主图：att.loaded 模板直读） -->
                 <view
-                  v-for="att in msg.imageAtts"
+                  v-for="(att, attIdx) in msg.imageAtts"
                   :key="att.url"
+                  :id="'chat-img-att-' + msg.msgId + '-' + attIdx"
                   class="chat-image-box chat-image-box--att"
                 >
                   <!-- #ifdef APP-HARMONY -->
@@ -687,7 +689,7 @@
                     class="chat-image"
                     :src="att.url"
                     mode="aspectFill"
-                    @click="handleAttImageTap(msg, att)"
+                    @click="handleAttImageTap(msg, att, attIdx)"
                     @load="handleAttImageRenderLoaded(att)"
                     @error="handleAttImageRenderError(att)"
                   />
@@ -706,7 +708,7 @@
                   <view
                     v-if="harmonyImgGateOk(att.url)"
                     class="chat-image-hit"
-                    @click="handleAttImageTap(msg, att)"
+                    @click="handleAttImageTap(msg, att, attIdx)"
                   />
                   <!-- #endif -->
                 </view>
@@ -894,6 +896,13 @@
         </view>
       </view>
     </view>
+    <!-- 定位等待遮罩：带定位目标进页时从首屏拉取一直盖到定位揭幕（中间列表是 veiled 全白），
+         居中给转圈 +「正在定位消息…」；不透明白底顺带盖住 chat-state 的「加载中…」，
+         全程只有一处反馈（避免先「加载中」再「正在定位」两段重复）。
+         ★零绑定组件——模板不新增捕获参数（渲染 lambda 已顶 255 上限，见 utils/chatAiHint.uts）；
+         显隐由脚本经模块级 ref 驱动（initHistory / jumpToMsg 开，listSettled 翻转即收）。
+         置于浮钮之后按 DOM 序盖住列表区（含顶部翻页胶囊） -->
+    <chat-locate-loading />
     </view>
 
     <!-- 多选态底部工具条：取消 + 逐条转发 + 合并转发（>50 条禁用合并，服务端上限 50 items） -->
@@ -1888,6 +1897,7 @@
     apiImForwardMsg,
     apiImMessages,
     apiImMsgAddReaction,
+    apiImMsgDetail,
     apiImRecentEmojis,
     apiImRecordEmojiUsage,
     apiImMsgRemoveReaction,
@@ -1980,6 +1990,8 @@
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
   import { unescapeMarkdownEscapes } from "@/utils/markdown.uts";
   import { setAiContentHintVisible } from "@/utils/chatAiHint.uts";
+  // 定位等待遮罩（components/chat-locate-loading）显隐：同样是模板零绑定的模块级 ref
+  import { setChatLocateLoadingVisible } from "@/utils/chatLocateLoading.uts";
   // 视频播放态/进度/全屏态（模块级 ref）：自绘控制条 components/chat-video-bar 与页面事件共用
   import {
     chatVideoFullscreen,
@@ -9636,10 +9648,33 @@
     downloadPreviewImageToTemp(url, onOk, onFail);
   }
 
-  /** Android 图片预览入口（本函数仅 Android 分流调用）：全会话图集 + 起点下标。
+  /** 缩略图在视口内的落点（px）：原生查看器关闭转场的终点（图片缩回这里）。
+   *  测量失败/节点不在屏幕上时传全 0，原生侧退化为整体淡出，不影响打开。 */
+  function measureThumbRect(selector: string, onDone: (x: number, y: number, w: number, h: number) => void): void {
+    uni.createSelectorQuery()
+      .select(selector)
+      .boundingClientRect()
+      .exec((results: Array<any>) => {
+        let x = 0.0;
+        let y = 0.0;
+        let w = 0.0;
+        let h = 0.0;
+        if (results != null && results.length > 0 && results[0] != null) {
+          const rect = results[0] as NodeInfo;
+          if (rect.left != null) x = parseFloat(`${rect.left}`);
+          if (rect.top != null) y = parseFloat(`${rect.top}`);
+          if (rect.width != null) w = parseFloat(`${rect.width}`);
+          if (rect.height != null) h = parseFloat(`${rect.height}`);
+        }
+        onDone(x, y, w, h);
+      });
+  }
+
+  /** Android 图片预览入口（本函数仅 Android 分流调用）：全会话图集 + 起点下标 + 缩略图落点。
    *  原生 previewImage 长图按一屏元素解码必糊；改走 UTS 原生查看器（SubsamplingScaleImageView
-   *  分块按需解码，长图/巨图/内存一并解决）。GIF 分块解码只出首帧，回落系统预览可播动画。 */
-  function openAndroidImgPreviewAt(url: string): void {
+   *  分块按需解码，长图/巨图/内存一并解决）。GIF 分块解码只出首帧，回落系统预览可播动画。
+   *  落点只用于关闭转场（返回手势/单击时图片缩回缩略图原位），量不到就给 0 走淡出。 */
+  function openAndroidImgPreviewAt(url: string, originX: number, originY: number, originW: number, originH: number): void {
     const purls = collectChatPreviewImages();
     const pidx = purls.indexOf(url);
     const urls = pidx >= 0 ? purls : [url];
@@ -9647,8 +9682,25 @@
       previewImageCompat(urls, url);
       return;
     }
-    openNativeImageViewer(urls, pidx >= 0 ? pidx : 0, fetchNativeViewerFile, (imgUrl: string): void => {
-      savePreviewImageToAlbumInApp(imgUrl).then((): void => {}, (_e: any | null): void => {});
+    openNativeImageViewer(
+      urls,
+      pidx >= 0 ? pidx : 0,
+      originX,
+      originY,
+      originW,
+      originH,
+      fetchNativeViewerFile,
+      (imgUrl: string): void => {
+        savePreviewImageToAlbumInApp(imgUrl).then((): void => {}, (_e: any | null): void => {});
+      },
+    );
+  }
+
+  /** 量缩略图落点后打开原生查看器（点击→查询→打开，查询仅一帧，不阻塞手感）。 */
+  function openAndroidImgPreviewMeasured(url: string, selector: string): void {
+    measureThumbRect(selector, (x: number, y: number, w: number, h: number) => {
+      if (!isChatCurrent()) return;
+      openAndroidImgPreviewAt(url, x, y, w, h);
     });
   }
   // #endif
@@ -9678,7 +9730,8 @@
     // #ifdef APP-ANDROID
     // Android 图片预览全量走原生分块解码查看器（含缩放/连播/长按保存）：原生 previewImage
     // 长图按一屏元素解码必糊（5.26 官方修复也不覆盖预览器）；尺寸由查看器自行解码，无需预取
-    openAndroidImgPreviewAt(msg.imageUrl);
+    // 缩略图 box 自带 id（模板 chat-img-box-<msgId>），量出落点供关闭转场缩回原位
+    openAndroidImgPreviewMeasured(msg.imageUrl, `#chat-img-box-${msg.msgId}`);
     return;
     // #endif
     const urls = collectChatPreviewImages();
@@ -9789,7 +9842,7 @@
   }
 
   /** rich_text 图片附件点击：全屏放大预览（同主图：长按后的 click 吞掉；同样支持全会话多图滑动）。 */
-  function handleAttImageTap(msg: ImMsgRow, att: ImMsgAtt): void {
+  function handleAttImageTap(msg: ImMsgRow, att: ImMsgAtt, attIdx: number): void {
     if (rowPressFired || pageTapSwallowed() || multiSwallow()) {
       return;
     }
@@ -9802,8 +9855,8 @@
       return;
     }
     // #ifdef APP-ANDROID
-    // 同主图：Android 全量走原生查看器（尺寸由查看器自行解码）
-    openAndroidImgPreviewAt(att.url);
+    // 同主图：Android 全量走原生查看器（尺寸由查看器自行解码）；落点量附件缩略图 box
+    openAndroidImgPreviewMeasured(att.url, `#chat-img-att-${msg.msgId}-${attIdx}`);
     return;
     // #endif
     const urls = collectChatPreviewImages();
@@ -10152,6 +10205,51 @@
     return null;
   }
 
+  // ===== 定位等待遮罩（components/chat-locate-loading，模板零绑定）=====
+  // 空白根因：带定位目标进页（搜索命中/引用/置顶）时列表全程 veiled——视觉隐藏但参与
+  // scroll-into-view 布局，等首屏拉取 + seq 直达取页 + 150ms 稳定重定位这段全是纯白。
+  // ★带定位目标进页时遮罩从「首屏拉取」就开始挂（不是等首屏落数据后），全程只给一次
+  //   「正在定位消息…」：否则先露 chat-state 的「加载中…」、再换成本遮罩，同一段等待
+  //   出现两套文案（用户体验到的重复）。遮罩不透明白底，顺带把底下那份「加载中…」盖住，
+  //   不必给 chat-state 加模板条件（chat.uvue 模板不能新增 setup 引用）。
+  // listSettled 一翻转即收（见下方 watch，那是唯一的揭幕出口）。
+  const LOCATE_LOADING_SAFETY_MS: number = 20000;
+  /** 兜底定时器（0=无）：定位异常（取页卡住/揭幕分支没走到）时不让遮罩永久盖住列表。 */
+  let locateLoadingSafetyTimer = 0;
+
+  function beginLocateLoading(): void {
+    if (listSettled.value == true) {
+      return;
+    }
+    if (locateLoadingSafetyTimer != 0) {
+      clearTimeout(locateLoadingSafetyTimer);
+      locateLoadingSafetyTimer = 0;
+    }
+    setChatLocateLoadingVisible(true);
+    locateLoadingSafetyTimer = setTimeout(() => {
+      locateLoadingSafetyTimer = 0;
+      setChatLocateLoadingVisible(false);
+    }, LOCATE_LOADING_SAFETY_MS);
+  }
+
+  function endLocateLoading(): void {
+    if (locateLoadingSafetyTimer != 0) {
+      clearTimeout(locateLoadingSafetyTimer);
+      locateLoadingSafetyTimer = 0;
+    }
+    setChatLocateLoadingVisible(false);
+  }
+
+  /** 揭幕即收遮罩（scrollToAnchorWithSettle 与各兜底分支都经 listSettled 翻转收口）。 */
+  watch(
+    (): boolean => listSettled.value,
+    (settled: boolean) => {
+      if (settled == true) {
+        endLocateLoading();
+      }
+    },
+  );
+
   /** 应用待定位：滚到目标行并闪烁高亮（幂等，消费 pendingJumpId）。
    *  scrollToAnchorWithSettle 收口：揭幕 + 150ms 稳定重定位——进页首屏图片/卡片
    *  异步撑高会推走单次锚定（locateFirstUnread 同款）；页面不可见时锚点暂存
@@ -10236,10 +10334,41 @@
   }
 
   /**
-   * 定位到某条消息，两段式：
+   * 无 seq 载荷兜底：按 msgId 取一次单条详情换出 seq（MessageDto 恒带 seq）。
+   *
+   * ★为什么需要：跳转载荷有两种 —— 搜索页/引用详情带 `msgId|seq`（一发直达），
+   *  旧调用方只给裸 msgId。后者若直接进「逐页向前回翻」，点一条很早的消息就是
+   *  一直「加载中 + 不断加载更早」（20 条/页、封顶 15 页），最后还可能够不着。
+   *  这里花一次请求把 seq 换回来，定位仍然是一发直达。
+   * ★失败/无 seq 返回 0：调用方回落回翻兜底，不削减原有可用性。
+   */
+  async function resolveJumpSeqByMsgId(msgId: string): Promise<number> {
+    if (msgId.length == 0 || convId.value.length == 0) {
+      return 0;
+    }
+    try {
+      const res = await apiImMsgDetail(convId.value, msgId);
+      if (!isChatCurrent() || apiResCode(res) != SUCCESS_CODE) {
+        return 0;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj == null) {
+        return 0;
+      }
+      const seq = readNumber(dataObj, "seq", 0);
+      return seq > 0 ? Math.floor(seq) : 0;
+    } catch (_error) {
+      return 0;
+    }
+  }
+
+  /**
+   * 定位到某条消息：
    * ① 带 seq（搜索跳转/引用定位）：fetchJumpWindow 一发直达；未命中不再回翻——
    *   比 seq 更早的页不可能包含它（已被清删/过滤）。
-   * ② 无 seq（旧载荷）：尾窗向上连续翻页（最多 15 页）。
+   * ② 无 seq（旧载荷）：先按 msgId 换出 seq（resolveJumpSeqByMsgId）仍走一发直达；
+   *   换不到（详情失败/已删）才退回尾窗向上连续翻页（最多 15 页）。
    * ★滚动/高亮不在本函数直接做：emit 时本页还被 quote-detail 盖着，隐藏状态下
    *   scroll-into-view 不生效——统一延到 onShow（页面重新可见）后再应用。
    */
@@ -10247,11 +10376,21 @@
     entryFollowLatest = false;
     cancelSettle();
     jumpLocating = true;
+    // 遮蔽期定位：列表全白，先挂等待遮罩（揭幕即收，见 listSettled watch）
+    beginLocateLoading();
     try {
-      if (findMsgById(msgId) == null && jumpSeq > 0) {
-        await fetchJumpWindow(jumpSeq);
-        if (!isChatCurrent()) return;
-      } else {
+      let targetSeq = jumpSeq;
+      if (findMsgById(msgId) == null) {
+        if (targetSeq <= 0) {
+          targetSeq = await resolveJumpSeqByMsgId(msgId);
+          if (!isChatCurrent()) return;
+        }
+        if (targetSeq > 0) {
+          await fetchJumpWindow(targetSeq);
+          if (!isChatCurrent()) return;
+        }
+      }
+      if (findMsgById(msgId) == null && targetSeq <= 0) {
         let pages = 0;
         while (findMsgById(msgId) == null && pages < 15) {
           if (loading.value || loadFailed.value || messages.value.length == 0 || hasMore.value != true) {
@@ -13029,6 +13168,11 @@
     if (loading.value) {
       return;
     }
+    // 带定位目标进页（搜索命中/引用/置顶/未读定位）：遮罩从首屏拉取这一拍就挂上，
+    // 一路盖到定位完成揭幕——中间不再先露 chat-state 的「加载中…」再换「正在定位」
+    if (pendingJumpId.length > 0 || unreadViewportRead) {
+      beginLocateLoading();
+    }
     // 冷启动 myUserId 未知：等用户信息返回（失败也放行，保持全左侧旧兜底）；
     // 暖会话 loadMyInfo 已同步回填缓存，此处零等待直落首屏
     const myInfoTask = myInfoPending;
@@ -13686,6 +13830,31 @@
         cancelIosKbShortHold();
         return;
       }
+      // #ifdef APP-ANDROID
+      // 「窗口重排的假键盘高度」拦截（2026-10-28）：Android 端该事件的高度不是 IME insets，
+      // 而是 uni-keyboard 模块 OnKeyBoardChangedListener 的差值测量——
+      // rootView 高 − getWindowVisibleDisplayFrame().height() − 系统栏（状态栏+导航栏）。
+      // 从相册/文件选择器返回、窗口重新可见并重排的那一拍，可见帧与系统栏读数尚未就绪，
+      // 差出来的那段会被当成键盘高度派发过来；而事件通道本身不启 IME 轮询（轮询只在聚焦
+      // 时 start），这一笔没人再清回 0，让位就永久残留——真机症状：群聊点图片键→相册选图
+      // →发送后，输入坞下那行灰色工具栏整体上抬，底下留出一片空白（键盘并不存在）。
+      // 判据：真键盘升起必先经本页某个输入控件聚焦（inputFocused / 展开面板 / 语音编辑卡，
+      // 见 applyKeyboardHeight 头注与 handleVoiceDraftFocus 注释）；三者全否 ⇒ 键盘不可能
+      // 真升起，再用本页自己的 IME insets 直读复核，读数为 0 即丢弃该读数（不落高度、不清
+      // 面板）。聚焦态下的正高度不受影响，走原有通路（万一聚焦事件晚到漏掉一笔，聚焦时
+      // startAndroidImePolling 的 rAF 首拍会按 insets 重新落地）。
+      if (
+        res.height > 0 &&
+        inputFocused.value != true &&
+        expanded.value != true &&
+        voiceDraftFocus.value != true
+      ) {
+        if (readAndroidImeHeight() <= 0) {
+          clearKbWatchdog();
+          return;
+        }
+      }
+      // #endif
       // #ifdef APP-IOS
       // iOS 动画沿多次派发（中间高度+终值），去抖收敛到终值一次落地防抖动
       scheduleIosKbApply(res.height);
@@ -13698,6 +13867,16 @@
         return;
       }
       applyKeyboardHeight(res.height, "event");
+      // #ifdef APP-ANDROID
+      // 残留让位自愈网：事件通道不启轮询，这一笔正高度之后真实的「收起 0」若丢失
+      // （相册/文件选择器、系统权限弹窗返回后这类机型常见），没人再按 insets 把它清回 0，
+      // 让位就永久挂在半空（输入坞下方留白）。正高度落地后确保 IME 轮询链在跑：它按
+      // insets 归零自愈；链已在跑时不重入（重入是状态重置，动画沿无谓抖动）。
+      // 仅本页可见时补启（隐藏态下同一 activity 的 insets 会被子页键盘污染，见 onHide）。
+      if (res.height > 0 && pageVisible == true && androidImePollTimer == 0 && androidImeRafId == 0) {
+        startAndroidImePolling();
+      }
+      // #endif
       // #endif
     });
     // #endif
@@ -13721,6 +13900,8 @@
   onUnload(() => {
     // 合规提示复位（navigateBack 不触发 onHide，退页这条链路单独收口；幂等）
     setAiContentHintVisible(false);
+    // 定位等待遮罩复位（同上；幂等，兜底清安全定时器）
+    endLocateLoading();
     // 全屏态复位（模块级 ref 跨页存活：残留 true 会让下个聊天页行内就挂系统控制条）
     setChatVideoFullscreen(false);
     releasePrependAnchor();
@@ -13881,6 +14062,8 @@
     // 下一个聊天页首帧会先按旧值把这行文案画出来再被自己的 onLoad 改掉（群聊里露半行）。
     // 回本页由 onShow 的齐料回填重新给值（见下方）。
     setAiContentHintVisible(false);
+    // 定位等待遮罩同上：模块级 ref 跨页存活，不复位会让下一个聊天页首帧先画遮罩
+    endLocateLoading();
     // 全屏态一并复位（同上：模块级 ref 跨页存活，进子页时全屏早已退出）
     setChatVideoFullscreen(false);
     releasePrependAnchor();

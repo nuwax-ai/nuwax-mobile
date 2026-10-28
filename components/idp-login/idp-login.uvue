@@ -1,0 +1,168 @@
+<template>
+  <view v-if="providers.length > 0 || errorText.length > 0" class="idp-login">
+    <text v-if="errorText.length > 0" class="idp-error">{{ errorText }}</text>
+    <text v-if="providers.length > 0" class="idp-title">{{ t('Mobile.Auth.externalLogin') }}</text>
+    <view class="idp-buttons">
+      <button v-for="provider in providers" :key="provider.id" class="idp-button"
+        :disabled="busy || disabled" :loading="busy && activeId == provider.id"
+        @click="login(provider.id, false)">
+        <image v-if="provider.icon.length > 0" class="idp-icon" :src="provider.icon" mode="aspectFit" />
+        <text class="idp-name">{{ provider.name.length > 0 ? provider.name : t('Mobile.Auth.externalLogin') }}</text>
+      </button>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+import { ref, onMounted, onUnmounted } from 'vue';
+import { onShow, onHide } from '@dcloudio/uni-app';
+import { AuthIdpProvider } from '@/types/interfaces/authIdp';
+import { apiAuthIdpLoginList } from '@/servers/authIdp';
+import { apiResCode, apiResData } from '@/utils/apiResponse';
+import { SUCCESS_CODE } from '@/constants/codes.constants';
+import { getApiBaseUrl } from '@/constants/config';
+import { AuthLoadScope, parseAuthIdpList, availableAuthProviders, autoAuthProviderId } from '@/utils/authIdp';
+import { canUseBrowserIdp, authBrowserQuery, authBrowserUserAgent, beginBrowserIdp } from '@/utils/idpNavigation';
+import { useI18n, emptyI18nParams } from '@/utils/i18n';
+
+const props = defineProps<{ agreed: boolean, disabled: boolean, redirectUrl: string }>();
+const emit = defineEmits(['agreed', 'busy']);
+const { t: translate } = useI18n();
+const t = (key: string): string => translate(key, emptyI18nParams(), '');
+const providers = ref<AuthIdpProvider[]>([]);
+const errorText = ref<string>('');
+const busy = ref<boolean>(false);
+const activeId = ref<string>('');
+const scope = new AuthLoadScope();
+let loadedOrigin = '';
+let loadedRevision = 0;
+let automaticId = '';
+let mounted = false;
+let suspended = false;
+
+function setBusy(value: boolean): void {
+  busy.value = value;
+  emit('busy', value);
+}
+
+function tryAutomaticLogin(): void {
+  if (!suspended && automaticId.length > 0) login(automaticId, true);
+}
+
+function login(id: string, automatic: boolean): void {
+  if (suspended || busy.value || (!automatic && props.disabled) || !scope.accepts(loadedRevision, loadedOrigin, getApiBaseUrl())) return;
+  if (!canUseBrowserIdp()) return;
+  if (!automatic && !providers.value.some((p: AuthIdpProvider): boolean => p.id == id)) return;
+  // 只去重本次展示内的并发发起；下次进入或返回登录页时重新读取自动配置。
+  automaticId = '';
+  activeId.value = id;
+  setBusy(true);
+  const start = (): void => {
+    if (!scope.accepts(loadedRevision, loadedOrigin, getApiBaseUrl())) {
+      setBusy(false);
+      return;
+    }
+    if (!beginBrowserIdp(id, props.redirectUrl, automatic)) {
+      setBusy(false);
+      errorText.value = t('Mobile.Auth.idpUnavailable');
+    }
+  };
+  // 租户配置的自动认证先同步勾选状态，直接继续；手动入口仍由用户确认协议。
+  if (automatic && !props.agreed) emit('agreed');
+  if (automatic || props.agreed) {
+    start();
+    return;
+  }
+  uni.showModal({
+    title: t('Mobile.Common.tip'),
+    content: t('Mobile.Auth.pleaseAgreeProtocol'),
+    confirmText: t('Mobile.Common.agree'),
+    cancelText: t('Mobile.Common.disagree'),
+    success: (res) => {
+      if (!scope.accepts(loadedRevision, loadedOrigin, getApiBaseUrl())) return;
+      if (res.confirm == true) {
+        emit('agreed');
+        start();
+      } else setBusy(false);
+    },
+    fail: (_error) => {
+      if (scope.accepts(loadedRevision, loadedOrigin, getApiBaseUrl())) setBusy(false);
+    },
+  });
+}
+
+// #ifdef H5 || WEB
+function restoreFromBrowser(event: PageTransitionEvent): void {
+  if (event.persisted) resumeAutomaticLogin();
+}
+// #endif
+
+function suspendAutomaticLogin(): void {
+  if (!mounted) return;
+  suspended = true;
+  automaticId = '';
+  scope.invalidate();
+}
+
+function resumeAutomaticLogin(): void {
+  if (!mounted || !suspended) return;
+  suspended = false;
+  setBusy(false);
+  loadProviders().catch((_error: any | null): void => {});
+}
+
+async function loadProviders(): Promise<void> {
+  if (suspended || !canUseBrowserIdp()) return;
+  const error = authBrowserQuery('idpError');
+  errorText.value = error != null ? (error.length > 0 ? error.substring(0, 500) : t('Mobile.Auth.idpSessionFailed')) : '';
+  const revision = scope.begin();
+  const origin = getApiBaseUrl();
+  try {
+    const response = await apiAuthIdpLoginList();
+    if (!scope.accepts(revision, origin, getApiBaseUrl()) || apiResCode(response) != SUCCESS_CODE) return;
+    const list = parseAuthIdpList(apiResData<any>(response));
+    loadedOrigin = origin;
+    loadedRevision = revision;
+    providers.value = availableAuthProviders(list.items, authBrowserUserAgent());
+    // 自动项直接采用服务端配置，不受 URL 参数、手动按钮列表或本地表单状态影响。
+    automaticId = autoAuthProviderId(list.autoRedirectIdpId);
+    tryAutomaticLogin();
+  } catch (_error) {
+    // 列表失败、超时或旧后端不支持时，普通登录仍然可用。
+  }
+}
+
+onShow(resumeAutomaticLogin);
+onHide(suspendAutomaticLogin);
+
+onMounted(async () => {
+  mounted = true;
+  // #ifdef H5 || WEB
+  window.addEventListener('pagehide', suspendAutomaticLogin);
+  window.addEventListener('pageshow', restoreFromBrowser);
+  // #endif
+  await loadProviders();
+});
+
+onUnmounted(() => {
+  mounted = false;
+  automaticId = '';
+  scope.invalidate();
+  emit('busy', false);
+  // #ifdef H5 || WEB
+  window.removeEventListener('pagehide', suspendAutomaticLogin);
+  window.removeEventListener('pageshow', restoreFromBrowser);
+  // #endif
+});
+</script>
+
+<style scoped>
+.idp-login { width: 100%; margin-top: 24px; }
+.idp-title { color: #777777; font-size: 13px; text-align: center; margin-bottom: 12px; }
+.idp-error { color: #b42318; font-size: 13px; margin-bottom: 12px; }
+.idp-buttons { display: flex; flex-direction: column; }
+.idp-button { display: flex; flex-direction: row; align-items: center; justify-content: center; width: 100%; min-height: 42px; background-color: #ffffff; color: #111111; border: 1px solid #dddddd; border-radius: 7px; margin-bottom: 10px; }
+.idp-button::after { border-width: 0; }
+.idp-icon { width: 20px; height: 20px; margin-right: 8px; }
+.idp-name { font-size: 14px; line-height: 22px; }
+</style>

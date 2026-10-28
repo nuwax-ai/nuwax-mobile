@@ -1042,6 +1042,33 @@
     scheduleIconTableRefresh();
   }
 
+  /** 按原始 URL 复位各行展示地址，但**不在原生事件栈里读响应式表**。
+   *
+   * <image> 的 @error 在 Android 上由原生图片加载栈直接回调（不落在 JS 渲染 effect 栈上）。
+   * 在这一栈里读响应式表（acceptedContacts.value[i] 这类）会撞 Vue 内部 activeEffect
+   * 的判空竞态：track() 的 `shouldTrack && activeEffect != null` 守卫刚读到非 null，
+   * trackEffects() 真正取用时它已被置空（跨线程内存可见性），Kotlin 的 non-null 断言就抛
+   * `java.lang.NullPointerException: null cannot be cast to non-null type
+   * ReactiveEffect<T of trackEffects>`（线上栈指向本文件 996 行 acceptedContacts 循环，
+   * 前一处 conversations 循环因当时表为空未执行，所以只在这一行炸）。
+   * 与 runIconTableRefresh / resident-chat-shell 的 web-view 事件同口径：响应式读写一律
+   * 挪到 JS 定时器任务（与渲染 effect 同一条线程）再动；0ms 顺带与 resetRowsForIconRetry
+   * 末尾的 scheduleIconTableRefresh 50ms 去抖合并，不额外多做整表重建。 */
+  function scheduleRowsResetForIconRetry(rawUrl: string): void {
+    setTimeout((): void => {
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) {
+        return;
+      }
+      // 这一拍之内若该地址已经加载成功（@error 后紧接一个 @load 的机型），不能再把
+      // 行状态复位回「未加载」——那会让已成功的头像退回渐变字母底，直到下一次整表
+      // 刷新才恢复。同步时代复位发生在 @load 之前天然没有这个顺序问题，延时后必须显式让位。
+      if (renderedIconUrls.has(rawUrl)) {
+        return;
+      }
+      resetRowsForIconRetry(rawUrl);
+    }, 0);
+  }
+
   function retryIconAfterLoadError(rawUrl: string): void {
     if (rawUrl.length == 0 || messagePageDisposed || messagePageSession != getImSessionStamp()) {
       return;
@@ -1063,7 +1090,8 @@
       releaseDisplayImageUrl(cached);
       resolvedIconCache.delete(rawUrl);
     }
-    resetRowsForIconRetry(rawUrl);
+    // 复位走延时任务：见 scheduleRowsResetForIconRetry 注释（原生 @error 栈里读响应式会炸）
+    scheduleRowsResetForIconRetry(rawUrl);
     const delayMs = 1000 * (currentCount + 1);
     const timer = setTimeout(() => {
       iconLoadRetryTimers.delete(rawUrl);

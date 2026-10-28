@@ -1934,7 +1934,7 @@
     parseAgentStatusDetail,
     parseAgentStatusObject,
   } from "@/utils/im/imAgentStatus";
-  import { preserveImPrependAnchor } from "@/utils/im/imPrependAnchor";
+  import { preserveImPrependAnchor, forceScrollToElement } from "@/utils/im/imPrependAnchor";
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
   import { classifyKind, extOf, urlExtOf } from "@/utils/imChatAttachments";
@@ -1991,7 +1991,7 @@
   import { unescapeMarkdownEscapes } from "@/utils/markdown.uts";
   import { setAiContentHintVisible } from "@/utils/chatAiHint.uts";
   // 定位等待遮罩（components/chat-locate-loading）显隐：同样是模板零绑定的模块级 ref
-  import { setChatLocateLoadingVisible } from "@/utils/chatLocateLoading.uts";
+  import { setChatLocateLoadingVisible, setChatLocateLoadingInline } from "@/utils/chatLocateLoading.uts";
   // 视频播放态/进度/全屏态（模块级 ref）：自绘控制条 components/chat-video-bar 与页面事件共用
   import {
     chatVideoFullscreen,
@@ -2052,6 +2052,10 @@
 
   /** 历史消息单页条数（服务端上限 200，见 im-openapi LimitQueryDefault20）。 */
   const MSG_PAGE_SIZE = 20;
+  /** 定位直达页条数：对齐 PC `focusPinnedMessage`（`msgApi.history(convId, seq+1, 30)`）。
+   *  比首屏页大一圈，目标滚动贴顶后上方还有一整屏上文可看（贴顶定位看不到被引用的上文，
+   *  这正是 PC 用 `scrollIntoView({block:'center'})` 想解决的那件事）。 */
+  const JUMP_PAGE_SIZE = 30;
 
   /**
    * 表情面板字表（与 PC 端 nuwax-im-web lib/emoji.ts 的 EMOJIS 完全一致，
@@ -2454,6 +2458,10 @@
   // ===== 「定位到聊天位置」高亮（引用详情页跳回后背景快速切换） =====
   const highlightId = ref<string>("");
   let pendingJumpId = "";
+  /** pendingJumpId 对应的 seq（会话内搜索/Pin/引用详情事件载荷里带的那个）。 */
+  let pendingJumpSeq = 0;
+  /** onJumpEvent 只登记、还没取页定位：等 onShow（页面真正可见）再跑，见 onJumpEvent 注释。 */
+  let pendingJumpAwaitShow = false;
   // 搜索/引用定位进行中（jumpToMsg 全程）：屏蔽 scrolltoupper 误触发 + 定位窗内不裁尾
   let jumpLocating = false;
   let pageVisible = false;
@@ -10218,30 +10226,51 @@
   //   不必给 chat-state 加模板条件（chat.uvue 模板不能新增 setup 引用）。
   // listSettled 一翻转即收（见下方 watch，那是唯一的揭幕出口）。
   const LOCATE_LOADING_SAFETY_MS: number = 20000;
+  /** 会话内（列表已揭幕）形态的兜底：胶囊只该活一次「取页 + 落定核验」，超时即收。 */
+  const LOCATE_PILL_SAFETY_MS: number = 2500;
   /** 兜底定时器（0=无）：定位异常（取页卡住/揭幕分支没走到）时不让遮罩永久盖住列表。 */
   let locateLoadingSafetyTimer = 0;
+  /** 胶囊是否在等「落定核验」收口（true 时 jumpToMsg 的 finally 不抢着收）。 */
+  let locatePillAwaitVerify = false;
 
-  function beginLocateLoading(): void {
-    if (listSettled.value == true) {
-      return;
-    }
-    if (locateLoadingSafetyTimer != 0) {
-      clearTimeout(locateLoadingSafetyTimer);
-      locateLoadingSafetyTimer = 0;
-    }
-    setChatLocateLoadingVisible(true);
-    locateLoadingSafetyTimer = setTimeout(() => {
-      locateLoadingSafetyTimer = 0;
-      setChatLocateLoadingVisible(false);
-    }, LOCATE_LOADING_SAFETY_MS);
-  }
-
+  /** 收等待反馈（★须定义在 beginLocateLoading 之前：UTS 不提升声明，定时器回调里
+   *  调用后定义的函数会编译成 Unresolved reference）。 */
   function endLocateLoading(): void {
     if (locateLoadingSafetyTimer != 0) {
       clearTimeout(locateLoadingSafetyTimer);
       locateLoadingSafetyTimer = 0;
     }
     setChatLocateLoadingVisible(false);
+  }
+
+  /**
+   * 挂等待反馈。两种形态：
+   * - 进页遮蔽（全局搜索等，列表还是白的）→ 铺满遮罩，揭幕即收（listSettled watch）；
+   * - 会话内跳转（`listSettled` 已 true，列表本来就看得见）→ 居中半透明胶囊，
+   *   否则整段对话会被铺白的遮罩闪一下。胶囊由落定核验显式收，另有 2.5s 保险。
+   */
+  function beginLocateLoading(): void {
+    // 新一轮定位：收口权先归 finally（apply 走到核验时才转交给它）
+    locatePillAwaitVerify = false;
+    if (locateLoadingSafetyTimer != 0) {
+      clearTimeout(locateLoadingSafetyTimer);
+      locateLoadingSafetyTimer = 0;
+    }
+    if (listSettled.value == true) {
+      setChatLocateLoadingInline(true);
+      setChatLocateLoadingVisible(true);
+      locateLoadingSafetyTimer = setTimeout(() => {
+        locateLoadingSafetyTimer = 0;
+        setChatLocateLoadingVisible(false);
+      }, LOCATE_PILL_SAFETY_MS);
+      return;
+    }
+    setChatLocateLoadingInline(false);
+    setChatLocateLoadingVisible(true);
+    locateLoadingSafetyTimer = setTimeout(() => {
+      locateLoadingSafetyTimer = 0;
+      setChatLocateLoadingVisible(false);
+    }, LOCATE_LOADING_SAFETY_MS);
   }
 
   /** 揭幕即收遮罩（scrollToAnchorWithSettle 与各兜底分支都经 listSettled 翻转收口）。 */
@@ -10253,6 +10282,58 @@
       }
     },
   );
+
+  // ===== 定位落定核验（仅「列表已揭幕」的跳转路径）=====
+  // ★为什么需要：进页遮蔽（全局搜索）定位可靠；会话内搜索/Pin/引用详情是「本页从子页
+  //   返回后定位」，scroll-into-view 的下发要穿过框架的页面复现与旧滚动位置恢复，
+  //   实测出现过「命中日志正常、列表不动」。落了锚还要看一眼，不认账就重发。
+  const LOCATE_VERIFY_TRIES = 3;
+  const LOCATE_VERIFY_DELAY_MS = 380;
+  /** 核验版本：新一轮定位/离页即作废在途核验（避免旧轮次把视口拽走）。 */
+  let locateVerifyVersion = 0;
+
+  /** 目标行是否已在滚动视口内（不要求贴顶：末行等滚不上去的也视为已定位）。 */
+  function anchorRowVisible(anchorId: string): boolean {
+    const bodyEl = uni.getElementById("im-chat-body");
+    if (bodyEl == null) return false;
+    const rowEl = uni.getElementById(anchorId);
+    if (rowEl == null) return false;
+    const bodyRect = bodyEl.getBoundingClientRect();
+    const rowRect = rowEl.getBoundingClientRect();
+    if (rowRect.height <= 0) return false;
+    return rowRect.top >= bodyRect.top - 4 && rowRect.top < bodyRect.top + bodyRect.height - 24;
+  }
+
+  /** 核验 → 未落位就重设锚点，最后一次尝试走 Android 原生强制落位（其它端持续重设）。 */
+  function verifyAnchorPlaced(anchorId: string, attempt: number): void {
+    if (attempt > LOCATE_VERIFY_TRIES) return;
+    const version = locateVerifyVersion;
+    setTimeout(() => {
+      if (version != locateVerifyVersion || !isChatActive()) {
+        // 被新一轮定位/离页作废：只放掉自己的收口权，别去收别人的胶囊
+        if (version == locateVerifyVersion) {
+          locatePillAwaitVerify = false;
+        }
+        return;
+      }
+      if (anchorRowVisible(anchorId)) {
+        locatePillAwaitVerify = false;
+        endLocateLoading();
+        scheduleJumpLatestCheck(60);
+        return;
+      }
+      if (attempt >= LOCATE_VERIFY_TRIES) {
+        // 兜底：原生通道直接落位（鸿蒙/iOS/H5 返回 false，仍靠 scroll-into-view 重设）
+        forceScrollToElement("im-chat-body", anchorId);
+        locatePillAwaitVerify = false;
+        endLocateLoading();
+        scheduleJumpLatestCheck(120);
+        return;
+      }
+      scrollToAnchorWithSettle(anchorId);
+      verifyAnchorPlaced(anchorId, attempt + 1);
+    }, LOCATE_VERIFY_DELAY_MS);
+  }
 
   /** 应用待定位：滚到目标行并闪烁高亮（幂等，消费 pendingJumpId）。
    *  scrollToAnchorWithSettle 收口：揭幕 + 150ms 稳定重定位——进页首屏图片/卡片
@@ -10266,9 +10347,17 @@
     if (findMsgById(msgId) == null) {
       return;
     }
+    // 已揭幕=本页本就可见（会话内跳转）：scroll-into-view 可能被回页时序吃掉，落定后核验
+    const alreadySettled = listSettled.value == true;
     pendingJumpId = "";
     scrollToAnchorWithSettle(`msg-${msgId}`);
     flashHighlight(msgId);
+    if (alreadySettled) {
+      locateVerifyVersion += 1;
+      // 胶囊交给核验收口（落定/兜底各收一次），jumpToMsg 的 finally 不抢
+      locatePillAwaitVerify = true;
+      verifyAnchorPlaced(`msg-${msgId}`, 1);
+    }
   }
 
   /**
@@ -10304,24 +10393,20 @@
    * 语义）。直达页成为新表头时 hasMore 随之重算。
    */
   async function fetchJumpWindow(jumpSeq: number): Promise<void> {
-    const anchorId = listSettled.value && isChatActive() ? `msg-${firstVisibleRowKey().msgId}` : "";
+    // ★不装翻页锚点、也不亮顶部加载胶囊：定位是「有意离开当前位置」，保住原视口毫无
+    //   意义；而锚点守卫（Android onPreDraw 每帧按锚点内容偏移补偿，见
+    //   utils/im/imPrependAnchor.uts）与紧随其后的定位滚动同时作用于同一个原生
+    //   scroller，会话内搜索（已揭幕、isChatActive 为真）恰好命中安装条件，是
+    //   「全局搜索定位正常、会话内搜索命中却不动」的路径差异来源。进页遮蔽期
+    //   （全局搜索）本就不装，此处对齐成一律不装。
     scrollAnchor.value = "";
-    if (anchorId.length > 0) {
-      // #ifdef APP-IOS
-      engageHistoryLock();
-      // #endif
-      loadingOlder.value = true;
-    }
     try {
-      const dataObj = await chatHistoryFetcher(convId.value, jumpSeq + 1, MSG_PAGE_SIZE);
+      const dataObj = await chatHistoryFetcher(convId.value, jumpSeq + 1, JUMP_PAGE_SIZE);
       if (!isChatCurrent()) return;
       if (dataObj == null || dataObj["records"] == null) return;
       const records = dataObj["records"] as UTSJSONObject[];
       if (records.length > 0) {
         const headSeqBefore = messages.value.length > 0 ? messages.value[0].seq : 0;
-        if (anchorId.length > 0) {
-          engagePrependAnchor(anchorId);
-        }
         mergeSyncedMessages(records);
         if (messages.value.length > 0 && messages.value[0].seq < headSeqBefore) {
           hasMore.value = readBool(dataObj, "hasMore");
@@ -10329,11 +10414,7 @@
         refreshReadStatus();
       }
     } catch (_error) {
-      // #ifdef APP-IOS
-      releaseHistoryLock("error");
-      // #endif
-    } finally {
-      loadingOlder.value = false;
+      // 取页失败不额外处理：下文按「未命中」收口（miss 分支给提示并贴底揭幕）
     }
   }
 
@@ -10369,8 +10450,9 @@
 
   /**
    * 定位到某条消息：
-   * ① 带 seq（搜索跳转/引用定位）：fetchJumpWindow 一发直达；未命中不再回翻——
-   *   比 seq 更早的页不可能包含它（已被清删/过滤）。
+   * ① 带 seq（搜索跳转/引用定位）：fetchJumpWindow 一发直达；未命中先用 msgDetail 的
+   *   权威 seq 补一发（见下方注释），仍不中才放弃——比 seq 更早的页不可能包含它
+   *   （已被清删/按人删除过滤），不再逐页回翻。
    * ② 无 seq（旧载荷）：先按 msgId 换出 seq（resolveJumpSeqByMsgId）仍走一发直达；
    *   换不到（详情失败/已删）才退回尾窗向上连续翻页（最多 15 页）。
    * ★滚动/高亮不在本函数直接做：emit 时本页还被 quote-detail 盖着，隐藏状态下
@@ -10378,20 +10460,45 @@
    */
   async function jumpToMsg(msgId: string, jumpSeq: number): Promise<void> {
     entryFollowLatest = false;
+    // ★关掉「贴底跟随」（PC 同款：ChatWindow 兑现 focusRequest 时先
+    // stickToBottomRef=false）。不关的话：跳转期间/刚落到目标后只要有新消息进来，
+    // 贴底态（此刻还没被 checkJumpLatest 校准，仍是用户跳转前在底部的 true）
+    // 就会立刻把列表拽回最新 —— 用户看到的就是「点了搜索命中，结果停在新消息」。
+    nearChatBottom.value = false;
     cancelSettle();
+    // 新一轮定位作废在途核验（上一轮的重设会把视口拽回旧目标）
+    locateVerifyVersion += 1;
     jumpLocating = true;
-    // 遮蔽期定位：列表全白，先挂等待遮罩（揭幕即收，见 listSettled watch）
+    // 等待反馈：遮蔽期=铺满遮罩（揭幕即收），会话内=居中轻量胶囊（落定核验收口）
     beginLocateLoading();
     try {
       let targetSeq = jumpSeq;
+      /** targetSeq 是否来自 msgDetail：换过就用的是权威值，不再重复问一次详情。 */
+      let seqFromDetail = false;
       if (findMsgById(msgId) == null) {
         if (targetSeq <= 0) {
           targetSeq = await resolveJumpSeqByMsgId(msgId);
+          seqFromDetail = true;
           if (!isChatCurrent()) return;
         }
         if (targetSeq > 0) {
           await fetchJumpWindow(targetSeq);
           if (!isChatCurrent()) return;
+        }
+        // ★直达页未命中补一发：搜索载荷的 seq 来自 ES 索引，可能与库内 seq 不一致
+        //  （索引滞后/消息编辑后重建索引），也可能这一发请求偶发失败（fetchJumpWindow
+        //  内部吞异常只 return）。这两种都会表现为「有时定位准、有时直接停在最新」。
+        //  用 msgDetail 的权威 seq 再走一次直达：seq 变了按新值重取，没变即同 seq 重发。
+        if (findMsgById(msgId) == null && !seqFromDetail) {
+          const authoritativeSeq = await resolveJumpSeqByMsgId(msgId);
+          if (!isChatCurrent()) return;
+          if (authoritativeSeq > 0) {
+            targetSeq = authoritativeSeq;
+          }
+          if (targetSeq > 0) {
+            await fetchJumpWindow(targetSeq);
+            if (!isChatCurrent()) return;
+          }
         }
       }
       if (findMsgById(msgId) == null && targetSeq <= 0) {
@@ -10433,7 +10540,26 @@
       }
     } finally {
       jumpLocating = false;
+      // 没走到「落定核验」（未命中/未应用/列表不可见）时胶囊没有别人收，这里收；
+      // 有核验在跑就交给它（落定或兜底那一拍才收，别在滚动前就把「定位中」撤掉）
+      if (!locatePillAwaitVerify) {
+        endLocateLoading();
+      }
     }
+  }
+
+  /** 本页是否当前栈顶页：emit 跳转事件的源头（会话内搜索 / Pin 页 / 引用详情）发完事件
+   *  紧跟着 navigateBack，此刻本页还被它盖着——立即取页定位会走空（见 onJumpEvent）。 */
+  function isChatTopPage(): boolean {
+    const pages = getCurrentPages();
+    if (pages.length == 0) {
+      return false;
+    }
+    const top = pages[pages.length - 1];
+    if (top == null) {
+      return false;
+    }
+    return `${top.route}`.indexOf("/pages/message/chat") >= 0;
   }
 
   /** 引用详情页 emit 的跳转事件（payload = "msgId|seq"，seq 供直达取页；旧载荷裸 msgId 兼容）。 */
@@ -10454,7 +10580,19 @@
       return;
     }
     pendingJumpId = msgId;
-    jumpToMsg(msgId, seq);
+    pendingJumpSeq = seq;
+    // ★不在事件里立即取页：emit 方（会话内搜索 / Pin / 引用详情）紧跟着 navigateBack，
+    //   此刻本页仍被它盖着。此时跑 jumpToMsg：scroll-into-view 不生效（页面不可见），
+    //   而 pendingJumpId 又在 applyPendingJump 里被提前消费 —— 用户回到页面后仍是原位置，
+    //   表现就是「点了搜索结果没定位」。统一交给 onShow（页面真正可见）再跑，与全局搜索
+    //   「进页后定位」同构。
+    if (isChatTopPage()) {
+      // 非常规路径：事件来自已可见的本页（无返回动作可等）
+      pendingJumpAwaitShow = false;
+      jumpToMsg(msgId, seq);
+      return;
+    }
+    pendingJumpAwaitShow = true;
   }
 
   // ===== 按住说话全屏蒙层（liveAsr 三阶段状态机）=====
@@ -13035,7 +13173,16 @@
     //   不拽走阅读位置（微信式不打扰），靠右下角「回到底部」浮钮回最新；
     //   未读定位翻页中同样不拽（nearChatBottom 初值 true 未校准，拽了会中途
     //   掀遮蔽揭到底部）——定位落定后贴底态由 checkJumpLatest 校准照常接管
-    if (isChatActive() && autoScroll && !unreadLocating && insertAt >= rows.length - 1 && nearChatBottom.value) {
+    //   ★jumpLocating 一并拦（PC stickToBottomRef 同款语义）：定位窗内到达的新消息
+    //   绝不能拽底，否则取页那 ~450ms 里来一条就把定位覆盖掉
+    if (
+      isChatActive() &&
+      autoScroll &&
+      !unreadLocating &&
+      !jumpLocating &&
+      insertAt >= rows.length - 1 &&
+      nearChatBottom.value
+    ) {
       scrollToBottom();
     }
     // 上报已读
@@ -13789,6 +13936,9 @@
       const jumpSeqNum = isNaN(parsedJumpSeq) || parsedJumpSeq <= 0 ? 0 : Math.floor(parsedJumpSeq);
       if (jumpMsgId.length > 0) {
         pendingJumpId = jumpMsgId;
+        // 进页参数路径自带 seq 且由 initHistory 直接驱动定位，不走 onShow 重放分支
+        pendingJumpSeq = jumpSeqNum;
+        pendingJumpAwaitShow = false;
       }
       initHistory().then((): void => {
         if (jumpMsgId.length > 0) {
@@ -14054,9 +14204,15 @@
     if (pendingJumpId.length == 0) {
       return;
     }
-    // 从 quote-detail 返回本页后再滚动定位并闪烁（延迟一拍等页面切换完成）
+    // 从 quote-detail / 会话内搜索 / Pin 页返回本页后再取页定位并闪烁（延迟一拍等页面切换完成）
     setTimeout(() => {
       if (!isChatActive()) return;
+      if (pendingJumpAwaitShow) {
+        // onJumpEvent 登记的目标：此刻页面才真正可见，跑完整定位（直达取页 + 滚动）
+        pendingJumpAwaitShow = false;
+        jumpToMsg(pendingJumpId, pendingJumpSeq);
+        return;
+      }
       applyPendingJump();
     }, 100);
   });
@@ -14075,6 +14231,8 @@
     releaseHistoryLock("hide");
     // #endif
     pageVisible = false;
+    // 离页作废在途定位核验（回来时由新一轮 jumpToMsg 重新核验）
+    locateVerifyVersion += 1;
     // 进子页停语音/视频播放（微信同款：离开聊天即停；视频只暂停不清首帧）；
     // 息屏/锁屏/切后台不停语音——判后台放行续播，见 stopChatAudioOnHideIfNeeded
     stopChatAudioOnHideIfNeeded();

@@ -59,11 +59,11 @@
       <view class="atp__transcript-card">
         <template v-if="segments.length > 0">
           <view
-            v-for="seg in segments"
+            v-for="(seg, transcriptIndex) in segments"
             :key="seg.seq"
             :id="'seg-' + seg.seq.toString()"
             :class="['atp__seg', isActiveSegment(seg) ? 'atp__seg--active' : '']"
-            @click="handleSegmentClick(seg)"
+            @click="handleSegmentClick(transcriptIndex)"
           >
             <!-- 时间线轨道 -->
             <view class="atp__seg-rail">
@@ -73,7 +73,7 @@
             <view class="atp__seg-body">
               <view class="atp__seg-head">
                 <text class="atp__seg-speaker">{{ speakerLabel(seg) }}</text>
-                <text v-if="hasValidTime(seg)" :class="['atp__seg-time', isActiveSegment(seg) ? 'atp__seg-time--active' : '']">{{ formatMs(seg.startMs) }}</text>
+                <text v-if="transcriptTimeMs(transcriptIndex) >= 0" :class="['atp__seg-time', isActiveSegment(seg) ? 'atp__seg-time--active' : '']">{{ formatMs(transcriptTimeMs(transcriptIndex)) }}</text>
               </view>
               <text class="atp__seg-text">{{ seg.text }}</text>
             </view>
@@ -94,6 +94,7 @@
   import { apiResCode, apiResData } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { AudioTranscriptSegment } from "./types.uts";
+  import { mapMonitoringTranscriptSegments } from "@/utils/voxTranscriptTimeline";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -175,9 +176,11 @@
   class SegRuntime {
     audioUrl: string = "";
     durationMs: number = 0;
-    constructor(audioUrl: string = "", durationMs: number = 0) {
+    startedAt: string = "";
+    constructor(audioUrl: string = "", durationMs: number = 0, startedAt: string = "") {
       this.audioUrl = audioUrl;
       this.durationMs = durationMs;
+      this.startedAt = startedAt;
     }
   }
   let audioSegments: SegRuntime[] = [] as SegRuntime[];
@@ -191,7 +194,7 @@
   /** 段有效时长结束前提前切段，跳过预签名音频尾部静音 */
   const SEGMENT_TAIL_CUT_MS: number = 250;
   /** 监控转写分段的音频段归属（与 props.segments 同长，值=音频段下标）；会议不使用 */
-  let segIndexOfTranscript: number[] = [] as number[];
+  const segIndexOfTranscript = ref<number[]>([] as number[]);
 
   /** 全部音频段有效时长合计（接口 durationMs 权威，多段时覆盖详情时长） */
   const segmentsTotalMs = (): number => {
@@ -304,14 +307,12 @@
     const monitoringMultiSeg =
       props.recordType == "monitoring" && audioSegments.length > 1;
     // 监控多段：把全局时间换算为当前段段内偏移，且只匹配属于当前段的转写句
-    const matchMs = monitoringMultiSeg
-      ? Math.max(0, ms - segBaseMs)
-      : ms;
-    const matchSeg = monitoringMultiSeg ? currentSegIndex : -1;
+    const matchMs = monitoringMultiSeg ? segmentOffsetMs(ms) : ms;
+    const matchSeg = monitoringMultiSeg ? locateSegment(ms) : -1;
     let result = -1;
     for (let i = 0; i < list.length; i++) {
       if (!hasValidTime(list[i])) continue;
-      if (monitoringMultiSeg && segIndexOfTranscript[i] != matchSeg) continue;
+      if (monitoringMultiSeg && segIndexOfTranscript.value[i] != matchSeg) continue;
       if (list[i].startMs <= matchMs) {
         result = list[i].seq;
       }
@@ -321,39 +322,30 @@
 
   /**
    * 预计算监控转写句的音频段归属（segIndexOfTranscript）。
-   * 接口口径：segments 按顺序依次属于各音频分段（与 audio-files 的
-   * segmentIndex 顺序对应），每句 startMs 相对其所在段起点。这里顺序装段：
-   * 依序装入当前段，直到某句 startMs 超出当前段有效时长则归入下一段。
-   * total=1（无卡现状）全部归段 0，与旧行为一致。
+   * 两个接口的 startedAt 同为所属音频段的采集起点，用它精确关联；
+   * startMs 相对段起点，跨段会归零，不能据此按时长装段。
    */
   const rebuildTranscriptSegIndex = () => {
-    const n = props.segments.length;
-    const result = [] as number[];
-    if (audioSegments.length <= 1) {
-      for (let i = 0; i < n; i++) {
-        result.push(0);
-      }
-      segIndexOfTranscript = result;
-      return;
+    const transcriptStarts = [] as string[];
+    const audioStarts = [] as string[];
+    for (let i = 0; i < props.segments.length; i++) {
+      transcriptStarts.push(props.segments[i].startedAt);
     }
-    let seg = 0;
-    for (let i = 0; i < n; i++) {
-      const item = props.segments[i];
-      if (!hasValidTime(item)) {
-        result.push(seg);
-        continue;
-      }
-      const s = item.startMs;
-      // 超出当前段有效时长（留 1ms 边界）则前进到能容纳它的段
-      while (
-        seg < audioSegments.length - 1 &&
-        s >= audioSegments[seg].durationMs - 1
-      ) {
-        seg++;
-      }
-      result.push(seg);
+    for (let i = 0; i < audioSegments.length; i++) {
+      audioStarts.push(audioSegments[i].startedAt);
     }
-    segIndexOfTranscript = result;
+    segIndexOfTranscript.value = mapMonitoringTranscriptSegments(transcriptStarts, audioStarts);
+  };
+
+  /** 节点时间、点击跳转统一使用与播放条相同的全局时间。 */
+  const transcriptTimeMs = (index: number): number => {
+    if (index < 0 || index >= props.segments.length) return -1;
+    const start = props.segments[index].startMs;
+    if (start < 0) return -1;
+    if (props.recordType != "monitoring" || audioSegments.length <= 1) return start;
+    const audioIndex = segIndexOfTranscript.value[index];
+    if (audioIndex == null || audioIndex < 0 || audioIndex >= audioSegments.length) return -1;
+    return segmentBaseMs(audioIndex) + start;
   };
 
   /** 刷新高亮，并在跟随开启且可见时滚到当前句 */
@@ -533,7 +525,7 @@
     seekGuardTargetMs = -1;
     seekGuardUntilMs = 0;
     audioSegments = [] as SegRuntime[];
-    segIndexOfTranscript = [] as number[];
+    segIndexOfTranscript.value = [] as number[];
     currentSegIndex = -1;
     segBaseMs = 0;
     switchingSeg = false;
@@ -604,7 +596,8 @@
           segs[j] = segs[j - 1];
           segIdx[j] = segIdx[j - 1];
         }
-        segs[pos] = new SegRuntime(url, durMs);
+        const startedAt = it["startedAt"] != null ? `${it["startedAt"]}` : "";
+        segs[pos] = new SegRuntime(url, durMs, startedAt);
         segIdx[pos] = order;
       }
       audioSegments = segs;
@@ -760,24 +753,10 @@
     sliderDragging.value = false;
   };
 
-  const handleSegmentClick = (seg: AudioTranscriptSegment) => {
-    if (!resolvedHasAudio.value || !hasValidTime(seg)) return;
+  const handleSegmentClick = (index: number) => {
+    const targetMs = transcriptTimeMs(index);
+    if (!resolvedHasAudio.value || targetMs < 0) return;
     enableFollowTranscript();
-    let targetMs = seg.startMs;
-    if (props.recordType == "monitoring" && audioSegments.length > 1) {
-      let segIdx = -1;
-      for (let i = 0; i < props.segments.length; i++) {
-        if (props.segments[i].seq == seg.seq) {
-          if (i < segIndexOfTranscript.length) {
-            segIdx = segIndexOfTranscript[i];
-          }
-          break;
-        }
-      }
-      if (segIdx >= 0 && segIdx < audioSegments.length) {
-        targetMs = segmentBaseMs(segIdx) + seg.startMs;
-      }
-    }
     seekToMs(targetMs);
     // #ifdef APP
     if (!playing.value) {
@@ -808,6 +787,14 @@
       if (props.meetingId > 0) {
         initAudio(props.autoplay);
       }
+    },
+  );
+
+  watch(
+    (): AudioTranscriptSegment[] => props.segments,
+    (_segments: AudioTranscriptSegment[]) => {
+      rebuildTranscriptSegIndex();
+      syncActiveFromTime(currentTimeMs.value, false);
     },
   );
 

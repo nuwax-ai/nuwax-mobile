@@ -1,0 +1,318 @@
+// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { apiImDeviceRegister } from "@/servers/im";
+// #ifdef APP-HARMONY
+// ★勿改成 @kit.NotificationKit 具名导入：基座 JS 运行时模块表不提供 notificationManager
+//   具名导出（SyntaxError，2026-10-22 真机实锤），必须默认导入（官方 runtime 同款）。
+import notificationManager from "@ohos.notificationManager";
+// #endif
+// #ifdef APP-ANDROID
+import Build from "android.os.Build";
+// #endif
+
+/**
+ * uni-push 2.0 客户端（离线推送）：cid 获取/上报 + 通知点击进会话。
+ *
+ * 分工：
+ * - cid 获取：uni.getPushClientId() → 落 storage + 模块缓存
+ * - cid 上报：走现有 POST /api/instant-message/devices 的 pushToken 字段（后端 DEV-422 已接受并落库，
+ *   与 Web Push endpoint 共用 push_token 列）——不新增接口
+ * - 离线发送：后端取设备 pushToken(cid) 调 uniCloud 云函数 push-send，由 DCloud 转厂商通道
+ *   （后端不接触华为服务账号密钥）
+ * - 点击通知：onPushMessage(type=click) → 按 payload.convId/convType 打开会话
+ *
+ * 平台范围：Android / iOS / 鸿蒙（manifest 三端均已勾 uni-push 模块）。未勾模块的平台
+ * 调用会失败，故整文件条件编译，调用点同样条件编译。
+ *
+ * ★失败一律静默：标准基座、未开通 uni-push、厂商通道未配置、用户拒授权时
+ * getPushClientId 都会失败，绝不能影响启动与 IM 主链路。
+ */
+
+/** cid 本地缓存键（跨启动复用，冷启动页面栈未就绪时也能带 cid 注册设备）。 */
+const PUSH_CID_STORAGE_KEY = "im_push_client_id";
+/** 点击通知首次延迟：冷启动时登录态/页面栈尚未就绪（原生事件栈不补绘帧，见 harmony 三修记忆）。 */
+const PUSH_CLICK_NAV_DELAY_MS = 300;
+/** 页面栈/启动页未就绪时最长重试次数（每次 300ms，合计约 6s）。 */
+const PUSH_CLICK_NAV_MAX_RETRY = 20;
+/** 冷启动中转页：它的 onReady 会 reLaunch 到主 Tab，此期间跳会话会被冲掉，需等它走完。 */
+const LAUNCH_PAGE_ROUTE = "pages/launch/launch";
+/** 登录页：未登录时跳过去，此时不跳会话（登录后落首页，会话上下文已无意义）。 */
+const LOGIN_PAGE_ROUTE = "subpackages/pages/login/login";
+
+/** 防重复绑定（App 生命周期内只绑一次）。 */
+let pushBound = false;
+/** cid 模块缓存（空 = 尚未取到）。 */
+let cachedPushCid = "";
+
+/** 当前 uni-push cid（空 = 未取到：标准基座/未开通/未授权）。 */
+export function getImPushCid(): string {
+  if (cachedPushCid.length > 0) {
+    return cachedPushCid;
+  }
+  try {
+    const raw = uni.getStorageSync(PUSH_CID_STORAGE_KEY);
+    if (raw != null && typeof raw == "string") {
+      cachedPushCid = `${raw}`;
+    }
+  } catch (_e) {
+    // storage 异常：保持空，不影响注册
+  }
+  return cachedPushCid;
+}
+
+/**
+ * 绑定推送消息监听（App.uvue onLaunch 调，幂等）。
+ * receive 不处理：前台由 WS 消息链路负责，后台进程被系统挂起，离线触达由系统通知栏展示。
+ */
+export function bindImPushClient(): void {
+  if (pushBound) {
+    return;
+  }
+  pushBound = true;
+  // ★ 云打包开关：uni-app x 按「代码用到的 API」自动引入 uni-push 模块，DCloud 后台未开通
+  //   uni-push 2.0 时云打包会报「使用了 uni-push 模块但尚未开通」——此时把下面 try 块注释掉
+  //   并从 manifest 移除 uni-push 模块即可（本地自定义基座不受影响）。
+  try {
+    uni.onPushMessage((res: OnPushMessageCallbackResult): void => {
+      if (res.type != "click") {
+        return;
+      }
+      const payload = res.data;
+      if (payload == null) {
+        return;
+      }
+      const convId = pushField(payload, "convId");
+      if (convId.length == 0) {
+        // 无会话参数的推送（如系统公告）交给默认行为：仅拉起 App
+        return;
+      }
+      openConvWithRetry(
+        convId,
+        pushField(payload, "convType"),
+        pushField(payload, "name"),
+        pushField(payload, "avatar"),
+        0,
+      );
+    });
+  } catch (e) {
+    console.error("[ImPush] onPushMessage bind fail:", e);
+  }
+}
+
+/** 取 cid 并上报（App.uvue onLaunch 调；fail 只落日志，不重试不弹窗）。 */
+export function syncImPushClientId(): void {
+  // #ifdef APP-ANDROID
+  // 通知授权：Android 13+ 运行时权限，离线推送要靠它才展示
+  ensureAndroidNotifyPermission();
+  // #endif
+  // #ifdef APP-HARMONY
+  // 通知授权：离线推送到达后要靠它才能展示。原 utils/imHarmonyNotify.uts 已删，
+  // 授权申请是它唯一还需要保留的能力，迁到这里。
+  ensureHarmonyNotifyPermission();
+  // #endif
+  // ★ 云打包开关：同 bindImPushClient。
+  try {
+    uni.getPushClientId({
+      success: (res: GetPushClientIdSuccess): void => {
+        applyPushCid(res.cid);
+      },
+      fail: (err: UniError): void => {
+        // 常见原因：基座未含 uni-push 模块 / uni-push 未开通 / 厂商通道未配置 / 通知未授权
+        console.error(`[ImPush] getPushClientId fail: ${err.errMsg}`);
+      },
+    });
+  } catch (e) {
+    console.error("[ImPush] getPushClientId threw:", e);
+  }
+}
+
+// #ifdef APP-ANDROID
+/** 授权申请只做一次（Android 系统弹窗在「拒绝」后可再次弹，但没必要反复打扰）。 */
+let androidNotifyPermissionRequested = false;
+
+/**
+ * Android 13+（API 33）通知运行时权限。
+ * ★只在清单里声明 POST_NOTIFICATIONS 不会弹窗：用户不授权 → 通知被系统静默丢弃，
+ *   而后端拿到的 pushEnabled 仍是 true，问题极难定位。必须在 onLaunch 主动申请。
+ * Android 12 及以下没有该权限，直接跳过（老版本通知默认开启）。
+ */
+function ensureAndroidNotifyPermission(attempt: number = 0): void {
+  if (androidNotifyPermissionRequested) {
+    return;
+  }
+  try {
+    if (Build.VERSION.SDK_INT < 33) {
+      androidNotifyPermissionRequested = true;
+      return;
+    }
+    const activity = UTSAndroid.getUniActivity();
+    if (activity == null) {
+      // onLaunch 早期 Activity 可能尚未就绪：延后重试，别把唯一一次申请机会丢掉
+      if (attempt < 6) {
+        setTimeout((): void => {
+          ensureAndroidNotifyPermission(attempt + 1);
+        }, 500);
+      }
+      return;
+    }
+    androidNotifyPermissionRequested = true;
+    const permissions = ["android.permission.POST_NOTIFICATIONS"] as string[];
+    if (UTSAndroid.checkSystemPermissionGranted(activity, permissions)) {
+      return;
+    }
+    UTSAndroid.requestSystemPermission(
+      activity,
+      permissions,
+      (allGranted: boolean, _granted: string[]): void => {
+        console.error(`[ImPush][android] notification permission granted=${allGranted}`);
+      },
+      (_doNotAskAgain: boolean, _denied: string[]): void => {
+        // 拒绝：不阻塞启动，推送到达后系统静默丢弃，等用户去设置手动开
+        console.error("[ImPush][android] notification permission denied");
+      },
+    );
+  } catch (e) {
+    console.error("[ImPush][android] ensureAndroidNotifyPermission threw:", e);
+  }
+}
+// #endif
+
+// #ifdef APP-HARMONY
+/** 授权申请只做一次（App 生命周期内；系统弹窗本来也只弹一次）。 */
+let notifyPermissionRequested = false;
+
+/**
+ * 鸿蒙通知授权：未授权则弹系统窗，已授权/被拒都静默（被拒只能去设置手动开）。
+ * 必须在 onLaunch 前台时机调——鸿蒙系统弹窗每应用只弹一次，错过就只能引导设置页。
+ */
+function ensureHarmonyNotifyPermission(): void {
+  if (notifyPermissionRequested) {
+    return;
+  }
+  notifyPermissionRequested = true;
+  try {
+    const context = UTSHarmony.getUIAbilityContext();
+    notificationManager
+      .isNotificationEnabled()
+      .then((enabled: boolean): void => {
+        if (enabled) {
+          console.error("[ImPush][hm] notification already enabled");
+          return;
+        }
+        notificationManager
+          .requestEnableNotification(context)
+          .then((): void => {
+            console.error("[ImPush][hm] notification granted");
+          })
+          .catch((_e: any | null): void => {
+            // 拒绝/弹窗已用尽：不阻塞启动，推送到时系统仍会静默丢弃
+            console.error("[ImPush][hm] notification disabled (user declined?)");
+          });
+      })
+      .catch((_e: any | null): void => {
+        console.error("[ImPush][hm] isNotificationEnabled fail");
+      });
+  } catch (e) {
+    console.error("[ImPush][hm] ensureHarmonyNotifyPermission threw:", e);
+  }
+}
+// #endif
+
+/** cid 落地：变化才重报；未登录跳过（CONNECT_ACK 设备注册会带上缓存的 cid）。 */
+function applyPushCid(cid: string): void {
+  if (cid.length == 0) {
+    return;
+  }
+  const previous = getImPushCid();
+  cachedPushCid = cid;
+  try {
+    uni.setStorageSync(PUSH_CID_STORAGE_KEY, cid);
+  } catch (_e) {
+    // 落盘失败仅影响下次冷启动提前带 cid，不影响本次上报
+  }
+  if (cid == previous) {
+    return;
+  }
+  if (isLoggedIn()) {
+    reportPushCid(cid);
+  }
+}
+
+/** 登录态判定：Bearer token 非空（与 authSession 的 storage 口径一致）。 */
+function isLoggedIn(): boolean {
+  try {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    return tokenRaw != null && `${tokenRaw}`.length > 0;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/** 单独上报（设备注册 UPSERT 幂等，重复调无副作用）。 */
+async function reportPushCid(cid: string): Promise<void> {
+  try {
+    await apiImDeviceRegister(cid);
+  } catch (_e) {
+    // 网络失败：下次 CONNECT_ACK 的设备注册会带缓存 cid 补报
+  }
+}
+
+/** 推送 payload 取值统一转字符串（数字 convType 也能转）。 */
+function pushField(payload: UTSJSONObject, key: string): string {
+  const value = payload[key];
+  if (value == null) {
+    return "";
+  }
+  return `${value}`;
+}
+
+/**
+ * 点击通知打开会话：等页面栈与登录态就绪后再跳。
+ * - 未登录直接丢弃：登录流程会落首页，此时续跳会话无意义（且可能撞未授权接口）
+ * - 页面栈为空 / 栈顶是冷启动中转页（pages/launch/launch）：此时跳转会被它随后的
+ *   reLaunch 冲掉，必须等它落到主 Tab 再跳（最多等 6s）
+ * - 栈顶已是会话页 → redirectTo 换会话，不堆叠重页（chat 页实例很重）
+ */
+function openConvWithRetry(
+  convId: string,
+  convType: string,
+  name: string,
+  avatar: string,
+  attempt: number,
+): void {
+  setTimeout((): void => {
+    if (!isLoggedIn()) {
+      console.error("[ImPush] click dropped: not logged in");
+      return;
+    }
+    const pages = getCurrentPages();
+    const top = pages.length > 0 ? pages[pages.length - 1] : null;
+    const topRoute = top != null ? `${top.route}` : "";
+    const notReady = pages.length == 0 || topRoute == LAUNCH_PAGE_ROUTE || topRoute == LOGIN_PAGE_ROUTE;
+    if (notReady && attempt < PUSH_CLICK_NAV_MAX_RETRY) {
+      openConvWithRetry(convId, convType, name, avatar, attempt + 1);
+      return;
+    }
+    if (topRoute == LOGIN_PAGE_ROUTE) {
+      console.error("[ImPush] click dropped: still on login page");
+      return;
+    }
+    const type = convType.length > 0 ? convType : "1";
+    let url = `/pages/message/chat?convId=${encodeURIComponent(convId)}&convType=${type}`;
+    if (name.length > 0) {
+      url += `&name=${encodeURIComponent(name)}`;
+    }
+    if (avatar.length > 0) {
+      url += `&avatar=${encodeURIComponent(avatar)}`;
+    }
+    const failHandler = (_err: any): void => {
+      // 冷启动落在启动页/登录跳转中：navigateTo 可能失败，不再重试（避免重复开页）
+    };
+    if (topRoute == "pages/message/chat") {
+      uni.redirectTo({ url: url, fail: failHandler });
+      return;
+    }
+    uni.navigateTo({ url: url, fail: failHandler });
+  }, attempt == 0 ? PUSH_CLICK_NAV_DELAY_MS : 300);
+}
+// #endif

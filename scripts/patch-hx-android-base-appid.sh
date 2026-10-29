@@ -10,6 +10,8 @@ HX_ROOT="${HX_APP_ROOT:-/Applications/HBuilderX.app/Contents/HBuilderX}"
 TARGET="$HX_ROOT/plugins/launcher/out/main.js"
 OLD='getZipEntriesFile)(t,"manifest.json")'
 NEW='getZipEntriesFile)(t,"/www/manifest.json")'
+# HBuilderX 5.26+ 上游已自行收窄为 www/manifest.json（无前导斜杠），无需补丁
+UPSTREAM='getZipEntriesFile)(t,"www/manifest.json")'
 
 if [[ ! -f "$TARGET" ]]; then
   echo "未找到 HBuilderX 启动器: $TARGET" >&2
@@ -18,6 +20,11 @@ fi
 
 if grep -qF "$NEW" "$TARGET"; then
   # 已打过补丁；若仍弹「未检测到应用资源」，多为 HX 主进程未重启或未走自定义基座完整运行
+  exit 0
+fi
+
+if grep -qF "$UPSTREAM" "$TARGET"; then
+  # 上游已修复，无需也无法再打补丁
   exit 0
 fi
 

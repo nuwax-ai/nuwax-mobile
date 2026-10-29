@@ -10,6 +10,14 @@ import { t } from "@/utils/i18n";
 // 模块内均为顶层函数声明、无初始化期交叉取值，安全
 import { isWorkCommercialBlockedSync } from "@/utils/workCommercial";
 import { isAppWebViewEmbedded, isIosAppWebView } from "@/utils/appWebViewDetect";
+// 文档链接预览：仅函数体内调用（模块间是既有环：authProtectedFileUrl → system 的
+// jumpToFilePreviewPage；与 useRequest→system 同构，无初始化期交叉取值）
+import { urlExtOf } from "@/utils/imChatAttachments";
+import {
+  fetchAuthProtectedFileAkUrl,
+  isAuthProtectedFileUrl,
+  resolveAuthProtectedFileFetchUrl,
+} from "@/utils/authProtectedFileUrl";
 import type { TenantConfigInfo } from "@/types/interfaces/login";
 
 /**
@@ -475,6 +483,81 @@ export function openExternalLinkPage(href: string, title: string = ""): boolean 
   return true;
 }
 
+/** 平台预览网关（/static/file-preview.html）能渲染的文档后缀：pdf/docx/xlsx/pptx。
+ *  口径同会话文件页预览按钮（components/im-file-pane/gf-models.uts PREVIEWABLE_EXTS）
+ *  的文档子集——doc/xls/ppt 老二进制格式网关归一成新格式后必然报错，不在此列。 */
+const DOC_PREVIEW_EXTS: string[] = ["pdf", "docx", "xlsx", "pptx"];
+
+/** 站内 webview 页路由（与 im-group-files 预览、外链页同一页面）。 */
+const WEBVIEW_PAGE_PATH_FOR_FILE = "/subpackages/pages/webview/webview";
+
+/** URL 末段后缀是否在文档预览白名单内。 */
+function isDocPreviewExtUrl(url: string): boolean {
+  const ext = urlExtOf(url);
+  return ext.length > 0 && DOC_PREVIEW_EXTS.indexOf(ext) >= 0;
+}
+
+/** 预览网关只在页面里 fetch(fileUrl) 取字节（见平台 static/file-preview/file-preview.js），
+ *  跨域取不到（第三方域名没有 CORS 放行），所以只接手自己的文件：受保护 /api/f/
+ *  或站内域名；第三方域名的文档交给原逻辑（webview / 下载）。 */
+function isOwnFileUrl(url: string): boolean {
+  if (isAuthProtectedFileUrl(url)) {
+    return true;
+  }
+  // 站内相对路径（/api/...、/static/...）本身就是同源
+  if (url.indexOf("/") == 0 && url.indexOf("//") != 0) {
+    return true;
+  }
+  const base = getApiBaseUrl();
+  return base.length > 0 && (url == base || url.indexOf(`${base}/`) == 0);
+}
+
+/** 用站内 webview 页打开（App：noTicket=1 不拼登录态给网关页、hideShare=1 纯预览；
+ *  其余平台没有该页，统一走外链页——H5 内嵌时由承载页 postMessage 转原生打开，
+ *  浏览器/小程序同各自既有外链通路，与其它外链点击行为一致）。 */
+function openGatewayWebviewPage(gatewayUrl: string, title: string): void {
+  // #ifdef APP
+  let pageUrl =
+    `${WEBVIEW_PAGE_PATH_FOR_FILE}?url=${encodeURIComponent(gatewayUrl)}` +
+    `&noTicket=1&hideShare=1`;
+  if (title.length > 0) {
+    pageUrl = `${pageUrl}&title=${encodeURIComponent(title)}`;
+  }
+  uni.navigateTo({ url: pageUrl });
+  // #endif
+  // #ifndef APP
+  openExternalLinkPage(gatewayUrl, title);
+  // #endif
+}
+
+/**
+ * 文档链接（pdf/docx/xlsx/pptx，且是站内/受保护文件）走平台预览网关 webview：
+ * 裸 webview 加载 PDF 在 Android 渲不出、docx 更无从渲染，网关页才是统一渲染面
+ * （会话文件页「预览」按钮同一条通路）。返回 true=已接管（换 ak 是异步的，也在内部完成）。
+ * 受保护 /api/f/ 先换 ak 匿名直链——webview 带不了 Bearer。
+ */
+export function openDocPreviewLinkPage(url: string, title: string = ""): boolean {
+  if (!isDocPreviewExtUrl(url) || !isOwnFileUrl(url)) {
+    return false;
+  }
+  const gateway = `${getApiBaseUrl()}/static/file-preview.html?fileUrl=`;
+  if (!isAuthProtectedFileUrl(url)) {
+    openGatewayWebviewPage(`${gateway}${encodeURIComponent(resolveAuthProtectedFileFetchUrl(url))}`, title);
+    return true;
+  }
+  uni.showLoading({ title: "" });
+  fetchAuthProtectedFileAkUrl(url)
+    .then((akUrl: string) => {
+      uni.hideLoading();
+      openGatewayWebviewPage(`${gateway}${encodeURIComponent(akUrl)}`, title);
+    })
+    .catch((_e: any | null) => {
+      uni.hideLoading();
+      uni.showToast({ title: t("Mobile.Link.openFailed"), icon: "none" });
+    });
+  return true;
+}
+
 /** 站内资料库路径（/repo 或 /repo/…；绝对地址仅认站内域名，归一化同 openNativeHomeChatLink）。 */
 function isRepoScopeLink(rawUrl: string): boolean {
   if (rawUrl == null || rawUrl.length == 0) {
@@ -547,6 +630,12 @@ export function handleExternalLink(url: string, title: string = ""): void {
   // 因无 cookie 登录态被 IM 接口弹「token 无效或已过期」（iOS 维持 webview 流，见
   // openNativeHomeChatLink 注释）
   if (openNativeHomeChatLink(url)) {
+    return;
+  }
+
+  // 自己的文档（pdf/docx/xlsx/pptx）→ 平台预览网关 webview（见 openDocPreviewLinkPage）：
+  // 聊天正文/智能体回答/智能体详情的 markdown 链接都汇到本函数，一处接全端生效
+  if (openDocPreviewLinkPage(url, title)) {
     return;
   }
 

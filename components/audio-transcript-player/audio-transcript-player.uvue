@@ -2,7 +2,7 @@
   <!-- 音频转写播放器：会议 / 监控列表共用（播放条 + 转写分段同步高亮 / 点击跳转） -->
   <view class="atp flex flex-col">
     <!-- 播放器 -->
-    <view v-if="showPlayer && hasAudio && resolvedHasAudio" class="atp__player">
+    <view v-if="showPlayer && resolvedHasAudio" class="atp__player">
       <!-- 主行：播放按钮（带声波动效）+ 进度 + 倍速 -->
       <view class="atp__player-main">
         <view class="atp__play-btn" hover-class="atp__play-btn--active" @click="handlePlayToggle">
@@ -59,11 +59,11 @@
       <view class="atp__transcript-card">
         <template v-if="segments.length > 0">
           <view
-            v-for="seg in segments"
+            v-for="(seg, transcriptIndex) in segments"
             :key="seg.seq"
             :id="'seg-' + seg.seq.toString()"
             :class="['atp__seg', isActiveSegment(seg) ? 'atp__seg--active' : '']"
-            @click="handleSegmentClick(seg)"
+            @click="handleSegmentClick(transcriptIndex)"
           >
             <!-- 时间线轨道 -->
             <view class="atp__seg-rail">
@@ -73,7 +73,7 @@
             <view class="atp__seg-body">
               <view class="atp__seg-head">
                 <text class="atp__seg-speaker">{{ speakerLabel(seg) }}</text>
-                <text v-if="hasValidTime(seg)" :class="['atp__seg-time', isActiveSegment(seg) ? 'atp__seg-time--active' : '']">{{ formatMs(seg.startMs) }}</text>
+                <text v-if="transcriptTimeMs(transcriptIndex) >= 0" :class="['atp__seg-time', isActiveSegment(seg) ? 'atp__seg-time--active' : '']">{{ formatMs(transcriptTimeMs(transcriptIndex)) }}</text>
               </view>
               <text class="atp__seg-text">{{ seg.text }}</text>
             </view>
@@ -94,6 +94,7 @@
   import { apiResCode, apiResData } from "@/utils/common";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { AudioTranscriptSegment } from "./types.uts";
+  import { mapMonitoringTranscriptSegments } from "@/utils/voxTranscriptTimeline";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -102,7 +103,7 @@
    * - meetingId：拉临时播放地址（会议 / 监控记录 id）
    * - segments：带 startMs/endMs 的转写分段
    * - durationMs：业务时长（进度条与 seek 上限）
-   * - hasAudio：无录音时隐藏播放器
+   * - hasAudio：加载前的录音提示，加载后以 audio-files 的有效条目为准
    * - autoplay：就绪后自动播放
    * - showPlayer / showTranscript：控制播放条与转写列表显隐
    * - visible：父级不可见时暂停自动滚屏（如切到纪要 Tab）
@@ -163,6 +164,9 @@
   let audioCtx: InnerAudioContext | null = null;
   /** 避免重复 init 同一 meetingId */
   let initedMeetingId: number = 0;
+  let audioLoadVersion: number = 0;
+  let audioLoading: boolean = false;
+  let autoplayWhenReady: boolean = false;
 
   /**
    * 分段连播运行时（NW-269 audio-files 新口径）：
@@ -172,9 +176,11 @@
   class SegRuntime {
     audioUrl: string = "";
     durationMs: number = 0;
-    constructor(audioUrl: string = "", durationMs: number = 0) {
+    startedAt: string = "";
+    constructor(audioUrl: string = "", durationMs: number = 0, startedAt: string = "") {
       this.audioUrl = audioUrl;
       this.durationMs = durationMs;
+      this.startedAt = startedAt;
     }
   }
   let audioSegments: SegRuntime[] = [] as SegRuntime[];
@@ -188,7 +194,7 @@
   /** 段有效时长结束前提前切段，跳过预签名音频尾部静音 */
   const SEGMENT_TAIL_CUT_MS: number = 250;
   /** 监控转写分段的音频段归属（与 props.segments 同长，值=音频段下标）；会议不使用 */
-  let segIndexOfTranscript: number[] = [] as number[];
+  const segIndexOfTranscript = ref<number[]>([] as number[]);
 
   /** 全部音频段有效时长合计（接口 durationMs 权威，多段时覆盖详情时长） */
   const segmentsTotalMs = (): number => {
@@ -216,7 +222,7 @@
     for (let i = 0; i < audioSegments.length; i++) {
       const dur = audioSegments[i].durationMs;
       if (globalMs < acc + dur || i == audioSegments.length - 1) {
-        return Math.max(0, Math.min(globalMs - acc, dur));
+        return Math.max(0, dur > 0 ? Math.min(globalMs - acc, dur) : globalMs - acc);
       }
       acc += dur;
     }
@@ -237,10 +243,9 @@
   let seekGuardUntilMs: number = 0;
 
   const audioLoaded = ref<boolean>(false);
+  const audioSegmentCount = ref<number>(0);
   const resolvedHasAudio = computed((): boolean => {
-    if (!props.hasAudio) return false;
-    if (audioLoaded.value && audioSegments.length == 0) return false;
-    return true;
+    return audioLoaded.value ? audioSegmentCount.value > 0 : props.hasAudio;
   });
 
   const hasValidTime = (seg: AudioTranscriptSegment): boolean => {
@@ -274,7 +279,7 @@
 
   const resolveDurationMs = (): number => {
     // 分段口径（NW-269）：接口各段 durationMs 合计为权威总时长
-    if (audioSegments.length > 0) return segmentsTotalMs();
+    if (audioSegments.length > 0 && segmentsTotalMs() > 0) return segmentsTotalMs();
     if (props.durationMs > 0) return props.durationMs;
     if (audioCtx != null && audioCtx!!.duration > 0) {
       return Math.floor(audioCtx!!.duration * 1000);
@@ -302,14 +307,12 @@
     const monitoringMultiSeg =
       props.recordType == "monitoring" && audioSegments.length > 1;
     // 监控多段：把全局时间换算为当前段段内偏移，且只匹配属于当前段的转写句
-    const matchMs = monitoringMultiSeg
-      ? Math.max(0, ms - segBaseMs)
-      : ms;
-    const matchSeg = monitoringMultiSeg ? currentSegIndex : -1;
+    const matchMs = monitoringMultiSeg ? segmentOffsetMs(ms) : ms;
+    const matchSeg = monitoringMultiSeg ? locateSegment(ms) : -1;
     let result = -1;
     for (let i = 0; i < list.length; i++) {
       if (!hasValidTime(list[i])) continue;
-      if (monitoringMultiSeg && segIndexOfTranscript[i] != matchSeg) continue;
+      if (monitoringMultiSeg && segIndexOfTranscript.value[i] != matchSeg) continue;
       if (list[i].startMs <= matchMs) {
         result = list[i].seq;
       }
@@ -319,39 +322,30 @@
 
   /**
    * 预计算监控转写句的音频段归属（segIndexOfTranscript）。
-   * 接口口径：segments 按顺序依次属于各音频分段（与 audio-files 的
-   * segmentIndex 顺序对应），每句 startMs 相对其所在段起点。这里顺序装段：
-   * 依序装入当前段，直到某句 startMs 超出当前段有效时长则归入下一段。
-   * total=1（无卡现状）全部归段 0，与旧行为一致。
+   * 两个接口的 startedAt 同为所属音频段的采集起点，用它精确关联；
+   * startMs 相对段起点，跨段会归零，不能据此按时长装段。
    */
   const rebuildTranscriptSegIndex = () => {
-    const n = props.segments.length;
-    const result = [] as number[];
-    if (audioSegments.length <= 1) {
-      for (let i = 0; i < n; i++) {
-        result.push(0);
-      }
-      segIndexOfTranscript = result;
-      return;
+    const transcriptStarts = [] as string[];
+    const audioStarts = [] as string[];
+    for (let i = 0; i < props.segments.length; i++) {
+      transcriptStarts.push(props.segments[i].startedAt);
     }
-    let seg = 0;
-    for (let i = 0; i < n; i++) {
-      const item = props.segments[i];
-      if (!hasValidTime(item)) {
-        result.push(seg);
-        continue;
-      }
-      const s = item.startMs;
-      // 超出当前段有效时长（留 1ms 边界）则前进到能容纳它的段
-      while (
-        seg < audioSegments.length - 1 &&
-        s >= audioSegments[seg].durationMs - 1
-      ) {
-        seg++;
-      }
-      result.push(seg);
+    for (let i = 0; i < audioSegments.length; i++) {
+      audioStarts.push(audioSegments[i].startedAt);
     }
-    segIndexOfTranscript = result;
+    segIndexOfTranscript.value = mapMonitoringTranscriptSegments(transcriptStarts, audioStarts);
+  };
+
+  /** 节点时间、点击跳转统一使用与播放条相同的全局时间。 */
+  const transcriptTimeMs = (index: number): number => {
+    if (index < 0 || index >= props.segments.length) return -1;
+    const start = props.segments[index].startMs;
+    if (start < 0) return -1;
+    if (props.recordType != "monitoring" || audioSegments.length <= 1) return start;
+    const audioIndex = segIndexOfTranscript.value[index];
+    if (audioIndex == null || audioIndex < 0 || audioIndex >= audioSegments.length) return -1;
+    return segmentBaseMs(audioIndex) + start;
   };
 
   /** 刷新高亮，并在跟随开启且可见时滚到当前句 */
@@ -437,10 +431,10 @@
     // 分段口径：全局进度 = 当前段基址 + 段内偏移（截到段有效时长）
     if (audioSegments.length > 0 && currentSegIndex >= 0) {
       const segDur = audioSegments[currentSegIndex].durationMs;
-      if (localMs > segDur) localMs = segDur;
+      if (segDur > 0 && localMs > segDur) localMs = segDur;
       // 段有效时长将尽且还有下一段：提前切段，跳过预签名音频尾部静音
       if (
-        playing.value &&
+        playing.value && segDur > 0 &&
         currentSegIndex < audioSegments.length - 1 &&
         localMs >= segDur - SEGMENT_TAIL_CUT_MS
       ) {
@@ -516,6 +510,9 @@
   };
 
   const destroyAudio = () => {
+    audioLoadVersion++;
+    audioLoading = false;
+    autoplayWhenReady = false;
     // #ifdef APP
     if (audioCtx != null) {
       audioCtx!!.destroy();
@@ -528,12 +525,13 @@
     seekGuardTargetMs = -1;
     seekGuardUntilMs = 0;
     audioSegments = [] as SegRuntime[];
-    segIndexOfTranscript = [] as number[];
+    segIndexOfTranscript.value = [] as number[];
     currentSegIndex = -1;
     segBaseMs = 0;
     switchingSeg = false;
     segPendingSeekMs = -1;
     audioLoaded.value = false;
+    audioSegmentCount.value = 0;
   };
 
   /**
@@ -541,7 +539,16 @@
    * 一次分页拉全所有段（预签名 24h，进页面一次即可）；total=1 退化为旧单文件行为。
    */
   const initAudio = async (doAutoplay: boolean) => {
-    if (!props.hasAudio || props.meetingId <= 0) return;
+    if (props.meetingId <= 0) return;
+    if (audioLoading) {
+      autoplayWhenReady = autoplayWhenReady || doAutoplay;
+      return;
+    }
+    audioLoading = true;
+    autoplayWhenReady = doAutoplay;
+    const loadVersion = ++audioLoadVersion;
+    const recordId = props.meetingId;
+    const recordType = props.recordType;
     try {
       // 分页拉全（pageSize 上限 50；正常整场/有卡段数远小于此，循环是兜底）
       const collected = [] as UTSJSONObject[];
@@ -550,9 +557,10 @@
       const PAGE_SIZE = 50;
       const MAX_PAGES = 10;
       while (page <= MAX_PAGES && (total < 0 || collected.length < total)) {
-        const res = props.recordType == "monitoring"
-          ? await apiVoxMonitoringAudioFiles(props.meetingId, page, PAGE_SIZE)
-          : await apiVoxMeetingAudioFiles(props.meetingId, page, PAGE_SIZE);
+        const res = recordType == "monitoring"
+          ? await apiVoxMonitoringAudioFiles(recordId, page, PAGE_SIZE)
+          : await apiVoxMeetingAudioFiles(recordId, page, PAGE_SIZE);
+        if (loadVersion != audioLoadVersion || recordId != props.meetingId || recordType != props.recordType) return;
         if (apiResCode(res) != SUCCESS_CODE) return;
         const raw = apiResData<any>(res);
         const obj = raw != null ? (raw as UTSJSONObject) : null;
@@ -566,8 +574,6 @@
         if (items.length < PAGE_SIZE) break;
         page++;
       }
-      audioLoaded.value = true;
-      if (collected.length == 0) return;
       // 组装运行时段队列（接口按 segmentIndex 升序返回，此处再防御性插入排序）
       const segs = [] as SegRuntime[];
       const segIdx = [] as number[];
@@ -576,7 +582,8 @@
         const urlVal = it["audioUrl"];
         const url = urlVal != null ? `${urlVal}` : "";
         if (url == "") continue;
-        const durMs = parseInt(`${it["durationMs"] ?? 0}`, 10);
+        const parsedDuration = parseInt(`${it["durationMs"] ?? 0}`, 10);
+        const durMs = collected.length == 1 && parsedDuration <= 0 ? props.durationMs : parsedDuration;
         const order = parseInt(`${it["segmentIndex"] ?? segs.length}`, 10);
         let pos = segs.length;
         while (pos > 0 && segIdx[pos - 1] > order) {
@@ -589,11 +596,14 @@
           segs[j] = segs[j - 1];
           segIdx[j] = segIdx[j - 1];
         }
-        segs[pos] = new SegRuntime(url, durMs);
+        const startedAt = it["startedAt"] != null ? `${it["startedAt"]}` : "";
+        segs[pos] = new SegRuntime(url, durMs, startedAt);
         segIdx[pos] = order;
       }
-      if (segs.length == 0) return;
       audioSegments = segs;
+      audioSegmentCount.value = segs.length;
+      audioLoaded.value = true;
+      if (segs.length == 0) return;
       currentSegIndex = 0;
       segBaseMs = 0;
       rebuildTranscriptSegIndex();
@@ -620,7 +630,7 @@
       }
       audioCtx!!.src = audioSegments[0].audioUrl;
       audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-      initedMeetingId = props.meetingId;
+      initedMeetingId = recordId;
       syncDisplayDuration();
       syncActiveFromTime(0, false);
       if (pendingSeekMs >= 0) {
@@ -628,7 +638,7 @@
         pendingSeekMs = -1;
         applySeekToAudio(target);
       }
-      if (doAutoplay) {
+      if (autoplayWhenReady) {
         enableFollowTranscript();
         audioCtx!!.play();
         playing.value = true;
@@ -640,6 +650,11 @@
       // #endif
     } catch (e) {
       console.error("audio-transcript-player initAudio error", e);
+    } finally {
+      if (loadVersion == audioLoadVersion) {
+        audioLoading = false;
+        autoplayWhenReady = false;
+      }
     }
   };
 
@@ -707,7 +722,7 @@
 
   /** 相对当前位置快退/快进 deltaMs（±15s） */
   const seekBy = (deltaMs: number) => {
-    if (!props.hasAudio) return;
+    if (!resolvedHasAudio.value) return;
     // #ifdef APP
     const durMs = resolveDurationMs();
     let target = currentTimeMs.value + deltaMs;
@@ -738,24 +753,10 @@
     sliderDragging.value = false;
   };
 
-  const handleSegmentClick = (seg: AudioTranscriptSegment) => {
-    if (!props.hasAudio || !hasValidTime(seg)) return;
+  const handleSegmentClick = (index: number) => {
+    const targetMs = transcriptTimeMs(index);
+    if (!resolvedHasAudio.value || targetMs < 0) return;
     enableFollowTranscript();
-    let targetMs = seg.startMs;
-    if (props.recordType == "monitoring" && audioSegments.length > 1) {
-      let segIdx = -1;
-      for (let i = 0; i < props.segments.length; i++) {
-        if (props.segments[i].seq == seg.seq) {
-          if (i < segIndexOfTranscript.length) {
-            segIdx = segIndexOfTranscript[i];
-          }
-          break;
-        }
-      }
-      if (segIdx >= 0 && segIdx < audioSegments.length) {
-        targetMs = segmentBaseMs(segIdx) + seg.startMs;
-      }
-    }
     seekToMs(targetMs);
     // #ifdef APP
     if (!playing.value) {
@@ -765,16 +766,16 @@
   };
 
   const isActiveSegment = (seg: AudioTranscriptSegment): boolean => {
-    return props.hasAudio && hasValidTime(seg) && activeSeq.value == seg.seq;
+    return resolvedHasAudio.value && hasValidTime(seg) && activeSeq.value == seg.seq;
   };
 
   // meetingId 变化时重新拉播放地址
   watch(
     (): number => props.meetingId,
     (id: number) => {
-      if (id > 0 && props.hasAudio && id != initedMeetingId) {
+      if (id != initedMeetingId) {
         destroyAudio();
-        initAudio(props.autoplay);
+        if (id > 0) initAudio(props.autoplay);
       }
     },
   );
@@ -782,10 +783,18 @@
   watch(
     (): string => props.recordType,
     (_type: string) => {
-      if (props.meetingId > 0 && props.hasAudio) {
-        destroyAudio();
+      destroyAudio();
+      if (props.meetingId > 0) {
         initAudio(props.autoplay);
       }
+    },
+  );
+
+  watch(
+    (): AudioTranscriptSegment[] => props.segments,
+    (_segments: AudioTranscriptSegment[]) => {
+      rebuildTranscriptSegIndex();
+      syncActiveFromTime(currentTimeMs.value, false);
     },
   );
 
@@ -810,7 +819,7 @@
 
   onMounted(() => {
     syncDisplayDuration();
-    if (props.hasAudio && props.meetingId > 0) {
+    if (props.meetingId > 0) {
       initAudio(props.autoplay);
     } else {
       syncActiveFromTime(0, false);

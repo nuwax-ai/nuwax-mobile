@@ -39,6 +39,25 @@ beforeEach(() => {
     request: (options: any) => { state.pending = options; }, showToast: vi.fn(),
   });
 });
+
+describe('可选接口路由探测的错误提示', () => {
+  let now = Date.now();
+  beforeEach(() => {
+    now += 3000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+  });
+  afterEach(() => vi.restoreAllMocks());
+  it.each([
+    { status: 404, suppress: true, expected: 0 },
+    { status: 404, suppress: false, expected: 1 },
+    { status: 500, suppress: true, expected: 1 },
+  ])('HTTP $status / suppressNotFoundToast=$suppress', async ({ status, suppress, expected }) => {
+    const result = request({ url: '/api/app/meetings/42/audio-files', method: 'GET', suppressNotFoundToast: suppress });
+    state.pending.success({ statusCode: status, data: JSON.stringify({ status, message: `fixture HTTP ${status}` }), header: {} });
+    expect((await result).status).toBe(status);
+    expect(uni.showToast).toHaveBeenCalledTimes(expected);
+  });
+});
 function respond(code: string, data: unknown = null) {
   state.pending.success({ statusCode: 200, data: JSON.stringify({ code, data, message: '/login?local=1' }), header: {} });
 }

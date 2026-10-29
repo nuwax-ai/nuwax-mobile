@@ -2480,6 +2480,9 @@
   let pendingJumpSeq = 0;
   /** onJumpEvent 只登记、还没取页定位：等 onShow（页面真正可见）再跑，见 onJumpEvent 注释。 */
   let pendingJumpAwaitShow = false;
+  /** 跳转载荷来自「会话内搜索」：无论目标行是否已在窗口内，一律用大遮罩（白屏 + 正在定位），
+   *  不降级成轻量胶囊——同一入口时而白屏时而露列表滚动，是不该有的不一致（见 onJumpEvent）。 */
+  let pendingJumpForceCover = false;
   // 搜索/引用定位进行中（jumpToMsg 全程）：屏蔽 scrolltoupper 误触发 + 定位窗内不裁尾
   let jumpLocating = false;
   let pageVisible = false;
@@ -10294,20 +10297,23 @@
   }
 
   // ===== 定位等待遮罩（components/chat-locate-loading，模板零绑定）=====
-  // 空白根因：带定位目标进页（搜索命中/引用/置顶）时列表全程 veiled——视觉隐藏但参与
-  // scroll-into-view 布局，等首屏拉取 + seq 直达取页 + 150ms 稳定重定位这段全是纯白。
-  // ★带定位目标进页时遮罩从「首屏拉取」就开始挂（不是等首屏落数据后），全程只给一次
-  //   「正在定位消息…」：否则先露 chat-state 的「加载中…」、再换成本遮罩，同一段等待
-  //   出现两套文案（用户体验到的重复）。遮罩不透明白底，顺带把底下那份「加载中…」盖住，
-  //   不必给 chat-state 加模板条件（chat.uvue 模板不能新增 setup 引用）。
-  // listSettled 一翻转即收（见下方 watch，那是唯一的揭幕出口）。
+  // 要盖住的两段等待：
+  // ① 进页遮蔽：带定位目标进页（搜索命中/引用/置顶）时列表全程 veiled——视觉隐藏但参与
+  //    scroll-into-view 布局，等首屏拉取 + seq 直达取页 + 150ms 稳定重定位这段全是纯白；
+  // ② 会话内定位（2026-10-29）：目标行不在当前窗口时要直达取页插入 + 长距离滚动 + 核验
+  //    重试，列表在底下连滚好几屏——白底盖住，落定核验后才揭开（对齐全局搜索/伙伴页搜索）。
+  // ★①的遮罩从「首屏拉取」就开始挂（不是等首屏落数据后），全程只给一次「正在定位消息…」：
+  //   否则先露 chat-state 的「加载中…」、再换成本遮罩，同一段等待出现两套文案（用户体验到
+  //   的重复）。遮罩不透明白底，顺带把底下那份「加载中…」盖住，不必给 chat-state 加模板
+  //   条件（chat.uvue 模板不能新增 setup 引用）。
+  // ①由 listSettled 一翻转收口（见下方 watch）；②走落定核验（verifyAnchorPlaced）。
   const LOCATE_LOADING_SAFETY_MS: number = 20000;
-  /** 会话内（列表已揭幕）形态的兜底：胶囊只该活一次「取页 + 落定核验」，超时即收。 */
+  /** 轻量胶囊（目标行已在窗口内）的兜底：只该活一次「滚动 + 落定核验」，超时即收。 */
   const LOCATE_PILL_SAFETY_MS: number = 2500;
   /** 兜底定时器（0=无）：定位异常（取页卡住/揭幕分支没走到）时不让遮罩永久盖住列表。 */
   let locateLoadingSafetyTimer = 0;
-  /** 胶囊是否在等「落定核验」收口（true 时 jumpToMsg 的 finally 不抢着收）。 */
-  let locatePillAwaitVerify = false;
+  /** 遮罩是否在等「落定核验」收口（true 时 jumpToMsg 的 finally 不抢着收；两种形态共用）。 */
+  let locateAwaitVerify = false;
 
   /** 收等待反馈（★须定义在 beginLocateLoading 之前：UTS 不提升声明，定时器回调里
    *  调用后定义的函数会编译成 Unresolved reference）。 */
@@ -10320,33 +10326,29 @@
   }
 
   /**
-   * 挂等待反馈。两种形态：
-   * - 进页遮蔽（全局搜索等，列表还是白的）→ 铺满遮罩，揭幕即收（listSettled watch）；
-   * - 会话内跳转（`listSettled` 已 true，列表本来就看得见）→ 居中半透明胶囊，
-   *   否则整段对话会被铺白的遮罩闪一下。胶囊由落定核验显式收，另有 2.5s 保险。
+   * 挂等待反馈。两种形态，按「目标是否已在当前窗口内」选（2026-10-29 起，不再只看是否揭幕）：
+   * - fullCover=true，或列表尚未揭幕（进页遮蔽）→ 铺满不透明白底 + 居中「正在定位消息…」：
+   *   底下要么是空列表，要么是「直达取页插入 + 长距离 scroll-into-view + 落定核验重试」
+   *   连滚好几屏——会话内搜索命中的真机反馈就是「内容区域不断滚动」。白底把这段整段盖住，
+   *   落定核验/揭幕收口时才揭开，观感与全局搜索进页、伙伴页搜索跳转一致。
+   *   ★不要改回「会话内一律轻量胶囊」：胶囊不遮内容，长距离滚动全部露在外面。
+   * - 其余（目标行已在窗口内，只滚一小段：Pin/引用命中在当前页）→ 居中半透明胶囊，
+   *   避免整段对话闪一下白。胶囊由落定核验显式收，另有 2.5s 保险。
    */
-  function beginLocateLoading(): void {
+  function beginLocateLoading(fullCover: boolean): void {
     // 新一轮定位：收口权先归 finally（apply 走到核验时才转交给它）
-    locatePillAwaitVerify = false;
+    locateAwaitVerify = false;
     if (locateLoadingSafetyTimer != 0) {
       clearTimeout(locateLoadingSafetyTimer);
       locateLoadingSafetyTimer = 0;
     }
-    if (listSettled.value == true) {
-      setChatLocateLoadingInline(true);
-      setChatLocateLoadingVisible(true);
-      locateLoadingSafetyTimer = setTimeout(() => {
-        locateLoadingSafetyTimer = 0;
-        setChatLocateLoadingVisible(false);
-      }, LOCATE_PILL_SAFETY_MS);
-      return;
-    }
-    setChatLocateLoadingInline(false);
+    const pill = fullCover != true && listSettled.value == true;
+    setChatLocateLoadingInline(pill);
     setChatLocateLoadingVisible(true);
     locateLoadingSafetyTimer = setTimeout(() => {
       locateLoadingSafetyTimer = 0;
       setChatLocateLoadingVisible(false);
-    }, LOCATE_LOADING_SAFETY_MS);
+    }, pill ? LOCATE_PILL_SAFETY_MS : LOCATE_LOADING_SAFETY_MS);
   }
 
   /** 揭幕即收遮罩（scrollToAnchorWithSettle 与各兜底分支都经 listSettled 翻转收口）。 */
@@ -10386,14 +10388,14 @@
     const version = locateVerifyVersion;
     setTimeout(() => {
       if (version != locateVerifyVersion || !isChatActive()) {
-        // 被新一轮定位/离页作废：只放掉自己的收口权，别去收别人的胶囊
+        // 被新一轮定位/离页作废：只放掉自己的收口权，别去收别人的遮罩
         if (version == locateVerifyVersion) {
-          locatePillAwaitVerify = false;
+          locateAwaitVerify = false;
         }
         return;
       }
       if (anchorRowVisible(anchorId)) {
-        locatePillAwaitVerify = false;
+        locateAwaitVerify = false;
         endLocateLoading();
         scheduleJumpLatestCheck(60);
         return;
@@ -10401,7 +10403,7 @@
       if (attempt >= LOCATE_VERIFY_TRIES) {
         // 兜底：原生通道直接落位（鸿蒙/iOS/H5 返回 false，仍靠 scroll-into-view 重设）
         forceScrollToElement("im-chat-body", anchorId);
-        locatePillAwaitVerify = false;
+        locateAwaitVerify = false;
         endLocateLoading();
         scheduleJumpLatestCheck(120);
         return;
@@ -10430,8 +10432,8 @@
     flashHighlight(msgId);
     if (alreadySettled) {
       locateVerifyVersion += 1;
-      // 胶囊交给核验收口（落定/兜底各收一次），jumpToMsg 的 finally 不抢
-      locatePillAwaitVerify = true;
+      // 遮罩交给核验收口（落定/兜底各收一次），jumpToMsg 的 finally 不抢
+      locateAwaitVerify = true;
       verifyAnchorPlaced(`msg-${msgId}`, 1);
     }
   }
@@ -10544,9 +10546,13 @@
     cancelSettle();
     // 新一轮定位作废在途核验（上一轮的重设会把视口拽回旧目标）
     locateVerifyVersion += 1;
-    jumpLocating = true;
-    // 等待反馈：遮蔽期=铺满遮罩（揭幕即收），会话内=居中轻量胶囊（落定核验收口）
-    beginLocateLoading();
+    // 等待反馈形态：搜索来源一律大遮罩（同一入口不许有时白屏有时露列表）；其余按「目标是否
+    // 已在窗口内」定——不在（要直达取页 + 长距离滚动，列表在底下会连滚好几屏）→ 铺满白底
+    // 「白屏 + 正在定位消息」；已在（Pin/引用命中当前页附近，只滚一小段）→ 居中轻量胶囊。
+    // 进页遮蔽期由 initHistory 传 true，与本函数同一套收口。
+    const forceCover = pendingJumpForceCover;
+    pendingJumpForceCover = false;
+    beginLocateLoading(forceCover || findMsgById(msgId) == null);
     try {
       let targetSeq = jumpSeq;
       /** targetSeq 是否来自 msgDetail：换过就用的是权威值，不再重复问一次详情。 */
@@ -10616,9 +10622,9 @@
       }
     } finally {
       jumpLocating = false;
-      // 没走到「落定核验」（未命中/未应用/列表不可见）时胶囊没有别人收，这里收；
+      // 没走到「落定核验」（未命中/未应用/列表不可见）时遮罩没有别人收，这里收；
       // 有核验在跑就交给它（落定或兜底那一拍才收，别在滚动前就把「定位中」撤掉）
-      if (!locatePillAwaitVerify) {
+      if (!locateAwaitVerify) {
         endLocateLoading();
       }
     }
@@ -10638,7 +10644,8 @@
     return `${top.route}`.indexOf("/pages/message/chat") >= 0;
   }
 
-  /** 引用详情页 emit 的跳转事件（payload = "msgId|seq"，seq 供直达取页；旧载荷裸 msgId 兼容）。 */
+  /** 引用详情页 / 会话内搜索 / Pin 页 emit 的跳转事件（payload = "msgId|seq[|s]"，
+   *  seq 供直达取页，第三段 `s`=搜索来源；旧载荷裸 msgId 兼容）。 */
   function onJumpEvent(data: any): void {
     const raw = data == null ? "" : `${data}`;
     if (raw.length == 0) {
@@ -10646,17 +10653,24 @@
     }
     let msgId = raw;
     let seq = 0;
+    let fromSearch = false;
     const sep = raw.indexOf("|");
     if (sep >= 0) {
       msgId = raw.substring(0, sep);
-      const seqRaw = parseFloat(raw.substring(sep + 1));
+      const rest = raw.substring(sep + 1);
+      const restSep = rest.indexOf("|");
+      const seqPart = restSep >= 0 ? rest.substring(0, restSep) : rest;
+      const sourcePart = restSep >= 0 ? rest.substring(restSep + 1) : "";
+      const seqRaw = parseFloat(seqPart);
       seq = isNaN(seqRaw) || seqRaw <= 0 ? 0 : Math.floor(seqRaw);
+      fromSearch = sourcePart.indexOf("s") >= 0;
     }
     if (msgId.length == 0) {
       return;
     }
     pendingJumpId = msgId;
     pendingJumpSeq = seq;
+    pendingJumpForceCover = fromSearch;
     // ★不在事件里立即取页：emit 方（会话内搜索 / Pin / 引用详情）紧跟着 navigateBack，
     //   此刻本页仍被它盖着。此时跑 jumpToMsg：scroll-into-view 不生效（页面不可见），
     //   而 pendingJumpId 又在 applyPendingJump 里被提前消费 —— 用户回到页面后仍是原位置，
@@ -13398,7 +13412,7 @@
     // 带定位目标进页（搜索命中/引用/置顶/未读定位）：遮罩从首屏拉取这一拍就挂上，
     // 一路盖到定位完成揭幕——中间不再先露 chat-state 的「加载中…」再换「正在定位」
     if (pendingJumpId.length > 0 || unreadViewportRead) {
-      beginLocateLoading();
+      beginLocateLoading(true);
     }
     // 冷启动 myUserId 未知：等用户信息返回（失败也放行，保持全左侧旧兜底）；
     // 暖会话 loadMyInfo 已同步回填缓存，此处零等待直落首屏
@@ -14059,6 +14073,16 @@
         cancelIosKbShortHold();
         return;
       }
+      // ★本页不可见（被子页盖着 / 切后台）时收到的键盘事件一律不理（2026-10-29）：
+      // 该监听是 activity 级的——会话内搜索页/引用详情等子页的输入框一聚焦，本页也会收到
+      // 同高度读数，照着落地就会把隐藏中的本页顶起 liftPx；等返回时子页键盘已收、而
+      // 「收起 0」又常丢，底部就永久留一片键盘高的空白（真机症状：搜索页点输入框→点结果
+      // →回聊天页，页面下方空白）。真键盘只可能属于本页聚焦中的输入框，隐藏期间必然不是，
+      // 直接丢；回页由 onShow 的轮询 / calibrateAndroidImeAfterShow 按 insets 重新对齐。
+      if (!isChatActive()) {
+        clearKbWatchdog();
+        return;
+      }
       // #ifdef APP-ANDROID
       // 「窗口重排的假键盘高度」拦截（2026-10-28）：Android 端该事件的高度不是 IME insets，
       // 而是 uni-keyboard 模块 OnKeyBoardChangedListener 的差值测量——
@@ -14069,19 +14093,18 @@
       // →发送后，输入坞下那行灰色工具栏整体上抬，底下留出一片空白（键盘并不存在）。
       // 判据：真键盘升起必先经本页某个输入控件聚焦（inputFocused / 展开面板 / 语音编辑卡，
       // 见 applyKeyboardHeight 头注与 handleVoiceDraftFocus 注释）；三者全否 ⇒ 键盘不可能
-      // 真升起，再用本页自己的 IME insets 直读复核，读数为 0 即丢弃该读数（不落高度、不清
-      // 面板）。聚焦态下的正高度不受影响，走原有通路（万一聚焦事件晚到漏掉一笔，聚焦时
-      // startAndroidImePolling 的 rAF 首拍会按 insets 重新落地）。
+      // 真升起，直接丢弃该读数（不落高度、不清面板）。
+      // ★2026-10-29 去掉「本页 IME insets 直读复核」这道通行证：从子页（会话内搜索页等）
+      //   返回的那一拍，子页键盘还没收完，insets 确实 >0，复核会把子页键盘的高度放行进来。
+      //   漏掉的这一笔由聚焦时 startAndroidImePolling 的 rAF 首拍按 insets 重新落地（兜底不变）。
       if (
         res.height > 0 &&
         inputFocused.value != true &&
         expanded.value != true &&
         voiceDraftFocus.value != true
       ) {
-        if (readAndroidImeHeight() <= 0) {
-          clearKbWatchdog();
-          return;
-        }
+        clearKbWatchdog();
+        return;
       }
       // #endif
       // #ifdef APP-IOS
@@ -14247,6 +14270,15 @@
     if (inputFocused.value || expanded.value) {
       startAndroidImePolling();
     } else {
+      // #ifdef APP-ANDROID
+      // 本页没有任何输入控件在聚焦：键盘高度只可能是子页残留（子页键盘事件是 activity 级，
+      // 已在键盘监听里按「本页不可见即丢」拦住；万一漏进一笔）——直接清 0，不绕 insets 复核：
+      // 子页键盘收得慢的机型上 insets 读数滞后，复核会让「底部一片键盘高的空白」多挂几百毫秒
+      // 甚至挂死（真机症状：会话内搜索页点输入框→点结果→回聊天页，下方空白）。
+      if (keyboardHeight.value > 0) {
+        applyKeyboardHeight(0, "event");
+      }
+      // #endif
       calibrateAndroidImeAfterShow();
     }
     // @ 成员选择页选完返回：等页面切换动画收尾再聚焦拉键盘（太早窗口未就绪不生效）
@@ -14277,6 +14309,16 @@
     chatHasShownOnce = true;
     if (pendingJumpId.length == 0) {
       return;
+    }
+    // 目标行不在当前窗口（会话内搜索命中远早于已加载窗口的常态）：在这一拍就把白底遮罩挂上，
+    // 让回页首帧即为「白屏 + 正在定位消息」——jumpToMsg 还要等下面 100ms 的切换档期，
+    // 期间旧视口位置会被看见，之后底下又会连滚好几屏（取页插入 + 长距离 scroll-into-view），
+    // 用户的观感就是「点完搜索结果，内容区域自己不断滚动」。
+    // ★搜索来源必挂（与 jumpToMsg 同判据，否则会先白屏再降级成胶囊/直接露列表）；
+    //   其余只在「目标行不在窗口内」时预挂——已在窗口内的只滚一小段，jumpToMsg 会切成
+    //   轻量胶囊，预挂白底反而闪。
+    if (pendingJumpAwaitShow && (pendingJumpForceCover || findMsgById(pendingJumpId) == null)) {
+      beginLocateLoading(true);
     }
     // 从 quote-detail / 会话内搜索 / Pin 页返回本页后再取页定位并闪烁（延迟一拍等页面切换完成）
     setTimeout(() => {

@@ -8,7 +8,8 @@
  * - 心跳间隔必须读 CONNECT_ACK.body.heartbeatInterval，不要硬编码
  * - MSG_RECV 必须先回 ACK(3003) 再 emit（先 ACK 后落盘，反之中途崩了永久丢）
  * - 重连退避 1→2→4→8→16→30s，连上后重置 + 调 HTTP /sync 兜底
- * - onHide 不要 close，只 pauseKeepalive（iOS 后台 30s 自然断）
+ * - onHide 暂停心跳**并 close**：后端只认 im:route 判在线，连接留着就收不到离线推送
+ *   （2026-10-30 改；锁屏 / 退后台都会触发 onHide，真机已验）
  * - onShow reconnect('foreground') 强制重连（OS 后台期间 socket 状态不可信）
  *
  * 复用现有：
@@ -25,7 +26,7 @@ import { getImDeviceId, apiImSync, apiImDeviceRegister, apiImDeviceUnregister, i
 // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
 import { getImPushCid } from "@/utils/im/imPushClient";
 // #endif
-import { apiResCode, apiResData } from "@/utils/apiResponse";
+import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
 import eventBus from "@/utils/eventBus";
 import {
   IM_WS_PATH,
@@ -51,8 +52,7 @@ import {
 import { dispatchImEnvelope, IM_EVENT } from "./imWsEventBridge";
 
 /** 调试日志开关；业务告警（imWarn/imParseEnvelope）不受此开关影响。 */
-/** ★调试期临时开启（丢帧排查：recv 每帧留痕 + 连接/重连轨迹）；排查完关回 false。 */
-export const IM_WS_DEBUG = true;
+export const IM_WS_DEBUG = false;
 
 /** 重连退避曲线（毫秒）。连上后从 0 开始累计。 */
 const IM_RECONNECT_BACKOFF_MS: Array<number> = [
@@ -79,6 +79,16 @@ function imLog(msg: string): void {
 
 function imWarn(msg: string): void {
   console.warn(`[ImWs] ${msg}`);
+}
+
+/**
+ * 设备注册探针（排查「后端 pushEnabled=false 永远不推」用），随 IM_WS_DEBUG 一起开关。
+ * ★用 console.error：鸿蒙真机看不到 log/warn。
+ */
+function imPushLog(msg: string): void {
+  if (IM_WS_DEBUG) {
+    console.error(`[ImPush] ${msg}`);
+  }
 }
 
 /** 从 storage 读 token（参照 imUnreadBadge.uts:91-99）。 */
@@ -175,7 +185,7 @@ class ImWsClientImpl {
   private tokenRetryTimerId: number | null = null;
   /** token 重试计数（连上后归零；超限停止，等下一次 foreground/网络事件再触发）。 */
   private tokenRetryCount: number = 0;
-  /** 后台标记（onHide 暂停心跳但不关 socket）。 */
+  /** 后台标记（onHide 置位：停心跳 + 关 socket，所有重连入口在此守卫下静默）。 */
   private inBackground: boolean = false;
   /** 是否主动 close（区分主动 vs 异常，避免误重连）。 */
   private manualClosed: boolean = false;
@@ -246,7 +256,17 @@ class ImWsClientImpl {
     this.connect();
   }
 
-  /** 暂停心跳（onHide）。不关 socket。 */
+  /**
+   * 暂停心跳**并断开连接**（App.onHide：退后台 / 锁屏）。
+   *
+   * ★必须真的关 socket，不能只停心跳 —— 后端判「在线」的唯一依据是 im:route 里
+   *  有没有这个 uid 的 field（`OfflinePushConsumer`：`hlen(route(uid)) > 0` ⇒
+   *  判定在线、直接 skippedOnline 放弃离线推送）。连接留着，用户就永远收不到通知。
+   *   网关在连接关闭时会立即 `unregisterIfSame` 清路由，所以断开 = 后端秒级判离线。
+   *
+   * 保持 `manualClosed = false`：onShow 的 resumeKeepaliveAndReconnect 还要靠它重建。
+   * 真机实锤（Android 12 / EMUI 14.2）：退后台、主动锁屏、自动锁屏都会触发 onHide。
+   */
   pauseKeepalive(): void {
     imLog("pauseKeepalive");
     this.inBackground = true;
@@ -255,12 +275,12 @@ class ImWsClientImpl {
     this.cancelTokenRetry();
     this.cancelConnectTimeout();
     this.stopPingLoop();
-    // 后台建立中的连接不再等待握手；已有连接保留，由恢复入口重建。
-    if (this.state == "connecting") {
-      const adapter = this.adapter;
-      if (adapter != null) adapter.close(true);
-      this.state = "disconnected";
+    // connecting / open 一律关掉：离线推送的前提是「后端认为已离线」
+    const adapter = this.adapter;
+    if (adapter != null) {
+      adapter.close(true);
     }
+    this.state = "disconnected";
   }
 
   /** 恢复心跳 + 强制重连（onShow）。OS 后台 30s 自然断，不可信。 */
@@ -497,14 +517,21 @@ class ImWsClientImpl {
     // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
     pushCid = getImPushCid();
     // #endif
+    // 离线推送联调探针：pushCid 为空 ⇒ 后端拿到 pushEnabled=false，永远不会推。
+    // 带上 deviceId，后端可直接按 (userId, deviceId) 查 im_user_device 那行确认落库。
+    imPushLog(
+      `device register platform=${imDevicePlatform()} deviceId=${getImDeviceId()} pushCid=${pushCid.length > 0 ? pushCid : "(empty)"}`,
+    );
     try {
       const res = await apiImDeviceRegister(pushCid);
+      imPushLog(`device register result code=${apiResCode(res)} msg=${apiResMessage(res)}`);
       if (apiResCode(res) != SUCCESS_CODE) {
         // 典型如 IM_90001：后端未识别 platform（鸿蒙 "harmonyos" 加值前）——等后端，勿重试轰炸
         imWarn(`device register rejected (platform=${imDevicePlatform()})`);
       }
     } catch (_e) {
       // 网络失败等：下次重连 CONNECT_ACK 自然再试（UPSERT 幂等，退避重连限频）
+      imPushLog(`device register fail: ${_e}`);
     }
   }
 
@@ -758,7 +785,7 @@ export function reconnectImWsOnForeground(): void {
   ins.resumeKeepaliveAndReconnect();
 }
 
-/** App.onHide 调用：暂停心跳（不关 socket）。 */
+/** App.onHide 调用：暂停心跳并断开连接（离线推送的前提，见 pauseKeepalive 注释）。 */
 export function pauseImWsKeepalive(): void {
   const ins = getInstance();
   ins.pauseKeepalive();

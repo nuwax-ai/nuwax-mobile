@@ -179,9 +179,11 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
 | 取 cid 并随设备注册上报 | ✅ 已实现 |
 | 通知点击 → 打开对应会话 | ✅ 已实现（读 `payload.convId/convType`，兼容旧的 `name/avatar`；无 `convId` 时只拉起 App） |
 | 前台/后台 `receive` 事件 | ⬜ **刻意不处理**，前台由 WS 消息链路负责，后台由系统通知栏展示 |
-| Android 13+ / 鸿蒙通知授权 | ✅ 启动时主动申请 |
+| Android 13+ / 鸿蒙通知授权 | ✅ **首启协议弹窗点「同意」后**申请一次（`requestImNotifyPermission`，持久化标记 `im_notify_permission_asked`）。2026-10-30 起不再放登录成功后（避免「登录完再弹一次」的二次打扰）。鸿蒙首启的系统弹窗实际由 **uni-push SDK 自己弹**（比 JS onLaunch 更早，日志里没有 `[ImPush][hm]` 打点），我们这次调用通常只探测到「已授权」；Android 13+ 才是真正弹窗的时机 |
 | iOS 通知授权 | ⚠️ 由 uni-push 模块申请，待真机确认 |
 | 通知渠道路由（`setPushChannel`） | ⬜ 未做，厂商"自分类权益"开启后需补 |
+| 前后台连接策略 | ✅ **`App.onHide` 一律断开 WS**（退后台 / 主动锁屏 / 自动锁屏，真机已验触发）：后端只认 `im:route` 判在线，连接留着就永远走 `skippedOnline`。回前台 `onShow` 强制重连 → `CONNECT_ACK`（重发设备注册 + 触发 HTTP `/sync` 补拉）→ 聊天页 `silentSyncLatest()` 与全局 `/sync` 双路把断连窗口的消息补齐，所以断连**不会丢消息**，只会把「后台期间的实时」换成「推送 + 回前台补拉」 |
+| 华为/荣耀机型的系统代弹 | ⚠️ **App 无法控制**：EMUI/HarmonyOS 自建通知权限管理（`PermissionPolicyService`），在**每次冷启动**且该应用通知未授权时由 `system_server` 主动拉起 `REQUEST_PERMISSIONS_FOR_OTHER`，与我们的 `requestImNotifyPermission()` 无关（实测 API 31 机器上我们的代码第一行 `SDK_INT < 33` 就 return 了，日志里根本没有"发起申请"）。用户点一次「允许」后不再弹 |
 | 桌面图标角标 | ✅ **端上不需要做**：由 `uniPush.sendMessage({badge})` 下发给厂商通道直接设置。uni-app x 没有 `uni.setBadgeNumber`，App 回前台也不会去清角标 —— 如需"点开后清零"，得后端在下一次推送时传新值，或后续接原生插件 |
 
 ## 5. 安全
@@ -201,6 +203,80 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
 | 注册请求里没有 `pushToken` | App 未拿到 cid：查启动日志 `[ImPush] getPushClientId fail`；多为基座不含 uni-push 模块 |
 | 后端调云函数返回 401 | `X-Push-Sign` 与云函数 `SIGN_KEY` 不一致（改过要重新部署云函数） |
 | 云函数返回成功但收不到 | DCloud 后台厂商推送配置 / 设备通知权限（Android 13+ `POST_NOTIFICATIONS`、iOS 通知授权、鸿蒙授权） |
+| 编译安装后**没登录**就弹「是否允许发送通知」 | 华为/荣耀机型是**系统代弹**，不是我们的代码：logcat 搜 `PermissionPolicyService: launch notification permission request dialog` + `REQUEST_PERMISSIONS_FOR_OTHER ... from uid 1000`（system_server 发起）。确认通知是否被禁：`adb shell cmd appops get <pkg> \| grep POST_NOTIFICATION`，`ignore` = 未授权，华为会在每次冷启动再弹；让用户点一次「允许」即可 |
+| 退后台 / 锁屏后仍收不到（前台正常） | 后端按 `im:route` 判在线 ⇒ 只要 WS 没断就 `skippedOnline`。看 App 日志：退后台应有 `pauseKeepalive` + `onClose ... manual=false`，回前台应有 `reconnect by foreground` + `CONNECT_ACK`。**同一账号 PC 端在线也会让手机被判「在线」而不推**（后端判定粒度是 uid 不是 deviceId，属已知待办） |
+| 云函数 `successed_offline`、logcat 里本应用**零痕迹** | 华为侧没拿到 push token。抓 logcat 搜 `HMSSDK_HmsInstanceId: TokenTask failed, ErrorCode:`：**6003 = 签名证书指纹与 AGC 登记的不一致**（`app_id` 打印在下一行 `HMSSDK_HmsClient`）。修法见 6.2 |
+| logcat 里 `HMSSDK_AGCUtils: Get appId with AGConnectServicesConfig failed` | **干扰项，不是故障**：个推接华为走 manifest 的 `com.huawei.hms.client.appid`，DCloud 云打包与本地自定义基座都不注入 `agconnect-services.json`。该行永远出现在 6003 之后，是 token 失败后的降级路径 |
+
+### 6.2 华为 6003（证书指纹不一致）
+
+1. 先从**装到手机上的那个包**取指纹（不是 keystore、不是别的包）：
+
+   ```bash
+   export JAVA_HOME=/Applications/HBuilderX.app/Contents/HBuilderX/plugins/amazon-corretto
+   $ANDROID_HOME/build-tools/36.0.0/apksigner verify --print-certs <apk> | grep -E "DN|SHA-"
+   ```
+
+2. AGC → 我的项目 → 项目设置 → 常规 → 应用信息 → **SHA-256 证书指纹**，与上一步的
+   `certificate SHA-256 digest` 逐位一致（SHA-1 一并填上，不用带冒号也算不同值，按 AGC 提示格式填）。
+   注意 debug 基座与正式包若用不同证书，两条指纹都要登记。
+3. 手机上 **设置 → 应用 → 应用管理 → HMS Core（华为移动服务）→ 存储 → 清除数据**：
+   HMS 会缓存上次校验的签名，不清就会一直报 6003。
+4. 重开 App，logcat 里 `push.gettoken` 的 `errorCode` 应变成 0；此时个推才会把华为 token 与 cid 绑定，
+   之后离线消息才可能经华为通道下发。
+
+> cid 能拿到 ≠ 厂商通道通：`uni.getPushClientId()` 返回的是**个推 cid**，不依赖华为 token，
+> 所以「注册成功、云函数 `successed_offline`、设备端零痕迹」这一组合是 6003 的典型指纹。
 | 点击通知只拉起 App 不进会话 | `payload` 里缺 `convId`/`convType` |
 | 鸿蒙只能前台收到 | 鸿蒙推送需带 push 能力的签名 Profile（调试 profile 已换，**release profile 发版前须在 AGC 重申**） |
 | iOS 收不到 | DCloud 后台 APNs 证书（开发/生产要分开）；系统通知授权被拒后只能去设置手动开 |
+
+### 6.1 联调日志对照表
+
+探针开关：`utils/im/imPushClient.uts` 的 `IM_PUSH_DEBUG`，**默认 `false`**（日志里含完整 cid）；
+排查时临时改 `true`、复现完改回来。`utils/im/imWsClient.uts` 的设备注册探针走既有的 `IM_WS_DEBUG`。
+**统一走 `console.error`**——鸿蒙真机看不到 `console.log/warn`。
+取 cid 失败、权限被拒这类真失败日志不受开关控制，始终打印。
+
+按链路顺序看：
+
+| # | 日志 | 含义 / 怎么判 |
+|---|---|---|
+| 1 | `[ImPush] sync start platform=android storageCid=...` | onLaunch 已进入取 cid 流程。`storageCid` 非空说明上次已取到过 |
+| 2 | `[ImPush] getPushClientId ok cid=...` | ✅ 拿到 cid —— 把这个值给后端做手工 curl 联调 |
+| 2' | `[ImPush] getPushClientId fail: ...` | 基座不含 uni-push / 未开通 / 厂商通道未配。**停在这里，后面都不用看** |
+| 3 | `[ImPush] apply cid changed X → Y，loggedIn=true` | cid 变了会立刻补报一次 |
+| 4 | `[ImPush] report result code=0000 msg=...` | ✅ 后端已落 `push_token`。code 非 0000（如 `IM_90001`）= 后端没存下 |
+| 5 | `[ImPush] device register platform=android deviceId=... pushCid=...` | 每次 WS `CONNECT_ACK` 后的 UPSERT。`pushCid=(empty)` ⇒ 后端拿到 `pushEnabled=false`，**永远不会推** |
+| 6 | `[ImPush] onPushMessage type=receive data={...}` | ✅ 推送**真的到达了本机**（厂商通道 + 通知授权都通）。前台刻意不处理，只留痕 |
+| 7 | `[ImPush] onPushMessage type=click data={...}` | 用户点了通知，接下来看 payload 里有没有 `convId` |
+| 8 | `[ImPush] nav attempt=0 pages=3 top=pages/...` → `nav → navigateTo /pages/message/chat?...` | 跳转决策；`attempt` 反复递增说明启动页/登录页还没走完 |
+| 9 | `[ImPush] nav fail: ...` | `navigateTo` 被拒（多为冷启动时机），只记不重试 |
+| — | 云函数日志 `[push-send] req {...}` / `[push-send] batch N errCode= 0` | uniCloud 控制台 → 云函数 `push-send` → 日志。**有 req = 后端确实调了**，没有 = 后端没调（或签名 401，此时打的是 `rejected: invalid sign`）。`req` 只记长度与 `convId`，不落消息正文 |
+
+联调顺序建议（每步不过就别往下走）：
+
+1. App 冷启动 → 看日志 1~5，拿到 cid 与 deviceId
+2. uniCloud 控制台看有没有 `[push-send] req`（后端该有推送动作了）
+3. 把 App **退到后台或杀掉**（用户在线时后端按设计不推）→ 让另一个账号发消息
+4. 看系统通知栏；App 在前台时看日志 6；点通知看日志 7~8
+
+### 6.3 华为真机闭环实测（2026-10-30，ABR-AL80 / Android 12 / EMUI 14.2）
+
+全链路已通（App 切后台 → 另一个账号发消息 → 通知栏收到）。三处证据留档，便于下次快速判「到底断在哪」：
+
+| 环节 | 证据 |
+|---|---|
+| 后端 → 云函数 | `[push-send] req {"cidCount":4,...}` + `[push-send] batch 4 errCode= 0` |
+| 云函数 → DCloud | `batch res` 里 `successed_offline`（3 个 cid）。★另有 `appid_notmatch`：该 cid 不属于本 App（DCloud 账号下别的应用 / 历史脏数据），后端应据此置 `pushEnabled=false` |
+| DCloud → 手机 | `adb logcat` 里 `NotificationService: enqueueNotificationInternal: pkg=com.nuwax.app channel=com.huawei.android.pushagent73735 importance=3`，`dumpsys` 里 `opPkg=com.huawei.android.pushagent` |
+
+★**"收到了但没看见"**：华为会把同一 App 的多条推送归进一个 `ranker_group` 折叠成一张卡（并可能加「已置顶」），且组内只响一次：
+
+```
+muting noisy, suppressed due to isGroup
+isNeedInterceptStart true, interceptionState:BACKGROUND   # 后台不弹横幅，只进通知栏
+```
+
+排查「通知栏有没有」用 `adb shell dumpsys notification --noredact | grep <pkg>`，别只看屏幕顶部有没有横幅。
+通知权限开关同理：`adb shell cmd appops get <pkg> | grep POST_NOTIFICATION`，出现 `ignore` = 被关（华为机型会因此每次冷启动弹授权框），整行不存在 = 允许。

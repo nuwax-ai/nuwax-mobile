@@ -12,9 +12,10 @@ const BATCH_SIZE = 500                    // 单次最多 500 个 cid
 const MAX_TITLE = 19                      // 通知栏标题（官方：小于 20，留一格给省略号）
 const MAX_CONTENT = 49                    // 通知栏内容（官方：小于 50）
 const MAX_PAYLOAD = 800                   // 透传数据字符数
-// 消息分类：★鸿蒙通道必填，其余通道不配会被认定为"营销类别"而限量推送。
-// harmony 与 huawei 取值相同；IM 即时消息属"服务与通讯"类，不受营销配额限制。
-const DEFAULT_CATEGORY = { harmony: 'IM', huawei: 'IM', vivo: 'IM' }
+// 消息分类：★只有鸿蒙通道「必填」，不配会被认定为"营销类别"而限量推送。
+// ★华为/小米等 Android 通道的 category 是「自分类权益」，必须先在厂商后台申请到该分类才能传，
+//   未申请就传可能被拒或降级 —— 所以我们只默认给 harmony，其余通道留给后端按需显式覆盖。
+const DEFAULT_CATEGORY = { harmony: 'IM' }
 
 const uniPush = uniCloud.getPushManager({ appId: APP_ID })
 
@@ -57,6 +58,7 @@ function normalizePayload(payload) {
 
 exports.main = async (event) => {
   if (!verifySign(event)) {
+    console.error('[push-send] rejected: invalid sign')
     return { errCode: 401, errMsg: 'invalid sign' }
   }
 
@@ -80,6 +82,23 @@ exports.main = async (event) => {
   const payload = normalizePayload(body.payload)
   const category = body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
 
+  // 运维日志：证明「后端确实调了云函数」，并回显本次下发的关键参数
+  // （uniCloud 控制台 → 云函数 push-send → 日志）。
+  // ★不落文案与 payload 明文：云端日志多人可查，消息内容属于用户隐私。
+  //   要核对"文案被截断/角标没生效"，看响应里的 applied 回显即可。
+  console.log('[push-send] req', JSON.stringify({
+    cidCount: ids.length,
+    cidSample: ids.slice(0, 2),
+    titleLength: title.length,
+    contentLength: content.length,
+    convId: payload && payload.convId ? payload.convId : null,
+    convType: payload && payload.convType ? payload.convType : null,
+    payloadLength: JSON.stringify(payload || {}).length,
+    badge: body.badge === undefined ? null : body.badge,
+    force_notification: body.force_notification !== false,
+    request_id: body.request_id || null
+  }))
+
   const results = []
   for (let i = 0; i < ids.length; i += BATCH_SIZE) {
     const chunk = ids.slice(i, i + BATCH_SIZE)
@@ -99,8 +118,12 @@ exports.main = async (event) => {
     }
     try {
       const res = await uniPush.sendMessage(args)
+      console.log('[push-send] batch', chunk.length, 'errCode=', res && res.errCode, res && res.errMsg)
+      // errCode=0 只代表 DCloud 受理，不代表送达；完整结果里可能有按端的任务 id / 失败明细
+      console.log('[push-send] batch res', JSON.stringify(res))
       results.push(res)
     } catch (err) {
+      console.error('[push-send] batch threw:', (err && err.message) || String(err))
       results.push({ errCode: -1, errMsg: (err && err.message) || String(err), push_clientid: chunk })
     }
   }

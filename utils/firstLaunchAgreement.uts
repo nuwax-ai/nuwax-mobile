@@ -1,20 +1,78 @@
 /**
  * 首启协议同意状态（服务协议 + 隐私政策）。
  *
- * 产品流程（对齐主流 App）：安装后首次启动不直接进登录页，先弹协议弹窗；
- * 同意才继续，不同意直接退出。同意状态跨启动持久化，之后不再打扰。
+ * 产品流程（对齐主流 App）：**安装或升级后的首次打开**不直接进登录页，先弹协议卡片；
+ * 同意才继续，不同意直接退出。同意状态持久化，同一版本内不再打扰。
+ *
+ * ★为什么按「版本号」而不是布尔标记：产品要求「升级 App 后也要再弹一次」。
+ *   标记值为同意时的 appVersion，与当前版本比对：
+ *   - 相同 → 本版本已同意，直接放行；
+ *   - 不同/缺失 → 需要弹（新装、升级、或标记被异常清掉）。
+ *
+ * ★这个标记是「安装级」状态：退出登录 / token 失效的缓存清理**不会**清掉它
+ *   （见 utils/installScopedStorage.uts）。否则用户登出再打开会重新被协议卡片挡一次，
+ *   冷启动由推送点击唤起时更会盖在推送跳转上（2026-10-30 鸿蒙真机复现）。
  *
  * ★与登录页的 `agreement-checkbox` 是两回事：那个是登录表单的勾选（每次登录勾一次），
- *   这里只拦冷启动的第一屏。
+ *   这里只拦 App 的启动首屏。
  */
 
-const AGREEMENT_ACCEPTED_KEY = "app_agreement_accepted_v1";
+import {
+  FIRST_LAUNCH_AGREEMENT_KEY,
+  FIRST_LAUNCH_AGREEMENT_LEGACY_KEY,
+} from "@/utils/installScopedStorage";
 
-/** 是否已在本次安装中同意过首启协议。 */
+/**
+ * 当前 App 版本号（= manifest.json 的 versionName，用于判定「本版本是否已同意」；取不到时返回空串）。
+ * 先走 getAppBaseInfo()（包体信息专用接口，与「我的」页版本号同源），
+ * 取不到再退回 getSystemInfoSync() 兜底——端上偶发返回空串，不能让它直接决定「永不弹」。
+ */
+function currentAppVersion(): string {
+  try {
+    const base = uni.getAppBaseInfo();
+    const fromBase = base != null && base.appVersion != null ? `${base.appVersion}`.trim() : "";
+    if (fromBase.length > 0) return fromBase;
+  } catch (_e) {
+  }
+  try {
+    const info = uni.getSystemInfoSync();
+    return `${info.appVersion}`.trim();
+  } catch (_e) {
+    return "";
+  }
+}
+
+/**
+ * 本版本是否已同意首启协议。
+ * - 有版本标记：与当前版本比对（升级 → 版本不同 → 重新弹）。
+ * - 无版本标记但有旧版布尔标记 "1"：说明是「加版本号之前」的那版同意的，
+ *   静默升级成当前版本，不再多问一次；之后升级照常弹。
+ */
 export function hasAcceptedFirstLaunchAgreement(): boolean {
   try {
-    const raw = uni.getStorageSync(AGREEMENT_ACCEPTED_KEY);
-    return raw != null && `${raw}` == "1";
+    const current = currentAppVersion();
+    const saved = uni.getStorageSync(FIRST_LAUNCH_AGREEMENT_KEY);
+    const savedText = saved != null ? `${saved}`.trim() : "";
+    if (savedText.length > 0) {
+      // "1" = 旧布尔标记，或同意时没读到版本号（见 markFirstLaunchAgreementAccepted）。
+      // 一律按已同意处理，并把标记升级成真版本号——否则「写 1 / 读 1.2.9」会被判成
+      // 版本不一致，变成每次启动都弹。
+      if (savedText == "1") {
+        if (current.length > 0) uni.setStorageSync(FIRST_LAUNCH_AGREEMENT_KEY, current);
+        return true;
+      }
+      // 读不到当前版本号（理论上不会）：无从比对，按已同意处理，别拿用户当首次启动
+      if (current.length == 0) return true;
+      return savedText == current;
+    }
+    if (current.length > 0) {
+      const legacy = uni.getStorageSync(FIRST_LAUNCH_AGREEMENT_LEGACY_KEY);
+      if (legacy != null && `${legacy}` == "1") {
+        uni.setStorageSync(FIRST_LAUNCH_AGREEMENT_KEY, current);
+        return true;
+      }
+    }
+    return false;
   } catch (_e) {
     // 读失败按「未同意」处理：最多让用户多点一次，不能放过未同意的用户
     return false;
@@ -24,7 +82,8 @@ export function hasAcceptedFirstLaunchAgreement(): boolean {
 /** 记录已同意（同意按钮点击时写，先落盘再放行）。 */
 export function markFirstLaunchAgreementAccepted(): void {
   try {
-    uni.setStorageSync(AGREEMENT_ACCEPTED_KEY, "1");
+    const current = currentAppVersion();
+    uni.setStorageSync(FIRST_LAUNCH_AGREEMENT_KEY, current.length > 0 ? current : "1");
   } catch (_e) {
     // 落盘失败：本次仍放行，下次启动会再问一次
   }

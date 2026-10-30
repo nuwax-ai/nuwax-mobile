@@ -32,6 +32,33 @@ HMS / 鸿蒙 NEXT 厂商参数）已在 DCloud 开发者中心填好，只用于
 
 联调顺序建议：先用一条真实的 cid 手工 `curl` 调通云函数（能收到通知），再接后端逻辑。
 
+### 2.1 后端代码接入位置（2026-10-30 核查后的现状）
+
+`nuwax-im` 里离线推送框架已经齐了：`OfflinePushConsumer` 消费 `PUSH_OFFLINE`、
+`OfflinePushChannel` 接口 + `WebPushChannel`（唯一实现）+ `ImOfflinePushChannelGuard`（启动打印通道覆盖矩阵）。
+**但没有任何代码调 `push-send`，移动端在覆盖矩阵里显示"（无通道）"**。要接入需改 4 处：
+
+1. **新增 `UniPushChannel implements OfflinePushChannel`**：`supports()` 返回 ANDROID/IOS/HARMONYOS，
+   `push()` 里 POST 云函数；`configured()` 判断云函数 URL 与签名密钥是否配好（没配就让 guard 报出来，别静默跳过）。
+2. **★改 `OfflinePushConsumer.pushToDevices()` 的设备过滤**（隐藏坑，不改前面全白做）：
+
+   ```java
+   // 现状：移动端设备结构上就没有 p256dh/auth，会被整批跳过
+   if (isBlank(d.getPushToken()) || isBlank(d.getPushP256dh()) || isBlank(d.getPushAuth())) {
+       skippedNoSubscription.incrementAndGet(); continue;
+   }
+   ```
+
+   接口注释写的"新增实现类即可，不用改消费逻辑"**并不成立**。要么把这个判断拆成
+   Web Push（三要素齐全）与移动端（只要 `pushToken` 非空）两条分支，要么把这个校验下沉进各
+   `OfflinePushChannel` 自己实现。
+3. **`ImPushProperties` 增加配置**：云函数 URL、`X-Push-Sign` 密钥（走配置中心/密钥管理，不要写进 yml 提交）。
+4. **`badge` 计算**：consumer 目前不算未读总数，需要按接收者取一次 `/api/instant-message/unread-total`
+   同口径的值（= `total`，已排除免打扰）塞进请求体；同时保证**一次调用一个接收者**（见 3.2 的角标约束）。
+
+`Subscription` record 是为 Web Push 设计的（`endpoint/p256dh/auth`），移动端只需用到 `deviceId` +
+查库拿 `pushToken`，不必强行把 cid 塞进 `endpoint`。
+
 ## 3. 后端调云函数的契约
 
 ### 3.1 存 cid（复用现有接口，无需新增）
@@ -75,10 +102,9 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
   "content": "在吗",
   "payload": {
     "convId": "1234567890",
-    "convType": 1,
-    "name": "张三",
-    "avatar": "https://..."
+    "convType": 1
   },
+  "badge": 5,
   "force_notification": true,
   "request_id": "可选，用于幂等"
 }
@@ -88,18 +114,38 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `push_clientid` | ✅ | 单个字符串或数组；云函数内部按 500 个一批自动分包 |
-| `title` | ✅ | 通知标题（单聊=发送者名，群聊=群名） |
-| `content` | ✅ | 通知正文（摘要） |
-| `payload` | ⬜ | **点击跳转依据**，原样透传到客户端 `onPushMessage` 的 `res.data` |
+| `push_clientid` | ✅ | 单个字符串或数组；云函数内部按 500 个一批自动分包。★**一批必须是同一个接收者的设备**（见下方角标） |
+| `title` | ✅ | 通知标题（单聊=发送者名，群聊=群名）。**官方限制小于 20 字**，云函数会裁到 19 + `…` |
+| `content` | ✅ | 通知正文（摘要）。**官方限制小于 50 字**，云函数会裁到 49 + `…` |
+| `payload` | ⬜ | **点击跳转依据**，原样透传到客户端 `onPushMessage` 的 `res.data`。官方限制 **800 字符**，超长时云函数只保留 `convId`/`convType` |
+| `badge` | ⬜ | 应用图标角标，Number 或 String（`5` 置为 5；`"+1"` 累加；`"-1"` 递减仅 iOS）。**填该接收者的未读总数** |
+| `category` | ⬜ | 消息分类，默认 `{"harmony":"IM","huawei":"IM","vivo":"IM"}`。★**鸿蒙通道必填**，不配会被判为营销类限量推送；一般不用传 |
 | `force_notification` | ⬜ | 默认 true：离线时由系统通知栏展示 |
-| `request_id` | ⬜ | 幂等键 |
+| `request_id` | ⬜ | 幂等键，10~32 位，重复会导致消息丢失 |
 
 `payload` 约定（App 端 [utils/im/imPushClient.uts](../../utils/im/imPushClient.uts) 读取）：
 
 - `convId`：**必须**，没有则点击只拉起 App 不进会话
 - `convType`：1 单聊 / 2 群聊 / 4 团队，缺省按 1
-- `name`、`avatar`：可选，用于会话页首帧标题与头像（缺省时页面自己拉）
+- ~~`name`、`avatar`~~：**不建议再传**。端上会话页本来就会自己拉标题和头像，而带签名的头像 URL 很容易顶满 800 字符额度，挤掉跳转必需字段。
+
+#### ★角标（badge）的三个约束
+
+1. **一次调用只能一个接收者**。`badge` 是单值，不是数组；若把多个用户的 cid 拼成一批，不只角标会错，`title`/`content` 也会串到别人手机上。
+2. **值填未读总数，不要填 `+1`**。总数方案每次推送都把角标拉回真实值，自带纠偏；`+1` 在丢一条推送后会永久偏小且无法自愈。
+3. **口径 = `/api/instant-message/unread-total` 返回的 `total`**。该值**已排除免打扰会话**（后端 `ImUnreadCounter` 不变式：`total == Σ(dnd=0 会话未读)`），**不要再减 `dndTotal`**，否则与 App 内 TabBar 角标对不上。
+
+#### 平台支持（官方限制，不是我们能改的）
+
+| 平台 | badge |
+|---|---|
+| iOS | ✅ |
+| 鸿蒙 | 文档标注支持，**待真机验证** |
+| 华为 Android | ✅（`uni-app` 应用） |
+| 华为 Android（**uni-app x 应用**） | ❌ 官方明示"暂不支持"——本 App 属此类 |
+| 其他 Android（小米/OPPO/vivo） | 走各自厂商通道，不保证 |
+
+⇒ 测试时若华为 Android 机上角标不动，是官方限制；后端仍照常传 `badge`，无需特殊处理。
 
 响应：
 
@@ -107,9 +153,18 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
 {
   "errCode": 0,          // 401=签名不对 400=参数缺失 -1=某批次发送失败
   "errMsg": "ok",
-  "data": { "total": 2, "batches": 1, "failedBatches": 0, "results": [ ... ] }
+  "data": {
+    "total": 2,
+    "batches": 1,
+    "failedBatches": 0,
+    "applied": { "titleLength": 2, "contentLength": 2, "payloadLength": 32,
+                 "badge": 5, "category": {"harmony":"IM","huawei":"IM","vivo":"IM"} },
+    "results": [ ... ]
+  }
 }
 ```
+
+`applied` 回显实际下发的值（裁剪后的标题/正文长度、载荷长度、角标、分类），排查"文案被截断/角标没生效"时先看它。
 
 ### 3.3 失败处理
 
@@ -122,12 +177,12 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
 | 能力 | 状态 |
 |---|---|
 | 取 cid 并随设备注册上报 | ✅ 已实现 |
-| 通知点击 → 打开对应会话 | ✅ 已实现（读 `payload.convId/convType/name/avatar`；无 `convId` 时只拉起 App） |
+| 通知点击 → 打开对应会话 | ✅ 已实现（读 `payload.convId/convType`，兼容旧的 `name/avatar`；无 `convId` 时只拉起 App） |
 | 前台/后台 `receive` 事件 | ⬜ **刻意不处理**，前台由 WS 消息链路负责，后台由系统通知栏展示 |
 | Android 13+ / 鸿蒙通知授权 | ✅ 启动时主动申请 |
 | iOS 通知授权 | ⚠️ 由 uni-push 模块申请，待真机确认 |
 | 通知渠道路由（`setPushChannel`） | ⬜ 未做，厂商"自分类权益"开启后需补 |
-| 推送角标数字 | ⬜ 未做，如需要后端在 payload 里带，端上另做适配 |
+| 桌面图标角标 | ✅ **端上不需要做**：由 `uniPush.sendMessage({badge})` 下发给厂商通道直接设置。uni-app x 没有 `uni.setBadgeNumber`，App 回前台也不会去清角标 —— 如需"点开后清零"，得后端在下一次推送时传新值，或后续接原生插件 |
 
 ## 5. 安全
 

@@ -96,6 +96,30 @@
                 </view>
               </view>
             </view>
+            <!--
+              ★DEV-271：群内**智能体**的衔接模式（1=唤起 / 2=监听）。
+              判据 = 服务端有没有下发 agentMode（真人行键不出现 ⇒ 读到 0），
+              绝不按 id 段位猜 —— 见 utils/im/imAgentMode.uts 文件头。
+              ★"没权限也看得见、只是改不了"：谁在这个群里收全群消息，是成员该知道的事。
+              ★文案在行解析时算好存 agentModeLabel（不在模板里调方法：Android
+              方法调用式绑定不收集依赖，改完模式标签不会刷新）。
+              ★点按钮 = 改模式（canAgentModeOf && 服务端才是权威）；无权限吐提示。
+              ★放在行尾做成大胶囊：原先贴在名字后只有 10px 字高的命中区，点偏一点
+              就落回整行（进成员资料页）。touchstart 落位记守卫，兜住 `.stop` 失效的端。
+            -->
+            <view
+              v-if="m.agentMode > 0"
+              class="gm-mode"
+              :class="{ 'gm-mode--listen': m.agentMode == 2 }"
+              hover-class="gm-mode--pressed"
+              @touchstart="handleModeTouchStart"
+              @click.stop="handleAgentModeTap(m)"
+            >
+              <text
+                class="gm-mode__text"
+                :class="{ 'gm-mode__text--listen': m.agentMode == 2 }"
+              >{{ m.agentModeLabel }}</text>
+            </view>
           </view>
         </view>
         <view v-if="filteredMembers.length == 0" class="gm-state">
@@ -166,6 +190,8 @@
 
     <!-- 紧凑确认弹窗（撤销管理员二次确认，替代系统 showModal 样式） -->
     <confirm-modal ref="confirmModalRef" @confirm="handleRevokeManagerConfirm" />
+    <!-- 智能体「改为监听」二次确认（DEV-271：监听是花钱开关，每一条消息一次真实调用） -->
+    <confirm-modal ref="agentModeConfirmRef" @confirm="handleAgentModeConfirm" />
 
     <!-- 添加成员：复用添加伙伴弹窗（群模式：隐藏附言/发消息，走 convAddMembers） -->
     <add-buddy-sheet ref="addBuddySheetRef" @added="handleMemberAdded" />
@@ -185,6 +211,7 @@
     apiImConvDetail,
     apiImConvMembersPage,
     apiImGroupRemoveMember,
+    apiImGroupSetAgentMode,
     apiImGroupSetMemberRole,
   } from "@/servers/im";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
@@ -193,6 +220,15 @@
   import AddBuddySheet from "@/components/add-buddy-sheet/add-buddy-sheet.uvue";
   import { registerPopupClose, unregisterPopupClose } from "@/utils/popupBackRegistry";
   import { getCachedContactRemarks } from "@/utils/im/contactRemarkCache";
+  import {
+    AGENT_MODE_LISTEN,
+    AGENT_MODE_MENTION,
+    agentModeLabelKey,
+    canSetAgentMode,
+    isAgentMemberMode,
+    normalizeAgentMode,
+  } from "@/utils/im/imAgentMode";
+  import { getMyUserIdSync } from "@/utils/imNoticeBar";
   import { invalidateCachedConvMembers, setCachedConvMembers } from "@/utils/im/convMembersCache";
   import { CUSTOM_TAB_BAR_ENABLED } from "@/constants/customTabBar.constants";
 
@@ -224,6 +260,14 @@
     self: boolean = false;
     avatarFailed: boolean = false;
     contactState: string = "";
+    /** ★DEV-271 衔接模式：1=唤起 / 2=监听 / 0=非智能体（服务端未下发）。
+     *  判「是不是智能体」只认它（>0），见 utils/im/imAgentMode.uts。 */
+    agentMode: number = 0;
+    /** ★把这个智能体拉进群的人（雪花号字符串；空=真人行或存量行不知道谁拉的）。 */
+    agentInviterId: string = "";
+    /** 模式的展示文案（解析时算好；模板直接渲染，勿在模板里调方法——Android 方法
+     *  调用式绑定不收集依赖，改完模式标签不会刷新）。 */
+    agentModeLabel: string = "";
   }
 
   // ===== 页面入参 =====
@@ -344,6 +388,15 @@
   let suppressNextSwipeClick = false;
   let suppressSwipeClickUntil = 0;
 
+  // 模式按钮吞击位：按在「唤起/监听」胶囊上时行不该进资料页。
+  // 正常端 `@click.stop` 就够；个别端（Android 原生手势链路）子节点 stop 不生效，
+  // 抬手补发的行 click 会漏上来 —— 落点时间窗内一律吞掉（同 suppressNextSwipeClick 思路）。
+  let modeTouchGuardUntil = 0;
+
+  function handleModeTouchStart(): void {
+    modeTouchGuardUntil = Date.now() + 600;
+  }
+
   /** 长按浮层行高亮 class：浮层开着且为指向行 → 浅灰底（无蒙层后的原位高亮）。 */
   function rowMenuOnCls(rowId: string): string {
     return rowMenuVisible.value && rowMenuRowId == rowId ? "gm-row--menu-on" : "";
@@ -434,7 +487,8 @@
     if (
       touchingRowPending.length > 0 &&
       listScrolling.value != true &&
-      rowMenuVisible.value != true
+      rowMenuVisible.value != true &&
+      Date.now() > modeTouchGuardUntil
     ) {
       const e = eventValue as UniTouchEvent;
       if (e.changedTouches != null && e.changedTouches.length > 0) {
@@ -562,6 +616,9 @@
    *  姓名/头像传原始值——勿传解析出的 blob: 地址，资料页自行解析用户名与联系人状态；
    *  不带 fromConvId：群会话 ≠ 成员单聊会话，「发消息」建的新 P2P 会话须 redirectTo）。 */
   function handleRowTap(m: GmMember): void {
+    if (Date.now() <= modeTouchGuardUntil) {
+      return;
+    }
     if (rowClickIntercept()) {
       return;
     }
@@ -609,6 +666,12 @@
     m.avatar = imAvatarDisplayUrl(m.avatarRaw, 72);
     m.role = readNumber(record, "role", 1);
     m.self = readBool(record, "self");
+    // ★DEV-271：智能体行恒有值（1/2）、真人行键不出现 ⇒ 缺省 0 即「不是智能体」。
+    //   意外值（服务端将来加第三值）由 normalizeAgentMode 归到花钱更少的「唤起」。
+    const agentModeRaw = readNumber(record, "agentMode", 0);
+    m.agentMode = isAgentMemberMode(agentModeRaw) ? normalizeAgentMode(agentModeRaw) : 0;
+    m.agentInviterId = readString(record, "agentInviterId");
+    m.agentModeLabel = m.agentMode > 0 ? t(agentModeLabelKey(m.agentMode)) : "";
     const cachedRemarks = getCachedContactRemarks();
     const myRemark = cachedRemarks == null
       ? ""
@@ -710,10 +773,11 @@
     const live = visibleMembers.value;
     for (let i = 0; i < live.length; i++) {
       const row = live[i];
-      // ★跳过条件看「avatar 仍等于原始地址」：App 端未解析时 avatar=raw 透传非空，
-      //   旧 length>0 判断会把 App 端解析整个跳过（read-status 同款更正）
+      // ★跳过条件：空串=H5/鸿蒙未解析的受保护地址（先藏图）、等于原址=App 透传
+      //   （未解析非空）——两种都须解析；已解析（非空且≠原址）跳过。旧「avatar
+      //   != raw」单条件会把藏图空串行整个跳过（H5 潜伏 bug，鸿蒙接入藏图后同踩）
       const raw = row.avatarRaw;
-      if (raw.length == 0 || row.avatar != raw) {
+      if (raw.length == 0 || (row.avatar.length > 0 && row.avatar != raw)) {
         continue;
       }
       resolveImAvatarDisplay(raw, 72).then((resolved: string) => {
@@ -764,6 +828,17 @@
    *  互管；不能给自己——本人走群设置的 members/me，群主无人可管）。 */
   function canCardOf(m: GmMember): boolean {
     return canRemoveOf(m);
+  }
+
+  /**
+   * 智能体衔接模式可改？判据在 utils/im/imAgentMode.canSetAgentMode（与服务端
+   * setAgentMode 三选一逐字对齐）：群主 / 管理员 / **把这个智能体拉进群的人**。
+   * ★与 canRemoveOf **刻意不同口径**：拉智能体进群的普通成员管不了任何人，
+   *   但能改自己加进来的智能体的模式（需求点名的就是「添加者」）；
+   *   这里少算一个 inviter 不会有任何报错，表现只是「那个人看不到可改入口」。
+   */
+  function canAgentModeOf(m: GmMember): boolean {
+    return canSetAgentMode(m.agentMode, myRole.value, m.agentInviterId, getMyUserIdSync());
   }
 
   // ===== 长按行操作浮层：定位与入口（行矩形测量 → 气泡几何拼装，message.uvue 同款）=====
@@ -833,6 +908,19 @@
       }
       if (canCardOf(m)) {
         acts.push(new GmRowMenuAct("card", t("Mobile.Message.setGroupCard"), "icon-Edit"));
+      }
+      // ★DEV-271：智能体行的「衔接模式」——与点行上模式标签同一入口（长按是本页既有的
+      //   操作面，标签是快捷路径；两处都只调 handleAgentModeTap，口径不会分叉）。
+      if (canAgentModeOf(m)) {
+        acts.push(
+          new GmRowMenuAct(
+            "agentmode",
+            m.agentMode == AGENT_MODE_LISTEN
+              ? t("Mobile.Message.agentModeToMention")
+              : t("Mobile.Message.agentModeToListen"),
+            m.agentMode == AGENT_MODE_LISTEN ? "icon-a-Checkcircle" : "icon-attention",
+          ),
+        );
       }
       if (canContactOf(m)) {
         acts.push(new GmRowMenuAct("contact", t("Mobile.Message.addToDirectory"), "icon-a-Pluscircle"));
@@ -1253,6 +1341,143 @@
     }
   }
 
+  // ===== 成员操作：改群内智能体的衔接模式（DEV-271，对齐 PC MemberPanelBody）=====
+  /** 模式切换在途（防重入；与 roleChanging 分开，互不阻塞）。 */
+  const agentModeChanging = ref<boolean>(false);
+  /** 「改为监听」二次确认弹窗（监听 = 每条消息一次真实模型调用，必须确认）。 */
+  const agentModeConfirmRef = ref<any | null>(null);
+  /** 待确认的成员行与目标模式（确认回调取用；取消由下次打开覆盖）。 */
+  let pendingAgentModeMember: GmMember | null = null;
+  let pendingAgentModeValue: number = AGENT_MODE_MENTION;
+
+  /**
+   * 打开「改为监听」二次确认（监听 = 每条消息一次真实模型调用，必须让用户看清代价）。
+   * ★两个入口（点标签 / 长按菜单）共用，文案与闸门只有这一份。
+   */
+  function openAgentModeListenConfirm(m: GmMember): void {
+    pendingAgentModeMember = m;
+    pendingAgentModeValue = AGENT_MODE_LISTEN;
+    const proxy = agentModeConfirmRef.value as ComponentPublicInstance | null;
+    if (proxy == null) {
+      return;
+    }
+    proxy.$callMethod(
+      "open",
+      t("Mobile.Message.agentModeListenConfirmTitle"),
+      t("Mobile.Message.agentModeListenConfirmBody"),
+      t("Mobile.Message.agentModeListenConfirmOk"),
+    );
+  }
+
+  /**
+   * 提交模式切换（服务端 PUT .../agent-mode）。
+   *
+   * ★**没有乐观更新**：回包成功后才改行上的值，失败时它自己就停在原值上，
+   *   不需要本地态也就不需要回滚代码。反过来先改本地态再请求，失败时会看到
+   *   「界面切过去了、服务端没变」—— 监听这一侧的错觉是要花钱的。
+   * ★返回 data=false = 「值没变、服务端没写库」（幂等），**不是**失败：文案必须与
+   *   「已切换」分开，否则用户会以为刚才那一下没生效、再点一次。
+   * ★不动列表顺序/渲染窗口（不整表重拉）：就地改这一行，避免 100 人列表闪一次加载态。
+   */
+  async function setMemberAgentMode(m: GmMember, mode: number): Promise<void> {
+    if (agentModeChanging.value || convId.value.length == 0) {
+      return;
+    }
+    agentModeChanging.value = true;
+    const params = new Map<string, string | number>();
+    params.set("mode", t(agentModeLabelKey(mode)));
+    try {
+      const res = await apiImGroupSetAgentMode(convId.value, m.userId, mode);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        m.agentMode = mode;
+        m.agentModeLabel = t(agentModeLabelKey(mode));
+        // ★App-Android 不追踪 ref 数组内实例属性的原地变更（本页 avatarFailed/avatar
+        //   同款平台缺陷）：写回后须去抖整表重建一次，否则标签停在旧模式上。
+        scheduleRowsRefresh();
+        // @ 两入口复用的成员快照随模式写入变脏；失效即可（下次取用自会重拉）
+        invalidateCachedConvMembers(convId.value);
+        const dataRaw = apiResData<any>(res);
+        const changed = dataRaw != null && `${dataRaw}` == "true";
+        uni.showToast({
+          title: translateFn(
+            changed ? "Mobile.Message.agentModeChanged" : "Mobile.Message.agentModeNoChange",
+            toI18nParams(params),
+            "",
+          ),
+          icon: "none",
+        });
+      } else {
+        // 服务端才是权限权威（IM_30001 越权 / IM_90001 目标是真人 / IM_20104 不在群）
+        uni.showToast({ title: apiResMessage(res), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+    agentModeChanging.value = false;
+  }
+
+  /** 监听二次确认：确认后提交（弹窗组件负责关闭自身）。 */
+  function handleAgentModeConfirm(): void {
+    const m = pendingAgentModeMember;
+    pendingAgentModeMember = null;
+    if (m != null) {
+      setMemberAgentMode(m, pendingAgentModeValue);
+    }
+  }
+
+  /**
+   * 点智能体行上的模式标签：可改 → 动作面板（唤起 / 监听）；不可改 → 只吐含义提示。
+   * ★不可改的人**仍然看得见**标签（成员该知道这个群里的智能体是不是在收全群消息），
+   *   这与 PC 群成员面板「没权限也看得见、只是改不了」同一条口径。
+   * ★切到监听必须二次确认：那是花钱开关（群里每一条消息都触发一次真实模型调用）。
+   */
+  function handleAgentModeTap(m: GmMember): void {
+    if (!isAgentMemberMode(m.agentMode)) {
+      return;
+    }
+    if (!canAgentModeOf(m)) {
+      uni.showToast({ title: t("Mobile.Message.agentModeHint"), icon: "none" });
+      return;
+    }
+    const current = m.agentMode;
+    uni.showActionSheet({
+      itemList: [t("Mobile.Message.agentModeMention"), t("Mobile.Message.agentModeListen")],
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        const mode = res.tapIndex == 0 ? AGENT_MODE_MENTION : AGENT_MODE_LISTEN;
+        if (mode == current) {
+          const params = new Map<string, string | number>();
+          params.set("mode", t(agentModeLabelKey(mode)));
+          uni.showToast({
+            title: translateFn("Mobile.Message.agentModeNoChange", toI18nParams(params), ""),
+            icon: "none",
+          });
+          return;
+        }
+        if (mode == AGENT_MODE_LISTEN) {
+          openAgentModeListenConfirm(m);
+          return;
+        }
+        setMemberAgentMode(m, mode);
+      },
+    });
+  }
+
+  /**
+   * 长按菜单的「改为监听 / 改为唤起」：直接切到**另一侧**（菜单项文案就是这个意思）。
+   * ★切到监听仍走花钱二次确认；切回唤起不花钱，直接提交。
+   */
+  function toggleAgentMode(m: GmMember): void {
+    if (!canAgentModeOf(m)) {
+      return;
+    }
+    if (m.agentMode == AGENT_MODE_LISTEN) {
+      setMemberAgentMode(m, AGENT_MODE_MENTION);
+      return;
+    }
+    openAgentModeListenConfirm(m);
+  }
+
 
   // ===== 成员操作：添加到智联录（不传 direct：走申请/对方同意链路） =====
   async function handleContactTap(m: GmMember): Promise<void> {
@@ -1328,6 +1553,8 @@
       handleRoleTap(m);
     } else if (actKey == "card") {
       handleCardTap(m);
+    } else if (actKey == "agentmode") {
+      toggleAgentMode(m);
     } else if (actKey == "contact") {
       handleContactTap(m);
     } else if (actKey == "remove") {
@@ -1612,6 +1839,43 @@
     font-size: 10px;
     line-height: 15px;
     color: #5147ff;
+  }
+
+  /* ★DEV-271：智能体衔接模式按钮。与角色标签分开配色：唤起=灰（默认态、不打扰），
+     监听=琥珀（此刻在收全群消息，值得一眼看见）。有权限的人点它即改（动作面板）。
+     ★做成行尾胶囊而非名字后的小标签：命中区要够大（30px 高），否则手指一偏就落回
+     整行 → 误进成员资料页。 */
+  .gm-mode {
+    flex-shrink: 0;
+    margin-left: 8px;
+    min-width: 52px;
+    min-height: 30px;
+    padding: 6px 11px;
+    border-radius: 15px;
+    background-color: rgba(90, 89, 102, 0.1);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+  }
+
+  .gm-mode--listen {
+    background-color: rgba(232, 146, 42, 0.16);
+  }
+
+  .gm-mode--pressed {
+    opacity: 0.6;
+  }
+
+  .gm-mode__text {
+    font-size: 12.5px;
+    line-height: 17px;
+    color: #5a5966;
+  }
+
+  .gm-mode__text--listen {
+    color: #c97a12;
   }
 
   .gm-tail {

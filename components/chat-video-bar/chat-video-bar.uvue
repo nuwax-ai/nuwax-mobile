@@ -1,0 +1,403 @@
+<template>
+  <!-- 自绘视频控制条（App 三端统一）：播放/暂停 + 当前时间 + 可拖动进度 + 总时长 + 全屏键。
+       为什么要自绘：系统 controls 的时间文案/全屏键都由平台播放器绘制，字号与排布没有
+       任何接口可调（鸿蒙 ArkUI Video.controls 只收一个 boolean），时长一长（如 01:23:45）
+       就把最右侧的全屏键挤出可视区。自绘后所有元素宽度都是我们的：时间文案固定 10px 定宽，
+       进度条 flex 吃掉余量，全屏键恒在最右、永不被挤走。
+
+       ★与 <video> 必须是兄弟节点，不能是子节点：iOS 往 <video> 里挂节点，全屏切换时
+       子节点销毁直接闪退（#22070 未修复）。页面侧把本组件放在 <video> 之后、同一个
+       position:relative 的容器里，由容器 overflow:hidden 裁圆角。
+
+       零页面绑定：进度/播放态读 utils/chatVideoControl.uts 的模块级 ref（timeupdate 每秒
+       数拍，写页面级 reactive 会整列表重渲）；操作直接按 playerId 取 UniVideoElement
+       （play/pause/seek/requestFullScreen 都在元素 API 上，无 currentTime/duration getter，
+       进度只能由页面 @timeupdate 喂进来）。
+
+       ★全屏态：系统全屏里的退出键与控制条共用同一闸门（controls），所以页面模板是
+       `:controls="videoFullscreen"`——行内 false（本组件接管），一进全屏 true（系统条
+       带退出键回来）。全屏态在 utils/chatVideoControl.uts，本组件进全屏前乐观置位。 -->
+  <view
+    class="cvb"
+    @click.stop="blockTap"
+    @touchstart.stop="blockTouch"
+    @touchmove.stop="blockTouch"
+    @touchend.stop="blockTouch"
+  >
+    <!-- 播放/暂停：▶ 用 PNG（各平台字体字形度量不一，PNG 光学居中三端一致），
+         ❚❚ 用两个纯 view 画（不依赖字体/图标资源） -->
+    <view class="cvb__btn" @click.stop="togglePlay">
+      <view v-if="playing" class="cvb__pause">
+        <view class="cvb__pause-bar" />
+        <view class="cvb__pause-bar" />
+      </view>
+      <image v-else class="cvb__play" src="/static/images/icon-video-play.png" mode="aspectFit" />
+    </view>
+    <text class="cvb__time">{{ curText }}</text>
+    <!-- 进度：外层 20px 高做热区（2px 的细条按不住），内层细条 + 圆点 -->
+    <view
+      :id="trackId"
+      class="cvb__track"
+      @touchstart.stop="handleTrackTouch($event)"
+      @touchmove.stop="handleTrackTouch($event)"
+      @touchend.stop="handleTrackTouchEnd"
+      @touchcancel.stop="handleTrackTouchEnd"
+    >
+      <view class="cvb__track-bg">
+        <view class="cvb__track-fill" :style="{ width: pctText }" />
+        <view v-if="hasDuration" class="cvb__track-dot" :style="{ left: pctText }" />
+      </view>
+    </view>
+    <text class="cvb__time cvb__time--total">{{ durText }}</text>
+    <!-- 全屏键：四角括号纯 view 绘制（同原 Android 兜底键，不依赖字体字形） -->
+    <view class="cvb__btn cvb__btn--fs" @click.stop="toggleFullscreen">
+      <view class="cvb__corner cvb__corner--tl" />
+      <view class="cvb__corner cvb__corner--tr" />
+      <view class="cvb__corner cvb__corner--bl" />
+      <view class="cvb__corner cvb__corner--br" />
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref } from "vue";
+  import {
+    beginChatVideoFullscreen,
+    chatVideoCurrentRef,
+    chatVideoDurationRef,
+    chatVideoPlayingRef,
+    isChatVideoFullscreen,
+    setChatVideoFullscreen,
+  } from "@/utils/chatVideoControl.uts";
+
+  const props = defineProps<{
+    /** <video> 的元素 id（进度/播放态按它索引，操作也按它取元素）。 */
+    playerId: string;
+  }>();
+
+  /** 本组件私有进度（模块级 ref，按 playerId 各一份）。 */
+  const curRef = chatVideoCurrentRef(props.playerId);
+  const durRef = chatVideoDurationRef(props.playerId);
+  const playingRef = chatVideoPlayingRef(props.playerId);
+
+  /** 进度热区元素 id（拖动时算触点落在轨道上的比例）。 */
+  const trackId = `cvbTrack-${props.playerId}`;
+
+  /** 拖动中的比例（0-100，-1=未拖动）：按下即跟手反馈，松手才真正 seek。 */
+  const dragPct = ref<number>(-1);
+  /** 上次 seek 时间（拖动 seek 节流，避免一帧一次 seek 卡播放器）。 */
+  let lastSeekAt = 0;
+
+  /** 播放态（模板直读 computed，App-Android 方法调用绑定不收集方法体内依赖）。 */
+  const playing = computed<boolean>((): boolean => playingRef.value);
+  const hasDuration = computed<boolean>((): boolean => durRef.value > 0);
+
+  /** 00:12 / 1:02:03（>1 小时才出小时位，宽度仍在定宽内）。 */
+  function formatClock(seconds: number): string {
+    if (!(seconds > 0)) {
+      return "00:00";
+    }
+    const total = Math.floor(seconds);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const mText = m < 10 ? `0${m}` : `${m}`;
+    const sText = s < 10 ? `0${s}` : `${s}`;
+    if (h > 0) {
+      return `${h}:${mText}:${sText}`;
+    }
+    return `${mText}:${sText}`;
+  }
+
+  const curText = computed<string>((): string => formatClock(curRef.value));
+  const durText = computed<string>((): string => formatClock(durRef.value));
+
+  /** 进度条宽度（拖动中跟手，否则按真实进度）。 */
+  const pctText = computed<string>((): string => {
+    if (dragPct.value >= 0) {
+      return `${dragPct.value}%`;
+    }
+    const dur = durRef.value;
+    if (!(dur > 0)) {
+      return "0%";
+    }
+    let pct = (curRef.value / dur) * 100;
+    if (!(pct > 0)) {
+      pct = 0;
+    }
+    if (pct > 100) {
+      pct = 100;
+    }
+    return `${Math.round(pct * 10) / 10}%`;
+  });
+
+  /** 按 playerId 取播放器（预载后每行各有一个实例）。 */
+  function playerElement(): UniVideoElement | null {
+    if (props.playerId.length == 0) {
+      return null;
+    }
+    return uni.getElementById(props.playerId) as UniVideoElement | null;
+  }
+
+  /** 控制条自身的点击/触摸不外抛：外层容器上挂着「点视频切播放/暂停」与长按菜单。 */
+  function blockTap(): void {
+    // 只为吃掉冒泡
+  }
+
+  function blockTouch(): void {
+    // 只为吃掉冒泡（touchstart 不外抛，外层的长按计时器就不会启动）
+  }
+
+  function togglePlay(): void {
+    const el = playerElement();
+    if (el == null) {
+      return;
+    }
+    if (playing.value) {
+      el.pause();
+    } else {
+      el.play();
+    }
+  }
+
+  /** 全屏键：已在全屏（系统全屏条没出来时的兜底出口）就退出，否则请求进入。
+   *  进全屏前先乐观置位全屏态（页面 :controls 绑它）——系统全屏里唯一的退出键挂在
+   *  「controls 打开」这条闸门后，事件回得慢一点就会短暂没有出口，见 utils/chatVideoControl.uts。
+   *  起播由页面 fullscreenchange 统一补（某端不派发该事件时这里先起一次，避免全屏页停在第一帧）。 */
+  function toggleFullscreen(): void {
+    const el = playerElement();
+    if (el == null) {
+      return;
+    }
+    if (isChatVideoFullscreen()) {
+      el.exitFullScreen();
+      return;
+    }
+    beginChatVideoFullscreen();
+    try {
+      el.requestFullScreen(null);
+      el.play();
+    } catch (e) {
+      // 请求直接抛（鸿蒙节点未挂载等）：立刻撤回乐观置位，别让行内凭空多出系统控制条
+      console.error(`[ChatVideoBar] requestFullScreen failed: ${e}`);
+      setChatVideoFullscreen(false);
+    }
+  }
+
+  function clampedRatio(x: number, width: number): number {
+    if (!(width > 0)) {
+      return -1;
+    }
+    let r = x / width;
+    if (!(r > 0)) {
+      r = 0;
+    }
+    if (r > 1) {
+      r = 1;
+    }
+    return r;
+  }
+
+  /** 按比例 seek（★必须定义在 handleTrackTouch/handleTrackTouchEnd 之前：
+   *  UTS 同级函数不支持前向引用，被调的必须排在调用者前，否则 error18 找不到名称）。 */
+  function seekToRatio(ratio: number): void {
+    const el = playerElement();
+    if (el == null) {
+      return;
+    }
+    const dur = durRef.value;
+    if (!(dur > 0)) {
+      return;
+    }
+    // 上限留一点余量：正好 seek 到片尾会立刻触发 ended（控制条闪回 00:00）
+    let r = ratio;
+    if (r > 0.999) {
+      r = 0.999;
+    }
+    if (!(r > 0)) {
+      r = 0;
+    }
+    el.seek(r * dur);
+  }
+
+  /** 轨道触摸：按下/拖动都只更新跟手比例，松手（或 120ms 节流到点）才 seek。 */
+  function handleTrackTouch(eventValue: Any): void {
+    const event = eventValue as UniTouchEvent;
+    const touches = event.touches;
+    if (touches.length == 0) {
+      return;
+    }
+    const track = uni.getElementById(trackId) as UniElement | null;
+    if (track == null) {
+      return;
+    }
+    const rect = track.getBoundingClientRect();
+    let ratio = clampedRatio(touches[0].clientX - rect.left, rect.width);
+    if (ratio < 0) {
+      return;
+    }
+    dragPct.value = Math.round(ratio * 1000) / 10;
+    // 拖动途中低频真 seek，控制条圆点不至于和画面差太远；松手再补最终位置
+    const now = Date.now();
+    if (now - lastSeekAt >= 120) {
+      lastSeekAt = now;
+      seekToRatio(ratio);
+    }
+  }
+
+  function handleTrackTouchEnd(): void {
+    if (dragPct.value >= 0) {
+      seekToRatio(dragPct.value / 100);
+      dragPct.value = -1;
+    }
+  }
+</script>
+
+<style lang="scss" scoped>
+  /* 底部覆盖条：24px 高、半透明黑。不用 padding（绝对定位 + left/right:0 下
+     content-box 会把内边距算到容器外、右端被父级裁掉），内边距改由首尾子项 margin 提供。
+     z-index 压过 <video> 内部的中央播放键盖层（框架里 .uni-video-cover 是 zIndex:10）：
+     未起播时那层透明盖层盖满整块，不给 z-index 本组件按钮会点不到。 */
+  .cvb {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 24px;
+    z-index: 20;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    background-color: rgba(0, 0, 0, 0.42);
+  }
+
+  .cvb__btn {
+    width: 24px;
+    height: 24px;
+    margin-left: 2px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  .cvb__play {
+    width: 13px;
+    height: 13px;
+    margin-left: 1px;
+  }
+
+  .cvb__pause {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .cvb__pause-bar {
+    width: 3px;
+    height: 10px;
+    margin-left: 1px;
+    margin-right: 1px;
+    border-radius: 1px;
+    background-color: #ffffff;
+  }
+
+  /* 时间文案固定 10px + 定宽：时长再长也只在本格内排（全屏键永不被挤出去）。
+     定宽按「1:02:03」7 字 @10px 留足余量 */
+  .cvb__time {
+    width: 38px;
+    flex-shrink: 0;
+    font-size: 10px;
+    line-height: 12px;
+    text-align: center;
+    color: rgba(255, 255, 255, 0.92);
+  }
+
+  .cvb__time--total {
+    margin-right: 2px;
+  }
+
+  /* 进度热区：20px 高撑大命中面，细条在内部垂直居中 */
+  .cvb__track {
+    flex-grow: 1;
+    flex-shrink: 1;
+    min-width: 0;
+    height: 20px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .cvb__track-bg {
+    flex-grow: 1;
+    flex-shrink: 1;
+    min-width: 0;
+    height: 2px;
+    border-radius: 1px;
+    background-color: rgba(255, 255, 255, 0.32);
+    position: relative;
+  }
+
+  .cvb__track-fill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    height: 2px;
+    border-radius: 1px;
+    background-color: #ffffff;
+  }
+
+  .cvb__track-dot {
+    position: absolute;
+    top: -3px;
+    width: 8px;
+    height: 8px;
+    margin-left: -4px;
+    border-radius: 4px;
+    background-color: #ffffff;
+  }
+
+  .cvb__btn--fs {
+    width: 22px;
+    margin-left: 2px;
+    margin-right: 3px;
+  }
+
+  .cvb__corner {
+    position: absolute;
+    width: 5px;
+    height: 5px;
+    border-color: #ffffff;
+    border-style: solid;
+  }
+
+  .cvb__corner--tl {
+    top: 6px;
+    left: 5px;
+    border-top-width: 1.5px;
+    border-left-width: 1.5px;
+  }
+
+  .cvb__corner--tr {
+    top: 6px;
+    right: 5px;
+    border-top-width: 1.5px;
+    border-right-width: 1.5px;
+  }
+
+  .cvb__corner--bl {
+    bottom: 6px;
+    left: 5px;
+    border-bottom-width: 1.5px;
+    border-left-width: 1.5px;
+  }
+
+  .cvb__corner--br {
+    bottom: 6px;
+    right: 5px;
+    border-bottom-width: 1.5px;
+    border-right-width: 1.5px;
+  }
+</style>

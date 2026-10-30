@@ -1,0 +1,160 @@
+import { ref, type Ref } from "vue";
+
+/**
+ * 视频播放进度 / 播放态中心状态（模块级单例，按「播放器元素 id」索引）。
+ *
+ * 读侧只有一个：自绘控制条 components/chat-video-bar。为什么放模块不放行内：
+ * 1. timeupdate 每秒数拍，写页面级 reactive 会把整条消息列表重渲（渲染局部性原则：
+ *    进度只有控制条读，就让控制条自己重渲，一行一拍只动一行）；
+ * 2. chat.uvue 的渲染 lambda 捕获参数已顶到 255 上限，模板每多引用一个 setup 顶层
+ *    符号就多一个捕获参数（见 components/chat-ai-hint 与 chat-uvue-render-lambda-param-limit）。
+ *
+ * 单位恒为秒，三端口径一致：
+ * - Android：uni-video 的 VideoImpl 以 ExoPlayer 毫秒 /1000 出 currentTime / duration，
+ *   seek(秒) 内部再 ×1000（5.24 离线 SDK 里 uni-video-release.aar 反编译确认）；
+ * - 鸿蒙：video builder 的 onUpdate 直接透传 ArkUI 的 event.time（秒），onPrepared
+ *   的 duration 同为秒（runtime.har 逆查确认）；
+ * - iOS 与两端对齐。
+ */
+
+/** key = 播放器元素 id（聊天页 chatVideoPlayer-<msgId>，合并转发详情 mfdVideoPlayer-<uid>）。 */
+const currentRefs = new Map<string, Ref<number>>();
+const durationRefs = new Map<string, Ref<number>>();
+const playingRefs = new Map<string, Ref<boolean>>();
+
+function currentRefOf(key: string): Ref<number> {
+  const hit = currentRefs.get(key);
+  if (hit != null) {
+    return hit;
+  }
+  const made: Ref<number> = ref(0);
+  currentRefs.set(key, made);
+  return made;
+}
+
+function durationRefOf(key: string): Ref<number> {
+  const hit = durationRefs.get(key);
+  if (hit != null) {
+    return hit;
+  }
+  const made: Ref<number> = ref(0);
+  durationRefs.set(key, made);
+  return made;
+}
+
+function playingRefOf(key: string): Ref<boolean> {
+  const hit = playingRefs.get(key);
+  if (hit != null) {
+    return hit;
+  }
+  const made: Ref<boolean> = ref(false);
+  playingRefs.set(key, made);
+  return made;
+}
+
+/** 控制条读：已播放秒数（0=未起播/未知）。 */
+export function chatVideoCurrentRef(key: string): Ref<number> {
+  return currentRefOf(key);
+}
+
+/** 控制条读：总时长秒（0=未知；控制条据此显 00:00 且进度条不动）。 */
+export function chatVideoDurationRef(key: string): Ref<number> {
+  return durationRefOf(key);
+}
+
+/** 控制条读：是否播放中（页面 @play/@pause 回写，控制条据此切 ▶ / ❚❚）。 */
+export function chatVideoPlayingRef(key: string): Ref<boolean> {
+  return playingRefOf(key);
+}
+
+/** 播放态回写（@play/@pause/@ended/@error）。同值不写，避免无谓重渲。 */
+export function setChatVideoPlaying(key: string, playing: boolean): void {
+  const r = playingRefOf(key);
+  if (r.value != playing) {
+    r.value = playing;
+  }
+}
+
+/** 页面侧轻触视频切换播放/暂停时判方向（替代原页面级 playingVideoIds）。 */
+export function isChatVideoPlaying(key: string): boolean {
+  return playingRefOf(key).value;
+}
+
+/**
+ * <video> @timeupdate 回写进度（单位秒）。
+ * 脏值兜底：NaN / 负数一律归 0（`!(x > 0)` 同时拦住 NaN）；进度不越过时长。
+ */
+export function updateChatVideoProgress(key: string, currentTime: number, duration: number): void {
+  let dur = duration;
+  if (!(dur > 0)) {
+    dur = 0;
+  }
+  let cur = currentTime;
+  if (!(cur > 0)) {
+    cur = 0;
+  }
+  if (dur > 0 && cur > dur) {
+    cur = dur;
+  }
+  const dRef = durationRefOf(key);
+  if (dRef.value != dur) {
+    dRef.value = dur;
+  }
+  const cRef = currentRefOf(key);
+  if (cRef.value != cur) {
+    cRef.value = cur;
+  }
+}
+
+// ===== 全屏态（页面模板 :controls 直读） =====
+//
+// 为什么要页面跟着全屏态翻 controls：自绘控制条的前提是行内关掉系统 controls，而系统
+// 全屏里的退出键（标题栏左上返回）与系统控制条共用同一个闸门——runtime 里是
+// `fullscreen && controlsShow`、`controlsShow = !centerPlayBtnShow && controls && controlsVisible`。
+// 也就是说 controls=false 连全屏标题栏一起关掉：Android 的全屏是页面内的 JS 容器，
+// 没有系统返回兜底（framework 里视频全屏路径不接 onBackPress），会卡死在全屏页出不去。
+// 折中：行内 controls=false（自绘），一进全屏 controls=true（交回系统，退出键回来）。
+
+/** 全屏态（三端共用一份；页面 setup 里 `const videoFullscreen = chatVideoFullscreen;`
+ *  别名后模板 :controls 直读，控制条请求时乐观置位。utils/chatAiHint.uts 同款写法）。 */
+export const chatVideoFullscreen: Ref<boolean> = ref(false);
+/** 乐观置位版本号：fullscreenchange 事件到达即作废看门狗（见 beginChatVideoFullscreen）。 */
+let fullscreenSeq = 0;
+
+/** 当前是否全屏（控制条据此决定进/出全屏）。 */
+export function isChatVideoFullscreen(): boolean {
+  return chatVideoFullscreen.value;
+}
+
+/** 直接置位（页面 onHide/onUnload 复位用：模块级 ref 跨页存活，残留 true 会让下一个
+ *  聊天页的行内视频首帧就挂上系统控制条——时间文案挤掉全屏键的老问题跟着回来）。 */
+export function setChatVideoFullscreen(fullscreen: boolean): void {
+  if (chatVideoFullscreen.value != fullscreen) {
+    chatVideoFullscreen.value = fullscreen;
+  }
+}
+
+/**
+ * 控制条按全屏键：先乐观置位再 requestFullScreen。
+ *
+ * 为什么要乐观：鸿蒙全屏态由 ArkUI 原生控制，fullscreenchange 要晚约 500ms 才回；
+ * 极少数情况不派发时，若只信事件就会「进了全屏却一个退出键都没有」。
+ * 看门狗：1.5s 内页面没回事件（版本号未变）说明请求没真正生效，撤回置位，
+ * 免得行内白白多出一条系统控制条。
+ */
+export function beginChatVideoFullscreen(): void {
+  fullscreenSeq = fullscreenSeq + 1;
+  const token = fullscreenSeq;
+  setChatVideoFullscreen(true);
+  setTimeout((): void => {
+    if (token == fullscreenSeq) {
+      setChatVideoFullscreen(false);
+    }
+  }, 1500);
+}
+
+/** 页面 @fullscreenchange：以事件为准（进/出都覆盖），并作废上面那次乐观置位的看门狗。 */
+export function confirmChatVideoFullscreen(fullscreen: boolean): void {
+  fullscreenSeq = fullscreenSeq + 1;
+  setChatVideoFullscreen(fullscreen);
+}

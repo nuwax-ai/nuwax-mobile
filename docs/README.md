@@ -31,6 +31,8 @@
 | [agent_integration_guide.md](integration/agent_integration_guide.md) | Agent 组件（文件树等）接入 |
 | [app-asr-tts.md](integration/app-asr-tts.md) | Vox ASR / TTS 对接 |
 | [app-native-pay-integration.md](integration/app-native-pay-integration.md) | App 原生支付（现行；webview 支付已废弃归档） |
+| [mobile-h5-idp-login.md](integration/mobile-h5-idp-login.md) | 移动 H5 CAS/OAuth2 Cookie 登录、配置与回跳约束 |
+| [mobile-idp-native-plan.md](integration/mobile-idp-native-plan.md) | 联合登录总方案：原生复用边界、会话交接、平台配置、分期验收与后端待确认项 |
 | [SSE-Implementation-Guide.md](integration/SSE-Implementation-Guide.md) | SSE 流式请求实现 |
 | [Markdown-Custom-Renderer-Guide.md](integration/Markdown-Custom-Renderer-Guide.md) | Markdown 自定义渲染元素 |
 | [openui-mobile-integration.md](integration/openui-mobile-integration.md) | OpenUI 移动端接入 |

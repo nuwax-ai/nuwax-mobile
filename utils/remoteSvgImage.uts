@@ -6,7 +6,9 @@ import { getImSessionStamp } from "@/utils/im/imSessionScope";
  * mode=aspectFit / CSS 宽高缩放对 SVG 失效：容器小于声明尺寸时只显示局部（看起来被裁切/放大），
  * 容器大于声明尺寸时图标显得严重偏小。H5（含 web-view 内嵌页）由浏览器渲染，无此问题。
  *
- * 方案：仅 Android / iOS 生效——
+ * 方案：resolveDisplayImageUrl 对 App 两端（Android / iOS）的 SVG 已改直连透传原始
+ * 地址（2026-10-23 消息列表真机定稿，见该函数注释）；以下「下载→改尺寸→data URL」
+ * 机制仅由 resolveAppSvgUrl 的直调方使用（agent-icon / 终端页 / chat svg 预览等）——
  * 1. 下载 SVG 文本（uni.request responseType:text，8s 超时，按 URL 缓存文本）；
  * 2. stripPreamble：丢弃 <svg 前的 <?xml ?> 声明 / 注释等前置内容，避免后两步的
  *    indexOf(">") 误定位到前置内容里的 ">"，改写/前移到错误位置而破坏 XML 结构；
@@ -19,12 +21,15 @@ import { getImSessionStamp } from "@/utils/im/imSessionScope";
  * 失败 URL 只短暂记入负缓存并允许后续重试；调用方应按需（可见行）解析，
  * 不要一次性 await 全量列表。
  *
- * 注意：Android / iOS 为 1:1 绘制，每个显示尺寸必须各自调用（各自生成对应物理像素的 data URL）。
+ * 注意：走本机制的调用方（Android 为 1:1 绘制）每个显示尺寸必须各自调用（各自生成
+ * 对应物理像素的 data URL）；消息列表头像不走本机制（App 两端直连透传）。
  *
  * 鸿蒙（APP-HARMONY）例外，原样透传 URL：ArkUI 的 <image> 不支持 SVG 的 data URL
  * （data:image/svg+xml 无论 ;utf8, 还是 ;base64, 都直接触发 error，图标显示为默认图），
- * 但它支持远程 .svg 地址且按组件尺寸正确缩放（没有 Android / iOS 的 1:1 光栅化问题），
- * 因此鸿蒙不需要也不能走 data URL 方案。H5 / 小程序同样原样透传，不产生额外请求。
+ * 但它支持远程 .svg 地址且按组件尺寸正确缩放（没有 Android 的 1:1 光栅化问题），
+ * 因此鸿蒙不需要也不能走 data URL 方案。iOS 同样直连透传（2026-10-23 实测 302 /
+ * Cookie / 渲染均正常，早前「直连渲染失败」的记载有误）。H5 / 小程序同样原样透传，
+ * 不产生额外请求。
  *
  * 鉴权：/api/f/ 受保护 SVG 的文本下载会自动补 Bearer 头并把相对地址补全为绝对地址，
  * 其它根相对路径（如 /instant-message/emoji/*.svg）同样在入口补全（App 端相对地址拉不到），
@@ -293,10 +298,10 @@ export async function resolveAppSvgUrl(url: string, widthRpx: number, heightRpx:
 /**
  * 解析可直接绑定给 <image> 的地址：一次处理「受保护文件」与「远程 SVG」两种异步场景。
  *
- * 两者的顺序不能颠倒：Android / iOS 上 SVG 必须走「取文本 → 改尺寸 → data URL」，
- * 若先 downloadFile 落成本地 file://，既无法再取文本（uni.request 不支持 file 协议），
- * 也会退回原生 1:1 光栅化 → 头像显示异常。鸿蒙 / H5 的 <image> 能正确缩放远程 SVG，
- * 受保护地址走 downloadFile 拿本地临时文件即可。
+ * 两者的顺序不能颠倒：App 两端 SVG 已直连透传（见下方分支），本函数不再落 file://；
+ * 若 SVG 要走 resolveAppSvgUrl 改写（仅剩直调方），先 downloadFile 落成本地文件会
+ * 既取不到文本（uni.request 不支持 file 协议）也退回原生 1:1 光栅化。鸿蒙 / H5 的
+ * <image> 能正确缩放远程 SVG，受保护地址走 downloadFile 拿本地临时文件即可。
  *
  * @param url 原始地址（可为相对路径的 /api/f/ 文件）
  * @param widthRpx 容器宽度（rpx）
@@ -310,11 +315,17 @@ export async function resolveDisplayImageUrl(
 ): Promise<string> {
   if (url.length == 0) return url;
   // #ifdef APP-ANDROID || APP-IOS
+  // App 两端：远程 SVG 直连原始地址（根相对路径先补全绝对，否则 App <image> 按本地
+  // 文件处理必失败）。2026-10-23 消息列表真机定稿：iOS SDWebImage 自动跟 302
+  // （/api/f/s3 跳转存储地址）、Cookie 鉴权 OK、渲染尺寸正确（推翻早前「iOS 直连
+  // SVG 渲染失败」的记载）；Android 直连显示正常（推翻「1:1 光栅化必须 data URL
+  // 改写」的旧结论）。直连省掉「文本下载+改尺寸+data URL」整条链路；改写机制仍由
+  // resolveAppSvgUrl 直调方使用（agent-icon / 终端页 / chat svg 预览等）。
   if (isRemoteSvgUrl(url)) {
-    // App 端 SVG 必须始终走「下载文本 → 改尺寸 → data URL」；
-    // 解析失败时返回原地址交给调用方重试，不能再落成本地临时文件，
-    // 否则会绕过尺寸改写，恢复 Android 原生 SVG 的裁切/变形问题。
-    return await resolveAppSvgUrl(url, widthRpx, heightRpx);
+    if (isRootRelativeHttpPath(url)) {
+      return resolveAuthProtectedFileFetchUrl(url);
+    }
+    return url;
   }
   // #endif
   if (isAuthProtectedFileUrl(url)) {

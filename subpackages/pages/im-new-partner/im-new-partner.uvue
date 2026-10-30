@@ -1,0 +1,1119 @@
+<template>
+  <!--
+    「新的伙伴」记录页（PC DEV-413 对齐，微信「新的朋友」式）：
+    - 记录流水 = 通讯录三态全部（对方申请我 / 我发出的 / 已互为联系人）按 time 倒序、
+      按天分组（今天/昨天/前天/N天前/M月D日/跨年带年/时间未知）
+    - 搜索框是模式切换不是过滤：有关键词 = 搜平台用户直加（searchContacts），
+      清空 = 回看记录（记录里的人都已在通讯录里，过滤他们没有意义）
+    - 三态行整行点按进单聊（createP2p 幂等，PC DEV-418 口径：未通过的行也响应，
+      宁可进去被闸住也不能点了没反应）；incoming 行附「同意/拒绝」按钮（直接调接口）
+    - 搜索结果行四态：添加 / 同意 / 等待验证 / 已添加——判据是我的通讯录 status，
+      不是搜索结果自己（搜到已申请过我的人要给「同意」，给「添加」会两边对着等）；
+      整行点按同样进单聊（按钮 .stop 防冒泡）
+    - 非 tabBar 页：底部安全区由尾垫层兜底
+  -->
+  <view class="np-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 标题 + 待处理角标（与智联录入口行同一个数：只数 status=2） -->
+    <view class="np-header">
+      <view class="np-header__btn" hover-class="np-header__btn--active" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="20" unit="px" color="#141416" />
+      </view>
+      <view class="np-header__title-wrap">
+        <text class="np-header__title">{{ t("Mobile.Message.newPartnerEntry") }}</text>
+        <view v-if="pendingCount > 0" class="np-header__badge">
+          <text class="np-header__badge-text">{{ pendingCount }}</text>
+        </view>
+      </view>
+      <view class="np-header__btn np-header__btn--ghost" />
+    </view>
+
+    <!-- 搜索框（模式开关）：有关键词走搜人，清空回记录 -->
+    <view class="np-search">
+      <view class="np-search__icon">
+        <svg-icon name="icon-Search" size="14" unit="px" color="#9a9aa2" />
+      </view>
+      <input
+        class="np-search__input"
+        v-model="keyword"
+        :placeholder="t('Mobile.Message.newPartnerSearchPh')"
+        placeholder-class="np-search__ph"
+      />
+      <view v-if="keyword.length > 0" class="np-search__clear" @click="clearKeyword">
+        <svg-icon name="icon-X" size="12" unit="px" color="#9a9aa2" />
+      </view>
+    </view>
+
+    <scroll-view class="np-body" direction="vertical" :show-scrollbar="false">
+      <!-- ===== 搜索模式 ===== -->
+      <view v-if="searchMode">
+        <view v-if="searchLoading" class="np-state">
+          <text class="np-state__text">{{ t("Mobile.Common.loading") }}</text>
+        </view>
+        <view v-else-if="hits.length == 0" class="np-state">
+          <text class="np-state__text">{{ noHitText }}</text>
+        </view>
+        <view v-else>
+          <view
+            v-for="(m, index) in hits"
+            :key="m.userId"
+            class="np-row"
+            hover-class="np-row--active"
+            @click="handleHitRowTap(m)"
+          >
+            <view class="np-avatar">
+              <!-- 裁圆走外层 clip 容器：App-Android <image> 自身 border-radius 对 SVG
+                   渲染路径不生效（记录行/消息页同款结构） -->
+              <view
+                v-if="m.avatarDisplay.length > 0 && m.avatarFailed != true"
+                class="np-avatar-clip"
+              >
+                <image
+                  class="np-avatar-img"
+                  :src="m.avatarDisplay"
+                  mode="aspectFill"
+                  :fade-show="false"
+                  @error="handleHitAvatarError(m)"
+                />
+              </view>
+              <view
+                v-else
+                class="np-avatar-fallback"
+                :style="{ backgroundImage: avatarGradient(m.displayName) }"
+              >
+                <text class="np-avatar-letter">{{ avatarLetter(m.displayName) }}</text>
+              </view>
+            </view>
+            <view class="np-row__main">
+              <text class="np-row__name text-ellipsis">{{ m.displayName }}</text>
+            </view>
+            <!-- 四态动作：add/accept 可点；waiting/added 只作展示（点了不该有任何变化） -->
+            <view
+              v-if="m.action == 'add'"
+              class="np-btn np-btn--primary"
+              :class="{ 'np-btn--disabled': busyUserId == m.userId }"
+              @click.stop="handleHitAdd(m)"
+            >
+              <text class="np-btn__text np-btn__text--primary">{{ t("Mobile.Message.newPartnerAdd") }}</text>
+            </view>
+            <view
+              v-else-if="m.action == 'accept'"
+              class="np-btn np-btn--primary"
+              :class="{ 'np-btn--disabled': busyUserId == m.userId }"
+              @click.stop="handleHitAccept(m)"
+            >
+              <text class="np-btn__text np-btn__text--primary">{{ t("Mobile.Message.contactAccept") }}</text>
+            </view>
+            <text v-else-if="m.action == 'waiting'" class="np-row__state">{{ t("Mobile.Message.newPartnerWaiting") }}</text>
+            <text v-else class="np-row__state">{{ t("Mobile.Message.newPartnerAdded") }}</text>
+          </view>
+        </view>
+      </view>
+
+      <!-- ===== 记录模式 ===== -->
+      <view v-else>
+        <view v-if="recordsLoading" class="np-state">
+          <text class="np-state__text">{{ t("Mobile.Common.loading") }}</text>
+        </view>
+        <view v-else-if="recordsFailed" class="np-state" @click="loadRecords">
+          <text class="np-state__text">{{ t("Mobile.Message.loadFailed") }}</text>
+        </view>
+        <view v-else-if="dayGroups.length == 0" class="np-state">
+          <text class="np-state__text">{{ t("Mobile.Message.newPartnerEmpty") }}</text>
+        </view>
+        <view v-else>
+          <view v-for="(g, gi) in dayGroups" :key="g.label">
+            <view class="np-day-title">
+              <text class="np-day-title__text">{{ g.label }}</text>
+            </view>
+            <view
+              v-for="(row, ri) in g.rows"
+              :key="row.userId"
+              class="np-row np-row--stack"
+              hover-class="np-row--active"
+              @click="handleRowTap(row)"
+            >
+              <view class="np-row__line">
+                <view class="np-avatar">
+                  <!-- 兜底层常驻、真图层覆盖（显隐走字段判定）：与消息列表行同构，
+                       真图失败/未加载时字母渐变底兜底，绝不留白 -->
+                  <view
+                    v-if="row.avatarLoaded != true || row.avatarFailed == true"
+                    class="np-avatar-fallback"
+                    :style="{ backgroundImage: avatarGradient(row.displayName) }"
+                  >
+                    <text class="np-avatar-letter">{{ row.fallbackLine1 }}</text>
+                  </view>
+                  <view
+                    v-if="row.avatarDisplay.length > 0 && row.avatarFailed != true"
+                    class="np-avatar-clip"
+                  >
+                    <image
+                      class="np-avatar-img"
+                      :src="row.avatarDisplay"
+                      mode="aspectFill"
+                      :fade-show="false"
+                      @load="handleRowAvatarLoaded(row)"
+                      @error="handleRowAvatarError(row)"
+                    />
+                  </view>
+                </view>
+                <view class="np-row__main">
+                  <view class="np-row__title-line">
+                    <text class="np-row__name text-ellipsis">{{ row.displayName }}</text>
+                    <!-- 右侧状态列：outgoing=等待验证 accepted=已添加；incoming 留给按钮 -->
+                    <text v-if="row.status == 3" class="np-row__state">{{ t("Mobile.Message.newPartnerWaiting") }}</text>
+                    <text v-else-if="row.status == 1" class="np-row__state">{{ t("Mobile.Message.newPartnerAdded") }}</text>
+                  </view>
+                  <text v-if="row.subtitle.length > 0" class="np-row__subtitle text-ellipsis">{{ row.subtitle }}</text>
+                </view>
+              </view>
+              <!-- incoming 的同意/拒绝：单独一行不挤名字右侧（中文长名会被压剩两三字） -->
+              <view v-if="row.status == 2" class="np-row__actions">
+                <view
+                  class="np-btn"
+                  :class="{ 'np-btn--disabled': busyUserId == row.userId }"
+                  hover-class="np-btn--ghost-active"
+                  @click.stop="handleReject(row)"
+                >
+                  <text class="np-btn__text np-btn__text--ghost">{{ t("Mobile.Message.contactReject") }}</text>
+                </view>
+                <view
+                  class="np-btn np-btn--primary"
+                  :class="{ 'np-btn--disabled': busyUserId == row.userId }"
+                  hover-class="np-btn--primary-active"
+                  @click.stop="handleAccept(row)"
+                >
+                  <text class="np-btn__text np-btn__text--primary">{{ t("Mobile.Message.contactAccept") }}</text>
+                </view>
+              </view>
+            </view>
+          </view>
+        </view>
+      </view>
+      <view class="np-tail" :style="tailStyle" />
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { switchMainTab } from "@/utils/mainTabNavigation";
+
+  import { computed, onUnmounted, ref, watch } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { imAvatarDisplayUrl, resolveImAvatarDisplay } from "@/utils/imAvatarDisplay";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import {
+    apiImAddContact,
+    apiImContactAccept,
+    apiImContactReject,
+    apiImContacts,
+    apiImCreateP2pConversation,
+    apiImSearchContacts,
+  } from "@/servers/im";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 头像解析请求尺寸（px，≈显示盒 46px 的 2 倍出图，高清屏不吃糊；同 at-select 88/盒44 口径）。 */
+  const AVATAR_PX = 88;
+
+  /** 记录行（通讯录三态之一的扁平投影；subtitle 构建期算好——模板方法调用在
+      Android 不收集依赖，派生文案一律预写字段）。 */
+  class NpRecord {
+    userId: string = "";
+    displayName: string = "";
+    avatarRaw: string = "";
+    avatarDisplay: string = "";
+    avatarFailed: boolean = false;
+    avatarLoaded: boolean = false;
+    fallbackLine1: string = "";
+    status: number = 1;
+    applyMsg: string = "";
+    time: number = 0;
+    subtitle: string = "";
+  }
+
+  /** 一天的分组（保持 time 降序扫描出来的顺序）。 */
+  class NpDayGroup {
+    label: string = "";
+    rows: NpRecord[] = [];
+  }
+
+  /** 搜索结果行（action 随通讯录刷新重算后重写字段刷新）。 */
+  class NpHit {
+    userId: string = "";
+    displayName: string = "";
+    avatarRaw: string = "";
+    avatarDisplay: string = "";
+    avatarFailed: boolean = false;
+    action: string = "add";
+  }
+
+  /** 头像字母底色渐变板（对齐消息页五色系，同 im-add-buddy）。 */
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  /** 搜索关键字（空 = 记录模式）。 */
+  const keyword = ref<string>("");
+  /** 记录分组（time 降序按天分组）。 */
+  const dayGroups = ref<NpDayGroup[]>([]);
+  const recordsLoading = ref<boolean>(false);
+  const recordsFailed = ref<boolean>(false);
+  /** 搜索结果（去重后逐行判动作）。 */
+  const hits = ref<NpHit[]>([]);
+  const searchLoading = ref<boolean>(false);
+  /** 正在同意/拒绝/添加的 userId（防连点：动作接口不可重复提交）。 */
+  const busyUserId = ref<string>("");
+  /** 整页导航中（createP2p 跳会话期间拦二次点按）。 */
+  let navigating = false;
+
+  /** 我的通讯录 status 索引（搜索行动作的唯一判据；记录加载后重建）。 */
+  const contactStatusByUserId = new Map<string, number>();
+
+  /** 搜索模式 = 关键词非空（模式切换，不是记录过滤）。 */
+  const searchMode = computed((): boolean => keyword.value.trim().length > 0);
+
+  /** 待我处理数（页头角标；与智联录入口行同判据——只数 status=2）。 */
+  const pendingCount = computed((): number => {
+    let n = 0;
+    for (let i = 0; i < dayGroups.value.length; i++) {
+      const rows = dayGroups.value[i].rows;
+      for (let j = 0; j < rows.length; j++) {
+        if (rows[j].status == 2) {
+          n++;
+        }
+      }
+    }
+    return n;
+  });
+
+  /** 搜不到文案（带上关键词，反馈"搜的是什么没命中"）。 */
+  const noHitText = computed((): string => {
+    const params = new Map<string, string | number>();
+    params.set("kw", keyword.value.trim());
+    return translateFn(
+      "Mobile.Message.newPartnerNoHit",
+      toI18nParams(params),
+      keyword.value.trim(),
+    );
+  });
+
+  /** 尾垫层底部安全距离（App 端样式表 env() 不可靠，内联 px；同 im-add-buddy 口径）。 */
+  const tailStyle = computed((): string => {
+    let style = "";
+    // #ifdef APP
+    try {
+      const win = uni.getWindowInfo();
+      style = `padding-bottom: ${12 + win.safeAreaInsets.bottom}px;`;
+    } catch (_e) {
+      style = "";
+    }
+    // #endif
+    return style;
+  });
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const n = parseFloat(`${raw}`);
+    return isNaN(n) ? fallback : n;
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    return raw != null && `${raw}` == "true";
+  }
+
+  function avatarGradient(name: string): string {
+    let sum = 0;
+    for (let i = 0; i < name.length; i++) {
+      const code = name.charCodeAt(i);
+      if (code == null) continue;
+      sum += code;
+    }
+    return AVATAR_GRADIENTS[sum % AVATAR_GRADIENTS.length];
+  }
+
+  function avatarLetter(name: string): string {
+    const trimmed = name.trim();
+    if (trimmed.length == 0) {
+      return "#";
+    }
+    return trimmed.charAt(0).toUpperCase();
+  }
+
+  // ===== 日分组标签（PC lib/newPartner.ts 同判据）=====
+
+  /** 本地时区某天的 00:00。 */
+  function startOfDay(ms: number): number {
+    const d = new Date(ms);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  }
+
+  /**
+   * 分组标题：今天/昨天/前天/N天前(3~6)/M月D日/跨年带年/时间未知。
+   * 差值按日历日算（先归 00:00 再减），round 兜 DST 的 23/25 小时天；
+   * diff<=0 一律「今天」（服务端时钟略快于本机时显示「-1天前」更糟）。
+   */
+  function dayLabelOf(ms: number): string {
+    if (ms <= 0) {
+      return t("Mobile.Message.newPartnerTimeUnknown");
+    }
+    const now = Date.now();
+    const diff = Math.round((startOfDay(now) - startOfDay(ms)) / 86400000);
+    if (diff <= 0) {
+      return t("Mobile.Message.today");
+    }
+    if (diff == 1) {
+      return t("Mobile.Message.yesterday");
+    }
+    if (diff == 2) {
+      return t("Mobile.Time.dayBeforeYesterday");
+    }
+    if (diff <= 6) {
+      const params = new Map<string, string | number>();
+      params.set("count", diff);
+      return translateFn("Mobile.Time.daysAgo", toI18nParams(params), `${diff}`);
+    }
+    const d = new Date(ms);
+    const n = new Date(now);
+    const md = `${d.getMonth() + 1}月${d.getDate()}日`;
+    return d.getFullYear() == n.getFullYear() ? md : `${d.getFullYear()}年${md}`;
+  }
+
+  // ===== 副标题（PC newPartnerSubtitle 同口径：申请信息三态一视同仁优先）=====
+
+  function subtitleOf(status: number, applyMsg: string, userName: string): string {
+    const msg = applyMsg.trim();
+    if (msg.length > 0) {
+      return msg;
+    }
+    if (status == 1) {
+      const account = userName.trim();
+      if (account.length > 0) {
+        const params = new Map<string, string | number>();
+        params.set("name", account);
+        return translateFn("Mobile.Message.newPartnerAccount", toI18nParams(params), account);
+      }
+      return "";
+    }
+    if (status == 3) {
+      // 右侧状态列已写「等待验证」，副标题不再复述（同一行不把同一件事说两遍）
+      return "";
+    }
+    return t("Mobile.Message.newPartnerDefaultApply");
+  }
+
+  /** 批量解析记录行头像展示地址（/api/f/ 受保护与远程 SVG）：行取自 ref 数组
+      （响应式代理实例），异步写回才触发渲染——裸实例上写回不刷新（im-add-buddy 同款）。
+      ★须声明在 loadRecords 之前：UTS 同级函数前向引用报 error18。 */
+  function resolveRecordAvatars(): void {
+    const groups = dayGroups.value;
+    for (let i = 0; i < groups.length; i++) {
+      const rows = groups[i].rows;
+      for (let j = 0; j < rows.length; j++) {
+        const row = rows[j];
+        const raw = row.avatarRaw;
+        if (raw.length == 0) {
+          continue;
+        }
+        resolveImAvatarDisplay(raw, AVATAR_PX).then((resolved: string): void => {
+          if (resolved != raw && resolved != row.avatarDisplay) {
+            row.avatarDisplay = resolved;
+            row.avatarFailed = false; // 首帧失败可能已标死字母底，解析成功救回
+          }
+        });
+      }
+    }
+  }
+
+  /** 通讯录刷新后重算搜索行动作（判据是我的通讯录，不是搜索结果自己）。
+      ★须声明在 loadRecords 之前：UTS 同级函数前向引用报 error18。 */
+  function refreshHitActions(): void {
+    const statusOf = (userId: string): string => {
+      const st = contactStatusByUserId.get(userId);
+      if (st == null) {
+        return "add";
+      }
+      if (st == 1) {
+        return "added";
+      }
+      if (st == 3) {
+        return "waiting";
+      }
+      if (st == 2) {
+        return "accept";
+      }
+      return "add";
+    };
+    const rows = hits.value;
+    for (let i = 0; i < rows.length; i++) {
+      rows[i].action = statusOf(rows[i].userId);
+    }
+  }
+
+  // ===== 记录加载 =====
+
+  /** 通讯录三态 → time 降序 → 按天分组；顺带重建 status 索引与搜索行动作。 */
+  async function loadRecords(): Promise<void> {
+    if (recordsLoading.value) {
+      return;
+    }
+    recordsLoading.value = true;
+    recordsFailed.value = false;
+    try {
+      const res = await apiImContacts();
+      recordsLoading.value = false;
+      if (apiResCode(res) != SUCCESS_CODE) {
+        recordsFailed.value = true;
+        return;
+      }
+      const rows: NpRecord[] = [];
+      contactStatusByUserId.clear();
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        const itemsRaw = dataObj["items"];
+        if (itemsRaw != null) {
+          const items = itemsRaw as UTSJSONObject[];
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const row = new NpRecord();
+            row.userId = readString(item, "userId");
+            if (row.userId.length == 0) {
+              continue;
+            }
+            row.status = readNumber(item, "status", 1);
+            // displayName 服务端已按 remark > nick > userName 算好，缺键回落 nick
+            const display = readString(item, "displayName");
+            const nickName = readString(item, "nickName");
+            row.displayName = display.length > 0 ? display : nickName;
+            row.avatarRaw = readString(item, "avatar");
+            row.applyMsg = readString(item, "applyMsg");
+            row.time = readNumber(item, "time", 0);
+            row.fallbackLine1 = avatarLetter(row.displayName);
+            row.subtitle = subtitleOf(row.status, row.applyMsg, readString(item, "userName"));
+            row.avatarDisplay = imAvatarDisplayUrl(row.avatarRaw, AVATAR_PX);
+            rows.push(row);
+            contactStatusByUserId.set(row.userId, row.status);
+          }
+        }
+      }
+      // time 降序（缺失排尾，不霸占顶部）；随后顺序扫描出分组（「时间未知」自然落最后）
+      rows.sort((a: NpRecord, b: NpRecord): number => {
+        return b.time - a.time;
+      });
+      const groups: NpDayGroup[] = [];
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const label = dayLabelOf(row.time);
+        // 与上一组同标签即并入，否则开新组（非空写法，避开 UTS smart-cast 坑）
+        if (groups.length > 0 && groups[groups.length - 1].label == label) {
+          groups[groups.length - 1].rows.push(row);
+        } else {
+          const group = new NpDayGroup();
+          group.label = label;
+          group.rows.push(row);
+          groups.push(group);
+        }
+      }
+      dayGroups.value = groups;
+      resolveRecordAvatars();
+      refreshHitActions();
+    } catch (e) {
+      recordsLoading.value = false;
+      recordsFailed.value = true;
+    }
+  }
+
+  function handleRowAvatarLoaded(row: NpRecord): void {
+    row.avatarLoaded = true;
+  }
+
+  function handleRowAvatarError(row: NpRecord): void {
+    row.avatarFailed = true;
+  }
+
+  function handleHitAvatarError(m: NpHit): void {
+    m.avatarFailed = true;
+  }
+
+  // ===== 行点按：进单聊（三态全部可点，PC DEV-418 口径）=====
+
+  /** 开单聊并跳会话页（记录行/搜索行共用）。redirectTo 替换本页：从会话返回直达
+      消息列表（与 im-add-buddy 发消息同栈序）；navigating 拦连点双跳。 */
+  async function openP2pChat(userId: string, displayName: string, avatarRaw: string): Promise<void> {
+    if (navigating) {
+      return;
+    }
+    navigating = true;
+    try {
+      const res = await apiImCreateP2pConversation(userId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Message.openChatFailed"), icon: "none" });
+        return;
+      }
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      const convId = dataObj != null ? readString(dataObj, "convId") : "";
+      if (convId.length == 0) {
+        uni.showToast({ title: t("Mobile.Message.openChatFailed"), icon: "none" });
+        return;
+      }
+      uni.redirectTo({
+        url:
+          `/pages/message/chat?convId=${convId}&convType=1` +
+          `&name=${encodeURIComponent(displayName)}&avatar=${encodeURIComponent(avatarRaw)}`,
+      });
+    } catch (e) {
+      uni.showToast({ title: t("Mobile.Message.openChatFailed"), icon: "none" });
+    } finally {
+      navigating = false;
+    }
+  }
+
+  /** 记录行整行点按进单聊（三态全部可点，PC DEV-418 口径）。 */
+  async function handleRowTap(row: NpRecord): Promise<void> {
+    await openP2pChat(row.userId, row.displayName, row.avatarRaw);
+  }
+
+  // ===== 同意 / 拒绝（incoming 行内按钮，直接调接口 + 整页刷新）=====
+
+  async function handleAccept(row: NpRecord): Promise<void> {
+    if (busyUserId.value.length > 0) {
+      return;
+    }
+    busyUserId.value = row.userId;
+    try {
+      const res = await apiImContactAccept(row.userId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+        return;
+      }
+      uni.showToast({ title: t("Mobile.Message.contactAccepted"), icon: "none" });
+      loadRecords();
+    } catch (e) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    } finally {
+      busyUserId.value = "";
+    }
+  }
+
+  async function handleReject(row: NpRecord): Promise<void> {
+    if (busyUserId.value.length > 0) {
+      return;
+    }
+    busyUserId.value = row.userId;
+    try {
+      const res = await apiImContactReject(row.userId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+        return;
+      }
+      uni.showToast({ title: t("Mobile.Message.contactRejected"), icon: "none" });
+      loadRecords();
+    } catch (e) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    } finally {
+      busyUserId.value = "";
+    }
+  }
+
+  // ===== 搜索（防抖 + 序号防竞态，同 im-add-buddy）=====
+
+  let searchDebounceTimer = -1;
+  let searchSeq = 0;
+
+  function clearKeyword(): void {
+    keyword.value = "";
+  }
+
+  function resetSearch(): void {
+    searchSeq++;
+    searchLoading.value = false;
+    hits.value = [];
+  }
+
+  /** 批量解析搜索结果头像（口径同 resolveRecordAvatars）。 */
+  function resolveHitAvatars(): void {
+    const rows = hits.value;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const raw = row.avatarRaw;
+      if (raw.length == 0) {
+        continue;
+      }
+      resolveImAvatarDisplay(raw, AVATAR_PX).then((resolved: string): void => {
+        if (resolved != raw && resolved != row.avatarDisplay) {
+          row.avatarDisplay = resolved;
+          row.avatarFailed = false;
+        }
+      });
+    }
+  }
+
+  async function doSearch(): Promise<void> {
+    const kw = keyword.value.trim();
+    if (kw.length == 0) {
+      resetSearch();
+      return;
+    }
+    const seq = ++searchSeq;
+    searchLoading.value = true;
+    try {
+      const res = await apiImSearchContacts(kw, 20);
+      if (seq != searchSeq) {
+        return;
+      }
+      if (apiResCode(res) != SUCCESS_CODE) {
+        searchLoading.value = false;
+        hits.value = [];
+        return;
+      }
+      const rows: NpHit[] = [];
+      const seen = new Set<string>();
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        const itemsRaw = dataObj["items"];
+        if (itemsRaw != null) {
+          const items = itemsRaw as UTSJSONObject[];
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const userId = readString(item, "userId");
+            // 按 userId 去重：平台 ∪ 本地两条来源拼装，撞出重复行会各带一个按钮
+            if (userId.length == 0 || seen.has(userId)) {
+              continue;
+            }
+            seen.add(userId);
+            const hit = new NpHit();
+            hit.userId = userId;
+            // ContactSearchItem 无 displayName：按 nickName > userName 回落
+            const nickName = readString(item, "nickName");
+            hit.displayName = nickName.length > 0 ? nickName : readString(item, "userName");
+            hit.avatarRaw = readString(item, "avatar");
+            hit.avatarDisplay = imAvatarDisplayUrl(hit.avatarRaw, AVATAR_PX);
+            rows.push(hit);
+          }
+        }
+      }
+      hits.value = rows;
+      refreshHitActions();
+      searchLoading.value = false;
+      resolveHitAvatars();
+    } catch (e) {
+      if (seq == searchSeq) {
+        searchLoading.value = false;
+        hits.value = [];
+      }
+    }
+  }
+
+  /** 输入防抖 400ms（连打只发最后一次）；清空立即回记录模式。 */
+  watch(keyword, (val: string) => {
+    if (searchDebounceTimer != -1) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = -1;
+    }
+    if (val.trim().length == 0) {
+      resetSearch();
+      return;
+    }
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = -1;
+      doSearch();
+    }, 400);
+  });
+
+  // ===== 搜索行动作 =====
+
+  /** 搜索行整行点按=进单聊（与记录行同口径；添加/同意按钮已 .stop 不冒泡）。 */
+  function handleHitRowTap(m: NpHit): void {
+    openP2pChat(m.userId, m.displayName, m.avatarRaw);
+  }
+
+  /** 「添加」：失败不改本地状态（服务端是真源，成功路径整页刷新）。 */
+  async function handleHitAdd(m: NpHit): Promise<void> {
+    if (busyUserId.value.length > 0) {
+      return;
+    }
+    busyUserId.value = m.userId;
+    try {
+      const res = await apiImAddContact(m.userId, "");
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
+        return;
+      }
+      let accepted = false;
+      let alreadyContact = false;
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        accepted = readBool(dataObj, "accepted");
+        alreadyContact = readBool(dataObj, "alreadyContact");
+      }
+      let title = t("Mobile.Message.contactRequestSent");
+      if (alreadyContact) {
+        title = t("Mobile.Message.alreadyContact");
+      } else if (accepted) {
+        title = t("Mobile.Message.contactAdded");
+      }
+      uni.showToast({ title, icon: "none" });
+      loadRecords();
+    } catch (e) {
+      uni.showToast({ title: t("Mobile.Message.addContactFailed"), icon: "none" });
+    } finally {
+      busyUserId.value = "";
+    }
+  }
+
+  /** 搜索行「同意」：对方先申请了我，在这里直接通过（与记录行按钮同一条通道）。 */
+  async function handleHitAccept(m: NpHit): Promise<void> {
+    if (busyUserId.value.length > 0) {
+      return;
+    }
+    busyUserId.value = m.userId;
+    try {
+      const res = await apiImContactAccept(m.userId);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+        return;
+      }
+      uni.showToast({ title: t("Mobile.Message.contactAccepted"), icon: "none" });
+      loadRecords();
+    } catch (e) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    } finally {
+      busyUserId.value = "";
+    }
+  }
+
+  function handleBack(): void {
+    // 刷新后栈底保护：无页可退时切回消息 tab，避免整页重载死循环（im-add-buddy 同款）
+    const pages = getCurrentPages();
+    if (pages.length <= 1) {
+      switchMainTab({ url: "/pages/message/message" });
+      return;
+    }
+    uni.navigateBack({ delta: 1 });
+  }
+
+  onLoad((options: any) => {
+    loadRecords();
+  });
+
+  onUnmounted(() => {
+    if (searchDebounceTimer != -1) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = -1;
+    }
+  });
+</script>
+
+<style lang="scss" scoped>
+  /* ===== 页面骨架（白底，页头/搜索框视觉与 im-add-buddy 一致） ===== */
+  .np-page {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background-color: #ffffff;
+  }
+
+  .np-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 8px 12px;
+  }
+
+  .np-header__btn {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .np-header__btn--active {
+    border-radius: 8px;
+    background-color: #f4f3f8;
+  }
+
+  .np-header__btn--ghost {
+    /* 占位让标题真正居中（返回键的同尺寸影子） */
+  }
+
+  .np-header__title-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .np-header__title {
+    font-size: 17px;
+    line-height: 24px;
+    font-weight: 600;
+    color: #141416;
+  }
+
+  .np-header__badge {
+    margin-left: 6px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background-color: #e0942e;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .np-header__badge-text {
+    font-size: 11px;
+    line-height: 15px;
+    color: #ffffff;
+  }
+
+  /* ===== 搜索框 ===== */
+  .np-search {
+    margin: 4px 16px 8px;
+    height: 36px;
+    border-radius: 8px;
+    background-color: #f4f3f8;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 0 10px;
+  }
+
+  .np-search__icon {
+    margin-right: 6px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .np-search__input {
+    flex: 1;
+    height: 36px;
+    font-size: 14px;
+    line-height: 20px;
+    color: #141416;
+  }
+
+  .np-search__ph {
+    color: #9a9aa2;
+    font-size: 14px;
+  }
+
+  .np-search__clear {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .np-body {
+    flex: 1;
+  }
+
+  .np-tail {
+    padding-bottom: 12px;
+  }
+
+  /* ===== 状态区 ===== */
+  .np-state {
+    padding: 80px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .np-state__text {
+    font-size: 14px;
+    line-height: 20px;
+    color: #94929c;
+  }
+
+  /* ===== 日分组标题 ===== */
+  .np-day-title {
+    padding: 12px 16px 4px;
+  }
+
+  .np-day-title__text {
+    font-size: 13px;
+    line-height: 18px;
+    color: #94929c;
+  }
+
+  /* ===== 记录 / 搜索结果行 ===== */
+  .np-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 10.5px 16px;
+  }
+
+  .np-row--stack {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .np-row--active {
+    background-color: #eceaf3;
+  }
+
+  .np-row__line {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .np-avatar {
+    position: relative;
+    width: 46px;
+    height: 46px;
+    margin-right: 14px;
+    flex-shrink: 0;
+  }
+
+  .np-avatar-fallback {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .np-avatar-letter {
+    font-size: 16px;
+    line-height: 20px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .np-avatar-clip {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    overflow: hidden;
+  }
+
+  .np-avatar-img {
+    width: 100%;
+    height: 100%;
+  }
+
+  .np-row__main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .np-row__title-line {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .np-row__name {
+    flex: 1;
+    font-size: 17px;
+    line-height: 20.5px;
+    font-weight: 400;
+    color: #141416;
+  }
+
+  .np-row__subtitle {
+    margin-top: 4px;
+    font-size: 13.5px;
+    line-height: 19px;
+    color: #8f959e;
+  }
+
+  .np-row__state {
+    margin-left: 8px;
+    flex-shrink: 0;
+    font-size: 13.5px;
+    line-height: 18px;
+    color: #8f959e;
+  }
+
+  /* incoming 行的同意/拒绝：内容行下方单独一排，右侧对齐不挤名字 */
+  .np-row__actions {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+    padding-left: 76px;
+  }
+
+  /* ===== 按钮 ===== */
+  .np-btn {
+    margin-left: 10px;
+    padding: 0 14px;
+    height: 30px;
+    border-radius: 6px;
+    background-color: #f0eff4;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .np-btn--primary {
+    background-color: #337eff;
+  }
+
+  .np-btn--primary-active {
+    background-color: #2868d9;
+  }
+
+  .np-btn--ghost-active {
+    background-color: #e3e1ea;
+  }
+
+  .np-btn--disabled {
+    opacity: 0.5;
+  }
+
+  .np-btn__text {
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .np-btn__text--primary {
+    color: #ffffff;
+  }
+
+  .np-btn__text--ghost {
+    color: #4e4e58;
+  }
+</style>

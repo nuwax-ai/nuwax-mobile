@@ -23,6 +23,11 @@
               <rich-text class="create-hub__title-rich" :nodes="homeHeroNodes" />
             </view>
 
+            <!-- 分类+推荐均拉取失败时的重试入口（合法空配置不显示）；此前该区域一直空白无法恢复 -->
+            <view v-if="homeNavFailedVisible" class="create-hub__nav-failed" @tap.stop="handleHomeNavRetry">
+              <text class="create-hub__nav-failed-text">{{ t("Mobile.CreateHub.loadFailed") }}</text>
+            </view>
+
             <!-- 分类和推荐均由接口下发；点击类别后每次展示三条推荐。 -->
             <view v-if="categoryNavList.length > 0" class="create-hub__category-wrap" @touchstart.stop="onEdgeSwipeTouchCancel">
               <view class="create-hub__category-track">
@@ -451,7 +456,7 @@
 
   // ════════════════ 3. 基础状态 ════════════════
 
-  const { onLoad, onShow, onBackPress, onResize } = useMainTabLifecycle("/pages/index/index");
+  const { onLoad, onShow, onBackPress, onResize, onRetap } = useMainTabLifecycle("/pages/index/index");
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
@@ -476,6 +481,10 @@
   const chatboxCategoryDisplayIcons = ref<string[]>([] as string[]);
   const recommendNavList = ref<DisplayRecommendInfo[]>([] as DisplayRecommendInfo[]);
   let chatboxNavLoaded = false;
+  // 最近一次类型体系加载是否有请求失败（区分「加载失败」与「接口成功但无配置」）；
+  // 仅在两列表皆空时驱动重试入口（homeNavFailedVisible），已有内容时静默保留旧数据。
+  const navLoadFailed = ref<boolean>(false);
+  let navLoadInFlight = false;
   const userPickedCategory = ref<string>("");
   const selectedRecommend = ref<DisplayRecommendInfo | null>(null);
 
@@ -704,6 +713,13 @@
   });
 
   // ── 类型体系派生（对齐 PC categoryNavList/autoCategoryKey/activeCategory） ──
+  /** 失败重试入口可见：最近一次加载失败且两列表皆空（合法空配置不显示）；有引导问题时让位。 */
+  const homeNavFailedVisible = computed((): boolean => {
+    return navLoadFailed.value &&
+      chatboxCategories.value.length == 0 &&
+      recommendNavList.value.length == 0 &&
+      activeGuideQuestions.value.length == 0;
+  });
   const categoryNavList = computed((): HomeCategoryDef[] => {
     const result = [] as HomeCategoryDef[];
     const categories = chatboxCategories.value;
@@ -1204,7 +1220,7 @@
     }
   }
 
-  /** 类型体系数据加载（对齐 PC runRecommendNavList + fetchChatboxCategories；onShow 触发但只拉一次） */
+  /** 分类/推荐图标解析为可展示地址（鉴权下载失败回退空串） */
   async function resolveHomeTagIcon(icon: string): Promise<string> {
     if (icon.length == 0) return "";
     try {
@@ -1217,9 +1233,15 @@
     }
   }
 
-  async function loadChatboxNav(): Promise<void> {
-    if (chatboxNavLoaded == true) return;
-    // 分类与推荐并行；任一失败保持空（区域整体不渲染，下次 onShow 重试）
+  /** 类型体系数据加载（对齐 PC runRecommendNavList + fetchChatboxCategories）：
+   *  onShow 只拉一次；失败态点按重试 / 再点任务 tab 静默刷新走 force 重拉（旧数据在位不回闪）。 */
+  async function loadChatboxNav(force: boolean = false): Promise<void> {
+    // force = 手动重试 / 再点 tab 静默刷新：解 latch 重拉；在途请求不重入
+    if (navLoadInFlight == true) return;
+    if (force != true && chatboxNavLoaded == true) return;
+    navLoadInFlight = true;
+    let catFailed = false;
+    let recFailed = false;
     try {
       const categories = await fetchChatboxCategories();
       chatboxCategories.value = categories;
@@ -1233,6 +1255,7 @@
       }
       console.log("[home] chatbox categories:", categories.length);
     } catch (_catError) {
+      catFailed = true;
       console.warn("[home] chatbox categories failed");
     }
     try {
@@ -1278,14 +1301,25 @@
             }
           }
         }
+      } else {
+        recFailed = true;
       }
     } catch (_error) {
-      recommendNavList.value = [] as DisplayRecommendInfo[];
+      // 静默刷新失败保留旧列表（首拉时本就为空）：不回清，避免已展示内容闪没
+      recFailed = true;
     }
     console.log("[home] recommends:", recommendNavList.value.length);
+    // 失败标记仅驱动「两列表皆空」时的重试入口；已有内容时旧数据在位不回闪
+    navLoadFailed.value = catFailed || recFailed;
     if (recommendNavList.value.length > 0 || chatboxCategories.value.length > 0) {
       chatboxNavLoaded = true;
     }
+    navLoadInFlight = false;
+  }
+
+  /** 失败态点按重试（homeNavFailedVisible 区域） */
+  function handleHomeNavRetry(): void {
+    loadChatboxNav(true);
   }
 
   /** 当前智能体详情的提示问题，兼容 GuidQuestionDto[] 和旧版 string[]。 */
@@ -2132,7 +2166,7 @@
       handleExpertAgentSelect(pendingItem);
     }
     loadDefaultAgentEntry();
-    // 类型体系（对齐 PC Home）：分类 + 推荐位并行拉取
+    // 类型体系（对齐 PC Home）：分类 + 推荐位并行拉取（latch 后 onShow 不再重拉，见 onRetap）
     loadChatboxNav();
     // 空间列表（对齐 PC SpaceSelector 挂载即拉）
     loadSpaces();
@@ -2152,6 +2186,12 @@
     // #ifndef APP-IOS
     syncNativeTabBarState();
     // #endif
+  });
+
+  // 再点已激活的任务 tab（common-tab-bar 派发）：失败空白态即重试；已有内容静默刷新
+  // （force 重拉，旧数据在位直到新数据落地，不闪加载态）
+  onRetap((): void => {
+    loadChatboxNav(true);
   });
 
   onBackPress((_options: OnBackPressOptions): boolean => {
@@ -2261,6 +2301,21 @@
     line-height: 36px;
     color: #111111;
     text-align: left;
+  }
+
+  /* 加载失败重试入口：与分类栏同位（两列表皆空时的占位），点按整行重拉。 */
+  .create-hub__nav-failed {
+    width: 100%;
+    margin-top: 24px;
+    padding: 18px 0;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .create-hub__nav-failed-text {
+    font-size: 14px;
+    line-height: 20px;
+    color: #8a8a93;
   }
 
   /* 分类标签常驻横滚；选择后在下方展示每组三条推荐。 */

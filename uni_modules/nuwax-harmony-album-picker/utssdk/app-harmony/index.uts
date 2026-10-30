@@ -7,23 +7,30 @@
 // 与聊天页图片键的二选一弹窗叠成双层（Android/iOS 无此层）。
 //
 // 权限：系统相册选择器属安全控件，无需任何媒体读取权限（与运行时相册分支一致）。
-// fileType 判定：媒体库 URI 路径段 file://media/Photo/…=图片、/Video/…=视频
-// （媒体库真源，运行时为取元数据走 DB 查询，这里仅需类型，取廉价路径）；
-// 无路径段时按扩展名兜底，均未命中按图片。
+// fileType 判定：扩展名优先（媒体库图片与视频 URI 都在 /Photo/ 段下，见 isVideoUri），
+// 均未命中按图片。
+// 产物路径：不是媒体库 URI，而是 cacheDir 下的沙箱副本——媒体库读授权只在本会话可靠，
+// 草稿回显/跨页预览/上传都需要长期可读的路径（见 materializeToCache）。
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+// @kit.CoreFileKit 不导出 fs（ArkTS 编译报 10505001）；官方 runtime 同款默认导入
+import fs from '@ohos.file.fs';
 import type {
   HarmonyAlbumFailCallback,
   HarmonyAlbumSuccessCallback,
 } from '../interface.uts';
 
-/** URI → 是否视频：路径段优先，扩展名兜底。 */
+/**
+ * URI → 是否视频。
+ *
+ * ★扩展名优先（2026-10-27 真机修）：鸿蒙媒体库的图片与视频 URI **都在 /Photo/ 段下**
+ * （视频形如 file://media/Photo/12/VID_20261027120000/VID_20261027120000.mp4），
+ * 原实现「/Photo/ 直接判图片」会把视频全判成图片塞进聊天页的暂存条——真机现象：
+ * 相册里选视频后没直接发出去，而是出现在输入框上方的预览区。
+ */
 function isVideoUri(uri: string): boolean {
   if (uri.indexOf('/Video/') >= 0) {
     return true;
-  }
-  if (uri.indexOf('/Photo/') >= 0) {
-    return false;
   }
   const lower = uri.toLowerCase();
   return (
@@ -32,8 +39,57 @@ function isVideoUri(uri: string): boolean {
     lower.indexOf('.3gp') >= 0 ||
     lower.indexOf('.mkv') >= 0 ||
     lower.indexOf('.mpg') >= 0 ||
-    lower.indexOf('.mpeg') >= 0
+    lower.indexOf('.mpeg') >= 0 ||
+    lower.indexOf('.webm') >= 0 ||
+    lower.indexOf('.m4v') >= 0
   );
+}
+
+/** URI 末段（媒体库原名，可能带扩展名）。 */
+function tailNameOf(uri: string): string {
+  const cut = uri.indexOf('?');
+  const pure = cut >= 0 ? uri.substring(0, cut) : uri;
+  const segs = pure.split('/');
+  if (segs.length == 0) {
+    return '';
+  }
+  return segs[segs.length - 1];
+}
+
+/**
+ * 媒体库 URI → 沙箱缓存副本（返回副本绝对路径；失败回退原 URI）。
+ *
+ * 为什么要复制：file://media/… 是媒体库授权 URI，读授权只对本进程本次会话可靠，
+ * 而暂存图要活得更久——真机实证「相册选图 → 返回消息列表 → 再进聊天页」后，
+ * 输入框上方的草稿图空白（回显时那个 URI 已读不出来）。复制进 cacheDir 后与普通
+ * 本地文件同源：草稿跨页/跨进程可读，预览、上传、视频播放都按普通路径走。
+ * 文件名保留媒体库原名（视频整段直接把该名当展示名，加前缀会变成用户可见的怪名字）。
+ */
+function materializeToCache(uri: string, isVideo: boolean, index: number): string {
+  try {
+    const cacheDir = UTSHarmony.getUIAbilityContext().cacheDir;
+    let name = tailNameOf(uri);
+    if (name.length == 0) {
+      name = `album_${Date.now()}_${index}`;
+    }
+    // 扩展名补齐：上传链路按物理文件名判 mime（服务端嗅探），无扩展名会退化成
+    // application/octet-stream（图片降级成文件卡片、视频被判 file）
+    if (name.indexOf('.') < 0) {
+      name = isVideo ? `${name}.mp4` : `${name}.jpg`;
+    }
+    const dest = `${cacheDir}/${name}`;
+    const src = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+    try {
+      fs.copyFileSync(src.fd, dest);
+    } finally {
+      fs.closeSync(src);
+    }
+    return dest;
+  } catch (e) {
+    // 复制失败：回退原 URI 降级（本会话内仍可能可读，别直接把用户选的图丢掉）
+    console.error(`[HarmonyAlbumPicker] copy to cache failed: ${uri} ${e}`);
+    return uri;
+  }
 }
 
 export function pickHarmonyAlbumMedia(
@@ -61,8 +117,11 @@ export function pickHarmonyAlbumMedia(
         const isVideos: boolean[] = [];
         for (let i = 0; i < uris.length; i++) {
           const uri = `${uris[i]}`;
-          paths.push(uri);
-          isVideos.push(isVideoUri(uri));
+          const video = isVideoUri(uri);
+          // 一律落沙箱副本（见 materializeToCache）：暂存草稿要跨页/跨进程可读，
+          // 视频还要靠它挂本地播放器与上传
+          paths.push(materializeToCache(uri, video, i));
+          isVideos.push(video);
         }
         success(paths, isVideos);
       })

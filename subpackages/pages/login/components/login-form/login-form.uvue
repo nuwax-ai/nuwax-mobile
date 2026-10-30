@@ -138,6 +138,11 @@
       :disabled="isSubmitting"
     >{{ loginButtonText }}</button>
 
+    <!-- #ifdef H5 || WEB -->
+    <idp-login :agreed="agreeTerms" :disabled="isSubmitting" :redirectUrl="redirectUrlVal"
+      @agreed="agreeTerms = true" @busy="handleIdpBusy" />
+    <!-- #endif -->
+
     <!-- #ifdef APP-ANDROID || APP-IOS || APP-HARMONY -->
     <view
       class="enterprise-login-btn"
@@ -203,6 +208,10 @@
   import { notifyImSessionReady } from "@/utils/im/imSessionScope";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import enterpriseLoginIcon from "@/static/icons/enterprise_login.svg";
+  // #ifdef H5 || WEB
+  import IdpLogin from "@/components/idp-login/idp-login.uvue";
+  import { finishBrowserLogin } from "@/utils/idpNavigation";
+  // #endif
 
   // i18n 包装：模板/脚本统一调用单参数 t(key)
   const { t: tFn } = useI18n();
@@ -336,6 +345,8 @@
   });
 
   const loading = ref<boolean>(false);
+  const idpBusy = ref<boolean>(false);
+  const handleIdpBusy = (value: boolean): void => { idpBusy.value = value; };
   const imageCaptchaId = ref<string>("");
   const imageCaptchaCode = ref<string>("");
   const imageCaptchaRefreshToken = ref<number>(0);
@@ -366,7 +377,7 @@
   }
   const loginCompleted = ref<boolean>(false);
   const isSubmitting = computed((): boolean => {
-    return loading.value || loginCompleted.value || props.submitting == true;
+    return loading.value || idpBusy.value || loginCompleted.value || props.submitting == true;
   });
 
   const handleLoginEditionSwitch = () => {
@@ -380,7 +391,6 @@
 
   const phoneNumber = ref<string>("");
   const verifyCode = ref<string>("");
-  const codeLoginCaptchaVerifyParam = ref<string>("");
   const codeCountdown = ref<number>(0);
   let codeCountdownTimer: number | null = null;
   const emailNumber = ref<string>("");
@@ -409,6 +419,11 @@
   const appCaptchaAlive = ref<boolean>(false);
   const showAppCaptcha = ref<boolean>(false);
   const appCaptchaReloadToken = ref<number>(0);
+  // 当前这次打开正在等待的加载序号。关掉弹层或已经收下参数后置 0，
+  // 避免重载时上一份验证码页卸载再吐出的 postMessage 被当成新结果。
+  let appCaptchaPendingSession = 0;
+  // 本页已交给发码或登录接口的参数。阿里云参数只能用一次。
+  const usedAppCaptchaParams: string[] = [];
 
   // 阿里云验证码页地址
   const appCaptchaUrl = computed((): string => {
@@ -630,6 +645,9 @@
         if (isPopupVal.value) {
           emit("login-success");
         } else {
+          // #ifdef H5 || WEB
+          if (finishBrowserLogin(redirectUrlVal.value)) return;
+          // #endif
           redirectTo(redirectUrlVal.value);
         }
       }, 1000);
@@ -703,14 +721,12 @@
       if (isTenantEmailAuth.value) {
         // 邮箱验证码
         if (code == SUCCESS_CODE) {
-          codeLoginCaptchaVerifyParam.value = captchaVerifyParam;
           uni.showToast({
             title: t("Mobile.Auth.codeSentSuccess"),
             icon: "none",
           });
           startCodeCountdown();
         } else if (code == AGENT_NOT_EXIST) {
-          codeLoginCaptchaVerifyParam.value = captchaVerifyParam;
           uni.showToast({
             title: message,
             icon: "none",
@@ -723,7 +739,6 @@
       } else {
         // 手机验证码
         if (code == SUCCESS_CODE) {
-          codeLoginCaptchaVerifyParam.value = captchaVerifyParam;
           uni.showToast({
             title: t("Mobile.Auth.codeSentSuccess"),
             icon: "none",
@@ -770,26 +785,50 @@
     // 每次打开都换 token 触发 src 变更，让常驻的 webview 重新加载验证码页；
     // 不用 v-if 重建，避免 iOS 端 WKWebView 建销竞态闪退。
     appCaptchaReloadToken.value = appCaptchaReloadToken.value + 1;
+    appCaptchaPendingSession = appCaptchaReloadToken.value;
     appCaptchaAlive.value = true;
     showAppCaptcha.value = true;
   };
 
   const closeAppCaptcha = () => {
     showAppCaptcha.value = false;
+    appCaptchaPendingSession = 0;
     loading.value = false;
   };
 
+  function isUsedAppCaptchaParam(param: string): boolean {
+    for (let i = 0; i < usedAppCaptchaParams.length; i++) {
+      if (usedAppCaptchaParams[i] == param) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   const handleAppCaptchaMessage = (event: UniWebViewMessageEvent) => {
-    const messages = event.detail.data;
-    if (messages.length == 0) {
+    // 弹层未打开，或这次加载的结果已经收下，都不再处理。
+    // 重载 web-view 时，上一份页面卸载可能把用过的 postMessage 再吐出来。
+    if (!showAppCaptcha.value || appCaptchaPendingSession == 0) {
       return;
     }
-    const captchaVerifyParam = extractCaptchaVerifyParam(
-      messages[messages.length - 1] as any
-    );
+    if (appCaptchaReloadToken.value != appCaptchaPendingSession) {
+      return;
+    }
+    const messages = event.detail.data;
+    let captchaVerifyParam = "";
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const param = extractCaptchaVerifyParam(messages[i] as any);
+      if (param.length == 0 || isUsedAppCaptchaParam(param)) {
+        continue;
+      }
+      captchaVerifyParam = param;
+      break;
+    }
     if (captchaVerifyParam.length == 0) {
       return;
     }
+    usedAppCaptchaParams.push(captchaVerifyParam);
+    appCaptchaPendingSession = 0;
     showAppCaptcha.value = false;
     handlerSuccess(captchaVerifyParam);
   };
@@ -919,8 +958,6 @@
       "code-login",
       verificationTarget.value,
       code,
-      isTenantEmailAuth.value,
-      codeLoginCaptchaVerifyParam.value,
     );
   };
 

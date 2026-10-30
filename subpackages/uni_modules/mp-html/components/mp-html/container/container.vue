@@ -80,7 +80,7 @@
                 :class="getStatusIconType(toolCall.status)"
                 :style="{
                   color: getStatusIconColor(toolCall.status),
-                  fontSize: '32rpx',
+                  fontSize: '16px',
                 }"
               ></text>
             </view>
@@ -492,7 +492,7 @@
     overflow: hidden;
 
     .iconfont {
-      font-size: 32rpx;
+      font-size: 16px;
       color: #333;
     }
 
@@ -513,7 +513,7 @@
         min-width: 0;
 
         .plan-name {
-          font-size: 28rpx;
+          font-size: 14px;
           font-weight: 600;
           color: #333;
           line-height: 40rpx;
@@ -543,7 +543,7 @@
           }
 
           .plan-status-text {
-            font-size: 24rpx;
+            font-size: 12px;
             color: #666;
             line-height: 32rpx;
           }
@@ -582,7 +582,7 @@
 
           .task-icon {
             font-family: "iconfont";
-            font-size: 32rpx;
+            font-size: 16px;
             font-style: normal;
             -webkit-font-smoothing: antialiased;
             -moz-osx-font-smoothing: grayscale;
@@ -592,7 +592,7 @@
 
         .task-content {
           flex: 1;
-          font-size: 26rpx;
+          font-size: 13px;
           color: #262626;
           line-height: 40rpx;
         }
@@ -616,7 +616,7 @@
         min-width: 0;
 
         .tool-name {
-          font-size: 28rpx;
+          font-size: 14px;
           // font-weight: 600;
           color: #333;
           line-height: 40rpx;
@@ -638,7 +638,7 @@
         .file-tool-title-text {
           flex: 1;
           min-width: 0;
-          font-size: 28rpx;
+          font-size: 14px;
           color: #333;
           line-height: 40rpx;
           overflow: hidden;
@@ -655,14 +655,14 @@
         }
 
         .file-tool-added {
-          font-size: 22rpx;
+          font-size: 11px;
           line-height: 30rpx;
           color: #1a7f37;
           font-weight: 600;
         }
 
         .file-tool-removed {
-          font-size: 22rpx;
+          font-size: 11px;
           line-height: 30rpx;
           color: #cf222e;
           font-weight: 600;
@@ -704,7 +704,7 @@
           }
 
           .tool-status-text {
-            font-size: 24rpx;
+            font-size: 12px;
             color: #666;
             line-height: 32rpx;
             margin-right: 6px;
@@ -766,7 +766,7 @@
           margin-bottom: 16rpx;
 
           .section-title {
-            font-size: 26rpx;
+            font-size: 13px;
             font-weight: 600;
             color: #333;
             line-height: 36rpx;
@@ -788,7 +788,7 @@
           .output-text,
           .error-text,
           .time-text {
-            font-size: 24rpx;
+            font-size: 12px;
             line-height: 36rpx;
             color: #495057;
             font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
@@ -828,12 +828,12 @@
 
         .tool-info {
           .tool-name {
-            font-size: 26rpx;
+            font-size: 13px;
           }
 
           .tool-status-display {
             .tool-status-text {
-              font-size: 22rpx;
+              font-size: 11px;
             }
           }
         }

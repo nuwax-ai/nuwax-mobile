@@ -159,7 +159,7 @@
 
     .task-result-title {
       color: #17191f;
-      font-size: 28rpx;
+      font-size: 14px;
       font-weight: 600;
       line-height: 40rpx;
       margin-bottom: 16rpx;
@@ -181,7 +181,7 @@
     .file-text {
       flex: 1;
       min-width: 0;
-      font-size: 28rpx;
+      font-size: 14px;
       line-height: 40rpx;
       color: #17191f;
       white-space: nowrap;
@@ -198,7 +198,7 @@
       justify-content: center;
 
       .iconfont {
-        font-size: 32rpx;
+        font-size: 16px;
         color: rgba(0, 0, 0, 0.45);
       }
     }
@@ -209,7 +209,7 @@
       overflow: hidden;
 
       .action-text {
-        font-size: 28rpx;
+        font-size: 14px;
         font-weight: 600;
         color: #333;
         line-height: 40rpx;
@@ -228,7 +228,7 @@
       justify-content: center;
 
       .iconfont {
-        font-size: 24rpx;
+        font-size: 12px;
         color: rgba(0, 0, 0, 0.25);
       }
     }
@@ -237,7 +237,7 @@
     @media (max-width: 750rpx) {
       .task-result-action {
         .action-text {
-          font-size: 26rpx;
+          font-size: 13px;
         }
       }
     }

@@ -113,7 +113,7 @@
 
     &__icon-text,
     &__arrow-text {
-      font-size: 28rpx;
+      font-size: 14px;
       color: #333333;
     }
 
@@ -126,7 +126,7 @@
 
     &__title {
       color: #333333;
-      font-size: 28rpx;
+      font-size: 14px;
       font-weight: 600;
       line-height: 40rpx;
       overflow: hidden;
@@ -137,7 +137,7 @@
     &__hint {
       margin-top: 4rpx;
       color: #8b8e96;
-      font-size: 23rpx;
+      font-size: 11.5px;
       line-height: 32rpx;
     }
 

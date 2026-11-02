@@ -24,6 +24,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import com.davemorrissey.labs.subscaleview.ImageSource
 import com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView
+import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -35,6 +36,10 @@ private const val FAST_CLOSE_DURATION = 130L
 /** 手势关闭的动画终值：只走到回缩路程的 45%，在贴到缩略图前就 dismiss。 */
 private const val FAST_CLOSE_STOP = 0.45f
 private const val FAST_FADE_DURATION = 110L
+/** 打开转场：黑底从透明渐亮到全黑（底下是会话页），与图片首帧渐显叠在一起，不再硬切出现。 */
+private const val OPEN_FADE_DURATION = 300L
+/** 图比整层淡入更晚就绪时补一小段渐显（正常情况下图随整层一起浮上来，不会走到这里）。 */
+private const val REVEAL_DURATION = 140L
 
 /** UTS 侧保存回调：鉴权下载与入相册逻辑留在上层（savePreviewImageToAlbumInApp）。 */
 interface SaveRequestCallback {
@@ -53,6 +58,51 @@ interface FileResultCallback {
  */
 interface ViewerFileProvider {
     fun fetchFile(url: String, cb: FileResultCallback)
+}
+
+/**
+ * Fresco 主磁盘缓存读取（纯优化，失败一律当未命中）。
+ *
+ * uni-app x Android 端的 `<image>` / `uni.previewImage` 都走 Fresco，图片编码落在
+ * 主磁盘缓存（目录 uni-net-cache/image），缓存 key 就是 URL 原串——运行时自己的
+ * ImageLoaderAdapter 也是用 `SimpleCacheKey(url)` 查主文件缓存。
+ *
+ * 因此聊天页缩略图刚展示过的图，点开全屏时可以零网络直接复用这份编码：
+ * 首帧不再是黑屏 + 转圈等 downloadFile，而是接近秒开。
+ *
+ * 走反射而不是直接 import：本插件是独立的 uts 模块，编译 classpath 只有 subscaleview，
+ * 不含 Fresco（那是 app 模块的依赖）。运行期 Fresco 一定在（`<image>` 就靠它），
+ * 反射拿不到任何一环就当未命中，回落到 downloadFile。
+ * 用「方法名 + 参数个数」找方法，避开泛型擦除后的签名差异。
+ */
+private object FrescoCacheAdapter {
+    private fun methodOf(target: Any, name: String, argCount: Int): java.lang.reflect.Method? =
+        try {
+            target.javaClass.methods.firstOrNull { it.name == name && it.parameterTypes.size == argCount }
+        } catch (t: Throwable) {
+            null
+        }
+
+    fun cachedFile(url: String): File? {
+        if (url.isEmpty()) return null
+        return try {
+            val frescoClass = Class.forName("com.facebook.drawee.backends.pipeline.Fresco")
+            val factory = frescoClass.getMethod("getImagePipelineFactory").invoke(null) ?: return null
+            val supplier = methodOf(factory, "getDiskCachesStoreSupplier", 0)?.invoke(factory) ?: return null
+            val store = methodOf(supplier, "get", 0)?.invoke(supplier) ?: return null
+            val cache = methodOf(store, "getMainFileCache", 0)?.invoke(store) ?: return null
+            val enabled = methodOf(cache, "isEnabled", 0)?.invoke(cache) as? Boolean ?: false
+            if (!enabled) return null
+            val keyClass = Class.forName("com.facebook.cache.common.SimpleCacheKey")
+            val key = keyClass.getConstructor(String::class.java).newInstance(url)
+            val resource = methodOf(cache, "getResource", 1)?.invoke(cache, key) ?: return null
+            val file = methodOf(resource, "getFile", 0)?.invoke(resource) as? File ?: return null
+            // 空文件当作未命中（异常中断写入可能留下 0 字节条目）
+            if (file.exists() && file.length() > 0L) file else null
+        } catch (t: Throwable) {
+            null
+        }
+    }
 }
 
 /**
@@ -177,6 +227,7 @@ private class PagerHost(
     /** 黑底遮罩（独立一层）：关闭转场时只渐隐它，图片层才能缩小露到底下的会话页。 */
     private val scrim = View(context)
     private var closing = false
+    private var opened = false
     private var downX = 0f
     private var downY = 0f
     private var lastX = 0f
@@ -196,7 +247,34 @@ private class PagerHost(
     init {
         setBackgroundColor(Color.TRANSPARENT)
         scrim.setBackgroundColor(Color.BLACK)
+        alpha = 0f             // 整层从透明淡入（含黑底与图），见 playOpenTransition
         addView(scrim, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+    }
+
+    /** 打开转场：整层（黑底 + 图）一起线性淡入，对齐 uni.previewImage。
+     *
+     *  DCloud 的 previewImage 不是自绘弹窗，而是
+     *  `openDialogPage(url = "uni:previewImage", animationType = "fade-in")`——
+     *  由框架做**整层一次性淡入**，并不存在「黑底先渐入、图片再单独渐显」两段。
+     *  这里照着做：动的是 PagerHost 自身的 alpha，黑底与页内图片一起浮上来。
+     */
+    private fun playOpenTransition() {
+        if (closing) {
+            alpha = 1f
+            return
+        }
+        val anim = android.animation.ValueAnimator.ofFloat(0f, 1f)
+        anim.duration = OPEN_FADE_DURATION
+        anim.interpolator = android.view.animation.LinearInterpolator()
+        anim.addUpdateListener { a -> alpha = a.animatedValue as Float }
+        anim.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(a: android.animation.Animator) {
+                alpha = 1f
+                if (animator === a) animator = null
+            }
+        })
+        animator = anim
+        anim.start()
     }
 
     /** 只裁图片页，黑底不裁（否则黑背景只剩一小块方框）。 */
@@ -211,7 +289,14 @@ private class PagerHost(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (w > 0) rebuild()
+        if (w > 0) {
+            rebuild()
+            // 首帧排版好后再起渐入，避免动画抢在窗口出现前跑完（等于没播）
+            if (!opened) {
+                opened = true
+                post { playOpenTransition() }
+            }
+        }
     }
 
     fun release() {
@@ -235,6 +320,7 @@ private class PagerHost(
         if (closing) return
         closing = true
         animator?.cancel()
+        alpha = 1f      // 打开淡入没跑完就被关闭：先补足，避免回缩/淡出全程半透明
         dragging = false
         // 已翻页看过别的图：缩略图不在当前视野，回缩无处可去 → 直接关，不做任何转场
         if (index != openedIndex) {
@@ -321,8 +407,11 @@ private class PagerHost(
 
     /** 兜底关闭：整层淡出（放大态、图未就绪、测量不到落点）。 */
     private fun fadeOutAndClose(fast: Boolean = false) {
-        val anim = android.animation.ValueAnimator.ofFloat(1f, 0f)
-        anim.duration = if (fast) FAST_FADE_DURATION else 160
+        val anim = android.animation.ValueAnimator.ofFloat(alpha, 0f)
+        // 与打开同一条口径：uni.previewImage 关闭走 closeDialogPage(animationType = "fade-out")，
+        // 是整层淡出，时长取与 fade-in 相同的 300ms、同样的线性曲线。
+        anim.duration = if (fast) FAST_FADE_DURATION else OPEN_FADE_DURATION
+        anim.interpolator = android.view.animation.LinearInterpolator()
         anim.addUpdateListener { a ->
             alpha = a.animatedValue as Float
         }
@@ -502,6 +591,10 @@ private class PageView(
     private val errText = TextView(context)
     private var url = ""
     private var fileUrl = ""
+    /** 当前图取自 Fresco 磁盘缓存（不是我们下载的临时文件）：解码失败时可回落整段下载重试一次。 */
+    private var frescoBacked = false
+    /** 首帧渐显只播一次（相邻页预加载时也会走到 onReady，此时页面在屏外，播了也无感）。 */
+    private var revealed = false
 
     init {
         setBackgroundColor(Color.TRANSPARENT)   // 黑底由 PagerHost 的 scrim 承担（关闭时要单独渐隐）
@@ -510,6 +603,7 @@ private class PageView(
         ssiv.setOnImageEventListener(object : SubsamplingScaleImageView.DefaultOnImageEventListener() {
             override fun onReady() {
                 spinner.visibility = View.GONE      // 预览位图已上屏，清晰瓦片稍后流入
+                revealFirstFrame()
                 val sW = ssiv.sWidth
                 val sH = ssiv.sHeight
                 if (sW <= 0 || sH <= 0 || width <= 0 || height <= 0) return
@@ -534,11 +628,13 @@ private class PageView(
             }
 
             override fun onImageLoadError(e: Exception?) {
+                if (retryFromDownloadIfFresco()) return
                 spinner.visibility = View.GONE
                 errText.visibility = View.VISIBLE
             }
 
             override fun onPreviewLoadError(e: Exception?) {
+                if (retryFromDownloadIfFresco()) return
                 spinner.visibility = View.GONE
                 errText.visibility = View.VISIBLE
             }
@@ -577,12 +673,26 @@ private class PageView(
         if (newUrl == url && errText.visibility != View.VISIBLE) return   // 已载或下载中
         url = newUrl
         fileUrl = ""
+        frescoBacked = false
         errText.visibility = View.GONE
         spinner.visibility = View.VISIBLE
         ssiv.recycle()
+        // 上一张的渐显可能没跑完：一律拉回终态，新图重新从 onReady 起一段渐显
+        ssiv.animate().cancel()
+        ssiv.alpha = 1f
+        revealed = false
         val cached = fileCache[newUrl]
         if (cached != null) {
             applyFile(cached)
+            return
+        }
+        // 缩略图阶段 <image> 已把同一 URL 的原图编码写进 Fresco 主磁盘缓存：直接拿来解码，
+        // 省掉一次分块解码前的整段下载（这条是「点开先黑屏再出图」的主要消除手段）。
+        // 不写进 fileCache：那份缓存会随 Fresco LRU 淘汰，记下来早晚指向一个不存在的文件。
+        val frescoCached = FrescoCacheAdapter.cachedFile(newUrl)
+        if (frescoCached != null) {
+            frescoBacked = true
+            applyFile(frescoCached.getAbsolutePath())
             return
         }
         files.fetchFile(url, object : FileResultCallback {
@@ -599,6 +709,38 @@ private class PageView(
                 errText.visibility = View.VISIBLE
             }
         })
+    }
+
+    /** 首帧渐显（兜底）：图比整层淡入更晚就绪时，补一小段线性淡入，免得图「啪」地出现。
+     *  图若在整层淡入期间就绪，直接返回——让 PagerHost 的整体 fade 带着图一起浮上来，
+     *  与 previewImage 的一次整层 fade 保持一致（不再给图叠第二段动画）。 */
+    private fun revealFirstFrame() {
+        if (revealed) return
+        revealed = true
+        // 父层（PagerHost）仍在淡入中：这一次由整层负责
+        if (((parent as? View)?.alpha ?: 1f) < 0.99f) return
+        ssiv.alpha = 0f
+        ssiv.animate()
+            .alpha(1f)
+            .setDuration(REVEAL_DURATION)
+            .setInterpolator(android.view.animation.LinearInterpolator())
+            .start()
+    }
+
+    /** Fresco 缓存文件解码失败（被 LRU 淘汰 / 写入半截）→ 丢掉它改走整段下载重试一次。
+     *  成功接管返回 true；下载也失败则照常落到「加载失败，点击重试」。 */
+    private fun retryFromDownloadIfFresco(): Boolean {
+        if (!frescoBacked) return false
+        frescoBacked = false
+        val retryUrl = url
+        spinner.visibility = View.VISIBLE
+        errText.visibility = View.GONE
+        post {
+            if (url != retryUrl) return@post   // 期间已翻到别的图
+            url = ""
+            load(retryUrl)
+        }
+        return true
     }
 
     private fun applyFile(path: String) {

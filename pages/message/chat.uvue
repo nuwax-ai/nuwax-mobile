@@ -7235,6 +7235,11 @@
   /** App 端 SVG 全屏预览展示地址（空=关闭；页面内自绘 <image> aspectFit 保比例）。 */
   const svgPreviewSrc = ref<string>("");
 
+  // #ifdef APP-HARMONY
+  /** 鸿蒙受保护图解析总尝试次数（退避 400ms×n，对齐头像链 AVATAR_RESOLVE_MAX_RETRIES）。 */
+  const HARMONY_IMG_RESOLVE_MAX_ATTEMPTS = 3;
+  // #endif
+
   /** 受保护图片取址：allowAk 时首选 /api/file/ak/refresh 换 ?ak= 直链——<image> 自跟
    *  302 到对象存储流式加载，只花一次轻量 JSON 请求，免去整段下载落盘与完整性校验
    *  （视频 resolveChatVideo 同款策略）；接口不可用/失败回落原整段下载路径（temp/blob）。
@@ -7255,6 +7260,29 @@
         console.error(`[ChatImg] ak 直链解析失败，回落整段下载 url=${url}`);
       }
     }
+    // #ifdef APP-HARMONY
+    // 鸿蒙 downloadFile 偶发悬挂/瞬时失败（authProtectedFileUrl 内已挂看门狗 abort）：
+    // 受保护地址单发失败会回退原址，挂载闸门（harmonyImgGateOk）从此打不开——
+    // 图片永久停在灰块，点按也预览不出（2026-11-02 真机：发送图灰块+预览失败）。
+    // 对齐头像链的退避重试：至多 3 次；resolveDisplayImageUrl 失败回退原址
+    //（resolved == url，仅受保护地址此语义成立）即本轮失败。
+    if (isAuthProtectedFileUrl(url)) {
+      for (let attempt = 1; attempt <= HARMONY_IMG_RESOLVE_MAX_ATTEMPTS; attempt++) {
+        const resolved = await resolveDisplayImageUrl(url, size, size);
+        if (resolved != url) {
+          return resolved;
+        }
+        if (attempt < HARMONY_IMG_RESOLVE_MAX_ATTEMPTS) {
+          await new Promise<void>((resolve) => {
+            setTimeout((): void => {
+              resolve();
+            }, 400 * attempt);
+          });
+        }
+      }
+      return url;
+    }
+    // #endif
     return await resolveDisplayImageUrl(url, size, size);
   }
 
@@ -8421,6 +8449,120 @@
     return name;
   }
 
+  // #ifdef APP-HARMONY
+  /** 鸿蒙 <image> 换 src 不重绘（节点挂上后只认首次那个地址）：要让新地址真正上屏，
+   *  必须先把这个地址从挂载闸门里摘掉（节点被卸载）、下一拍再按新地址重建节点。
+   *  本表登记「暂时不许挂载」的地址，由 harmonyImgGateOk 读取。 */
+  const harmonyImgRebuildUrls = new Set<string>();
+
+  /** 强制重建某行主图节点并换成 nextUrl（仅鸿蒙，语义见上）。 */
+  function forceHarmonyImageRebuild(row: ImMsgRow, nextUrl: string): void {
+    const prev = row.imageUrl;
+    harmonyImgRebuildUrls.add(prev);
+    scheduleChatMediaRefresh();
+    setTimeout((): void => {
+      if (!isChatCurrent()) return;
+      if (row.imageUrl != prev) return;
+      row.imageUrl = nextUrl;
+      harmonyImgRebuildUrls.delete(prev);
+      // 新地址未加载过：复位 loading 态（转圈等新节点 onComplete）
+      row.imageLoaded = false;
+      scheduleChatMediaRefresh();
+    }, 140);
+  }
+
+  /** 强制重建 rich_text 附件图节点（语义同 forceHarmonyImageRebuild）。 */
+  function forceHarmonyAttRebuild(row: ImMsgRow, index: number, nextUrl: string): void {
+    if (index >= row.imageAtts.length) return;
+    const prev = row.imageAtts[index].url;
+    harmonyImgRebuildUrls.add(prev);
+    scheduleChatMediaRefresh();
+    setTimeout((): void => {
+      if (!isChatCurrent()) return;
+      if (index >= row.imageAtts.length) return;
+      const curAtt = row.imageAtts[index];
+      if (curAtt.url != prev) return;
+      curAtt.url = nextUrl;
+      harmonyImgRebuildUrls.delete(prev);
+      curAtt.loaded = false;
+      scheduleChatMediaRefresh();
+    }, 140);
+  }
+  // #endif
+
+  /** 可本地优先展示的发送预览地址：非空、且不是带不了鉴权的受保护原址（那种挂上去
+   *  只会灰）。相册插件落沙箱的裸路径、Android content:// 、iOS 相册临时路径，
+   *  暂存条已用同一地址渲染过 → 各端 <image> 都能直接出图。 */
+  function localSendPreviewOf(localPath: string): string {
+    if (localPath.length == 0) return "";
+    if (isAuthProtectedFileUrl(localPath)) return "";
+    // #ifdef APP-HARMONY
+    // 媒体库 URI（file://media/…）ArkUI <image> 读不出（挂上节点也不显=灰块）：
+    // 不拿它做本地预览，退回受保护原址的灰底热区，等远端 temp 回来再建节点
+    if (localPath.indexOf("file://") == 0) return "";
+    // #endif
+    return localPath;
+  }
+
+  /** 发送后远端地址补齐（主图）：本地优先展示期间异步解析服务端地址，成功即换回——
+   *  重进会话/转发只认远端字段，本地沙箱文件也可能被系统清理。解析失败（回退原址）
+   *  就保持本地展示，绝不退回灰块。
+   *  task：已在途的解析任务（鸿蒙上传完就开始跑，与发送 POST 并行），传了就不再重复下载。 */
+  function resolveSentImageRemote(
+    row: ImMsgRow,
+    localPreview: string,
+    remoteUrl: string,
+    task: Promise<string> | null = null,
+  ): void {
+    const pending: Promise<string> = task != null ? task : resolveChatImage(remoteUrl, 300, true);
+    pending
+      .then((resolved: string) => {
+        if (!isChatCurrent()) return;
+        if (resolved == remoteUrl) return;
+        // 期间已被别的链路（WS 合并/刷新）换过地址：勿覆盖
+        if (row.imageUrl != localPreview) return;
+        // #ifdef APP-HARMONY
+        // 本地图始终没 load（没上屏）：ArkUI 不会因换 src 重绘，必须摘节点重建
+        if (row.imageLoaded != true) {
+          forceHarmonyImageRebuild(row, resolved);
+          return;
+        }
+        // #endif
+        row.imageUrl = resolved;
+        // 不重置 imageLoaded：本地图已上屏且内容相同，重置会让转圈再闪一遍
+        scheduleChatMediaRefresh();
+      })
+      .catch((_e: any | null) => {});
+  }
+
+  /** 发送后远端地址补齐（rich_text 附件图）：语义同 resolveSentImageRemote。 */
+  function resolveSentAttRemote(
+    row: ImMsgRow,
+    index: number,
+    localPreview: string,
+    remoteUrl: string,
+  ): void {
+    resolveChatImage(remoteUrl, 260, true)
+      .then((resolved: string) => {
+        if (!isChatCurrent()) return;
+        if (resolved == remoteUrl) return;
+        if (index >= row.imageAtts.length) return;
+        const att = row.imageAtts[index];
+        if (att.url != localPreview) return;
+        // #ifdef APP-HARMONY
+        // 本地图没上屏：摘节点重建（语义同主图，见 forceHarmonyImageRebuild）
+        if (att.loaded != true) {
+          forceHarmonyAttRebuild(row, index, resolved);
+          return;
+        }
+        // #endif
+        att.url = resolved;
+        // 同上：不重置 loaded，避免整条消息重渲时图片区闪一下
+        scheduleChatMediaRefresh();
+      })
+      .catch((_e: any | null) => {});
+  }
+
   /**
    * 媒体发送核心（与 PC 端 sendAttachment 单附件链路对齐）：
    * uploadSingleFile 拿远端 url/size/mime → 定 msgType（相册/拍摄入队的行恒 image，
@@ -8445,6 +8587,12 @@
         return;
       }
       const file = up.file;
+      // 鸿蒙：上传一拿到远端地址就并行把它换成本地 temp（与下面的发送 POST 同时跑），
+      // 本地预览不可用（媒体库 URI / 受保护原址）时确认行直接拿它起手，省掉
+      // 「先灰块、等 1~2s 再出图」。earlyPreview 只当「已就绪」快照用，不 await：
+      // 没赶上就退回原址（闸门关着=不建节点，解析回来自然新建节点上屏）。
+      let earlyImageTask: Promise<string> | null = null;
+      let earlyPreview = "";
       // 入口契约（PC kindOf 同口径，servers/im.uts 注释「相册/拍摄入口恒为 image」）：
       // 入队时已判定的图片行不被服务端 mime 嗅探失败（octet-stream——上传物理文件
       // 无扩展名的形态）降级成文件消息；视频按 mime/扩展名升格 kind=video——PC 单附件
@@ -8456,6 +8604,16 @@
       } else if (file.type.indexOf("video/") == 0 || classifyKind("", file.name) == "video") {
         kind = "video";
       }
+      // #ifdef APP-HARMONY
+      if (kind == "image") {
+        earlyImageTask = resolveChatImage(file.url, 300, true).then((p: string): string => {
+          if (p.length > 0 && p != file.url) {
+            earlyPreview = p;
+          }
+          return p;
+        });
+      }
+      // #endif
       const res = await apiImSendMediaMsg(
         convId.value,
         kind,
@@ -8472,8 +8630,25 @@
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
         const confirmed = buildConfirmedRow(dataObj, row);
         confirmed.msgType = kind;
+        // 本地优先（对齐微信）：确认行先用刚选的本地文件展示——此前这里直接换成
+        // 服务端 /api/f/ 受保护地址，鸿蒙 <image> 对它加载不出即灰块（2026-11-02 真机：
+        // 发送成功后灰块、点按预览也失败），而同一本地路径暂存条一直是正常显示的。
+        // 远端地址由 resolveSentImageRemote 异步补齐（成功后换回，失败保持本地）。
+        const localPreview = localSendPreviewOf(localPath);
+        // 确认行起手地址：本地优先（fail-open 到服务端地址）。
+        // startFromLocal：是否仍在「本地优先」态（远端要异步补齐）；已是远端 temp 则不用补。
+        let imageStartUrl = localPreview.length > 0 ? localPreview : file.url;
+        const startFromLocal = localPreview.length > 0;
         if (kind == "image") {
-          confirmed.imageUrl = file.url;
+          // #ifdef APP-HARMONY
+          // 本地预览不可用（媒体库 URI / 受保护原址）且并行解析已就绪：直接拿远端 temp
+          // 起手。没赶上就退回原址——闸门对受保护原址是关的（不建节点），解析回来
+          // 由 resolveRowMedia 换址新建节点，不会留下「换 src 不重绘」的灰块。
+          if (startFromLocal != true && earlyPreview.length > 0) {
+            imageStartUrl = earlyPreview;
+          }
+          // #endif
+          confirmed.imageUrl = imageStartUrl;
           confirmed.linkAtts = [];
         } else if (kind == "video") {
           // 视频文件：确认行转视频渲染（readMsgRow 同口径，发送契约 kind=video），
@@ -8503,6 +8678,11 @@
         const proxied = findRowByClientMsgId(confirmed.clientMsgId);
         if (proxied != null) {
           resolveRowMedia(proxied);
+          // 本地优先展示的图：服务端地址异步补齐（失败保持本地，不发灰块）。
+          // 起手已经是远端 temp 时不补（同址换址会白白摘节点重建，闪一下）。
+          if (kind == "image" && startFromLocal) {
+            resolveSentImageRemote(proxied, imageStartUrl, file.url, earlyImageTask);
+          }
         }
         // 视频确认行预载（原占位是本地播放，确认后换远端地址重挂播放器）
         preloadChatVideos();
@@ -8583,11 +8763,15 @@
         confirmed.msgType = "rich_text";
         confirmed.imageUrl = "";
         confirmed.linkAtts = [];
-        // 远端真实 url/mime 覆盖乐观行的本地路径占位（readMsgRow 同款三字段）
+        // 本地优先（同 sendMediaWithRow）：每张先用本地文件展示，远端地址随后异步补齐；
+        // 鸿蒙 <image> 对 /api/f/ 受保护地址加载不出，直接换远端会整片灰块。
+        const localPreviews: string[] = [];
         confirmed.imageAtts = [];
         for (let i = 0; i < files.length; i++) {
+          const localPreview = localSendPreviewOf(localPaths[i]);
+          localPreviews.push(localPreview);
           const att = new ImMsgAtt();
-          att.url = files[i].url;
+          att.url = localPreview.length > 0 ? localPreview : files[i].url;
           att.fileName = files[i].name;
           att.mime = files[i].type;
           confirmed.imageAtts.push(att);
@@ -8603,6 +8787,11 @@
         const proxied = findRowByClientMsgId(confirmed.clientMsgId);
         if (proxied != null) {
           resolveRowMedia(proxied);
+          for (let i = 0; i < files.length; i++) {
+            if (localPreviews[i].length > 0) {
+              resolveSentAttRemote(proxied, i, localPreviews[i], files[i].url);
+            }
+          }
         }
         reportReadIfNeeded(maxSeq());
         refreshReadStatus();
@@ -9755,23 +9944,27 @@
    *  等回填后由 v-for key/条件变化新建节点才出图；灰底与转圈仍由 box/spinbox 承担。
    *  非受保护直链、本地 temp（/data/storage/…）照常挂载。 */
   function harmonyImgGateOk(url: string): boolean {
-    return url.length > 0 && isAuthProtectedFileUrl(url) != true;
+    return url.length > 0 && isAuthProtectedFileUrl(url) != true && harmonyImgRebuildUrls.has(url) != true;
   }
 
   /** 鸿蒙「灰底热区」点击（<image> 未挂载期间的兜底）：先按需整段下载成 temp 再预览，
-   *  别把带不了 Bearer 的原址直接丢给预览器（那里同样是空白），保住改动前「灰块可点
-   *  预览」的能力；下载失败才按原址试一次（Cookie 命中时仍可能显示）。 */
+   *  别把带不了 Bearer 的原址直接丢给预览器（那里同样是空白）；重试后仍回退原址＝
+   *  下载终态失败，原址预览只会得到空白页（用户视角「预览失败」），明确 toast 收场。 */
   function handleHarmonyPendingImageTap(url: string): void {
     if (url.length == 0) return;
     if (harmonyImgGateOk(url) == true) return;
     resolveChatImage(url, 260, false)
       .then((resolved: string) => {
         if (!isChatCurrent()) return;
+        if (resolved == url) {
+          uni.showToast({ title: t("Mobile.Intervention.McpAsk.previewImageFailed"), icon: "none" });
+          return;
+        }
         previewImageCompat([resolved], resolved);
       })
       .catch((_e: any | null) => {
         if (!isChatCurrent()) return;
-        previewImageCompat([url], url);
+        uni.showToast({ title: t("Mobile.Intervention.McpAsk.previewImageFailed"), icon: "none" });
       });
   }
 
@@ -12889,6 +13082,9 @@
               }
             }
           }
+          // 拍摄产物若是媒体库 URI（file://media/…），不再在业务侧改编排：localSendPreviewOf
+          // 对它返回空（ArkUI <image> 渲染不出），确认行改用并行的远端 temp 起手，见
+          // sendMediaWithRow 的 earlyImageTask。不在插件侧落副本是为了免重打自定义基座。
           // 逐张入暂存条（点发送时与文案合并 rich_text / 单图直发 image）
           for (let i = 0; i < pathList.length && i < room; i++) {
             const staged = new StagedImage();

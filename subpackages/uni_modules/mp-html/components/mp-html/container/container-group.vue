@@ -221,7 +221,7 @@
         align-items: center;
 
         .group-title {
-          font-size: 26rpx;
+          font-size: 13px;
           color: #333333;
         }
       }
@@ -233,12 +233,12 @@
         gap: 12rpx;
 
         .process-count {
-          font-size: 24rpx;
+          font-size: 12px;
           color: #8c8c8c;
         }
 
         .expand-icon {
-          font-size: 24rpx;
+          font-size: 12px;
           color: #8c8c8c;
           transition: transform 0.3s ease;
 

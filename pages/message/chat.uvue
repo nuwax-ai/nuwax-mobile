@@ -923,6 +923,10 @@
         </view>
       </view>
     </view>
+    <!-- 「N 条新消息」提示：息屏/锁屏/退后台或在读历史期间到达、当前不在视口下方的消息
+         由它提示，点击滚到最新（飞书式）。零绑定组件——条数与点击回调走模块级 ref
+         （utils/chatNewMsgTip.uts），模板不新增捕获参数（255 上限同 chat-ai-hint）。 -->
+    <chat-new-msg-tip />
     <!-- 定位等待遮罩：带定位目标进页时从首屏拉取一直盖到定位揭幕（中间列表是 veiled 全白），
          居中给转圈 +「正在定位消息…」；不透明白底顺带盖住 chat-state 的「加载中…」，
          全程只有一处反馈（避免先「加载中」再「正在定位」两段重复）。
@@ -2024,6 +2028,12 @@
   import { setAiContentHintVisible } from "@/utils/chatAiHint.uts";
   // 定位等待遮罩（components/chat-locate-loading）显隐：同样是模板零绑定的模块级 ref
   import { setChatLocateLoadingVisible, setChatLocateLoadingInline } from "@/utils/chatLocateLoading.uts";
+  // 「N 条新消息」提示（components/chat-new-msg-tip）条数与点击回调：同样是模板零绑定
+  import {
+    setChatNewMsgTipCount,
+    setChatNewMsgTipJumpHandler,
+    clearChatNewMsgTipJumpHandler,
+  } from "@/utils/chatNewMsgTip.uts";
   // 视频播放态/进度/全屏态（模块级 ref）：自绘控制条 components/chat-video-bar 与页面事件共用
   import {
     chatVideoFullscreen,
@@ -5259,6 +5269,69 @@
     return isMultiSelected(msg) ? "chat-check--on" : "";
   }
 
+  // ===== 「N 条新消息」提示（飞书式；零绑定组件 components/chat-new-msg-tip） =====
+  // 场景：停留在会话页时息屏/锁屏/退后台，期间到达多条消息；解锁回页仍停在原位置，
+  // 新消息在视口下方看不见 ⇒ 悬出「N 条新消息」，点击滚到最新（原从列表进会话的
+  // 定位逻辑不变，见 locateFirstUnread）。
+  // ★计数由「行 + 基线」推导，不做累加：基线 = 最近一次贴底看到最新时的 max seq
+  //  （贴底探测 atBottom 时推进）。这样回页后才由 WS 补拉/静默同步落地的消息天然计入，
+  //   不依赖到达时机（后台断 WS，消息基本都在回前台后才到）。
+  // ★页面本地用普通变量、组件经模块级 ref 读：模板不新增 setup 顶层引用（255 捕获
+  //   上限，见 utils/chatAiHint.uts）。
+  // ★定义在多选段之前：enter/exitMultiSelect 要即时收起/恢复提示（UTS 不提升声明）。
+  let newMsgTipCount = 0;
+  let newMsgTipBaselineSeq = 0;
+
+  /** 列表内最大 seq（本地占位行 seq=0 不参与）。 */
+  function maxSeq(): number {
+    let seq = 0;
+    for (let i = 0; i < messages.value.length; i++) seq = Math.max(seq, messages.value[i].seq);
+    return seq;
+  }
+
+  /** 把本页条数写进模块 ref（组件渲染源）。★仅本页可见时写：聊天页可叠栈
+   *  （会话 A 未销毁、上面压着会话 B），A 离页后仍会收 WS 消息并跑探测——此时写
+   *  模块 ref 会串到 B 的提示上（A 自己的值走 onShow 回填）。 */
+  function pushNewMsgTipCount(): void {
+    if (!pageVisible) return;
+    setChatNewMsgTipCount(multiSelectMode.value ? 0 : newMsgTipCount);
+  }
+
+  /** 贴底看到最新：基线推进到当前最大 seq，提示清零。 */
+  function markNewMsgTipSeen(): void {
+    const seq = maxSeq();
+    if (seq > newMsgTipBaselineSeq) {
+      newMsgTipBaselineSeq = seq;
+    }
+    newMsgTipCount = 0;
+    pushNewMsgTipCount();
+  }
+
+  /** 基线之后（= 视口下方）的对方新消息条数 → 组件渲染；多选态整体隐藏（数值保留，
+   *  退出多选后恢复）。 */
+  function refreshNewMsgTipCount(): void {
+    if (!isChatCurrent()) return;
+    const base = newMsgTipBaselineSeq;
+    let count = 0;
+    const rows = messages.value;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      // local=本机发送/失败占位（seq=0），不是「离开期间别人发来的新消息」
+      if (r.local == true || r.seq <= base) continue;
+      count++;
+    }
+    newMsgTipCount = count;
+    pushNewMsgTipCount();
+  }
+
+  /** 进会话首屏/缓存落地：已加载窗口内的消息都不是「离开期间来的新消息」，
+   *  基线直接压到当前最大 seq（未读定位停在历史区时也不会把整屏算成新消息）。 */
+  function resetNewMsgTipForEntry(): void {
+    newMsgTipBaselineSeq = maxSeq();
+    newMsgTipCount = 0;
+    setChatNewMsgTipCount(0);
+  }
+
   /** 进多选态：收键盘/面板（closeExpandSheet 体内联——其定义在后方，UTS 先用后定义会炸）；
    *  长按起点消息可转发则预选（微信/飞书同款）。 */
   function enterMultiSelect(msg: ImMsgRow): void {
@@ -5277,11 +5350,15 @@
     }
     multiSelectedIds.value = ids;
     multiSelectMode.value = true;
+    // 多选工具条占底部，提示一并收起（数值保留，退出多选再恢复）
+    setChatNewMsgTipCount(0);
   }
 
   function exitMultiSelect(): void {
     multiSelectMode.value = false;
     multiSelectedIds.value = [];
+    // 多选期间的阅读位置没变，按现有行/基线恢复「N 条新消息」
+    refreshNewMsgTipCount();
   }
 
   /** 多选态点行/点勾选框：切选中；不可转发的行提示后忽略（系统行不渲染勾选框，气泡行仍可点）。 */
@@ -6367,12 +6444,6 @@
     }
   }
 
-  function maxSeq(): number {
-    let seq = 0;
-    for (let i = 0; i < messages.value.length; i++) seq = Math.max(seq, messages.value[i].seq);
-    return seq;
-  }
-
   let readReportTimer = 0;
   let readReportRunning = false;
   let wantedReadSeq = 0;
@@ -6465,6 +6536,16 @@
   /** 触发展示阈值（px）：距底余量超过该值才算「在读历史」——略大于 NEAR_BOTTOM_PX，
    *  避免贴底微滚/回弹就闪钮。 */
   const JUMP_LATEST_TRIGGER_PX = 200;
+  /** 「N 条新消息」基线推进阈值（px）：比 NEAR_BOTTOM_PX 严得多——贴底时距底 ≈ 0
+   *  （.chat-bottom-anchor 是内容最后一个节点），32 足够吸收回弹/取整；而一条最短的
+   *  单行消息也 ≥36px，故「后台来一条、视口没滚」不会被 120 的宽容差当成已看到。 */
+  const NEW_MSG_TIP_AT_BOTTOM_PX = 32;
+  /** 最近一次探测的距底余量（onHide 基线快照判「离页时是否真在底部」用，初值=不在底）。 */
+  let lastDistBottomPx = NEW_MSG_TIP_AT_BOTTOM_PX + 1;
+  /** 程序化滚底的跟进窗口截止时间戳：滚底是异步的（settle 两拍 ≈ 250ms），窗口内的
+   *  距底余量是动画中间态——不能据此点亮「N 条新消息」（否则贴底收消息会闪一下提示）。
+   *  由 scrollToBottom 统一置位：所有「主动回最新」的入口都经它。 */
+  let bottomFollowUntilTs = 0;
   let jumpLatestCheckTimer = 0;
 
   /** 距底探测：与 saveScrollMemo 同款 boundingClientRect 方案——scrollOffset
@@ -6495,8 +6576,20 @@
       if (Date.now() - kbLandedTs >= 400) {
         bodySlackPx.value = distBottom;
       }
-      showJumpLatest.value = distBottom > JUMP_LATEST_TRIGGER_PX;
       nearChatBottom.value = distBottom <= NEAR_BOTTOM_PX;
+      lastDistBottomPx = distBottom;
+      // 「N 条新消息」：真贴底（或正被主动滚底）→ 基线推进、提示清零；否则由基线之后
+      //  的行为动态推导。★两条判据缺一不可：
+      //  ①严格阈值 NEW_MSG_TIP_AT_BOTTOM_PX——后台/离页期间消息只落列表不滚动，
+      //    几十像素内的几条不能被 NEAR_BOTTOM_PX 的宽容差当成「已经看到」；
+      //  ②滚底跟进窗——贴底收消息会自动滚底，动画中途的余量不能点亮提示（会闪）。
+      if (distBottom <= NEW_MSG_TIP_AT_BOTTOM_PX || Date.now() < bottomFollowUntilTs) {
+        markNewMsgTipSeen();
+      } else {
+        refreshNewMsgTipCount();
+      }
+      // 提示在场时由它承担「回最新」入口（同一位置不叠两枚浮钮）
+      showJumpLatest.value = distBottom > JUMP_LATEST_TRIGGER_PX && newMsgTipCount == 0;
     });
   }
 
@@ -6559,6 +6652,8 @@
   }
 
   function scrollToBottom(): void {
+    // 滚底跟进窗口（见 bottomFollowUntilTs）：窗口内的距底余量不算「有消息没看到」
+    bottomFollowUntilTs = Date.now() + 700;
     scrollToAnchorWithSettle("chat-bottom");
   }
 
@@ -6566,8 +6661,20 @@
   function handleJumpLatest(): void {
     if (pageTapSwallowed()) return;
     showJumpLatest.value = false;
+    // 「N 条新消息」与圆钮共用入口：点下即收起提示（滚到底后的探测再校准基线）
+    if (newMsgTipCount != 0) {
+      newMsgTipCount = 0;
+      setChatNewMsgTipCount(0);
+    }
     scrollToBottom();
   }
+
+  /** 组件点按 → 页面滚到最新（组件经 utils/chatNewMsgTip.uts 的回调注册转过来）。 */
+  function handleNewMsgTipTap(): void {
+    handleJumpLatest();
+  }
+  /** onShow 注册给组件的回调（Android 裸函数引用绑不上，用箭头常量，同 eventBus 惯用法）。 */
+  const onNewMsgTipJump = (): void => { handleNewMsgTipTap(); };
 
   // ===== Android 键盘高度通道（WindowInsets 轮询：逐帧同步 + 事件丢失兜底） =====
   // 双角色：① 键盘动画期间 IME insets 逐帧更新（API 30+），快节拍走 requestAnimationFrame
@@ -13308,6 +13415,8 @@
     ) {
       scrollToBottom();
     }
+    // 「N 条新消息」/圆钮按新行重算（贴底滚底后由探测再校准；不在底部时点亮提示）
+    scheduleJumpLatestCheck(120);
     // 上报已读
     reportReadAuto();
   }
@@ -13322,6 +13431,8 @@
     if (records != null && Array.isArray(records)) {
       if (mergeSyncedMessages(records as UTSJSONObject[])) {
         scheduleReadRefresh();
+        // 断线重连补拉（退后台/锁屏回来）落地的消息：重算「N 条新消息」与浮钮
+        scheduleJumpLatestCheck(120);
       }
     }
   }
@@ -13359,6 +13470,9 @@
       }
       mergeSyncedMessages(records);
       scheduleReadRefresh();
+      // 回前台/回页补来的新消息：重算「N 条新消息」（进页揭示前的列表未落定则跳过，
+      // 避免首屏遮蔽期算出提示再撤回）
+      if (listSettled.value) scheduleJumpLatestCheck(120);
     } catch (_error) {
       // 静默失败
     } finally {
@@ -13371,6 +13485,9 @@
     await silentSyncLatest();
     if (!isChatCurrent()) return;
     if (needBottom && entryFollowLatest) {
+      // 进页即贴底：同步补来的消息属于「进入时就在的最新一屏」，不该弹「N 条新消息」
+      // （基线压到同步后的最大 seq，随后 scrollToBottom 的探测也不会再亮提示）
+      resetNewMsgTipForEntry();
       scrollToBottom();
     }
   }
@@ -13486,6 +13603,8 @@
       mergeSyncedMessages(cached);
       // 失败行发件箱回显（幂等）：缓存/历史重建都会清掉本地行，两条路径都要补
       restoreFailedRows();
+      // 进页基线：缓存窗口里的消息都不算「离开期间来的新消息」（同步补来的另行推导）
+      resetNewMsgTipForEntry();
       hasMore.value = cached.length >= MSG_PAGE_SIZE;
       // 重新进入会话始终展示最新消息，不恢复上次阅读的历史位置。
       // 未读定位模式：不滚底（保持遮蔽，定位交给 onLoad 的 locateFirstUnread）。
@@ -13495,6 +13614,8 @@
       //   失败静默放行，按旧尾巴定位（与现状一致，不更糟）。
       if (unreadViewportRead) {
         await settleAfterSync(false);
+        // 未读定位：同步补齐后重压基线，分隔线以下的内容仍由分隔线表达，不叠提示
+        resetNewMsgTipForEntry();
       } else if (pendingJumpId.length > 0) {
         // 搜索/引用带定位目标进页：不贴底揭幕——veiled 直达定位（jumpToMsg 终态
         // 揭幕；够不着/被清删分支兜底贴底）。尾部静默同步照常发，不阻塞定位取数。
@@ -13513,6 +13634,8 @@
       await loadHistory(0);
       loading.value = false;
       restoreFailedRows();
+      // 进页基线：首屏窗口内的消息都不是「离开期间来的新消息」
+      resetNewMsgTipForEntry();
       // 未读定位/跳转定位模式：首屏不滚底（保持遮蔽，定位交给 onLoad 的
       // locateFirstUnread / jumpToMsg；失败分支各自兜底揭幕）
       if (!unreadViewportRead && pendingJumpId.length == 0) {
@@ -13999,6 +14122,11 @@
 
   onLoad((options: any) => {
     convId.value = readOption(options, "convId");
+    // 「N 条新消息」提示：模块级 ref 跨页存活，本页首帧前无条件清零（条数由本页推导，
+    // 组件零绑定读模块 ref，见 utils/chatNewMsgTip.uts）
+    newMsgTipCount = 0;
+    newMsgTipBaselineSeq = 0;
+    setChatNewMsgTipCount(0);
     // App 三端：按会话恢复上次输入方式（仅明确记忆过"voice"才恢复语音条，未记录默认键盘文本）
     // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
     if (convId.value.length > 0) {
@@ -14197,6 +14325,10 @@
   });
 
   onUnload(() => {
+    // 「N 条新消息」：解除点击回调注册（按会话 id token，只清自己的；条数不复位——
+    // 退页后由下一个聊天页 onLoad 首帧前清零，避免误伤 navigateBack 后被返回页 onShow
+    // 刚写回的值，同下方合规提示的先后坑）
+    clearChatNewMsgTipJumpHandler(convId.value);
     // 合规提示不复位：模块 ref 的值就是「本页该不该显示」，退页后由下一个聊天页的
     // onLoad（首帧前）无条件重写。★这里写 false 会误伤——navigateBack 时被返回页的
     // onShow 可能先跑、本页 onUnload 后跑，等于把返回页刚回填的值清掉。
@@ -14301,6 +14433,12 @@
     // 返回本页必须按本页判据重写。★无条件写（不再用齐料门控）：首次 onShow 与 onLoad
     // 的值同源同值（幂等不影响首帧）；而一旦门控把某次返回挡掉，提示就永久丢了。
     applyAiContentHint();
+    // 「N 条新消息」：回前台/回页重新注册点击回调，并按当前行重算提示——息屏/锁屏/
+    // 退后台期间到达的消息可能刚由 WS 补拉或下面的静默同步落地（贴底探测随后校准
+    // 基线：仍在底部则基线推进、提示清零，否则亮出「N 条新消息」）。
+    setChatNewMsgTipJumpHandler(convId.value, onNewMsgTipJump);
+    setChatNewMsgTipCount(multiSelectMode.value ? 0 : newMsgTipCount);
+    scheduleJumpLatestCheck(60);
     // 从文件详情页返回：bump 文件卡片下载状态重渲（见 downloadTick 注释）
     downloadTick.value = downloadTick.value + 1;
     for (let i = 0; i < messages.value.length; i++) {
@@ -14392,7 +14530,19 @@
     // #ifdef APP-IOS
     releaseHistoryLock("hide");
     // #endif
+    // 「N 条新消息」：解除点击回调注册（条数保留——息屏/锁屏/退后台期间到达的新消息
+    // 要在回页时还能看到提示；onShow 重新注册）。token 比对只清自己的，多聊天页堆叠安全。
+    clearChatNewMsgTipJumpHandler(convId.value);
     pageVisible = false;
+    // 离页基线快照：贴底时把基线压到当前最大 seq，此后（后台/子页期间）到达的消息
+    // 全部计入提示。★这是「熄屏期间来消息」的主路径：后台列表不滚（isChatActive 为假），
+    // 新行直接落到视口下方，只靠几何探测的话，几十像素内的几条会被 NEAR_BOTTOM_PX 的
+    // 宽容差当成「还在底部」而漏计。在读历史（不贴底）时不压基线，已有的待计数保留。
+    // ★放在 pageVisible=false 之后：本页已不可见，只改本地状态、不写模块 ref
+    //   （否则叠在另一个聊天页下面时会把条数串上去；回页由 onShow 回填）。
+    if (lastDistBottomPx <= NEW_MSG_TIP_AT_BOTTOM_PX || Date.now() < bottomFollowUntilTs) {
+      markNewMsgTipSeen();
+    }
     // 离页作废在途定位核验（回来时由新一轮 jumpToMsg 重新核验）
     locateVerifyVersion += 1;
     // 进子页停语音/视频播放（微信同款：离开聊天即停；视频只暂停不清首帧）；

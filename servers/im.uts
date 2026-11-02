@@ -1,4 +1,7 @@
 import request from "./useRequest";
+import { getApiBaseUrl } from "@/constants/config";
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { hasImPushPreferenceSession, hasImPushPreferenceUser, bindImPushPreferenceUser, readImPushEnabled } from "@/utils/im/imPushPreference";
 import { generateUUID } from "@/utils/common";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -153,13 +156,47 @@ export function imDevicePlatform(): string {
  * 后端据此跳过离线推送（UserDevice.pushEnabled 语义）；Web Push 三要素与
  * voipToken 移动端均不传。
  */
+let deviceRegistrationQueue: Promise<void> = Promise.resolve();
+
+/** 只绑定当前服务端鉴权确认的用户；迟到响应不能把上一账号的偏好带进来。 */
+export async function ensureImPushPreferenceUser(): Promise<boolean> {
+  if (hasImPushPreferenceUser()) return true;
+  if (!hasImPushPreferenceSession()) return false;
+  const stamp = getImSessionStamp();
+  const origin = getApiBaseUrl();
+  const res = await apiImWhoami();
+  if (stamp != getImSessionStamp() || origin != getApiBaseUrl()
+    || apiResCode(res) != SUCCESS_CODE) return false;
+  const raw = apiResData<UTSJSONObject>(res);
+  if (raw == null) return false;
+  const data = raw as UTSJSONObject;
+  const userId = data["userId"];
+  if (userId == null) return false;
+  return bindImPushPreferenceUser(`${userId}`);
+}
+
 export async function apiImDeviceRegister(pushToken: string = ""): Promise<RequestResponse<any>> {
+  const stamp = getImSessionStamp();
+  const origin = getApiBaseUrl();
+  // cid刷新、重连和用户开关共用一队列，防旧的开启请求晚到覆盖新关闭请求。
+  const pending = deviceRegistrationQueue.then(async (): Promise<RequestResponse<any>> => {
+    if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) throw new Error("IM device session changed");
+    const preferenceReady = await ensureImPushPreferenceUser();
+    if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) throw new Error("IM device session changed");
+    if (hasImPushPreferenceSession() && !preferenceReady) throw new Error("IM push identity unavailable");
+    return await registerImDeviceNow(pushToken);
+  });
+  deviceRegistrationQueue = pending.then((): void => {}, (): void => {});
+  return await pending;
+}
+
+async function registerImDeviceNow(pushToken: string): Promise<RequestResponse<any>> {
   const body = new UTSJSONObject();
   body["deviceId"] = getImDeviceId();
   body["platform"] = imDevicePlatform();
   body["appName"] = "nuwax-mobile";
   if (pushToken.length > 0) {
-    body["pushEnabled"] = true;
+    body["pushEnabled"] = readImPushEnabled();
     body["pushToken"] = pushToken;
   } else {
     body["pushEnabled"] = false;

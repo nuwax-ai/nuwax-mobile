@@ -58,17 +58,16 @@ feat/nuwa-zhuoda-<YYYY.MM>[-<slug>]   →  release/nuwa-zhuoda  →  生产发�
 
 - **禁止**桌搭专属提交直接合入 `release/nuwa-basic` / `main`
 - **推荐**定期把 `release/nuwa-basic` merge 进 `release/nuwa-zhuoda`
-- `dev` 与历史 `feat-2026.*` 等旧分支保留不动；新需求一律按上表命名，**不要**再写 `feat/2026.07`、`feat/zhuoda/2026.07`、`feat-2026.7.18`、`feature/2026.07-zhuoda-dong` 这类旧格式
+- 当前跨端需求线按用户约定统一为 `feat-2026.11`；其它产品专属分支仍按上表命名。`dev` 与既有旧分支保留；除当前跨端需求线外，**不要**再写 `feat/2026.07`、`feat/zhuoda/2026.07`、`feat-2026.7.18`、`feature/2026.07-zhuoda-dong` 这类旧格式
 
 旧名对照（已删除远程旧分支）：`feat-app-zhuoda` → `release/nuwa-basic`；`feature/2026.07-zhuoda-dong` → `release/nuwa-zhuoda`。本地若仍停在旧名，执行 `git fetch --prune` 后切到对应 `release/*`。
 
-## Git 远程约定（2026-10-15 起更新）
+## Git 远程约定（2026-11-02）
 
-**双远端**：`origin` = `https://git.yichamao.com/agent-platform/agent-platform-front-weapp.git`（内网 GitLab，协作主仓）；`github` = `git@github.com:nuwax-ai/nuwax-mobile.git`（GitHub，SSH，公开镜像）。
-
-- **两个远端都推送**：`git push origin <分支>` + `git push github <分支>`
-- 分支上游统一跟踪 `origin/*`（`git pull` / `git push` 默认走内网，同事都推这里）；共推分支（如 `feat/nuwa-zhuoda-*`）push 前先 `git pull --rebase`（远程常有同事新提交）
-- 历史配置沿革（2026-09 双远端 → 2026-10-10 单远端 → 2026-10-15 恢复双远端并最终定名 origin=内网 / github=镜像）见 [docs/archive/switch-git-remote.md](docs/archive/switch-git-remote.md)
+- `origin` = `https://github.com/nuwax-ai/nuwax-mobile.git`（GitHub，默认远端）；`gitlab` = `https://git.yichamao.com/agent-platform/agent-platform-front-weapp.git`（内网 GitLab，推送时显式指定）。分支默认跟踪 `origin/*`，`remote.pushDefault=origin`。
+- **每次代码合并与提交完成后，必须同步推送 GitHub 和 GitLab 的对应分支**，与 PC Web 的规则一致：`git push origin <分支>` + `git push gitlab <分支>`。构建产物提交也遵守此规则；只推一端不得报告完成。
+- push 前先 fetch 两个远端，保留双方已有提交；共享分支不强推、不改写同事历史。任一远端失败时保留现场、补齐另一个远端，并回读核对两端 HEAD 一致。
+- 当前跨端需求联调分支为 `feat-2026.11`，与 PC Web 同名。历史产品线与旧分支映射见 [docs/archive/switch-git-remote.md](docs/archive/switch-git-remote.md)，历史 remote 名称不作为当前操作入口。
 
 ## 构建工具链（重要）
 

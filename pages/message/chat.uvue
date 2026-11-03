@@ -1408,8 +1408,7 @@
         :style="{ marginBottom: 6 + safeBottomPx + 'px' }"
       >
         <view class="chat-plus-grid">
-          <!-- 文件入口：H5/Android/鸿蒙走 uni.chooseFile（kotlin/arkts 已实现）；iOS 的
-               chooseFile 无 Swift 实现，走 nuwax-ios-file-picker 插件的 UIDocumentPicker（需自定义基座） -->
+          <!-- 文件入口：全端 uni.chooseFile（iOS 5.26 基座已实现，上传直通；旧「走插件」结论已废） -->
           <view class="chat-plus-item" hover-class="chat-plus-item--active" @click="handlePickFile">
             <view class="chat-plus-item__icon">
               <svg-icon name="icon-Folder" size="26" unit="px" color="#e0942e" />
@@ -2017,14 +2016,14 @@
   // #endif
   import { generateUUID } from "@/utils/common";
   import { ImForwardItem, ImForwardSession, openImForward } from "@/utils/im/imForwardSession";
-  import { uploadSingleFile } from "@/utils/fileUploader";
+  import { enforceUploadSizeLimit, uploadSingleFile } from "@/utils/fileUploader";
   // 仅发语音：裸 PCM 录音封装 WAV（播放器可播）后上传
   import { pcmToWavFile, PcmToWavResult } from "@/utils/voice/pcmToWav";
   import { UploadFileInfo } from "@/types/interfaces/common.uts";
   import { imUnreadCount, refreshImUnreadBadge } from "@/utils/imUnreadBadge";
   import { noteConvReadFromReadReport } from "@/utils/im/imConvReadLocal";
   import { isRemoteSvgUrl, resolveAppSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
-  import { getSafeAreaBottom, handleExternalLink, isWorkCommercialRepoLinkBlocked, openDocPreviewLinkPage, openNativeHomeChatLink } from "@/utils/system";
+  import { getSafeAreaBottom, handleExternalLink, isWorkCommercialRepoLinkBlocked, openDocPreviewLinkPage, openNativeHomeChatLink, openNativeSpaceInviteLink } from "@/utils/system";
   import { resolveWorkCommercialBlocked } from "@/utils/workCommercial";
   // 会话资料库：空间 docs 页经站内 webview 打开（含商业版闸门与防重复导航）
   import { openNativeRepoLibraryPage } from "@/utils/repoLibraryLink";
@@ -2057,7 +2056,7 @@
   import { ImMergeItem, ImMergeMedia } from "@/types/interfaces/imMergeItem";
   import { ImMergeRecordSession, openImMergeRecord } from "@/utils/im/imMergeRecordSession";
   // #ifdef APP-IOS
-  import { pickIosFiles } from "@/uni_modules/nuwax-ios-file-picker";
+  import { iosLocalFileExists } from "@/uni_modules/nuwax-ios-file-picker";
   // #endif
   // 鸿蒙相册直选：uni.chooseMedia 对混选 mediaType 会强弹自家「拍摄/从相册选择」
   // sheet（无视 sourceType:["album"]），改走自研插件直开系统相册选择器（图+视频混选）
@@ -2329,6 +2328,10 @@
     local: boolean = false;
     /** 媒体占位行的本地文件路径（发送失败点击重试时重走上传）。 */
     localPath: string = "";
+    /** 本地行位置锚 = 创建该乐观行时列表的最大 seq：失败行（status=2）按它回到
+     *  「发送时刻」的列表位置，不被同步合并排序扫到末尾（后发成功消息显示到失败
+     *  文件上方的根因）；发送中行仍恒排末尾。-1=未记录（旧发件箱包），按末尾处理。 */
+    anchorSeq: number = -1;
     /** @提及元数据（服务端 MessageDto 原样返回，本地占位行由 scanMentions 反扫得到）。 */
     mentionIds: string[] = [];
     mentionAll: boolean = false;
@@ -5295,6 +5298,21 @@
     return seq;
   }
 
+  /** 本地未确认行（seq=0）在排序中的位置键哨兵：任何会话的 seq 都远到不了，
+   *  发送中行/无锚行恒排末尾（保持既有「乐观行贴尾」观感）。 */
+  const LOCAL_ROW_TAIL_SEQ = 1000000000000000;
+
+  /** 行排序位置键：已确认行（seq>0，含 local=true 的确认行）按真实 seq；失败行
+   *  （status=2）按创建锚 anchorSeq 回到发送时刻的位置——原先「local 行一律压末尾」
+   *  会把失败文件行扫到所有后续成功消息之下（后发消息显示在失败文件上方）；
+   *  发送中行与无锚行（旧发件箱包 anchorSeq=-1）仍固定末尾。 */
+  function msgRowPosKey(r: ImMsgRow): number {
+    if (r.local == true && r.seq <= 0) {
+      return r.status == 2 && r.anchorSeq >= 0 ? r.anchorSeq : LOCAL_ROW_TAIL_SEQ;
+    }
+    return r.seq;
+  }
+
   /** 把本页条数写进模块 ref（组件渲染源）。★仅本页可见时写：聊天页可叠栈
    *  （会话 A 未销毁、上面压着会话 B），A 离页后仍会收 WS 消息并跑探测——此时写
    *  模块 ref 会串到 B 的提示上（A 自己的值走 onShow 回填）。 */
@@ -6238,6 +6256,8 @@
     p["msgId"] = row.msgId;
     p["clientMsgId"] = row.clientMsgId;
     p["sendTime"] = row.sendTime;
+    // 位置锚随包持久化：重进会话恢复失败行时回到发送时刻的位置（缺失=旧包，按末尾）
+    p["anchorSeq"] = row.anchorSeq;
     p["msgType"] = row.msgType;
     p["bodyText"] = row.bodyText;
     p["mentionAll"] = row.mentionAll;
@@ -6369,6 +6389,7 @@
     row.msgId = readString(p, "msgId");
     row.clientMsgId = clientMsgId;
     row.sendTime = readNumber(p, "sendTime", 0);
+    row.anchorSeq = readNumber(p, "anchorSeq", -1);
     row.msgType = readString(p, "msgType");
     row.bodyText = readString(p, "bodyText");
     row.mentionAll = readBool(p, "mentionAll");
@@ -6424,9 +6445,9 @@
     return row;
   }
 
-  /** 发件箱恢复（幂等，可在任意列表重建后调）：按 clientMsgId 查重后追加到列表
-   *  末尾——与同步合并的排序语义一致（本地未确认行恒在末尾）。媒体的本地文件
-   *  重启后可能已被清理：行照常回显（图裂灰底），重发时 localFileReadable 提示。 */
+  /** 发件箱恢复（幂等，可在任意列表重建后调）：按 clientMsgId 查重后回显，并按
+   *  创建锚插回发送时刻的位置（键语义见 msgRowPosKey）。媒体的本地文件重启后
+   *  可能已被清理：行照常回显（图裂灰底），重发时 localFileReadable 提示。 */
   function restoreFailedRows(): void {
     if (convId.value.length == 0) {
       return;
@@ -6446,7 +6467,16 @@
       appended = true;
     }
     if (appended) {
-      messages.value = messages.value.slice();
+      // 失败行按创建锚回到发送时刻的位置（不再一律追加末尾——那会让重进会话后
+      // 后续成功消息全部显示到失败文件上方）；服务端行已按 seq 升序，重排稳定无扰动。
+      const rows = messages.value.slice();
+      rows.sort((a: ImMsgRow, b: ImMsgRow): number => {
+        const ka = msgRowPosKey(a);
+        const kb = msgRowPosKey(b);
+        if (ka != kb) return ka - kb;
+        return a.sendTime - b.sendTime;
+      });
+      messages.value = rows;
     }
   }
 
@@ -8016,10 +8046,13 @@
       changed.add(msgId);
     }
     if (changed.size == 0) return false;
-    // 未确认的本地占位 seq=0，固定留在末尾。
+    // 本地未确认行 seq=0：失败行按创建锚回到发送时刻的位置（否则文件发送失败后，
+    // 后续成功发送的消息会显示到失败文件上方）；发送中行仍固定末尾。键语义见 msgRowPosKey。
     rows.sort((a: ImMsgRow, b: ImMsgRow): number => {
-      if (a.local != b.local) return a.local ? 1 : -1;
-      return a.seq - b.seq;
+      const ka = msgRowPosKey(a);
+      const kb = msgRowPosKey(b);
+      if (ka != kb) return ka - kb;
+      return a.sendTime - b.sendTime;
     });
     messages.value = rows;
     // 拉取快照可能带入对端回复/已读变化：赋值后重算合成标记，借去抖重建上屏
@@ -8892,10 +8925,16 @@
     }
   }
 
+  /** 媒体发送串行链（多选文件/图片逐条排队，PC sendComposed 同款背压：并发多文件
+   *  上传会撞服务端限流，表现为「有时能发成功、有时失败」）。各发送核心自身
+   *  catch-all 永不 reject，链尾再兜一层 catch 保证不断链。 */
+  let mediaSendChain: Promise<void> = Promise.resolve();
+
   /**
    * 媒体消息入队：先以本地内容乐观渲染（图片直接显本地路径，文件先出卡片占位），
    * 再走上传+发送。isImage：相册/拍摄恒 true（与 PC kindOf 口径一致）；
    * H5 文件入口传 false，上传后按返回 mime 判定最终类型。
+   * 发送按入队顺序串行（mediaSendChain，见其头注）。
    */
   function queueMediaRow(localPath: string, displayName: string, isImage: boolean): void {
     if (convId.value.length == 0 || localPath.length == 0) {
@@ -8909,6 +8948,7 @@
     row.localPath = localPath;
     row.sendTime = Date.now();
     row.status = 0;
+    row.anchorSeq = maxSeq();
     if (isImage) {
       row.msgType = "image";
       row.imageUrl = localPath;
@@ -8933,7 +8973,9 @@
     messages.value.push(row);
     journalOutgoingRow(row);
     scrollToBottom();
-    sendMediaWithRow(row, localPath, displayName);
+    mediaSendChain = mediaSendChain
+      .then((): Promise<void> => sendMediaWithRow(row, localPath, displayName))
+      .catch((_e: any | null): void => {});
   }
 
   /**
@@ -8986,6 +9028,7 @@
     }
     row.sendTime = Date.now();
     row.status = 0;
+    row.anchorSeq = maxSeq();
     messages.value.push(row);
     journalOutgoingRow(row);
     scrollToBottom();
@@ -9013,6 +9056,7 @@
     applyQuoteToRow(row);
     row.sendTime = Date.now();
     row.status = 0;
+    row.anchorSeq = maxSeq();
     messages.value.push(row);
     journalOutgoingRow(row);
     scrollToBottom();
@@ -9507,6 +9551,13 @@
       } catch (_e) {
         return false;
       }
+    }
+    // #endif
+    // #ifdef APP-IOS
+    // ★iOS 上 accessSync 失败只打 log 不抛异常（1300002），下面 try/catch 恒判 true，
+    // 已失效的沙盒临时件会被放行到 uploadFile 才报 "Illegal file"。真实绝对路径问原生。
+    if (path.indexOf("/") == 0) {
+      return iosLocalFileExists(path);
     }
     // #endif
     // #ifndef H5
@@ -10553,6 +10604,7 @@
     if (url.indexOf("/") == 0 && url.indexOf("//") != 0 && base.length > 0) {
       url = base + url;
     }
+    if (openNativeSpaceInviteLink(url)) return;
     // 工作商业版未授权：资料库卡片链接不开 webview，toast 授权提示
     //（本路径直开 webview 页、不经 handleExternalLink，须单独拦）
     if (isWorkCommercialRepoLinkBlocked(url)) {
@@ -11229,6 +11281,7 @@
     row.audioDuration = wav.durationSec;
     row.sendTime = Date.now();
     row.status = 0;
+    row.anchorSeq = maxSeq();
     applyQuoteToRow(row);
     quoteTarget.value = null;
     resetQuoteMentionSnapshot();
@@ -11317,6 +11370,7 @@
     applyQuoteToRow(row);
     row.sendTime = Date.now();
     row.status = 0;
+    row.anchorSeq = maxSeq();
     messages.value.push(row);
     scrollToBottom();
     sendWithRow(row);
@@ -13186,34 +13240,14 @@
   }
 
   /**
-   * 文件入口（加号面板）：H5/Android/鸿蒙走 uni.chooseFile（kotlin/arkts 已实现、H5 原生支持）；
-   * iOS 的 chooseFile 无 Swift 实现（modules.json swift=false），走 nuwax-ios-file-picker
-   * 插件弹系统 UIDocumentPicker（含自定义基座）。选中文件按文件链路逐个上传发送。
+   * 文件入口（加号面板）：全端走 uni.chooseFile。iOS 旧结论「无 Swift 实现、走
+   * nuwax-ios-file-picker 插件」已被 5.26 基座实测推翻（agent-detail 同款调用上传成功）；
+   * 且 iOS uploadFile 只认 chooseFile 返回的托管路径，插件物化的裸 /tmp 绝对路径会被
+   * 判 Illegal file——选中即用，勿再加工路径。选中文件按文件链路逐个上传发送。
    * ★须定义在 queueMediaRow 之后（UTS→Kotlin 先用后定义会报「找不到名称」）。
    */
   function handlePickFile(): void {
-    // #ifdef APP-IOS
-    pickIosFiles(
-      (path: string, name: string): void => {
-        if (path.length == 0) {
-          return;
-        }
-        let resolvedName = name;
-        if (resolvedName.length == 0) {
-          const pathParts = path.split("/");
-          if (pathParts.length > 0) {
-            resolvedName = pathParts[pathParts.length - 1];
-          }
-        }
-        queueMediaRow(path, resolvedName, false);
-      },
-      (_code: string, _message: string): void => {
-        // 用户取消/无窗口：无需提示（与 uni.chooseFile 的 fail 同口径）
-      },
-    );
-    return;
-    // #endif
-    // #ifdef H5 || WEB || APP-ANDROID || APP-HARMONY
+    // #ifdef H5 || WEB || APP-ANDROID || APP-HARMONY || APP-IOS
     uni.chooseFile({
       type: "file",
       count: 5,
@@ -13235,6 +13269,10 @@
             if (pathParts.length > 0) {
               resolvedName = pathParts[pathParts.length - 1];
             }
+          }
+          // ChooseFileTempFile.size（B）；异常平台给 0 时闸门 fail-open 放行
+          if (!enforceUploadSizeLimit(resolvedName, f.size)) {
+            continue;
           }
           queueMediaRow(`${f.path}`, resolvedName, false);
         }
@@ -17108,12 +17146,15 @@
 
   /* 加号键：圆环 + 加号自绘 icon（点击无背景；开面板时圆环/加号变蓝，
      加号整体旋 45° 成 X，再点收起面板）——尺寸 24px 与同行 svg 图标统一，
-     基色 #7a7887 同行统一（按下载目录参考图 20260924-163047，2026-10-01 调浅） */
+     基色 #7a7887 同行统一（按下载目录参考图 20260924-163047，2026-10-01 调浅）。
+     ★几何值必须全整数（边框 2 / 字形 12 / 偏移 5）：iOS 按物理像素取整小数 pt，
+     1.5 边框与 4.5 偏移在 3x 屏（4.5/13.5 物理像素）各轴取整方向不一 →
+     十字两杠互相错位、整体偏离圆心（2026-11-03 真机），Android 无此取整问题 */
   .chat-plus-key {
     width: 24px;
     height: 24px;
     border-radius: 12px;
-    border: 1.5px solid #7a7887;
+    border: 2px solid #7a7887;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -17126,8 +17167,8 @@
 
   .chat-plus-key__glyph {
     position: relative;
-    width: 11px;
-    height: 11px;
+    width: 12px;
+    height: 12px;
     /* 基态显式 rotate(0)：类移除时 iOS 原生层需要「回落值」才解除旋转，
        仅靠删 --on 的 transform 会卡在 45°（2026-10-01 真机：圈中叉不还原） */
     transform: rotate(0deg);
@@ -17143,8 +17184,8 @@
   .chat-plus-key__h {
     position: absolute;
     left: 0;
-    top: 4.5px;
-    width: 11px;
+    top: 5px;
+    width: 12px;
     height: 2px;
     border-radius: 1px;
     background-color: #7a7887;
@@ -17157,9 +17198,9 @@
   .chat-plus-key__v {
     position: absolute;
     top: 0;
-    left: 4.5px;
+    left: 5px;
     width: 2px;
-    height: 11px;
+    height: 12px;
     border-radius: 1px;
     background-color: #7a7887;
   }

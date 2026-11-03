@@ -19,7 +19,15 @@ const active = {
 const ok = (data: unknown) => ({ code: "0000", data });
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-function setup(options: { app?: boolean; token?: string; info?: object } = {}) {
+function setup(
+  options: {
+    app?: boolean;
+    token?: string;
+    info?: object;
+    embedded?: boolean;
+    sdkReady?: boolean;
+  } = {},
+) {
   // 执行真实页面脚本，分别保留 H5 与 APP 的条件编译分支。
   const script = source
     .replace(/\/\/ #ifdef APP\n([\s\S]*?)\/\/ #endif/g, (_, body) =>
@@ -34,18 +42,18 @@ function setup(options: { app?: boolean; token?: string; info?: object } = {}) {
     info.mockResolvedValue(ok({ ...active, joined: true }));
     return ok(null);
   });
-  const enter = vi
-    .fn()
-    .mockResolvedValue(
-      ok({
-        convId: "9007199254740993",
-        convType: 4,
-        name: "学校 & 交流",
-        avatar: "/team.png?a=1&b=2",
-      }),
-    );
+  const enter = vi.fn().mockResolvedValue(
+    ok({
+      convId: "9007199254740993",
+      convType: 4,
+      name: "学校 & 交流",
+      avatar: "/team.png?a=1&b=2",
+    }),
+  );
   const redirect = vi.fn();
   const login = vi.fn();
+  const native = vi.fn().mockReturnValue(true);
+  const sdkReady = vi.fn().mockResolvedValue(options.sdkReady ?? true);
   let load: (query: object) => void = () => {};
   let unload: () => void = () => {};
   const page = runInNewContext(
@@ -78,13 +86,27 @@ function setup(options: { app?: boolean; token?: string; info?: object } = {}) {
       useI18n: () => ({ t: (key: string) => key }),
       emptyI18nParams: () => ({}),
       authBrowserQuery: () => null,
+      isNativeAppWebView: () => options.embedded ?? false,
+      ensureAppWebViewNavigationReady: sdkReady,
+      navigateViaWebViewSdk: native,
       uni: {
         getStorageSync: () => options.token ?? "session",
         redirectTo: redirect,
       },
     },
   );
-  return { ...page, info, join, enter, redirect, login, load, unload };
+  return {
+    ...page,
+    info,
+    join,
+    enter,
+    redirect,
+    login,
+    native,
+    sdkReady,
+    load,
+    unload,
+  };
 }
 
 describe("邀请页面手动确认后入团并打开指定群", () => {
@@ -152,11 +174,16 @@ describe("邀请页面手动确认后入团并打开指定群", () => {
     },
   );
 
-  it("已有成员跳过加入，直接进入团队群", async () => {
+  it("已有成员先展示已加入，点击后进入团队群，不重复加入", async () => {
     const p = setup({ info: { ...active, joined: true } });
     p.load({ code: "school" });
     await settle();
     expect(p.join).not.toHaveBeenCalled();
+    expect(p.state.value).toBe("joined");
+    expect(p.enter).not.toHaveBeenCalled();
+    expect(p.redirect).not.toHaveBeenCalled();
+    p.confirmJoin();
+    await settle();
     expect(p.enter).toHaveBeenCalledOnce();
     expect(p.redirect).toHaveBeenCalledOnce();
   });
@@ -196,6 +223,33 @@ describe("邀请页面手动确认后入团并打开指定群", () => {
     expect(p.enter).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { app: false, joined: false },
+    { app: false, joined: true },
+    { app: true, joined: false },
+    { app: true, joined: true },
+  ])(
+    "登录返回 $app / joined=$joined 先展示状态，点击才继续",
+    async ({ app, joined }) => {
+      const p = setup({ app });
+      p.info.mockResolvedValueOnce({ code: "4010" });
+      p.load({ code: "school" });
+      await settle();
+      expect(p.login).toHaveBeenCalledOnce();
+      p.info.mockResolvedValue(ok({ ...active, joined }));
+      p.load({ code: "school" });
+      await settle();
+      expect(p.state.value).toBe(joined ? "joined" : "ready");
+      expect(p.join).not.toHaveBeenCalled();
+      expect(p.enter).not.toHaveBeenCalled();
+      expect(p.redirect).not.toHaveBeenCalled();
+      p.confirmJoin();
+      await settle();
+      expect(p.join).toHaveBeenCalledTimes(joined ? 0 : 1);
+      expect(p.enter).toHaveBeenCalledOnce();
+    },
+  );
+
   it("登录回跳重新加载后不沿用之前的入团确认", async () => {
     const p = setup();
     p.join.mockResolvedValueOnce({ code: "4010" });
@@ -227,6 +281,60 @@ describe("邀请页面手动确认后入团并打开指定群", () => {
     resolve(ok(active));
     await settle();
     expect(p.join).not.toHaveBeenCalled();
+    expect(p.redirect).not.toHaveBeenCalled();
+  });
+});
+
+describe("App 内打开邀请网页后转原生群聊", () => {
+  it.each([false, true])(
+    "joined=%s 手动点击后使用原生导航，保留 int64 群号",
+    async (joined) => {
+      const p = setup({ embedded: true, info: { ...active, joined } });
+      p.load({ code: "school" });
+      await settle();
+      expect(p.native).not.toHaveBeenCalled();
+      expect(p.enter).not.toHaveBeenCalled();
+      p.confirmJoin();
+      await settle();
+      expect(p.join).toHaveBeenCalledTimes(joined ? 0 : 1);
+      expect(p.native).toHaveBeenCalledOnce();
+      expect(p.native.mock.calls[0][0]).toContain(
+        "/pages/message/chat?convId=9007199254740993&convType=4",
+      );
+      expect(p.redirect).not.toHaveBeenCalled();
+      expect(p.state.value).toBe("joined");
+    },
+  );
+  it("JSSDK 失败时保留重试，不落入 H5 群聊", async () => {
+    const p = setup({ embedded: true, sdkReady: false });
+    p.load({ code: "school" });
+    await settle();
+    p.confirmJoin();
+    await settle();
+    expect(p.state.value).toBe("error");
+    expect(p.native).not.toHaveBeenCalled();
+    expect(p.redirect).not.toHaveBeenCalled();
+    p.sdkReady.mockResolvedValue(true);
+    await p.continueInvite();
+    expect(p.native).toHaveBeenCalledOnce();
+    expect(p.join).toHaveBeenCalledOnce();
+  });
+  it("等待 JSSDK 时离开邀请页，旧页面不再打开原生群聊", async () => {
+    const p = setup({ embedded: true });
+    let ready!: (value: boolean) => void;
+    p.sdkReady.mockReturnValue(
+      new Promise((resolve) => {
+        ready = resolve;
+      }),
+    );
+    p.load({ code: "school" });
+    await settle();
+    p.confirmJoin();
+    await settle();
+    p.unload();
+    ready(true);
+    await settle();
+    expect(p.native).not.toHaveBeenCalled();
     expect(p.redirect).not.toHaveBeenCalled();
   });
 });

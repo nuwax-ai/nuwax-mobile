@@ -190,6 +190,3 @@ AI 助手消息渲染分两条平行链路（`ai-msg.uvue` 内条件编译）：
   本层通过 `:final-result` 通道向消息组件透传 `MessageInfo.finalResult`
   （最终回答 / 耗时 / 失败态）。
 - **原生 uvue（UniAiXMsgRender）**：保持旧渲染（正文内嵌标签 → tool-call 卡片组）。
-
-离线目检入口：`#/pages/test-work-trace/test-work-trace`（历史终态 / 纯文本 /
-单步流式模拟三场景）。

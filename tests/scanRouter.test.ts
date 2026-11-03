@@ -32,6 +32,14 @@ describe("scanRouter", () => {
   });
 
   describe("build 与 match 对称（下载页格式）", () => {
+    it('App 扫本站团队邀请走原生页面，外站仿冒地址仍作为普通链接', () => {
+      const invite = parseScanContent(HOST + '/invite/space/abc?source=qr');
+      expect(invite.kind).toBe('spaceInvite');
+      expect(invite.spaceInviteCode).toBe('abc');
+      expect(parseScanContent('https://evil.example/invite/space/abc').kind).toBe('url');
+      expect(parseScanContent(HOST + '.evil.example/invite/space/abc').kind).toBe('url');
+      expect(parseScanContent(HOST + '/invite/space/').kind).toBe('url');
+    });
     it("个人码：带账号 → 识别 user 且 a 解码还原", () => {
       const url = buildUserCardUrl(USER_ID, "zq010");
       expect(url).toBe(`${DL}?u=${USER_ID}&a=zq010`);

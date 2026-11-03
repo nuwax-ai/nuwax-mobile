@@ -1,0 +1,146 @@
+<template>
+  <view class="invite-page">
+    <view class="invite-card">
+      <text class="invite-title">{{ title }}</text>
+      <text v-if="teamName.length > 0" class="invite-team">{{ teamName }}</text>
+      <text v-if="state == 'loading' || state == 'opening'" class="invite-hint">{{ t('Mobile.SpaceInvite.opening') }}</text>
+      <text v-if="state == 'auth'" class="invite-hint">{{ t('Mobile.SpaceInvite.signingIn') }}</text>
+      <text v-if="state == 'expired' || state == 'disabled'" class="invite-hint">{{ t('Mobile.SpaceInvite.askForNew') }}</text>
+      <text v-if="state == 'error'" class="invite-error">{{ errorText }}</text>
+      <button v-if="state == 'error'" class="invite-button" @tap="continueInvite">{{ t('Mobile.Common.retry') }}</button>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+import { computed, ref } from 'vue';
+import { onLoad, onUnload } from '@dcloudio/uni-app';
+import { apiSpaceInviteInfo, apiSpaceInviteJoin } from '@/servers/spaceInvite';
+import { apiImSpaceEnter } from '@/servers/im';
+import { apiResCode, apiResData, apiResMessage } from '@/utils/apiResponse';
+import { SUCCESS_CODE, USER_NO_LOGIN, REDIRECT_LOGIN } from '@/constants/codes.constants';
+import { ACCESS_TOKEN } from '@/constants/home.constants';
+import { redirectToLoginOnce, LOGIN_PAGE_PATH } from '@/utils/authNavigation';
+import { spaceInvitePageUrl } from '@/utils/spaceInvite';
+import { useI18n, emptyI18nParams } from '@/utils/i18n';
+// #ifdef H5 || WEB
+import { authBrowserQuery } from '@/utils/idpNavigation';
+// #endif
+
+const { t: translate } = useI18n();
+const t = (key: string): string => translate(key, emptyI18nParams(), '');
+const state = ref<string>('loading');
+const teamName = ref<string>('');
+const errorText = ref<string>('');
+let inviteCode = '';
+let running = false;
+let revision = 0;
+
+const title = computed((): string => {
+  if (state.value == 'expired') return t('Mobile.SpaceInvite.expired');
+  if (state.value == 'disabled') return t('Mobile.SpaceInvite.disabled');
+  if (state.value == 'error') return t('Mobile.SpaceInvite.failed');
+  return t('Mobile.SpaceInvite.title');
+});
+
+function field(data: UTSJSONObject, key: string): string {
+  const value = data[key];
+  return value != null ? `${value}` : '';
+}
+
+function authenticated(response: UTSJSONObject): boolean {
+  const code = apiResCode(response);
+  if (code == USER_NO_LOGIN || code == REDIRECT_LOGIN) {
+    state.value = 'auth';
+    redirectToLoginOnce(LOGIN_PAGE_PATH, spaceInvitePageUrl(inviteCode));
+    return false;
+  }
+  return true;
+}
+
+async function continueInvite(): Promise<void> {
+  if (running || inviteCode.length == 0) return;
+  running = true;
+  const currentRevision = revision;
+  const returnPath = spaceInvitePageUrl(inviteCode);
+  state.value = 'loading';
+  errorText.value = '';
+  try {
+    // #ifdef APP
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    if (token == null || `${token}`.length == 0) {
+      state.value = 'auth';
+      redirectToLoginOnce(LOGIN_PAGE_PATH, returnPath);
+      return;
+    }
+    // #endif
+    const response = await apiSpaceInviteInfo(inviteCode);
+    if (currentRevision != revision || !authenticated(response)) return;
+    const raw = apiResData<any>(response);
+    if (apiResCode(response) != SUCCESS_CODE || raw == null) throw new Error(apiResMessage(response));
+    const info = raw as UTSJSONObject;
+    const status = field(info, 'status');
+    if (status != 'Active') {
+      state.value = status == 'Expired' ? 'expired' : 'disabled';
+      return;
+    }
+    const spaceId = field(info, 'spaceId');
+    if (!/^[1-9][0-9]*$/.test(spaceId)) throw new Error(t('Mobile.SpaceInvite.failed'));
+    teamName.value = field(info, 'spaceName');
+    if (info['joined'] != true) {
+      const joined = await apiSpaceInviteJoin(inviteCode);
+      if (currentRevision != revision || !authenticated(joined)) return;
+      if (apiResCode(joined) != SUCCESS_CODE) throw new Error(apiResMessage(joined));
+    }
+    state.value = 'opening';
+    const entered = await apiImSpaceEnter(spaceId, returnPath);
+    if (currentRevision != revision || !authenticated(entered)) return;
+    const conversationRaw = apiResData<any>(entered);
+    if (apiResCode(entered) != SUCCESS_CODE || conversationRaw == null) throw new Error(apiResMessage(entered));
+    const conversation = conversationRaw as UTSJSONObject;
+    // convId 由请求层按字符串保留 int64 精度，不能转成 number。
+    const convId = field(conversation, 'convId');
+    if (!/^[1-9][0-9]*$/.test(convId)) throw new Error(t('Mobile.SpaceInvite.openFailed'));
+    const convType = field(conversation, 'convType');
+    const name = field(conversation, 'name');
+    const avatar = field(conversation, 'avatar');
+    const chatUrl = '/pages/message/chat?convId=' + encodeURIComponent(convId) + '&convType=' + (convType.length > 0 ? convType : '4') + '&name=' + encodeURIComponent(name.length > 0 ? name : teamName.value) + '&avatar=' + encodeURIComponent(avatar);
+    uni.redirectTo({ url: chatUrl, fail: (_error: any) => {
+      if (currentRevision != revision) return;
+      state.value = 'error';
+      errorText.value = t('Mobile.SpaceInvite.openFailed');
+    } });
+  } catch (error) {
+    if (currentRevision != revision) return;
+    state.value = 'error';
+    const message = error instanceof Error ? error.message : '';
+    errorText.value = message.length > 0 ? message : t('Mobile.SpaceInvite.failed');
+  } finally {
+    if (currentRevision == revision) running = false;
+  }
+}
+
+onLoad((query: any) => {
+  revision += 1;
+  const params = query as UTSJSONObject;
+  const raw = params['code'];
+  inviteCode = raw != null ? `${raw}` : '';
+  // #ifdef H5 || WEB
+  const browserCode = authBrowserQuery('code');
+  if (browserCode != null) inviteCode = browserCode;
+  // #endif
+  if (inviteCode.length == 0) { state.value = 'disabled'; return; }
+  continueInvite();
+});
+onUnload(() => { revision += 1; });
+</script>
+
+<style scoped>
+.invite-page { flex: 1; background-color: #f5f6f8; align-items: center; justify-content: center; padding: 24px; }
+.invite-card { width: 100%; max-width: 420px; padding: 32px 24px; border-radius: 16px; background-color: #ffffff; align-items: center; }
+.invite-title { font-size: 20px; font-weight: bold; color: #111111; text-align: center; }
+.invite-team { font-size: 17px; color: #333333; margin-top: 16px; text-align: center; }
+.invite-hint { font-size: 14px; color: #777777; margin-top: 20px; text-align: center; }
+.invite-error { font-size: 14px; color: #b42318; margin-top: 20px; text-align: center; }
+.invite-button { width: 100%; background-color: #111111; color: #ffffff; font-size: 15px; border-radius: 8px; margin-top: 24px; }
+</style>

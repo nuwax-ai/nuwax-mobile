@@ -19,6 +19,7 @@ vi.mock('../utils/appWebViewDetect.uts', () => ({ applyXClientTypeHeader: vi.fn(
 vi.mock('../constants/i18n.local.constants.uts', () => ({ getLocalFallback: () => 'failed' }));
 import request from '../servers/useRequest.uts';
 import { apiAuthIdpLoginList, apiAuthIdpSession } from '../servers/authIdp.uts';
+import { apiSpaceInviteInfo, apiSpaceInviteJoin } from '../servers/spaceInvite.uts';
 
 class WebUTSJSONObject {
   constructor(value = {}) { Object.assign(this, value); }
@@ -63,6 +64,17 @@ function respond(code: string, data: unknown = null) {
 }
 
 describe('H5 联合登录真实请求层', () => {
+  it.each(['4010', '4011'])('邀请接口 %s 向登录处理器传递完整业务目标', async code => {
+    for (const api of [apiSpaceInviteInfo, apiSpaceInviteJoin]) {
+      state.redirect.mockClear();
+      const result = api('school&code');
+      respond(code); await result;
+      expect(state.redirect).toHaveBeenCalledExactlyOnceWith(
+        code === '4010' ? '/subpackages/pages/login/login' : '/subpackages/pages/login/login?local=1',
+        '/subpackages/pages/space-invite/space-invite?code=school%26code',
+      );
+    }
+  });
   it.each(['4010', '4011'])('普通业务 %s 继续清理过期登录态并跳登录', async code => {
     const result = request({ url: '/api/user/identity/list', method: 'GET' });
     respond(code);

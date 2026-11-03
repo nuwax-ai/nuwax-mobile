@@ -47,6 +47,8 @@ describe('浏览器 Cookie 登录', () => {
     expect(beginBrowserIdp('5', '', shouldReplace)).toBe(false);
   });
   it('普通登录后回移动路由或安全 pending 页面', () => {
+    finishBrowserLogin(origin + '/invite/space/abc');
+    expect(replace).toHaveBeenLastCalledWith('/m/#/subpackages/pages/space-invite/space-invite?code=abc');
     finishBrowserLogin('/pages/message/chat?convId=123');
     expect(replace).toHaveBeenLastCalledWith('/m/#/pages/message/chat?convId=123');
     finishBrowserLogin('/auth/bind-or-register?token=fixture&bind=1');

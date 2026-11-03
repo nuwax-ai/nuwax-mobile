@@ -8,6 +8,9 @@ import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { jumpToFilePreviewPage } from "@/utils/system.uts";
 import { applyXClientTypeHeader, isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
+import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+
+const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
 const AUTH_PROTECTED_FILE_PATH_RE = /\/api\/f\//i;
 
@@ -88,9 +91,36 @@ function buildProtectedFileHeaders(includeClientType: boolean): UTSJSONObject {
   return header;
 }
 
+/** header 键名小写副本（鸿蒙 downloadFile 专用，见 buildAuthProtectedFileHeaders）。 */
+function lowerCaseHeaderKeys(header: UTSJSONObject): UTSJSONObject {
+  const out = {} as UTSJSONObject;
+  const keys = UTSJSONObject.keys(header);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const value = header[key];
+    if (value != null) {
+      out[`${key}`.toLowerCase()] = `${value}`;
+    }
+  }
+  return out;
+}
+
 /** 构造受保护文件请求所需的 Bearer 头（供 downloadFile / request 复用）。 */
 export function buildAuthProtectedFileHeaders(): UTSJSONObject {
-  return buildProtectedFileHeaders(true);
+  const header = buildProtectedFileHeaders(true);
+  // #ifdef APP-HARMONY
+  // 鸿蒙 uni.downloadFile 未像 runtime request 那样把 header 键名 toLowerCase
+  //（runtime uni-network/index.ets：downloadFile 直接把 header 交给
+  // http.requestInStream，而 request 实现里有显式小写化）。鸿蒙
+  // http.HttpRequestOptions.header 要求键名小写，大写 Authorization /
+  // X-Client-Type 会被忽略 → 受保护 /api/f/ 文件 401 → 图片整段下载必失败
+  //（<image> 只剩灰块，2026-11-02 真机排查确认下载链路为本端唯一出入）。
+  // 下载专用 header 一律小写；HTTP 头名大小写不敏感，其他端行为不变。
+  return lowerCaseHeaderKeys(header);
+  // #endif
+  // #ifndef APP-HARMONY
+  return header;
+  // #endif
 }
 
 /** 从绝对 URL 提取 pathname，供 file-preview 使用。 */
@@ -308,15 +338,19 @@ function isPngTailIntact(bytes: Uint8Array): boolean {
   );
 }
 
-/** JPG 尾部 64 字节内须有 FF D9（EOI）；垃圾填充尾同样拦下交给重下。 */
+/** JPG 整段倒扫查 FF D9（EOI）；整段都没有 = 落盘被截断，交给重下。
+ *
+ *  ★不能只看尾 64 字节（2026-11-02 真机）：鸿蒙相机出的是「动态照片」，主图 EOI 之后
+ *  还附了几百 KB 的副数据（MPF/运动照片段），尾 64 字节里根本没有 EOI → 被误判成半截
+ *  图反复删掉重下，表现为「拍照发送必灰块、相册图正常」。整段倒扫不会误判：JPEG 熵编码
+ *  数据做了字节填充（0xFF 后必是 0x00），FF D9 只可能是真正的 EOI 标记。 */
 function isJpgTailIntact(bytes: Uint8Array): boolean {
   const len = bytes.length;
   if (len < 4) {
     return false;
   }
-  const scanFrom = len - 64 > 0 ? len - 64 : 0;
   let i = len - 2;
-  while (i >= scanFrom) {
+  while (i >= 0) {
     if (bytes[i] == 0xff && bytes[i + 1] == 0xd9) {
       return true;
     }
@@ -363,10 +397,51 @@ function isLocalImageFileIntact(filePath: string): boolean {
 
 function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Promise<string> {
   return new Promise((resolve, reject) => {
-    uni.downloadFile({
+    let settled = false;
+    // #ifdef APP-HARMONY
+    // 鸿蒙 downloadFile 偶发 success/fail 都不回调（promise 悬挂，2026-10-27 头像链
+    // 实测；2026-11-02 真机复现「发送图片灰块、点按预览失败」）。挂空闲看门狗：
+    // 8s 无进度无回调视为悬挂，abort 掉任务——abort 会触发 fail 回调、promise 正常
+    // reject，inflight 登记随之释放，外层重试才能拿到全新下载；abort 后运行时仍
+    // 不回调的极端情形再兜底 reject，promise 不许永久悬挂。
+    let downloadTask: DownloadTask | null = null;
+    let watchdogTimer = 0;
+    const settle = (): void => {
+      if (watchdogTimer != 0) {
+        clearTimeout(watchdogTimer);
+        watchdogTimer = 0;
+      }
+    };
+    const armWatchdog = (): void => {
+      settle();
+      watchdogTimer = setTimeout((): void => {
+        if (settled) return;
+        if (downloadTask != null) {
+          try {
+            downloadTask.abort();
+          } catch (_eAbort) {
+            // abort 抛异常也继续走兜底 reject
+          }
+        }
+        // abort 应触发 fail 回调；500ms 后仍无回调则直接兜底 reject
+        setTimeout((): void => {
+          if (settled) return;
+          settled = true;
+          reject(new Error("downloadFile watchdog abort (no callback)"));
+        }, 500);
+      }, 8000);
+    };
+    armWatchdog();
+    // #endif
+    const task = uni.downloadFile({
       url: fetchUrl,
       header,
       success: (res) => {
+        if (settled) return;
+        settled = true;
+        // #ifdef APP-HARMONY
+        settle();
+        // #endif
         const tempPath = res.tempFilePath;
         if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
           resolve(tempPath);
@@ -379,12 +454,25 @@ function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Pro
         reject(new Error());
       },
       fail: (err) => {
+        if (settled) return;
+        settled = true;
+        // #ifdef APP-HARMONY
+        settle();
+        // #endif
         console.error(
           `[ChatImg] downloadFile fail: ${err.errMsg != null ? err.errMsg : ""} url=${fetchUrl}`,
         );
         reject(err);
       },
     });
+    // #ifdef APP-HARMONY
+    downloadTask = task;
+    // 进度事件即活性信号：重置看门狗，慢网大图不会被误杀，只有真悬挂才 abort
+    task.onProgressUpdate((_res) => {
+      if (settled) return;
+      armWatchdog();
+    });
+    // #endif
   });
 }
 
@@ -408,7 +496,75 @@ async function downloadProtectedImageWithIntegrityCheck(
   throw new Error("protected image download corrupt after retries url=" + fetchUrl);
 }
 
+// #ifdef APP-HARMONY
+/**
+ * 鸿蒙受保护文件取址：ak 直链 + 无鉴权下载。
+ *
+ * 为什么不直接 Bearer 下载 /api/f/…：该地址会 302 到对象存储，鸿蒙 http 跟随
+ * 重定向时把原请求头（含 Authorization: Bearer …）一并转发到对象存储，S3 见到
+ * 非 SigV4 的 Authorization 直接回 400 Bad Request——2026-11-02 真机日志实证：
+ * `downloadFile statusCode=400`，三次重试全 400（其他端 OkHttp/NSURLSession 在
+ * 跨主机重定向时会丢掉鉴权头，故不受影响；鸿蒙 App 端图片恒为灰块）。
+ * 改走 ak：/api/file/ak/refresh 换出带临时签名的 ?ak= 直链（uni.request 走 runtime
+ * 的小写化实现，鉴权正常），再用**不带鉴权头**的 downloadFile 拉取——302 到对象
+ * 存储时凭的是预签名参数，S3 认签名即可。
+ * 返回空串 = 失败，由调用方回落原址下载（兼容不 302 私服部署）。
+ */
+function fetchProtectedDisplayUrlViaAkOnHarmony(url: string): Promise<string> {
+  return new Promise<string>((resolve) => {
+    fetchAuthProtectedFileAkUrl(url).then((akUrl: string): void => {
+      uni.downloadFile({
+        url: akUrl,
+        // ★不传任何鉴权头：重定向后请求头同样被转发，Bearer 正是 400 的直接原因
+        header: {} as UTSJSONObject,
+        success: (res) => {
+          const tempPath = res.tempFilePath;
+          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+            // 落盘不完整（动态照片等格式带附加数据已由整段倒扫兼容）时放弃这份，
+            // 由调用方回落原址下载重取
+            if (isLocalImageFileIntact(tempPath)) {
+              resolve(tempPath);
+              return;
+            }
+          }
+          resolve("");
+        },
+        fail: (_err) => {
+          resolve("");
+        },
+      });
+    }).catch((_e: any | null): void => {
+      resolve("");
+    });
+  });
+}
+// #endif
+
 function fetchProtectedImageDisplayUrlOnApp(fetchUrl: string, header: UTSJSONObject): Promise<string> {
+  // #ifdef APP-HARMONY
+  // 先走 ak 无鉴权下载（见 fetchProtectedDisplayUrlViaAkOnHarmony），失败再回落原址整段下载。
+  // 同 URL 并发共享一次任务（10-07 截断事故的同一个护栏：并发落盘竞争会互相覆盖）
+  const inflightAk = protectedImageInflight.get(fetchUrl);
+  if (inflightAk != null) {
+    return inflightAk;
+  }
+  const akTask = fetchProtectedDisplayUrlViaAkOnHarmony(fetchUrl).then(
+    (tempPath: string): Promise<string> => {
+      if (tempPath.length > 0) {
+        return Promise.resolve(tempPath);
+      }
+      return downloadProtectedImageWithIntegrityCheck(fetchUrl, header);
+    },
+  );
+  protectedImageInflight.set(fetchUrl, akTask);
+  akTask.then((_path: string) => {
+    protectedImageInflight.delete(fetchUrl);
+  }).catch((_err) => {
+    protectedImageInflight.delete(fetchUrl);
+  });
+  return akTask;
+  // #endif
+  // #ifndef APP-HARMONY
   const inflight = protectedImageInflight.get(fetchUrl);
   if (inflight != null) {
     return inflight;
@@ -422,6 +578,7 @@ function fetchProtectedImageDisplayUrlOnApp(fetchUrl: string, header: UTSJSONObj
     protectedImageInflight.delete(fetchUrl);
   });
   return task;
+  // #endif
 }
 // #endif
 
@@ -456,15 +613,70 @@ export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
 // 需要同时处理受保护文件与远程 SVG 时，请用 utils/remoteSvgImage 的 resolveDisplayImageUrl。
 
 /**
+ * 下载非 200 后回捞后端失败原因：uni.downloadFile 不暴露响应体，用同 URL
+ * 同请求头以默认 JSON 模式重发一次，读错误体 message 字段（后端错误体口径
+ * {code, message}，fileTree 小程序分支同款）；非 JSON 体（网关 HTML 错误页）、
+ * 网络挂、无 message 一律返回空串，由调用方落兜底文案。
+ */
+function fetchRemoteFailReason(fetchUrl: string, header: UTSJSONObject): Promise<string> {
+  return new Promise<string>((resolve) => {
+    uni.request({
+      url: fetchUrl,
+      method: "GET",
+      header,
+      success: (res) => {
+        let reason = "";
+        try {
+          if (res.data != null) {
+            const obj = res.data as UTSJSONObject;
+            const msg = obj["message"];
+            if (msg != null) {
+              reason = `${msg}`;
+            }
+          }
+        } catch (_e) {
+          // 非 JSON 错误体（网关 HTML 错误页等）：无后端原因可取
+        }
+        resolve(reason);
+      },
+      fail: (_err) => {
+        resolve("");
+      },
+    });
+  });
+}
+
+/** 下载失败 toast：有后端原因优先展示原因，否则兜底「下载失败，请重试」。 */
+function toastDownloadFail(reason: string): void {
+  uni.showToast({
+    title: reason.length > 0 ? reason : t("Mobile.Terminal.downloadFailed"),
+    icon: "none",
+    duration: 3000,
+  });
+}
+
+/** 文件打开失败 toast（下载已成功、系统查看器打不开，与下载失败区分）。 */
+function toastOpenFileFail(): void {
+  uni.showToast({
+    title: t("Mobile.Intervention.McpAsk.openFileFailed"),
+    icon: "none",
+    duration: 3000,
+  });
+}
+
+/**
  * 打开或下载远程文件。
  * 受保护地址带 Bearer 下载；若提供 conversationId 则跳转预览页（附 source=im）。
  * 预览页按 source=im 走「只预览文件」路径、不调智能体域 /api/agent/conversation/share
  * （IM convId 在该接口必报 conversation not found）——改造落地前的过渡期会白屏+报错。
+ * failToast=true 时失败提示由本函数内部弹出（downloadFileInApp 同款约定）：
+ * 非 200 回捞后端 message 优先、无原因兜底「下载失败，请重试」；调用方不必再 toast。
  */
 export function openRemoteFileUrl(
   url: string,
   fileName: string = "",
   conversationId: string = "",
+  failToast: boolean = false,
 ): Promise<void> {
   const resolvedName =
     fileName.length > 0 ? fileName : extractFileNameFromUrl(url);
@@ -494,6 +706,11 @@ export function openRemoteFileUrl(
         })
         .catch((err) => {
           uni.hideLoading();
+          if (failToast) {
+            fetchRemoteFailReason(fetchUrl, header).then((reason: string) => {
+              toastDownloadFail(reason);
+            });
+          }
           reject(err);
         });
     });
@@ -514,15 +731,27 @@ export function openRemoteFileUrl(
                 resolve();
               },
               fail: (err) => {
+                if (failToast) {
+                  toastOpenFileFail();
+                }
                 reject(err);
               },
             });
             return;
           }
-          reject(new Error());
+          // 非 200：downloadFile 不暴露响应体，补一发 JSON 请求回捞后端 message
+          fetchRemoteFailReason(fetchUrl, header).then((reason: string) => {
+            if (failToast) {
+              toastDownloadFail(reason);
+            }
+            reject(new Error(reason));
+          });
         },
         fail: (err) => {
           uni.hideLoading();
+          if (failToast) {
+            toastDownloadFail("");
+          }
           reject(err);
         },
       });
@@ -547,14 +776,27 @@ export function openRemoteFileUrl(
               resolve();
             },
             fail: (err) => {
+              if (failToast) {
+                toastOpenFileFail();
+              }
               reject(err);
             },
           });
         } else {
-          reject(new Error());
+          // 非 200：同 URL 补发 JSON 请求回捞后端 message（非受保护地址多为
+          // 网关/对象存储直链，错误体常为 XML/HTML，取不到自然落兜底文案）
+          fetchRemoteFailReason(url, new UTSJSONObject()).then((reason: string) => {
+            if (failToast) {
+              toastDownloadFail(reason);
+            }
+            reject(new Error(reason));
+          });
         }
       },
       fail: (err) => {
+        if (failToast) {
+          toastDownloadFail("");
+        }
         reject(err);
       },
     });

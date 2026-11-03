@@ -2,7 +2,6 @@ package com.nuwax.imageviewer
 
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.AlertDialog
 import android.app.Dialog
 import android.content.Context
 import android.graphics.Canvas
@@ -41,7 +40,7 @@ private const val OPEN_FADE_DURATION = 300L
 /** 图比整层淡入更晚就绪时补一小段渐显（正常情况下图随整层一起浮上来，不会走到这里）。 */
 private const val REVEAL_DURATION = 140L
 
-/** UTS 侧保存回调：鉴权下载与入相册逻辑留在上层（savePreviewImageToAlbumInApp）。 */
+/** UTS 侧长按回调：确认弹窗与保存逻辑都在上层（uni.showActionSheet + savePreviewImageToAlbumInApp）。 */
 interface SaveRequestCallback {
     fun onSaveRequested(url: String)
 }
@@ -162,11 +161,9 @@ private class ViewerDialog(
 ) : Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen) {
 
     private val pager: PagerHost = PagerHost(activity, urls, index, exitRect, fileProvider, ::dismiss) { url ->
-        // 长按先确认再保存（保存期间查看器保持打开）
-        AlertDialog.Builder(activity)
-            .setItems(arrayOf("保存图片")) { _, _ -> saveCb.onSaveRequested(url) }
-            .setNegativeButton("取消", null)
-            .show()
+        // 长按即上报：确认弹窗在上层（uni.showActionSheet，dialogPage 为独立 Activity 窗口，
+        // 可叠在本查看器之上），文案/i18n 随上层走，原生侧不再自带菜单（保存期间查看器保持打开）
+        saveCb.onSaveRequested(url)
     }
 
     init {

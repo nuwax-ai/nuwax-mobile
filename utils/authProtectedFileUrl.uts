@@ -7,6 +7,9 @@ import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { jumpToFilePreviewPage } from "@/utils/system.uts";
 import { applyXClientTypeHeader, isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
+import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+
+const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
 const AUTH_PROTECTED_FILE_PATH_RE = /\/api\/f\//i;
 
@@ -609,15 +612,70 @@ export function fetchAuthProtectedFileDisplayUrl(url: string): Promise<string> {
 // 需要同时处理受保护文件与远程 SVG 时，请用 utils/remoteSvgImage 的 resolveDisplayImageUrl。
 
 /**
+ * 下载非 200 后回捞后端失败原因：uni.downloadFile 不暴露响应体，用同 URL
+ * 同请求头以默认 JSON 模式重发一次，读错误体 message 字段（后端错误体口径
+ * {code, message}，fileTree 小程序分支同款）；非 JSON 体（网关 HTML 错误页）、
+ * 网络挂、无 message 一律返回空串，由调用方落兜底文案。
+ */
+function fetchRemoteFailReason(fetchUrl: string, header: UTSJSONObject): Promise<string> {
+  return new Promise<string>((resolve) => {
+    uni.request({
+      url: fetchUrl,
+      method: "GET",
+      header,
+      success: (res) => {
+        let reason = "";
+        try {
+          if (res.data != null) {
+            const obj = res.data as UTSJSONObject;
+            const msg = obj["message"];
+            if (msg != null) {
+              reason = `${msg}`;
+            }
+          }
+        } catch (_e) {
+          // 非 JSON 错误体（网关 HTML 错误页等）：无后端原因可取
+        }
+        resolve(reason);
+      },
+      fail: (_err) => {
+        resolve("");
+      },
+    });
+  });
+}
+
+/** 下载失败 toast：有后端原因优先展示原因，否则兜底「下载失败，请重试」。 */
+function toastDownloadFail(reason: string): void {
+  uni.showToast({
+    title: reason.length > 0 ? reason : t("Mobile.Terminal.downloadFailed"),
+    icon: "none",
+    duration: 3000,
+  });
+}
+
+/** 文件打开失败 toast（下载已成功、系统查看器打不开，与下载失败区分）。 */
+function toastOpenFileFail(): void {
+  uni.showToast({
+    title: t("Mobile.Intervention.McpAsk.openFileFailed"),
+    icon: "none",
+    duration: 3000,
+  });
+}
+
+/**
  * 打开或下载远程文件。
  * 受保护地址带 Bearer 下载；若提供 conversationId 则跳转预览页（附 source=im）。
  * 预览页按 source=im 走「只预览文件」路径、不调智能体域 /api/agent/conversation/share
  * （IM convId 在该接口必报 conversation not found）——改造落地前的过渡期会白屏+报错。
+ * failToast=true 时失败提示由本函数内部弹出（downloadFileInApp 同款约定）：
+ * 非 200 回捞后端 message 优先、无原因兜底「下载失败，请重试」；调用方不必再 toast。
  */
 export function openRemoteFileUrl(
   url: string,
   fileName: string = "",
   conversationId: string = "",
+  failToast: boolean = false,
 ): Promise<void> {
   const resolvedName =
     fileName.length > 0 ? fileName : extractFileNameFromUrl(url);
@@ -647,6 +705,11 @@ export function openRemoteFileUrl(
         })
         .catch((err) => {
           uni.hideLoading();
+          if (failToast) {
+            fetchRemoteFailReason(fetchUrl, header).then((reason: string) => {
+              toastDownloadFail(reason);
+            });
+          }
           reject(err);
         });
     });
@@ -667,15 +730,27 @@ export function openRemoteFileUrl(
                 resolve();
               },
               fail: (err) => {
+                if (failToast) {
+                  toastOpenFileFail();
+                }
                 reject(err);
               },
             });
             return;
           }
-          reject(new Error());
+          // 非 200：downloadFile 不暴露响应体，补一发 JSON 请求回捞后端 message
+          fetchRemoteFailReason(fetchUrl, header).then((reason: string) => {
+            if (failToast) {
+              toastDownloadFail(reason);
+            }
+            reject(new Error(reason));
+          });
         },
         fail: (err) => {
           uni.hideLoading();
+          if (failToast) {
+            toastDownloadFail("");
+          }
           reject(err);
         },
       });
@@ -700,14 +775,27 @@ export function openRemoteFileUrl(
               resolve();
             },
             fail: (err) => {
+              if (failToast) {
+                toastOpenFileFail();
+              }
               reject(err);
             },
           });
         } else {
-          reject(new Error());
+          // 非 200：同 URL 补发 JSON 请求回捞后端 message（非受保护地址多为
+          // 网关/对象存储直链，错误体常为 XML/HTML，取不到自然落兜底文案）
+          fetchRemoteFailReason(url, new UTSJSONObject()).then((reason: string) => {
+            if (failToast) {
+              toastDownloadFail(reason);
+            }
+            reject(new Error(reason));
+          });
         }
       },
       fail: (err) => {
+        if (failToast) {
+          toastDownloadFail("");
+        }
         reject(err);
       },
     });

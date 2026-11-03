@@ -51,6 +51,7 @@
           :error="filesError"
           :has-more="filesHasMore"
           :auto-stopped="filesAutoStopped"
+          :downloading-keys="downloadingKeys"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
@@ -66,6 +67,7 @@
           :error="filesError"
           :has-more="filesHasMore"
           :auto-stopped="filesAutoStopped"
+          :downloading-keys="downloadingKeys"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
@@ -81,6 +83,7 @@
           :error="filesError"
           :has-more="filesHasMore"
           :auto-stopped="filesAutoStopped"
+          :downloading-keys="downloadingKeys"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
@@ -96,6 +99,7 @@
           :error="filesError"
           :has-more="filesHasMore"
           :auto-stopped="filesAutoStopped"
+          :downloading-keys="downloadingKeys"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
@@ -111,6 +115,7 @@
           :error="filesError"
           :has-more="filesHasMore"
           :auto-stopped="filesAutoStopped"
+          :downloading-keys="downloadingKeys"
           @rowtap="handleFileTap"
           @preview="handlePreview"
           @download="handleDownload"
@@ -540,55 +545,112 @@
   /**
    * H5 普通地址下载：拉字节转 blob（octet-stream 强制走下载而非导航），
    * CORS 不放行或请求失败时退回新页打开（与旧行为一致，不让用户点了没反应）。
+   * 返回 Promise 于链路终态（含兜底新页打开）resolve，页面据此收「下载中」态。
    */
-  function downloadNormalUrlOnH5(url: string, name: string): void {
-    uni.request({
-      url,
-      method: "GET",
-      responseType: "arraybuffer",
-      // 默认 dataType=json 会尝试 JSON.parse，二进制会失败
-      dataType: "text",
-      success: (res) => {
-        if (res.statusCode == 200 && res.data != null) {
-          const blob = new Blob([res.data as ArrayBuffer], { type: "application/octet-stream" });
-          const objectUrl = URL.createObjectURL(blob);
-          const link = document.createElement("a");
-          link.href = objectUrl;
-          link.download = name;
-          link.click();
-          setTimeout(() => {
-            URL.revokeObjectURL(objectUrl);
-          }, 60000);
-          return;
-        }
-        window.open(url, "_blank");
-      },
-      fail: (_err) => {
-        window.open(url, "_blank");
-      },
+  function downloadNormalUrlOnH5(url: string, name: string): Promise<void> {
+    return new Promise<void>((resolve, _reject) => {
+      uni.request({
+        url,
+        method: "GET",
+        responseType: "arraybuffer",
+        // 默认 dataType=json 会尝试 JSON.parse，二进制会失败
+        dataType: "text",
+        success: (res) => {
+          if (res.statusCode == 200 && res.data != null) {
+            const blob = new Blob([res.data as ArrayBuffer], { type: "application/octet-stream" });
+            const objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = objectUrl;
+            link.download = name;
+            link.click();
+            setTimeout(() => {
+              URL.revokeObjectURL(objectUrl);
+            }, 60000);
+            resolve();
+            return;
+          }
+          window.open(url, "_blank");
+          resolve();
+        },
+        fail: (_err) => {
+          window.open(url, "_blank");
+          resolve();
+        },
+      });
     });
   }
   // #endif
 
-  /** 下载按钮：受保护地址走 openRemoteFileUrl（H5 带 Bearer 拉 blob+保存；App 下载后交系统查看器）。 */
+  /**
+   * 在途下载行 key（msgId#index）集合：整组替换写入（Set 原地变更不触发重渲），
+   * 行内按钮据此转「下载中」并挡重复点按——大文件连点会叠多个 downloadFile。
+   */
+  const downloadingKeys = ref<string[]>([]);
+
+  function isDownloading(key: string): boolean {
+    return downloadingKeys.value.indexOf(key) >= 0;
+  }
+
+  function markDownloading(key: string): void {
+    if (isDownloading(key)) {
+      return;
+    }
+    const next = [] as string[];
+    for (let i = 0; i < downloadingKeys.value.length; i++) {
+      next.push(downloadingKeys.value[i]);
+    }
+    next.push(key);
+    downloadingKeys.value = next;
+  }
+
+  function unmarkDownloading(key: string): void {
+    const next = [] as string[];
+    for (let i = 0; i < downloadingKeys.value.length; i++) {
+      if (downloadingKeys.value[i] != key) {
+        next.push(downloadingKeys.value[i]);
+      }
+    }
+    downloadingKeys.value = next;
+  }
+
+  /**
+   * 下载按钮：受保护地址走 openRemoteFileUrl（H5 带 Bearer 拉 blob+保存；App 下载后交系统查看器）。
+   * 在途期间行按钮转「下载中」（mark/unmark 与组件侧 emitDownload 闸门双保险），
+   * 成功/失败都回落常态；失败提示由 openRemoteFileUrl 内部弹出（failToast=true：
+   * 非 200 回捞后端 message 优先展示、无原因兜底「下载失败，请重试」），
+   * H5 普通地址的兜底新页打开不算失败、不 toast。
+   */
   function handleDownload(f: GfFile): void {
-    if (f.url.length == 0) {
+    if (f.url.length == 0 || isDownloading(f.key)) {
       return;
     }
     const name = downloadNameOf(f);
+    markDownloading(f.key);
     if (isAuthProtectedFileUrl(f.url)) {
-      openRemoteFileUrl(f.url, name).catch((_e: any | null) => {
-        uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
-      });
+      openRemoteFileUrl(f.url, name, "", true)
+        .then((): void => {
+          unmarkDownloading(f.key);
+        })
+        .catch((_e: any | null) => {
+          // 失败 toast 由 openRemoteFileUrl 内部弹（后端原因优先，兜底「下载失败，请重试」）
+          unmarkDownloading(f.key);
+        });
       return;
     }
     // #ifdef H5 || WEB
-    downloadNormalUrlOnH5(f.url, name);
+    downloadNormalUrlOnH5(f.url, name).then((): void => {
+      unmarkDownloading(f.key);
+    });
     // #endif
     // #ifndef H5 || WEB
-    openRemoteFileUrl(f.url, name).catch((_e: any | null) => {
-      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
-    });
+    openRemoteFileUrl(f.url, name, "", true)
+      .then((): void => {
+        unmarkDownloading(f.key);
+      })
+      .catch((_e: any | null) => {
+        // 同上：失败提示由链路内部弹出
+        unmarkDownloading(f.key);
+      });
     // #endif
   }
 

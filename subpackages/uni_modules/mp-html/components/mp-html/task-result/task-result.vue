@@ -5,6 +5,9 @@
       v-for="(name, index) in fileNames"
       :key="index"
       class="task-result-file"
+      hover-class="task-result-file--hover"
+      :hover-start-time="20"
+      :hover-stay-time="70"
       @tap="handleClickFile(name)"
     >
       <view class="task-result-icon">
@@ -171,11 +174,15 @@
       align-items: center;
       width: 100%;
       margin-bottom: 16rpx;
-      padding: 22rpx 24rpx;
+      padding: 20rpx 24rpx;
       border-radius: 16rpx;
       background-color: #ffffff;
-      border: 1rpx solid #eceef2;
+      border: 1rpx solid rgba(12, 20, 102, 0.2);
       box-sizing: border-box;
+    }
+
+    .task-result-file--hover {
+      background-color: rgba(12, 20, 102, 0.04);
     }
 
     .file-text {

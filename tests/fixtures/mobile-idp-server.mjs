@@ -5,13 +5,15 @@ import path from 'node:path';
 // 仅在 loopback 提供本地模拟接口，不转发真实 API，不使用真实账号或凭据。
 if (!process.argv[2]) throw new Error('Usage: node tests/fixtures/mobile-idp-server.mjs <HBuilderX web output>');
 const root = path.resolve(process.argv[2]);
+const webRoot = process.argv[3] ? path.resolve(process.argv[3]) : null;
 const port = Number(process.env.IDP_FIXTURE_PORT || 18765);
 const providers = [
   { id: '101', type: 'CAS', name: '西财统一认证（本地模拟）' },
   { id: '102', type: 'OAUTH2', name: 'OAuth2（本地模拟）' },
   { id: '103', type: 'WECHAT', name: '微信', wechatMode: 'QRCODE' },
 ];
-const state = { auto: null, listFailure: false, verifyFailure: false, authorizeFailure: false, pending: false, events: [] };
+const state = { auto: null, listFailure: false, verifyFailure: false, authorizeFailure: false, pending: false,
+  inviteStatus: 'Active', inviteJoined: false, inviteAuthCode: '4010', inviteJoinFailure: false, events: [] };
 const mime = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2', '.json': 'application/json' };
 
 http.createServer(async (req, res) => {
@@ -51,6 +53,16 @@ http.createServer(async (req, res) => {
       res.setHeader('Set-Cookie', 'ticket=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
       return json(null);
     }
+    if (url.pathname.startsWith('/api/space/invite/')) {
+      // 4011 中后端只看得到 /m/，真实业务 fragment 必须由前端续接。
+      if (!signedIn) return json(null, state.inviteAuthCode, '/login?redirect=%2Fm%2F');
+      if (url.pathname.startsWith('/api/space/invite/info/')) return json({ status: state.inviteStatus,
+        spaceId: '1140', spaceName: '本地分享会团队', role: 'User', expire: null, joined: state.inviteJoined });
+      if (state.inviteStatus !== 'Active' || state.inviteJoinFailure) return json(null, '4000', '本地模拟：加入失败，请重试');
+      state.inviteJoined = true;
+      return json(null);
+    }
+    if (url.pathname === '/api/instant-message/spaces/1140/enter') return json({ convId: '9007199254740993', convType: 4, name: '本地分享会团队群', avatar: '' });
     if (url.pathname.includes('/i18n/')) return json([]);
     return json({ records: [], list: [], total: 0 });
   }
@@ -61,6 +73,15 @@ http.createServer(async (req, res) => {
     return res.end('<p>首次关联（本地模拟）</p><a href="' + login + '">登录已有账号</a>');
   }
   try {
+    // 可选 PC 产物用于验证同源 /invite → /m/ 的真实首屏分流。
+    if (webRoot && !url.pathname.startsWith('/m/')) {
+      const candidate = path.resolve(webRoot, '.' + decodeURIComponent(url.pathname));
+      if (!candidate.startsWith(webRoot + path.sep)) { res.writeHead(403); return res.end(); }
+      const file = path.extname(candidate) ? candidate : path.join(webRoot, 'index.html');
+      res.setHeader('Content-Type', mime[path.extname(file)] || 'application/octet-stream');
+      res.setHeader('Cache-Control', 'no-store');
+      return res.end(await fs.readFile(file));
+    }
     const relative = decodeURIComponent(url.pathname).replace(/^\/m\/?/, '');
     const file = path.resolve(root, relative || 'index.html');
     if (!file.startsWith(root + path.sep)) { res.writeHead(403); return res.end(); }

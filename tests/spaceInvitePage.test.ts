@@ -34,16 +34,14 @@ function setup(options: { app?: boolean; token?: string; info?: object } = {}) {
     info.mockResolvedValue(ok({ ...active, joined: true }));
     return ok(null);
   });
-  const enter = vi
-    .fn()
-    .mockResolvedValue(
-      ok({
-        convId: "9007199254740993",
-        convType: 4,
-        name: "学校 & 交流",
-        avatar: "/team.png?a=1&b=2",
-      }),
-    );
+  const enter = vi.fn().mockResolvedValue(
+    ok({
+      convId: "9007199254740993",
+      convType: 4,
+      name: "学校 & 交流",
+      avatar: "/team.png?a=1&b=2",
+    }),
+  );
   const redirect = vi.fn();
   const login = vi.fn();
   let load: (query: object) => void = () => {};
@@ -152,11 +150,16 @@ describe("邀请页面手动确认后入团并打开指定群", () => {
     },
   );
 
-  it("已有成员跳过加入，直接进入团队群", async () => {
+  it("已有成员先展示已加入，点击后进入团队群，不重复加入", async () => {
     const p = setup({ info: { ...active, joined: true } });
     p.load({ code: "school" });
     await settle();
     expect(p.join).not.toHaveBeenCalled();
+    expect(p.state.value).toBe("joined");
+    expect(p.enter).not.toHaveBeenCalled();
+    expect(p.redirect).not.toHaveBeenCalled();
+    p.confirmJoin();
+    await settle();
     expect(p.enter).toHaveBeenCalledOnce();
     expect(p.redirect).toHaveBeenCalledOnce();
   });
@@ -195,6 +198,33 @@ describe("邀请页面手动确认后入团并打开指定群", () => {
     expect(p.join).not.toHaveBeenCalled();
     expect(p.enter).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { app: false, joined: false },
+    { app: false, joined: true },
+    { app: true, joined: false },
+    { app: true, joined: true },
+  ])(
+    "登录返回 $app / joined=$joined 先展示状态，点击才继续",
+    async ({ app, joined }) => {
+      const p = setup({ app });
+      p.info.mockResolvedValueOnce({ code: "4010" });
+      p.load({ code: "school" });
+      await settle();
+      expect(p.login).toHaveBeenCalledOnce();
+      p.info.mockResolvedValue(ok({ ...active, joined }));
+      p.load({ code: "school" });
+      await settle();
+      expect(p.state.value).toBe(joined ? "joined" : "ready");
+      expect(p.join).not.toHaveBeenCalled();
+      expect(p.enter).not.toHaveBeenCalled();
+      expect(p.redirect).not.toHaveBeenCalled();
+      p.confirmJoin();
+      await settle();
+      expect(p.join).toHaveBeenCalledTimes(joined ? 0 : 1);
+      expect(p.enter).toHaveBeenCalledOnce();
+    },
+  );
 
   it("登录回跳重新加载后不沿用之前的入团确认", async () => {
     const p = setup();

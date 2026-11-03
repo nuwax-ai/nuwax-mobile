@@ -15,8 +15,22 @@ const excludeFiles = new Set([
   "utils/pinyin.uts",
 ]);
 const excludePathPrefixes = ["subpackages/uni_modules/"];
-const zhLocalePath = "constants/i18n-locales/zh-CN.uts";
-const enLocalePath = "constants/i18n-locales/en-US.uts";
+const zhLocalePath = "constants/i18n-locales/zh-cn.uts";
+const enLocalePath = "constants/i18n-locales/en-us.uts";
+
+// macOS 通常不区分大小写，先校验实际文件名，避免本地通过而 Linux CI 读不到词典。
+for (const localePath of [zhLocalePath, enLocalePath]) {
+  const directory = path.dirname(path.join(rootDir, localePath));
+  if (
+    !fs.existsSync(directory) ||
+    !fs.readdirSync(directory).includes(path.basename(localePath))
+  ) {
+    console.error(
+      `[i18n audit] missing locale file (check filename case): ${localePath}`,
+    );
+    process.exit(1);
+  }
+}
 
 const hasChinese = /[\u4e00-\u9fff]/;
 const visibleLine = new RegExp(
@@ -47,9 +61,9 @@ const visibleLine = new RegExp(
 );
 const hardcodedVisibleLiteral = new RegExp(
   [
-    "title\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
-    "content\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
-    "text\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
+    "(?:^|[{,])\\s*title\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
+    "(?:^|[{,])\\s*content\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
+    "(?:^|[{,])\\s*text\\s*:\\s*['\"](?!Mobile\\.)[^'\"\\n]+['\"]",
     "showError\\s*\\(\\s*['\"][^'\"\\n]+['\"]\\s*\\)",
     "showError\\s*\\(\\s*`[^`\\n]+`\\s*\\)",
     "new\\s+Error\\s*\\(\\s*['\"][^'\"\\n]+['\"]\\s*\\)",
@@ -141,11 +155,24 @@ files.forEach((relPath) => {
   let keyMatch;
   while ((keyMatch = keyRegex.exec(content)) !== null) {
     const key = keyMatch[1];
+    // 动态拼接的 key 前缀不是可直接翻译的完整词条。
+    const preceding = content.slice(0, keyMatch.index).split("\n").pop() || "";
+    const assignment = preceding.match(/\b(?:const|let)\s+(\w+)\s*=\s*$/);
+    const prefix =
+      /^\s*\+/.test(content.slice(keyRegex.lastIndex)) ||
+      (assignment != null &&
+        new RegExp("\\b" + assignment[1] + "\\s*\\+").test(
+          content.slice(keyRegex.lastIndex),
+        ));
     if (!usedKeyLocations.has(key)) {
       usedKeyLocations.set(key, {
         file: relPath,
         line: content.slice(0, keyMatch.index).split(/\r?\n/).length,
+        prefix,
       });
+    } else if (!prefix) {
+      // 同一字符串被当作完整 key 使用时，仍必须有精确词条。
+      usedKeyLocations.get(key).prefix = false;
     }
   }
 
@@ -164,7 +191,11 @@ files.forEach((relPath) => {
     const trimmed = code.trim();
     if (!trimmed || trimmed.startsWith("//")) return;
 
-    if (hardcodedVisibleLiteral.test(code)) {
+    // 空白占位和纯插值不是文案；保留真实字面量的检查。
+    const literals = code
+      .replace(/(['"])\s*\1/g, '""')
+      .replace(/`(?:\s|\$\{[^}]*\})*`/g, "``");
+    if (hardcodedVisibleLiteral.test(literals)) {
       findings.push({
         file: relPath,
         line: index + 1,
@@ -258,7 +289,14 @@ legacyLocaleKeyList.forEach((key) => {
   });
 
 usedKeyLocations.forEach((location, key) => {
-  if (!zhKeys.has(key) || !enKeys.has(key)) {
+  const matches = (keys) =>
+    keys.has(key) ||
+    (location.prefix &&
+      [...keys].some(
+        (candidate) =>
+          candidate.startsWith(key) && candidate.length > key.length,
+      ));
+  if (!matches(zhKeys) || !matches(enKeys)) {
     findings.push({
       file: location.file,
       line: location.line,

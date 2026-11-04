@@ -69,6 +69,18 @@ export function hasPushClickSinceLaunch(): boolean {
 
 /** 防重复绑定（App 生命周期内只绑一次）。 */
 let pushBound = false;
+/**
+ * onPushMessage 回调代次（每次注册自增）。
+ * 只给「iOS 一次性回调重挂」用：旧回调若仍存活，代次不等就让它让位，保证同一条事件只处理一次。
+ */
+let pushListenerGen = 0;
+/**
+ * 推送事件去重（仅 iOS 重挂用）：若某版本在注册回调时重放「最近一次事件」，
+ * 重挂会把它再喂回来 → 再重挂 → 死循环（表现为通知连弹/反复跳会话）。
+ * 同类型同会话同内容的相邻事件 1.5s 内只处理一次即可挡住。
+ */
+let lastPushEventKey = "";
+let lastPushEventAt = 0;
 /** cid 模块缓存（空 = 尚未取到）。 */
 let cachedPushCid = "";
 
@@ -108,15 +120,100 @@ function showLocalNoticeForReceive(data: UTSJSONObject | null): void {
   if (content.length == 0) {
     return;
   }
+  // ★本地通知的 payload 只放**业务字段**（信封里的 data.payload），不要整只信封：
+  //   框架会对它再包一层，整只信封传进去点击回调就成了两层嵌套（点通知取不到 convId）。
+  //   信封本身没有业务字段时退回整只 data（pushPayloadField 逐层剥也能兜住）。
+  const envelopeInner = data["payload"];
+  const localPayload: UTSJSONObject =
+    envelopeInner != null && typeof envelopeInner == "object" && !Array.isArray(envelopeInner)
+      ? (envelopeInner as UTSJSONObject)
+      : data;
   try {
     uni.createPushMessage({
       title: pushPayloadField(data, "title"),
       content: content,
-      payload: data,
+      payload: localPayload,
       sound: "system",
     });
   } catch (e) {
     console.error("[ImPush] createPushMessage fail:", e);
+  }
+}
+
+/**
+ * 注册一份 onPushMessage 回调（被 bindImPushClient 调；iOS 每次事件后还要重挂，见下）。
+ *
+ * ★iOS 回调是**一次性**的（2026-11-02 真机实证）：HX 4.25 起 uts 插件回调默认
+ *   「触发一次即回收」，官方 uni-push 的 onPushMessage 未声明 keepAlive ⇒ 每个进程里
+ *   **第一条**推送事件就消耗掉唯一一次回调，之后控制台报
+ *   `onPushMessage callback回调函数已释放，不能再次执行`。
+ *   后果正是「点通知只拉起 App、进不了会话」：iOS 退后台后进程仍存活，先收到一条
+ *   在线透传（我们据此补了本地通知）→ 回调当场被回收 → 用户这时再点通知，
+ *   click 事件没人接收，只能落到原来的页面（消息列表）。
+ *   Android / 鸿蒙回调常驻，没有这个现象。
+ *   ⇒ iOS 在回调**入口**先重挂下一份再处理：旧回调已被框架释放，重挂不会叠加；
+ *     万一某版本不回收，下面的代次比较会让旧回调直接让位，同一条事件只处理一次。
+ */
+function registerPushListener(): void {
+  pushListenerGen += 1;
+  const gen = pushListenerGen;
+  // ★ 云打包开关：uni-app x 按「代码用到的 API」自动引入 uni-push 模块，DCloud 后台未开通
+  //   uni-push 2.0 时云打包会报「使用了 uni-push 模块但尚未开通」——此时把下面 try 块注释掉
+  //   并从 manifest 移除 uni-push 模块即可（本地自定义基座不受影响）。
+  try {
+    uni.onPushMessage((res: OnPushMessageCallbackResult): void => {
+      if (gen != pushListenerGen) {
+        // 旧回调（该框架版本不回收）：后挂的那份会处理，这里让位，避免同一条事件处理两次
+        return;
+      }
+      // 相邻重复事件（iOS 重挂若被框架重放）：只处理一次，防止连弹/反复跳转
+      const evData = res.data;
+      const evConvId = evData != null ? pushPayloadField(evData, "convId") : "";
+      const evContent = evData != null ? pushPayloadField(evData, "content") : "";
+      const eventKey = `${res.type}|${evConvId}|${evContent}`;
+      const eventNow = Date.now();
+      const duplicated = eventKey == lastPushEventKey && eventNow - lastPushEventAt < 1500;
+      lastPushEventKey = eventKey;
+      lastPushEventAt = eventNow;
+      if (duplicated) {
+        return;
+      }
+      // #ifdef APP-IOS
+      registerPushListener();
+      // #endif
+      if (res.type != "click") {
+        // #ifdef APP-IOS
+        // 退后台仍存活时收到的是在线透传，系统不弹通知栏 → 本地通知补一条。
+        showLocalNoticeForReceive(res.data);
+        // #endif
+        return;
+      }
+      pushClickReceived = true;
+      const data = res.data;
+      if (data == null) {
+        console.error("[ImPush] click without data");
+        return;
+      }
+      const convId = pushPayloadField(data, "convId");
+      if (convId.length == 0) {
+        // 无会话参数的推送（如系统公告）交给默认行为：仅拉起 App。
+        // 打 raw：payload 结构（信封层数）只有真机日志能证实，别再靠猜。
+        console.error(`[ImPush] click without convId raw=${JSON.stringify(data)}`);
+        return;
+      }
+      // 排查用（保留）：点通知到底是「事件没到」还是「payload 没带 convId」一眼可分
+      const convType = pushPayloadField(data, "convType");
+      console.log(`[ImPush] click convId=${convId} convType=${convType}`);
+      openConvWithRetry(
+        convId,
+        convType,
+        pushPayloadField(data, "name"),
+        pushPayloadField(data, "avatar"),
+        0,
+      );
+    });
+  } catch (e) {
+    console.error("[ImPush] onPushMessage bind fail:", e);
   }
 }
 
@@ -132,39 +229,7 @@ export function bindImPushClient(): void {
     return;
   }
   pushBound = true;
-  // ★ 云打包开关：uni-app x 按「代码用到的 API」自动引入 uni-push 模块，DCloud 后台未开通
-  //   uni-push 2.0 时云打包会报「使用了 uni-push 模块但尚未开通」——此时把下面 try 块注释掉
-  //   并从 manifest 移除 uni-push 模块即可（本地自定义基座不受影响）。
-  try {
-    uni.onPushMessage((res: OnPushMessageCallbackResult): void => {
-      if (res.type != "click") {
-        // #ifdef APP-IOS
-        // 退后台仍存活时收到的是在线透传，系统不弹通知栏 → 本地通知补一条。
-        showLocalNoticeForReceive(res.data);
-        // #endif
-        return;
-      }
-      pushClickReceived = true;
-      const data = res.data;
-      if (data == null) {
-        return;
-      }
-      const convId = pushPayloadField(data, "convId");
-      if (convId.length == 0) {
-        // 无会话参数的推送（如系统公告）交给默认行为：仅拉起 App
-        return;
-      }
-      openConvWithRetry(
-        convId,
-        pushPayloadField(data, "convType"),
-        pushPayloadField(data, "name"),
-        pushPayloadField(data, "avatar"),
-        0,
-      );
-    });
-  } catch (e) {
-    console.error("[ImPush] onPushMessage bind fail:", e);
-  }
+  registerPushListener();
 }
 
 /**
@@ -710,15 +775,36 @@ function pushField(payload: UTSJSONObject, key: string): string {
  *   表现为「点通知只拉起 App 停在伙伴页、进不了会话」——这是 2026-10-30 华为真机
  *   多台复现的根因。
  *   顶层也一并兜一下：兼容透传消息与历史格式（老版本没有信封包裹）。
+ *
+ * ★信封可能不止一层（2026-11-04 iOS 真机：点**本地通知**偶发 `click without convId`）：
+ *   `showLocalNoticeForReceive` 把 receive 收到的**整只信封**当 payload 交给
+ *   `uni.createPushMessage`，框架再包一层 → 点击回调变成
+ *   `{ payload: { payload: { convId } } }`，只剥一层就取不到。
+ *   所以这里逐层剥（最多 3 层）；Android/鸿蒙的离线推送只有一层信封，剥第一层即命中。
  */
 function pushPayloadField(data: UTSJSONObject, key: string): string {
   const direct = pushField(data, key);
   if (direct.length > 0) {
     return direct;
   }
-  const inner = data["payload"];
-  if (inner != null && typeof inner == "object" && !Array.isArray(inner)) {
-    return pushField(inner as UTSJSONObject, key);
+  let node: UTSJSONObject | null = data;
+  let depth = 0;
+  while (depth < 3) {
+    const current = node;
+    if (current == null) {
+      return "";
+    }
+    const inner = current["payload"];
+    if (inner == null || typeof inner != "object" || Array.isArray(inner)) {
+      return "";
+    }
+    const obj = inner as UTSJSONObject;
+    const value = pushField(obj, key);
+    if (value.length > 0) {
+      return value;
+    }
+    node = obj;
+    depth += 1;
   }
   return "";
 }
@@ -762,8 +848,9 @@ function openConvWithRetry(
     if (avatar.length > 0) {
       url += `&avatar=${encodeURIComponent(avatar)}`;
     }
-    const failHandler = (_err: any): void => {
+    const failHandler = (err: any): void => {
       // 冷启动落在启动页/登录跳转中：navigateTo 可能失败，不再重试（避免重复开页）
+      console.error(`[ImPush] nav fail: ${JSON.stringify(err)}`);
     };
     if (topRoute == "pages/message/chat") {
       uni.redirectTo({ url: url, fail: failHandler });

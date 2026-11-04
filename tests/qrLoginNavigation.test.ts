@@ -84,3 +84,51 @@ it('登录二维码不能通过额外 kind 参数伪装成分享入口', () => {
     parseShareUrl(qrLoginAppUrl('scene-a', origin) + '&kind=file&sk=foo'),
   ).toBeNull();
 });
+
+it('M 站首屏分流在桌面模式下保留扫码确认及其登录返回，其它页面仍回 PC', () => {
+  const script = [
+    ...readFileSync('index.html', 'utf8').matchAll(
+      /<script>\s*([\s\S]*?)<\/script>/g,
+    ),
+  ].find((match) => match[1].includes('const isMobile'))![1];
+  function run(path: string, userAgent: string) {
+    const replace = vi.fn();
+    const url = new URL(origin + path);
+    const location = {
+      href: url.href,
+      protocol: url.protocol,
+      host: url.host,
+      hash: url.hash,
+      hostname: url.hostname,
+      port: url.port,
+      replace,
+    };
+    runInNewContext(script, {
+      window: { location },
+      location,
+      navigator: { userAgent },
+      URL,
+      URLSearchParams,
+    });
+    return replace;
+  }
+  const page = qrLoginPageUrl('scene-a', origin);
+  for (const ua of [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X)',
+    'iPhone Mobile',
+  ]) {
+    expect(run('/m/#' + page, ua)).not.toHaveBeenCalled();
+    for (const back of [page, '/m/#' + page]) {
+      expect(
+        run(
+          '/m/#/subpackages/pages/login/login?redirect=' +
+            encodeURIComponent(back),
+          ua,
+        ),
+      ).not.toHaveBeenCalled();
+    }
+  }
+  expect(run('/m/#/pages/message/message', 'Macintosh')).toHaveBeenCalledWith(
+    origin + '/',
+  );
+});

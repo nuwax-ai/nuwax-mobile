@@ -58,4 +58,11 @@ describe("与 PC 群号及双目标的边界", () => {
     expect(planImInvite("?convId=7#pane")).toMatchObject({ action: "detail", value: "7" });
     expect(planImInvite("?convId=7%23pane").action).toBe("invalid");
   });
+  it("PC 锚点元数据不参与业务参数判定", () => {
+    expect(planImInvite("?convId=9007199254740993&__imEntryHash=%23pane")).toMatchObject({
+      action: "detail", value: "9007199254740993",
+    });
+    expect(planImInvite("?convId=7%23pane&__imEntryHash=%23other").action).toBe("invalid");
+    expect(planImInvite("?__imEntryHash=%23pane").action).toBe("empty");
+  });
 });

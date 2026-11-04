@@ -67,6 +67,19 @@ describe("真实 IM 承接页脚本", () => {
     const p=setup({search:"?convId=invalid&spaceId=42"});p.load({});await settle();
     expect(p.state.value).toBe("invalid");for(const api of p.apis)expect(api).not.toHaveBeenCalled();
   });
+  it("PC 独立锚点元数据不污染会话 ID，登录回跳仍保留原编码",async()=>{
+    const search="?convId=9007199254740993&__imEntryHash=%23pane%3Fx%3D1%26y%3D2";
+    const p=setup({search});p.load({});await settle();
+    expect(p.detail).toHaveBeenCalledExactlyOnceWith("9007199254740993",route+search,true,true);
+    expect(p.redirect.mock.calls[0][0].url).toContain("convId=9007199254740993&convType=2");
+    p.detail.mockResolvedValue({code:"4010",data:null});await p.continueInvite();
+    expect(p.login).toHaveBeenCalledExactlyOnceWith("/subpackages/pages/login/login",route+search);
+  });
+  it("业务 ID 内编码的 # 仍无效，不把它当页面锚点截断",async()=>{
+    const p=setup({search:"?convId=9007199254740993%23pane&__imEntryHash=%23other"});p.load({});await settle();
+    expect(p.state.value).toBe("invalid");for(const api of p.apis)expect(api).not.toHaveBeenCalled();
+    expect(p.redirect).not.toHaveBeenCalled();expect(p.login).not.toHaveBeenCalled();
+  });
   it.each(["4010","4011","IM_10401","IM_10402"])("当前会话的%s 才清理旧登录并保留完整回跳",async code=>{
     const p=setup({search:"?convId=7&opaque=a%2525#pane",outer:"?tracking=keep%26value"});
     p.detail.mockResolvedValue({code,data:null,message:"/login?local=1&redirect=%2Fm%2F"});p.load({convId:"999"});await settle();

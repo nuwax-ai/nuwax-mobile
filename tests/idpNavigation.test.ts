@@ -35,6 +35,12 @@ describe('浏览器 Cookie 登录', () => {
     expect(authBrowserQuery('unknown')).toBeNull();
     expect(authBrowserQuery('redirect')).toBe('/pages/message/chat?name=a%20b');
   });
+  it('raw hash 片段不混入 query，编码片段仍属于参数值', () => {
+    window.location.hash = '#/subpackages/pages/im-invite/im-invite?convId=7#pane';
+    expect(authBrowserQuery('convId')).toBe('7');
+    window.location.hash = '#/subpackages/pages/im-invite/im-invite?convId=7%23pane';
+    expect(authBrowserQuery('convId')).toBe('7#pane');
+  });
   it('手动授权 push，自动授权 replace', () => {
     expect(beginBrowserIdp('5', '', false)).toBe(true);
     expect(assign).toHaveBeenCalledOnce();

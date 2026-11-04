@@ -970,17 +970,139 @@ export function mergeDirectoryLevelFiles(
   // #endif
 
   /**
-   * 取公共 Download 里该文件的落盘路径（按文件名回捞，含重名加缀），找不到返回 ""。
-   * 用途：im-file-detail 已下载但文件是别处下的（本页无 localPath）时直接打开；
-   * iOS 下载落私有 tmp 无公共目录可查，返回 ""（调用方回落重走下载）。
+   * 非 Android（iOS/鸿蒙）下载落盘目录：应用沙盒 USER_DATA_PATH 下 Download/。
+   * 鸿蒙/iOS USER_DATA_PATH 均为 unifile:// 虚拟路径（iOS 实测 `unifile://usr/`，带尾斜杠），
+   * 拼 Download 时避免再补斜杠成双斜杠。
    */
   // #ifdef APP
-  export function resolveDownloadedFilePath(filename: string): string {
+  // #ifndef APP-ANDROID
+  function sandboxDownloadDir(): string {
+    const base = uni.env.USER_DATA_PATH;
+    return base.endsWith('/') ? `${base}Download` : `${base}/Download`;
+  }
+
+  /** 沙盒落盘名清理：发端文件名可含文件系统非法字符（/ \ : * ? " < > |），替换为 _。 */
+  function sanitizeSandboxFileName(filename: string): string {
+    const trimmed = filename.trim();
+    let out = '';
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed.charAt(i);
+      if (ch == '/' || ch == '\\' || ch == ':' || ch == '*' || ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|') {
+        out += '_';
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 异步实查路径存在：iOS 上 *Sync 系（access/copyFile）失败只打 log 不抛异常、
+   * accessSync 对不存在文件恒判存在（2026-11-03 真机两轮实证：accessSync 内部打
+   * 1300002 失败日志但 UTS 侧不抛错，回捞/去重全被带偏），唯一可靠信号=异步 API 回调。
+   */
+  function sandboxPathExists(path: string): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      uni.getFileSystemManager().getFileInfo({
+        filePath: path,
+        success: (_res) => {
+          resolve(true);
+        },
+        fail: (_err) => {
+          resolve(false);
+        },
+      });
+    });
+  }
+
+  /**
+   * 非 Android（iOS/鸿蒙）：把下载临时文件以真实文件名拷入沙盒 Download 目录。
+   * downloadFile 临时文件名为 UUID+扩展名（用户反馈：预览顶部标题显示 70d2….docx），
+   * 直接 openDocument 标题即 UUID；拷贝改名后预览标题才是真实文件名。
+   * 重名加 " (n)" 缀（异步实查，上限 20 防极端堆积）；拷贝走异步回调并回验落盘，
+   * 任一步失败回落临时路径（与 copyToPublicDownload 失败口径一致，至少还能打开）。
+   */
+  async function copyToNamedSandbox(tempFilePath: string, filename: string): Promise<string> {
+    const safeName = sanitizeSandboxFileName(filename);
+    if (safeName.length == 0) {
+      return tempFilePath;
+    }
+    const fs = uni.getFileSystemManager();
+    const dir = sandboxDownloadDir();
+    // 幂等建目录：recursive 已存在不报错；不依赖 accessSync 判存在（iOS 恒判存在不可信）
+    try {
+      fs.mkdirSync(dir, true);
+    } catch (_eMkdir) {
+      // 已存在/权限等：拷贝回验兜底
+    }
+    const dotIdx = safeName.lastIndexOf('.');
+    const base = dotIdx > 0 ? safeName.substring(0, dotIdx) : safeName;
+    const ext = dotIdx > 0 ? safeName.substring(dotIdx) : '';
+    let target = `${dir}/${safeName}`;
+    for (let i = 1; i <= 20; i++) {
+      if (!(await sandboxPathExists(target))) {
+        break;
+      }
+      target = `${dir}/${base} (${i})${ext}`;
+    }
+    const copied = await new Promise<boolean>((resolve) => {
+      fs.copyFile({
+        srcPath: tempFilePath,
+        destPath: target,
+        success: (_res) => {
+          resolve(true);
+        },
+        fail: (_err) => {
+          resolve(false);
+        },
+      });
+    });
+    if (copied && (await sandboxPathExists(target))) {
+      return target;
+    }
+    // 拷贝失败/未落盘：回落临时路径（标题退化为 UUID，至少还能打开）
+    return tempFilePath;
+  }
+
+  /** 沙盒 Download 内按文件名回捞落盘路径（含重名加缀 "name (n).ext"，异步实查），找不到返回 ""。 */
+  async function findSandboxDownloadedPath(filename: string): Promise<string> {
+    const safeName = sanitizeSandboxFileName(filename);
+    if (safeName.length == 0) {
+      return "";
+    }
+    const dir = sandboxDownloadDir();
+    const direct = `${dir}/${safeName}`;
+    if (await sandboxPathExists(direct)) {
+      return direct;
+    }
+    const dotIdx = safeName.lastIndexOf('.');
+    const base = dotIdx > 0 ? safeName.substring(0, dotIdx) : safeName;
+    const ext = dotIdx > 0 ? safeName.substring(dotIdx) : '';
+    for (let i = 1; i <= 20; i++) {
+      const candidate = `${dir}/${base} (${i})${ext}`;
+      if (await sandboxPathExists(candidate)) {
+        return candidate;
+      }
+    }
+    return "";
+  }
+  // #endif
+  // #endif
+
+  /**
+   * 取该文件的落盘路径（按文件名回捞，含重名加缀），找不到返回 ""。
+   * Android：公共 Download（MediaStore/File 实查，同步）；iOS/鸿蒙：沙盒 Download
+   * （异步实查——iOS 上该目录文件会被系统清理，必须实查而非信注册表 flag）。
+   * 用途：im-file-detail 已下载但文件是别处下的（本页无 localPath）时直接打开；
+   * 找不到（旧 UUID 临时文件/沙盒文件被系统清理）返回 ""，调用方回落重走下载。
+   */
+  // #ifdef APP
+  export async function resolveDownloadedFilePath(filename: string): Promise<string> {
     // #ifdef APP-ANDROID
     return findDownloadedFilePath(filename);
     // #endif
     // #ifndef APP-ANDROID
-    return "";
+    return await findSandboxDownloadedPath(filename);
     // #endif
   }
   // #endif
@@ -1017,31 +1139,42 @@ export function mergeDirectoryLevelFiles(
         header: header,
         success: (res) => {
           if (res.statusCode === 200) {
-            let finalFilePath = res.tempFilePath;
+            // 下载成功汇合处理：打标 + 非静默弹窗 + resolve（iOS/鸿蒙拷贝为异步，抽出共用）
+            const finishDownloadSuccess = (finalFilePath: string): void => {
+              // 全 App 下载汇合点打标：IM 文件卡片「已下载」状态按文件名登记
+              // （本函数拿不到原始 url，注册表故以 fileName 为主键）
+              markImFileDownloaded(filename);
+              if (!silent) {
+                uni.hideLoading();
+                const modalParams = new Map<string, any>();
+                modalParams.set("fileName", filename);
+                modalParams.set("filePath", finalFilePath);
+                uni.showModal({
+                  title: t("Mobile.FileTree.downloadComplete"),
+                  content: t("Mobile.FileTree.zipSavedContentApp", toI18nParams(modalParams), ""),
+                  confirmText: t("Mobile.Common.open"),
+                  cancelText: t("Mobile.Common.cancel"),
+                  success: (modalRes) => {
+                    if (modalRes.confirm) {
+                      openDownloadedFile(finalFilePath);
+                    }
+                  },
+                });
+              }
+              resolve(finalFilePath);
+            };
             // #ifdef APP-ANDROID
-            finalFilePath = copyToPublicDownload(res.tempFilePath, filename);
+            finishDownloadSuccess(copyToPublicDownload(res.tempFilePath, filename));
             // #endif
-            // 全 App 下载汇合点打标：IM 文件卡片「已下载」状态按文件名登记
-            // （本函数拿不到原始 url，注册表故以 fileName 为主键）
-            markImFileDownloaded(filename);
-            if (!silent) {
-              uni.hideLoading();
-              const modalParams = new Map<string, any>();
-              modalParams.set("fileName", filename);
-              modalParams.set("filePath", finalFilePath);
-              uni.showModal({
-                title: t("Mobile.FileTree.downloadComplete"),
-                content: t("Mobile.FileTree.zipSavedContentApp", toI18nParams(modalParams), ""),
-                confirmText: t("Mobile.Common.open"),
-                cancelText: t("Mobile.Common.cancel"),
-                success: (modalRes) => {
-                  if (modalRes.confirm) {
-                    openDownloadedFile(finalFilePath);
-                  }
-                },
-              });
-            }
-            resolve(finalFilePath);
+            // #ifndef APP-ANDROID
+            // iOS/鸿蒙：临时文件名为 UUID，拷入沙盒 Download 改成真实文件名再打开（异步实查）
+            copyToNamedSandbox(res.tempFilePath, filename).then((namedPath: string): void => {
+              finishDownloadSuccess(namedPath);
+            }).catch((_eNamed: any | null): void => {
+              // 兜底回落临时路径，勿让 Promise 挂起（页面会卡在下载中）
+              finishDownloadSuccess(res.tempFilePath);
+            });
+            // #endif
           } else {
             uni.hideLoading();
             uni.showToast({

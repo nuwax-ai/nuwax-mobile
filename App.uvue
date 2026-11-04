@@ -14,7 +14,12 @@
   } from "@/utils/imUnreadBadge";
   import { bindImNoticeEvents, clearImNoticeState } from "@/utils/imNoticeBar";
   // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
-  import { bindImPushClient, syncImPushClientId } from "@/utils/im/imPushClient";
+  import {
+    bindImPushClientIfLoggedIn,
+    scheduleImPushAfterLogin,
+    // 回前台校正推送注册（Android 实作；系统通知权限「关 → 开」后个推通道失效）
+    syncImPushOnForeground,
+  } from "@/utils/im/imPushClient";
   // #endif
   import {
     initImWsClient,
@@ -34,6 +39,7 @@
   import { ACCESS_TOKEN } from "@/constants/home.constants";
   import { notifyStreamAppForeground } from "@/utils/streamRequest.uts";
   import { clearLoginCheckPending } from "@/utils/profileSetupGate";
+  import { primeSafeAreaBottom } from "@/utils/safeAreaBottom.uts";
   // #ifdef H5 || WEB
   import { bootstrapH5AccessTokenFromUrl } from "@/utils/authSession";
   import { isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
@@ -119,6 +125,23 @@
   // 冷启动一律清「待做新用户引导判定」标记：只有登录页真实调登录接口（saveAccessToken
   // 写新 token）才重新置位——保证杀 App 重开（持久登录态）不再弹引导（utils/profileSetupGate.uts）
   clearLoginCheckPending();
+  // 底部安全区预热（见 utils/safeAreaBottom.uts）：鸿蒙页面 setup 阶段两种口径都可能
+  // 取不到底部 insets，页面首帧会按 0 垫底、下一拍才校正。启动后取到的第一个真值先记下来，
+  // 后续页面 setup 期直接命中；首帧可能仍未就绪，补两拍重试。
+  // 整体 try：onLaunch 里任何同步异常都会截断后续初始化（见下方 WS 注释）。
+  try {
+    primeSafeAreaBottom();
+  } catch (_eSafeBottomLaunch) {}
+  setTimeout((): void => {
+    try {
+      primeSafeAreaBottom();
+    } catch (_eSafeBottomTick) {}
+  }, 0);
+  setTimeout((): void => {
+    try {
+      primeSafeAreaBottom();
+    } catch (_eSafeBottomLate) {}
+  }, 600);
   // #ifdef H5 || WEB
   // 常驻壳把纯 token 放在 hash query 的 accessToken 上；请求前写入 storage 并标记内嵌，才能带 Bearer。
   bootstrapH5AccessTokenFromUrl();
@@ -144,9 +167,12 @@
   });
   eventBus.on(IM_SESSION_READY, (_event: any) => {
     initImWsClient();
-    // ★通知权限申请已移到首启协议弹窗的「同意」按钮（pages/launch/launch.uvue onAgree）：
-    //   实测鸿蒙的系统通知弹窗由 uni-push SDK 在启动时自己弹（比 JS 更早），
-    //   登录后再弹一次纯属打扰；Android 13+ 则在协议同意后那一次调用里弹。
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+    // ★推送 SDK 初始化 + 通知权限申请都在登录成功后（延迟两拍执行，见
+    //   imPushClient.scheduleImPushAfterLogin）：应用市场审核要求「同意隐私政策前
+    //   不得初始化第三方 SDK / 申请权限」，首次安装未登录期间这两件事都不做。
+    scheduleImPushAfterLogin();
+    // #endif
   });
   initImWsClient();
   // tabBar 未读角标接 WS 帧（新消息/其他端已读同步 → 1s 去抖全量拉；回前台 onShow 再拉一次兜断线窗口）
@@ -154,11 +180,13 @@
   // 新消息顶部横幅（非消息 tab 页弹提示；预拉 myUserId 与会话缓存，未登录静默失败）
   bindImNoticeEvents();
   // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
-  // uni-push 2.0 离线推送：绑定点击监听 + 取 cid（失败静默：标准基座/未开通/未授权
-  // 都不影响启动；cid 上报走 CONNECT_ACK 的设备注册与变化时的兜底重报）。
-  // ★通知授权不在这里申请：移到首启协议弹窗点「同意」后（pages/launch/launch.uvue）
-  bindImPushClient();
-  syncImPushClientId();
+  // ★uni-push 2.0 离线推送（2026-11-04 合规调整）：
+  //   onPushMessage / getPushClientId 一旦调用就会初始化个推 SDK、采集 cid 并发网络请求，
+  //   而 onLaunch 早于用户同意隐私政策（登录页勾选框），是应用市场自动审核的直接命中项。
+  //   ⇒ 未登录（含首次安装）这里什么都不做；已登录冷启动只补绑点击监听，
+  //     取 cid / 申请通知权限都等登录态成立后由 scheduleImPushAfterLogin 延迟执行
+  //     （见 IM_SESSION_READY、pages/launch/launch.uvue）。
+  bindImPushClientIfLoggedIn();
   // #endif
   // 监听 IM 鉴权失效（CONNECT_REJECT 非重试 / KICK.stopReconnect=true）
   // useRequest.uts:248 已 redirectToLoginOnce，这里只需关 WS 防止 4010 循环重连
@@ -289,6 +317,10 @@
     onShow: function (options : OnShowOptions) {
       console.log("App Show");
       setAppInBackground(false);
+      // 回前台（含冷启动第一个 onShow）再刷一次底部安全区缓存：此时窗口 insets 必已就绪
+      try {
+        primeSafeAreaBottom();
+      } catch (_eSafeBottomShow) {}
       // #ifdef APP
       // 冷启动交给 pages/launch。协议字符串在 appScheme，不在页面 path。
       const scheme = options.appScheme != null ? options.appScheme : "";
@@ -317,6 +349,12 @@
       refreshImUnreadBadge();
       // IM WS：恢复心跳 + 强制重连（OS 后台期间 socket 状态不可信）
       reconnectImWsOnForeground();
+      // #ifdef APP-ANDROID
+      // 回前台校正离线推送注册：系统设置里关掉「允许通知」再打开后，个推/厂商通道的
+      // 注册已被系统注销，进程在后台存活时 SDK 不会自己恢复 → 表现为「权限开着却收不到」。
+      // 这里重新取 cid（权限恢复时强制重报设备），见 imPushClient.syncImPushOnForeground。
+      syncImPushOnForeground();
+      // #endif
     },
     onHide: function () {
       console.log("App Hide");

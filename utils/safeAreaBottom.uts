@@ -1,0 +1,88 @@
+/**
+ * 底部安全区（iOS home indicator / Android 手势条 / 鸿蒙导航条）读数 + 缓存。
+ *
+ * 为什么单独成模块：App.uvue 启动期要预热缓存，而 utils/system.uts 还牵着一串依赖
+ * （authProtectedFileUrl / workCommercial 等，含既有循环引用），不该被拉进 onLaunch 路径。
+ * 页面侧仍从 utils/system 取 getSafeAreaBottom（那边是薄包装），调用方无需改动。
+ *
+ * 缓存分两层：
+ *  ①模块变量（启动后任一拍取到真值即写入，同一次运行内所有页面共享）；
+ *  ②storage（跨启动兜底：个别鸿蒙机型在页面 setup 阶段两种口径都返回 0，只有页面
+ *    呈现之后才读得到真值 —— 那一次的真值落盘后，下次进页面 setup 直接命中）。
+ */
+
+const SAFE_BOTTOM_STORAGE_KEY = "NUWAX_SAFE_BOTTOM_PX";
+
+/** 底部安全区实测值（0 = 这一拍取不到，也可能是真的 0）。 */
+const readSafeBottomLive = (): number => {
+  // #ifdef APP-HARMONY
+  // 鸿蒙口径：页面 setup 阶段 getSystemInfoSync().safeAreaInsets.bottom 恒为 0，真值要等
+  // onReady 才读到（真机实测 25）。getWindowInfo 与主 Tab 同一口径（见 utils/mainTabSafeArea.uts），
+  // 多数机型 setup 期就有值，个别机型首帧同样为 0 —— 所以还要靠下面的缓存兜住。
+  const winInsets = uni.getWindowInfo().safeAreaInsets;
+  if (winInsets != null && winInsets.bottom > 0) {
+    return winInsets.bottom;
+  }
+  // #endif
+  const info = uni.getSystemInfoSync();
+  const safeBottom = info.safeAreaInsets?.bottom;
+  if (safeBottom != null && safeBottom > 0) {
+    return safeBottom;
+  }
+  return 0;
+};
+
+/**
+ * 「已取到的真值」缓存（-2 = 还没从 storage 水合，-1 = 从未取到）。
+ *
+ * 只记 >0 的值：真 0（无手势条 / 隐藏手势条）每次按实测返回，不会被缓存污染。
+ */
+let safeBottomCached: number = -2;
+
+/** 懒水合 storage（不在模块初始化期读，避免 uni 未就绪 / iOS 缺 key 抛异常）。 */
+const ensureSafeBottomHydrated = (): void => {
+  if (safeBottomCached != -2) return;
+  safeBottomCached = -1;
+  try {
+    const raw = uni.getStorageSync(SAFE_BOTTOM_STORAGE_KEY);
+    if (raw != null) {
+      const n = parseInt(`${raw}`);
+      if (n > 0) {
+        safeBottomCached = n;
+      }
+    }
+  } catch (_eHydrate) {
+    // 无缓存/平台缺 key 抛异常（iOS getStorageSync 缺 key 已知坑）：按未取到处理
+  }
+};
+
+/** 记下真值：模块变量 + 落盘（值没变不重复写）。 */
+const rememberSafeBottom = (value: number): void => {
+  if (value <= 0) return;
+  if (safeBottomCached == value) return;
+  safeBottomCached = value;
+  try {
+    uni.setStorageSync(SAFE_BOTTOM_STORAGE_KEY, value);
+  } catch (_ePersist) {
+    // 落盘失败不影响本次运行（模块变量已生效）
+  }
+};
+
+/** App 启动 / 回前台时刷新缓存（App.uvue onLaunch + onShow 调用；取不到就保持旧值）。 */
+export const primeSafeAreaBottom = (): void => {
+  ensureSafeBottomHydrated();
+  rememberSafeBottom(readSafeBottomLive());
+};
+
+/** 底部安全区高度；普通屏为 0。 */
+export const getSafeAreaBottom = (): number => {
+  ensureSafeBottomHydrated();
+  const live = readSafeBottomLive();
+  if (live > 0) {
+    // 顺手刷新缓存：任何一次取到真值的调用都能让后续页面受益（含下次启动）
+    rememberSafeBottom(live);
+    return live;
+  }
+  // 这一拍取不到：用已记下的真值（启动后 / 上次运行），没有就按 0
+  return safeBottomCached > 0 ? safeBottomCached : 0;
+};

@@ -237,13 +237,17 @@ export function bindImPushClient(): void {
  * ★不要放回 App.onLaunch：getPushClientId 会初始化个推 SDK（且是鸿蒙启动弹通知窗的
  *   真正来源），属于「同意前初始化第三方 SDK / 取设备标识」。
  * ★这里**不**申请通知权限：申请由 requestImNotifyPermission 单独负责（同在登录后）。
+ *
+ * @param forceReport true = 即使 cid 与缓存相同也重报一次设备注册。
+ *   ★系统通知权限「关 → 开」后必须这么做：cid 可能不变，但该 cid 在系统侧的通道
+ *     曾被注销，后端需要重新拿一次有效注册（见 syncImPushOnForeground）。
  */
-export function syncImPushClientId(): void {
+export function syncImPushClientId(forceReport: boolean = false): void {
   // ★ 云打包开关：同 bindImPushClient。
   try {
     uni.getPushClientId({
       success: (res: GetPushClientIdSuccess): void => {
-        applyPushCid(res.cid);
+        applyPushCid(res.cid, forceReport);
       },
       fail: (err: UniError): void => {
         // 常见原因：基座未含 uni-push 模块 / uni-push 未开通 / 厂商通道未配置 / 通知未授权
@@ -649,8 +653,11 @@ export function requestImNotifyPermission(): void {
   // #endif
 }
 
-/** cid 落地：变化才重报；未登录跳过（CONNECT_ACK 设备注册会带上缓存的 cid）。 */
-function applyPushCid(cid: string): void {
+/**
+ * cid 落地：变化才重报；未登录跳过（CONNECT_ACK 设备注册会带上缓存的 cid）。
+ * @param forceReport 见 syncImPushClientId：权限恢复后即使 cid 未变也要重报一次。
+ */
+function applyPushCid(cid: string, forceReport: boolean = false): void {
   if (cid.length == 0) {
     return;
   }
@@ -661,7 +668,7 @@ function applyPushCid(cid: string): void {
   } catch (_e) {
     // 落盘失败仅影响下次冷启动提前带 cid，不影响本次上报
   }
-  if (cid == previous) {
+  if (cid == previous && !forceReport) {
     return;
   }
   // 未登录时不上报：登录后的 CONNECT_ACK 设备注册会带上缓存 cid。
@@ -858,5 +865,72 @@ function openConvWithRetry(
     }
     uni.navigateTo({ url: url, fail: failHandler });
   }, attempt == 0 ? PUSH_CLICK_NAV_DELAY_MS : 300);
+}
+
+// #ifdef APP-ANDROID
+/** 上一次观察到的系统通知权限状态（仅内存，用于识别「关 → 开」边沿）。 */
+let lastNotifyPermissionState = "";
+/** 上次回前台校正的时刻（节流用：频繁切前后台不必每次重复 UPSERT 设备）。 */
+let lastForegroundPushSyncAt = 0;
+const FOREGROUND_PUSH_SYNC_MIN_INTERVAL_MS = 5000;
+
+/**
+ * 回前台重报：节流（「权限恢复」边沿免节流），然后重新取 cid 并强制上报。
+ * ★forceReport=true：cid 未变也要重报，恢复后端可能已置 status=2 的设备行。
+ */
+function foregroundResyncPush(ignoreThrottle: boolean): void {
+  const now = Date.now();
+  if (!ignoreThrottle && lastForegroundPushSyncAt > 0
+    && now - lastForegroundPushSyncAt < FOREGROUND_PUSH_SYNC_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastForegroundPushSyncAt = now;
+  bindImPushClient();
+  syncImPushClientId(true);
+}
+// #endif
+
+/**
+ * App 回到前台时校正推送注册（App.uvue onShow 调）。
+ *
+ * ★2026-11-04 真机问题（Android）：系统设置里「允许通知」关掉再打开后，App 退后台收不到
+ *   离线推送（iOS / 鸿蒙正常）。根因在端上：通知权限被撤销时系统/个推会把本设备的推送
+ *   注册注销（厂商通道 token 失效），而进程一直在后台存活，个推 SDK 不会自己重新注册
+ *   （uni-push 也没有暴露「重新注册」API）；端上又只有缓存里的旧 cid，之后每次
+ *   CONNECT_ACK 的设备注册都把旧 cid 继续报给后端 → 投递到失效通道被静默丢弃。
+ *   ⇒ 回前台时重新调 getPushClientId（让 SDK 重新初始化/注册厂商通道），
+ *     并**强制重报一次设备注册**（cid 可能不变也必须报，理由见下）。
+ *
+ * ★为什么 cid 未变也要重报：后端离线推送遇到通道返回 404/410 会把该设备
+ *   {@code status} 置 2（不再选为推送目标），只有重新注册（UPSERT 冲突时 reset status=1）
+ *   才能恢复；而旧实现里 cid 未变就走早退，永远不发这个请求
+ *   ⇒ 通知权限重新打开后仍然「设备在、但永远不会被选中」= 用户看到的现象。
+ *
+ * ★iOS / 鸿蒙：关闭通知不会注销设备通道，本函数为空实现；iOS 的 onPushMessage 回调还是
+ *   一次性的（见 registerPushListener），更不宜回前台反复初始化。
+ * ★必须在登录态成立后执行（合规：未登录/首装不初始化个推 SDK）。
+ * ★权限状态只用于识别「关 → 开」边沿（免节流），不作为是否重报的判据。
+ */
+export function syncImPushOnForeground(): void {
+  // #ifdef APP-ANDROID
+  if (!isLoggedIn()) {
+    return;
+  }
+  getImNotifyPermissionState()
+    .then((state: string): void => {
+      const previous = lastNotifyPermissionState;
+      lastNotifyPermissionState = state;
+      // ★不以权限状态短路（2026-11-04 二次修正）：华为/荣耀（SDK<33 反移植）等机型的
+      //   状态读取不一定准，一旦读成 denied/unknown 就 return，整条恢复路径会被悄悄堵死。
+      //   而且权限真关着时重报也无副作用：后端推了系统照样丢弃，权限一开就立刻恢复。
+      const regained = previous == IM_NOTIFY_PERMISSION_DENIED
+        || previous == IM_NOTIFY_PERMISSION_UNDETERMINED;
+      foregroundResyncPush(regained);
+    })
+    .catch((_e: any | null): void => {
+      // 权限状态读失败同样不能堵死恢复路径：照常节流后重报一次
+      foregroundResyncPush(false);
+    });
+  // #endif
 }
 // #endif

@@ -1,7 +1,7 @@
 // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
 import { ACCESS_TOKEN } from "@/constants/home.constants";
-import { apiImDeviceRegister, imDevicePlatform } from "@/servers/im";
-import { apiResCode, apiResMessage } from "@/utils/apiResponse";
+import { apiImDeviceRegister } from "@/servers/im";
+import { isAppInBackground } from "@/utils/appLifecycle.uts";
 import { NOTIFY_PERMISSION_ASKED_KEY } from "@/utils/installScopedStorage";
 // #ifdef APP-HARMONY
 // ★勿改成 @kit.NotificationKit 具名导入：基座 JS 运行时模块表不提供 notificationManager
@@ -22,10 +22,19 @@ import Build from "android.os.Build";
  * - 离线发送：后端取设备 pushToken(cid) 调 uniCloud 云函数 push-send，由 DCloud 转厂商通道
  *   （后端不接触华为服务账号密钥）
  * - 点击通知：onPushMessage(type=click) → 按 payload.convId/convType 打开会话
- * - 通知授权：**首启协议弹窗点「同意」后**申请一次（requestImNotifyPermission）。
- *   ★鸿蒙首启的系统通知弹窗由 uni-push SDK 自己弹（比 JS 更早，端上拦不住），
- *     所以鸿蒙这次调用通常只会探测到「已授权」；Android 13+ 才是真正弹窗的时机。
- *   ★2026-10-30 起不再在登录成功后弹（产品要求对齐主流 App：首启一次问完）。
+ * - 初始化与授权时机：**登录成功之后**（scheduleImPushAfterLogin）。见下。
+ *
+ * ★2026-11-04 合规调整（应用市场自动审核被拒）：uni-push 官方要求
+ *   「弹出隐私框之前不得调用 getPushClientId / onPushMessage」——调用即初始化个推 SDK。
+ *   本文件原先由 App.onLaunch 无条件调用这两个 API，发生在协议弹窗之前，属于
+ *   「同意前初始化第三方 SDK / 取设备标识 / 发网络请求」，是审核的主要命中项。
+ *   现在改为：
+ *     - App.onLaunch 只绑 WS/横幅事件，**不碰 uni-push**；
+ *     - 登录成功（IM_SESSION_READY）或已登录冷启动（launch 页分流）后，
+ *       经 scheduleImPushAfterLogin 延迟初始化：先取 cid，再申请通知权限。
+ *   ⇒ 首次安装、未登录期间没有任何推送 SDK 初始化、权限申请与 cid 上报。
+ *   ⇒ 鸿蒙「启动就弹通知窗」随之消失——它本来就由我们自己提前调 getPushClientId 触发，
+ *     旧注释里「SDK 自己弹、端上拦不住」的结论已更正。
  *
  * 平台范围：Android / iOS / 鸿蒙（manifest 三端均已勾 uni-push 模块）。未勾模块的平台
  * 调用会失败，故整文件条件编译，调用点同样条件编译。
@@ -46,38 +55,10 @@ const LAUNCH_PAGE_ROUTE = "pages/launch/launch";
 const LOGIN_PAGE_ROUTE = "subpackages/pages/login/login";
 
 /**
- * 调试日志开关：**默认关闭**（这批日志含完整 cid）。排查推送问题时临时改 true，
- * 复现完改回 false 再提交。真机 Logcat 关键字 `[ImPush]`。
- * ★必须用 console.error 而不是 console.log：鸿蒙真机看不到 log/warn，只有 error 能进日志。
- * 注：真正的失败（取 cid 失败、权限被拒）走独立的 console.error，不受本开关影响。
- */
-const IM_PUSH_DEBUG = false;
-
-/** 联调探针（受 IM_PUSH_DEBUG 控制）。 */
-function pushLog(msg: string): void {
-  if (IM_PUSH_DEBUG) {
-    console.error(`[ImPush] ${msg}`);
-  }
-}
-
-/** payload 打印用（UTSJSONObject 序列化失败也不能炸链路）。 */
-function pushPayloadText(payload: any | null): string {
-  if (payload == null) {
-    return "(null)";
-  }
-  try {
-    return `${JSON.stringify(payload)}`;
-  } catch (_e) {
-    return "(unserializable)";
-  }
-}
-
-/**
  * 本次进程启动后是否收到过「通知点击」（含冷启动由推送唤起）。
  *
- * 用途：首启协议卡片只该在「安装/升级后自己打开 App」时出现。用户点通知进来时
- * 显然不是首启用户，协议卡片若盖在上面，还要等推送跳转把它顶掉，观感很差。
- * 见 pages/launch/launch.uvue。
+ * 历史用途是「点通知进来时不弹首启协议卡片」，协议闸门已于 2026-11-04 移除，
+ * 现在仅作为排查状态保留（日志/后续深链分流可用），不再影响任何 UI。
  */
 let pushClickReceived = false;
 
@@ -108,8 +89,43 @@ export function getImPushCid(): string {
 }
 
 /**
- * 绑定推送消息监听（App.uvue onLaunch 调，幂等）。
- * receive 不处理：前台由 WS 消息链路负责，后台进程被系统挂起，离线触达由系统通知栏展示。
+ * iOS 后台在线透传兜底：把 receive 到的消息补成一条本地通知。
+ *
+ * ★2026-11-04 真机实证：manifest 里 app-ios.distribute.UIBackgroundModes=["audio"]，
+ *   App 退后台后进程仍存活、个推长连接不断 ⇒ 服务端判定「在线」，推送以在线透传方式
+ *   直接回调到 JS（日志 `[ImPush] onPushMessage type=receive`），iOS **不会**为在线
+ *   透传消息弹通知栏，用户因此「退后台收不到通知条」（同一时刻 Android 正常，
+ *   走的是厂商通道通知栏）。
+ *   进程被系统挂起/杀掉后才走 APNs 离线通道，那条由系统自己展示，不需要这里补。
+ *   ⇒ 只在 iOS + App 在后台时补；前台 App 内已有 WS 消息与页内提示，再弹是重复打扰。
+ *   （uni.createPushMessage 自 HBuilderX 4.18 起支持 iOS。）
+ */
+function showLocalNoticeForReceive(data: UTSJSONObject | null): void {
+  if (data == null || !isAppInBackground()) {
+    return;
+  }
+  const content = pushPayloadField(data, "content");
+  if (content.length == 0) {
+    return;
+  }
+  try {
+    uni.createPushMessage({
+      title: pushPayloadField(data, "title"),
+      content: content,
+      payload: data,
+      sound: "system",
+    });
+  } catch (e) {
+    console.error("[ImPush] createPushMessage fail:", e);
+  }
+}
+
+/**
+ * 绑定推送消息监听（登录后由 scheduleImPushAfterLogin 调；已登录冷启动还会经
+ * bindImPushClientIfLoggedIn 在 onLaunch 提前绑一次，保证点通知进来的 click 不丢。幂等。）
+ * ★不要无条件放回 App.onLaunch：onPushMessage 会初始化个推 SDK，属于「同意前初始化第三方 SDK」。
+ * receive 前台不处理（WS 链路负责）；iOS 退后台时进程可能仍存活，需本地通知兜底，
+ * 见 showLocalNoticeForReceive。
  */
 export function bindImPushClient(): void {
   if (pushBound) {
@@ -121,14 +137,11 @@ export function bindImPushClient(): void {
   //   并从 manifest 移除 uni-push 模块即可（本地自定义基座不受影响）。
   try {
     uni.onPushMessage((res: OnPushMessageCallbackResult): void => {
-      // ★联调关键点：receive 事件证明「推送真的到达了本机」（厂商通道/通知授权都通了），
-      //   只是前台不处理——排查"收不到"时先看有没有这一行，没有就是还没到设备。
-      //   注意离线（进程被杀）时 App 里没有代码在跑，这条日志不会出现，只能看系统通知栏。
-      if (IM_PUSH_DEBUG) {
-        // 门控放在字符串拼接外层：开关关闭时不做 JSON 序列化
-        pushLog(`onPushMessage type=${res.type} data=${pushPayloadText(res.data)}`);
-      }
       if (res.type != "click") {
+        // #ifdef APP-IOS
+        // 退后台仍存活时收到的是在线透传，系统不弹通知栏 → 本地通知补一条。
+        showLocalNoticeForReceive(res.data);
+        // #endif
         return;
       }
       pushClickReceived = true;
@@ -139,7 +152,6 @@ export function bindImPushClient(): void {
       const convId = pushPayloadField(data, "convId");
       if (convId.length == 0) {
         // 无会话参数的推送（如系统公告）交给默认行为：仅拉起 App
-        pushLog("click without convId → app only");
         return;
       }
       openConvWithRetry(
@@ -150,24 +162,22 @@ export function bindImPushClient(): void {
         0,
       );
     });
-    pushLog("onPushMessage bound");
   } catch (e) {
     console.error("[ImPush] onPushMessage bind fail:", e);
   }
 }
 
 /**
- * 取 cid 并上报（App.uvue onLaunch 调；fail 只落日志，不重试不弹窗）。
- * ★这里**不**申请通知权限：取 cid 不需要授权，而权限弹窗要等首启协议点「同意」后
- *   （见 requestImNotifyPermission）——启动页还没弹协议就问通知会被用户当骚扰。
+ * 取 cid 并上报（登录后由 scheduleImPushAfterLogin 调；fail 只落日志，不重试不弹窗）。
+ * ★不要放回 App.onLaunch：getPushClientId 会初始化个推 SDK（且是鸿蒙启动弹通知窗的
+ *   真正来源），属于「同意前初始化第三方 SDK / 取设备标识」。
+ * ★这里**不**申请通知权限：申请由 requestImNotifyPermission 单独负责（同在登录后）。
  */
 export function syncImPushClientId(): void {
   // ★ 云打包开关：同 bindImPushClient。
-  pushLog(`sync start platform=${imDevicePlatform()} storageCid=${getImPushCid()}`);
   try {
     uni.getPushClientId({
       success: (res: GetPushClientIdSuccess): void => {
-        pushLog(`getPushClientId ok cid=${res.cid}`);
         applyPushCid(res.cid);
       },
       fail: (err: UniError): void => {
@@ -181,10 +191,50 @@ export function syncImPushClientId(): void {
 }
 
 /**
+ * 确保拿到推送 cid：已有缓存立即返回，否则触发一次 getPushClientId 并轮询等待。
+ * ★用于「用户打开推送开关」时：servers/im.uts 的 registerImDeviceNow 在 cid 为空时
+ *   会把 pushEnabled 强制置为 false，即使用户刚打开开关——服务端因此继续按「关闭」
+ *   过滤本设备的离线推送。所以开启前必须先确保 cid 就绪（拿不到则调用方回弹并提示）。
+ */
+export function ensureImPushCid(timeoutMs: number = 3000): Promise<string> {
+  const existing = getImPushCid();
+  if (existing.length > 0) {
+    return Promise.resolve(existing);
+  }
+  return new Promise<string>((resolve) => {
+    syncImPushClientId();
+    let waited = 0;
+    // ★必须 let 先声明再赋值：`const timer = setInterval(() => clearInterval(timer))`
+    //   会让回调里看不到 timer（UTS error18 / Kotlin 找不到名称）。
+    let timer = 0;
+    timer = setInterval((): void => {
+      waited += 250;
+      const cid = getImPushCid();
+      if (cid.length > 0) {
+        clearInterval(timer);
+        resolve(cid);
+        return;
+      }
+      if (waited >= timeoutMs) {
+        clearInterval(timer);
+        console.error(`[ImPush] ensureImPushCid timeout after ${waited}ms`);
+        resolve("");
+      }
+    }, 250);
+  });
+}
+
+/**
  * 通知授权「已问过」的持久化标记（跨启动生效）。
  * 系统给的机会本来就少（Android 13+ 最多两次、iOS/鸿蒙一次），
  * 加上产品要求「不是每次登录都弹」，所以整个安装周期只真正申请一次。
  * ★键名定义在 utils/installScopedStorage.uts：退出登录的缓存清理会保留它。
+ *
+ * ★标记时机（2026-11-04）：asked 只在**拿到系统响应后**落，不再「先落再弹」。
+ *   旧实现会把技术性失败（Activity 未就绪、API 抛异常）也算成「已问过」，
+ *   永久吃掉用户本来还有的机会。现在：
+ *     - 技术性失败 → asked 不落，下次登录可再试（当次防重入靠 notifyAskInFlight）；
+ *     - 系统真的弹了（用户允许或拒绝）→ 落 asked，本安装周期不再问。
  */
 function notifyAskedBefore(): boolean {
   try {
@@ -204,31 +254,225 @@ function markNotifyAsked(): void {
   }
 }
 
+/**
+ * 授权申请在途标记（仅内存）：防同一次登录里 init 与权限申请两拍重复发起。
+ * ★不落盘：进程被杀时系统弹窗也已消失，下次启动重来才是正确的。
+ */
+let notifyAskInFlight = false;
+
+/**
+ * 系统通知权限状态（getImNotifyPermissionState 的返回值）。
+ * ★用字符串常量而不是字面量联合类型：联合类型跨端（iOS/Android/鸿蒙）支持不一致，
+ *   页面侧也比较常量更好读、不会写错拼写。
+ */
+export const IM_NOTIFY_PERMISSION_GRANTED = "granted";
+export const IM_NOTIFY_PERMISSION_DENIED = "denied";
+export const IM_NOTIFY_PERMISSION_UNDETERMINED = "undetermined";
+export const IM_NOTIFY_PERMISSION_UNKNOWN = "unknown";
+
+// #ifdef APP-ANDROID
+/**
+ * 系统是否把「通知」当作可授权权限管理（决定要不要查状态 / 发起申请）。
+ *
+ * 基线规则是 Android 13+（API 33）才有 POST_NOTIFICATIONS，12 及以下通知默认开启。
+ * ★但华为 HarmonyOS 4.x / EMUI 在 Android 12 基线上**反移植**了这条权限：
+ *   2026-11-04 在 ELS-AN00（HarmonyOS 4.2.0，SDK 31）实测
+ *     - `dumpsys package` 里 `POST_NOTIFICATIONS: granted=false`（真实生效）
+ *     - logcat `PackageParsing: com.nuwax.app: compat added android.permission.POST_NOTIFICATIONS`
+ *   若只按 `SDK_INT < 33` 短路成「已授权」，设置页会恒显示「已开启」，
+ *   实际没授权时用户永远看不到「去设置」入口。
+ * ⇒ SDK < 33 时按厂商判：华为/荣耀按真实状态走，其余（真 Android 12 及以下）维持「默认开启」。
+ *   更通用的做法是探测 PackageManager.getPermissionInfo 是否抛 NameNotFoundException，
+ *   项目暂无先例（有 UTS→Kotlin 编译风险），先用厂商判断兜住实际场景。
+ */
+function androidNotifyPermissionAvailable(): boolean {
+  if (Build.VERSION.SDK_INT >= 33) {
+    return true;
+  }
+  const manufacturer = `${Build.MANUFACTURER}`.toLowerCase();
+  const brand = `${Build.BRAND}`.toLowerCase();
+  return manufacturer.indexOf("huawei") >= 0 || brand.indexOf("huawei") >= 0 ||
+    manufacturer.indexOf("honor") >= 0 || brand.indexOf("honor") >= 0;
+}
+
+/**
+ * Android 通知权限状态。
+ * ★Android 没有 iOS 的 "not determined"：未授权时系统层面无法区分「从未问过」与
+ *   「问过且被永久拒绝」（项目未用 shouldShowRequestPermissionRationale），
+ *   只能靠我们自己的 asked 标记补齐：
+ *     asked=false ⇒ undetermined（系统窗还能弹）
+ *     asked=true  ⇒ denied（系统窗不会再出现，只能引导去系统设置）
+ * ★系统不把通知当权限管理的机型（真 Android 12 及以下）⇒ 按 granted 处理。
+ *   这些机型上用户在系统设置里手动关掉通知的情形此接口查不到，属已知局限。
+ */
+function androidNotifyPermissionState(): string {
+  try {
+    if (!androidNotifyPermissionAvailable()) {
+      return IM_NOTIFY_PERMISSION_GRANTED;
+    }
+    const activity = UTSAndroid.getUniActivity();
+    if (activity == null) {
+      return IM_NOTIFY_PERMISSION_UNKNOWN;
+    }
+    const permissions = ["android.permission.POST_NOTIFICATIONS"] as string[];
+    if (UTSAndroid.checkSystemPermissionGranted(activity, permissions)) {
+      return IM_NOTIFY_PERMISSION_GRANTED;
+    }
+    return notifyAskedBefore() ? IM_NOTIFY_PERMISSION_DENIED : IM_NOTIFY_PERMISSION_UNDETERMINED;
+  } catch (_e) {
+    return IM_NOTIFY_PERMISSION_UNKNOWN;
+  }
+}
+// #endif
+
+// #ifdef APP-IOS
+/**
+ * iOS 通知权限状态：notificationAuthorized 本身就是三态字符串
+ * （authorized / denied / not determined），不需要额外标记。
+ */
+function iosNotifyPermissionState(): string {
+  try {
+    const raw = `${uni.getAppAuthorizeSetting().notificationAuthorized}`;
+    if (raw == "authorized") {
+      return IM_NOTIFY_PERMISSION_GRANTED;
+    }
+    if (raw == "denied") {
+      return IM_NOTIFY_PERMISSION_DENIED;
+    }
+    if (raw == "not determined") {
+      return IM_NOTIFY_PERMISSION_UNDETERMINED;
+    }
+    // "config error"：info.plist 缺少描述等配置问题，无法判断
+    return IM_NOTIFY_PERMISSION_UNKNOWN;
+  } catch (_e) {
+    return IM_NOTIFY_PERMISSION_UNKNOWN;
+  }
+}
+// #endif
+
+// #ifdef APP-HARMONY
+/**
+ * 鸿蒙通知状态：isNotificationEnabled 只回答「现在能不能发通知」，不回答「问没问过」，
+ * 未开启时同样用 asked 标记区分「还没问过」与「问过被拒」。
+ * ★读状态失败（技术性问题）返回 UNKNOWN，不落任何标记。
+ */
+function harmonyNotifyPermissionState(): Promise<string> {
+  return new Promise<string>((resolve) => {
+    try {
+      notificationManager
+        .isNotificationEnabled()
+        .then((enabled: boolean): void => {
+          if (enabled) {
+            resolve(IM_NOTIFY_PERMISSION_GRANTED);
+            return;
+          }
+          resolve(notifyAskedBefore() ? IM_NOTIFY_PERMISSION_DENIED : IM_NOTIFY_PERMISSION_UNDETERMINED);
+        })
+        .catch((_e: any | null): void => {
+          resolve(IM_NOTIFY_PERMISSION_UNKNOWN);
+        });
+    } catch (_e) {
+      resolve(IM_NOTIFY_PERMISSION_UNKNOWN);
+    }
+  });
+}
+// #endif
+
+/**
+ * 查询系统层通知权限状态（设置页「系统通知权限」行用），返回 IM_NOTIFY_PERMISSION_* 之一。
+ *
+ * ★与业务开关（readImPushEnabled）是**两件事**，不要混用：
+ *   - 权限状态：系统允许不允许这台设备展示通知（用户在系统设置里控）；
+ *   - 业务开关：我们要不要给这台设备下发离线推送（用户在账号管理里控）。
+ *   系统权限关掉时业务开关仍可能是开着的（表现为「开关绿了但收不到」），
+ *   所以设置页要分别展示，并在开关打开时联动引导。
+ *
+ * 任何异常都返回 UNKNOWN：调用方按「未知」静默展示，不阻塞页面。
+ */
+export function getImNotifyPermissionState(): Promise<string> {
+  // #ifdef APP-ANDROID
+  return new Promise<string>((resolve) => {
+    resolve(androidNotifyPermissionState());
+  });
+  // #endif
+  // #ifdef APP-IOS
+  return new Promise<string>((resolve) => {
+    resolve(iosNotifyPermissionState());
+  });
+  // #endif
+  // #ifdef APP-HARMONY
+  return harmonyNotifyPermissionState();
+  // #endif
+}
+
+/**
+ * 打开系统通知设置（设置页权限行点击 / 业务开关联动引导用）。
+ * - Android 13+ / 华为·荣耀（反移植）：直接落到本应用的通知权限页；
+ * - 真 Android 12 及以下：没有该运行时权限，退化为应用详情页（可在此关/开通知）；
+ * - iOS：落到本应用设置页；
+ * - 鸿蒙：没有稳定的「跳通知设置页」公开 API，复用 requestEnableNotification
+ *   （还能弹就弹系统窗；已被永久拒绝时只会 reject，用户仍需自行进系统设置，日志留痕不阻塞）。
+ */
+export function openImNotifyPermissionSettings(): void {
+  // #ifdef APP-ANDROID
+  try {
+    const activity = UTSAndroid.getUniActivity();
+    if (androidNotifyPermissionAvailable() && activity != null) {
+      UTSAndroid.gotoSystemPermissionActivity(activity, ["android.permission.POST_NOTIFICATIONS"] as string[]);
+      return;
+    }
+  } catch (e) {
+    console.error("[ImPush][android] gotoSystemPermissionActivity threw:", e);
+  }
+  uni.openAppAuthorizeSetting({});
+  // #endif
+  // #ifdef APP-IOS
+  uni.openAppAuthorizeSetting({});
+  // #endif
+  // #ifdef APP-HARMONY
+  try {
+    notificationManager
+      .requestEnableNotification(UTSHarmony.getUIAbilityContext())
+      .then((): void => {
+        markNotifyAsked();
+        console.error("[ImPush][hm] notification enabled from settings entry");
+      })
+      .catch((e: any | null): void => {
+        // 用户走到这里说明已经弹过系统窗/去过设置：落 asked，避免下次登录再打扰
+        markNotifyAsked();
+        console.error(`[ImPush][hm] settings entry not enabled: ${e}`);
+      });
+  } catch (e) {
+    console.error("[ImPush][hm] openImNotifyPermissionSettings threw:", e);
+  }
+  // #endif
+}
+
 // #ifdef APP-ANDROID
 /**
  * Android 13+（API 33）通知运行时权限。
- * ★只在首启协议点「同意」后调一次（见 requestImNotifyPermission）：
- *   对用户而言这是「安装后第一次同意用这个 App」的时刻，问通知权限最自然；
- *   而系统弹窗最多两次，拒完就只能引导去设置页，「机会」必须用在首启这次。
- * Android 12 及以下没有该权限，直接跳过（老版本通知默认开启）。
+ * ★登录成功后由 requestImNotifyPermission 调（见 scheduleImPushAfterLogin）。
+ * 系统不把通知当权限管理的机型（真 Android 12 及以下）直接跳过（通知默认开启）；
+ * 华为/荣耀反移植场景仍会申请（见 androidNotifyPermissionAvailable）。
  */
 function requestAndroidNotifyPermission(attempt: number = 0): void {
-  if (notifyAskedBefore()) {
+  if (notifyAskedBefore() || notifyAskInFlight) {
     return;
   }
   try {
-    if (Build.VERSION.SDK_INT < 33) {
+    if (!androidNotifyPermissionAvailable()) {
       markNotifyAsked();
-      pushLog(`[android] sdk=${Build.VERSION.SDK_INT} < 33，通知默认开启，无需申请`);
       return;
     }
     const activity = UTSAndroid.getUniActivity();
     if (activity == null) {
-      // 登录回调早期 Activity 可能尚未就绪：延后重试，别把唯一一次机会丢掉（不落标记）
+      // 登录回调早期 Activity 可能尚未就绪：延后重试，别把机会丢掉（不落标记）
       if (attempt < 6) {
         setTimeout((): void => {
           requestAndroidNotifyPermission(attempt + 1);
         }, 500);
+      } else {
+        console.error("[ImPush][android] activity 未就绪，本次放弃申请（下次登录再试）");
       }
       return;
     }
@@ -236,24 +480,28 @@ function requestAndroidNotifyPermission(attempt: number = 0): void {
     if (UTSAndroid.checkSystemPermissionGranted(activity, permissions)) {
       // 已授权（老版本装过 / 用户手动开过）：不再打扰
       markNotifyAsked();
-      pushLog("[android] POST_NOTIFICATIONS already granted");
       return;
     }
-    // ★先落标记再弹：无论用户选允许还是拒绝，本次安装只问这一次
-    markNotifyAsked();
-    pushLog("[android] POST_NOTIFICATIONS not granted，发起申请");
+    // ★标记在系统响应之后落（见 notifyAskedBefore 注释）：
+    //   这里只置内存在途位，避免「Activity 还没就绪」等技术性失败吃掉唯一机会。
+    notifyAskInFlight = true;
     UTSAndroid.requestSystemPermission(
       activity,
       permissions,
       (allGranted: boolean, _granted: string[]): void => {
+        notifyAskInFlight = false;
+        markNotifyAsked();
         console.error(`[ImPush][android] notification permission granted=${allGranted}`);
       },
       (_doNotAskAgain: boolean, _denied: string[]): void => {
         // 拒绝：不阻塞使用，推送到达后系统静默丢弃，等用户去设置手动开
+        notifyAskInFlight = false;
+        markNotifyAsked();
         console.error("[ImPush][android] notification permission denied");
       },
     );
   } catch (e) {
+    notifyAskInFlight = false;
     console.error("[ImPush][android] requestAndroidNotifyPermission threw:", e);
   }
 }
@@ -263,9 +511,11 @@ function requestAndroidNotifyPermission(attempt: number = 0): void {
 /**
  * 鸿蒙通知授权：未授权则弹系统窗，已授权/被拒都静默（被拒只能去设置手动开）。
  * ★鸿蒙系统弹窗每应用只弹一次，所以同样只在登录后申请一次。
+ * ★标记在 promise 落地后落：isNotificationEnabled 本身失败（读不到状态）不算「问过」，
+ *   下次登录还能再试。
  */
 function requestHarmonyNotifyPermission(): void {
-  if (notifyAskedBefore()) {
+  if (notifyAskedBefore() || notifyAskInFlight) {
     return;
   }
   try {
@@ -275,42 +525,50 @@ function requestHarmonyNotifyPermission(): void {
       .then((enabled: boolean): void => {
         if (enabled) {
           markNotifyAsked();
-          console.error("[ImPush][hm] notification already enabled");
           return;
         }
-        // ★先落标记再弹（同 Android）
-        markNotifyAsked();
+        notifyAskInFlight = true;
         notificationManager
           .requestEnableNotification(context)
           .then((): void => {
+            notifyAskInFlight = false;
+            markNotifyAsked();
             console.error("[ImPush][hm] notification granted");
           })
-          .catch((_e: any | null): void => {
-            // 拒绝/弹窗已用尽：不阻塞使用，推送到时系统仍会静默丢弃
-            console.error("[ImPush][hm] notification disabled (user declined?)");
+          .catch((e: any | null): void => {
+            // 用户拒绝 / 系统弹窗已用尽 / 开关被关：不阻塞使用，推送到时系统仍会静默丢弃。
+            // 调用已有明确响应，视为「已问过」，不重复打扰。
+            notifyAskInFlight = false;
+            markNotifyAsked();
+            console.error(`[ImPush][hm] notification not enabled: ${e}`);
           });
       })
       .catch((_e: any | null): void => {
-        console.error("[ImPush][hm] isNotificationEnabled fail");
+        // 读不到通知状态：技术性失败，不落标记
+        notifyAskInFlight = false;
+        console.error("[ImPush][hm] isNotificationEnabled fail（下次登录再试）");
       });
   } catch (e) {
+    notifyAskInFlight = false;
     console.error("[ImPush][hm] requestHarmonyNotifyPermission threw:", e);
   }
 }
 // #endif
 
 /**
- * 申请通知权限（**首启协议弹窗点「同意」后** 调；本安装内只真正申请一次）。
+ * 申请通知权限（**登录成功后** 调，入口统一走 scheduleImPushAfterLogin；
+ * 本安装内只真正申请一次）。
  *
- * 时机理由（2026-10-30 调整）：协议同意是用户完成「安装后第一次同意用这个 App」的时刻，
- * 此时问通知权限最自然，也符合主流 App 的首启顺序。此前放在登录成功后，会出现
- * 「登录完再弹一次」的二次打扰，产品明确要求去掉。
+ * 时机理由（2026-11-04 调整）：应用市场自动审核要求「同意隐私政策前不得申请权限」。
+ * 首启协议弹窗已移除，同意动作落在登录页协议勾选上，因此权限申请必须排在登录成功之后。
  *
  * 平台差异：
- * - 鸿蒙：首启系统通知弹窗由 uni-push SDK 初始化时自己弹（比 JS onLaunch 更早），
- *   本函数只在之后探测状态，已授权直接返回，不会重复弹。
- * - Android 13+：uni-push 不会自己申请，这里是唯一的弹窗时机（12 及以下无此权限，直接跳过）。
- * - iOS：由 uni-push 模块首帧申请，本函数空实现。
+ * - Android 13+：这里是唯一的弹窗时机（12 及以下无此权限，直接跳过）。
+ * - 鸿蒙：requestEnableNotification 弹系统窗；此时 getPushClientId 已在登录后调过，
+ *   不会再有「启动就弹」的副作用。
+ * - iOS：系统授权窗由 uni-push 模块在 getPushClientId/onPushMessage 初始化时申请，
+ *   而这两个 API 现在也在登录后才调，所以 iOS 的弹窗时机随之落到登录后
+ *   （若实测仍是启动首帧，说明是原生模块自注册，端上无法改，见文档记录）。
  *
  * 幂等：已授权、已问过（无论用户当时选了什么）都直接返回，重复调用不会重复弹窗。
  */
@@ -322,14 +580,18 @@ export function requestImNotifyPermission(): void {
   requestHarmonyNotifyPermission();
   // #endif
   // #ifdef APP-IOS
-  // iOS 通知授权由 uni-push 模块在首帧自己申请，这里不做（避免重复弹）
+  // iOS 没有独立的「申请通知权限」API：系统授权窗由 uni-push 模块在**初始化时**申请。
+  // 所以只在「尚未询问过」时补一次 getPushClientId 触发它（设置页权限行点开时用）；
+  // 已授权/已拒绝时系统都不会再弹，不必重复触发。
+  if (iosNotifyPermissionState() == IM_NOTIFY_PERMISSION_UNDETERMINED) {
+    syncImPushClientId();
+  }
   // #endif
 }
 
 /** cid 落地：变化才重报；未登录跳过（CONNECT_ACK 设备注册会带上缓存的 cid）。 */
 function applyPushCid(cid: string): void {
   if (cid.length == 0) {
-    pushLog("apply cid skipped: empty cid");
     return;
   }
   const previous = getImPushCid();
@@ -340,15 +602,11 @@ function applyPushCid(cid: string): void {
     // 落盘失败仅影响下次冷启动提前带 cid，不影响本次上报
   }
   if (cid == previous) {
-    pushLog(`apply cid unchanged (${cid})，不上报（CONNECT_ACK 注册会带）`);
     return;
   }
-  const loggedIn = isLoggedIn();
-  pushLog(`apply cid changed ${previous.length > 0 ? previous : "(empty)"} → ${cid}，loggedIn=${loggedIn}`);
-  if (loggedIn) {
+  // 未登录时不上报：登录后的 CONNECT_ACK 设备注册会带上缓存 cid。
+  if (isLoggedIn()) {
     reportPushCid(cid);
-  } else {
-    pushLog("cid 未上报：未登录（登录后 CONNECT_ACK 设备注册会带缓存 cid）");
   }
 }
 
@@ -362,16 +620,77 @@ function isLoggedIn(): boolean {
   }
 }
 
-/** 单独上报（设备注册 UPSERT 幂等，重复调无副作用）。 */
+/** cid 初始化延迟：让登录页 → 主界面的切换与首屏请求先落地，避免和切 Tab 动画抢帧。 */
+const PUSH_INIT_AFTER_LOGIN_DELAY_MS = 1000;
+/** 通知授权再晚一拍：确保 cid 已就绪、页面已稳定，弹窗不会压在登录成功的瞬间。 */
+const PUSH_ASK_AFTER_LOGIN_DELAY_MS = 1800;
+
+/** 防止同一登录流程里重复排期（两个入口：IM_SESSION_READY / 已登录冷启动）。 */
+let pushInitScheduled = false;
+let notifyAskScheduled = false;
+
+/**
+ * 已登录冷启动时**尽早**绑定点击监听（App.onLaunch 调，未登录直接返回）。
+ *
+ * 为什么要单独一个入口：点通知拉起 App 时，click 回调可能早于「登录后延迟初始化」
+ * 到达；绑晚了这次点击就丢了（用户点通知却停在伙伴页）。
+ * ★合规边界：只在**已有 token**（= 此前已登录 ⇒ 已同意隐私政策）时绑定。
+ *   首次安装未登录期间不碰 uni-push，所以不会命中「同意前初始化 SDK」。
+ */
+export function bindImPushClientIfLoggedIn(): void {
+  if (!isLoggedIn()) {
+    return;
+  }
+  bindImPushClient();
+}
+
+/**
+ * 登录后启动推送（**唯一入口**，幂等）。
+ *
+ * 调用点（都在登录态成立之后）：
+ * - App.uvue 的 IM_SESSION_READY 监听 → 本次进程内登录成功；
+ * - pages/launch/launch.uvue routeByAuthState → 已登录冷启动（不发 IM_SESSION_READY）。
+ *
+ * 顺序：先初始化（onPushMessage + getPushClientId），再申请通知权限。
+ * ★为什么不在 App.onLaunch 做：那会把个推 SDK 初始化、cid 采集、通知权限申请
+ *   全部提前到「用户同意隐私政策之前」，是应用市场自动审核的直接命中项（见文件头）。
+ *
+ * 首次安装未登录期间：本函数不会被调用 ⇒ 零推送 SDK 初始化、零网络请求。
+ */
+export function scheduleImPushAfterLogin(): void {
+  if (!isLoggedIn()) {
+    return;
+  }
+  if (!pushInitScheduled) {
+    pushInitScheduled = true;
+    setTimeout((): void => {
+      pushInitScheduled = false;
+      if (!isLoggedIn()) return;
+      bindImPushClient();
+      syncImPushClientId();
+    }, PUSH_INIT_AFTER_LOGIN_DELAY_MS);
+  }
+  // 已问过就不再排期（含「用户已允许」与「用户已拒绝」两种情况）
+  if (notifyAskScheduled || notifyAskedBefore()) {
+    return;
+  }
+  notifyAskScheduled = true;
+  setTimeout((): void => {
+    notifyAskScheduled = false;
+    if (!isLoggedIn()) return;
+    requestImNotifyPermission();
+  }, PUSH_ASK_AFTER_LOGIN_DELAY_MS);
+}
+
+/**
+ * 单独上报（设备注册 UPSERT 幂等，重复调无副作用）。
+ * 失败不重试：下次 CONNECT_ACK 的设备注册会带缓存 cid 补报。
+ */
 async function reportPushCid(cid: string): Promise<void> {
-  pushLog(`report start → POST /api/instant-message/devices cid=${cid}`);
   try {
-    const res = await apiImDeviceRegister(cid);
-    // code 非 0000（如 IM_90001 平台未识别）说明后端没落库，后续推送必然收不到
-    pushLog(`report result code=${apiResCode(res)} msg=${apiResMessage(res)}`);
-  } catch (e) {
+    await apiImDeviceRegister(cid);
+  } catch (_e) {
     // 网络失败：下次 CONNECT_ACK 的设备注册会带缓存 cid 补报
-    pushLog(`report fail: ${e}`);
   }
 }
 
@@ -431,7 +750,6 @@ function openConvWithRetry(
     const pages = getCurrentPages();
     const top = pages.length > 0 ? pages[pages.length - 1] : null;
     const topRoute = top != null ? `${top.route}` : "";
-    pushLog(`nav attempt=${attempt} pages=${pages.length} top=${topRoute.length > 0 ? topRoute : "(empty)"}`);
     const notReady = pages.length == 0 || topRoute == LAUNCH_PAGE_ROUTE || topRoute == LOGIN_PAGE_ROUTE;
     if (notReady && attempt < PUSH_CLICK_NAV_MAX_RETRY) {
       openConvWithRetry(convId, convType, name, avatar, attempt + 1);
@@ -449,11 +767,9 @@ function openConvWithRetry(
     if (avatar.length > 0) {
       url += `&avatar=${encodeURIComponent(avatar)}`;
     }
-    const failHandler = (err: any): void => {
+    const failHandler = (_err: any): void => {
       // 冷启动落在启动页/登录跳转中：navigateTo 可能失败，不再重试（避免重复开页）
-      pushLog(`nav fail: ${err}`);
     };
-    pushLog(`nav → ${topRoute == "pages/message/chat" ? "redirectTo" : "navigateTo"} ${url}`);
     if (topRoute == "pages/message/chat") {
       uni.redirectTo({ url: url, fail: failHandler });
       return;

@@ -171,6 +171,14 @@ export function fetchAuthProtectedFileAkUrl(url: string): Promise<string> {
           resolve(akUrl);
           return;
         }
+        if (code != null && `${code}` == "0000") {
+          // code 正常但 data 不是绝对地址：动态端点（如 /api/user/avatar/<uid>/<hash>）
+          // 后端原样回相对路径，说明该地址换不出 ak 直链，属预期分支不是错误。
+          // 鸿蒙侧据此转裸头下载（见 downloadProtectedImageAnonymous）。
+          console.error(`[AkUrl] refresh 无直链(动态端点) data=${akUrl} url=${fetchUrl}`);
+          reject(new Error(localText("Mobile.Error.fileAuthInvalid")));
+          return;
+        }
         console.error(`[AkUrl] refresh 响应非法 code=${code != null ? `${code}` : ""} url=${fetchUrl}`);
         reject(new Error(localText("Mobile.Error.fileAuthInvalid")));
       },
@@ -540,9 +548,46 @@ function fetchProtectedDisplayUrlViaAkOnHarmony(url: string): Promise<string> {
 }
 // #endif
 
+// #ifdef APP-HARMONY
+/**
+ * 无鉴权整段下载一次（返回空串=失败）。
+ *
+ * 用途：ak refresh 换不出直链的**动态图片端点**（典型 /api/user/avatar/<uid>/<hash>：
+ * 后端对非存储路径原样返回相对路径而非签名直链），这些端点本身匿名可读，但会
+ * 302 跳到对象存储。带 Bearer 下载时鸿蒙下载器**不会**在跨主机重定向时丢掉鉴权头，
+ * 对象存储见到非 SigV4 的 `Authorization: Bearer …` 直接回 **400**（curl -L 因为会
+ * 丢弃鉴权头才正常；2026-11-04 真机日志：`downloadFile statusCode=400`，同一头像
+ * 地址连试 8+ 次全 400 → 头像永久空白）。所以先裸头拉一次。
+ *
+ * 返回空串交给调用方回落带 Bearer 的常规下载（真受保护文件匿名访问是 401/403）。
+ * 仍需完整性校验：动态照片等格式的尾字节判定见 isLocalImageFileIntact。
+ */
+function downloadProtectedImageAnonymous(fetchUrl: string): Promise<string> {
+  return new Promise<string>((resolve) => {
+    uni.downloadFile({
+      url: fetchUrl,
+      // ★不得带任何鉴权头：302 到对象存储时请求头会被原样转发，Bearer 正是 400 的根因
+      header: {} as UTSJSONObject,
+      success: (res) => {
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0 && isLocalImageFileIntact(tempPath)) {
+          resolve(tempPath);
+          return;
+        }
+        resolve("");
+      },
+      fail: (_err) => {
+        resolve("");
+      },
+    });
+  });
+}
+// #endif
+
 function fetchProtectedImageDisplayUrlOnApp(fetchUrl: string, header: UTSJSONObject): Promise<string> {
   // #ifdef APP-HARMONY
-  // 先走 ak 无鉴权下载（见 fetchProtectedDisplayUrlViaAkOnHarmony），失败再回落原址整段下载。
+  // 先走 ak 无鉴权下载（见 fetchProtectedDisplayUrlViaAkOnHarmony），换不出直链时
+  // 再试一次裸头下载（动态端点），最后才回落原址带 Bearer 整段下载。
   // 同 URL 并发共享一次任务（10-07 截断事故的同一个护栏：并发落盘竞争会互相覆盖）
   const inflightAk = protectedImageInflight.get(fetchUrl);
   if (inflightAk != null) {
@@ -553,7 +598,12 @@ function fetchProtectedImageDisplayUrlOnApp(fetchUrl: string, header: UTSJSONObj
       if (tempPath.length > 0) {
         return Promise.resolve(tempPath);
       }
-      return downloadProtectedImageWithIntegrityCheck(fetchUrl, header);
+      return downloadProtectedImageAnonymous(fetchUrl).then((okPath: string): Promise<string> => {
+        if (okPath.length > 0) {
+          return Promise.resolve(okPath);
+        }
+        return downloadProtectedImageWithIntegrityCheck(fetchUrl, header);
+      });
     },
   );
   protectedImageInflight.set(fetchUrl, akTask);

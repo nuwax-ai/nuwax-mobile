@@ -20,6 +20,7 @@ vi.mock('../constants/i18n.local.constants.uts', () => ({ getLocalFallback: () =
 import request from '../servers/useRequest.uts';
 import { apiAuthIdpLoginList, apiAuthIdpSession } from '../servers/authIdp.uts';
 import { apiSpaceInviteInfo, apiSpaceInviteJoin } from '../servers/spaceInvite.uts';
+import { apiImConvDetail, apiImCreateP2pConversation, apiImCreateAgentConversation, apiImSpaceEnter } from '../servers/im.uts';
 
 class WebUTSJSONObject {
   constructor(value = {}) { Object.assign(this, value); }
@@ -104,5 +105,33 @@ describe('H5 联合登录真实请求层', () => {
     state.pending.fail(error);
     await expect(result).rejects.toEqual(error);
     expect(state.redirect).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('IM 承接的真实请求层鉴权隔离', () => {
+  it.each([apiImConvDetail, apiImCreateP2pConversation, apiImCreateAgentConversation, apiImSpaceEnter])('承接调用只返回业务鉴权码，不提前清理或重定向', async api => {
+    const target = '/subpackages/pages/im-invite/im-invite?spaceId=9007199254740993';
+    for (const code of ['4010', '4011', 'IM_10401', 'IM_10402']) {
+      const result = api('9007199254740993', target, true, true);
+      respond(code);
+      expect((await result).code).toBe(code);
+      expect(state.clear).not.toHaveBeenCalled();
+      expect(state.redirect).not.toHaveBeenCalled();
+      expect(state.storage.get('ACCESS_TOKEN')).toBe('old-session');
+    }
+  });
+  it('普通调用默认仍由请求层踢登录，回跳目标保留', async () => {
+    const target = '/subpackages/pages/space-invite/space-invite?code=old-flow';
+    const result = apiImSpaceEnter('1140', target);
+    respond('4010');await result;
+    expect(state.clear).toHaveBeenCalledOnce();
+    expect(state.redirect).toHaveBeenCalledExactlyOnceWith('/subpackages/pages/login/login', target);
+  });
+  it.each([[apiImCreateP2pConversation, 'targetUserId'], [apiImCreateAgentConversation, 'agentId']])('直达请求体保留雪花ID的原始数字字面量', async (api, key) => {
+    const result = api('9007199254740993', '', true, true);
+    expect(state.pending.data).toBe('{"'+key+'":9007199254740993}');
+    respond('0000', {convId: '9007199254740995', convType: 1});
+    expect((await result).data.convId).toBe('9007199254740995');
   });
 });

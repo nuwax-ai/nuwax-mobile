@@ -43,15 +43,7 @@
         <!-- 语言切换 -->
         <LanguagePicker />
 
-        <!-- #ifdef APP-ANDROID || APP-IOS || APP-HARMONY -->
-        <!-- 推送开关：业务开关 + 系统通知权限合并为一个（开关状态 = 真能收到推送）
-             ★系统权限只能申请、无法由代码关闭，所以「关」只关业务侧（后端不再下发本设备）；
-               系统权限被拒/未授予时开关回弹为关，并弹窗引导去系统设置开启。 -->
-        <view class="profile-row push-row">
-          <text class="label">{{ t("Mobile.Profile.pushNotifications") }}</text>
-          <switch :checked="pushSwitchChecked" :disabled="pushBusy || !pushReady" color="#6155F5" @change="handlePushChange" />
-        </view>
-        <!-- #endif -->
+        <!-- 推送开关已移至「我的-账户」的「系统消息」下方（pages/mine/mine-content.uvue） -->
 
         <!-- 动态认证码 -->
         <view class="profile-row dynamic-code-row">
@@ -94,224 +86,11 @@
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import defaultAvatar from "@/static/assets/avatar.png";
   import { ACCESS_TOKEN } from "@/constants/home.constants";
-  import { clearStoragePreservingApiBaseUrl, getApiBaseUrl } from "@/constants/config";
+  import { clearStoragePreservingApiBaseUrl } from "@/constants/config";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   import LanguagePicker from "./language-picker/language-picker.uvue";
   import AvatarUploader from "./avatar-uploader.uvue";
-  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
-  import { apiImDeviceRegister, ensureImPushPreferenceUser } from "@/servers/im";
-  import {
-    getImPushCid,
-    ensureImPushCid,
-    getImNotifyPermissionState,
-    openImNotifyPermissionSettings,
-    IM_NOTIFY_PERMISSION_GRANTED,
-  } from "@/utils/im/imPushClient";
-  import { readImPushEnabled, writeImPushEnabled } from "@/utils/im/imPushPreference";
-  import { getImSessionStamp } from "@/utils/im/imSessionScope";
-
-  const pushEnabled = ref<boolean>(false);
-  const pushReady = ref<boolean>(false);
-  const pushBusy = ref<boolean>(false);
-  let pushPageActive = true;
-  let pushPageStamp = "";
-  /**
-   * pushBusy 操作代次 + 看门狗。
-   * ★踩过的坑：拨开开关时若用户跳去系统设置手动开权限，App 期间退到后台，
-   *   `ensureImPushPreferenceUser` / `apiImDeviceRegister` 的请求回调可能丢失
-   *   （Promise 永不 settle）→ pushBusy 卡在 true → 开关 `:disabled="pushBusy"` 永久变灰，
-   *   用户只能杀 App。所以：①每次操作带代次，旧流程回来不得再写状态；②看门狗超时强制复位。
-   */
-  let pushBusySeq = 0;
-  let pushBusyTimer = 0;
-  const PUSH_BUSY_TIMEOUT_MS = 8000;
-
-  // === 推送通知 ===
-  // ★开关状态 = 业务开关本身（后端 push_enabled）：拨开即开、拨关即关。
-  //   系统通知权限只在「拨到开」之后做一次提示：未开启则弹窗引导去设置，
-  //   ★但开关保持打开（用户是否去开启系统权限不影响这里的业务状态）；拨关完全不读权限。
-  /** 开关的显示值：乐观更新（用户拨动即变），失败时回弹。 */
-  const pushSwitchChecked = ref<boolean>(false);
-
-  /** 按业务开关同步开关显示值。 */
-  function syncPushSwitch(): void {
-    pushSwitchChecked.value = pushEnabled.value;
-  }
-
-  /** 开始一次开关操作：返回本次代次，并挂上看门狗（请求挂起时自动解灰）。 */
-  function beginPushBusy(): number {
-    pushBusySeq += 1;
-    const seq = pushBusySeq;
-    pushBusy.value = true;
-    if (pushBusyTimer != 0) {
-      clearTimeout(pushBusyTimer);
-    }
-    pushBusyTimer = setTimeout(() => {
-      pushBusyTimer = 0;
-      if (seq != pushBusySeq) return;
-      pushBusy.value = false;
-      // 挂起期间显示的乐观值可能从未落库：按真实业务开关重算
-      syncPushSwitch();
-    }, PUSH_BUSY_TIMEOUT_MS);
-    return seq;
-  }
-
-  /** 结束一次开关操作（只有代次仍是最新的那次才生效，旧流程回来不得解掉新流程的忙碌态）。 */
-  function endPushBusy(seq: number): void {
-    if (seq != pushBusySeq) return;
-    if (pushBusyTimer != 0) {
-      clearTimeout(pushBusyTimer);
-      pushBusyTimer = 0;
-    }
-    pushBusy.value = false;
-  }
-
-  /** 作废所有在途操作并解灰（页面重新可见时用：上一次操作可能已被系统挂起）。 */
-  function abortPushBusy(): void {
-    pushBusySeq += 1;
-    if (pushBusyTimer != 0) {
-      clearTimeout(pushBusyTimer);
-      pushBusyTimer = 0;
-    }
-    pushBusy.value = false;
-    syncPushSwitch();
-  }
-
-  function pushSettingsStamp(): string {
-    return `${getImSessionStamp()}|${getApiBaseUrl()}`;
-  }
-
-  function pushCurrent(stamp: string, seq: number): boolean {
-    // 代次不符 = 本次操作已被 onShow 的 abortPushBusy 作废，返回值一律丢弃
-    return pushPageActive && seq == pushBusySeq && stamp == pushSettingsStamp();
-  }
-
-  async function refreshPushPreference(): Promise<void> {
-    if (pushBusy.value) return;
-    const stamp = pushSettingsStamp();
-    const seq = beginPushBusy();
-    try {
-      const ready = await ensureImPushPreferenceUser();
-      if (!pushCurrent(stamp, seq)) return;
-      pushReady.value = ready;
-      pushEnabled.value = readImPushEnabled();
-      syncPushSwitch();
-      if (!ready) throw new Error(t("Mobile.Error.pushIdentityUnavailable"));
-      // 注册一次让服务端拿到本设备的最新偏好（失败无 UI 提示：下次进页 onShow 会重试）
-      await apiImDeviceRegister(getImPushCid());
-    } catch (_e) {
-      // 忽略：提示行已移除，开关状态保持不变
-    } finally {
-      endPushBusy(seq);
-    }
-  }
-
-  /**
-   * 拨开后检查系统通知权限：未开启就弹窗提示并引导去系统设置。
-   * ★只提示，不影响开关：业务开关已经打开，用户去不去开系统权限由他自己决定。
-   */
-  function hintSystemNotificationIfOff(): void {
-    getImNotifyPermissionState().then((state: string): void => {
-      if (!pushPageActive) return;
-      if (state == IM_NOTIFY_PERMISSION_GRANTED) return;
-      uni.showModal({
-        title: t("Mobile.Profile.systemNotificationPermission"),
-        content: t("Mobile.Profile.systemNotificationDeniedTip"),
-        confirmText: t("Mobile.Voice.goToSettings"),
-        cancelText: t("Mobile.Common.cancel"),
-        success: (res: ShowModalSuccess) => {
-          if (res.confirm == true) {
-            openImNotifyPermissionSettings();
-          }
-        },
-      });
-    }).catch((_e: any | null): void => {
-      // 读不到权限状态就不提示，不影响业务开关
-    });
-  }
-
-  /** 补推一次当前偏好（用于旧请求可能晚于新状态落到服务端的收敛，失败忽略）。 */
-  async function resyncPushRegistration(): Promise<void> {
-    try {
-      await apiImDeviceRegister(getImPushCid());
-    } catch (_e) {
-      // 忽略：下次进页 onShow 的 refreshPushPreference 还会再注册
-    }
-  }
-
-  /**
-   * 推送通知（业务开关）：拨开即开、拨关即关。
-   * ★打开后若系统通知未开启，弹一次提示引导去设置；开关本身保持打开，
-   *   用户是否去开启系统权限不影响这里的业务状态。
-   * ★并发控制：busy 期间开关 disabled + 入口再判 busy（互斥，杜绝并发注册乱序）；
-   *   不做时间窗防抖——拨动必须即时响应，重复/连拨已被互斥挡住。
-   */
-  async function handlePushChange(event: any): Promise<void> {
-    if (pushBusy.value || !pushReady.value) return;
-    const change = event as UniSwitchChangeEvent;
-    const want = change.detail.value;
-    // 程序化改值（回弹）在部分平台会再冒一次 change：与当前显示值相同即视为回传，忽略
-    if (want == pushSwitchChecked.value) return;
-    // 乐观更新：用户拨动即改变显示值，失败时再回弹（switch 非受控回弹需要值有变化）
-    pushSwitchChecked.value = want;
-    const stamp = pushSettingsStamp();
-    const seq = beginPushBusy();
-    try {
-      if (want) {
-        // ★开启前必须先有推送 cid：cid 为空时设备注册会把 pushEnabled 强制置为 false
-        //   （见 servers/im.uts registerImDeviceNow），服务端会继续按「关闭」过滤本设备，
-        //   表现为「开关已打开但退后台收不到离线通知」。
-        const cid = await ensureImPushCid();
-        if (!pushCurrent(stamp, seq)) return;
-        if (cid.length == 0) {
-          console.error("[PushSwitch] open aborted: push cid unavailable");
-          uni.showToast({ title: t("Mobile.Profile.pushTokenPending"), icon: "none" });
-          // 没有 cid 就无法真正开启：回弹到真实业务开关值（保持关闭）
-          syncPushSwitch();
-          return;
-        }
-      }
-      if (!writeImPushEnabled(want)) throw new Error(t("Mobile.Error.pushIdentityChanged"));
-      pushEnabled.value = readImPushEnabled();
-      const res = await apiImDeviceRegister(getImPushCid());
-      if (!pushCurrent(stamp, seq)) {
-        // 本次操作已被 onShow / 换账号作废，但请求可能后到把旧偏好写进服务端：
-        // 按当前真实偏好补推一次，让服务端收敛到最新值（并发互斥之外的最后一道保险）
-        resyncPushRegistration();
-        return;
-      }
-      if (apiResCode(res) != SUCCESS_CODE) throw new Error(t("Mobile.Error.pushNotSynchronized"));
-      syncPushSwitch();
-      if (want) {
-        uni.showToast({title:t("Mobile.Profile.pushSaved"),icon:"none"});
-        // 开关已打开；若系统通知未开启，过一拍弹提示（先让 toast 露一下再弹窗）
-        setTimeout((): void => {
-          hintSystemNotificationIfOff();
-        }, 750);
-      } else {
-        uni.showToast({title:t("Mobile.Profile.pushDisabledToast"),icon:"none"});
-      }
-    } catch (_e) {
-      if (pushCurrent(stamp, seq)) {
-        pushEnabled.value = readImPushEnabled();
-        // 按真实业务开关回算显示：关闭失败时业务仍开着，应显示为开
-        syncPushSwitch();
-        uni.showToast({title:t("Mobile.Profile.pushPending"),icon:"none"});
-      }
-    } finally {
-      endPushBusy(seq);
-    }
-  }
-
-  onUnload(() => {
-    pushPageActive = false;
-    if (pushBusyTimer != 0) {
-      clearTimeout(pushBusyTimer);
-      pushBusyTimer = 0;
-    }
-  });
-  // #endif
   // #ifdef MP-WEIXIN
   import DeleteAccountModal from "@/pages/mine/components/delete-account-modal/delete-account-modal.uvue";
   // #endif
@@ -511,20 +290,6 @@
   // #endif
 
   onShow(() => {
-    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
-    pushPageActive = true;
-    if (pushPageStamp != pushSettingsStamp()) {
-      // 账号 / 环境变了：状态清空，由下面的 abort + 重新拉取校正
-      pushPageStamp = pushSettingsStamp();
-      pushReady.value = false;
-      pushEnabled.value = false;
-    }
-    // ★从系统设置 / 后台返回：上一次操作可能已被系统挂起（跳去设置期间请求回调丢失，
-    //   Promise 永不 settle）→ pushBusy 卡在 true、开关 `:disabled` 变灰点不动。
-    //   这里作废在途操作立即解灰，再重新拉一次真实状态。
-    abortPushBusy();
-    refreshPushPreference();
-    // #endif
     fetchUserInfo();
   });
 </script>
@@ -588,8 +353,6 @@
         font-weight: 500;
         color: #1a1a1a;
       }
-
-      &.push-row { justify-content: space-between; }
 
       &:last-child {
         border-bottom-width: 0;

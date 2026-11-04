@@ -87,6 +87,10 @@ describe("真实 IM 承接页脚本", () => {
     const p=setup();p.detail.mockResolvedValue(ok(response));p.load({convId:"9007199254740993"});await settle();
     expect(p.state.value).toBe("error");expect(p.redirect).not.toHaveBeenCalled();
   });
+  it("详情允许当前服务端SYSTEM=3，不改写成单聊",async()=>{
+    const p=setup();p.detail.mockResolvedValue(ok({convId:"9007199254740993",convType:3}));p.load({convId:"9007199254740993"});await settle();
+    expect(p.redirect.mock.calls[0][0].url).toContain("convId=9007199254740993&convType=3");
+  });
   it("团队缺省类型只按团队回退，不猜成单聊",async()=>{
     const p=setup();p.enter.mockResolvedValueOnce(ok({convId:"9007199254740993"}));p.load({spaceId:"42"});await settle();
     expect(p.redirect.mock.calls[0][0].url).toContain("convType=4");

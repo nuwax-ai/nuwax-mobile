@@ -1,0 +1,260 @@
+<template>
+  <view class="invite-page">
+    <view class="invite-card">
+      <text class="invite-title">{{ title }}</text>
+      <text v-if="state == 'loading' || state == 'opening' || state == 'handed'" class="invite-hint">{{ hint }}</text>
+      <text v-if="state == 'auth'" class="invite-hint">{{ t('Mobile.ImInvite.signingIn') }}</text>
+      <text v-if="state == 'invalid'" class="invite-hint">{{ t('Mobile.ImInvite.invalid') }}</text>
+      <text v-if="state == 'unsupported'" class="invite-error">{{ t('Mobile.ImInvite.multipleTargets') }}</text>
+      <text v-if="state == 'error'" class="invite-error">{{ errorText }}</text>
+      <button v-if="state == 'error' || state == 'handed'" class="invite-button" @tap="continueInvite">{{ t('Mobile.Common.retry') }}</button>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+import { computed, ref } from 'vue';
+import { onLoad, onUnload } from '@dcloudio/uni-app';
+import { apiImConvDetail, apiImCreateAgentConversation, apiImCreateP2pConversation, apiImSpaceEnter } from '@/servers/im';
+import type { RequestResponse } from '@/types/interfaces/request';
+import { apiResCode, apiResData, apiResMessage } from '@/utils/apiResponse';
+import { SUCCESS_CODE, USER_NO_LOGIN, REDIRECT_LOGIN, IM_TOKEN_INVALID, IM_AUTH_REDIRECT } from '@/constants/codes.constants';
+import { ACCESS_TOKEN } from '@/constants/home.constants';
+import { clearStoragePreservingApiBaseUrl, getApiBaseUrl } from '@/constants/config';
+import { getImSessionStamp } from '@/utils/im/imSessionScope';
+import { redirectToLoginOnce, LOGIN_PAGE_PATH } from '@/utils/authNavigation';
+import { imInviteReturnPath, planImInvite, ImInvitePlan } from '@/utils/imInviteEntry';
+import { useI18n, emptyI18nParams } from '@/utils/i18n';
+// #ifdef H5 || WEB
+import { isNativeAppWebView, ensureAppWebViewNavigationReady } from '@/utils/appWebViewNavigation';
+import { navigateViaWebViewSdk } from '@/utils/system';
+// #endif
+
+const { t: translate } = useI18n();
+const t = (key: string): string => translate(key, emptyI18nParams(), '');
+const state = ref<string>('loading');
+const errorText = ref<string>('');
+let entrySearch = '';
+let running = false;
+let revision = 0;
+
+const title = computed((): string => {
+  if (state.value == 'invalid' || state.value == 'unsupported') return t('Mobile.ImInvite.invalid');
+  if (state.value == 'error') return t('Mobile.ImInvite.failed');
+  return t('Mobile.ImInvite.loading');
+});
+
+const hint = computed((): string => {
+  return state.value == 'loading' ? t('Mobile.ImInvite.loading') : t('Mobile.ImInvite.opening');
+});
+
+function field(data: UTSJSONObject, key: string): string {
+  const value = data[key];
+  return value != null ? `${value}` : '';
+}
+
+function optionValue(params: UTSJSONObject, key: string): string | null {
+  const raw = params[key];
+  // uni 页面参数已经解码一次；重新包装时只编码，不再解码业务值。
+  return raw != null ? `${raw}` : null;
+}
+
+function appendParam(search: string, key: string, value: string | null): string {
+  if (value == null) return search;
+  const piece = key + '=' + encodeURIComponent(value);
+  return search.length == 0 ? '?' + piece : search + '&' + piece;
+}
+
+/**
+ * 页面入参和 H5 地址栏拼成同一条 query。
+ * 浏览器 hash 优先：首屏脚本把参数放在 /m/#/subpackages/pages/im-invite/im-invite?...，onLoad 有时拿不到。
+ */
+function readEntrySearch(params: UTSJSONObject): string {
+  // #ifdef H5 || WEB
+  // 保留原始 query（含未知字段和编码），hash 参数优先；raw # 之后是片段。
+  const hash = window.location.hash;
+  const queryAt = hash.indexOf('?');
+  const hashQuery = queryAt >= 0 ? hash.substring(queryAt + 1).split('#')[0] : '';
+  const outerQuery = window.location.search.startsWith('?') ? window.location.search.substring(1) : window.location.search;
+  const query = hashQuery.length > 0 ? hashQuery + (outerQuery.length > 0 ? '&' + outerQuery : '') : outerQuery;
+  if (query.length > 0) return '?' + query;
+  // #endif
+  let search = '';
+  for (const key of ['convId', 'userId', 'agentId', 'invite', 'groupNo', 'spaceId']) {
+    search = appendParam(search, key, optionValue(params, key));
+  }
+  return search;
+}
+
+function acceptsAttempt(currentRevision: number, stamp: string, origin: string): boolean {
+  if (currentRevision != revision) return false;
+  if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) {
+    state.value = 'error';
+    errorText.value = t('Mobile.ImInvite.failed');
+    return false;
+  }
+  return true;
+}
+
+function authenticated(response: RequestResponse<any> | null, returnPath: string): boolean {
+  const code = apiResCode(response);
+  if (code == USER_NO_LOGIN || code == REDIRECT_LOGIN || code == IM_TOKEN_INVALID || code == IM_AUTH_REDIRECT) {
+    state.value = 'auth';
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    if (token != null && `${token}`.length > 0) {
+      uni.setStorageSync(ACCESS_TOKEN, '');
+      clearStoragePreservingApiBaseUrl();
+    }
+    const message = apiResMessage(response);
+    const loginUrl = message.startsWith('/login') ? message.replace('/login', LOGIN_PAGE_PATH) : LOGIN_PAGE_PATH;
+    redirectToLoginOnce(loginUrl, returnPath);
+    return false;
+  }
+  return true;
+}
+
+function chatUrl(convId: string, convType: string, name: string, avatar: string): string {
+  return '/pages/message/chat?convId=' + encodeURIComponent(convId)
+    + '&convType=' + encodeURIComponent(convType)
+    + '&name=' + encodeURIComponent(name)
+    + '&avatar=' + encodeURIComponent(avatar);
+}
+
+/**
+ * 打开聊天页。H5 跑在已发布 App 的 webview 里时走原生通道，
+ * 否则留在 M 站自己的聊天页。convType 必须一起带上，聊天页缺省会按单聊渲染。
+ */
+async function openChat(convId: string, convType: string, name: string, avatar: string, currentRevision: number, stamp: string, origin: string): Promise<void> {
+  const url = chatUrl(convId, convType, name, avatar);
+  // #ifdef H5 || WEB
+  if (isNativeAppWebView()) {
+    const ready = await ensureAppWebViewNavigationReady();
+    if (!acceptsAttempt(currentRevision, stamp, origin)) return;
+    if (!ready || !navigateViaWebViewSdk(url)) throw new Error(t('Mobile.ImInvite.failed'));
+    // 原生群聊盖住 H5 后，关掉聊天页仍停在承接页，留重试可再进一次。
+    state.value = 'handed';
+    return;
+  }
+  // #endif
+  uni.redirectTo({
+    url: url,
+    fail: (_error: any) => {
+      if (!acceptsAttempt(currentRevision, stamp, origin)) return;
+      state.value = 'error';
+      errorText.value = t('Mobile.ImInvite.failed');
+    },
+  });
+}
+
+function openJoin(groupNo: string, currentRevision: number): void {
+  uni.redirectTo({
+    url: '/subpackages/pages/im-join-group/im-join-group?groupNo=' + encodeURIComponent(groupNo),
+    fail: (_error: any) => {
+      if (currentRevision != revision) return;
+      state.value = 'error';
+      errorText.value = t('Mobile.ImInvite.failed');
+    },
+  });
+}
+
+function conversationOf(response: RequestResponse<any> | null, returnPath: string): UTSJSONObject | null {
+  if (!authenticated(response, returnPath)) return null;
+  const raw = apiResData<any>(response);
+  if (apiResCode(response) != SUCCESS_CODE || raw == null) {
+    throw new Error(apiResMessage(response));
+  }
+  return raw as UTSJSONObject;
+}
+
+/**
+ * 按 planImInvite 的结果打开目标。
+ * enter / 详情 / 单聊都要先拿到带 convType 的会话，再进聊天页。
+ * 详情没有 convType 时停在失败态，不能猜成单聊。团队 enter 缺类型时用 4，单聊缺类型时用 1。
+ */
+async function continueInvite(): Promise<void> {
+  if (running) return;
+  const plan = planImInvite(entrySearch);
+  if (plan.action == 'empty' || plan.action == 'invalid' || plan.action == 'unsupported') {
+    state.value = plan.action == 'unsupported' ? 'unsupported' : 'invalid';
+    return;
+  }
+  running = true;
+  const currentRevision = revision;
+  const stamp = getImSessionStamp();
+  const origin = getApiBaseUrl();
+  const returnPath = imInviteReturnPath(entrySearch);
+  state.value = 'opening';
+  errorText.value = '';
+  try {
+    // #ifdef APP
+    const token = uni.getStorageSync(ACCESS_TOKEN);
+    if (token == null || `${token}`.length == 0) {
+      state.value = 'auth';
+      redirectToLoginOnce(LOGIN_PAGE_PATH, returnPath);
+      return;
+    }
+    // #endif
+    if (plan.action == 'join') {
+      openJoin(plan.value, currentRevision);
+      return;
+    }
+    let response: RequestResponse<any> | null = null;
+    if (plan.action == 'detail') {
+      response = await apiImConvDetail(plan.value, returnPath, true, true);
+    } else if (plan.action == 'p2p') {
+      response = await apiImCreateP2pConversation(plan.value, returnPath, true, true);
+    } else if (plan.action == 'agent') {
+      response = await apiImCreateAgentConversation(plan.value, returnPath, true, true);
+    } else if (plan.action == 'enter') {
+      response = await apiImSpaceEnter(plan.value, returnPath, true, true);
+    }
+    if (response == null || !acceptsAttempt(currentRevision, stamp, origin)) return;
+    const conversation = conversationOf(response, returnPath);
+    if (conversation == null || !acceptsAttempt(currentRevision, stamp, origin)) return;
+    const convId = field(conversation, 'convId');
+    if (!/^[1-9][0-9]{0,18}$/.test(convId) || (plan.action == 'detail' && convId != plan.value)) throw new Error(t('Mobile.ImInvite.failed'));
+    let convType = field(conversation, 'convType');
+    if (convType.length == 0) {
+      if (plan.action == 'enter') convType = '4';
+      else if (plan.action == 'p2p' || plan.action == 'agent') convType = '1';
+      else throw new Error(t('Mobile.ImInvite.failed'));
+    }
+    if (convType != '1' && convType != '2' && convType != '3' && convType != '4') throw new Error(t('Mobile.ImInvite.failed'));
+    if ((plan.action == 'enter' && convType != '4') || ((plan.action == 'p2p' || plan.action == 'agent') && convType != '1')) throw new Error(t('Mobile.ImInvite.failed'));
+    const name = field(conversation, 'name');
+    const avatar = field(conversation, 'avatar');
+    await openChat(convId, convType, name, avatar, currentRevision, stamp, origin);
+  } catch (error) {
+    if (!acceptsAttempt(currentRevision, stamp, origin)) return;
+    state.value = 'error';
+    const message = error instanceof Error ? error.message : '';
+    errorText.value = message.length > 0 ? message : t('Mobile.ImInvite.failed');
+  } finally {
+    if (currentRevision == revision) running = false;
+  }
+}
+
+onLoad((query: any) => {
+  revision += 1;
+  running = false;
+  const params = query as UTSJSONObject;
+  entrySearch = readEntrySearch(params);
+  const plan: ImInvitePlan = planImInvite(entrySearch);
+  if (plan.action == 'empty' || plan.action == 'invalid' || plan.action == 'unsupported') {
+    state.value = plan.action == 'unsupported' ? 'unsupported' : 'invalid';
+    return;
+  }
+  continueInvite();
+});
+
+onUnload(() => { revision += 1; });
+</script>
+
+<style scoped>
+.invite-page { flex: 1; background-color: #f5f6f8; align-items: center; justify-content: center; padding: 24px; }
+.invite-card { width: 100%; max-width: 420px; padding: 32px 24px; border-radius: 16px; background-color: #ffffff; align-items: center; }
+.invite-title { font-size: 20px; font-weight: bold; color: #111111; text-align: center; }
+.invite-hint { font-size: 14px; color: #777777; margin-top: 20px; text-align: center; }
+.invite-error { font-size: 14px; color: #b42318; margin-top: 20px; text-align: center; }
+.invite-button { width: 100%; background-color: #111111; color: #ffffff; font-size: 15px; border-radius: 8px; margin-top: 24px; }
+</style>

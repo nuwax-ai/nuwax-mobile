@@ -27,15 +27,22 @@
 
 - H5 部署在业务域的 `/m/`，接口与页面同源。跨域开发和 App 内嵌 H5 不展示联合登录入口，避免产生仅在授权域有效的 Cookie。
 - 后端应允许 `/m/#/…` 相对回跳，并设置可供 `/api/` 使用的 Cookie。不能通过 `document.cookie` 是否可读判断是否登录成功。
-- 失败、取消、首次关联页面的返回位置由后端控制；当前公开协议的失败默认入口是 PC `/login?idpError=…`。如需全程保持移动页面，后端需保留移动返回上下文。本次未修改后端或 PC Web。
+- 失败、取消、首次关联页面的返回位置由后端控制；当前公开协议的失败默认入口是 PC `/login?idpError=…`。团队邀请由 PC Web 配套转换回 M 登录并保留邀请目标；其它业务仍依赖后端保留移动返回上下文。本次未修改后端。
 - 首次关联需普通登录时，移动登录页允许续接同源 `/auth/bind-or-register?token=…&bind=1`，不接受其他认证/API 地址。设置密码后同样保留该返回目标。
+
+## 团队邀请与三端落点
+
+- PC Web 的 `/invite/space/:code` 在手机浏览器转到 `/m/#/subpackages/pages/space-invite/space-invite?code=…`；移动登录接受原 Web 邀请、M 路由及同源绝对地址，并保留原 query 的编码。
+- 4010/4011 统一保留原业务页；服务端只回 `/m/`（fragment 不在 HTTP referrer 中）时，使用当前邀请路由。原生请求显式传 `authReturnUrl`，避免登录失效后丢失页面参数。
+- 有效邀请登录后展示团队及确认按钮；只有用户点击“确认加入团队”才提交加入请求，登录回跳或刷新不会自动入团。已有成员跳过加入请求。使用 `spaces/{spaceId}/enter` 返回的精确 `convId` 打开团队会话，失败保留重试入口，不回默认群或猜测群号。
+- 原生 App 的扫一扫将当前服务域的团队邀请识别为业务入口，走原生登录与聊天页；该能力需要新版 App。系统/第三方扫码使用 M 站，不依赖 App 更新。
 
 本次仅实现源码和本地回归；真实测试环境及西财账号由使用方验证，未部署。
 
 ## 本地回归
 
 ```bash
-pnpm exec vitest run tests/authIdp.test.ts tests/idpNavigation.test.ts tests/authIdpRequest.test.ts tests/idpLoginConsent.test.ts
+pnpm exec vitest run tests/authIdp.test.ts tests/idpNavigation.test.ts tests/authIdpRequest.test.ts tests/idpLoginConsent.test.ts tests/spaceInvitePage.test.ts tests/scanRouter.test.ts
 
 # HBuilderX 编译 H5 后，可用本地模拟接口走浏览器链路；不会转发真实 API。
 node tests/fixtures/mobile-idp-server.mjs <HBuilderX生成的web目录>

@@ -1,4 +1,7 @@
 import request from "./useRequest";
+import { getApiBaseUrl } from "@/constants/config";
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { hasImPushPreferenceSession, hasImPushPreferenceUser, bindImPushPreferenceUser, readImPushEnabled } from "@/utils/im/imPushPreference";
 import { generateUUID } from "@/utils/common";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -6,6 +9,10 @@ import type { RequestResponse } from "@/types/interfaces/request";
 // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
 import { getStableDeviceBaseId } from "@/uni_modules/nuwax-device-identity";
 // #endif
+
+// 稳定的内部错误标识用于会话隔离/客户端注入检查，不能随界面语言改变。
+const IM_DEVICE_SESSION_CHANGED = "IM device session changed";
+const IM_PUSH_IDENTITY_UNAVAILABLE = "IM push identity unavailable";
 
 const IM_DEVICE_BASE_ID_STORAGE_KEY = "NUWAX_IM_DEVICE_BASE_ID";
 
@@ -153,13 +160,47 @@ export function imDevicePlatform(): string {
  * 后端据此跳过离线推送（UserDevice.pushEnabled 语义）；Web Push 三要素与
  * voipToken 移动端均不传。
  */
+let deviceRegistrationQueue: Promise<void> = Promise.resolve();
+
+/** 只绑定当前服务端鉴权确认的用户；迟到响应不能把上一账号的偏好带进来。 */
+export async function ensureImPushPreferenceUser(): Promise<boolean> {
+  if (hasImPushPreferenceUser()) return true;
+  if (!hasImPushPreferenceSession()) return false;
+  const stamp = getImSessionStamp();
+  const origin = getApiBaseUrl();
+  const res = await apiImWhoami();
+  if (stamp != getImSessionStamp() || origin != getApiBaseUrl()
+    || apiResCode(res) != SUCCESS_CODE) return false;
+  const raw = apiResData<UTSJSONObject>(res);
+  if (raw == null) return false;
+  const data = raw as UTSJSONObject;
+  const userId = data["userId"];
+  if (userId == null) return false;
+  return bindImPushPreferenceUser(`${userId}`);
+}
+
 export async function apiImDeviceRegister(pushToken: string = ""): Promise<RequestResponse<any>> {
+  const stamp = getImSessionStamp();
+  const origin = getApiBaseUrl();
+  // cid刷新、重连和用户开关共用一队列，防旧的开启请求晚到覆盖新关闭请求。
+  const pending = deviceRegistrationQueue.then(async (): Promise<RequestResponse<any>> => {
+    if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) throw new Error(IM_DEVICE_SESSION_CHANGED);
+    const preferenceReady = await ensureImPushPreferenceUser();
+    if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) throw new Error(IM_DEVICE_SESSION_CHANGED);
+    if (hasImPushPreferenceSession() && !preferenceReady) throw new Error(IM_PUSH_IDENTITY_UNAVAILABLE);
+    return await registerImDeviceNow(pushToken);
+  });
+  deviceRegistrationQueue = pending.then((): void => {}, (): void => {});
+  return await pending;
+}
+
+async function registerImDeviceNow(pushToken: string): Promise<RequestResponse<any>> {
   const body = new UTSJSONObject();
   body["deviceId"] = getImDeviceId();
   body["platform"] = imDevicePlatform();
   body["appName"] = "nuwax-mobile";
   if (pushToken.length > 0) {
-    body["pushEnabled"] = true;
+    body["pushEnabled"] = readImPushEnabled();
     body["pushToken"] = pushToken;
   } else {
     body["pushEnabled"] = false;
@@ -275,10 +316,16 @@ export async function apiImSpaces(): Promise<RequestResponse<any>> {
  */
 export async function apiImSpaceEnter(
   spaceId: string,
+  authReturnUrl: string = "",
+  suppressErrorToast: boolean = false,
+  suppressAuthRedirect: boolean = false,
 ): Promise<RequestResponse<any>> {
   return await request({
     url: `/api/instant-message/spaces/${spaceId}/enter`,
     method: "POST",
+    authReturnUrl: authReturnUrl,
+    suppressErrorToast: suppressErrorToast,
+    suppressAuthRedirect: suppressAuthRedirect,
   });
 }
 
@@ -327,6 +374,9 @@ export async function apiImGroupLeave(
  */
 export async function apiImCreateP2pConversation(
   targetUserId: string,
+  authReturnUrl: string = "",
+  suppressErrorToast: boolean = false,
+  suppressAuthRedirect: boolean = false,
 ): Promise<RequestResponse<any>> {
   // ★targetUserId 是 int64：以原始数字字面量拼 JSON 直传（同 apiImSendTextMsg 的
   //   convId），避免经 JS number 丢精度后建错/找不到会话
@@ -334,6 +384,32 @@ export async function apiImCreateP2pConversation(
     url: "/api/instant-message/conversations/p2p",
     method: "POST",
     data: `{"targetUserId":${targetUserId}}`,
+    authReturnUrl: authReturnUrl,
+    suppressErrorToast: suppressErrorToast,
+    suppressAuthRedirect: suppressAuthRedirect,
+  });
+}
+
+/**
+ * 按平台原生 agentId 打开或创建智能体单聊。
+ *
+ * POST /api/instant-message/conversations/agent，body {"agentId":<数字>}。
+ * agentId 与真人 userId 是同一个数值域，不能改走 apiImCreateP2pConversation：
+ * 服务端会把它当成同号真人，而且不会报错。换算只能由这个接口在服务端完成。
+ */
+export async function apiImCreateAgentConversation(
+  agentId: string,
+  authReturnUrl: string = "",
+  suppressErrorToast: boolean = false,
+  suppressAuthRedirect: boolean = false,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: "/api/instant-message/conversations/agent",
+    method: "POST",
+    data: `{"agentId":${agentId}}`,
+    authReturnUrl: authReturnUrl,
+    suppressErrorToast: suppressErrorToast,
+    suppressAuthRedirect: suppressAuthRedirect,
   });
 }
 
@@ -1116,10 +1192,16 @@ export async function apiImUnpinMsg(
  */
 export async function apiImConvDetail(
   convId: string,
+  authReturnUrl: string = "",
+  suppressErrorToast: boolean = false,
+  suppressAuthRedirect: boolean = false,
 ): Promise<RequestResponse<any>> {
   return await request({
     url: `/api/instant-message/conversations/${convId}`,
     method: "GET",
+    authReturnUrl: authReturnUrl,
+    suppressErrorToast: suppressErrorToast,
+    suppressAuthRedirect: suppressAuthRedirect,
   });
 }
 

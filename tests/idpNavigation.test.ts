@@ -35,6 +35,12 @@ describe('浏览器 Cookie 登录', () => {
     expect(authBrowserQuery('unknown')).toBeNull();
     expect(authBrowserQuery('redirect')).toBe('/pages/message/chat?name=a%20b');
   });
+  it('raw hash 片段不混入 query，编码片段仍属于参数值', () => {
+    window.location.hash = '#/subpackages/pages/im-invite/im-invite?convId=7#pane';
+    expect(authBrowserQuery('convId')).toBe('7');
+    window.location.hash = '#/subpackages/pages/im-invite/im-invite?convId=7%23pane';
+    expect(authBrowserQuery('convId')).toBe('7#pane');
+  });
   it('手动授权 push，自动授权 replace', () => {
     expect(beginBrowserIdp('5', '', false)).toBe(true);
     expect(assign).toHaveBeenCalledOnce();
@@ -47,6 +53,8 @@ describe('浏览器 Cookie 登录', () => {
     expect(beginBrowserIdp('5', '', shouldReplace)).toBe(false);
   });
   it('普通登录后回移动路由或安全 pending 页面', () => {
+    finishBrowserLogin(origin + '/invite/space/abc');
+    expect(replace).toHaveBeenLastCalledWith('/m/#/subpackages/pages/space-invite/space-invite?code=abc');
     finishBrowserLogin('/pages/message/chat?convId=123');
     expect(replace).toHaveBeenLastCalledWith('/m/#/pages/message/chat?convId=123');
     finishBrowserLogin('/auth/bind-or-register?token=fixture&bind=1');

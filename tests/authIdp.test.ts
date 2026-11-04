@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AuthLoadScope, MOBILE_AUTH_HOME, parseAuthIdpList, availableAuthProviders,
   autoAuthProviderId, buildIdpAuthorizePath, mobileAuthWebReturn,
-  resolveMobileAuthReturn, resolvePendingAuthReturn,
+  resolveMobileAuthReturn, resolvePendingAuthReturn, mobileLoginDestination,
 } from '../utils/authIdp.uts';
 
 const origin = 'https://tenant.example';
@@ -42,6 +42,29 @@ describe('移动 H5 登录方式配置', () => {
 });
 
 describe('移动登录回跳', () => {
+  const invite = '/subpackages/pages/space-invite/space-invite?code=abc&source=a%26b';
+  it.each(['/invite/space/abc?source=a%26b', origin + '/invite/space/abc?source=a%26b', '/m/#' + invite])('Web 邀请转换为 M 路由且不破坏 query %s', value => {
+    expect(resolveMobileAuthReturn(value, origin)).toBe(invite);
+  });
+  it('4010 没有回跳目标、4011 只带服务端 /m/ referrer 时，仍回当前邀请', () => {
+    for (const url of ['/subpackages/pages/login/login', '/login?redirect=' + encodeURIComponent(origin + '/m/')]) {
+      const target = new URL(mobileLoginDestination(url, origin + '/m/#' + invite, origin), origin);
+      expect(target.pathname).toBe('/subpackages/pages/login/login');
+      expect(target.searchParams.get('redirect')).toBe(invite);
+    }
+  });
+  it('原生端显式邀请码优先于缺失 query 的当前页，保留登录参数', () => {
+    const target = new URL(mobileLoginDestination('/subpackages/pages/login/login?local=1', invite), origin);
+    expect(target.searchParams.get('redirect')).toBe(invite);
+    expect(target.searchParams.get('local')).toBe('1');
+  });
+  it('密码、首次设置密码与 IdP 回调共用的目标始终为 M 邀请', () => {
+    const source = origin + '/invite/space/abc?source=a%26b';
+    expect(mobileAuthWebReturn(source, origin)).toBe('/m/#' + invite);
+    const authorization = new URL(buildIdpAuthorizePath('5', source, origin), origin);
+    const callback = new URL(authorization.searchParams.get('redirect')!, origin);
+    expect(new URLSearchParams(callback.hash.substring(callback.hash.indexOf('?') + 1)).get('redirect')).toBe(invite);
+  });
   const route = '/pages/message/chat?convId=9007199254740993&name=%E8%A5%BF%E8%B4%A2';
   it.each([route, '/m/#' + route, origin + '/m/#' + route, encodeURIComponent('/m/#' + route)])('保留移动深链接及编码 %s', (path) => {
     expect(resolveMobileAuthReturn(path, origin)).toBe(route);

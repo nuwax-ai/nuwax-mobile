@@ -3,7 +3,7 @@
  * 从 chat-input-phone 提取的共享上传逻辑
  * 供 MCP Ask 卡片等组件复用
  */
-import { getUploadFileAction } from "@/constants/common.constants";
+import { getUploadFileAction, UPLOAD_MAX_FILE_MB } from "@/constants/common.constants";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { UploadFileInfo } from "@/types/interfaces/common.uts";
@@ -12,6 +12,11 @@ import { t } from "@/utils/i18n.uts";
 import { orEmpty, orNumber, orString } from "@/utils/utsCoalesce";
 import { applyBearerAuthorization } from "@/utils/authSession";
 import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
+import { formatFileSize } from "@/utils/imFileCard";
+
+// #ifdef APP-IOS
+import { iosLocalFileExists } from "@/uni_modules/nuwax-ios-file-picker";
+// #endif
 
 // #ifdef APP-ANDROID
 import Uri from "android.net.Uri";
@@ -224,7 +229,7 @@ function prepareUploadFilePath(filePath: string, uid: string, fallbackExtension:
   try {
     const context = UTSAndroid.getAppContext();
     if (context == null) {
-      throw new Error("Android context unavailable");
+      throw new Error(t("Mobile.Error.androidContextUnavailable"));
     }
     if (filePath.indexOf("content://") != 0) {
       // 已带扩展名或调用方未提供类型线索：保持原路径（原行为）
@@ -243,7 +248,7 @@ function prepareUploadFilePath(filePath: string, uid: string, fallbackExtension:
     const uri = Uri.parse(filePath);
     const input = context.getContentResolver().openInputStream(uri);
     if (input == null) {
-      throw new Error("Cannot open selected file");
+      throw new Error(t("Mobile.Error.selectedFileUnavailable"));
     }
     let extension = ".tmp";
     const lastSegmentRaw = uri.getLastPathSegment();
@@ -283,9 +288,44 @@ function prepareUploadFilePath(filePath: string, uid: string, fallbackExtension:
     throw error;
   }
   // #endif
-  // #ifndef APP-ANDROID
+  // #ifdef APP-IOS
+  // iOS uploadFile 只认系统选择器返回的托管/沙盒路径（agent-detail chooseFile 直传
+  // 实证），第三方物化的裸 tmp 绝对路径会被判 Illegal file——此层只做存在性兜底
+  // （原生 FileManager；accessSync 失败静默不抛、恒判 true 不可靠），零路径加工。
+  if (filePath.indexOf("/") == 0 && iosLocalFileExists(filePath) != true) {
+    return "";
+  }
   return filePath;
   // #endif
+  // #ifndef APP-ANDROID || APP-IOS
+  return filePath;
+  // #endif
+}
+
+/** 上传体积闸门（对齐 PC nuwax-im-web UPLOAD_MAX_MB=100）：超出 toast 提示并拦下，
+ *  返回 false。size<=0（平台未提供大小）放行 fail-open，不让闸门挡住正常发送；
+ *  服务端真实上限未实测，超限最终由网关 413 兜底（uploadSingleFile 有对应文案）。 */
+export function enforceUploadSizeLimit(displayName: string, size: number): boolean {
+  if (size <= 0) {
+    return true;
+  }
+  const maxBytes = UPLOAD_MAX_FILE_MB * 1024 * 1024;
+  if (size <= maxBytes) {
+    return true;
+  }
+  // UTS 的 i18n 插值参数须用 Map，不能传对象字面量（同 streamRequest.uts 先例）
+  const params = new Map<string, string | number>();
+  params.set("name", displayName);
+  params.set("size", formatFileSize(size));
+  params.set("max", UPLOAD_MAX_FILE_MB);
+  uni.showToast({
+    title: t(
+      "Mobile.FileUploader.overLimit",
+      params as Record<string, string | number>,
+    ),
+    icon: "none",
+  });
+  return false;
 }
 
 /**
@@ -316,6 +356,12 @@ export function uploadSingleFile(
       );
     } catch (_prepareError) {
       resolve(createFailedUploadResult(t("Mobile.FileUploader.uploadFailed")));
+      return;
+    }
+    if (uploadPath.length == 0) {
+      // iOS 沙盒临时件已被系统清理（App 重启/更新后 tmp、Inbox 会清空）：
+      // 明确让用户重新选择，不要让 uploadFile 报无从理解的 "Illegal file"
+      resolve(createFailedUploadResult(t("Mobile.Message.sendFileExpired")));
       return;
     }
     const lastSegment = uploadPath.split("/").pop();
@@ -428,14 +474,21 @@ export function uploadSingleFile(
       fail: (error) => {
         console.error("[fileUploader] 上传失败:", error);
         const errorObj = error as UTSJSONObject;
-        resolve(
-          createFailedUploadResult(
-            orString(
-              readObjectField(errorObj, "errMsg"),
-              t("Mobile.FileUploader.networkError"),
-            ),
-          ),
+        // iOS 系统 NSError 细节藏在 cause.message（errMsg 只有一句无用的
+        // "request system error"）：一并透出，避免「未能完成操作。（NSURLErrorDomain…）」只进日志不进 toast
+        let reason = orString(
+          readObjectField(errorObj, "errMsg"),
+          t("Mobile.FileUploader.networkError"),
         );
+        const causeRaw = readObjectField(errorObj, "cause");
+        if (causeRaw != null && typeof causeRaw == "object") {
+          const causeObj = causeRaw as UTSJSONObject;
+          const causeMsg = orString(readObjectField(causeObj, "message"), "");
+          if (causeMsg.length > 0) {
+            reason = `${reason} (${causeMsg})`;
+          }
+        }
+        resolve(createFailedUploadResult(reason));
       },
     });
 

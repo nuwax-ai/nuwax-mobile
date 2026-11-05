@@ -13,6 +13,7 @@ if [[ -z "$SDK_BUILD" ]]; then
     5.15) SDK_BUILD="14915" ;;
     5.23) SDK_BUILD="14987" ;;
     5.24) SDK_BUILD="15006" ;;
+    5.34) SDK_BUILD="15179" ;;
   esac
 fi
 [[ -n "$SDK_BUILD" || -n "${UNIAPPX_ANDROID_SDK_ROOT:-}" ]] || {

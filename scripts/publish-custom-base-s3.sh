@@ -160,8 +160,12 @@ fi
 if want_target ios-simulator; then
   src="$DEBUG_DIR/Pandora_simulator_debug.app"
   if [[ -d "$src" ]]; then
-    echo "→ zip Pandora_simulator_debug.app"
-    (cd "$DEBUG_DIR" && zip -qry "$ARTIFACTS_DIR/Pandora_simulator_debug.app.zip" "Pandora_simulator_debug.app")
+    if [[ -n "${NUWAX_BASE_REUSED_IOS_VERSION:-}" && -f "$DEBUG_DIR/Pandora_simulator_debug.app.zip" ]]; then
+      cp "$DEBUG_DIR/Pandora_simulator_debug.app.zip" "$ARTIFACTS_DIR/Pandora_simulator_debug.app.zip"
+    else
+      echo "→ zip Pandora_simulator_debug.app"
+      (cd "$DEBUG_DIR" && zip -qry "$ARTIFACTS_DIR/Pandora_simulator_debug.app.zip" "Pandora_simulator_debug.app")
+    fi
     add_artifact "Pandora_simulator_debug.app.zip" "$ARTIFACTS_DIR/Pandora_simulator_debug.app.zip"
   else
     echo "  skip ios-simulator (missing $src)" >&2
@@ -194,8 +198,21 @@ fi
 
 GIT_SHA=$(cd "$ROOT_DIR" && git rev-parse HEAD 2>/dev/null || echo unknown)
 GIT_SHORT=$(cd "$ROOT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY=false
+[[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=normal)" ]] && GIT_DIRTY=true
 RELEASE_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-HX_VERSION="${NUWAX_HX_VERSION:-5.24}"
+HX_VERSION="${NUWAX_HX_VERSION:-}"
+# Android 以 APK 内的真实运行时为准，避免脚本默认值把 5.34 误报成 5.24。
+if [[ -f "$ARTIFACTS_DIR/android_debug.apk" ]]; then
+  APK_HX_VERSION="$(unzip -p "$ARTIFACTS_DIR/android_debug.apk" assets/uni-app-x/version.json | node -e 'let s="";process.stdin.on("data",x=>s+=x);process.stdin.on("end",()=>process.stdout.write(JSON.parse(s).hxVersion||""))')"
+  [[ -n "$APK_HX_VERSION" ]] || { echo "无法读取 Android 基座运行时版本" >&2; exit 1; }
+  if [[ -n "$HX_VERSION" && "$HX_VERSION" != "$APK_HX_VERSION" ]]; then
+    echo "NUWAX_HX_VERSION=$HX_VERSION 与 APK=$APK_HX_VERSION 不一致，拒绝发布" >&2
+    exit 1
+  fi
+  HX_VERSION="$APK_HX_VERSION"
+fi
+[[ -n "$HX_VERSION" ]] || { echo "请设置 NUWAX_HX_VERSION 为实际构建版本" >&2; exit 1; }
 
 MANIFEST_OUT="$ARTIFACTS_DIR/manifest.json"
 {
@@ -207,6 +224,7 @@ MANIFEST_OUT="$ARTIFACTS_DIR/manifest.json"
   echo "  \"channel\": \"$CHANNEL\","
   echo "  \"gitSha\": \"$GIT_SHA\","
   echo "  \"gitShort\": \"$GIT_SHORT\","
+  echo "  \"gitDirty\": $GIT_DIRTY,"
   echo "  \"releasedAt\": \"$RELEASE_DATE\","
   echo "  \"hxVersion\": \"$HX_VERSION\","
   echo "  \"overwritePolicy\": \"same-version-replace\","
@@ -217,9 +235,13 @@ MANIFEST_OUT="$ARTIFACTS_DIR/manifest.json"
     path="${ARTIFACT_PATHS[$i]}"
     size=$(wc -c < "$path" | tr -d ' ')
     hash=$(sha256_file "$path")
+    reused=""
+    if [[ "$name" != "android_debug.apk" && -n "${NUWAX_BASE_REUSED_IOS_VERSION:-}" ]]; then
+      reused=", \"reused\": true, \"sourceVersion\": \"$NUWAX_BASE_REUSED_IOS_VERSION\""
+    fi
     comma=","
     [[ "$i" -eq $((${#ARTIFACT_NAMES[@]} - 1)) ]] && comma=""
-    echo "    { \"name\": \"$name\", \"sha256\": \"$hash\", \"bytes\": $size }$comma"
+    echo "    { \"name\": \"$name\", \"sha256\": \"$hash\", \"bytes\": $size$reused }$comma"
   done
   echo "  ]"
   echo "}"

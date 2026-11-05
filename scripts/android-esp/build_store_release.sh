@@ -226,5 +226,5 @@ fi
 
 echo ""
 echo "======== 正式打包完成 ========"
-[[ -n "$APK_DEST" ]] && echo "APK: $APK_DEST"
-[[ -n "$AAB_DEST" ]] && echo "AAB: $AAB_DEST"
+if [[ -n "$APK_DEST" ]]; then echo "APK: $APK_DEST"; fi
+if [[ -n "$AAB_DEST" ]]; then echo "AAB: $AAB_DEST"; fi

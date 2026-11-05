@@ -15,11 +15,12 @@ const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const execute = promisify(execFile);
 const APK_CACHE = 'public, max-age=0, must-revalidate';
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
-const usage = `用法：pnpm apk:publish --file '/path/with spaces/app.apk'
+const usage = `用法：pnpm apk:publish --file '/path/with spaces/app.apk' --version 1.3.2
       pnpm apk:publish --url 'https://download.example/app.apk?token=...'
 
 --file PATH        本地 APK，与 --url 二选一
 --url URL          HBuilderX HTTP(S) 下载链接
+--version VERSION  发布版本（支持 1.3.2 或 v1.3.2；默认 manifest.json versionName）
 --notes-file PATH  UTF-8 更新说明（默认空）
 --dry-run          下载、校验并展示计划，不访问 S3
 --json             只向 stdout 输出结果 JSON；进度写入 stderr
@@ -29,11 +30,18 @@ const usage = `用法：pnpm apk:publish --file '/path/with spaces/app.apk'
 配置：NUWAX_S3_ENDPOINT/REGION/BUCKET/PREFIX/PUBLIC_BASE_URL、AWS_PROFILE
 凭证：AWS_* 或 NUWAX_S3_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN
 可选：NUWAX_AAPT2 指定 aapt2；NUWAX_S3_NO_VERIFY_SSL=1 仅关闭 AWS TLS 校验。
-PUBLIC_BASE_URL 是公开桶根地址（默认 endpoint/bucket），不含 PREFIX。`;
+PUBLIC_BASE_URL 是公开桶根地址（默认 endpoint/bucket），不含 PREFIX。
+发布版本用于 S3 路径、文件名和 JSON version；APK 的 versionName/versionCode 单独记录。`;
+
+function releaseVersion(value, source) {
+  const version = typeof value === 'string' ? value.trim().replace(/^v/i, '') : '';
+  if (!VERSION.test(version)) throw new Error(`${source} 必须是 X.Y.Z 或 vX.Y.Z 格式的发布版本`);
+  return version;
+}
 
 export function parseArgs(args) {
   const options = {};
-  const values = { '--file': 'file', '--url': 'url', '--notes-file': 'notesFile' };
+  const values = { '--file': 'file', '--url': 'url', '--notes-file': 'notesFile', '--version': 'version' };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--') continue;
@@ -47,6 +55,7 @@ export function parseArgs(args) {
     else throw new Error('未知参数，请使用 --help 查看用法');
   }
   if (!options.help && Boolean(options.file) === Boolean(options.url)) throw new Error('--file 与 --url 必须且只能指定一个');
+  if (options.version !== undefined) options.version = releaseVersion(options.version, '--version');
   return options;
 }
 
@@ -239,6 +248,10 @@ export async function publishObjects(objects, { store, workDir, identity, signal
 
 export async function publishApk(options, { root = ROOT, env = process.env, signal, log = () => {}, inspect = inspectApk, store } = {}) {
   if (Boolean(options.file) === Boolean(options.url)) throw new Error('--file 与 --url 必须且只能指定一个');
+  const versionSource = options.version === undefined ? 'manifest' : 'argument';
+  const version = releaseVersion(options.version === undefined
+    ? JSON.parse(await fsp.readFile(path.join(root, 'manifest.json'), 'utf8')).versionName
+    : options.version, versionSource === 'manifest' ? 'manifest.json versionName' : '--version');
   const config = configuration(env);
   const cache = path.join(root, 'unpackage/apk-publish');
   await fsp.mkdir(cache, { recursive: true });
@@ -256,17 +269,18 @@ export async function publishApk(options, { root = ROOT, env = process.env, sign
     }
     log('正在校验 APK、版本和离线资源…');
     const identity = await inspect(input, { root, env, signal });
+    log(`发布版本：${version}（${versionSource === 'manifest' ? 'manifest.json versionName' : '--version'}）；APK 版本：${identity.version} (${identity.versionCode})`);
     const digest = await digestFile(input);
-    const filename = `nuwax-${identity.version}.apk`;
+    const filename = `nuwax-${version}.apk`;
     const apkFile = path.join(workDir, filename);
     await fsp.rename(input, apkFile);
-    const versionRoot = `${config.prefix}/v${identity.version}`;
+    const versionRoot = `${config.prefix}/v${version}`;
     const apkKey = `${versionRoot}/${filename}`;
     const versionKey = `${versionRoot}/latest.json`;
     const latestKey = `${config.prefix}/latest/latest.json`;
     const apkUrl = `${config.publicBase}/${apkKey}`;
-    const metadata = { version: identity.version, notes: options.notesFile ? await fsp.readFile(path.resolve(options.notesFile), 'utf8') : '',
-      pub_date: new Date().toISOString(), platforms: { android: { url: apkUrl, versionCode: identity.versionCode,
+    const metadata = { version, notes: options.notesFile ? await fsp.readFile(path.resolve(options.notesFile), 'utf8') : '',
+      pub_date: new Date().toISOString(), platforms: { android: { url: apkUrl, versionName: identity.version, versionCode: identity.versionCode,
         packageName: identity.packageName, ...digest } } };
     const metadataFile = path.join(workDir, 'latest.json');
     await fsp.writeFile(metadataFile, `${JSON.stringify(metadata, null, 2)}\n`);
@@ -287,7 +301,7 @@ export async function publishApk(options, { root = ROOT, env = process.env, sign
       for (const name of await fsp.readdir(workDir))
         if (/^(backup|restored)-\d+$/.test(name)) await fsp.rm(path.join(workDir, name), { force: true });
     }
-    const result = { ok: true, dryRun: Boolean(options.dryRun), ...identity, ...digest, apkUrl,
+    const result = { ok: true, dryRun: Boolean(options.dryRun), ...identity, version, apkVersionName: identity.version, versionSource, ...digest, apkUrl,
       versionJsonUrl: `${config.publicBase}/${versionKey}`, latestUrl: `${config.publicBase}/${latestKey}`, metadataFile, metadata };
     await fsp.writeFile(path.join(workDir, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
     return result;

@@ -72,15 +72,19 @@ aws s3api head-object \
 HBuilderX 打包完成后，准备正式 APK 文件或复制其**直接下载链接**。不传打包状态页/登录页地址。以下 `/绝对路径/app.apk` 替换为你本机的实际文件路径；macOS 可将 APK 拖进终端取得路径。
 
 ```bash
-# 1. 本地文件预演，路径有空格时加引号
+# 1. 本地文件预演，默认发布版本读取仓库 manifest.json 的 versionName
 pnpm apk:publish --file "/绝对路径/app.apk" --dry-run
 
 # 2. 核对预演显示的版本、构建号、S3 地址后，去掉 --dry-run 正式上传
 pnpm apk:publish --file "/绝对路径/app.apk"
 
+# 显式指定发布版本（例如上传历史 1.3.2 包），优先于 manifest.json
+pnpm apk:publish --file "/绝对路径/app.apk" --version 1.3.2 --dry-run
+pnpm apk:publish --file "/绝对路径/app.apk" --version 1.3.2
+
 # 也支持 HBuilderX 直接下载链接；--silent 避免回显临时令牌
-pnpm --silent apk:publish --url 'https://example.com/app.apk?token=...' --dry-run
-pnpm --silent apk:publish --url 'https://example.com/app.apk?token=...'
+pnpm --silent apk:publish --url 'https://example.com/app.apk?token=...' --version 1.3.2 --dry-run
+pnpm --silent apk:publish --url 'https://example.com/app.apk?token=...' --version 1.3.2
 
 # 更新说明与机器可读结果（--silent 避免 pnpm 自身输出干扰 stdout）
 pnpm --silent apk:publish --file '/path/to/app.apk' --notes-file '/path/to/更新说明.md' --json
@@ -88,13 +92,22 @@ pnpm --silent apk:publish --file '/path/to/app.apk' --notes-file '/path/to/更�
 
 `--notes-file` 指向普通 UTF-8 文本或 Markdown 文件，内容作为本次更新说明；不指定时说明为空。`--json` 用于自动化读取输出，手动发布时可以省略。
 
+### 版本号如何指定
+
+- 传入 `--version 1.3.2` 时，使用指定的发布版本；也接受 `--version v1.3.2`，统一为 `1.3.2`。
+- 不传 `--version` 时，读取**本仓库根目录** `manifest.json` 的 `versionName`。发布版本仅支持 `X.Y.Z`，缺失或格式不正确时提示修正配置或传入 `--version`。
+- 发布版本决定 S3 的 `v<version>/` 目录、`nuwax-<version>.apk` 文件名和两份 JSON 顶层的 `version`。
+- APK 的实际 `versionName`、`versionCode` 仍从包内读取，分别记录在 `platforms.android.versionName`、`platforms.android.versionCode`；脚本不修改 APK。日志会同时展示发布版本及来源、APK 实际版本和构建号。
+
+例如仓库 `versionName` 是 `1.3.3`，上传包内版本 `1.3.2 (132)` 的 APK：不传参数时发布到 `v1.3.3/nuwax-1.3.3.apk`，顶层 `version` 为 `1.3.3`，安卓条目仍记录 `versionName=1.3.2`、`versionCode=132`；传 `--version 1.3.2` 则发布到 `v1.3.2/nuwax-1.3.2.apk`。上传历史版本时应显式指定对应发布版本。
+
 `--file`、`--url` 必须且只能选一个。`--dry-run` 会下载（链接来源）、读取包内版本并完整校验 APK，生成本地 JSON、打印目标地址，但不访问 S3，因而不检查远端构建号或写权限。
 
 带临时令牌的链接使用 `pnpm --silent`，避免 pnpm 自身回显命令参数；发布脚本本身不输出下载链接。也可用本地文件来源。
 
 实际发布需要 Node.js **22+**、`unzip`、Android SDK **build-tools/aapt2**、AWS CLI。macOS 可 `brew install awscli`；已有 HBuilderX 内置 Node 22 也可直接运行脚本。无需启动 HBuilderX，无需下载离线 SDK 或重新打包。
 
-`aapt2` 自动从 PATH、`ANDROID_SDK_ROOT`、`ANDROID_HOME`、常见 Android SDK 和 Homebrew SDK 路径查找；也可用 `NUWAX_AAPT2=/absolute/path/to/aapt2` 指定。APK 包名必须匹配仓库 `manifest.json` 的 `app-android.distribute.packagename`。版本使用 **APK 内的 versionName/versionCode**，与仓库当前版本无关；首版支持 `X.Y.Z` 正式版。
+`aapt2` 自动从 PATH、`ANDROID_SDK_ROOT`、`ANDROID_HOME`、常见 Android SDK 和 Homebrew SDK 路径查找；也可用 `NUWAX_AAPT2=/absolute/path/to/aapt2` 指定。APK 包名必须匹配仓库 `manifest.json` 的 `app-android.distribute.packagename`；APK 实际版本与发布版本分别记录，支持 `X.Y.Z` 正式版。
 
 ## 如何确认发布成功
 
@@ -125,6 +138,7 @@ APK：https://s3.nuwax.com:9443/nuwax-packages/mobile-app/v1.3.2/nuwax-1.3.2.apk
 | S3 API 提示证书验证失败 | 优先配置本机信任的证书；确属受控自签证书环境时可设 `NUWAX_S3_NO_VERIFY_SSL=1`。公开下载域名仍需有效信任。 |
 | 下载失败 / APK ZIP 校验失败 | 本地文件确认下载完整；链接来源确认未过期且能直接下载 APK，重新从 HBuilderX 获取链接后重试。 |
 | APK 包名不匹配 / 版本格式不支持 | 使用本项目正式 APK，版本名为 `X.Y.Z`；不要为绕过校验而修改 JSON 标注。 |
+| `manifest.json versionName` 格式错误或缺失 | 修正仓库版本配置，或通过 `--version 1.3.2` 显式指定发布版本。 |
 | APK 离线资源校验失败 | 交给打包同事检查离线资源准备和构建流程，重新出包后重试。 |
 | 拒绝将 latest 降到较低构建号 | 当前入口已发布更高 `versionCode`；核对选包是否正确。不要手工改 JSON 绕过降级检查。 |
 | 同一前缀已有发布任务 | 等当前任务完成；异常退出残留按下文检查锁和备份，不直接删锁并发上传。 |
@@ -157,7 +171,7 @@ s3://nuwax-packages/mobile-app/
 └── latest/latest.json
 ```
 
-对应公开 APK 地址为 `https://s3.nuwax.com:9443/nuwax-packages/mobile-app/v1.3.2/nuwax-1.3.2.apk`。`--json` 返回 `apkUrl`、`versionJsonUrl`、`latestUrl`、包内版本、摘要、`metadataFile` 和生成的 `metadata`；进度写入 stderr。失败返回非零退出码。
+对应公开 APK 地址为 `https://s3.nuwax.com:9443/nuwax-packages/mobile-app/v1.3.2/nuwax-1.3.2.apk`。`--json` 返回 `apkUrl`、`versionJsonUrl`、`latestUrl`、发布版本 `version`、版本来源 `versionSource`（`argument` / `manifest`）、APK 实际版本 `apkVersionName`、实际构建号 `versionCode`、摘要、`metadataFile` 和生成的 `metadata`；进度写入 stderr。失败返回非零退出码。
 
 ## latest.json
 
@@ -171,6 +185,7 @@ s3://nuwax-packages/mobile-app/
   "platforms": {
     "android": {
       "url": "https://s3.nuwax.com:9443/nuwax-packages/mobile-app/v1.3.2/nuwax-1.3.2.apk",
+      "versionName": "1.3.2",
       "versionCode": 132,
       "packageName": "com.nuwax.app",
       "size": 123456,
@@ -185,7 +200,7 @@ s3://nuwax-packages/mobile-app/
 
 ## 校验、覆盖与恢复
 
-1. 复制或下载 APK 到 `unpackage/apk-publish/run-*/`，校验 ZIP、包名、真实版本和包内离线资源，再计算摘要。
+1. 从 `--version` 或仓库 `manifest.json` 确定发布版本；复制或下载 APK 到 `unpackage/apk-publish/run-*/`，校验 ZIP、包名、真实版本和包内离线资源，再计算摘要。
 2. 保存三个目标对象的旧内容及内容类型、缓存等元数据。若当前 latest 的 `versionCode` 更大，或 JSON 无法解析，写入前终止。
 3. 上传 APK，从公开地址流式完整读取并核对大小、SHA-256；通过后上传并回读版本 JSON，最后上传并回读固定 latest。
 4. 任一步失败（包括中断）均尝试恢复已经触及的对象，原来不存在的对象则删除；恢复后通过 S3 回读核对。若恢复也失败，报出对象键并保留本地备份，供人工处理。

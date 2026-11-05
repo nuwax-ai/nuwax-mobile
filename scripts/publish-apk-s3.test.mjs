@@ -25,7 +25,7 @@ async function fixture(t) {
   const file = path.join(directory, '__UNI__8BF05E4 old.apk');
   const body = Buffer.from('test APK payload');
   await fs.writeFile(file, body);
-  await fs.writeFile(path.join(root, 'manifest.json'), JSON.stringify({ versionName: '9.9.9', versionCode: '999',
+  await fs.writeFile(path.join(root, 'manifest.json'), JSON.stringify({ versionName: '1.3.2', versionCode: '999',
     'app-android': { distribute: { packagename: identity.packageName } } }));
   return { root, file, body };
 }
@@ -66,6 +66,10 @@ test('CLI requires exactly one source and does not echo unknown secrets', () => 
   assert.throws(() => parseArgs(['--token=SECRET']), error => !error.message.includes('SECRET'));
   assert.deepEqual(parseArgs(['--', '--file', 'some path/a.apk', '--notes-file', '说明.md', '--dry-run', '--json']),
     { file: 'some path/a.apk', notesFile: '说明.md', dryRun: true, json: true });
+  assert.deepEqual(parseArgs(['--file', 'a.apk', '--version', 'v1.3.2']), { file: 'a.apk', version: '1.3.2' });
+  assert.throws(() => parseArgs(['--file', 'a.apk', '--version']), /缺少参数/);
+  assert.throws(() => parseArgs(['--file', 'a.apk', '--version', '1.3.2', '--version', '1.3.3']), /重复指定/);
+  assert.throws(() => parseArgs(['--file', 'a.apk', '--version', '../../bad']), /发布版本/);
 });
 
 test('APK metadata is read from badging, validates package and stable version', () => {
@@ -99,7 +103,7 @@ test('local path with spaces publishes package identity, notes and three verifie
   assert.deepEqual(store.data.get(versionKey).body, store.data.get(latestKey).body);
   const value = JSON.parse(store.data.get(latestKey).body);
   assert.equal(value.notes, '中文更新说明\n第二行\n');
-  assert.deepEqual(value.platforms.android, { url: result.apkUrl, versionCode: 132,
+  assert.deepEqual(value.platforms.android, { url: result.apkUrl, versionName: '1.3.2', versionCode: 132,
     packageName: identity.packageName, ...await bytesDigest(f.body) });
   assert.deepEqual(store.calls.filter(([action]) => action !== 'get'), [
     ['put', apkKey], ['verify', apkKey], ['put', versionKey], ['verify', versionKey], ['put', latestKey], ['verify', latestKey],
@@ -120,6 +124,52 @@ test('dry-run validates and creates JSON without S3 calls or a lock', async t =>
   assert.ok((await fs.readdir(path.join(f.root, 'unpackage/apk-publish'))).every(name => !name.endsWith('.lock')));
 });
 
+test('default release version comes from manifest while APK version and code remain accurate', async t => {
+  const f = await fixture(t), store = memoryStore();
+  const file = path.join(f.root, 'manifest.json');
+  const manifest = JSON.parse(await fs.readFile(file, 'utf8'));
+  manifest.versionName = 'v9.9.9';
+  await fs.writeFile(file, JSON.stringify(manifest));
+  const result = await publishApk({ file: f.file }, { root: f.root, env: {}, inspect, store });
+  assert.equal(result.version, '9.9.9');
+  assert.equal(result.versionSource, 'manifest');
+  assert.equal(result.apkVersionName, '1.3.2');
+  assert.equal(result.versionCode, 132);
+  assert.equal(result.apkUrl, 'https://s3.nuwax.com:9443/nuwax-packages/mobile-app/v9.9.9/nuwax-9.9.9.apk');
+  assert.equal(result.metadata.version, '9.9.9');
+  assert.equal(result.metadata.platforms.android.versionName, '1.3.2');
+  assert.equal(result.metadata.platforms.android.versionCode, 132);
+  assert.ok(store.data.has('mobile-app/v9.9.9/nuwax-9.9.9.apk'));
+  assert.deepEqual(store.data.get('mobile-app/v9.9.9/latest.json').body, store.data.get(latestKey).body);
+});
+
+test('explicit release version overrides manifest and controls paths and both JSONs', async t => {
+  const f = await fixture(t), store = memoryStore();
+  const result = await publishApk({ file: f.file, version: 'v2.0.0' }, { root: f.root, env: {}, inspect, store });
+  assert.equal(result.version, '2.0.0');
+  assert.equal(result.versionSource, 'argument');
+  assert.equal(result.apkVersionName, '1.3.2');
+  assert.equal(result.versionCode, 132);
+  assert.equal(result.apkUrl, 'https://s3.nuwax.com:9443/nuwax-packages/mobile-app/v2.0.0/nuwax-2.0.0.apk');
+  const versionJson = JSON.parse(store.data.get('mobile-app/v2.0.0/latest.json').body);
+  assert.equal(versionJson.version, '2.0.0');
+  assert.equal(versionJson.platforms.android.versionName, '1.3.2');
+  assert.deepEqual(store.data.get('mobile-app/v2.0.0/latest.json').body, store.data.get(latestKey).body);
+});
+
+test('invalid or missing manifest version fails before reading the APK or writing S3; explicit version takes precedence', async t => {
+  const f = await fixture(t), store = memoryStore();
+  const file = path.join(f.root, 'manifest.json');
+  const manifest = JSON.parse(await fs.readFile(file, 'utf8'));
+  delete manifest.versionName;
+  await fs.writeFile(file, JSON.stringify(manifest));
+  await assert.rejects(publishApk({ file: f.file }, { root: f.root, env: {}, inspect, store }), /manifest.json versionName/);
+  await assert.rejects(publishApk({ file: f.file, version: '../bad' }, { root: f.root, env: {}, inspect, store }), /--version/);
+  assert.deepEqual(store.calls, []);
+  const result = await publishApk({ file: f.file, version: '1.3.2', dryRun: true }, { root: f.root, env: {}, inspect, store });
+  assert.equal(result.version, '1.3.2');
+});
+
 test('HTTP source follows redirects, retries transient failures, and never persists signed URL', async t => {
   const f = await fixture(t);
   let attempts = 0;
@@ -128,9 +178,10 @@ test('HTTP source follows redirects, retries transient failures, and never persi
     else if (++attempts === 1) { res.writeHead(503); res.end('busy'); }
     else { res.end(f.body); }
   });
-  const result = await publishApk({ url: `${base}/start?token=SECRET`, dryRun: true }, { root: f.root, env: {}, inspect });
+  const result = await publishApk({ url: `${base}/start?token=SECRET`, version: '2.0.0', dryRun: true }, { root: f.root, env: {}, inspect });
   assert.equal(attempts, 2);
   assert.equal(result.sha256, (await bytesDigest(f.body)).sha256);
+  assert.equal(result.version, '2.0.0');
   assert.ok(!JSON.stringify(result).includes('SECRET'));
   assert.ok(!(await fs.readFile(result.metadataFile, 'utf8')).includes(base));
 });
@@ -159,7 +210,7 @@ test('same version and build can replace the APK and latest JSON', async t => {
 
 test('lower versionCode is rejected before any upload', async t => {
   const f = await fixture(t), store = memoryStore([[latestKey, JSON.stringify({ platforms: { android: { ...identity, versionCode: 133 } } })]]);
-  await assert.rejects(publishApk({ file: f.file }, { root: f.root, env: {}, inspect, store }), /拒绝.*133.*132/);
+  await assert.rejects(publishApk({ file: f.file, version: '9.9.9' }, { root: f.root, env: {}, inspect, store }), /拒绝.*133.*132/);
   assert.ok(store.calls.every(([action]) => action === 'get'));
 });
 

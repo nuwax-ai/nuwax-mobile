@@ -67,6 +67,7 @@ case "${1:-}:${2:-}" in
 esac
 case "${1:-}:${2:-}" in
   launch:app-*|publish:app|pack:app*)
+    hx_run "$SCRIPT_DIR/generate-app-privacy-policy.mjs"
     hx_run "$SCRIPT_DIR/prepare-offline-h5.mjs"
     cli_kind="${1}:${2}"
     ;;

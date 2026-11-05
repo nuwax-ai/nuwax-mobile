@@ -1,6 +1,6 @@
 # Android 隐私协议与授权版本
 
-Android 启动弹窗通过 WebView 直接展示 `https://nuwax.com/privacy.html`。`privacy-source-v2.8.md` 是核对时的网页快照，`android-clipboard-disclosure.md` 是 Android 实际行为与网页更新的对照说明；这两个文件不作为 App 的协议正文展示，也不会由构建脚本发布到官网。
+Android 启动弹窗在可滚动文本区域本地展示完整协议。`privacy-source-v2.9.md` 是 2026-11-04 修订版协议快照，来源为产品提供的 Markdown 文件；`android-clipboard-disclosure.md` 是 Android 实际行为补充说明。启动页正文使用 `scripts/generate-app-privacy-policy-content.mjs` 从协议快照生成 `constants/appPrivacyPolicyContent.uts`。
 
 `scripts/generate-app-privacy-policy.mjs` 根据快照和行为说明生成 `constants/appPrivacyPolicy.uts` 中的独立授权版本。首次启动、授权版本不匹配、框架授权被重置时，Android 都需要用户重新明确同意。退出登录保留授权版本；iOS / Harmony 不使用此弹窗逻辑。
 

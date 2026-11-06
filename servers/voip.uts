@@ -1,0 +1,106 @@
+import { callFailure } from "@/utils/voip/callErrors";
+import { getApiBaseUrl, normalizeApiBaseUrl } from "@/constants/config";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { getImDeviceId } from "@/servers/im";
+import { hasAppPrivacyConsent } from "@/utils/appPrivacyConsent";
+
+const DEV_KEY = "NUWAX_VOIP_DEV_SESSION";
+const PREFIX = "/api/instant-message/calls";
+
+/** 开发身份完全独立于平台登录态；发行构建不读取这个开关或凭据。 */
+export function readVoipDevSession(): UTSJSONObject | null {
+  if (process.env.NODE_ENV != "development") return null;
+  const raw = uni.getStorageSync(DEV_KEY);
+  if (typeof raw != "string" || `${raw}`.length == 0) return null;
+  try {
+    const config = JSON.parse(`${raw}`) as UTSJSONObject;
+    if (config["enabled"] !== true || normalizeApiBaseUrl(`${config["apiBaseUrl"] ?? ""}`).length == 0) return null;
+    return config;
+  } catch (_e) { return null; }
+}
+
+export function setVoipDevSession(config: UTSJSONObject | null): void {
+  if (process.env.NODE_ENV != "development") return;
+  if (config == null) uni.removeStorageSync(DEV_KEY);
+  else uni.setStorageSync(DEV_KEY, JSON.stringify(config));
+}
+
+export function voipSessionConfig(): UTSJSONObject {
+  const dev = readVoipDevSession();
+  const body = new UTSJSONObject();
+  body["apiBaseUrl"] = dev != null ? normalizeApiBaseUrl(`${dev["apiBaseUrl"]}`) : getApiBaseUrl();
+  body["accessToken"] = dev != null ? `${dev["accessToken"] ?? ""}` : `${uni.getStorageSync(ACCESS_TOKEN) ?? ""}`;
+  body["userId"] = dev != null ? `${dev["userId"] ?? ""}` : "";
+  body["deviceId"] = getImDeviceId();
+  body["development"] = dev != null;
+  body["pushEnvironment"] = process.env.NODE_ENV == "development" ? "development" : "production";
+  return body;
+}
+
+/** 独立通话 HTTP 层：不把平台 token 发往开发服务，不记录请求头/响应 JWT。 */
+export function voipRequest(path: string, data: UTSJSONObject | null = null): Promise<UTSJSONObject> {
+  const config = voipSessionConfig();
+  return new Promise<UTSJSONObject>((resolve, reject) => {
+    if (!hasAppPrivacyConsent() || `${config["accessToken"]}`.length == 0) { reject(callFailure("CALL_UNAUTHENTICATED")); return; }
+    uni.request({
+      url: `${config["apiBaseUrl"]}${PREFIX}${path}`,
+      method: data == null ? "GET" : "POST",
+      timeout: 10000,
+      header: { "Authorization": `Bearer ${config["accessToken"]}`, "X-Call-Device-Id": `${config["deviceId"]}`, "Content-Type": "application/json" },
+      data: data,
+      success: (response) => {
+        const envelope = response.data as UTSJSONObject | null;
+        if (response.statusCode != 200 || envelope == null) { reject(callFailure("CALL_SERVICE_UNAVAILABLE")); return; }
+        if (`${envelope["code"] ?? ""}` != "0000") { reject(callFailure(`${envelope["code"] ?? "CALL_SERVICE_UNAVAILABLE"}`)); return; }
+        const value = envelope["data"];
+        if (value == null) { reject(callFailure("CALL_INVALID_RESPONSE")); return; }
+        resolve(value as UTSJSONObject);
+      },
+      fail: (_error) => { reject(callFailure("CALL_SERVICE_UNAVAILABLE")); },
+    });
+  });
+}
+
+export function apiCallCapabilities(convId: string = ""): Promise<UTSJSONObject> {
+  return voipRequest(`/capabilities?convId=${encodeURIComponent(convId)}`);
+}
+
+export function apiCreateCall(convId: string, mediaType: string, requestId: string): Promise<UTSJSONObject> {
+  return voipRequest("", { convId, mediaType, requestId } as UTSJSONObject);
+}
+
+export function apiCallSnapshot(callId: string): Promise<UTSJSONObject> {
+  return voipRequest(`/${encodeURIComponent(callId)}`);
+}
+
+export function apiCallAction(callId: string, action: string, actionId: string, answerMediaType: string): Promise<UTSJSONObject> {
+  return voipRequest(`/${encodeURIComponent(callId)}/actions`, { action, actionId, answerMediaType } as UTSJSONObject);
+}
+
+export function apiCallCredentials(callId: string): Promise<UTSJSONObject> {
+  return voipRequest(`/${encodeURIComponent(callId)}/credentials`, {} as UTSJSONObject);
+}
+
+export function loginVoipDev(base: string, userId: string): Promise<UTSJSONObject> {
+  return new Promise<UTSJSONObject>((resolve, reject) => {
+    const origin = normalizeApiBaseUrl(base);
+    if (process.env.NODE_ENV != "development" || !hasAppPrivacyConsent() || origin.length == 0) { reject(callFailure("CALL_FORBIDDEN")); return; }
+    uni.request({ url: `${origin}/dev/login`, method: "POST", data: { userId }, timeout: 5000,
+      success: (res) => {
+        const envelope = res.data as UTSJSONObject;
+        if (res.statusCode != 200 || `${envelope["code"]}` != "0000") { reject(callFailure("CALL_UNAUTHENTICATED")); return; }
+        const session = envelope["data"] as UTSJSONObject;
+        session["enabled"] = true; session["apiBaseUrl"] = origin;
+        setVoipDevSession(session); resolve(session);
+      }, fail: (_e) => { reject(callFailure("CALL_SERVICE_UNAVAILABLE")); },
+    });
+  });
+}
+
+/** Late create responses after logout are cancelled with the captured former session. */
+export function cancelCreatedVoipCall(config: UTSJSONObject, callId: string): void {
+  if (callId.length == 0) return;
+  uni.request({ url: `${config["apiBaseUrl"]}${PREFIX}/${encodeURIComponent(callId)}/actions`, method: "POST", timeout: 4000,
+    header: { "Authorization": `Bearer ${config["accessToken"]}`, "X-Call-Device-Id": `${config["deviceId"]}`, "Content-Type": "application/json" },
+    data: { action: "cancel", actionId: `cancel-${callId}` }, fail: (_e) => {} });
+}

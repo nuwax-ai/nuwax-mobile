@@ -986,6 +986,11 @@
       class="chat-dock-wrap"
       :style="{ paddingBottom: dockPadBottomPx + 'px', transform: dockLiftTransform, transitionDuration: kbTransDuration }"
     >
+      <!-- 群禁言常驻提示条（「你已被禁言，X 后自动解除」/「群主已开启全员禁言」）。
+           ★零绑定挂载：组件从 utils/im/chatMuteState 现取状态并自己每秒 tick，
+             本页模板捕获参数已到 255 硬限（多一个绑定就 R8 桩超限）。
+             未禁言时组件内部返回空，不留占位。 -->
+      <chat-mute-tip />
       <!-- 输入坞第一行：输入框（语音条互斥）+ 发送（有内容时）+ 展开长文编辑 -->
       <view class="chat-dock">
         <!-- 待发图片暂存条（微信同款）：选图/拍照后先暂存，可与文案合并发送；
@@ -1092,7 +1097,7 @@
           <view
             v-if="!voiceMode && !convDisbanded"
             class="chat-input-box"
-            :class="quoteTarget != null ? 'chat-input-box--reply' : ''"
+            :class="[quoteTarget != null ? 'chat-input-box--reply' : '', composerLocked ? 'chat-input-box--locked' : '']"
             :style="quoteTarget == null ? chatInputBoxHeightStyle : ''"
           >
             <view v-if="quoteTarget != null" class="chat-reply-preview">
@@ -1113,6 +1118,7 @@
                 id="chat-input-textarea"
                 class="chat-input"
                 v-model="inputText"
+                :disabled="composerLocked"
                 :maxlength="-1"
                 :auto-height="chatInputAutoHeight"
                 :placeholder="t('Mobile.Message.inputPlaceholder')"
@@ -1960,6 +1966,17 @@
     customLinkIdOfKey,
     isCustomLinkTabKey,
   } from "@/utils/im/chatCustomTabs";
+  // 群禁言（个人 / 全员）：输入坞禁用判据 + 提示条数据源（模块级 store，
+  // 提示条组件零绑定挂载靠它取数 —— 本页模板捕获参数已到 255 硬限）
+  import {
+    bindChatMuteState,
+    chatMuteKindOf,
+    chatMuteRejectText,
+    chatMyMuteEnd,
+    CHAT_MUTE_ALL,
+    CHAT_MUTE_NONE,
+    resetChatMuteState,
+  } from "@/utils/im/chatMuteState";
   import { MsgActionItem } from "@/types/interfaces/msgActionItem";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import eventBus from "@/utils/eventBus";
@@ -3065,14 +3082,87 @@
   /** 已上报的已读水位（单调递增，避免重复上报）。 */
   let reportedReadSeq: number = 0;
 
-  // 有文案或有暂存图即可发（图文合并发送后，纯图也能点亮发送键）
-  const canSend = computed((): boolean => inputText.value.trim().length > 0 || stagedImages.value.length > 0);
+  // ===== 群禁言：我此刻能不能发言（对齐 PC nuwax-im-web DEV-313 需求5） =====
+
+  /** 到期重算刻度：只在「我的禁言恰好到期」那一刻写一次（不是每秒 → 不整页重渲）。 */
+  const muteTick = ref<number>(Date.now());
+
+  /** 我的禁言到期定时器（null = 没在等）。 */
+  let muteExpiryTimer: number | null = null;
+
+  /**
+   * 群已解散（convDetail.status=2）：输入区折叠为「该群已解散」，禁发消息（权威校验在服务端 IM_20105）。
+   * ★声明必须排在本段之前：rejectIfMuted 要用它（UTS 不提升声明，前向引用报 error18）。
+   */
+  const convDisbanded = ref<boolean>(false);
+
+  /**
+   * 我此刻被禁言（个人禁言 / 全员禁言且我不是群主/管理员）。
+   *
+   * ★判据整条在 utils/im/chatMuteState（单聊恒 none；先判个人再判全员；
+   *   全员对 myRole>=2 豁免，与服务端发消息链路同款），这里一条都不重写。
+   * ★`convType` 参与判断：单聊没有禁言这个概念（服务端对这俩端点直接报参数错）。
+   */
+  const composerLocked = computed((): boolean => {
+    if (convType.value != 2 && convType.value != 4) {
+      return false;
+    }
+    return chatMuteKindOf(convId.value, muteTick.value) != CHAT_MUTE_NONE;
+  });
+
+  /**
+   * 排「到期自动解锁」。
+   *
+   * ★到点那一刻**没有任何数据变化**来推动重渲：不主动排的话，被禁 10 分钟的人
+   *   在第 10 分 01 秒依然打不出字（只能重进会话），而他会认定「禁言没解除」。
+   * ★分段排（每次最多 1 小时）：服务端禁言上限 30 天，而 setTimeout 的延迟上限约
+   *   24.8 天，一次排到底会在超长时长上被运行时夹成「立刻触发」。
+   */
+  function scheduleMuteExpiry(): void {
+    const pending = muteExpiryTimer;
+    if (pending != null) {
+      clearTimeout(pending);
+      muteExpiryTimer = null;
+    }
+    const remain = chatMyMuteEnd.value - Date.now();
+    if (remain <= 0) {
+      // 已到期 / 本来没禁言：把刻度推到现在，让 composerLocked 立刻按真实时间重算
+      muteTick.value = Date.now();
+      return;
+    }
+    const wait = remain > 3600000 ? 3600000 : remain + 50;
+    muteExpiryTimer = setTimeout((): void => {
+      muteExpiryTimer = null;
+      scheduleMuteExpiry();
+    }, wait);
+  }
+
+  /**
+   * 被禁言时统一拦下「发送类」动作并说明原因，返回 true = 拦下了。
+   *
+   * ★发送键已置灰，但语音条、加号面板、展开面板、表情、@ 等入口都通向同一个发送链路，
+   *   不拦的话用户会先录一段语音/挑半天图，最后被服务端 IM_30002/30003 拒掉。
+   * ★群已解散有自己的灰条与文案，这里不抢它的提示。
+   */
+  function rejectIfMuted(): boolean {
+    if (convDisbanded.value || !composerLocked.value) {
+      return false;
+    }
+    const kind = chatMuteKindOf(convId.value, Date.now());
+    const code = kind == CHAT_MUTE_ALL ? "IM_30003" : "IM_30002";
+    uni.showToast({ title: chatMuteRejectText(code), icon: "none" });
+    return true;
+  }
+
+  // 有文案或有暂存图即可发（图文合并发送后，纯图也能点亮发送键）；
+  // ★被禁言时恒灰（canSend 驱动发送键的蓝色/灰色与点击态）
+  const canSend = computed(
+    (): boolean => (inputText.value.trim().length > 0 || stagedImages.value.length > 0) && !composerLocked.value,
+  );
 
   // ===== 会话能力（长按菜单显隐 / 已读 icon 门控；权限权威永远在服务端，这里只做入口 UX） =====
   /** 我的角色：1=普通成员 2=管理员 3=群主（convDetail.myRole；管理权限 = >=2）。 */
   const myRole = ref<number>(1);
-  /** 群已解散（convDetail.status=2）：输入区折叠为「该群已解散」，禁发消息（权威校验在服务端 IM_20105）。 */
-  const convDisbanded = ref<boolean>(false);
   /** 群设置：允许普通成员置顶消息（缺省 true；群主/管理员不受限，p2p 无此约束）。 */
   let allowMemberPin = true;
   /** 群设置：已读回执开关（关闭 ⇒ 我发的消息不渲染已读 icon；单聊无此开关恒显示）。 */
@@ -5863,8 +5953,13 @@
   // ===== 会话能力加载（convDetail / pins / whoami；失败静默保留默认值） =====
 
   /** 拉会话详情：群聊取 myRole 与治理开关（键缺省/null = 不限制）；单聊取对端 userId
-   *  （识别智能体单聊）——两类会话都取 spaceId（已绑资料库空间的会话点开零网络）。 */
-  async function loadConvInfo(): Promise<void> {
+   *  （识别智能体单聊）——两类会话都取 spaceId（已绑资料库空间的会话点开零网络）。
+   *
+   *  forceTitle：从子页返回（群设置改过群名）时要**覆盖入口快照**的标题。
+   *  默认 false —— 列表/搜索入口带过来的名字是"当时的快照"，进页不重拉覆盖，
+   *  否则群名一改，历史入口的标题会与本页不一致（老行为保留）。
+   *  但用户改完群名回到本页，看到的仍是旧名 = 明显 bug，所以 onShow 显式传 true。 */
+  async function loadConvInfo(forceTitle: boolean = false): Promise<void> {
     if (convId.value.length == 0) {
       return;
     }
@@ -5879,8 +5974,9 @@
           peerUserIdFromDetail.value = readString(dataObj, "peerUserId");
           // 标题兜底（推送点击入口没带 name）：用会话详情回填，否则顶部一直显示「会话」。
           // 群聊=群名 name；单聊=我方备注 > 对端昵称 peerName（详情 name 对单聊为空）。
-          // ★只在入口没给名时动手，列表/搜索等入口的标题（含当时快照）不被覆盖。
-          if (!titleFromEntry) {
+          // ★只在入口没给名时动手，列表/搜索等入口的标题（含当时快照）不被覆盖；
+          //   例外是 forceTitle（子页返回，群名可能刚被改过，见函数注释）。
+          if (!titleFromEntry || forceTitle) {
             let resolvedTitle = "";
             if (isGroupLike.value) {
               resolvedTitle = readString(dataObj, "name");
@@ -5913,6 +6009,17 @@
             allowMemberPin = pinRaw == null ? true : `${pinRaw}` == "true";
             const receiptRaw = dataObj["readReceiptOn"];
             readReceiptOn.value = receiptRaw == null ? true : `${receiptRaw}` == "true";
+            // 禁言（对齐 PC DEV-313）：全员开关 + 我的到期时刻（详情里都有，
+            // 见 ImConversationDtoAssembler.assemble 的 muteAll / muteEndTime）。
+            // ★覆盖写不做合并：详情是权威快照；6000 帧只是"通知"，收到后靠 onShow 重拉。
+            bindChatMuteState(
+              convId.value,
+              readBool(dataObj, "muteAll"),
+              readNumber(dataObj, "muteEndTime", 0),
+              myRole.value,
+            );
+            // 排一次「到期自动解锁」（个人禁言才有确定的到期时刻）
+            scheduleMuteExpiry();
           }
         }
       }
@@ -6431,8 +6538,13 @@
     }
     // 行移除同步出箱（可能是重试撞禁言：箱里留着会跨重启复活成孤儿失败行）
     removeFailedSend(convId.value, clientMsgId);
-    const message = apiResMessage(res);
+    // ★文案自己写（判据只认错误码；服务端 message 是给日志看的机器话，
+    //   改一次就全失效）。服务端没给对应码时退回通用失败文案。
+    const message = chatMuteRejectText(code);
     uni.showToast({ title: message.length > 0 ? message : t("Mobile.Message.sendFailed"), icon: "none" });
+    // ★被拒 = 本地快照已过期（别处刚把我禁了 / 群主刚开全员禁言 / 我刚到期而库里没到）。
+    //   重拉详情让提示条与输入框立刻跟上；不 await，失败的发送流程不等它。
+    loadConvInfo();
     return true;
   }
 
@@ -9246,6 +9358,11 @@
       uni.showToast({ title: t("Mobile.Message.groupDisbandedSendTip"), icon: "none" });
       return;
     }
+    // 被禁言：所有发送入口（主坞/加号面板/展开面板/重试）统一在此拦下
+    //（发送键已置灰，这里兜住键盘回车等旁路；服务端 IM_30002/30003 仍兜底）
+    if (rejectIfMuted()) {
+      return;
+    }
     const text = inputText.value.trim();
     // 图文合并发送后：文案与暂存图均空才无内容可发
     if ((text.length == 0 && stagedImages.value.length == 0) || convId.value.length == 0) {
@@ -11396,6 +11513,10 @@
     if (pageTapSwallowed()) {
       return;
     }
+    // 被禁言：不进语音态（否则会录完整段、松手才被拒 —— 与发送键置灰不一致）
+    if (voiceMode.value != true && rejectIfMuted()) {
+      return;
+    }
     if (voiceMode.value != true) {
       if (panelMode.value.length > 0) {
         panelMode.value = "";
@@ -11417,6 +11538,11 @@
    * 有暂存图时与图合并发送（单图直发 image / 图文一条 rich_text，判定同 handleSend）。
    */
   function handleVoiceStop(result: string): void {
+    // 被禁言兜底：toggleVoiceMode 已挡住"进语音态"，但已在语音态时被管理员禁言
+    // （或从子页回来）仍可能录完 —— 这里再拦一次，不让识别结果白跑一趟发送链路
+    if (rejectIfMuted()) {
+      return;
+    }
     const text = result.trim();
     if (text.length == 0 || convId.value.length == 0) {
       return;
@@ -11539,6 +11665,10 @@
     if (pageTapSwallowed()) {
       return;
     }
+    // 被禁言：不展开加号面板（文件/相册挑完也发不出去）；收起方向始终放行
+    if (panelMode.value != "plus" && rejectIfMuted()) {
+      return;
+    }
     if (voiceMode.value) {
       voiceMode.value = false;
     }
@@ -11551,6 +11681,10 @@
    */
   function handleMentionKeyTap(): void {
     if (pageTapSwallowed()) {
+      return;
+    }
+    // 被禁言：@ 选人只会往输入框塞 token，最终仍发不出去 —— 入口直接拦
+    if (rejectIfMuted()) {
       return;
     }
     if (voiceMode.value) {
@@ -12218,6 +12352,11 @@
       closeExpandSheet();
       return;
     }
+    // 被禁言：不打开大输入面板（打开也是"能打字、发不出去"；收起分支在上面已放行，
+    // 避免把人困在展开态里出不来 —— 同 PC 的展开态陷阱裁定）
+    if (rejectIfMuted()) {
+      return;
+    }
     if (voiceMode.value) {
       voiceMode.value = false;
     }
@@ -12239,6 +12378,8 @@
   /** 展开面板发送：走统一 handleSend（格式态包装/提及反扫/滚动同链路），发完收面板。 */
   function handleExpandSend(): void {
     if (canSend.value != true) {
+      // 被禁言时 canSend 恒 false：把"发不出去"的原因说出来（否则点了完全没反应）
+      rejectIfMuted();
       return;
     }
     handleSend();
@@ -13033,6 +13174,10 @@
    * 之后（UTS 先声明后使用）。
    */
   function handlePickImage(source: string): void {
+    // 被禁言：不许选图/拍视频（选完暂存也发不出去；统一在入口拦，比让用户白选好）
+    if (rejectIfMuted()) {
+      return;
+    }
     const sourceTypes =
       source == "camera"
         ? (["camera"] as ("album" | "camera")[])
@@ -14290,6 +14435,27 @@
     }
   }
 
+  /**
+   * 会话变更（CONV_UPDATE 6000）：群名/头像、全员禁言、解散状态都可能变。
+   *
+   * ★帧体对全体成员**字节相同**，装不下"我个人"的 muteEndTime/角色，
+   *   所以帧只是「通知」—— 收到就重拉详情（权威快照）。
+   * ★forceTitle：群资料变更时标题要跟着换（同 onShow 的理由）。
+   * ★别在这里直接按帧里的字段改本地状态：帧不带个人视角字段，
+   *   猜出来的值会让"我还能不能说话"判错（PC 同款裁定，见其 store/chat.ts 注释）。
+   */
+  function handleImConvUpdated(payload: any): void {
+    if (payload == null) {
+      return;
+    }
+    const obj = payload as UTSJSONObject;
+    const changedConvId = readString(obj, "convId");
+    if (changedConvId.length > 0 && changedConvId != convId.value) {
+      return;
+    }
+    loadConvInfo(true);
+  }
+
   // ★App-Android(UTS→Kotlin) 裸函数引用传 eventBus.on 绑不上回调（订阅静默失效，
   // 聊天页不实时的直接原因；须箭头包装）；on/off 同一引用故存具名 const
   const onImMessagesSynced = (payload: any): void => { handleImMessagesSynced(payload); };
@@ -14301,6 +14467,7 @@
   const onImConvUnread = (payload: any): void => { handleImConvUnread(payload); };
   const onImMessageReaction = (payload: any): void => { handleImMessageReaction(payload); };
   const onImAgentStatus = (payload: any): void => { handleImAgentStatus(payload); };
+  const onImConvUpdated = (payload: any): void => { handleImConvUpdated(payload); };
 
   /** 当前用户信息：区分我方/对方消息 + 我方头像昵称（IM senderId 即平台用户 id）。 */
   async function loadMyInfo(): Promise<void> {
@@ -14555,6 +14722,9 @@
     eventBus.on(`${EVENT_TYPE.ImAgentStatus}`, onImAgentStatus);
     // 会话自定义链接变更（op 3007 custom_link.changed）：只认本会话，收到就重拉列表
     eventBus.on(`${EVENT_TYPE.ImCustomEvent}`, onImCustomEvent);
+    // 会话资料/治理变更（CONV_UPDATE 6000：改群名、全员禁言、解散…）：只认本会话，
+    // 收到就重拉详情 —— 禁言状态是"我的视角"字段，帧里没有，只能靠重拉
+    eventBus.on(`${EVENT_TYPE.ImConversationUpdated}`, onImConvUpdated);
     // ★链接列表的首拉放在 onShow（见 bindChatTabsForPage 上面那段），这里不重复请求。
     // #ifndef H5 || WEB
     // 键盘高度监听（App 三端/小程序；H5 不支持该 API）：驱动 liftPx 刚体平移让位。
@@ -14650,6 +14820,14 @@
     // ★只在这里清、不在 onHide 清：进子页（Pin/文件/资料库）会走 onHide，那时清掉
     //   就等于每次返回都重拉一遍，标签行还会先空一帧。串会话由 convId 守卫兜住。
     releaseChatTabsForToken(convId.value);
+    // 群禁言：清模块级快照 + 到期定时器（convId 守卫；不清的话下个聊天页首帧会
+    // 按本页的禁言状态先把输入框锁住 —— 「零绑定组件模块 ref 跨页残留」那一课）
+    const muteTimer = muteExpiryTimer;
+    if (muteTimer != null) {
+      clearTimeout(muteTimer);
+      muteExpiryTimer = null;
+    }
+    resetChatMuteState(convId.value);
     // 「N 条新消息」：解除点击回调注册（按会话 id token，只清自己的；条数不复位——
     // 退页后由下一个聊天页 onLoad 首帧前清零，避免误伤 navigateBack 后被返回页 onShow
     // 刚写回的值，同下方合规提示的先后坑）
@@ -14738,6 +14916,7 @@
     eventBus.off(`${EVENT_TYPE.ImMessageReaction}`, onImMessageReaction);
     eventBus.off(`${EVENT_TYPE.ImAgentStatus}`, onImAgentStatus);
     eventBus.off(`${EVENT_TYPE.ImCustomEvent}`, onImCustomEvent);
+    eventBus.off(`${EVENT_TYPE.ImConversationUpdated}`, onImConvUpdated);
     clearAgentClockTimers();
     clearImgSpinTimers();
     if (readRefreshTimer != 0) {
@@ -14819,6 +14998,10 @@
       loadContactRemarks();
       // 成员表零请求对齐最新缓存快照（群设置/成员页的加删人、改名片在此生效）
       resyncMembersFromCache();
+      // 群资料（名称/头像）可能刚在群设置页改过：标题是进页时的入口快照，
+      // 不重拉会一直停在旧名（用户实测：改完群名返回，顶部标题不变）⇒ 覆盖式回填。
+      // ★静默失败（catch 保留旧标题），不阻塞回页。
+      loadConvInfo(true);
     }
     // 静默同步最新消息（离开期间其他端新发的消息兜底；不打断滚动）
     if (chatHasShownOnce && convId.value.length > 0 && messages.value.length > 0) {
@@ -16650,6 +16833,12 @@
   /* 已解散灰条：占住输入 pill 位置，居中灰字（高度沿用 44px 单行 pill 标准） */
   .chat-input-box--disbanded {
     justify-content: center;
+  }
+
+  /* 被禁言：输入 pill 变灰（textarea 已 disabled，这里给"不可输入"一个视觉上的确认）。
+     底色与上方提示条同族（#f2f3f5），不做红框：它不是报错，是"现在不能发" */
+  .chat-input-box--locked {
+    background-color: #f2f3f5;
   }
 
   .chat-input-box__disbanded-text {

@@ -1936,6 +1936,30 @@
   } from "@/servers/im";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { ChatSubpageTab } from "@/types/interfaces/chatSubpageTab";
+  // 子页签注册表 + 显隐偏好（对齐 PC topTabs 的内置页签那一段；自定义链接另见 chatCustomTabs）
+  import {
+    CHAT_TAB_LIBRARY,
+    chatTabDefOf,
+    isChatTabAllowedIn,
+  } from "@/utils/im/chatSubpageTabs";
+  // 页签的模块级状态（显隐偏好 + 会话自定义链接）：聊天页、页签行组件、标签页管理页跨页共享
+  import {
+    bindChatTabsContext,
+    ChatTabsContext,
+    chatCustomLinks,
+    chatCustomLinksConvId,
+    chatTabPrefs,
+    loadChatLinks,
+    onChatCustomLinkEvent,
+    releaseChatTabsForToken,
+    unbindChatTabsContext,
+  } from "@/utils/im/chatTabsStore";
+  // 自定义链接页签（key = link:<id>；URL 规范化）
+  import {
+    CUSTOM_TAB_KEY_PREFIX,
+    customLinkIdOfKey,
+    isCustomLinkTabKey,
+  } from "@/utils/im/chatCustomTabs";
   import { MsgActionItem } from "@/types/interfaces/msgActionItem";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import eventBus from "@/utils/eventBus";
@@ -2394,6 +2418,9 @@
   });
 
   // ===== 子页签行（单聊标题下方：消息/Pin/资料库/文件；群聊复用同组件拼装） =====
+  /** 自定义链接页签的图标（★96×96 PNG，与内置页签同规格；三端都按位图渲染）。 */
+  const CUSTOM_LINK_TAB_ICON = "/static/images/icon-tab-link.png";
+
   function makeSubpageTab(id: string, labelKey: string, icon: string): ChatSubpageTab {
     const tab = new ChatSubpageTab();
     tab.id = id;
@@ -2985,16 +3012,53 @@
     return p2pAgentCheckSettled.value;
   });
 
-  /** 子页签集（★放 members 之后：isAgentP2p 引用它，UTS→Kotlin 不允许前向引用）。 */
+  /**
+   * 子页签集（★放 members 之后：isAgentP2p 引用它，UTS→Kotlin 不允许前向引用）。
+   *
+   * <h2>来源分两段，别混</h2>
+   * <ol>
+   *   <li><b>内置页签</b>：utils/im/chatSubpageTabs 的注册表 + 用户显隐偏好
+   *       （{@code chatTabPrefs} 来自 chatTabsStore 的模块级 ref，「管理标签页」改完立即重算）；</li>
+   *   <li><b>自定义链接</b>：服务端 im_custom_link，key = {@code link:<id>}，追加在内置页签之后，
+   *       顺序就是服务端给的 sortOrder（端上不重排）。</li>
+   * </ol>
+   * ★自定义链接按 {@code chatCustomLinksConvId} 过滤：换会话时新列表要等请求回来才替换，
+   * 中间几帧若不过滤会先画出上一个会话的链接（模块级状态的经典串页）。
+   */
   const subpageTabs = computed<ChatSubpageTab[]>((): ChatSubpageTab[] => {
-    const tabs: ChatSubpageTab[] = [
-      makeSubpageTab("messages", "Mobile.Message.chatTabMessages", "/static/images/icon-tab-messages.png"),
-      makeSubpageTab("pin", "Mobile.Message.chatTabPin", "/static/images/icon-tab-pin.png"),
-    ];
-    if (showLibraryTab.value) {
-      tabs.push(makeSubpageTab("library", "Mobile.Message.chatTabLibrary", "/static/images/icon-tab-library.png"));
+    const tabs: ChatSubpageTab[] = [];
+    const keys = chatTabPrefs.value;
+    for (let i = 0; i < keys.length; i++) {
+      const def = chatTabDefOf(keys[i]);
+      if (def == null) {
+        continue;
+      }
+      // 会话类型 / 对端主体 / 系统会话三条投影：判据全部由页面算好传进去
+      if (!isChatTabAllowedIn(def, isGroupLike.value, isAgentP2p.value, isSystemConvLike.value)) {
+        continue;
+      }
+      // 资料库多一道「判定齐料」闸门：普通单聊要等对端是不是智能体算出来才出现，
+      // 否则先按普通单聊显示、数据到位再隐藏，会闪一下（见 showLibraryTab 头注）
+      if (def.key == CHAT_TAB_LIBRARY && !showLibraryTab.value) {
+        continue;
+      }
+      tabs.push(makeSubpageTab(def.key, def.labelKey, def.icon));
     }
-    tabs.push(makeSubpageTab("files", "Mobile.Message.chatTabFiles", "/static/images/icon-tab-files.png"));
+    // 自定义链接：只在「这批链接确实属于本会话」时追加
+    if (chatCustomLinksConvId.value == convId.value && chatCustomLinksConvId.value.length > 0) {
+      const links = chatCustomLinks.value;
+      for (let i = 0; i < links.length; i++) {
+        const linkTab = new ChatSubpageTab();
+        // ★id 必须是 link:<id>：内置页签用裸 key，两套不许撞
+        linkTab.id = `${CUSTOM_TAB_KEY_PREFIX}${links[i].id}`;
+        // 名字是用户起的，不走 i18n
+        linkTab.label = links[i].name;
+        // ★三端统一用链条 PNG（服务端 icon 字段是 emoji / 短字符，鸿蒙 <text>
+        //   彩色字形渲染不可靠，Android/iOS 也有分辨率差异 —— 见 chatCustomTabs 头注）
+        linkTab.icon = CUSTOM_LINK_TAB_ICON;
+        tabs.push(linkTab);
+      }
+    }
     return tabs;
   });
 
@@ -13384,13 +13448,54 @@
   }
 
   /**
+   * 打开一条自定义链接（网页类标签）。
+   *
+   * ★同源相对路径要先补域名：App 端 web-view 只能加载完整地址，不补全就是白屏。
+   * ★其余交给通用外链入口 handleExternalLink（文档类走预览网关、站内链接走带票
+   *   webview、受保护文件走预览流 —— 这些判断只该有那一份）。
+   */
+  function openChatCustomLinkUrl(rawUrl: string, name: string): void {
+    let url = rawUrl.trim();
+    if (url.length == 0) {
+      return;
+    }
+    if (url.indexOf("/") == 0 && url.indexOf("//") != 0) {
+      const base = getApiBaseUrl();
+      if (base.length > 0) {
+        url = base + url;
+      }
+    }
+    handleExternalLink(url, name);
+  }
+
+  /** 自定义链接页签点按：按 id 找当前链接并打开（找不到 = 别人刚把它删了）。 */
+  function openCustomLinkTab(tabKeyValue: string): void {
+    const linkId = customLinkIdOfKey(tabKeyValue);
+    const links = chatCustomLinks.value;
+    for (let i = 0; i < links.length; i++) {
+      if (links[i].id == linkId) {
+        openChatCustomLinkUrl(links[i].url, links[i].name);
+        return;
+      }
+    }
+    uni.showToast({ title: t("Mobile.Message.chatTabLinkMissing"), icon: "none" });
+  }
+
+  /**
    * 子页签点击（单聊与群聊共用，接口均按 convId 过滤）：
    * - messages：恒为选中（本页就是消息页），点击无动作；
+   * - link:<id>：会话自定义链接，应用内 webview 打开（openCustomLinkTab）；
    * - pin：从右侧进「Pin 消息」独立页（列表/取消Pin/跳转定位）；
    * - library：进会话资料库（handleLibraryTap，空间 docs 页 webview 打开）；
    * - files：复用群文件页（翻历史消息聚合附件），入参带标题「文件」。
    */
   function handleSubpageSelect(id: string): void {
+    // ★自定义链接分支必须在最前面：它的 key 带 link: 前缀，落进下面任何一个
+    //   id == "xxx" 判断都会静默穿过，表现就是「点了没反应」
+    if (isCustomLinkTabKey(id)) {
+      openCustomLinkTab(id);
+      return;
+    }
     if (id == "pin") {
       if (convId.value.length == 0) {
         return;
@@ -14301,6 +14406,35 @@
     jumpLatestCheckTimer = 0;
   }
 
+  // ===== 顶部页签：自定义链接与会话上下文（「+」跳独立管理页，上下文经 chatTabsStore 共享） =====
+  // ★必须定义在 onLoad 之前：UTS 同作用域函数不能前向引用（onLoad 里要把它注册给 eventBus）。
+
+  /**
+   * 注册会话上下文提供者（页签行点「+」时现取一次，拼成管理页的入参）。
+   * ★onShow 里注册：本页可能被别的聊天页压住（navigateTo 叠栈），返回时必须把
+   *   「当前会话」重新指回自己 —— 模块级上下文只记一份，谁最后 onShow 谁说了算。
+   * ★不做成 onLoad 一次性写入：myRole（群主/管理员）与智能体判定都是异步齐料的，
+   *   写快照就要有人在数据到位后再推一次，漏推的表现是「普通成员看到编辑按钮」。
+   */
+  function bindChatTabsForPage(): void {
+    bindChatTabsContext(convId.value, (): ChatTabsContext => {
+      const ctx = new ChatTabsContext();
+      ctx.convId = convId.value;
+      ctx.isGroup = isGroupLike.value;
+      ctx.isAgentP2p = isAgentP2p.value;
+      ctx.isSystemConv = isSystemConvLike.value;
+      // 单聊双方都可改；群聊仅群主/管理员（myRole>=2，见 loadConvInfo）
+      ctx.canEditLinks = isGroupLike.value != true || myRole.value >= 2;
+      ctx.canShowLibrary = showLibraryTab.value;
+      return ctx;
+    });
+  }
+
+  /** WS 3007（custom_link.changed）：只认本会话，收到就重拉（不拿 payload 拼增量）。 */
+  function onImCustomEvent(payload: any): void {
+    onChatCustomLinkEvent(payload);
+  }
+
   onLoad((options: any) => {
     convId.value = readOption(options, "convId");
     // 「N 条新消息」提示：模块级 ref 跨页存活，本页首帧前无条件清零（条数由本页推导，
@@ -14419,6 +14553,9 @@
     eventBus.on(`${EVENT_TYPE.ImMessageReaction}`, onImMessageReaction);
     // 智能体处理状态实时推进（op 3006：处理中转钟 → 终态蓝勾/红叹，仅发送者收到）
     eventBus.on(`${EVENT_TYPE.ImAgentStatus}`, onImAgentStatus);
+    // 会话自定义链接变更（op 3007 custom_link.changed）：只认本会话，收到就重拉列表
+    eventBus.on(`${EVENT_TYPE.ImCustomEvent}`, onImCustomEvent);
+    // ★链接列表的首拉放在 onShow（见 bindChatTabsForPage 上面那段），这里不重复请求。
     // #ifndef H5 || WEB
     // 键盘高度监听（App 三端/小程序；H5 不支持该 API）：驱动 liftPx 刚体平移让位。
     // 保存监听 id 精确注销（无参 off 会清掉全局所有监听，殃及 conversation-input 等组件）；
@@ -14509,6 +14646,10 @@
   });
 
   onUnload(() => {
+    // 顶部页签：解除本页对模块级 store 的注册（清链接列表与「打开链接」回调）。
+    // ★只在这里清、不在 onHide 清：进子页（Pin/文件/资料库）会走 onHide，那时清掉
+    //   就等于每次返回都重拉一遍，标签行还会先空一帧。串会话由 convId 守卫兜住。
+    releaseChatTabsForToken(convId.value);
     // 「N 条新消息」：解除点击回调注册（按会话 id token，只清自己的；条数不复位——
     // 退页后由下一个聊天页 onLoad 首帧前清零，避免误伤 navigateBack 后被返回页 onShow
     // 刚写回的值，同下方合规提示的先后坑）
@@ -14596,6 +14737,7 @@
     eventBus.off(`${EVENT_TYPE.ImConversationUnread}`, onImConvUnread);
     eventBus.off(`${EVENT_TYPE.ImMessageReaction}`, onImMessageReaction);
     eventBus.off(`${EVENT_TYPE.ImAgentStatus}`, onImAgentStatus);
+    eventBus.off(`${EVENT_TYPE.ImCustomEvent}`, onImCustomEvent);
     clearAgentClockTimers();
     clearImgSpinTimers();
     if (readRefreshTimer != 0) {
@@ -14617,6 +14759,13 @@
     // 返回本页必须按本页判据重写。★无条件写（不再用齐料门控）：首次 onShow 与 onLoad
     // 的值同源同值（幂等不影响首帧）；而一旦门控把某次返回挡掉，提示就永久丢了。
     applyAiContentHint();
+    // 顶部页签：把「当前会话上下文」指回本页（叠栈返回时必须重指，见 bindChatTabsForPage）
+    bindChatTabsForPage();
+    // 链接列表缺失就补拉：进子页（onHide）不清列表，但首进页 / 被隐藏期间晚归的请求
+    // 被守卫丢弃时，这里会把列表补回来（已加载过就不会重复请求）
+    if (chatCustomLinksConvId.value != convId.value) {
+      loadChatLinks(convId.value, false);
+    }
     // 「N 条新消息」：回前台/回页重新注册点击回调，并按当前行重算提示——息屏/锁屏/
     // 退后台期间到达的消息可能刚由 WS 补拉或下面的静默同步落地（贴底探测随后校准
     // 基线：仍在底部则基线推进、提示清零，否则亮出「N 条新消息」）。
@@ -14703,6 +14852,9 @@
   });
 
   onHide(() => {
+    // 顶部页签：只摘上下文、不清链接列表（token 守卫，见 unbindChatTabsContext 注释）。
+    // ★必须在下面 pageVisible=false 之前做也无所谓，它只改模块级注册。
+    unbindChatTabsContext(convId.value);
     // 合规提示不复位（见 applyAiContentHint / onShow / onUnload 注释）：这里写 false 会让
     // 「进子页再返回本页」丢提示，而复位本身挡不住任何真实泄漏——每个聊天页 onLoad 都在
     // 首帧前无条件写自己的值。

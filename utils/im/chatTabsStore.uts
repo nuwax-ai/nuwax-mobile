@@ -1,0 +1,469 @@
+import { ref, type Ref } from "vue";
+import type { RequestResponse } from "@/types/interfaces/request";
+import {
+  apiImConvAddLink,
+  apiImConvLinks,
+  apiImConvRemoveLink,
+  apiImConvReorderLinks,
+  apiImConvUpdateLink,
+} from "@/servers/im";
+import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+import {
+  CustomLinkTab,
+  isCustomLinkChangeFor,
+  normalizeCustomLinkIcon,
+  normalizeCustomLinkName,
+  normalizeCustomLinkUrl,
+  parseCustomLinkTabs,
+  validateCustomLinkInput,
+} from "./chatCustomTabs";
+import { readChatTabPrefs, saveChatTabPrefs } from "./chatSubpageTabs";
+
+/**
+ * 聊天页顶部页签的**模块级状态**（内置页签显隐 + 会话自定义链接）。
+ *
+ * <h2>为什么是模块级 store 而不是聊天页的 state</h2>
+ * 同一个会话的页签数据有三个使用者：聊天页（渲染标签行）、页签行组件（「+」跳转时
+ * 要会话上下文）、独立的「标签管理」页（subpackages/pages/im-chat-tabs）。
+ * 三者是**不同页面实例**，跨页传值只能走模块级 ref。
+ * 附带好处：聊天页本身不必为页签再多引模板符号 —— chat.uvue 的渲染 lambda 捕获参数
+ * 已顶到 255 上限（多一个就 R8 桩超限 → Android `VerifyError` → 整页加载失败）。
+ *
+ * <h2>★上下文只存一份，谁最后 bind 谁说了算</h2>
+ * 「当前会话」不止聊天页知道：管理页跳进来时聊天页会 onHide（摘掉上下文），
+ * 它必须用自己的 token 重新 bind（见该页文件头）。两个 token **必须不同**
+ * （聊天页用裸 convId，管理页用 {@code tabspage:<convId>}），否则返回时两页的
+ * 生命周期先后不定，会互相清掉对方刚注册的那份。
+ *
+ * <h2>会话上下文为什么是「提供者回调」而不是几个字段</h2>
+ * 页面在 onLoad 时还不知道是不是群聊、我是不是管理员（loadConvInfo 回来才知道）。
+ * 若用 setter 推快照，晚到的那次必须有人记得再推一遍，漏一次的表现是
+ * 「群里普通成员也能看到编辑按钮」这种越权显隐错。改成页面注册一个 getter，
+ * 组件每次要上下文时现取 —— 页面侧的响应式值天然是最新的。
+ *
+ * <h2>两套真源，别混</h2>
+ * <ul>
+ *   <li>{@link chatTabPrefs}：内置页签**显隐**，存本地存储，不跨设备（对齐 PC 的 localStorage）；</li>
+ *   <li>{@link chatCustomLinks}：会话自定义链接，服务端 im_custom_link，**会话成员共享**。</li>
+ * </ul>
+ *
+ * <h2>★离开页面必须复位</h2>
+ * 模块级 ref 的生命周期跟进程走：不清的话，从 B 会话退出后列表还挂着 A 会话的链接，
+ * 下一个进页在首帧会先画出别人的链接行（记忆里「零绑定组件模块 ref 跨页残留」那一课）。
+ * 页面 onHide/onUnload 调 {@link releaseChatTabsForToken}（token 守卫：多聊天页堆叠时
+ * 后进页面的注册不会被先退出页面清掉）。
+ */
+
+/** 内置页签显隐偏好（全量 key，含当前会话不显示的那些 —— 见 setChatTabEnabled 注释）。 */
+export const chatTabPrefs: Ref<string[]> = ref<string[]>(readChatTabPrefs());
+
+/** 当前会话的自定义链接（已按服务端顺序排好，端上不重排）。 */
+export const chatCustomLinks: Ref<CustomLinkTab[]> = ref<CustomLinkTab[]>([]);
+
+/**
+ * {@link chatCustomLinks} 属于哪个会话（空串 = 没有）。
+ * ★渲染侧必须拿它和当前 convId 比对：换会话时列表要等新请求回来才替换，
+ *   中间那几帧若不过滤，标签行会先画出上一个会话的链接。
+ */
+export const chatCustomLinksConvId: Ref<string> = ref<string>("");
+
+/** 链接列表是否在途。 */
+export const chatLinksLoading: Ref<boolean> = ref<boolean>(false);
+
+/** 链接列表上次拉取失败（UI 显示可点重拉的空态）。 */
+export const chatLinksFailed: Ref<boolean> = ref<boolean>(false);
+
+/** 会话上下文快照。 */
+export class ChatTabsContext {
+  convId: string = "";
+  /** 是否群聊。 */
+  isGroup: boolean = false;
+  /** 与智能体的单聊（资料库这类页签在里面没有内容）。 */
+  isAgentP2p: boolean = false;
+  /** 系统通知会话。 */
+  isSystemConv: boolean = false;
+  /** 我能否改本会话的自定义链接（单聊恒 true；群聊仅群主/管理员）。 */
+  canEditLinks: boolean = true;
+  /**
+   * 本会话能不能用「资料库」。
+   * ★它与上一条正交：智能体单聊里资料库本就不适用（hiddenInAgentP2p），
+   *   而普通会话也可能因为拿不到空间而暂时不可用（chat.uvue 的 showLibraryTab 闸门）。
+   *   管理/添加菜单必须跟着一起挡，否则会造出一个「勾了不出现」的死按钮。
+   */
+  canShowLibrary: boolean = false;
+}
+
+let ctxToken: string = "";
+let ctxProvider: (() => ChatTabsContext) | null = null;
+
+/**
+ * 页面进页时注册上下文提供者。
+ *
+ * @param token 归属标记（用 convId 即可），用于 {?link releaseChatTabsForToken} 的守卫
+ */
+export function bindChatTabsContext(token: string, provider: () => ChatTabsContext): void {
+  ctxToken = token;
+  ctxProvider = provider;
+}
+
+/**
+ * 本页隐藏（onHide）时只摘掉上下文，**不清链接列表**。
+ *
+ * <p>两个作用：
+ * <ol>
+ *   <li>叠栈时「只有当前可见页说了算」——弹层靠「有没有上下文」判断要不要响应
+ *       「+」，隐藏页的弹层因此不会在后台被打开、返回时突然盖一层；</li>
+ *   <li>token 守卫让两种生命周期顺序都正确（谁最后 onShow 谁生效，
+ *       隐藏页的清理不会把刚 onShow 的页清掉）。</li>
+ * </ol>
+ * ★为什么不清列表：进子页（Pin / 文件 / 资料库）也会走 onHide，清掉就等于每次返回
+ *   都重拉一遍、标签行还先空一帧。串会话由 chatCustomLinksConvId 比对兜住。
+ */
+export function unbindChatTabsContext(token: string): void {
+  if (token.length == 0 || token != ctxToken) {
+    return;
+  }
+  ctxToken = "";
+  ctxProvider = null;
+}
+
+/**
+ * 解除注册并清掉本会话的链接列表（onUnload 用）。
+ *
+ * ★闸门写成「等于自己的 token **或** 上下文当前为空」：正常退页的顺序是
+ *   onHide（已把上下文摘成空）→ onUnload，只比 token 会把这次清理整个跳过，
+ *   链接列表就残留在模块里串给下一个会话。而叠栈场景里 ctxToken 已被后进页改写，
+ *   此时 token 既不相等也不为空 ⇒ 不误清别人那份。
+ */
+export function releaseChatTabsForToken(token: string): void {
+  if (token.length == 0) {
+    return;
+  }
+  if (ctxToken.length > 0 && token != ctxToken) {
+    return;
+  }
+  ctxToken = "";
+  ctxProvider = null;
+  chatCustomLinks.value = [];
+  chatCustomLinksConvId.value = "";
+  chatLinksLoading.value = false;
+  chatLinksFailed.value = false;
+}
+
+/** 现取一次上下文（页面没注册就返回空快照，调用方按「无会话」处理）。 */
+export function currentChatTabsContext(): ChatTabsContext {
+  const provider = ctxProvider;
+  if (provider != null) {
+    return provider();
+  }
+  return new ChatTabsContext();
+}
+
+/** 当前会话 id（空串 = 页面还没注册）。 */
+export function chatTabsConvId(): string {
+  return currentChatTabsContext().convId;
+}
+
+/** 文案（本模块与组件共用一套取法，保持与项目其它 .uts 一致）。 */
+export function chatTabsText(key: string): string {
+  return translateFn(key, emptyI18nParams(), "");
+}
+
+// ===== 内置页签显隐 =====
+
+/**
+ * 勾选/取消一个内置页签。
+ *
+ * ★按 key 增删、其余原样保留：管理弹窗只列本会话适用的项，若拿"列出来的那些"
+ * 重算偏好，会把没列出的项从偏好里静默删掉（PC DEV-265 实测踩过：
+ * 单聊里勾一下，切回群聊那几项就没了）。
+ */
+export function setChatTabEnabled(key: string, enabled: boolean): void {
+  const current = chatTabPrefs.value;
+  const next: string[] = [];
+  for (let i = 0; i < current.length; i++) {
+    if (current[i] != key) {
+      next.push(current[i]);
+    }
+  }
+  if (enabled) {
+    next.push(key);
+  }
+  chatTabPrefs.value = saveChatTabPrefs(next);
+}
+
+/** 当前偏好里是否勾着某内置页签（管理弹窗的勾选态）。 */
+export function isChatTabEnabled(key: string): boolean {
+  const current = chatTabPrefs.value;
+  for (let i = 0; i < current.length; i++) {
+    if (current[i] == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ===== 自定义链接 =====
+
+/** 校验错误码 → 可显示文案（空串 = 没有错误）。 */
+export function chatTabErrorText(code: string): string {
+  if (code == "full") {
+    return chatTabsText("Mobile.Message.chatTabErrFull");
+  }
+  if (code == "url_invalid") {
+    return chatTabsText("Mobile.Message.chatTabErrUrlInvalid");
+  }
+  if (code == "url_duplicate") {
+    return chatTabsText("Mobile.Message.chatTabErrUrlDuplicate");
+  }
+  if (code == "name_empty") {
+    return chatTabsText("Mobile.Message.chatTabErrNameEmpty");
+  }
+  if (code == "name_too_long") {
+    return chatTabsText("Mobile.Message.chatTabErrNameTooLong");
+  }
+  if (code == "icon_too_long") {
+    return chatTabsText("Mobile.Message.chatTabErrIconTooLong");
+  }
+  return "";
+}
+
+/** 列表里按 id 找一条（找不到 null）。 */
+export function chatLinkOf(linkId: string): CustomLinkTab | null {
+  const links = chatCustomLinks.value;
+  for (let i = 0; i < links.length; i++) {
+    if (links[i].id == linkId) {
+      return links[i];
+    }
+  }
+  return null;
+}
+
+/** 接口失败统一文案：服务端 message 优先（那是给人看的），否则通用「操作失败」。 */
+function failText(res: RequestResponse<any>): string {
+  const msg = apiResMessage(res);
+  return msg.length > 0 ? msg : chatTabsText("Mobile.Common.operationFailed");
+}
+
+/**
+ * 拉当前会话的自定义链接。
+ *
+ * @param convId 目标会话；空串直接返回
+ * @param silent true = 后台静默刷新（保留旧列表、不置 loading；WS 3007 与回页用）
+ */
+export async function loadChatLinks(convId: string, silent: boolean): Promise<void> {
+  if (convId.length == 0) {
+    return;
+  }
+  if (!silent) {
+    chatLinksLoading.value = true;
+    chatLinksFailed.value = false;
+  }
+  try {
+    const res = await apiImConvLinks(convId);
+    // 晚归守卫：期间换了会话/离开页面 ⇒ 丢弃（否则会写进别人的列表）
+    if (convId != chatTabsConvId()) {
+      return;
+    }
+    if (apiResCode(res) != SUCCESS_CODE) {
+      if (!silent) {
+        chatLinksFailed.value = true;
+      }
+      return;
+    }
+    const dataRaw = apiResData<any>(res);
+    const rows: UTSJSONObject[] | null = dataRaw != null ? (dataRaw as UTSJSONObject[]) : null;
+    const next: CustomLinkTab[] = [];
+    if (rows != null) {
+      const parsed = parseCustomLinkTabs(rows);
+      for (let i = 0; i < parsed.length; i++) {
+        next.push(parsed[i]);
+      }
+    }
+    chatCustomLinks.value = next;
+    chatCustomLinksConvId.value = convId;
+    chatLinksFailed.value = false;
+  } catch (_error) {
+    if (!silent && convId == chatTabsConvId()) {
+      chatLinksFailed.value = true;
+    }
+  } finally {
+    if (!silent) {
+      chatLinksLoading.value = false;
+    }
+  }
+}
+
+/**
+ * 新增一条自定义链接。
+ *
+ * @returns 空串 = 成功；否则是可显示的错误文案（本地校验 / 服务端 message）
+ */
+export async function addChatLink(name: string, url: string): Promise<string> {
+  const convId = chatTabsConvId();
+  if (convId.length == 0) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+  // 校验整段委托给 chatCustomTabs（单一路径，避免两处判据分叉）
+  const code = validateCustomLinkInput(name, "", url, "", chatCustomLinks.value);
+  if (code.length > 0) {
+    return chatTabErrorText(code);
+  }
+  const finalUrl = normalizeCustomLinkUrl(url);
+  const finalName = normalizeCustomLinkName(name, finalUrl);
+  try {
+    // ★图标恒传空串：App 不做图标输入（emoji 在鸿蒙 <text> 上渲染不可靠，三端统一用
+    //   static/images/icon-tab-link.png）。空串 = 服务端默认图标，无副作用。
+    const res = await apiImConvAddLink(convId, finalName, "", finalUrl);
+    if (apiResCode(res) != SUCCESS_CODE) {
+      return failText(res);
+    }
+    await loadChatLinks(convId, true);
+    return "";
+  } catch (_error) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+}
+
+/**
+ * 修改一条自定义链接（名称 / 网址）。
+ *
+ * ★icon 原样回传：App 不提供图标输入，但 PC 端可能给这条设过 emoji ——
+ *   传空串会被服务端当成「清空图标」，等于用 App 编辑一次就把 PC 的图标抹掉了。
+ */
+export async function updateChatLink(
+  linkId: string,
+  name: string,
+  url: string,
+): Promise<string> {
+  const convId = chatTabsConvId();
+  if (convId.length == 0 || linkId.length == 0) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+  // 判重范围要**去掉被编辑那条**，否则「什么都不改直接保存」会被自己的 URL 判成重复
+  const others: CustomLinkTab[] = [];
+  let icon = "";
+  const links = chatCustomLinks.value;
+  for (let i = 0; i < links.length; i++) {
+    if (links[i].id == linkId) {
+      icon = links[i].icon;
+    } else {
+      others.push(links[i]);
+    }
+  }
+  const code = validateCustomLinkInput(name, icon, url, linkId, others);
+  if (code.length > 0) {
+    return chatTabErrorText(code);
+  }
+  const finalUrl = normalizeCustomLinkUrl(url);
+  const finalName = normalizeCustomLinkName(name, finalUrl);
+  try {
+    const res = await apiImConvUpdateLink(
+      convId,
+      linkId,
+      finalName,
+      normalizeCustomLinkIcon(icon),
+      finalUrl,
+    );
+    if (apiResCode(res) != SUCCESS_CODE) {
+      return failText(res);
+    }
+    await loadChatLinks(convId, true);
+    return "";
+  } catch (_error) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+}
+
+/** 删除一条自定义链接（服务端业务幂等：删不存在的 id 也算成功）。 */
+export async function removeChatLink(linkId: string): Promise<string> {
+  const convId = chatTabsConvId();
+  if (convId.length == 0 || linkId.length == 0) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+  try {
+    const res = await apiImConvRemoveLink(convId, linkId);
+    if (apiResCode(res) != SUCCESS_CODE) {
+      return failText(res);
+    }
+    await loadChatLinks(convId, true);
+    return "";
+  } catch (_error) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+}
+
+/**
+ * 上移 / 下移一条自定义链接。
+ *
+ * ★排序改的是**会话级共享顺序**（sortOrder），同会话所有人看到的标签行一起变。
+ * ★reorder 必须传当前**全部** id（从左到右），不是只传被移动那条；集合与服务端不一致
+ *   （别人刚增删）报 IM_90001 ⇒ 正确处理是重拉列表让用户再操作，不要用同一组 id 重试。
+ *
+ * @param delta -1 = 上移 / +1 = 下移
+ */
+export async function moveChatLink(linkId: string, delta: number): Promise<string> {
+  const convId = chatTabsConvId();
+  if (convId.length == 0) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+  const links = chatCustomLinks.value;
+  let from = -1;
+  for (let i = 0; i < links.length; i++) {
+    if (links[i].id == linkId) {
+      from = i;
+      break;
+    }
+  }
+  const to = from + delta;
+  if (from < 0 || to < 0 || to >= links.length) {
+    // 已在首/末：什么都不做（UI 上按钮本来就该禁用，这里是双保险）
+    return "";
+  }
+  const ids: string[] = [];
+  for (let i = 0; i < links.length; i++) {
+    if (i == from) {
+      ids.push(links[to].id);
+    } else if (i == to) {
+      ids.push(links[from].id);
+    } else {
+      ids.push(links[i].id);
+    }
+  }
+  try {
+    const res = await apiImConvReorderLinks(convId, ids);
+    if (apiResCode(res) != SUCCESS_CODE) {
+      // ★集合不一致 / 任何失败：都重拉一次真实顺序，别让本地顺序与服务端分叉
+      await loadChatLinks(convId, true);
+      return failText(res);
+    }
+    const dataRaw = apiResData<any>(res);
+    const rows = dataRaw != null ? (dataRaw as UTSJSONObject[]) : null;
+    if (rows != null && rows.length > 0) {
+      // 服务端返回重排后的完整列表，直接覆盖（省一次 GET）
+      chatCustomLinks.value = parseCustomLinkTabs(rows);
+      chatCustomLinksConvId.value = convId;
+    } else {
+      await loadChatLinks(convId, true);
+    }
+    return "";
+  } catch (_error) {
+    return chatTabsText("Mobile.Common.operationFailed");
+  }
+}
+
+/**
+ * WS {@code MSG_CUSTOM_EVENT(3007) / custom_link.changed} 入口（页面 eventBus 收到后转交）。
+ *
+ * ★事件只是「变了」的信号：收到后**重拉列表**，不拿 payload 里的 link 做本地增量拼接
+ *   （payload 可能只带被改的那一条，也可能是别人端的视角）。
+ */
+export function onChatCustomLinkEvent(payload: any): void {
+  const convId = chatTabsConvId();
+  if (!isCustomLinkChangeFor(payload, convId)) {
+    return;
+  }
+  loadChatLinks(convId, true);
+}

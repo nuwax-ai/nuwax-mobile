@@ -2,7 +2,7 @@
 
 移动端一对一电话式通话桥。当前为接入验证实现，生产入口关闭；完整验收状态见 [验收记录](../../docs/engineering/voip-acceptance.md)。
 
-UTS 不直接持有 SDK 对象，使用 JSON 命令和事件队列隔离 Kotlin/Swift/ArkTS 类型。应用级管理器在 `utils/voip/callManager.uts`。
+UTS 不直接持有 SDK 对象，使用 JSON 命令和事件队列隔离 Kotlin/Swift/ArkTS 类型。应用级管理器在 `features/voip/callManager.uts`。
 
 | API / 命令 | 含义 |
 | --- | --- |

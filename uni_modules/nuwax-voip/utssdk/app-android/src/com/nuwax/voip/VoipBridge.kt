@@ -95,6 +95,8 @@ object VoipBridge {
         val manager = ctx.getSystemService(NotificationManager::class.java)
         val channel = manager.getNotificationChannel("nuwax-voip")
         return JSONObject().put("supported", true)
+            .put("developmentListener", VoipDevControlService.running)
+            .put("uniPushConfigured", ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA).metaData?.getBoolean("nuwax.voip.uniPush", false) == true)
             .put("notificationsAllowed", NotificationManagerCompat.from(ctx).areNotificationsEnabled())
             .put("fullScreenAllowed", Build.VERSION.SDK_INT < 34 || manager.canUseFullScreenIntent())
             .put("channelEnabled", channel == null || channel.importance >= NotificationManager.IMPORTANCE_HIGH).toString()
@@ -108,6 +110,7 @@ object VoipBridge {
         ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + ctx.packageName)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
     internal fun label(key: String): String = config.optJSONObject("labels")?.optString(key, key) ?: key
+    internal fun developmentListenerAllowed(ctx: Context): Boolean = isTestPackage(ctx) && config.optBoolean("development") && config.optString("accessToken").isNotEmpty()
     internal fun uiSnapshot(id: String): JSONObject? {
         val value = current ?: return null
         if (value.optString("callId") != id || value.optString("state") == "ended") return null
@@ -143,6 +146,12 @@ object VoipBridge {
                 if (command.optString("op") in listOf("action", "microphone", "camera", "speaker", "audioRoute", "switchCamera") &&
                     command.optString("callId") != current?.optString("callId")) return@launch
                 when (command.optString("op")) {
+                    "developmentListener" -> {
+                        if (command.optBoolean("enabled")) {
+                            check(developmentListenerAllowed(ctx) && !hidden)
+                            ContextCompat.startForegroundService(ctx, Intent(ctx, VoipDevControlService::class.java))
+                        } else ctx.stopService(Intent(ctx, VoipDevControlService::class.java))
+                    }
                     "reset" -> reset()
                     "watch" -> adopt(command.getJSONObject("snapshot"))
                     "action" -> act(command.optString("action"), command.optString("answerMediaType", "audio"))
@@ -500,6 +509,7 @@ object VoipBridge {
         }
     }
     private fun reset() {
+        context?.stopService(Intent(context, VoipDevControlService::class.java))
         closeServerCall()
         generation++; streamCall?.cancel(); streamJob?.cancel(); streamJob = null; finish("sessionChanged")
         config = JSONObject(); terminal.clear(); queue.clear()

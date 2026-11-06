@@ -24,6 +24,25 @@ s=s[:start]+'''    self.window = self.sdkSceneDelegate.window;
     ((AppDelegate *)UIApplication.sharedApplication.delegate).window = self.window;
     [self.window makeKeyAndVisible];'''+s[end:]
 scene.write_text(s)
+# The SDK may restore the demo storyboard when rebuilding a scene. Its root must
+# enter the test app automatically, including after a cold launch or SDK exit.
+(APP/'ViewController.m').write_text('''#import "ViewController.h"
+#import "UniAppX-Swift.h"
+
+@interface ViewController ()
+@property (nonatomic) BOOL openingTestApp;
+@end
+
+@implementation ViewController
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (self.openingTestApp || self.presentedViewController) return;
+    self.openingTestApp = YES;
+    [UniAppBridge presentWithDefaultAnimationWithRootViewController:self];
+    self.openingTestApp = NO;
+}
+@end
+''')
 info=plistlib.loads((APP/'Info.plist').read_bytes())
 version=json.loads((RES/'__UNI__8BF05E4/www/manifest.json').read_text())['version']
 info.update(CFBundleIdentifier='$(PRODUCT_BUNDLE_IDENTIFIER)',CFBundleExecutable='$(EXECUTABLE_NAME)',CFBundleName='$(PRODUCT_NAME)',CFBundlePackageType='APPL',CFBundleInfoDictionaryVersion='6.0',

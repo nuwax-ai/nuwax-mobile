@@ -63,9 +63,12 @@ assemble 入口使用 DevEco 自带的 Node/JBR/hvigor，先执行 prepare 再�
 
 ## 集成边界
 
-- `utils/voip/callManager.uts`：账号隔离、单呼叫占用、原生事件收敛、权限、页面入口。
+客户端应用层集中在 `features/voip`，目录和对外入口见 [模块说明](../../features/voip/README.md)。正式接口切换、三端差异和对接批次见 [后端交接](voip-backend-integration.md)。
+
+
+- `features/voip/callManager.uts`：账号隔离、单呼叫占用、原生事件收敛、权限、页面入口。
 - `uni_modules/nuwax-voip`：三端原生媒体、系统来电与独立控制连接；UTS polling 只用于界面投影，后台不靠它运行。
-- `utils/voip/audioFocus.uts`：通话占用期间阻止录音/播报；释放后不自动恢复旧录音。消息音视频与通话互斥。
+- `features/voip/audioFocus.uts`：通话占用期间阻止录音/播报；释放后不自动恢复旧录音。消息音视频与通话互斥。
 - Android 国内厂商 / FCM 接收器必须把通话邀请交给原生 `incoming()` hook；供应商具体分发配置和真机送达仍是验收项。不要把普通 IM 推送当作通话邀请。
 - 后端按 [客户端契约](voip-client-contract.md) 实现；正式智能体由后端接入，开发合成音轨不能替代。
 

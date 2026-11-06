@@ -2,9 +2,11 @@
 
 本分支实现电话式单呼。会议、屏幕共享、录制、SIM、SIP/PSTN 不在范围内。LiveKit 只负责媒体；它的 room 不能代替业务呼叫、忙线、抢接和权限裁决。本文接口是**拟新增契约**，不是现网接口清单。没有修改 `agent-platform` 或独立 IM 服务。
 
+正式对接顺序、客户端修改入口与待确认项见 [交接说明](voip-backend-integration.md)。开发专属 `/dev/login`、`/health`、`/diagnostics` 和 `/dev/inject` 仅供测试工具使用。
+
 ## 传输与身份
 
-正式环境 HTTPS/WSS。REST 与 SSE 使用 `Authorization: Bearer <平台登录凭据>` 和 `X-Call-Device-Id: <设备标识>`；凭据不进入推送、页面 URL、日志。所有 ID（用户、会话、设备、呼叫）按字符串处理。响应沿用 `{code:"0000",data:{...},message:""}`；失败 `data:null`，`code` 是稳定错误码。客户端展示 i18n 文案，不直接展示后端错误正文。
+正式环境 HTTPS/WSS。REST 与 SSE 使用 `Authorization: Bearer <平台登录凭据>` 和 `X-Call-Device-Id: <设备标识>`；凭据不进入推送、页面 URL、日志。所有 ID（用户、会话、设备、呼叫）按字符串处理。REST 业务成功和业务错误均以 HTTP 200 返回信封，鉴权失效使用 HTTP 401/403。响应沿用 `{code:"0000",data:{...},message:""}`；失败 `data:null`，`code` 是稳定错误码。客户端展示 i18n 文案，不直接展示后端错误正文。
 
 客户端只能基于有权限的单聊会话创建呼叫。服务端从会话成员计算对端，不能相信客户端指定的 callee、房间名或 LiveKit identity。智能体也作为明确的会话参与方，由智能体接入服务加入；视频传输能力不表示模型能理解视频。
 

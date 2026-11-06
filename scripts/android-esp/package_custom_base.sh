@@ -60,6 +60,7 @@ write_local_properties "$PROJ"
 echo "==== 1) sync + inject + configure ===="
 "$SCRIPT_DIR/sync_local_pack_resources.sh"
 python3 "$SCRIPT_DIR/configure_app.py"
+ANDROID_ESP_PROJECT="$PROJ" python3 "$WT_ROOT/scripts/voip-native/device/configure-android.py"
 
 echo "==== 2) gradlew ${GRADLE_TASK} (pack only, BUILD_TYPE=${BUILD_TYPE}) ===="
 cd "$PROJ"

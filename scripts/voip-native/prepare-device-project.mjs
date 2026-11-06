@@ -7,6 +7,9 @@ const output = resolve(root, 'out/voip-device-project');
 await mkdir(output, { recursive: true });
 // Keep one isolated, reproducible source snapshot; native builds/resources never touch the main checkout.
 for (const folder of ['constants','utils','servers','types','hooks']) await cp(join(root,folder),join(output,folder),{recursive:true});
+await rm(join(output,'features/voip'),{recursive:true,force:true});
+await cp(join(root,'features/voip'),join(output,'features/voip'),{recursive:true});
+await rm(join(output,'utils/voip'),{recursive:true,force:true});
 for (const plugin of ['nuwax-voip','nuwax-device-identity','nuwax-stream-pcm-player']) {
   const target=join(output,'uni_modules',plugin); await rm(target,{recursive:true,force:true});
   await cp(join(root,'uni_modules',plugin),target,{recursive:true});

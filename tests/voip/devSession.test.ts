@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({ allowed: true, consent: true, storage: new Map<string, unknown>(), requests: [] as any[] }));
-vi.mock('../../utils/voip/development.uts', () => ({ isVoipDevelopmentBuild: () => state.allowed }));
+vi.mock('../../features/voip/development.uts', () => ({ isVoipDevelopmentBuild: () => state.allowed }));
 vi.mock('../../utils/appPrivacyConsent.uts', () => ({ hasAppPrivacyConsent: () => state.consent }));
 vi.mock('../../constants/config.uts', () => ({ getApiBaseUrl: () => 'https://platform.example', normalizeApiBaseUrl: (url: string) => url.trim() }));
 vi.mock('../../servers/im.uts', () => ({ getImDeviceId: () => 'test-device' }));
-import { loginVoipDev, setVoipDevSession, readVoipDevSession, probeVoipDevServer, voipSessionConfig } from '../../servers/voip.uts';
+import { loginVoipDev, setVoipDevSession, readVoipDevSession, probeVoipDevServer, voipSessionConfig, registerVoipDevPush } from '../../servers/voip.uts';
 beforeEach(() => {
   state.allowed = true; state.consent = true; state.storage.clear(); state.requests = [];
   vi.stubGlobal('UTSJSONObject', class { constructor(value = {}) { Object.assign(this, value); } });
@@ -21,6 +21,21 @@ function complete(index: number, userId: string) {
   state.requests[index].success({ statusCode: 200, data: { code: '0000', data: { userId, accessToken: `${userId}-fixture-token` } } });
 }
 describe('explicit device-test session', () => {
+  it('does not bind a late push CID to a replacement identity', async () => {
+    const old = { enabled: true, apiBaseUrl: 'http://test-service:7890', userId: 'alice', accessToken: 'old-fixture' };
+    setVoipDevSession(old);
+    setVoipDevSession({ ...old, userId: 'bob', accessToken: 'new-fixture' });
+    await expect(registerVoipDevPush(old, 'cid-fixture')).rejects.toThrow('CALL_SESSION_CHANGED');
+    expect(state.requests).toHaveLength(0);
+  });
+  it('registers a test CID in its own channel and environment', async () => {
+    const session = { enabled: true, apiBaseUrl: 'http://test-service:7890', userId: 'alice', accessToken: 'test-fixture' };
+    setVoipDevSession(session);
+    const pending = registerVoipDevPush(session, 'cid-fixture');
+    expect(state.requests[0].data).toEqual({ channel: 'uniPush', token: 'cid-fixture', environment: 'development' });
+    state.requests[0].success({ statusCode: 200, data: { code: '0000', data: { registered: true, nativePush: false } } });
+    await expect(pending).resolves.toEqual({ registered: true, nativePush: false });
+  });
   it('logout discards a late development login response', async () => {
     const pending = loginVoipDev('http://test-service:7890', 'alice');
     setVoipDevSession(null); complete(0, 'alice');

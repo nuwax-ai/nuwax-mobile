@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CallSnapshot, CallStateStore } from "../../utils/voip/callState.uts";
+import { CallSnapshot, CallStateStore } from "../../features/voip/callState.uts";
 
 function snapshot(overrides: Partial<CallSnapshot> = {}) {
   return Object.assign(new CallSnapshot(), { callId: "c1", convId: "9007199254740993123", version: 1,

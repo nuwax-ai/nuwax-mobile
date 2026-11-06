@@ -394,10 +394,6 @@ def configure_manifest() -> None:
     # scheme
     text = text.replace("hellouniappx", "nuwax")
     text = text.replace("uniappxhello", "nuwaxapp")
-    # Explicit test marker is ignored unless the installed APK is debuggable.
-    text = re.sub(r'\s*<meta-data\s+android:name="nuwax\.voip\.deviceTest"\s+android:value="[^"]*"\s*/>', '', text)
-    if os.environ.get("NUWAX_VOIP_DEVICE_TEST") == "1":
-        text = text.replace("</application>", '        <meta-data android:name="nuwax.voip.deviceTest" android:value="true" />\n    </application>')
     text = text.replace(
         '@style/UniAppX.Activity.DefaultTheme',
         '@style/Theme.Nuwax.UniAppContent',

@@ -174,6 +174,23 @@ function normalizePayload(payload) {
   return slim
 }
 
+/**
+ * 把未读总数塞进 payload。
+ * ★为什么必须这么做：iOS 退后台但进程仍存活时（本项目 UIBackgroundModes 含 audio），
+ *   个推长连接不断 ⇒ 服务端判定「在线」，推送以**在线透传**回调到 JS，**不走 APNs**，
+ *   顶层 badge 在这一刻不生效（桌面角标不动；Android 走厂商通道所以正常）。
+ *   端上只能从 payload 里拿数字自己调 setAppBadgeNumber 补设，见
+ *   utils/im/imPushClient.uts → showLocalNoticeForReceive。
+ * ★payload 上限 800 字符，超了宁可不加：透传被截断/丢弃比少个角标严重得多。
+ */
+function attachBadgeToPayload(payload, badge) {
+  const n = parseBadgeCount(badge)
+  if (n === null) return payload
+  const out = Object.assign({}, payload)
+  out.badge = n
+  return JSON.stringify(out).length <= MAX_PAYLOAD ? out : payload
+}
+
 exports.main = async (event) => {
   if (!verifySign(event)) {
     console.error('[push-send] rejected: invalid sign')
@@ -197,7 +214,8 @@ exports.main = async (event) => {
   // 长度限制：厂商通道会静默截断甚至拒绝，这里先按官方上限裁好（按码点裁，不切坏 emoji）
   const title = clip(body.title, MAX_TITLE)
   const content = clip(body.content, MAX_CONTENT)
-  const payload = normalizePayload(body.payload)
+  // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
+  const payload = attachBadgeToPayload(normalizePayload(body.payload), body.badge)
   const category = body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)

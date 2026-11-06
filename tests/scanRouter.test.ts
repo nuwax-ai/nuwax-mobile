@@ -5,6 +5,7 @@
  * ?g={群号}[&c=convId]——外部扫码落下载页引导安装，App 内扫码按 query 判型，
  * 不依赖 API 域名（域名经 setApiBaseUrl / resetApiBaseUrl 走真实配置代码路径控制，
  * tests/setup.ts 已 mock uni storage）。
+ * 任意 http(s) URL 只要同时带纯数字 g+c，也必须按群码处理且优先于其它 URL 路由。
  * 旧格式（API 域名 /u/ 个人码、group# 文本群码）仅为兼容已分享历史码保留识别，
  * 「match 容错」describe 即旧格式兼容用例（手写字面量）。
  */
@@ -15,6 +16,7 @@ import {
   extractUrlQueryValue,
   matchDownloadCardUrl,
   matchGroupCardContent,
+  matchGroupQueryUrl,
   matchUserCardUrl,
   parseScanContent,
 } from "@/utils/scanRouter.uts";
@@ -142,6 +144,46 @@ describe("scanRouter", () => {
       const route = parseScanContent(`HTTPS://NUWAX.COM/app.html?u=${USER_ID}`);
       expect(route.kind).toBe("user");
       expect(route.userId).toBe(USER_ID);
+    });
+  });
+
+  describe("通用群链接 query match（域名与路径不限）", () => {
+    it("两个实际链接都识别为同一群码", () => {
+      const download = `${DL}?g=1790753084&c=230958321622843392`;
+      const im = `${HOST}/instant-message?invite=1790753084&g=1790753084&c=230958321622843392`;
+      for (const url of [download, im]) {
+        const route = parseScanContent(url);
+        expect(route.kind).toBe("group");
+        expect(route.groupNo).toBe("1790753084");
+        expect(route.groupConvId).toBe("230958321622843392");
+      }
+    });
+
+    it("任意域名、路径、参数顺序和额外参数均可识别", () => {
+      const route = matchGroupQueryUrl(
+        `https://example.com/anything?source=qr&c=${CONV_ID}&g=${GROUP_NO}&invite=legacy`,
+      );
+      expect(route?.kind).toBe("group");
+      expect(route?.groupNo).toBe(GROUP_NO);
+      expect(route?.groupConvId).toBe(CONV_ID);
+    });
+
+    it("g/c 优先于链接自身的其它业务路由", () => {
+      const spaceInvite = parseScanContent(
+        `${HOST}/invite/space/abc?g=${GROUP_NO}&c=${CONV_ID}`,
+      );
+      expect(spaceInvite.kind).toBe("group");
+      const userCard = parseScanContent(
+        `${HOST}/u/${USER_ID}?g=${GROUP_NO}&c=${CONV_ID}`,
+      );
+      expect(userCard.kind).toBe("group");
+    });
+
+    it("通用链接必须同时带合法纯数字 g/c", () => {
+      expect(parseScanContent(`https://example.com/x?g=${GROUP_NO}`).kind).toBe("url");
+      expect(parseScanContent(`https://example.com/x?c=${CONV_ID}`).kind).toBe("url");
+      expect(parseScanContent(`https://example.com/x?g=${GROUP_NO}&c=abc`).kind).toBe("url");
+      expect(parseScanContent(`https://example.com/x?g=abc&c=${CONV_ID}`).kind).toBe("url");
     });
   });
 

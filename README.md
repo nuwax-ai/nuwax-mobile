@@ -99,6 +99,8 @@ Via HBuilderX: "Release" → "Mini Program-WeChat"
 
 ## Documentation
 
+For uploading completed Android APKs to S3 and publishing `latest.json`, see the [APK publishing guide (Chinese)](docs/engineering/android-apk-distribution-s3.md), including setup, credentials, local files/download links, verification, and troubleshooting.
+
 Additional documentation can be found in the [docs](./docs) directory.
 
 ## License

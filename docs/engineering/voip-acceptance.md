@@ -16,6 +16,7 @@
 | iOS HBuilderX 资源 | App 资源导出成功；完整模拟器基座验证受 5.34 模拟器标准基座缺失阻断，真机标准基座未签名。独立 framework 编译不能代替自定义基座集成与安装 |
 | 专用真机安装包 | 5.34 的三页面测试工程从源码生成并经 HBuilderX 导出。Android 完整 APK 构建及团队签名校验通过；iOS 5.34 完整原生测试宿主、3 个 UTS 模块、LiveKit SDK 和开发签名构建通过，并校验 App 资源、bundleId 与 framework 嵌入。已按用户指示覆盖安装到 Redmi / iPhone 16 并启动，未卸载或清数据。首次安装时安卓实屏为隐私确认页，iOS 回读进程仍在；当时尚未执行双机通话，后续局部结果见下一项，不能等同全业务 App 或系统推送验收。详见 [真机测试说明](voip-device-testing.md) |
 | Android 原生来电排查 | Redmi API 36 已收到 native SSE 邀请并进入 Telecom RINGING。新增专用原生接听 Activity、CallStyle 的独立通知目标及公共 API 权限诊断；5.34 资源导出和完整 APK 构建通过、覆盖安装成功。前台显示接听/拒接，点击拒接后权威状态为 rejected，前台服务消失，未再出现原来的 CALL_SYSTEM_UNAVAILABLE。全屏通知已允许，并经系统 UI 允许本应用锁屏显示和后台弹出。已存在来电在 Keyguard showing=true 时展示成功；完全睡眠后新邀请未观察到进入 Telecom，后台/锁屏新来电仍未通过。仅响铃检查，没有自动接听或启动音视频采集 |
+| iPhone→Android 后台真实呼入 | **未通过**。17:20:10 iPhone Bob 发起呼叫，服务端 ringing；安卓桌面没有通知/接听提示，用户确认未看到。系统日志记录该应用退后台被冻结；17:20:44 打开应用解冻后，17:20:45 才进入 Telecom RINGING，随后 45 秒超时。当前原生长连接不能替代厂商推送唤醒。详细时间与通道前置见 [复测记录](voip-device-testing.md#iphone--安卓后台呼入2026-11-06-1720-复测未通过) |
 | Harmony | HBuilderX 5.34 生成工程后，`pnpm voip:harmony:assemble` 重建 Ability、权限、推送监听与 ArkWeb 资源；ArkTS 编译、PackageHap/assembleHap 通过；产物未配置正式签名 |
 | Harmony 重复生成 | 注入脚本多次运行后无重复 Ability/页面/push listener，随后原生打包通过。不是只手改生成目录 |
 | 全量 Vitest 对比 | 本分支 674 通过 / 37 失败（711 项）；未改动基线 648 通过 / 37 失败（685 项）。逐项对比失败名称集合一致，属于原有 8 个测试文件，未据此声称全量测试通过 |

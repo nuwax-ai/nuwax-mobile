@@ -81,6 +81,16 @@ export function createDevServer({ registry = new CallRegistry(), livekitUrl = 'w
         send(res, { enabled, audio: enabled, video: enabled && !members.includes('agent'),
           developmentOnly: true, nativePush: false, incomingEvents: `${prefix}/events` }); return;
       }
+      if (url.pathname === `${prefix}/diagnostics` && req.method === 'GET') {
+        let mediaReachable = false;
+        let timeout;
+        try {
+          await Promise.race([rooms.listRooms(), new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('media timeout')), 3000); })]);
+          mediaReachable = true;
+        } catch { /* Stable diagnostics, no SDK error or credentials. */ }
+        finally { clearTimeout(timeout); }
+        send(res, { developmentOnly: true, controlReachable: true, mediaReachable, nativePush: false }); return;
+      }
       const path = url.pathname.slice(prefix.length);
       const match = path.match(/^\/([^/]+)(?:\/(actions|credentials|events))?$/);
       const specific = url.pathname.startsWith(`${prefix}/`) && match && match[1] !== 'events' ? match : null;

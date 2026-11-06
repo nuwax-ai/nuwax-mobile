@@ -29,6 +29,14 @@ import LiveKit
     private let prefix = "/api/instant-message/calls"
     private let service = "com.nuwax.voip.session"
 
+    @objc public nonisolated static func isTestPackage() -> Bool {
+        #if DEBUG
+        return Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipDeviceTest") as? Bool == true
+        #else
+        return false
+        #endif
+    }
+
     @objc public nonisolated static func restoreOnLaunch() {
         if Thread.isMainThread { MainActor.assumeIsolated { shared.restore() } } else { DispatchQueue.main.sync { shared.restore() } }
     }
@@ -45,7 +53,7 @@ import LiveKit
         }
         return Thread.isMainThread ? MainActor.assumeIsolated(read) : DispatchQueue.main.sync(execute: read)
     }
-    @objc public nonisolated static func requestPermissions(_ mediaType: String, completion: @escaping @Sendable (Bool) -> Void) {
+    @objc public nonisolated static func requestPermissions(_ mediaType: String, _ completion: @escaping @Sendable (Bool) -> Void) {
         AVCaptureDevice.requestAccess(for: .audio) { microphone in
             if mediaType != "video" { DispatchQueue.main.async { completion(microphone) }; return }
             AVCaptureDevice.requestAccess(for: .video) { camera in DispatchQueue.main.async { completion(microphone && camera) } }

@@ -1,40 +1,114 @@
 <template>
-  <view class="dev-page"><safety-zone />
-    <text class="dev-title">{{ t("Mobile.Voip.devTitle") }}</text>
-    <view v-if="development">
-      <text>{{ t("Mobile.Voip.devHint") }}</text>
-      <input v-model="origin" class="dev-input" placeholder="http://192.168.1.100:7890" />
-      <view class="dev-row"><button @click="login('alice')">Alice</button><button @click="login('bob')">Bob</button></view>
-      <text>{{ status }}</text>
-      <view class="dev-row"><button @click="dial('demo-people', 'audio')">{{ t("Mobile.Voip.audio") }}</button><button @click="dial('demo-people', 'video')">{{ t("Mobile.Voip.video") }}</button></view>
-      <button @click="dial('demo-agent', 'audio')">{{ t("Mobile.Voip.devAgent") }}</button>
-      <button @click="openVoipPage()">{{ t("Mobile.Voip.return") }}</button>
-      <button @click="logout">{{ t("Mobile.Voip.devDisconnect") }}</button>
-    </view>
-    <button @click="back">{{ t("Mobile.Voip.close") }}</button>
+  <view class="dev-page">
+    <safety-zone />
+    <text class="dev-title">{{ t("Mobile.Voip.testTitle") }}</text>
+    <scroll-view class="dev-scroll" :scroll-y="true">
+      <view v-if="development">
+        <view class="dev-card">
+          <text class="dev-heading">{{ t("Mobile.Voip.testSetup") }}</text>
+          <text class="dev-hint">{{ t("Mobile.Voip.testHint") }}</text>
+          <input v-model="origin" class="dev-input" :placeholder="t('Mobile.Voip.testServerPlaceholder')" :disabled="busy || connected" />
+          <view class="dev-row">
+            <button class="dev-button" :disabled="busy || connected" @click="connect('alice')">{{ t("Mobile.Voip.testAlice") }}</button>
+            <button class="dev-button" :disabled="busy || connected" @click="connect('bob')">{{ t("Mobile.Voip.testBob") }}</button>
+          </view>
+          <text class="dev-status">{{ identity.length > 0 ? identity : t("Mobile.Voip.testSignedOut") }}</text>
+          <text class="dev-hint">{{ t("Mobile.Voip.testControl") }}: {{ controlStatus }}</text>
+          <text class="dev-hint">{{ t("Mobile.Voip.testMedia") }}: {{ mediaStatus }}</text>
+          <text class="dev-warning">{{ t("Mobile.Voip.testPushPending") }}</text>
+          <text v-if="lastError.length > 0" class="dev-warning">{{ lastError }}</text>
+        </view>
+        <view class="dev-card">
+          <text class="dev-heading">{{ t("Mobile.Voip.testCall") }}</text>
+          <text class="dev-status">{{ phaseText }}</text>
+          <text v-if="callId.length > 0" class="dev-hint">{{ callId }}</text>
+          <view class="dev-row">
+            <button class="dev-button" :disabled="!connected || busy" @click="dial('demo-people', 'audio')">{{ t("Mobile.Voip.audio") }}</button>
+            <button class="dev-button" :disabled="!connected || busy" @click="dial('demo-people', 'video')">{{ t("Mobile.Voip.video") }}</button>
+          </view>
+          <button :disabled="!connected" @click="openVoipPage()">{{ t("Mobile.Voip.return") }}</button>
+          <button :disabled="!connected" @click="endVoipCall()">{{ t("Mobile.Voip.hangup") }}</button>
+          <button :disabled="!connected" @click="dial('demo-agent', 'audio')">{{ t("Mobile.Voip.devAgent") }}</button>
+          <text class="dev-hint">{{ t("Mobile.Voip.testAgentHint") }}</text>
+        </view>
+        <view class="dev-card">
+          <text class="dev-heading">{{ t("Mobile.Voip.testLog") }}</text>
+          <text v-for="(line, index) in logs" :key="index" class="dev-log">{{ line }}</text>
+          <button :disabled="busy" @click="logout">{{ t("Mobile.Voip.devDisconnect") }}</button>
+        </view>
+      </view>
+      <text v-else class="dev-warning">{{ t("Mobile.Voip.testDisabled") }}</text>
+    </scroll-view>
   </view>
 </template>
 <script setup lang="uts">
-  import { ref } from "vue";
+  import { ref, computed, onMounted, onUnmounted } from "vue";
   import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
+  import { loginVoipDev, readVoipDevSession, probeVoipDevServer, voipRequest } from "@/servers/voip";
+  import { isVoipDevelopmentBuild } from "@/utils/voip/development";
+  import { bootstrapVoip, clearVoipSession, startVoipCall, openVoipPage as openCallPage, endVoipCall as endCall, getVoipPhase, getVoipSnapshot, voipRevision, voipError } from "@/utils/voip/callManager";
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
-  import { loginVoipDev, setVoipDevSession } from "@/servers/voip";
-  import { bootstrapVoip, clearVoipSession, startVoipCall, openVoipPage as openCallPage } from "@/utils/voip/callManager";
-  const development = process.env.NODE_ENV == "development";
-  const origin = ref("http://127.0.0.1:7890"), status = ref("");
-  async function login(user: string): Promise<void> {
-    if (!development) return;
-    clearVoipSession();
-    try { await loginVoipDev(origin.value, user); await bootstrapVoip(); status.value = user; }
-    catch (_e) { status.value = t("Mobile.Voip.devUnavailable"); }
+  const development = isVoipDevelopmentBuild();
+  const origin = ref(""), identity = ref(""), busy = ref(false), connected = ref(false);
+  const controlStatus = ref(t("Mobile.Voip.testUnchecked")), mediaStatus = ref(t("Mobile.Voip.testUnchecked"));
+  const lastError = ref(""), logs = ref<string[]>([]);
+  let timer = 0, serial = 0, lastState = "";
+  const phaseText = computed((): string => { const _revision = voipRevision.value; const phase = getVoipPhase(); return t(phase == "idle" ? "Mobile.Voip.testIdle" : phase == "active" ? "Mobile.Voip.testActive" : "Mobile.Voip." + phase); });
+  const callId = computed((): string => { const _revision = voipRevision.value; return getVoipSnapshot()?.callId ?? ""; });
+  function log(value: string): void { logs.value = [...logs.value.slice(-11), `${Date.now()} ${value}`]; }
+  async function connect(user: string): Promise<void> {
+    if (!development || busy.value || connected.value) return;
+    const run = ++serial;
+    busy.value = true; lastError.value = ""; clearVoipSession();
+    controlStatus.value = t("Mobile.Voip.testChecking"); mediaStatus.value = t("Mobile.Voip.testUnchecked");
+    try {
+      await probeVoipDevServer(origin.value);
+      await loginVoipDev(origin.value, user);
+      if (run != serial) return;
+      await bootstrapVoip();
+      const diagnostic = await voipRequest("/diagnostics");
+      if (run != serial) return;
+      identity.value = user; connected.value = true;
+      controlStatus.value = t("Mobile.Voip.testReachable");
+      mediaStatus.value = t(diagnostic["mediaReachable"] === true ? "Mobile.Voip.testReachable" : "Mobile.Voip.testUnreachable");
+      uni.setStorageSync("NUWAX_VOIP_DEV_ORIGIN", origin.value);
+      log(`${user}: ${controlStatus.value} / ${mediaStatus.value}`);
+    } catch (_e) {
+      if (run != serial) return;
+      clearVoipSession(); connected.value = false; identity.value = "";
+      controlStatus.value = t("Mobile.Voip.testUnreachable"); lastError.value = t("Mobile.Voip.devUnavailable"); log(lastError.value);
+    } finally { if (run == serial) busy.value = false; }
   }
-  function dial(conv: string, mode: string): void { if (development) startVoipCall(conv, mode); }
-  function openVoipPage(): void { openCallPage(); }
-  function logout(): void { clearVoipSession(); setVoipDevSession(null); status.value = ""; }
-  function back(): void { uni.navigateBack(); }
+  function dial(conv: string, mode: string): void { if (development && connected.value) startVoipCall(conv, mode); }
+  function endVoipCall(): void { endCall(); }
+  function openVoipPage(): void { if (getVoipSnapshot() != null) openCallPage(); }
+  function logout(): void { serial += 1; clearVoipSession(); connected.value = false; identity.value = ""; busy.value = false; controlStatus.value = t("Mobile.Voip.testUnchecked"); mediaStatus.value = t("Mobile.Voip.testUnchecked"); }
+  onMounted(() => {
+    if (!development) return;
+    const saved = uni.getStorageSync("NUWAX_VOIP_DEV_ORIGIN"); if (typeof saved == "string") origin.value = `${saved}`;
+    const session = readVoipDevSession();
+    if (session != null) { origin.value = `${session["apiBaseUrl"]}`; identity.value = `${session["userId"]}`; connected.value = true; bootstrapVoip().catch((_e) => {}); }
+    timer = setInterval(() => {
+      const snapshot = getVoipSnapshot();
+      const state = `${snapshot?.callId ?? ""}|${getVoipPhase()}|${voipError.value}`;
+      if (state == lastState) return; lastState = state;
+      lastError.value = voipError.value;
+      log(`${phaseText.value}${snapshot == null ? "" : " · " + snapshot.reason}${voipError.value.length == 0 ? "" : " · " + voipError.value}`);
+    }, 500);
+  });
+  onUnmounted(() => { if (timer != 0) clearInterval(timer); serial += 1; });
 </script>
 <style scoped>
-  .dev-page { flex: 1; padding: 20px; background-color: #f5f6fa; }
-  .dev-title { font-size: 23px; margin-bottom: 20px; }.dev-row { flex-direction: row; margin-top: 18px; }
-  .dev-input { height: 48px; background-color: #ffffff; padding: 8px; margin-top: 18px; margin-bottom: 18px; }
+  .dev-page { flex: 1; padding: 16px; background-color: #f5f6fa; }
+  .dev-title { font-size: 23px; font-weight: 600; margin-bottom: 14px; color: #161925; }
+  .dev-scroll { flex: 1; }
+  .dev-card { padding: 14px; margin-bottom: 14px; background-color: #ffffff; border-radius: 12px; }
+  .dev-heading { font-size: 17px; font-weight: 600; color: #161925; margin-bottom: 8px; }
+  .dev-hint { font-size: 13px; line-height: 20px; color: #606575; margin-top: 6px; }
+  .dev-status { font-size: 16px; color: #5147ff; margin-top: 8px; }
+  .dev-warning { font-size: 13px; color: #b05a17; line-height: 20px; margin-top: 8px; }
+  .dev-input { height: 46px; background-color: #f2f3f8; padding: 8px; margin-top: 12px; margin-bottom: 8px; border-radius: 6px; }
+  .dev-row { flex-direction: row; margin-top: 10px; margin-bottom: 8px; }
+  .dev-button { flex: 1; font-size: 14px; margin: 4px; }
+  .dev-log { font-size: 11px; line-height: 18px; color: #606575; margin-bottom: 4px; }
 </style>

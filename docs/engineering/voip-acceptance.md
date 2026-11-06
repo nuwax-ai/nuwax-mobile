@@ -8,15 +8,16 @@
 
 | 项目 | 结果与实际范围 |
 | --- | --- |
-| 状态/开发契约/媒体生命周期 | `pnpm voip:test` 19 项通过：乱序、过期、终态、多设备获胜者、账号代次、房间异步操作中挂断、凭据权限、设备 token 命名空间、取消后迟到连接与后台不启动摄像头 |
+| 状态/开发契约/媒体生命周期 | `pnpm voip:test` 26 项通过：乱序、过期、终态、多设备获胜者、账号代次、房间异步操作中挂断、凭据权限、设备 token 命名空间、取消后迟到连接、后台不启动摄像头、测试身份退出/抢登录隔离、开发凭据不转发平台 token、控制与媒体健康分别报告 |
 | 真实 LiveKit 本地媒体 | 固定 server 1.13.11；ego-browser 中 alice→agent 媒体替身完成接听、双向合成音轨订阅、active、挂断；未申请真人麦克风，不证明模型能力 |
 | Android HBuilderX | 5.34 页面/UTS/原生插件编译通过；标准基座不包含新插件，未将其当作安装包验收 |
 | Android 原生依赖 | 在 worktree 忽略目录复制的 5.34 SDK 工程中生成 UTS library，`:uts-nuwax-voip:assembleDebug` 通过；LiveKit/Core-Telecom 依赖从 config 注入。未安装或替换主工作区 APK |
 | iOS 原生桥 | `pnpm voip:ios:check` 通过：真实 Swift SDK 2.19.0、Swift 6、arm64/x86_64 simulator framework；最低系统 15.0，动态产物确认 LCK 为 `LC_LOAD_WEAK_DYLIB` |
 | iOS HBuilderX 资源 | App 资源导出成功；完整模拟器基座验证受 5.34 模拟器标准基座缺失阻断，真机标准基座未签名。独立 framework 编译不能代替自定义基座集成与安装 |
+| 专用真机安装包 | 5.34 的三页面测试工程从源码生成并经 HBuilderX 导出。Android 完整 APK 构建及团队签名校验通过；iOS 5.34 完整原生测试宿主、3 个 UTS 模块、LiveKit SDK 和开发签名构建通过，并校验 App 资源、bundleId 与 framework 嵌入。尚未安装手机，不能等同全业务 App 基座验收。详见 [真机测试说明](voip-device-testing.md) |
 | Harmony | HBuilderX 5.34 生成工程后，`pnpm voip:harmony:assemble` 重建 Ability、权限、推送监听与 ArkWeb 资源；ArkTS 编译、PackageHap/assembleHap 通过；产物未配置正式签名 |
 | Harmony 重复生成 | 注入脚本多次运行后无重复 Ability/页面/push listener，随后原生打包通过。不是只手改生成目录 |
-| 全量 Vitest 对比 | 本分支 667 通过 / 37 失败（704 项）；未改动基线 648 通过 / 37 失败（685 项）。逐项对比失败名称集合一致，属于原有 8 个测试文件，未据此声称全量测试通过 |
+| 全量 Vitest 对比 | 本分支 674 通过 / 37 失败（711 项）；未改动基线 648 通过 / 37 失败（685 项）。逐项对比失败名称集合一致，属于原有 8 个测试文件，未据此声称全量测试通过 |
 | 离线 H5 脚本回归 | 18 项中 16 通过 / 2 失败；未改动基线同样因 `mobileLoginDestination` 缺失出现这两项失败，未修改该既有问题 |
 | i18n 对比 | 新增通话文案进入四份词典。全仓审计仍有 22 项原有问题；未改动基线也是同样 22 项，涉及原隐私启动页和请求层 |
 

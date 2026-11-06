@@ -16,6 +16,14 @@ async function fixture(roomService = { createRoom: async () => {}, deleteRoom: a
   return { app, origin, login };
 }
 describe('development phone HTTP contract', () => {
+  it.each([true, false])('reports actual media service availability separately from call control (%s)', async reachable => {
+    const { login } = await fixture({ createRoom: async () => {}, deleteRoom: async () => {}, listRooms: async () => {
+      if (!reachable) throw new Error('fixture media unavailable');
+      return [];
+    } });
+    const alice = await login('alice', 'device-test');
+    expect((await alice('/diagnostics')).data).toEqual({ developmentOnly: true, controlReachable: true, mediaReachable: reachable, nativePush: false });
+  });
   it('checks conversation membership and disallows RTC credentials before acceptance / on losing devices', async () => {
     const { login } = await fixture();
     const alice = await login('alice', 'a'), bob = await login('bob', 'b'), other = await login('bob', 'b2');

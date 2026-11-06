@@ -2,6 +2,8 @@
 
 当前实现处于三端接入验证阶段。`isVoipPlatformAccepted()` 为 false；正式接口未实现时生产入口隐藏。只能在 development 构建中主动配置独立开发身份。不要通过把此函数改为 true 来跳过验收。
 
+Android / iPhone 专门测试页与签名安装包见 [真机测试包说明](voip-device-testing.md)。它通过原生 Debug 和显式包标记允许独立开发身份，启动直接进入测试页，仍不打开生产入口。
+
 ## 本地联调
 
 ```bash

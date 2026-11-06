@@ -48,6 +48,10 @@ import android.util.Base64
 
 /** Singleton survives the UTS page. Cold-start push integrations call incoming() directly. */
 object VoipBridge {
+    @JvmStatic fun isTestPackage(ctx: Context): Boolean {
+        if ((ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) return false
+        return runCatching { ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA).metaData?.getBoolean("nuwax.voip.deviceTest", false) == true }.getOrDefault(false)
+    }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val queue = ConcurrentLinkedQueue<JSONObject>()
     private val http = OkHttpClient.Builder().callTimeout(4, TimeUnit.SECONDS).build()

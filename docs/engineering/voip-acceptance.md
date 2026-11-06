@@ -14,7 +14,8 @@
 | Android 原生依赖 | 在 worktree 忽略目录复制的 5.34 SDK 工程中生成 UTS library，`:uts-nuwax-voip:assembleDebug` 通过；LiveKit/Core-Telecom 依赖从 config 注入。未安装或替换主工作区 APK |
 | iOS 原生桥 | `pnpm voip:ios:check` 通过：真实 Swift SDK 2.19.0、Swift 6、arm64/x86_64 simulator framework；最低系统 15.0，动态产物确认 LCK 为 `LC_LOAD_WEAK_DYLIB` |
 | iOS HBuilderX 资源 | App 资源导出成功；完整模拟器基座验证受 5.34 模拟器标准基座缺失阻断，真机标准基座未签名。独立 framework 编译不能代替自定义基座集成与安装 |
-| 专用真机安装包 | 5.34 的三页面测试工程从源码生成并经 HBuilderX 导出。Android 完整 APK 构建及团队签名校验通过；iOS 5.34 完整原生测试宿主、3 个 UTS 模块、LiveKit SDK 和开发签名构建通过，并校验 App 资源、bundleId 与 framework 嵌入。已按用户指示覆盖安装到 Redmi / iPhone 16 并启动，未卸载或清数据。安卓实屏为隐私确认页，iOS 回读进程仍在；尚未执行双机通话，不能等同全业务 App 或系统推送验收。详见 [真机测试说明](voip-device-testing.md) |
+| 专用真机安装包 | 5.34 的三页面测试工程从源码生成并经 HBuilderX 导出。Android 完整 APK 构建及团队签名校验通过；iOS 5.34 完整原生测试宿主、3 个 UTS 模块、LiveKit SDK 和开发签名构建通过，并校验 App 资源、bundleId 与 framework 嵌入。已按用户指示覆盖安装到 Redmi / iPhone 16 并启动，未卸载或清数据。首次安装时安卓实屏为隐私确认页，iOS 回读进程仍在；当时尚未执行双机通话，后续局部结果见下一项，不能等同全业务 App 或系统推送验收。详见 [真机测试说明](voip-device-testing.md) |
+| Android 原生来电排查 | Redmi API 36 已收到 native SSE 邀请并进入 Telecom RINGING。新增专用原生接听 Activity、CallStyle 的独立通知目标及公共 API 权限诊断；5.34 资源导出和完整 APK 构建通过、覆盖安装成功。前台显示接听/拒接，点击拒接后权威状态为 rejected，前台服务消失，未再出现原来的 CALL_SYSTEM_UNAVAILABLE。全屏通知已允许，并经系统 UI 允许本应用锁屏显示和后台弹出。已存在来电在 Keyguard showing=true 时展示成功；完全睡眠后新邀请未观察到进入 Telecom，后台/锁屏新来电仍未通过。仅响铃检查，没有自动接听或启动音视频采集 |
 | Harmony | HBuilderX 5.34 生成工程后，`pnpm voip:harmony:assemble` 重建 Ability、权限、推送监听与 ArkWeb 资源；ArkTS 编译、PackageHap/assembleHap 通过；产物未配置正式签名 |
 | Harmony 重复生成 | 注入脚本多次运行后无重复 Ability/页面/push listener，随后原生打包通过。不是只手改生成目录 |
 | 全量 Vitest 对比 | 本分支 674 通过 / 37 失败（711 项）；未改动基线 648 通过 / 37 失败（685 项）。逐项对比失败名称集合一致，属于原有 8 个测试文件，未据此声称全量测试通过 |
@@ -33,7 +34,7 @@ NW-367 推送前置仅作为用户提供的关联线索，未独立核实工单�
 
 ## 必须补完的真实环境验收
 
-以下均为**未执行 / 未通过验收**，不是已知已修复或已验证行为。当前没有 Android/鸿蒙真机组合；本机可见的 iOS 设备不足以完成跨端矩阵。
+以下均仍需完成完整验收，上面的局部检查不代表整项通过。现有 Redmi 和 iPhone 16 可继续双机测试，尚缺鸿蒙设备；用户报告 iOS 已显示系统来电弹层，双向媒体、后台和冷启动推送仍需各自留证。
 
 | 类别 | 必测内容 |
 | --- | --- |

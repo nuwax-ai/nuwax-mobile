@@ -12,6 +12,12 @@
 4. 一台点语音或视频，另一台在来电页接听。测试静音、扬声器、摄像头、摄像头切换、返回测试页再进入通话、挂断与释放。
 5. 电脑浏览器打开同一服务，选择 agent，才可使用合成音轨替身；不代表正式智能体。
 
+Android 测试页还单独显示通知、全屏来电提醒和高优先级通知通道的授权状态，并提供系统设置入口。这三项仅报告 Android 公共 API 的结果。部分厂商另设“锁屏显示”“后台弹出界面”等权限，需从“应用权限设置”进入应用信息核对，不能把三个“已允许”当作锁屏验收通过。
+
+Android 使用 Core-Telecom 管理通话、CallStyle 通知提供接听/拒接操作，通知指向独立的原生接听 Activity；锁屏可语音接听，视频接听先由系统解锁。返回/收起不挂断，点击通话通知可恢复。系统在使用手机时可选择显示横幅，锁屏全屏展示受系统和厂商权限控制，见 [Android 全屏来电通知说明](https://developer.android.com/develop/connectivity/telecom/dialer-app)及 [全屏 Intent 授权](https://developer.android.com/reference/android/app/NotificationManager#canUseFullScreenIntent())。
+
+2026-11-06 Redmi 排查记录：普通通知已允许，最初 `USE_FULL_SCREEN_INTENT` 实际 app-op 为 `ignore`，之后系统设置中确认为 `allow`。系统 Telecom 日志已记录来电 `RINGING`，因此这次没有显示接听界面不能归因于来电未送达。新增原生接听页后，前台来电展示、点击拒接、服务释放已在该机观察；取消和正常结束时先 disconnect Telecom 再结束 owner job，协程取消不再误报 `CALL_SYSTEM_UNAVAILABLE`。之后在系统 UI 中将本应用“锁屏显示”和“后台弹出界面”从拒绝改为始终允许；只调整来电展示相关项，未改变自启动或省电策略。已存在来电在 Keyguard showing=true 时可显示原生接听页；手机先完全睡眠后再发新邀请，本轮未观察到进入 Telecom，不算后台/锁屏新来电通过。该开发服务没有厂商电话推送，不能靠这些授权代替推送唤醒。上述已到达的邀请均由原生 SSE 送达。
+
 LiveKit 使用 TCP 7880（信令）、TCP 7881 / UDP 7882（媒体）。服务可达仅表示 RoomService 查询成功；实际音视频与网络切换须继续看通话状态并用真机确认。测试页只保留最近 12 条状态记录，不显示平台 token、RTC JWT 或原生推送 token。
 
 2026-11-06 切换 Wi-Fi 后，本机为 `192.168.32.42`，安卓为 `192.168.32.136`；已从安卓请求 `192.168.32.42:7890/health` 并收到 200。尚不代表 iPhone 访问或两端 RTP 音视频已验证。
@@ -44,3 +50,5 @@ iOS SDK 固定 5.34 VDOM，下载来源为 [DCloud 官方 iOS SDK 页面](https:
 测试入口要求 **原生 Debug + 明确包标记**，不依赖修改 `NODE_ENV`。普通发行包不会因为 storage 中残留开发身份而启用测试服务；生产通话总开关仍为关闭。iOS LAN ATS 例外仅写入这个隔离 Debug 测试宿主，没有改正式 manifest。
 
 打包脚本验证 iOS 签名、可执行文件、bundleId、App 资源以及所有 `@rpath` framework 的实际嵌入。构建与签名通过仍不等于安装、双向通话或电话推送验收通过。
+
+本轮优先补验方向为 **iPhone（Bob）→ Redmi（Alice）**：分别在安卓前台、桌面后台、锁屏发起新呼叫，确认系统 CallStyle 通知有接听/拒接，通知点击打开原生通话页；每项需单独记录送达、展示、接听、媒体与挂断结果。只验证安卓呼出或应用内来电页不能替代这一方向。

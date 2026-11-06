@@ -1,0 +1,135 @@
+/** 电话业务状态与媒体状态分开；可脱离 uni/native 运行，供三端与契约测试共用。 */
+export class CallSnapshot {
+  callId: string = "";
+  convId: string = "";
+  version: number = 0;
+  state: string = "ringing";
+  callerId: string = "";
+  calleeId: string = "";
+  callerDeviceId: string = "";
+  acceptedDeviceId: string = "";
+  mediaType: string = "audio";
+  peerKind: string = "user";
+  displayName: string = "";
+  callerDisplayName: string = "";
+  calleeDisplayName: string = "";
+  expiresAt: number = 0;
+  connectedAt: number = 0;
+  endedAt: number = 0;
+  reason: string = "";
+}
+
+export function parseCallSnapshot(raw: UTSJSONObject): CallSnapshot {
+  const s = new CallSnapshot();
+  s.callId = `${raw["callId"] ?? ""}`;
+  s.convId = `${raw["convId"] ?? ""}`;
+  s.version = parseFloat(`${raw["version"] ?? 0}`);
+  s.state = `${raw["state"] ?? ""}`;
+  s.callerId = `${raw["callerId"] ?? ""}`;
+  s.calleeId = `${raw["calleeId"] ?? ""}`;
+  s.callerDeviceId = `${raw["callerDeviceId"] ?? ""}`;
+  s.acceptedDeviceId = `${raw["acceptedDeviceId"] ?? ""}`;
+  s.mediaType = `${raw["mediaType"] ?? "audio"}`;
+  s.peerKind = `${raw["peerKind"] ?? "user"}`;
+  s.callerDisplayName = `${raw["callerDisplayName"] ?? raw["callerId"] ?? ""}`;
+  s.calleeDisplayName = `${raw["calleeDisplayName"] ?? raw["calleeId"] ?? ""}`;
+  s.displayName = `${raw["displayName"] ?? ""}`;
+  s.expiresAt = parseFloat(`${raw["expiresAt"] ?? 0}`);
+  s.connectedAt = parseFloat(`${raw["connectedAt"] ?? 0}`);
+  s.endedAt = parseFloat(`${raw["endedAt"] ?? 0}`);
+  s.reason = `${raw["reason"] ?? ""}`;
+  return s;
+}
+
+export function isCallState(state: string): boolean {
+  return state == "ringing" || state == "connecting" || state == "active" || state == "ended";
+}
+
+function stateRank(state: string): number {
+  if (state == "ringing") return 1;
+  if (state == "connecting") return 2;
+  if (state == "active") return 3;
+  if (state == "ended") return 4;
+  return 0;
+}
+
+export class CallStateStore {
+  current: CallSnapshot | null = null;
+  epoch: number = 0;
+  mediaConnected: boolean = false;
+  peerMediaReady: boolean = false;
+  reconnecting: boolean = false;
+  private terminalIds: string[] = [];
+
+  /** 账号切换使在途 REST/native 回调失效；终态去重记录与账号一起清理。 */
+  reset(): void {
+    this.epoch += 1;
+    this.current = null;
+    this.terminalIds = [];
+    this.clearMedia();
+  }
+
+  clearMedia(): void {
+    this.mediaConnected = false;
+    this.peerMediaReady = false;
+    this.reconnecting = false;
+  }
+
+  isBusy(): boolean {
+    const s = this.current;
+    return s != null && s.state != "ended";
+  }
+
+  ownsMedia(userId: string, deviceId: string): boolean {
+    const s = this.current;
+    if (s == null || s.state == "ended" || s.state == "ringing") return false;
+    if (s.callerId == userId) return s.callerDeviceId == deviceId;
+    return s.calleeId == userId && s.acceptedDeviceId == deviceId;
+  }
+
+  apply(next: CallSnapshot, epoch: number, userId: string, now: number): boolean {
+    if (epoch != this.epoch || next.callId.length == 0 || !Number.isFinite(next.version) || !Number.isInteger(next.version) || next.version < 1 || !isCallState(next.state)) return false;
+    if (next.mediaType != "audio" && next.mediaType != "video") return false;
+    if (next.state == "ringing" && (!Number.isFinite(next.expiresAt) || next.expiresAt <= now)) return false;
+    if (next.callerId != userId && next.calleeId != userId) return false;
+    const prev = this.current;
+    if (prev != null && prev.callId == next.callId) {
+      if (prev.state == "ended" || next.version <= prev.version || stateRank(next.state) < stateRank(prev.state)) return false;
+    } else {
+      if (this.isBusy() || this.terminalIds.indexOf(next.callId) >= 0) return false;
+      if (next.state == "ringing" && next.expiresAt <= now) return false;
+      this.clearMedia();
+    }
+    this.current = next;
+    if (next.state == "ended") {
+      this.rememberTerminal(next.callId);
+      this.clearMedia();
+    }
+    return true;
+  }
+
+  endLocal(reason: string, now: number): void {
+    const s = this.current;
+    if (s == null || s.state == "ended") return;
+    s.state = "ended";
+    s.reason = reason;
+    s.endedAt = now;
+    this.rememberTerminal(s.callId);
+    this.clearMedia();
+  }
+
+  private rememberTerminal(callId: string): void {
+    if (this.terminalIds.indexOf(callId) < 0) this.terminalIds.push(callId);
+    if (this.terminalIds.length > 128) this.terminalIds.shift();
+  }
+
+  phase(userId: string): string {
+    const s = this.current;
+    if (s == null) return "idle";
+    if (s.state == "ended") return "ended";
+    if (s.state == "ringing") return s.callerId == userId ? "dialing" : "incoming";
+    if (this.reconnecting) return "reconnecting";
+    if (s.state == "active" && this.mediaConnected && this.peerMediaReady) return "active";
+    return "connecting";
+  }
+}

@@ -79,7 +79,19 @@ def has_abi_libs(libs: Path) -> bool:
     return False
 
 
-def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: bool) -> None:
+def read_native_dependencies(export_dir: Path) -> tuple[list[str], list[str]]:
+    config = export_dir / "config.json"
+    if not config.is_file():
+        return [], []
+    data = json.loads(config.read_text())
+    dependencies = data.get("dependencies", [])
+    repositories = data.get("project", {}).get("repositories", [])
+    if not all(isinstance(value, str) for value in dependencies + repositories):
+        raise ValueError(f"无效原生依赖配置: {export_dir.name}")
+    return dependencies, repositories
+
+
+def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: bool, dependencies: list[str] | None = None) -> None:
     jni_block = ""
     if jni_from_libs:
         jni_block = """
@@ -89,6 +101,7 @@ def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: 
         }
     }
 """
+    dependency_lines = "\n".join(f"    implementation {json.dumps(value)}" for value in (dependencies or []))
     text = f"""plugins {{
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
@@ -129,6 +142,7 @@ dependencies {{
     compileOnly "androidx.core:core-ktx:1.10.1"
     compileOnly 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.3.8'
     compileOnly 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.3.8'
+{dependency_lines}
 }}
 """
     (mod / "build.gradle").write_text(text)
@@ -183,6 +197,7 @@ def inject_one(export_dir: Path) -> str:
     mod = PROJ / gradle_name
     namespace = detect_namespace(export_dir)
     min_sdk = detect_min_sdk(export_dir)
+    dependencies, repositories = read_native_dependencies(export_dir)
 
     if mod.exists():
         shutil.rmtree(mod)
@@ -199,7 +214,21 @@ def inject_one(export_dir: Path) -> str:
             else:
                 shutil.copy2(item, dst)
 
-    write_module_gradle(mod, namespace, min_sdk, jni)
+    write_module_gradle(mod, namespace, min_sdk, jni, dependencies)
+    # FAIL_ON_PROJECT_REPOS: repositories belong to settings, never the library build file.
+    if repositories:
+        settings = PROJ / "settings.gradle"
+        content = settings.read_text()
+        for repository in repositories:
+            # Existing SDKs may use a slightly different Gradle spelling of the same URL.
+            url = re.search(r"https://[^'\"\s}]+", repository)
+            if url and url.group(0) in content:
+                continue
+            content, count = re.subn(r"(dependencyResolutionManagement\s*\{[\s\S]*?repositories\s*\{)",
+                lambda match: match.group(1) + "\n        " + repository, content, count=1)
+            if count != 1:
+                raise ValueError("无法定位 dependencyResolutionManagement.repositories")
+        settings.write_text(content)
     copy_manifest(export_dir, mod)
     copy_kotlin_sources(export_dir, mod)
 

@@ -18,6 +18,9 @@ public class NotificationClearBridge {
   /// 不清理 pending（本仓没有定时本地通知的用法）；也不动图标角标 ——
   /// 角标口径是 IM 未读总数（utils/appIconBadge.uts），与通知条数无关。
   public static func clearAll() {
-    UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+    let center = UNUserNotificationCenter.current()
+    center.getDeliveredNotifications { notifications in
+      center.removeDeliveredNotifications(withIdentifiers: notifications.map { $0.request.identifier }.filter { !$0.hasPrefix("voip-") })
+    }
   }
 }

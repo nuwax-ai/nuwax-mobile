@@ -101,3 +101,9 @@ Android 测试 manifest 和 uni-push 配置统一由 `scripts/voip-native/device
 本轮补齐 Android 注册包名、iOS PushKit 注册/撤销字段和旧回调隔离，开发服务按包名、环境和厂商保存、撤销独立设备记录。测试包分别为 `android_debug-20261107-131257.apk` 和 `nuwax-voip-ios-20261107-131304.ipa`，对应 `out/voip-device-packages` 中的 latest 入口。35 项专项测试及两端编译、签名检查通过，包哈希记录在忽略目录的 `build-manifest.json`。
 
 用户确认先交付代码和文档，真机稍后测试。下一轮先在两台设备安装此版并重新选择各自测试身份，再复测语音呼叫和开发监听。设备注册需检查实际 bundleId、channel、environment，iOS token 失效及切账号隔离另在正式推送环境验证。
+
+## 2026-11-07 生命周期复核版
+
+最新测试包更新为 `android_debug-20261107-133720.apk` 和 `nuwax-voip-ios-20261107-133730.ipa`，latest 入口指向此版。新增拨号异步检查以处理退出、切账号和先到达的来电，鸿蒙 token 注册补齐系统包名、显式环境和迟到回调隔离。
+
+43 项 VoIP 专项测试通过，全量为 691 通过及 37 项既有失败。Android/iOS 签名测试宿主构建和鸿蒙未签名 HAP 构建通过。本轮真机继续按用户安排稍后进行，下一次安装后重点复测正常互拨、权限等待中来电、挂断释放与账号切换。

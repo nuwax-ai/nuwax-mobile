@@ -97,7 +97,7 @@ UTS 页面的 onHide 可以断开现有 IM WebSocket；**通话控制流由原�
 
 通道枚举 `uniPush/pushKit/harmonyPush/fcm/vendor`。正式注册和撤销均携带 `bundleId`，`channel=vendor` 时还须携带 `vendor` 厂商标识。存储主键包含 `userId+deviceId+channel+environment+bundleId+vendor`，其他通道的 vendor 使用空值。每次只更新该主键对应记录，空 token 撤销该记录，重复撤销返回 `registered=false`。登录刷新与切账号分别处理，uni-push cid、PushKit 和鸿蒙 token 分开保存。登出后服务端立即撤销通话路由和设备授权。
 
-开发服务兼容早期测试包缺失 `bundleId` 的请求，将其放入独立的空包名命名空间。新版 Android 测试页从原生读取 applicationId 并注册，iOS 注册及 token 失效撤销使用相同包名和环境，旧 registry 的迟到回调按账号代次丢弃。正式接口应校验包名，兼容窗口仅用于现存开发测试数据。
+开发服务兼容早期测试包缺失 `bundleId` 的请求，将其放入独立的空包名命名空间。新版 Android 测试页从原生读取 applicationId 并注册，iOS 注册及 token 失效撤销使用相同包名和环境，旧 registry 的迟到回调按账号代次丢弃。鸿蒙注册同样携带系统 bundleId，使用 initialize 的 pushEnvironment，退出或替换会话后丢弃迟到的 getToken 结果。正式接口应校验包名，兼容窗口仅用于现存开发测试数据。
 
 uni-push/普通通知用 `kind:"voip.invite"` 标明邀请；原生 PushKit/鸿蒙 VoIP 通道由系统识别。邀请推送只含 `callId/version/expiresAt/callerId/calleeId/displayName/mediaType` 等最小显示信息；不含平台 token、RTC JWT 或可执行 URL。收到推送后启动/恢复控制连接并核对权威状态。取消、拒接、挂断、抢接结果都从已建立的原生控制连接送达，不能再用 VoIP 推送承载取消。
 

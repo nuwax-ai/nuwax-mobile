@@ -1,5 +1,5 @@
 import BuildProfile from 'BuildProfile'
-import { common, UIAbility, wantAgent } from '@kit.AbilityKit'
+import { bundleManager, common, UIAbility, wantAgent } from '@kit.AbilityKit'
 import { http } from '@kit.NetworkKit'
 import { util } from '@kit.ArkTS'
 import { asset } from '@kit.AssetStoreKit'
@@ -20,6 +20,7 @@ export interface CallData {
 interface Configuration {
   scope: string; apiBaseUrl: string; accessToken: string; deviceId: string; userId: string;
   development: boolean; qaAccepted: boolean; callLabel: string; labels?: Record<string, string>;
+  pushEnvironment?: string;
 }
 interface Command {
   op: string; route?: string; scope?: string; callId?: string; snapshot?: CallData; action?: string;
@@ -117,8 +118,13 @@ export class VoipBridge {
     }
     if (VoipBridge.ability) VoipBridge.registerPush(VoipBridge.ability)
     VoipBridge.startStream()
-    pushService.getToken().then(token => VoipBridge.request('/devices', JSON.stringify({ channel: 'harmonyPush', token,
-      environment: config.development ? 'development' : 'production' }))).catch(() => {})
+    const run = VoipBridge.generation
+    pushService.getToken().then(async token => {
+      if (run !== VoipBridge.generation || VoipBridge.configuration !== config) return
+      const bundleId = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT).name
+      await VoipBridge.request('/devices', JSON.stringify({ channel: 'harmonyPush', token, bundleId,
+        environment: config.pushEnvironment ?? (config.development ? 'development' : 'production') }))
+    }).catch(() => {})
     if (VoipBridge.current) {
       VoipBridge.emit('snapshot', '', VoipBridge.current)
       if (VoipBridge.connected) VoipBridge.emit('connected')

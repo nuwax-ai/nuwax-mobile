@@ -95,3 +95,9 @@ iOS SDK 固定 5.34 VDOM，下载来源为 [DCloud 官方 iOS SDK 页面](https:
 2026-11-06 已核对发布的 1.3.3(133) APK，并在专用测试包中恢复 uni-push 注册，Redmi 显示“设备已注册”。该发布包未检出小米 SDK/metadata，DCloud 控制台配置仍待团队确认。CID 注册、邀请发送、厂商送达分别记录结果。
 
 Android 测试 manifest 和 uni-push 配置统一由 `scripts/voip-native/device/configure-android.py` 管理，普通构建清理该脚本拥有的测试声明。测试监听不申请媒体采集，通话结束释放媒体与通话服务，开发监听由用户单独停止或退出测试身份时释放。
+
+## 2026-11-07 接口交接版
+
+本轮补齐 Android 注册包名、iOS PushKit 注册/撤销字段和旧回调隔离，开发服务按包名、环境和厂商保存、撤销独立设备记录。测试包分别为 `android_debug-20261107-131257.apk` 和 `nuwax-voip-ios-20261107-131304.ipa`，对应 `out/voip-device-packages` 中的 latest 入口。35 项专项测试及两端编译、签名检查通过，包哈希记录在忽略目录的 `build-manifest.json`。
+
+用户确认先交付代码和文档，真机稍后测试。下一轮先在两台设备安装此版并重新选择各自测试身份，再复测语音呼叫和开发监听。设备注册需检查实际 bundleId、channel、environment，iOS token 失效及切账号隔离另在正式推送环境验证。

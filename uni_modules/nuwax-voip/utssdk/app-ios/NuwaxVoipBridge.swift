@@ -138,7 +138,10 @@ import LiveKit
             AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
             try? AudioManager.shared.setEngineAvailability(audioActive ? .default : .none)
             if pushRegistry == nil {
-                let registry = PKPushRegistry(queue: .main); registry.delegate = self; registry.desiredPushTypes = [.voIP]; pushRegistry = registry
+                let registry = PKPushRegistry(queue: .main)
+                registry.delegate = self
+                pushRegistry = registry
+                registry.desiredPushTypes = [.voIP]
             }
         }
         startStream()
@@ -379,13 +382,27 @@ extension NuwaxVoipBridge: RoomDelegate {
     }
 }
 extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
+    private func updatePushToken(_ token: String, registry: PKPushRegistry) {
+        guard registry === pushRegistry, !configuration.isEmpty else { return }
+        let run = generation
+        let body: [String: Any] = [
+            "channel": "pushKit", "token": token,
+            "bundleId": Bundle.main.bundleIdentifier ?? "",
+            "environment": configuration["pushEnvironment"] as? String ?? "production"
+        ]
+        Task { @MainActor in
+            guard run == self.generation, registry === self.pushRegistry else { return }
+            _ = try? await self.request("/devices", body: body)
+        }
+    }
     public func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
+        guard type == .voIP else { return }
         let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
-        Task { _ = try? await self.request("/devices", body: ["channel": "pushKit", "token": token,
-            "bundleId": Bundle.main.bundleIdentifier ?? "", "environment": self.configuration["pushEnvironment"] as? String ?? "production"]) }
+        updatePushToken(token, registry: registry)
     }
     public func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
-        Task { _ = try? await self.request("/devices", body: ["channel": "pushKit", "token": "", "environment": self.configuration["pushEnvironment"] as? String ?? "production", "revoked": true]) }
+        guard type == .voIP else { return }
+        updatePushToken("", registry: registry)
     }
     public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType) async {
         guard type == .voIP else { return }

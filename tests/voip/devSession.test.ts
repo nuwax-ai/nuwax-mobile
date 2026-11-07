@@ -4,7 +4,7 @@ vi.mock('../../features/voip/development.uts', () => ({ isVoipDevelopmentBuild: 
 vi.mock('../../utils/appPrivacyConsent.uts', () => ({ hasAppPrivacyConsent: () => state.consent }));
 vi.mock('../../constants/config.uts', () => ({ getApiBaseUrl: () => 'https://platform.example', normalizeApiBaseUrl: (url: string) => url.trim() }));
 vi.mock('../../servers/im.uts', () => ({ getImDeviceId: () => 'test-device' }));
-import { loginVoipDev, setVoipDevSession, readVoipDevSession, probeVoipDevServer, voipSessionConfig, registerVoipDevPush } from '../../servers/voip.uts';
+import { loginVoipDev, setVoipDevSession, readVoipDevSession, probeVoipDevServer, voipSessionConfig, registerVoipDevPush, voipRequest } from '../../servers/voip.uts';
 beforeEach(() => {
   state.allowed = true; state.consent = true; state.storage.clear(); state.requests = [];
   vi.stubGlobal('UTSJSONObject', class { constructor(value = {}) { Object.assign(this, value); } });
@@ -25,16 +25,22 @@ describe('explicit device-test session', () => {
     const old = { enabled: true, apiBaseUrl: 'http://test-service:7890', userId: 'alice', accessToken: 'old-fixture' };
     setVoipDevSession(old);
     setVoipDevSession({ ...old, userId: 'bob', accessToken: 'new-fixture' });
-    await expect(registerVoipDevPush(old, 'cid-fixture')).rejects.toThrow('CALL_SESSION_CHANGED');
+    await expect(registerVoipDevPush(old, 'cid-fixture', 'com.nuwax.app')).rejects.toThrow('CALL_SESSION_CHANGED');
     expect(state.requests).toHaveLength(0);
   });
   it('registers a test CID in its own channel and environment', async () => {
     const session = { enabled: true, apiBaseUrl: 'http://test-service:7890', userId: 'alice', accessToken: 'test-fixture' };
     setVoipDevSession(session);
-    const pending = registerVoipDevPush(session, 'cid-fixture');
-    expect(state.requests[0].data).toEqual({ channel: 'uniPush', token: 'cid-fixture', environment: 'development' });
+    const pending = registerVoipDevPush(session, 'cid-fixture', 'com.nuwax.app');
+    expect(state.requests[0].data).toEqual({ channel: 'uniPush', token: 'cid-fixture', environment: 'development', bundleId: 'com.nuwax.app' });
     state.requests[0].success({ statusCode: 200, data: { code: '0000', data: { registered: true, nativePush: false } } });
     await expect(pending).resolves.toEqual({ registered: true, nativePush: false });
+  });
+  it.each([[401, 'CALL_UNAUTHENTICATED'], [403, 'CALL_FORBIDDEN']])('preserves HTTP authorization failure %s', async (statusCode, code) => {
+    setVoipDevSession({ enabled: true, apiBaseUrl: 'http://test-service:7890', userId: 'alice', accessToken: 'test-fixture' });
+    const pending = voipRequest('/capabilities');
+    state.requests[0].success({ statusCode, data: null });
+    await expect(pending).rejects.toThrow(code);
   });
   it('logout discards a late development login response', async () => {
     const pending = loginVoipDev('http://test-service:7890', 'alice');

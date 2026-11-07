@@ -95,6 +95,7 @@ object VoipBridge {
         val manager = ctx.getSystemService(NotificationManager::class.java)
         val channel = manager.getNotificationChannel("nuwax-voip")
         return JSONObject().put("supported", true)
+            .put("bundleId", ctx.packageName)
             .put("developmentListener", VoipDevControlService.running)
             .put("uniPushConfigured", ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA).metaData?.getBoolean("nuwax.voip.uniPush", false) == true)
             .put("notificationsAllowed", NotificationManagerCompat.from(ctx).areNotificationsEnabled())

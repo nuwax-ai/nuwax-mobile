@@ -71,7 +71,17 @@ export function createDevServer({ registry = new CallRegistry(), livekitUrl = 'w
           !['development', 'production'].includes(value.environment) || typeof value.token !== 'string' || value.token.length > 4096) {
           throw new CallError('CALL_INVALID_ARGUMENT');
         }
-        devices.set(`${userId}:${deviceId}:${value.channel}:${value.environment}`, { ...value, userId, deviceId });
+        // Older dedicated test packages omitted bundleId. Keep their records in
+        // an explicit empty namespace until those devices register with a newer package.
+        const bundleId = value.bundleId ?? '';
+        const vendor = value.channel === 'vendor' ? value.vendor : '';
+        if (typeof bundleId !== 'string' || bundleId.length > 255 ||
+          typeof vendor !== 'string' || vendor.length > 64 || (value.channel === 'vendor' && vendor.length === 0)) {
+          throw new CallError('CALL_INVALID_ARGUMENT');
+        }
+        const key = JSON.stringify([userId, deviceId, value.channel, value.environment, bundleId, vendor]);
+        if (value.token.length === 0) devices.delete(key);
+        else devices.set(key, { ...value, userId, deviceId, bundleId, vendor });
         send(res, { registered: value.token.length > 0, nativePush: false }); return;
       }
       if (url.pathname === `${prefix}/capabilities` && req.method === 'GET') {

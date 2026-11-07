@@ -1,6 +1,6 @@
 # VoIP 正式后端接入交接
 
-2026-11-06 整理，供下一轮后端对接和正式体测使用。客户端按独立功能集成，接口为双方待确认的实现契约。当前生产闸门关闭，正式接口就绪后按平台逐项验证。
+2026-11-07 更新，供下一轮后端对接和正式体测使用。客户端按独立功能集成，接口为双方待确认的实现契约。当前生产闸门关闭，正式接口就绪后按平台逐项验证。
 
 ## 当前基线
 
@@ -35,7 +35,7 @@
 | 能力 | `enabled/audio/video/nativePush/incomingEvents` | 开关维度、智能体语音能力、平台通道就绪口径 |
 | SSE | 账号级 `/events` 加单呼叫 `/{callId}/events`，完整快照，Last-Event-ID | 10 秒心跳、网关缓冲/超时、续接保留窗口 |
 | 媒体就绪 | 两端 `ready` 后进入 active，正式服务补 LiveKit 事件核验 | 轨道就绪判定、30 秒连接超时、重连回收策略 |
-| 设备路由 | uniPush、pushKit、harmonyPush 等分通道注册 | bundleId、环境、厂商、撤销时机和换账号隔离 |
+| 设备路由 | uniPush、pushKit、harmonyPush 等按通道、环境、bundleId、vendor 注册与撤销 | 正式包名校验、撤销时机和换账号隔离 |
 | LiveKit | 短期本次呼叫凭据，房间最多两人 | WSS/TURN、区域、网络端口、房间销毁与拒绝旧凭据重入 |
 | 智能体 | 会话成员推导被叫，能力由后端声明 | 主动来电授权、上下文来源、智能体媒体服务入口 |
 
@@ -58,7 +58,7 @@
 2. 通过普通登录获取平台身份。清理旧开发会话，确认 native initialize 的 `development=false`，API 地址来自平台配置。Alice/Bob 开发凭据仅用于开发服务。
 3. 在受控内部构建中按已验证平台放行 `isVoipPlatformAccepted()`，后端 capabilities 同时控制会话能力。当前实现固定 false，放行改动需随对接批次提交并记录覆盖平台。
 4. 对照三端桥的请求前缀、headers、SSE 事件名、快照字段和错误码，特别确认账号级来电流及 `ready` 动作。
-5. 校验设备注册包含通道、环境、bundleId，空 token 撤销及登出后的路由清除。Android 正式基座的厂商回调、鸿蒙原生 Push Token 注册需要补完并留证，iOS 检查 PushKit 实际注册/撤销请求。
+5. 校验设备注册包含通道、环境、bundleId 和对应 vendor，空 token 只撤销同一记录，登出由服务端清除对应账号路由。Android 正式基座的厂商回调、鸿蒙原生 Push Token 注册需要补完并留证。iOS 已补齐注册/撤销字段与旧 registry 回调隔离，仍须用真实 APNs 环境验证送达和撤销。
 6. 系统来电体测使用正式通道，关闭 Android 开发监听并确认专用 `VoipDevControlService` 未进入正式 manifest。删除测试宿主的 LAN ATS 例外、开发身份和测试服务地址配置。
 7. 每轮记录前后端提交、包版本、签名环境、设备和系统版本、网络、callId、权威版本及结果。证据中去除登录 token、RTC JWT、推送 token 和个人通知。
 

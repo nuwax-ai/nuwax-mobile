@@ -53,7 +53,44 @@ describe('development phone HTTP contract', () => {
     for (const [channel, token] of [['pushKit', 'pk'], ['uniPush', 'cid1'], ['uniPush', 'cid2']]) {
       expect((await bob('/devices', { channel, token, environment: 'development' })).code).toBe('0000');
     }
-    expect(app.devices.get('bob:b:pushKit:development').token).toBe('pk');
-    expect(app.devices.get('bob:b:uniPush:development').token).toBe('cid2');
+    expect([...app.devices.values()]).toEqual([
+      expect.objectContaining({ channel: 'pushKit', token: 'pk', bundleId: '' }),
+      expect.objectContaining({ channel: 'uniPush', token: 'cid2', bundleId: '' }),
+    ]);
+    await bob('/devices', { channel: 'pushKit', token: '', environment: 'development' });
+    expect([...app.devices.values()]).toEqual([expect.objectContaining({ channel: 'uniPush', token: 'cid2' })]);
+  });
+  it('isolates package, push environment and vendor when updating or revoking a device', async () => {
+    const { app, login } = await fixture();
+    const bob = await login('bob', 'b');
+    const base = { channel: 'pushKit', environment: 'development', bundleId: 'com.nuwax.app' };
+    for (const registration of [
+      { ...base, token: 'pk-app-dev' },
+      { ...base, token: 'pk-other-app', bundleId: 'com.nuwax.other' },
+      { ...base, token: 'pk-production', environment: 'production' },
+      { ...base, token: 'vendor-xiaomi', channel: 'vendor', vendor: 'xiaomi' },
+      { ...base, token: 'vendor-huawei', channel: 'vendor', vendor: 'huawei' },
+    ]) {
+      expect((await bob('/devices', registration)).code).toBe('0000');
+    }
+    await bob('/devices', { ...base, token: 'pk-refreshed' });
+    expect(app.devices.size).toBe(5);
+    for (let retry = 0; retry < 2; retry++) {
+      expect((await bob('/devices', { ...base, token: '' })).data.registered).toBe(false);
+    }
+    expect([...app.devices.values()].map((device: any) => device.token).sort()).toEqual([
+      'pk-other-app', 'pk-production', 'vendor-huawei', 'vendor-xiaomi',
+    ]);
+  });
+  it('rejects malformed device namespaces before changing registrations', async () => {
+    const { app, login } = await fixture();
+    const bob = await login('bob', 'b');
+    for (const registration of [
+      { channel: 'uniPush', bundleId: 42 },
+      { channel: 'vendor', bundleId: 'com.nuwax.app' },
+    ]) {
+      expect((await bob('/devices', { token: 'fixture', environment: 'development', ...registration })).code).toBe('CALL_INVALID_ARGUMENT');
+    }
+    expect(app.devices.size).toBe(0);
   });
 });

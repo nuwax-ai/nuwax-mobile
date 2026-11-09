@@ -242,6 +242,7 @@ pnpm hx:ios:simulators     # iOS 模拟器列表
 pnpm hx:ios:sim -- --deviceId <UDID>      # 跑模拟器（须指定 UDID）
 pnpm hx:ios:device -- --deviceId <序列号>  # 跑真机
 pnpm hx:ios:log            # iOS 应用日志
+pnpm publish:h5            # 发行/打包 H5（Web 产物输出至 unpackage/dist/build/web/）
 ```
 
 ## 工程约定

@@ -2,7 +2,7 @@
 
 核对日期为 2026-11-09。后端来源为 `nuwax-im` 的 `feat-video-meeting`，fetch 后提交为 `fb880f21b02714d46d8d28591296878b98f09611`。本次依据控制器、DTO、应用服务、推送实现及 Web 端调用流程核对，部署环境的接口与真实推送仍需联调。
 
-移动端继续使用 `feat/nuwa-basic-2026.11-voip-calls`，已通过 `d68143d9a` 合入两端一致的 `feat-2026.11@caf93effb`。VoIP 按下一版本在独立分支推进。
+移动端继续使用 `feat/nuwa-basic-2026.11-voip-calls`，先通过 `d68143d9a` 合入 `feat-2026.11@caf93effb`，随后同步两端一致的最新基线 `a8d6cc7db`，增量为 H5 构建产物。VoIP 按下一版本在独立分支推进。
 
 ## 已实现的调用链
 

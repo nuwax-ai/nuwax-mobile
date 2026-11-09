@@ -5,6 +5,7 @@
 </template>
 
 <script lang="uts" setup>
+  import { H5_CAPTCHA_SETTLE_EVENT } from "@/utils/aliyunCaptcha";
   // 阿里云验证码配置类型定义
   interface AliyunCaptchaConfig {
     captchaSceneId: string; // 场景ID
@@ -56,70 +57,248 @@
   const emit = defineEmits(['doAction', 'onReady'])
   // 验证码是否初始化完成
   const captchaInited = ref<boolean>(false)
+  // index.html 用 defer 加载 AliyunCaptcha.js，配置往往比脚本更早到。
+  // 未就绪时先等脚本，就绪后只对同一组场景初始化一次。
+  let initStarted = false
+  let viewMounted = false
+  let boundKey = ""
+  let waitTimer: number | null = null
+  let disposed = false
+  let settleCaptcha: ((passed: boolean) => void) | null = null
+  const usedCaptchaParams: string[] = []
+  // 点绑定按钮时，SDK 会先给一次参数再弹出滑块。这次不能发登录请求。
+  let skippedBeforeSlider = false
 
-  // 使用useCallback缓存回调函数，避免不必要的重新渲染
-  const captchaVerifyCallback = (captchaVerifyParam: any) => {
-    emit('doAction', captchaVerifyParam);
-    return {
-      captchaResult: true,
-      bizResult: true,
-    };
-  };
-
-  // 清理验证码相关DOM元素
-  const cleanupCaptchaElements = () => {
-    document.getElementById('aliyunCaptcha-mask')?.remove();
-    document.getElementById('aliyunCaptcha-window-popup')?.remove();
+  function sliderPopupVisible(): boolean {
+    return document.getElementById("aliyunCaptcha-window-popup") != null
   }
 
-  // 获取验证码实例
+  /**
+   * 阿里云回调有时直接给字符串，有时给带 captchaVerifyParam 的对象。
+   * 空值或对象被拼成 "[object Object]" 时不要交给登录接口。
+   */
+  function readCaptchaParam(value: any): string {
+    if (value == null) {
+      return ""
+    }
+    if (typeof value == "string") {
+      const text = value as string
+      if (text == "[object Object]") {
+        return ""
+      }
+      return text
+    }
+    const payload = value as UTSJSONObject
+    const direct = payload["captchaVerifyParam"]
+    if (direct == null) {
+      return ""
+    }
+    const text = `${direct}`
+    if (text == "[object Object]") {
+      return ""
+    }
+    return text
+  }
+
+  function isUsedCaptchaParam(param: string): boolean {
+    for (let i = 0; i < usedCaptchaParams.length; i++) {
+      if (usedCaptchaParams[i] == param) {
+        return true
+      }
+    }
+    return false
+  }
+
+  function onCaptchaSettled(passed: any): void {
+    const settle = settleCaptcha
+    settleCaptcha = null
+    if (settle == null) {
+      return
+    }
+    settle(passed == true)
+  }
+
+  // 业务接口回来后再把结果交给阿里云。提前返回成功会让同一条参数被重复提交。
+  const captchaVerifyCallback = (captchaVerifyParam: any) => {
+    if (!sliderPopupVisible()) {
+      if (!skippedBeforeSlider) {
+        skippedBeforeSlider = true
+        return {
+          captchaResult: false,
+          bizResult: false,
+        }
+      }
+    }
+    skippedBeforeSlider = false
+    const verifyParam = readCaptchaParam(captchaVerifyParam)
+    if (verifyParam.length == 0 || isUsedCaptchaParam(verifyParam)) {
+      return {
+        captchaResult: false,
+        bizResult: false,
+      }
+    }
+    usedCaptchaParams.push(verifyParam)
+    return new Promise<CaptchaVerifyResult>((resolve) => {
+      settleCaptcha = (passed: boolean) => {
+        resolve({
+          captchaResult: passed,
+          bizResult: passed,
+        })
+      }
+      emit('doAction', verifyParam)
+    })
+  }
+
+  const cleanupCaptchaElements = () => {
+    document.getElementById('aliyunCaptcha-mask')?.remove()
+    document.getElementById('aliyunCaptcha-window-popup')?.remove()
+  }
+
+  function clearWaitTimer(): void {
+    if (waitTimer != null) {
+      clearInterval(waitTimer)
+      waitTimer = null
+    }
+  }
+
+  function scriptReady(): boolean {
+    const win = window as UTSJSONObject
+    const initFn = win["initAliyunCaptcha"]
+    return initFn != null
+  }
+
   const getInstance = (instance: any) => {
-    if (instance) {
-      captchaInited.value = true;
+    if (instance != null) {
+      captchaInited.value = true
     }
   }
 
   watch(captchaInited, (newVal) => {
     if (newVal) {
-      emit('onReady');
-      console.log('验证码初始化完成，onReady已调用');
+      emit('onReady')
     }
   })
 
-  // 初始化阿里云验证码
   const initCaptcha = () => {
+    if (disposed || !viewMounted || captchaInited.value) {
+      return
+    }
+    if (!scriptReady()) {
+      return
+    }
+    if (document.getElementById("captcha-element") == null) {
+      return
+    }
+    if (document.getElementById(props.elementId) == null) {
+      return
+    }
+    const config = props.config
+    if (config == null) {
+      return
+    }
+    const sceneRaw = config.captchaSceneId
+    const prefixRaw = config.captchaPrefix
+    if (sceneRaw == null || prefixRaw == null) {
+      return
+    }
+    const sceneId = `${sceneRaw}`
+    const prefix = `${prefixRaw}`
+    if (sceneId.length == 0 || prefix.length == 0) {
+      return
+    }
     try {
-      // 初始化验证码
+      cleanupCaptchaElements()
       window.initAliyunCaptcha({
-        SceneId: props.config.captchaSceneId, // 场景ID
-        prefix: props.config.captchaPrefix, // 身份标
-        mode: 'popup', // 验证码模式：弹出式
-        element: '#captcha-element', // 渲染验证码的元素
-        button: `#${props.elementId}`, // 触发验证码弹窗的元素
-        captchaVerifyCallback, // 业务请求回调函数
-        onBizResultCallback: () => {}, // 业务请求结果回调函数
-        getInstance, // 绑定验证码实例函数
+        SceneId: sceneId,
+        prefix: prefix,
+        mode: 'popup',
+        element: '#captcha-element',
+        button: `#${props.elementId}`,
+        captchaVerifyCallback,
+        onBizResultCallback: () => {},
+        getInstance,
         slideStyle: {
           width: 320,
           height: 40,
-        }, // 滑块验证码样式
-        language: 'cn', // 验证码语言类型
-      });
+        },
+        language: 'cn',
+      })
     } catch (error) {
-      console.error('阿里云验证码初始化错误:', error);
+      initStarted = false
+      console.error('阿里云验证码初始化错误:', error)
     }
-  };
+  }
+
+  function scheduleInit(): void {
+    if (disposed) {
+      return
+    }
+    if (scriptReady()) {
+      clearWaitTimer()
+      initCaptcha()
+      return
+    }
+    if (waitTimer != null) {
+      return
+    }
+    let attempts = 0
+    waitTimer = setInterval(() => {
+      attempts = attempts + 1
+      if (disposed || scriptReady() || attempts >= 50) {
+        clearWaitTimer()
+        if (!disposed && scriptReady()) {
+          initCaptcha()
+        }
+      }
+    }, 200)
+  }
 
   watch(() => props.config, (newVal) => {
-    if (newVal && newVal.openCaptcha) {
-      initCaptcha();
+    if (newVal == null) {
+      return
     }
+    // 租户配置里 openCaptcha 是 1，组件类型声明是 boolean，两种都认。
+    const openRaw = newVal.openCaptcha
+    if (openRaw == null || (`${openRaw}` != "1" && openRaw != true)) {
+      return
+    }
+    const sceneRaw = newVal.captchaSceneId
+    const prefixRaw = newVal.captchaPrefix
+    if (sceneRaw == null || prefixRaw == null) {
+      return
+    }
+    const sceneId = `${sceneRaw}`
+    const prefix = `${prefixRaw}`
+    if (sceneId.length == 0 || prefix.length == 0) {
+      return
+    }
+    const key = sceneId + "|" + prefix
+    if (key == boundKey && (captchaInited.value || initStarted)) {
+      return
+    }
+    boundKey = key
+    initStarted = true
+    captchaInited.value = false
+    if (!viewMounted) {
+      return
+    }
+    scheduleInit()
   }, { deep: true, immediate: true })
 
+  onMounted(() => {
+    viewMounted = true
+    uni.$on(H5_CAPTCHA_SETTLE_EVENT, onCaptchaSettled)
+    nextTick(() => {
+      scheduleInit()
+    })
+  })
+
   onUnmounted(() => {
-    // 组件卸载时清理DOM元素
-    cleanupCaptchaElements();
-  });
+    disposed = true
+    uni.$off(H5_CAPTCHA_SETTLE_EVENT, onCaptchaSettled)
+    clearWaitTimer()
+    cleanupCaptchaElements()
+  })
 </script>
 
 <style lang="scss" scoped>

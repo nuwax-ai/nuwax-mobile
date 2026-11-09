@@ -1,0 +1,461 @@
+<template>
+  <view class="qr-page">
+    <view class="qr-card">
+      <text class="qr-title">{{ title }}</text>
+      <text v-if="state == 'loading' || state == 'auth'" class="qr-hint">{{
+        t('Mobile.QrLogin.loading')
+      }}</text>
+      <view v-if="state == 'ready' || state == 'confirming'" class="qr-account">
+        <text class="qr-hint">{{ t('Mobile.QrLogin.accountHint') }}</text>
+        <text class="qr-name">{{ accountName }}</text>
+        <text v-if="accountLabel.length > 0" class="qr-hint">{{
+          accountLabel
+        }}</text>
+        <text class="qr-hint">{{ t('Mobile.QrLogin.service') }}</text>
+        <text class="qr-service">{{ serviceOrigin }}</text>
+      </view>
+      <text v-if="state == 'error' || state == 'invalid'" class="qr-error">{{
+        errorText
+      }}</text>
+      <text v-if="state == 'success'" class="qr-hint">{{
+        t('Mobile.QrLogin.successHint')
+      }}</text>
+      <text v-if="state == 'cancelled'" class="qr-hint">{{
+        t(
+          confirmationAttempted
+            ? 'Mobile.QrLogin.confirmUnknown'
+            : 'Mobile.QrLogin.cancelHint',
+        )
+      }}</text>
+      <button
+        v-if="state == 'ready' || state == 'confirming'"
+        class="qr-button"
+        :disabled="state == 'confirming'"
+        :loading="state == 'confirming'"
+        @tap="confirmLogin"
+      >
+        {{ t('Mobile.QrLogin.confirm') }}
+      </button>
+      <button v-if="state == 'error'" class="qr-button" @tap="retryLogin">
+        {{ t('Mobile.QrLogin.retry') }}
+      </button>
+      <button
+        v-if="
+          state == 'ready' ||
+          state == 'loading' ||
+          state == 'auth' ||
+          state == 'error'
+        "
+        class="qr-secondary"
+        @tap="cancelLogin"
+      >
+        {{ t('Mobile.Common.cancel') }}
+      </button>
+      <button
+        v-if="state == 'success' || state == 'cancelled' || state == 'invalid'"
+        class="qr-button"
+        @tap="finish"
+      >
+        {{ t('Mobile.QrLogin.done') }}
+      </button>
+      <!-- #ifdef H5 || WEB -->
+      <view v-if="showOpenApp && state == 'ready'" class="qr-app-actions">
+        <text class="qr-link" @tap="openApp">{{
+          t('Mobile.QrLogin.openApp')
+        }}</text>
+        <text class="qr-hint">{{ t('Mobile.QrLogin.browserFallback') }}</text>
+        <text class="qr-link" @tap="downloadApp">{{
+          t('Mobile.QrLogin.download')
+        }}</text>
+      </view>
+      <!-- #endif -->
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+import { computed, ref } from 'vue';
+import { onLoad, onShow, onHide, onUnload } from '@dcloudio/uni-app';
+import {
+  apiQrLoginUser,
+  apiQrLoginScan,
+  apiQrLoginConfirm,
+} from '@/servers/qrLogin';
+import { apiResCode, apiResData, apiResMessage } from '@/utils/apiResponse';
+import {
+  SUCCESS_CODE,
+  USER_NO_LOGIN,
+  REDIRECT_LOGIN,
+} from '@/constants/codes.constants';
+import { ACCESS_TOKEN } from '@/constants/home.constants';
+import { APP_DOWNLOAD_PAGE_URL } from '@/constants/config';
+import {
+  bootstrapH5AccessTokenFromUrl,
+  clearAccessToken,
+} from '@/utils/authSession';
+import { redirectToLoginOnce, LOGIN_PAGE_PATH } from '@/utils/authNavigation';
+import {
+  currentQrLoginOrigin,
+  normalizeQrLoginOrigin,
+  validQrLoginScene,
+  qrLoginPageUrl,
+  qrLoginAppUrl,
+} from '@/utils/qrLogin';
+import { switchMainTab } from '@/utils/mainTabNavigation';
+import { useI18n, emptyI18nParams } from '@/utils/i18n';
+// #ifdef H5 || WEB
+import { authBrowserQuery } from '@/utils/idpNavigation';
+import { isAppWebViewEmbedded } from '@/utils/appWebViewDetect';
+// #endif
+
+const { t: translate } = useI18n();
+const t = (key: string): string => translate(key, emptyI18nParams(), '');
+const state = ref<string>('loading');
+const accountName = ref<string>('');
+const accountLabel = ref<string>('');
+const serviceOrigin = ref<string>('');
+const errorText = ref<string>('');
+const showOpenApp = ref<boolean>(false);
+const confirmationAttempted = ref<boolean>(false);
+let sceneId = '';
+let shownAccountKey = '';
+let revision = 0;
+let running = false;
+let foreground = true;
+let pageToken = '';
+
+const title = computed((): string => {
+  if (state.value == 'success') return t('Mobile.QrLogin.success');
+  if (state.value == 'cancelled') return t('Mobile.QrLogin.cancelled');
+  return t('Mobile.QrLogin.title');
+});
+
+function field(data: UTSJSONObject, key: string): string {
+  const raw = data[key];
+  return raw != null ? `${raw}` : '';
+}
+function tokenValue(): string {
+  const raw = uni.getStorageSync(ACCESS_TOKEN);
+  return raw != null ? `${raw}` : '';
+}
+function invalidate(): void {
+  revision += 1;
+  running = false;
+  shownAccountKey = '';
+}
+function stillCurrent(value: number, token: string): boolean {
+  if (value != revision || !foreground) return false;
+  if (currentQrLoginOrigin() != serviceOrigin.value || tokenValue() != token) {
+    invalidate();
+    state.value = 'error';
+    errorText.value = t('Mobile.QrLogin.contextChanged');
+    return false;
+  }
+  return true;
+}
+function accepted(
+  response: UTSJSONObject,
+  value: number,
+  token: string,
+  requestLogin: boolean = true,
+): boolean {
+  if (!stillCurrent(value, token)) return false;
+  const code = apiResCode(response);
+  if (code == USER_NO_LOGIN || code == REDIRECT_LOGIN) {
+    invalidate();
+    state.value = 'auth';
+    clearAccessToken();
+    if (requestLogin)
+      redirectToLoginOnce(
+        LOGIN_PAGE_PATH,
+        qrLoginPageUrl(sceneId, serviceOrigin.value),
+      );
+    else {
+      state.value = 'error';
+      errorText.value = t('Mobile.QrLogin.loginRequired');
+    }
+    return false;
+  }
+  if (code != SUCCESS_CODE) {
+    state.value = 'error';
+    const message = apiResMessage(response);
+    errorText.value = message.length > 0 ? message : t('Mobile.QrLogin.failed');
+    return false;
+  }
+  return true;
+}
+function accountKey(user: UTSJSONObject): string {
+  const uid = field(user, 'uid'),
+    name = field(user, 'userName');
+  return uid.length > 0 || name.length > 0 ? uid + ':' + name : '';
+}
+function maskedAccount(user: UTSJSONObject): string {
+  const phone = field(user, 'phone');
+  if (phone.length >= 7)
+    return phone.substring(0, 3) + '****' + phone.substring(phone.length - 4);
+  const email = field(user, 'email');
+  const at = email.indexOf('@');
+  return at > 0 ? email.substring(0, 1) + '***' + email.substring(at) : '';
+}
+
+async function prepareLogin(requestLogin: boolean = true): Promise<void> {
+  if (running || !foreground || !validQrLoginScene(sceneId)) return;
+  if (currentQrLoginOrigin() != serviceOrigin.value) {
+    state.value = 'invalid';
+    errorText.value = t('Mobile.QrLogin.invalid');
+    return;
+  }
+  bootstrapH5AccessTokenFromUrl();
+  // #ifdef APP
+  if (tokenValue().length == 0) {
+    invalidate();
+    state.value = requestLogin ? 'auth' : 'error';
+    if (requestLogin)
+      redirectToLoginOnce(
+        LOGIN_PAGE_PATH,
+        qrLoginPageUrl(sceneId, serviceOrigin.value),
+      );
+    else errorText.value = t('Mobile.QrLogin.loginRequired');
+    return;
+  }
+  // #endif
+  const token = tokenValue(),
+    value = ++revision;
+  pageToken = token;
+  running = true;
+  shownAccountKey = '';
+  state.value = 'loading';
+  errorText.value = '';
+  try {
+    const response = await apiQrLoginUser(sceneId, serviceOrigin.value);
+    if (!accepted(response, value, token, requestLogin)) return;
+    const raw = apiResData<any>(response);
+    if (raw == null) throw new Error(t('Mobile.QrLogin.failed'));
+    const user = raw as UTSJSONObject;
+    const key = accountKey(user);
+    if (key.length == 0) throw new Error(t('Mobile.QrLogin.failed'));
+    const scanned = await apiQrLoginScan(sceneId, serviceOrigin.value);
+    if (!accepted(scanned, value, token, requestLogin)) return;
+    shownAccountKey = key;
+    accountName.value =
+      field(user, 'nickName').length > 0
+        ? field(user, 'nickName')
+        : field(user, 'userName');
+    accountLabel.value = maskedAccount(user);
+    state.value = 'ready';
+  } catch (_error) {
+    if (stillCurrent(value, token)) {
+      state.value = 'error';
+      errorText.value = t('Mobile.QrLogin.failed');
+    }
+  } finally {
+    if (value == revision) running = false;
+  }
+}
+function retryLogin(): void {
+  prepareLogin();
+}
+
+async function confirmLogin(): Promise<void> {
+  if (running || state.value != 'ready' || shownAccountKey.length == 0) return;
+  const value = revision,
+    token = pageToken,
+    expectedAccount = shownAccountKey;
+  if (!stillCurrent(value, token)) return;
+  running = true;
+  state.value = 'confirming';
+  errorText.value = '';
+  try {
+    // H5 的 HttpOnly Cookie 不能本地读取；提交前重新确认实际账号，服务端再校验扫码者。
+    const response = await apiQrLoginUser(sceneId, serviceOrigin.value);
+    if (!accepted(response, value, token)) return;
+    const raw = apiResData<any>(response);
+    if (raw == null || accountKey(raw as UTSJSONObject) != expectedAccount) {
+      invalidate();
+      state.value = 'error';
+      errorText.value = t('Mobile.QrLogin.accountChanged');
+      return;
+    }
+    confirmationAttempted.value = true;
+    const confirmed = await apiQrLoginConfirm(sceneId, serviceOrigin.value);
+    if (!accepted(confirmed, value, token)) return;
+    state.value = 'success';
+  } catch (_error) {
+    if (stillCurrent(value, token)) {
+      state.value = 'error';
+      errorText.value = t(
+        confirmationAttempted.value
+          ? 'Mobile.QrLogin.confirmUnknown'
+          : 'Mobile.QrLogin.failed',
+      );
+    }
+  } finally {
+    if (value == revision) running = false;
+  }
+}
+function cancelLogin(): void {
+  invalidate();
+  sceneId = '';
+  state.value = 'cancelled';
+}
+function finish(): void {
+  uni.navigateBack({
+    fail: (_error: any) => {
+      switchMainTab({ url: '/pages/message/message' });
+    },
+  });
+}
+function hidePage(): void {
+  foreground = false;
+  invalidate();
+}
+function showPage(): void {
+  if (foreground) return;
+  foreground = true;
+  if (
+    state.value == 'success' ||
+    state.value == 'cancelled' ||
+    state.value == 'invalid'
+  )
+    return;
+  if (confirmationAttempted.value) {
+    state.value = 'error';
+    errorText.value = t('Mobile.QrLogin.confirmUnknown');
+    return;
+  }
+  prepareLogin(false);
+}
+// #ifdef H5 || WEB
+function openApp(): void {
+  if (state.value == 'ready')
+    window.location.href = qrLoginAppUrl(sceneId, serviceOrigin.value);
+}
+function downloadApp(): void {
+  window.open(APP_DOWNLOAD_PAGE_URL, '_blank', 'noopener');
+}
+function visibilityChanged(): void {
+  if (document.visibilityState == 'hidden') hidePage();
+  else showPage();
+}
+// #endif
+
+onLoad((query: any) => {
+  invalidate();
+  foreground = true;
+  confirmationAttempted.value = false;
+  const params = query as UTSJSONObject;
+  sceneId = field(params, 'sceneId');
+  let origin = field(params, 'origin');
+  // #ifdef H5 || WEB
+  const browserScene = authBrowserQuery('sceneId'),
+    browserOrigin = authBrowserQuery('origin');
+  if (browserScene != null) sceneId = browserScene;
+  if (browserOrigin != null) origin = browserOrigin;
+  showOpenApp.value = !isAppWebViewEmbedded();
+  document.addEventListener('visibilitychange', visibilityChanged);
+  // #endif
+  serviceOrigin.value =
+    origin.length > 0 ? normalizeQrLoginOrigin(origin) : currentQrLoginOrigin();
+  if (
+    !validQrLoginScene(sceneId) ||
+    serviceOrigin.value.length == 0 ||
+    serviceOrigin.value != currentQrLoginOrigin()
+  ) {
+    state.value = 'invalid';
+    errorText.value = t('Mobile.QrLogin.invalid');
+    return;
+  }
+  prepareLogin();
+});
+onShow(showPage);
+onHide(hidePage);
+onUnload(() => {
+  hidePage();
+  // #ifdef H5 || WEB
+  document.removeEventListener('visibilitychange', visibilityChanged);
+  // #endif
+});
+</script>
+
+<style scoped>
+.qr-page {
+  flex: 1;
+  background-color: #f5f6f8;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.qr-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 32px 24px;
+  border-radius: 16px;
+  background-color: #ffffff;
+  align-items: center;
+}
+.qr-title {
+  font-size: 22px;
+  font-weight: bold;
+  color: #111111;
+  text-align: center;
+}
+.qr-account {
+  width: 100%;
+  align-items: center;
+}
+.qr-name {
+  font-size: 20px;
+  font-weight: bold;
+  color: #111111;
+  margin-top: 16px;
+  text-align: center;
+}
+.qr-hint {
+  font-size: 14px;
+  color: #777777;
+  margin-top: 16px;
+  text-align: center;
+}
+.qr-service {
+  font-size: 14px;
+  color: #333333;
+  margin-top: 8px;
+  text-align: center;
+}
+/* #ifdef H5 || WEB */
+.qr-service {
+  word-break: break-all;
+}
+/* #endif */
+.qr-error {
+  font-size: 14px;
+  color: #b42318;
+  margin-top: 20px;
+  text-align: center;
+}
+.qr-button {
+  width: 100%;
+  background-color: #111111;
+  color: #ffffff;
+  font-size: 15px;
+  border-radius: 8px;
+  margin-top: 24px;
+}
+.qr-secondary {
+  width: 100%;
+  background-color: #ffffff;
+  color: #555555;
+  font-size: 15px;
+  border-radius: 8px;
+  margin-top: 12px;
+}
+.qr-app-actions {
+  margin-top: 24px;
+  align-items: center;
+}
+.qr-link {
+  font-size: 14px;
+  color: #7146d6;
+  margin-top: 16px;
+}
+</style>

@@ -3,7 +3,8 @@
 面向：nuwax-mobile 端上开发、nuwax-im 后端开发、uniCloud 云函数维护者。
 前置阅读：[im-offline-push.md](im-offline-push.md)（现有 uni-push 2.0 链路）。
 
-状态：**计划稿**（2026-11-04）。Phase 1 项目扫描已完成，本文是落地清单，不含代码。
+状态：**计划稿**（2026-11-04；**2026-11-06 增补 §0.5 推送方案选型结论、关闭 D1**）。
+Phase 1 项目扫描已完成，本文是落地清单，不含代码。
 
 ---
 
@@ -13,15 +14,97 @@
 （首要目标：三星国行）新增一条 **Foreground Service + WebSocket + 本地通知** 的兜底通道，
 推送走哪条路由**由服务端按设备能力决定**，端上不按 brand 写死业务逻辑。
 
+**覆盖面（2026-11-06 明确）**：只覆盖「**确实没有厂商通道**」的 Android 设备，**三星国行为首要目标**。
+华为 / 荣耀 / OPPO / vivo 走现有厂商通道；**小米有厂商通道、只是尚未配置**，归 `vendor`，
+**不纳入本 fallback**（配置完成前的空窗期，小米设备离线收不到推送——这是现状，不是本期要解决的问题）。
+
+**为什么不是换一家推送 SDK（极光）**：见 §0.5，结论是不采用。
+
+---
+
+## 0.5 推送方案选型：为何不采用极光推送（2026-11-06 决策）
+
+**结论：不采用。极光在国内没有三星厂商通道，对「三星国行离线推送」不构成有效补充。**
+
+换掉的是「SDK 供应商」，换不掉的是「三星国行没有系统级推送」这个物理事实——极光剩下的只有
+自己的 TCP 长连接，与 uni-push 2.0 底层的**个推自建通道结构完全同构**。
+
+### 0.5.1 三星国行在系统层面就没有可用通道
+
+| 候选通道 | 三星国行可用性 | 依据 |
+|---|---|---|
+| FCM | ❌ | 国行机型按合规不预装 GMS，无 Google Play Services |
+| Samsung Push Service (SPP) | ❌ | 只推三星自家服务（Galaxy Apps / Pay / Link），不对第三方 App 开放 |
+| 华为 / 荣耀 / 小米 / OPPO / vivo / 魅族 | ❌ | 各自只在本品牌 ROM 中存在，三星 ROM 没有这些系统服务 |
+| 统一推送联盟（UPA） | ❌ | 三星加入过，但联盟基本名存实亡，无可对接的第三方 SDK |
+| 第三方自建长连接（个推 / 极光） | ⚠️ | 唯一剩下的一条路，但**依赖进程存活**，不是系统级通道 |
+
+### 0.5.2 极光官方通道清单里没有三星
+
+- 《通知下发策略》列出的厂商通道：**小米、华为、OPPO、vivo、荣耀、魅族、FCM、华硕、鸿蒙、蔚来**。
+- 服务端 `options.third_party_channel` 接受的 key：`xiaomi / huawei / honor / meizu / oppo / vivo / fcm / nio / asus / hmos`
+  ——**没有 `samsung`**，即不存在「接三星通道」的配置项。
+- 极光工程师文章原文：「**除三星和 vivo 外**，小米、OPPO、华为、荣耀均有各自的厂商通道加持。」
+
+⇒ 三星国行只能落在「极光通道」，而极光官方对这条通道的口径是：断网、关机、**进程被杀死**都会断开长连接；
+官方推荐做法是引导用户开自启动 / 后台白名单，并不推荐开发者自行保活。
+
+### 0.5.3 关键判断：极光能给的是「保活」，不是「通道」
+
+极光在三星上如果比个推活得久，靠的是双进程守护、系统广播拉活、应用互助（链路调节器）——**三样都是保活手段**。推论：
+
+1. 凡是极光能做到的存活，本方案自建的 FGS + WS 也能做到，且更可控（直接复用
+   [imProtocol.uts](../../utils/im/imProtocol.uts)，不必再养一套 token / 点击路由 / 角标）。
+2. **应用互助依赖外部条件**：用户手机里得装着别的集成极光的 App、未被休眠、允许关联启动
+   ⇒ 只能算**概率提升**，不能对产品承诺。
+3. 三星 One UI 的「休眠 / 深度休眠应用」是冻结级约束（无网络、无 wakelock、无 Job），
+   自启与互拉会一起失效，极光在这里没有特权。
+
+### 0.5.4 成本与风险对比
+
+| 维度 | 自建 FGS + WS（本方案） | 引入极光 |
+|---|---|---|
+| 解决「被杀后收推送」 | 部分缓解（受休眠限制） | **一样**（受休眠限制） |
+| 新增第三方 SDK | 0 | 1 个（jpush + jcore；含厂商子模块更大） |
+| 端上长连接 | 1（接管现有 WS） | 2（个推 + 极光，双倍耗电 / 双倍自启嫌疑） |
+| 后端 | B-00 设备级 presence + 路由 | 另加极光 REST 鉴权、Registration ID 表、双通道路由、双回执 |
+| 包体 | 无 | +数 MB |
+| 构建 | 需重打自定义基座 | 同样需重打，且 SDK 升级要跟进 |
+| 合规风险 | 中（FGS 需说明 `specialUse` 用途） | **高**（见下） |
+
+**合规是决定性因素**：极光 SDK 的「应用互助 / 关联启动」是工信部 164 号文与隐私检测的高频点名项，
+其官方合规指引要求隐私政策披露「**软件列表信息**」并说明用于「应用自启动、链路调节器」。
+而本项目 2026-11-04 **刚因「隐私弹窗前初始化推送 SDK」被应用市场自动审核拒绝**
+（见 [imPushClient.uts](../../utils/im/imPushClient.uts) 顶部注释），正在收敛为「同意协议前零 SDK 初始化」。
+此时再引入一个带自启动行为的推送 SDK，会直接抵消这轮改造。
+
+**费用（社区口径，接入前需向商务核实）**：免费版离线消息只保留 **5 条**；
+2025 起免费用户单次推送中走厂商通道的用户量占比有上限（社区反馈 30%）；付费门槛约年费 2 万级。
+
+### 0.5.5 技术可行性（留档，不等于该做）
+
+极光**确有官方 uni-app x 插件**，接入成本可估：
+
+- 官方仓 `jiguang-official/jpush-uniapp-plugin`
+- DCloud 插件市场 `jg-jpush-u`（id=22886），标注支持 uni-app x（Android 5.0+ / iOS 12+ / 鸿蒙 12+）
+- 仓库内含 `huawei / honor / xiaomi / oppo / vivo / meizu / fcm` 厂商子模块
+
+**重新评估的触发条件**（三条同时满足才考虑）：
+
+1. §7 全量验收跑完，三星国行到达率仍不达标；
+2. 已落地 F-07~F-09（FGS 可靠性工程）与 F-17（后台优化引导）；
+3. 极光能给出**三星国行场景的实测到达率数据**，而不是「理论上更好」。
+
 ---
 
 ## 1. 前置决策（未拍板前不要开工）
 
 | # | 问题 | 影响 | 建议 |
 |---|---|---|---|
-| D1 | **小米通道是否真的已启用？** `manifest.json` 的 `app-android.distribute.modules["uni-push"]` 只声明了 `hms / oppo / vivo / honor`，**没有 xiaomi**。另见 [../../utils/appIconBadge.uts](../../utils/appIconBadge.uts) 头部注释：「小米通道待应用市场上架审核通过后再补」 | 决定 fallback 的覆盖面（小米是否也要走 WebSocket） | **倾向结论：小米暂未启用**。若确认，小米设备本期即归入 fallback 目标；上架后补通道再切回 vendor |
+| D1 | ~~小米通道是否真的已启用？~~ **✅ 已决策（2026-11-06）**：小米**有厂商通道，只是尚未配置**。`manifest.json` 的 `app-android.distribute.modules["uni-push"]` 当前只声明 `hms / oppo / vivo / honor`，属**配置未完成**，不是能力缺失（另见 [../../utils/appIconBadge.uts](../../utils/appIconBadge.uts) 头部注释） | 决定 fallback 的覆盖面（小米是否也要走 WebSocket） | **小米归 `vendor`，不纳入本 fallback**。配置完成前的空窗期，小米设备离线收不到推送属**现状**，本期不解决。F-01 中 `xiaomi` → `vendorCandidates`，`fallbackCandidate = false` |
 | D2 | **`foregroundServiceType` 选型** | `dataSync` 在 Android 15 起有 6 小时/24 小时限额，会硬性掐断 IM 长连接；`specialUse` 不受时限但需声明用途 | 建议 `specialUse`，并在 Android 15 真机验证 >6 小时存活 |
 | D3 | **pushChannel 判定权归属** | 端上无法判断厂商通道是否真的可用（`getPushClientId` 返回的是个推 cid，与厂商 token 无关） | 采用三级模型：端上报候选能力 → 服务端按配置+回执判定 → 回执失败自动降级 |
+| D4 | **是否引入极光推送（JPush）作为三星国行的补充通道？** | 决定整条 fallback 线的技术路线、包体与合规风险 | **✅ 已决策（2026-11-06）：不采用**。极光无三星厂商通道，自建长连接与个推同构；成本 / 合规 / 费用均不划算。完整论证与「重新评估触发条件」见 [§0.5](#05-推送方案选型为何不采用极光推送2026-11-06-决策) |
 
 ---
 
@@ -55,6 +138,8 @@
   - `brand`、`model`、`manufacturer`
   - `push_channel`（枚举：`vendor` / `websocket` / `fcm` / `none`）
   - `vendor`（枚举：`huawei` / `honor` / `xiaomi` / `oppo` / `vivo` / `meizu` / `none`）
+    - ★`xiaomi` **保留**：小米有厂商通道，配置完成即启用（见 D1）。不做 fallback、也不要从枚举里删。
+    - ★无 `samsung`：三星国行没有可用厂商通道，只能落 `push_channel=websocket`（见 §0.5）。
   - `vendor_token`（预留，当前 uni-push 不暴露厂商 token，先空）
   - `fallback_enabled`（布尔，与现有 `push_enabled` 区分：前者=允许走 WS 兜底，后者=是否下发推送）
   - `last_seen_at`、`last_ws_connected_at`
@@ -130,6 +215,10 @@
     { vendorCandidates: ["huawei"], fallbackCandidate: true, cid: "...", notifyPermission: "granted" }
     ```
   - 注意：这只是候选，**不是**最终 `pushChannel`
+  - 品牌映射（2026-11-06 明确）：
+    - `samsung` → `vendorCandidates: []`、`fallbackCandidate = true`（三星国行无任何厂商通道）
+    - `xiaomi` → `vendorCandidates: ["xiaomi"]`、`fallbackCandidate = false`（有通道、待配置，归 vendor）
+    - 其余品牌按 `manifest.json` 已声明通道映射；未声明的品牌不臆造候选
 - [ ] **F-02** 扩展设备注册请求体（[../../servers/im.uts:197-220](../../servers/im.uts#L197-L220) 的 `registerImDeviceNow`）
   - 新增 `brand` / `model` / `manufacturer` / `sdkVersion`
   - 现有 7 个字段语义**一字不改**
@@ -292,6 +381,8 @@ F-16~F-21 权限 / 日志 / 构建（贯穿）
 
 设备：华为 / 荣耀 / 小米 / OPPO / vivo / 三星国行 / 其他 Android
 
+> **小米按厂商通道验收**，不参与 fallback（见 §0 覆盖面 / D1）。其通道配置完成前的空窗期不在本期范围。
+
 场景：
 
 - [ ] App 前台
@@ -332,4 +423,14 @@ F-16~F-21 权限 / 日志 / 构建（贯穿）
 3. 厂商省电策略（三星中国 ROM 尤其激进）可能杀掉 FGS。
 4. Android 图标数字角标是否显示，取决于 Launcher / ROM / 通知渠道 / 通知权限 / 系统版本，**不可承诺**。
 5. Fallback 通道的时效性弱于厂商推送：依赖常驻进程，持续耗电，且受上述限制。
-6. 现有能力对比：厂商推送（华为/荣耀/OPPO/vivo）在 App 被杀后仍可送达；fallback 不能。
+6. 现有能力对比：厂商推送（华为/荣耀/小米/OPPO/vivo）在 App 被杀后仍可送达；fallback 不能。
+   其中**小米通道尚未配置**（见 D1），配置完成前该品牌设备按无通道对待，但这属于配置进度问题，不是能力缺失。
+7. **「后台 App 刷新 / 电池不受限制」不等于保活**（2026-11-06 补，避免反复解释）：
+   - 长连接绑定在**进程**上，进程被杀 socket 即断；这类设置只是「允许后台运行 / 提高唤醒概率」，
+     不是「替不存在的进程维持 TCP」。
+   - Android 侧对应的是「电池 → 不受限制」「移出休眠/深度休眠应用」「自启动管理」，都是**放行**，
+     打不过 `force-stop`：进 stopped state 后 Job / Alarm / 广播全部停派发，直到用户手动打开 App。
+   - iOS 的 `BGAppRefreshTask` 是系统施舍的执行窗口（单次约 30s、频率不保证、低电量模式停用），
+     不能维持 TCP；iOS 离线推送正解仍是 APNs，[App.uvue](../../App.uvue) 侧的 `UIBackgroundModes: audio`
+     也不能当 IM 保活用（会被 App Store 审核拒）。
+   - 它能换来的是「存活率 + 定时补拉（`WorkManager`/`AlarmManager`）」，属 F-17 档增强项，不是新通道。

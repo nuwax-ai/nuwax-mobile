@@ -1,0 +1,301 @@
+/**
+ * 会话自定义链接页签：模型、URL 规范化/校验、DTO 解析。
+ *
+ * <p>对齐 PC nuwax-im-web 的 {@code lib/customTabs.ts}（DEV-434），口径逐条对齐：
+ * <ul>
+ *   <li>标签<b>挂在会话上</b>（服务端 im_custom_link），同会话成员共享、跨设备一致；
+ *       与「内置页签显隐偏好」（本地存储）是两套真源，不要混。</li>
+ *   <li>上限 100 条；名称/图标各 ≤16（图标是 emoji 或短字符，空串 = 默认链接图标）。</li>
+ *   <li>URL 规范化：无 {@code ://} 补 {@code https://}；拒绝 javascript:/data:/vbscript:/
+ *       file:/mailto:/tel: 等危险协议；同源相对路径 {@code /} 放行。</li>
+ *   <li>服务端已按 sortOrder 排好返回，端上不再重排。</li>
+ * </ul>
+ *
+ * <p>★变更事件 {@code MSG_CUSTOM_EVENT(3007)} / {@code custom_link.changed} 只是
+ * 「变了」的信号：收到后<b>重拉列表</b>，不要拿 payload 里的 link 做本地增量拼接。
+ */
+
+/** 服务端广播的变更事件类型（{@code ImConstants.CUSTOM_LINK_EVENT_TYPE} 逐字相同）。 */
+export const CUSTOM_LINK_EVENT_TYPE = "custom_link.changed";
+
+/** 每会话自定义链接上限（服务端 {@code ImConstants.CUSTOM_LINK_MAX} 的镜像）。 */
+export const MAX_CUSTOM_TABS = 100;
+
+/** 标签名上限（UTF-16 码元，与服务端同口径）。 */
+export const MAX_CUSTOM_TAB_NAME = 16;
+
+/** 图标上限（emoji / 短字符；空串合法 = 默认链接图标）。 */
+export const MAX_CUSTOM_TAB_ICON = 16;
+
+/** 自定义链接标签的 key 前缀：内置页签用裸 key，自定义链接一律 {@code link:<id>}。 */
+export const CUSTOM_TAB_KEY_PREFIX = "link:";
+
+/** 一行自定义链接（与服务端 CustomLinkDto 对应）。 */
+export class CustomLinkTab {
+  /** 链接 id（雪花号存字符串）：更新/删除时原样回传。 */
+  id: string = "";
+  /** 所属会话。 */
+  convId: string = "";
+  /** 标签名（服务端已归一，≤16）。 */
+  name: string = "";
+  /** 图标（emoji / 短字符）；空串 = 用默认链接图标。 */
+  icon: string = "";
+  /** 已规范化的网址（http/https 绝对地址，或同源 / 路径）。 */
+  url: string = "";
+  /** 会话内顺序（0 起，升序 = 从左到右）。 */
+  sortOrder: number = 0;
+}
+
+/** 标签 key：{@code link:<id>}。 */
+export function customLinkTabKey(id: string): string {
+  return `${CUSTOM_TAB_KEY_PREFIX}${id}`;
+}
+
+/** 这个 key 是不是自定义链接（内置页签永远不带前缀）。 */
+export function isCustomLinkTabKey(key: string): boolean {
+  return key.indexOf(CUSTOM_TAB_KEY_PREFIX) == 0;
+}
+
+/** 从 {@code link:<id>} 取回 id；不是自定义链接 key 时返回空串。 */
+export function customLinkIdOfKey(key: string): string {
+  if (!isCustomLinkTabKey(key)) {
+    return "";
+  }
+  return key.substring(CUSTOM_TAB_KEY_PREFIX.length);
+}
+
+/**
+ * URL 规范化（对齐 PC {@code normalizeCustomTabUrl}）。
+ *
+ * @returns 规范化后的地址；空串 = 非法（调用方据此拒绝并提示）
+ */
+export function normalizeCustomLinkUrl(raw: string): string {
+  let url = raw.trim();
+  if (url.length == 0) {
+    return "";
+  }
+  const lower = url.toLowerCase();
+  // 危险协议一律拒绝（这些在 WebView 里能执行脚本或访问本地文件）
+  if (
+    lower.indexOf("javascript:") == 0 ||
+    lower.indexOf("data:") == 0 ||
+    lower.indexOf("vbscript:") == 0 ||
+    lower.indexOf("file:") == 0 ||
+    lower.indexOf("mailto:") == 0 ||
+    lower.indexOf("tel:") == 0
+  ) {
+    return "";
+  }
+  // 同源相对路径：放行，但拒绝 //host 与 /\host（协议相对地址会被当外域打开）
+  if (url.indexOf("/") == 0) {
+    if (url.indexOf("//") == 0 || url.indexOf("/\\") == 0) {
+      return "";
+    }
+    return url;
+  }
+  // 没写协议（example.com、www.example.com、localhost:3000）补 https://
+  if (url.indexOf("://") < 0) {
+    url = `https://${url}`;
+  }
+  const normalized = url.toLowerCase();
+  if (normalized.indexOf("http://") != 0 && normalized.indexOf("https://") != 0) {
+    return "";
+  }
+  return url;
+}
+
+/** 从 URL 取展示用域名（去掉协议、路径、开头的 www.）；取不到返回空串。 */
+export function customLinkHostOf(url: string): string {
+  let s = url;
+  const schemeAt = s.indexOf("://");
+  if (schemeAt >= 0) {
+    s = s.substring(schemeAt + 3);
+  }
+  const slashAt = s.indexOf("/");
+  if (slashAt >= 0) {
+    s = s.substring(0, slashAt);
+  }
+  const queryAt = s.indexOf("?");
+  if (queryAt >= 0) {
+    s = s.substring(0, queryAt);
+  }
+  if (s.indexOf("www.") == 0) {
+    s = s.substring(4);
+  }
+  return s;
+}
+
+/**
+ * 图标归一（对齐 PC {@code normalizeCustomTabIcon}）：剥掉空白与控制字符。
+ *
+ * ★为什么必须归一：用户从聊天里复制 emoji 常常一起带上零宽字符/换行，
+ *   不剥的话长度会莫名其妙超限，而肉眼完全看不出哪里多了一个字符。
+ * ★逐码元拼接：emoji 由代理对组成，逐 charAt 复制不会破坏成对的码元。
+ */
+export function normalizeCustomLinkIcon(raw: string): string {
+  const s = raw.trim();
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code == null) {
+      continue;
+    }
+    if (code <= 32) {
+      continue;
+    }
+    if (code >= 127 && code <= 160) {
+      continue;
+    }
+    out += s.charAt(i);
+  }
+  return out;
+}
+
+/** 名称归一：trim；空则回落域名，再空则「链接」。★超长不在这里截，交给 validate 报错。 */
+export function normalizeCustomLinkName(raw: string, url: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length > 0) {
+    return trimmed;
+  }
+  const host = customLinkHostOf(url);
+  return host.length > 0 ? host : "链接";
+}
+
+/**
+ * 校验一条待新增/修改的自定义链接（顺序对齐 PC {@code validateCustomTabInput}）。
+ *
+ * @param editingId 编辑态传被编辑那条的 id（判重时排除自己）；新增传空串
+ * @returns 空串 = 通过；否则是错误码，由 UI 层翻译文案
+ *   （{@code full} / {@code name_empty} / {@code name_too_long} / {@code icon_too_long} /
+ *    {@code url_invalid} / {@code url_duplicate}）
+ */
+export function validateCustomLinkInput(
+  name: string,
+  icon: string,
+  url: string,
+  editingId: string,
+  links: CustomLinkTab[],
+): string {
+  if (links.length >= MAX_CUSTOM_TABS && editingId.length == 0) {
+    return "full";
+  }
+  const normalizedUrl = normalizeCustomLinkUrl(url);
+  if (normalizedUrl.length == 0) {
+    return "url_invalid";
+  }
+  for (let i = 0; i < links.length; i++) {
+    if (links[i].id == editingId) {
+      continue;
+    }
+    if (links[i].url == normalizedUrl) {
+      return "url_duplicate";
+    }
+  }
+  const finalName = normalizeCustomLinkName(name, normalizedUrl);
+  if (finalName.length == 0) {
+    return "name_empty";
+  }
+  if (finalName.length > MAX_CUSTOM_TAB_NAME) {
+    return "name_too_long";
+  }
+  if (normalizeCustomLinkIcon(icon).length > MAX_CUSTOM_TAB_ICON) {
+    return "icon_too_long";
+  }
+  return "";
+}
+
+/**
+ * 单行 DTO → 模型。坏行返回 null（缺 id、URL 非法/危险）——照 PC {@code toCustomTab}，
+ * 坏数据宁可不显示，也不要让一个点开就打不开的标签留在标签行里。
+ */
+export function parseCustomLinkTab(raw: UTSJSONObject): CustomLinkTab | null {
+  const idRaw = raw["id"];
+  const id = idRaw != null ? `${idRaw}` : "";
+  if (id.length == 0) {
+    return null;
+  }
+  const urlRaw = raw["url"];
+  const url = normalizeCustomLinkUrl(urlRaw != null ? `${urlRaw}` : "");
+  if (url.length == 0) {
+    return null;
+  }
+  const tab = new CustomLinkTab();
+  tab.id = id;
+  const convRaw = raw["convId"];
+  tab.convId = convRaw != null ? `${convRaw}` : "";
+  const nameRaw = raw["name"];
+  const name = normalizeCustomLinkName(nameRaw != null ? `${nameRaw}` : "", url);
+  tab.name = name.length > MAX_CUSTOM_TAB_NAME ? name.substring(0, MAX_CUSTOM_TAB_NAME) : name;
+  const iconRaw = raw["icon"];
+  const icon = normalizeCustomLinkIcon(iconRaw != null ? `${iconRaw}` : "");
+  // 图标超长只收敛成空串（回落默认图标），不让整条失效 —— 与名称的处理方向相反
+  tab.icon = icon.length > MAX_CUSTOM_TAB_ICON ? "" : icon;
+  tab.url = url;
+  const sortRaw = raw["sortOrder"];
+  if (sortRaw != null) {
+    const sortNum = parseFloat(`${sortRaw}`);
+    tab.sortOrder = isNaN(sortNum) ? 0 : sortNum;
+  }
+  return tab;
+}
+
+/**
+ * DTO 数组 → 模型数组：跳过坏行，按 id 去重，截到上限。
+ *
+ * ★参数类型必须是 UTSJSONObject[]（不是 any[]）：调用方拿到的 data 是
+ *   UTSArray<UTSJSONObject>，UTS→Kotlin 不把数组协变成 UTSArray<Any>（error17）。
+ */
+export function parseCustomLinkTabs(rows: UTSJSONObject[]): CustomLinkTab[] {
+  const out: CustomLinkTab[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < rows.length; i++) {
+    if (out.length >= MAX_CUSTOM_TABS) {
+      break;
+    }
+    const raw: UTSJSONObject | null = rows[i];
+    if (raw == null) {
+      continue;
+    }
+    const tab = parseCustomLinkTab(raw);
+    if (tab == null) {
+      continue;
+    }
+    if (seen.has(tab.id)) {
+      continue;
+    }
+    seen.add(tab.id);
+    out.push(tab);
+  }
+  return out;
+}
+
+/**
+ * 这帧自定义事件是不是「当前会话的标签变更」（对齐 PC {@code isCustomLinkChangeFor}）。
+ *
+ * ★判据是双向的：事件没带 convId ⇒ 不认（宁可少刷一次，也不要刷错会话）；
+ *   当前没开会话 ⇒ 不认。
+ */
+export function isCustomLinkChangeFor(payload: any, convId: string): boolean {
+  if (convId.length == 0 || payload == null) {
+    return false;
+  }
+  // 收窄成 UTSJSONObject | null：直接 as UTSJSONObject 遇到非对象载荷会在 Kotlin 里抛
+  // ClassCastException，而这里的原则是「不认识的载荷一律当没收到」
+  const obj = payload as UTSJSONObject | null;
+  if (obj == null) {
+    return false;
+  }
+  const eventType = obj["eventType"];
+  if (eventType == null || `${eventType}` != CUSTOM_LINK_EVENT_TYPE) {
+    return false;
+  }
+  const inner = obj["payload"] as UTSJSONObject | null;
+  if (inner == null) {
+    return false;
+  }
+  const evConv = inner["convId"];
+  if (evConv == null) {
+    return false;
+  }
+  return `${evConv}` == convId;
+}

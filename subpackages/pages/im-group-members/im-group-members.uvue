@@ -94,6 +94,11 @@
                 <view v-else-if="m.role == 2" class="gm-tag">
                   <text class="gm-tag__text">{{ t("Mobile.Message.roleManager") }}</text>
                 </view>
+                <!-- 禁言中（灰字，**所有人可见**）：普通成员也该知道「张三现在说不了话」，
+                     否则会以为对方不理他。判据纯看 muteEndTime 是否还没到，与权限无关 -->
+                <view v-if="m.muted" class="gm-tag gm-tag--muted">
+                  <text class="gm-tag__text gm-tag__text--muted">{{ t("Mobile.Message.groupMemberMutedTag") }}</text>
+                </view>
               </view>
             </view>
             <!--
@@ -210,6 +215,7 @@
     apiImContacts,
     apiImConvDetail,
     apiImConvMembersPage,
+    apiImGroupMuteMembers,
     apiImGroupRemoveMember,
     apiImGroupSetAgentMode,
     apiImGroupSetMemberRole,
@@ -268,6 +274,11 @@
     /** 模式的展示文案（解析时算好；模板直接渲染，勿在模板里调方法——Android 方法
      *  调用式绑定不收集依赖，改完模式标签不会刷新）。 */
     agentModeLabel: string = "";
+    /** 禁言到期时刻（毫秒时间戳；0 = 没被禁言过）。服务端 ConversationMemberDto.muteEndTime。 */
+    muteEndTime: number = 0;
+    /** ★此刻是否禁言中：muteEndTime > 当前时间。解析时算好（模板不调方法，同 agentModeLabel），
+     *  禁言/解除后由操作处原地改两个字段再 scheduleRowsRefresh。 */
+    muted: boolean = false;
   }
 
   // ===== 页面入参 =====
@@ -286,10 +297,14 @@
   let inited = false;
   /** 点击成员资料返回时只消费一次，保留当前列表、搜索词与滚动位置。 */
   let skipNextShowReload = false;
-  /** allowMemberInvite 三态：""=缺省(允许) / "true" / "false"。 */
-  let allowInviteRaw = "";
 
-  const canAdd = computed((): boolean => myRole.value >= 2 || allowInviteRaw != "false");
+  /**
+   * 添加成员入口：**仅群主 / 管理员**（对齐 PC DEV-358「没有权限的时候不要展示添加图标」）。
+   *
+   * ★别再把 `allowMemberInvite !== false` 或进来：它默认 true ⇒ 普通成员恒可见；
+   *   服务端仍允许其在策略放行时邀请，前端只是不给入口（可见性 ≠ 权限）。
+   */
+  const canAdd = computed((): boolean => myRole.value >= 2);
 
   /** 客户端搜索：群名片/昵称/姓名/userId 包含匹配（同 @面板口径）。 */
   const filteredMembers = computed((): GmMember[] => {
@@ -678,6 +693,9 @@
     m.agentMode = isAgentMemberMode(agentModeRaw) ? normalizeAgentMode(agentModeRaw) : 0;
     m.agentInviterId = readString(record, "agentInviterId");
     m.agentModeLabel = m.agentMode > 0 ? t(agentModeLabelKey(m.agentMode)) : "";
+    // ★禁言：判据只有时间戳一个（PC lib/mute#isMemberMuted 同口径：等于当期也算了）
+    m.muteEndTime = readNumber(record, "muteEndTime", 0);
+    m.muted = m.muteEndTime > Date.now();
     const cachedRemarks = getCachedContactRemarks();
     const myRemark = cachedRemarks == null
       ? ""
@@ -837,6 +855,15 @@
   }
 
   /**
+   * 禁言 / 解除禁言：与删除同口径（PC lib/memberList#canMuteMember 直接复用 canGovern）。
+   * ★两者今天取值相同，仍各自留名：服务端是三条路径（removeMember / setMemberNickName /
+   *   mute），一旦分叉，写歪的那一处只表现为「界面给了按钮、服务端拒绝」。
+   */
+  function canMuteOf(m: GmMember): boolean {
+    return canRemoveOf(m);
+  }
+
+  /**
    * 智能体衔接模式可改？判据在 utils/im/imAgentMode.canSetAgentMode（与服务端
    * setAgentMode 三选一逐字对齐）：群主 / 管理员 / **把这个智能体拉进群的人**。
    * ★与 canRemoveOf **刻意不同口径**：拉智能体进群的普通成员管不了任何人，
@@ -914,6 +941,18 @@
       }
       if (canCardOf(m)) {
         acts.push(new GmRowMenuAct("card", t("Mobile.Message.setGroupCard"), "icon-Edit"));
+      }
+      // ★DEV-313：同一个入口承担两个动作，形态由 muted 决定 —— 已在禁言中的人
+      //   不该还挂着「禁言」（点下去是延长还是重置，说不清）。解除不需要二次确认：
+      //   它是一次点击就能撤销的动作，加确认反而让「解封他」变成两步。
+      if (canMuteOf(m)) {
+        acts.push(
+          new GmRowMenuAct(
+            m.muted ? "unmute" : "mute",
+            m.muted ? t("Mobile.Message.groupMemberUnmuteAction") : t("Mobile.Message.groupMemberMuteAction"),
+            "icon-Mic",
+          ),
+        );
       }
       // ★DEV-271：智能体行的「衔接模式」——与点行上模式标签同一入口（长按是本页既有的
       //   操作面，标签是快捷路径；两处都只调 handleAgentModeTap，口径不会分叉）。
@@ -1194,8 +1233,6 @@
         const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
         if (dataObj != null) {
           myRole.value = readNumber(dataObj, "myRole", 1);
-          const inviteRaw = dataObj["allowMemberInvite"];
-          allowInviteRaw = inviteRaw == null ? "" : `${inviteRaw}`;
         }
       }
       const page = await apiImConvMembersPage(convId.value, "");
@@ -1535,6 +1572,171 @@
     });
   }
 
+  // ===== 成员操作：禁言 / 解除禁言（DEV-313，对齐 PC MemberPanelBody / MuteDurationModal）=====
+  /** 时长预设（秒）：10 分钟 / 1 小时 / 12 小时 / 1 天，与 PC lib/mute 同一组。 */
+  const MUTE_PRESET_SECONDS: number[] = [600, 3600, 43200, 86400];
+  /** 自定义时长上限（天）：与服务端 IM_90001 的 durationSec 上限同口径。 */
+  const MUTE_MAX_DAYS = 30;
+  /** 禁言请求在途（防连点：两次写库会让 toast 叠两遍）。 */
+  const muteChanging = ref<boolean>(false);
+
+  /** 秒数 → 展示文案（只覆盖预设与整天，两者合起来就是本页能发出的全部取值）。 */
+  function muteDurationLabelOf(seconds: number): string {
+    if (seconds == 600) return t("Mobile.Message.groupMuteDuration10m");
+    if (seconds == 3600) return t("Mobile.Message.groupMuteDuration1h");
+    if (seconds == 43200) return t("Mobile.Message.groupMuteDuration12h");
+    if (seconds == 86400) return t("Mobile.Message.groupMuteDuration1d");
+    if (seconds > 0 && seconds % 86400 == 0) {
+      const params = new Map<string, string | number>();
+      params.set("count", seconds / 86400);
+      return translateFn("Mobile.Message.groupMuteDurationDays", toI18nParams(params), "");
+    }
+    return seconds.toString();
+  }
+
+  /**
+   * 提交禁言/解除（durationSec=0 即解除）。
+   *
+   * ★成功后才改行（不乐观更新）：失败时行自己就停在原值上，不需要回滚代码。
+   * ★★**必须读回包的 affected / skippedUserIds，不能见到成功码就宣布成功**：
+   *   服务端对「不在群 / 你管不了（同级管理员、群主）」是**跳过而不是报错**——
+   *   单个人被跳过时依然回成功码，只有 skippedUserIds 里那一条和 affected=0 能说明
+   *   「这个操作其实什么都没做」。照着成功码改行，就会让人以为对方已被禁言，
+   *   而对方还在继续发消息（后端 MuteResult 的 javadoc 点名了这个坑）。
+   * ★行上的到期时刻取回包的 muteEndTime（服务端 authoritative，且是**截断到秒**的，
+   *   自己算 now+sec 会和库里差最多 1 秒）；为 null ⇒ 没禁言（解禁/被跳过）。
+   * ★改完必须 scheduleRowsRefresh：App-Android 不追踪 ref 数组内实例属性的原地变更，
+   *   不整表重建赋值的话「禁言中」标签不会出现/消失（本页头像 @error 同款平台缺陷）。
+   */
+  async function submitMemberMute(m: GmMember, durationSec: number): Promise<void> {
+    if (muteChanging.value || convId.value.length == 0) {
+      return;
+    }
+    muteChanging.value = true;
+    try {
+      const res = await apiImGroupMuteMembers(convId.value, [m.userId], durationSec);
+      if (apiResCode(res) == SUCCESS_CODE) {
+        const dataRaw = apiResData<any>(res);
+        const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+        let affected = 0;
+        let until = 0;
+        let skippedCount = 0;
+        if (dataObj != null) {
+          affected = readNumber(dataObj, "affected", 0);
+          const untilRaw = dataObj["muteEndTime"];
+          if (untilRaw != null) {
+            const parsedUntil = parseFloat(`${untilRaw}`);
+            until = isNaN(parsedUntil) ? 0 : parsedUntil;
+          }
+          const skippedRaw = dataObj["skippedUserIds"];
+          if (skippedRaw != null) {
+            const skippedArr = skippedRaw as any[];
+            skippedCount = skippedArr.length;
+          }
+        }
+        const params = new Map<string, string | number>();
+        params.set("name", m.token);
+        if (affected <= 0 && skippedCount > 0) {
+          // 一行都没写进去：明确说「没能处理他」，别报成功
+          uni.showToast({
+            title: translateFn(
+              durationSec <= 0
+                ? "Mobile.Message.groupMemberUnmuteSkipped"
+                : "Mobile.Message.groupMemberMuteSkipped",
+              toI18nParams(params),
+              "",
+            ),
+            icon: "none",
+          });
+        } else if (durationSec <= 0) {
+          m.muteEndTime = 0;
+          m.muted = false;
+          uni.showToast({
+            title: translateFn("Mobile.Message.groupMemberUnmuteDone", toI18nParams(params), ""),
+            icon: "none",
+          });
+          scheduleRowsRefresh();
+        } else {
+          // 回包没给到期时刻时按本地估算兜底（只影响标签显隐，不影响服务端判定）
+          m.muteEndTime = until > 0 ? until : Date.now() + durationSec * 1000;
+          m.muted = m.muteEndTime > Date.now();
+          params.set("duration", muteDurationLabelOf(durationSec));
+          uni.showToast({
+            title: translateFn("Mobile.Message.groupMemberMuteDone", toI18nParams(params), ""),
+            icon: "none",
+          });
+          scheduleRowsRefresh();
+        }
+      } else {
+        // 服务端才是权限与合法性权威（IM_30001 越权 / IM_90001 时长超限 / IM_20104 不在群）
+        uni.showToast({ title: apiResMessage(res), icon: "none" });
+      }
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Common.operationFailed"), icon: "none" });
+    }
+    muteChanging.value = false;
+  }
+
+  /** 自定义时长：1~30 天（PC 的输入框在 App 上落到 showModal 的 editable）。 */
+  function openCustomMuteInput(m: GmMember): void {
+    uni.showModal({
+      title: t("Mobile.Message.groupMuteCustomTitle"),
+      editable: true,
+      placeholderText: t("Mobile.Message.groupMuteCustomPlaceholder"),
+      content: "",
+      cancelText: t("Mobile.Common.cancel"),
+      confirmText: t("Mobile.Common.confirm"),
+      success: (res) => {
+        if (!res.confirm) {
+          return;
+        }
+        const raw = res.content != null ? `${res.content}`.trim() : "";
+        const days = parseFloat(raw);
+        // ★非法一律挡回并说明上限：夹取会让人以为输入的 60 天生效了（其实是 30）
+        if (isNaN(days) || days < 1 || days > MUTE_MAX_DAYS || Math.floor(days) != days) {
+          uni.showToast({ title: t("Mobile.Message.groupMuteCustomInvalid"), icon: "none" });
+          return;
+        }
+        submitMemberMute(m, days * 86400);
+      },
+    });
+  }
+
+  /**
+   * 长按菜单「禁言 / 解除禁言」。
+   * ★解除不弹时长、不二次确认：一次点击就能撤销，加确认反而让「解封他」变两步；
+   *   真正需要选时长的是**禁言**那一侧（选多久是治理决定）。
+   */
+  function handleMuteTap(m: GmMember): void {
+    if (muteChanging.value) {
+      return;
+    }
+    if (m.muted) {
+      submitMemberMute(m, 0);
+      return;
+    }
+    uni.showActionSheet({
+      itemList: [
+        t("Mobile.Message.groupMuteDuration10m"),
+        t("Mobile.Message.groupMuteDuration1h"),
+        t("Mobile.Message.groupMuteDuration12h"),
+        t("Mobile.Message.groupMuteDuration1d"),
+        t("Mobile.Message.groupMuteDurationCustom"),
+      ],
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        const idx = res.tapIndex;
+        if (idx >= 0 && idx < MUTE_PRESET_SECONDS.length) {
+          submitMemberMute(m, MUTE_PRESET_SECONDS[idx]);
+          return;
+        }
+        if (idx == MUTE_PRESET_SECONDS.length) {
+          openCustomMuteInput(m);
+        }
+      },
+    });
+  }
+
   /**
    * 气泡操作分发（按 act.key，拼装顺序见 onRowMenuRectsMeasured）：先取行数据再收浮层——
    * closeRowMenu 会清 rowMenuMember；收完再执行，确认弹窗不被气泡挡住。气泡内点击是
@@ -1559,6 +1761,8 @@
       handleRoleTap(m);
     } else if (actKey == "card") {
       handleCardTap(m);
+    } else if (actKey == "mute" || actKey == "unmute") {
+      handleMuteTap(m);
     } else if (actKey == "agentmode") {
       toggleAgentMode(m);
     } else if (actKey == "contact") {
@@ -1825,6 +2029,9 @@
     display: flex;
     flex-direction: row;
     align-items: center;
+    /* 名字（max-width 190）+ 角色标签 + 禁言标签在窄屏会超一行：
+       换行而不是横向溢出，避免「禁言中」被挤出可视区（行高随之变高，只影响超长的那种） */
+    flex-wrap: wrap;
   }
 
   .gm-name {
@@ -1845,10 +2052,19 @@
     background-color: rgba(240, 176, 106, 0.22);
   }
 
+  /* 禁言中：灰底灰字（治理状态，不比角色标签抢眼；与 PC 的灰字口径一致） */
+  .gm-tag--muted {
+    background-color: rgba(0, 0, 0, 0.05);
+  }
+
   .gm-tag__text {
     font-size: 10px;
     line-height: 15px;
     color: #5147ff;
+  }
+
+  .gm-tag__text--muted {
+    color: #8a8794;
   }
 
   /* ★DEV-271：智能体衔接模式按钮。与角色标签分开配色：唤起=灰（默认态、不打扰），

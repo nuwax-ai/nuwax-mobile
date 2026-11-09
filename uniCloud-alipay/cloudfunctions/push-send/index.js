@@ -12,6 +12,9 @@ const BATCH_SIZE = 500                    // 单次最多 500 个 cid
 const MAX_TITLE = 19                      // 通知栏标题（官方：小于 20，留一格给省略号）
 const MAX_CONTENT = 49                    // 通知栏内容（官方：小于 50）
 const MAX_PAYLOAD = 800                   // 透传数据字符数
+// 临时联调开关：设为 1 时输出推送正文、完整 payload 与目标 cid。
+// 默认关闭，避免生产云函数日志长期留存用户私聊内容。
+const DEBUG_MESSAGE_CONTENT = process.env.PUSH_DEBUG_MESSAGE_CONTENT === '1'
 // 消息分类：★只有鸿蒙通道「必填」，不配会被认定为"营销类别"而限量推送。
 // ★华为/小米等 Android 通道的 category 是「自分类权益」，必须先在厂商后台申请到该分类才能传，
 //   未申请就传可能被拒或降级 —— 所以我们只默认给 harmony，其余通道留给后端按需显式覆盖。
@@ -50,7 +53,8 @@ const uniPush = uniCloud.getPushManager({ appId: APP_ID })
 //   OPPO OP    ❌ 仅红点（数字角标需厂商准入）。
 //   vivo VV    ⚠️ 红点/数字取决于系统开关与 BADGE_ICON 权限，无法稳定指定数字。
 //   iOS        ✅ 走顶层 `badge`（APNs aps.badge），不经 options。
-//   鸿蒙       ✅ 走顶层 `badge`。
+//   鸿蒙       ✅ 顶层 `badge` 保留兼容，同时通过 options.harmony.HW 直传
+//                Push Kit `/payload/notification/badge`，避免 uni-push 未映射顶层字段。
 //
 // ⇒ 厂商能做的走这里；做不到的（小米/OPPO/vivo）只能靠 App 运行时
 //   setAppBadgeNumber 兜底，或后续接 Foreground Service 方案。
@@ -77,6 +81,20 @@ function buildHuaweiBadge(unreadCount) {
   return {
     '/message/android/notification/badge/class': HW_LAUNCHER_ACTIVITY,
     '/message/android/notification/badge/set_num': unreadCount
+  }
+}
+
+/**
+ * 【鸿蒙】HarmonyHuaweiBadgeAdapter
+ * Huawei Push Kit HarmonyOS 通知角标字段：payload.notification.badge.setNum。
+ * uni-push 厂商参数以 JSON Pointer 路径透传；使用固定值保证与服务端未读总数一致。
+ * @param {number} unreadCount
+ */
+function buildHarmonyHuaweiBadge(unreadCount) {
+  return {
+    '/payload/notification/badge': {
+      setNum: unreadCount
+    }
   }
 }
 
@@ -121,9 +139,9 @@ function parseBadgeCount(badge) {
 }
 
 /**
- * PushRouter：业务 unreadCount → 各厂商 options.android。
+ * PushRouter：业务 unreadCount → Android / HarmonyOS 厂商参数。
  * @param {number|string} badge 服务端算出的未读总数
- * @returns {Object|null} 如 { android: { HW: {...} } }；null = 本次不下发厂商角标
+ * @returns {Object|null} 如 { android: { HW: {...} }, harmony: { HW: {...} } }；null = 本次不下发厂商角标
  */
 function buildVendorBadgeOptions(badge) {
   const raw = parseBadgeCount(badge)
@@ -134,7 +152,12 @@ function buildVendorBadgeOptions(badge) {
     if (!adapter.enabled) continue
     android[adapter.channel] = adapter.build(unreadCount)
   }
-  return Object.keys(android).length ? { android } : null
+  return {
+    android,
+    harmony: {
+      HW: buildHarmonyHuaweiBadge(unreadCount)
+    }
+  }
 }
 
 // 简单签名校验：后端在 header 里带 X-Push-Sign
@@ -236,6 +259,18 @@ exports.main = async (event) => {
     force_notification: body.force_notification !== false,
     request_id: body.request_id || null
   }))
+  if (DEBUG_MESSAGE_CONTENT) {
+    console.log('[push-send] message detail', JSON.stringify({
+      push_clientid: ids,
+      title,
+      content,
+      payload,
+      badge: body.badge === undefined ? null : body.badge,
+      category,
+      force_notification: body.force_notification !== false,
+      request_id: body.request_id || null
+    }))
+  }
 
   const results = []
   for (let i = 0; i < ids.length; i += BATCH_SIZE) {

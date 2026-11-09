@@ -1,5 +1,7 @@
 # 移动端一对一通话契约（待正式后端实现）
 
+2026-11-09 已取得后端实际实现。本文为移动端目标协议，实际 `nuwax-im/feat-video-meeting@fb880f2` 使用消息邀请、3007 事件和 RTC 房间接口，字段映射及待补齐行为见[实际接口核对](voip-im-backend-review.md)。正式接入按对齐后的协议实施。
+
 本分支实现电话式单呼。会议、屏幕共享、录制、SIM、SIP/PSTN 不在范围内。LiveKit 只负责媒体；它的 room 不能代替业务呼叫、忙线、抢接和权限裁决。本文接口是**拟新增契约**，不是现网接口清单。没有修改 `agent-platform` 或独立 IM 服务。
 
 正式对接顺序、客户端修改入口与待确认项见 [交接说明](voip-backend-integration.md)。开发专属 `/dev/login`、`/health`、`/diagnostics` 和 `/dev/inject` 仅供测试工具使用。

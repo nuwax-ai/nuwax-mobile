@@ -13,9 +13,20 @@
 - iOS 完整 App 本地 HX 基座签名及动态 framework 依赖检查通过，完整业务资源和 7 个 UTS 模块，含 DebugServe/LiveKit/ESP/scopeparser，ipatype=1，无测试标记。路径 `out/voip-business-packages/iOS_debug-latest.ipa`。
 - iPhone 16 后续已接回，覆盖安装完整 App，16:21 HBuilderX local 自定义基座模式完成同步和启动，16:26 同账号呼叫拦截热更新成功；设备 app-service.js 与当前开发产物 SHA-256 一致。镜像确认消息页、联系人与“我的”1.3.3 正常。
 - 16:35 按用户最新要求，安卓接回并覆盖为同分支 VoIP 完整业务版，覆盖前确认签名一致，未卸载或清数据。HX 编译、安装、同步与 App Show 日志通过；安装后 APK 确认 native 来电 Activity/通话服务存在，专用测试监听和 deviceTest 标记不存在。普通发布包不作为此次 VoIP 测试包。
-- Android 已安装包回读留在 `out/voip-android-installed.apk`，覆盖前备份为 `out/voip-android-before-overwrite.apk`。iOS 本地包为 `out/voip-business-packages/iOS_debug-latest.ipa`。两个设备当前同账号；已补充同账号拦截测试，互拨等待不同的第二账号。
+- Android 已安装包回读留在 `out/voip-android-installed.apk`，覆盖前备份为 `out/voip-android-before-overwrite.apk`。iOS 本地包为 `out/voip-business-packages/iOS_debug-latest.ipa`。16:35 时两机同账号，未互拨；17:12 后用户切为不同账号，后续真实联调见下一节。
 - USB 授权检查：当前电脑公钥已出现在手机授权记录，最后接收的 RSA 指纹与本机一致，授权超时值为 604800000 ms；未取得此前反复弹窗的复现证据。本轮未重启 ADB，后续若复现继续抓取当次指纹与系统事件。
 - 本轮未上传基座；正式接口互拨、推送冷启动、视频、长时间锁屏和鸿蒙真机仍待验收。既有专用测试包的已通记录不计为本批业务接入通过。
+
+## 2026-11-09 真实业务双账号复测
+
+- 使用测试环境的 `ldd ↔ dong2` 单聊，两台均为完整 `com.nuwax.app` App，由 HBuilderX 运行。
+- iPhone 16 初始点击语音/文件入口均只收起面板，组件能力查询 enabled=true，但拨号函数没有收到事件。将加号面板层级从 1 调为 2 后，同位置点击成功，17:31:56 建房并交给原生层，17:31:59 后端已有 `msgType=voip` 邀请。用户确认已出现呼出页面。此问题修正同步到 Android；生产闸门未变。
+- 17:38 真实 iPhone 再拨，后端确认第二条邀请；Android 自 17:36:53 停在桌面，没有出现接听/拒接提示，系统中没有 id=9090 的 CallStyle 通知。17:38:48 打开 Android App 后也未观察到本轮系统来电。此轮后台验收**未通过**，不据此断言具体厂商推送或系统冻结根因。
+- Android 增加仅 debuggable 构建输出的 `NuwaxVoip` 阶段日志；UTS 增加仅 development 构建输出的 `[VoipCall]`、`[VoipActions]` 阶段日志，不记录邀请正文、账号、URL 或凭据。
+- 17:44 前台对照：原生控制 WS 已鉴权；17:44:36 收到并通过邀请校验，17:44:37 完成 Telecom 注册。镜像观察到系统来电通知（接听/拒接）及原生来电页。拒接后 id=9090 通知和 `VoipCallService` 均已消失。此轮未接听、未验证双向语音，不作为后台来电通过。
+- 更新本地完整 Android 基座 `out/voip-business-packages/android_debug-20261109-174425.apk`，17:46 HBuilderX 再次完成完整 App 编译、覆盖安装及资源同步；原生日志再次确认业务会话及控制鉴权成功。未卸载、未清数据、未上传基座。
+- 最终后台复测仍**未通过**：17:47:13 Android 退到桌面；17:48:11 同一进程出现系统 Greeze 解冻记录及 `control socket failed`；17:48:53 iPhone 点击拨号，17:48:56 后端落库第四条真实邀请。桌面无系统来电提示，通知/服务回读均没有 9090 来电通知或 `VoipCallService`。17:50:39 将 Android 打开后，控制连接才重新打开并鉴权。此证据说明后台控制链路存在执行/连接缺口，不将其直接归因为唯一的冻结、权限或后端问题；需完成正式原生唤醒/推送链路后再验。
+- 专项测试仍为 56 项通过；本轮证据保存在忽略目录 `out/voip-real-business-20261109/`，iPhone 日志为 `out/voip-im-iphone-hx-local.log`。
 
 ## 已取得的证据
 

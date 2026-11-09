@@ -47,6 +47,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import android.util.Base64
+import android.util.Log
 
 /** Singleton survives the UTS page. Cold-start push integrations call incoming() directly. */
 object VoipBridge {
@@ -90,6 +91,11 @@ object VoipBridge {
     private val bindings = mutableMapOf<FrameLayout, VideoTrack>()
     private var activity = WeakReference<Activity>(null)
     private const val PREFIX = "/api/instant-message/calls"
+
+    /** Only lifecycle stages: never log invitations, identities, URLs or credentials. */
+    private fun trace(stage: String) {
+        if (((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) Log.d("NuwaxVoip", stage)
+    }
 
     @JvmStatic fun setActivity(value: Activity) { activity = WeakReference(value) }
     private fun cameraVisible() = !hidden || nativeUiId == current?.optString("callId")
@@ -178,6 +184,7 @@ object VoipBridge {
     }
 
     private fun initialize(value: JSONObject) {
+        trace("initialize requested")
         val debug = ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
         if (!value.optBoolean("development") && !value.optBoolean("qaAccepted") && !(debug && value.optBoolean("businessEnabled"))) return
         if (value.optBoolean("development") && ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
@@ -187,6 +194,7 @@ object VoipBridge {
         val same = config.optString("userId") == value.optString("userId") && config.optString("apiBaseUrl") == value.optString("apiBaseUrl") && config.optString("deviceId") == value.optString("deviceId")
         if (!same) reset()
         config = value
+        trace(if (business()) "business session accepted" else "development session accepted")
         hidden = activity.get() == null || value.optBoolean("background")
         saveConfig()
         if (calls == null) {
@@ -286,6 +294,7 @@ object VoipBridge {
                 val request = Request.Builder().url(base + "/instant-message/ws").header("Sec-WebSocket-Protocol", "im-v1").build()
                 val socket = streamHttp.newWebSocket(request, object : WebSocketListener() {
                     override fun onOpen(ws: WebSocket, response: Response) {
+                        trace("control socket opened")
                         ws.send(frame(1000, JSONObject().put("token", settings.getString("accessToken")).put("deviceId", settings.getString("deviceId").substringBefore('#') + "#voip").put("platform", "android").put("lastAckSeq", 0)))
                     }
                     override fun onMessage(ws: WebSocket, text: String) { scope.launch {
@@ -295,21 +304,23 @@ object VoipBridge {
                             val envelope = JSONObject(text); val body = envelope.optJSONObject("body") ?: JSONObject()
                             when (envelope.optInt("op")) {
                                 1001 -> {
+                                    trace("control authenticated")
                                     retry = 1000L; heartbeat?.cancel()
                                     val interval = body.optLong("heartbeatInterval", 30).coerceIn(5, 60) * 1000
                                     heartbeat = launch { while (isActive) { delay(interval); if (System.currentTimeMillis() - lastFrame > interval * 2) { ws.cancel(); closed.complete(Unit); break }; ws.send(frame(2000)) } }
                                 }
-                                1002, 9000 -> { rejected = true; emit("error", "code", "CALL_CONTROL_REJECTED"); ws.close(1000, null); closed.complete(Unit) }
+                                1002, 9000 -> { trace("control rejected"); rejected = true; emit("error", "code", "CALL_CONTROL_REJECTED"); ws.close(1000, null); closed.complete(Unit) }
                                 3002 -> if (body.optString("msgType") == "voip") {
+                                    trace("control invitation received")
                                     ws.send(frame(3003, JSONObject().put("convId", body.optString("convId")).put("seq", body.optLong("seq"))))
                                     receiveInvitation(body)
                                 }
                                 3007 -> receiveSignal(body)
                             }
-                        } catch (_: Exception) { emit("error", "code", "CALL_INVALID_EVENT") }
+                        } catch (_: Exception) { trace("control event failed"); emit("error", "code", "CALL_INVALID_EVENT") }
                     } }
-                    override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { closed.complete(Unit) }
-                    override fun onClosed(ws: WebSocket, code: Int, reason: String) { closed.complete(Unit) }
+                    override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { trace("control socket failed"); closed.complete(Unit) }
+                    override fun onClosed(ws: WebSocket, code: Int, reason: String) { trace("control socket closed"); closed.complete(Unit) }
                 })
                 imSocket = socket
                 try { withTimeoutOrNull(10000) { while (heartbeat == null && !closed.isCompleted) delay(100) }; if (heartbeat == null) socket.cancel(); else closed.await() }
@@ -320,6 +331,7 @@ object VoipBridge {
         }
     }
     private suspend fun receiveInvitation(message: JSONObject) {
+        trace("invitation validating")
         if (message.optString("msgType") != "voip" || message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
         val body = message.optJSONObject("body") ?: return
         val id = body.optString("callId"); val conv = message.optString("convId"); val sender = message.optString("senderId")
@@ -333,7 +345,7 @@ object VoipBridge {
             .put("version", 1).put("state", "ringing").put("callerId", sender).put("calleeId", config.getString("userId")).put("callerDeviceId", "").put("acceptedDeviceId", "")
             .put("mediaType", media).put("callerDisplayName", conversation.optString("peerName", sender)).put("calleeDisplayName", config.getString("userId")).put("expiresAt", sent + 60000)
         if (current != null && current?.optString("callId") != id) { notifyBusinessEnd(next, "busy"); terminal.add(id); return }
-        adopt(next)
+        trace("invitation accepted"); adopt(next)
     }
     private fun receiveSignal(event: JSONObject) {
         val payload = event.optJSONObject("payload") ?: return
@@ -459,6 +471,7 @@ object VoipBridge {
                     // finish() waits for this scope and disconnects it before cancelling addCall.
                     if (!ownsCall()) return@addCall
                     control = owner
+                    trace("telecom call registered")
                     // Telecom must own the call before asking for background phone-call execution.
                     // Posting CallStyle here also satisfies Core-Telecom's five-second deadline.
                     publishCall()
@@ -467,6 +480,7 @@ object VoipBridge {
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) {
+                trace("telecom call failed")
                 if (ownsCall()) { emit("error", "code", "CALL_SYSTEM_UNAVAILABLE"); finish("systemFailed") }
             } finally { if (!ready.isCompleted) ready.complete(null) }
         }

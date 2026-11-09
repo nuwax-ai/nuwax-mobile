@@ -6,7 +6,7 @@
 
 使用完整“女娲Nuwax”App：同意隐私政策 → 登录测试环境 → 消息 → 真人联系人单聊 → 加号 → 语音/视频通话。安装身份仍为 `com.nuwax.app` / `__UNI__8BF05E4`。无需测试页面、Alice/Bob 身份或本地开发呼叫服务。真实 App 忽略专用测试宿主留下的开发身份。
 
-当前仅在 **HBuilderX development 运行模式、测试地址 `https://testagent.xspaceagi.com`、Android/iOS** 开放入口。`isVoipPlatformAccepted()` 仍为 false；生产发行和鸿蒙入口未开放，不表示三端验收完成。能力由单聊详情及联系人 `subjectType=1` 判断；未知主体、群聊和智能体暂不开放。此判断是客户端联调范围，不代替后端能力声明。
+当前仅在 **HBuilderX development 运行模式、测试地址 `https://testagent.xspaceagi.com`、Android/iOS** 开放入口。`isVoipPlatformAccepted()` 仍为 false；生产发行和鸿蒙入口未开放，不表示三端验收完成。能力由单聊详情及联系人 `subjectType=1` 判断；未知主体、群聊和智能体暂不开放。同账号的两台设备不作为主被叫，能力查询和创建均拦截呼叫自己。此判断是客户端联调范围，不代替后端能力声明。
 
 ## 协议与代码归属
 
@@ -42,18 +42,41 @@ NUWAX_ANDROID_UNIPUSH_CONFIG=<匹配包名和签名的本地配置> \
 NUWAX_SIGNING_ENV=<受控签名环境文件> \
   bash scripts/voip-native/package-business-ios.sh
 
-# 仅在真机窗口归还后执行；本轮尚未执行安装运行
+# 同名项目的 launch 命令存在歧义：给工作树导入一个唯一 IDE 名称。
+# 链接放在工作树的同级，避免位于项目内部造成循环扫描。
+ln -s nuwax-mobile ../hx-mobile-voip
+/Applications/HBuilderX.app/Contents/MacOS/cli project open \
+  --path "$(cd .. && pwd)/hx-mobile-voip"
+# 使用 local 自定义基座模式，手机 Bundle ID/版本由 IPA/APK 读取。
 /Applications/HBuilderX.app/Contents/MacOS/cli launch app-android \
-  --project "$PWD" --deviceId <Android序列号> --playground custom
+  --project hx-mobile-voip --deviceId <Android序列号> --playground custom
 /Applications/HBuilderX.app/Contents/MacOS/cli launch app-ios \
-  --project "$PWD" --iosTarget device --deviceId <iPhone序列号> --playground custom
+  --project hx-mobile-voip --iosTarget device --deviceId <iPhone序列号> --playground custom --customType local
 ```
 
 iOS 完整宿主包含完整业务资源、所有导出 UTS 模块、模块声明的本地 framework、ESPProvision 3.1.0/SwiftProtobuf 1.22.1、LiveKit 2.19.0 及 HBuilderX DebugServe；最低系统 15.0。它与专用测试宿主使用不同的生成目录；不注入 deviceTest 标记或测试启动页。Android 完整宿主启用 HX debug server，移除专用测试监听服务声明，保留正常 UniPush 依赖。
 
+### HBuilderX 5.34 的 iOS 原生复用
+
+本机 HBuilderX 动态 SPM 编译遇到 Xcode 索引目录参数错误；完整原生工程的同一 Swift 源码可正常构建。需要原生调试包装信息时，先让 HX 生成开发 Swift，再以 `NUWAX_IOS_HX_DEV_NATIVE=1` 执行 `package-business-ios.sh`，使用同一批生成代码构建完整宿主。`register-business-ios-cache.mjs` 核对 HX 版本、LiveKit 锁定版本、原生源文件、生成 Swift、构建时序及宿主签名后，登记实际已构建的原生缓存，并将成功的 HX 原生补丁整合、签名进宿主；校验失败会中止。`--verify-only` 只验证，不登记或打包。
+
+```bash
+NUWAX_IOS_HX_DEV_NATIVE=1 NUWAX_SIGNING_ENV=<受控签名环境文件> \
+  bash scripts/voip-native/package-business-ios.sh
+node scripts/voip-native/register-business-ios-cache.mjs
+```
+
+业务 `.uvue/.uts` 变更通过 HX 热更新；原生 Swift、插件 index.uts 或依赖变更需要重新构建并校验。IPA 使用保留显式目录记录的 ZIP 格式，供 HX 解析。以上流程未修改 HBuilderX 安装文件、未导出私钥、未上传包。大型项目首次开发编译需要充足 Node 内存；本次临时使用 8 GB，编译后恢复原设置。原生断点、后台来电及音视频通话仍需单独验收。
+
+## 本轮真机状态
+
+2026-11-09 已覆盖安装到 iPhone 16 与 Redmi，均为 `com.nuwax.app`、1.3.3（133）的完整 App。Android 覆盖前确认新旧签名一致，保留数据；从安装后的 APK 回读确认包含系统来电 Activity、通话服务和 HX debug server，没有专用测试标记或开发监听服务。两端均经 HBuilderX 同步并启动，iOS 设备中的 app-service.js 与当前开发产物 SHA-256 一致，同账号拦截已热更新。镜像核对完整消息页、联系人及“我的”版本信息通过。
+
+互拨前需两个不同测试账号，彼此加为联系人并建立真人单聊。目前两机为同一账号，因此没有执行真实互拨，没有向现有联系人发消息或拨号。生产开关保持关闭，基座仅在本地。
+
 ## 验证与后端待补项
 
-专项测试 55 项通过；全量 803 通过、37 项既有失败，失败名称相对合并基线没有新增。Android 全 App 编译、Swift 6 原生桥及鸿蒙未签名 HAP 构建分别留在 `out/voip-im-*.log`。构建、签名、安装和互拨的证据分开登记到[验收记录](voip-acceptance.md)。
+专项测试 56 项通过；全量 804 通过、37 项既有失败，失败名称相对合并基线没有新增。Android 全 App 编译、Swift 6 原生桥及鸿蒙未签名 HAP 构建分别留在 `out/voip-im-*.log`。构建、签名、安装和互拨的证据分开登记到[验收记录](voip-acceptance.md)。
 
 以下仍是正式验收前置，不能以当前客户端适配替代：
 

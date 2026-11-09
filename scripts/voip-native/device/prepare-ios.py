@@ -5,6 +5,8 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[3]
 SDK=Path(os.environ['UNIAPPX_SDK_ROOT']).resolve()
 BUSINESS=os.environ.get('NUWAX_VOIP_BUSINESS_HOST')=='1'
+HX_DEV=BUSINESS and os.environ.get('NUWAX_IOS_HX_DEV_NATIVE')=='1'
+HX_DEV_ROOT=ROOT/'unpackage/dist/dev/app-ios'
 PROJECT='VoipBusiness' if BUSINESS else 'VoipDeviceTest'
 OUT=ROOT/('out/voip-business-ios' if BUSINESS else 'out/voip-device-ios')
 RES=ROOT/('unpackage/resources/app-ios' if BUSINESS else 'out/voip-device-project/unpackage/resources/app-ios')
@@ -16,6 +18,9 @@ APP=OUT/'App'
 shutil.copytree(SDK/'UniAppXDemo/UniAppXDemo',APP,dirs_exist_ok=True)
 shutil.rmtree(APP/'uni-app-x',ignore_errors=True)
 shutil.copytree(RES/'__UNI__8BF05E4',APP/'uni-app-x/apps/__UNI__8BF05E4')
+if HX_DEV and (HX_DEV_ROOT/'app-service.js').is_file():
+ shutil.rmtree(APP/'uni-app-x/apps/__UNI__8BF05E4/www')
+ shutil.copytree(HX_DEV_ROOT,APP/'uni-app-x/apps/__UNI__8BF05E4/www')
 # The official demo replaces the SDK root with sample buttons. Keep its SDK scene lifecycle instead.
 scene=APP/'SceneDelegate.m'
 s=scene.read_text();start=s.index('    UIStoryboard *storyboard');end=s.index('\n}',start)
@@ -89,7 +94,11 @@ for p in sorted((RES/'uni_modules').iterdir()):
  if not src.is_dir():continue
  module='unimodule'+''.join(x[0].upper()+x[1:] for x in p.name.split('-'))
  dest=OUT/'Modules'/module
- shutil.copytree(src,dest,dirs_exist_ok=True)
+ shutil.rmtree(dest,ignore_errors=True)
+ shutil.copytree(src,dest)
+ if HX_DEV:
+  dev_src=HX_DEV_ROOT/'uni_modules'/p.name/'utssdk/app-ios'
+  if dev_src.is_dir(): shutil.copytree(dev_src,dest,dirs_exist_ok=True)
  settings={'PRODUCT_BUNDLE_IDENTIFIER':('com.nuwax.app.module.' if BUSINESS else 'com.nuwax.test.')+module,'GENERATE_INFOPLIST_FILE':'YES','DEFINES_MODULE':'YES'}
  deps=[{'framework':str(libs[n]),'embed':False} for n in ['DCloudUTSFoundation','DCloudUniappRuntime','DCloudUTSExtAPI']]
  if BUSINESS:

@@ -7,11 +7,14 @@
 ## 2026-11-09 真实 App 接入批次
 
 - [业务接入说明](voip-business-integration.md)为当前对接入口；正式协议改为 RTC rooms/tokens、IM voip 消息和 3007 事件，原生控制 WS 独立于宿主聊天连接。
-- `pnpm voip:test` 55 项通过；全量 803 通过 / 37 项既有失败，相对合并后基线没有新增失败。
+- `pnpm voip:test` 56 项通过；全量 804 通过 / 37 项既有失败，相对合并后基线没有新增失败。
 - HBuilderX 5.34 Android 完整 App 编译、iOS 完整资源导出、Swift 6 原生桥编译及鸿蒙未签名 HAP 构建通过。
 - Android 完整 App 本地 HX 基座已生成，`com.nuwax.app` / 1.3.3（133）/“女娲Nuwax”；包含 debug server、CallStyle/Telecom/UniPush，不含专用测试监听声明或 deviceTest 标记。路径 `out/voip-business-packages/android_debug-20261109-150558.apk`。
 - iOS 完整 App 本地 HX 基座签名及动态 framework 依赖检查通过，完整业务资源和 7 个 UTS 模块，含 DebugServe/LiveKit/ESP/scopeparser，ipatype=1，无测试标记。路径 `out/voip-business-packages/iOS_debug-latest.ipa`。
-- **尚未安装或运行本批完整 App**。14:47 安卓真机 `8PNNT4TKHIJVU8RO` 已释放给明日版本提测，本轮未改动手机安装包；原包版本 1.3.3（133），可恢复 APK 为 `out/voip-device-packages/android_debug-20261107-133720.apk`。目前未检测到 iPhone。
+- iPhone 16 后续已接回，覆盖安装完整 App，16:21 HBuilderX local 自定义基座模式完成同步和启动，16:26 同账号呼叫拦截热更新成功；设备 app-service.js 与当前开发产物 SHA-256 一致。镜像确认消息页、联系人与“我的”1.3.3 正常。
+- 16:35 按用户最新要求，安卓接回并覆盖为同分支 VoIP 完整业务版，覆盖前确认签名一致，未卸载或清数据。HX 编译、安装、同步与 App Show 日志通过；安装后 APK 确认 native 来电 Activity/通话服务存在，专用测试监听和 deviceTest 标记不存在。普通发布包不作为此次 VoIP 测试包。
+- Android 已安装包回读留在 `out/voip-android-installed.apk`，覆盖前备份为 `out/voip-android-before-overwrite.apk`。iOS 本地包为 `out/voip-business-packages/iOS_debug-latest.ipa`。两个设备当前同账号；已补充同账号拦截测试，互拨等待不同的第二账号。
+- USB 授权检查：当前电脑公钥已出现在手机授权记录，最后接收的 RSA 指纹与本机一致，授权超时值为 604800000 ms；未取得此前反复弹窗的复现证据。本轮未重启 ADB，后续若复现继续抓取当次指纹与系统事件。
 - 本轮未上传基座；正式接口互拨、推送冷启动、视频、长时间锁屏和鸿蒙真机仍待验收。既有专用测试包的已通记录不计为本批业务接入通过。
 
 ## 已取得的证据

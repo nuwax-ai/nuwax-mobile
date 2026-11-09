@@ -31,6 +31,13 @@ describe('actual IM backend adapter', () => {
     await expect(createImVoipCall(conv, 'audio', 'c1')).rejects.toThrow('CALL_MEDIA_UNSUPPORTED');
     expect(f.request).not.toHaveBeenCalled();
   });
+  it('does not offer or create a call between two devices of the same account', async () => {
+    f.detail.mockResolvedValue({ code: '0000', data: { convType: 1, peerUserId: uid } });
+    f.contacts.mockResolvedValue({ code: '0000', data: { items: [{ userId: uid, subjectType: 1 }] } });
+    expect((await imVoipCapabilities(conv)).enabled).toBe(false);
+    await expect(createImVoipCall(conv, 'audio', 'c1')).rejects.toThrow('CALL_MEDIA_UNSUPPORTED');
+    expect(f.request).not.toHaveBeenCalled();
+  });
   it('does not create a room after an account switch during eligibility lookup', async () => {
     f.contacts.mockImplementation(async () => { f.stamp = 'b'; return { code: '0000', data: { items: [{ userId: peer, subjectType: 1 }] } }; });
     await expect(createImVoipCall(conv, 'audio', 'c1')).rejects.toThrow('CALL_SESSION_CHANGED');

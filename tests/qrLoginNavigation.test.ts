@@ -19,7 +19,7 @@ import { parseShareUrl } from '@/utils/appShare.uts';
 import { mobileLoginDestination } from '@/utils/authIdp.uts';
 
 const origin = 'https://agent.nuwax.com';
-function setup(incoming: string) {
+function setup(incoming: string, onLoginPage = false) {
   const source = readFileSync('utils/qrLoginNavigation.uts', 'utf8')
     .replace(/^\s*import[\s\S]*?from\s+["'][^"']+["'];?\s*$/gm, '')
     .replace(/^export /gm, '')
@@ -36,6 +36,8 @@ function setup(incoming: string) {
       currentQrLoginOrigin: () => origin,
       LOGIN_PAGE_PATH: '/subpackages/pages/login/login',
       redirectToLoginOnce: login,
+      isOnLoginPage: () => onLoginPage,
+      mobileLoginDestination,
       Date: { now: () => clock },
       uni: {
         getEnterOptionsSync: () => ({ appScheme: incoming }),
@@ -72,6 +74,59 @@ it('热启动只消费本次明确链接，普通回前台不重放上一次登�
   f.later();
   f.route(true, link);
   expect(f.launch).toHaveBeenCalledTimes(2);
+});
+it('已在登录页时，新扫码意图替换登录返回目标，重复回调不重建登录页', () => {
+  const link = qrLoginAppUrl('scene-b', origin),
+    f = setup(link, true);
+  expect(f.route(false, link)).toBe(true);
+  expect(f.login).not.toHaveBeenCalled();
+  expect(f.launch).toHaveBeenCalledWith({
+    url: mobileLoginDestination(
+      '/subpackages/pages/login/login',
+      qrLoginPageUrl('scene-b', origin),
+      origin,
+    ),
+  });
+  f.route(false, link);
+  expect(f.launch).toHaveBeenCalledOnce();
+});
+it.each(['APP', 'MP-WEIXIN'])('扫码登录在 %s 只进入支持的确认路由', (platform) => {
+  const component = readFileSync('components/scan-launcher/scan-launcher.uvue', 'utf8');
+  const start = component.indexOf('  function routeScanResult(');
+  const source = component.slice(start, component.indexOf('  /** 相机权限检查结果', start));
+  const enabled = [true];
+  const compiled = source.split('\n').filter((line) => {
+    const directive = line.match(/^\s*\/\/ #(ifdef|ifndef) (.+)$/);
+    if (directive) {
+      const matches = directive[2].split('||').some((name) => name.trim() === platform);
+      enabled.push(enabled[enabled.length - 1] && (directive[1] === 'ifdef' ? matches : !matches));
+      return false;
+    }
+    if (/^\s*\/\/ #endif/.test(line)) {
+      enabled.pop();
+      return false;
+    }
+    return enabled[enabled.length - 1];
+  }).join('\n');
+  const navigate = vi.fn(), toast = vi.fn();
+  const route = runInNewContext(
+    transformSync(compiled + '\nrouteScanResult;', { loader: 'ts' }).code,
+    {
+      parseScanContent: () => ({ kind: 'qrLogin', qrLoginSceneId: 'scene-a', qrLoginOrigin: origin }),
+      qrLoginPageUrl,
+      navigateToPageOnce: navigate,
+      t: (key: string) => key,
+      uni: { showToast: toast },
+    },
+  );
+  route(origin + '/qrlogin/scene-a');
+  if (platform === 'APP') {
+    expect(navigate).toHaveBeenCalledWith(qrLoginPageUrl('scene-a', origin));
+    expect(toast).not.toHaveBeenCalled();
+  } else {
+    expect(navigate).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith({ title: 'Mobile.Error.unsupportedPlatform', icon: 'none' });
+  }
 });
 it('异域 scheme 进入错误页，不切企业域、不发起登录', () => {
   const f = setup('');

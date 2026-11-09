@@ -5,6 +5,9 @@ import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
 import { orEmpty, orNumber, orString } from "@/utils/utsCoalesce.uts";
 import { imFileDownloadKey, isImFileDownloaded, markImFileDownloaded } from "@/utils/imFileDownloadRegistry";
 import { extractFileNameFromUrl } from "@/utils/authProtectedFileUrl";
+// #ifdef APP
+import { downloadAuthProtectedFileToTemp, isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
+// #endif
 
 // #ifdef APP-ANDROID
 import Intent from 'android.content.Intent';
@@ -1154,47 +1157,77 @@ export function mergeDirectoryLevelFiles(
       if (!silent) {
         uni.showLoading({ title: t("Mobile.FileTree.downloading") });
       }
+
+      const finishTempDownload = (tempFilePath: string): void => {
+        // 下载成功汇合处理：打标 + 非静默弹窗 + resolve（iOS/鸿蒙拷贝为异步，抽出共用）
+        const finishDownloadSuccess = (finalFilePath: string): void => {
+          // 全 App 下载汇合点打标：IM 文件卡片「已下载」状态按文件名登记
+          // （本函数拿不到原始 url，注册表故以 fileName 为主键）
+          markImFileDownloaded(filename);
+          if (!silent) {
+            uni.hideLoading();
+            const modalParams = new Map<string, any>();
+            modalParams.set("fileName", filename);
+            modalParams.set("filePath", finalFilePath);
+            uni.showModal({
+              title: t("Mobile.FileTree.downloadComplete"),
+              content: t("Mobile.FileTree.zipSavedContentApp", toI18nParams(modalParams), ""),
+              confirmText: t("Mobile.Common.open"),
+              cancelText: t("Mobile.Common.cancel"),
+              success: (modalRes) => {
+                if (modalRes.confirm) {
+                  openDownloadedFile(finalFilePath);
+                }
+              },
+            });
+          }
+          resolve(finalFilePath);
+        };
+        // #ifdef APP-ANDROID
+        finishDownloadSuccess(copyToPublicDownload(tempFilePath, filename));
+        // #endif
+        // #ifndef APP-ANDROID
+        // iOS/鸿蒙：临时文件名为 UUID，拷入沙盒 Download 改成真实文件名再打开（异步实查）
+        copyToNamedSandbox(tempFilePath, filename).then((namedPath: string): void => {
+          finishDownloadSuccess(namedPath);
+        }).catch((_eNamed: any | null): void => {
+          // 兜底回落临时路径，勿让 Promise 挂起（页面会卡在下载中）
+          finishDownloadSuccess(tempFilePath);
+        });
+        // #endif
+      };
+
+      const failDownload = (err: any | null): void => {
+        uni.hideLoading();
+        console.error('下载文件失败:', err);
+        uni.showToast({
+          title: t("Mobile.FileTree.downloadNetworkFailed"),
+          icon: 'none',
+          duration: 2000,
+        });
+        reject(err != null ? err : new Error(t("Mobile.FileTree.downloadNetworkFailed")));
+      };
+
+      // /api/f/... 在鸿蒙不能带 Bearer 跨主机重定向，统一走 ak 临时签名下载。
+      // Android/iOS 也复用该函数，但仍保持原 Bearer 请求行为。
+      if (needAuth && isAuthProtectedFileUrl(downloadUrl)) {
+        downloadAuthProtectedFileToTemp(downloadUrl).then(
+          (tempFilePath: string): void => {
+            finishTempDownload(tempFilePath);
+          },
+          (err: any | null): void => {
+            failDownload(err);
+          },
+        );
+        return;
+      }
+
       uni.downloadFile({
         url: downloadUrl,
         header: requestHeader,
         success: (res) => {
           if (res.statusCode === 200) {
-            // 下载成功汇合处理：打标 + 非静默弹窗 + resolve（iOS/鸿蒙拷贝为异步，抽出共用）
-            const finishDownloadSuccess = (finalFilePath: string): void => {
-              // 全 App 下载汇合点打标：IM 文件卡片「已下载」状态按文件名登记
-              // （本函数拿不到原始 url，注册表故以 fileName 为主键）
-              markImFileDownloaded(filename);
-              if (!silent) {
-                uni.hideLoading();
-                const modalParams = new Map<string, any>();
-                modalParams.set("fileName", filename);
-                modalParams.set("filePath", finalFilePath);
-                uni.showModal({
-                  title: t("Mobile.FileTree.downloadComplete"),
-                  content: t("Mobile.FileTree.zipSavedContentApp", toI18nParams(modalParams), ""),
-                  confirmText: t("Mobile.Common.open"),
-                  cancelText: t("Mobile.Common.cancel"),
-                  success: (modalRes) => {
-                    if (modalRes.confirm) {
-                      openDownloadedFile(finalFilePath);
-                    }
-                  },
-                });
-              }
-              resolve(finalFilePath);
-            };
-            // #ifdef APP-ANDROID
-            finishDownloadSuccess(copyToPublicDownload(res.tempFilePath, filename));
-            // #endif
-            // #ifndef APP-ANDROID
-            // iOS/鸿蒙：临时文件名为 UUID，拷入沙盒 Download 改成真实文件名再打开（异步实查）
-            copyToNamedSandbox(res.tempFilePath, filename).then((namedPath: string): void => {
-              finishDownloadSuccess(namedPath);
-            }).catch((_eNamed: any | null): void => {
-              // 兜底回落临时路径，勿让 Promise 挂起（页面会卡在下载中）
-              finishDownloadSuccess(res.tempFilePath);
-            });
-            // #endif
+            finishTempDownload(res.tempFilePath);
           } else {
             uni.hideLoading();
             uni.showToast({
@@ -1210,14 +1243,7 @@ export function mergeDirectoryLevelFiles(
           }
         },
         fail: (err) => {
-          uni.hideLoading();
-          console.error('下载文件失败:', err);
-          uni.showToast({
-            title: t("Mobile.FileTree.downloadNetworkFailed"),
-            icon: 'none',
-            duration: 2000,
-          });
-          reject(err);
+          failDownload(err);
         },
       });
     });

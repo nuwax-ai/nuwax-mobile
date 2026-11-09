@@ -455,9 +455,9 @@ function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Pro
           resolve(tempPath);
           return;
         }
-        // 非 200（如 302→对象存储带 Bearer 被拒的 4xx）：logcat 抓 [ChatImg] 定位
+        // 非 200（如 302→对象存储带 Bearer 被拒的 4xx）：统一标签便于 logcat 定位
         console.error(
-          `[ChatImg] downloadFile statusCode=${res.statusCode} temp=${tempPath != null ? tempPath : ""} url=${fetchUrl}`,
+          `[ProtectedFile] downloadFile statusCode=${res.statusCode} temp=${tempPath != null ? tempPath : ""} url=${fetchUrl}`,
         );
         reject(new Error());
       },
@@ -468,7 +468,7 @@ function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Pro
         settle();
         // #endif
         console.error(
-          `[ChatImg] downloadFile fail: ${err.errMsg != null ? err.errMsg : ""} url=${fetchUrl}`,
+          `[ProtectedFile] downloadFile fail: ${err.errMsg != null ? err.errMsg : ""} url=${fetchUrl}`,
         );
         reject(err);
       },
@@ -482,6 +482,28 @@ function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Pro
     });
     // #endif
   });
+}
+
+/**
+ * App 端把受保护文件下载到临时目录。
+ *
+ * 鸿蒙不能直接带 Bearer 下载 /api/f/...：网关 302 到对象存储后，下载器会把
+ * Authorization 原样转发，S3/MinIO 将 Bearer 当成非法签名并返回 400。先通过
+ * ak refresh 换取临时签名地址，再以空请求头下载；ak 链路不可用时回落原地址，
+ * 兼容不经对象存储重定向的私有部署。Android/iOS 保持原来的 Bearer 下载。
+ */
+export async function downloadAuthProtectedFileToTemp(url: string): Promise<string> {
+  const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
+  const header = buildAuthProtectedFileHeaders();
+  // #ifdef APP-HARMONY
+  try {
+    const akUrl = await fetchAuthProtectedFileAkUrl(fetchUrl);
+    return await downloadProtectedFileOnce(akUrl, {} as UTSJSONObject);
+  } catch (akError) {
+    console.error(`[ProtectedFile] ak 下载失败，回落原地址 url=${fetchUrl}`, akError);
+  }
+  // #endif
+  return await downloadProtectedFileOnce(fetchUrl, header);
 }
 
 async function downloadProtectedImageWithIntegrityCheck(
@@ -716,7 +738,8 @@ function toastOpenFileFail(): void {
 
 /**
  * 打开或下载远程文件。
- * 受保护地址带 Bearer 下载；若提供 conversationId 则跳转预览页（附 source=im）。
+ * 受保护地址下载：Android/iOS 带 Bearer；鸿蒙先换 ak 临时签名后裸头下载。
+ * 若提供 conversationId 则跳转预览页（附 source=im）。
  * 预览页按 source=im 走「只预览文件」路径、不调智能体域 /api/agent/conversation/share
  * （IM convId 在该接口必报 conversation not found）——改造落地前的过渡期会白屏+报错。
  * failToast=true 时失败提示由本函数内部弹出（downloadFileInApp 同款约定）：
@@ -768,43 +791,32 @@ export function openRemoteFileUrl(
 
     // #ifndef H5 || WEB
     return new Promise((resolve, reject) => {
-      uni.downloadFile({
-        url: fetchUrl,
-        header,
-        success: (res) => {
+      downloadAuthProtectedFileToTemp(fetchUrl)
+        .then((tempPath: string) => {
           uni.hideLoading();
-          const tempPath = res.tempFilePath;
-          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
-            uni.openDocument({
-              filePath: tempPath,
-              success: () => {
-                resolve();
-              },
-              fail: (err) => {
-                if (failToast) {
-                  toastOpenFileFail();
-                }
-                reject(err);
-              },
-            });
-            return;
-          }
-          // 非 200：downloadFile 不暴露响应体，补一发 JSON 请求回捞后端 message
+          uni.openDocument({
+            filePath: tempPath,
+            success: () => {
+              resolve();
+            },
+            fail: (err) => {
+              if (failToast) {
+                toastOpenFileFail();
+              }
+              reject(err);
+            },
+          });
+        })
+        .catch((err: any | null) => {
+          uni.hideLoading();
+          // downloadFile 不暴露非 200 响应体，补一发 JSON 请求回捞后端 message。
           fetchRemoteFailReason(fetchUrl, header).then((reason: string) => {
             if (failToast) {
               toastDownloadFail(reason);
             }
-            reject(new Error(reason));
+            reject(err != null ? err : new Error(reason));
           });
-        },
-        fail: (err) => {
-          uni.hideLoading();
-          if (failToast) {
-            toastDownloadFail("");
-          }
-          reject(err);
-        },
-      });
+        });
     });
     // #endif
   }
@@ -814,7 +826,7 @@ export function openRemoteFileUrl(
     window.open(url, "_blank");
     resolve();
     // #endif
-    // #ifdef MP || APP-PLUS || APP-ANDROID || APP-IOS
+    // #ifdef MP || APP-PLUS || APP-ANDROID || APP-IOS || APP-HARMONY
     uni.downloadFile({
       url,
       success: (res) => {

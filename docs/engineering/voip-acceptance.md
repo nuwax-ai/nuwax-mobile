@@ -1,8 +1,18 @@
 # VoIP 接入验收记录
 
-更新日期为 2026-11-07。工作树 `mobile-voip`，分支 `feat/nuwa-basic-2026.11-voip-calls`；从双远程一致的 `feat-2026.11@5c71314ca028c580098623ba4f214d19d0cb206e` 派生。主 checkout 与已有调试基座未替换。
+更新日期为 2026-11-09。工作树 `mobile-voip`，分支 `feat/nuwa-basic-2026.11-voip-calls`；从双远程一致的 `feat-2026.11@5c71314ca028c580098623ba4f214d19d0cb206e` 派生。主 checkout 与已有调试基座未替换。
 
 **当前状态：开发接入与构建验证，尚未完成三端真机验收。生产开关保持关闭。** 本文中的构建通过、浏览器测试和模拟服务结果不能替代正式后端、推送或手机验收。
+
+## 2026-11-09 真实 App 接入批次
+
+- [业务接入说明](voip-business-integration.md)为当前对接入口；正式协议改为 RTC rooms/tokens、IM voip 消息和 3007 事件，原生控制 WS 独立于宿主聊天连接。
+- `pnpm voip:test` 55 项通过；全量 803 通过 / 37 项既有失败，相对合并后基线没有新增失败。
+- HBuilderX 5.34 Android 完整 App 编译、iOS 完整资源导出、Swift 6 原生桥编译及鸿蒙未签名 HAP 构建通过。
+- Android 完整 App 本地 HX 基座已生成，`com.nuwax.app` / 1.3.3（133）/“女娲Nuwax”；包含 debug server、CallStyle/Telecom/UniPush，不含专用测试监听声明或 deviceTest 标记。路径 `out/voip-business-packages/android_debug-20261109-150558.apk`。
+- iOS 完整 App 本地 HX 基座签名及动态 framework 依赖检查通过，完整业务资源和 7 个 UTS 模块，含 DebugServe/LiveKit/ESP/scopeparser，ipatype=1，无测试标记。路径 `out/voip-business-packages/iOS_debug-latest.ipa`。
+- **尚未安装或运行本批完整 App**。14:47 安卓真机 `8PNNT4TKHIJVU8RO` 已释放给明日版本提测，本轮未改动手机安装包；原包版本 1.3.3（133），可恢复 APK 为 `out/voip-device-packages/android_debug-20261107-133720.apk`。目前未检测到 iPhone。
+- 本轮未上传基座；正式接口互拨、推送冷启动、视频、长时间锁屏和鸿蒙真机仍待验收。既有专用测试包的已通记录不计为本批业务接入通过。
 
 ## 已取得的证据
 

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../servers/voipIm.uts', () => ({ createImVoipCall: vi.fn(), imVoipCapabilities: vi.fn() }));
 const state = vi.hoisted(() => ({ allowed: true, consent: true, storage: new Map<string, unknown>(), requests: [] as any[] }));
 vi.mock('../../features/voip/development.uts', () => ({ isVoipDevelopmentBuild: () => state.allowed }));
 vi.mock('../../utils/appPrivacyConsent.uts', () => ({ hasAppPrivacyConsent: () => state.consent }));

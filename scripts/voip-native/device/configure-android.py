@@ -58,7 +58,5 @@ if __name__ == "__main__":
     project = Path(os.environ["ANDROID_ESP_PROJECT"])
     enabled = os.environ.get("NUWAX_VOIP_DEVICE_TEST") == "1"
     config_path = os.environ.get("NUWAX_ANDROID_UNIPUSH_CONFIG")
-    if config_path and not enabled:
-        raise SystemExit("VoIP uni-push test configuration requires the dedicated device test host")
     configure_test_host(project, enabled)
     configure(project, Path(config_path) if config_path else None)

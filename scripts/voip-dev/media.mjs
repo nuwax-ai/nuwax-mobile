@@ -63,6 +63,7 @@ export function createMediaEngine(emit, root = document.body) {
     next.on(RoomEvent.Reconnecting, () => { if (current()) notify('reconnecting'); });
     next.on(RoomEvent.Reconnected, () => { if (current()) notify('connected'); });
     next.on(RoomEvent.AudioPlaybackStatusChanged, () => { if (current() && !next.canPlaybackAudio) notify('playbackBlocked'); });
+    next.on(RoomEvent.ParticipantDisconnected, () => { if (current() && command.protocol === 'im-voip-v1') notify('disconnected'); });
     next.on(RoomEvent.Disconnected, () => { if (current()) notify('disconnected'); });
     try {
       await next.connect(command.serverUrl, command.participantToken);

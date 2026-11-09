@@ -35,7 +35,9 @@ beforeEach(() => {
   vi.spyOn(VoipBridge, 'startStream').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'finish').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'request').mockResolvedValue({} as any);
+  VoipBridge.current = null;
   VoipBridge.reset();
+  vi.mocked(VoipBridge.finish).mockClear();
 });
 afterEach(() => { VoipBridge.reset(); vi.restoreAllMocks(); });
 
@@ -71,5 +73,46 @@ describe('Harmony push registration lifetime', () => {
     await previous;
     const registrations = vi.mocked(VoipBridge.request).mock.calls.map(([, body]) => JSON.parse(body!));
     expect(registrations.map(body => body.token)).toEqual(replacement ? ['new-account-token'] : []);
+  });
+});
+
+describe('IM call event ordering and isolation', () => {
+  const invitation = () => ({ msgType: 'voip', senderType: 1, senderId: 'bob', convId: 'chat', msgId: '1987654321098765432', sendTime: Date.now(), body: { callId: 'c1', roomName: 'call-c1', mediaType: 'audio' } });
+  const setup = () => {
+    token.get.mockResolvedValue('unused');
+    VoipBridge.initialize({ ...session('alice'), protocol: 'im-voip-v1' });
+    vi.mocked(VoipBridge.request).mockResolvedValue({ convType: 1, peerUserId: 'bob', peerName: 'Bob' } as any);
+    return vi.spyOn(VoipBridge, 'adopt').mockImplementation(() => {});
+  };
+  it('keeps snowflake identifiers exact when decoding native events', () => {
+    expect(VoipBridge.parse('{"convId":1987654321098765432,"msgId":1987654321098765433,"sendTime":1794190000000}')).toMatchObject({ convId: '1987654321098765432', msgId: '1987654321098765433', sendTime: 1794190000000 });
+  });
+  it('does not revive an invitation after its cancel arrived first', async () => {
+    const adopt = setup();
+    VoipBridge.receiveSignal({ eventType: 'voip:cancel', payload: { callId: 'c1', convId: 'chat' } } as any);
+    await VoipBridge.receiveInvitation(invitation() as any);
+    expect(adopt).not.toHaveBeenCalled();
+  });
+  it('ignores expired invitations and group invitations', async () => {
+    const adopt = setup();
+    await VoipBridge.receiveInvitation({ ...invitation(), sendTime: Date.now() - 61000 } as any);
+    vi.mocked(VoipBridge.request).mockResolvedValue({ convType: 2, peerUserId: 'bob' } as any);
+    await VoipBridge.receiveInvitation(invitation() as any);
+    expect(adopt).not.toHaveBeenCalled();
+  });
+  it('does not stop an outgoing call with an unrelated signal lacking a msgId', () => {
+    setup();
+    VoipBridge.current = { callId: 'c1', convId: 'chat', msgId: '' } as any;
+    VoipBridge.receiveSignal({ eventType: 'voip:cancel', payload: { callId: 'different', convId: 'chat' } } as any);
+    expect(VoipBridge.finish).not.toHaveBeenCalled();
+    VoipBridge.current = null;
+  });
+  it('reconciles only validated direct invitations and never starts capture on receipt', async () => {
+    const adopt = setup();
+    const connect = vi.spyOn(VoipBridge, 'connect');
+    await VoipBridge.receiveInvitation(invitation() as any);
+    expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ state: 'ringing', callId: 'c1', callerId: 'bob', calleeId: 'alice', msgId: '1987654321098765432' }));
+    expect(connect).not.toHaveBeenCalled();
+    expect(token.get).not.toHaveBeenCalled(); // current backend has no Harmony native-token contract
   });
 });

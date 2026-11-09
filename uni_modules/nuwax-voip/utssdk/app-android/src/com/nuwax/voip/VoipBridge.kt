@@ -62,7 +62,9 @@ object VoipBridge {
     private var config = JSONObject()
     private var generation = 0
     private var current: JSONObject? = null
+    private var imSocket: WebSocket? = null
     private var streamCall: Call? = null
+    private fun business() = config.optString("protocol") == "im-voip-v1"
     private var streamJob: Job? = null
     private var mediaJob: Job? = null
     private var expiryJob: Job? = null
@@ -155,6 +157,7 @@ object VoipBridge {
                     }
                     "reset" -> reset()
                     "watch" -> adopt(command.getJSONObject("snapshot"))
+                    "invitation" -> if (business()) receiveInvitation(api("/api/instant-message/messages/" + Uri.encode(command.getString("msgId")) + "?convId=" + Uri.encode(command.getString("convId")), absolute = true))
                     "action" -> act(command.optString("action"), command.optString("answerMediaType", "audio"))
                     "microphone" -> setMicrophone(command.optBoolean("enabled"))
                     "camera" -> setCamera(command.optBoolean("enabled"))
@@ -175,7 +178,8 @@ object VoipBridge {
     }
 
     private fun initialize(value: JSONObject) {
-        if (!value.optBoolean("development") && !value.optBoolean("qaAccepted")) return
+        val debug = ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (!value.optBoolean("development") && !value.optBoolean("qaAccepted") && !(debug && value.optBoolean("businessEnabled"))) return
         if (value.optBoolean("development") && ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
         val base = Uri.parse(value.optString("apiBaseUrl"))
         if (base.host.isNullOrEmpty() || (base.scheme != "https" && !(value.optBoolean("development") && base.scheme == "http"))) return
@@ -211,11 +215,11 @@ object VoipBridge {
         return result.toString()
     }
 
-    private suspend fun api(path: String, data: JSONObject? = null): JSONObject {
+    private suspend fun api(path: String, data: JSONObject? = null, absolute: Boolean = false, captured: JSONObject? = null): JSONObject {
         val owner = generation
-        val settings = JSONObject(config.toString())
+        val settings = captured ?: JSONObject(config.toString())
         val result = withContext(Dispatchers.IO) {
-            val request = Request.Builder().url(settings.getString("apiBaseUrl") + PREFIX + path)
+            val request = Request.Builder().url(settings.getString("apiBaseUrl") + (if (absolute) "" else PREFIX) + path)
                 .header("Authorization", "Bearer " + settings.getString("accessToken"))
                 .header("X-Call-Device-Id", settings.getString("deviceId"))
             if (data != null) request.post(data.toString().toRequestBody("application/json".toMediaType()))
@@ -226,12 +230,13 @@ object VoipBridge {
                 envelope.getJSONObject("data")
             }
         }
-        check(owner == generation) { "CALL_SESSION_CHANGED" }
+        if (captured == null) check(owner == generation) { "CALL_SESSION_CHANGED" }
         return result
     }
 
     private fun startStream() {
-        streamCall?.cancel(); streamJob?.cancel()
+        imSocket?.cancel(); imSocket = null; streamCall?.cancel(); streamJob?.cancel()
+        if (business()) { startImStream(); return }
         val run = generation
         val settings = JSONObject(config.toString())
         streamJob = scope.launch {
@@ -265,6 +270,129 @@ object VoipBridge {
         }
     }
 
+    /** Independent IM route: same physical base, separate tab; never registers a push device. */
+    private fun startImStream() {
+        val run = generation
+        val settings = JSONObject(config.toString())
+        streamJob = scope.launch {
+            var retry = 1000L
+            while (isActive && run == generation) {
+                val closed = CompletableDeferred<Unit>()
+                var rejected = false
+                var heartbeat: Job? = null
+                var lastFrame = System.currentTimeMillis()
+                fun frame(op: Int, body: JSONObject = JSONObject()) = JSONObject().put("v", 1).put("op", op).put("reqId", UUID.randomUUID().toString()).put("ts", System.currentTimeMillis()).put("body", body).toString()
+                val base = settings.getString("apiBaseUrl").replaceFirst("https://", "wss://").replaceFirst("http://", "ws://")
+                val request = Request.Builder().url(base + "/instant-message/ws").header("Sec-WebSocket-Protocol", "im-v1").build()
+                val socket = streamHttp.newWebSocket(request, object : WebSocketListener() {
+                    override fun onOpen(ws: WebSocket, response: Response) {
+                        ws.send(frame(1000, JSONObject().put("token", settings.getString("accessToken")).put("deviceId", settings.getString("deviceId").substringBefore('#') + "#voip").put("platform", "android").put("lastAckSeq", 0)))
+                    }
+                    override fun onMessage(ws: WebSocket, text: String) { scope.launch {
+                        if (run != generation || imSocket !== ws) return@launch
+                        try {
+                            lastFrame = System.currentTimeMillis()
+                            val envelope = JSONObject(text); val body = envelope.optJSONObject("body") ?: JSONObject()
+                            when (envelope.optInt("op")) {
+                                1001 -> {
+                                    retry = 1000L; heartbeat?.cancel()
+                                    val interval = body.optLong("heartbeatInterval", 30).coerceIn(5, 60) * 1000
+                                    heartbeat = launch { while (isActive) { delay(interval); if (System.currentTimeMillis() - lastFrame > interval * 2) { ws.cancel(); closed.complete(Unit); break }; ws.send(frame(2000)) } }
+                                }
+                                1002, 9000 -> { rejected = true; emit("error", "code", "CALL_CONTROL_REJECTED"); ws.close(1000, null); closed.complete(Unit) }
+                                3002 -> if (body.optString("msgType") == "voip") {
+                                    ws.send(frame(3003, JSONObject().put("convId", body.optString("convId")).put("seq", body.optLong("seq"))))
+                                    receiveInvitation(body)
+                                }
+                                3007 -> receiveSignal(body)
+                            }
+                        } catch (_: Exception) { emit("error", "code", "CALL_INVALID_EVENT") }
+                    } }
+                    override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { closed.complete(Unit) }
+                    override fun onClosed(ws: WebSocket, code: Int, reason: String) { closed.complete(Unit) }
+                })
+                imSocket = socket
+                try { withTimeoutOrNull(10000) { while (heartbeat == null && !closed.isCompleted) delay(100) }; if (heartbeat == null) socket.cancel(); else closed.await() }
+                finally { heartbeat?.cancel(); socket.cancel(); if (imSocket === socket) imSocket = null }
+                if (rejected) return@launch
+                delay(retry); retry = (retry * 2).coerceAtMost(30000)
+            }
+        }
+    }
+    private suspend fun receiveInvitation(message: JSONObject) {
+        if (message.optString("msgType") != "voip" || message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
+        val body = message.optJSONObject("body") ?: return
+        val id = body.optString("callId"); val conv = message.optString("convId"); val sender = message.optString("senderId")
+        val media = body.optString("mediaType")
+        if (!id.matches(Regex("[A-Za-z0-9_-]{1,128}")) || body.optString("roomName").isEmpty() || media !in listOf("audio", "video") || sender == config.optString("userId")) return
+        val sent = message.optLong("sendTime")
+        if (sent <= 0 || sent + 60000 <= System.currentTimeMillis() || terminal.contains(id) || current?.optString("callId") == id) return
+        val conversation = api("/api/instant-message/conversations/" + Uri.encode(conv), absolute = true)
+        if (conversation.optInt("convType") != 1 || conversation.optString("peerUserId") != sender) return
+        val next = JSONObject().put("protocol", "im-voip-v1").put("callId", id).put("roomName", body.getString("roomName")).put("msgId", message.getString("msgId")).put("convId", conv)
+            .put("version", 1).put("state", "ringing").put("callerId", sender).put("calleeId", config.getString("userId")).put("callerDeviceId", "").put("acceptedDeviceId", "")
+            .put("mediaType", media).put("callerDisplayName", conversation.optString("peerName", sender)).put("calleeDisplayName", config.getString("userId")).put("expiresAt", sent + 60000)
+        if (current != null && current?.optString("callId") != id) { notifyBusinessEnd(next, "busy"); terminal.add(id); return }
+        adopt(next)
+    }
+    private fun receiveSignal(event: JSONObject) {
+        val payload = event.optJSONObject("payload") ?: return
+        val eventType = event.optString("eventType")
+        val eventId = payload.optString("callId")
+        if (eventType in listOf("voip:cancel", "voip:timeout", "voip:decline") && eventId.isNotEmpty()) { terminal.add(eventId); if (terminal.size > 128) terminal.remove(terminal.first()) }
+        val call = current ?: return
+        val sameId = (payload.optString("callId").isNotEmpty() && payload.optString("callId") == call.optString("callId")) || (payload.optString("msgId").isNotEmpty() && payload.optString("msgId") == call.optString("msgId"))
+        if (payload.optString("convId") != call.optString("convId") || !sameId) return
+        when (event.optString("eventType")) {
+            "voip:answered" -> if (call.optString("calleeId") == config.optString("userId") && call.optString("acceptedDeviceId").isEmpty()) finish("answeredElsewhere")
+            "voip:cancel", "voip:timeout", "voip:decline" -> { finish("remoteEnded") }
+        }
+    }
+    private fun project(state: String, media: String? = null) {
+        val old = current ?: return
+        val next = JSONObject(old.toString()).put("state", state).put("version", old.optLong("version") + 1)
+        if (media != null) next.put("mediaType", media)
+        if (state == "connecting") next.put("acceptedDeviceId", config.getString("deviceId")).put("connectExpiresAt", System.currentTimeMillis() + 30000)
+        if (state == "active") next.put("connectedAt", System.currentTimeMillis())
+        adopt(next)
+    }
+    private suspend fun businessCredentials(call: JSONObject): JSONObject {
+        val data = api("/api/instant-message/meetings/rtc/rooms/" + Uri.encode(call.getString("roomName")) + "/tokens", JSONObject().put("platform", "android").put("deviceId", config.getString("deviceId")).put("displayName", config.getString("userId")), true)
+        return JSONObject().put("serverUrl", data.getString("wsUrl")).put("participantToken", data.getString("token"))
+    }
+    private fun businessBody(call: JSONObject) = JSONObject().put("convId", call.getString("convId")).put("msgId", call.getString("msgId")).put("callId", call.getString("callId")).put("roomName", call.getString("roomName"))
+    private suspend fun mediaJoined() = withContext(NonCancellable) {
+        val call = current ?: return@withContext
+        val settings = JSONObject(config.toString()); val run = generation
+        if (call.optString("callerId") == config.optString("userId")) {
+            val invitation = JSONObject().put("convId", call.getString("convId")).put("deviceId", config.getString("deviceId")).put("clientMsgId", call.getString("callId")).put("msgType", "voip")
+                .put("body", JSONObject().put("callId", call.getString("callId")).put("roomName", call.getString("roomName")).put("mediaType", call.getString("mediaType")))
+            val response = api("/api/instant-message/messages", invitation, true, settings)
+            if (run != generation || current?.optString("callId") != call.optString("callId")) { notifyBusinessEnd(JSONObject(call.toString()).put("msgId", response.getString("msgId")), "cancel", settings); return@withContext }
+            current = JSONObject(current.toString()).put("msgId", response.getString("msgId")).put("version", current!!.optLong("version") + 1)
+            emitSnapshot(current!!)
+        } else api("/answered", businessBody(call))
+    }
+    private suspend fun businessAction(action: String, media: String) {
+        val call = current ?: return
+        when (action) {
+            "accept" -> { if (call.optString("state") != "ringing") return; if (!permissions(media)) { emit("error", "code", "CALL_PERMISSION_REQUIRED"); return }; project("connecting", if (call.optString("mediaType") == "video") media else "audio") }
+            "ready" -> if (connected && peerReady) project("active")
+            "end", "cancel", "reject" -> finish(if (action == "reject") "rejected" else "cancel")
+        }
+    }
+    private fun notifyBusinessEnd(call: JSONObject, reason: String, captured: JSONObject? = null) {
+        val settings = captured ?: JSONObject(config.toString())
+        if (call.optString("msgId").isEmpty() || reason in listOf("remoteEnded", "answeredElsewhere", "sessionChanged")) return
+        val caller = call.optString("callerId") == settings.optString("userId")
+        if (!caller && call.optString("state") != "ringing") return
+        val body = businessBody(call); val path = if (caller) "/ended" else "/declined"
+        if (caller) body.put("reason", if (reason == "timeout") "timeout" else "cancel")
+        val request = Request.Builder().url(settings.getString("apiBaseUrl") + PREFIX + path).header("Authorization", "Bearer " + settings.getString("accessToken"))
+            .post(body.toString().toRequestBody("application/json".toMediaType())).build()
+        scope.launch(Dispatchers.IO) { runCatching { http.newCall(request).execute().close() } }
+    }
+
     private fun adopt(snapshot: JSONObject) {
         val id = snapshot.optString("callId")
         if (id.isEmpty() || terminal.contains(id)) return
@@ -284,7 +412,7 @@ object VoipBridge {
         expiryJob?.cancel(); expiryJob = null
         val phase = snapshot.optString("state")
         if (phase == "ringing" || phase == "connecting") {
-            val limit = if (phase == "ringing") 45000L else 30000L
+            val limit = if (phase == "ringing") (if (business()) 60000L else 45000L) else 30000L
             val deadline = snapshot.optLong(if (phase == "ringing") "expiresAt" else "connectExpiresAt", System.currentTimeMillis() + limit)
             expiryJob = scope.launch {
                 delay((deadline - System.currentTimeMillis()).coerceIn(0L, limit))
@@ -303,7 +431,7 @@ object VoipBridge {
             try { context?.startActivity(VoipIncomingActivity.intent(context!!, id)) }
             catch (_: Exception) { emit("openPage") }
         }
-        if (snapshot.optString("state") != "ringing" && (caller || accepted == config.optString("deviceId"))) connectMedia(snapshot)
+        if ((snapshot.optString("state") != "ringing" || (business() && caller)) && (caller || accepted == config.optString("deviceId"))) connectMedia(snapshot)
     }
 
     private fun addTelecom(snapshot: JSONObject, incoming: Boolean) {
@@ -351,6 +479,7 @@ object VoipBridge {
         val run = generation
         val token = config.optString("accessToken")
         val id = call.optString("callId")
+        if (business()) { businessAction(action, answerMediaType); return }
         if (action == "accept" && !permissions(answerMediaType)) { emit("error", "code", "CALL_PERMISSION_REQUIRED"); return }
         // Local hangup always releases capture even when the business endpoint is unreachable.
         if (action == "end" || action == "cancel" || action == "reject") releaseMedia()
@@ -393,7 +522,7 @@ object VoipBridge {
                 }
                 val result = if (snapshot.optString("calleeId") == config.optString("userId")) c.answer(if (camera) CallAttributesCompat.CALL_TYPE_VIDEO_CALL else CallAttributesCompat.CALL_TYPE_AUDIO_CALL) else c.setActive()
                 check(result is CallControlResult.Success)
-                val credentials = api("/$id/credentials", JSONObject())
+                val credentials = if (business()) businessCredentials(snapshot) else api("/$id/credentials", JSONObject())
                 val signal = credentials.getString("serverUrl")
                 check(signal.startsWith("wss://") || (config.optBoolean("development") && signal.startsWith("ws://")))
                 if (run != generation || current?.optString("callId") != id || terminal.contains(id)) return@launch
@@ -411,6 +540,7 @@ object VoipBridge {
                             is RoomEvent.TrackUnsubscribed -> refreshViews()
                             is RoomEvent.Reconnecting -> { reconnecting = true; emit("reconnecting") }
                             is RoomEvent.Reconnected -> { reconnecting = false; emit("connected") }
+                            is RoomEvent.ParticipantDisconnected -> if (business() && peerReady) finish("remoteEnded")
                             is RoomEvent.Disconnected -> if (!terminal.contains(id)) { finish("disconnected") }
                             else -> {}
                         }
@@ -422,7 +552,9 @@ object VoipBridge {
                 withTimeout(5000) { while (!VoipCallService.enableCapture(camera && cameraVisible())) delay(50) }
                 next.localParticipant.setMicrophoneEnabled(microphone)
                 if (camera && cameraVisible()) next.localParticipant.setCameraEnabled(true)
-                connected = true; emit("connected"); refreshViews(); maybeReady()
+                connected = true; emit("connected"); refreshViews()
+                if (business()) mediaJoined()
+                maybeReady()
                 context?.let { VoipCallService.show(it) }
             } catch (_: Exception) { if (run == generation && !terminal.contains(id)) { finish("mediaFailed"); emit("error", "code", "CALL_MEDIA_FAILED") } }
         }
@@ -471,7 +603,7 @@ object VoipBridge {
         renderers.clear(); bindings.clear(); old?.release(); connected = false; peerReady = false; reconnecting = false
     }
     private fun finish(reason: String = "") {
-        if (reason.isNotEmpty() && reason != "answeredElsewhere" && reason != "sessionChanged") closeServerCall()
+        if (reason.isNotEmpty() && reason != "answeredElsewhere" && reason != "sessionChanged") closeServerCall(reason)
         val id = current?.optString("callId") ?: ""
         if (id.isNotEmpty()) { terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first()) }
         expiryJob?.cancel(); expiryJob = null
@@ -498,7 +630,8 @@ object VoipBridge {
         val event = JSONObject().put("type", "localEnded").put("scope", config.optString("scope")).put("callId", current?.optString("callId")).put("reason", "sessionExpired")
         reset(); queue.add(event)
     }
-    private fun closeServerCall() {
+    private fun closeServerCall(reason: String = "") {
+        if (business()) { current?.let { notifyBusinessEnd(JSONObject(it.toString()), reason) }; return }
         val old = current
         val settings = JSONObject(config.toString())
         if (old != null && settings.optString("accessToken").isNotEmpty()) {
@@ -512,7 +645,7 @@ object VoipBridge {
     private fun reset() {
         context?.stopService(Intent(context, VoipDevControlService::class.java))
         closeServerCall()
-        generation++; streamCall?.cancel(); streamJob?.cancel(); streamJob = null; finish("sessionChanged")
+        generation++; imSocket?.cancel(); imSocket = null; streamCall?.cancel(); streamJob?.cancel(); streamJob = null; finish("sessionChanged")
         config = JSONObject(); terminal.clear(); queue.clear()
         context?.getSharedPreferences("nuwax-voip", 0)?.edit()?.clear()?.apply()
     }
@@ -524,7 +657,9 @@ object VoipBridge {
             try {
                 if (config.optString("accessToken").isEmpty()) loadConfig()?.let { initialize(it) }
                 if (config.optString("accessToken").isEmpty()) return@launch
-                val callId = JSONObject(payload).getString("callId")
+                val invitation = JSONObject(payload)
+                if (business()) { receiveInvitation(api("/api/instant-message/messages/" + Uri.encode(invitation.getString("msgId")) + "?convId=" + Uri.encode(invitation.getString("convId")), absolute = true)); return@launch }
+                val callId = invitation.getString("callId")
                 if (!callId.matches(Regex("[A-Za-z0-9_-]{1,128}"))) return@launch
                 adopt(api("/$callId"))
             } catch (_: Exception) { emit("error", "code", "CALL_INVITATION_FAILED") }

@@ -1,5 +1,7 @@
 # VoIP 正式后端接入交接
 
+当前实现与完整 App 基座请先看[真实业务接入说明](voip-business-integration.md)。其中区分实际 IM 协议、原目标契约与尚未完成的真机/推送验收。
+
 2026-11-09 更新，供后端对接和正式体测使用。客户端按独立功能集成。已核对 `nuwax-im/feat-video-meeting@fb880f2` 的实际接口、IM 事件及 RTC 流程，接入前先阅读[实际接口核对](voip-im-backend-review.md)。下文保留原目标协议的交接项，按实际实现逐项确认和适配。
 
 ## 当前基线

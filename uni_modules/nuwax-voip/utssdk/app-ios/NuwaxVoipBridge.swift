@@ -15,6 +15,8 @@ import LiveKit
     private var generation = 0
     private var snapshot: [String: Any]?
     private var terminal = Set<String>()
+    private var imSocket: URLSessionWebSocketTask?
+    private var business: Bool { configuration["protocol"] as? String == "im-voip-v1" }
     private var stream: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
     private var mediaTask: Task<Void, Never>?
@@ -84,6 +86,8 @@ import LiveKit
         if ["action", "microphone", "camera", "speaker", "audioRoute", "switchCamera"].contains(operation), commandId != snapshot?["callId"] as? String { return }
         switch operation {
         case "reset": reset()
+        case "invitation":
+            if business, let conv = command["convId"] as? String, let msg = command["msgId"] as? String { Task { if let message = try? await self.request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true) { await self.receiveInvitation(message) } } }
         case "watch": if let value = command["snapshot"] as? [String: Any] { adopt(value) }
         case "action":
             let action = command["action"] as? String ?? ""
@@ -120,9 +124,9 @@ import LiveKit
     }
     private func initialize(_ config: [String: Any]) {
         #if !DEBUG
-        guard config["development"] as? Bool != true else { return }
+        guard config["development"] as? Bool != true, config["businessEnabled"] as? Bool != true || config["qaAccepted"] as? Bool == true else { return }
         #endif
-        guard config["development"] as? Bool == true || config["qaAccepted"] as? Bool == true,
+        guard config["development"] as? Bool == true || config["qaAccepted"] as? Bool == true || config["businessEnabled"] as? Bool == true,
               let base = config["apiBaseUrl"] as? String, let url = URL(string: base), url.host != nil,
               url.scheme == "https" || (config["development"] as? Bool == true && url.scheme == "http"),
               let token = config["accessToken"] as? String, !token.isEmpty,
@@ -150,21 +154,22 @@ import LiveKit
             if connected { emit("connected") }; if peerReady { emit("peerMediaReady") }
         }
     }
-    private func request(_ path: String, body: [String: Any]? = nil) async throws -> [String: Any] {
-        let run = generation; let config = configuration
-        guard let base = config["apiBaseUrl"] as? String, let url = URL(string: base + prefix + path) else { throw VoipError.invalid }
+    private func request(_ path: String, body: [String: Any]? = nil, absolute: Bool = false, captured: [String: Any]? = nil) async throws -> [String: Any] {
+        let run = generation; let config = captured ?? configuration
+        guard let base = config["apiBaseUrl"] as? String, let url = URL(string: base + (absolute ? "" : prefix) + path) else { throw VoipError.invalid }
         var request = URLRequest(url: url, timeoutInterval: 4)
         request.setValue("Bearer \(config["accessToken"] as? String ?? "")", forHTTPHeaderField: "Authorization")
         request.setValue(config["deviceId"] as? String, forHTTPHeaderField: "X-Call-Device-Id")
         if let body { request.httpMethod = "POST"; request.httpBody = try JSONSerialization.data(withJSONObject: body); request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard run == generation, (response as? HTTPURLResponse)?.statusCode == 200,
+        guard (captured != nil || run == generation), (response as? HTTPURLResponse)?.statusCode == 200,
               let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any], envelope["code"] as? String == "0000",
               let value = envelope["data"] as? [String: Any] else { throw VoipError.invalid }
         return value
     }
     private func startStream() {
-        stream?.cancel(); let run = generation; let config = configuration
+        imSocket?.cancel(with: .goingAway, reason: nil); imSocket = nil
+        stream?.cancel(); if business { startImStream(); return }; let run = generation; let config = configuration
         stream = Task { @MainActor in
             var cursor = ""
             while !Task.isCancelled && run == self.generation {
@@ -193,6 +198,136 @@ import LiveKit
             }
         }
     }
+    private func wireString(_ value: Any?) -> String { value.map { String(describing: $0) } ?? "" }
+    private func frame(_ op: Int, _ body: [String: Any] = [:]) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: ["v": 1, "op": op, "reqId": UUID().uuidString, "ts": Int64(Date().timeIntervalSince1970 * 1000), "body": body])
+        return String(data: data ?? Data(), encoding: .utf8) ?? ""
+    }
+    /** Separate IM tab keeps the app's ordinary device route and push registration intact. */
+    private func startImStream() {
+        let run = generation, config = configuration
+        stream = Task { @MainActor in
+            var retry: UInt64 = 1_000_000_000
+            while !Task.isCancelled && run == self.generation {
+                let base = (config["apiBaseUrl"] as? String ?? "").replacingOccurrences(of: "https://", with: "wss://").replacingOccurrences(of: "http://", with: "ws://")
+                guard let url = URL(string: base + "/instant-message/ws") else { return }
+                let socket = URLSession.shared.webSocketTask(with: url, protocols: ["im-v1"]); self.imSocket = socket
+                socket.resume()
+                var heartbeat: Task<Void, Never>?
+                var rejected = false
+                let handshake = Task { @MainActor in
+                    do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
+                    socket.cancel(with: .goingAway, reason: nil)
+                }
+                do {
+                    let physical = (config["deviceId"] as? String ?? "").components(separatedBy: "#").first ?? ""
+                    try await socket.send(.string(self.frame(1000, ["token": config["accessToken"] as? String ?? "", "deviceId": physical + "#voip", "platform": "ios", "lastAckSeq": 0])))
+                    while !Task.isCancelled && run == self.generation {
+                        let received = try await socket.receive()
+                        guard self.imSocket === socket, run == self.generation else { break }
+                        guard case .string(let text) = received, let bytes = text.data(using: .utf8), let env = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { continue }
+                        let body = env["body"] as? [String: Any] ?? [:]
+                        switch env["op"] as? Int ?? 0 {
+                        case 1001:
+                            handshake.cancel(); heartbeat?.cancel(); retry = 1_000_000_000
+                            let interval = UInt64(max(5, min(60, body["heartbeatInterval"] as? Int ?? 30))) * 1_000_000_000
+                            heartbeat = Task { @MainActor in
+                                while !Task.isCancelled {
+                                    do { try await Task.sleep(nanoseconds: interval); try await socket.send(.string(self.frame(2000))); socket.sendPing { error in if error != nil { socket.cancel(with: .goingAway, reason: nil) } } }
+                                    catch { socket.cancel(with: .goingAway, reason: nil); return }
+                                }
+                            }
+                        case 1002, 9000: rejected = true; self.emit("error", ["code": "CALL_CONTROL_REJECTED"]); socket.cancel(with: .normalClosure, reason: nil)
+                        case 3002:
+                            if body["msgType"] as? String == "voip" {
+                                try await socket.send(.string(self.frame(3003, ["convId": self.wireString(body["convId"]), "seq": body["seq"] ?? 0])))
+                                await self.receiveInvitation(body)
+                            }
+                        case 3007: self.receiveSignal(body)
+                        default: break
+                        }
+                        if rejected { break }
+                    }
+                } catch { /* No request or token-bearing error output. */ }
+                handshake.cancel(); heartbeat?.cancel(); socket.cancel(with: .goingAway, reason: nil)
+                if self.imSocket === socket { self.imSocket = nil }
+                if rejected || Task.isCancelled { return }
+                try? await Task.sleep(nanoseconds: retry); retry = min(30_000_000_000, retry * 2)
+            }
+        }
+    }
+    private func receiveInvitation(_ message: [String: Any]) async {
+        guard message["msgType"] as? String == "voip", (message["senderType"] as? Int ?? 1) == 1, (message["msgStatus"] as? Int ?? 1) == 1,
+              let body = message["body"] as? [String: Any], let id = body["callId"] as? String, let roomName = body["roomName"] as? String,
+              let media = body["mediaType"] as? String, ["audio", "video"].contains(media), !roomName.isEmpty,
+              id.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) != nil else { return }
+        let sender = wireString(message["senderId"]), conv = wireString(message["convId"]), sent = (message["sendTime"] as? NSNumber)?.doubleValue ?? 0
+        guard sender != configuration["userId"] as? String, sent > 0, sent + 60000 > Date().timeIntervalSince1970 * 1000, !terminal.contains(id), snapshot?["callId"] as? String != id else { return }
+        guard let conversation = try? await request("/api/instant-message/conversations/\(conv)", absolute: true), conversation["convType"] as? Int == 1, wireString(conversation["peerUserId"]) == sender else { return }
+        let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "callerDisplayName": conversation["peerName"] as? String ?? sender, "calleeDisplayName": configuration["userId"] as? String ?? "", "expiresAt": sent + 60000]
+        if snapshot != nil && snapshot?["callId"] as? String != id { notifyBusinessEnd(next, reason: "busy"); terminal.insert(id); return }
+        adopt(next)
+    }
+    private func receiveSignal(_ event: [String: Any]) {
+        guard let payload = event["payload"] as? [String: Any] else { return }
+        let type = event["eventType"] as? String ?? "", id = wireString(payload["callId"])
+        if ["voip:cancel", "voip:timeout", "voip:decline"].contains(type), !id.isEmpty { terminal.insert(id); if terminal.count > 128, let first = terminal.first { terminal.remove(first) } }
+        guard let call = snapshot, wireString(payload["convId"]) == wireString(call["convId"]),
+              (!id.isEmpty && id == wireString(call["callId"])) || (!wireString(payload["msgId"]).isEmpty && wireString(payload["msgId"]) == wireString(call["msgId"])) else { return }
+        switch type {
+        case "voip:answered": if call["calleeId"] as? String == configuration["userId"] as? String && wireString(call["acceptedDeviceId"]).isEmpty { finish("answeredElsewhere") }
+        case "voip:cancel", "voip:timeout", "voip:decline": finish("remoteEnded")
+        default: break
+        }
+    }
+    private func project(_ state: String, media: String? = nil) {
+        guard var call = snapshot else { return }
+        call["state"] = state; call["version"] = (call["version"] as? Int ?? 0) + 1
+        if let media { call["mediaType"] = media }
+        if state == "connecting" { call["acceptedDeviceId"] = configuration["deviceId"]; call["connectExpiresAt"] = Date().timeIntervalSince1970 * 1000 + 30000 }
+        if state == "active" { call["connectedAt"] = Date().timeIntervalSince1970 * 1000 }
+        adopt(call)
+    }
+    private func businessCredentials(_ call: [String: Any]) async throws -> [String: Any] {
+        let room = wireString(call["roomName"]).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
+        let result = try await request("/api/instant-message/meetings/rtc/rooms/\(room)/tokens", body: ["platform": "ios", "deviceId": configuration["deviceId"] as? String ?? "", "displayName": configuration["userId"] as? String ?? ""], absolute: true)
+        return ["serverUrl": result["wsUrl"] as? String ?? "", "participantToken": result["token"] as? String ?? ""]
+    }
+    private func businessBody(_ call: [String: Any]) -> [String: Any] {
+        ["convId": wireString(call["convId"]), "msgId": wireString(call["msgId"]), "callId": wireString(call["callId"]), "roomName": wireString(call["roomName"])]
+    }
+    private func mediaJoined() async throws {
+        guard let call = snapshot else { return }
+        let settings = configuration, run = generation
+        if call["callerId"] as? String == configuration["userId"] as? String {
+            let result = try await request("/api/instant-message/messages", body: ["convId": wireString(call["convId"]), "deviceId": configuration["deviceId"] as? String ?? "", "clientMsgId": wireString(call["callId"]), "msgType": "voip", "body": ["callId": wireString(call["callId"]), "roomName": wireString(call["roomName"]), "mediaType": wireString(call["mediaType"])]], absolute: true, captured: settings)
+            guard run == generation, snapshot?["callId"] as? String == call["callId"] as? String else { var late = call; late["msgId"] = wireString(result["msgId"]); notifyBusinessEnd(late, reason: "cancel", captured: settings); return }
+            if var next = snapshot { next["msgId"] = wireString(result["msgId"]); next["version"] = (next["version"] as? Int ?? 0) + 1; snapshot = next; emit("snapshot", ["snapshot": next]) }
+        } else { _ = try await request("/answered", body: businessBody(call)) }
+    }
+    private func businessAction(_ action: String, media: String) async -> Bool {
+        guard let call = snapshot else { return false }
+        switch action {
+        case "accept":
+            guard call["state"] as? String == "ringing", permissions(media) else { emit("error", ["code": "CALL_PERMISSION_REQUIRED"]); return false }
+            project("connecting", media: call["mediaType"] as? String == "video" ? media : "audio"); return true
+        case "ready": if connected && peerReady { project("active") }; return true
+        case "end", "cancel", "reject": finish(action == "reject" ? "rejected" : "cancel"); return true
+        default: return false
+        }
+    }
+    private func notifyBusinessEnd(_ call: [String: Any], reason: String, captured: [String: Any]? = nil) {
+        let settings = captured ?? configuration
+        guard !wireString(call["msgId"]).isEmpty, !["remoteEnded", "answeredElsewhere", "sessionChanged"].contains(reason) else { return }
+        let caller = call["callerId"] as? String == settings["userId"] as? String
+        if !caller && call["state"] as? String != "ringing" { return }
+        guard let base = settings["apiBaseUrl"] as? String, let url = URL(string: base + prefix + (caller ? "/ended" : "/declined")) else { return }
+        var body = businessBody(call); if caller { body["reason"] = reason == "timeout" ? "timeout" : "cancel" }
+        var request = URLRequest(url: url, timeoutInterval: 4); request.httpMethod = "POST"
+        request.setValue("Bearer \(settings["accessToken"] as? String ?? "")", forHTTPHeaderField: "Authorization"); request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body); URLSession.shared.dataTask(with: request).resume()
+    }
+
     private func adopt(_ value: [String: Any]) {
         guard let id = value["callId"] as? String, !terminal.contains(id), let user = configuration["userId"] as? String,
               value["callerId"] as? String == user || value["calleeId"] as? String == user else { return }
@@ -210,7 +345,7 @@ import LiveKit
         if state == "ended" { finish(); return }
         expiryTask?.cancel(); expiryTask = nil
         if state == "ringing" || state == "connecting" {
-            let limit = state == "ringing" ? 45000.0 : 30000.0
+            let limit = state == "ringing" ? (business ? 60000.0 : 45000.0) : 30000.0
             let now = Date().timeIntervalSince1970 * 1000
             let deadline = value[state == "ringing" ? "expiresAt" : "connectExpiresAt"] as? Double ?? (now + limit)
             expiryTask = Task { @MainActor in
@@ -229,11 +364,13 @@ import LiveKit
                 content.userInfo = ["callId": id]
                 UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "voip-\(id)", content: content, trigger: nil))
             }
-        } else if caller || accepted == configuration["deviceId"] as? String { connectMedia(value) }
+        }
+        if (state != "ringing" || (business && caller)) && (caller || accepted == configuration["deviceId"] as? String) { connectMedia(value) }
     }
     fileprivate func action(_ action: String, answerMediaType: String = "audio") async -> Bool {
         guard let value = snapshot, let id = value["callId"] as? String else { return false }
         let run = generation, token = configuration["accessToken"] as? String
+        if business { return await businessAction(action, media: answerMediaType) }
         if action == "accept" && !permissions(answerMediaType) { emit("error", ["code": "CALL_PERMISSION_REQUIRED"]); return false }
         if ["end", "cancel", "reject"].contains(action) { await releaseMedia() }
         do {
@@ -257,7 +394,7 @@ import LiveKit
             do {
                 if value["mediaType"] as? String != "video" { self.camera = false }
                 guard self.permissions(self.camera ? "video" : "audio") else { throw VoipError.invalid }
-                let credentials = try await self.request("/\(id)/credentials", body: [:])
+                let credentials = try await (self.business ? self.businessCredentials(value) : self.request("/\(id)/credentials", body: [:]))
                 guard run == self.generation && !self.terminal.contains(id) else { return }
                 let signal = credentials["serverUrl"] as? String ?? ""
                 guard signal.hasPrefix("wss://") || (self.configuration["development"] as? Bool == true && signal.hasPrefix("ws://")) else { throw VoipError.invalid }
@@ -278,7 +415,15 @@ import LiveKit
                 try await next.localParticipant.setMicrophone(enabled: self.microphone)
                 if self.camera && UIApplication.shared.applicationState == .active { try await next.localParticipant.setCamera(enabled: true) }
                 guard self.room === next && run == self.generation else { await next.disconnect(); return }
-                self.connected = true; self.emit("connected"); self.refreshViews(); self.maybeReady()
+                self.connected = true; self.emit("connected"); self.refreshViews()
+                if self.business {
+                    Task { @MainActor in
+                        guard run == self.generation, self.snapshot?["callId"] as? String == id else { return }
+                        do { try await self.mediaJoined() }
+                        catch { if run == self.generation && self.snapshot?["callId"] as? String == id { self.finish("mediaFailed") } }
+                    }
+                }
+                self.maybeReady()
             } catch { if run == self.generation && !self.terminal.contains(id) { self.finish("mediaFailed"); self.emit("error", ["code": "CALL_MEDIA_FAILED"]) } }
         }
     }
@@ -305,7 +450,7 @@ import LiveKit
         await old?.disconnect(); connected = false; peerReady = false
     }
     fileprivate func finish(_ reason: String = "") {
-        if !reason.isEmpty && reason != "answeredElsewhere" && reason != "sessionChanged" { closeServerCall() }
+        if !reason.isEmpty && reason != "answeredElsewhere" && reason != "sessionChanged" { closeServerCall(reason) }
         if let id = snapshot?["callId"] as? String {
             terminal.insert(id)
             if terminal.count > 128, let expired = terminal.first { terminal.remove(expired); callUUIDs.removeValue(forKey: expired) }
@@ -319,7 +464,8 @@ import LiveKit
         if !reason.isEmpty { emit("localEnded", ["reason": reason]) }
         snapshot = nil; connected = false; peerReady = false; readySent = false
     }
-    private func closeServerCall() {
+    private func closeServerCall(_ reason: String = "") {
+        if business { if let call = snapshot { notifyBusinessEnd(call, reason: reason) }; return }
         if let call = snapshot, let id = call["callId"] as? String, let base = configuration["apiBaseUrl"] as? String, let url = URL(string: base + prefix + "/\(id)/actions") {
             var request = URLRequest(url: url, timeoutInterval: 4); request.httpMethod = "POST"
             request.setValue("Bearer \(configuration["accessToken"] as? String ?? "")", forHTTPHeaderField: "Authorization")
@@ -332,7 +478,7 @@ import LiveKit
     }
     private func reset() {
         closeServerCall()
-        generation += 1; stream?.cancel(); stream = nil; finish("sessionChanged")
+        generation += 1; imSocket?.cancel(with: .goingAway, reason: nil); imSocket = nil; stream?.cancel(); stream = nil; finish("sessionChanged")
         pushRegistry?.desiredPushTypes = []; pushRegistry = nil
         if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.invalidate() }
         systemBridge = nil; configuration = [:]; events = []; terminal = []; callUUIDs = [:]
@@ -367,6 +513,9 @@ import LiveKit
 }
 
 extension NuwaxVoipBridge: RoomDelegate {
+    public nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
+        DispatchQueue.main.async { if self.room === room && self.business && self.peerReady { self.finish("remoteEnded") } }
+    }
     public nonisolated func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
         DispatchQueue.main.async { guard self.room === room else { return }; self.refreshViews()
             if publication.track is AudioTrack { self.peerReady = true; self.emit("peerMediaReady"); self.maybeReady() } }
@@ -392,7 +541,9 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         ]
         Task { @MainActor in
             guard run == self.generation, registry === self.pushRegistry else { return }
-            _ = try? await self.request("/devices", body: body)
+            if self.business {
+                _ = try? await self.request("/api/instant-message/devices", body: ["deviceId": self.configuration["deviceId"] as? String ?? "", "platform": "ios", "voipToken": token], absolute: true)
+            } else { _ = try? await self.request("/devices", body: body) }
         }
     }
     public func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {

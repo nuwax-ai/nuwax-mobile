@@ -1,0 +1,197 @@
+import { ref, type Ref } from "vue";
+import { emptyI18nParams, toI18nParams, t as translateFn } from "@/utils/i18n";
+
+/**
+ * 群禁言在**聊天页**这一侧的状态：我此刻能不能发言（对齐 PC nuwax-im-web DEV-313 需求5）。
+ *
+ * <h2>为什么是模块级 store</h2>
+ * 有两个使用者，且它们都不能走 props：
+ * <ul>
+ *   <li>聊天页（chat.uvue）—— 判「输入框禁用 + 发送键置灰」，这要读响应式值；</li>
+ *   <li>提示条组件（components/chat-mute-tip）—— 要显示「你已被禁言，X 后自动解除」，
+ *       其中 X 每秒在变。</li>
+ * </ul>
+ * ★chat.uvue 的渲染 lambda 捕获参数已顶到 255 硬限（多一个就 R8 桩超限 →
+ *   Android {@code VerifyError} → 整页加载失败），所以提示条走**零绑定挂载**，
+ *   数据只能从模块级 ref 现取（同 chatTabsStore 的理由与做法）。
+ *
+ * <h2>★判据只有一份（勿在页面里重写）</h2>
+ * 与 PC {@code lib/mute.selfMuteState} 逐条对齐：
+ * <ol>
+ *   <li><b>只在群里成立</b>（convType 2 / 4；单聊没有禁言这个概念）；</li>
+ *   <li><b>先判个人、再判全员</b>：两者同时成立时显示"我"那一份 —— 它带明确的到期时刻，
+ *       而全员禁言没有。反过来会让一个被禁 10 分钟的人看到"全员禁言中"；</li>
+ *   <li><b>全员禁言豁免群主/管理员</b>（myRole >= 2）：服务端在发消息链路里同样豁免，
+ *       前端不豁免的话，群主开了全员禁言之后自己也被锁在门外；</li>
+ *   <li><b>到期判据只比时间戳</b>（{@code muteEndTime > now}），文案另算差值 ——
+ *       两者取不同的量，才不会出现"0 秒后自动解除"却还锁着的自相矛盾。</li>
+ * </ol>
+ *
+ * <h2>★数据从哪来</h2>
+ * 会话详情 {@code GET /api/instant-message/conversations/{id}}：
+ * {@code muteAll}（会话级）+ {@code myRole} + 我的 {@code muteEndTime}（到期的 epoch ms）。
+ * 这三项在 {@code ImConversationDtoAssembler.assemble} 里都填了，是权威快照；
+ * 服务端的 6000 帧只当"通知"（帧体对全体成员字节相同，装不下个人视角字段），
+ * 收到后要重拉详情 —— 所以这里存的是**上一次拉取时的快照**，
+ * 与库里的值在边界上必然短暂不一致，发送被拒仍要兜底提示（见 chatMuteRejectText）。
+ *
+ * <h2>★离开页面必须复位</h2>
+ * 模块级 ref 跟进程走：不清的话，从 A 群退出后进 B 会话，首帧会按 A 的禁言状态
+ * 先把输入框锁住（记忆里「零绑定组件模块 ref 跨页残留」那一课）。页面 onUnload
+ * 调 {@link resetChatMuteState}，带 convId 守卫（多聊天页堆叠时后进页面不会被先退出页面清掉）。
+ */
+
+/** 禁言判定结果（字符串而非枚举：UTS 跨端最稳，且要跨模块比较）。 */
+export const CHAT_MUTE_NONE: string = "none";
+export const CHAT_MUTE_SELF: string = "self";
+export const CHAT_MUTE_ALL: string = "all";
+
+/** 会话级全员禁言开关。 */
+export const chatMuteAll: Ref<boolean> = ref<boolean>(false);
+/** 我自己的禁言到期时刻（epoch ms；0 = 没被单独禁言）。 */
+export const chatMyMuteEnd: Ref<number> = ref<number>(0);
+/** 我的角色：1=普通成员 2=管理员 3=群主（全员禁言对 >=2 豁免）。 */
+export const chatMuteMyRole: Ref<number> = ref<number>(1);
+/** 上面这份数据属于哪个会话（空串 = 没有）。渲染侧必须比对，防换会话时晚归。 */
+export const chatMuteConvId: Ref<string> = ref<string>("");
+
+/** 页面拉到会话详情后写入（每次 loadConvInfo 都覆盖，不做合并：详情是权威快照）。 */
+export function bindChatMuteState(
+  convId: string,
+  muteAll: boolean,
+  myMuteEnd: number,
+  myRole: number,
+): void {
+  chatMuteConvId.value = convId;
+  chatMuteAll.value = muteAll;
+  chatMyMuteEnd.value = myMuteEnd;
+  chatMuteMyRole.value = myRole;
+}
+
+/** 离开页面复位（convId 守卫：别的聊天页刚写进来的数据不能被清掉）。 */
+export function resetChatMuteState(convId: string): void {
+  if (chatMuteConvId.value != convId) {
+    return;
+  }
+  chatMuteConvId.value = "";
+  chatMuteAll.value = false;
+  chatMyMuteEnd.value = 0;
+  chatMuteMyRole.value = 1;
+}
+
+/**
+ * 此刻的禁言状态：{@link CHAT_MUTE_SELF} / {@link CHAT_MUTE_ALL} / {@link CHAT_MUTE_NONE}。
+ *
+ * @param convId 当前页面会话（与 store 里那份比对，不匹配一律按"没禁言"）
+ * @param now 调用方传（不在这里取 Date.now）—— 到期那一秒界面该变，
+ *            而"什么时候重算"是页面侧必须显式处理的事（见 chat.uvue 的 muteExpiryTimer）。
+ */
+export function chatMuteKindOf(convId: string, now: number): string {
+  if (convId.length == 0 || chatMuteConvId.value != convId) {
+    return CHAT_MUTE_NONE;
+  }
+  const until = chatMyMuteEnd.value;
+  if (until > now) {
+    return CHAT_MUTE_SELF;
+  }
+  if (chatMuteAll.value && chatMuteMyRole.value < 2) {
+    return CHAT_MUTE_ALL;
+  }
+  return CHAT_MUTE_NONE;
+}
+
+/** 单单位时长文案（"10 分钟" 这类，参数只有一个计数）。 */
+function chatMuteCountText(key: string, count: number): string {
+  const params = new Map<string, string | number>();
+  params.set("count", count);
+  return translateFn(key, toI18nParams(params), "");
+}
+
+/**
+ * 剩余时长 → 人话（最多两个单位："1 天 2 小时" / "9 分钟" / "58 秒"）。
+ *
+ * ★与 PC {@code lib/mute.muteRemainingText} 逐条同口径：
+ * <ul>
+ *   <li><b>向上取整</b>（不是四舍五入/向下）：后面跟的是「后自动解除」，
+ *       向下取整会让还剩 900ms 的禁言读出「0 秒后自动解除」而输入框还锁着 ——
+ *       一行自相矛盾的字，看起来就是"界面卡住了"；</li>
+ *   <li><b>最多两个单位</b>：这一行常驻，每秒跳三个单位是噪音；</li>
+ *   <li>ms &lt;= 0 返回空串：调用方**必须不渲染**（没有剩余 = 已到期，该撤提示条）。</li>
+ * </ul>
+ */
+export function chatMuteRemainText(ms: number): string {
+  if (ms <= 0) {
+    return "";
+  }
+  const total = Math.ceil(ms / 1000);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (days > 0) {
+    if (hours > 0) {
+      const params = new Map<string, string | number>();
+      params.set("days", days);
+      params.set("hours", hours);
+      return translateFn("Mobile.Message.chatMuteRemainDaysHours", toI18nParams(params), "");
+    }
+    return chatMuteCountText("Mobile.Message.chatMuteRemainDays", days);
+  }
+  if (hours > 0) {
+    if (minutes > 0) {
+      const params = new Map<string, string | number>();
+      params.set("hours", hours);
+      params.set("minutes", minutes);
+      return translateFn("Mobile.Message.chatMuteRemainHoursMinutes", toI18nParams(params), "");
+    }
+    return chatMuteCountText("Mobile.Message.chatMuteRemainHours", hours);
+  }
+  if (minutes > 0) {
+    return chatMuteCountText("Mobile.Message.chatMuteRemainMinutes", minutes);
+  }
+  return chatMuteCountText("Mobile.Message.chatMuteRemainSeconds", seconds);
+}
+
+/**
+ * 输入坞上方那一行常驻提示的文案（被禁言时非空；否则空串 ⇒ 不渲染）。
+ *
+ * ★自己那一份在"恰好跨过到期点"的那一帧，剩余时间会算成空串 ——
+ *   必须给非空兜底：提示条常驻，"条在、字是空的"比"晚 1 秒撤掉"难看得多，
+ *   也更容易被当成渲染故障去查（PC 同款裁定）。
+ */
+export function chatMuteTipText(convId: string, now: number): string {
+  const kind = chatMuteKindOf(convId, now);
+  if (kind == CHAT_MUTE_ALL) {
+    return translateFn("Mobile.Message.chatMuteTipAll", emptyI18nParams(), "");
+  }
+  if (kind != CHAT_MUTE_SELF) {
+    return "";
+  }
+  const remain = chatMuteRemainText(chatMyMuteEnd.value - now);
+  if (remain.length == 0) {
+    return translateFn("Mobile.Message.chatMuteTipSelfShort", emptyI18nParams(), "");
+  }
+  const params = new Map<string, string | number>();
+  params.set("remain", remain);
+  return translateFn("Mobile.Message.chatMuteTipSelf", toI18nParams(params), "");
+}
+
+/**
+ * 发送被服务端拒绝时的兜底文案。
+ *
+ * ★输入框都禁用了为什么还要这条：前端判据是**上一次拉取**的快照，服务端读的是库里
+ *   那一刻的值，边界上必然有三种不一致（别处刚把我禁了 / 禁言刚到期的这一秒 /
+ *   群主刚开了全员禁言）。没有这条，用户拿到的是 {@code IM_30003} 这种机器话。
+ * ★只认**错误码**不认 message：文案是给日志与平台看的，改一次就全失效。
+ *
+ * @returns 非空 ⇒ 用它替换默认的「发送失败」；空串 ⇒ 不是禁言类错误，走默认处置
+ */
+export function chatMuteRejectText(code: string): string {
+  if (code == "IM_30002") {
+    return translateFn("Mobile.Message.chatMuteRejectSelf", emptyI18nParams(), "");
+  }
+  if (code == "IM_30003") {
+    return translateFn("Mobile.Message.chatMuteRejectAll", emptyI18nParams(), "");
+  }
+  return "";
+}

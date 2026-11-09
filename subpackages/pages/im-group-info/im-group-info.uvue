@@ -25,6 +25,16 @@
         <!-- 群概览：头像 + 群名 + 成员数 -->
         <view class="gi-card">
           <view class="gi-group-row">
+            <!-- #ifdef APP-HARMONY -->
+            <view class="gi-group-ava gi-group-ava--clip">
+              <im-buffered-avatar :source-key="groupAvatarRaw" :src="groupAvatar" :failed="avatarFailed" @avatar-error="handleAvatarError">
+                <view class="gi-group-ava" :style="{ backgroundImage: avatarGradient(groupName) }">
+                  <text class="gi-group-ava-letter">{{ avatarLetter(groupName) }}</text>
+                </view>
+              </im-buffered-avatar>
+            </view>
+            <!-- #endif -->
+            <!-- #ifndef APP-HARMONY -->
             <image
               v-if="groupAvatar.length > 0 && avatarFailed != true"
               class="gi-group-ava"
@@ -35,6 +45,7 @@
             <view v-else class="gi-group-ava" :style="{ backgroundImage: avatarGradient(groupName) }">
               <text class="gi-group-ava-letter">{{ avatarLetter(groupName) }}</text>
             </view>
+            <!-- #endif -->
             <view class="gi-group-col">
               <view class="gi-group-name-row">
                 <text class="gi-group-name text-ellipsis">{{ groupName }}</text>
@@ -191,6 +202,9 @@
 
   import { computed, nextTick, ref, type ComponentPublicInstance } from "vue";
   import { onLoad, onResize, onShow } from "@dcloudio/uni-app";
+  // #ifdef APP-HARMONY
+  import ImBufferedAvatar from "@/components/im-buffered-avatar/im-buffered-avatar.uvue";
+  // #endif
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import {
     apiImConvDetail,
@@ -341,7 +355,8 @@
   const groupAvatar = ref<string>("");
   /** 群头像原始地址（API 返回值）：静默刷新只与它比对——不拆开则展示地址≠原始地址
    * 恒成立，每次返回都「解析地址→原始地址→解析地址」往返换 src，icon 闪动。 */
-  let groupAvatarRaw = "";
+  const groupAvatarRaw = ref<string>("");
+  let groupAvatarResolveVersion = 0;
   const avatarFailed = ref<boolean>(false);
   const noticeText = ref<string>("");
   /** 群号（19 位数字；★团队详情共用本页但无群号 → 空，二维码入口据此隐藏）。 */
@@ -353,8 +368,6 @@
   const topFlag = ref<boolean>(false);
   /** 我在本群的昵称（详情 myNickName，null → ""：cell 灰显「未设置」）。 */
   const myNick = ref<string>("");
-  /** allowMemberInvite 三态原始值：""=键缺失(按默认放行) / "true" / "false"。 */
-  let allowInviteRaw = "";
 
   // ===== 成员 + 入群申请角标 =====
   const members = ref<GiMember[]>([]);
@@ -363,10 +376,17 @@
   /** 管理权限（群主+管理员）：公告编辑 / 入群申请入口。 */
   const canGovern = computed((): boolean => myRole.value >= 2);
   /**
-   * 添加成员入口：群主/管理员恒可；普通成员按 allowMemberInvite 开关
-   * （★与 PC 端同口径 `!== false`：键缺失视为允许，勿用 readBool 把缺失读成关）。
+   * 添加成员入口：**仅群主 / 管理员**（对齐 PC DEV-358，用户拍板原话
+   * 「我没有权限的时候不要展示添加图标」）。
+   *
+   * ★不再掺 `allowMemberInvite`（那是 DEV-257 的旧口径，PC 已明确推翻）：
+   *   该字段 DDL 默认 1、存量群几乎恒 true ⇒ 旧写法等于对**每个群成员**都显示，
+   *   普通成员于是看到一个自己点进去也只能转「申请」的入口。
+   * ★服务端没动：群策略允许时普通成员**仍然能通过接口邀请**，这里只是**看不见**入口
+   *   （可见性 ≠ 权限，判错的后果是少一个按钮，不是越权）。
+   * ★加人入口只此一处（PC DEV-394 已删掉成员面板里那份），别在别处再写第二个判据。
    */
-  const canAdd = computed((): boolean => canGovern.value || allowInviteRaw != "false");
+  const canAdd = computed((): boolean => canGovern.value);
 
   /** 头像条成员：格子数扣除添加圆（canAdd 时占 1 格），余下全给头像。 */
   const stripMembers = computed((): GiMember[] => {
@@ -519,10 +539,17 @@
     }
   }
 
+  /** 写入候选展示地址；鸿蒙由缓冲头像组件等 image.load 后再替换旧节点。 */
+  function setGroupAvatarSrc(url: string): void {
+    avatarFailed.value = false;
+    groupAvatar.value = url;
+  }
+
   /** /api/f/ 受保护群头像：带 Bearer 拉取换成可展示地址，失败回落字母渐变底。
    *  只在原始地址变化时被调用（loadAll 比对 groupAvatarRaw），静默刷新不重解析。 */
   function resolveAvatar(): void {
-    const url = groupAvatarRaw;
+    const version = ++groupAvatarResolveVersion;
+    const url = groupAvatarRaw.value;
     if (url.length == 0) {
       groupAvatar.value = "";
       return;
@@ -530,12 +557,28 @@
     // 光栅口径按 rpx 等价值传入：60px 盒 × 750/375 = 120（勿改成 60，会半分辨率发虚）
     resolveDisplayImageUrl(url, 120, 120)
       .then((resolved: string) => {
-        if (resolved != url && url == groupAvatarRaw) {
-          groupAvatar.value = resolved;
+        // 晚归守卫：期间又换了头像 ⇒ 丢弃这次结果
+        if (url != groupAvatarRaw.value || version != groupAvatarResolveVersion) {
+          return;
         }
+        // #ifdef APP-HARMONY
+        // 鸿蒙不直连受保护的原地址；候选图片加载成功后才替换旧头像。
+        setGroupAvatarSrc(resolved.length > 0 ? resolved : url);
+        // #endif
+        // #ifndef APP-HARMONY
+        if (resolved != url) {
+          setGroupAvatarSrc(resolved);
+        }
+        // #endif
       })
       .catch((_e: any | null) => {
-        // 失败保留原地址：交给 <image> 的 error 回落
+        // #ifdef APP-HARMONY
+        // 图片失败时缓冲组件保留旧头像；首次加载无旧图才回落字母底。
+        if (url == groupAvatarRaw.value && version == groupAvatarResolveVersion) {
+          setGroupAvatarSrc(url);
+        }
+        // #endif
+        // 其余端原地址已在 loadAll 里显示过，交 <image> 的 error 回落即可
       });
   }
 
@@ -571,10 +614,16 @@
         const avatar = readString(dataObj, "avatar");
         // 与原始地址比对（而非展示地址）：同 URL 静默刷新完全不碰头像，
         // 防返回本页时 src 往返闪动（见 groupAvatarRaw 声明处注释）
-        if (avatar != groupAvatarRaw) {
-          groupAvatarRaw = avatar;
+        if (avatar != groupAvatarRaw.value) {
+          groupAvatarRaw.value = avatar;
           avatarFailed.value = false;
-          groupAvatar.value = avatar;
+          // #ifdef APP-HARMONY
+          // 清候选地址以等待解析；已加载的旧图由组件内部保留。
+          groupAvatar.value = "";
+          // #endif
+          // #ifndef APP-HARMONY
+          setGroupAvatarSrc(avatar);
+          // #endif
           resolveAvatar();
         }
         noticeText.value = readString(dataObj, "notice");
@@ -584,8 +633,6 @@
         dndFlag.value = readBool(dataObj, "dnd");
         topFlag.value = readBool(dataObj, "topFlag");
         myNick.value = readString(dataObj, "myNickName");
-        const inviteRaw = dataObj["allowMemberInvite"];
-        allowInviteRaw = inviteRaw == null ? "" : `${inviteRaw}`;
       }
       // 成员条只展示屏宽内格子（stripMembers 按 stripSlots 切片，~10-20 个），
       // 首页 100 条绰绰有余——不做全量翻页（全量只在群成员页做，省串行请求；
@@ -959,6 +1006,10 @@
     flex-direction: row;
     align-items: center;
     justify-content: center;
+  }
+
+  .gi-group-ava--clip {
+    overflow: hidden;
   }
 
   .gi-group-ava-letter {

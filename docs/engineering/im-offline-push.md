@@ -166,7 +166,61 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
 
 `applied` 回显实际下发的值（裁剪后的标题/正文长度、载荷长度、角标、分类），排查"文案被截断/角标没生效"时先看它。
 
-### 3.3 失败处理
+### 3.3 桌面图标角标（离线链路）
+
+**口径**：`badge` 必须是**绝对值**（= 该用户当前 IM 未读总数，与 `/api/instant-message/unread-total` 的 `total` 同源），
+不要传 `+1`。厂商侧的 `set_num` 只接受固定值，增量在离线通道里无法表达；云函数遇到 `+1`/`-1` 会跳过厂商角标。
+
+**为什么必须由服务端下发**：App 退后台（进程冻结）或进程被杀时，端上一行 JS/UTS 都不会执行。
+`uni.setAppBadgeNumber()` 只覆盖"App 正在运行"的场景，**不能**作为离线角标方案。
+有厂商推送通道的设备，正确路径是 `Push System → Launcher` 直接写角标，全程不经过 App 进程。
+
+**uni-push 侧的落地方式**（官方来源：HBuilderX 内置 `uni-cloud-push/api.md`、`options.md`）：
+
+| uni-push 参数 | 映射到个推 | 覆盖端 |
+|---|---|---|
+| `badge` | 顶层 badge 逻辑 | iOS（APNs `aps.badge`）、鸿蒙 |
+| `options.android.<通道key>` | `push_channel.android.ups.options` | Android 各厂商通道 |
+
+官方 `api.md` 对 `badge` 的平台特性标注为 `ios、android-huawei、harmony-huawei`
+**（注意：基于 uni-app-x 的应用在华为手机上暂不支持）**，所以华为改走 `options` 直通华为原生字段：
+
+```js
+options: {
+  android: {
+    HW: {
+      '/message/android/notification/badge/class': 'io.dcloud.uniapp.UniAppActivity',
+      '/message/android/notification/badge/set_num': 5
+    }
+  }
+}
+```
+
+- `options.android` 按通道 key 分组，个推只取当前设备所属通道那份，其余忽略
+  ⇒ **一次可同时带多个厂商，服务端不需要知道设备品牌**（后端 `UserDevice` 也没有 brand 字段）。
+- `class` 必填且必须是 launcher activity，写错时整条角标静默不生效（不报错）。
+  本包实证值：`io.dcloud.uniapp.UniAppActivity`（`aapt2 dump badging <apk>` 解析）。
+- 华为 `set_num` 取值 0~99，`0` = 清除；与 `add_num` 同时存在时以 `set_num` 为准。
+
+**厂商能力（2026-11）**：
+
+| 厂商 | 数字角标 | 说明 |
+|---|---|---|
+| 华为 | ✅ | `badge.{class,set_num}`；未上架华为应用市场的包可能不显示 |
+| 荣耀 | ⏳ | `badge.{badgeClass,setNum}`（Magic UI 4.0+），通道 key 与字段未在本项目真机验证，云函数里 `enabled:false` 留位 |
+| 小米 | ❌ | MIUI 角标 = 通知栏条数，系统自动增减，无 API 指定数字 |
+| OPPO | ❌ | 仅红点 |
+| vivo | ⚠️ | 红点/数字取决于系统开关与 `BADGE_ICON` 权限，无法稳定指定 |
+| iOS / 鸿蒙 | ✅ | 走顶层 `badge` |
+
+代码位置：[push-send/index.js](../../uniCloud-alipay/cloudfunctions/push-send/index.js) 的
+`VENDOR_BADGE_ADAPTERS` / `buildVendorBadgeOptions`（业务层只传 unreadCount，厂商字段差异封装在 adapter 里）。
+响应 `data.applied.vendorBadge` 回显本次实际下发的厂商角标参数。
+
+> ⚠️ 云函数 `options` 参数受 `uni-push-cloud` 扩展库影响：HBuilderX 4.31 存在参数丢失，
+> 且**只能连云端云函数**才生效（本地云函数调试会丢 options）。本机 HBuilderX 5.34 无此问题。
+
+### 3.4 失败处理
 
 - 推送失败**绝不能阻塞消息主链路**（消息落库/WS 投递是主，离线推送是旁路）
 - `errCode=401`：密钥不一致，属于部署问题，记录错误即可，不要重试轰击
@@ -184,7 +238,8 @@ X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
 | 通知渠道路由（`setPushChannel`） | ⬜ 未做，厂商"自分类权益"开启后需补 |
 | 前后台连接策略 | ✅ **`App.onHide` 一律断开 WS**（退后台 / 主动锁屏 / 自动锁屏，真机已验触发）：后端只认 `im:route` 判在线，连接留着就永远走 `skippedOnline`。回前台 `onShow` 强制重连 → `CONNECT_ACK`（重发设备注册 + 触发 HTTP `/sync` 补拉）→ 聊天页 `silentSyncLatest()` 与全局 `/sync` 双路把断连窗口的消息补齐，所以断连**不会丢消息**，只会把「后台期间的实时」换成「推送 + 回前台补拉」 |
 | 华为/荣耀机型的系统代弹 | ⚠️ **App 无法控制**：EMUI/HarmonyOS 自建通知权限管理（`PermissionPolicyService`），在**每次冷启动**且该应用通知未授权时由 `system_server` 主动拉起 `REQUEST_PERMISSIONS_FOR_OTHER`，与我们的 `requestImNotifyPermission()` 无关（实测 API 31 机器上我们的代码第一行 `SDK_INT < 33` 就 return 了，日志里根本没有"发起申请"）。用户点一次「允许」后不再弹 |
-| 桌面图标角标 | ✅ **端上不需要做**：由 `uniPush.sendMessage({badge})` 下发给厂商通道直接设置。uni-app x 没有 `uni.setBadgeNumber`，App 回前台也不会去清角标 —— 如需"点开后清零"，得后端在下一次推送时传新值，或后续接原生插件 |
+| 桌面图标角标（App 在前台/存活） | ✅ 端上 `uni.setAppBadgeNumber(n)`（uni-push 模块 API，HBuilderX 4.25+，三端可用）。唯一入口 [utils/appIconBadge.uts](../../utils/appIconBadge.uts)，跟随 `refreshImUnreadBadge()` 的 total —— 打开 App、未读数变化、已读上报后重拉、全部已读清零都会落地。机型/系统开关限制见该文件顶部清单 |
+| 桌面图标角标（App 后台/进程被杀） | ✅ 服务端 `push-send` 云函数把 `unreadCount` 翻译成厂商 Payload（**端上一行代码都不执行**，见 §3.3）。华为走 `options.android.HW` 的 Push Kit 原生 `badge.{class,set_num}`；iOS/鸿蒙走顶层 `badge`；小米/OPPO/vivo 无数字角标 API |
 
 ## 5. 安全
 

@@ -8,6 +8,7 @@
 |---|---|
 | [local-custom-base-maintenance.md](engineering/local-custom-base-maintenance.md) | 本地离线自定义基座维护规范 |
 | [custom-base-distribution-s3.md](engineering/custom-base-distribution-s3.md) | 自定义基座 S3 分发（拉取/发布） |
+| [android-apk-distribution-s3.md](engineering/android-apk-distribution-s3.md) | 正式 APK 上传 S3：首次配置、本地文件/下载链接、latest.json 与故障处理 |
 | [offline-sdk-distribution-s3.md](engineering/offline-sdk-distribution-s3.md) | 离线 SDK S3 分发 |
 | [esp-provisioning-local-base.md](engineering/esp-provisioning-local-base.md) | 桌搭 BLE 配网本地基座总览 |
 | [android-esp-provisioning-local-base.md](engineering/android-esp-provisioning-local-base.md) | Android 端配网本地基座 |

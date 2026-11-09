@@ -28,6 +28,21 @@
 - 最终后台复测仍**未通过**：17:47:13 Android 退到桌面；17:48:11 同一进程出现系统 Greeze 解冻记录及 `control socket failed`；17:48:53 iPhone 点击拨号，17:48:56 后端落库第四条真实邀请。桌面无系统来电提示，通知/服务回读均没有 9090 来电通知或 `VoipCallService`。17:50:39 将 Android 打开后，控制连接才重新打开并鉴权。此证据说明后台控制链路存在执行/连接缺口，不将其直接归因为唯一的冻结、权限或后端问题；需完成正式原生唤醒/推送链路后再验。
 - 专项测试仍为 56 项通过；本轮证据保存在忽略目录 `out/voip-real-business-20261109/`，iPhone 日志为 `out/voip-im-iphone-hx-local.log`。
 
+## 2026-11-09 UniPush 原生接收排查
+
+- 后端只读刷新到 `nuwax-im/feat-video-meeting@c626558ead9c427c713335dd38426f81151b7406`，确认 `UniPushChannel` 仍发送 `force_notification=true`。5.34 的普通 UniPush 接收器会直接生成通知，原有 UTS receive 分流不足以触发原生来电。详细协议核对文档的其余接口仍以原记录版本为准，本轮没有修改后端。
+- 来电接收器、最小载荷解析均归属 `uni_modules/nuwax-voip`；生成脚本在完整 App 原生模块注册唯一 SDK 接收器子类，普通推送和 CID 回调沿用父类。载荷只接受有效 convId/msgId，不信任推送凭据；会话、消息参与方、时效、重复与终态仍由既有原生流程检查。关闭适配后恢复 SDK 接收器。
+- `pnpm voip:test`：10 个文件、57 项通过；`pnpm voip:android:push:check` 在真实 Kotlin/JSONObject 中运行 5 项载荷测试，0 失败。验证强制通知包装、字符串包装、int64、拒绝浮点舍入值、载荷界限和普通消息回退。未因本轮修改重跑全量测试，不将前批全量数据当作本批结果。
+- HBuilderX 5.34 完整 Android/iOS App 资源导出通过；Android 本地完整基座 `out/voip-business-packages/android_debug-20261109-181005.apk` 构建成功，manifest 有 `VoipUniPushIntentService`、`VoipCallService`，无 SDK 旧接收器重复声明、专用测试监听或 deviceTest 标记。18:18 由 HBuilderX 覆盖安装，未卸载/清数据。HX 调试资源同步缺少的 8002 reverse 端口补齐后，18:20:51 App 启动并完成真实业务控制鉴权，未重启 ADB、未修改主 checkout、未上传基座。
+- 实机持久化的 Getui 接收器为新原生类，SDK CID 与 UTS 已登记 CID 一致；当前本地配置有 Getui AppID，未配置 Xiaomi 适配。不能由“已取得 CID”或“服务端返回成功”推导厂商推送到达。
+- 18:21:55 Android 退到桌面，18:22:55 控制连接失败。18:23:33 iPhone 真实单聊邀请落库，但 Android 未显示系统来电。18:25:13 打开 Android 后，18:25:14 首次出现 `push received: transmission, call=true`、`native push routed to call` 及邀请校验；此时超过 60 秒，未注册过期来电。证明原生分流已生效，**此轮后台实时送达仍未通过**。
+- 系统 UI 观察到女娲 App 自启动关闭，省电策略为智能限制后台运行。经用户明确同意，仅本 App 调整为“无限制”并开启自启动；18:33 UI 回读两项状态。18:34:07 再退到桌面，至 18:36 控制连接未再记录失败。该对照是系统策略条件下的连接观察，不作为推送唤醒通过。
+- 自有设备的后端 push-test 返回 `pushed=true / pushHttpStatus=200`，包括调整策略后的请求；当次后台尚未观察到新的原生到达日志，因此只登记为发送端成功。
+- **调整策略后的桌面后台来电与接听通过（有条件）**：18:34:07 起 Android 停在桌面，18:41:31 iPhone 真实业务邀请落库；callId `bfe60dff-a390-4a84-b229-caaa6962bd74`，msgId `245498029635796992`。18:41:32 控制连接收到邀请并校验，18:41:33 Telecom 注册；镜像直接观察到桌面上的 `ldd 来电`、接听/拒接系统通知。18:41:34 原生 UniPush transmission 也到达、识别为 VoIP 并交给同一流程，未重复响铃。在线控制先到，因此不能单凭此轮证明推送独立唤醒。
+- 点击系统通知“接听”，原生页面显示 ldd 和计时（观察到 00:11），媒体连接成立。18:42:12 对端媒体断开；同期 HX 正同步/重载 iPhone 资源，不登记为人工主动挂断通过。Android 回到完整消息页，系统读取确认 9090 通话通知和 `VoipCallService` 不存在，原生日志确认 AudioRecord stop/destroy。真人双向听感、锁屏/回收后唤醒、主动挂断完整回归仍须补验。
+- 18:39 的点击曾显示暂时无法发起通话，没有新邀请；18:41 重试才实际发出。该瞬态未确定根因，不把未拨出的点击计作 Android 来电失败，也未为此改动 iOS 业务逻辑。iOS 本轮 HX 完整编译和资源同步成功；无原生 iOS 修改、未重打 iOS 基座。
+- 忽略目录 `out/voip-unipush-20261109/` 保存资源导出、基座、原生日志和测试结果；其中设备缓存及接口响应按私有证据处理，不提交。基座未上传，生产闸门未开启。
+
 ## 已取得的证据
 
 | 项目 | 结果与实际范围 |
@@ -82,7 +97,7 @@ NW-367 推送前置仅作为用户提供的关联线索，未独立核实工单�
 ## 仍需交付方配合的条件
 
 - 正式后端按 [契约](voip-client-contract.md) 实现，补齐推送、原子抢接、房间授权、媒体事件核验和失联回收。开发服务不提供正式账号、持久化或生产可靠性保证。
-- Android 分发基座的国内厂商/FCM 接收器接到 `VoipBridge.incoming()`。当前提供原生 hook 与普通 app-push 适配，**具体供应商冷启动回调尚未绑定/验收**。
+- Android 完整本地基座已将现有 Getui/UniPush 原生接收器接入 VoIP，普通消息保持 SDK 行为。国内厂商/FCM 的配置、服务端下发方式与系统回收后冷启动仍须分别核验；当前 Getui 在线接收回调不能代替厂商冷启动验收。
 - iOS/Harmony 证书、PushKit/HMS 环境、VoIP 权益和真实 token。使用正确 5.34 SDK 出隔离自定义基座，再验证安装包中的插件、权限、SPM 依赖和 native hooks。
 - 确认可访问的 LiveKit 信令/TURN 地址。正式环境使用 HTTPS/WSS；不把开发 HTTP/ATS 例外带进生产。
 - 发布前同步正式隐私政策/SDK 目录，说明用户主动通话中的音视频与后台麦克风用途。代码已更新权限用途描述并保留同意、登录与生产功能闸门。

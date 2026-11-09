@@ -3,11 +3,15 @@
 import json
 import os
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ANDROID = "{http://schemas.android.com/apk/res/android}"
 TOOLS = "{http://schemas.android.com/tools}"
+STOCK_RECEIVER = "uts.sdk.modules.DCloudUniPush.UniPushIntentService"
+CALL_RECEIVER = "com.nuwax.voip.VoipUniPushIntentService"
+CALL_RECEIVER_FILE = "app/src/main/java/com/nuwax/voip/VoipUniPushIntentService.kt"
 ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
 ET.register_namespace("tools", "http://schemas.android.com/tools")
 
@@ -23,12 +27,20 @@ def clear_previous_configuration(project: Path) -> None:
     application = tree.getroot().find("application")
     if application is None:
         raise SystemExit("Android application manifest element is missing")
-    owned = any(node.get(ANDROID + "name") == "nuwax.voip.uniPush" for node in application.findall("meta-data"))
+    owned = any(node.get(ANDROID + "name") == "nuwax.voip.uniPush" for node in application.findall("meta-data")) or any(
+        node.get(ANDROID + "name") == CALL_RECEIVER for node in application.findall("service")
+    )
     if owned:
         names = {"GETUI_APPID", "PUSH_APPID", "GETUI_APP_ID", "MIPUSH_APPID", "MIPUSH_APPKEY", "dcloud_unipush_auto_notification", "nuwax.voip.uniPush"}
         for node in list(application.findall("meta-data")):
             if node.get(ANDROID + "name") in names:
                 application.remove(node)
+        for node in list(application.findall("service")):
+            if node.get(ANDROID + "name") == CALL_RECEIVER or (
+                node.get(ANDROID + "name") == STOCK_RECEIVER and node.get(TOOLS + "node") == "remove"
+            ):
+                application.remove(node)
+        (project / CALL_RECEIVER_FILE).unlink(missing_ok=True)
         tree.write(manifest, encoding="utf-8", xml_declaration=True)
 
 
@@ -102,6 +114,15 @@ def configure(project: Path, config_file: Path | None) -> None:
             node = ET.SubElement(application, "meta-data", {ANDROID + "name": name})
         node.set(ANDROID + "value", value)
         node.set(TOOLS + "replace", "android:value")
+    # Getui 3.x discovers the one GTIntentService declared in the merged manifest.
+    # Its subclass keeps UniPush behavior and can receive before UTS/JS is resumed.
+    if (project / "uts-nuwax-voip").is_dir():
+        source = Path(__file__).resolve().parents[3] / "uni_modules/nuwax-voip/native/android-unipush/VoipUniPushIntentService.kt"
+        target = project / CALL_RECEIVER_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        ET.SubElement(application, "service", {ANDROID + "name": STOCK_RECEIVER, TOOLS + "node": "remove"})
+        ET.SubElement(application, "service", {ANDROID + "name": CALL_RECEIVER, ANDROID + "exported": "false"})
     tree.write(manifest, encoding="utf-8", xml_declaration=True)
     print("✓ uni-push client configured; Xiaomi adapter " + ("enabled" if xiaomi else "not configured"))
 

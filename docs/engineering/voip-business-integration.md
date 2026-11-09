@@ -16,7 +16,7 @@
 | 业务与开发协议选择 | `servers/voip.uts` 的 `protocol=im-voip-v1/calls-v1`；开发服务和平台凭据保持隔离 |
 | 单呼叫、页面、音频互斥 | `features/voip`；聊天页仅传 convId，页面不持有媒体或连接 |
 | 后台控制、媒体、系统通话 | `uni_modules/nuwax-voip/utssdk/app-*` 原生单例；真实业务使用 IM WS，开发工具保留原 SSE |
-| 普通 UniPush 邀请 | 既有 push 分发器只识别 `{type:"voip",convId,msgId}` 并交给功能；原生查询消息详情校验会话、时效及主体 |
+| UniPush 原生邀请 | 完整 Android 基座中的接收器先识别 `{type:"voip",convId,msgId}` 并交给原生桥；查询消息详情校验会话、时效及主体。普通消息与 CID 回调沿用 SDK，UTS 分发器保留前台兼容 |
 
 主叫生成 callId/roomName → 创建 RTC 房间 → 原生获取本账号 RTC token → 连接并发布媒体 → 发送 `msgType=voip` 消息并保存 msgId。被叫接收邀请时不采集；点击接听并获得权限后入房，成功连接后调用 `/calls/answered`。主叫取消/超时调用 `/calls/ended`，被叫拒接调用 `/calls/declined`。通话中离房通过 LiveKit 对端离开事件结束另一端。
 
@@ -56,6 +56,14 @@ ln -s nuwax-mobile ../hx-mobile-voip
 
 iOS 完整宿主包含完整业务资源、所有导出 UTS 模块、模块声明的本地 framework、ESPProvision 3.1.0/SwiftProtobuf 1.22.1、LiveKit 2.19.0 及 HBuilderX DebugServe；最低系统 15.0。它与专用测试宿主使用不同的生成目录；不注入 deviceTest 标记或测试启动页。Android 完整宿主启用 HX debug server，移除专用测试监听服务声明，保留正常 UniPush 依赖。
 
+### Android UniPush 原生接收
+
+后端 `nuwax-im/feat-video-meeting@c626558e` 的 `UniPushChannel` 使用 `force_notification=true`。5.34 SDK 会将其转换为普通通知，不向 UTS 产生原来的 receive 内容回调。仅靠 `imPushClient.uts` 分发 VoIP 会漏掉原生来电处理。
+
+新增接收器归属 `uni_modules/nuwax-voip/native/android-unipush`，本地基座脚本在已启用 UniPush 的完整 App 中复制并注册，继承 SDK 接收器以保留普通消息/CID 行为。来电先在原生层分类，再读取加密会话、校验消息参与方与时效；登出或没有有效会话时不启动呼叫。载荷只保留两个 int64 定位字符串，不接受推送中的 URL 或凭据。不改聊天页、不启动常驻测试监听服务。
+
+接收器生成与移除均可重复执行。原生源码变化需重新导出资源、构建本地完整基座，再通过 HX 运行；业务热更新不能替代此步骤。配置、锁定版本、单元测试和 SDK 官方依据见[原生适配说明](../../uni_modules/nuwax-voip/native/android-unipush/README.md)。供应商通道与系统执行条件仍需真机验证，原生回调不等同于厂商冷启动已通过。
+
 ### HBuilderX 5.34 的 iOS 原生复用
 
 本机 HBuilderX 动态 SPM 编译遇到 Xcode 索引目录参数错误；完整原生工程的同一 Swift 源码可正常构建。需要原生调试包装信息时，先让 HX 生成开发 Swift，再以 `NUWAX_IOS_HX_DEV_NATIVE=1` 执行 `package-business-ios.sh`，使用同一批生成代码构建完整宿主。`register-business-ios-cache.mjs` 核对 HX 版本、LiveKit 锁定版本、原生源文件、生成 Swift、构建时序及宿主签名后，登记实际已构建的原生缓存，并将成功的 HX 原生补丁整合、签名进宿主；校验失败会中止。`--verify-only` 只验证，不登记或打包。
@@ -84,13 +92,23 @@ node scripts/voip-native/register-business-ios-cache.mjs
 
 17:48 使用更新后的本地基座再次验证超过一分钟的桌面后台呼入，仍未通过：后台控制连接断开，真实邀请落库后无系统来电；返回前台后控制连接才恢复鉴权。完整时间线见[验收记录](voip-acceptance.md#2026-11-09-真实业务双账号复测)。正式原生唤醒/推送与后台来电继续作为待验项，不使用专用测试监听服务替代。
 
+### 原生 UniPush 修正后的后台结果
+
+18:18 经 HX 安装包含原生接收器的新完整基座。18:23 后台呼入仍未显示，18:25 返回前台才收到原生推送，且邀请已过期。此轮保留为失败证据。
+
+经用户同意，将 Redmi 上本 App 的省电策略设为“无限制”并开启自启动。18:34:07 退到桌面，18:41:32 收到真实 iPhone 单聊邀请，18:41:33 注册 Telecom，桌面显示 `ldd 来电` 及接听/拒接按钮；18:41:34 UniPush 原生回调也收到同一邀请并去重。点击系统通知接听后，原生通话页出现计时，媒体连接成立。此轮证明**当前系统策略、进程存活条件下的桌面后台来电及接听**，在线控制先到，不将其当作推送单独唤醒或系统回收后冷启动证明。
+
+18:42:12 对端媒体断开并释放；同期 HX 正在同步/重载 iPhone 开发资源，此轮不计作人工主动挂断验收。Android 回到完整消息页，9090 通话通知及 `VoipCallService` 已消失，AudioRecord 已 stop/destroy。未进行真人听感、视频、锁屏长测或冷启动验收。
+
+原生修正与设备策略都保留在验收条件中；不能据一台调试设备的通过认定所有设备默认设置均可唤醒。当前本地配置未包含 Xiaomi 适配，正式厂商通道仍须补齐并实测。
+
 ## 验证与后端待补项
 
-专项测试 56 项通过；全量 804 通过、37 项既有失败，失败名称相对合并基线没有新增。Android 全 App 编译、Swift 6 原生桥及鸿蒙未签名 HAP 构建分别留在 `out/voip-im-*.log`。构建、签名、安装和互拨的证据分开登记到[验收记录](voip-acceptance.md)。
+本轮专项测试 57 项及真实 Kotlin 载荷测试 5 项通过。前批全量为 804 通过、37 项既有失败，失败名称相对合并基线没有新增；本轮未重跑全量。Android 全 App 编译、Swift 6 原生桥及鸿蒙未签名 HAP 构建分别留在 `out/voip-im-*.log`。构建、签名、安装和互拨的证据分开登记到[验收记录](voip-acceptance.md)。
 
 以下仍是正式验收前置，不能以当前客户端适配替代：
 
-- 测试环境实际服务版本仍需后端确认；当前已有建房、主叫入房、邀请发送和 Android 前台来电证据，双向语音/视频及后台来电仍待验收。
+- 测试环境实际服务版本仍需后端确认；当前已有建房、邀请发送、Android 前台及上述条件下后台来电和接听证据；双向听感/视频、默认系统策略、锁屏和系统回收后唤醒仍待验收。
 - 服务端持久化终态、断线补偿、账号忙线及原子抢接。当前 answered 事件不含获胜 deviceId，两个设备同时接听无法由客户端可靠裁决。
 - 电话房间绑定主被叫/获胜设备并收紧 token 授权；当前同租户房间授权及 platform 级 identity 尚不满足该目标。
 - 普通设备刷新不能清空 voipToken；PushKit token 的环境和精确撤销；鸿蒙原生 Push Token 的独立契约。

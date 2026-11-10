@@ -1934,7 +1934,7 @@
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { IM_CHAT_INPUT_METHOD } from "@/constants/common.constants";
   import { apiTenantConfig, apiUserInfo } from "@/servers/account";
-  import { cacheDefaultAgentName, readAgentInputGuidePrompts, readCachedTenantConfig } from "@/utils/tenantAgentConfig";
+  import { cacheDefaultAgentName, readCachedTenantConfig, readDefaultAgentPrompts, readDefaultAgentPromptsByAgentId } from "@/utils/tenantAgentConfig";
   import { AudioFile, AudioUploader } from "@/servers/audioUploader";
   import {
     apiImContacts,
@@ -2434,14 +2434,10 @@
   const peerAvatar = ref<string>("");
   /** 单聊对端 userId（convDetail.peerUserId 回填，int64 存字符串）：识别智能体单聊用。 */
   const peerUserIdFromDetail = ref<string>("");
-  /** 智能体会话详情可能同时返回 agentId；优先使用该字段，避免 peerUserId 是 IM 映射用户 ID。 */
+  /** 智能体会话详情可能同时返回 agentId（平台原生 id，仅用于名称缓存）。 */
   const agentIdFromDetail = ref<number>(0);
-  /** 入口自带的平台原生 agentId（下拉直达入口带；列表行入口没有）。仅作提示语兜底键，
-   *  每次 onLoad 无条件重写，不跨页残留。 */
-  let entryGuideAgentId = 0;
-  /** 入口自带的 IM 对端 id（列表行/下拉直达入口都带）：**租户配置 agentInputGuidePrompts
-   *  的行键就是它**，提示语首帧按它取才命得中；平台原生 agentId 与 IM 身份不是一回事，
-   *  拿它去查必空（下拉入口曾只带 agentId，占位文案因此不轮播）。 */
+  /** 入口自带的 IM 对端 id（列表行/下拉直达入口都带）：**租户配置 defaultIMAgentConfig
+   *  的 userId 就是它**，提示语首帧按它取才命得中；每次 onLoad 无条件重写，不跨页残留。 */
   let entryGuidePeerId = 0;
   /** 会话资料库空间 id（convDetail.spaceId 回填，int64 存字符串；空/0=还没有空间，
    *  点开资料库时再走 ensureSpace 懒建）。 */
@@ -2606,6 +2602,10 @@
   /** 远端提示语按「候选 id 列表」去重：进页（onLoad，入口 id）与详情回包（详情 id）都会
    *  触发刷新，同一组候选只打一次；候选集合变了（如详情补上对端 id）才重拉。 */
   let agentGuideRemoteKey = "";
+  /** 会话内智能体发送方 id 兜底：messages 接口 records 里 `senderType==2` 的 `senderId`
+   *  ——推送/深链等入口没有 peerUserId 时，靠它去 defaultIMAgentConfig 里匹配 userId。
+   *  非响应式（只在解析消息时写一次，消息装载函数前后对比后决定是否重算提示语）。 */
+  let agentSenderUserId = 0;
 
   function pickNextAgentGuidePrompt(currentIndex: number, promptCount: number): number {
     if (promptCount <= 1) return 0;
@@ -2663,15 +2663,15 @@
     ids.push(id);
   }
 
-  /** 提示语配置的候选 id（按可信度排序）：★agentInputGuidePrompts 的行键是 **IM 对端 id**
-   *  ——列表行入口只带 peerId，命中；下拉直达入口带的是**平台原生 agentId**，按它查必空。
-   *  所以对端 id 排前面、平台 agentId 只作兜底（旧租户/旧缓存可能按平台 id 配过）。 */
-  function agentGuideCandidateIds(): number[] {
+  /** 提示语配置的候选 **IM 用户 id**（按可信度排序）：★defaultIMAgentConfig 的行键是
+   *  `userId`（IM 身份 id，与会话 peerUserId / 消息 senderId 同一值域）。
+   *  详情对端 id 最权威，入口 peerId 供首帧，消息里 senderType==2 的 senderId 兜底
+   *  （推送/深链入口前面两个都没有）。 */
+  function agentGuideCandidateUserIds(): number[] {
     const ids: number[] = [];
     pushGuideCandidateId(ids, parseInt(peerUserIdFromDetail.value, 10));
     pushGuideCandidateId(ids, entryGuidePeerId);
-    pushGuideCandidateId(ids, agentIdFromDetail.value);
-    pushGuideCandidateId(ids, entryGuideAgentId);
+    pushGuideCandidateId(ids, agentSenderUserId);
     return ids;
   }
 
@@ -2685,16 +2685,16 @@
   }
 
   /** 按候选 id 顺序取第一组非空提示语（不同 id 的提示语是不同配置行，不合并）。 */
-  function readGuidePromptsForCandidates(config: UTSJSONObject | null, ids: number[]): string[] {
+  function readGuidePromptsForUserIds(config: UTSJSONObject | null, ids: number[]): string[] {
     for (let i = 0; i < ids.length; i++) {
-      const prompts = readAgentInputGuidePrompts(config, ids[i]);
+      const prompts = readDefaultAgentPrompts(config, ids[i]);
       if (prompts.length > 0) return prompts;
     }
     return [];
   }
 
   function setAgentGuidePrompts(config: UTSJSONObject | null): void {
-    const prompts = readGuidePromptsForCandidates(config, agentGuideCandidateIds());
+    const prompts = readGuidePromptsForUserIds(config, agentGuideCandidateUserIds());
     if (prompts.length == 0) {
       // ★取不到不清空：调用方可能拿着「详情回的 IM 对端 id / 过期缓存」来问，把已经算好的
       //   首帧提示语清掉会让 placeholder 退回通用文案（进页后跳一下、且不再轮播）。
@@ -2732,25 +2732,30 @@
     }
   }
 
-  /** 入口候选 id（onLoad 首帧用；会话详情还没回来）：对端 id 优先，平台 agentId 兜底。 */
-  function entryGuideCandidateIds(): number[] {
+  /** 入口候选 IM 用户 id（onLoad 首帧用；会话详情还没回来）：只有入口 peerId。 */
+  function entryGuideCandidateUserIds(): number[] {
     const ids: number[] = [];
     pushGuideCandidateId(ids, entryGuidePeerId);
-    pushGuideCandidateId(ids, entryGuideAgentId);
     return ids;
   }
 
-  /** 首帧占位提示（onLoad 内、首次渲染之前调）：入口已带对端 id / agentId 时用租户配置
+  /** 首帧占位提示（onLoad 内、首次渲染之前调）：入口已带对端 id 时用租户配置
    *  缓存同步定值，进页第一帧就是最终文案——否则先渲染通用「发送消息…」、等会话详情
-   *  回包再切换，placeholder 会在页面上跳一下。取不到缓存时退回入口文案（若带）。 */
-  function seedAgentGuidePrompts(entryPrompt: string): void {
-    const prompts = readGuidePromptsForCandidates(readCachedTenantConfig(), entryGuideCandidateIds());
+   *  回包再切换，placeholder 会在页面上跳一下。取不到缓存时退回入口文案（若带）。
+   *  返回是否命中了配置行（onLoad 据此决定要不要对齐远端配置）。 */
+  function seedAgentGuidePrompts(entryPrompt: string): boolean {
+    const config = readCachedTenantConfig();
+    let prompts: string[] = readGuidePromptsForUserIds(config, entryGuideCandidateUserIds());
+    // 下拉直达入口兜底：建会话回包没带 peerUserId 时，用入口平台 agentId 找同一行配置
+    if (prompts.length == 0 && agentIdFromDetail.value > 0) {
+      prompts = readDefaultAgentPromptsByAgentId(config, agentIdFromDetail.value);
+    }
     if (prompts.length == 0) {
       if (entryPrompt.length > 0) {
         agentGuidePrompts.value = [entryPrompt];
         agentGuidePromptIndex.value = 0;
       }
-      return;
+      return false;
     }
     let index = prompts.length > 1 ? Math.floor(Math.random() * prompts.length) : 0;
     if (entryPrompt.length > 0) {
@@ -2765,6 +2770,7 @@
     agentGuidePromptIndex.value = index;
     // 首帧素材就位即开始轮播（不必等 onShow / 详情回包）：多条提示时随机跳，单条不动
     startAgentGuidePromptRotation();
+    return true;
   }
 
   async function loadAgentGuidePromptsForChat(): Promise<void> {
@@ -2772,8 +2778,9 @@
       clearAgentGuidePrompts();
       return;
     }
-    // 候选 id：详情对端 id / 入口对端 id（配置的真实行键）+ 平台 agentId 兜底
-    const key = agentGuideIdsText(agentGuideCandidateIds());
+    // 候选 IM 用户 id：详情对端 id / 入口对端 id / 消息 senderType==2 的 senderId
+    //（配置 defaultIMAgentConfig 的真实行键 userId）
+    const key = agentGuideIdsText(agentGuideCandidateUserIds());
     // 一个 id 都还没有（详情未回、入口也没带）：保留首帧提示，等详情回包再来
     if (key.length == 0) return;
     setAgentGuidePrompts(readCachedTenantConfig());
@@ -4820,6 +4827,15 @@
     row.seq = readNumber(obj, "seq", 0);
     row.senderId = readString(obj, "senderId");
     row.senderType = readNumber(obj, "senderType", 1);
+    // 智能体发送方 id 兜底：messages records 里 senderType==2 的 senderId 就是该智能体
+    // 在 IM 的用户 id，与租户配置 defaultIMAgentConfig.userId 同值域。推送/深链等没有
+    // peerUserId 的入口靠它匹配输入框提示语（只记第一个，之后由调用方消费）。
+    if (agentSenderUserId <= 0 && row.senderType == 2 && row.senderId.length > 0) {
+      const agentUid = parseInt(row.senderId, 10);
+      if (!isNaN(agentUid) && agentUid > 0) {
+        agentSenderUserId = agentUid;
+      }
+    }
     row.senderName = readString(obj, "senderName");
     row.senderAvatar = readString(obj, "senderAvatar");
     row.msgType = readString(obj, "msgType");
@@ -6227,6 +6243,13 @@
               cacheDefaultAgentName(agentForName, readString(dataObj, "peerName"));
             }
             loadAgentGuidePromptsForChat();
+          } else if (convType.value == 1) {
+            // 主体类型未知的入口：配置里按 IM 用户 id（peerUserId / senderId）命中即视为
+            // 智能体会话，重算一次提示语（只查本地缓存，不额外打接口）。
+            const peerUid = parseInt(peerUserIdFromDetail.value, 10);
+            if (agentSenderUserId > 0 || readDefaultAgentPrompts(readCachedTenantConfig(), peerUid).length > 0) {
+              loadAgentGuidePromptsForChat();
+            }
           }
           // 标题兜底（推送点击入口没带 name）：用会话详情回填，否则顶部一直显示「会话」。
           // 群聊=群名 name；单聊=我方备注 > 对端昵称 peerName（详情 name 对单聊为空）。
@@ -8444,6 +8467,7 @@
   /** 合并服务端快照：批内去重、按版本更新，保留已解析的未变消息。 */
   function mergeSyncedMessages(records: UTSJSONObject[]): boolean {
     if (!isChatCurrent()) return false;
+    const agentUidBefore = agentSenderUserId;
     const rows = messages.value.slice();
     const indices = new Map<string, number>();
     const clientIndices = new Map<string, number>();
@@ -8491,6 +8515,8 @@
       }
       changed.add(msgId);
     }
+    // 本批消息里新学到智能体发送方 id：提示语候选变了，重算一次（内部有去重）
+    if (agentSenderUserId != agentUidBefore) loadAgentGuidePromptsForChat();
     if (changed.size == 0) return false;
     // 本地未确认行 seq=0：失败行按创建锚回到发送时刻的位置（否则文件发送失败后，
     // 后续成功发送的消息会显示到失败文件上方）；发送中行仍固定末尾。键语义见 msgRowPosKey。
@@ -8563,6 +8589,7 @@
   function prependHistoryRecords(records: UTSJSONObject[]): boolean {
     if (!isChatCurrent()) return false;
     if (records.length == 0) return false;
+    const agentUidBefore = agentSenderUserId;
     const existing = new Set<string>();
     for (let i = 0; i < messages.value.length; i++) {
       existing.add(messages.value[i].msgId);
@@ -8576,6 +8603,8 @@
       existing.add(msgId);
       fresh.push(readMsgRow(record));
     }
+    // 本批消息里新学到智能体发送方 id：提示语候选变了，重算一次（内部有去重）
+    if (agentSenderUserId != agentUidBefore) loadAgentGuidePromptsForChat();
     fresh.sort((a: ImMsgRow, b: ImMsgRow): number => a.seq - b.seq);
     if (fresh.length == 0) return false;
     // 尾起逐条 unshift：表头按升序就位；local 占位行恒在尾部不受扰。
@@ -14985,18 +15014,16 @@
     peerSubjectSaysAgent = convType.value == 1 && !isNaN(peerSubjectRaw) && peerSubjectRaw > 0 && peerSubjectRaw != 1;
     const entryAgentIdRaw = parseFloat(readOption(options, "agentId"));
     agentIdFromDetail.value = isNaN(entryAgentIdRaw) || entryAgentIdRaw <= 0 ? 0 : Math.floor(entryAgentIdRaw);
-    // 智能体单聊输入框占位提示：入口带来的对端 id（列表行/下拉直达）+ 平台 agentId，
-    // 已知时用租户配置缓存同步算好——首帧即最终文案，进页不跳。
-    // ★对端 id 才是 agentInputGuidePrompts 的行键，排第一（见 entryGuidePeerId 注释）。
+    // 智能体单聊输入框占位提示：入口带来的对端 id 与租户配置 defaultIMAgentConfig 的
+    // userId 直接相等比较（同一个 IM 身份值域），已知时用缓存同步算好——进页不跳。
     const entryPeerIdRaw = parseFloat(readOption(options, "peerId"));
     // ★无条件写（模块级变量跨页实例存活，前一个会话的值不能带进来）
-    entryGuideAgentId = agentIdFromDetail.value;
     entryGuidePeerId = isNaN(entryPeerIdRaw) || entryPeerIdRaw <= 0 ? 0 : Math.floor(entryPeerIdRaw);
-    if (peerSubjectSaysAgent) {
-      seedAgentGuidePrompts(readOption(options, "guidePrompt"));
-      // 提示语不等会话详情回包：进页即按缓存定值轮播，远端配置在同一函数里对齐
-      // （内部去重，详情回包那次不会再打一次接口）
-      loadAgentGuidePromptsForChat();
+    if (peerSubjectSaysAgent || (convType.value == 1 && entryGuidePeerId > 0)) {
+      const seeded = seedAgentGuidePrompts(readOption(options, "guidePrompt"));
+      // 提示语不等会话详情回包：进页即按缓存定值轮播；命中配置或入口已判定是智能体时，
+      // 顺带对齐一次远端配置（内部按候选 id 去重，详情回包那次不会再打一次接口）。
+      if (peerSubjectSaysAgent || seeded) loadAgentGuidePromptsForChat();
     }
     applyAiContentHint();
     const name = readOption(options, "name");

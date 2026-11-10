@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { transformSync } from 'esbuild';
 import { describe, expect, it, vi } from 'vitest';
+import { APP_DOWNLOAD_PAGE_URL } from '@/constants/config';
 import {
   normalizeQrLoginOrigin,
   validQrLoginScene,
@@ -24,7 +25,7 @@ function setup(
   app = false,
   initialToken = app ? 'phone-session' : '',
   routes = ['subpackages/pages/qr-login/qr-login'],
-  embedded = false,
+  embedded = !app,
 ) {
   const script = source
     .replace(/\/\/ #ifdef APP\n([\s\S]*?)\/\/ #endif/g, (_, body) =>
@@ -43,8 +44,9 @@ function setup(
   const home = vi.fn();
   const nativeHome = vi.fn();
   const bridgeReady = vi.fn().mockResolvedValue(true);
+  const bootstrapToken = vi.fn();
   const browserWindow: any = {
-    location: { href: '' },
+    location: { href: '', replace: vi.fn() },
     open: vi.fn(),
     uni: { webView: { reLaunch: nativeHome } },
   };
@@ -84,6 +86,7 @@ function setup(
       USER_NO_LOGIN: '4010',
       REDIRECT_LOGIN: '4011',
       ACCESS_TOKEN: 'ACCESS_TOKEN',
+      APP_DOWNLOAD_PAGE_URL,
       currentQrLoginOrigin: () => currentOrigin,
       normalizeQrLoginOrigin,
       validQrLoginScene,
@@ -91,12 +94,11 @@ function setup(
       qrLoginAppUrl,
       redirectToLoginOnce: login,
       LOGIN_PAGE_PATH: '/subpackages/pages/login/login',
-      bootstrapH5AccessTokenFromUrl: vi.fn(),
+      bootstrapH5AccessTokenFromUrl: bootstrapToken,
       clearAccessToken: () => (token = ''),
       useI18n: () => ({ t: (key: string) => key }),
       emptyI18nParams: () => ({}),
       authBrowserQuery: () => null,
-      isAppWebViewEmbedded: () => false,
       isNativeAppWebView: () => embedded,
       ensureAppWebViewNavigationReady: bridgeReady,
       switchMainTab: home,
@@ -118,6 +120,7 @@ function setup(
     home,
     nativeHome,
     bridgeReady,
+    bootstrapToken,
     browserWindow,
     navigateBack,
     back: (from = 'backbutton') => back({ from }),
@@ -139,6 +142,7 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     expect(f.page.state.value).toBe('ready');
     expect(f.info).toHaveBeenCalledTimes(1);
     expect(f.scan).toHaveBeenCalledTimes(1);
+    expect(f.browserWindow.location.replace).not.toHaveBeenCalled();
     expect(f.confirm).not.toHaveBeenCalled();
     expect(f.page.accountName.value).toBe('Alice');
     expect(f.page.accountLabel.value).toBe('180****5678');
@@ -158,7 +162,7 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     expect(f.page.state.value).toBe('success');
     expect(f.token()).toBe(previous);
     if (app) expect(f.home).toHaveBeenCalledOnce();
-    else expect(f.home).not.toHaveBeenCalled();
+    else expect(f.nativeHome).toHaveBeenCalledOnce();
     f.hide();
     f.show();
     await settle();
@@ -195,8 +199,12 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     expect(f.page.state.value).toBe('cancelled');
     expect(f.confirm).not.toHaveBeenCalled();
     expect(f.scan).toHaveBeenCalledTimes(1);
-    expect(f.home).toHaveBeenCalledWith(
-      expect.objectContaining({ url: '/pages/message/message' }),
+    expect(app ? f.home : f.nativeHome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: app
+          ? '/pages/message/message'
+          : '/pages/tab-shell/tab-shell?tab=/pages/message/message',
+      }),
     );
     expect(f.navigateBack).not.toHaveBeenCalled();
   });
@@ -208,8 +216,13 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
       await settle();
       f.page.state.value = state;
       f.page.finish();
-      expect(f.home).toHaveBeenCalledWith(
-        expect.objectContaining({ url: '/pages/message/message' }),
+      await settle();
+      expect(app ? f.home : f.nativeHome).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: app
+            ? '/pages/message/message'
+            : '/pages/tab-shell/tab-shell?tab=/pages/message/message',
+        }),
       );
       expect(f.navigateBack).not.toHaveBeenCalled();
       expect(f.confirm).not.toHaveBeenCalled();
@@ -221,7 +234,8 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     await settle();
     expect(f.back()).toBe(true);
     f.page.finish();
-    expect(f.home).toHaveBeenCalledOnce();
+    await settle();
+    expect(app ? f.home : f.nativeHome).toHaveBeenCalledOnce();
     expect(f.navigateBack).not.toHaveBeenCalled();
   });
   it('应用内扫码取消退回上一页，放行 navigateBack 避免递归拦截', async () => {
@@ -232,10 +246,16 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     f.load();
     await settle();
     f.page.cancelLogin();
-    expect(f.navigateBack).toHaveBeenCalledOnce();
-    expect(f.navigateBack).toHaveBeenCalledWith(
-      expect.objectContaining({ delta: 1 }),
-    );
+    await settle();
+    if (app) {
+      expect(f.navigateBack).toHaveBeenCalledOnce();
+      expect(f.navigateBack).toHaveBeenCalledWith(
+        expect.objectContaining({ delta: 1 }),
+      );
+    } else {
+      expect(f.nativeHome).toHaveBeenCalledOnce();
+      expect(f.navigateBack).not.toHaveBeenCalled();
+    }
     expect(f.back('navigateBack')).toBe(false);
     expect(f.home).not.toHaveBeenCalled();
   });
@@ -247,24 +267,10 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     f.load();
     await settle();
     expect(f.back()).toBe(true);
-    expect(f.navigateBack).toHaveBeenCalledOnce();
+    await settle();
+    if (app) expect(f.navigateBack).toHaveBeenCalledOnce();
+    else expect(f.nativeHome).toHaveBeenCalledOnce();
     expect(f.home).not.toHaveBeenCalled();
-  });
-  it('返回 API 失败时兜底回首页，失败后仍可再次退出', () => {
-    const f = setup(app, 'phone-session', [
-      'pages/tab-shell/tab-shell',
-      'subpackages/pages/qr-login/qr-login',
-    ]);
-    f.navigateBack.mockImplementation((options: any) =>
-      options.fail({ errMsg: 'navigateBack:fail' }),
-    );
-    f.home.mockImplementation((options: any) =>
-      options.fail({ errMsg: 'switchTab:fail' }),
-    );
-    f.page.finish();
-    expect(f.home).toHaveBeenCalledOnce();
-    f.page.finish();
-    expect(f.home).toHaveBeenCalledTimes(2);
   });
   it('返回时立即丢弃迟到的未登录响应，不能又跳回登录页', async () => {
     const f = setup(app);
@@ -278,7 +284,7 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     await settle();
     expect(f.login).not.toHaveBeenCalled();
     expect(f.scan).not.toHaveBeenCalled();
-    expect(f.home).toHaveBeenCalledOnce();
+    expect(app ? f.home : f.nativeHome).toHaveBeenCalledOnce();
   });
   it('等待返回期间换域或换 Token，旧结果不能变成可确认状态', async () => {
     const f = setup(app);
@@ -337,6 +343,49 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     expect(f.page.state.value).toBe('error');
   });
 });
+it('App 原生返回 API 失败时兜底回首页，失败后仍可再次退出', () => {
+  const f = setup(true, 'phone-session', [
+    'pages/tab-shell/tab-shell',
+    'subpackages/pages/qr-login/qr-login',
+  ]);
+  f.navigateBack.mockImplementation((options: any) =>
+    options.fail({ errMsg: 'navigateBack:fail' }),
+  );
+  f.home.mockImplementation((options: any) =>
+    options.fail({ errMsg: 'switchTab:fail' }),
+  );
+  f.page.finish();
+  expect(f.home).toHaveBeenCalledOnce();
+  f.page.finish();
+  expect(f.home).toHaveBeenCalledTimes(2);
+});
+
+describe('App 外 H5 扫码入口', () => {
+  it.each(['', 'existing-browser-session'])(
+    '浏览器 Token 为 %s 时直接跳下载页，不启动扫码或登录流程',
+    async (token) => {
+      const f = setup(false, token, undefined, false);
+      f.load();
+      f.show();
+      f.hide();
+      f.show();
+      await f.page.prepareLogin();
+      await f.page.confirmLogin();
+      await settle();
+      // 即使普通浏览器已加载 uni.webView JSSDK，也不能被当成 App 内。
+      expect(f.browserWindow.uni.webView).toBeDefined();
+      expect(f.browserWindow.location.replace).toHaveBeenCalledExactlyOnceWith(
+        APP_DOWNLOAD_PAGE_URL,
+      );
+      expect(f.bootstrapToken).not.toHaveBeenCalled();
+      expect(f.info).not.toHaveBeenCalled();
+      expect(f.scan).not.toHaveBeenCalled();
+      expect(f.confirm).not.toHaveBeenCalled();
+      expect(f.login).not.toHaveBeenCalled();
+    },
+  );
+});
+
 it('App 无 Token 时先登录，不请求账号或扫码接口', async () => {
   const f = setup(true, '');
   f.load();

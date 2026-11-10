@@ -11,11 +11,28 @@
     - ★行测量协议：measureRow(domId) 组件作用域自测（$callMethod 调起），矩形
       原始数字经 row-rect 上抛（conv-list-pane / im-header-tabs 同机制）
   -->
+  <!-- #ifdef APP-HARMONY -->
+  <!-- 鸿蒙专用外壳：refresher 插槽的内容被 runtime 挂进 Refresh 的 NativeBuilder 子树
+       （@dcloudio/uni-app-x-runtime UniRefresher.ets），插槽内的样式更新不跟手，
+       下拉圆点因此移到列表外的覆盖层（见文件末尾 pull-dot-layer）。 -->
+  <view class="im-pane-wrap">
+  <!-- #endif -->
   <scroll-view
     class="im-pane"
+    :key="pullEntryEnabled ? 'pull-on' : 'pull-off'"
     :direction="menuVisible ? 'none' : 'vertical'"
     :show-scrollbar="false"
+    :refresher-enabled="pullEntryEnabled"
+    :refresher-triggered="pullTriggered"
+    :refresher-threshold="pullThreshold"
+    :refresher-max-drag-distance="pullMaxDragDistance"
+    refresher-default-style="none"
+    refresher-background="#f4f3fb"
     @scroll="emitScroll"
+    @refresherpulling="handlePulling($event)"
+    @refresherrefresh="emitPullRefresh"
+    @refresherrestore="emitPullRestore"
+    @refresherabort="emitPullAbort"
     @touchstart="emitPaneTouchStart($event)"
     @touchend="emitPaneTouchEnd($event)"
     @touchcancel="emitPaneTouchCancel($event)"
@@ -403,11 +420,37 @@
         }}</text>
       </view>
     </template>
+    <!-- 原生节点直接作为 refresher 插槽（置末位：App 端 refresher 取末个 slot 内容）。
+         Android/iOS 的插槽按最大拖拽距离开高、露出多少看多少，圆点就在这里随位移上浮；
+         鸿蒙插槽只当「浅灰底 + 占位」用（不画圆点，插槽内的动态样式不跟手），
+         圆点改画在下面列表外的覆盖层里。 -->
+    <view slot="refresher" class="pull-guide" :style="pullGuideRootStyle">
+      <!-- #ifndef APP-HARMONY -->
+      <view class="pull-guide__dots" :style="pullGuideDotsStyle">
+        <view class="pull-guide__dot" :style="pullGuideLeftDotStyle"></view>
+        <view class="pull-guide__dot" :style="pullGuideCenterDotStyle"></view>
+        <view class="pull-guide__dot" :style="pullGuideRightDotStyle"></view>
+      </view>
+      <!-- #endif -->
+    </view>
   </scroll-view>
+  <!-- #ifdef APP-HARMONY -->
+  <!-- 下拉圆点覆盖层：贴 pane 顶，高度 = 原生下拉位移 dy（=列表被推下来的那段空白），
+       圆点在该层内 flex 居中 → 全程恒在下拉区域的垂直中心（与原生刷新控件内部怎么排版无关）。
+       纯展示层，pointer-events:none 不抢列表手势。 -->
+  <view class="pull-dot-layer" :style="pullDotLayerStyle">
+    <view class="pull-guide__dots" :style="pullGuideDotsStyle">
+      <view class="pull-guide__dot" :style="pullGuideLeftDotStyle"></view>
+      <view class="pull-guide__dot" :style="pullGuideCenterDotStyle"></view>
+      <view class="pull-guide__dot" :style="pullGuideRightDotStyle"></view>
+    </view>
+  </view>
+  </view>
+  <!-- #endif -->
 </template>
 
 <script setup lang="uts">
-  import { getCurrentInstance } from "vue";
+  import { computed, getCurrentInstance, ref } from "vue";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import iconGroupSet from "@/static/icons/group_set.png";
   import iconNewPartner from "@/static/icons/new_partner.svg";
@@ -431,6 +474,11 @@
     retry: [];
     /** 列表滚动（页面 handleListScroll）。 */
     scroll: [];
+    /** 下拉进入默认智能体会话：过阈值松手触发 refresherrefresh（页面建会话并跳转）；
+     *  restore/abort = 未过阈值松手回弹 / 手势被打断（页面收提示条，什么都不做）。 */
+    "pull-refresh": [];
+    "pull-restore": [];
+    "pull-abort": [];
     /** scroll-view 层页面触摸三件套（冒泡到页面根之前先到这，40ms 去重语义在页面）。 */
     "pane-touchstart": [e: UniTouchEvent];
     "pane-touchend": [e: UniTouchEvent];
@@ -480,7 +528,7 @@
     "row-rect": [top: number, bottom: number, left: number];
   }>();
 
-  withDefaults(
+  const props = withDefaults(
     defineProps<{
       /** 新的伙伴申请行（对方申请了我）。 */
       pendingIn: ImContactRow[];
@@ -514,6 +562,16 @@
       menuRowId: string;
       /** 按压闪亮行 id（300ms 闪灰）。 */
       pressedRowId: string;
+      /** 下拉进入默认智能体：是否启用原生下拉（租户未配置默认智能体时为 false）。
+       *  ★同时用作 scroll-view 的 :key：false→true 时重建滚动容器——Android 端挂载后
+       *   再改 refresher-enabled 不会重新装配下拉控件（官方示例也用静态 true）。 */
+      pullEntryEnabled: boolean;
+      /** 原生下拉刷新处于「已触发」态（页面持有，导航/失败后复位收回）。 */
+      pullTriggered: boolean;
+      /** 下拉触发距离 px（与提示条高度对齐）。 */
+      pullThreshold: number;
+      /** 最大拖拽距离 px（Android/iOS 圆点插槽高度；鸿蒙插槽按阈值高度）。 */
+      pullMaxDragDistance: number;
     }>(),
     {
       pendingIn: [] as ImContactRow[],
@@ -535,6 +593,10 @@
       menuVisible: false,
       menuRowId: "",
       pressedRowId: "",
+      pullEntryEnabled: false,
+      pullTriggered: false,
+      pullThreshold: 120,
+      pullMaxDragDistance: 320,
     },
   );
 
@@ -552,6 +614,54 @@
   const spaceRoleTextClass = (space: ImSpaceRow): string => spaceRoleTextClassOf(space);
 
   const componentInstance = getCurrentInstance();
+  const pullGuideDistance = ref<number>(0);
+  const pullGuideProgress = computed((): number => Math.max(0, Math.min(pullGuideDistance.value / props.pullThreshold, 1)));
+  const pullGuideMorphProgress = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.55) / 0.45, 1)));
+  const pullGuideOpacity = computed((): number => Math.max(0, Math.min((pullGuideDistance.value - 40) / 16, 1)));
+  /** refresher 插槽高度。Android/iOS 的原生 refresher 按「最大拖拽距离」开高、露出多少看多少
+   *  （Android 的刷新态停靠高度就是这个高度，所以页面给的 maxDrag 贴近阈值，见 message-content）；
+   *  鸿蒙插槽只当浅灰底与占位用（圆点画在列表外的覆盖层），按 runtime 给的窗口高度（阈值）排版。 */
+  const pullGuideSlotHeight = computed((): number => {
+    // #ifdef APP-HARMONY
+    return props.pullThreshold;
+    // #endif
+    // #ifndef APP-HARMONY
+    return props.pullMaxDragDistance;
+    // #endif
+  });
+  /** Android/iOS：圆点随下拉位移上浮，恒定居中于插槽下方露出的那条空白
+   *  （插槽中心 = maxDrag/2，露出的是插槽底部 distance 段 → 偏移 (max-d)/2）。 */
+  const pullGuideOffsetY = computed((): number => (props.pullMaxDragDistance - pullGuideDistance.value) * 0.5);
+  /** 鸿蒙下拉圆点覆盖层高度 = 原生下拉位移 dy。dy 就是列表被推下来、露出空白的高度，
+   *  圆点在该层内 flex 居中 → 全程恒在下拉区域的垂直中心（不依赖原生刷新控件内部排版）。 */
+  const pullDotLayerStyle = computed((): string => {
+    return `height: ${Math.max(0, pullGuideDistance.value)}px;`;
+  });
+  const pullGuideRootStyle = computed((): string => {
+    return `width: 100%; height: ${pullGuideSlotHeight.value}px; display: flex; flex-direction: row; align-items: center; justify-content: center; background-color: #f4f3fb;`;
+  });
+  const pullGuideDotsStyle = computed((): string => {
+    // #ifdef APP-HARMONY
+    // 覆盖层里由 flex 居中定位，不需要位移，只跟下拉进度淡入。
+    return `position: relative; width: 42px; height: 18px; opacity: ${pullGuideOpacity.value};`;
+    // #endif
+    // #ifndef APP-HARMONY
+    return `position: relative; width: 42px; height: 18px; transform: translateY(${pullGuideOffsetY.value}px); opacity: ${pullGuideOpacity.value};`;
+    // #endif
+  });
+  const pullGuideLeftDotStyle = computed((): string => `left: ${18 - 12 * pullGuideMorphProgress.value}px; opacity: ${pullGuideMorphProgress.value};`);
+  const pullGuideRightDotStyle = computed((): string => `left: ${18 + 12 * pullGuideMorphProgress.value}px; opacity: ${pullGuideMorphProgress.value};`);
+  const pullGuideCenterDotStyle = computed((): string => {
+    const size = 12 - 6 * pullGuideMorphProgress.value;
+    const offset = 3 + 3 * pullGuideMorphProgress.value;
+    return `top: ${offset}px; left: ${15 + 3 * pullGuideMorphProgress.value}px; width: ${size}px; height: ${size}px; border-radius: ${size * 0.5}px;`;
+  });
+
+  function handlePulling(eventValue: Any): void {
+    const e = eventValue as UniRefresherEvent;
+    const distance = Math.max(0, e.detail.dy);
+    if (Math.abs(pullGuideDistance.value - distance) >= 1) pullGuideDistance.value = distance;
+  }
 
   /** createSelectorQuery.exec 回调（具名函数：深层箭头块会触发 UTS 截断编译，
       message-content 同款约束）。矩形解析后原始数字直发页面（视口坐标系）。 */
@@ -603,6 +713,20 @@
 
   function emitScroll(): void {
     emit("scroll");
+  }
+
+  function emitPullRefresh(): void {
+    emit("pull-refresh");
+  }
+
+  function emitPullRestore(): void {
+    pullGuideDistance.value = 0;
+    emit("pull-restore");
+  }
+
+  function emitPullAbort(): void {
+    pullGuideDistance.value = 0;
+    emit("pull-abort");
   }
 
   function emitPaneTouchStart(eventValue: Any): void {
@@ -733,6 +857,61 @@
   /* swiper-item 内列表：撑满页高（swiper-item 自身随 swiper 拉伸，子级须显式 100%） */
   .im-pane {
     height: 100%;
+  }
+
+  /* #ifdef APP-HARMONY */
+  /* 鸿蒙专用外壳：让下拉圆点覆盖层能贴 pane 顶绝对定位（Android/iOS 不渲染这层）。 */
+  .im-pane-wrap {
+    width: 100%;
+    height: 100%;
+    position: relative;
+  }
+
+  /* 下拉圆点覆盖层：高度由内联 style 按原生下拉位移给出，圆点在该层内 flex 居中，
+     于是全程恒在下拉区域垂直中心。纯展示层，pointer-events:none 不抢列表手势。 */
+  .pull-dot-layer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    z-index: 1;
+  }
+  /* #endif */
+
+  .pull-guide {
+    width: 100%;
+    height: 320px;
+    /* #ifdef APP-HARMONY */
+    /* 鸿蒙的插槽只当浅灰底/占位（圆点画在列表外的覆盖层），高度按 runtime 给的窗口
+       （refresher-threshold，= 页面 PULL_ENTRY_THRESHOLD 默认 120）排版即可；
+       此处同时是内联 style 未生效时的兜底值。 */
+    height: 120px;
+    /* #endif */
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    background-color: #f4f3fb;
+  }
+
+  .pull-guide__dots {
+    position: relative;
+    width: 42px;
+    height: 18px;
+  }
+
+  .pull-guide__dot {
+    position: absolute;
+    top: 6px;
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background-color: #9b9ba1;
   }
 
   .im-state {

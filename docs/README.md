@@ -8,6 +8,7 @@
 |---|---|
 | [local-custom-base-maintenance.md](engineering/local-custom-base-maintenance.md) | 本地离线自定义基座维护规范 |
 | [custom-base-distribution-s3.md](engineering/custom-base-distribution-s3.md) | 自定义基座 S3 分发（拉取/发布） |
+| [android-apk-distribution-s3.md](engineering/android-apk-distribution-s3.md) | 正式 APK 上传 S3：首次配置、本地文件/下载链接、latest.json 与故障处理 |
 | [offline-sdk-distribution-s3.md](engineering/offline-sdk-distribution-s3.md) | 离线 SDK S3 分发 |
 | [esp-provisioning-local-base.md](engineering/esp-provisioning-local-base.md) | 桌搭 BLE 配网本地基座总览 |
 | [android-esp-provisioning-local-base.md](engineering/android-esp-provisioning-local-base.md) | Android 端配网本地基座 |
@@ -30,6 +31,7 @@
 |---|---|
 | [agent_integration_guide.md](integration/agent_integration_guide.md) | Agent 组件（文件树等）接入 |
 | [app-asr-tts.md](integration/app-asr-tts.md) | Vox ASR / TTS 对接 |
+| [im-meeting-app-plan.md](integration/im-meeting-app-plan.md) | App 实时会议方案：对齐 PC、飞书式移动交互、原生 LiveKit 接入与分期验收（待评审） |
 | [app-native-pay-integration.md](integration/app-native-pay-integration.md) | App 原生支付（现行；webview 支付已废弃归档） |
 | [mobile-h5-idp-login.md](integration/mobile-h5-idp-login.md) | 移动 H5 CAS/OAuth2 Cookie 登录、配置与回跳约束 |
 | [mobile-idp-native-plan.md](integration/mobile-idp-native-plan.md) | 联合登录总方案：原生复用边界、会话交接、平台配置、分期验收与后端待确认项 |

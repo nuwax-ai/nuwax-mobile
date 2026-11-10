@@ -35,11 +35,16 @@
   import { EVENT_TYPE } from "@/constants/event.constants";
   import { initCmark } from "@/uni_modules/uni-cmark";
   import { setAppInBackground } from "@/utils/appLifecycle.uts";
-  import { routeClipboardShare, routeIncomingShare } from "@/utils/appShare";
+  import { rememberColdStartScheme, routeIncomingShare } from "@/utils/appShare";
+  import { routeIncomingQrLogin } from "@/utils/qrLoginNavigation";
+  import { APP_PRIVACY_GRANTED_EVENT, hasAppPrivacyConsent, prepareAppPrivacyConsent } from "@/utils/appPrivacyConsent";
   import { ACCESS_TOKEN } from "@/constants/home.constants";
   import { notifyStreamAppForeground } from "@/utils/streamRequest.uts";
   import { clearLoginCheckPending } from "@/utils/profileSetupGate";
   import { primeSafeAreaBottom } from "@/utils/safeAreaBottom.uts";
+  import { clearNotificationsOnAppOpen } from "@/utils/notificationClear.uts";
+  // 桌面角标：App 前台/退后台生命周期清零；后台收到新推送时重新允许厂商角标落地。
+  import { clearAppIconBadge, setAppIconBadgeSuppressed } from "@/utils/appIconBadge.uts";
   // #ifdef H5 || WEB
   import { bootstrapH5AccessTokenFromUrl } from "@/utils/authSession";
   import { isAppWebViewEmbedded, readAppWebViewHostPlatform } from "@/utils/appWebViewDetect";
@@ -120,8 +125,13 @@
   // #ifdef APP
   let appShareColdStart = true;
   // #endif
-  export default {
-    onLaunch: function () {
+  let applicationInitialized = false;
+  function initializeApplication(): void {
+    if (applicationInitialized || !hasAppPrivacyConsent()) return;
+    applicationInitialized = true;
+  // 打开 App 清空通知栏里的推送通知（Android 首启协议弹窗期间 onShow 已提前返回，
+  // 同意后不会再触发第二次 onShow，这里补一次；见 utils/notificationClear.uts）
+  clearNotificationsOnAppOpen();
   // 冷启动一律清「待做新用户引导判定」标记：只有登录页真实调登录接口（saveAccessToken
   // 写新 token）才重新置位——保证杀 App 重开（持久登录态）不再弹引导（utils/profileSetupGate.uts）
   clearLoginCheckPending();
@@ -313,10 +323,28 @@
       // 注册 iOS 原生支付桥（支付宝 openURL / 微信 scheme 兜底）
       bootstrapAppNativePay();
       // #endif
+  }
+  export default {
+    onLaunch: function () {
+      // Android 首启先停在 launch 页；真实同意后才初始化 IM、推送、设备与业务请求。
+      // #ifdef APP-ANDROID
+      uni.$on(APP_PRIVACY_GRANTED_EVENT, () => { initializeApplication(); });
+      prepareAppPrivacyConsent((accepted: boolean) => {
+        if (accepted) initializeApplication();
+      });
+      // #endif
+      // #ifndef APP-ANDROID
+      initializeApplication();
+      // #endif
     },
     onShow: function (options : OnShowOptions) {
+      if (!hasAppPrivacyConsent()) return;
       console.log("App Show");
       setAppInBackground(false);
+      setAppIconBadgeSuppressed(true);
+      // 打开 App（冷启动 / 回前台）即清空通知栏里本 App 的推送通知。
+      // 点通知进 App 时系统只会消掉被点的那条，其余留在这里统一清掉。
+      clearNotificationsOnAppOpen();
       // 回前台（含冷启动第一个 onShow）再刷一次底部安全区缓存：此时窗口 insets 必已就绪
       try {
         primeSafeAreaBottom();
@@ -328,13 +356,16 @@
       const incoming = scheme.length > 0 ? scheme : link;
       if (appShareColdStart) {
         appShareColdStart = false;
+        if (incoming.length > 0) rememberColdStartScheme(incoming);
       } else {
         const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
         const token = tokenRaw != null ? `${tokenRaw}`.trim() : "";
         if (incoming.length > 0) {
-          routeIncomingShare(token.length > 0, incoming);
-        } else {
-          routeClipboardShare(token.length > 0, (_opened: boolean) => {});
+          // 扫码登录优先于普通分享。剪贴板分享已在隐私同意改造里去掉，这里不再读剪贴板。
+          // 冷启动的扫码登录由 pages/launch 处理，本段只覆盖回前台再次带入的链接。
+          if (!routeIncomingQrLogin(token.length > 0, incoming)) {
+            routeIncomingShare(token.length > 0, incoming);
+          }
         }
       }
       // #endif
@@ -357,8 +388,11 @@
       // #endif
     },
     onHide: function () {
+      if (!hasAppPrivacyConsent()) return;
       console.log("App Hide");
       setAppInBackground(true);
+      setAppIconBadgeSuppressed(false);
+      clearAppIconBadge();
       // #ifndef H5
       // 非 H5 端：切换到后台，暂停轮询（H5 由 visibilitychange 自动处理）
       stopEventPolling();
@@ -370,6 +404,10 @@
     },
     // #ifdef APP-ANDROID || APP-HARMONY
     onLastPageBackPress: function () {
+      if (!hasAppPrivacyConsent()) {
+        uni.exit();
+        return;
+      }
       console.log("App LastPageBackPress");
       if (firstBackTime == 0) {
         uni.showToast({

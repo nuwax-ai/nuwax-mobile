@@ -112,14 +112,93 @@ export function updateChatVideoProgress(key: string, currentTime: number, durati
 // 全屏里的退出键（标题栏左上返回）与系统控制条共用同一个闸门——runtime 里是
 // `fullscreen && controlsShow`、`controlsShow = !centerPlayBtnShow && controls && controlsVisible`。
 // 也就是说 controls=false 连全屏标题栏一起关掉：Android 的全屏是页面内的 JS 容器，
-// 没有系统返回兜底（framework 里视频全屏路径不接 onBackPress），会卡死在全屏页出不去。
+// 框架不会替视频消费页面返回；消息页另用 onBackPress/边缘手势处理退出全屏。
 // 折中：行内 controls=false（自绘），一进全屏 controls=true（交回系统，退出键回来）。
 
 /** 全屏态（三端共用一份；页面 setup 里 `const videoFullscreen = chatVideoFullscreen;`
  *  别名后模板 :controls 直读，控制条请求时乐观置位。utils/chatAiHint.uts 同款写法）。 */
 export const chatVideoFullscreen: Ref<boolean> = ref(false);
+
 /** 乐观置位版本号：fullscreenchange 事件到达即作废看门狗（见 beginChatVideoFullscreen）。 */
 let fullscreenSeq = 0;
+let fullscreenPlayerId = "";
+// #ifdef APP-IOS
+let fullscreenBackPage: UniPage | null = null;
+let fullscreenPreviousDisableSwipeBack = false;
+let fullscreenSwipeArmed = false;
+let fullscreenSwipeStartX = 0;
+let fullscreenSwipeStartY = 0;
+let fullscreenSwipeStartedAt = 0;
+// #endif
+
+/** iOS 侧滑不经过 onBackPress：仅全屏期间阻止聊天页被原生手势直接弹栈。 */
+function syncChatVideoBackGuard(fullscreen: boolean): void {
+  // #ifdef APP-IOS
+  if (!fullscreen) {
+    fullscreenSwipeArmed = false;
+    const page = fullscreenBackPage;
+    fullscreenBackPage = null;
+    if (page != null) page.setPageStyle({ disableSwipeBack: fullscreenPreviousDisableSwipeBack });
+    return;
+  }
+  if (fullscreenBackPage != null || !fullscreenPlayerId.startsWith("chatVideoPlayer-")) return;
+  const pages = getCurrentPages();
+  if (pages.length == 0) return;
+  const page = pages[pages.length - 1];
+  if (page.route != "pages/message/chat") return;
+  fullscreenPreviousDisableSwipeBack = page.getPageStyle()["disableSwipeBack"] == true;
+  fullscreenBackPage = page;
+  page.setPageStyle({ disableSwipeBack: true });
+  // #endif
+}
+
+/** 消费本次返回，只退出原生全屏；不导航、不暂停、不重建播放器。 */
+export function exitChatVideoFullscreenOnBack(): boolean {
+  // #ifdef APP-ANDROID || APP-IOS
+  if (!chatVideoFullscreen.value) return false;
+  const playerId = fullscreenPlayerId;
+  try {
+    const player = uni.getElementById(playerId) as UniVideoElement | null;
+    if (player != null) player.exitFullScreen();
+  } catch (_error) {}
+  // controls/手势守卫等 fullscreenchange(false) 再恢复，避免退出过程中穿透到聊天页。
+  return true;
+  // #endif
+  // #ifndef APP-ANDROID || APP-IOS
+  return false;
+  // #endif
+}
+
+/** 全屏中的 iOS 左边缘右滑替代页面弹栈；普通进度拖动不触发。 */
+export function startChatVideoBackSwipe(eventValue: Any): void {
+  // #ifdef APP-IOS
+  fullscreenSwipeArmed = false;
+  if (!chatVideoFullscreen.value || fullscreenBackPage == null) return;
+  const event = eventValue as UniTouchEvent;
+  if (event.touches.length != 1) return;
+  const touch = event.touches[0];
+  if (touch.clientX < 0 || touch.clientX > 40) return;
+  fullscreenSwipeStartX = touch.clientX;
+  fullscreenSwipeStartY = touch.clientY;
+  fullscreenSwipeStartedAt = Date.now();
+  fullscreenSwipeArmed = true;
+  // #endif
+}
+
+export function finishChatVideoBackSwipe(eventValue: Any): void {
+  // #ifdef APP-IOS
+  const armed = fullscreenSwipeArmed;
+  fullscreenSwipeArmed = false;
+  if (!armed || !chatVideoFullscreen.value) return;
+  const event = eventValue as UniTouchEvent;
+  if (event.type != "touchend" || event.changedTouches == null || event.changedTouches.length != 1) return;
+  const touch = event.changedTouches[0];
+  const dx = touch.clientX - fullscreenSwipeStartX;
+  const dy = touch.clientY - fullscreenSwipeStartY;
+  if (dx < 70 || Math.abs(dy) > dx * 0.6 || Date.now() - fullscreenSwipeStartedAt > 1200) return;
+  exitChatVideoFullscreenOnBack();
+  // #endif
+}
 
 /** 当前是否全屏（控制条据此决定进/出全屏）。 */
 export function isChatVideoFullscreen(): boolean {
@@ -129,6 +208,8 @@ export function isChatVideoFullscreen(): boolean {
 /** 直接置位（页面 onHide/onUnload 复位用：模块级 ref 跨页存活，残留 true 会让下一个
  *  聊天页的行内视频首帧就挂上系统控制条——时间文案挤掉全屏键的老问题跟着回来）。 */
 export function setChatVideoFullscreen(fullscreen: boolean): void {
+  syncChatVideoBackGuard(fullscreen);
+  if (!fullscreen) fullscreenPlayerId = "";
   if (chatVideoFullscreen.value != fullscreen) {
     chatVideoFullscreen.value = fullscreen;
   }
@@ -142,7 +223,8 @@ export function setChatVideoFullscreen(fullscreen: boolean): void {
  * 看门狗：1.5s 内页面没回事件（版本号未变）说明请求没真正生效，撤回置位，
  * 免得行内白白多出一条系统控制条。
  */
-export function beginChatVideoFullscreen(): void {
+export function beginChatVideoFullscreen(playerId: string = ""): void {
+  fullscreenPlayerId = playerId;
   fullscreenSeq = fullscreenSeq + 1;
   const token = fullscreenSeq;
   setChatVideoFullscreen(true);
@@ -154,7 +236,8 @@ export function beginChatVideoFullscreen(): void {
 }
 
 /** 页面 @fullscreenchange：以事件为准（进/出都覆盖），并作废上面那次乐观置位的看门狗。 */
-export function confirmChatVideoFullscreen(fullscreen: boolean): void {
+export function confirmChatVideoFullscreen(fullscreen: boolean, playerId: string = ""): void {
+  if (fullscreen && playerId.length > 0) fullscreenPlayerId = playerId;
   fullscreenSeq = fullscreenSeq + 1;
   setChatVideoFullscreen(fullscreen);
 }

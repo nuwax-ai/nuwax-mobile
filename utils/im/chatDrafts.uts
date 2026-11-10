@@ -1,11 +1,12 @@
 import { ACCESS_TOKEN, ACCESS_TOKEN_ORIGIN } from "@/constants/home.constants";
+import { readStorageString } from "@/utils/readStorageString";
+import { ChatStagedMedia, readStagedMedia, serializeStagedMedia } from "@/utils/im/chatStagedMedia";
 /**
- * 会话输入草稿（微信式）：聊天页未发出的文案+暂存图按 convId 本地记忆——
- * 退出聊天页后消息列表摘要行显示「[草稿]xxx」（图片占位 [图片]），再进页输入框与
- * 暂存图条回显上次内容；发送（输入框与暂存图清空）后草稿随之清除。
+ * 会话输入草稿：文案和暂存图片/视频按 convId 本地记忆。
+ * 列表摘要显示 [图片]/[视频] 占位，再进页恢复待发媒体；发送后随之清除。
  *
- * 图片存本地路径（App 端相册/拍摄临时文件跨页面实例可读；H5 相册是 blob: URL，
- * 页面卸载即失效，页面侧不写入）。路径被系统清理的极端情形恢复出裂图，可手删。
+ * 媒体存本地路径及类型（App 端临时文件跨页面实例可读；H5 blob: URL 不入草稿）。
+ * 文件可能被系统清理，此时需删除后重新选择。
  *
  * 存储：单 storage 键存全部会话草稿（items 数组：id/文案/图片/顺序），跨进程重启保留；
  * 账号 tag（token|origin，imSessionScope 同源字段但去掉进程内 epoch——epoch 重启
@@ -24,6 +25,7 @@ class ChatDraftEntry {
   convId: string = "";
   text: string = "";
   images: string[] = [];
+  media: ChatStagedMedia[] = [];
   constructor(convId: string, text: string, images: string[]) {
     this.convId = convId;
     this.text = text;
@@ -33,9 +35,7 @@ class ChatDraftEntry {
 
 /** 账号 tag（重启稳定；token 轮换会失配丢草稿，可接受的边界）。 */
 function accountTag(): string {
-  const token = uni.getStorageSync(ACCESS_TOKEN);
-  const origin = uni.getStorageSync(ACCESS_TOKEN_ORIGIN);
-  return `${token ?? ""}|${origin ?? ""}`;
+  return `${readStorageString(ACCESS_TOKEN)}|${readStorageString(ACCESS_TOKEN_ORIGIN)}`;
 }
 
 function readString(obj: UTSJSONObject, key: string): string {
@@ -110,7 +110,17 @@ function ensureCache(): void {
       if (convId.length == 0 || draftsByConv.has(convId)) {
         continue;
       }
-      draftsByConv.set(convId, new ChatDraftEntry(convId, readString(items[i], "t"), readImages(items[i])));
+      const entry = new ChatDraftEntry(convId, readString(items[i], "t"), readImages(items[i]));
+      entry.media = readStagedMedia(items[i]["media"]);
+      // 旧草稿仅记录 imgs，升级后仍按图片恢复。
+      if (items[i]["media"] == null) {
+        for (let j = 0; j < entry.images.length; j++) {
+          const media = new ChatStagedMedia();
+          media.localPath = entry.images[j];
+          entry.media.push(media);
+        }
+      }
+      draftsByConv.set(convId, entry);
       draftOrder.push(convId);
     }
   } catch (_e) {
@@ -130,6 +140,7 @@ function persist(): void {
     obj["id"] = entry.convId;
     obj["t"] = entry.text;
     obj["imgs"] = entry.images;
+    obj["media"] = serializeStagedMedia(entry.media);
     items.push(obj);
   }
   const root = new UTSJSONObject();
@@ -166,6 +177,13 @@ export function getChatDraftImages(convId: string): string[] {
   return entry != null ? [...entry.images] : ([] as string[]);
 }
 
+/** 返回副本，页面分配 id 或删除附件不会修改缓存。 */
+export function getChatDraftMedia(convId: string): ChatStagedMedia[] {
+  ensureCache();
+  const entry = draftsByConv.get(convId);
+  return entry != null ? readStagedMedia(serializeStagedMedia(entry.media)) : [] as ChatStagedMedia[];
+}
+
 /** 会话是否有草稿（文案非空白或暂存图非空）——列表浮顶/插行分区判定用。 */
 export function chatDraftHasContent(convId: string): boolean {
   ensureCache();
@@ -176,14 +194,14 @@ export function chatDraftHasContent(convId: string): boolean {
   if (entry == null) {
     return false;
   }
-  return entry.text.trim().length > 0 || entry.images.length > 0;
+  return entry.text.trim().length > 0 || entry.media.length > 0;
 }
 
 /**
  * 写/清会话草稿：纯空白文案且无暂存图视为清除（微信同款）；文案与暂存图一起记忆。
  * 相同内容重复写仍刷更新序（防被淘汰后读丢）。清一个不存在的会话不触发落盘。
  */
-export function setChatDraft(convId: string, text: string, images: string[] = [] as string[]): void {
+export function setChatDraft(convId: string, text: string, images: string[] = [] as string[], media: ChatStagedMedia[] = [] as ChatStagedMedia[]): void {
   ensureCache();
   if (convId.length == 0) {
     return;
@@ -194,7 +212,19 @@ export function setChatDraft(convId: string, text: string, images: string[] = []
       keptImages.push(images[i]);
     }
   }
-  const keep = text.trim().length > 0 || keptImages.length > 0;
+  const keptMedia = readStagedMedia(serializeStagedMedia(media));
+  if (keptMedia.length == 0) {
+    for (let i = 0; i < keptImages.length; i++) {
+      const item = new ChatStagedMedia();
+      item.localPath = keptImages[i];
+      keptMedia.push(item);
+    }
+  }
+  keptImages.splice(0, keptImages.length);
+  for (let i = 0; i < keptMedia.length; i++) {
+    if (keptMedia[i].kind == "image") keptImages.push(keptMedia[i].localPath);
+  }
+  const keep = text.trim().length > 0 || keptMedia.length > 0;
   const idx = draftOrder.indexOf(convId);
   const existed = idx >= 0;
   // 有效变更（新增/更新/清除任一）自增版本号；同内容重写也刷更新序故同样自增
@@ -211,7 +241,9 @@ export function setChatDraft(convId: string, text: string, images: string[] = []
     }
     return;
   }
-  draftsByConv.set(convId, new ChatDraftEntry(convId, text, keptImages));
+  const entry = new ChatDraftEntry(convId, text, keptImages);
+  entry.media = keptMedia;
+  draftsByConv.set(convId, entry);
   draftOrder.push(convId);
   while (draftOrder.length > DRAFTS_MAX_CONVS) {
     const oldest = draftOrder[0];

@@ -6,7 +6,6 @@
     @touchcancel="handlePageTouchCancel($event)"
   >
     <safety-zone />
-
     <!-- 工作商业版未授权（workCommercialEdition !== true）：整页居中提示，
          不渲染列表与入口、不发任何 IM 请求（对齐 PC WorkCommercialRouteBoundary；
          WS 连接 / 未读角标在工具层同步闸门，见 utils/workCommercial.uts） -->
@@ -30,7 +29,6 @@
       @plus-tap="openAddDrawer"
       @plus-rect="onHeaderPlusMeasured"
     />
-
     <!-- 消息 / 智联录双页 swiper（专家页同款滑动效果）：横滑跟手切 tab，tab 点击经
          current 驱动滑向目标页；横滑与列表纵向滚动的手势仲裁由原生 swiper 承担
          （斜滑不再带动列表，页面级触摸只留吞击守卫与浮层收起，滚动锁只剩长按浮层） -->
@@ -59,9 +57,16 @@
           :menu-visible="rowMenuVisible"
           :menu-row-id="rowMenuRowId"
           :pressed-row-id="pressedRowId"
+          :pull-entry-enabled="pullEntryEnabled"
+          :pull-triggered="pullConvTriggered"
+          :pull-threshold="PULL_ENTRY_THRESHOLD"
+          :pull-max-drag-distance="PULL_ENTRY_MAX_DRAG_DISTANCE"
           @retry="handleConvRetry"
           @scroll="handleListScroll"
           @scroll-lower="handleConvScrollLower"
+          @pull-refresh="handleConvPanePullRefresh"
+          @pull-restore="handleConvPullSettle"
+          @pull-abort="handleConvPullSettle"
           @pane-touchstart="handlePageTouchStart"
           @pane-touchend="handlePageTouchEnd"
           @pane-touchcancel="handlePageTouchCancel"
@@ -100,8 +105,15 @@
           :menu-visible="rowMenuVisible"
           :menu-row-id="rowMenuRowId"
           :pressed-row-id="pressedRowId"
+          :pull-entry-enabled="pullEntryEnabled"
+          :pull-triggered="pullContactTriggered"
+          :pull-threshold="PULL_ENTRY_THRESHOLD"
+          :pull-max-drag-distance="PULL_ENTRY_MAX_DRAG_DISTANCE"
           @retry="handleContactRetry"
           @scroll="handleListScroll"
+          @pull-refresh="handleContactPanePullRefresh"
+          @pull-restore="handleContactPullSettle"
+          @pull-abort="handleContactPullSettle"
           @pane-touchstart="handlePageTouchStart"
           @pane-touchend="handlePageTouchEnd"
           @pane-touchcancel="handlePageTouchCancel"
@@ -213,7 +225,7 @@
 </template>
 
 <script setup lang="uts">
-  import { getCurrentInstance, nextTick, ref, watch, type ComponentPublicInstance } from "vue";
+  import { computed, getCurrentInstance, nextTick, ref, watch, type ComponentPublicInstance } from "vue";
   import { useMainTabLifecycle } from "@/hooks/useMainTabLifecycle";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { hasLoginSession } from "@/utils/authSession";
@@ -258,6 +270,7 @@
     apiImConvSetDnd,
     apiImConvSetTop,
     apiImCreateP2pConversation,
+    apiImCreateAgentConversation,
     apiImGroupDisband,
     apiImGroupLeave,
     apiImMyGroups,
@@ -266,6 +279,7 @@
     apiImWhoami,
   } from "@/servers/im";
   import { apiUserInfo } from "@/servers/account";
+  import { readCachedDefaultAgentName, readCachedTenantConfig, readDefaultAgentPrompts, readDefaultIMAgentId, resolveDefaultIMAgentId, resolveDefaultIMAgentName, cacheDefaultAgentName } from "@/utils/tenantAgentConfig";
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { refreshImUnreadBadge, clearImUnreadBadge } from "@/utils/imUnreadBadge";
@@ -411,6 +425,20 @@
    *  原 listScrolling + 160ms idle 尾窗已撤：读点全改起手快照（尾窗连坐死点击，见
    *  rowTouchDuringScroll 声明处注释）。 */
   let lastScrollEventAt = 0;
+  const activeTab = ref<string>("chat");
+
+  /** 入口提示语（随 URL 带过去，会话页首帧即可显示）：
+   *  租户配置 defaultIMAgentConfig 的行键是 `userId`（IM 用户 id），与会话的
+   *  `peerUserId` 同一值域，直接相等比较；命中后随机取一条 prompts。
+   *  取不到（未配置/建会话回包没有 peerUserId）不拼参数，会话页自行兜底。 */
+  function guidePromptQuery(peerUserId: string): string {
+    const peerId = peerUserId.length > 0 ? parseInt(peerUserId, 10) : 0;
+    if (isNaN(peerId) || peerId <= 0) return "";
+    const prompts = readDefaultAgentPrompts(readCachedTenantConfig(), peerId);
+    if (prompts.length == 0) return "";
+    const index = prompts.length > 1 ? Math.floor(Math.random() * prompts.length) : 0;
+    return `&guidePrompt=${encodeURIComponent(prompts[index])}`;
+  }
 
   // ===== 长按行操作浮层 / 横滑切 tab 页级状态（须先于 handleListScroll 等使用方：UTS 不提升声明）=====
   /** 长按操作浮层是否展开（无蒙层：行浅灰高亮 + 行旁锚定气泡）。 */
@@ -638,8 +666,6 @@
     // 该手势已被消费（只关气泡不穿透），行级 touchend 不再判为点击闪灰
     clearRowTouch();
   }
-
-  const activeTab = ref<string>("chat");
 
   // ===== 会话列表状态 =====
   const conversations = ref<ImConvRow[]>([]);
@@ -1902,6 +1928,242 @@
     }
   }
 
+  // ===== 下拉进入默认智能体会话（消息/智联录列表顶部下拉，微信下拉展开式的同款交互）=====
+  // 交互：两个列表的 scroll-view 开原生下拉（refresher-default-style=none + 自定义
+  // refresher 插槽：三个灰点），下拉时列表整体下移、圆点从列表顶部后面露出来。
+  // 圆点为微信式：前半程一个大灰点，后半程展开为横向三个小灰点：
+  //   · 没到阈值就松手 → 原生回弹（refresherrestore/abort），什么都不发生；
+  //   · 越过阈值松手 → 原生 refresherrefresh → 立刻回弹收起 → 回弹结束后进会话页
+  //     （跳转等 PULL_BOUNCE_BACK_MS，请求快返回也不会在拉出态上直接闪进会话）。
+  // ★判定全交原生 refresher：App-Android 子 view 的 touchmove 在 touchslop(≈8px) 之后
+  //   被 scroll-view 截断，旧版逐帧累积 touchmove 距离的写法永远攒不起来（只有 touchend
+  //   能拿到终点坐标），提示语因此一帧都没显示过。
+  // ★圆点渲染按平台分两套（见 pane 组件）：
+  //   Android/iOS 画在 refresher 插槽里，随原生位移上浮（插槽按最大拖拽距离开高）；
+  //   鸿蒙的插槽内容被 runtime 挂进 Refresh 的 NativeBuilder 子树，插槽里的样式更新不跟手，
+  //   所以鸿蒙把圆点画在列表外的覆盖层（贴 pane 顶、高度 = 原生下拉位移 dy），
+  //   圆点在该层 flex 居中 → 全程恒在下拉区域的垂直中心。
+  // ★目标智能体恒取租户配置 defaultIMAgentConfig 的**第一项**（不排序、不记上次使用）。
+
+  /** 默认智能体 id（0=租户未配置：原生下拉入口整体关闭）。
+   *  ★首帧就按缓存同步定值（不等异步闸门）：原生 refresher 的 enabled 若在挂载后才
+   *    false→true 翻转，Android 端不会重新装配下拉控件（实测下拉无反应）；缓存缺配置
+   *   时才由 refreshPullEntryAgent 兜底补拉。 */
+  const pullEntryAgentId = ref<number>(readDefaultIMAgentId(readCachedTenantConfig()));
+  /** 默认智能体名称（创建会话与标题缓存使用）。 */
+  const pullEntryAgentName = ref<string>(readCachedDefaultAgentName(pullEntryAgentId.value));
+  /** 原生下拉触发态（只为把原生 refresher 收回，见 handlePanePullRefresh）。
+   *  ★两个列表各持一份：共用一个值时，一个列表下拉会把另一个（可能正被 swiper 隐藏的）
+   *   列表也置成 triggered 并展开提示条，隐藏期间收不回来 —— 回页切过去就还挂着提示语。 */
+  const pullConvTriggered = ref<boolean>(false);
+  const pullContactTriggered = ref<boolean>(false);
+  /** 建会话请求在途（防连拉连点重复创建/重复导航）。 */
+  let pullLaunchInFlight = false;
+  /** 下拉跳转批次号：页面隐藏/重新下拉都换一批，迟到的响应不再抢导航。 */
+  let pullLaunchSeq = 0;
+  /** 回弹结束后的延迟跳转定时器（0=没有挂起任务）。 */
+  let pullNavigateTimer = 0;
+  /** 松手后等原生回弹动画走完再跳转的时长（ms）：太快跳会看起来「拉出态直接闪进会话」。 */
+  const PULL_BOUNCE_BACK_MS = 300;
+  /** 原生 refresher 触发距离（鸿蒙原生的 refreshingContent 窗口高度也取这个值）。 */
+  const PULL_ENTRY_THRESHOLD = 120;
+  /** 原生 refresher 最大拖拽距离（圆点插槽按它开高，见 pane 组件里的 pullGuideSlotHeight）。
+   *  ★Android 必须贴近阈值：Android 原生的刷新态停靠高度 = 插槽（header）高度
+   *    （app-runtime 里 header 高度取插槽 getLayoutHeight，触发点再按 阈值/插槽高 归一），
+   *    插槽按 320 开高时，松手过阈值后原生会把列表一路推到 320 再回弹，看起来就是
+   *    「松手后又自动下滑一段」再跳转；iOS/鸿蒙按阈值停靠，没有这一段。
+   *    Android 压到 阈值+20：停靠位置≈松手位置（最多 20px 余量），同时留出可触发区间
+   *    ——插槽高 ≤ 阈值时触发点=插槽高，永远拉不过去。 */
+  // #ifdef APP-ANDROID
+  const PULL_ENTRY_MAX_DRAG_DISTANCE = PULL_ENTRY_THRESHOLD + 20;
+  // #endif
+  // #ifndef APP-ANDROID
+  const PULL_ENTRY_MAX_DRAG_DISTANCE = 320;
+  // #endif
+
+  const pullEntryEnabled = computed((): boolean => pullEntryAgentId.value > 0);
+
+  /** 写某一个列表的原生下拉触发态（pane: "conv"=消息列表 / "contact"=智联录）。 */
+  function setPullTriggered(pane: string, on: boolean): void {
+    if (pane == "contact") {
+      pullContactTriggered.value = on;
+    } else {
+      pullConvTriggered.value = on;
+    }
+  }
+
+  /** 收起下拉提示（refresherrestore/abort：没拉过阈值就松手，或手势被系统打断）。 */
+  function resetPullEntryGuide(pane: string): void {
+    setPullTriggered(pane, false);
+  }
+
+  /** 收掉一次下拉跳转（页面隐藏/回页时调）：作废在途批次、取消延迟跳转、收起下拉态。 */
+  function cancelPullEntryLaunch(): void {
+    pullLaunchSeq = pullLaunchSeq + 1;
+    pullLaunchInFlight = false;
+    if (pullNavigateTimer != 0) {
+      clearTimeout(pullNavigateTimer);
+      pullNavigateTimer = 0;
+    }
+    pullConvTriggered.value = false;
+    pullContactTriggered.value = false;
+  }
+
+  /** 让原生下拉立刻回弹：先置 true，等 Vue 把该状态提交给原生 scroll-view 后再置 false。
+   *  直接用 16ms 定时可能被同一渲染批次合并，原生只看到 false，导致页面停在拉出态。 */
+  function retractPullRefresher(pane: string): void {
+    setPullTriggered(pane, true);
+    nextTick((): void => {
+      setTimeout((): void => {
+        setPullTriggered(pane, false);
+      }, 50);
+    });
+  }
+
+  /** 刷新下拉入口目标：租户默认智能体 = defaultIMAgentConfig 第一项；名称缓存缺失时
+   *  向平台补一次详情（首次下拉也能显示真名）。闸门放行后与每次回前台时调。 */
+  async function refreshPullEntryAgent(): Promise<void> {
+    const agentId = await resolveDefaultIMAgentId();
+    if (agentId <= 0) {
+      // 解析失败/租户未配置：不改判当前入口（网络抖动不该把已就绪的下拉入口关掉，
+      // 也不该翻转 :key 让列表重建回顶）；未配置时初值本来就是 0，无变化。
+      return;
+    }
+    if (pullEntryAgentId.value != agentId) {
+      pullEntryAgentId.value = agentId;
+    }
+    const cachedName = readCachedDefaultAgentName(agentId);
+    pullEntryAgentName.value = cachedName;
+    if (cachedName.length == 0) {
+      const name = await resolveDefaultIMAgentName(agentId);
+      // 期间可能已被更新的刷新改过目标：只回填仍指向同一个 agent 的名字
+      if (name.length > 0 && pullEntryAgentId.value == agentId) {
+        pullEntryAgentName.value = name;
+      }
+    }
+  }
+
+  /** 真正跳转：批次号已作废（期间切走/重新下拉）或页面不可见就放弃，只收状态。 */
+  function doPullNavigate(url: string, seq: number, pane: string): void {
+    if (seq != pullLaunchSeq || messagePageDisposed || !messagePageVisible) {
+      pullLaunchInFlight = false;
+      resetPullEntryGuide(pane);
+      return;
+    }
+    uni.navigateTo({ url: url });
+  }
+
+  /** 回弹动画走完再跳转：请求很快返回也要等够 PULL_BOUNCE_BACK_MS（从松手时刻算），
+   *  慢请求则立即跳（回弹早结束了）。 */
+  function navigateToChatAfterBounce(url: string, releasedAt: number, seq: number, pane: string): void {
+    if (pullNavigateTimer != 0) {
+      clearTimeout(pullNavigateTimer);
+      pullNavigateTimer = 0;
+    }
+    const remain = PULL_BOUNCE_BACK_MS - (Date.now() - releasedAt);
+    if (remain <= 0) {
+      doPullNavigate(url, seq, pane);
+      return;
+    }
+    pullNavigateTimer = setTimeout((): void => {
+      pullNavigateTimer = 0;
+      doPullNavigate(url, seq, pane);
+    }, remain);
+  }
+
+  /** 建/取租户默认智能体的 IM 会话，复用消息列表智能体行的 /pages/message/chat 详情页。 */
+  async function openDefaultIMAgentConversation(agentId: number, releasedAt: number, seq: number, pane: string): Promise<void> {
+    try {
+      const response = await apiImCreateAgentConversation(`${agentId}`);
+      // 期间已切走/已换一批：这个响应作废（不导航、不动新批次的状态）
+      if (seq != pullLaunchSeq) return;
+      const dataRaw = apiResCode(response) == "0000" ? apiResData<any>(response) : null;
+      const data = dataRaw != null ? dataRaw as UTSJSONObject : null;
+      if (data == null) {
+        pullLaunchInFlight = false;
+        resetPullEntryGuide(pane);
+        return;
+      }
+      const convId = readString(data, "convId");
+      if (convId.length == 0) {
+        pullLaunchInFlight = false;
+        resetPullEntryGuide(pane);
+        return;
+      }
+      const convType = readNumber(data, "convType", 1);
+      const name = readString(data, "peerName");
+      // 会话对端 id（IM 身份）：会话页据此取输入框占位提示（配置按 IM 对端 id 存，
+      // 与列表行入口同一条路）；建会话回包没有该字段时留空，会话页回落平台 agentId。
+      const peerUserId = readString(data, "peerUserId");
+      // 名称回写缓存：下次下拉提示语就能直接「进入{name}会话」（首次拉取时还没有名字）
+      if (name.length > 0) {
+        pullEntryAgentName.value = name;
+        cacheDefaultAgentName(agentId, name);
+      }
+      const url = `/pages/message/chat?convId=${encodeURIComponent(convId)}&convType=${convType}` +
+        (name.length > 0 ? `&name=${encodeURIComponent(name)}` : ``) +
+        `&peerSubject=2&agentId=${agentId}` +
+        (peerUserId.length > 0 ? `&peerId=${encodeURIComponent(peerUserId)}` : ``) +
+        guidePromptQuery(peerUserId);
+      // 先把下拉收回去（快速回弹），回弹动画结束再进会话页
+      navigateToChatAfterBounce(url, releasedAt, seq, pane);
+    } catch (_e) {
+      // 下拉快捷入口失败时保持当前列表，不打扰用户。
+      pullLaunchInFlight = false;
+      resetPullEntryGuide(pane);
+    }
+  }
+
+  /** 越过阈值松手（原生 refresherrefresh）：先快速回弹，再（回弹结束后）进默认智能体会话。
+   *  pane 决定回弹哪一个列表（两个列表各持一份 triggered，见 setPullTriggered）。 */
+  async function handlePanePullRefresh(pane: string): Promise<void> {
+    if (pullLaunchInFlight) {
+      // 上一批还在途（罕见：连拉）：只把下拉收回去，不重复建会话
+      retractPullRefresher(pane);
+      return;
+    }
+    const seq = pullLaunchSeq + 1;
+    pullLaunchSeq = seq;
+    pullLaunchInFlight = true;
+    // 松手即回弹：不再把列表固定在拉出态，跳转等回弹结束后再做（见 navigateToChatAfterBounce）
+    const releasedAt = Date.now();
+    retractPullRefresher(pane);
+    let agentId = pullEntryAgentId.value;
+    if (agentId <= 0) {
+      // 兜底：挂载时缓存里没有默认智能体（旧缓存/闸门后首拉未回）——现场补解析一次
+      agentId = await resolveDefaultIMAgentId();
+      if (seq != pullLaunchSeq) {
+        pullLaunchInFlight = false;
+        return;
+      }
+      if (agentId <= 0) {
+        pullLaunchInFlight = false;
+        return;
+      }
+      pullEntryAgentId.value = agentId;
+      pullEntryAgentName.value = readCachedDefaultAgentName(agentId);
+    }
+    openDefaultIMAgentConversation(agentId, releasedAt, seq, pane);
+  }
+
+  /** 两个列表各自的 refresherrefresh 入口（模板事件绑同步函数：异步逻辑留在上面）。 */
+  function handleConvPanePullRefresh(): void {
+    handlePanePullRefresh("conv");
+  }
+
+  function handleContactPanePullRefresh(): void {
+    handlePanePullRefresh("contact");
+  }
+
+  /** 未过阈值松手回弹 / 手势打断：只收起该列表的下拉态。 */
+  function handleConvPullSettle(): void {
+    resetPullEntryGuide("conv");
+  }
+
+  function handleContactPullSettle(): void {
+    resetPullEntryGuide("contact");
+  }
+
   /** 页面 onLoad 闸门：缓存优先、缺失拉一次租户配置；放行后补跑首拉（原 onLoad 直调的两个 load）。 */
   async function initWorkGate(): Promise<void> {
     const blocked = await resolveWorkCommercialBlocked();
@@ -1919,6 +2181,8 @@
       initImWsClient();
       refreshImUnreadBadge();
     }
+    // 租户配置此刻已在缓存（resolveWorkCommercialBlocked 写）：定下拉入口的默认智能体
+    refreshPullEntryAgent();
     // 先水合再首拉：缓存命中秒出列表（加载态直接进静默刷新语义），网络照常整表替换
     //（onShow 复查可能已抢先解锁并补拉过：loadXxx 自带 loading 去重，水合已有数据早退，重复调用无害）
     hydrateConversationsFromCache();
@@ -2343,12 +2607,15 @@
     const peerSubject = conv.convType == 1
       ? readCachedContactSubjectType(conv.peerUserId)
       : 0;
+    // 单聊恒带对端 id（不依赖主体类型缓存）：详情页拿它与 defaultIMAgentConfig 的
+    // userId 直接比对，首帧就能算好输入框占位提示（不带来则要等详情回包才切文案）。
     const chatUrl =
       `/pages/message/chat?convId=${conv.convId}&convType=${conv.convType}` +
       `&name=${encodeURIComponent(displayConvName(conv))}` +
       `&avatar=${encodeURIComponent(conv.avatarUrl)}` +
       `&unread=${conv.unreadCount}` +
-      (peerSubject > 0 ? `&peerSubject=${peerSubject}` : ``);
+      (peerSubject > 0 ? `&peerSubject=${peerSubject}` : ``) +
+      (conv.convType == 1 && conv.peerUserId.length > 0 ? `&peerId=${encodeURIComponent(conv.peerUserId)}` : ``);
     uni.navigateTo({ url: chatUrl });
   }
 
@@ -3672,6 +3939,8 @@
     cancelRowLongPress();
     addDrawerVisible.value = false;
     messagePageVisible = false;
+    // 切走/进子页：作废下拉跳转（迟到的建会话响应不再把人拽进会话页）
+    cancelPullEntryLaunch();
     // 草稿脏标记快照（问题1）：回页时版本号未变则跳过同步整表重建
     draftsVersionAtHide = chatDraftsVersion();
     if (convRefreshTimer != 0) clearTimeout(convRefreshTimer);
@@ -3699,6 +3968,10 @@
     refreshImUnreadBadge();
     // 本端刚读过的会话：read 回包 unreadCleared 本地清行角标（不等 300ms 去抖全量刷新）
     applyPendingConvReadMark();
+    // 下拉进入默认智能体会话：回页必复位（从会话页返回时列表还停在拉出态），并重读
+    // 租户配置里的默认智能体（管理员可能刚改配置；名称缓存此刻也已由会话详情回填）
+    cancelPullEntryLaunch();
+    refreshPullEntryAgent();
     // 闸门缓存复查（同步读，开销可忽略）：登录页/其他 Tab 拉租户配置会写缓存，
     // 授权态翻转就地生效——撤销即停 WS 清角标，恢复即解锁补首拉
     if (isWorkCommercialBlockedSync()) {

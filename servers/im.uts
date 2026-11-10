@@ -1001,11 +1001,11 @@ export async function apiImSendMediaMsg(
 }
 
 /**
- * 发送图文混排消息（msgSend，msgType=rich_text）。
+ * 发送文字与图片/视频混排消息（msgSend，msgType=rich_text）。
  *
  * ★契约 = PC 端 sendComposed 的 rich_text 分支（nuwax-im-web store/chat.ts，DEV-159）：
  *   body = {"text": 干净 Markdown 正文（可空串，纯多图合法）,
- *          "attachments": [{kind:"image", url, fileName, size, mime}, ...]}
+ *          "attachments": [{kind:"image" 或 "video", url, fileName, size, mime}, ...]}
  *   attachments 是附件元数据的唯一来源；segments 刻意不带——缺席完全合法，
  *   接收端按 text + attachments 渲染（nuwax-im docs/07 §5.12）。
  * ★「有文字且有附件 / 多附件」走本形态；纯文字走 apiImSendTextMsg、
@@ -1178,6 +1178,115 @@ export async function apiImUnpinMsg(
   });
 }
 
+// ============================================================ 自定义链接页签域（对齐 PC nuwax-im-web convApi.listLinks 系列）
+
+/**
+ * 会话自定义链接列表（listLinks）。
+ *
+ * ★标签挂在**会话**上，不是用户级全局一份：A 群加的链接 B 群看不到，同会话成员共享
+ *   （服务端 im_custom_link 持久化，跨设备一致）。
+ * - GET /api/instant-message/conversations/{convId}/links
+ * - data = CustomLinkDto[]：{ id, convId, name, icon?, url, sortOrder?, createTime?, updateTime? }
+ * - 服务端已按 sortOrder 排好（0 起，升序=从左到右），**端上不要重排**
+ * - id/convId 是 int64 雪花号，按字符串处理
+ * - 权限：单聊双方可写；群聊仅群主/管理员可写（普通成员只读，写报 IM_30001）
+ */
+export async function apiImConvLinks(convId: string): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/links`,
+    method: "GET",
+  });
+}
+
+/**
+ * 新增一条自定义链接（addLink）。
+ *
+ * - POST /api/instant-message/conversations/{convId}/links，body={ name, icon?, url }
+ * - ★幂等：同会话同 URL（服务端按规范化 URL 取哈希）再添一次返回既有那条，不占配额
+ * - ★判重先于上限：到上限时补一条已存在的仍成功，新链接才报 IM_20110
+ * - icon 空串 = 用默认链接图标；name/url 为必填
+ */
+export async function apiImConvAddLink(
+  convId: string,
+  name: string,
+  icon: string,
+  url: string,
+): Promise<RequestResponse<any>> {
+  const body = new UTSJSONObject();
+  body["name"] = name;
+  body["icon"] = icon;
+  body["url"] = url;
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/links`,
+    method: "POST",
+    data: JSON.stringify(body),
+  });
+}
+
+/**
+ * 修改一条自定义链接（updateLink）。
+ *
+ * - PUT /api/instant-message/conversations/{convId}/links/{linkId}，body={ name?, icon?, url? }
+ * - ★局部更新：省略的字段保持原值；icon 传空串 = 清空图标（回落默认图标）
+ * - 链接不存在 IM_20111；URL 撞同会话另一条 IM_20112
+ * - 每次成功都会广播 3007 事件（无实际变化也广播）
+ */
+export async function apiImConvUpdateLink(
+  convId: string,
+  linkId: string,
+  name: string,
+  icon: string,
+  url: string,
+): Promise<RequestResponse<any>> {
+  const body = new UTSJSONObject();
+  body["name"] = name;
+  body["icon"] = icon;
+  body["url"] = url;
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/links/${linkId}`,
+    method: "PUT",
+    data: JSON.stringify(body),
+  });
+}
+
+/**
+ * 删除一条自定义链接（removeLink）。
+ *
+ * - DELETE /api/instant-message/conversations/{convId}/links/{linkId}
+ * - ★业务幂等：删不存在的 id 也返回成功
+ */
+export async function apiImConvRemoveLink(
+  convId: string,
+  linkId: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/links/${linkId}`,
+    method: "DELETE",
+  });
+}
+
+/**
+ * 按目标顺序重排自定义链接（reorderLinks，上移/下移用）。
+ *
+ * - PUT /api/instant-message/conversations/{convId}/links/order，body={ linkIds }
+ * - ★linkIds 必须是该会话**当前全部**链接的 id，从最左到最右，不是只传被移动那条
+ * - ★集合与服务端不一致（别人刚增删）→ IM_90001：正确处理是重拉列表让用户再操作，
+ *   不要重试同一组 linkIds
+ * - data = 重排后的完整 CustomLinkDto[]，直接覆盖本地
+ * - linkIds 元素是 int64 雪花号：按原始数字字面量拼（同 apiImCreateGroup 的 memberUserIds）
+ */
+export async function apiImConvReorderLinks(
+  convId: string,
+  linkIds: string[],
+): Promise<RequestResponse<any>> {
+  const ids = linkIds.join(",");
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/links/order`,
+    method: "PUT",
+    data: `{"linkIds":[${ids}]}`,
+  });
+}
+
 // ============================================================ 群信息页域（im-group-info*，契约对齐 PC nuwax-im-web convApi）
 
 /**
@@ -1291,6 +1400,78 @@ export async function apiImGroupSetReadReceipt(
   on: boolean,
 ): Promise<RequestResponse<any>> {
   return await apiImGroupUpdateProfile(convId, `{"readReceiptOn":${on}}`);
+}
+
+/**
+ * 更换群头像（convUpdateProfile 的 avatar 键，PUT /conversations/{convId}）。
+ *
+ * ★入参是**已上传的 URL**（先走 /api/file/upload 直传，见 utils/fileUploader
+ *   uploadSingleFile）——本函数只负责把 URL 写进会话行。
+ * ★仅 IM 自建群的群主/管理员可用：团队群的资料跟随平台，服务端 requireNotSpaceMirror
+ *   会拒；端上在群设置页直接不给入口（判 convType）。
+ */
+export async function apiImGroupSetAvatar(
+  convId: string,
+  avatarUrl: string,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupUpdateProfile(convId, `{"avatar":${JSON.stringify(avatarUrl)}}`);
+}
+
+/**
+ * 禁言（POST /conversations/{convId}/mute，群主/管理员）。
+ *
+ * <p>两个入口共用这一个端点，靠 body 区分：
+ * <ul>
+ *   <li><b>全员禁言</b>：{@code {"muteAll":true|false}} —— ★服务端口径是
+ *       「开启仅群主、关闭管理员也行」（群主不在线时管理员必须能把群解封）；</li>
+ *   <li><b>单人禁言</b>：{@code {"userIds":[...],"durationSec":N}} ——
+ *       {@code durationSec:0} = 解除禁言。</li>
+ * </ul>
+ *
+ * <p>★data 里的 {@code muteAllChanged === false} 表示「本来就是目标状态、没写库」，
+ * 仍是成功码，**不是失败**（同 updateProfile 的 false）。
+ * ★userIds 是 int64 雪花号：以**原始数字字面量**拼进 JSON（同 addMembers），
+ * 走 JSON.stringify 数组会带引号、服务端按字符串解析会报参数错误。
+ * ★body 由调用方拼（本模块不猜字段），见 apiImGroupMuteAll / apiImGroupMuteMembers。
+ */
+async function apiImGroupMuteRaw(
+  convId: string,
+  body: string,
+): Promise<RequestResponse<any>> {
+  return await request({
+    url: `/api/instant-message/conversations/${convId}/mute`,
+    method: "POST",
+    data: body,
+  });
+}
+
+/**
+ * 全员禁言开/关。
+ *
+ * @param on true=开启（仅群主）；false=关闭（群主/管理员都可以）
+ */
+export async function apiImGroupMuteAll(
+  convId: string,
+  on: boolean,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupMuteRaw(convId, `{"muteAll":${on}}`);
+}
+
+/**
+ * 单人禁言 / 解除禁言。
+ *
+ * @param userIds 目标成员（int64 字符串，原样拼进 JSON）
+ * @param durationSec 禁言时长（秒）；**0 = 解除禁言**
+ */
+export async function apiImGroupMuteMembers(
+  convId: string,
+  userIds: string[],
+  durationSec: number,
+): Promise<RequestResponse<any>> {
+  return await apiImGroupMuteRaw(
+    convId,
+    `{"userIds":[${userIds.join(",")}],"durationSec":${durationSec}}`,
+  );
 }
 
 /**

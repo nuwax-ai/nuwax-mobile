@@ -99,6 +99,8 @@ H5 版本部署在 `{域名}/m/` 路径下。
 
 ## 文档
 
+安卓正式包上传 S3、生成 `latest.json`：参见 [APK 发布使用指南](docs/engineering/android-apk-distribution-s3.md)（含首次环境与凭证配置、本地 APK/下载链接发布、结果核对及常见问题）。
+
 更多文档请查看 [docs](./docs) 目录。
 
 ## 许可证

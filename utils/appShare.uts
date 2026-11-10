@@ -10,20 +10,21 @@ import { hasLoginSession } from "@/utils/authSession";
 import { redirectToLoginOnce } from "@/utils/authNavigation";
 import { openShareIntoChat } from "@/utils/im/imForwardSession";
 import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+import { isQrLoginLink } from "@/utils/qrLogin";
 
 const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
 const PENDING_KEY = "nuwax_share_pending";
-const HANDLED_KEY = "nuwax_share_handled_raw";
+/** 冷启动时 onShow 先拿到的协议，交给启动页进入对应页面。 */
+let coldStartScheme = "";
 
 /**
  * 是否启用尚未验收的新分享。
  *
- * false（当前默认）：回到原来的分享。
- * - 会话产物链接仍是 `{域名}/static/file-preview.html?sk={shareKey}`。
- * - 所有分享入口直接系统分享或复制，不弹出「分享到女娲 / 其他」。
- * true：产物链接改为 `{域名}/m/static/share-open.html?kind=file&sk=`，
- * 并且分享先弹出「分享到女娲 / 其他」。验收通过后再改为 true。
+ * false（当前默认）：直接系统分享或复制，不弹出「分享到女娲 / 其他」。
+ * true：分享先弹出「分享到女娲 / 其他」。
+ * 文件预览、网页预览的外链始终是 `{域名}/m/static/share-open.html`：
+ * 微信内点「打开 App」只提示用浏览器打开；其它应用里先看页面内容，再点按钮用 nuwax:// 唤起 App。
  */
 export const USE_NEW_ARTIFACT_SHARE = false;
 
@@ -34,6 +35,8 @@ export class ShareTarget {
   text: string = "";
   sk: string = "";
   filePath: string = "";
+  /** 外部分享要直接展示的 http(s) 页面。文件产物留空，中转页按 sk 打开预览。 */
+  pageUrl: string = "";
 }
 
 function queryValue(raw: string, key: string): string {
@@ -61,14 +64,35 @@ function appendQuery(url: string, key: string, value: string): string {
   return url + join + key + "=" + encodeURIComponent(value);
 }
 
-/** 微信 / 浏览器可打开的 HTTPS 中转页。 */
+/**
+ * 中转页所在站点。
+ * App 用当前服务域名；H5 生产环境接口走相对路径、服务域名为空时，用页面自己的 origin。
+ */
+function sharePageOrigin(): string {
+  const api = getApiBaseUrl();
+  if (api.length > 0) return api;
+  // #ifdef H5 || WEB
+  try {
+    const origin = window.location.origin;
+    const text = origin != null ? `${origin}` : "";
+    if (text.length > 0 && text.indexOf("file:") != 0) return text;
+  } catch (_e) {
+    return "";
+  }
+  // #endif
+  return "";
+}
+
+/** 微信 / 浏览器可打开的 HTTPS 中转页。域名缺失时返回空串，调用方不要把相对路径分享出去。 */
 export function buildShareOpenUrl(target: ShareTarget): string {
-  const base = getApiBaseUrl();
+  const base = sharePageOrigin();
+  if (base.length == 0) return "";
   let url = base + "/m/static/share-open.html?kind=" + encodeURIComponent(target.kind);
   url = appendQuery(url, "id", target.id);
   url = appendQuery(url, "title", target.title);
   url = appendQuery(url, "sk", target.sk);
   url = appendQuery(url, "text", target.text.length > 180 ? target.text.substring(0, 180) : target.text);
+  url = appendQuery(url, "url", target.pageUrl);
   return url;
 }
 
@@ -78,11 +102,14 @@ export function buildAppScheme(target: ShareTarget): string {
   url = appendQuery(url, "title", target.title);
   url = appendQuery(url, "sk", target.sk);
   url = appendQuery(url, "text", target.text.length > 180 ? target.text.substring(0, 180) : target.text);
+  url = appendQuery(url, "url", target.pageUrl);
   return url;
 }
 
 export function parseShareUrl(raw: string): ShareTarget | null {
   if (raw.length == 0) return null;
+  // 登录确认有独立的同服务域校验，不能被 query 中的 kind 当成普通分享消费。
+  if (isQrLoginLink(raw)) return null;
   const lower = raw.toLowerCase();
   const isScheme = lower.indexOf("nuwax://") >= 0;
   const isPage = lower.indexOf("share-open.html") >= 0 || lower.indexOf("kind=") >= 0;
@@ -94,6 +121,8 @@ export function parseShareUrl(raw: string): ShareTarget | null {
   target.sk = queryValue(raw, "sk");
   target.text = queryValue(raw, "text");
   target.filePath = queryValue(raw, "file");
+  const pageTo = queryValue(raw, "to");
+  target.pageUrl = pageTo.length > 0 ? pageTo : queryValue(raw, "url");
   if (target.kind.length == 0) return null;
   return target;
 }
@@ -139,6 +168,7 @@ export function saveShareTarget(target: ShareTarget): void {
   obj["text"] = target.text;
   obj["sk"] = target.sk;
   obj["filePath"] = target.filePath;
+  obj["pageUrl"] = target.pageUrl;
   uni.setStorageSync(PENDING_KEY, JSON.stringify(obj));
 }
 
@@ -154,6 +184,7 @@ export function peekShareTarget(): ShareTarget | null {
     target.text = obj["text"] != null ? `${obj["text"]}` : "";
     target.sk = obj["sk"] != null ? `${obj["sk"]}` : "";
     target.filePath = obj["filePath"] != null ? `${obj["filePath"]}` : "";
+    target.pageUrl = obj["pageUrl"] != null ? `${obj["pageUrl"]}` : "";
     if (target.kind.length == 0) return null;
     return target;
   } catch (_e) {
@@ -249,16 +280,55 @@ export function shareTarget(target: ShareTarget): void {
   // #endif
 }
 
-/** 智能体、文件直接进业务页；其余仍进分享接收页。 */
+/** 智能体、文件、网页直接进对应页面；其余仍进分享接收页。 */
 function openTargetUrl(target: ShareTarget): string {
   if (target.kind == "agent" && target.id.length > 0) {
     return "/subpackages/pages/agent-detail/agent-detail?id=" + encodeURIComponent(target.id);
   }
-  if (target.kind == "file" && target.sk.length > 0) {
-    const fileUrl = getApiBaseUrl() + "/static/file-preview.html?sk=" + encodeURIComponent(target.sk);
-    return "/subpackages/pages/webview/webview?noTicket=1&url=" + encodeURIComponent(fileUrl);
+  const previewUrl = filePreviewUrl(target);
+  if (previewUrl.length > 0) {
+    return webviewRoute(previewUrl, target.title, true);
+  }
+  if (isHttpPageUrl(target.pageUrl)) {
+    return webviewRoute(target.pageUrl, target.title, isSameApiHost(target.pageUrl) != true);
   }
   return receiveUrl(target);
+}
+
+/** 文件分享优先打开带 sk 的预览地址，避免只剩标题时落到「没有可读文本」。 */
+function filePreviewUrl(target: ShareTarget): string {
+  const pointedAtFile = isHttpPageUrl(target.pageUrl) && target.pageUrl.indexOf("file-preview.html") >= 0;
+  if (pointedAtFile) return target.pageUrl;
+  if (target.sk.length == 0) return "";
+  if (target.kind != "file" && target.kind != "page") return "";
+  // 普通网页自己有地址时，不拿 sk 覆盖。
+  if (target.kind == "page" && isHttpPageUrl(target.pageUrl)) return "";
+  const base = sharePageOrigin();
+  if (base.length == 0) return "";
+  return base + "/static/file-preview.html?sk=" + encodeURIComponent(target.sk);
+}
+
+function webviewRoute(raw: string, title: string, noTicket: boolean): string {
+  let page = "/subpackages/pages/webview/webview?url=" + encodeURIComponent(raw);
+  if (noTicket) {
+    page = page + "&noTicket=1";
+  }
+  if (title.length > 0) {
+    page = page + "&title=" + encodeURIComponent(title);
+  }
+  return page;
+}
+
+function isHttpPageUrl(raw: string): boolean {
+  const lower = raw.toLowerCase();
+  return lower.indexOf("https://") == 0 || lower.indexOf("http://") == 0;
+}
+
+/** 站内页回到 App 后仍走 webview 自己的登录票据；外站不要把 _ticket 拼到别人的域名上。 */
+function isSameApiHost(raw: string): boolean {
+  const api = getApiBaseUrl().toLowerCase();
+  if (api.length == 0) return true;
+  return raw.toLowerCase().indexOf(api) == 0;
 }
 
 function receiveUrl(target: ShareTarget): string {
@@ -268,49 +338,45 @@ function receiveUrl(target: ShareTarget): string {
   url = appendQuery(url, "sk", target.sk);
   url = appendQuery(url, "text", target.text);
   url = appendQuery(url, "file", target.filePath);
+  url = appendQuery(url, "to", target.pageUrl);
+  url = appendQuery(url, "sk", target.sk);
   return url;
 }
 
 /**
- * 冷启动或回前台时消费一次外部链接。
- * 智能体 / 文件可未登录打开；文本图片文件进来需已登录，否则先记下再去登录。
+ * 冷启动时 onShow 先拿到协议。启动页再取走，避免这次地址被丢掉后进入首页。
+ */
+export function rememberColdStartScheme(raw: string): void {
+  if (raw.length == 0) return;
+  coldStartScheme = raw;
+}
+
+/** 取走冷启动协议。没有则返回空串，调用方再读本次启动参数。 */
+export function takeColdStartScheme(): string {
+  const raw = coldStartScheme;
+  coldStartScheme = "";
+  return raw;
+}
+
+/**
+ * 冷启动或回前台时按外部链接进入对应页面。
+ * 不记录「已经打开过」：每次唤起都进入该页面。
+ * 连点由中转页在 App 还没起来时挡住。
+ * 智能体 / 文件可未登录打开；文本图片进来需已登录，否则先记下再去登录。
  */
 export function routeIncomingShare(hasToken: boolean, schemeFromShow: string): boolean {
   const fromShow = schemeFromShow.length > 0 ? schemeFromShow : "";
   const raw = fromShow.length > 0 ? fromShow : readEnterRaw();
   const target = parseShareUrl(raw);
   if (target == null) return false;
-  const handled = uni.getStorageSync(HANDLED_KEY);
-  if (handled != null && `${handled}` == raw) return false;
-  uni.setStorageSync(HANDLED_KEY, raw);
-  const inbound = target.kind == "text" || target.kind == "image" || target.kind == "file" || target.kind == "message";
+  // 文件和网页靠 sk / 页面地址就能看，不要求先登录。文本、图片、会话摘要仍要登录。
+  const inbound = target.kind == "text" || target.kind == "image" || target.kind == "message";
   if (inbound && hasToken != true) {
     saveShareTarget(target);
     return false;
   }
   uni.reLaunch({ url: openTargetUrl(target) });
   return true;
-}
-
-/**
- * 剪贴板里是「标题 + 分享链接」时，打开 App 后跳到对应页面。
- * 同一段内容只处理一次，避免每次回前台都跳走。
- */
-export function routeClipboardShare(hasToken: boolean, done: (opened: boolean) => void): void {
-  uni.getClipboardData({
-    success: (res: GetClipboardDataSuccess) => {
-      const text = res.data != null ? res.data : "";
-      const hit = text.indexOf("share-open.html") >= 0 || text.indexOf("nuwax://") >= 0;
-      if (hit != true) {
-        done(false);
-        return;
-      }
-      done(routeIncomingShare(hasToken, text));
-    },
-    fail: (_err: any) => {
-      done(false);
-    },
-  });
 }
 
 export function routePendingAfterLogin(): void {

@@ -75,7 +75,7 @@
 
 <script setup lang="uts">
 import { computed, ref } from 'vue';
-import { onLoad, onShow, onHide, onUnload } from '@dcloudio/uni-app';
+import { onLoad, onShow, onHide, onUnload, onBackPress } from '@dcloudio/uni-app';
 import {
   apiQrLoginUser,
   apiQrLoginScan,
@@ -106,6 +106,10 @@ import { useI18n, emptyI18nParams } from '@/utils/i18n';
 // #ifdef H5 || WEB
 import { authBrowserQuery } from '@/utils/idpNavigation';
 import { isAppWebViewEmbedded } from '@/utils/appWebViewDetect';
+import {
+  isNativeAppWebView,
+  ensureAppWebViewNavigationReady,
+} from '@/utils/appWebViewNavigation';
 // #endif
 
 const { t: translate } = useI18n();
@@ -123,6 +127,7 @@ let revision = 0;
 let running = false;
 let foreground = true;
 let pageToken = '';
+let leaving = false;
 
 const title = computed((): string => {
   if (state.value == 'success') return t('Mobile.QrLogin.success');
@@ -256,6 +261,63 @@ function retryLogin(): void {
   prepareLogin();
 }
 
+function returnHome(): void {
+  switchMainTab({
+    url: '/pages/message/message',
+    fail: (_error) => {
+      leaving = false;
+    },
+  });
+}
+function finish(): void {
+  if (leaving) return;
+  leaving = true;
+  // 导航开始就废弃请求，避免离页期间的 401 再次拉起登录。
+  foreground = false;
+  invalidate();
+  // #ifdef H5 || WEB
+  if (isNativeAppWebView()) {
+    // 1.2.8 等旧客户端把本页放在 web-view 内；必须退出原生容器，不能只切 H5 路由。
+    const exitRevision = revision;
+    ensureAppWebViewNavigationReady().then((ready: boolean): void => {
+      if (exitRevision != revision) {
+        leaving = false;
+        return;
+      }
+      try {
+        if (ready) {
+          const w = window as any;
+          w.uni.webView.reLaunch({
+            url: '/pages/tab-shell/tab-shell?tab=/pages/message/message',
+          });
+          return;
+        }
+      } catch (_error) {
+        // 保留完成/取消入口，允许用户再次退出。
+      }
+      leaving = false;
+    });
+    return;
+  }
+  // #endif
+  // 外部唤起、登录回跳会 reLaunch 到本页，栈底无页可退。
+  if (getCurrentPages().length <= 1) {
+    returnHome();
+    return;
+  }
+  uni.navigateBack({
+    delta: 1,
+    fail: (_error: any) => {
+      returnHome();
+    },
+  });
+}
+function cancelLogin(): void {
+  sceneId = '';
+  state.value = 'cancelled';
+  finish();
+}
+
 async function confirmLogin(): Promise<void> {
   if (running || state.value != 'ready' || shownAccountKey.length == 0) return;
   const value = revision,
@@ -280,6 +342,12 @@ async function confirmLogin(): Promise<void> {
     const confirmed = await apiQrLoginConfirm(sceneId, serviceOrigin.value);
     if (!accepted(confirmed, value, token)) return;
     state.value = 'success';
+    // #ifdef APP
+    finish();
+    // #endif
+    // #ifdef H5 || WEB
+    if (isNativeAppWebView()) finish();
+    // #endif
   } catch (_error) {
     if (stillCurrent(value, token)) {
       state.value = 'error';
@@ -293,24 +361,12 @@ async function confirmLogin(): Promise<void> {
     if (value == revision) running = false;
   }
 }
-function cancelLogin(): void {
-  invalidate();
-  sceneId = '';
-  state.value = 'cancelled';
-}
-function finish(): void {
-  uni.navigateBack({
-    fail: (_error: any) => {
-      switchMainTab({ url: '/pages/message/message' });
-    },
-  });
-}
 function hidePage(): void {
   foreground = false;
   invalidate();
 }
 function showPage(): void {
-  if (foreground) return;
+  if (leaving || foreground) return;
   foreground = true;
   if (
     state.value == 'success' ||
@@ -369,6 +425,12 @@ onLoad((query: any) => {
 });
 onShow(showPage);
 onHide(hidePage);
+onBackPress((options: OnBackPressOptions): boolean => {
+  // finish / switchMainTab 内部的 navigateBack 必须放行。
+  if (options.from == 'navigateBack') return false;
+  finish();
+  return true;
+});
 onUnload(() => {
   hidePage();
   // #ifdef H5 || WEB

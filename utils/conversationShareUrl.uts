@@ -1,0 +1,252 @@
+import { getApiBaseUrl } from "@/constants/config";
+
+/**
+ * 会话分享只去掉宿主注入参数。业务 query（id、conversationId、pType 等）原样保留。
+ */
+const CONVERSATION_SHARE_DROP_KEYS: string[] = [
+  "accessToken",
+  "appEmbedded",
+  "appNativeLogin",
+  "drawerTitleScope",
+  "drawerTitleBootstrap",
+  "statusBarHeight",
+  "safeAreaBottom",
+  "apiBase",
+  "token",
+  "offlineH5RequestId",
+  "offlineH5Attempt",
+];
+
+function isDroppedShareKey(key: string): boolean {
+  for (let i = 0; i < CONVERSATION_SHARE_DROP_KEYS.length; i++) {
+    if (CONVERSATION_SHARE_DROP_KEYS[i] == key) return true;
+  }
+  return false;
+}
+
+function stripQuery(query: string): string {
+  if (query.length == 0) return "";
+  const parts = query.split("&");
+  const kept: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.length == 0) continue;
+    const eq = part.indexOf("=");
+    const key = eq >= 0 ? part.substring(0, eq) : part;
+    if (isDroppedShareKey(key)) continue;
+    kept.push(part);
+  }
+  return kept.join("&");
+}
+
+function readQueryValue(url: string, key: string): string {
+  const hash = url.indexOf("#");
+  const beforeHash = hash >= 0 ? url.substring(0, hash) : url;
+  const mark = beforeHash.indexOf("?");
+  if (mark < 0) return "";
+  const parts = beforeHash.substring(mark + 1).split("&");
+  const prefix = key + "=";
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.indexOf(prefix) == 0) {
+      const raw = part.substring(prefix.length);
+      try {
+        const decoded = decodeURIComponent(raw);
+        return decoded != null ? decoded : raw;
+      } catch (_e) {
+        return raw;
+      }
+    }
+  }
+  return "";
+}
+
+function trimOrigin(origin: string): string {
+  let text = origin;
+  while (text.length > 0 && text.charAt(text.length - 1) == "/") {
+    text = text.substring(0, text.length - 1);
+  }
+  return text;
+}
+
+/** 取出主机名，并去掉末尾多余的点。 */
+function hostOf(url: string): string {
+  const lower = url.toLowerCase();
+  const schemeEnd = lower.indexOf("://");
+  if (schemeEnd < 0) return "";
+  const rest = lower.substring(schemeEnd + 3);
+  let host = rest;
+  const slash = rest.indexOf("/");
+  if (slash >= 0) host = rest.substring(0, slash);
+  const query = host.indexOf("?");
+  if (query >= 0) host = host.substring(0, query);
+  const hash = host.indexOf("#");
+  if (hash >= 0) host = host.substring(0, hash);
+  while (host.length > 0 && host.charAt(host.length - 1) == ".") {
+    host = host.substring(0, host.length - 1);
+  }
+  return host;
+}
+
+/**
+ * http(s) 地址去掉主机名末尾的点。路径只剩 / 时补回 /m/。
+ * 会话页改 hash 后，部分 WebView 会把地址收成 https://域名./#/路由。
+ */
+function canonicalHttpBase(url: string): string {
+  const schemeMark = url.indexOf("://");
+  if (schemeMark < 0) return url;
+  const scheme = url.substring(0, schemeMark + 3);
+  const rest = url.substring(schemeMark + 3);
+  let host = rest;
+  let afterHost = "";
+  const slash = rest.indexOf("/");
+  if (slash >= 0) {
+    host = rest.substring(0, slash);
+    afterHost = rest.substring(slash);
+  } else {
+    const query = rest.indexOf("?");
+    if (query >= 0) {
+      host = rest.substring(0, query);
+      afterHost = rest.substring(query);
+    }
+  }
+  while (host.length > 0 && host.charAt(host.length - 1) == ".") {
+    host = host.substring(0, host.length - 1);
+  }
+  let path = afterHost;
+  let queryText = "";
+  const queryPos = afterHost.indexOf("?");
+  if (queryPos >= 0) {
+    path = afterHost.substring(0, queryPos);
+    queryText = afterHost.substring(queryPos);
+  }
+  if (path.length == 0 || path == "/") path = "/m/";
+  return scheme + host + path + queryText;
+}
+
+function schemeAndHost(url: string): string {
+  const lower = url.toLowerCase();
+  const schemeEnd = lower.indexOf("://");
+  if (schemeEnd < 0) return "";
+  const host = hostOf(url);
+  if (host.length == 0) return "";
+  return lower.substring(0, schemeEnd + 3) + host;
+}
+
+function isInAppRoute(hash: string): boolean {
+  const queryPos = hash.indexOf("?");
+  const pathOnly = queryPos >= 0 ? hash.substring(0, queryPos) : hash;
+  return pathOnly.indexOf("/subpackages/") == 0 || pathOnly.indexOf("/pages/") == 0;
+}
+
+/**
+ * 把当前页地址收成可对外分享的会话链接。
+ * 浏览器页保留自己的 origin 和路径；离线包 file:// 改写到服务域名的 /m/ 路由。
+ * @param href 当前 location.href
+ * @param fallbackOrigin file:// 且地址上没有 apiBase 时使用的服务域名
+ */
+export function buildConversationShareUrl(href: string, fallbackOrigin: string): string {
+  if (href.length == 0) return "";
+  const hashIndex = href.indexOf("#");
+  const beforeHash = hashIndex >= 0 ? href.substring(0, hashIndex) : href;
+  let hash = hashIndex >= 0 ? href.substring(hashIndex + 1) : "";
+  const hashQuery = hash.indexOf("?");
+  if (hashQuery >= 0) {
+    const hashPath = hash.substring(0, hashQuery);
+    const kept = stripQuery(hash.substring(hashQuery + 1));
+    hash = kept.length > 0 ? hashPath + "?" + kept : hashPath;
+  }
+  const filePage = beforeHash.indexOf("file:") == 0;
+  if (hash.indexOf("/") != 0 && hash.length > 0) hash = "/" + hash;
+  // 站内会话统一收成 {域名}/m/#/路由，避免内嵌页地址缺 /m/ 或域名多一个点。
+  if (isInAppRoute(hash)) {
+    const fromQuery = filePage ? readQueryValue(href, "apiBase") : "";
+    const originSource = fromQuery.length > 0 ? fromQuery : (filePage ? fallbackOrigin : beforeHash);
+    const origin = schemeAndHost(originSource.length > 0 ? originSource : fallbackOrigin);
+    if (origin.length == 0) return "";
+    return origin + "/m/#" + hash;
+  }
+  if (filePage) return "";
+  const queryIndex = beforeHash.indexOf("?");
+  let cleanedBefore = beforeHash;
+  if (queryIndex >= 0) {
+    const base = beforeHash.substring(0, queryIndex);
+    const kept = stripQuery(beforeHash.substring(queryIndex + 1));
+    cleanedBefore = kept.length > 0 ? base + "?" + kept : base;
+  }
+  if (cleanedBefore.indexOf("http://") != 0 && cleanedBefore.indexOf("https://") != 0) return "";
+  if (hash.length == 0) return cleanedBefore;
+  return cleanedBefore + "#" + hash;
+}
+
+/**
+ * 从会话分享地址取出 App 内路由。
+ * 只接受当前服务域名下的 /pages、/subpackages 路由，避免把外站地址当成站内页打开。
+ * @param pageUrl 会话页 http(s) 地址
+ * @param apiOrigin 当前服务域名；为空时只接受路径里带 /m/# 的地址
+ */
+export function nativeRouteFromConversationUrl(pageUrl: string, apiOrigin: string): string {
+  const lower = pageUrl.toLowerCase();
+  if (lower.indexOf("http://") != 0 && lower.indexOf("https://") != 0) return "";
+  const originHost = hostOf(apiOrigin);
+  if (originHost.length > 0) {
+    if (hostOf(pageUrl) != originHost) return "";
+  } else if (pageUrl.indexOf("/m/#/") < 0 && pageUrl.indexOf("/m#/") < 0) {
+    return "";
+  }
+  const hashPos = pageUrl.indexOf("#");
+  if (hashPos < 0) return "";
+  let hash = pageUrl.substring(hashPos + 1);
+  if (hash.length == 0) return "";
+  if (hash.indexOf("/") != 0) hash = "/" + hash;
+  const queryPos = hash.indexOf("?");
+  const pathOnly = queryPos >= 0 ? hash.substring(0, queryPos) : hash;
+  if (pathOnly.indexOf("/subpackages/") != 0 && pathOnly.indexOf("/pages/") != 0) return "";
+  if (queryPos < 0) return hash;
+  const kept = stripQuery(hash.substring(queryPos + 1));
+  return kept.length > 0 ? pathOnly + "?" + kept : pathOnly;
+}
+
+/**
+ * 只替换当前页 hash，不使用 URL.hash。
+ * 部分 WebView 把以 / 开头的路由写进 hash 时，会在域名后多一个点，并丢掉 /m/。
+ * @param route 站内路由，如 /subpackages/pages/agent-detail/agent-detail?id=1
+ */
+export function replaceLocationHash(route: string): void {
+  // #ifdef H5 || WEB
+  if (route.length == 0) return;
+  let next = route;
+  if (next.indexOf("/") != 0) next = "/" + next;
+  let href = "";
+  try {
+    href = location.href != null ? `${location.href}` : "";
+  } catch (_e) {
+    return;
+  }
+  if (href.length == 0) return;
+  const hashIndex = href.indexOf("#");
+  let before = hashIndex >= 0 ? href.substring(0, hashIndex) : href;
+  if (before.indexOf("http://") == 0 || before.indexOf("https://") == 0) {
+    before = canonicalHttpBase(before);
+  }
+  try {
+    history.replaceState(null, "", before + "#" + next);
+  } catch (_e2) {
+    return;
+  }
+  // #endif
+}
+
+/** 读取当前 H5 地址并收成会话分享链接。非 H5 返回空串。 */
+export function currentConversationShareUrl(): string {
+  let href = "";
+  // #ifdef H5 || WEB
+  try {
+    href = window.location.href != null ? `${window.location.href}` : "";
+  } catch (_e) {
+    href = "";
+  }
+  // #endif
+  if (href.length == 0) return "";
+  return buildConversationShareUrl(href, getApiBaseUrl());
+}

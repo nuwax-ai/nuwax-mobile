@@ -61,12 +61,14 @@
           :pull-triggered="pullConvTriggered"
           :pull-threshold="PULL_ENTRY_THRESHOLD"
           :pull-max-drag-distance="PULL_ENTRY_MAX_DRAG_DISTANCE"
+          :pull-slot-height="PULL_ENTRY_SLOT_HEIGHT"
+          :pull-reset-token="pullConvResetToken"
           @retry="handleConvRetry"
           @scroll="handleListScroll"
           @scroll-lower="handleConvScrollLower"
           @pull-refresh="handleConvPanePullRefresh"
-          @pull-restore="handleConvPullSettle"
-          @pull-abort="handleConvPullSettle"
+          @pull-restore="handleConvPullRestore"
+          @pull-abort="handleConvPullAbort"
           @pane-touchstart="handlePageTouchStart"
           @pane-touchend="handlePageTouchEnd"
           @pane-touchcancel="handlePageTouchCancel"
@@ -109,11 +111,13 @@
           :pull-triggered="pullContactTriggered"
           :pull-threshold="PULL_ENTRY_THRESHOLD"
           :pull-max-drag-distance="PULL_ENTRY_MAX_DRAG_DISTANCE"
+          :pull-slot-height="PULL_ENTRY_SLOT_HEIGHT"
+          :pull-reset-token="pullContactResetToken"
           @retry="handleContactRetry"
           @scroll="handleListScroll"
           @pull-refresh="handleContactPanePullRefresh"
-          @pull-restore="handleContactPullSettle"
-          @pull-abort="handleContactPullSettle"
+          @pull-restore="handleContactPullRestore"
+          @pull-abort="handleContactPullAbort"
           @pane-touchstart="handlePageTouchStart"
           @pane-touchend="handlePageTouchEnd"
           @pane-touchcancel="handlePageTouchCancel"
@@ -1932,14 +1936,18 @@
   // 交互：两个列表的 scroll-view 开原生下拉（refresher-default-style=none + 自定义
   // refresher 插槽：三个灰点），下拉时列表整体下移、圆点从列表顶部后面露出来。
   // 圆点为微信式：前半程一个大灰点，后半程展开为横向三个小灰点：
-  //   · 没到阈值就松手 → 原生回弹（refresherrestore/abort），什么都不发生；
-  //   · 越过阈值松手 → 原生 refresherrefresh → 立刻回弹收起 → 回弹结束后进会话页
-  //     （跳转等 PULL_BOUNCE_BACK_MS，请求快返回也不会在拉出态上直接闪进会话）。
+  //   · 下拉到「三个圆点完整展开」= 原生触发线（PULL_ENTRY_THRESHOLD）；
+  //   · 没拉到这条线就松手 → 原生回弹（refresherabort），什么都不发生；
+  //   · 拉到/拉过这条线松手 → 原生 refresherrefresh → **当帧就进会话页**，不等回弹。
+  //     ★圆点形态进度按**触发距离**归一：三圆点完全展开时恰好落在原生触发线上，
+  //       看到三个点再松手必跳（旧版按 maxDrag 归一，圆点先展开、触发线还在后面，松手就白拉）。
+  //     ★页面切走会打断原生收回动画 → 跳转后趁页面被会话页盖住再翻 pull*ResetToken
+  //       让列表重建归位（不能在回页 onShow 做：整块 scroll-view 卸/挂会让回页首帧闪一下）。
   // ★判定全交原生 refresher：App-Android 子 view 的 touchmove 在 touchslop(≈8px) 之后
   //   被 scroll-view 截断，旧版逐帧累积 touchmove 距离的写法永远攒不起来（只有 touchend
   //   能拿到终点坐标），提示语因此一帧都没显示过。
   // ★圆点渲染按平台分两套（见 pane 组件）：
-  //   Android/iOS 画在 refresher 插槽里，随原生位移上浮（插槽按最大拖拽距离开高）；
+  //   Android/iOS 画在 refresher 插槽里，随原生位移上浮（插槽按 PULL_ENTRY_SLOT_HEIGHT 开高）；
   //   鸿蒙的插槽内容被 runtime 挂进 Refresh 的 NativeBuilder 子树，插槽里的样式更新不跟手，
   //   所以鸿蒙把圆点画在列表外的覆盖层（贴 pane 顶、高度 = 原生下拉位移 dy），
   //   圆点在该层 flex 居中 → 全程恒在下拉区域的垂直中心。
@@ -1959,26 +1967,124 @@
   const pullContactTriggered = ref<boolean>(false);
   /** 建会话请求在途（防连拉连点重复创建/重复导航）。 */
   let pullLaunchInFlight = false;
+  /** 下拉进入会话后首次返回：保留当前列表实例与数据，不做整表克隆/静默重拉，
+   *  避免返回首帧发生列表跳动或组件重渲染。轻量角标同步仍在 onShow 前半段执行。 */
+  let skipNextShowRefreshAfterPull = false;
   /** 下拉跳转批次号：页面隐藏/重新下拉都换一批，迟到的响应不再抢导航。 */
   let pullLaunchSeq = 0;
-  /** 回弹结束后的延迟跳转定时器（0=没有挂起任务）。 */
+  /** 正在等导航时机的列表（""=没有挂起的下拉跳转）。 */
+  let pullBouncePane = "";
+  /** 松手时刻（导航 = 松手 + PULL_NAVIGATE_DELAY_MS，与请求回包取较晚者）。 */
+  let pullReleaseAt = 0;
+  /** 原生是否已把下拉态收回到位（收到 refresherrestore）。只用来判断回页要不要重建复位，
+   *  不再卡导航——Android 的收回自带 300ms 延迟 + 收回动画，等完整是 1s 起步。 */
+  let pullBounceSettled = false;
+  /** 到点导航的定时器。 */
   let pullNavigateTimer = 0;
-  /** 松手后等原生回弹动画走完再跳转的时长（ms）：太快跳会看起来「拉出态直接闪进会话」。 */
-  const PULL_BOUNCE_BACK_MS = 300;
-  /** 原生 refresher 触发距离（鸿蒙原生的 refreshingContent 窗口高度也取这个值）。 */
-  const PULL_ENTRY_THRESHOLD = 120;
-  /** 原生 refresher 最大拖拽距离（圆点插槽按它开高，见 pane 组件里的 pullGuideSlotHeight）。
-   *  ★Android 必须贴近阈值：Android 原生的刷新态停靠高度 = 插槽（header）高度
-   *    （app-runtime 里 header 高度取插槽 getLayoutHeight，触发点再按 阈值/插槽高 归一），
-   *    插槽按 320 开高时，松手过阈值后原生会把列表一路推到 320 再回弹，看起来就是
-   *    「松手后又自动下滑一段」再跳转；iOS/鸿蒙按阈值停靠，没有这一段。
-   *    Android 压到 阈值+20：停靠位置≈松手位置（最多 20px 余量），同时留出可触发区间
-   *    ——插槽高 ≤ 阈值时触发点=插槽高，永远拉不过去。 */
+  /** 目标 URL / 批次（""=建会话请求还没回）。 */
+  let pullPendingUrl = "";
+  let pullPendingSeq = 0;
+  /** 预取的默认智能体会话（进页/回页静默建一次，下拉时直接用 convId 出 URL，
+   *  省掉「松手 → 等建会话回包（实测 500ms）→ 才跳」）。 */
+  let prefetchAgentId = 0;
+  let prefetchConvId = "";
+  let prefetchConvType = 1;
+  let prefetchPeerId = "";
+  let prefetchName = "";
+  let prefetchOwnerId = "";
+  let prefetchedAt = 0;
+  let prefetchInFlight = false;
+  /** 预取多久算「还新鲜」：过期只是后台重取一次（下拉仍用旧 convId，它依然有效）。 */
+  const PULL_PREFETCH_TTL_MS = 5 * 60 * 1000;
+  /** 「隐藏期重建列表」的标志（导航时原生还没收回完，页面切走会打断收回动画）。 */
+  let pullResetOnShow = false;
+  /** 上面那个重建只对这一个列表做（"conv"/"contact"；另一个不白重建）。 */
+  let pullResetPane = "";
+  /** 隐藏期复位的定时器（0=没有排队）。 */
+  let pullResetTimer = 0;
+  /** 跳转后多久在隐藏状态下翻重建令牌：要等会话页的入场动画把本页完全盖住
+   *  （uvue 默认转场约 300ms），本页的重建才不可见。 */
+  const PULL_RESET_HIDDEN_DELAY_MS = 400;
+  /** 是否把列表复位挪到「页面被盖住」的时候做。
+   *  ★Android 现在让 reset token 进入原生 scroll-view key，隐藏期翻 token 会确定创建
+   *    全新的 SmartRefreshLayout，不再复用残留位移节点；因此恢复隐藏期重建，避免回页
+   *    onShow 才卸载/挂载列表造成一帧白屏。onShow 仍保留 400ms 内极端快速返回的兜底。
+   *  ★Harmony 仍在 onShow 复位；iOS 不卸载 scroll-view，只清展示态。 */
   // #ifdef APP-ANDROID
-  const PULL_ENTRY_MAX_DRAG_DISTANCE = PULL_ENTRY_THRESHOLD + 20;
+  const PULL_RESET_WHILE_HIDDEN = true;
+  // #endif
+  // #ifdef APP-HARMONY
+  const PULL_RESET_WHILE_HIDDEN = false;
   // #endif
   // #ifndef APP-ANDROID
-  const PULL_ENTRY_MAX_DRAG_DISTANCE = 320;
+  // #ifndef APP-HARMONY
+  const PULL_RESET_WHILE_HIDDEN = true;
+  // #endif
+  // #endif
+  /** 列表重建令牌（各自拼进对应 pane 的 scroll-view key，变化=重建=原生下拉归位）。
+   *  两个列表分开计：只重建被下拉的那一个，另一个（含隐藏的）不白重建。 */
+  const pullConvResetToken = ref<number>(0);
+  const pullContactResetToken = ref<number>(0);
+  /** 松手到导航的等待（ms）：0 = 松手当帧就跳。
+   *  ★不再等原生回弹：Android `finishRefresh()` 内部就有 300ms 固定延迟才开始收，
+   *    等它收完是 1s 起步（13:48 实测 refresh→restore 1087ms），那就是用户说的「停顿」。
+   *    切页会打断收回动画，回页由 pull*ResetToken 重建滚动容器归位。 */
+  const PULL_NAVIGATE_DELAY_MS = 0;
+  /** 松手后的最短等待（ms）：同样 0（restore 先到也不额外等）。 */
+  const PULL_NAVIGATE_MIN_WAIT_MS = 0;
+  /** 下拉入口的视觉触发距离。Android/鸿蒙维持 54px；iOS 采用 68px，
+   *  让列表有更充足的跟手展开行程。Android/iOS 的原生 refresher-threshold 会由 pane
+   *  放到 maxDrag 之外，实际触发统一在 touchend 按这个距离判定。
+   *  ★相对的是**插槽高**（不是最大拖拽距离）：触发点 = 插槽高 × (threshold / 插槽高)，
+   *    判定要求位移**超过**它 —— 两者相等时位移正好卡在那一点，可能永远判不出来，留 10%。
+   *  ★圆点形态进度也按这个值归一（见 pane）：位移走到这里 = 三圆点完全展开 = 原生触发，
+   *    三者同一根线 → 看到三个点再松手必跳。 */
+  // #ifdef APP-IOS
+  const PULL_ENTRY_THRESHOLD = 68;
+  // #endif
+  // #ifndef APP-IOS
+  const PULL_ENTRY_THRESHOLD = 54;
+  // #endif
+  /** 圆点插槽高度（= 原生 refresher header 高度）。Android 固定为 60px，与最大
+   *  下拉距离完全一致；圆点按当前可见灰区高度补偿偏移，全程保持垂直居中。
+   *  iOS 保留 74px 插槽配 68px 行程。
+   *  原生按它算触发率
+   *  「threshold / headerHeight」、松手后也停靠到它 —— 必须**远小于** Android 的最大拖拽
+   *  距离（见下），否则触发后列表会继续往下滑一大段。圆点的垂直居中与形态进度都按它算：
+   *  形态进度按 **PULL_ENTRY_THRESHOLD** 归一 = 拉到触发线恰好三圆点完全展开。 */
+  // #ifdef APP-ANDROID
+  const PULL_ENTRY_SLOT_HEIGHT = 60;
+  // #endif
+  // #ifdef APP-IOS
+  const PULL_ENTRY_SLOT_HEIGHT = 74;
+  // #endif
+  // #ifndef APP-ANDROID
+  // #ifndef APP-IOS
+  const PULL_ENTRY_SLOT_HEIGHT = 60;
+  // #endif
+  // #endif
+  /** 原生 refresher 最大拖拽距离（= 能拉多远，不是插槽高度）。
+   *  ★Android 的 SmartRefreshLayout 对拖拽有阻尼：位移不是 1:1 跟手，而是
+   *    `dy = maxDrag * (1 - 100^(-手指位移 / 视口高))`（字节码逆查，dragRate 已被
+   *    DCloud 设成 1，剩下的就是这个饱和曲线）。maxDrag 越小，同样手指位移拿到的 dy 越小：
+   *    maxDrag=60 时要拉满一屏多（≈800px 手指位移）才走到 dy=54 —— 用户感受就是
+   *    「同样的距离圆点展开慢、整体发粘」。Android 现固定为 60px，不再运行时动态
+   *    改 maxDrag：无论连续下拉多少次，原生灰区与列表的最大位移都保持一致。
+   *  ★iOS：**最大拖拽距离 = 触发距离**——拉到「三个圆点完整」就是物理尽头（再往下
+   *    拉不动），松手立刻进会话页。这样原生也不会进入刷新态（不会把灰区再撑高一段），
+   *    松手后没有任何多余位移。iOS 的位移是 1:1 跟手、硬停点就是 maxDrag，所以尽头
+   *    dy 恰好 = 68，原生按「超过才触发」的口径会派 abort；兜底有两道 ——
+   *    pane 在 touchend 当帧判定 dy ≥ threshold×0.97 直接上抛 pull-refresh，
+   *    abort 回落里还有 threshold×0.98 的第二道 → 松手必跳。
+   *  ★鸿蒙：维持 60（原生 Refresh 没有 Android 那条阻尼曲线，60 就是硬停点）。 */
+  // #ifdef APP-ANDROID
+  const PULL_ENTRY_MAX_DRAG_DISTANCE = 60;
+  // #endif
+  // #ifdef APP-IOS
+  const PULL_ENTRY_MAX_DRAG_DISTANCE = PULL_ENTRY_THRESHOLD;
+  // #endif
+  // #ifdef APP-HARMONY
+  const PULL_ENTRY_MAX_DRAG_DISTANCE = 60;
   // #endif
 
   const pullEntryEnabled = computed((): boolean => pullEntryAgentId.value > 0);
@@ -1997,31 +2103,113 @@
     setPullTriggered(pane, false);
   }
 
-  /** 收掉一次下拉跳转（页面隐藏/回页时调）：作废在途批次、取消延迟跳转、收起下拉态。 */
-  function cancelPullEntryLaunch(): void {
-    pullLaunchSeq = pullLaunchSeq + 1;
-    pullLaunchInFlight = false;
+  /** 清掉「等导航时机」的挂起状态（不碰 triggered 与批次号）。 */
+  function clearPullBounceWait(): void {
     if (pullNavigateTimer != 0) {
       clearTimeout(pullNavigateTimer);
       pullNavigateTimer = 0;
     }
+    pullBouncePane = "";
+    pullReleaseAt = 0;
+    pullBounceSettled = false;
+    pullPendingUrl = "";
+    pullPendingSeq = 0;
+  }
+
+  /** 收掉一次下拉跳转（页面隐藏/回页时调）：作废在途批次、取消延迟跳转、收起下拉态。 */
+  function cancelPullEntryLaunch(): void {
+    pullLaunchSeq = pullLaunchSeq + 1;
+    pullLaunchInFlight = false;
+    clearPullBounceWait();
     pullConvTriggered.value = false;
     pullContactTriggered.value = false;
   }
 
-  /** 让原生下拉立刻回弹：先置 true，等 Vue 把该状态提交给原生 scroll-view 后再置 false。
-   *  直接用 16ms 定时可能被同一渲染批次合并，原生只看到 false，导致页面停在拉出态。 */
+  /** 鸿蒙仍由原生 refresherrefresh 触发，需要 true→false 完成收回；Android/iOS 的
+   *  原生触发线已放到 maxDrag 外，松手由 touchend 手动判定，绝不进入刷新停靠态。 */
+  // #ifdef APP-HARMONY
+  const PULL_RETRACT_DELAY_MS = 50;
+  // #endif
+
+  /** 收掉原生下拉态。Android/iOS 始终保持 false，让未触发 refresh 的手势自然回弹，
+   *  避免松手后先向下补到 header 高度；鸿蒙保留 true→false 的原生收回协议。 */
   function retractPullRefresher(pane: string): void {
+    // #ifndef APP-HARMONY
+    setPullTriggered(pane, false);
+    // #endif
+    // #ifdef APP-HARMONY
     setPullTriggered(pane, true);
     nextTick((): void => {
       setTimeout((): void => {
         setPullTriggered(pane, false);
-      }, 50);
+      }, PULL_RETRACT_DELAY_MS);
     });
+    // #endif
+  }
+
+  /** 拼会话页 URL（下拉入口与普通入口共用；字段口径见 openDefaultIMAgentConversation）。 */
+  function buildAgentChatUrl(agentId: number, convId: string, convType: number, name: string, peerUserId: string): string {
+    return `/pages/message/chat?convId=${encodeURIComponent(convId)}&convType=${convType}` +
+      (name.length > 0 ? `&name=${encodeURIComponent(name)}` : ``) +
+      `&peerSubject=2&agentId=${agentId}` +
+      (peerUserId.length > 0 ? `&peerId=${encodeURIComponent(peerUserId)}` : ``) +
+      guidePromptQuery(peerUserId);
+  }
+
+  /** 把一次建/取会话的回包写进预取缓存（下拉入口下次直接出 URL，不再等这回包）。 */
+  function rememberPrefetchedConversation(agentId: number, data: UTSJSONObject): void {
+    const convId = readString(data, "convId");
+    if (convId.length == 0) return;
+    prefetchAgentId = agentId;
+    prefetchConvId = convId;
+    prefetchConvType = readNumber(data, "convType", 1);
+    prefetchPeerId = readString(data, "peerUserId");
+    prefetchName = readString(data, "peerName");
+    const cached = getCachedMyInfo();
+    prefetchOwnerId = cached != null ? cached.userId : "";
+    prefetchedAt = Date.now();
+  }
+
+  /** 预取是否可用（下拉时能否跳过网络）：同智能体、有 convId、同账号。
+   *  不看有效期——过期的 convId 依然有效，后台预取会刷新；换账号/换智能体才作废。 */
+  function isPrefetchUsable(agentId: number): boolean {
+    if (prefetchConvId.length == 0 || prefetchAgentId != agentId) return false;
+    const cached = getCachedMyInfo();
+    const owner = cached != null ? cached.userId : "";
+    if (owner.length == 0 || prefetchOwnerId.length == 0) return true;
+    return owner == prefetchOwnerId;
+  }
+
+  /** 后台预取默认智能体会话（静默 best-effort）：进页/回页跑一次，用户下拉时 convId 已在手。
+   *  ★作用是把「松手 → 等建会话回包（实测 500ms）→ 才跳」压缩成「松手当帧就跳」。
+   *  接口是「打开或创建」（幂等），进页多调一次不会产生新会话。 */
+  async function prefetchDefaultAgentConversation(agentId: number): Promise<void> {
+    if (prefetchInFlight || workGateBlocked.value || agentId <= 0) return;
+    if (isPrefetchUsable(agentId) && Date.now() - prefetchedAt < PULL_PREFETCH_TTL_MS) return;
+    prefetchInFlight = true;
+    try {
+      // suppressErrorToast=true：预取失败不该弹错误（用户什么都没做，下拉时还有真请求兜底）
+      const response = await apiImCreateAgentConversation(`${agentId}`, "", true);
+      if (messagePageDisposed) return;
+      const dataRaw = apiResCode(response) == "0000" ? apiResData<any>(response) : null;
+      const data = dataRaw != null ? dataRaw as UTSJSONObject : null;
+      if (data == null) return;
+      rememberPrefetchedConversation(agentId, data);
+      const name = readString(data, "peerName");
+      if (name.length > 0) {
+        pullEntryAgentName.value = name;
+        cacheDefaultAgentName(agentId, name);
+      }
+    } catch (_e) {
+      // 静默：预取失败只影响速度，下拉时还有一次真请求兜底
+    } finally {
+      prefetchInFlight = false;
+    }
   }
 
   /** 刷新下拉入口目标：租户默认智能体 = defaultIMAgentConfig 第一项；名称缓存缺失时
-   *  向平台补一次详情（首次下拉也能显示真名）。闸门放行后与每次回前台时调。 */
+   *  向平台补一次详情（首次下拉也能显示真名）。闸门放行后与每次回前台时调。
+   *  顺带预取一次该智能体的会话（目标一定，解析只做一遍）。 */
   async function refreshPullEntryAgent(): Promise<void> {
     const agentId = await resolveDefaultIMAgentId();
     if (agentId <= 0) {
@@ -2041,6 +2229,57 @@
         pullEntryAgentName.value = name;
       }
     }
+    prefetchDefaultAgentConversation(agentId);
+  }
+
+  /** 翻某个列表的重建令牌（v-if 卸掉 scroll-view 再挂回 = 原生下拉态强制归位）。 */
+  function flipPullResetToken(pane: string): void {
+    if (pane == "contact") {
+      pullContactResetToken.value = pullContactResetToken.value + 1;
+    } else {
+      pullConvResetToken.value = pullConvResetToken.value + 1;
+    }
+  }
+
+  /** 作废一次待执行的回页重建（定时器一并取消）。 */
+  function cancelPullReset(pane: string): void {
+    if (pullResetTimer != 0) {
+      clearTimeout(pullResetTimer);
+      pullResetTimer = 0;
+    }
+    if (pullResetPane == pane) {
+      pullResetOnShow = false;
+      pullResetPane = "";
+    }
+  }
+
+  /** 列表复位排在**页面隐藏期间**做（见 scheduleHiddenPullReset 注释）。
+   *  到点不检查页面可见性：那时页面本就该被会话页盖住了。 */
+  function runHiddenPullReset(pane: string): void {
+    if (!pullResetOnShow || pullResetPane != pane) return;
+    pullResetOnShow = false;
+    pullResetPane = "";
+    if (pullResetTimer != 0) {
+      clearTimeout(pullResetTimer);
+      pullResetTimer = 0;
+    }
+    flipPullResetToken(pane);
+  }
+
+  /** 排队一次「隐藏期复位」：跳转当帧原生收回一定还没走完（切页会打断收回动画，
+   *  回来可能停在拉出态），必须重建滚动容器归位。
+   *  ★不能在 onShow 里做：v-if 卸/挂整块 scroll-view 会让回页首帧闪一下（整表重渲染）。
+   *    改成跳转后延迟翻令牌——那时会话页早已盖住本页，重建过程不可见；回页 onShow
+   *    只做兜底（定时器还没到就被切回来时才当场翻）。 */
+  function scheduleHiddenPullReset(pane: string): void {
+    pullResetOnShow = true;
+    pullResetPane = pane;
+    if (pullResetTimer != 0) clearTimeout(pullResetTimer);
+    if (!PULL_RESET_WHILE_HIDDEN) return;
+    pullResetTimer = setTimeout((): void => {
+      pullResetTimer = 0;
+      runHiddenPullReset(pane);
+    }, PULL_RESET_HIDDEN_DELAY_MS);
   }
 
   /** 真正跳转：批次号已作废（期间切走/重新下拉）或页面不可见就放弃，只收状态。 */
@@ -2048,31 +2287,74 @@
     if (seq != pullLaunchSeq || messagePageDisposed || !messagePageVisible) {
       pullLaunchInFlight = false;
       resetPullEntryGuide(pane);
+      // 没跳成就不需要重建列表（否则回页白重建一次）
+      cancelPullReset(pane);
       return;
     }
+    skipNextShowRefreshAfterPull = true;
     uni.navigateTo({ url: url });
   }
 
-  /** 回弹动画走完再跳转：请求很快返回也要等够 PULL_BOUNCE_BACK_MS（从松手时刻算），
-   *  慢请求则立即跳（回弹早结束了）。 */
-  function navigateToChatAfterBounce(url: string, releasedAt: number, seq: number, pane: string): void {
+  /** 到点导航：按挂起的 URL 走。原生收回还没完成就排队「隐藏期重建」，绝不把用户卡在等回弹。 */
+  function firePullNavigate(): void {
+    if (pullBouncePane.length == 0 || pullPendingUrl.length == 0) return;
+    const url = pullPendingUrl;
+    const seq = pullPendingSeq;
+    const pane = pullBouncePane;
+    if (!pullBounceSettled) {
+      // 收回还在进行（Android 约 1s 才 refresherrestore）：此刻切页会打断收回动画，
+      // 回来后列表可能停在拉出态、原生不再自己收 → 隐藏期翻重建令牌强制归位。
+      scheduleHiddenPullReset(pane);
+    }
+    clearPullBounceWait();
+    doPullNavigate(url, seq, pane);
+  }
+
+  /** 安排导航时机 = max(松手 + PULL_NAVIGATE_DELAY_MS, 建会话回包)；延迟为 0 = 就绪即跳。
+   *  ★不等原生 refresherrestore（收回完成信号）：Android 上它比松手晚 1s 上下，
+   *    等它就是「松手 → 停一下 → 回弹 → 再跳」的停顿。切页打断收回由回页重建兜底。 */
+  function schedulePullNavigate(): void {
+    if (pullBouncePane.length == 0) return;
+    if (pullPendingUrl.length == 0) return;
     if (pullNavigateTimer != 0) {
       clearTimeout(pullNavigateTimer);
       pullNavigateTimer = 0;
     }
-    const remain = PULL_BOUNCE_BACK_MS - (Date.now() - releasedAt);
+    const remain = PULL_NAVIGATE_DELAY_MS - (Date.now() - pullReleaseAt);
     if (remain <= 0) {
-      doPullNavigate(url, seq, pane);
+      firePullNavigate();
       return;
     }
     pullNavigateTimer = setTimeout((): void => {
       pullNavigateTimer = 0;
-      doPullNavigate(url, seq, pane);
+      firePullNavigate();
     }, remain);
   }
 
+  /** 原生回弹结束（refresherrestore：刷新态收回到位）：收起提示条。
+   *  正常路径松手当帧就已导航（PULL_NAVIGATE_DELAY_MS=0）；这里只兜「URL 就绪了但还没跳」
+   *  的窄窗口（例如建会话回包比 restore 还慢），URL 在就立刻走。
+   *  ★不撤销 pullResetOnShow：切页后的 restore 虽然会到，但不保证隐藏列表的视觉态已归位
+   *    （实测回页仍停在拉出态），回页重建照旧做。 */
+  function handlePullRestore(pane: string): void {
+    resetPullEntryGuide(pane);
+    if (pullBouncePane.length == 0 || pullBouncePane != pane) return;
+    pullBounceSettled = true;
+    if (pullPendingUrl.length > 0 && Date.now() - pullReleaseAt >= PULL_NAVIGATE_MIN_WAIT_MS) {
+      firePullNavigate();
+    }
+  }
+
+  /** 手势被打断/未过阈值松手（refresherabort）：只收提示条，作废本次下拉跳转。 */
+  function handlePullAbort(pane: string): void {
+    resetPullEntryGuide(pane);
+    if (pullBouncePane.length == 0 || pullBouncePane != pane) return;
+    pullLaunchInFlight = false;
+    clearPullBounceWait();
+  }
+
   /** 建/取租户默认智能体的 IM 会话，复用消息列表智能体行的 /pages/message/chat 详情页。 */
-  async function openDefaultIMAgentConversation(agentId: number, releasedAt: number, seq: number, pane: string): Promise<void> {
+  async function openDefaultIMAgentConversation(agentId: number, seq: number, pane: string): Promise<void> {
     try {
       const response = await apiImCreateAgentConversation(`${agentId}`);
       // 期间已切走/已换一批：这个响应作废（不导航、不动新批次的状态）
@@ -2081,12 +2363,14 @@
       const data = dataRaw != null ? dataRaw as UTSJSONObject : null;
       if (data == null) {
         pullLaunchInFlight = false;
+        clearPullBounceWait();
         resetPullEntryGuide(pane);
         return;
       }
       const convId = readString(data, "convId");
       if (convId.length == 0) {
         pullLaunchInFlight = false;
+        clearPullBounceWait();
         resetPullEntryGuide(pane);
         return;
       }
@@ -2100,21 +2384,28 @@
         pullEntryAgentName.value = name;
         cacheDefaultAgentName(agentId, name);
       }
-      const url = `/pages/message/chat?convId=${encodeURIComponent(convId)}&convType=${convType}` +
-        (name.length > 0 ? `&name=${encodeURIComponent(name)}` : ``) +
-        `&peerSubject=2&agentId=${agentId}` +
-        (peerUserId.length > 0 ? `&peerId=${encodeURIComponent(peerUserId)}` : ``) +
-        guidePromptQuery(peerUserId);
-      // 先把下拉收回去（快速回弹），回弹动画结束再进会话页
-      navigateToChatAfterBounce(url, releasedAt, seq, pane);
+      // 回包顺便暖预取缓存：本次之后的下拉直接命中
+      rememberPrefetchedConversation(agentId, data);
+      const url = buildAgentChatUrl(agentId, convId, convType, name, peerUserId);
+      // 本次下拉还挂着：URL 就位，按「松手 + 最短延迟」到点导航；
+      // 下拉状态已被收掉（切走/重新下拉/失败）说明这一批作废，直接走。
+      if (pullBouncePane.length > 0 && pullBouncePane == pane) {
+        pullPendingUrl = url;
+        pullPendingSeq = seq;
+        schedulePullNavigate();
+      } else {
+        doPullNavigate(url, seq, pane);
+      }
     } catch (_e) {
       // 下拉快捷入口失败时保持当前列表，不打扰用户。
       pullLaunchInFlight = false;
+      clearPullBounceWait();
       resetPullEntryGuide(pane);
     }
   }
 
-  /** 越过阈值松手（原生 refresherrefresh）：先快速回弹，再（回弹结束后）进默认智能体会话。
+  /** 拉到位松手，原生 refresherrefresh：当帧进默认智能体会话
+   *  （不等回弹收完，见 schedulePullNavigate；收回没走完由回页重建兜底）。
    *  pane 决定回弹哪一个列表（两个列表各持一份 triggered，见 setPullTriggered）。 */
   async function handlePanePullRefresh(pane: string): Promise<void> {
     if (pullLaunchInFlight) {
@@ -2125,8 +2416,12 @@
     const seq = pullLaunchSeq + 1;
     pullLaunchSeq = seq;
     pullLaunchInFlight = true;
-    // 松手即回弹：不再把列表固定在拉出态，跳转等回弹结束后再做（见 navigateToChatAfterBounce）
-    const releasedAt = Date.now();
+    // 松手即回弹：不把列表固定在拉出态；导航时机 = 松手 + PULL_NAVIGATE_DELAY_MS
+    // 与建会话回包取较晚者（见 schedulePullNavigate），不等原生收回完成。
+    clearPullBounceWait();
+    pullBouncePane = pane;
+    pullReleaseAt = Date.now();
+    pullBounceSettled = false;
     retractPullRefresher(pane);
     let agentId = pullEntryAgentId.value;
     if (agentId <= 0) {
@@ -2138,12 +2433,22 @@
       }
       if (agentId <= 0) {
         pullLaunchInFlight = false;
+        clearPullBounceWait();
         return;
       }
       pullEntryAgentId.value = agentId;
       pullEntryAgentName.value = readCachedDefaultAgentName(agentId);
     }
-    openDefaultIMAgentConversation(agentId, releasedAt, seq, pane);
+    // 预取命中（进页时已静默建/取过）：URL 直接出，导航只按「松手 + 延迟」走，
+    // 不再等建会话回包（实测回包 500ms，是剩余停顿的全部来源）。
+    if (isPrefetchUsable(agentId)) {
+      const url = buildAgentChatUrl(agentId, prefetchConvId, prefetchConvType, prefetchName, prefetchPeerId);
+      pullPendingUrl = url;
+      pullPendingSeq = seq;
+      schedulePullNavigate();
+      return;
+    }
+    openDefaultIMAgentConversation(agentId, seq, pane);
   }
 
   /** 两个列表各自的 refresherrefresh 入口（模板事件绑同步函数：异步逻辑留在上面）。 */
@@ -2155,13 +2460,22 @@
     handlePanePullRefresh("contact");
   }
 
-  /** 未过阈值松手回弹 / 手势打断：只收起该列表的下拉态。 */
-  function handleConvPullSettle(): void {
-    resetPullEntryGuide("conv");
+  /** 两个列表各自的 refresher 收起入口（模板事件绑同步函数：异步逻辑留在上面）。 */
+  function handleConvPullRestore(): void {
+    handlePullRestore("conv");
   }
 
-  function handleContactPullSettle(): void {
-    resetPullEntryGuide("contact");
+  function handleContactPullRestore(): void {
+    handlePullRestore("contact");
+  }
+
+  /** 未过阈值松手 / 手势被打断：只收起该列表的下拉态。 */
+  function handleConvPullAbort(): void {
+    handlePullAbort("conv");
+  }
+
+  function handleContactPullAbort(): void {
+    handlePullAbort("contact");
   }
 
   /** 页面 onLoad 闸门：缓存优先、缺失拉一次租户配置；放行后补跑首拉（原 onLoad 直调的两个 load）。 */
@@ -3921,6 +4235,7 @@
     if (convRefreshTimer != 0) clearTimeout(convRefreshTimer);
     if (iconTableRefreshTimer != 0) clearTimeout(iconTableRefreshTimer);
     if (showRefreshTimer != 0) clearTimeout(showRefreshTimer);
+    if (pullResetTimer != 0) clearTimeout(pullResetTimer);
     if (pageTouchIdleTimer != 0) clearTimeout(pageTouchIdleTimer);
     if (pageTouchHardTimer != 0) clearTimeout(pageTouchHardTimer);
     // 注销 IM WS 事件订阅（避免页面销毁后泄漏）
@@ -3968,9 +4283,26 @@
     refreshImUnreadBadge();
     // 本端刚读过的会话：read 回包 unreadCleared 本地清行角标（不等 300ms 去抖全量刷新）
     applyPendingConvReadMark();
-    // 下拉进入默认智能体会话：回页必复位（从会话页返回时列表还停在拉出态），并重读
-    // 租户配置里的默认智能体（管理员可能刚改配置；名称缓存此刻也已由会话详情回填）
+    // 下拉进入默认智能体会话：回页必复位，并重读租户配置里的默认智能体
+    //（管理员可能刚改配置；名称缓存此刻也已由会话详情回填）。
+    // ★跳转在松手当帧就发生，原生收回一定没走完（Android 要 1s 上下），
+    //   切页会打断收回动画 → 隐藏期就把被下拉那个列表的滚动容器重建归位
+    //   （见 scheduleHiddenPullReset；只重建被下拉的那一个，另一个 pane 不受影响）。
+    //   这里只剩兜底：定时器还没到就被切回来（页面其实没见过完整的隐藏期）才当场翻，
+    //   正常路径（定时器已执行）标志早已清掉，回页不做任何重建 → 不闪。
+    const needPullReset = pullResetOnShow;
+    const resetPane = pullResetPane;
+    pullResetOnShow = false;
+    pullResetPane = "";
+    if (pullResetTimer != 0) {
+      clearTimeout(pullResetTimer);
+      pullResetTimer = 0;
+    }
     cancelPullEntryLaunch();
+    if (needPullReset) {
+      flipPullResetToken(resetPane);
+    }
+    // 重读目标智能体，顺带预取它的会话（下拉时直接有 convId，不必等建会话回包）
     refreshPullEntryAgent();
     // 闸门缓存复查（同步读，开销可忽略）：登录页/其他 Tab 拉租户配置会写缓存，
     // 授权态翻转就地生效——撤销即停 WS 清角标，恢复即解锁补首拉
@@ -3991,6 +4323,13 @@
     }
     if (!hasShownOnce) {
       hasShownOnce = true;
+      return;
+    }
+    // 下拉入口返回的首个 onShow 保持原列表与滚动容器：隐藏期已经完成下拉归位，
+    // 这里只消费一次性标志，不克隆会话数组、不刷图标表、不发整表静默请求。
+    if (skipNextShowRefreshAfterPull) {
+      skipNextShowRefreshAfterPull = false;
+      draftsVersionAtHide = chatDraftsVersion();
       return;
     }
     // 从聊天页返回且草稿确有写入（隐藏前后版本号变化）才同步整表重建：让「[草稿]xxx」

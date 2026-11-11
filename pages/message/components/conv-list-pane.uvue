@@ -14,20 +14,19 @@
       measurePlus 同机制）
   -->
   <!-- #ifdef APP-HARMONY -->
-  <!-- 鸿蒙专用外壳：refresher 插槽的内容被 runtime 挂进 Refresh 的 NativeBuilder 子树
-       （@dcloudio/uni-app-x-runtime UniRefresher.ets），插槽内的样式更新不跟手，
-       下拉圆点因此移到列表外的覆盖层（见文件末尾 pull-dot-layer）。 -->
+  <!-- 鸿蒙圆点画在 scroll-view 外（原生插槽动态样式不跟手）。 -->
   <view class="im-pane-wrap">
   <!-- #endif -->
   <scroll-view
+    v-if="scrollAlive"
     class="im-pane"
-    :key="pullEntryEnabled ? 'pull-on' : 'pull-off'"
+    :key="scrollViewKey"
     :direction="menuVisible ? 'none' : 'vertical'"
     :show-scrollbar="false"
     :scroll-into-view="scrollAnchor"
     :refresher-enabled="pullEntryEnabled"
     :refresher-triggered="pullTriggered"
-    :refresher-threshold="pullThreshold"
+    :refresher-threshold="pullNativeThreshold"
     :refresher-max-drag-distance="pullMaxDragDistance"
     refresher-default-style="none"
     refresher-background="#f4f3fb"
@@ -93,15 +92,15 @@
       </view>
     </template>
     <!-- 原生节点直接作为 refresher 插槽（置末位：App 端 refresher 取末个 slot 内容）。
-         Android/iOS 的插槽按最大拖拽距离开高、露出多少看多少，圆点就在这里随位移上浮；
+         Android/iOS 的插槽按 PULL_ENTRY_SLOT_HEIGHT 开高、露出多少看多少，圆点就在这里随位移上浮；
          鸿蒙插槽只当「浅灰底 + 占位」用（不画圆点，插槽内的动态样式不跟手），
          圆点改画在下面列表外的覆盖层里。 -->
     <view slot="refresher" class="pull-guide" :style="pullGuideRootStyle">
       <!-- #ifndef APP-HARMONY -->
       <view class="pull-guide__dots" :style="pullGuideDotsStyle">
-        <view class="pull-guide__dot" :style="pullGuideLeftDotStyle"></view>
-        <view class="pull-guide__dot" :style="pullGuideCenterDotStyle"></view>
-        <view class="pull-guide__dot" :style="pullGuideRightDotStyle"></view>
+        <view class="pull-guide__dot pull-guide__dot--left" :style="pullGuideLeftDotStyle"></view>
+        <view class="pull-guide__dot pull-guide__dot--center" :style="pullGuideCenterDotStyle"></view>
+        <view class="pull-guide__dot pull-guide__dot--right" :style="pullGuideRightDotStyle"></view>
       </view>
       <!-- #endif -->
     </view>
@@ -112,17 +111,19 @@
        纯展示层，pointer-events:none 不抢列表手势。 -->
   <view class="pull-dot-layer" :style="pullDotLayerStyle">
     <view class="pull-guide__dots" :style="pullGuideDotsStyle">
-      <view class="pull-guide__dot" :style="pullGuideLeftDotStyle"></view>
-      <view class="pull-guide__dot" :style="pullGuideCenterDotStyle"></view>
-      <view class="pull-guide__dot" :style="pullGuideRightDotStyle"></view>
+      <view class="pull-guide__dot pull-guide__dot--left" :style="pullGuideLeftDotStyle"></view>
+      <view class="pull-guide__dot pull-guide__dot--center" :style="pullGuideCenterDotStyle"></view>
+      <view class="pull-guide__dot pull-guide__dot--right" :style="pullGuideRightDotStyle"></view>
     </view>
   </view>
+  <!-- #endif -->
+  <!-- #ifdef APP-HARMONY -->
   </view>
   <!-- #endif -->
 </template>
 
 <script setup lang="uts">
-  import { computed, getCurrentInstance, ref } from "vue";
+  import { computed, getCurrentInstance, nextTick, ref, watch } from "vue";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import ConvRowItem from "./conv-row-item.uvue";
   import { ImConvRow } from "./im-row-models.uts";
@@ -136,8 +137,8 @@
     scroll: [];
     /** 滚到底部分页加载（页面 handleConvScrollLower）。 */
     "scroll-lower": [];
-    /** 下拉进入默认智能体会话：过阈值松手触发 refresherrefresh（页面建会话并跳转）；
-     *  restore/abort = 未过阈值松手回弹 / 手势被打断（页面收提示条，什么都不做）。 */
+    /** 下拉进入默认智能体会话：拉到位松手触发 refresherrefresh（页面当帧跳转）；
+     *  restore/abort = 没拉到位就松手回弹 / 手势被打断（页面收提示条，什么都不做）。 */
     "pull-refresh": [];
     "pull-restore": [];
     "pull-abort": [];
@@ -189,10 +190,15 @@
       pullEntryEnabled: boolean;
       /** 原生下拉刷新处于「已触发」态（页面持有，导航/失败后复位收回）。 */
       pullTriggered: boolean;
-      /** 下拉触发距离 px（与提示条高度对齐）。 */
+      /** 下拉触发距离 px（原生 refresher-threshold；圆点形态进度也按它归一 = 三点完整即触发）。 */
       pullThreshold: number;
-      /** 最大拖拽距离 px（Android/iOS 圆点插槽高度；鸿蒙插槽按阈值高度）。 */
+      /** 最大拖拽距离 px（= 还能拉多远；Android 因原生拖拽阻尼被放大，见页面常量注释）。 */
       pullMaxDragDistance: number;
+      /** refresher 插槽（原生 header）高度 px：原生按它算触发率、松手也停靠到它。 */
+      pullSlotHeight: number;
+      /** 列表重建令牌：变化=重建 scroll-view（把原生下拉态强制归位）。
+       *  下拉跳转时回弹还没走完才用（跳转打断收回动画，见 message-content onShow）。 */
+      pullResetToken: number;
     }>(),
     {
       conversations: [] as ImConvRow[],
@@ -206,8 +212,10 @@
       pressedRowId: "",
       pullEntryEnabled: false,
       pullTriggered: false,
-      pullThreshold: 120,
-      pullMaxDragDistance: 320,
+      pullThreshold: 54,
+      pullMaxDragDistance: 60,
+      pullSlotHeight: 60,
+      pullResetToken: 0,
     },
   );
 
@@ -217,24 +225,98 @@
   // conv-row-item 组件迁移（行级局部渲染）；本组件仅剩外壳与列表态。
 
   const componentInstance = getCurrentInstance();
+  /** 滚动容器是否挂着：下拉跳转打断原生收回动画后，靠 v-if 卸掉再挂回来强制归位
+   *  （原生下拉态只有重建容器能确定复位；单改 :key 在 App 端不一定真的重建）。
+   *  只在翻 pullResetToken 时短暂置 false 一帧：正常路径是跳转后页面已被会话页盖住时翻
+   *  （隐藏期重建，回页看不见），回页 onShow 只为兜底。 */
+  const scrollAlive = ref<boolean>(true);
   const pullGuideDistance = ref<number>(0);
-  const pullGuideProgress = computed((): number => Math.max(0, Math.min(pullGuideDistance.value / props.pullThreshold, 1)));
+  /** 回弹/收回动画期间原生还会继续派 refresherpulling（位移一路减小），若继续写响应式，
+   *  列表外壳就在动画里逐帧重渲染 → 肉眼可见的回弹抖动（不如手指滑动丝滑）。
+   *  松手（refresh/abort/restore）后冻结，下一次触摸按下再解冻。 */
+  let pullGuideFrozen = false;
+  /** 手指是否正按在列表上：上一轮的收回动画收尾（refresherrestore）可能正好落在
+   *  新一轮下拉中间，那时不能清位移/冻结，否则圆点会突然消失。 */
+  let pullGuideDragging = false;
+  /** 本轮手势是否已经在 touchend / 原生 refresher 事件里判定过触发。
+   *  Android/iOS 统一由 touchend 当帧判定，避免等待原生 refresh 停靠动画；
+   *  Harmony 仍保留原生 refresherrefresh 通道，三端共用这个防重位。 */
+  let pullReleaseFired = false;
+  /** 重建滚动容器时把下拉位移一并清零：跳转打断收回的话 refresherrestore 不会来，
+   *  pullGuideDistance 会停在松手时的值，重建后圆点按旧位移显示。 */
+  watch((): number => props.pullResetToken, (_token: number): void => {
+    pullGuideDistance.value = 0;
+    pullGuideFrozen = false;
+    // #ifdef APP-IOS
+    // iOS 只清下拉展示状态，不卸载 scroll-view。该节点位于原生 swiper-item 内，
+    // 多次下拉进会话再返回时反复 v-if 卸挂，会让 swiper 的横向 transform 累积异常，
+    // 最终整页向左偏移、右侧露出空白。
+    return;
+    // #endif
+    scrollAlive.value = false;
+    nextTick((): void => {
+      scrollAlive.value = true;
+    });
+  });
+  /** Android/iOS 不让原生进入 refresh 停靠态：原生阈值放到最大拖距之外，
+   *  是否达到入口线由 touchend 使用 pullThreshold 自己判定。这样松手后不会先向下
+   *  补到 header 高度再跳页。Harmony 保留原生阈值与原生刷新事件。 */
+  const pullNativeThreshold = computed((): number => {
+    // #ifdef APP-HARMONY
+    return props.pullThreshold;
+    // #endif
+    // #ifndef APP-HARMONY
+    return props.pullMaxDragDistance + 1;
+    // #endif
+  });
+  /** 形态进度按**触发距离**（pullThreshold）归一：走到触发线恰好三圆点完全展开。
+   *  ★必须与原生触发线对齐——用户看到三点完整，就是「松手必跳」的那一刻；
+   *    按 maxDrag（还能拉多远）归一会让圆点先展开、触发线还在后面（旧版实坑）。
+   *  ★Android 的最大拖拽距离被放大到 300（原生拖拽有阻尼，见 message-content 常量），
+   *    更不能按它归一：触发线只占行程的 18%，圆点会几乎不动。 */
+  const pullGuideProgress = computed((): number => {
+    const extent = Math.max(1, props.pullThreshold);
+    return Math.max(0, Math.min(pullGuideDistance.value / extent, 1));
+  });
+  /** 展开进度：走到触发线的 55% 就开始分叉，到 100%（= 触发线）完全展开成三个。
+   *  ★起分点尽量早（54px 行程下 = 30px 起分、54px 收口）→ 三个点出现得干脆。 */
   const pullGuideMorphProgress = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.55) / 0.45, 1)));
-  const pullGuideOpacity = computed((): number => Math.max(0, Math.min((pullGuideDistance.value - 40) / 16, 1)));
-  /** refresher 插槽高度。Android/iOS 的原生 refresher 按「最大拖拽距离」开高、露出多少看多少
-   *  （Android 的刷新态停靠高度就是这个高度，所以页面给的 maxDrag 贴近阈值，见 message-content）；
-   *  鸿蒙插槽只当浅灰底与占位用（圆点画在列表外的覆盖层），按 runtime 给的窗口高度（阈值）排版。 */
+  /** 淡入：进度 0.35 露头、0.60 全显（≈ 触发线的 19px / 32px，与旧的绝对像素口径一致）。 */
+  const pullGuideOpacity = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.35) / 0.25, 1)));
+  /** scroll-view 的 key：enabled 翻转要重建（见 pullEntryEnabled 注释）。
+   *  回页强制归位走上面的 v-if（见 scrollAlive），不叠在这把 key 上，免一次翻两遍容器。 */
+  const scrollViewKey = computed((): string => {
+    const base = props.pullEntryEnabled ? "pull-on" : "pull-off";
+    // #ifdef APP-ANDROID
+    // Android 必须让 reset token 进入原生节点 key：仅 v-if 在页面隐藏/返回交界处
+    // 可能复用旧 SmartRefreshLayout，残留位移会和下一轮下拉叠加。
+    return `${base}-${props.pullResetToken}`;
+    // #endif
+    // #ifndef APP-ANDROID
+    return base;
+    // #endif
+  });
+  /** refresher 插槽高度（= 原生 header 高，原生按它算触发率、松手也停靠到它）。
+   *  Android/iOS 取 pullSlotHeight（页面常量 60，比 Android 的最大拖拽距离小得多，见
+   *  message-content）；鸿蒙插槽只当浅灰底与占位用（圆点画在列表外的覆盖层），
+   *  按 runtime 给的窗口高度（阈值）排版。 */
   const pullGuideSlotHeight = computed((): number => {
     // #ifdef APP-HARMONY
     return props.pullThreshold;
     // #endif
     // #ifndef APP-HARMONY
-    return props.pullMaxDragDistance;
+    return props.pullSlotHeight;
     // #endif
   });
   /** Android/iOS：圆点随下拉位移上浮，恒定居中于插槽下方露出的那条空白
-   *  （插槽中心 = maxDrag/2，露出的是插槽底部 distance 段 → 偏移 (max-d)/2）。 */
-  const pullGuideOffsetY = computed((): number => (props.pullMaxDragDistance - pullGuideDistance.value) * 0.5);
+   *  （露出的是插槽底部 min(dy, 插槽高) 段 → 偏移 (插槽高 - 露出高)/2）。
+   *  ★用插槽高、不是 maxDrag：Android 能拉过插槽高一大截，超过后插槽已整块露出，
+   *    圆点停在插槽中心（clamp 住），不会跟着被推出屏幕。 */
+  const pullGuideOffsetY = computed((): number => {
+    const slot = props.pullSlotHeight;
+    const shown = Math.min(pullGuideDistance.value, slot);
+    return (slot - shown) * 0.5;
+  });
   /** 鸿蒙下拉圆点覆盖层高度 = 原生下拉位移 dy。dy 就是列表被推下来、露出空白的高度，
    *  圆点在该层内 flex 居中 → 全程恒在下拉区域的垂直中心（不依赖原生刷新控件内部排版）。 */
   const pullDotLayerStyle = computed((): string => {
@@ -252,17 +334,21 @@
     return `position: relative; width: 42px; height: 18px; transform: translateY(${pullGuideOffsetY.value}px); opacity: ${pullGuideOpacity.value};`;
     // #endif
   });
-  const pullGuideLeftDotStyle = computed((): string => `left: ${18 - 12 * pullGuideMorphProgress.value}px; opacity: ${pullGuideMorphProgress.value};`);
-  const pullGuideRightDotStyle = computed((): string => `left: ${18 + 12 * pullGuideMorphProgress.value}px; opacity: ${pullGuideMorphProgress.value};`);
-  const pullGuideCenterDotStyle = computed((): string => {
-    const size = 12 - 6 * pullGuideMorphProgress.value;
-    const offset = 3 + 3 * pullGuideMorphProgress.value;
-    return `top: ${offset}px; left: ${15 + 3 * pullGuideMorphProgress.value}px; width: ${size}px; height: ${size}px; border-radius: ${size * 0.5}px;`;
-  });
+  /** 圆点只改 transform / opacity（合成层），**不碰 left/top/width/height**：
+   *  改布局属性会让 refresher 插槽每帧重新排版，回弹动画期间肉眼可见地抖。
+   *  两侧小点固定停在终点位置（left 6 / 30，见 .pull-guide__dot--left/--right），
+   *  展开由 translateX 从中心「推」出去；中间点固定 12px 盒子，靠 scale 缩到 6px。 */
+  const pullGuideLeftDotStyle = computed((): string =>
+    `transform: translateX(${12 - 12 * pullGuideMorphProgress.value}px); opacity: ${pullGuideMorphProgress.value};`);
+  const pullGuideRightDotStyle = computed((): string =>
+    `transform: translateX(${12 * pullGuideMorphProgress.value - 12}px); opacity: ${pullGuideMorphProgress.value};`);
+  const pullGuideCenterDotStyle = computed((): string =>
+    `transform: scale(${1 - 0.5 * pullGuideMorphProgress.value}); opacity: 1;`);
 
   function handlePulling(eventValue: Any): void {
+    if (pullGuideFrozen) return;
     const e = eventValue as UniRefresherEvent;
-    const distance = Math.max(0, e.detail.dy);
+    const distance = Math.max(0, Math.min(e.detail.dy, props.pullMaxDragDistance));
     if (Math.abs(pullGuideDistance.value - distance) >= 1) pullGuideDistance.value = distance;
   }
 
@@ -323,28 +409,68 @@
   }
 
   function emitPullRefresh(): void {
+    if (pullReleaseFired) return;
+    pullReleaseFired = true;
+    pullGuideFrozen = true;
     emit("pull-refresh");
   }
 
   function emitPullRestore(): void {
-    pullGuideDistance.value = 0;
+    // 上一轮收回动画收尾落在新一轮下拉中间：不复位，让这一拉继续跟手
+    if (!pullGuideDragging) {
+      pullGuideFrozen = true;
+      pullGuideDistance.value = 0;
+    }
     emit("pull-restore");
   }
 
+  /** 未拉到位松手。★兜底：位移其实已经到了触发线（三圆点正好完整展开处；原生口径是
+   *  「超过」触发线才算触发，恰好卡在线上会派 abort）仍按触发处理，避免「三个点明明
+   *  完整了却不跳」。 */
   function emitPullAbort(): void {
+    const distance = pullGuideDistance.value;
+    // touchend 已判定达到入口线时，Android 随后仍可能补派 abort；此时不能立即清零/
+    // 冻结，否则会截断正在进行的原生回弹。让 pulling 递减帧与 restore 自然收尾。
+    if (pullReleaseFired) return;
+    pullGuideFrozen = true;
     pullGuideDistance.value = 0;
+    pullReleaseFired = true;
+    if (distance >= props.pullThreshold * 0.98) {
+      emit("pull-refresh");
+      return;
+    }
     emit("pull-abort");
   }
 
+  /** 手指按下：解冻（上一轮的回弹动画可能还在跑，但新的下拉要能跟手）。 */
   function emitPaneTouchStart(eventValue: Any): void {
+    pullGuideFrozen = false;
+    pullGuideDragging = true;
+    pullReleaseFired = false;
     emit("pane-touchstart", eventValue as UniTouchEvent);
   }
 
   function emitPaneTouchEnd(eventValue: Any): void {
+    pullGuideDragging = false;
+    // Android/iOS 松手当帧判定：拉到触发线（= 三个圆点完整）就立刻上抛，
+    // 不等原生走 refresh/abort/restore 时序。原生稍后的事件由 pullReleaseFired 吞掉。
+    if (!pullReleaseFired && pullGuideDistance.value >= props.pullThreshold * 0.97) {
+      pullReleaseFired = true;
+      // #ifdef APP-ANDROID
+      // Android 回弹期间继续接收 pulling 的递减 dy，让圆点/灰区跟随原生回弹逐帧收起；
+      // 旧逻辑冻结在最大位置，直到 abort/restore 才突然清零，视觉上像列表卡了一下。
+      pullGuideFrozen = false;
+      // #endif
+      // #ifndef APP-ANDROID
+      pullGuideFrozen = true;
+      // #endif
+      emit("pull-refresh");
+    }
     emit("pane-touchend", eventValue as UniTouchEvent);
   }
 
   function emitPaneTouchCancel(eventValue: Any): void {
+    pullGuideDragging = false;
     emit("pane-touchcancel", eventValue as UniTouchEvent);
   }
 
@@ -389,15 +515,14 @@
   }
 
   /* #ifdef APP-HARMONY */
-  /* 鸿蒙专用外壳：让下拉圆点覆盖层能贴 pane 顶绝对定位（Android/iOS 不渲染这层）。 */
+  /* 鸿蒙圆点覆盖层的定位外壳。 */
   .im-pane-wrap {
     width: 100%;
     height: 100%;
     position: relative;
   }
 
-  /* 下拉圆点覆盖层：高度由内联 style 按原生下拉位移给出，圆点在该层内 flex 居中，
-     于是全程恒在下拉区域垂直中心。纯展示层，pointer-events:none 不抢列表手势。 */
+  /* 鸿蒙下拉圆点覆盖层。 */
   .pull-dot-layer {
     position: absolute;
     left: 0;
@@ -410,16 +535,19 @@
     pointer-events: none;
     z-index: 1;
   }
+
   /* #endif */
 
   .pull-guide {
     width: 100%;
-    height: 320px;
+    /* 兜底高度 = 页面 PULL_ENTRY_SLOT_HEIGHT 默认 60（正常由内联 style 覆盖：
+       Android/iOS 取插槽高，鸿蒙取下方的 54）。 */
+    height: 60px;
     /* #ifdef APP-HARMONY */
     /* 鸿蒙的插槽只当浅灰底/占位（圆点画在列表外的覆盖层），高度按 runtime 给的窗口
-       （refresher-threshold，= 页面 PULL_ENTRY_THRESHOLD 默认 120）排版即可；
+       （refresher-threshold，= 页面 PULL_ENTRY_THRESHOLD 默认 54）排版即可；
        此处同时是内联 style 未生效时的兜底值。 */
-    height: 120px;
+    height: 54px;
     /* #endif */
     display: flex;
     flex-direction: row;
@@ -441,6 +569,22 @@
     height: 6px;
     border-radius: 3px;
     background-color: #9b9ba1;
+  }
+  /* 三个点都固定停在「展开完成」的位置/尺寸，动画只走 transform（不触发布局重排）：
+     两侧点用 translateX 从中心推出去，中间点用 scale 从 12px 缩到 6px。 */
+  .pull-guide__dot--left {
+    left: 6px;
+  }
+  .pull-guide__dot--right {
+    left: 30px;
+  }
+  .pull-guide__dot--center {
+    top: 3px;
+    left: 15px;
+    width: 12px;
+    height: 12px;
+    border-radius: 6px;
+    transform-origin: center center;
   }
 
   .im-state {

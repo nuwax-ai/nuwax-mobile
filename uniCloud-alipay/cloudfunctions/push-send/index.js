@@ -256,7 +256,8 @@ exports.main = async (event) => {
     convType: payload && payload.convType ? payload.convType : null,
     payloadLength: JSON.stringify(payload || {}).length,
     badge: body.badge === undefined ? null : body.badge,
-    force_notification: body.force_notification !== false,
+    // 在线消息由客户端按前后台状态决定是否创建本地通知。
+    force_notification: false,
     request_id: body.request_id || null
   }))
   if (DEBUG_MESSAGE_CONTENT) {
@@ -267,7 +268,7 @@ exports.main = async (event) => {
       payload,
       badge: body.badge === undefined ? null : body.badge,
       category,
-      force_notification: body.force_notification !== false,
+      force_notification: false,
       request_id: body.request_id || null
     }))
   }
@@ -280,7 +281,7 @@ exports.main = async (event) => {
       title: title,
       content: content,
       payload: payload,
-      force_notification: body.force_notification !== false,
+      force_notification: false,
       category: category,
       request_id: body.request_id || undefined
     }

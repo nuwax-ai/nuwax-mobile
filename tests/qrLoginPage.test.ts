@@ -42,13 +42,14 @@ function setup(
       .mockResolvedValue(ok({ token: 'target-token-is-ignored' }));
   const login = vi.fn();
   const home = vi.fn();
-  const nativeHome = vi.fn();
+  const nativeBack = vi.fn();
+  const nativeReLaunch = vi.fn();
   const bridgeReady = vi.fn().mockResolvedValue(true);
   const bootstrapToken = vi.fn();
   const browserWindow: any = {
     location: { href: '', replace: vi.fn() },
     open: vi.fn(),
-    uni: { webView: { reLaunch: nativeHome } },
+    uni: { webView: { navigateBack: nativeBack, reLaunch: nativeReLaunch } },
   };
   const navigateBack = vi.fn((options: any) => {
     if (back?.({ from: 'navigateBack' }) === true) return;
@@ -118,7 +119,8 @@ function setup(
     confirm,
     login,
     home,
-    nativeHome,
+    nativeBack,
+    nativeReLaunch,
     bridgeReady,
     bootstrapToken,
     browserWindow,
@@ -162,7 +164,7 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     expect(f.page.state.value).toBe('success');
     expect(f.token()).toBe(previous);
     if (app) expect(f.home).toHaveBeenCalledOnce();
-    else expect(f.nativeHome).toHaveBeenCalledOnce();
+    else expect(f.nativeBack).toHaveBeenCalledOnce();
     f.hide();
     f.show();
     await settle();
@@ -199,17 +201,15 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     expect(f.page.state.value).toBe('cancelled');
     expect(f.confirm).not.toHaveBeenCalled();
     expect(f.scan).toHaveBeenCalledTimes(1);
-    expect(app ? f.home : f.nativeHome).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: app
-          ? '/pages/message/message'
-          : '/pages/tab-shell/tab-shell?tab=/pages/message/message',
-      }),
+    expect(app ? f.home : f.nativeBack).toHaveBeenCalledWith(
+      expect.objectContaining(
+        app ? { url: '/pages/message/message' } : { delta: 1 },
+      ),
     );
     expect(f.navigateBack).not.toHaveBeenCalled();
   });
   it.each(['ready', 'error', 'invalid', 'success'])(
-    '单页栈在 %s 状态点击完成或返回直接回首页',
+    '确认页在 %s 状态按运行端退出',
     async (state) => {
       const f = setup(app);
       f.load();
@@ -217,25 +217,23 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
       f.page.state.value = state;
       f.page.finish();
       await settle();
-      expect(app ? f.home : f.nativeHome).toHaveBeenCalledWith(
-        expect.objectContaining({
-          url: app
-            ? '/pages/message/message'
-            : '/pages/tab-shell/tab-shell?tab=/pages/message/message',
-        }),
+      expect(app ? f.home : f.nativeBack).toHaveBeenCalledWith(
+        expect.objectContaining(
+          app ? { url: '/pages/message/message' } : { delta: 1 },
+        ),
       );
       expect(f.navigateBack).not.toHaveBeenCalled();
       expect(f.confirm).not.toHaveBeenCalled();
     },
   );
-  it('单页栈系统返回回首页，重复点击只导航一次', async () => {
+  it('确认页系统返回，重复点击只导航一次', async () => {
     const f = setup(app);
     f.load();
     await settle();
     expect(f.back()).toBe(true);
     f.page.finish();
     await settle();
-    expect(app ? f.home : f.nativeHome).toHaveBeenCalledOnce();
+    expect(app ? f.home : f.nativeBack).toHaveBeenCalledOnce();
     expect(f.navigateBack).not.toHaveBeenCalled();
   });
   it('应用内扫码取消退回上一页，放行 navigateBack 避免递归拦截', async () => {
@@ -253,7 +251,7 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
         expect.objectContaining({ delta: 1 }),
       );
     } else {
-      expect(f.nativeHome).toHaveBeenCalledOnce();
+      expect(f.nativeBack).toHaveBeenCalledOnce();
       expect(f.navigateBack).not.toHaveBeenCalled();
     }
     expect(f.back('navigateBack')).toBe(false);
@@ -269,7 +267,7 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     expect(f.back()).toBe(true);
     await settle();
     if (app) expect(f.navigateBack).toHaveBeenCalledOnce();
-    else expect(f.nativeHome).toHaveBeenCalledOnce();
+    else expect(f.nativeBack).toHaveBeenCalledOnce();
     expect(f.home).not.toHaveBeenCalled();
   });
   it('返回时立即丢弃迟到的未登录响应，不能又跳回登录页', async () => {
@@ -284,7 +282,7 @@ describe.each([false, true])('扫码确认页面 app=%s', (app) => {
     await settle();
     expect(f.login).not.toHaveBeenCalled();
     expect(f.scan).not.toHaveBeenCalled();
-    expect(app ? f.home : f.nativeHome).toHaveBeenCalledOnce();
+    expect(app ? f.home : f.nativeBack).toHaveBeenCalledOnce();
   });
   it('等待返回期间换域或换 Token，旧结果不能变成可确认状态', async () => {
     const f = setup(app);
@@ -395,8 +393,7 @@ it('App 无 Token 时先登录，不请求账号或扫码接口', async () => {
 });
 
 describe('旧客户端内嵌扫码登录网页', () => {
-  const nativeHomeUrl = '/pages/tab-shell/tab-shell?tab=/pages/message/message';
-  it('随包 JSSDK 将退出请求送往原生服务，使用 1.2.8 已有的首页路由', async () => {
+  it('随包 JSSDK 将返回请求送往旧原生服务，仅关闭当前网页', async () => {
     const f = setup(false, 'phone-session', undefined, true);
     const nativeService = vi.fn();
     f.browserWindow.__uniapp_x_postMessage = vi.fn();
@@ -419,8 +416,8 @@ describe('旧客户端内嵌扫码登录网页', () => {
         type: 'WEB_INVOKE_APPSERVICE',
         args: expect.objectContaining({
           data: expect.objectContaining({
-            name: 'reLaunch',
-            arg: { url: nativeHomeUrl },
+            name: 'navigateBack',
+            arg: { delta: 1 },
           }),
         }),
       }),
@@ -428,19 +425,19 @@ describe('旧客户端内嵌扫码登录网页', () => {
     expect(f.navigateBack).not.toHaveBeenCalled();
     expect(f.home).not.toHaveBeenCalled();
   });
-  it('确认成功即退出原生容器回首页，不操作 H5 页面栈', async () => {
+  it('确认成功退回已有原生页面，保留首页实例与手机会话', async () => {
     const f = setup(false, 'phone-session', undefined, true);
     f.load();
     await settle();
     await f.page.confirmLogin();
     expect(f.confirm).toHaveBeenCalledOnce();
-    expect(f.nativeHome).toHaveBeenCalledExactlyOnceWith({
-      url: nativeHomeUrl,
-    });
+    expect(f.nativeBack).toHaveBeenCalledExactlyOnceWith({ delta: 1 });
+    expect(f.nativeReLaunch).not.toHaveBeenCalled();
+    expect(f.token()).toBe('phone-session');
     expect(f.navigateBack).not.toHaveBeenCalled();
     expect(f.home).not.toHaveBeenCalled();
   });
-  it('二维码过期后点取消，也退出原生容器回首页', async () => {
+  it('二维码过期后点取消，也退回已有原生页面', async () => {
     const f = setup(false, 'phone-session', undefined, true);
     f.scan.mockResolvedValue({
       code: '4000',
@@ -451,8 +448,8 @@ describe('旧客户端内嵌扫码登录网页', () => {
     expect(f.page.state.value).toBe('error');
     f.page.cancelLogin();
     await settle();
-    expect(f.nativeHome).toHaveBeenCalledExactlyOnceWith({
-      url: nativeHomeUrl,
+    expect(f.nativeBack).toHaveBeenCalledExactlyOnceWith({
+      delta: 1,
     });
     expect(f.navigateBack).not.toHaveBeenCalled();
     expect(f.home).not.toHaveBeenCalled();
@@ -462,15 +459,15 @@ describe('旧客户端内嵌扫码登录网页', () => {
     f.bridgeReady.mockResolvedValueOnce(false);
     f.page.finish();
     await settle();
-    expect(f.nativeHome).not.toHaveBeenCalled();
+    expect(f.nativeBack).not.toHaveBeenCalled();
     expect(f.home).not.toHaveBeenCalled();
     f.page.finish();
     await settle();
-    expect(f.nativeHome).toHaveBeenCalledExactlyOnceWith({
-      url: nativeHomeUrl,
+    expect(f.nativeBack).toHaveBeenCalledExactlyOnceWith({
+      delta: 1,
     });
   });
-  it('等待桥加载时页面已经卸载，不再发起迟到的首页跳转', async () => {
+  it('等待桥加载时页面已经卸载，不再发起迟到的返回', async () => {
     const f = setup(false, 'phone-session', undefined, true);
     let resolve!: (ready: boolean) => void;
     f.bridgeReady.mockReturnValueOnce(new Promise((done) => (resolve = done)));
@@ -478,7 +475,7 @@ describe('旧客户端内嵌扫码登录网页', () => {
     f.unload();
     resolve(true);
     await settle();
-    expect(f.nativeHome).not.toHaveBeenCalled();
+    expect(f.nativeBack).not.toHaveBeenCalled();
   });
   it('等待桥加载时切后台，回前台仍可再次点完成退出', async () => {
     const f = setup(false, 'phone-session', undefined, true);
@@ -489,12 +486,12 @@ describe('旧客户端内嵌扫码登录网页', () => {
     f.hide();
     resolve(true);
     await settle();
-    expect(f.nativeHome).not.toHaveBeenCalled();
+    expect(f.nativeBack).not.toHaveBeenCalled();
     f.show();
     f.page.finish();
     await settle();
-    expect(f.nativeHome).toHaveBeenCalledExactlyOnceWith({
-      url: nativeHomeUrl,
+    expect(f.nativeBack).toHaveBeenCalledExactlyOnceWith({
+      delta: 1,
     });
   });
   it('确认失败不会自动退出或再次授权', async () => {
@@ -504,7 +501,7 @@ describe('旧客户端内嵌扫码登录网页', () => {
     await settle();
     await f.page.confirmLogin();
     expect(f.page.state.value).toBe('error');
-    expect(f.nativeHome).not.toHaveBeenCalled();
+    expect(f.nativeBack).not.toHaveBeenCalled();
     expect(f.confirm).toHaveBeenCalledOnce();
   });
 });

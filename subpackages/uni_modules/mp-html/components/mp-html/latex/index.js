@@ -7,6 +7,11 @@ import parse from "./katex.min";
 function Latex() {}
 
 Latex.prototype.onParse = function (node, vm) {
+  // Markdown 的代码块及行内代码只展示源码；其中的 $HOME / $$ 等不能送进 KaTeX。
+  // 高亮插件会再次解析 <pre> 中的 span，因此须检查整个祖先栈。
+  if (vm.stack.some(parent => parent.name === "pre" || parent.name === "code")) {
+    return;
+  }
   // $...$包裹的内容为latex公式
   if (!vm.options.editable && node.type === "text" && node.text.includes("$")) {
     const part = node.text.split(/(\${1,2})/);

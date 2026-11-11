@@ -5,6 +5,7 @@
     <custom-nav-bar
       class="webview-nav"
       :title="displayPageTitle"
+      :subtitle="displayPageHost"
       :has-safety-zone="true"
     >
       <!-- 密度类尺寸 px 定值（22px = 44rpx @375），折叠屏展开/宽屏不随屏宽放大 -->
@@ -15,7 +16,7 @@
       </template>
       <template v-slot:right>
         <svg-icon
-          name="icon-AppShare"
+          name="icon-More"
           size="22"
           unit="px"
           @click="handleShare"
@@ -47,7 +48,7 @@
 <script lang="uts" setup>
   import { switchMainTab } from "@/utils/mainTabNavigation";
 
-  import { computed, ref } from "vue";
+  import { computed, ref, watch } from "vue";
   // #ifdef APP
   import { getCurrentInstance } from "vue";
   // #endif
@@ -70,7 +71,11 @@
   // App 端内嵌 H5 字体放大修复：Android 强制 webview textZoom = 100%（iOS 无此问题，自动跳过）
   import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
   // #ifdef APP
-  import { appWebViewGoBack } from "@/subpackages/utils/appWebViewHistory";
+  import {
+    appWebViewGoBack,
+    appWebViewPageTitle,
+    appWebViewPageUrl,
+  } from "@/subpackages/utils/appWebViewHistory";
   // #endif
   // #ifdef APP-IOS
   import {
@@ -90,6 +95,11 @@
   const data_type = ref<string>("");
   const request_id = ref<string>("");
   const pageTitle = ref<string>("");
+  /** 当前地址的域名。加载完成前单独居中显示。 */
+  const pageHost = ref<string>("");
+  /** 内嵌页 document.title。读到之后才显示在域名上方。 */
+  const embeddedTitle = ref<string>("");
+  let navSyncTimer: number = 0;
   // 资料库页要写入 localStorage 的登录 token。非资料库、未取到票据时为空。
   // 小程序 web-view 不能 evalJS，票据只走地址上的 _ticket。
   let repoPageTicket = "";
@@ -108,10 +118,161 @@
   /** 与模板 web-view id 一致，供原生后退栈查询。 */
   const WEBVIEW_ELEMENT_ID = "webview";
 
-  const displayPageTitle = computed(
-    (): string =>
-      pageTitle.value.length > 0 ? pageTitle.value : t("Mobile.Webview.defaultTitle"),
-  );
+  const displayPageTitle = computed((): string => {
+    if (embeddedTitle.value.length > 0) {
+      return embeddedTitle.value;
+    }
+    if (pageHost.value.length > 0) {
+      return pageHost.value;
+    }
+    return pageTitle.value.length > 0 ? pageTitle.value : t("Mobile.Webview.defaultTitle");
+  });
+
+  /** 只有读到网页标题后才把域名放到第二行，加载前标题位本身就是域名。 */
+  const displayPageHost = computed((): string => {
+    return embeddedTitle.value.length > 0 ? pageHost.value : "";
+  });
+
+  /** 去掉协议后，截出主机名，不带端口、路径和账号。 */
+  const stripHost = (raw: string): string => {
+    let value = raw.trim();
+    const schemeIdx = value.indexOf("://");
+    if (schemeIdx >= 0) {
+      value = value.substring(schemeIdx + 3);
+    }
+    const slash = value.indexOf("/");
+    if (slash >= 0) {
+      value = value.substring(0, slash);
+    }
+    const query = value.indexOf("?");
+    if (query >= 0) {
+      value = value.substring(0, query);
+    }
+    const hash = value.indexOf("#");
+    if (hash >= 0) {
+      value = value.substring(0, hash);
+    }
+    const at = value.indexOf("@");
+    if (at >= 0) {
+      value = value.substring(at + 1);
+    }
+    const colon = value.indexOf(":");
+    if (colon >= 0) {
+      value = value.substring(0, colon);
+    }
+    return value;
+  };
+
+  /**
+   * 从地址里取出主机名，不带协议、端口和路径。
+   * 站内相对路径用当前站点或接口域名。
+   */
+  const hostOf = (raw: string): string => {
+    const value = raw.trim();
+    if (value.length == 0) {
+      return "";
+    }
+    if (value.indexOf("://") < 0 && value.indexOf("/") == 0) {
+      // #ifdef H5 || WEB
+      return `${window.location.host}`;
+      // #endif
+      // #ifdef APP
+      return stripHost(getApiBaseUrl());
+      // #endif
+      // #ifdef MP-WEIXIN
+      return "";
+      // #endif
+    }
+    return stripHost(value);
+  };
+
+  /** 加载中 WebView 的 title 经常就是整段地址，这种情况不拿来当标题。 */
+  const isDocumentTitle = (title: string, pageUrl: string): boolean => {
+    const text = title.trim();
+    if (text.length == 0) {
+      return false;
+    }
+    if (text.indexOf("http://") == 0 || text.indexOf("https://") == 0) {
+      return false;
+    }
+    if (pageUrl.length > 0 && text == pageUrl) {
+      return false;
+    }
+    const host = hostOf(pageUrl.length > 0 ? pageUrl : text);
+    return host.length == 0 || text != host;
+  };
+
+  const applyNavTitle = (title: string): void => {
+    if (title == embeddedTitle.value) {
+      return;
+    }
+    embeddedTitle.value = title;
+    if (title.length > 0) {
+      uni.setNavigationBarTitle({ title: title });
+    }
+  };
+
+  /**
+   * 读取内嵌页标题和当前地址。
+   * App 走原生 WebView；H5 只在同源 iframe 可读，跨域时保持域名单行。
+   */
+  const syncEmbeddedNav = (): void => {
+    let nextUrl = "";
+    let nextTitle = "";
+    // #ifdef APP
+    nextUrl = appWebViewPageUrl(WEBVIEW_ELEMENT_ID);
+    nextTitle = appWebViewPageTitle(WEBVIEW_ELEMENT_ID);
+    // #endif
+    // #ifdef H5 || WEB
+    try {
+      const frames = document.getElementsByTagName("iframe");
+      if (frames.length > 0) {
+        const frame = frames[frames.length - 1];
+        const doc = frame.contentDocument;
+        if (doc != null) {
+          nextTitle = doc.title != null ? `${doc.title}` : "";
+          nextUrl = frame.contentWindow != null ? `${frame.contentWindow.location.href}` : "";
+        }
+      }
+    } catch (_eFrame) {
+      nextTitle = "";
+      nextUrl = "";
+    }
+    // #endif
+    const hostSource = nextUrl.length > 0 ? nextUrl : url.value;
+    const host = hostOf(hostSource);
+    if (host.length > 0) {
+      pageHost.value = host;
+    }
+    if (isDocumentTitle(nextTitle, hostSource)) {
+      applyNavTitle(nextTitle.trim());
+    }
+  };
+
+  const stopEmbeddedNavSync = (): void => {
+    if (navSyncTimer != 0) {
+      clearInterval(navSyncTimer);
+      navSyncTimer = 0;
+    }
+  };
+
+  const startEmbeddedNavSync = (): void => {
+    syncEmbeddedNav();
+    if (navSyncTimer != 0) {
+      return;
+    }
+    navSyncTimer = setInterval((): void => {
+      syncEmbeddedNav();
+    }, 500) as number;
+  };
+
+  watch(url, (value: string): void => {
+    const host = hostOf(value);
+    if (host.length > 0) {
+      pageHost.value = host;
+    }
+    embeddedTitle.value = "";
+  });
 
   /**
    * 还原 webview 的 url 参数。
@@ -369,6 +530,7 @@
     // Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
     fixAppWebviewTextZoom();
     syncIosWebViewSwipe();
+    syncEmbeddedNav();
     if (repoPageTicket.length > 0) {
       injectRepoTicketCookie();
     }
@@ -687,6 +849,7 @@
     onLoadInit(params);
     fixAppWebviewTextZoom();
     startIosWebViewSwipeSync();
+    startEmbeddedNavSync();
   });
 
   // 导航栏返回不走 onBackPress。系统返回键、Android/鸿蒙侧滑走这里。
@@ -705,6 +868,7 @@
     stopRepoTicketCookieInject();
     // #endif
     stopIosWebViewSwipeSync();
+    stopEmbeddedNavSync();
   });
 
   // #ifdef MP-WEIXIN

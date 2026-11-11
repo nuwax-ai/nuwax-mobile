@@ -1941,8 +1941,10 @@
   //   · 拉到/拉过这条线松手 → 原生 refresherrefresh → **当帧就进会话页**，不等回弹。
   //     ★圆点形态进度按**触发距离**归一：三圆点完全展开时恰好落在原生触发线上，
   //       看到三个点再松手必跳（旧版按 maxDrag 归一，圆点先展开、触发线还在后面，松手就白拉）。
-  //     ★页面切走会打断原生收回动画 → 跳转后趁页面被会话页盖住再翻 pull*ResetToken
-  //       让列表重建归位（不能在回页 onShow 做：整块 scroll-view 卸/挂会让回页首帧闪一下）。
+  //     ★页面切走会打断原生收回动画，鸿蒙的 Refresh 回页还会按切走前的 offset 恢复
+  //       下拉位移 → 跳转后趁页面被会话页盖住再翻 pull*ResetToken 让列表重建归位
+  //       （Android/Harmony；iOS 只清展示态。不能在回页 onShow 做：整块 scroll-view
+  //       卸/挂会让回页首帧闪一下）。
   // ★判定全交原生 refresher：App-Android 子 view 的 touchmove 在 touchslop(≈8px) 之后
   //   被 scroll-view 截断，旧版逐帧累积 touchmove 距离的写法永远攒不起来（只有 touchend
   //   能拿到终点坐标），提示语因此一帧都没显示过。
@@ -2002,25 +2004,13 @@
   let pullResetPane = "";
   /** 隐藏期复位的定时器（0=没有排队）。 */
   let pullResetTimer = 0;
-  /** 跳转后多久在隐藏状态下翻重建令牌：要等会话页的入场动画把本页完全盖住
-   *  （uvue 默认转场约 300ms），本页的重建才不可见。 */
+  /** 跳转后多久在隐藏状态下翻复位令牌（= 重建滚动容器）。要等会话页的入场动画把
+   *  本页完全盖住（uvue 默认转场约 300ms），重建过程才不可见。 */
   const PULL_RESET_HIDDEN_DELAY_MS = 400;
-  /** 是否把列表复位挪到「页面被盖住」的时候做。
-   *  ★Android 现在让 reset token 进入原生 scroll-view key，隐藏期翻 token 会确定创建
-   *    全新的 SmartRefreshLayout，不再复用残留位移节点；因此恢复隐藏期重建，避免回页
-   *    onShow 才卸载/挂载列表造成一帧白屏。onShow 仍保留 400ms 内极端快速返回的兜底。
-   *  ★Harmony 仍在 onShow 复位；iOS 不卸载 scroll-view，只清展示态。 */
-  // #ifdef APP-ANDROID
-  const PULL_RESET_WHILE_HIDDEN = true;
-  // #endif
-  // #ifdef APP-HARMONY
-  const PULL_RESET_WHILE_HIDDEN = false;
-  // #endif
-  // #ifndef APP-ANDROID
-  // #ifndef APP-HARMONY
-  const PULL_RESET_WHILE_HIDDEN = true;
-  // #endif
-  // #endif
+  /** 列表复位一律排在页面隐藏期做（见 scheduleHiddenPullReset）：Android 的
+   *  SmartRefreshLayout 与鸿蒙的 Refresh 都会在回页时恢复切走前的下拉位移，只有重建
+   *  滚动容器能确定归位；挪到页面被会话页盖住时重建，回页首帧不可见，也不会白闪。
+   *  onShow 仍保留兜底（定时器没到就被切回来时才当场重建）。 */
   /** 列表重建令牌（各自拼进对应 pane 的 scroll-view key，变化=重建=原生下拉归位）。
    *  两个列表分开计：只重建被下拉的那一个，另一个（含隐藏的）不白重建。 */
   const pullConvResetToken = ref<number>(0);
@@ -2275,7 +2265,6 @@
     pullResetOnShow = true;
     pullResetPane = pane;
     if (pullResetTimer != 0) clearTimeout(pullResetTimer);
-    if (!PULL_RESET_WHILE_HIDDEN) return;
     pullResetTimer = setTimeout((): void => {
       pullResetTimer = 0;
       runHiddenPullReset(pane);
@@ -2301,11 +2290,19 @@
     const url = pullPendingUrl;
     const seq = pullPendingSeq;
     const pane = pullBouncePane;
+    // #ifdef APP-HARMONY
+    // 鸿蒙必须无条件重建：即使原生已经派过 refresherrestore（pullBounceSettled=true），
+    // 回页时 Refresh 仍会按切走前的 offset 恢复下拉位移（灰区与圆点一起回来）。
+    // 只清展示态收不回去，只有新建原生节点才能保证 offset=0。
+    scheduleHiddenPullReset(pane);
+    // #endif
+    // #ifndef APP-HARMONY
     if (!pullBounceSettled) {
       // 收回还在进行（Android 约 1s 才 refresherrestore）：此刻切页会打断收回动画，
       // 回来后列表可能停在拉出态、原生不再自己收 → 隐藏期翻重建令牌强制归位。
       scheduleHiddenPullReset(pane);
     }
+    // #endif
     clearPullBounceWait();
     doPullNavigate(url, seq, pane);
   }
@@ -4285,9 +4282,10 @@
     applyPendingConvReadMark();
     // 下拉进入默认智能体会话：回页必复位，并重读租户配置里的默认智能体
     //（管理员可能刚改配置；名称缓存此刻也已由会话详情回填）。
-    // ★跳转在松手当帧就发生，原生收回一定没走完（Android 要 1s 上下），
-    //   切页会打断收回动画 → 隐藏期就把被下拉那个列表的滚动容器重建归位
-    //   （见 scheduleHiddenPullReset；只重建被下拉的那一个，另一个 pane 不受影响）。
+    // ★跳转在松手当帧就发生，原生收回一定没走完（Android 要 1s 上下；鸿蒙回页还会
+    //   按旧 offset 恢复下拉位移），切页会打断收回动画 → 隐藏期就把被下拉那个列表的
+    //   滚动容器重建归位（见 scheduleHiddenPullReset；只重建被下拉的那一个，另一个
+    //   pane 不受影响）。
     //   这里只剩兜底：定时器还没到就被切回来（页面其实没见过完整的隐藏期）才当场翻，
     //   正常路径（定时器已执行）标志早已清掉，回页不做任何重建 → 不闪。
     const needPullReset = pullResetOnShow;

@@ -6,6 +6,7 @@ import {
   PinnedProjectInfo,
   resolvePersonalWorkspacePath,
   resolvePinnedConversationSandboxId,
+  showSpaceSelectorForFunctionType,
 } from "@/types/interfaces/displayRecommend.uts";
 
 // 执行首页真实发送入口，仅隔离登录、网络、草稿存储与导航等运行时依赖。
@@ -16,8 +17,14 @@ const homeSource = readFileSync(
 const start = homeSource.indexOf("  async function handleSendMessage(");
 const end = homeSource.indexOf("  // ── 5.9 抽屉 / 登录 ──", start);
 if (start < 0 || end <= start) throw new Error("首页发送入口未找到");
+const computedCode = ["showHomeComputerSelector", "effectiveHomeComputerId", "showSpaceSelector"].map(name => {
+  const computedStart = homeSource.indexOf(`  const ${name} = computed(`);
+  const computedEnd = homeSource.indexOf("\n  });", computedStart);
+  if (computedStart < 0 || computedEnd <= computedStart) throw new Error(`首页状态未找到：${name}`);
+  return homeSource.slice(computedStart, computedEnd + 7);
+}).join("\n");
 const handlerCode = transformSync(
-  `${homeSource.slice(homeSource.indexOf("  const showHomeComputerSelector = computed("), homeSource.indexOf("\n  });", homeSource.indexOf("  const showHomeComputerSelector = computed(")) + 7)}\n${homeSource.slice(start, end)}\nhandleSendMessage;`,
+  `${computedCode}\n${homeSource.slice(start, end)}\n({ send: handleSendMessage, showSpaceSelector });`,
   { loader: "ts" },
 ).code;
 
@@ -41,11 +48,14 @@ function setup(computerId = "403", path = "/tmp/mobile-project", project: Pinned
     isAgentComputerBound: { value: boundComputerId.length > 0 },
     activeAgentSandboxId: { value: boundComputerId },
     pinnedProject: { value: project },
+    selectedRecommend: { value: null as { functionType: string } | null },
+    selectedSpaceId: { value: 0 },
     currentComputerId: { value: computerId },
     workspacePath: { value: path },
     tryCreateProjectFlow: vi.fn().mockResolvedValue(false),
     resolvePinnedConversationSandboxId,
     resolvePersonalWorkspacePath,
+    showSpaceSelectorForFunctionType,
     apiAgentConversationCreate: vi.fn().mockResolvedValue({ code: "0000", data: { id: 9527 } }),
     apiResCode: (res: { code: string }) => res.code,
     apiResData: (res: { data: unknown }) => res.data,
@@ -59,11 +69,46 @@ function setup(computerId = "403", path = "/tmp/mobile-project", project: Pinned
     uni: { showToast: vi.fn() },
     console,
   };
-  const send = runInNewContext(handlerCode, context) as (payload: Record<string, unknown>) => Promise<void>;
-  return { ...context, send };
+  const handlers = runInNewContext(handlerCode, context) as {
+    send: (payload: Record<string, unknown>) => Promise<void>;
+    showSpaceSelector: { value: boolean };
+  };
+  return { ...context, ...handlers };
 }
 
 describe("首页选择个人电脑与工作目录后创建会话", () => {
+  it.each(["", "366"])("项目外选择个人目录时可选团队空间，绑定电脑为 '%s'", async (boundComputerId) => {
+    const page = setup("403", "", null, boundComputerId);
+    expect(page.showSpaceSelector.value).toBe(false);
+    page.workspacePath.value = "/tmp/team-project";
+    expect(page.showSpaceSelector.value).toBe(true);
+    page.selectedSpaceId.value = 28;
+    await page.send({ messageInfo: "团队目录任务" });
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({
+      agentId: 1596, devMode: false, sandboxId: boundComputerId.length > 0 ? 366 : 403,
+      workspacePath: "/tmp/team-project", spaceId: 28,
+    });
+
+    page.workspacePath.value = "";
+    expect(page.showSpaceSelector.value).toBe(false);
+    await page.send({ messageInfo: "默认目录任务" });
+    expect(page.apiAgentConversationCreate.mock.lastCall?.[0]).not.toHaveProperty("spaceId");
+  });
+
+  it("切回云电脑后隐藏空间且不发送残留目录和空间", async () => {
+    const page = setup("-1", "/tmp/stale");
+    page.selectedSpaceId.value = 28;
+    expect(page.showSpaceSelector.value).toBe(false);
+    await page.send({ messageInfo: "云电脑任务" });
+    expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({ agentId: 1596, devMode: false, sandboxId: -1 });
+  });
+
+  it("项目类推荐未选个人目录时仍可选空间", () => {
+    const page = setup("-1", "");
+    page.selectedRecommend.value = { functionType: "NormalProjectDev" };
+    expect(page.showSpaceSelector.value).toBe(true);
+  });
+
   it.each([
     { name: "个人电脑指定目录", selected: "403", current: "-1", path: "/tmp/mobile-project", sandboxId: 403, workspacePath: "/tmp/mobile-project" },
     { name: "非数字电脑 ID", selected: "sb-a1b2c3", current: "-1", path: "/tmp/mobile-project", sandboxId: "sb-a1b2c3", workspacePath: "/tmp/mobile-project" },
@@ -91,17 +136,20 @@ describe("首页选择个人电脑与工作目录后创建会话", () => {
     expect(page.sending.value).toBe(false);
   });
 
-  it("已有常规项目继续绑定该项目并使用当前电脑", async () => {
+  it.each(["", "/tmp/mobile-project"])("已有常规项目目录为 '%s' 时不可选空间，仍绑定原项目", async (path) => {
     const project = new PinnedProjectInfo();
     project.projectId = 111;
     project.projectType = "NormalProject";
     project.sandboxId = 302;
-    const page = setup("403", "/tmp/mobile-project", project);
+    const page = setup("403", path, project);
+    page.selectedSpaceId.value = 28;
+    page.selectedRecommend.value = { functionType: "NormalProjectDev" };
+    expect(page.showSpaceSelector.value).toBe(false);
     await page.send({ messageInfo: "开始任务", sandboxId: "403" });
     expect(page.apiAgentConversationCreate).toHaveBeenCalledTimes(1);
     expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({
       agentId: 1596, devMode: false, projectId: 111, projectType: "NormalProject",
-      sandboxId: 403, workspacePath: "/tmp/mobile-project",
+      sandboxId: 403, ...(path.length > 0 ? { workspacePath: path } : {}),
     });
   });
 
@@ -150,8 +198,10 @@ describe("首页选择个人电脑与工作目录后创建会话", () => {
     { type: "ChatBot", allow: true }, { type: "PageApp", allow: true }, { type: "TaskAgent", allow: false },
   ])("$type 隐藏选择器时，创建请求和草稿不携带旧电脑/目录", async ({ type, allow }) => {
     const page = setup("403", "/work/previous");
+    page.selectedSpaceId.value = 28;
     page.activeAgentType.value = type;
     page.activeAllowPrivateSandbox.value = allow;
+    expect(page.showSpaceSelector.value).toBe(false);
     await page.send({ messageInfo: "开始任务", sandboxId: "403", workspacePath: "/work/previous" });
     expect(page.apiAgentConversationCreate).toHaveBeenCalledWith({ agentId: 1596, devMode: false });
     const draftArgs = page.saveDraft.mock.calls[0];

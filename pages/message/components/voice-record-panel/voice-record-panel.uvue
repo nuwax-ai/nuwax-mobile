@@ -1,0 +1,780 @@
+<template>
+  <view class="vr-page">
+    <view class="vr-nav">
+      <view class="vr-nav__side" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="22" unit="px" color="#1a1a1a" />
+      </view>
+      <text class="vr-nav__title">录音</text>
+      <view class="vr-nav__side vr-nav__side--right" @click="openHistory">
+        <text class="vr-nav__action">历史记录</text>
+      </view>
+    </view>
+
+    <view class="vr-body">
+      <text class="vr-timer">{{ timerText }}</text>
+      <view class="vr-wave">
+        <view class="vr-wave__base"></view>
+        <view v-if="phase != 'idle'" class="vr-wave__played"></view>
+        <view class="vr-wave__head">
+          <view class="vr-wave__dot"></view>
+          <view class="vr-wave__line"></view>
+          <view class="vr-wave__dot"></view>
+        </view>
+        <view class="vr-wave__ticks">
+          <view v-for="n in ticks" :key="n" class="vr-wave__tick"></view>
+        </view>
+      </view>
+      <view class="vr-spacer"></view>
+      <view v-if="phase == 'idle'" class="vr-stop" @click="handleStartTap">
+        <view class="vr-stop__ring">
+          <view class="vr-stop__btn">
+            <svg-icon name="icon-Mic" size="26" unit="px" color="#ffffff" />
+          </view>
+        </view>
+        <text class="vr-stop__label vr-stop__label--idle">开始录音</text>
+      </view>
+      <view v-else-if="phase == 'recording'" class="vr-stop" @click="handleStop">
+        <view class="vr-stop__btn">
+          <view class="vr-stop__square"></view>
+        </view>
+        <text class="vr-stop__label">停止录音</text>
+      </view>
+      <view v-else class="vr-actions">
+        <view class="vr-action" @click="handleRerecord">
+          <view class="vr-action__btn vr-action__btn--ghost">
+            <svg-icon name="icon-restart" size="22" unit="px" color="#e24b4b" />
+          </view>
+          <text class="vr-action__label">重录</text>
+        </view>
+        <view class="vr-action" @click="handlePlay">
+          <view class="vr-action__btn vr-action__btn--main">
+            <svg-icon name="icon-video-play" size="26" unit="px" color="#ffffff" />
+          </view>
+          <text class="vr-action__label">播放</text>
+        </view>
+        <view class="vr-action" @click="handleDone">
+          <view class="vr-action__btn vr-action__btn--side">
+            <svg-icon name="icon-Check" size="22" unit="px" color="#ffffff" />
+          </view>
+          <text class="vr-action__label">完成</text>
+        </view>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+/**
+ * 伙伴页内录音层：由消息列表右滑打开，不单独占路由。
+ * 关闭经 close 上抛，由伙伴页收起本层。
+ */
+import { MicrophonePermissionHelper } from "@/utils/permissionHelper";
+import { pageSystemOverlay } from "@/utils/pageSystemOverlay.uts";
+import { emptyI18nParams, useI18n } from "@/utils/i18n";
+// #ifdef APP-HARMONY
+import { openHarmonyMicPermissionSettings } from "@/uni_modules/nuwax-stream-pcm-player";
+// #endif
+
+const { t: tFn } = useI18n();
+function t(key: string): string {
+  return tFn(key, emptyI18nParams(), "");
+}
+
+const emit = defineEmits<{
+  close: [];
+}>();
+
+const HISTORY_KEY = "nuwax_voice_record_history";
+const ticks: number[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+
+type VoiceHistoryItem = {
+  id: string;
+  durationMs: number;
+  filePath: string;
+  createdAt: number;
+  createdLabel: string;
+  durationLabel: string;
+};
+
+const elapsedMs = ref<number>(0);
+/** idle 未开始 / recording 录音中 / stopped 已停止待播放或完成 */
+const phase = ref<string>("idle");
+const history = ref<VoiceHistoryItem[]>([]);
+
+let startedAt = 0;
+let tickTimer = 0;
+let stoppedFilePath = "";
+let recorderBound = false;
+let savedCurrent = false;
+let leaveAfterStop = false;
+let player: InnerAudioContext | null = null;
+
+function pad2(n: number): string {
+  if (n < 10) {
+    return "0" + n.toString();
+  }
+  return n.toString();
+}
+
+function formatDuration(ms: number): string {
+  const safe = ms < 0 ? 0 : ms;
+  const totalCs = Math.floor(safe / 10);
+  const cs = totalCs % 100;
+  const totalSec = Math.floor(totalCs / 100);
+  const sec = totalSec % 60;
+  const min = Math.floor(totalSec / 60);
+  return pad2(min) + ":" + pad2(sec) + "." + pad2(cs);
+}
+
+const timerText = computed((): string => {
+  return formatDuration(elapsedMs.value);
+});
+
+function formatClock(ts: number): string {
+  const d = new Date(ts);
+  return pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
+function loadHistory(): void {
+  const raw = uni.getStorageSync(HISTORY_KEY);
+  if (raw == null || raw == "") {
+    history.value = [];
+    return;
+  }
+  const text = raw as string;
+  let parsed: UTSJSONObject[] = [];
+  try {
+    parsed = JSON.parse(text) as UTSJSONObject[];
+  } catch (err) {
+    history.value = [];
+    return;
+  }
+  const rows: VoiceHistoryItem[] = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const obj = parsed[i];
+    const item: VoiceHistoryItem = {
+      id: obj["id"] as string,
+      durationMs: obj["durationMs"] as number,
+      filePath: obj["filePath"] as string,
+      createdAt: obj["createdAt"] as number,
+      createdLabel: obj["createdLabel"] as string,
+      durationLabel: obj["durationLabel"] as string,
+    };
+    rows.push(item);
+  }
+  history.value = rows;
+}
+
+function saveHistoryItem(durationMs: number, filePath: string): void {
+  const now = Date.now();
+  const item: VoiceHistoryItem = {
+    id: now.toString(),
+    durationMs: durationMs,
+    filePath: filePath,
+    createdAt: now,
+    createdLabel: formatClock(now),
+    durationLabel: formatDuration(durationMs),
+  };
+  const next: VoiceHistoryItem[] = [item];
+  for (let i = 0; i < history.value.length && next.length < 50; i++) {
+    next.push(history.value[i]);
+  }
+  history.value = next;
+  const payload: UTSJSONObject[] = [];
+  for (let i = 0; i < next.length; i++) {
+    const row = next[i];
+    const obj = {} as UTSJSONObject;
+    obj["id"] = row.id;
+    obj["durationMs"] = row.durationMs;
+    obj["filePath"] = row.filePath;
+    obj["createdAt"] = row.createdAt;
+    obj["createdLabel"] = row.createdLabel;
+    obj["durationLabel"] = row.durationLabel;
+    payload.push(obj);
+  }
+  uni.setStorageSync(HISTORY_KEY, JSON.stringify(payload));
+}
+
+function tick(): void {
+  if (phase.value != "recording") {
+    return;
+  }
+  elapsedMs.value = Date.now() - startedAt;
+}
+
+function startTicker(): void {
+  startedAt = Date.now();
+  elapsedMs.value = 0;
+  phase.value = "recording";
+  if (tickTimer != 0) {
+    clearInterval(tickTimer);
+  }
+  tickTimer = setInterval(() => {
+    tick();
+  }, 40);
+}
+
+function stopTicker(): void {
+  if (tickTimer != 0) {
+    clearInterval(tickTimer);
+    tickTimer = 0;
+  }
+  if (phase.value == "recording") {
+    phase.value = "stopped";
+  }
+}
+
+function persistCurrent(): void {
+  if (savedCurrent || stoppedFilePath.length == 0 || elapsedMs.value <= 0) {
+    return;
+  }
+  saveHistoryItem(elapsedMs.value, stoppedFilePath);
+  savedCurrent = true;
+}
+
+function bindRecorder(): void {
+  if (recorderBound) {
+    return;
+  }
+  recorderBound = true;
+  const recorder = uni.getRecorderManager();
+  recorder.onStop((res: RecorderManagerOnStopResult) => {
+    stoppedFilePath = res.tempFilePath;
+    savedCurrent = false;
+    stopTicker();
+    if (leaveAfterStop) {
+      leaveAfterStop = false;
+      persistCurrent();
+      emit("close");
+    }
+  });
+  recorder.onError((err: any) => {
+    stopTicker();
+    phase.value = "idle";
+    elapsedMs.value = 0;
+    let msg = "录音失败";
+    if (err != null) {
+      const obj = err as UTSJSONObject;
+      const raw = obj["errMsg"];
+      if (raw != null) {
+        const text = "" + raw;
+        if (text.length > 0) {
+          msg = text;
+        }
+      }
+    }
+    uni.showToast({ title: msg, icon: "none" });
+  });
+}
+
+function stopPlayer(): void {
+  const audio = player;
+  if (audio != null) {
+    audio.stop();
+    audio.destroy();
+    player = null;
+  }
+}
+
+function openMicSettings(): void {
+  // #ifdef APP-ANDROID
+  const activity = UTSAndroid.getUniActivity();
+  if (activity != null) {
+    pageSystemOverlay.begin("android.permissionSettings", true);
+    UTSAndroid.gotoSystemPermissionActivity(activity, ["android.permission.RECORD_AUDIO"] as string[]);
+  }
+  // #endif
+  // #ifdef APP-HARMONY
+  pageSystemOverlay.begin("harmony.permissionSettings", true);
+  openHarmonyMicPermissionSettings();
+  // #endif
+  // #ifdef APP-IOS
+  pageSystemOverlay.begin("ios.authorizeSetting", true);
+  uni.openAppAuthorizeSetting({});
+  // #endif
+  // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+  uni.openSetting({});
+  // #endif
+  // #ifdef H5 || WEB
+  MicrophonePermissionHelper.showGuide();
+  // #endif
+}
+
+function showMicGuide(): void {
+  uni.showModal({
+    title: t("Mobile.Voice.permissionRequired"),
+    content: t("Mobile.Voice.permissionContent"),
+    confirmText: t("Mobile.Voice.goToSettings"),
+    cancelText: t("Mobile.Common.cancel"),
+    success: (res) => {
+      if (res.confirm == true) {
+        openMicSettings();
+      }
+    },
+  });
+}
+
+/**
+ * 已授权返回 true。未决定时弹出系统授权窗，同意后返回 true。
+ * 之前已拒绝、系统不再弹窗时，弹出引导去系统设置，并返回 false。
+ */
+async function ensureMicPermission(): Promise<boolean> {
+  // #ifdef APP-ANDROID
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    return false;
+  }
+  const permissionNeed = ["android.permission.RECORD_AUDIO"] as string[];
+  if (UTSAndroid.checkSystemPermissionGranted(activity, permissionNeed)) {
+    return true;
+  }
+  return await new Promise<boolean>((resolve) => {
+    pageSystemOverlay.begin("android.recordPermission", true);
+    UTSAndroid.requestSystemPermission(
+      activity,
+      permissionNeed,
+      (_allGranted: boolean, _granted: string[]) => {
+        pageSystemOverlay.end();
+        resolve(true);
+      },
+      (doNotAskAgain: boolean, _denied: string[]) => {
+        pageSystemOverlay.end();
+        if (doNotAskAgain == true) {
+          showMicGuide();
+        }
+        resolve(false);
+      },
+    );
+  });
+  // #endif
+
+  // #ifdef APP-IOS
+  const authSetting = uni.getAppAuthorizeSetting();
+  if (authSetting.microphoneAuthorized == "authorized") {
+    return true;
+  }
+  if (authSetting.microphoneAuthorized == "denied") {
+    showMicGuide();
+    return false;
+  }
+  return true;
+  // #endif
+
+  // #ifdef APP-HARMONY
+  return await new Promise<boolean>((resolve) => {
+    pageSystemOverlay.begin("harmony.recordPermission", true);
+    UTSHarmony.requestSystemPermission(
+      ["ohos.permission.MICROPHONE"] as string[],
+      (_allRight: boolean, _granted: string[]) => {
+        pageSystemOverlay.end();
+        resolve(true);
+      },
+      (doNotAskAgain: boolean, _denied: string[]) => {
+        pageSystemOverlay.end();
+        if (doNotAskAgain == true) {
+          showMicGuide();
+        }
+        resolve(false);
+      },
+    );
+  });
+  // #endif
+
+  // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+  return await new Promise<boolean>((resolve) => {
+    uni.getSetting({
+      success: (res) => {
+        const setting = res.authSetting as UTSJSONObject;
+        if (setting["scope.record"] == true) {
+          resolve(true);
+          return;
+        }
+        if (setting["scope.record"] == false) {
+          showMicGuide();
+          resolve(false);
+          return;
+        }
+        uni.authorize({
+          scope: "scope.record",
+          success: () => {
+            resolve(true);
+          },
+          fail: () => {
+            resolve(false);
+          },
+        });
+      },
+      fail: () => {
+        resolve(false);
+      },
+    });
+  });
+  // #endif
+
+  // #ifdef H5 || WEB
+  const state = await MicrophonePermissionHelper.check();
+  if (state == "granted") {
+    return true;
+  }
+  if (state == "denied") {
+    showMicGuide();
+    return false;
+  }
+  const granted = await MicrophonePermissionHelper.request();
+  if (granted != true) {
+    const after = await MicrophonePermissionHelper.check();
+    if (after == "denied") {
+      showMicGuide();
+    }
+  }
+  return granted;
+  // #endif
+
+  return true;
+}
+
+function startRecording(): void {
+  stopPlayer();
+  bindRecorder();
+  stoppedFilePath = "";
+  savedCurrent = false;
+  leaveAfterStop = false;
+  startTicker();
+  const recorder = uni.getRecorderManager();
+  recorder.start({
+    duration: 600000,
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    format: "aac",
+  });
+}
+
+async function handleStartTap(): Promise<void> {
+  const permitted = await ensureMicPermission();
+  if (permitted != true) {
+    return;
+  }
+  startRecording();
+}
+
+function handleStop(): void {
+  if (phase.value != "recording") {
+    return;
+  }
+  const recorder = uni.getRecorderManager();
+  recorder.stop();
+}
+
+function handleRerecord(): void {
+  stopPlayer();
+  stoppedFilePath = "";
+  savedCurrent = false;
+  elapsedMs.value = 0;
+  phase.value = "idle";
+}
+
+function handlePlay(): void {
+  if (stoppedFilePath.length == 0) {
+    uni.showToast({ title: "没有可播放的录音", icon: "none" });
+    return;
+  }
+  stopPlayer();
+  const audio = uni.createInnerAudioContext();
+  player = audio;
+  audio.src = stoppedFilePath;
+  audio.onEnded(() => {
+    stopPlayer();
+  });
+  audio.play();
+}
+
+function handleDone(): void {
+  stopPlayer();
+  persistCurrent();
+  emit("close");
+}
+
+function leaveToChat(): void {
+  stopPlayer();
+  if (phase.value == "recording") {
+    leaveAfterStop = true;
+    const recorder = uni.getRecorderManager();
+    recorder.stop();
+    return;
+  }
+  if (phase.value == "stopped") {
+    persistCurrent();
+  }
+  emit("close");
+}
+
+function handleBack(): void {
+  leaveToChat();
+}
+
+function openHistory(): void {
+  uni.navigateTo({ url: "/subpackages/pages/voice-record-history/voice-record-history" });
+}
+
+onMounted(() => {
+  loadHistory();
+});
+
+onUnmounted(() => {
+  stopPlayer();
+  const wasRecording = phase.value == "recording";
+  stopTicker();
+  if (wasRecording) {
+    const recorder = uni.getRecorderManager();
+    recorder.stop();
+  }
+});
+</script>
+
+<style lang="scss" scoped>
+.vr-page {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background-color: #ffffff;
+}
+
+.vr-nav {
+  height: 88rpx;
+  flex-direction: row;
+  align-items: center;
+  padding: 0 8rpx;
+}
+
+.vr-nav__side {
+  width: 160rpx;
+  height: 88rpx;
+  justify-content: center;
+  padding-left: 16rpx;
+}
+
+.vr-nav__side--right {
+  align-items: flex-end;
+  padding-right: 24rpx;
+  padding-left: 0;
+}
+
+.vr-nav__title {
+  flex: 1;
+  text-align: center;
+  font-size: 34rpx;
+  font-weight: 600;
+  color: #1a1a1a;
+}
+
+.vr-nav__action {
+  font-size: 28rpx;
+  color: #8e8e93;
+}
+
+.vr-body {
+  flex: 1;
+  align-items: center;
+}
+
+.vr-timer {
+  margin-top: 72rpx;
+  font-size: 72rpx;
+  font-weight: 500;
+  color: #3a3a3c;
+  letter-spacing: 2rpx;
+}
+
+.vr-wave {
+  width: 750rpx;
+  height: 280rpx;
+  margin-top: 120rpx;
+  position: relative;
+}
+
+.vr-wave__base {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 140rpx;
+  height: 0;
+  border-top-width: 2rpx;
+  border-top-style: dotted;
+  border-top-color: #d8d8dc;
+}
+
+.vr-wave__played {
+  position: absolute;
+  left: 0;
+  width: 375rpx;
+  top: 140rpx;
+  height: 0;
+  border-top-width: 2rpx;
+  border-top-style: dotted;
+  border-top-color: #f0b429;
+}
+
+.vr-wave__head {
+  position: absolute;
+  left: 367rpx;
+  top: 36rpx;
+  width: 16rpx;
+  height: 210rpx;
+  align-items: center;
+}
+
+.vr-wave__dot {
+  width: 12rpx;
+  height: 12rpx;
+  border-radius: 6rpx;
+  background-color: #e24b4b;
+}
+
+.vr-wave__line {
+  width: 2rpx;
+  flex: 1;
+  background-color: #e24b4b;
+}
+
+.vr-wave__ticks {
+  position: absolute;
+  left: 24rpx;
+  right: 24rpx;
+  bottom: 8rpx;
+  height: 28rpx;
+  flex-direction: row;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.vr-wave__tick {
+  width: 2rpx;
+  height: 16rpx;
+  background-color: #e4e4e8;
+}
+
+.vr-spacer {
+  flex: 1;
+}
+
+.vr-stop {
+  align-items: center;
+  margin-bottom: 120rpx;
+}
+
+.vr-stop__ring {
+  width: 148rpx;
+  height: 148rpx;
+  border-radius: 74rpx;
+  background-color: #f4f4f4;
+  align-items: center;
+  justify-content: center;
+}
+
+.vr-stop__btn {
+  width: 128rpx;
+  height: 128rpx;
+  border-radius: 64rpx;
+  background-color: #f5b942;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.vr-stop__square {
+  width: 36rpx;
+  height: 36rpx;
+  border-radius: 8rpx;
+  background-color: #ffffff;
+}
+
+.vr-stop__label {
+  margin-top: 28rpx;
+  font-size: 30rpx;
+  color: #e24b4b;
+}
+
+.vr-stop__label--idle {
+  color: #8e8e93;
+}
+
+.vr-actions {
+  width: 750rpx;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 0 72rpx;
+  margin-bottom: 120rpx;
+}
+
+.vr-action {
+  width: 160rpx;
+  align-items: center;
+}
+
+.vr-action__btn {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  border-radius: 64rpx;
+}
+
+.vr-action__btn--ghost {
+  width: 96rpx;
+  height: 96rpx;
+  margin-top: 16rpx;
+  background-color: #f3f3f5;
+}
+
+.vr-action__btn--main {
+  width: 128rpx;
+  height: 128rpx;
+  background-color: #f5b942;
+}
+
+.vr-action__btn--side {
+  width: 96rpx;
+  height: 96rpx;
+  margin-top: 16rpx;
+  background-color: #f5b942;
+}
+
+.vr-action__label {
+  margin-top: 20rpx;
+  font-size: 26rpx;
+  color: #8e8e93;
+}
+
+.vr-history {
+  flex: 1;
+}
+
+.vr-history__empty {
+  padding-top: 200rpx;
+  align-items: center;
+}
+
+.vr-history__empty-text {
+  font-size: 28rpx;
+  color: #8e8e93;
+}
+
+.vr-history__row {
+  padding: 28rpx 32rpx;
+  border-bottom-width: 1rpx;
+  border-bottom-style: solid;
+  border-bottom-color: #f2f2f4;
+}
+
+.vr-history__name {
+  font-size: 30rpx;
+  color: #1a1a1a;
+}
+
+.vr-history__meta {
+  margin-top: 8rpx;
+  font-size: 24rpx;
+  color: #8e8e93;
+}
+</style>

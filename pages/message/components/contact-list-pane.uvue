@@ -671,6 +671,13 @@
   /** touchend 时的判定结论：true = 按住拖过触发线再松手（不是甩动）。
    *  abort 兜底只在没有这份结论（touchend 缺失）时才退回 dy 快照。 */
   let pullReleaseQualified = false;
+  /** 原生最近一次 pulling 的**原始** dy（冻结期也更新）——用来判断「列表是不是已经
+   *  回到顶部了」。松手后原生收回动画会继续派 pulling（dy 一路减到 0），收回结束再
+   *  补派一次 refresherrefresh；若此时列表其实早就回到 0，那个补派 refresh 就不能再生
+   *  pull-reject（会把已经回弹完的列表重新顶进刷新停靠态，见 emitPullRefresh）。 */
+  let pullLastRawDy = 0;
+  /** 本轮手势中原生是否已经自己收回（收到 refresherrestore / refresherabort）。 */
+  let pullNativeRetracted = false;
   /** 快速下滑（甩动）闸门：下拉位移的平均速度高于它 = 惯性甩动，不触发跳转。
    *  按**原生位移 dy / 按住时长**算（Android 的 dy 与手指位移不是 1:1，手指速度不可靠；
    *  dy 才是用户在屏幕上看到的「页面下滑」）。
@@ -695,6 +702,9 @@
     pullReleaseDistance = -1;
     pullReleaseQualified = false;
     pullReachLineSpeed = -1;
+    // 容器重建 = 原生节点全新，收回状态观测归零
+    pullLastRawDy = 0;
+    pullNativeRetracted = false;
     // 复用旧起点会让下一轮的速度算成 ≈0（elapsed 跨两轮）→ 甩动漏判，必须清
     pullTouchStartAt = 0;
     // #ifdef APP-HARMONY
@@ -766,26 +776,29 @@
   });
   /** H5/小程序：圆点随下拉位移上浮，恒定居中于插槽下方露出的那条空白
    *  （露出的是插槽底部 min(dy, 插槽高) 段 → 偏移 (插槽高 - 露出高)/2）。
-   *  ★App 三端不用这个偏移：圆点画在列表外的覆盖层里、由 flex 居中，见 pullDotLayerStyle。 */
+   *  ★App 三端不用这个偏移：圆点画在列表外的覆盖层里、由自身 translateY 定位，见 pullDotLayerStyle。 */
   const pullGuideOffsetY = computed((): number => {
     const slot = props.pullSlotHeight;
     const shown = Math.min(pullGuideDistance.value, slot);
     return (slot - shown) * 0.5;
   });
-  /** 下拉圆点覆盖层高度 = 原生下拉位移 dy。dy 就是列表被推下来、露出空白的高度，
-   *  圆点在该层内 flex 居中 → 全程恒在下拉区域的垂直中心（不依赖原生刷新控件内部排版）。
-   *  ★App 三端都用它：原生插槽里的圆点在 dy 超过插槽高（60/74px）后就不再跟灰区居中，
-   *    越拉越偏（iOS 500px 行程下肉眼明显）。 */
+  /** 下拉圆点覆盖层：**高度恒为整块 pane**（不再随 dy 逐帧改 height）。
+   *  旧写法把 height 写成 dy 再靠 flex 居中圆点 —— 下拉时每帧改一次布局属性，
+   *  覆盖层与其三个子节点每帧重新排版（Android 上叠加原生刷新控件自己的每帧布局，
+   *  是「拉动时手感忽轻忽重」的可疑来源之一）。现在层级恒满高、圆点顶端对齐，
+   *  居中完全交给圆点自身的 translateY（合成层，不触发排版）。 */
   const pullDotLayerStyle = computed((): string => {
-    return `height: ${Math.max(0, pullGuideDistance.value)}px;`;
+    return `height: 100%;`;
   });
   const pullGuideRootStyle = computed((): string => {
     return `width: 100%; height: ${pullGuideSlotHeight.value}px; display: flex; flex-direction: row; align-items: center; justify-content: center; background-color: #f4f3fb;`;
   });
   const pullGuideDotsStyle = computed((): string => {
     // #ifdef APP
-    // 覆盖层里由 flex 居中定位，不需要位移，只跟下拉进度淡入。
-    return `position: relative; width: 42px; height: 18px; opacity: ${pullGuideOpacity.value};`;
+    // 覆盖层（.pull-dot-layer）顶端对齐、恒满高：圆点靠 translateY 落到「露出空白的
+    // 垂直中心」= dy/2（18px 盒子的半高 9px 要扣掉）。★只改 transform/opacity，
+    // 不写 height/top，避免下拉时每帧触发布局。
+    return `position: relative; width: 42px; height: 18px; transform: translateY(${Math.max(0, pullGuideDistance.value) * 0.5 - 9}px); opacity: ${pullGuideOpacity.value};`;
     // #endif
     // #ifndef APP
     return `position: relative; width: 42px; height: 18px; transform: translateY(${pullGuideOffsetY.value}px); opacity: ${pullGuideOpacity.value};`;
@@ -821,8 +834,10 @@
   }
 
   function handlePulling(eventValue: Any): void {
-    if (pullGuideFrozen) return;
     const e = eventValue as UniRefresherEvent;
+    // 冻结期也要记原始 dy：收回动画期间它就是「列表回到哪儿了」的唯一观测值
+    pullLastRawDy = e.detail.dy;
+    if (pullGuideFrozen) return;
     const distance = Math.max(0, Math.min(e.detail.dy, props.pullMaxDragDistance));
     // 三圆点完整展开（= 已越过判定线）时给一次轻震，每轮手势只震一次。
     if (!pullHapticFired && distance >= props.pullThreshold * PULL_ARM_RATIO) {
@@ -903,6 +918,17 @@
       pullReleaseFired = true;
       pullGuideFrozen = true;
       pullGuideDistance.value = 0;
+      // ★补派识别（2026-11-12 Android 实测）：松手后原生收回动画会继续派 pulling，
+      //   收回结束**再补派一次 refresherrefresh**（实测松手后 ~526ms）。此时列表其实
+      //   早就回到顶了（原始 dy 已归零 / 或已收到 abort|restore），这个 refresh 不是
+      //   「原生停在刷新停靠态」，再生 pull-reject 只会把列表重新顶下去：页面写
+      //   triggered true→false → 原生 autoRefresh() 把列表拉回 header 高 + finishRefresh
+      //   内部还有 ~300ms 延迟才收回 = 用户看到的「拉一点点松手，回弹很慢」，而且这段
+      //   窗口里新的下拉会被原生刷新控件吃掉（「回弹过程中再下滑没反应」）。→ 只收回圆点。
+      if (pullNativeRetracted || pullLastRawDy <= 2) {
+        emit("pull-abort");
+        return;
+      }
       emit("pull-reject");
       return;
     }
@@ -917,6 +943,11 @@
       const rejected = fling || (pullReleaseDistance >= 0 && !pullReleaseQualified);
       if (rejected) {
         pullGuideDistance.value = 0;
+        // 同上：原生已经自己收回的补派 refresh 不 settle
+        if (pullNativeRetracted || pullLastRawDy <= 2) {
+          emit("pull-abort");
+          return;
+        }
         emit("pull-reject");
         return;
       }
@@ -925,6 +956,8 @@
   }
 
   function emitPullRestore(): void {
+    // 原生已自己收回：此后补派的 refresherrefresh 一律不 settle（见 emitPullRefresh）
+    pullNativeRetracted = true;
     // 上一轮收回动画收尾落在新一轮下拉中间：不复位，让这一拉继续跟手
     if (!pullGuideDragging) {
       pullGuideFrozen = true;
@@ -965,6 +998,8 @@
    *    touchend 已经判过「没拖到位或是一甩」，abort 时的 dy 只是惯性，不能翻案。
    *    快照缺失（touchend 没派发）才退回当前值，保留原兜底意图。 */
   function emitPullAbort(): void {
+    // 原生已自己收回（未过阈值松手派 abort）：此后补派的 refresh 一律不 settle
+    pullNativeRetracted = true;
     // touchend 已判定达到入口线时，Android 随后仍可能补派 abort；此时不能立即清零/
     // 冻结，否则会截断正在进行的原生回弹。让 pulling 递减帧与 restore 自然收尾。
     if (pullReleaseFired) return;
@@ -995,6 +1030,9 @@
     pullReleaseDistance = -1;
     pullReleaseQualified = false;
     pullReachLineSpeed = -1;
+    // 新一轮手势：原生「已收回」标记复位（pullLastRawDy 故意不清——它记录的是原生
+    // 实际停在哪，上一轮若真卡在刷新停靠态就要保持非零，才能在补派 refresh 时 settle）
+    pullNativeRetracted = false;
     // 只记按下时刻：越线/松手时用它算 dy 的速度（见 isPullReleaseQualified）。
     pullTouchStartAt = Date.now();
     emit("pane-touchstart", e);
@@ -1165,7 +1203,9 @@
     width: 100%;
     display: flex;
     flex-direction: row;
-    align-items: center;
+    /* 顶端对齐：高度恒满（=整块 pane），圆点垂直位置由自身 translateY 决定（见
+       pullGuideDotsStyle）。旧写法 align-items:center + 每帧改 height 会逐帧排版。 */
+    align-items: flex-start;
     justify-content: center;
     pointer-events: none;
     z-index: 1;

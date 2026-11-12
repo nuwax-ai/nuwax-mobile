@@ -1,11 +1,20 @@
 <template>
   <view class="common-tab-bar" :style="coverStyle">
   <uni-tab-bar class="common-tab-bar__items" style="padding-bottom: 0px; border-top-width: 0px;">
-    <uni-tab-item v-for="item in items" :key="item.path">
-      <!-- 插槽全尺寸 wrapper：uni-tab 的 changeTab 有同索引守卫，点已激活 tab 不 emit change，
-           插槽子 view 的 click 是感知重复点按的唯一通道（官方 uni-tab 示例同构）。
-           不加 .stop：先跑本 handler 再冒泡到 item 根完成切 tab，互不影响。 -->
-      <view class="common-tab-bar__hit" @click="handleTabItemTap(item.path)">
+    <uni-tab-item v-for="(item, index) in items" :key="item.path">
+      <!-- 插槽全尺寸 wrapper：**切换由本层自己落定**（touchend 主通道 + click 兜底，
+           见 activateTabAt），不再依赖 click 冒泡到 item 根由 uni-tab 派发 change——
+           那是唯一一条切页通道，一旦原生 click 没合成 / change 没派发（Android 下拉
+           回弹后偶发），整块 tabbar 就完全失灵（点击无反应、文案高亮不变），而列表行
+           因为走 touchend 主通道照常可点。加 touch 三路后与行点按同构。
+           不加 .stop：事件继续冒泡给 item 根，uni-tab 内部同索引守卫会吞掉重复切换。 -->
+      <view
+        class="common-tab-bar__hit"
+        @touchstart="handleTabTouchStart(index, $event)"
+        @touchend="handleTabTouchEnd(index, $event)"
+        @touchcancel="handleTabTouchCancel(index)"
+        @click="handleTabClick(index)"
+      >
         <text class="common-tab-bar__label" :class="{ 'common-tab-bar__label--active': item.path == props.activePath }">{{ t(item.key) }}</text>
         <view v-if="badgeCount(item) > 0" class="common-tab-bar__badge">
           <text class="common-tab-bar__badge-text">{{ badgeText(item) }}</text>
@@ -19,7 +28,7 @@
 
 <script setup lang="uts">
   import { computed } from "vue";
-  import { mainTabBarCovered } from "@/utils/mainTabNavigation";
+  import { MAIN_TAB_PATHS, mainTabBarCovered, selectMainTab } from "@/utils/mainTabNavigation";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { systemMessageUnreadCount } from "@/utils/notificationBadge";
   import { imTabBadgeCount } from "@/utils/imUnreadBadge";
@@ -64,7 +73,26 @@
   const RETAP_WINDOW_MS = 300;
   let lastMessageTabTapMs = 0;
 
-  function handleTabItemTap(path: string): void {
+  // ===== 轻点判定（触摸主通道 + 合成 click 兜底）=====
+  /** 静止点按的位移阈值（px）：下拉/横滑的抬手位移必超它，不会被当成点按。 */
+  const TAB_TAP_SLOP_PX = 12;
+  /** click 去重窗：touchend 已派发后，同一次手势紧随合成的 click 一律吞掉。 */
+  const TAB_CLICK_DEDUPE_MS = 500;
+  /** 各项的起手坐标/是否已记录（下标与 items 对齐）。 */
+  const tabTapStartX: Array<number> = [0, 0, 0, 0];
+  const tabTapStartY: Array<number> = [0, 0, 0, 0];
+  const tabTapArmed: Array<boolean> = [false, false, false, false];
+  /** 最近一次 touchend 主通道派发时刻（供 click 兜底去重）。
+   *  ★不复用 utils/reliableTap 的 ReliableTap：它的 500ms 防重窗连「双击伙伴定位
+   *    首条未读」的第二下（间隔 ~300ms 的 touchend）也一起吞；这里把去重只放在
+   *    click 通道，两下抬手都能正常派发。 */
+  let tabTouchEndedAt = 0;
+
+  /** 落定点击结果（切换 + 已激活项的重按语义）。切换**由本层直接写状态**，
+   *  不再依赖 uni-tab 的 change 派发（见模板注释：那条通道偶发断掉会让整块 tabbar 失灵）。 */
+  function activateTabAt(index: number): void {
+    if (index < 0 || index >= items.length) return;
+    const path = items[index].path;
     if (path == MESSAGE_TAB_PATH) {
       const now = Date.now();
       if (lastMessageTabTapMs > 0 && now - lastMessageTabTapMs <= RETAP_WINDOW_MS) {
@@ -74,12 +102,55 @@
       } else {
         lastMessageTabTapMs = now;
       }
-      return;
-    }
-    // 任务 tab：再点已激活项 → 静默刷新/失败重试（dispatch 仅激活 tab 的订阅者可达）
-    if (path == TASK_TAB_PATH && props.activePath == path) {
+    } else if (path == TASK_TAB_PATH && props.activePath == path) {
+      // 任务 tab：再点已激活项 → 静默刷新/失败重试（dispatch 仅激活 tab 的订阅者可达）
       dispatchMainTabRetap(TASK_TAB_PATH);
     }
+    const target = MAIN_TAB_PATHS.indexOf(path);
+    if (target >= 0) selectMainTab(target);
+  }
+
+  function handleTabTouchStart(index: number, eventValue: Any): void {
+    if (index < 0 || index >= tabTapArmed.length) return;
+    const e = eventValue as UniTouchEvent;
+    // touches 优先、changedTouches 兜底（部分运行时的 touchstart touches 可能为空）
+    if (e.touches.length > 0) {
+      tabTapStartX[index] = e.touches[0].clientX;
+      tabTapStartY[index] = e.touches[0].clientY;
+      tabTapArmed[index] = true;
+      return;
+    }
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      tabTapStartX[index] = e.changedTouches[0].clientX;
+      tabTapStartY[index] = e.changedTouches[0].clientY;
+      tabTapArmed[index] = true;
+    }
+  }
+
+  /** 触摸主通道：静止点按即落定（与列表行同款「抬手派发」，click 只作兜底）。 */
+  function handleTabTouchEnd(index: number, eventValue: Any): void {
+    if (index < 0 || index >= tabTapArmed.length || !tabTapArmed[index]) return;
+    tabTapArmed[index] = false;
+    const e = eventValue as UniTouchEvent;
+    if (e.changedTouches == null || e.changedTouches.length == 0) return;
+    const tc = e.changedTouches[0];
+    if (Math.abs(tc.clientX - tabTapStartX[index]) > TAB_TAP_SLOP_PX) return;
+    if (Math.abs(tc.clientY - tabTapStartY[index]) > TAB_TAP_SLOP_PX) return;
+    tabTouchEndedAt = Date.now();
+    activateTabAt(index);
+  }
+
+  /** 取消（手势被系统/滚动手势接管）：只弃本轮起点，不落定。 */
+  function handleTabTouchCancel(index: number): void {
+    if (index < 0 || index >= tabTapArmed.length) return;
+    tabTapArmed[index] = false;
+  }
+
+  /** click 兜底（H5 桌面无触摸；App 上紧随 touchend 的合成 click 在去重窗内被吞）。 */
+  function handleTabClick(index: number): void {
+    if (index < 0 || index >= tabTapArmed.length) return;
+    if (Date.now() - tabTouchEndedAt <= TAB_CLICK_DEDUPE_MS) return;
+    activateTabAt(index);
   }
 
 </script>

@@ -660,10 +660,16 @@
   /** 松手瞬间的位移快照（touchend 时的 dy）；-1 = 本轮还没收到 touchend。
    *  abort 兜底只认这个快照：松手后被惯性推高的 dy 不算数（见 emitPullAbort）。 */
   let pullReleaseDistance = -1;
-  /** 本轮手势的按下时刻（touchstart 记，touchcancel 清）。
+  /** 本轮手势的按下时刻（touchstart 记；Android 的原生接管 touchcancel 不清）。
    *  ★只用来算「松手速度」：快速下滑一甩时 dy 会被惯性冲过触发线，而手指其实没按住
    *    拖到位（「甩一下就跳进会话」的误触来源）。 */
   let pullTouchStartAt = 0;
+  // #ifdef APP-ANDROID
+  /** 触线后原生下拉位移的稳定窗口；只在本轮触摸期间采样。 */
+  let pullAndroidStillSince = 0;
+  let pullAndroidStillDy = -1;
+  let pullAndroidStillSamples = 0;
+  // #endif
   /** 「dy 首次越过触发线」那一刻的速度（px/s）；-1 = 本轮还没越线。
    *  ★这是甩动判定的**主**数据源：它来自 refresherpulling 事件序列，不依赖 touchend
    *    （Android 下拉时 scroll-view 的 touchend 未必上报，touchend 整条链路是兜底）。 */
@@ -687,13 +693,17 @@
    *    旧值 900 会把 160ms 左右的正常拖动误判成甩动（=「有时按住拖过阈值松手不跳」），
    *    抬到 1200 与实测甩动（1501）留出余量，正常拖动（<1000）全部放行。 */
   const PULL_FLING_MAX_SPEED = 1200;
-  /** 松手判定线（相对触发线的比例）：拉过触发线的 90% 就按「按住拖到位」处理。
+  /** 松手判定下限：其他端沿用 90%；Android 还须过完整触发线并停稳。
    *  ★0.97 太严：dy 136.67 / 触发线 148 = 92.3% 时三点已几乎完全展开，肉眼分辨不出
    *    最后 8%，松手却被判「没拉到位」= 用户反馈「明明拉过阈值却不跳」。 */
   const PULL_RELEASE_MIN_RATIO = 0.9;
-  /** 三圆点「完全展开」+ 触感提示的进度（相对触发线）：必须**早于**判定线，
-   *  保证「看到三点完整 ⇒ 松手必跳」，否则视觉会骗人（见 pullGuideMorphProgress）。 */
+  /** 三圆点形态/震动只提示位移；Android 跳转还要等触线后页面停稳再松手。 */
   const PULL_ARM_RATIO = 0.92;
+  // #ifdef APP-ANDROID
+  /** 松手前至少 120ms 位移变化不超过 2px，且有连续原生位移样本。 */
+  const PULL_ANDROID_STILL_MS = 120;
+  const PULL_ANDROID_STILL_DY = 2;
+  // #endif
   /** 重建滚动容器时把下拉位移一并清零：跳转打断收回的话 refresherrestore 不会来，
    *  pullGuideDistance 会停在松手时的值，重建后圆点按旧位移显示。 */
   watch((): number => props.pullResetToken, (_token: number): void => {
@@ -707,6 +717,11 @@
     pullNativeRetracted = false;
     // 复用旧起点会让下一轮的速度算成 ≈0（elapsed 跨两轮）→ 甩动漏判，必须清
     pullTouchStartAt = 0;
+    // #ifdef APP-ANDROID
+    pullAndroidStillSince = 0;
+    pullAndroidStillDy = -1;
+    pullAndroidStillSamples = 0;
+    // #endif
     // #ifdef APP-HARMONY
     // ★鸿蒙归位后保持冻结，直到下一次真实触摸（emitPaneTouchStart 解冻）：旧 Refresh
     //   在重建/回页交界仍可能补派一帧带旧 offset 的 refresherpulling，解冻的话会把
@@ -756,7 +771,7 @@
   });
   /** 展开进度：走到触发线的 55% 开始分叉，到 **92%（= PULL_ARM_RATIO）** 完全展开。
    *  ★收口点必须早于松手判定线（PULL_RELEASE_MIN_RATIO = 0.9 × 触发线）：
-   *    这样「看到三个点完整展开」⇒ 松手必跳，视觉与判定不会互相打脸。
+   *    Android 伙伴页还要求越过完整触发线，且松手前的位移已停稳。
    *    旧版收口正好在 100% 触发线，实测用户拉到 92%（dy 136.67/148）时三点已几乎
    *    展开、肉眼分辨不出，松手却被 fail(dy<line) 挡掉 =「明明拉过线却不跳」。
    *  ★起分点尽量早（55% 起分、92% 收口，跟阈值绝对像素无关）→ 三个点出现得干脆。 */
@@ -839,6 +854,23 @@
     pullLastRawDy = e.detail.dy;
     if (pullGuideFrozen) return;
     const distance = Math.max(0, Math.min(e.detail.dy, props.pullMaxDragDistance));
+    // #ifdef APP-ANDROID
+    // 只认按下后、越过完整入口线的原生位移；持续移动就重新计时。
+    if (pullTouchStartAt > 0 && distance >= props.pullThreshold) {
+      const now = Date.now();
+      if (pullAndroidStillSince == 0 || Math.abs(distance - pullAndroidStillDy) > PULL_ANDROID_STILL_DY) {
+        pullAndroidStillSince = now;
+        pullAndroidStillDy = distance;
+        pullAndroidStillSamples = 1;
+      } else {
+        pullAndroidStillSamples = pullAndroidStillSamples + 1;
+      }
+    } else {
+      pullAndroidStillSince = 0;
+      pullAndroidStillDy = -1;
+      pullAndroidStillSamples = 0;
+    }
+    // #endif
     // 三圆点完整展开（= 已越过判定线）时给一次轻震，每轮手势只震一次。
     if (!pullHapticFired && distance >= props.pullThreshold * PULL_ARM_RATIO) {
       pullHapticFired = true;
@@ -940,7 +972,11 @@
     setTimeout((): void => {
       // 甩动判定（主判据来自 pulling 的越线速度，touchend 漏报时也有效）
       const fling = pullReachLineSpeed > PULL_FLING_MAX_SPEED;
-      const rejected = fling || (pullReleaseDistance >= 0 && !pullReleaseQualified);
+      let rejected = fling || (pullReleaseDistance >= 0 && !pullReleaseQualified);
+      // #ifdef APP-ANDROID
+      // Android 没有 touchend 的停稳结论时，原生 refresh 不能直接触发跳转。
+      rejected = rejected || pullReleaseDistance < 0;
+      // #endif
       if (rejected) {
         pullGuideDistance.value = 0;
         // 同上：原生已经自己收回的补派 refresh 不 settle
@@ -966,20 +1002,28 @@
     emit("pull-restore");
   }
 
-  /** 松手判定：下拉位移到了「判定线」（PULL_RELEASE_MIN_RATIO × 触发线；三圆点在
-   *  更早的 PULL_ARM_RATIO 处就已完全展开，所以看到三点完整就必然过线），
+  /** 松手判定：下拉位移到了判定线（其他端为 PULL_RELEASE_MIN_RATIO × 触发线；
+   *  Android 要求完整触发线，并确认松手前页面已停稳），
    *  且这次是「按住拖到位再松手」，不是「快速下滑一甩」。
    *  ① 位移判据用原生 dy 快照（用户看到的点就是判定依据）。
    *  ② 甩动闸门：dy / 按住时长 > PULL_FLING_MAX_SPEED 即判快速下滑（一甩就到线），
    *     不触发。★只取 touchstart 的时刻、不取坐标：Android 的 dy 与手指位移不是 1:1
    *     （带阻尼与 header 加成），dy 才是用户眼里的「页面下滑」速度；触摸坐标在个
    *     别机型上不可靠，不参与判定。
-   *  ③ 没有 touchstart 采样（handler 丢了）：只看 dy，退回改动前的老口径。
+   *  ③ Android 必须有本轮 touchstart、越线后的停稳样本和 touchend；其他端保留原口径。
    *  ★必须定义在 emitPaneTouchEnd 之前：UTS 不保证函数声明提升（error18 找不到名称）。 */
   function isPullReleaseQualified(_eventValue: Any): boolean {
     const dy = pullGuideDistance.value;
     const line = props.pullThreshold * PULL_RELEASE_MIN_RATIO;
     if (dy < line) return false;
+    // #ifdef APP-ANDROID
+    // 快划惯性可把 dy 冲过线，但只有按住拖过完整线、页面稳定后松手才跳转。
+    const now = Date.now();
+    if (dy < props.pullThreshold || pullTouchStartAt <= 0 || pullGuideFrozen
+      || pullAndroidStillSince <= 0 || pullAndroidStillSamples < 2
+      || now - pullAndroidStillSince < PULL_ANDROID_STILL_MS
+      || Math.abs(Math.max(0, Math.min(pullLastRawDy, props.pullMaxDragDistance)) - pullAndroidStillDy) > PULL_ANDROID_STILL_DY) return false;
+    // #endif
     // 主判据：dy 首次越线那一刻的速度（来自 pulling 事件序列，不依赖 touchend）
     if (pullReachLineSpeed > PULL_FLING_MAX_SPEED) return false;
     // 兜底：越线速度没采到（pulling 少帧）时才用松手总时长复核
@@ -1012,7 +1056,12 @@
       emit("pull-abort");
       return;
     }
-    // touchend 没到（个别机型下拉时不上报）：仍要过甩动闸门，越线速度高 = 快速下滑
+    // #ifdef APP-ANDROID
+    // 缺少 touchend 就无法确认松手时已停稳，Android 只回弹。
+    emit("pull-abort");
+    return;
+    // #endif
+    // touchend 没到（其他端个别机型不上报）：仍要过甩动闸门，越线速度高 = 快速下滑
     if (snapshot >= props.pullThreshold * PULL_RELEASE_MIN_RATIO && pullReachLineSpeed <= PULL_FLING_MAX_SPEED) {
       emit("pull-refresh");
       return;
@@ -1030,6 +1079,11 @@
     pullReleaseDistance = -1;
     pullReleaseQualified = false;
     pullReachLineSpeed = -1;
+    // #ifdef APP-ANDROID
+    pullAndroidStillSince = 0;
+    pullAndroidStillDy = -1;
+    pullAndroidStillSamples = 0;
+    // #endif
     // 新一轮手势：原生「已收回」标记复位（pullLastRawDy 故意不清——它记录的是原生
     // 实际停在哪，上一轮若真卡在刷新停靠态就要保持非零，才能在补派 refresh 时 settle）
     pullNativeRetracted = false;
@@ -1044,16 +1098,15 @@
     pullReleaseDistance = pullGuideDistance.value;
     pullReleaseQualified = isPullReleaseQualified(e);
     // #ifdef APP-ANDROID
-    // Android 原生刷新即使只拉到插槽高、没过入口线，也可能在松手约 550ms 后才派
-    // refresherrefresh；等那时再 true→false，restore 会比松手晚约 1.4s。
-    // 已有 touchend 否决结论且原生位移达到插槽高时立即启动收回；迟到的 refresh
-    // 由 pullReleaseFired 吞掉，避免第二次 autoRefresh 延长回弹。
-    if (!pullReleaseFired && !pullReleaseQualified && pullReleaseDistance >= props.pullSlotHeight) {
-      pullReleaseFired = true;
-      emit("pull-reject");
-    }
+    // 判定已落地，清掉本轮采样，避免后续原生事件或下一次快划复用。
+    pullTouchStartAt = 0;
+    pullAndroidStillSince = 0;
+    pullAndroidStillDy = -1;
+    pullAndroidStillSamples = 0;
+    // 未达跳转条件时不主动触发原生刷新态收回；短下拉交给原生回弹。
+    // 若原生稍后真的派 refresh，仍由 emitPullRefresh 处理其停靠态。
     // #endif
-    // Android/iOS 松手当帧判定：按住拖过触发线（= 三个圆点完整）才立刻上抛，
+    // Android/iOS 松手当帧判定：Android 还要求触线后位移停稳，才立刻上抛，
     // 不等原生走 refresh/abort/restore 时序。原生稍后的事件由 pullReleaseFired 吞掉。
     if (!pullReleaseFired && pullReleaseQualified) {
       pullReleaseFired = true;

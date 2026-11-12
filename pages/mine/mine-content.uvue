@@ -102,9 +102,12 @@
         <!-- 推送通知（原账号管理页移入）：业务开关 + 系统通知权限合并为一个，开关状态 = 真能收到推送
              ★系统权限只能申请、无法由代码关闭，所以「关」只关业务侧（后端不再下发本设备）；
                系统权限被拒/未授予时开关回弹为关，并弹窗引导去系统设置开启。
-             ★Android 端此开关已移除：与下方「消息通知」里的「通知权限」项重复。 -->
-        <!-- #ifdef APP-IOS || APP-HARMONY -->
-        <view class="row-item" v-if="isLoggedIn">
+             ★Android 按「有没有 OEM 系统推送通道」二选一（见 legacyPushSwitchVisible）：
+               有渠道（华为/荣耀/小米/OPPO/vivo…）→ 本开关；无渠道 → 下方「消息通知」入口。
+               无渠道机型走个推自建通道，业务开关的「关」并不能真正止血（后端不下发 ≠ 能收不到），
+               且系统侧三项还得用户去设置页放开，所以改由一个只读入口引导，不再暴露业务开关。 -->
+        <!-- #ifdef APP-ANDROID || APP-IOS || APP-HARMONY -->
+        <view class="row-item" v-if="isLoggedIn && legacyPushSwitchVisible">
           <view class="row-icon-box">
             <svg-icon name="icon-notification-box" size="20" unit="px" />
           </view>
@@ -115,7 +118,7 @@
         </view>
         <!-- #endif -->
         <!-- #ifdef APP-ANDROID -->
-        <!-- 仅对确定没有 OEM 系统通道的设备展示；点「需要设置」直接拉起底部操作面板。 -->
+        <!-- 仅对确定没有 OEM 系统通道的设备展示，与原「推送通知」开关互斥；点「需要设置」直接拉起底部操作面板。 -->
         <view class="row-item" v-if="showPushBackgroundEntry" @click="openPushBackgroundActionSheet">
           <view class="row-icon-box">
             <svg-icon name="icon-notification-box" size="20" unit="px" />
@@ -695,6 +698,11 @@
   //   ★但开关保持打开（用户是否去开启系统权限不影响这里的业务状态）；拨关完全不读权限。
   // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   const pushEnabled = ref<boolean>(false);
+  /** 原「推送通知」业务开关是否显示：iOS/鸿蒙恒显示；Android 按「有没有 OEM 系统推送通道」
+   *  二选一——有渠道显示本开关，无渠道让位给「消息通知」入口（见 refreshPushBackgroundStatus）。
+   *  ★Android 初值/检测失败一律 true（fail-open）：绝大多数机型有渠道，且本开关只关业务侧、
+   *    误显示无害；确认无渠道的那一帧再切走。 */
+  const legacyPushSwitchVisible = ref<boolean>(true);
   /** 推送身份（users/me）已就绪：未就绪时本地偏好无宿主，开关置灰不可拨。 */
   const pushReady = ref<boolean>(false);
   const pushBusy = ref<boolean>(false);
@@ -718,8 +726,8 @@
   const pushBackgroundState = ref<PushBackgroundStatus | null>(null);
   let pushBackgroundSeq = 0;
 
-  // ★不再看 pushEnabled：Android 已移除业务推送开关（见模板），存量「已关闭」不再有 UI 入口，
-  //   否则这一行会永久隐藏。
+  // ★不再看 pushEnabled：无渠道机型的原业务开关已被本入口取代（见模板与 legacyPushSwitchVisible），
+  //   存量「已关闭」不再有 UI 入口，否则这一行会永久隐藏。
   const showPushBackgroundEntry = computed((): boolean => {
     const state = pushBackgroundState.value;
     return isLoggedIn.value && state != null && state.vendor == "none";
@@ -739,6 +747,7 @@
     if (!isLoggedIn.value) {
       pushBackgroundLoading.value = false;
       pushBackgroundState.value = null;
+      legacyPushSwitchVisible.value = true;
       return;
     }
     pushBackgroundLoading.value = true;
@@ -746,21 +755,29 @@
       const state = await getPushBackgroundStatus();
       if (seq != pushBackgroundSeq) return;
       pushBackgroundState.value = state;
+      // 无渠道 → 原业务开关让位给「消息通知」入口；有渠道 → 保留原开关
+      legacyPushSwitchVisible.value = state.vendor != "none";
     } catch (_e) {
-      if (seq == pushBackgroundSeq) pushBackgroundState.value = null;
+      if (seq == pushBackgroundSeq) {
+        pushBackgroundState.value = null;
+        legacyPushSwitchVisible.value = true;
+      }
     } finally {
       if (seq == pushBackgroundSeq) pushBackgroundLoading.value = false;
     }
   }
 
   /**
-   * Android 已移除业务推送开关（系统通知权限即唯一入口）：存量「已关闭」一律恢复开启。
+   * 无 OEM 系统推送通道的机型没有业务推送开关入口：存量「已关闭」恢复开启。
    * ★否则 registerImDeviceNow 会继续上报 pushEnabled=false，后端永不下发离线推送，
    *   而页面里已经没有任何入口能把开关拨回来。
+   * ★有渠道机型**不得**调用：用户主动关掉推送是有效诉求，强行打开属于篡改偏好。
+   * @returns 是否真的做了写入（调用方据此决定要不要补一次设备注册）
    */
-  function ensureAndroidPushPreferenceOn(): void {
-    if (!hasImPushPreferenceUser() || readImPushEnabled()) return;
+  function ensureAndroidPushPreferenceOn(): boolean {
+    if (!hasImPushPreferenceUser() || readImPushEnabled()) return false;
     writeImPushEnabled(true);
+    return true;
   }
 
   function openPushBackgroundActionSheet(): void {
@@ -843,6 +860,30 @@
     }
   }
 
+  // #ifdef APP-ANDROID
+  /**
+   * 检测后台接收状态，并在「确认无 OEM 推送通道」时把存量「已关闭」恢复为开启。
+   * ★必须在拿到 vendor 之后才改偏好：有渠道机型的开关是用户主动关的，提前改会篡改其意图。
+   * ★不能把这段搬进 refreshPushBackgroundStatus：它要调下面的 resyncPushRegistration，
+   *   而 UTS 不允许前向引用（error18）。
+   */
+  function refreshPushBackgroundAndMigrate(): void {
+    // UI 状态（入口分流 + 文案）走统一的 seq 去重链路
+    refreshPushBackgroundStatus();
+    // 偏好迁移单独判一次：不读 pushBackgroundState，避免和并发调用互相覆盖导致漏迁移
+    getPushBackgroundStatus().then((state): void => {
+      if (state.vendor != "none") return;
+      if (!ensureAndroidPushPreferenceOn()) return;
+      // 偏好已从「关」恢复为「开」：同步开关显示值，并补一次注册让服务端收敛
+      pushEnabled.value = readImPushEnabled();
+      syncPushSwitch();
+      resyncPushRegistration();
+    }).catch((_e: any | null): void => {
+      // 检测失败不动偏好（下次进页重试）
+    });
+  }
+  // #endif
+
   /**
    * 进页/切回本 Tab 时校正开关。
    * ★tab 页每次显示都会走这里（比账号管理页的「进页一次」频繁得多），所以分两条路：
@@ -854,13 +895,11 @@
     if (pushBusy.value) return;
     if (hasImPushPreferenceUser()) {
       pushReady.value = true;
-      // #ifdef APP-ANDROID
-      ensureAndroidPushPreferenceOn();
-      // #endif
       pushEnabled.value = readImPushEnabled();
       syncPushSwitch();
       // #ifdef APP-ANDROID
-      refreshPushBackgroundStatus();
+      // 后台接收状态检测；确认无 OEM 通道时同时迁移存量「已关闭」偏好（见上）
+      refreshPushBackgroundAndMigrate();
       // #endif
       resyncPushRegistration();
       return;
@@ -871,13 +910,10 @@
       const ready = await ensureImPushPreferenceUser();
       if (!pushCurrent(stamp, seq)) return;
       pushReady.value = ready;
-      // #ifdef APP-ANDROID
-      ensureAndroidPushPreferenceOn();
-      // #endif
       pushEnabled.value = readImPushEnabled();
       syncPushSwitch();
       // #ifdef APP-ANDROID
-      refreshPushBackgroundStatus();
+      refreshPushBackgroundAndMigrate();
       // #endif
       if (!ready) throw new Error(t("Mobile.Error.pushIdentityUnavailable"));
       // 注册一次让服务端拿到本设备的最新偏好（失败无 UI 提示：下次 onShow 会重试）
@@ -1042,12 +1078,10 @@
     // ★从系统设置 / 后台返回：上一次操作可能已被系统挂起（跳去设置期间请求回调丢失，
     //   Promise 永不 settle）→ pushBusy 卡在 true、开关 `:disabled` 变灰点不动。
     //   这里作废在途操作立即解灰，再重新核一次真实状态。
+    //   Android 的后台接收状态（入口分流 + 文案）由 refreshPushPreference 内部的
+    //   refreshPushBackgroundAndMigrate 一并刷新，不再单独直调——两次并发会被 seq 去重吃掉一次。
     abortPushBusy();
     refreshPushPreference();
-    // #ifdef APP-ANDROID
-    // 从系统设置返回后立即刷新可检测项；refreshPushPreference 完成后还会再校正一次。
-    refreshPushBackgroundStatus();
-    // #endif
     // #endif
   });
 </script>

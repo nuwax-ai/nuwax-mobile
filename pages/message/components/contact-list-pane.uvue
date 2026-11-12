@@ -673,9 +673,20 @@
   let pullReleaseQualified = false;
   /** 快速下滑（甩动）闸门：下拉位移的平均速度高于它 = 惯性甩动，不触发跳转。
    *  按**原生位移 dy / 按住时长**算（Android 的 dy 与手指位移不是 1:1，手指速度不可靠；
-   *  dy 才是用户在屏幕上看到的「页面下滑」）。按住拖到触发线一般 250ms 起（≈600px/s），
-   *  快速一甩 100~160ms 就到线（≥900px/s）→ 挡。 */
-  const PULL_FLING_MAX_SPEED = 900;
+   *  dy 才是用户在屏幕上看到的「页面下滑」）。
+   *  ★dy 含 header/插槽高度的加成（Android 实测 dy ≈ 60 + 手指位移），所以 dy 速度
+   *    比真实手指速度**偏高**：指到触发线 148 时手指只走了约 88px。
+   *    实测：快速一甩 dy 到线 ≈ 101ms → 1501px/s；正常按住拖动 160~300ms → 500~925px/s。
+   *    旧值 900 会把 160ms 左右的正常拖动误判成甩动（=「有时按住拖过阈值松手不跳」），
+   *    抬到 1200 与实测甩动（1501）留出余量，正常拖动（<1000）全部放行。 */
+  const PULL_FLING_MAX_SPEED = 1200;
+  /** 松手判定线（相对触发线的比例）：拉过触发线的 90% 就按「按住拖到位」处理。
+   *  ★0.97 太严：dy 136.67 / 触发线 148 = 92.3% 时三点已几乎完全展开，肉眼分辨不出
+   *    最后 8%，松手却被判「没拉到位」= 用户反馈「明明拉过阈值却不跳」。 */
+  const PULL_RELEASE_MIN_RATIO = 0.9;
+  /** 三圆点「完全展开」+ 触感提示的进度（相对触发线）：必须**早于**判定线，
+   *  保证「看到三点完整 ⇒ 松手必跳」，否则视觉会骗人（见 pullGuideMorphProgress）。 */
+  const PULL_ARM_RATIO = 0.92;
   /** 重建滚动容器时把下拉位移一并清零：跳转打断收回的话 refresherrestore 不会来，
    *  pullGuideDistance 会停在松手时的值，重建后圆点按旧位移显示。 */
   watch((): number => props.pullResetToken, (_token: number): void => {
@@ -726,18 +737,20 @@
     return props.pullSlotHeight + props.pullMaxDragDistance + 20;
     // #endif
   });
-  /** 形态进度按**触发距离**（pullThreshold）归一：走到触发线恰好三圆点完全展开。
-   *  ★必须与原生触发线对齐——用户看到三点完整，就是「松手必跳」的那一刻；
-   *    按 maxDrag（还能拉多远）归一会让圆点先展开、触发线还在后面（旧版实坑）。
-   *  ★Android/iOS 的最大拖拽距离放大到 500（见 message-content 常量），更不能按它归一：
+  /** 形态进度按**触发距离**（pullThreshold）归一。
+   *  ★Android/iOS 的最大拖拽距离放大到 500（见 message-content 常量），不能按它归一：
    *    触发线只占行程的 22%~30%，圆点会几乎不动。 */
   const pullGuideProgress = computed((): number => {
     const extent = Math.max(1, props.pullThreshold);
     return Math.max(0, Math.min(pullGuideDistance.value / extent, 1));
   });
-  /** 展开进度：走到触发线的 55% 就开始分叉，到 100%（= 触发线）完全展开成三个。
-   *  ★起分点尽量早（55% 起分、100% 收口，跟阈值绝对像素无关）→ 三个点出现得干脆。 */
-  const pullGuideMorphProgress = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.55) / 0.45, 1)));
+  /** 展开进度：走到触发线的 55% 开始分叉，到 **92%（= PULL_ARM_RATIO）** 完全展开。
+   *  ★收口点必须早于松手判定线（PULL_RELEASE_MIN_RATIO = 0.9 × 触发线）：
+   *    这样「看到三个点完整展开」⇒ 松手必跳，视觉与判定不会互相打脸。
+   *    旧版收口正好在 100% 触发线，实测用户拉到 92%（dy 136.67/148）时三点已几乎
+   *    展开、肉眼分辨不出，松手却被 fail(dy<line) 挡掉 =「明明拉过线却不跳」。
+   *  ★起分点尽量早（55% 起分、92% 收口，跟阈值绝对像素无关）→ 三个点出现得干脆。 */
+  const pullGuideMorphProgress = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.55) / (PULL_ARM_RATIO - 0.55), 1)));
   /** 淡入：进度 0.35 露头、0.60 全显（= 触发线的 35% / 60%，不写绝对像素）。 */
   const pullGuideOpacity = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.35) / 0.25, 1)));
   /** refresher 插槽高度（= 原生 header 高）。
@@ -811,8 +824,8 @@
     if (pullGuideFrozen) return;
     const e = eventValue as UniRefresherEvent;
     const distance = Math.max(0, Math.min(e.detail.dy, props.pullMaxDragDistance));
-    // 拉过触发线（三圆点完整展开）时给一次轻震，每轮手势只震一次。
-    if (!pullHapticFired && distance >= props.pullThreshold) {
+    // 三圆点完整展开（= 已越过判定线）时给一次轻震，每轮手势只震一次。
+    if (!pullHapticFired && distance >= props.pullThreshold * PULL_ARM_RATIO) {
       pullHapticFired = true;
       // 越线瞬间的速度 = 甩动判定的主依据（不依赖 touchend，见 pullReachLineSpeed）
       // ★没有 touchstart 采样（=0）时不要算：否则 elapsed 变成 Date.now() 全程，
@@ -920,9 +933,10 @@
     emit("pull-restore");
   }
 
-  /** 松手判定：下拉位移到了触发线（= 三个圆点完整展开，与视觉严格对齐），
+  /** 松手判定：下拉位移到了「判定线」（PULL_RELEASE_MIN_RATIO × 触发线；三圆点在
+   *  更早的 PULL_ARM_RATIO 处就已完全展开，所以看到三点完整就必然过线），
    *  且这次是「按住拖到位再松手」，不是「快速下滑一甩」。
-   *  ① 位移判据照旧用原生 dy 快照（拉到位 = 三点完整，用户看到的点就是判定依据）。
+   *  ① 位移判据用原生 dy 快照（用户看到的点就是判定依据）。
    *  ② 甩动闸门：dy / 按住时长 > PULL_FLING_MAX_SPEED 即判快速下滑（一甩就到线），
    *     不触发。★只取 touchstart 的时刻、不取坐标：Android 的 dy 与手指位移不是 1:1
    *     （带阻尼与 header 加成），dy 才是用户眼里的「页面下滑」速度；触摸坐标在个
@@ -931,7 +945,7 @@
    *  ★必须定义在 emitPaneTouchEnd 之前：UTS 不保证函数声明提升（error18 找不到名称）。 */
   function isPullReleaseQualified(_eventValue: Any): boolean {
     const dy = pullGuideDistance.value;
-    const line = props.pullThreshold * 0.97;
+    const line = props.pullThreshold * PULL_RELEASE_MIN_RATIO;
     if (dy < line) return false;
     // 主判据：dy 首次越线那一刻的速度（来自 pulling 事件序列，不依赖 touchend）
     if (pullReachLineSpeed > PULL_FLING_MAX_SPEED) return false;
@@ -964,7 +978,7 @@
       return;
     }
     // touchend 没到（个别机型下拉时不上报）：仍要过甩动闸门，越线速度高 = 快速下滑
-    if (snapshot >= props.pullThreshold * 0.98 && pullReachLineSpeed <= PULL_FLING_MAX_SPEED) {
+    if (snapshot >= props.pullThreshold * PULL_RELEASE_MIN_RATIO && pullReachLineSpeed <= PULL_FLING_MAX_SPEED) {
       emit("pull-refresh");
       return;
     }

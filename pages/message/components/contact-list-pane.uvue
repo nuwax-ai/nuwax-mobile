@@ -480,6 +480,9 @@
     "pull-refresh": [];
     "pull-restore": [];
     "pull-abort": [];
+    /** 原生已进入刷新态、但松手判定否决（没拖到位/快速下滑）：页面必须把原生刷新态
+     *  真正收回去（triggered 写 true→false），否则列表会停在灰区不消失。 */
+    "pull-reject": [];
     /** scroll-view 层页面触摸三件套（冒泡到页面根之前先到这，40ms 去重语义在页面）。 */
     "pane-touchstart": [e: UniTouchEvent];
     "pane-touchend": [e: UniTouchEvent];
@@ -657,12 +660,32 @@
   /** 松手瞬间的位移快照（touchend 时的 dy）；-1 = 本轮还没收到 touchend。
    *  abort 兜底只认这个快照：松手后被惯性推高的 dy 不算数（见 emitPullAbort）。 */
   let pullReleaseDistance = -1;
+  /** 本轮手势的按下时刻（touchstart 记，touchcancel 清）。
+   *  ★只用来算「松手速度」：快速下滑一甩时 dy 会被惯性冲过触发线，而手指其实没按住
+   *    拖到位（「甩一下就跳进会话」的误触来源）。 */
+  let pullTouchStartAt = 0;
+  /** 「dy 首次越过触发线」那一刻的速度（px/s）；-1 = 本轮还没越线。
+   *  ★这是甩动判定的**主**数据源：它来自 refresherpulling 事件序列，不依赖 touchend
+   *    （Android 下拉时 scroll-view 的 touchend 未必上报，touchend 整条链路是兜底）。 */
+  let pullReachLineSpeed = -1;
+  /** touchend 时的判定结论：true = 按住拖过触发线再松手（不是甩动）。
+   *  abort 兜底只在没有这份结论（touchend 缺失）时才退回 dy 快照。 */
+  let pullReleaseQualified = false;
+  /** 快速下滑（甩动）闸门：下拉位移的平均速度高于它 = 惯性甩动，不触发跳转。
+   *  按**原生位移 dy / 按住时长**算（Android 的 dy 与手指位移不是 1:1，手指速度不可靠；
+   *  dy 才是用户在屏幕上看到的「页面下滑」）。按住拖到触发线一般 250ms 起（≈600px/s），
+   *  快速一甩 100~160ms 就到线（≥900px/s）→ 挡。 */
+  const PULL_FLING_MAX_SPEED = 900;
   /** 重建滚动容器时把下拉位移一并清零：跳转打断收回的话 refresherrestore 不会来，
    *  pullGuideDistance 会停在松手时的值，重建后圆点按旧位移显示。 */
   watch((): number => props.pullResetToken, (_token: number): void => {
     pullGuideDistance.value = 0;
     pullHapticFired = false;
     pullReleaseDistance = -1;
+    pullReleaseQualified = false;
+    pullReachLineSpeed = -1;
+    // 复用旧起点会让下一轮的速度算成 ≈0（elapsed 跨两轮）→ 甩动漏判，必须清
+    pullTouchStartAt = 0;
     // #ifdef APP-HARMONY
     // ★鸿蒙归位后保持冻结，直到下一次真实触摸（emitPaneTouchStart 解冻）：旧 Refresh
     //   在重建/回页交界仍可能补派一帧带旧 offset 的 refresherpulling，解冻的话会把
@@ -686,15 +709,21 @@
       scrollAlive.value = true;
     });
   });
-  /** Android/iOS 不让原生进入 refresh 停靠态：原生阈值放到最大拖距之外，
+  /** Android/iOS 不让原生进入 refresh 停靠态：原生阈值放到「最大下拉位移」之外，
    *  是否达到入口线由 touchend 使用 pullThreshold 自己判定。这样松手后不会先向下
-   *  补到 header 高度再跳页。Harmony 保留原生阈值与原生刷新事件。 */
+   *  补到 header 高度再跳页。Harmony 保留原生阈值与原生刷新事件。
+   *  ★不能只写 maxDrag + 1：Android 的原生位移含 header 高度加成
+   *    （dy ≈ headerHeight + 手指位移，拉到底上限 ≈ slot + maxDrag = 60 + 500 = 560），
+   *    触发线落在 501 时拉深松手仍会进刷新停靠态 —— 列表停在灰区不回去，而且
+   *    refresherrefresh 常常抢在 touchend 之前到达，「快速下滑不跳」直接失效。
+   *    放到 slot + maxDrag 之外、留 20px 余量即可（Android rate = 580/60 ≈ 9.67，
+   *    ★必须 < 10：runtime 把 ≥10 的 rate 当绝对像素兼容分支）。 */
   const pullNativeThreshold = computed((): number => {
     // #ifdef APP-HARMONY
     return props.pullThreshold;
     // #endif
     // #ifndef APP-HARMONY
-    return props.pullMaxDragDistance + 1;
+    return props.pullSlotHeight + props.pullMaxDragDistance + 20;
     // #endif
   });
   /** 形态进度按**触发距离**（pullThreshold）归一：走到触发线恰好三圆点完全展开。
@@ -785,6 +814,13 @@
     // 拉过触发线（三圆点完整展开）时给一次轻震，每轮手势只震一次。
     if (!pullHapticFired && distance >= props.pullThreshold) {
       pullHapticFired = true;
+      // 越线瞬间的速度 = 甩动判定的主依据（不依赖 touchend，见 pullReachLineSpeed）
+      // ★没有 touchstart 采样（=0）时不要算：否则 elapsed 变成 Date.now() 全程，
+      //   速度恒≈0，甩动永远判不出来。
+      if (pullTouchStartAt > 0) {
+        const elapsed = Math.max(1, Date.now() - pullTouchStartAt);
+        pullReachLineSpeed = (distance * 1000) / elapsed;
+      }
       vibratePullThreshold();
     }
     if (Math.abs(pullGuideDistance.value - distance) >= 1) pullGuideDistance.value = distance;
@@ -844,9 +880,35 @@
 
   function emitPullRefresh(): void {
     if (pullReleaseFired) return;
+    // ★原生 refresh 只是「候选」：touchend 已经给出结论且没通过，说明这次是
+    //   惯性把 dy 冲过了原生阈值（手指没真拖到线 / 一甩即走），否决。
+    //   ★必须走 pull-reject 而不是 pull-abort：原生此刻已进入刷新停靠态，页面要把
+    //     triggered 写 true→false 才会真正 finishRefresh（写 false 到已是 false 的
+    //     状态是空操作，列表会一直停在灰区）。
+    //   touchend 还没到（pullReleaseDistance = -1）才按原生口径放行，避免误杀正常触发。
+    if (pullReleaseDistance >= 0) {
+      pullReleaseFired = true;
+      pullGuideFrozen = true;
+      pullGuideDistance.value = 0;
+      emit("pull-reject");
+      return;
+    }
+    // touchend 还没到：原生 refresh 与触摸事件跨线程，到达顺序不保证（Android 实测
+    // 原生刷新会抢在 touchend 前）。隔一拍再定：这期间 touchend 到了就按它的结论
+    // （未通过 → 否决收回），否则按原生口径放行。
     pullReleaseFired = true;
     pullGuideFrozen = true;
-    emit("pull-refresh");
+    setTimeout((): void => {
+      // 甩动判定（主判据来自 pulling 的越线速度，touchend 漏报时也有效）
+      const fling = pullReachLineSpeed > PULL_FLING_MAX_SPEED;
+      const rejected = fling || (pullReleaseDistance >= 0 && !pullReleaseQualified);
+      if (rejected) {
+        pullGuideDistance.value = 0;
+        emit("pull-reject");
+        return;
+      }
+      emit("pull-refresh");
+    }, 16);
   }
 
   function emitPullRestore(): void {
@@ -858,22 +920,51 @@
     emit("pull-restore");
   }
 
+  /** 松手判定：下拉位移到了触发线（= 三个圆点完整展开，与视觉严格对齐），
+   *  且这次是「按住拖到位再松手」，不是「快速下滑一甩」。
+   *  ① 位移判据照旧用原生 dy 快照（拉到位 = 三点完整，用户看到的点就是判定依据）。
+   *  ② 甩动闸门：dy / 按住时长 > PULL_FLING_MAX_SPEED 即判快速下滑（一甩就到线），
+   *     不触发。★只取 touchstart 的时刻、不取坐标：Android 的 dy 与手指位移不是 1:1
+   *     （带阻尼与 header 加成），dy 才是用户眼里的「页面下滑」速度；触摸坐标在个
+   *     别机型上不可靠，不参与判定。
+   *  ③ 没有 touchstart 采样（handler 丢了）：只看 dy，退回改动前的老口径。
+   *  ★必须定义在 emitPaneTouchEnd 之前：UTS 不保证函数声明提升（error18 找不到名称）。 */
+  function isPullReleaseQualified(_eventValue: Any): boolean {
+    const dy = pullGuideDistance.value;
+    const line = props.pullThreshold * 0.97;
+    if (dy < line) return false;
+    // 主判据：dy 首次越线那一刻的速度（来自 pulling 事件序列，不依赖 touchend）
+    if (pullReachLineSpeed > PULL_FLING_MAX_SPEED) return false;
+    // 兜底：越线速度没采到（pulling 少帧）时才用松手总时长复核
+    if (pullReachLineSpeed < 0 && pullTouchStartAt > 0) {
+      const elapsed = Math.max(1, Date.now() - pullTouchStartAt);
+      const speed = (dy * 1000) / elapsed;
+      if (speed > PULL_FLING_MAX_SPEED) return false;
+    }
+    return true;
+  }
+
   /** 未拉到位松手。★兜底：位移其实已经到了触发线（三圆点正好完整展开处；原生口径是
    *  「超过」触发线才算触发，恰好卡在线上会派 abort）仍按触发处理，避免「三个点明明
    *  完整了却不跳」。
-   *  ★判定只认**松手瞬间的快照**（pullReleaseDistance），不认 abort 到达时的当前 dy：
-   *    快速下滑松手后惯性还会把列表继续往下甩一段，abort 派发时 pullGuideDistance 可能
-   *    已被推过触发线，而手指其实没拉到那么远 —— 这正是「点了下就跳进会话」的误触来源。
+   *  ★判定只认**touchend 的结论**（pullReleaseDistance），不认 abort 到达时的当前 dy：
+   *    touchend 已经判过「没拖到位或是一甩」，abort 时的 dy 只是惯性，不能翻案。
    *    快照缺失（touchend 没派发）才退回当前值，保留原兜底意图。 */
   function emitPullAbort(): void {
-    const distance = pullReleaseDistance >= 0 ? pullReleaseDistance : pullGuideDistance.value;
     // touchend 已判定达到入口线时，Android 随后仍可能补派 abort；此时不能立即清零/
     // 冻结，否则会截断正在进行的原生回弹。让 pulling 递减帧与 restore 自然收尾。
     if (pullReleaseFired) return;
+    const snapshot = pullGuideDistance.value;
     pullGuideFrozen = true;
     pullGuideDistance.value = 0;
     pullReleaseFired = true;
-    if (distance >= props.pullThreshold * 0.98) {
+    // touchend 已经给出结论：以它为准（未通过就是未通过，dy 惯性不能翻案）。
+    if (pullReleaseDistance >= 0) {
+      emit("pull-abort");
+      return;
+    }
+    // touchend 没到（个别机型下拉时不上报）：仍要过甩动闸门，越线速度高 = 快速下滑
+    if (snapshot >= props.pullThreshold * 0.98 && pullReachLineSpeed <= PULL_FLING_MAX_SPEED) {
       emit("pull-refresh");
       return;
     }
@@ -882,21 +973,27 @@
 
   /** 手指按下：解冻（上一轮的回弹动画可能还在跑，但新的下拉要能跟手）。 */
   function emitPaneTouchStart(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
     pullGuideFrozen = false;
     pullGuideDragging = true;
     pullReleaseFired = false;
     pullHapticFired = false;
     pullReleaseDistance = -1;
-    emit("pane-touchstart", eventValue as UniTouchEvent);
+    pullReleaseQualified = false;
+    pullReachLineSpeed = -1;
+    // 只记按下时刻：越线/松手时用它算 dy 的速度（见 isPullReleaseQualified）。
+    pullTouchStartAt = Date.now();
+    emit("pane-touchstart", e);
   }
 
   function emitPaneTouchEnd(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
     pullGuideDragging = false;
-    const released = pullGuideDistance.value;
-    pullReleaseDistance = released;
-    // Android/iOS 松手当帧判定：拉到触发线（= 三个圆点完整）就立刻上抛，
+    pullReleaseDistance = pullGuideDistance.value;
+    pullReleaseQualified = isPullReleaseQualified(e);
+    // Android/iOS 松手当帧判定：按住拖过触发线（= 三个圆点完整）才立刻上抛，
     // 不等原生走 refresh/abort/restore 时序。原生稍后的事件由 pullReleaseFired 吞掉。
-    if (!pullReleaseFired && released >= props.pullThreshold * 0.97) {
+    if (!pullReleaseFired && pullReleaseQualified) {
       pullReleaseFired = true;
       // #ifdef APP-ANDROID
       // Android 回弹期间继续接收 pulling 的递减 dy，让圆点/灰区跟随原生回弹逐帧收起；
@@ -908,11 +1005,15 @@
       // #endif
       emit("pull-refresh");
     }
-    emit("pane-touchend", eventValue as UniTouchEvent);
+    emit("pane-touchend", e);
   }
 
   function emitPaneTouchCancel(eventValue: Any): void {
     pullGuideDragging = false;
+    // ★不要清 touchstart 采样与越线速度：App-Android 的原生刷新控件一接管下拉手势就会
+    //   派 touchcancel（实测手指移动 ~40ms 后），之后到达的 pulling / touchend 仍要靠
+    //   这个起点算速度。清掉的话 elapsed 变成 Date.now() 全程 → 速度恒≈0 → 甩动永远
+    //   判不出来（实测 speed=8.45e-8，正是「快速下滑仍跳会话页」的真因）。
     emit("pane-touchcancel", eventValue as UniTouchEvent);
   }
 

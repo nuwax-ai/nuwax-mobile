@@ -69,6 +69,7 @@
           @pull-refresh="handleConvPanePullRefresh"
           @pull-restore="handleConvPullRestore"
           @pull-abort="handleConvPullAbort"
+          @pull-reject="handleConvPullReject"
           @pane-touchstart="handlePageTouchStart"
           @pane-touchend="handlePageTouchEnd"
           @pane-touchcancel="handlePageTouchCancel"
@@ -118,6 +119,7 @@
           @pull-refresh="handleContactPanePullRefresh"
           @pull-restore="handleContactPullRestore"
           @pull-abort="handleContactPullAbort"
+          @pull-reject="handleContactPullReject"
           @pane-touchstart="handlePageTouchStart"
           @pane-touchend="handlePageTouchEnd"
           @pane-touchcancel="handlePageTouchCancel"
@@ -1938,7 +1940,10 @@
   // 圆点为微信式：前半程一个大灰点，后半程展开为横向三个小灰点：
   //   · 下拉到「三个圆点完整展开」= 原生触发线（PULL_ENTRY_THRESHOLD）；
   //   · 没拉到这条线就松手 → 原生回弹（refresherabort），什么都不发生；
-  //   · 拉到/拉过这条线松手 → 原生 refresherrefresh → **当帧就进会话页**，不等回弹。
+  //   · 按住拖过这条线再松手 → **当帧就进会话页**，不等回弹。
+  //     ★「只是快速下滑一甩」不算：dy 被惯性冲过触发线但手指没按住拖到位。pane 的
+  //       isPullReleaseQualified 用 dy 判「到没到线」（与三点展开严格对齐），再叠一道
+  //       松手速度闸门（dy / 按住时长 > PULL_FLING_MAX_SPEED 即判甩动，不跳）。
   //     ★圆点形态进度按**触发距离**归一：三圆点完全展开时恰好落在原生触发线上，
   //       看到三个点再松手必跳（旧版按 maxDrag 归一，圆点先展开、触发线还在后面，松手就白拉）。
   //     ★最大下拉距离放开到 500px（见 PULL_ENTRY_MAX_DRAG_DISTANCE）：越过触发线后
@@ -1947,9 +1952,12 @@
   //       下拉位移 → 跳转后趁页面被会话页盖住再翻 pull*ResetToken 让列表重建归位
   //       （Android/Harmony；iOS 只清展示态。不能在回页 onShow 做：整块 scroll-view
   //       卸/挂会让回页首帧闪一下）。
-  // ★判定全交原生 refresher：App-Android 子 view 的 touchmove 在 touchslop(≈8px) 之后
-  //   被 scroll-view 截断，旧版逐帧累积 touchmove 距离的写法永远攒不起来（只有 touchend
-  //   能拿到终点坐标），提示语因此一帧都没显示过。
+  // ★触摸坐标只取 touchstart / touchend 两个点：App-Android 子 view 的 touchmove 在
+  //   touchslop(≈8px) 之后被 scroll-view 截断，逐帧累积 touchmove 距离的写法永远攒不起来。
+  //   Android/iOS 的原生刷新阈值放到「插槽高 + 最大拖拽 + 余量」之外（dy 含 header
+  //   高度加成，只写 maxDrag+1 仍会触发），判定完全由 pane 的 touchend 负责；
+  //   鸿蒙仍保留原生 refresherrefresh 通道，但 touchend 已判定不通过（没到线/是甩动）时
+  //   该通道会被否决（emit pull-reject → 页面把 triggered 写 true→false 真正收回）。
   // ★圆点渲染按平台分两套（见 pane 组件）：
   //   App 三端都画在列表外的覆盖层（贴 pane 顶、高度 = 原生下拉位移 dy），圆点在该层
   //   flex 居中 → 全程恒在下拉区域的垂直中心。原生插槽只当浅灰底/占位：插槽高只有
@@ -2028,7 +2036,7 @@
   /** 下拉入口的视觉触发距离。iOS 132 / 鸿蒙 111 / H5·小程序 81（上一版整体 ×1.5）；
    *  Android 单独再调到 148（两端 App 取值分开标定，互不影响）。
    *  Android/iOS 的原生 refresher-threshold 会由 pane 放到 maxDrag 之外，实际触发统一
-   *  在 touchend 按这个距离判定。
+   *  在 touchend 按这个距离判定（dy 到线 + 松手速度不是甩动）。
    *  ★相对的是**插槽高**（不是最大拖拽距离）：触发点 = 插槽高 × (threshold / 插槽高)，
    *    判定要求位移**超过**它 —— 两者相等时位移正好卡在那一点，可能永远判不出来，留 10%。
    *  ★圆点形态进度也按这个值归一（见 pane）：位移走到这里 = 三圆点完全展开 = 原生触发，
@@ -2120,9 +2128,13 @@
     pullContactTriggered.value = false;
   }
 
-  /** 鸿蒙仍由原生 refresherrefresh 触发，需要 true→false 完成收回；Android/iOS 的
-   *  原生触发线已放到 maxDrag 外，松手由 touchend 手动判定，绝不进入刷新停靠态。 */
-  // #ifdef APP-HARMONY
+  /** 原生刷新态收回：triggered 写 true 后隔一拍再写 false（Android 16ms / 其余 50ms）。
+   *  鸿蒙一直走这套协议；Android/iOS 只在「原生已经进入刷新态」的否决路径上用
+   *  （见 ensurePullRefresherSettled）。 */
+  // #ifdef APP-ANDROID
+  const PULL_RETRACT_DELAY_MS = 16;
+  // #endif
+  // #ifndef APP-ANDROID
   const PULL_RETRACT_DELAY_MS = 50;
   // #endif
 
@@ -2140,6 +2152,21 @@
       }, PULL_RETRACT_DELAY_MS);
     });
     // #endif
+  }
+
+  /** 强制收回「原生已经拉出来的刷新停靠态」（否决下拉时用）。
+   *  ★runtime 的 setRefresherTriggered 先判「目标值 == 当前值」就直接 return —— 页面
+   *    平时一直持有 false，此时再写 false 是空操作，列表就停在灰区不回去（Android
+   *    实测：拉深松手被否决后列表卡住、灰区不消失）。原生自己进入刷新态时 header 的
+   *    triggered 已是 true，所以先写 true 基本是空操作，真正生效的是随后的 false
+   *    （走 finishRefresh 收回）。 */
+  function ensurePullRefresherSettled(pane: string): void {
+    setPullTriggered(pane, true);
+    nextTick((): void => {
+      setTimeout((): void => {
+        setPullTriggered(pane, false);
+      }, PULL_RETRACT_DELAY_MS);
+    });
   }
 
   /** 拼会话页 URL（下拉入口与普通入口共用；字段口径见 openDefaultIMAgentConversation）。 */
@@ -2478,6 +2505,18 @@
 
   function handleContactPullAbort(): void {
     handlePullAbort("contact");
+  }
+
+  /** 原生已进入刷新态但松手判定否决（快速下滑一甩 / 没按住拖到位）：作废本次入口
+   *  并强制把原生刷新态收回去（否则列表停在灰区，见 ensurePullRefresherSettled）。 */
+  function handleConvPullReject(): void {
+    handlePullAbort("conv");
+    ensurePullRefresherSettled("conv");
+  }
+
+  function handleContactPullReject(): void {
+    handlePullAbort("contact");
+    ensurePullRefresherSettled("contact");
   }
 
   /** 页面 onLoad 闸门：缓存优先、缺失拉一次租户配置；放行后补跑首拉（原 onLoad 直调的两个 load）。 */

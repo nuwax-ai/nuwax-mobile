@@ -882,6 +882,75 @@
   // 首页编辑器上推距离（不直接使用键盘总高度，避免把输入卡抬过键盘上沿）。
   const homeKeyboardOffset = ref<number>(0);
   let homeInputBaseBottom: number = -1;
+  // #ifdef APP-IOS
+  /**
+   * iOS 键盘高度是「两段式 + 慢半拍」上报（2026-11-13 真机实测，dt=距聚焦）：
+   *   弹起：dt=51ms 报 119 → dt=535ms 才报完整 389；
+   *   收起：blur 立即触发，dt=535ms 才报 0。
+   * 两处对策：
+   *  - iosKbHeightCeiling：弹起沿只认更大的高度（单调饱和），否则先到的 119
+   *    会把预抬到位的输入坞又拉回去，出现「先抬后落再抬」；
+   *  - lastHomeKeyboardOffset：上次软键盘的真实让位量，focus 时先用它顶到位，
+   *    不再等 535ms 的完整高度事件（同一台设备键盘高度稳定，实测到达后只做校正）。
+   */
+  let iosKbHeightCeiling = 0;
+  let lastHomeKeyboardOffset = 0;
+  /** 上次「完整」键盘高度：focus 时按它的 60% 设本轮下界，拦住先到的中间值。 */
+  let lastHomeKeyboardHeight = 0;
+  /** 被下界拦下的较小高度：若 700ms 内一直没等到更大值，说明这次键盘真的更小，兜底采纳。 */
+  let iosPendingKbHeight = 0;
+  let iosCeilingTimer = 0;
+  /** 键盘高度/让位量的最近一次完整值，持久化后冷启动首轮也能预抬（否则每轮首用都退回两段式）。 */
+  const IOS_HOME_KB_CACHE_KEY = "nuwax_ios_home_kb_layout";
+
+  function iosScreenHeight(): number {
+    try {
+      const info = uni.getSystemInfoSync();
+      return info.screenHeight != null ? info.screenHeight : 0;
+    } catch (_eInfo) {
+      return 0;
+    }
+  }
+
+  /** 首次使用（本地无缓存）时的键盘高度估算：只用于把输入坞先顶到位，真实高度到达
+   *  后按实测校正。系数按真机校准：844pt 设备实测键盘 389 ≈ 屏高 46%（0.44 会少估
+   *  18px，实测到位时输入坞还要再上跳一次，观感比空等更差）；上下限夹住小屏/大屏
+   *  的偏差。真机值一旦测到就写缓存，之后不再用估算。 */
+  function estimatedIosKeyboardHeight(): number {
+    const sh = iosScreenHeight();
+    if (sh <= 0) return 0;
+    const est = Math.round(sh * 0.46);
+    return Math.max(280, Math.min(400, est));
+  }
+
+  function restoreIosKbLayoutCache(): void {
+    // iOS getStorageSync 缺 key 会抛异常，必须 try-catch（首次安装走这里）。
+    try {
+      const raw = uni.getStorageSync(IOS_HOME_KB_CACHE_KEY);
+      if (raw == null) return;
+      const text = `${raw}`;
+      if (text.length == 0 || text.indexOf("|") < 0) return;
+      const parts = text.split("|");
+      if (parts.length != 2) return;
+      const h = parseFloat(parts[0]);
+      const off = parseFloat(parts[1]);
+      if (!isNaN(h) && h > 0) lastHomeKeyboardHeight = h;
+      if (!isNaN(off) && off > 0) lastHomeKeyboardOffset = off;
+    } catch (_eCache) {
+      // 首次安装没有缓存，忽略
+    }
+  }
+
+  function persistIosKbLayoutCache(): void {
+    try {
+      uni.setStorageSync(IOS_HOME_KB_CACHE_KEY, `${lastHomeKeyboardHeight}|${lastHomeKeyboardOffset}`);
+    } catch (_eCache) {
+      // 存储失败不影响让位
+    }
+  }
+
+  restoreIosKbLayoutCache();
+  // #endif
   /**
    * 原生注入的底部安全区（px）。App web-view 内嵌优先用它，
    * 避免鸿蒙 WebView/模拟器 env(safe-area-inset-bottom) 虚高。
@@ -1010,6 +1079,25 @@
     } catch (_eObj) {
       // ignore
     }
+    // #ifdef APP-IOS
+    // 弹起沿单调饱和：iOS 先报中间高度（实测 119）再报完整高度（389），中间值若被
+    // 采纳，预抬到位的输入坞会先落回去再抬一次。本轮下界 = 上次完整高度的 60%，
+    // 低于它的值先拦下记进 pending，700ms 兜底（见 onInputFocus）。
+    if (h > 0 && isInputFocused.value && h < iosKbHeightCeiling) {
+      iosPendingKbHeight = h;
+      return;
+    }
+    if (h > iosKbHeightCeiling) {
+      iosKbHeightCeiling = h;
+    }
+    if (h > 0) {
+      lastHomeKeyboardHeight = h;
+    }
+    if (h <= 0) {
+      iosKbHeightCeiling = 0;
+      iosPendingKbHeight = 0;
+    }
+    // #endif
     if (h > 0) {
       keyboardHeight.value = h;
     } else {
@@ -1352,10 +1440,45 @@
         const top = rect.top != null ? parseFloat(`${rect.top}`) : 0;
         const height = rect.height != null ? parseFloat(`${rect.height}`) : 0;
         if (top > 0 && height > 0) {
+          // #ifdef APP-IOS
+          // iOS 走 transform 让位（见 createHubBottomStyle）：selectorQuery 读的是视图
+          // frame，是否包含 transform 位移不可靠，不能再像 bottom 偏移那样「rect + offset
+          // 还原」。改为：未上推（offset=0）时 rect 就是自然位置，直接刷新基准；
+          // 已上推时才用锁定值重算遮挡量，避免偏移被反复累加把输入坞越顶越高。
+          if (homeKeyboardOffset.value <= 0 || homeInputBaseBottom <= 0) {
+            homeInputBaseBottom = top + height;
+          }
+          if (keyboardHeight.value > 0) {
+            homeKeyboardOffset.value = isInputFocused.value
+              ? computeHomeKeyboardOffset(homeInputBaseBottom, keyboardHeight.value) : 0;
+            // 只在「完整高度」上刷新预抬缓存：两段式先到的中间值算出的 35px 不能覆盖它。
+            if (homeKeyboardOffset.value > 0 && keyboardHeight.value >= iosKbHeightCeiling) {
+              lastHomeKeyboardOffset = homeKeyboardOffset.value;
+              persistIosKbLayoutCache();
+            }
+          } else {
+            // 键盘高度事件还没到（实测要 500ms+）：先用上次让位量预抬，
+            // 键盘弹出动画一开始输入坞就跟着起，事件到达后再按实测校正。
+            let prelift = isInputFocused.value ? lastHomeKeyboardOffset : 0;
+            if (prelift <= 0 && isInputFocused.value) {
+              // 首次使用（本地无缓存）：按屏高估算键盘高度先顶上去，
+              // 否则这一轮仍要空等 535ms 才抬到真实高度。
+              const estKb = estimatedIosKeyboardHeight();
+              const sh = iosScreenHeight();
+              if (estKb > 0 && sh > 0 && homeInputBaseBottom > 0) {
+                const estOffset = homeInputBaseBottom - (sh - estKb);
+                if (estOffset > 0) prelift = estOffset;
+              }
+            }
+            homeKeyboardOffset.value = prelift;
+          }
+          // #endif
+          // #ifndef APP-IOS
           // bottom 是已应用偏移后的坐标，还原自然位置后只补实际遮挡。
           homeInputBaseBottom = top + height + homeKeyboardOffset.value;
           homeKeyboardOffset.value = isInputFocused.value
             ? computeHomeKeyboardOffset(homeInputBaseBottom, keyboardHeight.value) : 0;
+          // #endif
         }
       });
   }
@@ -1590,7 +1713,17 @@
     // 是否弹出必须看原始键盘高度。resize 消化全部遮挡时 cover 为 0，但键盘仍在。
     // iOS 内嵌页的键盘高度事件常在动画末尾才到；此处若切掉安全区间距，
     // 输入框会在已经到位后再下落一小段。由 viewport cover 负责整个开合过程。
-    if (keyboardHeight.value > 0 && !(isIosAppWebView() == true && isHomeScene.value != true)) {
+    let keyboardActive = keyboardHeight.value > 0;
+    // #ifdef APP-IOS
+    // iOS 原生首页的让位在聚焦瞬间就预抬完成（键盘高度事件要 500ms+ 才到），
+    // 这里若仍等键盘高度，本样式会把容器高度从 18px 压到 6px，而这 12px 变化
+    // 要到 517ms 才发生：位移已静止，只有顶边往下掉 —— 真机上表现为「上升结束后
+    // 回落一小段」。首页改为聚焦即视为键盘态，让高度变化与让位同一帧发生。
+    if (isHomeScene.value && isInputFocused.value) {
+      keyboardActive = true;
+    }
+    // #endif
+    if (keyboardActive && !(isIosAppWebView() == true && isHomeScene.value != true)) {
       style["marginBottom"] = "0px";
       style["paddingBottom"] = "4px";
       return style;
@@ -3911,6 +4044,34 @@
     installComposerObserver();
     isInputFocused.value = true;
     emit('onFocusChange', true);
+    // #ifdef APP-IOS
+    // 聚焦瞬间键盘必然未弹：先把上次可能残留的让位量清零，保证下面首测到的
+    // 输入卡底边是「未上推」的自然位置（iOS 用 transform 让位，见 measure 注释）。
+    homeKeyboardOffset.value = 0;
+    // 本轮弹起的下界按上次完整高度折算（60%）。低于它的高度先当「中间值」拦下，
+    // 避免预抬被 119 这类两段式先到的值拉回去；700ms 内没有更大值说明这次键盘
+    // 真的更小（换输入法/横屏），兜底采纳被拦下的值。
+    // 首次使用没有缓存时用估算高度折算，保证估算预抬同样不被 119 拉回去。
+    const ceilingBase = lastHomeKeyboardHeight > 0 ? lastHomeKeyboardHeight : estimatedIosKeyboardHeight();
+    iosKbHeightCeiling = ceilingBase > 0 ? Math.floor(ceilingBase * 0.6) : 0;
+    iosPendingKbHeight = 0;
+    if (iosCeilingTimer != 0) {
+      clearTimeout(iosCeilingTimer);
+      iosCeilingTimer = 0;
+    }
+    iosCeilingTimer = setTimeout((): void => {
+      iosCeilingTimer = 0;
+      iosKbHeightCeiling = 0;
+      if (iosPendingKbHeight > 0 && keyboardHeight.value <= 0) {
+        keyboardHeight.value = iosPendingKbHeight;
+        iosPendingKbHeight = 0;
+      } else if (keyboardHeight.value <= 0 && isInputFocused.value) {
+        // 700ms 还没有任何键盘高度：软键盘没弹（外接键盘等），撤掉估算预抬，
+        // 否则输入坞会悬在半空等下一次聚焦。
+        homeKeyboardOffset.value = 0;
+      }
+    }, 700) as number;
+    // #endif
     // 先记录未上推时的输入区底边，再按 IME 顶部计算精确偏移，避免整段白边。
     homeInputBaseBottom = -1;
     // #ifdef APP
@@ -3939,6 +4100,22 @@
   // 输入框失去焦点
   const onInputBlur = () => {
     isInputFocused.value = false;
+    // #ifdef APP-IOS
+    // iOS 键盘收起事件实测要 535ms 才到（点「完成」时 blur 才是即时信号）：这里立即
+    // 开始下落，让输入坞与系统键盘收起动画同步收尾。lastHomeKeyboardOffset 保留，
+    // 供下次聚焦预抬。keyboardHeight 一并清零，避免残留高值被后续测量重新算成偏移。
+    if (isHomeScene.value) {
+      keyboardHeight.value = 0;
+      homeKeyboardOffset.value = 0;
+      homeInputBaseBottom = -1;
+      iosKbHeightCeiling = 0;
+      iosPendingKbHeight = 0;
+      if (iosCeilingTimer != 0) {
+        clearTimeout(iosCeilingTimer);
+        iosCeilingTimer = 0;
+      }
+    }
+    // #endif
     emit('onFocusChange', false);
     if (quickPopupFocusTimer != null) {
       clearTimeout(quickPopupFocusTimer!);

@@ -265,6 +265,118 @@
     }, 500) as number;
   };
 
+  // #ifdef APP-IOS
+  /** 标题桥消息类型，与注入脚本里的 type 保持一致。 */
+  const WEBVIEW_TITLE_MESSAGE_TYPE = "nuwax-webview-title";
+  /** @load 后读 document.title 的短轮询次数与间隔。 */
+  const WEBVIEW_TITLE_READ_TIMES = 10;
+  const WEBVIEW_TITLE_READ_INTERVAL = 400;
+  let webTitleReadTimer: number = 0;
+  let webTitleReadCount = 0;
+
+  /**
+   * iOS 读不到原生页面标题：appWebViewPageTitle 要拿 WKWebView 的 title，
+   * 而 WKWebView 只能经 utssdk 插件访问（见 appWebViewHistory 文件头），
+   * 业务代码里 import WebKit 打包期就编不过。
+   * 这里改在已加载的网页上下文里读 document.title，经容器注入的原生桥
+   * `__uniapp_x_postMessage` 回传本页 @message，与 Android / 鸿蒙的 getTitle 效果对齐。
+   */
+  const requestWebViewDocumentTitle = (): void => {
+    let ctx: WebviewContext | null = webViewContext;
+    if (ctx == null) {
+      try {
+        ctx = uni.createWebviewContext(
+          WEBVIEW_ELEMENT_ID,
+          instance != null ? instance.proxy : null,
+        );
+        webViewContext = ctx;
+      } catch (_eCtx) {
+        return;
+      }
+      if (ctx == null) {
+        return;
+      }
+    }
+    const context = ctx;
+    if (context == null) {
+      return;
+    }
+    try {
+      context.evalJS(
+        "(function(){try{var t=document.title||'';var u=location.href||'';if(!t){return;}" +
+          "var p={type:'nuwax-webview-title',title:t,url:u};" +
+          "if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:p});return;}" +
+          "if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:p});}" +
+          "}catch(e){}})()",
+      );
+    } catch (_eEval) {
+      // 文档还在加载时 evalJS 可能抛错，交给下一次轮询
+    }
+  };
+
+  const stopWebViewTitleRead = (): void => {
+    if (webTitleReadTimer != 0) {
+      clearInterval(webTitleReadTimer);
+      webTitleReadTimer = 0;
+    }
+  };
+
+  /**
+   * 每次 @load 后短轮询读标题：不少页面在 load 之后才由脚本写入 title，
+   * 读到有效标题即停（由消息回调触发 stopWebViewTitleRead）。
+   */
+  const startWebViewTitleRead = (): void => {
+    stopWebViewTitleRead();
+    webTitleReadCount = 0;
+    requestWebViewDocumentTitle();
+    webTitleReadTimer = setInterval((): void => {
+      webTitleReadCount++;
+      requestWebViewDocumentTitle();
+      if (webTitleReadCount >= WEBVIEW_TITLE_READ_TIMES) {
+        stopWebViewTitleRead();
+      }
+    }, WEBVIEW_TITLE_READ_INTERVAL) as number;
+  };
+
+  /**
+   * 消费标题桥消息并更新导航栏标题/域名。
+   * 返回 true 表示这条 @message 是标题桥消息，已处理完。
+   */
+  const consumeWebViewTitleMessage = (messages: Array<UTSJSONObject>): boolean => {
+    let matched = false;
+    let nextTitle = "";
+    let nextUrl = "";
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const typeVal = msg["type"];
+      if (typeVal == null || `${typeVal}` != WEBVIEW_TITLE_MESSAGE_TYPE) {
+        continue;
+      }
+      matched = true;
+      const titleVal = msg["title"];
+      nextTitle = titleVal != null ? `${titleVal}` : "";
+      const urlVal = msg["url"];
+      nextUrl = urlVal != null ? `${urlVal}` : "";
+    }
+    if (matched == false) {
+      return false;
+    }
+    // 页内跳转后地址也会变，顺手同步域名，与 Android / 鸿蒙读 getUrl 的效果一致
+    if (nextUrl.indexOf("http://") == 0 || nextUrl.indexOf("https://") == 0) {
+      const host = hostOf(nextUrl);
+      if (host.length > 0) {
+        pageHost.value = host;
+      }
+    }
+    const title = nextTitle.trim();
+    if (isDocumentTitle(title, nextUrl)) {
+      applyNavTitle(title);
+      stopWebViewTitleRead();
+    }
+    return true;
+  };
+  // #endif
+
   watch(url, (value: string): void => {
     const host = hostOf(value);
     if (host.length > 0) {
@@ -530,6 +642,13 @@
     fixAppWebviewTextZoom();
     syncIosWebViewSwipe();
     syncEmbeddedNav();
+    // #ifdef APP-IOS
+    // iOS 没有原生 getTitle，改注入脚本读 document.title（见 requestWebViewDocumentTitle）。
+    // AI 读页（browser_navigate_page）的页面要独占 @message 取 html，这类页面不插标题桥。
+    if (isNeedCallApi.value == false) {
+      startWebViewTitleRead();
+    }
+    // #endif
     if (repoPageTicket.length > 0) {
       injectRepoTicketCookie();
     }
@@ -562,6 +681,12 @@
    * 3. 如果没有，检查网页端代码是否正确调用 wx.miniProgram.postMessage
    */
   const handleWebviewMessage = (e: UniWebViewMessageEvent): void => {
+    // #ifdef APP-IOS
+    // 标题桥消息先消费掉，避免落进下面「取最后一条 html」的逻辑
+    if (consumeWebViewTitleMessage(e.detail.data)) {
+      return;
+    }
+    // #endif
     // #ifdef MP-WEIXIN || APP
     // UniWebViewMessageEvent 是原生强类型对象，Android 上不可整体强转 UTSJSONObject。
     // detail.data 是 postMessage 消息数组，只取最后一条的 html。
@@ -838,6 +963,9 @@
   onUnload(() => {
     // #ifdef APP
     stopRepoTicketCookieInject();
+    // #endif
+    // #ifdef APP-IOS
+    stopWebViewTitleRead();
     // #endif
     stopIosWebViewSwipeSync();
     stopEmbeddedNavSync();

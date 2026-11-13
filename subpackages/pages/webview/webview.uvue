@@ -5,19 +5,19 @@
     <custom-nav-bar
       class="webview-nav"
       :title="displayPageTitle"
+      :subtitle="displayPageHost"
       :has-safety-zone="true"
     >
       <!-- 密度类尺寸 px 定值（22px = 44rpx @375），折叠屏展开/宽屏不随屏宽放大 -->
       <template v-slot:left>
         <view class="webview-back" @click="onBackClick">
-          <svg-icon name="icon-a-Chevronleft" size="22" unit="px" />
+          <svg-icon name="icon-X" size="18" unit="px" />
         </view>
       </template>
       <template v-slot:right>
         <svg-icon
-          v-if="showShare"
-          name="icon-AppShare"
-          size="22"
+          name="icon-More"
+          size="18"
           unit="px"
           @click="handleShare"
         />
@@ -48,12 +48,11 @@
 <script lang="uts" setup>
   import { switchMainTab } from "@/utils/mainTabNavigation";
 
-  import { computed, ref } from "vue";
+  import { computed, ref, watch } from "vue";
   // #ifdef APP
   import { getCurrentInstance } from "vue";
   // #endif
   import { removeQueryCompat, isHttpUrl } from "@/utils/common";
-  import { NO_LOGIN_CHECK_URL } from "@/constants/config";
   // #ifdef APP
   import { getApiBaseUrl } from "@/constants/config";
   // #endif
@@ -71,7 +70,11 @@
   // App 端内嵌 H5 字体放大修复：Android 强制 webview textZoom = 100%（iOS 无此问题，自动跳过）
   import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
   // #ifdef APP
-  import { appWebViewGoBack } from "@/subpackages/utils/appWebViewHistory";
+  import {
+    appWebViewGoBack,
+    appWebViewPageTitle,
+    appWebViewPageUrl,
+  } from "@/subpackages/utils/appWebViewHistory";
   // #endif
   // #ifdef APP-IOS
   import {
@@ -91,8 +94,11 @@
   const data_type = ref<string>("");
   const request_id = ref<string>("");
   const pageTitle = ref<string>("");
-  // 分享按钮显隐：调用方在本页路由上传 hideShare=1 即可隐藏（如「关于我们」这类纯展示页）
-  const showShare = ref<boolean>(true);
+  /** 当前地址的域名。加载完成前单独居中显示。 */
+  const pageHost = ref<string>("");
+  /** 内嵌页 document.title。读到之后才显示在域名上方。 */
+  const embeddedTitle = ref<string>("");
+  let navSyncTimer: number = 0;
   // 资料库页要写入 localStorage 的登录 token。非资料库、未取到票据时为空。
   // 小程序 web-view 不能 evalJS，票据只走地址上的 _ticket。
   let repoPageTicket = "";
@@ -111,10 +117,273 @@
   /** 与模板 web-view id 一致，供原生后退栈查询。 */
   const WEBVIEW_ELEMENT_ID = "webview";
 
-  const displayPageTitle = computed(
-    (): string =>
-      pageTitle.value.length > 0 ? pageTitle.value : t("Mobile.Webview.defaultTitle"),
-  );
+  const displayPageTitle = computed((): string => {
+    if (embeddedTitle.value.length > 0) {
+      return embeddedTitle.value;
+    }
+    if (pageHost.value.length > 0) {
+      return pageHost.value;
+    }
+    return pageTitle.value.length > 0 ? pageTitle.value : t("Mobile.Webview.defaultTitle");
+  });
+
+  /** 只有读到网页标题后才把域名放到第二行，加载前标题位本身就是域名。 */
+  const displayPageHost = computed((): string => {
+    return embeddedTitle.value.length > 0 ? pageHost.value : "";
+  });
+
+  /** 去掉协议后，截出主机名，不带端口、路径和账号。 */
+  const stripHost = (raw: string): string => {
+    let value = raw.trim();
+    const schemeIdx = value.indexOf("://");
+    if (schemeIdx >= 0) {
+      value = value.substring(schemeIdx + 3);
+    }
+    const slash = value.indexOf("/");
+    if (slash >= 0) {
+      value = value.substring(0, slash);
+    }
+    const query = value.indexOf("?");
+    if (query >= 0) {
+      value = value.substring(0, query);
+    }
+    const hash = value.indexOf("#");
+    if (hash >= 0) {
+      value = value.substring(0, hash);
+    }
+    const at = value.indexOf("@");
+    if (at >= 0) {
+      value = value.substring(at + 1);
+    }
+    const colon = value.indexOf(":");
+    if (colon >= 0) {
+      value = value.substring(0, colon);
+    }
+    return value;
+  };
+
+  /**
+   * 从地址里取出主机名，不带协议、端口和路径。
+   * 站内相对路径用当前站点或接口域名。
+   */
+  const hostOf = (raw: string): string => {
+    const value = raw.trim();
+    if (value.length == 0) {
+      return "";
+    }
+    if (value.indexOf("://") < 0 && value.indexOf("/") == 0) {
+      // #ifdef H5 || WEB
+      return `${window.location.host}`;
+      // #endif
+      // #ifdef APP
+      return stripHost(getApiBaseUrl());
+      // #endif
+      // #ifdef MP-WEIXIN
+      return "";
+      // #endif
+    }
+    return stripHost(value);
+  };
+
+  /** 加载中 WebView 的 title 经常就是整段地址，这种情况不拿来当标题。 */
+  const isDocumentTitle = (title: string, pageUrl: string): boolean => {
+    const text = title.trim();
+    if (text.length == 0) {
+      return false;
+    }
+    if (text.indexOf("http://") == 0 || text.indexOf("https://") == 0) {
+      return false;
+    }
+    if (pageUrl.length > 0 && text == pageUrl) {
+      return false;
+    }
+    const host = hostOf(pageUrl.length > 0 ? pageUrl : text);
+    return host.length == 0 || text != host;
+  };
+
+  const applyNavTitle = (title: string): void => {
+    if (title == embeddedTitle.value) {
+      return;
+    }
+    embeddedTitle.value = title;
+    if (title.length > 0) {
+      uni.setNavigationBarTitle({ title: title });
+    }
+  };
+
+  /**
+   * 读取内嵌页标题和当前地址。
+   * App 走原生 WebView；H5 只在同源 iframe 可读，跨域时保持域名单行。
+   */
+  const syncEmbeddedNav = (): void => {
+    let nextUrl = "";
+    let nextTitle = "";
+    // #ifdef APP
+    nextUrl = appWebViewPageUrl(WEBVIEW_ELEMENT_ID);
+    nextTitle = appWebViewPageTitle(WEBVIEW_ELEMENT_ID);
+    // #endif
+    // #ifdef H5 || WEB
+    try {
+      const frames = document.getElementsByTagName("iframe");
+      if (frames.length > 0) {
+        const frame = frames[frames.length - 1];
+        const doc = frame.contentDocument;
+        if (doc != null) {
+          nextTitle = doc.title != null ? `${doc.title}` : "";
+          nextUrl = frame.contentWindow != null ? `${frame.contentWindow.location.href}` : "";
+        }
+      }
+    } catch (_eFrame) {
+      nextTitle = "";
+      nextUrl = "";
+    }
+    // #endif
+    const hostSource = nextUrl.length > 0 ? nextUrl : url.value;
+    const host = hostOf(hostSource);
+    if (host.length > 0) {
+      pageHost.value = host;
+    }
+    if (isDocumentTitle(nextTitle, hostSource)) {
+      applyNavTitle(nextTitle.trim());
+    }
+  };
+
+  const stopEmbeddedNavSync = (): void => {
+    if (navSyncTimer != 0) {
+      clearInterval(navSyncTimer);
+      navSyncTimer = 0;
+    }
+  };
+
+  const startEmbeddedNavSync = (): void => {
+    syncEmbeddedNav();
+    if (navSyncTimer != 0) {
+      return;
+    }
+    navSyncTimer = setInterval((): void => {
+      syncEmbeddedNav();
+    }, 500) as number;
+  };
+
+  // #ifdef APP-IOS
+  /** 标题桥消息类型，与注入脚本里的 type 保持一致。 */
+  const WEBVIEW_TITLE_MESSAGE_TYPE = "nuwax-webview-title";
+  /** @load 后读 document.title 的短轮询次数与间隔。 */
+  const WEBVIEW_TITLE_READ_TIMES = 10;
+  const WEBVIEW_TITLE_READ_INTERVAL = 400;
+  let webTitleReadTimer: number = 0;
+  let webTitleReadCount = 0;
+
+  /**
+   * iOS 读不到原生页面标题：appWebViewPageTitle 要拿 WKWebView 的 title，
+   * 而 WKWebView 只能经 utssdk 插件访问（见 appWebViewHistory 文件头），
+   * 业务代码里 import WebKit 打包期就编不过。
+   * 这里改在已加载的网页上下文里读 document.title，经容器注入的原生桥
+   * `__uniapp_x_postMessage` 回传本页 @message，与 Android / 鸿蒙的 getTitle 效果对齐。
+   */
+  const requestWebViewDocumentTitle = (): void => {
+    let ctx: WebviewContext | null = webViewContext;
+    if (ctx == null) {
+      try {
+        ctx = uni.createWebviewContext(
+          WEBVIEW_ELEMENT_ID,
+          instance != null ? instance.proxy : null,
+        );
+        webViewContext = ctx;
+      } catch (_eCtx) {
+        return;
+      }
+      if (ctx == null) {
+        return;
+      }
+    }
+    const context = ctx;
+    if (context == null) {
+      return;
+    }
+    try {
+      context.evalJS(
+        "(function(){try{var t=document.title||'';var u=location.href||'';if(!t){return;}" +
+          "var p={type:'nuwax-webview-title',title:t,url:u};" +
+          "if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:p});return;}" +
+          "if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:p});}" +
+          "}catch(e){}})()",
+      );
+    } catch (_eEval) {
+      // 文档还在加载时 evalJS 可能抛错，交给下一次轮询
+    }
+  };
+
+  const stopWebViewTitleRead = (): void => {
+    if (webTitleReadTimer != 0) {
+      clearInterval(webTitleReadTimer);
+      webTitleReadTimer = 0;
+    }
+  };
+
+  /**
+   * 每次 @load 后短轮询读标题：不少页面在 load 之后才由脚本写入 title，
+   * 读到有效标题即停（由消息回调触发 stopWebViewTitleRead）。
+   */
+  const startWebViewTitleRead = (): void => {
+    stopWebViewTitleRead();
+    webTitleReadCount = 0;
+    requestWebViewDocumentTitle();
+    webTitleReadTimer = setInterval((): void => {
+      webTitleReadCount++;
+      requestWebViewDocumentTitle();
+      if (webTitleReadCount >= WEBVIEW_TITLE_READ_TIMES) {
+        stopWebViewTitleRead();
+      }
+    }, WEBVIEW_TITLE_READ_INTERVAL) as number;
+  };
+
+  /**
+   * 消费标题桥消息并更新导航栏标题/域名。
+   * 返回 true 表示这条 @message 是标题桥消息，已处理完。
+   */
+  const consumeWebViewTitleMessage = (messages: Array<UTSJSONObject>): boolean => {
+    let matched = false;
+    let nextTitle = "";
+    let nextUrl = "";
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const typeVal = msg["type"];
+      if (typeVal == null || `${typeVal}` != WEBVIEW_TITLE_MESSAGE_TYPE) {
+        continue;
+      }
+      matched = true;
+      const titleVal = msg["title"];
+      nextTitle = titleVal != null ? `${titleVal}` : "";
+      const urlVal = msg["url"];
+      nextUrl = urlVal != null ? `${urlVal}` : "";
+    }
+    if (matched == false) {
+      return false;
+    }
+    // 页内跳转后地址也会变，顺手同步域名，与 Android / 鸿蒙读 getUrl 的效果一致
+    if (nextUrl.indexOf("http://") == 0 || nextUrl.indexOf("https://") == 0) {
+      const host = hostOf(nextUrl);
+      if (host.length > 0) {
+        pageHost.value = host;
+      }
+    }
+    const title = nextTitle.trim();
+    if (isDocumentTitle(title, nextUrl)) {
+      applyNavTitle(title);
+      stopWebViewTitleRead();
+    }
+    return true;
+  };
+  // #endif
+
+  watch(url, (value: string): void => {
+    const host = hostOf(value);
+    if (host.length > 0) {
+      pageHost.value = host;
+    }
+    embeddedTitle.value = "";
+  });
 
   /**
    * 还原 webview 的 url 参数。
@@ -372,6 +641,14 @@
     // Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
     fixAppWebviewTextZoom();
     syncIosWebViewSwipe();
+    syncEmbeddedNav();
+    // #ifdef APP-IOS
+    // iOS 没有原生 getTitle，改注入脚本读 document.title（见 requestWebViewDocumentTitle）。
+    // AI 读页（browser_navigate_page）的页面要独占 @message 取 html，这类页面不插标题桥。
+    if (isNeedCallApi.value == false) {
+      startWebViewTitleRead();
+    }
+    // #endif
     if (repoPageTicket.length > 0) {
       injectRepoTicketCookie();
     }
@@ -404,6 +681,12 @@
    * 3. 如果没有，检查网页端代码是否正确调用 wx.miniProgram.postMessage
    */
   const handleWebviewMessage = (e: UniWebViewMessageEvent): void => {
+    // #ifdef APP-IOS
+    // 标题桥消息先消费掉，避免落进下面「取最后一条 html」的逻辑
+    if (consumeWebViewTitleMessage(e.detail.data)) {
+      return;
+    }
+    // #endif
     // #ifdef MP-WEIXIN || APP
     // UniWebViewMessageEvent 是原生强类型对象，Android 上不可整体强转 UTSJSONObject。
     // detail.data 是 postMessage 消息数组，只取最后一条的 html。
@@ -426,13 +709,11 @@
   };
 
   /**
-   * 清理当前 webview 地址：去除 _ticket / jump_type 后重新标记为外部跳转来源。
+   * 清理当前 webview 地址：分享出去的链接去掉 _ticket。
    * 小程序转发（拼进内部路径）与「复制链接/系统分享」（需要真实可直接打开的外链）共用同一份清理逻辑。
    */
   const buildCleanShareTargetUrl = (): string => {
-    const newUrl = removeQueryCompat(url.value, ["_ticket", "jump_type"]);
-    const andStr = newUrl.includes("?") ? "&" : "?";
-    return newUrl + andStr + "jump_type=outer";
+    return removeQueryCompat(url.value, ["_ticket"]);
   };
 
   /**
@@ -539,10 +820,8 @@
     return false;
   };
 
+  /** 导航栏关闭：不论网页内部跳了多少层，直接离开本页。侧滑和系统返回仍走 consumeWebViewBack。 */
   const onBackClick = () => {
-    if (consumeWebViewBack()) {
-      return;
-    }
     const pages = getCurrentPages();
     if (pages.length > 1) {
       uni.navigateBack({ delta: 1 });
@@ -571,12 +850,8 @@
 
   // 初始化加载
   const onLoadInit = async (params: OnLoadOptions) => {
-    // 分享按钮显隐先于 url 校验读取，url 缺失时也保持调用方指定的形态
-    const hideShareVal = params["hideShare"];
-    showShare.value = !(hideShareVal != null && `${hideShareVal}` == "1");
-    // 外部站点自带鉴权参数时传 noTicket=1，避免把主站 _ticket 拼给第三方域名
-    const noTicketVal = params["noTicket"];
-    const noTicket = noTicketVal != null && `${noTicketVal}` == "1";
+    const pageAppVal = params["pageApp"];
+    const isPageApp = pageAppVal != null && `${pageAppVal}` == "1";
 
     const urlVal = params["url"];
     if (urlVal == null) {
@@ -620,15 +895,16 @@
     // #endif
 
     // #ifdef MP-WEIXIN || APP
-    // 判断当前url是否不需要登录检查
-    if (noTicket || NO_LOGIN_CHECK_URL.includes(currentUrl)) {
+    // 资料库（首页或某篇文档）不签发 _ticket，把本地登录 token 写入页面。
+    if (isRepoLibraryPath(currentUrl)) {
       url.value = currentUrl;
-      if (isRepoLibraryPath(currentUrl)) {
-        console.log(`[repo-link] preview src=${currentUrl}`);
+      const cachedToken = readCachedAccessToken();
+      if (cachedToken.length > 0) {
+        rememberRepoPageTicket(currentUrl, cachedToken);
+        injectRepoTicketCookie();
       }
       return;
     }
-
     const methodVal = queryParams["method"];
     if (methodVal != null) {
       method.value = `${methodVal}`;
@@ -642,51 +918,26 @@
       request_id.value = `${riVal}`;
     }
 
-    // 判断是否存在 _ticket
-    const ticketVal = queryParams["_ticket"];
-    if (ticketVal != null) {
+    // 只有跳转时带 pageApp=1 才签发票据，并拼到目标地址的 _ticket= 上。
+    if (isPageApp != true) {
       url.value = currentUrl;
-      if (isRepoLibraryPath(currentUrl)) {
-        const existingTicket = readQueryTicket(currentUrl);
-        rememberRepoPageTicket(
-          currentUrl,
-          existingTicket.length > 0 ? existingTicket : `${ticketVal}`,
-        );
-        injectRepoTicketCookie();
-      }
-    } else {
-      // 暂存当前url（仅微信小程序读取 globalThis.appConfig，APP 端无读取方）
-      // #ifdef MP-WEIXIN
-      globalThis.appConfig.redirectUrl = urlStr; // 未解码
-      // #endif
-      const ticketResult = await apiUserTicketCreate();
-      if (ticketResult.code == SUCCESS_CODE && ticketResult.data != null) {
-        // 带锚点(#fragment)的 URL 须把 _ticket 插在 # 之前，拼在末尾目标页读不到
-        const hashIdx = currentUrl.indexOf("#");
-        const baseUrl = hashIdx >= 0 ? currentUrl.substring(0, hashIdx) : currentUrl;
-        const hashStr = hashIdx >= 0 ? currentUrl.substring(hashIdx) : "";
-        const andStr = baseUrl.includes("?") ? "&" : "?";
-        const createdTicket = `${ticketResult.data}`;
-        url.value = baseUrl + andStr + `_ticket=${createdTicket}` + hashStr;
-        if (isRepoLibraryPath(currentUrl)) {
-          rememberRepoPageTicket(currentUrl, createdTicket);
-          injectRepoTicketCookie();
-        }
-      } else {
-        // ticket 获取失败也加载原地址：web-view 仅在 url 非空时挂载，
-        // 不兜底会整页白屏（目标站自身的登录/错误页至少可见、可操作）。
-        // 仅资料库页改用本地登录 token 写入 localStorage。
-        url.value = currentUrl;
+      return;
+    }
 
-        // 资料库链接地址需要注入token信息到localStorage中，用于验证用户身份和权限。注入
-        if (isRepoLibraryPath(currentUrl)) {
-          const cachedToken = readCachedAccessToken();
-          if (cachedToken.length > 0) {
-            rememberRepoPageTicket(currentUrl, cachedToken);
-            injectRepoTicketCookie();
-          }
-        }
-      }
+    // #ifdef MP-WEIXIN
+    globalThis.appConfig.redirectUrl = urlStr; // 未解码
+    // #endif
+    const ticketResult = await apiUserTicketCreate();
+    if (ticketResult.code == SUCCESS_CODE && ticketResult.data != null) {
+      // 带锚点(#fragment)的 URL 须把 _ticket 插在 # 之前，拼在末尾目标页读不到
+      const hashIdx = currentUrl.indexOf("#");
+      const baseUrl = hashIdx >= 0 ? currentUrl.substring(0, hashIdx) : currentUrl;
+      const hashStr = hashIdx >= 0 ? currentUrl.substring(hashIdx) : "";
+      const andStr = baseUrl.includes("?") ? "&" : "?";
+      const createdTicket = `${ticketResult.data}`;
+      url.value = baseUrl + andStr + `_ticket=${createdTicket}` + hashStr;
+    } else {
+      url.value = currentUrl;
     }
     // #endif
   };
@@ -695,6 +946,7 @@
     onLoadInit(params);
     fixAppWebviewTextZoom();
     startIosWebViewSwipeSync();
+    startEmbeddedNavSync();
   });
 
   // 导航栏返回不走 onBackPress。系统返回键、Android/鸿蒙侧滑走这里。
@@ -712,7 +964,11 @@
     // #ifdef APP
     stopRepoTicketCookieInject();
     // #endif
+    // #ifdef APP-IOS
+    stopWebViewTitleRead();
+    // #endif
     stopIosWebViewSwipeSync();
+    stopEmbeddedNavSync();
   });
 
   // #ifdef MP-WEIXIN

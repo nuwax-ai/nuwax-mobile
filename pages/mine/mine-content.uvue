@@ -101,9 +101,13 @@
         </view>
         <!-- 推送通知（原账号管理页移入）：业务开关 + 系统通知权限合并为一个，开关状态 = 真能收到推送
              ★系统权限只能申请、无法由代码关闭，所以「关」只关业务侧（后端不再下发本设备）；
-               系统权限被拒/未授予时开关回弹为关，并弹窗引导去系统设置开启。 -->
+               系统权限被拒/未授予时开关回弹为关，并弹窗引导去系统设置开启。
+             ★Android 按「有没有 OEM 系统推送通道」二选一（见 legacyPushSwitchVisible）：
+               有渠道（华为/荣耀/小米/OPPO/vivo…）→ 本开关；无渠道 → 下方「消息通知」入口。
+               无渠道机型走个推自建通道，业务开关的「关」并不能真正止血（后端不下发 ≠ 能收不到），
+               且系统侧三项还得用户去设置页放开，所以改由一个只读入口引导，不再暴露业务开关。 -->
         <!-- #ifdef APP-ANDROID || APP-IOS || APP-HARMONY -->
-        <view class="row-item" v-if="isLoggedIn">
+        <view class="row-item" v-if="isLoggedIn && legacyPushSwitchVisible">
           <view class="row-icon-box">
             <svg-icon name="icon-notification-box" size="20" unit="px" />
           </view>
@@ -111,6 +115,19 @@
             <text class="row-title">{{ t("Mobile.Profile.pushNotifications") }}</text>
           </view>
           <switch class="push-switch" :checked="pushSwitchChecked" :disabled="pushBusy || !pushReady" color="#6155F5" @change="handlePushChange" />
+        </view>
+        <!-- #endif -->
+        <!-- #ifdef APP-ANDROID -->
+        <!-- 仅对确定没有 OEM 系统通道的设备展示，与原「推送通知」开关互斥；点「需要设置」直接拉起底部操作面板。 -->
+        <view class="row-item" v-if="showPushBackgroundEntry" @click="openPushBackgroundActionSheet">
+          <view class="row-icon-box">
+            <svg-icon name="icon-notification-box" size="20" unit="px" />
+          </view>
+          <view class="row-info">
+            <text class="row-title">{{ t("Mobile.PushBackground.title") }}</text>
+          </view>
+          <text class="row-value">{{ pushBackgroundStatusLabel }}</text>
+          <text class="row-arrow">›</text>
         </view>
         <!-- #endif -->
       </view>
@@ -139,17 +156,6 @@
       </view>
       <!-- #endif -->
 
-      <view class="card-group logout-group" v-if="isLoggedIn">
-        <!-- 退出登录 -->
-        <view class="row-item logout-item" @click="handleLogout">
-          <view class="row-icon-box">
-            <svg-icon name="icon-Exit" size="20" unit="px" />
-          </view>
-          <view class="row-info">
-            <text class="row-title">{{ t("Mobile.Header.logout") }}</text>
-          </view>
-        </view>
-      </view>
       <view class="bottom-space"></view>
     </scroll-view>
 
@@ -165,20 +171,17 @@
   import { ref, computed, onUnmounted, type ComponentPublicInstance } from "vue";
   import { useMainTabLifecycle } from "@/hooks/useMainTabLifecycle";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
-  import { apiUserInfo, apiLogout, apiTenantConfig } from "@/servers/account";
+  import { apiUserInfo, apiTenantConfig } from "@/servers/account";
   import { apiGetCreditSummary } from "@/subpackages/servers/subscription";
   import { UserInfo } from "@/types/interfaces/login";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import defaultAvatar from "@/static/assets/avatar.png";
-  import { ACCESS_TOKEN } from "@/constants/home.constants";
-  import {
-    clearStoragePreservingApiBaseUrl,
-    getApiBaseUrl,
-  } from "@/constants/config";
+  import { getApiBaseUrl } from "@/constants/config";
+  import { isOpenableExternalUrl } from "@/utils/openExternalUrl";
+  import { setPendingAppStoreUrl } from "@/utils/pendingAppStoreUrl";
   import { syncNativeTabBarState } from "@/utils/commonBusiness";
   import { goToLogin } from "@/utils/authNavigation";
-  import { unregisterImDeviceSafe } from "@/utils/im/imWsClient";
   import { setCurrentPageNavigationBarTitle, checkSubscriptionEnable as checkSubscriptionEnableUtil, formatNumber } from "@/utils/system";
   import { useAuthInterceptor } from "@/hooks/useAuthInterceptor";
   import { useI18n, emptyI18nParams, t as translateFn } from "@/utils/i18n";
@@ -204,12 +207,19 @@
   } from "@/utils/im/imPushPreference";
   import { getImSessionStamp } from "@/utils/im/imSessionScope";
   // #endif
+  // #ifdef APP-ANDROID
+  import {
+    getPushBackgroundStatus,
+    openBatteryOptimizationSettings,
+    openNotificationSettings,
+    type PushBackgroundStatus,
+  } from "@/utils/push/pushBackgroundStatus";
+  // #endif
   import { isWorkCommercialBlockedSync } from "@/utils/workCommercial";
   import eventBus from "@/utils/eventBus";
   import { PROFILE_SETUP_COMPLETED_EVENT } from "@/utils/profileSetupPrompt";
   // #ifdef APP-IOS
   import {
-    teardownResidentChatForLogout,
     isResidentChatVisible,
     isResidentChatCoverActive,
   } from "@/utils/residentChatShell";
@@ -217,7 +227,7 @@
 
   const { onLoad, onShow } = useMainTabLifecycle("/pages/mine/mine");
 
-  const { loadI18n, ensureLangList } = useI18n();
+  const { ensureLangList } = useI18n();
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
   // 登录拦截
@@ -445,67 +455,6 @@
     isSubscriptionEnabled.value = await checkSubscriptionEnableUtil();
   };
 
-  // 退出登录
-  // 本地优先：服务端注销只是 best-effort。当前服务域名不可达（如企业域名失效、
-  // 覆盖安装保留了旧的切换域名）时接口必然失败，若只在成功时清本地态，用户会被
-  // 锁死在登录态里无法回到登录页切换域名，因此无论接口结果如何都清本地态并回登录页。
-  const performLogout = async () => {
-    // ★ 先注销 IM 设备再调 /api/user/logout：logout 会清服务端会话（H5 即清
-    //   ticket cookie），且下方「本地清 token」发生在 IM_SESSION_CLEARED 事件
-    //   之前——顺序反了 DELETE devices 既没 Cookie 也没 Bearer，必然 401。
-    //   此刻本地登录态未动，凭证齐全；内部已吞错，失败不阻断退出。
-    await unregisterImDeviceSafe();
-    try {
-      await apiLogout();
-    } catch (error) {
-      console.error("服务端注销失败，继续本地退出:", error);
-    }
-    // #ifdef APP-IOS
-    // 首页 Tab 上的常驻聊天 WKWebView 须先 blank/销毁，再 reLaunch；否则 iOS 下次登录开验证码 web-view 易崩
-    await teardownResidentChatForLogout();
-    // #endif
-    uni.setStorageSync(ACCESS_TOKEN, ""); // 清空token【兼容鸿蒙系统】
-    clearStoragePreservingApiBaseUrl(); // 清空业务缓存并保留企业域名
-    // #ifdef MP-WEIXIN
-    if (globalThis.appConfig != null) {
-      globalThis.appConfig.redirectUrl = "";
-    }
-    // #endif
-    // 获取一次语言
-    loadI18n(false);
-    uni.showToast({
-      title: t("Mobile.Header.logoutSuccess"),
-      icon: "success",
-    });
-    setTimeout(() => {
-      // #ifdef MP-WEIXIN
-      uni.reLaunch({ url: "/subpackages/pages/login-weixin/login-weixin" });
-      // #endif
-
-      // 除微信小程序外（H5 / WEB / Android / iOS / 鸿蒙）统一回普通登录页。
-      // 这里用 #ifndef 而不是逐平台枚举：此前按平台枚举漏了 APP-HARMONY，
-      // 鸿蒙端退出登录后没有任何分支参与编译，导致停留在原页面。
-      // #ifndef MP-WEIXIN
-      uni.reLaunch({ url: "/subpackages/pages/login/login" });
-      // #endif
-    }, 1000);
-  };
-
-  const handleLogout = () => {
-    uni.showModal({
-      title: t("Mobile.Common.tip"),
-      content: t("Mobile.Header.logoutConfirm"),
-      cancelText: t("Mobile.Common.cancel"),
-      confirmText: t("Mobile.Common.confirm"),
-      confirmColor: "#ff4d4f",
-      success: (res) => {
-        if (res.confirm == true) {
-          performLogout();
-        }
-      },
-    });
-  };
-
   /** 兼容配置中被 Markdown 链接语法包裹的更新地址。 */
   const normalizeUpdateUrl = (rawUrl: string): string => {
     let url = rawUrl.trim();
@@ -627,11 +576,9 @@
       const latestVersionRaw = platformInfo["version"];
       const versionInfoRaw = platformInfo["versionInfo"];
       const updateUrlRaw = platformInfo["url"];
-      const platformNameRaw = platformInfo["name"];
       const latestVersion = latestVersionRaw != null ? `${latestVersionRaw}`.trim() : "";
       const versionInfo = versionInfoRaw != null ? `${versionInfoRaw}`.trim() : "";
       const updateUrl = updateUrlRaw != null ? normalizeUpdateUrl(`${updateUrlRaw}`) : "";
-      const platformName = platformNameRaw != null ? `${platformNameRaw}`.trim() : "";
       if (latestVersion.length == 0) {
         uni.showToast({
           title: t("Mobile.Mine.alreadyLatest"),
@@ -647,19 +594,18 @@
         });
         return;
       }
-      if (!updateUrl.startsWith("https://") && !updateUrl.startsWith("http://")) {
+      if (isOpenableExternalUrl(updateUrl) != true) {
         throw new Error();
       }
 
-      const modalTitle = platformName.length > 0
-        ? `${platformName} v${normalizedVersion(latestVersion)}`
-        : `${t("Mobile.Mine.newVersion")} v${normalizedVersion(latestVersion)}`;
+      const modalTitle = t("Mobile.Mine.newVersion");
       const modalContent = versionInfo.length > 0 ? versionInfo : t("Mobile.Mine.newVersionAvailable");
+      setPendingAppStoreUrl(updateUrl);
       uni.openDialogPage({
         url: "/pages/mine/components/update-dialog/update-dialog"
           + `?title=${encodeURIComponent(modalTitle)}`
           + `&versionInfo=${encodeURIComponent(modalContent)}`
-          + `&url=${encodeURIComponent(updateUrl)}`,
+          + `&storeLink=${encodeURIComponent(updateUrl)}`,
         animationType: "fade-in",
       });
     } catch (error) {
@@ -677,6 +623,11 @@
   //   ★但开关保持打开（用户是否去开启系统权限不影响这里的业务状态）；拨关完全不读权限。
   // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   const pushEnabled = ref<boolean>(false);
+  /** 原「推送通知」业务开关是否显示：iOS/鸿蒙恒显示；Android 按「有没有 OEM 系统推送通道」
+   *  二选一——有渠道显示本开关，无渠道让位给「消息通知」入口（见 refreshPushBackgroundStatus）。
+   *  ★Android 初值/检测失败一律 true（fail-open）：绝大多数机型有渠道，且本开关只关业务侧、
+   *    误显示无害；确认无渠道的那一帧再切走。 */
+  const legacyPushSwitchVisible = ref<boolean>(true);
   /** 推送身份（users/me）已就绪：未就绪时本地偏好无宿主，开关置灰不可拨。 */
   const pushReady = ref<boolean>(false);
   const pushBusy = ref<boolean>(false);
@@ -694,6 +645,80 @@
   let pushBusySeq = 0;
   let pushBusyTimer = 0;
   const PUSH_BUSY_TIMEOUT_MS = 8000;
+
+  // #ifdef APP-ANDROID
+  const pushBackgroundLoading = ref<boolean>(false);
+  const pushBackgroundState = ref<PushBackgroundStatus | null>(null);
+  let pushBackgroundSeq = 0;
+
+  // ★不再看 pushEnabled：无渠道机型的原业务开关已被本入口取代（见模板与 legacyPushSwitchVisible），
+  //   存量「已关闭」不再有 UI 入口，否则这一行会永久隐藏。
+  const showPushBackgroundEntry = computed((): boolean => {
+    const state = pushBackgroundState.value;
+    return isLoggedIn.value && state != null && state.vendor == "none";
+  });
+
+  const pushBackgroundStatusLabel = computed((): string => {
+    if (pushBackgroundLoading.value) return t("Mobile.PushBackground.checking");
+    const state = pushBackgroundState.value;
+    if (state == null) return "";
+    return state.manualSettingsRequired
+      ? t("Mobile.PushBackground.needsSetup")
+      : t("Mobile.PushBackground.optimized");
+  });
+
+  async function refreshPushBackgroundStatus(): Promise<void> {
+    const seq = ++pushBackgroundSeq;
+    if (!isLoggedIn.value) {
+      pushBackgroundLoading.value = false;
+      pushBackgroundState.value = null;
+      legacyPushSwitchVisible.value = true;
+      return;
+    }
+    pushBackgroundLoading.value = true;
+    try {
+      const state = await getPushBackgroundStatus();
+      if (seq != pushBackgroundSeq) return;
+      pushBackgroundState.value = state;
+      // 无渠道 → 原业务开关让位给「消息通知」入口；有渠道 → 保留原开关
+      legacyPushSwitchVisible.value = state.vendor != "none";
+    } catch (_e) {
+      if (seq == pushBackgroundSeq) {
+        pushBackgroundState.value = null;
+        legacyPushSwitchVisible.value = true;
+      }
+    } finally {
+      if (seq == pushBackgroundSeq) pushBackgroundLoading.value = false;
+    }
+  }
+
+  /**
+   * 无 OEM 系统推送通道的机型没有业务推送开关入口：存量「已关闭」恢复开启。
+   * ★否则 registerImDeviceNow 会继续上报 pushEnabled=false，后端永不下发离线推送，
+   *   而页面里已经没有任何入口能把开关拨回来。
+   * ★有渠道机型**不得**调用：用户主动关掉推送是有效诉求，强行打开属于篡改偏好。
+   * @returns 是否真的做了写入（调用方据此决定要不要补一次设备注册）
+   */
+  function ensureAndroidPushPreferenceOn(): boolean {
+    if (!hasImPushPreferenceUser() || readImPushEnabled()) return false;
+    writeImPushEnabled(true);
+    return true;
+  }
+
+  function openPushBackgroundActionSheet(): void {
+    uni.showActionSheet({
+      itemList: [
+        t("Mobile.PushBackground.openNotificationSettings"),
+        // 电池子页没有公开深链：落到应用详情页，用户在那里点「电池」即可。
+        t("Mobile.PushBackground.openBatterySettings"),
+      ],
+      success: (res: ShowActionSheetSuccess): void => {
+        if (res.tapIndex == 0) openNotificationSettings();
+        else if (res.tapIndex == 1) openBatteryOptimizationSettings();
+      },
+    });
+  }
+  // #endif
 
   /** 按业务开关同步开关显示值。 */
   function syncPushSwitch(): void {
@@ -760,6 +785,30 @@
     }
   }
 
+  // #ifdef APP-ANDROID
+  /**
+   * 检测后台接收状态，并在「确认无 OEM 推送通道」时把存量「已关闭」恢复为开启。
+   * ★必须在拿到 vendor 之后才改偏好：有渠道机型的开关是用户主动关的，提前改会篡改其意图。
+   * ★不能把这段搬进 refreshPushBackgroundStatus：它要调下面的 resyncPushRegistration，
+   *   而 UTS 不允许前向引用（error18）。
+   */
+  function refreshPushBackgroundAndMigrate(): void {
+    // UI 状态（入口分流 + 文案）走统一的 seq 去重链路
+    refreshPushBackgroundStatus();
+    // 偏好迁移单独判一次：不读 pushBackgroundState，避免和并发调用互相覆盖导致漏迁移
+    getPushBackgroundStatus().then((state): void => {
+      if (state.vendor != "none") return;
+      if (!ensureAndroidPushPreferenceOn()) return;
+      // 偏好已从「关」恢复为「开」：同步开关显示值，并补一次注册让服务端收敛
+      pushEnabled.value = readImPushEnabled();
+      syncPushSwitch();
+      resyncPushRegistration();
+    }).catch((_e: any | null): void => {
+      // 检测失败不动偏好（下次进页重试）
+    });
+  }
+  // #endif
+
   /**
    * 进页/切回本 Tab 时校正开关。
    * ★tab 页每次显示都会走这里（比账号管理页的「进页一次」频繁得多），所以分两条路：
@@ -773,6 +822,10 @@
       pushReady.value = true;
       pushEnabled.value = readImPushEnabled();
       syncPushSwitch();
+      // #ifdef APP-ANDROID
+      // 后台接收状态检测；确认无 OEM 通道时同时迁移存量「已关闭」偏好（见上）
+      refreshPushBackgroundAndMigrate();
+      // #endif
       resyncPushRegistration();
       return;
     }
@@ -784,6 +837,9 @@
       pushReady.value = ready;
       pushEnabled.value = readImPushEnabled();
       syncPushSwitch();
+      // #ifdef APP-ANDROID
+      refreshPushBackgroundAndMigrate();
+      // #endif
       if (!ready) throw new Error(t("Mobile.Error.pushIdentityUnavailable"));
       // 注册一次让服务端拿到本设备的最新偏好（失败无 UI 提示：下次 onShow 会重试）
       await apiImDeviceRegister(getImPushCid());
@@ -861,6 +917,9 @@
       }
       if (apiResCode(res) != SUCCESS_CODE) throw new Error(t("Mobile.Error.pushNotSynchronized"));
       syncPushSwitch();
+      // #ifdef APP-ANDROID
+      refreshPushBackgroundStatus();
+      // #endif
       if (want) {
         uni.showToast({title:t("Mobile.Profile.pushSaved"),icon:"none"});
         // 开关已打开；若系统通知未开启，过一拍弹提示（先让 toast 露一下再弹窗）
@@ -907,6 +966,10 @@
       creditsSummary.value = null;
       refreshSystemMessageBadge();
     }
+    // #ifdef APP-ANDROID
+    // performLoad 与推送偏好刷新并行；无论哪条先完成，都补一次状态检测，避免首次进页不显示入口。
+    refreshPushBackgroundStatus();
+    // #endif
   };
 
   // tab 页每次显示时刷新登录态与数据
@@ -940,6 +1003,8 @@
     // ★从系统设置 / 后台返回：上一次操作可能已被系统挂起（跳去设置期间请求回调丢失，
     //   Promise 永不 settle）→ pushBusy 卡在 true、开关 `:disabled` 变灰点不动。
     //   这里作废在途操作立即解灰，再重新核一次真实状态。
+    //   Android 的后台接收状态（入口分流 + 文案）由 refreshPushPreference 内部的
+    //   refreshPushBackgroundAndMigrate 一并刷新，不再单独直调——两次并发会被 seq 去重吃掉一次。
     abortPushBusy();
     refreshPushPreference();
     // #endif
@@ -1231,7 +1296,6 @@
     }
   }
 
-  /* 退出登录 */
   .logout-group {
     margin-top: 12px;
   }

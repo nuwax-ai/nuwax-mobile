@@ -1,0 +1,201 @@
+import { apiTenantConfig } from "@/servers/account";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+import { DISMISSED_APP_UPDATE_VERSION_KEY } from "@/utils/installScopedStorage";
+import { isOpenableExternalUrl } from "@/utils/openExternalUrl";
+import { setPendingAppStoreUrl } from "@/utils/pendingAppStoreUrl";
+
+/** 用户在伙伴页取消过的远端版本。同一版本不再重复提醒，退出登录也不清除。 */
+const DISMISSED_APP_UPDATE_VERSION = DISMISSED_APP_UPDATE_VERSION_KEY;
+
+const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+const normalizeUpdateUrl = (rawUrl: string): string => {
+  let url = rawUrl.trim();
+  const separator = "](";
+  if (url.startsWith("[") && url.endsWith(")")) {
+    const separatorIndex = url.indexOf(separator);
+    if (separatorIndex >= 0) {
+      url = url.substring(separatorIndex + separator.length, url.length - 1).trim();
+    }
+  }
+  return url;
+};
+
+const normalizedVersion = (version: string): string => {
+  const value = version.trim();
+  if (value.startsWith("v") || value.startsWith("V")) {
+    return value.substring(1);
+  }
+  return value;
+};
+
+/** 取版本号第 index 段（从 0 起：大、中、小版本）。缺段或非数字按 0。 */
+const versionPartAt = (version: string, index: number): number => {
+  const parts = version.split(".");
+  if (index < 0 || index >= parts.length) {
+    return 0;
+  }
+  const raw = parts[index];
+  let value = 0;
+  let seenDigit = false;
+  for (let i = 0; i < raw.length; i++) {
+    const codeRaw = raw.charCodeAt(i);
+    if (codeRaw == null) {
+      break;
+    }
+    const code = codeRaw as number;
+    if (code < 48 || code > 57) {
+      break;
+    }
+    seenDigit = true;
+    value = value * 10 + (code - 48);
+  }
+  return seenDigit == true ? value : 0;
+};
+
+/**
+ * 远端版本是否比当前版本新。
+ * 从大版本号开始逐段比数字，大版本相同再比中版本，再比小版本。
+ */
+const isRemoteVersionNewer = (current: string, remote: string): boolean => {
+  const currentVersion = normalizedVersion(current);
+  const remoteVersion = normalizedVersion(remote);
+  const currentParts = currentVersion.split(".");
+  const remoteParts = remoteVersion.split(".");
+  const length = currentParts.length > remoteParts.length ? currentParts.length : remoteParts.length;
+  for (let i = 0; i < length; i++) {
+    const currentPart = versionPartAt(currentVersion, i);
+    const remotePart = versionPartAt(remoteVersion, i);
+    if (remotePart > currentPart) {
+      return true;
+    }
+    if (remotePart < currentPart) {
+      return false;
+    }
+  }
+  return false;
+};
+
+const isForceUpdateCheckOn = (info: UTSJSONObject): boolean => {
+  const raw = info["forceUpdateCheck"];
+  if (raw == null || raw == false) {
+    return false;
+  }
+  if (raw == true) {
+    return true;
+  }
+  const text = `${raw}`.trim();
+  return text == "1" || text == "true";
+};
+
+const currentPlatformKey = (): string => {
+  let platformKey = "";
+  // #ifdef APP-IOS
+  platformKey = "ios";
+  // #endif
+  // #ifdef APP-ANDROID
+  platformKey = "android";
+  // #endif
+  // #ifdef APP-HARMONY
+  platformKey = "harmonyos";
+  // #endif
+  return platformKey;
+};
+
+const dismissedVersion = (): string => {
+  const raw = uni.getStorageSync(DISMISSED_APP_UPDATE_VERSION);
+  return raw != null ? `${raw}`.trim() : "";
+};
+
+/**
+ * 记录用户取消更新的远端版本。下次同一版本不再弹窗。
+ * @param version 远端版本号
+ */
+export function rememberDismissedAppUpdate(version: string): void {
+  const value = normalizedVersion(version);
+  if (value.length == 0) {
+    return;
+  }
+  uni.setStorageSync(DISMISSED_APP_UPDATE_VERSION, value);
+}
+
+/**
+ * 进入伙伴页时后台检查一次 App 更新。失败、未开启检查、已是最新、或该版本已被取消，都不提示、不抛错。
+ */
+export async function checkPartnerAppUpdate(): Promise<void> {
+  // #ifndef APP
+  return;
+  // #endif
+  // #ifdef APP
+  const platformKey = currentPlatformKey();
+  if (platformKey.length == 0) {
+    return;
+  }
+  try {
+    const response = await apiTenantConfig();
+    if (apiResCode(response) != SUCCESS_CODE) {
+      return;
+    }
+    const dataRaw = apiResData<any>(response);
+    if (dataRaw == null) {
+      return;
+    }
+    const data = dataRaw as UTSJSONObject;
+    const versionConfigRaw = data["appVersionInfo"];
+    if (versionConfigRaw == null || typeof versionConfigRaw != "string") {
+      return;
+    }
+    const versionConfigText = `${versionConfigRaw}`.trim();
+    if (versionConfigText.length == 0) {
+      return;
+    }
+    const versionConfig = JSON.parse<UTSJSONObject>(versionConfigText);
+    if (versionConfig == null) {
+      return;
+    }
+    const platformRaw = versionConfig[platformKey];
+    if (platformRaw == null) {
+      return;
+    }
+    const platformInfo = platformRaw as UTSJSONObject;
+    if (isForceUpdateCheckOn(platformInfo) != true) {
+      return;
+    }
+    const latestVersionRaw = platformInfo["version"];
+    const versionInfoRaw = platformInfo["versionInfo"];
+    const updateUrlRaw = platformInfo["url"];
+    const latestVersion = latestVersionRaw != null ? `${latestVersionRaw}`.trim() : "";
+    const versionInfo = versionInfoRaw != null ? `${versionInfoRaw}`.trim() : "";
+    const updateUrl = updateUrlRaw != null ? normalizeUpdateUrl(`${updateUrlRaw}`) : "";
+    if (latestVersion.length == 0) {
+      return;
+    }
+    const currentVersion = (uni.getAppBaseInfo().appVersion ?? "").trim();
+    if (isRemoteVersionNewer(currentVersion, latestVersion) != true) {
+      return;
+    }
+    const latestNormalized = normalizedVersion(latestVersion);
+    if (dismissedVersion() == latestNormalized) {
+      return;
+    }
+    if (isOpenableExternalUrl(updateUrl) != true) {
+      return;
+    }
+    const modalTitle = t("Mobile.Mine.newVersion");
+    const modalContent = versionInfo.length > 0 ? versionInfo : t("Mobile.Mine.newVersionAvailable");
+    setPendingAppStoreUrl(updateUrl);
+    uni.openDialogPage({
+      url: "/pages/mine/components/update-dialog/update-dialog"
+        + `?title=${encodeURIComponent(modalTitle)}`
+        + `&versionInfo=${encodeURIComponent(modalContent)}`
+        + `&storeLink=${encodeURIComponent(updateUrl)}`
+        + `&dismissVersion=${encodeURIComponent(latestNormalized)}`,
+      animationType: "fade-in",
+    });
+  } catch (_error) {
+    // 检查失败不影响伙伴页
+  }
+  // #endif
+}

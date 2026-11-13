@@ -18,11 +18,12 @@
   <!-- #endif -->
   <scroll-view
     v-if="scrollAlive"
+    id="partner-contact-scroll"
     class="im-pane"
     :key="scrollViewKey"
     :direction="menuVisible ? 'none' : 'vertical'"
     :show-scrollbar="false"
-    :refresher-enabled="pullEntryEnabled"
+    :refresher-enabled="nativeRefresherEnabled"
     :refresher-triggered="pullTriggered"
     :refresher-threshold="pullNativeThreshold"
     :refresher-max-drag-distance="pullMaxDragDistance"
@@ -423,6 +424,7 @@
     <!-- 原生节点直接作为 refresher 插槽（置末位：App 端 refresher 取末个 slot 内容）。
          App 三端插槽只当「浅灰底 + 占位」用（不画圆点：拉过插槽高后圆点跟不上灰区），
          圆点改画在下面列表外的覆盖层里；H5/小程序仍把圆点画在插槽内（行程只到 60px）。 -->
+    <!-- #ifndef APP-ANDROID -->
     <view slot="refresher" class="pull-guide" :style="pullGuideRootStyle">
       <!-- #ifndef APP -->
       <view class="pull-guide__dots" :style="pullGuideDotsStyle">
@@ -432,6 +434,7 @@
       </view>
       <!-- #endif -->
     </view>
+    <!-- #endif -->
   </scroll-view>
   <!-- #ifdef APP -->
   <!-- 下拉圆点覆盖层：贴 pane 顶，高度 = 原生下拉位移 dy（=列表被推下来的那段空白），
@@ -451,7 +454,7 @@
 </template>
 
 <script setup lang="uts">
-  import { computed, getCurrentInstance, nextTick, ref, watch } from "vue";
+  import { computed, getCurrentInstance, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import iconGroupSet from "@/static/icons/group_set.png";
   import iconNewPartner from "@/static/icons/new_partner.svg";
@@ -468,6 +471,13 @@
     spaceRoleText as spaceRoleTextOf,
     spaceRoleTextClass as spaceRoleTextClassOf,
   } from "./im-row-helpers.uts";
+  // #ifdef APP-ANDROID
+  import {
+    attachAndroidPullAction,
+    detachAndroidPullAction,
+    setAndroidPullActionEnabled,
+  } from "@/uni_modules/nuwax-android-pull-action";
+  // #endif
 
   // 事件名须 kebab-case：App-Android 模板监听会把 camelCase 转小写导致收不到（add-menu-drawer 同规约）
   const emit = defineEmits<{
@@ -625,6 +635,15 @@
   const spaceRoleTextClass = (space: ImSpaceRow): string => spaceRoleTextClassOf(space);
 
   const componentInstance = getCurrentInstance();
+  /** Android 关闭 scroll-view 自带 refresher，改由 SmartRefreshLayout 单独接管手势。 */
+  const nativeRefresherEnabled = computed((): boolean => {
+    // #ifdef APP-ANDROID
+    return false;
+    // #endif
+    // #ifndef APP-ANDROID
+    return props.pullEntryEnabled;
+    // #endif
+  });
   /** scroll-view 的 key：enabled 翻转要重建（见 pullEntryEnabled 注释）。
    *  回页强制归位走上面的 v-if（见 scrollAlive），不叠在这把 key 上，免一次翻两遍容器。 */
   const scrollViewKey = computed((): string => {
@@ -703,6 +722,111 @@
   /** 松手前至少 120ms 位移变化不超过 2px，且有连续原生位移样本。 */
   const PULL_ANDROID_STILL_MS = 120;
   const PULL_ANDROID_STILL_DY = 2;
+  // #endif
+  // #ifdef APP-ANDROID
+  const ANDROID_PULL_KEY = "partner-contact-pull";
+  const ANDROID_PULL_ELEMENT_ID = "partner-contact-scroll";
+  let androidPullAttachTimer = 0;
+  let androidPullAttachAttempts = 0;
+
+  function handleAndroidPullProgress(distanceValue: number, dragging: boolean): void {
+    const distance = Math.max(0, Math.min(distanceValue, props.pullMaxDragDistance));
+    if (dragging && pullGuideDistance.value <= 0 && distance > 0) {
+      pullHapticFired = false;
+    }
+    if (!pullHapticFired && distance >= props.pullThreshold * PULL_ARM_RATIO) {
+      pullHapticFired = true;
+      try {
+        uni.vibrateShort({
+          type: "light",
+          fail: (_err) => {
+            // ignore
+          },
+        });
+      } catch (_eVibrate) {
+        // ignore
+      }
+    }
+    if (Math.abs(pullGuideDistance.value - distance) >= 0.5) {
+      pullGuideDistance.value = distance;
+    }
+  }
+
+  function handleAndroidPullTriggered(): void {
+    emit("pull-refresh");
+  }
+
+  function handleAndroidPullSettled(triggered: boolean): void {
+    pullGuideDistance.value = 0;
+    pullHapticFired = false;
+    if (triggered) {
+      emit("pull-restore");
+    } else {
+      emit("pull-abort");
+    }
+  }
+
+  function attachAndroidPullActionNow(): void {
+    androidPullAttachTimer = 0;
+    const attached = attachAndroidPullAction(
+      ANDROID_PULL_KEY,
+      ANDROID_PULL_ELEMENT_ID,
+      props.pullThreshold,
+      props.pullMaxDragDistance,
+      "#f4f3fb",
+      props.pullEntryEnabled && !props.menuVisible,
+      handleAndroidPullProgress,
+      handleAndroidPullTriggered,
+      handleAndroidPullSettled,
+    );
+    if (attached) {
+      androidPullAttachAttempts = 0;
+      return;
+    }
+    androidPullAttachAttempts = androidPullAttachAttempts + 1;
+    if (androidPullAttachAttempts < 8) {
+      androidPullAttachTimer = setTimeout((): void => {
+        attachAndroidPullActionNow();
+      }, 50);
+    }
+  }
+
+  function queueAndroidPullAttach(): void {
+    if (androidPullAttachTimer != 0) clearTimeout(androidPullAttachTimer);
+    androidPullAttachAttempts = 0;
+    nextTick((): void => {
+      attachAndroidPullActionNow();
+    });
+  }
+
+  onMounted((): void => {
+    queueAndroidPullAttach();
+  });
+
+  onUnmounted((): void => {
+    if (androidPullAttachTimer != 0) clearTimeout(androidPullAttachTimer);
+    androidPullAttachTimer = 0;
+    detachAndroidPullAction(ANDROID_PULL_KEY);
+  });
+
+  watch((): boolean => props.pullEntryEnabled && !props.menuVisible, (enabled: boolean): void => {
+    setAndroidPullActionEnabled(ANDROID_PULL_KEY, enabled);
+  });
+  watch((): boolean => scrollAlive.value, (alive: boolean): void => {
+    if (alive) {
+      queueAndroidPullAttach();
+      return;
+    }
+
+    if (androidPullAttachTimer != 0) {
+      clearTimeout(androidPullAttachTimer);
+    }
+    androidPullAttachTimer = 0;
+    androidPullAttachAttempts = 0;
+    detachAndroidPullAction(ANDROID_PULL_KEY);
+    pullGuideDistance.value = 0;
+    pullHapticFired = false;
+  });
   // #endif
   /** 重建滚动容器时把下拉位移一并清零：跳转打断收回的话 refresherrestore 不会来，
    *  pullGuideDistance 会停在松手时的值，重建后圆点按旧位移显示。 */
@@ -1072,6 +1196,10 @@
   /** 手指按下：解冻（上一轮的回弹动画可能还在跑，但新的下拉要能跟手）。 */
   function emitPaneTouchStart(eventValue: Any): void {
     const e = eventValue as UniTouchEvent;
+    // #ifdef APP-ANDROID
+    emit("pane-touchstart", e);
+    return;
+    // #endif
     pullGuideFrozen = false;
     pullGuideDragging = true;
     pullReleaseFired = false;
@@ -1094,6 +1222,10 @@
 
   function emitPaneTouchEnd(eventValue: Any): void {
     const e = eventValue as UniTouchEvent;
+    // #ifdef APP-ANDROID
+    emit("pane-touchend", e);
+    return;
+    // #endif
     pullGuideDragging = false;
     pullReleaseDistance = pullGuideDistance.value;
     pullReleaseQualified = isPullReleaseQualified(e);
@@ -1124,6 +1256,10 @@
   }
 
   function emitPaneTouchCancel(eventValue: Any): void {
+    // #ifdef APP-ANDROID
+    emit("pane-touchcancel", eventValue as UniTouchEvent);
+    return;
+    // #endif
     pullGuideDragging = false;
     // ★不要清 touchstart 采样与越线速度：App-Android 的原生刷新控件一接管下拉手势就会
     //   派 touchcancel（实测手指移动 ~40ms 后），之后到达的 pulling / touchend 仍要靠

@@ -12,6 +12,7 @@
 
     <view class="vr-body">
       <text class="vr-timer">{{ timerText }}</text>
+      <text v-if="statusText.length > 0" class="vr-status">{{ statusText }}</text>
       <view class="vr-wave">
         <view class="vr-wave__base"></view>
         <view v-if="phase != 'idle'" class="vr-wave__played"></view>
@@ -72,6 +73,15 @@ import { MicrophonePermissionHelper } from "@/utils/permissionHelper";
 import { pageSystemOverlay } from "@/utils/pageSystemOverlay.uts";
 import { emptyI18nParams, useI18n } from "@/utils/i18n";
 import { watch } from "vue";
+import {
+  discardVoiceNote,
+  finishVoiceNote,
+  getPanelVoiceNote,
+  startVoiceNote,
+  stopVoiceNote,
+  voiceNoteOnAppShow,
+} from "@/utils/voiceNoteEngine.uts";
+import { VoiceNoteRecord } from "@/utils/voiceNoteStore.uts";
 // #ifdef APP-HARMONY
 import { openHarmonyMicPermissionSettings } from "@/uni_modules/nuwax-stream-pcm-player";
 // #endif
@@ -86,32 +96,18 @@ const emit = defineEmits<{
   "recording-change": [recording: boolean];
 }>();
 
-const HISTORY_KEY = "nuwax_voice_record_history";
 const ticks: number[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
-
-type VoiceHistoryItem = {
-  id: string;
-  durationMs: number;
-  filePath: string;
-  createdAt: number;
-  createdLabel: string;
-  durationLabel: string;
-};
 
 const elapsedMs = ref<number>(0);
 /** idle 未开始 / recording 录音中 / stopped 已停止待播放或完成 */
 const phase = ref<string>("idle");
+const statusText = ref<string>("");
 watch(phase, (value: string) => {
   emit("recording-change", value == "recording");
 });
-const history = ref<VoiceHistoryItem[]>([]);
 
-let startedAt = 0;
-let tickTimer = 0;
+let uiTimer = 0;
 let stoppedFilePath = "";
-let recorderBound = false;
-let savedCurrent = false;
-let leaveAfterStop = false;
 let player: InnerAudioContext | null = null;
 
 function pad2(n: number): string {
@@ -135,141 +131,65 @@ const timerText = computed((): string => {
   return formatDuration(elapsedMs.value);
 });
 
-function formatClock(ts: number): string {
-  const d = new Date(ts);
-  return pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+function statusOf(record: VoiceNoteRecord): string {
+  let uploaded = 0;
+  let failed = 0;
+  const total = record.segments.length;
+  for (let i = 0; i < total; i++) {
+    const row = record.segments[i];
+    if (row.uploadStatus == "uploaded") uploaded = uploaded + 1;
+    if (row.uploadStatus == "failed") failed = failed + 1;
+  }
+  if (record.phase == "recording") {
+    if (total == 0) return "录音中，退到后台会继续";
+    return "录音中，已上传 " + uploaded + "/" + total + " 段";
+  }
+  if (record.phase == "processing") return "转写中";
+  if (record.phase == "uploading") return "上传中 " + uploaded + "/" + total;
+  if (record.phase == "failed" && record.error.length > 0) return record.error;
+  if (failed > 0) return failed + " 段上传失败，点完成会重试";
+  if (total > 0 && uploaded < total) return "待上传 " + uploaded + "/" + total;
+  if (record.noteId.length > 0) return "已缓存 noteId " + record.noteId;
+  return "已保存在本机";
 }
 
-function loadHistory(): void {
-  const raw = uni.getStorageSync(HISTORY_KEY);
-  if (raw == null || raw == "") {
-    history.value = [];
-    return;
-  }
-  const text = raw as string;
-  let parsed: UTSJSONObject[] = [];
-  try {
-    parsed = JSON.parse(text) as UTSJSONObject[];
-  } catch (err) {
-    history.value = [];
-    return;
-  }
-  const rows: VoiceHistoryItem[] = [];
-  for (let i = 0; i < parsed.length; i++) {
-    const obj = parsed[i];
-    const item: VoiceHistoryItem = {
-      id: obj["id"] as string,
-      durationMs: obj["durationMs"] as number,
-      filePath: obj["filePath"] as string,
-      createdAt: obj["createdAt"] as number,
-      createdLabel: obj["createdLabel"] as string,
-      durationLabel: obj["durationLabel"] as string,
-    };
-    rows.push(item);
-  }
-  history.value = rows;
+function latestFilePath(record: VoiceNoteRecord): string {
+  if (record.segments.length == 0) return "";
+  return record.segments[record.segments.length - 1].filePath;
 }
 
-function saveHistoryItem(durationMs: number, filePath: string): void {
-  const now = Date.now();
-  const item: VoiceHistoryItem = {
-    id: now.toString(),
-    durationMs: durationMs,
-    filePath: filePath,
-    createdAt: now,
-    createdLabel: formatClock(now),
-    durationLabel: formatDuration(durationMs),
-  };
-  const next: VoiceHistoryItem[] = [item];
-  for (let i = 0; i < history.value.length && next.length < 50; i++) {
-    next.push(history.value[i]);
-  }
-  history.value = next;
-  const payload: UTSJSONObject[] = [];
-  for (let i = 0; i < next.length; i++) {
-    const row = next[i];
-    const obj = {} as UTSJSONObject;
-    obj["id"] = row.id;
-    obj["durationMs"] = row.durationMs;
-    obj["filePath"] = row.filePath;
-    obj["createdAt"] = row.createdAt;
-    obj["createdLabel"] = row.createdLabel;
-    obj["durationLabel"] = row.durationLabel;
-    payload.push(obj);
-  }
-  uni.setStorageSync(HISTORY_KEY, JSON.stringify(payload));
-}
-
-function tick(): void {
-  if (phase.value != "recording") {
-    return;
-  }
-  elapsedMs.value = Date.now() - startedAt;
-}
-
-function startTicker(): void {
-  startedAt = Date.now();
-  elapsedMs.value = 0;
-  phase.value = "recording";
-  if (tickTimer != 0) {
-    clearInterval(tickTimer);
-  }
-  tickTimer = setInterval(() => {
-    tick();
-  }, 40);
-}
-
-function stopTicker(): void {
-  if (tickTimer != 0) {
-    clearInterval(tickTimer);
-    tickTimer = 0;
-  }
-  if (phase.value == "recording") {
-    phase.value = "stopped";
-  }
-}
-
-function persistCurrent(): void {
-  if (savedCurrent || stoppedFilePath.length == 0 || elapsedMs.value <= 0) {
-    return;
-  }
-  saveHistoryItem(elapsedMs.value, stoppedFilePath);
-  savedCurrent = true;
-}
-
-function bindRecorder(): void {
-  if (recorderBound) {
-    return;
-  }
-  recorderBound = true;
-  const recorder = uni.getRecorderManager();
-  recorder.onStop((res: RecorderManagerOnStopResult) => {
-    stoppedFilePath = res.tempFilePath;
-    savedCurrent = false;
-    stopTicker();
-    if (leaveAfterStop) {
-      leaveAfterStop = false;
-      persistCurrent();
-      emit("close");
-    }
-  });
-  recorder.onError((err: any) => {
-    stopTicker();
+function applySnapshot(): void {
+  const record = getPanelVoiceNote();
+  if (record == null || record.phase == "success") {
     phase.value = "idle";
     elapsedMs.value = 0;
-    let msg = "录音失败";
-    if (err != null) {
-      const obj = err as UTSJSONObject;
-      const raw = obj["errMsg"];
-      if (raw != null) {
-        const text = "" + raw;
-        if (text.length > 0) {
-          msg = text;
-        }
-      }
-    }
-    uni.showToast({ title: msg, icon: "none" });
-  });
+    statusText.value = "";
+    stoppedFilePath = "";
+    return;
+  }
+  stoppedFilePath = latestFilePath(record);
+  statusText.value = statusOf(record);
+  if (record.phase == "recording") {
+    phase.value = "recording";
+    elapsedMs.value = Date.now() - record.startedAt;
+    return;
+  }
+  phase.value = "stopped";
+  elapsedMs.value = record.elapsedMs;
+}
+
+function startUiTimer(): void {
+  if (uiTimer != 0) return;
+  uiTimer = setInterval(() => {
+    applySnapshot();
+  }, 200);
+}
+
+function stopUiTimer(): void {
+  if (uiTimer != 0) {
+    clearInterval(uiTimer);
+    uiTimer = 0;
+  }
 }
 
 function stopPlayer(): void {
@@ -438,44 +358,35 @@ async function ensureMicPermission(): Promise<boolean> {
   return true;
 }
 
-function startRecording(): void {
-  stopPlayer();
-  bindRecorder();
-  stoppedFilePath = "";
-  savedCurrent = false;
-  leaveAfterStop = false;
-  startTicker();
-  const recorder = uni.getRecorderManager();
-  recorder.start({
-    duration: 600000,
-    sampleRate: 16000,
-    numberOfChannels: 1,
-    format: "aac",
-  });
-}
-
 async function handleStartTap(): Promise<void> {
   const permitted = await ensureMicPermission();
   if (permitted != true) {
     return;
   }
-  startRecording();
+  stopPlayer();
+  try {
+    await startVoiceNote();
+  } catch (e) {
+    uni.showToast({ title: `${e}`, icon: "none" });
+  }
+  applySnapshot();
 }
 
 function handleStop(): void {
   if (phase.value != "recording") {
     return;
   }
-  const recorder = uni.getRecorderManager();
-  recorder.stop();
+  stopVoiceNote();
+  applySnapshot();
 }
 
 function handleRerecord(): void {
   stopPlayer();
-  stoppedFilePath = "";
-  savedCurrent = false;
-  elapsedMs.value = 0;
+  discardVoiceNote();
   phase.value = "idle";
+  elapsedMs.value = 0;
+  statusText.value = "";
+  stoppedFilePath = "";
 }
 
 function handlePlay(): void {
@@ -495,21 +406,13 @@ function handlePlay(): void {
 
 function handleDone(): void {
   stopPlayer();
-  persistCurrent();
+  finishVoiceNote();
   emit("close");
 }
 
 function leaveToChat(): void {
   stopPlayer();
-  if (phase.value == "recording") {
-    leaveAfterStop = true;
-    const recorder = uni.getRecorderManager();
-    recorder.stop();
-    return;
-  }
-  if (phase.value == "stopped") {
-    persistCurrent();
-  }
+  // 录音中返回消息列表或退到后台都不停止采集，会话留在 voiceNoteEngine。
   emit("close");
 }
 
@@ -522,17 +425,14 @@ function openHistory(): void {
 }
 
 onMounted(() => {
-  loadHistory();
+  voiceNoteOnAppShow();
+  applySnapshot();
+  startUiTimer();
 });
 
 onUnmounted(() => {
   stopPlayer();
-  const wasRecording = phase.value == "recording";
-  stopTicker();
-  if (wasRecording) {
-    const recorder = uni.getRecorderManager();
-    recorder.stop();
-  }
+  stopUiTimer();
 });
 </script>
 
@@ -589,6 +489,14 @@ onUnmounted(() => {
   font-weight: 500;
   color: #3a3a3c;
   letter-spacing: 2rpx;
+}
+
+.vr-status {
+  margin-top: 16rpx;
+  padding: 0 48rpx;
+  font-size: 24rpx;
+  color: #8e8e93;
+  text-align: center;
 }
 
 .vr-wave {

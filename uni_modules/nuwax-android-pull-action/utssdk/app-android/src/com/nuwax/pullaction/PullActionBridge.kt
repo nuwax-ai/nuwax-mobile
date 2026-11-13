@@ -147,7 +147,10 @@ private class PullActionSession(
         val thresholdPx = max(1, (thresholdDp * density).toInt())
         val maxDragPx = max(thresholdPx + 1, (maxDragDp * density).toInt())
         val wrapper = SmartRefreshLayout(target.context)
-        wrapper.setBackgroundColor(Color.WHITE)
+        // 外壳底色 = 下拉灰区同色（业务经 backgroundColor 传入，伙伴页为 #f4f3fb）。
+        // 静止下拉由 header 盖住这块；快速甩动到顶后列表的惯性 overscroll 不经过 header，
+        // 露出的就是外壳本身，写死白色会在顶部露出一条白边（业务侧列表本体已自铺白底）。
+        wrapper.setBackgroundColor(parseColor(backgroundColor))
         wrapper.setEnableLoadMore(false)
         wrapper.setEnableAutoLoadMore(false)
         wrapper.setEnableNestedScroll(true)

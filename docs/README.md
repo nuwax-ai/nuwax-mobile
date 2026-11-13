@@ -15,6 +15,7 @@
 | [ios-esp-provisioning-local-base.md](engineering/ios-esp-provisioning-local-base.md) | iOS 端配网本地基座 |
 | [harmony-esp-provisioning-local-base.md](engineering/harmony-esp-provisioning-local-base.md) | 鸿蒙端（预留） |
 | [pre-release-checklist.md](engineering/pre-release-checklist.md) | 发版前清理检查单 |
+| [im-longlist-performance-stages.md](engineering/im-longlist-performance-stages.md) | IM 长列表性能治理分阶段方案（会话详情 → 会话列表 → 智联录，含进度表与验收标准） |
 | [ios-app-store-submission-audit.md](engineering/ios-app-store-submission-audit.md) | iOS 提审就绪审计（2026-08-17） |
 
 ## vapor/ —— vapor 相关

@@ -79,7 +79,7 @@ object PullActionRegistry {
 private class PullActionHeader(context: android.content.Context, backgroundColor: Int) :
     SimpleComponent(View(context)), RefreshHeader {
     init {
-        mSpinnerStyle = SpinnerStyle.FixedBehind
+        mSpinnerStyle = SpinnerStyle.Scale
         view.setBackgroundColor(backgroundColor)
     }
 }
@@ -137,6 +137,11 @@ private class PullActionSession(
         originalParent = parent
         originalIndex = index
         originalLayoutParams = target.layoutParams
+
+        target.animate().cancel()
+        target.clearAnimation()
+        target.translationY = 0f
+        target.translationX = 0f
 
         val density = target.resources.displayMetrics.density
         val thresholdPx = max(1, (thresholdDp * density).toInt())
@@ -221,6 +226,7 @@ private class PullActionSession(
             ) {
                 if (newState == RefreshState.None && gestureStarted && !settledReported) {
                     settledReported = true
+                    target.translationY = 0f
                     dispatchProgress(0.0, false, true)
                     callback.onSettled(gestureTriggered)
                     gestureStarted = false
@@ -254,6 +260,17 @@ private class PullActionSession(
     }
 
     fun detach() {
+        // Reset any content translation left by an interrupted rebound before
+        // returning the scroll view to its original parent.
+        try {
+            refreshLayout?.finishRefresh(0)
+            target.animate().cancel()
+            target.clearAnimation()
+            target.translationY = 0f
+            target.translationX = 0f
+        } catch (_: Throwable) {
+            // Continue with structural detach even if the refresh state is stale.
+        }
         val wrapper = refreshLayout ?: return
         refreshLayout = null
         try {
@@ -276,6 +293,16 @@ private class PullActionSession(
         } catch (error: Throwable) {
             Log.w("NuwaxPullAction", "detach failed for $key", error)
         } finally {
+            target.translationY = 0f
+            target.translationX = 0f
+            gestureStarted = false
+            gestureTriggered = false
+            settledReported = true
+            gestureStartedAtMs = 0L
+            gestureMaxDistanceDp = 0.0
+            lastProgressAtMs = 0L
+            lastProgressDistanceDp = -1.0
+            lastProgressDragging = false
             originalParent = null
             originalLayoutParams = null
         }

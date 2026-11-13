@@ -24,20 +24,32 @@
             <text class="mfd-row__name text-ellipsis">{{ senderNameOf(it) }}</text>
             <text class="mfd-row__time">{{ formatRecordTime(it.sendTime) }}</text>
           </view>
-          <!-- 正文（原始文本，非占位归一值；图文混排快照文本与图片并列展示） -->
-          <text v-if="it.text.length > 0" class="mfd-row__text">{{ it.text }}</text>
-          <!-- 图片附件（kind=image 快照）：缩略图网格，点击全屏预览；受保护 /api/f/
-               地址 onLoad 异步解析回填后整表重建出图（chat.uvue resolveRowMedia 同款） -->
+          <!-- 正文（原始文本，非占位归一值；图文混排快照文本与图片并列展示）。
+               嵌套 text 分段渲染：裸 http(s) 地址与 [标题](url) 按链接样式展示、点击打开
+               （口径同聊天正文；快照不存富文本标记，只拆链接） -->
+          <text v-if="it.text.length > 0" class="mfd-row__text"><text
+            v-for="(sg, k) in textSegsOf(it)"
+            :key="k"
+            :class="sg.link ? 'mfd-row__link' : ''"
+            @click="handleTextSegTap(sg)"
+          >{{ sg.text }}</text></text>
+          <!-- 图片附件（kind=image 快照）：缩略图网格，点击全屏预览；受保护 /api/f/ 地址
+               onLoad 异步解析（ak 直链优先，失败回落整段下载）回填后整表重建出图
+               （chat.uvue resolveRowMedia 同款）；点击时若仍为受保护原址再现场解析一次 -->
           <view v-if="it.images.length > 0" class="mfd-media">
-            <image
-              v-for="(img, k) in it.images"
-              :key="k"
-              class="mfd-media__img"
-              :src="img.url"
-              mode="aspectFill"
-              @click="handleImageTap(img)"
-              @error="handleImageRenderError(img)"
-            />
+            <view v-for="(img, k) in it.images" :key="k" class="mfd-media__cell" @click="handleImageTap(img)">
+              <!-- 挂载闸门（mergeImgMountOk）：快照原值是发送端本机路径 → 只画灰底（点按提示
+                   加载失败）；鸿蒙另外要求受保护原址先不挂节点（已挂 <image> 换新 src 不重绘，
+                   解析出本地 temp 后由 v-if 新建节点才出图，聊天页 harmonyImgGateOk 同款） -->
+              <image
+                v-if="mergeImgMountOk(img.url)"
+                class="mfd-media__img"
+                :src="img.url"
+                mode="aspectFill"
+                @error="handleImageRenderError(img)"
+              />
+              <view v-else class="mfd-media__img" />
+            </view>
           </view>
           <!-- 视频附件（kind=video / kind=file 实为视频）：内联原生 <video>（chat.uvue 同款
                预载策略——onLoad 解析可播地址回填 playUrl ⇒ 常驻播放器首帧即封面，交给系统
@@ -142,16 +154,19 @@
   import { ImMergeItem, ImMergeMedia } from "@/types/interfaces/imMergeItem";
   import { takeImMergeRecord } from "@/utils/im/imMergeRecordSession";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
-  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { isRemoteSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
   import {
     buildAuthProtectedFileHeaders,
     extractFileNameFromUrl,
     fetchAuthProtectedFileAkUrl,
     fetchAuthProtectedFileDisplayUrl,
     isAuthProtectedFileUrl,
+    openAuthProtectedLinkUrl,
     releaseDisplayImageUrl,
     resolveAuthProtectedFileFetchUrl,
   } from "@/utils/authProtectedFileUrl";
+  import { getApiBaseUrl } from "@/constants/config";
+  import { handleExternalLinkInWebview } from "@/utils/system";
   import { previewImageCompat } from "@/utils/appWebViewImagePreview";
   import { formatFileSize } from "@/utils/imFileCard";
   // 视频播放态/进度/全屏态（模块级 ref）：自绘控制条 components/chat-video-bar 与页面事件共用
@@ -185,6 +200,44 @@
   const resolvedMediaUrls: string[] = [];
   /** 缩略图显示边长 rpx（与 .mfd-media__img 尺寸对齐，喂给解析器出图）。 */
   const MERGE_IMG_DISPLAY_RPX = 240;
+  /** 原始地址 → 已解析展示地址（重渲/点按预览免二次解析）。 */
+  const mergeImgResolved = new Map<string, string>();
+  /** 在途解析去重（同地址并发共享同一次解析）。 */
+  const mergeImgRequests = new Map<string, Promise<string>>();
+  /** ak 直链地址 → 原始受保护地址（ak 加载失败时回退整段下载用，聊天页 chatImageAkOrigins 同款）。 */
+  const mergeImgAkOrigins = new Map<string, string>();
+  /** 已走过一次 ak 失败自愈的原始地址（每页至多一次，坏图不无限重试）。 */
+  const mergeImgSelfHealed = new Set<string>();
+  /** 快照里「发送端本机路径」形态的附件地址（onLoad 解析前登记）：2026-11-13 真机事故
+   *  ——鸿蒙端转发把 `/data/storage/el2/base/cache/uni-download/…jpg` 写进了服务端，
+   *  接收端（Android）既画不出也不该反复下载。★只登记快照原值（解析前的 img.url），
+   *  本端解析产物（temp/blob/file://）绝不入此集合，否则会误杀正常展示地址。 */
+  const mergeForeignLocalUrls = new Set<string>();
+
+  /** 地址是否是「别的设备上的本机路径」：跨端必然取不到（鸿蒙 /data/storage/…、
+   *  Android /storage/…、iOS /var/ /private/…、file:// / content:// / blob:）。
+   *  仅用于判定快照原值，不要拿去判本端解析后的展示地址。 */
+  function isForeignLocalMediaUrl(url: string): boolean {
+    if (url.length == 0) {
+      return false;
+    }
+    if (url.indexOf("file://") == 0 || url.indexOf("content://") == 0 || url.indexOf("blob:") == 0) {
+      return true;
+    }
+    if (url.indexOf("/data/") == 0 || url.indexOf("/storage/") == 0 ||
+        url.indexOf("/var/") == 0 || url.indexOf("/private/") == 0) {
+      return true;
+    }
+    // 旧版本把本机路径当站内相对路径补成域名后的形态：https://host/data/storage/…
+    if (url.indexOf("http://") == 0 || url.indexOf("https://") == 0) {
+      return url.indexOf("/data/storage/") >= 0 || url.indexOf("/storage/emulated/") >= 0;
+    }
+    return false;
+  }
+  // #ifdef APP-HARMONY
+  /** 鸿蒙受保护图解析总尝试次数（退避 400ms×n，对齐聊天页 HARMONY_IMG_RESOLVE_MAX_ATTEMPTS）。 */
+  const MERGE_IMG_MAX_ATTEMPTS = 3;
+  // #endif
 
   /** 浅拷贝整表（Android 不追踪 ref 数组内实例属性的原地变更，回填后须整表重建赋值）。 */
   function copyItems(rows: ImMergeItem[]): ImMergeItem[] {
@@ -209,39 +262,151 @@
     }, 50);
   }
 
+  /** 受保护图片取址：App 两端优先 ak 换 ?ak= 直链（<image> 自跟 302 到对象存储流式加载，
+   *  只花一次轻量 JSON 请求，免整段下载落盘）；鸿蒙 <image> 对 ak 直链静默失败（2026-10-27
+   *  真机）一律跳过 ak，走整段下载并退避重试（downloadFile 偶发悬挂/瞬时失败）；接口不可用
+   *  或失败回落原整段下载（temp/blob）。SVG 例外交给 resolveDisplayImageUrl 原管线。
+   *  策略与聊天页 resolveChatImageProtected 逐条对齐（2026-11-13 反馈：详情页图不显示）。 */
+  async function resolveMergeImageProtected(url: string, allowAk: boolean): Promise<string> {
+    let useAk = allowAk;
+    // #ifdef APP-HARMONY
+    useAk = false;
+    // #endif
+    if (useAk && isAuthProtectedFileUrl(url) && isRemoteSvgUrl(url) != true) {
+      try {
+        return await fetchAuthProtectedFileAkUrl(url);
+      } catch (_e) {
+        console.error(`[MergeImg] ak 直链解析失败，回落整段下载 url=${url}`);
+      }
+    }
+    // #ifdef APP-HARMONY
+    if (isAuthProtectedFileUrl(url)) {
+      // resolveDisplayImageUrl 失败回退原址（resolved == url 仅受保护地址有此语义）：
+      // 单发失败会让缩略图永久停在灰块，点按也预览不出，故按头像链退避重试
+      for (let attempt = 1; attempt <= MERGE_IMG_MAX_ATTEMPTS; attempt++) {
+        const resolved = await resolveDisplayImageUrl(url, MERGE_IMG_DISPLAY_RPX, MERGE_IMG_DISPLAY_RPX);
+        if (resolved != url) {
+          return resolved;
+        }
+        if (attempt < MERGE_IMG_MAX_ATTEMPTS) {
+          await new Promise<void>((resolve) => {
+            setTimeout((): void => {
+              resolve();
+            }, 400 * attempt);
+          });
+        }
+      }
+      return url;
+    }
+    // #endif
+    return await resolveDisplayImageUrl(url, MERGE_IMG_DISPLAY_RPX, MERGE_IMG_DISPLAY_RPX);
+  }
+
+  /** 图片解析（缓存 + 在途去重）：CDN 直链原样返回；受保护地址换可展示地址，
+   *  失败回退原地址（由 <image>/@error 兜底）。 */
+  async function resolveMergeImage(url: string, allowAk: boolean): Promise<string> {
+    const cached = mergeImgResolved.get(url);
+    if (cached != null) {
+      return cached;
+    }
+    const existing = mergeImgRequests.get(url);
+    if (existing != null) {
+      return await existing;
+    }
+    const task = resolveMergeImageProtected(url, allowAk);
+    mergeImgRequests.set(url, task);
+    try {
+      const resolved = await task;
+      if (pageDisposed) {
+        releaseDisplayImageUrl(resolved);
+        return url;
+      }
+      mergeImgResolved.set(url, resolved);
+      if (resolved != url) {
+        if (isAuthProtectedFileUrl(resolved)) {
+          // ak 直链仍属 /api/f/ 判定：登记原址供 @error 自愈回落整段下载
+          mergeImgAkOrigins.set(resolved, url);
+        } else {
+          resolvedMediaUrls.push(resolved);
+        }
+      }
+      return resolved;
+    } finally {
+      mergeImgRequests.delete(url);
+    }
+  }
+
+  /** 单张图解析并回填（allowAk=false 时直接走整段下载：ak 失败自愈路径用）。 */
+  function applyMergeImage(img: ImMergeMedia, allowAk: boolean): void {
+    const url = img.url;
+    if (url.length == 0) {
+      return;
+    }
+    // 发送端本机路径：本端取不到，解析只会白跑一趟（还可能被补成域名后落成 404 假地址）
+    if (mergeForeignLocalUrls.has(url)) {
+      return;
+    }
+    resolveMergeImage(url, allowAk)
+      .then((resolved: string): void => {
+        if (pageDisposed) {
+          return;
+        }
+        // 失败会回退原地址（与 url 相同）：不当成功，保留原地址由 <image>/@error 兜底
+        if (resolved.length > 0 && resolved != url && resolved != img.url) {
+          img.url = resolved;
+          scheduleMediaTableRefresh();
+        }
+      })
+      .catch((_e: any | null): void => {
+        // 静默：真实失败由 @error 落日志
+      });
+  }
+
   /** 全量条目图片附件解析（受保护地址换可展示地址；失败保留原地址交给 <image> 兜底）。 */
   function resolveMergeMedia(): void {
     const rows = items.value;
     for (let i = 0; i < rows.length; i++) {
       const imgs = rows[i].images;
       for (let j = 0; j < imgs.length; j++) {
-        const img = imgs[j];
-        const url = img.url;
-        if (url.length == 0) {
-          continue;
-        }
-        resolveDisplayImageUrl(url, MERGE_IMG_DISPLAY_RPX, MERGE_IMG_DISPLAY_RPX)
-          .then((resolved: string): void => {
-            if (pageDisposed) {
-              return;
-            }
-            // 解析失败会回退原地址（与 rawUrl 相同）：不当成功，保留原地址由 <image> 兜底
-            if (resolved.length > 0 && resolved != url) {
-              img.url = resolved;
-              resolvedMediaUrls.push(resolved);
-              scheduleMediaTableRefresh();
-            }
-          })
-          .catch((_e: any | null): void => {
-            // 静默：真实失败由 @error 落日志
-          });
+        applyMergeImage(imgs[j], true);
       }
     }
   }
 
-  /** 可入滑动预览列表的图：空地址与未解析的 /api/f/ 受保护直链剔除（带不了 Bearer）。 */
+  /** <image> 挂载闸门：
+   *  - 快照原值就是发送端本机路径（跨端取不到）→ 不挂节点，只画灰底，点按提示加载失败；
+   *  - 鸿蒙（#ifdef 内）：已挂节点换新 src 不重绘（[[harmony-avatar-load-refresh-loop]]），
+   *    受保护 /api/f/ 原址带不了 Bearer 必失败 → 解析出本地 temp 前只画灰底，回填后由
+   *    v-if 新建节点才出图（聊天页 harmonyImgGateOk 同款）。 */
+  function mergeImgMountOk(url: string): boolean {
+    if (url.length == 0) {
+      return false;
+    }
+    if (mergeForeignLocalUrls.has(url)) {
+      return false;
+    }
+    // #ifdef APP-HARMONY
+    return isAuthProtectedFileUrl(url) != true;
+    // #endif
+    // #ifndef APP-HARMONY
+    return true;
+    // #endif
+  }
+
+  /** 可入滑动预览列表的图：ak 直链（带临时签名免鉴权）与 temp/blob 展示地址可入；
+   *  空地址、发送端本机路径、未解析的 /api/f/ 受保护直链剔除（预览器带不了 Bearer
+   *  或本机根本没这文件，进去必空白）。 */
   function isPreviewableMediaImage(url: string): boolean {
-    return url.length > 0 && isAuthProtectedFileUrl(url) != true;
+    if (url.length == 0) {
+      return false;
+    }
+    if (mergeForeignLocalUrls.has(url)) {
+      return false;
+    }
+    if (mergeImgAkOrigins.has(url)) {
+      return true;
+    }
+    return isAuthProtectedFileUrl(url) != true;
   }
 
   /** 全记录可预览图片（升序 = 视觉顺序，跨条目连续滑动）。 */
@@ -259,21 +424,253 @@
     return urls;
   }
 
-  /** 缩略图点击：全屏放大（全记录多图滑动；被剔除的未解析受保护图回落单张旧路径）。 */
-  function handleImageTap(img: ImMergeMedia): void {
+  /** 缩略图点击：全屏放大（全记录多图滑动）。仍是未解析的受保护原址时先解析出可展示
+   *  地址再预览——previewImageCompat 带不了 Bearer，直接喂 /api/f/ 必然打不开
+   *  （真机「点了没反应」的根因），解析失败才提示加载失败。 */
+  async function handleImageTap(img: ImMergeMedia): Promise<void> {
     if (img.url.length == 0) {
       return;
     }
+    // 快照存的是发送端本机路径：本端没有这个文件，预览必空白 → 直接提示（历史脏数据兜底）
+    if (mergeForeignLocalUrls.has(img.url)) {
+      uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+      return;
+    }
+    let url = img.url;
+    // 未解析的原始受保护地址才需现场解析：ak 直链（已登记原址映射）与 temp/blob 直接可预览
+    if (isAuthProtectedFileUrl(url) && mergeImgAkOrigins.has(url) != true) {
+      try {
+        url = await resolveMergeImage(url, true);
+      } catch (_e) {
+        url = img.url;
+      }
+      if (pageDisposed) {
+        return;
+      }
+      // ak 直链的地址仍属 /api/f/ 形态但已带临时签名，可预览；只有解析后仍为原始
+      // 受保护地址（解析终态失败）才判定打不开
+      if (isAuthProtectedFileUrl(url) && mergeImgAkOrigins.has(url) != true) {
+        uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+        return;
+      }
+      img.url = url;
+      scheduleMediaTableRefresh();
+    }
     const urls = collectPreviewImages();
-    if (urls.indexOf(img.url) >= 0) {
-      previewImageCompat(urls, img.url);
+    if (urls.indexOf(url) >= 0) {
+      previewImageCompat(urls, url);
     } else {
-      previewImageCompat([img.url], img.url);
+      previewImageCompat([url], url);
     }
   }
 
+  /** 缩略图加载失败：ak 直链过期/该端不跟 302 时作废缓存、按原始受保护地址整段下载
+   *  重来一次（每张图每页至多一次，坏图不无限循环；成功才换地址，失败保留原样）。
+   *  ★原始受保护地址的首次失败是常态（<image> 带不了 Bearer），解析中会换地址重载，
+   *  这里查不到 ak 原址映射即直接返回（聊天页 handleImageRenderError 同口径）。 */
   function handleImageRenderError(img: ImMergeMedia): void {
-    console.error("[MergeImg] 缩略图渲染失败 src=" + img.url);
+    const src = img.url;
+    console.error("[MergeImg] 缩略图渲染失败 src=" + src);
+    const origin = mergeImgAkOrigins.get(src);
+    if (origin == null || mergeImgSelfHealed.has(origin)) {
+      return;
+    }
+    mergeImgSelfHealed.add(origin);
+    mergeImgResolved.delete(origin);
+    mergeImgAkOrigins.delete(src);
+    resolveMergeImage(origin, false)
+      .then((resolved: string): void => {
+        if (pageDisposed) {
+          return;
+        }
+        if (resolved != origin && resolved != img.url) {
+          img.url = resolved;
+          scheduleMediaTableRefresh();
+        }
+      })
+      .catch((_e: any | null): void => {
+        // 下载兜底也失败：维持原样（终态由日志可查）
+      });
+  }
+
+  // ===== 正文链接分段（合并快照正文是纯文本；[标题](url) 与裸 http(s) 地址按链接段渲染，
+  // 口径与聊天正文 parseSegs 的链接部分一致——快照不存富文本标记，只拆链接两种形态） =====
+
+  /** 正文分段：文本段 / 链接段。 */
+  class MfdTextSeg {
+    text: string = "";
+    link: boolean = false;
+    url: string = "";
+  }
+
+  /** 分段缓存（同一段正文只解析一次；快照正文在页面生命周期内不会变）。 */
+  const mfdTextSegCache = new Map<string, MfdTextSeg[]>();
+
+  /** 裸链接字符口径（chat.uvue isBareUrlChar 同款）：ASCII 可见字符，排除空白/引号/
+   *  尖括号/反引号/花括号/竖线/反斜杠/脱字符，>0x7f（CJK/emoji）截断。 */
+  function isMfdBareUrlChar(code: number | null): boolean {
+    if (code == null || code <= 0x20 || code >= 0x7f) {
+      return false;
+    }
+    if (code == 0x22 || code == 0x3c || code == 0x60 || code == 0x7b ||
+        code == 0x7d || code == 0x7c || code == 0x5c || code == 0x5e) {
+      return false;
+    }
+    return true;
+  }
+
+  /** 常见 HTML 实体还原（后端正文里的 URL 常被转义成 &amp; 等，直接打开会 403/404）。 */
+  function unescapeMfdEntities(s: string): string {
+    if (s.indexOf("&") < 0) {
+      return s;
+    }
+    let out = s.split("&amp;").join("&");
+    out = out.split("&lt;").join("<");
+    out = out.split("&gt;").join(">");
+    out = out.split("&quot;").join("\"");
+    out = out.split("&#39;").join("'");
+    return out;
+  }
+
+  function pushMfdSeg(out: MfdTextSeg[], text: string): void {
+    if (text.length == 0) {
+      return;
+    }
+    const seg = new MfdTextSeg();
+    seg.text = text;
+    out.push(seg);
+  }
+
+  /** 纯文本段再拆裸 http(s) 地址（整段按链接渲染；末尾孤立标点回退给正文）。 */
+  function appendMfdPlainSegs(out: MfdTextSeg[], text: string): void {
+    if (text.length == 0) {
+      return;
+    }
+    let plainStart = 0;
+    let i = 0;
+    while (i < text.length) {
+      const httpAt = text.indexOf("http://", i);
+      const httpsAt = text.indexOf("https://", i);
+      let start = -1;
+      if (httpAt >= 0 && (httpsAt < 0 || httpAt <= httpsAt)) {
+        start = httpAt;
+      } else if (httpsAt >= 0) {
+        start = httpsAt;
+      }
+      if (start < 0) {
+        break;
+      }
+      const protoLen = text.charAt(start + 4) == "s" ? 8 : 7;
+      let end = start;
+      while (end < text.length) {
+        if (!isMfdBareUrlChar(text.charCodeAt(end))) {
+          break;
+        }
+        end++;
+      }
+      while (end > start + protoLen) {
+        const tail = text.charAt(end - 1);
+        if (tail == "." || tail == "," || tail == ";" || tail == ":" || tail == "!" ||
+            tail == "?" || tail == ")" || tail == "]" || tail == "}" || tail == "'" || tail == "\"") {
+          end--;
+        } else {
+          break;
+        }
+      }
+      if (end <= start + protoLen) {
+        i = start + 1;
+        continue;
+      }
+      pushMfdSeg(out, text.substring(plainStart, start));
+      const clean = unescapeMfdEntities(text.substring(start, end));
+      const linkSeg = new MfdTextSeg();
+      linkSeg.text = clean;
+      linkSeg.link = true;
+      linkSeg.url = clean;
+      out.push(linkSeg);
+      i = end;
+      plainStart = i;
+    }
+    pushMfdSeg(out, text.substring(plainStart));
+  }
+
+  /** 正文 → 分段：先拆 [标题](url) 链接（接受 http(s) 与站内相对路径），余下文本再拆裸链接。 */
+  function buildMfdTextSegs(text: string): MfdTextSeg[] {
+    const out: MfdTextSeg[] = [];
+    let plainStart = 0;
+    let i = 0;
+    while (i < text.length) {
+      const openAt = text.indexOf("[", i);
+      if (openAt < 0) {
+        break;
+      }
+      const closeAt = text.indexOf("]", openAt + 1);
+      if (closeAt < 0 || closeAt == openAt + 1) {
+        i = openAt + 1;
+        continue;
+      }
+      if (closeAt + 1 >= text.length || text.charAt(closeAt + 1) != "(") {
+        i = openAt + 1;
+        continue;
+      }
+      const urlEnd = text.indexOf(")", closeAt + 2);
+      if (urlEnd < 0) {
+        i = openAt + 1;
+        continue;
+      }
+      const rawUrl = text.substring(closeAt + 2, urlEnd).trim();
+      const isHttp = rawUrl.indexOf("http://") == 0 || rawUrl.indexOf("https://") == 0;
+      const isSiteRelative = rawUrl.indexOf("/") == 0 && rawUrl.indexOf("//") != 0;
+      if (rawUrl.length == 0 || (!isHttp && !isSiteRelative)) {
+        i = openAt + 1;
+        continue;
+      }
+      appendMfdPlainSegs(out, text.substring(plainStart, openAt));
+      const linkSeg = new MfdTextSeg();
+      linkSeg.text = text.substring(openAt + 1, closeAt);
+      linkSeg.link = true;
+      linkSeg.url = unescapeMfdEntities(rawUrl);
+      out.push(linkSeg);
+      i = urlEnd + 1;
+      plainStart = i;
+    }
+    appendMfdPlainSegs(out, text.substring(plainStart));
+    return out;
+  }
+
+  /** 模板入口：取一条记录的正文分段（无文本返回空数组；结果按正文内容缓存）。 */
+  function textSegsOf(it: ImMergeItem): MfdTextSeg[] {
+    const text = it.text;
+    if (text.length == 0) {
+      return [] as MfdTextSeg[];
+    }
+    const cached = mfdTextSegCache.get(text);
+    if (cached != null) {
+      return cached;
+    }
+    const segs = buildMfdTextSegs(text);
+    mfdTextSegCache.set(text, segs);
+    return segs;
+  }
+
+  /** 正文链接段点击：站内相对路径补域名 → 受保护 /api/f/ 走文件预览页（webview 带不了
+   *  Bearer）→ 其余按消息外链走站内 webview 页（与聊天正文 handleSegTap 同口径）。 */
+  function handleTextSegTap(sg: MfdTextSeg): void {
+    if (sg.link != true || sg.url.length == 0) {
+      return;
+    }
+    let url = sg.url;
+    const base = getApiBaseUrl();
+    if (url.indexOf("/") == 0 && url.indexOf("//") != 0 && base.length > 0) {
+      url = base + url;
+    }
+    if (isAuthProtectedFileUrl(url)) {
+      openAuthProtectedLinkUrl(url, sg.text, convId.value).catch((_e: any | null): void => {
+        uni.showToast({ title: t("Mobile.Message.loadFailed"), icon: "none" });
+      });
+      return;
+    }
+    handleExternalLinkInWebview(url, sg.text);
   }
 
   // ===== 语音附件播放（chat.uvue 语音块同款移植：页面级单一 InnerAudioContext，
@@ -513,6 +910,11 @@
       stopMfdAudio();
       return;
     }
+    // 快照存的是发送端本机路径：本端没有这个文件 → 提示（历史脏数据兜底）
+    if (mergeForeignLocalUrls.has(a.url)) {
+      uni.showToast({ title: t("Mobile.Message.audioPlayFailed"), icon: "none" });
+      return;
+    }
     const ctx = ensureMfdAudioCtx();
     ctx.stop();
     playingAudioId.value = a.uid;
@@ -669,6 +1071,10 @@
         const vids = rows[i].videos;
         for (let j = 0; j < vids.length; j++) {
           const v = vids[j];
+          // 发送端本机路径：本端取不到，预载只会白跑（点按另有提示，见 handleVideoTap）
+          if (mergeForeignLocalUrls.has(v.url)) {
+            continue;
+          }
           if (v.url.length > 0 && v.playUrl.length == 0) {
             if (pageDisposed) {
               return;
@@ -687,6 +1093,11 @@
    *  中央键/控制条仍归原生，各自消费各自的触摸不会双触发）；未挂载=占位卡 ▶ 手动预载。 */
   function handleVideoTap(v: ImMergeMedia): void {
     if (v.url.length == 0) {
+      return;
+    }
+    // 快照存的是发送端本机路径：本端没有这个文件 → 提示（历史脏数据兜底）
+    if (mergeForeignLocalUrls.has(v.url)) {
+      uni.showToast({ title: t("Mobile.Message.videoPlayFailed"), icon: "none" });
       return;
     }
     if (v.playUrl.length > 0) {
@@ -918,6 +1329,45 @@
           auds[j2].uid = "a" + i + "-" + j2;
         }
       }
+      // ★排查探针（真机/鸿蒙看不到 console.log，探针必须 console.error）：先确认快照里
+      // 到底有没有图片附件——「详情页不出图」若 images=0 就是数据侧没下发，不是渲染问题。
+      let imgTotal = 0;
+      let firstImgUrl = "";
+      let foreignTotal = 0;
+      for (let k = 0; k < rows.length; k++) {
+        const imgs = rows[k].images;
+        imgTotal += imgs.length;
+        if (firstImgUrl.length == 0 && imgs.length > 0) {
+          firstImgUrl = imgs[0].url;
+        }
+        // 快照原值里的发送端本机路径：登记为不可用（不挂 <image>、不解析、点按提示）。
+        // 只登记解析前的原值；本端解析出的 temp 地址不会落进这个集合
+        for (let m = 0; m < imgs.length; m++) {
+          if (isForeignLocalMediaUrl(imgs[m].url)) {
+            mergeForeignLocalUrls.add(imgs[m].url);
+            foreignTotal++;
+            console.error(`[MergeImg] 附件地址是发送端本机路径，跨端不可用 url=${imgs[m].url}`);
+          }
+        }
+        // 音视频同源问题（旧快照可能存发送端本地路径）：同样不预载、点按提示
+        const vids = rows[k].videos;
+        for (let mv = 0; mv < vids.length; mv++) {
+          if (isForeignLocalMediaUrl(vids[mv].url)) {
+            mergeForeignLocalUrls.add(vids[mv].url);
+            foreignTotal++;
+            console.error(`[MergeMedia] 视频地址是发送端本机路径，跨端不可用 url=${vids[mv].url}`);
+          }
+        }
+        const auds = rows[k].audios;
+        for (let ma = 0; ma < auds.length; ma++) {
+          if (isForeignLocalMediaUrl(auds[ma].url)) {
+            mergeForeignLocalUrls.add(auds[ma].url);
+            foreignTotal++;
+            console.error(`[MergeMedia] 语音地址是发送端本机路径，跨端不可用 url=${auds[ma].url}`);
+          }
+        }
+      }
+      console.error(`[MergeRec] items=${rows.length} images=${imgTotal} foreign=${foreignTotal} firstUrl=${firstImgUrl}`);
       resolveMergeMedia();
       preloadMfdVideos();
     }
@@ -1089,6 +1539,11 @@
     color: #33323d;
   }
 
+  /* 正文链接段：微信同款链接蓝（与聊天正文 chat-md--link 一致），点击在外链 webview 打开 */
+  .mfd-row__link {
+    color: #576b95;
+  }
+
   /* ===== 媒体附件（转发快照）===== */
   /* 图片缩略图网格（240rpx 方图，自动换行；多图快照横向铺开） */
   .mfd-media {
@@ -1098,10 +1553,15 @@
     flex-wrap: wrap;
   }
 
-  .mfd-media__img {
+  .mfd-media__cell {
     width: 240rpx;
     height: 240rpx;
     margin: 4rpx 12rpx 4rpx 0;
+  }
+
+  .mfd-media__img {
+    width: 240rpx;
+    height: 240rpx;
     border-radius: 12rpx;
     background-color: #ecebf1;
   }

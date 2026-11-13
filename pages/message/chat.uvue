@@ -2057,7 +2057,7 @@
   import { preserveImPrependAnchor, forceScrollToElement } from "@/utils/im/imPrependAnchor";
   import { isAppInBackground } from "@/utils/appLifecycle";
   import { EVENT_TYPE } from "@/constants/event.constants";
-  import { classifyKind, extOf, urlExtOf } from "@/utils/imChatAttachments";
+  import { classifyKind, extOf, isValidKind, urlExtOf } from "@/utils/imChatAttachments";
   import {
     ChatScrollMemo,
     getCachedChatRecords,
@@ -5096,19 +5096,30 @@
                   continue;
                 }
                 const media = new ImMergeMedia();
-                media.kind = readString(mAtts[j], "kind");
                 media.url = url;
                 media.fileName = readString(mAtts[j], "fileName");
                 media.size = readNumber(mAtts[j], "size", 0);
+                // kind 缺省/认不出（老客户端快照、手改库回灌）按后缀重分类——PC
+                // refineAttachmentKind 同口径（DEV-430）；否则快照里的图片会落成文件卡片，
+                // 详情页既出不了图也预览不了（2026-11-13 反馈的「图不显示」隐患）。
+                // 后缀线索优先取 fileName（受保护 /api/f/{id} 的 URL 段没有后缀）
+                const declaredKind = readString(mAtts[j], "kind");
+                const extHint = media.fileName.length > 0 ? media.fileName : url;
+                let kind = isValidKind(declaredKind) ? declaredKind : classifyKind("", extHint);
+                // kind=file 但后缀是媒体型（文件消息视频/图片端上按媒体渲染，readMsgRow
+                // 同款 classifyKind 重判）：详情页走内联 <video>/缩略图，不落文件卡片
+                if (kind == "file") {
+                  const inferred = classifyKind("", extHint);
+                  if (inferred != "file") {
+                    kind = inferred;
+                  }
+                }
+                media.kind = kind;
                 if (media.kind == "image") {
                   it.images.push(media);
                 } else if (media.kind == "audio") {
                   it.audios.push(media);
                 } else if (media.kind == "video") {
-                  it.videos.push(media);
-                } else if (classifyKind("", url) == "video") {
-                  // kind=file 但实为视频文件（文件消息视频端上按视频渲染，readMsgRow 同款
-                  // classifyKind 重判）：详情页也走内联 <video>，不落文件卡片
                   it.videos.push(media);
                 } else {
                   it.files.push(media);
@@ -5981,19 +5992,71 @@
     return out + "…";
   }
 
+  /** 展示地址 → 原始服务端地址（全量，含 temp / blob / 本地乐观预览）：合并转发快照必须存
+   *  服务端地址，而 row.imageUrl / att.url 会被解析回填换写成本机 temp——真机事故：鸿蒙端
+   *  转发 → 快照写进 `/data/storage/…` 本机沙箱路径 → 接收端（Android）永远画不出图。
+   *  登记点：resolveChatImage（受保护图解析）、resolveSentImageRemote / resolveSentAttRemote
+   *  （本地优先预览 ↔ 服务端地址）；会话切换时随 releaseChatImages 清空。 */
+  const chatMediaOrigins = new Map<string, string>();
+
+  /** 是否可跨设备取用的服务端地址：http(s) 绝对地址，或站内根相对路径（/api/… /static/…）。
+   *  本机地址（鸿蒙沙箱 /data/storage/…、Android /storage/…、iOS /var/ /private/…、
+   *  file://、blob:、content://）在别的端必然取不到。 */
+  function isCrossDeviceMediaUrl(url: string): boolean {
+    if (url.length == 0) {
+      return false;
+    }
+    if (url.indexOf("http://") == 0 || url.indexOf("https://") == 0) {
+      // 畸形样本防线：本站域名 + 本机沙箱路径（旧版本把 /data/storage/… 当站内相对路径
+      // 补成域名后的形态）同样不可用
+      return url.indexOf("/data/storage/") < 0 && url.indexOf("/storage/emulated/") < 0;
+    }
+    if (url.indexOf("/") != 0 || url.indexOf("//") == 0) {
+      return false;
+    }
+    if (url.indexOf("/data/") == 0 || url.indexOf("/storage/") == 0 ||
+        url.indexOf("/var/") == 0 || url.indexOf("/private/") == 0) {
+      return false;
+    }
+    return true;
+  }
+
+  /** 快照用地址：展示地址反查原始服务端地址；查不到且本身不是服务端地址 → 空串
+   *  （这条附件不写进快照——写一条别的端永远画不出的本机路径比丢弃更糟）。 */
+  function forwardMediaUrlOf(url: string): string {
+    if (url.length == 0) {
+      return "";
+    }
+    const origin = chatMediaOrigins.get(url);
+    let candidate: string = origin != null ? origin : url;
+    if (!isCrossDeviceMediaUrl(candidate)) {
+      console.error(`[Forward] 附件地址不是服务端地址，快照丢弃 url=${candidate}`);
+      return "";
+    }
+    // 站内根相对路径补成绝对地址：接收端（含 PC）不必各自猜域名
+    if (candidate.indexOf("/") == 0 && candidate.indexOf("//") != 0) {
+      const base = getApiBaseUrl();
+      if (base.length > 0) {
+        candidate = base + candidate;
+      }
+    }
+    return candidate;
+  }
+
   /** 单条消息的附件快照 JSON（[{kind,url,fileName}]；url 必填非空的项才收，size 可选缺省）。 */
   function buildForwardAttachmentsJson(m: ImMsgRow): string {
     let json = "[";
     let first = true;
     const push = (kind: string, url: string, fileName: string): void => {
-      if (url.length == 0) {
+      const serverUrl = forwardMediaUrlOf(url);
+      if (serverUrl.length == 0) {
         return;
       }
       if (first != true) {
         json += ",";
       }
       first = false;
-      json += `{"kind":"${kind}","url":${JSON.stringify(url)},"fileName":${JSON.stringify(fileName)}}`;
+      json += `{"kind":"${kind}","url":${JSON.stringify(serverUrl)},"fileName":${JSON.stringify(fileName)}}`;
     };
     if (m.msgType == "image" && m.imageUrl.length > 0) {
       push("image", m.imageUrl, "");
@@ -7928,9 +7991,13 @@
         return url;
       }
       if (resolved.startsWith("blob:")) chatImageUrls.add(resolved);
-      // ak 直链仍属 /api/f/ 判定：登记原址供 @error 自愈回落整段下载（temp 地址不登记）
-      if (resolved != url && isAuthProtectedFileUrl(resolved)) {
-        chatImageAkOrigins.set(resolved, url);
+      if (resolved != url) {
+        // 展示地址反查原始服务端地址（合并转发快照用，见 chatMediaOrigins 注释）
+        chatMediaOrigins.set(resolved, url);
+        // ak 直链仍属 /api/f/ 判定：登记原址供 @error 自愈回落整段下载（temp 地址不登记）
+        if (isAuthProtectedFileUrl(resolved)) {
+          chatImageAkOrigins.set(resolved, url);
+        }
       }
       return resolved;
     } finally {
@@ -8488,6 +8555,7 @@
     // ak 原址登记/自愈记账一并清空：会话切换后地址全部失效，防悬挂引用
     chatImageAkOrigins.clear();
     chatImageAkRetried.clear();
+    chatMediaOrigins.clear();
     // 头像解析产物一并回收：会话切换/页面卸载后 blob 已失效，缓存须清空防悬挂引用
     avatarBlobUrls.forEach((url: string) => { releaseDisplayImageUrl(url); });
     avatarBlobUrls.clear();
@@ -9160,6 +9228,11 @@
     remoteUrl: string,
     task: Promise<string> | null = null,
   ): void {
+    // 本地优先态：本地预览路径 ↔ 服务端地址先记下来（此刻转发就是要按服务端地址入快照，
+    // 见 chatMediaOrigins）；远端补齐成功后 resolveChatImage 内还会补登记 temp 那一段
+    if (localPreview.length > 0 && remoteUrl.length > 0) {
+      chatMediaOrigins.set(localPreview, remoteUrl);
+    }
     const pending: Promise<string> = task != null ? task : resolveChatImage(remoteUrl, 300, true);
     pending
       .then((resolved: string) => {
@@ -9188,6 +9261,10 @@
     localPreview: string,
     remoteUrl: string,
   ): void {
+    // 本地预览 ↔ 服务端地址登记（同 resolveSentImageRemote）
+    if (localPreview.length > 0 && remoteUrl.length > 0) {
+      chatMediaOrigins.set(localPreview, remoteUrl);
+    }
     resolveChatImage(remoteUrl, 260, true)
       .then((resolved: string) => {
         if (!isChatCurrent()) return;
@@ -9233,6 +9310,11 @@
         return;
       }
       const file = up.file;
+      // 本地预览路径 ↔ 服务端地址登记：发送确认前的乐观窗口里 row.imageUrl / videoUrl
+      // 还是本机路径，此刻转发必须按服务端地址入快照（见 chatMediaOrigins）
+      if (localPath.length > 0 && file.url.length > 0 && localPath != file.url) {
+        chatMediaOrigins.set(localPath, file.url);
+      }
       // 鸿蒙：上传一拿到远端地址就并行把它换成本地 temp（与下面的发送 POST 同时跑），
       // 本地预览不可用（媒体库 URI / 受保护原址）时确认行直接拿它起手，省掉
       // 「先灰块、等 1~2s 再出图」。earlyPreview 只当「已就绪」快照用，不 await：
@@ -9512,6 +9594,10 @@
         return;
       }
       const file = up.file;
+      // 本机 WAV ↔ 服务端地址登记（乐观窗口内转发按服务端地址入快照，见 chatMediaOrigins）
+      if (wavPath.length > 0 && file.url.length > 0 && wavPath != file.url) {
+        chatMediaOrigins.set(wavPath, file.url);
+      }
       const res = await apiImSendMediaMsg(
         convId.value,
         "audio",

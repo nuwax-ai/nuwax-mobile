@@ -2675,6 +2675,27 @@
     return clean;
   }
 
+  /**
+   * 鸿蒙空文档补位用的零宽空格（见 buildComposerEditorObserverScript 的 harmonyCaretAnchor）。
+   * 它只应存在于编辑器 DOM 里给系统做光标锚点：展示/发送用的纯文本必须剔除，
+   * 否则会出现「看着是空输入但发送按钮可点」或把不可见字符发出去；
+   * 但 indexed 文本（@ 触发、mention 原子替换下标）必须保留，才能与 Quill 索引对齐。
+   */
+  const COMPOSER_ANCHOR_CHAR = String.fromCharCode(0x200B);
+
+  function stripComposerAnchor(raw: string): string {
+    if (raw.length == 0 || raw.indexOf(COMPOSER_ANCHOR_CHAR) < 0) return raw;
+    let out = "";
+    let rest = raw;
+    let idx = rest.indexOf(COMPOSER_ANCHOR_CHAR);
+    while (idx >= 0) {
+      out += rest.substring(0, idx);
+      rest = rest.substring(idx + 1);
+      idx = rest.indexOf(COMPOSER_ANCHOR_CHAR);
+    }
+    return out + rest;
+  }
+
   /** editor 内 mention（技能/资料）→ 文本：统一序列化为 PC 约定的 @名称（输入态的图标前缀不外发） */
   function editorPlainTextFromDelta(deltaRaw: any | null): string {
     if (deltaRaw == null) return "";
@@ -2704,7 +2725,7 @@
       }
     }
     if (text.endsWith("\n")) text = text.substring(0, text.length - 1);
-    return text;
+    return stripComposerAnchor(text);
   }
 
   /** 编辑中删除 mention 时同步 selectedSkills/selectedDocs（chips 与 editor 单一数据源） */
@@ -3125,9 +3146,27 @@
     // #endif
   }
 
+  /**
+   * 鸿蒙专用：把编辑器首行内容整体右移 2px，让「空文档光标」不落在 x=0。
+   *
+   * 2026-11-13 真机对照（同一份代码、只看光标矩形）：
+   *  - 空文档：`caret=0,3,0,19` → 系统粘贴浮窗跑到页面顶部；
+   *  - 输入 `abc` 后长按：`caret=26,3,0,19` → 浮窗正确贴在光标处。
+   * 两次都是 collapsed 光标、矩形高度一致，差异只有 left 是否为 0：原生侧把
+   * `left == 0` 当成「没有锚点」而回落窗口原点。给 `.ql-editor` 恒定加 2px 左内边距
+   * （不是只在空态加）后，空文档光标落到 `2,3,0,19`，浮窗恢复正常；
+   * 正文与光标一起右移，视觉无感，也不会出现「打出第一个字时文字右跳」。
+   */
+  function injectHarmonyCaretLeftStyle(web: UniWebViewElement): void {
+    // #ifdef APP-HARMONY
+    web.evalJS("(function(){var id='nuwax-harmony-caret-left';function apply(){if(!document.head||!document.querySelector('.ql-editor'))return false;var s=document.getElementById(id);if(!s){s=document.createElement('style');s.id=id;document.head.appendChild(s)}s.textContent='.ql-editor{padding-left:2px!important}';return true}if(apply())return;if(window.__nuwaxCaretLeftTimer)return;var n=0;window.__nuwaxCaretLeftTimer=setInterval(function(){if(apply()||++n>=20){clearInterval(window.__nuwaxCaretLeftTimer);window.__nuwaxCaretLeftTimer=null}},100)})();");
+    // #endif
+  }
+
   function injectNativePlaceholderStyle(web: UniWebViewElement): void {
     // editor 的独立 WebView 可能晚于 EditorContext 就绪；在其内部等待 Quill 挂载。
     web.evalJS("(function(){var id='nuwax-composer-placeholder-style';function apply(){if(!document.head||!document.querySelector('.ql-editor'))return false;var style=document.getElementById(id);if(!style){style=document.createElement('style');style.id=id;document.head.appendChild(style)}style.textContent='.ql-editor.ql-blank::before{font-style:normal!important;font-weight:400!important;color:#b6b5c1!important;font-size:16px!important}';return true}if(apply())return;if(window.__nuwaxPlaceholderStyleTimer)return;var attempts=0;window.__nuwaxPlaceholderStyleTimer=setInterval(function(){if(apply()||++attempts>=20){clearInterval(window.__nuwaxPlaceholderStyleTimer);window.__nuwaxPlaceholderStyleTimer=null}},100)})();");
+    injectHarmonyCaretLeftStyle(web);
   }
 
   function retryNativePlaceholderStyle(attempt: number): void {
@@ -3161,11 +3200,17 @@
     // #ifdef APP-IOS
     watchIOSViewport = isHomeScene.value;
     // #endif
+    let harmonyCaretAnchor = false;
+    // #ifdef APP-HARMONY
+    // 鸿蒙空文档没有真实文本节点，collapsed range 的 rect 全 0，系统长按「粘贴」浮窗
+    // 会落到页面顶部；由注入脚本在空文档时常驻一个零宽锚点（详见该脚本注释）。
+    harmonyCaretAnchor = true;
+    // #endif
     if (web != null) {
       if (stopNativeComposerLayout != null) stopNativeComposerLayout!();
       const nativeLayoutListener = web.addEventListener("message", handleNativeComposerLayout);
       stopNativeComposerLayout = (): void => web.removeEventListener("message", nativeLayoutListener);
-      (web as UniWebViewElement).evalJS(buildComposerEditorObserverScript(watchIOSViewport));
+      (web as UniWebViewElement).evalJS(buildComposerEditorObserverScript(watchIOSViewport, harmonyCaretAnchor));
       injectNativePlaceholderStyle(web as UniWebViewElement);
     }
     // #endif
@@ -3203,6 +3248,9 @@
       const value = ops[i]["insert"];
       result += typeof value == "string" ? `${value}` : "\ufffc";
     }
+    // ★ 这里保持 Quill 原始索引（不剔除鸿蒙的零宽锚点）：本函数的返回值与
+    // editorInputCursor、mention 原子替换的 retain/delete 下标共用同一坐标系，
+    // 剔除会让后续替换错位。展示/发送用的纯文本走 editorPlainTextFromDelta（已剔除）。
     return result.endsWith("\n") ? result.substring(0, result.length - 1) : result;
   }
 
@@ -3308,6 +3356,7 @@
     // #endif
     let rawText = e.detail.text != null ? `${e.detail.text}` : "";
     if (rawText.endsWith("\n")) rawText = rawText.substring(0, rawText.length - 1);
+    rawText = stripComposerAnchor(rawText);
     lastEditorRawText = rawText;
     const value = editorPlainTextFromDelta(e.detail.delta);
     lastEditorText = value;

@@ -5,9 +5,8 @@ import { transformWithEsbuild } from "vite";
 /**
  * 移动端纯逻辑单测配置（对齐 PC 端 vitest 模式）。
  *
- * - 仅覆盖可脱离 uni 运行时的纯函数层（如 V2 轨迹投影 conversationTrace.uts），
- *   不引入 uvue 组件 / uni.* API
- * - .uts 是 TS 方言：先按 uni 条件编译语义（// #ifdef ... // #endif）以 H5 平台
+ * - 覆盖纯函数及功能生命周期。生命周期测试使用显式的 uni/native/系统 Kit mock。
+ * - .uts / .ets 使用 TS loader。先按 uni 条件编译语义（// #ifdef ... // #endif）以 H5 平台
  *   求值剥离无关分支（同一符号在 H5 / 非 H5 各有一份实现，node 下会重复导出），
  *   再用 esbuild 以 ts loader 转译（vite 官方 transformWithEsbuild 方式）
  * - `@` 别名指向仓库根（与 uni 编译一致）；H5 分支的 `import "diff"` 已在 dependencies
@@ -58,9 +57,11 @@ function stripConditionalCompilation(code: string): string {
 
 export default defineConfig({
   resolve: {
-    alias: {
-      "@": path.resolve(__dirname),
-    },
+    alias: [
+      // HBuilderX resolves uni_modules by platform. Node tests use the H5 entry.
+      { find: /^@\/uni_modules\/nuwax-voip$/, replacement: path.resolve(__dirname, "uni_modules/nuwax-voip/utssdk/web/index.uts") },
+      { find: "@", replacement: path.resolve(__dirname) },
+    ],
     // 依赖链里存在不带后缀的 `@/utils/xxx` import（.uts 文件间引用），
     // 让 vite 按 ts 方式解析 .uts 扩展
     extensions: [
@@ -79,10 +80,10 @@ export default defineConfig({
       name: "uts-as-ts",
       enforce: "pre",
       transform(code, id) {
-        if (id.endsWith(".uts")) {
+        if (id.endsWith(".uts") || id.endsWith(".ets")) {
           return transformWithEsbuild(
             stripConditionalCompilation(code),
-            id.replace(/\.uts$/, ".ts"),
+            id.replace(/\.(uts|ets)$/, ".ts"),
             { loader: "ts" },
           );
         }

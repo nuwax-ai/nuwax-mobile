@@ -1,0 +1,1103 @@
+<template>
+  <!--
+    发起会议（伙伴页「会议」tab 的第一个入口）。
+
+    ★本期纯 REST 范围：一次性完成「建房」（POST /meetings/rtc/rooms，origin=1 落一条
+    im_meeting），建房成功那一刻就 `redirectTo` 「会议信息」页（`im-meeting-room`，
+    会中页占位）——**不停「已创建」结果屏**；返回直接回伙伴页会议 tab。
+    邀请在后台发，发完用 toast 在信息页上报结果。真正的音视频会中能力随媒体层后续分期。
+
+    ★文案与交互逐项对齐 PC `MeetingPane.tsx` 的「发起会议」弹窗：
+      会议主题（含语音入会提示）→ 会议号（换一个 / 复制 / 复制邀请）→ 邀请参会人 → 允许游客。
+      ★PC 弹窗里**没有**「会议类型」：一律语音开局，进会后点「开视频」即可，这里同样去掉。
+
+    ★会议号/分享 slug 在**进页那一刻**生成，不是点提交时生成：
+    用户随时可能先复制邀请发出去，服务端建会用同一个值（另起一个号会让刚发出去的链接失效）。
+  -->
+  <view class="mc-page">
+    <safety-zone />
+
+    <!-- 顶部：返回 + 标题 -->
+    <view class="mc-header">
+      <view class="mc-header__btn" hover-class="mc-header__btn--active" @click="handleBack">
+        <back-chevron :size="20" color="#141416" />
+      </view>
+      <view class="mc-header__title-wrap">
+        <text class="mc-header__title">{{ t("Mobile.Meeting.create") }}</text>
+      </view>
+      <view class="mc-header__btn mc-header__btn--ghost" />
+    </view>
+
+    <scroll-view class="mc-body" direction="vertical" :show-scrollbar="false">
+      <!-- 表单态：★没有「会议已创建」结果屏——建房成功直接 redirectTo 会议信息页
+           （见 handleSubmit），返回即回到伙伴页会议 tab，不停在一个已经没用的中间屏上。 -->
+      <!-- 会议主题：不填就用会议号当标题（PC 同口径），并说明一律语音开局 -->
+        <view class="mc-card">
+          <text class="mc-label">{{ t("Mobile.Meeting.titleLabel") }}</text>
+          <input
+            class="mc-input"
+            v-model="titleText"
+            :maxlength="60"
+            :placeholder="t('Mobile.Meeting.createTitlePlaceholder')"
+            placeholder-style="color:#b0aebc"
+          />
+          <text class="mc-hint">{{ t("Mobile.Meeting.createTitleHint") }}</text>
+        </view>
+
+        <!-- 会议号（只读展示，进页已生成）：换一个 / 复制 / 复制邀请 -->
+        <view class="mc-card mc-card--row">
+          <text class="mc-label mc-label--inline">{{ t("Mobile.Meeting.roomNoLabel") }}</text>
+          <view class="mc-row-value">
+            <text class="mc-no">{{ formattedRoom }}</text>
+            <text class="mc-pill" hover-class="mc-pill--active" @click="handleRollRoomNo">{{ t("Mobile.Meeting.rollRoomNo") }}</text>
+            <text class="mc-pill" hover-class="mc-pill--active" @click="handleCopyNo">{{ t("Mobile.Meeting.copyNoShort") }}</text>
+            <text class="mc-pill" hover-class="mc-pill--active" @click="handleCopyInvite">{{ t("Mobile.Meeting.copyInvite") }}</text>
+          </view>
+        </view>
+
+        <!-- 邀请参会人：选人盒与「创建群组 → 用户」/ 预约会议的添加参与者**同一套**
+             （灰盒 + 已选芯片 + 尾部输入 + 右侧放大镜）；聚焦即在下方展开候选面板。 -->
+        <view class="mc-card">
+          <text class="mc-label">{{ t("Mobile.Meeting.inviteesLabel") }}</text>
+          <view class="mc-tagbox" @click="focusInviteeBox">
+            <view class="mc-tagbox-main">
+              <view
+                v-for="p in inviteeTags"
+                :key="p.userId"
+                class="mc-tag"
+                hover-class="mc-tag--active"
+                @click.stop="removeInvitee(p)"
+              >
+                <text class="mc-tag__text">{{ p.displayName }}</text>
+                <text class="mc-tag__x">×</text>
+              </view>
+              <view class="mc-tagbox-field">
+                <input
+                  class="mc-tagbox-input"
+                  v-model="inviteeKeyword"
+                  :focus="inviteeFocusRequest"
+                  :placeholder="t('Mobile.Meeting.inviteesPlaceholder')"
+                  placeholder-class="mc-ph"
+                  @focus="handleInviteeFocus"
+                  @blur="handleInviteeBlur"
+                />
+              </view>
+            </view>
+            <view class="mc-search-icon">
+              <svg-icon name="icon-Search" size="14" unit="px" color="#9a9aa2" />
+            </view>
+          </view>
+
+          <!-- 候选面板：聚焦即展开，输入框失焦即收起（延迟 180ms 收，避免「点结果」那一下
+               被 v-if 卸载点空；点中行会撤掉这次收起，选中不收起） -->
+          <view v-if="inviteePanelVisible" class="mc-panel">
+            <scroll-view class="mc-panel-list" direction="vertical" :show-scrollbar="false" :style="{ height: inviteeListHeight }">
+              <view v-if="inviteeListState == 'loading'" class="mc-panel-state">
+                <text class="mc-panel-state__text">{{ t("Mobile.Common.loading") }}</text>
+              </view>
+              <view v-else-if="inviteeListState == 'failed'" class="mc-panel-state" @click="retryInviteeList">
+                <text class="mc-panel-state__text">{{ t("Mobile.Meeting.participantsLoadFailed") }}</text>
+              </view>
+              <view v-else-if="inviteeView.length == 0" class="mc-panel-state">
+                <text class="mc-panel-state__text">{{ inviteeHasKeyword ? t("Mobile.AgentSearch.emptyResult") : t("Mobile.Meeting.participantsEmpty") }}</text>
+              </view>
+              <view v-else class="mc-panel-body">
+                <view
+                  v-for="p in inviteeView"
+                  :key="p.userId"
+                  class="mc-panel-row"
+                  hover-class="mc-panel-row--active"
+                  @click="toggleInvitee(p)"
+                >
+                  <text class="mc-panel-row__name text-ellipsis">{{ p.displayName }}</text>
+                  <view class="mc-panel-check" :class="{ 'mc-panel-check--on': isInviteeSelected(p.userId) }">
+                    <svg-icon v-if="isInviteeSelected(p.userId)" name="icon-Check" size="12" unit="px" color="#ffffff" />
+                  </view>
+                </view>
+              </view>
+            </scroll-view>
+          </view>
+
+          <text class="mc-hint">{{ t("Mobile.Meeting.inviteesHint") }}</text>
+        </view>
+
+        <!-- 允许游客：显式传服务端（缺省 true，不传等于对所有人开放）；提示随开关两态 -->
+        <view class="mc-card mc-card--row">
+          <view class="mc-row-main">
+            <text class="mc-label mc-label--inline">{{ t("Mobile.Meeting.allowGuestLabel") }}</text>
+            <text class="mc-hint">{{ allowGuest ? t("Mobile.Meeting.allowGuestHintOn") : t("Mobile.Meeting.allowGuestHintOff") }}</text>
+          </view>
+          <switch class="mc-switch" :checked="allowGuest" color="#5147ff" @change="handleAllowGuestChange" />
+        </view>
+
+        <view class="mc-submit">
+          <view
+            class="mc-primary"
+            :class="{ 'mc-primary--disabled': submitting }"
+            hover-class="mc-primary--active"
+            @click="handleSubmit"
+          >
+            <text class="mc-primary__text">{{ submitting ? t("Mobile.Meeting.creating") : t("Mobile.Meeting.start") }}</text>
+          </view>
+        </view>
+
+      <view class="mc-tail" />
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { getApiBaseUrl } from "@/constants/config";
+  import {
+    apiImContacts,
+    apiImCreateP2pConversation,
+    apiImSearchContacts,
+    apiImSendTextMsg,
+    getImDeviceId,
+    imDevicePlatform,
+  } from "@/servers/im";
+  import { apiImMeetingCreateRoom, IM_MEETING_CHANGED_EVENT } from "@/servers/imMeeting";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  // 会议数据变更广播（走仓内 eventBus，见 servers/imMeeting.uts 常量声明处）
+  import eventBus from "@/utils/eventBus";
+  import { generateUUID } from "@/utils/common";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { getCachedMyInfo } from "@/utils/im/myInfoCache";
+  import {
+    buildMeetingInviteText,
+    buildMeetingInviteUrl,
+    formatMeetingId,
+    makeMeetingNo,
+    makeShareSlug,
+  } from "@/utils/meeting/meetingLink";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 带插值的词条（如「已邀请 {count} 位参会人」）。 */
+  function tOf(key: string, params: Map<string, string | number>): string {
+    return translateFn(key, toI18nParams(params), "");
+  }
+
+  /** 参会人候选行（搜索结果与已选共用；只取 id + 展示名，选择器不画头像）。 */
+  class MeetingInvitee {
+    userId: string = "";
+    displayName: string = "";
+  }
+
+  /** 会议号 = LiveKit 房间名：进页生成，提交与复制邀请用的是同一个值。 */
+  const roomName = ref<string>("");
+  /** 分享 slug：链接里真正带的值（8-32 位 [a-z0-9]）。 */
+  let shareSlug = "";
+
+  const titleText = ref<string>("");
+  const allowGuest = ref<boolean>(false);
+  const submitting = ref<boolean>(false);
+
+  // ---------------------------------------------------------------- 参会人选择
+
+  /** 已选参会人（跨关键字切换保持；tag 芯片与提交都用它）。 */
+  const invitees = ref<MeetingInvitee[]>([]);
+  /** 我的联系人（打开面板时拉一次，status=1 且是真人，已排除自己）。 */
+  const inviteePool = ref<MeetingInvitee[]>([]);
+  /** idle | loading | ready | failed */
+  const inviteePoolState = ref<string>("idle");
+  let inviteePoolLoading = false;
+  const inviteeKeyword = ref<string>("");
+  /** 远程搜索结果（本地命中排在前，远程补其后，按 userId 去重）。 */
+  const inviteeRemote = ref<MeetingInvitee[]>([]);
+  /** idle | loading | done | failed */
+  const inviteeSearchState = ref<string>("idle");
+  let inviteeSearchTimer = -1;
+  let inviteeSearchSeq = 0;
+  /** 候选面板是否已展开：展开期间输入框失焦就收起（见 handleInviteeBlur）。 */
+  const inviteePanelVisible = ref<boolean>(false);
+  /** 输入框是否真的聚焦（只看它决定要不要边沿驱动一次 focus）。 */
+  const inviteeInputFocused = ref<boolean>(false);
+  /** 程序化聚焦请求（同建群页 focusRequest：false→nextTick→true 才是一次新的聚焦边沿）。 */
+  const inviteeFocusRequest = ref<boolean>(false);
+  /** 失焦收起面板的延迟句柄（<0 = 没有待执行的收起）。
+   *  ★为什么要延迟：原生 @blur 可能先于候选行 @click 派发，立刻 v-if 卸载会让那一下点空。 */
+  let inviteeBlurTimer = -1;
+
+  /** 取消待执行的「失焦收起」。点中候选行 / 重新聚焦时调用。 */
+  function cancelInviteeBlurCollapse(): void {
+    if (inviteeBlurTimer != -1) {
+      clearTimeout(inviteeBlurTimer);
+      inviteeBlurTimer = -1;
+    }
+  }
+
+  const formattedRoom = computed((): string => {
+    return formatMeetingId(roomName.value);
+  });
+
+  function readString(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    return raw != null ? `${raw}` : "";
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) {
+      return fallback;
+    }
+    const parsed = parseFloat(`${raw}`);
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function myUserId(): string {
+    const info = getCachedMyInfo();
+    return info != null ? info.userId : "";
+  }
+
+  function myDisplayName(): string {
+    const info = getCachedMyInfo();
+    return info != null ? info.displayName : "";
+  }
+
+  /** 联系人响应行：displayName 服务端已按 remark > nickName > userName 算好，缺键才回落。 */
+  function readPoolRow(item: UTSJSONObject, selfId: string): MeetingInvitee | null {
+    const row = new MeetingInvitee();
+    row.userId = readString(item, "userId");
+    if (row.userId.length == 0) {
+      return null;
+    }
+    // 把自己列进「邀请参会人」是纯噪音（PC 用 excludeUserIds 排掉同一个人）
+    if (selfId.length > 0 && row.userId == selfId) {
+      return null;
+    }
+    const display = readString(item, "displayName");
+    const nick = readString(item, "nickName");
+    row.displayName = display.length > 0 ? display : nick;
+    return row;
+  }
+
+  /** 搜索响应行：ContactSearchItem 无 displayName，按 nickName > userName 回落。 */
+  function readSearchRow(item: UTSJSONObject, selfId: string): MeetingInvitee | null {
+    const row = new MeetingInvitee();
+    row.userId = readString(item, "userId");
+    if (row.userId.length == 0) {
+      return null;
+    }
+    if (selfId.length > 0 && row.userId == selfId) {
+      return null;
+    }
+    const nick = readString(item, "nickName");
+    row.displayName = nick.length > 0 ? nick : readString(item, "userName");
+    return row;
+  }
+
+  /**
+   * 拉我的联系人（只在第一次打开选择面板时拉，不在进页时拉）：
+   * 发起页每多一次进页请求，点「发起会议」到页面出现的那一下就更慢一分。
+   */
+  async function loadInviteePool(): Promise<void> {
+    if (inviteePoolLoading) {
+      return;
+    }
+    inviteePoolLoading = true;
+    inviteePoolState.value = "loading";
+    try {
+      const res = await apiImContacts();
+      if (apiResCode(res) != SUCCESS_CODE) {
+        inviteePoolState.value = "failed";
+        return;
+      }
+      const selfId = myUserId();
+      const rows: MeetingInvitee[] = [];
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        const itemsRaw = dataObj["items"];
+        if (itemsRaw != null) {
+          const items = itemsRaw as UTSJSONObject[];
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            // status 2/3 是待确认态，拉进会议会被服务端拒（PC 同口径只取已互为联系人）
+            if (readNumber(item, "status", 1) != 1) {
+              continue;
+            }
+            // subjectType 1=人；智能体不能当参会人
+            if (readNumber(item, "subjectType", 1) != 1) {
+              continue;
+            }
+            const row = readPoolRow(item, selfId);
+            if (row != null) {
+              rows.push(row);
+            }
+          }
+        }
+      }
+      inviteePool.value = rows;
+      inviteePoolState.value = "ready";
+    } catch (_e) {
+      inviteePoolState.value = "failed";
+    } finally {
+      inviteePoolLoading = false;
+    }
+  }
+
+  /** 回初始搜索态：清防抖定时器 + 序号自增作废在途请求。 */
+  function resetInviteeSearch(): void {
+    if (inviteeSearchTimer != -1) {
+      clearTimeout(inviteeSearchTimer);
+      inviteeSearchTimer = -1;
+    }
+    inviteeSearchSeq++;
+    inviteeSearchState.value = "idle";
+    inviteeRemote.value = [];
+  }
+
+  /** 远程搜索联系人（本地没命中的才补进来，见 inviteeView）。 */
+  async function doInviteeSearch(): Promise<void> {
+    const kw = inviteeKeyword.value.trim();
+    if (kw.length == 0) {
+      resetInviteeSearch();
+      return;
+    }
+    const seq = ++inviteeSearchSeq;
+    inviteeSearchState.value = "loading";
+    try {
+      const res = await apiImSearchContacts(kw, 20);
+      if (seq != inviteeSearchSeq) {
+        return;
+      }
+      if (apiResCode(res) != SUCCESS_CODE) {
+        inviteeSearchState.value = "failed";
+        return;
+      }
+      const selfId = myUserId();
+      const rows: MeetingInvitee[] = [];
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      if (dataObj != null) {
+        const itemsRaw = dataObj["items"];
+        if (itemsRaw != null) {
+          const items = itemsRaw as UTSJSONObject[];
+          for (let i = 0; i < items.length; i++) {
+            const row = readSearchRow(items[i], selfId);
+            if (row != null) {
+              rows.push(row);
+            }
+          }
+        }
+      }
+      inviteeRemote.value = rows;
+      inviteeSearchState.value = "done";
+    } catch (_e) {
+      if (seq == inviteeSearchSeq) {
+        inviteeSearchState.value = "failed";
+      }
+    }
+  }
+
+  /** 输入防抖 400ms（连打只发最后一次）；清空立即回默认联系人列表。 */
+  watch(inviteeKeyword, (val: string) => {
+    if (inviteeSearchTimer != -1) {
+      clearTimeout(inviteeSearchTimer);
+      inviteeSearchTimer = -1;
+    }
+    if (val.trim().length == 0) {
+      resetInviteeSearch();
+      return;
+    }
+    inviteeSearchTimer = setTimeout(() => {
+      inviteeSearchTimer = -1;
+      doInviteeSearch();
+    }, 400);
+  });
+
+  /** 面板里要显示的候选：空关键字=我的联系人；有关键字=本地命中 + 远程结果（去重）。 */
+  const inviteeView = computed((): MeetingInvitee[] => {
+    const kw = inviteeKeyword.value.trim().toLowerCase();
+    if (kw.length == 0) {
+      return inviteePool.value;
+    }
+    const out: MeetingInvitee[] = [];
+    const seen = new Map<string, boolean>();
+    const local = inviteePool.value;
+    for (let i = 0; i < local.length; i++) {
+      const row = local[i];
+      if (row.displayName.toLowerCase().indexOf(kw) >= 0) {
+        out.push(row);
+        seen.set(row.userId, true);
+      }
+    }
+    const remote = inviteeRemote.value;
+    for (let i = 0; i < remote.length; i++) {
+      const row = remote[i];
+      if (seen.get(row.userId) == true) {
+        continue;
+      }
+      out.push(row);
+      seen.set(row.userId, true);
+    }
+    return out;
+  });
+
+  /** 面板列表态（把「联系人加载」与「搜索」两个状态收敛成一个给模板用）。 */
+  const inviteeListState = computed((): string => {
+    if (inviteeKeyword.value.trim().length == 0) {
+      return inviteePoolState.value;
+    }
+    if (inviteeRemote.value.length > 0) {
+      return "ready";
+    }
+    if (inviteeSearchState.value == "loading" || inviteeSearchState.value == "idle") {
+      return "loading";
+    }
+    if (inviteeSearchState.value == "failed") {
+      return "failed";
+    }
+    return "ready";
+  });
+
+  /** 面板是否处于「有关键字」态（模板里不写 .trim() 调用链）。 */
+  const inviteeHasKeyword = computed((): boolean => inviteeKeyword.value.trim().length > 0);
+
+  /**
+   * 候选列表的高度：scroll-view 竖直方向必须给定高度才滚得动。
+   * 不写 `max-height`（App-uvue 的 CSS 子集对它支持不一致），改成按行数算出具体值：
+   * 5 行以内按实际行高铺开（不留空），超过 5 行固定 220px 内部滚动。
+   */
+  const inviteeListHeight = computed((): string => {
+    if (inviteeListState.value != "ready" || inviteeView.value.length == 0) {
+      return "64px";
+    }
+    const n = inviteeView.value.length;
+    return n >= 5 ? "220px" : `${n * 44 + 4}px`;
+  });
+
+  /** 表单里展示的已选 tag（截断到 12 个，避免上千人把表单刷爆）。 */
+  const inviteeTags = computed((): MeetingInvitee[] => invitees.value.slice(0, 12));
+
+  function isInviteeSelected(userId: string): boolean {
+    const sel = invitees.value;
+    for (let i = 0; i < sel.length; i++) {
+      if (sel[i].userId == userId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function toggleInvitee(row: MeetingInvitee): void {
+    // 点候选行时若已经吃过一次 @blur（原生 blur 先于 click），撤掉待收起并重新聚焦：
+    // 面板展开期间输入框要保持聚焦（同 PC 的 antd 多选下拉——选中不收起），否则会变成
+    // 「面板开着、输入框已失焦」，之后再点别处也不会再有 blur 事件，面板就再也收不起来。
+    if (!inviteeInputFocused.value) {
+      cancelInviteeBlurCollapse();
+      inviteeFocusRequest.value = false;
+      nextTick((): void => {
+        inviteeFocusRequest.value = true;
+      });
+    }
+    const next: MeetingInvitee[] = [];
+    let removed = false;
+    const sel = invitees.value;
+    for (let i = 0; i < sel.length; i++) {
+      if (sel[i].userId == row.userId) {
+        removed = true;
+      } else {
+        next.push(sel[i]);
+      }
+    }
+    if (removed != true) {
+      // 与 PC MAX_INVITEES 同口径：50 人。超出会变成一次几百条的串行发送，不该放行
+      if (next.length >= 50) {
+        uni.showToast({ title: t("Mobile.Meeting.inviteesLimit"), icon: "none" });
+        return;
+      }
+      next.push(row);
+      // 选中即清关键词：回到默认联系人列表（与建群页 toggleMember 同一手感）
+      if (inviteeKeyword.value.length > 0) {
+        inviteeKeyword.value = "";
+      }
+    }
+    invitees.value = next;
+  }
+
+  function removeInvitee(row: MeetingInvitee): void {
+    toggleInvitee(row);
+  }
+
+  /** 点选人盒（任意空白处）：展开面板 + 首次展开才拉联系人 + 未聚焦时边沿驱动拉起键盘。 */
+  function focusInviteeBox(): void {
+    cancelInviteeBlurCollapse();
+    inviteePanelVisible.value = true;
+    // 懒加载：进页不发请求，第一次用到联系人时才拉
+    if (inviteePoolState.value != "ready" && inviteePoolState.value != "loading") {
+      loadInviteePool();
+    }
+    if (inviteeInputFocused.value) {
+      return;
+    }
+    inviteeFocusRequest.value = false;
+    nextTick((): void => {
+      inviteeFocusRequest.value = true;
+    });
+  }
+
+  /** input 原生聚焦：记录聚焦态 + 展开面板（直接点 input 本体的双保险）。 */
+  function handleInviteeFocus(): void {
+    inviteeInputFocused.value = true;
+    inviteePanelVisible.value = true;
+    if (inviteePoolState.value != "ready" && inviteePoolState.value != "loading") {
+      loadInviteePool();
+    }
+  }
+
+  /** input 失焦：收起候选面板。
+   *  ★延迟 180ms 收：原生 @blur 可能先于候选行 @click 派发，当场 v-if 卸载会让那一下点空；
+   *  延迟窗内点中行（toggleInvitee）会撤掉这次收起，多选/边搜边选仍是一路点下去。
+   *  ★窗内重新聚焦（点输入框/选人盒）也不收——判据看 inviteeInputFocused。 */
+  function handleInviteeBlur(): void {
+    inviteeInputFocused.value = false;
+    inviteeFocusRequest.value = false;
+    cancelInviteeBlurCollapse();
+    inviteeBlurTimer = setTimeout(() => {
+      inviteeBlurTimer = -1;
+      if (inviteeInputFocused.value) {
+        return;
+      }
+      inviteePanelVisible.value = false;
+    }, 180);
+  }
+
+  function retryInviteeList(): void {
+    if (inviteeKeyword.value.trim().length > 0) {
+      doInviteeSearch();
+      return;
+    }
+    loadInviteePool();
+  }
+
+  // ---------------------------------------------------------------- 交互
+
+  onLoad((_options: any) => {
+    // 9 位号段与 PC 同源（makeMeetingNo 取模）；随机种子够用，服务端还会校验唯一性
+    roomName.value = makeMeetingNo(Math.floor(Math.random() * 1000000000));
+    shareSlug = makeShareSlug();
+  });
+
+  function handleBack(): void {
+    uni.navigateBack({ delta: 1 });
+  }
+
+  /** 换一个号：★号与分享 slug 必须一起换（同 PC rollNewNo），
+   *  否则「复制邀请」发出去的链接还指着上一个号。 */
+  function handleRollRoomNo(): void {
+    roomName.value = makeMeetingNo(Math.floor(Math.random() * 1000000000));
+    shareSlug = makeShareSlug();
+  }
+
+  function handleAllowGuestChange(event: any): void {
+    const se = event as UniSwitchChangeEvent;
+    allowGuest.value = se.detail.value;
+  }
+
+  function copyText(data: string, toastText: string): void {
+    if (data.length == 0) {
+      return;
+    }
+    uni.setClipboardData({
+      data,
+      success: (_res) => {
+        uni.showToast({ title: toastText, icon: "none" });
+      },
+    });
+  }
+
+  function handleCopyNo(): void {
+    copyText(formatMeetingId(roomName.value), t("Mobile.Meeting.noCopied"));
+  }
+
+  function handleCopyInvite(): void {
+    const room = roomName.value;
+    const url = buildMeetingInviteUrl(getApiBaseUrl(), shareSlug.length > 0 ? shareSlug : room);
+    const text = buildMeetingInviteText(myDisplayName(), titleText.value.trim(), room, url);
+    copyText(text, t("Mobile.Meeting.copied"));
+  }
+
+  /**
+   * 「会议信息」页地址（会中页占位）。
+   * ★对齐 PC：点「开始」之后直接进会中界面（PC 的「会议信息」入口就在会中页左上角）；
+   *   App 媒体层还没接，先落到信息页。status=1：刚建好的房间就是进行中。
+   * ★必须写在 handleSubmit 之前——uvue 同级函数前向引用报 error18。
+   */
+  function createdRoomUrl(): string {
+    return (
+      `/subpackages/pages/im-meeting/im-meeting-room?room=${encodeURIComponent(roomName.value)}` +
+      `&title=${encodeURIComponent(titleText.value.trim())}` +
+      `&slug=${encodeURIComponent(shareSlug)}` +
+      `&status=1&start=&members=0&passcode=0`
+    );
+  }
+
+  /**
+   * ★把邀请逐个发给选中的参会人（对齐 PC 的 notifyMeetingInvitees）。
+   *
+   * PC 发的是「来电式」定制消息（会触发全屏来电页）；App 侧没有这条消息类型，
+   * 走普通单聊文本 —— 对方在会话里能看到会议号/密码/链接，点链接即可进会。
+   * ★必须等建房成功后再发：房间没建起来就发邀请，对方点进去只会看到「会议不存在」。
+   * ★逐个发、失败只累计不中断：某个人发不出去不该让后面的人全都收不到。
+   */
+  async function sendInvitesToContacts(room: string): Promise<string> {
+    const sel = invitees.value;
+    if (sel.length == 0) {
+      return "";
+    }
+    const url = buildMeetingInviteUrl(getApiBaseUrl(), shareSlug.length > 0 ? shareSlug : room);
+    const who = myDisplayName();
+    const inviteTitle = titleText.value.trim();
+    let ok = 0;
+    let failed = 0;
+    for (let i = 0; i < sel.length; i++) {
+      const person = sel[i];
+      try {
+        // 单聊会话：服务端幂等，已有那一条就直接返回
+        const convRes = await apiImCreateP2pConversation(person.userId, "", true);
+        if (apiResCode(convRes) != SUCCESS_CODE) {
+          failed++;
+          continue;
+        }
+        const convRaw = apiResData<any>(convRes);
+        const convObj = convRaw != null ? (convRaw as UTSJSONObject) : null;
+        const convId = convObj == null ? "" : readString(convObj, "convId");
+        if (convId.length == 0) {
+          failed++;
+          continue;
+        }
+        const text = buildMeetingInviteText(who, inviteTitle, room, url);
+        const sendRes = await apiImSendTextMsg(convId, text, generateUUID());
+        if (apiResCode(sendRes) == SUCCESS_CODE) {
+          ok++;
+        } else {
+          failed++;
+        }
+      } catch (_e) {
+        failed++;
+      }
+    }
+    if (failed == 0) {
+      const p1 = new Map<string, string | number>();
+      p1.set("count", ok);
+      return tOf("Mobile.Meeting.inviteesSent", p1);
+    }
+    if (ok == 0) {
+      return t("Mobile.Meeting.inviteesFailed");
+    }
+    const p2 = new Map<string, string | number>();
+    p2.set("count", ok);
+    p2.set("failed", failed);
+    return tOf("Mobile.Meeting.inviteesSentPartial", p2);
+  }
+
+  /**
+   * 后台发邀请（不 await）：建房成功当帧就跳会议信息页，邀请的结果晚一点到也没关系。
+   * ★参数只用调用当刻的快照（room 与函数内读到的已选人），页面已卸载也不影响发送；
+   *   toast 是全局的，落在信息页上同样看得到。
+   */
+  async function sendInvitesInBackground(room: string): Promise<void> {
+    try {
+      const toastText = await sendInvitesToContacts(room);
+      if (toastText.length > 0) {
+        uni.showToast({ title: toastText, icon: "none" });
+      }
+    } catch (_e) {
+      // 已经在后台发了，失败不再打扰用户（邀请发不出去不该挡住会议本身）
+    }
+  }
+
+  async function handleSubmit(): Promise<void> {
+    if (submitting.value || roomName.value.length == 0) {
+      return;
+    }
+    submitting.value = true;
+    try {
+      const body: UTSJSONObject = {};
+      body["name"] = roomName.value;
+      body["platform"] = imDevicePlatform();
+      body["deviceId"] = getImDeviceId();
+      body["maxParticipants"] = 20;
+      // ★origin=1 才在建房时落 im_meeting：否则会议结束后记录里什么都没有
+      body["origin"] = 1;
+      body["title"] = titleText.value.trim();
+      // ★PC 发起弹窗没有「会议类型」：一律语音开局，进会后点「开视频」即可
+      body["meetingType"] = 1;
+      // ★必须显式传：服务端缺省 true，不传等于对所有人开放游客入会
+      body["allowGuest"] = allowGuest.value;
+      body["shareSlug"] = shareSlug;
+      // 会议口径的空房保留（1 小时）：发起人建完房先退出去等人也不该让房间消失
+      body["emptyTimeoutSeconds"] = 3600;
+
+      const res = await apiImMeetingCreateRoom(body);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        uni.showToast({ title: t("Mobile.Meeting.failed"), icon: "none" });
+        return;
+      }
+      const room = roomName.value;
+      // 伙伴页会议 tab 收到后静默重拉（进行中多一条）
+      eventBus.emit(IM_MEETING_CHANGED_EVENT, {});
+      // ★建房成功即进入「会议信息」页：不再停「会议已创建」结果屏。
+      //   redirectTo 而不是 navigateTo：返回直接回伙伴页会议 tab，
+      //   不停在一个已经提交完、再点「开始」会重复建房的表单上。
+      uni.redirectTo({ url: createdRoomUrl() });
+      // ★邀请放后台发：不让「已邀请 N 人」的网络往返挡住进入会议。
+      //   发完（此时用户已在信息页）再用 toast 报结果；没选人则什么都不弹。
+      sendInvitesInBackground(room);
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Meeting.failed"), icon: "none" });
+    } finally {
+      submitting.value = false;
+    }
+  }
+
+  onUnmounted(() => {
+    if (inviteeSearchTimer != -1) {
+      clearTimeout(inviteeSearchTimer);
+      inviteeSearchTimer = -1;
+    }
+    cancelInviteeBlurCollapse();
+  });
+</script>
+
+<style lang="scss" scoped>
+  .mc-page {
+    flex: 1;
+    background-color: #f5f6f8;
+  }
+
+  .mc-header {
+    height: 48px;
+    padding: 0 8px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .mc-header__btn {
+    width: 40px;
+    height: 40px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mc-header__btn--active {
+    opacity: 0.6;
+  }
+
+  .mc-header__btn--ghost {
+    opacity: 0;
+  }
+
+  .mc-header__title-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mc-header__title {
+    font-size: 17px;
+    line-height: 24px;
+    font-weight: 600;
+    color: #141416;
+  }
+
+  .mc-body {
+    flex: 1;
+  }
+
+  .mc-card {
+    margin: 10px 12px 0 12px;
+    padding: 14px;
+    background-color: #ffffff;
+    border-radius: 12px;
+  }
+
+  .mc-card--row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .mc-row-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    margin-right: 12px;
+  }
+
+  .mc-label {
+    font-size: 13px;
+    line-height: 18px;
+    color: rgba(21, 23, 31, 0.55);
+  }
+
+  .mc-label--inline {
+    flex-shrink: 0;
+    margin-right: 12px;
+  }
+
+  .mc-hint {
+    margin-top: 4px;
+    font-size: 11px;
+    line-height: 16px;
+    color: rgba(21, 23, 31, 0.4);
+  }
+
+  .mc-input {
+    margin-top: 8px;
+    height: 24px;
+    font-size: 16px;
+    line-height: 24px;
+    color: #141416;
+  }
+
+  /* 会议号一行：号 + 三个文字操作（换一个 / 复制 / 复制邀请），窄屏换行仍右对齐 */
+  .mc-row-value {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    row-gap: 4px;
+  }
+
+  .mc-no {
+    font-size: 16px;
+    line-height: 22px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: #141416;
+  }
+
+  .mc-pill {
+    margin-left: 12px;
+    padding: 2px 0;
+    font-size: 12px;
+    line-height: 18px;
+    color: #5147ff;
+  }
+
+  .mc-pill--active {
+    opacity: 0.6;
+  }
+
+  .mc-switch {
+    transform: scale(0.85);
+  }
+
+  /* ===== 邀请参会人（选人盒：与建群页 cg-tagbox / 预约页 ms-tagbox 同款） ===== */
+  .mc-tagbox {
+    margin-top: 8px;
+    min-height: 40px;
+    padding: 4px 4px 4px 12px;
+    border-radius: 10px;
+    background-color: #f6f5f8;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    box-sizing: border-box;
+  }
+
+  /* Android 原生输入控件底部视觉偏高，建群页同样只去掉下内边距（真机实测） */
+  /* #ifdef APP-ANDROID */
+  .mc-tagbox {
+    padding-bottom: 0;
+  }
+  /* #endif */
+
+  .mc-tagbox-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  /* 输入外固定高行槽：Android EditText 按内容行盒测量、可超 CSS 高，
+     直接作 flex 子项会把盒子撑高（建群页同款处理），超出部分裁掉 */
+  .mc-tagbox-field {
+    flex: 1;
+    min-width: 60px;
+    height: 32px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    overflow: hidden;
+  }
+
+  .mc-tagbox-input {
+    flex: 1;
+    /* H5 高度+行高必须同值成对设（同建群页注释：placeholder 是绝对定位盒子） */
+    height: 32px;
+    /* #ifdef H5 */
+    line-height: 32px;
+    /* #endif */
+    font-size: 14px;
+    color: #1c1b20;
+  }
+
+  .mc-search-icon {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .mc-ph {
+    color: #b7b7be;
+    font-size: 13px;
+  }
+
+  /* 灰盒内白芯 tag（描边分隔），点整芯移除 */
+  .mc-tag {
+    margin: 0 8px 6px 0;
+    padding: 4px 10px;
+    border-radius: 16px;
+    background-color: #ffffff;
+    border: 1px solid #eceaf1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .mc-tag--active {
+    background-color: #f4f3fa;
+  }
+
+  .mc-tag__text {
+    color: #4b4b52;
+    font-size: 12px;
+    line-height: 17px;
+  }
+
+  .mc-tag__x {
+    margin-left: 5px;
+    color: #9a9aa2;
+    font-size: 14px;
+    line-height: 17px;
+  }
+
+  /* ===== 候选面板（盒子下方，常驻） ===== */
+  .mc-panel {
+    margin-top: 8px;
+    border-radius: 10px;
+    background-color: #f9f9fb;
+    overflow: hidden;
+  }
+
+  /* 高度由模板上的 :style 按行数算出（见 inviteeListHeight） */
+  .mc-panel-list {
+    width: 100%;
+  }
+
+  .mc-panel-body {
+    padding: 2px 0;
+  }
+
+  .mc-panel-state {
+    padding: 20px 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .mc-panel-state__text {
+    font-size: 12px;
+    line-height: 17px;
+    color: #9a9aa2;
+  }
+
+  .mc-panel-row {
+    padding: 0 12px;
+    height: 44px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #efeff4;
+  }
+
+  .mc-panel-row--active {
+    background-color: #f2f1f7;
+  }
+
+  .mc-panel-row__name {
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    line-height: 20px;
+    color: #1c1b20;
+  }
+
+  .mc-panel-check {
+    width: 18px;
+    height: 18px;
+    margin-left: 12px;
+    border-radius: 9px;
+    border: 1px solid #d8d7e0;
+    background-color: #ffffff;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .mc-panel-check--on {
+    border-color: #5147ff;
+    background-color: #5147ff;
+  }
+
+  /* 提交按钮：建房成功后本页会被 redirectTo 换掉，不再有「已创建」结果屏样式 */
+  .mc-submit {
+    margin: 20px 12px 0 12px;
+  }
+
+  /* 主操作黑色（PC 端主按钮同款；预约页「保存」、加入页「加入」同一套） */
+  .mc-primary {
+    height: 46px;
+    border-radius: 23px;
+    background-color: #111111;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mc-primary--disabled {
+    opacity: 0.6;
+  }
+
+  .mc-primary--active {
+    opacity: 0.85;
+  }
+
+  .mc-primary__text {
+    font-size: 15px;
+    line-height: 21px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .mc-tail {
+    height: 32px;
+  }
+</style>

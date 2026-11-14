@@ -1,0 +1,480 @@
+<template>
+  <!--
+    会议信息页（会中页的占位实现）。
+
+    ★对齐 PC：发起会议点「开始」、预约卡点「开始」、进行中点「入会」之后，PC 会直接
+      拉起会中界面（`MeetingRoomView`，左上角「会议信息」入口 → `MeetingInfoPanel`）。
+      App 端媒体层（LiveKit）尚未接入，先把「会议信息」这一屏立起来：
+      主题 / 状态 / 会议号 / 开始时间 / 参会人数 / 入会密码 / 邀请链接。
+
+    ★本页只做信息展示与复制邀请，**不放任何看起来能进会的假入口**（没有「进入会议」
+      按钮、没有麦克风/摄像头图标）——真正的会中能力随媒体层后续落地。
+
+    ★数据全部由上一页（伙伴页会议 tab / 发起会议页）通过 query 传进来，本页不请求接口：
+      列表里已经有这份投影，再拉一次只会多一次等待、还有两边不一致的风险。
+  -->
+  <view class="mr-page">
+    <safety-zone />
+
+    <view class="mr-header">
+      <view class="mr-header__btn" hover-class="mr-header__btn--active" @click="handleBack">
+        <back-chevron :size="20" color="#141416" />
+      </view>
+      <view class="mr-header__title-wrap">
+        <text class="mr-header__title">{{ t("Mobile.Meeting.infoTitle") }}</text>
+      </view>
+      <view class="mr-header__btn mr-header__btn--ghost" />
+    </view>
+
+    <scroll-view class="mr-body" direction="vertical" :show-scrollbar="false">
+      <!-- 主题 + 状态：与列表卡同一套 Tag 配色（tone 由 applyStatus 口径复用） -->
+      <view class="mr-hero">
+        <text class="mr-hero__title" :lines="2">{{ pageTitle }}</text>
+        <view :class="tagClass">
+          <text :class="tagTextClass">{{ statusText }}</text>
+        </view>
+      </view>
+
+      <view class="mr-card">
+        <view class="mr-row">
+          <text class="mr-label">{{ t("Mobile.Meeting.roomNoLabel") }}</text>
+          <view class="mr-value-row">
+            <text class="mr-no">{{ formattedRoom }}</text>
+            <text
+              v-if="formattedRoom.length > 0"
+              class="mr-pill"
+              hover-class="mr-pill--active"
+              @click="handleCopyNo"
+            >{{ t("Mobile.Meeting.copyNoShort") }}</text>
+          </view>
+        </view>
+
+        <view v-if="startText.length > 0" class="mr-row">
+          <text class="mr-label">{{ t("Mobile.Meeting.startTimeLabel") }}</text>
+          <text class="mr-value">{{ startText }}</text>
+        </view>
+
+        <view class="mr-row">
+          <text class="mr-label">{{ t("Mobile.Meeting.membersLabel") }}</text>
+          <text class="mr-value">{{ membersText }}</text>
+        </view>
+
+        <!-- 入会密码：服务端不下发明文，只有「设了/没设」这个事实，不假装能显示 -->
+        <view v-if="hasPasscode" class="mr-row">
+          <text class="mr-label">{{ t("Mobile.Meeting.passcodeLabel") }}</text>
+          <text class="mr-value">{{ t("Mobile.Meeting.passcodeSet") }}</text>
+        </view>
+      </view>
+
+      <!-- 邀请链接 + 复制邀请：整段飞书式邀请文案（与列表卡「复制邀请」同一份） -->
+      <view v-if="inviteUrl.length > 0" class="mr-card">
+        <text class="mr-label">{{ t("Mobile.Meeting.inviteLinkLabel") }}</text>
+        <view class="mr-link-box">
+          <text class="mr-link">{{ inviteUrl }}</text>
+        </view>
+        <view class="mr-actions">
+          <view class="mr-btn" hover-class="mr-btn--active" @click="handleCopyInvite">
+            <text class="mr-btn__text">{{ t("Mobile.Meeting.copyInvite") }}</text>
+          </view>
+        </view>
+      </view>
+
+      <!-- 如实交代当前能力边界：这一屏是信息页，不是会中界面 -->
+      <view class="mr-pending">
+        <text class="mr-pending__text">{{ t("Mobile.Meeting.roomPending") }}</text>
+      </view>
+
+      <view class="mr-tail" />
+    </scroll-view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, ref } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { getApiBaseUrl } from "@/constants/config";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { getCachedMyInfo } from "@/utils/im/myInfoCache";
+  import {
+    buildMeetingInviteText,
+    buildMeetingInviteUrl,
+    formatMeetingId,
+    meetingDisplayTitle,
+    shareKeyOf,
+  } from "@/utils/meeting/meetingLink";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  function tOf(key: string, params: Map<string, string | number>): string {
+    return translateFn(key, toI18nParams(params), "");
+  }
+
+  /** 会议号 = LiveKit 房间名原值（展示按 3-3-3 分组，复制时用原值）。 */
+  const roomRaw = ref<string>("");
+  const titleRaw = ref<string>("");
+  const slugRaw = ref<string>("");
+  /** 0=未开始 1=进行中 2=已结束 3=已取消（与列表/服务端同一口径）。 */
+  const status = ref<number>(1);
+  /** 服务端给的原始开始时间（ISO 或 yyyy-MM-dd HH:mm:ss）。 */
+  const startRaw = ref<string>("");
+  const memberCount = ref<number>(0);
+  const hasPasscode = ref<boolean>(false);
+
+  // ---------------------------------------------------------------- 字段读取
+
+  /** ★字段读取必须写在 onLoad 之前：uvue 同级函数不支持前向引用（error18）。 */
+  function readStr(obj: UTSJSONObject, key: string): string {
+    const value = obj[key];
+    return value != null ? `${value}` : "";
+  }
+
+  function readNum(obj: UTSJSONObject, key: string, fallback: number): number {
+    const value = obj[key];
+    if (value == null) {
+      return fallback;
+    }
+    if (typeof value == "number") {
+      const n = value as number;
+      return n != n ? fallback : n;
+    }
+    const parsed = parseFloat(`${value}`);
+    return parsed != parsed ? fallback : parsed;
+  }
+
+  onLoad((options: any) => {
+    if (options == null) {
+      return;
+    }
+    const obj = options as UTSJSONObject;
+    roomRaw.value = readStr(obj, "room");
+    titleRaw.value = readStr(obj, "title");
+    slugRaw.value = readStr(obj, "slug");
+    status.value = readNum(obj, "status", 1);
+    startRaw.value = readStr(obj, "start");
+    memberCount.value = readNum(obj, "members", 0);
+    hasPasscode.value = readStr(obj, "passcode") == "1";
+  });
+
+  function handleBack(): void {
+    uni.navigateBack({ delta: 1 });
+  }
+
+  // ---------------------------------------------------------------- 展示
+
+  /** 空标题的会议显示成「会议 xxxx」，与列表卡同一套回落（见 meetingDisplayTitle）。 */
+  const pageTitle = computed((): string => {
+    return meetingDisplayTitle(titleRaw.value, roomRaw.value);
+  });
+
+  const formattedRoom = computed((): string => {
+    return roomRaw.value.length > 0 ? formatMeetingId(roomRaw.value) : "";
+  });
+
+  /** 状态文案：直接对齐列表 Tag 的四档（未开始 / 进行中 / 已结束 / 已取消）。 */
+  const statusText = computed((): string => {
+    if (status.value == 0) {
+      return t("Mobile.Meeting.tagPending");
+    }
+    if (status.value == 1) {
+      return t("Mobile.Meeting.tagOngoing");
+    }
+    if (status.value == 3) {
+      return t("Mobile.Meeting.tagCancelled");
+    }
+    return t("Mobile.Meeting.tagEnded");
+  });
+
+  /** Tag 配色与列表卡一致：进行中绿 / 待开始灰 / 已取消灰 / 已结束灰。 */
+  const tagClass = computed((): string => {
+    return status.value == 1 ? "mr-tag mr-tag--live" : "mr-tag mr-tag--pending";
+  });
+
+  const tagTextClass = computed((): string => {
+    return status.value == 1 ? "mr-tag__text mr-tag__text--live" : "mr-tag__text mr-tag__text--pending";
+  });
+
+  /** 时间统一成「yyyy-MM-dd HH:mm」（与列表卡 formatTime 同口径：秒是噪音）。 */
+  const startText = computed((): string => {
+    const text = startRaw.value.trim();
+    if (text.length == 0) {
+      return "";
+    }
+    let s = text.replaceAll("T", " ");
+    const dot = s.indexOf(".");
+    if (dot > 0) {
+      s = s.substring(0, dot);
+    }
+    if (s.length >= 16) {
+      return `${s.substring(0, 10)} ${s.substring(11, 16)}`;
+    }
+    return s;
+  });
+
+  const membersText = computed((): string => {
+    if (memberCount.value <= 0) {
+      return "—";
+    }
+    const params = new Map<string, string | number>();
+    params.set("count", memberCount.value);
+    return tOf("Mobile.Meeting.inRoomCount", params);
+  });
+
+  const inviteUrl = computed((): string => {
+    if (roomRaw.value.length == 0) {
+      return "";
+    }
+    return buildMeetingInviteUrl(getApiBaseUrl(), shareKeyOf(slugRaw.value, roomRaw.value));
+  });
+
+  // ---------------------------------------------------------------- 交互
+
+  function myDisplayName(): string {
+    const info = getCachedMyInfo();
+    return info != null ? info.displayName : "";
+  }
+
+  function handleCopyNo(): void {
+    if (roomRaw.value.length == 0) {
+      return;
+    }
+    uni.setClipboardData({
+      data: roomRaw.value,
+      success: (_res) => {
+        uni.showToast({ title: t("Mobile.Meeting.noCopied"), icon: "none" });
+      },
+    });
+  }
+
+  function handleCopyInvite(): void {
+    const url = inviteUrl.value;
+    if (url.length == 0) {
+      return;
+    }
+    const text = buildMeetingInviteText(myDisplayName(), titleRaw.value, roomRaw.value, url);
+    uni.setClipboardData({
+      data: text,
+      success: (_res) => {
+        uni.showToast({ title: t("Mobile.Meeting.copied"), icon: "none" });
+      },
+    });
+  }
+</script>
+
+<style lang="scss" scoped>
+  .mr-page {
+    flex: 1;
+    background-color: #f5f6f8;
+  }
+
+  .mr-header {
+    height: 48px;
+    padding: 0 8px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .mr-header__btn {
+    width: 40px;
+    height: 40px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mr-header__btn--active {
+    opacity: 0.6;
+  }
+
+  .mr-header__btn--ghost {
+    opacity: 0;
+  }
+
+  .mr-header__title-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mr-header__title {
+    font-size: 17px;
+    line-height: 24px;
+    font-weight: 600;
+    color: #141416;
+  }
+
+  .mr-body {
+    flex: 1;
+  }
+
+  /* 主题 + 状态：标题最多两行（会议主题常常就是会议号，一行放得下） */
+  .mr-hero {
+    margin: 4px 12px 0 12px;
+    padding: 6px 4px 4px 4px;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .mr-hero__title {
+    flex: 1;
+    font-size: 20px;
+    line-height: 28px;
+    font-weight: 600;
+    color: #141416;
+  }
+
+  .mr-tag {
+    margin-left: 8px;
+    margin-top: 3px;
+    padding: 2px 8px;
+    border-radius: 9px;
+    background-color: #f2f1f7;
+    /* 标题再长也不压缩 Tag */
+    flex-shrink: 0;
+  }
+
+  .mr-tag__text {
+    font-size: 11px;
+    line-height: 15px;
+    color: rgba(21, 23, 31, 0.6);
+  }
+
+  .mr-tag--live {
+    background-color: #e7f6ef;
+  }
+
+  .mr-tag__text--live {
+    color: #1f9e6f;
+  }
+
+  .mr-tag--pending {
+    background-color: #f2f1f7;
+  }
+
+  .mr-tag__text--pending {
+    color: rgba(21, 23, 31, 0.6);
+  }
+
+  .mr-card {
+    margin: 10px 12px 0 12px;
+    padding: 4px 14px;
+    background-color: #ffffff;
+    border-radius: 12px;
+  }
+
+  /* 信息行：左标签右值（值可换行，会议号较长时不截断） */
+  .mr-row {
+    padding: 10px 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .mr-label {
+    font-size: 13px;
+    line-height: 18px;
+    color: rgba(21, 23, 31, 0.55);
+    flex-shrink: 0;
+    margin-right: 12px;
+  }
+
+  .mr-value {
+    flex: 1;
+    font-size: 14px;
+    line-height: 20px;
+    color: #141416;
+    text-align: right;
+  }
+
+  .mr-value-row {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+  }
+
+  .mr-no {
+    font-size: 15px;
+    line-height: 21px;
+    font-weight: 600;
+    color: #141416;
+  }
+
+  .mr-pill {
+    margin-left: 8px;
+    padding: 3px 10px;
+    border-radius: 10px;
+    background-color: #f2f1f7;
+    font-size: 12px;
+    line-height: 16px;
+    color: #5147ff;
+  }
+
+  .mr-pill--active {
+    opacity: 0.6;
+  }
+
+  /* 邀请链接：灰底框，长链接自动换行（不给复制按钮以外的交互） */
+  .mr-link-box {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background-color: #f7f6fb;
+  }
+
+  .mr-link {
+    font-size: 12px;
+    line-height: 18px;
+    color: rgba(21, 23, 31, 0.6);
+  }
+
+  .mr-actions {
+    margin-top: 10px;
+    margin-bottom: 10px;
+    display: flex;
+    flex-direction: row;
+    justify-content: flex-end;
+  }
+
+  .mr-btn {
+    padding: 6px 14px;
+    border-radius: 16px;
+    background-color: #f2f1f7;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mr-btn--active {
+    opacity: 0.7;
+  }
+
+  .mr-btn__text {
+    font-size: 13px;
+    line-height: 18px;
+    font-weight: 600;
+    color: #141416;
+  }
+
+  .mr-pending {
+    margin: 14px 24px 0 24px;
+  }
+
+  .mr-pending__text {
+    font-size: 12px;
+    line-height: 18px;
+    color: rgba(21, 23, 31, 0.4);
+    text-align: center;
+  }
+
+  .mr-tail {
+    height: 32px;
+  }
+</style>

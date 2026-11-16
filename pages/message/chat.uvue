@@ -1959,6 +1959,7 @@
 
 <script setup lang="uts">
   import { objectI18nParams } from "@/utils/i18nParams";
+  import { PULL_AGENT_CLOSE_EVENT } from "@/utils/im/pullAgentTransition";
 
   import { switchMainTab } from "@/utils/mainTabNavigation";
   import { computed, nextTick, ref, watch, onUnmounted, type ComponentPublicInstance } from "vue";
@@ -2546,6 +2547,13 @@
   // 面板入口的 click 处理器首行用 pageTapSwallowed() 拦截（50ms 后自动失效，不影响后续正常点击）。
   let pageTouchStartX = 0;
   let pageTouchStartY = 0;
+  /** 本页是否由伙伴页「下拉进会话」入口打开（普通页面导航，不是 dialogPage）。 */
+  let pullEntryDialog = false;
+  let pullEntryClosing = false;
+  let pullEntryScreenHeight = 0;
+  /** 后置状态全部声明完成后再注入，规避 UTS error18 前向引用。
+   *  返回空串 = 允许上滑退出，否则是不允许的原因（同时用于探针日志）。 */
+  let pullEntrySwipeBackGuard: (() => string) | null = null;
   let pageTouchSwallowed = false;
   let pageTouchResetTimer = 0;
   // ===== 长按吞击守卫 =====
@@ -2554,6 +2562,30 @@
   // 真正触发时置位、下一次 touchstart（新手势）复位；★勿在 touchend 复位——
   // click 在 touchend 之后才派生，先复位就拦不住了。
   let rowPressFired = false;
+
+  /** 微信式反向收起：会话页向上滑出屏幕，底下伙伴页原位显露（原生页面转场）。
+   *  ★这里必须用 navigateBack 的 slide-out-top，而不是 dialogPage 的 close：
+   *    chat 页要从普通入口（点会话行）和下拉入口共用同一套页面栈与生命周期。 */
+  function closePullEntryDialog(source: string): boolean {
+    if (!pullEntryDialog || pullEntryClosing) return false;
+    console.log(`[PullAgent] entry-close source=${source}`);
+    pullEntryClosing = true;
+    uni.hideKeyboard({ complete: () => {} });
+    // 先让下层伙伴页复位（tab-shell 同步写 style），下一帧再播上滑退出：
+    // 否则滑出过程露出的是提交态（整页在屏幕外/透明），而不是正常伙伴页。
+    uni.$emit(PULL_AGENT_CLOSE_EVENT);
+    setTimeout((): void => {
+      uni.navigateBack({
+        delta: 1,
+        animationType: "slide-out-top",
+        animationDuration: 260,
+        fail: (_err) => {
+          pullEntryClosing = false;
+        },
+      });
+    }, 16);
+    return true;
+  }
 
   function handlePageTouchStart(eventValue: Any): void {
     startChatVideoBackSwipe(eventValue);
@@ -2575,6 +2607,27 @@
     const t = e.changedTouches[0];
     const dx = t.clientX - pageTouchStartX;
     const dy = t.clientY - pageTouchStartY;
+    const swipeBackGuard = pullEntrySwipeBackGuard;
+    let guardReason = "";
+    if (swipeBackGuard != null) guardReason = swipeBackGuard();
+    const swipeBackAllowed = guardReason.length == 0;
+    // 只接管「已贴最新消息、工具层全收起、从屏幕下半部起手的明确上滑」：
+    // 阅读历史、输入和横向手势不受影响；起手区放在 58% 以下也避开顶部标题/页签操作。
+    if (
+      pullEntryDialog &&
+      pullEntryScreenHeight > 0 &&
+      swipeBackAllowed &&
+      pageTouchStartY >= pullEntryScreenHeight * 0.58 &&
+      dy <= -96 &&
+      Math.abs(dy) > Math.abs(dx) * 1.35
+    ) {
+      closePullEntryDialog("swipe-up");
+      return;
+    }
+    // 探针：下拉入口会话页里的明显上滑没退出时，打印是哪一项没满足，便于真机调参。
+    if (pullEntryDialog && dy <= -40 && Math.abs(dy) > Math.abs(dx) * 1.35) {
+      console.log(`[PullAgent] swipe-up-miss dy=${dy} dx=${dx} startY=${pageTouchStartY} allowed=${swipeBackAllowed} reason=${guardReason}`);
+    }
     if (Math.abs(dx) <= 10 && Math.abs(dy) <= 10) {
       return;
     }
@@ -7231,6 +7284,16 @@
    *  在读历史不打扰（不拽走阅读位置，靠「回到底部」浮钮回最新）；与浮钮 200px
    *  亮钮阈值构成迟滞带，避免临界抖动。初值 true：进页即在底，首个探测前不误拦。 */
   const nearChatBottom = ref<boolean>(true);
+  // 必须放在上述所有 ref 声明之后：chat.uvue 的 UTS 编译不支持函数体前向引用。
+  pullEntrySwipeBackGuard = (): string => {
+    if (nearChatBottom.value != true) return "reading-history";
+    if (keyboardHeight.value > 0) return "keyboard";
+    if (panelMode.value.length > 0) return "panel";
+    if (expandPanel.value.length > 0) return "expand-panel";
+    if (expanded.value == true) return "expanded";
+    if (multiSelectMode.value == true) return "multi-select";
+    return "";
+  };
   /** 触发展示阈值（px）：距底余量超过该值才算「在读历史」——略大于 NEAR_BOTTOM_PX，
    *  避免贴底微滚/回弹就闪钮。 */
   const JUMP_LATEST_TRIGGER_PX = 200;
@@ -14016,6 +14079,7 @@
 
   function handleBack(): void {
     if (exitChatVideoFullscreenOnBack()) return;
+    if (closePullEntryDialog("header-back")) return;
     // 浏览器刷新后本页成为栈底（getCurrentPages 仅剩本页）：navigateBack 无页可退，
     // H5 会退化成整页重载当前 URL（表现为"一直退不出去、不停刷新"）——栈底直接切回消息 tab
     const pages = getCurrentPages();
@@ -15215,6 +15279,9 @@
 
   onLoad((options: any) => {
     convId.value = readOption(options, "convId");
+    pullEntryDialog = readOption(options, "pullEntry") == "1";
+    pullEntryClosing = false;
+    pullEntryScreenHeight = uni.getWindowInfo().windowHeight;
     // 「N 条新消息」提示：模块级 ref 跨页存活，本页首帧前无条件清零（条数由本页推导，
     // 组件零绑定读模块 ref，见 utils/chatNewMsgTip.uts）
     newMsgTipCount = 0;
@@ -15440,7 +15507,14 @@
   });
 
   onBackPress((_options: OnBackPressOptions): boolean => {
-    return exitChatVideoFullscreenOnBack();
+    if (exitChatVideoFullscreenOnBack()) return true;
+    // 下拉入口打开的会话页同样交回系统默认返回（页面栈正常 pop）：
+    // 在 onBackPress 里再调 navigateBack 会和系统返回互相打架，动画也不可控。
+    // 但下层伙伴页要先复位，否则系统 pop 动画期间露出的是提交态。
+    if (pullEntryDialog) {
+      uni.$emit(PULL_AGENT_CLOSE_EVENT);
+    }
+    return false;
   });
 
   onUnload(() => {

@@ -31,7 +31,7 @@
     :refresher-threshold="pullNativeThreshold"
     :refresher-max-drag-distance="pullMaxDragDistance"
     refresher-default-style="none"
-    refresher-background="#f4f3fb"
+    :refresher-background="pullRefresherBackground"
     @scroll="emitScroll"
     @scrolltolower="emitScrollLower"
     @refresherpulling="handlePulling($event)"
@@ -116,7 +116,7 @@
   <!-- 下拉圆点覆盖层：贴 pane 顶，高度 = 原生下拉位移 dy（=列表被推下来的那段空白），
        圆点在该层内 flex 居中 → 全程恒在下拉区域的垂直中心（与原生刷新控件内部怎么排版无关）。
        纯展示层，pointer-events:none 不抢列表手势。 -->
-  <view class="pull-dot-layer" :style="pullDotLayerStyle">
+  <view v-if="!pullLayerPreview" class="pull-dot-layer" :style="pullDotLayerStyle">
     <view class="pull-guide__dots" :style="pullGuideDotsStyle">
       <view class="pull-guide__dot pull-guide__dot--left" :style="pullGuideLeftDotStyle"></view>
       <view class="pull-guide__dot pull-guide__dot--center" :style="pullGuideCenterDotStyle"></view>
@@ -162,6 +162,8 @@
     /** Android 未过线松手时提前收回，或原生已进入刷新态后判定否决：页面把
      *  triggered 写 true→false，避免列表停在灰区。 */
     "pull-reject": [];
+    /** 完整伙伴页下拉合成帧：页面逐级透传到 tab-shell。 */
+    "pull-layer-frame": [distance: number, threshold: number, transitionMs: number, committing: boolean];
     /** scroll-view 层页面触摸三件套（冒泡到页面根之前先到这，40ms 去重语义在页面）。 */
     "pane-touchstart": [e: UniTouchEvent];
     "pane-touchend": [e: UniTouchEvent];
@@ -219,6 +221,8 @@
       /** 列表重建令牌：变化=重建 scroll-view（把原生下拉态强制归位）。
        *  下拉跳转时回弹还没走完才用（跳转打断收回动画，见 message-content onShow）。 */
       pullResetToken: number;
+      /** 新微信式双层预览：拖动时直接改前景/背层的 transform 与 opacity。 */
+      pullLayerPreview: boolean;
     }>(),
     {
       conversations: [] as ImConvRow[],
@@ -236,6 +240,7 @@
       pullMaxDragDistance: 90,
       pullSlotHeight: 60,
       pullResetToken: 0,
+      pullLayerPreview: false,
     },
   );
 
@@ -254,12 +259,20 @@
     return props.pullEntryEnabled;
     // #endif
   });
+  /** 微信式入口仍沿用旧实现的灰色下拉区与单点→三点形变。 */
+  const pullRefresherBackground = computed((): string => "#f4f3fb");
   /** 滚动容器是否挂着：下拉跳转打断原生收回动画后，靠 v-if 卸掉再挂回来强制归位
    *  （原生下拉态只有重建容器能确定复位；单改 :key 在 App 端不一定真的重建）。
    *  只在翻 pullResetToken 时短暂置 false 一帧：正常路径是跳转后页面已被会话页盖住时翻
    *  （隐藏期重建，回页看不见），回页 onShow 只为兜底。 */
   const scrollAlive = ref<boolean>(true);
+  /** 旧入口（H5/小程序）插槽内圆点的响应式位移。
+   *  ★新双层入口（App）**不再写这个 ref**：每次写都会让整个 pane 重渲染，
+   *    下拉时逐帧重渲染 = 掉帧/抖动的主要来源。新入口只走下面的非响应式变量。 */
   const pullGuideDistance = ref<number>(0);
+  /** 新双层入口的实时位移（非响应式）：只用于抵消原生位移与上抛合成层，
+   *  不进入任何渲染依赖，拖动期零 Vue 重渲染。 */
+  let pullGuideLiveDistance = 0;
   /** 回弹/收回动画期间原生还会继续派 refresherpulling（位移一路减小），若继续写响应式，
    *  列表外壳就在动画里逐帧重渲染 → 肉眼可见的回弹抖动（不如手指滑动丝滑）。
    *  松手（refresh/abort/restore）后冻结，下一次触摸按下再解冻。 */
@@ -303,13 +316,135 @@
    *    旧值 900 会把 160ms 左右的正常拖动误判成甩动（=「有时按住拖过阈值松手不跳」），
    *    抬到 1200 与实测甩动（1501）留出余量，正常拖动（<1000）全部放行。 */
   const PULL_FLING_MAX_SPEED = 1200;
-  /** 松手判定线（相对触发线的比例）：拉过触发线的 90% 就按「按住拖到位」处理。
-   *  ★0.97 太严：dy 136.67 / 触发线 148 = 92.3% 时三点已几乎完全展开，肉眼分辨不出
-   *    最后 8%，松手却被判「没拉到位」= 用户反馈「明明拉过阈值却不跳」。 */
-  const PULL_RELEASE_MIN_RATIO = 0.9;
-  /** 三圆点「完全展开」+ 触感提示的进度（相对触发线）：必须**早于**判定线，
-   *  保证「看到三点完整 ⇒ 松手必跳」，否则视觉会骗人（见 pullGuideMorphProgress）。 */
+  /** 三圆点完全展开、轻震和松手触发共用同一条线，视觉反馈就是实际判定。 */
   const PULL_ARM_RATIO = 0.92;
+  const PULL_RELEASE_MIN_RATIO = PULL_ARM_RATIO;
+  /** 上一次写进 scroll 的位移；<0 = 还没有写过。
+   *  相邻帧位移不足 0.5px 时直接跳过，避免触摸高频微抖造成无意义写入。 */
+  let pullLayerAppliedDistance = -1;
+  /** 上一次真正写进样式的 transition 时长（-1 = 未设置）。 */
+  let pullLayerTransitionApplied = -1;
+  let pullLayerCommitting = false;
+  let pullLayerTransitionMs = 0;
+  let pullLayerDebugGestureLogged = false;
+  let pullLayerDebugArmedLogged = false;
+  /** scroll-view 节点缓存：applyPullLayerProgress 每帧都要写它，不能每帧跨桥查询。
+   *  容器重建（v-if 卸挂）时由对应 watch 置空。 */
+  let pullLayerScrollEl: UniElement | null = null;
+
+  function pullLayerScroll(): UniElement | null {
+    if (pullLayerScrollEl == null) {
+      pullLayerScrollEl = uni.getElementById("partner-conv-scroll") as UniElement | null;
+    }
+    return pullLayerScrollEl;
+  }
+
+
+  /**
+   * transition 只在「阶段切换」时写一次（拖动 ↔ 回弹 ↔ 提交）；
+   * 拖动期恒为 0ms。
+   * ★每帧重写 transition-duration 会让原生把每次设样式当成重新起一段动画，
+   *   是下拉过程抖动的主因之一。
+   */
+  function setPullLayerTransition(durationMs: number): void {
+    if (!props.pullLayerPreview) return;
+    const next = Math.max(0, durationMs);
+    pullLayerTransitionMs = next;
+    if (next == pullLayerTransitionApplied) return;
+    pullLayerTransitionApplied = next;
+    const scroll = pullLayerScroll();
+    if (scroll == null) return;
+    scroll.style.setProperty("transition-property", "transform");
+    scroll.style.setProperty("transition-duration", `${next}ms`);
+    scroll.style.setProperty("transition-timing-function", next <= 0 ? "linear" : "cubic-bezier(0.22, 0.78, 0.2, 1)");
+  }
+
+  /**
+   * 把本轮下拉位移同步给「滚动抵消 + 整页合成层」。
+   * 每帧只写两个地方：scroll 的 translateY（抵消原生推下量）、合成层的 translateY（tab-shell）。
+   * 不写任何响应式状态 —— 长列表每帧重渲染会直接把跟手变成卡顿。
+   */
+  function applyPullLayerProgress(distance: number): void {
+    if (!props.pullLayerPreview) return;
+    if (pullLayerCommitting) return;
+    if (Math.abs(distance - pullLayerAppliedDistance) < 0.5) return;
+    pullLayerAppliedDistance = distance;
+    // iOS/鸿蒙的原生 refresher 会把 scroll-view 内容推下 distance；整页再统一下移之前
+    // 先用等量反向位移抵消，屏幕上只保留合成层那一份位移。
+    // ★Android 不需要抵消：插件已关闭原生内容位移（setEnableHeaderTranslationContent(false)），
+    //   列表零位移；而且 uvue 的 style.transform 与原生 translationY 是同一个属性，
+    //   在这里写反而会和插件每帧抢值（实测=列表错位 + 拖动抖动）。
+    const scroll = pullLayerScroll();
+    if (scroll != null) {
+      // #ifndef APP-ANDROID
+      scroll.style.setProperty("transform", `translateY(${-distance}px)`);
+      // #endif
+    }
+    emit("pull-layer-frame", distance, props.pullThreshold, pullLayerTransitionMs, false);
+  }
+
+  /** 达到阈值松手后才移动整页祖先；拖动期不动它，避免与原生 refresher 重复位移而抖动。 */
+  function commitPullLayer(): void {
+    if (!props.pullLayerPreview || pullLayerCommitting) return;
+    pullLayerCommitting = true;
+    pullLayerAppliedDistance = props.pullThreshold * PULL_ARM_RATIO;
+    // 提交：列表与整页在同一段合成动画里继续下移出屏（240ms 后由页面无动画换真页）。
+    setPullLayerTransition(240);
+    emit("pull-layer-frame", props.pullThreshold * PULL_ARM_RATIO, props.pullThreshold, 240, true);
+  }
+
+  function emitQualifiedPullRefresh(): void {
+    commitPullLayer();
+    emit("pull-refresh");
+  }
+
+  function resetPullLayerImmediately(): void {
+    pullLayerCommitting = false;
+    pullLayerAppliedDistance = -1;
+    setPullLayerTransition(0);
+    applyPullLayerProgress(0);
+  }
+
+  /** 清空本轮下拉位移（新旧入口共用）：新入口只动非响应式变量，旧入口同步刷新圆点。 */
+  function resetPullGuideDistance(): void {
+    pullGuideLiveDistance = 0;
+    if (!props.pullLayerPreview && pullGuideDistance.value != 0) {
+      pullGuideDistance.value = 0;
+    }
+  }
+
+  // ===== 手感探针（真机验收用；只统计不逐帧打印，避免日志本身拖慢渲染）=====
+  let pullPerfFrames = 0;
+  let pullPerfStartedAt = 0;
+  let pullPerfMaxCostMs = 0;
+
+  function pullPerfReset(): void {
+    pullPerfFrames = 0;
+    pullPerfStartedAt = 0;
+    pullPerfMaxCostMs = 0;
+  }
+
+  function pullPerfFrame(costMs: number): void {
+    pullPerfFrames = pullPerfFrames + 1;
+    if (pullPerfStartedAt <= 0) pullPerfStartedAt = Date.now() - costMs;
+    if (costMs > pullPerfMaxCostMs) pullPerfMaxCostMs = costMs;
+  }
+
+  /** 松手/收回时汇总：帧数、总时长、平均帧率、单帧最大耗时。
+   *  fps 明显 < 60 或 maxCost > 16ms 说明主线程被同步写入拖住了。 */
+  function pullPerfFlush(tag: string): void {
+    if (pullPerfFrames > 0 && pullPerfStartedAt > 0) {
+      const elapsed = Math.max(1, Date.now() - pullPerfStartedAt);
+      const fps = (pullPerfFrames * 1000) / elapsed;
+      console.log(`[PullAgent] perf-${tag} frames=${pullPerfFrames} elapsed=${elapsed}ms fps=${fps.toFixed(1)} maxCost=${pullPerfMaxCostMs.toFixed(2)}ms`);
+    }
+    pullPerfReset();
+  }
+
+  // iOS/鸿蒙没有 Android 原生 session 的 detach 回调，组件销毁也必须主动清全局底栏样式。
+  onUnmounted((): void => {
+    resetPullLayerImmediately();
+  });
   // #ifdef APP-ANDROID
   const ANDROID_PULL_KEY = "partner-conv-pull";
   const ANDROID_PULL_ELEMENT_ID = "partner-conv-scroll";
@@ -337,9 +472,17 @@
   }
 
   function handleAndroidPullProgress(distanceValue: number, dragging: boolean): void {
+    const startedAt = Date.now();
     const distance = Math.max(0, Math.min(distanceValue, props.pullMaxDragDistance));
-    if (dragging && pullGuideDistance.value <= 0 && distance > 0) {
+    if (dragging && pullGuideLiveDistance <= 0 && distance > 0) {
       pullHapticFired = false;
+      setPullLayerTransition(0);
+      pullLayerDebugArmedLogged = false;
+      pullPerfReset();
+      if (!pullLayerDebugGestureLogged) {
+        pullLayerDebugGestureLogged = true;
+        console.log(`[PullAgent] progress-start distance=${distance}`);
+      }
     }
     if (!pullHapticFired && distance >= props.pullThreshold * PULL_ARM_RATIO) {
       pullHapticFired = true;
@@ -353,19 +496,34 @@
       } catch (_eVibrate) {
         // ignore
       }
+      if (!pullLayerDebugArmedLogged) {
+        pullLayerDebugArmedLogged = true;
+        console.log(`[PullAgent] progress-armed distance=${distance}`);
+      }
     }
-    if (Math.abs(pullGuideDistance.value - distance) >= 0.5) {
+    pullGuideLiveDistance = distance;
+    if (!props.pullLayerPreview && Math.abs(pullGuideDistance.value - distance) >= 0.5) {
       pullGuideDistance.value = distance;
     }
+    applyPullLayerProgress(distance);
+    pullPerfFrame(Date.now() - startedAt);
   }
 
   function handleAndroidPullTriggered(): void {
-    emit("pull-refresh");
+    emitQualifiedPullRefresh();
   }
 
   function handleAndroidPullSettled(triggered: boolean): void {
-    pullGuideDistance.value = 0;
+    console.log(`[PullAgent] progress-settled triggered=${triggered}`);
+    pullPerfFlush("android");
+    resetPullGuideDistance();
+    if (!triggered || !pullLayerCommitting) {
+      setPullLayerTransition(260);
+      applyPullLayerProgress(0);
+    }
     pullHapticFired = false;
+    pullLayerDebugGestureLogged = false;
+    pullLayerDebugArmedLogged = false;
     if (triggered) {
       emit("pull-restore");
     } else {
@@ -379,7 +537,7 @@
     const attached = attachAndroidPullAction(
       ANDROID_PULL_KEY,
       ANDROID_PULL_ELEMENT_ID,
-      props.pullThreshold,
+      props.pullThreshold * PULL_ARM_RATIO / 1.15,
       props.pullMaxDragDistance,
       "#f4f3fb",
       props.pullEntryEnabled && !props.menuVisible,
@@ -439,14 +597,19 @@
     androidPullAttachTimer = 0;
     androidPullAttachAttempts = 0;
     detachAndroidPullAction(ANDROID_PULL_KEY);
-    pullGuideDistance.value = 0;
+    pullLayerScrollEl = null;
+    resetPullGuideDistance();
     pullHapticFired = false;
   });
   // #endif
   /** 重建滚动容器时把下拉位移一并清零：跳转打断收回的话 refresherrestore 不会来，
    *  pullGuideDistance 会停在松手时的值，重建后圆点按旧位移显示。 */
   watch((): number => props.pullResetToken, (_token: number): void => {
-    pullGuideDistance.value = 0;
+    // ★不要把 pullLayerScrollEl 置空：这里的复位发生在页面隐藏期（会话页是栈顶），
+    //   uni.getElementById 只能查栈顶页，重新查询会拿到 null；必须复用已经缓存的
+    //   原生节点引用直接写样式（节点已销毁时写入无害，重建后的新节点本就无位移）。
+    resetPullGuideDistance();
+    resetPullLayerImmediately();
     pullHapticFired = false;
     pullReleaseDistance = -1;
     pullReleaseQualified = false;
@@ -490,7 +653,7 @@
    *    ★必须 < 10：runtime 把 ≥10 的 rate 当绝对像素兼容分支）。 */
   const pullNativeThreshold = computed((): number => {
     // #ifdef APP-HARMONY
-    return props.pullThreshold;
+    return props.pullThreshold * PULL_ARM_RATIO;
     // #endif
     // #ifndef APP-HARMONY
     return props.pullSlotHeight + props.pullMaxDragDistance + 20;
@@ -503,12 +666,7 @@
     const extent = Math.max(1, props.pullThreshold);
     return Math.max(0, Math.min(pullGuideDistance.value / extent, 1));
   });
-  /** 展开进度：走到触发线的 55% 开始分叉，到 **92%（= PULL_ARM_RATIO）** 完全展开。
-   *  ★收口点必须早于松手判定线（PULL_RELEASE_MIN_RATIO = 0.9 × 触发线）：
-   *    这样「看到三个点完整展开」⇒ 松手必跳，视觉与判定不会互相打脸。
-   *    旧版收口正好在 100% 触发线，实测用户拉到 92%（dy 136.67/148）时三点已几乎
-   *    展开、肉眼分辨不出，松手却被 fail(dy<line) 挡掉 =「明明拉过线却不跳」。
-   *  ★起分点尽量早（55% 起分、92% 收口，跟阈值绝对像素无关）→ 三个点出现得干脆。 */
+  /** 展开进度：走到触发线的 55% 开始分叉，到 92% 完全展开；此刻同步震动并 armed。 */
   const pullGuideMorphProgress = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.55) / (PULL_ARM_RATIO - 0.55), 1)));
   /** 淡入：进度 0.35 露头、0.60 全显（= 触发线的 35% / 60%，不写绝对像素）。 */
   const pullGuideOpacity = computed((): number => Math.max(0, Math.min((pullGuideProgress.value - 0.35) / 0.25, 1)));
@@ -596,6 +754,7 @@
   }
 
   function handlePulling(eventValue: Any): void {
+    const startedAt = Date.now();
     const e = eventValue as UniRefresherEvent;
     // 冻结期也要记原始 dy：收回动画期间它就是「列表回到哪儿了」的唯一观测值
     pullLastRawDy = e.detail.dy;
@@ -613,7 +772,12 @@
       }
       vibratePullThreshold();
     }
-    if (Math.abs(pullGuideDistance.value - distance) >= 1) pullGuideDistance.value = distance;
+    pullGuideLiveDistance = distance;
+    if (!props.pullLayerPreview && Math.abs(pullGuideDistance.value - distance) >= 1) {
+      pullGuideDistance.value = distance;
+    }
+    applyPullLayerProgress(distance);
+    pullPerfFrame(Date.now() - startedAt);
   }
 
   /** createSelectorQuery.exec 回调（具名函数：深层箭头块会触发 UTS 截断编译，
@@ -683,7 +847,7 @@
     if (pullReleaseDistance >= 0) {
       pullReleaseFired = true;
       pullGuideFrozen = true;
-      pullGuideDistance.value = 0;
+      resetPullGuideDistance();
       // ★补派识别（2026-11-12 Android 实测）：松手后原生收回动画会继续派 pulling，
       //   收回结束**再补派一次 refresherrefresh**（实测松手后 ~526ms）。此时列表其实
       //   早就回到顶了（原始 dy 已归零 / 或已收到 abort|restore），这个 refresh 不是
@@ -708,7 +872,7 @@
       const fling = pullReachLineSpeed > PULL_FLING_MAX_SPEED;
       const rejected = fling || (pullReleaseDistance >= 0 && !pullReleaseQualified);
       if (rejected) {
-        pullGuideDistance.value = 0;
+        resetPullGuideDistance();
         // 同上：原生已经自己收回的补派 refresh 不 settle
         if (pullNativeRetracted || pullLastRawDy <= 2) {
           emit("pull-abort");
@@ -717,7 +881,7 @@
         emit("pull-reject");
         return;
       }
-      emit("pull-refresh");
+      emitQualifiedPullRefresh();
     }, 16);
   }
 
@@ -727,13 +891,15 @@
     // 上一轮收回动画收尾落在新一轮下拉中间：不复位，让这一拉继续跟手
     if (!pullGuideDragging) {
       pullGuideFrozen = true;
-      pullGuideDistance.value = 0;
+      pullPerfFlush("restore");
+      resetPullGuideDistance();
+      setPullLayerTransition(260);
+      applyPullLayerProgress(0);
     }
     emit("pull-restore");
   }
 
-  /** 松手判定：下拉位移到了「判定线」（PULL_RELEASE_MIN_RATIO × 触发线；三圆点在
-   *  更早的 PULL_ARM_RATIO 处就已完全展开，所以看到三点完整就必然过线），
+  /** 松手判定：下拉位移到了三圆点完全展开并震动的同一条判定线，
    *  且这次是「按住拖到位再松手」，不是「快速下滑一甩」。
    *  ① 位移判据用原生 dy 快照（用户看到的点就是判定依据）。
    *  ② 甩动闸门：dy / 按住时长 > PULL_FLING_MAX_SPEED 即判快速下滑（一甩就到线），
@@ -743,7 +909,7 @@
    *  ③ 没有 touchstart 采样（handler 丢了）：只看 dy，退回改动前的老口径。
    *  ★必须定义在 emitPaneTouchEnd 之前：UTS 不保证函数声明提升（error18 找不到名称）。 */
   function isPullReleaseQualified(_eventValue: Any): boolean {
-    const dy = pullGuideDistance.value;
+    const dy = pullGuideLiveDistance;
     const line = props.pullThreshold * PULL_RELEASE_MIN_RATIO;
     if (dy < line) return false;
     // 主判据：dy 首次越线那一刻的速度（来自 pulling 事件序列，不依赖 touchend）
@@ -770,9 +936,12 @@
     // touchend 已判定达到入口线时，Android 随后仍可能补派 abort；此时不能立即清零/
     // 冻结，否则会截断正在进行的原生回弹。让 pulling 递减帧与 restore 自然收尾。
     if (pullReleaseFired) return;
-    const snapshot = pullGuideDistance.value;
+    const snapshot = pullGuideLiveDistance;
     pullGuideFrozen = true;
-    pullGuideDistance.value = 0;
+    pullPerfFlush("abort");
+    resetPullGuideDistance();
+    setPullLayerTransition(260);
+    applyPullLayerProgress(0);
     pullReleaseFired = true;
     // touchend 已经给出结论：以它为准（未通过就是未通过，dy 惯性不能翻案）。
     if (pullReleaseDistance >= 0) {
@@ -781,7 +950,7 @@
     }
     // touchend 没到（个别机型下拉时不上报）：仍要过甩动闸门，越线速度高 = 快速下滑
     if (snapshot >= props.pullThreshold * PULL_RELEASE_MIN_RATIO && pullReachLineSpeed <= PULL_FLING_MAX_SPEED) {
-      emit("pull-refresh");
+      emitQualifiedPullRefresh();
       return;
     }
     emit("pull-abort");
@@ -796,6 +965,9 @@
     return;
     // #endif
     pullGuideFrozen = false;
+    setPullLayerTransition(0);
+    if (pullGuideLiveDistance <= 0) applyPullLayerProgress(0);
+    pullPerfReset();
     pullGuideDragging = true;
     pullReleaseFired = false;
     pullHapticFired = false;
@@ -817,8 +989,9 @@
     return;
     // #endif
     pullGuideDragging = false;
-    pullReleaseDistance = pullGuideDistance.value;
+    pullReleaseDistance = pullGuideLiveDistance;
     pullReleaseQualified = isPullReleaseQualified(e);
+    pullPerfFlush("touch-end");
     // #ifdef APP-ANDROID
     // Android 原生刷新即使只拉到插槽高、没过入口线，也可能在松手约 550ms 后才派
     // refresherrefresh；等那时再 true→false，restore 会比松手晚约 1.4s。
@@ -841,7 +1014,7 @@
       // #ifndef APP-ANDROID
       pullGuideFrozen = true;
       // #endif
-      emit("pull-refresh");
+      emitQualifiedPullRefresh();
     }
     emit("pane-touchend", e);
   }

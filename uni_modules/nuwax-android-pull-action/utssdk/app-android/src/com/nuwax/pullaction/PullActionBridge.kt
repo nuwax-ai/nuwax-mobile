@@ -156,7 +156,11 @@ private class PullActionSession(
         wrapper.setEnableNestedScroll(true)
         wrapper.setEnableOverScrollBounce(false)
         wrapper.setEnableOverScrollDrag(false)
-        wrapper.setEnableHeaderTranslationContent(true)
+        // ★关闭内容位移：列表由业务侧整页合成层（tab-shell 的 translateY）统一推动。
+        //   开着的话 SmartRefreshLayout 会给 scroll-view 设 translationY，而 uvue 侧给
+        //   同一个元素写 style.transform 会**覆盖**（不是叠加）这个值，两边每帧抢同一个
+        //   属性 —— 实测表现就是列表和顶部错位 + 拖动抖动。关闭后位移只有一个来源。
+        wrapper.setEnableHeaderTranslationContent(false)
         wrapper.setEnableScrollContentWhenRefreshed(false)
         wrapper.setEnableClipHeaderWhenFixedBehind(true)
         wrapper.setDragRate(1f)
@@ -164,8 +168,9 @@ private class PullActionSession(
         wrapper.setHeaderHeightPx(thresholdPx)
         wrapper.setHeaderTriggerRate(PULL_ACTION_TRIGGER_RATE)
         wrapper.setHeaderMaxDragRate(max(1f, min(9.9f, maxDragPx.toFloat() / thresholdPx)))
+        // header 必须透明：整页下移后顶部露出的是下层会话页预览，不能盖一层灰底。
         wrapper.setRefreshHeader(
-            PullActionHeader(target.context, parseColor(backgroundColor))
+            PullActionHeader(target.context, Color.TRANSPARENT)
         )
         wrapper.setOnMultiListener(object : SimpleMultiListener() {
             override fun onHeaderMoving(

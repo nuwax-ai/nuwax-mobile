@@ -1,6 +1,20 @@
 <template>
+  <view class="tab-shell-stage">
+  <view id="partner-pull-preview-host" class="tab-shell__pull-preview">
+    <agent-chat-pull-preview
+      :agent-name="pullAgentPreviewName"
+      :messages="pullAgentPreviewMessages"
+    />
+  </view>
+  <!-- 灰色遮挡：下拉初期盖住会话页预览（只看到纯灰）；圆点出现那一刻转半透明，
+       下层的会话页才透出来。 -->
+  <view id="partner-pull-scrim" class="tab-shell__pull-scrim" />
+  <!-- 位移外壳：单独一层 view 承载 transform。
+       不让 id/transform 直接落在 uni-tab 组件根上——组件根节点的 id 是否能被
+       uni.getElementById 命中在不同端不保证，而这一层是原生 view，稳定可查。 -->
+  <view id="partner-pull-shell" class="tab-shell__shell">
   <uni-tab class="tab-shell" :style="safeAreaStyle" :active-index="activeIndex" @change="handleTabChange">
-    <uni-tab-content><MessageContent /></uni-tab-content>
+    <uni-tab-content><MessageContent @pull-layer-frame="onPullAgentFrame" /></uni-tab-content>
     <uni-tab-content><IndexContent /></uni-tab-content>
     <uni-tab-content><DiscoverContent /></uni-tab-content>
     <uni-tab-content><MineContent /></uni-tab-content>
@@ -12,6 +26,13 @@
     <view v-if="settleMaskVisible" class="tab-shell__settle-mask" />
     <!-- #endif -->
   </uni-tab>
+  </view>
+  <view id="partner-pull-dots" class="tab-shell__pull-dots">
+    <view id="partner-pull-dot-left" class="tab-shell__pull-dot tab-shell__pull-dot--left" />
+    <view id="partner-pull-dot-center" class="tab-shell__pull-dot tab-shell__pull-dot--center" />
+    <view id="partner-pull-dot-right" class="tab-shell__pull-dot tab-shell__pull-dot--right" />
+  </view>
+  </view>
 </template>
 
 <script setup lang="uts">
@@ -21,6 +42,12 @@
   import IndexContent from "@/pages/index/index-content.uvue";
   import DiscoverContent from "@/pages/discover/discover-content.uvue";
   import MineContent from "@/pages/mine/mine-content.uvue";
+  import AgentChatPullPreview from "@/pages/message/components/agent-chat-pull-preview.uvue";
+  import {
+    PULL_AGENT_CLOSE_EVENT,
+    pullAgentPreviewMessages,
+    pullAgentPreviewName,
+  } from "@/utils/im/pullAgentTransition";
   import { MAIN_TAB_PATHS, mainTabActivePath, mainTabPageVisible, isMainTabPath, selectMainTab, syncMainTabLocation } from "@/utils/mainTabNavigation";
   import { dispatchMainTabBack, dispatchMainTabResize } from "@/hooks/useMainTabLifecycle";
   import { syncNativeTabBarState } from "@/utils/commonBusiness";
@@ -44,6 +71,292 @@
     selectMainTab(index);
   }
 
+  // ===== 下拉合成层（丝滑优先）=====
+  //
+  // 手感三条铁律（改这里之前先读）：
+  //  1) 拖动期每帧只写 2 个合成属性：shell 的 translateY、圆点层的 translateY。
+  //     preview 层在拖动期**完全不动**（静止的下层页面才是微信的效果；逐帧改
+  //     opacity/scale 会让整棵子树重新合成，是抖动的直接来源）。
+  //  2) transition 只在阶段切换（拖动 ↔ 回弹 ↔ 提交）写一次，拖动期恒为 0ms。
+  //     每帧重写 transition-duration 等于每帧重启一段补间动画。
+  //  3) 节点引用缓存：uni.getElementById 的跨桥查询不要放在每帧里做。
+
+  const PULL_ARM_RATIO = 0.92;
+  const PULL_DOTS_FADE_START = 0.35;
+  const PULL_DOTS_MORPH_START = 0.55;
+
+  let pullShellEl: UniElement | null = null;
+  let pullDotsEl: UniElement | null = null;
+  let pullDotLeftEl: UniElement | null = null;
+  let pullDotCenterEl: UniElement | null = null;
+  let pullDotRightEl: UniElement | null = null;
+  /** 底部 tabbar：拖动期要用反位移把它钉在原地（交互要求：tabbar 不动，
+   *  只有提交、会话页即将出现的最后一刻才一起下移隐藏）。 */
+  let pullTabBarEl: UniElement | null = null;
+  /** 灰色遮挡层：初期不透明，圆点出现时转半透明。 */
+  let pullScrimEl: UniElement | null = null;
+  let pullShellTransitionApplied = -1;
+  let pullDotsTransitionApplied = -1;
+  let pullTabBarTransitionApplied = -1;
+  let pullDotsVisible = false;
+  let pullDotsMorphed = false;
+  let pullScrimDimmed = false;
+
+  // 合成层写入耗时探针：fps 正常但单帧写入 > 8ms 时，说明跨桥 setProperty 是瓶颈，
+  // 下一步就该把整页位移下沉到原生（SmartRefreshLayout 包 shell）。
+  let pullShellPerfFrames = 0;
+  let pullShellPerfStartedAt = 0;
+  let pullShellPerfMaxCostMs = 0;
+
+  function flushPullShellPerf(tag: string): void {
+    if (pullShellPerfFrames > 0 && pullShellPerfStartedAt > 0) {
+      const elapsed = Math.max(1, Date.now() - pullShellPerfStartedAt);
+      const fps = (pullShellPerfFrames * 1000) / elapsed;
+      console.log(`[PullAgent] shell-perf-${tag} frames=${pullShellPerfFrames} fps=${fps.toFixed(1)} maxCost=${pullShellPerfMaxCostMs.toFixed(2)}ms`);
+    }
+    pullShellPerfFrames = 0;
+    pullShellPerfStartedAt = 0;
+    pullShellPerfMaxCostMs = 0;
+  }
+
+  function resolvePullNodes(): void {
+    if (pullShellEl != null) return;
+    // ★全部用局部快照再写样式：Kotlin 对「被闭包修改的可变变量」不做 smart cast，
+    //   `if (x != null) x.foo()` 会编译失败（Smart cast is impossible）。
+    const shell = uni.getElementById("partner-pull-shell") as UniElement | null;
+    const dots = uni.getElementById("partner-pull-dots") as UniElement | null;
+    const left = uni.getElementById("partner-pull-dot-left") as UniElement | null;
+    const center = uni.getElementById("partner-pull-dot-center") as UniElement | null;
+    const right = uni.getElementById("partner-pull-dot-right") as UniElement | null;
+    const tabBar = uni.getElementById("main-common-tab-bar") as UniElement | null;
+    const scrim = uni.getElementById("partner-pull-scrim") as UniElement | null;
+    pullShellEl = shell;
+    pullDotsEl = dots;
+    pullDotLeftEl = left;
+    pullDotCenterEl = center;
+    pullDotRightEl = right;
+    pullTabBarEl = tabBar;
+    pullScrimEl = scrim;
+    pullShellTransitionApplied = -1;
+    pullDotsTransitionApplied = -1;
+    pullTabBarTransitionApplied = -1;
+    if (tabBar != null) tabBar.style.setProperty("transform", "translateY(0px)");
+    pullScrimDimmed = false;
+    if (scrim != null) scrim.style.setProperty("opacity", "1");
+    // 新元素：把圆点状态与 DOM 对齐（旧节点可能停在「展开/可见」态，而状态标记已清）。
+    pullDotsVisible = false;
+    pullDotsMorphed = false;
+    if (dots != null) dots.style.setProperty("opacity", "0");
+    if (left != null) {
+      left.style.setProperty("transform", "translateX(12px)");
+      left.style.setProperty("opacity", "0");
+    }
+    if (right != null) {
+      right.style.setProperty("transform", "translateX(-12px)");
+      right.style.setProperty("opacity", "0");
+    }
+    if (center != null) center.style.setProperty("transform", "scale(1)");
+    if (shell != null) {
+      console.log(`[PullAgent] nodes-ready shell=1 dots=${dots != null} tabbar=${tabBar != null}`);
+    }
+  }
+
+  /** 页面重建/卸载后节点会换新，缓存必须失效。 */
+  function clearPullNodes(): void {
+    pullShellEl = null;
+    pullDotsEl = null;
+    pullDotLeftEl = null;
+    pullDotCenterEl = null;
+    pullDotRightEl = null;
+    pullTabBarEl = null;
+    pullScrimEl = null;
+    pullShellTransitionApplied = -1;
+    pullDotsTransitionApplied = -1;
+    pullTabBarTransitionApplied = -1;
+    pullDotsVisible = false;
+    pullDotsMorphed = false;
+    pullScrimDimmed = false;
+  }
+
+  function applyShellTransition(durationMs: number): void {
+    const shell = pullShellEl;
+    if (shell == null) return;
+    const next = Math.max(0, durationMs);
+    if (next == pullShellTransitionApplied) return;
+    pullShellTransitionApplied = next;
+    shell.style.setProperty("transition-property", "transform, opacity");
+    shell.style.setProperty("transition-duration", `${next}ms`);
+    shell.style.setProperty("transition-timing-function", next <= 0 ? "linear" : "cubic-bezier(0.22, 0.78, 0.2, 1)");
+  }
+
+  function applyTabBarTransition(durationMs: number): void {
+    const tabBar = pullTabBarEl;
+    if (tabBar == null) return;
+    const next = Math.max(0, durationMs);
+    if (next == pullTabBarTransitionApplied) return;
+    pullTabBarTransitionApplied = next;
+    tabBar.style.setProperty("transition-property", "transform");
+    tabBar.style.setProperty("transition-duration", `${next}ms`);
+    tabBar.style.setProperty("transition-timing-function", next <= 0 ? "linear" : "cubic-bezier(0.22, 0.78, 0.2, 1)");
+  }
+
+  function applyDotsTransition(durationMs: number): void {
+    const dots = pullDotsEl;
+    if (dots == null) return;
+    const next = Math.max(0, durationMs);
+    if (next == pullDotsTransitionApplied) return;
+    pullDotsTransitionApplied = next;
+    dots.style.setProperty("transition-property", "transform, opacity");
+    dots.style.setProperty("transition-duration", `${next}ms`);
+    dots.style.setProperty("transition-timing-function", next <= 0 ? "linear" : "cubic-bezier(0.22, 0.78, 0.2, 1)");
+  }
+
+  /** 单点 ↔ 三点：只在跨段时切换一次，形变交给 CSS 过渡（不逐帧写）。 */
+  function applyDotsMorph(morphed: boolean): void {
+    if (morphed == pullDotsMorphed) return;
+    pullDotsMorphed = morphed;
+    const left = pullDotLeftEl;
+    if (left != null) {
+      left.style.setProperty("transition-property", "transform, opacity");
+      left.style.setProperty("transition-duration", "180ms");
+      left.style.setProperty("transition-timing-function", "ease-out");
+      left.style.setProperty("transform", morphed ? "translateX(0px)" : "translateX(12px)");
+      left.style.setProperty("opacity", morphed ? "1" : "0");
+    }
+    const right = pullDotRightEl;
+    if (right != null) {
+      right.style.setProperty("transition-property", "transform, opacity");
+      right.style.setProperty("transition-duration", "180ms");
+      right.style.setProperty("transition-timing-function", "ease-out");
+      right.style.setProperty("transform", morphed ? "translateX(0px)" : "translateX(-12px)");
+      right.style.setProperty("opacity", morphed ? "1" : "0");
+    }
+    const center = pullDotCenterEl;
+    if (center != null) {
+      center.style.setProperty("transition-property", "transform");
+      center.style.setProperty("transition-duration", "180ms");
+      center.style.setProperty("transition-timing-function", "ease-out");
+      center.style.setProperty("transform", morphed ? "scale(0.5)" : "scale(1)");
+    }
+  }
+
+  function applyDotsVisible(visible: boolean): void {
+    if (visible == pullDotsVisible) return;
+    pullDotsVisible = visible;
+    const dots = pullDotsEl;
+    if (dots == null) return;
+    dots.style.setProperty("opacity", visible ? "1" : "0");
+  }
+
+  /** 灰色遮挡：只做一次跨段切换（圆点出现 = 转半透明），不逐帧写。 */
+  function applyScrimDimmed(dimmed: boolean): void {
+    if (dimmed == pullScrimDimmed) return;
+    pullScrimDimmed = dimmed;
+    const scrim = pullScrimEl;
+    if (scrim == null) return;
+    scrim.style.setProperty("transition-property", "opacity");
+    scrim.style.setProperty("transition-duration", "180ms");
+    scrim.style.setProperty("transition-timing-function", "ease-out");
+    scrim.style.setProperty("opacity", dimmed ? "0.55" : "1");
+  }
+
+  /** 提交时灰层彻底淡出，交给下面的会话页占满。 */
+  function fadeOutScrim(durationMs: number): void {
+    const scrim = pullScrimEl;
+    if (scrim == null) return;
+    scrim.style.setProperty("transition-property", "opacity");
+    scrim.style.setProperty("transition-duration", `${Math.max(0, durationMs)}ms`);
+    scrim.style.setProperty("transition-timing-function", "linear");
+    scrim.style.setProperty("opacity", "0");
+  }
+
+  let pullFrameDebugActive = false;
+
+  /** 完整伙伴页的下拉合成帧。
+   *  拖动期只写 shell + 圆点的 translateY；提交时把整页推出屏幕，让下面的会话页占满。 */
+  const onPullAgentFrame = (
+    distanceValue: number,
+    thresholdValue: number,
+    transitionMs: number,
+    committing: boolean,
+  ): void => {
+    const startedAt = Date.now();
+    resolvePullNodes();
+    const shell = pullShellEl;
+    if (shell == null) return;
+    const dots = pullDotsEl;
+    const tabBar = pullTabBarEl;
+    const scrim = pullScrimEl;
+    const distance = Math.max(0, distanceValue);
+    const extent = Math.max(1, thresholdValue * PULL_ARM_RATIO);
+    const progress = Math.max(0, Math.min(distance / extent, 1));
+    if (!pullFrameDebugActive && distance > 0) {
+      pullFrameDebugActive = true;
+      console.log(`[PullAgent] shell-frame distance=${distance} threshold=${thresholdValue}`);
+    }
+    if (committing) {
+      console.log(`[PullAgent] shell-commit distance=${distance}`);
+      const screenHeight = Math.max(1, uni.getWindowInfo().windowHeight);
+      applyShellTransition(transitionMs);
+      shell.style.setProperty("transform", `translateY(${screenHeight}px)`);
+      shell.style.setProperty("opacity", "0");
+      // tabbar：提交这一刻才撤掉反位移，让它随整页一起滑出屏幕。
+      applyTabBarTransition(transitionMs);
+      if (tabBar != null) tabBar.style.setProperty("transform", "translateY(0px)");
+      applyDotsTransition(transitionMs);
+      applyDotsVisible(false);
+      fadeOutScrim(transitionMs);
+      return;
+    }
+    if (pullFrameDebugActive && distance <= 0) {
+      pullFrameDebugActive = false;
+      console.log("[PullAgent] shell-reset");
+    }
+    // 唯一逐帧写入：整页位移（列表在 pane 内已用等量反向位移抵消原生推下量）。
+    applyShellTransition(transitionMs);
+    if (distance <= 0) {
+      // 复位帧（松手回弹到底 / 导航成功后的隐藏期复位）：把提交时写下的 opacity
+      // 归位，否则回页会看到整页透明、只露出下层会话预览。
+      shell.style.setProperty("opacity", "1");
+      // 灰层同样复位成不透明的初始态，下一次下拉从"只见纯灰"开始。
+      pullScrimDimmed = false;
+      if (scrim != null) {
+        scrim.style.setProperty("transition-duration", "0ms");
+        scrim.style.setProperty("opacity", "1");
+      }
+    }
+    shell.style.setProperty("transform", `translateY(${distance}px)`);
+    // tabbar 拖动期反向抵消整页位移，钉在屏幕底部不动（交互要求）；
+    // shell 下移多少，它就上移多少，屏幕位置恒为 0。
+    applyTabBarTransition(transitionMs);
+    if (tabBar != null) {
+      tabBar.style.setProperty("transform", `translateY(${-distance}px)`);
+    }
+    // 圆点跟着下拉区域的垂直中心走；显隐/形变只在跨段时切一次。
+    applyDotsTransition(transitionMs);
+    if (dots != null) {
+      dots.style.setProperty("transform", `translateY(${distance * 0.5 - 9}px)`);
+    }
+    applyDotsVisible(progress >= PULL_DOTS_FADE_START);
+    applyDotsMorph(progress >= PULL_DOTS_MORPH_START);
+    // 灰层：一开始不透明（只见纯灰），圆点出现那一刻转半透明、透出会话页。
+    applyScrimDimmed(progress >= PULL_DOTS_FADE_START);
+    // 探针：只统计合成层写入本身，不含 pane 侧。
+    pullShellPerfFrames = pullShellPerfFrames + 1;
+    if (pullShellPerfStartedAt <= 0) pullShellPerfStartedAt = startedAt;
+    const cost = Date.now() - startedAt;
+    if (cost > pullShellPerfMaxCostMs) pullShellPerfMaxCostMs = cost;
+    if (distance <= 0) flushPullShellPerf("reset");
+  };
+
+  /** 会话页关闭前广播（chat → 这里）：把伙伴页合成层复位到静止态。
+   *  必须早于会话页滑出动画，否则滑出过程露出的是提交态（屏外/透明）。
+   *  ★不要 clearPullNodes：广播时会话页是栈顶，uni.getElementById 只能查栈顶页，
+   *    清掉缓存就再也查不到本页节点；这里复用缓存引用直接写样式。 */
+  const handlePullEntryClose = (_payload: any): void => {
+    onPullAgentFrame(0, 1, 0, false);
+  };
+
   watch((): string => mainTabActivePath.value, () => {
     if (mainTabPageVisible.value) syncMainTabLocation();
   });
@@ -54,12 +367,18 @@
       const path = decodeURIComponent(`${tab}`) ?? `${tab}`;
       if (isMainTabPath(path)) mainTabActivePath.value = path;
     }
+    uni.$on(PULL_AGENT_CLOSE_EVENT, handlePullEntryClose);
   });
   onShow(() => {
     safeArea.value = readMainTabSafeArea();
     syncNativeTabBarState();
     mainTabPageVisible.value = true;
     syncMainTabLocation();
+    // 下拉入口的会话页返回兜底：正常路径在会话页关闭前已复位（PULL_AGENT_CLOSE_EVENT），
+    // 这里再兜一次，保证回页第一帧就是正常伙伴页。
+    // ★不清节点缓存：清掉后要重新 getElementById，而本函数可能在页面尚未成为栈顶时
+    //   执行，查不到就只能放弃复位。ref 是常驻节点，长期有效。
+    onPullAgentFrame(0, 1, 0, false);
     // 新用户引导判定：未登录/拉取失败不 latch，下次 onShow 仍会重查（会话内至多一次）。
     // 弹窗改独立页（2026-10-21）：键盘让位吃页面级默认行为，背景 tab-shell 不受键盘影响
     maybePromptProfileSetup((_raw: UTSJSONObject): boolean => {
@@ -77,7 +396,12 @@
     settleMaskVisible.value = false;
   });
   onHide(() => { mainTabPageVisible.value = false; });
-  onUnmounted(() => { mainTabPageVisible.value = false; });
+  onUnmounted(() => {
+    uni.$off(PULL_AGENT_CLOSE_EVENT, handlePullEntryClose);
+    onPullAgentFrame(0, 1, 0, false);
+    clearPullNodes();
+    mainTabPageVisible.value = false;
+  });
   onBackPress((options: OnBackPressOptions): boolean => dispatchMainTabBack(mainTabActivePath.value, options));
   onResize((options: OnResizeOptions) => {
     safeArea.value = readMainTabSafeArea();
@@ -100,6 +424,80 @@
 </style>
 
 <style scoped>
+  .tab-shell-stage {
+    flex: 1;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+    background-color: #f4f3fb;
+  }
+
+  /* 下层的会话页预览：常驻、静止、不参与拖动期动画。
+     它只在 shell 被推下时露出，所以静止时完全被 shell 盖住。 */
+  .tab-shell__pull-preview {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 1;
+    opacity: 1;
+    pointer-events: none;
+  }
+
+  /* 灰色遮挡：初期不透明（只看得到灰），圆点出现时转 0.55 透出下层会话页，
+     提交时淡出到 0。 */
+  .tab-shell__pull-scrim {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 2;
+    background-color: #f4f3fb;
+    opacity: 1;
+    pointer-events: none;
+  }
+
+  .tab-shell__pull-dots {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    margin-left: -21px;
+    width: 42px;
+    height: 18px;
+    z-index: 4;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .tab-shell__pull-dot {
+    position: absolute;
+    top: 6px;
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background-color: #a9a8af;
+  }
+
+  .tab-shell__pull-dot--left {
+    left: 6px;
+    opacity: 0;
+  }
+
+  .tab-shell__pull-dot--center {
+    left: 15px;
+    top: 3px;
+    width: 12px;
+    height: 12px;
+    border-radius: 6px;
+  }
+
+  .tab-shell__pull-dot--right {
+    left: 30px;
+    opacity: 0;
+  }
+
   /* #ifdef APP */
   .tab-shell__settle-mask {
     position: fixed;
@@ -111,6 +509,20 @@
     background-color: #ffffff;
   }
   /* #endif */
+
+  /* 唯一承担下拉位移的合成层：transform 只写在这一层上。
+     overflow:hidden 必须保留：下拉时 pane 内的 scroll-view 被反向上移，超出本层的
+     那一截要被裁掉，顶部露出的是下层的会话页预览。 */
+  .tab-shell__shell {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 3;
+    overflow: hidden;
+    transform: translateY(0px);
+  }
 
   .tab-shell {
     flex: 1;

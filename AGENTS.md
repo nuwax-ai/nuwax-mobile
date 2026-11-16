@@ -251,3 +251,16 @@ pnpm publish:h5            # 发行/打包 H5（Web 产物输出至 unpackage/di
 - 网络请求统一走 `servers/` 目录的 UTS 模块，不要在页面里直接写 `uni.request`
 - `unpackage/` 下仅 `unpackage/dist/build/web/` 被允许提交（用于 H5 部署），其余产物不进版本库
 - 样式变量统一放在 [uni.scss](uni.scss)
+
+## 鸿蒙会话输入框踩坑记录
+
+会话详情页主输入框的鸿蒙实现经过真机验证，后续修改时保留以下约束：
+
+- 鸿蒙原生 `<textarea>` 的 placeholder 样式和聚焦行为不稳定：通过 `placeholder-style` 设置透明度时，进入页面可能出现文案由浅变深；在输入框上覆盖普通 `<text>` 自绘 placeholder 时，即使键盘被拉起，也可能出现输入框没有真正获得焦点。不要再用透明度方案修 placeholder，也不要仅靠覆盖层点击事件修主输入框聚焦。
+- `APP-HARMONY` 的主输入框使用 [components/chat-message-editor/chat-message-editor.uvue](components/chat-message-editor/chat-message-editor.uvue) 封装 `<editor>`；Android、iOS、H5 等平台继续使用原 `<textarea>`。不要为统一代码而把鸿蒙实现改回 `<textarea>`。
+- `<editor>` 内容按纯文本处理：通过 `EditorContext.setContents` 写入 delta，通过 `UniEditorInputEvent.detail.text` 回传 `v-model`，避免把富文本 HTML 写入现有消息发送链路。
+- `<editor>` ready 后再创建 `EditorContext` 和处理聚焦。程序化聚焦要在 `nextTick` 后调用 `UniEditorElement.focus()`；只切换 `focus`/`focusRequest` 状态不足以保证鸿蒙真机获得焦点。
+- placeholder 使用固定颜色 `#b6b5c1`，不叠加 opacity。只有输入内容非空时才隐藏；聚焦空输入框时仍应显示。轮播文案的原有白纱动画继续由 `chat-input-veil` 实现，并保持遮罩层级高于输入内容且 `pointer-events: none`。
+- 输入框高度仍由 [pages/message/chat.uvue](pages/message/chat.uvue) 的行数计算控制，最多自然增长到 4 行；超过 4 行后固定高度，并由 `.ql-editor` 内部 `overflow-y: auto` 显示 3px 垂直滚动条。不要让 `<editor>` 自己无限撑高。
+- `<editor>` 在鸿蒙中由内层 web-view 渲染，字体、padding、placeholder 和滚动条样式需要在 ready 后注入到 `.ql-editor` / `.ql-editor.ql-blank::before`；只写组件外层 scoped CSS 无法稳定覆盖内部样式。
+- 当前协作约定：除非用户明确要求，不主动运行 HBuilderX、`pnpm uni:build` 或任何平台编译；默认只做静态检查（如 `git diff --check`）。

@@ -18,11 +18,12 @@
   <!-- #endif -->
   <scroll-view
     v-if="scrollAlive"
+    id="partner-contact-scroll"
     class="im-pane"
     :key="scrollViewKey"
     :direction="menuVisible ? 'none' : 'vertical'"
     :show-scrollbar="false"
-    :refresher-enabled="pullEntryEnabled"
+    :refresher-enabled="nativeRefresherEnabled"
     :refresher-triggered="pullTriggered"
     :refresher-threshold="pullNativeThreshold"
     :refresher-max-drag-distance="pullMaxDragDistance"
@@ -37,6 +38,9 @@
     @touchend="emitPaneTouchEnd($event)"
     @touchcancel="emitPaneTouchCancel($event)"
   >
+    <!-- 滚动内容白底外壳：Android 的底色由这里提供（容器层留灰给惯性 overscroll），
+         其它平台本样式为空，只多一层透明包裹。内部节点未重排缩进以压缩 diff -->
+    <view class="im-pane-body">
     <!-- 新的伙伴入口行（PC DEV-413 对齐，微信「新的朋友」入口）：智联录最顶行，
          恒渲染——入口是导航不是数据，零记录的新用户也要能找到这一层（同「我的团队」
          入口行判据，与「我的群组」有群才显示相反）；角标只数待我处理的申请
@@ -338,7 +342,6 @@
                   <view v-if="group.myRole == 3" class="contact-tag contact-tag--owner">
                     <text class="contact-tag__text contact-tag__text--owner">{{ t("Mobile.Message.groupOwner") }}</text>
                   </view>
-                  <text class="chat-item__time">{{ formatConvTime(group.lastMsgAt) }}</text>
                 </view>
                 <text class="group-row__count">{{ groupMemberLabel(group) }}</text>
               </view>
@@ -420,9 +423,11 @@
         }}</text>
       </view>
     </template>
+    </view>
     <!-- 原生节点直接作为 refresher 插槽（置末位：App 端 refresher 取末个 slot 内容）。
          App 三端插槽只当「浅灰底 + 占位」用（不画圆点：拉过插槽高后圆点跟不上灰区），
          圆点改画在下面列表外的覆盖层里；H5/小程序仍把圆点画在插槽内（行程只到 60px）。 -->
+    <!-- #ifndef APP-ANDROID -->
     <view slot="refresher" class="pull-guide" :style="pullGuideRootStyle">
       <!-- #ifndef APP -->
       <view class="pull-guide__dots" :style="pullGuideDotsStyle">
@@ -432,6 +437,7 @@
       </view>
       <!-- #endif -->
     </view>
+    <!-- #endif -->
   </scroll-view>
   <!-- #ifdef APP -->
   <!-- 下拉圆点覆盖层：贴 pane 顶，高度 = 原生下拉位移 dy（=列表被推下来的那段空白），
@@ -451,7 +457,7 @@
 </template>
 
 <script setup lang="uts">
-  import { computed, getCurrentInstance, nextTick, ref, watch } from "vue";
+  import { computed, getCurrentInstance, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import iconGroupSet from "@/static/icons/group_set.png";
   import iconNewPartner from "@/static/icons/new_partner.svg";
@@ -461,13 +467,22 @@
     avatarBoxStyle as avatarBoxStyleOf,
     avatarGradient as avatarGradientOf,
     displayConvName as displayConvNameOf,
-    formatConvTime as formatConvTimeOf,
     groupMemberLabel as groupMemberLabelOf,
     isExpertContact as isExpertContactOf,
     spaceRoleTagClass as spaceRoleTagClassOf,
     spaceRoleText as spaceRoleTextOf,
     spaceRoleTextClass as spaceRoleTextClassOf,
   } from "./im-row-helpers.uts";
+  // #ifdef APP-ANDROID
+  import {
+    attachAndroidPullAction,
+    detachAndroidPullAction,
+    setAndroidPullActionEnabled,
+  } from "@/uni_modules/nuwax-android-pull-action";
+  import View from "android.view.View";
+  import ViewGroup from "android.view.ViewGroup";
+  import Color from "android.graphics.Color";
+  // #endif
 
   // 事件名须 kebab-case：App-Android 模板监听会把 camelCase 转小写导致收不到（add-menu-drawer 同规约）
   const emit = defineEmits<{
@@ -617,7 +632,6 @@
   const avatarBoxStyle = avatarBoxStyleOf;
   const avatarGradient = (name: string): string => avatarGradientOf(name);
   const displayConvName = (conv: ImConvRow): string => displayConvNameOf(conv);
-  const formatConvTime = (ts: number): string => formatConvTimeOf(ts);
   const groupMemberLabel = (conv: ImConvRow): string => groupMemberLabelOf(conv);
   const isExpertContact = (contact: ImContactRow): boolean => isExpertContactOf(contact);
   const spaceRoleTagClass = (space: ImSpaceRow): string => spaceRoleTagClassOf(space);
@@ -625,6 +639,15 @@
   const spaceRoleTextClass = (space: ImSpaceRow): string => spaceRoleTextClassOf(space);
 
   const componentInstance = getCurrentInstance();
+  /** Android 关闭 scroll-view 自带 refresher，改由 SmartRefreshLayout 单独接管手势。 */
+  const nativeRefresherEnabled = computed((): boolean => {
+    // #ifdef APP-ANDROID
+    return false;
+    // #endif
+    // #ifndef APP-ANDROID
+    return props.pullEntryEnabled;
+    // #endif
+  });
   /** scroll-view 的 key：enabled 翻转要重建（见 pullEntryEnabled 注释）。
    *  回页强制归位走上面的 v-if（见 scrollAlive），不叠在这把 key 上，免一次翻两遍容器。 */
   const scrollViewKey = computed((): string => {
@@ -703,6 +726,139 @@
   /** 松手前至少 120ms 位移变化不超过 2px，且有连续原生位移样本。 */
   const PULL_ANDROID_STILL_MS = 120;
   const PULL_ANDROID_STILL_DY = 2;
+  // #endif
+  // #ifdef APP-ANDROID
+  const ANDROID_PULL_KEY = "partner-contact-pull";
+  const ANDROID_PULL_ELEMENT_ID = "partner-contact-scroll";
+  let androidPullAttachTimer = 0;
+  let androidPullAttachAttempts = 0;
+  let androidPullAttachGeneration = 0;
+
+  /** 刷新外壳（插件包在 scroll-view 外的 SmartRefreshLayout）底色 = 下拉灰区同色。
+   *  ★它原先写死白色：静止下拉时被原生 header 盖住看不出来，但快速甩动到顶后列表的
+   *    惯性 overscroll 不经过 header，露出的就是外壳本身 —— 顶部会出现一条白边。
+   *    插件侧已改为直接用传入色（PullActionBridge.kt），此处是热更兜底（不重打自定义
+   *    基座也能生效）；重打基座后与本函数叠加，同色幂等。 */
+  function applyAndroidPullWrapperColor(): void {
+    const el = uni.getElementById(ANDROID_PULL_ELEMENT_ID);
+    if (el == null) {
+      return;
+    }
+    const host = el.getAndroidView();
+    if (host instanceof View) {
+      const parent = (host as View).getParent();
+      if (parent instanceof ViewGroup) {
+        (parent as ViewGroup).setBackgroundColor(Color.parseColor("#f4f3fb"));
+      }
+    }
+  }
+
+  function handleAndroidPullProgress(distanceValue: number, dragging: boolean): void {
+    const distance = Math.max(0, Math.min(distanceValue, props.pullMaxDragDistance));
+    if (dragging && pullGuideDistance.value <= 0 && distance > 0) {
+      pullHapticFired = false;
+    }
+    if (!pullHapticFired && distance >= props.pullThreshold * PULL_ARM_RATIO) {
+      pullHapticFired = true;
+      try {
+        uni.vibrateShort({
+          type: "light",
+          fail: (_err) => {
+            // ignore
+          },
+        });
+      } catch (_eVibrate) {
+        // ignore
+      }
+    }
+    if (Math.abs(pullGuideDistance.value - distance) >= 0.5) {
+      pullGuideDistance.value = distance;
+    }
+  }
+
+  function handleAndroidPullTriggered(): void {
+    emit("pull-refresh");
+  }
+
+  function handleAndroidPullSettled(triggered: boolean): void {
+    pullGuideDistance.value = 0;
+    pullHapticFired = false;
+    if (triggered) {
+      emit("pull-restore");
+    } else {
+      emit("pull-abort");
+    }
+  }
+
+  function attachAndroidPullActionNow(generation: number): void {
+    androidPullAttachTimer = 0;
+    if (generation != androidPullAttachGeneration || !scrollAlive.value) return;
+    const attached = attachAndroidPullAction(
+      ANDROID_PULL_KEY,
+      ANDROID_PULL_ELEMENT_ID,
+      props.pullThreshold,
+      props.pullMaxDragDistance,
+      "#f4f3fb",
+      props.pullEntryEnabled && !props.menuVisible,
+      handleAndroidPullProgress,
+      handleAndroidPullTriggered,
+      handleAndroidPullSettled,
+    );
+    if (attached) {
+      // wrap 完成后外层才是 SmartRefreshLayout，此刻设底色（见上面注释）
+      applyAndroidPullWrapperColor();
+      androidPullAttachAttempts = 0;
+      return;
+    }
+    androidPullAttachAttempts = androidPullAttachAttempts + 1;
+    if (androidPullAttachAttempts < 30) {
+      androidPullAttachTimer = setTimeout((): void => {
+        attachAndroidPullActionNow(generation);
+      }, 50);
+    }
+  }
+
+  function queueAndroidPullAttach(): void {
+    if (androidPullAttachTimer != 0) clearTimeout(androidPullAttachTimer);
+    androidPullAttachAttempts = 0;
+    const generation = androidPullAttachGeneration + 1;
+    androidPullAttachGeneration = generation;
+    nextTick((): void => {
+      if (generation != androidPullAttachGeneration || !scrollAlive.value) return;
+      attachAndroidPullActionNow(generation);
+    });
+  }
+
+  onMounted((): void => {
+    queueAndroidPullAttach();
+  });
+
+  onUnmounted((): void => {
+    androidPullAttachGeneration = androidPullAttachGeneration + 1;
+    if (androidPullAttachTimer != 0) clearTimeout(androidPullAttachTimer);
+    androidPullAttachTimer = 0;
+    detachAndroidPullAction(ANDROID_PULL_KEY);
+  });
+
+  watch((): boolean => props.pullEntryEnabled && !props.menuVisible, (enabled: boolean): void => {
+    setAndroidPullActionEnabled(ANDROID_PULL_KEY, enabled);
+  });
+  watch((): boolean => scrollAlive.value, (alive: boolean): void => {
+    if (alive) {
+      queueAndroidPullAttach();
+      return;
+    }
+
+    if (androidPullAttachTimer != 0) {
+      clearTimeout(androidPullAttachTimer);
+    }
+    androidPullAttachGeneration = androidPullAttachGeneration + 1;
+    androidPullAttachTimer = 0;
+    androidPullAttachAttempts = 0;
+    detachAndroidPullAction(ANDROID_PULL_KEY);
+    pullGuideDistance.value = 0;
+    pullHapticFired = false;
+  });
   // #endif
   /** 重建滚动容器时把下拉位移一并清零：跳转打断收回的话 refresherrestore 不会来，
    *  pullGuideDistance 会停在松手时的值，重建后圆点按旧位移显示。 */
@@ -1072,6 +1228,10 @@
   /** 手指按下：解冻（上一轮的回弹动画可能还在跑，但新的下拉要能跟手）。 */
   function emitPaneTouchStart(eventValue: Any): void {
     const e = eventValue as UniTouchEvent;
+    // #ifdef APP-ANDROID
+    emit("pane-touchstart", e);
+    return;
+    // #endif
     pullGuideFrozen = false;
     pullGuideDragging = true;
     pullReleaseFired = false;
@@ -1094,6 +1254,10 @@
 
   function emitPaneTouchEnd(eventValue: Any): void {
     const e = eventValue as UniTouchEvent;
+    // #ifdef APP-ANDROID
+    emit("pane-touchend", e);
+    return;
+    // #endif
     pullGuideDragging = false;
     pullReleaseDistance = pullGuideDistance.value;
     pullReleaseQualified = isPullReleaseQualified(e);
@@ -1124,6 +1288,10 @@
   }
 
   function emitPaneTouchCancel(eventValue: Any): void {
+    // #ifdef APP-ANDROID
+    emit("pane-touchcancel", eventValue as UniTouchEvent);
+    return;
+    // #endif
     pullGuideDragging = false;
     // ★不要清 touchstart 采样与越线速度：App-Android 的原生刷新控件一接管下拉手势就会
     //   派 touchcancel（实测手指移动 ~40ms 后），之后到达的 pulling / touchend 仍要靠
@@ -1245,10 +1413,22 @@
   /* ★本样式块与 conv-list-pane 各持一份 .chat-item 全族（App 端 scoped 样式按
      组件解析，跨组件不生效）——改任一份必须同步另一份（R5 同步注释）。 */
 
-  /* 与页头同处一列：占满页头以下剩余高度 */
+  /* swiper-item 内列表：撑满页高（swiper-item 自身随 swiper 拉伸，子级须显式 100%） */
   .im-pane {
-    flex: 1;
-    min-height: 0;
+    height: 100%;
+    /* ★App-Android 不给滚动容器自己铺白：外层 SmartRefreshLayout 的底色已是下拉
+       灰区色（见 nuwax-android-pull-action PullActionBridge.kt），快速甩动到顶的
+       惯性 overscroll 会拉伸滚动控件、露出容器底色。白底必须由下面的
+       .im-pane-body（滚动内容）提供，容器留透明才会露出灰。 */
+  }
+
+  /* 滚动内容白底外壳（仅 Android 需要，其它端 list 底色本就来自页面白） */
+  .im-pane-body {
+    /* #ifdef APP-ANDROID */
+    background-color: #ffffff;
+    /* 内容不足一屏时也尽量撑满，避免列表末尾露出灰色容器底 */
+    min-height: 100%;
+    /* #endif */
   }
 
   /* #ifdef APP */
@@ -1467,14 +1647,6 @@
     line-height: 20.5px;
     font-weight: 400;
     color: #141416;
-  }
-
-  .chat-item__time {
-    margin-left: 8px;
-    flex-shrink: 0;
-    font-size: 13.5px;
-    line-height: 18px;
-    color: #8f959e;
   }
 
   /* 长按浮层行高亮：取按压态同色（#eceaf3，状态一致优先）；气泡/蒙层样式在

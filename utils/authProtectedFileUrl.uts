@@ -130,16 +130,21 @@ export function extractPathnameFromRemoteUrl(url: string): string {
 
 /**
  * 受保护文件换 ak 流式直链（对齐 PC 端 /api/file/ak/refresh 契约）：
- * GET {base}/api/file/ak/refresh?url=<encodeURIComponent(pathname)> →
+ * GET {base}/api/file/ak/refresh?url=<encodeURIComponent(pathname)>[&download=1] →
  * data = 原地址 + ?ak=<临时签名>。访问该地址 302 到对象存储（s3p）流输出，
  * Range 206 已验证——可直接喂 <video>/<audio> 渐进播放，免去整段下载。
  * 接口匿名可调（ak 即短期凭证），仍带 Bearer 兼容后续收紧鉴权。
  * 非 200 / 非 0000 / data 非法一律 reject，由调用方自行回落旧下载路径。
+ *
+ * @param forDownload true = 要落盘保存（附件下载）：按平台契约补 `download=1`，
+ *   PC 端 media.ts 的 DEV-340 实现即如此（「需要落盘的传 download=1，只做展示的不传」）。
+ *   图片/视频流式播放保持 false，避免把内联资源换成 attachment 形态。
  */
-export function fetchAuthProtectedFileAkUrl(url: string): Promise<string> {
+export function fetchAuthProtectedFileAkUrl(url: string, forDownload: boolean = false): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const encodedPath = encodeURIComponent(extractPathname(url));
-    const fetchUrl = `${getApiBaseUrl()}/api/file/ak/refresh?url=${encodedPath}`;
+    const downloadFlag = forDownload ? "&download=1" : "";
+    const fetchUrl = `${getApiBaseUrl()}/api/file/ak/refresh?url=${encodedPath}${downloadFlag}`;
     uni.request({
       url: fetchUrl,
       method: "GET",
@@ -403,6 +408,27 @@ function isLocalImageFileIntact(filePath: string): boolean {
   }
 }
 
+/**
+ * 从下载链路抛出的错误里取出可展示的原因文本（取不到返回空串）。
+ *
+ * 本链路自己 reject 的一律是 Error（message 里带 statusCode / errMsg）；
+ * 拿到别的类型时 `as Error` 在 Kotlin 侧会抛 ClassCastException，这里吞掉返回空串。
+ * 用途：下载失败 toast 透出具体原因，避免只看到「下载失败，请检查网络」无从定位。
+ */
+export function errorReasonText(err: any | null): string {
+  if (err == null) {
+    return "";
+  }
+  try {
+    // 不走 instanceof：本链路自己抛的必然是 Error（message 带 statusCode/errMsg），
+    // 若拿到的是别的东西，强转在 Kotlin 侧抛异常，统一吞掉返回空串即可。
+    const message = (err as Error).message;
+    return message != null ? message.trim() : "";
+  } catch (_eCast) {
+    return "";
+  }
+}
+
 function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Promise<string> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -459,7 +485,8 @@ function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Pro
         console.error(
           `[ProtectedFile] downloadFile statusCode=${res.statusCode} temp=${tempPath != null ? tempPath : ""} url=${fetchUrl}`,
         );
-        reject(new Error());
+        // 原因写进 Error.message：日志里能看出被哪个状态码挡下（原先空 Error 无从定位）
+        reject(new Error(`statusCode=${res.statusCode}`));
       },
       fail: (err) => {
         if (settled) return;
@@ -467,10 +494,11 @@ function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Pro
         // #ifdef APP-HARMONY
         settle();
         // #endif
+        const rawFailMsg = err.errMsg != null ? `${err.errMsg}` : "";
         console.error(
-          `[ProtectedFile] downloadFile fail: ${err.errMsg != null ? err.errMsg : ""} url=${fetchUrl}`,
+          `[ProtectedFile] downloadFile fail: ${rawFailMsg} url=${fetchUrl}`,
         );
-        reject(err);
+        reject(new Error(rawFailMsg.length > 0 ? rawFailMsg : "downloadFile fail"));
       },
     });
     // #ifdef APP-HARMONY
@@ -484,26 +512,112 @@ function downloadProtectedFileOnce(fetchUrl: string, header: UTSJSONObject): Pro
   });
 }
 
+// #ifdef APP-HARMONY
+/**
+ * 落盘内容是不是**平台的错误信封**。
+ *
+ * 平台对匿名 GET `/api/f/s3/**` 回的是 **HTTP 200 + `{"code":"4010","message":"未登录或登录超时","success":false}`**
+ * （不是 401/403，见 IM 对接文档 §10-37）——只看状态码会把这坨 JSON 当文件存下来，
+ * 用户看到「下载成功」却打不开。兜底链里必须拦掉这种假成功。
+ *
+ * 信封很小：超过 4KB 一律不看内容直接放行（避免把视频整段读进内存）。
+ */
+async function isPlatformErrorEnvelopeFile(filePath: string): Promise<boolean> {
+  const size = await new Promise<number>((resolve) => {
+    uni.getFileSystemManager().getFileInfo({
+      filePath: filePath,
+      success: (res) => {
+        resolve(res.size);
+      },
+      fail: (_err) => {
+        resolve(-1);
+      },
+    });
+  });
+  if (size < 0 || size > 4096) {
+    return false;
+  }
+  const text = await new Promise<string>((resolve) => {
+    uni.getFileSystemManager().readFile({
+      filePath: filePath,
+      encoding: "utf8",
+      success: (res) => {
+        resolve(res.data as string);
+      },
+      fail: (_err) => {
+        resolve("");
+      },
+    });
+  });
+  const trimmed = text != null ? text.trim() : "";
+  if (trimmed.indexOf("{") != 0) {
+    return false;
+  }
+  const hasFailFlag = trimmed.indexOf("\"success\":false") >= 0 || trimmed.indexOf("\"success\": false") >= 0;
+  const hasCode = trimmed.indexOf("\"code\":") >= 0 || trimmed.indexOf("\"code\": ") >= 0;
+  return hasFailFlag && hasCode;
+}
+// #endif
+
+// #ifdef APP-HARMONY
+/**
+ * 鸿蒙受保护文件下载的三级兜底链（ak 直链 → 原址匿名 → 原址 Bearer），返回临时文件路径。
+ *
+ * 为什么必须走 ak：网关 302 到对象存储时鸿蒙下载器会把 Authorization 原样转发，
+ * S3/MinIO 把 Bearer 当非法签名直接回 400（2026-11-02 真机实证）。
+ * 为什么保留后两级：ak 换链失败不等于文件取不到——不经对象存储重定向的私有部署
+ * 匿名或 Bearer 都能读，不能让下载整个不可用（fail-open，与图片链路同口径）。
+ * 每一级都要过错误信封校验：平台对匿名 `/api/f/` 回的是 HTTP 200 + 未登录 JSON。
+ */
+async function downloadProtectedFileOnHarmony(fetchUrl: string, header: UTSJSONObject): Promise<string> {
+  let akFailReason = "";
+  try {
+    const akUrl = await fetchAuthProtectedFileAkUrl(fetchUrl, true);
+    const akTempPath = await downloadProtectedFileOnce(akUrl, {} as UTSJSONObject);
+    if (await isPlatformErrorEnvelopeFile(akTempPath)) {
+      throw new Error("ak 地址返回错误信封");
+    }
+    return akTempPath;
+  } catch (akError) {
+    akFailReason = errorReasonText(akError);
+    if (akFailReason.length == 0) {
+      akFailReason = "unknown";
+    }
+  }
+  // 兜底一：原址匿名（不带任何鉴权头）
+  try {
+    const anonTempPath = await downloadProtectedFileOnce(fetchUrl, {} as UTSJSONObject);
+    if (await isPlatformErrorEnvelopeFile(anonTempPath)) {
+      throw new Error("匿名原址返回错误信封");
+    }
+    return anonTempPath;
+  } catch (_anonError) {
+    // 继续走下一级兜底
+  }
+  // 兜底二：原址带 Bearer（兼容不重定向的私有部署；302 场景必 400）
+  const bearerTempPath = await downloadProtectedFileOnce(fetchUrl, header);
+  if (await isPlatformErrorEnvelopeFile(bearerTempPath)) {
+    throw new Error(`ak:${akFailReason}; bearer:错误信封`);
+  }
+  return bearerTempPath;
+}
+// #endif
+
 /**
  * App 端把受保护文件下载到临时目录。
  *
- * 鸿蒙不能直接带 Bearer 下载 /api/f/...：网关 302 到对象存储后，下载器会把
- * Authorization 原样转发，S3/MinIO 将 Bearer 当成非法签名并返回 400。先通过
- * ak refresh 换取临时签名地址，再以空请求头下载；ak 链路不可用时回落原地址，
- * 兼容不经对象存储重定向的私有部署。Android/iOS 保持原来的 Bearer 下载。
+ * 鸿蒙走 downloadProtectedFileOnHarmony 的三级兜底链（ak → 匿名 → Bearer），
+ * Android/iOS 保持原来的 Bearer 下载（这两端跨主机重定向会丢鉴权头，不受影响）。
  */
 export async function downloadAuthProtectedFileToTemp(url: string): Promise<string> {
   const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
   const header = buildAuthProtectedFileHeaders();
   // #ifdef APP-HARMONY
-  try {
-    const akUrl = await fetchAuthProtectedFileAkUrl(fetchUrl);
-    return await downloadProtectedFileOnce(akUrl, {} as UTSJSONObject);
-  } catch (akError) {
-    console.error(`[ProtectedFile] ak 下载失败，回落原地址 url=${fetchUrl}`, akError);
-  }
+  return await downloadProtectedFileOnHarmony(fetchUrl, header);
   // #endif
+  // #ifndef APP-HARMONY
   return await downloadProtectedFileOnce(fetchUrl, header);
+  // #endif
 }
 
 async function downloadProtectedImageWithIntegrityCheck(

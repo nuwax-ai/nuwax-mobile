@@ -22,8 +22,8 @@ let coldStartScheme = "";
 /**
  * 是否启用尚未验收的新分享。
  *
- * false（当前默认）：直接系统分享或复制，不弹出「分享到女娲 / 其他」。
- * true：分享先弹出「分享到女娲 / 其他」。
+ * false：直接系统分享或复制，不弹出分享面板。
+ * true：分享先弹出微信浏览器式分享面板（转发给会话 / 其他应用，其余入口先占位）。
  * 文件预览、网页预览的外链始终是 `{域名}/m/static/share-open.html`：
  * 微信内点「打开 App」只提示用浏览器打开；其它应用里先看页面内容，再点按钮用 nuwax:// 唤起 App。
  */
@@ -256,16 +256,103 @@ export function shareConversationLink(title: string, pageUrl: string): void {
   });
 }
 
-/**
- * 新分享先选去向：分享到女娲（选会话发文本），或交给调用方继续系统分享 / 复制链接。
- * 开关关闭时不弹选择面板，直接走调用方原来的系统分享或复制。
- * 智能体、网页、会话菜单、会话消息、文件预览都从这里出去。
- */
-export function chooseShareTarget(title: string, body: string, shareOutside: () => void): void {
-  if (USE_NEW_ARTIFACT_SHARE != true) {
-    shareOutside();
-    return;
+/** 分享面板入参。当前页的 share-sheet 组件读取，不单独开页面。 */
+export class PendingShareSheet {
+  title: string = "";
+  /** 发进女娲会话的正文，通常是标题加链接。 */
+  body: string = "";
+  /** 可复制、可在浏览器打开的 http(s) 链接。 */
+  url: string = "";
+  /** 面板顶栏「此网页由 xxx 提供」。 */
+  host: string = "";
+}
+
+/** 当前页挂上的分享面板。后挂的盖住先挂的，关闭时按 id 摘掉。 */
+class ShareSheetBinding {
+  id: number = 0;
+  notify: () => void = (): void => {};
+}
+
+let pendingSheet: PendingShareSheet | null = null;
+let pendingOutside: (() => void) | null = null;
+/** 本次分享的「刷新」。网页预览、文件预览传入；没有则面板里点刷新只提示占位。 */
+let pendingRefresh: (() => void) | null = null;
+let shareSheetOpen = false;
+let shareSheetBindings: ShareSheetBinding[] = [];
+let shareSheetBindingSeq = 1;
+
+function httpUrlIn(raw: string): string {
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line.indexOf("https://") == 0 || line.indexOf("http://") == 0) return line;
   }
+  return "";
+}
+
+function hostOfHttp(raw: string): string {
+  const scheme = raw.indexOf("://");
+  const rest = scheme >= 0 ? raw.substring(scheme + 3) : raw;
+  // indexOf 返回 number，end 显式标 number（length 是 Int，裸推断后赋值报 Number→Int）
+  let end: number = rest.length;
+  const slash = rest.indexOf("/");
+  const question = rest.indexOf("?");
+  const hash = rest.indexOf("#");
+  if (slash >= 0 && slash < end) end = slash;
+  if (question >= 0 && question < end) end = question;
+  if (hash >= 0 && hash < end) end = hash;
+  return rest.substring(0, end);
+}
+
+function clearPendingShare(): void {
+  pendingSheet = null;
+  pendingOutside = null;
+  pendingRefresh = null;
+}
+
+function notifyTopShareSheet(): void {
+  if (shareSheetBindings.length == 0) return;
+  shareSheetBindings[shareSheetBindings.length - 1].notify();
+}
+
+/** 页面挂上分享面板时登记。返回 id，卸载时交给 unbindShareSheet。 */
+export function bindShareSheet(notify: () => void): number {
+  const item = new ShareSheetBinding();
+  item.id = shareSheetBindingSeq;
+  shareSheetBindingSeq += 1;
+  item.notify = notify;
+  shareSheetBindings.push(item);
+  return item.id;
+}
+
+/** 页面卸载时摘掉自己的面板，避免关页后还通知到已销毁组件。 */
+export function unbindShareSheet(id: number): void {
+  const next: ShareSheetBinding[] = [];
+  for (let i = 0; i < shareSheetBindings.length; i++) {
+    if (shareSheetBindings[i].id != id) next.push(shareSheetBindings[i]);
+  }
+  shareSheetBindings = next;
+}
+
+export function isShareSheetOpen(): boolean {
+  return shareSheetOpen;
+}
+
+/** 先收起当前页面板，再执行后续动作。 */
+function closeShareSheetThen(action: (() => void) | null): void {
+  let ran = false;
+  const run = (): void => {
+    if (ran) return;
+    ran = true;
+    if (action != null) action();
+  };
+  shareSheetOpen = false;
+  notifyTopShareSheet();
+  clearPendingShare();
+  run();
+}
+
+function showLegacyShareSheet(title: string, body: string, shareOutside: () => void): void {
   uni.showActionSheet({
     itemList: [t("Mobile.Share.toNuwax"), t("Mobile.Share.toOther")],
     cancelText: t("Mobile.Common.cancel"),
@@ -283,6 +370,91 @@ export function chooseShareTarget(title: string, body: string, shareOutside: () 
       shareOutside();
     },
   });
+}
+
+export function peekShareSheet(): PendingShareSheet | null {
+  return pendingSheet;
+}
+
+/** 分享到女娲：关掉面板后进入选会话页。 */
+export function runShareToNuwax(): void {
+  const sheet = pendingSheet;
+  const title = sheet != null && sheet.title.length > 0 ? sheet.title : t("Mobile.Share.appName");
+  const text = sheet != null && sheet.body.length > 0 ? sheet.body : title;
+  closeShareSheetThen(() => {
+    if (hasLoginSession() != true) {
+      uni.showToast({ title: t("Mobile.Share.loginRequired"), icon: "none" });
+      redirectToLoginOnce();
+      return;
+    }
+    openShareIntoChat(title, text);
+  });
+}
+
+/** 分享到其他应用：交给调用方原来的系统分享或复制。 */
+export function runShareOutside(): void {
+  const fn = pendingOutside;
+  closeShareSheetThen(fn);
+}
+
+/**
+ * 刷新当前页。调用方打开面板时传入了刷新函数才执行，否则返回 false 由面板提示占位。
+ */
+export function runShareRefresh(): boolean {
+  const fn = pendingRefresh;
+  if (fn == null) return false;
+  closeShareSheetThen(() => {
+    fn();
+    uni.showToast({ title: t("Mobile.Share.refreshed"), icon: "none" });
+  });
+  return true;
+}
+
+/** 点遮罩或取消。 */
+export function dismissShareSheet(): void {
+  closeShareSheetThen(null);
+}
+
+/**
+ * 新分享先打开当前页里的分享面板：转发给女娲会话，或交给调用方继续系统分享 / 复制链接。
+ * 开关关闭时不弹面板，直接走调用方原来的系统分享或复制。
+ * 页面需挂 components/share-sheet。当前页没挂时退回两项菜单。
+ * 微信小程序仍用两项菜单。
+ * @param onRefresh 网页 / 文件预览的刷新；没有可刷新内容时传 null
+ */
+export function chooseShareTarget(
+  title: string,
+  body: string,
+  shareOutside: () => void,
+  onRefresh: (() => void) | null = null,
+): void {
+  if (USE_NEW_ARTIFACT_SHARE != true) {
+    shareOutside();
+    return;
+  }
+  const sheet = new PendingShareSheet();
+  sheet.title = title;
+  sheet.body = body.length > 0 ? body : title;
+  sheet.url = httpUrlIn(sheet.body);
+  const nested = queryValue(sheet.url, "url");
+  const hostSource =
+    nested.indexOf("https://") == 0 || nested.indexOf("http://") == 0 ? nested : sheet.url;
+  sheet.host = hostOfHttp(hostSource);
+  pendingSheet = sheet;
+  pendingOutside = shareOutside;
+  pendingRefresh = onRefresh;
+  // #ifdef MP-WEIXIN
+  clearPendingShare();
+  showLegacyShareSheet(title, sheet.body, shareOutside);
+  return;
+  // #endif
+  if (shareSheetBindings.length == 0) {
+    clearPendingShare();
+    showLegacyShareSheet(title, sheet.body, shareOutside);
+    return;
+  }
+  shareSheetOpen = true;
+  notifyTopShareSheet();
 }
 
 /** 唤起系统分享面板，把中转页发给微信等。 */

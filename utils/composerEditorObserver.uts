@@ -105,7 +105,7 @@ export function observeWebComposer(q: any, report: (state: UTSJSONObject) => voi
 }
 
 /** 原生 editor 已支持 input 的 delta 透传；只附加观测信息，不改内容和 SDK。 */
-export function buildComposerEditorObserverScript(watchIOSViewport: boolean = false): string {
+export function buildComposerEditorObserverScript(watchIOSViewport: boolean = false, harmonyCaretAnchor: boolean = false): string {
   return `(function installComposerObserver(attempt){
     var root=document.querySelector('.ql-container');
     var q=root&&(root.__quill||(window.Quill&&window.Quill.find(root)));
@@ -113,6 +113,15 @@ export function buildComposerEditorObserverScript(watchIOSViewport: boolean = fa
     if(q.__nuwaxLayoutVersion===3){q.__nuwaxRequestLayout();return;}
     q.__nuwaxObserver=true;q.__nuwaxLayoutVersion=3;
     var watchViewport=${watchIOSViewport ? "true" : "false"},iosScrollable=false;
+    /* 鸿蒙空文档光标锚点（2026-11-13 真机日志实证）：
+       空输入框里 collapsed range 的 rect 全 0（caret=0,0,0,0），ArkUI 拿不到锚点，
+       系统「粘贴 / 权限」浮窗就回落到页面顶部；有正文时 rect 正常、浮窗也正常。
+       CSS 伪元素（零宽 ::before）经真机验证无效 —— Chromium 只认真实文本节点。
+       故空文档时在开头常驻一个零宽空格（U+200B，silent 插入，不进 undo 栈）；
+       它只存在于编辑器内部，原生侧展示/发送用的纯文本必须过 stripAnchor 剔除，
+       而 indexed 文本（@ 触发、mention 原子替换下标）必须保留它才能与 Quill 索引对齐。 */
+    var harmonyAnchor=${harmonyCaretAnchor ? "true" : "false"};var ZWSP=String.fromCharCode(0x200B);
+    function stripAnchor(s){return s==null?'':String(s).split(ZWSP).join('');}
     // iOS 首页仅允许五行以上的编辑内容滚动，文档和外层容器始终停在原点。
     function resetIOSScroll(){
       if(!watchViewport)return;
@@ -179,7 +188,7 @@ export function buildComposerEditorObserverScript(watchIOSViewport: boolean = fa
         syncIOSScroll(measured);
         if(measured&&typeof triggerEvent==='function')triggerEvent('nuwax-layout',measured);
         delta.__nuwaxComposer={layout:measured,text:text,cursor:range?range.index:-1,length:range?range.length:0,composing:composing,reason:pending,viewportCollapsed:window.innerWidth===0||window.innerHeight===0};
-        if(typeof triggerEvent==='function')triggerEvent('input',{text:q.getText(),html:q.root.innerHTML,delta:delta});
+        if(typeof triggerEvent==='function')triggerEvent('input',{text:stripAnchor(q.getText()),html:q.root.innerHTML,delta:delta});
         pending='';pasted=false;
       },0);
     }
@@ -213,5 +222,36 @@ export function buildComposerEditorObserverScript(watchIOSViewport: boolean = fa
     q.__nuwaxRequestLayout=function(){schedule('layout');};
     schedule('layout');
     q.root.addEventListener('keydown',function(e){if(e.key==='Escape')schedule('dismiss');});
+    if(harmonyAnchor){
+      // 只有换行/空格也算空（零宽字符本身要忽略）
+      function visuallyBlank(){
+        var t=stripAnchor(q.getText()||'');
+        for(var i=0;i<t.length;i++){var c=t.charCodeAt(i);if(c!==10&&c!==13&&c!==32&&c!==160)return false;}
+        return true;
+      }
+      // 零宽字符会让 Quill 认为「非空」从而摘掉 ql-blank，placeholder 会消失；这里补回来
+      function syncBlankClass(){
+        if(!q.root||!q.root.classList)return;
+        if(visuallyBlank()){if(!q.root.classList.contains('ql-blank'))q.root.classList.add('ql-blank');}
+        else if(q.root.classList.contains('ql-blank'))q.root.classList.remove('ql-blank');
+      }
+      function ensureAnchor(){
+        try{
+          if(!visuallyBlank())return;
+          if((q.getText()||'').indexOf(ZWSP)>=0)return;
+          q.insertText(0,ZWSP,'silent');
+          q.setSelection(1,0,'silent');
+          syncBlankClass();
+        }catch(eEnsure){}
+      }
+      // 锚点插入后一直留着（silent，不进 undo 栈、不触发 text-change）：
+      // 用户开始输入后它仍在正文最前面，所以「回传给原生的纯文本 / indexed 文本 /
+      // @ 触发坐标」必须口径一致 —— 见 conversation-input 的 stripComposerAnchor
+      // 与 indexedEditorText 注释（indexed 保持 Quill 原始索引，不能剔）。
+      q.root.addEventListener('focusin',function(){setTimeout(ensureAnchor,0);});
+      q.on('selection-change',function(){syncBlankClass();if(visuallyBlank())setTimeout(ensureAnchor,0);});
+      q.on('text-change',function(){setTimeout(syncBlankClass,0);});
+      setTimeout(function(){if(document.activeElement===q.root)ensureAnchor();},0);
+    }
   })();`;
 }

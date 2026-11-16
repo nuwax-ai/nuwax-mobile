@@ -177,6 +177,7 @@
       :config="tenantConfigInfoVal"
       :element-id="buttonId"
       @doAction="handlerSuccess"
+      @onReady="handleH5CaptchaReady"
     />
     <!-- #endif -->
   <!-- #ifdef APP -->
@@ -203,7 +204,7 @@
   import { apiErrorMessage } from "@/utils/apiResponse";
   import { redirectTo } from "@/utils/common";
   import { getApiBaseUrl } from "@/constants/config";
-  import { extractCaptchaVerifyParam } from "@/utils/aliyunCaptcha";
+  import { extractCaptchaVerifyParam, H5_CAPTCHA_SETTLE_EVENT } from "@/utils/aliyunCaptcha";
   import { saveAccessToken } from "@/utils/authSession";
   import { notifyImSessionReady } from "@/utils/im/imSessionScope";
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
@@ -406,6 +407,32 @@
   });
   // 阿里云验证码按钮id
   const buttonId = ref<string>("aliyun-captcha-id");
+  // #ifdef H5 || WEB
+  // 必须在用户点击登录的调用栈里打开验证码。延迟 click() 不是用户手势，
+  // 阿里云设备校验会生成无效参数，登录接口返回校验参数异常。
+  let h5CaptchaReady = false;
+
+  function handleH5CaptchaReady(): void {
+    h5CaptchaReady = true;
+  }
+
+  function settleH5Captcha(passed: boolean): void {
+    uni.$emit(H5_CAPTCHA_SETTLE_EVENT, passed);
+  }
+
+  function isCaptchaParamAccepted(result: any): boolean {
+    if (result == null) {
+      return false;
+    }
+    const resObj = result as UTSJSONObject;
+    const code = `${resObj["code"]}`;
+    if (code == SUCCESS_CODE) {
+      return true;
+    }
+    const message = resObj["message"] != null ? `${resObj["message"]}` : "";
+    return message.indexOf("校验参数") < 0;
+  }
+  // #endif
   // #ifdef MP-WEIXIN
   const captchaResultEvent = "login_aliyun_captcha_result";
   let waitingCaptchaResult = false;
@@ -660,10 +687,10 @@
   }
 
   // ====== 账号密码登录 ======
-  async function handlePasswordLogin(captchaVerifyParam: string): Promise<void> {
+  async function handlePasswordLogin(captchaVerifyParam: string): Promise<boolean> {
     if (!validateLoginParams()) {
       loading.value = false;
-      return;
+      return false;
     }
     const pass = password.value;
     if (pass.length == 0) {
@@ -672,7 +699,7 @@
         icon: "none",
       });
       loading.value = false;
-      return;
+      return false;
     }
     const params = new LoginFieldType();
     params.phoneOrEmail = account.value;
@@ -686,8 +713,15 @@
       loading.value = true;
       const result = await apiLogin(params);
       handleLoginSuccess(result as UTSJSONObject);
+      // #ifdef H5 || WEB
+      return isCaptchaParamAccepted(result);
+      // #endif
+      // #ifndef H5 || WEB
+      return true;
+      // #endif
     } catch (error) {
       showAuthError(error);
+      return false;
     } finally {
       if (!loginCompleted.value) refreshImageCaptcha();
       loading.value = false;
@@ -695,9 +729,9 @@
   }
 
   // ====== 下一步（验证码登录） ======
-  async function handleNext(captchaVerifyParam: string): Promise<void> {
+  async function handleNext(captchaVerifyParam: string): Promise<boolean> {
     if (!validateLoginParams()) {
-      return;
+      return false;
     }
     const params = new SendCode();
     // Android：勿赋 SendCodeEnum，会序列化为 { value: "LOGIN_OR_REGISTER" }
@@ -716,6 +750,9 @@
       loading.value = true;
       const res = await apiSendCode(params);
       const resObj = res as UTSJSONObject;
+      // #ifdef H5 || WEB
+      const captchaAccepted = isCaptchaParamAccepted(res);
+      // #endif
       const code = `${resObj["code"]}`;
       const message = resObj["message"] != null ? `${resObj["message"]}` : "";
       if (isTenantEmailAuth.value) {
@@ -751,8 +788,15 @@
           });
         }
       }
+      // #ifdef H5 || WEB
+      return captchaAccepted;
+      // #endif
+      // #ifndef H5 || WEB
+      return true;
+      // #endif
     } catch (error) {
       showAuthError(error);
+      return false;
     } finally {
       refreshImageCaptcha();
       loading.value = false;
@@ -761,21 +805,40 @@
 
   // ====== 阿里云验证码成功回调 ======
   async function handlerSuccess(captchaVerifyParam: string): Promise<void> {
-    if (authRequestRunning || loginCompleted.value) return;
+    if (authRequestRunning || loginCompleted.value) {
+      // #ifdef H5 || WEB
+      settleH5Captcha(false);
+      // #endif
+      return;
+    }
+    if (captchaVerifyParam == "[object Object]") {
+      loading.value = false;
+      // #ifdef H5 || WEB
+      settleH5Captcha(false);
+      // #endif
+      return;
+    }
     if (!validateImageCaptcha()) {
       loading.value = false;
+      // #ifdef H5 || WEB
+      settleH5Captcha(false);
+      // #endif
       return;
     }
     authRequestRunning = true;
+    let captchaPassed = true;
     try {
       if (isCaptchaVerify.value) {
-        await handleNext(captchaVerifyParam);
+        captchaPassed = await handleNext(captchaVerifyParam);
       } else {
-        await handlePasswordLogin(captchaVerifyParam);
+        captchaPassed = await handlePasswordLogin(captchaVerifyParam);
       }
     } finally {
       authRequestRunning = false;
       loading.value = false;
+      // #ifdef H5 || WEB
+      settleH5Captcha(captchaPassed);
+      // #endif
     }
   }
 
@@ -918,13 +981,17 @@
 
     if (needAliyunCaptcha) {
       // #ifdef H5 || WEB
-      // H5和WEB端验证码
-      const el = document.getElementById(buttonId.value);
-      if (el != null) {
-        el.click();
-      } else {
+      // 弹出模式由初始化时绑定的按钮触发，必须在这次点击里点它，验证码通过后才会发登录请求。
+      if (!h5CaptchaReady) {
         loading.value = false;
+        return;
       }
+      const captchaButton = document.getElementById(buttonId.value);
+      if (captchaButton != null) {
+        captchaButton.click();
+      }
+      // 滑块弹出期间不要停在加载态。验证通过后 handlerSuccess 会再进入加载。
+      loading.value = false;
       // #endif
       // #ifdef APP
       // App 三端：页内弹层加载验证码页，校验结果经 web-view message 回传。

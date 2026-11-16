@@ -74,7 +74,7 @@
   import { onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
   // #endif
   import { useShareLink, ShareLinkOptions } from "@/hooks/useShareLink";
-  import { chooseShareTarget, USE_NEW_ARTIFACT_SHARE } from "@/utils/appShare";
+  import { buildShareOpenUrl, chooseShareTarget, ShareTarget, USE_NEW_ARTIFACT_SHARE } from "@/utils/appShare";
   import {
     parseUrlInfo,
     getFileName,
@@ -153,9 +153,8 @@
 
   /**
    * 产物分享标题。
-   * 开关关闭时用文件名或页面标题本身，与已上线的 file-preview 分享一致。
-   * 开关打开后才包「【】」，供新中转页和系统分享摘要使用。
-   * 微信转发卡片也走这里，所以新旧产物的卡片标题一起切换。
+   * 开关关闭时用文件名或页面标题本身。
+   * 开关打开后才包「【】」，供系统分享摘要和微信转发卡片使用。
    */
   const getShareTitle = (): string => {
     const title = navTitle.value;
@@ -196,28 +195,37 @@
     return `${shareKey}`;
   }
 
-  /**
-   * 分享/外链地址不得携带会话内预览标记 mode=preview。当前分享链接由 shareKey 独立拼接、
-   * 本不含该标记；此处作兜底过滤，防止日后误把带标记的 previewUrl 用于分享场景。
-   */
-  const stripPreviewMode = (url: string): string => {
-    if (url.indexOf("mode=preview") < 0) return url;
-    let s = url.replace("&mode=preview", "");
-    s = s.replace("?mode=preview&", "?");
-    s = s.replace("?mode=preview", "");
-    return s;
-  };
-
-  /** 分享链接缓存：同一页面生命周期内只请求一次 shareKey，避免每次操作重复创建分享 */
+  /** 分享链接缓存：同一页面生命周期内只生成一次，避免连点重复创建分享 */
   let shareUrlCache: string | null = null;
 
   /**
-   * 生成产物分享链接，并经 stripPreviewMode 兜底。
-   * 会话内预览地址带 mode=preview，绝不能外泄到分享链接。
-   *
-   * 开关关闭：回到已验收的静态预览页 `/static/file-preview.html?sk=`。
-   * 开关打开：走尚未验收的中转页 `/m/static/share-open.html?kind=file&sk=`。
-   * 同一页面生命周期只请求一次 shareKey，避免连点重复创建分享。
+   * 从外链里去掉会话内预览标记和登录票据。
+   * mode=preview、_ticket 只服务 App 内打开，不能出现在分享链接里。
+   */
+  const stripShareOnlyQuery = (url: string): string => {
+    const hashIdx = url.indexOf("#");
+    const hash = hashIdx >= 0 ? url.substring(hashIdx) : "";
+    const base = hashIdx >= 0 ? url.substring(0, hashIdx) : url;
+    const qIdx = base.indexOf("?");
+    if (qIdx < 0) return url;
+    const path = base.substring(0, qIdx);
+    const parts = base.substring(qIdx + 1).split("&");
+    let next = "";
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part.indexOf("mode=") == 0 || part.indexOf("_ticket=") == 0) continue;
+      if (next.length > 0) next = next + "&";
+      next = next + part;
+    }
+    if (next.length == 0) return path + hash;
+    return path + "?" + next + hash;
+  };
+
+  /**
+   * 生成分享中转页。
+   * 有 shareKey 的产物走 kind=file，对方打开后直接看到文件，并可用按钮唤起女娲。
+   * 没有 shareKey 的地址（如 IM 直链）走 kind=page，中转页内嵌这份地址。
+   * 同一页面生命周期只生成一次，避免连点重复创建分享。
    */
   const getShareUrl = async (): Promise<string> => {
     // shareUrlCache 是异步闭包内会改写的 let，不能直接智能判空（Kotlin smart cast 限制），先取快照
@@ -225,19 +233,38 @@
     if (cached != null && cached.length > 0) {
       return cached;
     }
-    if (baseUrl.length == 0) {
+    const target = new ShareTarget();
+    target.title = navTitle.value;
+    const existingSk = sk.value;
+    if (previewSource.value == FILE_PREVIEW_SOURCE_ARTIFACT || existingSk.length > 0) {
+      let shareKey = existingSk;
+      if (shareKey.length == 0) {
+        if (baseUrl.length == 0) {
+          throw new Error(t("Mobile.FilePreview.shareDomainMissing"));
+        }
+        const cIdVal = conversationId.value != null ? (conversationId.value as string) : "";
+        shareKey = await getConversationShareKey(
+          cIdVal,
+          fileProxyUrl.value != null ? fileProxyUrl.value : "",
+        );
+      }
+      target.kind = "file";
+      target.sk = shareKey;
+      if (baseUrl.indexOf("http://") == 0 || baseUrl.indexOf("https://") == 0) {
+        target.pageUrl = baseUrl + "/static/file-preview.html?sk=" + shareKey;
+      }
+    } else {
+      const raw = stripShareOnlyQuery(previewUrl.value);
+      if (raw.indexOf("http://") != 0 && raw.indexOf("https://") != 0) {
+        throw new Error(t("Mobile.FilePreview.getShareKeyFailed"));
+      }
+      target.kind = "page";
+      target.pageUrl = raw;
+    }
+    const previewUrlValue = buildShareOpenUrl(target);
+    if (previewUrlValue.indexOf("http://") != 0 && previewUrlValue.indexOf("https://") != 0) {
       throw new Error(t("Mobile.FilePreview.shareDomainMissing"));
     }
-    const cIdVal = conversationId.value != null ? (conversationId.value as string) : "";
-    const shareKey = await getConversationShareKey(
-      cIdVal,
-      fileProxyUrl.value != null ? fileProxyUrl.value : "",
-    );
-    // 新中转页未验收前保持旧产物。改 utils/appShare.uts 的 USE_NEW_ARTIFACT_SHARE 即可切换。
-    const artifactSharePath = USE_NEW_ARTIFACT_SHARE == true
-      ? `/m/static/share-open.html?kind=file&sk=${shareKey}`
-      : `/static/file-preview.html?sk=${shareKey}`;
-    const previewUrlValue = stripPreviewMode(`${baseUrl}${artifactSharePath}`);
     shareUrlCache = previewUrlValue;
     return previewUrlValue;
   };
@@ -252,69 +279,23 @@
   const share = useShareLink(shareOptions);
   const handleShare = share.handleShare;
 
-  /** 非产物入口：不调 shareKey，只把当前地址写入剪贴板。IM 只复制正在打开的文件链接。 */
-  function copyPreviewAddress(): void {
-    let url = previewUrl.value;
-    if (url.length == 0) {
+  /**
+   * 外链一律是中转页：对方先看到文件，再从页面上的按钮回到女娲。
+   * USE_NEW_ARTIFACT_SHARE 只决定要不要先选「分享到女娲 / 其他」；
+   * 关闭时直接系统分享或复制这份中转页。
+   */
+  async function handleShareClick(): Promise<void> {
+    try {
+      const url = await getShareUrl();
+      chooseShareTarget(wrapShareTitle(navTitle.value), url, () => {
+        handleShare();
+      });
+    } catch (_error) {
       uni.showToast({
         title: t("Mobile.FilePreview.getShareKeyFailed"),
         icon: "none",
-        duration: 2000,
       });
-      return;
     }
-    uni.setClipboardData({
-      data: url,
-      success: () => {
-        uni.showToast({
-          title: t("Mobile.Share.shareSuccess"),
-          icon: "none",
-          duration: 2000,
-        });
-      },
-      fail: () => {
-        uni.showToast({
-          title: t("Mobile.Share.shareFailed"),
-          icon: "none",
-          duration: 2000,
-        });
-      },
-    });
-  }
-
-  /**
-   * 产物入口由 USE_NEW_ARTIFACT_SHARE 决定链接和交互。
-   * 关闭时直接系统分享或复制旧的 file-preview 链接。
-   * 打开时先弹出「分享到女娲 / 其他」，外部去向再交给 useShareLink。
-   * 非产物入口（如 IM）关闭开关时只复制当前地址；打开后才出现选择面板。
-   */
-  async function handleShareClick(): Promise<void> {
-    if (previewSource.value == FILE_PREVIEW_SOURCE_ARTIFACT) {
-      if (USE_NEW_ARTIFACT_SHARE != true) {
-        handleShare();
-        return;
-      }
-      try {
-        const url = await getShareUrl();
-        chooseShareTarget(getShareTitle(), url, () => {
-          handleShare();
-        });
-      } catch (_error) {
-        uni.showToast({
-          title: t("Mobile.FilePreview.getShareKeyFailed"),
-          icon: "none",
-        });
-      }
-      return;
-    }
-    const url = previewUrl.value;
-    if (url.length == 0) {
-      copyPreviewAddress();
-      return;
-    }
-    chooseShareTarget(wrapShareTitle(navTitle.value), url, () => {
-      copyPreviewAddress();
-    });
   }
 
   /** 仅 html/htm 需要抓 <title>，其他类型（pdf/图片等）不必整包下载 */

@@ -1,0 +1,187 @@
+import { TENANT_CONFIG_INFO } from "@/constants/home.constants";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiTenantConfig } from "@/servers/account";
+import { apiPublishedAgentInfo } from "@/servers/agentDev";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+
+/**
+ * 任意 JSON 值 → JSON 文本（解析前的统一入口）。
+ * ★不能用 `Array.isArray` 判嵌套数组：Android 端从 UTSJSONObject 里取出来的数组是
+ *   UTSJSONArray，`Array.isArray` 不认（恒 false），提示语列表会被整段丢掉；
+ *   字符串（服务端把配置以 JSON 文本下发）直接用，其余值一律 JSON.stringify 归一化。
+ */
+function toJsonText(value: any | null): string {
+  if (value == null) return "";
+  // UTS 不支持 `value is string` 收窄（error18），用 typeof 判
+  if (typeof value == "string") {
+    const text = (value as string).trim();
+    return text.length > 0 ? text : "";
+  }
+  // JSON.stringify 返回非空 string（UTS 类型定义），空指代只可能是字面量 "null"
+  const trimmed = JSON.stringify(value).trim();
+  return trimmed == "null" ? "" : trimmed;
+}
+
+/** Android 端不能把 UTSJSONObject 元素直接 cast 成业务 interface。 */
+function parseConfigRows(value: any | null): UTSJSONObject[] {
+  const text = toJsonText(value);
+  if (text.length == 0) return [];
+  try {
+    const parsed = JSON.parse<UTSJSONObject[]>(text);
+    return parsed != null ? parsed : [];
+  } catch (_e) {
+    return [];
+  }
+}
+
+/** 任意 JSON 值 → 非空字符串数组（同一套 JSON 文本归一化，见 toJsonText）。 */
+function toStringList(value: any | null): string[] {
+  const out: string[] = [];
+  const text = toJsonText(value);
+  if (text.length == 0) return out;
+  try {
+    const values = JSON.parse<any[]>(text);
+    if (values == null) return out;
+    for (let i = 0; i < values.length; i++) {
+      const prompt = values[i] != null ? `${values[i]}`.trim() : "";
+      if (prompt.length > 0) out.push(prompt);
+    }
+  } catch (_e) {
+    return out;
+  }
+  return out;
+}
+
+/** 读租户配置整包缓存（TENANT_CONFIG_INFO）：空/损坏返回 null。
+ *  ★getStorageSync 也要放在 try 里：iOS 端 key 不存在时框架直接 throw
+ *   （「返回值为：undefined」），会打断调用方的同步栈——本函数现在在页面 setup 阶段就被调。 */
+export function readCachedTenantConfig(): UTSJSONObject | null {
+  try {
+    const cached = uni.getStorageSync(TENANT_CONFIG_INFO);
+    if (cached == null || `${cached}`.trim().length == 0) return null;
+    return JSON.parse<UTSJSONObject>(`${cached}`);
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** 读 defaultIMAgentConfig 的全部行（服务端以 JSON 字符串/数组返回）。 */
+function readDefaultAgentRows(rawConfig: UTSJSONObject | null): UTSJSONObject[] {
+  if (rawConfig == null) return [];
+  return parseConfigRows(rawConfig["defaultIMAgentConfig"]);
+}
+
+/** 按平台原生 agentId 读同一行的 prompts（下拉直达入口建会话回包没带 peerUserId 时兜底）。 */
+export function readDefaultAgentPromptsByAgentId(rawConfig: UTSJSONObject | null, agentId: number): string[] {
+  if (rawConfig == null || isNaN(agentId) || agentId <= 0) return [];
+  const rows = readDefaultAgentRows(rawConfig);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (parseInt(`${row["agentId"]}`, 10) != agentId) continue;
+    return toStringList(row["prompts"]);
+  }
+  return [];
+}
+
+/**
+ * 按 **IM 用户 id** 读智能体单聊输入框的动态占位提示（多条轮播）。
+ *
+ * 配置行 `defaultIMAgentConfig[]` 每项 = `{ agentId, userId, prompts }`：
+ * `userId` 是该智能体在 IM 侧的身份 id —— 与会话列表的 `peerUserId`、消息记录的
+ * `senderId`（`senderType==2`）同一个值域，直接相等比较即可，无需换算。
+ * 未配置/取不到返回空数组（调用方回落通用文案）。
+ */
+export function readDefaultAgentPrompts(rawConfig: UTSJSONObject | null, userId: number): string[] {
+  if (rawConfig == null || isNaN(userId) || userId <= 0) return [];
+  const rows = readDefaultAgentRows(rawConfig);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (parseInt(`${row["userId"]}`, 10) != userId) continue;
+    // prompts 是嵌套数组（Android 为 UTSJSONArray）：走 JSON 文本解析，见 toJsonText
+    return toStringList(row["prompts"]);
+  }
+  return [];
+}
+
+/**
+ * 读租户配置中的默认 IM 智能体 ID：**恒取 defaultIMAgentConfig 数组的第一项**
+ * （平台按下发顺序给，第一项即管理员配置的首个智能体；不排序、不记忆上次使用，
+ *  未配置/解析失败返回 0）。
+ */
+export function readDefaultIMAgentId(rawConfig: UTSJSONObject | null): number {
+  if (rawConfig == null) return 0;
+  const rows = parseConfigRows(rawConfig["defaultIMAgentConfig"]);
+  if (rows.length == 0) return 0;
+  const id = parseInt(`${rows[0]["agentId"]}`, 10);
+  return id > 0 ? id : 0;
+}
+
+/** 默认智能体名称缓存键前缀（按 agentId 分键：换租户/换默认智能体各取各的）。 */
+const DEFAULT_AGENT_NAME_CACHE_PREFIX = "IM_DEFAULT_AGENT_NAME_";
+
+/**
+ * 读取默认智能体名称缓存（伙伴页下拉提示语「下拉进入{name}会话」用）。
+ * 写入方：下拉创建会话回包的 peerName、会话详情回包的 peerName、平台智能体详情兜底。
+ * 取不到返回空串（调用方回落通用文案「智能体」）。
+ */
+export function readCachedDefaultAgentName(agentId: number): string {
+  if (agentId <= 0) return "";
+  try {
+    const raw = uni.getStorageSync(`${DEFAULT_AGENT_NAME_CACHE_PREFIX}${agentId}`);
+    return raw != null ? `${raw}`.trim() : "";
+  } catch (_e) {
+    return "";
+  }
+}
+
+/** 写默认智能体名称缓存（空名不覆盖已有缓存）。 */
+export function cacheDefaultAgentName(agentId: number, name: string): void {
+  const trimmed = name.trim();
+  if (agentId <= 0 || trimmed.length == 0) return;
+  try {
+    uni.setStorageSync(`${DEFAULT_AGENT_NAME_CACHE_PREFIX}${agentId}`, trimmed);
+  } catch (_e) {
+    // 缓存失败不影响业务：下次仍可回落通用文案。
+  }
+}
+
+/**
+ * 解析默认 IM 智能体 ID（缓存优先）：缓存里没有 defaultIMAgentConfig（旧版本后端 /
+ * 登录页游客态拉取的缓存）时补拉一次 /api/tenant/config 并写回整包缓存，再取第一项。
+ * 拉取失败返回 0（下拉入口关闭，不影响列表）。
+ */
+export async function resolveDefaultIMAgentId(): Promise<number> {
+  const cachedId = readDefaultIMAgentId(readCachedTenantConfig());
+  if (cachedId > 0) return cachedId;
+  try {
+    const res = await apiTenantConfig();
+    const dataRaw = apiResCode(res) == SUCCESS_CODE ? apiResData<any>(res) : null;
+    if (dataRaw == null) return 0;
+    const config = dataRaw as UTSJSONObject;
+    uni.setStorageSync(TENANT_CONFIG_INFO, JSON.stringify(config));
+    return readDefaultIMAgentId(config);
+  } catch (_e) {
+    return 0;
+  }
+}
+
+/**
+ * 解析默认 IM 智能体名称：名称缓存优先，缺失时向平台查一次智能体详情
+ * （/api/published/agent/{id}）并回写缓存；都取不到返回空串
+ * （调用方回落通用文案「智能体」）。永不抛错。
+ */
+export async function resolveDefaultIMAgentName(agentId: number): Promise<string> {
+  const cached = readCachedDefaultAgentName(agentId);
+  if (cached.length > 0 || agentId <= 0) return cached;
+  try {
+    const res = await apiPublishedAgentInfo(agentId, false, null, true);
+    const dataRaw = apiResCode(res) == SUCCESS_CODE ? apiResData<any>(res) : null;
+    if (dataRaw == null) return "";
+    const nameRaw = (dataRaw as UTSJSONObject)["name"];
+    const name = nameRaw != null ? `${nameRaw}`.trim() : "";
+    if (name.length > 0) cacheDefaultAgentName(agentId, name);
+    return name;
+  } catch (_e) {
+    return "";
+  }
+}

@@ -58,24 +58,13 @@
       >
         {{ t('Mobile.QrLogin.done') }}
       </button>
-      <!-- #ifdef H5 || WEB -->
-      <view v-if="showOpenApp && state == 'ready'" class="qr-app-actions">
-        <text class="qr-link" @tap="openApp">{{
-          t('Mobile.QrLogin.openApp')
-        }}</text>
-        <text class="qr-hint">{{ t('Mobile.QrLogin.browserFallback') }}</text>
-        <text class="qr-link" @tap="downloadApp">{{
-          t('Mobile.QrLogin.download')
-        }}</text>
-      </view>
-      <!-- #endif -->
     </view>
   </view>
 </template>
 
 <script setup lang="uts">
 import { computed, ref } from 'vue';
-import { onLoad, onShow, onHide, onUnload } from '@dcloudio/uni-app';
+import { onLoad, onShow, onHide, onUnload, onBackPress } from '@dcloudio/uni-app';
 import {
   apiQrLoginUser,
   apiQrLoginScan,
@@ -99,13 +88,15 @@ import {
   normalizeQrLoginOrigin,
   validQrLoginScene,
   qrLoginPageUrl,
-  qrLoginAppUrl,
 } from '@/utils/qrLogin';
 import { switchMainTab } from '@/utils/mainTabNavigation';
 import { useI18n, emptyI18nParams } from '@/utils/i18n';
 // #ifdef H5 || WEB
 import { authBrowserQuery } from '@/utils/idpNavigation';
-import { isAppWebViewEmbedded } from '@/utils/appWebViewDetect';
+import {
+  isNativeAppWebView,
+  ensureAppWebViewNavigationReady,
+} from '@/utils/appWebViewNavigation';
 // #endif
 
 const { t: translate } = useI18n();
@@ -115,7 +106,6 @@ const accountName = ref<string>('');
 const accountLabel = ref<string>('');
 const serviceOrigin = ref<string>('');
 const errorText = ref<string>('');
-const showOpenApp = ref<boolean>(false);
 const confirmationAttempted = ref<boolean>(false);
 let sceneId = '';
 let shownAccountKey = '';
@@ -123,6 +113,7 @@ let revision = 0;
 let running = false;
 let foreground = true;
 let pageToken = '';
+let leaving = false;
 
 const title = computed((): string => {
   if (state.value == 'success') return t('Mobile.QrLogin.success');
@@ -256,6 +247,62 @@ function retryLogin(): void {
   prepareLogin();
 }
 
+function returnHome(): void {
+  switchMainTab({
+    url: '/pages/message/message',
+    fail: (_error) => {
+      leaving = false;
+    },
+  });
+}
+function finish(): void {
+  if (leaving) return;
+  leaving = true;
+  // 导航开始就废弃请求，避免离页期间的 401 再次拉起登录。
+  foreground = false;
+  invalidate();
+  // #ifdef H5 || WEB
+  if (isNativeAppWebView()) {
+    // 旧客户端从原生扫码页打开本网页。退回已有页面，保留首页实例与登录态刷新链；
+    // reLaunch 重建首页会触发旧容器清理与新容器显示的竞态，导致「我的」误显未登录。
+    const exitRevision = revision;
+    ensureAppWebViewNavigationReady().then((ready: boolean): void => {
+      if (exitRevision != revision) {
+        leaving = false;
+        return;
+      }
+      try {
+        if (ready) {
+          const w = window as any;
+          w.uni.webView.navigateBack({ delta: 1 });
+          return;
+        }
+      } catch (_error) {
+        // 保留完成/取消入口，允许用户再次退出。
+      }
+      leaving = false;
+    });
+    return;
+  }
+  // #endif
+  // 外部唤起、登录回跳会 reLaunch 到本页，栈底无页可退。
+  if (getCurrentPages().length <= 1) {
+    returnHome();
+    return;
+  }
+  uni.navigateBack({
+    delta: 1,
+    fail: (_error: any) => {
+      returnHome();
+    },
+  });
+}
+function cancelLogin(): void {
+  sceneId = '';
+  state.value = 'cancelled';
+  finish();
+}
+
 async function confirmLogin(): Promise<void> {
   if (running || state.value != 'ready' || shownAccountKey.length == 0) return;
   const value = revision,
@@ -280,6 +327,12 @@ async function confirmLogin(): Promise<void> {
     const confirmed = await apiQrLoginConfirm(sceneId, serviceOrigin.value);
     if (!accepted(confirmed, value, token)) return;
     state.value = 'success';
+    // #ifdef APP
+    finish();
+    // #endif
+    // #ifdef H5 || WEB
+    if (isNativeAppWebView()) finish();
+    // #endif
   } catch (_error) {
     if (stillCurrent(value, token)) {
       state.value = 'error';
@@ -293,24 +346,12 @@ async function confirmLogin(): Promise<void> {
     if (value == revision) running = false;
   }
 }
-function cancelLogin(): void {
-  invalidate();
-  sceneId = '';
-  state.value = 'cancelled';
-}
-function finish(): void {
-  uni.navigateBack({
-    fail: (_error: any) => {
-      switchMainTab({ url: '/pages/message/message' });
-    },
-  });
-}
 function hidePage(): void {
   foreground = false;
   invalidate();
 }
 function showPage(): void {
-  if (foreground) return;
+  if (leaving || foreground) return;
   foreground = true;
   if (
     state.value == 'success' ||
@@ -326,13 +367,6 @@ function showPage(): void {
   prepareLogin(false);
 }
 // #ifdef H5 || WEB
-function openApp(): void {
-  if (state.value == 'ready')
-    window.location.href = qrLoginAppUrl(sceneId, serviceOrigin.value);
-}
-function downloadApp(): void {
-  window.open(APP_DOWNLOAD_PAGE_URL, '_blank', 'noopener');
-}
 function visibilityChanged(): void {
   if (document.visibilityState == 'hidden') hidePage();
   else showPage();
@@ -340,6 +374,16 @@ function visibilityChanged(): void {
 // #endif
 
 onLoad((query: any) => {
+  // #ifdef H5 || WEB
+  // JSSDK 在普通浏览器也会定义 uni.webView，只认宿主原生桥，避免把 App 外扫码当成内嵌页。
+  if (!isNativeAppWebView()) {
+    leaving = true;
+    foreground = false;
+    invalidate();
+    window.location.replace(APP_DOWNLOAD_PAGE_URL);
+    return;
+  }
+  // #endif
   invalidate();
   foreground = true;
   confirmationAttempted.value = false;
@@ -351,7 +395,6 @@ onLoad((query: any) => {
     browserOrigin = authBrowserQuery('origin');
   if (browserScene != null) sceneId = browserScene;
   if (browserOrigin != null) origin = browserOrigin;
-  showOpenApp.value = !isAppWebViewEmbedded();
   document.addEventListener('visibilitychange', visibilityChanged);
   // #endif
   serviceOrigin.value =
@@ -369,6 +412,12 @@ onLoad((query: any) => {
 });
 onShow(showPage);
 onHide(hidePage);
+onBackPress((options: OnBackPressOptions): boolean => {
+  // finish / switchMainTab 内部的 navigateBack 必须放行。
+  if (options.from == 'navigateBack') return false;
+  finish();
+  return true;
+});
 onUnload(() => {
   hidePage();
   // #ifdef H5 || WEB
@@ -448,14 +497,5 @@ onUnload(() => {
   font-size: 15px;
   border-radius: 8px;
   margin-top: 12px;
-}
-.qr-app-actions {
-  margin-top: 24px;
-  align-items: center;
-}
-.qr-link {
-  font-size: 14px;
-  color: #7146d6;
-  margin-top: 16px;
 }
 </style>

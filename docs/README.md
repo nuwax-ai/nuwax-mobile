@@ -15,6 +15,7 @@
 | [ios-esp-provisioning-local-base.md](engineering/ios-esp-provisioning-local-base.md) | iOS 端配网本地基座 |
 | [harmony-esp-provisioning-local-base.md](engineering/harmony-esp-provisioning-local-base.md) | 鸿蒙端（预留） |
 | [pre-release-checklist.md](engineering/pre-release-checklist.md) | 发版前清理检查单 |
+| [im-longlist-performance-stages.md](engineering/im-longlist-performance-stages.md) | IM 长列表性能治理分阶段方案（会话详情 → 会话列表 → 智联录，含进度表与验收标准） |
 | [ios-app-store-submission-audit.md](engineering/ios-app-store-submission-audit.md) | iOS 提审就绪审计（2026-08-17） |
 
 ## vapor/ —— vapor 相关
@@ -31,6 +32,7 @@
 |---|---|
 | [agent_integration_guide.md](integration/agent_integration_guide.md) | Agent 组件（文件树等）接入 |
 | [app-asr-tts.md](integration/app-asr-tts.md) | Vox ASR / TTS 对接 |
+| [im-meeting-app-plan.md](integration/im-meeting-app-plan.md) | App 实时会议方案：对齐 PC、飞书式移动交互、原生 LiveKit 接入与分期验收（待评审） |
 | [app-native-pay-integration.md](integration/app-native-pay-integration.md) | App 原生支付（现行；webview 支付已废弃归档） |
 | [mobile-h5-idp-login.md](integration/mobile-h5-idp-login.md) | 移动 H5 CAS/OAuth2 Cookie 登录、配置与回跳约束 |
 | [mobile-idp-native-plan.md](integration/mobile-idp-native-plan.md) | 联合登录总方案：原生复用边界、会话交接、平台配置、分期验收与后端待确认项 |

@@ -1,0 +1,290 @@
+import {
+  computeManualSettingsRequired,
+  PushBackgroundPolicyInput,
+  resolvePushSystemVendor,
+  type FcmAvailability,
+  type PushSystemVendor,
+} from "@/utils/push/pushBackgroundPolicy";
+import {
+  getImNotifyPermissionState,
+  openImNotifyPermissionSettings,
+  IM_NOTIFY_PERMISSION_GRANTED,
+} from "@/utils/im/imPushClient";
+// #ifdef APP-ANDROID
+import ActivityManager from "android.app.ActivityManager";
+import Context from "android.content.Context";
+import Intent from "android.content.Intent";
+import PackageInfo from "android.content.pm.PackageInfo";
+import Uri from "android.net.Uri";
+import Build from "android.os.Build";
+import PowerManager from "android.os.PowerManager";
+import Settings from "android.provider.Settings";
+// #endif
+
+export class PushBatteryOptimizationStatus {
+  supported: boolean
+  ignored: boolean | null
+
+  constructor(supported: boolean, ignored: boolean | null) {
+    this.supported = supported;
+    this.ignored = ignored;
+  }
+}
+
+export class PushBackgroundRestrictionStatus {
+  supported: boolean
+  restricted: boolean | null
+
+  constructor(supported: boolean, restricted: boolean | null) {
+    this.supported = supported;
+    this.restricted = restricted;
+  }
+}
+
+export class PushBackgroundStatus {
+  notificationEnabled: boolean
+  batteryOptimization: PushBatteryOptimizationStatus
+  backgroundRestricted: PushBackgroundRestrictionStatus
+  vendor: string
+  vendorPushAvailable: boolean
+  manualSettingsRequired: boolean
+
+  constructor(
+    notificationEnabled: boolean,
+    batteryOptimization: PushBatteryOptimizationStatus,
+    backgroundRestricted: PushBackgroundRestrictionStatus,
+    vendor: string,
+    vendorPushAvailable: boolean,
+    manualSettingsRequired: boolean,
+  ) {
+    this.notificationEnabled = notificationEnabled;
+    this.batteryOptimization = batteryOptimization;
+    this.backgroundRestricted = backgroundRestricted;
+    this.vendor = vendor;
+    this.vendorPushAvailable = vendorPushAvailable;
+    this.manualSettingsRequired = manualSettingsRequired;
+  }
+}
+
+const ACK_STORAGE_PREFIX = "push_background_setup_ack";
+const SNOOZE_STORAGE_PREFIX = "push_background_guide_snooze";
+export const PUSH_BACKGROUND_GUIDE_SNOOZE_MS = 30 * 24 * 60 * 60 * 1000;
+
+function storageScope(): string {
+  let version = "unknown";
+  try {
+    const raw = uni.getAppBaseInfo().appVersion;
+    if (raw != null && `${raw}`.trim().length > 0) version = `${raw}`.trim();
+  } catch (_e) {}
+  let androidMajor = "na";
+  // #ifdef APP-ANDROID
+  androidMajor = `${Build.VERSION.SDK_INT}`;
+  // #endif
+  return `${version}_${androidMajor}`;
+}
+
+function ackStorageKey(): string {
+  return `${ACK_STORAGE_PREFIX}_${storageScope()}`;
+}
+
+function snoozeStorageKey(): string {
+  return `${SNOOZE_STORAGE_PREFIX}_${storageScope()}`;
+}
+
+export function isPushBackgroundSetupAcknowledged(): boolean {
+  try {
+    return uni.getStorageSync(ackStorageKey()) == true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+export function acknowledgePushBackgroundSetup(): void {
+  try {
+    uni.setStorageSync(ackStorageKey(), true);
+  } catch (_e) {}
+}
+
+export function snoozePushBackgroundGuide(): void {
+  try {
+    uni.setStorageSync(snoozeStorageKey(), Date.now());
+  } catch (_e) {}
+}
+
+export function canAutoShowPushBackgroundGuide(): boolean {
+  try {
+    const raw = uni.getStorageSync(snoozeStorageKey());
+    if (raw == null || `${raw}`.length == 0) return true;
+    const last = parseInt(`${raw}`);
+    return isNaN(last) || Date.now() - last >= PUSH_BACKGROUND_GUIDE_SNOOZE_MS;
+  } catch (_e) {
+    return true;
+  }
+}
+
+// #ifdef APP-ANDROID
+/**
+ * 不引入 Google SDK 编译依赖，通过系统包状态确认 GMS 是否真实可用：
+ * 包必须存在、启用、有版本信息，且能创建包上下文。任何初始化异常返回 unknown，避免误导。
+ */
+function detectFcmAvailability(): FcmAvailability {
+  const context = UTSAndroid.getAppContext();
+  if (context == null) return "unknown";
+  const packageManager = context!!.getPackageManager();
+  if (packageManager == null) return "unknown";
+  let packageInfo: PackageInfo | null = null;
+  try {
+    packageInfo = packageManager!!.getPackageInfo("com.google.android.gms", 0);
+  } catch (_missing) {
+    // ★若这里报 NameNotFoundException 但机器实际装了 GMS，多半是根 AndroidManifest.xml
+    //   缺 <queries> 包可见性（Android 11+ 过滤），需重新云打包自定义基座。
+    return "unavailable";
+  }
+  if (packageInfo == null) return "unavailable";
+  try {
+    const appInfo = packageInfo!!.applicationInfo;
+    if (appInfo == null || appInfo!!.enabled != true) return "unavailable";
+    const versionName = packageInfo!!.versionName;
+    if (versionName == null || `${versionName}`.trim().length == 0) return "unavailable";
+    // 能创建 GMS 包上下文，才视为安装状态可被当前应用正常初始化使用。
+    const gmsContext = context!!.createPackageContext(
+      "com.google.android.gms",
+      Context.CONTEXT_IGNORE_SECURITY,
+    );
+    if (gmsContext == null) return "unknown";
+    return "available";
+  } catch (_e) {
+    return "unknown";
+  }
+}
+
+function readVendor(): PushSystemVendor {
+  const manufacturer = `${Build.MANUFACTURER}`;
+  const brand = `${Build.BRAND}`;
+  const fcmDetected = detectFcmAvailability();
+  /**
+   * 个推控制台是否配置了 FCM 通道。
+   * ★当前按国内发版：只配了华为/荣耀/小米/OPPO/vivo 厂商通道，**FCM 未配置**
+   *   （2026-11-12 用户确认：国行三星走 uni-push 个推保活/自建通道，不走 FCM）。
+   *   若把「设备装了 GMS」当成「有系统推送通道」，三星等机型会被判成 fcm →
+   *   vendorPushAvailable=true → 后台接收引导与「我的」页入口双双被抑制，
+   *   结果既收不到离线推送又没有提示。出海版本接入 FCM 后才改成 true。
+   * ★必须是函数内局部常量：定义为模块级 const 时 UTS→Kotlin 报 error18 找不到名称。
+   */
+  const fcmConfigured = false;
+  const fcmForVendor: FcmAvailability = fcmConfigured ? fcmDetected : "unavailable";
+  return resolvePushSystemVendor(manufacturer, brand, fcmForVendor);
+}
+
+function readBatteryOptimization(): PushBatteryOptimizationStatus {
+  if (Build.VERSION.SDK_INT < 23) return new PushBatteryOptimizationStatus(false, null);
+  try {
+    const context = UTSAndroid.getAppContext();
+    if (context == null) return new PushBatteryOptimizationStatus(false, null);
+    const manager = context!!.getSystemService(Context.POWER_SERVICE) as PowerManager;
+    if (manager == null) return new PushBatteryOptimizationStatus(false, null);
+    return new PushBatteryOptimizationStatus(
+      true,
+      manager.isIgnoringBatteryOptimizations(context!!.getPackageName()),
+    );
+  } catch (_e) {
+    return new PushBatteryOptimizationStatus(false, null);
+  }
+}
+
+function readBackgroundRestricted(): PushBackgroundRestrictionStatus {
+  if (Build.VERSION.SDK_INT < 28) return new PushBackgroundRestrictionStatus(false, null);
+  try {
+    const context = UTSAndroid.getAppContext();
+    if (context == null) return new PushBackgroundRestrictionStatus(false, null);
+    const manager = context!!.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager;
+    if (manager == null) return new PushBackgroundRestrictionStatus(false, null);
+    return new PushBackgroundRestrictionStatus(true, manager.isBackgroundRestricted());
+  } catch (_e) {
+    return new PushBackgroundRestrictionStatus(false, null);
+  }
+}
+
+function startResolvableSettings(intent: Intent): boolean {
+  try {
+    const activity = UTSAndroid.getUniActivity();
+    if (activity == null) return false;
+    const target = intent.resolveActivity(activity!!.getPackageManager());
+    if (target == null) return false;
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+    activity!!.startActivity(intent);
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+// #endif
+
+/** 非 Android 直接返回无需处理；调用方无需再写平台分支。 */
+export async function getPushBackgroundStatus(): Promise<PushBackgroundStatus> {
+  // #ifndef APP-ANDROID
+  return new PushBackgroundStatus(
+    true,
+    new PushBatteryOptimizationStatus(false, null),
+    new PushBackgroundRestrictionStatus(false, null),
+    "unknown",
+    true,
+    false,
+  );
+  // #endif
+
+  // #ifdef APP-ANDROID
+  const permission = await getImNotifyPermissionState();
+  const notificationEnabled = permission == IM_NOTIFY_PERMISSION_GRANTED;
+  const batteryOptimization = readBatteryOptimization();
+  const backgroundRestricted = readBackgroundRestricted();
+  const vendor = readVendor();
+  // 布尔字段只在“确定无系统通道”时为 false；unknown 保持 true，避免误触发引导。
+  const vendorPushAvailable = vendor != "none";
+  const manualSettingsRequired = vendor == "none" && computeManualSettingsRequired(
+    new PushBackgroundPolicyInput(
+      false,
+      notificationEnabled,
+      batteryOptimization.supported,
+      batteryOptimization.ignored,
+      backgroundRestricted.supported,
+      backgroundRestricted.restricted,
+      isPushBackgroundSetupAcknowledged(),
+    ),
+  );
+  return new PushBackgroundStatus(
+    notificationEnabled,
+    batteryOptimization,
+    backgroundRestricted,
+    vendor,
+    vendorPushAvailable,
+    manualSettingsRequired,
+  );
+  // #endif
+}
+
+export function openNotificationSettings(): void {
+  openImNotifyPermissionSettings();
+}
+
+export function openApplicationDetailsSettings(): void {
+  // #ifdef APP-ANDROID
+  const context = UTSAndroid.getAppContext();
+  if (context == null) return;
+  const intent = new Intent(
+    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+    Uri.parse(`package:${context!!.getPackageName()}`),
+  );
+  startResolvableSettings(intent);
+  // #endif
+}
+
+export function openBatteryOptimizationSettings(): void {
+  // #ifdef APP-ANDROID
+  // ★不要用 ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS：Samsung 等 ROM 会落到
+  //   「后台使用限制」列表页，用户要在长列表里自己找 App（2026-11-12 真机反馈路径不对）。
+  //   「应用详情 → 电池」子页没有公开深链，公开 API 只能到应用详情页；
+  //   用户在那里点「电池」即可进入「后台运行/使用限制」。
+  openApplicationDetailsSettings();
+  // #endif
+}

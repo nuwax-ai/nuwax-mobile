@@ -1,0 +1,273 @@
+/**
+ * nuwax-livekit · app-android（LiveKit Android SDK 2.28.x 桥接）
+ *
+ * <h2>分工</h2>
+ * <ul>
+ *   <li>本文件：UTS 侧薄封装 —— 运行时权限申请、回调适配、单例持有。</li>
+ *   <li>`src/com/nuwax/livekit/MeetingRoomBridge.kt`：真正调 LiveKit SDK 的地方
+ *       （连接/退房/麦克风/摄像头/音频路由/人数）。**SDK API 只在那里出现**，
+ *       升级 SDK 时只改那一个文件。</li>
+ * </ul>
+ *
+ * <h2>权限</h2>
+ * <p>麦克风在入会时申请；摄像头只在 `cameraOn=true` 时申请（默认不开，避免一进会就弹相机）。
+ * 拒绝麦克风不阻断入会：仍然连接成功，只是没声音（PC 同口径，用户可再去设置里放行）。</p>
+ *
+ * <h2>★★基座</h2>
+ * <p>本插件含 Maven 依赖（`io.livekit:livekit-android`），**标准基座不含**：
+ * 必须重打自定义基座（`make app-resource` → `make base-android`）后真机验证。</p>
+ */
+import Manifest from "android.Manifest";
+import View from "android.view.View";
+import MeetingRoomBridge from "com.nuwax.livekit.MeetingRoomBridge";
+import MeetingRoomCallback from "com.nuwax.livekit.MeetingRoomCallback";
+
+/** 插件内置 SDK 版本（排查用；与 Gradle 依赖保持一致）。 */
+const LIVEKIT_VERSION = "2.28.2";
+
+let bridge: MeetingRoomBridge | null = null;
+function roomBridge(): MeetingRoomBridge {
+  if (bridge == null) {
+    bridge = new MeetingRoomBridge(UTSAndroid.getAppContext()!);
+  }
+  return bridge!!;
+}
+
+/** 本端能否真正收发音视频：SDK 已随本插件打进基座，恒 true。 */
+export function isSupported(): boolean {
+  return true;
+}
+
+/** 内部：SDK 版本号（页面/日志排查用）。 */
+export function sdkVersion(): string {
+  return LIVEKIT_VERSION;
+}
+
+/**
+ * 连接已有房间（不建房）。
+ * ★不挂回调（原因见 interface.uts 的 NuwaxLiveKitStateQuery 注释）：连接结果由业务层
+ *   轮询 isConnected() / lastError() 获得。
+ * @UTSJS.keepAlive 权限弹窗期间本函数栈上的临时对象要防回收。
+ */
+@UTSJS.keepAlive
+export function connect(
+  serverUrl: string,
+  token: string,
+  room: string,
+  displayName: string,
+  micOn: boolean,
+  cameraOn: boolean,
+): void {
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    return;
+  }
+  // 麦克风必须有的权限；摄像头按需（默认不开摄像头，不打扰用户）
+  let permissions = [Manifest.permission.RECORD_AUDIO] as string[];
+  if (cameraOn) {
+    permissions = [Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA] as string[];
+  }
+  if (!UTSAndroid.checkSystemPermissionGranted(activity, permissions)) {
+    UTSAndroid.requestSystemPermission(
+      activity,
+      permissions,
+      (_allGranted: boolean, _perms: string[]) => {
+        // ★拒绝也继续连接：能听不能说（与 PC「拒绝麦克风可仅收听」一致），
+        //   由 SDK 侧 setMicrophoneEnabled 自行失败，不在这里把用户挡在会外
+        startConnect(serverUrl, token, micOn, cameraOn);
+      },
+      (_doNotAskAgain: boolean, _perms: string[]) => {
+        startConnect(serverUrl, token, micOn, cameraOn);
+      },
+    );
+    return;
+  }
+  startConnect(serverUrl, token, micOn, cameraOn);
+}
+
+function startConnect(serverUrl: string, token: string, micOn: boolean, cameraOn: boolean): void {
+  // displayName 由服务端令牌里的 participant name 决定（签票时已带入），这里不重复传；
+  // 入会即按口径开关设备在 Kotlin 侧 connect 成功后执行（见 MeetingRoomBridge.connect）
+  roomBridge().connect(serverUrl, token, micOn, cameraOn);
+}
+
+/** 最近一次连接失败原因（空串=无错）。 */
+export function lastError(): string {
+  if (bridge == null) {
+    return "";
+  }
+  return bridge!!.lastError();
+}
+
+/**
+ * 离开：只断本端，不删房。
+ * ★把 bridge 一起丢掉：下一次入会重建一个干净实例，避免上一场的 scope/房间残留
+ *   （「退出后再加入同一场会失败」的成因之一）。
+ */
+export function disconnect(): void {
+  if (bridge != null) {
+    bridge!!.disconnect();
+    bridge = null;
+  }
+}
+
+/**
+ * 麦克风开关。
+ * ★开启时补一次运行时授权：入会那一刻用户可能拒过/没勾，这里再点必须有弹窗机会，
+ *   否则 SDK 静默失败，用户以为"点了没反应"。
+ */
+@UTSJS.keepAlive
+export function setMicEnabled(on: boolean): void {
+  if (bridge == null || bridge!!.isConnected() == false) {
+    return;
+  }
+  if (!on) {
+    bridge!!.setMicEnabled(false);
+    return;
+  }
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    return;
+  }
+  const perms = [Manifest.permission.RECORD_AUDIO] as string[];
+  if (UTSAndroid.checkSystemPermissionGranted(activity, perms)) {
+    bridge!!.setMicEnabled(true);
+    return;
+  }
+  UTSAndroid.requestSystemPermission(
+    activity,
+    perms,
+    (_allGranted: boolean, _p: string[]) => {
+      if (bridge != null) {
+        bridge!!.setMicEnabled(true);
+      }
+    },
+    (_doNotAskAgain: boolean, _p: string[]) => {},
+  );
+}
+
+/**
+ * 摄像头开关。
+ * ★同上：入会默认不开摄像头，所以 CAMERA 权限在**第一次点开**时才申请；
+ *   不补这一步，点了只会静默失败（这就是"点摄像头没反应"的直接原因）。
+ */
+@UTSJS.keepAlive
+export function setCameraEnabled(on: boolean): void {
+  if (bridge == null || bridge!!.isConnected() == false) {
+    return;
+  }
+  if (!on) {
+    bridge!!.setCameraEnabled(false);
+    return;
+  }
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    return;
+  }
+  const perms = [Manifest.permission.CAMERA] as string[];
+  if (UTSAndroid.checkSystemPermissionGranted(activity, perms)) {
+    bridge!!.setCameraEnabled(true);
+    return;
+  }
+  UTSAndroid.requestSystemPermission(
+    activity,
+    perms,
+    (_allGranted: boolean, _p: string[]) => {
+      if (bridge != null) {
+        bridge!!.setCameraEnabled(true);
+      }
+    },
+    (_doNotAskAgain: boolean, _p: string[]) => {},
+  );
+}
+
+/** 音频输出：扬声器 / 听筒。 */
+export function setSpeakerEnabled(on: boolean): void {
+  if (bridge == null) {
+    return;
+  }
+  bridge!!.setSpeakerEnabled(on);
+}
+
+/** 房间人数（含本端；未连接返回 0）。 */
+export function participantCount(): number {
+  if (bridge == null) {
+    return 0;
+  }
+  return bridge!!.participantCount();
+}
+
+/**
+ * 创建视频渲染视图，交给页面 `<native-view>` 的 init 事件里 `bindAndroidView`。
+ * ★返回 null = 无法创建（未连接/插件异常），调用方保留头像占位即可。
+ */
+export function createVideoView(): View | null {
+  if (bridge == null) {
+    return null;
+  }
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    return null;
+  }
+  return bridge!!.createVideoRenderer(activity);
+}
+
+/** 把本机摄像头轨道挂到已绑定的渲染视图上（开摄像头/页面重进时各调一次）。 */
+export function attachLocalVideo(): void {
+  if (bridge == null) {
+    return;
+  }
+  bridge!!.attachLocalVideo();
+}
+
+/** 释放渲染视图（关摄像头/离开页面）。 */
+export function releaseVideoView(): void {
+  if (bridge == null) {
+    return;
+  }
+  bridge!!.releaseRenderer();
+}
+
+/** 已订阅到视频的远端成员 identity（逗号分隔；空串=没人开视频）。 */
+export function remoteVideoIdentities(): string {
+  if (bridge == null) {
+    return "";
+  }
+  return bridge!!.remoteVideoIdentities();
+}
+
+/** 为某个远端成员创建/复用渲染视图（页面每个格子 init 时调用）。 */
+export function createRemoteVideoView(identity: string): View | null {
+  if (bridge == null) {
+    return null;
+  }
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    return null;
+  }
+  return bridge!!.createRemoteRenderer(activity, identity);
+}
+
+/** 本机麦克风音量（0..1）：页面每 250ms 拉一次画音波，不走事件流。 */
+export function localAudioLevel(): number {
+  if (bridge == null) {
+    return 0;
+  }
+  return bridge!!.localAudioLevel();
+}
+
+/** 切换前后摄像头（入会默认前置）。 */
+export function switchCamera(): void {
+  if (bridge == null) {
+    return;
+  }
+  bridge!!.switchCamera();
+}
+
+/** 是否已连接（RoomEvent 驱动）。 */
+export function isConnected(): boolean {
+  if (bridge == null) {
+    return false;
+  }
+  return bridge!!.isConnected();
+}

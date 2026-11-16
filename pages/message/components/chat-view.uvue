@@ -2561,10 +2561,32 @@
   /** 后置状态全部声明完成后再注入，规避 UTS error18 前向引用。
    *  返回空串 = 允许上滑退出，否则是不允许的原因（同时用于探针日志）。 */
   let pullEntrySwipeBackGuard: (() => string) | null = null;
+  /** 探针：起手判定快照（排查「到底后再上滑偶发拉不起」，验证后连同 [StageSwipe] 日志一起删）。 */
+  let pullEntryProbeState: (() => string) | null = null;
+  /** 探针：立即补一次距底探测（同上，验证后删）。 */
+  let pullEntryProbeBottom: (() => void) | null = null;
   let stageSwipeCandidate = false;
   let stageSwipeTracking = false;
   let stageSwipeDistance = 0;
   let stageSwipeStartedAt = 0;
+  /** Android 原生列表抢走手势后的待定态：起手后约 7px 就收到 touchcancel，之后 move 全被
+   *  原生层吃掉，**唯一可信的终点是 touchend 的最终位移**（实测 251px）。为 false 时
+   *  touchend 按旧逻辑只做吞击；为 true 时用它补判一次上滑退出。
+   *  只在「起手判定通过、但还没跟手（tracking=false）」时置位——已跟手的被抢走仍走原有
+   *  emit cancel 回弹，避免和合成层动画打架。 */
+  let stageSwipeNativeCaptured = false;
+  /** 被原生接管时改用 touchend 距离判定（px）：与 tab-shell 的 CLOSE_TRIGGER_PX 同值。
+   *  这条路径没有跟手过程，速度不可信（实测 1.4s 拖完 251px），只按距离一道线。 */
+  const STAGE_NATIVE_CLOSE_PX = 110;
+  /** 探针：手势序号 / move 计数（排查「到底后再上滑偶发拉不起」，验证后删）。 */
+  let stageSwipeProbeSeq = 0;
+  let stageSwipeMoveCount = 0;
+  /** 探针：最近一次滚动事件的 scrollTop（滚动停止时打点用）。 */
+  let stageSwipeLastScrollTop = 0;
+  /** 探针：布尔 → "1"/"0"（字符串直接拼布尔值在 UTS 里不保险，统一走它；验证后删）。 */
+  function probeBool(value: boolean): string {
+    return value ? "1" : "0";
+  }
   let pageTouchSwallowed = false;
   let pageTouchResetTimer = 0;
   // ===== 长按吞击守卫 =====
@@ -2579,6 +2601,7 @@
     stageSwipeTracking = false;
     stageSwipeDistance = 0;
     stageSwipeStartedAt = 0;
+    stageSwipeNativeCaptured = false;
   }
 
   /** 顶部返回 / 系统返回交给 Stage 播放统一收起动画。 */
@@ -2604,10 +2627,18 @@
     stageSwipeStartedAt = Date.now();
     stageSwipeTracking = false;
     stageSwipeCandidate = false;
+    stageSwipeProbeSeq = stageSwipeProbeSeq + 1;
+    stageSwipeMoveCount = 0;
+    // 上一次手势若停在「被原生接管」态（漏了 touchend），新手势起手即作废
+    stageSwipeNativeCaptured = false;
     if (pullEntryDialog && pullEntryScreenHeight > 0) {
       const guard = pullEntrySwipeBackGuard;
       const reason = guard != null ? guard() : "not-ready";
       stageSwipeCandidate = reason.length == 0;
+      const probe = pullEntryProbeState;
+      console.log("[StageSwipe] #" + stageSwipeProbeSeq + " start cand=" + probeBool(stageSwipeCandidate) + " reason=" + reason
+        + " lastScrollTop=" + Math.round(stageSwipeLastScrollTop)
+        + " " + (probe != null ? probe() : ""));
     }
   }
 
@@ -2618,15 +2649,27 @@
     const touch = e.touches[0];
     const dx = touch.clientX - pageTouchStartX;
     const dy = touch.clientY - pageTouchStartY;
+    stageSwipeMoveCount = stageSwipeMoveCount + 1;
+    if (stageSwipeMoveCount <= 3 || stageSwipeMoveCount % 10 == 0) {
+      console.log("[StageSwipe] #" + stageSwipeProbeSeq + " move n=" + stageSwipeMoveCount
+        + " dx=" + Math.round(dx) + " dy=" + Math.round(dy) + " track=" + probeBool(stageSwipeTracking));
+    }
     if (dy >= 0 || Math.abs(dx) > Math.abs(dy) * 0.82) {
-      if (stageSwipeTracking) emit("stage-swipe-cancel");
-      resetStageSwipe();
+      if (stageSwipeTracking) {
+        console.log("[StageSwipe] #" + stageSwipeProbeSeq + " move abort dx=" + Math.round(dx) + " dy=" + Math.round(dy));
+        emit("stage-swipe-cancel");
+        resetStageSwipe();
+      }
+      // ★未跟手时不能 resetStageSwipe：Android 起手的第一个 move 常是 dx=0/dy=0
+      //  （实测偶发），紧接着原生列表就发 cancel。清掉 candidate 等于把 cancel→touchend
+      //  的补判也一起废掉——这正是「有时滑不上去」的另一半成因。方向合规的下一帧仍可追踪。
       return;
     }
     const distance = Math.max(0, -dy);
     if (!stageSwipeTracking) {
       if (distance < 8 || distance <= Math.abs(dx) * 1.25) return;
       stageSwipeTracking = true;
+      console.log("[StageSwipe] #" + stageSwipeProbeSeq + " track begin dist=" + Math.round(distance));
       emit("stage-swipe-start");
     }
     stageSwipeDistance = distance;
@@ -2642,9 +2685,40 @@
     const t = e.changedTouches[0];
     const dx = t.clientX - pageTouchStartX;
     const dy = t.clientY - pageTouchStartY;
+    if (pullEntryDialog) {
+      console.log("[StageSwipe] #" + stageSwipeProbeSeq + " touchend track=" + probeBool(stageSwipeTracking)
+        + " dx=" + Math.round(dx) + " dy=" + Math.round(dy) + " moveCount=" + stageSwipeMoveCount
+        + " nativeCaptured=" + probeBool(stageSwipeNativeCaptured));
+    }
+    // Android：本次手势 mid-move 可能已被原生列表吃掉（见 handlePageTouchCancel），这里拿最终
+    // 位移补判。不要求 nativeCaptured——个别机型连 cancel 都不派；只要「贴底判定通过 + 从未跟手
+    // + 最终位移够」，在已贴底的列表上就只可能是一次上滑退出。
+    // 直接走返回键同一条关闭通道（closePullEntryDialog）：不经合成层手势，避免一帧跃迁再滑出。
+    // #ifdef APP-ANDROID
+    if (!stageSwipeTracking && pullEntryDialog && stageSwipeCandidate) {
+      const swipeUp = Math.max(0, -dy);
+      // 方向门槛与 move 里的横向排除同口径（斜滑不算上滑退出）
+      if (swipeUp >= STAGE_NATIVE_CLOSE_PX && swipeUp > Math.abs(dx) * 0.82) {
+        console.log("[StageSwipe] #" + stageSwipeProbeSeq + " native-captured end swipeUp=" + Math.round(swipeUp)
+          + " captured=" + probeBool(stageSwipeNativeCaptured));
+        stageSwipeNativeCaptured = false;
+        resetStageSwipe();
+        closePullEntryDialog("stage-native-captured");
+        pageTouchSwallowed = true;
+        if (pageTouchResetTimer != 0) clearTimeout(pageTouchResetTimer);
+        pageTouchResetTimer = setTimeout((): void => {
+          pageTouchResetTimer = 0;
+          pageTouchSwallowed = false;
+        }, 80);
+        return;
+      }
+    }
+    // #endif
     if (stageSwipeTracking) {
       const distance = Math.max(stageSwipeDistance, Math.max(0, -dy));
       const elapsed = Math.max(1, Date.now() - stageSwipeStartedAt);
+      console.log("[StageSwipe] #" + stageSwipeProbeSeq + " end dist=" + Math.round(distance)
+        + " v=" + Math.round((distance * 1000) / elapsed) + " dx=" + Math.round(dx) + " dy=" + Math.round(dy));
       emit("stage-swipe-end", distance, (distance * 1000) / elapsed);
       resetStageSwipe();
       pageTouchSwallowed = true;
@@ -2675,6 +2749,31 @@
     // Android 的原生 scroll-view 在识别到向上滚动后会截获触摸，并向 uvue 派
     // touchcancel。此时消息已在底部、手势方向也已判定为向上，就把这次 cancel
     // 作为 Stage 收起提交；否则后续 move/end 都被原生层吃掉，表现为偶尔拉不起。
+    if (pullEntryDialog) {
+      const cancelEvent = eventValue as UniTouchEvent;
+      let fromEvent = 0;
+      if (cancelEvent.changedTouches != null && cancelEvent.changedTouches.length > 0) {
+        fromEvent = Math.max(0, pageTouchStartY - cancelEvent.changedTouches[0].clientY);
+      } else if (cancelEvent.touches.length > 0) {
+        fromEvent = Math.max(0, pageTouchStartY - cancelEvent.touches[0].clientY);
+      }
+      const cancelDistance = Math.max(stageSwipeDistance, fromEvent);
+      const guardAtCancel = pullEntrySwipeBackGuard;
+      const probeState = pullEntryProbeState;
+      let changedLen = -1;
+      if (cancelEvent.changedTouches != null) {
+        changedLen = cancelEvent.changedTouches.length;
+      }
+      console.log("[StageSwipe] #" + stageSwipeProbeSeq + " cancel cand=" + probeBool(stageSwipeCandidate) + " track=" + probeBool(stageSwipeTracking)
+        + " dist=" + Math.round(cancelDistance) + " fromEvent=" + Math.round(fromEvent)
+        + " changed=" + changedLen
+        + " touches=" + cancelEvent.touches.length
+        + " moveCount=" + stageSwipeMoveCount
+        + " guard=" + (guardAtCancel != null ? guardAtCancel() : "null") + " " + (probeState != null ? probeState() : ""));
+      // 复核：只测「cancel 这一拍的真实距底」，不写任何状态（避免探针自己就成了修复）
+      const probeBottom = pullEntryProbeBottom;
+      if (probeBottom != null) probeBottom();
+    }
     if (pullEntryDialog && (stageSwipeCandidate || stageSwipeTracking)) {
       const e = eventValue as UniTouchEvent;
       let distance = stageSwipeDistance;
@@ -2695,6 +2794,14 @@
           pageTouchResetTimer = 0;
           pageTouchSwallowed = false;
         }, 80);
+        return;
+      }
+      if (!stageSwipeTracking) {
+        // 位移还不够判（cancel 的 changedTouches 坐标实测恒等于起点，量不出来）：
+        // ★不能就地 resetStageSwipe——它会把 candidate 一起清掉，随后的 touchend 就只剩
+        //   一次「吞击」处理，这就是「到底后上滑偶发拉不起」的成因。留待 touchend 判定。
+        stageSwipeNativeCaptured = true;
+        console.log("[StageSwipe] #" + stageSwipeProbeSeq + " native-captured pending dist=" + Math.round(distance));
         return;
       }
     }
@@ -7367,6 +7474,13 @@
   const NEW_MSG_TIP_AT_BOTTOM_PX = 32;
   /** 最近一次探测的距底余量（onHide 基线快照判「离页时是否真在底部」用，初值=不在底）。 */
   let lastDistBottomPx = NEW_MSG_TIP_AT_BOTTOM_PX + 1;
+  /** 探针：起手判定快照（须在 lastDistBottomPx 声明之后注入，规避 UTS 前向引用）。 */
+  pullEntryProbeState = (): string => {
+    return "nearBottom=" + probeBool(nearChatBottom.value) + " distBottom=" + Math.round(lastDistBottomPx)
+      + " kb=" + keyboardHeight.value + " panel=" + panelMode.value + " expandPanel=" + expandPanel.value
+      + " expanded=" + probeBool(expanded.value) + " multi=" + probeBool(multiSelectMode.value)
+      + " settled=" + probeBool(listSettled.value) + " msgCount=" + messages.value.length;
+  };
   /** 程序化滚底的跟进窗口截止时间戳：滚底是异步的（settle 两拍 ≈ 250ms），窗口内的
    *  距底余量是动画中间态——不能据此点亮「N 条新消息」（否则贴底收消息会闪一下提示）。
    *  由 scrollToBottom 统一置位：所有「主动回最新」的入口都经它。 */
@@ -7401,7 +7515,11 @@
       if (Date.now() - kbLandedTs >= 400) {
         bodySlackPx.value = distBottom;
       }
+      const wasNearBottom = nearChatBottom.value;
       nearChatBottom.value = distBottom <= NEAR_BOTTOM_PX;
+      if (wasNearBottom != nearChatBottom.value && pullEntryDialog) {
+        console.log("[StageSwipe] probe nearBottom=" + probeBool(nearChatBottom.value) + " distBottom=" + Math.round(distBottom));
+      }
       lastDistBottomPx = distBottom;
       // 「N 条新消息」：真贴底（或正被主动滚底）→ 基线推进、提示清零；否则由基线之后
       //  的行为动态推导。★两条判据缺一不可：
@@ -7427,6 +7545,24 @@
       checkJumpLatest();
     }, delay);
   }
+  /** 探针：只量当前距底余量（不写 nearChatBottom/浮钮等任何状态；验证后删）。 */
+  function probeDistBottomOnly(): void {
+    if (!isChatCurrent()) return;
+    const query = uni.createSelectorQuery();
+    query.select(".chat-body").boundingClientRect();
+    query.select("#chat-bottom").boundingClientRect();
+    query.exec((results: Array<any>) => {
+      if (results.length < 2 || results[0] == null || results[1] == null) return;
+      const bodyRect = results[0] as NodeInfo;
+      const endRect = results[1] as NodeInfo;
+      if (bodyRect.top == null || bodyRect.height == null || endRect.top == null) return;
+      const distBottom = parseFloat(`${endRect.top}`) - (parseFloat(`${bodyRect.top}`) + parseFloat(`${bodyRect.height}`));
+      console.log("[StageSwipe] cancelDistBottom=" + Math.round(distBottom));
+    });
+  }
+  pullEntryProbeBottom = (): void => {
+    probeDistBottomOnly();
+  };
 
   /**
    * 锚点定位 + 稳定重定位 + 揭幕（滚底 / 阅读位置恢复共用）。
@@ -7958,8 +8094,12 @@
   let loadOlderHook: (() => void) | null = null;
 
   function handleChatScroll(e: UniScrollEvent): void {
+    stageSwipeLastScrollTop = e.detail.scrollTop;
     if (chatScrolling.value != true) {
       chatScrolling.value = true;
+      if (pullEntryDialog) {
+        console.log("[StageSwipe] scroll start top=" + Math.round(e.detail.scrollTop) + " deltaY=" + Math.round(e.detail.deltaY));
+      }
     }
     if (chatScrollIdleTimer != 0) {
       clearTimeout(chatScrollIdleTimer);
@@ -7967,6 +8107,9 @@
     chatScrollIdleTimer = setTimeout(() => {
       chatScrollIdleTimer = 0;
       chatScrolling.value = false;
+      if (pullEntryDialog) {
+        console.log("[StageSwipe] scroll idle top=" + Math.round(stageSwipeLastScrollTop) + " nearBottom=" + probeBool(nearChatBottom.value));
+      }
       // #ifdef APP-HARMONY
       // 停手放行：滚动中落地的行到这一刻才挂头像节点（滚动帧里新建的节点补绘不到，
       // 会静默停在字母兜底）；一批放行一次，版本号驱动模板重算。

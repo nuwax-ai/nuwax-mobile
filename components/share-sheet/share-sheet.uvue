@@ -1,0 +1,628 @@
+<template>
+  <!--
+    分享面板，对齐微信浏览器点「···」后的底部菜单。
+    由需要分享的页面引入。chooseShareTarget 通知当前页最上层的这一组件打开。
+    转发给最近会话、转发给朋友、其他应用、复制链接、浏览器打开、刷新（调用方有刷新时）可用；
+    朋友圈、收藏、搜一搜、投诉、查找、翻译、字号先占位。
+  -->
+  <view v-if="visible" class="share-mask" @tap="onDismiss">
+    <view class="share-sheet" @tap.stop="onSheetTap">
+      <view class="share-panel">
+        <text v-if="hostText.length > 0" class="share-host">{{ hostText }}</text>
+        <text class="share-section">{{ t("Mobile.Share.forwardTo") }}</text>
+        <scroll-view class="share-scroll" direction="horizontal" :show-scrollbar="false">
+          <view class="share-scroll__inner" :style="{ width: recentWidth }">
+            <view
+              v-for="item in recents"
+              :key="item.key"
+              class="share-cell"
+              @tap="onRecent(item)"
+            >
+              <view v-if="item.pick" class="share-avatar share-avatar--action">
+                <svg-icon name="icon-Share" size="22" unit="px" color="#ffffff" />
+              </view>
+              <view
+                v-else-if="item.avatar.length > 0 && item.avatarFailed != true"
+                class="share-avatar share-avatar--clip"
+              >
+                <image
+                  class="share-avatar__img"
+                  :src="item.avatar"
+                  mode="aspectFill"
+                  @error="onAvatarError(item.key)"
+                />
+              </view>
+              <view v-else class="share-avatar" :style="{ backgroundImage: item.gradient }">
+                <text class="share-avatar__letter">{{ item.letter }}</text>
+              </view>
+              <text class="share-cell__label">{{ item.name }}</text>
+            </view>
+          </view>
+        </scroll-view>
+        <scroll-view class="share-scroll" direction="horizontal" :show-scrollbar="false">
+          <view class="share-scroll__inner" :style="{ width: rowOneWidth }">
+            <view
+              v-for="item in rowOne"
+              :key="item.key"
+              class="share-cell"
+              @tap="onAction(item.key)"
+            >
+              <view class="share-icon" :style="{ backgroundColor: item.bg }">
+                <svg-icon :name="item.icon" size="22" unit="px" :color="item.color" />
+              </view>
+              <text class="share-cell__label">{{ item.label }}</text>
+            </view>
+          </view>
+        </scroll-view>
+        <scroll-view class="share-scroll share-scroll--last" direction="horizontal" :show-scrollbar="false">
+          <view class="share-scroll__inner" :style="{ width: rowTwoWidth }">
+            <view
+              v-for="item in rowTwo"
+              :key="item.key"
+              class="share-cell"
+              @tap="onAction(item.key)"
+            >
+              <view class="share-icon share-icon--plain">
+                <text v-if="item.glyph.length > 0" class="share-icon__glyph">{{ item.glyph }}</text>
+                <svg-icon v-else :name="item.icon" size="22" unit="px" color="#333333" />
+              </view>
+              <text class="share-cell__label">{{ item.label }}</text>
+            </view>
+          </view>
+        </scroll-view>
+      </view>
+      <view class="share-gap" />
+      <view class="share-cancel" :style="{ paddingBottom: cancelPad }" @tap="onDismiss">
+        <text class="share-cancel__text">{{ t("Mobile.Common.cancel") }}</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, onMounted, onUnmounted, ref } from "vue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImSendTextMsg } from "@/servers/im";
+  import { apiResCode, apiResMessage } from "@/utils/apiResponse";
+  import { hasLoginSession } from "@/utils/authSession";
+  import { generateUUID } from "@/utils/common";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { imAvatarDisplayUrl } from "@/utils/imAvatarDisplay";
+  import { readImConvCache } from "@/utils/im/imListCache";
+  import { openExternalUrl } from "@/utils/openExternalUrl";
+  import { getSafeAreaBottom } from "@/utils/system";
+  import {
+    bindShareSheet,
+    dismissShareSheet,
+    isShareSheetOpen,
+    peekShareSheet,
+    runShareOutside,
+    runShareRefresh,
+    runShareToNuwax,
+    unbindShareSheet,
+  } from "@/utils/appShare";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 一行操作。glyph 非空时画文字（调整字体的 Aa），不再画图标。 */
+  class ShareAction {
+    key: string = "";
+    label: string = "";
+    icon: string = "";
+    glyph: string = "";
+    bg: string = "#ffffff";
+    color: string = "#ffffff";
+  }
+
+  /** 最近会话。pick=true 是「选择会话」，没有最近会话时单独出现。 */
+  class ShareRecent {
+    key: string = "";
+    convId: string = "";
+    name: string = "";
+    avatar: string = "";
+    letter: string = "";
+    gradient: string = "";
+    avatarFailed: boolean = false;
+    pick: boolean = false;
+  }
+
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  const visible = ref<boolean>(false);
+  const safeBottom = ref<number>(getSafeAreaBottom());
+  const sending = ref<boolean>(false);
+  const recents = ref<ShareRecent[]>([]);
+  const rowOne = ref<ShareAction[]>([]);
+  const rowTwo = ref<ShareAction[]>([]);
+  const shareBody = ref<string>("");
+  const shareUrl = ref<string>("");
+  const host = ref<string>("");
+  let bindingId = 0;
+
+  const hostText = computed((): string => {
+    if (host.value.length == 0) return "";
+    const params = new Map<string, string | number>();
+    params.set("host", host.value);
+    return translateFn("Mobile.Share.providedBy", toI18nParams(params), "");
+  });
+
+  const cancelPad = computed((): string => {
+    const pad = 10 + safeBottom.value;
+    return pad + "px";
+  });
+
+  /** 横滑行内容宽。UTS 不提升函数，必须写在 computed 调用之前。 */
+  function rowInnerWidth(count: number): string {
+    const cells = count > 0 ? count : 1;
+    return (cells * 76 + 16).toString() + "px";
+  }
+
+  const recentWidth = computed((): string => {
+    return rowInnerWidth(recents.value.length);
+  });
+  const rowOneWidth = computed((): string => {
+    return rowInnerWidth(rowOne.value.length);
+  });
+  const rowTwoWidth = computed((): string => {
+    return rowInnerWidth(rowTwo.value.length);
+  });
+
+  function makeAction(
+    key: string,
+    labelKey: string,
+    icon: string,
+    glyph: string,
+    bg: string,
+    color: string,
+  ): ShareAction {
+    const item = new ShareAction();
+    item.key = key;
+    item.label = t(labelKey);
+    item.icon = icon;
+    item.glyph = glyph;
+    item.bg = bg;
+    item.color = color;
+    return item;
+  }
+
+  function readStr(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    if (raw == null) return "";
+    const text = `${raw}`.trim();
+    if (text == "null" || text == "undefined") return "";
+    return text;
+  }
+
+  function readNum(obj: UTSJSONObject, key: string): number {
+    const raw = obj[key];
+    if (raw == null) return 0;
+    const n = parseFloat(`${raw}`);
+    if (n != n) return 0;
+    return n;
+  }
+
+  function isDigits(raw: string): boolean {
+    if (raw.length == 0) return false;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw.charAt(i);
+      if (ch < "0" || ch > "9") return false;
+    }
+    return true;
+  }
+
+  function gradientOf(name: string): string {
+    let code = 0;
+    if (name.length > 0) {
+      const raw = name.charCodeAt(0);
+      if (raw != null) code = raw;
+    }
+    const index = code % AVATAR_GRADIENTS.length;
+    return AVATAR_GRADIENTS[index];
+  }
+
+  function letterOf(name: string): string {
+    if (name.length == 0) return "";
+    return name.substring(0, 1);
+  }
+
+  function buildPick(): ShareRecent {
+    const item = new ShareRecent();
+    item.key = "pick";
+    item.pick = true;
+    item.name = t("Mobile.Share.pickChat");
+    return item;
+  }
+
+  function buildRecents(): void {
+    const out: ShareRecent[] = [];
+    if (hasLoginSession() == true) {
+      const cache = readImConvCache();
+      if (cache != null) {
+        const records = cache.records;
+        for (let i = 0; i < records.length && out.length < 8; i++) {
+          const rec = records[i];
+          const convId = readStr(rec, "convId");
+          if (isDigits(convId) != true) continue;
+          const convType = readNum(rec, "convType");
+          const name = readStr(rec, "name");
+          const peerName = readStr(rec, "peerName");
+          const avatar = readStr(rec, "avatar");
+          const peerAvatar = readStr(rec, "peerAvatar");
+          let displayName = "";
+          let avatarRaw = "";
+          if (convType == 1) {
+            displayName = peerName.length > 0 ? peerName : name;
+            avatarRaw = peerAvatar.length > 0 ? peerAvatar : avatar;
+          } else {
+            displayName = name.length > 0 ? name : peerName;
+            avatarRaw = avatar;
+          }
+          if (displayName.length == 0) displayName = t("Mobile.Share.unnamedChat");
+          const item = new ShareRecent();
+          item.key = convId;
+          item.convId = convId;
+          item.name = displayName;
+          item.letter = letterOf(displayName);
+          item.gradient = gradientOf(displayName);
+          item.avatar = imAvatarDisplayUrl(avatarRaw, 96);
+          out.push(item);
+        }
+      }
+    }
+    if (out.length == 0) out.push(buildPick());
+    recents.value = out;
+  }
+
+  function buildActions(): void {
+    const first: ShareAction[] = [];
+    first.push(makeAction("forwardFriend", "Mobile.Share.forwardFriend", "icon-Share", "", "#07c160", "#ffffff"));
+    first.push(makeAction("moments", "Mobile.Share.moments", "icon-Camera", "", "#ff6a3d", "#ffffff"));
+    first.push(makeAction("favorite", "Mobile.Share.favorite", "icon-Star-fill", "", "#faad14", "#ffffff"));
+    first.push(makeAction("search", "Mobile.Share.search", "icon-Search", "", "#ff4d4f", "#ffffff"));
+    first.push(makeAction("openBrowser", "Mobile.Share.openBrowser", "icon-Globe", "", "#1677ff", "#ffffff"));
+    first.push(makeAction("openOther", "Mobile.Share.openOther", "icon-ShareAltOutlined", "", "#fa541c", "#ffffff"));
+    rowOne.value = first;
+
+    const second: ShareAction[] = [];
+    second.push(makeAction("report", "Mobile.Share.report", "icon-attention", "", "#ffffff", "#333333"));
+    second.push(makeAction("copyLink", "Mobile.Share.copyLink", "icon-Link", "", "#ffffff", "#333333"));
+    second.push(makeAction("refresh", "Mobile.Share.refresh", "icon-restart", "", "#ffffff", "#333333"));
+    second.push(makeAction("findInPage", "Mobile.Share.findInPage", "icon-a-Filetext", "", "#ffffff", "#333333"));
+    second.push(makeAction("translate", "Mobile.Share.translate", "icon-book", "", "#ffffff", "#333333"));
+    second.push(makeAction("fontSize", "Mobile.Share.fontSize", "", "Aa", "#ffffff", "#333333"));
+    rowTwo.value = second;
+  }
+
+  function placeholder(): void {
+    uni.showToast({ title: t("Mobile.Common.comingSoon"), icon: "none" });
+  }
+
+  function copyLink(): void {
+    const data = shareUrl.value.length > 0 ? shareUrl.value : shareBody.value;
+    if (data.length == 0) {
+      uni.showToast({ title: t("Mobile.Share.noLink"), icon: "none" });
+      return;
+    }
+    uni.setClipboardData({
+      data: data,
+      success: () => {
+        uni.showToast({ title: t("Mobile.Share.linkCopied"), icon: "none" });
+        dismissShareSheet();
+      },
+      fail: () => {
+        uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+      },
+    });
+  }
+
+  async function openInBrowser(): Promise<void> {
+    if (shareUrl.value.length == 0) {
+      uni.showToast({ title: t("Mobile.Share.noLink"), icon: "none" });
+      return;
+    }
+    const url = shareUrl.value;
+    dismissShareSheet();
+    // #ifdef H5 || WEB
+    try {
+      window.open(url, "_blank");
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Share.noLink"), icon: "none" });
+    }
+    // #endif
+    // #ifdef APP
+    try {
+      await openExternalUrl(url);
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+    }
+    // #endif
+  }
+
+  function refreshPage(): void {
+    if (runShareRefresh() != true) placeholder();
+  }
+
+  function onAction(key: string): void {
+    if (key == "forwardFriend") {
+      runShareToNuwax();
+      return;
+    }
+    if (key == "openOther") {
+      runShareOutside();
+      return;
+    }
+    if (key == "copyLink") {
+      copyLink();
+      return;
+    }
+    if (key == "openBrowser") {
+      void openInBrowser();
+      return;
+    }
+    if (key == "refresh") {
+      refreshPage();
+      return;
+    }
+    placeholder();
+  }
+
+  async function sendToConv(convId: string): Promise<void> {
+    if (sending.value == true) return;
+    sending.value = true;
+    try {
+      const res = await apiImSendTextMsg(convId, shareBody.value, generateUUID());
+      if (apiResCode(res) != SUCCESS_CODE) {
+        const message = apiResMessage(res);
+        uni.showToast({
+          title: message.length > 0 ? message : t("Mobile.Share.shareFailed"),
+          icon: "none",
+        });
+        sending.value = false;
+        return;
+      }
+      dismissShareSheet();
+      setTimeout(() => {
+        uni.showToast({ title: t("Mobile.Share.sent"), icon: "none" });
+      }, 200);
+    } catch (_error) {
+      sending.value = false;
+      uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+    }
+  }
+
+  function onRecent(item: ShareRecent): void {
+    if (item.pick == true || item.convId.length == 0) {
+      runShareToNuwax();
+      return;
+    }
+    if (hasLoginSession() != true) {
+      runShareToNuwax();
+      return;
+    }
+    if (sending.value == true) return;
+    if (shareBody.value.length == 0) {
+      uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+      return;
+    }
+    const convId = item.convId;
+    const name = item.name;
+    let preview = shareBody.value;
+    if (preview.length > 80) preview = preview.substring(0, 80);
+    uni.showModal({
+      title: t("Mobile.Share.sendTo") + " " + name,
+      content: preview,
+      confirmText: t("Mobile.Common.confirm"),
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        if (res.confirm != true) return;
+        void sendToConv(convId);
+      },
+    });
+  }
+
+  function onAvatarError(key: string): void {
+    const list = recents.value;
+    const next: ShareRecent[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (item.key == key) item.avatarFailed = true;
+      next.push(item);
+    }
+    recents.value = next;
+  }
+
+  function onDismiss(): void {
+    dismissShareSheet();
+  }
+
+  function onSheetTap(): void {}
+
+  /** 当前页 chooseShareTarget 打开或收起时刷新本组件。 */
+  function applyShareSheet(): void {
+    if (isShareSheetOpen() != true) {
+      visible.value = false;
+      sending.value = false;
+      return;
+    }
+    const sheet = peekShareSheet();
+    if (sheet == null) {
+      visible.value = false;
+      return;
+    }
+    shareBody.value = sheet.body.length > 0 ? sheet.body : sheet.title;
+    shareUrl.value = sheet.url;
+    host.value = sheet.host;
+    buildRecents();
+    visible.value = true;
+    const bottom = getSafeAreaBottom();
+    if (bottom > 0) safeBottom.value = bottom;
+  }
+
+  buildActions();
+
+  onMounted(() => {
+    bindingId = bindShareSheet((): void => {
+      applyShareSheet();
+    });
+  });
+
+  onUnmounted(() => {
+    unbindShareSheet(bindingId);
+  });
+</script>
+
+<style lang="scss" scoped>
+  .share-mask {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 10050;
+    background-color: rgba(0, 0, 0, 0.45);
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+
+  .share-sheet {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .share-panel {
+    background-color: #f7f7f7;
+    border-radius: 14px 14px 0 0;
+    padding-top: 14px;
+    padding-bottom: 6px;
+  }
+
+  .share-host {
+    font-size: 12px;
+    line-height: 18px;
+    color: #888888;
+    text-align: center;
+    padding: 0 16px 4px;
+  }
+
+  .share-section {
+    font-size: 15px;
+    line-height: 22px;
+    font-weight: 600;
+    color: #191919;
+    padding: 8px 16px 4px;
+  }
+
+  .share-scroll {
+    width: 100%;
+    height: 96px;
+  }
+
+  .share-scroll--last {
+    height: 100px;
+  }
+
+  .share-scroll__inner {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    height: 96px;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .share-cell {
+    width: 76px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .share-avatar {
+    width: 52px;
+    height: 52px;
+    border-radius: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .share-avatar--clip {
+    overflow: hidden;
+  }
+
+  .share-avatar--action {
+    background-color: #07c160;
+    border-radius: 26px;
+  }
+
+  .share-avatar__img {
+    width: 52px;
+    height: 52px;
+  }
+
+  .share-avatar__letter {
+    font-size: 18px;
+    color: #ffffff;
+    font-weight: 600;
+  }
+
+  .share-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .share-icon--plain {
+    background-color: #ffffff;
+    border-width: 1px;
+    border-style: solid;
+    border-color: #eeeeee;
+  }
+
+  .share-icon__glyph {
+    font-size: 16px;
+    color: #333333;
+    font-weight: 700;
+  }
+
+  .share-cell__label {
+    width: 68px;
+    margin-top: 6px;
+    font-size: 11px;
+    line-height: 15px;
+    color: #666666;
+    text-align: center;
+    lines: 2;
+  }
+
+  .share-gap {
+    height: 8px;
+    background-color: #f7f7f7;
+  }
+
+  .share-cancel {
+    background-color: #ffffff;
+    padding-top: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .share-cancel__text {
+    font-size: 17px;
+    line-height: 24px;
+    color: #576b95;
+  }
+</style>

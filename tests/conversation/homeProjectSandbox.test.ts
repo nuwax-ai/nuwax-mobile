@@ -4,7 +4,7 @@ import { transformSync } from "esbuild";
 import { describe, expect, it, vi } from "vitest";
 import { resolvePersonalWorkspacePath } from "@/types/interfaces/displayRecommend.uts";
 
-const home = readFileSync("pages/index/index-content.uvue", "utf8");
+const home = readFileSync("subpackages/pages/index/index-content.uvue", "utf8");
 const api = readFileSync("servers/project.uts", "utf8");
 const start = home.indexOf("  async function tryCreateProjectFlow(");
 const end = home.indexOf("\n  }", start);

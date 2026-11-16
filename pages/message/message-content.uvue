@@ -2,6 +2,7 @@
   <view
     class="im-page"
     @touchstart="handlePageTouchStart($event)"
+    @touchmove="handlePageTouchMove($event)"
     @touchend="handlePageTouchEnd($event)"
     @touchcancel="handlePageTouchCancel($event)"
   >
@@ -17,12 +18,14 @@
       <text class="work-gate__text">{{ t("Mobile.Page.loadingMore") }}</text>
     </view>
     <template v-else>
-    <!-- 顶部：消息 / 智联录 tab + 搜索、添加占位入口（组件化 Stage 3 抽出
-         im-header-tabs；加号测量经组件 measurePlus/$callMethod + plus-rect 上抛） -->
+    <!-- 顶部：消息标题 + 录音、搜索、添加（加号测量经组件 measurePlus/$callMethod + plus-rect 上抛）。
+         右滑不在页内换页：由 tab-shell 把整页连底栏一起右移，左边露出录音层。 -->
     <im-header-tabs
       ref="headerTabsRef"
       header-mode="chat"
       :add-covered="addDrawerVisible"
+      :recording="partnerVoiceRecording"
+      @mic-tap="openVoiceRecord"
       @search-tap="handlePlaceholderTap"
       @plus-tap="openAddDrawer"
       @plus-rect="onHeaderPlusMeasured"
@@ -42,6 +45,8 @@
           :menu-row-id="rowMenuRowId"
           :pressed-row-id="pressedRowId"
           :pull-entry-enabled="pullEntryEnabled"
+          :scroll-locked="partnerVoiceScrollLock"
+          @pane-touchmove="handlePageTouchMove"
           @retry="handleConvRetry"
           @scroll="handleListScroll"
           @scroll-lower="handleConvScrollLower"
@@ -153,6 +158,17 @@
   import RowMenuPop from "./components/row-menu-pop.uvue";
   import ImHeaderTabs from "./components/im-header-tabs.uvue";
   import ConvListPane from "./components/conv-list-pane.uvue";
+  import {
+    beginPartnerVoiceDrag,
+    endPartnerVoiceDrag,
+    movePartnerVoiceDrag,
+    openPartnerVoiceDrawer,
+    partnerVoiceDragging,
+    partnerVoiceOpen,
+    partnerVoiceRecording,
+    partnerVoiceScrollLock,
+    takePartnerVoiceClaim,
+  } from "@/utils/partnerVoiceDrawer";
   import ScanLauncher from "@/components/scan-launcher/scan-launcher.uvue";
   import RemarkSheet from "./components/remark-sheet.uvue";
   import ApplyDetailSheet from "./components/apply-detail-sheet.uvue";
@@ -1573,6 +1589,46 @@
     pingWhoamiForAgentProvision();
     // 会话行标题的自环纠正（myInfoCache 缺失时补拉一次）
     refreshConvTitlesAfterSelfInfo();
+    // 「我自己」置顶行：与联系人首拉同机（已有行早退，幂等）
+    ensureSelfContactRow();
+    if (isContactSurface) {
+      hydrateGroupsFromCache();
+      loadGroups();
+      hydrateSpacesFromCache();
+      loadSpaces();
+    }
+  }
+
+  /** 切 tab 落定（tab 点击与 swiper 横滑共用）。横滑抬手必置吞击位，走 switchTab 会被
+   *  自己的守卫拦掉，故拆无守卫版供 swiper change 直调。 */
+  function applyTabSwitch(tab: string): void {
+    if (activeTab.value == tab) {
+      return;
+    }
+    activeTab.value = tab;
+    // 切 tab 收起长按浮层（气泡随 v-if 摘除、行高亮随 rowMenuVisible 摘除）
+    if (rowMenuVisible.value) {
+      rowMenuVisible.value = false;
+    }
+    // 智联录懒加载：联系人已随页面首拉（tab 角标需要「待我处理」数据），群组/团队首次切入时拉取。
+    // 各分支先水合再照常 load（条件进 body 时已定，水合命中也不跳过请求）＝SWR：
+    // 缓存秒出 + 静默刷新；水合失败/未命中则与原行为完全一致。
+    if (tab == "contact") {
+      if (contactLoaded.value != true) {
+        hydrateContactsFromCache();
+        loadContacts();
+      }
+      // 「我自己」置顶行：首拉失败/冷启动为空时切入智联录再试（已有行早退）
+      ensureSelfContactRow();
+      if (groupsLoaded.value != true) {
+        hydrateGroupsFromCache();
+        loadGroups();
+      }
+      if (spacesLoaded.value != true) {
+        hydrateSpacesFromCache();
+        loadSpaces();
+      }
+    }
   }
 
   // ===== 页面级触摸：吞击守卫（chat.uvue 同款；横滑切 tab 已交原生 swiper） =====
@@ -1625,9 +1681,25 @@
     // 抬手由行路径按 rowTouchOnMenuOwner 快照决策——所属行=只收层（不进会话不闪灰），
     // 其余行=正常点按（进会话/联系人动作）。★行落点判定依据 touchingRowPending：行
     // touchstart 已先于本函数（冒泡序）执行并记好行 id。
-    if (rowMenuVisible.value) {
+    const menuWasOpen = rowMenuVisible.value;
+    if (menuWasOpen) {
       closeRowMenu();
       rowMenuTouchSwallowed = touchingRowPending.length == 0;
+    }
+    if (!menuWasOpen && !addDrawerVisible.value && !workGateBlocked.value && !workGatePending.value) {
+      beginPartnerVoiceDrag(e.touches[0].screenX, e.touches[0].screenY);
+    }
+  }
+
+  function handlePageTouchMove(eventValue: Any): void {
+    const e = eventValue as UniTouchEvent;
+    if (e.touches.length == 0) {
+      return;
+    }
+    const claimed = movePartnerVoiceDrag(e.touches[0].screenX, e.touches[0].screenY);
+    if (claimed) {
+      e.preventDefault();
+      e.stopPropagation();
     }
   }
 
@@ -1654,34 +1726,36 @@
     }, 50);
   }
 
-  /** 伙伴页录音子页状态（远端「增强消息页面录音」引入，模板尚未挂载录音页）。
-   *  先补定义保证编译通过；后续接入录音页时直接复用。 */
-  const pagerIndex = ref<number>(1);
-  const voiceRecording = ref<boolean>(false);
-
-  /** 录音页返回消息：改 swiper current，由原生 swiper 做过渡动画。 */
-  function closeVoiceRecord(): void {
-    pagerIndex.value = 1;
-  }
-
-  function openVoiceRecord(): void {
-    pagerIndex.value = 0;
-  }
-
-  function onVoiceRecordingChange(recording: boolean): void {
-    voiceRecording.value = recording;
-  }
-
   function handlePageTouchEnd(eventValue: Any): void {
+    const endEvent = eventValue as UniTouchEvent;
+    const endX = endEvent.changedTouches != null && endEvent.changedTouches.length > 0 ? endEvent.changedTouches[0].screenX : -1;
+    const endY = endEvent.changedTouches != null && endEvent.changedTouches.length > 0 ? endEvent.changedTouches[0].screenY : -1;
+    endPartnerVoiceDrag(endX, endY);
+    const claimed = takePartnerVoiceClaim();
     // 手势活跃窗口收尾（问题2）：400ms 后复位（盖住 swiper 300ms 切页动画尾部）；
     // 无条件 arm（finishPageTouch 对位移≤10px 的点按提前 return，不能放它里面）
     armPageTouchIdleClear();
     finishPageTouch(eventValue);
+    // 横滑会锁住路由，紧随的 click 若去 navigateTo 会报 locked。吞掉这次点击。
+    if (claimed) {
+      pageTouchSwallowed = true;
+      if (pageTouchResetTimer != 0) {
+        clearTimeout(pageTouchResetTimer);
+      }
+      pageTouchResetTimer = setTimeout(() => {
+        pageTouchResetTimer = 0;
+        pageTouchSwallowed = false;
+      }, 400);
+    }
   }
 
   /** 触摸被取消（Android 滚动/横滑接管/系统打断）：同样走吞击判定（cancel 不派生 click，
    *  实际无副作用，保持与 end 同路径简单）。 */
   function handlePageTouchCancel(eventValue: Any): void {
+    const endEvent = eventValue as UniTouchEvent;
+    const endX = endEvent.changedTouches != null && endEvent.changedTouches.length > 0 ? endEvent.changedTouches[0].screenX : -1;
+    const endY = endEvent.changedTouches != null && endEvent.changedTouches.length > 0 ? endEvent.changedTouches[0].screenY : -1;
+    endPartnerVoiceDrag(endX, endY);
     armPageTouchIdleClear();
     finishPageTouch(eventValue);
   }
@@ -1689,6 +1763,13 @@
   /** click 入口守卫：true=本次 click 由滑动 touchup 派生、或「气泡/长按浮层点外收起」手势产生，应吞掉。 */
   function pageTapSwallowed(): boolean {
     return pageTouchSwallowed || addDrawerTouchSwallowed || rowMenuTouchSwallowed;
+  }
+
+  function openVoiceRecord(): void {
+    if (pageTapSwallowed()) {
+      return;
+    }
+    openPartnerVoiceDrawer();
   }
 
   // 展示辅助纯函数已抽至 im-row-helpers.uts（Stage 1）；随 pane 组件化（Stage 4 起）
@@ -1916,7 +1997,36 @@
   /** 进入消息详情页：携带会话基础信息（名称/头像 encodeURIComponent，详情页容错解码）。
    *  unread=点击时行未读数快照（天然在清零前），>0 时详情页定位首条未读+水位清零；
    *  其余入口（通知栏/加好友等）不带该参 → 详情页走现状贴底。 */
+  function openChatUrl(chatUrl: string, attempt: number): void {
+    try {
+      uni.navigateTo({
+        url: chatUrl,
+        fail: (err) => {
+          const message = `${err}`;
+          if (attempt >= 1 || message.indexOf("locked") < 0) {
+            return;
+          }
+          // 横滑刚结束时路由仍锁着，下一帧再进会话。
+          setTimeout(() => {
+            openChatUrl(chatUrl, attempt + 1);
+          }, 80);
+        },
+      });
+    } catch (error) {
+      const message = `${error}`;
+      if (attempt >= 1 || message.indexOf("locked") < 0) {
+        return;
+      }
+      setTimeout(() => {
+        openChatUrl(chatUrl, attempt + 1);
+      }, 80);
+    }
+  }
+
   function openConversation(conv: ImConvRow): void {
+    if (partnerVoiceDragging.value || partnerVoiceOpen.value) {
+      return;
+    }
     // 单聊对端主体类型：从本地联系人缓存同步算好带过去，详情页首帧就能定合规提示显隐
     // （否则要等两条异步回包，文案晚到会把输入坞顶高 22px）；0=未知，详情页回落异步判定
     const peerSubject = conv.convType == 1
@@ -1931,7 +2041,7 @@
       `&unread=${conv.unreadCount}` +
       (peerSubject > 0 ? `&peerSubject=${peerSubject}` : ``) +
       (conv.convType == 1 && conv.peerUserId.length > 0 ? `&peerId=${encodeURIComponent(conv.peerUserId)}` : ``);
-    uni.navigateTo({ url: chatUrl });
+    openChatUrl(chatUrl, 0);
   }
 
   // ===== 长按行操作浮层（无蒙层：行浅灰高亮 + 行旁锚定气泡；浮层状态与 closeRowMenu/
@@ -3316,12 +3426,6 @@
   .im-body {
     flex: 1;
     min-height: 0;
-  }
-
-  .im-slide {
-    flex: 1;
-    height: 100%;
-    flex-direction: column;
   }
 
   /* 列表态样式（.im-pane/.im-state/.im-foot）与行样式（.chat-item 全族等）已随

@@ -1,0 +1,204 @@
+/** App 端 VoIP 会话状态与 WS 路由。 */
+import eventBus from "@/utils/eventBus";
+import { EVENT_TYPE } from "@/constants/event.constants";
+import { apiImMeetingInviteHandled } from "@/servers/imMeeting";
+
+export const IM_CALL_CHANGED_EVENT = "im-call-changed";
+
+export class ImCallSession {
+  phase: string = "idle";
+  direction: string = "";
+  callId: string = "";
+  msgId: string = "";
+  convId: string = "";
+  mediaType: string = "audio";
+  roomName: string = "";
+  peerName: string = "";
+  peerAvatar: string = "";
+  startedAt: number = 0;
+  detail: string = "";
+}
+
+let bound = false;
+let session = new ImCallSession();
+const heard = new Set<string>();
+const heardMeetingInvites = new Set<string>();
+
+function readString(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  return raw == null ? "" : "" + raw;
+}
+
+function copySession(): ImCallSession {
+  const out = new ImCallSession();
+  out.phase = session.phase;
+  out.direction = session.direction;
+  out.callId = session.callId;
+  out.msgId = session.msgId;
+  out.convId = session.convId;
+  out.mediaType = session.mediaType;
+  out.roomName = session.roomName;
+  out.peerName = session.peerName;
+  out.peerAvatar = session.peerAvatar;
+  out.startedAt = session.startedAt;
+  out.detail = session.detail;
+  return out;
+}
+
+function changed(): void {
+  eventBus.emit(IM_CALL_CHANGED_EVENT, copySession());
+}
+
+function isCallPageOpen(): boolean {
+  const pages = getCurrentPages();
+  if (pages.length == 0) return false;
+  const last = pages[pages.length - 1] as any;
+  const route = last != null && last.route != null ? "" + last.route : "";
+  return route == "subpackages/pages/im-call/im-call";
+}
+
+function openCallPage(): void {
+  if (!isCallPageOpen()) uni.navigateTo({ url: "/subpackages/pages/im-call/im-call" });
+}
+
+function parseBody(raw: any): UTSJSONObject | null {
+  if (raw == null) return null;
+  if (typeof raw == "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed != null ? (parsed as UTSJSONObject) : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+  return raw as UTSJSONObject;
+}
+
+const onMessageReceived = (payload: any): void => {
+  if (payload == null) return;
+  const obj = payload as UTSJSONObject;
+  const msgType = readString(obj, "msgType");
+  if (msgType == "meeting_invite") {
+    const invite = parseBody(obj["body"]);
+    if (invite == null || readString(invite, "silent") == "true") return;
+    const inviteId = readString(invite, "inviteId");
+    const room = readString(invite, "roomName");
+    const title = readString(invite, "title");
+    const media = readString(invite, "mediaType") == "video" ? "video" : "audio";
+    if (inviteId.length == 0 || room.length == 0 || heardMeetingInvites.has(inviteId)) return;
+    heardMeetingInvites.add(inviteId);
+    if (session.phase != "idle" && session.phase != "ended") return;
+    const convId = readString(obj, "convId");
+    const msgId = readString(obj, "msgId");
+    const sender = readString(obj, "senderName");
+    uni.showModal({
+      title: media == "video" ? "群视频通话" : "群语音通话",
+      content: (sender.length > 0 ? sender + " 邀请你加入：" : "邀请你加入：") + (title.length > 0 ? title : "群通话"),
+      confirmText: "加入",
+      cancelText: "忽略",
+      success: (res) => {
+        apiImMeetingInviteHandled(convId, msgId, inviteId, room, true);
+        if (!res.confirm) return;
+        uni.navigateTo({
+          url: "/subpackages/pages/im-meeting/im-meeting-room?room=" + encodeURIComponent(room) + "&title=" + encodeURIComponent(title) + "&status=1&host=0&call=1&video=" + (media == "video" ? "1" : "0"),
+        });
+      },
+    });
+    return;
+  }
+  if (msgType != "voip") return;
+  const body = parseBody(obj["body"]);
+  if (body == null) return;
+  const callId = readString(body, "callId");
+  const roomName = readString(body, "roomName");
+  const mediaType = readString(body, "mediaType").toLowerCase();
+  if (callId.length == 0 || roomName.length == 0 || (mediaType != "audio" && mediaType != "video")) return;
+  if (heard.has(callId) || session.callId == callId) return;
+  heard.add(callId);
+  if (session.phase != "idle" && session.phase != "ended") return;
+  session = new ImCallSession();
+  session.phase = "incoming";
+  session.direction = "in";
+  session.callId = callId;
+  session.msgId = readString(obj, "msgId");
+  session.convId = readString(obj, "convId");
+  session.mediaType = mediaType;
+  session.roomName = roomName;
+  session.peerName = readString(obj, "senderName");
+  session.peerAvatar = readString(obj, "senderAvatar");
+  session.startedAt = Date.now();
+  changed();
+  openCallPage();
+};
+
+const onCustomEvent = (payload: any): void => {
+  if (payload == null || session.callId.length == 0) return;
+  const obj = payload as UTSJSONObject;
+  const eventType = readString(obj, "eventType");
+  if (eventType != "voip:answered" && eventType != "voip:cancel" && eventType != "voip:timeout" && eventType != "voip:decline") return;
+  const body = parseBody(obj["payload"]);
+  if (body == null || readString(body, "callId") != session.callId) return;
+  if (eventType == "voip:answered") {
+    // answered 只用于让被叫自己的其它设备停铃；主叫靠 LiveKit 远端入会转 active。
+    if (session.direction == "in" && session.phase == "incoming") {
+      session.phase = "ended";
+      session.detail = "已在其他设备接听";
+      changed();
+    }
+    return;
+  }
+  session.phase = "ended";
+  if (eventType == "voip:decline") session.detail = session.direction == "out" ? "对方已拒绝" : "已在其他设备拒绝";
+  else if (eventType == "voip:timeout") session.detail = "无人接听";
+  else if (eventType == "voip:cancel") session.detail = session.direction == "in" ? "对方已取消" : "已取消";
+  changed();
+};
+
+export function bindImCallEvents(): void {
+  if (bound) return;
+  bound = true;
+  eventBus.on("" + EVENT_TYPE.ImMessageReceived, onMessageReceived);
+  eventBus.on("" + EVENT_TYPE.ImCustomEvent, onCustomEvent);
+}
+
+export function getImCallSession(): ImCallSession { return copySession(); }
+
+export function startOutgoingImCall(convId: string, peerName: string, peerAvatar: string, mediaType: string): boolean {
+  if (session.phase != "idle" && session.phase != "ended") {
+    uni.showToast({ title: "你正在通话中", icon: "none" });
+    return false;
+  }
+  const now = Date.now();
+  const rand = Math.floor(Math.random() * 100000000).toString(36);
+  session = new ImCallSession();
+  session.phase = "outgoing";
+  session.direction = "out";
+  session.callId = "call-" + now.toString(36) + "-" + rand;
+  session.convId = convId;
+  session.mediaType = mediaType == "video" ? "video" : "audio";
+  session.roomName = "im-" + convId.substring(0, 32) + "-" + now.toString(36) + "-" + rand;
+  session.peerName = peerName;
+  session.peerAvatar = peerAvatar;
+  session.startedAt = now;
+  changed();
+  openCallPage();
+  return true;
+}
+
+export function patchImCallSession(phase: string, msgId: string = "", detail: string = ""): void {
+  if (phase.length > 0) session.phase = phase;
+  if (msgId.length > 0) session.msgId = msgId;
+  session.detail = detail;
+  changed();
+}
+
+export function finishImCall(detail: string = ""): void {
+  session.phase = "ended";
+  session.detail = detail;
+  changed();
+}
+
+export function clearImCallSession(): void {
+  session = new ImCallSession();
+  changed();
+}

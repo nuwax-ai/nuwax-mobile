@@ -161,6 +161,33 @@ class MeetingRoomBridge(context: Context) {
     return r.remoteParticipants.size + 1
   }
 
+  /** 房间 metadata：服务端更新后 LiveKit 会同步到 Room，本端由页面轮询读取。 */
+  fun roomMetadata(): String {
+    return room?.metadata ?: ""
+  }
+
+  /** 举手状态走 participant attributes，与 PC / iOS 使用同一个 handRaised 键。 */
+  fun setHandRaised(raised: Boolean) {
+    val r = room ?: return
+    val s = scope ?: return
+    s.launch {
+      try {
+        r.localParticipant.updateAttributes(
+          mapOf("handRaised" to if (raised) "1" else "")
+        )
+      } catch (e: Throwable) {
+      }
+    }
+  }
+
+  fun localHandRaised(): Boolean {
+    return try {
+      (room?.localParticipant?.attributes?.get("handRaised") ?: "").isNotEmpty()
+    } catch (e: Throwable) {
+      false
+    }
+  }
+
   /** 是否已连接（由 connect 结果驱动）。 */
   fun isConnected(): Boolean {
     return connectedFlag
@@ -286,10 +313,6 @@ class MeetingRoomBridge(context: Context) {
   fun createRemoteRenderer(context: Context, identity: String): SurfaceViewRenderer? {
     val r = room ?: return null
     try {
-      val existing = remoteRenderers[identity]
-      if (existing != null) {
-        return existing
-      }
       var target: io.livekit.android.room.participant.RemoteParticipant? = null
       for (p in r.remoteParticipants.values) {
         if ((p.identity?.value ?: "") == identity) {
@@ -298,15 +321,19 @@ class MeetingRoomBridge(context: Context) {
       }
       val participant = target ?: return null
       // ★TrackPublication 上没有 videoTrack 便捷属性：统一 `track as? VideoTrack`
-      var track = participant.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack
-      if (track == null) {
-        for (pub in participant.trackPublications.values) {
-          if (track == null) {
-            track = pub.track as? VideoTrack
-          }
-        }
+      val cameraPublication = participant.getTrackPublication(Track.Source.CAMERA)
+      var track = if (cameraPublication != null && !cameraPublication.isMuted) {
+        cameraPublication.track as? VideoTrack
+      } else {
+        null
       }
       val video = track ?: return null
+      val existing = remoteRenderers[identity]
+      if (existing != null) {
+        // 对方关摄像头再打开时可能换成新轨道；复用 View，但必须重新挂当前轨道。
+        video.addRenderer(existing)
+        return existing
+      }
       val view = SurfaceViewRenderer(context)
       r.initVideoRenderer(view)
       // 远端画面也按"裁切铺满"处理，避免黑边
@@ -355,12 +382,8 @@ class MeetingRoomBridge(context: Context) {
   /** 这个远端是否已经订阅到视频轨道（`track as? VideoTrack` 判空，同 createRemoteRenderer）。 */
   private fun hasVideoTrack(p: io.livekit.android.room.participant.RemoteParticipant): Boolean {
     return try {
-      for (pub in p.trackPublications.values) {
-        if ((pub.track as? VideoTrack) != null) {
-          return true
-        }
-      }
-      false
+      val pub = p.getTrackPublication(Track.Source.CAMERA)
+      pub != null && !pub.isMuted && (pub.track as? VideoTrack) != null
     } catch (e: Throwable) {
       false
     }

@@ -176,7 +176,7 @@ class VoipIncomingActivity : Activity() {
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     companion object {
         fun intent(context: Context, id: String): Intent = Intent(context, VoipIncomingActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NO_USER_ACTION)
             .setData(Uri.parse("nuwax-voip://call/" + Uri.encode(id)))
             .putExtra("callId", id)
     }

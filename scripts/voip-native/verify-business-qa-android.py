@@ -62,7 +62,8 @@ with zipfile.ZipFile(APK) as archive:
             count += 1
     assert count > 100
     dex = b"".join(archive.read(name) for name in archive.namelist() if re.fullmatch(r"classes[0-9]*\.dex", name))
-    for value in [ORIGIN, "Lcom/nuwax/voip/VoipBridge;", "Lcom/igexin/sdk/HonorPushMessageService;", "Lcom/igexin/sdk/HmsPushMessageService;"]:
+    for value in [ORIGIN, "Lcom/nuwax/voip/VoipBridge;", "Lcom/igexin/sdk/HonorPushMessageService;", "Lcom/igexin/sdk/HmsPushMessageService;",
+                  "nuwax-voip-incoming-v1", "nuwax-voip-ongoing-v1"]:
         assert value.encode() in dex, f"Missing compiled implementation: {value}"
     assert b"Lio/dcloud/debug/" not in dex, "HX debug server is bundled"
 
@@ -76,6 +77,8 @@ result = {**variant, "platform": "android", "packageName": "com.nuwax.app", "ver
           "versionCode": str(manifest["versionCode"]), "apk": str(APK), "sha256": sha(APK.read_bytes()),
           "certificateSha256": cert, "bundledResourceCount": count, "hxDebugServer": False,
           "developmentListener": False, "uniPushVendorAdapters": ["huawei", "honor"], "installed": False,
+          "incomingNotificationChannel": "nuwax-voip-incoming-v1", "ongoingNotificationChannel": "nuwax-voip-ongoing-v1",
+          "notificationFixes": ["systemRingtoneAudioAttributes", "insistentIncomingOnly", "deduplicatedIncomingPublication", "silentCallProgress", "presentationDiagnostics"],
           "deviceAcceptance": "pending; lock screen and all-processes-absent wake require real-device evidence"}
 Path(str(APK) + ".json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 Path(str(APK) + ".sha256").write_text(result["sha256"] + "  " + APK.name + "\n")

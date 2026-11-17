@@ -6,6 +6,7 @@ import android.content.*
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
@@ -86,6 +87,7 @@ object VoipBridge {
     private var nativeUiId = ""
     private var speaker = false
     private val terminal = LinkedHashSet<String>()
+    private val incomingNotifications = VoipIncomingNotificationGate()
     private val views = mutableMapOf<FrameLayout, String>()
     private val renderers = mutableMapOf<FrameLayout, TextureViewRenderer>()
     private val bindings = mutableMapOf<FrameLayout, VideoTrack>()
@@ -101,14 +103,23 @@ object VoipBridge {
     private fun cameraVisible() = !hidden || nativeUiId == current?.optString("callId")
     @JvmStatic fun presentationStatus(ctx: Context): String {
         val manager = ctx.getSystemService(NotificationManager::class.java)
-        val channel = manager.getNotificationChannel("nuwax-voip")
+        val channel = VoipNotificationChannels.incoming(manager)
+        val audio = ctx.getSystemService(AudioManager::class.java)
         return JSONObject().put("supported", true)
             .put("bundleId", ctx.packageName)
             .put("developmentListener", VoipDevControlService.running)
             .put("uniPushConfigured", ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA).metaData?.getBoolean("nuwax.voip.uniPush", false) == true)
             .put("notificationsAllowed", NotificationManagerCompat.from(ctx).areNotificationsEnabled())
             .put("fullScreenAllowed", Build.VERSION.SDK_INT < 34 || manager.canUseFullScreenIntent())
-            .put("channelEnabled", channel == null || channel.importance >= NotificationManager.IMPORTANCE_HIGH).toString()
+            .put("fullScreenPermissionChecked", Build.VERSION.SDK_INT >= 34)
+            .put("sdk", Build.VERSION.SDK_INT).put("manufacturer", Build.MANUFACTURER)
+            .put("channelEnabled", channel == null || channel.importance >= NotificationManager.IMPORTANCE_HIGH)
+            .put("channelId", channel?.id ?: VoipNotificationChannels.INCOMING)
+            .put("channelImportance", channel?.importance ?: -1)
+            .put("channelSoundEnabled", channel?.sound != null)
+            .put("ringerMode", audio.ringerMode).put("ringVolume", audio.getStreamVolume(AudioManager.STREAM_RING))
+            .put("interruptionFilter", manager.currentInterruptionFilter)
+            .put("keyguardLocked", ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked).toString()
     }
     @JvmStatic fun openPresentationSettings(ctx: Context) {
         val intent = if (Build.VERSION.SDK_INT >= 34) Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + ctx.packageName))
@@ -128,6 +139,7 @@ object VoipBridge {
             .put("mediaReady", connected && peerReady).put("reconnecting", reconnecting)
     }
     internal fun nativeVisible(id: String, visible: Boolean) {
+        trace(if (visible) "native call activity visible" else "native call activity hidden")
         if (visible && current?.optString("callId") == id) nativeUiId = id
         else if (!visible && nativeUiId == id) nativeUiId = ""
         scope.launch {
@@ -524,13 +536,19 @@ object VoipBridge {
     }
     private fun publishCall() {
         val ctx = context ?: return
-        try { VoipCallService.show(ctx) }
+        val call = current ?: return
+        val incoming = call.optString("state") == "ringing" && call.optString("calleeId") == config.optString("userId")
+        if (!incomingNotifications.publish(call.optString("callId"), incoming)) return
+        try { VoipCallService.show(ctx, call.optString("callId")) }
         catch (_: IllegalStateException) {
             // Core-Telecom on Android 14+ can keep a notified call alive via its own
             // foreground delegation. Do not lose the invitation if an OEM denies our FGS.
-            NotificationManagerCompat.from(ctx).notify(9090, notification(ctx))
+            try { NotificationManagerCompat.from(ctx).notify(9090, notification(ctx)); trace("call notification posted without own service") }
+            catch (_: Exception) { incomingNotifications.reset(); trace("call notification failed") }
         }
+        catch (_: Exception) { incomingNotifications.reset(); trace("call service failed") }
     }
+    internal fun hasSystemCall() = current != null && control != null
     private fun permissions(type: String): Boolean {
         val ctx = context ?: return false
         return ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED &&
@@ -594,7 +612,7 @@ object VoipBridge {
                 connected = true; emit("connected"); refreshViews(); announceMediaReady()
                 if (business()) mediaJoined()
                 maybeReady()
-                context?.let { VoipCallService.show(it) }
+                context?.let { VoipCallService.show(it, id) }
             } catch (_: Exception) { if (run == generation && !terminal.contains(id)) { finish("mediaFailed"); emit("error", "code", "CALL_MEDIA_FAILED") } }
         }
     }
@@ -681,6 +699,8 @@ object VoipBridge {
         }
         telecomCleanup = cleanup
         cleanup.start()
+        incomingNotifications.reset()
+        VoipCallService.removeNotification()
         context?.stopService(Intent(context, VoipCallService::class.java))
         context?.getSystemService(NotificationManager::class.java)?.cancel(9090)
         if (reason.isNotEmpty()) emit("localEnded", "reason", reason)
@@ -771,8 +791,7 @@ object VoipBridge {
     }
 
     internal fun notification(ctx: Context): Notification {
-        val nm = ctx.getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel("nuwax-voip", config.optString("callLabel", "Nuwax"), NotificationManager.IMPORTANCE_HIGH))
+        VoipNotificationChannels.ensure(ctx, config.optString("callLabel", "Nuwax"), config.optString("callLabel", "Nuwax") + " · " + label("incoming"))
         val s = current ?: JSONObject()
         val incoming = s.optString("state") == "ringing" && s.optString("calleeId") == config.optString("userId")
         fun intent(action: String): PendingIntent = PendingIntent.getBroadcast(ctx, action.hashCode(), Intent(ctx, VoipActionReceiver::class.java)
@@ -784,11 +803,19 @@ object VoipBridge {
         val person = Person.Builder().setName(s.optString(if (s.optString("callerId") == config.optString("userId")) "calleeDisplayName" else "callerDisplayName", "Nuwax")).setImportant(true).build()
         val style = if (incoming) NotificationCompat.CallStyle.forIncomingCall(person, intent("reject"), answer)
             else NotificationCompat.CallStyle.forOngoingCall(person, intent(if (s.optString("state") == "ringing") "cancel" else "end"))
-        val builder = NotificationCompat.Builder(ctx, "nuwax-voip").setSmallIcon(android.R.drawable.sym_call_incoming).setContentIntent(content)
+        val builder = NotificationCompat.Builder(ctx, if (incoming) VoipNotificationChannels.INCOMING else VoipNotificationChannels.ONGOING)
+            .setSmallIcon(android.R.drawable.sym_call_incoming).setContentIntent(content)
+            .setContentTitle(person.name).setContentText(if (s.optString("state") == "active") config.optString("callLabel", "Nuwax")
+                else label(if (incoming) "incoming" else if (s.optString("state") == "ringing") "dialing" else "connecting"))
             .setCategory(NotificationCompat.CATEGORY_CALL).setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setOngoing(true).setOnlyAlertOnce(true).setStyle(style)
+            .setPriority(NotificationCompat.PRIORITY_MAX).setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setOngoing(true).setOnlyAlertOnce(!incoming).setStyle(style)
         if (incoming) builder.setFullScreenIntent(content, true)
-        return builder.build()
+        else builder.setSilent(true)
+        return builder.build().also {
+            if (incoming) it.flags = it.flags or Notification.FLAG_INSISTENT
+            trace("call notification incoming=" + incoming + ", presentation=" + presentationStatus(ctx))
+        }
     }
     internal fun receiveAction(id: String, action: String) { if (id == current?.optString("callId")) scope.launch { act(action) } }
 }
@@ -798,16 +825,19 @@ class VoipActionReceiver : BroadcastReceiver() {
 }
 class VoipCallService : Service() {
     override fun onCreate() { super.onCreate(); instance = this }
-    override fun onDestroy() { if (instance === this) instance = null; super.onDestroy() }
+    override fun onDestroy() { stopForeground(STOP_FOREGROUND_REMOVE); if (instance === this) instance = null; super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!VoipBridge.hasSystemCall()) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return START_NOT_STICKY }
+        if (VoipBridge.uiSnapshot(intent?.getStringExtra("callId") ?: "") == null) return START_NOT_STICKY
         if (Build.VERSION.SDK_INT >= 29) startForeground(9090, VoipBridge.notification(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
         else startForeground(9090, VoipBridge.notification(this))
         return START_NOT_STICKY
     }
     companion object {
         private var instance: VoipCallService? = null
-        fun show(context: Context) { ContextCompat.startForegroundService(context, Intent(context, VoipCallService::class.java)) }
+        fun removeNotification() { instance?.stopForeground(STOP_FOREGROUND_REMOVE) }
+        fun show(context: Context, id: String) { ContextCompat.startForegroundService(context, Intent(context, VoipCallService::class.java).putExtra("callId", id)) }
         fun enableCapture(video: Boolean): Boolean {
             val service = instance ?: return false
             if (Build.VERSION.SDK_INT >= 30) {

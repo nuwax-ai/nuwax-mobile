@@ -59,6 +59,34 @@ export class VoiceNoteM4aBridge {
     }
   }
 
+  async pauseSegment(): Promise<string> {
+    const av = this.recorder
+    if (av == null) {
+      return '0'
+    }
+    try {
+      await av.pause()
+      return '1'
+    } catch (ePause) {
+      console.warn('[voice-note] m4a pause failed', ePause)
+      return '0'
+    }
+  }
+
+  async resumeSegment(): Promise<string> {
+    const av = this.recorder
+    if (av == null) {
+      return '0'
+    }
+    try {
+      await av.resume()
+      return '1'
+    } catch (eResume) {
+      console.warn('[voice-note] m4a resume failed', eResume)
+      return '0'
+    }
+  }
+
   async stopSegment(): Promise<string> {
     const av = this.recorder
     this.recorder = null

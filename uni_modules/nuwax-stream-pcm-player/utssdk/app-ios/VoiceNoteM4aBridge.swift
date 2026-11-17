@@ -67,6 +67,24 @@ public class VoiceNoteM4aBridge {
         }
     }
 
+    public func pauseSegment() -> String {
+        guard let current = recorder else {
+            return "0"
+        }
+        current.pause()
+        return "1"
+    }
+
+    public func resumeSegment() -> String {
+        guard let current = recorder else {
+            return "0"
+        }
+        if !current.record() {
+            return "0"
+        }
+        return "1"
+    }
+
     public func stopSegment() -> String {
         guard let current = recorder else {
             return "0"

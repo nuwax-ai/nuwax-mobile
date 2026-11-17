@@ -58,6 +58,34 @@ class VoiceNoteM4aBridge {
         }
     }
 
+    /** 暂停采集，不结束当前 m4a，避免每次暂停都生成新文件。 */
+    fun pauseSegment(): String {
+        val current = recorder ?: return "0"
+        if (Build.VERSION.SDK_INT < 24) {
+            return "0"
+        }
+        return try {
+            current.pause()
+            "1"
+        } catch (_e: Exception) {
+            "0"
+        }
+    }
+
+    /** 接着写入暂停前的同一个文件。 */
+    fun resumeSegment(): String {
+        val current = recorder ?: return "0"
+        if (Build.VERSION.SDK_INT < 24) {
+            return "0"
+        }
+        return try {
+            current.resume()
+            "1"
+        } catch (_e: Exception) {
+            "0"
+        }
+    }
+
     fun stopSegment(): String {
         val current = recorder ?: return "0"
         recorder = null

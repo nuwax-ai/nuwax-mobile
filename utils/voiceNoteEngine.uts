@@ -2,7 +2,7 @@
  * 伙伴页录音会话。
  * App 使用独立的 VoiceNoteM4aRecorder，直接把每一段写成 m4a，不经过聊天页的 PCM 采集。
  * 录音器挂在模块上，不随页面卸载停止。退到后台继续录，约 1 小时切一段后上传。
- * 主按钮只暂停或继续，不结束会话。暂停段 isLast=false。只有点完成才把最后一段标成 isLast 并 complete。
+ * 主按钮只暂停或继续，不结束会话，也不落盘。当前段满 1 小时，或点完成，才落盘并上传。
  */
 import {
   findOpenVoiceNote,
@@ -32,8 +32,11 @@ import {
 import { VoiceNoteM4aRecorder } from "@/uni_modules/nuwax-stream-pcm-player";
 // #endif
 
-/** 约 1 小时切一段，单段体积低于服务端 100MB。 */
-const SEGMENT_MS = 3600000;
+/**
+ * 伙伴页录音切片时长（毫秒）。当前段累计超过这个时间才落盘并上传。
+ * 上线用 3600000（1 小时）。测试可改成 300000（5 分钟）。只改这一处。
+ */
+const segmentMs = 3600000;
 
 let recorderBound = false;
 // #ifdef APP
@@ -214,6 +217,22 @@ function stopTicker(): void {
   }
 }
 
+function openSegmentMs(record: VoiceNoteRecord, now: number): number {
+  let extra = 0;
+  if (record.segmentStartedAt > 0) {
+    extra = now - record.segmentStartedAt;
+    if (extra < 0) extra = 0;
+  }
+  return record.openElapsedMs + extra;
+}
+
+function freezeOpenSegment(record: VoiceNoteRecord): void {
+  const now = Date.now();
+  record.openElapsedMs = openSegmentMs(record, now);
+  record.elapsedMs = record.accumulatedMs + record.openElapsedMs;
+  record.segmentStartedAt = 0;
+}
+
 function onTick(): void {
   const record = activeRecord();
   if (record == null) {
@@ -221,22 +240,22 @@ function onTick(): void {
     return;
   }
   const now = Date.now();
-  const segmentElapsed = record.segmentStartedAt > 0 ? now - record.segmentStartedAt : 0;
+  const segmentElapsed = openSegmentMs(record, now);
   record.elapsedMs = record.accumulatedMs + segmentElapsed;
   if (now - lastPersistAt >= 2000) {
     lastPersistAt = now;
     touch(record);
   }
-  if (segmentElapsed >= SEGMENT_MS && stopIntent.length == 0) {
+  if (segmentElapsed >= segmentMs && stopIntent.length == 0) {
     stopActiveRecorder("rotate");
   }
 }
 
 async function closeSegment(record: VoiceNoteRecord, tempPath: string, isLast: boolean): Promise<void> {
   const index = record.openSegmentIndex;
-  const startedAt = record.segmentStartedAt > 0 ? record.segmentStartedAt : record.startedAt;
   const endedAt = Date.now();
-  const durationMs = endedAt - startedAt;
+  const durationMs = openSegmentMs(record, endedAt);
+  const startedAt = endedAt - durationMs;
   // App 的 m4a 已经写在最终路径上。小程序拿到的是临时 aac，再拷进会话目录。
   let filePath = tempPath;
   // #ifndef APP
@@ -254,6 +273,7 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string, isLast: b
   record.segments.push(segment);
   record.openSegmentIndex = index + 1;
   record.segmentStartedAt = 0;
+  record.openElapsedMs = 0;
   record.openSegmentPath = "";
   record.accumulatedMs = record.accumulatedMs + duration;
   record.elapsedMs = record.accumulatedMs;
@@ -604,9 +624,27 @@ function findPausedVoiceNote(): VoiceNoteRecord | null {
   return null;
 }
 
-/** 暂停后的同一条笔记接着录，不新建会话。 */
+/** 暂停后的同一条笔记接着录，不新建会话，也不新开文件。 */
 async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
   bindRecorder();
+  // #ifdef APP
+  if (m4aRecorder != null && record.openSegmentPath.length > 0) {
+    const resumed = await m4aRecorder!.resume();
+    if (resumed == "1") {
+      record.phase = "recording";
+      record.segmentStartedAt = Date.now();
+      record.awaitComplete = false;
+      record.error = "";
+      touch(record);
+      captureAlive = true;
+      beginBackground();
+      stopIntent = "";
+      pushVoiceNoteDebug("录音", "继续写入当前文件");
+      ensureTicker();
+      return;
+    }
+  }
+  // #endif
   record.phase = "recording";
   record.segmentStartedAt = Date.now();
   record.awaitComplete = false;
@@ -658,10 +696,30 @@ export async function startVoiceNote(): Promise<void> {
   ensureTicker();
 }
 
-/** 暂停当前段。分段照常上传，但 isLast 为 false，不调用 complete。 */
+/**
+ * 暂停采集。App 不结束当前文件，也不上传。
+ * 满 1 小时切段，或点完成，才会落盘并上传。
+ */
 export function stopVoiceNote(): void {
   const record = activeRecord();
   if (record == null) return;
+  void pauseActiveRecorder(record);
+}
+
+async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
+  // #ifdef APP
+  if (m4aRecorder != null && record.openSegmentPath.length > 0) {
+    const paused = await m4aRecorder!.pause();
+    if (paused == "1") {
+      freezeOpenSegment(record);
+      record.phase = "paused";
+      record.awaitComplete = false;
+      touch(record);
+      pushVoiceNoteDebug("录音", "暂停，当前文件不落盘");
+      return;
+    }
+  }
+  // #endif
   stopActiveRecorder("user");
 }
 
@@ -778,7 +836,7 @@ export function voiceNoteOnAppShow(): void {
     beginBackground();
     ensureTicker();
     const now = Date.now();
-    if (record.segmentStartedAt > 0 && now - record.segmentStartedAt >= SEGMENT_MS && stopIntent.length == 0) {
+    if (openSegmentMs(record, now) >= segmentMs && stopIntent.length == 0) {
       stopActiveRecorder("rotate");
     }
   }
@@ -786,9 +844,9 @@ export function voiceNoteOnAppShow(): void {
   resumeProcessingPoll();
 }
 
-/** 退出程序：暂停正在录的段。会话不结束，只有点完成才 complete。 */
+/** 退出程序：把正在写的段收成文件。会话不结束，只有点完成才 complete。 */
 export function voiceNoteOnAppExit(): void {
   if (activeRecord() == null) return;
-  pushVoiceNoteDebug("录音", "退出程序，暂停当前段，会话未结束");
-  stopVoiceNote();
+  pushVoiceNoteDebug("录音", "退出程序，落下当前段，会话未结束");
+  stopActiveRecorder("user");
 }

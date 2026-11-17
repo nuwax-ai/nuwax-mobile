@@ -1,5 +1,19 @@
 # nuwax-im VoIP 实际接口核对
 
+## 2026-11-17 对照 PC Web 会议后的结论
+
+重新 fetch `feat-video-meeting`，HEAD 仍为 `26dd3491826ddbbfdc9cedfe169fa93ba9144c1f`。PC 的 `nuwax-im-web/src/store/call.ts` 与 `docs/14`、`docs/15` 明确：**一对一通话复用会议域建房/令牌/LiveKit，人数上限设为 2**。当前移动端 `servers/voipIm.uts` 和 iOS 原生 `businessCredentials/mediaJoined` 走同样接口，已打好的测试 IPA 无须等待另一套建房或 `/calls` CRUD 服务才能做在线互拨。
+
+使用 ego-browser 的测试登录态只读查询 `https://testagent.xspaceagi.com`：`/users/me`、`/meetings/rtc/rooms`、`/meetings` 均 HTTP 200、`code=0000`（完整前缀 `/api/instant-message`）。房间查询代码确实调用 RTC provider，所以本次已确认会议开关和房间控制查询可用；未另建房或重复执行媒体通话。脱敏结果在 `out/voip-backend-pc-review-20261117/read-only-endpoints.json`。
+
+RTC token 的 `/rooms/{room}/tokens/refresh` 已有实现，默认参与方也已允许 `canPublishData=true`。不能把这些列为“后端仍未提供”。尚未确认的原生续期指平台登录 accessToken，而非 LiveKit 票据。
+
+本次 `GET /calls/devices`、`GET /calls/capabilities` 均为 404；本轮未提交注册请求，源码也未发现对应新路径，**不据此认定既有会议/在线通话不可用**。实际移动端在线通话不使用这两条新路径。另查现有 `/devices` 已接受 `voipToken`，但当前发送实现仍使用 UniPush CID，DTO 也明确 PushKit token 尚无消费方；未发现直接 APNs VoIP sender。手机未运行时的电话唤醒仍需完成专用投递和隔离路由，可扩展旧接口或按独立服务的实际契约实现等价语义。
+
+结论应分为：**RTC 与在线呼叫可复用、两机可先测；APNs 冷唤醒待接通；终态补偿/原子抢接等作为完整产品增强另列。** 已据此收窄[后端清单](voip-backend-required.md)，不要求重做 PC 已用的媒体服务。本轮未发消息、创建会议、拨打电话、修改后端或生产配置。
+
+## 2026-11-16 及此前核对记录
+
 2026-11-16 恢复核对：`feat-video-meeting@26dd3491` 仍没有 APNs sender 与 `/calls/devices` 注册接口；测试环境鉴权有效，新增注册路径 GET/POST 均为 404。电话控制仍使用原消息邀请和 3007 事件，尚不能进行真实 APNs 来电验收。详见 [本轮记录](voip-acceptance.md#2026-11-16-恢复联调与合并主线)。
 
 2026-11-10 增量只读复核 `feat-video-meeting@241f8a4c`：UniPush 仍使用 CID/普通邀请，设备刷新仍直接覆盖 voipToken。当前方案改用独立 APNs `/calls/devices` 注册，不再写该列；新增接口与发送见 [iOS 推送交接](voip-ios-push-handoff.md)，Android 发送门禁/厂商条件见 [系统推送分工](voip-system-push.md)。下文保留首次核对基线。

@@ -2,6 +2,8 @@ package com.nuwax.voip
 
 /** Business policy, independent from Telecom/media, and executable on the JVM. */
 internal object VoipCallPolicy {
+    fun originAllowed(fixedOrigin: String?, origin: String): Boolean = fixedOrigin.isNullOrEmpty() || fixedOrigin == origin
+
     fun matches(signalId: String, messageId: String, callId: String, callMessageId: String): Boolean =
         if (signalId.isNotEmpty()) signalId == callId else messageId.isNotEmpty() && callMessageId.isNotEmpty() && messageId == callMessageId
 

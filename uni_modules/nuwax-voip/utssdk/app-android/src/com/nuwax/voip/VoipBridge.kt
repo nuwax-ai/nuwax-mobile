@@ -185,6 +185,7 @@ object VoipBridge {
 
     private fun initialize(value: JSONObject) {
         trace("initialize requested")
+        if (!qaOriginAllowed(value)) return
         val debug = ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
         if (!value.optBoolean("development") && !value.optBoolean("qaAccepted") && !(debug && value.optBoolean("businessEnabled"))) return
         if (value.optBoolean("development") && ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
@@ -758,9 +759,16 @@ object VoipBridge {
         if (encoded == null) null else {
             val bytes = Base64.decode(encoded, Base64.NO_WRAP)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding"); cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
-            JSONObject(String(cipher.doFinal(bytes.copyOfRange(12, bytes.size))))
+            JSONObject(String(cipher.doFinal(bytes.copyOfRange(12, bytes.size)))).takeIf { qaOriginAllowed(it) }
         }
     } catch (_: Exception) { null }
+
+    private fun qaOriginAllowed(value: JSONObject): Boolean {
+        val ctx = context ?: return false
+        val fixedOrigin = ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA)
+            .metaData?.getString("nuwax.voip.qaApiOrigin")
+        return VoipCallPolicy.originAllowed(fixedOrigin, value.optString("apiBaseUrl"))
+    }
 
     internal fun notification(ctx: Context): Notification {
         val nm = ctx.getSystemService(NotificationManager::class.java)

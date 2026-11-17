@@ -4,7 +4,14 @@ object VoipCallPolicyTest {
     @JvmStatic fun main(args: Array<String>) {
         explicitCallIdMustMatch(); onlyAUserRejectionProducesDeclined()
         staleRingingSignalsCannotTerminateAnAcceptedCall(); userHangupIsDistinctFromCancelAndReject()
-        println("4 Kotlin call policy cases passed")
+        standaloneQaCannotRestoreProductionIdentity()
+        println("5 Kotlin call policy cases passed")
+    }
+    private fun standaloneQaCannotRestoreProductionIdentity() {
+        check(VoipCallPolicy.originAllowed(null, "https://agent.nuwax.com"))
+        check(VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://testagent.xspaceagi.com"))
+        check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://agent.nuwax.com"))
+        check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://testagent.xspaceagi.com.evil.example"))
     }
     private fun explicitCallIdMustMatch() {
         check(!VoipCallPolicy.matches("old", "m1", "new", "m1"))

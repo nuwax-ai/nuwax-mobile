@@ -19,7 +19,8 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     manifest = root / 'app/src/main/AndroidManifest.xml'
     manifest.write_text('<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application><service android:name="example.OrdinaryService"/></application></manifest>')
     config = root / 'config.json'
-    config.write_text(json.dumps({'packageName':'com.nuwax.app','getuiAppId':'fixtureGetuiAppId'}))
+    config.write_text(json.dumps({'packageName':'com.nuwax.app','getuiAppId':'fixtureGetuiAppId',
+        'huawei':{'appId':'123456789'}, 'honor':{'appId':'987654321'}}))
     os.environ['ANDROID_BUNDLE_ID'] = 'com.nuwax.app'
     configure(root, config)
     configure(root, config)
@@ -29,11 +30,22 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     assert len([s for s in services if s.get(ANDROID+'name') == STOCK_RECEIVER and s.get(TOOLS+'node') == 'remove']) == 1
     assert 'super.onReceiveMessageData' in (root / CALL_RECEIVER_FILE).read_text()
     assert (root / 'app/build.gradle').read_text().count("com.getui:gtsdk:3.3.7.0") == 1
+    gradle = (root / 'app/build.gradle').read_text()
+    assert gradle.count('com.getui.opt:hwp:3.1.4') == 1
+    assert gradle.count('com.getui.opt:honor:3.6.0') == 1
+    assert '"HUAWEI_APP_ID": "appid=123456789"' in gradle
+    assert '"HONOR_APP_ID": "987654321"' in gradle
+    assert 'https://developer.hihonor.com/repo/' in (root / 'settings.gradle').read_text()
+    metadata = {n.get(ANDROID+'name'):n.get(ANDROID+'value') for n in app.findall('meta-data')}
+    assert metadata['com.huawei.hms.client.appid'] == 'appid=123456789'
+    assert metadata['com.hihonor.push.app_id'] == '987654321'
     configure(root, None)
     app = ET.parse(manifest).getroot().find('application')
     assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']
     assert not (root / CALL_RECEIVER_FILE).exists()
     assert 'com.getui:gtsdk' not in (root / 'app/build.gradle').read_text()
+    assert 'com.getui.opt:honor' not in (root / 'app/build.gradle').read_text()
+    assert not any(n.get(ANDROID+'name') in ['com.huawei.hms.client.appid','com.hihonor.push.app_id'] for n in app.findall('meta-data'))
     (root / 'uts-nuwax-voip').rmdir()
     configure(root, config)
     app = ET.parse(manifest).getroot().find('application')

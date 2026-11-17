@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Own all Android test-host additions, including cleanup when leaving test mode."""
 import os
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -9,6 +10,27 @@ from configure_unipush import ANDROID, configure
 LISTENER = "com.nuwax.voip.VoipDevControlService"
 MARKER = "nuwax.voip.deviceTest"
 PERMISSION = "android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+QA_ORIGIN = "nuwax.voip.qaApiOrigin"
+
+
+def configure_qa_manifest(project: Path, qa_project: Path | None) -> None:
+    manifest = project / "app/src/main/AndroidManifest.xml"
+    tree = ET.parse(manifest)
+    application = tree.getroot().find("application")
+    if application is None:
+        raise SystemExit("Android application manifest element is missing")
+    origin = None
+    if qa_project is not None:
+        variant = json.loads((qa_project / "nuwax-local-qa.json").read_text())
+        if variant.get("flavor") != "voip-business-qa" or variant.get("apiOrigin") != "https://testagent.xspaceagi.com":
+            raise SystemExit("Unexpected standalone QA origin")
+        origin = variant["apiOrigin"]
+    for node in list(application.findall("meta-data")):
+        if node.get(ANDROID + "name") == QA_ORIGIN:
+            application.remove(node)
+    if origin:
+        ET.SubElement(application, "meta-data", {ANDROID + "name": QA_ORIGIN, ANDROID + "value": origin})
+    tree.write(manifest, encoding="utf-8", xml_declaration=True)
 
 
 def configure_test_manifest(manifest: Path, enabled: bool) -> None:
@@ -60,3 +82,5 @@ if __name__ == "__main__":
     config_path = os.environ.get("NUWAX_ANDROID_UNIPUSH_CONFIG")
     configure_test_host(project, enabled)
     configure(project, Path(config_path) if config_path else None)
+    qa_path = os.environ.get("NUWAX_ANDROID_QA_PROJECT")
+    configure_qa_manifest(project, Path(qa_path) if qa_path else None)

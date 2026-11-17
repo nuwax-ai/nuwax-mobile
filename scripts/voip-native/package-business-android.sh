@@ -21,5 +21,10 @@ done
 export APP_RESOURCES_DIR="$VOIP_REPO_ROOT/unpackage/resources/app-android"
 export ANDROID_CUSTOM_BASE_OUT="$VOIP_REPO_ROOT/out/voip-business-packages"
 export ENABLE_HX_DEBUG=1 ANDROID_BUILD_TYPE=debug
+if [[ -n "${NUWAX_ANDROID_QA_PROJECT:-}" ]]; then
+  [[ "$NUWAX_ANDROID_QA_PROJECT" == "$VOIP_REPO_ROOT/out/voip-business-qa-project" ]] || { echo 'QA project must be the isolated source variant.' >&2; exit 1; }
+  export APP_RESOURCES_DIR="$NUWAX_ANDROID_QA_PROJECT/unpackage/resources/app-android"
+  export ENABLE_HX_DEBUG=0 ANDROID_COPY_CUSTOM_BASE=0
+fi
 unset NUWAX_VOIP_DEVICE_TEST APP_NAME
 bash "$VOIP_REPO_ROOT/scripts/android-esp/package_custom_base.sh"

@@ -14,9 +14,16 @@ VOIP_PROJECT="${VOIP_PROJECTS[0]}"
 VOIP_TEST_INIT="$VOIP_ROOT/out/voip-unipush-tests.init.gradle"
 python3 - "$VOIP_ROOT" "$VOIP_TEST_INIT" <<'PY'
 import sys
+import shutil
 from pathlib import Path
 root, target = map(Path, sys.argv[1:])
-tests = str(root / 'tests/voip/android').replace('\\', '\\\\').replace("'", "\\'")
+# The policy console tests compile beside internal policy code via check-android-policy.py.
+# Do not add them to the app module, which cannot access another module's internals.
+test_source = root / 'out/voip-android-push-test-source'
+shutil.rmtree(test_source, ignore_errors=True)
+test_source.mkdir(parents=True)
+shutil.copyfile(root / 'tests/voip/android/VoipPushPayloadTest.kt', test_source / 'VoipPushPayloadTest.kt')
+tests = str(test_source).replace('\\', '\\\\').replace("'", "\\'")
 target.write_text("""gradle.afterProject { project, state ->
     if (project.path == ':app') {
         project.dependencies.add('testImplementation', 'junit:junit:4.13.2')

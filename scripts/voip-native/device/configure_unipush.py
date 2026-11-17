@@ -31,7 +31,7 @@ def clear_previous_configuration(project: Path) -> None:
         node.get(ANDROID + "name") == CALL_RECEIVER for node in application.findall("service")
     )
     if owned:
-        names = {"GETUI_APPID", "PUSH_APPID", "GETUI_APP_ID", "MIPUSH_APPID", "MIPUSH_APPKEY", "dcloud_unipush_auto_notification", "nuwax.voip.uniPush"}
+        names = {"GETUI_APPID", "PUSH_APPID", "GETUI_APP_ID", "MIPUSH_APPID", "MIPUSH_APPKEY", "com.huawei.hms.client.appid", "com.hihonor.push.app_id", "dcloud_unipush_auto_notification", "nuwax.voip.uniPush"}
         for node in list(application.findall("meta-data")):
             if node.get(ANDROID + "name") in names:
                 application.remove(node)
@@ -82,13 +82,33 @@ def configure(project: Path, config_file: Path | None) -> None:
 
     gradle = project / "app/build.gradle"
     text = re.sub(r"\n\s*// BEGIN NUWAX UNIPUSH.*?// END NUWAX UNIPUSH\n", "\n", gradle.read_text(), flags=re.S)
-    block = "\n    // BEGIN NUWAX UNIPUSH\n    " + "\n    ".join(dependencies) + "\n    // END NUWAX UNIPUSH\n"
     if "dependencies {" not in text:
         raise SystemExit("Android app dependencies block was not found")
-    text = text.replace("dependencies {", "dependencies {" + block, 1)
     # Vendor AAR manifests consume placeholders as well as app-level metadata.
     placeholders = {"GETUI_APPID": app_id, "PUSH_APPID": app_id, "GETUI_APP_ID": app_id,
                     "dcloud_unipush_auto_notification": "false"}
+    # Existing UniPush vendor channels; client AppIDs are supplied locally, never server secrets.
+    vendor_repositories = []
+    for vendor, placeholder, name, libraries, repository in [
+        ("huawei", "HUAWEI_APP_ID", "com.huawei.hms.client.appid",
+         ["com.getui.opt:hwp:3.1.4", "com.huawei.hms:push:6.12.0.300"], "https://developer.huawei.com/repo/"),
+        ("honor", "HONOR_APP_ID", "com.hihonor.push.app_id",
+         ["com.getui.opt:honor:3.6.0", "com.hihonor.mcs:push:7.0.61.303"], "https://developer.hihonor.com/repo/"),
+    ]:
+        entry = config.get(vendor)
+        if entry is None:
+            continue
+        value = entry.get("appId") if isinstance(entry, dict) else None
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]{5,20}", value):
+            raise SystemExit(f"A valid {vendor} client AppID is required")
+        # Both SDKs accept the manifest configuration used by the existing cloud package.
+        placeholders[placeholder] = "appid=" + value if vendor == "huawei" else value
+        metadata[name] = placeholders[placeholder]
+        dependencies.extend("implementation '" + library + "'" for library in libraries)
+        vendor_repositories.append(repository)
+    # Build the dependency block after optional vendor dependencies have been collected.
+    block = "\n    // BEGIN NUWAX UNIPUSH\n    " + "\n    ".join(dependencies) + "\n    // END NUWAX UNIPUSH\n"
+    text = text.replace("dependencies {", "dependencies {" + block, 1)
     if xiaomi is not None:
         placeholders.update({"XIAOMI_APP_ID": xiaomi["appId"], "XIAOMI_APP_KEY": xiaomi["appKey"]})
     text = re.sub(r"\n\s*// BEGIN NUWAX PUSH PLACEHOLDERS.*?// END NUWAX PUSH PLACEHOLDERS\n", "\n", text, flags=re.S)
@@ -98,10 +118,10 @@ def configure(project: Path, config_file: Path | None) -> None:
 
     settings = project / "settings.gradle"
     text = settings.read_text()
-    repository = "https://mvn.getui.com/nexus/content/repositories/releases"
-    if repository not in text:
-        text = text.replace("repositories {", "repositories {\n        maven { url '" + repository + "' }")
-        settings.write_text(text)
+    for repository in ["https://mvn.getui.com/nexus/content/repositories/releases", *vendor_repositories]:
+        if repository not in text:
+            text = text.replace("repositories {", "repositories {\n        maven { url '" + repository + "' }")
+    settings.write_text(text)
 
     manifest = project / "app/src/main/AndroidManifest.xml"
     tree = ET.parse(manifest)
@@ -124,7 +144,7 @@ def configure(project: Path, config_file: Path | None) -> None:
         ET.SubElement(application, "service", {ANDROID + "name": STOCK_RECEIVER, TOOLS + "node": "remove"})
         ET.SubElement(application, "service", {ANDROID + "name": CALL_RECEIVER, ANDROID + "exported": "false"})
     tree.write(manifest, encoding="utf-8", xml_declaration=True)
-    print("✓ uni-push client configured; Xiaomi adapter " + ("enabled" if xiaomi else "not configured"))
+    print("✓ uni-push client configured; vendor adapters: " + ", ".join(vendor for vendor in ["huawei", "honor", "xiaomi"] if config.get(vendor)))
 
 
 if __name__ == "__main__":

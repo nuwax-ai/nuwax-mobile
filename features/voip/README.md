@@ -8,6 +8,8 @@ iOS 完整接打流程、未启动/锁屏/系统回收场景及交付缺口见 [
 
 通话与会议的业务记录、参与者及会话关系按 [统一复用说明](../../docs/engineering/voip-meeting-relationship.md)交接；目标为复用现有会议模型保存通话结果，记录不以录制为前提。启动权限引导和后台服务状态分层见 [通话准备方案](../../docs/engineering/voip-call-readiness.md)。
 
+PC Web 的实际锁定代码与移动端接口／行为差异见 [PC Web 对齐清单](../../docs/engineering/voip-pcweb-alignment.md)，后续优先沿用已验证的同一业务调用顺序。
+
 本轮 iOS 客户端补齐与独立测试 IPA 的使用见[两台 iPhone 测试包说明](../../docs/engineering/voip-ios-qa-package.md)，正式后端接口和逻辑单独列于[后端待配合清单](../../docs/engineering/voip-backend-required.md)。
 
 ## 代码归属

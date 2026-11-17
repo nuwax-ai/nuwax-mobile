@@ -1,5 +1,9 @@
 # nuwax-im VoIP 实际接口核对
 
+## 2026-11-17 当前 PC Web 锁定版本逐项对照
+
+本轮从 PC 主仓 `nuwax/feat-2026.11` 的微应用入口及 gitlink 确认实际通话代码为 `nuwax-im@0fa014fc86712a09bb9e321e24b5aa2dc4fc2ea0`，并逐项比较 Android／iOS／鸿蒙调用。建房、签票、先入房后邀请、接听后上报及拒接等核心接口已对齐；接听上报失败容错、重连离房保护、主叫响铃起点、active 挂断上报和 RTC 显示名尚有差异。完整证据和优先级见 [PC Web 对齐清单](voip-pcweb-alignment.md)。此清单为源码核查，尚未实施这些行为修正；下文日期相同的 `26dd3491` 结论保留为此前批次记录。
+
 ## 2026-11-17 对照 PC Web 会议后的结论
 
 重新 fetch `feat-video-meeting`，HEAD 仍为 `26dd3491826ddbbfdc9cedfe169fa93ba9144c1f`。PC 的 `nuwax-im-web/src/store/call.ts` 与 `docs/14`、`docs/15` 明确：**一对一通话复用会议域建房/令牌/LiveKit，人数上限设为 2**。当前移动端 `servers/voipIm.uts` 和 iOS 原生 `businessCredentials/mediaJoined` 走同样接口，已打好的测试 IPA 无须等待另一套建房或 `/calls` CRUD 服务才能做在线互拨。

@@ -283,6 +283,15 @@
   /** 会话列表页大小（服务端 clamp 到 [1,100]；首拉与上滑翻页共用）。
    *  性能排查阶段先取 50，避免单次挂载 100 行放大合并/渲染/头像解码峰值。 */
   const CONV_PAGE_SIZE = 50;
+  /** 分页回包后先等滚动真正停稳；持续手势间偶发 400ms 空窗，500ms 可避免误判空闲。 */
+  const CONV_PAGE_COMMIT_SCROLL_IDLE_MS = 500;
+  /** 分页行分批挂载；后续批次若遇到新滚动，至少再等此时长才恢复。 */
+  const CONV_PAGE_BATCH_RESUME_IDLE_MS = 180;
+  const CONV_PAGE_COMMIT_POLL_MS = 60;
+  const CONV_PAGE_COMMIT_BATCH_SIZE = 6;
+  const CONV_PAGE_COMMIT_BATCH_GAP_MS = 16;
+  const CONV_PAGE_ICON_BATCH_SIZE = 4;
+  const CONV_PAGE_ICON_BATCH_GAP_MS = 80;
 
   // ===== 工作商业版闸门（对齐 PC WorkCommercialRouteBoundary）=====
   // workCommercialEdition !== true → 整页替换为居中提示语，所有 IM 请求（会话/
@@ -373,53 +382,6 @@
    *  rowTouchDuringScroll 声明处注释）。 */
   let lastScrollEventAt = 0;
 
-  // ===== 会话列表翻页性能临时打点（真机日志筛选 [conv-perf]）=====
-  // console.error 是为了鸿蒙/部分真机日志链路可见；仅在翻页及明显长帧时输出，避免
-  // 每个 scroll 事件刷日志反过来干扰测量。排查结束后可整体删除本区。
-  const CONV_PERF_ENABLED = true;
-  const CONV_PERF_SCROLL_GAP_CEILING_MS = 500;
-  let convPerfScrollSamples = 0;
-  let convPerfScrollMaxGapMs = 0;
-  let convPerfScrollGapOver32 = 0;
-  let convPerfScrollGapOver50 = 0;
-  let convPerfIconRefreshCount = 0;
-  let convPerfIconRefreshTotalMs = 0;
-  let convPerfIconRefreshMaxMs = 0;
-  let convPerfTailTimer = 0;
-
-  function logConvPerf(message: string): void {
-    if (!CONV_PERF_ENABLED) return;
-    console.error("[conv-perf] " + message);
-  }
-
-  function resetConvPerfWindow(): void {
-    convPerfScrollSamples = 0;
-    convPerfScrollMaxGapMs = 0;
-    convPerfScrollGapOver32 = 0;
-    convPerfScrollGapOver50 = 0;
-    convPerfIconRefreshCount = 0;
-    convPerfIconRefreshTotalMs = 0;
-    convPerfIconRefreshMaxMs = 0;
-    if (convPerfTailTimer != 0) {
-      clearTimeout(convPerfTailTimer);
-      convPerfTailTimer = 0;
-    }
-  }
-
-  function scheduleConvPerfTailReport(beforeCount: number, afterCount: number): void {
-    if (!CONV_PERF_ENABLED) return;
-    if (convPerfTailTimer != 0) clearTimeout(convPerfTailTimer);
-    convPerfTailTimer = setTimeout(() => {
-      convPerfTailTimer = 0;
-      logConvPerf(
-        "tail rows=" + beforeCount + "->" + afterCount + " scrollSamples=" + convPerfScrollSamples +
-        " maxGap=" + convPerfScrollMaxGapMs + "ms gap>32=" + convPerfScrollGapOver32 +
-        " gap>50=" + convPerfScrollGapOver50 + " iconRefresh=" + convPerfIconRefreshCount +
-        " iconRefreshTotal=" + convPerfIconRefreshTotalMs + "ms iconRefreshMax=" + convPerfIconRefreshMaxMs + "ms",
-      );
-    }, 1500);
-  }
-
   /** 入口提示语（随 URL 带过去，会话页首帧即可显示）：
    *  租户配置 defaultIMAgentConfig 的行键是 `userId`（IM 用户 id），与会话的
    *  `peerUserId` 同一值域，直接相等比较；命中后随机取一条 prompts。
@@ -489,18 +451,7 @@
   }
 
   function handleListScroll(): void {
-    const now = Date.now();
-    if (CONV_PERF_ENABLED && lastScrollEventAt > 0) {
-      const gap = now - lastScrollEventAt;
-      // 停稳后再次起滚的首个大间隔不是掉帧，排除 >500ms 的跨滚动段间隔。
-      if (gap > 0 && gap <= CONV_PERF_SCROLL_GAP_CEILING_MS) {
-        convPerfScrollSamples += 1;
-        if (gap > convPerfScrollMaxGapMs) convPerfScrollMaxGapMs = gap;
-        if (gap > 32) convPerfScrollGapOver32 += 1;
-        if (gap > 50) convPerfScrollGapOver50 += 1;
-      }
-    }
-    lastScrollEventAt = now;
+    lastScrollEventAt = Date.now();
     // 滚动事件 = 手势已被原生滚动接管：立即清触摸判定态（否则抬手会被误判为
     // 点击闪灰）。Android 上子视图 touchmove 在 touchslop(≈8px) 拦截后断流，
     // 位移清除路径走不到（iOS move 持续分发故无此问题），滚动事件是兜底。
@@ -794,7 +745,11 @@
   let iconTableRefreshTimer = 0;
   let convIconRowRefreshTimer = 0;
   const dirtyConvIconRowIds = new Set<string>();
-  const CONV_ICON_REFRESH_BATCH_MS = 80;
+  /** 头像异步回调先聚合一小段时间，减少分页完成后连续十余次响应式提交。 */
+  const CONV_ICON_REFRESH_BATCH_MS = 300;
+  /** 单次只换少量行身份：首屏 dirty=22 曾产生 363ms 峰值，拆批控制单帧挂载压力。 */
+  const CONV_ICON_REFRESH_MAX_DIRTY_ROWS = 6;
+  const CONV_ICON_REFRESH_CONTINUE_MS = 80;
   const CONV_ICON_REFRESH_SCROLL_IDLE_MS = 180;
 
   function copyRows<T>(rows: T[]): T[] {
@@ -829,25 +784,23 @@
     let dirtyCount = 0;
     for (let i = 0; i < nextRows.length; i++) {
       if (!dirtyConvIconRowIds.has(nextRows[i].convId)) continue;
+      if (dirtyCount >= CONV_ICON_REFRESH_MAX_DIRTY_ROWS) break;
       nextRows[i] = cloneConvRow(nextRows[i]);
+      dirtyConvIconRowIds.delete(nextRows[i].convId);
       dirtyCount += 1;
     }
-    dirtyConvIconRowIds.clear();
-    if (dirtyCount == 0) return;
+    if (dirtyCount == 0) {
+      // 全量刷新/会话切换后可能残留已不在列表中的 id，避免无效定时循环。
+      dirtyConvIconRowIds.clear();
+      return;
+    }
+    const pendingDirtyCount = dirtyConvIconRowIds.size;
 
-    const perfStartedAt = Date.now();
     conversations.value = nextRows;
-    if (CONV_PERF_ENABLED) {
-      convPerfIconRefreshCount += 1;
-      nextTick((): void => {
-        const elapsed = Date.now() - perfStartedAt;
-        convPerfIconRefreshTotalMs += elapsed;
-        if (elapsed > convPerfIconRefreshMaxMs) convPerfIconRefreshMaxMs = elapsed;
-        logConvPerf(
-          "icon-refresh partial dirty=" + dirtyCount + " rows=" + conversations.value.length +
-          " nextTick=" + elapsed + "ms",
-        );
-      });
+    if (pendingDirtyCount > 0) {
+      convIconRowRefreshTimer = setTimeout(() => {
+        runConvIconRowRefresh();
+      }, CONV_ICON_REFRESH_CONTINUE_MS);
     }
   }
 
@@ -872,24 +825,12 @@
     if (!messagePageVisible || isAppInBackground()) return;
     // ★会话行内容已抽 conv-row-item（按对象身份跳过重渲染）：头像回填/相对时间这类
     // 原位改字段的显示刷新必须换行身份——深克隆整表；智联录行未组件化，浅拷即可
-    const perfStartedAt = Date.now();
     if (convIconRowRefreshTimer != 0) {
       clearTimeout(convIconRowRefreshTimer);
       convIconRowRefreshTimer = 0;
     }
     dirtyConvIconRowIds.clear();
     conversations.value = cloneConvRows(conversations.value);
-    if (CONV_PERF_ENABLED) {
-      convPerfIconRefreshCount += 1;
-      nextTick((): void => {
-        const elapsed = Date.now() - perfStartedAt;
-        convPerfIconRefreshTotalMs += elapsed;
-        if (elapsed > convPerfIconRefreshMaxMs) convPerfIconRefreshMaxMs = elapsed;
-        if (elapsed > 32) {
-          logConvPerf("icon-refresh full rows=" + conversations.value.length + " nextTick=" + elapsed + "ms");
-        }
-      });
-    }
   }
 
   function scheduleIconTableRefresh(): void {
@@ -1241,7 +1182,19 @@
     return merged;
   }
 
-  function parseConvRecords(res: RequestResponse<any>): ImConvRow[] {
+  function readConvNextCursor(res: RequestResponse<any>): string {
+    const dataRaw = apiResData<any>(res);
+    const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+    if (dataObj == null) return "";
+    const cursorRaw = dataObj["nextCursor"];
+    return cursorRaw != null ? `${cursorRaw}` : "";
+  }
+
+  /**
+   * 解析会话页。首页合并本地草稿并建立完整分区顺序；后续游标页保持服务端顺序，
+   * 提交时只追加新行，避免分页回包重排已有可见项、破坏滚动锚点。
+   */
+  function parseConvRecords(res: RequestResponse<any>, includeDraftRows: boolean = true): ImConvRow[] {
     const rows: ImConvRow[] = [];
     const dataRaw = apiResData<any>(res);
     const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
@@ -1255,9 +1208,78 @@
         rows.push(readConvRow(records[i], true));
       }
     }
-    const cursorRaw = dataObj["nextCursor"];
-    nextCursor.value = cursorRaw != null ? `${cursorRaw}` : "";
+    if (!includeDraftRows) return rows;
     return reorderConvRows(mergeDraftConversationRows(rows));
+  }
+
+  function waitConvPageCommitPoll(delayMs: number = CONV_PAGE_COMMIT_POLL_MS): Promise<void> {
+    return new Promise<void>((resolve, _reject) => {
+      setTimeout(() => { resolve(); }, delayMs);
+    });
+  }
+
+  function waitConvPageCommitNextTick(): Promise<void> {
+    return new Promise<void>((resolve, _reject) => {
+      nextTick((): void => {
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * 网络回包已完成，但滚动/惯性滚动期间只暂存响应，不做解析、合并和响应式提交。
+   * revision/session/page visibility 任一失效即丢弃本页，由现有全量刷新链路重新取真值。
+   */
+  async function waitForConvPageCommitIdle(
+    revision: number,
+    idleMs: number = CONV_PAGE_COMMIT_SCROLL_IDLE_MS,
+  ): Promise<boolean> {
+    while (true) {
+      if (
+        messagePageDisposed ||
+        !messagePageVisible ||
+        isAppInBackground() ||
+        messagePageSession != getImSessionStamp() ||
+        revision != convRevision
+      ) {
+        return false;
+      }
+      const now = Date.now();
+      const scrollIdleFor = lastScrollEventAt > 0
+        ? now - lastScrollEventAt
+        : idleMs;
+      if (!pageTouchActive && scrollIdleFor >= idleMs) {
+        return true;
+      }
+      await waitConvPageCommitPoll();
+    }
+  }
+
+  /** 新增行全部挂载后再小批启动头像解析；同步缓存命中也走 dirty-row 刷新，避免占位不退。 */
+  async function resolveConvPageRowsIcons(rows: ImConvRow[], revision: number): Promise<void> {
+    let offset = 0;
+    while (offset < rows.length) {
+      await waitConvPageCommitPoll(CONV_PAGE_ICON_BATCH_GAP_MS);
+      const canResolve = await waitForConvPageCommitIdle(
+        revision,
+        CONV_PAGE_BATCH_RESUME_IDLE_MS,
+      );
+      if (!canResolve) return;
+
+      const end = Math.min(offset + CONV_PAGE_ICON_BATCH_SIZE, rows.length);
+      const batch: ImConvRow[] = [];
+      for (let i = offset; i < end; i++) {
+        batch.push(rows[i]);
+      }
+      resolveConvRowsIcons(batch);
+      // resolveIconInto 的正缓存命中是同步路径，不会触发 onAsyncApplied；分页行已经
+      // 上屏，必须主动换行身份才能让 conv-row-item 从占位切到真实图片。
+      for (let i = 0; i < batch.length; i++) {
+        if (batch[i].avatarDisplay.length == 0) continue;
+        scheduleConvIconRowRefresh(batch[i].convId);
+      }
+      offset = end;
+    }
   }
 
   /**
@@ -1429,6 +1451,7 @@
         return;
       }
       conversations.value = parseConvRecords(res);
+      nextCursor.value = readConvNextCursor(res);
       resolveConvRowsIcons(conversations.value);
       assignConvFallbacks(conversations.value);
       convHasMore.value = nextCursor.value.length > 0;
@@ -1459,33 +1482,28 @@
       return;
     }
     const revision = convRevision;
-    const perfStartedAt = Date.now();
-    const perfBeforeCount = conversations.value.length;
-    resetConvPerfWindow();
-    logConvPerf("load-more start pageSize=" + CONV_PAGE_SIZE + " rows=" + perfBeforeCount);
+    const requestedCursor = nextCursor.value;
     convLoadingMore.value = true;
     try {
-      const res = await apiImConversations(nextCursor.value, CONV_PAGE_SIZE);
-      const perfResponseAt = Date.now();
-      // 先复位 loading 再守卫（同 loadConversations：防会话戳变化早退卡死翻页态）
-      convLoadingMore.value = false;
+      const res = await apiImConversations(requestedCursor, CONV_PAGE_SIZE);
       if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
       if (messagePageDisposed || messagePageSession != getImSessionStamp() || revision != convRevision) {
         scheduleConvRefresh();
         return;
       }
       if (apiResCode(res) != SUCCESS_CODE) {
-        logConvPerf(
-          "load-more failed request=" + (perfResponseAt - perfStartedAt) + "ms code=" + apiResCode(res),
-        );
         return;
       }
-      const perfParseStartedAt = Date.now();
-      const rows = parseConvRecords(res);
-      const perfParseMs = Date.now() - perfParseStartedAt;
-      // 追加后整表重排：新页里带草稿/置顶的行不能滞留表尾（分区不变式跨页成立）
-      const perfMergeStartedAt = Date.now();
-      const merged: ImConvRow[] = copyRows(conversations.value);
+      // 回包只暂存在本 async 栈中：不解析行、不推进 live cursor、不修改 conversations。
+      const canCommit = await waitForConvPageCommitIdle(revision);
+      if (!canCommit) {
+        if (revision != convRevision) scheduleConvRefresh();
+        return;
+      }
+      const rows = parseConvRecords(res, false);
+      const prefetchedNextCursor = readConvNextCursor(res);
+      // 游标页由服务端保持全局顺序；这里只收集新行，不重排已有数组，保证可见项锚点稳定。
+      const pendingRows: ImConvRow[] = [];
       // convId 去重：缓存水合的 nextCursor 可能落后服务端头，翻页会带回已展示行
       //（服务端游标边界重复同防），重复行直接跳过
       const seen = new Set<string>();
@@ -1497,42 +1515,61 @@
           continue;
         }
         seen.add(rows[i].convId);
-        merged.push(rows[i]);
+        // 新增行首帧只显示文字/渐变占位；全部批次挂载完成后再异步解析头像，
+        // 避免 20+ 图片节点创建与解码峰值撞上分页 DOM 提交。
+        rows[i].avatarDisplay = "";
+        rows[i].avatarLoaded = false;
+        pendingRows.push(rows[i]);
       }
-      const perfAppendedCount = merged.length - perfBeforeCount;
-      const nextRows = reorderConvRows(merged);
-      const perfMergeMs = Date.now() - perfMergeStartedAt;
-      const perfCommitStartedAt = Date.now();
-      conversations.value = nextRows;
-      // 追加行统一解析（helper 跳过已回填行，直接传整表安全）
-      const perfIconStartedAt = Date.now();
-      resolveConvRowsIcons(conversations.value);
-      const perfIconScheduleMs = Date.now() - perfIconStartedAt;
-      // 取字整表重算（去重 map 重建，顺序稳定：loadMore 追加行参与同列表去重）
-      const perfFallbackStartedAt = Date.now();
-      assignConvFallbacks(conversations.value);
-      const perfFallbackMs = Date.now() - perfFallbackStartedAt;
+      // 取字需要与已展示群名共享去重 map；仅计算字段，不提前挂真实图片节点。
+      const fallbackRows: ImConvRow[] = copyRows(conversations.value);
+      for (let i = 0; i < pendingRows.length; i++) {
+        fallbackRows.push(pendingRows[i]);
+      }
+      assignConvFallbacks(fallbackRows);
+
+      let committedCount = 0;
+      let batchCount = 0;
+      while (committedCount < pendingRows.length) {
+        // 第一批沿用上面的 500ms 稳定空闲判定；后续每一批都重新检查，
+        // 用户再次触摸/滚动时暂停剩余挂载，防止连续四批追着滚动提交。
+        if (batchCount > 0) {
+          const canCommitBatch = await waitForConvPageCommitIdle(
+            revision,
+            CONV_PAGE_BATCH_RESUME_IDLE_MS,
+          );
+          if (!canCommitBatch) {
+            if (!messagePageDisposed) scheduleConvRefresh();
+            return;
+          }
+        }
+
+        const batchStart = committedCount;
+        const batchEnd = Math.min(batchStart + CONV_PAGE_COMMIT_BATCH_SIZE, pendingRows.length);
+        const nextRows: ImConvRow[] = copyRows(conversations.value);
+        for (let i = batchStart; i < batchEnd; i++) {
+          nextRows.push(pendingRows[i]);
+        }
+        conversations.value = nextRows;
+        await waitConvPageCommitNextTick();
+        batchCount++;
+        committedCount = batchEnd;
+        if (committedCount < pendingRows.length) {
+          await waitConvPageCommitPoll(CONV_PAGE_COMMIT_BATCH_GAP_MS);
+        }
+      }
+
+      // 所有批次完成后才推进游标，保证 loadMore promise 的原有语义不变；零新增页也要推进。
+      nextCursor.value = prefetchedNextCursor;
       convHasMore.value = nextCursor.value.length > 0;
-      const perfSyncTotalMs = Date.now() - perfResponseAt;
-      logConvPerf(
-        "load-more data request=" + (perfResponseAt - perfStartedAt) + "ms received=" + rows.length +
-        " appended=" + perfAppendedCount + " rows=" + perfBeforeCount + "->" + conversations.value.length +
-        " parse=" + perfParseMs + "ms merge=" + perfMergeMs + "ms" +
-        " iconSchedule=" + perfIconScheduleMs + "ms fallback=" + perfFallbackMs + "ms" +
-        " syncAfterResponse=" + perfSyncTotalMs + "ms",
-      );
-      nextTick((): void => {
-        const perfNextTickMs = Date.now() - perfCommitStartedAt;
-        logConvPerf(
-          "load-more commit rows=" + conversations.value.length + " nextTick=" + perfNextTickMs + "ms" +
-          " total=" + (Date.now() - perfStartedAt) + "ms",
-        );
-        scheduleConvPerfTailReport(perfBeforeCount, conversations.value.length);
-      });
+
+      if (pendingRows.length > 0) {
+        resolveConvPageRowsIcons(pendingRows, revision);
+      }
     } catch (_error) {
-      convLoadingMore.value = false;
-      logConvPerf("load-more exception elapsed=" + (Date.now() - perfStartedAt) + "ms");
+      // 翻页失败静默保留当前列表，下次触底可继续重试。
     } finally {
+      convLoadingMore.value = false;
       if (convRefreshOwed) scheduleConvRefresh();
     }
   }
@@ -3411,10 +3448,9 @@
     eventBus.on(`${EVENT_TYPE.ImContactUpdated}`, onImContactUpdated);
   });
 
-  // ===== onShow 网络刷新去抖 + 草稿脏标记（问题1）=====
-  /** 300ms 去抖合并 onShow 的三个静默刷新：快速切 tab 时 300ms 内离开即整组取消，
-   *  HTTP 与回包落表的风暴归零；停留则合并为一次（比原直调晚 300ms，静默刷新不可
-   *  感知；列表期间显示旧数据=原网络延迟期间的表现，无新增空窗）。 */
+  // ===== onShow 异常补拉去抖 + 草稿脏标记（问题1）=====
+  /** 300ms 去抖合并 onShow 的异常补拉：正常切 tab 返回时保留已加载会话、分页游标
+   *  与已到底状态；仅首拉未完成、失败或列表异常为空时重新请求第一页。 */
   let showRefreshTimer = 0;
   /** 草稿版本快照（onHide 记录；-1=无快照，回退为现状必重建）。 */
   let draftsVersionAtHide = -1;
@@ -3429,7 +3465,7 @@
         showRefreshTimer = setTimeout(() => { scheduleShowRefresh(); }, 300);
         return;
       }
-      if (convLoaded.value || convFailed.value) {
+      if (convFailed.value || !convLoaded.value || conversations.value.length == 0) {
         loadConversations();
       }
       // 会话行标题的自环纠正（myInfo 缺失时补拉一次）
@@ -3450,7 +3486,6 @@
     if (iconTableRefreshTimer != 0) clearTimeout(iconTableRefreshTimer);
     if (convIconRowRefreshTimer != 0) clearTimeout(convIconRowRefreshTimer);
     if (showRefreshTimer != 0) clearTimeout(showRefreshTimer);
-    if (convPerfTailTimer != 0) clearTimeout(convPerfTailTimer);
     if (locateAnchorTimer != 0) {
       clearTimeout(locateAnchorTimer);
       locateAnchorTimer = 0;

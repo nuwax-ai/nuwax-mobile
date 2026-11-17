@@ -55,15 +55,19 @@ def snapshot(label):
     processes = [line.strip() for line in process_lines if re.search(r"\scom\.nuwax\.app(?::[^\s]+)?$", line)]
     dump = shell("dumpsys", "package", PACKAGE, check=False)
     users = re.findall(r"User (\d+):[^\n]*stopped=(true|false)", dump)
+    platform_sdk = int(shell("getprop", "ro.build.version.sdk"))
     window = shell("dumpsys", "window", "policy", check=False)
     lock = [line.strip() for line in window.splitlines() if re.search(r"(?:showing|keyguard|lockscreen)\w*=(?:true|false)", line, re.I)]
     result = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "label": label,
               "manufacturer": manufacturer, "model": shell("getprop", "ro.product.model"),
-              "android": shell("getprop", "ro.build.version.release"), "sdk": shell("getprop", "ro.build.version.sdk"),
+              "android": shell("getprop", "ro.build.version.release"), "sdk": str(platform_sdk),
               "magicVersion": shell("getprop", "ro.build.version.magic"), "emuiVersion": shell("getprop", "ro.build.version.emui"),
               "processes": processes, "allAppProcessesAbsent": not processes, "currentUser": shell("am", "get-current-user"), "stoppedByUser": dict(users),
               "keyguard": lock,
-              "presentationAppOps": shell("cmd", "appops", "get", PACKAGE, "USE_FULL_SCREEN_INTENT", check=False)}
+              "fullScreenManifestPermission": bool(re.search(r"android\.permission\.USE_FULL_SCREEN_INTENT: granted=true", dump)),
+              "fullScreenAppOpApplicable": platform_sdk >= 34,
+              "presentationAppOps": shell("cmd", "appops", "get", PACKAGE, "USE_FULL_SCREEN_INTENT", check=False)
+                  if platform_sdk >= 34 else "not applicable before Android 14; manufacturer presentation policy still requires device verification"}
     label = re.sub(r"[^a-zA-Z0-9_-]", "_", label)
     output = evidence / (time.strftime("%H%M%S") + "-" + label + ".json")
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

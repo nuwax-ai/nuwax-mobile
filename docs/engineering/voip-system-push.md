@@ -2,7 +2,7 @@
 
 2026-11-10 用户确认：普通消息继续 UniPush，iOS 电话使用 APNs VoIP；本批仅本地移动端代码、测试和后端交接，生产配置与部署不动。Android 纳入同一方案。交互保持一对一电话，媒体继续 LiveKit。
 
-2026-11-16 起分两条交付线：现有技术方案继续真实 App 调试；厂商申请、苹果及国内完整流程见[国内通道申请手册](voip-cn-provider-onboarding.md)。研究线的新 Kit 不自动变更本页实施方案。最新构建/安装结果以[验收记录](voip-acceptance.md)为准，下文“本批未安装”指 11 月 10 日的本地 APNs 实现批次。
+2026-11-17 已将调试与申请合并为[最新总方案](voip-cn-provider-onboarding.md)及[统一交付计划](voip-delivery-plan.md)。iOS 发送优先复用 UniPush／个推的真正 VoIP 类型，最后仍由 APNs VoIP 投递到 PushKit；原有直连 APNs 契约保留为备用，当前源码尚未完成聚合绑定／发送切换。厂商新 Kit 按权益与适配确认，不自动启用。最新构建/安装结果以[验收记录](voip-acceptance.md)为准，下文“本批未安装”指 11 月 10 日批次。
 
 ## 通道与边界
 
@@ -10,7 +10,7 @@
 | --- | --- | --- | --- |
 | 普通消息 | 现有 UniPush / 普通 APNs | 现有 UniPush / 厂商推送 | 现有 UniPush / 厂商推送 |
 | 在线邀请与控制 | 原生独立 IM WS，业务 REST | 原生独立 IM WS，业务 REST | 现有原生控制适配 |
-| 电话后台唤起 | APNs VoIP → PushKit | UniPush 原生接收器 + 厂商允许的电话唤起能力，逐厂商验证 | 原生 VoIP Push 权益及系统接口，待真机 |
+| 电话后台唤起 | 优先 UniPush／个推真实 VoIP → APNs VoIP → PushKit，投递未闭环 | UniPush 原生接收器 + 厂商允许的电话唤起能力，逐厂商验证 | 原生 VoIP Push 权益及系统接口，待真机 |
 | 电话接听与音频管理 | iOS 17.4+ LCK；15–17.3 前台/普通通知 | Core-Telecom、CallStyle、原生接听页与通话 FGS | Call Service、VoIP 后台任务及 ArkWeb 媒体 |
 | 接通后的音视频 | LiveKit Swift | LiveKit Kotlin | LiveKit JS / ArkWeb |
 
@@ -18,9 +18,9 @@ UniPush 的普通通知、个推 SDK 的原生能力和电话专用推送分别�
 
 ## iOS 实施
 
-详见 [APNs VoIP 对接契约](voip-ios-push-handoff.md)。原生插件直接向 `/api/instant-message/calls/devices` 登记独立 APNs 设备命名空间；正式后端需新增此接口。普通 `/devices` 注册与 CID 不参与 APNs token 更新。
+现有源码保留向 `/api/instant-message/calls/devices` 登记的独立 APNs 注册器，该接口及发送未作为本应用已部署能力交付。接下来优先将已有 PushKit token 绑定给当前个推 SDK，并扩展 IM 的账号／设备／CID 电话路由；设备接口可扩展现有 `/devices` 或等价实现，不要求必须新建某个 URL。普通刷新不能覆盖电话信息，切账号、轮换及撤销须有版本隔离；只保留一个有效注册入口及就绪状态。
 
-后台专用发送由后端同事在现有服务内实现，客户端不保存 APNs 私钥。签名环境由本地 profile 生成并校验。PushKit 收到邀请后先报 LCK，再核对消息、账号和单聊成员；接听前不采集。本批未向 APNs 发送，也未安装新版。
+后台发送由后端与现有 `push-send` 电话分支配合，实际设置 `options.ios.type=voip`，并核实本应用的 topic、环境与厂商直投能力。客户端不保存 APNs 私钥。签名环境由 profile 生成并校验；收到 PushKit 后先报 LCK，再核对消息、账号和单聊成员，接听前不采集。若聚合路线不可用，才评审[备用直连 APNs 契约](voip-ios-push-handoff.md)，不默认双投。实际逐项操作见 [iOS 无进程细则](voip-ios-cold-start-runbook.md)。
 
 ## Android 实施与厂商前置
 
@@ -50,7 +50,7 @@ Redmi 在用户批准“无限制＋自启动”后，主进程存活的后台/�
 
 ## 两端联调与验收
 
-先完成后端测试环境的 APNs 注册和发送，再安装真实 App（另行确认）。Android 作为前台主叫可以先验证 iPhone 被叫，不要求其厂商离线通道就绪；随后 iPhone → 已配置厂商通道的非小米 Android 验后台被叫。两方向均需要两个不同账号。
+先完成现有测试环境的电话设备／个推绑定／真正 VoIP 发送，取得实际服务版本和新签包，再测试无进程唤醒。Android 作为前台主叫可以先验证 iPhone 被叫，不要求其厂商离线通道就绪；随后 iPhone → 已配置厂商通道的非小米 Android 验后台被叫。两方向均需要两个不同账号。
 
 除前后台/锁屏/系统回收，还需覆盖：立即接听/拒接、重复/迟到邀请、主叫取消、多设备抢接、账号切换、权限拒绝、蓝牙与蜂窝电话打断、网络切换、锁屏双向音频 30 分钟及完整资源释放。无厂商执行机会、无正式 APNs 凭据或无权威终态时如实留待验，不用常驻开发服务替代。
 

@@ -2,6 +2,8 @@
 
 日期：2026-11-17。统一工作树 `mobile-voip`，分支 `feat/nuwa-basic-2026.11-voip-calls`。用户要求 PC Web 对齐和 iOS 无进程来电两条工作线合并计划，避免重复修改。普通消息保持 UniPush，媒体复用会议 RTC；本清单不授权生产配置、厂商权益、证书或部署变更。
 
+最新整体方案、各 Android 厂商／Apple／鸿蒙的申请流程及当前设备通过范围统一见 [总方案与申请手册](voip-cn-provider-onboarding.md)；到公司后按 [iOS 操作细则](voip-ios-cold-start-runbook.md)逐项执行。PC 对齐代码批次已作为 `ff8d49019` 同步两端；本批文档不代表后续 iOS 绑定／投递代码已完成或新包已就绪。
+
 ## 已合入的共同基线
 
 - PC Web 对照报告为 [对齐清单](voip-pcweb-alignment.md)，实际微应用锁定 `nuwax-im@0fa014fc86712a09bb9e321e24b5aa2dc4fc2ea0`；真实业务继续用现有 rooms／tokens、IM voip 消息和 3007，不另建媒体或历史服务。

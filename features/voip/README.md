@@ -32,9 +32,9 @@ PC 行为补齐与 iOS 后台唤醒统一按 [实施与交付清单](../../docs/
 
 HTTP 按仓库约定集中在 `servers/voip.uts` 和 `servers/voipIm.uts`。三端原生能力归属 `uni_modules/nuwax-voip`。路由注册页 `subpackages/pages/voip-call` 和 `voip-dev` 只挂载这里的界面组件。构建模板放 `scripts/voip-native`，开发服务放 `scripts/voip-dev`，回归测试放 `tests/voip`。
 
-iOS PushKit 校验、独立 APNs 注册器和系统 action 归属插件 `app-ios`，不依赖个推 VoIP 绑定。普通 UniPush 邀请云端修补归 `push-send/voip.js`，不发送 iOS APNs。三端通道、Android 厂商条件和验收边界见 [系统推送分工](../../docs/engineering/voip-system-push.md)，新增后端接口见 [APNs 对接契约](../../docs/engineering/voip-ios-push-handoff.md)。
+iOS PushKit 校验、现有 APNs 注册器和系统 action 归属插件 `app-ios`。当前还未调用个推 VoIP 绑定，`push-send/voip.js` 也仅处理普通邀请通知；下一步在同一功能内接通既有 SDK 绑定、电话设备路由和真正 VoIP 发送，不重新创建 registry。三端通道及验收边界见 [系统推送分工](../../docs/engineering/voip-system-push.md)，原有直连 APNs 备用契约见 [对接说明](../../docs/engineering/voip-ios-push-handoff.md)。
 
-国内逐厂商申请、苹果签名、前后端分工与全链路验收见[国内 VoIP 申请手册](../../docs/engineering/voip-cn-provider-onboarding.md)。它是独立流程交付，不自动更换当前调试方案或启用新 SDK。
+最新架构、国内逐厂商申请、苹果签名、前后端分工与全链路验收统一见 [总方案与申请手册](../../docs/engineering/voip-cn-provider-onboarding.md)，到公司后按 [iOS 无进程来电操作细则](../../docs/engineering/voip-ios-cold-start-runbook.md)执行。文档更新不表示已启用新 SDK、改配置、部署或完成无进程验收。
 
 ## 宿主接入边界
 

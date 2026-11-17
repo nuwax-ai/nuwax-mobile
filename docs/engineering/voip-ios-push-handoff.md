@@ -1,5 +1,7 @@
 # iOS APNs VoIP 对接契约
 
+2026-11-17 当前执行顺序以 [最新总方案](voip-cn-provider-onboarding.md)和 [iOS 操作细则](voip-ios-cold-start-runbook.md)为准：优先在既有 UniPush／个推中接通真正的 VoIP 发送及 token 绑定。本文下述 `provider=apns`、专用 `/calls/devices` 和 HTTP/2 直连发送是已经编写的备用适配器契约，不代表本次要另起服务或强制新增这个接口；设备隔离、条件撤销与身份校验仍须在所选实际路线等价实现。
+
 2026-11-10 用户确认：普通消息继续 UniPush，iOS 电话邀请采用 APNs VoIP。本批完成本地客户端、签名配置生成、mock 和测试；正式发送由后端同事实现。未改生产配置、证书、部署或设备安装，不修改 agent-platform/独立 IM 仓库。Android 同步方案见 [系统推送分工](voip-system-push.md)。
 
 ## 实际状态

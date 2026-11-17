@@ -1,5 +1,9 @@
 # nuwax-im VoIP 实际接口核对
 
+2026-11-16 恢复核对：`feat-video-meeting@26dd3491` 仍没有 APNs sender 与 `/calls/devices` 注册接口；测试环境鉴权有效，新增注册路径 GET/POST 均为 404。电话控制仍使用原消息邀请和 3007 事件，尚不能进行真实 APNs 来电验收。详见 [本轮记录](voip-acceptance.md#2026-11-16-恢复联调与合并主线)。
+
+2026-11-10 增量只读复核 `feat-video-meeting@241f8a4c`：UniPush 仍使用 CID/普通邀请，设备刷新仍直接覆盖 voipToken。当前方案改用独立 APNs `/calls/devices` 注册，不再写该列；新增接口与发送见 [iOS 推送交接](voip-ios-push-handoff.md)，Android 发送门禁/厂商条件见 [系统推送分工](voip-system-push.md)。下文保留首次核对基线。
+
 当前实现与完整 App 基座请先看[真实业务接入说明](voip-business-integration.md)。其中区分实际 IM 协议、原目标契约与尚未完成的真机/推送验收。
 
 核对日期为 2026-11-09。后端来源为 `nuwax-im` 的 `feat-video-meeting`，fetch 后提交为 `fb880f21b02714d46d8d28591296878b98f09611`。本次依据控制器、DTO、应用服务、推送实现及 Web 端调用流程核对，部署环境的接口与真实推送仍需联调。

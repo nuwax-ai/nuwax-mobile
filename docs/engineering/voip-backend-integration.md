@@ -1,5 +1,9 @@
 # VoIP 正式后端接入交接
 
+2026-11-17：本轮客户端补齐后的后端工作按[独立待配合清单](voip-backend-required.md)执行；该清单明确区分当前 `im-voip-v1` 和拟新增权威接口。两台 iPhone 使用[真实 App 测试环境 IPA](voip-ios-qa-package.md)，不再走专用 Alice/Bob 测试 App。
+
+2026-11-10 通道定案：普通消息 UniPush，iOS 电话 APNs VoIP。Android 保留 UniPush 原生接收与 Telecom/CallStyle，厂商冷唤醒单独验收。以 [两端系统推送分工](voip-system-push.md) 和 [APNs 注册/撤销/发送契约](voip-ios-push-handoff.md) 为当前交接入口；后端复核基线为 `feat-video-meeting@241f8a4c`。下文测试包与目标协议说明保留历史背景。
+
 当前实现与完整 App 基座请先看[真实业务接入说明](voip-business-integration.md)。其中区分实际 IM 协议、原目标契约与尚未完成的真机/推送验收。
 
 2026-11-09 更新，供后端对接和正式体测使用。客户端按独立功能集成。已核对 `nuwax-im/feat-video-meeting@fb880f2` 的实际接口、IM 事件及 RTC 流程，接入前先阅读[实际接口核对](voip-im-backend-review.md)。下文保留原目标协议的交接项，按实际实现逐项确认和适配。

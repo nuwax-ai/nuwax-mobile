@@ -115,4 +115,39 @@ describe('IM call event ordering and isolation', () => {
     expect(connect).not.toHaveBeenCalled();
     expect(token.get).not.toHaveBeenCalled(); // current backend has no Harmony native-token contract
   });
+  it('does not fall back to msgId when the signal contains a conflicting callId', () => {
+    setup(); VoipBridge.current = { callId: 'current', convId: 'chat', msgId: 'm1', state: 'ringing' } as any;
+    VoipBridge.receiveSignal({ eventType: 'voip:cancel', payload: { callId: 'old', msgId: 'm1', convId: 'chat' } } as any);
+    expect(VoipBridge.finish).not.toHaveBeenCalled();
+  });
+  it.each(['voip:decline', 'voip:timeout'])('ignores a late %s after an answer without poisoning the active call', type => {
+    setup(); VoipBridge.current = { callId: 'c1', convId: 'chat', msgId: 'm1', state: 'active' } as any;
+    VoipBridge.receiveSignal({ eventType: type, payload: { callId: 'c1', convId: 'chat' } } as any);
+    expect(VoipBridge.finish).not.toHaveBeenCalled();
+    expect(VoipBridge.terminal.has('c1')).toBe(false);
+  });
+  it('deduplicates another device answer that preceded its incoming invitation', async () => {
+    const adopt = setup();
+    VoipBridge.receiveSignal({ eventType: 'voip:answered', payload: { callId: 'c1', convId: 'chat', userId: 'alice' } } as any);
+    await VoipBridge.receiveInvitation(invitation() as any);
+    expect(adopt).not.toHaveBeenCalled();
+  });
+  it.each(['timeout', 'systemFailed', 'busy', 'mediaFailed'])('does not claim an explicit rejection for %s', reason => {
+    setup(); vi.mocked(VoipBridge.request).mockClear();
+    VoipBridge.notifyBusinessEnd({ callId: 'c1', convId: 'chat', msgId: 'm1', callerId: 'bob', state: 'ringing' } as any, reason);
+    expect(VoipBridge.request).not.toHaveBeenCalled();
+  });
+  it('sends a user rejection through the existing declined contract', () => {
+    setup(); vi.mocked(VoipBridge.request).mockClear();
+    VoipBridge.notifyBusinessEnd({ callId: 'c1', convId: 'chat', msgId: 'm1', callerId: 'bob', state: 'ringing' } as any, 'rejected');
+    expect(VoipBridge.request).toHaveBeenCalledWith('/declined', expect.any(String), false, expect.any(Object));
+  });
+  it('drops a previous media connection failure after a replacement call', async () => {
+    setup(); let reject!: (error: Error) => void;
+    vi.spyOn(VoipBridge, 'connect').mockReturnValue(new Promise((_, fail) => { reject = fail; }));
+    VoipBridge.current = { callId: 'old' } as any; VoipBridge.startMedia(VoipBridge.current!);
+    VoipBridge.current = { callId: 'new' } as any;
+    reject(new Error('old transport')); await Promise.resolve();
+    expect(VoipBridge.finish).not.toHaveBeenCalled();
+  });
 });

@@ -1,10 +1,14 @@
-import { mkdir, copyFile, writeFile } from 'node:fs/promises';
+import { mkdir, copyFile, writeFile, readdir, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const project = `${root}/out/voip-native-ios`;
+await rm(`${project}/Sources/VoipNativeCheck`, { recursive: true, force: true });
 await mkdir(`${project}/Sources/VoipNativeCheck`, { recursive: true });
-await copyFile(`${root}/uni_modules/nuwax-voip/utssdk/app-ios/NuwaxVoipBridge.swift`, `${project}/Sources/VoipNativeCheck/NuwaxVoipBridge.swift`);
+const native = `${root}/uni_modules/nuwax-voip/utssdk/app-ios`;
+for (const file of await readdir(native)) {
+  if (file.endsWith('.swift')) await copyFile(`${native}/${file}`, `${project}/Sources/VoipNativeCheck/${file}`);
+}
 await writeFile(`${project}/Package.swift`, `// swift-tools-version:6.1
 import PackageDescription
 let package = Package(name: "VoipNativeCheck", platforms: [.iOS(.v15)],

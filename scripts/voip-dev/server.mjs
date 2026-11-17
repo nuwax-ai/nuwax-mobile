@@ -4,6 +4,7 @@ import { readFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { AccessToken, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
 import { CallRegistry, CallError } from './registry.mjs';
+import { ApnsDeviceRegistry } from './apns-devices.mjs';
 
 const prefix = '/api/instant-message/calls';
 export function createDevServer({ registry = new CallRegistry(), livekitUrl = 'ws://127.0.0.1:7880',
@@ -11,6 +12,7 @@ export function createDevServer({ registry = new CallRegistry(), livekitUrl = 'w
   if (!apiSecret) throw new Error('VOIP_LIVEKIT_SECRET is required');
   const rooms = roomService ?? new RoomServiceClient(livekitUrl.replace(/^ws/, 'http'), apiKey, apiSecret);
   const devices = new Map();
+  const apnsDevices = new ApnsDeviceRegistry(devices);
   const sessions = new Map();
   const channels = new Set();
   const send = (res, data, code = '0000', status = 200) => {
@@ -66,6 +68,8 @@ export function createDevServer({ registry = new CallRegistry(), livekitUrl = 'w
       }
       if (url.pathname === `${prefix}/devices` && req.method === 'POST') {
         const value = await body(req);
+        if (value.provider === 'apns') { send(res, apnsDevices.apply(userId, deviceId, value)); return; }
+        if (value.provider != null) throw new CallError('CALL_INVALID_ARGUMENT');
         // Separate namespaces: an IM cid refresh must never replace the native call token.
         if (!['uniPush', 'pushKit', 'harmonyPush', 'fcm', 'vendor'].includes(value.channel) ||
           !['development', 'production'].includes(value.environment) || typeof value.token !== 'string' || value.token.length > 4096) {

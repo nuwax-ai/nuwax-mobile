@@ -33,7 +33,7 @@ describe('VoIP feature integration boundary', () => {
   });
 
   it('keeps registered routes as screen mounts and the main launch free of test routing', () => {
-    for (const [route, screen] of [['voip-call', 'call'], ['voip-dev', 'development']]) {
+    for (const [route, screen] of [['voip-call', 'call'], ['voip-dev', 'development'], ['voip-history', 'history']]) {
       const page = read(`subpackages/pages/${route}/${route}.uvue`);
       expect(page).toContain(`@/features/voip/screens/${screen}.uvue`);
       expect(page).not.toMatch(/uni\.|onMounted|setInterval|callManager|servers\/voip/);

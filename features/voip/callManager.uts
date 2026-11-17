@@ -1,7 +1,8 @@
 import { getApiBaseUrl } from "@/constants/config";
-import { callFailure } from "@/features/voip/callErrors";
+import { callFailure, callErrorTranslationKey, isIncomingPresentationError } from "@/features/voip/callErrors";
 import { ref } from "vue";
 import { CallStateStore, CallSnapshot, parseCallSnapshot } from "./callState";
+import { VoipHistoryRecord, parseVoipHistory } from "./callHistory";
 import { apiCallCapabilities, apiCreateCall, apiCallSnapshot, voipSessionConfig, readVoipDevSession, setVoipDevSession, cancelCreatedVoipCall } from "@/servers/voip";
 import { apiImWhoami } from "@/servers/im";
 import { apiResData } from "@/utils/apiResponse";
@@ -9,7 +10,7 @@ import { generateUUID } from "@/utils/common";
 import { getImSessionStamp } from "@/utils/im/imSessionScope";
 import { hasAppPrivacyConsent } from "@/utils/appPrivacyConsent";
 import { isAppInBackground } from "@/utils/appLifecycle";
-import { executeVoip, drainVoipEvents, ensureVoipPermissions } from "@/uni_modules/nuwax-voip";
+import { executeVoip, drainVoipEvents, ensureVoipPermissions, openVoipAppSettings } from "@/uni_modules/nuwax-voip";
 import { claimVoipAudio, releaseVoipAudio } from "./audioFocus";
 import { stopAllSpeechPlayback } from "@/utils/voice/stopAllSpeechPlayback";
 import { t } from "@/utils/i18n";
@@ -19,10 +20,16 @@ export const voipError = ref<string>("");
 export const voipMicrophone = ref<boolean>(true);
 export const voipCamera = ref<boolean>(false);
 export const voipSpeaker = ref<boolean>(false);
+export const voipAudioInterrupted = ref<boolean>(false);
+export const voipPermissionPending = ref<boolean>(false);
+export const voipAudioRoutes = ref<UTSJSONObject[]>([]);
+export const voipAudioRoute = ref<string>("");
+export const voipHistory = ref<VoipHistoryRecord[]>([]);
 const store = new CallStateStore();
-let userId = "", deviceId = "", sessionStamp = "", nativeScope = "";
+let userId = "", deviceId = "", sessionStamp = "", nativeScope = "", sessionApiBase = "";
 let timer = 0, creating = false, routeOpening = false;
 let bootstrapSerial = 0, createSerial = 0;
+let answeringCallId = "";
 
 /** 开发联调只记录阶段；不输出账号、会话、平台 token 或 RTC 凭据。 */
 function traceCall(stage: string): void {
@@ -52,6 +59,7 @@ function send(command: UTSJSONObject): void {
 
 export function getVoipSnapshot(): CallSnapshot | null { return store.current; }
 export function getVoipPhase(): string { return store.phase(userId); }
+export function getVoipConnectedAt(): number { return store.activeStartedAt; }
 export function isVoipBusy(): boolean { return store.isBusy() || creating; }
 export function getVoipPeerName(): string {
   const s = store.current;
@@ -79,27 +87,36 @@ function consumeNative(): void {
       const event = events[i];
       if (`${event["scope"] ?? ""}` != nativeScope || nativeScope.length == 0) continue;
       const type = `${event["type"] ?? ""}`;
-      if (type == "snapshot") {
+      if (type == "history") {
+        voipHistory.value = parseVoipHistory(event["records"] as UTSJSONObject[]);
+      } else if (type == "snapshot") {
         const raw = event["snapshot"] as UTSJSONObject;
         const next = parseCallSnapshot(raw);
         const firstSnapshot = store.current?.callId != next.callId;
-        if (!store.apply(next, store.epoch, userId, Date.now())) continue;
-        if (firstSnapshot) { voipMicrophone.value = true; voipCamera.value = next.mediaType == "video"; voipError.value = ""; }
+        if (!store.apply(next, store.epoch, userId, Date.now(), deviceId)) continue;
+        if (firstSnapshot) { voipMicrophone.value = true; voipCamera.value = next.mediaType == "video"; voipError.value = ""; resetCallControls(); }
         if (next.state != "ended") {
           if (next.state == "connecting") voipCamera.value = next.mediaType == "video";
           occupyAudio();
           if (next.state == "ringing" && next.calleeId == userId && !isAppInBackground() && event["nativeIncomingUI"] !== true) openVoipPage();
-        } else releaseVoipAudio();
+        } else { resetCallControls(); releaseVoipAudio(); }
         if (next.calleeId == userId && next.acceptedDeviceId.length > 0 && next.acceptedDeviceId != deviceId) {
           store.endLocal("answeredElsewhere", Date.now()); releaseVoipAudio();
         }
       } else if (type == "error") {
-        voipError.value = `${event["code"] ?? "CALL_SERVICE_UNAVAILABLE"}`;
+        const code = `${event["code"] ?? "CALL_SERVICE_UNAVAILABLE"}`;
+        const eventId = `${event["callId"] ?? ""}`;
+        // Session errors have no callId. A filtered new incoming call has not
+        // been published as a snapshot, and may follow an already-ended call.
+        if (eventId.length > 0 && eventId != store.current?.callId && (store.isBusy() || !isIncomingPresentationError(code))) continue;
+        voipError.value = code;
+        if (isIncomingPresentationError(code) && !isAppInBackground()) uni.showToast({ title: t(callErrorTranslationKey(code)), icon: "none" });
         traceCall("native error " + voipError.value);
       } else if (type == "localEnded") {
         traceCall("native call ended");
         if (store.current != null && `${event["callId"] ?? ""}` != store.current?.callId) continue;
         store.endLocal(`${event["reason"] ?? "failed"}`, Date.now());
+        resetCallControls();
         releaseVoipAudio();
       } else if (type == "openPage") {
         if (store.isBusy() && !isAppInBackground()) openVoipPage();
@@ -115,10 +132,20 @@ function consumeNative(): void {
         if (type == "microphone") voipMicrophone.value = event["enabled"] === true;
         if (type == "camera") voipCamera.value = event["enabled"] === true;
         if (type == "speaker") voipSpeaker.value = event["enabled"] === true;
+        if (type == "audioInterrupted") voipAudioInterrupted.value = event["enabled"] === true;
+        if (type == "audioRoutes") { voipAudioRoutes.value = event["routes"] as UTSJSONObject[]; voipAudioRoute.value = `${event["selected"] ?? ""}`; }
+        if (type == "permissionPending") voipPermissionPending.value = true;
+        if (type == "connected") voipPermissionPending.value = false;
       }
+      store.syncActiveClock(Date.now());
       voipRevision.value += 1;
     }
   } catch (_e) { /* Native event decoding cannot break App/IM initialization. */ }
+}
+
+function resetCallControls(): void {
+  voipAudioInterrupted.value = false; voipPermissionPending.value = false;
+  voipAudioRoutes.value = []; voipAudioRoute.value = "";
 }
 
 export function clearVoipSession(): void {
@@ -126,8 +153,9 @@ export function clearVoipSession(): void {
   setVoipDevSession(null);
   try { send({ op: "reset" } as UTSJSONObject); } catch (_e) { /* Older bases must still be able to log out. */ }
   if (timer != 0) { clearInterval(timer); timer = 0; }
-  store.reset(); creating = false; userId = ""; deviceId = ""; sessionStamp = ""; nativeScope = "";
+  store.reset(); creating = false; answeringCallId = ""; userId = ""; deviceId = ""; sessionStamp = ""; nativeScope = ""; sessionApiBase = "";
   voipError.value = ""; voipRevision.value += 1;
+  resetCallControls(); voipHistory.value = [];
   releaseVoipAudio();
 }
 
@@ -150,8 +178,10 @@ export async function bootstrapVoip(): Promise<void> {
   if (sessionStamp == currentScope) return;
   // Do not reset the native singleton here: it may already own a cold-start system call.
   if (timer != 0) { clearInterval(timer); timer = 0; }
-  store.reset(); releaseVoipAudio();
+  const sameIdentity = userId == uid && deviceId == `${config["deviceId"]}` && sessionApiBase == `${config["apiBaseUrl"]}`;
+  if (!sameIdentity) { store.reset(); resetCallControls(); voipHistory.value = []; releaseVoipAudio(); }
   sessionStamp = currentScope; userId = uid; deviceId = `${config["deviceId"]}`;
+  sessionApiBase = `${config["apiBaseUrl"]}`;
   nativeScope = generateUUID();
   config["userId"] = userId; config["op"] = "initialize";
   config["qaAccepted"] = isVoipPlatformAccepted();
@@ -159,7 +189,7 @@ export async function bootstrapVoip(): Promise<void> {
   config["background"] = isAppInBackground();
   config["callLabel"] = t("Mobile.Voip.title");
   const labels = new UTSJSONObject();
-  const labelKeys = ["title", "minimize", "mute", "unmute", "speaker", "earpiece", "cameraOff", "cameraOn", "switchCamera", "hangup", "connecting", "reconnecting", "ended", "incoming", "dialing", "answerAudio", "answerVideo", "reject", "permissionRequired", "testListenerTitle", "testListenerNotification", "testListenerStop"];
+  const labelKeys = ["title", "minimize", "mute", "unmute", "speaker", "earpiece", "cameraOff", "cameraOn", "switchCamera", "hangup", "connecting", "reconnecting", "ended", "incoming", "dialing", "answerAudio", "answerVideo", "reject", "permissionRequired", "permissionForeground", "testListenerTitle", "testListenerNotification", "testListenerStop"];
   for (let i = 0; i < labelKeys.length; i++) labels[labelKeys[i]] = t("Mobile.Voip." + labelKeys[i]);
   config["labels"] = labels;
   send(config);
@@ -202,8 +232,8 @@ export async function startVoipCall(convId: string, mediaType: string): Promise<
     traceCall("room created");
     if (epoch != store.epoch || operation != createSerial) { cancelCreatedVoipCall(config, `${raw["callId"] ?? ""}`); return; }
     const snapshot = parseCallSnapshot(raw);
-    if (!store.apply(snapshot, epoch, userId, Date.now())) { traceCall("snapshot rejected"); return; }
-    voipMicrophone.value = true; voipCamera.value = mediaType == "video"; voipSpeaker.value = mediaType == "video";
+    if (!store.apply(snapshot, epoch, userId, Date.now(), deviceId)) { traceCall("snapshot rejected"); cancelCreatedVoipCall(config, snapshot.callId); return; }
+    resetCallControls(); voipMicrophone.value = true; voipCamera.value = mediaType == "video"; voipSpeaker.value = mediaType == "video";
     send({ op: "watch", snapshot: raw } as UTSJSONObject);
     traceCall("native call dispatched");
     voipRevision.value += 1; openVoipPage();
@@ -212,6 +242,10 @@ export async function startVoipCall(convId: string, mediaType: string): Promise<
     if (operation != createSerial) return;
     const code = error instanceof Error ? error.message : "CALL_START_FAILED";
     voipError.value = code;
+    if (code == "CALL_PERMISSION_REQUIRED") {
+      uni.showModal({ title: t("Mobile.Voip.permissionRequired"), content: t("Mobile.Voip.permissionSettings"), confirmText: t("Mobile.Voip.openSettings"), success: (result) => { if (result.confirm) openVoipAppSettings(); } });
+      return;
+    }
     const text = code == "CALL_BUSY" ? t("Mobile.Voip.busy") : code == "CALL_PERMISSION_REQUIRED" ? t("Mobile.Voip.permissionRequired") : t("Mobile.Voip.startFailed");
     uni.showToast({ title: text, icon: "none" });
   } finally { traceCall("dial preparation finished"); if (operation == createSerial) { creating = false; if (!store.isBusy()) releaseVoipAudio(); } }
@@ -220,11 +254,17 @@ export async function startVoipCall(convId: string, mediaType: string): Promise<
 export async function answerVoipCall(mediaType: string): Promise<void> {
   const epoch = store.epoch;
   const current = store.current;
-  if (current == null || current.state != "ringing") return;
-  occupyAudio();
-  if (!await ensureVoipPermissions(mediaType)) { voipError.value = "CALL_PERMISSION_REQUIRED"; return; }
-  if (epoch != store.epoch || store.current?.callId != current.callId) return;
-  send({ op: "action", action: "accept", answerMediaType: mediaType, callId: current.callId } as UTSJSONObject);
+  if (current == null || current.state != "ringing" || current.calleeId != userId || answeringCallId == current.callId) return;
+  if (mediaType != "audio" && mediaType != "video") return;
+  if (mediaType == "video" && current.mediaType != "video") return;
+  answeringCallId = current.callId;
+  try {
+    occupyAudio();
+    const permitted = await ensureVoipPermissions(mediaType);
+    if (epoch != store.epoch || store.current?.callId != current.callId || store.current?.state != "ringing") return;
+    if (!permitted) { voipError.value = "CALL_PERMISSION_REQUIRED"; return; }
+    send({ op: "action", action: "accept", answerMediaType: mediaType, callId: current.callId } as UTSJSONObject);
+  } finally { if (epoch == store.epoch && answeringCallId == current.callId) answeringCallId = ""; }
 }
 
 /** Ordinary app-push adapter (including iOS 15); a push only initiates an authoritative query. */
@@ -262,3 +302,6 @@ export function setVoipDevelopmentListener(enabled: boolean): void { send({ op: 
 export function showNativeVoipMedia(): void { send({ op: "showMedia" } as UTSJSONObject); }
 
 export function setVoipAudioRoute(route: string): void { send({ op: "audioRoute", route } as UTSJSONObject); }
+export async function refreshVoipHistory(): Promise<void> { await bootstrapVoip(); send({ op: "history" } as UTSJSONObject); }
+export function clearVoipHistory(): void { send({ op: "clearHistory" } as UTSJSONObject); }
+export function openVoipHistory(): void { uni.navigateTo({ url: "/subpackages/pages/voip-history/voip-history" }); }

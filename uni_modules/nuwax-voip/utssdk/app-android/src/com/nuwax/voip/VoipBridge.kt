@@ -349,22 +349,29 @@ object VoipBridge {
     }
     private fun receiveSignal(event: JSONObject) {
         val payload = event.optJSONObject("payload") ?: return
-        val eventType = event.optString("eventType")
-        val eventId = payload.optString("callId")
-        if (eventType in listOf("voip:cancel", "voip:timeout", "voip:decline") && eventId.isNotEmpty()) { terminal.add(eventId); if (terminal.size > 128) terminal.remove(terminal.first()) }
-        val call = current ?: return
-        val sameId = (payload.optString("callId").isNotEmpty() && payload.optString("callId") == call.optString("callId")) || (payload.optString("msgId").isNotEmpty() && payload.optString("msgId") == call.optString("msgId"))
-        if (payload.optString("convId") != call.optString("convId") || !sameId) return
-        when (event.optString("eventType")) {
-            "voip:answered" -> if (call.optString("calleeId") == config.optString("userId") && call.optString("acceptedDeviceId").isEmpty()) finish("answeredElsewhere")
-            "voip:cancel", "voip:timeout", "voip:decline" -> { finish("remoteEnded") }
+        val type = event.optString("eventType"); val id = payload.optString("callId")
+        val conv = payload.optString("convId"); if (conv.isEmpty()) return
+        val call = current
+        if (call != null && conv == call.optString("convId") && VoipCallPolicy.matches(id, payload.optString("msgId"), call.optString("callId"), call.optString("msgId"))) {
+            if (type == "voip:answered") {
+                if (call.optString("calleeId") == config.optString("userId") && call.optString("acceptedDeviceId").isEmpty()) finish("answeredElsewhere", false)
+                else if (call.optString("callerId") == config.optString("userId") && call.optString("state") == "ringing") project("connecting")
+            } else VoipCallPolicy.signalEndReason(type, call.optString("state"))?.let { finish(it, false) }
+            return
+        }
+        if (id.isEmpty() || call?.optString("callId") == id) return
+        if (type in listOf("voip:cancel", "voip:timeout", "voip:decline") || (type == "voip:answered" && payload.optString("userId") == config.optString("userId"))) {
+            terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first())
         }
     }
     private fun project(state: String, media: String? = null) {
         val old = current ?: return
         val next = JSONObject(old.toString()).put("state", state).put("version", old.optLong("version") + 1)
         if (media != null) next.put("mediaType", media)
-        if (state == "connecting") next.put("acceptedDeviceId", config.getString("deviceId")).put("connectExpiresAt", System.currentTimeMillis() + 30000)
+        if (state == "connecting") {
+            if (old.optString("calleeId") == config.optString("userId")) next.put("acceptedDeviceId", config.getString("deviceId"))
+            next.put("connectExpiresAt", System.currentTimeMillis() + 30000)
+        }
         if (state == "active") next.put("connectedAt", System.currentTimeMillis())
         adopt(next)
     }
@@ -388,16 +395,21 @@ object VoipBridge {
     private suspend fun businessAction(action: String, media: String) {
         val call = current ?: return
         when (action) {
-            "accept" -> { if (call.optString("state") != "ringing") return; if (!permissions(media)) { emit("error", "code", "CALL_PERMISSION_REQUIRED"); return }; project("connecting", if (call.optString("mediaType") == "video") media else "audio") }
+            "accept" -> {
+                if (call.optString("state") != "ringing" || call.optString("calleeId") != config.optString("userId")) return
+                if (media != "audio" && !(media == "video" && call.optString("mediaType") == "video")) return
+                if (!permissions(media)) { emit("error", "code", "CALL_PERMISSION_REQUIRED"); return }
+                project("connecting", if (call.optString("mediaType") == "video") media else "audio")
+            }
             "ready" -> if (connected && peerReady) project("active")
-            "end", "cancel", "reject" -> finish(if (action == "reject") "rejected" else "cancel")
+            "end", "cancel", "reject" -> finish(VoipCallPolicy.endReason(call.optString("state"), call.optString("calleeId") == config.optString("userId")))
         }
     }
     private fun notifyBusinessEnd(call: JSONObject, reason: String, captured: JSONObject? = null) {
         val settings = captured ?: JSONObject(config.toString())
-        if (call.optString("msgId").isEmpty() || reason in listOf("remoteEnded", "answeredElsewhere", "sessionChanged")) return
+        if (call.optString("msgId").isEmpty() || reason in listOf("remoteEnded", "remoteCancelled", "answeredElsewhere", "sessionChanged")) return
         val caller = call.optString("callerId") == settings.optString("userId")
-        if (!caller && call.optString("state") != "ringing") return
+        if (!caller && !VoipCallPolicy.canDecline(reason, call.optString("state"))) return
         val body = businessBody(call); val path = if (caller) "/ended" else "/declined"
         if (caller) body.put("reason", if (reason == "timeout") "timeout" else "cancel")
         val request = Request.Builder().url(settings.getString("apiBaseUrl") + PREFIX + path).header("Authorization", "Bearer " + settings.getString("accessToken"))
@@ -410,6 +422,7 @@ object VoipBridge {
         if (id.isEmpty() || terminal.contains(id)) return
         val uid = config.optString("userId")
         if (snapshot.optString("callerId") != uid && snapshot.optString("calleeId") != uid) return
+        if (snapshot.optString("callerId") == uid && snapshot.optString("callerDeviceId") != config.optString("deviceId")) return
         val old = current
         fun rank(state: String) = listOf("ringing", "connecting", "active", "ended").indexOf(state)
         if (rank(snapshot.optString("state")) < 0 || snapshot.optLong("version") < 1) return
@@ -494,9 +507,11 @@ object VoipBridge {
         val token = config.optString("accessToken")
         val id = call.optString("callId")
         if (business()) { businessAction(action, answerMediaType); return }
+        if (action in listOf("end", "cancel", "reject")) {
+            finish(VoipCallPolicy.endReason(call.optString("state"), call.optString("calleeId") == config.optString("userId")))
+            return
+        }
         if (action == "accept" && !permissions(answerMediaType)) { emit("error", "code", "CALL_PERMISSION_REQUIRED"); return }
-        // Local hangup always releases capture even when the business endpoint is unreachable.
-        if (action == "end" || action == "cancel" || action == "reject") releaseMedia()
         try {
             val result = api("/$id/actions", JSONObject().put("action", action).put("actionId", UUID.randomUUID().toString()).put("answerMediaType", answerMediaType))
             if (current?.optString("callId") == id) adopt(result)
@@ -552,9 +567,18 @@ object VoipBridge {
                                 refreshViews()
                             }
                             is RoomEvent.TrackUnsubscribed -> refreshViews()
+                            is RoomEvent.ParticipantConnected -> announceMediaReady()
+                            is RoomEvent.DataReceived -> {
+                                if (event.participant != null && event.topic == "nuwax.voip.media-ready.v1" && event.data.size <= 256) {
+                                    val payload = runCatching { JSONObject(String(event.data, Charsets.UTF_8)) }.getOrNull()
+                                    if (payload?.optInt("v") == 1 && payload.optString("type") == "ready" && payload.optString("callId") == id) {
+                                        peerReady = true; emit("peerMediaReady"); maybeReady()
+                                    }
+                                }
+                            }
                             is RoomEvent.Reconnecting -> { reconnecting = true; emit("reconnecting") }
-                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected") }
-                            is RoomEvent.ParticipantDisconnected -> if (business() && peerReady) finish("remoteEnded")
+                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected"); announceMediaReady() }
+                            is RoomEvent.ParticipantDisconnected -> if (business()) finish("remoteEnded", false)
                             is RoomEvent.Disconnected -> if (!terminal.contains(id)) { finish("disconnected") }
                             else -> {}
                         }
@@ -566,21 +590,42 @@ object VoipBridge {
                 withTimeout(5000) { while (!VoipCallService.enableCapture(camera && cameraVisible())) delay(50) }
                 next.localParticipant.setMicrophoneEnabled(microphone)
                 if (camera && cameraVisible()) next.localParticipant.setCameraEnabled(true)
-                connected = true; emit("connected"); refreshViews()
+                connected = true; emit("connected"); refreshViews(); announceMediaReady()
                 if (business()) mediaJoined()
                 maybeReady()
                 context?.let { VoipCallService.show(it) }
             } catch (_: Exception) { if (run == generation && !terminal.contains(id)) { finish("mediaFailed"); emit("error", "code", "CALL_MEDIA_FAILED") } }
         }
     }
-    private fun maybeReady() { if (connected && peerReady && !readySent) { readySent = true; scope.launch { act("ready") } } }
-    private suspend fun setMicrophone(enabled: Boolean) { microphone = enabled; room?.localParticipant?.setMicrophoneEnabled(enabled); emit("microphone", "enabled", enabled) }
+    private fun maybeReady() { if (connected && peerReady && !readySent) {
+        readySent = true; val id = current?.optString("callId"); val run = generation
+        scope.launch { if (run == generation && current?.optString("callId") == id) act("ready") }
+    } }
+    private fun announceMediaReady() {
+        val target = room ?: return; val id = current?.optString("callId") ?: return; val run = generation
+        if (!connected) return
+        val data = JSONObject().put("v", 1).put("type", "ready").put("callId", id).toString().toByteArray(Charsets.UTF_8)
+        scope.launch {
+            if (run == generation && room === target && current?.optString("callId") == id) {
+                try { target.localParticipant.publishData(data, topic = "nuwax.voip.media-ready.v1") }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { /* Audio subscription remains compatible with older peers. */ }
+            }
+        }
+    }
+    private suspend fun setMicrophone(enabled: Boolean) {
+        val target = room; val id = current?.optString("callId"); val run = generation
+        microphone = enabled; target?.localParticipant?.setMicrophoneEnabled(enabled)
+        if (run == generation && current?.optString("callId") == id && room === target) emit("microphone", "enabled", enabled)
+    }
     private suspend fun setCamera(enabled: Boolean) {
         if (current?.optString("mediaType") != "video") return
         if (enabled && !permissions("video")) { emit("error", "code", "CALL_PERMISSION_REQUIRED"); return }
+        val target = room; val id = current?.optString("callId"); val run = generation
         camera = enabled
         if (room != null) VoipCallService.enableCapture(enabled && cameraVisible())
-        room?.localParticipant?.setCameraEnabled(enabled && cameraVisible()); refreshViews(); emit("camera", "enabled", enabled)
+        target?.localParticipant?.setCameraEnabled(enabled && cameraVisible())
+        if (run == generation && current?.optString("callId") == id && room === target) { refreshViews(); emit("camera", "enabled", enabled) }
     }
     private suspend fun setSpeaker(enabled: Boolean) {
         setAudioRoute(if (enabled) "speaker" else "earpiece")
@@ -616,8 +661,8 @@ object VoipBridge {
         for ((host, renderer) in renderers) { bindings[host]?.removeRenderer(renderer); renderer.release(); host.removeAllViews() }
         renderers.clear(); bindings.clear(); old?.release(); connected = false; peerReady = false; reconnecting = false
     }
-    private fun finish(reason: String = "") {
-        if (reason.isNotEmpty() && reason != "answeredElsewhere" && reason != "sessionChanged") closeServerCall(reason)
+    private fun finish(reason: String = "", notifyRemote: Boolean = true) {
+        if (notifyRemote && reason.isNotEmpty() && reason != "answeredElsewhere" && reason != "sessionChanged") closeServerCall(reason)
         val id = current?.optString("callId") ?: ""
         if (id.isNotEmpty()) { terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first()) }
         expiryJob?.cancel(); expiryJob = null

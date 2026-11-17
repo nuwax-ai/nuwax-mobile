@@ -1,5 +1,7 @@
 # 移动端一对一通话契约（待正式后端实现）
 
+当前定案为普通消息 UniPush、iOS 电话 APNs VoIP，Android 保留 UniPush/Telecom 并逐厂商验证冷唤醒，见 [系统推送分工](voip-system-push.md)。APNs 的 `/calls/devices` 新增契约、条件撤销和发送见 [iOS 推送交接](voip-ios-push-handoff.md)；它与下文通用空 token 撤销有区别。其余 calls-v1 目标接口仍不能当作当前 im-voip-v1 已上线接口。
+
 当前实现与完整 App 基座请先看[真实业务接入说明](voip-business-integration.md)。其中区分实际 IM 协议、原目标契约与尚未完成的真机/推送验收。
 
 2026-11-09 已取得后端实际实现。本文为移动端目标协议，实际 `nuwax-im/feat-video-meeting@fb880f2` 使用消息邀请、3007 事件和 RTC 房间接口，字段映射及待补齐行为见[实际接口核对](voip-im-backend-review.md)。正式接入按对齐后的协议实施。

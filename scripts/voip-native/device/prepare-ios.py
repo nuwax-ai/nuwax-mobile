@@ -2,25 +2,43 @@
 """Generate isolated iOS 5.34 test or full business App hosts; never print signing material."""
 import os, json, plistlib, re, shutil, subprocess
 from pathlib import Path
+from ios_push_config import selected_push_configuration
 ROOT=Path(__file__).resolve().parents[3]
 SDK=Path(os.environ['UNIAPPX_SDK_ROOT']).resolve()
 BUSINESS=os.environ.get('NUWAX_VOIP_BUSINESS_HOST')=='1'
 HX_DEV=BUSINESS and os.environ.get('NUWAX_IOS_HX_DEV_NATIVE')=='1'
+QA_PROJECT=Path(os.environ['NUWAX_IOS_QA_PROJECT']).resolve() if os.environ.get('NUWAX_IOS_QA_PROJECT') else None
+assert not (QA_PROJECT and HX_DEV), 'Standalone QA and HX development resources must not be mixed'
+if QA_PROJECT:
+ assert BUSINESS and str(QA_PROJECT).startswith(str(ROOT/'out')+'/'), 'QA source must be isolated under this worktree out/'
+ qa=json.loads((QA_PROJECT/'nuwax-local-qa.json').read_text())
+ assert qa['flavor']=='voip-business-qa' and qa['apiOrigin']=='https://testagent.xspaceagi.com', 'Invalid QA source variant'
 HX_DEV_ROOT=ROOT/'unpackage/dist/dev/app-ios'
 PROJECT='VoipBusiness' if BUSINESS else 'VoipDeviceTest'
 OUT=ROOT/('out/voip-business-ios' if BUSINESS else 'out/voip-device-ios')
 RES=ROOT/('unpackage/resources/app-ios' if BUSINESS else 'out/voip-device-project/unpackage/resources/app-ios')
+if QA_PROJECT: RES=QA_PROJECT/'unpackage/resources/app-ios'
 MANIFEST=json.loads((ROOT/'manifest.json').read_text())
 assert str(SDK).startswith(str(ROOT/'out')+'/'), 'iOS SDK must be isolated under this worktree out/'
 assert (RES/'__UNI__8BF05E4/www/app-service.js').is_file(), 'Export device project app resources in HBuilderX first'
+if HX_DEV:
+ assert (HX_DEV_ROOT/'app-service.js').is_file(), 'HX development resources missing: finish the HBuilderX iOS compile before building the development host; never fall back to release resources'
 OUT.mkdir(parents=True,exist_ok=True)
 APP=OUT/'App'
 shutil.copytree(SDK/'UniAppXDemo/UniAppXDemo',APP,dirs_exist_ok=True)
 shutil.rmtree(APP/'uni-app-x',ignore_errors=True)
 shutil.copytree(RES/'__UNI__8BF05E4',APP/'uni-app-x/apps/__UNI__8BF05E4')
-if HX_DEV and (HX_DEV_ROOT/'app-service.js').is_file():
+if HX_DEV:
  shutil.rmtree(APP/'uni-app-x/apps/__UNI__8BF05E4/www')
  shutil.copytree(HX_DEV_ROOT,APP/'uni-app-x/apps/__UNI__8BF05E4/www')
+if BUSINESS:
+ # The offline SDK host explicitly restores the already consented native call
+ # context before page initialization; it must not rely on a JS page opening.
+ delegate=APP/'AppDelegate.m'
+ text=delegate.read_text().replace('#import "UniAppX-Swift.h"', '#import "UniAppX-Swift.h"\n#import <unimoduleNuwaxVoip/unimoduleNuwaxVoip-Swift.h>')
+ anchor='    [UniAppBridge applicationDidFinishLaunchingWithOptions:application :launchOptions];'
+ assert text.count(anchor)==1, 'Offline SDK launch template changed; review native VoIP bootstrap'
+ delegate.write_text(text.replace(anchor, anchor+'\n    [NuwaxVoipBridge restoreOnLaunch];'))
 # The official demo replaces the SDK root with sample buttons. Keep its SDK scene lifecycle instead.
 scene=APP/'SceneDelegate.m'
 s=scene.read_text();start=s.index('    UIStoryboard *storyboard');end=s.index('\n}',start)
@@ -67,16 +85,29 @@ for scenes in info.get('UIApplicationSceneManifest',{}).get('UISceneConfiguratio
 if BUSINESS:
  info.pop('NuwaxVoipDeviceTest',None)
  info['CFBundleDisplayName']=MANIFEST['name']
- info['uniapp-x']['ipatype']=1
+ info['uniapp-x']['ipatype']=2 if QA_PROJECT else 1
+ if QA_PROJECT:
+  info['NuwaxBuildFlavor']='voip-business-qa'
+  info['NuwaxAPIOrigin']=qa['apiOrigin']
+  info['NuwaxSourceDigest']=qa['sourceDigest']
  info.update(MANIFEST.get('app-ios',{}).get('distribute',{}).get('privacyDescription',{}))
  info['NSLocalNetworkUsageDescription']=info.get('NSLocalNetworkUsageDescription') if 'NSLocalNetworkUsageDescription' in MANIFEST.get('app-ios',{}).get('distribute',{}).get('privacyDescription',{}) else '连接您配置的企业服务器及局域网设备。'
  info['NSAppTransportSecurity']={'NSAllowsLocalNetworking':True}
+push_info, push_entitlements = selected_push_configuration('com.nuwax.app')
+info.update(push_info)
 (APP/'Info.plist').write_bytes(plistlib.dumps(info));os.chmod(APP/'Info.plist',0o600)
-(APP/'Test.entitlements').write_bytes(plistlib.dumps({'aps-environment':'development'}))
+if BUSINESS:
+ # Use the real product icon in both the HX host and the standalone QA App.
+ icon=ROOT/MANIFEST['app-ios']['distribute']['icons']['appstore']
+ assets=APP/'Assets.xcassets/AppIcon.appiconset'
+ assert icon.is_file() and assets.is_dir(), 'Missing real App icon or SDK asset catalog'
+ shutil.copy2(icon,assets/'Nuwax-1024.png')
+ (assets/'Contents.json').write_text(json.dumps({'images':[{'idiom':'universal','platform':'ios','size':'1024x1024','filename':'Nuwax-1024.png'}],'info':{'author':'xcode','version':1}}))
+(APP/'Test.entitlements').write_bytes(plistlib.dumps(push_entitlements))
 libs={p.stem:p for p in (SDK/'SDK/Libs').glob('*.xcframework')}
 libs['DCloudUTSExtAPI']=SDK/'TemporarySampleFramework/DCloudUTSExtAPI.xcframework'
 queue=['DCloudUniappRuntime','DCloudUTSFoundation','DCloudUTSExtAPI','DCloudPermissionMicrophone','DCloudPermissionCamera','DCloudPermissionPush'];seen=set()
-if BUSINESS: queue.append('DCloudDebugServe')
+if BUSINESS and not QA_PROJECT: queue.append('DCloudDebugServe')
 while queue:
  n=queue.pop()
  if n in seen:continue
@@ -99,6 +130,11 @@ for p in sorted((RES/'uni_modules').iterdir()):
  if HX_DEV:
   dev_src=HX_DEV_ROOT/'uni_modules'/p.name/'utssdk/app-ios'
   if dev_src.is_dir(): shutil.copytree(dev_src,dest,dirs_exist_ok=True)
+ # Native Swift implementations are authoritative in the module source. HX's
+ # generated index.swift remains the UTS wrapper; cached copies must not replace
+ # a newer private native implementation when rebuilding the offline host.
+ for swift in (ROOT/'uni_modules'/p.name/'utssdk/app-ios').glob('*.swift'):
+  shutil.copy2(swift,dest/swift.name)
  settings={'PRODUCT_BUNDLE_IDENTIFIER':('com.nuwax.app.module.' if BUSINESS else 'com.nuwax.test.')+module,'GENERATE_INFOPLIST_FILE':'YES','DEFINES_MODULE':'YES'}
  deps=[{'framework':str(libs[n]),'embed':False} for n in ['DCloudUTSFoundation','DCloudUniappRuntime','DCloudUTSExtAPI']]
  if BUSINESS:

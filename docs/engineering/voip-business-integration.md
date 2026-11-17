@@ -1,5 +1,7 @@
 # 真实 App 的 VoIP 业务接入
 
+2026-11-10 用户确认普通消息走 UniPush、iOS 电话改 APNs VoIP。两端通道、Android 厂商条件和回收验收见 [系统推送分工](voip-system-push.md)，新增 `/calls/devices` 契约见 [APNs 对接](voip-ios-push-handoff.md)。本批仅本地修改/编译，尚未安装或部署；后端复核基线为 `241f8a4c`。
+
 2026-11-09，分支 `feat/nuwa-basic-2026.11-voip-calls`。已合入两端一致的 `feat-2026.11@a8d6cc7db`；后端源码按 `nuwax-im/feat-video-meeting@fb880f2` 对接。本轮不修改后端，不合入明日普通发布分支，不上传基座。
 
 ## 当前入口与范围
@@ -47,11 +49,12 @@ NUWAX_SIGNING_ENV=<受控签名环境文件> \
 ln -s nuwax-mobile ../hx-mobile-voip
 /Applications/HBuilderX.app/Contents/MacOS/cli project open \
   --path "$(cd .. && pwd)/hx-mobile-voip"
-# 使用 local 自定义基座模式，手机 Bundle ID/版本由 IPA/APK 读取。
+# Android 使用本地自定义基座。iOS 已签名产物使用原生工程基座路径；仍须回读版本和资源，不能只看 HX 成功提示。
 /Applications/HBuilderX.app/Contents/MacOS/cli launch app-android \
   --project hx-mobile-voip --deviceId <Android序列号> --playground custom
 /Applications/HBuilderX.app/Contents/MacOS/cli launch app-ios \
-  --project hx-mobile-voip --iosTarget device --deviceId <iPhone序列号> --playground custom --customType local
+  --project hx-mobile-voip --iosTarget device --deviceId <iPhone序列号> \
+  --playground custom --customType device --ipaPath "$PWD/unpackage/debug/iOS_debug.ipa"
 ```
 
 iOS 完整宿主包含完整业务资源、所有导出 UTS 模块、模块声明的本地 framework、ESPProvision 3.1.0/SwiftProtobuf 1.22.1、LiveKit 2.19.0 及 HBuilderX DebugServe；最低系统 15.0。它与专用测试宿主使用不同的生成目录；不注入 deviceTest 标记或测试启动页。Android 完整宿主启用 HX debug server，移除专用测试监听服务声明，保留正常 UniPush 依赖。
@@ -73,6 +76,26 @@ NUWAX_IOS_HX_DEV_NATIVE=1 NUWAX_SIGNING_ENV=<受控签名环境文件> \
   bash scripts/voip-native/package-business-ios.sh
 node scripts/voip-native/register-business-ios-cache.mjs
 ```
+
+开发宿主必须先有一次完整成功的 HBuilderX iOS 编译，再以 `NUWAX_IOS_HX_DEV_NATIVE=1` 重建。缺少 `unpackage/dist/dev/app-ios/app-service.js` 时脚本现在直接报错；不能回退到 `appResource` 导出的发行资源，否则默认服务域名和功能闸门会与开发目标不同。
+
+2026-11-16 的 5.34 原生工程运行日志出现包名/版本为空，虽提示安装和同步成功，设备实际仍是旧包/旧资源。遇到该情况，停止将日志计作运行验收：从已签名的同源原生工程通过 Apple 设备工具覆盖安装，单独同步 HBuilderX 编译出的 `www` 资源，并回读校验。只同步生成资源，不删除 `wxstorage` 或账号数据。
+
+```bash
+xcrun devicectl device install app --device <iPhone序列号> \
+  out/voip-business-ios-derived/Build/Products/Debug-iphoneos/UniAppX.app
+xcrun devicectl device copy to --device <iPhone序列号> \
+  --domain-type appDataContainer --domain-identifier com.nuwax.app \
+  --source unpackage/dist/dev/app-ios \
+  --destination Documents/uni-app-x/apps/__UNI__8BF05E4/www
+xcrun devicectl device info apps --device <iPhone序列号> \
+  --include-all-apps --bundle-id com.nuwax.app
+# 另将设备 www/app-service.js copy from 到忽略目录，与本地文件比较 SHA-256。
+```
+
+该回退确认的是 HBuilderX 编译资源在真机运行，不将它记作 IDE 实时连接/热更新已通过。大型开发编译曾触及默认约 5 GB Node 上限；本轮临时设置 `node.run.memoryParam=8192`，编译成功后已逐字节恢复原用户配置。
+
+完整离线宿主在原生 AppDelegate 启动回调显式调用 VoIP 恢复入口，和 UTS hook 的恢复都由原生单例做幂等检查；仅恢复已保存的同意隐私/登录上下文。此入口解决被启动后的初始化次序，本身不提供系统推送或冷唤起能力。系统来电仍须按平台路由获取原生执行机会。
 
 业务 `.uvue/.uts` 变更通过 HX 热更新；原生 Swift、插件 index.uts 或依赖变更需要重新构建并校验。IPA 使用保留显式目录记录的 ZIP 格式，供 HX 解析。以上流程未修改 HBuilderX 安装文件、未导出私钥、未上传包。大型项目首次开发编译需要充足 Node 内存；本次临时使用 8 GB，编译后恢复原设置。原生断点、后台来电及音视频通话仍需单独验收。
 

@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
+const { prepareVoip } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -234,11 +235,15 @@ exports.main = async (event) => {
   if (!ids.length || !ids[0]) return { errCode: 400, errMsg: 'push_clientid required' }
   if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
 
+  const voip = prepareVoip(body)
+  if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
+  if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
+
   // 长度限制：厂商通道会静默截断甚至拒绝，这里先按官方上限裁好（按码点裁，不切坏 emoji）
   const title = clip(body.title, MAX_TITLE)
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
-  const payload = attachBadgeToPayload(normalizePayload(body.payload), body.badge)
+  const payload = attachBadgeToPayload(voip ? voip.payload : normalizePayload(body.payload), body.badge)
   const category = body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)
@@ -249,18 +254,19 @@ exports.main = async (event) => {
   //   要核对"文案被截断/角标没生效"，看响应里的 applied 回显即可。
   console.log('[push-send] req', JSON.stringify({
     cidCount: ids.length,
-    cidSample: ids.slice(0, 2),
+    cidSample: voip ? undefined : ids.slice(0, 2),
     titleLength: title.length,
     contentLength: content.length,
-    convId: payload && payload.convId ? payload.convId : null,
+    convId: voip ? undefined : (payload && payload.convId ? payload.convId : null),
     convType: payload && payload.convType ? payload.convType : null,
     payloadLength: JSON.stringify(payload || {}).length,
     badge: body.badge === undefined ? null : body.badge,
-    // 在线消息由客户端按前后台状态决定是否创建本地通知。
+    // 保留 feat-2026.11 的在线通知策略，展示由客户端前后台状态决定。
     force_notification: false,
-    request_id: body.request_id || null
+    request_id: voip ? undefined : (body.request_id || null),
+    ...(voip ? { kind: 'voip', ttl: voip.settings.ttl } : {})
   }))
-  if (DEBUG_MESSAGE_CONTENT) {
+  if (DEBUG_MESSAGE_CONTENT && !voip) {
     console.log('[push-send] message detail', JSON.stringify({
       push_clientid: ids,
       title,
@@ -285,6 +291,9 @@ exports.main = async (event) => {
       category: category,
       request_id: body.request_id || undefined
     }
+    // Ringing invites must not use the SDK's one-hour default retention.
+    // Forward only the validated TTL; vendor capabilities/options need separate approval.
+    if (voip) args.settings = voip.settings
     // ★角标：Number 或 String（"+1"/"-1"/绝对值）。同一批 cid 只能共用一个值，
     //   因此调用方必须保证一批 = 同一个接收者的设备（见 docs/engineering/im-offline-push.md）。
     //   顶层 badge 只吃 iOS（APNs aps.badge）与鸿蒙通道；华为等 Android 厂商通道
@@ -301,7 +310,7 @@ exports.main = async (event) => {
       const res = await uniPush.sendMessage(args)
       console.log('[push-send] batch', chunk.length, 'errCode=', res && res.errCode, res && res.errMsg)
       // errCode=0 只代表 DCloud 受理，不代表送达；完整结果里可能有按端的任务 id / 失败明细
-      console.log('[push-send] batch res', JSON.stringify(res))
+      if (!voip) console.log('[push-send] batch res', JSON.stringify(res))
       results.push(res)
     } catch (err) {
       console.error('[push-send] batch threw:', (err && err.message) || String(err))

@@ -7,6 +7,23 @@ function snapshot(overrides: Partial<CallSnapshot> = {}) {
 }
 
 describe("phone call state", () => {
+  it("does not adopt an outgoing call owned by another device of the same account", () => {
+    const store = new CallStateStore();
+    expect(store.apply(snapshot(), 0, "alice", 1, "other-device")).toBe(false);
+    expect(store.current).toBeNull();
+  });
+  it("starts its local clock only after media readiness and keeps it across reconnection", () => {
+    const store = new CallStateStore();
+    store.apply(snapshot({ state: "active", connectedAt: 1 }), 0, "bob", 10);
+    store.mediaConnected = true; store.syncActiveClock(20);
+    expect(store.activeStartedAt).toBe(0);
+    store.peerMediaReady = true; store.syncActiveClock(30);
+    expect(store.activeStartedAt).toBe(30);
+    store.reconnecting = true; store.syncActiveClock(40);
+    expect(store.activeStartedAt).toBe(30);
+    store.endLocal("ended", 50);
+    expect(store.activeStartedAt).toBe(0);
+  });
   it("rejects malformed versions and expired invitations even for the current call", () => {
     const store = new CallStateStore();
     for (const version of [NaN, Infinity, -1, 0, 1.5]) expect(store.apply(snapshot({ version }), 0, "bob", 1)).toBe(false);

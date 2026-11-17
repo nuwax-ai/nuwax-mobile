@@ -16,6 +16,51 @@ async function fixture(roomService = { createRoom: async () => {}, deleteRoom: a
   return { app, origin, login };
 }
 describe('development phone HTTP contract', () => {
+  const apns = { provider: 'apns', channel: 'pushKit', platform: 'ios', deviceId: 'b', environment: 'development',
+    bundleId: 'com.nuwax.app', token: '0001ff', registrationId: '00000000-0000-4000-8000-000000000001', previousRegistrationId: '', action: 'register' };
+  it('acknowledges an APNs namespace without pretending to send, and preserves it across ordinary CID refresh', async () => {
+    const { app, login } = await fixture(); const bob = await login('bob', 'b');
+    expect((await bob('/devices', apns)).data).toEqual({ provider: 'apns', channel: 'pushKit', deviceId: 'b',
+      environment: 'development', bundleId: 'com.nuwax.app', registrationId: apns.registrationId, registered: true, nativePush: false });
+    await bob('/devices', { channel: 'uniPush', token: 'cid-updated', bundleId: 'com.nuwax.app', environment: 'development' });
+    expect([...app.devices.values()].map((d: any) => d.token).sort()).toEqual(['0001ff', 'cid-updated']);
+  });
+  it('conditionally revokes old tokens and prevents late registration from reviving a revoked id', async () => {
+    const { app, login } = await fixture(); const bob = await login('bob', 'b');
+    await bob('/devices', apns);
+    const next = { ...apns, token: '0002ff', registrationId: '00000000-0000-4000-8000-000000000002', previousRegistrationId: apns.registrationId };
+    expect((await bob('/devices', next)).code).toBe('0000');
+    await bob('/devices', { ...apns, action: 'revoke' });
+    expect([...app.devices.values()][0].token).toBe(next.token);
+    expect((await bob('/devices', apns)).code).toBe('CALL_PUSH_REGISTRATION_REVOKED');
+    await bob('/devices', { ...next, action: 'revoke' });
+    expect((await bob('/devices', next)).code).toBe('CALL_PUSH_REGISTRATION_REVOKED');
+    expect(app.devices.size).toBe(0);
+  });
+  it('rejects stale compare-and-set updates and idempotency keys reused with another token', async () => {
+    const { login } = await fixture(); const bob = await login('bob', 'b');
+    await bob('/devices', apns);
+    expect((await bob('/devices', { ...apns, token: '0002ff', action: 'revoke' })).code).toBe('CALL_PUSH_REGISTRATION_CONFLICT');
+    expect((await bob('/devices', apns)).code).toBe('0000');
+    expect((await bob('/devices', { ...apns, token: '0002ff' })).code).toBe('CALL_PUSH_REGISTRATION_CONFLICT');
+    expect((await bob('/devices', { ...apns, registrationId: '00000000-0000-4000-8000-000000000003' })).code).toBe('CALL_PUSH_REGISTRATION_CONFLICT');
+  });
+  it('isolates APNs environments, bundles and accounts even when the physical device matches', async () => {
+    const { app, login } = await fixture(); const bob = await login('bob', 'b'), alice = await login('alice', 'b');
+    for (const request of [apns, { ...apns, environment: 'production' }, { ...apns, bundleId: 'com.nuwax.other' }]) await bob('/devices', request);
+    await alice('/devices', apns);
+    await bob('/devices', { ...apns, action: 'revoke' });
+    expect(app.devices.size).toBe(3);
+    expect([...app.devices.values()].filter((d: any) => d.userId === 'alice')).toHaveLength(1);
+  });
+  it('rejects malformed APNs registrations before modifying the store', async () => {
+    const { app, login } = await fixture(); const bob = await login('bob', 'b');
+    for (const extra of [{ deviceId: 'other-phone' }, { environment: '' }, { token: '0001ff\n' }, { token: '' },
+      { registrationId: 'not-uuid' }, { previousRegistrationId: undefined }, { provider: 'other' }]) {
+      expect((await bob('/devices', { ...apns, ...extra })).code).toBe('CALL_INVALID_ARGUMENT');
+    }
+    expect(app.devices.size).toBe(0);
+  });
   it.each([true, false])('reports actual media service availability separately from call control (%s)', async reachable => {
     const { login } = await fixture({ createRoom: async () => {}, deleteRoom: async () => {}, listRooms: async () => {
       if (!reachable) throw new Error('fixture media unavailable');

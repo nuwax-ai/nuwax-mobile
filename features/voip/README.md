@@ -10,6 +10,8 @@ iOS 完整接打流程、未启动/锁屏/系统回收场景及交付缺口见 [
 
 PC Web 的实际锁定代码与移动端接口／行为差异见 [PC Web 对齐清单](../../docs/engineering/voip-pcweb-alignment.md)，后续优先沿用已验证的同一业务调用顺序。
 
+PC 行为补齐与 iOS 后台唤醒统一按 [实施与交付清单](../../docs/engineering/voip-delivery-plan.md)推进：已合入的 PushKit／持久化补丁与本批四项稳定性修补共用同一分支，后续优先在既有 UniPush 中接通真正的 VoIP 投递，不重复改原生桥或部署另一套媒体服务。
+
 本轮 iOS 客户端补齐与独立测试 IPA 的使用见[两台 iPhone 测试包说明](../../docs/engineering/voip-ios-qa-package.md)，正式后端接口和逻辑单独列于[后端待配合清单](../../docs/engineering/voip-backend-required.md)。
 
 ## 代码归属

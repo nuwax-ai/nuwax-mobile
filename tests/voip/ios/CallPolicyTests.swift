@@ -3,6 +3,31 @@ import XCTest
 @testable import VoipPush
 
 final class CallPolicyTests: XCTestCase {
+    func testRingTimeUsesTheAcceptedInvitationAndDoesNotExtendExpiredRetries() {
+        XCTAssertEqual(NuwaxVoipCallPolicy.ringDeadline(sendTime: 120_000, acknowledgedAt: 120_500), 180_000)
+        XCTAssertEqual(NuwaxVoipCallPolicy.ringDeadline(sendTime: nil, acknowledgedAt: 120_500), 180_500)
+        XCTAssertEqual(NuwaxVoipCallPolicy.ringDeadline(sendTime: 1_000_000, acknowledgedAt: 120_500), 180_500)
+        XCTAssertLessThan(NuwaxVoipCallPolicy.ringDeadline(sendTime: 1000, acknowledgedAt: 120_500), 120_500)
+    }
+    func testActiveHangupDoesNotBecomeLegacyCancel() {
+        XCTAssertNil(NuwaxVoipCallPolicy.businessEndAction(caller: true, state: "active", reason: "ended"))
+        XCTAssertEqual(NuwaxVoipCallPolicy.businessEndAction(caller: true, state: "connecting", reason: "cancelled"), "ended")
+        XCTAssertEqual(NuwaxVoipCallPolicy.businessEndAction(caller: true, state: "ringing", reason: "timeout"), "ended")
+        XCTAssertEqual(NuwaxVoipCallPolicy.businessEndAction(caller: false, state: "ringing", reason: "rejected"), "declined")
+        XCTAssertNil(NuwaxVoipCallPolicy.businessEndAction(caller: false, state: "connecting", reason: "rejected"))
+        XCTAssertNil(NuwaxVoipCallPolicy.businessEndAction(caller: true, state: "ringing", reason: "remoteEnded"))
+    }
+    func testRemoteDepartureWaitsThroughReconnectAndRequiresActualPreviousPeer() {
+        XCTAssertFalse(NuwaxVoipCallPolicy.shouldFinishRemoteLeft(everHadRemote: true, remoteCount: 0, reconnecting: true, graceElapsed: true))
+        XCTAssertFalse(NuwaxVoipCallPolicy.shouldFinishRemoteLeft(everHadRemote: true, remoteCount: 1, reconnecting: false, graceElapsed: true))
+        XCTAssertFalse(NuwaxVoipCallPolicy.shouldFinishRemoteLeft(everHadRemote: false, remoteCount: 0, reconnecting: false, graceElapsed: true))
+        XCTAssertFalse(NuwaxVoipCallPolicy.shouldFinishRemoteLeft(everHadRemote: true, remoteCount: 0, reconnecting: false, graceElapsed: false))
+        XCTAssertTrue(NuwaxVoipCallPolicy.shouldFinishRemoteLeft(everHadRemote: true, remoteCount: 0, reconnecting: false, graceElapsed: true))
+    }
+    func testAuthenticationFailureRemainsFatalUnlikeAnswerReportServiceFailure() {
+        XCTAssertTrue(NuwaxVoipCallPolicy.isAuthenticationFailure(401)); XCTAssertTrue(NuwaxVoipCallPolicy.isAuthenticationFailure(403))
+        XCTAssertFalse(NuwaxVoipCallPolicy.isAuthenticationFailure(500)); XCTAssertFalse(NuwaxVoipCallPolicy.isAuthenticationFailure(404))
+    }
     func testPendingColdIncomingReservesTheOnlyCallSlot() {
         XCTAssertFalse(NuwaxVoipCallPolicy.mayWatch(callID: "outgoing", currentID: nil, pendingIDs: ["incoming"]))
         XCTAssertFalse(NuwaxVoipCallPolicy.mayWatch(callID: "outgoing", currentID: "active", pendingIDs: []))

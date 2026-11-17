@@ -1,4 +1,4 @@
-import { Room, RoomEvent, Track } from 'livekit-client';
+import { Room, RoomEvent, Track, ConnectionState } from 'livekit-client';
 
 export const MEDIA_READY_TOPIC = 'nuwax.voip.media-ready.v1';
 export function isPeerMediaReady(data, topic, callId) {
@@ -10,9 +10,11 @@ export function isPeerMediaReady(data, topic, callId) {
 /** Only media commands cross this bridge; platform/auth credentials never enter the HTML URL. */
 export function createMediaEngine(emit, root = document.body) {
   let room = null, generation = 0, fixture = null, microphone = true, camera = false, hidden = false, callId = '';
+  let remoteLeftTimer = null;
   const views = new Set();
   const notify = (type, extra = {}) => emit({ type, callId, ...extra });
   const clear = async () => {
+    clearTimeout(remoteLeftTimer); remoteLeftTimer = null;
     const previous = room; room = null;
     const oldFixture = fixture; fixture = null;
     for (const view of views) view.remove();
@@ -57,12 +59,27 @@ export function createMediaEngine(emit, root = document.body) {
       videoCaptureDefaults: { resolution: { width: 640, height: 360, frameRate: 20 } } });
     room = next;
     const current = () => run === generation && room === next;
+    let everHadRemote = false, recovering = false;
+    const observeRemotePresence = () => {
+      if (!current() || command.protocol !== 'im-voip-v1') return;
+      if (next.remoteParticipants.size > 0) {
+        everHadRemote = true; clearTimeout(remoteLeftTimer); remoteLeftTimer = null; return;
+      }
+      if (!everHadRemote || remoteLeftTimer != null) return;
+      remoteLeftTimer = setTimeout(() => {
+        if (!current()) return;
+        remoteLeftTimer = null;
+        if (next.remoteParticipants.size > 0) return;
+        if (recovering || next.state === ConnectionState.Reconnecting) { observeRemotePresence(); return; }
+        notify('remoteEnded');
+      }, 3000);
+    };
     let localReady = false;
     const announceReady = () => {
       if (!current() || !localReady) return;
       next.localParticipant.publishData?.(new TextEncoder().encode(JSON.stringify({ v: 1, type: 'ready', callId })), { reliable: true, topic: MEDIA_READY_TOPIC }).catch(() => {});
     };
-    next.on(RoomEvent.ParticipantConnected, announceReady);
+    next.on(RoomEvent.ParticipantConnected, () => { everHadRemote = true; observeRemotePresence(); announceReady(); });
     next.on(RoomEvent.DataReceived, (data, participant, _kind, topic) => {
       if (current() && participant && isPeerMediaReady(data, topic, callId)) notify('peerMediaReady');
     });
@@ -77,14 +94,15 @@ export function createMediaEngine(emit, root = document.body) {
       if (track.kind === Track.Kind.Audio) notify('peerMediaReady');
     });
     next.on(RoomEvent.TrackUnsubscribed, track => { for (const element of track.detach()) { views.delete(element); element.remove(); } });
-    next.on(RoomEvent.Reconnecting, () => { if (current()) notify('reconnecting'); });
-    next.on(RoomEvent.Reconnected, () => { if (current()) { notify('connected'); announceReady(); } });
+    next.on(RoomEvent.Reconnecting, () => { if (current()) { recovering = true; notify('reconnecting'); observeRemotePresence(); } });
+    next.on(RoomEvent.Reconnected, () => { if (current()) { recovering = false; notify('connected'); observeRemotePresence(); announceReady(); } });
     next.on(RoomEvent.AudioPlaybackStatusChanged, () => { if (current() && !next.canPlaybackAudio) notify('playbackBlocked'); });
-    next.on(RoomEvent.ParticipantDisconnected, () => { if (current() && command.protocol === 'im-voip-v1') notify('disconnected'); });
+    next.on(RoomEvent.ParticipantDisconnected, observeRemotePresence);
     next.on(RoomEvent.Disconnected, () => { if (current()) notify('disconnected'); });
     try {
       await next.connect(command.serverUrl, command.participantToken);
       if (!current()) { await next.disconnect(); return; }
+      observeRemotePresence();
       await next.startAudio?.();
       if (command.synthetic === true) {
         // Explicit test fixture: real WebRTC audio, does NOT validate the microphone/voice AI.

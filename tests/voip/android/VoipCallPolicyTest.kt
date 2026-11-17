@@ -8,7 +8,35 @@ object VoipCallPolicyTest {
         incomingSoundHonorsSilenceAndExplicitChoices()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
         endingOrAnsweringReleasesTheIncomingNotificationSlot()
-        println("8 Kotlin call policy cases passed")
+        ringTimeStartsAfterInvitationAcknowledgement(); activeHangupDoesNotSendLegacyCancel()
+        reconnectMustNotLookLikeRemoteHangup(); authFailuresAreSeparateFromNotificationFailures()
+        println("12 Kotlin call policy cases passed")
+    }
+    private fun ringTimeStartsAfterInvitationAcknowledgement() {
+        check(VoipCallPolicy.ringDeadline(120000, 120500) == 180000L)
+        check(VoipCallPolicy.ringDeadline(0, 120500) == 180500L)
+        check(VoipCallPolicy.ringDeadline(1000000, 120500) == 180500L) // no clock-skew extension
+        check(VoipCallPolicy.ringDeadline(1000, 120500) < 120500) // stale idempotent response
+        check(VoipCallPolicy.PREPARE_TIMEOUT_MS == 30000L)
+    }
+    private fun activeHangupDoesNotSendLegacyCancel() {
+        check(VoipCallPolicy.businessEndAction(true, "active", "ended") == null)
+        check(VoipCallPolicy.businessEndAction(true, "connecting", "cancelled") == "ended")
+        check(VoipCallPolicy.businessEndAction(true, "ringing", "timeout") == "ended")
+        check(VoipCallPolicy.businessEndAction(false, "ringing", "rejected") == "declined")
+        check(VoipCallPolicy.businessEndAction(false, "connecting", "rejected") == null)
+        check(VoipCallPolicy.businessEndAction(true, "ringing", "remoteEnded") == null)
+    }
+    private fun reconnectMustNotLookLikeRemoteHangup() {
+        check(!VoipCallPolicy.shouldFinishRemoteLeft(true, 0, true, true))
+        check(!VoipCallPolicy.shouldFinishRemoteLeft(true, 1, false, true))
+        check(!VoipCallPolicy.shouldFinishRemoteLeft(false, 0, false, true))
+        check(!VoipCallPolicy.shouldFinishRemoteLeft(true, 0, false, false))
+        check(VoipCallPolicy.shouldFinishRemoteLeft(true, 0, false, true))
+    }
+    private fun authFailuresAreSeparateFromNotificationFailures() {
+        check(VoipCallPolicy.isAuthenticationFailure(401)); check(VoipCallPolicy.isAuthenticationFailure(403))
+        check(!VoipCallPolicy.isAuthenticationFailure(500)); check(!VoipCallPolicy.isAuthenticationFailure(404))
     }
     private fun incomingSoundHonorsSilenceAndExplicitChoices() {
         val notification = "default-notification"; val ringtone = "default-ringtone"; val bundled = "bundled-ringtone"

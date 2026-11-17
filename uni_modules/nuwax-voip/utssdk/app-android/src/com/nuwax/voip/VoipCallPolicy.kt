@@ -2,6 +2,19 @@ package com.nuwax.voip
 
 /** Business policy, independent from Telecom/media, and executable on the JVM. */
 internal object VoipCallPolicy {
+    const val PREPARE_TIMEOUT_MS = 30000L
+    const val REMOTE_LEFT_GRACE_MS = 3000L
+    fun ringDeadline(sendTime: Long, acknowledgedAt: Long): Long =
+        (if (sendTime > 0) minOf(sendTime, acknowledgedAt) else acknowledgedAt) + 60000L
+    fun isAuthenticationFailure(status: Int) = status == 401 || status == 403
+    fun businessEndAction(caller: Boolean, state: String, reason: String): String? = when {
+        reason in listOf("remoteEnded", "remoteCancelled", "answeredElsewhere", "sessionChanged") -> null
+        caller && state in listOf("ringing", "connecting") -> "ended"
+        !caller && canDecline(reason, state) -> "declined"
+        else -> null
+    }
+    fun shouldFinishRemoteLeft(everHadRemote: Boolean, remoteCount: Int, reconnecting: Boolean, graceElapsed: Boolean) =
+        everHadRemote && remoteCount == 0 && !reconnecting && graceElapsed
     /** Null userSetSound means pre-30: preserve the existing choice when it cannot be inspected. */
     fun invitationSound(previousExists: Boolean, previousSound: String?, userSetSound: Boolean?,
                         oldDefaults: Set<String>, bundledSound: String): String? =

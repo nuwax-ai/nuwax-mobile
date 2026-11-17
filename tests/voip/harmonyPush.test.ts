@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const token = vi.hoisted(() => ({ get: vi.fn() }));
+const transport = vi.hoisted(() => ({ request: vi.fn(), destroy: vi.fn() }));
 vi.mock('BuildProfile', () => ({ default: { DEBUG: true } }));
 vi.mock('@kit.AbilityKit', () => ({ bundleManager: {
   BundleFlag: { GET_BUNDLE_INFO_DEFAULT: 0 },
   getBundleInfoForSelfSync: () => ({ name: 'com.nuwax.app' }),
 } }));
-vi.mock('@kit.NetworkKit', () => ({ http: {} }));
+vi.mock('@kit.NetworkKit', () => ({ http: {
+  createHttp: () => ({ request: transport.request, destroy: transport.destroy }),
+  HttpDataType: { STRING: 0 }, RequestMethod: { GET: 'GET', POST: 'POST' },
+} }));
 vi.mock('@kit.ArkTS', () => ({ util: { TextEncoder: class {
   encodeInto(value: string) { return new TextEncoder().encode(value); }
 } } }));
@@ -21,7 +25,8 @@ vi.mock('@kit.ImageKit', () => ({ image: {} }));
 vi.mock('@kit.AudioKit', () => ({ audio: {} }));
 vi.mock('@kit.ArkWeb', () => ({ webview: {} }));
 
-import { VoipBridge } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets';
+import { VoipBridge, VoipBusinessPolicy } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets';
+const actualRequest = VoipBridge.request;
 
 function session(userId: string) {
   return {
@@ -31,7 +36,10 @@ function session(userId: string) {
 }
 
 beforeEach(() => {
+  if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry);
+  VoipBridge.expiry = -1; VoipBridge.mediaId = ''; VoipBridge.nativeId = ''; VoipBridge.connected = false; VoipBridge.readySent = false;
   token.get.mockReset();
+  transport.request.mockReset(); transport.destroy.mockClear();
   vi.spyOn(VoipBridge, 'startStream').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'finish').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'request').mockResolvedValue({} as any);
@@ -39,7 +47,7 @@ beforeEach(() => {
   VoipBridge.reset();
   vi.mocked(VoipBridge.finish).mockClear();
 });
-afterEach(() => { VoipBridge.reset(); vi.restoreAllMocks(); });
+afterEach(() => { VoipBridge.reset(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('Harmony push registration lifetime', () => {
   it('registers the actual bundle and explicit environment', async () => {
@@ -73,6 +81,111 @@ describe('Harmony push registration lifetime', () => {
     await previous;
     const registrations = vi.mocked(VoipBridge.request).mock.calls.map(([, body]) => JSON.parse(body!));
     expect(registrations.map(body => body.token)).toEqual(replacement ? ['new-account-token'] : []);
+  });
+});
+
+describe('PC-aligned business lifecycle', () => {
+  function setup() {
+    VoipBridge.initialize({ ...session('alice'), protocol: 'im-voip-v1' });
+    vi.mocked(VoipBridge.request).mockClear();
+  }
+  const outgoing = () => ({ callId: 'c1', convId: 'chat', version: 1, state: 'ringing',
+    callerId: 'alice', callerDeviceId: 'fixture-device', calleeId: 'bob', acceptedDeviceId: '',
+    msgId: '', roomName: 'call-c1', mediaType: 'audio', expiresAt: Date.now() + 60000, connectedAt: 0 } as any);
+  it('retains joined media when the answered notification fails, but still fails an unsent invitation', async () => {
+    setup();
+    VoipBridge.current = { ...outgoing(), callerId: 'bob', calleeId: 'alice', msgId: 'm1', state: 'active' };
+    const current = VoipBridge.current;
+    vi.mocked(VoipBridge.request).mockRejectedValueOnce(new Error('temporary 5xx'));
+    await VoipBridge.mediaJoined();
+    expect(VoipBridge.current).toBe(current); expect(VoipBridge.finish).not.toHaveBeenCalled();
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'controlWarning', code: 'CALL_ANSWER_REPORT_FAILED' }));
+    VoipBridge.current = outgoing();
+    vi.mocked(VoipBridge.request).mockRejectedValueOnce(new Error('invitation failed'));
+    await expect(VoipBridge.mediaJoined()).rejects.toThrow('invitation failed');
+  });
+  it.each([401, 403])('expires the current session on HTTP %s instead of treating it as a retryable report failure', async status => {
+    setup();
+    transport.request.mockResolvedValue({ responseCode: status, result: 'not JSON' });
+    await expect(actualRequest('/answered', '{}')).rejects.toThrow('CALL_SESSION_EXPIRED');
+    expect(VoipBridge.configuration).toBeNull();
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'localEnded', reason: 'sessionExpired' }));
+    expect(transport.destroy).toHaveBeenCalledOnce();
+  });
+  it('does not let a previous token authentication failure clear the refreshed session', async () => {
+    setup(); let finish!: (response: any) => void;
+    transport.request.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const pending = actualRequest('/answered', '{}');
+    VoipBridge.initialize({ ...session('alice'), protocol: 'im-voip-v1', accessToken: 'new-fixture' });
+    finish({ responseCode: 401, result: '{"code":"EXPIRED","data":null}' });
+    await expect(pending).rejects.toThrow('CALL_ACTION_FAILED');
+    expect(VoipBridge.configuration?.accessToken).toBe('new-fixture');
+    expect(VoipBridge.queue.some(event => event.type === 'localEnded' && event.reason === 'sessionExpired')).toBe(false);
+  });
+  it('starts the full ringing window after invitation success even after a slow media setup', async () => {
+    setup(); vi.useFakeTimers();
+    vi.spyOn(VoipBridge, 'startMedia').mockImplementation(call => { VoipBridge.mediaId = call.callId; });
+    vi.spyOn(VoipBridge, 'outgoing').mockResolvedValue();
+    VoipBridge.adopt(outgoing()); await vi.advanceTimersByTimeAsync(20000);
+    const sentAt = Date.now();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ msgId: 'm1', sendTime: sentAt } as any);
+    await VoipBridge.mediaJoined();
+    expect(VoipBridge.current?.expiresAt).toBe(sentAt + 60000);
+    await vi.advanceTimersByTimeAsync(41000); expect(VoipBridge.finish).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(19000); expect(VoipBridge.finish).toHaveBeenCalledWith('timeout');
+  });
+  it('bounds preparation independently and does not extend it on duplicate snapshots', async () => {
+    setup(); vi.useFakeTimers();
+    vi.spyOn(VoipBridge, 'startMedia').mockImplementation(call => { VoipBridge.mediaId = call.callId; });
+    vi.spyOn(VoipBridge, 'outgoing').mockResolvedValue();
+    VoipBridge.adopt(outgoing()); await vi.advanceTimersByTimeAsync(25000);
+    VoipBridge.adopt({ ...VoipBridge.current!, version: 2 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(VoipBridge.finish).toHaveBeenCalledExactlyOnceWith('connectionTimeout');
+  });
+  it('does not restart an expired idempotent invitation window', async () => {
+    setup();
+    VoipBridge.current = outgoing();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ msgId: 'm1', sendTime: Date.now() - 61000 } as any);
+    await VoipBridge.mediaJoined();
+    expect(VoipBridge.finish).toHaveBeenCalledWith('timeout');
+    const now = Date.now();
+    expect(VoipBusinessPolicy.ringDeadline(now + 999999, now)).toBe(now + 60000);
+  });
+  it('compensates an invitation acknowledged after local cancellation instead of restarting ringing', async () => {
+    setup(); VoipBridge.current = outgoing(); let accept!: (value: any) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { accept = resolve; }));
+    const pending = VoipBridge.mediaJoined(); VoipBridge.current = null;
+    accept({ msgId: 'late-m1', sendTime: Date.now() }); await pending;
+    expect(VoipBridge.current).toBeNull();
+    expect(VoipBridge.request).toHaveBeenLastCalledWith('/ended', expect.stringContaining('"msgId":"late-m1"'), false, expect.any(Object));
+  });
+  it('does not attach a failed old answer report to a replacement call', async () => {
+    setup(); VoipBridge.current = { ...outgoing(), callerId: 'bob', calleeId: 'alice', msgId: 'm1', state: 'active' };
+    let reject!: (error: Error) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }));
+    const pending = VoipBridge.mediaJoined(); VoipBridge.current = { ...outgoing(), callId: 'replacement' };
+    reject(new Error('old answer report')); await pending;
+    expect(VoipBridge.current?.callId).toBe('replacement');
+    expect(VoipBridge.finish).not.toHaveBeenCalled();
+    expect(VoipBridge.queue.some(event => event.type === 'controlWarning')).toBe(false);
+  });
+  it('keeps active hangup out of legacy cancel while preserving ringing cancel, timeout, and rejection', () => {
+    setup();
+    const call = { ...outgoing(), msgId: 'm1' };
+    VoipBridge.notifyBusinessEnd({ ...call, state: 'active' }, 'ended');
+    expect(VoipBridge.request).not.toHaveBeenCalled();
+    VoipBridge.notifyBusinessEnd(call, 'cancelled');
+    expect(VoipBridge.request).toHaveBeenLastCalledWith('/ended', expect.stringContaining('"reason":"cancel"'), false, expect.any(Object));
+    VoipBridge.notifyBusinessEnd(call, 'timeout');
+    expect(VoipBridge.request).toHaveBeenLastCalledWith('/ended', expect.stringContaining('"reason":"timeout"'), false, expect.any(Object));
+    VoipBridge.notifyBusinessEnd({ ...call, callerId: 'bob', calleeId: 'alice' }, 'rejected');
+    expect(VoipBridge.request).toHaveBeenLastCalledWith('/declined', expect.any(String), false, expect.any(Object));
+  });
+  it('does not finish an online call when a nonfatal control warning arrives from the media page', () => {
+    setup(); VoipBridge.current = { ...outgoing(), state: 'active' };
+    VoipBridge.mediaEvent(JSON.stringify({ type: 'controlWarning', callId: 'c1', code: 'CALL_ANSWER_REPORT_FAILED' }));
+    expect(VoipBridge.finish).not.toHaveBeenCalled();
   });
 });
 

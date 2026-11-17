@@ -2,6 +2,21 @@ import Foundation
 
 /// Protocol policy only; no system UI, capture or network side effects.
 enum NuwaxVoipCallPolicy {
+    static let prepareTimeout: Double = 30_000
+    static let remoteLeftGrace: UInt64 = 3_000_000_000
+    static func ringDeadline(sendTime: Double?, acknowledgedAt: Double) -> Double {
+        let sent = sendTime.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? acknowledgedAt
+        return min(sent, acknowledgedAt) + 60_000
+    }
+    static func isAuthenticationFailure(_ status: Int) -> Bool { status == 401 || status == 403 }
+    static func businessEndAction(caller: Bool, state: String, reason: String) -> String? {
+        if ["remoteEnded", "remoteCancelled", "answeredElsewhere", "sessionChanged"].contains(reason) { return nil }
+        if caller && ["ringing", "connecting"].contains(state) { return "ended" }
+        return !caller && canDecline(reason: reason, state: state) ? "declined" : nil
+    }
+    static func shouldFinishRemoteLeft(everHadRemote: Bool, remoteCount: Int, reconnecting: Bool, graceElapsed: Bool) -> Bool {
+        everHadRemote && remoteCount == 0 && !reconnecting && graceElapsed
+    }
     static func mayWatch(callID: String, currentID: String?, pendingIDs: [String]) -> Bool {
         guard !callID.isEmpty else { return false }
         if let currentID, currentID != callID { return false }

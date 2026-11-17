@@ -14,7 +14,7 @@ export interface CallData {
   callId: string; convId: string; version: number; state: string; callerId: string; calleeId: string;
   callerDeviceId: string; acceptedDeviceId: string; mediaType: string; displayName: string;
   callerDisplayName?: string; calleeDisplayName?: string;
-  connectExpiresAt?: number; expiresAt: number; connectedAt: number; reason: string;
+  connectExpiresAt?: number; prepareExpiresAt?: number; expiresAt: number; connectedAt: number; reason: string;
   serverUrl?: string; participantToken?: string;
   protocol?: string; roomName?: string; msgId?: string; wsUrl?: string; token?: string;
   convType?: number; peerUserId?: string; peerName?: string;
@@ -25,6 +25,17 @@ export interface CallData {
 interface InvitationBody { callId: string; roomName: string; mediaType: string }
 interface SignalBody { callId?: string; convId?: string; msgId?: string; userId?: string }
 interface ImFrame { op: number; body: CallData }
+export class VoipBusinessPolicy {
+  static ringDeadline(sendTime: number | undefined, now: number): number {
+    return Math.min(sendTime && Number.isFinite(sendTime) && sendTime > 0 ? sendTime : now, now) + 60000
+  }
+  static isAuthenticationFailure(status: number): boolean { return status === 401 || status === 403 }
+  static endAction(caller: boolean, state: string, reason: string): string {
+    if (['remoteEnded', 'remoteCancelled', 'answeredElsewhere', 'sessionChanged'].includes(reason)) return ''
+    if (caller && ['ringing', 'connecting'].includes(state)) return '/ended'
+    return !caller && state === 'ringing' && reason === 'rejected' ? '/declined' : ''
+  }
+}
 interface Configuration {
   scope: string; apiBaseUrl: string; accessToken: string; deviceId: string; userId: string;
   development: boolean; qaAccepted: boolean; businessEnabled?: boolean; protocol?: string; callLabel: string; labels?: Record<string, string>;
@@ -183,6 +194,11 @@ export class VoipBridge {
         header: { 'Authorization': `Bearer ${config.accessToken}`, 'X-Call-Device-Id': config.deviceId, 'Content-Type': 'application/json' },
         extraData: body, connectTimeout: 4000, readTimeout: 4000, expectDataType: http.HttpDataType.STRING,
       })
+      if (captured === null && run === VoipBridge.generation && config.accessToken === VoipBridge.configuration?.accessToken && VoipBusinessPolicy.isAuthenticationFailure(response.responseCode)) {
+        const event: CallEvent = { type: 'localEnded', scope: config.scope, callId: VoipBridge.current?.callId, reason: 'sessionExpired' }
+        VoipBridge.reset(); VoipBridge.queue.push(event)
+        throw new Error('CALL_SESSION_EXPIRED')
+      }
       const envelope = JSON.parse((response.result as string).replace(/("(?:convId|msgId|senderId|userId|peerUserId)"\s*:\s*)([0-9]{16,})(?=[,}\s])/g, '$1"$2"')) as Envelope
       if ((captured === null && run !== VoipBridge.generation) || response.responseCode !== 200 || envelope.code !== '0000') throw new Error('CALL_ACTION_FAILED')
       return envelope.data
@@ -317,15 +333,22 @@ export class VoipBridge {
       const invitation: InvitationBody = { callId: call.callId, roomName: call.roomName ?? '', mediaType: call.mediaType }
       const result = await VoipBridge.request('/api/instant-message/messages', JSON.stringify({ convId: call.convId, deviceId: config.deviceId, clientMsgId: call.callId, msgType: 'voip', body: invitation }), true, config)
       if (VoipBridge.generation !== run || VoipBridge.current?.callId !== call.callId) { call.msgId = result.msgId; VoipBridge.notifyBusinessEnd(call, 'cancel', config); return }
-      const next = VoipBridge.parse(JSON.stringify(VoipBridge.current)); next.msgId = result.msgId; next.version++; VoipBridge.adopt(next)
-    } else await VoipBridge.request('/answered', JSON.stringify({ convId: call.convId, msgId: call.msgId, callId: call.callId, roomName: call.roomName }))
+      const next = VoipBridge.parse(JSON.stringify(VoipBridge.current)); next.msgId = result.msgId; next.version++
+      const now = Date.now(); next.expiresAt = VoipBusinessPolicy.ringDeadline(result.sendTime, now)
+      if (next.state === 'ringing' && next.expiresAt <= now) { VoipBridge.current = next; VoipBridge.finish('timeout'); return }
+      VoipBridge.adopt(next)
+    } else {
+      try { await VoipBridge.request('/answered', JSON.stringify({ convId: call.convId, msgId: call.msgId, callId: call.callId, roomName: call.roomName })) }
+      catch (_) { if (run === VoipBridge.generation && VoipBridge.current?.callId === call.callId) VoipBridge.emit('controlWarning', 'CALL_ANSWER_REPORT_FAILED') }
+    }
   }
   static notifyBusinessEnd(call: CallData, reason: string, captured: Configuration | null = null): void {
     const config = captured ?? VoipBridge.configuration
     if (!call.msgId || !reason || ['remoteEnded', 'remoteCancelled', 'answeredElsewhere', 'sessionChanged'].includes(reason)) return
     const caller = call.callerId === config?.userId
-    if (!caller && !(call.state === 'ringing' && reason === 'rejected')) return
-    VoipBridge.request(caller ? '/ended' : '/declined', JSON.stringify({ convId: call.convId, msgId: call.msgId, callId: call.callId, roomName: call.roomName, reason: caller ? (reason === 'timeout' ? 'timeout' : 'cancel') : undefined }), false, config).catch(() => {})
+    const path = VoipBusinessPolicy.endAction(caller, call.state, reason)
+    if (!path) return
+    VoipBridge.request(path, JSON.stringify({ convId: call.convId, msgId: call.msgId, callId: call.callId, roomName: call.roomName, reason: caller ? (reason === 'timeout' ? 'timeout' : 'cancel') : undefined }), false, config).catch(() => {})
   }
   static adopt(value: CallData): void {
     const config = VoipBridge.configuration, previous = VoipBridge.current
@@ -345,7 +368,10 @@ export class VoipBridge {
       if (VoipBridge.business() && value.callerId === config.userId && value.callerDeviceId === config.deviceId && VoipBridge.mediaId !== value.callId) VoipBridge.startMedia(value)
       if (value.callerId === config.userId && value.callerDeviceId === config.deviceId && !VoipBridge.nativeId) VoipBridge.outgoing(value)
       if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry)
-      VoipBridge.expiry = setTimeout(() => { if (VoipBridge.current?.callId === value.callId && VoipBridge.current.state === 'ringing') VoipBridge.finish('timeout') }, Math.max(0, value.expiresAt - Date.now()))
+      const preparing = VoipBridge.business() && value.callerId === config.userId && !value.msgId
+      if (preparing) value.prepareExpiresAt = previous?.callId === value.callId ? (previous.prepareExpiresAt ?? Date.now() + 30000) : Date.now() + 30000
+      const deadline = preparing ? (value.prepareExpiresAt ?? Date.now() + 30000) : value.expiresAt
+      VoipBridge.expiry = setTimeout(() => { if (VoipBridge.current?.callId === value.callId && VoipBridge.current.state === 'ringing') VoipBridge.finish(preparing ? 'connectionTimeout' : 'timeout') }, Math.max(0, deadline - Date.now()))
     } else {
       if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry)
       if (value.state === 'connecting') VoipBridge.expiry = setTimeout(() => {
@@ -435,6 +461,7 @@ export class VoipBridge {
         if (firstConnection && VoipBridge.business()) VoipBridge.mediaJoined().catch(() => { if (run === VoipBridge.generation && VoipBridge.current?.callId === id) VoipBridge.finish('mediaFailed') })
       }
       if (event.type === 'peerMediaReady') VoipBridge.peerReady = true
+      if (event.type === 'remoteEnded') { VoipBridge.finish('remoteEnded', false); return }
       if (event.type === 'disconnected' || (event.type === 'error' && event.fatal !== false)) { VoipBridge.finish('disconnected'); return }
       VoipBridge.emit(event.type, event.code)
       if (VoipBridge.connected && VoipBridge.peerReady && !VoipBridge.readySent) { VoipBridge.readySent = true; VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_ACTIVE); VoipBridge.action('ready') }

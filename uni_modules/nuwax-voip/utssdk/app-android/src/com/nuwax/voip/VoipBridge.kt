@@ -50,6 +50,8 @@ import javax.crypto.spec.GCMParameterSpec
 import android.util.Base64
 import android.util.Log
 
+private class VoipHttpFailure(val status: Int) : Exception("CALL_SERVICE_UNAVAILABLE")
+
 /** Singleton survives the UTS page. Cold-start push integrations call incoming() directly. */
 object VoipBridge {
     @JvmStatic fun isTestPackage(ctx: Context): Boolean {
@@ -70,6 +72,8 @@ object VoipBridge {
     private var streamJob: Job? = null
     private var mediaJob: Job? = null
     private var expiryJob: Job? = null
+    private var remoteLeftJob: Job? = null
+    private var everHadRemote = false
     private var telecomJob: Job? = null
     private var telecomReady: CompletableDeferred<CallControlScope?>? = null
     private var telecomCleanup: Job? = null
@@ -239,17 +243,20 @@ object VoipBridge {
     private suspend fun api(path: String, data: JSONObject? = null, absolute: Boolean = false, captured: JSONObject? = null): JSONObject {
         val owner = generation
         val settings = captured ?: JSONObject(config.toString())
-        val result = withContext(Dispatchers.IO) {
+        val result = try { withContext(Dispatchers.IO) {
             val request = Request.Builder().url(settings.getString("apiBaseUrl") + (if (absolute) "" else PREFIX) + path)
                 .header("Authorization", "Bearer " + settings.getString("accessToken"))
                 .header("X-Call-Device-Id", settings.getString("deviceId"))
             if (data != null) request.post(data.toString().toRequestBody("application/json".toMediaType()))
             http.newCall(request.build()).execute().use { response ->
-                if (!response.isSuccessful) error("CALL_SERVICE_UNAVAILABLE")
+                if (!response.isSuccessful) throw VoipHttpFailure(response.code)
                 val envelope = JSONObject(response.body?.string() ?: "{}")
                 if (envelope.optString("code") != "0000") error(envelope.optString("code", "CALL_SERVICE_UNAVAILABLE"))
                 envelope.getJSONObject("data")
             }
+        } } catch (error: VoipHttpFailure) {
+            if (captured == null && owner == generation && settings.optString("accessToken") == config.optString("accessToken") && VoipCallPolicy.isAuthenticationFailure(error.status)) expireSession()
+            throw error
         }
         if (captured == null) check(owner == generation) { "CALL_SESSION_CHANGED" }
         return result
@@ -401,9 +408,16 @@ object VoipBridge {
                 .put("body", JSONObject().put("callId", call.getString("callId")).put("roomName", call.getString("roomName")).put("mediaType", call.getString("mediaType")))
             val response = api("/api/instant-message/messages", invitation, true, settings)
             if (run != generation || current?.optString("callId") != call.optString("callId")) { notifyBusinessEnd(JSONObject(call.toString()).put("msgId", response.getString("msgId")), "cancel", settings); return@withContext }
-            current = JSONObject(current.toString()).put("msgId", response.getString("msgId")).put("version", current!!.optLong("version") + 1)
-            emitSnapshot(current!!)
-        } else api("/answered", businessBody(call))
+            val now = System.currentTimeMillis()
+            val next = JSONObject(current.toString()).put("msgId", response.getString("msgId"))
+                .put("expiresAt", VoipCallPolicy.ringDeadline(response.optLong("sendTime"), now)).put("version", current!!.optLong("version") + 1)
+            if (next.optString("state") == "ringing" && next.optLong("expiresAt") <= now) { current = next; finish("timeout"); return@withContext }
+            adopt(next)
+        } else {
+            try { api("/answered", businessBody(call)) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { if (run == generation && current?.optString("callId") == call.optString("callId")) trace("answer report unavailable; media retained") }
+        }
     }
     private suspend fun businessAction(action: String, media: String) {
         val call = current ?: return
@@ -420,10 +434,10 @@ object VoipBridge {
     }
     private fun notifyBusinessEnd(call: JSONObject, reason: String, captured: JSONObject? = null) {
         val settings = captured ?: JSONObject(config.toString())
-        if (call.optString("msgId").isEmpty() || reason in listOf("remoteEnded", "remoteCancelled", "answeredElsewhere", "sessionChanged")) return
+        if (call.optString("msgId").isEmpty()) return
         val caller = call.optString("callerId") == settings.optString("userId")
-        if (!caller && !VoipCallPolicy.canDecline(reason, call.optString("state"))) return
-        val body = businessBody(call); val path = if (caller) "/ended" else "/declined"
+        val action = VoipCallPolicy.businessEndAction(caller, call.optString("state"), reason) ?: return
+        val body = businessBody(call); val path = "/$action"
         if (caller) body.put("reason", if (reason == "timeout") "timeout" else "cancel")
         val request = Request.Builder().url(settings.getString("apiBaseUrl") + PREFIX + path).header("Authorization", "Bearer " + settings.getString("accessToken"))
             .post(body.toString().toRequestBody("application/json".toMediaType())).build()
@@ -450,11 +464,13 @@ object VoipBridge {
         expiryJob?.cancel(); expiryJob = null
         val phase = snapshot.optString("state")
         if (phase == "ringing" || phase == "connecting") {
-            val limit = if (phase == "ringing") (if (business()) 60000L else 45000L) else 30000L
-            val deadline = snapshot.optLong(if (phase == "ringing") "expiresAt" else "connectExpiresAt", System.currentTimeMillis() + limit)
+            val preparing = business() && phase == "ringing" && snapshot.optString("callerId") == uid && snapshot.optString("msgId").isEmpty()
+            if (preparing) snapshot.put("prepareExpiresAt", old?.optLong("prepareExpiresAt")?.takeIf { it > 0 } ?: (System.currentTimeMillis() + VoipCallPolicy.PREPARE_TIMEOUT_MS))
+            val limit = if (preparing || phase == "connecting") 30000L else if (business()) 60000L else 45000L
+            val deadline = snapshot.optLong(if (preparing) "prepareExpiresAt" else if (phase == "ringing") "expiresAt" else "connectExpiresAt", System.currentTimeMillis() + limit)
             expiryJob = scope.launch {
                 delay((deadline - System.currentTimeMillis()).coerceIn(0L, limit))
-                if (current?.optString("callId") == id && current?.optString("state") == phase) finish(if (phase == "ringing") "timeout" else "connectionTimeout")
+                if (current?.optString("callId") == id && current?.optString("state") == phase) finish(if (!preparing && phase == "ringing") "timeout" else "connectionTimeout")
             }
         }
         if (current?.optString("callId") != id || terminal.contains(id)) return
@@ -568,6 +584,7 @@ object VoipBridge {
         val id = snapshot.optString("callId")
         if (mediaId == id) return
         mediaId = id; connected = false; peerReady = false; readySent = false
+        remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
         val run = generation
         mediaJob = scope.launch {
             try {
@@ -595,7 +612,7 @@ object VoipBridge {
                                 refreshViews()
                             }
                             is RoomEvent.TrackUnsubscribed -> refreshViews()
-                            is RoomEvent.ParticipantConnected -> announceMediaReady()
+                            is RoomEvent.ParticipantConnected -> { everHadRemote = true; observeRemotePresence(next, id, run); announceMediaReady() }
                             is RoomEvent.DataReceived -> {
                                 if (event.participant != null && event.topic == "nuwax.voip.media-ready.v1" && event.data.size <= 256) {
                                     val payload = runCatching { JSONObject(String(event.data, Charsets.UTF_8)) }.getOrNull()
@@ -604,9 +621,9 @@ object VoipBridge {
                                     }
                                 }
                             }
-                            is RoomEvent.Reconnecting -> { reconnecting = true; emit("reconnecting") }
-                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected"); announceMediaReady() }
-                            is RoomEvent.ParticipantDisconnected -> if (business()) finish("remoteEnded", false)
+                            is RoomEvent.Reconnecting -> { reconnecting = true; emit("reconnecting"); observeRemotePresence(next, id, run) }
+                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected"); observeRemotePresence(next, id, run); announceMediaReady() }
+                            is RoomEvent.ParticipantDisconnected -> observeRemotePresence(next, id, run)
                             is RoomEvent.Disconnected -> if (!terminal.contains(id)) { finish("disconnected") }
                             else -> {}
                         }
@@ -614,16 +631,38 @@ object VoipBridge {
                 }
                 next.connect(credentials.getString("serverUrl"), credentials.getString("participantToken"))
                 if (room !== next || run != generation || terminal.contains(id)) { next.release(); return@launch }
+                observeRemotePresence(next, id, run)
                 // Android 14+: phoneCall alone does not grant microphone/camera foreground-service access.
                 withTimeout(5000) { while (!VoipCallService.enableCapture(camera && cameraVisible())) delay(50) }
                 next.localParticipant.setMicrophoneEnabled(microphone)
                 if (camera && cameraVisible()) next.localParticipant.setCameraEnabled(true)
                 connected = true; emit("connected"); refreshViews(); announceMediaReady()
                 if (business()) mediaJoined()
+                if (room !== next || run != generation || current?.optString("callId") != id) return@launch
                 maybeReady()
                 context?.let { VoipCallService.show(it, id) }
             } catch (_: Exception) { if (run == generation && !terminal.contains(id)) { finish("mediaFailed"); emit("error", "code", "CALL_MEDIA_FAILED") } }
         }
+    }
+    private fun observeRemotePresence(target: Room, id: String, run: Int) {
+        if (!business() || room !== target || run != generation || current?.optString("callId") != id) return
+        if (target.remoteParticipants.isNotEmpty()) {
+            everHadRemote = true; remoteLeftJob?.cancel(); remoteLeftJob = null; return
+        }
+        if (!everHadRemote || remoteLeftJob != null) return
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                while (room === target && run == generation && current?.optString("callId") == id) {
+                    delay(VoipCallPolicy.REMOTE_LEFT_GRACE_MS)
+                    if (target.remoteParticipants.isNotEmpty()) return@launch
+                    val recovering = reconnecting || target.state == Room.State.RECONNECTING
+                    if (VoipCallPolicy.shouldFinishRemoteLeft(everHadRemote, target.remoteParticipants.size, recovering, true)) {
+                        finish("remoteEnded", false); return@launch
+                    }
+                }
+            } finally { if (remoteLeftJob === coroutineContext[Job]) remoteLeftJob = null }
+        }
+        remoteLeftJob = job; job.start()
     }
     private fun maybeReady() { if (connected && peerReady && !readySent) {
         readySent = true; val id = current?.optString("callId"); val run = generation
@@ -685,6 +724,8 @@ object VoipBridge {
         }
     }
     private fun releaseMedia() {
+        remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
+        reconnecting = false
         val old = room; room = null
         for ((host, renderer) in renderers) { bindings[host]?.removeRenderer(renderer); renderer.release(); host.removeAllViews() }
         renderers.clear(); bindings.clear(); old?.release(); connected = false; peerReady = false; reconnecting = false

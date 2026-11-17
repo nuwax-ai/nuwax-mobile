@@ -20,6 +20,9 @@ import LiveKit
     private var business: Bool { configuration["protocol"] as? String == "im-voip-v1" }
     private var stream: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
+    private var remoteLeftTask: Task<Void, Never>?
+    private var remoteLeftToken: UUID?
+    private var everHadRemote = false
     private var mediaTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var reconnectWindow = NuwaxVoipReconnectWindow()
@@ -276,7 +279,8 @@ import LiveKit
         request.setValue(config["deviceId"] as? String, forHTTPHeaderField: "X-Call-Device-Id")
         if let body { request.httpMethod = "POST"; request.httpBody = try JSONSerialization.data(withJSONObject: body); request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let (data, response) = try await URLSession.shared.data(for: request)
-        if captured == nil, run == generation, (response as? HTTPURLResponse)?.statusCode == 401,
+        if captured == nil, run == generation, let status = (response as? HTTPURLResponse)?.statusCode,
+           NuwaxVoipCallPolicy.isAuthenticationFailure(status),
            config["accessToken"] as? String == configuration["accessToken"] as? String {
             invalidateSession("sessionExpired"); throw VoipError.invalid
         }
@@ -459,8 +463,20 @@ import LiveKit
         if call["callerId"] as? String == configuration["userId"] as? String {
             let result = try await request("/api/instant-message/messages", body: ["convId": wireString(call["convId"]), "deviceId": configuration["deviceId"] as? String ?? "", "clientMsgId": wireString(call["callId"]), "msgType": "voip", "body": ["callId": wireString(call["callId"]), "roomName": wireString(call["roomName"]), "mediaType": wireString(call["mediaType"])]], absolute: true, captured: settings)
             guard run == generation, snapshot?["callId"] as? String == call["callId"] as? String else { var late = call; late["msgId"] = wireString(result["msgId"]); notifyBusinessEnd(late, reason: "cancel", captured: settings); return }
-            if var next = snapshot { next["msgId"] = wireString(result["msgId"]); next["version"] = (next["version"] as? Int ?? 0) + 1; snapshot = next; emitSnapshot(next) }
-        } else { _ = try await request("/answered", body: businessBody(call)) }
+            if var next = snapshot {
+                let now = Date().timeIntervalSince1970 * 1000
+                next["msgId"] = wireString(result["msgId"]); next["version"] = (next["version"] as? Int ?? 0) + 1
+                next["expiresAt"] = NuwaxVoipCallPolicy.ringDeadline(sendTime: result["sendTime"] as? Double, acknowledgedAt: now)
+                if next["state"] as? String == "ringing", (next["expiresAt"] as? Double ?? 0) <= now { snapshot = next; finish("timeout"); return }
+                adopt(next)
+            }
+        } else {
+            do { _ = try await request("/answered", body: businessBody(call)) }
+            catch {
+                if Task.isCancelled { throw error }
+                if run == generation, snapshot?["callId"] as? String == call["callId"] as? String { trace("answer report unavailable; media retained") }
+            }
+        }
     }
     private func businessAction(_ action: String, media: String) async -> Bool {
         guard let call = snapshot else { return false }
@@ -479,8 +495,8 @@ import LiveKit
         let settings = captured ?? configuration
         guard !wireString(call["msgId"]).isEmpty, !["remoteEnded", "remoteCancelled", "answeredElsewhere", "sessionChanged"].contains(reason) else { return }
         let caller = call["callerId"] as? String == settings["userId"] as? String
-        if !caller && !NuwaxVoipCallPolicy.canDecline(reason: reason, state: wireString(call["state"])) { return }
-        guard let base = settings["apiBaseUrl"] as? String, let url = URL(string: base + prefix + (caller ? "/ended" : "/declined")) else { return }
+        guard let action = NuwaxVoipCallPolicy.businessEndAction(caller: caller, state: wireString(call["state"]), reason: reason),
+              let base = settings["apiBaseUrl"] as? String, let url = URL(string: base + prefix + "/" + action) else { return }
         var body = businessBody(call); if caller { body["reason"] = reason == "timeout" ? "timeout" : "cancel" }
         var request = URLRequest(url: url, timeoutInterval: 4); request.httpMethod = "POST"
         request.setValue("Bearer \(settings["accessToken"] as? String ?? "")", forHTTPHeaderField: "Authorization"); request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -495,6 +511,7 @@ import LiveKit
             if previous["callId"] as? String != id && previous["state"] as? String != "ended" { return }
             if previous["callId"] as? String == id && (previous["version"] as? Int ?? 0) >= (value["version"] as? Int ?? 0) { return }
         }
+        let previousPreparation = snapshot?["callId"] as? String == id ? snapshot?["prepareExpiresAt"] as? Double : nil
         let state = value["state"] as? String ?? ""
         if state == "ringing" && (value["expiresAt"] as? Double ?? 0) <= Date().timeIntervalSince1970 * 1000 { return }
         let ranks = ["ringing", "connecting", "active", "ended"]
@@ -505,12 +522,15 @@ import LiveKit
         if state == "ended" { finish(); return }
         expiryTask?.cancel(); expiryTask = nil
         if state == "ringing" || state == "connecting" {
-            let limit = state == "ringing" ? (business ? 60000.0 : 45000.0) : 30000.0
+            let preparing = business && state == "ringing" && value["callerId"] as? String == user && wireString(value["msgId"]).isEmpty
+            let limit = preparing || state == "connecting" ? 30000.0 : (business ? 60000.0 : 45000.0)
             let now = Date().timeIntervalSince1970 * 1000
-            let deadline = value[state == "ringing" ? "expiresAt" : "connectExpiresAt"] as? Double ?? (now + limit)
+            let deadline = preparing ? (previousPreparation ?? now + NuwaxVoipCallPolicy.prepareTimeout)
+                : (value[state == "ringing" ? "expiresAt" : "connectExpiresAt"] as? Double ?? (now + limit))
+            if preparing { snapshot?["prepareExpiresAt"] = deadline }
             expiryTask = Task { @MainActor in
                 do { try await Task.sleep(nanoseconds: UInt64(max(0, min(limit, deadline - now)) * 1_000_000)) } catch { return }
-                if self.snapshot?["callId"] as? String == id && self.snapshot?["state"] as? String == state { self.finish(state == "ringing" ? "timeout" : "connectionTimeout") }
+                if self.snapshot?["callId"] as? String == id && self.snapshot?["state"] as? String == state { self.finish(!preparing && state == "ringing" ? "timeout" : "connectionTimeout") }
             }
         }
         let caller = value["callerId"] as? String == user && value["callerDeviceId"] as? String == configuration["deviceId"] as? String
@@ -552,6 +572,7 @@ import LiveKit
     private func connectMedia(_ value: [String: Any]) {
         guard let id = value["callId"] as? String, id != mediaId else { return }
         mediaId = id; connected = false; peerReady = false; readySent = false
+        cancelRemoteLeft(); everHadRemote = false
         let run = generation
         mediaTask = Task { @MainActor in
             do {
@@ -564,6 +585,7 @@ import LiveKit
                 let next = Room(delegate: self); self.room = next
                 try await next.connect(url: credentials["serverUrl"] as? String ?? "", token: credentials["participantToken"] as? String ?? "")
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id, !self.terminal.contains(id) else { await next.disconnect(); return }
+                self.observeRemotePresence(next)
                 if #available(iOS 17.4, *), let system = self.systemBridge as? NuwaxSystemCalls {
                     system.mediaConnected(uuid: self.uuid(id))
                     for _ in 0..<100 {
@@ -599,6 +621,28 @@ import LiveKit
             readySent = true; let run = generation
             if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.peerMediaReady(uuid: uuid(id)) }
             Task { guard run == self.generation, self.snapshot?["callId"] as? String == id else { return }; _ = await self.action("ready") }
+        }
+    }
+    private func cancelRemoteLeft() {
+        remoteLeftToken = nil; remoteLeftTask?.cancel(); remoteLeftTask = nil
+    }
+    fileprivate func observeRemotePresence(_ target: Room) {
+        guard business, room === target, let id = snapshot?["callId"] as? String else { return }
+        if !target.remoteParticipants.isEmpty { everHadRemote = true; cancelRemoteLeft(); return }
+        guard everHadRemote, remoteLeftTask == nil else { return }
+        let token = UUID(), run = generation
+        remoteLeftToken = token
+        remoteLeftTask = Task { @MainActor in
+            defer { if self.remoteLeftToken == token { self.remoteLeftTask = nil; self.remoteLeftToken = nil } }
+            while !Task.isCancelled, self.room === target, run == self.generation, self.snapshot?["callId"] as? String == id {
+                do { try await Task.sleep(nanoseconds: NuwaxVoipCallPolicy.remoteLeftGrace) } catch { return }
+                guard !Task.isCancelled else { return }
+                if !target.remoteParticipants.isEmpty { return }
+                if NuwaxVoipCallPolicy.shouldFinishRemoteLeft(everHadRemote: self.everHadRemote, remoteCount: target.remoteParticipants.count,
+                    reconnecting: target.connectionState == .reconnecting || self.reconnectTask != nil, graceElapsed: true) {
+                    self.finish("remoteEnded", notifyRemote: false); return
+                }
+            }
         }
     }
     fileprivate func announceMediaReady() {
@@ -655,6 +699,7 @@ import LiveKit
         expiryTask?.cancel(); expiryTask = nil
         mediaTask?.cancel(); mediaTask = nil; mediaId = ""
         reconnectTask?.cancel(); reconnectTask = nil; reconnectWindow.cancel()
+        cancelRemoteLeft(); everHadRemote = false
         let old = room; room = nil; for item in views { item.view?.track = nil }
         audioActive = false; systemPaused = false; audioInterrupted = false
         try? AudioManager.shared.setEngineAvailability(.none)
@@ -879,7 +924,7 @@ import LiveKit
 
 extension NuwaxVoipBridge: RoomDelegate {
     public nonisolated func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
-        DispatchQueue.main.async { if self.room === room { self.announceMediaReady() } }
+        DispatchQueue.main.async { if self.room === room { self.everHadRemote = true; self.observeRemotePresence(room); self.announceMediaReady() } }
     }
     public nonisolated func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
         guard participant != nil else { return }
@@ -890,19 +935,20 @@ extension NuwaxVoipBridge: RoomDelegate {
         }
     }
     public nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
-        DispatchQueue.main.async { if self.room === room && self.business { self.finish("remoteEnded", notifyRemote: false) } }
+        DispatchQueue.main.async { self.observeRemotePresence(room) }
     }
     public nonisolated func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
         DispatchQueue.main.async { guard self.room === room else { return }; self.refreshViews()
             if publication.track is AudioTrack { self.peerReady = true; self.emit("peerMediaReady"); self.maybeReady() } }
     }
     public nonisolated func room(_ room: Room, didStartReconnectWithMode reconnectMode: ReconnectMode) {
-        DispatchQueue.main.async { self.beginReconnect(room) }
+        DispatchQueue.main.async { self.beginReconnect(room); self.observeRemotePresence(room) }
     }
     public nonisolated func room(_ room: Room, didCompleteReconnectWithMode reconnectMode: ReconnectMode) {
         DispatchQueue.main.async { if self.room === room {
             self.reconnectTask?.cancel(); self.reconnectTask = nil; self.reconnectWindow.cancel()
             self.emit("connected"); self.announceMediaReady()
+            self.observeRemotePresence(room)
         } }
     }
     public nonisolated func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {

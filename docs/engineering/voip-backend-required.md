@@ -1,5 +1,7 @@
 # VoIP 正式后端待配合清单
 
+统一实施入口已更新为 [VoIP 交付清单](voip-delivery-plan.md)。iOS 的 APNs VoIP 投递优先复用既有 UniPush／个推真正的 VoIP 分支，不要求为此独立部署 APNs 服务；但当前应用的绑定、环境、VoIP topic 与厂商直投仍须核实和实投。电话设备隔离契约可扩展现有接口等价实现，不能省略。PC 对齐 D1–D4 的客户端修补不包含后端部署或生产配置变更。
+
 ## 2026-11-17 再核对：iOS 无进程来电仍为 P0
 
 不需要单独部署一套 APNs／呼叫服务。可扩展现有 IM 与 UniPush `push-send`，利用官方 `options.ios.type=voip`；还须补原生 PushKit token→个推绑定、电话设备归属、有效邀请触发及 iOS 厂商直投能力。IM 可复用 CID 路由而不重复存原始 token，不能省略登录／撤销隔离。逐项增量与待交付的测试部署版本见 [UniPush 闭环跟进](voip-ios-cold-start-followup.md)。原有直连 APNs 作为另一种发送适配器保留，本轮没有自动切换 provider 或部署。

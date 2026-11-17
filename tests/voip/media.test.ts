@@ -1,10 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const fake = vi.hoisted(() => ({ rooms: [] as any[] }));
 vi.mock('livekit-client', () => ({
-  RoomEvent: { TrackSubscribed: 'subscribed', TrackUnsubscribed: 'unsubscribed', ParticipantConnected: 'participant', DataReceived: 'data', Reconnecting: 'reconnecting', Reconnected: 'reconnected', AudioPlaybackStatusChanged: 'audio', Disconnected: 'disconnected' },
+  RoomEvent: { TrackSubscribed: 'subscribed', TrackUnsubscribed: 'unsubscribed', ParticipantConnected: 'participant', ParticipantDisconnected: 'left', DataReceived: 'data', Reconnecting: 'reconnecting', Reconnected: 'reconnected', AudioPlaybackStatusChanged: 'audio', Disconnected: 'disconnected' },
+  ConnectionState: { Reconnecting: 'reconnecting', Connected: 'connected' },
   Track: { Source: { Camera: 'camera', Microphone: 'microphone' }, Kind: { Audio: 'audio', Video: 'video' } },
   Room: class {
     resolve!: () => void;
+    state = 'connected'; remoteParticipants = new Map();
     on = vi.fn(); disconnect = vi.fn(async () => {});
     localParticipant = { setMicrophoneEnabled: vi.fn(async () => {}), setCameraEnabled: vi.fn(async () => {}), getTrackPublication: vi.fn(), publishData: vi.fn(async () => {}) };
     constructor() { fake.rooms.push(this); }
@@ -12,6 +14,7 @@ vi.mock('livekit-client', () => ({
   },
 }));
 beforeEach(() => { fake.rooms.length = 0; vi.stubGlobal('document', { documentElement: { dataset: {} } }); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 async function media() {
   const { createMediaEngine } = await import('../../scripts/voip-dev/media.mjs');
   const events: any[] = [];
@@ -87,6 +90,54 @@ describe('media bridge lifetime', () => {
     await engine.execute({ op: 'background', hidden: true }); fake.rooms[0].resolve(); await pending;
     expect(fake.rooms[0].localParticipant.setMicrophoneEnabled).toHaveBeenCalledWith(false);
     expect(fake.rooms[0].localParticipant.setCameraEnabled).not.toHaveBeenCalledWith(true);
+    await engine.execute({ op: 'disconnect' });
+  });
+});
+
+describe('business-call remote departure protection', () => {
+  async function connected() {
+    vi.useFakeTimers();
+    const result = await media();
+    const pending = result.engine.execute({ op: 'connect', callId: 'call', protocol: 'im-voip-v1', mediaType: 'audio' });
+    await vi.waitFor(() => expect(fake.rooms).toHaveLength(1));
+    const room = fake.rooms[0]; room.resolve(); await pending;
+    const emit = (event: string) => room.on.mock.calls.find(([type]: any[]) => type === event)[1]();
+    return { ...result, room, emit };
+  }
+  it('does not end a call while its peer disappears and returns during full reconnect', async () => {
+    const { engine, events, room, emit } = await connected();
+    room.remoteParticipants.set('peer', {}); emit('participant');
+    room.remoteParticipants.clear(); room.state = 'reconnecting'; emit('left'); emit('reconnecting');
+    await vi.advanceTimersByTimeAsync(6500);
+    expect(events.some(e => e.type === 'remoteEnded' || e.type === 'disconnected')).toBe(false);
+    room.remoteParticipants.set('peer', {}); room.state = 'connected'; emit('reconnected');
+    await vi.advanceTimersByTimeAsync(3500);
+    expect(events.some(e => e.type === 'remoteEnded')).toBe(false);
+    await engine.execute({ op: 'disconnect' });
+  });
+  it('ends a real departure after one grace period, without extending it for duplicate events', async () => {
+    const { engine, events, room, emit } = await connected();
+    room.remoteParticipants.set('peer', {}); emit('participant'); room.remoteParticipants.clear(); emit('left');
+    await vi.advanceTimersByTimeAsync(1000); emit('left');
+    await vi.advanceTimersByTimeAsync(1999); expect(events.some(e => e.type === 'remoteEnded')).toBe(false);
+    await vi.advanceTimersByTimeAsync(1); expect(events.filter(e => e.type === 'remoteEnded')).toHaveLength(1);
+    await engine.execute({ op: 'disconnect' });
+  });
+  it('does not classify an initially empty room as a peer hanging up', async () => {
+    const { engine, events, emit } = await connected(); emit('left');
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(events.some(e => e.type === 'remoteEnded')).toBe(false);
+    emit('disconnected'); expect(events.filter(e => e.type === 'disconnected')).toHaveLength(1);
+    await engine.execute({ op: 'disconnect' });
+  });
+  it('cancels the previous call grace timer when a new call replaces it', async () => {
+    const { engine, events, room, emit } = await connected();
+    room.remoteParticipants.set('peer', {}); emit('participant'); room.remoteParticipants.clear(); emit('left');
+    const next = engine.execute({ op: 'connect', callId: 'replacement', protocol: 'im-voip-v1', mediaType: 'audio' });
+    await vi.waitFor(() => expect(fake.rooms).toHaveLength(2)); fake.rooms[1].resolve(); await next;
+    emit('left'); await vi.advanceTimersByTimeAsync(4000);
+    expect(events.some(e => e.type === 'remoteEnded')).toBe(false);
+    expect(engine.room()).toBe(fake.rooms[1]);
     await engine.execute({ op: 'disconnect' });
   });
 });

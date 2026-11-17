@@ -539,6 +539,15 @@ object VoipBridge {
         val call = current ?: return
         val incoming = call.optString("state") == "ringing" && call.optString("calleeId") == config.optString("userId")
         if (!incomingNotifications.publish(call.optString("callId"), incoming)) return
+        if (incoming && Build.VERSION.SDK_INT >= 31) {
+            // Ringing is a call invitation, not an ongoing foreground-service notification.
+            // Telecom already grants foreground execution while owning this call. Start our
+            // microphone/camera foreground service only after the user answers. Keep
+            // the FGS association on older Android versions for CallStyle ranking.
+            try { NotificationManagerCompat.from(ctx).notify(9090, notification(ctx)); trace("incoming call notification posted") }
+            catch (_: Exception) { incomingNotifications.reset(); trace("incoming call notification failed") }
+            return
+        }
         try { VoipCallService.show(ctx, call.optString("callId")) }
         catch (_: IllegalStateException) {
             // Core-Telecom on Android 14+ can keep a notified call alive via its own
@@ -791,7 +800,9 @@ object VoipBridge {
     }
 
     internal fun notification(ctx: Context): Notification {
-        VoipNotificationChannels.ensure(ctx, config.optString("callLabel", "Nuwax"), config.optString("callLabel", "Nuwax") + " · " + label("incoming"))
+        VoipNotificationChannels.ensure(ctx,
+            config.optString("ongoingNotificationLabel").ifEmpty { VoipNotificationChannels.resourceLabel(ctx, "nuwax_voip_ongoing_channel") },
+            config.optString("incomingNotificationLabel").ifEmpty { VoipNotificationChannels.resourceLabel(ctx, "nuwax_voip_incoming_channel") })
         val s = current ?: JSONObject()
         val incoming = s.optString("state") == "ringing" && s.optString("calleeId") == config.optString("userId")
         fun intent(action: String): PendingIntent = PendingIntent.getBroadcast(ctx, action.hashCode(), Intent(ctx, VoipActionReceiver::class.java)
@@ -808,12 +819,14 @@ object VoipBridge {
             .setContentTitle(person.name).setContentText(if (s.optString("state") == "active") config.optString("callLabel", "Nuwax")
                 else label(if (incoming) "incoming" else if (s.optString("state") == "ringing") "dialing" else "connecting"))
             .setCategory(NotificationCompat.CATEGORY_CALL).setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_ALL)
             .setPriority(NotificationCompat.PRIORITY_MAX).setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setOngoing(true).setOnlyAlertOnce(!incoming).setStyle(style)
         if (incoming) builder.setFullScreenIntent(content, true)
         else builder.setSilent(true)
         return builder.build().also {
             if (incoming) it.flags = it.flags or Notification.FLAG_INSISTENT
+            trace("call notification fullscreenIntent=" + (it.fullScreenIntent != null) + ", groupAlertBehavior=" + it.groupAlertBehavior + ", flags=" + it.flags)
             trace("call notification incoming=" + incoming + ", presentation=" + presentationStatus(ctx))
         }
     }

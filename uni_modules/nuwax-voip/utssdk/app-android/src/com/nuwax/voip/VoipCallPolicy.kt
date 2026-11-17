@@ -3,10 +3,10 @@ package com.nuwax.voip
 /** Business policy, independent from Telecom/media, and executable on the JVM. */
 internal object VoipCallPolicy {
     /** Null userSetSound means pre-30: preserve the existing choice when it cannot be inspected. */
-    fun incomingSound(legacyExists: Boolean, legacySound: String?, userSetSound: Boolean?,
-                      defaultNotification: String, defaultRingtone: String?): String? =
-        if (legacyExists && (legacySound == null || legacySound != defaultNotification || userSetSound != false)) legacySound
-        else defaultRingtone
+    fun invitationSound(previousExists: Boolean, previousSound: String?, userSetSound: Boolean?,
+                        oldDefaults: Set<String>, bundledSound: String): String? =
+        if (!previousExists || (userSetSound == false && previousSound in oldDefaults)) bundledSound
+        else previousSound
 
     fun originAllowed(fixedOrigin: String?, origin: String): Boolean = fixedOrigin.isNullOrEmpty() || fixedOrigin == origin
 

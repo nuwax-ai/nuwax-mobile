@@ -11,10 +11,14 @@ object VoipCallPolicyTest {
         println("8 Kotlin call policy cases passed")
     }
     private fun incomingSoundHonorsSilenceAndExplicitChoices() {
-        val notification = "default-notification"; val ringtone = "default-ringtone"
-        fun sound(exists: Boolean, old: String?, chosen: Boolean?) = VoipCallPolicy.incomingSound(exists, old, chosen, notification, ringtone)
-        check(sound(false, null, null) == ringtone)
-        check(sound(true, notification, false) == ringtone)
+        val notification = "default-notification"; val ringtone = "default-ringtone"; val bundled = "bundled-ringtone"
+        fun sound(exists: Boolean, old: String?, chosen: Boolean?) =
+            VoipCallPolicy.invitationSound(exists, old, chosen, setOf(notification, ringtone), bundled)
+        check(sound(false, null, null) == bundled)
+        check(sound(true, notification, false) == bundled)
+        check(sound(true, ringtone, false) == bundled)
+        check(sound(true, ringtone, true) == ringtone)
+        check(sound(true, ringtone, null) == ringtone)
         check(sound(true, notification, true) == notification)
         check(sound(true, notification, null) == notification) // old OS cannot inspect user choice
         check(sound(true, "custom", false) == "custom")

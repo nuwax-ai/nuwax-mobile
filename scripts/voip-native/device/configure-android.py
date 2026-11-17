@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from configure_unipush import ANDROID, configure
+from android_resources import configure_resources
 
 LISTENER = "com.nuwax.voip.VoipDevControlService"
 MARKER = "nuwax.voip.deviceTest"
@@ -83,4 +84,5 @@ if __name__ == "__main__":
     configure_test_host(project, enabled)
     configure(project, Path(config_path) if config_path else None)
     qa_path = os.environ.get("NUWAX_ANDROID_QA_PROJECT")
+    configure_resources(project, Path(qa_path) if qa_path else Path(__file__).resolve().parents[3])
     configure_qa_manifest(project, Path(qa_path) if qa_path else None)

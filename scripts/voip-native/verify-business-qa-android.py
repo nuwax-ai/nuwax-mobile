@@ -10,6 +10,9 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts/voip-native/device"))
+from android_resources import RESOURCE_PATH, localized_labels
+
 QA = ROOT / "out/voip-business-qa-project"
 SDK = ROOT / "out/voip-native-work/android"
 PROJECT, = SDK.glob("Android-uni-app-x-SDK@*-5.34/uniappxnativepackage")
@@ -40,6 +43,10 @@ assert f"versionCode='{manifest['versionCode']}'" in badging
 assert f"versionName='{manifest['versionName']}'" in badging
 assert f"application-label:'{manifest['name']}'" in badging
 xml = run(tools / "aapt", "dump", "xmltree", APK, "AndroidManifest.xml")
+resources = run(tools / "aapt", "dump", "--values", "resources", APK)
+for label in ["nuwax_voip_incoming_channel", "nuwax_voip_ongoing_channel", "音视频通话邀请通知", "通话状态",
+              "Audio and video call invitations", "音視訊通話邀請通知", "音視像通話邀請通知"]:
+    assert label in resources, f"Missing native notification translation: {label}"
 assert "nuwax.voip.qaApiOrigin" in xml and ORIGIN in xml
 assert "com.nuwax.voip.VoipUniPushIntentService" in xml
 assert "com.igexin.sdk.HonorPushMessageService" in xml and "com.igexin.sdk.HmsPushMessageService" in xml
@@ -52,6 +59,7 @@ assert 'return supported && getApiBaseUrl() == "https://testagent.xspaceagi.com"
 
 with zipfile.ZipFile(APK) as archive:
     assert archive.testzip() is None
+    assert archive.read("res/raw/nuwax_voip_ring.wav") == (ROOT / RESOURCE_PATH / "raw/nuwax_voip_ring.wav").read_bytes(), "Missing or stale bundled ringtone"
     assert not any(re.search(r"\.(p8|p12|jks|keystore|mobileprovision)$|local-secrets\.env", name, re.I) for name in archive.namelist())
     assets = QA / "unpackage/resources/app-android/__UNI__8BF05E4/www"
     count = 0
@@ -63,7 +71,7 @@ with zipfile.ZipFile(APK) as archive:
     assert count > 100
     dex = b"".join(archive.read(name) for name in archive.namelist() if re.fullmatch(r"classes[0-9]*\.dex", name))
     for value in [ORIGIN, "Lcom/nuwax/voip/VoipBridge;", "Lcom/igexin/sdk/HonorPushMessageService;", "Lcom/igexin/sdk/HmsPushMessageService;",
-                  "nuwax-voip-incoming-v1", "nuwax-voip-ongoing-v1"]:
+                  "nuwax-voip-incoming-v2", "nuwax-voip-ongoing-v1"]:
         assert value.encode() in dex, f"Missing compiled implementation: {value}"
     assert b"Lio/dcloud/debug/" not in dex, "HX debug server is bundled"
 
@@ -72,13 +80,17 @@ for path in native.glob("*.kt"):
     assert path.read_bytes() == (PROJECT / "uts-nuwax-voip/src/main/java/com/nuwax/voip" / path.name).read_bytes(), f"Stale native source: {path.name}"
 receiver = ROOT / "uni_modules/nuwax-voip/native/android-unipush/VoipUniPushIntentService.kt"
 assert receiver.read_bytes() == (PROJECT / "app/src/main/java/com/nuwax/voip" / receiver.name).read_bytes()
+for path, data in localized_labels(ROOT).items():
+    assert (ROOT / RESOURCE_PATH / path).read_bytes() == data
+    assert (PROJECT / "uts-nuwax-voip/src/main/res" / path).read_bytes() == data
 variant = json.loads((QA / "nuwax-local-qa.json").read_text())
 result = {**variant, "platform": "android", "packageName": "com.nuwax.app", "versionName": manifest["versionName"],
           "versionCode": str(manifest["versionCode"]), "apk": str(APK), "sha256": sha(APK.read_bytes()),
           "certificateSha256": cert, "bundledResourceCount": count, "hxDebugServer": False,
           "developmentListener": False, "uniPushVendorAdapters": ["huawei", "honor"], "installed": False,
-          "incomingNotificationChannel": "nuwax-voip-incoming-v1", "ongoingNotificationChannel": "nuwax-voip-ongoing-v1",
-          "notificationFixes": ["systemRingtoneAudioAttributes", "insistentIncomingOnly", "deduplicatedIncomingPublication", "silentCallProgress", "presentationDiagnostics"],
+          "incomingNotificationChannel": "nuwax-voip-incoming-v2", "incomingNotificationLabel": "音视频通话邀请通知",
+          "ongoingNotificationChannel": "nuwax-voip-ongoing-v1", "bundledRingtone": "res/raw/nuwax_voip_ring.wav",
+          "notificationFixes": ["bundledRingtoneAudioAttributes", "preservedUserSoundChoices", "insistentIncomingOnly", "deduplicatedIncomingPublication", "silentCallProgress", "ringingWithoutOwnForegroundServiceOnAndroid12Plus", "presentationDiagnostics"],
           "deviceAcceptance": "pending; lock screen and all-processes-absent wake require real-device evidence"}
 Path(str(APK) + ".json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 Path(str(APK) + ".sha256").write_text(result["sha256"] + "  " + APK.name + "\n")

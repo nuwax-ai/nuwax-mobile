@@ -34,3 +34,46 @@ print('QA host origin isolation verified')
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
   expect(result).toContain('QA host origin isolation verified');
 });
+
+it('packages a playable bundled ringtone and four localized channel names, and rejects stale translations', () => {
+  const result = execFileSync('python3', ['-c', `
+import array, math, shutil, sys, tempfile, wave
+from pathlib import Path
+import xml.etree.ElementTree as ET
+sys.path.insert(0, sys.argv[1])
+from android_resources import RESOURCE_PATH, LOCALES, configure_resources, localized_labels
+source = Path(sys.argv[2])
+with wave.open(str(source/RESOURCE_PATH/'raw/nuwax_voip_ring.wav')) as audio:
+    assert (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getnframes()) == (1, 2, 22050, 88200)
+    samples = array.array('h', audio.readframes(audio.getnframes()))
+    if sys.byteorder != 'little': samples.byteswap()
+    assert max(map(abs, samples)) < 32767
+    assert math.sqrt(sum(sample*sample for sample in samples)/len(samples)) > 500
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory); project = root/'build'; fixture = root/'source'
+    (project/'uts-nuwax-voip/src/main').mkdir(parents=True)
+    shutil.copytree(source/RESOURCE_PATH, fixture/RESOURCE_PATH)
+    shutil.copytree(source/'constants/i18n-locales', fixture/'constants/i18n-locales')
+    configure_resources(project, fixture)
+    native = project/'uts-nuwax-voip/src/main/res'
+    assert (native/'raw/nuwax_voip_ring.wav').read_bytes() == (source/RESOURCE_PATH/'raw/nuwax_voip_ring.wav').read_bytes()
+    before = {str(path): path.read_bytes() for path in native.rglob('*') if path.is_file()}
+    configure_resources(project, fixture)
+    assert before == {str(path): path.read_bytes() for path in native.rglob('*') if path.is_file()}
+    assert len(localized_labels(fixture)) == len(LOCALES) == 4
+    chinese = ET.parse(native/'values-zh-rCN/nuwax_voip.xml').getroot()
+    assert chinese.find("string[@name='nuwax_voip_incoming_channel']").text == '"音视频通话邀请通知"'
+    assert chinese.find("string[@name='nuwax_voip_ongoing_channel']").text == '"通话状态"'
+    (fixture/RESOURCE_PATH/'values-zh-rCN/nuwax_voip.xml').write_text('<resources/>')
+    try: configure_resources(project, fixture)
+    except ValueError as error: assert 'Stale' in str(error)
+    else: raise AssertionError('Stale native labels must fail packaging')
+    (fixture/'constants/i18n-locales/zh-cn.uts').write_text('export const I18N_ZH_CN = {}')
+    try: localized_labels(fixture)
+    except ValueError as error: assert 'Expected one translation' in str(error)
+    else: raise AssertionError('Missing canonical labels must fail packaging')
+print('Native notification resources verified')
+`, resolve(import.meta.dirname, '../../scripts/voip-native/device'), resolve(import.meta.dirname, '../..')],
+    { encoding: 'utf8', timeout: 10_000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
+  expect(result).toContain('Native notification resources verified');
+});

@@ -25,6 +25,14 @@ IPA：`out/voip-business-packages/Nuwax-VoIP-Test-20261117-113500.ipa`，67,616,
 
 证据在忽略目录 `out/voip-ios-delivery-20261117/`：最终 VoIP/Swift/全仓测试、HEAD 失败案例对照、HBuilderX 导出、iOS 编译/签名日志、实际 IPA 归档 CRC/环境/设备覆盖校验；逐资源和原生来源核对在 `out/voip-ios-audit-20261117/ipa-verification.json`。签名材料只在统一 `nuwax-signing` 目录维护。
 
+### 15:15 iPhone 16 覆盖安装与启动核对
+
+按用户要求将上述同一 IPA 覆盖安装到 LLD16（iPhone 16），设备回读确认 `com.nuwax.app`、女娲Nuwax、1.3.6（136），安装回执成功。首次启动被锁屏拒绝；用户解锁后启动成功，进程回读确认存活。本次仅安装与启动，没有发起新通话。
+
+发现该手机仍保留 11 月 16 日 HBuilderX 的开发页面代码缓存；先备份旧 `www`，再只将 `Documents/uni-app-x/apps/__UNI__8BF05E4/www` 替换为本 IPA 内置资源，没有卸载、清数据或操作相邻 `wxstorage`。设备回读的 `app-service.js`（6,697,428 字节）与 IPA 内文件 SHA-256 完全相同，测试环境配置随本次资源生效。此操作不涉及生产配置或 APNs 发送。
+
+安装、启动、版本、资源回读及进程证据位于忽略目录 `out/voip-ios-install-20261117/`。ZQ 设备尚未接入、未安装；待同事接到这台 Mac 后使用同一 IPA。启动通过不作为前后台接打、冷唤醒或双向媒体验收。
+
 ## 2026-11-17 早前 iOS 产品流程静态检查阶段
 
 按用户要求先完成逻辑和完整产品检查，暂停配合拨号与手机设置操作。[检查报告](voip-ios-product-readiness.md)覆盖首次安装/登录、前台、后台、锁屏、挂起、系统回收无进程、重启首次解锁前后、主动强退、凭据失效及系统过滤；逐项列出客户端修正、产品缺口和后端前置。

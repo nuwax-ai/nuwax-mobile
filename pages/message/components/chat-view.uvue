@@ -2601,8 +2601,12 @@
     if (e.touches.length == 0) {
       return;
     }
-    pageTouchStartX = e.touches[0].clientX;
-    pageTouchStartY = e.touches[0].clientY;
+    // Stage 会在手势过程中直接平移整棵会话树。Android 原生渲染下 clientX/clientY
+    // 偶尔会按当前节点（已被 transform）的局部坐标回传，页面一移动，下一帧坐标基准也
+    // 跟着变，形成轻微的正反馈抖动。screenX/screenY 始终以物理屏幕为基准，手势全程
+    // 统一使用它；iOS/H5 同一根触点内也保持等价。
+    pageTouchStartX = e.touches[0].screenX;
+    pageTouchStartY = e.touches[0].screenY;
     stageSwipeDistance = 0;
     stageSwipeStartedAt = Date.now();
     stageSwipeTracking = false;
@@ -2619,8 +2623,8 @@
     const e = eventValue as UniTouchEvent;
     if (e.touches.length == 0) return;
     const touch = e.touches[0];
-    const dx = touch.clientX - pageTouchStartX;
-    const dy = touch.clientY - pageTouchStartY;
+    const dx = touch.screenX - pageTouchStartX;
+    const dy = touch.screenY - pageTouchStartY;
     // 横向判据只用来在**起手前**筛掉误滑，且只 return 不 reset：
     //  · Android 起手的第一个 move 常是 dx=0/dy=0（实测偶发），紧接着原生列表就派 cancel；
     //    清掉 candidate 等于把 cancel→touchend 的补判一起废掉。
@@ -2635,10 +2639,17 @@
       return;
     }
     const distance = Math.max(0, -dy);
-    // ★坐标系跳变过滤：overscroll 拉伸期间，同一手势的 clientY 会在「屏幕坐标」与「内容坐标」
-    // （= 屏幕坐标 − 拉伸量）两套基准间交替，后者算出的距离恒 ≈0，父层卡片就会在 198 与 0
-    // 之间来回跳（真机实测）。单帧位移不可能超过 100px（实测跳变 145~198px），超出即判为跳变样本，
-    // 直接忽略这一帧——卡片最多顿一下，不会再抖。跟手前的样本不过滤（那时拉伸还没起来）。
+    // #ifdef APP-ANDROID
+    // 已在列表底部且纵向上滑意图成立时，Stage 接管本轮手势；阻止原生 scroll-view
+    // 继续尝试滚动/派生 overscroll。否则列表与外层 Stage 会在同一帧各改一次视觉位置，
+    // 即使 overscroll mode 已关闭也会留下细小抖动。
+    if (distance > 0 && Math.abs(dx) <= distance * HORIZONTAL_RATIO) {
+      e.preventDefault();
+    }
+    // #endif
+    // ★异常样本过滤：screenY 已避免 transform/滚动造成的局部坐标漂移；仍保留大跳变
+    // 防线，兼容少数设备在原生手势接管边界回传的陈旧触点。单帧位移不可能超过 100px
+    // （实测异常幅度 145~198px），超出就忽略这一帧。
     if (stageSwipeTracking && Math.abs(distance - stageSwipeDistance) > 100) {
       return;
     }
@@ -2658,8 +2669,8 @@
       return;
     }
     const t = e.changedTouches[0];
-    const dx = t.clientX - pageTouchStartX;
-    const dy = t.clientY - pageTouchStartY;
+    const dx = t.screenX - pageTouchStartX;
+    const dy = t.screenY - pageTouchStartY;
     // Android：本次手势 mid-move 可能已被原生列表吃掉（见 handlePageTouchCancel），这里拿最终
     // 位移补判。不依赖 cancel 是否来过（个别机型连 cancel 都不派）；只要「贴底判定通过 + 从未
     // 跟手 + 最终位移够」，在已贴底的列表上就只可能是一次上滑退出。
@@ -2724,9 +2735,9 @@
       const e = eventValue as UniTouchEvent;
       let distance = stageSwipeDistance;
       if (e.changedTouches != null && e.changedTouches.length > 0) {
-        distance = Math.max(distance, Math.max(0, pageTouchStartY - e.changedTouches[0].clientY));
+        distance = Math.max(distance, Math.max(0, pageTouchStartY - e.changedTouches[0].screenY));
       } else if (e.touches.length > 0) {
-        distance = Math.max(distance, Math.max(0, pageTouchStartY - e.touches[0].clientY));
+        distance = Math.max(distance, Math.max(0, pageTouchStartY - e.touches[0].screenY));
       }
       if (distance >= 8) {
         if (!stageSwipeTracking) emit("stage-swipe-start");
@@ -7533,6 +7544,19 @@
     // 滚底跟进窗口（见 bottomFollowUntilTs）：窗口内的距底余量不算「有消息没看到」
     bottomFollowUntilTs = Date.now() + 700;
     scrollToAnchorWithSettle("chat-bottom");
+  }
+
+  /** Stage 下拉真正提交前归位：后台预加载页若误收了 Android 原生触摸，必须在揭幕前
+   *  回到最新消息。只供 pullEntry 调用，不影响普通会话从搜索/文件页返回时保留阅读位置。 */
+  function preparePullEntryCommit(): void {
+    if (!pullEntryDialog) return;
+    entryFollowLatest = true;
+    showJumpLatest.value = false;
+    scrollToBottom();
+    // 原生 scroll-view 的触摸收尾可能晚于当前 JS 回调一拍；补一次仍走统一锚点稳定器。
+    setTimeout((): void => {
+      if (pullEntryDialog && isChatActive()) scrollToBottom();
+    }, 32);
   }
 
   /** 浮钮点击：滚到最新消息并藏钮（定位被抢/失败时滚动事件会再探测复位）。 */
@@ -15944,6 +15968,7 @@
     onPageReady: onPageReady as any,
     onPageUnload: onPageUnload as any,
     onPageBackPress: onPageBackPress as any,
+    preparePullEntryCommit: preparePullEntryCommit as any,
   });
 </script>
 

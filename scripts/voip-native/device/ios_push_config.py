@@ -50,6 +50,31 @@ def verify_signed_push(info, entitlements):
         raise ValueError('Signed App identifier differs from its bundle ID')
 
 
+def has_native_launch_restore(disassembly):
+    import re
+    method = re.search(r'(?ms)^-\[AppDelegate application:didFinishLaunchingWithOptions:\]:\n(.*?)(?=^\S[^\n]*:\n|\Z)', disassembly)
+    return bool(method and 'NuwaxVoipBridge' in method[1]
+                and re.search(r'\bbl\s+[^\n]*_objc_msgSend\$restoreOnLaunch\b', method[1]))
+
+
+def verify_native_launch_restore(app, info):
+    """Inspect code in the signed host, including Xcode's loaded debug companion."""
+    binary = app / info['CFBundleExecutable']
+    linked = subprocess.run(['otool', '-L', str(binary)], capture_output=True, text=True, check=True).stdout
+    candidates = [binary]
+    companion = binary.with_name(binary.name + '.debug.dylib')
+    if '@rpath/' + companion.name in linked:
+        if not companion.is_file():
+            raise ValueError('Signed host is missing its loaded debug companion')
+        candidates.append(companion)
+    for candidate in candidates:
+        code = subprocess.run(['xcrun', 'llvm-objdump', '--macho', '--disassemble', '--symbolize-operands', str(candidate)],
+                              capture_output=True, text=True, check=True).stdout
+        if has_native_launch_restore(code):
+            return
+    raise ValueError('Signed business AppDelegate does not call the native VoIP launch restore hook')
+
+
 def verify_business_qa(app, info, project):
     import json
     metadata = json.loads((Path(project) / 'nuwax-local-qa.json').read_text())
@@ -91,6 +116,8 @@ if __name__ == '__main__':
         raise ValueError('Cannot read signed App entitlements')
     info = plistlib.loads((app / 'Info.plist').read_bytes())
     verify_signed_push(info, plistlib.loads(result.stdout))
+    if not info.get('NuwaxVoipDeviceTest'):
+        verify_native_launch_restore(app, info)
     if os.environ.get('NUWAX_IOS_QA_PROJECT'):
         verify_business_qa(app, info, os.environ['NUWAX_IOS_QA_PROJECT'])
     print('Signed APNs VoIP metadata verified (no installation or upload)')

@@ -36,6 +36,7 @@ import LiveKit
     private struct PendingPush { let invitation: NuwaxVoipPushInvitation; var declined = false }
     private var pendingPushes: [UUID: PendingPush] = [:]
     private var pendingPushExpiry: [UUID: Task<Void, Never>] = [:]
+    private var pushWork: [UUID: NuwaxVoipPushWork] = [:]
     private var pushRegistration: NuwaxVoipApnsRegistration?
     private var systemBridge: AnyObject?
     #if DEBUG
@@ -244,6 +245,7 @@ import LiveKit
             return try await self.request("/devices", body: body, captured: settings)
         }, changed: { [weak self] state, ready in
             guard let self, run == self.generation else { return }
+            self.trace("PushKit registration state=\(state) senderReady=\(ready)")
             self.emit("pushRegistration", ["provider": "apns", "state": state, "nativePush": ready])
         })
         persist()
@@ -682,6 +684,7 @@ import LiveKit
         closeServerCall()
         generation += 1; imSocket?.cancel(with: .goingAway, reason: nil); imSocket = nil; stream?.cancel(); stream = nil; finish("sessionChanged")
         pushRegistration?.stop(revoke: true); pushRegistration = nil
+        for work in Array(pushWork.values) { work.cancel() }; pushWork = [:]
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
         pushRegistry?.desiredPushTypes = []; pushRegistry = nil
         if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.invalidate() }
@@ -854,10 +857,7 @@ import LiveKit
         var stored = configuration; stored["systemUUIDs"] = callUUIDs.mapValues { $0.uuidString }
         stored["terminalCallIds"] = terminalOrder
         guard let data = try? JSONSerialization.data(withJSONObject: stored) else { return }
-        let query = [kSecClass: kSecClassGenericPassword, kSecAttrService: service] as [CFString: Any]
-        SecItemDelete(query as CFDictionary)
-        var item = query; item[kSecValueData] = data; item[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        if SecItemAdd(item as CFDictionary, nil) != errSecSuccess { emit("error", ["code": "CALL_SECURE_STORAGE_FAILED"]) }
+        if !NuwaxVoipSessionStorage.write(data, service: service) { emit("error", ["code": "CALL_SECURE_STORAGE_FAILED"]) }
     }
     private func rememberTerminal(_ id: String) {
         let previous = terminal
@@ -870,8 +870,10 @@ import LiveKit
         guard configuration.isEmpty, UserDefaults.standard.bool(forKey: "nuwax-voip-install-session") else { return }
         var result: CFTypeRef?
         let query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]
-        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data,
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecSuccess, let data = result as? Data,
            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { trace("native session restored"); initialize(config) }
+        else { trace("native session unavailable status=\(status)") }
     }
 }
 
@@ -945,6 +947,7 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             let run = generation
             let invitation = NuwaxVoipPushInvitation(payload.dictionaryPayload, userId: configuration["userId"] as? String ?? "", business: business, now: Date().timeIntervalSince1970 * 1000)
             let systemUUID = invitation.map { uuid($0.callId) } ?? UUID()
+            trace("PushKit received callId=\(invitation?.callId ?? "invalid") systemUUID=\(systemUUID.uuidString)")
             let system = (systemBridge as? NuwaxSystemCalls) ?? NuwaxSystemCalls(owner: self)
             systemBridge = system
             let duplicate = pendingPushes[systemUUID] != nil
@@ -952,43 +955,87 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                 pendingPushes[systemUUID] = PendingPush(invitation: invitation)
                 expirePendingPush(systemUUID, invitation: invitation)
             }
-            // Report before network access, including malformed/stale deliveries. No capture here.
-            do { try await system.reportIncoming(invitation?.report ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: true) }
-            catch {
-                removePendingPush(systemUUID); system.end(uuid: systemUUID)
-                if run == generation, let invitation {
-                    rememberTerminal(invitation.callId)
-                    if snapshot == nil { emit("error", ["code": NuwaxVoipIncomingFailure(error).code]) }
+            let workID = UUID()
+            var backgroundID = UIBackgroundTaskIdentifier.invalid
+            let work = NuwaxVoipPushWork(finished: { [weak self] in
+                if backgroundID != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundID); backgroundID = .invalid
                 }
-                return
+                self?.pushWork.removeValue(forKey: workID)
+            })
+            pushWork[workID] = work
+            backgroundID = UIApplication.shared.beginBackgroundTask(withName: "NuwaxVoipInvitation") { [weak self, weak work] in
+                Task { @MainActor in
+                    work?.cancel()
+                    guard let self, run == self.generation, !self.validatedSystemUUID(systemUUID) else { return }
+                    self.trace("PushKit validation background time expired systemUUID=\(systemUUID.uuidString)")
+                    if let invitation { self.rememberTerminal(invitation.callId) }
+                    self.removePendingPush(systemUUID); system.end(uuid: systemUUID)
+                }
             }
-            guard run == generation, let invitation, !configuration.isEmpty else { system.end(uuid: systemUUID); return }
-            if duplicate { if pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID) }; return }
-            if validatedSystemUUID(systemUUID) { removePendingPush(systemUUID); return }
-            guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.callId) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); system.end(uuid: systemUUID); return }
-            defer { if run == generation { removePendingPush(systemUUID) } }
+            // Report before network access, including malformed/stale deliveries. No capture here.
             do {
-                if business, let conv = invitation.convId, let msg = invitation.msgId {
-                    let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
-                    guard invitation.matches(message, now: Date().timeIntervalSince1970 * 1000),
-                          var next = await businessInvitation(message), run == generation,
-                          let pending = pendingPushes[systemUUID] else { system.end(uuid: systemUUID); return }
-                    next["expiresAt"] = invitation.expiresAt
-                    if pending.declined { notifyBusinessEnd(next, reason: "rejected"); system.end(uuid: systemUUID); return }
-                    guard !terminal.contains(invitation.callId) else { system.end(uuid: systemUUID); return }
-                    adoptBusinessInvitation(next)
-                } else {
-                    let value = try await request("/\(invitation.callId)")
-                    guard run == generation, let pending = pendingPushes[systemUUID] else { system.end(uuid: systemUUID); return }
-                    if pending.declined {
-                        _ = try? await request("/\(invitation.callId)/actions", body: ["action": "reject", "actionId": UUID().uuidString])
-                        system.end(uuid: systemUUID); return
+                try await work.reportThenValidate(report: {
+                    try await system.reportIncoming(invitation?.report ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: true)
+                }, validate: { [weak self] in
+                    guard let self, run == self.generation, let invitation, !self.configuration.isEmpty else { system.end(uuid: systemUUID); return }
+                    await self.validatePush(invitation, systemUUID: systemUUID, system: system, run: run, duplicate: duplicate)
+                })
+                // The async delegate now returns to PushKit without waiting for HTTP.
+                trace("PushKit report completed systemUUID=\(systemUUID.uuidString)")
+            }
+            catch {
+                system.end(uuid: systemUUID)
+                if run == generation {
+                    removePendingPush(systemUUID)
+                    if let invitation {
+                        rememberTerminal(invitation.callId)
+                        if snapshot == nil { emit("error", ["code": NuwaxVoipIncomingFailure(error).code]) }
                     }
-                    adopt(value)
                 }
-                if validatedSystemUUID(systemUUID) { system.invitationReady(uuid: systemUUID) }
-                else { system.end(uuid: systemUUID) }
-            } catch { system.end(uuid: systemUUID); if run == generation { emit("error", ["code": "CALL_INVITATION_FAILED"]) } }
+            }
+        }
+    }
+    @available(iOS 17.4, *)
+    private func validatePush(_ invitation: NuwaxVoipPushInvitation, systemUUID: UUID, system: NuwaxSystemCalls, run: Int, duplicate: Bool) async {
+        // The online path may have independently validated this same call while
+        // HTTP was pending. Cancelling redundant push work must not end it.
+        let endIfUnverified = {
+            if run != self.generation || !self.validatedSystemUUID(systemUUID) { system.end(uuid: systemUUID) }
+        }
+        guard !Task.isCancelled, run == generation else { endIfUnverified(); return }
+        if duplicate { if pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID) }; return }
+        if validatedSystemUUID(systemUUID) { removePendingPush(systemUUID); return }
+        guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.callId) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
+        defer { if run == generation { removePendingPush(systemUUID) } }
+        do {
+            if business, let conv = invitation.convId, let msg = invitation.msgId {
+                let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
+                guard !Task.isCancelled, run == generation,
+                      invitation.matches(message, now: Date().timeIntervalSince1970 * 1000),
+                      var next = await businessInvitation(message), run == generation,
+                      !Task.isCancelled, let pending = pendingPushes[systemUUID] else { endIfUnverified(); return }
+                next["expiresAt"] = invitation.expiresAt
+                if pending.declined { notifyBusinessEnd(next, reason: "rejected"); system.end(uuid: systemUUID); return }
+                guard !terminal.contains(invitation.callId) else { system.end(uuid: systemUUID); return }
+                adoptBusinessInvitation(next)
+            } else {
+                let value = try await request("/\(invitation.callId)")
+                guard !Task.isCancelled, run == generation, let pending = pendingPushes[systemUUID] else { endIfUnverified(); return }
+                if pending.declined {
+                    _ = try? await request("/\(invitation.callId)/actions", body: ["action": "reject", "actionId": UUID().uuidString])
+                    system.end(uuid: systemUUID); return
+                }
+                adopt(value)
+            }
+            if validatedSystemUUID(systemUUID) {
+                trace("PushKit invitation verified callId=\(invitation.callId) systemUUID=\(systemUUID.uuidString)")
+                system.invitationReady(uuid: systemUUID)
+            }
+            else { system.end(uuid: systemUUID) }
+        } catch {
+            endIfUnverified()
+            if run == generation, !validatedSystemUUID(systemUUID) { emit("error", ["code": "CALL_INVITATION_FAILED"]) }
         }
     }
 }

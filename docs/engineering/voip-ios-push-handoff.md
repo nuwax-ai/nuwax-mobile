@@ -4,6 +4,8 @@
 
 ## 实际状态
 
+2026-11-17 独立跟进补充：发送可以复用现有 UniPush／个推，无需另部署 VoIP 服务；官方映射、原生 token 绑定和现有 IM／云函数最小增量见 [无进程来电跟进](voip-ios-cold-start-followup.md)。本次修补 PushKit 完成时机及 Keychain 原位更新，112 项 Vitest／53 项 Swift 单测通过；未切换 provider、重新打包或部署，iPhone 无进程来电仍未通过。
+
 2026-11-17 已按完整 iOS 产品流程复核客户端。未启动/回收后唤起、原生凭据续期、权威终态及原子接听仍需后端前置；完整场景矩阵和客户端修正见 [iOS 产品完整性检查](voip-ios-product-readiness.md)。本轮没有重新验证后端部署或发送真实 APNs，不沿用旧记录推断服务今日状态。
 
 2026-11-16 复核后端 `feat-video-meeting@26dd3491` 及测试环境：鉴权 GET `/users/me` 正常，新增 `/calls/devices` 的 GET 与空请求体 POST 均返回 404，源码仍无专用发送实现。下述契约继续作为后端待交付项，不改回普通 UniPush 或将注册回执当作推送送达。

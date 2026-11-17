@@ -58,3 +58,32 @@ print('Incomplete development resources rejected without copying release resourc
 `, resolve(import.meta.dirname, '../../scripts/voip-native/device')], { encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
   expect(result).toContain('Incomplete development resources rejected');
 });
+
+it('requires a real launch-hook call in AppDelegate, including an Xcode debug companion', () => {
+  const result = execFileSync('python3', ['-c', `
+import sys, tempfile
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import ios_push_config as config
+method = '-[AppDelegate application:didFinishLaunchingWithOptions:]:\\n'
+body = '  406c: ldr x0, [x8] ; Objc class ref: _OBJC_CLASS_$__TtC18unimoduleNuwaxVoip15NuwaxVoipBridge\\n  4070: bl _objc_msgSend$restoreOnLaunch\\n'
+assert config.has_native_launch_restore(method + body)
+assert not config.has_native_launch_restore('restoreOnLaunch')
+assert not config.has_native_launch_restore('-[OtherClass restore]:\\n' + body)
+assert not config.has_native_launch_restore(method + '  406c: ret\\n-[OtherClass restore]:\\n' + body)
+assert not config.has_native_launch_restore(method + body.replace('bl _objc_msgSend$', 'adr x0, _objc_msgSend$'))
+with tempfile.TemporaryDirectory() as directory:
+    app = Path(directory); (app/'UniAppX.debug.dylib').touch()
+    seen = []
+    def run(args, **kwargs):
+        seen.append(args)
+        if args[0] == 'otool': return SimpleNamespace(stdout='@rpath/UniAppX.debug.dylib')
+        return SimpleNamespace(stdout=method + body if args[-1].endswith('.debug.dylib') else 'stub only')
+    config.subprocess.run = run
+    config.verify_native_launch_restore(app, {'CFBundleExecutable':'UniAppX'})
+    assert seen[-1][-1].endswith('UniAppX.debug.dylib')
+print('Native launch-hook code verified without compilation or signing')
+`, resolve(import.meta.dirname, '../../scripts/voip-native/device')], { encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
+  expect(result).toContain('Native launch-hook code verified');
+});

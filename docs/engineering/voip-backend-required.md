@@ -2,6 +2,8 @@
 
 ## 2026-11-17 再核对：iOS 无进程来电仍为 P0
 
+不需要单独部署一套 APNs／呼叫服务。可扩展现有 IM 与 UniPush `push-send`，利用官方 `options.ios.type=voip`；还须补原生 PushKit token→个推绑定、电话设备归属、有效邀请触发及 iOS 厂商直投能力。IM 可复用 CID 路由而不重复存原始 token，不能省略登录／撤销隔离。逐项增量与待交付的测试部署版本见 [UniPush 闭环跟进](voip-ios-cold-start-followup.md)。原有直连 APNs 作为另一种发送适配器保留，本轮没有自动切换 provider 或部署。
+
 本轮重新 fetch `nuwax-im/feat-video-meeting`，HEAD 仍为 `0fa014fc86712a09bb9e321e24b5aa2dc4fc2ea0`；所查控制器仍无电话专用设备登记，未发现 APNs VoIP sender。该仓 `docs/07-移动端APP对接文档.md` §9.3 也明确 `voipToken` 仅落库、无发送使用方，原 R-07 仍排除 VoIP Push。请按当前移动端需求补入实现范围，而不是以会议 RTC／在线呼叫已通认定后台电话已就绪。
 
 本轮没有重测部署接口或修改后端／生产配置；若能力已由其他服务提供，按其实际部署版本和等价接口对接。客户端权限引导与此项分别交付，详见 [通话准备与 iOS 优先项](voip-call-readiness.md)。

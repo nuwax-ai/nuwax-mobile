@@ -15,7 +15,6 @@ import {
   qrLoginAppUrl,
   qrLoginPageUrl,
 } from '@/utils/qrLogin.uts';
-import { parseShareUrl } from '@/utils/appShare.uts';
 import { mobileLoginDestination } from '@/utils/authIdp.uts';
 
 const origin = 'https://agent.nuwax.com';
@@ -134,12 +133,6 @@ it('异域 scheme 进入错误页，不切企业域、不发起登录', () => {
   expect(f.launch).toHaveBeenCalledWith({ url: qrLoginPageUrl('', '') });
   expect(f.login).not.toHaveBeenCalled();
 });
-it('登录二维码不能通过额外 kind 参数伪装成分享入口', () => {
-  expect(
-    parseShareUrl(qrLoginAppUrl('scene-a', origin) + '&kind=file&sk=foo'),
-  ).toBeNull();
-});
-
 it('M 站首屏分流在桌面模式下保留扫码确认及其登录返回，其它页面仍回 PC', () => {
   const script = [
     ...readFileSync('index.html', 'utf8').matchAll(

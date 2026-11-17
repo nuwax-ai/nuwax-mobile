@@ -1,5 +1,15 @@
 # VoIP 正式后端待配合清单
 
+## 2026-11-17 再核对：iOS 无进程来电仍为 P0
+
+本轮重新 fetch `nuwax-im/feat-video-meeting`，HEAD 仍为 `0fa014fc86712a09bb9e321e24b5aa2dc4fc2ea0`；所查控制器仍无电话专用设备登记，未发现 APNs VoIP sender。该仓 `docs/07-移动端APP对接文档.md` §9.3 也明确 `voipToken` 仅落库、无发送使用方，原 R-07 仍排除 VoIP Push。请按当前移动端需求补入实现范围，而不是以会议 RTC／在线呼叫已通认定后台电话已就绪。
+
+本轮没有重测部署接口或修改后端／生产配置；若能力已由其他服务提供，按其实际部署版本和等价接口对接。客户端权限引导与此项分别交付，详见 [通话准备与 iOS 优先项](voip-call-readiness.md)。
+
+## 记录与会议复用的交接补充
+
+按用户要求，通话结果应优先复用现有会议记录／参与者关系，保存不依赖录制。所查 `CreateRoomRequest` 与 `MeetingRtcApplicationService.createRoom()` 目前仅 `origin=1` 建房即落库；`origin=2` 由录制路径的 `createCallMeeting()` 创建。需补未接／拒接／取消及未加入参与方，保留电话抢接、终态与个人删除语义；不可直接改 `origin=1` 冒充普通会议。字段关系、复用流程和验收见 [业务关系说明](voip-meeting-relationship.md)。无需因此另建重复 RTC／历史服务，现有在线接口继续使用。
+
 日期：2026-11-17。客户端分支 `feat/nuwa-basic-2026.11-voip-calls`。已按用户指出的 PC Web 会议链路重新核对：**会议 RTC 和在线一对一呼叫已有可复用接口，当前 IPA 已按这套接口接入，可以先做两台手机在线互拨。** 下文另外列手机冷唤醒及完整产品的增强项，不再把新接口名称作为开始联调的前置。生产配置、APNs 证书及部署本轮均不变更。
 
 普通消息继续 UniPush；iOS 来电使用原生 PushKit + APNs VoIP + LiveCommunicationKit，媒体使用 LiveKit。Android 沿用 UniPush 的厂商通道适配与原生来电展示；厂商普通通知送达不能直接等同于后台进程唤起。鸿蒙另有原生 Push/Call Service 接入和待验收项，见[国内通道申请](voip-cn-provider-onboarding.md)。本项目只做一对一电话。

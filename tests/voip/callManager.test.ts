@@ -41,7 +41,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -79,6 +79,50 @@ async function deliverIncoming() {
   await vi.advanceTimersByTimeAsync(100);
   expect(getVoipSnapshot()?.callId).toBe('incoming');
 }
+
+describe('session-level VoIP push readiness', () => {
+  function registration(state: string, nativePush = false, scope?: string) {
+    fake.events.push({ type: 'pushRegistration', scope: scope ?? fake.commands.filter(c => c.op === 'initialize').at(-1).scope,
+      provider: 'apns', state, nativePush, token: 'must-not-be-exposed' });
+  }
+  it('exposes unavailable registration before the first call without asking for media permissions', async () => {
+    await bootstrapVoip();
+    registration('configurationMissing');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(getVoipSnapshot()).toBeNull();
+    expect(voipPushRegistration.value).toEqual({ provider: 'apns', state: 'configurationMissing', serverReady: false });
+    expect(fake.permissions).not.toHaveBeenCalled(); expect(fake.claimAudio).not.toHaveBeenCalled();
+    expect(voipError.value).toBe('');
+  });
+  it('separates a stored device registration from a sender readiness declaration', async () => {
+    await bootstrapVoip();
+    registration('registered', false); await vi.advanceTimersByTimeAsync(100);
+    expect(voipPushRegistration.value.serverReady).toBe(false);
+    registration('registered', true); await vi.advanceTimersByTimeAsync(100);
+    expect(voipPushRegistration.value.serverReady).toBe(true);
+    registration('unavailable', true); await vi.advanceTimersByTimeAsync(100);
+    expect(voipPushRegistration.value.serverReady).toBe(false);
+  });
+  it('clears readiness on identity refresh/logout and ignores an old registration callback', async () => {
+    await bootstrapVoip();
+    const previous = fake.commands.filter(c => c.op === 'initialize').at(-1).scope;
+    registration('registered', true); await vi.advanceTimersByTimeAsync(100);
+    fake.token = 'refreshed-fixture'; await bootstrapVoip();
+    expect(voipPushRegistration.value).toEqual({ provider: '', state: 'unknown', serverReady: false });
+    registration('registered', true, previous); await vi.advanceTimersByTimeAsync(100);
+    expect(voipPushRegistration.value.state).toBe('unknown');
+    registration('registered', true); await vi.advanceTimersByTimeAsync(100);
+    clearVoipSession();
+    expect(voipPushRegistration.value).toEqual({ provider: '', state: 'unknown', serverReady: false });
+  });
+  it('keeps an online call alive when dedicated push registration fails', async () => {
+    await bootstrapVoip(); await deliverIncoming();
+    const call = getVoipSnapshot();
+    registration('unavailable'); await vi.advanceTimersByTimeAsync(100);
+    expect(getVoipSnapshot()).toBe(call);
+    expect(getVoipSnapshot()?.state).toBe('ringing'); expect(voipError.value).toBe('');
+  });
+});
 
 describe('outgoing call races', () => {
   it('offers system settings after a denied outgoing permission without creating a call', async () => {

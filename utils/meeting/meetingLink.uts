@@ -1,0 +1,327 @@
+/**
+ * 会议号 / 邀请链接 / 邀请文案的纯逻辑（对齐 PC `nuwax-im-web/src/lib/meetingLink.ts` +
+ * `meetingSchedule.ts` 的 normalizeMeetingNo，分支 feat-video-meeting）。
+ *
+ * ★为什么单独一个文件、且不做任何 IO：会议号是「念给对方听 / 手抄 / 粘贴」的三重易错点。
+ * 2026-11-07 PC 线上真实发生过一次末两位抄反（063575412 vs 063575421），
+ * 所以这里必须是**唯一**的规范化入口——输入框、链接、邀请卡片都走它，
+ * 两份校验迟早分叉。
+ *
+ * ★不写正则：uni-app x 三端 RegExp 行为不一致，这里全部用手写字符判定，
+ * 保证 Android/iOS/鸿蒙 得到同一个结果。
+ */
+
+/** 邀请链接里的查询参数名。★改它等于改已经发出去的链接，不要动。 */
+export const IM_MEETING_INVITE_PARAM = "meeting";
+
+/** 生成会议号时用的位数（校验时允许 4~20，兼容自定义房间名）。 */
+export const IM_MEETING_NO_DIGITS = 9;
+
+/** 分享 slug 字母表 —— ★必须与服务端 MeetingShareSlug.ALPHABET 一致（去掉易混淆的 i l o 0 1）。 */
+const SHARE_SLUG_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+
+/** slug 长度（服务端同值）。 */
+export const IM_MEETING_SHARE_SLUG_LENGTH = 12;
+
+/** PC 会议页路径（Web 端 base）。App 只拿它拼「分享链接」，不负责打开它。 */
+export const IM_MEETING_WEB_PATH = "/instant-message/";
+
+function padStartNum(value: string, width: number): string {
+  let out = value;
+  while (out.length < width) {
+    out = `0${out}`;
+  }
+  return out;
+}
+
+/** 只保留可打印的 ASCII 数字。 */
+function isAllDigits(s: string): boolean {
+  if (s.length == 0) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)!!;
+    if (c < 48 || c > 57) return false;
+  }
+  return true;
+}
+
+/** 数字或短横线（抄写时的分组符）。 */
+function isDigitsWithDash(s: string): boolean {
+  if (s.length == 0) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)!!;
+    if ((c < 48 || c > 57) && c != 45) return false;
+  }
+  return true;
+}
+
+/** 去掉所有空白（空格、制表、全角空格）。 */
+function stripSpaces(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)!!;
+    if (c == 32 || c == 9 || c == 10 || c == 13 || c == 12288) continue;
+    out += s.charAt(i);
+  }
+  return out;
+}
+
+/**
+ * 房间名白名单（与后端 MeetingRtcConstants.ROOM_NAME_PATTERN 同口径，更窄）：
+ * 首位必须是字母或数字，其后允许 [A-Za-z0-9._-]，总长 1~64。
+ * 这样「会议号」既可以是 9 位数字，也可以是历史房间名（含 . _ -）。
+ */
+function isValidRoomName(s: string): boolean {
+  if (s.length < 1 || s.length > 64) return false;
+  const first = s.charCodeAt(0)!!;
+  const firstOk = (first >= 48 && first <= 57)
+    || (first >= 65 && first <= 90)
+    || (first >= 97 && first <= 122);
+  if (!firstOk) return false;
+  for (let i = 1; i < s.length; i++) {
+    const c = s.charCodeAt(i)!!;
+    const ok = (c >= 48 && c <= 57)
+      || (c >= 65 && c <= 90)
+      || (c >= 97 && c <= 122)
+      || c == 45 || c == 46 || c == 95; // - . _
+    if (!ok) return false;
+  }
+  return true;
+}
+
+/**
+ * 生成一个会议号（9 位纯数字，允许前导 0 —— 与飞书一致，用户能口头念）。
+ *
+ * @param seed 调用方给的随机源乘积（0~1 的随机数）。纯函数，便于离线复算。
+ */
+export function makeMeetingNo(seed: number): string {
+  // ★NaN/Infinity 兜 0：不依赖 isFinite/Number.POSITIVE_INFINITY（三端支持不一致），
+  //   NaN 自反为假、Infinity 越界，两者都能被下面这一行拦住
+  const finite = seed == seed && seed < 1e308 && seed > -1e308;
+  const safe = finite ? Math.abs(Math.floor(seed)) : 0;
+  const n = safe % 1000000000; // 10^9
+  return padStartNum(`${n}`, IM_MEETING_NO_DIGITS);
+}
+
+/**
+ * 把用户输入 / 粘贴的内容规范化成可用的会议号或分享 slug；不合法返回 null
+ * （调用方据此就地报错，**不要**兜底成空串——空串会被服务端当成"任意房间"）。
+ *
+ * 能吃下四种粘贴形态（实测用户就是这么分享的）：
+ * - `123456789`：直接念的数字
+ * - `123 456 789` / `123-456-789`：抄写时的分组符
+ * - `https://host/instant-message/?meeting=rn5usnh5mmbm`：整条邀请链接
+ * - 分享 slug：`rn5usnh5mmbm`
+ *
+ * ★★先砍查询串/锚点、再按 `/` 取最后一段。反过来会把 `?from=chat` 当成最后一段，
+ * 整条带参数的链接被判成非法。
+ */
+export function normalizeMeetingNo(raw: string | null): string | null {
+  if (raw == null) return null;
+  const text = raw.trim();
+  if (text.length == 0) return null;
+  // 先从链接里取 meeting 参数（邀请链接的规范来源）
+  const fromQuery = readInviteNoFromUrl(text);
+  if (fromQuery != null) return fromQuery;
+  // 再砍 ? / # 之后的内容，取最后一段路径
+  let path = text;
+  const cut = path.indexOf("?");
+  if (cut >= 0) path = path.substring(0, cut);
+  const cut2 = path.indexOf("#");
+  if (cut2 >= 0) path = path.substring(0, cut2);
+  let tail = "";
+  const parts = path.split("/");
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const seg = parts[i].trim();
+    if (seg.length > 0) {
+      tail = seg;
+      break;
+    }
+  }
+  const compact = stripSpaces(tail);
+  if (compact.length == 0) return null;
+  if (isDigitsWithDash(compact)) {
+    let digits = "";
+    for (let i = 0; i < compact.length; i++) {
+      if (compact.charAt(i) != "-") digits += compact.charAt(i);
+    }
+    if (digits.length < 4 || digits.length > 20) return null;
+    return digits;
+  }
+  return isValidRoomName(compact) ? compact : null;
+}
+
+/**
+ * 从一段（可能是完整 URL、也可能是裸查询串）里读 `meeting` 参数。
+ * 没有该参数返回 null —— 调用方继续走别的规范化路径。
+ */
+export function readInviteNoFromUrl(raw: string): string | null {
+  const text = raw.trim();
+  if (text.length == 0) return null;
+  const marker = `${IM_MEETING_INVITE_PARAM}=`;
+  const idx = text.indexOf(marker);
+  if (idx < 0) return null;
+  // ★只认「?meeting=」或「&meeting=」：避免把文字里 "meeting=" 之外的内容误抓
+  if (idx > 0) {
+    const prev = text.charAt(idx - 1);
+    if (prev != "?" && prev != "&" && prev != ";") return null;
+  }
+  let rest = text.substring(idx + marker.length);
+  const amp = rest.indexOf("&");
+  if (amp >= 0) rest = rest.substring(0, amp);
+  const hash = rest.indexOf("#");
+  if (hash >= 0) rest = rest.substring(0, hash);
+  const value = decodeUriComponentSafe(rest).trim();
+  if (value.length == 0) return null;
+  return isValidRoomName(value) ? value : null;
+}
+
+/** decodeURIComponent 的安全版：畸形转义不抛，原样返回。 */
+function decodeUriComponentSafe(s: string): string {
+  try {
+    // ★Kotlin 侧 decodeURIComponent 返回 String?：不补 !! 会报「返回类型不匹配」
+    return decodeURIComponent(s)!!;
+  } catch (_error) {
+    return s;
+  }
+}
+
+/**
+ * 会议号展示写法：9 位数字按 3-3-3 分组（`945 968 030`）。
+ * ★只是展示口径，不参与解析；非 9 位原样返回，不硬塞空格。
+ */
+export function formatMeetingId(roomName: string): string {
+  const s = roomName.trim();
+  if (s.length == 9 && isAllDigits(s)) {
+    return `${s.substring(0, 3)} ${s.substring(3, 6)} ${s.substring(6, 9)}`;
+  }
+  return s;
+}
+
+/** 默认会议标题：`会议 123 456 789`（服务端兜底的「会议记录」在列表里认不出是哪场会）。 */
+export function defaultMeetingTitle(roomName: string): string {
+  return `会议 ${formatMeetingId(roomName)}`;
+}
+
+/**
+ * 列表/详情真正显示的标题：服务端兜底名（「会议记录」「通话记录」）一律换成会议号。
+ * ★老记录里已经躺着兜底名了，光改服务端救不回来，展示层必须再拦一道。
+ */
+export function meetingDisplayTitle(rawTitle: string | null, roomName: string | null): string {
+  const title = rawTitle == null ? "" : rawTitle.trim();
+  const room = roomName == null ? "" : roomName.trim();
+  const isGeneric = title.length == 0 || title == "会议记录" || title == "通话记录";
+  if (!isGeneric) return title;
+  if (room.length > 0) return defaultMeetingTitle(room);
+  return title.length > 0 ? title : "未命名会议";
+}
+
+/**
+ * 生成分享 slug（12 位，32^12 ≈ 1.2e18 种可能）。
+ *
+ * ★为什么端上也要生成：发起会议/预约弹窗在**建房之前**就允许「复制邀请」，
+ * 那时没有 room metadata 可读；先生成随建房/预约请求带给服务端，服务端校验格式后沿用。
+ * ★它不替代安全保护：真正的保护来自"链接不外传"，slug 只是让链接不能被 1..10^9 撞出来。
+ */
+export function makeShareSlug(): string {
+  let out = "";
+  for (let i = 0; i < IM_MEETING_SHARE_SLUG_LENGTH; i++) {
+    const idx = Math.floor(Math.random() * SHARE_SLUG_ALPHABET.length);
+    const safe = idx < 0 ? 0 : (idx >= SHARE_SLUG_ALPHABET.length ? SHARE_SLUG_ALPHABET.length - 1 : idx);
+    out += SHARE_SLUG_ALPHABET.charAt(safe);
+  }
+  return out;
+}
+
+/**
+ * 邀请链接里该用哪个值：有合法 slug 用 slug，否则（老房间/老记录）回退会议号。
+ * ★回退不是凑合：升级前发出去的链接里就是会议号，服务端两种都认，老链接必须继续能进。
+ */
+export function shareKeyOf(shareSlug: string | null, roomName: string): string {
+  const slug = shareSlug == null ? "" : shareSlug.trim();
+  if (isValidShareSlug(slug)) return slug;
+  return roomName.trim();
+}
+
+function isValidShareSlug(slug: string): boolean {
+  if (slug.length < 8 || slug.length > 32) return false;
+  for (let i = 0; i < slug.length; i++) {
+    const c = slug.charCodeAt(i)!!;
+    const ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122);
+    if (!ok) return false;
+  }
+  return true;
+}
+
+/**
+ * 拼邀请链接：`{webBase}/instant-message/?meeting={key}`。
+ *
+ * @param webBase 平台 Web 站点根（例如 `https://agent.nuwax.com`），由调用方从部署配置取；
+ *                ★不要在端上硬编码域名——多环境（测试/正式/私有化）各有各的站点。
+ * @param key     {@link shareKeyOf} 的结果（slug 或老会议号）
+ * @returns 空串表示 key 为空，调用方据此不展示「复制链接」
+ */
+export function buildMeetingInviteUrl(webBase: string, key: string): string {
+  const base = webBase.trim();
+  const k = key.trim();
+  if (k.length == 0) return "";
+  let origin = base;
+  const q = origin.indexOf("?");
+  if (q >= 0) origin = origin.substring(0, q);
+  const h = origin.indexOf("#");
+  if (h >= 0) origin = origin.substring(0, h);
+  if (origin.endsWith("/")) origin = origin.substring(0, origin.length - 1);
+  return `${origin}${IM_MEETING_WEB_PATH}?${IM_MEETING_INVITE_PARAM}=${encodeURIComponent(k)}`;
+}
+
+/**
+ * 邀请文案（版式对齐飞书，与 PC 完全一致——双端发出的邀请看起来必须是同一条）：
+ *
+ * ```
+ * 冯飞邀请你加入女娲会议
+ * 会议主题：冯飞的会议
+ * 会议号：945 968 030
+ * 入会密码：246810        ← 只在设了密码且拿得到明文时才有这一行
+ * 会议链接：https://…/instant-message/?meeting=945968030
+ * ```
+ *
+ * ★一条链接对所有人：登录用户点开直接入会；没登录的人在开放游客时填昵称即可进。
+ * 文案里不写「对方无需登录」这种把人分类的话。
+ * ★★必须逐行换行（`\n`）：粘贴到聊天框/短信里仍是一行一件事，方便念给参会人听。
+ * ★密码行位置与 PC 一致（会议号 → 入会密码 → 链接）：号与密码是连着念的一组，
+ * 链接放最后那条长串。空密码**不输出空行**（PC 同口径）。
+ */
+export function buildMeetingInviteText(
+  inviter: string,
+  title: string,
+  roomName: string,
+  url: string,
+  passcode: string = "",
+): string {
+  const room = roomName.trim();
+  if (room.length == 0) return "";
+  const who = inviter.trim();
+  const theme = title.trim().length > 0 ? title.trim() : defaultMeetingTitle(room);
+  let text = who.length > 0 ? `${who}邀请你加入女娲会议` : "邀请你加入女娲会议";
+  text += `\n会议主题：${theme}`;
+  text += `\n会议号：${formatMeetingId(room)}`;
+  const pwd = passcode.trim();
+  if (pwd.length > 0) text += `\n入会密码：${pwd}`;
+  const link = url.trim();
+  if (link.length > 0) text += `\n会议链接：${link}`;
+  return text;
+}
+
+/**
+ * 时长（秒）⇒ 中文短标签：`7200→2 小时`、`5400→1 小时 30 分`、`300→5 分钟`。
+ * ★用于会中「限时 2 小时」，不显示 `2:00:00`（那个看起来像已用时长）。
+ */
+export function formatDurationLabel(seconds: number | null): string {
+  if (seconds == null) return "";
+  const safe = seconds > 0 ? Math.floor(seconds) : 0;
+  if (safe <= 0) return "";
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  if (h > 0) return m > 0 ? `${h} 小时 ${m} 分` : `${h} 小时`;
+  if (m > 0) return `${m} 分钟`;
+  return `${safe} 秒`;
+}

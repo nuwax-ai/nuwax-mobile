@@ -18,6 +18,8 @@ function navigation(custom = true, routes = ["pages/tab-shell/tab-shell"], ios =
     ref: <T>(value: T) => ({ value }),
     nextTick: (callback: () => void) => nextTicks.push(callback),
     closeAllPopups: vi.fn(),
+    activateAppEntryMain: vi.fn(),
+    isAppEntryLogin: () => false,
     getCurrentPages: () => routes.map(route => ({ route })),
     uni: { switchTab: vi.fn(), navigateBack: vi.fn(success), reLaunch: vi.fn(success) },
   };
@@ -31,8 +33,8 @@ describe("常驻主界面路由", () => {
   it("切 Tab 只修改内容，保留容器；成功回调在响应式更新后执行", () => {
     const page = navigation();
     const success = vi.fn(); const complete = vi.fn();
-    page.switchMainTab({ url: "/pages/index/index", success, complete });
-    expect(page.mainTabActivePath.value).toBe("/pages/index/index");
+    page.switchMainTab({ url: "/pages/union-record/union-record", success, complete });
+    expect(page.mainTabActivePath.value).toBe("/pages/union-record/union-record");
     expect(page.uni.switchTab).not.toHaveBeenCalled();
     expect(page.uni.reLaunch).not.toHaveBeenCalled();
     expect(page.uni.navigateBack).not.toHaveBeenCalled();
@@ -40,15 +42,15 @@ describe("常驻主界面路由", () => {
     page.settle();
     expect(success).toHaveBeenCalledTimes(1);
     expect(complete).toHaveBeenCalledWith(expect.objectContaining({ errMsg: "switchTab:ok" }));
-    expect(page.resolveMainTabPagePath("pages/tab-shell/tab-shell")).toBe("/pages/index/index");
+    expect(page.resolveMainTabPagePath("pages/tab-shell/tab-shell")).toBe("/pages/union-record/union-record");
   });
 
   it("从二级页返回指定 Tab，退回已有容器而不重建首页", () => {
     const page = navigation(true, ["pages/tab-shell/tab-shell", "subpackages/pages/agent-search/agent-search", "subpackages/pages/agent-detail/agent-detail"]);
-    page.switchMainTab({ url: "/pages/expert-list/expert-list?old=1" });
+    page.switchMainTab({ url: "/pages/discover/discover?old=1" });
     expect(page.uni.navigateBack).toHaveBeenCalledWith(expect.objectContaining({ delta: 2 }));
     expect(page.uni.reLaunch).not.toHaveBeenCalled();
-    expect(page.mainTabActivePath.value).toBe("/pages/expert-list/expert-list");
+    expect(page.mainTabActivePath.value).toBe("/pages/discover/discover");
     expect(page.resolveMainTabPagePath("subpackages/pages/agent-search/agent-search")).toBe("/subpackages/pages/agent-search/agent-search");
   });
 
@@ -61,16 +63,16 @@ describe("常驻主界面路由", () => {
 
   it("小程序仍走原生 Tab API，回调保持透传", () => {
     const page = navigation(false);
-    const options = { url: "/pages/index/index", success: vi.fn() };
+    const options = { url: "/pages/union-record/union-record", success: vi.fn() };
     page.switchMainTab(options);
     expect(page.uni.switchTab).toHaveBeenCalledWith(options);
     expect(page.mainTabActivePath.value).toBe("/pages/message/message");
   });
 
-  it("iOS 的索引和内容都跳过应用 Tab", () => {
+  it("iOS 保持当前四个业务 Tab", () => {
     const page = navigation(true, [], true);
     expect([...page.MAIN_TAB_PATHS]).toEqual([
-      "/pages/message/message", "/pages/index/index", "/pages/expert-list/expert-list", "/pages/mine/mine",
+      "/pages/message/message", "/pages/union-record/union-record", "/pages/discover/discover", "/pages/mine/mine",
     ]);
   });
 
@@ -129,7 +131,7 @@ describe("Tab 内容显隐生命周期", () => {
     hooks.onLoad(load); hooks.onShow(show); hooks.onHide(hide); hooks.onUnload(unload);
     page.visible.value = true; page.flush(); page.mount(owner);
     expect(load).toHaveBeenCalledTimes(1); expect(show).toHaveBeenCalledTimes(1);
-    page.active.value = "/pages/index/index"; page.flush();
+    page.active.value = "/pages/union-record/union-record"; page.flush();
     expect(hide).toHaveBeenCalledTimes(1); expect(unload).not.toHaveBeenCalled();
     page.active.value = "/pages/message/message"; page.flush();
     expect(show).toHaveBeenCalledTimes(2); expect(load).toHaveBeenCalledTimes(1);
@@ -142,10 +144,10 @@ describe("Tab 内容显隐生命周期", () => {
     const message = page.useMainTabLifecycle("/pages/message/message");
     const messageShow = vi.fn(); message.onShow(messageShow);
     const taskOwner = page.setup();
-    const task = page.useMainTabLifecycle("/pages/index/index");
+    const task = page.useMainTabLifecycle("/pages/union-record/union-record");
     const taskShow = vi.fn(); task.onShow(taskShow);
     page.visible.value = true; page.flush(); page.mount(messageOwner); page.mount(taskOwner);
-    page.active.value = "/pages/index/index"; page.flush();
+    page.active.value = "/pages/union-record/union-record"; page.flush();
     page.visible.value = false; page.flush(); page.visible.value = true; page.flush();
     expect(messageShow).toHaveBeenCalledTimes(1);
     expect(taskShow).toHaveBeenCalledTimes(2);
@@ -153,10 +155,10 @@ describe("Tab 内容显隐生命周期", () => {
 
   it("录音等内嵌组件跟随所属 Tab；普通详情页继续使用 SDK 钩子", () => {
     const page = lifecycle();
-    const parent = page.setup(); page.useMainTabLifecycle("/pages/index/index");
+    const parent = page.setup(); page.useMainTabLifecycle("/pages/union-record/union-record");
     const child = page.setup(parent); const show = vi.fn(); const hide = vi.fn();
     page.onTabPageShow(show); page.onTabPageHide(hide);
-    page.active.value = "/pages/index/index"; page.visible.value = true; page.flush(); page.mount(child);
+    page.active.value = "/pages/union-record/union-record"; page.visible.value = true; page.flush(); page.mount(child);
     page.active.value = "/pages/message/message"; page.flush();
     expect(show).toHaveBeenCalledTimes(1); expect(hide).toHaveBeenCalledTimes(1);
     page.setup(); page.onTabPageShow(show); page.onTabPageHide(hide);
@@ -169,7 +171,7 @@ describe("Tab 内容显隐生命周期", () => {
     page.visible.value = true;
     expect(page.dispatchMainTabBack("/pages/message/message", { from: "backbutton" })).toBe(true);
     page.dispatchMainTabResize("/pages/message/message", { size: { windowWidth: 375 } });
-    page.active.value = "/pages/index/index";
+    page.active.value = "/pages/union-record/union-record";
     expect(page.dispatchMainTabBack("/pages/message/message", { from: "backbutton" })).toBe(false);
     page.dispatchMainTabResize("/pages/message/message", { size: { windowWidth: 812 } });
     expect(back).toHaveBeenCalledTimes(1); expect(resize).toHaveBeenCalledTimes(1);
@@ -181,7 +183,7 @@ describe("Tab 内容显隐生命周期", () => {
     page.visible.value = true;
     page.dispatchMainTabRetap("/pages/message/message");
     expect(retap).toHaveBeenCalledTimes(1);
-    page.active.value = "/pages/index/index";
+    page.active.value = "/pages/union-record/union-record";
     page.dispatchMainTabRetap("/pages/message/message");
     page.dispatchMainTabRetap("/pages/unknown/not-registered");
     expect(retap).toHaveBeenCalledTimes(1);

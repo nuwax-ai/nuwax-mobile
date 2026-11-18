@@ -1,0 +1,942 @@
+<template>
+  <view class="tab-shell-stage">
+    <!-- #ifdef APP-HARMONY -->
+    <view v-if="pullChatPrepared" id="partner-pull-chat" class="tab-shell__chat-layer" :style="harmonyChatStyle">
+    <!-- #endif -->
+    <!-- #ifndef APP-HARMONY -->
+    <view v-if="pullChatPrepared" id="partner-pull-chat" class="tab-shell__chat-layer">
+    <!-- #endif -->
+      <chat-view
+        :key="pullChatKey"
+        ref="pullChatRef"
+        @close="closePullChat"
+        @stage-swipe-start="handleChatSwipeStart"
+        @stage-swipe-move="handleChatSwipeMove"
+        @stage-swipe-end="handleChatSwipeEnd"
+        @stage-swipe-cancel="handleChatSwipeCancel"
+      />
+    </view>
+    <!-- #ifdef APP-HARMONY -->
+    <!-- 鸿蒙拖动期保留与 Android/iOS 一致的薄灰蒙层；提交时通过 v-if 直接卸载，
+         不依赖原生 opacity 终态，避免蒙层残留为全屏灰色。 -->
+    <view v-if="!pullChatActive" id="partner-pull-scrim" class="tab-shell__pull-scrim" :style="harmonyScrimStyle" />
+    <view id="partner-pull-shell" class="tab-shell__shell" :style="harmonyShellStyle">
+    <!-- #endif -->
+    <!-- #ifndef APP-HARMONY -->
+    <view id="partner-pull-scrim" class="tab-shell__pull-scrim" />
+    <view id="partner-pull-shell" class="tab-shell__shell">
+    <!-- #endif -->
+      <!-- 录音抽屉（横滑）+ 主界面：track 的横向位移由 partnerVoiceDrawer 驱动，
+           外层 shell 只管 Stage 下拉/上滑的纵向位移，两套位移互不干扰。 -->
+      <view class="tab-shell-track" :style="trackStyle">
+        <view
+          v-if="partnerVoiceAlive"
+          class="tab-shell-record"
+          :style="recordStyle"
+          @touchstart="handleDismissTouchStart"
+          @touchmove="handleDismissTouchMove"
+          @touchend="handleDismissTouchEnd"
+          @touchcancel="handleDismissTouchEnd"
+        >
+          <voice-record-panel @close="handleVoicePanelClose()" @recording-change="handleVoiceRecordingChange($event)" />
+        </view>
+        <view class="tab-shell-foreground" :style="pageStyle">
+      <uni-tab class="tab-shell" :style="safeAreaStyle" :active-index="activeIndex" @change="handleTabChange">
+        <uni-tab-content>
+          <MessageContent
+            @prepare-pull-chat="preparePullChat"
+            @pull-gesture-start="handlePullGestureStart"
+            @pull-gesture-move="handlePullGestureMove"
+            @pull-gesture-end="handlePullGestureEnd"
+            @pull-gesture-cancel="handlePullGestureCancel"
+          />
+        </uni-tab-content>
+        <!-- 智联录首次访问才挂载：避免默认消息 Tab 冷启动时执行其 onLoad 并预拉联系人、
+             群组、团队数据。首次进入后保持常驻，后续切换不重复初始化。 -->
+        <uni-tab-content><UnionRecordContent v-if="unionRecordVisited" /></uni-tab-content>
+        <uni-tab-content><DiscoverContent /></uni-tab-content>
+        <uni-tab-content><MineContent /></uni-tab-content>
+        <!-- #ifdef APP-HARMONY -->
+        <common-tab-bar :active-path="mainTabActivePath" :bottom-inset="safeArea.bottom" :stage-style="harmonyTabBarStyle" />
+        <!-- #endif -->
+        <!-- #ifndef APP-HARMONY -->
+        <common-tab-bar :active-path="mainTabActivePath" :bottom-inset="safeArea.bottom" stage-style="" />
+        <!-- #endif -->
+      </uni-tab>
+        </view>
+      </view>
+      <!-- #ifdef APP-HARMONY -->
+      <view id="partner-pull-shell-fade" class="tab-shell__shell-fade" :style="harmonyShellFadeStyle" />
+      <!-- #endif -->
+      <!-- #ifndef APP-HARMONY -->
+      <view id="partner-pull-shell-fade" class="tab-shell__shell-fade" />
+      <!-- #endif -->
+      <!-- 下拉提示属于前景消息 Header：跟随整个消息页下移，只按手势进度渐显渐隐。 -->
+      <!-- #ifdef APP-HARMONY -->
+      <view id="partner-pull-release-hint" class="tab-shell__pull-release-hint" :style="harmonyPullHintStyle">
+      <!-- #endif -->
+      <!-- #ifndef APP-HARMONY -->
+      <view id="partner-pull-release-hint" class="tab-shell__pull-release-hint" :style="pullHintBaseStyle">
+      <!-- #endif -->
+        <text class="tab-shell__pull-release-hint-text">松手进入对话</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, nextTick, onMounted, onUnmounted, ref, watch, type ComponentPublicInstance } from "vue";
+  import ChatView from "@/pages/message/components/chat-view.uvue";
+  import MessageContent from "@/pages/message/message-content.uvue";
+  import UnionRecordContent from "@/pages/union-record/union-record-content.uvue";
+  import DiscoverContent from "@/pages/discover/discover-content.uvue";
+  import MineContent from "@/pages/mine/mine-content.uvue";
+  import { MAIN_TAB_PATHS, mainTabActivePath, mainTabPageVisible, selectMainTab, syncMainTabLocation } from "@/utils/mainTabNavigation";
+  import { dispatchMainTabBack, dispatchMainTabResize } from "@/hooks/useMainTabLifecycle";
+  import { syncNativeTabBarState } from "@/utils/commonBusiness";
+  import { getStatusBarHeight } from "@/utils/system.uts";
+  import { readMainTabSafeArea, type MainTabSafeArea } from "@/utils/mainTabSafeArea";
+  import { maybePromptProfileSetup } from "@/utils/profileSetupPrompt";
+  import VoiceRecordPanel from "@/pages/message/components/voice-record-panel/voice-record-panel.uvue";
+  import {
+    beginPartnerVoiceDrag,
+    closePartnerVoiceDrawer,
+    endPartnerVoiceDrag,
+    movePartnerVoiceDrag,
+    partnerVoiceAlive,
+    partnerVoiceDragging,
+    partnerVoiceMaxOffset,
+    partnerVoiceOffset,
+    partnerVoiceOpen,
+    partnerVoiceSnapless,
+    setPartnerVoiceRecording,
+  } from "@/utils/partnerVoiceDrawer";
+  import { disableAndroidOverScroll, setAndroidScrollInteractionEnabled } from "@/utils/im/stageSwipeConfig";
+  // 页面所有者转发显隐、首帧、返回和尺寸变化，内容组件不注册页面钩子。
+  const props = defineProps<{ visible: boolean; pageReady: boolean }>();
+  let contentMounted = false;
+  let contentReady = false;
+
+  let pullPlatformThresholdOffsetPx = 0;
+  // #ifdef APP-ANDROID
+  pullPlatformThresholdOffsetPx = 50;
+  // #endif
+  // #ifdef APP-HARMONY
+  pullPlatformThresholdOffsetPx = 50;
+  // #endif
+  /** iOS 保持原距离；Android / 鸿蒙增加 50px，正式与快速触发同步后移。 */
+  const PULL_TRIGGER_PX = 132 + pullPlatformThresholdOffsetPx;
+  const PULL_FAST_MIN_PX = 92 + pullPlatformThresholdOffsetPx;
+  const PULL_FAST_VELOCITY = 900;
+  const CLOSE_TRIGGER_PX = 110;
+  const CLOSE_FAST_MIN_PX = 56;
+  const CLOSE_FAST_VELOCITY = 900;
+  const STAGE_DURATION_MS = 260;
+  /** 达到阈值后松手进入会话统一稍放慢；未达阈值的取消回弹仍保持 260ms。 */
+  const PULL_COMMIT_DURATION_MS = 340;
+  const STAGE_EASING = "cubic-bezier(0.22, 0.78, 0.2, 1)";
+  /** 提示按钮先跟手下拉一小段再开始出现，并在正式触发阈值处完整显示。 */
+  const PULL_HINT_SHOW_PX = 52;
+  const PULL_HINT_FULL_PX = PULL_TRIGGER_PX;
+  /** 背层会话的静止缩放：藏在消息页背后时 70%，下拉/上滑过程中线性回到 100%。
+   *  缩放原点取 top（见 .tab-shell__chat-layer）：下拉露出多少，看到的就是会话页顶部，
+   *  不会先露出一截空白灰区（center 原点时顶部有 15% 屏高的留白）。 */
+  const PULL_CHAT_BASE_SCALE = 0.7;
+  /** 拖动期遮罩的「薄雾」不透明度：整段下拉恒定这一层灰白压在会话上（磨砂观感），
+   *  不再在下拉 42px 处硬切（快速上下滑时那一刻会反复闪出灰区）。
+   *  App 端不支持 CSS filter: blur，模糊感由此层 + 缩放 + 不透明白底共同模拟。 */
+  const SCRIM_DIM_OPACITY = 0.3;
+
+  const safeArea = ref<MainTabSafeArea>(readMainTabSafeArea());
+  const activeIndex = computed((): number => MAIN_TAB_PATHS.indexOf(mainTabActivePath.value));
+  const unionRecordVisited = ref<boolean>(mainTabActivePath.value == MAIN_TAB_PATHS[1]);
+  // safeArea 在 onReady/onResize 会重新赋值，用它驱动窗口宽度重读；避免 Android setup
+  // 首拍 windowWidth=0 时 pageStyle/trackStyle 的 computed 永久缓存 240px 兜底宽度。
+  const stageViewportWidth = computed((): number => {
+    const insetFloor = safeArea.value.left + safeArea.value.right + 1;
+    return Math.max(partnerVoiceMaxOffset(), insetFloor);
+  });
+  const trackStyle = computed((): string => {
+    const width = stageViewportWidth.value;
+    const duration = partnerVoiceDragging.value || partnerVoiceSnapless.value ? 0 : 280;
+    const alive = partnerVoiceAlive.value;
+    const trackWidth = alive ? width * 2 : width;
+    // 录音在左、伙伴页在右。位移 0 时露出右页，位移满一屏时露出左页。
+    const shift = alive ? partnerVoiceOffset.value - width : 0;
+    return `width: ${trackWidth}px; transform: translateX(${shift}px); transition-property: transform; transition-duration: ${duration}ms; transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);`;
+  });
+  const pageStyle = computed((): string => {
+    return `width: ${stageViewportWidth.value}px;`;
+  });
+  const recordStyle = computed((): string => {
+    const insets = uni.getWindowInfo().safeAreaInsets;
+    const topInset = insets != null ? insets.top : 0;
+    return `width: ${stageViewportWidth.value}px; padding-top: ${topInset}px;`;
+  });
+
+  function touchPointX(eventValue: Any): number {
+    const e = eventValue as UniTouchEvent;
+    if (e.touches.length > 0) {
+      return e.touches[0].screenX;
+    }
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      return e.changedTouches[0].screenX;
+    }
+    return -1;
+  }
+
+  function touchPointY(eventValue: Any): number {
+    const e = eventValue as UniTouchEvent;
+    if (e.touches.length > 0) {
+      return e.touches[0].screenY;
+    }
+    if (e.changedTouches != null && e.changedTouches.length > 0) {
+      return e.changedTouches[0].screenY;
+    }
+    return -1;
+  }
+
+  function handleDismissTouchStart(eventValue: Any): void {
+    const x = touchPointX(eventValue);
+    const y = touchPointY(eventValue);
+    if (x < 0 || y < 0) {
+      return;
+    }
+    beginPartnerVoiceDrag(x, y);
+  }
+
+  function handleDismissTouchMove(eventValue: Any): void {
+    const x = touchPointX(eventValue);
+    const y = touchPointY(eventValue);
+    if (x < 0 || y < 0) {
+      return;
+    }
+    const claimed = movePartnerVoiceDrag(x, y);
+    if (claimed) {
+      const e = eventValue as UniTouchEvent;
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }
+
+  function handleDismissTouchEnd(eventValue: Any): void {
+    endPartnerVoiceDrag(touchPointX(eventValue), touchPointY(eventValue));
+  }
+
+  function handleVoicePanelClose(): void {
+    closePartnerVoiceDrawer();
+  }
+
+  function handleVoiceRecordingChange(eventValue: Any): void {
+    setPartnerVoiceRecording(eventValue == true);
+  }
+  const pullChatPrepared = ref<boolean>(false);
+  const pullChatActive = ref<boolean>(false);
+  const pullChatKey = ref<number>(0);
+  const pullChatRef = ref<any | null>(null);
+
+  let pullChatUrl = "";
+  let pullChatOptions: UTSJSONObject | null = null;
+  let pullChatShown = false;
+  let stageAnimating = false;
+  let pullGestureActive = false;
+  let closeGestureActive = false;
+  let pullArmed = false;
+  let pullReachedTrigger = false;
+  let pullHapticFired = false;
+  let stageAnimationTimer = 0;
+  let stageShellEl: UniElement | null = null;
+  let stageShellFadeEl: UniElement | null = null;
+  let stageChatEl: UniElement | null = null;
+  let stageScrimEl: UniElement | null = null;
+  let stagePullHintEl: UniElement | null = null;
+  let stageTabBarEl: UniElement | null = null;
+  const PULL_HINT_BACKGROUND_COLOR = "#e7e6ea";
+  const pullHintTopPx = getStatusBarHeight() - 24;
+  const pullHintBaseStyle = "top: " + pullHintTopPx + "px; transform: translateY(-5px); background-color: " + PULL_HINT_BACKGROUND_COLOR + ";";
+
+  function pullHintProgress(distance: number): number {
+    const linearProgress = Math.max(0, Math.min((distance - PULL_HINT_SHOW_PX) / (PULL_HINT_FULL_PX - PULL_HINT_SHOW_PX), 1));
+    // smoothstep：起始和接近阈值时都放缓，避免按钮突然出现或在阈值前过早全亮。
+    return linearProgress * linearProgress * (3 - 2 * linearProgress);
+  }
+
+  // #ifdef APP-HARMONY
+  const harmonyShellStyle = ref<string>("transform: translateY(0px); pointer-events: auto;");
+  const harmonyShellFadeStyle = ref<string>("opacity: 0;");
+  const harmonyChatStyle = ref<string>("transform: translateY(0px) scale(0.7); opacity: 1; pointer-events: none;");
+  const harmonyScrimStyle = ref<string>("opacity: 0.3;");
+  const harmonyPullHintStyle = ref<string>("top: " + pullHintTopPx + "px; transform: translateY(-2px); background-color: " + PULL_HINT_BACKGROUND_COLOR + "; opacity: 0;");
+  const harmonyTabBarStyle = ref<string>("transform: translateY(0px);");
+
+  function harmonyTransition(durationMs: number, properties: string): string {
+    return "transition-property: " + properties
+      + "; transition-duration: " + Math.max(0, durationMs) + "ms"
+      + "; transition-timing-function: " + (durationMs <= 0 ? "linear" : STAGE_EASING) + ";";
+  }
+
+  function applyHarmonyPullFrame(distance: number, progress: number): void {
+    harmonyShellStyle.value = "transform: translateY(" + distance + "px); pointer-events: auto; " + harmonyTransition(0, "transform");
+    harmonyShellFadeStyle.value = "opacity: " + (progress * 0.14) + "; " + harmonyTransition(0, "opacity");
+    harmonyChatStyle.value = "transform: translateY(0px) scale(" + (PULL_CHAT_BASE_SCALE + (1 - PULL_CHAT_BASE_SCALE) * progress) + "); opacity: 1; pointer-events: none; " + harmonyTransition(0, "transform");
+    harmonyScrimStyle.value = "opacity: " + SCRIM_DIM_OPACITY + ";";
+    harmonyTabBarStyle.value = "transform: translateY(" + (-distance) + "px); " + harmonyTransition(0, "transform");
+    const hintProgress = pullHintProgress(distance);
+    harmonyPullHintStyle.value = "top: " + pullHintTopPx + "px; transform: translateY(-2px); background-color: " + PULL_HINT_BACKGROUND_COLOR + "; opacity: " + hintProgress + "; " + harmonyTransition(0, "opacity");
+  }
+
+  function resetHarmonyStageStyles(animated: boolean): void {
+    const duration = animated ? STAGE_DURATION_MS : 0;
+    harmonyShellStyle.value = "transform: translateY(0px); pointer-events: auto; " + harmonyTransition(duration, "transform");
+    harmonyShellFadeStyle.value = "opacity: 0; " + harmonyTransition(duration, "opacity");
+    harmonyChatStyle.value = "transform: translateY(0px) scale(" + PULL_CHAT_BASE_SCALE + "); opacity: 1; pointer-events: none; " + harmonyTransition(duration, "transform");
+    harmonyScrimStyle.value = "opacity: " + SCRIM_DIM_OPACITY + ";";
+    harmonyPullHintStyle.value = "top: " + pullHintTopPx + "px; transform: translateY(-2px); background-color: " + PULL_HINT_BACKGROUND_COLOR + "; opacity: 0; " + harmonyTransition(duration, "opacity");
+    harmonyTabBarStyle.value = "transform: translateY(0px); " + harmonyTransition(duration, "transform");
+  }
+
+  function commitHarmonyStageStyles(): void {
+    const height = Math.max(1, uni.getWindowInfo().windowHeight);
+    harmonyShellStyle.value = "transform: translateY(" + height + "px); pointer-events: auto; " + harmonyTransition(PULL_COMMIT_DURATION_MS, "transform");
+    harmonyShellFadeStyle.value = "opacity: 0.14; " + harmonyTransition(PULL_COMMIT_DURATION_MS, "opacity");
+    harmonyChatStyle.value = "transform: translateY(0px) scale(1); opacity: 1; pointer-events: none; " + harmonyTransition(PULL_COMMIT_DURATION_MS, "transform");
+    harmonyTabBarStyle.value = "transform: translateY(0px); " + harmonyTransition(PULL_COMMIT_DURATION_MS, "transform");
+    harmonyPullHintStyle.value = "top: " + pullHintTopPx + "px; transform: translateY(-2px); background-color: " + PULL_HINT_BACKGROUND_COLOR + "; opacity: 0; " + harmonyTransition(PULL_COMMIT_DURATION_MS, "opacity");
+  }
+
+  function finishHarmonyStageCommit(): void {
+    const height = Math.max(1, uni.getWindowInfo().windowHeight);
+    harmonyShellStyle.value = "transform: translateY(" + height + "px); pointer-events: none; " + harmonyTransition(0, "transform");
+    harmonyChatStyle.value = "transform: none; opacity: 1; pointer-events: auto;";
+    harmonyTabBarStyle.value = "transform: translateY(0px);";
+  }
+  // #endif
+
+  const safeAreaStyle = computed((): string => {
+    // #ifdef APP
+    return "padding-left: " + safeArea.value.left + "px; padding-right: " + safeArea.value.right + "px;";
+    // #endif
+    // #ifndef APP
+    return "";
+    // #endif
+  });
+
+  function screenHeight(): number { return Math.max(1, uni.getWindowInfo().windowHeight); }
+
+  function handleTabChange(index: number): void {
+    if (pullChatActive.value || stageAnimating) return;
+    if (index == 1) unionRecordVisited.value = true;
+    selectMainTab(index);
+  }
+
+  function clearStageAnimationTimer(): void {
+    if (stageAnimationTimer != 0) {
+      clearTimeout(stageAnimationTimer);
+      stageAnimationTimer = 0;
+    }
+  }
+
+  function clearStageNodes(): void {
+    stageShellEl = null;
+    stageShellFadeEl = null;
+    stageChatEl = null;
+    stageScrimEl = null;
+    stagePullHintEl = null;
+    stageTabBarEl = null;
+  }
+
+  function resolveStageNodes(): void {
+    if (stageShellEl == null) stageShellEl = uni.getElementById("partner-pull-shell") as UniElement | null;
+    if (stageShellFadeEl == null) stageShellFadeEl = uni.getElementById("partner-pull-shell-fade") as UniElement | null;
+    if (stageChatEl == null) stageChatEl = uni.getElementById("partner-pull-chat") as UniElement | null;
+    if (stageScrimEl == null) stageScrimEl = uni.getElementById("partner-pull-scrim") as UniElement | null;
+    if (stagePullHintEl == null) stagePullHintEl = uni.getElementById("partner-pull-release-hint") as UniElement | null;
+    if (stageTabBarEl == null) stageTabBarEl = uni.getElementById("main-common-tab-bar") as UniElement | null;
+  }
+
+  function setNodeTransition(node: UniElement | null, durationMs: number, properties: string): void {
+    if (node == null) return;
+    node.style.setProperty("transition-property", properties);
+    node.style.setProperty("transition-duration", Math.max(0, durationMs) + "ms");
+    node.style.setProperty("transition-timing-function", durationMs <= 0 ? "linear" : STAGE_EASING);
+  }
+
+  function setStageTransition(durationMs: number): void {
+    resolveStageNodes();
+    setNodeTransition(stageShellEl, durationMs, "transform");
+    setNodeTransition(stageShellFadeEl, durationMs, "opacity");
+    setNodeTransition(stageChatEl, durationMs, "transform, opacity");
+    setNodeTransition(stageScrimEl, durationMs, "opacity");
+    setNodeTransition(stagePullHintEl, durationMs, "opacity");
+    setNodeTransition(stageTabBarEl, durationMs, "transform");
+  }
+
+  function setStageHitTesting(chatVisible: boolean): void {
+    resolveStageNodes();
+    const shell = stageShellEl;
+    const chat = stageChatEl;
+    if (shell != null) shell.style.setProperty("pointer-events", chatVisible ? "none" : "auto");
+    if (chat != null) chat.style.setProperty("pointer-events", chatVisible ? "auto" : "none");
+  }
+
+  function firePullHaptic(): void {
+    if (pullHapticFired) return;
+    pullHapticFired = true;
+    // #ifdef APP
+    try {
+      uni.vibrateShort({ type: "light", fail: (_err) => {} });
+    } catch (_error) {
+      // ignore
+    }
+    // #endif
+  }
+
+  function showPreparedChat(): void {
+    if (pullChatShown) return;
+    const proxy = pullChatRef.value as ComponentPublicInstance | null;
+    if (proxy == null) return;
+    proxy.$callMethod("onPageShow");
+    pullChatShown = true;
+  }
+
+  function hidePreparedChat(): void {
+    if (!pullChatShown) return;
+    const proxy = pullChatRef.value as ComponentPublicInstance | null;
+    if (proxy != null) proxy.$callMethod("onPageHide");
+    pullChatShown = false;
+  }
+
+  function applyPullFrame(distanceValue: number): void {
+    resolveStageNodes();
+    const shell = stageShellEl;
+    const shellFade = stageShellFadeEl;
+    const chat = stageChatEl;
+    const scrim = stageScrimEl;
+    const pullHint = stagePullHintEl;
+    const tabBar = stageTabBarEl;
+    if (shell == null) return;
+    const distance = Math.max(0, distanceValue);
+    const progress = Math.max(0, Math.min(distance / PULL_TRIGGER_PX, 1));
+    // #ifdef APP-HARMONY
+    applyHarmonyPullFrame(distance, progress);
+    // #endif
+    // #ifndef APP-HARMONY
+    shell.style.setProperty("transform", "translateY(" + distance + "px)");
+    // #endif
+    // 背层会话：静止 70%，随手势下拉一路放大到 100%（与上方消息页下移同一条 progress）。
+    // 只写 transform 合成属性，拖动期不做布局；内容恒不透明，层次靠上方遮罩薄雾给。
+    // #ifndef APP-HARMONY
+    if (chat != null) {
+      chat.style.setProperty("transform", "translateY(0px) scale(" + (PULL_CHAT_BASE_SCALE + (1 - PULL_CHAT_BASE_SCALE) * progress) + ")");
+    }
+    if (shellFade != null) shellFade.style.setProperty("opacity", (progress * 0.14) + "");
+    if (tabBar != null) tabBar.style.setProperty("transform", "translateY(" + (-distance) + "px)");
+    if (pullHint != null) {
+      const hintProgress = pullHintProgress(distance);
+      pullHint.style.setProperty("opacity", hintProgress + "");
+    }
+    // 遮罩在拖动期恒为"薄雾"，不跟 progress：静止时消息页（z-index 3）本来就盖住
+    // 背层，遮罩不需要靠不透明来藏东西；一旦开始下移，露出的第一像素起就该是
+    // 可辨认的会话页。原来的做法是到 42px 才由 1 硬切到 0.55，快速上下滑反复穿过
+    // 该阈值时顶部会一闪一闪全是灰区（真机反馈「看不到智能体会话页面」）。
+    if (scrim != null) {
+      scrim.style.setProperty("opacity", SCRIM_DIM_OPACITY + "");
+    }
+    // #endif
+    pullArmed = distance >= PULL_TRIGGER_PX;
+    if (pullArmed) {
+      pullReachedTrigger = true;
+      // 在前层仍遮住大部分会话时完成 onShow 带来的响应式更新，松手提交时只做合成层动画。
+      showPreparedChat();
+      firePullHaptic();
+    }
+  }
+
+  function resetPullStage(animated: boolean): void {
+    clearStageAnimationTimer();
+    stageAnimating = animated;
+    setStageTransition(animated ? STAGE_DURATION_MS : 0);
+    const shell = stageShellEl;
+    const shellFade = stageShellFadeEl;
+    const chat = stageChatEl;
+    const scrim = stageScrimEl;
+    const pullHint = stagePullHintEl;
+    const tabBar = stageTabBarEl;
+    // #ifdef APP-HARMONY
+    resetHarmonyStageStyles(animated);
+    // #endif
+    // #ifndef APP-HARMONY
+    if (shell != null) {
+      shell.style.setProperty("transform", "translateY(0px)");
+    }
+    if (shellFade != null) shellFade.style.setProperty("opacity", "0");
+    if (chat != null) {
+      chat.style.setProperty("transform", "translateY(0px) scale(" + PULL_CHAT_BASE_SCALE + ")");
+      chat.style.setProperty("opacity", "1");
+    }
+    if (scrim != null) scrim.style.setProperty("opacity", "1");
+    if (tabBar != null) tabBar.style.setProperty("transform", "translateY(0px)");
+    if (pullHint != null) pullHint.style.setProperty("opacity", "0");
+    // #endif
+    pullGestureActive = false;
+    closeGestureActive = false;
+    pullArmed = false;
+    pullReachedTrigger = false;
+    pullHapticFired = false;
+    setStageHitTesting(false);
+    if (!pullChatActive.value) setAndroidScrollInteractionEnabled("im-chat-body", false);
+    if (!pullChatActive.value) hidePreparedChat();
+    if (animated) {
+      stageAnimationTimer = setTimeout((): void => {
+        stageAnimationTimer = 0;
+        stageAnimating = false;
+        setStageTransition(0);
+        // #ifdef APP-HARMONY
+        resetHarmonyStageStyles(false);
+        // #endif
+      }, STAGE_DURATION_MS);
+    } else {
+      stageAnimating = false;
+    }
+  }
+
+  function commitPullStage(): void {
+    clearStageAnimationTimer();
+    pullChatActive.value = true;
+    // Android 原生 scroll-view 在隐藏期禁用，先恢复交互，再把本次下拉可能带偏的列表
+    // 强制归到最新消息；归位发生在前层滑出前，用户进入时直接看到终态。
+    setAndroidScrollInteractionEnabled("im-chat-body", true);
+    showPreparedChat();
+    const proxy = pullChatRef.value as ComponentPublicInstance | null;
+    if (proxy != null) proxy.$callMethod("preparePullEntryCommit");
+    stageAnimating = true;
+    setStageTransition(PULL_COMMIT_DURATION_MS);
+    const shell = stageShellEl;
+    const shellFade = stageShellFadeEl;
+    const chat = stageChatEl;
+    const scrim = stageScrimEl;
+    const pullHint = stagePullHintEl;
+    const tabBar = stageTabBarEl;
+    // #ifdef APP-HARMONY
+    commitHarmonyStageStyles();
+    // #endif
+    // #ifndef APP-HARMONY
+    if (shell != null) {
+      shell.style.setProperty("transform", "translateY(" + screenHeight() + "px)");
+    }
+    if (shellFade != null) shellFade.style.setProperty("opacity", "0.14");
+    if (chat != null) {
+      chat.style.setProperty("transform", "translateY(0px) scale(1)");
+      chat.style.setProperty("opacity", "1");
+    }
+    if (scrim != null) scrim.style.setProperty("opacity", "0");
+    if (tabBar != null) tabBar.style.setProperty("transform", "translateY(0px)");
+    if (pullHint != null) pullHint.style.setProperty("opacity", "0");
+    // #endif
+    stageAnimationTimer = setTimeout((): void => {
+      stageAnimationTimer = 0;
+      stageAnimating = false;
+      pullGestureActive = false;
+      pullArmed = false;
+      pullReachedTrigger = false;
+      pullHapticFired = false;
+      setStageTransition(0);
+      setStageHitTesting(true);
+      // #ifdef APP-HARMONY
+      finishHarmonyStageCommit();
+      // #endif
+    }, PULL_COMMIT_DURATION_MS);
+  }
+
+  function handlePullGestureStart(): void {
+    if (!pullChatPrepared.value || pullChatActive.value || stageAnimating || activeIndex.value != 0) return;
+    clearStageAnimationTimer();
+    resolveStageNodes();
+    // #ifdef APP-HARMONY
+    // 返回消息页后，下一次下拉从首帧就恢复背层会话生命周期，给鸿蒙原生视图提前
+    // 完成重绘；不能等越过阈值才 onShow，否则前半段会先露出 stage 的灰色底层。
+    showPreparedChat();
+    // #endif
+    pullGestureActive = true;
+    pullArmed = false;
+    pullReachedTrigger = false;
+    pullHapticFired = false;
+    setStageTransition(0);
+  }
+
+  function handlePullGestureMove(distance: number): void {
+    if (!pullGestureActive || stageAnimating) return;
+    applyPullFrame(distance);
+  }
+
+  function handlePullGestureEnd(distance: number, velocity: number): void {
+    if (!pullGestureActive || stageAnimating) return;
+    // 一次手势中如果已经越过正式阈值，随后又主动退回阈值内，松手应视为取消。
+    // 快速提交只保留给从未越过正式阈值的短促下拉。
+    const retreatedBelowTrigger = pullReachedTrigger && distance < PULL_TRIGGER_PX;
+    const shouldCommit = !retreatedBelowTrigger && (
+      distance >= PULL_TRIGGER_PX ||
+      (distance >= PULL_FAST_MIN_PX && velocity >= PULL_FAST_VELOCITY)
+    );
+    if (shouldCommit) {
+      firePullHaptic();
+      commitPullStage();
+    } else {
+      resetPullStage(true);
+    }
+  }
+
+  function handlePullGestureCancel(): void {
+    if (!pullGestureActive || stageAnimating) return;
+    resetPullStage(true);
+  }
+
+  function handleChatSwipeStart(): void {
+    if (!pullChatActive.value || stageAnimating) return;
+    clearStageAnimationTimer();
+    resolveStageNodes();
+    closeGestureActive = true;
+    setStageTransition(0);
+    // #ifdef APP-HARMONY
+    // 鸿蒙返回时只把前层消息页从屏幕底部拉回，不再移动/淡出背层会话。
+    // 原生命令式 opacity/transform 会残留到下一次下拉，表现为整屏灰色。
+    harmonyShellStyle.value = "transform: translateY(" + screenHeight() + "px); pointer-events: auto; " + harmonyTransition(0, "transform");
+    harmonyChatStyle.value = "transform: none; opacity: 1; pointer-events: auto;";
+    // #endif
+    // #ifndef APP-HARMONY
+    const shell = stageShellEl;
+    if (shell != null) {
+      shell.style.setProperty("transform", "translateY(" + screenHeight() + "px)");
+    }
+    // #endif
+  }
+
+  function handleChatSwipeMove(distanceValue: number): void {
+    if (!closeGestureActive || stageAnimating) return;
+    const height = screenHeight();
+    const distance = Math.max(0, Math.min(distanceValue, height));
+    // #ifdef APP-HARMONY
+    harmonyShellStyle.value = "transform: translateY(" + Math.max(0, height - distance * 1.35) + "px); pointer-events: auto; " + harmonyTransition(0, "transform");
+    harmonyChatStyle.value = "transform: none; opacity: 1; pointer-events: auto;";
+    // #endif
+    // #ifndef APP-HARMONY
+    const fadeProgress = Math.max(0, Math.min(distance / (CLOSE_TRIGGER_PX * 1.6), 1));
+    const chat = stageChatEl;
+    const shell = stageShellEl;
+    if (chat != null) {
+      // 上滑退出只做位移，不缩放：缩放会让整棵会话子树每帧重新光栅化（Android 上尤其重），
+      // 且与「下拉放大」不对称——退出时保持 100%，滑走即可。
+      chat.style.setProperty("transform", "translateY(" + (-distance) + "px) scale(1)");
+      chat.style.setProperty("opacity", (1 - fadeProgress * 0.28) + "");
+    }
+    if (shell != null) {
+      shell.style.setProperty("transform", "translateY(" + Math.max(0, height - distance * 1.35) + "px)");
+    }
+    // #endif
+  }
+
+  function finishChatClose(): void {
+    clearStageAnimationTimer();
+    resolveStageNodes();
+    stageAnimating = true;
+    setStageTransition(STAGE_DURATION_MS);
+    // #ifdef APP-HARMONY
+    harmonyShellStyle.value = "transform: translateY(0px); pointer-events: auto; " + harmonyTransition(STAGE_DURATION_MS, "transform");
+    harmonyChatStyle.value = "transform: none; opacity: 1; pointer-events: none;";
+    // #endif
+    // #ifndef APP-HARMONY
+    const chat = stageChatEl;
+    const shell = stageShellEl;
+    const scrim = stageScrimEl;
+    if (chat != null) {
+      // 退出全程不缩放（与 handleChatSwipeMove 同口径），只上移淡出
+      chat.style.setProperty("transform", "translateY(" + (-screenHeight()) + "px) scale(1)");
+      chat.style.setProperty("opacity", "0");
+    }
+    if (shell != null) {
+      shell.style.setProperty("transform", "translateY(0px)");
+    }
+    if (scrim != null) scrim.style.setProperty("opacity", "1");
+    // #endif
+    stageAnimationTimer = setTimeout((): void => {
+      stageAnimationTimer = 0;
+      pullChatActive.value = false;
+      hidePreparedChat();
+      resetPullStage(false);
+    }, STAGE_DURATION_MS);
+  }
+
+  function cancelChatClose(): void {
+    clearStageAnimationTimer();
+    stageAnimating = true;
+    setStageTransition(STAGE_DURATION_MS);
+    // #ifdef APP-HARMONY
+    harmonyShellStyle.value = "transform: translateY(" + screenHeight() + "px); pointer-events: none; " + harmonyTransition(STAGE_DURATION_MS, "transform");
+    harmonyChatStyle.value = "transform: none; opacity: 1; pointer-events: auto;";
+    // #endif
+    // #ifndef APP-HARMONY
+    const chat = stageChatEl;
+    const shell = stageShellEl;
+    if (chat != null) {
+      chat.style.setProperty("transform", "translateY(0px) scale(1)");
+      chat.style.setProperty("opacity", "1");
+    }
+    if (shell != null) {
+      shell.style.setProperty("transform", "translateY(" + screenHeight() + "px)");
+    }
+    // #endif
+    stageAnimationTimer = setTimeout((): void => {
+      stageAnimationTimer = 0;
+      stageAnimating = false;
+      closeGestureActive = false;
+      setStageTransition(0);
+    }, STAGE_DURATION_MS);
+  }
+
+  function handleChatSwipeEnd(distance: number, velocity: number): void {
+    const shouldClose = distance >= CLOSE_TRIGGER_PX || (distance >= CLOSE_FAST_MIN_PX && velocity >= CLOSE_FAST_VELOCITY);
+    if (!closeGestureActive || stageAnimating) return;
+    if (shouldClose) finishChatClose(); else cancelChatClose();
+  }
+
+  function handleChatSwipeCancel(): void {
+    if (!closeGestureActive || stageAnimating) return;
+    cancelChatClose();
+  }
+
+  function closePullChat(): void {
+    if (!pullChatActive.value || stageAnimating) return;
+    resolveStageNodes();
+    closeGestureActive = true;
+    // #ifdef APP-HARMONY
+    harmonyShellStyle.value = "transform: translateY(" + screenHeight() + "px); pointer-events: auto; " + harmonyTransition(0, "transform");
+    // #endif
+    // #ifndef APP-HARMONY
+    const shell = stageShellEl;
+    if (shell != null) {
+      shell.style.setProperty("transform", "translateY(" + screenHeight() + "px)");
+    }
+    // #endif
+    finishChatClose();
+  }
+
+  function chatUrlParam(url: string, key: string): string {
+    const queryAt = url.indexOf("?");
+    if (queryAt < 0) return "";
+    const parts = url.substring(queryAt + 1).split("&");
+    for (let i = 0; i < parts.length; i++) {
+      const pair = parts[i].split("=");
+      if (pair.length >= 2 && pair[0] == key) {
+        const decoded = decodeURIComponent(pair[1]);
+        return decoded != null ? decoded : pair[1];
+      }
+    }
+    return "";
+  }
+
+  function makePullChatOptions(url: string): UTSJSONObject {
+    return {
+      convId: chatUrlParam(url, "convId"),
+      convType: chatUrlParam(url, "convType"),
+      name: chatUrlParam(url, "name"),
+      avatar: chatUrlParam(url, "avatar"),
+      peerSubject: chatUrlParam(url, "peerSubject"),
+      agentId: chatUrlParam(url, "agentId"),
+      peerId: chatUrlParam(url, "peerId"),
+      guidePrompt: chatUrlParam(url, "guidePrompt"),
+      pullEntry: "1",
+    };
+  }
+
+  function initPreparedChat(attempt: number): void {
+    const proxy = pullChatRef.value as ComponentPublicInstance | null;
+    const options = pullChatOptions;
+    if (proxy == null || options == null) {
+      if (attempt < 8 && pullChatPrepared.value) setTimeout((): void => { initPreparedChat(attempt + 1); }, 16);
+      return;
+    }
+    proxy.$callMethod("initFromOptions", options);
+    proxy.$callMethod("onPageReady");
+    pullChatShown = false;
+    nextTick((): void => {
+      clearStageNodes();
+      resolveStageNodes();
+      resetPullStage(false);
+    });
+    // 背层会话的消息列表关掉 Android 原生 overscroll：拉伸期间 touch 坐标会在
+    // 「屏幕坐标 / 内容坐标」两套基准间切换，上滑收起手势的距离值来回跳、卡片持续抖动。
+    // 列表挂载需要一两拍，这里延迟一次；重复调用幂等。
+    setTimeout((): void => {
+      disableAndroidOverScroll("im-chat-body");
+      // 初始化后 300ms 内若用户已经完成下拉进入，不能让这笔旧定时器把前台列表再禁用。
+      if (!pullChatActive.value) setAndroidScrollInteractionEnabled("im-chat-body", false);
+    }, 300);
+  }
+
+  function unloadPreparedChat(): void {
+    const proxy = pullChatRef.value as ComponentPublicInstance | null;
+    if (proxy != null) {
+      hidePreparedChat();
+      proxy.$callMethod("onPageUnload");
+    }
+    pullChatShown = false;
+  }
+
+  function preparePullChat(url: string): void {
+    if (url.length == 0 || url == pullChatUrl) return;
+    // 当前会话正在展开或已经展示时，不允许接口晚回包重建背层组件。
+    // 目标配置变化留到回到伙伴页后再应用，避免 active 被重置导致瞬间闪回列表。
+    if (stageAnimating || pullGestureActive || pullChatActive.value || closeGestureActive) return;
+    if (pullChatPrepared.value) unloadPreparedChat();
+    pullChatUrl = url;
+    pullChatOptions = makePullChatOptions(url);
+    pullChatActive.value = false;
+    pullChatShown = false;
+    pullChatKey.value = pullChatKey.value + 1;
+    pullChatPrepared.value = true;
+    clearStageNodes();
+    nextTick((): void => { initPreparedChat(0); });
+  }
+
+  watch((): string => mainTabActivePath.value, (path: string) => {
+    // 覆盖底栏点击之外的程序化切换、登录回跳和 tab-shell?tab=... 冷启动直达。
+    if (path == MAIN_TAB_PATHS[1]) unionRecordVisited.value = true;
+    if (path != "/pages/message/message") closePartnerVoiceDrawer();
+    if (mainTabPageVisible.value) syncMainTabLocation();
+  });
+
+  function promptProfileSetup(): void {
+    maybePromptProfileSetup((_raw: UTSJSONObject): boolean => {
+      if (!contentMounted || !props.visible) return false;
+      uni.navigateTo({ url: "/pages/profile-setup/profile-setup" });
+      return true;
+    });
+  }
+
+  function showContent(): void {
+    safeArea.value = readMainTabSafeArea();
+    syncNativeTabBarState();
+    mainTabPageVisible.value = true;
+    syncMainTabLocation();
+    if (pullChatPrepared.value && pullChatActive.value) {
+      setAndroidScrollInteractionEnabled("im-chat-body", true);
+      showPreparedChat();
+      nextTick((): void => { setStageHitTesting(true); });
+    } else {
+      setAndroidScrollInteractionEnabled("im-chat-body", false);
+      nextTick((): void => { setStageHitTesting(false); });
+    }
+    if (contentReady) promptProfileSetup();
+  }
+
+  function readyContent(): void {
+    if (!contentMounted || !props.pageReady || contentReady) return;
+    contentReady = true;
+    safeArea.value = readMainTabSafeArea();
+    nextTick((): void => {
+      if (!contentMounted) return;
+      resolveStageNodes();
+      if (props.visible) promptProfileSetup();
+    });
+  }
+
+  function hideContent(): void {
+    mainTabPageVisible.value = false;
+    setAndroidScrollInteractionEnabled("im-chat-body", false);
+    hidePreparedChat();
+  }
+
+  onMounted(() => {
+    contentMounted = true;
+    if (props.visible) showContent();
+    readyContent();
+  });
+  watch((): boolean => props.visible, (visible: boolean) => {
+    if (!contentMounted) return;
+    if (visible) showContent(); else hideContent();
+  });
+  watch((): boolean => props.pageReady, (_ready: boolean) => { readyContent(); });
+
+  onUnmounted(() => {
+    contentMounted = false;
+    hideContent();
+    clearStageAnimationTimer();
+    closePartnerVoiceDrawer();
+    if (pullChatPrepared.value) unloadPreparedChat();
+    clearStageNodes();
+    mainTabPageVisible.value = false;
+  });
+
+  function onPageBackPress(options: OnBackPressOptions): boolean {
+    if (stageAnimating) return true;
+    if (pullChatActive.value) {
+      const proxy = pullChatRef.value as ComponentPublicInstance | null;
+      if (proxy != null) {
+        const handled = proxy.$callMethod("onPageBackPress", options) as boolean;
+        if (handled) return true;
+      }
+      closePullChat();
+      return true;
+    }
+    // 录音抽屉优先于返回：开着的抽屉先收（Stage 未激活时）。
+    if (partnerVoiceOpen.value || partnerVoiceOffset.value > 0) {
+      closePartnerVoiceDrawer();
+      return true;
+    }
+    return dispatchMainTabBack(mainTabActivePath.value, options);
+  }
+
+  function onPageResize(options: OnResizeOptions): void {
+    safeArea.value = readMainTabSafeArea();
+    if (pullChatActive.value && !closeGestureActive) {
+      resolveStageNodes();
+      // #ifdef APP-HARMONY
+      harmonyShellStyle.value = "transform: translateY(" + screenHeight() + "px); pointer-events: none; " + harmonyTransition(0, "transform");
+      // #endif
+      // #ifndef APP-HARMONY
+      const shell = stageShellEl;
+      if (shell != null) shell.style.setProperty("transform", "translateY(" + screenHeight() + "px)");
+      // #endif
+    }
+    dispatchMainTabResize(mainTabActivePath.value, options);
+  }
+
+  defineExpose({ onPageBackPress, onPageResize });
+</script>
+
+<style scoped>
+  .tab-shell-stage { flex: 1; height: 100%; position: relative; overflow: hidden; background-color: #f1f0f5; }
+  /* 背层会话静止态：0.7 缩放、不透明，缩放原点在顶部中间——下拉露出的第一屏就是
+     会话页顶部而不是空白灰区。scale 数值须与 PULL_CHAT_BASE_SCALE 同步（首帧走这里，
+     之后由合成层每帧覆写）。 */
+  .tab-shell__chat-layer { position: absolute; left: 0; right: 0; top: 0; bottom: 0; z-index: 1; background-color: #ffffff; transform-origin: center top; transform: translateY(0px) scale(0.7); opacity: 1; pointer-events: none; }
+  .tab-shell__pull-scrim { position: absolute; left: 0; right: 0; top: 0; bottom: 0; z-index: 2; background-color: #f1f0f5; opacity: 1; pointer-events: none; }
+  .tab-shell__shell { position: absolute; left: 0; right: 0; top: 0; bottom: 0; z-index: 3; overflow: hidden; transform: translateY(0px); }
+  .tab-shell__shell-fade { position: absolute; left: 0; right: 0; top: 0; bottom: 0; z-index: 10; background-color: #ffffff; opacity: 0; pointer-events: none; }
+  .tab-shell__pull-release-hint { position: absolute; left: 50%; margin-left: -58px; width: 116px; height: 28px; z-index: 11; border-radius: 14px; background-color: #e7e6ea; align-items: center; justify-content: center; opacity: 0; pointer-events: none; }
+  .tab-shell__pull-release-hint-text { color: #55545c; font-size: 13px; line-height: 18px; }
+  .tab-shell { flex: 1; height: 100%; box-sizing: border-box; background-color: #ffffff; /* #ifdef H5 || WEB */ padding-top: constant(safe-area-inset-top); padding-top: env(safe-area-inset-top, 0px); padding-left: constant(safe-area-inset-left); padding-left: env(safe-area-inset-left, 0px); padding-right: constant(safe-area-inset-right); padding-right: env(safe-area-inset-right, 0px); /* #endif */ }
+  /* 录音抽屉与主界面同排（宽 = 两屏，横向位移见 trackStyle）；`.tab-shell-stage` 与
+     `.tab-shell` 的样式沿用上方 Stage 版本，勿重复定义。 */
+  .tab-shell-track {
+    height: 100%;
+    flex-direction: row;
+    flex-shrink: 0;
+  }
+
+  .tab-shell-record {
+    height: 100%;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: #ffffff;
+  }
+
+  .tab-shell-foreground {
+    height: 100%;
+    flex-shrink: 0;
+    overflow: hidden;
+    background-color: #ffffff;
+    box-shadow: -8px 0 18px rgba(0, 0, 0, 0.12);
+  }
+</style>

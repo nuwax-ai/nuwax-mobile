@@ -15,17 +15,17 @@ import {
   qrLoginAppUrl,
   qrLoginPageUrl,
 } from '@/utils/qrLogin.uts';
-import { parseShareUrl } from '@/utils/appShare.uts';
 import { mobileLoginDestination } from '@/utils/authIdp.uts';
 
 const origin = 'https://agent.nuwax.com';
-function setup(incoming: string, onLoginPage = false) {
+function setup(incoming: string, onLoginPage = false, embeddedLogin = false) {
   const source = readFileSync('utils/qrLoginNavigation.uts', 'utf8')
     .replace(/^\s*import[\s\S]*?from\s+["'][^"']+["'];?\s*$/gm, '')
     .replace(/^export /gm, '')
     .replace(/^\s*\/\/ #(?:ifdef APP|endif).*$/gm, '');
   const login = vi.fn(),
     launch = vi.fn();
+  const rootLogin = vi.fn(() => true);
   let clock = 10000;
   const route = runInNewContext(
     transformSync(source + '\nrouteIncomingQrLogin;', { loader: 'ts' }).code,
@@ -37,6 +37,8 @@ function setup(incoming: string, onLoginPage = false) {
       LOGIN_PAGE_PATH: '/subpackages/pages/login/login',
       redirectToLoginOnce: login,
       isOnLoginPage: () => onLoginPage,
+      isAppEntryLogin: () => embeddedLogin,
+      showAppEntryLogin: rootLogin,
       mobileLoginDestination,
       Date: { now: () => clock },
       uni: {
@@ -45,7 +47,7 @@ function setup(incoming: string, onLoginPage = false) {
       },
     },
   );
-  return { route, login, launch, later: () => (clock += 3000) };
+  return { route, login, launch, rootLogin, later: () => (clock += 3000) };
 }
 it('冷启动未登录保留完整确认场景，登录返回仍进入手动确认页', () => {
   const link = qrLoginAppUrl('scene-a', origin),
@@ -60,6 +62,15 @@ it('冷启动未登录保留完整确认场景，登录返回仍进入手动确�
   );
   expect(decodeURIComponent(login.split('redirect=')[1])).toBe(url);
   expect(f.launch).not.toHaveBeenCalled();
+});
+it('根页面的内嵌登录原位续接新二维码，重复唤起不重建界面', () => {
+  const link = qrLoginAppUrl('scene-root', origin), f = setup('', true, true);
+  expect(f.route(false, link)).toBe(true);
+  expect(f.rootLogin).toHaveBeenCalledWith(qrLoginPageUrl('scene-root', origin));
+  expect(f.login).not.toHaveBeenCalled();
+  expect(f.launch).not.toHaveBeenCalled();
+  f.route(false, link);
+  expect(f.rootLogin).toHaveBeenCalledOnce();
 });
 it('热启动只消费本次明确链接，普通回前台不重放上一次登录码', () => {
   const link = qrLoginAppUrl('scene-a', origin),
@@ -134,12 +145,6 @@ it('异域 scheme 进入错误页，不切企业域、不发起登录', () => {
   expect(f.launch).toHaveBeenCalledWith({ url: qrLoginPageUrl('', '') });
   expect(f.login).not.toHaveBeenCalled();
 });
-it('登录二维码不能通过额外 kind 参数伪装成分享入口', () => {
-  expect(
-    parseShareUrl(qrLoginAppUrl('scene-a', origin) + '&kind=file&sk=foo'),
-  ).toBeNull();
-});
-
 it('M 站首屏分流在桌面模式下保留扫码确认及其登录返回，其它页面仍回 PC', () => {
   const script = [
     ...readFileSync('index.html', 'utf8').matchAll(

@@ -8,7 +8,7 @@
 import { getApiBaseUrl } from "@/constants/config";
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { isAppWebViewEmbedded, applyXClientTypeHeader } from "@/utils/appWebViewDetect";
-import { resolveAuthProtectedFileFetchUrl } from "@/utils/authProtectedFileUrl";
+import { downloadAuthProtectedFileToTemp, errorReasonText, isAuthProtectedFileUrl, resolveAuthProtectedFileFetchUrl } from "@/utils/authProtectedFileUrl";
 import { t as translateFn, emptyI18nParams } from "@/utils/i18n";
 
 const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
@@ -631,6 +631,57 @@ function albumSaveToast(title: string, icon: string, aboveDialog: boolean): void
 }
 
 /**
+ * 把媒体地址取到本地临时文件（保存相册 / 原生查看器共用）。
+ *
+ * ★受保护 `/api/f/**` 必须走 downloadAuthProtectedFileToTemp（与文件详情页下载同一条链路）：
+ * 鸿蒙下载器跟随 302 到对象存储时会把 Authorization 原样转发，S3/MinIO 把它当非法签名
+ * 直接回 400 —— 2026-11-16 真机实证：会话页长按视频「下载视频」1~2 秒即弹
+ * 「下载失败，请检查网络」，同一条视频在 Android/iOS 正常（这两端跨主机重定向会丢鉴权头）。
+ * 统一链路的鸿蒙分支先用 /api/file/ak/refresh 换临时签名直链，再以空请求头下载。
+ *
+ * 非受保护地址（CDN / S3 直链）保持原来的裸下载：只在同源时带 Bearer，
+ * 对象存储见到业务 JWT 同样会 400。
+ */
+function downloadMediaFileForApp(url: string): Promise<string> {
+  // #ifdef APP
+  // 受保护文件走统一链路（鸿蒙=ak 直链三级兜底，Android/iOS=原 Bearer 行为）。
+  // 文件详情页能下载而这里不能的差别就在这一条：原先本函数绕过统一链路直接带 Bearer。
+  if (isAuthProtectedFileUrl(url)) {
+    return downloadAuthProtectedFileToTemp(url);
+  }
+  // #endif
+  const fetchUrl = resolveAuthProtectedFileFetchUrl(url);
+  const sameOrigin = isSameOriginPreviewUrl(fetchUrl) == true;
+  const header = new UTSJSONObject();
+  if (sameOrigin) {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    const token = tokenRaw != null ? `${tokenRaw}` : "";
+    if (token.length > 0) {
+      header.set("Authorization", `Bearer ${token}`);
+    }
+    applyXClientTypeHeader(header);
+  }
+  return new Promise<string>((resolve, reject) => {
+    uni.downloadFile({
+      url: fetchUrl,
+      header: header,
+      success: (res) => {
+        const tempPath = res.tempFilePath;
+        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+          resolve(tempPath);
+          return;
+        }
+        reject(new Error(`statusCode=${res.statusCode}`));
+      },
+      fail: (err) => {
+        const msg = readUniFailMessage(err);
+        reject(new Error(msg.length > 0 ? msg : "downloadFile fail"));
+      },
+    });
+  });
+}
+
+/**
  * APP 原生：下载预览图并保存到系统相册。内嵌 WebView 壳的预览保存、Android 原生
  * 图片查看器长按保存（经 chat.uvue ActionSheet 确认）共用本函数。
  * @param toastAboveDialog 调用方有原生全屏弹层盖着页面层时传 true：反馈 toast 走
@@ -653,65 +704,35 @@ export function savePreviewImageToAlbumInApp(
       return;
     }
     // #endif
-    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
-    const token = tokenRaw != null ? `${tokenRaw}` : "";
-    const header = new UTSJSONObject();
-    // 对象存储 / CDN 图不能带业务 JWT：S3/MinIO 会直接 400 Bad Request
-    const attachAuth = isSameOriginPreviewUrl(downloadUrl) == true && token.length > 0;
-    if (attachAuth == true) {
-      header.set("Authorization", `Bearer ${token}`);
-    }
-    if (isSameOriginPreviewUrl(downloadUrl) == true) {
-      applyXClientTypeHeader(header);
-    }
-
     if (toastAboveDialog != true) {
       uni.showLoading({ title: t("Mobile.FileTree.downloading"), mask: true });
     }
-    uni.downloadFile({
-      url: downloadUrl,
-      header: header,
-      success: (res) => {
-        const tempPath = res.tempFilePath;
-        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
-          uni.saveImageToPhotosAlbum({
-            filePath: tempPath,
-            success: (_saveRes) => {
-              uni.hideLoading();
-              albumSaveToast(t("Mobile.ImagePreview.savedToAlbum"), "success", toastAboveDialog);
-              resolve();
-            },
-            fail: (saveErr) => {
-              uni.hideLoading();
-              console.error("保存预览图到相册失败:", saveErr);
-              const saveErrMsg = readUniFailMessage(saveErr);
-              if (isAlbumPermissionError(saveErrMsg) == true || isAlbumAccessDeniedForever() == true) {
-                guideSaveImageAlbumSettings();
-              } else {
-                albumSaveToast(t("Mobile.ImagePreview.saveToAlbumFailed"), "none", toastAboveDialog);
-              }
-              reject(saveErr);
-            },
-          });
-          return;
-        }
-        uni.hideLoading();
-        albumSaveToast(t("Mobile.FileTree.downloadNetworkFailed"), "none", toastAboveDialog);
-        reject(new Error(t("Mobile.FileTree.downloadNetworkFailed")));
-      },
-      fail: (err) => {
-        uni.hideLoading();
-        let errLog = "";
-        try {
-          errLog = JSON.stringify(err);
-        } catch (_eErrLog) {
-          errLog = `${err}`;
-        }
-
-        console.error("下载预览图失败:", errLog);
-        albumSaveToast(t("Mobile.FileTree.downloadNetworkFailed"), "none", toastAboveDialog);
-        reject(err);
-      },
+    // 统一走 downloadMediaFileForApp：受保护 /api/f/** 在鸿蒙必须 ak 直链下载，
+    // 否则 302 转发 Bearer 被对象存储 400（与「下载视频」同一个坑）
+    downloadMediaFileForApp(downloadUrl).then((tempPath: string): void => {
+      uni.saveImageToPhotosAlbum({
+        filePath: tempPath,
+        success: (_saveRes) => {
+          uni.hideLoading();
+          albumSaveToast(t("Mobile.ImagePreview.savedToAlbum"), "success", toastAboveDialog);
+          resolve();
+        },
+        fail: (saveErr) => {
+          uni.hideLoading();
+          console.error("保存预览图到相册失败:", saveErr);
+          const saveErrMsg = readUniFailMessage(saveErr);
+          if (isAlbumPermissionError(saveErrMsg) == true || isAlbumAccessDeniedForever() == true) {
+            guideSaveImageAlbumSettings();
+          } else {
+            albumSaveToast(t("Mobile.ImagePreview.saveToAlbumFailed"), "none", toastAboveDialog);
+          }
+          reject(saveErr);
+        },
+      });
+    }).catch((err: any | null): void => {
+      uni.hideLoading();
+      albumSaveToast(t("Mobile.FileTree.downloadNetworkFailed"), "none", toastAboveDialog);
+      reject(err != null ? err : new Error(t("Mobile.FileTree.downloadNetworkFailed")));
     });
   });
 }
@@ -732,37 +753,12 @@ export function downloadPreviewImageToTemp(
     onFail("empty url");
     return;
   }
-  const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
-  const token = tokenRaw != null ? `${tokenRaw}` : "";
-  const header = new UTSJSONObject();
-  const sameOrigin = isSameOriginPreviewUrl(target) == true;
-  // 对象存储 / CDN 图不能带业务 JWT：S3/MinIO 会直接 400 Bad Request
-  if (sameOrigin && token.length > 0) {
-    header.set("Authorization", `Bearer ${token}`);
-  }
-  if (sameOrigin) {
-    applyXClientTypeHeader(header);
-  }
-  uni.downloadFile({
-    url: target,
-    header: header,
-    success: (res) => {
-      const tempPath = res.tempFilePath;
-      if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
-        onOk(tempPath);
-        return;
-      }
-      onFail(`http ${res.statusCode}`);
-    },
-    fail: (err) => {
-      let msg = "";
-      try {
-        msg = readUniFailMessage(err);
-      } catch (_e) {
-        msg = `${err}`;
-      }
-      onFail(msg);
-    },
+  // 统一走 downloadMediaFileForApp：受保护 /api/f/** 在鸿蒙必须 ak 直链下载
+  // （原生查看器取图同样会撞 302 转发 Bearer → 400）
+  downloadMediaFileForApp(target).then((tempPath: string): void => {
+    onOk(tempPath);
+  }).catch((err: any | null): void => {
+    onFail(errorReasonText(err));
   });
 }
 
@@ -787,73 +783,42 @@ export function saveVideoToAlbumInApp(downloadUrl: string): Promise<void> {
       return;
     }
     // #endif
-    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
-    const token = tokenRaw != null ? `${tokenRaw}` : "";
-    const header = new UTSJSONObject();
-    const attachAuth = isSameOriginPreviewUrl(downloadUrl) == true && token.length > 0;
-    if (attachAuth == true) {
-      header.set("Authorization", `Bearer ${token}`);
-    }
-    if (isSameOriginPreviewUrl(downloadUrl) == true) {
-      applyXClientTypeHeader(header);
-    }
-
     uni.showLoading({ title: t("Mobile.FileTree.downloading"), mask: true });
-    uni.downloadFile({
-      url: resolveAuthProtectedFileFetchUrl(downloadUrl),
-      header: header,
-      success: (res) => {
-        const tempPath = res.tempFilePath;
-        if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
-          uni.saveVideoToPhotosAlbum({
-            filePath: tempPath,
-            success: (_saveRes) => {
-              uni.hideLoading();
-              uni.showToast({
-                title: t("Mobile.ImagePreview.savedToAlbum"),
-                icon: "success",
-              });
-              resolve();
-            },
-            fail: (saveErr) => {
-              uni.hideLoading();
-              console.error("保存视频到相册失败:", saveErr);
-              const saveErrMsg = readUniFailMessage(saveErr);
-              if (isAlbumPermissionError(saveErrMsg) == true || isAlbumAccessDeniedForever() == true) {
-                guideSaveImageAlbumSettings();
-              } else {
-                uni.showToast({
-                  title: t("Mobile.ImagePreview.saveVideoToAlbumFailed"),
-                  icon: "none",
-                });
-              }
-              reject(saveErr);
-            },
+    // 统一走 downloadMediaFileForApp：受保护 /api/f/** 在鸿蒙用 ak 直链下载
+    // （原先这里直接带 Bearer，302 到对象存储被 400 拒绝 → 长按下载视频必失败）
+    downloadMediaFileForApp(downloadUrl).then((tempPath: string): void => {
+      uni.saveVideoToPhotosAlbum({
+        filePath: tempPath,
+        success: (_saveRes) => {
+          uni.hideLoading();
+          uni.showToast({
+            title: t("Mobile.ImagePreview.savedToAlbum"),
+            icon: "success",
           });
-          return;
-        }
-        uni.hideLoading();
-        uni.showToast({
-          title: t("Mobile.FileTree.downloadNetworkFailed"),
-          icon: "none",
-        });
-        reject(new Error(t("Mobile.FileTree.downloadNetworkFailed")));
-      },
-      fail: (err) => {
-        uni.hideLoading();
-        let errLog = "";
-        try {
-          errLog = JSON.stringify(err);
-        } catch (_eErrLog) {
-          errLog = `${err}`;
-        }
-        console.error("下载视频失败:", errLog);
-        uni.showToast({
-          title: t("Mobile.FileTree.downloadNetworkFailed"),
-          icon: "none",
-        });
-        reject(err);
-      },
+          resolve();
+        },
+        fail: (saveErr) => {
+          uni.hideLoading();
+          console.error("保存视频到相册失败:", saveErr);
+          const saveErrMsg = readUniFailMessage(saveErr);
+          if (isAlbumPermissionError(saveErrMsg) == true || isAlbumAccessDeniedForever() == true) {
+            guideSaveImageAlbumSettings();
+          } else {
+            uni.showToast({
+              title: t("Mobile.ImagePreview.saveVideoToAlbumFailed"),
+              icon: "none",
+            });
+          }
+          reject(saveErr);
+        },
+      });
+    }).catch((err: any | null): void => {
+      uni.hideLoading();
+      uni.showToast({
+        title: t("Mobile.FileTree.downloadNetworkFailed"),
+        icon: "none",
+      });
+      reject(err != null ? err : new Error(t("Mobile.FileTree.downloadNetworkFailed")));
     });
   });
 }

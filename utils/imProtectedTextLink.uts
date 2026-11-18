@@ -1,0 +1,73 @@
+/**
+ * 消息页「可读纯文本」受保护链接（/api/f/…txt / log / md / json…）的打开路由。
+ *
+ * 背景：这类链接原先统一进 file-preview-page，但预览页 source=im 分支只接
+ * pathname（extractPathnameFromRemoteUrl 剥 query），消息里带的 `?ak=` 短时
+ * 直链会被丢掉，web-view 再拿裸 /api/f/ 地址请求就是 401 → 白屏。
+ * 而站内 web-view 直接 GET 原地址可跟随 302 由对象存储内联渲染（text/plain +
+ * Range 实测正常），既保住 ak，又贴「点链接看内容」的预期。
+ *
+ * 边界（重要）：
+ * - 只放行可读文本后缀。pdf/docx/zip/图片/无后缀/未知类型一律不放行——web-view
+ *   没有下载回调，遇到附件类响应（octet-stream / Content-Disposition: attachment）
+ *   会白屏且无提示，仍交回原路由（预览网关 / 下载 / 预览页）。
+ * - html/svg 明确排除：/api/f/ 与站点同源，web-view 会在站点 origin 下执行上传
+ *   的脚本（预览页有 sk 校验，web-view 没有），安全面不接受。
+ * - web-view 带不上 Bearer，所以没有 ak 时必须先换 ak 短时直链再打开；ak 是
+ *   短期凭证，每次点击现换，别做页面级缓存。
+ */
+import { fetchAuthProtectedFileAkUrl, isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
+import { urlExtOf } from "@/utils/imChatAttachments";
+import { handleExternalLinkInWebview } from "@/utils/system";
+import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+
+const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+/** 可读文本后缀（小写、无点）：web-view 里以 text/plain 之类内联展示的类型。 */
+const READABLE_TEXT_EXTS: string[] = [
+  "txt", "log", "md", "markdown",
+  "json", "jsonl", "csv", "tsv",
+  "yml", "yaml", "xml",
+  "ini", "conf", "cfg",
+];
+
+/** URL 末段后缀是否在可读文本白名单内。 */
+export function isReadableTextFileLink(url: string): boolean {
+  const ext = urlExtOf(url);
+  return ext.length > 0 && READABLE_TEXT_EXTS.indexOf(ext) >= 0;
+}
+
+/** 地址是否已带 ak 短时签名（只看 query，避免路径里出现 "ak=" 误判）。 */
+function hasAkQuery(url: string): boolean {
+  const queryIdx = url.indexOf("?");
+  if (queryIdx < 0 || queryIdx + 1 >= url.length) {
+    return false;
+  }
+  const query = url.substring(queryIdx + 1);
+  return query == "ak" || query.indexOf("ak=") == 0 || query.indexOf("&ak=") >= 0;
+}
+
+/**
+ * 打开受保护的可读文本链接。返回 true = 已接管（同步打开或已进入异步换 ak 流程）；
+ * 返回 false = 不在本函数职责内（非受保护地址 / 非文本后缀），调用方按原路由继续。
+ */
+export function openProtectedTextLink(url: string, title: string = ""): boolean {
+  if (!isAuthProtectedFileUrl(url) || !isReadableTextFileLink(url)) {
+    return false;
+  }
+  if (hasAkQuery(url)) {
+    handleExternalLinkInWebview(url, title);
+    return true;
+  }
+  uni.showLoading({ title: "" });
+  fetchAuthProtectedFileAkUrl(url)
+    .then((akUrl: string): void => {
+      uni.hideLoading();
+      handleExternalLinkInWebview(akUrl, title);
+    })
+    .catch((_e: any | null): void => {
+      uni.hideLoading();
+      uni.showToast({ title: t("Mobile.Link.openFailed"), icon: "none" });
+    });
+  return true;
+}

@@ -1,0 +1,1116 @@
+<template>
+  <view class="vr-page">
+    <view class="vr-nav">
+      <view class="vr-nav__side" @click="handleBack">
+        <svg-icon name="icon-a-Chevronleft" size="22" unit="px" color="#1a1a1a" />
+      </view>
+      <text class="vr-nav__title">录音</text>
+      <view class="vr-nav__side vr-nav__side--right" @click="openHistory">
+        <text class="vr-nav__action">历史记录</text>
+      </view>
+    </view>
+
+    <view class="vr-body">
+      <text class="vr-timer">{{ timerText }}</text>
+      <text v-if="statusText.length > 0" class="vr-status">{{ statusText }}</text>
+      <view class="vr-wave">
+        <view class="vr-wave__clip">
+          <view class="vr-wave__base"></view>
+          <view class="vr-wave__track" :style="waveTrackStyle">
+            <view v-for="n in levelIndexes" :key="n" class="vr-wave__mark" :style="waveMarkStyle(n)">
+              <view class="vr-wave__bar" :style="eqBarStyle(n)"></view>
+            </view>
+          </view>
+        </view>
+        <view v-if="phase != 'idle'" class="vr-wave__played" :style="wavePlayedStyle"></view>
+        <view class="vr-wave__head" :style="waveHeadStyle">
+          <view class="vr-wave__dot"></view>
+          <view class="vr-wave__line"></view>
+          <view class="vr-wave__dot"></view>
+        </view>
+        <view class="vr-wave__fade vr-wave__fade--left"></view>
+        <view class="vr-wave__fade vr-wave__fade--right"></view>
+        <view v-if="canPlay" class="vr-wave__play" @click="handlePlayToggle">
+          <view v-if="playing" class="vr-wave__play-stop"></view>
+          <svg-icon v-else name="icon-video-play" size="16" unit="px" color="#1a1a1a" />
+        </view>
+      </view>
+      <view class="vr-spacer">
+        <!-- 临时日志：接口与缓存，后期删除 -->
+        <scroll-view class="vr-log" direction="vertical" :scroll-top="logScrollTop" :show-scrollbar="true">
+          <view v-for="(line, index) in voiceNoteDebugLines" :key="index" class="vr-log__row">
+            <text class="vr-log__line">{{ line }}</text>
+          </view>
+        </scroll-view>
+      </view>
+      <view class="vr-dock">
+        <view v-if="phase != 'idle' && phase != 'recording'" class="vr-dock__side" @click="handleRerecord">
+          <view class="vr-dock__slot">
+            <view class="vr-action__btn vr-action__btn--ghost">
+              <svg-icon name="icon-restart" size="22" unit="px" color="#e24b4b" />
+            </view>
+          </view>
+          <text class="vr-dock__label">重录</text>
+        </view>
+        <view v-else class="vr-dock__side"></view>
+        <view class="vr-dock__main" @click="handleMainAction">
+          <view class="vr-stop__ring">
+            <view class="vr-stop__btn">
+              <view v-if="phase == 'recording'" class="vr-stop__square"></view>
+              <svg-icon v-else name="icon-Mic" size="26" unit="px" color="#ffffff" />
+            </view>
+          </view>
+          <text class="vr-dock__label" :class="phase == 'recording' ? 'vr-dock__label--stop' : ''">{{ mainActionLabel() }}</text>
+        </view>
+        <view v-if="phase != 'idle' && phase != 'recording'" class="vr-dock__side" @click="handleDone">
+          <view class="vr-dock__slot">
+            <view class="vr-action__btn vr-action__btn--side">
+              <view class="vr-action__check">
+                <svg-icon name="icon-Check" size="22" unit="px" color="#ffffff" />
+              </view>
+            </view>
+          </view>
+          <text class="vr-dock__label">完成</text>
+        </view>
+        <view v-else class="vr-dock__side"></view>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+/**
+ * 伙伴页内录音层：由消息列表右滑打开，不单独占路由。
+ * 关闭经 close 上抛，由伙伴页收起本层。
+ */
+import { MicrophonePermissionHelper } from "@/utils/permissionHelper";
+import { pageSystemOverlay } from "@/utils/pageSystemOverlay.uts";
+import { emptyI18nParams, useI18n } from "@/utils/i18n";
+import { watch } from "vue";
+import { voiceNoteDebugLines } from "@/utils/voiceNoteDebugLog.uts";
+import {
+  discardVoiceNote,
+  finishVoiceNote,
+  getPanelVoiceNote,
+  startVoiceNote,
+  stopVoiceNote,
+  voiceNoteOnAppShow,
+} from "@/utils/voiceNoteEngine.uts";
+import { VoiceNoteRecord } from "@/utils/voiceNoteStore.uts";
+// #ifdef APP-HARMONY
+import { openHarmonyMicPermissionSettings } from "@/uni_modules/nuwax-stream-pcm-player";
+// #endif
+
+const { t: tFn } = useI18n();
+function t(key: string): string {
+  return tFn(key, emptyI18nParams(), "");
+}
+
+const emit = defineEmits<{
+  close: [];
+  "recording-change": [recording: boolean];
+}>();
+
+const levelIndexes: number[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47];
+/** 音波左右各留出的宽度（rpx）。左侧留给播放按钮，右侧留出对称空白。 */
+const WAVE_SIDE_RPX = 112;
+/** 音柱间距（px）。整段音波按这个间距从右往左滑。 */
+const WAVE_PITCH = 12;
+/** 录音时音波向左滑动的速度（px/秒）。 */
+const WAVE_SPEED = 22;
+
+const elapsedMs = ref<number>(0);
+/** 录音进度和播放进度分开记，切换时各自回到自己的波浪线位置。 */
+let recordWaveMs = 0;
+let playWaveMs = 0;
+/** 当前波浪线跟随播放进度。继续录音时改回录音进度。 */
+let waveFollowsPlay = false;
+/** 音波已向左滑过的整格数。 */
+const waveStep = ref<number>(0);
+/** 当前这一格里的平移（px），范围是 -WAVE_PITCH 到 0。 */
+const waveShift = ref<number>(0);
+/** 中间竖线的横坐标（px）。 */
+const waveHeadLeft = ref<number>(187);
+/** 已经滑过竖线的音柱高度，按出现顺序记下，不再重算。 */
+let waveHistory: number[] = [];
+/** 已有可播放的录音分段。 */
+const canPlay = ref<boolean>(false);
+const playing = ref<boolean>(false);
+/** idle 未开始 / recording 录音中 / paused 已暂停可继续 / stopped 正在收尾 */
+const phase = ref<string>("idle");
+const statusText = ref<string>("");
+const logScrollTop = ref<number>(0);
+watch((): number => voiceNoteDebugLines.value.length, (count: number) => {
+  logScrollTop.value = count * 48;
+});
+watch(phase, (value: string) => {
+  emit("recording-change", value == "recording");
+});
+
+let uiTimer = 0;
+let player: InnerAudioContext | null = null;
+let playToken = 0;
+/** 播放计时起点。时间按本地时钟累加，避免跟着稀疏的音频回调跳动。 */
+let playClockStart = 0;
+let playClockBase = 0;
+
+function pad2(n: number): string {
+  if (n < 10) {
+    return "0" + n.toString();
+  }
+  return n.toString();
+}
+
+function formatDuration(ms: number): string {
+  const safe = ms < 0 ? 0 : ms;
+  const totalCs = Math.floor(safe / 10);
+  const cs = totalCs % 100;
+  const totalSec = Math.floor(totalCs / 100);
+  const sec = totalSec % 60;
+  const min = Math.floor(totalSec / 60);
+  return pad2(min) + ":" + pad2(sec) + "." + pad2(cs);
+}
+
+const timerText = computed((): string => {
+  return formatDuration(elapsedMs.value);
+});
+
+function statusOf(record: VoiceNoteRecord): string {
+  let uploaded = 0;
+  let failed = 0;
+  const total = record.segments.length;
+  for (let i = 0; i < total; i++) {
+    const row = record.segments[i];
+    if (row.uploadStatus == "uploaded") uploaded = uploaded + 1;
+    if (row.uploadStatus == "failed") failed = failed + 1;
+  }
+  if (record.phase == "recording") {
+    if (total == 0) return "录音中，退到后台会继续";
+    return "录音中，已上传 " + uploaded + "/" + total + " 段";
+  }
+  if (record.phase == "paused") {
+    if (failed > 0) return "已暂停，" + failed + " 段上传失败";
+    if (total > 0 && uploaded < total) return "已暂停，已上传 " + uploaded + "/" + total + " 段";
+    return "已暂停，可继续录音";
+  }
+  if (record.phase == "processing") return "转写中";
+  if (record.phase == "uploading") return "上传中 " + uploaded + "/" + total;
+  if (record.phase == "failed" && record.error.length > 0) return record.error;
+  if (failed > 0) return failed + " 段上传失败，点完成会重试";
+  if (total > 0 && uploaded < total) return "待上传 " + uploaded + "/" + total;
+  if (record.noteId.length > 0) return "已缓存 noteId " + record.noteId;
+  return "已保存在本机";
+}
+
+function windowWidthPx(): number {
+  const width = uni.getWindowInfo().windowWidth;
+  if (width > 0) {
+    return width;
+  }
+  return 375;
+}
+
+/** 左右留白换算成 px，和播放按钮所在的左侧空位对齐。 */
+function waveSidePx(): number {
+  return Math.round(windowWidthPx() * WAVE_SIDE_RPX / 750);
+}
+
+function waveViewWidth(): number {
+  const inner = windowWidthPx() - waveSidePx() * 2;
+  if (inner > 0) {
+    return inner;
+  }
+  return windowWidthPx();
+}
+
+function randomBarHeight(): number {
+  return 8 + Math.floor(Math.random() * 54);
+}
+
+/** 竖线停在中间。录音时按时间补随机音柱，并整段向左滑。 */
+function syncLevels(): void {
+  const view = waveViewWidth();
+  const head = waveSidePx() + Math.round(view * 0.5);
+  waveHeadLeft.value = head;
+  if (phase.value == "idle") {
+    waveHistory = [];
+    waveShift.value = 0;
+    waveStep.value = 0;
+    return;
+  }
+  const travel = elapsedMs.value / 1000 * WAVE_SPEED;
+  const steps = Math.floor(travel / WAVE_PITCH);
+  while (waveHistory.length <= steps) {
+    waveHistory.push(randomBarHeight());
+  }
+  const into = travel - steps * WAVE_PITCH;
+  waveStep.value = steps;
+  waveShift.value = -Math.floor(into);
+}
+
+function waveMarkStyle(index: number): string {
+  return `left: ${index * WAVE_PITCH}px;`;
+}
+
+function eqBarStyle(index: number): string {
+  if (phase.value == "idle") {
+    return "height: 6px; background-color: #e4e4e8;";
+  }
+  const x = index * WAVE_PITCH + waveShift.value;
+  const headInWave = waveHeadLeft.value - waveSidePx();
+  const anchor = Math.round(headInWave / WAVE_PITCH);
+  const sample = waveStep.value + index - anchor;
+  let height = 6;
+  if (sample >= 0 && sample < waveHistory.length) {
+    const recorded = waveHistory[sample];
+    if (recorded != null) {
+      height = recorded;
+    }
+  }
+  const color = x <= headInWave ? "#f0b429" : "#e4e4e8";
+  return `height: ${height}px; background-color: ${color};`;
+}
+
+const waveTrackStyle = computed((): string => {
+  return `transform: translateX(${waveShift.value}px);`;
+});
+
+const waveHeadStyle = computed((): string => {
+  return `left: ${waveHeadLeft.value}px;`;
+});
+
+const wavePlayedStyle = computed((): string => {
+  const played = waveHeadLeft.value - waveSidePx();
+  const width = played > 0 ? played : 0;
+  return `left: ${waveSidePx()}px; width: ${width}px;`;
+});
+
+class PlaySlice {
+  filePath: string = "";
+  startMs: number = 0;
+  durationMs: number = 0;
+}
+
+function playSlices(): PlaySlice[] {
+  const record = getPanelVoiceNote();
+  const list: PlaySlice[] = [];
+  if (record == null) {
+    return list;
+  }
+  let cursor = 0;
+  for (let i = 0; i < record.segments.length; i++) {
+    const row = record.segments[i];
+    if (row.filePath.length == 0) {
+      continue;
+    }
+    const slice = new PlaySlice();
+    slice.filePath = row.filePath;
+    slice.startMs = cursor;
+    slice.durationMs = row.durationMs > 0 ? row.durationMs : 0;
+    list.push(slice);
+    cursor = cursor + slice.durationMs;
+  }
+  return list;
+}
+
+function playablePaths(): string[] {
+  const slices = playSlices();
+  const paths: string[] = [];
+  for (let i = 0; i < slices.length; i++) {
+    paths.push(slices[i].filePath);
+  }
+  return paths;
+}
+
+/** 可播放内容的总时长。竖线停在末尾时，下一次播放从头开始。 */
+function playableDurationMs(): number {
+  const slices = playSlices();
+  if (slices.length == 0) {
+    return 0;
+  }
+  const last = slices[slices.length - 1];
+  return last.startMs + last.durationMs;
+}
+
+function recordProgressMs(record: VoiceNoteRecord): number {
+  let shown = record.accumulatedMs + record.openElapsedMs;
+  if (record.phase == "recording" && record.segmentStartedAt > 0) {
+    const extra = Date.now() - record.segmentStartedAt;
+    if (extra > 0) shown = shown + extra;
+  }
+  return shown;
+}
+
+function playClockMs(): number {
+  if (playClockStart == 0) {
+    return playWaveMs;
+  }
+  return playClockBase + (Date.now() - playClockStart);
+}
+
+function clampedPlayMs(ms: number): number {
+  const total = playableDurationMs();
+  let next = ms;
+  if (next < 0) {
+    next = 0;
+  }
+  if (total > 0 && next > total) {
+    next = total;
+  }
+  return next;
+}
+
+function armPlayClock(ms: number): void {
+  const next = clampedPlayMs(ms);
+  playWaveMs = next;
+  playClockBase = next;
+  playClockStart = Date.now();
+}
+
+function showRecordWave(): void {
+  waveFollowsPlay = false;
+  elapsedMs.value = recordWaveMs;
+  syncLevels();
+}
+
+function applySnapshot(): void {
+  const record = getPanelVoiceNote();
+  if (record == null || record.phase == "success") {
+    phase.value = "idle";
+    elapsedMs.value = 0;
+    recordWaveMs = 0;
+    playWaveMs = 0;
+    waveFollowsPlay = false;
+    statusText.value = "";
+    canPlay.value = false;
+    syncLevels();
+    return;
+  }
+  canPlay.value = playablePaths().length > 0;
+  statusText.value = statusOf(record);
+  if (record.phase == "recording") {
+    phase.value = "recording";
+  } else if (record.phase == "paused") {
+    phase.value = "paused";
+  } else {
+    phase.value = "stopped";
+  }
+  if (playing.value || waveFollowsPlay) {
+    if (playing.value) {
+      playWaveMs = clampedPlayMs(playClockMs());
+    }
+    elapsedMs.value = playWaveMs;
+    syncLevels();
+    return;
+  }
+  recordWaveMs = recordProgressMs(record);
+  elapsedMs.value = recordWaveMs;
+  syncLevels();
+}
+
+function startUiTimer(): void {
+  if (uiTimer != 0) return;
+  uiTimer = setInterval(() => {
+    applySnapshot();
+  }, 80);
+}
+
+function stopUiTimer(): void {
+  if (uiTimer != 0) {
+    clearInterval(uiTimer);
+    uiTimer = 0;
+  }
+}
+
+function openMicSettings(): void {
+  // #ifdef APP-ANDROID
+  const activity = UTSAndroid.getUniActivity();
+  if (activity != null) {
+    pageSystemOverlay.begin("android.permissionSettings", true);
+    UTSAndroid.gotoSystemPermissionActivity(activity, ["android.permission.RECORD_AUDIO"] as string[]);
+  }
+  // #endif
+  // #ifdef APP-HARMONY
+  pageSystemOverlay.begin("harmony.permissionSettings", true);
+  openHarmonyMicPermissionSettings();
+  // #endif
+  // #ifdef APP-IOS
+  pageSystemOverlay.begin("ios.authorizeSetting", true);
+  uni.openAppAuthorizeSetting({});
+  // #endif
+  // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+  uni.openSetting({});
+  // #endif
+  // #ifdef H5 || WEB
+  MicrophonePermissionHelper.showGuide();
+  // #endif
+}
+
+function showMicGuide(): void {
+  uni.showModal({
+    title: t("Mobile.Voice.permissionRequired"),
+    content: t("Mobile.Voice.permissionContent"),
+    confirmText: t("Mobile.Voice.goToSettings"),
+    cancelText: t("Mobile.Common.cancel"),
+    success: (res) => {
+      if (res.confirm == true) {
+        openMicSettings();
+      }
+    },
+  });
+}
+
+/**
+ * 已授权返回 true。未决定时弹出系统授权窗，同意后返回 true。
+ * 之前已拒绝、系统不再弹窗时，弹出引导去系统设置，并返回 false。
+ */
+async function ensureMicPermission(): Promise<boolean> {
+  // #ifdef APP-ANDROID
+  const activity = UTSAndroid.getUniActivity();
+  if (activity == null) {
+    return false;
+  }
+  const permissionNeed = ["android.permission.RECORD_AUDIO"] as string[];
+  if (UTSAndroid.checkSystemPermissionGranted(activity, permissionNeed)) {
+    return true;
+  }
+  return await new Promise<boolean>((resolve) => {
+    pageSystemOverlay.begin("android.recordPermission", true);
+    UTSAndroid.requestSystemPermission(
+      activity,
+      permissionNeed,
+      (_allGranted: boolean, _granted: string[]) => {
+        pageSystemOverlay.end();
+        resolve(true);
+      },
+      (doNotAskAgain: boolean, _denied: string[]) => {
+        pageSystemOverlay.end();
+        if (doNotAskAgain == true) {
+          showMicGuide();
+        }
+        resolve(false);
+      },
+    );
+  });
+  // #endif
+
+  // #ifdef APP-IOS
+  const authSetting = uni.getAppAuthorizeSetting();
+  if (authSetting.microphoneAuthorized == "authorized") {
+    return true;
+  }
+  if (authSetting.microphoneAuthorized == "denied") {
+    showMicGuide();
+    return false;
+  }
+  return true;
+  // #endif
+
+  // #ifdef APP-HARMONY
+  return await new Promise<boolean>((resolve) => {
+    pageSystemOverlay.begin("harmony.recordPermission", true);
+    UTSHarmony.requestSystemPermission(
+      ["ohos.permission.MICROPHONE"] as string[],
+      (_allRight: boolean, _granted: string[]) => {
+        pageSystemOverlay.end();
+        resolve(true);
+      },
+      (doNotAskAgain: boolean, _denied: string[]) => {
+        pageSystemOverlay.end();
+        if (doNotAskAgain == true) {
+          showMicGuide();
+        }
+        resolve(false);
+      },
+    );
+  });
+  // #endif
+
+  // #ifdef MP-WEIXIN || MP-ALIPAY || MP-BAIDU || MP-TOUTIAO || MP-QQ
+  return await new Promise<boolean>((resolve) => {
+    uni.getSetting({
+      success: (res) => {
+        const setting = res.authSetting as UTSJSONObject;
+        if (setting["scope.record"] == true) {
+          resolve(true);
+          return;
+        }
+        if (setting["scope.record"] == false) {
+          showMicGuide();
+          resolve(false);
+          return;
+        }
+        uni.authorize({
+          scope: "scope.record",
+          success: () => {
+            resolve(true);
+          },
+          fail: () => {
+            resolve(false);
+          },
+        });
+      },
+      fail: () => {
+        resolve(false);
+      },
+    });
+  });
+  // #endif
+
+  // #ifdef H5 || WEB
+  const state = await MicrophonePermissionHelper.check();
+  if (state == "granted") {
+    return true;
+  }
+  if (state == "denied") {
+    showMicGuide();
+    return false;
+  }
+  const granted = await MicrophonePermissionHelper.request();
+  if (granted != true) {
+    const after = await MicrophonePermissionHelper.check();
+    if (after == "denied") {
+      showMicGuide();
+    }
+  }
+  return granted;
+  // #endif
+
+  return true;
+}
+
+function stopPlayback(): void {
+  if (playing.value) {
+    playWaveMs = clampedPlayMs(playClockMs());
+  }
+  playClockStart = 0;
+  playToken = playToken + 1;
+  playing.value = false;
+  const audio = player;
+  player = null;
+  if (audio != null) {
+    audio.stop();
+    audio.destroy();
+  }
+}
+
+function sliceIndexAt(ms: number): number {
+  const slices = playSlices();
+  for (let i = 0; i < slices.length; i++) {
+    const slice = slices[i];
+    const end = slice.startMs + slice.durationMs;
+    if (ms < end || i == slices.length - 1) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+function showPlayhead(ms: number): void {
+  armPlayClock(ms);
+  waveFollowsPlay = true;
+  elapsedMs.value = playWaveMs;
+  syncLevels();
+}
+
+function startPlaybackAt(index: number, offsetMs: number): void {
+  const slices = playSlices();
+  if (index < 0 || index >= slices.length) {
+    stopPlayback();
+    return;
+  }
+  const slice = slices[index];
+  let into = offsetMs - slice.startMs;
+  if (into < 0) {
+    into = 0;
+  }
+  if (slice.durationMs > 0 && into > slice.durationMs) {
+    into = slice.durationMs;
+  }
+  const previous = player;
+  player = null;
+  if (previous != null) {
+    previous.stop();
+    previous.destroy();
+  }
+  const token = playToken + 1;
+  playToken = token;
+  const audio = uni.createInnerAudioContext();
+  player = audio;
+  audio.src = slice.filePath;
+  audio.startTime = into / 1000;
+  audio.onTimeUpdate(() => {
+    if (playToken != token) {
+      return;
+    }
+    const reported = slice.startMs + audio.currentTime * 1000;
+    const shown = playClockMs();
+    if (reported - shown > 400 || shown - reported > 400) {
+      armPlayClock(reported);
+    }
+  });
+  audio.onEnded(() => {
+    if (playToken != token) {
+      return;
+    }
+    const next = index + 1;
+    if (next >= slices.length) {
+      showPlayhead(playableDurationMs());
+      stopPlayback();
+      return;
+    }
+    startPlaybackAt(next, slices[next].startMs);
+  });
+  audio.onError((_err) => {
+    if (playToken != token) {
+      return;
+    }
+    stopPlayback();
+  });
+  playing.value = true;
+  showPlayhead(slice.startMs + into);
+  audio.play();
+}
+
+function handlePlayToggle(): void {
+  if (playing.value) {
+    stopPlayback();
+    return;
+  }
+  if (phase.value == "recording") {
+    recordWaveMs = elapsedMs.value;
+    stopVoiceNote();
+    playWaveMs = 0;
+  } else {
+    const total = playableDurationMs();
+    if (total > 0 && playWaveMs >= total - 250) {
+      playWaveMs = 0;
+    }
+  }
+  showPlayhead(playWaveMs);
+  startPlaybackAt(sliceIndexAt(playWaveMs), playWaveMs);
+}
+
+async function handleStartTap(): Promise<void> {
+  const permitted = await ensureMicPermission();
+  if (permitted != true) {
+    return;
+  }
+  stopPlayback();
+  showRecordWave();
+  try {
+    await startVoiceNote();
+  } catch (e) {
+    uni.showToast({ title: `${e}`, icon: "none" });
+  }
+  applySnapshot();
+}
+
+function handleStop(): void {
+  if (phase.value != "recording") {
+    return;
+  }
+  stopVoiceNote();
+  applySnapshot();
+}
+
+function handleRerecord(): void {
+  uni.showModal({
+    title: t("Mobile.Voice.rerecordTitle"),
+    content: t("Mobile.Voice.rerecordContent"),
+    confirmText: t("Mobile.Voice.rerecordConfirm"),
+    cancelText: t("Mobile.Common.cancel"),
+    success: (res) => {
+      if (res.confirm != true) {
+        return;
+      }
+      stopPlayback();
+      discardVoiceNote();
+      phase.value = "idle";
+      elapsedMs.value = 0;
+      recordWaveMs = 0;
+      playWaveMs = 0;
+      waveFollowsPlay = false;
+      statusText.value = "";
+      syncLevels();
+    },
+  });
+}
+
+function mainActionLabel(): string {
+  if (phase.value == "recording") return "停止录音";
+  if (phase.value == "paused") return "继续录音";
+  if (phase.value == "idle") return "开始录音";
+  return "";
+}
+
+function handleMainAction(): void {
+  if (phase.value == "recording") {
+    handleStop();
+    return;
+  }
+  if (phase.value == "idle" || phase.value == "paused") {
+    void handleStartTap();
+  }
+}
+
+function handleDone(): void {
+  stopPlayback();
+  finishVoiceNote();
+  playWaveMs = 0;
+  recordWaveMs = 0;
+  waveFollowsPlay = false;
+  applySnapshot();
+}
+
+function leaveToChat(): void {
+  // 录音中返回消息列表或退到后台都不停止采集，会话留在 voiceNoteEngine。
+  emit("close");
+}
+
+function handleBack(): void {
+  leaveToChat();
+}
+
+function openHistory(): void {
+  uni.navigateTo({ url: "/subpackages/pages/voice-record-history/voice-record-history" });
+}
+
+onMounted(() => {
+  voiceNoteOnAppShow();
+  applySnapshot();
+  startUiTimer();
+});
+
+onUnmounted(() => {
+  stopPlayback();
+  stopUiTimer();
+});
+</script>
+
+<style lang="scss" scoped>
+.vr-page {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background-color: #ffffff;
+}
+
+.vr-nav {
+  height: 88rpx;
+  flex-direction: row;
+  align-items: center;
+  padding: 0 8rpx;
+}
+
+.vr-nav__side {
+  width: 160rpx;
+  height: 88rpx;
+  justify-content: center;
+  padding-left: 16rpx;
+}
+
+.vr-nav__side--right {
+  align-items: flex-end;
+  padding-right: 24rpx;
+  padding-left: 0;
+}
+
+.vr-nav__title {
+  flex: 1;
+  text-align: center;
+  font-size: 34rpx;
+  font-weight: 600;
+  color: #1a1a1a;
+}
+
+.vr-nav__action {
+  font-size: 28rpx;
+  color: #8e8e93;
+}
+
+.vr-body {
+  flex: 1;
+  align-items: center;
+}
+
+.vr-timer {
+  margin-top: 72rpx;
+  font-size: 72rpx;
+  font-weight: 500;
+  color: #3a3a3c;
+  letter-spacing: 2rpx;
+}
+
+.vr-status {
+  margin-top: 16rpx;
+  padding: 0 48rpx;
+  font-size: 24rpx;
+  color: #8e8e93;
+  text-align: center;
+}
+
+.vr-wave {
+  width: 750rpx;
+  height: 280rpx;
+  margin-top: 120rpx;
+  position: relative;
+  overflow: hidden;
+}
+
+.vr-wave__clip {
+  position: absolute;
+  top: 0;
+  right: 112rpx;
+  bottom: 0;
+  left: 112rpx;
+  overflow: hidden;
+}
+
+.vr-wave__track {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 640px;
+  height: 100%;
+}
+
+.vr-wave__mark {
+  position: absolute;
+  top: 0;
+  width: 4px;
+  height: 280rpx;
+  align-items: center;
+  justify-content: center;
+}
+
+.vr-wave__bar {
+  width: 3px;
+  border-radius: 2px;
+  background-color: #e4e4e8;
+}
+
+.vr-wave__base {
+  position: absolute;
+  left: 112rpx;
+  right: 112rpx;
+  top: 140rpx;
+  height: 0;
+  border-top-width: 2rpx;
+  border-top-style: dotted;
+  border-top-color: #d8d8dc;
+}
+
+.vr-wave__played {
+  position: absolute;
+  top: 140rpx;
+  height: 0;
+  border-top-width: 2rpx;
+  border-top-style: dotted;
+  border-top-color: #f0b429;
+}
+
+.vr-wave__head {
+  position: absolute;
+  top: 8rpx;
+  width: 16rpx;
+  height: 264rpx;
+  align-items: center;
+}
+
+.vr-wave__fade {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 140rpx;
+  z-index: 2;
+}
+
+.vr-wave__fade--left {
+  left: 112rpx;
+  background-image: linear-gradient(to right, #ffffff, rgba(255, 255, 255, 0));
+}
+
+.vr-wave__fade--right {
+  right: 112rpx;
+  background-image: linear-gradient(to left, #ffffff, rgba(255, 255, 255, 0));
+}
+
+.vr-wave__play {
+  position: absolute;
+  z-index: 3;
+  left: 24rpx;
+  top: 108rpx;
+  width: 64rpx;
+  height: 64rpx;
+  border-radius: 32rpx;
+  background-color: #f4f4f4;
+  align-items: center;
+  justify-content: center;
+}
+
+.vr-wave__play-stop {
+  width: 18rpx;
+  height: 18rpx;
+  border-radius: 4rpx;
+  background-color: #1a1a1a;
+}
+
+.vr-wave__dot {
+  width: 12rpx;
+  height: 12rpx;
+  border-radius: 6rpx;
+  background-color: #e24b4b;
+}
+
+.vr-wave__line {
+  width: 2rpx;
+  flex: 1;
+  background-color: #e24b4b;
+}
+
+.vr-spacer {
+  flex: 1;
+  position: relative;
+  width: 750rpx;
+  min-height: 0;
+}
+
+.vr-log {
+  position: absolute;
+  top: 12rpx;
+  right: 32rpx;
+  bottom: 12rpx;
+  left: 32rpx;
+}
+
+.vr-log__row {
+  padding-bottom: 8rpx;
+}
+
+.vr-log__line {
+  font-size: 22rpx;
+  line-height: 32rpx;
+  color: #6e6e73;
+}
+
+.vr-dock {
+  width: 750rpx;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: center;
+  margin-bottom: 120rpx;
+}
+
+.vr-dock__side {
+  width: 180rpx;
+  align-items: center;
+}
+
+.vr-dock__slot {
+  width: 148rpx;
+  height: 148rpx;
+  align-items: center;
+  justify-content: center;
+}
+
+.vr-dock__main {
+  width: 240rpx;
+  align-items: center;
+}
+
+.vr-dock__label {
+  margin-top: 28rpx;
+  height: 42rpx;
+  line-height: 42rpx;
+  font-size: 30rpx;
+  color: #8e8e93;
+  text-align: center;
+}
+
+.vr-dock__label--stop {
+  color: #e24b4b;
+}
+
+.vr-stop__ring {
+  width: 148rpx;
+  height: 148rpx;
+  border-radius: 74rpx;
+  background-color: #f4f4f4;
+  align-items: center;
+  justify-content: center;
+}
+
+.vr-stop__btn {
+  width: 128rpx;
+  height: 128rpx;
+  border-radius: 64rpx;
+  background-color: #f5b942;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.vr-stop__square {
+  width: 36rpx;
+  height: 36rpx;
+  border-radius: 8rpx;
+  background-color: #ffffff;
+}
+
+.vr-action__btn {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  border-radius: 64rpx;
+}
+
+.vr-action__btn--ghost {
+  width: 96rpx;
+  height: 96rpx;
+  background-color: #f3f3f5;
+}
+
+.vr-action__btn--side {
+  width: 96rpx;
+  height: 96rpx;
+  background-color: #f5b942;
+}
+
+.vr-action__check {
+  transform: translateX(2px);
+}
+
+.vr-history {
+  flex: 1;
+}
+
+.vr-history__empty {
+  padding-top: 200rpx;
+  align-items: center;
+}
+
+.vr-history__empty-text {
+  font-size: 28rpx;
+  color: #8e8e93;
+}
+
+.vr-history__row {
+  padding: 28rpx 32rpx;
+  border-bottom-width: 1rpx;
+  border-bottom-style: solid;
+  border-bottom-color: #f2f2f4;
+}
+
+.vr-history__name {
+  font-size: 30rpx;
+  color: #1a1a1a;
+}
+
+.vr-history__meta {
+  margin-top: 8rpx;
+  font-size: 24rpx;
+  color: #8e8e93;
+}
+</style>

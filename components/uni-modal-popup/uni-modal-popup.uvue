@@ -26,7 +26,12 @@
     @beforeleave="onBeforeLeave"
     @leave="onLeave"
   >
-    <view class="uni-modal-popup__host" :class="hostClassName" @tap="onClickOverlay">
+    <view
+      class="uni-modal-popup__host"
+      :class="hostClassName"
+      @touchstart="onHostTouchStart"
+      @tap="onClickOverlay"
+    >
       <view
         v-if="visible && useInternalSideOverlay && overlay"
         class="uni-modal-popup__side-mask"
@@ -70,7 +75,8 @@
         </scroll-view>
         <view
           v-else
-          class="uni-modal-popup__body uni-modal-popup__body--static"
+          class="uni-modal-popup__body"
+          :class="hugContent ? 'uni-modal-popup__body--hug' : 'uni-modal-popup__body--static'"
         >
           <slot></slot>
         </view>
@@ -100,7 +106,12 @@
     @beforeleave="onBeforeLeave"
     @leave="onLeave"
   >
-    <view class="uni-modal-popup__host" :class="hostClassName" @tap="onClickOverlay">
+    <view
+      class="uni-modal-popup__host"
+      :class="hostClassName"
+      @touchstart="onHostTouchStart"
+      @tap="onClickOverlay"
+    >
       <!-- #ifdef APP-ANDROID -->
       <!-- 蒙层触摸接管（三星 One UI）：原生遮罩对带位移的按压不合成 clickoverlay，
            且微移会触发原生下滑手势（面板/蒙层跟着微动一下弹回=闪动、不收起）。
@@ -158,7 +169,8 @@
         </scroll-view>
         <view
           v-else
-          class="uni-modal-popup__body uni-modal-popup__body--static"
+          class="uni-modal-popup__body"
+          :class="hugContent ? 'uni-modal-popup__body--hug' : 'uni-modal-popup__body--static'"
         >
           <slot></slot>
         </view>
@@ -260,10 +272,12 @@
   ]);
 
   const visible = ref(false);
-  // Android 上初始 :show="false" 的 page-container 仍可能留下透明命中层，
-  // 挡住随后打开的弹窗。首次打开时再挂载，关闭后保留节点以完成离场动画。
+  // App 上初始 show=false 的 page-container 会留下全屏透明命中层。
+  // Android、iOS 首次打开再挂载；iOS 在关闭动画结束后卸掉。
   const renderPageContainer = ref(true);
-  // #ifdef APP-ANDROID
+  // #ifdef APP-ANDROID || APP-IOS
+  // 初始 show=false 的 page-container 会留下全屏透明命中层，挡住导航栏上的分享按钮。
+  // 首次打开再挂载；iOS 关闭动画结束后再卸掉，避免遮罩继续吃掉下一次点击。
   renderPageContainer.value = false;
   // #endif
   // #ifdef APP-HARMONY
@@ -286,6 +300,9 @@
    */
   const OPEN_TAP_GUARD_MS = 400;
   let openedAtMs = 0;
+  /** iOS：打开分享的按下在按钮上，弹层出来后的 tail tap 会落到全屏 host。没有在遮罩上按下过就不要关。 */
+  let hostTouchStarted = false;
+  let iosUnmountTimer: number = 0;
   /** 蒙层触摸门闩：tap-mask 自身收到 touchstart 才置位；无起点直达的 touchend
    *  属旧点击链尾事件（气泡菜单切弹窗等场景），一律忽略（三星修复，2026-10-08）。 */
   let maskTouchStarted = false;
@@ -414,6 +431,10 @@
    * - center：面板用 props.width，并限制 max-width
    * - top/bottom：用 height
    */
+  const hugContent = computed((): boolean => {
+    return props.height == "auto";
+  });
+
   const panelInlineStyle = computed((): string => {
     const pos = resolvedPosition.value;
     if (pos == "left" || pos == "right") {
@@ -442,6 +463,11 @@
     openedAtMs = Date.now();
     // 新开重置蒙层触摸门闩：上一轮手势的残留 true 不再误放行本轮尾事件
     maskTouchStarted = false;
+    hostTouchStarted = false;
+    if (iosUnmountTimer != 0) {
+      clearTimeout(iosUnmountTimer);
+      iosUnmountTimer = 0;
+    }
     // 新开清关闭键防重窗：上一轮收面板手势的防重态不再吞本轮首点
     closeTap.reset();
     renderPageContainer.value = true;
@@ -454,8 +480,21 @@
       return;
     }
     visible.value = false;
+    hostTouchStarted = false;
     // 立即同步父级；勿只等 afterleave（iOS 上可能延迟或丢失）
     emit("update-visible", false);
+    // #ifdef APP-IOS
+    if (iosUnmountTimer != 0) {
+      clearTimeout(iosUnmountTimer);
+    }
+    const waitMs = props.duration + 80;
+    iosUnmountTimer = setTimeout(() => {
+      iosUnmountTimer = 0;
+      if (visible.value == false) {
+        renderPageContainer.value = false;
+      }
+    }, waitMs);
+    // #endif
   };
 
   // ===== 关闭键点按三通道（closeTap 声明在 open 之前，见其注释）=====
@@ -499,6 +538,10 @@
     { immediate: true },
   );
   onUnmounted(() => {
+    if (iosUnmountTimer != 0) {
+      clearTimeout(iosUnmountTimer);
+      iosUnmountTimer = 0;
+    }
     if (popupRegistryId != 0) {
       unregisterPopupClose(popupRegistryId);
       popupRegistryId = 0;
@@ -523,12 +566,28 @@
     emit("leave");
   };
 
+  const onHostTouchStart = (): void => {
+    hostTouchStarted = true;
+  };
+
   const onClickOverlay = (): void => {
     // 时间窗内视为旧点击链的尾事件（无完整按下-抬起），吞掉
     if (Date.now() - openedAtMs < OPEN_TAP_GUARD_MS) {
       console.log("[UniModalPopup] overlay tap swallowed by open guard");
       return;
     }
+    // #ifdef APP-IOS
+    // 关闭后的原生层仍可能收到 clickoverlay，这时分享按钮其实没点到。
+    if (visible.value != true) {
+      return;
+    }
+    // 打开手势的按下不在遮罩上，弹出来之后补来的 tap 不能把面板马上关掉。
+    if (hostTouchStarted != true) {
+      console.log("[UniModalPopup] overlay tap swallowed, touch did not start on mask");
+      return;
+    }
+    hostTouchStarted = false;
+    // #endif
     if (props.maskClick) {
       console.log("[UniModalPopup] overlay tap close");
       close();
@@ -553,6 +612,13 @@
 
   const onAfterLeave = (): void => {
     visible.value = false;
+    // #ifdef APP-IOS
+    if (iosUnmountTimer != 0) {
+      clearTimeout(iosUnmountTimer);
+      iosUnmountTimer = 0;
+    }
+    renderPageContainer.value = false;
+    // #endif
     emit("afterleave");
     emit("update-visible", false);
   };

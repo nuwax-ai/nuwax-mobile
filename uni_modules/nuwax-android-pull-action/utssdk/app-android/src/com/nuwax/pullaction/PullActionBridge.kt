@@ -1,8 +1,10 @@
 package com.nuwax.pullaction
 
+import android.content.Context
 import android.graphics.Color
 import android.os.SystemClock
 import android.util.Log
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import com.scwang.smart.refresh.layout.SmartRefreshLayout
@@ -18,6 +20,10 @@ import kotlin.math.min
 
 private const val PULL_ACTION_TRIGGER_RATE = 1.15f
 private const val PULL_ACTION_MIN_DRAG_DURATION_MS = 180L
+// offset 由 SmartRefreshLayout 以整数物理像素给出。旧的 0.5dp 门槛在 3x 密度
+// 设备上会吞掉每隔一个物理像素的更新，慢拉时页面呈阶梯跳动。保留 16ms 帧限，
+// 但距离只要变化就派发，使业务层直接跟手且不会超过屏幕刷新频率。
+private const val PULL_ACTION_PROGRESS_EPSILON_DP = 0.01
 
 interface PullActionCallback {
     fun onProgress(distance: Double, dragging: Boolean)
@@ -84,6 +90,70 @@ private class PullActionHeader(context: android.content.Context, backgroundColor
     }
 }
 
+/**
+ * 冻结消息列表：本轮手势只要拉出过 header，列表既不能跟手滚，也不能在松手瞬间自己甩出去。
+ *
+ * 真实事件路径（DCloud 的 NestedScrollView 在 ACTION_DOWN 里就 startNestedScroll）：
+ * SmartRefreshLayout 走 mNestedInProgress 分支，把真实 DOWN/MOVE/UP **原样转给列表**，
+ * 靠 onNestedPreScroll 截走位移来驱动 header。于是有两个口子：
+ * 1. 反向上滑越过 0 后，剩余 dy 默认落回列表 → 在 onNestedPreScroll 里全部吃掉；
+ * 2. 列表手里有完整的手指速度样本，松手收到 ACTION_UP 会自己 fling；而此时 nested
+ *    parent 已在 stopNestedScroll 里结束，父层再也拦不住 → 页面回弹期间列表继续上滑。
+ *    所以在松手那一下把 UP 换成 CANCEL 派给列表：CANCEL 只做 springBack（位置没变=
+ *    无位移），不会产生惯性，回弹结束前列表就是冻结的。
+ *
+ * 只在“本轮确实拉出过 header”后生效，ACTION_UP/CANCEL 或下一轮真实 DOWN 立即复位，
+ * 不影响正常列表滚动。onInterceptTouchEvent 是给少数走非 nested 路径的机型兜底：
+ * 那里 SRL 会给列表合成 DOWN/MOVE/UP，同样会按伪手势起 fling。
+ */
+private class PullActionRefreshLayout(context: Context) : SmartRefreshLayout(context) {
+    private var holdUpwardRemainder = false
+
+    fun markPullStarted() {
+        holdUpwardRemainder = true
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val action = event.actionMasked
+        if (action == MotionEvent.ACTION_DOWN) {
+            holdUpwardRemainder = false
+        }
+        if (holdUpwardRemainder && action == MotionEvent.ACTION_UP) {
+            // 本轮是下拉手势的松手：不给列表派 UP，改派 CANCEL，掐掉松手自带的 fling。
+            holdUpwardRemainder = false
+            val cancel = MotionEvent.obtain(event)
+            cancel.action = MotionEvent.ACTION_CANCEL
+            val handled = try {
+                super.dispatchTouchEvent(cancel)
+            } finally {
+                cancel.recycle()
+            }
+            return handled
+        }
+        val handled = super.dispatchTouchEvent(event)
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            holdUpwardRemainder = false
+        }
+        return handled
+    }
+
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        // 伪手势的 DOWN 是 SmartRefreshLayout 内部直接派发出来的，不会走本类的
+        // dispatchTouchEvent；真实手指的新 DOWN 上面已复位标志，不会被误拦。
+        if (holdUpwardRemainder && ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            return true
+        }
+        return super.onInterceptTouchEvent(ev)
+    }
+
+    override fun onNestedPreScroll(target: View, dx: Int, dy: Int, consumed: IntArray) {
+        super.onNestedPreScroll(target, dx, dy, consumed)
+        if (!holdUpwardRemainder || dy <= 0) return
+        val remainingY = dy - consumed[1]
+        if (remainingY > 0) consumed[1] += remainingY
+    }
+}
+
 private class PullActionSession(
     private val key: String,
     private val target: View,
@@ -113,7 +183,8 @@ private class PullActionSession(
         val normalized = max(0.0, distanceDp)
         val now = SystemClock.uptimeMillis()
         val draggingChanged = dragging != lastProgressDragging
-        val distanceChanged = abs(normalized - lastProgressDistanceDp) >= 0.5
+        val distanceChanged =
+            abs(normalized - lastProgressDistanceDp) >= PULL_ACTION_PROGRESS_EPSILON_DP
 
         if (
             !force &&
@@ -146,7 +217,7 @@ private class PullActionSession(
         val density = target.resources.displayMetrics.density
         val thresholdPx = max(1, (thresholdDp * density).toInt())
         val maxDragPx = max(thresholdPx + 1, (maxDragDp * density).toInt())
-        val wrapper = SmartRefreshLayout(target.context)
+        val wrapper = PullActionRefreshLayout(target.context)
         // 外壳底色 = 下拉灰区同色（业务经 backgroundColor 传入，伙伴页为 #f4f3fb）。
         // 静止下拉由 header 盖住这块；快速甩动到顶后列表的惯性 overscroll 不经过 header，
         // 露出的就是外壳本身，写死白色会在顶部露出一条白边（业务侧列表本体已自铺白底）。
@@ -156,7 +227,11 @@ private class PullActionSession(
         wrapper.setEnableNestedScroll(true)
         wrapper.setEnableOverScrollBounce(false)
         wrapper.setEnableOverScrollDrag(false)
-        wrapper.setEnableHeaderTranslationContent(true)
+        // ★关闭内容位移：列表由业务侧整页合成层（tab-shell 的 translateY）统一推动。
+        //   开着的话 SmartRefreshLayout 会给 scroll-view 设 translationY，而 uvue 侧给
+        //   同一个元素写 style.transform 会**覆盖**（不是叠加）这个值，两边每帧抢同一个
+        //   属性 —— 实测表现就是列表和顶部错位 + 拖动抖动。关闭后位移只有一个来源。
+        wrapper.setEnableHeaderTranslationContent(false)
         wrapper.setEnableScrollContentWhenRefreshed(false)
         wrapper.setEnableClipHeaderWhenFixedBehind(true)
         wrapper.setDragRate(1f)
@@ -164,8 +239,9 @@ private class PullActionSession(
         wrapper.setHeaderHeightPx(thresholdPx)
         wrapper.setHeaderTriggerRate(PULL_ACTION_TRIGGER_RATE)
         wrapper.setHeaderMaxDragRate(max(1f, min(9.9f, maxDragPx.toFloat() / thresholdPx)))
+        // header 必须透明：整页下移后顶部露出的是下层会话页预览，不能盖一层灰底。
         wrapper.setRefreshHeader(
-            PullActionHeader(target.context, parseColor(backgroundColor))
+            PullActionHeader(target.context, Color.TRANSPARENT)
         )
         wrapper.setOnMultiListener(object : SimpleMultiListener() {
             override fun onHeaderMoving(
@@ -183,6 +259,7 @@ private class PullActionSession(
                     settledReported = false
                     gestureStartedAtMs = SystemClock.uptimeMillis()
                     gestureMaxDistanceDp = 0.0
+                    wrapper.markPullStarted()
                 }
                 if (isDragging) {
                     gestureMaxDistanceDp = max(gestureMaxDistanceDp, distanceDp)

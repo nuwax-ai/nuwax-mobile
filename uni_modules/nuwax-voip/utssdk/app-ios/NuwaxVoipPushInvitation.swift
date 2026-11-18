@@ -11,7 +11,7 @@ struct NuwaxVoipPushInvitation {
     let convId: String?
     let msgId: String?
 
-    init?(_ raw: [AnyHashable: Any], userId: String, business: Bool, now: Double) {
+    init?(_ raw: [AnyHashable: Any], userId: String, business: Bool, now: Double, requiredRegistrationId: String? = nil) {
         var payload = raw
         // Getui's VoIP custom payload can be a dictionary or a JSON string.
         if raw["callId"] == nil {
@@ -19,6 +19,8 @@ struct NuwaxVoipPushInvitation {
             else if let json = raw["payload"] as? String, let data = json.data(using: .utf8),
                     let nested = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { payload = nested }
         }
+        if let requiredRegistrationId,
+           requiredRegistrationId.isEmpty || payload["routeRegistrationId"] as? String != requiredRegistrationId { return nil }
         guard let id = payload["callId"] as? String,
               id.range(of: "^[A-Za-z0-9_-]{1,128}\\z", options: .regularExpression) != nil,
               !userId.isEmpty, let callee = payload["calleeId"] as? String, callee == userId,

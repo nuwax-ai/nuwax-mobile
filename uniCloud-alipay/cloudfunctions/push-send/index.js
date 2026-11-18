@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { prepareVoip } = require('./voip')
+const { prepareVoip, prepareNativeVoip } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -229,6 +229,46 @@ exports.main = async (event) => {
     body = JSON.parse(raw)
   } catch (e) {
     return { errCode: 400, errMsg: 'invalid json body' }
+  }
+
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { errCode: 400, errMsg: 'invalid request body' }
+  const nativeVoip = prepareNativeVoip(body)
+  if (nativeVoip) {
+    if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
+    if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }
+    if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
+    const route = body.callRoute
+    const enabled = route.transport === 'ios-voip'
+      ? process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT === route.environment
+      : (process.env.NUWAX_VOIP_ANDROID_TRANSPORTS || '').split(',').includes(route.transport)
+    if (!enabled) return { errCode: 503, errMsg: 'call transport unavailable' }
+    try {
+      const result = await uniPush.sendMessage({
+        push_clientid: [body.callRoute.cid],
+        title: clip(body.title, MAX_TITLE),
+        content: clip(body.content, MAX_CONTENT),
+        payload: nativeVoip.payload,
+        settings: nativeVoip.settings,
+        force_notification: false,
+        request_id: nativeVoip.requestId,
+        ...(nativeVoip.options ? { options: nativeVoip.options } : {})
+      })
+      const errCode = result?.errCode ?? -1
+      const details = result?.data && typeof result.data === 'object'
+        ? Object.entries(result.data).filter(([key, value]) =>
+          /^[A-Za-z0-9_-]{10,128}$/.test(key) && key !== route.cid &&
+          value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, route.cid))
+        : []
+      const tasks = details.map(([taskId, targets]) => {
+        const status = targets[route.cid]
+        return { taskId, status: typeof status === 'string' && /^[A-Za-z0-9_-]{1,50}$/.test(status) ? status : 'unknown' }
+      })
+      console.log('[push-send] call transport', body.callRoute.transport, nativeVoip.payload.callId, nativeVoip.requestId, errCode)
+      return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
+    } catch {
+      console.error('[push-send] call transport failed', nativeVoip.requestId)
+      return { errCode: -1, data: { requestId: nativeVoip.requestId } }
+    }
   }
 
   const ids = Array.isArray(body.push_clientid) ? body.push_clientid : [body.push_clientid]

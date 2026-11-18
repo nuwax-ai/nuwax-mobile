@@ -41,6 +41,9 @@ import LiveKit
     private var pendingPushExpiry: [UUID: Task<Void, Never>] = [:]
     private var pushWork: [UUID: NuwaxVoipPushWork] = [:]
     private var pushRegistration: NuwaxVoipApnsRegistration?
+    private var getuiBindingTask: Task<Void, Never>?
+    private var getuiBinding: (token: Data, cid: String)?
+    private var pushProvider: String { Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipPushProvider") as? String ?? "" }
     private var systemBridge: AnyObject?
     #if DEBUG
     private var systemDiagnostics: NuwaxVoipSystemDiagnostics?
@@ -65,6 +68,9 @@ import LiveKit
 
     @objc public nonisolated static func restoreOnLaunch() {
         if Thread.isMainThread { MainActor.assumeIsolated { shared.restore() } } else { DispatchQueue.main.sync { shared.restore() } }
+    }
+    @objc public nonisolated static func syncGetuiPushRoute() {
+        DispatchQueue.main.async { shared.refreshGetuiPushRoute() }
     }
     @objc public nonisolated static func execute(_ raw: String) {
         DispatchQueue.main.async {
@@ -206,14 +212,18 @@ import LiveKit
         }
         trace("initialize accepted")
         let same = configuration["userId"] as? String == user && configuration["apiBaseUrl"] as? String == base && configuration["deviceId"] as? String == config["deviceId"] as? String
-        if !same { reset() }
+        if !same && !configuration.isEmpty { reset() }
         let savedRegistration = same ? configuration["apnsRegistration"] : nil
-        configuration = config; configuration["pushProvider"] = "apns"
+        let savedRoutePaused = same ? configuration["pushRoutePaused"] : nil
+        let savedRouteRevoked = same ? configuration["pushRouteRevoked"] : nil
+        configuration = config; configuration["pushProvider"] = pushProvider
         if !same {
             historyStorage = NuwaxVoipHistoryStorage(origin: base, userID: user)
             history = NuwaxVoipCallHistory(data: historyStorage?.read(), recoveringAt: Date().timeIntervalSince1970 * 1000)
         }
         if configuration["apnsRegistration"] == nil { configuration["apnsRegistration"] = savedRegistration }
+        if configuration["pushRoutePaused"] == nil { configuration["pushRoutePaused"] = savedRoutePaused }
+        if configuration["pushRouteRevoked"] == nil { configuration["pushRouteRevoked"] = savedRouteRevoked }
         // Refresh the transport when access credentials refresh; retain the exact registration identity.
         pushRegistration?.stop(revoke: false); pushRegistration = nil
         if let mapping = config["systemUUIDs"] as? [String: String] { for (key, value) in mapping { if let id = UUID(uuidString: value) { callUUIDs[key] = id } } }
@@ -241,15 +251,22 @@ import LiveKit
             })
         } else { systemDiagnostics?.report() }
         #endif
-        let run = generation, settings = configuration
+        let run = generation, settings = configuration, provider = pushProvider
         let restored = (settings["apnsRegistration"] as? [String: Any]).flatMap { NuwaxVoipApnsDevice(stored: $0) }
-        pushRegistration = NuwaxVoipApnsRegistration(restored: restored, transport: { [weak self] body in
+        let transport: NuwaxVoipApnsRegistration.Transport = { [weak self] body in
             guard let self else { throw VoipError.invalid }
             return try await self.request("/devices", body: body, captured: settings)
-        }, changed: { [weak self] state, ready in
+        }
+        if let restored, restored.provider != provider {
+            NuwaxVoipApnsRegistration(restored: restored, transport: transport, changed: { _, _ in }).stop(revoke: true)
+            configuration.removeValue(forKey: "apnsRegistration")
+            configuration.removeValue(forKey: "pushRoutePaused")
+            configuration.removeValue(forKey: "pushRouteRevoked")
+        }
+        pushRegistration = NuwaxVoipApnsRegistration(restored: restored?.provider == provider ? restored : nil, transport: transport, changed: { [weak self] state, ready in
             guard let self, run == self.generation else { return }
             self.trace("PushKit registration state=\(state) senderReady=\(ready)")
-            self.emit("pushRegistration", ["provider": "apns", "state": state, "nativePush": ready])
+            self.emit("pushRegistration", ["provider": provider, "state": state, "nativePush": ready])
         })
         persist()
         UserDefaults.standard.set(true, forKey: "nuwax-voip-install-session")
@@ -729,6 +746,7 @@ import LiveKit
         closeServerCall()
         generation += 1; imSocket?.cancel(with: .goingAway, reason: nil); imSocket = nil; stream?.cancel(); stream = nil; finish("sessionChanged")
         pushRegistration?.stop(revoke: true); pushRegistration = nil
+        getuiBindingTask?.cancel(); getuiBindingTask = nil; getuiBinding = nil
         for work in Array(pushWork.values) { work.cancel() }; pushWork = [:]
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
         pushRegistry?.desiredPushTypes = []; pushRegistry = nil
@@ -815,10 +833,15 @@ import LiveKit
         emit("error", ["code": "CALL_PERMISSION_REQUIRED"]); emit("openPage"); finish("permissionDenied")
     }
     private func becameActive() {
+        refreshGetuiPushRoute()
         if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.resumePendingAnswer() }
         guard snapshot != nil else { return }
         emitAudioRoutes()
         executeOnMain(["op": "background", "scope": configuration["scope"] as? String ?? "", "hidden": false])
+    }
+    private func refreshGetuiPushRoute() {
+        if pushProvider == "unipush", let registry = pushRegistry,
+           let token = registry.pushToken(for: .voIP) { updatePushToken(token, registry: registry) }
     }
     fileprivate func pauseAudio(_ paused: Bool) { systemPaused = paused; updateAudioEngine() }
     private func handleInterruption(began: Bool, resume: Bool) {
@@ -958,24 +981,79 @@ extension NuwaxVoipBridge: RoomDelegate {
 extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
     private func updatePushToken(_ data: Data, registry: PKPushRegistry) {
         guard registry === pushRegistry, !configuration.isEmpty else { return }
+        getuiBindingTask?.cancel(); getuiBindingTask = nil
         if data.isEmpty {
+            getuiBinding = nil
             pushRegistration?.stop(revoke: true)
-            configuration.removeValue(forKey: "apnsRegistration"); persist(); return
+            configuration.removeValue(forKey: "apnsRegistration")
+            configuration.removeValue(forKey: "pushRoutePaused")
+            configuration.removeValue(forKey: "pushRouteRevoked")
+            persist(); return
         }
+        if pushProvider == "unipush" {
+            if let previous = storedPushDevice, !previous.hasToken(data) { pausePushRoute() }
+            let run = generation
+            getuiBindingTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { if !Task.isCancelled { self.getuiBindingTask = nil } }
+                for attempt in 0..<5 {
+                    if attempt > 0 {
+                        do { try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000) } catch { return }
+                    }
+                    guard !Task.isCancelled, run == self.generation, registry === self.pushRegistry else { return }
+                    guard let cid = NuwaxVoipGetui.clientId(), NuwaxVoipApnsDevice.validCid(cid) else { continue }
+                    if let previous = self.storedPushDevice, previous.cid != cid { self.pausePushRoute() }
+                    if self.getuiBinding?.token != data || self.getuiBinding?.cid != cid {
+                        guard NuwaxVoipGetui.bind(data) else { continue }
+                        self.getuiBinding = (data, cid)
+                        self.trace("Getui accepted PushKit token argument")
+                    }
+                    self.registerPushDevice(data, cid: cid)
+                    return
+                }
+                if self.configuration["pushRoutePaused"] as? Bool == true {
+                    self.pushRegistration?.stop(revoke: true)
+                    self.configuration["pushRouteRevoked"] = true
+                    self.persist()
+                }
+                self.emit("pushRegistration", ["provider": "unipush", "state": "unavailable", "nativePush": false])
+            }
+            return
+        }
+        registerPushDevice(data, cid: nil)
+    }
+
+    private var storedPushDevice: NuwaxVoipApnsDevice? {
+        (configuration["apnsRegistration"] as? [String: Any]).flatMap { NuwaxVoipApnsDevice(stored: $0) }
+    }
+
+    private var requiredPushRegistration: String? {
+        guard pushProvider == "unipush" else { return nil }
+        if configuration["pushRoutePaused"] as? Bool == true { return "" }
+        return storedPushDevice?.registrationId ?? ""
+    }
+
+    private func pausePushRoute() {
+        guard configuration["pushRoutePaused"] as? Bool != true else { return }
+        pushRegistration?.stop(revoke: false)
+        configuration["pushRoutePaused"] = true
+        persist()
+    }
+
+    private func registerPushDevice(_ data: Data, cid: String?) {
         let config = configuration
         // The signed host owns APNs environment. Never infer it from DEBUG or the API domain.
         let environment = Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipAPNSEnvironment") as? String ?? ""
         let bundle = Bundle.main.bundleIdentifier ?? "", device = config["deviceId"] as? String ?? ""
-        let previous = (config["apnsRegistration"] as? [String: Any]).flatMap { NuwaxVoipApnsDevice(stored: $0) }
-        let sameToken = previous?.token == data.map { String(format: "%02x", $0) }.joined()
-            && previous?.environment == environment && previous?.bundleId == bundle && previous?.deviceId == device
-        guard Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipPushProvider") as? String == "apns",
-            let registration = NuwaxVoipApnsDevice(token: data, bundleId: bundle, environment: environment,
-            deviceId: device, registrationId: sameToken ? previous!.registrationId : UUID().uuidString,
-            previousRegistrationId: sameToken ? previous!.previousRegistrationId : (previous?.registrationId ?? "")) else {
-            emit("pushRegistration", ["provider": "apns", "state": "configurationMissing", "nativePush": false]); return
+        guard let candidate = NuwaxVoipApnsDevice(token: data, bundleId: bundle, environment: environment,
+                                                 deviceId: device, cid: cid), candidate.provider == pushProvider else {
+            emit("pushRegistration", ["provider": pushProvider, "state": "configurationMissing", "nativePush": false]); return
         }
-        configuration["apnsRegistration"] = registration.body("register"); persist()
+        let registration = candidate.replacing(storedPushDevice, forceNew: configuration["pushRouteRevoked"] as? Bool == true)
+        configuration["apnsRegistration"] = registration.stored
+        configuration.removeValue(forKey: "pushRoutePaused")
+        configuration.removeValue(forKey: "pushRouteRevoked")
+        persist()
         pushRegistration?.register(registration)
     }
     public func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
@@ -991,7 +1069,9 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         restore()
         if #available(iOS 17.4, *) {
             let run = generation
-            let invitation = NuwaxVoipPushInvitation(payload.dictionaryPayload, userId: configuration["userId"] as? String ?? "", business: business, now: Date().timeIntervalSince1970 * 1000)
+            let route = requiredPushRegistration
+            let invitation = NuwaxVoipPushInvitation(payload.dictionaryPayload, userId: configuration["userId"] as? String ?? "",
+                business: business, now: Date().timeIntervalSince1970 * 1000, requiredRegistrationId: route)
             let systemUUID = invitation.map { uuid($0.callId) } ?? UUID()
             trace("PushKit received callId=\(invitation?.callId ?? "invalid") systemUUID=\(systemUUID.uuidString)")
             let system = (systemBridge as? NuwaxSystemCalls) ?? NuwaxSystemCalls(owner: self)
@@ -1025,10 +1105,14 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                     try await system.reportIncoming(invitation?.report ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: true)
                 }, validate: { [weak self] in
                     guard let self, run == self.generation, let invitation, !self.configuration.isEmpty else { system.end(uuid: systemUUID); return }
-                    await self.validatePush(invitation, systemUUID: systemUUID, system: system, run: run, duplicate: duplicate)
+                    await self.validatePush(invitation, systemUUID: systemUUID, system: system, run: run, duplicate: duplicate, route: route)
                 })
                 // The async delegate now returns to PushKit without waiting for HTTP.
                 trace("PushKit report completed systemUUID=\(systemUUID.uuidString)")
+                if pushProvider == "unipush", invitation != nil {
+                    let raw = payload.dictionaryPayload
+                    Task { @MainActor in NuwaxVoipGetui.recordReceipt(raw) }
+                }
             }
             catch {
                 system.end(uuid: systemUUID)
@@ -1043,13 +1127,13 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         }
     }
     @available(iOS 17.4, *)
-    private func validatePush(_ invitation: NuwaxVoipPushInvitation, systemUUID: UUID, system: NuwaxSystemCalls, run: Int, duplicate: Bool) async {
+    private func validatePush(_ invitation: NuwaxVoipPushInvitation, systemUUID: UUID, system: NuwaxSystemCalls, run: Int, duplicate: Bool, route: String?) async {
         // The online path may have independently validated this same call while
         // HTTP was pending. Cancelling redundant push work must not end it.
         let endIfUnverified = {
             if run != self.generation || !self.validatedSystemUUID(systemUUID) { system.end(uuid: systemUUID) }
         }
-        guard !Task.isCancelled, run == generation else { endIfUnverified(); return }
+        guard !Task.isCancelled, run == generation, route == requiredPushRegistration else { endIfUnverified(); return }
         if duplicate { if pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID) }; return }
         if validatedSystemUUID(systemUUID) { removePendingPush(systemUUID); return }
         guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.callId) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
@@ -1057,10 +1141,10 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         do {
             if business, let conv = invitation.convId, let msg = invitation.msgId {
                 let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
-                guard !Task.isCancelled, run == generation,
+                guard !Task.isCancelled, run == generation, route == requiredPushRegistration,
                       invitation.matches(message, now: Date().timeIntervalSince1970 * 1000),
                       var next = await businessInvitation(message), run == generation,
-                      !Task.isCancelled, let pending = pendingPushes[systemUUID] else { endIfUnverified(); return }
+                      !Task.isCancelled, route == requiredPushRegistration, let pending = pendingPushes[systemUUID] else { endIfUnverified(); return }
                 next["expiresAt"] = invitation.expiresAt
                 if pending.declined { notifyBusinessEnd(next, reason: "rejected"); system.end(uuid: systemUUID); return }
                 guard !terminal.contains(invitation.callId) else { system.end(uuid: systemUUID); return }

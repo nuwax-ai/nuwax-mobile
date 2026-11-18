@@ -29,6 +29,16 @@ with tempfile.TemporaryDirectory() as directory:
     m.configure_qa_manifest(root, None)
     entries = ET.parse(manifest).getroot().find('application').findall('meta-data')
     assert len(entries) == 1 and entries[0].get(m.ANDROID+'name') == 'existing'
+    for origin in ['http://test.example', 'https://test.example/path', 'https://test.example?query']:
+        try: m.configure_qa_manifest(root, None, origin)
+        except SystemExit: pass
+        else: raise AssertionError('Release policy must require an exact HTTPS origin')
+    m.configure_qa_manifest(root, None, 'https://test.example')
+    entries = ET.parse(manifest).getroot().find('application').findall('meta-data')
+    assert [n.get(m.ANDROID+'value') for n in entries if n.get(m.ANDROID+'name') == m.RELEASE_ORIGIN] == ['https://test.example']
+    m.configure_qa_manifest(root, None)
+    entries = ET.parse(manifest).getroot().find('application').findall('meta-data')
+    assert all(n.get(m.ANDROID+'name') != m.RELEASE_ORIGIN for n in entries)
 print('QA host origin isolation verified')
 `, resolve(import.meta.dirname, '../../scripts/voip-native/device')], { encoding: 'utf8', timeout: 10_000,
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });

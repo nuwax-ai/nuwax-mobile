@@ -21,11 +21,17 @@ compiler = [jar('org.jetbrains.kotlin', artifact, version) for artifact, version
     ('kotlin-script-runtime', '2.2.0'), ('kotlin-reflect', '1.6.10'), ('kotlin-daemon-embeddable', '2.2.0')]]
 compiler += [jar('org.jetbrains.kotlinx', 'kotlinx-coroutines-core-jvm', '1.8.0'), jar('org.jetbrains', 'annotations', '13.0')]
 runtime = [jar('org.jetbrains.kotlin', 'kotlin-stdlib', '2.2.0')]
+runtime += [jar('org.json', 'json', '20240303'), jar('junit', 'junit', '4.13.2'),
+            jar('org.hamcrest', 'hamcrest-core', '1.3')]
 java = Path(os.environ.get('JAVA_HOME', '/Applications/HBuilderX.app/Contents/HBuilderX/plugins/amazon-corretto')) / 'bin/java'
 output = ROOT / 'out/voip-android-policy-tests'
 output.mkdir(parents=True, exist_ok=True)
 subprocess.run([str(java), '-cp', os.pathsep.join(compiler), 'org.jetbrains.kotlin.cli.jvm.K2JVMCompiler',
     '-no-stdlib', '-no-reflect', '-jvm-target', '17', '-classpath', os.pathsep.join(runtime), '-d', str(output),
     str(ROOT / 'uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip/VoipCallPolicy.kt'),
-    str(ROOT / 'tests/voip/android/VoipCallPolicyTest.kt')], check=True, timeout=90)
+    str(ROOT / 'uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip/VoipPushPayload.kt'),
+    str(ROOT / 'tests/voip/android/VoipCallPolicyTest.kt'),
+    str(ROOT / 'tests/voip/android/VoipPushPayloadTest.kt')], check=True, timeout=90)
 subprocess.run([str(java), '-cp', os.pathsep.join([str(output), *runtime]), 'com.nuwax.voip.VoipCallPolicyTest'], check=True, timeout=30)
+subprocess.run([str(java), '-cp', os.pathsep.join([str(output), *runtime]), 'org.junit.runner.JUnitCore',
+    'com.nuwax.voip.VoipPushPayloadTest'], check=True, timeout=30)

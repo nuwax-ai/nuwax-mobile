@@ -43,4 +43,30 @@ class VoipPushPayloadTest {
         assertNull(VoipPushPayload.invitation(JSONObject().put("payload", value).toString()))
         assertNull(VoipPushPayload.invitation(" ".repeat(8193)))
     }
+
+    @Test fun nativePushRequiresMatchingAccountAndAuthoritativeInvitationWithinItsDeadline() {
+        val now = 1_793_000_000_000L
+        val push = JSONObject(locator).put("delivery", "android-native").put("callId", "call-12")
+            .put("calleeId", "bob").put("expiresAt", now + 30_000).put("mediaType", "audio").put("token", "ignored")
+        val parsed = JSONObject(VoipPushPayload.invitation(JSONObject().put("payload", push.toString()).toString())!!)
+        assertFalse(parsed.has("token"))
+        assertTrue(VoipPushPayload.eligible(parsed, "bob", now))
+        assertFalse(VoipPushPayload.eligible(parsed, "other-account", now))
+        assertFalse(VoipPushPayload.eligible(parsed, "bob", now + 30_000))
+        val message = JSONObject().put("msgType", "voip").put("convId", 1987654321098765432L)
+            .put("msgId", 1987654321098765433L).put("sendTime", now - 1000)
+            .put("body", JSONObject().put("callId", "call-12").put("mediaType", "audio"))
+        assertTrue(VoipPushPayload.matches(parsed, message, "bob", now))
+        assertFalse(VoipPushPayload.matches(parsed, JSONObject(message.toString()).put("msgId", 99L), "bob", now))
+        assertFalse(VoipPushPayload.matches(parsed, JSONObject(message.toString()).put("sendTime", now - 31_000), "bob", now))
+        message.getJSONObject("body").put("callId", "other")
+        assertFalse(VoipPushPayload.matches(parsed, message, "bob", now))
+    }
+
+    @Test fun incompleteNativeInvitesDoNotBecomeLegacyLocators() {
+        val marked = JSONObject(locator).put("delivery", "android-native")
+        assertNull(VoipPushPayload.invitation(marked.toString()))
+        marked.put("callId", "call-1").put("calleeId", "bob").put("mediaType", "audio").put("expiresAt", true)
+        assertNull(VoipPushPayload.invitation(marked.toString()))
+    }
 }

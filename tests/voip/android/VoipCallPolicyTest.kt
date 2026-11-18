@@ -5,12 +5,13 @@ object VoipCallPolicyTest {
         explicitCallIdMustMatch(); onlyAUserRejectionProducesDeclined()
         staleRingingSignalsCannotTerminateAnAcceptedCall(); userHangupIsDistinctFromCancelAndReject()
         standaloneQaCannotRestoreProductionIdentity()
+        releaseOriginRequiresAnExplicitMatchingHttpsPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
         endingOrAnsweringReleasesTheIncomingNotificationSlot()
         ringTimeStartsAfterInvitationAcknowledgement(); activeHangupDoesNotSendLegacyCancel()
         reconnectMustNotLookLikeRemoteHangup(); authFailuresAreSeparateFromNotificationFailures()
-        println("12 Kotlin call policy cases passed")
+        println("13 Kotlin call policy cases passed")
     }
     private fun ringTimeStartsAfterInvitationAcknowledgement() {
         check(VoipCallPolicy.ringDeadline(120000, 120500) == 180000L)
@@ -77,6 +78,13 @@ object VoipCallPolicyTest {
         check(VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://testagent.xspaceagi.com"))
         check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://agent.nuwax.com"))
         check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://testagent.xspaceagi.com.evil.example"))
+    }
+    private fun releaseOriginRequiresAnExplicitMatchingHttpsPin() {
+        val origin = "https://release.example"
+        check(!VoipCallPolicy.releaseOriginAllowed(null, origin))
+        check(!VoipCallPolicy.releaseOriginAllowed(origin, "https://test.example"))
+        check(!VoipCallPolicy.releaseOriginAllowed("http://release.example", "http://release.example"))
+        check(VoipCallPolicy.releaseOriginAllowed(origin, origin))
     }
     private fun explicitCallIdMustMatch() {
         check(!VoipCallPolicy.matches("old", "m1", "new", "m1"))

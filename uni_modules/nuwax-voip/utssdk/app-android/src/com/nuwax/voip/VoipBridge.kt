@@ -203,7 +203,7 @@ object VoipBridge {
         trace("initialize requested")
         if (!qaOriginAllowed(value)) return
         val debug = ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-        if (!value.optBoolean("development") && !value.optBoolean("qaAccepted") && !(debug && value.optBoolean("businessEnabled"))) return
+        if (!value.optBoolean("development") && !businessSessionAllowed(value, debug)) return
         if (value.optBoolean("development") && ((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) return
         val base = Uri.parse(value.optString("apiBaseUrl"))
         if (base.host.isNullOrEmpty() || (base.scheme != "https" && !(value.optBoolean("development") && base.scheme == "http"))) return
@@ -350,7 +350,7 @@ object VoipBridge {
             }
         }
     }
-    private suspend fun receiveInvitation(message: JSONObject) {
+    private suspend fun receiveInvitation(message: JSONObject, push: JSONObject? = null, sessionScope: String? = null) {
         trace("invitation validating")
         if (message.optString("msgType") != "voip" || message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
         val body = message.optJSONObject("body") ?: return
@@ -360,10 +360,13 @@ object VoipBridge {
         val sent = message.optLong("sendTime")
         if (sent <= 0 || sent + 60000 <= System.currentTimeMillis() || terminal.contains(id) || current?.optString("callId") == id) return
         val conversation = api("/api/instant-message/conversations/" + Uri.encode(conv), absolute = true)
+        if (sessionScope != null && config.optString("scope") != sessionScope) return
         if (conversation.optInt("convType") != 1 || conversation.optString("peerUserId") != sender) return
+        val deadline = if (push == null) sent + 60000 else push.optLong("expiresAt")
+        if (deadline <= System.currentTimeMillis() || terminal.contains(id) || current?.optString("callId") == id) return
         val next = JSONObject().put("protocol", "im-voip-v1").put("callId", id).put("roomName", body.getString("roomName")).put("msgId", message.getString("msgId")).put("convId", conv)
             .put("version", 1).put("state", "ringing").put("callerId", sender).put("calleeId", config.getString("userId")).put("callerDeviceId", "").put("acceptedDeviceId", "")
-            .put("mediaType", media).put("callerDisplayName", conversation.optString("peerName", sender)).put("calleeDisplayName", config.getString("userId")).put("expiresAt", sent + 60000)
+            .put("mediaType", media).put("callerDisplayName", conversation.optString("peerName", sender)).put("calleeDisplayName", config.getString("userId")).put("expiresAt", deadline)
         if (current != null && current?.optString("callId") != id) { notifyBusinessEnd(next, "busy"); terminal.add(id); return }
         trace("invitation accepted"); adopt(next)
     }
@@ -781,34 +784,53 @@ object VoipBridge {
     }
 
     /** Called by the native UniPush service before the SDK converts force_notification into an IM notice. */
-    @JvmStatic fun receiveUniPush(ctx: Context, payload: String): Boolean {
+    @JvmStatic fun receiveUniPush(ctx: Context, payload: String, source: String): Boolean {
         context = ctx.applicationContext
+        val invitation = runCatching { JSONObject(payload) }.getOrNull() ?: return false
+        val native = VoipPushPayload.isNative(invitation)
+        if (native && source == "click") return true
         // A persisted context exists only after privacy consent and an authenticated bootstrap.
         // Read it afresh: logout must not revive the previous account on a cold push.
-        val saved = loadConfig() ?: return false
+        val saved = loadConfig() ?: return native
         val debug = ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         if (saved.optString("protocol") != "im-voip-v1" || saved.optString("accessToken").isEmpty() ||
-            !(saved.optBoolean("qaAccepted") || (debug && saved.optBoolean("businessEnabled")))) return false
-        trace("native push routed to call")
-        incoming(ctx, payload)
+            !businessSessionAllowed(saved, debug)) return native
+        if (!debug && !saved.optBoolean("qaAccepted") && !native) return false
+        if (native && !VoipPushPayload.eligible(invitation, saved.optString("userId"), System.currentTimeMillis())) return true
+        trace(if (native) "native push routed to call source=$source callId=${invitation.optString("callId")}" else "native push routed to call")
+        incoming(ctx, invitation, saved.optString("scope"))
         return true
     }
 
-    /** Explicit vendor adapter hook. Feed a real call invitation, never an ordinary message notification. */
-    @JvmStatic fun incoming(ctx: Context, payload: String) {
+    /** Restore the authenticated native context and verify the invitation before ringing. */
+    private fun incoming(ctx: Context, invitation: JSONObject, sessionScope: String) {
         context = ctx.applicationContext
         scope.launch {
             try {
-                if (config.optString("accessToken").isEmpty()) loadConfig()?.let { initialize(it) }
-                if (config.optString("accessToken").isEmpty()) return@launch
-                val invitation = JSONObject(payload)
-                if (business()) { receiveInvitation(api("/api/instant-message/messages/" + Uri.encode(invitation.getString("msgId")) + "?convId=" + Uri.encode(invitation.getString("convId")), absolute = true)); return@launch }
-                val callId = invitation.getString("callId")
-                if (!callId.matches(Regex("[A-Za-z0-9_-]{1,128}"))) return@launch
-                adopt(api("/$callId"))
-            } catch (_: Exception) { emit("error", "code", "CALL_INVITATION_FAILED") }
+                if (config.optString("accessToken").isEmpty()) {
+                    loadConfig()?.takeIf { it.optString("scope") == sessionScope }?.let { initialize(it) }
+                }
+                if (!business() || sessionScope.isEmpty() || config.optString("scope") != sessionScope) return@launch
+                val message = api("/api/instant-message/messages/" + Uri.encode(invitation.getString("msgId")) +
+                    "?convId=" + Uri.encode(invitation.getString("convId")), absolute = true)
+                if (config.optString("scope") != sessionScope) return@launch
+                val native = VoipPushPayload.isNative(invitation)
+                if (native && !VoipPushPayload.matches(invitation, message, config.optString("userId"), System.currentTimeMillis())) return@launch
+                receiveInvitation(message, invitation.takeIf { native }, sessionScope)
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { if (config.optString("scope") == sessionScope) emit("error", "code", "CALL_INVITATION_FAILED") }
         }
     }
+
+    @JvmStatic fun isReleaseOrigin(ctx: Context, origin: String): Boolean {
+        val pinned = ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA)
+            .metaData?.getString("nuwax.voip.releaseApiOrigin")
+        return VoipCallPolicy.releaseOriginAllowed(pinned, origin)
+    }
+
+    private fun businessSessionAllowed(value: JSONObject, debug: Boolean): Boolean =
+        value.optBoolean("qaAccepted") || (value.optBoolean("businessEnabled") &&
+            (debug || context?.let { isReleaseOrigin(it, value.optString("apiBaseUrl")) } == true))
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey("nuwax-voip-context", null) as? SecretKey)?.let { return it }

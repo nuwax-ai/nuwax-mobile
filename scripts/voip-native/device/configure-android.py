@@ -4,6 +4,7 @@ import os
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from configure_unipush import ANDROID, configure
 from android_resources import configure_resources
@@ -12,9 +13,10 @@ LISTENER = "com.nuwax.voip.VoipDevControlService"
 MARKER = "nuwax.voip.deviceTest"
 PERMISSION = "android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
 QA_ORIGIN = "nuwax.voip.qaApiOrigin"
+RELEASE_ORIGIN = "nuwax.voip.releaseApiOrigin"
 
 
-def configure_qa_manifest(project: Path, qa_project: Path | None) -> None:
+def configure_qa_manifest(project: Path, qa_project: Path | None, release_origin: str | None = None) -> None:
     manifest = project / "app/src/main/AndroidManifest.xml"
     tree = ET.parse(manifest)
     application = tree.getroot().find("application")
@@ -26,11 +28,17 @@ def configure_qa_manifest(project: Path, qa_project: Path | None) -> None:
         if variant.get("flavor") != "voip-business-qa" or variant.get("apiOrigin") != "https://testagent.xspaceagi.com":
             raise SystemExit("Unexpected standalone QA origin")
         origin = variant["apiOrigin"]
+    if release_origin:
+        url = urlsplit(release_origin)
+        if qa_project or url.scheme != "https" or not url.hostname or url.netloc != url.hostname or url.path or url.query or url.fragment:
+            raise SystemExit("Android VoIP release requires a dedicated HTTPS origin without a path")
     for node in list(application.findall("meta-data")):
-        if node.get(ANDROID + "name") == QA_ORIGIN:
+        if node.get(ANDROID + "name") in (QA_ORIGIN, RELEASE_ORIGIN):
             application.remove(node)
     if origin:
         ET.SubElement(application, "meta-data", {ANDROID + "name": QA_ORIGIN, ANDROID + "value": origin})
+    if release_origin:
+        ET.SubElement(application, "meta-data", {ANDROID + "name": RELEASE_ORIGIN, ANDROID + "value": release_origin})
     tree.write(manifest, encoding="utf-8", xml_declaration=True)
 
 
@@ -85,4 +93,7 @@ if __name__ == "__main__":
     configure(project, Path(config_path) if config_path else None)
     qa_path = os.environ.get("NUWAX_ANDROID_QA_PROJECT")
     configure_resources(project, Path(qa_path) if qa_path else Path(__file__).resolve().parents[3])
-    configure_qa_manifest(project, Path(qa_path) if qa_path else None)
+    release_origin = os.environ.get("NUWAX_ANDROID_VOIP_RELEASE_ORIGIN")
+    if enabled and release_origin:
+        raise SystemExit("Android VoIP release origin cannot be combined with the device test host")
+    configure_qa_manifest(project, Path(qa_path) if qa_path else None, release_origin)

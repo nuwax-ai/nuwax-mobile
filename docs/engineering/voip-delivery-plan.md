@@ -73,6 +73,22 @@ APNs VoIP 是苹果的电话投递机制，不意味着要另部署一个 APNs �
 
 ## 统一文件分工与顺序
 
+### 2026-11-18 客户端和云函数提交范围
+
+- iOS 在签名宿主选择 `NUWAX_IOS_VOIP_PUSH_PROVIDER=unipush` 时，调用 App 已有的 `GeTuiSdk` 绑定 PushKit token。原生在 token、CID 到达和回前台时同步登记。SDK 接受参数后仍须等待 IM 确认当前版本。原始 token 只交给厂商 SDK 并保存在本机加密会话，IM 只收到 CID 与电话路由字段。当前构建默认 provider 仍为 `apns`，需要测试包显式选择 UniPush。
+- Android 用既有原生接收器接收厂商回调。专用邀请在访问 IM 前校验被叫账号和截止时间，再比对鉴权接口返回的消息、会话、callId 和媒体类型。核对当前会话后才报告 Telecom，普通通知点击入口不会处理这类专用邀请。对后续发行构建提供 `NUWAX_ANDROID_VOIP_RELEASE_ORIGIN` HTTPS 精确匹配入口，缺省关闭。测试包和发行构建走同一个原生接收器。
+- `push-send` 仍复用原 HTTP 鉴权。服务端通过 `callRoute` 指定一个设备，函数只构造固定字段、最长 5 秒的投递 TTL 和稳定防重请求号。iOS 使用 `options.ios.type=voip`，Android 华为、荣耀使用 UniPush 的厂商路由策略；本地测试验证请求参数与回调后的校验链路。Android 策略本身无法确认厂商会在无进程时调用原生接收器。
+
+| 负责人 | 测试联调前要交付 |
+| --- | --- |
+| IM 后端 | 在现有 `POST /api/instant-message/calls/devices` 接受 `provider=unipush, channel=pushKit, platform=ios, deviceId, bundleId, environment, cid, registrationId, previousRegistrationId, action=register/revoke`。鉴权确定账号，核对设备与 CID 的归属。成功 data 回显 provider、channel、deviceId、bundleId、environment、cid、registrationId、registered，以及可选 nativePush。依登记版本比较更新与撤销，旧请求不得复活；允许以已撤销版本为条件前驱创建后继。退出或换账号须由后端撤销旧账号路由。若请求响应丢失、连续轮换与条件更新冲突，返回可识别结果，待与客户端统一安全重对账，禁止无条件覆盖。 |
+| IM 业务发送 | 在有效单聊邀请落库后，按账号、设备及当前路由选择单个目标。POST 原有 `push-send` 时 `push_clientid` 为同一个 CID 字符串，`callRoute` 含 `cid, platform, transport`，iOS 还须带 `environment, registrationId`。transport 为 `ios-voip`、`android-huawei` 或 `android-honor`。`payload` 必须含 `type=voip, convType=1, convId, msgId, callId, calleeId, mediaType, expiresAt`，ID 使用字符串，截止时间为毫秒。保留现有的投递资格与可靠去重，在发送前复核路由及有效性。启用专用路由后避免普通通知叠加。取消、抢接和终态补偿通过业务信令继续补齐。 |
+| UniPush／个推 | 确认本 App 的 VoIP topic `com.nuwax.app.voip`、CID → PushKit token 绑定情况、实际 sandbox／production 选择方式、`strategy.ios=2` 和短 TTL 至 APNs expiration 的映射。提供受理或失败原因、任务标识。SDK BOOL、CID 和任务受理只分别证明对应环节。 |
+| Android 厂商／聚合方 | 分别确认现有华为、荣耀 SDK 及已批准权益能否让拟支持的系统版本在无进程时触发原生回调，以及 UniPush 是否支持对应电话类型。当前分支已提供 Android 专用载荷及 `hw/ho` 厂商策略，尚缺生产直投能力与实机凭证。若只能展示普通通知或要求点击，厂商方需提供获准的专用投递、回调契约及适用机型，随后按其契约补适配。 |
+| 测试环境负责人 | 在隔离的现有测试部署中确认专用路由与供应商配置后，设置云函数的 `NUWAX_VOIP_IOS_APNS_ENVIRONMENT=development`（以签名包为准）和已获准的 `NUWAX_VOIP_ANDROID_TRANSPORTS`（逗号分隔）。两个开关缺省关闭，环境不匹配时发送返回 503。提供 IM 与云函数部署版本并留存同一 callId 的发送、厂商状态、原生回调、系统来电及媒体证据。 |
+
+本轮本地通过 153 项 Vitest、60 项 Swift、20 项 Kotlin/JVM 测试，以及 Swift 语法和云函数 JS 语法检查。HBuilderX 平台编译、安装和真机无进程来电仍待执行。安卓如遇供应商仅支持普通通知的场景，暂按该机型不可验收。iOS 如遇供应商无法路由匹配签名环境的 VoIP token，先取得厂商结论，再评估现有直连 APNs 备选。详见 [DCloud 扩展参数](https://doc.dcloud.net.cn/uniCloud/uni-cloud-push/options.html)、[个推 Android 集成指引](https://docs.getui.com/getui/mobile/vendor/androidstudio/)。
+
 当前会话负责 PC 行为对齐及公共回归；[iOS 专项会话](codex://threads/01a1e940-e635-7110-8bdd-0388dfbee39f)负责 PushKit／供应商路线核查与无进程验收。共享同一分支和已提交基线，不重复 cherry-pick 同一补丁。
 
 `NuwaxVoipBridge.swift` 为共享文件：PC 批次修改 mediaJoined／connectMedia／adopt／挂断及 Room 事件；iOS 专项的 PushKit、后台验证及持久化区域保持已有提交。本批修改期间专项仅补只读清单；后续需要改共享区域先同步范围，顺序提交，不能两边各自重打包或覆盖真机。

@@ -32,6 +32,34 @@ import XCTest
         XCTAssertFalse(record.acknowledges(wrong))
         XCTAssertTrue(record.acknowledges(ack(record.body("register"))))
     }
+    func testUniPushRegistrationKeepsTokenOnDeviceAndVersionsCidAndTokenChanges() throws {
+        func candidate(_ byte: UInt8, _ cid: String, environment: String = "development") throws -> NuwaxVoipApnsDevice {
+            try XCTUnwrap(NuwaxVoipApnsDevice(token: Data([byte]), bundleId: "com.nuwax.app", environment: environment,
+                                             deviceId: "phone", cid: cid))
+        }
+        let old = try candidate(1, "cid-one")
+        let same = try candidate(1, "cid-one")
+        let changedCid = try candidate(1, "cid-two")
+        let changedToken = try candidate(2, "cid-one")
+        let changedEnvironment = try candidate(1, "cid-one", environment: "production")
+        XCTAssertEqual(same.replacing(old), old)
+        XCTAssertEqual(changedCid.replacing(old).previousRegistrationId, old.registrationId)
+        XCTAssertEqual(changedToken.replacing(old).previousRegistrationId, old.registrationId)
+        XCTAssertEqual(changedEnvironment.replacing(old).previousRegistrationId, "")
+        XCTAssertEqual(same.replacing(old, forceNew: true).registrationId, same.registrationId)
+        XCTAssertEqual(NuwaxVoipApnsDevice(stored: old.stored), old)
+        for action in ["register", "revoke"] {
+            let body = old.body(action)
+            XCTAssertEqual(body["provider"] as? String, "unipush")
+            XCTAssertEqual(body["cid"] as? String, "cid-one")
+            XCTAssertNil(body["token"])
+        }
+        var response = ack(old.body("register"), ready: true)
+        XCTAssertTrue(old.acknowledges(response))
+        response["cid"] = "wrong"
+        XCTAssertFalse(old.acknowledges(response))
+        XCTAssertFalse(old.acknowledges(ack(device().body("register"), ready: true)))
+    }
     func testBackendAcknowledgementIsSeparateFromDeliveryReadiness() async {
         var states: [(String, Bool)] = []
         let registration = NuwaxVoipApnsRegistration(transport: { self.ack($0) }, changed: { states.append(($0, $1)) })

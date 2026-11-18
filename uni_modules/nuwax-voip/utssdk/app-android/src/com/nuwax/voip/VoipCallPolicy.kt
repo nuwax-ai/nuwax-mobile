@@ -22,6 +22,8 @@ internal object VoipCallPolicy {
         else previousSound
 
     fun originAllowed(fixedOrigin: String?, origin: String): Boolean = fixedOrigin.isNullOrEmpty() || fixedOrigin == origin
+    fun releaseOriginAllowed(fixedOrigin: String?, origin: String): Boolean =
+        !fixedOrigin.isNullOrEmpty() && origin == fixedOrigin && origin.startsWith("https://")
 
     fun matches(signalId: String, messageId: String, callId: String, callMessageId: String): Boolean =
         if (signalId.isNotEmpty()) signalId == callId else messageId.isNotEmpty() && callMessageId.isNotEmpty() && messageId == callMessageId

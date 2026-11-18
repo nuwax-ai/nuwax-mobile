@@ -14,7 +14,7 @@ class VoipUniPushIntentService : UniPushIntentService() {
         val invitation = raw?.let { VoipPushPayload.invitation(it) }
         val debug = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
         if (debug) Log.d("NuwaxVoip", "push received: $source, call=" + (invitation != null))
-        return invitation != null && VoipBridge.receiveUniPush(context, invitation)
+        return invitation != null && VoipBridge.receiveUniPush(context, invitation, source)
     }
 
     override fun onReceiveMessageData(context: Context, message: GTTransmitMessage) {

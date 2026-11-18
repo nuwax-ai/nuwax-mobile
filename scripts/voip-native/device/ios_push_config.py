@@ -5,13 +5,15 @@ import subprocess
 from pathlib import Path
 
 
-def push_configuration(entitlements, bundle_id, team_id):
+def push_configuration(entitlements, bundle_id, team_id, provider='apns'):
     environment = entitlements.get('aps-environment')
     if environment not in ('development', 'production'):
         raise ValueError('Signing profile has no supported APNs environment')
     if entitlements.get('application-identifier') != f'{team_id}.{bundle_id}':
         raise ValueError('Signing profile does not match the App bundle/team')
-    return {'NuwaxVoipPushProvider': 'apns', 'NuwaxVoipAPNSEnvironment': environment}, {'aps-environment': environment}
+    if provider not in ('apns', 'unipush'):
+        raise ValueError('Unsupported iOS VoIP provider')
+    return {'NuwaxVoipPushProvider': provider, 'NuwaxVoipAPNSEnvironment': environment}, {'aps-environment': environment}
 
 
 def selected_profile():
@@ -35,15 +37,16 @@ def selected_profile():
 
 def selected_push_configuration(bundle_id):
     decoded = selected_profile()
-    return push_configuration(decoded.get('Entitlements', {}), bundle_id, os.environ['IOS_DEVELOPMENT_TEAM'])
+    return push_configuration(decoded.get('Entitlements', {}), bundle_id, os.environ['IOS_DEVELOPMENT_TEAM'],
+                              os.environ.get('NUWAX_IOS_VOIP_PUSH_PROVIDER', 'apns'))
 
 
 def verify_signed_push(info, entitlements):
     environment = info.get('NuwaxVoipAPNSEnvironment')
     if environment not in ('development', 'production') or environment != entitlements.get('aps-environment'):
         raise ValueError('Signed APNs environment and VoIP metadata differ')
-    if info.get('NuwaxVoipPushProvider') != 'apns':
-        raise ValueError('Signed host is missing the APNs VoIP provider')
+    if info.get('NuwaxVoipPushProvider') not in ('apns', 'unipush'):
+        raise ValueError('Signed host is missing a supported VoIP provider')
     bundle = info.get('CFBundleIdentifier')
     identifier = entitlements.get('application-identifier', '')
     if not bundle or not identifier.endswith('.' + bundle):

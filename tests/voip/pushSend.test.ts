@@ -13,14 +13,66 @@ const ordinaryFixtures = JSON.parse(readFileSync(resolve(import.meta.dirname, 'f
 const now = 1_793_000_000_000;
 const locator = { type: 'voip', convId: '245475557381246976', msgId: '9223372036854775807' };
 
-function load(code = source) {
+function load(code = source, env: Record<string, string> = {}) {
   const send = vi.fn().mockResolvedValue({ errCode: 0, data: { accepted: true } });
   const module = { exports: {} as any };
   runInNewContext(code, { exports: module.exports, require, Buffer,
-    process: { env: { PUSH_SIGN_KEY: 'fixture-only-sign' } },
+    process: { env: { PUSH_SIGN_KEY: 'fixture-only-sign', ...env } },
     uniCloud: { getPushManager: () => ({ sendMessage: send }) }, console: { log() {}, error() {} } });
   return { send, call: (body: any, sign = 'fixture-only-sign') => module.exports.main({ headers: { 'x-push-sign': sign }, body: JSON.stringify(body) }) };
 }
+
+describe('native call delivery', () => {
+  const cid = 'fixture-target-cid';
+  const registrationId = 'cb67ff9e-54ee-44ef-a6c0-601fd536cdf5';
+  const env = { NUWAX_VOIP_IOS_APNS_ENVIRONMENT: 'development', NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei,android-honor' };
+  const makeBody = (expiresAt = Date.now() + 45_000) => ({
+    push_clientid: cid, title: 'Nuwax', content: 'call',
+    callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId },
+    payload: { ...locator, callId: 'same-call', calleeId: 'bob', convType: 1, mediaType: 'audio', expiresAt },
+  });
+
+  it('sends the real iOS VoIP options to one device and returns only its provider task status', async () => {
+    const { call, send } = load(source, env);
+    const body = makeBody();
+    send.mockResolvedValueOnce({ errCode: 0, data: { 'task-fixture-123': { [cid]: 'successed_offline', 'other-cid': 'successed_online' } } });
+    const result = await call({ ...body, payload: { ...body.payload, token: 'secret' }, badge: 12, options: { ios: { type: 'notify' } } });
+    const args = send.mock.calls[0][0];
+    expect(args).toMatchObject({ push_clientid: [cid], settings: { ttl: 5000, strategy: { ios: 2 } }, options: { ios: { type: 'voip' } } });
+    expect(JSON.parse(args.options.ios.payload)).toEqual({ ...body.payload, routeRegistrationId: registrationId });
+    expect(args).not.toHaveProperty('badge');
+    expect(result.data).toEqual({ requestId: args.request_id, tasks: [{ taskId: 'task-fixture-123', status: 'successed_offline' }] });
+    await call(body);
+    expect(send.mock.calls[1][0].request_id).toBe(args.request_id);
+    await call({ ...body, callRoute: { ...body.callRoute, registrationId: '2872678e-3315-4a30-b20f-12200b5f74ed' } });
+    expect(send.mock.calls[2][0].request_id).not.toBe(args.request_id);
+  });
+
+  it.each([['android-huawei', 'hw'], ['android-honor', 'ho']])('routes %s to its vendor with the validated native invitation', async (transport, key) => {
+    const { call, send } = load(source, env);
+    const body = makeBody();
+    await call({ ...body, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } });
+    expect(send.mock.calls[0][0]).toMatchObject({
+      settings: { ttl: 2000, strategy: { [key]: 2 } },
+      payload: { ...body.payload, delivery: 'android-native' },
+    });
+    expect(send.mock.calls[0][0]).not.toHaveProperty('options');
+  });
+
+  it('fails closed for mixed devices, wrong platform, invalid invites, missing configuration and wrong signed environment', async () => {
+    const { call, send } = load(source, env);
+    const body = makeBody();
+    expect((await call(body, 'bad-sign')).errCode).toBe(401);
+    expect((await call({ ...body, push_clientid: [cid, 'other'] })).errCode).toBe(400);
+    expect((await call({ ...body, callRoute: { ...body.callRoute, platform: 'android' } })).errCode).toBe(400);
+    expect((await call({ ...body, payload: { ...body.payload, callId: undefined } })).errCode).toBe(400);
+    expect((await call(makeBody(Date.now() + 70_000))).errCode).toBe(400);
+    expect((await call(makeBody(Date.now() - 100))).data.skipped).toBe(true);
+    expect((await call({ ...body, callRoute: { ...body.callRoute, environment: 'production' } })).errCode).toBe(503);
+    expect((await load().call(body)).errCode).toBe(503);
+    expect(send).not.toHaveBeenCalled();
+  });
+});
 
 describe('VoIP UniPush notice isolation', () => {
   it('keeps locators even when untrusted display/extra data exceeds the payload budget', () => {

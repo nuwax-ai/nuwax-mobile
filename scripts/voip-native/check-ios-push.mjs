@@ -7,7 +7,7 @@ const project = `${root}/out/voip-ios-push-tests`;
 await rm(`${project}/Sources/VoipPush`, { recursive: true, force: true });
 await mkdir(`${project}/Sources/VoipPush`, { recursive: true });
 await mkdir(`${project}/Tests/VoipPushTests`, { recursive: true });
-for (const name of ['NuwaxVoipPushInvitation', 'NuwaxVoipApnsRegistration', 'NuwaxVoipSystemCallRegistry', 'NuwaxVoipCallPolicy', 'NuwaxVoipClientState', 'NuwaxVoipCallHistory', 'NuwaxVoipPushWork', 'NuwaxVoipSessionStorage']) {
+for (const name of ['NuwaxVoipPushInvitation', 'NuwaxVoipApnsRegistration', 'NuwaxVoipSystemCallRegistry', 'NuwaxVoipCallPolicy', 'NuwaxVoipClientState', 'NuwaxVoipCallHistory', 'NuwaxVoipPushWork', 'NuwaxVoipSessionStorage', 'NuwaxVoipGetui']) {
   await copyFile(`${root}/uni_modules/nuwax-voip/utssdk/app-ios/${name}.swift`, `${project}/Sources/VoipPush/${name}.swift`);
 }
 for (const file of await readdir(`${root}/tests/voip/ios`)) {

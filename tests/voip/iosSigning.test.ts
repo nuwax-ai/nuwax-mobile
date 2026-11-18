@@ -18,6 +18,9 @@ for env in ['development', 'production']:
     assert info['NuwaxVoipAPNSEnvironment'] == entitlements['aps-environment'] == env
     config.verify_signed_push(dict(info, CFBundleIdentifier='com.nuwax.app'), dict(entitlements, **{'application-identifier':'TEAM.com.nuwax.app'}))
     rejects(lambda: config.verify_signed_push(dict(info, CFBundleIdentifier='com.nuwax.app'), {'aps-environment':'wrong'}))
+    aggregate_info, aggregate_entitlements = config.push_configuration({'aps-environment':env,'application-identifier':'TEAM.com.nuwax.app'}, 'com.nuwax.app','TEAM','unipush')
+    assert aggregate_info['NuwaxVoipPushProvider'] == 'unipush' and aggregate_entitlements == entitlements
+    config.verify_signed_push(dict(aggregate_info, CFBundleIdentifier='com.nuwax.app'), dict(aggregate_entitlements, **{'application-identifier':'TEAM.com.nuwax.app'}))
 rejects(lambda: config.push_configuration({'aps-environment':'development','application-identifier':'TEAM.com.other'}, 'com.nuwax.app','TEAM'))
 rejects(lambda: config.push_configuration({'application-identifier':'TEAM.com.nuwax.app'}, 'com.nuwax.app','TEAM'))
 with tempfile.TemporaryDirectory() as directory:

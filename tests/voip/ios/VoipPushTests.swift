@@ -26,6 +26,18 @@ final class VoipPushTests: XCTestCase {
         var wrong = payload; wrong["calleeId"] = "another-account"; XCTAssertNil(parse(wrong))
         XCTAssertNil(NuwaxVoipPushInvitation(payload, userId: "", business: true, now: now))
     }
+    func testUniPushRejectsStaleOrMissingRouteEvenForSameAccount() {
+        func parseRoute(_ fields: [AnyHashable: Any], required: String) -> NuwaxVoipPushInvitation? {
+            NuwaxVoipPushInvitation(fields, userId: "bob", business: true, now: now, requiredRegistrationId: required)
+        }
+        var fields = payload
+        XCTAssertNil(parseRoute(fields, required: "route-new"))
+        fields["routeRegistrationId"] = "route-old"
+        XCTAssertNil(parseRoute(fields, required: "route-new"))
+        XCTAssertNil(parseRoute(fields, required: ""))
+        fields["routeRegistrationId"] = "route-new"
+        XCTAssertNotNil(parseRoute(["payload": fields], required: "route-new"))
+    }
     func testRejectsUnsafeIdsAndMalformedPayloads() {
         for id: Any in [245475557381246976 as Int64, "9223372036854775808", "../123", "1?token=x", "0", true] {
             var wrong = payload; wrong["convId"] = id; XCTAssertNil(parse(wrong))

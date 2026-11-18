@@ -20,6 +20,10 @@ import kotlin.math.min
 
 private const val PULL_ACTION_TRIGGER_RATE = 1.15f
 private const val PULL_ACTION_MIN_DRAG_DURATION_MS = 180L
+// offset 由 SmartRefreshLayout 以整数物理像素给出。旧的 0.5dp 门槛在 3x 密度
+// 设备上会吞掉每隔一个物理像素的更新，慢拉时页面呈阶梯跳动。保留 16ms 帧限，
+// 但距离只要变化就派发，使业务层直接跟手且不会超过屏幕刷新频率。
+private const val PULL_ACTION_PROGRESS_EPSILON_DP = 0.01
 
 interface PullActionCallback {
     fun onProgress(distance: Double, dragging: Boolean)
@@ -179,7 +183,8 @@ private class PullActionSession(
         val normalized = max(0.0, distanceDp)
         val now = SystemClock.uptimeMillis()
         val draggingChanged = dragging != lastProgressDragging
-        val distanceChanged = abs(normalized - lastProgressDistanceDp) >= 0.5
+        val distanceChanged =
+            abs(normalized - lastProgressDistanceDp) >= PULL_ACTION_PROGRESS_EPSILON_DP
 
         if (
             !force &&

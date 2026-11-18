@@ -243,16 +243,33 @@ outgoing/incoming ──单方取消──> ended(canceled)
 
 ### 5.1 发送侧（App → 服务端）
 
-复用 `servers/im.uts` 的 `msgSend`，新增两个发送封装：
+#### convId 的语义（先澄清）
 
-```ts
-// 单聊通话邀请
-sendVoipInvite(convId, { callId, mediaType, roomName })
-// 会议邀请
-sendMeetingInvite(convId, { inviteId, roomName, title, mediaType, groupCall?, passcode? })
+`convId` 是**这条邀请消息落到哪个 IM 会话**，不是会议标识，也不是"会议号"：
+
+- **会议本身没有 `convId`**，会议标识是 `roomName`（会议号 = LiveKit 房间名）。
+- 1v1 通话：`convId` = 与对方的单聊会话。
+- 创建会议 / 会中加人：**每个被邀请人各建一条单聊**，每人一个 `convId`（`apiImCreateP2pConversation`，服务端幂等）。
+- 群通话：群会话 `convId` 只用于发一条 `silent=true` 的群卡片；响铃邀请仍逐人走单聊。
+
+所以「创建会议时选人」不能拿会议去套一个 `convId`，正确调用链是：
+
+```text
+for each 被邀请人:
+  convId = createP2p(userId)       // 幂等，已存在直接复用
+  sendMeetingInvite(convId, body)  // roomName / title / mediaType 在 body 里
 ```
 
-`clientMsgId` 仍按现有规则生成；`deviceId` 必须带（服务端据此排除来源端）。
+#### 分层封装
+
+| 层 | 函数 | 职责 |
+|---|---|---|
+| 底层 | `apiImSendMeetingInvite(convId, inviteId, roomName, title, mediaType, groupCall, silent, clientMsgId, passcode?)` | 发一条 `meeting_invite`；**已存在**于 `servers/imCall.uts`，待补 `passcode` |
+| 高层 | `inviteContactsToMeeting({ roomName, title, mediaType, passcode, contacts })` | 逐人建单聊 + 发送 + 汇总失败；创建页 / 预约页 / 会中加人共用 |
+| 群卡片 | `sendGroupCallCard(groupConvId, body)` | 群会话发一条 `silent=true` 卡片，**不响铃** |
+| 通话 | `apiImSendVoipInvite(convId, callId, mediaType, roomName, clientMsgId)` | 1v1 通话邀请；**已存在**于 `servers/imCall.uts` |
+
+`clientMsgId` 每条唯一（幂等键）；`deviceId` 必带（服务端据此排除来源端）。
 
 ### 5.2 推送侧（服务端 → 云函数 → App）
 
@@ -283,7 +300,7 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
 | `roomName` | LiveKit 房间名，接听后直接入房 | **必须** |
 | `mediaType` | `audio`/`video`，决定来电页样式与是否开摄像头 | **必须** |
 | `sendTime` | 毫秒时间戳，端上判断是否仍在 60 秒响铃窗口 | **必须** |
-| `senderName` | 来电页姓名，避免冷启动先拉会话 | 建议 |
+| `senderName` | 来电页姓名；iOS 点击通知后才执行 JS，此时要立刻画界面，不能等拉会话 | **必须** |
 
 ```json
 {
@@ -310,9 +327,9 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
 | `title` | 浮层/卡片标题；不带就得先拉消息 | **必须** |
 | `mediaType` | 入会默认开不开摄像头 | **必须** |
 | `silent` | 群通话卡片不响铃；缺了会「勾选 2 人、全群弹窗」 | **必须** |
-| `passcode` | 4~6 位数字；冷启动点通知即可入会，不撞密码框 | 强烈建议 |
-| `senderName` | 浮层显示「张三邀请你加入」 | 建议 |
-| `groupCall` | 卡片文案用语音/视频口径 | 建议 |
+| `passcode` | 4~6 位数字；有密码的会议冷启动点通知必须能直接入会，不撞密码框 | **必须**（有密码时） |
+| `senderName` | 浮层显示「张三邀请你加入」；不能等拉会话 | **必须** |
+| `groupCall` | 区分「群通话」与「会议邀请」的卡片文案与浮层标题 | **必须** |
 
 ```json
 {
@@ -323,6 +340,7 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
   "title": "周会",
   "mediaType": "video",
   "silent": false,
+  "groupCall": false,
   "passcode": "1234",
   "senderName": "张三"
 }
@@ -332,9 +350,35 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
 >
 > `passcode` 放 payload 是安全的：payload 不渲染到通知栏/锁屏（展示的只有 `title`/`content`），且与 PC「邀请卡片随身带密码」的约定一致。
 
-**不要放进 payload**：`senderAvatar`（URL 长、受保护需鉴权、可能过期）、RTC `token`（接听后另行签发）、`roomUrl`（token 接口响应里带）。
+**不要放进 payload**：
+
+| 字段 | 原因 |
+|---|---|
+| `senderAvatar` | URL 长、受保护需鉴权、可能过期；端上按 `convId` 拉会话，先显示首字头像 |
+| `senderId` | 多端去重靠 `callId`/`inviteId`，服务端已按 `sourceDeviceId` 排除发起端 |
+| `convName` | 1v1 用 `senderName`；群卡片不弹浮层，不需要即时展示 |
+| `sendTime`（会议邀请） | 会议邀请整场有效，没有过期语义 |
+| RTC `token` / `roomUrl` | 接听后由 token 接口返回 |
 
 体积估算：voip ≈ 230 字符，meeting_invite ≈ 320 字符，均在 800 上限内。
+
+#### 5.2.2.1 信封层语义（端上必须理解）
+
+**`type` 可能是 `message`，不能只判 `voip`。** 服务端 `render()` 会在三种情况下把 `type` 置空（通道按 `"message"` 输出）：
+
+1. 消息被撤回或查不到；
+2. **同一会话还有其他未读**（`others > 0`）——通知文案已不是单纯那一条，不能弹来电界面；
+3. **voip 已超过 60 秒响铃窗口**——补推候选可存活 7 天，昨天的未接电话今天不能再来电。
+
+所以端上规则是「**`type=voip` 才来电；`type=message` 一律按普通消息处理**」。会议邀请不受 60 秒限制，第 3 条不适用。
+
+**`badge` 的未读口径待产品确认。** payload 里的 `badge` 是未读总数，`voip` / `meeting_invite` 当前按普通消息计入未读：
+
+- 未接来电是否计入（一般计入）；
+- 会议邀请是否计入（一般计入）；
+- 若不计，服务端未读计数要排除，否则角标虚高，iOS 本地补角标也会跟着错。
+
+**`request_id` 必须每次唯一。** 重复的 `request_id` 会导致整条消息被丢弃；重发与「取消来电」通知都要用新的 id。
 
 #### 5.2.3 云函数连带改动
 
@@ -342,7 +386,7 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
 
 - 接收并透传 `channelId`（`options.android.HW['/message/android/notification/channel_id']`）。
 - 保持 `category` 整体覆盖语义；调用方必须同时给 `harmony` 与 `huawei`。
-- **同步扩 `normalizePayload` 的保留白名单**：现在超 800 字符时只保留 `convId/convType`，会把新字段整段裁掉。白名单至少加 `type/callId/roomName/mediaType/sendTime/inviteId/title/silent/passcode`。
+- **同步扩 `normalizePayload` 的保留白名单**：现在超 800 字符时只保留 `convId/convType`，会把新字段整段裁掉。白名单至少加 `type/callId/roomName/mediaType/sendTime/inviteId/title/silent/groupCall/passcode/senderName`。
 - 回显 `applied.channelId` / `applied.category`，便于排查「推了但没响铃」。
 
 ### 5.3 状态上报（App → 服务端）
@@ -384,8 +428,8 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | `utils/im/imCallProtocol.uts`（新） | `parseVoipInvite` / `parseVoipEvent` / `parseMeetingInvite` / `makeCallId` / `makeRoomName` / TTL 常量，逐条对齐 PC `lib/voip.ts`、`lib/meetingInvite.ts` |
 | `utils/im/imCallState.uts`（新） | 通话状态机：忙碌判定、去重、超时、事件应用；模块级单例 |
 | `utils/meeting/meetingInviteState.uts`（新） | 邀请队列、`inviteId` 去重、`handled` 集合（上限 200）、与事件对账 |
-| `servers/im.uts` | 新增 `sendVoipInvite` / `sendMeetingInvite` 两个发送封装 |
-| `servers/imMeeting.uts` | 复用已有 `apiImMeetingInviteHandled`；新增 call 三个端点封装（或放到 `servers/imCall.uts`） |
+| `servers/imCall.uts` | **已有** `apiImSendVoipInvite` / `apiImSendMeetingInvite` / `answered` / `ended` / `declined`；只需给 `apiImSendMeetingInvite` 补 `passcode` |
+| `utils/meeting/meetingInviteSend.uts`（新） | 高层 `inviteContactsToMeeting`：逐人 `createP2p` + 发送 + 失败汇总；创建页 / 预约页 / 会中加人共用 |
 
 ### 6.2 界面
 
@@ -490,14 +534,19 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 
 ---
 
-## 11. 待核对项（feat-zq 分支）
+## 11. 现有实现核对（feat-zq）
 
-> 写本文时工作区在 `feat-2026.11`，无法读取 `feat-zq` 上的实现，以下需在该分支逐项确认后再定稿：
-
-1. `voip` / `meeting_invite` 的 App 端解析、发送封装是否已存在，命名是否与本文一致。
-2. 通话状态机是否已落地；是否存在与会议模块重复的 LiveKit 封装。
-3. 来电页/邀请浮层是否已有组件；是否复用了 `uni-modal-popup` 的 lazyMount。
-4. 消息卡片渲染是否已在 `message-content` 中实现。
-5. 推送点击路由是否已扩展 `type` 分支。
-6. `VoipCall` 渠道是否已在客户端创建。
-7. 群通话入口是否已设计。
+| 能力 | 现状 | 位置 |
+|---|---|---|
+| 发送 `voip` / `meeting_invite` | ✅ 已有 | `servers/imCall.uts` |
+| 接收与卡片渲染 | ✅ 已有 | `pages/message/components/chat-view.uvue`（解析 + 点击入会） |
+| 实时弹窗 + 加入/忽略 | ✅ 已有（App 启动全局监听） | `utils/im/imCallSession.uts` |
+| 通话页面与状态 | ✅ 已有 | `subpackages/pages/im-call/im-call*`、`utils/im/imCallSession.uts` |
+| 创建会议选人 | ⚠️ 选人已实现，但发的是**纯文本** | `im-meeting-create.uvue:sendInvitesToContacts` |
+| 预约会议邀请 | ⚠️ 同样发纯文本 | `im-meeting-schedule.uvue` |
+| 会中「添加成员」 | ❌ 无入口 | `im-meeting-room.uvue` members 面板 |
+| 邀请携带密码 | ❌ 发送接口无 `passcode` 参数 | `servers/imCall.uts` |
+| 接收端弹窗文案 | ⚠️ 写死「群视频/群语音通话」，且 `silent` 按字符串判断 | `utils/im/imCallSession.uts` |
+| `VoipCall` 渠道 | ❌ 未见 `setPushChannel` 调用 | — |
+| 群通话入口 | ❌ 未见 | — |
+| 离线推送 payload/category | ❌ 后端未补 | nuwax-im `UniPushChannel` |

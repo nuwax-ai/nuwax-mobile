@@ -247,7 +247,6 @@ pnpm publish:h5            # 发行/打包 H5（Web 产物输出至 unpackage/di
 
 ## 工程约定
 
-- 会议相关问题先参考同级 PC 仓库 ../nuwax-im 的接口、状态管理和参会人权限实现，再核对后端契约后修改 App；跨端行为应尽量保持一致。
 - 组件/页面使用 `.uvue` + `.uts`（uni-app x），Web/小程序兼容代码注意条件编译（`#ifdef APP-ANDROID`、`#ifdef H5`、`#ifdef MP-WEIXIN` 等）
 - 网络请求统一走 `servers/` 目录的 UTS 模块，不要在页面里直接写 `uni.request`
 - `unpackage/` 下仅 `unpackage/dist/build/web/` 被允许提交（用于 H5 部署），其余产物不进版本库

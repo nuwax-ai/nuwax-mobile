@@ -99,7 +99,7 @@ test('detail toolbar reads restored parent selection and writes user toggles bac
 });
 
 function setupHomeDraftTransfer() {
-  const homeSource = fs.readFileSync(new URL('../subpackages/pages/index/index-content.uvue', import.meta.url), 'utf8');
+  const homeSource = fs.readFileSync(new URL('../pages/index/index-content.uvue', import.meta.url), 'utf8');
   const normalizeStart = homeSource.indexOf('  function normalizeSendPayload(');
   const normalizeEnd = homeSource.indexOf('  /** 归一化后的 files', normalizeStart);
   const applyStart = homeSource.indexOf('  function applySendPayloadToDraft(');

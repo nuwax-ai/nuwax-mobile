@@ -333,27 +333,6 @@ public class MeetingRoomBridge: NSObject {
     return NSNumber(value: room.remoteParticipants.count + 1)
   }
 
-  /// 房间 metadata：服务端写入后由 LiveKit 同步，本端页面轮询读取。
-  public static func roomMetadata() -> String {
-    return room?.metadata ?? ""
-  }
-
-  /// 举手状态走 participant attributes，与 PC / Android 使用同一个 handRaised 键。
-  public static func setHandRaised(_ raised: Bool) {
-    onMain {
-      Task { @MainActor in
-        guard let room = room else { return }
-        try? await room.localParticipant.set(
-          attributes: ["handRaised": raised ? "1" : ""]
-        )
-      }
-    }
-  }
-
-  public static func localHandRaised() -> Bool {
-    return (room?.localParticipant.attributes["handRaised"] ?? "") != ""
-  }
-
   public static func isConnected() -> Bool {
     return connectedFlag
   }
@@ -471,8 +450,6 @@ public class MeetingRoomBridge: NSObject {
   /// 取该远端已订阅的第一条视频轨道（遍历 trackPublications，不依赖具体 source 枚举名）。
   private static func firstVideoTrack(_ participant: RemoteParticipant) -> VideoTrack? {
     for (_, publication) in participant.trackPublications {
-      if publication.isMuted { continue }
-      if publication.source != .camera { continue }
       if let video = publication.track as? VideoTrack {
         return video
       }

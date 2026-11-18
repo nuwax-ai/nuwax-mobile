@@ -1266,20 +1266,17 @@
   async function resolveConvPageRowsIcons(
     rows: ImConvRow[],
     revision: number,
-    requireCurrentTable: boolean = false,
     firstBatchIdleMs: number = CONV_PAGE_BATCH_RESUME_IDLE_MS,
   ): Promise<void> {
     let offset = 0;
     let firstBatch = true;
     while (offset < rows.length) {
       await waitConvPageCommitPoll(CONV_PAGE_ICON_BATCH_GAP_MS);
-      if (requireCurrentTable && conversations.value != rows) return;
       const canResolve = await waitForConvPageCommitIdle(
         revision,
         firstBatch ? firstBatchIdleMs : CONV_PAGE_BATCH_RESUME_IDLE_MS,
       );
       if (!canResolve) return;
-      if (requireCurrentTable && conversations.value != rows) return;
 
       const end = Math.min(offset + CONV_PAGE_ICON_BATCH_SIZE, rows.length);
       const batch: ImConvRow[] = [];
@@ -1299,25 +1296,82 @@
   }
 
   let currentConvIconResolveRows: ImConvRow[] | null = null;
+  let currentConvIconResolveGeneration = 0;
 
-  async function resolveCurrentConvRowsIcons(rows: ImConvRow[], revision: number): Promise<void> {
+  // UTS/Kotlin 不支持此处引用后文才声明的函数，头像队列与 WS 更新路径共用该查找。
+  function findConvRowById(convId: string): ImConvRow | null {
+    const list = conversations.value;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].convId == convId) {
+        return list[i];
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 首屏头像按 convId 回填当前表中的最新行对象。头像局部刷新会替换 conversations
+   * 的数组/行身份，不能继续把最初 rows 引用当作任务有效性的判断依据；否则第一批头像
+   * 上屏后，后续批次会被误判成旧表任务并永久退出。
+   */
+  function resolveCurrentConvRowIcon(convId: string, generation: number): void {
+    if (generation != currentConvIconResolveGeneration) return;
+    const row = findConvRowById(convId);
+    if (row == null || row.avatarUrl.length == 0 || row.avatarDisplay.length > 0) return;
+    const rawUrl = row.avatarUrl;
+    resolveIconInto(rawUrl, (resolved: string): void => {
+      if (generation != currentConvIconResolveGeneration) return;
+      const current = findConvRowById(convId);
+      if (current == null || current.avatarUrl != rawUrl || current.avatarDisplay.length > 0) return;
+      current.avatarDisplay = resolved;
+      scheduleConvIconRowRefresh(convId);
+    }, (): void => {
+      // apply 已按当前行做局部刷新；禁止回退到整表 clone。
+    });
+  }
+
+  async function resolveCurrentConvRowsIcons(
+    convIds: string[],
+    revision: number,
+    generation: number,
+  ): Promise<void> {
+    let offset = 0;
+    let firstBatch = true;
     try {
-      await resolveConvPageRowsIcons(rows, revision, true, CONV_PAGE_COMMIT_SCROLL_IDLE_MS);
+      while (offset < convIds.length) {
+        await waitConvPageCommitPoll(CONV_PAGE_ICON_BATCH_GAP_MS);
+        if (generation != currentConvIconResolveGeneration) return;
+        const canResolve = await waitForConvPageCommitIdle(
+          revision,
+          firstBatch ? CONV_PAGE_COMMIT_SCROLL_IDLE_MS : CONV_PAGE_BATCH_RESUME_IDLE_MS,
+        );
+        if (!canResolve || generation != currentConvIconResolveGeneration) return;
+
+        const end = Math.min(offset + CONV_PAGE_ICON_BATCH_SIZE, convIds.length);
+        for (let i = offset; i < end; i++) {
+          resolveCurrentConvRowIcon(convIds[i], generation);
+        }
+        offset = end;
+        firstBatch = false;
+      }
     } finally {
-      if (currentConvIconResolveRows == rows) currentConvIconResolveRows = null;
+      if (generation == currentConvIconResolveGeneration) currentConvIconResolveRows = null;
     }
   }
 
-  /** 当前整张会话表的头像解析：仅在有未回填头像时启动，且旧表被替换后自动终止。 */
+  /** 当前整张会话表的头像解析：仅在有未回填头像时启动；新整表任务会取消旧任务。 */
   function scheduleCurrentConvRowsIcons(rows: ImConvRow[], revision: number): void {
     if (currentConvIconResolveRows == rows) return;
+    const convIds: string[] = [];
     for (let i = 0; i < rows.length; i++) {
       if (rows[i].avatarUrl.length > 0 && rows[i].avatarDisplay.length == 0) {
-        currentConvIconResolveRows = rows;
-        resolveCurrentConvRowsIcons(rows, revision);
-        return;
+        convIds.push(rows[i].convId);
       }
     }
+    if (convIds.length == 0) return;
+    currentConvIconResolveRows = rows;
+    currentConvIconResolveGeneration += 1;
+    resolveCurrentConvRowsIcons(convIds, revision, currentConvIconResolveGeneration);
   }
 
   iconResolveRetryRunner = (): void => {
@@ -3259,16 +3313,6 @@
     // 从原位置移除
     list.splice(idx, 1);
     insertConvRowPromoted(row);
-  }
-
-  function findConvRowById(convId: string): ImConvRow | null {
-    const list = conversations.value;
-    for (let i = 0; i < list.length; i++) {
-      if (list[i].convId == convId) {
-        return list[i];
-      }
-    }
-    return null;
   }
 
   function handleImMessageReceived(payload: any): void {

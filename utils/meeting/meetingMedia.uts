@@ -1,0 +1,628 @@
+/**
+ * 会议媒体层适配（Android / iOS 接 LiveKit，鸿蒙留逻辑占位）。
+ *
+ * <h2>三端策略（2026-11-14 定）</h2>
+ * <ul>
+ *   <li><b>Android / iOS</b>：接 LiveKit 原生 SDK。桥接放在独立 UTS 插件
+ *       `uni_modules/nuwax-livekit`（Android 走 Maven/AAR，iOS 走 CocoaPods/XCFramework），
+ *       业务侧只经本文件调用，**页面不直接持有 SDK 对象**（方案 §5.2）。</li>
+ *   <li><b>鸿蒙</b>：LiveKit 官方无 HarmonyOS 客户端，先**留逻辑占位**：插件 `app-harmony`
+ *       是空实现、能力恒为 false，会中页只提供会议信息；后续基于鸿蒙自研的 LiveKitClient
+ *       （ArkTS + 原生 RTC + 原生视频渲染组件）在插件里补实现，本文件不用改。</li>
+ *   <li><b>H5 / 小程序</b>：不做实时会议，恒为 false。</li>
+ * </ul>
+ *
+ * <h2>★★插件未随包时的行为</h2>
+ * <p>插件的 `isSupported()` 现在返回 false（SDK 还没随自定义基座），此时本文件不会发任何
+ * 网络请求、也不会改任何状态：会中页据此把麦克风/摄像头/扬声器标成「接入中」，
+ * **绝不显示假的开关状态**。等 LiveKit SDK 随基座打进真机跑通（连上自建 LiveKit、
+ * 收发流、退后台重连）后，插件把 `isSupported()` 改 true，业务层自动放开。
+ *
+ * <h2>一场会只有一个媒体会话</h2>
+ * <p>与方案 §4.1-7 一致：模块级单例，加入新会议前必须显式断开上一场（不自动结束别人的会）。
+ */
+
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiImMeetingIssueToken, apiImMeetingPublicRoomSafe } from "@/servers/imMeeting";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
+// 会议媒体状态变更广播走仓内 eventBus（App-Android 上 uni.$on 的订阅者有零触发前科）
+import eventBus from "@/utils/eventBus";
+
+// ★只在 Android/iOS 引原生桥接插件：鸿蒙没有 LiveKit 客户端（插件内是占位实现，
+//   本文件连都不连），H5/小程序更没有——条件编译保证这些平台不解析该 import。
+// #ifdef APP-ANDROID || APP-IOS
+import {
+  connect as livekitConnect,
+  disconnect as livekitDisconnect,
+  isConnected as livekitIsConnected,
+  isSupported as livekitIsSupported,
+  sdkVersion as livekitSdkVersion,
+  lastError as livekitLastError,
+  localAudioLevel as livekitLocalAudioLevel,
+  localHandRaised as livekitLocalHandRaised,
+  participantCount as livekitParticipantCount,
+  roomMetadata as livekitRoomMetadata,
+  setCameraEnabled as livekitSetCamera,
+  setHandRaised as livekitSetHandRaised,
+  setMicEnabled as livekitSetMic,
+  setSpeakerEnabled as livekitSetSpeaker,
+  switchCamera as livekitSwitchCamera,
+} from "@/uni_modules/nuwax-livekit";
+// #endif
+
+// 远端视频订阅：Android / iOS 都已实现（鸿蒙无 RTC 客户端）
+// #ifdef APP-ANDROID || APP-IOS
+import { remoteVideoIdentities as livekitRemoteVideoIdentities } from "@/uni_modules/nuwax-livekit";
+// #endif
+
+/** 媒体状态变更（连接/断开、麦克风/摄像头/扬声器切换）。载荷为空对象。 */
+export const MEETING_MEDIA_CHANGED_EVENT = "im-meeting-media-changed";
+
+/** 媒体会话的连接参数（令牌由服务端签发，客户端不自己算地址）。 */
+export class MeetingMediaOptions {
+  /** 会议号（= LiveKit 房间名）。 */
+  room: string = "";
+  /** 我自己的展示名（进 LiveKit participant name，不落库）。 */
+  displayName: string = "";
+  /** 入会密码（会议设了才传；服务端据此校验）。 */
+  passcode: string = "";
+}
+
+/** 媒体会话快照（对外只读；调用方拿到的是拷贝，改不动内部状态）。 */
+export class MeetingMediaState {
+  /** 是否已连上房间。 */
+  connected: boolean = false;
+  /** 正在连接（点了没反应的那段时间要能显示 loading）。 */
+  connecting: boolean = false;
+  /** 本地麦克风是否在采集。 */
+  micOn: boolean = false;
+  /** 本地摄像头是否在采集（默认关，与 PC「语音开局」口径一致）。 */
+  cameraOn: boolean = false;
+  /** 是否走扬声器（否则听筒/耳机）。 */
+  speakerOn: boolean = true;
+  /** 房间内人数（含本端；0 = 未知/未连接）。 */
+  peopleCount: number = 0;
+  /** 会议时长上限（秒；0 = 服务端没给，界面上不显示"限时"）。来源：令牌接口 `plannedDurationSec`。 */
+  plannedDurationSec: number = 0;
+  /** 最近一次失败的简短原因（页面可直出，不需要 i18n 时留空）。 */
+  errorText: string = "";
+}
+
+/** LiveKit 房间 metadata 快照；字段与 PC `RoomSettings` 保持一致。 */
+export class MeetingRoomMetadata {
+  muteAll: boolean = false;
+  danmaku: boolean = true;
+  hostUserId: string = "";
+  shareSlug: string = "";
+  shareHolder: string = "";
+  shareHolderName: string = "";
+  shareSince: number = 0;
+}
+
+// ---------------------------------------------------------------- 内部状态
+
+let state = new MeetingMediaState();
+
+function readStr(obj: UTSJSONObject, key: string): string {
+  const value = obj[key];
+  return value != null ? `${value}` : "";
+}
+
+function readBool(obj: UTSJSONObject, key: string): boolean {
+  const value = obj[key];
+  if (value == null) {
+    return false;
+  }
+  if (typeof value == "boolean") {
+    return value as boolean;
+  }
+  return `${value}` == "true";
+}
+
+function readNumOr(obj: UTSJSONObject, key: string, fallback: number): number {
+  const value = obj[key];
+  if (value == null) {
+    return fallback;
+  }
+  if (typeof value == "number") {
+    const n = value as number;
+    return n != n ? fallback : n;
+  }
+  const parsed = parseFloat(`${value}`);
+  return parsed != parsed ? fallback : parsed;
+}
+
+function changed(): void {
+  eventBus.emit(MEETING_MEDIA_CHANGED_EVENT, {});
+}
+
+function resetState(): void {
+  state = new MeetingMediaState();
+}
+
+/** 连接结果轮询句柄（-1 = 没在轮询）。 */
+let connectPollTimer = -1;
+
+function stopConnectPoll(): void {
+  if (connectPollTimer != -1) {
+    clearInterval(connectPollTimer);
+    connectPollTimer = -1;
+  }
+}
+
+/**
+ * 连接结果轮询：每 500ms 问一次原生层「连上了吗/出错了吗」，最多约 20 秒。
+ * ★为什么不用回调：UTS 函数类型跨到 Swift 会变成 `UTSCallback`，iOS 编译直接报
+ *   `'UTSCallback' is unavailable`；改成状态查询后三端接口完全一致。
+ */
+function startConnectPoll(): void {
+  stopConnectPoll();
+  let ticks = 0;
+  connectPollTimer = setInterval(() => {
+    ticks = ticks + 1;
+    let connected = false;
+    let err = "";
+    // #ifdef APP-ANDROID || APP-IOS
+    try {
+      connected = livekitIsConnected();
+      err = livekitLastError();
+    } catch (_e) {
+      err = "exception";
+    }
+    // #endif
+    if (connected) {
+      stopConnectPoll();
+      state.connected = true;
+      state.connecting = false;
+      state.errorText = "";
+      // 入会默认设备状态（麦克风关、摄像头关），与 connect 入参一致
+      state.micOn = false;
+      state.cameraOn = false;
+      changed();
+      return;
+    }
+    if (err.length > 0) {
+      stopConnectPoll();
+      state.connected = false;
+      state.connecting = false;
+      state.errorText = err;
+      changed();
+      return;
+    }
+    if (ticks > 40) {
+      stopConnectPoll();
+      state.connecting = false;
+      state.errorText = "connect";
+      changed();
+    }
+  }, 500);
+}
+
+// ---------------------------------------------------------------- 能力查询
+
+/**
+ * 本端能不能真正收发音视频。
+ * ★false 时调用方不要发令牌请求、不要显示开关态，只如实说明能力未就绪。
+ * ★能力由插件自己报（`nuwax-livekit` 的 isSupported）：SDK 随基座后它返回 true，
+ *   业务层无需改任何判断。
+ */
+export function meetingMediaSupported(): boolean {
+  let supported = false;
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    supported = livekitIsSupported();
+    console.error(`[Meeting] isSupported returned ${supported}`);
+  } catch (_e) {
+    // 标准基座不含插件 / 原生调用异常：一律按不支持处理
+    // ★必须把异常本身打出来：iOS 上「基座里没有原生类」就表现为调用抛错，
+    //   只打 false 会把「没打进基座」误判成「插件说本端不支持」。
+    console.error(`[Meeting] isSupported threw: ${_e}`);
+    supported = false;
+  }
+  // #endif
+  // #ifdef APP-IOS
+  // 与能力结果分开捕获：诊断调用失败不能把已可用的媒体能力改成 false。
+  try {
+    console.error(`[Meeting] iOS base probe ${livekitSdkVersion()}`);
+  } catch (_e) {
+    console.error(`[Meeting] iOS base probe threw: ${_e}`);
+  }
+  // #endif
+  // #ifdef APP-HARMONY
+  // ★鸿蒙占位：无 LiveKit 客户端，后续基于自研 LiveKitClient 在插件里打开
+  supported = false;
+  // #endif
+  return supported;
+}
+
+/** 当前平台名（排查用；与 identity 里的 platform 段同一词表）。 */
+export function meetingMediaPlatform(): string {
+  let platform = "other";
+  // #ifdef APP-ANDROID
+  platform = "android";
+  // #endif
+  // #ifdef APP-IOS
+  platform = "ios";
+  // #endif
+  // #ifdef APP-HARMONY
+  platform = "harmony";
+  // #endif
+  return platform;
+}
+
+export function meetingMediaState(): MeetingMediaState {
+  const copy = new MeetingMediaState();
+  copy.connected = state.connected;
+  copy.connecting = state.connecting;
+  copy.micOn = state.micOn;
+  copy.cameraOn = state.cameraOn;
+  copy.speakerOn = state.speakerOn;
+  copy.peopleCount = state.peopleCount;
+  copy.plannedDurationSec = state.plannedDurationSec;
+  copy.errorText = state.errorText;
+  // 已连接时以插件实时人数为准（会中人员进出由 RoomEvent 更新，这里再兜一道）
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    const live = livekitParticipantCount();
+    if (live > 0) {
+      copy.peopleCount = live;
+    }
+  } catch (_e) {
+  }
+  // #endif
+  return copy;
+}
+
+// ---------------------------------------------------------------- 连接 / 断开
+
+/**
+ * 入会：签发令牌 → 交给原生插件连房。
+ * ★只连接、不建房：查不到会议就失败返回，绝不因连不上而创建同号空房（方案 §4.1-3）。
+ * ★加入前先断开上一场：模块只管理一场会议（方案 §4.1-7）。
+ */
+export async function meetingMediaConnect(options: MeetingMediaOptions): Promise<boolean> {
+  if (state.connected) {
+    return true;
+  }
+  if (state.connecting) {
+    return false;
+  }
+  if (!meetingMediaSupported()) {
+    // 插件未随包：不发请求、不改状态，交给页面显示「接入中」
+    return false;
+  }
+  state.connecting = true;
+  state.errorText = "";
+  changed();
+  try {
+    // ★★连接前先问服务端"这场会走到哪一步了"：LiveKit 允许连不存在的房间（会顺手建房），
+    //   不预检就会在"房间早没了、列表还挂着进行中"的脏状态下凭空造出一间同号空房。
+    //   ★预检请求本身失败（网络/500）时放行连接：宁可偶尔多一次连接尝试，也不要把
+    //     刚建好的会议挡在门外。
+    const pre = await apiImMeetingPublicRoomSafe(options.room);
+    if (apiResCode(pre) == SUCCESS_CODE) {
+      const preRaw = apiResData<any>(pre);
+      const preObj = preRaw != null ? (preRaw as UTSJSONObject) : null;
+      if (preObj != null && !readBool(preObj, "active")) {
+        // 只拦**明确**的三种「进不去」；status 拿不到（老房间/记录查不到）时放行，
+        // 避免刚建完房的竞态被误判成「已结束」
+        const preStatus = readNumOr(preObj, "status", -1);
+        const earlyJoin = readBool(preObj, "allowEarlyJoin");
+        if (preStatus == 3) {
+          state.connecting = false;
+          state.errorText = "cancelled";
+          changed();
+          return false;
+        }
+        if (preStatus == 0 && !earlyJoin) {
+          state.connecting = false;
+          state.errorText = "notStarted";
+          changed();
+          return false;
+        }
+        if (preStatus == 2) {
+          state.connecting = false;
+          state.errorText = "ended";
+          changed();
+          return false;
+        }
+      }
+    }
+
+    const res = await apiImMeetingIssueToken(options.room, options.displayName, "", options.passcode);
+    if (apiResCode(res) != SUCCESS_CODE) {
+      state.connecting = false;
+      state.errorText = "token";
+      changed();
+      return false;
+    }
+    const data = apiResData<any>(res);
+    const obj = data != null ? (data as UTSJSONObject) : null;
+    const wsUrl = obj != null ? readStr(obj, "wsUrl") : "";
+    const token = obj != null ? readStr(obj, "token") : "";
+    // 会议时长上限（毫秒？不，后端是秒）：PC 端「限时 2 小时」用的就是令牌里的这个字段
+    state.plannedDurationSec = obj != null ? readNumOr(obj, "plannedDurationSec", 0) : 0;
+    if (wsUrl.length == 0 || token.length == 0) {
+      state.connecting = false;
+      state.errorText = "token";
+      changed();
+      return false;
+    }
+
+    // 排查用：把服务端下发的地址打出来（鸿蒙真机看不到 console.log，统一用 error）
+    console.error(`[Meeting] token ok room=${options.room} wsUrl=${wsUrl}`);
+
+    // ---------------------------------------------------------------- 交给原生插件
+    // Android/iOS：nuwax-livekit 里包 LiveKit 官方 SDK；SDK 未随基座时插件回报
+    // `livekit_sdk_missing` 且不置 connected（见插件文件头）。
+    // 鸿蒙：无 LiveKit 客户端，插件是占位实现（harmony_rtc_unsupported）。
+    // #ifdef APP-ANDROID || APP-IOS
+    // 状态经回调持续回报（连上/断开/人数变化），这里不等同步结果
+    // 入会默认：**麦克风关**（由用户主动点开）、摄像头关
+    // ★不传回调（UTS 回调跨到 Swift 会变成 UTSCallback 编不过），改为轮询状态
+    livekitConnect(wsUrl, token, options.room, options.displayName, false, false);
+    startConnectPoll();
+    // #endif
+
+    // #ifdef APP-HARMONY
+    // 鸿蒙占位：等 HarmonyOS LiveKitClient 落地后在这里接同一套接口
+    state.connecting = false;
+    state.errorText = "harmony_rtc_unsupported";
+    changed();
+    // #endif
+
+    return state.connected;
+  } catch (_error) {
+    state.connecting = false;
+    state.errorText = "exception";
+    changed();
+    return false;
+  }
+}
+
+/**
+ * 离开会议：只断自己，不删房（对齐 PC「仅退出」；结束会议是主持人动作，走服务端删房）。
+ */
+export async function meetingMediaDisconnect(): Promise<void> {
+  // 停掉连接结果轮询，避免退房后还把状态改回 connected
+  stopConnectPoll();
+  if (!state.connected && !state.connecting) {
+    resetState();
+    return;
+  }
+  // Android/iOS：交给插件退房（停采集、停前台服务/通知、归还音频会话）
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    livekitDisconnect();
+  } catch (_e) {
+    // 基座不含插件时静默：本来也没连上
+  }
+  // #endif
+  // #ifdef APP-HARMONY
+  // 鸿蒙占位：等 LiveKitClient 落地后在这里断开 RTC 并退出 VOIP 长时任务
+  // #endif
+  resetState();
+  changed();
+}
+
+// ---------------------------------------------------------------- 设备开关
+
+/** 麦克风开关（未连接时忽略，避免留下"以为开了其实没连"的状态）。 */
+export function meetingMediaSetMic(on: boolean): void {
+  if (!state.connected) {
+    return;
+  }
+  // #ifdef APP-ANDROID || APP-IOS
+  console.error(`[Meeting] setMic ${on} -> native`);
+  try {
+    livekitSetMic(on);
+  } catch (_e) {
+    console.error(`[Meeting] setMic throw: ${_e}`);
+  }
+  console.error(`[Meeting] setMic ${on} <- native`);
+  // #endif
+  state.micOn = on;
+  changed();
+}
+
+/** 摄像头开关（默认关；关闭时**不保留最后一帧**，由插件侧销毁渲染）。 */
+export function meetingMediaSetCamera(on: boolean): void {
+  if (!state.connected) {
+    return;
+  }
+  // #ifdef APP-ANDROID || APP-IOS
+  console.error(`[Meeting] setCamera ${on} -> native`);
+  try {
+    livekitSetCamera(on);
+  } catch (_e) {
+    console.error(`[Meeting] setCamera throw: ${_e}`);
+  }
+  console.error(`[Meeting] setCamera ${on} <- native`);
+  // #endif
+  state.cameraOn = on;
+  changed();
+}
+
+/** 扬声器 / 听筒切换（iOS 需要 AVAudioSession 路由，Android 走 AudioManager 路由）。 */
+export function meetingMediaSetSpeaker(on: boolean): void {
+  if (!state.connected) {
+    return;
+  }
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    livekitSetSpeaker(on);
+  } catch (_e) {
+  }
+  // #endif
+  state.speakerOn = on;
+  changed();
+}
+
+/**
+ * 本机麦克风音量（0..1）：页面按 ~250ms 拉取画"说话音波"。
+ * ★没连上/未开麦恒 0，避免画面上一直跳动。
+ */
+export function meetingMediaLocalAudioLevel(): number {
+  let level = 0.0;
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    level = livekitLocalAudioLevel();
+  } catch (_e) {
+    level = 0;
+  }
+  // #endif
+  if (!state.connected || !state.micOn) {
+    return 0;
+  }
+  if (level < 0) {
+    return 0;
+  }
+  return level > 1 ? 1 : level;
+}
+
+/**
+ * 已订阅到视频的远端成员 identity 列表（逗号解析成数组）。
+ * ★空数组 = 没人开视频；页面据此决定哪些宫格格子换成视频画面。
+ */
+export function meetingMediaRemoteVideoIdentities(): string[] {
+  const out: string[] = [];
+  // #ifdef APP-ANDROID || APP-IOS
+  if (state.connected) {
+    try {
+      const raw = livekitRemoteVideoIdentities();
+      if (raw.length > 0) {
+        const parts = raw.split(",");
+        for (let i = 0; i < parts.length; i++) {
+          const one = parts[i].trim();
+          if (one.length > 0) {
+            out.push(one);
+          }
+        }
+      }
+    } catch (_e) {
+    }
+  }
+  // #endif
+  return out;
+}
+
+/**
+ * 房间 metadata 权威快照。缺键 / 解析失败按 PC 口径回退：muteAll=false、danmaku=true。
+ */
+export function meetingMediaRoomMetadata(): MeetingRoomMetadata {
+  const out = new MeetingRoomMetadata();
+  // #ifdef APP-ANDROID || APP-IOS
+  if (state.connected) {
+    try {
+      const raw = livekitRoomMetadata();
+      if (raw.length > 0) {
+        const parsed = JSON.parse(raw);
+        if (parsed != null) {
+          const obj = parsed as UTSJSONObject;
+          out.muteAll = readBool(obj, "muteAll");
+          const danmakuRaw = obj["danmaku"];
+          out.danmaku = danmakuRaw == null ? true : readBool(obj, "danmaku");
+          out.hostUserId = readStr(obj, "hostUserId");
+          out.shareSlug = readStr(obj, "shareSlug").trim();
+          out.shareHolder = readStr(obj, "shareHolder").trim();
+          out.shareHolderName = readStr(obj, "shareHolderName").trim();
+          out.shareSince = readNumOr(obj, "shareSince", 0);
+        }
+      }
+    } catch (_e) {
+      return new MeetingRoomMetadata();
+    }
+  }
+  // #endif
+  return out;
+}
+
+/** 举手 / 放下手（LiveKit participant attributes.handRaised）。 */
+export function meetingMediaSetHandRaised(on: boolean): void {
+  if (!state.connected) {
+    return;
+  }
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    livekitSetHandRaised(on);
+  } catch (_e) {
+  }
+  // #endif
+}
+
+/** 查询本端举手状态；用于跨端变更后的轮询校准。 */
+export function meetingMediaLocalHandRaised(): boolean {
+  if (!state.connected) {
+    return false;
+  }
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    return livekitLocalHandRaised();
+  } catch (_e) {
+  }
+  // #endif
+  return false;
+}
+
+/** 切换前后摄像头（默认前置）。 */
+export function meetingMediaSwitchCamera(): void {
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    livekitSwitchCamera();
+  } catch (_e) {
+  }
+  // #endif
+}
+
+/**
+ * 一行式诊断（页面每 3 秒打一次，仅排查用）。
+ *
+ * <p>闪退拿不到堆栈时，靠这一行定位卡在哪一步：前半段是本层状态（`mic/cam` 是我们
+ * 以为的开关态），`native[...]` 是直接问原生层的实时值
+ * （`people` 原生人数 / `level` 原生音量 / `remotes` 已订阅到视频的远端 / `err` 原生错误）。</p>
+ *
+ * <p>★不加插件新导出：`?uts-proxy` 只认插件现有导出表，新增导出会报
+ * `is not exported by ...?uts-proxy`（2026-11-15 实测），所以这里只用已有接口拼；
+ * 更细的原生值（授权状态 / 渲染视图 / 摄像头轨道 / 音频会话 category）在
+ * iOS 侧以 `NSLog("[MeetingBridge] …")` 打在控制台。</p>
+ */
+export function meetingMediaDebugLine(): string {
+  let nativeConnected = false;
+  let nativePeople = 0;
+  let nativeLevel = 0.0;
+  let nativeErr = "";
+  let nativeRemotes = "";
+  let nativeDiag = "";
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    nativeConnected = livekitIsConnected();
+    nativePeople = livekitParticipantCount();
+    nativeLevel = livekitLocalAudioLevel();
+    nativeErr = livekitLastError();
+    nativeRemotes = livekitRemoteVideoIdentities();
+  } catch (_e) {
+    nativeErr = "throw";
+  }
+  // #endif
+  // #ifdef APP-ANDROID
+  try {
+    nativeDiag = livekitSdkVersion();
+  } catch (_e) {
+    nativeDiag = "probe_throw";
+  }
+  // #endif
+  // #ifdef APP-IOS
+  // 单独查询基座标记：前面的状态调用失败时，仍尽量显示实际安装的原生版本。
+  try {
+    nativeDiag = livekitSdkVersion();
+  } catch (_e) {
+    nativeDiag = `probe_throw:${_e}`;
+  }
+  // #endif
+  return `connected=${state.connected} connecting=${state.connecting} mic=${state.micOn} cam=${state.cameraOn} people=${state.peopleCount} err=${state.errorText} native[connected=${nativeConnected} people=${nativePeople} level=${nativeLevel} remotes=${nativeRemotes} err=${nativeErr} diag=${nativeDiag}]`;
+}
+
+/** 页面卸载/换会时调用：丢弃残留状态（不触发请求）。 */
+export function meetingMediaReset(): void {
+  resetState();
+}

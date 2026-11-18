@@ -28,6 +28,7 @@
     <view class="webview-content">
       <web-view
         class="web-view"
+        :class="repoPageCover ? 'web-view--hidden' : ''"
         v-if="url.length != 0"
         :src="url"
         id="webview"
@@ -94,6 +95,8 @@
   // uvue 中直接调用 t() 会因缺少 params 形参报错，这里包一层单参版本
 
   const url = ref<string>("");
+  /** 资料库登录态还没写完时，先不把网页铺开，避免闪出预写页源码。 */
+  const repoPageCover = ref<boolean>(false);
   const method = ref<string>("");
   const data_type = ref<string>("");
   const request_id = ref<string>("");
@@ -113,6 +116,11 @@
   let webViewContext: WebviewContext | null = null;
   let repoCookieTimer: number = 0;
   let repoCookieAttempts = 0;
+  /** 正在同源页预写登录态，资料库地址先不打开。Android、iOS、鸿蒙同一时机。 */
+  const repoPriming = ref<boolean>(false);
+  let repoPrimeTarget = "";
+  let repoPrimeTimer: number = 0;
+  let repoPrimeAttempts = 0;
   // #endif
   // #ifdef APP-IOS
   /** iOS 页面侧滑是否已按网页 canGoBack 锁住。-1 表示还没设置过。 */
@@ -242,6 +250,11 @@
    * App 走原生 WebView；H5 只在同源 iframe 可读，跨域时保持域名单行。
    */
   const syncEmbeddedNav = (): void => {
+    // #ifdef APP
+    if (repoPriming.value == true) {
+      return;
+    }
+    // #endif
     let nextUrl = "";
     let nextTitle = "";
     // #ifdef APP
@@ -360,6 +373,9 @@
       return;
     }
     iosUrlSyncTimer = setInterval((): void => {
+      if (repoPriming.value == true) {
+        return;
+      }
       if (isNeedCallApi.value == false) {
         requestWebViewDocumentTitle();
       }
@@ -511,6 +527,13 @@
 
   // WebView 加载错误处理
   const handleWebviewError = (e: any) => {
+    // #ifdef APP
+    if (repoPriming.value == true) {
+      console.error("资料库登录态预写失败:", e);
+      finishRepoTokenPrime();
+      return;
+    }
+    // #endif
     console.error("WebView 加载错误:", e);
     uni.showToast({
       title: t("Mobile.Webview.loadFailed"),
@@ -647,6 +670,138 @@
     // #endif
   };
 
+  // #ifdef APP
+  const REPO_TOKEN_READY_TYPE = "nuwax-repo-token-ready";
+
+  /** 资料库地址的站点源。localStorage 按源隔离，预写页必须和资料库同域。 */
+  const originOfAbsolute = (raw: string): string => {
+    const value = raw.trim();
+    const proto = value.indexOf("://");
+    if (proto < 0) {
+      return "";
+    }
+    const rest = value.substring(proto + 3);
+    let end = rest.length;
+    const slash = rest.indexOf("/");
+    if (slash >= 0 && slash < end) {
+      end = slash;
+    }
+    const query = rest.indexOf("?");
+    if (query >= 0 && query < end) {
+      end = query;
+    }
+    const hash = rest.indexOf("#");
+    if (hash >= 0 && hash < end) {
+      end = hash;
+    }
+    if (end <= 0) {
+      return "";
+    }
+    return value.substring(0, proto + 3 + end);
+  };
+
+  const stopRepoTokenPrimeTimer = (): void => {
+    if (repoPrimeTimer != 0) {
+      clearInterval(repoPrimeTimer);
+      repoPrimeTimer = 0;
+    }
+  };
+
+  /** 登录态已经写入当前源，再打开真正的资料库地址。 */
+  const finishRepoTokenPrime = (): void => {
+    if (repoPriming.value != true) {
+      return;
+    }
+    const target = repoPrimeTarget;
+    repoPriming.value = false;
+    repoPrimeTarget = "";
+    stopRepoTokenPrimeTimer();
+    if (target.length > 0) {
+      url.value = target;
+    }
+  };
+
+  /**
+   * 在同源静态文档上写入 ACCESS_TOKEN，并通知本页可以打开资料库。
+   * 不判断路径：这个文档不是 /repo/，判断会把写入跳过。
+   */
+  const writeRepoTokenBeforeNavigation = (): void => {
+    const cachedToken = readCachedAccessToken();
+    const tokenToInject = cachedToken.length > 0 ? cachedToken : repoPageTicket;
+    if (tokenToInject.length == 0) {
+      finishRepoTokenPrime();
+      return;
+    }
+    let ctx: WebviewContext | null = webViewContext;
+    if (ctx == null) {
+      try {
+        ctx = uni.createWebviewContext(
+          WEBVIEW_ELEMENT_ID,
+          instance != null ? instance.proxy : null,
+        );
+        webViewContext = ctx;
+      } catch (_e) {
+        return;
+      }
+      if (ctx == null) {
+        return;
+      }
+    }
+    const ticketLiteral = JSON.stringify(tokenToInject);
+    try {
+      ctx.evalJS(
+        "try{localStorage.setItem('ACCESS_TOKEN'," + ticketLiteral + ");" +
+          "var p={type:'" + REPO_TOKEN_READY_TYPE + "'};" +
+          "if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:p});}" +
+          "else if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:p});}" +
+          "}catch(e){}",
+      );
+    } catch (_eEval) {
+      // 网页还没挂上时失败，下一轮再写
+    }
+  };
+
+  /**
+   * 先打开同域静态脚本，让 localStorage 落在资料库所在源上。
+   * 写完后再把 web-view 切到资料库，页面脚本才能读到 token。
+   */
+  const startRepoTokenPrime = (target: string): boolean => {
+    const origin = originOfAbsolute(target);
+    if (origin.length == 0) {
+      return false;
+    }
+    repoPrimeTarget = target;
+    repoPrimeAttempts = 0;
+    repoPriming.value = true;
+    repoPageCover.value = true;
+    stopRepoTokenPrimeTimer();
+    url.value = origin + "/m/static/uni.webview.1.5.5.js";
+    repoPrimeTimer = setInterval((): void => {
+      if (repoPriming.value != true) {
+        stopRepoTokenPrimeTimer();
+        return;
+      }
+      repoPrimeAttempts++;
+      writeRepoTokenBeforeNavigation();
+      if (repoPrimeAttempts >= 20) {
+        finishRepoTokenPrime();
+      }
+    }, 200) as number;
+    return true;
+  };
+
+  const consumeRepoTokenReadyMessage = (messages: Array<UTSJSONObject>): boolean => {
+    for (let i = 0; i < messages.length; i++) {
+      const typeVal = messages[i]["type"];
+      if (typeVal != null && `${typeVal}` == REPO_TOKEN_READY_TYPE) {
+        finishRepoTokenPrime();
+        return true;
+      }
+    }
+    return false;
+  };
+  // #endif
+
   /**
    * iOS：网页还能后退时关掉页面侧滑，边缘手势交给 WKWebView；
    * 已经在第一页时恢复页面侧滑，右滑离开本页。
@@ -699,6 +854,14 @@
 
   // WebView 加载完成
   const handleWebviewLoad = (e: UniWebViewLoadEvent) => {
+    // #ifdef APP
+    // 预写页只负责把 token 放进同源 localStorage，不把它当成资料库页面。
+    if (repoPriming.value == true) {
+      writeRepoTokenBeforeNavigation();
+      return;
+    }
+    // #endif
+    repoPageCover.value = false;
     const loadedSrc = e.detail.src;
     if (loadedSrc.length > 0) {
       rememberEmbeddedPage(loadedSrc);
@@ -746,6 +909,11 @@
    * 3. 如果没有，检查网页端代码是否正确调用 wx.miniProgram.postMessage
    */
   const handleWebviewMessage = (e: UniWebViewMessageEvent): void => {
+    // #ifdef APP
+    if (consumeRepoTokenReadyMessage(e.detail.data)) {
+      return;
+    }
+    // #endif
     // #ifdef APP-IOS
     // 标题桥消息先消费掉，避免落进下面「取最后一条 html」的逻辑
     if (consumeWebViewTitleMessage(e.detail.data)) {
@@ -976,7 +1144,6 @@
     if (currentUrl.length == 0) {
       return;
     }
-    const queryParams = getQueryParams(currentUrl);
 
     // 设置页面标题：优先取本页路由参数 title（外部链接不便在目标 URL 上拼 query），
     // 其次取目标 URL 自带的 title（站内页沿用原有约定），都没有才用默认标题
@@ -987,6 +1154,9 @@
       const decodedTitle = decodeURIComponent(`${routeTitleRaw}`);
       routeTitle = decodedTitle != null ? decodedTitle : "";
     }
+
+    // 获取查询参数
+    const queryParams = getQueryParams(currentUrl);
     const titleRaw = queryParams["title"];
     const title =
       routeTitle.length > 0
@@ -1018,11 +1188,19 @@
     // #ifdef MP-WEIXIN || APP
     // 资料库（首页或某篇文档）不签发 _ticket，把本地登录 token 写入页面。
     if (isRepoLibraryPath(currentUrl)) {
-      url.value = currentUrl;
       prepareRepoPageShare(currentUrl);
       const cachedToken = readCachedAccessToken();
       if (cachedToken.length > 0) {
         rememberRepoPageTicket(currentUrl, cachedToken);
+      }
+      // #ifdef APP
+      // 先在同域静态页写入 token，再打开资料库，避免页面脚本读到空登录态后跳登录。
+      if (cachedToken.length > 0 && startRepoTokenPrime(currentUrl)) {
+        return;
+      }
+      // #endif
+      url.value = currentUrl;
+      if (cachedToken.length > 0) {
         injectRepoTicketCookie();
       }
       return;
@@ -1096,6 +1274,7 @@
   onUnload(() => {
     // #ifdef APP
     stopRepoTicketCookieInject();
+    stopRepoTokenPrimeTimer();
     // #endif
     // #ifdef APP-IOS
     stopWebViewTitleRead();
@@ -1163,11 +1342,22 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
+    position: relative;
+    background-color: #ffffff;
   }
 
   .web-view {
     width: 100%;
     height: 100%;
+  }
+
+  .web-view--hidden {
+    position: absolute;
+    left: -2000px;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
   }
 
   .webview-placeholder {

@@ -100,6 +100,8 @@
   const pageTitle = ref<string>("");
   /** 当前地址的域名。加载完成前单独居中显示。 */
   const pageHost = ref<string>("");
+  /** 内嵌 webview / iframe 当前地址。分享按这个地址生成，页内跳转后会更新。 */
+  const embeddedPageUrl = ref<string>("");
   /** 内嵌页 document.title。读到之后才显示在域名上方。 */
   const embeddedTitle = ref<string>("");
   let navSyncTimer: number = 0;
@@ -216,6 +218,26 @@
   };
 
   /**
+   * 记下内嵌页当前地址。和上次不同时，资料库、文件预览重新取分享链接。
+   */
+  const rememberEmbeddedPage = (rawUrl: string): void => {
+    if (rawUrl.indexOf("http://") != 0 && rawUrl.indexOf("https://") != 0) {
+      return;
+    }
+    const clean = removeQueryCompat(rawUrl, ["_ticket"]);
+    if (clean.length == 0 || clean == embeddedPageUrl.value) {
+      return;
+    }
+    embeddedPageUrl.value = clean;
+    if (isRepoLibraryPath(clean)) {
+      prepareRepoPageShare(clean);
+    }
+    if (filePreviewPath(clean).length > 0) {
+      prepareFilePageShare(clean);
+    }
+  };
+
+  /**
    * 读取内嵌页标题和当前地址。
    * App 走原生 WebView；H5 只在同源 iframe 可读，跨域时保持域名单行。
    */
@@ -231,10 +253,19 @@
       const frames = document.getElementsByTagName("iframe");
       if (frames.length > 0) {
         const frame = frames[frames.length - 1];
-        const doc = frame.contentDocument;
-        if (doc != null) {
-          nextTitle = doc.title != null ? `${doc.title}` : "";
-          nextUrl = frame.contentWindow != null ? `${frame.contentWindow.location.href}` : "";
+        const frameSrc = frame.src != null ? `${frame.src}` : "";
+        try {
+          const doc = frame.contentDocument;
+          if (doc != null) {
+            nextTitle = doc.title != null ? `${doc.title}` : "";
+            nextUrl = frame.contentWindow != null ? `${frame.contentWindow.location.href}` : "";
+          }
+        } catch (_eCross) {
+          // 外链跨域读不到 location，退回 iframe 自己的地址。
+          nextUrl = frameSrc;
+        }
+        if (nextUrl.length == 0) {
+          nextUrl = frameSrc;
         }
       }
     } catch (_eFrame) {
@@ -246,6 +277,9 @@
     const host = hostOf(hostSource);
     if (host.length > 0) {
       pageHost.value = host;
+    }
+    if (nextUrl.length > 0) {
+      rememberEmbeddedPage(nextUrl);
     }
     if (isDocumentTitle(nextTitle, hostSource)) {
       applyNavTitle(nextTitle.trim());
@@ -307,7 +341,7 @@
     }
     try {
       context.evalJS(
-        "(function(){try{var t=document.title||'';var u=location.href||'';if(!t){return;}" +
+        "(function(){try{var t=document.title||'';var u=location.href||'';if(!t&&!u){return;}" +
           "var p={type:'nuwax-webview-title',title:t,url:u};" +
           "if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:p});return;}" +
           "if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:p});}" +
@@ -315,6 +349,27 @@
       );
     } catch (_eEval) {
       // 文档还在加载时 evalJS 可能抛错，交给下一次轮询
+    }
+  };
+
+  let iosUrlSyncTimer: number = 0;
+
+  /** 页内跳到外链后，持续读取当前网址，供分享使用。 */
+  const startIosEmbeddedUrlSync = (): void => {
+    if (iosUrlSyncTimer != 0) {
+      return;
+    }
+    iosUrlSyncTimer = setInterval((): void => {
+      if (isNeedCallApi.value == false) {
+        requestWebViewDocumentTitle();
+      }
+    }, 500) as number;
+  };
+
+  const stopIosEmbeddedUrlSync = (): void => {
+    if (iosUrlSyncTimer != 0) {
+      clearInterval(iosUrlSyncTimer);
+      iosUrlSyncTimer = 0;
     }
   };
 
@@ -371,6 +426,7 @@
       if (host.length > 0) {
         pageHost.value = host;
       }
+      rememberEmbeddedPage(nextUrl);
     }
     const title = nextTitle.trim();
     if (isDocumentTitle(title, nextUrl)) {
@@ -643,6 +699,17 @@
 
   // WebView 加载完成
   const handleWebviewLoad = (e: any) => {
+    try {
+      const detail = e.detail;
+      if (detail != null) {
+        const srcVal = detail["src"];
+        if (srcVal != null) {
+          rememberEmbeddedPage(`${srcVal}`);
+        }
+      }
+    } catch (_eSrc) {
+      // 没有 src 时仍靠下面的地址同步
+    }
     // Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
     fixAppWebviewTextZoom();
     syncIosWebViewSwipe();
@@ -718,7 +785,8 @@
    * 小程序转发（拼进内部路径）与「复制链接/系统分享」（需要真实可直接打开的外链）共用同一份清理逻辑。
    */
   const buildCleanShareTargetUrl = (): string => {
-    return removeQueryCompat(url.value, ["_ticket"]);
+    const source = embeddedPageUrl.value.length > 0 ? embeddedPageUrl.value : url.value;
+    return removeQueryCompat(source, ["_ticket"]);
   };
 
   /**
@@ -1012,6 +1080,9 @@
     fixAppWebviewTextZoom();
     startIosWebViewSwipeSync();
     startEmbeddedNavSync();
+    // #ifdef APP-IOS
+    startIosEmbeddedUrlSync();
+    // #endif
   });
 
   // 导航栏返回不走 onBackPress。系统返回键、Android/鸿蒙侧滑走这里。
@@ -1035,6 +1106,7 @@
     // #endif
     // #ifdef APP-IOS
     stopWebViewTitleRead();
+    stopIosEmbeddedUrlSync();
     // #endif
     stopIosWebViewSwipeSync();
     stopEmbeddedNavSync();

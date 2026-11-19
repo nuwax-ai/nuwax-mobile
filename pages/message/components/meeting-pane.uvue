@@ -335,12 +335,14 @@
    * scroll-view 没有虚拟化/回收，节点数 = 行数 × 每行节点数，成长是线性的
    * （鸿蒙 ArkUI 首帧布局与 JS 同线程，60 行卡片实测约 1.2s）。所以「一次请求
    * 100 条」不能等于「一次渲染 100 行」：
-   *   · 首屏只渲染 RENDER_INITIAL 行（滚到尾部再 +RENDER_STEP，纯本地、不发请求）；
+   *   · 首屏先渲染 RENDER_INITIAL 行，随后「分帧补齐」到一整页（见 scheduleRenderFill，
+   *     纯本地、不发请求，用户不用触底就能看到满一页）；
+   *   · 第 2 页起：滚到尾部再 +RENDER_STEP（纯本地、不发请求）；
    *   · 已加载行渲染完了才去请求下一页（100 条/次）；
    *   · 渲染量在 RENDER_CAP 处硬停，尾部提示「仅显示最近 N 条」；
    *   · 数据本身不丢（内存里是纯对象，1000 条量级可忽略），要看完整体请到网页端。
    *
-   * 步长取 20 而不是 40：一次触底只新增约 200 个节点（一张卡 ≈10 个 view/text），
+   * 步长取 20 而不是 40：一次新增约 200 个节点（一张卡 ≈10 个 view/text），
    * 单帧插入的布局开销减半，滚动手感更稳；行是 keyed 追加在末尾，已有行不重排，
    * 所以追加成本 ≈ 新节点创建 + 一次滚动内容高度更新。
    *
@@ -350,6 +352,8 @@
   const RENDER_INITIAL = 40;
   const RENDER_STEP = 20;
   const RENDER_CAP = 500;
+  /** 分帧补齐的帧间隔（ms）：让每个 20 行块之间留一帧，鸿蒙首帧布局不连续占满 JS 线程。 */
+  const RENDER_FILL_INTERVAL_MS = 32;
 
   /** 一行会议（列表项投影：接口运行时是 UTSJSONObject，不能 as DTO）。 */
   class MeetingRow {
@@ -439,6 +443,51 @@
     const limit = historyLimit.value < RENDER_CAP ? historyLimit.value : RENDER_CAP;
     return filteredHistoryRows.value.slice(0, limit);
   });
+
+  /**
+   * 首屏「分帧补齐」定时器（-1=没在跑）。
+   *
+   * 用户口径：一页 100 条希望「直接看到」，不接受还要触底才长出来；但一次同步
+   * 渲染 100 张卡片在鸿蒙会白屏（首帧布局与 JS 同线程，实测 60 行≈1.2s）。折中：
+   * 首帧只画 RENDER_INITIAL（页面立刻可用），之后每 RENDER_FILL_INTERVAL_MS 本地
+   * +RENDER_STEP，补到 min(已加载条数, 一页)，全程不发请求。
+   * ★只自动补到一页：第 2 页起仍由触底 RENDER_STEP 驱动，RENDER_CAP 前的性能
+   *   闸门不放开（否则翻几页就又回到一次渲染几百行）。
+   */
+  let renderFillTimer: number = -1;
+
+  function stopRenderFill(): void {
+    if (renderFillTimer >= 0) {
+      clearTimeout(renderFillTimer);
+      renderFillTimer = -1;
+    }
+  }
+
+  /** 目标 = min(当前可渲染行数, 一页)；搜索过滤后行数变少也不补空行。 */
+  function renderFillTarget(): number {
+    const ready = filteredHistoryRows.value.length;
+    return PAGE_SIZE < ready ? PAGE_SIZE : ready;
+  }
+
+  function scheduleRenderFill(): void {
+    stopRenderFill();
+    if (historyLimit.value >= renderFillTarget()) {
+      return;
+    }
+    renderFillTimer = setTimeout((): void => {
+      renderFillTimer = -1;
+      const target = renderFillTarget();
+      if (historyLimit.value >= target) {
+        return;
+      }
+      const next = historyLimit.value + RENDER_STEP;
+      historyLimit.value = next < target ? next : target;
+      // 还没补满就排下一帧（每次只增量 patch 20 行，已有行不重排）
+      if (historyLimit.value < target) {
+        scheduleRenderFill();
+      }
+    }, RENDER_FILL_INTERVAL_MS);
+  }
 
   /** 渲染量已撞上封顶（三区任一）。 */
   const capped = computed((): boolean => {
@@ -1056,6 +1105,8 @@
         splitRows();
         // 整表重置 = 渲染也从第一屏重新开始（与数据换引用同一批，避免先收缩再长大）
         historyLimit.value = RENDER_INITIAL;
+        // 首屏落地后分帧补齐到一整页（不发请求；见 scheduleRenderFill 注释）
+        scheduleRenderFill();
       }
       // 游标只跟着「本页最后一条」走；静默合并不动它（否则会丢已加载的后续页）
       if (!silent && page.length > 0) {
@@ -1173,7 +1224,8 @@
 
   /**
    * 触底：优先「本地展开已加载但未渲染的行」，全部渲染完才去请求下一页。
-   * 这样 100 条一页不会被一次性塞进 100 个节点，而是 40 → 60 → 80 → 100 长出来。
+   * 第一页落地后已由 scheduleRenderFill 自动补齐到一页；这里负责第 2 页起的
+   * 分步展开（仍按 RENDER_STEP，避免一次插入上百个节点）。
    */
   function handleLoadMore(): void {
     if (loadingMore.value || loading.value || failed.value) {
@@ -1481,9 +1533,10 @@
 
   onUnmounted(() => {
     eventBus.off(IM_MEETING_CHANGED_EVENT, onMeetingChanged);
-    // 定时器必须在卸载时停：组件的 setInterval 不会随节点销毁自动清（否则会一直拉接口）
+    // 定时器必须在卸载时停：组件的 setInterval/setTimeout 不会随节点销毁自动清
     stopTranscriptPoll();
     stopLiveTimer();
+    stopRenderFill();
   });
 
   // 每次成功写入数据后重算一次「要不要开转写轮询 / 进行中计时」（见 dataSeq 注释）

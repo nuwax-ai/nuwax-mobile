@@ -36,6 +36,8 @@ export function verifyResourcePackage(directory) {
   for (const entry of manifest.files) {
     if (typeof entry.path !== 'string' || entry.path.includes('\\') || entry.path.startsWith('/') || entry.path.split('/').some(p => !p || p === '.' || p === '..') || seen.has(entry.path)) throw new Error('Invalid resource path');
     seen.add(entry.path);
+    // macOS 会把 .DS_Store 写进清单，云打包又会丢掉点开头的文件。这个文件不参与校验。
+    if (entry.path === '.DS_Store' || entry.path.endsWith('/.DS_Store')) continue;
     const file = path.join(directory, entry.path);
     for (let current = file; current !== path.resolve(directory); current = path.dirname(current)) {
       if (fs.lstatSync(current).isSymbolicLink()) throw new Error(`Symlink resource: ${entry.path}`);

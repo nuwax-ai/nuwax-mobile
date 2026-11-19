@@ -2,8 +2,11 @@ import AppKit
 
 // Feature-local vector source; exports 3x PNGs for identical iOS/Android rendering.
 // Run from repository root: swift scripts/voip-ui/generate-call-icons.swift
-let output = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("static/voip/call-icons")
+let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+let output = root.appendingPathComponent("static/voip/call-icons")
+let nativeOutput = root.appendingPathComponent("uni_modules/nuwax-voip/utssdk/app-android/res/drawable-nodpi")
 try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+try FileManager.default.createDirectory(at: nativeOutput, withIntermediateDirectories: true)
 
 func path(_ c: CGContext, _ points: [CGPoint]) {
     guard let first = points.first else { return }
@@ -73,7 +76,12 @@ for name in ["microphone", "microphone-off", "speaker", "earpiece", "video", "vi
         context.translateBy(x: 0, y: 96); context.scaleBy(x: 4, y: -4)
         context.setStrokeColor(color.cgColor); context.setLineWidth(1.7); context.setLineCap(.round); context.setLineJoin(.round)
         context.setShouldAntialias(true); icon(name, context)
-        try bitmap.representation(using: .png, properties: [:])!.write(to: output.appendingPathComponent("\(name)-\(variant).png"))
+        let png = bitmap.representation(using: .png, properties: [:])!
+        try png.write(to: output.appendingPathComponent("\(name)-\(variant).png"))
+        if variant == "white" && name != "close" && name != "earpiece" {
+            let resource = "nuwax_voip_" + name.replacingOccurrences(of: "-", with: "_") + ".png"
+            try png.write(to: nativeOutput.appendingPathComponent(resource))
+        }
     }
 }
-print("Generated 22 feature-local call icons")
+print("Generated shared call icons and their native Android copies")

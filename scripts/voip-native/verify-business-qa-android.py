@@ -47,6 +47,12 @@ resources = run(tools / "aapt", "dump", "--values", "resources", APK)
 for label in ["nuwax_voip_incoming_channel", "nuwax_voip_ongoing_channel", "音视频通话邀请通知", "通话状态",
               "Audio and video call invitations", "音視訊通話邀請通知", "音視像通話邀請通知"]:
     assert label in resources, f"Missing native notification translation: {label}"
+for icon in ["hangup", "phone", "video", "video_off", "switch_camera", "microphone", "microphone_off", "speaker", "minimize"]:
+    name = "nuwax_voip_" + icon
+    assert f"drawable/{name}" in resources, f"Missing native call drawable: {name}"
+    shared = ROOT / "static/voip/call-icons" / (icon.replace("_", "-") + "-white.png")
+    native = ROOT / RESOURCE_PATH / "drawable-nodpi" / (name + ".png")
+    assert native.read_bytes() == shared.read_bytes(), f"Native call drawable differs from the in-app icon: {name}"
 assert "nuwax.voip.qaApiOrigin" in xml and ORIGIN in xml
 assert "com.nuwax.voip.VoipUniPushIntentService" in xml
 assert "com.igexin.sdk.HonorPushMessageService" in xml and "com.igexin.sdk.HmsPushMessageService" in xml
@@ -70,7 +76,7 @@ with zipfile.ZipFile(APK) as archive:
             count += 1
     assert count > 100
     dex = b"".join(archive.read(name) for name in archive.namelist() if re.fullmatch(r"classes[0-9]*\.dex", name))
-    for value in [ORIGIN, "Lcom/nuwax/voip/VoipBridge;", "Lcom/igexin/sdk/HonorPushMessageService;", "Lcom/igexin/sdk/HmsPushMessageService;",
+    for value in [ORIGIN, "Lcom/nuwax/voip/VoipBridge;", "Lcom/nuwax/voip/VoipNativeCallView;", "Lcom/igexin/sdk/HonorPushMessageService;", "Lcom/igexin/sdk/HmsPushMessageService;",
                   "nuwax-voip-incoming-v2", "nuwax-voip-ongoing-v1"]:
         assert value.encode() in dex, f"Missing compiled implementation: {value}"
     assert b"Lio/dcloud/debug/" not in dex, "HX debug server is bundled"

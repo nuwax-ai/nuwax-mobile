@@ -5,6 +5,8 @@
 参考实现：`nuwax-im` 仓库 `feat-video-meeting` 分支（`lib/voip.ts`、`lib/meetingInvite.ts`、`store/call.ts`、`store/meetingInvite.ts`、`ImCallController`）
 状态：方案稿，待评审
 
+> 2026-11-19 对接范围更新。移动端交付单聊语音原生来电字段契约，IM 后端同学负责实现投递。字段、JSON 示例和 iPhone 扩展以[单聊语音来电推送字段（后端对接稿）](../engineering/单聊语音来电字段对照-后端定稿.md)为准。
+
 ---
 
 ## 0. 结论摘要
@@ -14,7 +16,7 @@
    - `meeting_invite`：会议邀请，**整场会议有效**，不超时。
 2. 瞬时状态（接听/拒绝/挂断/超时/已处理）走 `MSG_CUSTOM_EVENT(3007)`，由 4 个 REST 端点触发，**不落库、不补发**。
 3. RTC 统一用 LiveKit：1v1 通话与多人会议是**同一个房间概念**，复用 `nunuax-livekit` 插件与 `utils/meeting/meetingMedia.uts`，区别只在房间的创建者与生命周期。
-4. 离线送达依赖 uni-push：**必须先补齐 `category` 与 `channel_id`**，否则华为/鸿蒙会按营销消息降级，通话不会响铃。
+4. 单聊语音原生来电由 IM 按被叫设备提供 `callRoute`，并在 `payload` 带上完整邀请定位、被叫身份和截止时间。字段见 §5.2.2。
 5. App 端缺口集中在：协议解析、通话状态机、来电/邀请界面、铃声与音频会话、推送点击路由、消息卡片渲染。
 
 ---
@@ -33,7 +35,7 @@
 
 ### 1.2 本期不包含
 
-- iOS 系统级 CallKit / Android ConnectionService 全屏来电（需独立原生插件，见 §8）。
+- 系统来电的跨平台扩展先验单聊语音，按 §5.2.2 的字段送达，视频和群通话后续单独确认。
 - 通话中录制、通话记录独立页（首期用消息气泡承载记录）。
 - 会议邀请的「稍后提醒」等日历能力。
 
@@ -101,12 +103,7 @@ Android / iOS / 鸿蒙首批；H5、微信小程序不在本期（无原生推�
 }
 ```
 
-**必须补齐**：
-
-1. `category` 按消息类型动态：`voip` → `{ harmony: "VOIP", huawei: "VOIP" }`；`meeting_invite` → 仍用 `IM`（不是实时来电，避免 VOIP 权益滥用）。
-2. 增加 `channelId`（华为 Android 必带）：`voip` → `VoipCall`；其余消息不传。
-3. `payload` 增加唤醒所需字段（**必做**，完整清单与理由见 §5.2.2）。
-4. 推送标题/正文区分：来电用「张三邀请你语音通话」，会议邀请用「会议邀请：周会」。
+单聊语音原生来电在此信封上增加 `callRoute`，并补齐 `payload` 字段。普通离线通知可按原会话定位和点击处理。见 §5.2.2。
 
 ---
 
@@ -225,7 +222,7 @@ outgoing/incoming ──单方取消──> ended(canceled)
 |---|---|---|
 | App 前台（WS 在线） | 3007 + 消息帧 | 来电页/邀请浮层，无系统通知 |
 | App 后台但进程存活 | 厂商通道 + 在线透传 | Android 系统通知；iOS 由端上补本地通知 |
-| App 进程被杀 | 厂商通道离线推送 | 系统通知；点击拉起 App → 按 `type` 路由；`voip` 先按 `sendTime` 判 60 秒窗口 |
+| App 无进程 | 普通通知或单聊语音原生来电通道 | 普通通知按点击路由处理。原生来电按 §5.2.2 的 `callRoute` 和 `payload.expiresAt` 验证系统来电 |
 | 鸿蒙退后台 | Push Kit | 系统通知；进程被冻结，点击后才恢复 |
 
 **必须做去重**：同一条消息可能同时经 WS 与推送到达，按 `msgId`（通话再叠 `callId`）只处理一次。
@@ -275,46 +272,11 @@ for each 被邀请人:
 
 #### 5.2.1 分类与渠道
 
-服务端 `UniPushChannel.buildBody` 需要按 `msgType` 分支：
-
-```java
-boolean isVoip = "voip".equals(ctx.payloadType());
-category.put("harmony", isVoip ? "VOIP" : "IM");
-category.put("huawei",  isVoip ? "VOIP" : "IM");
-if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channel_id
-```
-
-会议邀请**不要**用 `VOIP`：它不是实时来电，滥用会被华为收回自分类权益。
+由后端根据已登记的被叫设备选择来电能力。单聊语音原生来电使用 `callRoute`；`category` 与 `channelId` 属于具体通知配置，原生来电字段见下一节。
 
 #### 5.2.2 payload 字段（完整清单）
 
-判定标准：**离线推送到达后，App 不请求接口也能立刻把界面立起来**。iOS 在用户点击通知前不执行 JS；冷启动/弱网时拉消息可能失败。
-
-**voip**
-
-| 字段 | 用途 | 必要性 |
-|---|---|---|
-| `convId` / `convType` / `msgId` | 已有：会话定位、状态上报 | 已有 |
-| `type` | 已有：值为 `voip` | 已有 |
-| `callId` | 去重 + 3007 事件匹配「是不是这一通」 | **必须** |
-| `roomName` | LiveKit 房间名，接听后直接入房 | **必须** |
-| `mediaType` | `audio`/`video`，决定来电页样式与是否开摄像头 | **必须** |
-| `sendTime` | 毫秒时间戳，端上判断是否仍在 60 秒响铃窗口 | **必须** |
-| `senderName` | 来电页姓名；iOS 点击通知后才执行 JS，此时要立刻画界面，不能等拉会话 | **必须** |
-
-```json
-{
-  "convId": "1879...", "convType": 2, "msgId": "1879...",
-  "type": "voip",
-  "callId": "call-m3k2-abc123",
-  "roomName": "im-1879-m3k2-abc",
-  "mediaType": "audio",
-  "sendTime": 1763456789000,
-  "senderName": "张三"
-}
-```
-
-> `sendTime` 是最容易漏的字段：厂商通道延迟几十秒到几分钟很常见。没有它，用户点开 3 分钟前的通知仍会弹来电页、接听进入空房间。端上按 `now - sendTime < 60s` 判断，过期直接展示「未接来电」，不弹来电页。
+**单聊 VoIP 原生来电。** IM → 云函数新增一个顶层对象 `callRoute`。在现有 `payload` 里补 `callId`、`mediaType`、`calleeId`、`expiresAt`，`displayName` 为展示字段。服务端按消息发送时间计算截止时间；端上用 `convId + msgId` 回查原邀请，接听时读取其中的 RTC 房间名。完整 JSON、字段类型和 iPhone 登记字段见[后端对接稿](../engineering/单聊语音来电字段对照-后端定稿.md)。
 
 **meeting_invite**
 
@@ -360,7 +322,7 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
 | `sendTime`（会议邀请） | 会议邀请整场有效，没有过期语义 |
 | RTC `token` / `roomUrl` | 接听后由 token 接口返回 |
 
-体积估算：voip ≈ 230 字符，meeting_invite ≈ 320 字符，均在 800 上限内。
+来电关键字段在云函数传递中须保留；会议邀请字段继续按本节约定。
 
 #### 5.2.2.1 信封层语义（端上必须理解）
 
@@ -370,7 +332,7 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
 2. **同一会话还有其他未读**（`others > 0`）——通知文案已不是单纯那一条，不能弹来电界面；
 3. **voip 已超过 60 秒响铃窗口**——补推候选可存活 7 天，昨天的未接电话今天不能再来电。
 
-所以端上规则是「**`type=voip` 才来电；`type=message` 一律按普通消息处理**」。会议邀请不受 60 秒限制，第 3 条不适用。
+以上描述普通通知的聚合逻辑。原生来电需要 `type=voip` 和 §5.2.2 约定的有效字段。会议邀请不受 60 秒限制。
 
 **`badge` 的未读口径待产品确认。** payload 里的 `badge` 是未读总数，`voip` / `meeting_invite` 当前按普通消息计入未读：
 
@@ -378,16 +340,11 @@ if (isVoip) root.put("channelId", "VoipCall");   // 云函数透传到 HW channe
 - 会议邀请是否计入（一般计入）；
 - 若不计，服务端未读计数要排除，否则角标虚高，iOS 本地补角标也会跟着错。
 
-**`request_id` 必须每次唯一。** 重复的 `request_id` 会导致整条消息被丢弃；重发与「取消来电」通知都要用新的 id。
+普通通知沿用现有的 `request_id`。原生来电由候选云函数按路由、目标设备和 `callId` 生成 `request_id`，同一次通话的重试仍使用原业务 `callId`。取消和超时沿用 §5.3 的通话状态上报。
 
 #### 5.2.3 云函数连带改动
 
-`push-send` 云函数需要：
-
-- 接收并透传 `channelId`（`options.android.HW['/message/android/notification/channel_id']`）。
-- 保持 `category` 整体覆盖语义；调用方必须同时给 `harmony` 与 `huawei`。
-- **同步扩 `normalizePayload` 的保留白名单**：现在超 800 字符时只保留 `convId/convType`，会把新字段整段裁掉。白名单至少加 `type/callId/roomName/mediaType/sendTime/inviteId/title/silent/groupCall/passcode/senderName`。
-- 回显 `applied.channelId` / `applied.category`，便于排查「推了但没响铃」。
+`push-send` 的原生来电请求按 `callRoute` 选厂商通道，保留 §5.2.2 的关键字段。回执用于按同一 `callId` 跟踪送达。
 
 ### 5.3 状态上报（App → 服务端）
 
@@ -451,9 +408,8 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 |---|---|
 | 铃声/震动 | 来电铃声（可循环）、震动；停止时机与音频会话协调 |
 | 音频会话 | 统一 `meetingMedia` 的音频占用：会议/通话/语音消息/ASR 互斥，入会前抢占、退出后释放 |
-| 推送路由 | `utils/im/imPushClient.uts` 点击分支：`type=voip` → 先按 `sendTime` 判 60 秒窗口，未过期才恢复来电页，过期只显示「未接来电」；`type=meeting_invite` → 邀请浮层/入会页；其余仍进会话 |
-| 本地通知 | Android 带 `channelId=VoipCall`；iOS 后台透传补通知同样带业务 payload |
-| 渠道创建 | 启动/登录后 `uni.getPushChannelManager().setPushChannel({ channelId: 'VoipCall', importance: 4, ... })` |
+| 推送路由 | 原生通话入口按 `expiresAt` 判断有效期。普通通知的点击分支仍按 `type` 路由，旧来电从原消息 `sendTime` 判 60 秒窗口，过期显示「未接来电」 |
+| 原生来电展示 | Android 原生来电使用端上已有的电话通知渠道。iPhone 按 PushKit 回调上报系统来电。普通通知按现有规则展示 |
 | 权限 | 麦克风/摄像头申请时机：发起或接听时；拒绝后给「仅收听」降级路径 |
 | 前后台 | `App.onHide` 不主动断 RTC（会议模块已约定）；来电页在后台时由通知承载 |
 
@@ -474,10 +430,8 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 4 个 calls REST 端点 | ✅ 已有 | 确认 App 鉴权头/平台参数一致 |
 | 3007 事件下发 | ✅ 已有 | 无需改动 |
 | 推送 `payload.type` | ✅ 已有（wire 值） | 无需改动 |
-| 推送 `payload` 业务字段 | ⚠️ 只有 `convId/convType/type/msgId` | voip：`callId/roomName/mediaType/sendTime`；会议：`inviteId/roomName/title/mediaType/silent/passcode`；建议 `senderName` |
-| 云函数 `normalizePayload` 白名单 | ⚠️ 超长只保留 `convId/convType` | 加入通话/邀请字段，否则整段被裁 |
-| 推送 `category` | ⚠️ 固定 `IM` | 按 msgType 动态，`voip` → `VOIP` |
-| 推送 `channelId` | ❌ 未传 | `voip` → `VoipCall` |
+| 单聊语音原生来电 | 普通推送已有 `convId/convType/type/msgId` | IM 后端按 §5.2.2 提供 `callRoute`，并补四个必传业务字段 |
+| 云函数原生来电分支 | 移动端仓已有候选字段校验 | 以实际联调部署验证厂商路由与下行字段 |
 | 推送文案 | 通用会话摘要 | `voip`：「张三邀请你语音通话」；会议：「会议邀请：周会」 |
 | 60 秒 TTL | ✅ 服务端常量 `CALL_RING_TTL_SEC` | 确认离线推送时的过期处理（过期推送到端后不应再响） |
 | 群通话扇出 | PC 前端拼装 | 保持前端拼装即可，服务端无需新增 |
@@ -490,10 +444,10 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 
 | 风险 | 影响 | 应对 |
 |---|---|---|
-| iOS 不支持 VoIP Push（PushKit） | App 被杀后无法系统级全屏来电 | 首期用普通通知 + 本地通知；后续评估 CallKit 原生插件 |
+| iOS PushKit 尚待联调闭环 | App 无进程时的系统来电取决于有效的设备登记与专用投递 | 用同一 `callId` 核对 iOS VoIP 回执、PushKit 回调与系统来电 |
 | 鸿蒙后台进程冻结 | 退后台后 WS 不实时，只能靠 Push Kit 通知 | 依赖离线推送 + 点击恢复；不要承诺「后台秒响铃」 |
 | 华为 VOIP 分类审核 | 滥用会被收回权益 | 仅实时通话用 `VOIP`；会议邀请用 `IM` |
-| 通知渠道不可改 | `VoipCall` 配置一旦创建永久固定 | 上线前定稿重要性/铃声；后续调整只能换 Channel ID |
+| Android 电话通知渠道 | 系统允许用户设置铃声和展示行为 | 联调记录渠道和系统设置，按真机响铃及来电页验收 |
 | 在线与离线双通道重复 | 同一邀请弹两次 | 按 `msgId`/`callId` 去重 |
 | 音频会话冲突 | 会议中接通话/语音消息抢占麦克风 | 统一音频占用协调层，入会前释放 |
 | 端上时钟偏差 | 60s 判断提前/延后 | 以服务端 `sendTime` 与本地单调时钟结合，留 5s 兜底 |
@@ -507,7 +461,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | P0 | 单聊 voip：消息发送/解析、来电页、接听/拒绝/挂断、3007、LiveKit 入房 | 双端在线互通，语音/视频可通话 |
-| P1 | 离线推送：category/channelId/payload 扩展、点击路由、本地通知、渠道创建 | 杀进程后收到响铃通知，点击进通话 |
+| P1 | 单聊语音原生来电字段与云函数选路，普通通知点击恢复 | 原生来电从真实拨号验到系统来电页；普通通知点开后按平台处理 |
 | P2 | 会议邀请：创建/会中加人、邀请浮层、卡片、handled 同步 | 收到邀请可加入会议，多端同步停铃 |
 | P3 | 群通话：群卡片 + 单聊邀请、选人弹窗 | 群内只叫勾选的人，其余人可点卡片加入 |
 | P4 | 体验完善：铃声/震动、音频路由、弱网重连、多设备兜底 | 待定 |
@@ -521,7 +475,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 3. A 打给 B，无人接 → 60 秒后 A 显示「未接听」，B 停止响铃。
 4. A 打给 B，A 在第 5 秒取消 → B 立即停铃（不残留 55 秒）。
 5. B 已有一通通话时 A 再打 → B 不弹窗，消息显示「忙线未接」。
-6. B 进程被杀 → 收到系统通知（响铃/横幅）→ 点击直接进入来电页并可接听。
+6. B 无进程且设备完成原生来电登记 → A 发起单聊语音 → B 收到系统来电 → 接听后确认双向语音。普通通知的点击恢复另按实际平台验证。
 7. 同账号 B 两台设备 → 一台接听，另一台立即停铃。
 8. 会议创建时邀请 3 人 → 3 人各收到卡片 + 浮层；1 人加入后其另一台设备停止响铃。
 9. 会中邀请新成员 → 新成员可加入同一房间。
@@ -547,6 +501,6 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 会中「添加成员」 | ❌ 无入口 | `im-meeting-room.uvue` members 面板 |
 | 邀请携带密码 | ❌ 发送接口无 `passcode` 参数 | `servers/imCall.uts` |
 | 接收端弹窗文案 | ⚠️ 写死「群视频/群语音通话」，且 `silent` 按字符串判断 | `utils/im/imCallSession.uts` |
-| `VoipCall` 渠道 | ❌ 未见 `setPushChannel` 调用 | — |
+| Android 原生通话渠道 | VoIP 专项分支已有原生渠道定义 | `nuwax-voip` Android 原生插件 |
 | 群通话入口 | ❌ 未见 | — |
 | 离线推送 payload/category | ❌ 后端未补 | nuwax-im `UniPushChannel` |

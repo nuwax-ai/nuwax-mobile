@@ -72,6 +72,12 @@ class VoipIncomingActivity : Activity() {
     private fun answer(type: String) {
         val value = VoipBridge.uiSnapshot(callId) ?: return
         if (!value.optBoolean("incoming") || value.optString("state") != "ringing" || actionPending) return
+        // 会议接听只负责打开会议页，麦克风/摄像头由会议页按需申请，不在锁屏强行弹权限。
+        if (value.optString("scene") == "meeting") {
+            actionPending = true
+            VoipBridge.uiCommand(callId, "action", mediaType = type)
+            return
+        }
         // Video and runtime permission prompts require the user to unlock. Audio with an
         // existing grant can be accepted on the lockscreen, without dismissing the keyguard.
         val missing = mutableListOf<String>()

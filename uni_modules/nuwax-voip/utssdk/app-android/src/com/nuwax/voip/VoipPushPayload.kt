@@ -24,16 +24,28 @@ object VoipPushPayload {
         if (value.optString("type") == "voip" || value.optString("kind") == "voip.invite") {
             val conv = id(value.opt("convId")) ?: return null
             val message = id(value.opt("msgId")) ?: return null
+            val meeting = value.optString("scene") == "meeting"
             // Do not forward tokens, URLs or unrelated notification fields to the call bridge.
             val locator = JSONObject().put("type", "voip").put("convId", conv).put("msgId", message)
+            if (meeting) locator.put("scene", "meeting")
             if (!value.has("delivery")) return locator
             if (!isNative(value) || value.opt("convId") !is String || value.opt("msgId") !is String) return null
             val call = (value.opt("callId") as? String)?.takeIf(callId::matches) ?: return null
             val callee = (value.opt("calleeId") as? String)?.takeIf(callId::matches) ?: return null
             val media = (value.opt("mediaType") as? String)?.takeIf { it == "audio" || it == "video" } ?: return null
             val expiry = integer(value.opt("expiresAt")) ?: return null
-            return locator.put("delivery", NATIVE).put("callId", call).put("calleeId", callee)
+            val invitation = locator.put("delivery", NATIVE).put("callId", call).put("calleeId", callee)
                 .put("mediaType", media).put("expiresAt", expiry)
+            if (meeting) {
+                val invite = (value.opt("inviteId") as? String)
+                    ?.takeIf { it.matches(Regex("[A-Za-z0-9._-]{1,128}")) } ?: return null
+                val room = (value.opt("roomName") as? String)
+                    ?.takeIf { it.matches(Regex("[A-Za-z0-9._-]{1,128}")) } ?: return null
+                invitation.put("inviteId", invite).put("roomName", room)
+                (value.opt("title") as? String)?.takeIf { it.isNotBlank() }
+                    ?.let { invitation.put("title", it.take(80)) }
+            }
+            return invitation
         }
         for (key in listOf("payload", "data")) {
             val child = value.opt(key)
@@ -60,11 +72,18 @@ object VoipPushPayload {
             invitation.optLong("expiresAt") in (now + 1)..(now + 65_000)
 
     fun matches(invitation: JSONObject, message: JSONObject, user: String, now: Long): Boolean {
-        if (!eligible(invitation, user, now) || message.opt("msgType") != "voip") return false
+        if (!eligible(invitation, user, now)) return false
         val body = message.optJSONObject("body") ?: return false
         val sent = integer(message.opt("sendTime")) ?: return false
-        return id(message.opt("convId")) == invitation.opt("convId") &&
-            id(message.opt("msgId")) == invitation.opt("msgId") &&
+        val sameLocator = id(message.opt("convId")) == invitation.opt("convId") &&
+            id(message.opt("msgId")) == invitation.opt("msgId")
+        if (invitation.optString("scene") == "meeting") {
+            return message.opt("msgType") == "meeting_invite" && sameLocator &&
+                body.opt("inviteId") == invitation.opt("inviteId") &&
+                body.opt("roomName") == invitation.opt("roomName") &&
+                sent > 0 && sent <= now + 5_000 && invitation.optLong("expiresAt") <= sent + 60_000
+        }
+        return message.opt("msgType") == "voip" && sameLocator &&
             body.opt("callId") == invitation.opt("callId") && body.opt("mediaType") == invitation.opt("mediaType") &&
             sent > 0 && sent <= now + 5_000 && invitation.optLong("expiresAt") <= sent + 60_000
     }

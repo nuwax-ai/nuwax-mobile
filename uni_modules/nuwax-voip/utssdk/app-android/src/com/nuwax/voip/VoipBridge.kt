@@ -352,6 +352,7 @@ object VoipBridge {
     }
     private suspend fun receiveInvitation(message: JSONObject, push: JSONObject? = null, sessionScope: String? = null) {
         trace("invitation validating")
+        if (message.optString("msgType") == "meeting_invite") { receiveMeetingInvitation(message, push, sessionScope); return }
         if (message.optString("msgType") != "voip" || message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
         val body = message.optJSONObject("body") ?: return
         val id = body.optString("callId"); val conv = message.optString("convId"); val sender = message.optString("senderId")
@@ -370,6 +371,66 @@ object VoipBridge {
         if (current != null && current?.optString("callId") != id) { notifyBusinessEnd(next, "busy"); terminal.add(id); return }
         trace("invitation accepted"); adopt(next)
     }
+    /**
+     * 会议来电只借用系统来电界面和铃声，不进入 1:1 通话状态机：
+     * 接听后由 JS 打开会议页，忽略/超时回写 meeting-invite-handled。
+     */
+    private fun receiveMeetingInvitation(message: JSONObject, push: JSONObject?, sessionScope: String?) {
+        if (message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
+        val body = message.optJSONObject("body") ?: return
+        val inviteId = body.optString("inviteId")
+        val room = body.optString("roomName")
+        val title = body.optString("title")
+        val media = body.optString("mediaType")
+        val conv = message.optString("convId")
+        val msg = message.optString("msgId")
+        if (!inviteId.matches(Regex("[A-Za-z0-9._-]{1,128}")) || !room.matches(Regex("[A-Za-z0-9._-]{1,128}")) ||
+            title.isBlank() || media !in listOf("audio", "video")) return
+        if (sessionScope != null && config.optString("scope") != sessionScope) return
+        if (push != null && (push.optString("inviteId") != inviteId || push.optString("roomName") != room)) return
+        if (terminal.contains(inviteId) || current?.optString("callId") == inviteId) return
+        val sent = message.optLong("sendTime")
+        val now = System.currentTimeMillis()
+        if (sent <= 0 || sent + 60000 <= now) return
+        val deadline = if (push == null) sent + 60000 else push.optLong("expiresAt")
+        if (deadline <= now) return
+        // 忙线不打断：保留聊天卡片，用户结束后自行加入。
+        if (current != null) return
+        val sender = message.optString("senderId")
+        val next = JSONObject().put("protocol", "im-voip-v1").put("scene", "meeting")
+            .put("callId", inviteId).put("inviteId", inviteId).put("roomName", room).put("title", title)
+            .put("msgId", msg).put("convId", conv).put("version", 1).put("state", "ringing")
+            .put("callerId", sender).put("calleeId", config.optString("userId")).put("acceptedDeviceId", "")
+            .put("mediaType", media)
+            .put("callerDisplayName", message.optString("senderName", title))
+            .put("calleeDisplayName", config.optString("userId"))
+            .put("expiresAt", deadline)
+        current = next
+        trace("meeting invitation accepted")
+        publishCall()
+    }
+
+    private fun emitMeeting(action: String, meeting: JSONObject) {
+        val event = JSONObject().put("type", "meetingInvite").put("scope", config.optString("scope"))
+            .put("action", action).put("callId", meeting.optString("callId"))
+            .put("inviteId", meeting.optString("inviteId")).put("roomName", meeting.optString("roomName"))
+            .put("title", meeting.optString("title")).put("mediaType", meeting.optString("mediaType"))
+            .put("convId", meeting.optString("convId")).put("msgId", meeting.optString("msgId"))
+        queue.add(event)
+        while (queue.size > 256) queue.poll()
+    }
+
+    private fun closeMeeting() {
+        val ctx = context
+        val id = current?.optString("callId") ?: ""
+        if (id.isNotEmpty()) { terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first()) }
+        current = null
+        expiryJob?.cancel(); expiryJob = null
+        incomingNotifications.reset()
+        try { VoipCallService.removeNotification() } catch (_: Exception) { }
+        try { if (ctx != null) NotificationManagerCompat.from(ctx).cancel(9090) } catch (_: Exception) { }
+    }
+
     private fun receiveSignal(event: JSONObject) {
         val payload = event.optJSONObject("payload") ?: return
         val type = event.optString("eventType"); val id = payload.optString("callId")
@@ -535,6 +596,12 @@ object VoipBridge {
 
     private suspend fun act(action: String, answerMediaType: String = "audio") {
         val call = current ?: return
+        if (call.optString("scene") == "meeting") {
+            if (action == "accept") emitMeeting("accept", call)
+            else if (action in listOf("reject", "end", "cancel")) emitMeeting("reject", call)
+            closeMeeting()
+            return
+        }
         val run = generation
         val token = config.optString("accessToken")
         val id = call.optString("callId")
@@ -576,7 +643,7 @@ object VoipBridge {
         }
         catch (_: Exception) { incomingNotifications.reset(); trace("call service failed") }
     }
-    internal fun hasSystemCall() = current != null && control != null
+    internal fun hasSystemCall() = current != null && (control != null || current?.optString("scene") == "meeting")
     private fun permissions(type: String): Boolean {
         val ctx = context ?: return false
         return ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED &&

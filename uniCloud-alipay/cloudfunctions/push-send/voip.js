@@ -121,7 +121,12 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     return { error: 'invalid meeting expiresAt' }
   }
   if (deadline <= now) return { expired: true }
-  payload.expiresAt = Math.min(deadline, now + 60_000)
+  // Keep the native check (expiresAt must not exceed sendTime + 60s) satisfied even
+  // when the invitation message was stored a few seconds before the push.
+  const cap = payload.sendTime !== undefined
+    ? Math.min(now + 60_000, payload.sendTime + 60_000)
+    : now + 60_000
+  payload.expiresAt = Math.min(deadline, cap)
   return { payload, settings: { ttl: Math.min(60_000, payload.expiresAt - now) } }
 }
 

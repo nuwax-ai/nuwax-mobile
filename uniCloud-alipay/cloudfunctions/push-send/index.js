@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
+const { prepareVoip, prepareNativeVoip, prepareVoipScene } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -230,16 +231,68 @@ exports.main = async (event) => {
     return { errCode: 400, errMsg: 'invalid json body' }
   }
 
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { errCode: 400, errMsg: 'invalid request body' }
+  const scene = prepareVoipScene(body)
+  if (scene?.error) return { errCode: 400, errMsg: scene.error }
+  if (scene?.meeting && JSON.stringify(scene.meeting).length > MAX_PAYLOAD) {
+    return { errCode: 400, errMsg: 'meeting invitation payload too large' }
+  }
+  const nativeVoip = scene ? null : prepareNativeVoip(body)
+  if (nativeVoip) {
+    if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
+    if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }
+    if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
+    const route = body.callRoute
+    const enabled = route.transport === 'ios-voip'
+      ? process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT === route.environment
+      : (process.env.NUWAX_VOIP_ANDROID_TRANSPORTS || '').split(',').includes(route.transport)
+    if (!enabled) return { errCode: 503, errMsg: 'call transport unavailable' }
+    try {
+      const result = await uniPush.sendMessage({
+        push_clientid: [body.callRoute.cid],
+        title: clip(body.title, MAX_TITLE),
+        content: clip(body.content, MAX_CONTENT),
+        payload: nativeVoip.payload,
+        settings: nativeVoip.settings,
+        force_notification: false,
+        request_id: nativeVoip.requestId,
+        ...(nativeVoip.options ? { options: nativeVoip.options } : {})
+      })
+      const errCode = result?.errCode ?? -1
+      const details = result?.data && typeof result.data === 'object'
+        ? Object.entries(result.data).filter(([key, value]) =>
+          /^[A-Za-z0-9_-]{10,128}$/.test(key) && key !== route.cid &&
+          value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, route.cid))
+        : []
+      const tasks = details.map(([taskId, targets]) => {
+        const status = targets[route.cid]
+        return { taskId, status: typeof status === 'string' && /^[A-Za-z0-9_-]{1,50}$/.test(status) ? status : 'unknown' }
+      })
+      console.log('[push-send] call transport', body.callRoute.transport, nativeVoip.payload.callId, nativeVoip.requestId, errCode)
+      return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
+    } catch {
+      console.error('[push-send] call transport failed', nativeVoip.requestId)
+      return { errCode: -1, data: { requestId: nativeVoip.requestId } }
+    }
+  }
+
   const ids = Array.isArray(body.push_clientid) ? body.push_clientid : [body.push_clientid]
   if (!ids.length || !ids[0]) return { errCode: 400, errMsg: 'push_clientid required' }
   if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
+
+  const voip = scene ? scene.call : prepareVoip(body)
+  if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
+  if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
   // 长度限制：厂商通道会静默截断甚至拒绝，这里先按官方上限裁好（按码点裁，不切坏 emoji）
   const title = clip(body.title, MAX_TITLE)
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
-  const payload = attachBadgeToPayload(normalizePayload(body.payload), body.badge)
-  const category = body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
+  const payload = attachBadgeToPayload(voip?.payload ?? scene?.meeting ?? normalizePayload(body.payload), body.badge)
+  const category = scene?.meeting
+    ? { harmony: 'IM', huawei: 'IM' }
+    : body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
+  const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)
 
@@ -249,18 +302,19 @@ exports.main = async (event) => {
   //   要核对"文案被截断/角标没生效"，看响应里的 applied 回显即可。
   console.log('[push-send] req', JSON.stringify({
     cidCount: ids.length,
-    cidSample: ids.slice(0, 2),
+    cidSample: privateInvitation ? undefined : ids.slice(0, 2),
     titleLength: title.length,
     contentLength: content.length,
-    convId: payload && payload.convId ? payload.convId : null,
+    convId: privateInvitation ? undefined : (payload && payload.convId ? payload.convId : null),
     convType: payload && payload.convType ? payload.convType : null,
     payloadLength: JSON.stringify(payload || {}).length,
     badge: body.badge === undefined ? null : body.badge,
-    // 在线消息由客户端按前后台状态决定是否创建本地通知。
+    // 保留 feat-2026.11 的在线通知策略，展示由客户端前后台状态决定。
     force_notification: false,
-    request_id: body.request_id || null
+    request_id: privateInvitation ? undefined : (body.request_id || null),
+    ...(voip ? { kind: 'voip', ttl: voip.settings.ttl } : {})
   }))
-  if (DEBUG_MESSAGE_CONTENT) {
+  if (DEBUG_MESSAGE_CONTENT && !privateInvitation) {
     console.log('[push-send] message detail', JSON.stringify({
       push_clientid: ids,
       title,
@@ -285,6 +339,9 @@ exports.main = async (event) => {
       category: category,
       request_id: body.request_id || undefined
     }
+    // Ringing invites must not use the SDK's one-hour default retention.
+    // Forward only the validated TTL; vendor capabilities/options need separate approval.
+    if (voip) args.settings = voip.settings
     // ★角标：Number 或 String（"+1"/"-1"/绝对值）。同一批 cid 只能共用一个值，
     //   因此调用方必须保证一批 = 同一个接收者的设备（见 docs/engineering/im-offline-push.md）。
     //   顶层 badge 只吃 iOS（APNs aps.badge）与鸿蒙通道；华为等 Android 厂商通道
@@ -301,7 +358,7 @@ exports.main = async (event) => {
       const res = await uniPush.sendMessage(args)
       console.log('[push-send] batch', chunk.length, 'errCode=', res && res.errCode, res && res.errMsg)
       // errCode=0 只代表 DCloud 受理，不代表送达；完整结果里可能有按端的任务 id / 失败明细
-      console.log('[push-send] batch res', JSON.stringify(res))
+      if (!privateInvitation) console.log('[push-send] batch res', JSON.stringify(res))
       results.push(res)
     } catch (err) {
       console.error('[push-send] batch threw:', (err && err.message) || String(err))

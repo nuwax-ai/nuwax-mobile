@@ -301,6 +301,89 @@ describe('envelope type and scene-driven notification config', () => {
   });
 });
 
+describe('meeting ringing delivery', () => {
+  const ringPayload = () => ({ ...locator, scene: 'meeting', convType: 1, inviteId: 'mi-ring', roomName: '123456789',
+    title: '周会', mediaType: 'video', senderName: '张三', silent: false, groupCall: true,
+    callId: 'mi-ring', calleeId: '10002', expiresAt: Date.now() + 30_000 });
+  const envelope = { title: '张三', content: '会议邀请：周会' };
+  const registrationId = 'cb67ff9e-54ee-44ef-a6c0-601fd536cdf5';
+  const ringEnv = { NUWAX_VOIP_MEETING_RING: '1' };
+
+  it('keeps meetings on ordinary IM notifications while the ringing switch is off', async () => {
+    const { call, send } = load();
+    await call({ ...envelope, push_clientid: 'fixture-cid', channelId: 'VoipCall', payload: ringPayload() });
+    const args = send.mock.calls[0][0];
+    expect(args.payload.type).toBe('meeting_invite');
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args).not.toHaveProperty('settings');
+    expect(args).not.toHaveProperty('options');
+  });
+
+  it('rings through the iOS VoIP route with the meeting payload and VoipCall channel', async () => {
+    const cid = 'fixture-target-cid';
+    const { call, send } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_IOS_APNS_ENVIRONMENT: 'development' });
+    const result = await call({
+      ...envelope, push_clientid: cid, channelId: 'VoipCall',
+      callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId },
+      payload: ringPayload(),
+    });
+    expect(result.errCode).toBe(0);
+    const args = send.mock.calls[0][0];
+    expect(args.settings).toMatchObject({ ttl: 5000, strategy: { ios: 2 } });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
+    expect(args.options.ios.type).toBe('voip');
+    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
+    const pushed = JSON.parse(args.options.ios.payload);
+    expect(pushed).toMatchObject({ type: 'voip', scene: 'meeting', callId: 'mi-ring', calleeId: '10002',
+      inviteId: 'mi-ring', roomName: '123456789', title: '周会', mediaType: 'video', displayName: '张三' });
+    expect(pushed.expiresAt).toBeLessThanOrEqual(Date.now() + 61_000);
+  });
+
+  it('clamps a long meeting deadline to the 60 second ringing window', async () => {
+    const { call, send } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_IOS_APNS_ENVIRONMENT: 'development' });
+    const cid = 'fixture-target-cid';
+    await call({
+      ...envelope, push_clientid: cid,
+      callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId },
+      payload: { ...ringPayload(), expiresAt: Date.now() + 300_000 },
+    });
+    const pushed = JSON.parse(send.mock.calls[0][0].options.ios.payload);
+    expect(pushed.expiresAt).toBeLessThanOrEqual(Date.now() + 60_000);
+  });
+
+  it('rings each registered device and falls back to an IM card for unregistered ones', async () => {
+    const binding = { appId: '__UNI__8BF05E4', calleeId: '10002', active: true };
+    const route = { ...binding, _id: 'huawei-cid', platform: 'android', transport: 'android-huawei' };
+    const { call, send } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1',
+      NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei' }, [route]);
+    const result = await call({ ...envelope, push_clientid: ['huawei-cid', 'notice-cid'], payload: ringPayload() });
+    expect(result.data.results).toMatchObject([
+      { clientid: 'huawei-cid', errCode: 0, delivery: 'native', transport: 'android-huawei' },
+      { clientid: 'notice-cid', errCode: 0, delivery: 'notification' },
+    ]);
+    const [native, notice] = send.mock.calls.map(([args]) => args);
+    expect(native.settings).toMatchObject({ strategy: { hw: 2 } });
+    expect(native.payload).toMatchObject({ type: 'voip', scene: 'meeting', delivery: 'android-native' });
+    expect(notice.payload.type).toBe('meeting_invite');
+    expect(notice.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(notice).not.toHaveProperty('settings');
+  });
+
+  it('never rings a silent group card and rejects incomplete ringing invitations', async () => {
+    const env = { ...ringEnv, NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1' };
+    const silent = load(latestEntry, env);
+    await silent.call({ ...envelope, push_clientid: 'fixture-cid', payload: { ...ringPayload(), silent: true } });
+    expect(silent.send.mock.calls[0][0].payload.type).toBe('meeting_invite');
+    expect(silent.send.mock.calls[0][0]).not.toHaveProperty('settings');
+
+    const incomplete = ringPayload();
+    delete (incomplete as any).calleeId;
+    const { call, send } = load(latestEntry, env);
+    expect((await call({ ...envelope, push_clientid: 'fixture-cid', payload: incomplete })).errCode).toBe(400);
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+
 describe('CID-based native call delivery', () => {
   const env = {
     NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1',

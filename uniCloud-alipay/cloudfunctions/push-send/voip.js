@@ -72,6 +72,61 @@ function prepareCallInvitation(body, now) {
   return invitation
 }
 
+/**
+ * 会议响铃邀请：只走原生来电通道，用于「App 未打开/熄屏也要让用户感知」。
+ * 与 meeting_invite 卡片消息分开：卡片消息走 IM，响铃邀请下发 type="voip"。
+ * 响铃窗口限制在 60 秒内（现有 PushKit/CallKit 客户端校验上限 65 秒），
+ * 超时后用户仍可在聊天里看到会议邀请卡片，不会错过入会记录。
+ */
+function prepareMeetingRingInvitation(body, now = Date.now()) {
+  const source = body.payload
+  const callId = source?.callId ?? source?.inviteId
+  // The prepared payload uses displayName; the IM envelope uses senderName.
+  const senderName = source?.senderName ?? source?.displayName
+  if (source?.type !== 'voip' || source.scene !== 'meeting' ||
+      !matches(callId, /^[A-Za-z0-9_-]{1,128}$/) ||
+      !locator(source.convId) || !locator(source.msgId) || !locator(source.calleeId) ||
+      !matches(source.inviteId, /^[A-Za-z0-9._-]{1,128}$/) ||
+      !matches(source.roomName, /^[A-Za-z0-9._-]{1,128}$/) ||
+      typeof source.title !== 'string' || !source.title.trim() ||
+      typeof senderName !== 'string' || !senderName.trim() ||
+      !['audio', 'video'].includes(source.mediaType)) {
+    return { error: 'complete meeting invitation required' }
+  }
+  const payload = {
+    type: 'voip',
+    scene: 'meeting',
+    callId,
+    calleeId: source.calleeId,
+    convId: source.convId,
+    msgId: source.msgId,
+    inviteId: source.inviteId,
+    roomName: source.roomName,
+    title: Array.from(source.title.trim()).slice(0, 80).join(''),
+    mediaType: source.mediaType,
+    displayName: Array.from(senderName.trim()).slice(0, 80).join(''),
+    groupCall: source.groupCall === true,
+  }
+  if (Number.isInteger(source.convType) && source.convType >= 1) payload.convType = source.convType
+  if (source.passcode !== undefined) {
+    if (!matches(source.passcode, /^[0-9]{4,6}$/)) return { error: 'invalid meeting passcode' }
+    payload.passcode = source.passcode
+  }
+  let deadline = source.expiresAt
+  if (Number.isSafeInteger(source.sendTime) && source.sendTime > 0) {
+    payload.sendTime = source.sendTime
+    if (deadline === undefined) deadline = source.sendTime + 60_000
+  }
+  if (deadline === undefined || !Number.isSafeInteger(deadline) || deadline <= 0) {
+    return { error: 'invalid meeting expiresAt' }
+  }
+  if (deadline <= now) return { expired: true }
+  payload.expiresAt = Math.min(deadline, now + 60_000)
+  return { payload, settings: { ttl: Math.min(60_000, payload.expiresAt - now) } }
+}
+
+exports.prepareMeetingRingInvitation = prepareMeetingRingInvitation
+
 // The IM envelope uses one type for both scenes; keep the existing client wire types.
 exports.prepareVoipScene = (body, now = Date.now()) => {
   const source = body.payload
@@ -134,7 +189,9 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
       typeof route.registrationId !== 'string' || route.registrationId.length !== 36 || !registrationId.test(route.registrationId))) {
     return { error: 'signed environment and current iOS route registration are required' }
   }
-  const invitation = prepareCallInvitation(body, now)
+  const invitation = body.payload?.scene === 'meeting'
+    ? prepareMeetingRingInvitation(body, now)
+    : prepareCallInvitation(body, now)
   if (invitation.error || invitation.expired) return invitation
   const payload = ios
     ? { ...invitation.payload, routeRegistrationId: route.registrationId }

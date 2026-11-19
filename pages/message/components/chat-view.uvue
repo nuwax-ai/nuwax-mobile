@@ -46,17 +46,18 @@
              ★零绑定组件——模板不新增捕获参数（渲染 lambda 已顶 255 上限，见 utils/chatAiHint.uts） -->
         <chat-ai-hint />
       </view>
-      <!-- 右侧：群聊/团队「...」进群设置页（飞书式）；单聊「...」进对端个人资料页
-           （微信式，与头像点按同款路由）；系统通知会话占位保证标题绝对居中 -->
-      <view
-        v-if="showHeaderMore"
-        class="chat-header__btn"
-        hover-class="chat-header__btn--active"
-        @click="handleHeaderMoreTap"
-      >
-        <svg-icon name="icon-More" size="20" unit="px" color="#141416" />
+      <!-- 右侧：语音/视频通话 + 会话详情（群聊/团队「...」进群设置页，单聊进对端资料页）。
+           通话菜单内部区分单聊直拨与群聊选人；两枚按钮共用一个分发函数，
+           避免聊天页渲染 lambda 再多捕获一个函数（Android 255 参数上限）。 -->
+      <view v-if="showHeaderMore" class="chat-header__actions">
+        <view class="chat-header__btn" hover-class="chat-header__btn--active" @click="handleHeaderAction('call')">
+          <svg-icon name="icon-VideoCamera" size="20" unit="px" color="#141416" />
+        </view>
+        <view class="chat-header__btn" hover-class="chat-header__btn--active" @click="handleHeaderAction('more')">
+          <svg-icon name="icon-More" size="20" unit="px" color="#141416" />
+        </view>
       </view>
-      <view v-else class="chat-header__btn chat-header__btn--ghost" />
+      <view v-else class="chat-header__actions chat-header__actions--ghost" />
     </view>
 
     <!-- 子页签行（单聊与群聊共用）：默认选中「消息」展示当前消息页，Pin/文件从右侧进独立页
@@ -203,6 +204,8 @@
         <view
           v-if="(msg.msgType == 'system' && sysMsgTextOf(msg).length > 0) || (msg.bodyText.length == 0 && msg.imageUrl.length == 0 && msg.audioUrl.length == 0 && msg.videoUrl.length == 0 && msg.imageAtts.length == 0 && msg.linkAtts.length == 0 && msg.cardTitle.length == 0 && msg.mergeItems.length == 0 && (msg.revoked || msg.digest.length > 0))"
           class="chat-sys"
+          :class="msg.msgType == 'meeting_invite' ? 'chat-sys--meeting' : ''"
+          @click="handleBubbleTap(msg)"
         >
           <text class="chat-sys__text">{{ sysText(msg, membersTick + contactRemarkTick) }}</text>
         </view>
@@ -2058,6 +2061,9 @@
   import { MsgActionItem } from "@/types/interfaces/msgActionItem";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import eventBus from "@/utils/eventBus";
+  import { startOutgoingImCall } from "@/utils/im/imCallSession";
+  import { isNativeImVoipEnabled, startVoipCall } from "@/features/voip/integration";
+  import { apiImMeetingInviteHandled } from "@/servers/imMeeting";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
   // 会话草稿（微信式）：未发文案+暂存图本地按 convId 记忆，列表「[草稿]xxx」+ 进页回显
   import { getChatDraft, getChatDraftMedia, rememberChatDraftConversation, setChatDraft } from "@/utils/im/chatDrafts";
@@ -2458,6 +2464,11 @@
     mergeTotal: number = 0;
     /** 合并转发全量条目（点卡片拉起聊天记录详情侧栏看全量；气泡只渲染 mergeItems 前 2 条）。 */
     mergeAllItems: ImMergeItem[] = [];
+    /** 会议邀请卡片（msgType=meeting_invite）：系统摘要行点击直接加入。 */
+    meetingInviteId: string = "";
+    meetingRoom: string = "";
+    meetingTitle: string = "";
+    meetingMedia: string = "audio";
     avatarFailed: boolean = false;
   }
 
@@ -5204,6 +5215,12 @@
             row.linkAtts.push(att);
           }
         }
+      } else if (row.msgType == "meeting_invite") {
+        // 会议邀请：整条消息的有效载荷就是 body 里这四个字段，摘要行点击即可入会
+        row.meetingInviteId = readString(body, "inviteId");
+        row.meetingRoom = readString(body, "roomName");
+        row.meetingTitle = readString(body, "title");
+        row.meetingMedia = readString(body, "mediaType") == "video" ? "video" : "audio";
       } else if (row.msgType == "audio") {
         // 语音消息：body.url 即播放地址；duration 秒可缺省（>3600 按 ms 误传换算回秒，
         // 超出合理语音时长不展示，首播后由播放器回填真值）
@@ -5287,6 +5304,7 @@
           for (let i = 0; i < items.length; i++) {
             const it = new ImMergeItem();
             it.senderName = readString(items[i], "senderName");
+            it.senderAvatar = readString(items[i], "senderAvatar");
             it.sendTime = readNumber(items[i], "sendTime", 0);
             it.text = readString(items[i], "text");
             it.preview = mergePreviewTextOf(readString(items[i], "msgType"), it.text);
@@ -6291,6 +6309,8 @@
     item.msgId = m.msgId;
     item.msgType = m.msgType;
     item.senderName = m.senderName.length > 0 ? m.senderName : t("Mobile.Message.imSearchUnknownUser");
+    // 头像同附件口径：快照只存服务端可跨设备地址（本机 temp 会让接收端永远画不出）
+    item.senderAvatar = forwardMediaUrlOf(m.senderAvatar);
     item.sendTime = m.sendTime;
     item.text = truncateCodePoints(m.bodyText, FORWARD_TEXT_MAX_CPS);
     item.attachmentsJson = buildForwardAttachmentsJson(m);
@@ -10897,6 +10917,17 @@
       openMergeDetail(msg);
       return;
     }
+    // 会议邀请：上报已处理（其它端摘掉该邀请并停铃）+ 入会（create=false，绝不凭空建房）
+    if (msg.msgType == "meeting_invite" && msg.meetingRoom.length > 0) {
+      apiImMeetingInviteHandled(convId.value, msg.msgId, msg.meetingInviteId, msg.meetingRoom, true);
+      uni.navigateTo({
+        url:
+          `/subpackages/pages/im-meeting/im-meeting-room?room=${encodeURIComponent(msg.meetingRoom)}` +
+          `&title=${encodeURIComponent(msg.meetingTitle)}&status=1&host=0&call=1` +
+          `&video=${msg.meetingMedia == "video" ? "1" : "0"}`,
+      });
+      return;
+    }
     // 微信同款：点消息内容切换显示/隐藏这条消息的时间（失败重发路径除外——那一下的重心是重发）
     timeRevealedId.value = timeRevealedId.value == msg.msgId ? "" : msg.msgId;
   }
@@ -14261,10 +14292,38 @@
     });
   }
 
-  /** header「...」分发：群式会话进群设置页；单聊进对端个人资料页（handleAvatarTap
-   *  同款路由与参数——name/头像先出首帧，资料页自行解析；对端为智能体带 subject=agent
-   *  走智能体形态。对端 userId 由 convDetail 异步回填，未就绪时静默不跳）。 */
-  function handleHeaderMoreTap(): void {
+  /** 顶栏右侧统一分发（call=语音/视频通话，more=会话详情）：两枚按钮共用一个函数，
+   *  避免聊天页渲染 lambda 再多捕获一个函数（Android 255 参数上限）。
+   *  call：单聊直拨；群聊进选人页（群内只叫被勾选的人，其余人点群卡片加入）。
+   *       智能体单聊与系统通知会话没有对端人，直接提示不支持。
+   *  more：群式会话进群设置页；单聊进对端个人资料页（handleAvatarTap 同款路由与参数
+   *       ——name/头像先出首帧，资料页自行解析；对端为智能体带 subject=agent 走智能体
+   *       形态。对端 userId 由 convDetail 异步回填，未就绪时静默不跳）。 */
+  function handleHeaderAction(kind: string): void {
+    if (kind == "call") {
+      if (isAgentP2p.value || isSystemConvLike.value) {
+        uni.showToast({ title: "当前会话暂不支持通话", icon: "none" });
+        return;
+      }
+      uni.showActionSheet({
+        itemList: ["语音通话", "视频通话"],
+        success: (res) => {
+          const media = res.tapIndex == 1 ? "video" : "audio";
+          if (isGroupLike.value) {
+            uni.navigateTo({
+              url: `/subpackages/pages/im-call/im-group-call-select?convId=${convId.value}&name=${encodeURIComponent(titleName.value)}&media=${media}`,
+            });
+            return;
+          }
+          if (isNativeImVoipEnabled()) {
+            startVoipCall(convId.value, media);
+            return;
+          }
+          startOutgoingImCall(convId.value, titleName.value, peerAvatar.value, media);
+        },
+      });
+      return;
+    }
     if (isGroupLike.value) {
       handleOpenGroupInfo();
       return;
@@ -16093,6 +16152,21 @@
     background-color: rgba(81, 71, 255, 0.06);
   }
 
+  /* 右侧「通话 + 详情」两枚按钮：固定 72px（两枚 36px），左侧返回组同宽，
+     标题基准才保持在正中（与 chat-header__left 的 72px 成对，改一处必改另一处） */
+  .chat-header__actions {
+    width: 72px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+    flex-shrink: 0;
+  }
+
+  .chat-header__actions--ghost {
+    background-color: rgba(0, 0, 0, 0);
+  }
+
   .chat-header__btn--ghost {
     background-color: rgba(0, 0, 0, 0);
   }
@@ -16124,6 +16198,9 @@
   /* 返回键 + 未读角标横排组：占原返回键槽位（角标进布局流，不越按钮盒——App 原生
      渲染裁剪越界子元素）；标题居中基准随左组加宽右移半角标宽（飞书同样不保绝对居中） */
   .chat-header__left {
+    /* 与右侧 .chat-header__actions 同宽 72px：标题保持居中。用 min-width 不用 width ——
+       未读角标进布局流会把左组撑宽（App 原生裁剪越界子元素，定宽会切角标） */
+    min-width: 72px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -17552,6 +17629,16 @@
     line-height: 16px;
     color: #a5a3b0;
     text-align: center;
+  }
+
+  /* 会议邀请：摘要行做成可点的胶囊（紫底），点击直接入会。
+     align-self:center 让底色随文案收成胶囊——.chat-sys 本身是整行 flex 居中，
+     不加这个会变成一条通栏紫带（feat-zq 原样只有内边距，此处补上） */
+  .chat-sys--meeting {
+    align-self: center;
+    padding: 8px 14px;
+    border-radius: 15px;
+    background-color: #efedff;
   }
 
   .chat-bottom-anchor {

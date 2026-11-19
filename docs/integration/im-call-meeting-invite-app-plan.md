@@ -1,11 +1,11 @@
 # App 会议邀请与音视频通话技术方案
 
-日期：2026-11-18
+更新日期：2026-11-19
 基线分支：`feat-zq`（会议模块与通话实现所在分支）
 参考实现：`nuwax-im` 仓库 `feat-video-meeting` 分支（`lib/voip.ts`、`lib/meetingInvite.ts`、`store/call.ts`、`store/meetingInvite.ts`、`ImCallController`）
 状态：方案稿，待评审
 
-> 2026-11-19 对接范围更新。移动端交付单聊语音原生来电字段契约，IM 后端同学负责实现投递。字段、JSON 示例和 iPhone 扩展以[单聊语音来电推送字段（后端对接稿）](../engineering/单聊语音来电字段对照-后端定稿.md)为准。
+> 单聊 VoIP 的语音、视频共用一套字段。移动端提供字段契约，IM 后端同学负责实现投递。字段和请求示例见 [§5.2.2](#522-payload-字段完整清单)。
 
 ---
 
@@ -16,7 +16,7 @@
    - `meeting_invite`：会议邀请，**整场会议有效**，不超时。
 2. 瞬时状态（接听/拒绝/挂断/超时/已处理）走 `MSG_CUSTOM_EVENT(3007)`，由 4 个 REST 端点触发，**不落库、不补发**。
 3. RTC 统一用 LiveKit：1v1 通话与多人会议是**同一个房间概念**，复用 `nunuax-livekit` 插件与 `utils/meeting/meetingMedia.uts`，区别只在房间的创建者与生命周期。
-4. 单聊语音原生来电由 IM 按被叫设备提供 `callRoute`，并在 `payload` 带上完整邀请定位、被叫身份和截止时间。字段见 §5.2.2。
+4. 单聊 VoIP 原生来电由 IM 按被叫设备提供 `callRoute`，并在 `payload` 带上完整邀请定位、被叫身份和截止时间。字段见 §5.2.2。
 5. App 端缺口集中在：协议解析、通话状态机、来电/邀请界面、铃声与音频会话、推送点击路由、消息卡片渲染。
 
 ---
@@ -33,9 +33,9 @@
 | 单聊发起视频通话 | 聊天页「+」/顶栏 | 全屏来电页，接听进入 1v1 视频房间 |
 | 群聊发起语音/视频通话 | 群聊天页「+」 | 群内一条通话卡片（不响铃）+ 被勾选成员收到单聊邀请（响铃） |
 
-### 1.2 本期不包含
+单聊语音和视频按 §5.2.2 共用原生来电契约，分别验收系统来电和接听后的媒体。
 
-- 系统来电的跨平台扩展先验单聊语音，按 §5.2.2 的字段送达，视频和群通话后续单独确认。
+### 1.2 本期不包含
 - 通话中录制、通话记录独立页（首期用消息气泡承载记录）。
 - 会议邀请的「稍后提醒」等日历能力。
 
@@ -89,21 +89,26 @@ Android / iOS / 鸿蒙首批；H5、微信小程序不在本期（无原生推�
 
 ### 2.4 离线推送
 
-服务端现有信封（`UniPushChannel`）：
+服务端现有 `UniPushChannel` 信封。以下为单聊视频邀请作为普通离线通知发送的示例。
 
 ```json
 {
-  "push_clientid": ["..."],
-  "title": "…",
-  "content": "…",
-  "payload": { "convId": "雪花字符串", "convType": 2, "type": "voip|meeting_invite|message", "msgId": "雪花字符串" },
+  "push_clientid": ["example-device-cid"],
+  "title": "视频通话",
+  "content": "张三邀请你视频通话",
+  "payload": {
+    "type": "voip",
+    "convType": 1,
+    "convId": "90001",
+    "msgId": "80001"
+  },
   "category": { "harmony": "IM", "huawei": "IM" },
   "force_notification": true,
   "request_id": "..."
 }
 ```
 
-单聊语音原生来电在此信封上增加 `callRoute`，并补齐 `payload` 字段。普通离线通知可按原会话定位和点击处理。见 §5.2.2。
+单聊 VoIP 原生来电在此信封上增加 `callRoute`，并补齐 `payload` 字段。普通离线通知可按原会话定位和点击处理。见 §5.2.2。
 
 ---
 
@@ -222,7 +227,7 @@ outgoing/incoming ──单方取消──> ended(canceled)
 |---|---|---|
 | App 前台（WS 在线） | 3007 + 消息帧 | 来电页/邀请浮层，无系统通知 |
 | App 后台但进程存活 | 厂商通道 + 在线透传 | Android 系统通知；iOS 由端上补本地通知 |
-| App 无进程 | 普通通知或单聊语音原生来电通道 | 普通通知按点击路由处理。原生来电按 §5.2.2 的 `callRoute` 和 `payload.expiresAt` 验证系统来电 |
+| App 无进程 | 普通通知或单聊 VoIP 原生来电通道 | 普通通知按点击路由处理。原生来电按 §5.2.2 的 `callRoute` 和 `payload.expiresAt` 验证系统来电 |
 | 鸿蒙退后台 | Push Kit | 系统通知；进程被冻结，点击后才恢复 |
 
 **必须做去重**：同一条消息可能同时经 WS 与推送到达，按 `msgId`（通话再叠 `callId`）只处理一次。
@@ -272,11 +277,65 @@ for each 被邀请人:
 
 #### 5.2.1 分类与渠道
 
-由后端根据已登记的被叫设备选择来电能力。单聊语音原生来电使用 `callRoute`；`category` 与 `channelId` 属于具体通知配置，原生来电字段见下一节。
+由后端根据已登记的被叫设备选择来电能力。单聊 VoIP 原生来电使用 `callRoute`；`category` 与 `channelId` 属于具体通知配置，原生来电字段见下一节。
 
 #### 5.2.2 payload 字段（完整清单）
 
-**单聊 VoIP 原生来电。** IM → 云函数新增一个顶层对象 `callRoute`。在现有 `payload` 里补 `callId`、`mediaType`、`calleeId`、`expiresAt`，`displayName` 为展示字段。服务端按消息发送时间计算截止时间；端上用 `convId + msgId` 回查原邀请，接听时读取其中的 RTC 房间名。完整 JSON、字段类型和 iPhone 登记字段见[后端对接稿](../engineering/单聊语音来电字段对照-后端定稿.md)。
+##### 单聊 VoIP（语音与视频）
+
+IM → 云函数新增一个顶层对象 `callRoute`。现有 `payload` 补四个必传字段 `callId`、`mediaType`、`calleeId`、`expiresAt`，`displayName` 默认为可选展示字段。主叫继续以 `msgType="voip"` 和原邀请正文发消息。
+
+下面把 §2.4 的同一条视频邀请发给一台华为安卓设备。语音使用相同格式，`mediaType` 取 `"audio"`。同一邀请发送多台设备时，每台设备各有一份请求，`callId` 和消息定位字段相同。
+
+```json
+{
+  "push_clientid": "example-device-cid",
+  "title": "视频通话",
+  "content": "张三邀请你视频通话",
+  "callRoute": {
+    "platform": "android",
+    "transport": "android-huawei",
+    "cid": "example-device-cid"
+  },
+  "payload": {
+    "type": "voip",
+    "convType": 1,
+    "convId": "90001",
+    "msgId": "80001",
+    "callId": "73cf5bde-74e9-4412-8fa3-c7845542d1c6",
+    "mediaType": "video",
+    "calleeId": "10002",
+    "expiresAt": 1795050060000,
+    "displayName": "张三"
+  }
+}
+```
+
+| 变化 | 字段 | 格式与来源 |
+| --- | --- | --- |
+| 原样复用 | `payload.type`、`convType`、`convId`、`msgId` | `"voip"`、整数 `1`、会话和消息 ID 的十进制字符串。用 `convId + msgId` 回查原邀请。 |
+| 复用设备字段，原生入口改单设备 | `push_clientid`、`title`、`content` | `push_clientid` 用单个字符串，取服务端选中的被叫设备 CID，必须等于 `callRoute.cid`。`title`、`content` 保持字符串。 |
+| **新增顶层对象，原生来电必传** | `callRoute` | 后端从被叫设备登记组装。所有子字段均为字符串，`cid` 为 1–128 位字母、数字、下划线或连字符。Android 的 `platform="android"`，`transport` 取 `android-huawei` 或 `android-honor`。iOS 登记和路由见下表。普通消息和会议请求沿用原信封。 |
+| **在现有 `payload` 补传** | `callId`、`mediaType` | 从原邀请正文复制。当前原生来电支持 1–128 位字母、数字、下划线或连字符组成的 `callId`，已有 UUID 可原样使用。`mediaType` 为小写字符串 `"audio"` 或 `"video"`，按原邀请透传。 |
+| **在现有 `payload` 补传** | `calleeId`、`expiresAt` | `calleeId` 从原消息发送者和单聊关系取对端，以十进制字符串下发。`expiresAt` 取服务端原消息 `sendTime + 60000`，为 Unix 毫秒整数，重试沿用原截止时间。 |
+| 展示字段，建议可选 | `displayName` | 从可信的主叫 `senderName` 映射，原生分支最多保留 80 个字符。若产品要求 iPhone 系统来电首屏展示主叫姓名，双方将其确认成必传。 |
+
+接听时按 `convId + msgId` 回查原邀请的 `roomName`，沿用现有 RTC 凭据接口。云函数为 Android 原生投递附上 `payload.delivery="android-native"`。在线邀请与原生推送均按同一 `callId` 去重。
+
+##### iPhone 被叫（UniPush 路线）
+
+`callRoute` 沿用同一顶层位置，`platform="ios"`、`transport="ios-voip"`、`cid` 仍取当前该设备的 UniPush CID，另外必传下面两项。两项均来自服务端已确认的 PushKit 登记。
+
+| 字段 | 格式与来源 |
+| --- | --- |
+| `callRoute.environment` | 字符串 `development` 或 `production`，以被叫安装包的 APNs 签名环境为准。 |
+| `callRoute.registrationId` | 当前有效的 PushKit 设备登记 UUID，使用小写标准格式。云函数下发为 `payload.routeRegistrationId`。 |
+
+登记归属包含测试账号与设备、`bundleId="com.nuwax.app"`、APNs 环境以及已绑定 PushKit token 的 CID。后端可在现有设备登记上扩展，按登记版本处理更新与撤销。联调按有效 CID 的实际投递与 PushKit 回调验收。
+
+##### 联调状态
+
+截至 11 月 18 日，华为独立透传已观察到冷启动，独立试点当前只接受 `mediaType="audio"`。红米拨 iPhone 16 的实际请求只有 `type="voip"` 和消息定位等普通推送字段，缺少 `callRoute` 和 `callId`。目标 CID 被 UniPush 以 `20001 / target user is invalid` 拒绝，设备状态查询无记录。需先核对有效 CID，再验同一 `callId` 的原生来电投递。视频已通过候选云函数字段校验，锁屏、无进程来电及接听后的双向画面待真机验收。
 
 **meeting_invite**
 
@@ -430,7 +489,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 4 个 calls REST 端点 | ✅ 已有 | 确认 App 鉴权头/平台参数一致 |
 | 3007 事件下发 | ✅ 已有 | 无需改动 |
 | 推送 `payload.type` | ✅ 已有（wire 值） | 无需改动 |
-| 单聊语音原生来电 | 普通推送已有 `convId/convType/type/msgId` | IM 后端按 §5.2.2 提供 `callRoute`，并补四个必传业务字段 |
+| 单聊 VoIP 原生来电 | 普通推送已有 `convId/convType/type/msgId` | IM 后端按 §5.2.2 提供 `callRoute`，并补四个必传业务字段 |
 | 云函数原生来电分支 | 移动端仓已有候选字段校验 | 以实际联调部署验证厂商路由与下行字段 |
 | 推送文案 | 通用会话摘要 | `voip`：「张三邀请你语音通话」；会议：「会议邀请：周会」 |
 | 60 秒 TTL | ✅ 服务端常量 `CALL_RING_TTL_SEC` | 确认离线推送时的过期处理（过期推送到端后不应再响） |
@@ -461,7 +520,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | P0 | 单聊 voip：消息发送/解析、来电页、接听/拒绝/挂断、3007、LiveKit 入房 | 双端在线互通，语音/视频可通话 |
-| P1 | 单聊语音原生来电字段与云函数选路，普通通知点击恢复 | 原生来电从真实拨号验到系统来电页；普通通知点开后按平台处理 |
+| P1 | 单聊语音和视频的原生来电字段与云函数选路，普通通知点击恢复 | 用真实拨号分别验证语音和视频的系统来电页与接听后媒体。普通通知点开后按平台处理 |
 | P2 | 会议邀请：创建/会中加人、邀请浮层、卡片、handled 同步 | 收到邀请可加入会议，多端同步停铃 |
 | P3 | 群通话：群卡片 + 单聊邀请、选人弹窗 | 群内只叫勾选的人，其余人可点卡片加入 |
 | P4 | 体验完善：铃声/震动、音频路由、弱网重连、多设备兜底 | 待定 |
@@ -475,7 +534,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 3. A 打给 B，无人接 → 60 秒后 A 显示「未接听」，B 停止响铃。
 4. A 打给 B，A 在第 5 秒取消 → B 立即停铃（不残留 55 秒）。
 5. B 已有一通通话时 A 再打 → B 不弹窗，消息显示「忙线未接」。
-6. B 无进程且设备完成原生来电登记 → A 发起单聊语音 → B 收到系统来电 → 接听后确认双向语音。普通通知的点击恢复另按实际平台验证。
+6. B 无进程且设备完成原生来电登记。A 分别发起单聊语音和视频，按同一 `callId` 核对投递、原生回调及系统来电页。接听后确认双向语音，视频场景同时确认双向画面。普通通知另验点击恢复。
 7. 同账号 B 两台设备 → 一台接听，另一台立即停铃。
 8. 会议创建时邀请 3 人 → 3 人各收到卡片 + 浮层；1 人加入后其另一台设备停止响铃。
 9. 会中邀请新成员 → 新成员可加入同一房间。

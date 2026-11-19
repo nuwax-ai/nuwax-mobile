@@ -19,17 +19,31 @@ exports.prepareVoip = (body, now = Date.now()) => {
       payload[field] = source[field]
     }
   }
+  // LiveKit room name for calls; the client needs it to join without another round trip.
+  if (source.roomName !== undefined) {
+    if (!matches(source.roomName, /^[A-Za-z0-9._-]{1,128}$/)) return { error: 'invalid voip roomName' }
+    payload.roomName = source.roomName
+  }
   if (source.mediaType !== undefined) {
     if (!['audio', 'video'].includes(source.mediaType)) return { error: 'invalid voip mediaType' }
     payload.mediaType = source.mediaType
   }
-  if (typeof source.displayName === 'string') payload.displayName = Array.from(source.displayName.trim()).slice(0, 80).join('')
+  // senderName is the IM envelope name; displayName is the legacy alias.
+  const displayName = source.displayName ?? source.senderName
+  if (typeof displayName === 'string') payload.displayName = Array.from(displayName.trim()).slice(0, 80).join('')
   let ttl = 60_000
-  if (source.expiresAt !== undefined) {
-    if (!Number.isSafeInteger(source.expiresAt) || source.expiresAt <= 0) return { error: 'invalid voip expiresAt' }
-    if (source.expiresAt <= now) return { expired: true }
-    payload.expiresAt = source.expiresAt
-    ttl = Math.min(ttl, source.expiresAt - now)
+  // The ringing window is either an explicit expiresAt or the IM sendTime + 60s.
+  // Both are forwarded so the client can use its existing expiresAt check.
+  let deadline = source.expiresAt
+  if (Number.isSafeInteger(source.sendTime) && source.sendTime > 0) {
+    payload.sendTime = source.sendTime
+    if (deadline === undefined) deadline = source.sendTime + 60_000
+  }
+  if (deadline !== undefined) {
+    if (!Number.isSafeInteger(deadline) || deadline <= 0) return { error: 'invalid voip expiresAt' }
+    if (deadline <= now) return { expired: true }
+    payload.expiresAt = deadline
+    ttl = Math.min(ttl, deadline - now)
   }
   if (body.settings?.ttl !== undefined) {
     if (!Number.isSafeInteger(body.settings.ttl) || body.settings.ttl <= 0) return { error: 'invalid voip ttl' }
@@ -40,13 +54,20 @@ exports.prepareVoip = (body, now = Date.now()) => {
 
 function prepareCallInvitation(body, now) {
   const source = body.payload
+  const hasDeadline = source != null &&
+    (Object.prototype.hasOwnProperty.call(source, 'expiresAt') ||
+      Object.prototype.hasOwnProperty.call(source, 'sendTime'))
   if (source?.type !== 'voip' || source.convType !== 1 ||
-      !['callId', 'calleeId', 'mediaType', 'expiresAt'].every(field => Object.prototype.hasOwnProperty.call(source, field))) {
+      !['callId', 'calleeId', 'mediaType'].every(field => Object.prototype.hasOwnProperty.call(source, field)) ||
+      !hasDeadline) {
     return { error: 'complete single-chat invitation required' }
   }
   const invitation = exports.prepareVoip(body, now)
   if (invitation.error || invitation.expired) return invitation
-  if (invitation.payload.expiresAt > now + 65_000) return { error: 'invalid invitation window' }
+  // prepareVoip writes expiresAt back after resolving sendTime, so validate the written value.
+  if (!Number.isSafeInteger(invitation.payload.expiresAt) || invitation.payload.expiresAt > now + 65_000) {
+    return { error: 'invalid invitation window' }
+  }
   return invitation
 }
 

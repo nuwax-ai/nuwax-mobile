@@ -84,6 +84,28 @@ describe('native call delivery', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('accepts a scene=call envelope on a verified native route', async () => {
+    const { call, send } = load(source, env);
+    const body = makeBody();
+    const result = await call({ ...body, type: 'voip', channelId: 'VoipCall',
+      payload: { ...body.payload, calleeId: '10002', scene: 'call' } });
+    expect(result.errCode).toBe(0);
+    const args = send.mock.calls[0][0];
+    expect(args.settings.strategy).toEqual({ ios: 2 });
+    expect(args.options.ios.type).toBe('voip');
+    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
+  });
+
+  it('falls back to the ordinary VoIP notice when a scene=call native route is not enabled', async () => {
+    const { call, send } = load();
+    const body = makeBody();
+    const result = await call({ ...body, type: 'voip',
+      payload: { ...body.payload, calleeId: '10002', scene: 'call' } });
+    expect(result.errCode).toBe(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].settings).not.toHaveProperty('strategy');
+  });
+
   it('fails closed for mixed devices, wrong platform, invalid invites, missing configuration and wrong signed environment', async () => {
     const { call, send } = load(source, env);
     const body = makeBody();
@@ -179,6 +201,80 @@ describe('IM invitation scenes', () => {
       expect((await call({ ...envelope, payload: { ...callPayload(), ...changes } })).errCode).toBe(400);
     }
     expect((await call({ ...envelope, payload: { ...callPayload(), expiresAt: Date.now() - 1 } })).data.skipped).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+
+describe('envelope type and scene-driven notification config', () => {
+  const envelope = { push_clientid: ['fixture-cid-1', 'fixture-cid-2'], title: '张三', content: '邀请你通话' };
+  const callFields = () => ({ convId: '245475557381246976', msgId: '245475557381246977', scene: 'call', convType: 1,
+    callId: 'fixture-call', calleeId: '10002', mediaType: 'audio', roomName: 'im-90001-live', senderName: '张三' });
+  const meetingFields = () => ({ convId: '245475557381246976', msgId: '245475557381246977', scene: 'meeting', convType: 2,
+    inviteId: 'mi-fixture', roomName: '123456789', title: '周会', mediaType: 'video', senderName: '张三',
+    silent: false, groupCall: false });
+
+  it('backfills payload.type from the envelope type and resolves the sendTime window', async () => {
+    const { call, send } = load();
+    const sendTime = Date.now() - 5_000;
+    const { scene, senderName, ...expected } = callFields();
+    const result = await call({ ...envelope, type: 'voip', channelId: 'VoipCall', payload: { ...callFields(), sendTime } });
+    expect(result.errCode).toBe(0);
+    const args = send.mock.calls[0][0];
+    expect(args.payload).toEqual({ ...expected, type: 'voip', displayName: '张三', sendTime, expiresAt: sendTime + 60_000 });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
+    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
+    expect(args.settings.ttl).toBeLessThanOrEqual(60_000);
+  });
+
+  it('merges the VoipCall channel with vendor badge options instead of overwriting them', async () => {
+    const { call, send } = load();
+    await call({ ...envelope, type: 'voip', channelId: 'VoipCall', badge: 120,
+      payload: { ...callFields(), expiresAt: Date.now() + 30_000 } });
+    const hardware = send.mock.calls[0][0].options.android.HW;
+    expect(hardware).toMatchObject({
+      '/message/android/notification/badge/class': 'io.dcloud.uniapp.UniAppActivity',
+      '/message/android/notification/badge/set_num': 99,
+      '/message/android/notification/channel_id': 'VoipCall',
+    });
+    expect(send.mock.calls[0][0].options.harmony.HW['/payload/notification/badge']).toEqual({ setNum: 99 });
+  });
+
+  it('keeps meeting invitations on IM classification without a VoIP channel', async () => {
+    const { call, send } = load();
+    await call({ ...envelope, type: 'voip', channelId: 'VoipCall',
+      category: { harmony: 'VOIP', huawei: 'VOIP' }, payload: meetingFields() });
+    const args = send.mock.calls[0][0];
+    expect(args.payload.type).toBe('meeting_invite');
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args).not.toHaveProperty('options');
+  });
+
+  it('leaves ordinary IM message envelopes untouched by the VoIP channel and type fields', async () => {
+    const { call, send } = load();
+    const payload = { convId: '123', convType: 2, type: 'text' };
+    await call({ ...envelope, type: 'message', channelId: 'VoipCall', category: { harmony: 'IM' }, payload });
+    const args = send.mock.calls[0][0];
+    expect(args.payload).toEqual(payload);
+    expect(args.category).toEqual({ harmony: 'IM' });
+    expect(args).not.toHaveProperty('options');
+    expect(args).not.toHaveProperty('settings');
+  });
+
+  it('does not treat an IM wire type at the envelope level as a call envelope', async () => {
+    const { call, send } = load();
+    const payload = { convId: '123', convType: 1 };
+    await call({ ...envelope, type: 'voip', payload });
+    const args = send.mock.calls[0][0];
+    expect(args.payload).toEqual(payload);
+    expect(args.category).toEqual({ harmony: 'IM' });
+    expect(args).not.toHaveProperty('settings');
+    expect(args).not.toHaveProperty('options');
+  });
+
+  it('skips a scene=call invitation whose sendTime window has elapsed', async () => {
+    const { call, send } = load();
+    const result = await call({ ...envelope, type: 'voip', payload: { ...callFields(), sendTime: Date.now() - 61_000 } });
+    expect(result.data.skipped).toBe(true);
     expect(send).not.toHaveBeenCalled();
   });
 });

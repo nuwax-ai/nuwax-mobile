@@ -20,6 +20,61 @@ const DEBUG_MESSAGE_CONTENT = process.env.PUSH_DEBUG_MESSAGE_CONTENT === '1'
 // ★华为/小米等 Android 通道的 category 是「自分类权益」，必须先在厂商后台申请到该分类才能传，
 //   未申请就传可能被拒或降级 —— 所以我们只默认给 harmony，其余通道留给后端按需显式覆盖。
 const DEFAULT_CATEGORY = { harmony: 'IM' }
+// 通话与会议的通知分类/渠道由场景决定，不再沿用调用方传入值：
+//   通话 → VOIP（华为需已申请自分类权益）+ 华为 VoipCall 通知渠道
+//   会议 → IM（会议邀请是普通消息，不能用 VOIP）
+const IM_CATEGORY = { harmony: 'IM', huawei: 'IM' }
+const CALL_CATEGORY = { harmony: 'VOIP', huawei: 'VOIP' }
+// ★uni-push sendMessage 没有顶层 channelId 字段，Android 通知渠道只能走 options 厂商透传。
+//   官方 options.md 明确给出的是华为 /message/android/notification/channel_id；
+//   小米 /extra.channel_id 是「小米后台申请的通知类别 id」，与端上渠道名不是一回事，
+//   未确认前不下发，避免整批被厂商拒。
+const VOIP_CHANNEL = 'VoipCall'
+
+/**
+ * 新契约允许后端只传顶层 type="voip"，payload.type 由云函数回填。
+ * ★只在 payload.type 缺失、顶层显式声明 voip，且 payload 带通话/会议标识时补。
+ *   加了 scene/callId/calleeId 这一层是为了防止后端把「消息 wire type」放在顶层 type：
+ *   一条 msgType=voip 的 IM 消息若被误回填，会走邀请通道并被重写 payload。
+ *   IM 普通消息的 payload 只有 convId/convType，不会命中这个条件。
+ */
+function withEnvelopeType(body) {
+  const payload = body.payload
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return body
+  if (payload.type !== undefined) return body
+  if (body.type !== 'voip') return body
+  const looksLikeVoip = payload.scene === 'call' || payload.scene === 'meeting' ||
+    payload.callId !== undefined || payload.calleeId !== undefined
+  if (!looksLikeVoip) return body
+  return Object.assign({}, body, { payload: Object.assign({}, payload, { type: 'voip' }) })
+}
+
+/** 只有白名单渠道名才下发，避免调用方注入任意通知渠道。 */
+function buildChannelOptions(channelId) {
+  if (channelId !== VOIP_CHANNEL) return null
+  return {
+    android: {
+      HW: { '/message/android/notification/channel_id': VOIP_CHANNEL }
+    }
+  }
+}
+
+/** 厂商角标 options 与通话渠道 options 必须合并，直接赋值会互相覆盖。 */
+function mergeOptions(base, extra) {
+  if (base == null) return extra
+  if (extra == null) return base
+  const out = Object.assign({}, base, extra)
+  const android = Object.assign({}, base.android || {})
+  for (const key of Object.keys(extra.android || {})) {
+    android[key] = Object.assign({}, android[key] || {}, extra.android[key])
+  }
+  if (Object.keys(android).length) out.android = android
+  out.ios = Object.assign({}, base.ios || {}, extra.ios || {})
+  if (!Object.keys(out.ios).length) delete out.ios
+  out.harmony = Object.assign({}, base.harmony || {}, extra.harmony || {})
+  if (!Object.keys(out.harmony).length) delete out.harmony
+  return out
+}
 
 const uniPush = uniCloud.getPushManager({ appId: APP_ID })
 
@@ -232,12 +287,18 @@ exports.main = async (event) => {
   }
 
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { errCode: 400, errMsg: 'invalid request body' }
+  // 顶层 type="voip" 是通话/会议的显式声明；payload.type 缺失时由云函数回填。
+  body = withEnvelopeType(body)
   const scene = prepareVoipScene(body)
   if (scene?.error) return { errCode: 400, errMsg: scene.error }
   if (scene?.meeting && JSON.stringify(scene.meeting).length > MAX_PAYLOAD) {
     return { errCode: 400, errMsg: 'meeting invitation payload too large' }
   }
-  const nativeVoip = scene ? null : prepareNativeVoip(body)
+  // 会议邀请永远走普通 IM 通道；通话带 callRoute 时优先单设备原生投递。
+  // ★scene="call" 下 callRoute 只是增强：设备路由不完整时回退普通 VOIP 通知，
+  //   不能因为多设备或平台不匹配把整条通话邀请拒掉。
+  const nativeAttempt = scene?.meeting ? null : prepareNativeVoip(body)
+  const nativeVoip = nativeAttempt?.error && scene?.call ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
     if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }
@@ -246,33 +307,41 @@ exports.main = async (event) => {
     const enabled = route.transport === 'ios-voip'
       ? process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT === route.environment
       : (process.env.NUWAX_VOIP_ANDROID_TRANSPORTS || '').split(',').includes(route.transport)
-    if (!enabled) return { errCode: 503, errMsg: 'call transport unavailable' }
-    try {
-      const result = await uniPush.sendMessage({
-        push_clientid: [body.callRoute.cid],
-        title: clip(body.title, MAX_TITLE),
-        content: clip(body.content, MAX_CONTENT),
-        payload: nativeVoip.payload,
-        settings: nativeVoip.settings,
-        force_notification: false,
-        request_id: nativeVoip.requestId,
-        ...(nativeVoip.options ? { options: nativeVoip.options } : {})
-      })
-      const errCode = result?.errCode ?? -1
-      const details = result?.data && typeof result.data === 'object'
-        ? Object.entries(result.data).filter(([key, value]) =>
-          /^[A-Za-z0-9_-]{10,128}$/.test(key) && key !== route.cid &&
-          value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, route.cid))
-        : []
-      const tasks = details.map(([taskId, targets]) => {
-        const status = targets[route.cid]
-        return { taskId, status: typeof status === 'string' && /^[A-Za-z0-9_-]{1,50}$/.test(status) ? status : 'unknown' }
-      })
-      console.log('[push-send] call transport', body.callRoute.transport, nativeVoip.payload.callId, nativeVoip.requestId, errCode)
-      return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
-    } catch {
-      console.error('[push-send] call transport failed', nativeVoip.requestId)
-      return { errCode: -1, data: { requestId: nativeVoip.requestId } }
+    if (!enabled) {
+      // scene="call" 的 callRoute 只是增强：通道没配好时回退下面的普通 VOIP 通知，
+      // 不能因为原生通道未启用把整条通话邀请拒掉（无 scene 的定向请求仍 fail-closed）。
+      if (!scene?.call) return { errCode: 503, errMsg: 'call transport unavailable' }
+    } else {
+      const nativeChannelOptions = buildChannelOptions(body.channelId)
+      const nativeOptions = mergeOptions(nativeVoip.options, nativeChannelOptions)
+      try {
+        const result = await uniPush.sendMessage({
+          push_clientid: [body.callRoute.cid],
+          title: clip(body.title, MAX_TITLE),
+          content: clip(body.content, MAX_CONTENT),
+          payload: nativeVoip.payload,
+          settings: nativeVoip.settings,
+          category: CALL_CATEGORY,
+          force_notification: false,
+          request_id: nativeVoip.requestId,
+          ...(nativeOptions ? { options: nativeOptions } : {})
+        })
+        const errCode = result?.errCode ?? -1
+        const details = result?.data && typeof result.data === 'object'
+          ? Object.entries(result.data).filter(([key, value]) =>
+            /^[A-Za-z0-9_-]{10,128}$/.test(key) && key !== route.cid &&
+            value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, route.cid))
+          : []
+        const tasks = details.map(([taskId, targets]) => {
+          const status = targets[route.cid]
+          return { taskId, status: typeof status === 'string' && /^[A-Za-z0-9_-]{1,50}$/.test(status) ? status : 'unknown' }
+        })
+        console.log('[push-send] call transport', body.callRoute.transport, nativeVoip.payload.callId, nativeVoip.requestId, errCode)
+        return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
+      } catch {
+        console.error('[push-send] call transport failed', nativeVoip.requestId)
+        return { errCode: -1, data: { requestId: nativeVoip.requestId } }
+      }
     }
   }
 
@@ -289,12 +358,18 @@ exports.main = async (event) => {
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
   const payload = attachBadgeToPayload(voip?.payload ?? scene?.meeting ?? normalizePayload(body.payload), body.badge)
+  // 分类按场景定：会议强制 IM、通话强制 VOIP；普通 IM 消息保持后端传入/默认值不变。
   const category = scene?.meeting
-    ? { harmony: 'IM', huawei: 'IM' }
-    : body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
+    ? IM_CATEGORY
+    : scene?.call
+      ? CALL_CATEGORY
+      : body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
   const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)
+  // 通话才下发华为 VoipCall 渠道；会议与普通消息不传 channelId。
+  const channelOptions = scene?.call ? buildChannelOptions(body.channelId) : null
+  const sendOptions = mergeOptions(vendorBadgeOptions, channelOptions)
 
   // 运维日志：证明「后端确实调了云函数」，并回显本次下发的关键参数
   // （uniCloud 控制台 → 云函数 push-send → 日志）。
@@ -351,8 +426,9 @@ exports.main = async (event) => {
     }
     // ★Android 厂商离线角标：华为走 Push Kit 原生字段，系统侧直接写桌面图标，
     //   全程不依赖 App 进程（验收场景 C：进程被杀仍要显示数字）。
-    if (vendorBadgeOptions != null) {
-      args.options = vendorBadgeOptions
+    //   通话的 VoipCall 渠道已合并进同一份 options，避免覆盖角标字段。
+    if (sendOptions != null) {
+      args.options = sendOptions
     }
     try {
       const res = await uniPush.sendMessage(args)

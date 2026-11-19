@@ -172,6 +172,8 @@ const strategies = {
   // Samsung devices with Google Play services can register for FCM, a separate transport.
   'android-fcm': null,
 }
+// The UniPush UPS pure-transmission request is documented for Huawei Android.
+const nativeStrategies = new Set(['ios', 'hw'])
 const registrationId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 // One authenticated IM route per request. No caller-controlled vendor options or broadcast target.
@@ -180,8 +182,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const route = body.callRoute
   if (!route || typeof route.transport !== 'string' || !Object.prototype.hasOwnProperty.call(strategies, route.transport)) return { error: 'unsupported call route' }
   const strategy = strategies[route.transport]
-  // FCM and HarmonyOS need dedicated delivery paths before they can be used for calls.
-  if (strategy === null || strategy === 'hoshw') return { error: 'native call transport unavailable' }
+  if (!nativeStrategies.has(strategy)) return { error: 'native call transport unavailable' }
   const ios = strategy === 'ios'
   if (route.platform !== (ios ? 'ios' : 'android') ||
       !isCallCid(route.cid) || body.push_clientid !== route.cid) return { error: 'one matching call device is required' }

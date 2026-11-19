@@ -278,19 +278,40 @@ function callTransportEnabled(route) {
 }
 
 async function sendNativeVoip(body, route, nativeVoip) {
-  const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+  const android = route.platform === 'android'
+  if (android && typeof uniPush.request !== 'function') {
+    return { errCode: 503, errMsg: 'UniPush transmission adapter unavailable', data: { requestId: nativeVoip.requestId } }
+  }
   try {
-    const result = await uniPush.sendMessage({
-      push_clientid: [route.cid],
-      title: clip(body.title, MAX_TITLE),
-      content: clip(body.content, MAX_CONTENT),
-      payload: nativeVoip.payload,
-      settings: nativeVoip.settings,
-      category: CALL_CATEGORY,
-      force_notification: false,
-      request_id: nativeVoip.requestId,
-      ...(nativeOptions ? { options: nativeOptions } : {})
-    })
+    let result
+    if (android) {
+      const transmission = JSON.stringify({ unipush_version: '2.0', payload: nativeVoip.payload })
+      // sendMessage builds ups.notification even when force_notification is false.
+      result = await uniPush.request({
+        method: 'POST',
+        module: '/push/single/cid',
+        requestData: {
+          request_id: nativeVoip.requestId,
+          audience: { cid: [route.cid] },
+          settings: nativeVoip.settings,
+          push_message: { transmission },
+          push_channel: { android: { ups: { transmission } } }
+        }
+      })
+    } else {
+      const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+      result = await uniPush.sendMessage({
+        push_clientid: [route.cid],
+        title: clip(body.title, MAX_TITLE),
+        content: clip(body.content, MAX_CONTENT),
+        payload: nativeVoip.payload,
+        settings: nativeVoip.settings,
+        category: CALL_CATEGORY,
+        force_notification: false,
+        request_id: nativeVoip.requestId,
+        ...(nativeOptions ? { options: nativeOptions } : {})
+      })
+    }
     const errCode = result?.errCode ?? -1
     const details = result?.data && typeof result.data === 'object'
       ? Object.entries(result.data).filter(([key, value]) =>
@@ -324,7 +345,7 @@ async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting)
     const nativeVoip = prepareNativeVoip({ ...body, push_clientid: cid, payload: invitation.payload, callRoute: route }, now)
     if (!nativeVoip.error && callTransportEnabled(route)) {
       const sent = await sendNativeVoip(body, route, nativeVoip)
-      return { ...result, errCode: sent.errCode, delivery: 'native', transport: route.transport, ...sent.data }
+      return { ...result, errCode: sent.errCode, errMsg: sent.errMsg, delivery: 'native', transport: route.transport, ...sent.data }
     }
   }
 
@@ -391,16 +412,15 @@ exports.main = async (event) => {
   // 会议响铃：走原生来电通道（PushKit / 全屏 Intent / 前台服务），让熄屏和进程被杀时
   // 也能亮屏、响铃并出现来电卡片。端上原生能力就绪前用环境变量关闭，保持普通 IM 通知。
   // silent=true 的群卡片、以及没有 callRoute/设备路由来源的请求，一律不响铃。
+  const lookupRoutes = process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1'
   const meetingRinging = scene?.meeting != null &&
     body.payload?.silent !== true &&
     process.env.NUWAX_VOIP_MEETING_RING === '1' &&
-    (body.callRoute != null || process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1')
+    (body.callRoute != null || lookupRoutes)
   const strictCids = scene?.call != null || meetingRinging
-
-  // 通话带 callRoute 时优先单设备原生投递；会议只有开启响铃时才进原生通道。
-  // ★scene="call"/会议响铃下 callRoute 只是增强：设备路由不完整时回退普通通知，
-  //   不能因为多设备或平台不匹配把整条邀请拒掉。
-  const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
+  // 通话/会议响铃开启 CID 查询时，以设备登记绑定为准，忽略调用方的 callRoute。
+  const useDeviceRoutes = strictCids && lookupRoutes
+  const nativeAttempt = (scene?.meeting && !meetingRinging) || useDeviceRoutes ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
@@ -425,16 +445,15 @@ exports.main = async (event) => {
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
-  if (meetingRinging) {
-    const ringInvitation = prepareMeetingRingInvitation(body)
-    if (ringInvitation.error) return { errCode: 400, errMsg: ringInvitation.error }
-    if (ringInvitation.expired) {
-      return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
-    }
-    if (process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1') {
+  if (useDeviceRoutes) {
+    if (meetingRinging) {
+      const ringInvitation = prepareMeetingRingInvitation(body)
+      if (ringInvitation.error) return { errCode: 400, errMsg: ringInvitation.error }
+      if (ringInvitation.expired) {
+        return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
+      }
       return sendRegisteredCalls(body, ids, ringInvitation, scene.meeting)
     }
-  } else if (scene?.call && process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1') {
     return sendRegisteredCalls(body, ids, scene.call, null)
   }
   return sendOrdinaryPush(body, ids, voip, scene?.meeting, scene?.call != null)

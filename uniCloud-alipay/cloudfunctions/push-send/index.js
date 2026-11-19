@@ -2,6 +2,7 @@
 
 const crypto = require('crypto')
 const { prepareVoip, prepareNativeVoip, prepareVoipScene } = require('./voip')
+const { callTargetCids, loadDeviceRoutes, routeForCid } = require('./device-routes')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -270,6 +271,95 @@ function attachBadgeToPayload(payload, badge) {
   return JSON.stringify(out).length <= MAX_PAYLOAD ? out : payload
 }
 
+function callTransportEnabled(route) {
+  return route.transport === 'ios-voip'
+    ? process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT === route.environment
+    : (process.env.NUWAX_VOIP_ANDROID_TRANSPORTS || '').split(',').includes(route.transport)
+}
+
+async function sendNativeVoip(body, route, nativeVoip) {
+  const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+  try {
+    const result = await uniPush.sendMessage({
+      push_clientid: [route.cid],
+      title: clip(body.title, MAX_TITLE),
+      content: clip(body.content, MAX_CONTENT),
+      payload: nativeVoip.payload,
+      settings: nativeVoip.settings,
+      category: CALL_CATEGORY,
+      force_notification: false,
+      request_id: nativeVoip.requestId,
+      ...(nativeOptions ? { options: nativeOptions } : {})
+    })
+    const errCode = result?.errCode ?? -1
+    const details = result?.data && typeof result.data === 'object'
+      ? Object.entries(result.data).filter(([key, value]) =>
+        /^[A-Za-z0-9_-]{10,128}$/.test(key) && key !== route.cid &&
+        value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, route.cid))
+      : []
+    const tasks = details.map(([taskId, targets]) => {
+      const status = targets[route.cid]
+      return { taskId, status: typeof status === 'string' && /^[A-Za-z0-9_-]{1,50}$/.test(status) ? status : 'unknown' }
+    })
+    console.log('[push-send] call transport', route.transport, nativeVoip.payload.callId, nativeVoip.requestId, errCode)
+    return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
+  } catch {
+    console.error('[push-send] call transport failed', nativeVoip.requestId)
+    return { errCode: -1, data: { requestId: nativeVoip.requestId } }
+  }
+}
+
+async function sendCallToDevice(body, invitation, cid, binding) {
+  const { calleeId, callId, expiresAt } = invitation.payload
+  const result = { clientid: cid }
+  if (binding && (binding.active !== true || binding.appId !== APP_ID || binding.calleeId !== calleeId)) {
+    return { ...result, errCode: 403, errMsg: 'device binding unavailable for callee' }
+  }
+
+  const now = Date.now()
+  if (expiresAt <= now) return { ...result, errCode: 0, skipped: true }
+
+  if (binding?.transport) {
+    const route = routeForCid(binding, cid)
+    const nativeVoip = prepareNativeVoip({ ...body, push_clientid: cid, payload: invitation.payload, callRoute: route }, now)
+    if (!nativeVoip.error && callTransportEnabled(route)) {
+      const sent = await sendNativeVoip(body, route, nativeVoip)
+      return { ...result, errCode: sent.errCode, delivery: 'native', transport: route.transport, ...sent.data }
+    }
+  }
+
+  const notice = prepareVoip({ ...body, payload: invitation.payload }, now)
+  // Each fallback has its own provider request ID, even if IM supplied a batch ID.
+  const requestId = crypto.createHash('sha256')
+    .update(JSON.stringify(['voip-notification', cid, callId]))
+    .digest('hex').slice(0, 32)
+  const sent = await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], notice, null, true)
+  return { ...result, errCode: sent.data.results[0]?.errCode ?? -1, delivery: 'notification', requestId }
+}
+
+async function sendRegisteredCalls(body, ids, invitation) {
+  let bindings
+  try {
+    bindings = await loadDeviceRoutes(uniCloud.database(), ids)
+  } catch {
+    console.error('[push-send] voip device route lookup failed', invitation.payload.callId)
+    return { errCode: 503, errMsg: 'device route lookup unavailable' }
+  }
+
+  const results = []
+  const concurrency = 8
+  for (let i = 0; i < ids.length; i += concurrency) {
+    const chunk = ids.slice(i, i + concurrency)
+    results.push(...await Promise.all(chunk.map(cid => sendCallToDevice(body, invitation, cid, bindings.get(cid)))))
+  }
+  const failed = results.find(entry => entry.errCode !== 0)
+  return {
+    errCode: failed?.errCode ?? 0,
+    errMsg: failed ? 'call delivery failed for some devices' : 'ok',
+    data: { total: ids.length, results }
+  }
+}
+
 exports.main = async (event) => {
   if (!verifySign(event)) {
     console.error('[push-send] rejected: invalid sign')
@@ -304,71 +394,48 @@ exports.main = async (event) => {
     if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }
     if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
     const route = body.callRoute
-    const enabled = route.transport === 'ios-voip'
-      ? process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT === route.environment
-      : (process.env.NUWAX_VOIP_ANDROID_TRANSPORTS || '').split(',').includes(route.transport)
-    if (!enabled) {
+    if (!callTransportEnabled(route)) {
       // scene="call" 的 callRoute 只是增强：通道没配好时回退下面的普通 VOIP 通知，
       // 不能因为原生通道未启用把整条通话邀请拒掉（无 scene 的定向请求仍 fail-closed）。
       if (!scene?.call) return { errCode: 503, errMsg: 'call transport unavailable' }
     } else {
-      const nativeChannelOptions = buildChannelOptions(body.channelId)
-      const nativeOptions = mergeOptions(nativeVoip.options, nativeChannelOptions)
-      try {
-        const result = await uniPush.sendMessage({
-          push_clientid: [body.callRoute.cid],
-          title: clip(body.title, MAX_TITLE),
-          content: clip(body.content, MAX_CONTENT),
-          payload: nativeVoip.payload,
-          settings: nativeVoip.settings,
-          category: CALL_CATEGORY,
-          force_notification: false,
-          request_id: nativeVoip.requestId,
-          ...(nativeOptions ? { options: nativeOptions } : {})
-        })
-        const errCode = result?.errCode ?? -1
-        const details = result?.data && typeof result.data === 'object'
-          ? Object.entries(result.data).filter(([key, value]) =>
-            /^[A-Za-z0-9_-]{10,128}$/.test(key) && key !== route.cid &&
-            value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, route.cid))
-          : []
-        const tasks = details.map(([taskId, targets]) => {
-          const status = targets[route.cid]
-          return { taskId, status: typeof status === 'string' && /^[A-Za-z0-9_-]{1,50}$/.test(status) ? status : 'unknown' }
-        })
-        console.log('[push-send] call transport', body.callRoute.transport, nativeVoip.payload.callId, nativeVoip.requestId, errCode)
-        return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
-      } catch {
-        console.error('[push-send] call transport failed', nativeVoip.requestId)
-        return { errCode: -1, data: { requestId: nativeVoip.requestId } }
-      }
+      return sendNativeVoip(body, route, nativeVoip)
     }
   }
 
-  const ids = Array.isArray(body.push_clientid) ? body.push_clientid : [body.push_clientid]
-  if (!ids.length || !ids[0]) return { errCode: 400, errMsg: 'push_clientid required' }
+  const ids = scene?.call
+    ? callTargetCids(body.push_clientid)
+    : Array.isArray(body.push_clientid) ? body.push_clientid : [body.push_clientid]
+  if (!ids?.length || !ids[0]) return { errCode: 400, errMsg: 'push_clientid required' }
   if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
 
   const voip = scene ? scene.call : prepareVoip(body)
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
+  if (scene?.call && process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1') {
+    return sendRegisteredCalls(body, ids, scene.call)
+  }
+  return sendOrdinaryPush(body, ids, voip, scene?.meeting, scene?.call != null)
+}
+
+async function sendOrdinaryPush(body, ids, voip, meeting, callScene) {
   // 长度限制：厂商通道会静默截断甚至拒绝，这里先按官方上限裁好（按码点裁，不切坏 emoji）
   const title = clip(body.title, MAX_TITLE)
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
-  const payload = attachBadgeToPayload(voip?.payload ?? scene?.meeting ?? normalizePayload(body.payload), body.badge)
+  const payload = attachBadgeToPayload(voip?.payload ?? meeting ?? normalizePayload(body.payload), body.badge)
   // 分类按场景定：会议强制 IM、通话强制 VOIP；普通 IM 消息保持后端传入/默认值不变。
-  const category = scene?.meeting
+  const category = meeting
     ? IM_CATEGORY
-    : scene?.call
+    : callScene
       ? CALL_CATEGORY
       : body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
   const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)
   // 通话才下发华为 VoipCall 渠道；会议与普通消息不传 channelId。
-  const channelOptions = scene?.call ? buildChannelOptions(body.channelId) : null
+  const channelOptions = callScene ? buildChannelOptions(body.channelId) : null
   const sendOptions = mergeOptions(vendorBadgeOptions, channelOptions)
 
   // 运维日志：证明「后端确实调了云函数」，并回显本次下发的关键参数

@@ -4,22 +4,31 @@ import { resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
-const directory = resolve(import.meta.dirname, '../../uniCloud-alipay/cloudfunctions/push-send');
-const require = createRequire(`${directory}/index.js`);
-const { prepareVoip } = require('./voip');
-const source = readFileSync(`${directory}/index.js`, 'utf8');
+const latestEntry = resolve(import.meta.dirname, '../../uniCloud-alipay/cloudfunctions/push-send/index.js');
+const backupEntry = resolve(import.meta.dirname, '../../backups/unicloud/push-send/v1.3.7/index.js');
+const entries = [backupEntry, latestEntry] as const;
+const { prepareVoip } = createRequire(latestEntry)('./voip');
 // Golden send arguments/responses captured from merged feat-2026.11 baseline 32882b4 before the local VoIP patch.
 const ordinaryFixtures = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures/push-send-ordinary.json'), 'utf8'));
 const now = 1_793_000_000_000;
 const locator = { type: 'voip', convId: '245475557381246976', msgId: '9223372036854775807' };
 
-function load(code = source, env: Record<string, string> = {}) {
+function load(entry = latestEntry, env: Record<string, string> = {}, routes: Record<string, unknown>[] = []) {
   const send = vi.fn().mockResolvedValue({ errCode: 0, data: { accepted: true } });
+  const query = {
+    where: vi.fn((filter: { _id: string[] }) => {
+      const selected = routes.filter(route => filter._id.includes(String(route._id)));
+      return { field: () => ({ limit: () => ({ get: async () => ({ data: selected }) }) }) };
+    }),
+  };
+  const collection = vi.fn(() => query);
+  const database = vi.fn(() => ({ collection, command: { in: (ids: string[]) => ids } }));
   const module = { exports: {} as any };
-  runInNewContext(code, { exports: module.exports, require, Buffer,
+  runInNewContext(readFileSync(entry, 'utf8'), { filename: entry, exports: module.exports, require: createRequire(entry), Buffer,
     process: { env: { PUSH_SIGN_KEY: 'fixture-only-sign', ...env } },
-    uniCloud: { getPushManager: () => ({ sendMessage: send }) }, console: { log() {}, error() {} } });
-  return { send, call: (body: any, sign = 'fixture-only-sign') => module.exports.main({ headers: { 'x-push-sign': sign }, body: JSON.stringify(body) }) };
+    uniCloud: { database, getPushManager: () => ({ sendMessage: send }) }, console: { log() {}, error() {} } });
+  return { send, database, collection, query,
+    call: (body: any, sign = 'fixture-only-sign') => module.exports.main({ headers: { 'x-push-sign': sign }, body: JSON.stringify(body) }) };
 }
 
 describe('native call delivery', () => {
@@ -33,7 +42,7 @@ describe('native call delivery', () => {
   });
 
   it('sends the real iOS VoIP options to one device and returns only its provider task status', async () => {
-    const { call, send } = load(source, env);
+    const { call, send } = load(latestEntry, env);
     const body = makeBody();
     send.mockResolvedValueOnce({ errCode: 0, data: { 'task-fixture-123': { [cid]: 'successed_offline', 'other-cid': 'successed_online' } } });
     const result = await call({ ...body, payload: { ...body.payload, token: 'secret' }, badge: 12, options: { ios: { type: 'notify' } } });
@@ -64,7 +73,7 @@ describe('native call delivery', () => {
     expect((await disabled.call(request)).errCode).toBe(503);
     expect(disabled.send).not.toHaveBeenCalled();
 
-    const { call, send } = load(source, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
+    const { call, send } = load(latestEntry, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
     expect((await call(request)).errCode).toBe(0);
     expect(send.mock.calls[0][0]).toMatchObject({
       settings: { ttl: 2000, strategy: { [key]: 2 } },
@@ -78,14 +87,14 @@ describe('native call delivery', () => {
     ['harmony-huawei', 'android'],
     ['android-fcm', 'android'],
   ])('keeps %s unavailable for native calls on %s', async (transport, platform) => {
-    const { call, send } = load(source, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
+    const { call, send } = load(latestEntry, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
     const result = await call({ ...makeBody(), callRoute: { cid, platform, transport } });
     expect(result).toEqual({ errCode: 400, errMsg: 'native call transport unavailable' });
     expect(send).not.toHaveBeenCalled();
   });
 
   it('accepts a scene=call envelope on a verified native route', async () => {
-    const { call, send } = load(source, env);
+    const { call, send } = load(latestEntry, env);
     const body = makeBody();
     const result = await call({ ...body, type: 'voip', channelId: 'VoipCall',
       payload: { ...body.payload, calleeId: '10002', scene: 'call' } });
@@ -107,7 +116,7 @@ describe('native call delivery', () => {
   });
 
   it('fails closed for mixed devices, wrong platform, invalid invites, missing configuration and wrong signed environment', async () => {
-    const { call, send } = load(source, env);
+    const { call, send } = load(latestEntry, env);
     const body = makeBody();
     expect((await call(body, 'bad-sign')).errCode).toBe(401);
     expect((await call({ ...body, push_clientid: [cid, 'other'] })).errCode).toBe(400);
@@ -165,22 +174,29 @@ describe('IM invitation scenes', () => {
     title: '周会', mediaType: 'audio', senderName: '张三', silent: true, groupCall: true, passcode: '1234' };
 
   it('keeps the meeting on IM notifications even when the input has a VoIP category or route', async () => {
-    const { call, send } = load();
+    const { call, send, database } = load(latestEntry, { NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1' });
+    const backup = load(backupEntry);
     const { scene, ...expected } = meetingFields;
-    const result = await call({
+    const request = {
       ...envelope, category: { harmony: 'VOIP', huawei: 'VOIP' }, callRoute: { transport: 'ios-voip' },
       payload: { ...meetingFields, expiresAt: 1, accessToken: 'fixture-extra' },
-    });
+    };
+    const result = await call(request);
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
     expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
     expect(args).not.toHaveProperty('settings');
     expect(args).not.toHaveProperty('options');
+    expect(database).not.toHaveBeenCalled();
+    expect((await backup.call(request)).errCode).toBe(0);
+    expect(backup.send.mock.calls[0][0]).toMatchObject({
+      payload: { type: 'voip', scene: 'meeting' }, category: request.category,
+    });
   });
 
   it('passes the call deadline and recipient through the ordinary fallback pending a verified route', async () => {
-    const { call, send } = load(source, { NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei' });
+    const { call, send } = load(latestEntry, { NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei' });
     const payload = callPayload();
     expect((await call({
       ...envelope, callRoute: { platform: 'android', transport: 'android-huawei', cid: envelope.push_clientid[0] },
@@ -197,10 +213,16 @@ describe('IM invitation scenes', () => {
 
   it('rejects unknown scenes and incomplete calls and skips expired calls before sending', async () => {
     const { call, send } = load();
+    const backup = load(backupEntry);
     for (const changes of [{ scene: 'unknown' }, { convType: 2 }, { calleeId: undefined }, { expiresAt: undefined }]) {
-      expect((await call({ ...envelope, payload: { ...callPayload(), ...changes } })).errCode).toBe(400);
+      const request = { ...envelope, payload: { ...callPayload(), ...changes } };
+      expect((await backup.call(request)).errCode).toBe(0);
+      expect((await call(request)).errCode).toBe(400);
     }
-    expect((await call({ ...envelope, payload: { ...callPayload(), expiresAt: Date.now() - 1 } })).data.skipped).toBe(true);
+    const expired = { ...envelope, payload: { ...callPayload(), expiresAt: Date.now() - 1 } };
+    expect((await backup.call(expired)).errCode).toBe(0);
+    expect(backup.send).toHaveBeenCalledTimes(5);
+    expect((await call(expired)).data.skipped).toBe(true);
     expect(send).not.toHaveBeenCalled();
   });
 });
@@ -279,11 +301,145 @@ describe('envelope type and scene-driven notification config', () => {
   });
 });
 
+describe('CID-based native call delivery', () => {
+  const env = {
+    NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1',
+    NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei,android-honor',
+    NUWAX_VOIP_IOS_APNS_ENVIRONMENT: 'development',
+  };
+  const registrationId = 'cb67ff9e-54ee-44ef-a6c0-601fd536cdf5';
+  const binding = { appId: '__UNI__8BF05E4', calleeId: '10002', active: true };
+  const huaweiRoute = { ...binding, _id: 'huawei-cid', platform: 'android', transport: 'android-huawei' };
+  const honorRoute = { ...binding, _id: 'honor-cid', platform: 'android', transport: 'android-honor' };
+  const iosRoute = { ...binding, _id: 'ios-cid', platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId };
+  const makeCall = (cids: string[], mediaType = 'audio') => ({
+    push_clientid: cids, title: '张三', content: '邀请你通话', request_id: 'fixture-batch-request',
+    payload: { ...locator, scene: 'call', convType: 1, callId: 'fixture-call', calleeId: binding.calleeId,
+      mediaType, expiresAt: Date.now() + 30_000, senderName: '张三' },
+  });
+
+  it.each(['audio', 'video'])('assembles %s routes from trusted CID records and falls back for an unregistered device', async mediaType => {
+    const routes = [huaweiRoute, honorRoute, iosRoute];
+    const { call, send, collection, query } = load(latestEntry, env, routes);
+    const backup = load(backupEntry, env, routes);
+    const cids = ['huawei-cid', 'honor-cid', 'ios-cid', 'notice-cid'];
+    const body = makeCall([...cids, 'huawei-cid'], mediaType);
+    const request = { ...body, callRoute: { platform: 'android', transport: 'android-vivo', cid: 'attacker-cid' } };
+    expect((await backup.call(request)).errCode).toBe(0);
+    expect(backup.database).not.toHaveBeenCalled();
+    expect(backup.send).toHaveBeenCalledOnce();
+    expect(backup.send.mock.calls[0][0]).toMatchObject({ push_clientid: body.push_clientid, payload: body.payload });
+    expect(backup.send.mock.calls[0][0]).not.toHaveProperty('settings');
+    expect(backup.send.mock.calls[0][0]).not.toHaveProperty('options');
+    const response = await call(request);
+    expect(collection).toHaveBeenCalledOnce();
+    expect(collection).toHaveBeenCalledWith('voip-device-routes');
+    expect(query.where).toHaveBeenCalledWith({ _id: cids });
+    expect(response).toMatchObject({ errCode: 0, data: { total: 4, results: cids.map((cid, i) => ({
+      clientid: cid, errCode: 0, delivery: i < 3 ? 'native' : 'notification',
+    })) } });
+    expect(send).toHaveBeenCalledTimes(4);
+    const [huawei, honor, ios, notice] = send.mock.calls.map(([args]) => args);
+    for (const [args, cid, key] of [[huawei, cids[0], 'hw'], [honor, cids[1], 'ho']]) {
+      expect(args).toMatchObject({ push_clientid: [cid], settings: { strategy: { [key]: 2 } },
+        payload: { callId: body.payload.callId, calleeId: binding.calleeId, mediaType, delivery: 'android-native' } });
+    }
+    expect(ios).toMatchObject({ push_clientid: ['ios-cid'], settings: { strategy: { ios: 2 } },
+      payload: { callId: body.payload.callId, mediaType, routeRegistrationId: registrationId }, options: { ios: { type: 'voip' } } });
+    expect(JSON.parse(ios.options.ios.payload)).toEqual(ios.payload);
+    expect(notice.push_clientid).toEqual(['notice-cid']);
+    expect(notice.payload).not.toHaveProperty('delivery');
+    expect(notice.request_id).not.toBe(body.request_id);
+    const firstIds = send.mock.calls.map(([args]) => args.request_id);
+    expect(new Set(firstIds).size).toBe(4);
+    send.mockClear();
+    await call(body);
+    expect(send.mock.calls.map(([args]) => args.request_id)).toEqual(firstIds);
+  });
+
+  it('blocks withdrawn, cross-account and foreign-app bindings without sending those devices a fallback', async () => {
+    const revoked = { ...huaweiRoute, _id: 'revoked-cid', active: false };
+    const wrongAccount = { ...honorRoute, _id: 'rebound-cid', calleeId: '30004' };
+    const wrongApp = { ...iosRoute, _id: 'foreign-cid', appId: '__UNI__OTHER' };
+    const { call, send } = load(latestEntry, env, [revoked, wrongAccount, wrongApp, huaweiRoute]);
+    const denied = [revoked._id, wrongAccount._id, wrongApp._id];
+    expect(await call(makeCall([...denied, huaweiRoute._id]))).toMatchObject({
+      errCode: 403, data: { results: [
+        ...denied.map(clientid => ({ clientid, errCode: 403 })),
+        { clientid: huaweiRoute._id, errCode: 0, delivery: 'native' },
+      ] },
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].push_clientid).toEqual([huaweiRoute._id]);
+  });
+
+  it('falls back for incomplete iOS registration or a disabled vendor and skips database access for stale or invalid calls', async () => {
+    const { call, send, database } = load(latestEntry, { ...env, NUWAX_VOIP_ANDROID_TRANSPORTS: '' },
+      [huaweiRoute, { ...iosRoute, registrationId: undefined }]);
+    const invitation = makeCall(['huawei-cid', 'ios-cid']);
+    expect((await call({ ...invitation, push_clientid: ['huawei-cid', 'invalid cid'] })).errCode).toBe(400);
+    expect((await call({ ...invitation, payload: { ...invitation.payload, expiresAt: Date.now() - 1 } })).data.skipped).toBe(true);
+    expect(database).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(await call(invitation)).toMatchObject({ errCode: 0, data: { results: [
+      { clientid: 'huawei-cid', delivery: 'notification' },
+      { clientid: 'ios-cid', delivery: 'notification' },
+    ] } });
+    expect(send.mock.calls.every(([args]) => !args.settings.strategy && !args.options)).toBe(true);
+  });
+
+  it('fails closed on a lookup error and reports a vendor error without a duplicate fallback', async () => {
+    const { call, send, database } = load(latestEntry, env, [huaweiRoute, honorRoute]);
+    database.mockImplementationOnce(() => { throw new Error('fixture database down'); });
+    const request = makeCall(['huawei-cid', 'honor-cid']);
+    expect(await call(request)).toMatchObject({ errCode: 503 });
+    expect(send).not.toHaveBeenCalled();
+    send.mockResolvedValueOnce({ errCode: 20001 });
+    expect(await call(request)).toMatchObject({ errCode: 20001, data: { results: [
+      { clientid: 'huawei-cid', errCode: 20001, delivery: 'native' },
+      { clientid: 'honor-cid', errCode: 0, delivery: 'native' },
+    ] } });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('ordinary production notifications remain compatible', () => {
-  it.each(ordinaryFixtures)('preserves existing send arguments and response: $label', async fixture => {
-    const { call, send } = load();
-    expect(await call(fixture.body)).toEqual(fixture.result);
-    expect(send.mock.calls.map(([args]) => JSON.parse(JSON.stringify(args)))).toEqual(fixture.calls);
+  it.each(ordinaryFixtures)('matches the rollback backup and expected output: $label', async fixture => {
+    for (const entry of entries) {
+      const { call, send } = load(entry);
+      expect(await call(fixture.body)).toEqual(fixture.result);
+      expect(send.mock.calls.map(([args]) => JSON.parse(JSON.stringify(args)))).toEqual(fixture.calls);
+    }
+  });
+  it('preserves ordinary and legacy meeting behavior with lookup enabled, including signature and provider errors', async () => {
+    const env = { NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1' };
+    for (const payload of [
+      { type: 'message', convId: '123' },
+      { type: 'meeting_invite', convId: '123', msgId: '456', inviteId: 'existing-meeting', roomName: '123456789', silent: true },
+    ]) {
+      const fixtures = entries.map(entry => load(entry, env));
+      const body = { push_clientid: 'cid-fixture', title: 'Nuwax', content: 'fixture', payload };
+      for (const fixture of fixtures) {
+        expect(await fixture.call(body, 'wrong-sign')).toEqual({ errCode: 401, errMsg: 'invalid sign' });
+        expect(fixture.send).not.toHaveBeenCalled();
+        fixture.send.mockResolvedValueOnce({ errCode: 20001, errMsg: 'test device unavailable' });
+      }
+      const [backup, latest] = await Promise.all(fixtures.map(fixture => fixture.call(body)));
+      expect(backup.errCode).toBe(20001);
+      expect(latest).toEqual(backup);
+      expect(fixtures[1].send.mock.calls).toEqual(fixtures[0].send.mock.calls);
+      expect(fixtures[1].database).not.toHaveBeenCalled();
+    }
+  });
+  it('keeps legacy call locators in the ordinary path with a 60-second TTL in the latest version', async () => {
+    const body = { push_clientid: 'fixture-cid', title: 'Nuwax', content: 'call', payload: { ...locator, convType: 1 } };
+    const [backup, latest] = entries.map(entry => load(entry, { NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1' }));
+    expect((await backup.call(body)).errCode).toBe(0);
+    expect((await latest.call(body)).errCode).toBe(0);
+    const backupArgs = backup.send.mock.calls[0][0];
+    expect(backupArgs).not.toHaveProperty('settings');
+    expect(latest.send.mock.calls[0][0]).toEqual({ ...backupArgs, settings: { ttl: 60_000 } });
+    expect(latest.database).not.toHaveBeenCalled();
   });
   it('retains the updated foreground notification policy and Harmony badge for messages and calls', async () => {
     for (const payload of [{ type: 'message', convId: '123' }, locator]) {
@@ -294,9 +450,12 @@ describe('ordinary production notifications remain compatible', () => {
     }
   });
   it('still batches ordinary notices in groups of 500', async () => {
-    const { call, send } = load();
-    await call({ push_clientid: Array.from({ length: 501 }, (_, i) => `cid-${i}`), title: 'Nuwax', content: 'message' });
-    expect(send.mock.calls.map(([args]) => args.push_clientid.length)).toEqual([500, 1]);
-    expect(send.mock.calls[0][0]).not.toHaveProperty('settings');
+    const body = { push_clientid: Array.from({ length: 501 }, (_, i) => `cid-${i}`), title: 'Nuwax', content: 'message' };
+    const [backup, latest] = entries.map(entry => load(entry));
+    const [backupResult, latestResult] = await Promise.all([backup.call(body), latest.call(body)]);
+    expect(latestResult).toEqual(backupResult);
+    expect(latest.send.mock.calls).toEqual(backup.send.mock.calls);
+    expect(latest.send.mock.calls.map(([args]) => args.push_clientid.length)).toEqual([500, 1]);
+    expect(latest.send.mock.calls[0][0]).not.toHaveProperty('settings');
   });
 });

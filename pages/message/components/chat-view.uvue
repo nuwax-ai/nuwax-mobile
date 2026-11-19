@@ -2082,7 +2082,7 @@
   import { apiImMeetingInviteHandled } from "@/servers/imMeeting";
   import { getImSessionStamp, IM_SESSION_CLEARED } from "@/utils/im/imSessionScope";
   // 会话草稿（微信式）：未发文案+暂存图本地按 convId 记忆，列表「[草稿]xxx」+ 进页回显
-  import { getChatDraft, getChatDraftMedia, rememberChatDraftConversation, setChatDraft } from "@/utils/im/chatDrafts";
+  import { CHAT_DRAFTS_CHANGED, getChatDraft, getChatDraftMedia, getChatDraftRevision, rememberChatDraftConversation, setChatDraft } from "@/utils/im/chatDrafts";
   import { ChatStagedMedia as StagedImage, stagedMediaName, stagedMediaMime, readStagedMedia, serializeStagedMedia, ensureStagedPathDisplayable } from "@/utils/im/chatStagedMedia";
   // 失败行发件箱（微信式）：发送失败的乐观行跨重启本地保留，重进会话回显末尾可重发
   import { getFailedSends, removeFailedSend, upsertFailedSend } from "@/utils/im/chatFailedSends";
@@ -3150,6 +3150,25 @@
   // （setChatDraft 内判）。指纹含暂存图路径：选图/删图与键入同样触发去抖落盘。
   let chatDraftSaveTimer = 0;
 
+  /** 本实例上次与草稿同步时的会话修订号（-1=还没同步过）。见 chatDrafts.getChatDraftRevision：
+   *  同一会话可能有两个输入框实例（普通会话页 + tab-shell 背层实例），谁最后一次改的草稿，
+   *  两边进来都得用那份；本实例手里的文案一旦被别人改过就作废，绝不再写回去。
+   *  ★必须定义在下面的 watch 之前（UTS 无提升，先用后定义报 error18）。 */
+  let draftRevSynced = -1;
+
+  function noteDraftRev(): void {
+    draftRevSynced = getChatDraftRevision(convId.value);
+  }
+
+  /** 把输入框切成草稿当前值（草稿被别的实例改过时用：本实例残留的文案已作废）。 */
+  function adoptStoredDraft(): void {
+    const draft = getChatDraft(convId.value);
+    if (draft != inputText.value) {
+      inputText.value = draft;
+    }
+    noteDraftRev();
+  }
+
   /** 草稿要记忆的暂存图路径；H5 相册是 blob: URL，页面卸载即失效，不入草稿。 */
   function stagedDraftMedia(): StagedImage[] {
     // #ifdef H5
@@ -3180,6 +3199,7 @@
       chatDraftSaveTimer = 0;
       if (isChatActive()) {
         setChatDraft(convId.value, inputText.value, [], stagedDraftMedia());
+        noteDraftRev();
       }
     }, 600) as number;
   });
@@ -3193,7 +3213,35 @@
     if (convId.value.length == 0) {
       return;
     }
+    // 草稿已被别的实例改写/清空（比如在普通会话页里把文案删掉了）⇒ 以草稿为准，
+    // 不能把本实例手里的残留文案写回去——否则删掉的文案会被背层实例的退页补存复活。
+    if (draftRevSynced >= 0 && getChatDraftRevision(convId.value) != draftRevSynced) {
+      adoptStoredDraft();
+      return;
+    }
     setChatDraft(convId.value, inputText.value, [], stagedDraftMedia());
+    noteDraftRev();
+    // 草稿落定：通知可见中的消息页刷新行摘要（背层 Stage 会话都不经过 onShow）。
+    // ★只在这里发、不在逐键入的去抖写盘里发——行摘要是整表重建，不能跟着敲字跑。
+    uni.$emit(CHAT_DRAFTS_CHANGED);
+  }
+
+  /** 回页时把输入框与本地草稿对齐一次。
+   *  普通聊天页每次进入都是新实例，草稿在 initFromOptions 里回显一次就够；但**背层
+   *  Stage 实例（tab-shell 下拉进入的默认智能体会话）是跨「进入/退出」复用的**，只在
+   *  prepare 时读过一次草稿，之后输入框一直留着上次的文案——在普通会话页里把草稿删掉
+   *  后，再下拉回到背层实例，删掉的文案又被带回来了。
+   *  退页路径都会 flushChatDraft（草稿 == 进框），所以正常场景下这里两侧相等、不改写；
+   *  只在别的实例动过草稿时才以草稿为准。★去抖窗内还有待写输入时不动，防覆盖刚敲的内容。 */
+  function syncComposerFromDraft(): void {
+    const draft = convId.value.length > 0 ? getChatDraft(convId.value) : "";
+    if (convId.value.length == 0 || chatDraftSaveTimer != 0) {
+      return;
+    }
+    if (draft != inputText.value) {
+      inputText.value = draft;
+    }
+    noteDraftRev();
   }
   /** 面板态（飞书式）：“”=无 / "emoji"=表情 / "plus"=加号（两者与键盘互斥）；
    *  "font"=格式横条（B/I/S/U + 列表）——与系统键盘【共存】，Aa 键即聚焦拉键盘。 */
@@ -15553,6 +15601,8 @@
         }
         stagedImages.value = restored;
       }
+      // 记下本实例的起点修订号：之后退页 flush 时据此判断草稿是否已被别的实例改过
+      noteDraftRev();
     }
     const convTypeRaw = readOption(options, "convType");
     const parsedType = parseFloat(convTypeRaw);
@@ -15885,6 +15935,9 @@
   let chatHasShownOnce = false;
   function onPageShow(): void {
     pageVisible = true;
+    // 输入框与草稿对齐（背层 Stage 实例跨进入复用，别的实例可能已改过草稿；
+    // 正常路径两侧相等，不改写。见 syncComposerFromDraft）
+    syncComposerFromDraft();
     // 占位提示轮换随回页恢复（onHide 停过；隐藏期间不写响应式、不触发整页重渲染）。
     // 已聚焦过（agentGuidePromptFocusStopped）时 start 内部自会拦掉，回页不会重新轮播
     startAgentGuidePromptRotation();
@@ -16093,6 +16146,8 @@
     // 草稿同步落盘：背层会话（tab-shell Stage）退页要等收层动画结束才派发 onPageHide，
     // 由父级在收层起点主动调一次，避免去抖窗内的最后一次输入（尤其删空）晚于重进回显。
     flushChatDraft: flushChatDraft as any,
+    // 回页/拉入时与草稿对齐输入框（背层实例跨进入复用，别的实例可能已改过草稿）
+    syncComposerFromDraft: syncComposerFromDraft as any,
   });
 </script>
 
